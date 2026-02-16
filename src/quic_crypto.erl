@@ -47,6 +47,13 @@
     derive_server_app_secret/2,
     derive_server_app_secret/3,
 
+    %% 0-RTT (Early Data)
+    derive_client_early_traffic_secret/2,
+    derive_client_early_traffic_secret/3,
+    derive_early_exporter_master_secret/2,
+    compute_psk_binder/3,
+    compute_psk_binder/4,
+
     %% Derive-Secret function
     derive_secret/3,
     derive_secret/4,
@@ -189,6 +196,52 @@ derive_server_app_secret(MasterSecret, TranscriptHash) ->
 derive_server_app_secret(Cipher, MasterSecret, TranscriptHash) ->
     Hash = cipher_to_hash(Cipher),
     derive_secret(Hash, MasterSecret, <<"s ap traffic">>, TranscriptHash).
+
+%%====================================================================
+%% 0-RTT / Early Data (RFC 8446 Section 7.1)
+%%====================================================================
+
+%% @doc Derive client early traffic secret.
+%% client_early_traffic_secret = Derive-Secret(early_secret, "c e traffic", ClientHello)
+%% This is used to encrypt 0-RTT data before the handshake completes.
+-spec derive_client_early_traffic_secret(binary(), binary()) -> binary().
+derive_client_early_traffic_secret(EarlySecret, ClientHelloHash) ->
+    derive_secret(EarlySecret, <<"c e traffic">>, ClientHelloHash).
+
+%% @doc Derive client early traffic secret with cipher-specific hash.
+-spec derive_client_early_traffic_secret(atom(), binary(), binary()) -> binary().
+derive_client_early_traffic_secret(Cipher, EarlySecret, ClientHelloHash) ->
+    Hash = cipher_to_hash(Cipher),
+    derive_secret(Hash, EarlySecret, <<"c e traffic">>, ClientHelloHash).
+
+%% @doc Derive early exporter master secret.
+%% early_exporter_master_secret = Derive-Secret(early_secret, "e exp master", ClientHello)
+-spec derive_early_exporter_master_secret(binary(), binary()) -> binary().
+derive_early_exporter_master_secret(EarlySecret, ClientHelloHash) ->
+    derive_secret(EarlySecret, <<"e exp master">>, ClientHelloHash).
+
+%% @doc Compute PSK binder value for a pre_shared_key extension.
+%% RFC 8446 Section 4.2.11.2:
+%%   binder_key = Derive-Secret(early_secret, "res binder" | "ext binder", "")
+%%   binder = HMAC(binder_key, Transcript-Hash(Truncated ClientHello))
+%% For resumption PSK, use "res binder". For external PSK, use "ext binder".
+-spec compute_psk_binder(binary(), binary(), resumption | external) -> binary().
+compute_psk_binder(EarlySecret, TruncatedClientHelloHash, Type) ->
+    compute_psk_binder(sha256, EarlySecret, TruncatedClientHelloHash, Type).
+
+%% @doc Compute PSK binder with cipher-specific hash.
+-spec compute_psk_binder(atom(), binary(), binary(), resumption | external) -> binary().
+compute_psk_binder(Cipher, EarlySecret, TruncatedClientHelloHash, Type) ->
+    Hash = cipher_to_hash(Cipher),
+    Label = case Type of
+        resumption -> <<"res binder">>;
+        external -> <<"ext binder">>
+    end,
+    %% binder_key = Derive-Secret(early_secret, label, "")
+    %% For empty context, derive_secret uses Hash("") as per RFC 8446
+    BinderKey = derive_secret(Hash, EarlySecret, Label, <<>>),
+    %% binder = HMAC(binder_key, TruncatedClientHelloHash)
+    crypto:mac(hmac, Hash, BinderKey, TruncatedClientHelloHash).
 
 %%====================================================================
 %% Derive-Secret Function

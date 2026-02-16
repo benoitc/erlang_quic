@@ -299,6 +299,40 @@
     rtt :: non_neg_integer() | undefined
 }).
 
+%% Session Ticket for 0-RTT (RFC 9001 Section 4.6)
+%% Stores session ticket information for resumption.
+-record(session_ticket, {
+    %% Server name (SNI) this ticket is valid for
+    server_name :: binary(),
+
+    %% Ticket data (opaque to client)
+    ticket :: binary(),
+
+    %% Ticket lifetime in seconds
+    lifetime :: non_neg_integer(),
+
+    %% Ticket age add (for obfuscation)
+    age_add :: non_neg_integer(),
+
+    %% Ticket nonce (for PSK derivation)
+    nonce :: binary(),
+
+    %% Resumption master secret (for deriving PSK)
+    resumption_secret :: binary(),
+
+    %% Max early data size (0 = no early data)
+    max_early_data :: non_neg_integer(),
+
+    %% When this ticket was received
+    received_at :: non_neg_integer(),
+
+    %% Cipher suite used for the original connection
+    cipher :: atom(),
+
+    %% ALPN used for the original connection
+    alpn :: binary() | undefined
+}).
+
 %% Connection ID Entry for CID Pool (RFC 9000 Section 5.1)
 %% Manages multiple connection IDs for connection migration.
 -record(cid_entry, {
