@@ -162,6 +162,11 @@
     last_activity :: non_neg_integer(),
     timer_ref :: reference() | undefined,
 
+    %% Congestion control and loss detection
+    cc_state :: quic_cc:cc_state() | undefined,
+    loss_state :: quic_loss:loss_state() | undefined,
+    pto_timer :: reference() | undefined,
+
     %% Pending data
     send_queue = [] :: [term()],
 
@@ -365,6 +370,10 @@ init([Host, Port, Opts, Owner, Socket]) ->
     AlpnOpt = maps:get(alpn, Opts, [<<"h3">>]),
     AlpnList = normalize_alpn_list(AlpnOpt),
 
+    %% Initialize congestion control and loss detection
+    CCState = quic_cc:new(),
+    LossState = quic_loss:new(),
+
     %% Initialize state
     State = #state{
         scid = SCID,
@@ -393,7 +402,9 @@ init([Host, Port, Opts, Owner, Socket]) ->
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
         idle_timeout = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
-        last_activity = erlang:monotonic_time(millisecond)
+        last_activity = erlang:monotonic_time(millisecond),
+        cc_state = CCState,
+        loss_state = LossState
     },
 
     {ok, idle, State}.
@@ -737,14 +748,30 @@ send_app_ack(State) ->
     end.
 
 %% Build an ACK frame from ranges
+%% Our internal format is [{Start, End}, ...] where Start <= End
+%% quic_frame expects [{LargestAcked, FirstRange}, {Gap, Range}, ...]
+%% where FirstRange = LargestAcked - SmallestAcked (count)
 build_ack_frame(Ranges) ->
-    %% Get the largest acknowledged PN
-    [{LargestAcked, _} | _] = Ranges,
-    %% ACK delay in microseconds (convert to ack_delay_exponent units, default 3)
+    %% Convert from {Start, End} to encoder format
+    EncoderRanges = convert_ack_ranges_for_encode(Ranges),
     AckDelay = 0,  % For simplicity
-    %% For a simple implementation, just acknowledge the largest
-    %% A complete implementation would encode all ranges
-    quic_frame:encode({ack, Ranges, AckDelay, undefined}).
+    quic_frame:encode({ack, EncoderRanges, AckDelay, undefined}).
+
+%% Convert internal ACK ranges to encoder format
+convert_ack_ranges_for_encode([{Start, End} | Rest]) ->
+    %% First range: LargestAcked = End, FirstRange = End - Start
+    FirstRange = End - Start,
+    RestConverted = convert_rest_ranges(Start, Rest),
+    [{End, FirstRange} | RestConverted].
+
+convert_rest_ranges(_PrevStart, []) ->
+    [];
+convert_rest_ranges(PrevStart, [{Start, End} | Rest]) ->
+    %% Gap = PrevStart - End - 2 (number of missing packets between ranges)
+    Gap = PrevStart - End - 2,
+    %% Range = End - Start (number of packets in this block)
+    Range = End - Start,
+    [{Gap, Range} | convert_rest_ranges(Start, Rest)].
 
 %% Send a Handshake packet
 send_handshake_packet(Payload, State) ->
@@ -800,7 +827,9 @@ send_app_packet(Payload, State) ->
         socket = Socket,
         remote_addr = {IP, Port},
         app_keys = {ClientKeys, _ServerKeys},
-        pn_app = PNSpace
+        pn_app = PNSpace,
+        cc_state = CCState,
+        loss_state = LossState
     } = State,
 
     PN = PNSpace#pn_space.next_pn,
@@ -827,11 +856,25 @@ send_app_packet(Payload, State) ->
 
     %% Build and send
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
+    PacketSize = byte_size(Packet),
     gen_udp:send(Socket, IP, Port, Packet),
+
+    %% Track sent packet for loss detection and congestion control
+    %% Determine if ack-eliciting (not ACK-only or padding-only)
+    AckEliciting = is_ack_eliciting_payload(Payload),
+    NewLossState = quic_loss:on_packet_sent(LossState, PN, PacketSize, AckEliciting),
+    NewCCState = case AckEliciting of
+        true -> quic_cc:on_packet_sent(CCState, PacketSize);
+        false -> CCState
+    end,
 
     %% Update PN space
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State#state{pn_app = NewPNSpace}.
+    State#state{
+        pn_app = NewPNSpace,
+        cc_state = NewCCState,
+        loss_state = NewLossState
+    }.
 
 %% Pad Initial packet to minimum 1200 bytes
 pad_initial_packet(Packet) when byte_size(Packet) >= 1200 ->
@@ -1018,9 +1061,48 @@ process_frame(_Level, ping, State) ->
 process_frame(Level, {crypto, Offset, Data}, State) ->
     buffer_crypto_data(Level, Offset, Data, State);
 
-process_frame(_Level, {ack, _Ranges, _Delay, _ECN}, State) ->
-    %% Process ACK - update loss detection, congestion control
-    State;
+process_frame(_Level, {ack, Ranges, AckDelay, _ECN}, State) ->
+    %% Process ACK - update loss detection and congestion control
+    #state{loss_state = LossState, cc_state = CCState} = State,
+
+    %% Convert Ranges list to the format expected by quic_loss
+    %% Ranges is a list of {Start, End} tuples from largest to smallest
+    case Ranges of
+        [] ->
+            State;
+        [{LargestAcked, _} | _] ->
+            %% Convert ranges to ACK frame format for quic_loss
+            %% quic_loss expects {ack, LargestAcked, AckDelay, FirstRange, AckRanges}
+            {FirstRange, RestRanges} = ranges_to_ack_format(Ranges),
+            AckFrame = {ack, LargestAcked, AckDelay, FirstRange, RestRanges},
+
+            Now = erlang:monotonic_time(millisecond),
+            {NewLossState, AckedPackets, LostPackets} =
+                quic_loss:on_ack_received(LossState, AckFrame, Now),
+
+            %% Calculate total bytes acked and lost
+            AckedBytes = lists:sum([P#sent_packet.size || P <- AckedPackets]),
+            LostBytes = lists:sum([P#sent_packet.size || P <- LostPackets]),
+
+            %% Update congestion control
+            CCState1 = quic_cc:on_packets_acked(CCState, AckedBytes),
+            CCState2 = quic_cc:on_packets_lost(CCState1, LostBytes),
+
+            %% If there was loss, signal congestion event
+            CCState3 = case LostPackets of
+                [] ->
+                    CCState2;
+                [#sent_packet{time_sent = SentTime} | _] ->
+                    quic_cc:on_congestion_event(CCState2, SentTime)
+            end,
+
+            State1 = State#state{
+                loss_state = NewLossState,
+                cc_state = CCState3
+            },
+            %% Try to send queued data now that cwnd may have freed up
+            process_send_queue(State1)
+    end;
 
 process_frame(_Level, handshake_done, State) ->
     %% Server confirmed handshake complete
@@ -1295,18 +1377,53 @@ process_stream_data(StreamId, Offset, Data, Fin, State) ->
     %% For now, deliver data immediately (ignoring out-of-order for simplicity)
     Owner ! {quic, Ref, {stream_data, StreamId, Data, Fin}},
 
+    NewRecvOffset = Offset + byte_size(Data),
     NewStream = Stream#stream_state{
-        recv_offset = Offset + byte_size(Data),
+        recv_offset = NewRecvOffset,
         recv_fin = Fin
     },
 
-    %% Send ACK for received data
     State1 = State#state{streams = maps:put(StreamId, NewStream, Streams)},
-    send_app_ack(State1).
+
+    %% Check if we need to send MAX_STREAM_DATA to allow more data
+    %% Send when we've consumed more than half our advertised limit
+    RecvMaxData = Stream#stream_state.recv_max_data,
+    State2 = case NewRecvOffset > (RecvMaxData div 2) of
+        true ->
+            %% Double the limit and send MAX_STREAM_DATA
+            NewMaxData = RecvMaxData * 2,
+            UpdatedStream = NewStream#stream_state{recv_max_data = NewMaxData},
+            MaxStreamDataFrame = quic_frame:encode({max_stream_data, StreamId, NewMaxData}),
+            State1a = State1#state{streams = maps:put(StreamId, UpdatedStream, Streams)},
+            send_app_packet(MaxStreamDataFrame, State1a);
+        false ->
+            State1
+    end,
+
+    %% Send ACK for received data
+    send_app_ack(State2).
 
 %%====================================================================
 %% Internal Functions - Helpers
 %%====================================================================
+
+%% Check if a payload contains ack-eliciting frames
+%% ACK and PADDING are not ack-eliciting, everything else is
+is_ack_eliciting_payload(Payload) when is_binary(Payload) ->
+    %% For encoded frames, check the first byte (frame type)
+    case Payload of
+        <<16#00, _/binary>> -> false;  % PADDING
+        <<16#02, _/binary>> -> false;  % ACK
+        <<16#03, _/binary>> -> false;  % ACK_ECN
+        <<>> -> false;
+        _ -> true
+    end.
+
+%% Convert ACK ranges from quic_frame format to quic_loss format
+%% Input from quic_frame: [{LargestAcked, FirstRange} | [{Gap, Range}, ...]]
+%% Output for quic_loss: {FirstRange, [{Gap, Range}, ...]}
+ranges_to_ack_format([{_LargestAcked, FirstRange} | RestRanges]) ->
+    {FirstRange, RestRanges}.
 
 %% Generate a random connection ID (8-20 bytes, using 8)
 generate_connection_id() ->
@@ -1468,22 +1585,58 @@ do_send_data(StreamId, Data, Fin, #state{streams = Streams} = State) ->
             {error, unknown_stream}
     end.
 
+%% Estimate packet overhead (header + AEAD tag + frame header)
+-define(PACKET_OVERHEAD, 50).
+
 %% Send stream data in fragments that fit in packets
+%% Respects congestion window by checking before each send
 send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) when byte_size(Data) =< ?MAX_STREAM_DATA_PER_PACKET ->
-    %% Data fits in one packet
-    StreamFrame = quic_frame:encode({stream, StreamId, Offset, Data, Fin}),
-    send_app_packet(StreamFrame, State);
+    %% Data fits in one packet - check congestion window
+    #state{cc_state = CCState} = State,
+    PacketSize = byte_size(Data) + ?PACKET_OVERHEAD,
+
+    case quic_cc:can_send(CCState, PacketSize) of
+        true ->
+            StreamFrame = quic_frame:encode({stream, StreamId, Offset, Data, Fin}),
+            send_app_packet(StreamFrame, State);
+        false ->
+            %% Queue the data for later sending when cwnd allows
+            queue_stream_data(StreamId, Offset, Data, Fin, State)
+    end;
 send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) ->
-    %% Split data into chunks
-    <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
+    %% Split data into chunks and send what we can
+    #state{cc_state = CCState} = State,
+    PacketSize = ?MAX_STREAM_DATA_PER_PACKET + ?PACKET_OVERHEAD,
 
-    %% Send this chunk (not fin, more data coming)
-    StreamFrame = quic_frame:encode({stream, StreamId, Offset, Chunk, false}),
-    State1 = send_app_packet(StreamFrame, State),
+    case quic_cc:can_send(CCState, PacketSize) of
+        true ->
+            <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
+            StreamFrame = quic_frame:encode({stream, StreamId, Offset, Chunk, false}),
+            State1 = send_app_packet(StreamFrame, State),
+            NewOffset = Offset + ?MAX_STREAM_DATA_PER_PACKET,
+            send_stream_data_fragmented(StreamId, NewOffset, Rest, Fin, State1);
+        false ->
+            %% Queue remaining data for later
+            queue_stream_data(StreamId, Offset, Data, Fin, State)
+    end.
 
-    %% Send remaining data
-    NewOffset = Offset + ?MAX_STREAM_DATA_PER_PACKET,
-    send_stream_data_fragmented(StreamId, NewOffset, Rest, Fin, State1).
+%% Queue stream data when congestion window is full
+queue_stream_data(StreamId, Offset, Data, Fin, #state{send_queue = Queue} = State) ->
+    QueueEntry = {stream_data, StreamId, Offset, Data, Fin},
+    State#state{send_queue = Queue ++ [QueueEntry]}.
+
+%% Process send queue when congestion window frees up
+process_send_queue(#state{send_queue = []} = State) ->
+    State;
+process_send_queue(#state{send_queue = [{stream_data, StreamId, Offset, Data, Fin} | Rest]} = State) ->
+    %% Try to send the queued data
+    State1 = State#state{send_queue = Rest},
+    State2 = send_stream_data_fragmented(StreamId, Offset, Data, Fin, State1),
+    %% If data was queued again (cwnd still full), stop processing
+    case State2#state.send_queue of
+        [_ | _] -> State2;  % Queue has items, stop for now
+        [] -> process_send_queue(State2)  % Keep processing
+    end.
 
 %% Send HTTP/3 headers on a stream
 do_send_headers(_StreamId, _Headers, _Fin, State) ->

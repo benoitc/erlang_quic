@@ -326,16 +326,15 @@ stream_large_data(Config) ->
         {quic, ConnRef, {connected, _Info}} ->
             {ok, StreamId} = quic:open_stream(ConnRef),
 
-            %% Generate 8KB of data (larger data requires congestion control)
-            %% TODO: Increase to 1MB once congestion control is implemented
-            DataSize = 8 * 1024,
+            %% Generate 1MB of data to test congestion control
+            DataSize = 1024 * 1024,
             LargeData = crypto:strong_rand_bytes(DataSize),
             ct:pal("Sending ~p bytes", [DataSize]),
 
             ok = quic:send_data(ConnRef, StreamId, LargeData, true),
 
-            %% Collect echo with timeout
-            ReceivedData = collect_stream_data(ConnRef, StreamId, <<>>, 10000),
+            %% Collect echo with timeout (30s for large transfers)
+            ReceivedData = collect_stream_data(ConnRef, StreamId, <<>>, 30000),
 
             ct:pal("Received ~p bytes", [byte_size(ReceivedData)]),
             ?assertEqual(DataSize, byte_size(ReceivedData)),
@@ -343,7 +342,7 @@ stream_large_data(Config) ->
 
             quic:close(ConnRef, normal),
             ok
-    after 10000 ->
+    after 60000 ->
         quic:close(ConnRef, timeout),
         ct:fail("Connection timeout")
     end.
