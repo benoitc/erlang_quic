@@ -725,6 +725,17 @@ send_handshake_ack(State) ->
             send_handshake_packet(AckFrame, State)
     end.
 
+%% Send an app-level ACK packet (1-RTT)
+send_app_ack(State) ->
+    #state{pn_app = PNSpace} = State,
+    case PNSpace#pn_space.ack_ranges of
+        [] ->
+            State;
+        Ranges ->
+            AckFrame = build_ack_frame(Ranges),
+            send_app_packet(AckFrame, State)
+    end.
+
 %% Build an ACK frame from ranges
 build_ack_frame(Ranges) ->
     %% Get the largest acknowledged PN
@@ -1289,7 +1300,9 @@ process_stream_data(StreamId, Offset, Data, Fin, State) ->
         recv_fin = Fin
     },
 
-    State#state{streams = maps:put(StreamId, NewStream, Streams)}.
+    %% Send ACK for received data
+    State1 = State#state{streams = maps:put(StreamId, NewStream, Streams)},
+    send_app_ack(State1).
 
 %%====================================================================
 %% Internal Functions - Helpers
@@ -1428,18 +1441,19 @@ do_open_stream(#state{next_stream_id_bidi = NextId,
             {ok, NextId, NewState}
     end.
 
-%% Send data on a stream
+%% Max stream data per packet (leave room for headers, frame overhead, AEAD tag)
+%% 1200 (min MTU for QUIC) - ~50 bytes overhead = ~1150 bytes
+-define(MAX_STREAM_DATA_PER_PACKET, 1100).
+
+%% Send data on a stream (with fragmentation for large data)
 do_send_data(StreamId, Data, Fin, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, StreamState} ->
             DataBin = iolist_to_binary(Data),
             Offset = StreamState#stream_state.send_offset,
 
-            %% Create STREAM frame
-            StreamFrame = quic_frame:encode({stream, StreamId, Offset, DataBin, Fin}),
-
-            %% Send in 1-RTT packet
-            NewState = send_app_packet(StreamFrame, State),
+            %% Fragment and send data
+            NewState = send_stream_data_fragmented(StreamId, Offset, DataBin, Fin, State),
 
             %% Update stream state
             NewStreamState = StreamState#stream_state{
@@ -1453,6 +1467,23 @@ do_send_data(StreamId, Data, Fin, #state{streams = Streams} = State) ->
         error ->
             {error, unknown_stream}
     end.
+
+%% Send stream data in fragments that fit in packets
+send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) when byte_size(Data) =< ?MAX_STREAM_DATA_PER_PACKET ->
+    %% Data fits in one packet
+    StreamFrame = quic_frame:encode({stream, StreamId, Offset, Data, Fin}),
+    send_app_packet(StreamFrame, State);
+send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) ->
+    %% Split data into chunks
+    <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
+
+    %% Send this chunk (not fin, more data coming)
+    StreamFrame = quic_frame:encode({stream, StreamId, Offset, Chunk, false}),
+    State1 = send_app_packet(StreamFrame, State),
+
+    %% Send remaining data
+    NewOffset = Offset + ?MAX_STREAM_DATA_PER_PACKET,
+    send_stream_data_fragmented(StreamId, NewOffset, Rest, Fin, State1).
 
 %% Send HTTP/3 headers on a stream
 do_send_headers(_StreamId, _Headers, _Fin, State) ->
