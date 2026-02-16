@@ -17,8 +17,8 @@ jobs:
       - name: Set up Erlang
         uses: erlef/setup-beam@v1
         with:
-          otp-version: '27.0'
-          rebar3-version: '3.23.0'
+          otp-version: '28.0'
+          rebar3-version: '3.24.0'
 
       - name: Restore dependencies cache
         uses: actions/cache@v4
@@ -26,28 +26,28 @@ jobs:
           path: |
             _build
             ~/.cache/rebar3
-          key: ${{ runner.os }}-e2e-otp27-${{ hashFiles('rebar.lock') }}
+          key: ${{ runner.os }}-e2e-otp28-${{ hashFiles('rebar.lock') }}
           restore-keys: |
-            ${{ runner.os }}-e2e-otp27-
+            ${{ runner.os }}-e2e-otp28-
 
       - name: Generate certificates
         run: |
           chmod +x ./certs/generate_certs.sh
           ./certs/generate_certs.sh
 
-      - name: Build Docker image
+      - name: Build Docker images
         run: docker compose -f docker/docker-compose.yml build
 
-      - name: Start QUIC server
+      - name: Start QUIC servers
         run: |
           docker compose -f docker/docker-compose.yml up -d
-          # Wait for server to be ready
+          # Wait for servers to be ready
           for i in {1..30}; do
             if docker compose -f docker/docker-compose.yml ps | grep -q "healthy"; then
-              echo "Server is healthy"
+              echo "Servers are healthy"
               break
             fi
-            echo "Waiting for server... ($i/30)"
+            echo "Waiting for servers... ($i/30)"
             sleep 2
           done
 
@@ -60,12 +60,22 @@ jobs:
           QUIC_SERVER_HOST: 127.0.0.1
           QUIC_SERVER_PORT: 4433
 
+      - name: Run Interop tests
+        run: rebar3 ct --suite=quic_interop_SUITE
+        env:
+          QUIC_AIOQUIC_HOST: 127.0.0.1
+          QUIC_AIOQUIC_PORT: 4433
+          QUIC_QUICGO_HOST: 127.0.0.1
+          QUIC_QUICGO_PORT: 4434
+
       - name: Collect server logs
         if: failure()
         run: |
-          echo "=== QUIC Server Logs ==="
+          echo "=== QUIC Server Logs (aioquic) ==="
           docker compose -f docker/docker-compose.yml logs quic-server
+          echo "=== QUIC Server Logs (quic-go) ==="
+          docker compose -f docker/docker-compose.yml logs quic-go-server || true
 
-      - name: Stop QUIC server
+      - name: Stop QUIC servers
         if: always()
         run: docker compose -f docker/docker-compose.yml down -v
