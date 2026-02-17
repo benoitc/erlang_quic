@@ -5,14 +5,14 @@
     <meta http-equiv="x-ua-compatible" content="ie=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="generator" content="ExDoc v0.39.1">
-    <meta name="project" content="quic v0.5.1">
+    <meta name="project" content="quic v0.6.1">
 
 
-    <title>quic — quic v0.5.1</title>
+    <title>quic — quic v0.6.1</title>
 
     <link rel="stylesheet" href="dist/html-erlang-7YNYEB7F.css" />
 
-    <script defer src="dist/sidebar_items-35C3BE0F.js"></script>
+    <script defer src="dist/sidebar_items-3A02CFF7.js"></script>
     <script defer src="docs_config.js"></script>
     <script defer src="dist/html-HBZYRXZS.js"></script>
 
@@ -37,7 +37,7 @@
 quic
         </a>
         <div class="sidebar-projectVersion" translate="no">
-          v0.5.1
+          v0.6.1
         </div>
       </div>
     </div>
@@ -94,11 +94,11 @@ quic
   <div class="heading-with-actions top-heading">
     <h1>
       <span translate="no">quic</span> 
-      <small class="app-vsn" translate="no">(quic v0.5.1)</small>
+      <small class="app-vsn" translate="no">(quic v0.6.1)</small>
 
     </h1>
 
-      <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L32" title="View Source" class="icon-action" rel="help">
+      <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L33" title="View Source" class="icon-action" rel="help">
         <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         <span class="sr-only">View Source</span>
       </a>
@@ -107,7 +107,7 @@ quic
 
 
     <section id="moduledoc">
-<p>QUIC public API.</p><p>This module provides the public interface for QUIC connections. The API is compatible with hackney_quic for drop-in replacement.</p><h3 id="module-messages" class="section-heading"><a href="#module-messages" class="hover-link"><i class="ri-link-m" aria-hidden="true"></i></a><span class="text"><a name="Messages">Messages</a></span></h3><p>Messages sent to owner process:</p><ul><li><code>{quic, ConnRef, {connected, Info}}</code> - Connection established</li><li><code>{quic, ConnRef, {stream_opened, StreamId}}</code> - Stream opened</li><li><code>{quic, ConnRef, {closed, Reason}}</code> - Connection closed</li><li><code>{quic, ConnRef, {transport_error, Code, Reason}}</code> - Transport error</li><li><code>{quic, ConnRef, {stream_data, StreamId, Bin, Fin}}</code> - Data received</li><li><code>{quic, ConnRef, {stream_reset, StreamId, ErrorCode}}</code> - Stream reset</li><li><code>{quic, ConnRef, {stop_sending, StreamId, ErrorCode}}</code> - Stop sending</li><li><code>{quic, ConnRef, {goaway, LastStreamId, ErrorCode, Debug}}</code> - GoAway received</li><li><code>{quic, ConnRef, {session_ticket, Ticket}}</code> - Session ticket for 0-RTT</li><li><code>{quic, ConnRef, {send_ready, StreamId}}</code> - Stream ready to write</li><li><code>{quic, ConnRef, {timer, NextTimeoutMs}}</code> - Timer notification</li></ul>
+<p>QUIC public API.</p><p>This module provides the public interface for QUIC connections. The API is compatible with hackney_quic for drop-in replacement.</p><h3 id="module-messages" class="section-heading"><a href="#module-messages" class="hover-link"><i class="ri-link-m" aria-hidden="true"></i></a><span class="text"><a name="Messages">Messages</a></span></h3><p>Messages sent to owner process:</p><ul><li><code>{quic, ConnRef, {connected, Info}}</code> - Connection established</li><li><code>{quic, ConnRef, {stream_opened, StreamId}}</code> - Stream opened</li><li><code>{quic, ConnRef, {closed, Reason}}</code> - Connection closed</li><li><code>{quic, ConnRef, {transport_error, Code, Reason}}</code> - Transport error</li><li><code>{quic, ConnRef, {stream_data, StreamId, Bin, Fin}}</code> - Data received</li><li><code>{quic, ConnRef, {stream_reset, StreamId, ErrorCode}}</code> - Stream reset</li><li><code>{quic, ConnRef, {stop_sending, StreamId, ErrorCode}}</code> - Stop sending</li><li><code>{quic, ConnRef, {goaway, LastStreamId, ErrorCode, Debug}}</code> - GoAway received</li><li><code>{quic, ConnRef, {session_ticket, Ticket}}</code> - Session ticket for 0-RTT</li><li><code>{quic, ConnRef, {send_ready, StreamId}}</code> - Stream ready to write</li><li><code>{quic, ConnRef, {timer, NextTimeoutMs}}</code> - Timer notification</li><li><code>{quic, ConnRef, {datagram, Data}}</code> - Datagram received (RFC 9221)</li></ul>
     </section>
 
 </div>
@@ -196,6 +196,16 @@ quic
 
     <div class="summary-row">
       <div class="summary-signature">
+        <a href="#peercert/1" data-no-tooltip="" translate="no">peercert(ConnRef)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Get the peer certificate. Returns the DER-encoded certificate of the peer if available.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
         <a href="#peername/1" data-no-tooltip="" translate="no">peername(ConnRef)</a>
 
       </div>
@@ -231,6 +241,26 @@ quic
       </div>
 
         <div class="summary-synopsis"><p>Send data on a stream. Fin indicates if this is the final frame on the stream.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#send_datagram/2" data-no-tooltip="" translate="no">send_datagram(ConnRef, Data)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Send a datagram on the connection. Datagrams are unreliable and may be lost.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#set_owner/2" data-no-tooltip="" translate="no">set_owner(ConnRef, NewOwner)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Set the owner process for a connection. Similar to gen_tcp:controlling_process/2.</p></div>
 
     </div>
 
@@ -278,7 +308,7 @@ quic
       <h1 class="signature" translate="no">close(ConnRef, Reason)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L117" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L121" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -306,7 +336,7 @@ quic
       <h1 class="signature" translate="no">connect(Host, Port, Opts, Owner)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L98" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L102" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -339,7 +369,7 @@ quic
       <h1 class="signature" translate="no">get_fd(Socket)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L75" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L79" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -367,7 +397,7 @@ quic
       <h1 class="signature" translate="no">handle_timeout(ConnRef, NowMs)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L188" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L192" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -396,7 +426,7 @@ quic
       <h1 class="signature" translate="no">is_available()</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L57" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L61" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -424,7 +454,7 @@ quic
       <h1 class="signature" translate="no">open_stream(ConnRef)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L129" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L133" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -453,7 +483,7 @@ quic
       <h1 class="signature" translate="no">open_unidirectional_stream(ConnRef)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L142" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L146" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -472,6 +502,34 @@ quic
 <p>Open a new unidirectional stream. Returns {ok, StreamId} on success. Unidirectional streams are send-only for the initiator.</p>
   </section>
 </section>
+<section class="detail" id="peercert/1">
+
+  <div class="detail-header">
+    <a href="#peercert/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">peercert(ConnRef)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L241" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> peercert(ConnRef) -> {ok, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()} when ConnRef :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>().</pre>
+
+      </div>
+
+<p>Get the peer certificate. Returns the DER-encoded certificate of the peer if available.</p>
+  </section>
+</section>
 <section class="detail" id="peername/1">
 
   <div class="detail-header">
@@ -482,7 +540,7 @@ quic
       <h1 class="signature" translate="no">peername(ConnRef)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L214" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L218" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -511,7 +569,7 @@ quic
       <h1 class="signature" translate="no">process(ConnRef)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L203" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L207" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -539,7 +597,7 @@ quic
       <h1 class="signature" translate="no">reset_stream(ConnRef, StreamId, ErrorCode)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L172" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L176" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -571,7 +629,7 @@ quic
       <h1 class="signature" translate="no">send_data(ConnRef, StreamId, Data, Fin)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L157" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L161" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -594,6 +652,64 @@ quic
 <p>Send data on a stream. Fin indicates if this is the final frame on the stream.</p>
   </section>
 </section>
+<section class="detail" id="send_datagram/2">
+
+  <div class="detail-header">
+    <a href="#send_datagram/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">send_datagram(ConnRef, Data)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L269" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> send_datagram(ConnRef, Data) -> ok | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}
+                       when ConnRef :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>(), Data :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:iodata/0">iodata</a>().</pre>
+
+      </div>
+
+<p>Send a datagram on the connection. Datagrams are unreliable and may be lost.</p>
+  </section>
+</section>
+<section class="detail" id="set_owner/2">
+
+  <div class="detail-header">
+    <a href="#set_owner/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">set_owner(ConnRef, NewOwner)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L254" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> set_owner(ConnRef, NewOwner) -> ok | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}
+                   when ConnRef :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>(), NewOwner :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>().</pre>
+
+      </div>
+
+<p>Set the owner process for a connection. Similar to gen_tcp:controlling_process/2.</p>
+  </section>
+</section>
 <section class="detail" id="setopts/2">
 
   <div class="detail-header">
@@ -604,7 +720,7 @@ quic
       <h1 class="signature" translate="no">setopts(ConnRef, Opts)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L237" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L283" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -633,7 +749,7 @@ quic
       <h1 class="signature" translate="no">sockname(ConnRef)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L225" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.1/src/quic.erl#L229" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -660,9 +776,9 @@ quic
       <p>
 
           <span class="line">
-            <a href="https://hex.pm/packages/quic/0.5.1" class="footer-hex-package">Hex Package</a>
+            <a href="https://hex.pm/packages/quic/0.6.1" class="footer-hex-package">Hex Package</a>
 
-            <a href="https://preview.hex.pm/preview/quic/0.5.1">Hex Preview</a>
+            <a href="https://preview.hex.pm/preview/quic/0.6.1">Hex Preview</a>
 
           </span>
 

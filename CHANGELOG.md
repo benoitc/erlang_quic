@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.4] - 2026-02-17
+
+### Fixed
+- Server now selects correct signature algorithm based on key type (EC vs RSA)
+
 ## [0.6.3] - 2026-02-17
 
 ### Fixed

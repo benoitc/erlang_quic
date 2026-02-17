@@ -1002,8 +1002,9 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     Transcript1 = <<Transcript/binary, EncExtMsg/binary, CertMsg/binary>>,
     TranscriptHashForCV = quic_crypto:transcript_hash(Cipher, Transcript1),
 
-    %% Build CertificateVerify
-    CertVerifyMsg = quic_tls:build_certificate_verify(?SIG_RSA_PSS_RSAE_SHA256, PrivateKey, TranscriptHashForCV),
+    %% Build CertificateVerify - select signature algorithm based on key type
+    SigAlg = select_signature_algorithm(PrivateKey),
+    CertVerifyMsg = quic_tls:build_certificate_verify(SigAlg, PrivateKey, TranscriptHashForCV),
 
     %% Update transcript after CertificateVerify
     Transcript2 = <<Transcript1/binary, CertVerifyMsg/binary>>,
@@ -2358,6 +2359,22 @@ derive_initial_keys(DCID) ->
         cipher = aes_128_gcm
     },
     {ClientKeys, ServerKeys}.
+
+%% Select signature algorithm based on private key type
+select_signature_algorithm({'ECPrivateKey', _, _, {namedCurve, {1,2,840,10045,3,1,7}}, _, _}) ->
+    %% secp256r1 / P-256
+    ?SIG_ECDSA_SECP256R1_SHA256;
+select_signature_algorithm({'ECPrivateKey', _, _, {namedCurve, {1,3,132,0,34}}, _, _}) ->
+    %% secp384r1 / P-384
+    ?SIG_ECDSA_SECP384R1_SHA384;
+select_signature_algorithm({'ECPrivateKey', _, _, _, _, _}) ->
+    %% Default EC to P-256
+    ?SIG_ECDSA_SECP256R1_SHA256;
+select_signature_algorithm({'RSAPrivateKey', _, _, _, _, _, _, _, _, _, _}) ->
+    ?SIG_RSA_PSS_RSAE_SHA256;
+select_signature_algorithm(_) ->
+    %% Default to RSA PSS
+    ?SIG_RSA_PSS_RSAE_SHA256.
 
 %% Check if we should transition to a new state
 check_state_transition(CurrentState, State) ->
