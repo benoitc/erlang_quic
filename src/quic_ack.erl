@@ -219,9 +219,10 @@ process_ack(State, {ack, LargestAcked, _AckDelay, FirstRange, AckRanges}, SentPa
             {NewState, NewlyAcked}
     end;
 
-process_ack(State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, _ECT0, _ECT1, _ECNCE}, SentPackets) ->
-    %% Process as regular ACK, ignoring ECN counts for now
-    process_ack(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, SentPackets).
+process_ack(State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, ECT0, ECT1, ECNCE}, SentPackets) ->
+    %% Process ACK and return ECN counts for congestion control
+    {NewState, NewlyAcked} = process_ack(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, SentPackets),
+    {NewState, NewlyAcked, {ecn, ECT0, ECT1, ECNCE}}.
 
 %%====================================================================
 %% Queries

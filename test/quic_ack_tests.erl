@@ -205,9 +205,13 @@ process_ack_updates_largest_test() ->
 process_ack_ecn_test() ->
     State = quic_ack:new(),
     AckFrame = {ack_ecn, 5, 0, 5, [], 10, 20, 5},
-    {NewState, AckedPNs} = quic_ack:process_ack(State, AckFrame),
+    %% ECN ACKs return {State, AckedPNs, {ecn, ECT0, ECT1, ECNCE}}
+    {NewState, AckedPNs, {ecn, ECT0, ECT1, ECNCE}} = quic_ack:process_ack(State, AckFrame),
     ?assertEqual(5, quic_ack:largest_acked(NewState)),
-    ?assertEqual(6, length(AckedPNs)).
+    ?assertEqual(6, length(AckedPNs)),
+    ?assertEqual(10, ECT0),
+    ?assertEqual(20, ECT1),
+    ?assertEqual(5, ECNCE).
 
 %%====================================================================
 %% Range Management Tests

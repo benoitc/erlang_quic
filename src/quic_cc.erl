@@ -34,6 +34,10 @@
     on_packets_lost/2,
     on_congestion_event/2,
 
+    %% ECN support (RFC 9002 Section 7.1)
+    on_ecn_ce/2,
+    ecn_ce_counter/1,
+
     %% Queries
     cwnd/1,
     ssthresh/1,
@@ -68,6 +72,10 @@
 
     %% Persistent congestion detection
     first_sent_time :: non_neg_integer() | undefined,
+
+    %% ECN state (RFC 9002 Section 7.1)
+    %% Tracks the highest ECN-CE count acknowledged
+    ecn_ce_counter = 0 :: non_neg_integer(),
 
     %% Configuration
     max_datagram_size :: non_neg_integer()
@@ -173,6 +181,42 @@ on_congestion_event(#cc_state{cwnd = Cwnd, max_datagram_size = MaxDS} = State,
         in_recovery = true,
         first_sent_time = SentTime  % Track for persistent congestion
     }.
+
+%%====================================================================
+%% ECN Support (RFC 9002 Section 7.1)
+%%====================================================================
+
+%% @doc Handle ECN-CE (Congestion Experienced) signal from ACK.
+%% RFC 9002: An increase in ECN-CE count is treated as a congestion signal.
+%% NewCECount is the ECN-CE count from the received ACK frame.
+%% SentTime is the time when the largest acknowledged packet was sent.
+-spec on_ecn_ce(cc_state(), non_neg_integer()) -> cc_state().
+on_ecn_ce(#cc_state{ecn_ce_counter = OldCount} = State, NewCECount)
+  when NewCECount =< OldCount ->
+    %% No new CE marks, no action needed
+    State;
+on_ecn_ce(#cc_state{in_recovery = true, ecn_ce_counter = OldCount} = State, NewCECount)
+  when NewCECount > OldCount ->
+    %% Already in recovery, just update counter
+    State#cc_state{ecn_ce_counter = NewCECount};
+on_ecn_ce(#cc_state{cwnd = Cwnd, max_datagram_size = MaxDS} = State, NewCECount) ->
+    %% RFC 9002: ECN-CE triggers the same response as packet loss
+    %% Enter recovery: ssthresh = cwnd * kLossReductionFactor
+    Now = erlang:monotonic_time(millisecond),
+    NewSSThresh = max(trunc(Cwnd * ?LOSS_REDUCTION_FACTOR), minimum_window(MaxDS)),
+    NewCwnd = max(NewSSThresh, minimum_window(MaxDS)),
+
+    State#cc_state{
+        cwnd = NewCwnd,
+        ssthresh = NewSSThresh,
+        recovery_start_time = Now,
+        in_recovery = true,
+        ecn_ce_counter = NewCECount
+    }.
+
+%% @doc Get the current ECN-CE counter.
+-spec ecn_ce_counter(cc_state()) -> non_neg_integer().
+ecn_ce_counter(#cc_state{ecn_ce_counter = C}) -> C.
 
 %%====================================================================
 %% Queries

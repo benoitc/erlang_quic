@@ -1591,7 +1591,7 @@ process_frame(_Level, ping, State) ->
 process_frame(Level, {crypto, Offset, Data}, State) ->
     buffer_crypto_data(Level, Offset, Data, State);
 
-process_frame(_Level, {ack, Ranges, AckDelay, _ECN}, State) ->
+process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
     %% Process ACK - update loss detection and congestion control
     #state{loss_state = LossState, cc_state = CCState} = State,
 
@@ -1626,9 +1626,12 @@ process_frame(_Level, {ack, Ranges, AckDelay, _ECN}, State) ->
                     quic_cc:on_congestion_event(CCState2, SentTime)
             end,
 
+            %% Process ECN counts if present (RFC 9002 Section 7.1)
+            CCState4 = process_ecn_counts(ECN, CCState3),
+
             State1 = State#state{
                 loss_state = NewLossState,
-                cc_state = CCState3
+                cc_state = CCState4
             },
 
             %% Retransmit lost packets
@@ -2116,6 +2119,15 @@ is_ack_eliciting_payload(Payload) when is_binary(Payload) ->
 %% Output for quic_loss: {FirstRange, [{Gap, Range}, ...]}
 ranges_to_ack_format([{_LargestAcked, FirstRange} | RestRanges]) ->
     {FirstRange, RestRanges}.
+
+%% Process ECN counts from ACK frame (RFC 9002 Section 7.1)
+%% ECN-CE indicates network congestion experienced
+process_ecn_counts(undefined, CCState) ->
+    %% No ECN information in this ACK
+    CCState;
+process_ecn_counts({_ECT0, _ECT1, ECNCE}, CCState) ->
+    %% RFC 9002: An increase in ECN-CE count triggers congestion response
+    quic_cc:on_ecn_ce(CCState, ECNCE).
 
 %% Generate a random connection ID (8-20 bytes, using 8)
 generate_connection_id() ->
