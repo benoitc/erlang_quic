@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-02-17
+
+### Added
+- Retry packet handling (RFC 9000 Section 8.1)
+- Stateless reset support (RFC 9000 Section 10.3)
+- Connection ID limit enforcement (RFC 9000 Section 5.1.1)
+- ECN support for congestion control (RFC 9002 Section 7.1)
+- RFC 9000/9001 test vectors
+- Interoperability test suite with quic-go server
+- E2E tests in CI pipeline
+
+### Fixed
+- CI compatibility with OTP 28 (use rebar3 nightly)
+- quic-go Docker build (pin to v0.48.2)
+
 ## [0.4.0] - 2025-02-17
 
 ### Changed
