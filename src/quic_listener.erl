@@ -293,10 +293,8 @@ create_connection(Packet, DCID, RemoteAddr,
             ets:insert(Conns, {DCID, ConnPid}),
             ets:insert(Conns, {ServerCID, ConnPid}),
 
-            %% Send initial packet to new connection
-            send_to_connection(ConnPid, Packet, RemoteAddr),
-
-            %% Invoke connection handler callback if provided
+            %% Invoke connection handler callback BEFORE sending packet
+            %% This ensures ownership is transferred before handshake can complete
             case ConnHandler of
                 undefined ->
                     ok;
@@ -305,6 +303,9 @@ create_connection(Packet, DCID, RemoteAddr,
                     %% Transfer ownership to handler
                     quic:set_owner(ConnRef, HandlerPid)
             end,
+
+            %% Send initial packet to new connection (after ownership transfer)
+            send_to_connection(ConnPid, Packet, RemoteAddr),
 
             {ok, ConnPid};
         {error, Reason} ->
