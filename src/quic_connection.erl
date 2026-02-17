@@ -1069,10 +1069,19 @@ send_initial_packet(Payload, State) ->
         version = Version,
         socket = Socket,
         remote_addr = {IP, Port},
-        initial_keys = {ClientKeys, _ServerKeys},
+        initial_keys = {ClientKeys, ServerKeys},
+        role = Role,
         pn_initial = PNSpace,
         retry_token = RetryToken
     } = State,
+
+    %% Select correct keys based on role:
+    %% - Client sends with ClientKeys
+    %% - Server sends with ServerKeys
+    EncryptKeys = case Role of
+        client -> ClientKeys;
+        server -> ServerKeys
+    end,
 
     PN = PNSpace#pn_space.next_pn,
     PNLen = quic_packet:pn_length(PN),
@@ -1103,7 +1112,7 @@ send_initial_packet(Payload, State) ->
     AAD = <<Header/binary, PNBin/binary>>,
 
     %% Encrypt payload
-    #crypto_keys{key = Key, iv = IV, hp = HP} = ClientKeys,
+    #crypto_keys{key = Key, iv = IV, hp = HP} = EncryptKeys,
     Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPayload),
 
     %% Apply header protection
@@ -1191,9 +1200,16 @@ send_handshake_packet(Payload, State) ->
         version = Version,
         socket = Socket,
         remote_addr = {IP, Port},
-        handshake_keys = {ClientKeys, _ServerKeys},
+        handshake_keys = {ClientKeys, ServerKeys},
+        role = Role,
         pn_handshake = PNSpace
     } = State,
+
+    %% Select correct keys based on role
+    EncryptKeys = case Role of
+        client -> ClientKeys;
+        server -> ServerKeys
+    end,
 
     PN = PNSpace#pn_space.next_pn,
     PNLen = quic_packet:pn_length(PN),
@@ -1218,7 +1234,7 @@ send_handshake_packet(Payload, State) ->
     AAD = <<Header/binary, PNBin/binary>>,
 
     %% Encrypt
-    #crypto_keys{key = Key, iv = IV, hp = HP} = ClientKeys,
+    #crypto_keys{key = Key, iv = IV, hp = HP} = EncryptKeys,
     Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPayload),
 
     %% Header protection
@@ -1243,11 +1259,18 @@ send_app_packet_internal(Payload, Frames, State) ->
         dcid = DCID,
         socket = Socket,
         remote_addr = {IP, Port},
-        app_keys = {ClientKeys, _ServerKeys},
+        app_keys = {ClientKeys, ServerKeys},
+        role = Role,
         pn_app = PNSpace,
         cc_state = CCState,
         loss_state = LossState
     } = State,
+
+    %% Select correct keys based on role
+    EncryptKeys = case Role of
+        client -> ClientKeys;
+        server -> ServerKeys
+    end,
 
     PN = PNSpace#pn_space.next_pn,
     PNLen = quic_packet:pn_length(PN),
@@ -1270,7 +1293,7 @@ send_app_packet_internal(Payload, Frames, State) ->
     PaddedPayload = pad_for_header_protection(Payload),
 
     %% Encrypt
-    #crypto_keys{key = Key, iv = IV, hp = HP} = ClientKeys,
+    #crypto_keys{key = Key, iv = IV, hp = HP} = EncryptKeys,
     Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPayload),
 
     %% Header protection
@@ -1554,16 +1577,19 @@ decode_short_header_packet(Data, State) ->
         undefined ->
             %% No app keys yet - check if this might be a stateless reset
             check_stateless_reset(Data, State);
-        {_ClientKeys, ServerKeys} ->
+        {ClientKeys, ServerKeys} ->
+            %% Select correct keys based on role
+            DecryptKeys = case State#state.role of
+                client -> ServerKeys;
+                server -> ClientKeys
+            end,
             %% Short header: first byte + DCID (assume 8 bytes based on our SCID)
             %% Short header packets don't have length field, so they consume all remaining data
             DCIDLen = byte_size(State#state.scid),
             <<FirstByte, DCID:DCIDLen/binary, EncryptedPayload/binary>> = Data,
             Header = <<FirstByte, DCID/binary>>,
             %% No remaining data after short header packet
-            %% For key update support, we use the current server keys for HP removal
-            %% and then check key_phase after unprotection
-            case decrypt_app_packet(Header, EncryptedPayload, ServerKeys, State) of
+            case decrypt_app_packet(Header, EncryptedPayload, DecryptKeys, State) of
                 {error, decryption_failed} ->
                     %% Decryption failed - check if this is a stateless reset
                     check_stateless_reset(Data, State);

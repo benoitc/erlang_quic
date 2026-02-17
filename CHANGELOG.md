@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.2] - 2026-02-17
+
+### Fixed
+- Fixed key selection for all packet types based on role (server vs client)
+- Server now uses correct keys for both sending and receiving packets
+- Fixed Initial, Handshake, and 1-RTT packet encryption/decryption
+
 ## [0.6.1] - 2026-02-17
 
 ### Fixed
