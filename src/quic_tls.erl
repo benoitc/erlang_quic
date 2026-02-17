@@ -617,7 +617,8 @@ build_certificate_verify(SignatureAlgorithm, PrivateKey, TranscriptHash) ->
 
     %% Sign with the appropriate algorithm
     {SigAlg, HashAlg, SignOpts} = get_signature_params(SignatureAlgorithm),
-    Signature = crypto:sign(SigAlg, HashAlg, Content, PrivateKey, SignOpts),
+    CryptoKey = convert_private_key(SigAlg, PrivateKey),
+    Signature = crypto:sign(SigAlg, HashAlg, Content, CryptoKey, SignOpts),
 
     SigLen = byte_size(Signature),
     Body = <<SignatureAlgorithm:16, SigLen:16, Signature/binary>>,
@@ -717,3 +718,18 @@ get_signature_params(?SIG_ECDSA_SECP384R1_SHA384) ->
     {ecdsa, sha384, []};
 get_signature_params(_) ->
     {rsa, sha256, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]}.
+
+%% Convert private key to format expected by crypto:sign
+convert_private_key(ecdsa, {'ECPrivateKey', _, PrivKeyBin, {namedCurve, {1,2,840,10045,3,1,7}}, _, _}) ->
+    %% secp256r1 / P-256
+    [PrivKeyBin, secp256r1];
+convert_private_key(ecdsa, {'ECPrivateKey', _, PrivKeyBin, {namedCurve, {1,3,132,0,34}}, _, _}) ->
+    %% secp384r1 / P-384
+    [PrivKeyBin, secp384r1];
+convert_private_key(ecdsa, {'ECPrivateKey', _, PrivKeyBin, _, _, _}) ->
+    %% Default EC curve
+    [PrivKeyBin, secp256r1];
+convert_private_key(rsa, Key) ->
+    Key;
+convert_private_key(_, Key) ->
+    Key.
