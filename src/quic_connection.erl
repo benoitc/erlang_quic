@@ -1272,6 +1272,11 @@ handle_packet_loop(Data, State) ->
             State1 = process_frames_noreenbl(_Type, Frames, NewState),
             %% Continue with remaining coalesced packets
             handle_packet_loop(RemainingData, State1);
+        {error, stateless_reset} ->
+            %% RFC 9000 Section 10.3: Stateless reset received
+            %% Immediately close the connection
+            inet:setopts(State#state.socket, [{active, once}]),
+            State#state{close_reason = stateless_reset};
         {error, _Reason} ->
             %% Re-enable socket
             inet:setopts(State#state.socket, [{active, once}]),
@@ -1433,10 +1438,39 @@ reset_initial_pn_space(State) ->
     },
     State#state{pn_initial = PNSpace}.
 
+%% Check if a packet is a stateless reset (RFC 9000 Section 10.3)
+check_stateless_reset(Data, _State) when byte_size(Data) < 21 ->
+    %% Packet too small to be a stateless reset
+    {error, decryption_failed};
+check_stateless_reset(Data, #state{peer_cid_pool = PeerCIDs} = _State) ->
+    %% Extract the last 16 bytes as potential reset token
+    DataSize = byte_size(Data),
+    TokenOffset = DataSize - 16,
+    <<_:TokenOffset/binary, PotentialToken:16/binary>> = Data,
+
+    %% Check against known reset tokens from peer's CIDs
+    case find_matching_reset_token(PotentialToken, PeerCIDs) of
+        {ok, _CID} ->
+            %% This is a stateless reset - signal connection termination
+            {error, stateless_reset};
+        not_found ->
+            %% Not a stateless reset, just decryption failure
+            {error, decryption_failed}
+    end.
+
+%% Find if a token matches any known stateless reset token
+find_matching_reset_token(_Token, []) ->
+    not_found;
+find_matching_reset_token(Token, [#cid_entry{stateless_reset_token = Token, cid = CID} | _]) ->
+    {ok, CID};
+find_matching_reset_token(Token, [_ | Rest]) ->
+    find_matching_reset_token(Token, Rest).
+
 decode_short_header_packet(Data, State) ->
     case State#state.app_keys of
         undefined ->
-            {error, no_app_keys};
+            %% No app keys yet - check if this might be a stateless reset
+            check_stateless_reset(Data, State);
         {_ClientKeys, ServerKeys} ->
             %% Short header: first byte + DCID (assume 8 bytes based on our SCID)
             %% Short header packets don't have length field, so they consume all remaining data
@@ -1446,7 +1480,13 @@ decode_short_header_packet(Data, State) ->
             %% No remaining data after short header packet
             %% For key update support, we use the current server keys for HP removal
             %% and then check key_phase after unprotection
-            decrypt_app_packet(Header, EncryptedPayload, ServerKeys, State)
+            case decrypt_app_packet(Header, EncryptedPayload, ServerKeys, State) of
+                {error, decryption_failed} ->
+                    %% Decryption failed - check if this is a stateless reset
+                    check_stateless_reset(Data, State);
+                Result ->
+                    Result
+            end
     end.
 
 %% Decrypt an application (1-RTT) packet with key phase handling

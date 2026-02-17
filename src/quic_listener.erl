@@ -49,6 +49,8 @@
     alpn_list :: [binary()],
     %% Connection ID -> Pid mapping
     connections :: ets:tid(),
+    %% Stateless reset secret (RFC 9000 Section 10.3)
+    reset_secret :: binary(),
     %% Options
     opts :: map()
 }).
@@ -110,6 +112,9 @@ init({Port, Opts}) ->
             %% Create ETS table for connection tracking
             Connections = ets:new(quic_connections, [set, protected]),
 
+            %% Generate or use provided stateless reset secret
+            ResetSecret = maps:get(reset_secret, Opts, crypto:strong_rand_bytes(32)),
+
             State = #listener_state{
                 socket = Socket,
                 port = ActualPort,
@@ -118,6 +123,7 @@ init({Port, Opts}) ->
                 private_key = PrivateKey,
                 alpn_list = ALPNList,
                 connections = Connections,
+                reset_secret = ResetSecret,
                 opts = Opts
             },
             {ok, State};
@@ -216,13 +222,14 @@ handle_initial_packet(Packet, DCID, RemoteAddr,
     end.
 
 %% Route packet to existing connection
-route_to_connection(DCID, Packet, RemoteAddr, #listener_state{connections = Conns}) ->
+route_to_connection(DCID, Packet, RemoteAddr,
+                    #listener_state{connections = Conns} = State) ->
     case ets:lookup(Conns, DCID) of
         [{DCID, ConnPid}] ->
             send_to_connection(ConnPid, Packet, RemoteAddr);
         [] ->
-            %% Unknown connection - drop packet
-            ok
+            %% Unknown connection - potentially send stateless reset
+            handle_unknown_packet(DCID, Packet, RemoteAddr, State)
     end.
 
 %% Create a new server-side connection
@@ -282,3 +289,64 @@ register_cid(Listener, CID, ConnPid) ->
 -spec unregister_cid(pid(), binary()) -> ok.
 unregister_cid(Listener, CID) ->
     gen_server:cast(Listener, {unregister_cid, CID}).
+
+%%====================================================================
+%% Stateless Reset (RFC 9000 Section 10.3)
+%%====================================================================
+
+%% Handle packet to unknown connection - potentially send stateless reset
+handle_unknown_packet(DCID, Packet, {IP, Port},
+                      #listener_state{socket = Socket, reset_secret = Secret}) ->
+    %% RFC 9000 Section 10.3.3: Don't send reset if packet might be a reset
+    case is_potential_stateless_reset(Packet) of
+        true ->
+            %% Don't respond to avoid reset loops
+            ok;
+        false ->
+            %% RFC 9000 Section 10.3.3: Reset must be smaller than triggering packet
+            %% and at least 21 bytes (minimum QUIC packet size)
+            TriggerSize = byte_size(Packet),
+            case TriggerSize > 21 of
+                true ->
+                    %% Generate and send stateless reset
+                    Token = compute_stateless_reset_token(Secret, DCID),
+                    ResetPacket = build_stateless_reset(Token, TriggerSize),
+                    gen_udp:send(Socket, IP, Port, ResetPacket);
+                false ->
+                    %% Packet too small to respond with reset
+                    ok
+            end
+    end.
+
+%% Check if a packet might be a stateless reset
+%% RFC 9000 Section 10.3: A reset looks like a short header packet
+%% ending with a 16-byte token
+is_potential_stateless_reset(<<0:1, _:7, _Rest/binary>> = Packet) ->
+    %% Short header - could be a stateless reset
+    %% A stateless reset is at least 21 bytes (1 header + 4 random + 16 token)
+    byte_size(Packet) >= 21;
+is_potential_stateless_reset(_) ->
+    %% Long header packets are not stateless resets
+    false.
+
+%% Compute stateless reset token from secret and CID
+%% RFC 9000 Section 10.3.2: Token = HMAC(secret, CID)[0:16]
+compute_stateless_reset_token(Secret, CID) ->
+    <<Token:16/binary, _/binary>> = crypto:mac(hmac, sha256, Secret, CID),
+    Token.
+
+%% Build a stateless reset packet
+%% RFC 9000 Section 10.3: Looks like a short header packet with random bytes
+%% followed by the 16-byte stateless reset token
+build_stateless_reset(Token, TriggerSize) ->
+    %% Reset should be smaller than trigger (RFC 9000 Section 10.3.3)
+    %% but at least 21 bytes. Use a size between 21 and TriggerSize-1.
+    ResetSize = min(TriggerSize - 1, max(21, rand:uniform(20) + 21)),
+    %% Unpredictable bits with fixed bit = 1 (first bit = 0 for short header)
+    RandomLen = ResetSize - 17,  % 1 byte header + 16 byte token
+    RandomBytes = crypto:strong_rand_bytes(RandomLen),
+    %% First byte: 0|1|XXXX = short header with fixed bit set
+    %% Use random bits for rest to be unpredictable
+    <<FirstRandom:6, _:2>> = crypto:strong_rand_bytes(1),
+    FirstByte = (0 bsl 7) bor (1 bsl 6) bor FirstRandom,
+    <<FirstByte, RandomBytes/binary, Token/binary>>.
