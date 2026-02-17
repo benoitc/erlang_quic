@@ -74,9 +74,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-plt-otp28-
 
-      - name: Build PLT
-        run: rebar3 dialyzer --plt-only
-
       - name: Run Dialyzer
         run: rebar3 dialyzer
 

@@ -1,5 +1,5 @@
 # quic-go echo server for interoperability testing
-FROM golang:1.22-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 RUN apk add --no-cache git
 
@@ -7,9 +7,10 @@ RUN apk add --no-cache git
 WORKDIR /build
 
 # Clone quic-go and build the echo example
+# Build from the repo root to handle the replace directive in example/go.mod
 RUN git clone --depth 1 https://github.com/quic-go/quic-go.git && \
-    cd quic-go/example && \
-    go build -o /build/echo ./echo
+    cd quic-go && \
+    go build -o /build/echo ./example/echo
 
 # Runtime image
 FROM alpine:latest
