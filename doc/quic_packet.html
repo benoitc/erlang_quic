@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="x-ua-compatible" content="ie=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="generator" content="ExDoc v0.39.1">
+    <meta name="project" content="quic v0.5.1">
+
+
+    <title>quic_packet — quic v0.5.1</title>
+
+    <link rel="stylesheet" href="dist/html-erlang-7YNYEB7F.css" />
+
+    <script defer src="dist/sidebar_items-35C3BE0F.js"></script>
+    <script defer src="docs_config.js"></script>
+    <script defer src="dist/html-HBZYRXZS.js"></script>
+
+  </head>
+  <body>
+    <script>(()=>{var t="ex_doc:settings",e="dark";var o="dark",s="light";var E="sidebar_state",n="closed";var r="sidebar_width";var a="sidebar-open";var i=new URLSearchParams(window.location.search),S=i.get("theme")||JSON.parse(localStorage.getItem(t)||"{}").theme;(S===o||S!==s&&window.matchMedia("(prefers-color-scheme: dark)").matches)&&document.body.classList.add(e);var d=sessionStorage.getItem(E),A=d!==n&&!window.matchMedia(`screen and (max-width: ${768}px)`).matches;document.body.classList.toggle(a,A);var c=sessionStorage.getItem(r);c&&document.body.style.setProperty("--sidebarWidth",`${c}px`);var p=/(Macintosh|iPhone|iPad|iPod)/.test(window.navigator.userAgent);document.documentElement.classList.toggle("apple-os",p);})();
+</script>
+
+<div class="body-wrapper">
+
+<button id="sidebar-menu" class="sidebar-button sidebar-toggle" aria-label="toggle sidebar" aria-controls="sidebar">
+  <i class="ri-menu-line ri-lg" title="Collapse/expand sidebar"></i>
+</button>
+
+<nav id="sidebar" class="sidebar">
+
+  <div class="sidebar-header">
+    <div class="sidebar-projectInfo">
+
+      <div>
+        <a href="readme.html" class="sidebar-projectName" translate="no">
+quic
+        </a>
+        <div class="sidebar-projectVersion" translate="no">
+          v0.5.1
+        </div>
+      </div>
+    </div>
+    <ul id="sidebar-list-nav" class="sidebar-list-nav" role="tablist" data-extras=""></ul>
+  </div>
+</nav>
+
+<output role="status" id="toast"></output>
+
+<main class="content page-module" id="main" data-type="modules">
+  <div id="content" class="content-inner">
+    <div class="top-search">
+      <div class="search-settings">
+        <form class="search-bar" action="search.html">
+          <label class="search-label">
+            <span class="sr-only">Search documentation of quic</span>
+            <div class="search-input-wrapper">
+              <input name="q" type="text" class="search-input" placeholder="Press / to search" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+              <button type="button" tabindex="-1" class="search-close-button" aria-hidden="true">
+                <i class="ri-close-line ri-lg" title="Cancel search"></i>
+              </button>
+            </div>
+          </label>
+        </form>
+        <div class="autocomplete">
+        </div>
+        <div class="engine-selector" data-multiple="false">
+          <button type="button" class="engine-button" aria-label="Select search engine" aria-haspopup="true" aria-expanded="false">
+            <i class="ri-search-2-line" aria-hidden="true"></i>
+            <span class="engine-name">Default</span>
+            <i class="ri-arrow-down-s-line" aria-hidden="true"></i>
+          </button>
+          <div class="engine-dropdown" hidden role="menu">
+
+              <button type="button"
+                      class="engine-option"
+                      data-engine-url="search.html?q="
+                      role="menuitemradio"
+                      aria-checked="true">
+                <span class="name">Default</span>
+                <span class="help">In-browser search</span>
+              </button>
+
+          </div>
+        </div>
+        <button class="icon-settings display-settings">
+          <i class="ri-settings-3-line"></i>
+          <span class="sr-only">Settings</span>
+        </button>
+      </div>
+    </div>
+
+<div id="top-content">
+  <div class="heading-with-actions top-heading">
+    <h1>
+      <span translate="no">quic_packet</span> 
+      <small class="app-vsn" translate="no">(quic v0.5.1)</small>
+
+    </h1>
+
+      <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_packet.erl#L44" title="View Source" class="icon-action" rel="help">
+        <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        <span class="sr-only">View Source</span>
+      </a>
+
+  </div>
+
+
+    <section id="moduledoc">
+<p>QUIC packet encoding and decoding.</p><p>This module handles encoding and decoding of QUIC packets including: - Long header packets (Initial, Handshake, 0-RTT, Retry) - Short header packets (1-RTT)</p><h3 id="module-packet-header-format" class="section-heading"><a href="#module-packet-header-format" class="hover-link"><i class="ri-link-m" aria-hidden="true"></i></a><span class="text"><a name="Packet_Header_Format">Packet Header Format</a></span></h3><p>Long Header:</p><pre><code class="makeup erlang" translate="no"><span class="w">   </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
+   </span><span class="p">|</span><span class="mi">1</span><span class="p">|</span><span class="mi">1</span><span class="p">|</span><span class="n">T</span><span class="w"> </span><span class="n">T</span><span class="p">|</span><span class="n">X</span><span class="w"> </span><span class="n">X</span><span class="w"> </span><span class="n">X</span><span class="w"> </span><span class="n">X</span><span class="p">|</span><span class="w">
+   </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
+   </span><span class="p">|</span><span class="w">                         </span><span class="n">Version</span><span class="w"> </span><span class="p" data-group-id="9611132107-1">(</span><span class="mi">32</span><span class="p" data-group-id="9611132107-1">)</span><span class="w">                          </span><span class="p">|</span><span class="w">
+   </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
+   </span><span class="p">|</span><span class="w"> </span><span class="n">DCID</span><span class="w"> </span><span class="n">Len</span><span class="w"> </span><span class="p" data-group-id="9611132107-2">(</span><span class="mi">8</span><span class="p" data-group-id="9611132107-2">)</span><span class="w">  </span><span class="p">|</span><span class="w">
+   </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
+   </span><span class="p">|</span><span class="w">               </span><span class="n">Destination</span><span class="w"> </span><span class="n">Connection</span><span class="w"> </span><span class="n">ID</span><span class="w"> </span><span class="p" data-group-id="9611132107-3">(</span><span class="mi">0</span><span class="p">.</span><span class="p">.</span><span class="mi">160</span><span class="p" data-group-id="9611132107-3">)</span><span class="w">            </span><span class="p">.</span><span class="p">.</span><span class="p">.</span><span class="w">
+   </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
+   </span><span class="p">|</span><span class="w"> </span><span class="n">SCID</span><span class="w"> </span><span class="n">Len</span><span class="w"> </span><span class="p" data-group-id="9611132107-4">(</span><span class="mi">8</span><span class="p" data-group-id="9611132107-4">)</span><span class="w">  </span><span class="p">|</span><span class="w">
+   </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
+   </span><span class="p">|</span><span class="w">                 </span><span class="n">Source</span><span class="w"> </span><span class="n">Connection</span><span class="w"> </span><span class="n">ID</span><span class="w"> </span><span class="p" data-group-id="9611132107-5">(</span><span class="mi">0</span><span class="p">.</span><span class="p">.</span><span class="mi">160</span><span class="p" data-group-id="9611132107-5">)</span><span class="w">               </span><span class="p">.</span><span class="p">.</span><span class="p">.</span><span class="w">
+   </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span></code></pre><p>Short Header:</p><pre><code class="makeup erlang" translate="no"><span class="w">   </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
+   </span><span class="p">|</span><span class="mi">0</span><span class="p">|</span><span class="mi">1</span><span class="p">|</span><span class="n">S</span><span class="p">|</span><span class="n">R</span><span class="p">|</span><span class="n">R</span><span class="p">|</span><span class="n">K</span><span class="p">|</span><span class="n">P</span><span class="w"> </span><span class="n">P</span><span class="p">|</span><span class="w">
+   </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
+   </span><span class="p">|</span><span class="w">                </span><span class="n">Destination</span><span class="w"> </span><span class="n">Connection</span><span class="w"> </span><span class="n">ID</span><span class="w"> </span><span class="p" data-group-id="6406875190-1">(</span><span class="mi">0</span><span class="p">.</span><span class="p">.</span><span class="mi">160</span><span class="p" data-group-id="6406875190-1">)</span><span class="w">           </span><span class="p">.</span><span class="p">.</span><span class="p">.</span><span class="w">
+   </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span></code></pre>
+    </section>
+
+</div>
+
+  <section id="summary" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#summary">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Summary</span>
+    </h1>
+<div class="summary-types summary">
+  <h2>
+    <a href="#types">Types</a>
+  </h2>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#t:packet/0" data-no-tooltip="" translate="no">packet/0</a>
+
+      </div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#t:packet_type/0" data-no-tooltip="" translate="no">packet_type/0</a>
+
+      </div>
+
+    </div>
+
+</div>
+<div class="summary-functions summary">
+  <h2>
+    <a href="#functions">Functions</a>
+  </h2>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#decode/2" data-no-tooltip="" translate="no">decode(Bin, DCIDLen)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Decode a QUIC packet. DCIDLen is used for short header packets where DCID length is implicit. Returns {ok, Packet, Rest} or {error, Reason}.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#decode_pn/2" data-no-tooltip="" translate="no">decode_pn(_, _)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Decode a packet number.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#decode_short_key_phase/1" data-no-tooltip="" translate="no">decode_short_key_phase(FirstByte)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Extract the key phase bit from a short header first byte. The key phase bit is bit 2 of the first byte (after header protection removal). Returns 0 or 1.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#encode_long/5" data-no-tooltip="" translate="no">encode_long(Type, Version, DCID, SCID, Opts)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Encode a long header packet. Type is one of: initial, handshake, zero_rtt, retry Returns the encoded packet header + payload. Note: For Initial packets, Token is required. Note: Packet number and payload should already be encrypted.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#encode_pn/2" data-no-tooltip="" translate="no">encode_pn(PN, _)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Encode a packet number.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#encode_short/4" data-no-tooltip="" translate="no">encode_short(DCID, PN, Payload, SpinBit)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Encode a short header (1-RTT) packet with default key phase 0. DCIDLen is the expected DCID length (from connection state). Returns the encoded packet.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#encode_short/5" data-no-tooltip="" translate="no">encode_short(DCID, PN, Payload, SpinBit, KeyPhase)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Encode a short header (1-RTT) packet with explicit key phase. KeyPhase is 0 or 1, indicating which set of keys was used for encryption. Returns the encoded packet.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#pn_length/1" data-no-tooltip="" translate="no">pn_length(PN)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Calculate the minimum number of bytes needed for a packet number.</p></div>
+
+    </div>
+
+</div>
+
+  </section>
+
+
+  <section id="types" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#types">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Types</span>
+    </h1>
+
+    <div class="types-list">
+<section class="detail" id="t:packet/0">
+
+  <div class="detail-header">
+    <a href="#t:packet/0" class="detail-link" data-no-tooltip="" aria-label="Link to this type">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">packet/0</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_packet.erl#L62" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-type</span> packet() ::
+          #quic_packet{type :: initial | handshake | zero_rtt | one_rtt | retry,
+                       version :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>() | undefined,
+                       dcid :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                       scid :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>() | undefined,
+                       token :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>() | undefined,
+                       pn :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>() | undefined,
+                       payload :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>() | [<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()]}.</pre>
+
+      </div>
+
+
+  </section>
+</section>
+<section class="detail" id="t:packet_type/0">
+
+  <div class="detail-header">
+    <a href="#t:packet_type/0" class="detail-link" data-no-tooltip="" aria-label="Link to this type">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">packet_type/0</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_packet.erl#L61" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-type</span> packet_type() :: initial | handshake | zero_rtt | one_rtt | retry.</pre>
+
+      </div>
+
+
+  </section>
+</section>
+
+    </div>
+  </section>
+
+  <section id="functions" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#functions">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Functions</span>
+    </h1>
+
+    <div class="functions-list">
+<section class="detail" id="decode/2">
+
+  <div class="detail-header">
+    <a href="#decode/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">decode(Bin, DCIDLen)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_packet.erl#L164" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> decode(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()) -> {ok, <a href="#t:packet/0">packet</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}.</pre>
+
+      </div>
+
+<p>Decode a QUIC packet. DCIDLen is used for short header packets where DCID length is implicit. Returns {ok, Packet, Rest} or {error, Reason}.</p>
+  </section>
+</section>
+<section class="detail" id="decode_pn/2">
+
+  <div class="detail-header">
+    <a href="#decode_pn/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">decode_pn(_, _)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_packet.erl#L180" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> decode_pn(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), 1..4) -> {<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()}.</pre>
+
+      </div>
+
+<p>Decode a packet number.</p>
+  </section>
+</section>
+<section class="detail" id="decode_short_key_phase/1">
+
+  <div class="detail-header">
+    <a href="#decode_short_key_phase/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">decode_short_key_phase(FirstByte)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_packet.erl#L156" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> decode_short_key_phase(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()) -> 0 | 1.</pre>
+
+      </div>
+
+<p>Extract the key phase bit from a short header first byte. The key phase bit is bit 2 of the first byte (after header protection removal). Returns 0 or 1.</p>
+  </section>
+</section>
+<section class="detail" id="encode_long/5">
+
+  <div class="detail-header">
+    <a href="#encode_long/5" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">encode_long(Type, Version, DCID, SCID, Opts)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_packet.erl#L81" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> encode_long(<a href="#t:packet_type/0">packet_type</a>(),
+                  <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                  <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                  <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                  #{token => <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), pn => <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), payload => <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()}) ->
+                     <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Encode a long header packet. Type is one of: initial, handshake, zero_rtt, retry Returns the encoded packet header + payload. Note: For Initial packets, Token is required. Note: Packet number and payload should already be encrypted.</p>
+  </section>
+</section>
+<section class="detail" id="encode_pn/2">
+
+  <div class="detail-header">
+    <a href="#encode_pn/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">encode_pn(PN, _)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_packet.erl#L173" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> encode_pn(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), 1..4) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Encode a packet number.</p>
+  </section>
+</section>
+<section class="detail" id="encode_short/4">
+
+  <div class="detail-header">
+    <a href="#encode_short/4" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">encode_short(DCID, PN, Payload, SpinBit)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_packet.erl#L132" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> encode_short(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:boolean/0">boolean</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Encode a short header (1-RTT) packet with default key phase 0. DCIDLen is the expected DCID length (from connection state). Returns the encoded packet.</p>
+  </section>
+</section>
+<section class="detail" id="encode_short/5">
+
+  <div class="detail-header">
+    <a href="#encode_short/5" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">encode_short(DCID, PN, Payload, SpinBit, KeyPhase)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_packet.erl#L139" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> encode_short(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:boolean/0">boolean</a>(), 0 | 1) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Encode a short header (1-RTT) packet with explicit key phase. KeyPhase is 0 or 1, indicating which set of keys was used for encryption. Returns the encoded packet.</p>
+  </section>
+</section>
+<section class="detail" id="pn_length/1">
+
+  <div class="detail-header">
+    <a href="#pn_length/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">pn_length(PN)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_packet.erl#L187" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> pn_length(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()) -> 1..4.</pre>
+
+      </div>
+
+<p>Calculate the minimum number of bytes needed for a packet number.</p>
+  </section>
+</section>
+
+    </div>
+  </section>
+
+    <footer class="footer">
+      <p>
+
+          <span class="line">
+            <a href="https://hex.pm/packages/quic/0.5.1" class="footer-hex-package">Hex Package</a>
+
+            <a href="https://preview.hex.pm/preview/quic/0.5.1">Hex Preview</a>
+
+          </span>
+
+        <span class="line">
+          <button class="a-main footer-button display-quick-switch" title="Search HexDocs packages">
+            Search HexDocs
+          </button>
+
+            <a href="quic.epub" title="ePub version">
+              Download ePub version
+            </a>
+
+        </span>
+      </p>
+
+      <p class="built-using">
+        Built using
+        <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener" translate="no">ExDoc</a> (v0.39.1) for the
+
+          <a href="https://erlang.org" title="Erlang" target="_blank" translate="no">Erlang programming language</a>
+
+      </p>
+
+    </footer>
+  </div>
+</main>
+</div>
+
+  </body>
+</html>

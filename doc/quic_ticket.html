@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="x-ua-compatible" content="ie=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="generator" content="ExDoc v0.39.1">
+    <meta name="project" content="quic v0.5.1">
+
+
+    <title>quic_ticket — quic v0.5.1</title>
+
+    <link rel="stylesheet" href="dist/html-erlang-7YNYEB7F.css" />
+
+    <script defer src="dist/sidebar_items-35C3BE0F.js"></script>
+    <script defer src="docs_config.js"></script>
+    <script defer src="dist/html-HBZYRXZS.js"></script>
+
+  </head>
+  <body>
+    <script>(()=>{var t="ex_doc:settings",e="dark";var o="dark",s="light";var E="sidebar_state",n="closed";var r="sidebar_width";var a="sidebar-open";var i=new URLSearchParams(window.location.search),S=i.get("theme")||JSON.parse(localStorage.getItem(t)||"{}").theme;(S===o||S!==s&&window.matchMedia("(prefers-color-scheme: dark)").matches)&&document.body.classList.add(e);var d=sessionStorage.getItem(E),A=d!==n&&!window.matchMedia(`screen and (max-width: ${768}px)`).matches;document.body.classList.toggle(a,A);var c=sessionStorage.getItem(r);c&&document.body.style.setProperty("--sidebarWidth",`${c}px`);var p=/(Macintosh|iPhone|iPad|iPod)/.test(window.navigator.userAgent);document.documentElement.classList.toggle("apple-os",p);})();
+</script>
+
+<div class="body-wrapper">
+
+<button id="sidebar-menu" class="sidebar-button sidebar-toggle" aria-label="toggle sidebar" aria-controls="sidebar">
+  <i class="ri-menu-line ri-lg" title="Collapse/expand sidebar"></i>
+</button>
+
+<nav id="sidebar" class="sidebar">
+
+  <div class="sidebar-header">
+    <div class="sidebar-projectInfo">
+
+      <div>
+        <a href="readme.html" class="sidebar-projectName" translate="no">
+quic
+        </a>
+        <div class="sidebar-projectVersion" translate="no">
+          v0.5.1
+        </div>
+      </div>
+    </div>
+    <ul id="sidebar-list-nav" class="sidebar-list-nav" role="tablist" data-extras=""></ul>
+  </div>
+</nav>
+
+<output role="status" id="toast"></output>
+
+<main class="content page-module" id="main" data-type="modules">
+  <div id="content" class="content-inner">
+    <div class="top-search">
+      <div class="search-settings">
+        <form class="search-bar" action="search.html">
+          <label class="search-label">
+            <span class="sr-only">Search documentation of quic</span>
+            <div class="search-input-wrapper">
+              <input name="q" type="text" class="search-input" placeholder="Press / to search" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+              <button type="button" tabindex="-1" class="search-close-button" aria-hidden="true">
+                <i class="ri-close-line ri-lg" title="Cancel search"></i>
+              </button>
+            </div>
+          </label>
+        </form>
+        <div class="autocomplete">
+        </div>
+        <div class="engine-selector" data-multiple="false">
+          <button type="button" class="engine-button" aria-label="Select search engine" aria-haspopup="true" aria-expanded="false">
+            <i class="ri-search-2-line" aria-hidden="true"></i>
+            <span class="engine-name">Default</span>
+            <i class="ri-arrow-down-s-line" aria-hidden="true"></i>
+          </button>
+          <div class="engine-dropdown" hidden role="menu">
+
+              <button type="button"
+                      class="engine-option"
+                      data-engine-url="search.html?q="
+                      role="menuitemradio"
+                      aria-checked="true">
+                <span class="name">Default</span>
+                <span class="help">In-browser search</span>
+              </button>
+
+          </div>
+        </div>
+        <button class="icon-settings display-settings">
+          <i class="ri-settings-3-line"></i>
+          <span class="sr-only">Settings</span>
+        </button>
+      </div>
+    </div>
+
+<div id="top-content">
+  <div class="heading-with-actions top-heading">
+    <h1>
+      <span translate="no">quic_ticket</span> 
+      <small class="app-vsn" translate="no">(quic v0.5.1)</small>
+
+    </h1>
+
+      <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_ticket.erl#L16" title="View Source" class="icon-action" rel="help">
+        <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        <span class="sr-only">View Source</span>
+      </a>
+
+  </div>
+
+
+    <section id="moduledoc">
+<p>Session ticket storage and PSK derivation for 0-RTT.</p><p>This module handles: - Storing and retrieving NewSessionTicket messages - Deriving PSK from resumption_master_secret - Managing ticket lifetimes and early data limits</p>
+    </section>
+
+</div>
+
+  <section id="summary" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#summary">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Summary</span>
+    </h1>
+<div class="summary-types summary">
+  <h2>
+    <a href="#types">Types</a>
+  </h2>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#t:session_ticket/0" data-no-tooltip="" translate="no">session_ticket/0</a>
+
+      </div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#t:ticket_store/0" data-no-tooltip="" translate="no">ticket_store/0</a>
+
+      </div>
+
+    </div>
+
+</div>
+<div class="summary-functions summary">
+  <h2>
+    <a href="#functions">Functions</a>
+  </h2>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#clear_expired/1" data-no-tooltip="" translate="no">clear_expired(Store)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Remove all expired tickets from the store.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#clear_ticket/2" data-no-tooltip="" translate="no">clear_ticket(ServerName, Store)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Remove a ticket for a server.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#derive_psk/2" data-no-tooltip="" translate="no">derive_psk(ResumptionSecret, Session_ticket)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Derive PSK from resumption_master_secret and ticket nonce. RFC 8446 Section 4.6.1: PSK = HKDF-Expand-Label(resumption_master_secret, &quot;resumption&quot;, ticket_nonce, Hash.length)</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#derive_resumption_secret/4" data-no-tooltip="" translate="no">derive_resumption_secret(Cipher, MasterSecret, TranscriptHash, ClientFinished)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Derive the resumption_master_secret from the master secret. RFC 8446 Section 7.1: resumption_master_secret = Derive-Secret(Master Secret, &quot;res master&quot;, ClientHello..client Finished)</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#lookup_ticket/2" data-no-tooltip="" translate="no">lookup_ticket(ServerName, Store)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Look up a ticket for a server. Returns {ok, Ticket} if found and not expired, error otherwise.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#new_store/0" data-no-tooltip="" translate="no">new_store()</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Create a new empty ticket store.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#parse_new_session_ticket/1" data-no-tooltip="" translate="no">parse_new_session_ticket(_)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Parse a NewSessionTicket message from the server. RFC 8446 Section 4.6.1: struct { uint32 ticket_lifetime; uint32 ticket_age_add; opaque ticket_nonce&lt;0..255&gt;; opaque ticket&lt;1..2^16-1&gt;; Extension extensions&lt;0..2^16-2&gt;; } NewSessionTicket;</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#store_ticket/3" data-no-tooltip="" translate="no">store_ticket(ServerName, Ticket, Store)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Store a session ticket for a server. The ticket is indexed by server name.</p></div>
+
+    </div>
+
+</div>
+
+  </section>
+
+
+  <section id="types" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#types">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Types</span>
+    </h1>
+
+    <div class="types-list">
+<section class="detail" id="t:session_ticket/0">
+
+  <div class="detail-header">
+    <a href="#t:session_ticket/0" class="detail-link" data-no-tooltip="" aria-label="Link to this type">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">session_ticket/0</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_ticket.erl#L45" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-type</span> session_ticket() ::
+          #session_ticket{server_name :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                          ticket :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                          lifetime :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                          age_add :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                          nonce :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                          resumption_secret :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                          max_early_data :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                          received_at :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                          cipher :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:atom/0">atom</a>(),
+                          alpn :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>() | undefined}.</pre>
+
+      </div>
+
+
+  </section>
+</section>
+<section class="detail" id="t:ticket_store/0">
+
+  <div class="detail-header">
+    <a href="#t:ticket_store/0" class="detail-link" data-no-tooltip="" aria-label="Link to this type">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">ticket_store/0</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_ticket.erl#L44" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-type</span> ticket_store() ::
+          #{<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>() =>
+                #session_ticket{server_name :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                                ticket :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                                lifetime :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                                age_add :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                                nonce :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                                resumption_secret :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                                max_early_data :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                                received_at :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                                cipher :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:atom/0">atom</a>(),
+                                alpn :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>() | undefined}}.</pre>
+
+      </div>
+
+
+  </section>
+</section>
+
+    </div>
+  </section>
+
+  <section id="functions" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#functions">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Functions</span>
+    </h1>
+
+    <div class="functions-list">
+<section class="detail" id="clear_expired/1">
+
+  <div class="detail-header">
+    <a href="#clear_expired/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">clear_expired(Store)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_ticket.erl#L87" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> clear_expired(<a href="#t:ticket_store/0">ticket_store</a>()) -> <a href="#t:ticket_store/0">ticket_store</a>().</pre>
+
+      </div>
+
+<p>Remove all expired tickets from the store.</p>
+  </section>
+</section>
+<section class="detail" id="clear_ticket/2">
+
+  <div class="detail-header">
+    <a href="#clear_ticket/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">clear_ticket(ServerName, Store)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_ticket.erl#L82" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> clear_ticket(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="#t:ticket_store/0">ticket_store</a>()) -> <a href="#t:ticket_store/0">ticket_store</a>().</pre>
+
+      </div>
+
+<p>Remove a ticket for a server.</p>
+  </section>
+</section>
+<section class="detail" id="derive_psk/2">
+
+  <div class="detail-header">
+    <a href="#derive_psk/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">derive_psk(ResumptionSecret, Session_ticket)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_ticket.erl#L110" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> derive_psk(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                 #session_ticket{server_name :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                                 ticket :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                                 lifetime :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                                 age_add :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                                 nonce :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                                 resumption_secret :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                                 max_early_data :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                                 received_at :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                                 cipher :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:atom/0">atom</a>(),
+                                 alpn :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>() | undefined}) ->
+                    <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Derive PSK from resumption_master_secret and ticket nonce. RFC 8446 Section 4.6.1: PSK = HKDF-Expand-Label(resumption_master_secret, &quot;resumption&quot;, ticket_nonce, Hash.length)</p>
+  </section>
+</section>
+<section class="detail" id="derive_resumption_secret/4">
+
+  <div class="detail-header">
+    <a href="#derive_resumption_secret/4" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">derive_resumption_secret(Cipher, MasterSecret, TranscriptHash, ClientFinished)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_ticket.erl#L102" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> derive_resumption_secret(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:atom/0">atom</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Derive the resumption_master_secret from the master secret. RFC 8446 Section 7.1: resumption_master_secret = Derive-Secret(Master Secret, &quot;res master&quot;, ClientHello..client Finished)</p>
+  </section>
+</section>
+<section class="detail" id="lookup_ticket/2">
+
+  <div class="detail-header">
+    <a href="#lookup_ticket/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">lookup_ticket(ServerName, Store)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_ticket.erl#L67" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> lookup_ticket(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="#t:ticket_store/0">ticket_store</a>()) -> {ok, <a href="#t:session_ticket/0">session_ticket</a>()} | error.</pre>
+
+      </div>
+
+<p>Look up a ticket for a server. Returns {ok, Ticket} if found and not expired, error otherwise.</p>
+  </section>
+</section>
+<section class="detail" id="new_store/0">
+
+  <div class="detail-header">
+    <a href="#new_store/0" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">new_store()</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_ticket.erl#L55" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> new_store() -> <a href="#t:ticket_store/0">ticket_store</a>().</pre>
+
+      </div>
+
+<p>Create a new empty ticket store.</p>
+  </section>
+</section>
+<section class="detail" id="parse_new_session_ticket/1">
+
+  <div class="detail-header">
+    <a href="#parse_new_session_ticket/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">parse_new_session_ticket(_)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_ticket.erl#L134" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> parse_new_session_ticket(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) ->
+                                  {ok,
+                                   #{lifetime := <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                                     age_add := <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                                     nonce := <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                                     ticket := <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(),
+                                     max_early_data := <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()}} |
+                                  {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}.</pre>
+
+      </div>
+
+<p>Parse a NewSessionTicket message from the server. RFC 8446 Section 4.6.1: struct { uint32 ticket_lifetime; uint32 ticket_age_add; opaque ticket_nonce&lt;0..255&gt;; opaque ticket&lt;1..2^16-1&gt;; Extension extensions&lt;0..2^16-2&gt;; } NewSessionTicket;</p>
+  </section>
+</section>
+<section class="detail" id="store_ticket/3">
+
+  <div class="detail-header">
+    <a href="#store_ticket/3" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">store_ticket(ServerName, Ticket, Store)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_ticket.erl#L61" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> store_ticket(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="#t:session_ticket/0">session_ticket</a>(), <a href="#t:ticket_store/0">ticket_store</a>()) -> <a href="#t:ticket_store/0">ticket_store</a>().</pre>
+
+      </div>
+
+<p>Store a session ticket for a server. The ticket is indexed by server name.</p>
+  </section>
+</section>
+
+    </div>
+  </section>
+
+    <footer class="footer">
+      <p>
+
+          <span class="line">
+            <a href="https://hex.pm/packages/quic/0.5.1" class="footer-hex-package">Hex Package</a>
+
+            <a href="https://preview.hex.pm/preview/quic/0.5.1">Hex Preview</a>
+
+          </span>
+
+        <span class="line">
+          <button class="a-main footer-button display-quick-switch" title="Search HexDocs packages">
+            Search HexDocs
+          </button>
+
+            <a href="quic.epub" title="ePub version">
+              Download ePub version
+            </a>
+
+        </span>
+      </p>
+
+      <p class="built-using">
+        Built using
+        <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener" translate="no">ExDoc</a> (v0.39.1) for the
+
+          <a href="https://erlang.org" title="Erlang" target="_blank" translate="no">Erlang programming language</a>
+
+      </p>
+
+    </footer>
+  </div>
+</main>
+</div>
+
+  </body>
+</html>

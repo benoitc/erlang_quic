@@ -301,13 +301,9 @@ create_connection(Packet, DCID, RemoteAddr,
                 undefined ->
                     ok;
                 Fun when is_function(Fun, 2) ->
-                    case Fun(ConnPid, ConnRef) of
-                        {ok, HandlerPid} when is_pid(HandlerPid) ->
-                            %% Transfer ownership to handler
-                            quic:set_owner(ConnRef, HandlerPid);
-                        _ ->
-                            ok
-                    end
+                    {ok, HandlerPid} = Fun(ConnPid, ConnRef),
+                    %% Transfer ownership to handler
+                    quic:set_owner(ConnRef, HandlerPid)
             end,
 
             {ok, ConnPid};

@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="x-ua-compatible" content="ie=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="generator" content="ExDoc v0.39.1">
+    <meta name="project" content="quic v0.5.1">
+
+
+    <title>quic_flow — quic v0.5.1</title>
+
+    <link rel="stylesheet" href="dist/html-erlang-7YNYEB7F.css" />
+
+    <script defer src="dist/sidebar_items-35C3BE0F.js"></script>
+    <script defer src="docs_config.js"></script>
+    <script defer src="dist/html-HBZYRXZS.js"></script>
+
+  </head>
+  <body>
+    <script>(()=>{var t="ex_doc:settings",e="dark";var o="dark",s="light";var E="sidebar_state",n="closed";var r="sidebar_width";var a="sidebar-open";var i=new URLSearchParams(window.location.search),S=i.get("theme")||JSON.parse(localStorage.getItem(t)||"{}").theme;(S===o||S!==s&&window.matchMedia("(prefers-color-scheme: dark)").matches)&&document.body.classList.add(e);var d=sessionStorage.getItem(E),A=d!==n&&!window.matchMedia(`screen and (max-width: ${768}px)`).matches;document.body.classList.toggle(a,A);var c=sessionStorage.getItem(r);c&&document.body.style.setProperty("--sidebarWidth",`${c}px`);var p=/(Macintosh|iPhone|iPad|iPod)/.test(window.navigator.userAgent);document.documentElement.classList.toggle("apple-os",p);})();
+</script>
+
+<div class="body-wrapper">
+
+<button id="sidebar-menu" class="sidebar-button sidebar-toggle" aria-label="toggle sidebar" aria-controls="sidebar">
+  <i class="ri-menu-line ri-lg" title="Collapse/expand sidebar"></i>
+</button>
+
+<nav id="sidebar" class="sidebar">
+
+  <div class="sidebar-header">
+    <div class="sidebar-projectInfo">
+
+      <div>
+        <a href="readme.html" class="sidebar-projectName" translate="no">
+quic
+        </a>
+        <div class="sidebar-projectVersion" translate="no">
+          v0.5.1
+        </div>
+      </div>
+    </div>
+    <ul id="sidebar-list-nav" class="sidebar-list-nav" role="tablist" data-extras=""></ul>
+  </div>
+</nav>
+
+<output role="status" id="toast"></output>
+
+<main class="content page-module" id="main" data-type="modules">
+  <div id="content" class="content-inner">
+    <div class="top-search">
+      <div class="search-settings">
+        <form class="search-bar" action="search.html">
+          <label class="search-label">
+            <span class="sr-only">Search documentation of quic</span>
+            <div class="search-input-wrapper">
+              <input name="q" type="text" class="search-input" placeholder="Press / to search" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+              <button type="button" tabindex="-1" class="search-close-button" aria-hidden="true">
+                <i class="ri-close-line ri-lg" title="Cancel search"></i>
+              </button>
+            </div>
+          </label>
+        </form>
+        <div class="autocomplete">
+        </div>
+        <div class="engine-selector" data-multiple="false">
+          <button type="button" class="engine-button" aria-label="Select search engine" aria-haspopup="true" aria-expanded="false">
+            <i class="ri-search-2-line" aria-hidden="true"></i>
+            <span class="engine-name">Default</span>
+            <i class="ri-arrow-down-s-line" aria-hidden="true"></i>
+          </button>
+          <div class="engine-dropdown" hidden role="menu">
+
+              <button type="button"
+                      class="engine-option"
+                      data-engine-url="search.html?q="
+                      role="menuitemradio"
+                      aria-checked="true">
+                <span class="name">Default</span>
+                <span class="help">In-browser search</span>
+              </button>
+
+          </div>
+        </div>
+        <button class="icon-settings display-settings">
+          <i class="ri-settings-3-line"></i>
+          <span class="sr-only">Settings</span>
+        </button>
+      </div>
+    </div>
+
+<div id="top-content">
+  <div class="heading-with-actions top-heading">
+    <h1>
+      <span translate="no">quic_flow</span> 
+      <small class="app-vsn" translate="no">(quic v0.5.1)</small>
+
+    </h1>
+
+      <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L24" title="View Source" class="icon-action" rel="help">
+        <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        <span class="sr-only">View Source</span>
+      </a>
+
+  </div>
+
+
+    <section id="moduledoc">
+<p>QUIC connection-level flow control implementation.</p><p>This module manages flow control at the connection level: - Tracking bytes sent against peer's MAX_DATA limit - Tracking bytes received against our MAX_DATA limit - Generating MAX_DATA frames when needed - Detecting when we're blocked by flow control</p><h3 id="module-flow-control-concepts" class="section-heading"><a href="#module-flow-control-concepts" class="hover-link"><i class="ri-link-m" aria-hidden="true"></i></a><span class="text"><a name="Flow_Control_Concepts">Flow Control Concepts</a></span></h3><p>- MAX_DATA: Maximum total bytes the peer can send - DATA_BLOCKED: Indicates sender is blocked by receiver's limit - Window: The difference between max_data and bytes received</p>
+    </section>
+
+</div>
+
+  <section id="summary" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#summary">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Summary</span>
+    </h1>
+<div class="summary-types summary">
+  <h2>
+    <a href="#types">Types</a>
+  </h2>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#t:flow_state/0" data-no-tooltip="" translate="no">flow_state/0</a>
+
+      </div>
+
+    </div>
+
+</div>
+<div class="summary-functions summary">
+  <h2>
+    <a href="#functions">Functions</a>
+  </h2>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#bytes_received/1" data-no-tooltip="" translate="no">bytes_received(Flow_state)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Get total bytes we've received.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#bytes_sent/1" data-no-tooltip="" translate="no">bytes_sent(Flow_state)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Get total bytes we've sent.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#can_send/2" data-no-tooltip="" translate="no">can_send(Flow_state, Size)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Check if we can send the specified number of bytes.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#generate_max_data/1" data-no-tooltip="" translate="no">generate_max_data(Flow_state)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Generate a new MAX_DATA value to send. Returns {NewMaxData, UpdatedState}.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#new/0" data-no-tooltip="" translate="no">new()</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Create a new flow control state.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#new/1" data-no-tooltip="" translate="no">new(Opts)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Create a new flow control state with options.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#on_data_received/2" data-no-tooltip="" translate="no">on_data_received(Flow_state, Size)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Record that we received data.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#on_data_sent/2" data-no-tooltip="" translate="no">on_data_sent(Flow_state, Size)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Record that we sent data. Returns {ok, NewState} or {blocked, NewState} if we hit the limit.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#on_max_data_received/2" data-no-tooltip="" translate="no">on_max_data_received(Flow_state, NewMax)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Process a MAX_DATA frame from peer. Updates our send limit.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#recv_limit/1" data-no-tooltip="" translate="no">recv_limit(Flow_state)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Get our current receive limit (our MAX_DATA).</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#recv_window/1" data-no-tooltip="" translate="no">recv_window(Flow_state)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Get available receive window.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#send_blocked/1" data-no-tooltip="" translate="no">send_blocked(Flow_state)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Check if we're currently blocked on send flow control.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#send_limit/1" data-no-tooltip="" translate="no">send_limit(Flow_state)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Get our current send limit (peer's MAX_DATA).</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#send_window/1" data-no-tooltip="" translate="no">send_window(Flow_state)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Get available send window.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#should_send_max_data/1" data-no-tooltip="" translate="no">should_send_max_data(Flow_state)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Check if we should send a MAX_DATA update. Returns true if we've consumed more than the threshold.</p></div>
+
+    </div>
+
+</div>
+
+  </section>
+
+
+  <section id="types" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#types">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Types</span>
+    </h1>
+
+    <div class="types-list">
+<section class="detail" id="t:flow_state/0">
+
+  <div class="detail-header">
+    <a href="#t:flow_state/0" class="detail-link" data-no-tooltip="" aria-label="Link to this opaque">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">flow_state/0</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L72" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-opaque</span> flow_state()</pre>
+
+      </div>
+
+
+  </section>
+</section>
+
+    </div>
+  </section>
+
+  <section id="functions" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#functions">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Functions</span>
+    </h1>
+
+    <div class="functions-list">
+<section class="detail" id="bytes_received/1">
+
+  <div class="detail-header">
+    <a href="#bytes_received/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">bytes_received(Flow_state)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L187" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> bytes_received(<a href="#t:flow_state/0">flow_state</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>().</pre>
+
+      </div>
+
+<p>Get total bytes we've received.</p>
+  </section>
+</section>
+<section class="detail" id="bytes_sent/1">
+
+  <div class="detail-header">
+    <a href="#bytes_sent/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">bytes_sent(Flow_state)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L183" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> bytes_sent(<a href="#t:flow_state/0">flow_state</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>().</pre>
+
+      </div>
+
+<p>Get total bytes we've sent.</p>
+  </section>
+</section>
+<section class="detail" id="can_send/2">
+
+  <div class="detail-header">
+    <a href="#can_send/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">can_send(Flow_state, Size)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L102" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> can_send(<a href="#t:flow_state/0">flow_state</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:boolean/0">boolean</a>().</pre>
+
+      </div>
+
+<p>Check if we can send the specified number of bytes.</p>
+  </section>
+</section>
+<section class="detail" id="generate_max_data/1">
+
+  <div class="detail-header">
+    <a href="#generate_max_data/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">generate_max_data(Flow_state)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L167" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> generate_max_data(<a href="#t:flow_state/0">flow_state</a>()) -> {<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), <a href="#t:flow_state/0">flow_state</a>()}.</pre>
+
+      </div>
+
+<p>Generate a new MAX_DATA value to send. Returns {NewMaxData, UpdatedState}.</p>
+  </section>
+</section>
+<section class="detail" id="new/0">
+
+  <div class="detail-header">
+    <a href="#new/0" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">new()</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L81" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> new() -> <a href="#t:flow_state/0">flow_state</a>().</pre>
+
+      </div>
+
+<p>Create a new flow control state.</p>
+  </section>
+</section>
+<section class="detail" id="new/1">
+
+  <div class="detail-header">
+    <a href="#new/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">new(Opts)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L86" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> new(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:map/0">map</a>()) -> <a href="#t:flow_state/0">flow_state</a>().</pre>
+
+      </div>
+
+<p>Create a new flow control state with options.</p>
+  </section>
+</section>
+<section class="detail" id="on_data_received/2">
+
+  <div class="detail-header">
+    <a href="#on_data_received/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">on_data_received(Flow_state, Size)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L141" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> on_data_received(<a href="#t:flow_state/0">flow_state</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()) ->
+                          {ok, <a href="#t:flow_state/0">flow_state</a>()} | {error, flow_control_error}.</pre>
+
+      </div>
+
+<p>Record that we received data.</p>
+  </section>
+</section>
+<section class="detail" id="on_data_sent/2">
+
+  <div class="detail-header">
+    <a href="#on_data_sent/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">on_data_sent(Flow_state, Size)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L109" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> on_data_sent(<a href="#t:flow_state/0">flow_state</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()) -> {ok | blocked, <a href="#t:flow_state/0">flow_state</a>()}.</pre>
+
+      </div>
+
+<p>Record that we sent data. Returns {ok, NewState} or {blocked, NewState} if we hit the limit.</p>
+  </section>
+</section>
+<section class="detail" id="on_max_data_received/2">
+
+  <div class="detail-header">
+    <a href="#on_max_data_received/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">on_max_data_received(Flow_state, NewMax)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L122" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> on_max_data_received(<a href="#t:flow_state/0">flow_state</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()) -> <a href="#t:flow_state/0">flow_state</a>().</pre>
+
+      </div>
+
+<p>Process a MAX_DATA frame from peer. Updates our send limit.</p>
+  </section>
+</section>
+<section class="detail" id="recv_limit/1">
+
+  <div class="detail-header">
+    <a href="#recv_limit/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">recv_limit(Flow_state)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L195" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> recv_limit(<a href="#t:flow_state/0">flow_state</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>().</pre>
+
+      </div>
+
+<p>Get our current receive limit (our MAX_DATA).</p>
+  </section>
+</section>
+<section class="detail" id="recv_window/1">
+
+  <div class="detail-header">
+    <a href="#recv_window/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">recv_window(Flow_state)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L204" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> recv_window(<a href="#t:flow_state/0">flow_state</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>().</pre>
+
+      </div>
+
+<p>Get available receive window.</p>
+  </section>
+</section>
+<section class="detail" id="send_blocked/1">
+
+  <div class="detail-header">
+    <a href="#send_blocked/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">send_blocked(Flow_state)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L132" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> send_blocked(<a href="#t:flow_state/0">flow_state</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:boolean/0">boolean</a>().</pre>
+
+      </div>
+
+<p>Check if we're currently blocked on send flow control.</p>
+  </section>
+</section>
+<section class="detail" id="send_limit/1">
+
+  <div class="detail-header">
+    <a href="#send_limit/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">send_limit(Flow_state)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L191" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> send_limit(<a href="#t:flow_state/0">flow_state</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>().</pre>
+
+      </div>
+
+<p>Get our current send limit (peer's MAX_DATA).</p>
+  </section>
+</section>
+<section class="detail" id="send_window/1">
+
+  <div class="detail-header">
+    <a href="#send_window/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">send_window(Flow_state)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L199" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> send_window(<a href="#t:flow_state/0">flow_state</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>().</pre>
+
+      </div>
+
+<p>Get available send window.</p>
+  </section>
+</section>
+<section class="detail" id="should_send_max_data/1">
+
+  <div class="detail-header">
+    <a href="#should_send_max_data/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">should_send_max_data(Flow_state)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_flow.erl#L154" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> should_send_max_data(<a href="#t:flow_state/0">flow_state</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:boolean/0">boolean</a>().</pre>
+
+      </div>
+
+<p>Check if we should send a MAX_DATA update. Returns true if we've consumed more than the threshold.</p>
+  </section>
+</section>
+
+    </div>
+  </section>
+
+    <footer class="footer">
+      <p>
+
+          <span class="line">
+            <a href="https://hex.pm/packages/quic/0.5.1" class="footer-hex-package">Hex Package</a>
+
+            <a href="https://preview.hex.pm/preview/quic/0.5.1">Hex Preview</a>
+
+          </span>
+
+        <span class="line">
+          <button class="a-main footer-button display-quick-switch" title="Search HexDocs packages">
+            Search HexDocs
+          </button>
+
+            <a href="quic.epub" title="ePub version">
+              Download ePub version
+            </a>
+
+        </span>
+      </p>
+
+      <p class="built-using">
+        Built using
+        <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener" translate="no">ExDoc</a> (v0.39.1) for the
+
+          <a href="https://erlang.org" title="Erlang" target="_blank" translate="no">Erlang programming language</a>
+
+      </p>
+
+    </footer>
+  </div>
+</main>
+</div>
+
+  </body>
+</html>

@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="x-ua-compatible" content="ie=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="generator" content="ExDoc v0.39.1">
+    <meta name="project" content="quic v0.5.1">
+
+
+    <title>quic_tls — quic v0.5.1</title>
+
+    <link rel="stylesheet" href="dist/html-erlang-7YNYEB7F.css" />
+
+    <script defer src="dist/sidebar_items-35C3BE0F.js"></script>
+    <script defer src="docs_config.js"></script>
+    <script defer src="dist/html-HBZYRXZS.js"></script>
+
+  </head>
+  <body>
+    <script>(()=>{var t="ex_doc:settings",e="dark";var o="dark",s="light";var E="sidebar_state",n="closed";var r="sidebar_width";var a="sidebar-open";var i=new URLSearchParams(window.location.search),S=i.get("theme")||JSON.parse(localStorage.getItem(t)||"{}").theme;(S===o||S!==s&&window.matchMedia("(prefers-color-scheme: dark)").matches)&&document.body.classList.add(e);var d=sessionStorage.getItem(E),A=d!==n&&!window.matchMedia(`screen and (max-width: ${768}px)`).matches;document.body.classList.toggle(a,A);var c=sessionStorage.getItem(r);c&&document.body.style.setProperty("--sidebarWidth",`${c}px`);var p=/(Macintosh|iPhone|iPad|iPod)/.test(window.navigator.userAgent);document.documentElement.classList.toggle("apple-os",p);})();
+</script>
+
+<div class="body-wrapper">
+
+<button id="sidebar-menu" class="sidebar-button sidebar-toggle" aria-label="toggle sidebar" aria-controls="sidebar">
+  <i class="ri-menu-line ri-lg" title="Collapse/expand sidebar"></i>
+</button>
+
+<nav id="sidebar" class="sidebar">
+
+  <div class="sidebar-header">
+    <div class="sidebar-projectInfo">
+
+      <div>
+        <a href="readme.html" class="sidebar-projectName" translate="no">
+quic
+        </a>
+        <div class="sidebar-projectVersion" translate="no">
+          v0.5.1
+        </div>
+      </div>
+    </div>
+    <ul id="sidebar-list-nav" class="sidebar-list-nav" role="tablist" data-extras=""></ul>
+  </div>
+</nav>
+
+<output role="status" id="toast"></output>
+
+<main class="content page-module" id="main" data-type="modules">
+  <div id="content" class="content-inner">
+    <div class="top-search">
+      <div class="search-settings">
+        <form class="search-bar" action="search.html">
+          <label class="search-label">
+            <span class="sr-only">Search documentation of quic</span>
+            <div class="search-input-wrapper">
+              <input name="q" type="text" class="search-input" placeholder="Press / to search" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+              <button type="button" tabindex="-1" class="search-close-button" aria-hidden="true">
+                <i class="ri-close-line ri-lg" title="Cancel search"></i>
+              </button>
+            </div>
+          </label>
+        </form>
+        <div class="autocomplete">
+        </div>
+        <div class="engine-selector" data-multiple="false">
+          <button type="button" class="engine-button" aria-label="Select search engine" aria-haspopup="true" aria-expanded="false">
+            <i class="ri-search-2-line" aria-hidden="true"></i>
+            <span class="engine-name">Default</span>
+            <i class="ri-arrow-down-s-line" aria-hidden="true"></i>
+          </button>
+          <div class="engine-dropdown" hidden role="menu">
+
+              <button type="button"
+                      class="engine-option"
+                      data-engine-url="search.html?q="
+                      role="menuitemradio"
+                      aria-checked="true">
+                <span class="name">Default</span>
+                <span class="help">In-browser search</span>
+              </button>
+
+          </div>
+        </div>
+        <button class="icon-settings display-settings">
+          <i class="ri-settings-3-line"></i>
+          <span class="sr-only">Settings</span>
+        </button>
+      </div>
+    </div>
+
+<div id="top-content">
+  <div class="heading-with-actions top-heading">
+    <h1>
+      <span translate="no">quic_tls</span> 
+      <small class="app-vsn" translate="no">(quic v0.5.1)</small>
+
+    </h1>
+
+      <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L22" title="View Source" class="icon-action" rel="help">
+        <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        <span class="sr-only">View Source</span>
+      </a>
+
+  </div>
+
+
+    <section id="moduledoc">
+<p>TLS 1.3 message generation and parsing for QUIC.</p><p>This module handles TLS 1.3 handshake messages as they appear in QUIC CRYPTO frames. Messages are encoded without the TLS record layer.</p><h3 id="module-tls-messages-in-quic" class="section-heading"><a href="#module-tls-messages-in-quic" class="hover-link"><i class="ri-link-m" aria-hidden="true"></i></a><span class="text"><a name="TLS_Messages_in_QUIC">TLS Messages in QUIC</a></span></h3><p>QUIC uses TLS 1.3 for the cryptographic handshake, but without the TLS record layer. TLS handshake messages are sent directly in CRYPTO frames.</p>
+    </section>
+
+</div>
+
+  <section id="summary" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#summary">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Summary</span>
+    </h1>
+<div class="summary-functions summary">
+  <h2>
+    <a href="#functions">Functions</a>
+  </h2>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#build_certificate/2" data-no-tooltip="" translate="no">build_certificate(Context, Certs)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Build Certificate message. Certs is a list of DER-encoded certificates (server cert first).</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#build_certificate_verify/3" data-no-tooltip="" translate="no">build_certificate_verify(SignatureAlgorithm, PrivateKey, TranscriptHash)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Build CertificateVerify message. PrivateKey is the server's private key. TranscriptHash is the hash of all handshake messages up to (not including) CertificateVerify.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#build_client_hello/1" data-no-tooltip="" translate="no">build_client_hello(Opts)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Build a TLS 1.3 ClientHello message for QUIC. Options: - server_name: SNI hostname (binary) - alpn: List of ALPN protocols (list of binaries) - transport_params: QUIC transport parameters (map)</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#build_encrypted_extensions/1" data-no-tooltip="" translate="no">build_encrypted_extensions(Opts)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Build EncryptedExtensions message. Options: - alpn: Selected ALPN protocol - transport_params: QUIC transport parameters</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#build_finished/1" data-no-tooltip="" translate="no">build_finished(VerifyData)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Build a Finished message. VerifyData should be computed using quic_crypto:compute_finished_verify/2.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#build_server_hello/1" data-no-tooltip="" translate="no">build_server_hello(Opts)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Build a ServerHello message. Options: - random: Server random (32 bytes, generated if not provided) - session_id: Legacy session ID to echo - cipher_suite: Selected cipher suite - key_share: Server's public key</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#decode_handshake_message/1" data-no-tooltip="" translate="no">decode_handshake_message(_)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Decode a TLS handshake message. Returns {Type, Body, Rest} or {error, Reason}.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#decode_transport_params/1" data-no-tooltip="" translate="no">decode_transport_params(Data)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Decode QUIC transport parameters.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#encode_handshake_message/2" data-no-tooltip="" translate="no">encode_handshake_message(Type, Body)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Encode a TLS handshake message with type and length.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#encode_transport_params/1" data-no-tooltip="" translate="no">encode_transport_params(Params)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Encode QUIC transport parameters. Params is a map with keys like: original_dcid, max_idle_timeout, max_udp_payload_size, initial_max_data, initial_max_stream_data_bidi_local, etc.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#parse_certificate/1" data-no-tooltip="" translate="no">parse_certificate(_)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Parse Certificate message.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#parse_certificate_verify/1" data-no-tooltip="" translate="no">parse_certificate_verify(_)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Parse CertificateVerify message.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#parse_client_hello/1" data-no-tooltip="" translate="no">parse_client_hello(_)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Parse a ClientHello message. Returns a map with: - random: 32-byte client random - session_id: Legacy session ID - cipher_suites: List of cipher suites offered - extensions: Map of extensions - key_share: Client's public key for key exchange - server_name: SNI hostname (if present) - alpn_protocols: List of ALPN protocols (if present) - transport_params: QUIC transport parameters (if present)</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#parse_encrypted_extensions/1" data-no-tooltip="" translate="no">parse_encrypted_extensions(_)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Parse EncryptedExtensions message.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#parse_finished/1" data-no-tooltip="" translate="no">parse_finished(VerifyData)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Parse Finished message.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#parse_server_hello/1" data-no-tooltip="" translate="no">parse_server_hello(_)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Parse a ServerHello message. Returns server's public key and selected cipher suite.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#verify_finished/3" data-no-tooltip="" translate="no">verify_finished(ReceivedVerifyData, TrafficSecret, TranscriptHash)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Verify a Finished message (default SHA-256). TrafficSecret is the sender's traffic secret. TranscriptHash is the hash of all messages up to (but not including) Finished.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#verify_finished/4" data-no-tooltip="" translate="no">verify_finished(ReceivedVerifyData, TrafficSecret, TranscriptHash, Cipher)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Verify a Finished message with cipher-specific hash.</p></div>
+
+    </div>
+
+</div>
+
+  </section>
+
+
+  <section id="functions" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#functions">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Functions</span>
+    </h1>
+
+    <div class="functions-list">
+<section class="detail" id="build_certificate/2">
+
+  <div class="detail-header">
+    <a href="#build_certificate/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">build_certificate(Context, Certs)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L595" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> build_certificate(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), [<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()]) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Build Certificate message. Certs is a list of DER-encoded certificates (server cert first).</p>
+  </section>
+</section>
+<section class="detail" id="build_certificate_verify/3">
+
+  <div class="detail-header">
+    <a href="#build_certificate_verify/3" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">build_certificate_verify(SignatureAlgorithm, PrivateKey, TranscriptHash)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L606" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> build_certificate_verify(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), <a href="https://www.erlang.org/doc/apps/crypto/crypto.html#t:key_id/0">crypto:key_id</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Build CertificateVerify message. PrivateKey is the server's private key. TranscriptHash is the hash of all handshake messages up to (not including) CertificateVerify.</p>
+  </section>
+</section>
+<section class="detail" id="build_client_hello/1">
+
+  <div class="detail-header">
+    <a href="#build_client_hello/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">build_client_hello(Opts)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L70" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> build_client_hello(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:map/0">map</a>()) -> {<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()}.</pre>
+
+      </div>
+
+<p>Build a TLS 1.3 ClientHello message for QUIC. Options: - server_name: SNI hostname (binary) - alpn: List of ALPN protocols (list of binaries) - transport_params: QUIC transport parameters (map)</p><p>Returns: {ClientHelloMsg, PrivateKey, Random}</p>
+  </section>
+</section>
+<section class="detail" id="build_encrypted_extensions/1">
+
+  <div class="detail-header">
+    <a href="#build_encrypted_extensions/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">build_encrypted_extensions(Opts)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L586" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> build_encrypted_extensions(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:map/0">map</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Build EncryptedExtensions message. Options: - alpn: Selected ALPN protocol - transport_params: QUIC transport parameters</p>
+  </section>
+</section>
+<section class="detail" id="build_finished/1">
+
+  <div class="detail-header">
+    <a href="#build_finished/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">build_finished(VerifyData)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L295" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> build_finished(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Build a Finished message. VerifyData should be computed using quic_crypto:compute_finished_verify/2.</p>
+  </section>
+</section>
+<section class="detail" id="build_server_hello/1">
+
+  <div class="detail-header">
+    <a href="#build_server_hello/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">build_server_hello(Opts)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L546" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> build_server_hello(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:map/0">map</a>()) -> {<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()}.</pre>
+
+      </div>
+
+<p>Build a ServerHello message. Options: - random: Server random (32 bytes, generated if not provided) - session_id: Legacy session ID to echo - cipher_suite: Selected cipher suite - key_share: Server's public key</p>
+  </section>
+</section>
+<section class="detail" id="decode_handshake_message/1">
+
+  <div class="detail-header">
+    <a href="#decode_handshake_message/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">decode_handshake_message(_)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L432" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> decode_handshake_message(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) ->
+                                  {ok, {<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()}, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}.</pre>
+
+      </div>
+
+<p>Decode a TLS handshake message. Returns {Type, Body, Rest} or {error, Reason}.</p>
+  </section>
+</section>
+<section class="detail" id="decode_transport_params/1">
+
+  <div class="detail-header">
+    <a href="#decode_transport_params/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">decode_transport_params(Data)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L370" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> decode_transport_params(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) -> {ok, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:map/0">map</a>()} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}.</pre>
+
+      </div>
+
+<p>Decode QUIC transport parameters.</p>
+  </section>
+</section>
+<section class="detail" id="encode_handshake_message/2">
+
+  <div class="detail-header">
+    <a href="#encode_handshake_message/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">encode_handshake_message(Type, Body)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L423" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> encode_handshake_message(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Encode a TLS handshake message with type and length.</p>
+  </section>
+</section>
+<section class="detail" id="encode_transport_params/1">
+
+  <div class="detail-header">
+    <a href="#encode_transport_params/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">encode_transport_params(Params)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L323" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> encode_transport_params(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:map/0">map</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Encode QUIC transport parameters. Params is a map with keys like: original_dcid, max_idle_timeout, max_udp_payload_size, initial_max_data, initial_max_stream_data_bidi_local, etc.</p>
+  </section>
+</section>
+<section class="detail" id="parse_certificate/1">
+
+  <div class="detail-header">
+    <a href="#parse_certificate/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">parse_certificate(_)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L257" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> parse_certificate(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) ->
+                           {ok, #{context := <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), certificates := [<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()]}} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}.</pre>
+
+      </div>
+
+<p>Parse Certificate message.</p>
+  </section>
+</section>
+<section class="detail" id="parse_certificate_verify/1">
+
+  <div class="detail-header">
+    <a href="#parse_certificate_verify/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">parse_certificate_verify(_)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L274" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> parse_certificate_verify(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) ->
+                                  {ok, #{algorithm := <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), signature := <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()}} |
+                                  {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}.</pre>
+
+      </div>
+
+<p>Parse CertificateVerify message.</p>
+  </section>
+</section>
+<section class="detail" id="parse_client_hello/1">
+
+  <div class="detail-header">
+    <a href="#parse_client_hello/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">parse_client_hello(_)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L484" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> parse_client_hello(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) -> {ok, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:map/0">map</a>()} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}.</pre>
+
+      </div>
+
+<p>Parse a ClientHello message. Returns a map with: - random: 32-byte client random - session_id: Legacy session ID - cipher_suites: List of cipher suites offered - extensions: Map of extensions - key_share: Client's public key for key exchange - server_name: SNI hostname (if present) - alpn_protocols: List of ALPN protocols (if present) - transport_params: QUIC transport parameters (if present)</p>
+  </section>
+</section>
+<section class="detail" id="parse_encrypted_extensions/1">
+
+  <div class="detail-header">
+    <a href="#parse_encrypted_extensions/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">parse_encrypted_extensions(_)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L228" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> parse_encrypted_extensions(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) ->
+                                    {ok, #{alpn => <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), transport_params => <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:map/0">map</a>()}} |
+                                    {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}.</pre>
+
+      </div>
+
+<p>Parse EncryptedExtensions message.</p>
+  </section>
+</section>
+<section class="detail" id="parse_finished/1">
+
+  <div class="detail-header">
+    <a href="#parse_finished/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">parse_finished(VerifyData)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L281" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> parse_finished(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) -> {ok, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}.</pre>
+
+      </div>
+
+<p>Parse Finished message.</p>
+  </section>
+</section>
+<section class="detail" id="parse_server_hello/1">
+
+  <div class="detail-header">
+    <a href="#parse_server_hello/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">parse_server_hello(_)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L186" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> parse_server_hello(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) ->
+                            {ok, #{public_key := <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), cipher := <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:atom/0">atom</a>(), random := <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()}} |
+                            {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}.</pre>
+
+      </div>
+
+<p>Parse a ServerHello message. Returns server's public key and selected cipher suite.</p>
+  </section>
+</section>
+<section class="detail" id="verify_finished/3">
+
+  <div class="detail-header">
+    <a href="#verify_finished/3" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">verify_finished(ReceivedVerifyData, TrafficSecret, TranscriptHash)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L302" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> verify_finished(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:boolean/0">boolean</a>().</pre>
+
+      </div>
+
+<p>Verify a Finished message (default SHA-256). TrafficSecret is the sender's traffic secret. TranscriptHash is the hash of all messages up to (but not including) Finished.</p>
+  </section>
+</section>
+<section class="detail" id="verify_finished/4">
+
+  <div class="detail-header">
+    <a href="#verify_finished/4" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">verify_finished(ReceivedVerifyData, TrafficSecret, TranscriptHash, Cipher)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_tls.erl#L309" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> verify_finished(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:atom/0">atom</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:boolean/0">boolean</a>().</pre>
+
+      </div>
+
+<p>Verify a Finished message with cipher-specific hash.</p>
+  </section>
+</section>
+
+    </div>
+  </section>
+
+    <footer class="footer">
+      <p>
+
+          <span class="line">
+            <a href="https://hex.pm/packages/quic/0.5.1" class="footer-hex-package">Hex Package</a>
+
+            <a href="https://preview.hex.pm/preview/quic/0.5.1">Hex Preview</a>
+
+          </span>
+
+        <span class="line">
+          <button class="a-main footer-button display-quick-switch" title="Search HexDocs packages">
+            Search HexDocs
+          </button>
+
+            <a href="quic.epub" title="ePub version">
+              Download ePub version
+            </a>
+
+        </span>
+      </p>
+
+      <p class="built-using">
+        Built using
+        <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener" translate="no">ExDoc</a> (v0.39.1) for the
+
+          <a href="https://erlang.org" title="Erlang" target="_blank" translate="no">Erlang programming language</a>
+
+      </p>
+
+    </footer>
+  </div>
+</main>
+</div>
+
+  </body>
+</html>

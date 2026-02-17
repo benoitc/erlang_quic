@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="x-ua-compatible" content="ie=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="generator" content="ExDoc v0.39.1">
+    <meta name="project" content="quic v0.5.1">
+
+
+    <title>quic — quic v0.5.1</title>
+
+    <link rel="stylesheet" href="dist/html-erlang-7YNYEB7F.css" />
+
+    <script defer src="dist/sidebar_items-35C3BE0F.js"></script>
+    <script defer src="docs_config.js"></script>
+    <script defer src="dist/html-HBZYRXZS.js"></script>
+
+  </head>
+  <body>
+    <script>(()=>{var t="ex_doc:settings",e="dark";var o="dark",s="light";var E="sidebar_state",n="closed";var r="sidebar_width";var a="sidebar-open";var i=new URLSearchParams(window.location.search),S=i.get("theme")||JSON.parse(localStorage.getItem(t)||"{}").theme;(S===o||S!==s&&window.matchMedia("(prefers-color-scheme: dark)").matches)&&document.body.classList.add(e);var d=sessionStorage.getItem(E),A=d!==n&&!window.matchMedia(`screen and (max-width: ${768}px)`).matches;document.body.classList.toggle(a,A);var c=sessionStorage.getItem(r);c&&document.body.style.setProperty("--sidebarWidth",`${c}px`);var p=/(Macintosh|iPhone|iPad|iPod)/.test(window.navigator.userAgent);document.documentElement.classList.toggle("apple-os",p);})();
+</script>
+
+<div class="body-wrapper">
+
+<button id="sidebar-menu" class="sidebar-button sidebar-toggle" aria-label="toggle sidebar" aria-controls="sidebar">
+  <i class="ri-menu-line ri-lg" title="Collapse/expand sidebar"></i>
+</button>
+
+<nav id="sidebar" class="sidebar">
+
+  <div class="sidebar-header">
+    <div class="sidebar-projectInfo">
+
+      <div>
+        <a href="readme.html" class="sidebar-projectName" translate="no">
+quic
+        </a>
+        <div class="sidebar-projectVersion" translate="no">
+          v0.5.1
+        </div>
+      </div>
+    </div>
+    <ul id="sidebar-list-nav" class="sidebar-list-nav" role="tablist" data-extras=""></ul>
+  </div>
+</nav>
+
+<output role="status" id="toast"></output>
+
+<main class="content page-module" id="main" data-type="modules">
+  <div id="content" class="content-inner">
+    <div class="top-search">
+      <div class="search-settings">
+        <form class="search-bar" action="search.html">
+          <label class="search-label">
+            <span class="sr-only">Search documentation of quic</span>
+            <div class="search-input-wrapper">
+              <input name="q" type="text" class="search-input" placeholder="Press / to search" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+              <button type="button" tabindex="-1" class="search-close-button" aria-hidden="true">
+                <i class="ri-close-line ri-lg" title="Cancel search"></i>
+              </button>
+            </div>
+          </label>
+        </form>
+        <div class="autocomplete">
+        </div>
+        <div class="engine-selector" data-multiple="false">
+          <button type="button" class="engine-button" aria-label="Select search engine" aria-haspopup="true" aria-expanded="false">
+            <i class="ri-search-2-line" aria-hidden="true"></i>
+            <span class="engine-name">Default</span>
+            <i class="ri-arrow-down-s-line" aria-hidden="true"></i>
+          </button>
+          <div class="engine-dropdown" hidden role="menu">
+
+              <button type="button"
+                      class="engine-option"
+                      data-engine-url="search.html?q="
+                      role="menuitemradio"
+                      aria-checked="true">
+                <span class="name">Default</span>
+                <span class="help">In-browser search</span>
+              </button>
+
+          </div>
+        </div>
+        <button class="icon-settings display-settings">
+          <i class="ri-settings-3-line"></i>
+          <span class="sr-only">Settings</span>
+        </button>
+      </div>
+    </div>
+
+<div id="top-content">
+  <div class="heading-with-actions top-heading">
+    <h1>
+      <span translate="no">quic</span> 
+      <small class="app-vsn" translate="no">(quic v0.5.1)</small>
+
+    </h1>
+
+      <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L32" title="View Source" class="icon-action" rel="help">
+        <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        <span class="sr-only">View Source</span>
+      </a>
+
+  </div>
+
+
+    <section id="moduledoc">
+<p>QUIC public API.</p><p>This module provides the public interface for QUIC connections. The API is compatible with hackney_quic for drop-in replacement.</p><h3 id="module-messages" class="section-heading"><a href="#module-messages" class="hover-link"><i class="ri-link-m" aria-hidden="true"></i></a><span class="text"><a name="Messages">Messages</a></span></h3><p>Messages sent to owner process:</p><ul><li><code>{quic, ConnRef, {connected, Info}}</code> - Connection established</li><li><code>{quic, ConnRef, {stream_opened, StreamId}}</code> - Stream opened</li><li><code>{quic, ConnRef, {closed, Reason}}</code> - Connection closed</li><li><code>{quic, ConnRef, {transport_error, Code, Reason}}</code> - Transport error</li><li><code>{quic, ConnRef, {stream_data, StreamId, Bin, Fin}}</code> - Data received</li><li><code>{quic, ConnRef, {stream_reset, StreamId, ErrorCode}}</code> - Stream reset</li><li><code>{quic, ConnRef, {stop_sending, StreamId, ErrorCode}}</code> - Stop sending</li><li><code>{quic, ConnRef, {goaway, LastStreamId, ErrorCode, Debug}}</code> - GoAway received</li><li><code>{quic, ConnRef, {session_ticket, Ticket}}</code> - Session ticket for 0-RTT</li><li><code>{quic, ConnRef, {send_ready, StreamId}}</code> - Stream ready to write</li><li><code>{quic, ConnRef, {timer, NextTimeoutMs}}</code> - Timer notification</li></ul>
+    </section>
+
+</div>
+
+  <section id="summary" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#summary">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Summary</span>
+    </h1>
+<div class="summary-functions summary">
+  <h2>
+    <a href="#functions">Functions</a>
+  </h2>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#close/2" data-no-tooltip="" translate="no">close(ConnRef, Reason)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Close a QUIC connection.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#connect/4" data-no-tooltip="" translate="no">connect(Host, Port, Opts, Owner)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Connect to a QUIC server. Returns {ok, ConnRef} on success where ConnRef is a reference(). The owner process will receive {quic, ConnRef, {connected, Info}} when the connection is established.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#get_fd/1" data-no-tooltip="" translate="no">get_fd(Socket)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Get the file descriptor from a gen_udp socket. This can be used to pass an existing UDP socket to connect/4 via the <code>socket_fd</code> option.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#handle_timeout/2" data-no-tooltip="" translate="no">handle_timeout(ConnRef, NowMs)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Handle connection timeout. Should be called when timer expires. Returns next timeout in ms or 'infinity'.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#is_available/0" data-no-tooltip="" translate="no">is_available()</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Check if QUIC support is available. Always returns true for pure Erlang implementation.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#open_stream/1" data-no-tooltip="" translate="no">open_stream(ConnRef)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Open a new bidirectional stream. Returns {ok, StreamId} on success.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#open_unidirectional_stream/1" data-no-tooltip="" translate="no">open_unidirectional_stream(ConnRef)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Open a new unidirectional stream. Returns {ok, StreamId} on success. Unidirectional streams are send-only for the initiator.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#peername/1" data-no-tooltip="" translate="no">peername(ConnRef)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Get the remote address of the connection.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#process/1" data-no-tooltip="" translate="no">process(ConnRef)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Process pending QUIC events. This is called automatically by the connection process. Returns the next timeout in milliseconds, or 'infinity'.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#reset_stream/3" data-no-tooltip="" translate="no">reset_stream(ConnRef, StreamId, ErrorCode)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Reset a stream with an error code.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#send_data/4" data-no-tooltip="" translate="no">send_data(ConnRef, StreamId, Data, Fin)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Send data on a stream. Fin indicates if this is the final frame on the stream.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#setopts/2" data-no-tooltip="" translate="no">setopts(ConnRef, Opts)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Set connection options.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#sockname/1" data-no-tooltip="" translate="no">sockname(ConnRef)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Get the local address of the connection.</p></div>
+
+    </div>
+
+</div>
+
+  </section>
+
+
+  <section id="functions" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#functions">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Functions</span>
+    </h1>
+
+    <div class="functions-list">
+<section class="detail" id="close/2">
+
+  <div class="detail-header">
+    <a href="#close/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">close(ConnRef, Reason)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L117" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> close(ConnRef, Reason) -> ok when ConnRef :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>(), Reason :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>().</pre>
+
+      </div>
+
+<p>Close a QUIC connection.</p>
+  </section>
+</section>
+<section class="detail" id="connect/4">
+
+  <div class="detail-header">
+    <a href="#connect/4" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">connect(Host, Port, Opts, Owner)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L98" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> connect(Host, Port, Opts, Owner) -> {ok, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>()} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}
+                 when
+                     Host :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:string/0">string</a>(),
+                     Port :: <a href="https://www.erlang.org/doc/apps/kernel/inet.html#t:port_number/0">inet:port_number</a>(),
+                     Opts :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:map/0">map</a>(),
+                     Owner :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>().</pre>
+
+      </div>
+
+<p>Connect to a QUIC server. Returns {ok, ConnRef} on success where ConnRef is a reference(). The owner process will receive {quic, ConnRef, {connected, Info}} when the connection is established.</p><p>Options:</p><ul><li><code>socket_fd</code> - Use an existing UDP socket FD (see <a href="#get_fd/1"><code>get_fd/1</code></a>)</li><li><code>verify</code> - Verify server certificate (default: false)</li><li><code>alpn</code> - ALPN protocols (default: [&lt;&lt;&quot;h3&quot;&gt;&gt;])</li><li><code>sni</code> - Server Name Indication (default: Host)</li></ul>
+  </section>
+</section>
+<section class="detail" id="get_fd/1">
+
+  <div class="detail-header">
+    <a href="#get_fd/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">get_fd(Socket)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L75" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> get_fd(<a href="https://www.erlang.org/doc/apps/kernel/gen_udp.html#t:socket/0">gen_udp:socket</a>()) -> {ok, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:integer/0">integer</a>()} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}.</pre>
+
+      </div>
+
+<p>Get the file descriptor from a gen_udp socket. This can be used to pass an existing UDP socket to connect/4 via the <code>socket_fd</code> option.</p>
+  </section>
+</section>
+<section class="detail" id="handle_timeout/2">
+
+  <div class="detail-header">
+    <a href="#handle_timeout/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">handle_timeout(ConnRef, NowMs)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L188" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> handle_timeout(ConnRef, NowMs) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>() | infinity
+                        when ConnRef :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>(), NowMs :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>().</pre>
+
+      </div>
+
+<p>Handle connection timeout. Should be called when timer expires. Returns next timeout in ms or 'infinity'.</p>
+  </section>
+</section>
+<section class="detail" id="is_available/0">
+
+  <div class="detail-header">
+    <a href="#is_available/0" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">is_available()</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L57" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> is_available() -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:boolean/0">boolean</a>().</pre>
+
+      </div>
+
+<p>Check if QUIC support is available. Always returns true for pure Erlang implementation.</p>
+  </section>
+</section>
+<section class="detail" id="open_stream/1">
+
+  <div class="detail-header">
+    <a href="#open_stream/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">open_stream(ConnRef)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L129" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> open_stream(ConnRef) -> {ok, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}
+                     when ConnRef :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>().</pre>
+
+      </div>
+
+<p>Open a new bidirectional stream. Returns {ok, StreamId} on success.</p>
+  </section>
+</section>
+<section class="detail" id="open_unidirectional_stream/1">
+
+  <div class="detail-header">
+    <a href="#open_unidirectional_stream/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">open_unidirectional_stream(ConnRef)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L142" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> open_unidirectional_stream(ConnRef) -> {ok, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}
+                                    when ConnRef :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>().</pre>
+
+      </div>
+
+<p>Open a new unidirectional stream. Returns {ok, StreamId} on success. Unidirectional streams are send-only for the initiator.</p>
+  </section>
+</section>
+<section class="detail" id="peername/1">
+
+  <div class="detail-header">
+    <a href="#peername/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">peername(ConnRef)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L214" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> peername(ConnRef) -> {ok, {<a href="https://www.erlang.org/doc/apps/kernel/inet.html#t:ip_address/0">inet:ip_address</a>(), <a href="https://www.erlang.org/doc/apps/kernel/inet.html#t:port_number/0">inet:port_number</a>()}} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}
+                  when ConnRef :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>().</pre>
+
+      </div>
+
+<p>Get the remote address of the connection.</p>
+  </section>
+</section>
+<section class="detail" id="process/1">
+
+  <div class="detail-header">
+    <a href="#process/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">process(ConnRef)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L203" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> process(ConnRef) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>() | infinity when ConnRef :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>().</pre>
+
+      </div>
+
+<p>Process pending QUIC events. This is called automatically by the connection process. Returns the next timeout in milliseconds, or 'infinity'.</p>
+  </section>
+</section>
+<section class="detail" id="reset_stream/3">
+
+  <div class="detail-header">
+    <a href="#reset_stream/3" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">reset_stream(ConnRef, StreamId, ErrorCode)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L172" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> reset_stream(ConnRef, StreamId, ErrorCode) -> ok | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}
+                      when
+                          ConnRef :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>(),
+                          StreamId :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                          ErrorCode :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>().</pre>
+
+      </div>
+
+<p>Reset a stream with an error code.</p>
+  </section>
+</section>
+<section class="detail" id="send_data/4">
+
+  <div class="detail-header">
+    <a href="#send_data/4" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">send_data(ConnRef, StreamId, Data, Fin)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L157" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> send_data(ConnRef, StreamId, Data, Fin) -> ok | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}
+                   when
+                       ConnRef :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>(),
+                       StreamId :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                       Data :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:iodata/0">iodata</a>(),
+                       Fin :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:boolean/0">boolean</a>().</pre>
+
+      </div>
+
+<p>Send data on a stream. Fin indicates if this is the final frame on the stream.</p>
+  </section>
+</section>
+<section class="detail" id="setopts/2">
+
+  <div class="detail-header">
+    <a href="#setopts/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">setopts(ConnRef, Opts)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L237" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> setopts(ConnRef, Opts) -> ok | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}
+                 when ConnRef :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>(), Opts :: [{<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:atom/0">atom</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}].</pre>
+
+      </div>
+
+<p>Set connection options.</p>
+  </section>
+</section>
+<section class="detail" id="sockname/1">
+
+  <div class="detail-header">
+    <a href="#sockname/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">sockname(ConnRef)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic.erl#L225" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> sockname(ConnRef) -> {ok, {<a href="https://www.erlang.org/doc/apps/kernel/inet.html#t:ip_address/0">inet:ip_address</a>(), <a href="https://www.erlang.org/doc/apps/kernel/inet.html#t:port_number/0">inet:port_number</a>()}} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}
+                  when ConnRef :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:reference/0">reference</a>() | <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>().</pre>
+
+      </div>
+
+<p>Get the local address of the connection.</p>
+  </section>
+</section>
+
+    </div>
+  </section>
+
+    <footer class="footer">
+      <p>
+
+          <span class="line">
+            <a href="https://hex.pm/packages/quic/0.5.1" class="footer-hex-package">Hex Package</a>
+
+            <a href="https://preview.hex.pm/preview/quic/0.5.1">Hex Preview</a>
+
+          </span>
+
+        <span class="line">
+          <button class="a-main footer-button display-quick-switch" title="Search HexDocs packages">
+            Search HexDocs
+          </button>
+
+            <a href="quic.epub" title="ePub version">
+              Download ePub version
+            </a>
+
+        </span>
+      </p>
+
+      <p class="built-using">
+        Built using
+        <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener" translate="no">ExDoc</a> (v0.39.1) for the
+
+          <a href="https://erlang.org" title="Erlang" target="_blank" translate="no">Erlang programming language</a>
+
+      </p>
+
+    </footer>
+  </div>
+</main>
+</div>
+
+  </body>
+</html>

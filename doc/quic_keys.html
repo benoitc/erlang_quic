@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="x-ua-compatible" content="ie=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="generator" content="ExDoc v0.39.1">
+    <meta name="project" content="quic v0.5.1">
+
+
+    <title>quic_keys — quic v0.5.1</title>
+
+    <link rel="stylesheet" href="dist/html-erlang-7YNYEB7F.css" />
+
+    <script defer src="dist/sidebar_items-35C3BE0F.js"></script>
+    <script defer src="docs_config.js"></script>
+    <script defer src="dist/html-HBZYRXZS.js"></script>
+
+  </head>
+  <body>
+    <script>(()=>{var t="ex_doc:settings",e="dark";var o="dark",s="light";var E="sidebar_state",n="closed";var r="sidebar_width";var a="sidebar-open";var i=new URLSearchParams(window.location.search),S=i.get("theme")||JSON.parse(localStorage.getItem(t)||"{}").theme;(S===o||S!==s&&window.matchMedia("(prefers-color-scheme: dark)").matches)&&document.body.classList.add(e);var d=sessionStorage.getItem(E),A=d!==n&&!window.matchMedia(`screen and (max-width: ${768}px)`).matches;document.body.classList.toggle(a,A);var c=sessionStorage.getItem(r);c&&document.body.style.setProperty("--sidebarWidth",`${c}px`);var p=/(Macintosh|iPhone|iPad|iPod)/.test(window.navigator.userAgent);document.documentElement.classList.toggle("apple-os",p);})();
+</script>
+
+<div class="body-wrapper">
+
+<button id="sidebar-menu" class="sidebar-button sidebar-toggle" aria-label="toggle sidebar" aria-controls="sidebar">
+  <i class="ri-menu-line ri-lg" title="Collapse/expand sidebar"></i>
+</button>
+
+<nav id="sidebar" class="sidebar">
+
+  <div class="sidebar-header">
+    <div class="sidebar-projectInfo">
+
+      <div>
+        <a href="readme.html" class="sidebar-projectName" translate="no">
+quic
+        </a>
+        <div class="sidebar-projectVersion" translate="no">
+          v0.5.1
+        </div>
+      </div>
+    </div>
+    <ul id="sidebar-list-nav" class="sidebar-list-nav" role="tablist" data-extras=""></ul>
+  </div>
+</nav>
+
+<output role="status" id="toast"></output>
+
+<main class="content page-module" id="main" data-type="modules">
+  <div id="content" class="content-inner">
+    <div class="top-search">
+      <div class="search-settings">
+        <form class="search-bar" action="search.html">
+          <label class="search-label">
+            <span class="sr-only">Search documentation of quic</span>
+            <div class="search-input-wrapper">
+              <input name="q" type="text" class="search-input" placeholder="Press / to search" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+              <button type="button" tabindex="-1" class="search-close-button" aria-hidden="true">
+                <i class="ri-close-line ri-lg" title="Cancel search"></i>
+              </button>
+            </div>
+          </label>
+        </form>
+        <div class="autocomplete">
+        </div>
+        <div class="engine-selector" data-multiple="false">
+          <button type="button" class="engine-button" aria-label="Select search engine" aria-haspopup="true" aria-expanded="false">
+            <i class="ri-search-2-line" aria-hidden="true"></i>
+            <span class="engine-name">Default</span>
+            <i class="ri-arrow-down-s-line" aria-hidden="true"></i>
+          </button>
+          <div class="engine-dropdown" hidden role="menu">
+
+              <button type="button"
+                      class="engine-option"
+                      data-engine-url="search.html?q="
+                      role="menuitemradio"
+                      aria-checked="true">
+                <span class="name">Default</span>
+                <span class="help">In-browser search</span>
+              </button>
+
+          </div>
+        </div>
+        <button class="icon-settings display-settings">
+          <i class="ri-settings-3-line"></i>
+          <span class="sr-only">Settings</span>
+        </button>
+      </div>
+    </div>
+
+<div id="top-content">
+  <div class="heading-with-actions top-heading">
+    <h1>
+      <span translate="no">quic_keys</span> 
+      <small class="app-vsn" translate="no">(quic v0.5.1)</small>
+
+    </h1>
+
+      <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_keys.erl#L27" title="View Source" class="icon-action" rel="help">
+        <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        <span class="sr-only">View Source</span>
+      </a>
+
+  </div>
+
+
+    <section id="moduledoc">
+<p>QUIC key derivation for packet protection.</p><p>This module derives the cryptographic keys used for QUIC packet protection at each encryption level (Initial, Handshake, Application).</p><h3 id="module-initial-keys" class="section-heading"><a href="#module-initial-keys" class="hover-link"><i class="ri-link-m" aria-hidden="true"></i></a><span class="text"><a name="Initial_Keys">Initial Keys</a></span></h3><p>Initial keys are derived from the Destination Connection ID using a fixed salt defined in RFC 9001.</p><h3 id="module-key-derivation" class="section-heading"><a href="#module-key-derivation" class="hover-link"><i class="ri-link-m" aria-hidden="true"></i></a><span class="text"><a name="Key_Derivation">Key Derivation</a></span></h3><p>Keys are derived using HKDF-Expand-Label with the following labels: - &quot;quic key&quot; for the AEAD key - &quot;quic iv&quot; for the AEAD IV/nonce - &quot;quic hp&quot; for header protection key</p>
+    </section>
+
+</div>
+
+  <section id="summary" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#summary">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Summary</span>
+    </h1>
+<div class="summary-types summary">
+  <h2>
+    <a href="#types">Types</a>
+  </h2>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#t:keys/0" data-no-tooltip="" translate="no">keys/0</a>
+
+      </div>
+
+    </div>
+
+</div>
+<div class="summary-functions summary">
+  <h2>
+    <a href="#functions">Functions</a>
+  </h2>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#derive_initial_client/1" data-no-tooltip="" translate="no">derive_initial_client(DCID)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Derive initial client keys from DCID. Returns {Key, IV, HP} for client Initial packets.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#derive_initial_client/2" data-no-tooltip="" translate="no">derive_initial_client(DCID, Version)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Derive initial client keys from DCID with version.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#derive_initial_secret/1" data-no-tooltip="" translate="no">derive_initial_secret(DCID)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Derive the initial secret from DCID using QUIC v1 salt.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#derive_initial_secret/2" data-no-tooltip="" translate="no">derive_initial_secret(DCID, Version)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Derive the initial secret from DCID. Version determines which salt to use.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#derive_initial_server/1" data-no-tooltip="" translate="no">derive_initial_server(DCID)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Derive initial server keys from DCID. Returns {Key, IV, HP} for server Initial packets.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#derive_initial_server/2" data-no-tooltip="" translate="no">derive_initial_server(DCID, Version)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Derive initial server keys from DCID with version.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#derive_keys/2" data-no-tooltip="" translate="no">derive_keys(Secret, Cipher)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Derive keys from a traffic secret. Returns {Key, IV, HP} for the given secret.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#derive_traffic_keys/1" data-no-tooltip="" translate="no">derive_traffic_keys(Secret)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Derive traffic keys (Key, IV, HP) from a traffic secret. Uses AES-128-GCM key sizes (16-byte key, 12-byte IV, 16-byte HP). This is used for Initial and Handshake encryption levels.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#derive_updated_keys/2" data-no-tooltip="" translate="no">derive_updated_keys(CurrentSecret, Cipher)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Derive updated keys from an updated application secret. This performs the full key update: derives the new secret and then derives keys. Returns {UpdatedSecret, {Key, IV, HP}}.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#derive_updated_secret/2" data-no-tooltip="" translate="no">derive_updated_secret(CurrentSecret, Cipher)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Derive an updated application secret for key update (RFC 9001 Section 6). The next application secret is computed as: updated_secret = HKDF-Expand-Label(current_secret, &quot;quic ku&quot;, &quot;&quot;, hash_len) where &quot;quic ku&quot; is the label for key update.</p></div>
+
+    </div>
+
+</div>
+
+  </section>
+
+
+  <section id="types" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#types">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Types</span>
+    </h1>
+
+    <div class="types-list">
+<section class="detail" id="t:keys/0">
+
+  <div class="detail-header">
+    <a href="#t:keys/0" class="detail-link" data-no-tooltip="" aria-label="Link to this type">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">keys/0</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_keys.erl#L47" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-type</span> keys() :: {Key :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), IV :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), HP :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()}.</pre>
+
+      </div>
+
+
+  </section>
+</section>
+
+    </div>
+  </section>
+
+  <section id="functions" class="details-list">
+    <h1 class="section-heading">
+      <a class="hover-link" href="#functions">
+        <i class="ri-link-m" aria-hidden="true"></i>
+      </a>
+      <span class="text">Functions</span>
+    </h1>
+
+    <div class="functions-list">
+<section class="detail" id="derive_initial_client/1">
+
+  <div class="detail-header">
+    <a href="#derive_initial_client/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">derive_initial_client(DCID)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_keys.erl#L68" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> derive_initial_client(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) -> <a href="#t:keys/0">keys</a>().</pre>
+
+      </div>
+
+<p>Derive initial client keys from DCID. Returns {Key, IV, HP} for client Initial packets.</p>
+  </section>
+</section>
+<section class="detail" id="derive_initial_client/2">
+
+  <div class="detail-header">
+    <a href="#derive_initial_client/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">derive_initial_client(DCID, Version)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_keys.erl#L73" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> derive_initial_client(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()) -> <a href="#t:keys/0">keys</a>().</pre>
+
+      </div>
+
+<p>Derive initial client keys from DCID with version.</p>
+  </section>
+</section>
+<section class="detail" id="derive_initial_secret/1">
+
+  <div class="detail-header">
+    <a href="#derive_initial_secret/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">derive_initial_secret(DCID)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_keys.erl#L55" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> derive_initial_secret(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Derive the initial secret from DCID using QUIC v1 salt.</p>
+  </section>
+</section>
+<section class="detail" id="derive_initial_secret/2">
+
+  <div class="detail-header">
+    <a href="#derive_initial_secret/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">derive_initial_secret(DCID, Version)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_keys.erl#L61" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> derive_initial_secret(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Derive the initial secret from DCID. Version determines which salt to use.</p>
+  </section>
+</section>
+<section class="detail" id="derive_initial_server/1">
+
+  <div class="detail-header">
+    <a href="#derive_initial_server/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">derive_initial_server(DCID)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_keys.erl#L81" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> derive_initial_server(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) -> <a href="#t:keys/0">keys</a>().</pre>
+
+      </div>
+
+<p>Derive initial server keys from DCID. Returns {Key, IV, HP} for server Initial packets.</p>
+  </section>
+</section>
+<section class="detail" id="derive_initial_server/2">
+
+  <div class="detail-header">
+    <a href="#derive_initial_server/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">derive_initial_server(DCID, Version)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_keys.erl#L86" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> derive_initial_server(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()) -> <a href="#t:keys/0">keys</a>().</pre>
+
+      </div>
+
+<p>Derive initial server keys from DCID with version.</p>
+  </section>
+</section>
+<section class="detail" id="derive_keys/2">
+
+  <div class="detail-header">
+    <a href="#derive_keys/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">derive_keys(Secret, Cipher)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_keys.erl#L94" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> derive_keys(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), aes_128_gcm | aes_256_gcm | chacha20_poly1305) -> <a href="#t:keys/0">keys</a>().</pre>
+
+      </div>
+
+<p>Derive keys from a traffic secret. Returns {Key, IV, HP} for the given secret.</p>
+  </section>
+</section>
+<section class="detail" id="derive_traffic_keys/1">
+
+  <div class="detail-header">
+    <a href="#derive_traffic_keys/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">derive_traffic_keys(Secret)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_keys.erl#L105" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> derive_traffic_keys(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) -> <a href="#t:keys/0">keys</a>().</pre>
+
+      </div>
+
+<p>Derive traffic keys (Key, IV, HP) from a traffic secret. Uses AES-128-GCM key sizes (16-byte key, 12-byte IV, 16-byte HP). This is used for Initial and Handshake encryption levels.</p>
+  </section>
+</section>
+<section class="detail" id="derive_updated_keys/2">
+
+  <div class="detail-header">
+    <a href="#derive_updated_keys/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">derive_updated_keys(CurrentSecret, Cipher)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_keys.erl#L125" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> derive_updated_keys(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), aes_128_gcm | aes_256_gcm | chacha20_poly1305) ->
+                             {UpdatedSecret :: <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="#t:keys/0">keys</a>()}.</pre>
+
+      </div>
+
+<p>Derive updated keys from an updated application secret. This performs the full key update: derives the new secret and then derives keys. Returns {UpdatedSecret, {Key, IV, HP}}.</p>
+  </section>
+</section>
+<section class="detail" id="derive_updated_secret/2">
+
+  <div class="detail-header">
+    <a href="#derive_updated_secret/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">derive_updated_secret(CurrentSecret, Cipher)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.5.1/src/quic_keys.erl#L113" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> derive_updated_secret(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), aes_128_gcm | aes_256_gcm | chacha20_poly1305) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Derive an updated application secret for key update (RFC 9001 Section 6). The next application secret is computed as: updated_secret = HKDF-Expand-Label(current_secret, &quot;quic ku&quot;, &quot;&quot;, hash_len) where &quot;quic ku&quot; is the label for key update.</p>
+  </section>
+</section>
+
+    </div>
+  </section>
+
+    <footer class="footer">
+      <p>
+
+          <span class="line">
+            <a href="https://hex.pm/packages/quic/0.5.1" class="footer-hex-package">Hex Package</a>
+
+            <a href="https://preview.hex.pm/preview/quic/0.5.1">Hex Preview</a>
+
+          </span>
+
+        <span class="line">
+          <button class="a-main footer-button display-quick-switch" title="Search HexDocs packages">
+            Search HexDocs
+          </button>
+
+            <a href="quic.epub" title="ePub version">
+              Download ePub version
+            </a>
+
+        </span>
+      </p>
+
+      <p class="built-using">
+        Built using
+        <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener" translate="no">ExDoc</a> (v0.39.1) for the
+
+          <a href="https://erlang.org" title="Erlang" target="_blank" translate="no">Erlang programming language</a>
+
+      </p>
+
+    </footer>
+  </div>
+</main>
+</div>
+
+  </body>
+</html>
