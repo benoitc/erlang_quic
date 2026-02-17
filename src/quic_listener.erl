@@ -127,6 +127,7 @@ init({Port, Opts}) ->
         {ok, Socket} ->
             %% Get actual port (useful if Port was 0)
             {ok, ActualPort} = inet:port(Socket),
+            error_logger:info_msg("Listener started on port ~p, socket=~p~n", [ActualPort, Socket]),
 
             %% Create ETS table for connection tracking
             Connections = ets:new(quic_connections, [set, protected]),
@@ -182,7 +183,8 @@ handle_info({'EXIT', Pid, _Reason}, #listener_state{connections = Conns} = State
     lists:foreach(fun(CID) -> ets:delete(Conns, CID) end, ToDelete),
     {noreply, State};
 
-handle_info(_Info, State) ->
+handle_info(Info, State) ->
+    error_logger:info_msg("Listener got unexpected info: ~p~n", [Info]),
     {noreply, State}.
 
 terminate(_Reason, #listener_state{socket = Socket, connections = Conns}) ->
