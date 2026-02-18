@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.5] - 2026-02-19
+
+### Added
+- `quic_listener:start/2` for unlinked listener processes
+- `set_owner` call handling in idle and handshaking states
+
+### Fixed
+- IPv4/IPv6 address family matching when opening client sockets
+- Race condition: transfer socket ownership before sending packet
+- Handle header unprotection errors gracefully in packet decryption
+- Removed verbose debug logging from listener
+
 ## [0.6.4] - 2026-02-17
 
 ### Fixed
