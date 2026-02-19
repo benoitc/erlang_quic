@@ -216,11 +216,8 @@ handle_info({udp_passive, Socket}, #listener_state{socket = Socket, opts = Opts}
 %% Handle connection process exit
 handle_info({'EXIT', Pid, _Reason}, #listener_state{connections = Conns} = State) ->
     %% Remove all CIDs associated with this connection
-    ToDelete = ets:foldl(
-        fun({CID, ConnPid}, Acc) when ConnPid =:= Pid -> [CID | Acc];
-           (_, Acc) -> Acc
-        end, [], Conns),
-    lists:foreach(fun(CID) -> ets:delete(Conns, CID) end, ToDelete),
+    Pattern = {{'_', Pid}, [], [true]},
+    _ = ets:select_delete(Conns, [Pattern]),
     {noreply, State};
 
 handle_info(_Info, State) ->
