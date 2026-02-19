@@ -180,6 +180,8 @@
 -define(EXT_SUPPORTED_GROUPS, 10).
 -define(EXT_SIGNATURE_ALGORITHMS, 13).
 -define(EXT_ALPN, 16).
+-define(EXT_PRE_SHARED_KEY, 41).       % RFC 8446 Section 4.2.11
+-define(EXT_EARLY_DATA, 42).            % RFC 8446 Section 4.2.10
 -define(EXT_SUPPORTED_VERSIONS, 43).
 -define(EXT_PSK_KEY_EXCHANGE_MODES, 45).
 -define(EXT_KEY_SHARE, 51).

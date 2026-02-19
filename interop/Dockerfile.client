@@ -1,0 +1,42 @@
+# QUIC Interop Runner - Erlang QUIC Client
+#
+# Build: docker build -t erlang-quic-client -f interop/Dockerfile.client .
+# Run: docker run -e REQUESTS="https://server:443/file" -e TESTCASE=handshake erlang-quic-client
+
+FROM erlang:26-alpine AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git openssl-dev
+
+# Copy source
+COPY rebar.config rebar.lock ./
+COPY src ./src
+COPY include ./include
+
+# Build release
+RUN rebar3 compile
+RUN rebar3 as interop_client escriptize
+
+FROM erlang:26-alpine
+
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apk add --no-cache openssl
+
+# Copy built application
+COPY --from=builder /app/_build/interop_client/bin/quic_interop_client /app/
+COPY --from=builder /app/_build/default/lib /app/lib
+
+# Create downloads directory
+RUN mkdir -p /downloads
+
+# Environment variables expected by interop runner
+ENV REQUESTS=""
+ENV TESTCASE="handshake"
+ENV DOWNLOADS="/downloads"
+ENV SSLKEYLOGFILE="/downloads/keys.log"
+
+ENTRYPOINT ["/app/quic_interop_client"]

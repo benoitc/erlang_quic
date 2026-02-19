@@ -1,0 +1,43 @@
+# QUIC Interop Runner - Erlang QUIC Server
+#
+# Build: docker build -t erlang-quic-server -f interop/Dockerfile.server .
+# Run: docker run -p 443:443 -v ./www:/www -v ./certs:/certs erlang-quic-server
+
+FROM erlang:26-alpine AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git openssl-dev
+
+# Copy source
+COPY rebar.config rebar.lock ./
+COPY src ./src
+COPY include ./include
+
+# Build release
+RUN rebar3 compile
+RUN rebar3 as interop_server escriptize
+
+FROM erlang:26-alpine
+
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apk add --no-cache openssl
+
+# Copy built application
+COPY --from=builder /app/_build/interop_server/bin/quic_interop_server /app/
+COPY --from=builder /app/_build/default/lib /app/lib
+
+# Create required directories
+RUN mkdir -p /www /certs /logs
+
+# Environment variables
+ENV TESTCASE="handshake"
+ENV SSLKEYLOGFILE="/logs/keys.log"
+
+# Expose QUIC port
+EXPOSE 443/udp
+
+ENTRYPOINT ["/app/quic_interop_server"]

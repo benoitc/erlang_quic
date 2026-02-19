@@ -49,6 +49,7 @@
     encode_long/5,
     encode_short/4,
     encode_short/5,
+    encode_version_negotiation/3,
     decode/2,
     decode_short_key_phase/1,
     encode_pn/2,
@@ -125,6 +126,24 @@ encode_long(Type, Version, DCID, SCID, Opts) ->
               SCIDLen, SCID/binary, Payload/binary>>
     end.
 
+%% @doc Encode a Version Negotiation packet.
+%% RFC 9000 Section 17.2.1 - Version Negotiation Packet
+%% The server sends this when it receives a packet with an unsupported version.
+%% The DCID and SCID are copied from the received packet (swapped).
+%% Versions is a list of supported version numbers.
+-spec encode_version_negotiation(binary(), binary(), [non_neg_integer()]) -> binary().
+encode_version_negotiation(DCID, SCID, Versions) ->
+    %% First byte: long header form (1) | fixed bit (1) | random bits (6)
+    %% Using 0xC0 | random bits for unused bits
+    RandomBits = rand:uniform(64) - 1,
+    FirstByte = 16#C0 bor RandomBits,
+    DCIDLen = byte_size(DCID),
+    SCIDLen = byte_size(SCID),
+    %% Version = 0 indicates Version Negotiation
+    VersionsData = encode_vn_versions(Versions),
+    <<FirstByte:8, 0:32, DCIDLen:8, DCID/binary,
+      SCIDLen:8, SCID/binary, VersionsData/binary>>.
+
 %% @doc Encode a short header (1-RTT) packet with default key phase 0.
 %% DCIDLen is the expected DCID length (from connection state).
 %% Returns the encoded packet.
@@ -193,6 +212,18 @@ pn_length(_) -> 4.
 %% Internal Functions
 %%====================================================================
 
+decode_long(<<_FirstByte, 0:32, DCIDLen, Rest/binary>>)
+  when DCIDLen =< ?MAX_CID_LEN ->
+    %% Version = 0 indicates Version Negotiation packet (RFC 9000 Section 17.2.1)
+    case Rest of
+        <<DCID:DCIDLen/binary, SCIDLen, Rest2/binary>>
+          when SCIDLen =< ?MAX_CID_LEN ->
+            <<SCID:SCIDLen/binary, VersionsData/binary>> = Rest2,
+            Versions = decode_vn_versions(VersionsData),
+            {ok, {version_negotiation, DCID, SCID, Versions}};
+        _ ->
+            {error, invalid_cid_length}
+    end;
 decode_long(<<FirstByte, Version:32, DCIDLen, Rest/binary>>)
   when DCIDLen =< ?MAX_CID_LEN ->
     case Rest of
@@ -299,3 +330,18 @@ bits_to_type(0) -> initial;
 bits_to_type(1) -> zero_rtt;
 bits_to_type(2) -> handshake;
 bits_to_type(3) -> retry.
+
+%% Encode a list of versions for VN packet
+encode_vn_versions([]) ->
+    <<>>;
+encode_vn_versions([Version | Rest]) ->
+    RestBin = encode_vn_versions(Rest),
+    <<Version:32, RestBin/binary>>.
+
+%% Decode versions from VN packet
+decode_vn_versions(<<>>) ->
+    [];
+decode_vn_versions(<<Version:32, Rest/binary>>) ->
+    [Version | decode_vn_versions(Rest)];
+decode_vn_versions(_) ->
+    [].

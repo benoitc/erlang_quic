@@ -1,0 +1,13 @@
+{
+  "erlang-quic": {
+    "name": "erlang-quic",
+    "url": "https://github.com/benoitc/erlang_quic",
+    "image": "erlang-quic",
+    "client": {
+      "image": "erlang-quic-client"
+    },
+    "server": {
+      "image": "erlang-quic-server"
+    }
+  }
+}

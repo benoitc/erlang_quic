@@ -30,10 +30,13 @@
 
 -export([
     encrypt/5,
+    encrypt/6,
     decrypt/5,
+    decrypt/6,
     protect_header/4,
     unprotect_header/4,
-    compute_nonce/2
+    compute_nonce/2,
+    compute_hp_mask/3
 ]).
 
 -export_type([cipher/0]).
@@ -67,6 +70,13 @@
     binary().
 encrypt(Key, IV, PN, AAD, Plaintext) ->
     Cipher = cipher_for_key(Key),
+    encrypt(Key, IV, PN, AAD, Plaintext, Cipher).
+
+%% @doc Encrypt with explicit cipher type.
+%% Useful for ChaCha20-Poly1305 which also uses 32-byte keys.
+-spec encrypt(binary(), binary(), non_neg_integer(), binary(), binary(), cipher()) ->
+    binary().
+encrypt(Key, IV, PN, AAD, Plaintext, Cipher) ->
     Nonce = compute_nonce(IV, PN),
     {Ciphertext, Tag} = crypto:crypto_one_time_aead(
         Cipher, Key, Nonce, Plaintext, AAD, ?TAG_LEN, true),
@@ -79,6 +89,13 @@ encrypt(Key, IV, PN, AAD, Plaintext) ->
     {ok, binary()} | {error, bad_tag}.
 decrypt(Key, IV, PN, AAD, CiphertextWithTag) ->
     Cipher = cipher_for_key(Key),
+    decrypt(Key, IV, PN, AAD, CiphertextWithTag, Cipher).
+
+%% @doc Decrypt with explicit cipher type.
+%% Useful for ChaCha20-Poly1305 which also uses 32-byte keys.
+-spec decrypt(binary(), binary(), non_neg_integer(), binary(), binary(), cipher()) ->
+    {ok, binary()} | {error, bad_tag}.
+decrypt(Key, IV, PN, AAD, CiphertextWithTag, Cipher) ->
     Nonce = compute_nonce(IV, PN),
     CipherLen = byte_size(CiphertextWithTag) - ?TAG_LEN,
     <<Ciphertext:CipherLen/binary, Tag:?TAG_LEN/binary>> = CiphertextWithTag,

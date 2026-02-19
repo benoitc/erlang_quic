@@ -237,7 +237,19 @@
     listener :: pid() | undefined,
     server_cert :: binary() | undefined,
     server_cert_chain = [] :: [binary()],
-    server_private_key :: term() | undefined
+    server_private_key :: term() | undefined,
+
+    %% Session resumption (RFC 8446 Section 4.6)
+    resumption_secret :: binary() | undefined,
+    max_early_data = 16384 :: non_neg_integer(),  % Default max 0-RTT data size
+
+    %% Client-side ticket storage for session resumption
+    ticket_store = #{} :: quic_ticket:ticket_store(),
+
+    %% 0-RTT / Early Data (RFC 9001 Section 4.6)
+    early_keys :: {#crypto_keys{}, binary()} | undefined,  % {Keys, EarlySecret}
+    early_data_sent = 0 :: non_neg_integer(),  % Bytes of early data sent
+    early_data_accepted = false :: boolean()   % Server accepted early data
 }).
 
 %%====================================================================
@@ -586,6 +598,9 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     CCState = quic_cc:new(),
     LossState = quic_loss:new(),
 
+    %% Extract session ticket for resumption (if provided)
+    SessionTicket = maps:get(session_ticket, Opts, undefined),
+
     %% Initialize state
     State = #state{
         scid = SCID,
@@ -616,7 +631,12 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         idle_timeout = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
-        loss_state = LossState
+        loss_state = LossState,
+        %% Store session ticket for resumption
+        ticket_store = case SessionTicket of
+            undefined -> quic_ticket:new_store();
+            Ticket -> quic_ticket:store_ticket(ServerName, Ticket, quic_ticket:new_store())
+        end
     },
 
     {ok, idle, State}.
@@ -904,8 +924,15 @@ send_client_hello(State) ->
         alpn_list = AlpnList,
         max_data_local = MaxData,
         max_streams_bidi_local = MaxStreamsBidi,
-        max_streams_uni_local = MaxStreamsUni
+        max_streams_uni_local = MaxStreamsUni,
+        ticket_store = TicketStore
     } = State,
+
+    %% Look up session ticket for resumption
+    SessionTicket = case quic_ticket:lookup_ticket(ServerName, TicketStore) of
+        {ok, Ticket} -> Ticket;
+        error -> undefined
+    end,
 
     %% Build transport parameters
     TransportParams = #{
@@ -920,15 +947,35 @@ send_client_hello(State) ->
         active_connection_id_limit => 2
     },
 
-    %% Build ClientHello
-    {ClientHello, PrivKey, _Random} = quic_tls:build_client_hello(#{
+    %% Build ClientHello (with or without PSK for resumption)
+    ClientHelloOpts = #{
         server_name => ServerName,
         alpn => AlpnList,
-        transport_params => TransportParams
-    }),
+        transport_params => TransportParams,
+        session_ticket => SessionTicket
+    },
+    {ClientHello, PrivKey, _Random} = quic_tls:build_client_hello(ClientHelloOpts),
 
     %% Update transcript
     Transcript = ClientHello,
+
+    %% Derive early keys if we have a session ticket for 0-RTT
+    EarlyKeys = case SessionTicket of
+        undefined ->
+            undefined;
+        #session_ticket{cipher = Cipher, resumption_secret = ResSecret} ->
+            %% Derive PSK and early secret
+            PSK = quic_ticket:derive_psk(ResSecret, SessionTicket),
+            EarlySecret = quic_crypto:derive_early_secret(Cipher, PSK),
+            %% Derive client early traffic secret from ClientHello hash
+            ClientHelloHash = quic_crypto:transcript_hash(Cipher, Transcript),
+            EarlyTrafficSecret = quic_crypto:derive_client_early_traffic_secret(
+                Cipher, EarlySecret, ClientHelloHash),
+            %% Derive traffic keys
+            {Key, IV, HP} = quic_keys:derive_keys(EarlyTrafficSecret, Cipher),
+            Keys = #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher},
+            {Keys, EarlySecret}
+    end,
 
     %% Create CRYPTO frame
     CryptoFrame = quic_frame:encode({crypto, 0, ClientHello}),
@@ -936,7 +983,12 @@ send_client_hello(State) ->
     %% Encrypt and send Initial packet
     NewState = send_initial_packet(CryptoFrame, State#state{
         tls_private_key = PrivKey,
-        tls_transcript = Transcript
+        tls_transcript = Transcript,
+        early_keys = EarlyKeys,
+        max_early_data = case SessionTicket of
+            undefined -> 0;
+            #session_ticket{max_early_data = MaxEarly} -> MaxEarly
+        end
     }),
 
     %% Enable socket for receiving
@@ -1076,6 +1128,44 @@ send_handshake_done(State) ->
     %% HANDSHAKE_DONE is frame type 0x1e with no payload
     Frame = quic_frame:encode(handshake_done),
     send_app_packet(Frame, State).
+
+%% Server: Send NewSessionTicket after handshake completes
+%% RFC 8446 Section 4.6.1: Server sends NewSessionTicket in post-handshake message
+%% In QUIC, this is sent as a TLS handshake message in a CRYPTO frame
+send_new_session_ticket(#state{resumption_secret = undefined} = State) ->
+    %% No resumption secret available - skip sending ticket
+    State;
+send_new_session_ticket(#state{
+    resumption_secret = ResumptionSecret,
+    server_name = ServerName,
+    max_early_data = MaxEarlyData,
+    alpn = ALPN,
+    handshake_keys = {ClientHsKeys, _}
+} = State) ->
+    %% Get cipher from the connection
+    Cipher = ClientHsKeys#crypto_keys.cipher,
+
+    %% Create a session ticket
+    Ticket = quic_ticket:create_ticket(
+        case ServerName of
+            undefined -> <<"">>;
+            Name -> Name
+        end,
+        ResumptionSecret,
+        MaxEarlyData,
+        Cipher,
+        ALPN
+    ),
+
+    %% Build NewSessionTicket TLS message
+    TicketMsg = quic_ticket:build_new_session_ticket(Ticket),
+
+    %% Wrap in TLS handshake message (type 4 = NewSessionTicket)
+    TLSMsg = quic_tls:encode_handshake_message(?TLS_NEW_SESSION_TICKET, TicketMsg),
+
+    %% Send in CRYPTO frame (at application level)
+    CryptoFrame = quic_frame:encode({crypto, 0, TLSMsg}),
+    send_app_packet(CryptoFrame, State).
 
 %% Send an Initial packet
 send_initial_packet(Payload, State) ->
@@ -2177,20 +2267,87 @@ process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg,
                     %% Update transcript with client Finished
                     Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
 
+                    %% Derive resumption_master_secret (RFC 8446 Section 7.1)
+                    %% resumption_master_secret = Derive-Secret(master_secret, "res master",
+                    %%                                          ClientHello..client Finished)
+                    FinalTranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
+                    ResumptionSecret = quic_ticket:derive_resumption_secret(
+                        Cipher, State#state.master_secret, FinalTranscriptHash, <<>>),
+
                     %% Application keys are already derived when server sent its Finished
                     %% Mark handshake as complete
                     State1 = State#state{
                         tls_state = ?TLS_HANDSHAKE_COMPLETE,
-                        tls_transcript = Transcript
+                        tls_transcript = Transcript,
+                        resumption_secret = ResumptionSecret
                     },
 
                     %% Send HANDSHAKE_DONE frame to client
-                    send_handshake_done(State1);
+                    State2 = send_handshake_done(State1),
+
+                    %% Send NewSessionTicket to enable session resumption
+                    send_new_session_ticket(State2);
                 false ->
                     error_logger:info_msg("[QUIC] Client Finished verification failed~n", []),
                     State
             end;
         {error, _} ->
+            State
+    end;
+
+%% Client receives NewSessionTicket from server (post-handshake)
+%% RFC 8446 Section 4.6.1
+process_tls_message(_Level, ?TLS_NEW_SESSION_TICKET, Body, _OriginalMsg,
+                    #state{role = client, tls_state = ?TLS_HANDSHAKE_COMPLETE,
+                           server_name = ServerName, alpn = ALPN,
+                           master_secret = MasterSecret,
+                           tls_transcript = Transcript,
+                           handshake_keys = {ClientHsKeys, _}} = State) ->
+    case quic_ticket:parse_new_session_ticket(Body) of
+        {ok, #{lifetime := Lifetime, age_add := AgeAdd, nonce := Nonce,
+               ticket := TicketData, max_early_data := MaxEarlyData}} ->
+            Cipher = ClientHsKeys#crypto_keys.cipher,
+
+            %% Derive resumption_master_secret from master secret
+            %% The transcript should include client Finished
+            FinalTranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
+            ResumptionSecret = quic_ticket:derive_resumption_secret(
+                Cipher, MasterSecret, FinalTranscriptHash, <<>>),
+
+            %% Create session ticket record
+            Ticket = #session_ticket{
+                server_name = case ServerName of
+                    undefined -> <<"">>;
+                    Name -> Name
+                end,
+                ticket = TicketData,
+                lifetime = Lifetime,
+                age_add = AgeAdd,
+                nonce = Nonce,
+                resumption_secret = ResumptionSecret,
+                max_early_data = MaxEarlyData,
+                received_at = erlang:system_time(second),
+                cipher = Cipher,
+                alpn = ALPN
+            },
+
+            %% Store ticket
+            TicketKey = case ServerName of
+                undefined -> <<"">>;
+                SN -> SN
+            end,
+            TicketStore = quic_ticket:store_ticket(
+                TicketKey, Ticket, State#state.ticket_store),
+
+            %% Notify owner about the new ticket
+            #state{owner = Owner, conn_ref = Ref} = State,
+            Owner ! {quic, Ref, {session_ticket, Ticket}},
+
+            State#state{
+                ticket_store = TicketStore,
+                resumption_secret = ResumptionSecret
+            };
+        {error, _Reason} ->
             State
     end;
 

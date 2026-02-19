@@ -64,6 +64,7 @@
 %%   - server_name: SNI hostname (binary)
 %%   - alpn: List of ALPN protocols (list of binaries)
 %%   - transport_params: QUIC transport parameters (map)
+%%   - session_ticket: #session_ticket{} for resumption with PSK (optional)
 %%
 %% Returns: {ClientHelloMsg, PrivateKey, Random}
 -spec build_client_hello(map()) -> {binary(), binary(), binary()}.
@@ -74,6 +75,18 @@ build_client_hello(Opts) ->
     %% Generate ECDHE key pair (x25519)
     {PubKey, PrivKey} = crypto:generate_key(ecdh, x25519),
 
+    %% Check if we have a session ticket for PSK resumption
+    case maps:get(session_ticket, Opts, undefined) of
+        undefined ->
+            %% Standard ClientHello without PSK
+            build_client_hello_standard(Random, PubKey, PrivKey, Opts);
+        Ticket ->
+            %% ClientHello with pre_shared_key extension for resumption
+            build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, Ticket)
+    end.
+
+%% Build standard ClientHello without PSK
+build_client_hello_standard(Random, PubKey, PrivKey, Opts) ->
     %% Build extensions
     Extensions = build_client_hello_extensions(PubKey, Opts),
 
@@ -81,7 +94,6 @@ build_client_hello(Opts) ->
     SessionId = <<>>,
 
     %% Cipher suites (TLS 1.3 only)
-    %% Only offering AES-128-GCM for now until AES-256-GCM derivation is fixed
     CipherSuites = <<?TLS_AES_128_GCM_SHA256:16>>,
 
     %% Legacy compression methods (null only)
@@ -102,6 +114,94 @@ build_client_hello(Opts) ->
 
     %% Wrap in handshake message
     Msg = encode_handshake_message(?TLS_CLIENT_HELLO, ClientHello),
+    {Msg, PrivKey, Random}.
+
+%% Build ClientHello with PSK for session resumption
+%% RFC 8446 Section 4.2.11: pre_shared_key MUST be the last extension
+%% The binder is computed over the truncated ClientHello (everything before binders)
+build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, Ticket) ->
+    %% Build base extensions (without pre_shared_key)
+    BaseExtensions = build_client_hello_extensions(PubKey, Opts),
+
+    %% Derive PSK from resumption secret
+    PSK = quic_ticket:derive_psk(Ticket#session_ticket.resumption_secret, Ticket),
+    Cipher = Ticket#session_ticket.cipher,
+
+    %% Compute obfuscated ticket age
+    %% RFC 8446 4.2.11.1: obfuscated_ticket_age = (now - received_at) * 1000 + age_add
+    Now = erlang:system_time(second),
+    TicketAge = (Now - Ticket#session_ticket.received_at) * 1000,
+    ObfuscatedAge = (TicketAge + Ticket#session_ticket.age_add) band 16#FFFFFFFF,
+
+    %% Build pre_shared_key extension identities (without binder yet)
+    TicketData = Ticket#session_ticket.ticket,
+    TicketLen = byte_size(TicketData),
+
+    %% PskIdentity: identity<1..2^16-1>, obfuscated_ticket_age
+    PskIdentity = <<TicketLen:16, TicketData/binary, ObfuscatedAge:32>>,
+    IdentitiesLen = byte_size(PskIdentity),
+    Identities = <<IdentitiesLen:16, PskIdentity/binary>>,
+
+    %% Binder placeholder (32 bytes for SHA-256, will be filled in)
+    BinderLen = 32,
+    BinderPlaceholder = <<0:BinderLen/unit:8>>,
+    BindersSection = <<(BinderLen + 1):16, BinderLen:8, BinderPlaceholder/binary>>,
+
+    %% Build pre_shared_key extension with placeholder binder
+    PskExtBody = <<Identities/binary, BindersSection/binary>>,
+    PskExtLen = byte_size(PskExtBody),
+    PskExt = <<?EXT_PRE_SHARED_KEY:16, PskExtLen:16, PskExtBody/binary>>,
+
+    %% Calculate total extensions length with PSK
+    AllExtensions = <<BaseExtensions/binary, PskExt/binary>>,
+    ExtensionsLen = byte_size(AllExtensions),
+
+    %% Legacy session ID (empty for TLS 1.3)
+    SessionId = <<>>,
+
+    %% Cipher suites
+    CipherSuites = <<?TLS_AES_128_GCM_SHA256:16>>,
+
+    %% Legacy compression methods (null only)
+    CompressionMethods = <<1, 0>>,
+
+    %% Build full ClientHello with placeholder binder
+    ClientHelloBody = <<
+        ?TLS_VERSION_1_2:16,
+        Random:32/binary,
+        (byte_size(SessionId)):8,
+        SessionId/binary,
+        (byte_size(CipherSuites)):16,
+        CipherSuites/binary,
+        CompressionMethods/binary,
+        ExtensionsLen:16,
+        AllExtensions/binary
+    >>,
+
+    %% Build truncated ClientHello for binder computation
+    %% Truncated = full ClientHello up to but not including the binders
+    %% The binders section starts at: end - binders_len
+    BindersSectionLen = byte_size(BindersSection),
+    TruncatedLen = byte_size(ClientHelloBody) - BindersSectionLen,
+    <<TruncatedBody:TruncatedLen/binary, _/binary>> = ClientHelloBody,
+
+    %% Wrap truncated ClientHello for hash computation
+    TruncatedMsg = encode_handshake_message(?TLS_CLIENT_HELLO, TruncatedBody),
+
+    %% Compute PSK binder
+    %% binder = HMAC(binder_key, Transcript-Hash(truncated ClientHello))
+    EarlySecret = quic_crypto:derive_early_secret(Cipher, PSK),
+    TruncatedHash = quic_crypto:transcript_hash(Cipher, TruncatedMsg),
+    Binder = quic_crypto:compute_psk_binder(Cipher, EarlySecret, TruncatedHash, resumption),
+
+    %% Build final binders section with real binder
+    FinalBindersSection = <<(BinderLen + 1):16, BinderLen:8, Binder/binary>>,
+
+    %% Build final ClientHello with real binder
+    FinalClientHello = <<TruncatedBody/binary, FinalBindersSection/binary>>,
+
+    %% Wrap in handshake message
+    Msg = encode_handshake_message(?TLS_CLIENT_HELLO, FinalClientHello),
     {Msg, PrivKey, Random}.
 
 %% Build ClientHello extensions
@@ -524,6 +624,15 @@ parse_client_hello(<<
                 error -> #{}
             end,
 
+            %% Extract pre_shared_key extension (for resumption)
+            PSK = case maps:find(?EXT_PRE_SHARED_KEY, ExtMap) of
+                {ok, PskData} -> parse_pre_shared_key_ext(PskData);
+                error -> undefined
+            end,
+
+            %% Extract early_data extension (client wants to send 0-RTT)
+            EarlyData = maps:is_key(?EXT_EARLY_DATA, ExtMap),
+
             {ok, #{
                 random => Random,
                 session_id => SessionId,
@@ -532,7 +641,9 @@ parse_client_hello(<<
                 key_share => KeyShare,
                 server_name => ServerName,
                 alpn_protocols => ALPNProtocols,
-                transport_params => TransportParams
+                transport_params => TransportParams,
+                pre_shared_key => PSK,
+                early_data => EarlyData
             }};
         {error, Reason} ->
             {error, Reason}
@@ -667,6 +778,32 @@ parse_alpn_list(<<Len:8, Proto:Len/binary, Rest/binary>>) ->
 parse_alpn_list(_) ->
     [].
 
+%% Parse pre_shared_key extension from ClientHello
+%% RFC 8446 Section 4.2.11
+%% Returns: #{identities => [{Ticket, ObfuscatedAge}], binders => [Binder]}
+parse_pre_shared_key_ext(<<IdentitiesLen:16, IdentitiesData:IdentitiesLen/binary,
+                          BindersLen:16, BindersData:BindersLen/binary>>) ->
+    Identities = parse_psk_identities(IdentitiesData),
+    Binders = parse_psk_binders(BindersData),
+    #{identities => Identities, binders => Binders};
+parse_pre_shared_key_ext(_) ->
+    undefined.
+
+parse_psk_identities(<<>>) ->
+    [];
+parse_psk_identities(<<IdentityLen:16, Identity:IdentityLen/binary,
+                       ObfuscatedAge:32, Rest/binary>>) ->
+    [{Identity, ObfuscatedAge} | parse_psk_identities(Rest)];
+parse_psk_identities(_) ->
+    [].
+
+parse_psk_binders(<<>>) ->
+    [];
+parse_psk_binders(<<BinderLen:8, Binder:BinderLen/binary, Rest/binary>>) ->
+    [Binder | parse_psk_binders(Rest)];
+parse_psk_binders(_) ->
+    [].
+
 build_server_hello_extensions(PubKey, _Opts) ->
     %% Supported versions extension (mandatory for TLS 1.3)
     SupportedVersions = encode_extension(?EXT_SUPPORTED_VERSIONS, <<?TLS_VERSION_1_3:16>>),
@@ -696,7 +833,16 @@ build_encrypted_extensions_list(Opts) ->
             <<>>
     end,
 
-    <<ALPNExt/binary, TPExt/binary>>.
+    %% Early data indication (RFC 8446 Section 4.2.10)
+    %% When server accepts early data, include empty early_data extension
+    EarlyDataExt = case maps:get(early_data, Opts, false) of
+        true ->
+            encode_extension(?EXT_EARLY_DATA, <<>>);
+        false ->
+            <<>>
+    end,
+
+    <<ALPNExt/binary, TPExt/binary, EarlyDataExt/binary>>.
 
 build_cert_list([]) ->
     <<>>;
