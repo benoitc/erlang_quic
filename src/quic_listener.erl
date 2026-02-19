@@ -226,13 +226,7 @@ handle_info({'EXIT', Pid, _Reason}, #listener_state{connections = Conns} = State
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #listener_state{socket = Socket, connections = Conns, opts = Opts}) ->
-    gen_udp:close(Socket),
-    %% Only delete ETS table if we created it (not a shared table from pool)
-    case maps:get(connections_table, Opts, undefined) of
-        undefined -> ets:delete(Conns);
-        _Tab -> ok
-    end,
+terminate(_Reason, _) ->
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
