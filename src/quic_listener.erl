@@ -50,6 +50,7 @@
 %% gen_server callbacks
 -export([
     init/1,
+    handle_continue/2,
     handle_call/3,
     handle_cast/2,
     handle_info/2,
@@ -68,6 +69,7 @@
     alpn_list :: [binary()],
     %% Connection ID -> Pid mapping
     connections :: ets:tid(),
+    tickets_table :: ets:tid(),
     %% Stateless reset secret (RFC 9000 Section 10.3)
     reset_secret :: binary(),
     %% Connection handler callback: fun(ConnPid, ConnRef) -> {ok, HandlerPid}
@@ -75,6 +77,7 @@
     %% Options
     opts :: map()
 }).
+-type state() :: #listener_state{}.
 
 %%====================================================================
 %% API
@@ -119,49 +122,45 @@ get_connections(Listener) ->
 %% gen_server callbacks
 %%====================================================================
 
+%% @doc false
+-spec init({inet:port_number(), map()}) -> dynamic().
 init({Port, Opts}) ->
     process_flag(trap_exit, true),
-
-    %% Extract required options
-    Cert = maps:get(cert, Opts),
-    CertChain = maps:get(cert_chain, Opts, []),
-    PrivateKey = maps:get(key, Opts),
-    ALPNList = maps:get(alpn, Opts, [<<"h3">>]),
-    ConnHandler = maps:get(connection_handler, Opts, undefined),
 
     %% Open UDP socket
     %% Default to IPv4 for maximum compatibility
     ActiveN = maps:get(active_n, Opts, 100),
     ReusePort = maps:get(reuseport, Opts, false),
+    ExtraFlags = maps:get(extra_socket_opts, Opts, []),
+
     SocketOpts = [
         binary,
         inet,
         {active, ActiveN},
         {reuseaddr, true}
     ] ++ case ReusePort of
-        true -> [{reuseport, true}];
+        true -> [{reuseport, true}, {reuseport_lb, true}];
         false -> []
-    end,
+    end ++ ExtraFlags,
     case gen_udp:open(Port, SocketOpts) of
         {ok, Socket} ->
-            init_listener_state(Socket, Cert, CertChain, PrivateKey, ALPNList, ConnHandler, Opts);
+            {ok, {Socket, Opts}, {continue, discover_manager}};
         {error, Reason} ->
             {stop, Reason}
     end.
 
-init_listener_state(Socket, Cert, CertChain, PrivateKey, ALPNList, ConnHandler, Opts) ->
+%% @doc false
+handle_continue(discover_manager, {Socket, Opts}) ->
+    %% Extract required options
+    #{cert := Cert, key := PrivateKey} = Opts,
+    CertChain = maps:get(cert_chain, Opts, []),
+    ALPNList = maps:get(alpn, Opts, [<<"h3">>]),
+    ConnHandler = maps:get(connection_handler, Opts, undefined),
+
+    {ConnTab, TicketTab} = get_tables(Opts),
+
     %% Get actual port and bound address
     {ok, {_BoundAddr, ActualPort}} = inet:sockname(Socket),
-
-    %% Use provided ETS table or create new one for connection tracking
-    %% When using pool mode, a shared table is passed via connections_table option
-    Connections = case maps:get(connections_table, Opts, undefined) of
-        undefined -> ets:new(quic_connections, [set, protected]);
-        Tab -> Tab
-    end,
-
-    %% Create global ticket store for 0-RTT support (if not already created)
-    ensure_ticket_table(),
 
     %% Generate or use provided stateless reset secret
     ResetSecret = maps:get(reset_secret, Opts, crypto:strong_rand_bytes(32)),
@@ -173,16 +172,20 @@ init_listener_state(Socket, Cert, CertChain, PrivateKey, ALPNList, ConnHandler, 
         cert_chain = CertChain,
         private_key = PrivateKey,
         alpn_list = ALPNList,
-        connections = Connections,
+        connections = ConnTab,
+        tickets_table = TicketTab,
         reset_secret = ResetSecret,
         connection_handler = ConnHandler,
         opts = Opts
     },
-    {ok, State}.
+    {noreply, State}.
 
+%% @doc false
+-spec handle_call(dynamic(), gen_server:from(), state()) -> {reply, dynamic(), state()}.
 handle_call(get_port, _From, #listener_state{port = Port} = State) ->
     {reply, Port, State};
 
+%% @doc false
 handle_call(get_socket_info, _From, #listener_state{socket = Socket, port = Port} = State) ->
     SockInfo = inet:info(Socket),
     {reply, #{port => Port, socket => Socket, info => SockInfo}, State};
@@ -194,19 +197,20 @@ handle_call(get_connections, _From, #listener_state{connections = Conns} = State
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
+%% @doc false
+-spec handle_cast(dynamic(), state()) -> {noreply, state()}.
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+%% @doc false
 %% Handle incoming UDP packets
 handle_info({udp, Socket, SrcIP, SrcPort, Packet},
             #listener_state{socket = Socket} = State) ->
     handle_packet(Packet, {SrcIP, SrcPort}, State),
     {noreply, State};
 
-%% Handle UDP from different socket (shouldn't happen)
-handle_info({udp, _OtherSocket, _SrcIP, _SrcPort, _Packet}, State) ->
-    {noreply, State};
-
+%% TODO: this might still be accepting more packets
+%% than connection workers might be willing to accept
 %% Handle socket going passive (backpressure with {active, N})
 handle_info({udp_passive, Socket}, #listener_state{socket = Socket, opts = Opts} = State) ->
     N = maps:get(active_n, Opts, 100),
@@ -215,23 +219,45 @@ handle_info({udp_passive, Socket}, #listener_state{socket = Socket, opts = Opts}
 
 %% Handle connection process exit
 handle_info({'EXIT', Pid, _Reason}, #listener_state{connections = Conns} = State) ->
-    %% Remove all CIDs associated with this connection
-    Pattern = {{'_', Pid}, [], [true]},
-    _ = ets:select_delete(Conns, [Pattern]),
+    cleanup_connection(Conns, Pid),
+    {noreply, State};
+
+%% Handle UDP from different socket (shouldn't happen)
+handle_info({udp, _OtherSocket, _SrcIP, _SrcPort, _Packet}, State) ->
     {noreply, State};
 
 handle_info(_Info, State) ->
     {noreply, State}.
 
+%% @doc false
 terminate(_Reason, _) ->
     ok.
 
+%% @doc false
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %%====================================================================
 %% Internal Functions
 %%====================================================================
+
+%% Remove all CIDs associated with this connection
+cleanup_connection(Conns, Pid) ->
+    Pattern = {{'_', Pid}, [], [true]},
+    _ = ets:select_delete(Conns, [Pattern]).
+
+%% Use provided ETS table or create new one for connection tracking
+%% When using pool mode, the supervisor is in the options, query it for the
+%% table manager and get the table from it.
+get_tables(#{supervisor := SupPid}) ->
+    Children = supervisor:which_children(SupPid),
+    {quic_listener_manager, ManagerPid, _, _} = lists:keyfind(quic_listener_manager, 1, Children),
+    {ok, {ConnTab, TicketTab}} = quic_listener_manager:get_tables(ManagerPid),
+    {ConnTab, TicketTab};
+get_tables(_) ->
+    ConnTab = ets:new(quic_connections, [set, protected]),
+    TicketTab = ets:new(quic_connections, [set, protected]),
+    {ConnTab, TicketTab}.
 
 handle_packet(Packet, RemoteAddr, State) ->
     case parse_packet_header(Packet) of
@@ -440,23 +466,3 @@ build_stateless_reset(Token, TriggerSize) ->
     <<FirstRandom:6, _:2>> = crypto:strong_rand_bytes(1),
     FirstByte = (0 bsl 7) bor (1 bsl 6) bor FirstRandom,
     <<FirstByte, RandomBytes/binary, Token/binary>>.
-
-%%====================================================================
-%% Global Ticket Storage (for 0-RTT)
-%%====================================================================
-
-%% Table name for server ticket storage
--define(TICKET_TABLE, quic_server_tickets).
-
-%% Create the global ticket table if it doesn't exist
-ensure_ticket_table() ->
-    case ets:whereis(?TICKET_TABLE) of
-        undefined ->
-            try
-                ets:new(?TICKET_TABLE, [named_table, public, set, {read_concurrency, true}])
-            catch
-                error:badarg -> ok  % Table already exists (race condition)
-            end;
-        _ ->
-            ok
-    end.
