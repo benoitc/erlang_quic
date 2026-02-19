@@ -84,6 +84,9 @@
 %%   - cert_chain: Certificate chain [binary()]
 %%   - key: Private key
 %%   - alpn: List of supported ALPN protocols
+%%   - active_n: Number of packets before socket goes passive (default 100)
+%%   - reuseport: Enable SO_REUSEPORT for multiple listeners (default false)
+%%   - connections_table: Shared ETS table for connection tracking (pool mode)
 -spec start_link(inet:port_number(), map()) -> {ok, pid()} | {error, term()}.
 start_link(Port, Opts) ->
     gen_server:start_link(?MODULE, {Port, Opts}, []).
@@ -124,12 +127,17 @@ init({Port, Opts}) ->
 
     %% Open UDP socket
     %% Default to IPv4 for maximum compatibility
+    ActiveN = maps:get(active_n, Opts, 100),
+    ReusePort = maps:get(reuseport, Opts, false),
     SocketOpts = [
         binary,
         inet,
-        {active, true},
+        {active, ActiveN},
         {reuseaddr, true}
-    ],
+    ] ++ case ReusePort of
+        true -> [{reuseport, true}];
+        false -> []
+    end,
     case gen_udp:open(Port, SocketOpts) of
         {ok, Socket} ->
             init_listener_state(Socket, Cert, CertChain, PrivateKey, ALPNList, ConnHandler, Opts);
@@ -141,8 +149,12 @@ init_listener_state(Socket, Cert, CertChain, PrivateKey, ALPNList, ConnHandler, 
     %% Get actual port and bound address
     {ok, {_BoundAddr, ActualPort}} = inet:sockname(Socket),
 
-    %% Create ETS table for connection tracking
-    Connections = ets:new(quic_connections, [set, protected]),
+    %% Use provided ETS table or create new one for connection tracking
+    %% When using pool mode, a shared table is passed via connections_table option
+    Connections = case maps:get(connections_table, Opts, undefined) of
+        undefined -> ets:new(quic_connections, [set, protected]);
+        Tab -> Tab
+    end,
 
     %% Generate or use provided stateless reset secret
     ResetSecret = maps:get(reset_secret, Opts, crypto:strong_rand_bytes(32)),
@@ -188,6 +200,12 @@ handle_info({udp, Socket, SrcIP, SrcPort, Packet},
 handle_info({udp, _OtherSocket, _SrcIP, _SrcPort, _Packet}, State) ->
     {noreply, State};
 
+%% Handle socket going passive (backpressure with {active, N})
+handle_info({udp_passive, Socket}, #listener_state{socket = Socket, opts = Opts} = State) ->
+    N = maps:get(active_n, Opts, 100),
+    inet:setopts(Socket, [{active, N}]),
+    {noreply, State};
+
 %% Handle connection process exit
 handle_info({'EXIT', Pid, _Reason}, #listener_state{connections = Conns} = State) ->
     %% Remove all CIDs associated with this connection
@@ -201,9 +219,13 @@ handle_info({'EXIT', Pid, _Reason}, #listener_state{connections = Conns} = State
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #listener_state{socket = Socket, connections = Conns}) ->
+terminate(_Reason, #listener_state{socket = Socket, connections = Conns, opts = Opts}) ->
     gen_udp:close(Socket),
-    ets:delete(Conns),
+    %% Only delete ETS table if we created it (not a shared table from pool)
+    case maps:get(connections_table, Opts, undefined) of
+        undefined -> ets:delete(Conns);
+        _Tab -> ok
+    end,
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
