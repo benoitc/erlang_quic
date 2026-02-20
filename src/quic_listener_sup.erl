@@ -70,6 +70,16 @@ get_listeners(Sup) ->
 init({Port, Opts}) ->
     Self = self(),
 
+    %% Register with server registry if name is provided
+    %% This handles both initial start and supervisor restarts
+    case maps:get(name, Opts, undefined) of
+        undefined ->
+            ok;
+        Name when is_atom(Name) ->
+            %% Use catch in case registry isn't started (standalone listener_sup usage)
+            catch quic_server_registry:register(Name, Self, Port, Opts)
+    end,
+
     SupFlags = #{strategy => rest_for_one, intensity => 10, period => 5},
 
     Manager = #{

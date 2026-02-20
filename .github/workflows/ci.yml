@@ -8,17 +8,24 @@ on:
 
 jobs:
   test:
-    name: Test OTP ${{ matrix.otp }}
-    runs-on: ubuntu-latest
+    name: Test OTP ${{ matrix.otp }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
         include:
-          - otp: '26.0'
+          - os: ubuntu-22.04
+            otp: '26.0'
             rebar3: '3.24.0'
-          - otp: '27.0'
+          - os: ubuntu-22.04
+            otp: '27.0'
             rebar3: '3.24.0'
-          - otp: '28.0'
+          - os: ubuntu-24.04
+            otp: '27.0'
+            rebar3: '3.24.0'
+          - os: ubuntu-24.04
+            otp: '28.0'
             rebar3: 'nightly'
 
     steps:

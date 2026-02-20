@@ -139,6 +139,37 @@ The owner process receives messages in the format `{quic, ConnRef, Event}`:
 - `quic_listener_sup:start_link/2` - Start pooled listeners (SO_REUSEPORT)
 - `quic_listener_sup:get_listeners/1` - Get listener PIDs in pool
 
+### Named Server Pools
+
+Ranch-style named server pool management:
+
+- `quic:start_server/3` - Start named server pool
+- `quic:stop_server/1` - Stop named server
+- `quic:get_server_info/1` - Get server information
+- `quic:get_server_port/1` - Get server listening port
+- `quic:get_server_connections/1` - Get server connection PIDs
+- `quic:which_servers/0` - List all running servers
+
+Example:
+
+```erlang
+%% Start a named server with connection pooling
+{ok, _} = quic:start_server(my_server, 4433, #{
+    cert => CertDer,
+    key => KeyTerm,
+    alpn => [<<"h3">>],
+    pool_size => 4  %% 4 listener processes
+}),
+
+%% Query servers
+quic:which_servers().           %% => [my_server]
+quic:get_server_port(my_server). %% => {ok, 4433}
+quic:get_server_info(my_server). %% => {ok, #{port => 4433, ...}}
+
+%% Stop server
+quic:stop_server(my_server).
+```
+
 ## Building
 
 ```bash
