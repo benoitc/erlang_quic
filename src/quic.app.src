@@ -1,6 +1,6 @@
 {application, quic, [
     {description, "Pure Erlang QUIC implementation (RFC 9000)"},
-    {vsn, "0.7.1"},
+    {vsn, "0.8.0"},
     {registered, []},
     {applications, [
         kernel,
