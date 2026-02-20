@@ -89,6 +89,8 @@
 %%   - active_n: Number of packets before socket goes passive (default 100)
 %%   - reuseport: Enable SO_REUSEPORT for multiple listeners (default false)
 %%   - connections_table: Shared ETS table for connection tracking (pool mode)
+%%   - preferred_ipv4: {IP, Port} for preferred IPv4 address (RFC 9000 Section 9.6)
+%%   - preferred_ipv6: {IP, Port} for preferred IPv6 address (RFC 9000 Section 9.6)
 -spec start_link(inet:port_number(), map()) -> {ok, pid()} | {error, term()}.
 start_link(Port, Opts) ->
     gen_server:start_link(?MODULE, {Port, Opts}, []).

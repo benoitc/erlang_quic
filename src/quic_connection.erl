@@ -39,8 +39,6 @@
     {process_frames, 3},
     {cancel_pto_timer, 1},
     {complete_key_update, 1},
-    {initiate_path_validation, 2},
-    {complete_migration, 2},
     {can_send_to_path, 3},
     {issue_new_connection_id, 1},
     {get_active_peer_cid, 1}
@@ -225,6 +223,9 @@
     current_path :: #path_state{} | undefined,
     %% Alternative paths being validated
     alt_paths = [] :: [#path_state{}],
+    %% Preferred address being validated (RFC 9000 Section 9.6)
+    %% Set when client is validating server's preferred address
+    preferred_address :: #preferred_address{} | undefined,
 
     %% Connection ID Pool (RFC 9000 Section 5.1)
     %% Our CIDs that we've issued to the peer (via NEW_CONNECTION_ID)
@@ -247,6 +248,9 @@
     server_cert :: binary() | undefined,
     server_cert_chain = [] :: [binary()],
     server_private_key :: term() | undefined,
+    %% Server preferred address config (RFC 9000 Section 9.6)
+    %% Set from listener options: {IPv4, IPv6} where each is {Addr, Port} | undefined
+    server_preferred_address :: #preferred_address{} | undefined,
 
     %% Session resumption (RFC 8446 Section 4.6)
     resumption_secret :: binary() | undefined,
@@ -563,10 +567,40 @@ init({server, Opts}) ->
         listener = Listener,
         server_cert = Cert,
         server_cert_chain = CertChain,
-        server_private_key = PrivateKey
+        server_private_key = PrivateKey,
+        server_preferred_address = build_server_preferred_address(Opts)
     },
 
     {ok, idle, State}.
+
+%% Build preferred_address record from listener options (RFC 9000 Section 9.6)
+build_server_preferred_address(Opts) ->
+    PreferredIPv4 = maps:get(preferred_ipv4, Opts, undefined),
+    PreferredIPv6 = maps:get(preferred_ipv6, Opts, undefined),
+    case {PreferredIPv4, PreferredIPv6} of
+        {undefined, undefined} ->
+            undefined;
+        _ ->
+            %% Generate new CID and stateless reset token for preferred address
+            CID = crypto:strong_rand_bytes(8),
+            Token = crypto:strong_rand_bytes(16),
+            {IPv4Addr, IPv4Port} = case PreferredIPv4 of
+                {Addr, Port} -> {Addr, Port};
+                undefined -> {undefined, undefined}
+            end,
+            {IPv6Addr, IPv6Port} = case PreferredIPv6 of
+                {Addr6, Port6} -> {Addr6, Port6};
+                undefined -> {undefined, undefined}
+            end,
+            #preferred_address{
+                ipv4_addr = IPv4Addr,
+                ipv4_port = IPv4Port,
+                ipv6_addr = IPv6Addr,
+                ipv6_port = IPv6Port,
+                cid = CID,
+                stateless_reset_token = Token
+            }
+    end.
 
 %% Helper to open or use provided socket for client
 %% Match address family based on the remote address
@@ -823,7 +857,8 @@ handshaking(EventType, EventContent, State) ->
 
 connected(enter, OldState, #state{owner = Owner, conn_ref = Ref, alpn = Alpn,
                                    socket = Socket, role = Role,
-                                   pending_data = Pending} = State)
+                                   pending_data = Pending,
+                                   transport_params = TransportParams} = State)
   when OldState =:= handshaking; OldState =:= idle ->
     %% Notify owner that connection is established
     Info = #{
@@ -840,7 +875,18 @@ connected(enter, OldState, #state{owner = Owner, conn_ref = Ref, alpn = Alpn,
     %% Send any data that was queued before connection established
     State1 = State#state{pending_data = []},
     State2 = send_pending_data(Pending, State1),
-    {keep_state, State2};
+    %% RFC 9000 Section 9.6: Client validates server's preferred address
+    State3 = case Role of
+        client ->
+            case maps:get(preferred_address, TransportParams, undefined) of
+                undefined -> State2;
+                PA when is_record(PA, preferred_address) ->
+                    initiate_preferred_address_validation(PA, State2);
+                _ -> State2
+            end;
+        server -> State2
+    end,
+    {keep_state, State3};
 
 connected({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
@@ -1233,7 +1279,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     } = State,
 
     %% Build transport parameters
-    TransportParams = #{
+    TransportParams0 = #{
         initial_scid => SCID,
         initial_max_data => MaxData,
         initial_max_stream_data_bidi_local => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
@@ -1244,6 +1290,14 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         max_idle_timeout => State#state.idle_timeout,
         active_connection_id_limit => 2
     },
+    %% Add preferred_address if configured (RFC 9000 Section 9.6)
+    %% Server MUST NOT send preferred_address if disable_active_migration is set
+    TransportParams = case State#state.server_preferred_address of
+        #preferred_address{} = PA ->
+            TransportParams0#{preferred_address => PA};
+        _ ->
+            TransportParams0
+    end,
 
     %% Build EncryptedExtensions
     EncExtMsg = quic_tls:build_encrypted_extensions(#{
@@ -3677,6 +3731,42 @@ initiate_path_validation(RemoteAddr, State) ->
     %% For now, send on the current path (for testing)
     send_app_packet(ChallengeFrame, State1).
 
+%% @doc Initiate path validation for server's preferred address (RFC 9000 Section 9.6).
+%% Client validates the preferred address before migrating to it.
+%% Prefers IPv6 over IPv4 when both are available.
+-spec initiate_preferred_address_validation(#preferred_address{}, #state{}) -> #state{}.
+initiate_preferred_address_validation(#preferred_address{cid = CID, stateless_reset_token = Token} = PA, State) ->
+    %% RFC 9000 Section 9.6: Client MUST use the new CID when communicating on preferred path
+    %% Add the new CID to peer's pool
+    CIDEntry = #cid_entry{
+        seq_num = 1,  % Preferred address CID has implicit sequence number 1
+        cid = CID,
+        stateless_reset_token = Token,
+        status = active
+    },
+    State1 = State#state{
+        peer_cid_pool = [CIDEntry | State#state.peer_cid_pool],
+        preferred_address = PA
+    },
+    %% Choose address - prefer IPv6 over IPv4
+    case select_preferred_addr(PA) of
+        undefined ->
+            %% No valid address to validate
+            State1;
+        RemoteAddr ->
+            initiate_path_validation(RemoteAddr, State1)
+    end.
+
+%% Select the preferred address (IPv6 over IPv4)
+select_preferred_addr(#preferred_address{ipv6_addr = IPv6, ipv6_port = IPv6Port})
+  when IPv6 =/= undefined, IPv6Port =/= undefined ->
+    {IPv6, IPv6Port};
+select_preferred_addr(#preferred_address{ipv4_addr = IPv4, ipv4_port = IPv4Port})
+  when IPv4 =/= undefined, IPv4Port =/= undefined ->
+    {IPv4, IPv4Port};
+select_preferred_addr(_) ->
+    undefined.
+
 %% @doc Rebind socket to a new local port (simulates network change).
 %% Closes the old socket and creates a new one with a different ephemeral port.
 -spec rebind_socket(gen_udp:socket()) -> {ok, gen_udp:socket()} | {error, term()}.
@@ -3697,6 +3787,7 @@ rebind_socket(OldSocket) ->
 
 %% @doc Handle PATH_RESPONSE frame.
 %% Validates the response against pending challenges.
+%% RFC 9000 Section 9.6: Auto-migrate to preferred address on validation success.
 handle_path_response(ResponseData, State) ->
     %% Find the path with matching challenge data
     case find_path_by_challenge(ResponseData, State#state.alt_paths) of
@@ -3706,7 +3797,9 @@ handle_path_response(ResponseData, State) ->
                 status = validated,
                 challenge_data = undefined
             },
-            State#state{alt_paths = [ValidatedPath | OtherPaths]};
+            State1 = State#state{alt_paths = [ValidatedPath | OtherPaths]},
+            %% Check if this is a preferred address validation - auto-migrate
+            maybe_migrate_to_preferred_address(ValidatedPath, State1);
         not_found ->
             %% Check current path (if we sent challenge on current path)
             case State#state.current_path of
@@ -3721,6 +3814,42 @@ handle_path_response(ResponseData, State) ->
                     State
             end
     end.
+
+%% @doc Auto-migrate to preferred address if the validated path matches.
+%% RFC 9000 Section 9.6: Client SHOULD migrate to validated preferred address.
+-spec maybe_migrate_to_preferred_address(#path_state{}, #state{}) -> #state{}.
+maybe_migrate_to_preferred_address(ValidatedPath, #state{preferred_address = undefined} = State) ->
+    %% No preferred address, just return
+    State#state{alt_paths = [ValidatedPath | State#state.alt_paths]};
+maybe_migrate_to_preferred_address(#path_state{remote_addr = RemoteAddr} = ValidatedPath,
+                                   #state{preferred_address = PA} = State) ->
+    %% Check if validated path matches the preferred address
+    case is_preferred_address_path(RemoteAddr, PA) of
+        true ->
+            %% Migrate to preferred address using the new CID
+            State1 = complete_migration(ValidatedPath, State),
+            %% Switch to preferred address CID
+            State2 = switch_to_preferred_cid(PA, State1),
+            %% Clear the preferred_address field since migration is complete
+            State2#state{preferred_address = undefined};
+        false ->
+            State
+    end.
+
+%% Check if remote address matches the preferred address
+is_preferred_address_path({IPv4, Port}, #preferred_address{ipv4_addr = IPv4, ipv4_port = Port})
+  when IPv4 =/= undefined ->
+    true;
+is_preferred_address_path({IPv6, Port}, #preferred_address{ipv6_addr = IPv6, ipv6_port = Port})
+  when IPv6 =/= undefined ->
+    true;
+is_preferred_address_path(_, _) ->
+    false.
+
+%% Switch to using the CID from preferred_address
+switch_to_preferred_cid(#preferred_address{cid = CID}, State) ->
+    %% RFC 9000 Section 9.6: MUST use the new CID on the preferred address
+    State#state{dcid = CID}.
 
 %% Find a path by challenge data
 find_path_by_challenge(_Data, []) ->

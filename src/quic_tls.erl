@@ -50,6 +50,10 @@
     encode_transport_params/1,
     decode_transport_params/1,
 
+    %% Preferred address (RFC 9000 Section 9.6)
+    encode_preferred_address/1,
+    decode_preferred_address/1,
+
     %% TLS message framing
     encode_handshake_message/2,
     decode_handshake_message/1
@@ -457,6 +461,8 @@ encode_transport_param(active_connection_id_limit, Value) ->
     encode_tp(?TP_ACTIVE_CONNECTION_ID_LIMIT, quic_varint:encode(Value));
 encode_transport_param(initial_scid, Value) ->
     encode_tp(?TP_INITIAL_SCID, Value);
+encode_transport_param(preferred_address, #preferred_address{} = PA) ->
+    encode_tp(?TP_PREFERRED_ADDRESS, encode_preferred_address(PA));
 encode_transport_param(_, _) ->
     <<>>.
 
@@ -508,11 +514,75 @@ decode_tp_value(?TP_STATELESS_RESET_TOKEN, Value) -> Value;
 decode_tp_value(?TP_INITIAL_SCID, Value) -> Value;
 decode_tp_value(?TP_RETRY_SCID, Value) -> Value;
 decode_tp_value(?TP_DISABLE_ACTIVE_MIGRATION, <<>>) -> true;
-decode_tp_value(?TP_PREFERRED_ADDRESS, Value) -> Value;
+decode_tp_value(?TP_PREFERRED_ADDRESS, Value) -> decode_preferred_address(Value);
 decode_tp_value(_, Value) ->
     %% Most parameters are varints
     {Int, _} = quic_varint:decode(Value),
     Int.
+
+%% @doc Decode preferred_address transport parameter (RFC 9000 Section 18.2).
+%% Format:
+%%   IPv4 address:     4 bytes
+%%   IPv4 port:        2 bytes
+%%   IPv6 address:    16 bytes
+%%   IPv6 port:        2 bytes
+%%   CID length:       1 byte
+%%   Connection ID:    variable (0-20 bytes)
+%%   Stateless reset: 16 bytes
+-spec decode_preferred_address(binary()) -> #preferred_address{}.
+decode_preferred_address(<<
+    IPv4_A:8, IPv4_B:8, IPv4_C:8, IPv4_D:8,
+    IPv4Port:16,
+    IPv6_1:16, IPv6_2:16, IPv6_3:16, IPv6_4:16,
+    IPv6_5:16, IPv6_6:16, IPv6_7:16, IPv6_8:16,
+    IPv6Port:16,
+    CIDLen:8, CID:CIDLen/binary,
+    StatelessResetToken:16/binary,
+    _Rest/binary
+>>) ->
+    %% Parse IPv4 - zero address means not present
+    {IPv4Addr, IPv4PortVal} = case {IPv4_A, IPv4_B, IPv4_C, IPv4_D, IPv4Port} of
+        {0, 0, 0, 0, 0} -> {undefined, undefined};
+        _ -> {{IPv4_A, IPv4_B, IPv4_C, IPv4_D}, IPv4Port}
+    end,
+    %% Parse IPv6 - zero address means not present
+    {IPv6Addr, IPv6PortVal} = case {IPv6_1, IPv6_2, IPv6_3, IPv6_4, IPv6_5, IPv6_6, IPv6_7, IPv6_8, IPv6Port} of
+        {0, 0, 0, 0, 0, 0, 0, 0, 0} -> {undefined, undefined};
+        _ -> {{IPv6_1, IPv6_2, IPv6_3, IPv6_4, IPv6_5, IPv6_6, IPv6_7, IPv6_8}, IPv6Port}
+    end,
+    #preferred_address{
+        ipv4_addr = IPv4Addr,
+        ipv4_port = IPv4PortVal,
+        ipv6_addr = IPv6Addr,
+        ipv6_port = IPv6PortVal,
+        cid = CID,
+        stateless_reset_token = StatelessResetToken
+    }.
+
+%% @doc Encode preferred_address transport parameter (RFC 9000 Section 18.2).
+-spec encode_preferred_address(#preferred_address{}) -> binary().
+encode_preferred_address(#preferred_address{
+    ipv4_addr = IPv4Addr,
+    ipv4_port = IPv4Port,
+    ipv6_addr = IPv6Addr,
+    ipv6_port = IPv6Port,
+    cid = CID,
+    stateless_reset_token = Token
+}) ->
+    %% Encode IPv4 (zeros if not present)
+    IPv4Bin = case IPv4Addr of
+        {A, B, C, D} -> <<A, B, C, D, IPv4Port:16>>;
+        undefined -> <<0, 0, 0, 0, 0:16>>
+    end,
+    %% Encode IPv6 (zeros if not present)
+    IPv6Bin = case IPv6Addr of
+        {V1, V2, V3, V4, V5, V6, V7, V8} ->
+            <<V1:16, V2:16, V3:16, V4:16, V5:16, V6:16, V7:16, V8:16, IPv6Port:16>>;
+        undefined ->
+            <<0:128, 0:16>>
+    end,
+    CIDLen = byte_size(CID),
+    <<IPv4Bin/binary, IPv6Bin/binary, CIDLen:8, CID/binary, Token/binary>>.
 
 %%====================================================================
 %% TLS Message Framing

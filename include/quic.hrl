@@ -305,6 +305,21 @@
     rtt :: non_neg_integer() | undefined
 }).
 
+%% Preferred Address for Server Migration (RFC 9000 Section 9.6)
+%% Server advertises this to clients for connection migration.
+-record(preferred_address, {
+    %% IPv4 address (optional)
+    ipv4_addr :: inet:ip4_address() | undefined,
+    ipv4_port :: inet:port_number() | undefined,
+    %% IPv6 address (optional)
+    ipv6_addr :: inet:ip6_address() | undefined,
+    ipv6_port :: inet:port_number() | undefined,
+    %% Connection ID for the preferred address
+    cid :: binary(),
+    %% Stateless reset token (16 bytes)
+    stateless_reset_token :: binary()
+}).
+
 %% Session Ticket for 0-RTT (RFC 9001 Section 4.6)
 %% Stores session ticket information for resumption.
 -record(session_ticket, {
