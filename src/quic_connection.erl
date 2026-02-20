@@ -210,8 +210,12 @@
     loss_state :: quic_loss:loss_state() | undefined,
     pto_timer :: reference() | undefined,
 
-    %% Pending data
-    send_queue = [] :: [term()],
+    %% Pending data - priority queue with 8 buckets (one per urgency 0-7)
+    %% Each bucket is a queue:queue() for FIFO within same priority
+    send_queue = {queue:new(), queue:new(), queue:new(), queue:new(),
+                  queue:new(), queue:new(), queue:new(), queue:new()} :: tuple(),
+    %% Pre-connection pending sends (simple list, processed when connected)
+    pending_data = [] :: [{non_neg_integer(), iodata(), boolean()}],
 
     %% Close reason
     close_reason :: term(),
@@ -723,8 +727,8 @@ idle({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) ->
 
 %% 0-RTT: Allow sending data in idle state if early keys are available
 idle({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = undefined} = State) ->
-    Queue = State#state.send_queue ++ [{StreamId, Data, Fin}],
-    {keep_state, State#state{send_queue = Queue}, [{reply, From, ok}]};
+    Pending = State#state.pending_data ++ [{StreamId, Data, Fin}],
+    {keep_state, State#state{pending_data = Pending}, [{reply, From, ok}]};
 idle({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = _} = State) ->
     case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
         {ok, NewState} ->
@@ -788,8 +792,8 @@ handshaking({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) 
 %% 0-RTT: Allow sending data during handshake if early keys are available
 handshaking({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = undefined} = State) ->
     %% No early keys, queue the data for later
-    Queue = State#state.send_queue ++ [{StreamId, Data, Fin}],
-    {keep_state, State#state{send_queue = Queue}, [{reply, From, ok}]};
+    Pending = State#state.pending_data ++ [{StreamId, Data, Fin}],
+    {keep_state, State#state{pending_data = Pending}, [{reply, From, ok}]};
 handshaking({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = _} = State) ->
     %% Send as 0-RTT data
     case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
@@ -818,7 +822,8 @@ handshaking(EventType, EventContent, State) ->
 %% ----- CONNECTED STATE -----
 
 connected(enter, OldState, #state{owner = Owner, conn_ref = Ref, alpn = Alpn,
-                                   socket = Socket, role = Role} = State)
+                                   socket = Socket, role = Role,
+                                   pending_data = Pending} = State)
   when OldState =:= handshaking; OldState =:= idle ->
     %% Notify owner that connection is established
     Info = #{
@@ -832,7 +837,10 @@ connected(enter, OldState, #state{owner = Owner, conn_ref = Ref, alpn = Alpn,
         client -> inet:setopts(Socket, [{active, once}]);
         server -> ok
     end,
-    {keep_state, State};
+    %% Send any data that was queued before connection established
+    State1 = State#state{pending_data = []},
+    State2 = send_pending_data(Pending, State1),
+    {keep_state, State2};
 
 connected({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
@@ -3184,11 +3192,12 @@ send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) ->
     end.
 
 %% Queue stream data when congestion window is full
-%% Includes stream urgency for priority-based scheduling (RFC 9218)
-queue_stream_data(StreamId, Offset, Data, Fin, #state{send_queue = Queue, streams = Streams} = State) ->
+%% Uses bucket-based priority queue for O(1) insert (RFC 9218)
+queue_stream_data(StreamId, Offset, Data, Fin, #state{send_queue = PQ, streams = Streams} = State) ->
     Urgency = get_stream_urgency(StreamId, Streams),
-    QueueEntry = {stream_data, StreamId, Offset, Data, Fin, Urgency},
-    State#state{send_queue = Queue ++ [QueueEntry]}.
+    Entry = {stream_data, StreamId, Offset, Data, Fin},
+    NewPQ = pqueue_in(Entry, Urgency, PQ),
+    State#state{send_queue = NewPQ}.
 
 %% Get stream urgency (default 3 if stream not found)
 get_stream_urgency(StreamId, Streams) ->
@@ -3199,43 +3208,80 @@ get_stream_urgency(StreamId, Streams) ->
 
 %% Process send queue when congestion window frees up
 %% Processes streams in priority order (lower urgency = higher priority)
-process_send_queue(#state{send_queue = []} = State) ->
-    State;
-process_send_queue(#state{send_queue = Queue} = State) ->
-    %% Sort queue by urgency (lower = more urgent = processed first)
-    SortedQueue = lists:sort(fun compare_queue_priority/2, Queue),
-    process_sorted_queue(State#state{send_queue = SortedQueue}).
-
-%% Compare queue entries by priority (for sorting)
-compare_queue_priority({stream_data, _, _, _, _, Urgency1},
-                       {stream_data, _, _, _, _, Urgency2}) ->
-    Urgency1 =< Urgency2;
-%% Handle legacy entries without urgency (treat as default priority 3)
-compare_queue_priority({stream_data, _, _, _, _}, _) ->
-    true;
-compare_queue_priority(_, {stream_data, _, _, _, _}) ->
-    false.
-
-%% Process the sorted queue
-process_sorted_queue(#state{send_queue = []} = State) ->
-    State;
-process_sorted_queue(#state{send_queue = [Entry | Rest]} = State) ->
-    %% Extract entry (handle both with and without urgency for compatibility)
-    {StreamId, Offset, Data, Fin} = extract_queue_entry(Entry),
-    %% Try to send the queued data
-    State1 = State#state{send_queue = Rest},
-    State2 = send_stream_data_fragmented(StreamId, Offset, Data, Fin, State1),
-    %% If data was queued again (cwnd still full), stop processing
-    case State2#state.send_queue of
-        [_ | _] -> State2;  % Queue has items, stop for now
-        [] -> process_sorted_queue(State2)  % Keep processing
+process_send_queue(#state{send_queue = PQ} = State) ->
+    case pqueue_out(PQ) of
+        {empty, _} ->
+            State;
+        {{value, {stream_data, StreamId, Offset, Data, Fin}}, NewPQ} ->
+            State1 = State#state{send_queue = NewPQ},
+            State2 = send_stream_data_fragmented(StreamId, Offset, Data, Fin, State1),
+            %% If data was queued again (cwnd still full), stop processing
+            case pqueue_is_empty(State2#state.send_queue) of
+                true -> State2;
+                false ->
+                    %% Check if we just queued more data (cwnd full)
+                    case State2#state.send_queue =:= State1#state.send_queue of
+                        true -> process_send_queue(State2);  % Keep processing
+                        false -> State2  % New data queued, cwnd full
+                    end
+            end
     end.
 
-%% Extract stream data from queue entry (handles both formats for compatibility)
-extract_queue_entry({stream_data, StreamId, Offset, Data, Fin, _Urgency}) ->
-    {StreamId, Offset, Data, Fin};
-extract_queue_entry({stream_data, StreamId, Offset, Data, Fin}) ->
-    {StreamId, Offset, Data, Fin}.
+%%--------------------------------------------------------------------
+%% Priority Queue - Bucket-based implementation for urgency 0-7
+%% O(1) insert, O(1) dequeue (8 buckets = constant)
+%%--------------------------------------------------------------------
+
+%% Insert entry at given urgency level (0-7)
+pqueue_in(Entry, Urgency, PQ) when Urgency >= 0, Urgency =< 7 ->
+    Bucket = element(Urgency + 1, PQ),
+    NewBucket = queue:in(Entry, Bucket),
+    setelement(Urgency + 1, PQ, NewBucket).
+
+%% Remove and return highest priority (lowest urgency) entry
+pqueue_out(PQ) ->
+    pqueue_out(PQ, 0).
+
+pqueue_out(_PQ, 8) ->
+    {empty, empty_pqueue()};
+pqueue_out(PQ, Urgency) ->
+    Bucket = element(Urgency + 1, PQ),
+    case queue:out(Bucket) of
+        {empty, _} ->
+            pqueue_out(PQ, Urgency + 1);
+        {{value, Entry}, NewBucket} ->
+            NewPQ = setelement(Urgency + 1, PQ, NewBucket),
+            {{value, Entry}, NewPQ}
+    end.
+
+%% Check if priority queue is empty
+pqueue_is_empty(PQ) ->
+    pqueue_is_empty(PQ, 0).
+
+pqueue_is_empty(_PQ, 8) ->
+    true;
+pqueue_is_empty(PQ, Urgency) ->
+    case queue:is_empty(element(Urgency + 1, PQ)) of
+        true -> pqueue_is_empty(PQ, Urgency + 1);
+        false -> false
+    end.
+
+%% Create empty priority queue
+empty_pqueue() ->
+    {queue:new(), queue:new(), queue:new(), queue:new(),
+     queue:new(), queue:new(), queue:new(), queue:new()}.
+
+%% Send data that was queued before connection was established
+send_pending_data([], State) ->
+    State;
+send_pending_data([{StreamId, Data, Fin} | Rest], State) ->
+    case do_send_data(StreamId, Data, Fin, State) of
+        {ok, NewState} ->
+            send_pending_data(Rest, NewState);
+        {error, _Reason} ->
+            %% Skip failed sends
+            send_pending_data(Rest, State)
+    end.
 
 %% Close a stream
 do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
