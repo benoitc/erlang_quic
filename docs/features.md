@@ -108,6 +108,14 @@
 - `quic:accept/1,2` - Accept connection
 - `quic:close_listener/1` - Close listener
 
+### Multi-Pool Server Management
+- `quic:start_server/3` - Start named server pool
+- `quic:stop_server/1` - Stop named server
+- `quic:get_server_info/1` - Get server information
+- `quic:get_server_port/1` - Get server listening port
+- `quic:get_server_connections/1` - Get server connection PIDs
+- `quic:which_servers/0` - List all running servers
+
 ### Options
 - `idle_timeout` - Connection idle timeout in milliseconds (0 to disable)
 - `max_data` - Connection-level flow control limit
@@ -116,6 +124,8 @@
 - `verify` - Certificate verification mode
 - `preferred_ipv4` - Server preferred IPv4 address
 - `preferred_ipv6` - Server preferred IPv6 address
+- `pool_size` - Number of listener processes for server pools (default: 1)
+- `connection_handler` - Callback for handling new connections
 
 ## Interop Runner Compliance
 

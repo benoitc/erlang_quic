@@ -1,7 +1,8 @@
 {application, quic, [
     {description, "Pure Erlang QUIC implementation (RFC 9000)"},
     {vsn, "0.8.0"},
-    {registered, []},
+    {registered, [quic_sup, quic_server_registry, quic_server_sup]},
+    {mod, {quic_app, []}},
     {applications, [
         kernel,
         stdlib,

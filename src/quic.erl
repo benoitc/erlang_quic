@@ -53,6 +53,16 @@
     get_stream_priority/2
 ]).
 
+%% Server management API
+-export([
+    start_server/3,
+    stop_server/1,
+    get_server_info/1,
+    get_server_port/1,
+    get_server_connections/1,
+    which_servers/0
+]).
+
 -export([is_available/0, get_fd/1]).
 
 %%====================================================================
@@ -342,3 +352,90 @@ get_stream_priority(ConnPid, StreamId) when is_pid(ConnPid) ->
     quic_connection:get_stream_priority(ConnPid, StreamId);
 get_stream_priority(_ConnRef, _StreamId) ->
     {error, badarg}.
+
+%%====================================================================
+%% Server Management API
+%%====================================================================
+
+%% @doc Start a named QUIC server on the specified port.
+%%
+%% Creates a listener pool that accepts incoming QUIC connections.
+%% Multiple named servers can run on different ports.
+%%
+%% Options:
+%% <ul>
+%%   <li>`cert' - DER-encoded certificate (required)</li>
+%%   <li>`key' - Private key term (required)</li>
+%%   <li>`alpn' - List of ALPN protocols (default: [&lt;&lt;"h3"&gt;&gt;])</li>
+%%   <li>`pool_size' - Number of listener processes (default: 1)</li>
+%%   <li>`connection_handler' - Fun(ConnPid, ConnRef) -> {ok, HandlerPid}</li>
+%% </ul>
+%%
+%% Example:
+%% ```
+%% {ok, _} = quic:start_server(my_server, 4433, #{
+%%     cert => CertDer,
+%%     key => KeyTerm,
+%%     alpn => [<<"h3">>],
+%%     pool_size => 4
+%% }).
+%% '''
+-spec start_server(Name, Port, Opts) -> {ok, pid()} | {error, term()}
+    when Name :: atom(),
+         Port :: inet:port_number(),
+         Opts :: map().
+start_server(Name, Port, Opts) when is_atom(Name), is_integer(Port),
+                                    Port >= 0, Port =< 65535, is_map(Opts) ->
+    quic_server_sup:start_server(Name, Port, Opts);
+start_server(_Name, _Port, _Opts) ->
+    {error, badarg}.
+
+%% @doc Stop a named QUIC server.
+%%
+%% Stops the server and all its connections.
+%% The port will be freed for reuse.
+-spec stop_server(Name) -> ok | {error, term()}
+    when Name :: atom().
+stop_server(Name) when is_atom(Name) ->
+    quic_server_sup:stop_server(Name);
+stop_server(_Name) ->
+    {error, badarg}.
+
+%% @doc Get information about a named server.
+%%
+%% Returns a map containing:
+%% <ul>
+%%   <li>`pid' - Server supervisor PID</li>
+%%   <li>`port' - Listening port</li>
+%%   <li>`opts' - Server options</li>
+%%   <li>`started_at' - Start timestamp in milliseconds</li>
+%% </ul>
+-spec get_server_info(Name) -> {ok, map()} | {error, not_found}
+    when Name :: atom().
+get_server_info(Name) when is_atom(Name) ->
+    quic_server_registry:lookup(Name);
+get_server_info(_Name) ->
+    {error, badarg}.
+
+%% @doc Get the listening port of a named server.
+%%
+%% Useful when the server was started with port 0 (ephemeral port).
+-spec get_server_port(Name) -> {ok, inet:port_number()} | {error, not_found}
+    when Name :: atom().
+get_server_port(Name) when is_atom(Name) ->
+    quic_server_registry:get_port(Name);
+get_server_port(_Name) ->
+    {error, badarg}.
+
+%% @doc Get the list of connection PIDs for a named server.
+-spec get_server_connections(Name) -> {ok, [pid()]} | {error, not_found}
+    when Name :: atom().
+get_server_connections(Name) when is_atom(Name) ->
+    quic_server_registry:get_connections(Name);
+get_server_connections(_Name) ->
+    {error, badarg}.
+
+%% @doc List all running server names.
+-spec which_servers() -> [atom()].
+which_servers() ->
+    quic_server_registry:list().

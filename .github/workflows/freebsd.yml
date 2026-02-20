@@ -1,0 +1,38 @@
+name: FreeBSD CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: FreeBSD
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.2'
+          usesh: true
+          prepare: |
+            pkg install -y erlang rebar3 git
+          run: |
+            # Verify Erlang version
+            erl -eval 'io:format("OTP ~s~n", [erlang:system_info(otp_release)]), halt().' -noshell
+
+            # Compile
+            rebar3 compile
+
+            # Run unit tests
+            rebar3 eunit
+
+            # Run property tests (if available)
+            rebar3 proper || true
+
+            # Run CT suites
+            rebar3 ct --suite=quic_multi_server_SUITE

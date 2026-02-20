@@ -68,56 +68,35 @@ get_listeners(Sup) ->
 %%====================================================================
 
 init({Port, Opts}) ->
-    PoolSize = maps:get(pool_size, Opts, 1),
+    Self = self(),
 
-    %% Create shared named ETS table for all listeners in the pool
-    %% Use public access so all listener processes can read/write
-    Tab = ets:new(quic_pool_connections, [set, public, {read_concurrency, true}]),
+    %% Register with server registry if name is provided
+    %% This handles both initial start and supervisor restarts
+    case maps:get(name, Opts, undefined) of
+        undefined ->
+            ok;
+        Name when is_atom(Name) ->
+            %% Use catch in case registry isn't started (standalone listener_sup usage)
+            catch quic_server_registry:register(Name, Self, Port, Opts)
+    end,
 
-    %% Create global ticket store for 0-RTT support
-    ensure_ticket_table(),
+    SupFlags = #{strategy => rest_for_one, intensity => 10, period => 5},
 
-    %% Generate shared reset secret for consistent stateless resets
-    ResetSecret = maps:get(reset_secret, Opts, crypto:strong_rand_bytes(32)),
-
-    %% Configure pool options
-    PoolOpts = Opts#{
-        connections_table => Tab,
-        reset_secret => ResetSecret,
-        reuseport => PoolSize > 1
+    Manager = #{
+        id => quic_listener_manager,
+        start => {quic_listener_manager, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [quic_listener_manager]
     },
 
-    %% Create child specs for each listener in the pool
-    Children = [
-        #{
-            id => {quic_listener, N},
-            start => {quic_listener, start_link, [Port, PoolOpts]},
+    ListenerSupSup = #{
+            id => quic_listener_sup_sup,
+            start => {quic_listener_sup_sup, start_link, [Port, Opts, Self]},
             restart => permanent,
-            shutdown => 5000,
-            type => worker,
-            modules => [quic_listener]
-        }
-        || N <- lists:seq(1, PoolSize)
-    ],
+            type => supervisor,
+            modules => [quic_listener_sup_sup]
+        },
 
-    {ok, {#{strategy => one_for_one, intensity => 10, period => 5}, Children}}.
-
-%%====================================================================
-%% Internal Functions
-%%====================================================================
-
-%% Table name for server ticket storage (shared with quic_connection)
--define(TICKET_TABLE, quic_server_tickets).
-
-%% Create the global ticket table if it doesn't exist
-ensure_ticket_table() ->
-    case ets:whereis(?TICKET_TABLE) of
-        undefined ->
-            try
-                ets:new(?TICKET_TABLE, [named_table, public, set, {read_concurrency, true}])
-            catch
-                error:badarg -> ok  % Table already exists (race condition)
-            end;
-        _ ->
-            ok
-    end.
+    {ok, {SupFlags, [Manager, ListenerSupSup]}}.

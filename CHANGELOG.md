@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-02-20
+
+### Added
+- Multi-pool server support with ranch-style named server pools
+- `quic:start_server/3` to start named server with connection pooling
+- `quic:stop_server/1` to stop named server
+- `quic:get_server_info/1` to get server information (pid, port, opts, started_at)
+- `quic:get_server_port/1` to get server listening port
+- `quic:get_server_connections/1` to get server connection PIDs
+- `quic:which_servers/0` to list all running servers
+- Application supervision structure (`quic_app`, `quic_sup`, `quic_server_sup`)
+- ETS-based server registry (`quic_server_registry`) with process monitoring
+- `pool_size` option for listener process pooling with SO_REUSEPORT
+- FreeBSD CI testing workflow
+- Expanded Linux CI matrix (Ubuntu 22.04/24.04, OTP 26-28)
+
+### Changed
+- `quic.app.src` now includes `{mod, {quic_app, []}}` for OTP application behaviour
+- Listener supervisor registers with server registry on init for restart recovery
+
 ## [0.8.0] - 2026-02-20
 
 ### Added
