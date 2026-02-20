@@ -35,18 +35,20 @@ docker run \
 
 ## Supported Test Cases
 
+All core test cases pass:
+
 | Test Case | Client | Server | Notes |
 |-----------|--------|--------|-------|
-| `handshake` | Yes | Yes | Basic QUIC handshake |
-| `transfer` | Yes | Yes | File download with flow control |
-| `retry` | Yes | Yes | Retry packet handling |
-| `keyupdate` | Yes | Yes | Key rotation during transfer |
-| `chacha20` | Yes | Yes | ChaCha20-Poly1305 only |
-| `multiconnect` | Yes | Yes | Multiple connections |
-| `v2` | Partial | Partial | QUIC v2 support |
-| `resumption` | No | No | Session resumption (planned) |
-| `zerortt` | No | No | 0-RTT early data (planned) |
-| `connectionmigration` | No | No | Active migration (planned) |
+| `handshake` | ✓ | ✓ | Basic QUIC handshake |
+| `transfer` | ✓ | ✓ | File download with flow control |
+| `retry` | ✓ | ✓ | Retry packet handling |
+| `keyupdate` | ✓ | ✓ | Key rotation during transfer |
+| `chacha20` | ✓ | ✓ | ChaCha20-Poly1305 only |
+| `multiconnect` | ✓ | ✓ | Multiple connections |
+| `v2` | ✓ | ✓ | QUIC v2 support |
+| `resumption` | - | - | Session resumption (planned) |
+| `zerortt` | - | - | 0-RTT early data (planned) |
+| `connectionmigration` | - | - | Active migration (planned) |
 
 ## Integration with Official Runner
 

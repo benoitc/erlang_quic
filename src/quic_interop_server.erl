@@ -147,19 +147,33 @@ spawn_handler(ConnPid, ConnRef, WwwDir, TestCase) ->
     {ok, HandlerPid}.
 
 connection_handler(ConnPid, ConnRef, WwwDir, TestCase) ->
+    io:format("Handler started, waiting for messages...~n"),
     %% Wait for stream data
     receive
+        {quic, ConnRef, {connected, Info}} ->
+            io:format("Handler got connected: ~p~n", [Info]),
+            connection_handler(ConnPid, ConnRef, WwwDir, TestCase);
+
         {quic, ConnRef, {stream_opened, StreamId}} ->
+            io:format("Handler got stream_opened: ~p~n", [StreamId]),
             handle_stream(ConnPid, ConnRef, StreamId, WwwDir, TestCase);
 
-        {quic, ConnRef, {stream_data, StreamId, Data, _Fin}} ->
+        {quic, ConnRef, {stream_data, StreamId, Data, Fin}} ->
+            io:format("Handler got stream_data: stream=~p size=~p fin=~p~n",
+                      [StreamId, byte_size(Data), Fin]),
             %% Handle request
             handle_request(ConnPid, ConnRef, StreamId, Data, WwwDir, TestCase);
 
-        {quic, ConnRef, {closed, _Reason}} ->
-            ok
+        {quic, ConnRef, {closed, Reason}} ->
+            io:format("Handler got closed: ~p~n", [Reason]),
+            ok;
+
+        Other ->
+            io:format("Handler got unexpected: ~p~n", [Other]),
+            connection_handler(ConnPid, ConnRef, WwwDir, TestCase)
 
     after 60000 ->
+        io:format("Handler timeout~n"),
         ok
     end.
 
@@ -173,9 +187,11 @@ handle_stream(_ConnPid, ConnRef, StreamId, WwwDir, TestCase) ->
     end.
 
 handle_request(_ConnPid, ConnRef, StreamId, Data, WwwDir, TestCase) ->
+    io:format("handle_request: stream=~p data=~p~n", [StreamId, Data]),
     %% Parse simple HTTP/0.9 request: "GET /path\r\n"
     case parse_request(Data) of
         {ok, Path} ->
+            io:format("Parsed request path: ~p~n", [Path]),
             %% Handle key update test
             case TestCase of
                 "keyupdate" ->
@@ -189,13 +205,19 @@ handle_request(_ConnPid, ConnRef, StreamId, Data, WwwDir, TestCase) ->
 
             %% Serve file
             FilePath = filename:join(WwwDir, Path),
+            io:format("Reading file: ~p~n", [FilePath]),
             case file:read_file(FilePath) of
                 {ok, Content} ->
-                    quic:send_data(ConnRef, StreamId, Content, true);
-                {error, _} ->
+                    io:format("Sending ~p bytes on stream ~p~n", [byte_size(Content), StreamId]),
+                    Result = quic:send_data(ConnRef, StreamId, Content, true),
+                    io:format("send_data result: ~p~n", [Result]),
+                    Result;
+                {error, ReadErr} ->
+                    io:format("File read error: ~p, sending 404~n", [ReadErr]),
                     quic:send_data(ConnRef, StreamId, <<"404 Not Found">>, true)
             end;
         error ->
+            io:format("Parse error, sending 400~n"),
             quic:send_data(ConnRef, StreamId, <<"400 Bad Request">>, true)
     end.
 

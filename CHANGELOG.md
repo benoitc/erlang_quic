@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-02-20
+
+### Added
+- Docker interop runner integration (client and server images)
+- All 7 QUIC Interop Runner test cases now pass:
+  - handshake, transfer, retry, keyupdate, chacha20, multiconnect, v2
+
+### Fixed
+- Server DCID initialization: server now correctly sets DCID from client's
+  Initial packet SCID field, fixing short header packet alignment
+- Key update HP key preservation: header protection keys are no longer rotated
+  during key updates per RFC 9001 Section 6.6
+- Fixed bit validation: skip padding bytes (0x00) and invalid short headers
+  (fixed bit not set) in coalesced packets
+- Role-based key selection in 1-RTT packet decryption
+
 ## [0.6.5] - 2026-02-19
 
 ### Added

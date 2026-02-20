@@ -140,6 +140,22 @@ rebar3 proper
 rebar3 eunit && rebar3 proper
 ```
 
+## Interoperability
+
+This implementation passes all [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner) test cases:
+
+| Test Case | Status |
+|-----------|--------|
+| handshake | ✓ |
+| transfer | ✓ |
+| retry | ✓ |
+| keyupdate | ✓ |
+| chacha20 | ✓ |
+| multiconnect | ✓ |
+| v2 | ✓ |
+
+See [interop/README.md](interop/README.md) for details on running interop tests.
+
 ## Documentation
 
 Generate documentation with:
