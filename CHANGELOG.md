@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - Unreleased
+
+### Added
+- RFC 9312 QUIC-LB Connection ID encoding support for load balancer routing
+- New `quic_lb` module with three encoding algorithms:
+  - Plaintext: server_id visible in CID (no encryption)
+  - Stream Cipher: AES-128-CTR encryption of server_id
+  - Block Cipher: 4-round Feistel network for <16 bytes, AES-CTR for 16 bytes,
+    truncated cipher for >16 bytes
+- `#lb_config{}` record for LB configuration (algorithm, server_id, key, nonce_len)
+- `#cid_config{}` record for CID generation configuration
+- `lb_config` option in `quic_listener` to enable LB-aware CID generation
+- Variable DCID length support in short header packet parsing
+- LB-aware CID generation in `quic_connection` for NEW_CONNECTION_ID frames
+- E2E test suite `quic_lb_e2e_SUITE` with 21 integration tests
+
 ## [0.9.0] - 2026-02-20
 
 ### Added
