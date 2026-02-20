@@ -73,19 +73,33 @@ quic:close(ConnRef, normal).
 {ok, CertDer} = file:read_file("server.crt"),
 {ok, KeyDer} = file:read_file("server.key"),
 
-%% Start listener
-{ok, Listener} = quic_listener:start_link(4433, #{
+%% Start a named server (recommended)
+{ok, _Pid} = quic:start_server(my_server, 4433, #{
     cert => CertDer,
     key => KeyDer,
     alpn => [<<"h3">>]
 }),
 
-%% Get the port (useful if 0 was specified)
-Port = quic_listener:get_port(Listener),
+%% Get the port (useful if 0 was specified for ephemeral port)
+{ok, Port} = quic:get_server_port(my_server),
 io:format("Listening on port ~p~n", [Port]),
 
 %% Incoming connections are handled automatically
-%% The listener spawns quic_connection processes for each client
+%% The server spawns quic_connection processes for each client
+
+%% Stop the server when done
+quic:stop_server(my_server).
+```
+
+Alternatively, use the low-level listener API directly:
+
+```erlang
+{ok, Listener} = quic_listener:start_link(4433, #{
+    cert => CertDer,
+    key => KeyDer,
+    alpn => [<<"h3">>]
+}),
+Port = quic_listener:get_port(Listener).
 ```
 
 ## Messages
@@ -150,7 +164,25 @@ Ranch-style named server pool management:
 - `quic:get_server_connections/1` - Get server connection PIDs
 - `quic:which_servers/0` - List all running servers
 
-Example:
+**Server Options:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `cert` | binary | required | DER-encoded server certificate |
+| `key` | term | required | Server private key |
+| `alpn` | [binary()] | `[<<"h3">>]` | ALPN protocols to advertise |
+| `pool_size` | pos_integer() | 1 | Number of listener processes (uses SO_REUSEPORT) |
+| `connection_handler` | fun/2 | none | Custom handler: `fun(ConnPid, ConnRef) -> {ok, HandlerPid}` |
+
+**Server Info Map:**
+
+`get_server_info/1` returns a map with:
+- `pid` - Server supervisor PID
+- `port` - Listening port number
+- `opts` - Server options map
+- `started_at` - Start timestamp (milliseconds since epoch)
+
+**Example:**
 
 ```erlang
 %% Start a named server with connection pooling
@@ -158,13 +190,14 @@ Example:
     cert => CertDer,
     key => KeyTerm,
     alpn => [<<"h3">>],
-    pool_size => 4  %% 4 listener processes
+    pool_size => 4  %% 4 listener processes with SO_REUSEPORT
 }),
 
 %% Query servers
-quic:which_servers().           %% => [my_server]
-quic:get_server_port(my_server). %% => {ok, 4433}
-quic:get_server_info(my_server). %% => {ok, #{port => 4433, ...}}
+quic:which_servers().             %% => [my_server]
+quic:get_server_port(my_server).  %% => {ok, 4433}
+quic:get_server_info(my_server).  %% => {ok, #{pid => <0.123.0>, port => 4433, ...}}
+quic:get_server_connections(my_server).  %% => {ok, [<0.150.0>, <0.151.0>]}
 
 %% Stop server
 quic:stop_server(my_server).
