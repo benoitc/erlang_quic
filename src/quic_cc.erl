@@ -38,6 +38,10 @@
     on_ecn_ce/2,
     ecn_ce_counter/1,
 
+    %% Persistent congestion (RFC 9002 Section 7.6)
+    detect_persistent_congestion/3,
+    on_persistent_congestion/1,
+
     %% Queries
     cwnd/1,
     ssthresh/1,
@@ -252,6 +256,40 @@ in_slow_start(#cc_state{cwnd = Cwnd, ssthresh = SSThresh}) ->
 %% @doc Check if in recovery phase.
 -spec in_recovery(cc_state()) -> boolean().
 in_recovery(#cc_state{in_recovery = R}) -> R.
+
+%%====================================================================
+%% Persistent Congestion (RFC 9002 Section 7.6)
+%%====================================================================
+
+%% @doc Detect persistent congestion from lost packets.
+%% Returns true if lost packets span more than PTO * kPersistentCongestionThreshold.
+%% LostPackets is a list of {PacketNumber, TimeSent} tuples.
+-spec detect_persistent_congestion([{non_neg_integer(), non_neg_integer()}],
+                                   non_neg_integer(), cc_state()) -> boolean().
+detect_persistent_congestion([], _PTO, _State) ->
+    false;
+detect_persistent_congestion([_], _PTO, _State) ->
+    %% Need at least 2 packets to establish a time span
+    false;
+detect_persistent_congestion(LostPackets, PTO, _State) ->
+    Times = [T || {_PN, T} <- LostPackets],
+    MinTime = lists:min(Times),
+    MaxTime = lists:max(Times),
+    CongestionPeriod = PTO * ?PERSISTENT_CONGESTION_THRESHOLD,
+    (MaxTime - MinTime) >= CongestionPeriod.
+
+%% @doc Reset to minimum window on persistent congestion (RFC 9002 §7.6.2).
+%% This is a severe response to prolonged packet loss.
+-spec on_persistent_congestion(cc_state()) -> cc_state().
+on_persistent_congestion(#cc_state{cwnd = Cwnd, max_datagram_size = MaxDS} = State) ->
+    NewSSThresh = max(trunc(Cwnd * ?LOSS_REDUCTION_FACTOR), ?MINIMUM_WINDOW),
+    State#cc_state{
+        cwnd = minimum_window(MaxDS),
+        ssthresh = NewSSThresh,
+        in_recovery = false,
+        recovery_start_time = undefined,
+        first_sent_time = undefined
+    }.
 
 %%====================================================================
 %% Internal Functions

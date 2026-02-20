@@ -245,6 +245,83 @@ cwnd_minimum_test() ->
     ?assert(FinalCwnd < InitialCwnd).
 
 %%====================================================================
+%% Persistent Congestion Tests (RFC 9002 Section 7.6)
+%%====================================================================
+
+detect_persistent_congestion_empty_test() ->
+    State = quic_cc:new(),
+    ?assertNot(quic_cc:detect_persistent_congestion([], 100, State)).
+
+detect_persistent_congestion_single_packet_test() ->
+    State = quic_cc:new(),
+    %% Single packet cannot establish a time span
+    LostPackets = [{1, 1000}],
+    ?assertNot(quic_cc:detect_persistent_congestion(LostPackets, 100, State)).
+
+detect_persistent_congestion_below_threshold_test() ->
+    State = quic_cc:new(),
+    PTO = 100,  % 100ms
+    %% Lost packets span 200ms, but threshold is PTO * 3 = 300ms
+    LostPackets = [{1, 1000}, {2, 1200}],
+    ?assertNot(quic_cc:detect_persistent_congestion(LostPackets, PTO, State)).
+
+detect_persistent_congestion_at_threshold_test() ->
+    State = quic_cc:new(),
+    PTO = 100,  % 100ms
+    %% Lost packets span exactly PTO * 3 = 300ms
+    LostPackets = [{1, 1000}, {2, 1300}],
+    ?assert(quic_cc:detect_persistent_congestion(LostPackets, PTO, State)).
+
+detect_persistent_congestion_above_threshold_test() ->
+    State = quic_cc:new(),
+    PTO = 100,  % 100ms
+    %% Lost packets span 500ms, threshold is PTO * 3 = 300ms
+    LostPackets = [{1, 1000}, {5, 1500}],
+    ?assert(quic_cc:detect_persistent_congestion(LostPackets, PTO, State)).
+
+detect_persistent_congestion_multiple_packets_test() ->
+    State = quic_cc:new(),
+    PTO = 100,
+    %% Multiple lost packets spanning > threshold
+    LostPackets = [{1, 1000}, {2, 1100}, {3, 1200}, {4, 1400}],
+    ?assert(quic_cc:detect_persistent_congestion(LostPackets, PTO, State)).
+
+on_persistent_congestion_resets_cwnd_test() ->
+    State = quic_cc:new(),
+    InitialCwnd = quic_cc:cwnd(State),
+
+    %% Persistent congestion should reset to minimum window
+    S1 = quic_cc:on_persistent_congestion(State),
+    NewCwnd = quic_cc:cwnd(S1),
+
+    %% Minimum window is 2 * max_datagram_size = 2400
+    ?assertEqual(2400, NewCwnd),
+    ?assert(NewCwnd < InitialCwnd).
+
+on_persistent_congestion_sets_ssthresh_test() ->
+    State = quic_cc:new(),
+    InitialCwnd = quic_cc:cwnd(State),
+
+    S1 = quic_cc:on_persistent_congestion(State),
+    SSThresh = quic_cc:ssthresh(S1),
+
+    %% ssthresh = cwnd * 0.5
+    ExpectedSSThresh = max(trunc(InitialCwnd * 0.5), 2400),
+    ?assertEqual(ExpectedSSThresh, SSThresh).
+
+on_persistent_congestion_clears_recovery_test() ->
+    State = quic_cc:new(),
+
+    %% Enter recovery first
+    Now = erlang:monotonic_time(millisecond),
+    S1 = quic_cc:on_congestion_event(State, Now),
+    ?assert(quic_cc:in_recovery(S1)),
+
+    %% Persistent congestion should clear recovery state
+    S2 = quic_cc:on_persistent_congestion(S1),
+    ?assertNot(quic_cc:in_recovery(S2)).
+
+%%====================================================================
 %% Integration Tests
 %%====================================================================
 

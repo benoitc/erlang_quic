@@ -38,6 +38,7 @@
     {send_handshake_ack, 1},
     {process_frames, 3},
     {cancel_pto_timer, 1},
+    {cancel_idle_timer, 1},
     {complete_key_update, 1},
     {can_send_to_path, 3},
     {issue_new_connection_id, 1},
@@ -207,6 +208,7 @@
     cc_state :: quic_cc:cc_state() | undefined,
     loss_state :: quic_loss:loss_state() | undefined,
     pto_timer :: reference() | undefined,
+    idle_timer :: reference() | undefined,
 
     %% Pending data - priority queue with 8 buckets (one per urgency 0-7)
     %% Each bucket is a queue:queue() for FIFO within same priority
@@ -706,8 +708,12 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
 
     {ok, idle, State}.
 
-terminate(_Reason, _StateName, #state{socket = Socket, conn_ref = ConnRef}) ->
+terminate(_Reason, _StateName, #state{socket = Socket, conn_ref = ConnRef,
+                                      pto_timer = PtoTimer, idle_timer = IdleTimer}) ->
     unregister_conn(ConnRef),
+    %% Cancel any active timers
+    cancel_timer(PtoTimer),
+    cancel_timer(IdleTimer),
     case Socket of
         undefined -> ok;
         _ -> gen_udp:close(Socket)
@@ -886,7 +892,9 @@ connected(enter, OldState, #state{owner = Owner, conn_ref = Ref, alpn = Alpn,
             end;
         server -> State2
     end,
-    {keep_state, State3};
+    %% RFC 9000 Section 10.1: Start idle timer when entering connected state
+    State4 = update_last_activity(State3),
+    {keep_state, State4};
 
 connected({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
@@ -1074,6 +1082,25 @@ handle_common_event(info, pto_timeout, StateName, State)
 
 handle_common_event(info, pto_timeout, _StateName, State) ->
     %% Ignore PTO in other states
+    {keep_state, State};
+
+handle_common_event(info, idle_timeout, StateName, State)
+  when StateName =/= draining, StateName =/= closed ->
+    %% Handle idle timeout - check if we've truly been idle
+    Now = erlang:monotonic_time(millisecond),
+    TimeSinceActivity = Now - State#state.last_activity,
+    case TimeSinceActivity >= State#state.idle_timeout of
+        true ->
+            %% Genuine idle timeout - initiate close
+            NewState = initiate_close(idle_timeout, State),
+            {next_state, draining, NewState};
+        false ->
+            %% Spurious timeout (activity occurred) - reset timer
+            {keep_state, set_idle_timer(State)}
+    end;
+
+handle_common_event(info, idle_timeout, _StateName, State) ->
+    %% Ignore idle timeout in draining/closed states
     {keep_state, State};
 
 handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
@@ -1516,6 +1543,7 @@ send_handshake_ack(State) ->
     end.
 
 %% Send an app-level ACK packet (1-RTT)
+%% Coalesces ACK with small pending stream data when possible
 send_app_ack(State) ->
     #state{pn_app = PNSpace} = State,
     case PNSpace#pn_space.ack_ranges of
@@ -1523,7 +1551,45 @@ send_app_ack(State) ->
             State;
         Ranges ->
             AckFrame = build_ack_frame(Ranges),
+            %% Try to coalesce ACK with small pending stream data
+            maybe_coalesce_ack_with_data(AckFrame, State)
+    end.
+
+%% Try to coalesce ACK frame with small pending stream data
+maybe_coalesce_ack_with_data(AckFrame, State) ->
+    case dequeue_small_stream_frame(State) of
+        {ok, StreamFrame, State1} ->
+            send_coalesced_frames([AckFrame, StreamFrame], State1);
+        none ->
             send_app_packet(AckFrame, State)
+    end.
+
+%% Dequeue a small stream frame if available (< 500 bytes)
+%% This allows coalescing ACK with small stream data
+-define(SMALL_FRAME_THRESHOLD, 500).
+dequeue_small_stream_frame(#state{send_queue = PQ} = State) ->
+    case pqueue_peek(PQ) of
+        {value, {stream_data, StreamId, Offset, Data, Fin}} when byte_size(Data) < ?SMALL_FRAME_THRESHOLD ->
+            %% Remove from queue and build STREAM frame
+            {{value, _}, NewPQ} = pqueue_out(PQ),
+            StreamFrame = quic_frame:encode({stream, StreamId, Offset, Data, Fin}),
+            {ok, StreamFrame, State#state{send_queue = NewPQ}};
+        _ ->
+            none
+    end.
+
+%% Send multiple frames in a single packet
+send_coalesced_frames(Frames, State) ->
+    Payload = iolist_to_binary(Frames),
+    %% Extract decoded frame info for loss tracking
+    FrameInfo = lists:map(fun decode_frame_for_tracking/1, Frames),
+    send_app_packet_internal(Payload, FrameInfo, State).
+
+%% Extract frame info for loss detection tracking
+decode_frame_for_tracking(FrameBin) ->
+    case quic_frame:decode(FrameBin) of
+        {ok, Frame, _} -> Frame;
+        _ -> unknown
     end.
 
 %% Build an ACK frame from ranges
@@ -2172,9 +2238,12 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
             %% Process ECN counts if present (RFC 9002 Section 7.1)
             CCState4 = process_ecn_counts(ECN, CCState3),
 
+            %% Check for persistent congestion (RFC 9002 Section 7.6)
+            CCState5 = check_persistent_congestion(LostPackets, NewLossState, CCState4),
+
             State1 = State#state{
                 loss_state = NewLossState,
-                cc_state = CCState4
+                cc_state = CCState5
             },
 
             %% Retransmit lost packets
@@ -2873,6 +2942,21 @@ process_ecn_counts({_ECT0, _ECT1, ECNCE}, CCState) ->
     %% RFC 9002: An increase in ECN-CE count triggers congestion response
     quic_cc:on_ecn_ce(CCState, ECNCE).
 
+%% Check for persistent congestion (RFC 9002 Section 7.6)
+%% If lost packets span more than PTO * 3, reset to minimum window
+check_persistent_congestion([], _LossState, CCState) ->
+    CCState;
+check_persistent_congestion(LostPackets, LossState, CCState) ->
+    %% Extract packet number and time sent from lost packets
+    LostInfo = [{P#sent_packet.pn, P#sent_packet.time_sent} || P <- LostPackets],
+    PTO = quic_loss:get_pto(LossState),
+    case quic_cc:detect_persistent_congestion(LostInfo, PTO, CCState) of
+        true ->
+            quic_cc:on_persistent_congestion(CCState);
+        false ->
+            CCState
+    end.
+
 %% Generate a random connection ID (8-20 bytes, using 8)
 generate_connection_id() ->
     crypto:strong_rand_bytes(8).
@@ -3016,9 +3100,10 @@ update_pn_space_recv(PN, PNSpace) ->
         ack_ranges = NewRanges
     }.
 
-%% Update last activity timestamp
+%% Update last activity timestamp and reset idle timer
 update_last_activity(State) ->
-    State#state{last_activity = erlang:monotonic_time(millisecond)}.
+    State1 = State#state{last_activity = erlang:monotonic_time(millisecond)},
+    set_idle_timer(State1).
 
 %% Open a new stream
 do_open_stream(#state{next_stream_id_bidi = NextId,
@@ -3308,6 +3393,21 @@ pqueue_out(PQ, Urgency) ->
             {{value, Entry}, NewPQ}
     end.
 
+%% Peek at highest priority entry without removing
+pqueue_peek(PQ) ->
+    pqueue_peek(PQ, 0).
+
+pqueue_peek(_PQ, 8) ->
+    empty;
+pqueue_peek(PQ, Urgency) ->
+    Bucket = element(Urgency + 1, PQ),
+    case queue:peek(Bucket) of
+        empty ->
+            pqueue_peek(PQ, Urgency + 1);
+        {value, Entry} ->
+            {value, Entry}
+    end.
+
 %% Check if priority queue is empty
 pqueue_is_empty(PQ) ->
     pqueue_is_empty(PQ, 0).
@@ -3504,6 +3604,25 @@ cancel_pto_timer(#state{pto_timer = Ref} = State) ->
 %% Helper to cancel a timer reference
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
+
+%%====================================================================
+%% Idle Timer Management (RFC 9000 §10.1)
+%%====================================================================
+
+%% Set idle timer based on idle_timeout configuration
+set_idle_timer(#state{idle_timeout = 0} = State) ->
+    State#state{idle_timer = undefined};
+set_idle_timer(#state{idle_timeout = Timeout, idle_timer = OldTimer} = State) ->
+    cancel_timer(OldTimer),
+    TimerRef = erlang:send_after(Timeout, self(), idle_timeout),
+    State#state{idle_timer = TimerRef}.
+
+%% Cancel idle timer
+cancel_idle_timer(#state{idle_timer = undefined} = State) ->
+    State;
+cancel_idle_timer(#state{idle_timer = Ref} = State) ->
+    cancel_timer(Ref),
+    State#state{idle_timer = undefined}.
 
 %% Convert state to map for debugging
 state_to_map(#state{} = S) ->

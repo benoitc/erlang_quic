@@ -15,6 +15,13 @@ All notable changes to this project will be documented in this file.
 - `preferred_ipv4` and `preferred_ipv6` listener options for server configuration
 - `#preferred_address{}` record for IPv4/IPv6 addresses, CID, and reset token
 - `quic_tls:encode_preferred_address/1` and `quic_tls:decode_preferred_address/1`
+- Idle timeout enforcement (RFC 9000 Section 10.1): when `idle_timeout` option
+  is set, internal timer automatically closes connection after timeout with no
+  activity (set to 0 to disable)
+- Persistent congestion detection (RFC 9002 Section 7.6): detects prolonged packet
+  loss spanning > PTO * 3 and resets cwnd to minimum window
+- Frame coalescing: ACK frames are coalesced with small pending stream data
+  (< 500 bytes) for more efficient packet utilization
 
 ## [0.7.1] - 2026-02-20
 
