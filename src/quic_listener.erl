@@ -156,6 +156,9 @@ init_listener_state(Socket, Cert, CertChain, PrivateKey, ALPNList, ConnHandler, 
         Tab -> Tab
     end,
 
+    %% Create global ticket store for 0-RTT support (if not already created)
+    ensure_ticket_table(),
+
     %% Generate or use provided stateless reset secret
     ResetSecret = maps:get(reset_secret, Opts, crypto:strong_rand_bytes(32)),
 
@@ -442,3 +445,23 @@ build_stateless_reset(Token, TriggerSize) ->
     <<FirstRandom:6, _:2>> = crypto:strong_rand_bytes(1),
     FirstByte = (0 bsl 7) bor (1 bsl 6) bor FirstRandom,
     <<FirstByte, RandomBytes/binary, Token/binary>>.
+
+%%====================================================================
+%% Global Ticket Storage (for 0-RTT)
+%%====================================================================
+
+%% Table name for server ticket storage
+-define(TICKET_TABLE, quic_server_tickets).
+
+%% Create the global ticket table if it doesn't exist
+ensure_ticket_table() ->
+    case ets:whereis(?TICKET_TABLE) of
+        undefined ->
+            try
+                ets:new(?TICKET_TABLE, [named_table, public, set, {read_concurrency, true}])
+            catch
+                error:badarg -> ok  % Table already exists (race condition)
+            end;
+        _ ->
+            ok
+    end.

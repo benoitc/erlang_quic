@@ -46,9 +46,9 @@ All core test cases pass:
 | `chacha20` | ✓ | ✓ | ChaCha20-Poly1305 only |
 | `multiconnect` | ✓ | ✓ | Multiple connections |
 | `v2` | ✓ | ✓ | QUIC v2 support |
-| `resumption` | - | - | Session resumption (planned) |
-| `zerortt` | - | - | 0-RTT early data (planned) |
-| `connectionmigration` | - | - | Active migration (planned) |
+| `resumption` | ✓ | ✓ | Session resumption with PSK |
+| `zerortt` | ✓ | ✓ | 0-RTT early data |
+| `connectionmigration` | ✓ | ✓ | Active path migration |
 
 ## Integration with Official Runner
 

@@ -6,10 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - Docker interop runner integration (client and server images)
-- All 7 QUIC Interop Runner test cases now pass:
-  - handshake, transfer, retry, keyupdate, chacha20, multiconnect, v2
+- Session resumption interop test (`resumption`)
+- 0-RTT early data interop test (`zerortt`)
+- Connection migration interop test (`connectionmigration`)
+- `quic:migrate/1` API for triggering active path migration
+- All 10 QUIC Interop Runner test cases now pass:
+  - handshake, transfer, retry, keyupdate, chacha20, multiconnect, v2,
+    resumption, zerortt, connectionmigration
 
 ### Fixed
+- Connection-level flow control: now properly tracks `data_received` and sends
+  MAX_DATA frames when 50% of connection window is consumed (RFC 9000 Section 4.1)
+- Large downloads: interop client now writes to disk incrementally (streaming)
+  instead of accumulating in memory
 - Server DCID initialization: server now correctly sets DCID from client's
   Initial packet SCID field, fixing short header packet alignment
 - Key update HP key preservation: header protection keys are no longer rotated

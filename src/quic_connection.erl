@@ -84,6 +84,8 @@
     setopts/2,
     %% Key update (RFC 9001 Section 6)
     key_update/1,
+    %% Connection migration (RFC 9000 Section 9)
+    migrate/1,
     %% Server mode
     start_server/1
 ]).
@@ -341,7 +343,7 @@ send_data(Conn, StreamId, Data, Fin) ->
 %% @doc Open a new bidirectional stream.
 -spec open_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
 open_stream(Conn) ->
-    gen_statem:call(Conn, open_stream).
+    gen_statem:call(Conn, open_stream, 10000).
 
 %% @doc Open a new unidirectional stream.
 -spec open_unidirectional_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
@@ -424,6 +426,13 @@ setopts(Conn, Opts) ->
 -spec key_update(pid()) -> ok | {error, term()}.
 key_update(Conn) ->
     gen_statem:call(Conn, key_update).
+
+%% @doc Initiate connection migration.
+%% This triggers path validation by sending PATH_CHALLENGE on a new path.
+%% Simulates network change by rebinding the socket.
+-spec migrate(pid()) -> ok | {error, term()}.
+migrate(Conn) ->
+    gen_statem:call(Conn, migrate).
 
 %%====================================================================
 %% gen_statem callbacks
@@ -683,6 +692,29 @@ idle({call, From}, {set_owner, NewOwner}, State) ->
     NewState = State#state{owner = NewOwner},
     {keep_state, NewState, [{reply, From, ok}]};
 
+%% 0-RTT: Allow opening streams in idle state if early keys are available
+idle({call, From}, open_stream, #state{early_keys = undefined} = State) ->
+    {keep_state, State, [{reply, From, {error, not_connected}}]};
+idle({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) ->
+    case do_open_stream(State) of
+        {ok, StreamId, NewState} ->
+            {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+
+%% 0-RTT: Allow sending data in idle state if early keys are available
+idle({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = undefined} = State) ->
+    Queue = State#state.send_queue ++ [{StreamId, Data, Fin}],
+    {keep_state, State#state{send_queue = Queue}, [{reply, From, ok}]};
+idle({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = _} = State) ->
+    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
+        {ok, NewState} ->
+            {keep_state, NewState, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+
 idle(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
     check_state_transition(idle, NewState);
@@ -721,6 +753,33 @@ handshaking({call, From}, sockname, #state{local_addr = Addr} = State) ->
 handshaking({call, From}, {set_owner, NewOwner}, State) ->
     NewState = State#state{owner = NewOwner},
     {keep_state, NewState, [{reply, From, ok}]};
+
+%% 0-RTT: Allow opening streams during handshake if early keys are available
+handshaking({call, From}, open_stream, #state{early_keys = undefined} = State) ->
+    %% No early keys, must wait for handshake to complete
+    {keep_state, State, [{reply, From, {error, not_connected}}]};
+handshaking({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) ->
+    %% Early keys available, can open stream for 0-RTT
+    case do_open_stream(State) of
+        {ok, StreamId, NewState} ->
+            {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+
+%% 0-RTT: Allow sending data during handshake if early keys are available
+handshaking({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = undefined} = State) ->
+    %% No early keys, queue the data for later
+    Queue = State#state.send_queue ++ [{StreamId, Data, Fin}],
+    {keep_state, State#state{send_queue = Queue}, [{reply, From, ok}]};
+handshaking({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = _} = State) ->
+    %% Send as 0-RTT data
+    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
+        {ok, NewState} ->
+            {keep_state, NewState, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
 
 handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
@@ -832,6 +891,20 @@ connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
         _ ->
             %% Key update already in progress
             {keep_state, State, [{reply, From, {error, key_update_in_progress}}]}
+    end;
+
+%% Handle connection migration request (RFC 9000 Section 9)
+connected({call, From}, migrate, #state{socket = Socket, remote_addr = RemoteAddr} = State) ->
+    %% Simulate network change by rebinding socket to a new port
+    %% In a real scenario, this would happen when the device changes networks
+    case rebind_socket(Socket) of
+        {ok, NewSocket} ->
+            %% Start path validation to the peer on the new path
+            NewState = State#state{socket = NewSocket},
+            State1 = initiate_path_validation(RemoteAddr, NewState),
+            {keep_state, State1, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
 
 connected(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
@@ -1029,6 +1102,72 @@ extract_x25519_key([]) -> undefined;
 extract_x25519_key([{?GROUP_X25519, PubKey} | _]) -> PubKey;
 extract_x25519_key([_ | Rest]) -> extract_x25519_key(Rest).
 
+%% Validate PSK from client's pre_shared_key extension
+%% Returns {ok, PSK, ResumptionSecret} if valid, error otherwise
+validate_psk(Identity, _Cipher, _ClientHelloMsg, #state{ticket_store = TicketStore}) ->
+    %% Try to find ticket by identity - first in local store, then global ETS
+    case find_ticket_by_identity(Identity, TicketStore) of
+        {ok, Ticket} ->
+            %% Extract resumption secret from ticket
+            ResumptionSecret = Ticket#session_ticket.resumption_secret,
+            %% Derive PSK from resumption secret
+            PSK = quic_ticket:derive_psk(ResumptionSecret, Ticket),
+            {ok, PSK, ResumptionSecret};
+        error ->
+            %% Try global ETS table
+            case lookup_ticket_globally(Identity) of
+                {ok, Ticket} ->
+                    ResumptionSecret = Ticket#session_ticket.resumption_secret,
+                    PSK = quic_ticket:derive_psk(ResumptionSecret, Ticket),
+                    {ok, PSK, ResumptionSecret};
+                error ->
+                    error
+            end
+    end;
+validate_psk(_Identity, _Cipher, _ClientHelloMsg, _State) ->
+    %% No ticket store
+    error.
+
+%% Find ticket by its identity (the ticket field)
+find_ticket_by_identity(Identity, Store) ->
+    %% Search through all stored tickets
+    Tickets = maps:values(Store),
+    find_matching_ticket(Identity, Tickets).
+
+find_matching_ticket(_Identity, []) ->
+    error;
+find_matching_ticket(Identity, [#session_ticket{ticket = Identity} = Ticket | _Rest]) ->
+    {ok, Ticket};
+find_matching_ticket(Identity, [_ | Rest]) ->
+    find_matching_ticket(Identity, Rest).
+
+%% Global ticket storage using ETS (for 0-RTT across connections)
+-define(TICKET_TABLE, quic_server_tickets).
+
+store_ticket_globally(TicketIdentity, Ticket) ->
+    ensure_ticket_table(),
+    ets:insert(?TICKET_TABLE, {TicketIdentity, Ticket}).
+
+lookup_ticket_globally(TicketIdentity) ->
+    ensure_ticket_table(),
+    case ets:lookup(?TICKET_TABLE, TicketIdentity) of
+        [{_, Ticket}] -> {ok, Ticket};
+        [] -> error
+    end.
+
+ensure_ticket_table() ->
+    case ets:whereis(?TICKET_TABLE) of
+        undefined ->
+            %% Create the table - public so all connections can access it
+            try
+                ets:new(?TICKET_TABLE, [named_table, public, set, {read_concurrency, true}])
+            catch
+                error:badarg -> ok  % Table already exists (race condition)
+            end;
+        _ ->
+            ok
+    end.
+
 %% Server: Send ServerHello in Initial packet
 send_server_hello(ServerHelloMsg, State) ->
     CryptoFrame = quic_frame:encode({crypto, 0, ServerHelloMsg}),
@@ -1148,7 +1287,8 @@ send_new_session_ticket(#state{
     server_name = ServerName,
     max_early_data = MaxEarlyData,
     alpn = ALPN,
-    handshake_keys = {ClientHsKeys, _}
+    handshake_keys = {ClientHsKeys, _},
+    ticket_store = TicketStore
 } = State) ->
     %% Get cipher from the connection
     Cipher = ClientHsKeys#crypto_keys.cipher,
@@ -1165,6 +1305,14 @@ send_new_session_ticket(#state{
         ALPN
     ),
 
+    %% Store ticket on server side for later PSK validation (0-RTT support)
+    %% Use the ticket identity (the ticket field) as the key
+    %% Store in both local map and global ETS table for cross-connection access
+    TicketIdentity = Ticket#session_ticket.ticket,
+    NewTicketStore = maps:put(TicketIdentity, Ticket, TicketStore),
+    %% Also store in global ETS table for 0-RTT across connections
+    store_ticket_globally(TicketIdentity, Ticket),
+
     %% Build NewSessionTicket TLS message
     TicketMsg = quic_ticket:build_new_session_ticket(Ticket),
 
@@ -1173,7 +1321,8 @@ send_new_session_ticket(#state{
 
     %% Send in CRYPTO frame (at application level)
     CryptoFrame = quic_frame:encode({crypto, 0, TLSMsg}),
-    send_app_packet(CryptoFrame, State).
+    State1 = State#state{ticket_store = NewTicketStore},
+    send_app_packet(CryptoFrame, State1).
 
 %% Send an Initial packet
 send_initial_packet(Payload, State) ->
@@ -1539,6 +1688,8 @@ decode_long_header_packet(Data, State) ->
     case Type of
         0 -> %% Initial
             decode_initial_packet(Data, FirstByte, DCID, SCID, Rest3, State);
+        1 -> %% 0-RTT
+            decode_zero_rtt_packet(Data, FirstByte, DCID, SCID, Rest3, State);
         2 -> %% Handshake
             decode_handshake_packet(Data, FirstByte, DCID, SCID, Rest3, State);
         3 -> %% Retry (RFC 9000 Section 17.2.5)
@@ -1608,6 +1759,28 @@ decode_handshake_packet(FullPacket, FirstByte, _DCID, _SCID, Rest, State) ->
                 false ->
                     {error, incomplete_packet}
             end
+    end.
+
+%% Decode 0-RTT packet (RFC 9001 Section 5.3)
+%% Server uses early keys derived from client's PSK
+decode_zero_rtt_packet(_FullPacket, _FirstByte, _DCID, _SCID, _Rest, #state{role = client}) ->
+    %% Clients don't receive 0-RTT packets
+    {error, unexpected_zero_rtt};
+decode_zero_rtt_packet(_FullPacket, _FirstByte, _DCID, _SCID, _Rest, #state{early_keys = undefined}) ->
+    %% No early keys - can't decrypt 0-RTT
+    {error, no_early_keys};
+decode_zero_rtt_packet(FullPacket, FirstByte, _DCID, _SCID, Rest, #state{early_keys = {EarlyKeys, _}} = State) ->
+    %% Parse length
+    {PayloadLen, Rest2} = quic_varint:decode(Rest),
+    HeaderLen = byte_size(FullPacket) - byte_size(Rest2),
+    <<Header:HeaderLen/binary, Payload/binary>> = FullPacket,
+
+    case byte_size(Payload) >= PayloadLen of
+        true ->
+            <<EncryptedPayload:PayloadLen/binary, RemainingData/binary>> = Payload,
+            decrypt_packet(zero_rtt, Header, FirstByte, EncryptedPayload, RemainingData, EarlyKeys, State);
+        false ->
+            {error, incomplete_packet}
     end.
 
 %% Handle Retry packet (RFC 9000 Section 8.1, RFC 9001 Section 5.8)
@@ -2064,11 +2237,42 @@ process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
                cipher_suites := CipherSuites,
                alpn_protocols := ClientALPN,
                transport_params := TP,
-               session_id := SessionId}} ->
+               session_id := SessionId} = ClientHelloInfo} ->
             %% Extract x25519 public key from key share entries
             ClientPubKey = extract_x25519_key(KeyShareEntries),
             %% Select cipher suite (prefer server's order)
             Cipher = select_cipher(CipherSuites),
+
+            %% Check for PSK (0-RTT/resumption)
+            PSKInfo = maps:get(pre_shared_key, ClientHelloInfo, undefined),
+            WantsEarlyData = maps:get(early_data, ClientHelloInfo, false),
+
+            %% For normal handshake, derive early secret from zero PSK
+            %% PSK-based resumption with full 0-RTT support requires additional changes
+            %% to skip Certificate/CertificateVerify - implementing basic 0-RTT decryption only
+            HashLen0 = case Cipher of aes_256_gcm -> 48; _ -> 32 end,
+            ZeroPSK = <<0:HashLen0/unit:8>>,
+
+            %% Check if we can derive early keys for 0-RTT decryption
+            {EarlyKeys, EarlySecret} = case PSKInfo of
+                #{identities := [{Identity, _Age}], binders := [_Binder]} when WantsEarlyData ->
+                    %% Try to validate PSK for 0-RTT only (not full PSK resumption)
+                    case validate_psk(Identity, Cipher, OriginalMsg, State) of
+                        {ok, PSK, ResumptionSecret} ->
+                            %% Derive early keys for 0-RTT decryption
+                            ES = quic_crypto:derive_early_secret(Cipher, PSK),
+                            ClientHelloHash = quic_crypto:transcript_hash(Cipher, OriginalMsg),
+                            ETS = quic_crypto:derive_client_early_traffic_secret(Cipher, ES, ClientHelloHash),
+                            {Key, IV, HP} = quic_keys:derive_keys(ETS, Cipher),
+                            EK = #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher},
+                            %% Still use zero PSK for handshake to keep Certificate flow
+                            {{EK, ResumptionSecret}, quic_crypto:derive_early_secret(Cipher, ZeroPSK)};
+                        error ->
+                            {undefined, quic_crypto:derive_early_secret(Cipher, ZeroPSK)}
+                    end;
+                _ ->
+                    {undefined, quic_crypto:derive_early_secret(Cipher, ZeroPSK)}
+            end,
 
             %% Generate server key pair
             {ServerPubKey, ServerPrivKey} = quic_crypto:generate_key_pair(x25519),
@@ -2093,12 +2297,7 @@ process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
             Transcript = <<Transcript0/binary, ServerHello/binary>>,
             TranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
 
-            %% Derive handshake secrets
-            HashLen = case Cipher of
-                aes_256_gcm -> 48;
-                _ -> 32
-            end,
-            EarlySecret = quic_crypto:derive_early_secret(Cipher, <<0:HashLen/unit:8>>),
+            %% Derive handshake secrets using already computed early secret
             HandshakeSecret = quic_crypto:derive_handshake_secret(Cipher, EarlySecret, SharedSecret),
 
             ClientHsSecret = quic_crypto:derive_client_handshake_secret(Cipher, HandshakeSecret, TranscriptHash),
@@ -2123,7 +2322,9 @@ process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
                 client_hs_secret = ClientHsSecret,
                 server_hs_secret = ServerHsSecret,
                 handshake_keys = {ClientHsKeys, ServerHsKeys},
-                alpn = ALPN
+                alpn = ALPN,
+                early_keys = EarlyKeys,
+                early_data_accepted = (EarlyKeys =/= undefined andalso WantsEarlyData)
             },
             %% Apply peer transport params (extracts active_connection_id_limit)
             State1 = apply_peer_transport_params(TP, State0),
@@ -2433,7 +2634,13 @@ process_stream_data(StreamId, Offset, Data, Fin, State) ->
         recv_fin = Fin
     },
 
-    State1 = State#state{streams = maps:put(StreamId, NewStream, Streams)},
+    %% Track connection-level data received (RFC 9000 Section 4.1)
+    DataSize = byte_size(Data),
+    NewDataReceived = State#state.data_received + DataSize,
+    State1 = State#state{
+        streams = maps:put(StreamId, NewStream, Streams),
+        data_received = NewDataReceived
+    },
 
     %% Check if we need to send MAX_STREAM_DATA to allow more data
     %% Send when we've consumed more than half our advertised limit
@@ -2441,17 +2648,31 @@ process_stream_data(StreamId, Offset, Data, Fin, State) ->
     State2 = case NewRecvOffset > (RecvMaxData div 2) of
         true ->
             %% Double the limit and send MAX_STREAM_DATA
-            NewMaxData = RecvMaxData * 2,
-            UpdatedStream = NewStream#stream_state{recv_max_data = NewMaxData},
-            MaxStreamDataFrame = quic_frame:encode({max_stream_data, StreamId, NewMaxData}),
+            NewMaxStreamData = RecvMaxData * 2,
+            UpdatedStream = NewStream#stream_state{recv_max_data = NewMaxStreamData},
+            MaxStreamDataFrame = quic_frame:encode({max_stream_data, StreamId, NewMaxStreamData}),
             State1a = State1#state{streams = maps:put(StreamId, UpdatedStream, Streams)},
             send_app_packet(MaxStreamDataFrame, State1a);
         false ->
             State1
     end,
 
+    %% Check if we need to send MAX_DATA for connection-level flow control
+    %% Send when we've consumed more than 50% of our advertised connection window
+    MaxDataLocal = State2#state.max_data_local,
+    State3 = case NewDataReceived > (MaxDataLocal div 2) of
+        true ->
+            %% Extend the connection-level window and send MAX_DATA
+            NewMaxData = NewDataReceived + MaxDataLocal,
+            MaxDataFrame = quic_frame:encode({max_data, NewMaxData}),
+            State2a = send_app_packet(MaxDataFrame, State2),
+            State2a#state{max_data_local = NewMaxData};
+        false ->
+            State2
+    end,
+
     %% ACK is sent at packet level by maybe_send_ack
-    State2.
+    State3.
 
 %%====================================================================
 %% Internal Functions - Helpers
@@ -2758,6 +2979,87 @@ do_send_data(StreamId, Data, Fin, #state{streams = Streams} = State) ->
         error ->
             {error, unknown_stream}
     end.
+
+%% Send 0-RTT (early) data on a stream
+%% RFC 9001 Section 4.6: 0-RTT data uses the early traffic secret
+do_send_zero_rtt_data(StreamId, Data, Fin, #state{streams = Streams, early_keys = {EarlyKeys, _}} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, StreamState} ->
+            DataBin = iolist_to_binary(Data),
+            Offset = StreamState#stream_state.send_offset,
+
+            %% Build STREAM frame
+            Frame = {stream, StreamId, Offset, DataBin, Fin},
+            Payload = quic_frame:encode(Frame),
+
+            %% Send as 0-RTT packet
+            NewState = send_zero_rtt_packet(Payload, EarlyKeys, State),
+
+            %% Update stream state and track early data sent
+            NewStreamState = StreamState#stream_state{
+                send_offset = Offset + byte_size(DataBin),
+                send_fin = Fin
+            },
+            EarlyDataSent = State#state.early_data_sent + byte_size(DataBin),
+
+            {ok, NewState#state{
+                streams = maps:put(StreamId, NewStreamState, Streams),
+                early_data_sent = EarlyDataSent
+            }};
+        error ->
+            {error, unknown_stream}
+    end.
+
+%% Send a 0-RTT packet (long header, type 1)
+%% RFC 9001 Section 5.3: 0-RTT packets use early traffic keys
+send_zero_rtt_packet(Payload, EarlyKeys, State) ->
+    #state{
+        scid = SCID,
+        dcid = DCID,
+        socket = Socket,
+        remote_addr = {IP, Port},
+        version = Version,
+        pn_app = PNSpace  % 0-RTT uses app PN space
+    } = State,
+
+    PN = PNSpace#pn_space.next_pn,
+    PNLen = quic_packet:pn_length(PN),
+
+    %% Long header for 0-RTT (type 1)
+    %% First byte: 11XX XXXX where XX = type (01 for 0-RTT)
+    FirstByte = 16#C0 bor (1 bsl 4) bor (PNLen - 1),  % 0xD0 base for 0-RTT
+
+    %% Build long header
+    DCIDLen = byte_size(DCID),
+    SCIDLen = byte_size(SCID),
+    Header = <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary>>,
+
+    %% Encode packet number and length
+    PNBin = quic_packet:encode_pn(PN, PNLen),
+    PayloadLen = byte_size(Payload) + 16,  % +16 for AEAD tag
+    LengthEncoded = quic_varint:encode(PNLen + PayloadLen),
+
+    %% AAD includes header with length but unprotected PN
+    AAD = <<Header/binary, LengthEncoded/binary, PNBin/binary>>,
+
+    %% Pad payload if needed for header protection sampling
+    PaddedPayload = pad_for_header_protection(Payload),
+
+    %% Encrypt with early keys
+    #crypto_keys{key = Key, iv = IV, hp = HP} = EarlyKeys,
+    Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPayload),
+
+    %% Header protection
+    PNOffset = byte_size(Header) + byte_size(LengthEncoded),
+    ProtectedHeader = quic_aead:protect_header(HP, <<Header/binary, LengthEncoded/binary, PNBin/binary>>, Encrypted, PNOffset),
+
+    %% Build and send packet
+    Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
+    gen_udp:send(Socket, IP, Port, Packet),
+
+    %% Update PN space
+    NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
+    State#state{pn_app = NewPNSpace}.
 
 %% Estimate packet overhead (header + AEAD tag + frame header)
 -define(PACKET_OVERHEAD, 50).
@@ -3196,6 +3498,24 @@ initiate_path_validation(RemoteAddr, State) ->
     %% Note: In a full implementation, we'd send to the specific path
     %% For now, send on the current path (for testing)
     send_app_packet(ChallengeFrame, State1).
+
+%% @doc Rebind socket to a new local port (simulates network change).
+%% Closes the old socket and creates a new one with a different ephemeral port.
+-spec rebind_socket(gen_udp:socket()) -> {ok, gen_udp:socket()} | {error, term()}.
+rebind_socket(OldSocket) ->
+    %% Get current socket options
+    {ok, [{active, Active}]} = inet:getopts(OldSocket, [active]),
+
+    %% Close old socket
+    gen_udp:close(OldSocket),
+
+    %% Open new socket on a different ephemeral port
+    case gen_udp:open(0, [binary, {active, Active}]) of
+        {ok, NewSocket} ->
+            {ok, NewSocket};
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 %% @doc Handle PATH_RESPONSE frame.
 %% Validates the response against pending challenges.

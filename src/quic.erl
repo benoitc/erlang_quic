@@ -46,7 +46,8 @@
     peercert/1,
     set_owner/2,
     send_datagram/2,
-    setopts/2
+    setopts/2,
+    migrate/1
 ]).
 
 -export([is_available/0, get_fd/1]).
@@ -288,4 +289,19 @@ setopts(ConnRef, Opts) when is_reference(ConnRef), is_list(Opts) ->
 setopts(ConnPid, Opts) when is_pid(ConnPid), is_list(Opts) ->
     quic_connection:setopts(ConnPid, Opts);
 setopts(_ConnRef, _Opts) ->
+    {error, badarg}.
+
+%% @doc Trigger connection migration to a new local address.
+%% This initiates path validation on a new network path.
+%% The connection will send PATH_CHALLENGE and wait for PATH_RESPONSE.
+-spec migrate(ConnRef) -> ok | {error, term()}
+    when ConnRef :: reference() | pid().
+migrate(ConnRef) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:migrate(Pid);
+        error -> {error, not_found}
+    end;
+migrate(ConnPid) when is_pid(ConnPid) ->
+    quic_connection:migrate(ConnPid);
+migrate(_ConnRef) ->
     {error, badarg}.

@@ -31,7 +31,10 @@
     "keyupdate",
     "chacha20",
     "multiconnect",
-    "v2"
+    "v2",
+    "resumption",
+    "zerortt",
+    "connectionmigration"
 ]).
 
 main(_Args) ->

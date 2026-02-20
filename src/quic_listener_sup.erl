@@ -74,6 +74,9 @@ init({Port, Opts}) ->
     %% Use public access so all listener processes can read/write
     Tab = ets:new(quic_pool_connections, [set, public, {read_concurrency, true}]),
 
+    %% Create global ticket store for 0-RTT support
+    ensure_ticket_table(),
+
     %% Generate shared reset secret for consistent stateless resets
     ResetSecret = maps:get(reset_secret, Opts, crypto:strong_rand_bytes(32)),
 
@@ -98,3 +101,23 @@ init({Port, Opts}) ->
     ],
 
     {ok, {#{strategy => one_for_one, intensity => 10, period => 5}, Children}}.
+
+%%====================================================================
+%% Internal Functions
+%%====================================================================
+
+%% Table name for server ticket storage (shared with quic_connection)
+-define(TICKET_TABLE, quic_server_tickets).
+
+%% Create the global ticket table if it doesn't exist
+ensure_ticket_table() ->
+    case ets:whereis(?TICKET_TABLE) of
+        undefined ->
+            try
+                ets:new(?TICKET_TABLE, [named_table, public, set, {read_concurrency, true}])
+            catch
+                error:badarg -> ok  % Table already exists (race condition)
+            end;
+        _ ->
+            ok
+    end.
