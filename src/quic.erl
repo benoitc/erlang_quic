@@ -57,6 +57,7 @@
 -export([
     start_server/3,
     stop_server/1,
+    server_spec/3,
     get_server_info/1,
     get_server_port/1,
     get_server_connections/1,
@@ -400,6 +401,31 @@ stop_server(Name) when is_atom(Name) ->
     quic_server_sup:stop_server(Name);
 stop_server(_Name) ->
     {error, badarg}.
+
+%% @doc Return a child spec for embedding a QUIC server in your own supervisor.
+%%
+%% This allows you to supervise QUIC servers within your application's
+%% supervision tree instead of using the built-in server management.
+%%
+%% Example:
+%% ```
+%% init([]) ->
+%%     Spec = quic:server_spec(my_quic, 4433, #{
+%%         cert => CertDer,
+%%         key => KeyTerm,
+%%         alpn => [<<"h3">>]
+%%     }),
+%%     {ok, {#{strategy => one_for_one}, [Spec]}}.
+%% '''
+-spec server_spec(Name, Port, Opts) -> supervisor:child_spec()
+    when Name :: atom(),
+         Port :: inet:port_number(),
+         Opts :: map().
+server_spec(Name, Port, Opts) when is_atom(Name), is_integer(Port),
+                                   Port >= 0, Port =< 65535, is_map(Opts) ->
+    quic_server_sup:server_spec(Name, Port, Opts);
+server_spec(_Name, _Port, _Opts) ->
+    error(badarg).
 
 %% @doc Get information about a named server.
 %%

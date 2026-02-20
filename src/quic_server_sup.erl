@@ -28,7 +28,8 @@
 -export([
     start_link/0,
     start_server/3,
-    stop_server/1
+    stop_server/1,
+    server_spec/3
 ]).
 
 %% supervisor callbacks
@@ -78,6 +79,36 @@ stop_server(Name) when is_atom(Name) ->
         {error, not_found} ->
             {error, {not_found, Name}}
     end.
+
+%% @doc Return a child spec for embedding a QUIC server in your own supervisor.
+%%
+%% This allows you to supervise QUIC servers within your application's
+%% supervision tree instead of using the built-in `quic_server_sup'.
+%%
+%% Example:
+%% ```
+%% init([]) ->
+%%     Spec = quic_server_sup:server_spec(my_quic, 4433, #{
+%%         cert => CertDer,
+%%         key => KeyTerm,
+%%         alpn => [<<"h3">>]
+%%     }),
+%%     {ok, {#{strategy => one_for_one}, [Spec]}}.
+%% '''
+%%
+%% Note: When using your own supervisor, the server will not be registered
+%% in the quic_server_registry. Use `quic_listener_sup:get_listeners/1' to
+%% get listener PIDs directly from the supervisor pid.
+-spec server_spec(atom(), inet:port_number(), map()) -> supervisor:child_spec().
+server_spec(Name, Port, Opts) when is_atom(Name), is_integer(Port), is_map(Opts) ->
+    #{
+        id => Name,
+        start => {quic_listener_sup, start_link, [Port, Opts]},
+        restart => permanent,
+        shutdown => infinity,
+        type => supervisor,
+        modules => [quic_listener_sup]
+    }.
 
 %%====================================================================
 %% Supervisor callbacks

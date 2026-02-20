@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file.
 - Variable DCID length support in short header packet parsing
 - LB-aware CID generation in `quic_connection` for NEW_CONNECTION_ID frames
 - E2E test suite `quic_lb_e2e_SUITE` with 21 integration tests
+- `quic:server_spec/3` to get a child spec for embedding QUIC servers in custom
+  supervision trees
 
 ### Fixed
 - Server-side connection termination no longer closes shared listener socket:
