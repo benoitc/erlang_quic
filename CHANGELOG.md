@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-02-20
+
+### Fixed
+- Packet number reconstruction per RFC 9000 Appendix A: truncated packet numbers
+  are now properly reconstructed using the largest received PN, fixing decryption
+  failures for large responses (>255 packets with 1-byte PN encoding)
+
 ## [0.7.0] - 2026-02-20
 
 ### Added

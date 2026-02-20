@@ -1942,9 +1942,11 @@ decrypt_app_packet_continue(UnprotectedHeader, PNLen, EncryptedPayload, State) -
         client -> element(2, DecryptKeys)   % ServerKeys
     end,
 
-    %% Extract PN and decrypt
+    %% Extract truncated PN and reconstruct full PN (RFC 9000 Appendix A)
     UnprotHeaderLen = byte_size(UnprotectedHeader),
-    <<_:((UnprotHeaderLen - PNLen) * 8), PN:PNLen/unit:8>> = UnprotectedHeader,
+    <<_:((UnprotHeaderLen - PNLen) * 8), TruncatedPN:PNLen/unit:8>> = UnprotectedHeader,
+    LargestRecv = get_largest_recv(app, State1),
+    PN = reconstruct_pn(LargestRecv, TruncatedPN, PNLen),
     AAD = UnprotectedHeader,
     Ciphertext = binary:part(EncryptedPayload, PNLen, byte_size(EncryptedPayload) - PNLen),
 
@@ -1980,9 +1982,11 @@ decrypt_packet(Level, Header, _FirstByte, EncryptedPayload, RemainingData, Keys,
     end.
 
 decrypt_packet_continue(Level, UnprotectedHeader, PNLen, EncryptedPayload, RemainingData, Key, IV, State) ->
-    %% Extract unprotected PN from the end of UnprotectedHeader
+    %% Extract truncated PN and reconstruct full PN (RFC 9000 Appendix A)
     UnprotHeaderLen = byte_size(UnprotectedHeader),
-    <<_:((UnprotHeaderLen - PNLen) * 8), PN:PNLen/unit:8>> = UnprotectedHeader,
+    <<_:((UnprotHeaderLen - PNLen) * 8), TruncatedPN:PNLen/unit:8>> = UnprotectedHeader,
+    LargestRecv = get_largest_recv(Level, State),
+    PN = reconstruct_pn(LargestRecv, TruncatedPN, PNLen),
 
     %% AAD is the full unprotected header (already includes PN)
     AAD = UnprotectedHeader,
@@ -2863,6 +2867,35 @@ record_received_pn(app, PN, State) ->
     State#state{pn_app = NewPNSpace};
 record_received_pn(_, _PN, State) ->
     State.
+
+%% Get largest received PN for a given encryption level
+get_largest_recv(initial, State) ->
+    (State#state.pn_initial)#pn_space.largest_recv;
+get_largest_recv(handshake, State) ->
+    (State#state.pn_handshake)#pn_space.largest_recv;
+get_largest_recv(app, State) ->
+    (State#state.pn_app)#pn_space.largest_recv.
+
+%% RFC 9000 Appendix A: Packet Number Reconstruction
+%% Reconstructs the full packet number from a truncated value
+reconstruct_pn(LargestPN, TruncatedPN, PNLen) ->
+    PNBits = PNLen * 8,
+    PNWin = 1 bsl PNBits,
+    PNHWin = PNWin bsr 1,
+    PNMask = PNWin - 1,
+    ExpectedPN = case LargestPN of
+        undefined -> 0;
+        _ -> LargestPN + 1
+    end,
+    CandidatePN = (ExpectedPN band (bnot PNMask)) bor TruncatedPN,
+    if
+        CandidatePN =< ExpectedPN - PNHWin, CandidatePN < (1 bsl 62) - PNWin ->
+            CandidatePN + PNWin;
+        CandidatePN > ExpectedPN + PNHWin, CandidatePN >= PNWin ->
+            CandidatePN - PNWin;
+        true ->
+            CandidatePN
+    end.
 
 update_pn_space_recv(PN, PNSpace) ->
     #pn_space{largest_recv = LargestRecv, ack_ranges = Ranges} = PNSpace,

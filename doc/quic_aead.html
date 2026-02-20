@@ -5,14 +5,14 @@
     <meta http-equiv="x-ua-compatible" content="ie=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="generator" content="ExDoc v0.39.1">
-    <meta name="project" content="quic v0.6.5">
+    <meta name="project" content="quic v0.7.0">
 
 
-    <title>quic_aead — quic v0.6.5</title>
+    <title>quic_aead — quic v0.7.0</title>
 
     <link rel="stylesheet" href="dist/html-erlang-7YNYEB7F.css" />
 
-    <script defer src="dist/sidebar_items-4DFDAA73.js"></script>
+    <script defer src="dist/sidebar_items-37BEB769.js"></script>
     <script defer src="docs_config.js"></script>
     <script defer src="dist/html-HBZYRXZS.js"></script>
 
@@ -37,7 +37,7 @@
 quic
         </a>
         <div class="sidebar-projectVersion" translate="no">
-          v0.6.5
+          v0.7.0
         </div>
       </div>
     </div>
@@ -94,11 +94,11 @@ quic
   <div class="heading-with-actions top-heading">
     <h1>
       <span translate="no">quic_aead</span> 
-      <small class="app-vsn" translate="no">(quic v0.6.5)</small>
+      <small class="app-vsn" translate="no">(quic v0.7.0)</small>
 
     </h1>
 
-      <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_aead.erl#L26" title="View Source" class="icon-action" rel="help">
+      <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_aead.erl#L26" title="View Source" class="icon-action" rel="help">
         <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         <span class="sr-only">View Source</span>
       </a>
@@ -140,6 +140,14 @@ quic
 
     <div class="summary-row">
       <div class="summary-signature">
+        <a href="#compute_hp_mask/3" data-no-tooltip="" translate="no">compute_hp_mask(_, HP, Sample)</a>
+
+      </div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
         <a href="#compute_nonce/2" data-no-tooltip="" translate="no">compute_nonce(IV, PN)</a>
 
       </div>
@@ -160,11 +168,31 @@ quic
 
     <div class="summary-row">
       <div class="summary-signature">
+        <a href="#decrypt/6" data-no-tooltip="" translate="no">decrypt(Key, IV, PN, AAD, CiphertextWithTag, Cipher)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Decrypt with explicit cipher type. Useful for ChaCha20-Poly1305 which also uses 32-byte keys.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
         <a href="#encrypt/5" data-no-tooltip="" translate="no">encrypt(Key, IV, PN, AAD, Plaintext)</a>
 
       </div>
 
         <div class="summary-synopsis"><p>Encrypt a QUIC packet payload using AEAD.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#encrypt/6" data-no-tooltip="" translate="no">encrypt(Key, IV, PN, AAD, Plaintext, Cipher)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Encrypt with explicit cipher type. Useful for ChaCha20-Poly1305 which also uses 32-byte keys.</p></div>
 
     </div>
 
@@ -212,7 +240,7 @@ quic
       <h1 class="signature" translate="no">cipher/0</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_aead.erl#L41" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_aead.erl#L44" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -243,6 +271,28 @@ quic
     </h1>
 
     <div class="functions-list">
+<section class="detail" id="compute_hp_mask/3">
+
+  <div class="detail-header">
+    <a href="#compute_hp_mask/3" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">compute_hp_mask(_, HP, Sample)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_aead.erl#L210" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+
+  </section>
+</section>
 <section class="detail" id="compute_nonce/2">
 
   <div class="detail-header">
@@ -253,7 +303,7 @@ quic
       <h1 class="signature" translate="no">compute_nonce(IV, PN)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_aead.erl#L177" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_aead.erl#L194" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -281,7 +331,7 @@ quic
       <h1 class="signature" translate="no">decrypt(Key, IV, PN, AAD, CiphertextWithTag)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_aead.erl#L80" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_aead.erl#L90" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -300,6 +350,35 @@ quic
 <p>Decrypt a QUIC packet payload using AEAD.</p><p>Returns: {ok, Plaintext} | {error, bad_tag}</p>
   </section>
 </section>
+<section class="detail" id="decrypt/6">
+
+  <div class="detail-header">
+    <a href="#decrypt/6" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">decrypt(Key, IV, PN, AAD, CiphertextWithTag, Cipher)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_aead.erl#L98" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> decrypt(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="#t:cipher/0">cipher</a>()) ->
+                 {ok, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()} | {error, bad_tag}.</pre>
+
+      </div>
+
+<p>Decrypt with explicit cipher type. Useful for ChaCha20-Poly1305 which also uses 32-byte keys.</p>
+  </section>
+</section>
 <section class="detail" id="encrypt/5">
 
   <div class="detail-header">
@@ -310,7 +389,7 @@ quic
       <h1 class="signature" translate="no">encrypt(Key, IV, PN, AAD, Plaintext)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_aead.erl#L68" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_aead.erl#L71" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -328,6 +407,34 @@ quic
 <p>Encrypt a QUIC packet payload using AEAD.</p><p>Key: AEAD key IV: AEAD initialization vector PN: Packet number (used with IV to create nonce) AAD: Additional authenticated data (unprotected header) Plaintext: Payload to encrypt</p><p>Returns: Ciphertext with authentication tag appended</p>
   </section>
 </section>
+<section class="detail" id="encrypt/6">
+
+  <div class="detail-header">
+    <a href="#encrypt/6" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">encrypt(Key, IV, PN, AAD, Plaintext, Cipher)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_aead.erl#L79" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> encrypt(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="#t:cipher/0">cipher</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Encrypt with explicit cipher type. Useful for ChaCha20-Poly1305 which also uses 32-byte keys.</p>
+  </section>
+</section>
 <section class="detail" id="protect_header/4">
 
   <div class="detail-header">
@@ -338,7 +445,7 @@ quic
       <h1 class="signature" translate="no">protect_header(HP, Header, EncryptedPayload, PNOffset)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_aead.erl#L108" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_aead.erl#L125" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -367,7 +474,7 @@ quic
       <h1 class="signature" translate="no">unprotect_header(HP, ProtectedHeader, EncryptedPayload, PNOffset)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_aead.erl#L139" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_aead.erl#L156" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -394,9 +501,9 @@ quic
       <p>
 
           <span class="line">
-            <a href="https://hex.pm/packages/quic/0.6.5" class="footer-hex-package">Hex Package</a>
+            <a href="https://hex.pm/packages/quic/0.7.0" class="footer-hex-package">Hex Package</a>
 
-            <a href="https://preview.hex.pm/preview/quic/0.6.5">Hex Preview</a>
+            <a href="https://preview.hex.pm/preview/quic/0.7.0">Hex Preview</a>
 
           </span>
 

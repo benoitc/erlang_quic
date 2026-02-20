@@ -5,14 +5,14 @@
     <meta http-equiv="x-ua-compatible" content="ie=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="generator" content="ExDoc v0.39.1">
-    <meta name="project" content="quic v0.6.5">
+    <meta name="project" content="quic v0.7.0">
 
 
-    <title>quic_listener — quic v0.6.5</title>
+    <title>quic_listener — quic v0.7.0</title>
 
     <link rel="stylesheet" href="dist/html-erlang-7YNYEB7F.css" />
 
-    <script defer src="dist/sidebar_items-4DFDAA73.js"></script>
+    <script defer src="dist/sidebar_items-37BEB769.js"></script>
     <script defer src="docs_config.js"></script>
     <script defer src="dist/html-HBZYRXZS.js"></script>
 
@@ -37,7 +37,7 @@
 quic
         </a>
         <div class="sidebar-projectVersion" translate="no">
-          v0.6.5
+          v0.7.0
         </div>
       </div>
     </div>
@@ -94,11 +94,11 @@ quic
   <div class="heading-with-actions top-heading">
     <h1>
       <span translate="no">quic_listener</span> 
-      <small class="app-vsn" translate="no">(quic v0.6.5)</small>
+      <small class="app-vsn" translate="no">(quic v0.7.0)</small>
 
     </h1>
 
-      <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_listener.erl#L33" title="View Source" class="icon-action" rel="help">
+      <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener.erl#L33" title="View Source" class="icon-action" rel="help">
         <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         <span class="sr-only">View Source</span>
       </a>
@@ -107,16 +107,16 @@ quic
 
 
     <section id="moduledoc">
-<p>QUIC server listener for accepting connections.</p><p>This module handles: - UDP socket management - Initial packet routing to connections - Connection ID management - Stateless retry (optional)</p><h3 id="module-connection-handler-callback" class="section-heading"><a href="#module-connection-handler-callback" class="hover-link"><i class="ri-link-m" aria-hidden="true"></i></a><span class="text"><a name="Connection_Handler_Callback">Connection Handler Callback</a></span></h3><p>The <code>connection_handler</code> option allows custom handling of new connections:</p><pre><code class="makeup erlang" translate="no"><span class="w">   </span><span class="n">Opts</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p" data-group-id="0364192260-1">#{</span><span class="w">
+<p>QUIC server listener for accepting connections.</p><p>This module handles: - UDP socket management - Initial packet routing to connections - Connection ID management - Stateless retry (optional)</p><h3 id="module-connection-handler-callback" class="section-heading"><a href="#module-connection-handler-callback" class="hover-link"><i class="ri-link-m" aria-hidden="true"></i></a><span class="text"><a name="Connection_Handler_Callback">Connection Handler Callback</a></span></h3><p>The <code>connection_handler</code> option allows custom handling of new connections:</p><pre><code class="makeup erlang" translate="no"><span class="w">   </span><span class="n">Opts</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p" data-group-id="2139123943-1">#{</span><span class="w">
        </span><span class="ss">cert</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="n">Cert</span><span class="p">,</span><span class="w">
        </span><span class="ss">key</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="n">Key</span><span class="p">,</span><span class="w">
-       </span><span class="ss">connection_handler</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="nf">fun</span><span class="p" data-group-id="0364192260-2">(</span><span class="n">ConnPid</span><span class="p">,</span><span class="w"> </span><span class="n">ConnRef</span><span class="p" data-group-id="0364192260-2">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w">
+       </span><span class="ss">connection_handler</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="nf">fun</span><span class="p" data-group-id="2139123943-2">(</span><span class="n">ConnPid</span><span class="p">,</span><span class="w"> </span><span class="n">ConnRef</span><span class="p" data-group-id="2139123943-2">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w">
            </span><span class="c1">%% Spawn your handler and return its pid</span><span class="w">
-           </span><span class="n">HandlerPid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nf">spawn</span><span class="p" data-group-id="0364192260-3">(</span><span class="nf">fun</span><span class="p" data-group-id="0364192260-4">(</span><span class="p" data-group-id="0364192260-4">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nf">my_handler</span><span class="p" data-group-id="0364192260-5">(</span><span class="n">ConnPid</span><span class="p">,</span><span class="w"> </span><span class="n">ConnRef</span><span class="p" data-group-id="0364192260-5">)</span><span class="w"> </span><span class="k">end</span><span class="p" data-group-id="0364192260-3">)</span><span class="p">,</span><span class="w">
+           </span><span class="n">HandlerPid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nf">spawn</span><span class="p" data-group-id="2139123943-3">(</span><span class="nf">fun</span><span class="p" data-group-id="2139123943-4">(</span><span class="p" data-group-id="2139123943-4">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nf">my_handler</span><span class="p" data-group-id="2139123943-5">(</span><span class="n">ConnPid</span><span class="p">,</span><span class="w"> </span><span class="n">ConnRef</span><span class="p" data-group-id="2139123943-5">)</span><span class="w"> </span><span class="k">end</span><span class="p" data-group-id="2139123943-3">)</span><span class="p">,</span><span class="w">
            </span><span class="c1">%% Ownership will be transferred to HandlerPid</span><span class="w">
-           </span><span class="p" data-group-id="0364192260-6">{</span><span class="ss">ok</span><span class="p">,</span><span class="w"> </span><span class="n">HandlerPid</span><span class="p" data-group-id="0364192260-6">}</span><span class="w">
+           </span><span class="p" data-group-id="2139123943-6">{</span><span class="ss">ok</span><span class="p">,</span><span class="w"> </span><span class="n">HandlerPid</span><span class="p" data-group-id="2139123943-6">}</span><span class="w">
        </span><span class="k">end</span><span class="w">
-   </span><span class="p" data-group-id="0364192260-1">}</span></code></pre>
+   </span><span class="p" data-group-id="2139123943-1">}</span></code></pre>
     </section>
 
 </div>
@@ -209,7 +209,7 @@ quic
 
       </div>
 
-        <div class="summary-synopsis"><p>Start a QUIC listener on the given port. Options: - cert: Server certificate (DER binary) - cert_chain: Certificate chain [binary()] - key: Private key - alpn: List of supported ALPN protocols</p></div>
+        <div class="summary-synopsis"><p>Start a QUIC listener on the given port. Options: - cert: Server certificate (DER binary) - cert_chain: Certificate chain [binary()] - key: Private key - alpn: List of supported ALPN protocols - active_n: Number of packets before socket goes passive (default 100) - reuseport: Enable SO_REUSEPORT for multiple listeners (default false) - connections_table: Shared ETS table for connection tracking (pool mode)</p></div>
 
     </div>
 
@@ -255,7 +255,7 @@ quic
       <h1 class="signature" translate="no">code_change(OldVsn, State, Extra)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_listener.erl#L209" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener.erl#L236" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -277,7 +277,7 @@ quic
       <h1 class="signature" translate="no">get_connections(Listener)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_listener.erl#L108" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener.erl#L113" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -305,7 +305,7 @@ quic
       <h1 class="signature" translate="no">get_port(Listener)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_listener.erl#L103" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener.erl#L108" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -333,7 +333,7 @@ quic
       <h1 class="signature" translate="no">handle_call(Request, From, Listener_state)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_listener.erl#L164" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener.erl#L181" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -355,7 +355,7 @@ quic
       <h1 class="signature" translate="no">handle_cast(Msg, State)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_listener.erl#L178" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener.erl#L195" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -377,7 +377,7 @@ quic
       <h1 class="signature" translate="no">handle_info(Info, Listener_state)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_listener.erl#L182" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener.erl#L199" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -399,7 +399,7 @@ quic
       <h1 class="signature" translate="no">init(_)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_listener.erl#L115" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener.erl#L120" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -421,7 +421,7 @@ quic
       <h1 class="signature" translate="no">start(Port, Opts)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_listener.erl#L93" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener.erl#L98" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -449,7 +449,7 @@ quic
       <h1 class="signature" translate="no">start_link(Port, Opts)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_listener.erl#L88" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener.erl#L93" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -464,7 +464,7 @@ quic
 
       </div>
 
-<p>Start a QUIC listener on the given port. Options: - cert: Server certificate (DER binary) - cert_chain: Certificate chain [binary()] - key: Private key - alpn: List of supported ALPN protocols</p>
+<p>Start a QUIC listener on the given port. Options: - cert: Server certificate (DER binary) - cert_chain: Certificate chain [binary()] - key: Private key - alpn: List of supported ALPN protocols - active_n: Number of packets before socket goes passive (default 100) - reuseport: Enable SO_REUSEPORT for multiple listeners (default false) - connections_table: Shared ETS table for connection tracking (pool mode)</p>
   </section>
 </section>
 <section class="detail" id="stop/1">
@@ -477,7 +477,7 @@ quic
       <h1 class="signature" translate="no">stop(Listener)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_listener.erl#L98" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener.erl#L103" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -505,7 +505,7 @@ quic
       <h1 class="signature" translate="no">terminate(Reason, Listener_state)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_listener.erl#L204" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener.erl#L227" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -525,9 +525,9 @@ quic
       <p>
 
           <span class="line">
-            <a href="https://hex.pm/packages/quic/0.6.5" class="footer-hex-package">Hex Package</a>
+            <a href="https://hex.pm/packages/quic/0.7.0" class="footer-hex-package">Hex Package</a>
 
-            <a href="https://preview.hex.pm/preview/quic/0.6.5">Hex Preview</a>
+            <a href="https://preview.hex.pm/preview/quic/0.7.0">Hex Preview</a>
 
           </span>
 

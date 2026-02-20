@@ -8,7 +8,7 @@
     <meta name="project" content="quic v0.7.0">
 
 
-    <title>quic_varint — quic v0.7.0</title>
+    <title>quic_listener_sup — quic v0.7.0</title>
 
     <link rel="stylesheet" href="dist/html-erlang-7YNYEB7F.css" />
 
@@ -93,12 +93,12 @@ quic
 <div id="top-content">
   <div class="heading-with-actions top-heading">
     <h1>
-      <span translate="no">quic_varint</span> 
+      <span translate="no">quic_listener_sup</span> 
       <small class="app-vsn" translate="no">(quic v0.7.0)</small>
 
     </h1>
 
-      <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_varint.erl#L22" title="View Source" class="icon-action" rel="help">
+      <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener_sup.erl#L29" title="View Source" class="icon-action" rel="help">
         <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         <span class="sr-only">View Source</span>
       </a>
@@ -107,7 +107,7 @@ quic
 
 
     <section id="moduledoc">
-<p>Variable-length integer encoding/decoding for QUIC.</p><p>QUIC uses a variable-length integer encoding scheme where the two most significant bits of the first byte indicate the length:</p><ul><li><code>2#00xxxxxx</code> - 1 byte, 6-bit value (0-63)</li><li><code>2#01xxxxxx</code> - 2 bytes, 14-bit value (0-16383)</li><li><code>2#10xxxxxx</code> - 4 bytes, 30-bit value (0-1073741823)</li><li><code>2#11xxxxxx</code> - 8 bytes, 62-bit value (0-4611686018427387903)</li></ul>
+<p>Supervisor for a pool of QUIC listeners using SO_REUSEPORT.</p><p>This module provides horizontal scaling for QUIC servers by running multiple listener processes that share the same port via reuseport. The kernel distributes incoming packets across the listeners.</p><h3 id="module-usage" class="section-heading"><a href="#module-usage" class="hover-link"><i class="ri-link-m" aria-hidden="true"></i></a><span class="text"><a name="Usage">Usage</a></span></h3><p>Single listener (default):</p><pre><code class="makeup erlang" translate="no"><span class="w">   </span><span class="nc">quic_listener</span><span class="p">:</span><span class="nf">start_link</span><span class="p" data-group-id="5518505591-1">(</span><span class="n">Port</span><span class="p">,</span><span class="w"> </span><span class="n">Opts</span><span class="p" data-group-id="5518505591-1">)</span></code></pre><p>Pooled listeners for scalability:</p><pre><code class="makeup erlang" translate="no"><span class="w">   </span><span class="nc">quic_listener_sup</span><span class="p">:</span><span class="nf">start_link</span><span class="p" data-group-id="0708474644-1">(</span><span class="n">Port</span><span class="p">,</span><span class="w"> </span><span class="n">Opts</span><span class="p" data-group-id="0708474644-2">#{</span><span class="ss">pool_size</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="mi">4</span><span class="p" data-group-id="0708474644-2">}</span><span class="p" data-group-id="0708474644-1">)</span></code></pre><p><em>See also: </em><a href="quic_listener.html">quic_listener</a>.</p>
     </section>
 
 </div>
@@ -126,41 +126,39 @@ quic
 
     <div class="summary-row">
       <div class="summary-signature">
-        <a href="#decode/1" data-no-tooltip="" translate="no">decode(Bin)</a>
+        <a href="#get_listeners/1" data-no-tooltip="" translate="no">get_listeners(Sup)</a>
 
       </div>
 
-        <div class="summary-synopsis"><p>Decode a QUIC variable-length integer from a binary. Returns {Value, Rest} where Rest is the remaining binary. Raises error:badarg for invalid input.</p></div>
+        <div class="summary-synopsis"><p>Get list of listener PIDs in the pool.</p></div>
 
     </div>
 
     <div class="summary-row">
       <div class="summary-signature">
-        <a href="#encode/1" data-no-tooltip="" translate="no">encode(V)</a>
+        <a href="#init/1" data-no-tooltip="" translate="no">init(_)</a>
 
       </div>
-
-        <div class="summary-synopsis"><p>Encode an integer as a QUIC variable-length integer. Returns the encoded binary. Raises error:badarg for negative values or values &gt; 2^62-1.</p></div>
 
     </div>
 
     <div class="summary-row">
       <div class="summary-signature">
-        <a href="#encode_len/1" data-no-tooltip="" translate="no">encode_len(V)</a>
+        <a href="#start_link/2" data-no-tooltip="" translate="no">start_link(Port, Opts)</a>
 
       </div>
 
-        <div class="summary-synopsis"><p>Return the number of bytes needed to encode a value.</p></div>
+        <div class="summary-synopsis"><p>Start a pool of QUIC listeners on the given port. Options: - pool_size: Number of listener processes (default 1) - All other options are passed to quic_listener</p></div>
 
     </div>
 
     <div class="summary-row">
       <div class="summary-signature">
-        <a href="#max_value/1" data-no-tooltip="" translate="no">max_value(_)</a>
+        <a href="#stop/1" data-no-tooltip="" translate="no">stop(Sup)</a>
 
       </div>
 
-        <div class="summary-synopsis"><p>Return the maximum value that can be encoded in N bytes.</p></div>
+        <div class="summary-synopsis"><p>Stop the listener pool supervisor.</p></div>
 
     </div>
 
@@ -178,17 +176,17 @@ quic
     </h1>
 
     <div class="functions-list">
-<section class="detail" id="decode/1">
+<section class="detail" id="get_listeners/1">
 
   <div class="detail-header">
-    <a href="#decode/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+    <a href="#get_listeners/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
       <i class="ri-link-m" aria-hidden="true"></i>
     </a>
     <div class="heading-with-actions">
-      <h1 class="signature" translate="no">decode(Bin)</h1>
+      <h1 class="signature" translate="no">get_listeners(Sup)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_varint.erl#L60" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener_sup.erl#L63" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -199,24 +197,24 @@ quic
 
       <div class="specs">
 
-          <pre translate="no"><span class="attribute">-spec</span> decode(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()) -> {<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>()}.</pre>
+          <pre translate="no"><span class="attribute">-spec</span> get_listeners(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>()) -> [<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>()].</pre>
 
       </div>
 
-<p>Decode a QUIC variable-length integer from a binary. Returns {Value, Rest} where Rest is the remaining binary. Raises error:badarg for invalid input.</p>
+<p>Get list of listener PIDs in the pool.</p>
   </section>
 </section>
-<section class="detail" id="encode/1">
+<section class="detail" id="init/1">
 
   <div class="detail-header">
-    <a href="#encode/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+    <a href="#init/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
       <i class="ri-link-m" aria-hidden="true"></i>
     </a>
     <div class="heading-with-actions">
-      <h1 class="signature" translate="no">encode(V)</h1>
+      <h1 class="signature" translate="no">init(_)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_varint.erl#L45" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener_sup.erl#L70" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -225,26 +223,20 @@ quic
 
   <section class="docstring">
 
-      <div class="specs">
 
-          <pre translate="no"><span class="attribute">-spec</span> encode(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
-
-      </div>
-
-<p>Encode an integer as a QUIC variable-length integer. Returns the encoded binary. Raises error:badarg for negative values or values &gt; 2^62-1.</p>
   </section>
 </section>
-<section class="detail" id="encode_len/1">
+<section class="detail" id="start_link/2">
 
   <div class="detail-header">
-    <a href="#encode_len/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+    <a href="#start_link/2" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
       <i class="ri-link-m" aria-hidden="true"></i>
     </a>
     <div class="heading-with-actions">
-      <h1 class="signature" translate="no">encode_len(V)</h1>
+      <h1 class="signature" translate="no">start_link(Port, Opts)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_varint.erl#L76" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener_sup.erl#L50" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -255,24 +247,24 @@ quic
 
       <div class="specs">
 
-          <pre translate="no"><span class="attribute">-spec</span> encode_len(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()) -> 1 | 2 | 4 | 8.</pre>
+          <pre translate="no"><span class="attribute">-spec</span> start_link(<a href="https://www.erlang.org/doc/apps/kernel/inet.html#t:port_number/0">inet:port_number</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:map/0">map</a>()) -> {ok, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>()} | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}.</pre>
 
       </div>
 
-<p>Return the number of bytes needed to encode a value.</p>
+<p>Start a pool of QUIC listeners on the given port. Options: - pool_size: Number of listener processes (default 1) - All other options are passed to quic_listener</p>
   </section>
 </section>
-<section class="detail" id="max_value/1">
+<section class="detail" id="stop/1">
 
   <div class="detail-header">
-    <a href="#max_value/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+    <a href="#stop/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
       <i class="ri-link-m" aria-hidden="true"></i>
     </a>
     <div class="heading-with-actions">
-      <h1 class="signature" translate="no">max_value(_)</h1>
+      <h1 class="signature" translate="no">stop(Sup)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_varint.erl#L84" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_listener_sup.erl#L55" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -283,11 +275,11 @@ quic
 
       <div class="specs">
 
-          <pre translate="no"><span class="attribute">-spec</span> max_value(1 | 2 | 4 | 8) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>().</pre>
+          <pre translate="no"><span class="attribute">-spec</span> stop(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>()) -> ok.</pre>
 
       </div>
 
-<p>Return the maximum value that can be encoded in N bytes.</p>
+<p>Stop the listener pool supervisor.</p>
   </section>
 </section>
 

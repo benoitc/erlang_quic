@@ -5,14 +5,14 @@
     <meta http-equiv="x-ua-compatible" content="ie=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="generator" content="ExDoc v0.39.1">
-    <meta name="project" content="quic v0.6.5">
+    <meta name="project" content="quic v0.7.0">
 
 
-    <title>quic_connection — quic v0.6.5</title>
+    <title>quic_connection — quic v0.7.0</title>
 
     <link rel="stylesheet" href="dist/html-erlang-7YNYEB7F.css" />
 
-    <script defer src="dist/sidebar_items-4DFDAA73.js"></script>
+    <script defer src="dist/sidebar_items-37BEB769.js"></script>
     <script defer src="docs_config.js"></script>
     <script defer src="dist/html-HBZYRXZS.js"></script>
 
@@ -37,7 +37,7 @@
 quic
         </a>
         <div class="sidebar-projectVersion" translate="no">
-          v0.6.5
+          v0.7.0
         </div>
       </div>
     </div>
@@ -94,11 +94,11 @@ quic
   <div class="heading-with-actions top-heading">
     <h1>
       <span translate="no">quic_connection</span> 
-      <small class="app-vsn" translate="no">(quic v0.6.5)</small>
+      <small class="app-vsn" translate="no">(quic v0.7.0)</small>
 
     </h1>
 
-      <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L30" title="View Source" class="icon-action" rel="help">
+      <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L30" title="View Source" class="icon-action" rel="help">
         <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         <span class="sr-only">View Source</span>
       </a>
@@ -180,7 +180,7 @@ quic
 
     <div class="summary-row">
       <div class="summary-signature">
-        <a href="#connected/3" data-no-tooltip="" translate="no">connected(EventType, EventContent, State)</a>
+        <a href="#connected/3" data-no-tooltip="" translate="no">connected(EventType, OldState, State)</a>
 
       </div>
 
@@ -265,6 +265,16 @@ quic
       </div>
 
         <div class="summary-synopsis"><p>Lookup a connection pid by reference.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
+        <a href="#migrate/1" data-no-tooltip="" translate="no">migrate(Conn)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Initiate connection migration. This triggers path validation by sending PATH_CHALLENGE on a new path. Simulates network change by rebinding the socket.</p></div>
 
     </div>
 
@@ -460,7 +470,7 @@ quic
       <h1 class="signature" translate="no">callback_mode()</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L420" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L441" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -482,7 +492,7 @@ quic
       <h1 class="signature" translate="no">close(Conn, Reason)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L341" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L355" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -510,7 +520,7 @@ quic
       <h1 class="signature" translate="no">close_stream(Conn, StreamId, ErrorCode)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L347" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L361" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -538,7 +548,7 @@ quic
       <h1 class="signature" translate="no">closed(EventType, OldState, State)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L858" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L959" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -560,7 +570,7 @@ quic
       <h1 class="signature" translate="no">code_change(OldVsn, StateName, State, Extra)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L632" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L661" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -582,7 +592,7 @@ quic
       <h1 class="signature" translate="no">connect(Host, Port, Opts, Owner)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L308" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L322" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -608,10 +618,10 @@ quic
       <i class="ri-link-m" aria-hidden="true"></i>
     </a>
     <div class="heading-with-actions">
-      <h1 class="signature" translate="no">connected(EventType, EventContent, State)</h1>
+      <h1 class="signature" translate="no">connected(EventType, OldState, State)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L723" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L802" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -633,7 +643,7 @@ quic
       <h1 class="signature" translate="no">draining(EventType, OldState, State)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L837" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L938" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -655,7 +665,7 @@ quic
       <h1 class="signature" translate="no">get_state(Conn)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L376" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L390" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -683,7 +693,7 @@ quic
       <h1 class="signature" translate="no">handle_timeout(Conn)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L358" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L372" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -711,7 +721,7 @@ quic
       <h1 class="signature" translate="no">handle_timeout(Conn, NowMs)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L365" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L379" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -739,7 +749,7 @@ quic
       <h1 class="signature" translate="no">handshaking(EventType, EventContent, State)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L685" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L737" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -761,7 +771,7 @@ quic
       <h1 class="signature" translate="no">idle(EventType, OldState, State)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L641" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L670" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -783,7 +793,7 @@ quic
       <h1 class="signature" translate="no">init(_)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L423" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L444" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -805,7 +815,7 @@ quic
       <h1 class="signature" translate="no">key_update(Conn)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L413" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L427" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -833,7 +843,7 @@ quic
       <h1 class="signature" translate="no">lookup(ConnRef)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L262" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L276" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -851,6 +861,34 @@ quic
 <p>Lookup a connection pid by reference.</p>
   </section>
 </section>
+<section class="detail" id="migrate/1">
+
+  <div class="detail-header">
+    <a href="#migrate/1" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">migrate(Conn)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L434" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> migrate(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:pid/0">pid</a>()) -> ok | {error, <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:term/0">term</a>()}.</pre>
+
+      </div>
+
+<p>Initiate connection migration. This triggers path validation by sending PATH_CHALLENGE on a new path. Simulates network change by rebinding the socket.</p>
+  </section>
+</section>
 <section class="detail" id="open_stream/1">
 
   <div class="detail-header">
@@ -861,7 +899,7 @@ quic
       <h1 class="signature" translate="no">open_stream(Conn)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L331" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L345" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -889,7 +927,7 @@ quic
       <h1 class="signature" translate="no">open_unidirectional_stream(Conn)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L336" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L350" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -917,7 +955,7 @@ quic
       <h1 class="signature" translate="no">peercert(Conn)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L391" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L405" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -945,7 +983,7 @@ quic
       <h1 class="signature" translate="no">peername(Conn)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L381" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L395" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -973,7 +1011,7 @@ quic
       <h1 class="signature" translate="no">process(Conn)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L371" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L385" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -1001,7 +1039,7 @@ quic
       <h1 class="signature" translate="no">register_conn(ConnRef, Pid)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L249" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L263" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -1029,7 +1067,7 @@ quic
       <h1 class="signature" translate="no">reset_stream(Conn, StreamId, ErrorCode)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L353" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L367" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -1057,7 +1095,7 @@ quic
       <h1 class="signature" translate="no">send_data(Conn, StreamId, Data, Fin)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L326" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L340" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -1085,7 +1123,7 @@ quic
       <h1 class="signature" translate="no">send_datagram(Conn, Data)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L401" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L415" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -1113,7 +1151,7 @@ quic
       <h1 class="signature" translate="no">set_owner(Conn, NewOwner)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L396" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L410" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -1141,7 +1179,7 @@ quic
       <h1 class="signature" translate="no">setopts(Conn, Opts)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L406" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L420" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -1169,7 +1207,7 @@ quic
       <h1 class="signature" translate="no">sockname(Conn)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L386" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L400" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -1197,7 +1235,7 @@ quic
       <h1 class="signature" translate="no">start_link(Host, Port, Opts, Owner)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L290" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L304" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -1226,7 +1264,7 @@ quic
       <h1 class="signature" translate="no">start_link(Host, Port, Opts, Owner, Socket)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L299" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L313" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -1259,7 +1297,7 @@ quic
       <h1 class="signature" translate="no">start_server(Opts)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L320" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L334" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -1287,7 +1325,7 @@ quic
       <h1 class="signature" translate="no">terminate(Reason, StateName, State)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L624" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L653" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -1309,7 +1347,7 @@ quic
       <h1 class="signature" translate="no">unregister_conn(ConnRef)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_connection.erl#L256" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_connection.erl#L270" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -1335,9 +1373,9 @@ quic
       <p>
 
           <span class="line">
-            <a href="https://hex.pm/packages/quic/0.6.5" class="footer-hex-package">Hex Package</a>
+            <a href="https://hex.pm/packages/quic/0.7.0" class="footer-hex-package">Hex Package</a>
 
-            <a href="https://preview.hex.pm/preview/quic/0.6.5">Hex Preview</a>
+            <a href="https://preview.hex.pm/preview/quic/0.7.0">Hex Preview</a>
 
           </span>
 

@@ -5,14 +5,14 @@
     <meta http-equiv="x-ua-compatible" content="ie=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="generator" content="ExDoc v0.39.1">
-    <meta name="project" content="quic v0.6.5">
+    <meta name="project" content="quic v0.7.0">
 
 
-    <title>quic_packet — quic v0.6.5</title>
+    <title>quic_packet — quic v0.7.0</title>
 
     <link rel="stylesheet" href="dist/html-erlang-7YNYEB7F.css" />
 
-    <script defer src="dist/sidebar_items-4DFDAA73.js"></script>
+    <script defer src="dist/sidebar_items-37BEB769.js"></script>
     <script defer src="docs_config.js"></script>
     <script defer src="dist/html-HBZYRXZS.js"></script>
 
@@ -37,7 +37,7 @@
 quic
         </a>
         <div class="sidebar-projectVersion" translate="no">
-          v0.6.5
+          v0.7.0
         </div>
       </div>
     </div>
@@ -94,11 +94,11 @@ quic
   <div class="heading-with-actions top-heading">
     <h1>
       <span translate="no">quic_packet</span> 
-      <small class="app-vsn" translate="no">(quic v0.6.5)</small>
+      <small class="app-vsn" translate="no">(quic v0.7.0)</small>
 
     </h1>
 
-      <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_packet.erl#L44" title="View Source" class="icon-action" rel="help">
+      <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_packet.erl#L44" title="View Source" class="icon-action" rel="help">
         <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         <span class="sr-only">View Source</span>
       </a>
@@ -110,19 +110,19 @@ quic
 <p>QUIC packet encoding and decoding.</p><p>This module handles encoding and decoding of QUIC packets including: - Long header packets (Initial, Handshake, 0-RTT, Retry) - Short header packets (1-RTT)</p><h3 id="module-packet-header-format" class="section-heading"><a href="#module-packet-header-format" class="hover-link"><i class="ri-link-m" aria-hidden="true"></i></a><span class="text"><a name="Packet_Header_Format">Packet Header Format</a></span></h3><p>Long Header:</p><pre><code class="makeup erlang" translate="no"><span class="w">   </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
    </span><span class="p">|</span><span class="mi">1</span><span class="p">|</span><span class="mi">1</span><span class="p">|</span><span class="n">T</span><span class="w"> </span><span class="n">T</span><span class="p">|</span><span class="n">X</span><span class="w"> </span><span class="n">X</span><span class="w"> </span><span class="n">X</span><span class="w"> </span><span class="n">X</span><span class="p">|</span><span class="w">
    </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
-   </span><span class="p">|</span><span class="w">                         </span><span class="n">Version</span><span class="w"> </span><span class="p" data-group-id="2799330851-1">(</span><span class="mi">32</span><span class="p" data-group-id="2799330851-1">)</span><span class="w">                          </span><span class="p">|</span><span class="w">
+   </span><span class="p">|</span><span class="w">                         </span><span class="n">Version</span><span class="w"> </span><span class="p" data-group-id="5376304766-1">(</span><span class="mi">32</span><span class="p" data-group-id="5376304766-1">)</span><span class="w">                          </span><span class="p">|</span><span class="w">
    </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
-   </span><span class="p">|</span><span class="w"> </span><span class="n">DCID</span><span class="w"> </span><span class="n">Len</span><span class="w"> </span><span class="p" data-group-id="2799330851-2">(</span><span class="mi">8</span><span class="p" data-group-id="2799330851-2">)</span><span class="w">  </span><span class="p">|</span><span class="w">
+   </span><span class="p">|</span><span class="w"> </span><span class="n">DCID</span><span class="w"> </span><span class="n">Len</span><span class="w"> </span><span class="p" data-group-id="5376304766-2">(</span><span class="mi">8</span><span class="p" data-group-id="5376304766-2">)</span><span class="w">  </span><span class="p">|</span><span class="w">
    </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
-   </span><span class="p">|</span><span class="w">               </span><span class="n">Destination</span><span class="w"> </span><span class="n">Connection</span><span class="w"> </span><span class="n">ID</span><span class="w"> </span><span class="p" data-group-id="2799330851-3">(</span><span class="mi">0</span><span class="p">.</span><span class="p">.</span><span class="mi">160</span><span class="p" data-group-id="2799330851-3">)</span><span class="w">            </span><span class="p">.</span><span class="p">.</span><span class="p">.</span><span class="w">
+   </span><span class="p">|</span><span class="w">               </span><span class="n">Destination</span><span class="w"> </span><span class="n">Connection</span><span class="w"> </span><span class="n">ID</span><span class="w"> </span><span class="p" data-group-id="5376304766-3">(</span><span class="mi">0</span><span class="p">.</span><span class="p">.</span><span class="mi">160</span><span class="p" data-group-id="5376304766-3">)</span><span class="w">            </span><span class="p">.</span><span class="p">.</span><span class="p">.</span><span class="w">
    </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
-   </span><span class="p">|</span><span class="w"> </span><span class="n">SCID</span><span class="w"> </span><span class="n">Len</span><span class="w"> </span><span class="p" data-group-id="2799330851-4">(</span><span class="mi">8</span><span class="p" data-group-id="2799330851-4">)</span><span class="w">  </span><span class="p">|</span><span class="w">
+   </span><span class="p">|</span><span class="w"> </span><span class="n">SCID</span><span class="w"> </span><span class="n">Len</span><span class="w"> </span><span class="p" data-group-id="5376304766-4">(</span><span class="mi">8</span><span class="p" data-group-id="5376304766-4">)</span><span class="w">  </span><span class="p">|</span><span class="w">
    </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
-   </span><span class="p">|</span><span class="w">                 </span><span class="n">Source</span><span class="w"> </span><span class="n">Connection</span><span class="w"> </span><span class="n">ID</span><span class="w"> </span><span class="p" data-group-id="2799330851-5">(</span><span class="mi">0</span><span class="p">.</span><span class="p">.</span><span class="mi">160</span><span class="p" data-group-id="2799330851-5">)</span><span class="w">               </span><span class="p">.</span><span class="p">.</span><span class="p">.</span><span class="w">
+   </span><span class="p">|</span><span class="w">                 </span><span class="n">Source</span><span class="w"> </span><span class="n">Connection</span><span class="w"> </span><span class="n">ID</span><span class="w"> </span><span class="p" data-group-id="5376304766-5">(</span><span class="mi">0</span><span class="p">.</span><span class="p">.</span><span class="mi">160</span><span class="p" data-group-id="5376304766-5">)</span><span class="w">               </span><span class="p">.</span><span class="p">.</span><span class="p">.</span><span class="w">
    </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span></code></pre><p>Short Header:</p><pre><code class="makeup erlang" translate="no"><span class="w">   </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
    </span><span class="p">|</span><span class="mi">0</span><span class="p">|</span><span class="mi">1</span><span class="p">|</span><span class="n">S</span><span class="p">|</span><span class="n">R</span><span class="p">|</span><span class="n">R</span><span class="p">|</span><span class="n">K</span><span class="p">|</span><span class="n">P</span><span class="w"> </span><span class="n">P</span><span class="p">|</span><span class="w">
    </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="w">
-   </span><span class="p">|</span><span class="w">                </span><span class="n">Destination</span><span class="w"> </span><span class="n">Connection</span><span class="w"> </span><span class="n">ID</span><span class="w"> </span><span class="p" data-group-id="9768400805-1">(</span><span class="mi">0</span><span class="p">.</span><span class="p">.</span><span class="mi">160</span><span class="p" data-group-id="9768400805-1">)</span><span class="w">           </span><span class="p">.</span><span class="p">.</span><span class="p">.</span><span class="w">
+   </span><span class="p">|</span><span class="w">                </span><span class="n">Destination</span><span class="w"> </span><span class="n">Connection</span><span class="w"> </span><span class="n">ID</span><span class="w"> </span><span class="p" data-group-id="1127512134-1">(</span><span class="mi">0</span><span class="p">.</span><span class="p">.</span><span class="mi">160</span><span class="p" data-group-id="1127512134-1">)</span><span class="w">           </span><span class="p">.</span><span class="p">.</span><span class="p">.</span><span class="w">
    </span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span><span class="o">-</span><span class="o">+</span></code></pre>
     </section>
 
@@ -234,6 +234,16 @@ quic
 
     <div class="summary-row">
       <div class="summary-signature">
+        <a href="#encode_version_negotiation/3" data-no-tooltip="" translate="no">encode_version_negotiation(DCID, SCID, Versions)</a>
+
+      </div>
+
+        <div class="summary-synopsis"><p>Encode a Version Negotiation packet. RFC 9000 Section 17.2.1 - Version Negotiation Packet The server sends this when it receives a packet with an unsupported version. The DCID and SCID are copied from the received packet (swapped). Versions is a list of supported version numbers.</p></div>
+
+    </div>
+
+    <div class="summary-row">
+      <div class="summary-signature">
         <a href="#pn_length/1" data-no-tooltip="" translate="no">pn_length(PN)</a>
 
       </div>
@@ -266,7 +276,7 @@ quic
       <h1 class="signature" translate="no">packet/0</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_packet.erl#L62" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_packet.erl#L63" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -301,7 +311,7 @@ quic
       <h1 class="signature" translate="no">packet_type/0</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_packet.erl#L61" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_packet.erl#L62" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -342,7 +352,7 @@ quic
       <h1 class="signature" translate="no">decode(Bin, DCIDLen)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_packet.erl#L164" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_packet.erl#L183" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -370,7 +380,7 @@ quic
       <h1 class="signature" translate="no">decode_pn(_, _)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_packet.erl#L180" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_packet.erl#L199" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -398,7 +408,7 @@ quic
       <h1 class="signature" translate="no">decode_short_key_phase(FirstByte)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_packet.erl#L156" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_packet.erl#L175" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -426,7 +436,7 @@ quic
       <h1 class="signature" translate="no">encode_long(Type, Version, DCID, SCID, Opts)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_packet.erl#L81" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_packet.erl#L82" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -459,7 +469,7 @@ quic
       <h1 class="signature" translate="no">encode_pn(PN, _)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_packet.erl#L173" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_packet.erl#L192" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -487,7 +497,7 @@ quic
       <h1 class="signature" translate="no">encode_short(DCID, PN, Payload, SpinBit)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_packet.erl#L132" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_packet.erl#L151" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -515,7 +525,7 @@ quic
       <h1 class="signature" translate="no">encode_short(DCID, PN, Payload, SpinBit, KeyPhase)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_packet.erl#L139" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_packet.erl#L158" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -533,6 +543,34 @@ quic
 <p>Encode a short header (1-RTT) packet with explicit key phase. KeyPhase is 0 or 1, indicating which set of keys was used for encryption. Returns the encoded packet.</p>
   </section>
 </section>
+<section class="detail" id="encode_version_negotiation/3">
+
+  <div class="detail-header">
+    <a href="#encode_version_negotiation/3" class="detail-link" data-no-tooltip="" aria-label="Link to this function">
+      <i class="ri-link-m" aria-hidden="true"></i>
+    </a>
+    <div class="heading-with-actions">
+      <h1 class="signature" translate="no">encode_version_negotiation(DCID, SCID, Versions)</h1>
+
+
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_packet.erl#L135" class="icon-action" rel="help" aria-label="View Source">
+          <i class="ri-code-s-slash-line" aria-hidden="true"></i>
+        </a>
+
+    </div>
+  </div>
+
+  <section class="docstring">
+
+      <div class="specs">
+
+          <pre translate="no"><span class="attribute">-spec</span> encode_version_negotiation(<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>(), [<a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()]) -> <a href="https://www.erlang.org/doc/apps/erts/erlang.html#t:binary/0">binary</a>().</pre>
+
+      </div>
+
+<p>Encode a Version Negotiation packet. RFC 9000 Section 17.2.1 - Version Negotiation Packet The server sends this when it receives a packet with an unsupported version. The DCID and SCID are copied from the received packet (swapped). Versions is a list of supported version numbers.</p>
+  </section>
+</section>
 <section class="detail" id="pn_length/1">
 
   <div class="detail-header">
@@ -543,7 +581,7 @@ quic
       <h1 class="signature" translate="no">pn_length(PN)</h1>
 
 
-        <a href="https://github.com/benoitc/erlang_quic/blob/v0.6.5/src/quic_packet.erl#L187" class="icon-action" rel="help" aria-label="View Source">
+        <a href="https://github.com/benoitc/erlang_quic/blob/v0.7.0/src/quic_packet.erl#L206" class="icon-action" rel="help" aria-label="View Source">
           <i class="ri-code-s-slash-line" aria-hidden="true"></i>
         </a>
 
@@ -569,9 +607,9 @@ quic
       <p>
 
           <span class="line">
-            <a href="https://hex.pm/packages/quic/0.6.5" class="footer-hex-package">Hex Package</a>
+            <a href="https://hex.pm/packages/quic/0.7.0" class="footer-hex-package">Hex Package</a>
 
-            <a href="https://preview.hex.pm/preview/quic/0.6.5">Hex Preview</a>
+            <a href="https://preview.hex.pm/preview/quic/0.7.0">Hex Preview</a>
 
           </span>
 
