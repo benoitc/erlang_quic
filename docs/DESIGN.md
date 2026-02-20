@@ -12,6 +12,7 @@ The implementation is organized into the following module groups:
 |--------|----------------|
 | `quic` | Main public API for client connections |
 | `quic_listener` | Server-side listener for accepting connections |
+| `quic_listener_sup` | Supervisor for pooled listeners with SO_REUSEPORT |
 
 ### Connection Layer
 
@@ -131,9 +132,11 @@ Frames are processed in order within a packet. Key frame types:
 | MAX_DATA (0x10) | Connection flow control |
 | MAX_STREAM_DATA (0x11) | Stream flow control |
 | NEW_CONNECTION_ID (0x18) | Issue new CID |
+| RETIRE_CONNECTION_ID (0x19) | Retire old CID |
 | PATH_CHALLENGE (0x1a) | Path validation |
 | PATH_RESPONSE (0x1b) | Path validation response |
 | CONNECTION_CLOSE (0x1c-0x1d) | Close connection |
+| DATAGRAM (0x30-0x31) | Unreliable datagram (RFC 9221) |
 
 ## TLS Integration
 
@@ -333,3 +336,92 @@ next_app_secret = HKDF-Expand-Label(current_app_secret, "quic ku", "", hash_len)
 - Store CIDs received from peer
 - Select appropriate CID for path
 - Respect `active_connection_id_limit` transport parameter
+
+## Session Resumption and 0-RTT
+
+### Session Tickets
+
+After a successful handshake, the server may issue a `NewSessionTicket`:
+
+1. Server sends ticket after handshake completion
+2. Client receives via `{session_ticket, Ticket}` message
+3. Client stores ticket for future connections
+4. Ticket contains PSK identity, resumption secret, and max_early_data
+
+### Resumption Flow
+
+```
+Client                                  Server
+  │                                       │
+  │───── Initial[ClientHello+PSK] ───────►│
+  │───── 0-RTT[Early Data] ──────────────►│ (optional)
+  │                                       │
+  │◄──── Initial[ServerHello+PSK] ────────│
+  │◄──── Handshake[EncryptedExtensions] ──│
+  │◄──── Handshake[Finished] ─────────────│
+  │                                       │
+  │───── Handshake[Finished] ────────────►│
+  │                                       │
+  │◄════ 1-RTT[Application Data] ═════════│
+```
+
+### 0-RTT Early Data
+
+When resuming with a stored ticket:
+
+1. Client derives `early_keys` from PSK
+2. Client sends 0-RTT packets (type 0x01) immediately
+3. Server validates PSK and derives matching keys
+4. Server processes early data or rejects with `early_data_rejected`
+5. Client falls back to 1-RTT if early data rejected
+
+**Limitations:**
+- 0-RTT data is not forward-secret
+- Max early data size is limited by ticket's `max_early_data_size`
+- Replay protection is application-layer responsibility
+
+## DATAGRAM Extension (RFC 9221)
+
+### Overview
+
+DATAGRAM frames provide unreliable message delivery:
+
+- Not retransmitted on loss
+- No flow control (use connection-level limits)
+- Useful for latency-sensitive data (gaming, real-time media)
+
+### Transport Parameter
+
+Negotiate via `max_datagram_frame_size` transport parameter:
+- 0 or absent: Datagrams not supported
+- Non-zero: Maximum datagram payload size
+
+### API
+
+```erlang
+%% Send a datagram
+quic:send_datagram(ConnRef, Data).
+
+%% Receive (owner process)
+receive
+    {quic, ConnRef, {datagram, Data}} -> ...
+end.
+```
+
+## Active Migration
+
+### Triggering Migration
+
+The `quic:migrate/1` API triggers active connection migration:
+
+1. Application calls `quic:migrate(ConnRef)`
+2. Connection rebinds to new local socket
+3. PATH_CHALLENGE sent to peer on new path
+4. On PATH_RESPONSE: migration complete
+5. Congestion controller reset for new path
+
+### Use Cases
+
+- Network handover (WiFi to cellular)
+- NAT rebinding recovery
+- Load balancing

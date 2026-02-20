@@ -7,11 +7,15 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 - TLS 1.3 handshake (RFC 8446)
 - Stream multiplexing (bidirectional and unidirectional)
 - Key update support (RFC 9001 Section 6)
-- Connection migration (RFC 9000 Section 9)
-- 0-RTT early data support (RFC 9001 Section 4.6)
-- Server mode with listener
+- Connection migration with active path migration API (RFC 9000 Section 9)
+- 0-RTT early data support with session resumption (RFC 9001 Section 4.6)
+- DATAGRAM frame support for unreliable data (RFC 9221)
+- QUIC v2 support (RFC 9369)
+- Server mode with listener and pooled listeners (SO_REUSEPORT)
+- Retry packet handling for address validation (RFC 9000 Section 8.1)
+- Stateless reset support (RFC 9000 Section 10.3)
 - Flow control (connection and stream level)
-- Congestion control (NewReno)
+- Congestion control (NewReno with ECN support)
 - Loss detection and packet retransmission (RFC 9002)
 
 ## Requirements
@@ -96,7 +100,10 @@ The owner process receives messages in the format `{quic, ConnRef, Event}`:
 | `{stream_reset, StreamId, ErrorCode}` | Stream reset by peer |
 | `{closed, Reason}` | Connection closed |
 | `{transport_error, Code, Reason}` | Transport error |
-| `{session_ticket, Ticket}` | Session ticket for 0-RTT |
+| `{session_ticket, Ticket}` | Session ticket for 0-RTT resumption |
+| `{datagram, Data}` | Datagram received (RFC 9221) |
+| `{stop_sending, StreamId, ErrorCode}` | Stop sending requested by peer |
+| `{send_ready, StreamId}` | Stream ready for writing |
 
 ## API Reference
 
@@ -106,6 +113,10 @@ The owner process receives messages in the format `{quic, ConnRef, Event}`:
 - `quic:close/2` - Close a connection
 - `quic:peername/1` - Get remote address
 - `quic:sockname/1` - Get local address
+- `quic:peercert/1` - Get peer certificate (DER-encoded)
+- `quic:set_owner/2` - Transfer connection ownership (like gen_tcp:controlling_process/2)
+- `quic:migrate/1` - Trigger connection migration to new local address
+- `quic:setopts/2` - Set connection options
 
 ### Streams
 
@@ -114,12 +125,19 @@ The owner process receives messages in the format `{quic, ConnRef, Event}`:
 - `quic:send_data/4` - Send data on stream
 - `quic:reset_stream/3` - Reset a stream
 
+### Datagrams (RFC 9221)
+
+- `quic:send_datagram/2` - Send unreliable datagram
+
 ### Server
 
 - `quic_listener:start_link/2` - Start a QUIC listener
+- `quic_listener:start/2` - Start unlinked listener
 - `quic_listener:stop/1` - Stop listener
 - `quic_listener:get_port/1` - Get listening port
 - `quic_listener:get_connections/1` - List active connections
+- `quic_listener_sup:start_link/2` - Start pooled listeners (SO_REUSEPORT)
+- `quic_listener_sup:get_listeners/1` - Get listener PIDs in pool
 
 ## Building
 
@@ -142,17 +160,20 @@ rebar3 eunit && rebar3 proper
 
 ## Interoperability
 
-This implementation passes all [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner) test cases:
+This implementation passes all 10 [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner) test cases:
 
-| Test Case | Status |
-|-----------|--------|
-| handshake | ✓ |
-| transfer | ✓ |
-| retry | ✓ |
-| keyupdate | ✓ |
-| chacha20 | ✓ |
-| multiconnect | ✓ |
-| v2 | ✓ |
+| Test Case | Status | Description |
+|-----------|--------|-------------|
+| handshake | ✓ | Basic QUIC handshake |
+| transfer | ✓ | File download with flow control |
+| retry | ✓ | Retry packet handling |
+| keyupdate | ✓ | Key rotation during transfer |
+| chacha20 | ✓ | ChaCha20-Poly1305 cipher |
+| multiconnect | ✓ | Multiple connections |
+| v2 | ✓ | QUIC v2 support |
+| resumption | ✓ | Session resumption with PSK |
+| zerortt | ✓ | 0-RTT early data |
+| connectionmigration | ✓ | Active path migration |
 
 See [interop/README.md](interop/README.md) for details on running interop tests.
 
