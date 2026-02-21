@@ -290,32 +290,36 @@ run_resumption_test(RequestsStr, DownloadsDir) ->
         [Url | _Rest] ->
             case parse_url(Url) of
                 {ok, Host, Port, Path} ->
-                    %% Phase 1: Initial connection to get ticket
-                    io:format("~n=== Phase 1: Initial connection to get ticket ===~n"),
-                    case resumption_phase1(Host, Port, Path, DownloadsDir) of
-                        {ok, Ticket} ->
-                            %% Save ticket to file
-                            save_ticket(Ticket),
-                            io:format("Ticket saved~n"),
-
-                            %% Phase 2: Resumption with ticket
-                            io:format("~n=== Phase 2: Resumption with ticket ===~n"),
-                            case resumption_phase2(Host, Port, Path, DownloadsDir, Ticket) of
-                                ok ->
-                                    io:format("Resumption test successful~n"),
-                                    halt(?EXIT_SUCCESS);
-                                error ->
-                                    io:format("Resumption phase 2 failed~n"),
-                                    halt(?EXIT_FAILURE)
-                            end;
+                    case do_resumption_phases(Host, Port, Path, DownloadsDir) of
+                        ok ->
+                            io:format("Resumption test successful~n"),
+                            halt(?EXIT_SUCCESS);
                         error ->
-                            io:format("Resumption phase 1 failed~n"),
                             halt(?EXIT_FAILURE)
                     end;
                 error ->
                     io:format("Invalid URL~n"),
                     halt(?EXIT_FAILURE)
             end
+    end.
+
+do_resumption_phases(Host, Port, Path, DownloadsDir) ->
+    io:format("~n=== Phase 1: Initial connection to get ticket ===~n"),
+    case resumption_phase1(Host, Port, Path, DownloadsDir) of
+        {ok, Ticket} ->
+            save_ticket(Ticket),
+            io:format("Ticket saved~n"),
+            io:format("~n=== Phase 2: Resumption with ticket ===~n"),
+            case resumption_phase2(Host, Port, Path, DownloadsDir, Ticket) of
+                ok ->
+                    ok;
+                error ->
+                    io:format("Resumption phase 2 failed~n"),
+                    error
+            end;
+        error ->
+            io:format("Resumption phase 1 failed~n"),
+            error
     end.
 
 %% Phase 1: Connect, download, and wait for session ticket
@@ -455,42 +459,33 @@ run_zerortt_test(RequestsStr, DownloadsDir) ->
         [Url | _Rest] ->
             case parse_url(Url) of
                 {ok, Host, Port, Path} ->
-                    %% Try to load existing ticket
-                    case load_ticket() of
-                        {ok, Ticket} ->
-                            io:format("Using stored ticket for 0-RTT~n"),
-                            case zerortt_with_ticket(Host, Port, Path, DownloadsDir, Ticket) of
-                                ok ->
-                                    io:format("0-RTT test successful~n"),
-                                    halt(?EXIT_SUCCESS);
-                                error ->
-                                    io:format("0-RTT test failed~n"),
-                                    halt(?EXIT_FAILURE)
-                            end;
+                    case do_zerortt_test(Host, Port, Path, DownloadsDir) of
+                        ok ->
+                            io:format("0-RTT test successful~n"),
+                            halt(?EXIT_SUCCESS);
                         error ->
-                            %% No ticket, do resumption first
-                            io:format("No stored ticket, running resumption first~n"),
-                            case resumption_phase1(Host, Port, Path, DownloadsDir) of
-                                {ok, Ticket} ->
-                                    save_ticket(Ticket),
-                                    case
-                                        zerortt_with_ticket(Host, Port, Path, DownloadsDir, Ticket)
-                                    of
-                                        ok ->
-                                            io:format("0-RTT test successful~n"),
-                                            halt(?EXIT_SUCCESS);
-                                        error ->
-                                            io:format("0-RTT test failed~n"),
-                                            halt(?EXIT_FAILURE)
-                                    end;
-                                error ->
-                                    io:format("Failed to get ticket for 0-RTT~n"),
-                                    halt(?EXIT_FAILURE)
-                            end
+                            halt(?EXIT_FAILURE)
                     end;
                 error ->
                     io:format("Invalid URL~n"),
                     halt(?EXIT_FAILURE)
+            end
+    end.
+
+do_zerortt_test(Host, Port, Path, DownloadsDir) ->
+    case load_ticket() of
+        {ok, Ticket} ->
+            io:format("Using stored ticket for 0-RTT~n"),
+            zerortt_with_ticket(Host, Port, Path, DownloadsDir, Ticket);
+        error ->
+            io:format("No stored ticket, running resumption first~n"),
+            case resumption_phase1(Host, Port, Path, DownloadsDir) of
+                {ok, Ticket} ->
+                    save_ticket(Ticket),
+                    zerortt_with_ticket(Host, Port, Path, DownloadsDir, Ticket);
+                error ->
+                    io:format("Failed to get ticket for 0-RTT~n"),
+                    error
             end
     end.
 

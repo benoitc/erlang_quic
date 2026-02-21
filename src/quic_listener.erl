@@ -71,8 +71,9 @@
     owns_tables = true :: boolean(),
     %% Stateless reset secret (RFC 9000 Section 10.3)
     reset_secret :: binary(),
-    %% Connection handler callback: fun(ConnPid, ConnRef) -> {ok, HandlerPid}
-    connection_handler :: fun((pid(), reference()) -> {ok, pid()}) | undefined,
+    %% Connection handler callback:
+    connection_handler ::
+        undefined | fun((pid(), reference()) -> {ok, pid()} | {error, term()} | term()),
     %% QUIC-LB CID configuration (RFC 9312)
     cid_config :: #cid_config{} | undefined,
     %% Expected DCID length for short header packets
@@ -477,34 +478,7 @@ create_connection(
 
             %% Invoke connection handler callback BEFORE sending packet
             %% This ensures ownership is transferred before handshake can complete
-            case ConnHandler of
-                undefined ->
-                    ok;
-                Fun when is_function(Fun, 2) ->
-                    case Fun(ConnPid, ConnRef) of
-                        {ok, HandlerPid} when is_pid(HandlerPid) ->
-                            %% Transfer ownership to handler
-                            case quic:set_owner(ConnRef, HandlerPid) of
-                                ok ->
-                                    ok;
-                                {error, Reason} ->
-                                    error_logger:warning_msg(
-                                        "QUIC listener: failed to set owner for ~p: ~p~n",
-                                        [ConnRef, Reason]
-                                    )
-                            end;
-                        {error, HandlerError} ->
-                            error_logger:warning_msg(
-                                "QUIC listener: connection_handler failed: ~p~n",
-                                [HandlerError]
-                            );
-                        Other ->
-                            error_logger:warning_msg(
-                                "QUIC listener: connection_handler returned unexpected: ~p~n",
-                                [Other]
-                            )
-                    end
-            end,
+            invoke_connection_handler(ConnHandler, ConnPid, ConnRef),
 
             %% Send initial packet to new connection (after ownership transfer)
             send_to_connection(ConnPid, Packet, RemoteAddr),
@@ -516,6 +490,35 @@ create_connection(
 
 send_to_connection(ConnPid, Packet, RemoteAddr) ->
     ConnPid ! {quic_packet, Packet, RemoteAddr}.
+
+invoke_connection_handler(undefined, _ConnPid, _ConnRef) ->
+    ok;
+invoke_connection_handler(Fun, ConnPid, ConnRef) when is_function(Fun, 2) ->
+    case Fun(ConnPid, ConnRef) of
+        {ok, HandlerPid} when is_pid(HandlerPid) ->
+            maybe_set_owner(ConnRef, HandlerPid);
+        {error, HandlerError} ->
+            error_logger:warning_msg(
+                "QUIC listener: connection_handler failed: ~p~n",
+                [HandlerError]
+            );
+        Other ->
+            error_logger:warning_msg(
+                "QUIC listener: connection_handler returned unexpected: ~p~n",
+                [Other]
+            )
+    end.
+
+maybe_set_owner(ConnRef, HandlerPid) ->
+    case quic:set_owner(ConnRef, HandlerPid) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            error_logger:warning_msg(
+                "QUIC listener: failed to set owner for ~p: ~p~n",
+                [ConnRef, Reason]
+            )
+    end.
 
 %%====================================================================
 %% Stateless Reset (RFC 9000 Section 10.3)
