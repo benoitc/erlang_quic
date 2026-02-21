@@ -20,6 +20,9 @@ All notable changes to this project will be documented in this file.
 - `quic:server_spec/3` to get a child spec for embedding QUIC servers in custom
   supervision trees
 
+### Changed
+- `quic:set_owner/2` is now asynchronous (cast instead of call)
+
 ### Fixed
 - `quic:get_server_port/1` now returns the actual OS-assigned port when server
   was started with port 0 (ephemeral port), instead of returning 0

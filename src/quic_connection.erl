@@ -425,9 +425,9 @@ peercert(Conn) ->
     gen_statem:call(Conn, peercert).
 
 %% @doc Set new owner process.
--spec set_owner(pid(), pid()) -> ok | {error, term()}.
+-spec set_owner(pid(), pid()) -> ok.
 set_owner(Conn, NewOwner) ->
-    gen_statem:call(Conn, {set_owner, NewOwner}).
+    gen_statem:cast(Conn, {set_owner, NewOwner}).
 
 %% @doc Send a datagram.
 -spec send_datagram(pid(), iodata()) -> ok | {error, term()}.
@@ -766,9 +766,8 @@ idle({call, From}, peername, #state{remote_addr = Addr} = State) ->
 idle({call, From}, sockname, #state{local_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
 
-idle({call, From}, {set_owner, NewOwner}, State) ->
-    NewState = State#state{owner = NewOwner},
-    {keep_state, NewState, [{reply, From, ok}]};
+idle(cast, {set_owner, NewOwner}, State) ->
+    {keep_state, State#state{owner = NewOwner}};
 
 %% 0-RTT: Allow opening streams in idle state if early keys are available
 idle({call, From}, open_stream, #state{early_keys = undefined} = State) ->
@@ -834,9 +833,8 @@ handshaking({call, From}, peername, #state{remote_addr = Addr} = State) ->
 handshaking({call, From}, sockname, #state{local_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
 
-handshaking({call, From}, {set_owner, NewOwner}, State) ->
-    NewState = State#state{owner = NewOwner},
-    {keep_state, NewState, [{reply, From, ok}]};
+handshaking(cast, {set_owner, NewOwner}, State) ->
+    {keep_state, State#state{owner = NewOwner}};
 
 %% 0-RTT: Allow opening streams during handshake if early keys are available
 handshaking({call, From}, open_stream, #state{early_keys = undefined} = State) ->
@@ -941,9 +939,8 @@ connected({call, From}, peercert, #state{peer_cert = undefined} = State) ->
 connected({call, From}, peercert, #state{peer_cert = Cert} = State) ->
     {keep_state, State, [{reply, From, {ok, Cert}}]};
 
-connected({call, From}, {set_owner, NewOwner}, State) ->
-    NewState = State#state{owner = NewOwner},
-    {keep_state, NewState, [{reply, From, ok}]};
+connected(cast, {set_owner, NewOwner}, State) ->
+    {keep_state, State#state{owner = NewOwner}};
 
 connected({call, From}, {send_datagram, Data}, State) ->
     case do_send_datagram(Data, State) of
