@@ -44,6 +44,9 @@
     process_ack/2,
     process_ack/3,
 
+    %% ACK frame utilities (shared with quic_loss)
+    ack_frame_to_pn_list/3,
+
     %% Queries
     largest_received/1,
     largest_acked/1,

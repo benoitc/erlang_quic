@@ -148,46 +148,49 @@ on_packet_sent(#loss_state{sent_packets = Sent, bytes_in_flight = InFlight} = St
     }.
 
 %% @doc Process an ACK frame.
-%% Returns {NewState, AckedPackets, LostPackets}
+%% Returns {NewState, AckedPackets, LostPackets} or {error, ack_range_too_large}
 -spec on_ack_received(loss_state(), term(), non_neg_integer()) ->
-    {loss_state(), [#sent_packet{}], [#sent_packet{}]}.
+    {loss_state(), [#sent_packet{}], [#sent_packet{}]} | {error, ack_range_too_large}.
 on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now) ->
-    %% Get list of acknowledged packet numbers
-    AckedPNs = ack_frame_to_pn_list(LargestAcked, FirstRange, AckRanges),
+    %% Get list of acknowledged packet numbers (use quic_ack for bounds-checked version)
+    case quic_ack:ack_frame_to_pn_list(LargestAcked, FirstRange, AckRanges) of
+        {error, _} = Error ->
+            Error;
+        AckedPNs ->
+            %% Find packets that were acknowledged
+            {AckedPackets, NewSent, RemovedBytes} = remove_acked_packets(
+                AckedPNs, State#loss_state.sent_packets),
 
-    %% Find packets that were acknowledged
-    {AckedPackets, NewSent, RemovedBytes} = remove_acked_packets(
-        AckedPNs, State#loss_state.sent_packets),
-
-    %% Update RTT if we got the largest acknowledged
-    NewState1 = case lists:member(LargestAcked, AckedPNs) of
-        true ->
-            case maps:get(LargestAcked, State#loss_state.sent_packets, undefined) of
-                #sent_packet{time_sent = TimeSent, ack_eliciting = true} ->
-                    LatestRTT = Now - TimeSent,
-                    AckDelayMs = ack_delay_to_ms(AckDelay, State),
-                    update_rtt(State, LatestRTT, AckDelayMs);
-                _ ->
+            %% Update RTT if we got the largest acknowledged
+            NewState1 = case lists:member(LargestAcked, AckedPNs) of
+                true ->
+                    case maps:get(LargestAcked, State#loss_state.sent_packets, undefined) of
+                        #sent_packet{time_sent = TimeSent, ack_eliciting = true} ->
+                            LatestRTT = Now - TimeSent,
+                            AckDelayMs = ack_delay_to_ms(AckDelay, State),
+                            update_rtt(State, LatestRTT, AckDelayMs);
+                        _ ->
+                            State
+                    end;
+                false ->
                     State
-            end;
-        false ->
-            State
-    end,
+            end,
 
-    %% Detect lost packets
-    {LostPackets, NewSent2, LostBytes} = detect_lost_packets(
-        NewSent, NewState1#loss_state.smoothed_rtt, LargestAcked, Now),
+            %% Detect lost packets
+            {LostPackets, NewSent2, LostBytes} = detect_lost_packets(
+                NewSent, NewState1#loss_state.smoothed_rtt, LargestAcked, Now),
 
-    %% Update state
-    NewInFlight = max(0, State#loss_state.bytes_in_flight - RemovedBytes - LostBytes),
-    NewState2 = NewState1#loss_state{
-        sent_packets = NewSent2,
-        bytes_in_flight = NewInFlight,
-        time_of_last_ack = Now,
-        pto_count = 0
-    },
+            %% Update state
+            NewInFlight = max(0, State#loss_state.bytes_in_flight - RemovedBytes - LostBytes),
+            NewState2 = NewState1#loss_state{
+                sent_packets = NewSent2,
+                bytes_in_flight = NewInFlight,
+                time_of_last_ack = Now,
+                pto_count = 0
+            },
 
-    {NewState2, AckedPackets, LostPackets};
+            {NewState2, AckedPackets, LostPackets}
+    end;
 
 on_ack_received(State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, _, _, _}, Now) ->
     on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now).
@@ -352,22 +355,6 @@ pto_count(#loss_state{pto_count = C}) -> C.
 %%====================================================================
 %% Internal Functions
 %%====================================================================
-
-%% Convert ACK frame to list of packet numbers
-ack_frame_to_pn_list(LargestAcked, FirstRange, AckRanges) ->
-    FirstEnd = LargestAcked,
-    FirstStart = LargestAcked - FirstRange,
-    FirstPNs = lists:seq(FirstStart, FirstEnd),
-    RestPNs = ack_ranges_to_pn_list(FirstStart, AckRanges),
-    FirstPNs ++ RestPNs.
-
-ack_ranges_to_pn_list(_PrevStart, []) ->
-    [];
-ack_ranges_to_pn_list(PrevStart, [{Gap, Range} | Rest]) ->
-    End = PrevStart - Gap - 2,
-    Start = End - Range,
-    PNs = lists:seq(Start, End),
-    PNs ++ ack_ranges_to_pn_list(Start, Rest).
 
 %% Remove acknowledged packets from sent map
 remove_acked_packets(AckedPNs, SentPackets) ->
