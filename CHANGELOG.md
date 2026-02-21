@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.1] - 2026-02-21
+
+### Fixed
+- ACK range encoding crash for out-of-order packets: when packets arrived out
+  of order (e.g., 10, 5, 6), ACK ranges were not properly maintained in
+  descending order or merged, causing negative Gap values that crashed
+  `quic_varint:encode/1` with `badarg`
+
 ## [0.10.0] - 2026-02-21
 
 ### Added
