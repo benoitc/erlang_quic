@@ -28,14 +28,18 @@ rfc9001_initial_secret_test() ->
 rfc9001_client_initial_secret_test() ->
     DCID = hexstr_to_bin("8394c8f03e515708"),
     InitialSecret = quic_keys:derive_initial_secret(DCID),
-    ExpectedClientSecret = hexstr_to_bin("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"),
+    ExpectedClientSecret = hexstr_to_bin(
+        "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"
+    ),
     ClientSecret = quic_hkdf:expand_label(InitialSecret, <<"client in">>, <<>>, 32),
     ?assertEqual(ExpectedClientSecret, ClientSecret).
 
 rfc9001_server_initial_secret_test() ->
     DCID = hexstr_to_bin("8394c8f03e515708"),
     InitialSecret = quic_keys:derive_initial_secret(DCID),
-    ExpectedServerSecret = hexstr_to_bin("3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b"),
+    ExpectedServerSecret = hexstr_to_bin(
+        "3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b"
+    ),
     ServerSecret = quic_hkdf:expand_label(InitialSecret, <<"server in">>, <<>>, 32),
     ?assertEqual(ExpectedServerSecret, ServerSecret).
 
@@ -117,8 +121,8 @@ derive_initial_deterministic_test() ->
     ?assertEqual(Keys1, Keys2).
 
 different_dcid_different_keys_test() ->
-    DCID1 = <<1,2,3,4,5,6,7,8>>,
-    DCID2 = <<8,7,6,5,4,3,2,1>>,
+    DCID1 = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    DCID2 = <<8, 7, 6, 5, 4, 3, 2, 1>>,
     Keys1 = quic_keys:derive_initial_client(DCID1),
     Keys2 = quic_keys:derive_initial_client(DCID2),
     ?assertNotEqual(Keys1, Keys2).
@@ -134,14 +138,14 @@ client_server_different_keys_test() ->
 %%====================================================================
 
 quic_v1_salt_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     %% Should use v1 salt
     Keys1 = quic_keys:derive_initial_client(DCID, ?QUIC_VERSION_1),
     Keys2 = quic_keys:derive_initial_client(DCID),
     ?assertEqual(Keys1, Keys2).
 
 quic_v2_different_from_v1_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     KeysV1 = quic_keys:derive_initial_client(DCID, ?QUIC_VERSION_1),
     KeysV2 = quic_keys:derive_initial_client(DCID, ?QUIC_VERSION_2),
     ?assertNotEqual(KeysV1, KeysV2).
@@ -159,7 +163,8 @@ derive_updated_secret_aes_128_test() ->
 
 %% Test key update with AES-256-GCM (uses SHA-384)
 derive_updated_secret_aes_256_test() ->
-    Secret = crypto:strong_rand_bytes(48),  % SHA-384 produces 48-byte secrets
+    % SHA-384 produces 48-byte secrets
+    Secret = crypto:strong_rand_bytes(48),
     UpdatedSecret = quic_keys:derive_updated_secret(Secret, aes_256_gcm),
     ?assertEqual(48, byte_size(UpdatedSecret)),
     ?assertNotEqual(Secret, UpdatedSecret).

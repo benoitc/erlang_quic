@@ -71,7 +71,8 @@ lookup_ticket(ServerName, Store) ->
             Age = Now - ReceivedAt,
             case Age =< Lifetime of
                 true -> {ok, Ticket};
-                false -> error  % Expired
+                % Expired
+                false -> error
             end;
         error ->
             error
@@ -89,7 +90,9 @@ clear_expired(Store) ->
     maps:filter(
         fun(_ServerName, #session_ticket{received_at = ReceivedAt, lifetime = Lifetime}) ->
             (Now - ReceivedAt) =< Lifetime
-        end, Store).
+        end,
+        Store
+    ).
 
 %%====================================================================
 %% PSK Derivation
@@ -126,11 +129,14 @@ derive_psk(ResumptionSecret, #session_ticket{nonce = Nonce, cipher = Cipher}) ->
 %%       Extension extensions&lt;0..2^16-2&gt;;
 %%   } NewSessionTicket;
 -spec parse_new_session_ticket(binary()) ->
-    {ok, #{lifetime := non_neg_integer(),
-           age_add := non_neg_integer(),
-           nonce := binary(),
-           ticket := binary(),
-           max_early_data := non_neg_integer()}} | {error, term()}.
+    {ok, #{
+        lifetime := non_neg_integer(),
+        age_add := non_neg_integer(),
+        nonce := binary(),
+        ticket := binary(),
+        max_early_data := non_neg_integer()
+    }}
+    | {error, term()}.
 parse_new_session_ticket(<<Lifetime:32, AgeAdd:32, NonceLen, Rest/binary>>) ->
     case Rest of
         <<Nonce:NonceLen/binary, TicketLen:16, Rest1/binary>> when byte_size(Rest1) >= TicketLen ->
@@ -180,7 +186,8 @@ create_ticket(ServerName, ResumptionSecret, MaxEarlyData, Cipher, ALPN) ->
     #session_ticket{
         server_name = ServerName,
         ticket = crypto:strong_rand_bytes(32),
-        lifetime = 86400,  % 24 hours
+        % 24 hours
+        lifetime = 86400,
         age_add = AgeAdd,
         nonce = crypto:strong_rand_bytes(8),
         resumption_secret = ResumptionSecret,
@@ -203,12 +210,13 @@ build_new_session_ticket(#session_ticket{
     TicketLen = byte_size(Ticket),
 
     %% Build early_data extension if max_early_data > 0
-    Extensions = case MaxEarlyData of
-        0 -> <<>>;
-        _ -> <<16#00, 16#2a, 4:16, MaxEarlyData:32>>  % early_data extension
-    end,
+    Extensions =
+        case MaxEarlyData of
+            0 -> <<>>;
+            % early_data extension
+            _ -> <<16#00, 16#2a, 4:16, MaxEarlyData:32>>
+        end,
     ExtLen = byte_size(Extensions),
 
-    <<Lifetime:32, AgeAdd:32, NonceLen, Nonce/binary,
-      TicketLen:16, Ticket/binary, ExtLen:16, Extensions/binary>>.
-
+    <<Lifetime:32, AgeAdd:32, NonceLen, Nonce/binary, TicketLen:16, Ticket/binary, ExtLen:16,
+        Extensions/binary>>.

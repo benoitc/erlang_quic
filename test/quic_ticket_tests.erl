@@ -104,14 +104,13 @@ parse_new_session_ticket_basic_test() ->
     %% Build a simple NewSessionTicket message
     Lifetime = 86400,
     AgeAdd = 12345,
-    Nonce = <<1,2,3,4,5,6,7,8>>,
+    Nonce = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     Ticket = <<"session_ticket_data">>,
     TicketLen = byte_size(Ticket),
     NonceLen = byte_size(Nonce),
 
     %% No extensions
-    Message = <<Lifetime:32, AgeAdd:32, NonceLen, Nonce/binary,
-                TicketLen:16, Ticket/binary, 0:16>>,
+    Message = <<Lifetime:32, AgeAdd:32, NonceLen, Nonce/binary, TicketLen:16, Ticket/binary, 0:16>>,
 
     {ok, Parsed} = quic_ticket:parse_new_session_ticket(Message),
     ?assertEqual(Lifetime, maps:get(lifetime, Parsed)),
@@ -123,7 +122,7 @@ parse_new_session_ticket_basic_test() ->
 parse_new_session_ticket_with_early_data_test() ->
     Lifetime = 3600,
     AgeAdd = 99999,
-    Nonce = <<1,2,3,4>>,
+    Nonce = <<1, 2, 3, 4>>,
     Ticket = <<"ticket">>,
     MaxEarlyData = 16384,
 
@@ -131,15 +130,16 @@ parse_new_session_ticket_with_early_data_test() ->
     EarlyDataExt = <<16#00, 16#2a, 4:16, MaxEarlyData:32>>,
     ExtLen = byte_size(EarlyDataExt),
 
-    Message = <<Lifetime:32, AgeAdd:32, (byte_size(Nonce)), Nonce/binary,
-                (byte_size(Ticket)):16, Ticket/binary, ExtLen:16, EarlyDataExt/binary>>,
+    Message =
+        <<Lifetime:32, AgeAdd:32, (byte_size(Nonce)), Nonce/binary, (byte_size(Ticket)):16,
+            Ticket/binary, ExtLen:16, EarlyDataExt/binary>>,
 
     {ok, Parsed} = quic_ticket:parse_new_session_ticket(Message),
     ?assertEqual(MaxEarlyData, maps:get(max_early_data, Parsed)).
 
 parse_new_session_ticket_invalid_test() ->
     %% Too short
-    ?assertEqual({error, invalid_format}, quic_ticket:parse_new_session_ticket(<<1,2,3>>)).
+    ?assertEqual({error, invalid_format}, quic_ticket:parse_new_session_ticket(<<1, 2, 3>>)).
 
 %%====================================================================
 %% Resumption Secret Tests
@@ -150,7 +150,8 @@ resumption_secret_derivation_test() ->
     TranscriptHash = crypto:strong_rand_bytes(32),
 
     ResSecret = quic_ticket:derive_resumption_secret(
-        aes_128_gcm, MasterSecret, TranscriptHash, <<>>),
+        aes_128_gcm, MasterSecret, TranscriptHash, <<>>
+    ),
 
     ?assertEqual(32, byte_size(ResSecret)).
 

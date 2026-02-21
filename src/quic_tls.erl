@@ -105,15 +105,24 @@ build_client_hello_standard(Random, PubKey, PrivKey, Opts) ->
 
     %% Build ClientHello body
     ClientHello = <<
-        ?TLS_VERSION_1_2:16,          % legacy_version (always 0x0303)
-        Random:32/binary,              % random
-        (byte_size(SessionId)):8,      % legacy_session_id length
-        SessionId/binary,              % legacy_session_id
-        (byte_size(CipherSuites)):16,  % cipher_suites length
-        CipherSuites/binary,           % cipher_suites
-        CompressionMethods/binary,     % legacy_compression_methods
-        (byte_size(Extensions)):16,    % extensions length
-        Extensions/binary              % extensions
+        % legacy_version (always 0x0303)
+        ?TLS_VERSION_1_2:16,
+        % random
+        Random:32/binary,
+        % legacy_session_id length
+        (byte_size(SessionId)):8,
+        % legacy_session_id
+        SessionId/binary,
+        % cipher_suites length
+        (byte_size(CipherSuites)):16,
+        % cipher_suites
+        CipherSuites/binary,
+        % legacy_compression_methods
+        CompressionMethods/binary,
+        % extensions length
+        (byte_size(Extensions)):16,
+        % extensions
+        Extensions/binary
     >>,
 
     %% Wrap in handshake message
@@ -216,53 +225,71 @@ build_client_hello_extensions(PubKey, Opts) ->
 
     %% Supported versions (TLS 1.3 only)
     %% Length is in bytes (2 bytes per version), not version count
-    SupportedVersions = encode_extension(?EXT_SUPPORTED_VERSIONS,
-        <<2, ?TLS_VERSION_1_3:16>>),
+    SupportedVersions = encode_extension(
+        ?EXT_SUPPORTED_VERSIONS,
+        <<2, ?TLS_VERSION_1_3:16>>
+    ),
 
     %% Supported groups (x25519)
-    SupportedGroups = encode_extension(?EXT_SUPPORTED_GROUPS,
-        <<2:16, ?GROUP_X25519:16>>),
+    SupportedGroups = encode_extension(
+        ?EXT_SUPPORTED_GROUPS,
+        <<2:16, ?GROUP_X25519:16>>
+    ),
 
     %% Signature algorithms
-    SigAlgs = encode_extension(?EXT_SIGNATURE_ALGORITHMS,
-        <<8:16,
-          ?SIG_ECDSA_SECP256R1_SHA256:16,
-          ?SIG_RSA_PSS_RSAE_SHA256:16,
-          ?SIG_RSA_PKCS1_SHA256:16,
-          ?SIG_ED25519:16>>),
+    SigAlgs = encode_extension(
+        ?EXT_SIGNATURE_ALGORITHMS,
+        <<8:16, ?SIG_ECDSA_SECP256R1_SHA256:16, ?SIG_RSA_PSS_RSAE_SHA256:16,
+            ?SIG_RSA_PKCS1_SHA256:16, ?SIG_ED25519:16>>
+    ),
 
     %% Key share (x25519 public key)
     KeyShareEntry = <<?GROUP_X25519:16, 32:16, PubKey:32/binary>>,
-    KeyShare = encode_extension(?EXT_KEY_SHARE,
-        <<(byte_size(KeyShareEntry)):16, KeyShareEntry/binary>>),
+    KeyShare = encode_extension(
+        ?EXT_KEY_SHARE,
+        <<(byte_size(KeyShareEntry)):16, KeyShareEntry/binary>>
+    ),
 
     %% Server Name Indication
-    SNI = case ServerName of
-        undefined -> <<>>;
-        Name when is_binary(Name) ->
-            NameLen = byte_size(Name),
-            NameList = <<0, NameLen:16, Name/binary>>,
-            encode_extension(?EXT_SERVER_NAME,
-                <<(byte_size(NameList)):16, NameList/binary>>)
-    end,
+    SNI =
+        case ServerName of
+            undefined ->
+                <<>>;
+            Name when is_binary(Name) ->
+                NameLen = byte_size(Name),
+                NameList = <<0, NameLen:16, Name/binary>>,
+                encode_extension(
+                    ?EXT_SERVER_NAME,
+                    <<(byte_size(NameList)):16, NameList/binary>>
+                )
+        end,
 
     %% ALPN
-    AlpnExt = case Alpn of
-        [] -> <<>>;
-        Protocols ->
-            ProtocolList = encode_alpn_list(Protocols),
-            encode_extension(?EXT_ALPN,
-                <<(byte_size(ProtocolList)):16, ProtocolList/binary>>)
-    end,
+    AlpnExt =
+        case Alpn of
+            [] ->
+                <<>>;
+            Protocols ->
+                ProtocolList = encode_alpn_list(Protocols),
+                encode_extension(
+                    ?EXT_ALPN,
+                    <<(byte_size(ProtocolList)):16, ProtocolList/binary>>
+                )
+        end,
 
     %% QUIC Transport Parameters
     TransportParamsData = encode_transport_params(TransportParams),
-    TransportParamsExt = encode_extension(?EXT_QUIC_TRANSPORT_PARAMS,
-        TransportParamsData),
+    TransportParamsExt = encode_extension(
+        ?EXT_QUIC_TRANSPORT_PARAMS,
+        TransportParamsData
+    ),
 
     %% PSK Key Exchange Modes (psk_dhe_ke only)
-    PskModes = encode_extension(?EXT_PSK_KEY_EXCHANGE_MODES,
-        <<1, 1>>),  % psk_dhe_ke = 1
+    PskModes = encode_extension(
+        ?EXT_PSK_KEY_EXCHANGE_MODES,
+        % psk_dhe_ke = 1
+        <<1, 1>>
+    ),
 
     iolist_to_binary([
         SupportedVersions,
@@ -285,15 +312,17 @@ encode_alpn_list(Protocols) ->
 %% @doc Parse a ServerHello message.
 %% Returns server's public key and selected cipher suite.
 -spec parse_server_hello(binary()) ->
-    {ok, #{public_key := binary(), cipher := atom(), random := binary()}} |
-    {error, term()}.
+    {ok, #{public_key := binary(), cipher := atom(), random := binary()}}
+    | {error, term()}.
 parse_server_hello(<<
-    ?TLS_VERSION_1_2:16,    % legacy_version
+    % legacy_version
+    ?TLS_VERSION_1_2:16,
     Random:32/binary,
     SessionIdLen:8,
     SessionId:SessionIdLen/binary,
     CipherSuite:16,
-    0,                       % legacy_compression_method
+    % legacy_compression_method
+    0,
     ExtensionsLen:16,
     Extensions:ExtensionsLen/binary,
     _Rest/binary
@@ -327,26 +356,28 @@ parse_server_hello(_) ->
 
 %% @doc Parse EncryptedExtensions message.
 -spec parse_encrypted_extensions(binary()) ->
-    {ok, #{alpn => binary(), transport_params => map()}} |
-    {error, term()}.
+    {ok, #{alpn => binary(), transport_params => map()}}
+    | {error, term()}.
 parse_encrypted_extensions(<<ExtensionsLen:16, Extensions:ExtensionsLen/binary, _Rest/binary>>) ->
     case parse_extensions(Extensions) of
         {ok, ExtMap} ->
-            Alpn = case maps:find(?EXT_ALPN, ExtMap) of
-                {ok, <<_ListLen:16, ProtoLen:8, Proto:ProtoLen/binary, _/binary>>} ->
-                    Proto;
-                _ ->
-                    undefined
-            end,
-            TransportParams = case maps:find(?EXT_QUIC_TRANSPORT_PARAMS, ExtMap) of
-                {ok, TPData} ->
-                    case decode_transport_params(TPData) of
-                        {ok, TP} -> TP;
-                        _ -> #{}
-                    end;
-                _ ->
-                    #{}
-            end,
+            Alpn =
+                case maps:find(?EXT_ALPN, ExtMap) of
+                    {ok, <<_ListLen:16, ProtoLen:8, Proto:ProtoLen/binary, _/binary>>} ->
+                        Proto;
+                    _ ->
+                        undefined
+                end,
+            TransportParams =
+                case maps:find(?EXT_QUIC_TRANSPORT_PARAMS, ExtMap) of
+                    {ok, TPData} ->
+                        case decode_transport_params(TPData) of
+                            {ok, TP} -> TP;
+                            _ -> #{}
+                        end;
+                    _ ->
+                        #{}
+                end,
             {ok, #{alpn => Alpn, transport_params => TransportParams}};
         Error ->
             Error
@@ -356,10 +387,12 @@ parse_encrypted_extensions(_) ->
 
 %% @doc Parse Certificate message.
 -spec parse_certificate(binary()) ->
-    {ok, #{context := binary(), certificates := [binary()]}} |
-    {error, term()}.
-parse_certificate(<<ContextLen:8, Context:ContextLen/binary,
-                    CertsLen:24, CertsData:CertsLen/binary, _Rest/binary>>) ->
+    {ok, #{context := binary(), certificates := [binary()]}}
+    | {error, term()}.
+parse_certificate(
+    <<ContextLen:8, Context:ContextLen/binary, CertsLen:24, CertsData:CertsLen/binary,
+        _Rest/binary>>
+) ->
     Certs = parse_certificate_list(CertsData),
     {ok, #{context => Context, certificates => Certs}};
 parse_certificate(_) ->
@@ -367,14 +400,15 @@ parse_certificate(_) ->
 
 parse_certificate_list(<<>>) ->
     [];
-parse_certificate_list(<<CertLen:24, Cert:CertLen/binary,
-                         ExtLen:16, _Ext:ExtLen/binary, Rest/binary>>) ->
+parse_certificate_list(
+    <<CertLen:24, Cert:CertLen/binary, ExtLen:16, _Ext:ExtLen/binary, Rest/binary>>
+) ->
     [Cert | parse_certificate_list(Rest)].
 
 %% @doc Parse CertificateVerify message.
 -spec parse_certificate_verify(binary()) ->
-    {ok, #{algorithm := non_neg_integer(), signature := binary()}} |
-    {error, term()}.
+    {ok, #{algorithm := non_neg_integer(), signature := binary()}}
+    | {error, term()}.
 parse_certificate_verify(<<Algorithm:16, SigLen:16, Signature:SigLen/binary, _Rest/binary>>) ->
     {ok, #{algorithm => Algorithm, signature => Signature}};
 parse_certificate_verify(_) ->
@@ -425,12 +459,16 @@ verify_finished(ReceivedVerifyData, TrafficSecret, TranscriptHash, Cipher) ->
 %%   initial_max_data, initial_max_stream_data_bidi_local, etc.
 -spec encode_transport_params(map()) -> binary().
 encode_transport_params(Params) ->
-    Encoded = maps:fold(fun(Key, Value, Acc) ->
-        case encode_transport_param(Key, Value) of
-            <<>> -> Acc;
-            Bin -> [Bin | Acc]
-        end
-    end, [], Params),
+    Encoded = maps:fold(
+        fun(Key, Value, Acc) ->
+            case encode_transport_param(Key, Value) of
+                <<>> -> Acc;
+                Bin -> [Bin | Acc]
+            end
+        end,
+        [],
+        Params
+    ),
     iolist_to_binary(lists:reverse(Encoded)).
 
 encode_transport_param(original_dcid, Value) ->
@@ -509,12 +547,18 @@ tp_id_to_key(?TP_INITIAL_SCID) -> initial_scid;
 tp_id_to_key(?TP_RETRY_SCID) -> retry_scid;
 tp_id_to_key(Id) -> {unknown, Id}.
 
-decode_tp_value(?TP_ORIGINAL_DCID, Value) -> Value;
-decode_tp_value(?TP_STATELESS_RESET_TOKEN, Value) -> Value;
-decode_tp_value(?TP_INITIAL_SCID, Value) -> Value;
-decode_tp_value(?TP_RETRY_SCID, Value) -> Value;
-decode_tp_value(?TP_DISABLE_ACTIVE_MIGRATION, <<>>) -> true;
-decode_tp_value(?TP_PREFERRED_ADDRESS, Value) -> decode_preferred_address(Value);
+decode_tp_value(?TP_ORIGINAL_DCID, Value) ->
+    Value;
+decode_tp_value(?TP_STATELESS_RESET_TOKEN, Value) ->
+    Value;
+decode_tp_value(?TP_INITIAL_SCID, Value) ->
+    Value;
+decode_tp_value(?TP_RETRY_SCID, Value) ->
+    Value;
+decode_tp_value(?TP_DISABLE_ACTIVE_MIGRATION, <<>>) ->
+    true;
+decode_tp_value(?TP_PREFERRED_ADDRESS, Value) ->
+    decode_preferred_address(Value);
 decode_tp_value(_, Value) ->
     %% Most parameters are varints
     {Int, _} = quic_varint:decode(Value),
@@ -531,25 +575,37 @@ decode_tp_value(_, Value) ->
 %%   Stateless reset: 16 bytes
 -spec decode_preferred_address(binary()) -> #preferred_address{}.
 decode_preferred_address(<<
-    IPv4_A:8, IPv4_B:8, IPv4_C:8, IPv4_D:8,
+    IPv4_A:8,
+    IPv4_B:8,
+    IPv4_C:8,
+    IPv4_D:8,
     IPv4Port:16,
-    IPv6_1:16, IPv6_2:16, IPv6_3:16, IPv6_4:16,
-    IPv6_5:16, IPv6_6:16, IPv6_7:16, IPv6_8:16,
+    IPv6_1:16,
+    IPv6_2:16,
+    IPv6_3:16,
+    IPv6_4:16,
+    IPv6_5:16,
+    IPv6_6:16,
+    IPv6_7:16,
+    IPv6_8:16,
     IPv6Port:16,
-    CIDLen:8, CID:CIDLen/binary,
+    CIDLen:8,
+    CID:CIDLen/binary,
     StatelessResetToken:16/binary,
     _Rest/binary
 >>) ->
     %% Parse IPv4 - zero address means not present
-    {IPv4Addr, IPv4PortVal} = case {IPv4_A, IPv4_B, IPv4_C, IPv4_D, IPv4Port} of
-        {0, 0, 0, 0, 0} -> {undefined, undefined};
-        _ -> {{IPv4_A, IPv4_B, IPv4_C, IPv4_D}, IPv4Port}
-    end,
+    {IPv4Addr, IPv4PortVal} =
+        case {IPv4_A, IPv4_B, IPv4_C, IPv4_D, IPv4Port} of
+            {0, 0, 0, 0, 0} -> {undefined, undefined};
+            _ -> {{IPv4_A, IPv4_B, IPv4_C, IPv4_D}, IPv4Port}
+        end,
     %% Parse IPv6 - zero address means not present
-    {IPv6Addr, IPv6PortVal} = case {IPv6_1, IPv6_2, IPv6_3, IPv6_4, IPv6_5, IPv6_6, IPv6_7, IPv6_8, IPv6Port} of
-        {0, 0, 0, 0, 0, 0, 0, 0, 0} -> {undefined, undefined};
-        _ -> {{IPv6_1, IPv6_2, IPv6_3, IPv6_4, IPv6_5, IPv6_6, IPv6_7, IPv6_8}, IPv6Port}
-    end,
+    {IPv6Addr, IPv6PortVal} =
+        case {IPv6_1, IPv6_2, IPv6_3, IPv6_4, IPv6_5, IPv6_6, IPv6_7, IPv6_8, IPv6Port} of
+            {0, 0, 0, 0, 0, 0, 0, 0, 0} -> {undefined, undefined};
+            _ -> {{IPv6_1, IPv6_2, IPv6_3, IPv6_4, IPv6_5, IPv6_6, IPv6_7, IPv6_8}, IPv6Port}
+        end,
     #preferred_address{
         ipv4_addr = IPv4Addr,
         ipv4_port = IPv4PortVal,
@@ -570,17 +626,19 @@ encode_preferred_address(#preferred_address{
     stateless_reset_token = Token
 }) ->
     %% Encode IPv4 (zeros if not present)
-    IPv4Bin = case IPv4Addr of
-        {A, B, C, D} -> <<A, B, C, D, IPv4Port:16>>;
-        undefined -> <<0, 0, 0, 0, 0:16>>
-    end,
+    IPv4Bin =
+        case IPv4Addr of
+            {A, B, C, D} -> <<A, B, C, D, IPv4Port:16>>;
+            undefined -> <<0, 0, 0, 0, 0:16>>
+        end,
     %% Encode IPv6 (zeros if not present)
-    IPv6Bin = case IPv6Addr of
-        {V1, V2, V3, V4, V5, V6, V7, V8} ->
-            <<V1:16, V2:16, V3:16, V4:16, V5:16, V6:16, V7:16, V8:16, IPv6Port:16>>;
-        undefined ->
-            <<0:128, 0:16>>
-    end,
+    IPv6Bin =
+        case IPv6Addr of
+            {V1, V2, V3, V4, V5, V6, V7, V8} ->
+                <<V1:16, V2:16, V3:16, V4:16, V5:16, V6:16, V7:16, V8:16, IPv6Port:16>>;
+            undefined ->
+                <<0:128, 0:16>>
+        end,
     CIDLen = byte_size(CID),
     <<IPv4Bin/binary, IPv6Bin/binary, CIDLen:8, CID/binary, Token/binary>>.
 
@@ -597,8 +655,8 @@ encode_handshake_message(Type, Body) ->
 %% @doc Decode a TLS handshake message.
 %% Returns {Type, Body, Rest} or {error, Reason}.
 -spec decode_handshake_message(binary()) ->
-    {ok, {non_neg_integer(), binary()}, binary()} |
-    {error, term()}.
+    {ok, {non_neg_integer(), binary()}, binary()}
+    | {error, term()}.
 decode_handshake_message(<<Type:8, Length:24, Body:Length/binary, Rest/binary>>) ->
     {ok, {Type, Body}, Rest};
 decode_handshake_message(<<_Type:8, Length:24, Data/binary>>) when byte_size(Data) < Length ->
@@ -652,12 +710,17 @@ cipher_from_suite(_) -> aes_128_gcm.
 -spec parse_client_hello(binary()) ->
     {ok, map()} | {error, term()}.
 parse_client_hello(<<
-    ?TLS_VERSION_1_2:16,  % Legacy version
+    % Legacy version
+    ?TLS_VERSION_1_2:16,
     Random:32/binary,
-    SessionIdLen:8, SessionId:SessionIdLen/binary,
-    CipherSuitesLen:16, CipherSuites:CipherSuitesLen/binary,
-    CompressionLen:8, _Compression:CompressionLen/binary,
-    ExtLen:16, Extensions:ExtLen/binary,
+    SessionIdLen:8,
+    SessionId:SessionIdLen/binary,
+    CipherSuitesLen:16,
+    CipherSuites:CipherSuitesLen/binary,
+    CompressionLen:8,
+    _Compression:CompressionLen/binary,
+    ExtLen:16,
+    Extensions:ExtLen/binary,
     _Rest/binary
 >>) ->
     %% Parse cipher suites
@@ -667,38 +730,44 @@ parse_client_hello(<<
     case parse_extensions(Extensions) of
         {ok, ExtMap} ->
             %% Extract key_share
-            KeyShare = case maps:find(?EXT_KEY_SHARE, ExtMap) of
-                {ok, KsData} -> parse_client_key_shares(KsData);
-                error -> undefined
-            end,
+            KeyShare =
+                case maps:find(?EXT_KEY_SHARE, ExtMap) of
+                    {ok, KsData} -> parse_client_key_shares(KsData);
+                    error -> undefined
+                end,
 
             %% Extract SNI
-            ServerName = case maps:find(?EXT_SERVER_NAME, ExtMap) of
-                {ok, SniData} -> parse_server_name_ext(SniData);
-                error -> undefined
-            end,
+            ServerName =
+                case maps:find(?EXT_SERVER_NAME, ExtMap) of
+                    {ok, SniData} -> parse_server_name_ext(SniData);
+                    error -> undefined
+                end,
 
             %% Extract ALPN
-            ALPNProtocols = case maps:find(?EXT_ALPN, ExtMap) of
-                {ok, AlpnData} -> parse_alpn_ext(AlpnData);
-                error -> []
-            end,
+            ALPNProtocols =
+                case maps:find(?EXT_ALPN, ExtMap) of
+                    {ok, AlpnData} -> parse_alpn_ext(AlpnData);
+                    error -> []
+                end,
 
             %% Extract QUIC transport parameters
-            TransportParams = case maps:find(?EXT_QUIC_TRANSPORT_PARAMS, ExtMap) of
-                {ok, TpData} ->
-                    case decode_transport_params(TpData) of
-                        {ok, TP} -> TP;
-                        {error, _} -> #{}
-                    end;
-                error -> #{}
-            end,
+            TransportParams =
+                case maps:find(?EXT_QUIC_TRANSPORT_PARAMS, ExtMap) of
+                    {ok, TpData} ->
+                        case decode_transport_params(TpData) of
+                            {ok, TP} -> TP;
+                            {error, _} -> #{}
+                        end;
+                    error ->
+                        #{}
+                end,
 
             %% Extract pre_shared_key extension (for resumption)
-            PSK = case maps:find(?EXT_PRE_SHARED_KEY, ExtMap) of
-                {ok, PskData} -> parse_pre_shared_key_ext(PskData);
-                error -> undefined
-            end,
+            PSK =
+                case maps:find(?EXT_PRE_SHARED_KEY, ExtMap) of
+                    {ok, PskData} -> parse_pre_shared_key_ext(PskData);
+                    error -> undefined
+                end,
 
             %% Extract early_data extension (client wants to send 0-RTT)
             EarlyData = maps:is_key(?EXT_EARLY_DATA, ExtMap),
@@ -740,10 +809,11 @@ build_server_hello(Opts) ->
     CipherSuite = maps:get(cipher_suite, Opts, ?TLS_AES_128_GCM_SHA256),
 
     %% Generate ECDHE key pair if not provided
-    {PubKey, PrivKey} = case maps:find(key_pair, Opts) of
-        {ok, {Pub, Priv}} -> {Pub, Priv};
-        error -> crypto:generate_key(ecdh, x25519)
-    end,
+    {PubKey, PrivKey} =
+        case maps:find(key_pair, Opts) of
+            {ok, {Pub, Priv}} -> {Pub, Priv};
+            error -> crypto:generate_key(ecdh, x25519)
+        end,
 
     %% Build extensions
     Extensions = build_server_hello_extensions(PubKey, Opts),
@@ -751,12 +821,16 @@ build_server_hello(Opts) ->
 
     %% Build ServerHello
     ServerHello = <<
-        ?TLS_VERSION_1_2:16,  % Legacy version (TLS 1.2)
+        % Legacy version (TLS 1.2)
+        ?TLS_VERSION_1_2:16,
         Random:32/binary,
-        SessionIdLen:8, SessionId/binary,
+        SessionIdLen:8,
+        SessionId/binary,
         CipherSuite:16,
-        0:8,  % Legacy compression method (null)
-        ExtLen:16, Extensions/binary
+        % Legacy compression method (null)
+        0:8,
+        ExtLen:16,
+        Extensions/binary
     >>,
 
     %% Wrap with handshake header
@@ -832,7 +906,8 @@ parse_server_name_ext(_) ->
     undefined.
 
 parse_server_name_list(<<0:8, NameLen:16, Name:NameLen/binary, _/binary>>) ->
-    Name;  % Type 0 = hostname
+    % Type 0 = hostname
+    Name;
 parse_server_name_list(_) ->
     undefined.
 
@@ -851,8 +926,10 @@ parse_alpn_list(_) ->
 %% Parse pre_shared_key extension from ClientHello
 %% RFC 8446 Section 4.2.11
 %% Returns: #{identities => [{Ticket, ObfuscatedAge}], binders => [Binder]}
-parse_pre_shared_key_ext(<<IdentitiesLen:16, IdentitiesData:IdentitiesLen/binary,
-                          BindersLen:16, BindersData:BindersLen/binary>>) ->
+parse_pre_shared_key_ext(
+    <<IdentitiesLen:16, IdentitiesData:IdentitiesLen/binary, BindersLen:16,
+        BindersData:BindersLen/binary>>
+) ->
     Identities = parse_psk_identities(IdentitiesData),
     Binders = parse_psk_binders(BindersData),
     #{identities => Identities, binders => Binders};
@@ -861,8 +938,9 @@ parse_pre_shared_key_ext(_) ->
 
 parse_psk_identities(<<>>) ->
     [];
-parse_psk_identities(<<IdentityLen:16, Identity:IdentityLen/binary,
-                       ObfuscatedAge:32, Rest/binary>>) ->
+parse_psk_identities(
+    <<IdentityLen:16, Identity:IdentityLen/binary, ObfuscatedAge:32, Rest/binary>>
+) ->
     [{Identity, ObfuscatedAge} | parse_psk_identities(Rest)];
 parse_psk_identities(_) ->
     [].
@@ -879,38 +957,43 @@ build_server_hello_extensions(PubKey, _Opts) ->
     SupportedVersions = encode_extension(?EXT_SUPPORTED_VERSIONS, <<?TLS_VERSION_1_3:16>>),
 
     %% Key share extension
-    KeyShare = encode_extension(?EXT_KEY_SHARE,
-        <<?GROUP_X25519:16, 32:16, PubKey:32/binary>>),
+    KeyShare = encode_extension(
+        ?EXT_KEY_SHARE,
+        <<?GROUP_X25519:16, 32:16, PubKey:32/binary>>
+    ),
 
     <<SupportedVersions/binary, KeyShare/binary>>.
 
 build_encrypted_extensions_list(Opts) ->
     %% ALPN extension (if ALPN was negotiated)
-    ALPNExt = case maps:find(alpn, Opts) of
-        {ok, ALPN} when is_binary(ALPN), byte_size(ALPN) > 0 ->
-            ALPNLen = byte_size(ALPN),
-            encode_extension(?EXT_ALPN, <<(ALPNLen + 1):16, ALPNLen:8, ALPN/binary>>);
-        _ ->
-            <<>>
-    end,
+    ALPNExt =
+        case maps:find(alpn, Opts) of
+            {ok, ALPN} when is_binary(ALPN), byte_size(ALPN) > 0 ->
+                ALPNLen = byte_size(ALPN),
+                encode_extension(?EXT_ALPN, <<(ALPNLen + 1):16, ALPNLen:8, ALPN/binary>>);
+            _ ->
+                <<>>
+        end,
 
     %% QUIC transport parameters
-    TPExt = case maps:find(transport_params, Opts) of
-        {ok, TP} when map_size(TP) > 0 ->
-            TPData = encode_transport_params(TP),
-            encode_extension(?EXT_QUIC_TRANSPORT_PARAMS, TPData);
-        _ ->
-            <<>>
-    end,
+    TPExt =
+        case maps:find(transport_params, Opts) of
+            {ok, TP} when map_size(TP) > 0 ->
+                TPData = encode_transport_params(TP),
+                encode_extension(?EXT_QUIC_TRANSPORT_PARAMS, TPData);
+            _ ->
+                <<>>
+        end,
 
     %% Early data indication (RFC 8446 Section 4.2.10)
     %% When server accepts early data, include empty early_data extension
-    EarlyDataExt = case maps:get(early_data, Opts, false) of
-        true ->
-            encode_extension(?EXT_EARLY_DATA, <<>>);
-        false ->
-            <<>>
-    end,
+    EarlyDataExt =
+        case maps:get(early_data, Opts, false) of
+            true ->
+                encode_extension(?EXT_EARLY_DATA, <<>>);
+            false ->
+                <<>>
+        end,
 
     <<ALPNExt/binary, TPExt/binary, EarlyDataExt/binary>>.
 
@@ -936,10 +1019,12 @@ get_signature_params(_) ->
     {rsa, sha256, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]}.
 
 %% Convert private key to format expected by crypto:sign
-convert_private_key(ecdsa, {'ECPrivateKey', _, PrivKeyBin, {namedCurve, {1,2,840,10045,3,1,7}}, _, _}) ->
+convert_private_key(
+    ecdsa, {'ECPrivateKey', _, PrivKeyBin, {namedCurve, {1, 2, 840, 10045, 3, 1, 7}}, _, _}
+) ->
     %% secp256r1 / P-256
     [PrivKeyBin, secp256r1];
-convert_private_key(ecdsa, {'ECPrivateKey', _, PrivKeyBin, {namedCurve, {1,3,132,0,34}}, _, _}) ->
+convert_private_key(ecdsa, {'ECPrivateKey', _, PrivKeyBin, {namedCurve, {1, 3, 132, 0, 34}}, _, _}) ->
     %% secp384r1 / P-384
     [PrivKeyBin, secp384r1];
 convert_private_key(ecdsa, {'ECPrivateKey', _, PrivKeyBin, _, _, _}) ->

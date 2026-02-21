@@ -17,7 +17,8 @@
 generate_test_cert() ->
     %% For tests, use dummy data - real certs would be loaded from files
     Cert = <<"test_certificate_data">>,
-    PrivKey = crypto:strong_rand_bytes(32),  % Simplified for tests
+    % Simplified for tests
+    PrivKey = crypto:strong_rand_bytes(32),
     {Cert, PrivKey}.
 
 %%====================================================================
@@ -214,14 +215,22 @@ cleanup_connection_removes_entries_test() ->
     Conns = ets:new(test_conns, [set, public]),
 
     %% Create fake connection PIDs
-    Pid1 = spawn(fun() -> receive stop -> ok end end),
-    Pid2 = spawn(fun() -> receive stop -> ok end end),
+    Pid1 = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    Pid2 = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
 
     %% Insert CID entries for both connections (mimics create_connection)
-    CID1a = <<1,2,3,4,5,6,7,8>>,
-    CID1b = <<10,20,30,40,50,60,70,80>>,
-    CID2a = <<11,12,13,14,15,16,17,18>>,
-    CID2b = <<21,22,23,24,25,26,27,28>>,
+    CID1a = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    CID1b = <<10, 20, 30, 40, 50, 60, 70, 80>>,
+    CID2a = <<11, 12, 13, 14, 15, 16, 17, 18>>,
+    CID2b = <<21, 22, 23, 24, 25, 26, 27, 28>>,
 
     ets:insert(Conns, {CID1a, Pid1}),
     ets:insert(Conns, {CID1b, Pid1}),
@@ -252,9 +261,13 @@ cleanup_connection_match_spec_variants_test() ->
     %% Both '_' and '$1' work as wildcards in ETS match specs
     Conns = ets:new(test_conns, [set, public]),
 
-    Pid = spawn(fun() -> receive stop -> ok end end),
-    CID1 = <<1,2,3,4,5,6,7,8>>,
-    CID2 = <<9,10,11,12,13,14,15,16>>,
+    Pid = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    CID1 = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    CID2 = <<9, 10, 11, 12, 13, 14, 15, 16>>,
 
     %% Test with '_' wildcard
     ets:insert(Conns, {CID1, Pid}),

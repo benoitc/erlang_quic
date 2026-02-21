@@ -327,24 +327,36 @@ transfer_multiplexing(_Config) ->
 
     %% Test multiple streams with different IDs
     Streams = [
-        {0, <<"Stream 0 data">>},   % Client bidi
-        {4, <<"Stream 4 data">>},   % Client bidi
-        {2, <<"Stream 2 data">>},   % Client uni
-        {6, <<"Stream 6 data">>}    % Client uni
+        % Client bidi
+        {0, <<"Stream 0 data">>},
+        % Client bidi
+        {4, <<"Stream 4 data">>},
+        % Client uni
+        {2, <<"Stream 2 data">>},
+        % Client uni
+        {6, <<"Stream 6 data">>}
     ],
 
-    lists:foreach(fun({StreamId, Data}) ->
-        Frame = {stream, StreamId, 0, Data, true},
-        Encoded = quic_frame:encode(Frame),
-        {Decoded, <<>>} = quic_frame:decode(Encoded),
-        ?assertMatch({stream, StreamId, 0, Data, true}, Decoded)
-    end, Streams),
+    lists:foreach(
+        fun({StreamId, Data}) ->
+            Frame = {stream, StreamId, 0, Data, true},
+            Encoded = quic_frame:encode(Frame),
+            {Decoded, <<>>} = quic_frame:decode(Encoded),
+            ?assertMatch({stream, StreamId, 0, Data, true}, Decoded)
+        end,
+        Streams
+    ),
 
     %% Verify stream ID types
-    ?assertEqual(0, 0 rem 4),   % Client bidi
-    ?assertEqual(0, 4 rem 4),   % Client bidi
-    ?assertEqual(2, 2 rem 4),   % Client uni
-    ?assertEqual(2, 6 rem 4),   % Client uni
+
+    % Client bidi
+    ?assertEqual(0, 0 rem 4),
+    % Client bidi
+    ?assertEqual(0, 4 rem 4),
+    % Client uni
+    ?assertEqual(2, 2 rem 4),
+    % Client uni
+    ?assertEqual(2, 6 rem 4),
 
     {comment, "Stream multiplexing works correctly"}.
 
@@ -382,8 +394,13 @@ retry_packet_format(_Config) ->
     %% Build retry payload (token + integrity tag)
     Payload = <<RetryToken/binary, IntegrityTag/binary>>,
 
-    Encoded = quic_packet:encode_long(retry, ?QUIC_VERSION_1, DCID, SCID,
-                                       #{payload => Payload}),
+    Encoded = quic_packet:encode_long(
+        retry,
+        ?QUIC_VERSION_1,
+        DCID,
+        SCID,
+        #{payload => Payload}
+    ),
 
     %% Verify header structure
     <<FirstByte, Version:32, _/binary>> = Encoded,
@@ -409,12 +426,18 @@ retry_integrity_tag(_Config) ->
 
     %% The integrity tag is computed over the pseudo-packet
     %% For this test, we verify the function exists and handles input
-    PseudoPacket = <<(byte_size(OriginalDCID)), OriginalDCID/binary,
-                     16#FF,  % Retry packet first byte
-                     ?QUIC_VERSION_1:32,
-                     (byte_size(DCID)), DCID/binary,
-                     (byte_size(SCID)), SCID/binary,
-                     RetryToken/binary>>,
+    PseudoPacket = <<
+        (byte_size(OriginalDCID)),
+        OriginalDCID/binary,
+        % Retry packet first byte
+        16#FF,
+        ?QUIC_VERSION_1:32,
+        (byte_size(DCID)),
+        DCID/binary,
+        (byte_size(SCID)),
+        SCID/binary,
+        RetryToken/binary
+    >>,
 
     %% Compute tag (RFC 9001 uses AES-128-GCM with fixed key/nonce)
     Tag = quic_crypto:compute_retry_integrity_tag(OriginalDCID, PseudoPacket, ?QUIC_VERSION_1),
@@ -507,7 +530,7 @@ resumption_ticket_parsing(_Config) ->
     %% Build a NewSessionTicket message
     Lifetime = 86400,
     AgeAdd = 16#12345678,
-    Nonce = <<1,2,3,4,5,6,7,8>>,
+    Nonce = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     Ticket = <<"this_is_the_ticket_value">>,
     MaxEarlyData = 16384,
 
@@ -518,8 +541,9 @@ resumption_ticket_parsing(_Config) ->
     EarlyDataExt = <<16#00, 16#2a, 4:16, MaxEarlyData:32>>,
     ExtLen = byte_size(EarlyDataExt),
 
-    Message = <<Lifetime:32, AgeAdd:32, NonceLen, Nonce/binary,
-                TicketLen:16, Ticket/binary, ExtLen:16, EarlyDataExt/binary>>,
+    Message =
+        <<Lifetime:32, AgeAdd:32, NonceLen, Nonce/binary, TicketLen:16, Ticket/binary, ExtLen:16,
+            EarlyDataExt/binary>>,
 
     %% Parse
     {ok, Parsed} = quic_ticket:parse_new_session_ticket(Message),
@@ -711,17 +735,19 @@ versionnegotiation_packet_format(_Config) ->
     FirstByte = 16#80 bor (rand:uniform(16#3F)),
 
     %% Build supported versions list
-    VersionsData = << <<V:32>> || V <- SupportedVersions >>,
+    VersionsData = <<<<V:32>> || V <- SupportedVersions>>,
 
-    Packet = <<FirstByte, 0:32,  % Version = 0
-               (byte_size(DCID)), DCID/binary,
-               (byte_size(SCID)), SCID/binary,
-               VersionsData/binary>>,
+    % Version = 0
+    Packet =
+        <<FirstByte, 0:32, (byte_size(DCID)), DCID/binary, (byte_size(SCID)), SCID/binary,
+            VersionsData/binary>>,
 
     %% Verify format
     <<FB, Ver:32, DCIDLen, _/binary>> = Packet,
-    ?assertEqual(1, (FB bsr 7) band 1),  % Form bit set
-    ?assertEqual(0, Ver),  % Version = 0 indicates VN
+    % Form bit set
+    ?assertEqual(1, (FB bsr 7) band 1),
+    % Version = 0 indicates VN
+    ?assertEqual(0, Ver),
     ?assertEqual(8, DCIDLen),
 
     {comment, "Version Negotiation packet format correct"}.
@@ -735,8 +761,13 @@ versionnegotiation_response(_Config) ->
     SCID = crypto:strong_rand_bytes(8),
     UnknownVersion = 16#FFFFFFFF,
 
-    Packet = quic_packet:encode_long(initial, UnknownVersion, DCID, SCID,
-                                     #{token => <<>>, payload => <<"test">>, pn => 0}),
+    Packet = quic_packet:encode_long(
+        initial,
+        UnknownVersion,
+        DCID,
+        SCID,
+        #{token => <<>>, payload => <<"test">>, pn => 0}
+    ),
 
     %% Verify the packet has the unknown version
     <<_FirstByte, Version:32, _/binary>> = Packet,
@@ -832,13 +863,14 @@ network_handshake(Config) ->
 
     case quic:connect(Host, Port, Opts, self()) of
         {ok, ConnRef} ->
-            Result = receive
-                {quic, ConnRef, {connected, Info}} ->
-                    ct:pal("Handshake completed: ~p", [Info]),
-                    {ok, Info}
-            after ?HANDSHAKE_TIMEOUT ->
-                {error, timeout}
-            end,
+            Result =
+                receive
+                    {quic, ConnRef, {connected, Info}} ->
+                        ct:pal("Handshake completed: ~p", [Info]),
+                        {ok, Info}
+                after ?HANDSHAKE_TIMEOUT ->
+                    {error, timeout}
+                end,
             quic:close(ConnRef, normal),
             case Result of
                 {ok, _} -> {comment, "Network handshake successful"};
@@ -859,12 +891,13 @@ network_retry(Config) ->
 
     case quic:connect(Host, Port, Opts, self()) of
         {ok, ConnRef} ->
-            Result = receive
-                {quic, ConnRef, {connected, _Info}} ->
-                    ok
-            after ?HANDSHAKE_TIMEOUT ->
-                timeout
-            end,
+            Result =
+                receive
+                    {quic, ConnRef, {connected, _Info}} ->
+                        ok
+                after ?HANDSHAKE_TIMEOUT ->
+                    timeout
+                end,
             quic:close(ConnRef, normal),
             case Result of
                 ok -> {comment, "Connection established (may have used retry)"};
@@ -890,12 +923,13 @@ network_transfer(Config) ->
                         {ok, StreamId} ->
                             TestData = <<"QUIC Interop Test Data">>,
                             ok = quic:send_data(ConnRef, StreamId, TestData, true),
-                            Result = receive
-                                {quic, ConnRef, {stream_data, StreamId, Data, _}} ->
-                                    {ok, Data}
-                            after ?TRANSFER_TIMEOUT ->
-                                timeout
-                            end,
+                            Result =
+                                receive
+                                    {quic, ConnRef, {stream_data, StreamId, Data, _}} ->
+                                        {ok, Data}
+                                after ?TRANSFER_TIMEOUT ->
+                                    timeout
+                                end,
                             quic:close(ConnRef, normal),
                             case Result of
                                 {ok, RecvData} ->
@@ -963,14 +997,16 @@ network_keyupdate(Config) ->
 check_server_reachable(Host, Port) ->
     case gen_udp:open(0, [binary]) of
         {ok, Socket} ->
-            HostAddr = case inet:parse_address(Host) of
-                {ok, Addr} -> Addr;
-                _ ->
-                    case inet:getaddr(Host, inet) of
-                        {ok, Addr} -> Addr;
-                        _ -> {127, 0, 0, 1}
-                    end
-            end,
+            HostAddr =
+                case inet:parse_address(Host) of
+                    {ok, Addr} ->
+                        Addr;
+                    _ ->
+                        case inet:getaddr(Host, inet) of
+                            {ok, Addr} -> Addr;
+                            _ -> {127, 0, 0, 1}
+                        end
+                end,
             Result = gen_udp:send(Socket, HostAddr, Port, <<0:32>>),
             gen_udp:close(Socket),
             Result =:= ok;

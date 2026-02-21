@@ -115,7 +115,9 @@ download_file(TestCase, Url, DownloadsDir) ->
             %% Connect
             case quic:connect(Host, Port, Opts, self()) of
                 {ok, ConnRef} ->
-                    Result = wait_for_connection_and_download(ConnRef, Path, DownloadsDir, TestCase),
+                    Result = wait_for_connection_and_download(
+                        ConnRef, Path, DownloadsDir, TestCase
+                    ),
                     quic:close(ConnRef, normal),
                     Result;
                 {error, Reason} ->
@@ -146,7 +148,8 @@ build_opts("v2") ->
     #{
         verify => false,
         alpn => [<<"hq-interop">>, <<"h3">>],
-        version => 16#6b3343cf  % QUIC v2
+        % QUIC v2
+        version => 16#6b3343cf
     };
 build_opts(_) ->
     %% Default options
@@ -183,15 +186,12 @@ wait_for_connection_and_download(ConnRef, Path, DownloadsDir, TestCase) ->
                     io:format("Failed to open stream: ~p~n", [StreamErr]),
                     error
             end;
-
         {quic, ConnRef, {closed, Reason}} ->
             io:format("Connection closed: ~p~n", [Reason]),
             error;
-
         {quic, ConnRef, {transport_error, Code, Msg}} ->
             io:format("Transport error: ~p ~p~n", [Code, Msg]),
             error
-
     after 30000 ->
         io:format("Connection timeout~n"),
         error
@@ -231,24 +231,23 @@ receive_stream_data_streaming(ConnRef, StreamId, FileHandle, BytesWritten, Timeo
                         true ->
                             {ok, NewBytesWritten};
                         false ->
-                            receive_stream_data_streaming(ConnRef, StreamId, FileHandle, NewBytesWritten, Timeout)
+                            receive_stream_data_streaming(
+                                ConnRef, StreamId, FileHandle, NewBytesWritten, Timeout
+                            )
                     end;
                 {error, WriteErr} ->
                     io:format("Write error: ~p~n", [WriteErr]),
                     error
             end;
-
         {quic, ConnRef, {stream_reset, StreamId, _Code}} ->
             io:format("Stream reset~n"),
             error;
-
         {quic, ConnRef, {closed, _Reason}} ->
             %% Connection closed, return what we have
             case BytesWritten of
                 0 -> error;
                 _ -> {ok, BytesWritten}
             end
-
     after Timeout ->
         io:format("Stream timeout~n"),
         case BytesWritten of
@@ -378,17 +377,14 @@ download_and_wait_for_ticket(ConnRef, StreamId, Path, DownloadsDir, Ticket) ->
                 false ->
                     download_and_wait_for_ticket(ConnRef, StreamId, Path, DownloadsDir, Ticket)
             end;
-
         {quic, ConnRef, {session_ticket, NewTicket}} ->
             io:format("Phase 1: Received session ticket~n"),
             download_and_wait_for_ticket(ConnRef, StreamId, Path, DownloadsDir, NewTicket);
-
         {quic, ConnRef, {closed, _Reason}} ->
             case Ticket of
                 undefined -> error;
                 _ -> {ok, Ticket}
             end
-
     after 60000 ->
         io:format("Phase 1: Stream/ticket timeout~n"),
         case Ticket of
@@ -477,7 +473,9 @@ run_zerortt_test(RequestsStr, DownloadsDir) ->
                             case resumption_phase1(Host, Port, Path, DownloadsDir) of
                                 {ok, Ticket} ->
                                     save_ticket(Ticket),
-                                    case zerortt_with_ticket(Host, Port, Path, DownloadsDir, Ticket) of
+                                    case
+                                        zerortt_with_ticket(Host, Port, Path, DownloadsDir, Ticket)
+                                    of
                                         ok ->
                                             io:format("0-RTT test successful~n"),
                                             halt(?EXIT_SUCCESS);
@@ -560,15 +558,16 @@ wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir) ->
 
 wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir, Connected, Retried, Acc) ->
     %% Use shorter timeout after handshake to detect rejected 0-RTT
-    Timeout = case Connected andalso Acc =:= <<>> andalso not Retried of
-        true -> 2000;  % Short wait for 0-RTT response after handshake
-        false -> 60000
-    end,
+    Timeout =
+        case Connected andalso Acc =:= <<>> andalso not Retried of
+            % Short wait for 0-RTT response after handshake
+            true -> 2000;
+            false -> 60000
+        end,
     receive
         {quic, ConnRef, {connected, _Info}} ->
             io:format("0-RTT: Handshake completed~n"),
             wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir, true, Retried, Acc);
-
         {quic, ConnRef, {stream_data, StreamId, Data, Fin}} ->
             NewAcc = <<Acc/binary, Data/binary>>,
             case Fin of
@@ -579,25 +578,25 @@ wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir, Connected, Retr
                     io:format("0-RTT: Downloaded ~s (~p bytes)~n", [FilePath, byte_size(NewAcc)]),
                     ok;
                 false ->
-                    wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir, Connected, Retried, NewAcc)
+                    wait_for_zerortt_response(
+                        ConnRef, StreamId, Path, DownloadsDir, Connected, Retried, NewAcc
+                    )
             end;
-
         {quic, ConnRef, {early_data_rejected, _}} ->
             io:format("0-RTT: Early data rejected, resending as 1-RTT~n"),
             %% Resend request on new stream
             resend_request_1rtt(ConnRef, Path, DownloadsDir);
-
         {quic, ConnRef, {closed, Reason}} ->
             io:format("0-RTT: Connection closed: ~p~n", [Reason]),
             case Acc of
-                <<>> -> error;
+                <<>> ->
+                    error;
                 _ ->
                     Filename = filename:basename(Path),
                     FilePath = filename:join(DownloadsDir, Filename),
                     file:write_file(FilePath, Acc),
                     ok
             end
-
     after Timeout ->
         case Connected andalso Acc =:= <<>> andalso not Retried of
             true ->
@@ -632,7 +631,9 @@ wait_for_1rtt_response(ConnRef, StreamId, Path, DownloadsDir, Acc) ->
                     Filename = filename:basename(Path),
                     FilePath = filename:join(DownloadsDir, Filename),
                     file:write_file(FilePath, NewAcc),
-                    io:format("0-RTT: Downloaded via 1-RTT ~s (~p bytes)~n", [FilePath, byte_size(NewAcc)]),
+                    io:format("0-RTT: Downloaded via 1-RTT ~s (~p bytes)~n", [
+                        FilePath, byte_size(NewAcc)
+                    ]),
                     ok;
                 false ->
                     wait_for_1rtt_response(ConnRef, StreamId, Path, DownloadsDir, NewAcc)
@@ -718,50 +719,52 @@ receive_with_migration(ConnRef, StreamId, Path, DownloadsDir, Migrated, Acc) ->
             NewAcc = <<Acc/binary, Data/binary>>,
 
             %% Trigger migration after receiving some data (but before FIN)
-            Migrated1 = case Migrated orelse Fin of
-                true ->
-                    Migrated;
-                false when byte_size(NewAcc) > 0 ->
-                    io:format("Migration test: Triggering path migration~n"),
-                    %% The migrate call initiates path validation
-                    case quic:migrate(ConnRef) of
-                        ok ->
-                            io:format("Migration test: Migration initiated~n"),
-                            true;
-                        {error, MigErr} ->
-                            io:format("Migration test: Migration failed: ~p~n", [MigErr]),
-                            true  % Continue anyway
-                    end;
-                false ->
-                    false
-            end,
+            Migrated1 =
+                case Migrated orelse Fin of
+                    true ->
+                        Migrated;
+                    false when byte_size(NewAcc) > 0 ->
+                        io:format("Migration test: Triggering path migration~n"),
+                        %% The migrate call initiates path validation
+                        case quic:migrate(ConnRef) of
+                            ok ->
+                                io:format("Migration test: Migration initiated~n"),
+                                true;
+                            {error, MigErr} ->
+                                io:format("Migration test: Migration failed: ~p~n", [MigErr]),
+                                % Continue anyway
+                                true
+                        end;
+                    false ->
+                        false
+                end,
 
             case Fin of
                 true ->
                     Filename = filename:basename(Path),
                     FilePath = filename:join(DownloadsDir, Filename),
                     file:write_file(FilePath, NewAcc),
-                    io:format("Migration test: Downloaded ~s (~p bytes)~n", [FilePath, byte_size(NewAcc)]),
+                    io:format("Migration test: Downloaded ~s (~p bytes)~n", [
+                        FilePath, byte_size(NewAcc)
+                    ]),
                     ok;
                 false ->
                     receive_with_migration(ConnRef, StreamId, Path, DownloadsDir, Migrated1, NewAcc)
             end;
-
         {quic, ConnRef, {path_validated, _PathInfo}} ->
             io:format("Migration test: New path validated~n"),
             receive_with_migration(ConnRef, StreamId, Path, DownloadsDir, Migrated, Acc);
-
         {quic, ConnRef, {closed, Reason}} ->
             io:format("Migration test: Connection closed: ~p~n", [Reason]),
             case Acc of
-                <<>> -> error;
+                <<>> ->
+                    error;
                 _ ->
                     Filename = filename:basename(Path),
                     FilePath = filename:join(DownloadsDir, Filename),
                     file:write_file(FilePath, Acc),
                     ok
             end
-
     after 60000 ->
         io:format("Migration test: Timeout~n"),
         error

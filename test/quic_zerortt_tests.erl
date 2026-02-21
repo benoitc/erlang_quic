@@ -46,14 +46,16 @@ early_traffic_secret_test() ->
 
     %% Derive client early traffic secret
     EarlyTrafficSecret = quic_crypto:derive_client_early_traffic_secret(
-        Cipher, EarlySecret, ClientHelloHash),
+        Cipher, EarlySecret, ClientHelloHash
+    ),
 
     %% Should be 32 bytes for SHA-256
     ?assertEqual(32, byte_size(EarlyTrafficSecret)),
 
     %% Should be deterministic
     EarlyTrafficSecret2 = quic_crypto:derive_client_early_traffic_secret(
-        Cipher, EarlySecret, ClientHelloHash),
+        Cipher, EarlySecret, ClientHelloHash
+    ),
     ?assertEqual(EarlyTrafficSecret, EarlyTrafficSecret2).
 
 %% Test 0-RTT packet type encoding
@@ -74,7 +76,8 @@ early_data_keys_test() ->
 
     %% Derive client early traffic secret
     EarlyTrafficSecret = quic_crypto:derive_client_early_traffic_secret(
-        Cipher, EarlySecret, ClientHelloHash),
+        Cipher, EarlySecret, ClientHelloHash
+    ),
 
     %% Derive traffic keys from early traffic secret
     %% Returns {Key, IV, HP} tuple
@@ -96,7 +99,8 @@ early_data_encryption_test() ->
     %% Derive keys
     EarlySecret = quic_crypto:derive_early_secret(Cipher, PSK),
     EarlyTrafficSecret = quic_crypto:derive_client_early_traffic_secret(
-        Cipher, EarlySecret, ClientHelloHash),
+        Cipher, EarlySecret, ClientHelloHash
+    ),
     {Key, BaseIV, _HP} = quic_keys:derive_keys(EarlyTrafficSecret, Cipher),
 
     %% Encrypt some data
@@ -111,7 +115,8 @@ early_data_encryption_test() ->
 
     %% Encrypt
     {Ciphertext, Tag} = crypto:crypto_one_time_aead(
-        aes_128_gcm, Key, Nonce, Plaintext, AAD, 16, true),
+        aes_128_gcm, Key, Nonce, Plaintext, AAD, 16, true
+    ),
 
     ?assert(is_binary(Ciphertext)),
     ?assertEqual(byte_size(Plaintext), byte_size(Ciphertext)),
@@ -119,7 +124,8 @@ early_data_encryption_test() ->
 
     %% Decrypt should give back original
     Decrypted = crypto:crypto_one_time_aead(
-        aes_128_gcm, Key, Nonce, Ciphertext, AAD, Tag, false),
+        aes_128_gcm, Key, Nonce, Ciphertext, AAD, Tag, false
+    ),
     ?assertEqual(Plaintext, Decrypted).
 
 %%====================================================================
@@ -136,7 +142,8 @@ server_early_keys_from_psk_test() ->
     %% Server derives the same early keys as client
     EarlySecret = quic_crypto:derive_early_secret(Cipher, PSK),
     EarlyTrafficSecret = quic_crypto:derive_client_early_traffic_secret(
-        Cipher, EarlySecret, ClientHelloHash),
+        Cipher, EarlySecret, ClientHelloHash
+    ),
     {Key, IV, _HP} = quic_keys:derive_keys(EarlyTrafficSecret, Cipher),
 
     %% Verify keys match expected format
@@ -147,7 +154,9 @@ server_early_keys_from_psk_test() ->
 early_data_indication_test() ->
     %% When server accepts early data, it includes early_data extension (type 42)
     %% in EncryptedExtensions with empty data
-    EarlyDataExt = <<?EXT_EARLY_DATA:16, 0:16>>,  % Type 42, length 0
+
+    % Type 42, length 0
+    EarlyDataExt = <<?EXT_EARLY_DATA:16, 0:16>>,
 
     ?assertEqual(4, byte_size(EarlyDataExt)),
     <<?EXT_EARLY_DATA:16, 0:16>> = EarlyDataExt.
@@ -176,7 +185,8 @@ early_exporter_master_secret_test() ->
 
     EarlySecret = quic_crypto:derive_early_secret(Cipher, PSK),
     EarlyExpMasterSecret = quic_crypto:derive_early_exporter_master_secret(
-        EarlySecret, ClientHelloHash),
+        EarlySecret, ClientHelloHash
+    ),
 
     ?assertEqual(32, byte_size(EarlyExpMasterSecret)).
 
@@ -204,7 +214,8 @@ client_early_secret_cipher_aware_test() ->
     ClientHelloHash = crypto:strong_rand_bytes(48),
 
     ClientEarlySecret = quic_crypto:derive_client_early_traffic_secret(
-        aes_256_gcm, EarlySecret, ClientHelloHash),
+        aes_256_gcm, EarlySecret, ClientHelloHash
+    ),
     ?assertEqual(48, byte_size(ClientEarlySecret)).
 
 %% Test 0-RTT packet encrypt/decrypt roundtrip
@@ -215,16 +226,19 @@ zero_rtt_packet_encrypt_decrypt_test() ->
     ClientHelloHash = crypto:hash(sha256, <<"ClientHello">>),
 
     ClientEarlySecret = quic_crypto:derive_client_early_traffic_secret(
-        EarlySecret, ClientHelloHash),
+        EarlySecret, ClientHelloHash
+    ),
     {Key, IV, _HP} = quic_keys:derive_keys(ClientEarlySecret, aes_128_gcm),
 
     %% Encrypt some data
     PN = 0,
     Plaintext = <<"Hello, 0-RTT world!">>,
-    AAD = <<>>,  % Simplified for test
+    % Simplified for test
+    AAD = <<>>,
 
     Ciphertext = quic_aead:encrypt(Key, IV, PN, AAD, Plaintext),
-    ?assert(byte_size(Ciphertext) > byte_size(Plaintext)),  % Has tag
+    % Has tag
+    ?assert(byte_size(Ciphertext) > byte_size(Plaintext)),
 
     %% Decrypt
     {ok, Decrypted} = quic_aead:decrypt(Key, IV, PN, AAD, Ciphertext),
@@ -237,7 +251,8 @@ zero_rtt_multiple_packets_test() ->
     ClientHelloHash = crypto:hash(sha256, <<"ClientHello">>),
 
     ClientEarlySecret = quic_crypto:derive_client_early_traffic_secret(
-        EarlySecret, ClientHelloHash),
+        EarlySecret, ClientHelloHash
+    ),
     {Key, IV, _HP} = quic_keys:derive_keys(ClientEarlySecret, aes_128_gcm),
 
     %% Encrypt multiple packets with different PNs
@@ -253,13 +268,17 @@ zero_rtt_multiple_packets_test() ->
             Ciphertext = quic_aead:encrypt(Key, IV, PN, AAD, Plaintext),
             {ok, Decrypted} = quic_aead:decrypt(Key, IV, PN, AAD, Ciphertext),
             {PN, Plaintext, Decrypted}
-        end, Packets),
+        end,
+        Packets
+    ),
 
     %% All decrypted correctly
     lists:foreach(
         fun({_PN, Original, Decrypted}) ->
             ?assertEqual(Original, Decrypted)
-        end, Results).
+        end,
+        Results
+    ).
 
 %%====================================================================
 %% Helper Functions

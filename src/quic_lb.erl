@@ -145,18 +145,28 @@ validate_config(#lb_config{
 }) ->
     Validations = [
         {CR >= 0 andalso CR =< 6, {invalid_config_rotation, CR}},
-        {lists:member(Algorithm, [plaintext, stream_cipher, block_cipher]),
-         {invalid_algorithm, Algorithm}},
+        {
+            lists:member(Algorithm, [plaintext, stream_cipher, block_cipher]),
+            {invalid_algorithm, Algorithm}
+        },
         {is_binary(ServerID), {invalid_server_id, not_binary}},
-        {ServerIDLen >= 1 andalso ServerIDLen =< ?LB_MAX_SERVER_ID_LEN,
-         {invalid_server_id_len, ServerIDLen}},
-        {byte_size(ServerID) =:= ServerIDLen,
-         {server_id_len_mismatch, byte_size(ServerID), ServerIDLen}},
-        {NonceLen >= ?LB_MIN_NONCE_LEN andalso NonceLen =< ?LB_MAX_NONCE_LEN,
-         {invalid_nonce_len, NonceLen}},
-        {Algorithm =:= plaintext orelse
-         (is_binary(Key) andalso byte_size(Key) =:= 16),
-         {missing_or_invalid_key, Algorithm}}
+        {
+            ServerIDLen >= 1 andalso ServerIDLen =< ?LB_MAX_SERVER_ID_LEN,
+            {invalid_server_id_len, ServerIDLen}
+        },
+        {
+            byte_size(ServerID) =:= ServerIDLen,
+            {server_id_len_mismatch, byte_size(ServerID), ServerIDLen}
+        },
+        {
+            NonceLen >= ?LB_MIN_NONCE_LEN andalso NonceLen =< ?LB_MAX_NONCE_LEN,
+            {invalid_nonce_len, NonceLen}
+        },
+        {
+            Algorithm =:= plaintext orelse
+                (is_binary(Key) andalso byte_size(Key) =:= 16),
+            {missing_or_invalid_key, Algorithm}
+        }
     ],
     validate_list(Validations).
 
@@ -184,13 +194,15 @@ generate_cid(#cid_config{lb_config = LBConfig}, Nonce) ->
     } = LBConfig,
 
     %% Ensure nonce is correct length
-    ActualNonce = case byte_size(Nonce) of
-        NonceLen -> Nonce;
-        N when N > NonceLen -> binary:part(Nonce, 0, NonceLen);
-        N when N < NonceLen ->
-            Pad = crypto:strong_rand_bytes(NonceLen - N),
-            <<Nonce/binary, Pad/binary>>
-    end,
+    ActualNonce =
+        case byte_size(Nonce) of
+            NonceLen ->
+                Nonce;
+            N when N > NonceLen -> binary:part(Nonce, 0, NonceLen);
+            N when N < NonceLen ->
+                Pad = crypto:strong_rand_bytes(NonceLen - N),
+                <<Nonce/binary, Pad/binary>>
+        end,
 
     %% Calculate CID length (excluding first byte with CR/Len)
     CIDLen = 1 + ServerIDLen + NonceLen,
@@ -279,8 +291,10 @@ encode_stream_cipher(FirstByte, ServerID, Nonce, Key) ->
     <<FinalFirstByte, EncServerID/binary, Nonce/binary>>.
 
 %% @private Decode stream cipher CID
-decode_stream_cipher(<<FirstByte, Rest/binary>>,
-                     #lb_config{server_id_len = ServerIDLen, nonce_len = NonceLen, key = Key}) ->
+decode_stream_cipher(
+    <<FirstByte, Rest/binary>>,
+    #lb_config{server_id_len = ServerIDLen, nonce_len = NonceLen, key = Key}
+) ->
     EncServerIDLen = ServerIDLen,
     case Rest of
         <<EncServerID:EncServerIDLen/binary, Nonce:NonceLen/binary, _/binary>> ->
@@ -384,8 +398,10 @@ encode_block_cipher_truncated(Data, Key, TotalLen, CR) ->
     <<FinalFirstByte, EncPayloadFirst16/binary, EncPayloadRest/binary>>.
 
 %% @private Decode block cipher CID
-decode_block_cipher(<<FirstByte, Rest/binary>> = CID,
-                    #lb_config{server_id_len = ServerIDLen, nonce_len = NonceLen, key = Key}) ->
+decode_block_cipher(
+    <<FirstByte, Rest/binary>> = CID,
+    #lb_config{server_id_len = ServerIDLen, nonce_len = NonceLen, key = Key}
+) ->
     DataLen = byte_size(CID),
 
     case DataLen of

@@ -33,7 +33,9 @@ rfc5869_test1_expand_test() ->
     PRK = hexstr_to_bin("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"),
     Info = hexstr_to_bin("f0f1f2f3f4f5f6f7f8f9"),
     L = 42,
-    Expected = hexstr_to_bin("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"),
+    Expected = hexstr_to_bin(
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+    ),
     OKM = quic_hkdf:expand(PRK, Info, L),
     ?assertEqual(Expected, OKM).
 
@@ -61,7 +63,9 @@ rfc5869_test2_expand_test() ->
     PRK = hexstr_to_bin("06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244"),
     Info = list_to_binary(lists:seq(16#b0, 16#ff)),
     L = 82,
-    Expected = hexstr_to_bin("b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87"),
+    Expected = hexstr_to_bin(
+        "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87"
+    ),
     OKM = quic_hkdf:expand(PRK, Info, L),
     ?assertEqual(Expected, OKM).
 
@@ -88,7 +92,9 @@ rfc5869_test3_extract_test() ->
 rfc5869_test3_expand_test() ->
     PRK = hexstr_to_bin("19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04"),
     L = 42,
-    Expected = hexstr_to_bin("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"),
+    Expected = hexstr_to_bin(
+        "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"
+    ),
     OKM = quic_hkdf:expand(PRK, <<>>, L),
     ?assertEqual(Expected, OKM).
 

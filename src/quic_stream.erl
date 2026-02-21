@@ -87,14 +87,16 @@
     send_fin = false :: boolean(),
     send_fin_acked = false :: boolean(),
     send_buffer = queue:new() :: queue:queue({non_neg_integer(), binary()}),
-    send_pending = 0 :: non_neg_integer(),  % Bytes waiting to be sent
+    % Bytes waiting to be sent
+    send_pending = 0 :: non_neg_integer(),
 
     %% Receive state
     recv_offset = 0 :: non_neg_integer(),
     recv_max_data :: non_neg_integer(),
     recv_fin = false :: boolean(),
     recv_buffer = gb_trees:empty() :: gb_trees:tree(non_neg_integer(), binary()),
-    recv_contiguous = 0 :: non_neg_integer(),  % Contiguous bytes available
+    % Contiguous bytes available
+    recv_contiguous = 0 :: non_neg_integer(),
 
     %% Final size (set when FIN received or sent)
     final_size :: non_neg_integer() | undefined,
@@ -126,10 +128,13 @@ new(StreamId, Role) ->
 -spec new(non_neg_integer(), client | server, map()) -> stream().
 new(StreamId, Role, Opts) ->
     IsLocal = is_local_stream(StreamId, Role),
-    InitialState = case IsLocal of
-        true -> open;  % We initiated, so it's open
-        false -> idle  % Peer initiated, waiting for first frame
-    end,
+    InitialState =
+        case IsLocal of
+            % We initiated, so it's open
+            true -> open;
+            % Peer initiated, waiting for first frame
+            false -> idle
+        end,
     #stream{
         id = StreamId,
         state = InitialState,
@@ -181,11 +186,18 @@ direction(Stream) ->
 
 %% @doc Queue data for sending on the stream.
 -spec send(stream(), binary()) -> {ok, stream()} | {error, term()}.
-send(#stream{state = State}, _Data)
-  when State =:= half_closed_local; State =:= closed ->
+send(#stream{state = State}, _Data) when
+    State =:= half_closed_local; State =:= closed
+->
     {error, stream_closed};
-send(#stream{send_buffer = Buffer, send_offset = Offset,
-             send_pending = Pending} = Stream, Data) ->
+send(
+    #stream{
+        send_buffer = Buffer,
+        send_offset = Offset,
+        send_pending = Pending
+    } = Stream,
+    Data
+) ->
     DataSize = byte_size(Data),
     NewBuffer = queue:in({Offset + Pending, Data}, Buffer),
     {ok, Stream#stream{
@@ -217,9 +229,16 @@ bytes_to_send(#stream{send_pending = Pending}) -> Pending.
 %% Returns {Data, Offset, Fin, UpdatedStream}
 -spec get_send_data(stream(), non_neg_integer()) ->
     {binary(), non_neg_integer(), boolean(), stream()}.
-get_send_data(#stream{send_buffer = Buffer, send_offset = Offset,
-                      send_max_data = MaxData, send_fin = Fin,
-                      send_pending = Pending} = Stream, MaxBytes) ->
+get_send_data(
+    #stream{
+        send_buffer = Buffer,
+        send_offset = Offset,
+        send_max_data = MaxData,
+        send_fin = Fin,
+        send_pending = Pending
+    } = Stream,
+    MaxBytes
+) ->
     %% Calculate how much we can actually send
     Available = min(Pending, min(MaxBytes, MaxData - Offset)),
     {Data, NewBuffer, Sent} = drain_buffer(Buffer, Available),
@@ -247,14 +266,24 @@ ack_send(Stream, _AckedOffset) ->
 %% @doc Receive data at a specific offset.
 -spec receive_data(stream(), non_neg_integer(), binary(), boolean()) ->
     {ok, stream()} | {error, term()}.
-receive_data(#stream{state = State}, _Offset, _Data, _Fin)
-  when State =:= half_closed_remote; State =:= closed ->
+receive_data(#stream{state = State}, _Offset, _Data, _Fin) when
+    State =:= half_closed_remote; State =:= closed
+->
     {error, stream_closed};
-receive_data(#stream{final_size = FinalSize}, Offset, Data, _Fin)
-  when FinalSize =/= undefined, Offset + byte_size(Data) > FinalSize ->
+receive_data(#stream{final_size = FinalSize}, Offset, Data, _Fin) when
+    FinalSize =/= undefined, Offset + byte_size(Data) > FinalSize
+->
     {error, final_size_error};
-receive_data(#stream{recv_buffer = Buffer, recv_contiguous = Contiguous,
-                     state = State} = Stream, Offset, Data, Fin) ->
+receive_data(
+    #stream{
+        recv_buffer = Buffer,
+        recv_contiguous = Contiguous,
+        state = State
+    } = Stream,
+    Offset,
+    Data,
+    Fin
+) ->
     %% Insert data into buffer
     NewBuffer = gb_trees:enter(Offset, Data, Buffer),
 
@@ -262,19 +291,28 @@ receive_data(#stream{recv_buffer = Buffer, recv_contiguous = Contiguous,
     NewContiguous = calculate_contiguous(NewBuffer, Contiguous),
 
     %% Update state for FIN
-    {NewState, NewFinalSize} = case Fin of
-        true ->
-            FS = Offset + byte_size(Data),
-            NS = case State of
-                idle -> half_closed_remote;  % Received data with FIN before sending
-                open -> half_closed_remote;
-                half_closed_local -> closed;
-                _ -> State
-            end,
-            {NS, FS};
-        false ->
-            {case State of idle -> open; _ -> State end, Stream#stream.final_size}
-    end,
+    {NewState, NewFinalSize} =
+        case Fin of
+            true ->
+                FS = Offset + byte_size(Data),
+                NS =
+                    case State of
+                        % Received data with FIN before sending
+                        idle -> half_closed_remote;
+                        open -> half_closed_remote;
+                        half_closed_local -> closed;
+                        _ -> State
+                    end,
+                {NS, FS};
+            false ->
+                {
+                    case State of
+                        idle -> open;
+                        _ -> State
+                    end,
+                    Stream#stream.final_size
+                }
+        end,
 
     {ok, Stream#stream{
         recv_buffer = NewBuffer,
@@ -296,12 +334,19 @@ read(Stream) ->
 
 %% @doc Read up to MaxBytes of contiguous data.
 -spec read(stream(), non_neg_integer() | infinity) -> {binary(), stream()}.
-read(#stream{recv_buffer = Buffer, recv_offset = Offset,
-             recv_contiguous = Contiguous} = Stream, MaxBytes) ->
-    BytesToRead = case MaxBytes of
-        infinity -> Contiguous - Offset;
-        N -> min(N, Contiguous - Offset)
-    end,
+read(
+    #stream{
+        recv_buffer = Buffer,
+        recv_offset = Offset,
+        recv_contiguous = Contiguous
+    } = Stream,
+    MaxBytes
+) ->
+    BytesToRead =
+        case MaxBytes of
+            infinity -> Contiguous - Offset;
+            N -> min(N, Contiguous - Offset)
+        end,
 
     {Data, NewBuffer} = read_from_buffer(Buffer, Offset, BytesToRead),
     NewOffset = Offset + byte_size(Data),
@@ -397,7 +442,9 @@ get_priority(#stream{urgency = Urgency, incremental = Incremental}) ->
 %% Incremental: boolean (data can be processed incrementally, default false)
 %% Returns {ok, UpdatedStream} or {error, invalid_urgency}.
 -spec set_priority(stream(), 0..7, boolean()) -> {ok, stream()} | {error, invalid_urgency}.
-set_priority(Stream, Urgency, Incremental) when Urgency >= 0, Urgency =< 7, is_boolean(Incremental) ->
+set_priority(Stream, Urgency, Incremental) when
+    Urgency >= 0, Urgency =< 7, is_boolean(Incremental)
+->
     {ok, Stream#stream{urgency = Urgency, incremental = Incremental}};
 set_priority(_Stream, _Urgency, _Incremental) ->
     {error, invalid_urgency}.
@@ -408,9 +455,11 @@ set_priority(_Stream, _Urgency, _Incremental) ->
 
 %% Check if stream was initiated locally
 is_local_stream(StreamId, client) ->
-    (StreamId band 16#01) =:= 0;  % Even = client-initiated
+    % Even = client-initiated
+    (StreamId band 16#01) =:= 0;
 is_local_stream(StreamId, server) ->
-    (StreamId band 16#01) =:= 1.  % Odd = server-initiated
+    % Odd = server-initiated
+    (StreamId band 16#01) =:= 1.
 
 %% Drain data from send buffer
 drain_buffer(Buffer, MaxBytes) ->
@@ -439,7 +488,8 @@ drain_buffer(Buffer, Remaining, Acc, Total) ->
 %% Calculate contiguous offset from buffer
 calculate_contiguous(Buffer, Current) ->
     case gb_trees:is_empty(Buffer) of
-        true -> Current;
+        true ->
+            Current;
         false ->
             %% Use iteration limit to prevent stack overflow with highly fragmented buffers
             calculate_contiguous_loop(Buffer, Current, 10000)
@@ -454,7 +504,8 @@ calculate_contiguous_loop(Buffer, Current, Remaining) ->
         {value, Data} ->
             DataSize = byte_size(Data),
             case DataSize of
-                0 -> Current;  % Empty data, stop here
+                % Empty data, stop here
+                0 -> Current;
                 _ -> calculate_contiguous_loop(Buffer, Current + DataSize, Remaining - 1)
             end;
         none ->

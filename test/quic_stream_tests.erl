@@ -138,11 +138,13 @@ receive_out_of_order_test() ->
     Stream = quic_stream:new(0, server),
     %% Receive chunk at offset 5 first
     {ok, S1} = quic_stream:receive_data(Stream, 5, <<" world">>, false),
-    ?assertEqual(0, quic_stream:bytes_available(S1)),  % Not contiguous yet
+    % Not contiguous yet
+    ?assertEqual(0, quic_stream:bytes_available(S1)),
 
     %% Now receive chunk at offset 0
     {ok, S2} = quic_stream:receive_data(S1, 0, <<"hello">>, false),
-    ?assertEqual(11, quic_stream:bytes_available(S2)),  % Now contiguous
+    % Now contiguous
+    ?assertEqual(11, quic_stream:bytes_available(S2)),
 
     {Data, _S3} = quic_stream:read(S2),
     ?assertEqual(<<"hello world">>, Data).
@@ -167,8 +169,10 @@ read_partial_test() ->
 receive_on_closed_stream_test() ->
     Stream = quic_stream:new(0, server),
     {ok, S1} = quic_stream:receive_data(Stream, 0, <<>>, true),
-    ?assertEqual({error, stream_closed},
-                 quic_stream:receive_data(S1, 0, <<"more">>, false)).
+    ?assertEqual(
+        {error, stream_closed},
+        quic_stream:receive_data(S1, 0, <<"more">>, false)
+    ).
 
 %%====================================================================
 %% Flow Control Tests
@@ -293,10 +297,13 @@ set_priority_test() ->
 set_priority_all_levels_test() ->
     Stream = quic_stream:new(0, client),
     %% Test all urgency levels 0-7
-    lists:foreach(fun(Urgency) ->
-        {ok, S} = quic_stream:set_priority(Stream, Urgency, false),
-        ?assertEqual({Urgency, false}, quic_stream:get_priority(S))
-    end, lists:seq(0, 7)).
+    lists:foreach(
+        fun(Urgency) ->
+            {ok, S} = quic_stream:set_priority(Stream, Urgency, false),
+            ?assertEqual({Urgency, false}, quic_stream:get_priority(S))
+        end,
+        lists:seq(0, 7)
+    ).
 
 set_priority_incremental_test() ->
     Stream = quic_stream:new(0, client),
@@ -307,7 +314,11 @@ set_priority_incremental_test() ->
 
 set_priority_invalid_urgency_test() ->
     Stream = quic_stream:new(0, client),
-    ?assertEqual({error, invalid_urgency},
-                 quic_stream:set_priority(Stream, 8, false)),
-    ?assertEqual({error, invalid_urgency},
-                 quic_stream:set_priority(Stream, -1, false)).
+    ?assertEqual(
+        {error, invalid_urgency},
+        quic_stream:set_priority(Stream, 8, false)
+    ),
+    ?assertEqual(
+        {error, invalid_urgency},
+        quic_stream:set_priority(Stream, -1, false)
+    ).

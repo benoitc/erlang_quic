@@ -76,8 +76,13 @@
 %% Returns the encoded packet header + payload.
 %% Note: For Initial packets, Token is required.
 %% Note: Packet number and payload should already be encrypted.
--spec encode_long(packet_type(), non_neg_integer(), binary(), binary(),
-                  #{token => binary(), pn => non_neg_integer(), payload => binary()}) ->
+-spec encode_long(
+    packet_type(),
+    non_neg_integer(),
+    binary(),
+    binary(),
+    #{token => binary(), pn => non_neg_integer(), payload => binary()}
+) ->
     binary().
 encode_long(Type, Version, DCID, SCID, Opts) ->
     TypeBits = type_to_bits(Type),
@@ -87,7 +92,8 @@ encode_long(Type, Version, DCID, SCID, Opts) ->
 
     %% Reserved bits (R R) are 0, packet number length encoded in low 2 bits
     PNLen = pn_length(PN),
-    PNLenBits = PNLen - 1,  % 0 = 1 byte, 1 = 2 bytes, etc.
+    % 0 = 1 byte, 1 = 2 bytes, etc.
+    PNLenBits = PNLen - 1,
 
     %% First byte: 1 | 1 | Type (2) | Reserved (2) | PN Len (2)
     FirstByte = 2#11000000 bor (TypeBits bsl 4) bor PNLenBits,
@@ -100,30 +106,23 @@ encode_long(Type, Version, DCID, SCID, Opts) ->
             TokenLen = byte_size(Token),
             PNBin = encode_pn(PN, PNLen),
             PayloadLen = byte_size(Payload) + PNLen,
-            <<FirstByte, Version:32, DCIDLen, DCID/binary,
-              SCIDLen, SCID/binary,
-              (quic_varint:encode(TokenLen))/binary, Token/binary,
-              (quic_varint:encode(PayloadLen))/binary,
-              PNBin/binary, Payload/binary>>;
+            <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary,
+                (quic_varint:encode(TokenLen))/binary, Token/binary,
+                (quic_varint:encode(PayloadLen))/binary, PNBin/binary, Payload/binary>>;
         handshake ->
             PNBin = encode_pn(PN, PNLen),
             PayloadLen = byte_size(Payload) + PNLen,
-            <<FirstByte, Version:32, DCIDLen, DCID/binary,
-              SCIDLen, SCID/binary,
-              (quic_varint:encode(PayloadLen))/binary,
-              PNBin/binary, Payload/binary>>;
+            <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary,
+                (quic_varint:encode(PayloadLen))/binary, PNBin/binary, Payload/binary>>;
         zero_rtt ->
             PNBin = encode_pn(PN, PNLen),
             PayloadLen = byte_size(Payload) + PNLen,
-            <<FirstByte, Version:32, DCIDLen, DCID/binary,
-              SCIDLen, SCID/binary,
-              (quic_varint:encode(PayloadLen))/binary,
-              PNBin/binary, Payload/binary>>;
+            <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary,
+                (quic_varint:encode(PayloadLen))/binary, PNBin/binary, Payload/binary>>;
         retry ->
             %% Retry packets have no packet number
             %% Payload contains Retry Token + Retry Integrity Tag
-            <<FirstByte, Version:32, DCIDLen, DCID/binary,
-              SCIDLen, SCID/binary, Payload/binary>>
+            <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary, Payload/binary>>
     end.
 
 %% @doc Encode a Version Negotiation packet.
@@ -141,8 +140,7 @@ encode_version_negotiation(DCID, SCID, Versions) ->
     SCIDLen = byte_size(SCID),
     %% Version = 0 indicates Version Negotiation
     VersionsData = encode_vn_versions(Versions),
-    <<FirstByte:8, 0:32, DCIDLen:8, DCID/binary,
-      SCIDLen:8, SCID/binary, VersionsData/binary>>.
+    <<FirstByte:8, 0:32, DCIDLen:8, DCID/binary, SCIDLen:8, SCID/binary, VersionsData/binary>>.
 
 %% @doc Encode a short header (1-RTT) packet with default key phase 0.
 %% DCIDLen is the expected DCID length (from connection state).
@@ -161,7 +159,11 @@ encode_short(DCID, PN, Payload, SpinBit, KeyPhase) ->
 
     %% First byte: 0 | 1 | S | Reserved (2) | Key Phase | PN Len (2)
     %% S = Spin bit (bit 5), Reserved (bits 3-4), Key Phase (bit 2), PN Len (bits 0-1)
-    SpinBitVal = case SpinBit of true -> 1; false -> 0 end,
+    SpinBitVal =
+        case SpinBit of
+            true -> 1;
+            false -> 0
+        end,
     KeyPhaseBit = KeyPhase band 1,
     FirstByte = 2#01000000 bor (SpinBitVal bsl 5) bor (KeyPhaseBit bsl 2) bor PNLenBits,
 
@@ -212,23 +214,27 @@ pn_length(_) -> 4.
 %% Internal Functions
 %%====================================================================
 
-decode_long(<<_FirstByte, 0:32, DCIDLen, Rest/binary>>)
-  when DCIDLen =< ?MAX_CID_LEN ->
+decode_long(<<_FirstByte, 0:32, DCIDLen, Rest/binary>>) when
+    DCIDLen =< ?MAX_CID_LEN
+->
     %% Version = 0 indicates Version Negotiation packet (RFC 9000 Section 17.2.1)
     case Rest of
-        <<DCID:DCIDLen/binary, SCIDLen, Rest2/binary>>
-          when SCIDLen =< ?MAX_CID_LEN ->
+        <<DCID:DCIDLen/binary, SCIDLen, Rest2/binary>> when
+            SCIDLen =< ?MAX_CID_LEN
+        ->
             <<SCID:SCIDLen/binary, VersionsData/binary>> = Rest2,
             Versions = decode_vn_versions(VersionsData),
             {ok, {version_negotiation, DCID, SCID, Versions}};
         _ ->
             {error, invalid_cid_length}
     end;
-decode_long(<<FirstByte, Version:32, DCIDLen, Rest/binary>>)
-  when DCIDLen =< ?MAX_CID_LEN ->
+decode_long(<<FirstByte, Version:32, DCIDLen, Rest/binary>>) when
+    DCIDLen =< ?MAX_CID_LEN
+->
     case Rest of
-        <<DCID:DCIDLen/binary, SCIDLen, Rest2/binary>>
-          when SCIDLen =< ?MAX_CID_LEN ->
+        <<DCID:DCIDLen/binary, SCIDLen, Rest2/binary>> when
+            SCIDLen =< ?MAX_CID_LEN
+        ->
             <<SCID:SCIDLen/binary, Rest3/binary>> = Rest2,
             Type = bits_to_type((FirstByte bsr 4) band 2#11),
             PNLenBits = FirstByte band 2#11,
@@ -237,8 +243,9 @@ decode_long(<<FirstByte, Version:32, DCIDLen, Rest/binary>>)
         _ ->
             {error, invalid_cid_length}
     end;
-decode_long(<<_FirstByte, _Version:32, DCIDLen, _Rest/binary>>)
-  when DCIDLen > ?MAX_CID_LEN ->
+decode_long(<<_FirstByte, _Version:32, DCIDLen, _Rest/binary>>) when
+    DCIDLen > ?MAX_CID_LEN
+->
     {error, invalid_cid_length};
 decode_long(_) ->
     {error, invalid_packet}.

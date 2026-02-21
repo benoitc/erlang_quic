@@ -61,9 +61,12 @@ init_per_suite(Config) ->
 
 end_per_suite(_Config) ->
     %% Clean up all servers
-    lists:foreach(fun(Name) ->
-        quic:stop_server(Name)
-    end, quic:which_servers()),
+    lists:foreach(
+        fun(Name) ->
+            quic:stop_server(Name)
+        end,
+        quic:which_servers()
+    ),
     ok.
 
 init_per_group(_Group, Config) ->
@@ -74,10 +77,13 @@ end_per_group(_Group, _Config) ->
 
 init_per_testcase(_TestCase, Config) ->
     %% Clean up any existing servers before each test
-    lists:foreach(fun(Name) ->
-        _ = quic:stop_server(Name),
-        _ = (catch quic_server_registry:unregister(Name))
-    end, quic:which_servers()),
+    lists:foreach(
+        fun(Name) ->
+            _ = quic:stop_server(Name),
+            _ = (catch quic_server_registry:unregister(Name))
+        end,
+        quic:which_servers()
+    ),
     timer:sleep(50),
     Config.
 
@@ -232,7 +238,8 @@ server_port_reuse_after_stop(_Config) ->
     %% Stop the server
     ok = quic:stop_server(port_test_server),
     _ = (catch quic_server_registry:unregister(port_test_server)),
-    timer:sleep(200),  %% Give OS time to release the port
+    %% Give OS time to release the port
+    timer:sleep(200),
 
     %% Start a new server on the same port
     case quic:start_server(port_test_server_2, TestPort, base_opts()) of

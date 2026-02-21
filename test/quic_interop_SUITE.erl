@@ -170,7 +170,8 @@ get_server_config() ->
         {quic_go, QuicGoHost, QuicGoPort, [handshake, streams]}
     ].
 
-check_any_server_reachable([]) -> false;
+check_any_server_reachable([]) ->
+    false;
 check_any_server_reachable([{_Name, Host, Port, _Features} | Rest]) ->
     case check_server_reachable(Host, Port) of
         true -> true;
@@ -181,14 +182,16 @@ check_server_reachable(Host, Port) ->
     %% Try to open a UDP socket and send a packet
     case gen_udp:open(0, [binary]) of
         {ok, Socket} ->
-            HostAddr = case inet:parse_address(Host) of
-                {ok, Addr} -> Addr;
-                _ ->
-                    case inet:getaddr(Host, inet) of
-                        {ok, Addr} -> Addr;
-                        _ -> {127, 0, 0, 1}
-                    end
-            end,
+            HostAddr =
+                case inet:parse_address(Host) of
+                    {ok, Addr} ->
+                        Addr;
+                    _ ->
+                        case inet:getaddr(Host, inet) of
+                            {ok, Addr} -> Addr;
+                            _ -> {127, 0, 0, 1}
+                        end
+                end,
             %% Send a minimal QUIC initial packet to check connectivity
             TestPacket = build_probe_packet(),
             Result = gen_udp:send(Socket, HostAddr, Port, TestPacket),
@@ -203,8 +206,13 @@ build_probe_packet() ->
     DCID = crypto:strong_rand_bytes(8),
     SCID = crypto:strong_rand_bytes(8),
     %% This won't complete a handshake but tests if server is listening
-    quic_packet:encode_long(initial, ?QUIC_VERSION_1, DCID, SCID,
-                            #{token => <<>>, payload => <<>>, pn => 0}).
+    quic_packet:encode_long(
+        initial,
+        ?QUIC_VERSION_1,
+        DCID,
+        SCID,
+        #{token => <<>>, payload => <<>>, pn => 0}
+    ).
 
 get_server(Name, Config) ->
     Servers = proplists:get_value(quic_servers, Config, []),
@@ -234,8 +242,13 @@ local_packet_roundtrip(_Config) ->
     ?assertEqual(SCID, InitialPacket#quic_packet.scid),
 
     %% Test Handshake packet
-    HSEncoded = quic_packet:encode_long(handshake, ?QUIC_VERSION_1, DCID, SCID,
-                                        #{payload => Payload, pn => 1}),
+    HSEncoded = quic_packet:encode_long(
+        handshake,
+        ?QUIC_VERSION_1,
+        DCID,
+        SCID,
+        #{payload => Payload, pn => 1}
+    ),
     {ok, HSPacket, <<>>} = quic_packet:decode(HSEncoded, 8),
     ?assertEqual(handshake, HSPacket#quic_packet.type),
 
@@ -262,24 +275,29 @@ local_frame_roundtrip(_Config) ->
         {max_streams, bidi, 100},
         {data_blocked, 1000000},
         {stream_data_blocked, 4, 500000},
-        {new_connection_id, 1, 0, <<1,2,3,4,5,6,7,8>>, crypto:strong_rand_bytes(16)},
+        {new_connection_id, 1, 0, <<1, 2, 3, 4, 5, 6, 7, 8>>, crypto:strong_rand_bytes(16)},
         {retire_connection_id, 0},
-        {path_challenge, <<1,2,3,4,5,6,7,8>>},
-        {path_response, <<8,7,6,5,4,3,2,1>>},
+        {path_challenge, <<1, 2, 3, 4, 5, 6, 7, 8>>},
+        {path_response, <<8, 7, 6, 5, 4, 3, 2, 1>>},
         {connection_close, transport, 0, 0, <<>>},
         handshake_done
     ],
 
-    lists:foreach(fun(Frame) ->
-        Encoded = quic_frame:encode(Frame),
-        {Decoded, <<>>} = quic_frame:decode(Encoded),
-        verify_frame_match(Frame, Decoded)
-    end, Frames),
+    lists:foreach(
+        fun(Frame) ->
+            Encoded = quic_frame:encode(Frame),
+            {Decoded, <<>>} = quic_frame:decode(Encoded),
+            verify_frame_match(Frame, Decoded)
+        end,
+        Frames
+    ),
 
     {comment, "Frame roundtrip successful"}.
 
-verify_frame_match(ping, ping) -> ok;
-verify_frame_match(padding, padding) -> ok;
+verify_frame_match(ping, ping) ->
+    ok;
+verify_frame_match(padding, padding) ->
+    ok;
 verify_frame_match({crypto, O1, D1}, {crypto, O2, D2}) ->
     ?assertEqual(O1, O2),
     ?assertEqual(D1, D2);
@@ -297,8 +315,10 @@ verify_frame_match({connection_close, T1, C1, F1, R1}, {connection_close, T2, C2
     ?assertEqual(C1, C2),
     ?assertEqual(F1, F2),
     ?assertEqual(R1, R2);
-verify_frame_match(handshake_done, handshake_done) -> ok;
-verify_frame_match(_, _) -> ok.
+verify_frame_match(handshake_done, handshake_done) ->
+    ok;
+verify_frame_match(_, _) ->
+    ok.
 
 local_key_derivation(_Config) ->
     ct:comment("Test key derivation against RFC 9001 test vectors"),
@@ -309,7 +329,8 @@ local_key_derivation(_Config) ->
     %% Initial secret
     InitialSecret = quic_keys:derive_initial_secret(DCID),
     ExpectedInitialSecret = hexstr_to_bin(
-        "7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44"),
+        "7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44"
+    ),
     ?assertEqual(ExpectedInitialSecret, InitialSecret),
 
     %% Client initial keys
@@ -380,13 +401,16 @@ packet_number_encoding(_Config) ->
     %% Test various packet numbers
     PNs = [0, 1, 127, 128, 255, 256, 16383, 16384, 1073741823],
 
-    lists:foreach(fun(PN) ->
-        DCID = crypto:strong_rand_bytes(8),
-        Payload = <<"test">>,
-        Encoded = quic_packet:encode_short(DCID, PN, Payload, false),
-        {ok, Decoded, <<>>} = quic_packet:decode(Encoded, 8),
-        ?assertEqual(one_rtt, Decoded#quic_packet.type)
-    end, PNs),
+    lists:foreach(
+        fun(PN) ->
+            DCID = crypto:strong_rand_bytes(8),
+            Payload = <<"test">>,
+            Encoded = quic_packet:encode_short(DCID, PN, Payload, false),
+            {ok, Decoded, <<>>} = quic_packet:decode(Encoded, 8),
+            ?assertEqual(one_rtt, Decoded#quic_packet.type)
+        end,
+        PNs
+    ),
 
     {comment, "Packet number encoding correct"}.
 
@@ -557,26 +581,32 @@ do_version_negotiation_test(Host, Port) ->
     SCID = crypto:strong_rand_bytes(8),
     UnknownVersion = 16#FFFFFFFF,
 
-    Packet = quic_packet:encode_long(initial, UnknownVersion, DCID, SCID,
-                                     #{token => <<>>, payload => <<"test">>, pn => 0}),
+    Packet = quic_packet:encode_long(
+        initial,
+        UnknownVersion,
+        DCID,
+        SCID,
+        #{token => <<>>, payload => <<"test">>, pn => 0}
+    ),
 
     {ok, Socket} = gen_udp:open(0, [binary, {active, true}]),
     HostAddr = parse_host(Host),
     ok = gen_udp:send(Socket, HostAddr, Port, Packet),
 
-    Result = receive
-        {udp, Socket, _IP, _Port, Response} ->
-            %% Check if it's a Version Negotiation packet
-            case Response of
-                <<1:1, _:7, 0:32, _/binary>> ->
-                    %% Version 0 indicates Version Negotiation
-                    {ok, version_negotiation_received};
-                _ ->
-                    {ok, other_response}
-            end
-    after 2000 ->
-        {error, no_response}
-    end,
+    Result =
+        receive
+            {udp, Socket, _IP, _Port, Response} ->
+                %% Check if it's a Version Negotiation packet
+                case Response of
+                    <<1:1, _:7, 0:32, _/binary>> ->
+                        %% Version 0 indicates Version Negotiation
+                        {ok, version_negotiation_received};
+                    _ ->
+                        {ok, other_response}
+                end
+        after 2000 ->
+            {error, no_response}
+        end,
 
     gen_udp:close(Socket),
 
@@ -821,7 +851,8 @@ do_uni_stream_test(Host, Port) ->
 
 parse_host(Host) when is_list(Host) ->
     case inet:parse_address(Host) of
-        {ok, Addr} -> Addr;
+        {ok, Addr} ->
+            Addr;
         _ ->
             case inet:getaddr(Host, inet) of
                 {ok, Addr} -> Addr;

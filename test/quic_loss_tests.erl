@@ -148,7 +148,8 @@ ack_multiple_packets_test() ->
     S1 = quic_loss:on_packet_sent(State, 0, 500, true),
     S2 = quic_loss:on_packet_sent(S1, 1, 500, true),
     S3 = quic_loss:on_packet_sent(S2, 2, 500, true),
-    AckFrame = {ack, 2, 0, 2, []},  % Acks 0, 1, 2
+    % Acks 0, 1, 2
+    AckFrame = {ack, 2, 0, 2, []},
     Now = erlang:monotonic_time(millisecond) + 50,
     {S4, Acked, _Lost} = quic_loss:on_ack_received(S3, AckFrame, Now),
     ?assertEqual(3, length(Acked)),
@@ -285,9 +286,12 @@ retransmittable_filters_ack_test() ->
 
 retransmittable_filters_ack_variants_test() ->
     Frames = [
-        {ack, 5, 0, 5},  % 4-tuple variant
-        {ack, 5, 0, 5, []},  % 5-tuple variant
-        {ack_ecn, 5, 0, 5, [], 1, 2, 3},  % ECN variant
+        % 4-tuple variant
+        {ack, 5, 0, 5},
+        % 5-tuple variant
+        {ack, 5, 0, 5, []},
+        % ECN variant
+        {ack_ecn, 5, 0, 5, [], 1, 2, 3},
         {stream, 0, 0, <<"data">>, false}
     ],
     Result = quic_loss:retransmittable_frames(Frames),

@@ -41,13 +41,17 @@ encode_1073741823_test() ->
     ?assertEqual(<<16#bf, 16#ff, 16#ff, 16#ff>>, quic_varint:encode(1073741823)).
 
 encode_1073741824_test() ->
-    ?assertEqual(<<16#c0, 16#00, 16#00, 16#00, 16#40, 16#00, 16#00, 16#00>>,
-                 quic_varint:encode(1073741824)).
+    ?assertEqual(
+        <<16#c0, 16#00, 16#00, 16#00, 16#40, 16#00, 16#00, 16#00>>,
+        quic_varint:encode(1073741824)
+    ).
 
 encode_max_test() ->
     Max = 4611686018427387903,
-    ?assertEqual(<<16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff>>,
-                 quic_varint:encode(Max)).
+    ?assertEqual(
+        <<16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff>>,
+        quic_varint:encode(Max)
+    ).
 
 %%====================================================================
 %% Decode Tests (inverse of encode)
@@ -72,13 +76,17 @@ decode_1073741823_test() ->
     ?assertEqual({1073741823, <<>>}, quic_varint:decode(<<16#bf, 16#ff, 16#ff, 16#ff>>)).
 
 decode_1073741824_test() ->
-    ?assertEqual({1073741824, <<>>},
-                 quic_varint:decode(<<16#c0, 16#00, 16#00, 16#00, 16#40, 16#00, 16#00, 16#00>>)).
+    ?assertEqual(
+        {1073741824, <<>>},
+        quic_varint:decode(<<16#c0, 16#00, 16#00, 16#00, 16#40, 16#00, 16#00, 16#00>>)
+    ).
 
 decode_max_test() ->
     Max = 4611686018427387903,
-    ?assertEqual({Max, <<>>},
-                 quic_varint:decode(<<16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff>>)).
+    ?assertEqual(
+        {Max, <<>>},
+        quic_varint:decode(<<16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff>>)
+    ).
 
 %%====================================================================
 %% Decode with trailing data
@@ -123,10 +131,23 @@ max_value_test() ->
 %%====================================================================
 
 roundtrip_test_() ->
-    Values = [0, 1, 63, 64, 100, 16383, 16384, 100000, 1073741823,
-              1073741824, 4611686018427387903],
-    [?_assertEqual({V, <<>>}, quic_varint:decode(quic_varint:encode(V)))
-     || V <- Values].
+    Values = [
+        0,
+        1,
+        63,
+        64,
+        100,
+        16383,
+        16384,
+        100000,
+        1073741823,
+        1073741824,
+        4611686018427387903
+    ],
+    [
+        ?_assertEqual({V, <<>>}, quic_varint:decode(quic_varint:encode(V)))
+     || V <- Values
+    ].
 
 %%====================================================================
 %% Error cases

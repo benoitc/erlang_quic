@@ -79,7 +79,8 @@ encrypt(Key, IV, PN, AAD, Plaintext) ->
 encrypt(Key, IV, PN, AAD, Plaintext, Cipher) ->
     Nonce = compute_nonce(IV, PN),
     {Ciphertext, Tag} = crypto:crypto_one_time_aead(
-        Cipher, Key, Nonce, Plaintext, AAD, ?TAG_LEN, true),
+        Cipher, Key, Nonce, Plaintext, AAD, ?TAG_LEN, true
+    ),
     <<Ciphertext/binary, Tag/binary>>.
 
 %% @doc Decrypt a QUIC packet payload using AEAD.
@@ -99,8 +100,11 @@ decrypt(Key, IV, PN, AAD, CiphertextWithTag, Cipher) ->
     Nonce = compute_nonce(IV, PN),
     CipherLen = byte_size(CiphertextWithTag) - ?TAG_LEN,
     <<Ciphertext:CipherLen/binary, Tag:?TAG_LEN/binary>> = CiphertextWithTag,
-    case crypto:crypto_one_time_aead(
-            Cipher, Key, Nonce, Ciphertext, AAD, Tag, false) of
+    case
+        crypto:crypto_one_time_aead(
+            Cipher, Key, Nonce, Ciphertext, AAD, Tag, false
+        )
+    of
         Plaintext when is_binary(Plaintext) ->
             {ok, Plaintext};
         error ->
@@ -169,10 +173,11 @@ unprotect_header(HP, ProtectedHeader, EncryptedPayload, _PNOffset) ->
 
             %% Unmask first byte to get PN length
             IsLongHeader = (ProtectedFirstByte band 16#80) =:= 16#80,
-            FirstByteMask = case IsLongHeader of
-                true -> MaskByte0 band 16#0f;
-                false -> MaskByte0 band 16#1f
-            end,
+            FirstByteMask =
+                case IsLongHeader of
+                    true -> MaskByte0 band 16#0f;
+                    false -> MaskByte0 band 16#1f
+                end,
             FirstByte = ProtectedFirstByte bxor FirstByteMask,
 
             %% Get PN length from unmasked first byte
@@ -219,7 +224,7 @@ compute_hp_mask(chacha20_poly1305, HP, Sample) ->
     %% Sample is 16 bytes: first 4 = counter, last 12 = nonce
     <<Counter:32/little, Nonce:12/binary>> = Sample,
     %% Generate 5 bytes of mask using ChaCha20
-    Zeros = <<0,0,0,0,0>>,
+    Zeros = <<0, 0, 0, 0, 0>>,
     crypto:crypto_one_time(chacha20, HP, <<Counter:32/little, Nonce/binary>>, Zeros, true).
 
 %% Apply mask to header (for protection)
@@ -233,14 +238,19 @@ apply_header_mask(Header, Mask, PNOffset) ->
 
     %% Mask first byte: for long header, mask lower 4 bits; for short, mask lower 5 bits
     IsLongHeader = (FirstByte band 16#80) =:= 16#80,
-    FirstByteMask = case IsLongHeader of
-        true -> MaskByte0 band 16#0f;  % Long header: mask bits 0-3
-        false -> MaskByte0 band 16#1f  % Short header: mask bits 0-4
-    end,
+    FirstByteMask =
+        case IsLongHeader of
+            % Long header: mask bits 0-3
+            true -> MaskByte0 band 16#0f;
+            % Short header: mask bits 0-4
+            false -> MaskByte0 band 16#1f
+        end,
     ProtectedFirstByte = FirstByte bxor FirstByteMask,
 
     %% Split header at PN offset
-    BeforePNLen = PNOffset - 1,  % -1 because we already split off first byte
+
+    % -1 because we already split off first byte
+    BeforePNLen = PNOffset - 1,
     <<BeforePN:BeforePNLen/binary, PN:PNLen/binary, AfterPN/binary>> = Rest,
 
     %% Mask PN bytes

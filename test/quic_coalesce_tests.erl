@@ -21,7 +21,9 @@ coalesce_frames_basic_test() ->
 %% Test coalescing ACK and STREAM frames
 coalesce_ack_and_stream_test() ->
     %% Create an ACK frame
-    AckRanges = [{10, 5}],  % Largest=10, FirstRange=5
+
+    % Largest=10, FirstRange=5
+    AckRanges = [{10, 5}],
     AckFrame = quic_frame:encode({ack, AckRanges, 0, undefined}),
 
     %% Create a small STREAM frame

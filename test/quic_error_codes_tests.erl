@@ -199,7 +199,9 @@ application_close_with_reason_test() ->
     Frame = {connection_close, application, 42, undefined, <<"application shutdown">>},
     Encoded = quic_frame:encode(Frame),
     {Decoded, <<>>} = quic_frame:decode(Encoded),
-    ?assertEqual({connection_close, application, 42, undefined, <<"application shutdown">>}, Decoded).
+    ?assertEqual(
+        {connection_close, application, 42, undefined, <<"application shutdown">>}, Decoded
+    ).
 
 %% H3 error codes (HTTP/3 specific)
 h3_no_error_test() ->

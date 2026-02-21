@@ -15,9 +15,15 @@
 
 %% Stream ID
 stream_id() ->
-    ?LET(Base, range(0, 1000),
-         ?LET(Type, range(0, 3),
-              Base * 4 + Type)).
+    ?LET(
+        Base,
+        range(0, 1000),
+        ?LET(
+            Type,
+            range(0, 3),
+            Base * 4 + Type
+        )
+    ).
 
 %% Data chunk
 data_chunk() ->
@@ -45,18 +51,22 @@ flow_limit() ->
 
 %% Stream send/receive roundtrip
 prop_stream_data_roundtrip() ->
-    ?FORALL({StreamId, Data, Role}, {stream_id(), data_chunk(), role()},
+    ?FORALL(
+        {StreamId, Data, Role},
+        {stream_id(), data_chunk(), role()},
         begin
             Stream = quic_stream:new(StreamId, Role),
             {ok, S1} = quic_stream:send(Stream, Data),
             {SendData, _Offset, _Fin, S2} = quic_stream:get_send_data(S1, byte_size(Data)),
             SendData =:= Data andalso quic_stream:bytes_to_send(S2) =:= 0
-        end).
+        end
+    ).
 
 %% Stream receive reassembly (in order)
 prop_stream_receive_in_order() ->
-    ?FORALL({StreamId, Chunks, Role},
-            {stream_id(), non_empty(list(data_chunk())), role()},
+    ?FORALL(
+        {StreamId, Chunks, Role},
+        {stream_id(), non_empty(list(data_chunk())), role()},
         begin
             Stream = quic_stream:new(StreamId, Role),
             %% Only test on streams where we can receive (not local uni)
@@ -87,11 +97,14 @@ prop_stream_receive_in_order() ->
                     %% Local uni stream can't receive - skip
                     true
             end
-        end).
+        end
+    ).
 
 %% Stream state transitions are valid
 prop_stream_state_transitions() ->
-    ?FORALL({StreamId, Role}, {stream_id(), role()},
+    ?FORALL(
+        {StreamId, Role},
+        {stream_id(), role()},
         begin
             Stream = quic_stream:new(StreamId, Role),
             %% Local stream starts open
@@ -101,22 +114,28 @@ prop_stream_state_transitions() ->
                 true -> InitState =:= open;
                 false -> InitState =:= idle
             end
-        end).
+        end
+    ).
 
 %% Stream ID type detection
 prop_stream_id_type() ->
-    ?FORALL(StreamId, stream_id(),
+    ?FORALL(
+        StreamId,
+        stream_id(),
         begin
             Stream = quic_stream:new(StreamId, client),
             IsBidi = quic_stream:is_bidi(Stream),
             %% Bit 1 determines bidi (0) vs uni (1)
             ExpectedBidi = (StreamId band 2) =:= 0,
             IsBidi =:= ExpectedBidi
-        end).
+        end
+    ).
 
 %% FIN closes appropriate side (only test on local streams)
 prop_stream_fin_closes() ->
-    ?FORALL({StreamId, Role}, {stream_id(), role()},
+    ?FORALL(
+        {StreamId, Role},
+        {stream_id(), role()},
         begin
             Stream = quic_stream:new(StreamId, Role),
             IsLocal = quic_stream:is_local(Stream, Role),
@@ -135,7 +154,8 @@ prop_stream_fin_closes() ->
                     %% Remote stream - skip test (not meaningful)
                     true
             end
-        end).
+        end
+    ).
 
 %%====================================================================
 %% ACK Properties
@@ -143,7 +163,9 @@ prop_stream_fin_closes() ->
 
 %% Recording packets creates ranges
 prop_ack_records_packets() ->
-    ?FORALL(PNs, non_empty(list(packet_number())),
+    ?FORALL(
+        PNs,
+        non_empty(list(packet_number())),
         begin
             State = quic_ack:new(),
             FinalState = lists:foldl(
@@ -153,11 +175,14 @@ prop_ack_records_packets() ->
             ),
             Largest = quic_ack:largest_received(FinalState),
             Largest =:= lists:max(PNs)
-        end).
+        end
+    ).
 
 %% ACK generation for recorded packets
 prop_ack_generation() ->
-    ?FORALL(PNs, non_empty(list(packet_number())),
+    ?FORALL(
+        PNs,
+        non_empty(list(packet_number())),
         begin
             State = quic_ack:new(),
             FinalState = lists:foldl(
@@ -171,11 +196,14 @@ prop_ack_generation() ->
                 _ ->
                     false
             end
-        end).
+        end
+    ).
 
 %% Sequential packets form single range
 prop_ack_sequential_single_range() ->
-    ?FORALL(Start, range(0, 1000),
+    ?FORALL(
+        Start,
+        range(0, 1000),
         begin
             PNs = lists:seq(Start, Start + 10),
             State = quic_ack:new(),
@@ -186,11 +214,14 @@ prop_ack_sequential_single_range() ->
             ),
             Ranges = quic_ack:ack_ranges(FinalState),
             length(Ranges) =:= 1
-        end).
+        end
+    ).
 
 %% Gaps create multiple ranges
 prop_ack_gaps_multiple_ranges() ->
-    ?FORALL({Start, Gap}, {range(0, 100), range(2, 10)},
+    ?FORALL(
+        {Start, Gap},
+        {range(0, 100), range(2, 10)},
         begin
             %% Create two separate ranges with a gap
             PNs = lists:seq(Start, Start + 5) ++ lists:seq(Start + 5 + Gap, Start + 10 + Gap),
@@ -202,7 +233,8 @@ prop_ack_gaps_multiple_ranges() ->
             ),
             Ranges = quic_ack:ack_ranges(FinalState),
             length(Ranges) >= 2
-        end).
+        end
+    ).
 
 %%====================================================================
 %% Loss Detection Properties
@@ -210,7 +242,9 @@ prop_ack_gaps_multiple_ranges() ->
 
 %% Sending packets increases bytes in flight
 prop_loss_bytes_in_flight() ->
-    ?FORALL(Sizes, non_empty(list(packet_size())),
+    ?FORALL(
+        Sizes,
+        non_empty(list(packet_size())),
         begin
             State = quic_loss:new(),
             {FinalState, _} = lists:foldl(
@@ -221,21 +255,27 @@ prop_loss_bytes_in_flight() ->
                 Sizes
             ),
             quic_loss:bytes_in_flight(FinalState) =:= lists:sum(Sizes)
-        end).
+        end
+    ).
 
 %% RTT update changes smoothed RTT
 prop_loss_rtt_update() ->
-    ?FORALL(RTT, range(10, 500),
+    ?FORALL(
+        RTT,
+        range(10, 500),
         begin
             State = quic_loss:new(),
             S1 = quic_loss:update_rtt(State, RTT, 0),
             %% First sample sets smoothed_rtt directly
             quic_loss:smoothed_rtt(S1) =:= RTT
-        end).
+        end
+    ).
 
 %% PTO increases with count
 prop_loss_pto_backoff() ->
-    ?FORALL(_, exactly(true),
+    ?FORALL(
+        _,
+        exactly(true),
         begin
             State = quic_loss:new(),
             PTO0 = quic_loss:get_pto(State),
@@ -244,7 +284,8 @@ prop_loss_pto_backoff() ->
             S2 = quic_loss:on_pto_expired(S1),
             PTO2 = quic_loss:get_pto(S2),
             PTO1 =:= PTO0 * 2 andalso PTO2 =:= PTO0 * 4
-        end).
+        end
+    ).
 
 %%====================================================================
 %% Congestion Control Properties
@@ -252,37 +293,48 @@ prop_loss_pto_backoff() ->
 
 %% Initial cwnd is positive
 prop_cc_initial_cwnd() ->
-    ?FORALL(_, exactly(true),
+    ?FORALL(
+        _,
+        exactly(true),
         begin
             State = quic_cc:new(),
             quic_cc:cwnd(State) > 0
-        end).
+        end
+    ).
 
 %% Slow start increases cwnd
 prop_cc_slow_start_increases() ->
-    ?FORALL(AckedBytes, range(1000, 5000),
+    ?FORALL(
+        AckedBytes,
+        range(1000, 5000),
         begin
             State = quic_cc:new(),
             InitCwnd = quic_cc:cwnd(State),
             S1 = quic_cc:on_packet_sent(State, AckedBytes),
             S2 = quic_cc:on_packets_acked(S1, AckedBytes),
             quic_cc:cwnd(S2) =:= InitCwnd + AckedBytes
-        end).
+        end
+    ).
 
 %% Congestion event reduces cwnd
 prop_cc_congestion_reduces() ->
-    ?FORALL(_, exactly(true),
+    ?FORALL(
+        _,
+        exactly(true),
         begin
             State = quic_cc:new(),
             InitCwnd = quic_cc:cwnd(State),
             Now = erlang:monotonic_time(millisecond),
             S1 = quic_cc:on_congestion_event(State, Now),
             quic_cc:cwnd(S1) < InitCwnd
-        end).
+        end
+    ).
 
 %% Bytes in flight tracking
 prop_cc_bytes_tracking() ->
-    ?FORALL(Sizes, non_empty(list(packet_size())),
+    ?FORALL(
+        Sizes,
+        non_empty(list(packet_size())),
         begin
             State = quic_cc:new(),
             FinalState = lists:foldl(
@@ -291,7 +343,8 @@ prop_cc_bytes_tracking() ->
                 Sizes
             ),
             quic_cc:bytes_in_flight(FinalState) =:= lists:sum(Sizes)
-        end).
+        end
+    ).
 
 %%====================================================================
 %% Flow Control Properties
@@ -299,50 +352,69 @@ prop_cc_bytes_tracking() ->
 
 %% Send within limit succeeds
 prop_flow_send_within_limit() ->
-    ?FORALL({Limit, Size}, {flow_limit(), packet_size()},
-        ?IMPLIES(Size < Limit,
+    ?FORALL(
+        {Limit, Size},
+        {flow_limit(), packet_size()},
+        ?IMPLIES(
+            Size < Limit,
             begin
                 State = quic_flow:new(#{peer_initial_max_data => Limit}),
                 quic_flow:can_send(State, Size)
-            end)).
+            end
+        )
+    ).
 
 %% Send exceeding limit fails
 prop_flow_send_exceeds_limit() ->
-    ?FORALL({Limit, Extra}, {flow_limit(), range(1, 1000)},
+    ?FORALL(
+        {Limit, Extra},
+        {flow_limit(), range(1, 1000)},
         begin
             State = quic_flow:new(#{peer_initial_max_data => Limit}),
             not quic_flow:can_send(State, Limit + Extra)
-        end).
+        end
+    ).
 
 %% Receive within limit succeeds
 prop_flow_receive_within_limit() ->
-    ?FORALL({Limit, Size}, {flow_limit(), packet_size()},
-        ?IMPLIES(Size < Limit,
+    ?FORALL(
+        {Limit, Size},
+        {flow_limit(), packet_size()},
+        ?IMPLIES(
+            Size < Limit,
             begin
                 State = quic_flow:new(#{initial_max_data => Limit}),
                 case quic_flow:on_data_received(State, Size) of
                     {ok, _} -> true;
                     _ -> false
                 end
-            end)).
+            end
+        )
+    ).
 
 %% Receive exceeding limit fails
 prop_flow_receive_exceeds_limit() ->
-    ?FORALL({Limit, Extra}, {flow_limit(), range(1, 1000)},
+    ?FORALL(
+        {Limit, Extra},
+        {flow_limit(), range(1, 1000)},
         begin
             State = quic_flow:new(#{initial_max_data => Limit}),
             {ok, S1} = quic_flow:on_data_received(State, Limit),
             quic_flow:on_data_received(S1, Extra) =:= {error, flow_control_error}
-        end).
+        end
+    ).
 
 %% MAX_DATA increases limit
 prop_flow_max_data_increases() ->
-    ?FORALL({Initial, Increase}, {flow_limit(), flow_limit()},
+    ?FORALL(
+        {Initial, Increase},
+        {flow_limit(), flow_limit()},
         begin
             State = quic_flow:new(#{peer_initial_max_data => Initial}),
             S1 = quic_flow:on_max_data_received(State, Initial + Increase),
             quic_flow:send_limit(S1) =:= Initial + Increase
-        end).
+        end
+    ).
 
 %%====================================================================
 %% EUnit wrapper
@@ -351,29 +423,55 @@ prop_flow_max_data_increases() ->
 proper_test_() ->
     {timeout, 300, [
         %% Stream tests
-        ?_assert(proper:quickcheck(prop_stream_data_roundtrip(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_stream_receive_in_order(), [{numtests, 100}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_stream_state_transitions(), [{numtests, 200}, {to_file, user}])),
+        ?_assert(
+            proper:quickcheck(prop_stream_data_roundtrip(), [{numtests, 200}, {to_file, user}])
+        ),
+        ?_assert(
+            proper:quickcheck(prop_stream_receive_in_order(), [{numtests, 100}, {to_file, user}])
+        ),
+        ?_assert(
+            proper:quickcheck(prop_stream_state_transitions(), [{numtests, 200}, {to_file, user}])
+        ),
         ?_assert(proper:quickcheck(prop_stream_id_type(), [{numtests, 200}, {to_file, user}])),
         ?_assert(proper:quickcheck(prop_stream_fin_closes(), [{numtests, 100}, {to_file, user}])),
         %% ACK tests
         ?_assert(proper:quickcheck(prop_ack_records_packets(), [{numtests, 200}, {to_file, user}])),
         ?_assert(proper:quickcheck(prop_ack_generation(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_ack_sequential_single_range(), [{numtests, 100}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_ack_gaps_multiple_ranges(), [{numtests, 100}, {to_file, user}])),
+        ?_assert(
+            proper:quickcheck(prop_ack_sequential_single_range(), [{numtests, 100}, {to_file, user}])
+        ),
+        ?_assert(
+            proper:quickcheck(prop_ack_gaps_multiple_ranges(), [{numtests, 100}, {to_file, user}])
+        ),
         %% Loss detection tests
-        ?_assert(proper:quickcheck(prop_loss_bytes_in_flight(), [{numtests, 100}, {to_file, user}])),
+        ?_assert(
+            proper:quickcheck(prop_loss_bytes_in_flight(), [{numtests, 100}, {to_file, user}])
+        ),
         ?_assert(proper:quickcheck(prop_loss_rtt_update(), [{numtests, 100}, {to_file, user}])),
         ?_assert(proper:quickcheck(prop_loss_pto_backoff(), [{numtests, 50}, {to_file, user}])),
         %% Congestion control tests
         ?_assert(proper:quickcheck(prop_cc_initial_cwnd(), [{numtests, 50}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_cc_slow_start_increases(), [{numtests, 100}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_cc_congestion_reduces(), [{numtests, 50}, {to_file, user}])),
+        ?_assert(
+            proper:quickcheck(prop_cc_slow_start_increases(), [{numtests, 100}, {to_file, user}])
+        ),
+        ?_assert(
+            proper:quickcheck(prop_cc_congestion_reduces(), [{numtests, 50}, {to_file, user}])
+        ),
         ?_assert(proper:quickcheck(prop_cc_bytes_tracking(), [{numtests, 100}, {to_file, user}])),
         %% Flow control tests
-        ?_assert(proper:quickcheck(prop_flow_send_within_limit(), [{numtests, 100}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_flow_send_exceeds_limit(), [{numtests, 100}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_flow_receive_within_limit(), [{numtests, 100}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_flow_receive_exceeds_limit(), [{numtests, 100}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_flow_max_data_increases(), [{numtests, 100}, {to_file, user}]))
+        ?_assert(
+            proper:quickcheck(prop_flow_send_within_limit(), [{numtests, 100}, {to_file, user}])
+        ),
+        ?_assert(
+            proper:quickcheck(prop_flow_send_exceeds_limit(), [{numtests, 100}, {to_file, user}])
+        ),
+        ?_assert(
+            proper:quickcheck(prop_flow_receive_within_limit(), [{numtests, 100}, {to_file, user}])
+        ),
+        ?_assert(
+            proper:quickcheck(prop_flow_receive_exceeds_limit(), [{numtests, 100}, {to_file, user}])
+        ),
+        ?_assert(
+            proper:quickcheck(prop_flow_max_data_increases(), [{numtests, 100}, {to_file, user}])
+        )
     ]}.

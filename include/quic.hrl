@@ -35,7 +35,8 @@
 -define(FRAME_STOP_SENDING, 16#05).
 -define(FRAME_CRYPTO, 16#06).
 -define(FRAME_NEW_TOKEN, 16#07).
--define(FRAME_STREAM, 16#08).  % 0x08-0x0f depending on flags
+% 0x08-0x0f depending on flags
+-define(FRAME_STREAM, 16#08).
 -define(FRAME_MAX_DATA, 16#10).
 -define(FRAME_MAX_STREAM_DATA, 16#11).
 -define(FRAME_MAX_STREAMS_BIDI, 16#12).
@@ -60,9 +61,12 @@
 %% Stream Frame Flags (bits 0-2 of frame type 0x08-0x0f)
 %%====================================================================
 
--define(STREAM_FLAG_OFF, 16#04).  % Offset field present
--define(STREAM_FLAG_LEN, 16#02).  % Length field present
--define(STREAM_FLAG_FIN, 16#01).  % Final frame for stream
+% Offset field present
+-define(STREAM_FLAG_OFF, 16#04).
+% Length field present
+-define(STREAM_FLAG_LEN, 16#02).
+% Final frame for stream
+-define(STREAM_FLAG_FIN, 16#01).
 
 %%====================================================================
 %% Transport Error Codes (RFC 9000 Section 20.1)
@@ -85,7 +89,8 @@
 -define(QUIC_KEY_UPDATE_ERROR, 16#0e).
 -define(QUIC_AEAD_LIMIT_REACHED, 16#0f).
 -define(QUIC_NO_VIABLE_PATH, 16#10).
--define(QUIC_CRYPTO_ERROR_BASE, 16#100).  % 0x100-0x1ff for TLS alerts
+% 0x100-0x1ff for TLS alerts
+-define(QUIC_CRYPTO_ERROR_BASE, 16#100).
 
 %%====================================================================
 %% HTTP/3 Error Codes (RFC 9114 Section 8.1)
@@ -138,15 +143,15 @@
 %% Initial salt for QUIC v1 (RFC 9001 Section 5.2)
 %% 0x38762cf7f55934b34d179ae6a4c80cadccbb7f0a
 -define(QUIC_V1_INITIAL_SALT,
-    <<16#38, 16#76, 16#2c, 16#f7, 16#f5, 16#59, 16#34, 16#b3,
-      16#4d, 16#17, 16#9a, 16#e6, 16#a4, 16#c8, 16#0c, 16#ad,
-      16#cc, 16#bb, 16#7f, 16#0a>>).
+    <<16#38, 16#76, 16#2c, 16#f7, 16#f5, 16#59, 16#34, 16#b3, 16#4d, 16#17, 16#9a, 16#e6, 16#a4,
+        16#c8, 16#0c, 16#ad, 16#cc, 16#bb, 16#7f, 16#0a>>
+).
 
 %% Initial salt for QUIC v2 (RFC 9369 Section 5.2)
 -define(QUIC_V2_INITIAL_SALT,
-    <<16#0d, 16#be, 16#91, 16#3e, 16#26, 16#56, 16#d1, 16#93,
-      16#83, 16#14, 16#86, 16#ac, 16#d1, 16#64, 16#9b, 16#f5,
-      16#77, 16#95, 16#c0, 16#80>>).
+    <<16#0d, 16#be, 16#91, 16#3e, 16#26, 16#56, 16#d1, 16#93, 16#83, 16#14, 16#86, 16#ac, 16#d1,
+        16#64, 16#9b, 16#f5, 16#77, 16#95, 16#c0, 16#80>>
+).
 
 %% HKDF labels
 -define(QUIC_LABEL_CLIENT_IN, <<"client in">>).
@@ -180,8 +185,10 @@
 -define(EXT_SUPPORTED_GROUPS, 10).
 -define(EXT_SIGNATURE_ALGORITHMS, 13).
 -define(EXT_ALPN, 16).
--define(EXT_PRE_SHARED_KEY, 41).       % RFC 8446 Section 4.2.11
--define(EXT_EARLY_DATA, 42).            % RFC 8446 Section 4.2.10
+% RFC 8446 Section 4.2.11
+-define(EXT_PRE_SHARED_KEY, 41).
+% RFC 8446 Section 4.2.10
+-define(EXT_EARLY_DATA, 42).
 -define(EXT_SUPPORTED_VERSIONS, 43).
 -define(EXT_PSK_KEY_EXCHANGE_MODES, 45).
 -define(EXT_KEY_SHARE, 51).
@@ -233,13 +240,17 @@
 %%====================================================================
 
 -define(DEFAULT_MAX_UDP_PAYLOAD_SIZE, 1200).
--define(DEFAULT_MAX_IDLE_TIMEOUT, 30000).  % 30 seconds
+% 30 seconds
+-define(DEFAULT_MAX_IDLE_TIMEOUT, 30000).
 -define(DEFAULT_MAX_STREAMS_BIDI, 100).
 -define(DEFAULT_MAX_STREAMS_UNI, 100).
--define(DEFAULT_INITIAL_MAX_DATA, 1048576).  % 1MB
--define(DEFAULT_INITIAL_MAX_STREAM_DATA, 262144).  % 256KB
+% 1MB
+-define(DEFAULT_INITIAL_MAX_DATA, 1048576).
+% 256KB
+-define(DEFAULT_INITIAL_MAX_STREAM_DATA, 262144).
 -define(DEFAULT_ACK_DELAY_EXPONENT, 3).
--define(DEFAULT_MAX_ACK_DELAY, 25).  % 25ms
+% 25ms
+-define(DEFAULT_MAX_ACK_DELAY, 25).
 
 %%====================================================================
 %% Records
@@ -385,7 +396,8 @@
     recv_offset :: non_neg_integer(),
     recv_max_data :: non_neg_integer(),
     recv_fin :: boolean(),
-    recv_buffer :: map(),  %% #{Offset => Data} for out-of-order reassembly
+    %% #{Offset => Data} for out-of-order reassembly
+    recv_buffer :: map(),
 
     %% Final size (set when FIN received)
     final_size :: non_neg_integer() | undefined,
@@ -432,15 +444,20 @@
     scid :: binary() | undefined,
     token :: binary() | undefined,
     pn :: non_neg_integer() | undefined,
-    payload :: binary() | [term()]  % frames list or encrypted payload
+    % frames list or encrypted payload
+    payload :: binary() | [term()]
 }).
 
 %% Connection state
 -record(conn_state, {
     %% Connection IDs
-    scid :: binary(),           % Source Connection ID
-    dcid :: binary(),           % Destination Connection ID
-    original_dcid :: binary(),  % Original DCID (for Initial packets)
+
+    % Source Connection ID
+    scid :: binary(),
+    % Destination Connection ID
+    dcid :: binary(),
+    % Original DCID (for Initial packets)
+    original_dcid :: binary(),
 
     %% Connection state
     state :: idle | handshaking | connected | draining | closed,
@@ -533,4 +550,5 @@
     reset_secret :: binary() | undefined
 }).
 
--endif.  % QUIC_HRL
+% QUIC_HRL
+-endif.

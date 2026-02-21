@@ -39,56 +39,70 @@ long_packet_type() ->
 
 %% Long header encode/decode roundtrip
 prop_long_header_roundtrip() ->
-    ?FORALL({Type, Ver, DCID, SCID, PN, Payload},
-            {long_packet_type(), version(), connection_id(), connection_id(),
-             packet_number(), payload()},
+    ?FORALL(
+        {Type, Ver, DCID, SCID, PN, Payload},
+        {
+            long_packet_type(),
+            version(),
+            connection_id(),
+            connection_id(),
+            packet_number(),
+            payload()
+        },
         begin
-            Opts = case Type of
-                initial -> #{token => <<>>, payload => Payload, pn => PN};
-                _ -> #{payload => Payload, pn => PN}
-            end,
+            Opts =
+                case Type of
+                    initial -> #{token => <<>>, payload => Payload, pn => PN};
+                    _ -> #{payload => Payload, pn => PN}
+                end,
             Encoded = quic_packet:encode_long(Type, Ver, DCID, SCID, Opts),
             case quic_packet:decode(Encoded, 8) of
                 {ok, Packet, <<>>} ->
                     Packet#quic_packet.type =:= Type andalso
-                    Packet#quic_packet.version =:= Ver andalso
-                    Packet#quic_packet.dcid =:= DCID andalso
-                    Packet#quic_packet.scid =:= SCID;
+                        Packet#quic_packet.version =:= Ver andalso
+                        Packet#quic_packet.dcid =:= DCID andalso
+                        Packet#quic_packet.scid =:= SCID;
                 _ ->
                     false
             end
-        end).
+        end
+    ).
 
 %% Short header encode/decode roundtrip
 prop_short_header_roundtrip() ->
-    ?FORALL({DCID, PN, Payload, SpinBit},
-            {connection_id(), packet_number(), payload(), boolean()},
+    ?FORALL(
+        {DCID, PN, Payload, SpinBit},
+        {connection_id(), packet_number(), payload(), boolean()},
         begin
             Encoded = quic_packet:encode_short(DCID, PN, Payload, SpinBit),
             case quic_packet:decode(Encoded, 8) of
                 {ok, Packet, <<>>} ->
                     Packet#quic_packet.type =:= one_rtt andalso
-                    Packet#quic_packet.dcid =:= DCID;
+                        Packet#quic_packet.dcid =:= DCID;
                 _ ->
                     false
             end
-        end).
+        end
+    ).
 
 %% Encoding is deterministic
 prop_encode_deterministic() ->
-    ?FORALL({DCID, SCID, PN, Payload},
-            {connection_id(), connection_id(), packet_number(), payload()},
+    ?FORALL(
+        {DCID, SCID, PN, Payload},
+        {connection_id(), connection_id(), packet_number(), payload()},
         begin
             Opts = #{payload => Payload, pn => PN},
             E1 = quic_packet:encode_long(handshake, ?QUIC_VERSION_1, DCID, SCID, Opts),
             E2 = quic_packet:encode_long(handshake, ?QUIC_VERSION_1, DCID, SCID, Opts),
             E1 =:= E2
-        end).
+        end
+    ).
 
 %% First byte indicates long vs short header
 prop_header_form_bit() ->
-    ?FORALL({DCID, SCID, PN, Payload},
-            {connection_id(), connection_id(), packet_number(), payload()},
+    ?FORALL(
+        {DCID, SCID, PN, Payload},
+        {connection_id(), connection_id(), packet_number(), payload()},
         begin
             LongOpts = #{payload => Payload, pn => PN},
             LongEncoded = quic_packet:encode_long(handshake, ?QUIC_VERSION_1, DCID, SCID, LongOpts),
@@ -97,24 +111,28 @@ prop_header_form_bit() ->
             <<ShortFirst, _/binary>> = ShortEncoded,
             %% Long header has form bit (0x80) set
             (LongFirst band 16#80) =:= 16#80 andalso
-            %% Short header has form bit clear
-            (ShortFirst band 16#80) =:= 16#00
-        end).
+                %% Short header has form bit clear
+                (ShortFirst band 16#80) =:= 16#00
+        end
+    ).
 
 %% DCID length is correctly encoded in long headers
 prop_dcid_length_encoded() ->
-    ?FORALL({Type, DCID, SCID, Payload},
-            {long_packet_type(), connection_id(), connection_id(), payload()},
+    ?FORALL(
+        {Type, DCID, SCID, Payload},
+        {long_packet_type(), connection_id(), connection_id(), payload()},
         begin
-            Opts = case Type of
-                initial -> #{token => <<>>, payload => Payload, pn => 0};
-                _ -> #{payload => Payload, pn => 0}
-            end,
+            Opts =
+                case Type of
+                    initial -> #{token => <<>>, payload => Payload, pn => 0};
+                    _ -> #{payload => Payload, pn => 0}
+                end,
             Encoded = quic_packet:encode_long(Type, ?QUIC_VERSION_1, DCID, SCID, Opts),
             %% DCID length is at byte 5
             <<_:5/binary, DCIDLen, _/binary>> = Encoded,
             DCIDLen =:= byte_size(DCID)
-        end).
+        end
+    ).
 
 %%====================================================================
 %% EUnit wrapper
@@ -122,9 +140,15 @@ prop_dcid_length_encoded() ->
 
 proper_test_() ->
     {timeout, 120, [
-        ?_assert(proper:quickcheck(prop_long_header_roundtrip(), [{numtests, 300}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_short_header_roundtrip(), [{numtests, 300}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_encode_deterministic(), [{numtests, 200}, {to_file, user}])),
+        ?_assert(
+            proper:quickcheck(prop_long_header_roundtrip(), [{numtests, 300}, {to_file, user}])
+        ),
+        ?_assert(
+            proper:quickcheck(prop_short_header_roundtrip(), [{numtests, 300}, {to_file, user}])
+        ),
+        ?_assert(
+            proper:quickcheck(prop_encode_deterministic(), [{numtests, 200}, {to_file, user}])
+        ),
         ?_assert(proper:quickcheck(prop_header_form_bit(), [{numtests, 200}, {to_file, user}])),
         ?_assert(proper:quickcheck(prop_dcid_length_encoded(), [{numtests, 200}, {to_file, user}]))
     ]}.

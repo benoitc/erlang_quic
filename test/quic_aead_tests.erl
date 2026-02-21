@@ -14,27 +14,26 @@
 
 nonce_computation_basic_test() ->
     %% Simple test: IV XOR with PN
-    IV = <<0,0,0,0,0,0,0,0,0,0,0,1>>,
+    IV = <<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1>>,
     PN = 0,
     Expected = IV,
     ?assertEqual(Expected, quic_aead:compute_nonce(IV, PN)).
 
 nonce_computation_with_pn_test() ->
     %% PN=1 should flip last bit
-    IV = <<0,0,0,0,0,0,0,0,0,0,0,0>>,
+    IV = <<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>>,
     PN = 1,
-    Expected = <<0,0,0,0,0,0,0,0,0,0,0,1>>,
+    Expected = <<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1>>,
     ?assertEqual(Expected, quic_aead:compute_nonce(IV, PN)).
 
 nonce_computation_large_pn_test() ->
     %% Larger packet number
-    IV = <<16#fa, 16#04, 16#4b, 16#2f, 16#42, 16#a3, 16#fd, 16#3b,
-           16#46, 16#fb, 16#25, 16#5c>>,
+    IV = <<16#fa, 16#04, 16#4b, 16#2f, 16#42, 16#a3, 16#fd, 16#3b, 16#46, 16#fb, 16#25, 16#5c>>,
     PN = 2,
     %% PN=2 in 12-byte form: 00 00 00 00 00 00 00 00 00 00 00 02
     %% XOR with IV
-    Expected = <<16#fa, 16#04, 16#4b, 16#2f, 16#42, 16#a3, 16#fd, 16#3b,
-                 16#46, 16#fb, 16#25, 16#5e>>,
+    Expected =
+        <<16#fa, 16#04, 16#4b, 16#2f, 16#42, 16#a3, 16#fd, 16#3b, 16#46, 16#fb, 16#25, 16#5e>>,
     ?assertEqual(Expected, quic_aead:compute_nonce(IV, PN)).
 
 %%====================================================================
@@ -136,21 +135,23 @@ rfc9001_client_initial_encrypt_test() ->
     AAD = hexstr_to_bin("c000000001088394c8f03e5157080000449e00000002"),
 
     %% Test plaintext (CRYPTO frame + PADDING)
-    Plaintext = hexstr_to_bin("060040f1010000ed0303ebf8fa56f129"
-                              "39b9584a3896472ec40bb863cfd3e868"
-                              "04fe3a47f06a2b69484c000004130113"
-                              "02010000c000000010000e00000b6578"
-                              "616d706c652e636f6dff01000100000a"
-                              "00080006001d00170018001000070005"
-                              "04616c706e0005000501000000000033"
-                              "00260024001d00209370b2c9caa47fba"
-                              "baf4559fedba753de171fa71f50f1ce1"
-                              "5d43e994ec74d748002b000302030400"
-                              "0d0010000e0403050306030203080408"
-                              "050806002d00020101001c0002400100"
-                              "3900320408ffffffffffffffff050480"
-                              "00ffff06048000ffff07048000ffff08"
-                              "01100901100f088394c8f03e515708"),
+    Plaintext = hexstr_to_bin(
+        "060040f1010000ed0303ebf8fa56f129"
+        "39b9584a3896472ec40bb863cfd3e868"
+        "04fe3a47f06a2b69484c000004130113"
+        "02010000c000000010000e00000b6578"
+        "616d706c652e636f6dff01000100000a"
+        "00080006001d00170018001000070005"
+        "04616c706e0005000501000000000033"
+        "00260024001d00209370b2c9caa47fba"
+        "baf4559fedba753de171fa71f50f1ce1"
+        "5d43e994ec74d748002b000302030400"
+        "0d0010000e0403050306030203080408"
+        "050806002d00020101001c0002400100"
+        "3900320408ffffffffffffffff050480"
+        "00ffff06048000ffff07048000ffff08"
+        "01100901100f088394c8f03e515708"
+    ),
 
     Ciphertext = quic_aead:encrypt(Key, IV, PN, AAD, Plaintext),
 
@@ -184,23 +185,37 @@ header_protection_roundtrip_long_test() ->
     %% Long header: first byte has 0x80 bit set
     %% Format: flags (1) + version (4) + DCID len (1) + DCID (8) + SCID len (1) + SCID (8) + ...
     %% PN length is encoded in bits 0-1: 0b11 = 3, so PNLen = 3 + 1 = 4
-    FirstByte = 16#c3,  % Long header, Initial packet, PN len = 4 (bits 0-1 = 3)
-    Header = <<FirstByte,
-               16#00, 16#00, 16#00, 16#01,  % Version
-               16#08,  % DCID length
-               1,2,3,4,5,6,7,8,  % DCID
-               16#08,  % SCID length
-               8,7,6,5,4,3,2,1,  % SCID
-               16#00,  % Token length (varint)
-               16#41, 16#23,  % Length (varint)
-               16#00, 16#00, 16#00, 16#01>>,  % Packet number (4 bytes)
+
+    % Long header, Initial packet, PN len = 4 (bits 0-1 = 3)
+    FirstByte = 16#c3,
+    Header =
+        <<FirstByte,
+            % Version
+            16#00, 16#00, 16#00, 16#01,
+            % DCID length
+            16#08,
+            % DCID
+            1, 2, 3, 4, 5, 6, 7, 8,
+            % SCID length
+            16#08,
+            % SCID
+            8, 7, 6, 5, 4, 3, 2, 1,
+            % Token length (varint)
+            16#00,
+            % Length (varint)
+            16#41, 16#23,
+            % Packet number (4 bytes)
+            16#00, 16#00, 16#00, 16#01>>,
 
     %% Need encrypted payload for sample (at least 20 bytes)
     EncryptedPayload = crypto:strong_rand_bytes(32),
 
     %% PN offset is position of PN in header
-    PNOffset = 1 + 4 + 1 + 8 + 1 + 8 + 1 + 2,  % = 26
-    PNLen = (FirstByte band 16#03) + 1,  % = 4
+
+    % = 26
+    PNOffset = 1 + 4 + 1 + 8 + 1 + 8 + 1 + 2,
+    % = 4
+    PNLen = (FirstByte band 16#03) + 1,
 
     Protected = quic_aead:protect_header(HP, Header, EncryptedPayload, PNOffset),
 
@@ -212,7 +227,9 @@ header_protection_roundtrip_long_test() ->
     EncryptedPayloadWithPN = <<ProtectedPN/binary, EncryptedPayload/binary>>,
 
     %% Unprotect should recover original
-    {Unprotected, UnprotPNLen} = quic_aead:unprotect_header(HP, ProtectedHeaderWithoutPN, EncryptedPayloadWithPN, PNOffset),
+    {Unprotected, UnprotPNLen} = quic_aead:unprotect_header(
+        HP, ProtectedHeaderWithoutPN, EncryptedPayloadWithPN, PNOffset
+    ),
     ?assertEqual(PNLen, UnprotPNLen),
     ?assertEqual(Header, Unprotected).
 
@@ -222,14 +239,21 @@ header_protection_roundtrip_short_test() ->
 
     %% Short header: first byte has 0x80 bit clear
     %% Format: flags (1) + DCID (8) + PN (1-4)
-    FirstByte = 16#40,  % Short header, 1-RTT, spin bit clear, PN len = 1 (bits 0-1 = 0)
-    Header = <<FirstByte,
-               1,2,3,4,5,6,7,8,  % DCID (8 bytes)
-               16#42>>,  % PN (1 byte)
+
+    % Short header, 1-RTT, spin bit clear, PN len = 1 (bits 0-1 = 0)
+    FirstByte = 16#40,
+    Header =
+        <<FirstByte,
+            % DCID (8 bytes)
+            1, 2, 3, 4, 5, 6, 7, 8,
+            % PN (1 byte)
+            16#42>>,
 
     EncryptedPayload = crypto:strong_rand_bytes(32),
-    PNOffset = 9,  % 1 + 8
-    PNLen = (FirstByte band 16#03) + 1,  % = 1
+    % 1 + 8
+    PNOffset = 9,
+    % = 1
+    PNLen = (FirstByte band 16#03) + 1,
 
     Protected = quic_aead:protect_header(HP, Header, EncryptedPayload, PNOffset),
 
@@ -237,7 +261,9 @@ header_protection_roundtrip_short_test() ->
     <<ProtectedHeaderWithoutPN:PNOffset/binary, ProtectedPN:PNLen/binary>> = Protected,
     EncryptedPayloadWithPN = <<ProtectedPN/binary, EncryptedPayload/binary>>,
 
-    {Unprotected, UnprotPNLen} = quic_aead:unprotect_header(HP, ProtectedHeaderWithoutPN, EncryptedPayloadWithPN, PNOffset),
+    {Unprotected, UnprotPNLen} = quic_aead:unprotect_header(
+        HP, ProtectedHeaderWithoutPN, EncryptedPayloadWithPN, PNOffset
+    ),
     ?assertEqual(PNLen, UnprotPNLen),
     ?assertEqual(Header, Unprotected).
 

@@ -141,7 +141,7 @@ multiple_connections_test() ->
 %%====================================================================
 
 ipv4_tuple_address_test() ->
-    {ok, Pid} = quic_connection:start_link({127,0,0,1}, 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link({127, 0, 0, 1}, 4433, #{}, self()),
     ?assert(is_pid(Pid)),
     quic_connection:close(Pid, normal),
     timer:sleep(100).

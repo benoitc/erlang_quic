@@ -25,12 +25,29 @@ decode_preferred_address_ipv4_and_ipv6_test() ->
     CID = crypto:strong_rand_bytes(8),
     Token = crypto:strong_rand_bytes(16),
     Binary = <<
-        192, 168, 1, 100,        % IPv4 address
-        4433:16,                 % IPv4 port
-        16#2001:16, 16#db8:16, 0:16, 0:16, 0:16, 0:16, 0:16, 1:16,  % IPv6 address
-        443:16,                  % IPv6 port
-        8:8, CID/binary,         % CID length + CID
-        Token/binary             % Stateless reset token
+        % IPv4 address
+        192,
+        168,
+        1,
+        100,
+        % IPv4 port
+        4433:16,
+        % IPv6 address
+        16#2001:16,
+        16#db8:16,
+        0:16,
+        0:16,
+        0:16,
+        0:16,
+        0:16,
+        1:16,
+        % IPv6 port
+        443:16,
+        % CID length + CID
+        8:8,
+        CID/binary,
+        % Stateless reset token
+        Token/binary
     >>,
     PA = quic_tls:decode_preferred_address(Binary),
     ?assertEqual({192, 168, 1, 100}, PA#preferred_address.ipv4_addr),
@@ -45,11 +62,19 @@ decode_preferred_address_ipv4_only_test() ->
     CID = crypto:strong_rand_bytes(8),
     Token = crypto:strong_rand_bytes(16),
     Binary = <<
-        10, 0, 0, 1,             % IPv4: 10.0.0.1
-        8443:16,                 % IPv4 port
-        0:128,                   % IPv6: all zeros
-        0:16,                    % IPv6 port: 0
-        8:8, CID/binary,
+        % IPv4: 10.0.0.1
+        10,
+        0,
+        0,
+        1,
+        % IPv4 port
+        8443:16,
+        % IPv6: all zeros
+        0:128,
+        % IPv6 port: 0
+        0:16,
+        8:8,
+        CID/binary,
         Token/binary
     >>,
     PA = quic_tls:decode_preferred_address(Binary),
@@ -63,11 +88,25 @@ decode_preferred_address_ipv6_only_test() ->
     CID = crypto:strong_rand_bytes(8),
     Token = crypto:strong_rand_bytes(16),
     Binary = <<
-        0, 0, 0, 0,              % IPv4: all zeros
-        0:16,                    % IPv4 port: 0
-        16#fe80:16, 0:16, 0:16, 0:16, 0:16, 0:16, 0:16, 1:16,  % IPv6: fe80::1
+        % IPv4: all zeros
+        0,
+        0,
+        0,
+        0,
+        % IPv4 port: 0
+        0:16,
+        % IPv6: fe80::1
+        16#fe80:16,
+        0:16,
+        0:16,
+        0:16,
+        0:16,
+        0:16,
+        0:16,
+        1:16,
         443:16,
-        8:8, CID/binary,
+        8:8,
+        CID/binary,
         Token/binary
     >>,
     PA = quic_tls:decode_preferred_address(Binary),
@@ -121,7 +160,8 @@ encode_preferred_address_ipv6_only_test() ->
     PA = #preferred_address{
         ipv4_addr = undefined,
         ipv4_port = undefined,
-        ipv6_addr = {0, 0, 0, 0, 0, 0, 0, 1},  % ::1
+        % ::1
+        ipv6_addr = {0, 0, 0, 0, 0, 0, 0, 1},
         ipv6_port = 443,
         cid = CID,
         stateless_reset_token = Token
@@ -236,11 +276,19 @@ preferred_address_port_zero_test() ->
     %% Port 0 with a valid address should still be considered valid
     %% (though unusual in practice)
     Binary = <<
-        192, 168, 1, 1,          % IPv4 address (non-zero)
-        0:16,                    % IPv4 port = 0
-        0:128,                   % IPv6: all zeros
-        0:16,                    % IPv6 port: 0
-        8:8, CID/binary,
+        % IPv4 address (non-zero)
+        192,
+        168,
+        1,
+        1,
+        % IPv4 port = 0
+        0:16,
+        % IPv6: all zeros
+        0:128,
+        % IPv6 port: 0
+        0:16,
+        8:8,
+        CID/binary,
         Token/binary
     >>,
     PA = quic_tls:decode_preferred_address(Binary),

@@ -29,10 +29,15 @@
 ]).
 
 %% Maximum values for each encoding length
--define(MAX_1BYTE, 63).                          % 2^6 - 1
--define(MAX_2BYTE, 16383).                       % 2^14 - 1
--define(MAX_4BYTE, 1073741823).                  % 2^30 - 1
--define(MAX_8BYTE, 4611686018427387903).         % 2^62 - 1
+
+% 2^6 - 1
+-define(MAX_1BYTE, 63).
+% 2^14 - 1
+-define(MAX_2BYTE, 16383).
+% 2^30 - 1
+-define(MAX_4BYTE, 1073741823).
+% 2^62 - 1
+-define(MAX_8BYTE, 4611686018427387903).
 
 %%====================================================================
 %% API
@@ -103,4 +108,5 @@ needed_bytes(<<First, _/binary>>) ->
         2 -> 4;
         3 -> 8
     end;
-needed_bytes(<<>>) -> 1.
+needed_bytes(<<>>) ->
+    1.

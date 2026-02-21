@@ -238,10 +238,11 @@ compute_psk_binder(EarlySecret, TruncatedClientHelloHash, Type) ->
 -spec compute_psk_binder(atom(), binary(), binary(), resumption | external) -> binary().
 compute_psk_binder(Cipher, EarlySecret, TruncatedClientHelloHash, Type) ->
     Hash = cipher_to_hash(Cipher),
-    Label = case Type of
-        resumption -> <<"res binder">>;
-        external -> <<"ext binder">>
-    end,
+    Label =
+        case Type of
+            resumption -> <<"res binder">>;
+            external -> <<"ext binder">>
+        end,
     %% binder_key = Derive-Secret(early_secret, label, "")
     %% For empty context, derive_secret uses Hash("") as per RFC 8446
     BinderKey = derive_secret(Hash, EarlySecret, Label, <<>>),
@@ -266,10 +267,12 @@ derive_secret(Hash, Secret, Label, Messages) ->
     %% If Messages is already hash-length, assume it's pre-hashed
     %% Otherwise, compute Transcript-Hash(Messages) = Hash(Messages)
     %% RFC 8446: Even for empty Messages, use Hash("") not empty binary
-    Context = case byte_size(Messages) of
-        HashLen -> Messages;
-        _ -> transcript_hash(Hash, Messages)  % Includes empty case: Hash("")
-    end,
+    Context =
+        case byte_size(Messages) of
+            HashLen -> Messages;
+            % Includes empty case: Hash("")
+            _ -> transcript_hash(Hash, Messages)
+        end,
     quic_hkdf:expand_label(Hash, Secret, Label, Context, HashLen).
 
 %%====================================================================
@@ -327,9 +330,11 @@ transcript_hash(HashOrCipher, Messages) ->
 cipher_to_hash(aes_128_gcm) -> sha256;
 cipher_to_hash(aes_256_gcm) -> sha384;
 cipher_to_hash(chacha20_poly1305) -> sha256;
-cipher_to_hash(sha256) -> sha256;  % Pass-through for hash atoms
+% Pass-through for hash atoms
+cipher_to_hash(sha256) -> sha256;
 cipher_to_hash(sha384) -> sha384;
-cipher_to_hash(_) -> sha256.  % Default to SHA-256
+% Default to SHA-256
+cipher_to_hash(_) -> sha256.
 
 %%====================================================================
 %% ECDHE Key Exchange
@@ -345,8 +350,11 @@ generate_key_pair(Curve) ->
 
 %% @doc Compute ECDHE shared secret.
 %% shared_secret = ECDH(our_private, their_public)
--spec compute_shared_secret(x25519 | x448 | secp256r1 | secp384r1,
-                            binary(), binary()) -> binary().
+-spec compute_shared_secret(
+    x25519 | x448 | secp256r1 | secp384r1,
+    binary(),
+    binary()
+) -> binary().
 compute_shared_secret(Curve, OurPrivate, TheirPublic) ->
     crypto:compute_key(ecdh, TheirPublic, OurPrivate, Curve).
 
@@ -355,16 +363,22 @@ compute_shared_secret(Curve, OurPrivate, TheirPublic) ->
 %%====================================================================
 
 %% RFC 9001 Section 5.8 - Retry Integrity Key and Nonce for QUIC v1
--define(RETRY_INTEGRITY_KEY_V1, <<16#be, 16#0c, 16#69, 16#0b, 16#9f, 16#66, 16#57, 16#5a,
-                                  16#1d, 16#76, 16#6b, 16#54, 16#e3, 16#68, 16#c8, 16#4e>>).
--define(RETRY_INTEGRITY_NONCE_V1, <<16#46, 16#15, 16#99, 16#d3, 16#5d, 16#63, 16#2b, 16#f2,
-                                   16#23, 16#98, 16#25, 16#bb>>).
+-define(RETRY_INTEGRITY_KEY_V1,
+    <<16#be, 16#0c, 16#69, 16#0b, 16#9f, 16#66, 16#57, 16#5a, 16#1d, 16#76, 16#6b, 16#54, 16#e3,
+        16#68, 16#c8, 16#4e>>
+).
+-define(RETRY_INTEGRITY_NONCE_V1,
+    <<16#46, 16#15, 16#99, 16#d3, 16#5d, 16#63, 16#2b, 16#f2, 16#23, 16#98, 16#25, 16#bb>>
+).
 
 %% RFC 9001 Section 5.8 - Retry Integrity Key and Nonce for QUIC v2
--define(RETRY_INTEGRITY_KEY_V2, <<16#8f, 16#b4, 16#b0, 16#1b, 16#56, 16#ac, 16#48, 16#e2,
-                                  16#60, 16#fb, 16#cb, 16#ce, 16#ad, 16#7c, 16#ba, 16#00>>).
--define(RETRY_INTEGRITY_NONCE_V2, <<16#d8, 16#69, 16#69, 16#50, 16#c9, 16#06, 16#79, 16#a4,
-                                   16#da, 16#88, 16#7e, 16#ce>>).
+-define(RETRY_INTEGRITY_KEY_V2,
+    <<16#8f, 16#b4, 16#b0, 16#1b, 16#56, 16#ac, 16#48, 16#e2, 16#60, 16#fb, 16#cb, 16#ce, 16#ad,
+        16#7c, 16#ba, 16#00>>
+).
+-define(RETRY_INTEGRITY_NONCE_V2,
+    <<16#d8, 16#69, 16#69, 16#50, 16#c9, 16#06, 16#79, 16#a4, 16#da, 16#88, 16#7e, 16#ce>>
+).
 
 %% @doc Verify the integrity tag of a Retry packet.
 %% RFC 9001 Section 5.8:
@@ -394,7 +408,9 @@ compute_retry_integrity_tag(OriginalDCID, RetryPacketWithoutTag, Version) ->
     PseudoPacket = <<ODCIDLen, OriginalDCID/binary, RetryPacketWithoutTag/binary>>,
     %% AEAD encrypt with empty plaintext (tag only)
     %% crypto_one_time_aead returns {Ciphertext, Tag} for encryption
-    {<<>>, Tag} = crypto:crypto_one_time_aead(aes_128_gcm, Key, Nonce, <<>>, PseudoPacket, 16, true),
+    {<<>>, Tag} = crypto:crypto_one_time_aead(
+        aes_128_gcm, Key, Nonce, <<>>, PseudoPacket, 16, true
+    ),
     Tag.
 
 %% Get the retry integrity key and nonce for a QUIC version

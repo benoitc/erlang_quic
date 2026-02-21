@@ -64,9 +64,12 @@
 
 %% Constants from RFC 9002
 -define(PACKET_THRESHOLD, 3).
--define(TIME_THRESHOLD, 1.125).  % 9/8
--define(GRANULARITY, 1).  % 1 millisecond
--define(INITIAL_RTT, 333).  % 333 milliseconds
+% 9/8
+-define(TIME_THRESHOLD, 1.125).
+% 1 millisecond
+-define(GRANULARITY, 1).
+% 333 milliseconds
+-define(INITIAL_RTT, 333).
 
 %% Loss detection state
 -record(loss_state, {
@@ -126,8 +129,13 @@ on_packet_sent(State, PacketNumber, Size, AckEliciting) ->
 %% @doc Record that a packet was sent with frames.
 -spec on_packet_sent(loss_state(), non_neg_integer(), non_neg_integer(), boolean(), [term()]) ->
     loss_state().
-on_packet_sent(#loss_state{sent_packets = Sent, bytes_in_flight = InFlight} = State,
-               PacketNumber, Size, AckEliciting, Frames) ->
+on_packet_sent(
+    #loss_state{sent_packets = Sent, bytes_in_flight = InFlight} = State,
+    PacketNumber,
+    Size,
+    AckEliciting,
+    Frames
+) ->
     Now = erlang:monotonic_time(millisecond),
     SentPacket = #sent_packet{
         pn = PacketNumber,
@@ -137,14 +145,16 @@ on_packet_sent(#loss_state{sent_packets = Sent, bytes_in_flight = InFlight} = St
         size = Size,
         frames = Frames
     },
-    NewInFlight = case AckEliciting of
-        true -> InFlight + Size;
-        false -> InFlight
-    end,
+    NewInFlight =
+        case AckEliciting of
+            true -> InFlight + Size;
+            false -> InFlight
+        end,
     State#loss_state{
         sent_packets = maps:put(PacketNumber, SentPacket, Sent),
         bytes_in_flight = NewInFlight,
-        pto_count = 0  % Reset PTO count on new packet
+        % Reset PTO count on new packet
+        pto_count = 0
     }.
 
 %% @doc Process an ACK frame.
@@ -159,26 +169,29 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
         AckedPNs ->
             %% Find packets that were acknowledged
             {AckedPackets, NewSent, RemovedBytes} = remove_acked_packets(
-                AckedPNs, State#loss_state.sent_packets),
+                AckedPNs, State#loss_state.sent_packets
+            ),
 
             %% Update RTT if we got the largest acknowledged
-            NewState1 = case lists:member(LargestAcked, AckedPNs) of
-                true ->
-                    case maps:get(LargestAcked, State#loss_state.sent_packets, undefined) of
-                        #sent_packet{time_sent = TimeSent, ack_eliciting = true} ->
-                            LatestRTT = Now - TimeSent,
-                            AckDelayMs = ack_delay_to_ms(AckDelay, State),
-                            update_rtt(State, LatestRTT, AckDelayMs);
-                        _ ->
-                            State
-                    end;
-                false ->
-                    State
-            end,
+            NewState1 =
+                case lists:member(LargestAcked, AckedPNs) of
+                    true ->
+                        case maps:get(LargestAcked, State#loss_state.sent_packets, undefined) of
+                            #sent_packet{time_sent = TimeSent, ack_eliciting = true} ->
+                                LatestRTT = Now - TimeSent,
+                                AckDelayMs = ack_delay_to_ms(AckDelay, State),
+                                update_rtt(State, LatestRTT, AckDelayMs);
+                            _ ->
+                                State
+                        end;
+                    false ->
+                        State
+                end,
 
             %% Detect lost packets
             {LostPackets, NewSent2, LostBytes} = detect_lost_packets(
-                NewSent, NewState1#loss_state.smoothed_rtt, LargestAcked, Now),
+                NewSent, NewState1#loss_state.smoothed_rtt, LargestAcked, Now
+            ),
 
             %% Update state
             NewInFlight = max(0, State#loss_state.bytes_in_flight - RemovedBytes - LostBytes),
@@ -191,7 +204,6 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
 
             {NewState2, AckedPackets, LostPackets}
     end;
-
 on_ack_received(State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, _, _, _}, Now) ->
     on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now).
 
@@ -202,8 +214,10 @@ on_ack_received(State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, 
 %% @doc Detect lost packets based on time and packet thresholds.
 -spec detect_lost_packets(loss_state(), non_neg_integer()) ->
     {loss_state(), [#sent_packet{}]}.
-detect_lost_packets(#loss_state{sent_packets = Sent, smoothed_rtt = SRTT} = State,
-                    LargestAcked) ->
+detect_lost_packets(
+    #loss_state{sent_packets = Sent, smoothed_rtt = SRTT} = State,
+    LargestAcked
+) ->
     Now = erlang:monotonic_time(millisecond),
     {LostPackets, NewSent, LostBytes} = detect_lost_packets(Sent, SRTT, LargestAcked, Now),
     NewState = State#loss_state{
@@ -219,8 +233,12 @@ detect_lost_packets(SentPackets, SmoothedRTT, LargestAcked, Now) ->
 
     %% Find lost packets
     {Lost, Remaining, LostBytes} = maps:fold(
-        fun(PN, #sent_packet{time_sent = TimeSent, size = Size, in_flight = true} = Packet,
-            {LostAcc, RemAcc, BytesAcc}) ->
+        fun
+            (
+                PN,
+                #sent_packet{time_sent = TimeSent, size = Size, in_flight = true} = Packet,
+                {LostAcc, RemAcc, BytesAcc}
+            ) ->
                 %% Check packet threshold
                 PacketLost = (LargestAcked - PN) >= ?PACKET_THRESHOLD,
                 %% Check time threshold
@@ -232,7 +250,7 @@ detect_lost_packets(SentPackets, SmoothedRTT, LargestAcked, Now) ->
                     false ->
                         {LostAcc, maps:put(PN, Packet, RemAcc), BytesAcc}
                 end;
-           (PN, Packet, {LostAcc, RemAcc, BytesAcc}) ->
+            (PN, Packet, {LostAcc, RemAcc, BytesAcc}) ->
                 {LostAcc, maps:put(PN, Packet, RemAcc), BytesAcc}
         end,
         {[], #{}, 0},
@@ -248,19 +266,23 @@ get_loss_time_and_space(#loss_state{sent_packets = Sent, smoothed_rtt = SRTT}) -
     LossDelay = max(trunc(?TIME_THRESHOLD * SRTT), ?GRANULARITY),
 
     %% Find earliest packet that might be declared lost
-    case maps:fold(
-        fun(_PN, #sent_packet{time_sent = TimeSent, in_flight = true}, undefined) ->
-                TimeSent + LossDelay;
-           (_PN, #sent_packet{time_sent = TimeSent, in_flight = true}, Earliest) ->
-                min(TimeSent + LossDelay, Earliest);
-           (_, _, Acc) ->
-                Acc
-        end,
-        undefined,
-        Sent
-    ) of
+    case
+        maps:fold(
+            fun
+                (_PN, #sent_packet{time_sent = TimeSent, in_flight = true}, undefined) ->
+                    TimeSent + LossDelay;
+                (_PN, #sent_packet{time_sent = TimeSent, in_flight = true}, Earliest) ->
+                    min(TimeSent + LossDelay, Earliest);
+                (_, _, Acc) ->
+                    Acc
+            end,
+            undefined,
+            Sent
+        )
+    of
         undefined -> {undefined, initial};
-        Time -> {Time, initial}  % Simplified: always return initial space
+        % Simplified: always return initial space
+        Time -> {Time, initial}
     end.
 
 %%====================================================================
@@ -278,16 +300,25 @@ update_rtt(#loss_state{first_rtt_sample = false} = State, LatestRTT, _AckDelay) 
         min_rtt = LatestRTT,
         first_rtt_sample = true
     };
-update_rtt(#loss_state{smoothed_rtt = SRTT, rtt_var = RTTVAR, min_rtt = MinRTT,
-                       max_ack_delay = MaxAckDelay} = State, LatestRTT, AckDelay) ->
+update_rtt(
+    #loss_state{
+        smoothed_rtt = SRTT,
+        rtt_var = RTTVAR,
+        min_rtt = MinRTT,
+        max_ack_delay = MaxAckDelay
+    } = State,
+    LatestRTT,
+    AckDelay
+) ->
     %% Update min RTT
     NewMinRTT = min(MinRTT, LatestRTT),
 
     %% Adjust for ACK delay
-    AdjustedRTT = case LatestRTT > NewMinRTT + AckDelay of
-        true -> LatestRTT - min(AckDelay, MaxAckDelay);
-        false -> LatestRTT
-    end,
+    AdjustedRTT =
+        case LatestRTT > NewMinRTT + AckDelay of
+            true -> LatestRTT - min(AckDelay, MaxAckDelay);
+            false -> LatestRTT
+        end,
 
     %% Update smoothed RTT and variance (RFC 9002 Section 5.3)
     %% rttvar = 3/4 * rttvar + 1/4 * |smoothed_rtt - adjusted_rtt|
@@ -325,8 +356,12 @@ min_rtt(#loss_state{min_rtt = M}) -> M.
 %% @doc Calculate the Probe Timeout.
 %% PTO = smoothed_rtt + max(4 * rttvar, kGranularity) + max_ack_delay
 -spec get_pto(loss_state()) -> non_neg_integer().
-get_pto(#loss_state{smoothed_rtt = SRTT, rtt_var = RTTVAR,
-                    max_ack_delay = MaxAckDelay, pto_count = PTOCount}) ->
+get_pto(#loss_state{
+    smoothed_rtt = SRTT,
+    rtt_var = RTTVAR,
+    max_ack_delay = MaxAckDelay,
+    pto_count = PTOCount
+}) ->
     PTO = SRTT + max(4 * RTTVAR, ?GRANULARITY) + MaxAckDelay,
     %% Exponential backoff
     PTO bsl PTOCount.
