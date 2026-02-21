@@ -59,9 +59,18 @@ stop(Sup) ->
     ok.
 
 %% @doc Get list of listener PIDs in the pool.
+%% Navigates to quic_listener_sup_sup to find actual quic_listener processes.
 -spec get_listeners(pid()) -> [pid()].
 get_listeners(Sup) ->
-    [Pid || {_Id, Pid, _Type, _Modules} <- supervisor:which_children(Sup), is_pid(Pid)].
+    Children = supervisor:which_children(Sup),
+    case lists:keyfind(quic_listener_sup_sup, 1, Children) of
+        {quic_listener_sup_sup, SupSupPid, _, _} when is_pid(SupSupPid) ->
+            %% Get actual listeners from the listener_sup_sup
+            [Pid || {{quic_listener, _}, Pid, _, _} <- supervisor:which_children(SupSupPid),
+                    is_pid(Pid)];
+        _ ->
+            []
+    end.
 
 %%====================================================================
 %% supervisor callbacks
