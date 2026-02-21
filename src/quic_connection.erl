@@ -31,6 +31,7 @@
 
 -behaviour(gen_statem).
 
+-include_lib("public_key/include/public_key.hrl").
 -include("quic.hrl").
 
 %% Suppress warnings for helper functions prepared for future use
@@ -3367,16 +3368,16 @@ derive_initial_keys(DCID) ->
     {ClientKeys, ServerKeys}.
 
 %% Select signature algorithm based on private key type
-select_signature_algorithm({'ECPrivateKey', _, _, {namedCurve, {1, 2, 840, 10045, 3, 1, 7}}, _, _}) ->
+select_signature_algorithm(#'ECPrivateKey'{parameters = {namedCurve, ?secp192r1}}) ->
     %% secp256r1 / P-256
     ?SIG_ECDSA_SECP256R1_SHA256;
-select_signature_algorithm({'ECPrivateKey', _, _, {namedCurve, {1, 3, 132, 0, 34}}, _, _}) ->
+select_signature_algorithm(#'ECPrivateKey'{parameters = {namedCurve, ?secp384r1}}) ->
     %% secp384r1 / P-384
     ?SIG_ECDSA_SECP384R1_SHA384;
-select_signature_algorithm({'ECPrivateKey', _, _, _, _, _}) ->
+select_signature_algorithm(#'ECPrivateKey'{}) ->
     %% Default EC to P-256
     ?SIG_ECDSA_SECP256R1_SHA256;
-select_signature_algorithm({'RSAPrivateKey', _, _, _, _, _, _, _, _, _, _}) ->
+select_signature_algorithm(#'RSAPrivateKey'{}) ->
     ?SIG_RSA_PSS_RSAE_SHA256;
 select_signature_algorithm(_) ->
     %% Default to RSA PSS
