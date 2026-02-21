@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.10.0] - Unreleased
+## [0.10.0] - 2026-02-21
 
 ### Added
 - RFC 9312 QUIC-LB Connection ID encoding support for load balancer routing
