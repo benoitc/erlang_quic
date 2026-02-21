@@ -18,12 +18,12 @@
 %%% - CR (Config Rotation): 3 bits identifying the configuration
 %%% - Length: 5 bits (CID length - 1, so 0-19 maps to 1-20 bytes)
 %%%
-%%% ```
+%%% <pre>
 %%% +--------+----------------+--------+
 %%% | CR:3   | Server ID      | Nonce  |
 %%% | Len:5  | (1-15 bytes)   | (4-18) |
 %%% +--------+----------------+--------+
-%%% ```
+%%% </pre>
 %%%
 %%% == Algorithms ==
 %%%
