@@ -19,6 +19,8 @@ All notable changes to this project will be documented in this file.
 - E2E test suite `quic_lb_e2e_SUITE` with 21 integration tests
 - `quic:server_spec/3` to get a child spec for embedding QUIC servers in custom
   supervision trees
+- Stream reassembly test suite `quic_stream_reassembly_SUITE` for ordered delivery
+  verification
 
 ### Changed
 - `quic:set_owner/2` is now asynchronous (cast instead of call)
@@ -48,6 +50,10 @@ All notable changes to this project will be documented in this file.
   memory exhaustion from slow handshakes
 - Buffer contiguity calculation now has iteration limit to prevent stack overflow
   with highly fragmented receive buffers
+- Stream data is now properly reassembled before delivery: previously data was
+  delivered immediately as received, causing corruption when packets arrived out
+  of order during large file transfers. Data is still streamed incrementally as
+  contiguous chunks become available
 
 ## [0.9.0] - 2026-02-20
 

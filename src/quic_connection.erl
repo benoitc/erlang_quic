@@ -2865,18 +2865,44 @@ process_stream_data(StreamId, Offset, Data, Fin, State) ->
                 recv_offset = 0,
                 recv_max_data = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
                 recv_fin = false,
-                recv_buffer = <<>>,
+                recv_buffer = #{},  %% Map for out-of-order reassembly
                 final_size = undefined
             }
     end,
 
-    %% For now, deliver data immediately (ignoring out-of-order for simplicity)
-    Owner ! {quic, Ref, {stream_data, StreamId, Data, Fin}},
+    %% Store data in buffer at its offset (handles duplicates gracefully)
+    RecvBuffer = case Stream#stream_state.recv_buffer of
+        B when is_map(B) -> B;
+        _ -> #{}  %% Upgrade old binary buffer format
+    end,
+    UpdatedBuffer = maps:put(Offset, Data, RecvBuffer),
 
-    NewRecvOffset = Offset + byte_size(Data),
+    %% Track FIN position if received
+    FinalSize = case Fin of
+        true -> Offset + byte_size(Data);
+        false -> Stream#stream_state.final_size
+    end,
+
+    %% Extract contiguous data starting from recv_offset and deliver it
+    CurrentOffset = Stream#stream_state.recv_offset,
+    {DeliverData, NewRecvOffset, NewBuffer} = extract_contiguous_data(UpdatedBuffer, CurrentOffset),
+
+    %% Determine if we should deliver FIN (all data up to FIN has been delivered)
+    DeliverFin = FinalSize =/= undefined andalso NewRecvOffset >= FinalSize,
+
+    %% Deliver contiguous data to owner (may be empty if out-of-order)
+    case DeliverData of
+        <<>> ->
+            ok;  %% No contiguous data to deliver yet
+        _ ->
+            Owner ! {quic, Ref, {stream_data, StreamId, DeliverData, DeliverFin}}
+    end,
+
     NewStream = Stream#stream_state{
         recv_offset = NewRecvOffset,
-        recv_fin = Fin
+        recv_fin = DeliverFin,
+        recv_buffer = NewBuffer,
+        final_size = FinalSize
     },
 
     %% Track connection-level data received (RFC 9000 Section 4.1)
@@ -2918,6 +2944,23 @@ process_stream_data(StreamId, Offset, Data, Fin, State) ->
 
     %% ACK is sent at packet level by maybe_send_ack
     State3.
+
+%% Extract contiguous data from buffer starting at Offset
+%% Returns {Data, NewOffset, UpdatedBuffer}
+extract_contiguous_data(Buffer, Offset) ->
+    extract_contiguous_data(Buffer, Offset, []).
+
+extract_contiguous_data(Buffer, Offset, Acc) ->
+    case maps:take(Offset, Buffer) of
+        {Data, NewBuffer} ->
+            %% Found data at this offset, continue looking for next chunk
+            NextOffset = Offset + byte_size(Data),
+            extract_contiguous_data(NewBuffer, NextOffset, [Data | Acc]);
+        error ->
+            %% No data at this offset (gap in stream)
+            DeliveredData = iolist_to_binary(lists:reverse(Acc)),
+            {DeliveredData, Offset, Buffer}
+    end.
 
 %%====================================================================
 %% Internal Functions - Helpers
@@ -3207,7 +3250,7 @@ do_open_stream(#state{next_stream_id_bidi = NextId,
                 recv_offset = 0,
                 recv_max_data = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
                 recv_fin = false,
-                recv_buffer = <<>>,
+                recv_buffer = #{},
                 final_size = undefined
             },
             NewState = State#state{
@@ -3239,7 +3282,7 @@ do_open_unidirectional_stream(#state{next_stream_id_uni = NextId,
                 recv_offset = 0,
                 recv_max_data = 0,  % We don't receive on our uni streams
                 recv_fin = true,    % No incoming data expected
-                recv_buffer = <<>>,
+                recv_buffer = #{},
                 final_size = undefined
             },
             NewState = State#state{

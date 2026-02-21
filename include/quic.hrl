@@ -385,7 +385,7 @@
     recv_offset :: non_neg_integer(),
     recv_max_data :: non_neg_integer(),
     recv_fin :: boolean(),
-    recv_buffer :: binary(),
+    recv_buffer :: map(),  %% #{Offset => Data} for out-of-order reassembly
 
     %% Final size (set when FIN received)
     final_size :: non_neg_integer() | undefined,
