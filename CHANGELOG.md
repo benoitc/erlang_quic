@@ -54,6 +54,10 @@ All notable changes to this project will be documented in this file.
   delivered immediately as received, causing corruption when packets arrived out
   of order during large file transfers. Data is still streamed incrementally as
   contiguous chunks become available
+- Server connections no longer modify listener's socket active state: server-side
+  connections were calling `inet:setopts(Socket, [{active, once}])` on the shared
+  listener socket, overriding the listener's `{active, N}` configuration and
+  causing the socket to go passive after receiving packets
 
 ## [0.9.0] - 2026-02-20
 
