@@ -578,19 +578,19 @@ decode_tp_value(_, Value) ->
 %%   Stateless reset: 16 bytes
 -spec decode_preferred_address(binary()) -> preferred_address().
 decode_preferred_address(<<
-    IPv4_A:8,
-    IPv4_B:8,
-    IPv4_C:8,
-    IPv4_D:8,
+    IPv4A:8,
+    IPv4B:8,
+    IPv4C:8,
+    IPv4D:8,
     IPv4Port:16,
-    IPv6_1:16,
-    IPv6_2:16,
-    IPv6_3:16,
-    IPv6_4:16,
-    IPv6_5:16,
-    IPv6_6:16,
-    IPv6_7:16,
-    IPv6_8:16,
+    IPv6a:16,
+    IPv6b:16,
+    IPv6c:16,
+    IPv6d:16,
+    IPv6e:16,
+    IPv6f:16,
+    IPv6g:16,
+    IPv6h:16,
     IPv6Port:16,
     CIDLen:8,
     CID:CIDLen/binary,
@@ -599,15 +599,15 @@ decode_preferred_address(<<
 >>) ->
     %% Parse IPv4 - zero address means not present
     {IPv4Addr, IPv4PortVal} =
-        case {IPv4_A, IPv4_B, IPv4_C, IPv4_D, IPv4Port} of
+        case {IPv4A, IPv4B, IPv4C, IPv4D, IPv4Port} of
             {0, 0, 0, 0, 0} -> {undefined, undefined};
-            _ -> {{IPv4_A, IPv4_B, IPv4_C, IPv4_D}, IPv4Port}
+            _ -> {{IPv4A, IPv4B, IPv4C, IPv4D}, IPv4Port}
         end,
     %% Parse IPv6 - zero address means not present
     {IPv6Addr, IPv6PortVal} =
-        case {IPv6_1, IPv6_2, IPv6_3, IPv6_4, IPv6_5, IPv6_6, IPv6_7, IPv6_8, IPv6Port} of
+        case {IPv6a, IPv6b, IPv6c, IPv6d, IPv6e, IPv6f, IPv6g, IPv6h, IPv6Port} of
             {0, 0, 0, 0, 0, 0, 0, 0, 0} -> {undefined, undefined};
-            _ -> {{IPv6_1, IPv6_2, IPv6_3, IPv6_4, IPv6_5, IPv6_6, IPv6_7, IPv6_8}, IPv6Port}
+            _ -> {{IPv6a, IPv6b, IPv6c, IPv6d, IPv6e, IPv6f, IPv6g, IPv6h}, IPv6Port}
         end,
     #preferred_address{
         ipv4_addr = IPv4Addr,

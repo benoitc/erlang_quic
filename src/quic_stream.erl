@@ -471,7 +471,7 @@ drain_buffer(Buffer, Remaining, Acc, Total) ->
     case queue:out(Buffer) of
         {empty, _} ->
             {iolist_to_binary(lists:reverse(Acc)), Buffer, Total};
-        {{value, {_Offset, Data}}, NewBuffer} ->
+        {{value, {Offset, Data}}, NewBuffer} ->
             Size = byte_size(Data),
             if
                 Size =< Remaining ->
@@ -480,7 +480,7 @@ drain_buffer(Buffer, Remaining, Acc, Total) ->
                     %% Split the chunk
                     <<Take:Remaining/binary, Rest/binary>> = Data,
                     %% Put the rest back
-                    FinalBuffer = queue:in_r({_Offset + Remaining, Rest}, NewBuffer),
+                    FinalBuffer = queue:in_r({Offset + Remaining, Rest}, NewBuffer),
                     {iolist_to_binary(lists:reverse([Take | Acc])), FinalBuffer, Total + Remaining}
             end
     end.
