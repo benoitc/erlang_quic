@@ -31,6 +31,8 @@ All notable changes to this project will be documented in this file.
   instead of actual listener processes
 - Removed redundant `link/1` call in listener (connection already linked via
   `gen_statem:start_link`)
+- Unhandled calls in connection state machine now return `{error, {invalid_state, State}}`
+  instead of silently timing out
 - Server-side connection termination no longer closes shared listener socket:
   previously when a server connection terminated, it would close the UDP socket
   shared with the listener, breaking all subsequent connections

@@ -1136,6 +1136,10 @@ handle_common_event(info, idle_timeout, _StateName, State) ->
 handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     {keep_state, State};
 
+%% Return error for unhandled calls to prevent timeout
+handle_common_event({call, From}, _Request, StateName, State) ->
+    {keep_state, State, [{reply, From, {error, {invalid_state, StateName}}}]};
+
 handle_common_event(_EventType, _EventContent, _StateName, State) ->
     {keep_state, State}.
 
