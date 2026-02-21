@@ -3443,13 +3443,16 @@ reconstruct_pn(LargestPN, TruncatedPN, PNLen) ->
             _ -> LargestPN + 1
         end,
     CandidatePN = (ExpectedPN band (bnot PNMask)) bor TruncatedPN,
-    if
-        CandidatePN =< ExpectedPN - PNHWin, CandidatePN < (1 bsl 62) - PNWin ->
-            CandidatePN + PNWin;
-        CandidatePN > ExpectedPN + PNHWin, CandidatePN >= PNWin ->
-            CandidatePN - PNWin;
+    case CandidatePN =< ExpectedPN - PNHWin andalso CandidatePN < (1 bsl 62) - PNWin of
         true ->
-            CandidatePN
+            CandidatePN + PNWin;
+        false ->
+            case CandidatePN > ExpectedPN + PNHWin andalso CandidatePN >= PNWin of
+                true ->
+                    CandidatePN - PNWin;
+                false ->
+                    CandidatePN
+            end
     end.
 
 update_pn_space_recv(PN, PNSpace) ->
@@ -3517,10 +3520,10 @@ do_open_stream(
             Streams
         )
     ),
-    if
-        StreamCount >= Max ->
-            {error, stream_limit};
+    case StreamCount >= Max of
         true ->
+            {error, stream_limit};
+        false ->
             StreamState = #stream_state{
                 id = NextId,
                 state = open,
@@ -3558,10 +3561,10 @@ do_open_unidirectional_stream(
             Streams
         )
     ),
-    if
-        StreamCount >= Max ->
-            {error, stream_limit};
+    case StreamCount >= Max of
         true ->
+            {error, stream_limit};
+        false ->
             %% Unidirectional streams are send-only for the initiator
             StreamState = #stream_state{
                 id = NextId,
@@ -3942,10 +3945,10 @@ initiate_close(Reason, State) ->
 check_timeouts(State) ->
     Now = erlang:monotonic_time(millisecond),
     TimeSinceActivity = Now - State#state.last_activity,
-    if
-        TimeSinceActivity > State#state.idle_timeout ->
-            initiate_close(idle_timeout, State);
+    case TimeSinceActivity > State#state.idle_timeout of
         true ->
+            initiate_close(idle_timeout, State);
+        false ->
             State
     end.
 

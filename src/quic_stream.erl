@@ -473,10 +473,10 @@ drain_buffer(Buffer, Remaining, Acc, Total) ->
             {iolist_to_binary(lists:reverse(Acc)), Buffer, Total};
         {{value, {Offset, Data}}, NewBuffer} ->
             Size = byte_size(Data),
-            if
-                Size =< Remaining ->
-                    drain_buffer(NewBuffer, Remaining - Size, [Data | Acc], Total + Size);
+            case Size =< Remaining of
                 true ->
+                    drain_buffer(NewBuffer, Remaining - Size, [Data | Acc], Total + Size);
+                false ->
                     %% Split the chunk
                     <<Take:Remaining/binary, Rest/binary>> = Data,
                     %% Put the rest back
@@ -525,10 +525,10 @@ read_from_buffer(Buffer, Offset, Remaining, Acc) ->
         {value, Data} ->
             Size = byte_size(Data),
             NewBuffer = gb_trees:delete(Offset, Buffer),
-            if
-                Size =< Remaining ->
-                    read_from_buffer(NewBuffer, Offset + Size, Remaining - Size, [Data | Acc]);
+            case Size =< Remaining of
                 true ->
+                    read_from_buffer(NewBuffer, Offset + Size, Remaining - Size, [Data | Acc]);
+                false ->
                     <<Take:Remaining/binary, Rest/binary>> = Data,
                     FinalBuffer = gb_trees:enter(Offset + Remaining, Rest, NewBuffer),
                     {iolist_to_binary(lists:reverse([Take | Acc])), FinalBuffer}
