@@ -2,7 +2,11 @@
 
 PROJECT = quic
 PROJECT_DESCRIPTION = Pure Erlang QUIC implementation (RFC 9000).
-PROJECT_VERSION = 0.10.1
+PROJECT_VERSION = 0.10.2
+
+# Options.
+
+ERLC_OPTS = +debug_info
 
 # Dependencies.
 
