@@ -807,9 +807,12 @@ idle(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
     check_state_transition(idle, NewState);
 
-idle(cast, process, State) ->
-    %% Re-enable socket for receiving
-    inet:setopts(State#state.socket, [{active, once}]),
+idle(cast, process, #state{role = client, socket = Socket} = State) ->
+    %% Re-enable socket for receiving (client only - server uses listener's socket)
+    inet:setopts(Socket, [{active, once}]),
+    {keep_state, State};
+idle(cast, process, #state{role = server} = State) ->
+    %% Server connections receive via listener, don't touch socket options
     {keep_state, State};
 
 idle(EventType, EventContent, State) ->
@@ -878,8 +881,12 @@ handshaking(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = Stat
     NewState = handle_packet(Data, State),
     check_state_transition(handshaking, NewState);
 
-handshaking(cast, process, State) ->
-    inet:setopts(State#state.socket, [{active, once}]),
+handshaking(cast, process, #state{role = client, socket = Socket} = State) ->
+    %% Re-enable socket for receiving (client only - server uses listener's socket)
+    inet:setopts(Socket, [{active, once}]),
+    {keep_state, State};
+handshaking(cast, process, #state{role = server} = State) ->
+    %% Server connections receive via listener, don't touch socket options
     {keep_state, State};
 
 handshaking(EventType, EventContent, State) ->
@@ -1042,8 +1049,12 @@ connected(cast, {close, Reason}, State) ->
     NewState = initiate_close(Reason, State),
     {next_state, draining, NewState};
 
-connected(cast, process, State) ->
-    inet:setopts(State#state.socket, [{active, once}]),
+connected(cast, process, #state{role = client, socket = Socket} = State) ->
+    %% Re-enable socket for receiving (client only - server uses listener's socket)
+    inet:setopts(Socket, [{active, once}]),
+    {keep_state, State};
+connected(cast, process, #state{role = server} = State) ->
+    %% Server connections receive via listener, don't touch socket options
     {keep_state, State};
 
 %% Handle delayed ACK timer (RFC 9221 Section 5.2)
@@ -1853,9 +1864,12 @@ pad_for_header_protection(Payload) ->
 handle_packet(Data, State) ->
     handle_packet_loop(Data, State).
 
-handle_packet_loop(<<>>, State) ->
-    %% No more data to process
-    inet:setopts(State#state.socket, [{active, once}]),
+handle_packet_loop(<<>>, #state{role = client, socket = Socket} = State) ->
+    %% No more data to process - re-enable socket for client connections only
+    inet:setopts(Socket, [{active, once}]),
+    State;
+handle_packet_loop(<<>>, #state{role = server} = State) ->
+    %% No more data to process - server socket managed by listener
     State;
 handle_packet_loop(Data, State) ->
     case decode_and_decrypt_packet(Data, State) of
@@ -1869,23 +1883,30 @@ handle_packet_loop(Data, State) ->
         {error, stateless_reset} ->
             %% RFC 9000 Section 10.3: Stateless reset received
             %% Immediately close the connection
-            inet:setopts(State#state.socket, [{active, once}]),
+            maybe_reenable_socket(State),
             State#state{close_reason = stateless_reset};
         {error, Reason} when Reason =:= padding_only;
                              Reason =:= empty_packet;
                              Reason =:= invalid_fixed_bit ->
             %% End of coalesced packets (padding or invalid trailing data)
             %% This is normal, just re-enable socket and return
-            inet:setopts(State#state.socket, [{active, once}]),
+            maybe_reenable_socket(State),
             State;
         {error, Reason} ->
             %% Log decryption failure for debugging
             error_logger:warning_msg("[QUIC ~p] Packet decode/decrypt failed: ~p, size=~p~n",
                                      [State#state.role, Reason, byte_size(Data)]),
             %% Re-enable socket
-            inet:setopts(State#state.socket, [{active, once}]),
+            maybe_reenable_socket(State),
             State
     end.
+
+%% Re-enable socket for receiving - only for client connections.
+%% Server connections use listener's socket which is managed by the listener.
+maybe_reenable_socket(#state{role = client, socket = Socket}) ->
+    inet:setopts(Socket, [{active, once}]);
+maybe_reenable_socket(#state{role = server}) ->
+    ok.
 
 %% Decode and decrypt a packet
 decode_and_decrypt_packet(Data, State) ->
@@ -2249,9 +2270,9 @@ decrypt_packet_continue(Level, UnprotectedHeader, PNLen, EncryptedPayload, Remai
             {error, decryption_failed}
     end.
 
-%% Process decoded frames (re-enables socket when done)
+%% Process decoded frames (re-enables socket when done for client connections)
 process_frames(_Level, [], State) ->
-    inet:setopts(State#state.socket, [{active, once}]),
+    maybe_reenable_socket(State),
     State;
 process_frames(Level, [Frame | Rest], State) ->
     NewState = process_frame(Level, Frame, State),
