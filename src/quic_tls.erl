@@ -69,7 +69,7 @@
 %% @doc Build a TLS 1.3 ClientHello message for QUIC.
 %% Options:
 %%   - server_name: SNI hostname (binary)
-%%   - alpn: List of ALPN protocols (list of binaries)
+%%   - alpn: List of Alpn protocols (list of binaries)
 %%   - transport_params: QUIC transport parameters (map)
 %%   - session_ticket: #session_ticket{} for resumption with PSK (optional)
 %%
@@ -267,7 +267,7 @@ build_client_hello_extensions(PubKey, Opts) ->
                 )
         end,
 
-    %% ALPN
+    %% Alpn
     AlpnExt =
         case Alpn of
             [] ->
@@ -373,8 +373,8 @@ parse_encrypted_extensions(<<ExtensionsLen:16, Extensions:ExtensionsLen/binary, 
                 end,
             TransportParams =
                 case maps:find(?EXT_QUIC_TRANSPORT_PARAMS, ExtMap) of
-                    {ok, TPData} ->
-                        case decode_transport_params(TPData) of
+                    {ok, TpData} ->
+                        case decode_transport_params(TpData) of
                             {ok, TP} -> TP;
                             _ -> #{}
                         end;
@@ -746,8 +746,8 @@ parse_client_hello(<<
                     error -> undefined
                 end,
 
-            %% Extract ALPN
-            ALPNProtocols =
+            %% Extract Alpn
+            AlpnProtocols =
                 case maps:find(?EXT_ALPN, ExtMap) of
                     {ok, AlpnData} -> parse_alpn_ext(AlpnData);
                     error -> []
@@ -782,7 +782,7 @@ parse_client_hello(<<
                 extensions => ExtMap,
                 key_share => KeyShare,
                 server_name => ServerName,
-                alpn_protocols => ALPNProtocols,
+                alpn_protocols => AlpnProtocols,
                 transport_params => TransportParams,
                 pre_shared_key => PSK,
                 early_data => EarlyData
@@ -968,12 +968,12 @@ build_server_hello_extensions(PubKey, _Opts) ->
     <<SupportedVersions/binary, KeyShare/binary>>.
 
 build_encrypted_extensions_list(Opts) ->
-    %% ALPN extension (if ALPN was negotiated)
-    ALPNExt =
+    %% Alpn extension (if Alpn was negotiated)
+    AlpnExt =
         case maps:find(alpn, Opts) of
-            {ok, ALPN} when is_binary(ALPN), byte_size(ALPN) > 0 ->
-                ALPNLen = byte_size(ALPN),
-                encode_extension(?EXT_ALPN, <<(ALPNLen + 1):16, ALPNLen:8, ALPN/binary>>);
+            {ok, Alpn} when is_binary(Alpn), byte_size(Alpn) > 0 ->
+                AlpnLen = byte_size(Alpn),
+                encode_extension(?EXT_ALPN, <<(AlpnLen + 1):16, AlpnLen:8, Alpn/binary>>);
             _ ->
                 <<>>
         end,
@@ -982,8 +982,8 @@ build_encrypted_extensions_list(Opts) ->
     TPExt =
         case maps:find(transport_params, Opts) of
             {ok, TP} when map_size(TP) > 0 ->
-                TPData = encode_transport_params(TP),
-                encode_extension(?EXT_QUIC_TRANSPORT_PARAMS, TPData);
+                TpData = encode_transport_params(TP),
+                encode_extension(?EXT_QUIC_TRANSPORT_PARAMS, TpData);
             _ ->
                 <<>>
         end,
@@ -998,7 +998,7 @@ build_encrypted_extensions_list(Opts) ->
                 <<>>
         end,
 
-    <<ALPNExt/binary, TPExt/binary, EarlyDataExt/binary>>.
+    <<AlpnExt/binary, TPExt/binary, EarlyDataExt/binary>>.
 
 build_cert_list([]) ->
     <<>>;
@@ -1027,7 +1027,9 @@ convert_private_key(
 ) ->
     %% secp256r1 / P-256
     [PrivKeyBin, secp256r1];
-convert_private_key(ecdsa, {'ECPrivateKey', _, PrivKeyBin, {namedCurve, {1, 3, 132, 0, 34}}, _, _}) ->
+convert_private_key(
+    ecdsa, {'ECPrivateKey', _, PrivKeyBin, {namedCurve, {1, 3, 132, 0, 34}}, _, _}
+) ->
     %% secp384r1 / P-384
     [PrivKeyBin, secp384r1];
 convert_private_key(ecdsa, {'ECPrivateKey', _, PrivKeyBin, _, _, _}) ->

@@ -182,7 +182,7 @@
     %% Incomplete TLS message buffer (data that couldn't be parsed yet)
     tls_buffer = #{initial => <<>>, handshake => <<>>, app => <<>>} :: map(),
 
-    %% Negotiated ALPN
+    %% Negotiated Alpn
     alpn :: binary() | undefined,
     alpn_list :: [binary()],
 
@@ -550,7 +550,7 @@ init({server, Opts}) ->
     Cert = maps:get(cert, Opts),
     CertChain = maps:get(cert_chain, Opts, []),
     PrivateKey = maps:get(private_key, Opts),
-    ALPNList = maps:get(alpn, Opts, [<<"h3">>]),
+    AlpnList = maps:get(alpn, Opts, [<<"h3">>]),
     Listener = maps:get(listener, Opts),
 
     %% Generate initial keys using client's DCID (which is our SCID initially)
@@ -592,7 +592,7 @@ init({server, Opts}) ->
         verify = false,
         initial_keys = InitialKeys,
         tls_state = ?TLS_AWAITING_CLIENT_HELLO,
-        alpn_list = normalize_alpn_list(ALPNList),
+        alpn_list = normalize_alpn_list(AlpnList),
         pn_initial = PNSpace,
         pn_handshake = PNSpace,
         pn_app = PNSpace,
@@ -707,7 +707,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             SN -> SN
         end,
 
-    %% Get ALPN list
+    %% Get Alpn list
     AlpnOpt = maps:get(alpn, Opts, [<<"h3">>]),
     AlpnList = normalize_alpn_list(AlpnOpt),
 
@@ -1284,9 +1284,9 @@ select_first_match([Cipher | Rest], ClientSuites) ->
         false -> select_first_match(Rest, ClientSuites)
     end.
 
-%% Server: Negotiate ALPN
-negotiate_alpn(ClientALPN, ServerALPN) ->
-    case [A || A <- ServerALPN, lists:member(A, ClientALPN)] of
+%% Server: Negotiate Alpn
+negotiate_alpn(ClientAlpn, ServerAlpn) ->
+    case [A || A <- ServerAlpn, lists:member(A, ClientAlpn)] of
         [First | _] -> First;
         [] -> undefined
     end.
@@ -1414,7 +1414,7 @@ send_server_hello(ServerHelloMsg, State) ->
 send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     #state{
         scid = SCID,
-        alpn = ALPN,
+        alpn = Alpn,
         max_data_local = MaxData,
         max_streams_bidi_local = MaxStreamsBidi,
         max_streams_uni_local = MaxStreamsUni,
@@ -1452,7 +1452,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
 
     %% Build EncryptedExtensions
     EncExtMsg = quic_tls:build_encrypted_extensions(#{
-        alpn => ALPN,
+        alpn => Alpn,
         transport_params => TransportParams
     }),
 
@@ -1542,7 +1542,7 @@ send_new_session_ticket(
         resumption_secret = ResumptionSecret,
         server_name = ServerName,
         max_early_data = MaxEarlyData,
-        alpn = ALPN,
+        alpn = Alpn,
         handshake_keys = {ClientHsKeys, _},
         ticket_store = TicketStore
     } = State
@@ -1559,7 +1559,7 @@ send_new_session_ticket(
         ResumptionSecret,
         MaxEarlyData,
         Cipher,
-        ALPN
+        Alpn
     ),
 
     %% Store ticket on server side for later PSK validation (0-RTT support)
@@ -2125,10 +2125,14 @@ decode_handshake_packet(FullPacket, FirstByte, _DCID, _SCID, Rest, State) ->
 
 %% Decode 0-RTT packet (RFC 9001 Section 5.3)
 %% Server uses early keys derived from client's PSK
-decode_zero_rtt_packet(_FullPacket, _FirstByte, _DCID, _SCID, _Rest, #state{role = client}) ->
+decode_zero_rtt_packet(
+    _FullPacket, _FirstByte, _DCID, _SCID, _Rest, #state{role = client}
+) ->
     %% Clients don't receive 0-RTT packets
     {error, unexpected_zero_rtt};
-decode_zero_rtt_packet(_FullPacket, _FirstByte, _DCID, _SCID, _Rest, #state{early_keys = undefined}) ->
+decode_zero_rtt_packet(
+    _FullPacket, _FirstByte, _DCID, _SCID, _Rest, #state{early_keys = undefined}
+) ->
     %% No early keys - can't decrypt 0-RTT
     {error, no_early_keys};
 decode_zero_rtt_packet(
@@ -2622,7 +2626,7 @@ process_tls_message(
                 random := _ClientRandom,
                 key_share := KeyShareEntries,
                 cipher_suites := CipherSuites,
-                alpn_protocols := ClientALPN,
+                alpn_protocols := ClientAlpn,
                 transport_params := TP,
                 session_id := SessionId
             } = ClientHelloInfo} ->
@@ -2680,8 +2684,8 @@ process_tls_message(
                 x25519, ServerPrivKey, ClientPubKey
             ),
 
-            %% Negotiate ALPN
-            ALPN = negotiate_alpn(ClientALPN, State#state.alpn_list),
+            %% Negotiate Alpn
+            Alpn = negotiate_alpn(ClientAlpn, State#state.alpn_list),
 
             %% Build ServerHello
             {ServerHello, _ServerPrivKey2} = quic_tls:build_server_hello(#{
@@ -2732,7 +2736,7 @@ process_tls_message(
                 client_hs_secret = ClientHsSecret,
                 server_hs_secret = ServerHsSecret,
                 handshake_keys = {ClientHsKeys, ServerHsKeys},
-                alpn = ALPN,
+                alpn = Alpn,
                 early_keys = EarlyKeys,
                 early_data_accepted = (EarlyKeys =/= undefined andalso WantsEarlyData)
             },
@@ -2742,7 +2746,8 @@ process_tls_message(
             %% Send ServerHello in Initial packet
             State2 = send_server_hello(ServerHello, State1),
 
-            %% Send EncryptedExtensions, Certificate, CertificateVerify, Finished in Handshake packet
+            %% Send EncryptedExtensions, Certificate, CertificateVerify, Finished
+            %% in Handshake packet
             send_server_handshake_flight(Cipher, TranscriptHash, State2);
         {error, _} ->
             State
@@ -2913,7 +2918,8 @@ process_tls_message(
                     },
 
                     %% Send client Finished (cipher-aware)
-                    %% Client Finished uses transcript INCLUDING server Finished (RFC 8446 Section 4.4.4)
+                    %% Client Finished uses transcript INCLUDING server Finished
+                    %% (RFC 8446 Section 4.4.4)
                     ClientFinishedKey = quic_crypto:derive_finished_key(
                         Cipher, State#state.client_hs_secret
                     ),
@@ -3004,7 +3010,7 @@ process_tls_message(
         role = client,
         tls_state = ?TLS_HANDSHAKE_COMPLETE,
         server_name = ServerName,
-        alpn = ALPN,
+        alpn = Alpn,
         master_secret = MasterSecret,
         tls_transcript = Transcript,
         handshake_keys = {ClientHsKeys, _}
@@ -3042,7 +3048,7 @@ process_tls_message(
                 max_early_data = MaxEarlyData,
                 received_at = erlang:system_time(second),
                 cipher = Cipher,
-                alpn = ALPN
+                alpn = Alpn
             },
 
             %% Store ticket
@@ -3752,7 +3758,9 @@ send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) ->
 
 %% Queue stream data when congestion window is full
 %% Uses bucket-based priority queue for O(1) insert (RFC 9218)
-queue_stream_data(StreamId, Offset, Data, Fin, #state{send_queue = PQ, streams = Streams} = State) ->
+queue_stream_data(
+    StreamId, Offset, Data, Fin, #state{send_queue = PQ, streams = Streams} = State
+) ->
     Urgency = get_stream_urgency(StreamId, Streams),
     Entry = {stream_data, StreamId, Offset, Data, Fin},
     NewPQ = pqueue_in(Entry, Urgency, PQ),
@@ -4058,7 +4066,7 @@ state_to_map(#state{} = S) ->
         data_received => S#state.data_received
     }.
 
-%% Normalize ALPN list - handles binary, list of binaries, list of strings
+%% Normalize Alpn list - handles binary, list of binaries, list of strings
 normalize_alpn_list(undefined) ->
     [];
 normalize_alpn_list(V) when is_binary(V) ->

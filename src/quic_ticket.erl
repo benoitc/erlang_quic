@@ -100,7 +100,8 @@ clear_expired(Store) ->
 
 %% @doc Derive the resumption_master_secret from the master secret.
 %% RFC 8446 Section 7.1:
-%%   resumption_master_secret = Derive-Secret(Master Secret, "res master", ClientHello..client Finished)
+%%   resumption_master_secret
+%%          = Derive-Secret(Master Secret, "res master", ClientHello..client Finished)
 -spec derive_resumption_secret(atom(), binary(), binary(), binary()) -> binary().
 derive_resumption_secret(Cipher, MasterSecret, TranscriptHash, _ClientFinished) ->
     Hash = quic_crypto:cipher_to_hash(Cipher),
