@@ -1403,6 +1403,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
 
     %% Build transport parameters
     TransportParams0 = #{
+        original_dcid => State#state.original_dcid,  %% RFC 9000 §7.3: server MUST send this
         initial_scid => SCID,
         initial_max_data => MaxData,
         initial_max_stream_data_bidi_local => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
@@ -2594,7 +2595,8 @@ process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
             ServerHsKeys = #crypto_keys{key = ServerKey, iv = ServerIV, hp = ServerHP, cipher = Cipher},
 
             %% Update DCID from ClientHello SCID
-            ClientSCID = maps:get(scid, TP, <<>>),
+            %% quic_tls decodes the initial_source_connection_id param as initial_scid
+            ClientSCID = maps:get(initial_scid, TP, <<>>),
 
             State0 = State#state{
                 dcid = ClientSCID,
