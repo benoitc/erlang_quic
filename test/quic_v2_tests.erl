@@ -47,10 +47,9 @@ version_negotiation_decoding_test() ->
     DCIDLen = byte_size(DCID),
     SCIDLen = byte_size(SCID),
     Versions = <<?QUIC_VERSION_1:32, ?QUIC_VERSION_2:32>>,
-    VNPacket = <<FirstByte:8, 0:32,  % Version = 0 indicates VN
-                 DCIDLen:8, DCID/binary,
-                 SCIDLen:8, SCID/binary,
-                 Versions/binary>>,
+    % Version = 0 indicates VN
+    VNPacket =
+        <<FirstByte:8, 0:32, DCIDLen:8, DCID/binary, SCIDLen:8, SCID/binary, Versions/binary>>,
 
     %% Decode it
     {ok, Decoded} = quic_packet:decode(VNPacket, undefined),
@@ -138,7 +137,8 @@ client_fallback_v1_test() ->
 
 %% Test version negotiation failure (no common version)
 no_common_version_test() ->
-    OfferedVersions = [16#ff000000],  % Some unsupported version
+    % Some unsupported version
+    OfferedVersions = [16#ff000000],
     SupportedVersions = [?QUIC_VERSION_1, ?QUIC_VERSION_2],
 
     Selected = select_best_version(OfferedVersions, SupportedVersions),

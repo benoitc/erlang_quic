@@ -26,8 +26,10 @@ idle_timeout_message_format_test() ->
 
 %% Test the basic concept of idle timeout checking
 idle_timeout_check_logic_test() ->
-    IdleTimeout = 30000,  % 30 seconds
-    LastActivity = erlang:monotonic_time(millisecond) - 25000,  % 25 seconds ago
+    % 30 seconds
+    IdleTimeout = 30000,
+    % 25 seconds ago
+    LastActivity = erlang:monotonic_time(millisecond) - 25000,
     Now = erlang:monotonic_time(millisecond),
     TimeSinceActivity = Now - LastActivity,
 
@@ -35,7 +37,9 @@ idle_timeout_check_logic_test() ->
     ?assertNot(TimeSinceActivity >= IdleTimeout),
 
     %% Simulate more time passing
-    LastActivity2 = erlang:monotonic_time(millisecond) - 35000,  % 35 seconds ago
+
+    % 35 seconds ago
+    LastActivity2 = erlang:monotonic_time(millisecond) - 35000,
     TimeSinceActivity2 = Now - LastActivity2,
 
     %% Should timeout (35s >= 30s)
@@ -44,7 +48,8 @@ idle_timeout_check_logic_test() ->
 %% Test that zero idle timeout means no timeout
 zero_idle_timeout_test() ->
     IdleTimeout = 0,
-    _LastActivity = erlang:monotonic_time(millisecond) - 1000000,  % Very old
+    % Very old
+    _LastActivity = erlang:monotonic_time(millisecond) - 1000000,
     _Now = erlang:monotonic_time(millisecond),
 
     %% With 0 timeout, comparison should indicate "set but disabled"
@@ -58,7 +63,8 @@ zero_idle_timeout_test() ->
 %% Test that activity resets the idle timeout window
 activity_resets_timeout_test() ->
     InitialActivity = erlang:monotonic_time(millisecond),
-    timer:sleep(10),  % Small delay
+    % Small delay
+    timer:sleep(10),
 
     %% Simulate activity update
     NewActivity = erlang:monotonic_time(millisecond),
@@ -71,7 +77,8 @@ activity_resets_timeout_test() ->
 
 %% Test exactly at timeout boundary
 exact_timeout_boundary_test() ->
-    IdleTimeout = 1000,  % 1 second
+    % 1 second
+    IdleTimeout = 1000,
 
     %% Exactly at boundary should trigger timeout (>= comparison)
     LastActivity = erlang:monotonic_time(millisecond) - 1000,
@@ -82,10 +89,13 @@ exact_timeout_boundary_test() ->
 
 %% Test just below timeout boundary
 just_below_timeout_boundary_test() ->
-    IdleTimeout = 10000,  % 10 seconds
+    % 10 seconds
+    IdleTimeout = 10000,
 
     %% Just below boundary should NOT trigger timeout
-    LastActivity = erlang:monotonic_time(millisecond) - 9990,  % 9.99 seconds ago
+
+    % 9.99 seconds ago
+    LastActivity = erlang:monotonic_time(millisecond) - 9990,
     Now = erlang:monotonic_time(millisecond),
     TimeSinceActivity = Now - LastActivity,
 

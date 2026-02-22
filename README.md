@@ -142,6 +142,20 @@ See [docs/features.md](docs/features.md) for the complete API reference and feat
 rebar3 compile
 ```
 
+## Formatting
+
+```bash
+rebar3 fmt
+```
+
+## Static analysis tools
+
+```bash
+rebar3 lint
+rebar3 xref
+rebar3 dialyzer
+```
+
 ## Testing
 
 ```bash

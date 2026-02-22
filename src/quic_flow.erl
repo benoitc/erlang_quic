@@ -51,19 +51,24 @@
 ]).
 
 %% Default values
--define(WINDOW_UPDATE_THRESHOLD, 0.5).  % Send MAX_DATA when 50% consumed
+
+% Send MAX_DATA when 50% consumed
+-define(WINDOW_UPDATE_THRESHOLD, 0.5).
 
 %% Flow control state
 -record(flow_state, {
     %% Send side (our sending, limited by peer's MAX_DATA)
     bytes_sent = 0 :: non_neg_integer(),
-    send_max_data :: non_neg_integer(),  % Peer's limit on what we can send
+    % Peer's limit on what we can send
+    send_max_data :: non_neg_integer(),
     send_blocked = false :: boolean(),
 
     %% Receive side (peer's sending, limited by our MAX_DATA)
     bytes_received = 0 :: non_neg_integer(),
-    recv_max_data :: non_neg_integer(),  % Our limit on what peer can send
-    recv_max_data_sent :: non_neg_integer(),  % Last MAX_DATA we sent
+    % Our limit on what peer can send
+    recv_max_data :: non_neg_integer(),
+    % Last MAX_DATA we sent
+    recv_max_data_sent :: non_neg_integer(),
 
     %% Configuration
     initial_max_data :: non_neg_integer()
@@ -138,8 +143,10 @@ send_blocked(#flow_state{send_blocked = B}) -> B.
 %% @doc Record that we received data.
 -spec on_data_received(flow_state(), non_neg_integer()) ->
     {ok, flow_state()} | {error, flow_control_error}.
-on_data_received(#flow_state{bytes_received = Received, recv_max_data = Max} = State,
-                 Size) ->
+on_data_received(
+    #flow_state{bytes_received = Received, recv_max_data = Max} = State,
+    Size
+) ->
     NewReceived = Received + Size,
     case NewReceived > Max of
         true ->
@@ -151,9 +158,11 @@ on_data_received(#flow_state{bytes_received = Received, recv_max_data = Max} = S
 %% @doc Check if we should send a MAX_DATA update.
 %% Returns true if we've consumed more than the threshold.
 -spec should_send_max_data(flow_state()) -> boolean().
-should_send_max_data(#flow_state{bytes_received = Received,
-                                  recv_max_data_sent = SentMax,
-                                  initial_max_data = Initial}) ->
+should_send_max_data(#flow_state{
+    bytes_received = Received,
+    recv_max_data_sent = SentMax,
+    initial_max_data = Initial
+}) ->
     %% Send update when we've consumed > threshold of the window
     WindowConsumed = Received,
     WindowGranted = SentMax,
@@ -164,8 +173,12 @@ should_send_max_data(#flow_state{bytes_received = Received,
 %% Returns {NewMaxData, UpdatedState}.
 -spec generate_max_data(flow_state()) ->
     {non_neg_integer(), flow_state()}.
-generate_max_data(#flow_state{bytes_received = Received,
-                              initial_max_data = Initial} = State) ->
+generate_max_data(
+    #flow_state{
+        bytes_received = Received,
+        initial_max_data = Initial
+    } = State
+) ->
     %% Grant a new window based on bytes consumed
     NewMax = Received + Initial,
     NewState = State#flow_state{

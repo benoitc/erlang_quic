@@ -79,8 +79,9 @@ is_available() ->
         Algos = crypto:supports(),
         Ciphers = proplists:get_value(ciphers, Algos, []),
         Macs = proplists:get_value(macs, Algos, []),
-        HasAES = lists:member(aes_128_gcm, Ciphers) orelse
-                 lists:member(aes_gcm, Ciphers),
+        HasAES =
+            lists:member(aes_128_gcm, Ciphers) orelse
+                lists:member(aes_gcm, Ciphers),
         HasSHA256 = lists:member(hmac, Macs),
         HasAES andalso HasSHA256
     catch
@@ -109,19 +110,24 @@ get_fd(Socket) ->
 %%   <li>`alpn' - ALPN protocols (default: [&lt;&lt;"h3"&gt;&gt;])</li>
 %%   <li>`sni' - Server Name Indication (default: Host)</li>
 %% </ul>
--spec connect(Host, Port, Opts, Owner) -> {ok, reference()} | {error, term()}
-    when Host :: binary() | string(),
-         Port :: inet:port_number(),
-         Opts :: map(),
-         Owner :: pid().
+-spec connect(Host, Port, Opts, Owner) -> {ok, reference()} | {error, term()} when
+    Host :: binary() | string(),
+    Port :: inet:port_number(),
+    Opts :: map(),
+    Owner :: pid().
 connect(Host, Port, Opts, Owner) when is_list(Host) ->
     connect(list_to_binary(Host), Port, Opts, Owner);
-connect(Host, Port, Opts, Owner) when is_binary(Host), is_integer(Port),
-                                       Port > 0, Port =< 65535,
-                                       is_map(Opts), is_pid(Owner) ->
+connect(Host, Port, Opts, Owner) when
+    is_binary(Host),
+    is_integer(Port),
+    Port > 0,
+    Port =< 65535,
+    is_map(Opts),
+    is_pid(Owner)
+->
     case quic_connection:start_link(Host, Port, Opts, Owner) of
         {ok, Pid} ->
-            ConnRef = gen_statem:call(Pid, get_ref),
+            ConnRef = quic_connection:get_ref(Pid),
             {ok, ConnRef};
         Error ->
             Error
@@ -130,9 +136,9 @@ connect(_Host, _Port, _Opts, _Owner) ->
     {error, badarg}.
 
 %% @doc Close a QUIC connection.
--spec close(ConnRef, Reason) -> ok
-    when ConnRef :: reference() | pid(),
-         Reason :: term().
+-spec close(ConnRef, Reason) -> ok when
+    ConnRef :: reference() | pid(),
+    Reason :: term().
 close(ConnRef, Reason) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:close(Pid, Reason);
@@ -143,8 +149,8 @@ close(ConnPid, Reason) when is_pid(ConnPid) ->
 
 %% @doc Open a new bidirectional stream.
 %% Returns {ok, StreamId} on success.
--spec open_stream(ConnRef) -> {ok, non_neg_integer()} | {error, term()}
-    when ConnRef :: reference() | pid().
+-spec open_stream(ConnRef) -> {ok, non_neg_integer()} | {error, term()} when
+    ConnRef :: reference() | pid().
 open_stream(ConnRef) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:open_stream(Pid);
@@ -156,8 +162,8 @@ open_stream(ConnPid) when is_pid(ConnPid) ->
 %% @doc Open a new unidirectional stream.
 %% Returns {ok, StreamId} on success.
 %% Unidirectional streams are send-only for the initiator.
--spec open_unidirectional_stream(ConnRef) -> {ok, non_neg_integer()} | {error, term()}
-    when ConnRef :: reference() | pid().
+-spec open_unidirectional_stream(ConnRef) -> {ok, non_neg_integer()} | {error, term()} when
+    ConnRef :: reference() | pid().
 open_unidirectional_stream(ConnRef) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:open_unidirectional_stream(Pid);
@@ -168,11 +174,11 @@ open_unidirectional_stream(ConnPid) when is_pid(ConnPid) ->
 
 %% @doc Send data on a stream.
 %% Fin indicates if this is the final frame on the stream.
--spec send_data(ConnRef, StreamId, Data, Fin) -> ok | {error, term()}
-    when ConnRef :: reference() | pid(),
-         StreamId :: non_neg_integer(),
-         Data :: iodata(),
-         Fin :: boolean().
+-spec send_data(ConnRef, StreamId, Data, Fin) -> ok | {error, term()} when
+    ConnRef :: reference() | pid(),
+    StreamId :: non_neg_integer(),
+    Data :: iodata(),
+    Fin :: boolean().
 send_data(ConnRef, StreamId, Data, Fin) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:send_data(Pid, StreamId, Data, Fin);
@@ -184,10 +190,10 @@ send_data(_ConnRef, _StreamId, _Data, _Fin) ->
     {error, badarg}.
 
 %% @doc Reset a stream with an error code.
--spec reset_stream(ConnRef, StreamId, ErrorCode) -> ok | {error, term()}
-    when ConnRef :: reference() | pid(),
-         StreamId :: non_neg_integer(),
-         ErrorCode :: non_neg_integer().
+-spec reset_stream(ConnRef, StreamId, ErrorCode) -> ok | {error, term()} when
+    ConnRef :: reference() | pid(),
+    StreamId :: non_neg_integer(),
+    ErrorCode :: non_neg_integer().
 reset_stream(ConnRef, StreamId, ErrorCode) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:reset_stream(Pid, StreamId, ErrorCode);
@@ -201,9 +207,9 @@ reset_stream(_ConnRef, _StreamId, _ErrorCode) ->
 %% @doc Handle connection timeout.
 %% Should be called when timer expires.
 %% Returns next timeout in ms or 'infinity'.
--spec handle_timeout(ConnRef, NowMs) -> non_neg_integer() | infinity
-    when ConnRef :: reference() | pid(),
-         NowMs :: non_neg_integer().
+-spec handle_timeout(ConnRef, NowMs) -> non_neg_integer() | infinity when
+    ConnRef :: reference() | pid(),
+    NowMs :: non_neg_integer().
 handle_timeout(ConnRef, NowMs) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:handle_timeout(Pid, NowMs);
@@ -217,8 +223,8 @@ handle_timeout(_ConnRef, _NowMs) ->
 %% @doc Process pending QUIC events.
 %% This is called automatically by the connection process.
 %% Returns the next timeout in milliseconds, or 'infinity'.
--spec process(ConnRef) -> non_neg_integer() | infinity
-    when ConnRef :: reference() | pid().
+-spec process(ConnRef) -> non_neg_integer() | infinity when
+    ConnRef :: reference() | pid().
 process(ConnRef) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:process(Pid);
@@ -228,8 +234,8 @@ process(ConnPid) when is_pid(ConnPid) ->
     quic_connection:process(ConnPid).
 
 %% @doc Get the remote address of the connection.
--spec peername(ConnRef) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}
-    when ConnRef :: reference() | pid().
+-spec peername(ConnRef) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()} when
+    ConnRef :: reference() | pid().
 peername(ConnRef) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:peername(Pid);
@@ -239,8 +245,8 @@ peername(ConnPid) when is_pid(ConnPid) ->
     quic_connection:peername(ConnPid).
 
 %% @doc Get the local address of the connection.
--spec sockname(ConnRef) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}
-    when ConnRef :: reference() | pid().
+-spec sockname(ConnRef) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()} when
+    ConnRef :: reference() | pid().
 sockname(ConnRef) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:sockname(Pid);
@@ -251,8 +257,8 @@ sockname(ConnPid) when is_pid(ConnPid) ->
 
 %% @doc Get the peer certificate.
 %% Returns the DER-encoded certificate of the peer if available.
--spec peercert(ConnRef) -> {ok, binary()} | {error, term()}
-    when ConnRef :: reference() | pid().
+-spec peercert(ConnRef) -> {ok, binary()} | {error, term()} when
+    ConnRef :: reference() | pid().
 peercert(ConnRef) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:peercert(Pid);
@@ -263,9 +269,9 @@ peercert(ConnPid) when is_pid(ConnPid) ->
 
 %% @doc Set the owner process for a connection.
 %% Similar to gen_tcp:controlling_process/2.
--spec set_owner(ConnRef, NewOwner) -> ok | {error, term()}
-    when ConnRef :: reference() | pid(),
-         NewOwner :: pid().
+-spec set_owner(ConnRef, NewOwner) -> ok | {error, term()} when
+    ConnRef :: reference() | pid(),
+    NewOwner :: pid().
 set_owner(ConnRef, NewOwner) when is_reference(ConnRef), is_pid(NewOwner) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:set_owner(Pid, NewOwner);
@@ -278,9 +284,9 @@ set_owner(_ConnRef, _NewOwner) ->
 
 %% @doc Send a datagram on the connection.
 %% Datagrams are unreliable and may be lost.
--spec send_datagram(ConnRef, Data) -> ok | {error, term()}
-    when ConnRef :: reference() | pid(),
-         Data :: iodata().
+-spec send_datagram(ConnRef, Data) -> ok | {error, term()} when
+    ConnRef :: reference() | pid(),
+    Data :: iodata().
 send_datagram(ConnRef, Data) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:send_datagram(Pid, Data);
@@ -292,9 +298,9 @@ send_datagram(_ConnRef, _Data) ->
     {error, badarg}.
 
 %% @doc Set connection options.
--spec setopts(ConnRef, Opts) -> ok | {error, term()}
-    when ConnRef :: reference() | pid(),
-         Opts :: [{atom(), term()}].
+-spec setopts(ConnRef, Opts) -> ok | {error, term()} when
+    ConnRef :: reference() | pid(),
+    Opts :: [{atom(), term()}].
 setopts(ConnRef, Opts) when is_reference(ConnRef), is_list(Opts) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:setopts(Pid, Opts);
@@ -308,8 +314,8 @@ setopts(_ConnRef, _Opts) ->
 %% @doc Trigger connection migration to a new local address.
 %% This initiates path validation on a new network path.
 %% The connection will send PATH_CHALLENGE and wait for PATH_RESPONSE.
--spec migrate(ConnRef) -> ok | {error, term()}
-    when ConnRef :: reference() | pid().
+-spec migrate(ConnRef) -> ok | {error, term()} when
+    ConnRef :: reference() | pid().
 migrate(ConnRef) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:migrate(Pid);
@@ -324,11 +330,11 @@ migrate(_ConnRef) ->
 %% Urgency: 0-7 (lower = more urgent, default 3)
 %% Incremental: boolean (data can be processed incrementally, default false)
 %% Per RFC 9218 (Extensible Priorities for HTTP).
--spec set_stream_priority(ConnRef, StreamId, Urgency, Incremental) -> ok | {error, term()}
-    when ConnRef :: reference() | pid(),
-         StreamId :: non_neg_integer(),
-         Urgency :: 0..7,
-         Incremental :: boolean().
+-spec set_stream_priority(ConnRef, StreamId, Urgency, Incremental) -> ok | {error, term()} when
+    ConnRef :: reference() | pid(),
+    StreamId :: non_neg_integer(),
+    Urgency :: 0..7,
+    Incremental :: boolean().
 set_stream_priority(ConnRef, StreamId, Urgency, Incremental) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:set_stream_priority(Pid, StreamId, Urgency, Incremental);
@@ -341,9 +347,9 @@ set_stream_priority(_ConnRef, _StreamId, _Urgency, _Incremental) ->
 
 %% @doc Get the priority for a stream.
 %% Returns {ok, {Urgency, Incremental}} or {error, not_found}.
--spec get_stream_priority(ConnRef, StreamId) -> {ok, {0..7, boolean()}} | {error, term()}
-    when ConnRef :: reference() | pid(),
-         StreamId :: non_neg_integer().
+-spec get_stream_priority(ConnRef, StreamId) -> {ok, {0..7, boolean()}} | {error, term()} when
+    ConnRef :: reference() | pid(),
+    StreamId :: non_neg_integer().
 get_stream_priority(ConnRef, StreamId) when is_reference(ConnRef) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:get_stream_priority(Pid, StreamId);
@@ -381,12 +387,17 @@ get_stream_priority(_ConnRef, _StreamId) ->
 %%     pool_size => 4
 %% }).
 %% '''
--spec start_server(Name, Port, Opts) -> {ok, pid()} | {error, term()}
-    when Name :: atom(),
-         Port :: inet:port_number(),
-         Opts :: map().
-start_server(Name, Port, Opts) when is_atom(Name), is_integer(Port),
-                                    Port >= 0, Port =< 65535, is_map(Opts) ->
+-spec start_server(Name, Port, Opts) -> {ok, pid()} | {error, term()} when
+    Name :: atom(),
+    Port :: inet:port_number(),
+    Opts :: map().
+start_server(Name, Port, Opts) when
+    is_atom(Name),
+    is_integer(Port),
+    Port >= 0,
+    Port =< 65535,
+    is_map(Opts)
+->
     quic_server_sup:start_server(Name, Port, Opts);
 start_server(_Name, _Port, _Opts) ->
     {error, badarg}.
@@ -395,8 +406,8 @@ start_server(_Name, _Port, _Opts) ->
 %%
 %% Stops the server and all its connections.
 %% The port will be freed for reuse.
--spec stop_server(Name) -> ok | {error, term()}
-    when Name :: atom().
+-spec stop_server(Name) -> ok | {error, term()} when
+    Name :: atom().
 stop_server(Name) when is_atom(Name) ->
     quic_server_sup:stop_server(Name);
 stop_server(_Name) ->
@@ -417,12 +428,17 @@ stop_server(_Name) ->
 %%     }),
 %%     {ok, {#{strategy => one_for_one}, [Spec]}}.
 %% '''
--spec server_spec(Name, Port, Opts) -> supervisor:child_spec()
-    when Name :: atom(),
-         Port :: inet:port_number(),
-         Opts :: map().
-server_spec(Name, Port, Opts) when is_atom(Name), is_integer(Port),
-                                   Port >= 0, Port =< 65535, is_map(Opts) ->
+-spec server_spec(Name, Port, Opts) -> supervisor:child_spec() when
+    Name :: atom(),
+    Port :: inet:port_number(),
+    Opts :: map().
+server_spec(Name, Port, Opts) when
+    is_atom(Name),
+    is_integer(Port),
+    Port >= 0,
+    Port =< 65535,
+    is_map(Opts)
+->
     quic_server_sup:server_spec(Name, Port, Opts);
 server_spec(_Name, _Port, _Opts) ->
     error(badarg).
@@ -436,8 +452,8 @@ server_spec(_Name, _Port, _Opts) ->
 %%   <li>`opts' - Server options</li>
 %%   <li>`started_at' - Start timestamp in milliseconds</li>
 %% </ul>
--spec get_server_info(Name) -> {ok, map()} | {error, not_found}
-    when Name :: atom().
+-spec get_server_info(Name) -> {ok, map()} | {error, not_found} when
+    Name :: atom().
 get_server_info(Name) when is_atom(Name) ->
     quic_server_registry:lookup(Name);
 get_server_info(_Name) ->
@@ -446,16 +462,16 @@ get_server_info(_Name) ->
 %% @doc Get the listening port of a named server.
 %%
 %% Useful when the server was started with port 0 (ephemeral port).
--spec get_server_port(Name) -> {ok, inet:port_number()} | {error, not_found}
-    when Name :: atom().
+-spec get_server_port(Name) -> {ok, inet:port_number()} | {error, not_found} when
+    Name :: atom().
 get_server_port(Name) when is_atom(Name) ->
     quic_server_registry:get_port(Name);
 get_server_port(_Name) ->
     {error, badarg}.
 
 %% @doc Get the list of connection PIDs for a named server.
--spec get_server_connections(Name) -> {ok, [pid()]} | {error, not_found}
-    when Name :: atom().
+-spec get_server_connections(Name) -> {ok, [pid()]} | {error, not_found} when
+    Name :: atom().
 get_server_connections(Name) when is_atom(Name) ->
     quic_server_registry:get_connections(Name);
 get_server_connections(_Name) ->

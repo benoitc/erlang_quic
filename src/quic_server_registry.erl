@@ -50,28 +50,32 @@
 
 -define(TABLE, quic_server_registry_tab).
 
+%% @private
 -record(state, {
     monitors = #{} :: #{reference() => atom()}
 }).
+
+%% @private
+-type state() :: #state{}.
 
 %%====================================================================
 %% API
 %%====================================================================
 
 %% @doc Start the server registry.
--spec start_link() -> {ok, pid()} | {error, term()}.
+-spec start_link() -> gen_server:start_ret().
 start_link() ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+    gen_server:start_link({local, ?MODULE}, ?MODULE, #{}, []).
 
 %% @doc Register a named server.
 -spec register(atom(), pid(), inet:port_number(), map()) -> ok.
 register(Name, Pid, Port, Opts) ->
-    gen_server:call(?MODULE, {register, Name, Pid, Port, Opts}).
+    gen_server:call(?MODULE, {register, Name, Pid, Port, Opts}, infinity).
 
 %% @doc Unregister a named server.
 -spec unregister(atom()) -> ok.
 unregister(Name) ->
-    gen_server:call(?MODULE, {unregister, Name}).
+    gen_server:call(?MODULE, {unregister, Name}, infinity).
 
 %% @doc Look up a server by name.
 -spec lookup(atom()) -> {ok, map()} | {error, not_found}.
@@ -130,8 +134,10 @@ get_connections(Name) ->
             %% Collect connections from all listeners
             Connections = lists:flatmap(
                 fun(ListenerPid) ->
-                    try quic_listener:get_connections(ListenerPid)
-                    catch _:_ -> []
+                    try
+                        quic_listener:get_connections(ListenerPid)
+                    catch
+                        _:_ -> []
                     end
                 end,
                 Listeners
@@ -145,7 +151,9 @@ get_connections(Name) ->
 %% gen_server callbacks
 %%====================================================================
 
-init([]) ->
+%% @private
+-spec init(map()) -> {ok, state()}.
+init(#{}) ->
     %% Create ETS table for server registry
     ?TABLE = ets:new(?TABLE, [
         named_table,
@@ -155,7 +163,10 @@ init([]) ->
     ]),
     {ok, #state{}}.
 
-handle_call({register, Name, Pid, Port, Opts}, _From, State = #state{monitors = Monitors}) ->
+%% @private
+-spec handle_call(term(), gen_server:from(), state()) ->
+    {reply, term(), state()}.
+handle_call({register, Name, Pid, Port, Opts}, _From, #state{monitors = Monitors} = State) ->
     %% Monitor the server process
     MonRef = erlang:monitor(process, Pid),
 
@@ -170,8 +181,7 @@ handle_call({register, Name, Pid, Port, Opts}, _From, State = #state{monitors = 
 
     NewMonitors = Monitors#{MonRef => Name},
     {reply, ok, State#state{monitors = NewMonitors}};
-
-handle_call({unregister, Name}, _From, State = #state{monitors = Monitors}) ->
+handle_call({unregister, Name}, _From, #state{monitors = Monitors} = State) ->
     %% Find and remove the monitor
     case ets:lookup(?TABLE, Name) of
         [{Name, #{pid := Pid}}] ->
@@ -187,14 +197,17 @@ handle_call({unregister, Name}, _From, State = #state{monitors = Monitors}) ->
         [] ->
             {reply, ok, State}
     end;
-
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
+%% @private
+-spec handle_cast(term(), state()) -> {noreply, state()}.
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({'DOWN', MonRef, process, _Pid, _Reason}, State = #state{monitors = Monitors}) ->
+%% @private
+-spec handle_info(term(), state()) -> {noreply, state()}.
+handle_info({'DOWN', MonRef, process, _Pid, _Reason}, #state{monitors = Monitors} = State) ->
     %% Server terminated, remove from registry
     case maps:get(MonRef, Monitors, undefined) of
         undefined ->
@@ -204,10 +217,11 @@ handle_info({'DOWN', MonRef, process, _Pid, _Reason}, State = #state{monitors = 
             NewMonitors = maps:remove(MonRef, Monitors),
             {noreply, State#state{monitors = NewMonitors}}
     end;
-
 handle_info(_Info, State) ->
     {noreply, State}.
 
+%% @private
+-spec terminate(term(), state()) -> ok.
 terminate(_Reason, _State) ->
     ok.
 

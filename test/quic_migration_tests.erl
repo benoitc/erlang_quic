@@ -15,18 +15,18 @@
 
 path_state_creation_test() ->
     Path = #path_state{
-        remote_addr = {{127,0,0,1}, 4433},
+        remote_addr = {{127, 0, 0, 1}, 4433},
         status = unknown,
         bytes_sent = 0,
         bytes_received = 0
     },
     ?assertEqual(unknown, Path#path_state.status),
-    ?assertEqual({{127,0,0,1}, 4433}, Path#path_state.remote_addr).
+    ?assertEqual({{127, 0, 0, 1}, 4433}, Path#path_state.remote_addr).
 
 path_state_validating_test() ->
     ChallengeData = crypto:strong_rand_bytes(8),
     Path = #path_state{
-        remote_addr = {{192,168,1,1}, 8443},
+        remote_addr = {{192, 168, 1, 1}, 8443},
         status = validating,
         challenge_data = ChallengeData,
         challenge_count = 1
@@ -36,7 +36,7 @@ path_state_validating_test() ->
 
 path_state_validated_test() ->
     Path = #path_state{
-        remote_addr = {{10,0,0,1}, 443},
+        remote_addr = {{10, 0, 0, 1}, 443},
         status = validated,
         challenge_data = undefined
     },
@@ -64,7 +64,7 @@ cid_entry_creation_test() ->
 cid_entry_retired_test() ->
     Entry = #cid_entry{
         seq_num = 0,
-        cid = <<1,2,3,4,5,6,7,8>>,
+        cid = <<1, 2, 3, 4, 5, 6, 7, 8>>,
         status = retired
     },
     ?assertEqual(retired, Entry#cid_entry.status).
@@ -75,28 +75,31 @@ cid_entry_retired_test() ->
 
 cid_pool_add_test() ->
     Pool = [],
-    CID1 = <<1,2,3,4,5,6,7,8>>,
+    CID1 = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     Token1 = crypto:strong_rand_bytes(16),
     Entry1 = #cid_entry{seq_num = 1, cid = CID1, stateless_reset_token = Token1, status = active},
     Pool1 = [Entry1 | Pool],
     ?assertEqual(1, length(Pool1)),
 
-    CID2 = <<8,7,6,5,4,3,2,1>>,
+    CID2 = <<8, 7, 6, 5, 4, 3, 2, 1>>,
     Token2 = crypto:strong_rand_bytes(16),
     Entry2 = #cid_entry{seq_num = 2, cid = CID2, stateless_reset_token = Token2, status = active},
     Pool2 = [Entry2 | Pool1],
     ?assertEqual(2, length(Pool2)).
 
 cid_retirement_test() ->
-    Entry1 = #cid_entry{seq_num = 1, cid = <<1,2,3,4>>, status = active},
-    Entry2 = #cid_entry{seq_num = 2, cid = <<5,6,7,8>>, status = active},
+    Entry1 = #cid_entry{seq_num = 1, cid = <<1, 2, 3, 4>>, status = active},
+    Entry2 = #cid_entry{seq_num = 2, cid = <<5, 6, 7, 8>>, status = active},
     Pool = [Entry1, Entry2],
 
     %% Retire entry with seq_num = 1
     NewPool = lists:map(
-        fun(#cid_entry{seq_num = 1} = E) -> E#cid_entry{status = retired};
-           (E) -> E
-        end, Pool),
+        fun
+            (#cid_entry{seq_num = 1} = E) -> E#cid_entry{status = retired};
+            (E) -> E
+        end,
+        Pool
+    ),
 
     [Retired, Active] = NewPool,
     ?assertEqual(retired, Retired#cid_entry.status),
@@ -162,13 +165,13 @@ path_challenge_data_size_test() ->
 
 path_challenge_response_match_test() ->
     %% PATH_RESPONSE must echo the exact challenge data
-    ChallengeData = <<1,2,3,4,5,6,7,8>>,
-    ResponseData = <<1,2,3,4,5,6,7,8>>,
+    ChallengeData = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    ResponseData = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     ?assertEqual(ChallengeData, ResponseData).
 
 path_challenge_response_mismatch_test() ->
-    ChallengeData = <<1,2,3,4,5,6,7,8>>,
-    ResponseData = <<8,7,6,5,4,3,2,1>>,
+    ChallengeData = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    ResponseData = <<8, 7, 6, 5, 4, 3, 2, 1>>,
     ?assert(ChallengeData /= ResponseData).
 
 %%====================================================================
@@ -178,7 +181,7 @@ path_challenge_response_mismatch_test() ->
 path_validation_success_test() ->
     %% Start with unknown path
     Path = #path_state{
-        remote_addr = {{192,168,1,100}, 4433},
+        remote_addr = {{192, 168, 1, 100}, 4433},
         status = unknown
     },
 
@@ -201,9 +204,9 @@ path_validation_success_test() ->
 path_validation_timeout_test() ->
     %% Path validation can fail after timeout
     Path = #path_state{
-        remote_addr = {{192,168,1,100}, 4433},
+        remote_addr = {{192, 168, 1, 100}, 4433},
         status = validating,
-        challenge_data = <<1,2,3,4,5,6,7,8>>,
+        challenge_data = <<1, 2, 3, 4, 5, 6, 7, 8>>,
         challenge_count = 3
     },
 
@@ -217,13 +220,13 @@ path_validation_timeout_test() ->
 path_validation_failure_test() ->
     %% Path validation fails on mismatched response
     Path = #path_state{
-        remote_addr = {{192,168,1,100}, 4433},
+        remote_addr = {{192, 168, 1, 100}, 4433},
         status = validating,
-        challenge_data = <<1,2,3,4,5,6,7,8>>
+        challenge_data = <<1, 2, 3, 4, 5, 6, 7, 8>>
     },
 
     %% Mismatched response doesn't validate
-    WrongResponse = <<8,7,6,5,4,3,2,1>>,
+    WrongResponse = <<8, 7, 6, 5, 4, 3, 2, 1>>,
     ?assert(Path#path_state.challenge_data /= WrongResponse).
 
 %%====================================================================

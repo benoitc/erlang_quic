@@ -119,7 +119,10 @@ higher_limit_test() ->
             CID = <<Seq, Seq, Seq, Seq, Seq, Seq, Seq, Seq>>,
             Token = crypto:strong_rand_bytes(16),
             handle_new_connection_id(Seq, 0, CID, Token, AccState)
-        end, {ok, State}, lists:seq(0, 7)),
+        end,
+        {ok, State},
+        lists:seq(0, 7)
+    ),
 
     ?assertEqual(8, length(FinalState#test_state.peer_cid_pool)),
 
@@ -213,11 +216,14 @@ handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
 
     %% Retire CIDs with seq < RetirePrior
     RetiredPool = lists:map(
-        fun(#cid_entry{seq_num = S} = Entry) when S < RetirePrior ->
+        fun
+            (#cid_entry{seq_num = S} = Entry) when S < RetirePrior ->
                 Entry#cid_entry{status = retired};
-           (Entry) ->
+            (Entry) ->
                 Entry
-        end, Pool),
+        end,
+        Pool
+    ),
 
     %% Add new CID entry
     NewEntry = #cid_entry{

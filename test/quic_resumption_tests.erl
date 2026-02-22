@@ -21,7 +21,8 @@ new_session_ticket_encoding_test() ->
     Ticket = #session_ticket{
         server_name = <<"example.com">>,
         ticket = crypto:strong_rand_bytes(32),
-        lifetime = 86400,  % 24 hours
+        % 24 hours
+        lifetime = 86400,
         age_add = 12345,
         nonce = <<1, 2, 3, 4, 5, 6, 7, 8>>,
         resumption_secret = crypto:strong_rand_bytes(32),
@@ -59,8 +60,9 @@ new_session_ticket_decoding_test() ->
     EarlyDataExt = <<16#00, 16#2a, 4:16, MaxEarlyData:32>>,
     ExtLen = byte_size(EarlyDataExt),
 
-    Encoded = <<Lifetime:32, AgeAdd:32, NonceLen:8, Nonce/binary,
-                TicketLen:16, TicketData/binary, ExtLen:16, EarlyDataExt/binary>>,
+    Encoded =
+        <<Lifetime:32, AgeAdd:32, NonceLen:8, Nonce/binary, TicketLen:16, TicketData/binary,
+            ExtLen:16, EarlyDataExt/binary>>,
 
     %% Parse it
     {ok, Parsed} = quic_ticket:parse_new_session_ticket(Encoded),
@@ -81,13 +83,15 @@ resumption_secret_derivation_test() ->
 
     %% Derive resumption secret
     ResumptionSecret = quic_ticket:derive_resumption_secret(
-        Cipher, MasterSecret, TranscriptHash, <<>>),
+        Cipher, MasterSecret, TranscriptHash, <<>>
+    ),
 
     %% Should be 32 bytes for SHA-256
     ?assertEqual(32, byte_size(ResumptionSecret)),
     %% Should be deterministic
     ResumptionSecret2 = quic_ticket:derive_resumption_secret(
-        Cipher, MasterSecret, TranscriptHash, <<>>),
+        Cipher, MasterSecret, TranscriptHash, <<>>
+    ),
     ?assertEqual(ResumptionSecret, ResumptionSecret2).
 
 %% Test PSK derivation from resumption secret and ticket nonce
@@ -130,7 +134,8 @@ ticket_creation_test() ->
     ALPN = <<"h3">>,
 
     Ticket = quic_ticket:create_ticket(
-        ServerName, ResumptionSecret, MaxEarlyData, Cipher, ALPN),
+        ServerName, ResumptionSecret, MaxEarlyData, Cipher, ALPN
+    ),
 
     ?assertEqual(ServerName, Ticket#session_ticket.server_name),
     ?assertEqual(ResumptionSecret, Ticket#session_ticket.resumption_secret),
@@ -178,7 +183,8 @@ new_session_ticket_no_early_data_test() ->
         age_add = 11111,
         nonce = <<1, 2, 3, 4>>,
         resumption_secret = crypto:strong_rand_bytes(32),
-        max_early_data = 0,  % No early data
+        % No early data
+        max_early_data = 0,
         received_at = erlang:system_time(second),
         cipher = aes_128_gcm,
         alpn = undefined
@@ -236,12 +242,14 @@ ticket_expiry_test() ->
     Ticket = #session_ticket{
         server_name = ServerName,
         ticket = crypto:strong_rand_bytes(32),
-        lifetime = 3600,  % 1 hour
+        % 1 hour
+        lifetime = 3600,
         age_add = 12345,
         nonce = <<1, 2, 3, 4, 5, 6, 7, 8>>,
         resumption_secret = crypto:strong_rand_bytes(32),
         max_early_data = 16384,
-        received_at = erlang:system_time(second) - 7200,  % 2 hours ago
+        % 2 hours ago
+        received_at = erlang:system_time(second) - 7200,
         cipher = aes_128_gcm,
         alpn = <<"h3">>
     },
@@ -339,12 +347,16 @@ psk_binder_computation_test() ->
     EarlySecret = quic_crypto:derive_early_secret(aes_128_gcm, PSK),
 
     %% Then compute binder using early secret
-    Binder = quic_crypto:compute_psk_binder(aes_128_gcm, EarlySecret, TruncatedTranscript, resumption),
+    Binder = quic_crypto:compute_psk_binder(
+        aes_128_gcm, EarlySecret, TruncatedTranscript, resumption
+    ),
 
     %% Should be 32 bytes for SHA-256
     ?assertEqual(32, byte_size(Binder)),
     %% Should be deterministic
-    Binder2 = quic_crypto:compute_psk_binder(aes_128_gcm, EarlySecret, TruncatedTranscript, resumption),
+    Binder2 = quic_crypto:compute_psk_binder(
+        aes_128_gcm, EarlySecret, TruncatedTranscript, resumption
+    ),
     ?assertEqual(Binder, Binder2).
 
 %% Test early secret derivation with PSK
@@ -371,7 +383,8 @@ pre_shared_key_extension_encoding_test() ->
         nonce = <<1, 2, 3, 4, 5, 6, 7, 8>>,
         resumption_secret = crypto:strong_rand_bytes(32),
         max_early_data = 16384,
-        received_at = erlang:system_time(second) - 100,  % 100 seconds ago
+        % 100 seconds ago
+        received_at = erlang:system_time(second) - 100,
         cipher = aes_128_gcm,
         alpn = <<"h3">>
     },
@@ -392,7 +405,8 @@ clienthello_with_psk_test() ->
         nonce = <<1, 2, 3, 4, 5, 6, 7, 8>>,
         resumption_secret = crypto:strong_rand_bytes(32),
         max_early_data = 16384,
-        received_at = erlang:system_time(second) - 10,  % 10 seconds ago
+        % 10 seconds ago
+        received_at = erlang:system_time(second) - 10,
         cipher = aes_128_gcm,
         alpn = <<"h3">>
     },

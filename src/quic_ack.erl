@@ -58,7 +58,8 @@
 -record(ack_state, {
     %% Receive tracking
     largest_recv :: non_neg_integer() | undefined,
-    recv_time :: non_neg_integer() | undefined,  % monotonic milliseconds
+    % monotonic milliseconds
+    recv_time :: non_neg_integer() | undefined,
     ack_ranges = [] :: [{non_neg_integer(), non_neg_integer()}],
 
     %% Send tracking
@@ -100,26 +101,34 @@ record_received(State, PacketNumber) ->
 
 %% @doc Record that a packet was received, optionally marking it as ACK-eliciting.
 -spec record_received(ack_state(), non_neg_integer(), boolean()) -> ack_state().
-record_received(#ack_state{largest_recv = Largest, ack_ranges = Ranges,
-                           ack_eliciting_received = AckEliciting} = State,
-                PacketNumber, IsAckEliciting) ->
+record_received(
+    #ack_state{
+        largest_recv = Largest,
+        ack_ranges = Ranges,
+        ack_eliciting_received = AckEliciting
+    } = State,
+    PacketNumber,
+    IsAckEliciting
+) ->
     Now = erlang:monotonic_time(millisecond),
 
     %% Update largest received
-    {NewLargest, NewTime} = case Largest of
-        undefined -> {PacketNumber, Now};
-        L when PacketNumber > L -> {PacketNumber, Now};
-        _ -> {Largest, State#ack_state.recv_time}
-    end,
+    {NewLargest, NewTime} =
+        case Largest of
+            undefined -> {PacketNumber, Now};
+            L when PacketNumber > L -> {PacketNumber, Now};
+            _ -> {Largest, State#ack_state.recv_time}
+        end,
 
     %% Update ACK ranges
     NewRanges = add_to_ranges(PacketNumber, Ranges),
 
     %% Update ACK-eliciting count
-    NewAckEliciting = case IsAckEliciting of
-        true -> AckEliciting + 1;
-        false -> AckEliciting
-    end,
+    NewAckEliciting =
+        case IsAckEliciting of
+            true -> AckEliciting + 1;
+            false -> AckEliciting
+        end,
 
     State#ack_state{
         largest_recv = NewLargest,
@@ -143,8 +152,15 @@ generate_ack(State) ->
 -spec generate_ack(ack_state(), non_neg_integer()) -> {ok, term()} | {error, no_packets}.
 generate_ack(#ack_state{largest_recv = undefined}, _Now) ->
     {error, no_packets};
-generate_ack(#ack_state{largest_recv = Largest, recv_time = RecvTime,
-                        ack_ranges = Ranges, ack_delay_exponent = Exp}, Now) ->
+generate_ack(
+    #ack_state{
+        largest_recv = Largest,
+        recv_time = RecvTime,
+        ack_ranges = Ranges,
+        ack_delay_exponent = Exp
+    },
+    Now
+) ->
     %% Calculate ACK delay in microseconds, then encode
     AckDelayUs = (Now - RecvTime) * 1000,
     AckDelayEncoded = AckDelayUs bsr Exp,
@@ -196,22 +212,27 @@ process_ack(State, {ack, LargestAcked, _AckDelay, FirstRange, AckRanges}, SentPa
             Error;
         AckedPNs ->
             %% Filter to only packets we actually sent
-            NewlyAcked = case maps:size(SentPackets) of
-                0 -> AckedPNs;
-                _ -> [PN || PN <- AckedPNs, maps:is_key(PN, SentPackets)]
-            end,
+            NewlyAcked =
+                case maps:size(SentPackets) of
+                    0 -> AckedPNs;
+                    _ -> [PN || PN <- AckedPNs, maps:is_key(PN, SentPackets)]
+                end,
 
             %% Update largest acked
-            NewLargestAcked = case State#ack_state.largest_acked of
-                undefined -> LargestAcked;
-                Old when LargestAcked > Old -> LargestAcked;
-                Old -> Old
-            end,
+            NewLargestAcked =
+                case State#ack_state.largest_acked of
+                    undefined -> LargestAcked;
+                    Old when LargestAcked > Old -> LargestAcked;
+                    Old -> Old
+                end,
 
             %% Update ACK-eliciting in flight count
-            AckElicitingAcked = length([PN || PN <- NewlyAcked,
-                                              maps:is_key(PN, SentPackets),
-                                              is_ack_eliciting(maps:get(PN, SentPackets))]),
+            AckElicitingAcked = length([
+                PN
+             || PN <- NewlyAcked,
+                maps:is_key(PN, SentPackets),
+                is_ack_eliciting(maps:get(PN, SentPackets))
+            ]),
             NewInFlight = max(0, State#ack_state.ack_eliciting_in_flight - AckElicitingAcked),
 
             NewState = State#ack_state{
@@ -221,10 +242,13 @@ process_ack(State, {ack, LargestAcked, _AckDelay, FirstRange, AckRanges}, SentPa
 
             {NewState, NewlyAcked}
     end;
-
-process_ack(State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, ECT0, ECT1, ECNCE}, SentPackets) ->
+process_ack(
+    State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, ECT0, ECT1, ECNCE}, SentPackets
+) ->
     %% Process ACK and return ECN counts for congestion control
-    {NewState, NewlyAcked} = process_ack(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, SentPackets),
+    {NewState, NewlyAcked} = process_ack(
+        State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, SentPackets
+    ),
     {NewState, NewlyAcked, {ecn, ECT0, ECT1, ECNCE}}.
 
 %%====================================================================
@@ -322,7 +346,8 @@ ack_ranges_to_pn_list(PrevStart, [{Gap, Range} | Rest]) ->
     end.
 
 %% Check if a sent packet info indicates ACK-eliciting
-is_ack_eliciting(#sent_packet{ack_eliciting = AE}) -> AE;
+is_ack_eliciting(#sent_packet{ack_eliciting = AE}) ->
+    AE;
 is_ack_eliciting(Info) when is_map(Info) ->
     maps:get(ack_eliciting, Info, false);
 is_ack_eliciting(_) ->

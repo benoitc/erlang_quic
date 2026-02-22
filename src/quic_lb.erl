@@ -49,6 +49,10 @@
 
 -include("quic.hrl").
 
+-type lb_config() :: #lb_config{}.
+-type cid_config() :: #cid_config{}.
+-export_type([lb_config/0, cid_config/0]).
+
 %%====================================================================
 %% API
 %%====================================================================
@@ -61,9 +65,7 @@
 %%   - config_rotation: 0..6 (default: 0)
 %%   - nonce_len: 4..18 (default: 4)
 %%   - key: binary() - 16-byte AES key (required for cipher algorithms)
-%%
-%% @returns {ok, #lb_config{}} | {error, term()}
--spec new_config(map()) -> {ok, #lb_config{}} | {error, term()}.
+-spec new_config(map()) -> {ok, lb_config()} | {error, term()}.
 new_config(Opts) when is_map(Opts) ->
     try
         ServerID = maps:get(server_id, Opts),
@@ -97,9 +99,7 @@ new_config(Opts) when is_map(Opts) ->
 %%   - lb_config: #lb_config{} | undefined - LB configuration
 %%   - cid_len: 1..20 (default: 8) - Target CID length
 %%   - reset_secret: binary() - Secret for reset token generation
-%%
-%% @returns {ok, #cid_config{}} | {error, term()}
--spec new_cid_config(map()) -> {ok, #cid_config{}} | {error, term()}.
+-spec new_cid_config(map()) -> {ok, cid_config()} | {error, term()}.
 new_cid_config(Opts) when is_map(Opts) ->
     LBConfig = maps:get(lb_config, Opts, undefined),
     CIDLen = maps:get(cid_len, Opts, 8),
@@ -134,7 +134,7 @@ new_cid_config(Opts) when is_map(Opts) ->
     end.
 
 %% @doc Validate an LB configuration.
--spec validate_config(#lb_config{}) -> ok | {error, term()}.
+-spec validate_config(lb_config()) -> ok | {error, term()}.
 validate_config(#lb_config{
     config_rotation = CR,
     algorithm = Algorithm,
@@ -145,24 +145,34 @@ validate_config(#lb_config{
 }) ->
     Validations = [
         {CR >= 0 andalso CR =< 6, {invalid_config_rotation, CR}},
-        {lists:member(Algorithm, [plaintext, stream_cipher, block_cipher]),
-         {invalid_algorithm, Algorithm}},
+        {
+            lists:member(Algorithm, [plaintext, stream_cipher, block_cipher]),
+            {invalid_algorithm, Algorithm}
+        },
         {is_binary(ServerID), {invalid_server_id, not_binary}},
-        {ServerIDLen >= 1 andalso ServerIDLen =< ?LB_MAX_SERVER_ID_LEN,
-         {invalid_server_id_len, ServerIDLen}},
-        {byte_size(ServerID) =:= ServerIDLen,
-         {server_id_len_mismatch, byte_size(ServerID), ServerIDLen}},
-        {NonceLen >= ?LB_MIN_NONCE_LEN andalso NonceLen =< ?LB_MAX_NONCE_LEN,
-         {invalid_nonce_len, NonceLen}},
-        {Algorithm =:= plaintext orelse
-         (is_binary(Key) andalso byte_size(Key) =:= 16),
-         {missing_or_invalid_key, Algorithm}}
+        {
+            ServerIDLen >= 1 andalso ServerIDLen =< ?LB_MAX_SERVER_ID_LEN,
+            {invalid_server_id_len, ServerIDLen}
+        },
+        {
+            byte_size(ServerID) =:= ServerIDLen,
+            {server_id_len_mismatch, byte_size(ServerID), ServerIDLen}
+        },
+        {
+            NonceLen >= ?LB_MIN_NONCE_LEN andalso NonceLen =< ?LB_MAX_NONCE_LEN,
+            {invalid_nonce_len, NonceLen}
+        },
+        {
+            Algorithm =:= plaintext orelse
+                (is_binary(Key) andalso byte_size(Key) =:= 16),
+            {missing_or_invalid_key, Algorithm}
+        }
     ],
     validate_list(Validations).
 
 %% @doc Generate a CID using the configuration.
 %% Uses a random nonce.
--spec generate_cid(#cid_config{}) -> binary().
+-spec generate_cid(cid_config()) -> binary().
 generate_cid(#cid_config{lb_config = undefined, cid_len = Len}) ->
     crypto:strong_rand_bytes(Len);
 generate_cid(#cid_config{lb_config = #lb_config{nonce_len = NonceLen}} = Config) ->
@@ -170,7 +180,7 @@ generate_cid(#cid_config{lb_config = #lb_config{nonce_len = NonceLen}} = Config)
     generate_cid(Config, Nonce).
 
 %% @doc Generate a CID with an explicit nonce.
--spec generate_cid(#cid_config{}, binary()) -> binary().
+-spec generate_cid(cid_config(), binary()) -> binary().
 generate_cid(#cid_config{lb_config = undefined, cid_len = Len}, _Nonce) ->
     crypto:strong_rand_bytes(Len);
 generate_cid(#cid_config{lb_config = LBConfig}, Nonce) ->
@@ -184,13 +194,15 @@ generate_cid(#cid_config{lb_config = LBConfig}, Nonce) ->
     } = LBConfig,
 
     %% Ensure nonce is correct length
-    ActualNonce = case byte_size(Nonce) of
-        NonceLen -> Nonce;
-        N when N > NonceLen -> binary:part(Nonce, 0, NonceLen);
-        N when N < NonceLen ->
-            Pad = crypto:strong_rand_bytes(NonceLen - N),
-            <<Nonce/binary, Pad/binary>>
-    end,
+    ActualNonce =
+        case byte_size(Nonce) of
+            NonceLen ->
+                Nonce;
+            N when N > NonceLen -> binary:part(Nonce, 0, NonceLen);
+            N when N < NonceLen ->
+                Pad = crypto:strong_rand_bytes(NonceLen - N),
+                <<Nonce/binary, Pad/binary>>
+        end,
 
     %% Calculate CID length (excluding first byte with CR/Len)
     CIDLen = 1 + ServerIDLen + NonceLen,
@@ -208,7 +220,7 @@ generate_cid(#cid_config{lb_config = LBConfig}, Nonce) ->
     end.
 
 %% @doc Extract the server ID from a CID.
--spec decode_server_id(binary(), #lb_config{}) -> {ok, binary()} | {error, term()}.
+-spec decode_server_id(binary(), lb_config()) -> {ok, binary()} | {error, term()}.
 decode_server_id(CID, #lb_config{algorithm = Algorithm} = Config) when byte_size(CID) >= 1 ->
     case Algorithm of
         plaintext ->
@@ -234,7 +246,7 @@ is_lb_routable(CID) ->
     get_config_rotation(CID) =/= ?LB_CR_UNROUTABLE.
 
 %% @doc Calculate the expected CID length from configuration.
--spec expected_cid_len(#lb_config{}) -> pos_integer().
+-spec expected_cid_len(lb_config()) -> pos_integer().
 expected_cid_len(#lb_config{server_id_len = ServerIDLen, nonce_len = NonceLen}) ->
     1 + ServerIDLen + NonceLen.
 
@@ -279,8 +291,10 @@ encode_stream_cipher(FirstByte, ServerID, Nonce, Key) ->
     <<FinalFirstByte, EncServerID/binary, Nonce/binary>>.
 
 %% @private Decode stream cipher CID
-decode_stream_cipher(<<FirstByte, Rest/binary>>,
-                     #lb_config{server_id_len = ServerIDLen, nonce_len = NonceLen, key = Key}) ->
+decode_stream_cipher(
+    <<FirstByte, Rest/binary>>,
+    #lb_config{server_id_len = ServerIDLen, nonce_len = NonceLen, key = Key}
+) ->
     EncServerIDLen = ServerIDLen,
     case Rest of
         <<EncServerID:EncServerIDLen/binary, Nonce:NonceLen/binary, _/binary>> ->
@@ -384,8 +398,10 @@ encode_block_cipher_truncated(Data, Key, TotalLen, CR) ->
     <<FinalFirstByte, EncPayloadFirst16/binary, EncPayloadRest/binary>>.
 
 %% @private Decode block cipher CID
-decode_block_cipher(<<FirstByte, Rest/binary>> = CID,
-                    #lb_config{server_id_len = ServerIDLen, nonce_len = NonceLen, key = Key}) ->
+decode_block_cipher(
+    <<FirstByte, Rest/binary>> = CID,
+    #lb_config{server_id_len = ServerIDLen, nonce_len = NonceLen, key = Key}
+) ->
     DataLen = byte_size(CID),
 
     case DataLen of

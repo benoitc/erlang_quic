@@ -91,12 +91,10 @@ run_server(TestCase, Port, CertsDir, WwwDir) ->
                             quic_listener:stop(Listener),
                             halt(?EXIT_SUCCESS)
                     end;
-
                 {error, Reason} ->
                     io:format("Failed to start listener: ~p~n", [Reason]),
                     halt(?EXIT_FAILURE)
             end;
-
         _ ->
             io:format("Failed to read certificates~n"),
             halt(?EXIT_FAILURE)
@@ -159,25 +157,22 @@ connection_handler(ConnPid, ConnRef, WwwDir, TestCase) ->
         {quic, ConnRef, {connected, Info}} ->
             io:format("Handler got connected: ~p~n", [Info]),
             connection_handler(ConnPid, ConnRef, WwwDir, TestCase);
-
         {quic, ConnRef, {stream_opened, StreamId}} ->
             io:format("Handler got stream_opened: ~p~n", [StreamId]),
             handle_stream(ConnPid, ConnRef, StreamId, WwwDir, TestCase);
-
         {quic, ConnRef, {stream_data, StreamId, Data, Fin}} ->
-            io:format("Handler got stream_data: stream=~p size=~p fin=~p~n",
-                      [StreamId, byte_size(Data), Fin]),
+            io:format(
+                "Handler got stream_data: stream=~p size=~p fin=~p~n",
+                [StreamId, byte_size(Data), Fin]
+            ),
             %% Handle request
             handle_request(ConnPid, ConnRef, StreamId, Data, WwwDir, TestCase);
-
         {quic, ConnRef, {closed, Reason}} ->
             io:format("Handler got closed: ~p~n", [Reason]),
             ok;
-
         Other ->
             io:format("Handler got unexpected: ~p~n", [Other]),
             connection_handler(ConnPid, ConnRef, WwwDir, TestCase)
-
     after 60000 ->
         io:format("Handler timeout~n"),
         ok
@@ -233,11 +228,12 @@ parse_request(Data) ->
             case binary:split(RequestLine, <<" ">>, [global]) of
                 [<<"GET">>, Path | _] ->
                     %% Remove leading slash for file path
-                    CleanPath = case Path of
-                        <<"/">> -> <<"index.html">>;
-                        <<"/", Rest/binary>> -> Rest;
-                        _ -> Path
-                    end,
+                    CleanPath =
+                        case Path of
+                            <<"/">> -> <<"index.html">>;
+                            <<"/", Rest/binary>> -> Rest;
+                            _ -> Path
+                        end,
                     {ok, binary_to_list(CleanPath)};
                 _ ->
                     error

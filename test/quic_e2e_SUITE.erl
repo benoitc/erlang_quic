@@ -95,13 +95,14 @@ init_per_suite(Config) ->
 
     % Path to CA certificate for verification
     PrivDir = code:priv_dir(quic),
-    CertsDir = case PrivDir of
-        {error, _} ->
-            % Fallback to relative path from test directory
-            filename:join([code:lib_dir(quic), "..", "certs"]);
-        _ ->
-            filename:join([PrivDir, "..", "certs"])
-    end,
+    CertsDir =
+        case PrivDir of
+            {error, _} ->
+                % Fallback to relative path from test directory
+                filename:join([code:lib_dir(quic), "..", "certs"]);
+            _ ->
+                filename:join([PrivDir, "..", "certs"])
+        end,
     CaCert = filename:join(CertsDir, "ca.pem"),
 
     ct:pal("E2E Test Configuration:"),
@@ -174,9 +175,11 @@ handshake_with_alpn(Config) ->
             % Verify ALPN was negotiated
             AlpnProtocol = maps:get(alpn_protocol, Info, undefined),
             ct:pal("Negotiated ALPN: ~p", [AlpnProtocol]),
-            ?assert(AlpnProtocol =:= <<"h3">> orelse
+            ?assert(
+                AlpnProtocol =:= <<"h3">> orelse
                     AlpnProtocol =:= <<"echo">> orelse
-                    AlpnProtocol =:= undefined),
+                    AlpnProtocol =:= undefined
+            ),
             quic:close(ConnRef, normal),
             ok
     after 10000 ->
@@ -447,10 +450,11 @@ wait_for_server(Host, Port, Retries) ->
     case gen_udp:open(0, [binary, {active, false}]) of
         {ok, Socket} ->
             % Try to send a packet (won't get response, but verifies route)
-            HostAddr = case inet:parse_address(Host) of
-                {ok, Addr} -> Addr;
-                {error, _} -> Host
-            end,
+            HostAddr =
+                case inet:parse_address(Host) of
+                    {ok, Addr} -> Addr;
+                    {error, _} -> Host
+                end,
             Result = gen_udp:send(Socket, HostAddr, Port, <<0:32>>),
             gen_udp:close(Socket),
             case Result of

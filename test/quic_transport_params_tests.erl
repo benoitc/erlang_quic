@@ -197,7 +197,8 @@ encode_zero_values_test() ->
 encode_max_values_test() ->
     %% Large values should encode correctly with 8-byte varints
     Params = #{
-        initial_max_data => 4611686018427387903  % Max varint value (2^62 - 1)
+        % Max varint value (2^62 - 1)
+        initial_max_data => 4611686018427387903
     },
     Encoded = quic_tls:encode_transport_params(Params),
     {ok, Decoded} = quic_tls:decode_transport_params(Encoded),

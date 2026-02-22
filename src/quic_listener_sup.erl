@@ -46,7 +46,7 @@
 %% Options:
 %%   - pool_size: Number of listener processes (default 1)
 %%   - All other options are passed to quic_listener
--spec start_link(inet:port_number(), map()) -> {ok, pid()} | {error, term()}.
+-spec start_link(inet:port_number(), map()) -> supervisor:startlink_ret().
 start_link(Port, Opts) ->
     supervisor:start_link(?MODULE, {Port, Opts}).
 
@@ -66,8 +66,11 @@ get_listeners(Sup) ->
     case lists:keyfind(quic_listener_sup_sup, 1, Children) of
         {quic_listener_sup_sup, SupSupPid, _, _} when is_pid(SupSupPid) ->
             %% Get actual listeners from the listener_sup_sup
-            [Pid || {{quic_listener, _}, Pid, _, _} <- supervisor:which_children(SupSupPid),
-                    is_pid(Pid)];
+            [
+                Pid
+             || {{quic_listener, _}, Pid, _, _} <- supervisor:which_children(SupSupPid),
+                is_pid(Pid)
+            ];
         _ ->
             []
     end.
@@ -76,6 +79,9 @@ get_listeners(Sup) ->
 %% supervisor callbacks
 %%====================================================================
 
+%% @private
+-spec init({inet:port_number(), map()}) ->
+    {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
 init({Port, Opts}) ->
     Self = self(),
 
@@ -86,7 +92,11 @@ init({Port, Opts}) ->
             ok;
         Name when is_atom(Name) ->
             %% Ignore errors in case registry isn't started (standalone listener_sup usage)
-            try quic_server_registry:register(Name, Self, Port, Opts) catch _:_ -> ok end
+            try
+                quic_server_registry:register(Name, Self, Port, Opts)
+            catch
+                _:_ -> ok
+            end
     end,
 
     SupFlags = #{strategy => rest_for_one, intensity => 10, period => 5},
@@ -101,11 +111,11 @@ init({Port, Opts}) ->
     },
 
     ListenerSupSup = #{
-            id => quic_listener_sup_sup,
-            start => {quic_listener_sup_sup, start_link, [Port, Opts, Self]},
-            restart => permanent,
-            type => supervisor,
-            modules => [quic_listener_sup_sup]
-        },
+        id => quic_listener_sup_sup,
+        start => {quic_listener_sup_sup, start_link, [Port, Opts, Self]},
+        restart => permanent,
+        type => supervisor,
+        modules => [quic_listener_sup_sup]
+    },
 
     {ok, {SupFlags, [Manager, ListenerSupSup]}}.

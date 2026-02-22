@@ -69,10 +69,12 @@ on_max_data_received_test() ->
 
 max_data_only_increases_test() ->
     State = quic_flow:new(#{peer_initial_max_data => 10000}),
-    S1 = quic_flow:on_max_data_received(State, 5000),  % Lower
+    % Lower
+    S1 = quic_flow:on_max_data_received(State, 5000),
     ?assertEqual(10000, quic_flow:send_limit(S1)),
 
-    S2 = quic_flow:on_max_data_received(S1, 15000),  % Higher
+    % Higher
+    S2 = quic_flow:on_max_data_received(S1, 15000),
     ?assertEqual(15000, quic_flow:send_limit(S2)).
 
 %%====================================================================
@@ -88,8 +90,10 @@ on_data_received_test() ->
 on_data_received_exceeds_limit_test() ->
     State = quic_flow:new(#{initial_max_data => 5000}),
     {ok, S1} = quic_flow:on_data_received(State, 5000),
-    ?assertEqual({error, flow_control_error},
-                 quic_flow:on_data_received(S1, 1)).
+    ?assertEqual(
+        {error, flow_control_error},
+        quic_flow:on_data_received(S1, 1)
+    ).
 
 on_data_received_at_limit_test() ->
     State = quic_flow:new(#{initial_max_data => 5000}),
@@ -110,7 +114,8 @@ should_send_max_data_after_threshold_test() ->
     {ok, S1} = quic_flow:on_data_received(State, 4000),
     ?assertNot(quic_flow:should_send_max_data(S1)),
 
-    {ok, S2} = quic_flow:on_data_received(S1, 2000),  % 6000 total > 50%
+    % 6000 total > 50%
+    {ok, S2} = quic_flow:on_data_received(S1, 2000),
     ?assert(quic_flow:should_send_max_data(S2)).
 
 generate_max_data_test() ->
@@ -195,7 +200,8 @@ full_recv_cycle_test() ->
 
     %% Generate MAX_DATA
     {NewMax, S3} = quic_flow:generate_max_data(S2),
-    ?assertEqual(16000, NewMax),  % 6000 + 10000
+    % 6000 + 10000
+    ?assertEqual(16000, NewMax),
     ?assertNot(quic_flow:should_send_max_data(S3)),
 
     %% Can receive more now

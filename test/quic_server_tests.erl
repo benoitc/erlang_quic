@@ -40,11 +40,19 @@ setup() ->
 
 cleanup(_) ->
     %% Clean up servers but keep the application running
-    Servers = try quic:which_servers() catch _:_ -> [] end,
-    lists:foreach(fun(Name) ->
-        _ = quic:stop_server(Name),
-        _ = (catch quic_server_registry:unregister(Name))
-    end, Servers),
+    Servers =
+        try
+            quic:which_servers()
+        catch
+            _:_ -> []
+        end,
+    lists:foreach(
+        fun(Name) ->
+            _ = quic:stop_server(Name),
+            _ = (catch quic_server_registry:unregister(Name))
+        end,
+        Servers
+    ),
     %% Wait for cleanup
     timer:sleep(50),
     ok.
@@ -54,21 +62,17 @@ cleanup(_) ->
 %%====================================================================
 
 server_test_() ->
-    {foreach,
-        fun setup/0,
-        fun cleanup/1,
-        [
-            {"Start and stop server", fun start_stop_server_test/0},
-            {"Multiple servers", fun multiple_servers_test/0},
-            {"Duplicate name error", fun duplicate_name_test/0},
-            {"Get server info", fun get_server_info_test/0},
-            {"Server not found", fun server_not_found_test/0},
-            {"Pool size option", fun pool_size_test/0},
-            {"Which servers", fun which_servers_test/0},
-            {"Get server port", fun get_server_port_test/0},
-            {"Badarg tests", fun badarg_test/0}
-        ]
-    }.
+    {foreach, fun setup/0, fun cleanup/1, [
+        {"Start and stop server", fun start_stop_server_test/0},
+        {"Multiple servers", fun multiple_servers_test/0},
+        {"Duplicate name error", fun duplicate_name_test/0},
+        {"Get server info", fun get_server_info_test/0},
+        {"Server not found", fun server_not_found_test/0},
+        {"Pool size option", fun pool_size_test/0},
+        {"Which servers", fun which_servers_test/0},
+        {"Get server port", fun get_server_port_test/0},
+        {"Badarg tests", fun badarg_test/0}
+    ]}.
 
 %%====================================================================
 %% Test cases
@@ -139,7 +143,8 @@ get_server_info_test() ->
 
     ?assertEqual(Pid, maps:get(pid, Info)),
     ?assert(is_integer(maps:get(port, Info))),
-    ?assert(maps:get(port, Info) >= 0),  %% Port 0 means ephemeral
+    %% Port 0 means ephemeral
+    ?assert(maps:get(port, Info) >= 0),
     ?assert(is_integer(maps:get(started_at, Info))),
 
     %% Opts should contain the name added by start_server
@@ -163,10 +168,13 @@ pool_size_test() ->
 
 which_servers_test() ->
     %% Clean up any leftover servers from previous tests
-    lists:foreach(fun(N) ->
-        _ = quic:stop_server(N),
-        _ = (catch quic_server_registry:unregister(N))
-    end, quic:which_servers()),
+    lists:foreach(
+        fun(N) ->
+            _ = quic:stop_server(N),
+            _ = (catch quic_server_registry:unregister(N))
+        end,
+        quic:which_servers()
+    ),
     timer:sleep(100),
 
     %% Now should be empty
@@ -188,7 +196,8 @@ get_server_port_test() ->
     %% Port 0 means ephemeral - should return actual OS-assigned port (> 0)
     {ok, Port} = quic:get_server_port(port_server),
     ?assert(is_integer(Port)),
-    ?assert(Port > 0),  %% Ephemeral ports are never 0
+    %% Ephemeral ports are never 0
+    ?assert(Port > 0),
     ?assert(Port < 65536),
 
     %% Second call should also return the same port (cached in registry)

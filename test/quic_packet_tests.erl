@@ -42,14 +42,19 @@ decode_pn_test() ->
 %%====================================================================
 
 initial_packet_roundtrip_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
-    SCID = <<10,20,30,40>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    SCID = <<10, 20, 30, 40>>,
     Token = <<"initial_token">>,
     Payload = <<"encrypted_payload">>,
     PN = 0,
 
-    Encoded = quic_packet:encode_long(initial, ?QUIC_VERSION_1, DCID, SCID,
-                                       #{token => Token, pn => PN, payload => Payload}),
+    Encoded = quic_packet:encode_long(
+        initial,
+        ?QUIC_VERSION_1,
+        DCID,
+        SCID,
+        #{token => Token, pn => PN, payload => Payload}
+    ),
 
     {ok, Packet, <<>>} = quic_packet:decode(Encoded, 8),
     ?assertEqual(initial, Packet#quic_packet.type),
@@ -61,13 +66,18 @@ initial_packet_roundtrip_test() ->
     ?assertEqual(Payload, Packet#quic_packet.payload).
 
 initial_packet_no_token_roundtrip_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
-    SCID = <<10,20,30,40>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    SCID = <<10, 20, 30, 40>>,
     Payload = <<"encrypted_payload">>,
     PN = 1,
 
-    Encoded = quic_packet:encode_long(initial, ?QUIC_VERSION_1, DCID, SCID,
-                                       #{pn => PN, payload => Payload}),
+    Encoded = quic_packet:encode_long(
+        initial,
+        ?QUIC_VERSION_1,
+        DCID,
+        SCID,
+        #{pn => PN, payload => Payload}
+    ),
 
     {ok, Packet, <<>>} = quic_packet:decode(Encoded, 8),
     ?assertEqual(initial, Packet#quic_packet.type),
@@ -76,13 +86,19 @@ initial_packet_no_token_roundtrip_test() ->
     ?assertEqual(Payload, Packet#quic_packet.payload).
 
 initial_packet_large_pn_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     SCID = <<>>,
     Payload = <<"data">>,
-    PN = 300,  % Requires 2 bytes
+    % Requires 2 bytes
+    PN = 300,
 
-    Encoded = quic_packet:encode_long(initial, ?QUIC_VERSION_1, DCID, SCID,
-                                       #{pn => PN, payload => Payload}),
+    Encoded = quic_packet:encode_long(
+        initial,
+        ?QUIC_VERSION_1,
+        DCID,
+        SCID,
+        #{pn => PN, payload => Payload}
+    ),
 
     {ok, Packet, <<>>} = quic_packet:decode(Encoded, 8),
     ?assertEqual(PN, Packet#quic_packet.pn).
@@ -92,13 +108,18 @@ initial_packet_large_pn_test() ->
 %%====================================================================
 
 handshake_packet_roundtrip_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
-    SCID = <<10,20,30,40>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    SCID = <<10, 20, 30, 40>>,
     Payload = <<"handshake_data">>,
     PN = 2,
 
-    Encoded = quic_packet:encode_long(handshake, ?QUIC_VERSION_1, DCID, SCID,
-                                       #{pn => PN, payload => Payload}),
+    Encoded = quic_packet:encode_long(
+        handshake,
+        ?QUIC_VERSION_1,
+        DCID,
+        SCID,
+        #{pn => PN, payload => Payload}
+    ),
 
     {ok, Packet, <<>>} = quic_packet:decode(Encoded, 8),
     ?assertEqual(handshake, Packet#quic_packet.type),
@@ -113,13 +134,18 @@ handshake_packet_roundtrip_test() ->
 %%====================================================================
 
 zero_rtt_packet_roundtrip_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
-    SCID = <<10,20,30,40>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    SCID = <<10, 20, 30, 40>>,
     Payload = <<"0rtt_data">>,
     PN = 0,
 
-    Encoded = quic_packet:encode_long(zero_rtt, ?QUIC_VERSION_1, DCID, SCID,
-                                       #{pn => PN, payload => Payload}),
+    Encoded = quic_packet:encode_long(
+        zero_rtt,
+        ?QUIC_VERSION_1,
+        DCID,
+        SCID,
+        #{pn => PN, payload => Payload}
+    ),
 
     {ok, Packet, <<>>} = quic_packet:decode(Encoded, 8),
     ?assertEqual(zero_rtt, Packet#quic_packet.type),
@@ -130,15 +156,20 @@ zero_rtt_packet_roundtrip_test() ->
 %%====================================================================
 
 retry_packet_roundtrip_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
-    SCID = <<10,20,30,40>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    SCID = <<10, 20, 30, 40>>,
     %% Retry payload = Retry Token + 16-byte Integrity Tag
     RetryToken = <<"retry_token_data">>,
     IntegrityTag = crypto:strong_rand_bytes(16),
     Payload = <<RetryToken/binary, IntegrityTag/binary>>,
 
-    Encoded = quic_packet:encode_long(retry, ?QUIC_VERSION_1, DCID, SCID,
-                                       #{payload => Payload}),
+    Encoded = quic_packet:encode_long(
+        retry,
+        ?QUIC_VERSION_1,
+        DCID,
+        SCID,
+        #{payload => Payload}
+    ),
 
     {ok, Packet, <<>>} = quic_packet:decode(Encoded, 8),
     ?assertEqual(retry, Packet#quic_packet.type),
@@ -149,7 +180,7 @@ retry_packet_roundtrip_test() ->
 %%====================================================================
 
 short_packet_roundtrip_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     Payload = <<"encrypted_app_data">>,
     PN = 100,
 
@@ -161,7 +192,7 @@ short_packet_roundtrip_test() ->
     ?assertEqual(PN, Packet#quic_packet.pn).
 
 short_packet_with_spin_bit_test() ->
-    DCID = <<1,2,3,4>>,
+    DCID = <<1, 2, 3, 4>>,
     Payload = <<"data">>,
     PN = 0,
 
@@ -173,9 +204,10 @@ short_packet_with_spin_bit_test() ->
     ?assertEqual(1, SpinBit).
 
 short_packet_large_pn_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     Payload = <<"data">>,
-    PN = 1000000,  % Requires 3 bytes
+    % Requires 3 bytes
+    PN = 1000000,
 
     Encoded = quic_packet:encode_short(DCID, PN, Payload, false),
 
@@ -188,15 +220,19 @@ short_packet_large_pn_test() ->
 
 long_header_detection_test() ->
     %% Long header starts with 1 in bit 7
-    LongPacket = quic_packet:encode_long(initial, ?QUIC_VERSION_1,
-                                          <<1,2,3,4>>, <<5,6,7,8>>,
-                                          #{pn => 0, payload => <<"data">>}),
+    LongPacket = quic_packet:encode_long(
+        initial,
+        ?QUIC_VERSION_1,
+        <<1, 2, 3, 4>>,
+        <<5, 6, 7, 8>>,
+        #{pn => 0, payload => <<"data">>}
+    ),
     <<FirstByte, _/binary>> = LongPacket,
     ?assertEqual(1, (FirstByte bsr 7) band 1).
 
 short_header_detection_test() ->
     %% Short header starts with 0 in bit 7, 1 in bit 6
-    ShortPacket = quic_packet:encode_short(<<1,2,3,4>>, 0, <<"data">>, false),
+    ShortPacket = quic_packet:encode_short(<<1, 2, 3, 4>>, 0, <<"data">>, false),
     <<FirstByte, _/binary>> = ShortPacket,
     ?assertEqual(0, (FirstByte bsr 7) band 1),
     ?assertEqual(1, (FirstByte bsr 6) band 1).
@@ -207,22 +243,32 @@ short_header_detection_test() ->
 
 empty_dcid_test() ->
     DCID = <<>>,
-    SCID = <<1,2,3,4>>,
+    SCID = <<1, 2, 3, 4>>,
     Payload = <<"data">>,
 
-    Encoded = quic_packet:encode_long(initial, ?QUIC_VERSION_1, DCID, SCID,
-                                       #{pn => 0, payload => Payload}),
+    Encoded = quic_packet:encode_long(
+        initial,
+        ?QUIC_VERSION_1,
+        DCID,
+        SCID,
+        #{pn => 0, payload => Payload}
+    ),
 
     {ok, Packet, <<>>} = quic_packet:decode(Encoded, 0),
     ?assertEqual(<<>>, Packet#quic_packet.dcid).
 
 empty_scid_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     SCID = <<>>,
     Payload = <<"data">>,
 
-    Encoded = quic_packet:encode_long(initial, ?QUIC_VERSION_1, DCID, SCID,
-                                       #{pn => 0, payload => Payload}),
+    Encoded = quic_packet:encode_long(
+        initial,
+        ?QUIC_VERSION_1,
+        DCID,
+        SCID,
+        #{pn => 0, payload => Payload}
+    ),
 
     {ok, Packet, <<>>} = quic_packet:decode(Encoded, 8),
     ?assertEqual(<<>>, Packet#quic_packet.scid).
@@ -233,7 +279,7 @@ empty_scid_test() ->
 
 %% Test encoding short header with key phase 0
 encode_short_key_phase_0_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     Payload = <<"data">>,
     PN = 0,
 
@@ -246,7 +292,7 @@ encode_short_key_phase_0_test() ->
 
 %% Test encoding short header with key phase 1
 encode_short_key_phase_1_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     Payload = <<"data">>,
     PN = 0,
 
@@ -266,12 +312,15 @@ decode_short_key_phase_test() ->
     ?assertEqual(0, quic_packet:decode_short_key_phase(16#40)),
     ?assertEqual(1, quic_packet:decode_short_key_phase(16#44)),
     %% With spin bit set
-    ?assertEqual(0, quic_packet:decode_short_key_phase(16#60)),  % 0110 0000
-    ?assertEqual(1, quic_packet:decode_short_key_phase(16#64)).  % 0110 0100
+
+    % 0110 0000
+    ?assertEqual(0, quic_packet:decode_short_key_phase(16#60)),
+    % 0110 0100
+    ?assertEqual(1, quic_packet:decode_short_key_phase(16#64)).
 
 %% Test that 4-arity encode_short is backward compatible (uses key phase 0)
 encode_short_backward_compatible_test() ->
-    DCID = <<1,2,3,4,5,6,7,8>>,
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     Payload = <<"data">>,
     PN = 0,
 
@@ -282,7 +331,7 @@ encode_short_backward_compatible_test() ->
 
 %% Test key phase and spin bit are independent
 key_phase_and_spin_bit_independent_test() ->
-    DCID = <<1,2,3,4>>,
+    DCID = <<1, 2, 3, 4>>,
     Payload = <<"data">>,
     PN = 0,
 

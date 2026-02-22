@@ -105,7 +105,8 @@ generate_ack_single_packet_test() ->
     S1 = quic_ack:record_received(State, 0),
     {ok, {ack, Largest, _Delay, FirstRange, Ranges}} = quic_ack:generate_ack(S1),
     ?assertEqual(0, Largest),
-    ?assertEqual(0, FirstRange),  % 1 packet - 1 = 0
+    % 1 packet - 1 = 0
+    ?assertEqual(0, FirstRange),
     ?assertEqual([], Ranges).
 
 generate_ack_range_test() ->
@@ -115,7 +116,8 @@ generate_ack_range_test() ->
     S3 = quic_ack:record_received(S2, 2),
     {ok, {ack, Largest, _Delay, FirstRange, Ranges}} = quic_ack:generate_ack(S3),
     ?assertEqual(2, Largest),
-    ?assertEqual(2, FirstRange),  % 3 packets - 1 = 2
+    % 3 packets - 1 = 2
+    ?assertEqual(2, FirstRange),
     ?assertEqual([], Ranges).
 
 generate_ack_with_gap_test() ->
@@ -126,7 +128,8 @@ generate_ack_with_gap_test() ->
     S4 = quic_ack:record_received(S3, 6),
     {ok, {ack, Largest, _Delay, FirstRange, AckRanges}} = quic_ack:generate_ack(S4),
     ?assertEqual(6, Largest),
-    ?assertEqual(1, FirstRange),  % 2 packets (5,6) - 1 = 1
+    % 2 packets (5,6) - 1 = 1
+    ?assertEqual(1, FirstRange),
     ?assertEqual(1, length(AckRanges)).
 
 %%====================================================================
@@ -160,7 +163,8 @@ mark_ack_sent_test() ->
 
 process_ack_simple_test() ->
     State = quic_ack:new(),
-    AckFrame = {ack, 5, 0, 5, []},  % Acks packets 0-5
+    % Acks packets 0-5
+    AckFrame = {ack, 5, 0, 5, []},
     {NewState, AckedPNs} = quic_ack:process_ack(State, AckFrame),
     ?assertEqual(5, quic_ack:largest_acked(NewState)),
     ?assertEqual([0, 1, 2, 3, 4, 5], lists:sort(AckedPNs)).
@@ -172,7 +176,8 @@ process_ack_with_sent_packets_test() ->
         1 => #{ack_eliciting => true},
         2 => #{ack_eliciting => false}
     },
-    AckFrame = {ack, 2, 0, 2, []},  % Acks 0-2
+    % Acks 0-2
+    AckFrame = {ack, 2, 0, 2, []},
     {_NewState, AckedPNs} = quic_ack:process_ack(State, AckFrame, SentPackets),
     ?assertEqual([0, 1, 2], lists:sort(AckedPNs)).
 
@@ -239,7 +244,8 @@ full_cycle_test() ->
     %% Receive some packets
     S1 = quic_ack:record_received(State, 0, true),
     S2 = quic_ack:record_received(S1, 1, true),
-    S3 = quic_ack:record_received(S2, 2, false),  % ACK-only
+    % ACK-only
+    S3 = quic_ack:record_received(S2, 2, false),
 
     ?assert(quic_ack:needs_ack(S3)),
 

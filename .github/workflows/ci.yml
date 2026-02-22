@@ -16,13 +16,13 @@ jobs:
         os: [ubuntu-22.04, ubuntu-24.04]
         include:
           - os: ubuntu-22.04
-            otp: '26.0'
+            otp: '26'
             rebar3: '3.24.0'
           - os: ubuntu-22.04
-            otp: '27.0'
+            otp: '27'
             rebar3: '3.24.0'
           - os: ubuntu-24.04
-            otp: '27.0'
+            otp: '27'
             rebar3: '3.24.0'
           - os: ubuntu-24.04
             otp: '28'
@@ -247,3 +247,33 @@ jobs:
 
       - name: Run XRef
         run: rebar3 xref
+
+  format:
+    name: erlfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: 'nightly'
+
+      - name: Run erlfmt check
+        run: rebar3 fmt --check
+
+  lint:
+    name: Elvis lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: 'nightly'
+
+      - name: Run elvis lint
+        run: rebar3 lint

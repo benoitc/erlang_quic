@@ -71,7 +71,8 @@ lookup_ticket(ServerName, Store) ->
             Age = Now - ReceivedAt,
             case Age =< Lifetime of
                 true -> {ok, Ticket};
-                false -> error  % Expired
+                % Expired
+                false -> error
             end;
         error ->
             error
@@ -89,7 +90,9 @@ clear_expired(Store) ->
     maps:filter(
         fun(_ServerName, #session_ticket{received_at = ReceivedAt, lifetime = Lifetime}) ->
             (Now - ReceivedAt) =< Lifetime
-        end, Store).
+        end,
+        Store
+    ).
 
 %%====================================================================
 %% PSK Derivation
@@ -97,7 +100,8 @@ clear_expired(Store) ->
 
 %% @doc Derive the resumption_master_secret from the master secret.
 %% RFC 8446 Section 7.1:
-%%   resumption_master_secret = Derive-Secret(Master Secret, "res master", ClientHello..client Finished)
+%%   resumption_master_secret
+%%          = Derive-Secret(Master Secret, "res master", ClientHello..client Finished)
 -spec derive_resumption_secret(atom(), binary(), binary(), binary()) -> binary().
 derive_resumption_secret(Cipher, MasterSecret, TranscriptHash, _ClientFinished) ->
     Hash = quic_crypto:cipher_to_hash(Cipher),
@@ -106,7 +110,7 @@ derive_resumption_secret(Cipher, MasterSecret, TranscriptHash, _ClientFinished) 
 %% @doc Derive PSK from resumption_master_secret and ticket nonce.
 %% RFC 8446 Section 4.6.1:
 %%   PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, Hash.length)
--spec derive_psk(binary(), #session_ticket{}) -> binary().
+-spec derive_psk(binary(), session_ticket()) -> binary().
 derive_psk(ResumptionSecret, #session_ticket{nonce = Nonce, cipher = Cipher}) ->
     Hash = quic_crypto:cipher_to_hash(Cipher),
     HashLen = quic_crypto:hash_len(Hash),
@@ -126,11 +130,14 @@ derive_psk(ResumptionSecret, #session_ticket{nonce = Nonce, cipher = Cipher}) ->
 %%       Extension extensions&lt;0..2^16-2&gt;;
 %%   } NewSessionTicket;
 -spec parse_new_session_ticket(binary()) ->
-    {ok, #{lifetime := non_neg_integer(),
-           age_add := non_neg_integer(),
-           nonce := binary(),
-           ticket := binary(),
-           max_early_data := non_neg_integer()}} | {error, term()}.
+    {ok, #{
+        lifetime := non_neg_integer(),
+        age_add := non_neg_integer(),
+        nonce := binary(),
+        ticket := binary(),
+        max_early_data := non_neg_integer()
+    }}
+    | {error, term()}.
 parse_new_session_ticket(<<Lifetime:32, AgeAdd:32, NonceLen, Rest/binary>>) ->
     case Rest of
         <<Nonce:NonceLen/binary, TicketLen:16, Rest1/binary>> when byte_size(Rest1) >= TicketLen ->
@@ -173,14 +180,15 @@ parse_early_data_extension(_) ->
 %% @doc Create a session ticket from connection state.
 %% This is used by the server to issue tickets to clients.
 -spec create_ticket(binary(), binary(), non_neg_integer(), atom(), binary() | undefined) ->
-    #session_ticket{}.
+    session_ticket().
 create_ticket(ServerName, ResumptionSecret, MaxEarlyData, Cipher, ALPN) ->
     %% Use crypto:strong_rand_bytes for age_add to prevent replay attacks
     <<AgeAdd:32>> = crypto:strong_rand_bytes(4),
     #session_ticket{
         server_name = ServerName,
         ticket = crypto:strong_rand_bytes(32),
-        lifetime = 86400,  % 24 hours
+        % 24 hours
+        lifetime = 86400,
         age_add = AgeAdd,
         nonce = crypto:strong_rand_bytes(8),
         resumption_secret = ResumptionSecret,
@@ -191,7 +199,7 @@ create_ticket(ServerName, ResumptionSecret, MaxEarlyData, Cipher, ALPN) ->
     }.
 
 %% @doc Build a NewSessionTicket message.
--spec build_new_session_ticket(#session_ticket{}) -> binary().
+-spec build_new_session_ticket(session_ticket()) -> binary().
 build_new_session_ticket(#session_ticket{
     lifetime = Lifetime,
     age_add = AgeAdd,
@@ -203,12 +211,13 @@ build_new_session_ticket(#session_ticket{
     TicketLen = byte_size(Ticket),
 
     %% Build early_data extension if max_early_data > 0
-    Extensions = case MaxEarlyData of
-        0 -> <<>>;
-        _ -> <<16#00, 16#2a, 4:16, MaxEarlyData:32>>  % early_data extension
-    end,
+    Extensions =
+        case MaxEarlyData of
+            0 -> <<>>;
+            % early_data extension
+            _ -> <<16#00, 16#2a, 4:16, MaxEarlyData:32>>
+        end,
     ExtLen = byte_size(Extensions),
 
-    <<Lifetime:32, AgeAdd:32, NonceLen, Nonce/binary,
-      TicketLen:16, Ticket/binary, ExtLen:16, Extensions/binary>>.
-
+    <<Lifetime:32, AgeAdd:32, NonceLen, Nonce/binary, TicketLen:16, Ticket/binary, ExtLen:16,
+        Extensions/binary>>.

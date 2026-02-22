@@ -16,16 +16,18 @@
 
 -export([start_link/0, init/1, handle_call/3, handle_cast/2]).
 
+%% @private
 -type state() :: {ets:table(), ets:table()}.
 
 -spec get_tables(pid()) -> {ok, state()}.
 get_tables(Pid) ->
-    gen_server:call(Pid, get_tables).
+    gen_server:call(Pid, get_tables, infinity).
 
 -spec start_link() -> gen_server:start_ret().
 start_link() ->
     gen_server:start_link(?MODULE, noargs, [{hibernate_after, 50}]).
 
+%% @private
 -spec init(noargs) -> {ok, state()}.
 init(noargs) ->
     Opts = [set, public, {read_concurrency, true}, {write_concurrency, auto}],
@@ -33,6 +35,7 @@ init(noargs) ->
     TicketTab = ets:new(quic_server_tickets, Opts),
     {ok, {ConnTab, TicketTab}}.
 
+%% @private
 -spec handle_call(term(), gen_server:from(), state()) ->
     {reply, {ok, state()} | not_implemented, state()}.
 handle_call(get_tables, _From, Tabs) ->
@@ -40,6 +43,7 @@ handle_call(get_tables, _From, Tabs) ->
 handle_call(_Request, _From, Tabs) ->
     {reply, not_implemented, Tabs}.
 
+%% @private
 -spec handle_cast(term(), state()) -> {noreply, state()}.
 handle_cast(_Msg, Tabs) ->
     {noreply, Tabs}.

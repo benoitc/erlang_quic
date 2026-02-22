@@ -181,7 +181,9 @@ multiple_losses_same_recovery_test() ->
     Cwnd1 = quic_cc:cwnd(S1),
 
     %% Second event with same sent time shouldn't reduce again
-    S2 = quic_cc:on_congestion_event(S1, Now - 10),  % Earlier than recovery start
+
+    % Earlier than recovery start
+    S2 = quic_cc:on_congestion_event(S1, Now - 10),
     Cwnd2 = quic_cc:cwnd(S2),
 
     ?assertEqual(Cwnd1, Cwnd2).
@@ -218,7 +220,8 @@ on_packets_lost_reduces_in_flight_test() ->
 on_packets_lost_floor_zero_test() ->
     State = quic_cc:new(),
     S1 = quic_cc:on_packet_sent(State, 1000),
-    S2 = quic_cc:on_packets_lost(S1, 2000),  % More than in flight
+    % More than in flight
+    S2 = quic_cc:on_packets_lost(S1, 2000),
     ?assertEqual(0, quic_cc:bytes_in_flight(S2)).
 
 %%====================================================================
@@ -260,21 +263,24 @@ detect_persistent_congestion_single_packet_test() ->
 
 detect_persistent_congestion_below_threshold_test() ->
     State = quic_cc:new(),
-    PTO = 100,  % 100ms
+    % 100ms
+    PTO = 100,
     %% Lost packets span 200ms, but threshold is PTO * 3 = 300ms
     LostPackets = [{1, 1000}, {2, 1200}],
     ?assertNot(quic_cc:detect_persistent_congestion(LostPackets, PTO, State)).
 
 detect_persistent_congestion_at_threshold_test() ->
     State = quic_cc:new(),
-    PTO = 100,  % 100ms
+    % 100ms
+    PTO = 100,
     %% Lost packets span exactly PTO * 3 = 300ms
     LostPackets = [{1, 1000}, {2, 1300}],
     ?assert(quic_cc:detect_persistent_congestion(LostPackets, PTO, State)).
 
 detect_persistent_congestion_above_threshold_test() ->
     State = quic_cc:new(),
-    PTO = 100,  % 100ms
+    % 100ms
+    PTO = 100,
     %% Lost packets span 500ms, threshold is PTO * 3 = 300ms
     LostPackets = [{1, 1000}, {5, 1500}],
     ?assert(quic_cc:detect_persistent_congestion(LostPackets, PTO, State)).

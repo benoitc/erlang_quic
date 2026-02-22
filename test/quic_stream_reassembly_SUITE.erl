@@ -119,7 +119,7 @@ ordered_delivery_large(Config) ->
             %% This makes it easy to detect any out-of-order delivery
             DataSize = 1024 * 1024,
             IntCount = DataSize div 4,
-            LargeData = << <<I:32/little>> || I <- lists:seq(0, IntCount - 1) >>,
+            LargeData = <<<<I:32/little>> || I <- lists:seq(0, IntCount - 1)>>,
 
             ct:pal("Sending ~p bytes with sequential pattern", [DataSize]),
             ok = quic:send_data(ConnRef, StreamId, LargeData, true),
@@ -192,14 +192,16 @@ wait_for_server(_Host, _Port, 0) ->
 wait_for_server(Host, Port, Retries) ->
     case gen_udp:open(0, [binary, {active, false}]) of
         {ok, Socket} ->
-            HostAddr = case inet:parse_address(Host) of
-                {ok, Addr} -> Addr;
-                {error, _} -> Host
-            end,
+            HostAddr =
+                case inet:parse_address(Host) of
+                    {ok, Addr} -> Addr;
+                    {error, _} -> Host
+                end,
             Result = gen_udp:send(Socket, HostAddr, Port, <<0:32>>),
             gen_udp:close(Socket),
             case Result of
-                ok -> ok;
+                ok ->
+                    ok;
                 {error, _} ->
                     timer:sleep(1000),
                     wait_for_server(Host, Port, Retries - 1)
@@ -239,6 +241,8 @@ verify_sequential_pattern(<<Value:32/little, Rest/binary>>, Expected) ->
         Expected ->
             verify_sequential_pattern(Rest, Expected + 1);
         _ ->
-            ct:fail("Out of order: expected ~p but got ~p at position ~p",
-                    [Expected, Value, Expected * 4])
+            ct:fail(
+                "Out of order: expected ~p but got ~p at position ~p",
+                [Expected, Value, Expected * 4]
+            )
     end.

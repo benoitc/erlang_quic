@@ -23,7 +23,8 @@
     expand_label/5
 ]).
 
--define(HASH_LEN, 32).  % SHA-256 output length
+% SHA-256 output length
+-define(HASH_LEN, 32).
 
 %%====================================================================
 %% API
@@ -58,7 +59,8 @@ expand(_Hash, _PRK, _Info, 0) ->
 expand(Hash, PRK, Info, Length) ->
     HashLen = quic_crypto:hash_len(Hash),
     MaxLen = 255 * HashLen,
-    true = Length =< MaxLen,  % Assert valid length
+    % Assert valid length
+    true = Length =< MaxLen,
     N = ceiling(Length, HashLen),
     FullOutput = expand_loop(Hash, PRK, Info, N, 1, <<>>, <<>>),
     %% Truncate to requested length
@@ -82,8 +84,7 @@ expand_label(Hash, Secret, Label, Context, Length) ->
     FullLabel = <<"tls13 ", Label/binary>>,
     LabelLen = byte_size(FullLabel),
     ContextLen = byte_size(Context),
-    HkdfLabel = <<Length:16, LabelLen, FullLabel/binary,
-                  ContextLen, Context/binary>>,
+    HkdfLabel = <<Length:16, LabelLen, FullLabel/binary, ContextLen, Context/binary>>,
     expand(Hash, Secret, HkdfLabel, Length).
 
 %%====================================================================

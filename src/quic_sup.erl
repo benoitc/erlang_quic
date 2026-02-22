@@ -35,15 +35,17 @@
 %%====================================================================
 
 %% @doc Start the top-level QUIC supervisor.
--spec start_link() -> {ok, pid()} | {error, term()}.
+-spec start_link() -> supervisor:startlink_ret().
 start_link() ->
-    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+    supervisor:start_link({local, ?MODULE}, ?MODULE, #{}).
 
 %%====================================================================
 %% Supervisor callbacks
 %%====================================================================
 
-init([]) ->
+%% @private
+-spec init(map()) -> {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
+init(#{}) ->
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,

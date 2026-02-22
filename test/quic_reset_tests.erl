@@ -68,8 +68,10 @@ reset_packet_structure_test() ->
 
     %% First byte should look like short header (0|1|XXXXXX)
     <<FirstByte, _/binary>> = Packet,
-    ?assertEqual(0, (FirstByte bsr 7) band 1),  % First bit = 0 (short header)
-    ?assertEqual(1, (FirstByte bsr 6) band 1),  % Fixed bit = 1
+    % First bit = 0 (short header)
+    ?assertEqual(0, (FirstByte bsr 7) band 1),
+    % Fixed bit = 1
+    ?assertEqual(1, (FirstByte bsr 6) band 1),
 
     %% Last 16 bytes should be the token
     PacketSize = byte_size(Packet),
@@ -80,7 +82,8 @@ reset_packet_structure_test() ->
 %% Test reset packet minimum size
 reset_packet_minimum_size_test() ->
     Token = crypto:strong_rand_bytes(16),
-    TriggerSize = 25,  % Just above minimum
+    % Just above minimum
+    TriggerSize = 25,
 
     Packet = build_reset_packet(Token, TriggerSize),
 
