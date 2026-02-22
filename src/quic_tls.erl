@@ -1009,17 +1009,20 @@ build_cert_list([Cert | Rest]) ->
     <<CertLen:24, Cert/binary, 0:16, RestCerts/binary>>.
 
 get_signature_params(?SIG_RSA_PSS_RSAE_SHA256) ->
-    {rsa, sha256, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]};
+    rsa_pss_params(sha256);
 get_signature_params(?SIG_RSA_PSS_RSAE_SHA384) ->
-    {rsa, sha384, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]};
+    rsa_pss_params(sha384);
 get_signature_params(?SIG_RSA_PSS_RSAE_SHA512) ->
-    {rsa, sha512, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]};
+    rsa_pss_params(sha512);
 get_signature_params(?SIG_ECDSA_SECP256R1_SHA256) ->
     {ecdsa, sha256, []};
 get_signature_params(?SIG_ECDSA_SECP384R1_SHA384) ->
     {ecdsa, sha384, []};
 get_signature_params(_) ->
-    {rsa, sha256, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]}.
+    get_signature_params(?SIG_RSA_PSS_RSAE_SHA256).
+
+rsa_pss_params(Hash) ->
+    {rsa, Hash, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]}.
 
 %% Convert private key to format expected by crypto:sign
 convert_private_key(

@@ -244,17 +244,16 @@ receive_stream_data_streaming(ConnRef, StreamId, FileHandle, BytesWritten, Timeo
             error;
         {quic, ConnRef, {closed, _Reason}} ->
             %% Connection closed, return what we have
-            case BytesWritten of
-                0 -> error;
-                _ -> {ok, BytesWritten}
-            end
+            finish_with_bytes(BytesWritten)
     after Timeout ->
         io:format("Stream timeout~n"),
-        case BytesWritten of
-            0 -> error;
-            _ -> {ok, BytesWritten}
-        end
+        finish_with_bytes(BytesWritten)
     end.
+
+finish_with_bytes(0) ->
+    error;
+finish_with_bytes(BytesWritten) ->
+    {ok, BytesWritten}.
 
 parse_url(Url) ->
     %% Simple URL parser for https://host:port/path
@@ -385,17 +384,24 @@ download_and_wait_for_ticket(ConnRef, StreamId, Path, DownloadsDir, Ticket) ->
             io:format("Phase 1: Received session ticket~n"),
             download_and_wait_for_ticket(ConnRef, StreamId, Path, DownloadsDir, NewTicket);
         {quic, ConnRef, {closed, _Reason}} ->
-            case Ticket of
-                undefined -> error;
-                _ -> {ok, Ticket}
-            end
+            ticket_result(Ticket)
     after 60000 ->
         io:format("Phase 1: Stream/ticket timeout~n"),
-        case Ticket of
-            undefined -> error;
-            _ -> {ok, Ticket}
-        end
+        ticket_result(Ticket)
     end.
+
+ticket_result(undefined) ->
+    error;
+ticket_result(Ticket) ->
+    {ok, Ticket}.
+
+save_download_or_error(<<>>, _Path, _DownloadsDir) ->
+    error;
+save_download_or_error(Acc, Path, DownloadsDir) ->
+    Filename = filename:basename(Path),
+    FilePath = filename:join(DownloadsDir, Filename),
+    file:write_file(FilePath, Acc),
+    ok.
 
 %% Wait only for a session ticket (after download is complete)
 wait_for_ticket_only(ConnRef, Timeout) ->
@@ -583,15 +589,7 @@ wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir, Connected, Retr
             resend_request_1rtt(ConnRef, Path, DownloadsDir);
         {quic, ConnRef, {closed, Reason}} ->
             io:format("0-RTT: Connection closed: ~p~n", [Reason]),
-            case Acc of
-                <<>> ->
-                    error;
-                _ ->
-                    Filename = filename:basename(Path),
-                    FilePath = filename:join(DownloadsDir, Filename),
-                    file:write_file(FilePath, Acc),
-                    ok
-            end
+            save_download_or_error(Acc, Path, DownloadsDir)
     after Timeout ->
         case Connected andalso Acc =:= <<>> andalso not Retried of
             true ->
@@ -751,15 +749,7 @@ receive_with_migration(ConnRef, StreamId, Path, DownloadsDir, Migrated, Acc) ->
             receive_with_migration(ConnRef, StreamId, Path, DownloadsDir, Migrated, Acc);
         {quic, ConnRef, {closed, Reason}} ->
             io:format("Migration test: Connection closed: ~p~n", [Reason]),
-            case Acc of
-                <<>> ->
-                    error;
-                _ ->
-                    Filename = filename:basename(Path),
-                    FilePath = filename:join(DownloadsDir, Filename),
-                    file:write_file(FilePath, Acc),
-                    ok
-            end
+            save_download_or_error(Acc, Path, DownloadsDir)
     after 60000 ->
         io:format("Migration test: Timeout~n"),
         error

@@ -109,21 +109,21 @@ encode_long(Type, Version, DCID, SCID, Opts) ->
             <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary,
                 (quic_varint:encode(TokenLen))/binary, Token/binary,
                 (quic_varint:encode(PayloadLen))/binary, PNBin/binary, Payload/binary>>;
-        handshake ->
-            PNBin = encode_pn(PN, PNLen),
-            PayloadLen = byte_size(Payload) + PNLen,
-            <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary,
-                (quic_varint:encode(PayloadLen))/binary, PNBin/binary, Payload/binary>>;
-        zero_rtt ->
-            PNBin = encode_pn(PN, PNLen),
-            PayloadLen = byte_size(Payload) + PNLen,
-            <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary,
-                (quic_varint:encode(PayloadLen))/binary, PNBin/binary, Payload/binary>>;
         retry ->
             %% Retry packets have no packet number
             %% Payload contains Retry Token + Retry Integrity Tag
-            <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary, Payload/binary>>
+            <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary, Payload/binary>>;
+        Type when Type =:= handshake; Type =:= zero_rtt ->
+            encode_long_header_with_pn(
+                FirstByte, Version, DCIDLen, DCID, SCIDLen, SCID, PN, PNLen, Payload
+            )
     end.
+
+encode_long_header_with_pn(FirstByte, Version, DCIDLen, DCID, SCIDLen, SCID, PN, PNLen, Payload) ->
+    PNBin = encode_pn(PN, PNLen),
+    PayloadLen = byte_size(Payload) + PNLen,
+    <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary,
+        (quic_varint:encode(PayloadLen))/binary, PNBin/binary, Payload/binary>>.
 
 %% @doc Encode a Version Negotiation packet.
 %% RFC 9000 Section 17.2.1 - Version Negotiation Packet

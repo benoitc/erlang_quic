@@ -173,11 +173,7 @@ unprotect_header(HP, ProtectedHeader, EncryptedPayload, _PNOffset) ->
 
             %% Unmask first byte to get PN length
             IsLongHeader = (ProtectedFirstByte band 16#80) =:= 16#80,
-            FirstByteMask =
-                case IsLongHeader of
-                    true -> MaskByte0 band 16#0f;
-                    false -> MaskByte0 band 16#1f
-                end,
+            FirstByteMask = first_byte_mask(IsLongHeader, MaskByte0),
             FirstByte = ProtectedFirstByte bxor FirstByteMask,
 
             %% Get PN length from unmasked first byte
@@ -185,8 +181,7 @@ unprotect_header(HP, ProtectedHeader, EncryptedPayload, _PNOffset) ->
 
             %% PN is at the start of EncryptedPayload, unmask it
             <<ProtectedPN:PNLen/binary, _/binary>> = EncryptedPayload,
-            PNMask = binary:part(<<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>, 0, PNLen),
-            PN = crypto:exor(ProtectedPN, PNMask),
+            PN = apply_pn_mask(ProtectedPN, MaskByte1, MaskByte2, MaskByte3, MaskByte4, PNLen),
 
             %% Return unprotected header (first byte + rest) with PN appended
             UnprotectedHeader = <<FirstByte, HeaderRest/binary, PN/binary>>,
@@ -227,6 +222,17 @@ compute_hp_mask(chacha20_poly1305, HP, Sample) ->
     Zeros = <<0, 0, 0, 0, 0>>,
     crypto:crypto_one_time(chacha20, HP, <<Counter:32/little, Nonce/binary>>, Zeros, true).
 
+%% Long header: mask bits 0-3; short header: mask bits 0-4
+first_byte_mask(true, MaskByte0) ->
+    MaskByte0 band 16#0f;
+first_byte_mask(false, MaskByte0) ->
+    MaskByte0 band 16#1f.
+
+%% XOR PN (or protected PN) with mask bytes; used for both protect and unprotect
+apply_pn_mask(Data, M1, M2, M3, M4, PNLen) ->
+    PNMask = binary:part(<<M1, M2, M3, M4>>, 0, PNLen),
+    crypto:exor(Data, PNMask).
+
 %% Apply mask to header (for protection)
 apply_header_mask(Header, Mask, PNOffset) ->
     <<FirstByte, Rest/binary>> = Header,
@@ -238,13 +244,7 @@ apply_header_mask(Header, Mask, PNOffset) ->
 
     %% Mask first byte: for long header, mask lower 4 bits; for short, mask lower 5 bits
     IsLongHeader = (FirstByte band 16#80) =:= 16#80,
-    FirstByteMask =
-        case IsLongHeader of
-            % Long header: mask bits 0-3
-            true -> MaskByte0 band 16#0f;
-            % Short header: mask bits 0-4
-            false -> MaskByte0 band 16#1f
-        end,
+    FirstByteMask = first_byte_mask(IsLongHeader, MaskByte0),
     ProtectedFirstByte = FirstByte bxor FirstByteMask,
 
     %% Split header at PN offset
@@ -254,7 +254,6 @@ apply_header_mask(Header, Mask, PNOffset) ->
     <<BeforePN:BeforePNLen/binary, PN:PNLen/binary, AfterPN/binary>> = Rest,
 
     %% Mask PN bytes
-    PNMask = binary:part(<<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>, 0, PNLen),
-    ProtectedPN = crypto:exor(PN, PNMask),
+    ProtectedPN = apply_pn_mask(PN, MaskByte1, MaskByte2, MaskByte3, MaskByte4, PNLen),
 
     <<ProtectedFirstByte, BeforePN/binary, ProtectedPN/binary, AfterPN/binary>>.
