@@ -117,12 +117,12 @@ stop(Listener) ->
 %% @doc Get the port the listener is bound to.
 -spec get_port(pid()) -> inet:port_number().
 get_port(Listener) ->
-    gen_server:call(Listener, get_port).
+    gen_server:call(Listener, get_port, infinity).
 
 %% @doc Get list of active connections.
 -spec get_connections(pid()) -> [pid()].
 get_connections(Listener) ->
-    gen_server:call(Listener, get_connections).
+    gen_server:call(Listener, get_connections, infinity).
 
 %%====================================================================
 %% gen_server callbacks
@@ -470,7 +470,7 @@ create_connection(
         {ok, ConnPid} ->
             %% Get connection reference
             %% Note: ConnPid is already linked via start_link in start_server/1
-            ConnRef = gen_statem:call(ConnPid, get_ref),
+            ConnRef = quic_connection:get_ref(ConnPid),
 
             %% Register connection ID
             ets:insert(Conns, {DCID, ConnPid}),

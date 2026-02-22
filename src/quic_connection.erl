@@ -59,6 +59,7 @@
     start_link/4,
     start_link/5,
     connect/4,
+    get_ref/1,
     send_data/4,
     send_datagram/2,
     open_stream/1,
@@ -377,11 +378,16 @@ start_link(Host, Port, Opts, Owner, Socket) ->
 connect(Host, Port, Opts, Owner) ->
     case start_link(Host, Port, Opts, Owner) of
         {ok, Pid} ->
-            ConnRef = gen_statem:call(Pid, get_ref),
+            ConnRef = gen_statem:call(Pid, get_ref, infinity),
             {ok, ConnRef, Pid};
         Error ->
             Error
     end.
+
+%% @doc Get connection reference
+-spec get_ref(gen_statem:server_ref()) -> reference().
+get_ref(Pid) ->
+    gen_statem:call(Pid, get_ref, infinity).
 
 %% @doc Start a server-side QUIC connection.
 %% Called by quic_listener when a new connection is accepted.
@@ -393,7 +399,7 @@ start_server(Opts) ->
 -spec send_data(pid(), non_neg_integer(), iodata(), boolean()) ->
     ok | {error, term()}.
 send_data(Conn, StreamId, Data, Fin) ->
-    gen_statem:call(Conn, {send_data, StreamId, Data, Fin}).
+    gen_statem:call(Conn, {send_data, StreamId, Data, Fin}, infinity).
 
 %% @doc Open a new bidirectional stream.
 -spec open_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
@@ -403,7 +409,7 @@ open_stream(Conn) ->
 %% @doc Open a new unidirectional stream.
 -spec open_unidirectional_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
 open_unidirectional_stream(Conn) ->
-    gen_statem:call(Conn, open_unidirectional_stream).
+    gen_statem:call(Conn, open_unidirectional_stream, infinity).
 
 %% @doc Close the connection.
 -spec close(pid(), term()) -> ok.
@@ -414,13 +420,13 @@ close(Conn, Reason) ->
 -spec close_stream(pid(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
 close_stream(Conn, StreamId, ErrorCode) ->
-    gen_statem:call(Conn, {close_stream, StreamId, ErrorCode}).
+    gen_statem:call(Conn, {close_stream, StreamId, ErrorCode}, infinity).
 
 %% @doc Reset a stream.
 -spec reset_stream(pid(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
 reset_stream(Conn, StreamId, ErrorCode) ->
-    gen_statem:call(Conn, {close_stream, StreamId, ErrorCode}).
+    gen_statem:call(Conn, {close_stream, StreamId, ErrorCode}, infinity).
 
 %% @doc Handle a timeout event.
 -spec handle_timeout(pid()) -> ok.
@@ -443,22 +449,22 @@ process(Conn) ->
 %% @doc Get current connection state (for debugging).
 -spec get_state(pid()) -> {atom(), map()}.
 get_state(Conn) ->
-    gen_statem:call(Conn, get_state).
+    gen_statem:call(Conn, get_state, infinity).
 
 %% @doc Get remote address.
 -spec peername(pid()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 peername(Conn) ->
-    gen_statem:call(Conn, peername).
+    gen_statem:call(Conn, peername, infinity).
 
 %% @doc Get local address.
 -spec sockname(pid()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 sockname(Conn) ->
-    gen_statem:call(Conn, sockname).
+    gen_statem:call(Conn, sockname, infinity).
 
 %% @doc Get peer certificate (DER-encoded).
 -spec peercert(pid()) -> {ok, binary()} | {error, term()}.
 peercert(Conn) ->
-    gen_statem:call(Conn, peercert).
+    gen_statem:call(Conn, peercert, infinity).
 
 %% @doc Set new owner process.
 -spec set_owner(pid(), pid()) -> ok.
@@ -468,26 +474,26 @@ set_owner(Conn, NewOwner) ->
 %% @doc Send a datagram.
 -spec send_datagram(pid(), iodata()) -> ok | {error, term()}.
 send_datagram(Conn, Data) ->
-    gen_statem:call(Conn, {send_datagram, Data}).
+    gen_statem:call(Conn, {send_datagram, Data}, infinity).
 
 %% @doc Set connection options.
 -spec setopts(pid(), [{atom(), term()}]) -> ok | {error, term()}.
 setopts(Conn, Opts) ->
-    gen_statem:call(Conn, {setopts, Opts}).
+    gen_statem:call(Conn, {setopts, Opts}, infinity).
 
 %% @doc Initiate a key update (RFC 9001 Section 6).
 %% This triggers a key update cycle, deriving new encryption keys.
 %% Only valid when connection is in connected state.
 -spec key_update(pid()) -> ok | {error, term()}.
 key_update(Conn) ->
-    gen_statem:call(Conn, key_update).
+    gen_statem:call(Conn, key_update, infinity).
 
 %% @doc Initiate connection migration.
 %% This triggers path validation by sending PATH_CHALLENGE on a new path.
 %% Simulates network change by rebinding the socket.
 -spec migrate(pid()) -> ok | {error, term()}.
 migrate(Conn) ->
-    gen_statem:call(Conn, migrate).
+    gen_statem:call(Conn, migrate, infinity).
 
 %% @doc Set stream priority (RFC 9218).
 %% Urgency: 0-7 (lower = more urgent, default 3)
@@ -495,14 +501,14 @@ migrate(Conn) ->
 -spec set_stream_priority(pid(), non_neg_integer(), 0..7, boolean()) ->
     ok | {error, term()}.
 set_stream_priority(Conn, StreamId, Urgency, Incremental) ->
-    gen_statem:call(Conn, {set_stream_priority, StreamId, Urgency, Incremental}).
+    gen_statem:call(Conn, {set_stream_priority, StreamId, Urgency, Incremental}, infinity).
 
 %% @doc Get stream priority (RFC 9218).
 %% Returns {ok, {Urgency, Incremental}} or {error, not_found}.
 -spec get_stream_priority(pid(), non_neg_integer()) ->
     {ok, {0..7, boolean()}} | {error, term()}.
 get_stream_priority(Conn, StreamId) ->
-    gen_statem:call(Conn, {get_stream_priority, StreamId}).
+    gen_statem:call(Conn, {get_stream_priority, StreamId}, infinity).
 
 %%====================================================================
 %% gen_statem callbacks

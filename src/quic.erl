@@ -127,7 +127,7 @@ connect(Host, Port, Opts, Owner) when
 ->
     case quic_connection:start_link(Host, Port, Opts, Owner) of
         {ok, Pid} ->
-            ConnRef = gen_statem:call(Pid, get_ref),
+            ConnRef = quic_connection:get_ref(Pid),
             {ok, ConnRef};
         Error ->
             Error

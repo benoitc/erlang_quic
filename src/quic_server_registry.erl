@@ -70,12 +70,12 @@ start_link() ->
 %% @doc Register a named server.
 -spec register(atom(), pid(), inet:port_number(), map()) -> ok.
 register(Name, Pid, Port, Opts) ->
-    gen_server:call(?MODULE, {register, Name, Pid, Port, Opts}).
+    gen_server:call(?MODULE, {register, Name, Pid, Port, Opts}, infinity).
 
 %% @doc Unregister a named server.
 -spec unregister(atom()) -> ok.
 unregister(Name) ->
-    gen_server:call(?MODULE, {unregister, Name}).
+    gen_server:call(?MODULE, {unregister, Name}, infinity).
 
 %% @doc Look up a server by name.
 -spec lookup(atom()) -> {ok, map()} | {error, not_found}.

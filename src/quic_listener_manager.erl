@@ -21,7 +21,7 @@
 
 -spec get_tables(pid()) -> {ok, state()}.
 get_tables(Pid) ->
-    gen_server:call(Pid, get_tables).
+    gen_server:call(Pid, get_tables, infinity).
 
 -spec start_link() -> gen_server:start_ret().
 start_link() ->
