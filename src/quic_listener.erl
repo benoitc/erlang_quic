@@ -34,7 +34,7 @@
 -behaviour(gen_server).
 
 %% Suppress pattern warnings for defensive callback handling (user-provided callbacks)
--dialyzer({no_match, create_connection/4}).
+-dialyzer({no_match, create_connection/5}).
 
 -export([
     start_link/2,
@@ -339,8 +339,8 @@ get_tables(_) ->
 
 handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) ->
     case parse_packet_header(Packet, DCIDLen) of
-        {initial, DCID, _SCID, _Rest} ->
-            handle_initial_packet(Packet, DCID, RemoteAddr, State);
+        {initial, DCID, _SCID, Version, _Rest} ->
+            handle_initial_packet(Packet, DCID, Version, RemoteAddr, State);
         {short, DCID, _Rest} ->
             route_to_connection(DCID, Packet, RemoteAddr, State);
         {long, DCID, _SCID, _PacketType, _Rest} ->
@@ -352,12 +352,14 @@ handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) -
 
 %% Parse packet header to extract DCID for routing
 %% DCIDLen parameter specifies expected DCID length for short header packets
-parse_packet_header(<<1:1, _:7, _Version:32, DCIDLenField, DCID:DCIDLenField/binary,
-                      SCIDLen, SCID:SCIDLen/binary, Rest/binary>>, _DCIDLen) ->
-    %% Long header - DCID length is in the packet
-    <<_:1, PacketType:2, _:5, _/binary>> = <<1:1, 0:7>>,
+parse_packet_header(<<FirstByte, Version:32, DCIDLenField, DCID:DCIDLenField/binary,
+                      SCIDLen, SCID:SCIDLen/binary, Rest/binary>>, _DCIDLen)
+        when FirstByte band 16#80 =:= 16#80 ->
+    %% Long header - extract packet type from bits 4-5 of first byte
+    %% Type: 00=Initial, 01=0-RTT, 10=Handshake, 11=Retry
+    PacketType = (FirstByte bsr 4) band 2#11,
     case PacketType of
-        0 -> {initial, DCID, SCID, Rest};
+        0 -> {initial, DCID, SCID, Version, Rest};
         _ -> {long, DCID, SCID, PacketType, Rest}
     end;
 parse_packet_header(<<0:1, _:7, Rest/binary>>, DCIDLen) ->
@@ -372,7 +374,7 @@ parse_packet_header(_, _DCIDLen) ->
     {error, invalid_header}.
 
 %% Handle Initial packet - may create new connection
-handle_initial_packet(Packet, DCID, RemoteAddr,
+handle_initial_packet(Packet, DCID, Version, RemoteAddr,
                       #listener_state{connections = Conns} = State) ->
     case ets:lookup(Conns, DCID) of
         [{DCID, ConnPid}] ->
@@ -380,7 +382,7 @@ handle_initial_packet(Packet, DCID, RemoteAddr,
             send_to_connection(ConnPid, Packet, RemoteAddr);
         [] ->
             %% New connection
-            create_connection(Packet, DCID, RemoteAddr, State)
+            create_connection(Packet, DCID, Version, RemoteAddr, State)
     end.
 
 %% Route packet to existing connection
@@ -395,7 +397,7 @@ route_to_connection(DCID, Packet, RemoteAddr,
     end.
 
 %% Create a new server-side connection
-create_connection(Packet, DCID, RemoteAddr,
+create_connection(Packet, DCID, Version, RemoteAddr,
                   #listener_state{
                       socket = Socket,
                       cert = Cert,
@@ -413,7 +415,7 @@ create_connection(Packet, DCID, RemoteAddr,
         #cid_config{} -> quic_lb:generate_cid(CIDConfig)
     end,
 
-    %% Start connection process
+    %% Start connection process with client's QUIC version
     ConnOpts = #{
         role => server,
         socket => Socket,
@@ -425,7 +427,8 @@ create_connection(Packet, DCID, RemoteAddr,
         private_key => PrivateKey,
         alpn => ALPNList,
         listener => self(),
-        cid_config => CIDConfig
+        cid_config => CIDConfig,
+        version => Version
     },
 
     case quic_connection:start_server(maps:merge(Opts, ConnOpts)) of

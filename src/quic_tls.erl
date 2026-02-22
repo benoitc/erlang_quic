@@ -620,6 +620,12 @@ parse_extensions(<<>>, Acc) ->
     {ok, Acc};
 parse_extensions(<<Type:16, Len:16, Data:Len/binary, Rest/binary>>, Acc) ->
     parse_extensions(Rest, maps:put(Type, Data, Acc));
+parse_extensions(<<Type:16, Len:16, Data/binary>>, _Acc) when byte_size(Data) < Len ->
+    %% Extension data is truncated
+    {error, {extension_truncated, Type, Len, byte_size(Data)}};
+parse_extensions(Data, _Acc) when byte_size(Data) < 4 ->
+    %% Not enough data for extension header (type + length)
+    {error, {extension_header_incomplete, byte_size(Data)}};
 parse_extensions(_, _) ->
     {error, invalid_extensions}.
 
@@ -718,8 +724,23 @@ parse_client_hello(<<
         {error, Reason} ->
             {error, Reason}
     end;
+parse_client_hello(Data) when is_binary(Data) ->
+    %% Provide detailed error for debugging ClientHello parsing failures
+    case Data of
+        <<Version:16, _/binary>> when Version =/= ?TLS_VERSION_1_2 ->
+            {error, {invalid_legacy_version, Version}};
+        <<_:16, _Random:32/binary, SessionIdLen:8, Rest1/binary>> when byte_size(Rest1) < SessionIdLen ->
+            {error, {session_id_too_short, SessionIdLen, byte_size(Rest1)}};
+        <<_:16, _:32/binary, SessionIdLen:8, _:SessionIdLen/binary,
+          CipherSuitesLen:16, Rest2/binary>> when byte_size(Rest2) < CipherSuitesLen ->
+            {error, {cipher_suites_too_short, CipherSuitesLen, byte_size(Rest2)}};
+        _ when byte_size(Data) < 38 ->  % Minimum: 2 + 32 + 1 + 2 + 1 = 38 bytes
+            {error, {client_hello_too_short, byte_size(Data)}};
+        _ ->
+            {error, {invalid_client_hello, byte_size(Data)}}
+    end;
 parse_client_hello(_) ->
-    {error, invalid_client_hello}.
+    {error, invalid_client_hello_not_binary}.
 
 %% @doc Build a ServerHello message.
 %% Options:

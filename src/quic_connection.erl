@@ -519,9 +519,11 @@ init({server, Opts}) ->
     PrivateKey = maps:get(private_key, Opts),
     ALPNList = maps:get(alpn, Opts, [<<"h3">>]),
     Listener = maps:get(listener, Opts),
+    %% Use client's QUIC version for key derivation (defaults to v1)
+    Version = maps:get(version, Opts, ?QUIC_VERSION_1),
 
-    %% Generate initial keys using client's DCID (which is our SCID initially)
-    InitialKeys = derive_initial_keys(InitialDCID),
+    %% Generate initial keys using client's DCID and version
+    InitialKeys = derive_initial_keys(InitialDCID, Version),
 
     %% Initialize packet number spaces
     PNSpace = #pn_space{
@@ -549,6 +551,7 @@ init({server, Opts}) ->
         dcid = <<>>,  % Will be set from ClientHello SCID
         original_dcid = InitialDCID,
         role = server,
+        version = Version,  % Use client's QUIC version
         socket = Socket,
         remote_addr = RemoteAddr,
         local_addr = undefined,
@@ -2094,8 +2097,8 @@ handle_valid_retry(RetryToken, ServerSCID, State) ->
         retry_received = true
     },
 
-    %% Regenerate initial keys with the NEW DCID (ServerSCID)
-    {ClientKeys, ServerKeys} = derive_initial_keys(ServerSCID),
+    %% Regenerate initial keys with the NEW DCID (ServerSCID) and current version
+    {ClientKeys, ServerKeys} = derive_initial_keys(ServerSCID, State1#state.version),
     State2 = State1#state{initial_keys = {ClientKeys, ServerKeys}},
 
     %% Reset crypto state for a fresh Initial
@@ -2603,7 +2606,8 @@ process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
             %% Send EncryptedExtensions, Certificate, CertificateVerify, Finished in Handshake packet
             send_server_handshake_flight(Cipher, TranscriptHash, State2);
 
-        {error, _} ->
+        {error, Reason} ->
+            error_logger:error_msg("[QUIC server] ClientHello parsing failed: ~p~n", [Reason]),
             State
     end;
 
@@ -3125,8 +3129,13 @@ resolve_address(Host, Port) when is_binary(Host) ->
 
 %% Derive initial encryption keys
 derive_initial_keys(DCID) ->
-    {ClientKey, ClientIV, ClientHP} = quic_keys:derive_initial_client(DCID),
-    {ServerKey, ServerIV, ServerHP} = quic_keys:derive_initial_server(DCID),
+    derive_initial_keys(DCID, ?QUIC_VERSION_1).
+
+%% Derive initial encryption keys with specific QUIC version
+%% Version determines which salt to use (v1 vs v2)
+derive_initial_keys(DCID, Version) ->
+    {ClientKey, ClientIV, ClientHP} = quic_keys:derive_initial_client(DCID, Version),
+    {ServerKey, ServerIV, ServerHP} = quic_keys:derive_initial_server(DCID, Version),
     ClientKeys = #crypto_keys{
         key = ClientKey,
         iv = ClientIV,
