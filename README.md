@@ -122,159 +122,19 @@ The owner process receives messages in the format `{quic, ConnRef, Event}`:
 
 ## API Reference
 
-### Connection
+See [docs/features.md](docs/features.md) for the complete API reference and feature list.
 
-- `quic:connect/4` - Connect to a QUIC server
-- `quic:close/2` - Close a connection
-- `quic:peername/1` - Get remote address
-- `quic:sockname/1` - Get local address
-- `quic:peercert/1` - Get peer certificate (DER-encoded)
-- `quic:set_owner/2` - Transfer connection ownership (like gen_tcp:controlling_process/2)
-- `quic:migrate/1` - Trigger connection migration to new local address
-- `quic:setopts/2` - Set connection options
+### Quick Reference
 
-### Streams
+**Connection:** `quic:connect/4`, `quic:close/2`, `quic:peername/1`, `quic:migrate/1`
 
-- `quic:open_stream/1` - Open bidirectional stream
-- `quic:open_unidirectional_stream/1` - Open unidirectional stream
-- `quic:send_data/4` - Send data on stream
-- `quic:reset_stream/3` - Reset a stream
+**Streams:** `quic:open_stream/1`, `quic:send_data/4`, `quic:reset_stream/3`
 
-### Datagrams (RFC 9221)
+**Server:** `quic:start_server/3`, `quic:stop_server/1`, `quic:get_server_port/1`
 
-- `quic:send_datagram/2` - Send unreliable datagram
+**Datagrams:** `quic:send_datagram/2` (RFC 9221)
 
-### Load Balancer (RFC 9312)
-
-- `quic_lb:new_config/1` - Create LB configuration from options map
-- `quic_lb:new_cid_config/1` - Create CID generation configuration
-- `quic_lb:generate_cid/1` - Generate a CID with encoded server_id
-- `quic_lb:decode_server_id/2` - Extract server_id from CID
-- `quic_lb:is_lb_routable/1` - Check if CID has valid LB routing bits
-- `quic_lb:get_config_rotation/1` - Get config rotation bits from CID
-- `quic_lb:expected_cid_len/1` - Calculate expected CID length from config
-
-### Server
-
-- `quic_listener:start_link/2` - Start a QUIC listener
-- `quic_listener:start/2` - Start unlinked listener
-- `quic_listener:stop/1` - Stop listener
-- `quic_listener:get_port/1` - Get listening port
-- `quic_listener:get_connections/1` - List active connections
-- `quic_listener_sup:start_link/2` - Start pooled listeners (SO_REUSEPORT)
-- `quic_listener_sup:get_listeners/1` - Get listener PIDs in pool
-
-### Named Server Pools
-
-Ranch-style named server pool management:
-
-- `quic:start_server/3` - Start named server pool
-- `quic:stop_server/1` - Stop named server
-- `quic:get_server_info/1` - Get server information
-- `quic:get_server_port/1` - Get server listening port
-- `quic:get_server_connections/1` - Get server connection PIDs
-- `quic:which_servers/0` - List all running servers
-
-**Server Options:**
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `cert` | binary | required | DER-encoded server certificate |
-| `key` | term | required | Server private key |
-| `alpn` | [binary()] | `[<<"h3">>]` | ALPN protocols to advertise |
-| `pool_size` | pos_integer() | 1 | Number of listener processes (uses SO_REUSEPORT) |
-| `connection_handler` | fun/2 | none | Custom handler: `fun(ConnPid, ConnRef) -> {ok, HandlerPid}` |
-| `lb_config` | map() | none | QUIC-LB configuration for load balancer routing (see below) |
-
-**Server Info Map:**
-
-`get_server_info/1` returns a map with:
-- `pid` - Server supervisor PID
-- `port` - Listening port number
-- `opts` - Server options map
-- `started_at` - Start timestamp (milliseconds since epoch)
-
-**Example:**
-
-```erlang
-%% Start a named server with connection pooling
-{ok, _} = quic:start_server(my_server, 4433, #{
-    cert => CertDer,
-    key => KeyTerm,
-    alpn => [<<"h3">>],
-    pool_size => 4  %% 4 listener processes with SO_REUSEPORT
-}),
-
-%% Query servers
-quic:which_servers().             %% => [my_server]
-quic:get_server_port(my_server).  %% => {ok, 4433}
-quic:get_server_info(my_server).  %% => {ok, #{pid => <0.123.0>, port => 4433, ...}}
-quic:get_server_connections(my_server).  %% => {ok, [<0.150.0>, <0.151.0>]}
-
-%% Stop server
-quic:stop_server(my_server).
-```
-
-### QUIC-LB Load Balancer Support (RFC 9312)
-
-Enable load balancers to route QUIC packets to the correct server by encoding
-server identity in Connection IDs.
-
-**LB Config Options:**
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `server_id` | binary() | required | Server identifier (1-15 bytes) |
-| `algorithm` | atom() | `plaintext` | `plaintext`, `stream_cipher`, or `block_cipher` |
-| `config_rotation` | 0..6 | 0 | Config version for LB coordination |
-| `nonce_len` | 4..18 | 4 | Random nonce length in bytes |
-| `key` | binary() | none | 16-byte AES key (required for cipher algorithms) |
-
-**Example:**
-
-```erlang
-%% Start server with QUIC-LB enabled
-{ok, _} = quic:start_server(my_server, 4433, #{
-    cert => CertDer,
-    key => KeyTerm,
-    alpn => [<<"h3">>],
-    lb_config => #{
-        server_id => <<1, 2, 3, 4>>,      %% Unique ID for this server
-        algorithm => stream_cipher,        %% Encrypt server_id in CID
-        key => crypto:strong_rand_bytes(16)  %% Shared with load balancer
-    }
-}),
-
-%% The server now generates CIDs that encode the server_id
-%% Load balancer can decode server_id to route packets correctly
-```
-
-**Algorithms:**
-
-- `plaintext` - Server ID visible in CID (no encryption, simplest)
-- `stream_cipher` - AES-128-CTR encryption (recommended for most deployments)
-- `block_cipher` - AES-based encryption with Feistel network for variable lengths
-
-**Direct API:**
-
-```erlang
-%% Create LB configuration
-{ok, LBConfig} = quic_lb:new_config(#{
-    server_id => <<1, 2, 3, 4>>,
-    algorithm => stream_cipher,
-    key => Key
-}),
-
-%% Generate a CID
-{ok, CIDConfig} = quic_lb:new_cid_config(#{lb_config => LBConfig}),
-CID = quic_lb:generate_cid(CIDConfig),
-
-%% Decode server_id from CID (used by load balancer)
-{ok, <<1, 2, 3, 4>>} = quic_lb:decode_server_id(CID, LBConfig),
-
-%% Check if CID is LB-routable
-true = quic_lb:is_lb_routable(CID).
-```
+**Load Balancer:** `quic_lb:new_config/1`, `quic_lb:generate_cid/1` (RFC 9312)
 
 ## Building
 
@@ -297,22 +157,7 @@ rebar3 eunit && rebar3 proper
 
 ## Interoperability
 
-This implementation passes all 10 [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner) test cases:
-
-| Test Case | Status | Description |
-|-----------|--------|-------------|
-| handshake | ✓ | Basic QUIC handshake |
-| transfer | ✓ | File download with flow control |
-| retry | ✓ | Retry packet handling |
-| keyupdate | ✓ | Key rotation during transfer |
-| chacha20 | ✓ | ChaCha20-Poly1305 cipher |
-| multiconnect | ✓ | Multiple connections |
-| v2 | ✓ | QUIC v2 support |
-| resumption | ✓ | Session resumption with PSK |
-| zerortt | ✓ | 0-RTT early data |
-| connectionmigration | ✓ | Active path migration |
-
-See [interop/README.md](interop/README.md) for details on running interop tests.
+This implementation passes all 10 [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner) test cases. See [docs/features.md](docs/features.md) for the full test matrix and [interop/README.md](interop/README.md) for details on running interop tests.
 
 ## Documentation
 
