@@ -33,9 +33,6 @@
 -module(quic_listener).
 -behaviour(gen_server).
 
-%% Suppress warnings for functions prepared for future use
--compile([{nowarn_unused_function, [{register_cid, 3}, {unregister_cid, 2}]}]).
--dialyzer({nowarn_function, [register_cid/3, unregister_cid/2]}).
 %% Suppress pattern warnings for defensive callback handling (user-provided callbacks)
 -dialyzer({no_match, create_connection/4}).
 
@@ -479,16 +476,6 @@ create_connection(Packet, DCID, RemoteAddr,
 
 send_to_connection(ConnPid, Packet, RemoteAddr) ->
     ConnPid ! {quic_packet, Packet, RemoteAddr}.
-
-%% @doc Register an additional connection ID for a connection
--spec register_cid(pid(), binary(), pid()) -> ok.
-register_cid(Listener, CID, ConnPid) ->
-    gen_server:cast(Listener, {register_cid, CID, ConnPid}).
-
-%% @doc Unregister a connection ID
--spec unregister_cid(pid(), binary()) -> ok.
-unregister_cid(Listener, CID) ->
-    gen_server:cast(Listener, {unregister_cid, CID}).
 
 %%====================================================================
 %% Stateless Reset (RFC 9000 Section 10.3)

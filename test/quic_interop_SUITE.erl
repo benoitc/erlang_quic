@@ -55,13 +55,6 @@
     bidirectional_stream/1,
     unidirectional_stream/1,
 
-    %% Flow control tests
-    flow_control_connection/1,
-    flow_control_stream/1,
-
-    %% Loss recovery tests
-    retransmission/1,
-
     %% Local tests (no network)
     local_packet_roundtrip/1,
     local_frame_roundtrip/1,
@@ -118,13 +111,6 @@ groups() ->
             stream_data_transfer,
             bidirectional_stream,
             unidirectional_stream
-        ]},
-        {flow_control_tests, [sequence], [
-            flow_control_connection,
-            flow_control_stream
-        ]},
-        {recovery_tests, [sequence], [
-            retransmission
         ]}
     ].
 
@@ -827,44 +813,6 @@ do_uni_stream_test(Host, Port) ->
             end;
         {error, Reason} ->
             {comment, io_lib:format("Connection failed: ~p", [Reason])}
-    end.
-
-%%====================================================================
-%% Flow Control Tests
-%%====================================================================
-
-flow_control_connection(Config) ->
-    ct:comment("Test connection-level flow control"),
-    %% This would require sending more data than MAX_DATA and verifying
-    %% that the peer sends MAX_DATA updates
-    case get_server(aioquic, Config) of
-        {ok, _Host, _Port, _Features} ->
-            {skip, "Flow control test requires large data transfer"};
-        {error, not_found} ->
-            {skip, "No server configured"}
-    end.
-
-flow_control_stream(Config) ->
-    ct:comment("Test stream-level flow control"),
-    case get_server(aioquic, Config) of
-        {ok, _Host, _Port, _Features} ->
-            {skip, "Stream flow control test requires large data transfer"};
-        {error, not_found} ->
-            {skip, "No server configured"}
-    end.
-
-%%====================================================================
-%% Loss Recovery Tests
-%%====================================================================
-
-retransmission(Config) ->
-    ct:comment("Test packet retransmission"),
-    %% This would require inducing packet loss and verifying retransmission
-    case get_server(aioquic, Config) of
-        {ok, _Host, _Port, _Features} ->
-            {skip, "Retransmission test requires packet loss simulation"};
-        {error, not_found} ->
-            {skip, "No server configured"}
     end.
 
 %%====================================================================

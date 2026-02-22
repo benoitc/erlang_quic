@@ -34,16 +34,7 @@
 -include("quic.hrl").
 
 %% Suppress warnings for helper functions prepared for future use
--compile([{nowarn_unused_function, [
-    {send_handshake_ack, 1},
-    {process_frames, 3},
-    {cancel_pto_timer, 1},
-    {cancel_idle_timer, 1},
-    {complete_key_update, 1},
-    {can_send_to_path, 3},
-    {issue_new_connection_id, 1},
-    {get_active_peer_cid, 1}
-]}]).
+-compile([{nowarn_unused_function, [{send_handshake_ack, 1}]}]).
 
 %% Dialyzer nowarn for functions prepared for future use and unreachable patterns
 %% (code structure supports multiple ciphers/paths not yet exercised)
@@ -2287,14 +2278,6 @@ decrypt_packet_continue(Level, UnprotectedHeader, PNLen, EncryptedPayload, Remai
             {error, decryption_failed}
     end.
 
-%% Process decoded frames (re-enables socket when done for client connections)
-process_frames(_Level, [], State) ->
-    maybe_reenable_socket(State),
-    State;
-process_frames(Level, [Frame | Rest], State) ->
-    NewState = process_frame(Level, Frame, State),
-    process_frames(Level, Rest, NewState).
-
 %% Process decoded frames without re-enabling socket (for coalesced packets)
 process_frames_noreenbl(_Level, [], State) ->
     State;
@@ -3776,13 +3759,6 @@ set_pto_timer(#state{loss_state = LossState, pto_timer = OldTimer} = State) ->
             State#state{pto_timer = undefined}
     end.
 
-%% Cancel PTO timer
-cancel_pto_timer(#state{pto_timer = undefined} = State) ->
-    State;
-cancel_pto_timer(#state{pto_timer = Ref} = State) ->
-    cancel_timer(Ref),
-    State#state{pto_timer = undefined}.
-
 %% Helper to cancel a timer reference
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
@@ -3798,13 +3774,6 @@ set_idle_timer(#state{idle_timeout = Timeout, idle_timer = OldTimer} = State) ->
     cancel_timer(OldTimer),
     TimerRef = erlang:send_after(Timeout, self(), idle_timeout),
     State#state{idle_timer = TimerRef}.
-
-%% Cancel idle timer
-cancel_idle_timer(#state{idle_timer = undefined} = State) ->
-    State;
-cancel_idle_timer(#state{idle_timer = Ref} = State) ->
-    cancel_timer(Ref),
-    State#state{idle_timer = undefined}.
 
 %% Convert state to map for debugging
 state_to_map(#state{} = S) ->
@@ -3955,15 +3924,6 @@ handle_peer_key_update(#state{key_state = KeyState} = State) ->
             %% Already responding, just continue
             State
     end.
-
-%% @doc Complete a key update after receiving an ACK for a packet with new keys.
-%% Discards the previous keys.
-complete_key_update(#state{key_state = KeyState} = State) ->
-    NewKeyState = KeyState#key_update_state{
-        prev_keys = undefined,
-        update_state = idle
-    },
-    State#state{key_state = NewKeyState}.
 
 %% @doc Select the appropriate keys for decryption based on the received key phase.
 %% Returns {Keys, State} where State may be updated if a key update is detected.
@@ -4179,14 +4139,6 @@ complete_migration(_, State) ->
     %% Can only migrate to validated paths
     State.
 
-%% @doc Check if we can send data to a path (anti-amplification).
-%% RFC 9000 Section 8.1: Can only send 3x received bytes on unvalidated path.
--spec can_send_to_path(#path_state{}, non_neg_integer(), #state{}) -> boolean().
-can_send_to_path(#path_state{status = validated}, _Size, _State) ->
-    true;
-can_send_to_path(#path_state{bytes_sent = Sent, bytes_received = Recv}, Size, _State) ->
-    (Sent + Size) =< (Recv * 3).
-
 %% @doc Handle NEW_CONNECTION_ID frame from peer.
 %% Adds the new CID to our pool of peer CIDs.
 %% RFC 9000 Section 5.1.1: Peer must not exceed our active_connection_id_limit.
@@ -4259,53 +4211,3 @@ handle_retire_connection_id(SeqNum, State) ->
         end, Pool),
     State#state{local_cid_pool = NewPool}.
 
-%% @doc Issue a new connection ID to the peer.
-%% Sends NEW_CONNECTION_ID frame with a new CID.
-%% RFC 9000: We must not issue more CIDs than peer's active_connection_id_limit.
-issue_new_connection_id(State) ->
-    #state{
-        local_cid_pool = Pool,
-        local_cid_seq = Seq,
-        peer_active_cid_limit = Limit,
-        cid_config = CIDConfig
-    } = State,
-
-    %% Check if we can issue more CIDs (respecting peer's limit)
-    ActiveCount = length([E || #cid_entry{status = active} = E <- Pool]),
-    case ActiveCount < Limit of
-        true ->
-            %% Generate new CID (LB-aware if configured) and reset token
-            NewCID = generate_connection_id(CIDConfig),
-            ResetToken = crypto:strong_rand_bytes(16),
-
-            NewEntry = #cid_entry{
-                seq_num = Seq,
-                cid = NewCID,
-                stateless_reset_token = ResetToken,
-                status = active
-            },
-
-            %% Send NEW_CONNECTION_ID frame
-            Frame = quic_frame:encode({new_connection_id, Seq, 0, NewCID, ResetToken}),
-            State1 = State#state{
-                local_cid_pool = [NewEntry | Pool],
-                local_cid_seq = Seq + 1
-            },
-            send_app_packet(Frame, State1);
-        false ->
-            State
-    end.
-
-%% @doc Get an active peer CID for use.
-%% Returns the CID with the lowest active sequence number.
-get_active_peer_cid(#state{peer_cid_pool = Pool, dcid = CurrentDCID}) ->
-    Active = [E || #cid_entry{status = active} = E <- Pool],
-    case Active of
-        [] ->
-            CurrentDCID;  % Fall back to current DCID
-        _ ->
-            Sorted = lists:sort(fun(A, B) ->
-                A#cid_entry.seq_num < B#cid_entry.seq_num
-            end, Active),
-            (hd(Sorted))#cid_entry.cid
-    end.

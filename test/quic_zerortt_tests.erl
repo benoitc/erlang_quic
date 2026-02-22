@@ -122,25 +122,6 @@ early_data_encryption_test() ->
         aes_128_gcm, Key, Nonce, Ciphertext, AAD, Tag, false),
     ?assertEqual(Plaintext, Decrypted).
 
-%% Test max_early_data limit tracking
-early_data_limit_test() ->
-    %% Create a session ticket with max_early_data limit
-    Ticket = #session_ticket{
-        server_name = <<"example.com">>,
-        ticket = crypto:strong_rand_bytes(32),
-        lifetime = 86400,
-        age_add = 12345,
-        nonce = <<1, 2, 3, 4, 5, 6, 7, 8>>,
-        resumption_secret = crypto:strong_rand_bytes(32),
-        max_early_data = 16384,  % 16KB limit
-        received_at = erlang:system_time(second),
-        cipher = aes_128_gcm,
-        alpn = <<"h3">>
-    },
-
-    %% Verify max_early_data is tracked
-    ?assertEqual(16384, Ticket#session_ticket.max_early_data).
-
 %%====================================================================
 %% Step 5: 0-RTT Server-Side Tests
 %%====================================================================
@@ -198,6 +179,87 @@ early_exporter_master_secret_test() ->
         EarlySecret, ClientHelloHash),
 
     ?assertEqual(32, byte_size(EarlyExpMasterSecret)).
+
+%%====================================================================
+%% Additional 0-RTT Tests (merged from quic_zero_rtt_tests)
+%%====================================================================
+
+%% Test early secret derivation without PSK
+early_secret_without_psk_test() ->
+    %% Without PSK, early secret is derived from zeros
+    EarlySecret = quic_crypto:derive_early_secret(),
+    ?assertEqual(32, byte_size(EarlySecret)).
+
+%% Test early secret determinism
+early_secret_deterministic_test() ->
+    PSK = crypto:strong_rand_bytes(32),
+    ES1 = quic_crypto:derive_early_secret(PSK),
+    ES2 = quic_crypto:derive_early_secret(PSK),
+    ?assertEqual(ES1, ES2).
+
+%% Test client early secret with AES-256-GCM cipher
+client_early_secret_cipher_aware_test() ->
+    PSK = crypto:strong_rand_bytes(48),
+    EarlySecret = quic_crypto:derive_early_secret(aes_256_gcm, PSK),
+    ClientHelloHash = crypto:strong_rand_bytes(48),
+
+    ClientEarlySecret = quic_crypto:derive_client_early_traffic_secret(
+        aes_256_gcm, EarlySecret, ClientHelloHash),
+    ?assertEqual(48, byte_size(ClientEarlySecret)).
+
+%% Test 0-RTT packet encrypt/decrypt roundtrip
+zero_rtt_packet_encrypt_decrypt_test() ->
+    %% Derive 0-RTT keys
+    PSK = crypto:strong_rand_bytes(32),
+    EarlySecret = quic_crypto:derive_early_secret(PSK),
+    ClientHelloHash = crypto:hash(sha256, <<"ClientHello">>),
+
+    ClientEarlySecret = quic_crypto:derive_client_early_traffic_secret(
+        EarlySecret, ClientHelloHash),
+    {Key, IV, _HP} = quic_keys:derive_keys(ClientEarlySecret, aes_128_gcm),
+
+    %% Encrypt some data
+    PN = 0,
+    Plaintext = <<"Hello, 0-RTT world!">>,
+    AAD = <<>>,  % Simplified for test
+
+    Ciphertext = quic_aead:encrypt(Key, IV, PN, AAD, Plaintext),
+    ?assert(byte_size(Ciphertext) > byte_size(Plaintext)),  % Has tag
+
+    %% Decrypt
+    {ok, Decrypted} = quic_aead:decrypt(Key, IV, PN, AAD, Ciphertext),
+    ?assertEqual(Plaintext, Decrypted).
+
+%% Test 0-RTT with multiple packets
+zero_rtt_multiple_packets_test() ->
+    PSK = crypto:strong_rand_bytes(32),
+    EarlySecret = quic_crypto:derive_early_secret(PSK),
+    ClientHelloHash = crypto:hash(sha256, <<"ClientHello">>),
+
+    ClientEarlySecret = quic_crypto:derive_client_early_traffic_secret(
+        EarlySecret, ClientHelloHash),
+    {Key, IV, _HP} = quic_keys:derive_keys(ClientEarlySecret, aes_128_gcm),
+
+    %% Encrypt multiple packets with different PNs
+    Packets = [
+        {0, <<"First 0-RTT packet">>},
+        {1, <<"Second 0-RTT packet">>},
+        {2, <<"Third 0-RTT packet">>}
+    ],
+
+    Results = lists:map(
+        fun({PN, Plaintext}) ->
+            AAD = <<PN:32>>,
+            Ciphertext = quic_aead:encrypt(Key, IV, PN, AAD, Plaintext),
+            {ok, Decrypted} = quic_aead:decrypt(Key, IV, PN, AAD, Ciphertext),
+            {PN, Plaintext, Decrypted}
+        end, Packets),
+
+    %% All decrypted correctly
+    lists:foreach(
+        fun({_PN, Original, Decrypted}) ->
+            ?assertEqual(Original, Decrypted)
+        end, Results).
 
 %%====================================================================
 %% Helper Functions
