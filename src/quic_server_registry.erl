@@ -55,6 +55,9 @@
     monitors = #{} :: #{reference() => atom()}
 }).
 
+%% @private
+-type state() :: #state{}.
+
 %%====================================================================
 %% API
 %%====================================================================
@@ -149,7 +152,7 @@ get_connections(Name) ->
 %%====================================================================
 
 %% @private
--spec init(map()) -> {ok, #state{}}.
+-spec init(map()) -> {ok, state()}.
 init(#{}) ->
     %% Create ETS table for server registry
     ?TABLE = ets:new(?TABLE, [
@@ -161,8 +164,8 @@ init(#{}) ->
     {ok, #state{}}.
 
 %% @private
--spec handle_call(term(), gen_server:from(), #state{}) ->
-    {reply, term(), #state{}}.
+-spec handle_call(term(), gen_server:from(), state()) ->
+    {reply, term(), state()}.
 handle_call({register, Name, Pid, Port, Opts}, _From, #state{monitors = Monitors} = State) ->
     %% Monitor the server process
     MonRef = erlang:monitor(process, Pid),
@@ -198,12 +201,12 @@ handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
 %% @private
--spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
+-spec handle_cast(term(), state()) -> {noreply, state()}.
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
 %% @private
--spec handle_info(term(), #state{}) -> {noreply, #state{}}.
+-spec handle_info(term(), state()) -> {noreply, state()}.
 handle_info({'DOWN', MonRef, process, _Pid, _Reason}, #state{monitors = Monitors} = State) ->
     %% Server terminated, remove from registry
     case maps:get(MonRef, Monitors, undefined) of
@@ -218,7 +221,7 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 %% @private
--spec terminate(term(), #state{}) -> ok.
+-spec terminate(term(), state()) -> ok.
 terminate(_Reason, _State) ->
     ok.
 

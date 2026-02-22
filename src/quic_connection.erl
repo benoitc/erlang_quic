@@ -293,6 +293,10 @@
     cid_config :: #cid_config{} | undefined
 }).
 
+-type state() :: #state{}.
+-type path_state() :: #path_state{}.
+-type preferred_address() :: #preferred_address{}.
+
 %%====================================================================
 %% Registry API
 %%====================================================================
@@ -4235,7 +4239,7 @@ get_current_key_phase(#state{key_state = KeyState}) -> KeyState#key_update_state
 
 %% @doc Initiate path validation by sending PATH_CHALLENGE.
 %% Returns updated state with the path in validating status.
--spec initiate_path_validation({inet:ip_address(), inet:port_number()}, #state{}) -> #state{}.
+-spec initiate_path_validation({inet:ip_address(), inet:port_number()}, state()) -> state().
 initiate_path_validation(RemoteAddr, State) ->
     %% Generate 8-byte random challenge data
     ChallengeData = crypto:strong_rand_bytes(8),
@@ -4264,7 +4268,7 @@ initiate_path_validation(RemoteAddr, State) ->
 %% @doc Initiate path validation for server's preferred address (RFC 9000 Section 9.6).
 %% Client validates the preferred address before migrating to it.
 %% Prefers IPv6 over IPv4 when both are available.
--spec initiate_preferred_address_validation(#preferred_address{}, #state{}) -> #state{}.
+-spec initiate_preferred_address_validation(preferred_address(), state()) -> state().
 initiate_preferred_address_validation(
     #preferred_address{cid = CID, stateless_reset_token = Token} = PA, State
 ) ->
@@ -4352,7 +4356,7 @@ handle_path_response(ResponseData, State) ->
 
 %% @doc Auto-migrate to preferred address if the validated path matches.
 %% RFC 9000 Section 9.6: Client SHOULD migrate to validated preferred address.
--spec maybe_migrate_to_preferred_address(#path_state{}, #state{}) -> #state{}.
+-spec maybe_migrate_to_preferred_address(path_state(), state()) -> state().
 maybe_migrate_to_preferred_address(ValidatedPath, #state{preferred_address = undefined} = State) ->
     %% No preferred address, just return
     State#state{alt_paths = [ValidatedPath | State#state.alt_paths]};
@@ -4405,7 +4409,7 @@ find_path_by_challenge(Data, [Path | Rest]) ->
 
 %% @doc Complete migration to a validated path.
 %% Updates the current path and DCID if necessary.
--spec complete_migration(#path_state{}, #state{}) -> #state{}.
+-spec complete_migration(path_state(), state()) -> state().
 complete_migration(#path_state{status = validated} = NewPath, State) ->
     %% Update remote address
     State#state{

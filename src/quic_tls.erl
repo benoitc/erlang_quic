@@ -23,6 +23,9 @@
 
 -include("quic.hrl").
 
+-opaque preferred_address() :: #preferred_address{}.
+-export_type([preferred_address/0]).
+
 -export([
     %% ClientHello
     build_client_hello/1,
@@ -573,7 +576,7 @@ decode_tp_value(_, Value) ->
 %%   CID length:       1 byte
 %%   Connection ID:    variable (0-20 bytes)
 %%   Stateless reset: 16 bytes
--spec decode_preferred_address(binary()) -> #preferred_address{}.
+-spec decode_preferred_address(binary()) -> preferred_address().
 decode_preferred_address(<<
     IPv4_A:8,
     IPv4_B:8,
@@ -616,7 +619,7 @@ decode_preferred_address(<<
     }.
 
 %% @doc Encode preferred_address transport parameter (RFC 9000 Section 18.2).
--spec encode_preferred_address(#preferred_address{}) -> binary().
+-spec encode_preferred_address(preferred_address()) -> binary().
 encode_preferred_address(#preferred_address{
     ipv4_addr = IPv4Addr,
     ipv4_port = IPv4Port,

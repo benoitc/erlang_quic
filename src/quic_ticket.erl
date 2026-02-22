@@ -109,7 +109,7 @@ derive_resumption_secret(Cipher, MasterSecret, TranscriptHash, _ClientFinished) 
 %% @doc Derive PSK from resumption_master_secret and ticket nonce.
 %% RFC 8446 Section 4.6.1:
 %%   PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, Hash.length)
--spec derive_psk(binary(), #session_ticket{}) -> binary().
+-spec derive_psk(binary(), session_ticket()) -> binary().
 derive_psk(ResumptionSecret, #session_ticket{nonce = Nonce, cipher = Cipher}) ->
     Hash = quic_crypto:cipher_to_hash(Cipher),
     HashLen = quic_crypto:hash_len(Hash),
@@ -179,7 +179,7 @@ parse_early_data_extension(_) ->
 %% @doc Create a session ticket from connection state.
 %% This is used by the server to issue tickets to clients.
 -spec create_ticket(binary(), binary(), non_neg_integer(), atom(), binary() | undefined) ->
-    #session_ticket{}.
+    session_ticket().
 create_ticket(ServerName, ResumptionSecret, MaxEarlyData, Cipher, ALPN) ->
     %% Use crypto:strong_rand_bytes for age_add to prevent replay attacks
     <<AgeAdd:32>> = crypto:strong_rand_bytes(4),
@@ -198,7 +198,7 @@ create_ticket(ServerName, ResumptionSecret, MaxEarlyData, Cipher, ALPN) ->
     }.
 
 %% @doc Build a NewSessionTicket message.
--spec build_new_session_ticket(#session_ticket{}) -> binary().
+-spec build_new_session_ticket(session_ticket()) -> binary().
 build_new_session_ticket(#session_ticket{
     lifetime = Lifetime,
     age_add = AgeAdd,

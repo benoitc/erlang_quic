@@ -98,7 +98,8 @@
 }).
 
 -opaque loss_state() :: #loss_state{}.
--export_type([loss_state/0]).
+-type sent_packet() :: #sent_packet{}.
+-export_type([loss_state/0, sent_packet/0]).
 
 %%====================================================================
 %% Loss Detection State
@@ -160,7 +161,7 @@ on_packet_sent(
 %% @doc Process an ACK frame.
 %% Returns {NewState, AckedPackets, LostPackets} or {error, ack_range_too_large}
 -spec on_ack_received(loss_state(), term(), non_neg_integer()) ->
-    {loss_state(), [#sent_packet{}], [#sent_packet{}]} | {error, ack_range_too_large}.
+    {loss_state(), [sent_packet()], [sent_packet()]}.
 on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now) ->
     %% Get list of acknowledged packet numbers (use quic_ack for bounds-checked version)
     case quic_ack:ack_frame_to_pn_list(LargestAcked, FirstRange, AckRanges) of
@@ -213,7 +214,7 @@ on_ack_received(State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, 
 
 %% @doc Detect lost packets based on time and packet thresholds.
 -spec detect_lost_packets(loss_state(), non_neg_integer()) ->
-    {loss_state(), [#sent_packet{}]}.
+    {loss_state(), [sent_packet()]}.
 detect_lost_packets(
     #loss_state{sent_packets = Sent, smoothed_rtt = SRTT} = State,
     LargestAcked
@@ -376,7 +377,7 @@ on_pto_expired(#loss_state{pto_count = Count} = State) ->
 %%====================================================================
 
 %% @doc Get all sent packets.
--spec sent_packets(loss_state()) -> #{non_neg_integer() => #sent_packet{}}.
+-spec sent_packets(loss_state()) -> #{non_neg_integer() => sent_packet()}.
 sent_packets(#loss_state{sent_packets = S}) -> S.
 
 %% @doc Get bytes currently in flight.
