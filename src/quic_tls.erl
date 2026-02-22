@@ -21,6 +21,7 @@
 
 -module(quic_tls).
 
+-include_lib("public_key/include/public_key.hrl").
 -include("quic.hrl").
 
 -opaque preferred_address() :: #preferred_address{}.
@@ -1026,19 +1027,16 @@ rsa_pss_params(Hash) ->
 
 %% Convert private key to format expected by crypto:sign
 convert_private_key(
-    ecdsa, {'ECPrivateKey', _, PrivKeyBin, {namedCurve, {1, 2, 840, 10045, 3, 1, 7}}, _, _}
+    ecdsa, #'ECPrivateKey'{privateKey = PrivKeyBin, parameters = {namedCurve, ?secp192r1}}
 ) ->
-    %% secp256r1 / P-256
     [PrivKeyBin, secp256r1];
 convert_private_key(
-    ecdsa, {'ECPrivateKey', _, PrivKeyBin, {namedCurve, {1, 3, 132, 0, 34}}, _, _}
+    ecdsa, #'ECPrivateKey'{privateKey = PrivKeyBin, parameters = {namedCurve, ?secp384r1}}
 ) ->
-    %% secp384r1 / P-384
     [PrivKeyBin, secp384r1];
-convert_private_key(ecdsa, {'ECPrivateKey', _, PrivKeyBin, _, _, _}) ->
-    %% Default EC curve
+convert_private_key(ecdsa, #'ECPrivateKey'{privateKey = PrivKeyBin}) ->
     [PrivKeyBin, secp256r1];
-convert_private_key(rsa, {'RSAPrivateKey', _, N, E, D, _P, _Q, _Dp, _Dq, _Qi, _}) ->
+convert_private_key(rsa, #'RSAPrivateKey'{modulus = N, publicExponent = E, privateExponent = D}) ->
     %% crypto:sign expects [E, N, D] list format for RSA
     [E, N, D];
 convert_private_key(rsa, Key) when is_list(Key) ->
