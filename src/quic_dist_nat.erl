@@ -34,6 +34,8 @@
 -module(quic_dist_nat).
 -behaviour(gen_server).
 
+-include_lib("estun/include/estun.hrl").
+
 %% API
 -export([
     start_link/0,
@@ -133,15 +135,16 @@ init(Opts) ->
         stun_servers = StunServers
     },
 
-    %% Try initial discovery if NAT is available
-    State1 = case Available of
+    %% Schedule deferred discovery to allow network to be ready
+    %% This is especially important in container environments
+    case Available of
         true ->
-            try_discover(State);
+            erlang:send_after(2000, self(), do_initial_discovery);
         false ->
-            State
+            ok
     end,
 
-    {ok, State1}.
+    {ok, State}.
 
 handle_call(discover, _From, #state{nat_available = false} = State) ->
     {reply, {error, nat_not_available}, State};
@@ -215,6 +218,17 @@ handle_cast({trigger_migration, ConnRef}, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info(do_initial_discovery, State) ->
+    %% Perform initial NAT discovery after network is ready
+    State1 = try_discover(State),
+    case State1#state.external_ip of
+        undefined ->
+            error_logger:info_msg("quic_dist_nat: Initial discovery found no NAT gateway~n");
+        IP ->
+            error_logger:info_msg("quic_dist_nat: Discovered external IP: ~p~n", [IP])
+    end,
+    {noreply, State1};
+
 handle_info(renew_mappings, State) ->
     State1 = renew_all_mappings(State),
     State2 = schedule_renewal(State1),
@@ -244,9 +258,14 @@ code_change(_OldVsn, State, _Extra) ->
 try_discover(#state{nat_available = true} = State) ->
     try
         case nat:discover() of
-            {ok, Context} ->
-                case nat:get_external_address(Context) of
-                    {ok, IP} ->
+            ok ->
+                case nat:get_external_address() of
+                    {ok, IPStr} when is_list(IPStr) ->
+                        case inet:parse_address(IPStr) of
+                            {ok, IP} -> State#state{external_ip = IP};
+                            _ -> State
+                        end;
+                    {ok, IP} when is_tuple(IP) ->
                         State#state{external_ip = IP};
                     _ ->
                         State
@@ -272,9 +291,8 @@ try_stun_discover(#state{stun_servers = [Server | Rest]} = State) ->
     end.
 
 %% @private
-%% Simple STUN binding request (RFC 5389).
+%% STUN binding request using estun library
 stun_query(Server) ->
-    %% Parse server address
     case parse_stun_server(Server) of
         {ok, Host, Port} ->
             do_stun_query(Host, Port);
@@ -300,104 +318,40 @@ parse_stun_server(Server) ->
 
 %% @private
 do_stun_query(Host, Port) ->
-    %% Open UDP socket
-    case gen_udp:open(0, [binary, {active, false}]) of
-        {ok, Socket} ->
+    %% Use estun client for STUN binding
+    case estun_client:start_link(#{}) of
+        {ok, Client} ->
             try
-                %% STUN Binding Request
-                %% Type: 0x0001 (Binding Request)
-                %% Length: 0 (no attributes)
-                %% Magic Cookie: 0x2112A442
-                %% Transaction ID: 12 random bytes
-                TransactionId = crypto:strong_rand_bytes(12),
-                Request = <<16#0001:16, 0:16, 16#2112A442:32, TransactionId/binary>>,
-
-                case inet:getaddr(Host, inet) of
-                    {ok, IP} ->
-                        ok = gen_udp:send(Socket, IP, Port, Request),
-
-                        case gen_udp:recv(Socket, 0, 3000) of
-                            {ok, {_FromIP, _FromPort, Response}} ->
-                                parse_stun_response(Response);
-                            {error, timeout} ->
-                                {error, timeout};
-                            Error ->
-                                Error
-                        end;
-                    Error ->
-                        Error
+                StunServer = #stun_server{
+                    id = make_ref(),
+                    host = Host,
+                    port = Port,
+                    transport = udp
+                },
+                case estun_client:bind(Client, StunServer, 5000) of
+                    {ok, #stun_addr{address = IP, port = MappedPort}} ->
+                        {ok, IP, MappedPort};
+                    {error, Reason} ->
+                        {error, Reason}
                 end
             after
-                gen_udp:close(Socket)
+                estun_client:stop(Client)
             end;
-        Error ->
-            Error
+        {error, Reason} ->
+            {error, Reason}
     end.
-
-%% @private
-parse_stun_response(<<16#0101:16, Len:16, 16#2112A442:32, _TransId:12/binary, Attrs:Len/binary, _/binary>>) ->
-    %% Binding Success Response
-    parse_stun_attrs(Attrs);
-parse_stun_response(_) ->
-    {error, invalid_response}.
-
-%% @private
-parse_stun_attrs(<<>>) ->
-    {error, no_address};
-parse_stun_attrs(<<16#0020:16, Len:16, Value:Len/binary, Rest/binary>>) ->
-    %% XOR-MAPPED-ADDRESS
-    case Value of
-        <<0, 1, XPort:16, XIP:4/binary>> ->
-            %% IPv4
-            Port = XPort bxor 16#2112,
-            <<A, B, C, D>> = crypto:exor(XIP, <<16#2112A442:32>>),
-            {ok, {A, B, C, D}, Port};
-        <<0, 2, XPort:16, XIP:16/binary>> ->
-            %% IPv6
-            Port = XPort bxor 16#2112,
-            MagicAndTxId = <<16#2112A442:32, 0:96>>,  % Simplified
-            IP = crypto:exor(XIP, MagicAndTxId),
-            {ok, binary_to_ip6(IP), Port};
-        _ ->
-            parse_stun_attrs(Rest)
-    end;
-parse_stun_attrs(<<16#0001:16, Len:16, Value:Len/binary, Rest/binary>>) ->
-    %% MAPPED-ADDRESS (fallback)
-    case Value of
-        <<0, 1, Port:16, A, B, C, D>> ->
-            {ok, {A, B, C, D}, Port};
-        _ ->
-            parse_stun_attrs(Rest)
-    end;
-parse_stun_attrs(<<_Type:16, Len:16, _Value:Len/binary, Rest/binary>>) ->
-    %% Skip unknown attribute
-    PaddedLen = (Len + 3) band (bnot 3),
-    Skip = PaddedLen - Len,
-    case Rest of
-        <<_:Skip/binary, NextAttrs/binary>> ->
-            parse_stun_attrs(NextAttrs);
-        _ ->
-            {error, no_address}
-    end;
-parse_stun_attrs(_) ->
-    {error, invalid_attrs}.
-
-%% @private
-binary_to_ip6(<<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>) ->
-    {A, B, C, D, E, F, G, H}.
 
 %% @private
 create_mapping(Port, #state{nat_available = true}) ->
     try
-        case nat:discover() of
-            {ok, Context} ->
-                %% Request same external port as internal
-                case nat:add_port_mapping(Context, udp, Port, Port, 1800) of
-                    {ok, _, ExtPort, _, _} ->
-                        {ok, ExtPort, {Context, Port}};
-                    Error ->
-                        Error
-                end;
+        %% Use same port for internal and external
+        case nat:add_port_mapping(udp, Port, Port, 1800) of
+            {ok, _, ExtPort, _, _} ->
+                {ok, ExtPort, Port};
+            {ok, ExtPort} ->
+                {ok, ExtPort, Port};
+            ok ->
+                {ok, Port, Port};
             Error ->
                 Error
         end
@@ -409,9 +363,9 @@ create_mapping(Port, _State) ->
     {ok, Port, undefined}.
 
 %% @private
-delete_mapping({Context, Port}) ->
+delete_mapping(Port) when is_integer(Port) ->
     try
-        nat:delete_port_mapping(Context, udp, Port)
+        nat:delete_port_mapping(udp, Port, Port)
     catch
         _:_ -> ok
     end;
@@ -454,17 +408,21 @@ renew_all_mappings(State) ->
     State.
 
 %% @private
-renew_mapping(Port, _ExtPort, {Context, _}) ->
+renew_mapping(_Port, ExtPort, undefined) ->
+    {ok, ExtPort, undefined};
+renew_mapping(Port, _ExtPort, _MappingRef) ->
     try
-        case nat:add_port_mapping(Context, udp, Port, Port, 1800) of
+        case nat:add_port_mapping(udp, Port, Port, 1800) of
             {ok, _, NewExtPort, _, _} ->
-                {ok, NewExtPort, {Context, Port}};
+                {ok, NewExtPort, Port};
+            {ok, NewExtPort} ->
+                {ok, NewExtPort, Port};
+            ok ->
+                {ok, Port, Port};
             Error ->
                 Error
         end
     catch
         _:Reason ->
             {error, Reason}
-    end;
-renew_mapping(_Port, ExtPort, undefined) ->
-    {ok, ExtPort, undefined}.
+    end.

@@ -138,6 +138,9 @@ listen(Name, ExtraOpts) ->
             Port = get_listen_port(),
             case start_quic_server(Name, Port, Config, ExtraOpts) of
                 {ok, ServerName, ActualPort} ->
+                    %% Request NAT port mapping if enabled
+                    ExternalPort = maybe_map_nat_port(Config, ActualPort),
+
                     %% Create listener record
                     Listener = #quic_dist_listener{
                         server_name = ServerName,
@@ -146,8 +149,9 @@ listen(Name, ExtraOpts) ->
                     },
 
                     %% Build net_address record
+                    %% Use external port if NAT mapping succeeded
                     Address = #net_address{
-                        address = {{0, 0, 0, 0}, ActualPort},
+                        address = {{0, 0, 0, 0}, ExternalPort},
                         host = localhost,
                         family = inet,
                         protocol = quic
@@ -438,6 +442,79 @@ dist_server_name(Name) ->
 %% Different instances should have different creation numbers.
 get_creation(Name) ->
     (erlang:phash2(Name) + erlang:system_time(second)) rem 3 + 1.
+
+%% @private
+%% Request NAT port mapping if NAT is enabled.
+%% Returns the external port (may differ from internal port).
+%%
+%% Note: During early boot (before quic application starts), the NAT
+%% gen_server may not be running. In this case, we schedule deferred
+%% port mapping to be performed once the application is fully started.
+maybe_map_nat_port(#quic_dist_config{nat_enabled = true}, Port) ->
+    %% NAT is enabled - try to create port mapping
+    case quic_dist_nat:is_available() of
+        true ->
+            %% Check if NAT server is running
+            case whereis(quic_dist_nat) of
+                Pid when is_pid(Pid) ->
+                    %% Server is running, try immediate mapping
+                    do_map_port(Port);
+                undefined ->
+                    %% Server not running yet (early boot), schedule deferred mapping
+                    schedule_deferred_nat_mapping(Port),
+                    Port
+            end;
+        false ->
+            error_logger:info_msg("quic_dist: NAT enabled but nat library not available~n"),
+            Port
+    end;
+maybe_map_nat_port(_, Port) ->
+    %% NAT not enabled
+    Port.
+
+%% @private
+%% Actually perform the port mapping.
+do_map_port(Port) ->
+    case quic_dist_nat:map_port(Port) of
+        {ok, ExternalPort} ->
+            error_logger:info_msg("quic_dist: NAT port mapping created ~p -> ~p~n",
+                                  [Port, ExternalPort]),
+            ExternalPort;
+        {error, Reason} ->
+            error_logger:warning_msg("quic_dist: NAT port mapping failed: ~p~n", [Reason]),
+            Port
+    end.
+
+%% @private
+%% Schedule deferred NAT port mapping for after application start.
+%% The mapping will be attempted once quic_dist_nat gen_server is available.
+schedule_deferred_nat_mapping(Port) ->
+    error_logger:info_msg("quic_dist: Scheduling deferred NAT port mapping for port ~p~n", [Port]),
+    %% Store the port for deferred mapping
+    persistent_term:put(quic_dist_deferred_nat_port, Port),
+    %% Spawn a process to attempt mapping once the server is available
+    spawn(fun() -> deferred_nat_mapping_loop(Port, 30) end),
+    ok.
+
+%% @private
+%% Loop waiting for NAT server to be available and ready, then create mapping.
+%% We wait extra time after server starts to allow NAT gateway discovery.
+deferred_nat_mapping_loop(_Port, 0) ->
+    error_logger:warning_msg("quic_dist: Deferred NAT port mapping timed out~n"),
+    ok;
+deferred_nat_mapping_loop(Port, Retries) ->
+    timer:sleep(1000),
+    case whereis(quic_dist_nat) of
+        Pid when is_pid(Pid) ->
+            %% Server is running, wait a bit for discovery to complete
+            %% The NAT server schedules discovery 2s after start
+            timer:sleep(3000),
+            _ExtPort = do_map_port(Port),
+            persistent_term:erase(quic_dist_deferred_nat_port),
+            ok;
+        undefined ->
+            deferred_nat_mapping_loop(Port, Retries - 1)
+    end.
 
 %% @private
 %% Load TLS credentials from files or config.
