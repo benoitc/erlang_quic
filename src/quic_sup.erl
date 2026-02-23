@@ -60,6 +60,9 @@ init([]) ->
         period => 10
     },
 
+    %% Get distribution options for NAT support
+    DistOpts = application:get_env(quic, dist, []),
+
     Children = [
         #{
             id => quic_server_registry,
@@ -76,6 +79,14 @@ init([]) ->
             shutdown => infinity,
             type => supervisor,
             modules => [quic_server_sup]
+        },
+        #{
+            id => quic_dist_sup,
+            start => {quic_dist_sup, start_link, [DistOpts]},
+            restart => permanent,
+            shutdown => infinity,
+            type => supervisor,
+            modules => [quic_dist_sup]
         }
     ],
 
