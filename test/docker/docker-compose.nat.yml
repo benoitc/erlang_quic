@@ -1,0 +1,127 @@
+# Docker Compose for NAT Traversal Testing
+# Simulates nodes behind NAT using iptables
+# Usage: docker-compose -f docker-compose.nat.yml up -d
+
+version: '3.8'
+
+services:
+  # NAT Router - simulates a NAT gateway
+  nat_router:
+    image: alpine:latest
+    hostname: nat_router
+    cap_add:
+      - NET_ADMIN
+    command: |
+      sh -c '
+        # Enable IP forwarding
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+
+        # Set up NAT masquerading
+        iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
+        # Allow established connections
+        iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+        # Allow traffic from internal network
+        iptables -A FORWARD -i eth1 -j ACCEPT
+
+        # Keep container running
+        tail -f /dev/null
+      '
+    networks:
+      external:
+        ipv4_address: 172.29.0.10
+      internal:
+        ipv4_address: 172.30.0.1
+
+  # Internal node - behind NAT
+  internal_node:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.node
+    hostname: internal_node
+    environment:
+      - NODE_NAME=internal@internal_node
+      - QUIC_DIST_PORT=4433
+      - NAT_ENABLED=true
+      - STUN_SERVERS=stun.l.google.com:19302
+    volumes:
+      - ./certs:/certs:ro
+    networks:
+      internal:
+        ipv4_address: 172.30.0.11
+    depends_on:
+      - nat_router
+    # Route through NAT router
+    dns:
+      - 8.8.8.8
+
+  # External node - direct internet access
+  external_node1:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.node
+    hostname: external_node1
+    environment:
+      - NODE_NAME=external1@external_node1
+      - QUIC_DIST_PORT=4433
+    volumes:
+      - ./certs:/certs:ro
+    networks:
+      external:
+        ipv4_address: 172.29.0.11
+    ports:
+      - "14433:4433/udp"
+
+  external_node2:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.node
+    hostname: external_node2
+    environment:
+      - NODE_NAME=external2@external_node2
+      - QUIC_DIST_PORT=4433
+    volumes:
+      - ./certs:/certs:ro
+    networks:
+      external:
+        ipv4_address: 172.29.0.12
+    ports:
+      - "14434:4433/udp"
+
+  # Test runner for NAT tests
+  nat_test_runner:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.node
+    hostname: nat_test_runner
+    environment:
+      - TEST_INTERNAL_NODE=internal@internal_node
+      - TEST_EXTERNAL_NODES=external1@external_node1,external2@external_node2
+    volumes:
+      - ./certs:/certs:ro
+      - ./scripts:/scripts:ro
+    networks:
+      external:
+        ipv4_address: 172.29.0.100
+    depends_on:
+      - nat_router
+      - internal_node
+      - external_node1
+      - external_node2
+    entrypoint: ["/scripts/run_nat_test.sh"]
+
+networks:
+  external:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+          gateway: 172.29.0.1
+
+  internal:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

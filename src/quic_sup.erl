@@ -44,6 +44,16 @@ start_link() ->
 %%====================================================================
 
 init([]) ->
+    %% Create discovery ETS table for quic_discovery_static
+    %% This must be created early as distribution may need it during startup
+    case ets:info(quic_discovery_static_nodes) of
+        undefined ->
+            ets:new(quic_discovery_static_nodes,
+                    [named_table, public, set, {read_concurrency, true}]);
+        _ ->
+            ok
+    end,
+
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,
