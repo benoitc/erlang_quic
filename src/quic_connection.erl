@@ -113,7 +113,9 @@
     add_to_ack_ranges/2,
     merge_ack_ranges/1,
     convert_ack_ranges_for_encode/1,
-    convert_rest_ranges/2
+    convert_rest_ranges/2,
+    check_send_queue_flow_control/3,
+    test_check_flow_control/5
 ]).
 -endif.
 
@@ -4338,7 +4340,64 @@ get_stream_urgency(StreamId, Streams) ->
 
 %% Process send queue when congestion window frees up
 %% Processes streams in priority order (lower urgency = higher priority)
-process_send_queue(
+%% IMPORTANT: Must check BOTH congestion control AND flow control before sending
+process_send_queue(#state{send_queue = PQ} = State) ->
+    case pqueue_peek(PQ) of
+        empty ->
+            State;
+        {value, {stream_data, StreamId, _Offset, Data, _Fin}} ->
+            %% Check flow control BEFORE dequeuing
+            DataSize = byte_size(Data),
+            case check_send_queue_flow_control(StreamId, DataSize, State) of
+                ok ->
+                    %% Flow control allows - dequeue and try to send
+                    process_send_queue_entry(State);
+                {blocked, _Reason} ->
+                    %% Flow control blocked - leave in queue, wait for MAX_DATA
+                    State
+            end
+    end.
+
+%% Check flow control limits for queued data
+%% Returns ok | {blocked, connection | {stream, StreamId}}
+%% NOTE: Only blocks if we're already OVER the limit (negative allowed).
+%% Normal flow control blocking happens in do_send_data before queueing.
+check_send_queue_flow_control(StreamId, DataSize, #state{
+    max_data_remote = MaxDataRemote,
+    data_sent = DataSent,
+    streams = Streams
+}) ->
+    %% Check connection-level flow control
+    %% Only block if we're already over limit (defensive check)
+    ConnectionAllowed = MaxDataRemote - DataSent,
+    case ConnectionAllowed >= 0 andalso DataSize =< ConnectionAllowed of
+        false when ConnectionAllowed < 0 ->
+            %% Already over limit - this shouldn't happen but guard against it
+            {blocked, connection};
+        false ->
+            %% Would exceed limit - block
+            {blocked, connection};
+        true ->
+            %% Check stream-level flow control
+            case maps:find(StreamId, Streams) of
+                {ok, #stream_state{send_max_data = SendMaxData, send_offset = Offset}} ->
+                    StreamAllowed = SendMaxData - Offset,
+                    case StreamAllowed >= 0 andalso DataSize =< StreamAllowed of
+                        false when StreamAllowed < 0 ->
+                            {blocked, {stream, StreamId}};
+                        false ->
+                            {blocked, {stream, StreamId}};
+                        true ->
+                            ok
+                    end;
+                error ->
+                    %% Stream not found - allow (will fail later)
+                    ok
+            end
+    end.
+
+%% Actually process the queue entry (called after flow control check passes)
+process_send_queue_entry(
     #state{send_queue = PQ, streams = Streams, send_queue_bytes = QueueBytes} = State
 ) ->
     case pqueue_out(PQ) of
@@ -4394,7 +4453,7 @@ process_send_queue(
                         false ->
                             %% Check if we just queued more data (cwnd full)
                             case State3#state.send_queue =:= State1#state.send_queue of
-                                % Keep processing
+                                % Keep processing (check flow control again)
                                 true -> process_send_queue(State3);
                                 % New data queued, cwnd full
                                 false -> State3
@@ -4407,8 +4466,6 @@ process_send_queue(
 %% Priority Queue - Bucket-based implementation for urgency 0-7
 %% O(1) insert, O(1) dequeue (8 buckets = constant)
 %%--------------------------------------------------------------------
-
-%% Insert entry at given urgency level (0-7)
 pqueue_in(Entry, Urgency, PQ) when Urgency >= 0, Urgency =< 7 ->
     Bucket = element(Urgency + 1, PQ),
     NewBucket = queue:in(Entry, Bucket),
@@ -5155,3 +5212,33 @@ handle_retire_connection_id(SeqNum, State) ->
         Pool
     ),
     State#state{local_cid_pool = NewPool}.
+
+%%====================================================================
+%% Test Helpers
+%%====================================================================
+
+-ifdef(TEST).
+%% @doc Test helper for check_send_queue_flow_control/3
+%% Wraps the internal function to avoid exposing #state{} record.
+%% RFC 9000 Section 4.1: Connection-level flow control (max_data)
+%% RFC 9000 Section 4.2: Stream-level flow control (max_stream_data)
+%% @param StreamId - Stream ID to check
+%% @param DataSize - Size of data to send
+%% @param MaxDataRemote - Peer's connection-level max_data limit
+%% @param DataSent - Bytes already sent on connection
+%% @param StreamsMap - Map of StreamId => {SendMaxData, SendOffset}
+%% @returns ok | {blocked, connection | {stream, StreamId}}
+test_check_flow_control(StreamId, DataSize, MaxDataRemote, DataSent, StreamsMap) ->
+    Streams = maps:map(
+        fun(_K, {SendMaxData, SendOffset}) ->
+            #stream_state{send_max_data = SendMaxData, send_offset = SendOffset}
+        end,
+        StreamsMap
+    ),
+    State = #state{
+        max_data_remote = MaxDataRemote,
+        data_sent = DataSent,
+        streams = Streams
+    },
+    check_send_queue_flow_control(StreamId, DataSize, State).
+-endif.

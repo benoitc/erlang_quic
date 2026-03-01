@@ -385,3 +385,126 @@ state_info_contains_queue_counters_test() ->
 
     quic_connection:close(Pid, normal),
     timer:sleep(100).
+
+%%====================================================================
+%% Send Queue Flow Control Tests
+%% RFC 9000 Section 4.1: Connection-level flow control
+%% RFC 9000 Section 4.2: "A sender MUST NOT send data at an offset
+%%                        beyond the limit set by its peer"
+%%====================================================================
+
+%% Test that sending within connection-level limits is allowed
+flow_control_connection_within_limit_test() ->
+    StreamId = 0,
+    DataSize = 1000,
+    MaxDataRemote = 10000,
+    DataSent = 5000,
+    Streams = #{StreamId => {10000, 0}},
+    ?assertEqual(
+        ok,
+        quic_connection:test_check_flow_control(
+            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+        )
+    ).
+
+%% Test that exceeding connection-level limit blocks
+%% RFC 9000 Section 4.1: Sender must not exceed max_data
+flow_control_connection_exceeds_limit_test() ->
+    StreamId = 0,
+    DataSize = 6000,
+    MaxDataRemote = 10000,
+    DataSent = 5000,
+    Streams = #{StreamId => {10000, 0}},
+    ?assertEqual(
+        {blocked, connection},
+        quic_connection:test_check_flow_control(
+            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+        )
+    ).
+
+%% Test that exactly at connection limit is allowed
+flow_control_connection_at_limit_test() ->
+    StreamId = 0,
+    DataSize = 5000,
+    MaxDataRemote = 10000,
+    DataSent = 5000,
+    Streams = #{StreamId => {10000, 0}},
+    ?assertEqual(
+        ok,
+        quic_connection:test_check_flow_control(
+            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+        )
+    ).
+
+%% Test that already over connection limit blocks
+%% This is a defensive check - shouldn't happen but guards against it
+flow_control_connection_already_over_limit_test() ->
+    StreamId = 0,
+    DataSize = 1000,
+    MaxDataRemote = 10000,
+    DataSent = 11000,
+    Streams = #{StreamId => {10000, 0}},
+    ?assertEqual(
+        {blocked, connection},
+        quic_connection:test_check_flow_control(
+            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+        )
+    ).
+
+%% Test that exceeding stream-level limit blocks
+%% RFC 9000 Section 4.2: max_stream_data limits per-stream
+flow_control_stream_exceeds_limit_test() ->
+    StreamId = 0,
+    DataSize = 2000,
+    MaxDataRemote = 100000,
+    DataSent = 0,
+    Streams = #{StreamId => {5000, 4000}},
+    ?assertEqual(
+        {blocked, {stream, StreamId}},
+        quic_connection:test_check_flow_control(
+            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+        )
+    ).
+
+%% Test that stream within limit is allowed
+flow_control_stream_within_limit_test() ->
+    StreamId = 4,
+    DataSize = 500,
+    MaxDataRemote = 100000,
+    DataSent = 0,
+    Streams = #{StreamId => {5000, 4000}},
+    ?assertEqual(
+        ok,
+        quic_connection:test_check_flow_control(
+            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+        )
+    ).
+
+%% Test that unknown stream is allowed (will fail later in processing)
+flow_control_unknown_stream_allowed_test() ->
+    StreamId = 99,
+    DataSize = 1000,
+    MaxDataRemote = 100000,
+    DataSent = 0,
+    Streams = #{0 => {5000, 0}},
+    ?assertEqual(
+        ok,
+        quic_connection:test_check_flow_control(
+            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+        )
+    ).
+
+%% Test connection limit checked before stream limit
+%% Even if stream has capacity, connection limit blocks first
+flow_control_connection_blocks_before_stream_test() ->
+    StreamId = 0,
+    DataSize = 5000,
+    MaxDataRemote = 1000,
+    DataSent = 0,
+    Streams = #{StreamId => {10000, 0}},
+    ?assertEqual(
+        {blocked, connection},
+        quic_connection:test_check_flow_control(
+            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+        )
+    ).
