@@ -479,8 +479,8 @@ peercert(Conn) ->
 set_owner(Conn, NewOwner) ->
     gen_statem:cast(Conn, {set_owner, NewOwner}).
 
-%% @doc Set new owner process (sync).
-%% Blocks until ownership is transferred.
+%% @doc Set new owner process (synchronous).
+%% Use this when you need to ensure ownership is transferred before continuing.
 -spec set_owner_sync(pid(), pid()) -> ok.
 set_owner_sync(Conn, NewOwner) ->
     gen_statem:call(Conn, {set_owner, NewOwner}).
