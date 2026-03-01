@@ -125,8 +125,11 @@ trigger_migration(ConnRef) ->
 %%====================================================================
 
 init(Opts) ->
-    StunServers = proplists:get_value(stun_servers, Opts,
-        ["stun.l.google.com:19302", "stun.stunprotocol.org:3478"]),
+    StunServers = proplists:get_value(
+        stun_servers,
+        Opts,
+        ["stun.l.google.com:19302", "stun.stunprotocol.org:3478"]
+    ),
 
     Available = is_available(),
 
@@ -148,7 +151,6 @@ init(Opts) ->
 
 handle_call(discover, _From, #state{nat_available = false} = State) ->
     {reply, {error, nat_not_available}, State};
-
 handle_call(discover, _From, State) ->
     State1 = try_discover(State),
     case State1#state.external_ip of
@@ -157,15 +159,16 @@ handle_call(discover, _From, State) ->
         IP ->
             {reply, {ok, IP}, State1}
     end;
-
-handle_call(get_external_address, _From,
-            #state{external_ip = IP, external_port = Port} = State)
-  when IP =/= undefined, Port =/= undefined ->
+handle_call(
+    get_external_address,
+    _From,
+    #state{external_ip = IP, external_port = Port} = State
+) when
+    IP =/= undefined, Port =/= undefined
+->
     {reply, {ok, {IP, Port}}, State};
-
 handle_call(get_external_address, _From, #state{nat_available = false} = State) ->
     {reply, {error, nat_not_available}, State};
-
 handle_call(get_external_address, _From, State) ->
     %% Try STUN discovery
     State1 = try_stun_discover(State),
@@ -175,11 +178,9 @@ handle_call(get_external_address, _From, State) ->
         {IP, Port} ->
             {reply, {ok, {IP, Port}}, State1}
     end;
-
 handle_call({map_port, Port}, _From, #state{nat_available = false} = State) ->
     %% No NAT available, return the same port
     {reply, {ok, Port}, State};
-
 handle_call({map_port, Port}, _From, #state{mappings = Mappings} = State) ->
     case maps:get(Port, Mappings, undefined) of
         undefined ->
@@ -196,7 +197,6 @@ handle_call({map_port, Port}, _From, #state{mappings = Mappings} = State) ->
             %% Already mapped
             {reply, {ok, ExtPort}, State}
     end;
-
 handle_call({unmap_port, Port}, _From, #state{mappings = Mappings} = State) ->
     case maps:get(Port, Mappings, undefined) of
         undefined ->
@@ -206,7 +206,6 @@ handle_call({unmap_port, Port}, _From, #state{mappings = Mappings} = State) ->
             NewMappings = maps:remove(Port, Mappings),
             {reply, ok, State#state{mappings = NewMappings}}
     end;
-
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
@@ -214,7 +213,6 @@ handle_cast({trigger_migration, ConnRef}, State) ->
     %% Trigger QUIC connection migration
     catch quic:migrate(ConnRef),
     {noreply, State};
-
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -228,12 +226,10 @@ handle_info(do_initial_discovery, State) ->
             error_logger:info_msg("quic_dist_nat: Discovered external IP: ~p~n", [IP])
     end,
     {noreply, State1};
-
 handle_info(renew_mappings, State) ->
     State1 = renew_all_mappings(State),
     State2 = schedule_renewal(State1),
     {noreply, State2};
-
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -311,7 +307,8 @@ parse_stun_server(Server) ->
                     {error, invalid_port}
             end;
         [Host] ->
-            {ok, Host, 3478};  % Default STUN port
+            % Default STUN port
+            {ok, Host, 3478};
         _ ->
             {error, invalid_server}
     end.

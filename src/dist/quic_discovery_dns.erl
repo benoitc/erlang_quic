@@ -45,7 +45,8 @@
 
 %% Default service name
 -define(SERVICE_NAME, "_erlang-dist._quic").
--define(DEFAULT_TTL, 30).  % seconds
+% seconds
+-define(DEFAULT_TTL, 30).
 
 %% ETS table for caching
 -define(CACHE_TABLE, quic_discovery_dns_cache).
@@ -72,8 +73,8 @@ init(Opts) ->
 
 %% @doc Look up a node's address via DNS.
 -spec lookup(NodeName :: atom(), Host :: string()) ->
-    {ok, {inet:ip_address() | string(), inet:port_number()}} |
-    {error, term()}.
+    {ok, {inet:ip_address() | string(), inet:port_number()}}
+    | {error, term()}.
 lookup(NodeName, Host) ->
     %% Check cache first
     case lookup_cache(NodeName) of
@@ -86,8 +87,8 @@ lookup(NodeName, Host) ->
 
 %% @doc List all nodes via DNS SRV query.
 -spec list_nodes(Host :: string()) ->
-    {ok, [{atom(), inet:port_number()}]} |
-    {error, term()}.
+    {ok, [{atom(), inet:port_number()}]}
+    | {error, term()}.
 list_nodes(_Host) ->
     Domain = get_domain(),
     case query_srv(Domain) of
@@ -174,14 +175,10 @@ lookup_dns(NodeName, Host) ->
 %% @private
 node_srv_name(NodeName, Domain) ->
     %% Format: _erlang-dist._quic.{nodename}.{domain}
-    case atom_to_list(NodeName) of
-        Name when is_list(Name) ->
-            case string:tokens(Name, "@") of
-                [_Node, NodeHost] ->
-                    ?SERVICE_NAME ++ "." ++ NodeHost ++ "." ++ Domain;
-                _ ->
-                    ?SERVICE_NAME ++ "." ++ Domain
-            end;
+    Name = atom_to_list(NodeName),
+    case string:tokens(Name, "@") of
+        [_Node, NodeHost] ->
+            ?SERVICE_NAME ++ "." ++ NodeHost ++ "." ++ Domain;
         _ ->
             ?SERVICE_NAME ++ "." ++ Domain
     end.
@@ -205,10 +202,11 @@ query_srv(Name) ->
 %% @private
 resolve_target(Target) ->
     %% Remove trailing dot if present
-    Host = case lists:reverse(Target) of
-        [$. | Rest] -> lists:reverse(Rest);
-        _ -> Target
-    end,
+    Host =
+        case lists:reverse(Target) of
+            [$. | Rest] -> lists:reverse(Rest);
+            _ -> Target
+        end,
 
     case inet:getaddr(Host, inet) of
         {ok, IP} ->
@@ -248,10 +246,11 @@ lookup_a_record(NodeName, Host) ->
 target_to_node(Target) ->
     %% Convert DNS target to node name
     %% Assumes format: nodename.domain.
-    Host = case lists:reverse(Target) of
-        [$. | Rest] -> lists:reverse(Rest);
-        _ -> Target
-    end,
+    Host =
+        case lists:reverse(Target) of
+            [$. | Rest] -> lists:reverse(Rest);
+            _ -> Target
+        end,
 
     %% Extract first part as node name, rest as host
     case string:tokens(Host, ".") of

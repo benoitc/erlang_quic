@@ -55,8 +55,11 @@ register_node(Name, Port) ->
     register_node(Name, Port, inet).
 
 %% @doc Register this node with address family.
--spec register_node(Name :: atom(), Port :: inet:port_number(),
-                    Family :: inet | inet6) ->
+-spec register_node(
+    Name :: atom(),
+    Port :: inet:port_number(),
+    Family :: inet | inet6
+) ->
     {ok, Creation :: non_neg_integer()} | {error, term()}.
 register_node(Name, Port, _Family) ->
     %% Register with discovery backend
@@ -70,16 +73,19 @@ register_node(Name, Port, _Family) ->
 
 %% @doc Look up a node's port.
 -spec port_please(Name :: string(), Host :: string()) ->
-    {port, Port :: inet:port_number(), Version :: non_neg_integer()} |
-    noport.
+    {port, Port :: inet:port_number(), Version :: non_neg_integer()}
+    | noport.
 port_please(Name, Host) ->
     port_please(Name, Host, infinity).
 
 %% @doc Look up a node's port with timeout.
--spec port_please(Name :: string(), Host :: string(),
-                  Timeout :: timeout()) ->
-    {port, Port :: inet:port_number(), Version :: non_neg_integer()} |
-    noport.
+-spec port_please(
+    Name :: string(),
+    Host :: string(),
+    Timeout :: timeout()
+) ->
+    {port, Port :: inet:port_number(), Version :: non_neg_integer()}
+    | noport.
 port_please(Name, Host, _Timeout) ->
     %% Convert name string to node atom
     NodeName = list_to_atom(Name ++ "@" ++ Host),
@@ -94,8 +100,8 @@ port_please(Name, Host, _Timeout) ->
 
 %% @doc List all registered nodes on a host.
 -spec names(Host :: string()) ->
-    {ok, [{Name :: string(), Port :: inet:port_number()}]} |
-    {error, term()}.
+    {ok, [{Name :: string(), Port :: inet:port_number()}]}
+    | {error, term()}.
 names(Host) ->
     case quic_discovery:list_nodes(Host) of
         {ok, Nodes} ->
@@ -103,10 +109,11 @@ names(Host) ->
             Names = lists:map(
                 fun({NodeAtom, Port}) ->
                     NodeStr = atom_to_list(NodeAtom),
-                    Name = case string:tokens(NodeStr, "@") of
-                        [N, _] -> N;
-                        _ -> NodeStr
-                    end,
+                    Name =
+                        case string:tokens(NodeStr, "@") of
+                            [N, _] -> N;
+                            _ -> NodeStr
+                        end,
                     {Name, Port}
                 end,
                 Nodes
@@ -118,11 +125,14 @@ names(Host) ->
 
 %% @doc Get the address for a node.
 %% This is called when we need to connect to another node.
--spec address_please(Name :: string(), Host :: string(),
-                     AddressFamily :: inet | inet6) ->
-    {ok, inet:ip_address()} |
-    {ok, inet:ip_address(), Port :: inet:port_number(), Version :: non_neg_integer()} |
-    {error, term()}.
+-spec address_please(
+    Name :: string(),
+    Host :: string(),
+    AddressFamily :: inet | inet6
+) ->
+    {ok, inet:ip_address()}
+    | {ok, inet:ip_address(), Port :: inet:port_number(), Version :: non_neg_integer()}
+    | {error, term()}.
 address_please(Name, Host, AddressFamily) ->
     NodeName = list_to_atom(Name ++ "@" ++ Host),
 

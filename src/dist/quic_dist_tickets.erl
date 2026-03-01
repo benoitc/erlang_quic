@@ -24,6 +24,9 @@
 -module(quic_dist_tickets).
 -behaviour(gen_server).
 
+%% Dialyzer suppressions - ETS match specs use atoms as placeholders
+-dialyzer({nowarn_function, [do_cleanup/0]}).
+
 %% API
 -export([
     start_link/0,
@@ -132,11 +135,9 @@ handle_cast({store, Node, Ticket}, State) ->
 
     ets:insert(?TABLE, Entry),
     {noreply, State};
-
 handle_cast(cleanup, State) ->
     do_cleanup(),
     {noreply, State};
-
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -145,7 +146,6 @@ handle_info(cleanup, State) ->
     %% Schedule next cleanup
     erlang:send_after(?CLEANUP_INTERVAL, self(), cleanup),
     {noreply, State};
-
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -164,11 +164,13 @@ code_change(_OldVsn, State, _Extra) ->
 do_cleanup() ->
     Now = erlang:system_time(second),
     %% Use match spec to find and delete expired entries
-    MatchSpec = [{
-        #ticket_entry{node = '$1', expires_at = '$2', _ = '_'},
-        [{'<', '$2', Now}],
-        ['$1']
-    }],
+    MatchSpec = [
+        {
+            #ticket_entry{node = '$1', expires_at = '$2', _ = '_'},
+            [{'<', '$2', Now}],
+            ['$1']
+        }
+    ],
     ExpiredNodes = ets:select(?TABLE, MatchSpec),
     lists:foreach(fun(Node) -> ets:delete(?TABLE, Node) end, ExpiredNodes),
     ok.
@@ -184,12 +186,11 @@ get_ticket_expiry(Ticket) when is_map(Ticket) ->
         Lifetime when is_integer(Lifetime) ->
             erlang:system_time(second) + Lifetime
     end;
-
-get_ticket_expiry({session_ticket, _, Lifetime, _, _, _, _, _, _, _})
-  when is_integer(Lifetime) ->
+get_ticket_expiry({session_ticket, _, Lifetime, _, _, _, _, _, _, _}) when
+    is_integer(Lifetime)
+->
     %% Handle #session_ticket record format
     erlang:system_time(second) + Lifetime;
-
 get_ticket_expiry(_Ticket) ->
     %% Unknown format, use default expiry
     default_expiry().
