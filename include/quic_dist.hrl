@@ -18,25 +18,41 @@
 -define(QUIC_DIST_ALPN, <<"erlang-dist">>).
 
 %% Stream types
--define(QUIC_DIST_CONTROL_STREAM, 0).      % Stream 0: Control (handshake, tick, signals)
--define(QUIC_DIST_DATA_STREAM_BASE, 4).    % Streams 4,8,12... for data messages
+
+% Stream 0: Control (handshake, tick, signals)
+-define(QUIC_DIST_CONTROL_STREAM, 0).
+% Streams 4,8,12... for data messages
+-define(QUIC_DIST_DATA_STREAM_BASE, 4).
 
 %% Stream urgency levels (RFC 9218)
--define(QUIC_DIST_URGENCY_CONTROL, 0).     % Control stream - highest priority
--define(QUIC_DIST_URGENCY_SIGNAL, 2).      % Link/monitor signals
--define(QUIC_DIST_URGENCY_DATA_HIGH, 4).   % High priority data
--define(QUIC_DIST_URGENCY_DATA_NORMAL, 5). % Normal data messages
--define(QUIC_DIST_URGENCY_DATA_LOW, 6).    % Low priority data
+
+% Control stream - highest priority
+-define(QUIC_DIST_URGENCY_CONTROL, 0).
+% Link/monitor signals
+-define(QUIC_DIST_URGENCY_SIGNAL, 2).
+% High priority data
+-define(QUIC_DIST_URGENCY_DATA_HIGH, 4).
+% Normal data messages
+-define(QUIC_DIST_URGENCY_DATA_NORMAL, 5).
+% Low priority data
+-define(QUIC_DIST_URGENCY_DATA_LOW, 6).
 
 %% Default number of data streams
 -define(QUIC_DIST_DATA_STREAMS, 4).
 
 %% Message length prefixes
--define(QUIC_DIST_HS_LEN_SIZE, 2).    % 2-byte length prefix during handshake
--define(QUIC_DIST_MSG_LEN_SIZE, 4).   % 4-byte length prefix post-handshake
+
+% 2-byte length prefix during handshake
+-define(QUIC_DIST_HS_LEN_SIZE, 2).
+% 4-byte length prefix post-handshake
+-define(QUIC_DIST_MSG_LEN_SIZE, 4).
 
 %% Tick interval (milliseconds)
 -define(QUIC_DIST_TICK_INTERVAL, 60000).
+
+%% Control message types (1-byte tag, sent on control stream only)
+-define(QUIC_DIST_MSG_TICK, 1).
+-define(QUIC_DIST_MSG_TICK_ACK, 2).
 
 %% Default ports
 -define(QUIC_DIST_DEFAULT_PORT, 4433).
@@ -114,8 +130,9 @@
 
     %% Distribution protocol callbacks
     f_send :: fun((term()) -> ok | {error, term()}) | undefined,
-    f_recv :: fun((non_neg_integer(), non_neg_integer()) ->
-                  {ok, binary()} | {error, term()}) | undefined,
+    f_recv ::
+        fun((non_neg_integer(), non_neg_integer()) -> {ok, binary()} | {error, term()})
+        | undefined,
 
     %% Session ticket for 0-RTT
     session_ticket :: term() | undefined
@@ -151,4 +168,5 @@
     fin = false :: boolean()
 }).
 
--endif.  % QUIC_DIST_HRL
+% QUIC_DIST_HRL
+-endif.

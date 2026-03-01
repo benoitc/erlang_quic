@@ -35,6 +35,11 @@
 
 -include("quic_dist.hrl").
 -include_lib("kernel/include/net_address.hrl").
+-include_lib("kernel/include/logger.hrl").
+
+-define(QUIC_LOG_META, #{
+    domain => [erlang_quic, dist_controller], report_cb => fun quic_log:format_report/2
+}).
 
 %% API
 -export([
@@ -134,8 +139,11 @@ send(Controller, Data) ->
     gen_statem:call(Controller, {send, Data}).
 
 %% @doc Receive data from the control stream.
--spec recv(Controller :: pid(), Length :: non_neg_integer(),
-           Timeout :: timeout()) ->
+-spec recv(
+    Controller :: pid(),
+    Length :: non_neg_integer(),
+    Timeout :: timeout()
+) ->
     {ok, binary()} | {error, term()}.
 recv(Controller, Length, Timeout) ->
     gen_statem:call(Controller, {recv, Length}, Timeout).
@@ -147,8 +155,7 @@ tick(Controller) ->
 
 %% @doc Get connection statistics.
 -spec getstat(Controller :: pid()) ->
-    {ok, RecvCnt :: non_neg_integer(), SendCnt :: non_neg_integer(),
-     SendPend :: non_neg_integer()}.
+    {ok, RecvCnt :: non_neg_integer(), SendCnt :: non_neg_integer(), SendPend :: non_neg_integer()}.
 getstat(Controller) ->
     gen_statem:call(Controller, getstat).
 
@@ -205,7 +212,6 @@ init({ConnRef, client}) ->
         error ->
             {stop, connection_not_found}
     end;
-
 %% Initialize for server role
 init({ConnPid, ConnRef, server}) ->
     State = #state{
@@ -216,7 +222,11 @@ init({ConnPid, ConnRef, server}) ->
     {ok, init_state, State}.
 
 terminate(_Reason, _StateName, #state{conn_ref = ConnRef}) ->
-    catch quic:close(ConnRef, normal),
+    try
+        quic:close(ConnRef, normal)
+    catch
+        _:_ -> ok
+    end,
     ok.
 
 code_change(_OldVsn, StateName, State, _Extra) ->
@@ -237,7 +247,6 @@ init_state(enter, _OldState, #state{role = client, conn_ref = ConnRef} = State) 
         {error, Reason} ->
             {stop, {stream_setup_failed, Reason}}
     end;
-
 init_state(enter, _OldState, #state{role = server, conn_ref = ConnRef} = State) ->
     %% Server: take ownership synchronously and proceed immediately
     %% The connection_handler callback is called during QUIC handshake,
@@ -258,25 +267,19 @@ init_state(enter, _OldState, #state{role = server, conn_ref = ConnRef} = State) 
         error ->
             {stop, connection_not_found}
     end;
-
 %% Server proceeds to handshaking after setup
 init_state(state_timeout, proceed_to_handshaking, State) ->
     {next_state, handshaking, State};
-
 %% Server receives connected message - just ignore, we already transitioned
 init_state(info, {quic, ConnRef, {connected, _Info}}, #state{conn_ref = ConnRef} = State) ->
     {keep_state, State};
-
 init_state(state_timeout, start_handshake, State) ->
     {next_state, handshaking, State};
-
 %% Handle QUIC errors during init
 init_state(info, {quic, ConnRef, {closed, Reason}}, #state{conn_ref = ConnRef}) ->
     {stop, {connection_closed, Reason}};
-
 init_state(info, {quic, ConnRef, {transport_error, Code, Reason}}, #state{conn_ref = ConnRef}) ->
     {stop, {transport_error, Code, Reason}};
-
 init_state(EventType, Event, State) ->
     handle_common_event(EventType, Event, init_state, State).
 
@@ -311,56 +314,53 @@ setup_streams(#state{role = server} = State) ->
 
 handshaking(enter, _OldState, _State) ->
     keep_state_and_data;
-
 %% Handle send during handshake
-handshaking({call, From}, {send, Data}, #state{role = Role} = State) ->
-    error_logger:info_msg("quic_dist_controller ~p: send(~p bytes) during handshake~n",
-                          [Role, iolist_size(Data)]),
+handshaking({call, From}, {send, Data}, State) ->
     case do_send_control(Data, State) of
         {ok, State1} ->
-            error_logger:info_msg("quic_dist_controller ~p: send succeeded~n", [Role]),
             {keep_state, State1, [{reply, From, ok}]};
         {error, Reason} ->
-            error_logger:info_msg("quic_dist_controller ~p: send failed: ~p~n", [Role, Reason]),
+            ?LOG_WARNING(#{what => handshake_send_failed, reason => Reason}, ?QUIC_LOG_META),
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
-
 %% Handle recv during handshake
-handshaking({call, From}, {recv, Length}, #state{role = Role, recv_buffer = Buffer} = State) ->
-    error_logger:info_msg("quic_dist_controller ~p: recv(~p) requested, buffer=~p bytes~n",
-                          [Role, Length, byte_size(Buffer)]),
+handshaking({call, From}, {recv, Length}, State) ->
     case try_recv(Length, State) of
         {ok, Data, State1} ->
             %% dist_util expects data as a list (charlist), not binary
             DataList = binary_to_list(Data),
-            error_logger:info_msg("quic_dist_controller ~p: recv returning ~p bytes~n",
-                                  [Role, byte_size(Data)]),
             {keep_state, State1, [{reply, From, {ok, DataList}}]};
         {need_more, State1} ->
             %% Queue the waiter
-            error_logger:info_msg("quic_dist_controller ~p: recv needs more data, queuing waiter~n", [Role]),
             Ref = make_ref(),
             Waiters = [{From, Ref, Length} | State1#state.recv_waiters],
             {keep_state, State1#state{recv_waiters = Waiters}};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
-
 %% Handshake complete notification with DHandle
 handshaking(info, {handshake_complete, Node, DHandle}, State) ->
-    error_logger:info_msg("quic_dist_controller: handshake complete, Node=~p, DHandle=~p~n", [Node, DHandle]),
+    ?LOG_INFO(#{what => handshake_complete, node => Node}, ?QUIC_LOG_META),
 
     %% Set up distribution control machinery
     %% This is required for process-based distribution to work properly
 
+    %% Server needs to open data streams too (server-initiated: 1, 5, 9, ...)
+    State0 =
+        case State#state.role of
+            server -> open_server_data_streams(State);
+            client -> State
+        end,
+
     %% Spawn input handler to receive QUIC data and deliver to VM
     Self = self(),
-    ConnRef = State#state.conn_ref,
-    ControlStream = State#state.control_stream,
+    ConnRef = State0#state.conn_ref,
+    ControlStream = State0#state.control_stream,
     InputHandler = spawn_link(
         fun() ->
             input_handler_loop(DHandle, Self, ConnRef, ControlStream)
-        end),
+        end
+    ),
 
     %% Register input handler with VM
     ok = erlang:dist_ctrl_input_handler(DHandle, InputHandler),
@@ -368,19 +368,17 @@ handshaking(info, {handshake_complete, Node, DHandle}, State) ->
     %% Request notification when outgoing data is available
     erlang:dist_ctrl_get_data_notification(DHandle),
 
-    State1 = State#state{
+    State1 = State0#state{
         node = Node,
         dhandle = DHandle,
         input_handler = InputHandler
     },
     {next_state, connected, State1};
-
 %% Legacy handshake complete notification (for backward compatibility)
 handshaking(info, {handshake_complete, Node}, State) ->
-    error_logger:warning_msg("quic_dist_controller: handshake_complete without DHandle~n"),
+    ?LOG_WARNING(#{what => handshake_complete_no_dhandle, node => Node}, ?QUIC_LOG_META),
     State1 = State#state{node = Node},
     {next_state, connected, State1};
-
 handshaking(EventType, Event, State) ->
     handle_common_event(EventType, Event, handshaking, State).
 
@@ -391,7 +389,6 @@ handshaking(EventType, Event, State) ->
 connected(enter, _OldState, _State) ->
     %% No tick timer needed - VM handles tick scheduling via dist_data
     keep_state_and_data;
-
 %% Handle send in connected state (direct send, not from VM)
 connected({call, From}, {send, Data}, State) ->
     case do_send_data(Data, State) of
@@ -400,7 +397,6 @@ connected({call, From}, {send, Data}, State) ->
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
-
 %% Handle recv in connected state (for backward compatibility)
 connected({call, From}, {recv, Length}, State) ->
     case try_recv(Length, State) of
@@ -414,27 +410,22 @@ connected({call, From}, {recv, Length}, State) ->
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
-
 %% Handle tick (from mf_tick callback)
-connected(cast, tick, #state{dhandle = DHandle} = State) when DHandle /= undefined ->
+connected(cast, tick, #state{dhandle = DHandle} = State) when DHandle =/= undefined ->
     %% Tick is handled via dist_data - just send any pending data
     send_dist_data(State),
     {keep_state, State};
-
 connected(cast, tick, State) ->
     %% No DHandle, use old tick method
     do_send_tick(State),
     {keep_state, State};
-
 %% Handle dist_data notification from VM
 %% This means the VM has data ready for us to send
-connected(info, dist_data, #state{dhandle = DHandle} = State) when DHandle /= undefined ->
-    error_logger:info_msg("quic_dist_controller: dist_data received~n"),
+connected(info, dist_data, #state{dhandle = DHandle} = State) when DHandle =/= undefined ->
     send_dist_data(State),
     %% Re-register for next notification
     erlang:dist_ctrl_get_data_notification(DHandle),
     {keep_state, State};
-
 connected(EventType, Event, State) ->
     handle_common_event(EventType, Event, connected, State).
 
@@ -446,68 +437,73 @@ handle_common_event({call, From}, getstat, _StateName, State) ->
     #state{recv_cnt = RecvCnt, send_cnt = SendCnt} = State,
     SendPend = queue:len(State#state.send_queue),
     {keep_state, State, [{reply, From, {ok, RecvCnt, SendCnt, SendPend}}]};
-
-handle_common_event({call, From}, {get_address, Node}, _StateName,
-                    #state{conn_ref = ConnRef} = State) ->
-    Address = case quic:peername(ConnRef) of
-        {ok, {IP, Port}} ->
-            #net_address{
-                address = {IP, Port},
-                host = atom_to_list(Node),
-                protocol = quic,
-                family = inet
-            };
-        _Error ->
-            #net_address{
-                address = undefined,
-                host = atom_to_list(Node),
-                protocol = quic,
-                family = inet
-            }
-    end,
+handle_common_event(
+    {call, From},
+    {get_address, Node},
+    _StateName,
+    #state{conn_ref = ConnRef} = State
+) ->
+    Address =
+        case quic:peername(ConnRef) of
+            {ok, {IP, Port}} ->
+                #net_address{
+                    address = {IP, Port},
+                    host = atom_to_list(Node),
+                    protocol = quic,
+                    family = inet
+                };
+            _Error ->
+                #net_address{
+                    address = undefined,
+                    host = atom_to_list(Node),
+                    protocol = quic,
+                    family = inet
+                }
+        end,
     {keep_state, State, [{reply, From, {ok, Address}}]};
-
 handle_common_event(cast, {set_supervisor, Pid}, _StateName, State) ->
     %% Store both as supervisor and kernel (net_kernel)
     {keep_state, State#state{supervisor = Pid, kernel = Pid}};
-
 handle_common_event(cast, {set_node, Node}, _StateName, State) ->
     {keep_state, State#state{node = Node}};
-
 handle_common_event({call, From}, get_node, _StateName, #state{node = Node} = State) ->
-    Reply = case Node of
-        undefined -> undefined;
-        _ -> {ok, Node}
-    end,
+    Reply =
+        case Node of
+            undefined -> undefined;
+            _ -> {ok, Node}
+        end,
     {keep_state, State, [{reply, From, Reply}]};
-
 handle_common_event({call, From}, getll, _StateName, State) ->
     {keep_state, State, [{reply, From, {ok, self()}}]};
-
-handle_common_event({call, From}, {pre_nodeup, SetupPid}, _StateName,
-                    #state{kernel = Kernel, node = Node} = State) ->
+handle_common_event(
+    {call, From},
+    {pre_nodeup, SetupPid},
+    _StateName,
+    #state{kernel = Kernel, node = Node} = State
+) ->
     %% Send dist_ctrlr message to kernel to register this controller
     %% This is required before mark_nodeup can succeed
     case {Kernel, Node} of
         {undefined, _} ->
-            error_logger:warning_msg("quic_dist_controller: pre_nodeup called but kernel is undefined~n"),
+            ?LOG_WARNING(#{what => pre_nodeup_no_kernel}, ?QUIC_LOG_META),
             {keep_state, State, [{reply, From, ok}]};
         {_, undefined} ->
-            error_logger:warning_msg("quic_dist_controller: pre_nodeup called but node is undefined~n"),
+            ?LOG_WARNING(#{what => pre_nodeup_no_node}, ?QUIC_LOG_META),
             {keep_state, State, [{reply, From, ok}]};
         {K, N} when is_pid(K), is_atom(N) ->
-            error_logger:info_msg("quic_dist_controller: sending dist_ctrlr to ~p for node ~p~n", [K, N]),
             K ! {dist_ctrlr, self(), N, SetupPid},
             {keep_state, State, [{reply, From, ok}]}
     end;
-
 %% Handle incoming QUIC messages
-handle_common_event(info, {quic, ConnRef, {stream_data, StreamId, Data, _Fin}},
-                    StateName, #state{conn_ref = ConnRef,
-                                      control_stream = CtrlStream,
-                                      role = Role} = State) ->
-    error_logger:info_msg("quic_dist_controller ~p(~p): stream_data on stream ~p, control=~p, ~p bytes~n",
-                          [Role, StateName, StreamId, CtrlStream, byte_size(Data)]),
+handle_common_event(
+    info,
+    {quic, ConnRef, {stream_data, StreamId, Data, _Fin}},
+    StateName,
+    #state{
+        conn_ref = ConnRef,
+        control_stream = CtrlStream
+    } = State
+) ->
     case StreamId of
         CtrlStream ->
             %% Data on control stream
@@ -516,39 +512,62 @@ handle_common_event(info, {quic, ConnRef, {stream_data, StreamId, Data, _Fin}},
             %% Data on data stream
             handle_stream_data(StreamId, Data, StateName, State)
     end;
-
-handle_common_event(info, {quic, ConnRef, {session_ticket, Ticket}},
-                    _StateName, #state{conn_ref = ConnRef} = State) ->
+handle_common_event(
+    info,
+    {quic, ConnRef, {session_ticket, Ticket}},
+    _StateName,
+    #state{conn_ref = ConnRef} = State
+) ->
     %% Store session ticket for 0-RTT
     {keep_state, State#state{session_ticket = Ticket}};
-
-handle_common_event(info, {quic, ConnRef, {connected, _Info}},
-                    _StateName, #state{conn_ref = ConnRef} = State) ->
+handle_common_event(
+    info,
+    {quic, ConnRef, {connected, _Info}},
+    _StateName,
+    #state{conn_ref = ConnRef} = State
+) ->
     %% Connection fully established - we may receive this after transitioning
     %% to handshaking state, just acknowledge and continue
     {keep_state, State};
-
-handle_common_event(info, {quic, ConnRef, {stream_opened, _StreamId}},
-                    _StateName, #state{conn_ref = ConnRef} = State) ->
+handle_common_event(
+    info,
+    {quic, ConnRef, {stream_opened, _StreamId}},
+    _StateName,
+    #state{conn_ref = ConnRef} = State
+) ->
     %% New stream opened by peer - for distribution, we primarily use stream 0
     {keep_state, State};
-
-handle_common_event(info, {quic, ConnRef, {closed, Reason}},
-                    _StateName, #state{conn_ref = ConnRef} = State) ->
+handle_common_event(
+    info,
+    {quic, ConnRef, {closed, Reason}},
+    _StateName,
+    #state{conn_ref = ConnRef} = State
+) ->
     %% Connection closed
     {stop, {connection_closed, Reason}, State};
-
-handle_common_event(info, {quic, ConnRef, {transport_error, Code, Reason}},
-                    _StateName, #state{conn_ref = ConnRef} = State) ->
+handle_common_event(
+    info,
+    {quic, ConnRef, {transport_error, Code, Reason}},
+    _StateName,
+    #state{conn_ref = ConnRef} = State
+) ->
     {stop, {transport_error, Code, Reason}, State};
-
-handle_common_event(info, {quic, _OtherRef, {stream_data, StreamId, Data, _Fin}},
-                    StateName, #state{conn_ref = ConnRef, role = Role} = State) ->
+handle_common_event(
+    info,
+    {quic, _OtherRef, {stream_data, StreamId, Data, _Fin}},
+    _StateName,
+    State
+) ->
     %% Stream data with non-matching ConnRef (should not happen)
-    error_logger:warning_msg("quic_dist_controller ~p(~p): stream_data on ~p (~p bytes) but ConnRef mismatch (expected ~p)~n",
-                              [Role, StateName, StreamId, byte_size(Data), ConnRef]),
+    ?LOG_WARNING(
+        #{
+            what => stream_data_conn_mismatch,
+            stream_id => StreamId,
+            data_size => byte_size(Data)
+        },
+        ?QUIC_LOG_META
+    ),
     {keep_state, State};
-
 handle_common_event(_EventType, _Event, _StateName, State) ->
     {keep_state, State}.
 
@@ -586,14 +605,29 @@ open_data_streams(#state{conn_ref = ConnRef, data_streams = Streams} = State, N)
             open_data_streams(State#state{data_streams = [StreamId | Streams]}, N - 1);
         {error, Reason} ->
             %% Log but continue with available streams
-            error_logger:warning_msg("quic_dist_controller: Failed to open data stream: ~p~n",
-                                     [Reason]),
+            ?LOG_WARNING(#{what => open_data_stream_failed, reason => Reason}, ?QUIC_LOG_META),
             {ok, State}
     end.
 
 %% @private
 set_stream_priority(#state{conn_ref = ConnRef}, StreamId, Urgency) ->
     quic:set_stream_priority(ConnRef, StreamId, Urgency, false).
+
+%% @private
+%% Open server-initiated data streams after handshake.
+%% Server-initiated bidirectional streams have IDs 1, 5, 9, ...
+open_server_data_streams(State) ->
+    case open_data_streams(State, ?QUIC_DIST_DATA_STREAMS) of
+        {ok, NewState} ->
+            NewState;
+        {error, Reason} ->
+            ?LOG_WARNING(
+                #{what => server_open_data_streams_failed, reason => Reason},
+                ?QUIC_LOG_META
+            ),
+            %% Continue with existing streams (or none)
+            State
+    end.
 
 %%====================================================================
 %% Internal Functions - Send
@@ -602,10 +636,15 @@ set_stream_priority(#state{conn_ref = ConnRef}, StreamId, Urgency) ->
 %% @private
 %% Send data on control stream (handshake messages).
 %% Note: No framing needed - dist_util handles its own protocol framing.
-do_send_control(Data, #state{conn_ref = ConnRef,
-                              control_stream = StreamId,
-                              send_cnt = SendCnt,
-                              send_oct = SendOct} = State) ->
+do_send_control(
+    Data,
+    #state{
+        conn_ref = ConnRef,
+        control_stream = StreamId,
+        send_cnt = SendCnt,
+        send_oct = SendOct
+    } = State
+) ->
     DataBin = iolist_to_binary(Data),
     Len = byte_size(DataBin),
 
@@ -622,11 +661,16 @@ do_send_control(Data, #state{conn_ref = ConnRef,
 %% @private
 %% Send data on a data stream (round-robin).
 %% Note: No framing needed - dist_util handles its own protocol framing.
-do_send_data(Data, #state{conn_ref = ConnRef,
-                          data_streams = Streams,
-                          data_stream_idx = Idx,
-                          send_cnt = SendCnt,
-                          send_oct = SendOct} = State) when Streams =/= [] ->
+do_send_data(
+    Data,
+    #state{
+        conn_ref = ConnRef,
+        data_streams = Streams,
+        data_stream_idx = Idx,
+        send_cnt = SendCnt,
+        send_oct = SendOct
+    } = State
+) when Streams =/= [] ->
     %% Select stream via round-robin
     StreamId = lists:nth((Idx rem length(Streams)) + 1, Streams),
 
@@ -643,45 +687,89 @@ do_send_data(Data, #state{conn_ref = ConnRef,
         Error ->
             Error
     end;
-
 %% Fall back to control stream if no data streams
 do_send_data(Data, State) ->
     do_send_control(Data, State).
 
 %% @private
-%% Send a tick message on control stream (legacy, without dist_ctrl).
+%% Send a tick message on control stream.
+%% Uses tagged message format for stream separation.
 do_send_tick(#state{conn_ref = ConnRef, control_stream = StreamId}) ->
     case StreamId of
         undefined ->
             ok;
         _ ->
-            error_logger:info_msg("quic_dist_controller: sending legacy tick~n"),
-            case quic:send_data(ConnRef, StreamId, <<>>, false) of
+            %% Send tagged tick message on control stream
+            Msg = <<?QUIC_DIST_MSG_TICK:8>>,
+            case quic:send_data(ConnRef, StreamId, Msg, false) of
                 ok -> ok;
                 {error, _Reason} -> ok
             end
     end.
 
 %% @private
+%% Send tick acknowledgment on control stream.
+send_tick_ack(#state{conn_ref = ConnRef, control_stream = StreamId}) ->
+    case StreamId of
+        undefined ->
+            ok;
+        _ ->
+            Msg = <<?QUIC_DIST_MSG_TICK_ACK:8>>,
+            quic:send_data(ConnRef, StreamId, Msg, false)
+    end.
+
+%% @private
 %% Send distribution data from VM via QUIC.
 %% Called when dist_data notification is received.
-send_dist_data(#state{dhandle = DHandle, conn_ref = ConnRef, control_stream = StreamId}) ->
-    send_dist_data_loop(DHandle, ConnRef, StreamId).
+%% Routes data to data streams (round-robin), falling back to control stream if none available.
+send_dist_data(#state{
+    dhandle = DHandle,
+    conn_ref = ConnRef,
+    data_streams = [],
+    control_stream = CtrlStream
+}) ->
+    %% Fallback: no data streams available, use control stream
+    send_dist_data_loop(DHandle, ConnRef, CtrlStream);
+send_dist_data(
+    #state{
+        dhandle = DHandle,
+        conn_ref = ConnRef,
+        data_streams = Streams,
+        data_stream_idx = Idx
+    } = State
+) ->
+    %% Use data streams with round-robin
+    StreamId = lists:nth((Idx rem length(Streams)) + 1, Streams),
+    send_dist_data_loop(DHandle, ConnRef, StreamId, Streams, Idx, State).
 
 send_dist_data_loop(DHandle, ConnRef, StreamId) ->
     case erlang:dist_ctrl_get_data(DHandle) of
         none ->
-            %% No more data to send
             ok;
         Data ->
-            %% Send data over QUIC control stream
-            error_logger:info_msg("quic_dist_controller: sending dist data ~p bytes~n", [iolist_size(Data)]),
             case quic:send_data(ConnRef, StreamId, iolist_to_binary(Data), false) of
                 ok ->
-                    %% Try to get more data
                     send_dist_data_loop(DHandle, ConnRef, StreamId);
                 {error, Reason} ->
-                    error_logger:error_msg("quic_dist_controller: send failed: ~p~n", [Reason]),
+                    ?LOG_ERROR(#{what => dist_send_failed, reason => Reason}, ?QUIC_LOG_META),
+                    ok
+            end
+    end.
+
+%% Round-robin across data streams
+send_dist_data_loop(DHandle, ConnRef, StreamId, Streams, Idx, _State) ->
+    case erlang:dist_ctrl_get_data(DHandle) of
+        none ->
+            ok;
+        Data ->
+            case quic:send_data(ConnRef, StreamId, iolist_to_binary(Data), false) of
+                ok ->
+                    %% Round-robin to next stream for next message
+                    NextIdx = Idx + 1,
+                    NextStreamId = lists:nth((NextIdx rem length(Streams)) + 1, Streams),
+                    send_dist_data_loop(DHandle, ConnRef, NextStreamId, Streams, NextIdx, _State);
+                {error, Reason} ->
+                    ?LOG_ERROR(#{what => dist_send_failed, reason => Reason}, ?QUIC_LOG_META),
                     ok
             end
     end.
@@ -697,20 +785,24 @@ input_handler_loop(DHandle, Controller, ConnRef, _ControlStream) ->
     receive
         {dist_data, Data} ->
             %% Data received from QUIC - deliver to VM
-            error_logger:info_msg("input_handler: putting ~p bytes to VM~n", [byte_size(Data)]),
             try
                 erlang:dist_ctrl_put_data(DHandle, Data)
             catch
                 Class:Reason ->
-                    error_logger:error_msg("input_handler: dist_ctrl_put_data failed: ~p:~p~n", [Class, Reason]),
+                    logger:error(
+                        #{
+                            what => dist_ctrl_put_data_failed,
+                            class => Class,
+                            reason => Reason
+                        },
+                        ?QUIC_LOG_META
+                    ),
                     exit(normal)
             end,
             input_handler_loop(DHandle, Controller, ConnRef, _ControlStream);
-
         {'EXIT', Controller, Reason} ->
             %% Controller died, exit
             exit(Reason);
-
         {quic, ConnRef, {stream_data, _StreamId, Data, _Fin}} ->
             %% Direct QUIC data (if we're receiving messages directly)
             try
@@ -720,12 +812,13 @@ input_handler_loop(DHandle, Controller, ConnRef, _ControlStream) ->
                     exit(normal)
             end,
             input_handler_loop(DHandle, Controller, ConnRef, _ControlStream);
-
         {quic, ConnRef, {closed, _Reason}} ->
             exit(normal);
-
         Other ->
-            error_logger:warning_msg("input_handler: unexpected message ~p~n", [Other]),
+            logger:warning(
+                #{what => input_handler_unexpected_msg, msg => Other},
+                ?QUIC_LOG_META
+            ),
             input_handler_loop(DHandle, Controller, ConnRef, _ControlStream)
     end.
 
@@ -750,20 +843,34 @@ try_recv(_Length, State) ->
 
 %% @private
 %% Handle data received on control stream.
-handle_control_data(Data, StateName, #state{recv_buffer = Buffer,
-                                              recv_waiters = Waiters,
-                                              recv_cnt = RecvCnt,
-                                              recv_oct = RecvOct,
-                                              role = Role,
-                                              input_handler = InputHandler} = State) ->
-    %% Debug: log received data
-    error_logger:info_msg("quic_dist_controller ~p(~p): received ~p bytes on control stream, waiters=~p~n",
-                          [Role, StateName, byte_size(Data), length(Waiters)]),
-
-    %% After handshake, forward data to input handler
+%% Detects tick messages and handles them specially.
+handle_control_data(<<?QUIC_DIST_MSG_TICK:8, Rest/binary>>, StateName, State) ->
+    %% Received tick - send acknowledgment
+    send_tick_ack(State),
+    handle_control_rest(Rest, StateName, State);
+handle_control_data(<<?QUIC_DIST_MSG_TICK_ACK:8, Rest/binary>>, StateName, State) ->
+    %% Tick acknowledged - connection is alive (no action needed)
+    handle_control_rest(Rest, StateName, State);
+handle_control_data(<<>>, _StateName, State) ->
+    %% Empty data (legacy tick) - ignore
+    {keep_state, State};
+handle_control_data(
+    Data,
+    StateName,
+    #state{
+        recv_buffer = Buffer,
+        recv_waiters = Waiters,
+        recv_cnt = RecvCnt,
+        recv_oct = RecvOct,
+        input_handler = InputHandler
+    } = State
+) ->
+    %% After handshake, control stream should only have tick messages.
+    %% Any other data during connected state is unexpected but handle gracefully.
     case {StateName, InputHandler} of
         {connected, Pid} when is_pid(Pid) ->
-            %% Forward to input handler which calls dist_ctrl_put_data
+            %% Unexpected data on control stream during connected state
+            %% This shouldn't happen after stream separation is in place
             Pid ! {dist_data, Data},
             State1 = State#state{
                 recv_cnt = RecvCnt + 1,
@@ -784,13 +891,44 @@ handle_control_data(Data, StateName, #state{recv_buffer = Buffer,
     end.
 
 %% @private
+%% Helper to process remaining data after tick message.
+handle_control_rest(<<>>, _StateName, State) ->
+    {keep_state, State};
+handle_control_rest(Rest, StateName, State) ->
+    handle_control_data(Rest, StateName, State).
+
+%% @private
 %% Handle data received on data streams.
-handle_stream_data(_StreamId, Data, _StateName,
-                   #state{recv_buffer = Buffer,
-                          recv_cnt = RecvCnt,
-                          recv_oct = RecvOct,
-                          recv_waiters = Waiters} = State) ->
-    %% Add data to buffer
+%% In connected state, forward to input handler for VM delivery.
+%% During handshake, buffer data (shouldn't happen for data streams).
+handle_stream_data(
+    _StreamId,
+    Data,
+    connected,
+    #state{
+        input_handler = InputHandler,
+        recv_cnt = RecvCnt,
+        recv_oct = RecvOct
+    } = State
+) when is_pid(InputHandler) ->
+    %% Forward data stream content to input handler
+    InputHandler ! {dist_data, Data},
+    {keep_state, State#state{
+        recv_cnt = RecvCnt + 1,
+        recv_oct = RecvOct + byte_size(Data)
+    }};
+handle_stream_data(
+    _StreamId,
+    Data,
+    _StateName,
+    #state{
+        recv_buffer = Buffer,
+        recv_cnt = RecvCnt,
+        recv_oct = RecvOct,
+        recv_waiters = Waiters
+    } = State
+) ->
+    %% During handshake, buffer data (shouldn't happen for data streams)
     NewBuffer = <<Buffer/binary, Data/binary>>,
     State1 = State#state{
         recv_buffer = NewBuffer,
@@ -810,17 +948,13 @@ handle_stream_data(_StreamId, Data, _StateName,
 %% Try to satisfy waiting recv requests.
 satisfy_waiters([], State, Actions) ->
     {State, lists:reverse(Actions)};
-satisfy_waiters([{From, _Ref, Length} | Rest], #state{recv_buffer = Buffer} = State, Actions) ->
-    error_logger:info_msg("satisfy_waiters: trying Length=~p, buffer=~p bytes~n",
-                          [Length, byte_size(Buffer)]),
+satisfy_waiters([{From, _Ref, Length} | Rest], State, Actions) ->
     case try_recv(Length, State) of
         {ok, Data, State1} ->
             %% dist_util expects data as a list (charlist), not binary
             DataList = binary_to_list(Data),
-            error_logger:info_msg("satisfy_waiters: satisfied with ~p bytes~n", [byte_size(Data)]),
             satisfy_waiters(Rest, State1, [{reply, From, {ok, DataList}} | Actions]);
         {need_more, State1} ->
             %% Put waiter back
-            error_logger:info_msg("satisfy_waiters: need more data~n", []),
             {State1#state{recv_waiters = [{From, _Ref, Length} | Rest]}, lists:reverse(Actions)}
     end.
