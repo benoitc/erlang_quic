@@ -32,61 +32,55 @@ cleanup(Pid) ->
 %%====================================================================
 
 store_lookup_test_() ->
-    {setup,
-     fun setup/0,
-     fun cleanup/1,
-     fun(_Pid) ->
-         [{"Store and lookup a ticket",
-           fun() ->
-               Node = 'test@localhost',
-               Ticket = #{ticket => <<"session_data">>, lifetime => 3600},
+    {setup, fun setup/0, fun cleanup/1, fun(_Pid) ->
+        [
+            {"Store and lookup a ticket", fun() ->
+                Node = 'test@localhost',
+                Ticket = #{ticket => <<"session_data">>, lifetime => 3600},
 
-               %% Store ticket
-               ok = quic_dist_tickets:store(Node, Ticket),
+                %% Store ticket
+                ok = quic_dist_tickets:store(Node, Ticket),
 
-               %% Small delay for async cast to complete
-               timer:sleep(50),
+                %% Small delay for async cast to complete
+                timer:sleep(50),
 
-               %% Lookup should succeed
-               {ok, Retrieved} = quic_dist_tickets:lookup(Node),
-               ?assertEqual(Ticket, Retrieved)
-           end}]
-     end}.
+                %% Lookup should succeed
+                {ok, Retrieved} = quic_dist_tickets:lookup(Node),
+                ?assertEqual(Ticket, Retrieved)
+            end}
+        ]
+    end}.
 
 lookup_not_found_test_() ->
-    {setup,
-     fun setup/0,
-     fun cleanup/1,
-     fun(_Pid) ->
-         [{"Lookup non-existent node returns not_found",
-           fun() ->
-               Result = quic_dist_tickets:lookup('nonexistent@node'),
-               ?assertEqual({error, not_found}, Result)
-           end}]
-     end}.
+    {setup, fun setup/0, fun cleanup/1, fun(_Pid) ->
+        [
+            {"Lookup non-existent node returns not_found", fun() ->
+                Result = quic_dist_tickets:lookup('nonexistent@node'),
+                ?assertEqual({error, not_found}, Result)
+            end}
+        ]
+    end}.
 
 delete_test_() ->
-    {setup,
-     fun setup/0,
-     fun cleanup/1,
-     fun(_Pid) ->
-         [{"Delete a ticket",
-           fun() ->
-               Node = 'delete_test@localhost',
-               Ticket = #{ticket => <<"to_delete">>},
+    {setup, fun setup/0, fun cleanup/1, fun(_Pid) ->
+        [
+            {"Delete a ticket", fun() ->
+                Node = 'delete_test@localhost',
+                Ticket = #{ticket => <<"to_delete">>},
 
-               %% Store and verify
-               ok = quic_dist_tickets:store(Node, Ticket),
-               timer:sleep(50),
-               {ok, _} = quic_dist_tickets:lookup(Node),
+                %% Store and verify
+                ok = quic_dist_tickets:store(Node, Ticket),
+                timer:sleep(50),
+                {ok, _} = quic_dist_tickets:lookup(Node),
 
-               %% Delete
-               ok = quic_dist_tickets:delete(Node),
+                %% Delete
+                ok = quic_dist_tickets:delete(Node),
 
-               %% Verify deleted
-               ?assertEqual({error, not_found}, quic_dist_tickets:lookup(Node))
-           end}]
-     end}.
+                %% Verify deleted
+                ?assertEqual({error, not_found}, quic_dist_tickets:lookup(Node))
+            end}
+        ]
+    end}.
 
 %%====================================================================
 %% Expiry Tests
@@ -101,79 +95,73 @@ expiry_extraction_test() ->
     ok.
 
 cleanup_test_() ->
-    {setup,
-     fun setup/0,
-     fun cleanup/1,
-     fun(_Pid) ->
-         [{"Cleanup doesn't crash",
-           fun() ->
-               ok = quic_dist_tickets:cleanup()
-           end}]
-     end}.
+    {setup, fun setup/0, fun cleanup/1, fun(_Pid) ->
+        [
+            {"Cleanup doesn't crash", fun() ->
+                ok = quic_dist_tickets:cleanup()
+            end}
+        ]
+    end}.
 
 %%====================================================================
 %% Multiple Nodes Test
 %%====================================================================
 
 multiple_nodes_test_() ->
-    {setup,
-     fun setup/0,
-     fun cleanup/1,
-     fun(_Pid) ->
-         [{"Store and lookup multiple nodes",
-           fun() ->
-               Nodes = [
-                   {'node1@host1', #{ticket => <<"ticket1">>}},
-                   {'node2@host2', #{ticket => <<"ticket2">>}},
-                   {'node3@host3', #{ticket => <<"ticket3">>}}
-               ],
+    {setup, fun setup/0, fun cleanup/1, fun(_Pid) ->
+        [
+            {"Store and lookup multiple nodes", fun() ->
+                Nodes = [
+                    {'node1@host1', #{ticket => <<"ticket1">>}},
+                    {'node2@host2', #{ticket => <<"ticket2">>}},
+                    {'node3@host3', #{ticket => <<"ticket3">>}}
+                ],
 
-               %% Store all
-               lists:foreach(
-                   fun({Node, Ticket}) ->
-                       ok = quic_dist_tickets:store(Node, Ticket)
-                   end,
-                   Nodes
-               ),
+                %% Store all
+                lists:foreach(
+                    fun({Node, Ticket}) ->
+                        ok = quic_dist_tickets:store(Node, Ticket)
+                    end,
+                    Nodes
+                ),
 
-               timer:sleep(50),
+                timer:sleep(50),
 
-               %% Verify all
-               lists:foreach(
-                   fun({Node, Ticket}) ->
-                       {ok, Retrieved} = quic_dist_tickets:lookup(Node),
-                       ?assertEqual(Ticket, Retrieved)
-                   end,
-                   Nodes
-               )
-           end}]
-     end}.
+                %% Verify all
+                lists:foreach(
+                    fun({Node, Ticket}) ->
+                        {ok, Retrieved} = quic_dist_tickets:lookup(Node),
+                        ?assertEqual(Ticket, Retrieved)
+                    end,
+                    Nodes
+                )
+            end}
+        ]
+    end}.
 
 %%====================================================================
 %% Update Test
 %%====================================================================
 
 update_test_() ->
-    {setup,
-     fun setup/0,
-     fun cleanup/1,
-     fun(_Pid) ->
-         [{"Update an existing ticket",
-           fun() ->
-               Node = 'update_test@localhost',
-               Ticket1 = #{ticket => <<"original">>},
-               Ticket2 = #{ticket => <<"updated">>},
+    {setup, fun setup/0, fun cleanup/1, fun(_Pid) ->
+        [
+            {"Update an existing ticket", fun() ->
+                Node = 'update_test@localhost',
+                Ticket1 = #{ticket => <<"original">>},
+                Ticket2 = #{ticket => <<"updated">>},
 
-               %% Store original
-               ok = quic_dist_tickets:store(Node, Ticket1),
-               timer:sleep(50),
+                %% Store original
+                ok = quic_dist_tickets:store(Node, Ticket1),
+                timer:sleep(50),
 
-               %% Update
-               ok = quic_dist_tickets:store(Node, Ticket2),
-               timer:sleep(50),
+                %% Update
+                ok = quic_dist_tickets:store(Node, Ticket2),
+                timer:sleep(50),
 
-               %% Verify updated
-               {ok, Retrieved} = quic_dist_tickets:lookup(Node),
-               ?assertEqual(Ticket2, Retrieved)
-           end}]
-     end}.
+                %% Verify updated
+                {ok, Retrieved} = quic_dist_tickets:lookup(Node),
+                ?assertEqual(Ticket2, Retrieved)
+            end}
+        ]
+    end}.

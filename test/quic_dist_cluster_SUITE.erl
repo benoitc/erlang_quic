@@ -48,16 +48,18 @@ all() ->
     [{group, five_node}].
 
 groups() ->
-    [{five_node, [sequence], [
-        mesh_formation_test,
-        mesh_all_pairs_test,
-        node_failure_test,
-        node_rejoin_test,
-        broadcast_test,
-        ring_message_test,
-        partition_test,
-        partition_heal_test
-    ]}].
+    [
+        {five_node, [sequence], [
+            mesh_formation_test,
+            mesh_all_pairs_test,
+            node_failure_test,
+            node_rejoin_test,
+            broadcast_test,
+            ring_message_test,
+            partition_test,
+            partition_heal_test
+        ]}
+    ].
 
 init_per_suite(Config) ->
     %% Generate test certificates
@@ -86,7 +88,6 @@ init_per_group(five_node, Config) ->
         {error, Reason} ->
             {skip, {cluster_start_failed, Reason}}
     end;
-
 init_per_group(_Group, Config) ->
     Config.
 
@@ -94,7 +95,6 @@ end_per_group(five_node, Config) ->
     Nodes = proplists:get_value(nodes, Config, []),
     stop_cluster(Nodes),
     ok;
-
 end_per_group(_Group, _Config) ->
     ok.
 
@@ -118,11 +118,17 @@ mesh_formation_test(Config) ->
     %% Each node should see exactly N-1 peers
     ExpectedPeerCount = length(Nodes) - 1,
 
-    lists:foreach(fun(Node) ->
-        Peers = rpc:call(Node, erlang, nodes, []),
-        ?assertEqual(ExpectedPeerCount, length(Peers),
-                     {Node, expected, ExpectedPeerCount, got, length(Peers)})
-    end, Nodes),
+    lists:foreach(
+        fun(Node) ->
+            Peers = rpc:call(Node, erlang, nodes, []),
+            ?assertEqual(
+                ExpectedPeerCount,
+                length(Peers),
+                {Node, expected, ExpectedPeerCount, got, length(Peers)}
+            )
+        end,
+        Nodes
+    ),
 
     ok.
 
@@ -133,11 +139,14 @@ mesh_all_pairs_test(Config) ->
     %% Test all pairs
     Pairs = [{N1, N2} || N1 <- Nodes, N2 <- Nodes, N1 < N2],
 
-    lists:foreach(fun({Node1, Node2}) ->
-        %% RPC from Node1 to Node2
-        Result = rpc:call(Node1, rpc, call, [Node2, erlang, node, []]),
-        ?assertEqual(Node2, Result, {pair, Node1, Node2})
-    end, Pairs),
+    lists:foreach(
+        fun({Node1, Node2}) ->
+            %% RPC from Node1 to Node2
+            Result = rpc:call(Node1, rpc, call, [Node2, erlang, node, []]),
+            ?assertEqual(Node2, Result, {pair, Node1, Node2})
+        end,
+        Pairs
+    ),
 
     ok.
 
@@ -155,10 +164,13 @@ node_failure_test(Config) ->
 
     %% Remaining nodes should have 3 peers each
     RemainingNodes = [Node1, Node2, Node4, Node5],
-    lists:foreach(fun(Node) ->
-        Peers = rpc:call(Node, erlang, nodes, []),
-        ?assertEqual(3, length(Peers), {Node, peers, Peers})
-    end, RemainingNodes),
+    lists:foreach(
+        fun(Node) ->
+            Peers = rpc:call(Node, erlang, nodes, []),
+            ?assertEqual(3, length(Peers), {Node, peers, Peers})
+        end,
+        RemainingNodes
+    ),
 
     %% Communication should still work
     Node5 = rpc:call(Node1, rpc, call, [Node5, erlang, node, []]),
@@ -182,22 +194,30 @@ broadcast_test(Config) ->
     [Sender | Receivers] = Nodes,
     Self = self(),
 
-    ReceiverPids = lists:map(fun(Node) ->
-        rpc:call(Node, erlang, spawn, [fun() ->
-            receive
-                {broadcast, Data} ->
-                    Self ! {received, Node, Data}
-            after 10000 ->
-                Self ! {timeout, Node}
-            end
-        end])
-    end, Receivers),
+    ReceiverPids = lists:map(
+        fun(Node) ->
+            rpc:call(Node, erlang, spawn, [
+                fun() ->
+                    receive
+                        {broadcast, Data} ->
+                            Self ! {received, Node, Data}
+                    after 10000 ->
+                        Self ! {timeout, Node}
+                    end
+                end
+            ])
+        end,
+        Receivers
+    ),
 
     %% Broadcast from sender
     TestData = {test, erlang:system_time()},
-    lists:foreach(fun(Pid) ->
-        Pid ! {broadcast, TestData}
-    end, ReceiverPids),
+    lists:foreach(
+        fun(Pid) ->
+            Pid ! {broadcast, TestData}
+        end,
+        ReceiverPids
+    ),
 
     %% Verify all received
     ReceivedFrom = receive_all(length(Receivers), []),
@@ -214,19 +234,28 @@ ring_message_test(Config) ->
 
     %% Start ring processes
     Self = self(),
-    RingNodes = Nodes ++ [hd(Nodes)],  % Close the ring
+    % Close the ring
+    RingNodes = Nodes ++ [hd(Nodes)],
 
     %% Create ring
-    Pids = lists:foldl(fun(Node, Acc) ->
-        NextPid = case Acc of
-            [] -> self;  % Last node points to test process
-            [Prev | _] -> Prev
+    Pids = lists:foldl(
+        fun(Node, Acc) ->
+            NextPid =
+                case Acc of
+                    % Last node points to test process
+                    [] -> self;
+                    [Prev | _] -> Prev
+                end,
+            Pid = rpc:call(Node, erlang, spawn, [
+                fun() ->
+                    ring_process(NextPid, Self)
+                end
+            ]),
+            [Pid | Acc]
         end,
-        Pid = rpc:call(Node, erlang, spawn, [fun() ->
-            ring_process(NextPid, Self)
-        end]),
-        [Pid | Acc]
-    end, [], lists:reverse(RingNodes)),
+        [],
+        lists:reverse(RingNodes)
+    ),
 
     %% Send message through ring
     [FirstPid | _] = Pids,
@@ -285,10 +314,13 @@ partition_heal_test(Config) ->
 
     %% Verify full connectivity
     ExpectedPeerCount = length(Nodes) - 1,
-    lists:foreach(fun(Node) ->
-        Peers = rpc:call(Node, erlang, nodes, []),
-        ?assertEqual(ExpectedPeerCount, length(Peers))
-    end, Nodes),
+    lists:foreach(
+        fun(Node) ->
+            Peers = rpc:call(Node, erlang, nodes, []),
+            ?assertEqual(ExpectedPeerCount, length(Peers))
+        end,
+        Nodes
+    ),
 
     ok.
 
@@ -310,29 +342,41 @@ start_cluster(N, CertDir) ->
     %% This is simplified - actual implementation would use peer module or docker
     BasePort = 14430,
 
-    Nodes = lists:map(fun(I) ->
-        Name = list_to_atom("cluster_node" ++ integer_to_list(I)),
-        Port = BasePort + I,
-        {Name, Port}
-    end, lists:seq(1, N)),
+    Nodes = lists:map(
+        fun(I) ->
+            Name = list_to_atom("cluster_node" ++ integer_to_list(I)),
+            Port = BasePort + I,
+            {Name, Port}
+        end,
+        lists:seq(1, N)
+    ),
 
     %% For now, return skip as we can't actually start nodes in CT
     {error, not_implemented}.
 
 stop_cluster(Nodes) ->
-    lists:foreach(fun(Node) ->
-        catch rpc:call(Node, erlang, halt, [0])
-    end, Nodes).
+    lists:foreach(
+        fun(Node) ->
+            catch rpc:call(Node, erlang, halt, [0])
+        end,
+        Nodes
+    ).
 
-connect_mesh([]) -> ok;
-connect_mesh([_]) -> ok;
+connect_mesh([]) ->
+    ok;
+connect_mesh([_]) ->
+    ok;
 connect_mesh([Node | Rest]) ->
-    lists:foreach(fun(OtherNode) ->
-        rpc:call(Node, net_adm, ping, [OtherNode])
-    end, Rest),
+    lists:foreach(
+        fun(OtherNode) ->
+            rpc:call(Node, net_adm, ping, [OtherNode])
+        end,
+        Rest
+    ),
     connect_mesh(Rest).
 
-receive_all(0, Acc) -> Acc;
+receive_all(0, Acc) ->
+    Acc;
 receive_all(N, Acc) ->
     receive
         {received, Node, _Data} ->

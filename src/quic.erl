@@ -285,9 +285,9 @@ set_owner(_ConnRef, _NewOwner) ->
 
 %% @doc Set the owner process for a connection (synchronous).
 %% Use this when you need to ensure ownership is transferred before continuing.
--spec set_owner_sync(ConnRef, NewOwner) -> ok | {error, term()}
-    when ConnRef :: reference() | pid(),
-         NewOwner :: pid().
+-spec set_owner_sync(ConnRef, NewOwner) -> ok | {error, term()} when
+    ConnRef :: reference() | pid(),
+    NewOwner :: pid().
 set_owner_sync(ConnRef, NewOwner) when is_reference(ConnRef), is_pid(NewOwner) ->
     case quic_connection:lookup(ConnRef) of
         {ok, Pid} -> quic_connection:set_owner_sync(Pid, NewOwner);
