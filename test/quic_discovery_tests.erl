@@ -16,28 +16,32 @@
 
 static_init_test() ->
     %% Initialize with some nodes
-    Opts = [{nodes, [
-        {'node1@host1', {{192,168,1,1}, 4433}},
-        {'node2@host2', {{192,168,1,2}, 4433}}
-    ]}],
+    Opts = [
+        {nodes, [
+            {'node1@host1', {{192, 168, 1, 1}, 4433}},
+            {'node2@host2', {{192, 168, 1, 2}, 4433}}
+        ]}
+    ],
 
     {ok, State} = quic_discovery_static:init(Opts),
     ?assert(is_map(State)).
 
 static_lookup_test() ->
     %% Initialize
-    Opts = [{nodes, [
-        {'node1@host1', {{192,168,1,1}, 4433}},
-        {'node2@host2', {{192,168,1,2}, 4433}}
-    ]}],
+    Opts = [
+        {nodes, [
+            {'node1@host1', {{192, 168, 1, 1}, 4433}},
+            {'node2@host2', {{192, 168, 1, 2}, 4433}}
+        ]}
+    ],
 
     {ok, _State} = quic_discovery_static:init(Opts),
 
     %% Lookup existing node
-    {ok, {{192,168,1,1}, 4433}} = quic_discovery_static:lookup('node1@host1', "host1"),
+    {ok, {{192, 168, 1, 1}, 4433}} = quic_discovery_static:lookup('node1@host1', "host1"),
 
     %% Lookup another node
-    {ok, {{192,168,1,2}, 4433}} = quic_discovery_static:lookup('node2@host2', "host2"),
+    {ok, {{192, 168, 1, 2}, 4433}} = quic_discovery_static:lookup('node2@host2', "host2"),
 
     %% Lookup non-existent node (should check config)
     %% Note: This may return error or fall through to DNS
@@ -56,10 +60,12 @@ static_register_test() ->
 
 static_list_nodes_test() ->
     %% Initialize with nodes
-    Opts = [{nodes, [
-        {'node1@host1', {{192,168,1,1}, 4433}},
-        {'node2@host2', {{192,168,1,2}, 4433}}
-    ]}],
+    Opts = [
+        {nodes, [
+            {'node1@host1', {{192, 168, 1, 1}, 4433}},
+            {'node2@host2', {{192, 168, 1, 2}, 4433}}
+        ]}
+    ],
 
     {ok, _State} = quic_discovery_static:init(Opts),
 
@@ -74,15 +80,17 @@ static_list_nodes_test() ->
 
 epmd_port_please_test() ->
     %% Initialize static discovery
-    Opts = [{nodes, [
-        {'test@localhost', {{127,0,0,1}, 4433}}
-    ]}],
+    Opts = [
+        {nodes, [
+            {'test@localhost', {{127, 0, 0, 1}, 4433}}
+        ]}
+    ],
     {ok, _} = quic_discovery_static:init(Opts),
 
     %% Set up application env
     application:set_env(quic, dist, [
         {discovery_module, quic_discovery_static},
-        {nodes, [{'test@localhost', {{127,0,0,1}, 4433}}]}
+        {nodes, [{'test@localhost', {{127, 0, 0, 1}, 4433}}]}
     ]),
 
     %% Test port_please
@@ -103,10 +111,12 @@ epmd_register_test() ->
 
 epmd_names_test() ->
     %% Initialize with nodes
-    Opts = [{nodes, [
-        {'test1@localhost', {{127,0,0,1}, 4433}},
-        {'test2@localhost', {{127,0,0,1}, 4434}}
-    ]}],
+    Opts = [
+        {nodes, [
+            {'test1@localhost', {{127, 0, 0, 1}, 4433}},
+            {'test2@localhost', {{127, 0, 0, 1}, 4434}}
+        ]}
+    ],
     {ok, _} = quic_discovery_static:init(Opts),
 
     %% Test names

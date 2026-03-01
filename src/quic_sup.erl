@@ -48,8 +48,10 @@ init([]) ->
     %% This must be created early as distribution may need it during startup
     case ets:info(quic_discovery_static_nodes) of
         undefined ->
-            ets:new(quic_discovery_static_nodes,
-                    [named_table, public, set, {read_concurrency, true}]);
+            ets:new(
+                quic_discovery_static_nodes,
+                [named_table, public, set, {read_concurrency, true}]
+            );
         _ ->
             ok
     end,

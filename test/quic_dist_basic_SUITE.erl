@@ -49,17 +49,19 @@ all() ->
     [{group, two_node}].
 
 groups() ->
-    [{two_node, [sequence], [
-        node_connect_test,
-        node_ping_test,
-        rpc_call_test,
-        spawn_link_test,
-        message_passing_test,
-        large_message_test,
-        concurrent_messages_test,
-        node_disconnect_test,
-        node_reconnect_test
-    ]}].
+    [
+        {two_node, [sequence], [
+            node_connect_test,
+            node_ping_test,
+            rpc_call_test,
+            spawn_link_test,
+            message_passing_test,
+            large_message_test,
+            concurrent_messages_test,
+            node_disconnect_test,
+            node_reconnect_test
+        ]}
+    ].
 
 init_per_suite(Config) ->
     %% Generate test certificates
@@ -92,13 +94,17 @@ init_per_group(two_node, Config) ->
             CertDir = proplists:get_value(cert_dir, Config),
             case start_peer_nodes(CertDir, Config) of
                 {ok, Node1, Peer1, Node2, Peer2} ->
-                    [{node1, Node1}, {peer1, Peer1},
-                     {node2, Node2}, {peer2, Peer2} | Config];
+                    [
+                        {node1, Node1},
+                        {peer1, Peer1},
+                        {node2, Node2},
+                        {peer2, Peer2}
+                        | Config
+                    ];
                 {error, Reason} ->
                     {skip, {peer_start_failed, Reason}}
             end
     end;
-
 init_per_group(_Group, Config) ->
     Config.
 
@@ -110,7 +116,6 @@ end_per_group(two_node, Config) ->
     catch peer:stop(Peer1),
     catch peer:stop(Peer2),
     ok;
-
 end_per_group(_Group, _Config) ->
     ok.
 
@@ -175,9 +180,12 @@ spawn_link_test(Config) ->
 
     %% Spawn a process on Node2 from Node1
     Self = self(),
-    Pid = rpc:call(Node1, erlang, spawn, [Node2, fun() ->
-        Self ! {hello, node()}
-    end]),
+    Pid = rpc:call(Node1, erlang, spawn, [
+        Node2,
+        fun() ->
+            Self ! {hello, node()}
+        end
+    ]),
 
     ?assert(is_pid(Pid)),
     ?assertEqual(Node2, node(Pid)),
@@ -199,14 +207,16 @@ message_passing_test(Config) ->
 
     %% Start a receiver on Node2
     Self = self(),
-    Receiver = rpc:call(Node2, erlang, spawn, [fun() ->
-        receive
-            {msg, Data} ->
-                Self ! {received, Data}
-        after 5000 ->
-            Self ! timeout
+    Receiver = rpc:call(Node2, erlang, spawn, [
+        fun() ->
+            receive
+                {msg, Data} ->
+                    Self ! {received, Data}
+            after 5000 ->
+                Self ! timeout
+            end
         end
-    end]),
+    ]),
 
     %% Send message from Node1 to Node2
     TestData = {test, 123, <<"binary">>, [list, items, atoms]},
@@ -234,15 +244,17 @@ large_message_test(Config) ->
 
     %% Send and verify integrity
     Self = self(),
-    Receiver = rpc:call(Node2, erlang, spawn, [fun() ->
-        receive
-            {large, Data} ->
-                RecvHash = crypto:hash(sha256, Data),
-                Self ! {hash, RecvHash}
-        after 30000 ->
-            Self ! timeout
+    Receiver = rpc:call(Node2, erlang, spawn, [
+        fun() ->
+            receive
+                {large, Data} ->
+                    RecvHash = crypto:hash(sha256, Data),
+                    Self ! {hash, RecvHash}
+            after 30000 ->
+                Self ! timeout
+            end
         end
-    end]),
+    ]),
 
     Receiver ! {large, LargeData},
 
@@ -266,16 +278,21 @@ concurrent_messages_test(Config) ->
     Self = self(),
     NumMessages = 100,
 
-    Receiver = rpc:call(Node2, erlang, spawn, [fun() ->
-        receive_loop(Self, NumMessages, [])
-    end]),
+    Receiver = rpc:call(Node2, erlang, spawn, [
+        fun() ->
+            receive_loop(Self, NumMessages, [])
+        end
+    ]),
 
     %% Send messages concurrently
-    lists:foreach(fun(N) ->
-        spawn(fun() ->
-            Receiver ! {msg, N}
-        end)
-    end, lists:seq(1, NumMessages)),
+    lists:foreach(
+        fun(N) ->
+            spawn(fun() ->
+                Receiver ! {msg, N}
+            end)
+        end,
+        lists:seq(1, NumMessages)
+    ),
 
     %% Wait for all messages
     receive
@@ -356,8 +373,12 @@ generate_test_certs(Config) ->
     os:cmd(lists:flatten(Cmd)),
 
     %% Verify files were created
-    case {filelib:is_file(filename:join(CertDir, "cert.pem")),
-          filelib:is_file(filename:join(CertDir, "key.pem"))} of
+    case
+        {
+            filelib:is_file(filename:join(CertDir, "cert.pem")),
+            filelib:is_file(filename:join(CertDir, "key.pem"))
+        }
+    of
         {true, true} ->
             {ok, CertDir};
         _ ->
@@ -368,8 +389,12 @@ start_peer_nodes(CertDir, Config) ->
     %% Write sys.config for nodes
     PrivDir = proplists:get_value(priv_dir, Config),
 
-    Node1Name = list_to_atom("quic_ct_node1_" ++ integer_to_list(erlang:unique_integer([positive]))),
-    Node2Name = list_to_atom("quic_ct_node2_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    Node1Name = list_to_atom(
+        "quic_ct_node1_" ++ integer_to_list(erlang:unique_integer([positive]))
+    ),
+    Node2Name = list_to_atom(
+        "quic_ct_node2_" ++ integer_to_list(erlang:unique_integer([positive]))
+    ),
 
     %% Build code path
     CodePath = code:get_path(),
@@ -380,12 +405,18 @@ start_peer_nodes(CertDir, Config) ->
             name => Name,
             host => "127.0.0.1",
             args => [
-                "-proto_dist", "quic",
-                "-epmd_module", "quic_epmd",
-                "-start_epmd", "false",
-                "-quic_dist_port", integer_to_list(Port),
-                "-setcookie", atom_to_list(erlang:get_cookie()),
-                "-pa" | lists:flatmap(fun(P) -> [P] end, CodePath)
+                "-proto_dist",
+                "quic",
+                "-epmd_module",
+                "quic_epmd",
+                "-start_epmd",
+                "false",
+                "-quic_dist_port",
+                integer_to_list(Port),
+                "-setcookie",
+                atom_to_list(erlang:get_cookie()),
+                "-pa"
+                | lists:flatmap(fun(P) -> [P] end, CodePath)
             ],
             connection => standard_io
         }

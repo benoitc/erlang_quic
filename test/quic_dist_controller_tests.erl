@@ -64,31 +64,28 @@ cleanup_meck(_) ->
     ok.
 
 controller_start_link_test_() ->
-    {setup,
-     fun setup_meck/0,
-     fun cleanup_meck/1,
-     fun(_) ->
-         ConnRef = make_ref(),
-         ConnPid = self(),
+    {setup, fun setup_meck/0, fun cleanup_meck/1, fun(_) ->
+        ConnRef = make_ref(),
+        ConnPid = self(),
 
-         %% Mock lookup to return our pid
-         meck:expect(quic_connection, lookup, fun(Ref) when Ref =:= ConnRef ->
-             {ok, ConnPid}
-         end),
+        %% Mock lookup to return our pid
+        meck:expect(quic_connection, lookup, fun(Ref) when Ref =:= ConnRef ->
+            {ok, ConnPid}
+        end),
 
-         %% Mock open_stream
-         meck:expect(quic, open_stream, fun(_) -> {ok, 0} end),
-         meck:expect(quic, set_stream_priority, fun(_, _, _, _) -> ok end),
+        %% Mock open_stream
+        meck:expect(quic, open_stream, fun(_) -> {ok, 0} end),
+        meck:expect(quic, set_stream_priority, fun(_, _, _, _) -> ok end),
 
-         %% Start controller
-         {ok, Pid} = quic_dist_controller:start_link(ConnRef, client),
-         ?assert(is_pid(Pid)),
+        %% Start controller
+        {ok, Pid} = quic_dist_controller:start_link(ConnRef, client),
+        ?assert(is_pid(Pid)),
 
-         %% Clean up
-         gen_statem:stop(Pid),
+        %% Clean up
+        gen_statem:stop(Pid),
 
-         ok
-     end}.
+        ok
+    end}.
 
 -endif.
 
@@ -143,4 +140,3 @@ buffer_operations_test() ->
     <<Extracted:Length/binary, Rest/binary>> = Buffer2,
     ?assertEqual(<<"hello">>, Extracted),
     ?assertEqual(<<" world">>, Rest).
-
