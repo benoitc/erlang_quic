@@ -32,3 +32,4 @@ _build/test/logs/
 certs/*.pem
 certs/*.key
 doc/
+rebar3.crashdump
