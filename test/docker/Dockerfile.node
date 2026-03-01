@@ -1,0 +1,37 @@
+# Dockerfile for QUIC Distribution Test Node
+# Erlang node with quic_dist for cluster testing
+
+FROM erlang:26-alpine
+
+# Install build dependencies
+RUN apk add --no-cache \
+    git \
+    make \
+    openssl \
+    bash \
+    curl \
+    iptables \
+    iproute2
+
+# Set working directory
+WORKDIR /app
+
+# Copy the erlang_quic source
+COPY . /app/
+
+# Build the application
+RUN rebar3 compile
+
+# Generate test certificates (will be overwritten by mounted certs)
+RUN mkdir -p /certs && \
+    openssl req -x509 -newkey rsa:2048 \
+    -keyout /certs/key.pem -out /certs/cert.pem \
+    -days 365 -nodes -subj '/CN=localhost'
+
+# Set up environment
+ENV ERL_FLAGS="-proto_dist quic -epmd_module quic_epmd -start_epmd false"
+ENV QUIC_CERT_FILE=/certs/cert.pem
+ENV QUIC_KEY_FILE=/certs/key.pem
+
+# Default command - start an Erlang node
+ENTRYPOINT ["/app/test/docker/scripts/start_node.sh"]

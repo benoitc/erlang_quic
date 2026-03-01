@@ -1,0 +1,134 @@
+# Docker Compose for 5-Node QUIC Distribution Cluster
+# Usage: docker-compose up -d
+
+version: '3.8'
+
+services:
+  node1:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.node
+    hostname: node1
+    environment:
+      - NODE_NAME=node1@node1
+      - QUIC_DIST_PORT=4433
+      - CLUSTER_NODES=node1@node1,node2@node2,node3@node3,node4@node4,node5@node5
+    volumes:
+      - ./certs:/certs:ro
+    networks:
+      quic_mesh:
+        ipv4_address: 172.28.0.11
+    ports:
+      - "4433:4433/udp"
+    healthcheck:
+      test: ["CMD", "epmd", "-names"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  node2:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.node
+    hostname: node2
+    environment:
+      - NODE_NAME=node2@node2
+      - QUIC_DIST_PORT=4433
+      - CLUSTER_NODES=node1@node1,node2@node2,node3@node3,node4@node4,node5@node5
+    volumes:
+      - ./certs:/certs:ro
+    networks:
+      quic_mesh:
+        ipv4_address: 172.28.0.12
+    ports:
+      - "4434:4433/udp"
+    depends_on:
+      - node1
+
+  node3:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.node
+    hostname: node3
+    environment:
+      - NODE_NAME=node3@node3
+      - QUIC_DIST_PORT=4433
+      - CLUSTER_NODES=node1@node1,node2@node2,node3@node3,node4@node4,node5@node5
+    volumes:
+      - ./certs:/certs:ro
+    networks:
+      quic_mesh:
+        ipv4_address: 172.28.0.13
+    ports:
+      - "4435:4433/udp"
+    depends_on:
+      - node1
+
+  node4:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.node
+    hostname: node4
+    environment:
+      - NODE_NAME=node4@node4
+      - QUIC_DIST_PORT=4433
+      - CLUSTER_NODES=node1@node1,node2@node2,node3@node3,node4@node4,node5@node5
+    volumes:
+      - ./certs:/certs:ro
+    networks:
+      quic_mesh:
+        ipv4_address: 172.28.0.14
+    ports:
+      - "4436:4433/udp"
+    depends_on:
+      - node1
+
+  node5:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.node
+    hostname: node5
+    environment:
+      - NODE_NAME=node5@node5
+      - QUIC_DIST_PORT=4433
+      - CLUSTER_NODES=node1@node1,node2@node2,node3@node3,node4@node4,node5@node5
+    volumes:
+      - ./certs:/certs:ro
+    networks:
+      quic_mesh:
+        ipv4_address: 172.28.0.15
+    ports:
+      - "4437:4433/udp"
+    depends_on:
+      - node1
+
+  test_runner:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.node
+    hostname: test_runner
+    environment:
+      - NODE_NAME=test_runner@test_runner
+      - TEST_NODES=node1@node1,node2@node2,node3@node3,node4@node4,node5@node5
+    volumes:
+      - ./certs:/certs:ro
+      - ./scripts:/scripts:ro
+    networks:
+      quic_mesh:
+        ipv4_address: 172.28.0.100
+    depends_on:
+      - node1
+      - node2
+      - node3
+      - node4
+      - node5
+    entrypoint: ["/scripts/run_5node_cluster_test.sh"]
+
+networks:
+  quic_mesh:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
