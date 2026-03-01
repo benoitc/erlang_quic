@@ -144,7 +144,7 @@ send(Controller, Data) ->
     Length :: non_neg_integer(),
     Timeout :: timeout()
 ) ->
-    {ok, binary()} | {error, term()}.
+    {ok, [byte()]} | {error, term()}.
 recv(Controller, Length, Timeout) ->
     gen_statem:call(Controller, {recv, Length}, Timeout).
 
@@ -334,9 +334,7 @@ handshaking({call, From}, {recv, Length}, State) ->
             %% Queue the waiter
             Ref = make_ref(),
             Waiters = [{From, Ref, Length} | State1#state.recv_waiters],
-            {keep_state, State1#state{recv_waiters = Waiters}};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
+            {keep_state, State1#state{recv_waiters = Waiters}}
     end;
 %% Handshake complete notification with DHandle
 handshaking(info, {handshake_complete, Node, DHandle}, State) ->
@@ -406,9 +404,7 @@ connected({call, From}, {recv, Length}, State) ->
         {need_more, State1} ->
             Ref = make_ref(),
             Waiters = [{From, Ref, Length} | State1#state.recv_waiters],
-            {keep_state, State1#state{recv_waiters = Waiters}};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
+            {keep_state, State1#state{recv_waiters = Waiters}}
     end;
 %% Handle tick (from mf_tick callback)
 connected(cast, tick, #state{dhandle = DHandle} = State) when DHandle =/= undefined ->
@@ -576,21 +572,13 @@ handle_common_event(_EventType, _Event, _StateName, State) ->
 %%====================================================================
 
 %% @private
-%% Open the control stream.
-open_control_stream(#state{conn_ref = ConnRef, role = Role} = State) ->
-    case Role of
-        client ->
-            %% Client opens stream 0
-            case quic:open_stream(ConnRef) of
-                {ok, StreamId} ->
-                    {ok, StreamId, State};
-                Error ->
-                    Error
-            end;
-        server ->
-            %% Server waits for stream from client
-            %% For now, we use a fixed stream ID
-            {ok, 0, State}
+%% Open the control stream (client only - server uses stream 0 from client).
+open_control_stream(#state{conn_ref = ConnRef} = State) ->
+    case quic:open_stream(ConnRef) of
+        {ok, StreamId} ->
+            {ok, StreamId, State};
+        Error ->
+            Error
     end.
 
 %% @private
@@ -617,17 +605,8 @@ set_stream_priority(#state{conn_ref = ConnRef}, StreamId, Urgency) ->
 %% Open server-initiated data streams after handshake.
 %% Server-initiated bidirectional streams have IDs 1, 5, 9, ...
 open_server_data_streams(State) ->
-    case open_data_streams(State, ?QUIC_DIST_DATA_STREAMS) of
-        {ok, NewState} ->
-            NewState;
-        {error, Reason} ->
-            ?LOG_WARNING(
-                #{what => server_open_data_streams_failed, reason => Reason},
-                ?QUIC_LOG_META
-            ),
-            %% Continue with existing streams (or none)
-            State
-    end.
+    {ok, NewState} = open_data_streams(State, ?QUIC_DIST_DATA_STREAMS),
+    NewState.
 
 %%====================================================================
 %% Internal Functions - Send

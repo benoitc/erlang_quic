@@ -62,19 +62,20 @@ init(Opts) ->
     },
 
     %% Build child specs based on configuration
-    Children = case proplists:get_value(nat_enabled, Opts, false) of
-        true ->
-            NatSpec = #{
-                id => quic_dist_nat,
-                start => {quic_dist_nat, start_link, [Opts]},
-                restart => permanent,
-                shutdown => 5000,
-                type => worker,
-                modules => [quic_dist_nat]
-            },
-            [TicketsSpec, NatSpec];
-        false ->
-            [TicketsSpec]
-    end,
+    Children =
+        case proplists:get_value(nat_enabled, Opts, false) of
+            true ->
+                NatSpec = #{
+                    id => quic_dist_nat,
+                    start => {quic_dist_nat, start_link, [Opts]},
+                    restart => permanent,
+                    shutdown => 5000,
+                    type => worker,
+                    modules => [quic_dist_nat]
+                },
+                [TicketsSpec, NatSpec];
+            false ->
+                [TicketsSpec]
+        end,
 
     {ok, {SupFlags, Children}}.

@@ -49,17 +49,20 @@
 -callback init(Opts :: proplists:proplist() | map()) ->
     {ok, State :: term()} | {error, Reason :: term()}.
 
--callback register(NodeName :: atom(), Port :: inet:port_number(),
-                   State :: term()) ->
+-callback register(
+    NodeName :: atom(),
+    Port :: inet:port_number(),
+    State :: term()
+) ->
     {ok, State :: term()} | {error, Reason :: term()}.
 
 -callback lookup(NodeName :: atom(), Host :: string()) ->
-    {ok, {inet:ip_address() | string(), inet:port_number()}} |
-    {error, Reason :: term()}.
+    {ok, {inet:ip_address() | string(), inet:port_number()}}
+    | {error, Reason :: term()}.
 
 -callback list_nodes(Host :: string()) ->
-    {ok, [{NodeName :: atom(), inet:port_number()}]} |
-    {error, Reason :: term()}.
+    {ok, [{NodeName :: atom(), inet:port_number()}]}
+    | {error, Reason :: term()}.
 
 %% Optional callbacks
 -optional_callbacks([init/1, register/3, list_nodes/1]).
@@ -77,15 +80,18 @@
 
 %% @doc Look up a node's address using the configured discovery module.
 -spec lookup(Node :: node(), Host :: string()) ->
-    {ok, {inet:ip_address() | string(), inet:port_number()}} |
-    {error, term()}.
+    {ok, {inet:ip_address() | string(), inet:port_number()}}
+    | {error, term()}.
 lookup(Node, Host) ->
     Module = get_discovery_module(),
     Module:lookup(Node, Host).
 
 %% @doc Register this node with the discovery backend.
--spec register_node(NodeName :: atom(), Port :: inet:port_number(),
-                    Opts :: proplists:proplist()) ->
+-spec register_node(
+    NodeName :: atom(),
+    Port :: inet:port_number(),
+    Opts :: proplists:proplist()
+) ->
     ok | {error, term()}.
 register_node(NodeName, Port, Opts) ->
     Module = get_discovery_module(),
@@ -97,7 +103,8 @@ register_node(NodeName, Port, Opts) ->
                 Error -> Error
             end;
         false ->
-            ok  % Registration not supported by backend
+            % Registration not supported by backend
+            ok
     end.
 
 %% @doc List all known nodes.

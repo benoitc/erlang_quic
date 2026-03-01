@@ -82,10 +82,11 @@ register(NodeName, Port, State) ->
     %% Ensure table exists
     ensure_table(),
     %% Get local address (or use 0.0.0.0)
-    Address = case inet:getif() of
-        {ok, [{IP, _, _} | _]} -> {IP, Port};
-        _ -> {{0, 0, 0, 0}, Port}
-    end,
+    Address =
+        case inet:getif() of
+            {ok, [{IP, _, _} | _]} -> {IP, Port};
+            _ -> {{0, 0, 0, 0}, Port}
+        end,
     ets:insert(?TABLE, {NodeName, Address}),
     {ok, State}.
 
@@ -107,7 +108,8 @@ ensure_table() ->
 %% This is a simplified API for manual registration during testing
 %% or when you need to add a node outside of the behaviour callback.
 %% Address can be {IP, Port} where IP is a tuple or string.
--spec register(NodeName :: atom(), Address :: {inet:ip_address() | string(), inet:port_number()}) -> ok.
+-spec register(NodeName :: atom(), Address :: {inet:ip_address() | string(), inet:port_number()}) ->
+    ok.
 register(NodeName, Address) ->
     ensure_table(),
     ets:insert(?TABLE, {NodeName, Address}),
@@ -117,14 +119,17 @@ register(NodeName, Address) ->
 -spec unregister(NodeName :: atom()) -> ok.
 unregister(NodeName) ->
     case ets:info(?TABLE) of
-        undefined -> ok;
-        _ -> ets:delete(?TABLE, NodeName), ok
+        undefined ->
+            ok;
+        _ ->
+            ets:delete(?TABLE, NodeName),
+            ok
     end.
 
 %% @doc Look up a node's address.
 -spec lookup(NodeName :: atom(), Host :: string()) ->
-    {ok, {inet:ip_address() | string(), inet:port_number()}} |
-    {error, not_found}.
+    {ok, {inet:ip_address() | string(), inet:port_number()}}
+    | {error, not_found}.
 lookup(NodeName, Host) ->
     %% First check ETS table (may not exist during early startup)
     case ets:info(?TABLE) of
@@ -182,18 +187,19 @@ get_init_arg_nodes() ->
 %% @private
 parse_init_nodes(Args) ->
     lists:flatmap(
-        fun(["nodes", NodesStr]) ->
-            case erl_scan:string(NodesStr ++ ".") of
-                {ok, Tokens, _} ->
-                    case erl_parse:parse_term(Tokens) of
-                        {ok, Nodes} when is_list(Nodes) -> Nodes;
-                        _ -> []
-                    end;
-                _ ->
-                    []
-            end;
-           (_) ->
-            []
+        fun
+            (["nodes", NodesStr]) ->
+                case erl_scan:string(NodesStr ++ ".") of
+                    {ok, Tokens, _} ->
+                        case erl_parse:parse_term(Tokens) of
+                            {ok, Nodes} when is_list(Nodes) -> Nodes;
+                            _ -> []
+                        end;
+                    _ ->
+                        []
+                end;
+            (_) ->
+                []
         end,
         Args
     ).
@@ -213,14 +219,10 @@ lookup_in_config(NodeName, Host) ->
 lookup_by_host(_Host, []) ->
     {error, not_found};
 lookup_by_host(Host, [{Node, {IP, Port}} | Rest]) ->
-    case atom_to_list(Node) of
-        Name when is_list(Name) ->
-            case string:tokens(Name, "@") of
-                [_, NodeHost] when NodeHost =:= Host ->
-                    {ok, {IP, Port}};
-                _ ->
-                    lookup_by_host(Host, Rest)
-            end;
+    Name = atom_to_list(Node),
+    case string:tokens(Name, "@") of
+        [_, NodeHost] when NodeHost =:= Host ->
+            {ok, {IP, Port}};
         _ ->
             lookup_by_host(Host, Rest)
     end.

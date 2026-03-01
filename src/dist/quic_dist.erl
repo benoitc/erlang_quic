@@ -46,6 +46,18 @@
 -include_lib("kernel/include/dist_util.hrl").
 -include_lib("kernel/include/net_address.hrl").
 
+%% Dialyzer suppressions:
+%% - accept/do_accept_connection: handshake functions have complex control flow
+%% - nat functions: call excluded quic_dist_nat module
+-dialyzer(
+    {nowarn_function, [
+        accept_connection/5,
+        do_accept_connection/6,
+        maybe_map_nat_port/2,
+        do_map_port/1
+    ]}
+).
+
 %% Distribution module callbacks
 -export([
     listen/1,
@@ -78,8 +90,10 @@ select(Node) ->
             %% Try to resolve address via EPMD module
             EpmdMod = net_kernel:epmd_module(),
             case catch EpmdMod:address_please(Name, Host, inet) of
-                {ok, _Addr} -> true;
-                {ok, _Addr, _Port, _Version} -> true;
+                {ok, _Addr} ->
+                    true;
+                {ok, _Addr, _Port, _Version} ->
+                    true;
                 _ ->
                     %% Even if address lookup fails, allow local connections
                     %% This is needed during initial node startup
@@ -161,7 +175,6 @@ listen(Name, ExtraOpts) ->
                     Creation = get_creation(Name),
 
                     {ok, {Listener, Address, Creation}};
-
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -180,11 +193,13 @@ accept(#quic_dist_listener{server_name = ServerName} = Listener) ->
 
 %% @doc Handle an accepted connection.
 %% Called by net_kernel when a new connection is accepted.
--spec accept_connection(AcceptPid :: pid(),
-                        Socket :: term(),
-                        MyNode :: node(),
-                        Allowed :: term(),
-                        SetupTime :: non_neg_integer()) -> pid().
+-spec accept_connection(
+    AcceptPid :: pid(),
+    Socket :: term(),
+    MyNode :: node(),
+    Allowed :: term(),
+    SetupTime :: non_neg_integer()
+) -> pid().
 accept_connection(AcceptPid, DistCtrl, MyNode, Allowed, SetupTime) ->
     %% IMPORTANT: self() here is net_kernel - capture it before spawning
     Kernel = self(),
@@ -199,14 +214,17 @@ accept_connection(AcceptPid, DistCtrl, MyNode, Allowed, SetupTime) ->
 
 %% @doc Set up an outgoing distribution connection.
 %% Called by net_kernel to establish a connection to another node.
--spec setup(Node :: node(),
-            Type :: atom(),
-            MyNode :: node(),
-            LongOrShortNames :: shortnames | longnames,
-            SetupTime :: non_neg_integer()) -> pid().
+-spec setup(
+    Node :: node(),
+    Type :: atom(),
+    MyNode :: node(),
+    LongOrShortNames :: shortnames | longnames,
+    SetupTime :: non_neg_integer()
+) -> pid().
 setup(Node, Type, MyNode, LongOrShortNames, SetupTime) ->
     spawn_opt(
-        ?MODULE, do_setup,
+        ?MODULE,
+        do_setup,
         [self(), Node, Type, MyNode, LongOrShortNames, SetupTime],
         [link, {priority, max}]
     ).
@@ -277,8 +295,10 @@ ensure_quic_minimal() ->
 ensure_discovery_table() ->
     case ets:info(quic_discovery_static_nodes) of
         undefined ->
-            ets:new(quic_discovery_static_nodes,
-                    [named_table, public, set, {read_concurrency, true}]);
+            ets:new(
+                quic_discovery_static_nodes,
+                [named_table, public, set, {read_concurrency, true}]
+            );
         _ ->
             ok
     end.
@@ -383,7 +403,6 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
                     %% Early boot mode - start standalone listener
                     start_standalone_listener(Name, Port, Opts)
             end;
-
         {error, Reason} ->
             {error, {credentials, Reason}}
     end.
@@ -477,8 +496,10 @@ maybe_map_nat_port(_, Port) ->
 do_map_port(Port) ->
     case quic_dist_nat:map_port(Port) of
         {ok, ExternalPort} ->
-            error_logger:info_msg("quic_dist: NAT port mapping created ~p -> ~p~n",
-                                  [Port, ExternalPort]),
+            error_logger:info_msg(
+                "quic_dist: NAT port mapping created ~p -> ~p~n",
+                [Port, ExternalPort]
+            ),
             ExternalPort;
         {error, Reason} ->
             error_logger:warning_msg("quic_dist: NAT port mapping failed: ~p~n", [Reason]),
@@ -518,10 +539,10 @@ deferred_nat_mapping_loop(Port, Retries) ->
 
 %% @private
 %% Load TLS credentials from files or config.
-load_credentials(#quic_dist_config{cert = Cert, key = Key, cacert = CACert})
-  when Cert =/= undefined, Key =/= undefined ->
+load_credentials(#quic_dist_config{cert = Cert, key = Key, cacert = CACert}) when
+    Cert =/= undefined, Key =/= undefined
+->
     {ok, Cert, Key, CACert};
-
 load_credentials(#quic_dist_config{
     cert_file = CertFile,
     key_file = KeyFile,
@@ -535,44 +556,48 @@ load_credentials(#quic_dist_config{
         [{'Certificate', CertDer, _}] = public_key:pem_decode(CertPem),
 
         %% Decode private key - must be fully decoded record for crypto:sign
-        KeyDer = case public_key:pem_decode(KeyPem) of
-            [{'RSAPrivateKey', Der, not_encrypted}] ->
-                public_key:der_decode('RSAPrivateKey', Der);
-            [{'ECPrivateKey', Der, not_encrypted}] ->
-                public_key:der_decode('ECPrivateKey', Der);
-            [{'PrivateKeyInfo', Der, not_encrypted}] ->
-                %% PKCS#8 format - decode and extract the key
-                public_key:der_decode('PrivateKeyInfo', Der);
-            [{Type, Der, not_encrypted}] ->
-                %% Fallback - try to decode as the specified type
-                public_key:der_decode(Type, Der);
-            [Entry] ->
-                Entry
-        end,
+        KeyDer =
+            case public_key:pem_decode(KeyPem) of
+                [{'RSAPrivateKey', Der, not_encrypted}] ->
+                    public_key:der_decode('RSAPrivateKey', Der);
+                [{'ECPrivateKey', Der, not_encrypted}] ->
+                    public_key:der_decode('ECPrivateKey', Der);
+                [{'PrivateKeyInfo', Der, not_encrypted}] ->
+                    %% PKCS#8 format - decode and extract the key
+                    public_key:der_decode('PrivateKeyInfo', Der);
+                [{Type, Der, not_encrypted}] ->
+                    %% Fallback - try to decode as the specified type
+                    public_key:der_decode(Type, Der);
+                [Entry] ->
+                    Entry
+            end,
 
         %% Load CA certificate if provided
-        CACertDer = case CACertFile of
-            undefined -> undefined;
-            _ ->
-                {ok, CACertPem} = file:read_file(CACertFile),
-                [{'Certificate', CADer, _}] = public_key:pem_decode(CACertPem),
-                CADer
-        end,
+        CACertDer =
+            case CACertFile of
+                undefined ->
+                    undefined;
+                _ ->
+                    {ok, CACertPem} = file:read_file(CACertFile),
+                    [{'Certificate', CADer, _}] = public_key:pem_decode(CACertPem),
+                    CADer
+            end,
 
         {ok, CertDer, KeyDer, CACertDer}
     catch
         _:Reason ->
             {error, {load_credentials, Reason}}
     end;
-
 load_credentials(_) ->
     {error, no_credentials}.
 
 %% @private
 %% Handle a new incoming QUIC connection.
 handle_new_connection(ConnPid, ConnRef) ->
-    error_logger:info_msg("quic_dist: handle_new_connection called, ConnPid=~p, ConnRef=~p~n",
-                          [ConnPid, ConnRef]),
+    error_logger:info_msg(
+        "quic_dist: handle_new_connection called, ConnPid=~p, ConnRef=~p~n",
+        [ConnPid, ConnRef]
+    ),
     %% Start distribution controller for this connection
     case quic_dist_controller:start_link(ConnPid, ConnRef, server) of
         {ok, ControllerPid} ->
@@ -580,15 +605,17 @@ handle_new_connection(ConnPid, ConnRef) ->
             %% Notify the acceptor about the new connection
             %% The server name is based on the short node name (before @)
             NodeName = node(),
-            ShortName = case NodeName of
-                nonode@nohost -> nonode;
-                _ ->
-                    NodeStr = atom_to_list(NodeName),
-                    case string:split(NodeStr, "@") of
-                        [Name, _Host] -> list_to_atom(Name);
-                        [Name] -> list_to_atom(Name)
-                    end
-            end,
+            ShortName =
+                case NodeName of
+                    nonode@nohost ->
+                        nonode;
+                    _ ->
+                        NodeStr = atom_to_list(NodeName),
+                        case string:split(NodeStr, "@") of
+                            [Name, _Host] -> list_to_atom(Name);
+                            [Name] -> list_to_atom(Name)
+                        end
+                end,
             ServerName = dist_server_name(ShortName),
             case persistent_term:get({quic_dist_acceptor, ServerName}, undefined) of
                 undefined ->
@@ -625,7 +652,6 @@ acceptor_loop(Kernel, #quic_dist_listener{} = Listener, Pending) ->
             Kernel ! {accept, self(), DistCtrl, inet, quic},
             %% Continue accepting
             acceptor_loop(Kernel, Listener, Pending);
-
         {Kernel, controller, SpawnedPid} ->
             %% Kernel notifying us about the controller process - SpawnedPid is the do_accept_connection process
             %% Lookup by SpawnedPid to find the waiting entry
@@ -633,7 +659,9 @@ acceptor_loop(Kernel, #quic_dist_listener{} = Listener, Pending) ->
             case maps:get(SpawnedPid, Pending, undefined) of
                 undefined ->
                     %% No registration yet - buffer with ready state
-                    acceptor_loop(Kernel, Listener, maps:put(SpawnedPid, {ready, undefined}, Pending));
+                    acceptor_loop(
+                        Kernel, Listener, maps:put(SpawnedPid, {ready, undefined}, Pending)
+                    );
                 {waiting, DistCtrl} ->
                     %% Someone waiting - set supervisor and respond only to SpawnedPid
                     ok = quic_dist_controller:set_supervisor(DistCtrl, Kernel),
@@ -643,14 +671,15 @@ acceptor_loop(Kernel, #quic_dist_listener{} = Listener, Pending) ->
                     %% Already ready (shouldn't happen), just continue
                     acceptor_loop(Kernel, Listener, Pending)
             end;
-
         {register_pending, DistCtrl, SpawnedPid} ->
             %% Register a pending do_accept_connection process
             %% SpawnedPid is self() of do_accept_connection, DistCtrl is the controller
             case maps:get(SpawnedPid, Pending, undefined) of
                 undefined ->
                     %% Not ready yet - register as waiting
-                    acceptor_loop(Kernel, Listener, maps:put(SpawnedPid, {waiting, DistCtrl}, Pending));
+                    acceptor_loop(
+                        Kernel, Listener, maps:put(SpawnedPid, {waiting, DistCtrl}, Pending)
+                    );
                 {ready, _} ->
                     %% Kernel already sent controller message - set supervisor and respond only to SpawnedPid
                     ok = quic_dist_controller:set_supervisor(DistCtrl, Kernel),
@@ -658,16 +687,15 @@ acceptor_loop(Kernel, #quic_dist_listener{} = Listener, Pending) ->
                     acceptor_loop(Kernel, Listener, maps:remove(SpawnedPid, Pending));
                 {waiting, _} ->
                     %% Already waiting (shouldn't happen), replace
-                    acceptor_loop(Kernel, Listener, maps:put(SpawnedPid, {waiting, DistCtrl}, Pending))
+                    acceptor_loop(
+                        Kernel, Listener, maps:put(SpawnedPid, {waiting, DistCtrl}, Pending)
+                    )
             end;
-
         {_From, {accept_pending, _Controller, _MyNode, _Allowed, _SetupTime}} ->
             %% Connection pending, continue
             acceptor_loop(Kernel, Listener, Pending);
-
         stop ->
             ok;
-
         _Other ->
             acceptor_loop(Kernel, Listener, Pending)
     end.
@@ -678,26 +706,37 @@ acceptor_loop(Kernel, #quic_dist_listener{} = Listener, Pending) ->
 
 %% @private
 do_accept_connection(AcceptPid, DistCtrl, MyNode, Allowed, SetupTime, Kernel) ->
-    error_logger:info_msg("do_accept_connection: waiting for controller message from ~p~n", [AcceptPid]),
+    error_logger:info_msg("do_accept_connection: waiting for controller message from ~p~n", [
+        AcceptPid
+    ]),
     receive
         {AcceptPid, controller} ->
-            error_logger:info_msg("do_accept_connection: got controller, starting handshake. MyNode=~p, Kernel=~p~n", [MyNode, Kernel]),
+            error_logger:info_msg(
+                "do_accept_connection: got controller, starting handshake. MyNode=~p, Kernel=~p~n",
+                [MyNode, Kernel]
+            ),
             Timer = dist_util:start_timer(SetupTime),
             HSData = create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel),
-            error_logger:info_msg("do_accept_connection: HSData created, kernel_pid=~p~n",
-                                  [HSData#hs_data.kernel_pid]),
+            error_logger:info_msg(
+                "do_accept_connection: HSData created, kernel_pid=~p~n",
+                [HSData#hs_data.kernel_pid]
+            ),
             try
                 Result = dist_util:handshake_other_started(HSData),
                 error_logger:info_msg("do_accept_connection: handshake result: ~p~n", [Result]),
                 Result
             catch
                 Class:Reason:Stack ->
-                    error_logger:error_msg("do_accept_connection: handshake crashed: ~p:~p~n~p~n",
-                                           [Class, Reason, Stack]),
+                    error_logger:error_msg(
+                        "do_accept_connection: handshake crashed: ~p:~p~n~p~n",
+                        [Class, Reason, Stack]
+                    ),
                     erlang:raise(Class, Reason, Stack)
             end
     after 5000 ->
-        error_logger:error_msg("do_accept_connection: TIMEOUT waiting for controller from ~p~n", [AcceptPid]),
+        error_logger:error_msg("do_accept_connection: TIMEOUT waiting for controller from ~p~n", [
+            AcceptPid
+        ]),
         exit(controller_timeout)
     end.
 
@@ -711,8 +750,7 @@ do_setup(Kernel, Node, Type, MyNode, LongOrShortNames, SetupTime) ->
     %% Ensure quic application is started
     case ensure_quic_started() of
         ok -> ok;
-        {error, AppReason} ->
-            ?shutdown2(Node, {quic_app_start_failed, AppReason})
+        {error, AppReason} -> ?shutdown2(Node, {quic_app_start_failed, AppReason})
     end,
 
     %% Start setup timer
@@ -826,7 +864,8 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                 cert => Cert,
                 key => Key,
                 alpn => [?QUIC_DIST_ALPN],
-                verify => false  % TODO: Enable proper verification
+                % TODO: Enable proper verification
+                verify => false
             },
 
             %% Convert IP to host format expected by QUIC
@@ -840,7 +879,6 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                 {error, Reason} ->
                     ?shutdown2(Node, {connect_failed, Reason})
             end;
-
         {error, Reason} ->
             ?shutdown2(Node, {credentials, Reason})
     end.
@@ -862,13 +900,10 @@ wait_for_connection(Kernel, Node, ConnRef, MyNode, Type, Timer) ->
                     quic:close(ConnRef, normal),
                     ?shutdown2(Node, {controller_failed, Reason})
             end;
-
         {quic, ConnRef, {closed, Reason}} ->
             ?shutdown2(Node, {closed, Reason});
-
         {quic, ConnRef, {transport_error, Code, Reason}} ->
             ?shutdown2(Node, {transport_error, Code, Reason});
-
         {'EXIT', Timer, setup_timer_timeout} ->
             quic:close(ConnRef, timeout),
             ?shutdown2(Node, connect_timeout)
@@ -883,8 +918,10 @@ wait_for_connection(Kernel, Node, ConnRef, MyNode, Type, Timer) ->
 create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel) ->
     %% Capture SetupPid (self) for dist_ctrlr message
     SetupPid = self(),
-    error_logger:info_msg("create_hs_data: Kernel=~p, DistCtrl=~p, SetupPid=~p~n",
-                          [Kernel, DistCtrl, SetupPid]),
+    error_logger:info_msg(
+        "create_hs_data: Kernel=~p, DistCtrl=~p, SetupPid=~p~n",
+        [Kernel, DistCtrl, SetupPid]
+    ),
     #hs_data{
         kernel_pid = Kernel,
         other_node = undefined,
@@ -898,7 +935,7 @@ create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel) ->
             %% Receive data and try to extract node name if this is the name message
             Result = quic_dist_controller:recv(Ctrl, Len, Timeout),
             case Result of
-                {ok, Data} when is_list(Data) ->
+                {ok, Data} ->
                     %% Try to parse name message and store node in controller
                     maybe_extract_node(Data, Ctrl),
                     Result;
@@ -909,8 +946,15 @@ create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel) ->
         f_setopts_pre_nodeup = fun(Ctrl) ->
             %% Just log and return ok - inet_tcp_dist doesn't do anything special here
             StoredNode = get_stored_node(Ctrl),
-            error_logger:info_msg("f_setopts_pre_nodeup (accept): Ctrl=~p, Node=~p, SetupPid=~p, linked=~p~n",
-                                  [Ctrl, StoredNode, SetupPid, lists:member(Ctrl, element(2, process_info(self(), links)))]),
+            error_logger:info_msg(
+                "f_setopts_pre_nodeup (accept): Ctrl=~p, Node=~p, SetupPid=~p, linked=~p~n",
+                [
+                    Ctrl,
+                    StoredNode,
+                    SetupPid,
+                    lists:member(Ctrl, element(2, process_info(self(), links)))
+                ]
+            ),
             ok
         end,
         f_setopts_post_nodeup = fun(_Ctrl) -> ok end,
@@ -925,8 +969,10 @@ create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel) ->
         mf_getopts = fun(_Ctrl, Opts) -> {ok, [{O, 0} || O <- Opts]} end,
         allowed = Allowed,
         f_handshake_complete = fun(Ctrl, HsNode, DHandle) ->
-            error_logger:info_msg("f_handshake_complete (accept): Ctrl=~p, Node=~p, DHandle=~p~n",
-                                  [Ctrl, HsNode, DHandle]),
+            error_logger:info_msg(
+                "f_handshake_complete (accept): Ctrl=~p, Node=~p, DHandle=~p~n",
+                [Ctrl, HsNode, DHandle]
+            ),
             %% Notify controller that handshake is complete
             %% Pass DHandle so controller can use dist_ctrl_* functions
             Ctrl ! {handshake_complete, HsNode, DHandle},
@@ -945,7 +991,8 @@ maybe_extract_node([H | Rest], Ctrl) when H =:= $N; H =:= $n ->
             $N ->
                 %% Protocol version 6 format
                 RestBin = list_to_binary(Rest),
-                <<_Flags:64/big, _Creation:32/big, NameLen:16/big, NameBin:NameLen/binary, _/binary>> = RestBin,
+                <<_Flags:64/big, _Creation:32/big, NameLen:16/big, NameBin:NameLen/binary,
+                    _/binary>> = RestBin,
                 Node = binary_to_atom(NameBin, utf8),
                 quic_dist_controller:set_node(Ctrl, Node);
             $n ->
@@ -976,8 +1023,10 @@ get_stored_node(Ctrl) ->
 create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer) ->
     %% Capture SetupPid (self) for dist_ctrlr message
     SetupPid = self(),
-    error_logger:info_msg("create_hs_data_setup: Kernel=~p, DistCtrl=~p, Node=~p, SetupPid=~p~n",
-                          [Kernel, DistCtrl, Node, SetupPid]),
+    error_logger:info_msg(
+        "create_hs_data_setup: Kernel=~p, DistCtrl=~p, Node=~p, SetupPid=~p~n",
+        [Kernel, DistCtrl, Node, SetupPid]
+    ),
     #hs_data{
         kernel_pid = Kernel,
         other_node = Node,
@@ -990,8 +1039,10 @@ create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer) ->
         f_recv = fun(Ctrl, Len, Timeout) -> quic_dist_controller:recv(Ctrl, Len, Timeout) end,
         f_setopts_pre_nodeup = fun(Ctrl) ->
             %% Just log and return ok - inet_tcp_dist doesn't do anything special here
-            error_logger:info_msg("f_setopts_pre_nodeup (setup): Ctrl=~p, Node=~p, SetupPid=~p, linked=~p~n",
-                                  [Ctrl, Node, SetupPid, lists:member(Ctrl, element(2, process_info(self(), links)))]),
+            error_logger:info_msg(
+                "f_setopts_pre_nodeup (setup): Ctrl=~p, Node=~p, SetupPid=~p, linked=~p~n",
+                [Ctrl, Node, SetupPid, lists:member(Ctrl, element(2, process_info(self(), links)))]
+            ),
             ok
         end,
         f_setopts_post_nodeup = fun(_Ctrl) -> ok end,
@@ -1005,8 +1056,10 @@ create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer) ->
         mf_setopts = fun(_Ctrl, _Opts) -> ok end,
         mf_getopts = fun(_Ctrl, Opts) -> {ok, [{O, 0} || O <- Opts]} end,
         f_handshake_complete = fun(Ctrl, HsNode, DHandle) ->
-            error_logger:info_msg("f_handshake_complete (setup): Ctrl=~p, Node=~p, DHandle=~p~n",
-                                  [Ctrl, HsNode, DHandle]),
+            error_logger:info_msg(
+                "f_handshake_complete (setup): Ctrl=~p, Node=~p, DHandle=~p~n",
+                [Ctrl, HsNode, DHandle]
+            ),
             %% Notify controller that handshake is complete
             %% Pass DHandle so controller can use dist_ctrl_* functions
             Ctrl ! {handshake_complete, HsNode, DHandle},
