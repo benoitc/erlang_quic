@@ -340,3 +340,48 @@ ack_ranges_encode_decode_roundtrip_test() ->
 ack_ranges_convert_empty_test() ->
     %% This should not happen in practice, but test defensive behavior
     ?assertError(function_clause, quic_connection:convert_ack_ranges_for_encode([])).
+
+%%====================================================================
+%% Queue Limit Tests
+%%====================================================================
+
+%% Test that send_queue_bytes is tracked in connection state
+send_queue_bytes_in_state_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {_State, Info} = quic_connection:get_state(Pid),
+
+    %% Should have send_queue_bytes field in state info
+    ?assert(maps:is_key(send_queue_bytes, Info)),
+    ?assertEqual(0, maps:get(send_queue_bytes, Info)),
+
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% Test that recv_buffer_bytes is tracked in connection state
+recv_buffer_bytes_in_state_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {_State, Info} = quic_connection:get_state(Pid),
+
+    %% Should have recv_buffer_bytes field in state info
+    ?assert(maps:is_key(recv_buffer_bytes, Info)),
+    ?assertEqual(0, maps:get(recv_buffer_bytes, Info)),
+
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% Test that state info contains both queue counters
+state_info_contains_queue_counters_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {_State, Info} = quic_connection:get_state(Pid),
+
+    %% Verify both counters are present
+    RequiredKeys = [send_queue_bytes, recv_buffer_bytes, data_sent, data_received],
+    lists:foreach(
+        fun(Key) ->
+            ?assert(maps:is_key(Key, Info), {missing_key, Key})
+        end,
+        RequiredKeys
+    ),
+
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
