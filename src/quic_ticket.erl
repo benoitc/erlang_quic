@@ -218,7 +218,6 @@ build_new_session_ticket(#session_ticket{
     Extensions =
         case MaxEarlyData of
             0 -> <<>>;
-            % early_data extension
             _ -> <<16#00, 16#2a, 4:16, ?QUIC_MAX_EARLY_DATA_SIZE:32>>
         end,
     ExtLen = byte_size(Extensions),

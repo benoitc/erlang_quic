@@ -142,6 +142,54 @@ parse_new_session_ticket_invalid_test() ->
     ?assertEqual({error, invalid_format}, quic_ticket:parse_new_session_ticket(<<1, 2, 3>>)).
 
 %%====================================================================
+%% NewSessionTicket Building Tests
+%%====================================================================
+
+build_new_session_ticket_no_early_data_test() ->
+    Ticket = #session_ticket{
+        server_name = <<"example.com">>,
+        ticket = <<"ticket_data">>,
+        lifetime = 3600,
+        age_add = 12345,
+        nonce = <<1, 2, 3, 4>>,
+        resumption_secret = crypto:strong_rand_bytes(32),
+        max_early_data = 0,
+        received_at = erlang:system_time(second),
+        cipher = aes_128_gcm
+    },
+    Message = quic_ticket:build_new_session_ticket(Ticket),
+    {ok, Parsed} = quic_ticket:parse_new_session_ticket(Message),
+    ?assertEqual(0, maps:get(max_early_data, Parsed)).
+
+%% RFC 9001 Section 4.6.1: QUIC requires max_early_data_size to be 0xffffffff
+%% on the wire. Strict clients like quiche/curl reject other values.
+build_new_session_ticket_rfc9001_max_early_data_test() ->
+    Ticket = #session_ticket{
+        server_name = <<"example.com">>,
+        ticket = <<"ticket_data">>,
+        lifetime = 3600,
+        age_add = 12345,
+        nonce = <<1, 2, 3, 4>>,
+        resumption_secret = crypto:strong_rand_bytes(32),
+        max_early_data = 16384,
+        received_at = erlang:system_time(second),
+        cipher = aes_128_gcm
+    },
+    Message = quic_ticket:build_new_session_ticket(Ticket),
+    {ok, Parsed} = quic_ticket:parse_new_session_ticket(Message),
+    %% Regardless of input max_early_data, wire value must be 0xFFFFFFFF
+    ?assertEqual(16#FFFFFFFF, maps:get(max_early_data, Parsed)).
+
+build_new_session_ticket_roundtrip_test() ->
+    Ticket = create_test_ticket(<<"example.com">>),
+    Message = quic_ticket:build_new_session_ticket(Ticket),
+    {ok, Parsed} = quic_ticket:parse_new_session_ticket(Message),
+    ?assertEqual(Ticket#session_ticket.lifetime, maps:get(lifetime, Parsed)),
+    ?assertEqual(Ticket#session_ticket.age_add, maps:get(age_add, Parsed)),
+    ?assertEqual(Ticket#session_ticket.nonce, maps:get(nonce, Parsed)),
+    ?assertEqual(Ticket#session_ticket.ticket, maps:get(ticket, Parsed)).
+
+%%====================================================================
 %% Resumption Secret Tests
 %%====================================================================
 

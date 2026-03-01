@@ -172,7 +172,7 @@ new_session_ticket_roundtrip_test() ->
     ?assertEqual(Ticket#session_ticket.age_add, maps:get(age_add, Parsed)),
     ?assertEqual(Ticket#session_ticket.nonce, maps:get(nonce, Parsed)),
     ?assertEqual(Ticket#session_ticket.ticket, maps:get(ticket, Parsed)),
-    %% RFC 9001 Section 4.6.1: QUIC requires max_early_data_size to be 0xFFFFFFFF on wire
+    %% QUIC NewSessionTicket carries early_data as 0xffffffff when enabled.
     ?assertEqual(16#FFFFFFFF, maps:get(max_early_data, Parsed)).
 
 %% Test ticket with no early data extension
