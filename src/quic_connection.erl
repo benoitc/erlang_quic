@@ -3865,7 +3865,7 @@ do_open_stream(
         streams = Streams
     } = State
 ) ->
-    %% Count streams WE initiated (not peer-initiated)
+    %% RFC 9000 §4.6: Check cumulative stream count against peer's limit.
     LocalPattern =
         case Role of
             % Client-initiated bidi = 0x00
@@ -3873,16 +3873,9 @@ do_open_stream(
             % Server-initiated bidi = 0x01
             server -> 1
         end,
-    StreamCount = maps:size(
-        maps:filter(
-            fun(Id, _) ->
-                (Id band 16#03) =:= LocalPattern
-            end,
-            Streams
-        )
-    ),
+    StreamIndex = (NextId - LocalPattern) div 4,
     if
-        StreamCount >= Max ->
+        StreamIndex >= Max ->
             {error, stream_limit};
         true ->
             %% Get peer's limit for streams WE initiate (bidi_remote from their perspective)
@@ -3916,7 +3909,11 @@ do_open_unidirectional_stream(
         streams = Streams
     } = State
 ) ->
-    %% Count uni streams WE initiated
+    %% RFC 9000 §4.6: MAX_STREAMS value of N permits opening streams with IDs
+    %% less than 4*N + stream_type_offset. Check against NextId (cumulative count
+    %% of streams opened) rather than current map size, since completed streams
+    %% remain in the map but should not block opening new ones once the peer
+    %% has increased the limit via MAX_STREAMS frames.
     LocalPattern =
         case Role of
             % Client-initiated uni = 0x02
@@ -3924,16 +3921,9 @@ do_open_unidirectional_stream(
             % Server-initiated uni = 0x03
             server -> 3
         end,
-    StreamCount = maps:size(
-        maps:filter(
-            fun(Id, _) ->
-                (Id band 16#03) =:= LocalPattern
-            end,
-            Streams
-        )
-    ),
+    StreamIndex = (NextId - LocalPattern) div 4,
     if
-        StreamCount >= Max ->
+        StreamIndex >= Max ->
             {error, stream_limit};
         true ->
             %% Unidirectional streams are send-only for the initiator
@@ -4067,9 +4057,15 @@ do_send_data(
                             %% Queue for later - MUST return the updated state with queued data!
                             case queue_stream_data(StreamId, Offset, DataBin, Fin, State) of
                                 {ok, QueuedState} ->
+                                    %% Advance send_offset so subsequent sends use the correct offset.
+                                    %% Without this, multiple sends while blocked would all queue at
+                                    %% the same offset, causing stream data corruption on dequeue.
+                                    QueuedState2 = advance_stream_send_offset(
+                                        StreamId, Offset + DataSize, Fin, QueuedState
+                                    ),
                                     %% RFC 9000 Section 19.12: DATA_BLOCKED reports the connection data limit
                                     BlockedFrame = quic_frame:encode({data_blocked, MaxDataRemote}),
-                                    FinalState = send_app_packet(BlockedFrame, QueuedState),
+                                    FinalState = send_app_packet(BlockedFrame, QueuedState2),
                                     {ok, FinalState};
                                 {error, send_queue_full} ->
                                     {error, send_queue_full}
@@ -4088,19 +4084,23 @@ do_send_data(
                             %% Queue for later - MUST return the updated state with queued data!
                             case queue_stream_data(StreamId, Offset, DataBin, Fin, State) of
                                 {ok, QueuedState} ->
+                                    %% Advance send_offset (see connection-blocked comment above)
+                                    QueuedState2 = advance_stream_send_offset(
+                                        StreamId, Offset + DataSize, Fin, QueuedState
+                                    ),
                                     %% RFC 9000 Section 19.13: STREAM_DATA_BLOCKED reports the stream data limit
                                     BlockedFrame = quic_frame:encode(
                                         {stream_data_blocked, StreamId, SendMaxData}
                                     ),
-                                    FinalState = send_app_packet(BlockedFrame, QueuedState),
+                                    FinalState = send_app_packet(BlockedFrame, QueuedState2),
                                     {ok, FinalState};
                                 {error, send_queue_full} ->
                                     {error, send_queue_full}
                             end;
                         {true, true} ->
                             %% Flow control allows sending
-                            %% Fragment and send data - let it handle state updates per fragment
-                            %% This ensures send_offset/data_sent are only updated for data actually sent
+                            %% Fragment and send data - congestion control may partially
+                            %% send and queue the remainder
                             case
                                 send_stream_data_fragmented_tracked(
                                     StreamId, Offset, DataBin, Fin, State
@@ -4109,11 +4109,13 @@ do_send_data(
                                 {error, send_queue_full} ->
                                     {error, send_queue_full};
                                 {NewState, BytesSent} ->
-                                    %% Update stream state based on what was actually sent
+                                    %% Advance send_offset by full DataSize (not just BytesSent),
+                                    %% because any unsent remainder was queued with correct offsets
+                                    %% and subsequent sends must not overlap.
                                     case maps:find(StreamId, NewState#state.streams) of
                                         {ok, UpdatedStream} ->
                                             FinalStream = UpdatedStream#stream_state{
-                                                send_offset = Offset + BytesSent,
+                                                send_offset = Offset + DataSize,
                                                 send_fin = (Fin andalso BytesSent =:= DataSize)
                                             },
                                             FinalState = NewState#state{
@@ -4330,6 +4332,20 @@ queue_stream_data(
             {ok, State#state{send_queue = NewPQ, send_queue_bytes = NewQueueBytes}}
     end.
 
+%% Advance a stream's send_offset without actually sending data.
+%% Called when data is queued so that subsequent sends use the correct offset.
+advance_stream_send_offset(StreamId, NewOffset, Fin, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            UpdatedStream = Stream#stream_state{
+                send_offset = NewOffset,
+                send_fin = Fin orelse Stream#stream_state.send_fin
+            },
+            State#state{streams = maps:put(StreamId, UpdatedStream, Streams)};
+        error ->
+            State
+    end.
+
 %% Get stream urgency (default 3 if stream not found)
 get_stream_urgency(StreamId, Streams) ->
     case maps:find(StreamId, Streams) of
@@ -4398,7 +4414,7 @@ check_send_queue_flow_control(StreamId, DataSize, #state{
 
 %% Actually process the queue entry (called after flow control check passes)
 process_send_queue_entry(
-    #state{send_queue = PQ, streams = Streams, send_queue_bytes = QueueBytes} = State
+    #state{send_queue = PQ, send_queue_bytes = QueueBytes} = State
 ) ->
     case pqueue_out(PQ) of
         {empty, _} ->
@@ -4409,11 +4425,9 @@ process_send_queue_entry(
             DataSize = iolist_size(Data),
             DecrementedQueueBytes = max(0, QueueBytes - DataSize),
             State1 = State#state{send_queue = NewPQ, send_queue_bytes = DecrementedQueueBytes},
-            %% Use tracked sender to properly update send_offset/data_sent
             case send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State1) of
                 {error, send_queue_full} ->
                     %% Edge case: dequeued data couldn't be re-queued
-                    %% This is rare - only happens if queue filled up between dequeue and re-queue
                     ?LOG_WARNING(
                         #{
                             what => send_queue_overflow_on_requeue,
@@ -4424,25 +4438,15 @@ process_send_queue_entry(
                     ),
                     State1;
                 {State2, BytesSent} ->
-                    %% Update stream state with bytes actually sent
+                    %% Only update data_sent for connection-level flow control accounting.
+                    %% send_offset was already advanced when the data was first queued
+                    %% (in do_send_data) to prevent offset overlap bugs.
                     State3 =
                         case BytesSent > 0 of
                             true ->
-                                case maps:find(StreamId, Streams) of
-                                    {ok, Stream} ->
-                                        NewStream = Stream#stream_state{
-                                            send_offset =
-                                                Stream#stream_state.send_offset + BytesSent
-                                        },
-                                        State2#state{
-                                            streams = maps:put(
-                                                StreamId, NewStream, State2#state.streams
-                                            ),
-                                            data_sent = State2#state.data_sent + BytesSent
-                                        };
-                                    error ->
-                                        State2
-                                end;
+                                State2#state{
+                                    data_sent = State2#state.data_sent + BytesSent
+                                };
                             false ->
                                 State2
                         end,
