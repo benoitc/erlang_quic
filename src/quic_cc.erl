@@ -23,6 +23,9 @@
 
 -module(quic_cc).
 
+-include_lib("kernel/include/logger.hrl").
+-define(QUIC_LOG_META, #{domain => [erlang_quic, congestion_control]}).
+
 -export([
     %% State management
     new/0,
@@ -104,10 +107,25 @@ new() ->
     new(#{}).
 
 %% @doc Create a new congestion control state with options.
+%% Options:
+%%   - max_datagram_size: Maximum datagram size (default: 1200)
+%%   - initial_window: Override initial congestion window (default: RFC 9002 formula)
+%%                     Higher values can improve throughput for bulk transfers.
+%%                     Recommended: 32768 (32KB) or 65536 (64KB) for LAN/distribution.
 -spec new(map()) -> cc_state().
 new(Opts) ->
     MaxDatagramSize = maps:get(max_datagram_size, Opts, ?MAX_DATAGRAM_SIZE),
-    InitialWindow = initial_window(MaxDatagramSize),
+    DefaultWindow = initial_window(MaxDatagramSize),
+    InitialWindow = maps:get(initial_window, Opts, DefaultWindow),
+    ?LOG_DEBUG(
+        #{
+            what => cc_state_initialized,
+            initial_cwnd => InitialWindow,
+            default_cwnd => DefaultWindow,
+            max_datagram_size => MaxDatagramSize
+        },
+        ?QUIC_LOG_META
+    ),
     #cc_state{
         cwnd = InitialWindow,
         ssthresh = infinity,
@@ -149,6 +167,7 @@ on_packets_acked(State, AckedBytes) ->
 on_packets_acked(
     #cc_state{
         bytes_in_flight = InFlight,
+        cwnd = OldCwnd,
         in_recovery = true,
         recovery_start_time = RecoveryStart
     } = State,
@@ -172,6 +191,18 @@ on_packets_acked(
                         Increment = (MaxDS * AckedBytes) div max(Cwnd, 1),
                         Cwnd + max(Increment, 1)
                 end,
+            ?LOG_DEBUG(
+                #{
+                    what => cc_ack_exit_recovery,
+                    acked_bytes => AckedBytes,
+                    old_cwnd => OldCwnd,
+                    new_cwnd => NewCwnd,
+                    old_in_flight => InFlight,
+                    new_in_flight => NewInFlight,
+                    ssthresh => SSThresh
+                },
+                ?QUIC_LOG_META
+            ),
             State#cc_state{
                 bytes_in_flight = NewInFlight,
                 in_recovery = false,
@@ -180,6 +211,16 @@ on_packets_acked(
             };
         false ->
             %% Still in recovery, don't increase cwnd
+            ?LOG_DEBUG(
+                #{
+                    what => cc_ack_in_recovery,
+                    acked_bytes => AckedBytes,
+                    cwnd => OldCwnd,
+                    old_in_flight => InFlight,
+                    new_in_flight => NewInFlight
+                },
+                ?QUIC_LOG_META
+            ),
             State#cc_state{bytes_in_flight = NewInFlight}
     end;
 on_packets_acked(
@@ -195,8 +236,9 @@ on_packets_acked(
     NewInFlight = max(0, InFlight - AckedBytes),
 
     %% Increase cwnd based on phase
+    InSlowStart = Cwnd < SSThresh,
     NewCwnd =
-        case Cwnd < SSThresh of
+        case InSlowStart of
             true ->
                 %% Slow start: increase by bytes acked
                 Cwnd + AckedBytes;
@@ -206,6 +248,20 @@ on_packets_acked(
                 Increment = (MaxDS * AckedBytes) div max(Cwnd, 1),
                 Cwnd + max(Increment, 1)
         end,
+
+    ?LOG_DEBUG(
+        #{
+            what => cc_ack_processed,
+            acked_bytes => AckedBytes,
+            old_cwnd => Cwnd,
+            new_cwnd => NewCwnd,
+            old_in_flight => InFlight,
+            new_in_flight => NewInFlight,
+            ssthresh => SSThresh,
+            slow_start => InSlowStart
+        },
+        ?QUIC_LOG_META
+    ),
 
     State#cc_state{
         cwnd = NewCwnd,
@@ -232,7 +288,7 @@ on_congestion_event(
     %% Already in recovery for this event
     State;
 on_congestion_event(
-    #cc_state{cwnd = Cwnd, max_datagram_size = MaxDS} = State,
+    #cc_state{cwnd = Cwnd, bytes_in_flight = InFlight, max_datagram_size = MaxDS} = State,
     SentTime
 ) ->
     Now = erlang:monotonic_time(millisecond),
@@ -242,6 +298,18 @@ on_congestion_event(
     %% cwnd = max(ssthresh, kMinimumWindow)
     NewSSThresh = max(trunc(Cwnd * ?LOSS_REDUCTION_FACTOR), minimum_window(MaxDS)),
     NewCwnd = max(NewSSThresh, minimum_window(MaxDS)),
+
+    ?LOG_DEBUG(
+        #{
+            what => cc_congestion_event,
+            old_cwnd => Cwnd,
+            new_cwnd => NewCwnd,
+            ssthresh => NewSSThresh,
+            bytes_in_flight => InFlight,
+            sent_time => SentTime
+        },
+        ?QUIC_LOG_META
+    ),
 
     State#cc_state{
         cwnd = NewCwnd,

@@ -252,6 +252,16 @@
 % 25ms
 -define(DEFAULT_MAX_ACK_DELAY, 25).
 
+%% Congestion Control - Initial Window
+%% RFC 9002 default: min(10 * max_datagram_size, max(14720, 2 * max_datagram_size))
+%% = ~14720 bytes for 1200 byte datagrams (~12 packets)
+%% For distribution/bulk transfer workloads, a higher initial window reduces
+%% slow start duration and improves throughput for large messages.
+% 64KB - recommended for distribution/LAN
+-define(INITIAL_WINDOW_DISTRIBUTION, 65536).
+% 128KB - aggressive for high-bandwidth LAN
+-define(INITIAL_WINDOW_AGGRESSIVE, 131072).
+
 %%====================================================================
 %% Records
 %%====================================================================
