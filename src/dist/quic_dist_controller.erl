@@ -314,6 +314,10 @@ setup_streams(#state{role = server} = State) ->
 
 handshaking(enter, _OldState, _State) ->
     keep_state_and_data;
+%% Handle tick during handshake - send empty frame to keep connection alive
+handshaking(cast, tick, State) ->
+    send_tick_frame(State),
+    {keep_state, State};
 %% Handle send during handshake
 handshaking({call, From}, {send, Data}, State) ->
     case do_send_control(Data, State) of
@@ -363,8 +367,8 @@ handshaking(info, {handshake_complete, Node, DHandle}, State) ->
     %% Register input handler with VM
     ok = erlang:dist_ctrl_input_handler(DHandle, InputHandler),
 
-    %% Request notification when outgoing data is available
-    erlang:dist_ctrl_get_data_notification(DHandle),
+    %% DON'T notify here - wait until we're in connected state
+    %% The notification happens in the connected state's enter callback
 
     State1 = State0#state{
         node = Node,
@@ -384,8 +388,20 @@ handshaking(EventType, Event, State) ->
 %% State: connected
 %%====================================================================
 
+connected(enter, _OldState, #state{role = server, data_streams = [], dhandle = DHandle} = State) when
+    DHandle =/= undefined
+->
+    %% Server needs to open data streams for sending distribution data
+    NewState = open_server_data_streams(State),
+    %% Notify VM we're ready for data
+    erlang:dist_ctrl_get_data_notification(DHandle),
+    {keep_state, NewState};
+connected(enter, _OldState, #state{dhandle = DHandle} = _State) when DHandle =/= undefined ->
+    %% Client already has data streams, just notify VM we're ready
+    erlang:dist_ctrl_get_data_notification(DHandle),
+    keep_state_and_data;
 connected(enter, _OldState, _State) ->
-    %% No tick timer needed - VM handles tick scheduling via dist_data
+    %% No DHandle (shouldn't happen in normal flow)
     keep_state_and_data;
 %% Handle send in connected state (direct send, not from VM)
 connected({call, From}, {send, Data}, State) ->
@@ -407,17 +423,26 @@ connected({call, From}, {recv, Length}, State) ->
             {keep_state, State1#state{recv_waiters = Waiters}}
     end;
 %% Handle tick (from mf_tick callback)
+%% The Erlang distribution protocol handles ticks through dist_ctrl_get_data.
+%% We just need to flush any pending data. If nothing pending, send empty frame
+%% to generate activity (the receiver's dist_ctrl_put_data wakes up the VM).
 connected(cast, tick, #state{dhandle = DHandle} = State) when DHandle =/= undefined ->
-    %% Tick is handled via dist_data - just send any pending data
-    send_dist_data(State),
+    %% Flush pending distribution data - this handles the tick protocol
+    case send_dist_data_with_tick(State) of
+        sent -> ok;
+        %% Send empty frame for liveness
+        none -> send_tick_frame(State)
+    end,
     {keep_state, State};
 connected(cast, tick, State) ->
-    %% No DHandle, use old tick method
-    do_send_tick(State),
+    %% No DHandle yet, send empty frame to keep QUIC connection alive
+    send_tick_frame(State),
     {keep_state, State};
 %% Handle dist_data notification from VM
 %% This means the VM has data ready for us to send
-connected(info, dist_data, #state{dhandle = DHandle} = State) when DHandle =/= undefined ->
+connected(info, dist_data, #state{dhandle = DHandle} = State) when
+    DHandle =/= undefined
+->
     send_dist_data(State),
     %% Re-register for next notification
     erlang:dist_ctrl_get_data_notification(DHandle),
@@ -564,6 +589,10 @@ handle_common_event(
         ?QUIC_LOG_META
     ),
     {keep_state, State};
+%% Handle tick in any state (fallback)
+handle_common_event(cast, tick, _StateName, State) ->
+    send_tick_frame(State),
+    {keep_state, State};
 handle_common_event(_EventType, _Event, _StateName, State) ->
     {keep_state, State}.
 
@@ -671,86 +700,87 @@ do_send_data(Data, State) ->
     do_send_control(Data, State).
 
 %% @private
-%% Send a tick message on control stream.
-%% Uses tagged message format for stream separation.
-do_send_tick(#state{conn_ref = ConnRef, control_stream = StreamId}) ->
-    case StreamId of
-        undefined ->
-            ok;
-        _ ->
-            %% Send tagged tick message on control stream
-            Msg = <<?QUIC_DIST_MSG_TICK:8>>,
-            case quic:send_data(ConnRef, StreamId, Msg, false) of
-                ok -> ok;
-                {error, _Reason} -> ok
-            end
-    end.
-
-%% @private
-%% Send tick acknowledgment on control stream.
-send_tick_ack(#state{conn_ref = ConnRef, control_stream = StreamId}) ->
-    case StreamId of
-        undefined ->
-            ok;
-        _ ->
-            Msg = <<?QUIC_DIST_MSG_TICK_ACK:8>>,
-            quic:send_data(ConnRef, StreamId, Msg, false)
-    end.
+%% Send an empty frame on the data stream for tick/liveness.
+%% This uses the same framing as regular data (4-byte length prefix).
+%% An empty frame (length=0) signals liveness without actual payload.
+send_tick_frame(#state{conn_ref = ConnRef, data_streams = [FirstStream | _]}) ->
+    %% Send empty frame: <<0:32>> = 4-byte length header with length 0
+    quic:send_data(ConnRef, FirstStream, <<0:32/big-unsigned>>, false),
+    ok;
+send_tick_frame(#state{conn_ref = ConnRef, control_stream = CtrlStream}) when
+    CtrlStream =/= undefined
+->
+    %% Fallback to control stream if no data streams
+    quic:send_data(ConnRef, CtrlStream, <<0:32/big-unsigned>>, false),
+    ok;
+send_tick_frame(_State) ->
+    ok.
 
 %% @private
 %% Send distribution data from VM via QUIC.
 %% Called when dist_data notification is received.
-%% Routes data to data streams (round-robin), falling back to control stream if none available.
+%% Uses a single data stream to maintain message ordering.
 send_dist_data(#state{
     dhandle = DHandle,
     conn_ref = ConnRef,
-    data_streams = [],
+    data_streams = [FirstStream | _]
+}) ->
+    %% Use first data stream for all distribution data to maintain ordering
+    send_dist_data_loop(DHandle, ConnRef, FirstStream);
+send_dist_data(#state{
+    dhandle = DHandle,
+    conn_ref = ConnRef,
     control_stream = CtrlStream
 }) ->
-    %% Fallback: no data streams available, use control stream
-    send_dist_data_loop(DHandle, ConnRef, CtrlStream);
-send_dist_data(
-    #state{
-        dhandle = DHandle,
-        conn_ref = ConnRef,
-        data_streams = Streams,
-        data_stream_idx = Idx
-    } = State
-) ->
-    %% Use data streams with round-robin
-    StreamId = lists:nth((Idx rem length(Streams)) + 1, Streams),
-    send_dist_data_loop(DHandle, ConnRef, StreamId, Streams, Idx, State).
+    %% Fallback: no data streams, use control stream
+    send_dist_data_loop(DHandle, ConnRef, CtrlStream).
+
+%% @private
+%% Send distribution data, returning `sent` if data was sent, `none` if nothing.
+%% Used by tick handler to know if an empty tick frame is needed.
+send_dist_data_with_tick(#state{
+    dhandle = DHandle,
+    conn_ref = ConnRef,
+    data_streams = [FirstStream | _]
+}) ->
+    send_dist_data_loop_tick(DHandle, ConnRef, FirstStream, none);
+send_dist_data_with_tick(#state{
+    dhandle = DHandle,
+    conn_ref = ConnRef,
+    control_stream = CtrlStream
+}) ->
+    send_dist_data_loop_tick(DHandle, ConnRef, CtrlStream, none).
 
 send_dist_data_loop(DHandle, ConnRef, StreamId) ->
     case erlang:dist_ctrl_get_data(DHandle) of
         none ->
             ok;
         Data ->
-            case quic:send_data(ConnRef, StreamId, iolist_to_binary(Data), false) of
-                ok ->
-                    send_dist_data_loop(DHandle, ConnRef, StreamId);
-                {error, Reason} ->
-                    ?LOG_ERROR(#{what => dist_send_failed, reason => Reason}, ?QUIC_LOG_META),
-                    ok
-            end
+            send_one_frame(ConnRef, StreamId, Data),
+            send_dist_data_loop(DHandle, ConnRef, StreamId)
     end.
 
-%% Round-robin across data streams
-send_dist_data_loop(DHandle, ConnRef, StreamId, Streams, Idx, _State) ->
+send_dist_data_loop_tick(DHandle, ConnRef, StreamId, Status) ->
     case erlang:dist_ctrl_get_data(DHandle) of
         none ->
-            ok;
+            Status;
         Data ->
-            case quic:send_data(ConnRef, StreamId, iolist_to_binary(Data), false) of
-                ok ->
-                    %% Round-robin to next stream for next message
-                    NextIdx = Idx + 1,
-                    NextStreamId = lists:nth((NextIdx rem length(Streams)) + 1, Streams),
-                    send_dist_data_loop(DHandle, ConnRef, NextStreamId, Streams, NextIdx, _State);
-                {error, Reason} ->
-                    ?LOG_ERROR(#{what => dist_send_failed, reason => Reason}, ?QUIC_LOG_META),
-                    ok
-            end
+            send_one_frame(ConnRef, StreamId, Data),
+            send_dist_data_loop_tick(DHandle, ConnRef, StreamId, sent)
+    end.
+
+%% @private
+%% Send a single framed message.
+%% Adds 4-byte big-endian length prefix for message framing over QUIC.
+send_one_frame(ConnRef, StreamId, Data) ->
+    %% dist_ctrl_get_data returns raw message data (no length prefix)
+    %% We add 4-byte length prefix for framing over QUIC
+    DataBin = iolist_to_binary(Data),
+    Length = byte_size(DataBin),
+    FramedData = <<Length:32/big-unsigned, DataBin/binary>>,
+    case quic:send_data(ConnRef, StreamId, FramedData, false) of
+        ok -> ok;
+        {error, _Reason} -> ok
     end.
 
 %%====================================================================
@@ -760,37 +790,45 @@ send_dist_data_loop(DHandle, ConnRef, StreamId, Streams, Idx, _State) ->
 %% @private
 %% Input handler loop - receives QUIC data from controller and delivers to VM.
 %% This runs in a separate process registered with erlang:dist_ctrl_input_handler.
-input_handler_loop(DHandle, Controller, ConnRef, _ControlStream) ->
+%%
+%% IMPORTANT: The distribution protocol uses 4-byte length-prefixed messages:
+%%   <<Length:32/big-unsigned, Payload:Length/binary>>
+%%
+%% QUIC delivers data in arbitrary chunks (typically ~1100 bytes due to MTU).
+%% We MUST buffer incoming data and only pass complete messages to the VM.
+%% Passing partial messages causes "corrupted distribution header" errors.
+input_handler_loop(DHandle, Controller, ConnRef, ControlStream) ->
+    %% Start with empty buffer
+    input_handler_loop(DHandle, Controller, ConnRef, ControlStream, <<>>).
+
+input_handler_loop(DHandle, Controller, ConnRef, ControlStream, Buffer) ->
     receive
         {dist_data, Data} ->
-            %% Data received from QUIC - deliver to VM
-            try
-                erlang:dist_ctrl_put_data(DHandle, Data)
-            catch
-                Class:Reason ->
-                    logger:error(
-                        #{
-                            what => dist_ctrl_put_data_failed,
-                            class => Class,
-                            reason => Reason
-                        },
-                        ?QUIC_LOG_META
-                    ),
+            %% Data received from QUIC - buffer and deliver complete messages
+            NewBuffer = <<Buffer/binary, Data/binary>>,
+            case deliver_complete_messages(DHandle, NewBuffer) of
+                {ok, RemainingBuffer} ->
+                    input_handler_loop(
+                        DHandle, Controller, ConnRef, ControlStream, RemainingBuffer
+                    );
+                {error, _Reason} ->
+                    %% Error delivering to VM, connection is broken
                     exit(normal)
-            end,
-            input_handler_loop(DHandle, Controller, ConnRef, _ControlStream);
+            end;
         {'EXIT', Controller, Reason} ->
             %% Controller died, exit
             exit(Reason);
         {quic, ConnRef, {stream_data, _StreamId, Data, _Fin}} ->
             %% Direct QUIC data (if we're receiving messages directly)
-            try
-                erlang:dist_ctrl_put_data(DHandle, Data)
-            catch
-                _:_ ->
+            NewBuffer = <<Buffer/binary, Data/binary>>,
+            case deliver_complete_messages(DHandle, NewBuffer) of
+                {ok, RemainingBuffer} ->
+                    input_handler_loop(
+                        DHandle, Controller, ConnRef, ControlStream, RemainingBuffer
+                    );
+                {error, _Reason} ->
                     exit(normal)
-            end,
-            input_handler_loop(DHandle, Controller, ConnRef, _ControlStream);
+            end;
         {quic, ConnRef, {closed, _Reason}} ->
             exit(normal);
         Other ->
@@ -798,7 +836,77 @@ input_handler_loop(DHandle, Controller, ConnRef, _ControlStream) ->
                 #{what => input_handler_unexpected_msg, msg => Other},
                 ?QUIC_LOG_META
             ),
-            input_handler_loop(DHandle, Controller, ConnRef, _ControlStream)
+            input_handler_loop(DHandle, Controller, ConnRef, ControlStream, Buffer)
+    end.
+
+%% @private
+%% Deliver complete messages to the VM.
+%% We use 4-byte length-prefixed framing: <<Length:32/big, Payload:Length/binary>>
+%% The payload (WITHOUT length header) is passed to dist_ctrl_put_data.
+%% Empty frames (Length=0) are tick signals - no payload to deliver.
+%% Returns {ok, RemainingBuffer} or {error, Reason}
+deliver_complete_messages(DHandle, Buffer) ->
+    case Buffer of
+        <<0:32/big-unsigned, Remaining/binary>> ->
+            %% Empty frame = tick signal - just continue (activity already counted)
+            logger:debug(#{what => tick_frame_received}, ?QUIC_LOG_META),
+            deliver_complete_messages(DHandle, Remaining);
+        <<Length:32/big-unsigned, Rest/binary>> when byte_size(Rest) >= Length ->
+            %% We have a complete message - extract payload only
+            <<Payload:Length/binary, Remaining/binary>> = Rest,
+            logger:debug(
+                #{
+                    what => complete_message,
+                    length => Length,
+                    payload_first_bytes => binary:part(Payload, 0, min(16, byte_size(Payload)))
+                },
+                ?QUIC_LOG_META
+            ),
+            try
+                %% Pass ONLY the payload to dist_ctrl_put_data (no length header)
+                erlang:dist_ctrl_put_data(DHandle, Payload),
+                %% Continue with remaining data
+                deliver_complete_messages(DHandle, Remaining)
+            catch
+                Class:Reason ->
+                    logger:error(
+                        #{
+                            what => dist_ctrl_put_data_failed,
+                            class => Class,
+                            reason => Reason,
+                            payload_size => Length
+                        },
+                        ?QUIC_LOG_META
+                    ),
+                    {error, {put_data_failed, Reason}}
+            end;
+        <<Length:32/big-unsigned, _Rest/binary>> ->
+            %% Have header but incomplete payload - need more data
+            logger:debug(
+                #{
+                    what => need_more_data,
+                    expected_length => Length,
+                    have_bytes => byte_size(_Rest)
+                },
+                ?QUIC_LOG_META
+            ),
+            {ok, Buffer};
+        _ when byte_size(Buffer) < 4 ->
+            %% Don't even have the header yet
+            {ok, Buffer};
+        _ ->
+            %% This shouldn't happen - log and keep the buffer
+            %% Check if this looks like unframed ETF data
+            logger:warning(
+                #{
+                    what => unexpected_buffer_state,
+                    buffer_size => byte_size(Buffer),
+                    first_bytes => binary:part(Buffer, 0, min(20, byte_size(Buffer))),
+                    looks_like_etf => (byte_size(Buffer) >= 1 andalso binary:first(Buffer) =:= 131)
+                },
+                ?QUIC_LOG_META
+            ),
+            {ok, Buffer}
     end.
 
 %%====================================================================
@@ -822,17 +930,15 @@ try_recv(_Length, State) ->
 
 %% @private
 %% Handle data received on control stream.
-%% Detects tick messages and handles them specially.
-handle_control_data(<<?QUIC_DIST_MSG_TICK:8, Rest/binary>>, StateName, State) ->
-    %% Received tick - send acknowledgment
-    send_tick_ack(State),
-    handle_control_rest(Rest, StateName, State);
-handle_control_data(<<?QUIC_DIST_MSG_TICK_ACK:8, Rest/binary>>, StateName, State) ->
-    %% Tick acknowledged - connection is alive (no action needed)
-    handle_control_rest(Rest, StateName, State);
+%% During handshake: buffer data for f_recv (distribution handshake)
+%% After handshake: control stream only receives tick frames (<<0:32>>)
+%%                  which are ignored - NOT forwarded to input handler
 handle_control_data(<<>>, _StateName, State) ->
-    %% Empty data (legacy tick) - ignore
+    %% Empty data - signals liveness, nothing to process
     {keep_state, State};
+handle_control_data(<<0:32/big-unsigned, Rest/binary>>, StateName, State) ->
+    %% Tick frame on control stream - ignore payload, process rest
+    handle_control_data(Rest, StateName, State);
 handle_control_data(
     Data,
     StateName,
@@ -840,22 +946,22 @@ handle_control_data(
         recv_buffer = Buffer,
         recv_waiters = Waiters,
         recv_cnt = RecvCnt,
-        recv_oct = RecvOct,
-        input_handler = InputHandler
+        recv_oct = RecvOct
     } = State
 ) ->
-    %% After handshake, control stream should only have tick messages.
-    %% Any other data during connected state is unexpected but handle gracefully.
-    case {StateName, InputHandler} of
-        {connected, Pid} when is_pid(Pid) ->
-            %% Unexpected data on control stream during connected state
-            %% This shouldn't happen after stream separation is in place
-            Pid ! {dist_data, Data},
-            State1 = State#state{
-                recv_cnt = RecvCnt + 1,
-                recv_oct = RecvOct + byte_size(Data)
-            },
-            {keep_state, State1};
+    case StateName of
+        connected ->
+            %% In connected state, control stream should only have tick frames
+            %% Any other data is unexpected - log and ignore to avoid corruption
+            ?LOG_WARNING(
+                #{
+                    what => unexpected_control_data,
+                    size => byte_size(Data),
+                    first_bytes => binary:part(Data, 0, min(20, byte_size(Data)))
+                },
+                ?QUIC_LOG_META
+            ),
+            {keep_state, State};
         _ ->
             %% During handshake, buffer data for f_recv
             NewBuffer = <<Buffer/binary, Data/binary>>,
@@ -868,13 +974,6 @@ handle_control_data(
             {State2, Actions} = satisfy_waiters(Waiters, State1, []),
             {keep_state, State2, Actions}
     end.
-
-%% @private
-%% Helper to process remaining data after tick message.
-handle_control_rest(<<>>, _StateName, State) ->
-    {keep_state, State};
-handle_control_rest(Rest, StateName, State) ->
-    handle_control_data(Rest, StateName, State).
 
 %% @private
 %% Handle data received on data streams.

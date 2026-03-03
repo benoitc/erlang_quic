@@ -1,0 +1,31 @@
+{erl_opts, [
+    debug_info,
+    warn_export_vars,
+    warn_shadow_vars,
+    warn_obsolete_guard,
+    {platform_define, "^[0-9]+", namespaced_types}
+]}.
+
+{minimum_otp_vsn, "26"}.
+
+{deps, [
+    {nat, "0.5.2"},
+    {estun, "0.1.2"}
+]}.
+
+{relx, [
+    {release, {quic_dist_test, "0.1.0"}, [
+        quic_dist_test,
+        quic,
+        nat,
+        estun,
+        crypto,
+        ssl,
+        sasl
+    ]},
+    {mode, prod},
+    {include_erts, true},
+    {extended_start_script, true},
+    {sys_config_src, "config/sys.config.src"},
+    {vm_args_src, "config/vm.args.src"}
+]}.
