@@ -42,6 +42,7 @@
 
 -module(quic_dist).
 
+-include("quic.hrl").
 -include("quic_dist.hrl").
 -include_lib("kernel/include/dist_util.hrl").
 -include_lib("kernel/include/net_address.hrl").
@@ -391,6 +392,8 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
                 key => Key,
                 alpn => [?QUIC_DIST_ALPN],
                 idle_timeout => ?QUIC_DIST_IDLE_TIMEOUT,
+                %% Use higher initial cwnd for distribution bulk transfers
+                initial_window => ?INITIAL_WINDOW_DISTRIBUTION,
                 connection_handler => fun(ConnPid, ConnRef) ->
                     handle_new_connection(ConnPid, ConnRef)
                 end
@@ -871,6 +874,8 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                 key => Key,
                 alpn => [?QUIC_DIST_ALPN],
                 idle_timeout => ?QUIC_DIST_IDLE_TIMEOUT,
+                %% Use higher initial cwnd for distribution bulk transfers
+                initial_window => ?INITIAL_WINDOW_DISTRIBUTION,
                 % TODO: Enable proper verification
                 verify => false
             },
