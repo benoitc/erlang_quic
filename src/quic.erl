@@ -283,9 +283,8 @@ set_owner(ConnPid, NewOwner) when is_pid(ConnPid), is_pid(NewOwner) ->
 set_owner(_ConnRef, _NewOwner) ->
     {error, badarg}.
 
-%% @doc Transfer ownership of a connection to a new process (synchronous).
-%% Blocks until ownership is transferred. Use this when you need to ensure
-%% the new owner receives all subsequent messages including {connected, Info}.
+%% @doc Set the owner process for a connection (synchronous).
+%% Use this when you need to ensure ownership is transferred before continuing.
 -spec set_owner_sync(ConnRef, NewOwner) -> ok | {error, term()} when
     ConnRef :: reference() | pid(),
     NewOwner :: pid().

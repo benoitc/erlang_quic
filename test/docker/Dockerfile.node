@@ -1,0 +1,55 @@
+# Dockerfile for QUIC Distribution Test Node
+# Erlang node with quic_dist for cluster testing
+
+FROM erlang:28-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache \
+    git \
+    make \
+    openssl
+
+# Set working directory
+WORKDIR /app
+
+# Copy rebar config first for better caching
+COPY rebar.config rebar.lock* /app/
+
+# Fetch dependencies
+RUN rebar3 get-deps || true
+
+# Copy the source code and config
+COPY src/ /app/src/
+COPY include/ /app/include/
+COPY config/ /app/config/
+
+# Build the release
+RUN rebar3 as dist_node release
+
+# Runtime image
+FROM erlang:28-alpine
+
+# Install runtime dependencies
+RUN apk add --no-cache \
+    bash \
+    openssl \
+    iptables \
+    iproute2
+
+# Copy the release
+COPY --from=builder /app/_build/dist_node/rel/quic_node /opt/quic_node
+
+# Copy start script
+COPY test/docker/scripts/start_release.sh /opt/start_release.sh
+RUN chmod +x /opt/start_release.sh
+
+# Set up environment defaults
+ENV NODE_NAME=node
+ENV ERLANG_COOKIE=quic_dist_test
+ENV QUIC_CERT_FILE=/certs/cert.pem
+ENV QUIC_KEY_FILE=/certs/key.pem
+ENV QUIC_DIST_PORT=4433
+ENV NAT_ENABLED=false
+
+# Default command
+ENTRYPOINT ["/opt/start_release.sh"]

@@ -1,0 +1,134 @@
+# Build context is the project root (erlang_quic/)
+# Run from docker/dist/ with: docker compose up
+# Or from project root with: docker compose -f docker/dist/docker-compose.yml up
+#
+# Use OTP_VERSION env var to select Erlang version (26, 27, or 28):
+#   OTP_VERSION=28 docker compose --profile five up
+
+x-node-base: &node-base
+  build:
+    context: ../..
+    dockerfile: docker/dist/Dockerfile
+    args:
+      OTP_VERSION: ${OTP_VERSION:-28}
+  restart: "no"
+
+services:
+  node1:
+    <<: *node-base
+    hostname: node1
+    container_name: quic_dist_node1
+    environment:
+      - NODE_NAME=node1@node1
+      - ERLANG_COOKIE=quic_dist_test_secret
+      - QUIC_DIST_PORT=9100
+      - EXPECTED_NODES=${EXPECTED_NODES:-2}
+      - SEED_NODE=
+      - CLUSTER_NODES=node2@node2,node3@node3,node4@node4,node5@node5
+    volumes:
+      - ./certs:/app/certs:ro
+      - node1_logs:/app/logs
+    networks:
+      quic_net:
+        ipv4_address: 172.30.1.1
+    profiles: ["two", "three", "five"]
+
+  node2:
+    <<: *node-base
+    hostname: node2
+    container_name: quic_dist_node2
+    environment:
+      - NODE_NAME=node2@node2
+      - ERLANG_COOKIE=quic_dist_test_secret
+      - QUIC_DIST_PORT=9100
+      - EXPECTED_NODES=${EXPECTED_NODES:-2}
+      - SEED_NODE=node1@node1
+      - CLUSTER_NODES=node1@node1,node3@node3,node4@node4,node5@node5
+    volumes:
+      - ./certs:/app/certs:ro
+      - node2_logs:/app/logs
+    networks:
+      quic_net:
+        ipv4_address: 172.30.1.2
+    depends_on:
+      - node1
+    profiles: ["two", "three", "five"]
+
+  node3:
+    <<: *node-base
+    hostname: node3
+    container_name: quic_dist_node3
+    environment:
+      - NODE_NAME=node3@node3
+      - ERLANG_COOKIE=quic_dist_test_secret
+      - QUIC_DIST_PORT=9100
+      - EXPECTED_NODES=${EXPECTED_NODES:-3}
+      - SEED_NODE=node1@node1
+      - CLUSTER_NODES=node1@node1,node2@node2,node4@node4,node5@node5
+    volumes:
+      - ./certs:/app/certs:ro
+      - node3_logs:/app/logs
+    networks:
+      quic_net:
+        ipv4_address: 172.30.1.3
+    depends_on:
+      - node1
+    profiles: ["three", "five"]
+
+  node4:
+    <<: *node-base
+    hostname: node4
+    container_name: quic_dist_node4
+    environment:
+      - NODE_NAME=node4@node4
+      - ERLANG_COOKIE=quic_dist_test_secret
+      - QUIC_DIST_PORT=9100
+      - EXPECTED_NODES=${EXPECTED_NODES:-5}
+      - SEED_NODE=node1@node1
+      - CLUSTER_NODES=node1@node1,node2@node2,node3@node3,node5@node5
+    volumes:
+      - ./certs:/app/certs:ro
+      - node4_logs:/app/logs
+    networks:
+      quic_net:
+        ipv4_address: 172.30.1.4
+    depends_on:
+      - node1
+    profiles: ["five"]
+
+  node5:
+    <<: *node-base
+    hostname: node5
+    container_name: quic_dist_node5
+    environment:
+      - NODE_NAME=node5@node5
+      - ERLANG_COOKIE=quic_dist_test_secret
+      - QUIC_DIST_PORT=9100
+      - EXPECTED_NODES=${EXPECTED_NODES:-5}
+      - SEED_NODE=node1@node1
+      - CLUSTER_NODES=node1@node1,node2@node2,node3@node3,node4@node4
+    volumes:
+      - ./certs:/app/certs:ro
+      - node5_logs:/app/logs
+    networks:
+      quic_net:
+        ipv4_address: 172.30.1.5
+    depends_on:
+      - node1
+    profiles: ["five"]
+
+networks:
+  quic_net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.1.0/24
+          gateway: 172.30.1.254
+
+volumes:
+  node1_logs:
+  node2_logs:
+  node3_logs:
+  node4_logs:
+  node5_logs:

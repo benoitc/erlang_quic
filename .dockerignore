@@ -1,0 +1,29 @@
+# Ignore build artifacts
+_build/
+_checkouts/
+ebin/
+*.beam
+
+# Ignore rebar stuff
+rebar3.crashdump
+.rebar3/
+
+# Ignore test artifacts
+test/e2e/logs/
+test/e2e/results/
+*.log
+
+# Ignore IDE/editor files
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Ignore git
+.git/
+.gitignore
+
+# Ignore docs and local config
+doc/
+.claude/

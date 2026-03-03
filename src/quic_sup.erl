@@ -44,11 +44,26 @@ start_link() ->
 %%====================================================================
 
 init([]) ->
+    %% Create discovery ETS table for quic_discovery_static
+    %% This must be created early as distribution may need it during startup
+    case ets:info(quic_discovery_static_nodes) of
+        undefined ->
+            ets:new(
+                quic_discovery_static_nodes,
+                [named_table, public, set, {read_concurrency, true}]
+            );
+        _ ->
+            ok
+    end,
+
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,
         period => 10
     },
+
+    %% Get distribution options for NAT support
+    DistOpts = application:get_env(quic, dist, []),
 
     Children = [
         #{
@@ -66,6 +81,14 @@ init([]) ->
             shutdown => infinity,
             type => supervisor,
             modules => [quic_server_sup]
+        },
+        #{
+            id => quic_dist_sup,
+            start => {quic_dist_sup, start_link, [DistOpts]},
+            restart => permanent,
+            shutdown => infinity,
+            type => supervisor,
+            modules => [quic_dist_sup]
         }
     ],
 
