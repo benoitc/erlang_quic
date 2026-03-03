@@ -596,7 +596,9 @@ init({server, Opts}) ->
     register_conn(ConnRef, self()),
 
     %% Initialize congestion control and loss detection
-    CCState = quic_cc:new(),
+    %% Support configurable initial cwnd for distribution workloads
+    CCOpts = build_cc_opts(Opts),
+    CCState = quic_cc:new(CCOpts),
     LossState = quic_loss:new(),
 
     %% Initialize state
@@ -644,6 +646,19 @@ init({server, Opts}) ->
     },
 
     {ok, idle, State}.
+
+%% Build congestion control options from connection options.
+%% Supports:
+%%   - initial_window: Initial congestion window in bytes (default: RFC 9002 formula)
+%%                     Higher values improve bulk transfer throughput.
+%%                     Recommended for distribution: 65536 (64KB) or higher.
+build_cc_opts(Opts) ->
+    case maps:find(initial_window, Opts) of
+        {ok, Value} when is_integer(Value), Value > 0 ->
+            #{initial_window => Value};
+        _ ->
+            #{}
+    end.
 
 %% Build preferred_address record from listener options (RFC 9000 Section 9.6)
 build_server_preferred_address(Opts) ->
@@ -737,7 +752,9 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     AlpnList = normalize_alpn_list(AlpnOpt),
 
     %% Initialize congestion control and loss detection
-    CCState = quic_cc:new(),
+    %% Support configurable initial cwnd for distribution workloads
+    CCOpts = build_cc_opts(Opts),
+    CCState = quic_cc:new(CCOpts),
     LossState = quic_loss:new(),
 
     %% Extract session ticket for resumption (if provided)
@@ -2549,8 +2566,16 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     State;
                 {NewLossState, AckedPackets, LostPackets} ->
                     %% Calculate total bytes acked and lost
-                    AckedBytes = lists:sum([P#sent_packet.size || P <- AckedPackets]),
-                    LostBytes = lists:sum([P#sent_packet.size || P <- LostPackets]),
+                    %% IMPORTANT: Only count ack-eliciting packets for congestion control
+                    %% since bytes_in_flight only tracks ack-eliciting packets (RFC 9002)
+                    AckedBytes = lists:sum([
+                        P#sent_packet.size
+                     || #sent_packet{ack_eliciting = true, size = _} = P <- AckedPackets
+                    ]),
+                    LostBytes = lists:sum([
+                        P#sent_packet.size
+                     || #sent_packet{ack_eliciting = true, size = _} = P <- LostPackets
+                    ]),
 
                     %% Find the largest acked packet's sent time for recovery exit detection
                     LargestAckedSentTime =
@@ -2590,6 +2615,25 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
 
                     %% Check for persistent congestion (RFC 9002 Section 7.6)
                     CCState5 = check_persistent_congestion(LostPackets, NewLossState, CCState4),
+
+                    %% Log bytes_in_flight synchronization for debugging
+                    CCBytesInFlight = quic_cc:bytes_in_flight(CCState5),
+                    LossBytesInFlight = quic_loss:bytes_in_flight(NewLossState),
+                    ?LOG_DEBUG(
+                        #{
+                            what => ack_processed,
+                            acked_bytes => AckedBytes,
+                            lost_bytes => LostBytes,
+                            acked_packets_count => length(AckedPackets),
+                            lost_packets_count => length(LostPackets),
+                            cwnd => quic_cc:cwnd(CCState5),
+                            cc_bytes_in_flight => CCBytesInFlight,
+                            loss_bytes_in_flight => LossBytesInFlight,
+                            bytes_in_flight_synced => CCBytesInFlight =:= LossBytesInFlight,
+                            send_queue_bytes => State#state.send_queue_bytes
+                        },
+                        ?QUIC_LOG_META
+                    ),
 
                     State1 = State#state{
                         loss_state = NewLossState,
@@ -4265,6 +4309,18 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSen
             {NewState, BytesSentSoFar + byte_size(Data)};
         false ->
             %% Queue the data for later sending when cwnd allows
+            ?LOG_DEBUG(
+                #{
+                    what => stream_data_queued_cwnd,
+                    stream_id => StreamId,
+                    data_size => byte_size(Data),
+                    offset => Offset,
+                    cwnd => quic_cc:cwnd(CCState),
+                    bytes_in_flight => quic_cc:bytes_in_flight(CCState),
+                    available_cwnd => quic_cc:available_cwnd(CCState)
+                },
+                ?QUIC_LOG_META
+            ),
             case queue_stream_data(StreamId, Offset, Data, Fin, State) of
                 {ok, QueuedState} ->
                     % Return bytes sent so far, not including queued
@@ -4291,6 +4347,19 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSen
             );
         false ->
             %% Queue remaining data for later
+            ?LOG_DEBUG(
+                #{
+                    what => stream_data_queued_cwnd_large,
+                    stream_id => StreamId,
+                    total_data_size => byte_size(Data),
+                    offset => Offset,
+                    bytes_sent_so_far => BytesSentSoFar,
+                    cwnd => quic_cc:cwnd(CCState),
+                    bytes_in_flight => quic_cc:bytes_in_flight(CCState),
+                    available_cwnd => quic_cc:available_cwnd(CCState)
+                },
+                ?QUIC_LOG_META
+            ),
             case queue_stream_data(StreamId, Offset, Data, Fin, State) of
                 {ok, QueuedState} ->
                     % Return bytes sent so far
@@ -4414,7 +4483,7 @@ check_send_queue_flow_control(StreamId, DataSize, #state{
 
 %% Actually process the queue entry (called after flow control check passes)
 process_send_queue_entry(
-    #state{send_queue = PQ, send_queue_bytes = QueueBytes} = State
+    #state{send_queue = PQ, send_queue_bytes = QueueBytes, cc_state = CCState} = State
 ) ->
     case pqueue_out(PQ) of
         {empty, _} ->
@@ -4424,6 +4493,19 @@ process_send_queue_entry(
             %% (if data is re-queued, queue_stream_data will increment appropriately)
             DataSize = iolist_size(Data),
             DecrementedQueueBytes = max(0, QueueBytes - DataSize),
+            ?LOG_DEBUG(
+                #{
+                    what => send_queue_draining,
+                    stream_id => StreamId,
+                    data_size => DataSize,
+                    queue_bytes_before => QueueBytes,
+                    queue_bytes_after => DecrementedQueueBytes,
+                    cwnd => quic_cc:cwnd(CCState),
+                    bytes_in_flight => quic_cc:bytes_in_flight(CCState),
+                    available_cwnd => quic_cc:available_cwnd(CCState)
+                },
+                ?QUIC_LOG_META
+            ),
             State1 = State#state{send_queue = NewPQ, send_queue_bytes = DecrementedQueueBytes},
             case send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State1) of
                 {error, send_queue_full} ->

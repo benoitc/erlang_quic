@@ -227,6 +227,8 @@ detect_lost_packets(
     {NewState, LostPackets}.
 
 %% Internal loss detection
+%% IMPORTANT: Only count ack-eliciting packet sizes in LostBytes since
+%% bytes_in_flight only tracks ack-eliciting packets (RFC 9002).
 detect_lost_packets(SentPackets, SmoothedRTT, LargestAcked, Now) ->
     %% Calculate loss delay
     LossDelay = max(trunc(?TIME_THRESHOLD * SmoothedRTT), ?GRANULARITY),
@@ -236,7 +238,12 @@ detect_lost_packets(SentPackets, SmoothedRTT, LargestAcked, Now) ->
         fun
             (
                 PN,
-                #sent_packet{time_sent = TimeSent, size = Size, in_flight = true} = Packet,
+                #sent_packet{
+                    time_sent = TimeSent,
+                    size = Size,
+                    in_flight = true,
+                    ack_eliciting = AckEliciting
+                } = Packet,
                 {LostAcc, RemAcc, BytesAcc}
             ) ->
                 %% Check packet threshold
@@ -246,7 +253,13 @@ detect_lost_packets(SentPackets, SmoothedRTT, LargestAcked, Now) ->
 
                 case PacketLost orelse TimeLost of
                     true ->
-                        {[Packet | LostAcc], RemAcc, BytesAcc + Size};
+                        %% Only count ack-eliciting packet sizes for bytes_in_flight
+                        NewBytes =
+                            case AckEliciting of
+                                true -> BytesAcc + Size;
+                                false -> BytesAcc
+                            end,
+                        {[Packet | LostAcc], RemAcc, NewBytes};
                     false ->
                         {LostAcc, maps:put(PN, Packet, RemAcc), BytesAcc}
                 end;
@@ -392,12 +405,20 @@ pto_count(#loss_state{pto_count = C}) -> C.
 %%====================================================================
 
 %% Remove acknowledged packets from sent map
+%% IMPORTANT: Only count ack-eliciting packet sizes in AccBytes since
+%% bytes_in_flight only tracks ack-eliciting packets (RFC 9002).
 remove_acked_packets(AckedPNs, SentPackets) ->
     lists:foldl(
         fun(PN, {AccPackets, AccSent, AccBytes}) ->
             case maps:take(PN, AccSent) of
-                {#sent_packet{size = Size} = Packet, NewSent} ->
-                    {[Packet | AccPackets], NewSent, AccBytes + Size};
+                {#sent_packet{size = Size, ack_eliciting = AckEliciting} = Packet, NewSent} ->
+                    %% Only count ack-eliciting packet sizes for bytes_in_flight
+                    NewBytes =
+                        case AckEliciting of
+                            true -> AccBytes + Size;
+                            false -> AccBytes
+                        end,
+                    {[Packet | AccPackets], NewSent, NewBytes};
                 error ->
                     {AccPackets, AccSent, AccBytes}
             end

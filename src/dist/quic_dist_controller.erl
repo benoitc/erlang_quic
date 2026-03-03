@@ -388,7 +388,9 @@ handshaking(EventType, Event, State) ->
 %% State: connected
 %%====================================================================
 
-connected(enter, _OldState, #state{role = server, data_streams = [], dhandle = DHandle} = State) when
+connected(
+    enter, _OldState, #state{role = server, data_streams = [], dhandle = DHandle} = State
+) when
     DHandle =/= undefined
 ->
     %% Server needs to open data streams for sending distribution data
