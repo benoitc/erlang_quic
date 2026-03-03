@@ -1,0 +1,38 @@
+{erl_opts, [
+    debug_info,
+    warn_export_vars,
+    warn_shadow_vars,
+    warn_obsolete_guard
+]}.
+
+{minimum_otp_vsn, "26"}.
+
+%% quic is provided via _checkouts directory in Docker build
+%% We need to include quic's dependencies here since checkouts don't inherit deps
+{deps, [
+    {nat, "0.5.2"},
+    {estun, "0.1.2"}
+]}.
+
+{relx, [
+    {release, {quic_dist_test, "0.1.0"}, [
+        quic_dist_test,
+        quic,
+        crypto,
+        sasl
+    ]},
+    {mode, prod},
+    {include_erts, true},
+    {extended_start_script, true},
+    {sys_config_src, "config/sys.config.src"},
+    {vm_args_src, "config/vm.args.src"}
+]}.
+
+{profiles, [
+    {prod, [
+        {relx, [
+            {mode, prod},
+            {include_erts, true}
+        ]}
+    ]}
+]}.

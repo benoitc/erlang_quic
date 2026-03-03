@@ -390,6 +390,7 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
                 cert => Cert,
                 key => Key,
                 alpn => [?QUIC_DIST_ALPN],
+                idle_timeout => ?QUIC_DIST_IDLE_TIMEOUT,
                 connection_handler => fun(ConnPid, ConnRef) ->
                     handle_new_connection(ConnPid, ConnRef)
                 end
@@ -706,6 +707,8 @@ acceptor_loop(Kernel, #quic_dist_listener{} = Listener, Pending) ->
 
 %% @private
 do_accept_connection(AcceptPid, DistCtrl, MyNode, Allowed, SetupTime, Kernel) ->
+    %% Trap exits so we can handle the setup timer timeout properly
+    process_flag(trap_exit, true),
     error_logger:info_msg("do_accept_connection: waiting for controller message from ~p~n", [
         AcceptPid
     ]),
@@ -747,6 +750,9 @@ do_accept_connection(AcceptPid, DistCtrl, MyNode, Allowed, SetupTime, Kernel) ->
 %% @private
 %% Set up outgoing connection to a node.
 do_setup(Kernel, Node, Type, MyNode, LongOrShortNames, SetupTime) ->
+    %% Trap exits so we can handle the setup timer timeout properly
+    process_flag(trap_exit, true),
+
     %% Ensure quic application is started
     case ensure_quic_started() of
         ok -> ok;
@@ -864,6 +870,7 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                 cert => Cert,
                 key => Key,
                 alpn => [?QUIC_DIST_ALPN],
+                idle_timeout => ?QUIC_DIST_IDLE_TIMEOUT,
                 % TODO: Enable proper verification
                 verify => false
             },

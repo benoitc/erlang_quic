@@ -54,6 +54,10 @@
 -define(QUIC_DIST_MSG_TICK, 1).
 -define(QUIC_DIST_MSG_TICK_ACK, 2).
 
+%% Idle timeout for distribution connections (5 minutes)
+%% Longer than default to allow for infrequent cluster traffic
+-define(QUIC_DIST_IDLE_TIMEOUT, 300000).
+
 %% Default ports
 -define(QUIC_DIST_DEFAULT_PORT, 4433).
 -define(QUIC_DIST_PORT_RANGE_START, 4433).
