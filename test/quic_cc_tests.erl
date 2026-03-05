@@ -27,6 +27,11 @@ new_state_with_opts_test() ->
     %% min(10 * 1400, max(14720, 2 * 1400)) = min(14000, 14720) = 14000
     ?assertEqual(14000, Cwnd).
 
+new_state_with_minimum_window_opt_test() ->
+    %% Initial window should be clamped to configured minimum window
+    State = quic_cc:new(#{initial_window => 8000, minimum_window => 16000}),
+    ?assertEqual(16000, quic_cc:cwnd(State)).
+
 %%====================================================================
 %% Packet Sent Tests
 %%====================================================================
@@ -247,6 +252,19 @@ cwnd_minimum_test() ->
     ?assert(FinalCwnd >= 2400),
     ?assert(FinalCwnd < InitialCwnd).
 
+configured_cwnd_minimum_test() ->
+    %% Custom minimum window should be respected under repeated losses.
+    State = quic_cc:new(#{initial_window => 65536, minimum_window => 16384}),
+    S1 = lists:foldl(
+        fun(_, Acc) ->
+            Now = erlang:monotonic_time(millisecond),
+            quic_cc:on_congestion_event(Acc, Now + 1000)
+        end,
+        State,
+        lists:seq(1, 10)
+    ),
+    ?assertEqual(16384, quic_cc:cwnd(S1)).
+
 %%====================================================================
 %% Persistent Congestion Tests (RFC 9002 Section 7.6)
 %%====================================================================
@@ -326,6 +344,11 @@ on_persistent_congestion_clears_recovery_test() ->
     %% Persistent congestion should clear recovery state
     S2 = quic_cc:on_persistent_congestion(S1),
     ?assertNot(quic_cc:in_recovery(S2)).
+
+on_persistent_congestion_respects_configured_minimum_window_test() ->
+    State = quic_cc:new(#{minimum_window => 16384}),
+    S1 = quic_cc:on_persistent_congestion(State),
+    ?assertEqual(16384, quic_cc:cwnd(S1)).
 
 %%====================================================================
 %% Integration Tests

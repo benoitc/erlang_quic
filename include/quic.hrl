@@ -259,6 +259,8 @@
 %% slow start duration and improves throughput for large messages.
 % 64KB - recommended for distribution/LAN
 -define(INITIAL_WINDOW_DISTRIBUTION, 65536).
+% 16KB - conservative floor to avoid starvation in bursty virtual networks
+-define(MINIMUM_WINDOW_DISTRIBUTION, 16384).
 % 128KB - aggressive for high-bandwidth LAN
 -define(INITIAL_WINDOW_AGGRESSIVE, 131072).
 

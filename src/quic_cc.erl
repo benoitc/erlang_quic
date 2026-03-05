@@ -65,8 +65,6 @@
 -define(MAX_DATAGRAM_SIZE, 1200).
 % 10 * 1472 or similar
 -define(INITIAL_WINDOW, 14720).
-% 2 * MAX_DATAGRAM_SIZE
--define(MINIMUM_WINDOW, 2400).
 -define(LOSS_REDUCTION_FACTOR, 0.5).
 -define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 
@@ -91,6 +89,7 @@
     ecn_ce_counter = 0 :: non_neg_integer(),
 
     %% Configuration
+    minimum_window :: non_neg_integer(),
     max_datagram_size :: non_neg_integer()
 }).
 
@@ -112,16 +111,29 @@ new() ->
 %%   - initial_window: Override initial congestion window (default: RFC 9002 formula)
 %%                     Higher values can improve throughput for bulk transfers.
 %%                     Recommended: 32768 (32KB) or 65536 (64KB) for LAN/distribution.
+%%   - minimum_window: Lower bound for cwnd after congestion events
+%%                     (default: 2 * max_datagram_size per RFC 9002).
 -spec new(map()) -> cc_state().
 new(Opts) ->
     MaxDatagramSize = maps:get(max_datagram_size, Opts, ?MAX_DATAGRAM_SIZE),
     DefaultWindow = initial_window(MaxDatagramSize),
-    InitialWindow = maps:get(initial_window, Opts, DefaultWindow),
+    DefaultMinimumWindow = minimum_window(MaxDatagramSize),
+    ConfiguredMinimumWindow =
+        case maps:find(minimum_window, Opts) of
+            {ok, Value} when is_integer(Value), Value > 0 ->
+                max(Value, DefaultMinimumWindow);
+            _ ->
+                DefaultMinimumWindow
+        end,
+    InitialWindow0 = maps:get(initial_window, Opts, DefaultWindow),
+    InitialWindow = max(InitialWindow0, ConfiguredMinimumWindow),
     ?LOG_DEBUG(
         #{
             what => cc_state_initialized,
             initial_cwnd => InitialWindow,
             default_cwnd => DefaultWindow,
+            minimum_window => ConfiguredMinimumWindow,
+            default_minimum_window => DefaultMinimumWindow,
             max_datagram_size => MaxDatagramSize
         },
         ?QUIC_LOG_META
@@ -129,6 +141,7 @@ new(Opts) ->
     #cc_state{
         cwnd = InitialWindow,
         ssthresh = infinity,
+        minimum_window = ConfiguredMinimumWindow,
         max_datagram_size = MaxDatagramSize
     }.
 
@@ -203,10 +216,14 @@ on_packets_acked(
                 },
                 ?QUIC_LOG_META
             ),
+            %% Update recovery_start_time to current time when exiting recovery.
+            %% This prevents re-entering recovery for packets sent during
+            %% the recovery period that are still in flight.
+            Now = erlang:monotonic_time(millisecond),
             State#cc_state{
                 bytes_in_flight = NewInFlight,
                 in_recovery = false,
-                recovery_start_time = undefined,
+                recovery_start_time = Now,
                 cwnd = NewCwnd
             };
         false ->
@@ -285,10 +302,42 @@ on_congestion_event(
     } = State,
     SentTime
 ) when SentTime =< RecoveryStart ->
-    %% Already in recovery for this event
+    %% Already in recovery for this event - skip
+    ?LOG_DEBUG(
+        #{
+            what => cc_congestion_skipped_in_recovery,
+            sent_time => SentTime,
+            recovery_start_time => RecoveryStart
+        },
+        ?QUIC_LOG_META
+    ),
     State;
 on_congestion_event(
-    #cc_state{cwnd = Cwnd, bytes_in_flight = InFlight, max_datagram_size = MaxDS} = State,
+    #cc_state{
+        in_recovery = false,
+        recovery_start_time = RecoveryStart
+    } = State,
+    SentTime
+) when is_integer(RecoveryStart), SentTime =< RecoveryStart ->
+    %% Packet was sent before the last recovery period ended.
+    %% Don't re-enter recovery for old packets.
+    ?LOG_DEBUG(
+        #{
+            what => cc_congestion_skipped_post_recovery,
+            sent_time => SentTime,
+            recovery_start_time => RecoveryStart
+        },
+        ?QUIC_LOG_META
+    ),
+    State;
+on_congestion_event(
+    #cc_state{
+        cwnd = Cwnd,
+        bytes_in_flight = InFlight,
+        minimum_window = MinimumWindow,
+        in_recovery = InRecovery,
+        recovery_start_time = OldRecoveryStart
+    } = State,
     SentTime
 ) ->
     Now = erlang:monotonic_time(millisecond),
@@ -296,8 +345,8 @@ on_congestion_event(
     %% Enter recovery
     %% ssthresh = cwnd * kLossReductionFactor
     %% cwnd = max(ssthresh, kMinimumWindow)
-    NewSSThresh = max(trunc(Cwnd * ?LOSS_REDUCTION_FACTOR), minimum_window(MaxDS)),
-    NewCwnd = max(NewSSThresh, minimum_window(MaxDS)),
+    NewSSThresh = max(trunc(Cwnd * ?LOSS_REDUCTION_FACTOR), MinimumWindow),
+    NewCwnd = max(NewSSThresh, MinimumWindow),
 
     ?LOG_DEBUG(
         #{
@@ -306,7 +355,10 @@ on_congestion_event(
             new_cwnd => NewCwnd,
             ssthresh => NewSSThresh,
             bytes_in_flight => InFlight,
-            sent_time => SentTime
+            sent_time => SentTime,
+            old_in_recovery => InRecovery,
+            old_recovery_start => OldRecoveryStart,
+            new_recovery_start => Now
         },
         ?QUIC_LOG_META
     ),
@@ -339,12 +391,12 @@ on_ecn_ce(#cc_state{in_recovery = true, ecn_ce_counter = OldCount} = State, NewC
 ->
     %% Already in recovery, just update counter
     State#cc_state{ecn_ce_counter = NewCECount};
-on_ecn_ce(#cc_state{cwnd = Cwnd, max_datagram_size = MaxDS} = State, NewCECount) ->
+on_ecn_ce(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} = State, NewCECount) ->
     %% RFC 9002: ECN-CE triggers the same response as packet loss
     %% Enter recovery: ssthresh = cwnd * kLossReductionFactor
     Now = erlang:monotonic_time(millisecond),
-    NewSSThresh = max(trunc(Cwnd * ?LOSS_REDUCTION_FACTOR), minimum_window(MaxDS)),
-    NewCwnd = max(NewSSThresh, minimum_window(MaxDS)),
+    NewSSThresh = max(trunc(Cwnd * ?LOSS_REDUCTION_FACTOR), MinimumWindow),
+    NewCwnd = max(NewSSThresh, MinimumWindow),
 
     State#cc_state{
         cwnd = NewCwnd,
@@ -420,10 +472,10 @@ detect_persistent_congestion(LostPackets, PTO, _State) ->
 %% @doc Reset to minimum window on persistent congestion (RFC 9002 §7.6.2).
 %% This is a severe response to prolonged packet loss.
 -spec on_persistent_congestion(cc_state()) -> cc_state().
-on_persistent_congestion(#cc_state{cwnd = Cwnd, max_datagram_size = MaxDS} = State) ->
-    NewSSThresh = max(trunc(Cwnd * ?LOSS_REDUCTION_FACTOR), ?MINIMUM_WINDOW),
+on_persistent_congestion(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} = State) ->
+    NewSSThresh = max(trunc(Cwnd * ?LOSS_REDUCTION_FACTOR), MinimumWindow),
     State#cc_state{
-        cwnd = minimum_window(MaxDS),
+        cwnd = MinimumWindow,
         ssthresh = NewSSThresh,
         in_recovery = false,
         recovery_start_time = undefined,

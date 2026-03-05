@@ -652,12 +652,21 @@ init({server, Opts}) ->
 %%   - initial_window: Initial congestion window in bytes (default: RFC 9002 formula)
 %%                     Higher values improve bulk transfer throughput.
 %%                     Recommended for distribution: 65536 (64KB) or higher.
+%%   - minimum_window: Lower bound for cwnd after congestion events.
+%%                     Defaults to RFC 9002 (2 * max_datagram_size).
 build_cc_opts(Opts) ->
-    case maps:find(initial_window, Opts) of
-        {ok, Value} when is_integer(Value), Value > 0 ->
-            #{initial_window => Value};
+    CCOpts1 =
+        case maps:find(initial_window, Opts) of
+            {ok, InitialWindow} when is_integer(InitialWindow), InitialWindow > 0 ->
+                #{initial_window => InitialWindow};
+            _ ->
+                #{}
+        end,
+    case maps:find(minimum_window, Opts) of
+        {ok, MinimumWindow} when is_integer(MinimumWindow), MinimumWindow > 0 ->
+            CCOpts1#{minimum_window => MinimumWindow};
         _ ->
-            #{}
+            CCOpts1
     end.
 
 %% Build preferred_address record from listener options (RFC 9000 Section 9.6)
@@ -2606,8 +2615,11 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                         case LostPackets of
                             [] ->
                                 CCState2;
-                            [#sent_packet{time_sent = SentTime} | _] ->
-                                quic_cc:on_congestion_event(CCState2, SentTime)
+                            [_ | _] ->
+                                quic_cc:on_congestion_event(
+                                    CCState2,
+                                    largest_lost_sent_time(LostPackets)
+                                )
                         end,
 
                     %% Process ECN counts if present (RFC 9002 Section 7.1)
@@ -3680,6 +3692,21 @@ is_ack_eliciting_frame(_) -> true.
 %% Output for quic_loss: {FirstRange, [{Gap, Range}, ...]}
 ranges_to_ack_format([{_LargestAcked, FirstRange} | RestRanges]) ->
     {FirstRange, RestRanges}.
+
+%% RFC 9002 congestion events use the largest lost packet.
+%% Lost packet lists can be unordered, so pick the max packet number explicitly.
+largest_lost_sent_time([Packet | Rest]) ->
+    Largest = lists:foldl(
+        fun(P, Acc) ->
+            case P#sent_packet.pn > Acc#sent_packet.pn of
+                true -> P;
+                false -> Acc
+            end
+        end,
+        Packet,
+        Rest
+    ),
+    Largest#sent_packet.time_sent.
 
 %% Process ECN counts from ACK frame (RFC 9002 Section 7.1)
 %% ECN-CE indicates network congestion experienced
