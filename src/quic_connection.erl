@@ -2689,8 +2689,6 @@ process_frame(
     {reset_stream, StreamId, ErrorCode, FinalSize},
     #state{owner = Owner, conn_ref = Ref, streams = Streams} = State
 ) ->
-    %% Notify owner of stream reset
-    Owner ! {quic, Ref, {stream_reset, StreamId, ErrorCode}},
     %% Update stream state to reset
     NewStreams =
         case maps:find(StreamId, Streams) of
@@ -2705,6 +2703,8 @@ process_frame(
                     Streams
                 );
             error ->
+                %% Notify owner of new stream
+                Owner ! {quic, Ref, {stream_opened, StreamId}},
                 %% Unknown stream - create minimal state to track reset
                 maps:put(
                     StreamId,
@@ -2716,6 +2716,8 @@ process_frame(
                     Streams
                 )
         end,
+    %% Notify owner of stream reset
+    Owner ! {quic, Ref, {stream_reset, StreamId, ErrorCode}},
     State#state{streams = NewStreams};
 %% STOP_SENDING: Peer wants us to stop sending on a stream
 %% RFC 9000 Section 19.5
@@ -2724,8 +2726,6 @@ process_frame(
     {stop_sending, StreamId, ErrorCode},
     #state{owner = Owner, conn_ref = Ref, streams = Streams} = State
 ) ->
-    %% Notify owner - they should stop sending and may send RESET_STREAM
-    Owner ! {quic, Ref, {stop_sending, StreamId, ErrorCode}},
     %% Clear any queued data for this stream and mark as stopped
     NewStreams =
         case maps:find(StreamId, Streams) of
@@ -2740,8 +2740,21 @@ process_frame(
                     Streams
                 );
             error ->
-                Streams
+                %% Notify owner of new stream
+                Owner ! {quic, Ref, {stream_opened, StreamId}},
+                %% Unknown stream - create minimal state to track
+                maps:put(
+                    StreamId,
+                    #stream_state{
+                        id = StreamId,
+                        state = stopped
+                    },
+                    Streams
+                )
+
         end,
+    %% Notify owner - they should stop sending and may send RESET_STREAM
+    Owner ! {quic, Ref, {stop_sending, StreamId, ErrorCode}},
     %% Also remove from send queue
     NewSendQueue = remove_stream_from_queue(StreamId, State#state.send_queue),
     State#state{streams = NewStreams, send_queue = NewSendQueue};
@@ -3360,6 +3373,8 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
             {ok, S} ->
                 {S, false};
             error ->
+                %% Notify owner of new stream
+                Owner ! {quic, Ref, {stream_opened, StreamId}},
                 %% New stream from peer - use peer's limits for streams they initiate
                 SendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
                 {
