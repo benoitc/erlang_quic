@@ -114,8 +114,8 @@
     merge_ack_ranges/1,
     convert_ack_ranges_for_encode/1,
     convert_rest_ranges/2,
-    check_send_queue_flow_control/3,
-    test_check_flow_control/5
+    check_send_queue_flow_control/4,
+    test_check_flow_control/6
 ]).
 -endif.
 
@@ -4457,10 +4457,12 @@ process_send_queue(#state{send_queue = PQ} = State) ->
     case pqueue_peek(PQ) of
         empty ->
             State;
-        {value, {stream_data, StreamId, _Offset, Data, _Fin}} ->
+        {value, {stream_data, StreamId, Offset, Data, _Fin}} ->
             %% Check flow control BEFORE dequeuing
+            %% Use the Offset stored in the queue entry, not stream.send_offset,
+            %% because send_offset may have advanced past this queued data's position.
             DataSize = byte_size(Data),
-            case check_send_queue_flow_control(StreamId, DataSize, State) of
+            case check_send_queue_flow_control(StreamId, Offset, DataSize, State) of
                 ok ->
                     %% Flow control allows - dequeue and try to send
                     process_send_queue_entry(State);
@@ -4472,31 +4474,24 @@ process_send_queue(#state{send_queue = PQ} = State) ->
 
 %% Check flow control limits for queued data
 %% Returns ok | {blocked, connection | {stream, StreamId}}
-%% NOTE: Only blocks if we're already OVER the limit (negative allowed).
-%% Normal flow control blocking happens in do_send_data before queueing.
-check_send_queue_flow_control(StreamId, DataSize, #state{
+%% Takes the Offset from the queue entry since stream.send_offset may have
+%% advanced past queued data positions (per PR #16 fix).
+check_send_queue_flow_control(StreamId, Offset, DataSize, #state{
     max_data_remote = MaxDataRemote,
     data_sent = DataSent,
     streams = Streams
 }) ->
     %% Check connection-level flow control
-    %% Only block if we're already over limit (defensive check)
     ConnectionAllowed = MaxDataRemote - DataSent,
-    case ConnectionAllowed >= 0 andalso DataSize =< ConnectionAllowed of
-        false when ConnectionAllowed < 0 ->
-            %% Already over limit - this shouldn't happen but guard against it
-            {blocked, connection};
+    case DataSize =< ConnectionAllowed of
         false ->
-            %% Would exceed limit - block
             {blocked, connection};
         true ->
-            %% Check stream-level flow control
+            %% Check stream-level flow control using the queue entry's Offset
             case maps:find(StreamId, Streams) of
-                {ok, #stream_state{send_max_data = SendMaxData, send_offset = Offset}} ->
-                    StreamAllowed = SendMaxData - Offset,
-                    case StreamAllowed >= 0 andalso DataSize =< StreamAllowed of
-                        false when StreamAllowed < 0 ->
-                            {blocked, {stream, StreamId}};
+                {ok, #stream_state{send_max_data = SendMaxData}} ->
+                    %% Data at Offset with DataSize must fit within SendMaxData
+                    case Offset + DataSize =< SendMaxData of
                         false ->
                             {blocked, {stream, StreamId}};
                         true ->
@@ -5335,12 +5330,13 @@ handle_retire_connection_id(SeqNum, State) ->
 %% RFC 9000 Section 4.1: Connection-level flow control (max_data)
 %% RFC 9000 Section 4.2: Stream-level flow control (max_stream_data)
 %% @param StreamId - Stream ID to check
+%% @param Offset - Offset of the queued data
 %% @param DataSize - Size of data to send
 %% @param MaxDataRemote - Peer's connection-level max_data limit
 %% @param DataSent - Bytes already sent on connection
 %% @param StreamsMap - Map of StreamId => {SendMaxData, SendOffset}
 %% @returns ok | {blocked, connection | {stream, StreamId}}
-test_check_flow_control(StreamId, DataSize, MaxDataRemote, DataSent, StreamsMap) ->
+test_check_flow_control(StreamId, Offset, DataSize, MaxDataRemote, DataSent, StreamsMap) ->
     Streams = maps:map(
         fun(_K, {SendMaxData, SendOffset}) ->
             #stream_state{send_max_data = SendMaxData, send_offset = SendOffset}
@@ -5352,5 +5348,5 @@ test_check_flow_control(StreamId, DataSize, MaxDataRemote, DataSent, StreamsMap)
         data_sent = DataSent,
         streams = Streams
     },
-    check_send_queue_flow_control(StreamId, DataSize, State).
+    check_send_queue_flow_control(StreamId, Offset, DataSize, State).
 -endif.
