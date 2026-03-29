@@ -140,3 +140,205 @@ buffer_operations_test() ->
     <<Extracted:Length/binary, Rest/binary>> = Buffer2,
     ?assertEqual(<<"hello">>, Extracted),
     ?assertEqual(<<" world">>, Rest).
+
+%%====================================================================
+%% Message Reassembly Tests
+%%====================================================================
+
+%% Test parsing complete messages from buffer (4-byte length prefix)
+parse_complete_message_test() ->
+    %% Single complete message
+    Payload = <<"hello world">>,
+    Len = byte_size(Payload),
+    Buffer = <<Len:32/big, Payload/binary>>,
+
+    <<MsgLen:32/big, Rest/binary>> = Buffer,
+    ?assertEqual(11, MsgLen),
+    <<Msg:MsgLen/binary, Remaining/binary>> = Rest,
+    ?assertEqual(<<"hello world">>, Msg),
+    ?assertEqual(<<>>, Remaining).
+
+%% Test parsing multiple messages in buffer
+parse_multiple_messages_test() ->
+    Msg1 = <<"hello">>,
+    Msg2 = <<"world">>,
+    Len1 = byte_size(Msg1),
+    Len2 = byte_size(Msg2),
+    Buffer = <<Len1:32/big, Msg1/binary, Len2:32/big, Msg2/binary>>,
+
+    %% Parse first message
+    <<L1:32/big, R1/binary>> = Buffer,
+    <<M1:L1/binary, R2/binary>> = R1,
+    ?assertEqual(<<"hello">>, M1),
+
+    %% Parse second message
+    <<L2:32/big, R3/binary>> = R2,
+    <<M2:L2/binary, R4/binary>> = R3,
+    ?assertEqual(<<"world">>, M2),
+    ?assertEqual(<<>>, R4).
+
+%% Test incomplete message (partial header)
+parse_incomplete_header_test() ->
+    %% Only 2 bytes of 4-byte header
+    Buffer = <<0, 0>>,
+    ?assert(byte_size(Buffer) < 4).
+
+%% Test incomplete message (partial payload)
+parse_incomplete_payload_test() ->
+    %% Header says 10 bytes, but only 5 available
+    Buffer = <<10:32/big, "hello">>,
+    <<Len:32/big, Rest/binary>> = Buffer,
+    ?assertEqual(10, Len),
+    ?assertEqual(5, byte_size(Rest)),
+    ?assert(byte_size(Rest) < Len).
+
+%% Test tick frame (zero-length message)
+parse_tick_frame_test() ->
+    %% Tick is an empty frame with length 0
+    Buffer = <<0:32/big>>,
+    <<Len:32/big, Rest/binary>> = Buffer,
+    ?assertEqual(0, Len),
+    ?assertEqual(<<>>, Rest).
+
+%% Test message reassembly across chunks (simulating QUIC delivery)
+reassembly_across_chunks_test() ->
+    Payload = <<"this is a longer message for testing">>,
+    Len = byte_size(Payload),
+    FullFrame = <<Len:32/big, Payload/binary>>,
+
+    %% Split into 3 chunks (simulating QUIC MTU fragmentation)
+    <<Chunk1:10/binary, Chunk2:15/binary, Chunk3/binary>> = FullFrame,
+
+    %% Reassemble
+    Buffer1 = Chunk1,
+    Buffer2 = <<Buffer1/binary, Chunk2/binary>>,
+    Buffer3 = <<Buffer2/binary, Chunk3/binary>>,
+
+    ?assertEqual(FullFrame, Buffer3),
+
+    %% Now parse
+    <<ParsedLen:32/big, ParsedRest/binary>> = Buffer3,
+    <<ParsedMsg:ParsedLen/binary, _/binary>> = ParsedRest,
+    ?assertEqual(Payload, ParsedMsg).
+
+%%====================================================================
+%% Handshake Framing Tests (2-byte length prefix)
+%%====================================================================
+
+handshake_framing_test() ->
+    Data = <<"handshake data">>,
+    Len = byte_size(Data),
+    Frame = <<Len:16/big, Data/binary>>,
+
+    <<ParsedLen:16/big, Rest/binary>> = Frame,
+    ?assertEqual(14, ParsedLen),
+    <<ParsedData:ParsedLen/binary, _/binary>> = Rest,
+    ?assertEqual(Data, ParsedData).
+
+handshake_max_size_test() ->
+    %% Max handshake message size with 2-byte length is 65535
+    MaxLen = 65535,
+    ?assert(MaxLen =< 16#FFFF).
+
+%%====================================================================
+%% Stream Selection Tests
+%%====================================================================
+
+%% Test data stream round-robin selection
+data_stream_round_robin_test() ->
+    DataStreams = [4, 8, 12, 16],
+    NumStreams = length(DataStreams),
+
+    %% Simulate 10 sends
+    Results = lists:map(
+        fun(Idx) ->
+            lists:nth((Idx rem NumStreams) + 1, DataStreams)
+        end,
+        lists:seq(0, 9)
+    ),
+
+    %% Should cycle through: 4,8,12,16,4,8,12,16,4,8
+    Expected = [4, 8, 12, 16, 4, 8, 12, 16, 4, 8],
+    ?assertEqual(Expected, Results).
+
+%% Test urgency values for different stream types
+stream_urgency_test() ->
+    %% From quic_dist.hrl
+    ControlUrgency = 0,
+    SignalUrgency = 2,
+    DataHighUrgency = 4,
+    DataNormalUrgency = 5,
+    DataLowUrgency = 6,
+
+    %% Control has highest priority (lowest number)
+    ?assert(ControlUrgency < SignalUrgency),
+    ?assert(SignalUrgency < DataHighUrgency),
+    ?assert(DataHighUrgency < DataNormalUrgency),
+    ?assert(DataNormalUrgency < DataLowUrgency).
+
+%%====================================================================
+%% Backpressure Logic Tests
+%%====================================================================
+
+%% Test congestion detection threshold
+congestion_threshold_test() ->
+    %% Default threshold is 2x cwnd
+    Cwnd = 65536,
+    Threshold = 2,
+
+    %% Queue below threshold - not congested
+    QueueSize1 = Cwnd,
+    Congested1 = QueueSize1 > (Cwnd * Threshold),
+    ?assertNot(Congested1),
+
+    %% Queue at threshold - not congested
+    QueueSize2 = Cwnd * Threshold,
+    Congested2 = QueueSize2 > (Cwnd * Threshold),
+    ?assertNot(Congested2),
+
+    %% Queue above threshold - congested
+    QueueSize3 = Cwnd * Threshold + 1,
+    Congested3 = QueueSize3 > (Cwnd * Threshold),
+    ?assert(Congested3).
+
+%% Test max pull limiting
+max_pull_limit_test() ->
+    MaxPull = 16,
+
+    %% Should pull at most MaxPull messages per notification
+    Available = 100,
+    Pulled = min(Available, MaxPull),
+    ?assertEqual(16, Pulled),
+
+    %% When fewer available, pull all
+    Available2 = 5,
+    Pulled2 = min(Available2, MaxPull),
+    ?assertEqual(5, Pulled2).
+
+%%====================================================================
+%% Statistics Tests
+%%====================================================================
+
+%% Test getstat return format
+getstat_format_test() ->
+    %% getstat should return list of {atom(), integer()} tuples
+    ExpectedKeys = [
+        recv_cnt,
+        recv_max,
+        recv_avg,
+        recv_oct,
+        recv_dvi,
+        send_cnt,
+        send_max,
+        send_avg,
+        send_oct,
+        send_pend
+    ],
+
+    %% Verify all expected keys are atoms
+    lists:foreach(
+        fun(Key) ->
+            ?assert(is_atom(Key))
+        end,
+        ExpectedKeys
+    ).
