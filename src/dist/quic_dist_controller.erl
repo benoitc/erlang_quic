@@ -41,6 +41,10 @@
     domain => [erlang_quic, dist_controller], report_cb => fun quic_log:format_report/2
 }).
 
+%% Maximum messages to deliver per batch in input handler before yielding.
+%% Prevents blocking on dist_ctrl_put_data during heavy incoming traffic.
+-define(INPUT_HANDLER_BATCH_SIZE, 32).
+
 %% API
 -export([
     start_link/2,
@@ -84,10 +88,15 @@
     data_streams = [] :: [non_neg_integer()],
     data_stream_idx = 0 :: non_neg_integer(),
 
-    %% Receive buffer for control stream
+    %% Receive buffer for control stream (handshake only)
     recv_buffer = <<>> :: binary(),
     recv_queue = queue:new() :: queue:queue(),
     recv_waiters = [] :: [{pid(), reference(), non_neg_integer()}],
+
+    %% Pending data stream buffer (for data arriving before connected state)
+    %% This handles the race where peer sends distribution data before we
+    %% have finished transitioning to connected state with input handler
+    pending_data_buffer = <<>> :: binary(),
 
     %% Send queue for pending messages
     send_queue = queue:new() :: queue:queue(),
@@ -418,13 +427,17 @@ connected(
 ->
     %% Server needs to open data streams for sending distribution data
     NewState = open_server_data_streams(State),
+    %% Forward any pending data stream content to input handler
+    NewState2 = forward_pending_data(NewState),
     %% Notify VM we're ready for data
     erlang:dist_ctrl_get_data_notification(DHandle),
-    {keep_state, NewState};
-connected(enter, _OldState, #state{dhandle = DHandle} = _State) when DHandle =/= undefined ->
+    {keep_state, NewState2};
+connected(enter, _OldState, #state{dhandle = DHandle} = State) when DHandle =/= undefined ->
     %% Client already has data streams, just notify VM we're ready
+    %% Forward any pending data stream content to input handler
+    NewState = forward_pending_data(State),
     erlang:dist_ctrl_get_data_notification(DHandle),
-    keep_state_and_data;
+    {keep_state, NewState};
 connected(enter, _OldState, _State) ->
     %% No DHandle (shouldn't happen in normal flow)
     keep_state_and_data;
@@ -448,15 +461,21 @@ connected({call, From}, {recv, Length}, State) ->
             {keep_state, State1#state{recv_waiters = Waiters}}
     end;
 %% Handle tick (from mf_tick callback)
-%% The Erlang distribution protocol handles ticks through dist_ctrl_get_data.
-%% We just need to flush any pending data. If nothing pending, send empty frame
-%% to generate activity (the receiver's dist_ctrl_put_data wakes up the VM).
-connected(cast, tick, #state{dhandle = DHandle} = State) when DHandle =/= undefined ->
-    %% Flush pending distribution data - this handles the tick protocol
-    case send_dist_data_with_tick(State) of
-        sent -> ok;
-        %% Send empty frame for liveness
-        none -> send_tick_frame(State)
+%% CRITICAL: Always send tick frame FIRST as the liveness signal.
+%% The tick frame uses the control stream (urgency 0, separate flow control)
+%% to ensure it gets through even when data streams are congested.
+%% Then optionally flush limited data (best effort, not blocking).
+connected(cast, tick, #state{dhandle = DHandle, conn_ref = ConnRef} = State) when
+    DHandle =/= undefined
+->
+    %% ALWAYS send tick frame first - this is the liveness signal
+    send_tick_frame(State),
+    %% Then try to flush some data if not congested (best effort)
+    case quic:get_send_queue_info(ConnRef) of
+        {ok, #{congested := false}} ->
+            _ = send_dist_data_with_tick(State);
+        _ ->
+            ok
     end,
     {keep_state, State};
 connected(cast, tick, State) ->
@@ -700,6 +719,47 @@ open_server_data_streams(State) ->
     {ok, NewState} = open_data_streams(State, ?QUIC_DIST_DATA_STREAMS),
     NewState.
 
+%% @private
+%% Forward any pending data stream content to the input handler.
+%% This handles the race condition where the peer starts sending distribution
+%% data before we've finished processing our handshake_complete message and
+%% transitioning to connected state.
+forward_pending_data(#state{pending_data_buffer = <<>>, input_handler = InputHandler} = State) when
+    is_pid(InputHandler)
+->
+    %% No pending data
+    State;
+forward_pending_data(
+    #state{pending_data_buffer = PendingData, input_handler = InputHandler} = State
+) when
+    is_pid(InputHandler), byte_size(PendingData) > 0
+->
+    %% Forward buffered data to input handler
+    ?LOG_INFO(
+        #{
+            what => forwarding_pending_data,
+            size => byte_size(PendingData)
+        },
+        ?QUIC_LOG_META
+    ),
+    InputHandler ! {dist_data, PendingData},
+    State#state{pending_data_buffer = <<>>};
+forward_pending_data(#state{pending_data_buffer = PendingData} = State) when
+    byte_size(PendingData) > 0
+->
+    %% No input handler yet - this shouldn't happen but log warning
+    ?LOG_WARNING(
+        #{
+            what => pending_data_no_handler,
+            size => byte_size(PendingData)
+        },
+        ?QUIC_LOG_META
+    ),
+    State;
+forward_pending_data(State) ->
+    %% No pending data and no handler
+    State.
+
 %%====================================================================
 %% Internal Functions - Send
 %%====================================================================
@@ -763,18 +823,18 @@ do_send_data(Data, State) ->
     do_send_control(Data, State).
 
 %% @private
-%% Send an empty frame on the data stream for tick/liveness.
-%% This uses the same framing as regular data (4-byte length prefix).
-%% An empty frame (length=0) signals liveness without actual payload.
-send_tick_frame(#state{conn_ref = ConnRef, data_streams = [FirstStream | _]}) ->
-    %% Send empty frame: <<0:32>> = 4-byte length header with length 0
-    quic:send_data(ConnRef, FirstStream, <<0:32/big-unsigned>>, false),
-    ok;
+%% Send tick frame on control stream for priority delivery.
+%% Control stream has urgency 0 and separate flow control from data streams.
+%% This ensures ticks always get through even when data streams are blocked.
 send_tick_frame(#state{conn_ref = ConnRef, control_stream = CtrlStream}) when
     CtrlStream =/= undefined
 ->
-    %% Fallback to control stream if no data streams
+    %% Always use control stream first - highest priority, separate flow control
     quic:send_data(ConnRef, CtrlStream, <<0:32/big-unsigned>>, false),
+    ok;
+send_tick_frame(#state{conn_ref = ConnRef, data_streams = [FirstStream | _]}) ->
+    %% Fallback to data stream only if no control stream
+    quic:send_data(ConnRef, FirstStream, <<0:32/big-unsigned>>, false),
     ok;
 send_tick_frame(_State) ->
     ok.
@@ -824,30 +884,38 @@ send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining) ->
 
 %% @private
 %% Send distribution data, returning `sent` if data was sent, `none` if nothing.
-%% Used by tick handler to know if an empty tick frame is needed.
+%% Used by tick handler to flush limited data (best effort, not blocking).
+%% Respects max_pull to prevent unbounded loop during tick callback.
 send_dist_data_with_tick(#state{
     dhandle = DHandle,
     conn_ref = ConnRef,
-    data_streams = [FirstStream | _]
+    data_streams = [FirstStream | _],
+    max_pull = MaxPull
 }) ->
-    send_dist_data_loop_tick(DHandle, ConnRef, FirstStream, none);
+    send_dist_data_loop_tick(DHandle, ConnRef, FirstStream, none, MaxPull);
 send_dist_data_with_tick(#state{
     dhandle = DHandle,
     conn_ref = ConnRef,
-    control_stream = CtrlStream
+    control_stream = CtrlStream,
+    max_pull = MaxPull
 }) ->
-    send_dist_data_loop_tick(DHandle, ConnRef, CtrlStream, none).
+    send_dist_data_loop_tick(DHandle, ConnRef, CtrlStream, none, MaxPull).
 
-send_dist_data_loop_tick(DHandle, ConnRef, StreamId, Status) ->
+%% @private
+%% Send distribution data with pull limit to prevent tick callback blocking.
+send_dist_data_loop_tick(_DHandle, _ConnRef, _StreamId, Status, 0) ->
+    %% Reached pull limit - stop to avoid blocking tick callback
+    Status;
+send_dist_data_loop_tick(DHandle, ConnRef, StreamId, Status, Remaining) ->
     case erlang:dist_ctrl_get_data(DHandle) of
         none ->
             Status;
         Data ->
             case send_one_frame(ConnRef, StreamId, Data) of
                 ok ->
-                    send_dist_data_loop_tick(DHandle, ConnRef, StreamId, sent);
+                    send_dist_data_loop_tick(DHandle, ConnRef, StreamId, sent, Remaining - 1);
                 {error, _} ->
-                    %% Error sending - still consider it as activity attempted
+                    %% Error sending - stop trying
                     sent
             end
     end.
@@ -887,6 +955,16 @@ input_handler_loop(DHandle, Controller, ConnRef, ControlStream) ->
 
 input_handler_loop(DHandle, Controller, ConnRef, ControlStream, Buffer) ->
     receive
+        {continue_delivery, PendingBuffer} ->
+            %% Continue processing after batch yield
+            case deliver_complete_messages(DHandle, PendingBuffer) of
+                {ok, RemainingBuffer} ->
+                    input_handler_loop(
+                        DHandle, Controller, ConnRef, ControlStream, RemainingBuffer
+                    );
+                {error, _Reason} ->
+                    exit(normal)
+            end;
         {dist_data, Data} ->
             %% Data received from QUIC - buffer and deliver complete messages
             NewBuffer = <<Buffer/binary, Data/binary>>,
@@ -924,20 +1002,31 @@ input_handler_loop(DHandle, Controller, ConnRef, ControlStream, Buffer) ->
     end.
 
 %% @private
-%% Deliver complete messages to the VM.
+%% Deliver complete messages to the VM with batch limiting.
 %% We use 4-byte length-prefixed framing: <<Length:32/big, Payload:Length/binary>>
 %% The payload (WITHOUT length header) is passed to dist_ctrl_put_data.
 %% Empty frames (Length=0) are tick signals - no payload to deliver.
 %% Returns {ok, RemainingBuffer} or {error, Reason}
 deliver_complete_messages(DHandle, Buffer) ->
+    deliver_complete_messages(DHandle, Buffer, ?INPUT_HANDLER_BATCH_SIZE).
+
+%% @private
+%% Deliver complete messages with batch limit to prevent blocking.
+%% After processing batch limit messages, yields back to receive loop
+%% via continue_delivery message to allow processing incoming ticks.
+deliver_complete_messages(_DHandle, Buffer, 0) ->
+    %% Reached batch limit - yield to allow processing other messages (e.g., ticks)
+    self() ! {continue_delivery, Buffer},
+    {ok, <<>>};
+deliver_complete_messages(DHandle, Buffer, Remaining) ->
     case Buffer of
-        <<0:32/big-unsigned, Remaining/binary>> ->
-            %% Empty frame = tick signal - just continue (activity already counted)
+        <<0:32/big-unsigned, Rest/binary>> ->
+            %% Empty frame = tick signal - just continue (ticks don't count against batch limit)
             logger:debug(#{what => tick_frame_received}, ?QUIC_LOG_META),
-            deliver_complete_messages(DHandle, Remaining);
+            deliver_complete_messages(DHandle, Rest, Remaining);
         <<Length:32/big-unsigned, Rest/binary>> when byte_size(Rest) >= Length ->
             %% We have a complete message - extract payload only
-            <<Payload:Length/binary, Remaining/binary>> = Rest,
+            <<Payload:Length/binary, Tail/binary>> = Rest,
             logger:debug(
                 #{
                     what => complete_message,
@@ -949,8 +1038,8 @@ deliver_complete_messages(DHandle, Buffer) ->
             try
                 %% Pass ONLY the payload to dist_ctrl_put_data (no length header)
                 erlang:dist_ctrl_put_data(DHandle, Payload),
-                %% Continue with remaining data
-                deliver_complete_messages(DHandle, Remaining)
+                %% Continue with remaining data, decrement batch counter
+                deliver_complete_messages(DHandle, Tail, Remaining - 1)
             catch
                 Class:Reason ->
                     logger:error(
@@ -1084,27 +1173,30 @@ handle_stream_data(
     Data,
     _StateName,
     #state{
-        recv_buffer = Buffer,
+        pending_data_buffer = PendingBuffer,
         recv_cnt = RecvCnt,
-        recv_oct = RecvOct,
-        recv_waiters = Waiters
+        recv_oct = RecvOct
     } = State
 ) ->
-    %% During handshake, buffer data (shouldn't happen for data streams)
-    NewBuffer = <<Buffer/binary, Data/binary>>,
-    State1 = State#state{
-        recv_buffer = NewBuffer,
+    %% Data stream content arrived before we transitioned to connected state.
+    %% This can happen due to race condition where peer sends distribution data
+    %% before we've finished processing our handshake_complete message.
+    %% Buffer it separately (NOT in recv_buffer which is for handshake) and
+    %% forward to input handler once we transition to connected state.
+    ?LOG_DEBUG(
+        #{
+            what => buffering_early_data_stream,
+            size => byte_size(Data),
+            pending_buffer_size => byte_size(PendingBuffer)
+        },
+        ?QUIC_LOG_META
+    ),
+    NewPendingBuffer = <<PendingBuffer/binary, Data/binary>>,
+    {keep_state, State#state{
+        pending_data_buffer = NewPendingBuffer,
         recv_cnt = RecvCnt + 1,
         recv_oct = RecvOct + byte_size(Data)
-    },
-    %% Try to satisfy any waiting recv requests
-    case Waiters of
-        [] ->
-            {keep_state, State1};
-        _ ->
-            {State2, Actions} = satisfy_waiters(Waiters, State1#state{recv_waiters = []}, []),
-            {keep_state, State2, Actions}
-    end.
+    }}.
 
 %% @private
 %% Try to satisfy waiting recv requests.
