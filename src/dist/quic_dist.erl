@@ -416,6 +416,10 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
                 max_stream_data_uni => ?DIST_INITIAL_MAX_STREAM_DATA,
                 %% Backpressure threshold for congestion detection
                 congestion_threshold => CongestionThreshold,
+                %% Disable pacing for now to test congestion behavior
+                pacing_enabled => false,
+                %% Longer recovery duration for virtual network packet reordering
+                min_recovery_duration => ?MIN_RECOVERY_DURATION_DISTRIBUTION,
                 connection_handler => fun(ConnPid, ConnRef) ->
                     handle_new_connection(ConnPid, ConnRef)
                 end
@@ -910,6 +914,10 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                 max_stream_data_uni => ?DIST_INITIAL_MAX_STREAM_DATA,
                 %% Backpressure threshold for congestion detection
                 congestion_threshold => CongestionThreshold,
+                %% Disable pacing for now to test congestion behavior
+                pacing_enabled => false,
+                %% Longer recovery duration for virtual network packet reordering
+                min_recovery_duration => ?MIN_RECOVERY_DURATION_DISTRIBUTION,
                 % TODO: Enable proper verification
                 verify => false
             },

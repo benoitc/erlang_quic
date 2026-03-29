@@ -263,6 +263,11 @@
 -define(MINIMUM_WINDOW_DISTRIBUTION, 16384).
 % 128KB - aggressive for high-bandwidth LAN
 
+%% Recovery Duration - Distribution-specific
+%% Longer minimum recovery duration for distribution to handle packet reordering
+%% in virtual networks (Docker bridge) without rapid recovery re-entry.
+-define(MIN_RECOVERY_DURATION_DISTRIBUTION, 200).
+
 %% Flow Control - Distribution-specific limits
 %% Higher limits for distribution to avoid flow control blocking during
 %% large message transfers (e.g., code loading, large term passing).

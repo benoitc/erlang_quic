@@ -11,9 +11,11 @@
     ]},
     {quic_dist_test, []},
     {kernel, [
-        {logger_level, info},
+        {logger_level, debug},
         {logger, [
             {handler, default, logger_std_h, #{
+                filters => [],
+                filter_default => log,
                 formatter => {logger_formatter, #{
                     template => ["[", level, "] ", msg, "\n"]
                 }}
