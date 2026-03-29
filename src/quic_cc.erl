@@ -58,6 +58,7 @@
     ssthresh/1,
     bytes_in_flight/1,
     can_send/2,
+    can_send_control/2,
     available_cwnd/1,
 
     %% State inspection
@@ -102,6 +103,10 @@
     %% Minimum time to stay in recovery (ms)
     %% Prevents rapid re-entry on low-latency networks
     min_recovery_duration = 100 :: non_neg_integer(),
+
+    %% Control message allowance (bytes) - allows critical small messages
+    %% to exceed cwnd by this amount to prevent blocking ticks
+    control_allowance = 1200 :: non_neg_integer(),
 
     %% Pacing state (RFC 9002 Section 7.7)
     %% Pacing prevents bursts by spacing out packet sends
@@ -246,7 +251,10 @@ on_packets_acked(
     %% is acknowledged. Check if the largest acked packet was sent AFTER recovery started.
     %% Extended: Also requires minimum recovery duration to pass before exiting.
     %% This prevents rapid cwnd oscillations on low-latency networks.
-    case LargestAckedSentTime > RecoveryStart andalso RecoveryDuration >= MinDuration of
+    case
+        RecoveryDuration >= MinDuration andalso
+            (LargestAckedSentTime > RecoveryStart orelse NewInFlight =:= 0)
+    of
         true ->
             %% Exit recovery - packet sent after recovery started was acked
             %% and minimum recovery duration has passed
@@ -372,6 +380,36 @@ on_congestion_event(
     State;
 on_congestion_event(
     #cc_state{
+        in_recovery = true,
+        recovery_start_time = RecoveryStart,
+        min_recovery_duration = MinDuration
+    } = State,
+    SentTime
+) ->
+    %% Already in recovery - check if min_recovery_duration has passed
+    Now = erlang:monotonic_time(millisecond),
+    RecoveryDuration = Now - RecoveryStart,
+    case RecoveryDuration < MinDuration of
+        true ->
+            %% Still within protected recovery period - don't reset recovery
+            ?LOG_DEBUG(
+                #{
+                    what => cc_congestion_skipped_protected_recovery,
+                    sent_time => SentTime,
+                    recovery_start_time => RecoveryStart,
+                    recovery_duration => RecoveryDuration,
+                    min_duration => MinDuration
+                },
+                ?QUIC_LOG_META
+            ),
+            State;
+        false ->
+            %% min_recovery_duration passed but packet sent after recovery started was lost
+            %% Allow this to reset recovery (fall through to general clause)
+            do_congestion_event(State, SentTime)
+    end;
+on_congestion_event(
+    #cc_state{
         in_recovery = false,
         recovery_start_time = RecoveryStart
     } = State,
@@ -388,7 +426,11 @@ on_congestion_event(
         ?QUIC_LOG_META
     ),
     State;
-on_congestion_event(
+on_congestion_event(State, SentTime) ->
+    do_congestion_event(State, SentTime).
+
+%% @private Helper to execute the congestion event logic.
+do_congestion_event(
     #cc_state{
         cwnd = Cwnd,
         bytes_in_flight = InFlight,
@@ -488,6 +530,16 @@ bytes_in_flight(#cc_state{bytes_in_flight = B}) -> B.
 -spec can_send(cc_state(), non_neg_integer()) -> boolean().
 can_send(#cc_state{cwnd = Cwnd, bytes_in_flight = InFlight}, Size) ->
     InFlight + Size =< Cwnd.
+
+%% @doc Check if a control message can be sent.
+%% Control messages (ticks, ACKs) can exceed cwnd by control_allowance
+%% to prevent net_tick_timeout in distribution.
+%% RFC 9002 recommends allowing at least one packet for progress.
+-spec can_send_control(cc_state(), non_neg_integer()) -> boolean().
+can_send_control(
+    #cc_state{cwnd = Cwnd, bytes_in_flight = InFlight, control_allowance = Allowance}, Size
+) ->
+    InFlight + Size =< Cwnd + Allowance.
 
 %% @doc Get the available congestion window (cwnd - bytes_in_flight).
 -spec available_cwnd(cc_state()) -> non_neg_integer().

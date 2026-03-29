@@ -79,6 +79,65 @@ available_cwnd_test() ->
     ?assertEqual(Cwnd - 5000, quic_cc:available_cwnd(S1)).
 
 %%====================================================================
+%% Control Message Allowance Tests
+%%====================================================================
+
+can_send_control_when_cwnd_full_test() ->
+    State = quic_cc:new(#{initial_window => 65536}),
+    %% Fill cwnd completely
+    S1 = quic_cc:on_packet_sent(State, 65536),
+    %% Regular can_send fails
+    ?assertNot(quic_cc:can_send(S1, 100)),
+    %% Control can_send succeeds (within allowance)
+    ?assert(quic_cc:can_send_control(S1, 100)).
+
+can_send_control_respects_allowance_test() ->
+    State = quic_cc:new(#{initial_window => 65536}),
+    S1 = quic_cc:on_packet_sent(State, 65536),
+    %% Large packet exceeds allowance (1200 bytes default)
+    ?assertNot(quic_cc:can_send_control(S1, 2000)).
+
+can_send_control_tick_message_test() ->
+    %% Simulate the exact tick blocking scenario
+    State = quic_cc:new(#{initial_window => 65536, minimum_window => 2400}),
+    %% Fill cwnd
+    S1 = quic_cc:on_packet_sent(State, 65536),
+    %% 4-byte tick + overhead
+    TickSize = 4 + 20,
+    %% Regular can_send blocks tick
+    ?assertNot(quic_cc:can_send(S1, TickSize)),
+    %% Control can_send allows tick
+    ?assert(quic_cc:can_send_control(S1, TickSize)).
+
+can_send_control_after_cwnd_collapse_test() ->
+    %% Simulate cwnd collapse after losses
+    %% The control_allowance (1200 bytes) is designed to handle the case
+    %% where cwnd is full but not massively exceeded.
+    State = quic_cc:new(#{
+        initial_window => 65536,
+        minimum_window => 2400,
+        min_recovery_duration => 0
+    }),
+    %% Trigger a congestion event to collapse cwnd
+    Now = erlang:monotonic_time(millisecond),
+    S1 = quic_cc:on_congestion_event(State, Now),
+    Cwnd = quic_cc:cwnd(S1),
+
+    %% Fill the collapsed cwnd exactly
+    S2 = quic_cc:on_packet_sent(S1, Cwnd),
+
+    %% Now bytes_in_flight = cwnd, regular can_send fails
+    ?assertNot(quic_cc:can_send(S2, 100)),
+    %% But can_send_control allows small control messages through
+    ?assert(quic_cc:can_send_control(S2, 100)),
+
+    %% Also test when slightly over cwnd (within allowance)
+    S3 = quic_cc:on_packet_sent(S1, Cwnd + 500),
+    ?assertNot(quic_cc:can_send(S3, 100)),
+    %% Still within allowance (500 + 100 < 1200)
+    ?assert(quic_cc:can_send_control(S3, 100)).
+
+%%====================================================================
 %% Slow Start Tests
 %%====================================================================
 
@@ -254,7 +313,12 @@ cwnd_minimum_test() ->
 
 configured_cwnd_minimum_test() ->
     %% Custom minimum window should be respected under repeated losses.
-    State = quic_cc:new(#{initial_window => 65536, minimum_window => 16384}),
+    %% Set min_recovery_duration => 0 to allow rapid congestion events in this test.
+    State = quic_cc:new(#{
+        initial_window => 65536,
+        minimum_window => 16384,
+        min_recovery_duration => 0
+    }),
     S1 = lists:foldl(
         fun(_, Acc) ->
             Now = erlang:monotonic_time(millisecond),

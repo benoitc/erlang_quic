@@ -210,6 +210,10 @@
     max_data_remote :: non_neg_integer(),
     data_sent = 0 :: non_neg_integer(),
     data_received = 0 :: non_neg_integer(),
+    %% Per-stream flow control limits (advertised in transport params)
+    max_stream_data_bidi_local :: non_neg_integer(),
+    max_stream_data_bidi_remote :: non_neg_integer(),
+    max_stream_data_uni :: non_neg_integer(),
 
     %% Stream management
     streams = #{} :: #{non_neg_integer() => #stream_state{}},
@@ -641,6 +645,13 @@ init({server, Opts}) ->
         pn_app = PNSpace,
         max_data_local = maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA),
         max_data_remote = ?DEFAULT_INITIAL_MAX_DATA,
+        max_stream_data_bidi_local = maps:get(
+            max_stream_data_bidi_local, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+        ),
+        max_stream_data_bidi_remote = maps:get(
+            max_stream_data_bidi_remote, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+        ),
+        max_stream_data_uni = maps:get(max_stream_data_uni, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA),
         % Server-initiated bidi: 1, 5, 9, ...
         next_stream_id_bidi = 1,
         % Server-initiated uni: 3, 7, 11, ...
@@ -807,6 +818,13 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         pn_app = PNSpace,
         max_data_local = maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA),
         max_data_remote = ?DEFAULT_INITIAL_MAX_DATA,
+        max_stream_data_bidi_local = maps:get(
+            max_stream_data_bidi_local, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+        ),
+        max_stream_data_bidi_remote = maps:get(
+            max_stream_data_bidi_remote, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+        ),
+        max_stream_data_uni = maps:get(max_stream_data_uni, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA),
         % Client-initiated bidi: 0, 4, 8, ...
         next_stream_id_bidi = 0,
         % Client-initiated uni: 2, 6, 10, ...
@@ -1300,6 +1318,9 @@ send_client_hello(State) ->
         server_name = ServerName,
         alpn_list = AlpnList,
         max_data_local = MaxData,
+        max_stream_data_bidi_local = MaxStreamDataBidiLocal,
+        max_stream_data_bidi_remote = MaxStreamDataBidiRemote,
+        max_stream_data_uni = MaxStreamDataUni,
         max_streams_bidi_local = MaxStreamsBidi,
         max_streams_uni_local = MaxStreamsUni,
         ticket_store = TicketStore
@@ -1316,9 +1337,9 @@ send_client_hello(State) ->
     TransportParams = #{
         initial_scid => SCID,
         initial_max_data => MaxData,
-        initial_max_stream_data_bidi_local => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-        initial_max_stream_data_bidi_remote => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-        initial_max_stream_data_uni => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+        initial_max_stream_data_bidi_local => MaxStreamDataBidiLocal,
+        initial_max_stream_data_bidi_remote => MaxStreamDataBidiRemote,
+        initial_max_stream_data_uni => MaxStreamDataUni,
         initial_max_streams_bidi => MaxStreamsBidi,
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => State#state.idle_timeout,
@@ -1540,6 +1561,9 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         scid = SCID,
         alpn = ALPN,
         max_data_local = MaxData,
+        max_stream_data_bidi_local = MaxStreamDataBidiLocal,
+        max_stream_data_bidi_remote = MaxStreamDataBidiRemote,
+        max_stream_data_uni = MaxStreamDataUni,
         max_streams_bidi_local = MaxStreamsBidi,
         max_streams_uni_local = MaxStreamsUni,
         server_cert = Cert,
@@ -1556,9 +1580,9 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         original_dcid => State#state.original_dcid,
         initial_scid => SCID,
         initial_max_data => MaxData,
-        initial_max_stream_data_bidi_local => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-        initial_max_stream_data_bidi_remote => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-        initial_max_stream_data_uni => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+        initial_max_stream_data_bidi_local => MaxStreamDataBidiLocal,
+        initial_max_stream_data_bidi_remote => MaxStreamDataBidiRemote,
+        initial_max_stream_data_uni => MaxStreamDataUni,
         initial_max_streams_bidi => MaxStreamsBidi,
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => State#state.idle_timeout,
@@ -4363,9 +4387,15 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSen
     byte_size(Data) =< ?MAX_STREAM_DATA_PER_PACKET
 ->
     %% Data fits in one packet - check congestion window and pacing
-    #state{cc_state = CCState, pacing_enabled = PacingEnabled} = State,
+    #state{cc_state = CCState, pacing_enabled = PacingEnabled, streams = Streams} = State,
     PacketSize = byte_size(Data) + ?PACKET_OVERHEAD,
-    CanSend = quic_cc:can_send(CCState, PacketSize),
+    %% Control streams (urgency 0) can exceed cwnd to prevent tick blocking
+    Urgency = get_stream_urgency(StreamId, Streams),
+    CanSend =
+        case Urgency of
+            0 -> quic_cc:can_send_control(CCState, PacketSize);
+            _ -> quic_cc:can_send(CCState, PacketSize)
+        end,
     case CanSend of
         true ->
             %% Cwnd allows - check pacing
@@ -4422,9 +4452,15 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSen
     end;
 send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
     %% Split data into chunks and send what we can
-    #state{cc_state = CCState, pacing_enabled = PacingEnabled} = State,
+    #state{cc_state = CCState, pacing_enabled = PacingEnabled, streams = Streams} = State,
     PacketSize = ?MAX_STREAM_DATA_PER_PACKET + ?PACKET_OVERHEAD,
-    CanSend = quic_cc:can_send(CCState, PacketSize),
+    %% Control streams (urgency 0) can exceed cwnd to prevent tick blocking
+    Urgency = get_stream_urgency(StreamId, Streams),
+    CanSend =
+        case Urgency of
+            0 -> quic_cc:can_send_control(CCState, PacketSize);
+            _ -> quic_cc:can_send(CCState, PacketSize)
+        end,
     case CanSend of
         true ->
             %% Cwnd allows - check pacing
