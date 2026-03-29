@@ -47,6 +47,12 @@
     detect_persistent_congestion/3,
     on_persistent_congestion/1,
 
+    %% Pacing (RFC 9002 Section 7.7)
+    update_pacing_rate/2,
+    pacing_allows/2,
+    get_pacing_tokens/2,
+    pacing_delay/2,
+
     %% Queries
     cwnd/1,
     ssthresh/1,
@@ -95,7 +101,19 @@
 
     %% Minimum time to stay in recovery (ms)
     %% Prevents rapid re-entry on low-latency networks
-    min_recovery_duration = 100 :: non_neg_integer()
+    min_recovery_duration = 100 :: non_neg_integer(),
+
+    %% Pacing state (RFC 9002 Section 7.7)
+    %% Pacing prevents bursts by spacing out packet sends
+
+    % bytes/ms
+    pacing_rate = 0 :: non_neg_integer(),
+    % available tokens (bytes)
+    pacing_tokens = 0 :: non_neg_integer(),
+    % 12 packets burst allowance
+    pacing_max_burst = 14400 :: non_neg_integer(),
+    % timestamp (ms)
+    last_pacing_update = 0 :: non_neg_integer()
 }).
 
 -opaque cc_state() :: #cc_state{}.
@@ -145,6 +163,9 @@ new(Opts) ->
     InitialWindow0 = maps:get(initial_window, Opts, DefaultWindow),
     InitialWindow = max(InitialWindow0, ConfiguredMinimumWindow),
     MinRecoveryDuration = maps:get(min_recovery_duration, Opts, 100),
+    %% Pacing: 10 packets burst allowance (12 with 1200 byte packets = 14400)
+    PacingMaxBurst = 12 * MaxDatagramSize,
+    Now = erlang:monotonic_time(millisecond),
     ?LOG_DEBUG(
         #{
             what => cc_state_initialized,
@@ -153,7 +174,8 @@ new(Opts) ->
             minimum_window => ConfiguredMinimumWindow,
             default_minimum_window => DefaultMinimumWindow,
             max_datagram_size => MaxDatagramSize,
-            min_recovery_duration => MinRecoveryDuration
+            min_recovery_duration => MinRecoveryDuration,
+            pacing_max_burst => PacingMaxBurst
         },
         ?QUIC_LOG_META
     ),
@@ -162,7 +184,11 @@ new(Opts) ->
         ssthresh = infinity,
         minimum_window = ConfiguredMinimumWindow,
         max_datagram_size = MaxDatagramSize,
-        min_recovery_duration = MinRecoveryDuration
+        min_recovery_duration = MinRecoveryDuration,
+        %% Initialize pacing with full burst allowance
+        pacing_max_burst = PacingMaxBurst,
+        pacing_tokens = PacingMaxBurst,
+        last_pacing_update = Now
     }.
 
 %%====================================================================
@@ -520,8 +546,106 @@ on_persistent_congestion(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} 
     }.
 
 %%====================================================================
+%% Pacing (RFC 9002 Section 7.7)
+%%====================================================================
+
+%% @doc Update pacing rate based on smoothed RTT and cwnd.
+%% RFC 9002: pacing_rate = cwnd / smoothed_rtt
+%% Called when RTT estimate is updated.
+-spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
+update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTT) when SmoothedRTT > 0 ->
+    %% pacing_rate = cwnd / smoothed_rtt (bytes/ms)
+    %% Multiply by 1.25 to allow slightly faster than cwnd/RTT for efficiency
+    PacingRate = max(1, (Cwnd * 5) div (SmoothedRTT * 4)),
+    State#cc_state{pacing_rate = PacingRate};
+update_pacing_rate(State, _SmoothedRTT) ->
+    %% No valid RTT yet, keep current state
+    State.
+
+%% @doc Check if pacing allows sending Size bytes.
+%% Returns true if enough tokens are available (including burst allowance).
+-spec pacing_allows(cc_state(), non_neg_integer()) -> boolean().
+pacing_allows(#cc_state{pacing_rate = 0}, _Size) ->
+    %% Pacing not initialized yet - allow sending
+    true;
+pacing_allows(
+    #cc_state{
+        pacing_tokens = Tokens,
+        pacing_max_burst = MaxBurst,
+        pacing_rate = Rate,
+        last_pacing_update = LastUpdate
+    },
+    Size
+) ->
+    %% Refill tokens first, then check
+    Now = erlang:monotonic_time(millisecond),
+    RefreshedTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
+    RefreshedTokens >= Size.
+
+%% @doc Get tokens for sending, consuming them and returning updated state.
+%% Returns {AllowedBytes, UpdatedState} where AllowedBytes <= Size.
+-spec get_pacing_tokens(cc_state(), non_neg_integer()) -> {non_neg_integer(), cc_state()}.
+get_pacing_tokens(#cc_state{pacing_rate = 0} = State, Size) ->
+    %% Pacing not initialized - allow full send
+    {Size, State};
+get_pacing_tokens(
+    #cc_state{
+        pacing_tokens = Tokens,
+        pacing_max_burst = MaxBurst,
+        pacing_rate = Rate,
+        last_pacing_update = LastUpdate
+    } = State,
+    Size
+) ->
+    Now = erlang:monotonic_time(millisecond),
+    %% Refill tokens based on elapsed time
+    NewTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
+    %% Consume up to available tokens
+    Allowed = min(Size, NewTokens),
+    RemainingTokens = max(0, NewTokens - Allowed),
+    NewState = State#cc_state{
+        pacing_tokens = RemainingTokens,
+        last_pacing_update = Now
+    },
+    {Allowed, NewState}.
+
+%% @doc Calculate delay (in ms) until Size bytes can be sent.
+%% Returns 0 if sending is allowed immediately.
+-spec pacing_delay(cc_state(), non_neg_integer()) -> non_neg_integer().
+pacing_delay(#cc_state{pacing_rate = 0}, _Size) ->
+    %% Pacing not initialized - no delay
+    0;
+pacing_delay(
+    #cc_state{
+        pacing_tokens = Tokens,
+        pacing_max_burst = MaxBurst,
+        pacing_rate = Rate,
+        last_pacing_update = LastUpdate
+    },
+    Size
+) ->
+    Now = erlang:monotonic_time(millisecond),
+    %% Calculate current tokens
+    CurrentTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
+    case CurrentTokens >= Size of
+        true ->
+            0;
+        false ->
+            %% Calculate time needed to accumulate enough tokens
+            Deficit = Size - CurrentTokens,
+            %% Time = bytes / (bytes/ms) = ms
+            max(1, (Deficit + Rate - 1) div Rate)
+    end.
+
+%%====================================================================
 %% Internal Functions
 %%====================================================================
+
+%% Refill pacing tokens based on elapsed time
+refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now) ->
+    Elapsed = max(0, Now - LastUpdate),
+    Added = Elapsed * Rate,
+    min(MaxBurst, Tokens + Added).
 
 %% Calculate initial window
 %% kInitialWindow = min(10 * max_datagram_size, max(14720, 2 * max_datagram_size))

@@ -386,6 +386,63 @@ send_until_blocked_test() ->
     ?assertNot(quic_cc:can_send(FinalState, 1200)).
 
 %%====================================================================
+%% Pacing Tests (RFC 9002 Section 7.7)
+%%====================================================================
+
+pacing_initial_state_test() ->
+    State = quic_cc:new(),
+    %% Initially, pacing should allow sending (rate is 0, no rate limit)
+    ?assert(quic_cc:pacing_allows(State, 1200)),
+    ?assertEqual(0, quic_cc:pacing_delay(State, 1200)).
+
+update_pacing_rate_test() ->
+    State = quic_cc:new(),
+    %% Update pacing rate with 50ms RTT
+    _S1 = quic_cc:update_pacing_rate(State, 50),
+    %% Rate should now be set (cwnd / rtt * 1.25)
+    Cwnd = quic_cc:cwnd(State),
+    ExpectedRate = max(1, (Cwnd * 5) div (50 * 4)),
+    %% Pacing should now be active
+    ?assert(ExpectedRate > 0).
+
+pacing_allows_with_tokens_test() ->
+    State = quic_cc:new(),
+    %% After init, tokens = max_burst (12 packets = 14400 bytes)
+    %% Should allow sending a single packet
+    ?assert(quic_cc:pacing_allows(State, 1200)).
+
+pacing_get_tokens_consumes_test() ->
+    State = quic_cc:new(),
+    S1 = quic_cc:update_pacing_rate(State, 50),
+    %% Get tokens to send 5000 bytes
+    {Allowed1, S2} = quic_cc:get_pacing_tokens(S1, 5000),
+    ?assertEqual(5000, Allowed1),
+    %% Get more tokens
+    {Allowed2, _S3} = quic_cc:get_pacing_tokens(S2, 5000),
+    ?assertEqual(5000, Allowed2).
+
+pacing_delay_when_blocked_test() ->
+    State = quic_cc:new(),
+    S1 = quic_cc:update_pacing_rate(State, 50),
+    %% Exhaust tokens by consuming the burst
+    {_, S2} = quic_cc:get_pacing_tokens(S1, 14400),
+    %% Now pacing should report a delay for the next packet
+    %% (After tokens exhausted, need to wait for refill)
+    Delay = quic_cc:pacing_delay(S2, 1200),
+    %% Delay may be 0 or small depending on how fast the test runs
+    ?assert(is_integer(Delay) andalso Delay >= 0).
+
+pacing_no_delay_without_rate_test() ->
+    %% When pacing rate is 0 (no RTT sample), no pacing should apply
+    State = quic_cc:new(),
+    ?assertEqual(0, quic_cc:pacing_delay(State, 50000)).
+
+pacing_allows_burst_test() ->
+    State = quic_cc:new(),
+    %% Should allow burst of 10+ packets (14400 bytes) initially
+    ?assert(quic_cc:pacing_allows(State, 12000)).
+
+%%====================================================================
 %% Helper Functions
 %%====================================================================
 

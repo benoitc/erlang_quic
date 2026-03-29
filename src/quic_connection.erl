@@ -234,6 +234,10 @@
     pto_timer :: reference() | undefined,
     idle_timer :: reference() | undefined,
 
+    %% Pacing (RFC 9002 Section 7.7)
+    pacing_timer :: reference() | undefined,
+    pacing_enabled = true :: boolean(),
+
     %% Pending data - priority queue with 8 buckets (one per urgency 0-7)
     %% Each bucket is a queue:queue() for FIFO within same priority
     send_queue = {
@@ -655,7 +659,8 @@ init({server, Opts}) ->
         server_private_key = PrivateKey,
         server_preferred_address = build_server_preferred_address(Opts),
         cid_config = maps:get(cid_config, Opts, undefined),
-        congestion_threshold = maps:get(congestion_threshold, Opts, 2)
+        congestion_threshold = maps:get(congestion_threshold, Opts, 2),
+        pacing_enabled = maps:get(pacing_enabled, Opts, true)
     },
 
     {ok, idle, State}.
@@ -820,7 +825,8 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
                 undefined -> quic_ticket:new_store();
                 Ticket -> quic_ticket:store_ticket(ServerName, Ticket, quic_ticket:new_store())
             end,
-        congestion_threshold = maps:get(congestion_threshold, Opts, 2)
+        congestion_threshold = maps:get(congestion_threshold, Opts, 2),
+        pacing_enabled = maps:get(pacing_enabled, Opts, true)
     },
 
     {ok, idle, State}.
@@ -830,12 +836,14 @@ terminate(_Reason, _StateName, #state{
     conn_ref = ConnRef,
     pto_timer = PtoTimer,
     idle_timer = IdleTimer,
+    pacing_timer = PacingTimer,
     role = Role
 }) ->
     unregister_conn(ConnRef),
     %% Cancel any active timers
     cancel_timer(PtoTimer),
     cancel_timer(IdleTimer),
+    cancel_timer(PacingTimer),
     %% Cancel delayed ACK timer from process dictionary
     case erase(ack_timer) of
         undefined -> ok;
@@ -1248,6 +1256,13 @@ handle_common_event(info, pto_timeout, StateName, State) when
 handle_common_event(info, pto_timeout, _StateName, State) ->
     %% Ignore PTO in other states
     {keep_state, State};
+handle_common_event(info, pacing_timeout, connected, State) ->
+    %% Handle pacing timeout - process send queue
+    NewState = handle_pacing_timeout(State),
+    {keep_state, NewState};
+handle_common_event(info, pacing_timeout, _StateName, State) ->
+    %% Ignore pacing timeout in other states
+    {keep_state, clear_pacing_timer(State)};
 handle_common_event(info, idle_timeout, StateName, State) when
     StateName =/= draining, StateName =/= closed
 ->
@@ -2663,8 +2678,12 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% Check for persistent congestion (RFC 9002 Section 7.6)
                     CCState5 = check_persistent_congestion(LostPackets, NewLossState, CCState4),
 
+                    %% Update pacing rate based on new RTT estimate (RFC 9002 Section 7.7)
+                    SmoothedRTT = quic_loss:smoothed_rtt(NewLossState),
+                    CCState6 = quic_cc:update_pacing_rate(CCState5, SmoothedRTT),
+
                     %% Log bytes_in_flight synchronization for debugging
-                    CCBytesInFlight = quic_cc:bytes_in_flight(CCState5),
+                    CCBytesInFlight = quic_cc:bytes_in_flight(CCState6),
                     LossBytesInFlight = quic_loss:bytes_in_flight(NewLossState),
                     ?LOG_DEBUG(
                         #{
@@ -2673,7 +2692,7 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                             lost_bytes => LostBytes,
                             acked_packets_count => length(AckedPackets),
                             lost_packets_count => length(LostPackets),
-                            cwnd => quic_cc:cwnd(CCState5),
+                            cwnd => quic_cc:cwnd(CCState6),
                             cc_bytes_in_flight => CCBytesInFlight,
                             loss_bytes_in_flight => LossBytesInFlight,
                             bytes_in_flight_synced => CCBytesInFlight =:= LossBytesInFlight,
@@ -2684,7 +2703,7 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
 
                     State1 = State#state{
                         loss_state = NewLossState,
-                        cc_state = CCState5
+                        cc_state = CCState6
                     },
 
                     %% Retransmit lost packets
@@ -4343,16 +4362,42 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State) ->
 send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) when
     byte_size(Data) =< ?MAX_STREAM_DATA_PER_PACKET
 ->
-    %% Data fits in one packet - check congestion window
-    #state{cc_state = CCState} = State,
+    %% Data fits in one packet - check congestion window and pacing
+    #state{cc_state = CCState, pacing_enabled = PacingEnabled} = State,
     PacketSize = byte_size(Data) + ?PACKET_OVERHEAD,
     CanSend = quic_cc:can_send(CCState, PacketSize),
     case CanSend of
         true ->
-            Frame = {stream, StreamId, Offset, Data, Fin},
-            Payload = quic_frame:encode(Frame),
-            NewState = send_app_packet_internal(Payload, [Frame], State),
-            {NewState, BytesSentSoFar + byte_size(Data)};
+            %% Cwnd allows - check pacing
+            case PacingEnabled andalso not quic_cc:pacing_allows(CCState, PacketSize) of
+                true ->
+                    %% Pacing blocked - queue data and set pacing timer
+                    Delay = quic_cc:pacing_delay(CCState, PacketSize),
+                    ?LOG_DEBUG(
+                        #{
+                            what => stream_data_paced,
+                            stream_id => StreamId,
+                            data_size => byte_size(Data),
+                            pacing_delay_ms => Delay
+                        },
+                        ?QUIC_LOG_META
+                    ),
+                    case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+                        {ok, QueuedState} ->
+                            PacedState = maybe_set_pacing_timer(Delay, QueuedState),
+                            {PacedState, BytesSentSoFar};
+                        {error, send_queue_full} ->
+                            {error, send_queue_full}
+                    end;
+                false ->
+                    %% Pacing allows - send immediately and consume tokens
+                    {_Allowed, NewCCState} = quic_cc:get_pacing_tokens(CCState, PacketSize),
+                    State1 = State#state{cc_state = NewCCState},
+                    Frame = {stream, StreamId, Offset, Data, Fin},
+                    Payload = quic_frame:encode(Frame),
+                    NewState = send_app_packet_internal(Payload, [Frame], State1),
+                    {NewState, BytesSentSoFar + byte_size(Data)}
+            end;
         false ->
             %% Queue the data for later sending when cwnd allows
             ?LOG_DEBUG(
@@ -4377,20 +4422,46 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSen
     end;
 send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
     %% Split data into chunks and send what we can
-    #state{cc_state = CCState} = State,
+    #state{cc_state = CCState, pacing_enabled = PacingEnabled} = State,
     PacketSize = ?MAX_STREAM_DATA_PER_PACKET + ?PACKET_OVERHEAD,
     CanSend = quic_cc:can_send(CCState, PacketSize),
     case CanSend of
         true ->
-            <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
-            Frame = {stream, StreamId, Offset, Chunk, false},
-            Payload = quic_frame:encode(Frame),
-            State1 = send_app_packet_internal(Payload, [Frame], State),
-            NewOffset = Offset + ?MAX_STREAM_DATA_PER_PACKET,
-            NewBytesSent = BytesSentSoFar + ?MAX_STREAM_DATA_PER_PACKET,
-            send_stream_data_fragmented_tracked(
-                StreamId, NewOffset, Rest, Fin, State1, NewBytesSent
-            );
+            %% Cwnd allows - check pacing
+            case PacingEnabled andalso not quic_cc:pacing_allows(CCState, PacketSize) of
+                true ->
+                    %% Pacing blocked - queue remaining data and set timer
+                    Delay = quic_cc:pacing_delay(CCState, PacketSize),
+                    ?LOG_DEBUG(
+                        #{
+                            what => stream_data_paced_large,
+                            stream_id => StreamId,
+                            data_size => byte_size(Data),
+                            pacing_delay_ms => Delay
+                        },
+                        ?QUIC_LOG_META
+                    ),
+                    case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+                        {ok, QueuedState} ->
+                            PacedState = maybe_set_pacing_timer(Delay, QueuedState),
+                            {PacedState, BytesSentSoFar};
+                        {error, send_queue_full} ->
+                            {error, send_queue_full}
+                    end;
+                false ->
+                    %% Pacing allows - consume tokens and send
+                    {_Allowed, NewCCState} = quic_cc:get_pacing_tokens(CCState, PacketSize),
+                    State0 = State#state{cc_state = NewCCState},
+                    <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
+                    Frame = {stream, StreamId, Offset, Chunk, false},
+                    Payload = quic_frame:encode(Frame),
+                    State1 = send_app_packet_internal(Payload, [Frame], State0),
+                    NewOffset = Offset + ?MAX_STREAM_DATA_PER_PACKET,
+                    NewBytesSent = BytesSentSoFar + ?MAX_STREAM_DATA_PER_PACKET,
+                    send_stream_data_fragmented_tracked(
+                        StreamId, NewOffset, Rest, Fin, State1, NewBytesSent
+                    )
+            end;
         false ->
             %% Queue remaining data for later
             ?LOG_DEBUG(
@@ -4814,6 +4885,49 @@ set_pto_timer(#state{loss_state = LossState, pto_timer = OldTimer} = State) ->
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
 
+%% Handle pacing timeout - drain queued data
+handle_pacing_timeout(#state{send_queue = PQ} = State) ->
+    %% Clear the expired timer first
+    State1 = State#state{pacing_timer = undefined},
+    %% Check if there's queued data
+    case pqueue_is_empty(PQ) of
+        true ->
+            State1;
+        false ->
+            %% Process the send queue
+            State2 = process_send_queue(State1),
+            %% If there's still queued data and pacing is blocking, set another timer
+            maybe_reschedule_pacing(State2)
+    end.
+
+%% Check if we need to reschedule pacing timer after processing queue
+maybe_reschedule_pacing(#state{send_queue = PQ, cc_state = CCState, pacing_enabled = true} = State) ->
+    case pqueue_is_empty(PQ) of
+        true ->
+            State;
+        false ->
+            %% Check if pacing would block the next send
+            PacketSize = ?MAX_STREAM_DATA_PER_PACKET + ?PACKET_OVERHEAD,
+            case quic_cc:can_send(CCState, PacketSize) of
+                true ->
+                    %% Cwnd allows, check pacing
+                    case quic_cc:pacing_allows(CCState, PacketSize) of
+                        true ->
+                            %% Can send now - no timer needed
+                            State;
+                        false ->
+                            %% Pacing blocked - set timer
+                            Delay = quic_cc:pacing_delay(CCState, PacketSize),
+                            maybe_set_pacing_timer(Delay, State)
+                    end;
+                false ->
+                    %% Cwnd blocked - no pacing timer needed
+                    State
+            end
+    end;
+maybe_reschedule_pacing(State) ->
+    State.
+
 %%====================================================================
 %% Idle Timer Management (RFC 9000 §10.1)
 %%====================================================================
@@ -4825,6 +4939,30 @@ set_idle_timer(#state{idle_timeout = Timeout, idle_timer = OldTimer} = State) ->
     cancel_timer(OldTimer),
     TimerRef = erlang:send_after(Timeout, self(), idle_timeout),
     State#state{idle_timer = TimerRef}.
+
+%%====================================================================
+%% Pacing Timer Management (RFC 9002 §7.7)
+%%====================================================================
+
+%% Set pacing timer if not already set
+%% Only sets a timer if there's data queued and no existing timer
+maybe_set_pacing_timer(0, State) ->
+    %% No delay - don't set timer
+    State;
+maybe_set_pacing_timer(_Delay, #state{pacing_timer = Ref} = State) when Ref =/= undefined ->
+    %% Timer already set - leave it
+    State;
+maybe_set_pacing_timer(Delay, #state{pacing_timer = undefined} = State) ->
+    %% Set new pacing timer
+    TimerRef = erlang:send_after(Delay, self(), pacing_timeout),
+    State#state{pacing_timer = TimerRef}.
+
+%% Clear pacing timer after processing
+clear_pacing_timer(#state{pacing_timer = undefined} = State) ->
+    State;
+clear_pacing_timer(#state{pacing_timer = Ref} = State) ->
+    cancel_timer(Ref),
+    State#state{pacing_timer = undefined}.
 
 %% Convert state to map for debugging
 state_to_map(#state{} = S) ->
