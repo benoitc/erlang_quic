@@ -58,13 +58,13 @@
 %% Longer than default to allow for infrequent cluster traffic
 -define(QUIC_DIST_IDLE_TIMEOUT, 300000).
 
-%% Distribution backpressure thresholds
-%% Congested when queue > cwnd * QUEUE_CONGESTION_MULTIPLIER
--define(QUEUE_CONGESTION_MULTIPLIER, 2).
+%% Distribution backpressure thresholds (can be overridden via config)
+%% Congested when queue > cwnd * congestion threshold
+-define(DEFAULT_QUEUE_CONGESTION_THRESHOLD, 2).
 %% Max messages to pull from VM per dist_data notification (prevents burst)
--define(MAX_PULL_PER_NOTIFICATION, 16).
+-define(DEFAULT_MAX_PULL_PER_NOTIFICATION, 16).
 %% Retry interval when congested (ms)
--define(BACKPRESSURE_RETRY_MS, 10).
+-define(DEFAULT_BACKPRESSURE_RETRY_MS, 10).
 
 %% Default ports
 -define(QUIC_DIST_DEFAULT_PORT, 4433).
@@ -107,7 +107,12 @@
     %% Load balancer
     lb_enabled = false :: boolean(),
     lb_server_id = auto :: auto | binary(),
-    lb_key :: binary() | undefined
+    lb_key :: binary() | undefined,
+
+    %% Backpressure tuning
+    congestion_threshold = ?DEFAULT_QUEUE_CONGESTION_THRESHOLD :: pos_integer(),
+    max_pull_per_notification = ?DEFAULT_MAX_PULL_PER_NOTIFICATION :: pos_integer(),
+    backpressure_retry_ms = ?DEFAULT_BACKPRESSURE_RETRY_MS :: pos_integer()
 }).
 
 %% Listener state

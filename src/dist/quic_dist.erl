@@ -326,7 +326,17 @@ load_config() ->
         stun_servers = get_opt(stun_servers, DistOpts, []),
         lb_enabled = get_opt(lb_enabled, DistOpts, false),
         lb_server_id = get_opt(lb_server_id, DistOpts, auto),
-        lb_key = get_opt(lb_key, DistOpts)
+        lb_key = get_opt(lb_key, DistOpts),
+        %% Backpressure tuning
+        congestion_threshold = get_opt(
+            congestion_threshold, DistOpts, ?DEFAULT_QUEUE_CONGESTION_THRESHOLD
+        ),
+        max_pull_per_notification = get_opt(
+            max_pull_per_notification, DistOpts, ?DEFAULT_MAX_PULL_PER_NOTIFICATION
+        ),
+        backpressure_retry_ms = get_opt(
+            backpressure_retry_ms, DistOpts, ?DEFAULT_BACKPRESSURE_RETRY_MS
+        )
     }.
 
 %% @private
@@ -387,6 +397,7 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
     %% Load certificate and key
     case load_credentials(Config) of
         {ok, Cert, Key, _CACert} ->
+            CongestionThreshold = Config#quic_dist_config.congestion_threshold,
             Opts = #{
                 cert => Cert,
                 key => Key,
@@ -403,6 +414,8 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
                 max_stream_data_bidi_local => ?DIST_INITIAL_MAX_STREAM_DATA,
                 max_stream_data_bidi_remote => ?DIST_INITIAL_MAX_STREAM_DATA,
                 max_stream_data_uni => ?DIST_INITIAL_MAX_STREAM_DATA,
+                %% Backpressure threshold for congestion detection
+                congestion_threshold => CongestionThreshold,
                 connection_handler => fun(ConnPid, ConnRef) ->
                     handle_new_connection(ConnPid, ConnRef)
                 end
@@ -878,6 +891,7 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
     %% Prepare QUIC connection options
     case load_credentials(Config) of
         {ok, Cert, Key, _CACert} ->
+            CongestionThreshold = Config#quic_dist_config.congestion_threshold,
             Opts = #{
                 cert => Cert,
                 key => Key,
@@ -894,6 +908,8 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                 max_stream_data_bidi_local => ?DIST_INITIAL_MAX_STREAM_DATA,
                 max_stream_data_bidi_remote => ?DIST_INITIAL_MAX_STREAM_DATA,
                 max_stream_data_uni => ?DIST_INITIAL_MAX_STREAM_DATA,
+                %% Backpressure threshold for congestion detection
+                congestion_threshold => CongestionThreshold,
                 % TODO: Enable proper verification
                 verify => false
             },

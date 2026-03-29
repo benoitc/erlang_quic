@@ -114,7 +114,11 @@
     send_oct = 0 :: non_neg_integer(),
 
     %% Session ticket for 0-RTT
-    session_ticket :: term() | undefined
+    session_ticket :: term() | undefined,
+
+    %% Backpressure tuning (from quic_dist_config or defaults)
+    max_pull = ?DEFAULT_MAX_PULL_PER_NOTIFICATION :: pos_integer(),
+    backpressure_retry = ?DEFAULT_BACKPRESSURE_RETRY_MS :: pos_integer()
 }).
 
 %%====================================================================
@@ -203,23 +207,42 @@ init({ConnRef, client}) ->
     %% Lookup connection PID
     case quic_connection:lookup(ConnRef) of
         {ok, ConnPid} ->
-            State = #state{
+            State = init_backpressure_config(#state{
                 conn_ref = ConnRef,
                 conn_pid = ConnPid,
                 role = client
-            },
+            }),
             {ok, init_state, State};
         error ->
             {stop, connection_not_found}
     end;
 %% Initialize for server role
 init({ConnPid, ConnRef, server}) ->
-    State = #state{
+    State = init_backpressure_config(#state{
         conn_ref = ConnRef,
         conn_pid = ConnPid,
         role = server
-    },
+    }),
     {ok, init_state, State}.
+
+%% @private
+%% Initialize backpressure configuration from application environment.
+%% Reads max_pull_per_notification and backpressure_retry_ms from quic dist config.
+init_backpressure_config(State) ->
+    DistOpts = application:get_env(quic, dist, []),
+    MaxPull = get_dist_opt(max_pull_per_notification, DistOpts, ?DEFAULT_MAX_PULL_PER_NOTIFICATION),
+    RetryMs = get_dist_opt(backpressure_retry_ms, DistOpts, ?DEFAULT_BACKPRESSURE_RETRY_MS),
+    State#state{
+        max_pull = MaxPull,
+        backpressure_retry = RetryMs
+    }.
+
+%% @private
+%% Get option from dist config (supports both proplist and map).
+get_dist_opt(Key, Opts, Default) when is_list(Opts) ->
+    proplists:get_value(Key, Opts, Default);
+get_dist_opt(Key, Opts, Default) when is_map(Opts) ->
+    maps:get(Key, Opts, Default).
 
 terminate(_Reason, _StateName, #state{conn_ref = ConnRef}) ->
     try
@@ -443,14 +466,18 @@ connected(cast, tick, State) ->
 %% Handle dist_data notification from VM
 %% This means the VM has data ready for us to send
 %% Uses backpressure to avoid overwhelming the QUIC send queue
-connected(info, dist_data, #state{dhandle = DHandle, conn_ref = ConnRef} = State) when
+connected(
+    info,
+    dist_data,
+    #state{dhandle = DHandle, conn_ref = ConnRef, backpressure_retry = RetryMs} = State
+) when
     DHandle =/= undefined
 ->
     case quic:get_send_queue_info(ConnRef) of
         {ok, #{congested := true}} ->
             %% Queue is congested - don't pull more data
             %% Re-check after a delay
-            erlang:send_after(?BACKPRESSURE_RETRY_MS, self(), check_queue),
+            erlang:send_after(RetryMs, self(), check_queue),
             {keep_state, State};
         {ok, #{congested := false}} ->
             %% Queue has room - pull and send limited amount of data
@@ -465,7 +492,11 @@ connected(info, dist_data, #state{dhandle = DHandle, conn_ref = ConnRef} = State
             {keep_state, State}
     end;
 %% Handle check_queue - retry sending after backpressure delay
-connected(info, check_queue, #state{dhandle = DHandle, conn_ref = ConnRef} = State) when
+connected(
+    info,
+    check_queue,
+    #state{dhandle = DHandle, conn_ref = ConnRef, backpressure_retry = RetryMs} = State
+) when
     DHandle =/= undefined
 ->
     case quic:get_send_queue_info(ConnRef) of
@@ -476,7 +507,7 @@ connected(info, check_queue, #state{dhandle = DHandle, conn_ref = ConnRef} = Sta
             {keep_state, State};
         _ ->
             %% Still congested or error - retry later
-            erlang:send_after(?BACKPRESSURE_RETRY_MS, self(), check_queue),
+            erlang:send_after(RetryMs, self(), check_queue),
             {keep_state, State}
     end;
 connected(EventType, Event, State) ->
@@ -751,21 +782,23 @@ send_tick_frame(_State) ->
 %% @private
 %% Send distribution data from VM via QUIC with backpressure.
 %% Called when dist_data notification is received.
-%% Limits pulls to MAX_PULL_PER_NOTIFICATION to prevent burst.
+%% Limits pulls to max_pull to prevent burst.
 send_dist_data_limited(#state{
     dhandle = DHandle,
     conn_ref = ConnRef,
-    data_streams = [FirstStream | _]
+    data_streams = [FirstStream | _],
+    max_pull = MaxPull
 }) ->
     %% Use first data stream for all distribution data to maintain ordering
-    send_dist_data_limited_loop(DHandle, ConnRef, FirstStream, ?MAX_PULL_PER_NOTIFICATION);
+    send_dist_data_limited_loop(DHandle, ConnRef, FirstStream, MaxPull);
 send_dist_data_limited(#state{
     dhandle = DHandle,
     conn_ref = ConnRef,
-    control_stream = CtrlStream
+    control_stream = CtrlStream,
+    max_pull = MaxPull
 }) ->
     %% Fallback: no data streams, use control stream
-    send_dist_data_limited_loop(DHandle, ConnRef, CtrlStream, ?MAX_PULL_PER_NOTIFICATION).
+    send_dist_data_limited_loop(DHandle, ConnRef, CtrlStream, MaxPull).
 
 %% @private
 %% Send distribution data with limited pulls per notification.

@@ -310,7 +310,11 @@
     early_data_accepted = false :: boolean(),
 
     %% QUIC-LB CID configuration (RFC 9312)
-    cid_config :: #cid_config{} | undefined
+    cid_config :: #cid_config{} | undefined,
+
+    %% Backpressure configuration (for distribution connections)
+    %% Connection is congested when queue > cwnd * congestion_threshold
+    congestion_threshold = 2 :: pos_integer()
 }).
 
 %%====================================================================
@@ -650,7 +654,8 @@ init({server, Opts}) ->
         server_cert_chain = CertChain,
         server_private_key = PrivateKey,
         server_preferred_address = build_server_preferred_address(Opts),
-        cid_config = maps:get(cid_config, Opts, undefined)
+        cid_config = maps:get(cid_config, Opts, undefined),
+        congestion_threshold = maps:get(congestion_threshold, Opts, 2)
     },
 
     {ok, idle, State}.
@@ -814,7 +819,8 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             case SessionTicket of
                 undefined -> quic_ticket:new_store();
                 Ticket -> quic_ticket:store_ticket(ServerName, Ticket, quic_ticket:new_store())
-            end
+            end,
+        congestion_threshold = maps:get(congestion_threshold, Opts, 2)
     },
 
     {ok, idle, State}.
@@ -1115,14 +1121,15 @@ connected(
     get_send_queue_info,
     #state{
         send_queue_bytes = Bytes,
-        cc_state = CCState
+        cc_state = CCState,
+        congestion_threshold = Threshold
     } = State
 ) ->
     Cwnd = quic_cc:cwnd(CCState),
     InFlight = quic_cc:bytes_in_flight(CCState),
     InRecovery = quic_cc:in_recovery(CCState),
-    %% Congested if queue > 2x cwnd OR in recovery with queue > cwnd
-    Congested = (Bytes > Cwnd * 2) orelse (InRecovery andalso Bytes > Cwnd),
+    %% Congested if queue > cwnd * threshold OR in recovery with queue > cwnd
+    Congested = (Bytes > Cwnd * Threshold) orelse (InRecovery andalso Bytes > Cwnd),
     Info = #{
         bytes => Bytes,
         cwnd => Cwnd,
