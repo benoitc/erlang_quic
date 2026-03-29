@@ -56,7 +56,8 @@
 
     %% State inspection
     in_slow_start/1,
-    in_recovery/1
+    in_recovery/1,
+    min_recovery_duration/1
 ]).
 
 %% Constants from RFC 9002
@@ -90,11 +91,25 @@
 
     %% Configuration
     minimum_window :: non_neg_integer(),
-    max_datagram_size :: non_neg_integer()
+    max_datagram_size :: non_neg_integer(),
+
+    %% Minimum time to stay in recovery (ms)
+    %% Prevents rapid re-entry on low-latency networks
+    min_recovery_duration = 100 :: non_neg_integer()
 }).
 
 -opaque cc_state() :: #cc_state{}.
 -export_type([cc_state/0]).
+
+%% CC options type for external implementations
+%% Exported for construction by callers.
+-type cc_opts() :: #{
+    initial_window => pos_integer(),
+    minimum_window => pos_integer(),
+    min_recovery_duration => non_neg_integer(),
+    max_datagram_size => pos_integer()
+}.
+-export_type([cc_opts/0]).
 
 %%====================================================================
 %% State Management
@@ -113,7 +128,9 @@ new() ->
 %%                     Recommended: 32768 (32KB) or 65536 (64KB) for LAN/distribution.
 %%   - minimum_window: Lower bound for cwnd after congestion events
 %%                     (default: 2 * max_datagram_size per RFC 9002).
--spec new(map()) -> cc_state().
+%%   - min_recovery_duration: Minimum time in recovery before exit (ms, default: 100)
+%%                            Prevents rapid cwnd oscillations on low-latency networks.
+-spec new(cc_opts()) -> cc_state().
 new(Opts) ->
     MaxDatagramSize = maps:get(max_datagram_size, Opts, ?MAX_DATAGRAM_SIZE),
     DefaultWindow = initial_window(MaxDatagramSize),
@@ -127,6 +144,7 @@ new(Opts) ->
         end,
     InitialWindow0 = maps:get(initial_window, Opts, DefaultWindow),
     InitialWindow = max(InitialWindow0, ConfiguredMinimumWindow),
+    MinRecoveryDuration = maps:get(min_recovery_duration, Opts, 100),
     ?LOG_DEBUG(
         #{
             what => cc_state_initialized,
@@ -134,7 +152,8 @@ new(Opts) ->
             default_cwnd => DefaultWindow,
             minimum_window => ConfiguredMinimumWindow,
             default_minimum_window => DefaultMinimumWindow,
-            max_datagram_size => MaxDatagramSize
+            max_datagram_size => MaxDatagramSize,
+            min_recovery_duration => MinRecoveryDuration
         },
         ?QUIC_LOG_META
     ),
@@ -142,7 +161,8 @@ new(Opts) ->
         cwnd = InitialWindow,
         ssthresh = infinity,
         minimum_window = ConfiguredMinimumWindow,
-        max_datagram_size = MaxDatagramSize
+        max_datagram_size = MaxDatagramSize,
+        min_recovery_duration = MinRecoveryDuration
     }.
 
 %%====================================================================
@@ -176,24 +196,34 @@ on_packets_acked(State, AckedBytes) ->
     Now = erlang:monotonic_time(millisecond),
     on_packets_acked(State, AckedBytes, Now).
 
+%% @doc Process acknowledged packets.
+%% RFC 9002: Exit recovery when the largest acked packet was sent after recovery started.
+%% Extended: Also requires minimum recovery duration to pass before exiting.
 -spec on_packets_acked(cc_state(), non_neg_integer(), non_neg_integer()) -> cc_state().
 on_packets_acked(
     #cc_state{
         bytes_in_flight = InFlight,
         cwnd = OldCwnd,
         in_recovery = true,
-        recovery_start_time = RecoveryStart
+        recovery_start_time = RecoveryStart,
+        min_recovery_duration = MinDuration
     } = State,
     AckedBytes,
     LargestAckedSentTime
 ) ->
     NewInFlight = max(0, InFlight - AckedBytes),
+    Now = erlang:monotonic_time(millisecond),
+    RecoveryDuration = Now - RecoveryStart,
+
     %% RFC 9002 Section 7.3.2: A recovery period ends and the sender
     %% enters congestion avoidance when a packet sent during the recovery period
     %% is acknowledged. Check if the largest acked packet was sent AFTER recovery started.
-    case LargestAckedSentTime > RecoveryStart of
+    %% Extended: Also requires minimum recovery duration to pass before exiting.
+    %% This prevents rapid cwnd oscillations on low-latency networks.
+    case LargestAckedSentTime > RecoveryStart andalso RecoveryDuration >= MinDuration of
         true ->
             %% Exit recovery - packet sent after recovery started was acked
+            %% and minimum recovery duration has passed
             %% Now in congestion avoidance, can increase cwnd
             #cc_state{cwnd = Cwnd, ssthresh = SSThresh, max_datagram_size = MaxDS} = State,
             NewCwnd =
@@ -212,14 +242,14 @@ on_packets_acked(
                     new_cwnd => NewCwnd,
                     old_in_flight => InFlight,
                     new_in_flight => NewInFlight,
-                    ssthresh => SSThresh
+                    ssthresh => SSThresh,
+                    recovery_duration => RecoveryDuration
                 },
                 ?QUIC_LOG_META
             ),
             %% Update recovery_start_time to current time when exiting recovery.
             %% This prevents re-entering recovery for packets sent during
             %% the recovery period that are still in flight.
-            Now = erlang:monotonic_time(millisecond),
             State#cc_state{
                 bytes_in_flight = NewInFlight,
                 in_recovery = false,
@@ -234,7 +264,9 @@ on_packets_acked(
                     acked_bytes => AckedBytes,
                     cwnd => OldCwnd,
                     old_in_flight => InFlight,
-                    new_in_flight => NewInFlight
+                    new_in_flight => NewInFlight,
+                    recovery_duration => RecoveryDuration,
+                    min_duration => MinDuration
                 },
                 ?QUIC_LOG_META
             ),
@@ -444,6 +476,11 @@ in_slow_start(#cc_state{cwnd = Cwnd, ssthresh = SSThresh}) ->
 %% @doc Check if in recovery phase.
 -spec in_recovery(cc_state()) -> boolean().
 in_recovery(#cc_state{in_recovery = R}) -> R.
+
+%% @doc Get minimum recovery duration setting.
+%% External CC implementations can use this to tune recovery behavior.
+-spec min_recovery_duration(cc_state()) -> non_neg_integer().
+min_recovery_duration(#cc_state{min_recovery_duration = D}) -> D.
 
 %%====================================================================
 %% Persistent Congestion (RFC 9002 Section 7.6)

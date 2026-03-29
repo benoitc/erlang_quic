@@ -58,6 +58,14 @@
 %% Longer than default to allow for infrequent cluster traffic
 -define(QUIC_DIST_IDLE_TIMEOUT, 300000).
 
+%% Distribution backpressure thresholds
+%% Congested when queue > cwnd * QUEUE_CONGESTION_MULTIPLIER
+-define(QUEUE_CONGESTION_MULTIPLIER, 2).
+%% Max messages to pull from VM per dist_data notification (prevents burst)
+-define(MAX_PULL_PER_NOTIFICATION, 16).
+%% Retry interval when congested (ms)
+-define(BACKPRESSURE_RETRY_MS, 10).
+
 %% Default ports
 -define(QUIC_DIST_DEFAULT_PORT, 4433).
 -define(QUIC_DIST_PORT_RANGE_START, 4433).

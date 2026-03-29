@@ -32,6 +32,28 @@
 
 -module(quic).
 
+-include("quic.hrl").
+
+%% Send queue information for backpressure decisions.
+%% Used by distribution controllers and other high-level protocols
+%% to implement backpressure based on congestion state.
+%% Exported for pattern matching by consumers.
+-type send_queue_info() :: #{
+    %% Bytes currently queued
+    bytes := non_neg_integer(),
+    %% Congestion window size
+    cwnd := non_neg_integer(),
+    %% Bytes sent but not acked
+    in_flight := non_neg_integer(),
+    %% Currently in recovery mode
+    in_recovery := boolean(),
+    %% Whether backpressure should apply
+    congested := boolean()
+}.
+
+%% Export the send_queue_info type for external use
+-export_type([send_queue_info/0]).
+
 -export([
     connect/4,
     close/2,
@@ -51,7 +73,9 @@
     migrate/1,
     %% Stream prioritization (RFC 9218)
     set_stream_priority/4,
-    get_stream_priority/2
+    get_stream_priority/2,
+    %% Congestion/backpressure status
+    get_send_queue_info/1
 ]).
 
 %% Server management API
@@ -374,6 +398,30 @@ get_stream_priority(ConnRef, StreamId) when is_reference(ConnRef) ->
 get_stream_priority(ConnPid, StreamId) when is_pid(ConnPid) ->
     quic_connection:get_stream_priority(ConnPid, StreamId);
 get_stream_priority(_ConnRef, _StreamId) ->
+    {error, badarg}.
+
+%% @doc Get send queue information for a connection.
+%% This can be used by distribution controllers or other high-level
+%% protocols to implement backpressure based on queue state.
+%%
+%% Returns a map with:
+%% - `bytes': Current bytes in send queue
+%% - `cwnd': Congestion window size
+%% - `in_flight': Bytes sent but not acknowledged
+%% - `in_recovery': Whether in congestion recovery
+%% - `congested': Whether backpressure should be applied
+%%
+%% @see quic_dist_controller for usage example
+-spec get_send_queue_info(ConnRef) -> {ok, send_queue_info()} | {error, term()} when
+    ConnRef :: reference() | pid().
+get_send_queue_info(ConnRef) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:get_send_queue_info(Pid);
+        error -> {error, not_found}
+    end;
+get_send_queue_info(ConnPid) when is_pid(ConnPid) ->
+    quic_connection:get_send_queue_info(ConnPid);
+get_send_queue_info(_ConnRef) ->
     {error, badarg}.
 
 %%====================================================================

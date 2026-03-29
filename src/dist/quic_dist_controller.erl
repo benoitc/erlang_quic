@@ -442,13 +442,43 @@ connected(cast, tick, State) ->
     {keep_state, State};
 %% Handle dist_data notification from VM
 %% This means the VM has data ready for us to send
-connected(info, dist_data, #state{dhandle = DHandle} = State) when
+%% Uses backpressure to avoid overwhelming the QUIC send queue
+connected(info, dist_data, #state{dhandle = DHandle, conn_ref = ConnRef} = State) when
     DHandle =/= undefined
 ->
-    send_dist_data(State),
-    %% Re-register for next notification
-    erlang:dist_ctrl_get_data_notification(DHandle),
-    {keep_state, State};
+    case quic:get_send_queue_info(ConnRef) of
+        {ok, #{congested := true}} ->
+            %% Queue is congested - don't pull more data
+            %% Re-check after a delay
+            erlang:send_after(?BACKPRESSURE_RETRY_MS, self(), check_queue),
+            {keep_state, State};
+        {ok, #{congested := false}} ->
+            %% Queue has room - pull and send limited amount of data
+            send_dist_data_limited(State),
+            %% Re-register for next notification
+            erlang:dist_ctrl_get_data_notification(DHandle),
+            {keep_state, State};
+        {error, _} ->
+            %% Error getting info - try sending anyway to avoid deadlock
+            send_dist_data_limited(State),
+            erlang:dist_ctrl_get_data_notification(DHandle),
+            {keep_state, State}
+    end;
+%% Handle check_queue - retry sending after backpressure delay
+connected(info, check_queue, #state{dhandle = DHandle, conn_ref = ConnRef} = State) when
+    DHandle =/= undefined
+->
+    case quic:get_send_queue_info(ConnRef) of
+        {ok, #{congested := false}} ->
+            %% Queue has room - pull and send data
+            send_dist_data_limited(State),
+            erlang:dist_ctrl_get_data_notification(DHandle),
+            {keep_state, State};
+        _ ->
+            %% Still congested or error - retry later
+            erlang:send_after(?BACKPRESSURE_RETRY_MS, self(), check_queue),
+            {keep_state, State}
+    end;
 connected(EventType, Event, State) ->
     handle_common_event(EventType, Event, connected, State).
 
@@ -719,23 +749,45 @@ send_tick_frame(_State) ->
     ok.
 
 %% @private
-%% Send distribution data from VM via QUIC.
+%% Send distribution data from VM via QUIC with backpressure.
 %% Called when dist_data notification is received.
-%% Uses a single data stream to maintain message ordering.
-send_dist_data(#state{
+%% Limits pulls to MAX_PULL_PER_NOTIFICATION to prevent burst.
+send_dist_data_limited(#state{
     dhandle = DHandle,
     conn_ref = ConnRef,
     data_streams = [FirstStream | _]
 }) ->
     %% Use first data stream for all distribution data to maintain ordering
-    send_dist_data_loop(DHandle, ConnRef, FirstStream);
-send_dist_data(#state{
+    send_dist_data_limited_loop(DHandle, ConnRef, FirstStream, ?MAX_PULL_PER_NOTIFICATION);
+send_dist_data_limited(#state{
     dhandle = DHandle,
     conn_ref = ConnRef,
     control_stream = CtrlStream
 }) ->
     %% Fallback: no data streams, use control stream
-    send_dist_data_loop(DHandle, ConnRef, CtrlStream).
+    send_dist_data_limited_loop(DHandle, ConnRef, CtrlStream, ?MAX_PULL_PER_NOTIFICATION).
+
+%% @private
+%% Send distribution data with limited pulls per notification.
+send_dist_data_limited_loop(_DHandle, _ConnRef, _StreamId, 0) ->
+    %% Pulled enough for now
+    ok;
+send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining) ->
+    case erlang:dist_ctrl_get_data(DHandle) of
+        none ->
+            ok;
+        Data ->
+            case send_one_frame(ConnRef, StreamId, Data) of
+                ok ->
+                    send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining - 1);
+                {error, send_queue_full} ->
+                    %% Stop pulling, queue is full
+                    ok;
+                {error, _} ->
+                    %% Other error - continue trying
+                    send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining - 1)
+            end
+    end.
 
 %% @private
 %% Send distribution data, returning `sent` if data was sent, `none` if nothing.
@@ -753,27 +805,24 @@ send_dist_data_with_tick(#state{
 }) ->
     send_dist_data_loop_tick(DHandle, ConnRef, CtrlStream, none).
 
-send_dist_data_loop(DHandle, ConnRef, StreamId) ->
-    case erlang:dist_ctrl_get_data(DHandle) of
-        none ->
-            ok;
-        Data ->
-            send_one_frame(ConnRef, StreamId, Data),
-            send_dist_data_loop(DHandle, ConnRef, StreamId)
-    end.
-
 send_dist_data_loop_tick(DHandle, ConnRef, StreamId, Status) ->
     case erlang:dist_ctrl_get_data(DHandle) of
         none ->
             Status;
         Data ->
-            send_one_frame(ConnRef, StreamId, Data),
-            send_dist_data_loop_tick(DHandle, ConnRef, StreamId, sent)
+            case send_one_frame(ConnRef, StreamId, Data) of
+                ok ->
+                    send_dist_data_loop_tick(DHandle, ConnRef, StreamId, sent);
+                {error, _} ->
+                    %% Error sending - still consider it as activity attempted
+                    sent
+            end
     end.
 
 %% @private
 %% Send a single framed message.
 %% Adds 4-byte big-endian length prefix for message framing over QUIC.
+%% Returns ok on success or {error, Reason} on failure.
 send_one_frame(ConnRef, StreamId, Data) ->
     %% dist_ctrl_get_data returns raw message data (no length prefix)
     %% We add 4-byte length prefix for framing over QUIC
@@ -782,7 +831,7 @@ send_one_frame(ConnRef, StreamId, Data) ->
     FramedData = <<Length:32/big-unsigned, DataBin/binary>>,
     case quic:send_data(ConnRef, StreamId, FramedData, false) of
         ok -> ok;
-        {error, _Reason} -> ok
+        {error, Reason} -> {error, Reason}
     end.
 
 %%====================================================================

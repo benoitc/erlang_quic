@@ -79,6 +79,7 @@
     set_owner/2,
     set_owner_sync/2,
     setopts/2,
+    get_send_queue_info/1,
     %% Key update (RFC 9001 Section 6)
     key_update/1,
     %% Connection migration (RFC 9000 Section 9)
@@ -495,6 +496,13 @@ send_datagram(Conn, Data) ->
 setopts(Conn, Opts) ->
     gen_statem:call(Conn, {setopts, Opts}).
 
+%% @doc Get send queue status for backpressure decisions.
+%% Returns information about the current send queue state including
+%% whether the connection is congested and should apply backpressure.
+-spec get_send_queue_info(pid()) -> {ok, quic:send_queue_info()} | {error, term()}.
+get_send_queue_info(Conn) ->
+    gen_statem:call(Conn, get_send_queue_info).
+
 %% @doc Initiate a key update (RFC 9001 Section 6).
 %% This triggers a key update cycle, deriving new encryption keys.
 %% Only valid when connection is in connected state.
@@ -654,19 +662,18 @@ init({server, Opts}) ->
 %%                     Recommended for distribution: 65536 (64KB) or higher.
 %%   - minimum_window: Lower bound for cwnd after congestion events.
 %%                     Defaults to RFC 9002 (2 * max_datagram_size).
+%%   - min_recovery_duration: Minimum time in recovery before exit (ms, default: 100)
+%%                            Prevents rapid cwnd oscillations on low-latency networks.
 build_cc_opts(Opts) ->
-    CCOpts1 =
-        case maps:find(initial_window, Opts) of
-            {ok, InitialWindow} when is_integer(InitialWindow), InitialWindow > 0 ->
-                #{initial_window => InitialWindow};
-            _ ->
-                #{}
-        end,
-    case maps:find(minimum_window, Opts) of
-        {ok, MinimumWindow} when is_integer(MinimumWindow), MinimumWindow > 0 ->
-            CCOpts1#{minimum_window => MinimumWindow};
-        _ ->
-            CCOpts1
+    CCOpts = #{},
+    CCOpts1 = maybe_add_cc_opt(initial_window, Opts, CCOpts),
+    CCOpts2 = maybe_add_cc_opt(minimum_window, Opts, CCOpts1),
+    maybe_add_cc_opt(min_recovery_duration, Opts, CCOpts2).
+
+maybe_add_cc_opt(Key, Opts, CCOpts) ->
+    case maps:find(Key, Opts) of
+        {ok, V} when is_integer(V), V > 0 -> CCOpts#{Key => V};
+        _ -> CCOpts
     end.
 
 %% Build preferred_address record from listener options (RFC 9000 Section 9.6)
@@ -1103,6 +1110,27 @@ connected({call, From}, {get_stream_priority, StreamId}, State) ->
     end;
 connected({call, From}, {setopts, _Opts}, State) ->
     {keep_state, State, [{reply, From, ok}]};
+connected(
+    {call, From},
+    get_send_queue_info,
+    #state{
+        send_queue_bytes = Bytes,
+        cc_state = CCState
+    } = State
+) ->
+    Cwnd = quic_cc:cwnd(CCState),
+    InFlight = quic_cc:bytes_in_flight(CCState),
+    InRecovery = quic_cc:in_recovery(CCState),
+    %% Congested if queue > 2x cwnd OR in recovery with queue > cwnd
+    Congested = (Bytes > Cwnd * 2) orelse (InRecovery andalso Bytes > Cwnd),
+    Info = #{
+        bytes => Bytes,
+        cwnd => Cwnd,
+        in_flight => InFlight,
+        in_recovery => InRecovery,
+        congested => Congested
+    },
+    {keep_state, State, [{reply, From, {ok, Info}}]};
 connected({call, From}, key_update, #state{key_state = undefined} = State) ->
     {keep_state, State, [{reply, From, {error, no_keys}}]};
 connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
