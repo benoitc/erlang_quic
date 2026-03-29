@@ -262,6 +262,14 @@
 % 16KB - conservative floor to avoid starvation in bursty virtual networks
 -define(MINIMUM_WINDOW_DISTRIBUTION, 16384).
 % 128KB - aggressive for high-bandwidth LAN
+
+%% Flow Control - Distribution-specific limits
+%% Higher limits for distribution to avoid flow control blocking during
+%% large message transfers (e.g., code loading, large term passing).
+% 16MB connection-level limit
+-define(DIST_INITIAL_MAX_DATA, 16777216).
+% 4MB per-stream limit
+-define(DIST_INITIAL_MAX_STREAM_DATA, 4194304).
 -define(INITIAL_WINDOW_AGGRESSIVE, 131072).
 
 %%====================================================================

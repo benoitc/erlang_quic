@@ -4117,7 +4117,10 @@ do_send_data(
                     case {DataSize =< ConnectionAllowed, DataSize =< StreamAllowed} of
                         {false, _} ->
                             %% Connection-level flow control blocked
-                            ?LOG_WARNING(
+                            %% RFC 9000: Don't queue data beyond flow control limits.
+                            %% Send DATA_BLOCKED and return error to caller.
+                            %% Caller should retry after receiving MAX_DATA from peer.
+                            ?LOG_DEBUG(
                                 #{
                                     what => connection_flow_control_blocked,
                                     need => DataSize,
@@ -4125,25 +4128,16 @@ do_send_data(
                                 },
                                 ?QUIC_LOG_META
                             ),
-                            %% Queue for later - MUST return the updated state with queued data!
-                            case queue_stream_data(StreamId, Offset, DataBin, Fin, State) of
-                                {ok, QueuedState} ->
-                                    %% Advance send_offset so subsequent sends use the correct offset.
-                                    %% Without this, multiple sends while blocked would all queue at
-                                    %% the same offset, causing stream data corruption on dequeue.
-                                    QueuedState2 = advance_stream_send_offset(
-                                        StreamId, Offset + DataSize, Fin, QueuedState
-                                    ),
-                                    %% RFC 9000 Section 19.12: DATA_BLOCKED reports the connection data limit
-                                    BlockedFrame = quic_frame:encode({data_blocked, MaxDataRemote}),
-                                    FinalState = send_app_packet(BlockedFrame, QueuedState2),
-                                    {ok, FinalState};
-                                {error, send_queue_full} ->
-                                    {error, send_queue_full}
-                            end;
+                            %% RFC 9000 Section 19.12: DATA_BLOCKED reports the connection data limit
+                            BlockedFrame = quic_frame:encode({data_blocked, MaxDataRemote}),
+                            _FinalState = send_app_packet(BlockedFrame, State),
+                            {error, {flow_control_blocked, connection}};
                         {_, false} ->
                             %% Stream-level flow control blocked
-                            ?LOG_WARNING(
+                            %% RFC 9000: Don't queue data beyond flow control limits.
+                            %% Send STREAM_DATA_BLOCKED and return error to caller.
+                            %% Caller should retry after receiving MAX_STREAM_DATA from peer.
+                            ?LOG_DEBUG(
                                 #{
                                     what => stream_flow_control_blocked,
                                     stream_id => StreamId,
@@ -4152,22 +4146,12 @@ do_send_data(
                                 },
                                 ?QUIC_LOG_META
                             ),
-                            %% Queue for later - MUST return the updated state with queued data!
-                            case queue_stream_data(StreamId, Offset, DataBin, Fin, State) of
-                                {ok, QueuedState} ->
-                                    %% Advance send_offset (see connection-blocked comment above)
-                                    QueuedState2 = advance_stream_send_offset(
-                                        StreamId, Offset + DataSize, Fin, QueuedState
-                                    ),
-                                    %% RFC 9000 Section 19.13: STREAM_DATA_BLOCKED reports the stream data limit
-                                    BlockedFrame = quic_frame:encode(
-                                        {stream_data_blocked, StreamId, SendMaxData}
-                                    ),
-                                    FinalState = send_app_packet(BlockedFrame, QueuedState2),
-                                    {ok, FinalState};
-                                {error, send_queue_full} ->
-                                    {error, send_queue_full}
-                            end;
+                            %% RFC 9000 Section 19.13: STREAM_DATA_BLOCKED reports the stream data limit
+                            BlockedFrame = quic_frame:encode(
+                                {stream_data_blocked, StreamId, SendMaxData}
+                            ),
+                            _FinalState = send_app_packet(BlockedFrame, State),
+                            {error, {flow_control_blocked, {stream, StreamId}}};
                         {true, true} ->
                             %% Flow control allows sending
                             %% Fragment and send data - congestion control may partially
@@ -4426,20 +4410,6 @@ queue_stream_data(
             Entry = {stream_data, StreamId, Offset, Data, Fin},
             NewPQ = pqueue_in(Entry, Urgency, PQ),
             {ok, State#state{send_queue = NewPQ, send_queue_bytes = NewQueueBytes}}
-    end.
-
-%% Advance a stream's send_offset without actually sending data.
-%% Called when data is queued so that subsequent sends use the correct offset.
-advance_stream_send_offset(StreamId, NewOffset, Fin, #state{streams = Streams} = State) ->
-    case maps:find(StreamId, Streams) of
-        {ok, Stream} ->
-            UpdatedStream = Stream#stream_state{
-                send_offset = NewOffset,
-                send_fin = Fin orelse Stream#stream_state.send_fin
-            },
-            State#state{streams = maps:put(StreamId, UpdatedStream, Streams)};
-        error ->
-            State
     end.
 
 %% Get stream urgency (default 3 if stream not found)

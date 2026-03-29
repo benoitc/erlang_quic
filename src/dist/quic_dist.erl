@@ -397,6 +397,12 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
                 %% Keep a higher congestion floor to avoid liveness stalls
                 %% on bursty virtual networks (e.g., Docker bridge).
                 minimum_window => ?MINIMUM_WINDOW_DISTRIBUTION,
+                %% Higher flow control limits for distribution to avoid blocking
+                %% during large message transfers (code loading, large terms)
+                max_data => ?DIST_INITIAL_MAX_DATA,
+                max_stream_data_bidi_local => ?DIST_INITIAL_MAX_STREAM_DATA,
+                max_stream_data_bidi_remote => ?DIST_INITIAL_MAX_STREAM_DATA,
+                max_stream_data_uni => ?DIST_INITIAL_MAX_STREAM_DATA,
                 connection_handler => fun(ConnPid, ConnRef) ->
                     handle_new_connection(ConnPid, ConnRef)
                 end
@@ -882,6 +888,12 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                 %% Keep a higher congestion floor to avoid liveness stalls
                 %% on bursty virtual networks (e.g., Docker bridge).
                 minimum_window => ?MINIMUM_WINDOW_DISTRIBUTION,
+                %% Higher flow control limits for distribution to avoid blocking
+                %% during large message transfers (code loading, large terms)
+                max_data => ?DIST_INITIAL_MAX_DATA,
+                max_stream_data_bidi_local => ?DIST_INITIAL_MAX_STREAM_DATA,
+                max_stream_data_bidi_remote => ?DIST_INITIAL_MAX_STREAM_DATA,
+                max_stream_data_uni => ?DIST_INITIAL_MAX_STREAM_DATA,
                 % TODO: Enable proper verification
                 verify => false
             },
