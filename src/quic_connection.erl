@@ -2648,25 +2648,31 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     ?LOG_ERROR(#{what => invalid_ack_range}, ?QUIC_LOG_META),
                     State;
                 {NewLossState, AckedPackets, LostPackets} ->
-                    %% Calculate total bytes acked and lost
-                    %% IMPORTANT: Only count ack-eliciting packets for congestion control
+                    %% Filter to only ack-eliciting packets for CC calculations
                     %% since bytes_in_flight only tracks ack-eliciting packets (RFC 9002)
+                    AckElicitingAcked = [
+                        P
+                     || #sent_packet{ack_eliciting = true} = P <- AckedPackets
+                    ],
                     AckedBytes = lists:sum([
                         P#sent_packet.size
-                     || #sent_packet{ack_eliciting = true, size = _} = P <- AckedPackets
+                     || P <- AckElicitingAcked
                     ]),
                     LostBytes = lists:sum([
                         P#sent_packet.size
-                     || #sent_packet{ack_eliciting = true, size = _} = P <- LostPackets
+                     || #sent_packet{ack_eliciting = true} = P <- LostPackets
                     ]),
 
-                    %% Find the largest acked packet's sent time for recovery exit detection
+                    %% Find largest acked sent time ONLY from ack-eliciting packets
+                    %% This ensures LargestAckedSentTime is consistent with AckedBytes
+                    %% to prevent deadlock in bidirectional transfer scenarios
                     LargestAckedSentTime =
-                        case AckedPackets of
+                        case AckElicitingAcked of
                             [] ->
+                                %% No ack-eliciting packets - use Now
                                 Now;
                             _ ->
-                                %% AckedPackets may not be sorted, find the one with largest PN
+                                %% AckElicitingAcked may not be sorted, find the one with largest PN
                                 LargestAckedPkt = lists:foldl(
                                     fun(P, Acc) ->
                                         case P#sent_packet.pn > Acc#sent_packet.pn of
@@ -2674,14 +2680,25 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                                             false -> Acc
                                         end
                                     end,
-                                    hd(AckedPackets),
-                                    tl(AckedPackets)
+                                    hd(AckElicitingAcked),
+                                    tl(AckElicitingAcked)
                                 ),
                                 LargestAckedPkt#sent_packet.time_sent
                         end,
 
-                    %% Update congestion control with largest acked sent time for proper recovery exit
-                    CCState1 = quic_cc:on_packets_acked(CCState, AckedBytes, LargestAckedSentTime),
+                    %% Only update CC ACK processing if there are ack-eliciting packets
+                    %% When only non-ack-eliciting packets are ACKed, skip on_packets_acked
+                    %% to prevent false recovery exit (LargestAckedSentTime=Now would always
+                    %% satisfy > RecoveryStart after min_duration). Loss handling is done
+                    %% separately by on_packets_lost and on_congestion_event.
+                    CCState1 =
+                        case AckElicitingAcked of
+                            [] ->
+                                %% No ack-eliciting acks - skip CC ACK update entirely
+                                CCState;
+                            _ ->
+                                quic_cc:on_packets_acked(CCState, AckedBytes, LargestAckedSentTime)
+                        end,
                     CCState2 = quic_cc:on_packets_lost(CCState1, LostBytes),
 
                     %% If there was loss, signal congestion event

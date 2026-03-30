@@ -83,6 +83,60 @@ new_loss_after_recovery_test() ->
     Cwnd3 = quic_cc:cwnd(S3),
     ?assert(Cwnd3 >= Cwnd1).
 
+%% Test recovery with only non-ack-eliciting packets acknowledged
+%% This simulates the bidirectional deadlock where only ACK frames get through
+recovery_with_no_ack_eliciting_test() ->
+    State = quic_cc:new(#{
+        initial_window => 65536,
+        min_recovery_duration => 10
+    }),
+
+    %% Enter recovery
+    Now = erlang:monotonic_time(millisecond),
+    S1 = quic_cc:on_congestion_event(State, Now),
+    ?assert(quic_cc:in_recovery(S1)),
+
+    %% Simulate repeated ACKs with 0 acked bytes (non-ack-eliciting only)
+    %% This should not prevent recovery exit
+    timer:sleep(15),
+    S2 = quic_cc:on_packets_acked(S1, 0),
+
+    %% Now ACK some actual data - should exit recovery
+    S3 = quic_cc:on_packet_sent(S2, 1200),
+    Now2 = erlang:monotonic_time(millisecond),
+    S4 = quic_cc:on_packets_acked(S3, 1200, Now2),
+
+    ?assertNot(quic_cc:in_recovery(S4)).
+
+%% Test that progress is made under bidirectional load
+bidirectional_large_transfer_test() ->
+    %% Simulates both sides sending 1MB with recovery events
+    State = quic_cc:new(#{
+        initial_window => 65536,
+        minimum_window => 16384,
+        min_recovery_duration => 50
+    }),
+
+    %% Enter recovery (simulates initial congestion)
+    Now = erlang:monotonic_time(millisecond),
+    S1 = quic_cc:on_congestion_event(State, Now),
+    CwndRecovery = quic_cc:cwnd(S1),
+
+    %% Simulate sending/acking data in chunks
+    timer:sleep(55),
+    S2 = lists:foldl(
+        fun(_, Acc) ->
+            A1 = quic_cc:on_packet_sent(Acc, 1200),
+            quic_cc:on_packets_acked(A1, 1200)
+        end,
+        S1,
+        lists:seq(1, 20)
+    ),
+
+    %% Should have exited recovery and cwnd should be growing
+    ?assertNot(quic_cc:in_recovery(S2)),
+    ?assert(quic_cc:cwnd(S2) >= CwndRecovery).
+
 %%====================================================================
 %% Rapid Loss Scenarios (Distribution-like patterns)
 %%====================================================================
