@@ -112,7 +112,10 @@
     %% Backpressure tuning
     congestion_threshold = ?DEFAULT_QUEUE_CONGESTION_THRESHOLD :: pos_integer(),
     max_pull_per_notification = ?DEFAULT_MAX_PULL_PER_NOTIFICATION :: pos_integer(),
-    backpressure_retry_ms = ?DEFAULT_BACKPRESSURE_RETRY_MS :: pos_integer()
+    backpressure_retry_ms = ?DEFAULT_BACKPRESSURE_RETRY_MS :: pos_integer(),
+
+    %% Pacing
+    pacing_enabled = true :: boolean()
 }).
 
 %% Listener state

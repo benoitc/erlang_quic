@@ -336,7 +336,9 @@ load_config() ->
         ),
         backpressure_retry_ms = get_opt(
             backpressure_retry_ms, DistOpts, ?DEFAULT_BACKPRESSURE_RETRY_MS
-        )
+        ),
+        %% Pacing
+        pacing_enabled = get_opt(pacing_enabled, DistOpts, true)
     }.
 
 %% @private
@@ -416,8 +418,8 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
                 max_stream_data_uni => ?DIST_INITIAL_MAX_STREAM_DATA,
                 %% Backpressure threshold for congestion detection
                 congestion_threshold => CongestionThreshold,
-                %% Disable pacing for now to test congestion behavior
-                pacing_enabled => false,
+                %% Pacing spreads packet sends to avoid bursts
+                pacing_enabled => Config#quic_dist_config.pacing_enabled,
                 %% Longer recovery duration for virtual network packet reordering
                 min_recovery_duration => ?MIN_RECOVERY_DURATION_DISTRIBUTION,
                 connection_handler => fun(ConnPid, ConnRef) ->
@@ -914,8 +916,8 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                 max_stream_data_uni => ?DIST_INITIAL_MAX_STREAM_DATA,
                 %% Backpressure threshold for congestion detection
                 congestion_threshold => CongestionThreshold,
-                %% Disable pacing for now to test congestion behavior
-                pacing_enabled => false,
+                %% Pacing spreads packet sends to avoid bursts
+                pacing_enabled => Config#quic_dist_config.pacing_enabled,
                 %% Longer recovery duration for virtual network packet reordering
                 min_recovery_duration => ?MIN_RECOVERY_DURATION_DISTRIBUTION,
                 % TODO: Enable proper verification
