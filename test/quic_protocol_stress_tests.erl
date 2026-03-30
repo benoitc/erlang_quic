@@ -266,9 +266,14 @@ pto_backoff_test() ->
     PTO2 = quic_loss:get_pto(S3),
     ?assertEqual(PTO0 * 4, PTO2),
 
-    %% Send packet resets PTO count
+    %% Send packet does NOT reset PTO count (per RFC 9002)
     S4 = quic_loss:on_packet_sent(S3, 0, 100, true),
-    ?assertEqual(0, quic_loss:pto_count(S4)).
+    ?assertEqual(2, quic_loss:pto_count(S4)),
+
+    %% ACK received resets PTO count
+    Now = erlang:monotonic_time(millisecond) + 50,
+    {S5, _, _} = quic_loss:on_ack_received(S4, {ack, 0, 0, 0, []}, Now),
+    ?assertEqual(0, quic_loss:pto_count(S5)).
 
 %%====================================================================
 %% Memory Efficiency Tests

@@ -150,11 +150,12 @@ on_packet_sent(
             true -> InFlight + Size;
             false -> InFlight
         end,
+    %% NOTE: pto_count is NOT reset here per RFC 9002.
+    %% PTO count is only reset when receiving an ACK (in on_ack_received).
+    %% Resetting on send would break exponential backoff for probe retransmissions.
     State#loss_state{
         sent_packets = maps:put(PacketNumber, SentPacket, Sent),
-        bytes_in_flight = NewInFlight,
-        % Reset PTO count on new packet
-        pto_count = 0
+        bytes_in_flight = NewInFlight
     }.
 
 %% @doc Process an ACK frame.
@@ -246,10 +247,12 @@ detect_lost_packets(SentPackets, SmoothedRTT, LargestAcked, Now) ->
                 } = Packet,
                 {LostAcc, RemAcc, BytesAcc}
             ) ->
-                %% Check packet threshold
+                %% Check packet threshold (RFC 9002 Section 6.1.1)
                 PacketLost = (LargestAcked - PN) >= ?PACKET_THRESHOLD,
-                %% Check time threshold
-                TimeLost = (Now - TimeSent) > LossDelay,
+                %% Check time threshold (RFC 9002 Section 6.1.2)
+                %% IMPORTANT: Time-based loss ONLY applies to packets with PN < LargestAcked
+                %% to prevent spurious loss when no later packet has been acknowledged
+                TimeLost = (PN < LargestAcked) andalso ((Now - TimeSent) > LossDelay),
 
                 case PacketLost orelse TimeLost of
                     true ->

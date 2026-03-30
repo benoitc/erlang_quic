@@ -122,12 +122,19 @@ pto_exponential_backoff_test() ->
     PTO2 = quic_loss:get_pto(S3),
     ?assertEqual(PTO0 * 4, PTO2).
 
-pto_reset_on_packet_sent_test() ->
+%% Test that PTO count is NOT reset on packet send
+%% (it should only reset on ACK received per RFC 9002)
+pto_not_reset_on_packet_sent_test() ->
     State = quic_loss:new(),
     S1 = quic_loss:on_pto_expired(State),
     ?assertEqual(1, quic_loss:pto_count(S1)),
-    S2 = quic_loss:on_packet_sent(S1, 0, 100, true),
-    ?assertEqual(0, quic_loss:pto_count(S2)).
+    %% Sending a packet should NOT reset PTO count
+    S2 = quic_loss:on_packet_sent(S1, 0, 100, true, []),
+    ?assertEqual(1, quic_loss:pto_count(S2)),
+    %% PTO count should only reset on ACK
+    Now = erlang:monotonic_time(millisecond) + 50,
+    {S3, _, _} = quic_loss:on_ack_received(S2, {ack, 0, 0, 0, []}, Now),
+    ?assertEqual(0, quic_loss:pto_count(S3)).
 
 %%====================================================================
 %% ACK Processing Tests

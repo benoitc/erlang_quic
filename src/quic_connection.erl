@@ -4851,20 +4851,43 @@ check_timeouts(State) ->
 %%====================================================================
 
 %% Retransmit frames from lost packets
+%% IMPORTANT: Retransmissions must respect congestion control to prevent
+%% bytes_in_flight from exceeding cwnd. Packets that can't be sent immediately
+%% will be retried on the next PTO timeout or when cwnd allows.
 retransmit_lost_packets([], State) ->
     State;
 retransmit_lost_packets([#sent_packet{frames = Frames} | Rest], State) ->
     RetransmitFrames = quic_loss:retransmittable_frames(Frames),
-    State1 = send_retransmit_frames(RetransmitFrames, State),
+    State1 = send_retransmit_frames_cc(RetransmitFrames, State),
     retransmit_lost_packets(Rest, State1).
 
-%% Send frames for retransmission
-send_retransmit_frames([], State) ->
+%% Send frames for retransmission with congestion control check
+send_retransmit_frames_cc([], State) ->
     State;
-send_retransmit_frames(Frames, State) ->
-    %% Encode all frames and send in a single packet
+send_retransmit_frames_cc(Frames, #state{cc_state = CCState} = State) ->
+    %% Encode all frames and check size
     Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
-    send_app_packet_internal(Payload, Frames, State).
+    PacketSize = byte_size(Payload) + 50,
+
+    %% Check if CC allows sending this retransmission
+    %% Use can_send_control to allow small overage for retransmissions
+    case quic_cc:can_send_control(CCState, PacketSize) of
+        true ->
+            send_app_packet_internal(Payload, Frames, State);
+        false ->
+            %% CC doesn't allow - defer retransmission
+            %% The PTO mechanism will eventually retry this data
+            ?LOG_DEBUG(
+                #{
+                    what => retransmit_deferred_by_cc,
+                    packet_size => PacketSize,
+                    cwnd => quic_cc:cwnd(CCState),
+                    bytes_in_flight => quic_cc:bytes_in_flight(CCState)
+                },
+                ?QUIC_LOG_META
+            ),
+            State
+    end.
 
 %% Handle PTO timeout - send probe packet
 handle_pto_timeout(#state{loss_state = LossState} = State) ->
@@ -4879,13 +4902,14 @@ handle_pto_timeout(#state{loss_state = LossState} = State) ->
     set_pto_timer(State2).
 
 %% Send a probe packet for PTO
+%% PTO probes are allowed to use control_allowance per RFC 9002
 send_probe_packet(State) ->
     case get_oldest_unacked_frames(State) of
         {ok, Frames} ->
-            %% Retransmit oldest data as probe
-            send_retransmit_frames(Frames, State);
+            %% Retransmit oldest data as probe with CC check
+            send_retransmit_frames_cc(Frames, State);
         none ->
-            %% No data to retransmit, send PING
+            %% No data to retransmit, send PING (always allowed as control)
             Payload = quic_frame:encode(ping),
             send_app_packet_internal(Payload, [ping], State)
     end.
