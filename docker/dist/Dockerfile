@@ -50,6 +50,7 @@ RUN apt-get update && apt-get install -y \
     openssl \
     netcat-openbsd \
     iproute2 \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -78,8 +79,9 @@ ENV NODE_NAME=node1@localhost \
 # Expose QUIC port (UDP)
 EXPOSE 9100/udp
 
-# Health check - verify the node is running
+# Health check - verify the beam process is running
+# Note: can't use ping as it requires epmd, which is disabled for QUIC distribution
 HEALTHCHECK --interval=5s --timeout=3s --start-period=30s --retries=3 \
-    CMD /app/bin/quic_dist_test ping || exit 1
+    CMD pgrep -x beam.smp > /dev/null || exit 1
 
 ENTRYPOINT ["/app/start_node.sh"]

@@ -37,7 +37,7 @@ while true; do
 
     if [ $healthy_count -ge $EXPECTED_NODES ]; then
         echo "All $EXPECTED_NODES nodes are healthy!"
-        return 0
+        exit 0
     fi
 
     echo "Healthy: $healthy_count/$EXPECTED_NODES (elapsed: ${elapsed}s)"

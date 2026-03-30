@@ -71,8 +71,11 @@ check_containers_running() {
 count_test_complete() {
     local complete=0
     for i in $(seq 1 $CLUSTER_SIZE); do
-        local done=$(docker compose logs "node$i" 2>&1 | grep -c "\[DIST_TEST\].*test_complete" || echo 0)
-        if [ "$done" -ge 1 ]; then
+        local cnt
+        cnt=$(docker compose logs "node$i" 2>&1 | grep -c "\[DIST_TEST\].*test_complete" || true)
+        cnt=${cnt:-0}
+        cnt=$(echo "$cnt" | tr -d '[:space:]')
+        if [ "$cnt" -ge 1 ] 2>/dev/null; then
             complete=$((complete + 1))
         fi
     done
@@ -83,8 +86,11 @@ count_test_complete() {
 count_mesh_complete() {
     local complete=0
     for i in $(seq 1 $CLUSTER_SIZE); do
-        local done=$(docker compose logs "node$i" 2>&1 | grep -c "\[DIST_TEST\].*mesh_complete" || echo 0)
-        if [ "$done" -ge 1 ]; then
+        local cnt
+        cnt=$(docker compose logs "node$i" 2>&1 | grep -c "\[DIST_TEST\].*mesh_complete" || true)
+        cnt=${cnt:-0}
+        cnt=$(echo "$cnt" | tr -d '[:space:]')
+        if [ "$cnt" -ge 1 ] 2>/dev/null; then
             complete=$((complete + 1))
         fi
     done
