@@ -7,20 +7,41 @@ DIST_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$DIST_DIR"
 
 # Parse arguments
-CLUSTER_SIZE=${1:-2}
-NO_CLEANUP=${2:-}
+CLUSTER_SIZE=""
+NO_CLEANUP=""
+BACKGROUND=""
+
+for arg in "$@"; do
+    case $arg in
+        --no-cleanup)
+            NO_CLEANUP="--no-cleanup"
+            ;;
+        --background)
+            BACKGROUND="--background"
+            ;;
+        --help|-h)
+            CLUSTER_SIZE="--help"
+            ;;
+        [0-9]*)
+            CLUSTER_SIZE="$arg"
+            ;;
+    esac
+done
+
+CLUSTER_SIZE=${CLUSTER_SIZE:-2}
 
 # OTP version (default: 28, supports 26, 27, 28)
 export OTP_VERSION=${OTP_VERSION:-28}
 
 usage() {
-    echo "Usage: $0 [2|3|5] [--no-cleanup]"
+    echo "Usage: $0 [2|3|5] [--no-cleanup] [--background]"
     echo ""
     echo "Run QUIC distribution tests with specified cluster size."
     echo ""
     echo "Arguments:"
     echo "  CLUSTER_SIZE  Number of nodes (2, 3, or 5). Default: 2"
     echo "  --no-cleanup  Don't stop containers after test (for debugging)"
+    echo "  --background  Start containers and exit immediately (non-blocking)"
     echo ""
     echo "Environment Variables:"
     echo "  OTP_VERSION   Erlang/OTP version (26, 27, or 28). Default: 28"
@@ -29,6 +50,7 @@ usage() {
     echo "  $0 2                        # Run 2-node test with OTP 28"
     echo "  $0 5                        # Run 5-node test"
     echo "  $0 3 --no-cleanup           # Run 3-node test, keep containers running"
+    echo "  $0 2 --background           # Start test in background, exit immediately"
     echo "  OTP_VERSION=27 $0 5         # Run with OTP 27"
     exit 1
 }
@@ -75,6 +97,28 @@ echo ""
 echo "Step 5: Waiting for cluster to be healthy..."
 "$SCRIPT_DIR/wait_for_cluster.sh" "$CLUSTER_SIZE" 180
 echo ""
+
+# If background mode, exit now
+if [ -n "$BACKGROUND" ]; then
+    # Save cluster info for other scripts
+    echo "$CLUSTER_SIZE" > "$DIST_DIR/.cluster_size"
+    echo "$PROFILE" > "$DIST_DIR/.cluster_profile"
+
+    echo "=========================================="
+    echo "Cluster started in background mode"
+    echo "=========================================="
+    echo ""
+    echo "To check test status:"
+    echo "  ./scripts/check_status.sh $CLUSTER_SIZE"
+    echo ""
+    echo "To wait for completion:"
+    echo "  ./scripts/check_status.sh $CLUSTER_SIZE --wait"
+    echo ""
+    echo "To stop and cleanup:"
+    echo "  ./scripts/stop_tests.sh"
+    echo ""
+    exit 0
+fi
 
 # Step 6: Wait for tests to complete
 echo "Step 6: Waiting for tests to complete..."
