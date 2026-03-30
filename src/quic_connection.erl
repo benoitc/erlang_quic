@@ -2086,8 +2086,12 @@ send_app_packet_internal(Payload, Frames, State) ->
                 loss_state = NewLossState
             },
 
+            %% Update activity timestamp on successful send
+            %% This prevents idle timeout during long one-way transfers
+            State2 = update_last_activity(State1),
+
             %% Set PTO timer for retransmission
-            set_pto_timer(State1);
+            set_pto_timer(State2);
         {error, Reason} ->
             %% Send failed - do NOT track packet as sent to avoid CC/loss inconsistency
             %% The data will be re-sent via the PTO timeout mechanism
@@ -2722,25 +2726,6 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% Update pacing rate based on new RTT estimate (RFC 9002 Section 7.7)
                     SmoothedRTT = quic_loss:smoothed_rtt(NewLossState),
                     CCState6 = quic_cc:update_pacing_rate(CCState5, SmoothedRTT),
-
-                    %% Log bytes_in_flight synchronization for debugging
-                    CCBytesInFlight = quic_cc:bytes_in_flight(CCState6),
-                    LossBytesInFlight = quic_loss:bytes_in_flight(NewLossState),
-                    ?LOG_DEBUG(
-                        #{
-                            what => ack_processed,
-                            acked_bytes => AckedBytes,
-                            lost_bytes => LostBytes,
-                            acked_packets_count => length(AckedPackets),
-                            lost_packets_count => length(LostPackets),
-                            cwnd => quic_cc:cwnd(CCState6),
-                            cc_bytes_in_flight => CCBytesInFlight,
-                            loss_bytes_in_flight => LossBytesInFlight,
-                            bytes_in_flight_synced => CCBytesInFlight =:= LossBytesInFlight,
-                            send_queue_bytes => State#state.send_queue_bytes
-                        },
-                        ?QUIC_LOG_META
-                    ),
 
                     State1 = State#state{
                         loss_state = NewLossState,
@@ -4634,7 +4619,7 @@ check_send_queue_flow_control(StreamId, Offset, DataSize, #state{
 
 %% Actually process the queue entry (called after flow control check passes)
 process_send_queue_entry(
-    #state{send_queue = PQ, send_queue_bytes = QueueBytes, cc_state = CCState} = State
+    #state{send_queue = PQ, send_queue_bytes = QueueBytes} = State
 ) ->
     case pqueue_out(PQ) of
         {empty, _} ->
@@ -4644,19 +4629,6 @@ process_send_queue_entry(
             %% (if data is re-queued, queue_stream_data will increment appropriately)
             DataSize = iolist_size(Data),
             DecrementedQueueBytes = max(0, QueueBytes - DataSize),
-            ?LOG_DEBUG(
-                #{
-                    what => send_queue_draining,
-                    stream_id => StreamId,
-                    data_size => DataSize,
-                    queue_bytes_before => QueueBytes,
-                    queue_bytes_after => DecrementedQueueBytes,
-                    cwnd => quic_cc:cwnd(CCState),
-                    bytes_in_flight => quic_cc:bytes_in_flight(CCState),
-                    available_cwnd => quic_cc:available_cwnd(CCState)
-                },
-                ?QUIC_LOG_META
-            ),
             State1 = State#state{send_queue = NewPQ, send_queue_bytes = DecrementedQueueBytes},
             case send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State1) of
                 {error, send_queue_full} ->
