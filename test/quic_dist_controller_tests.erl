@@ -1016,3 +1016,163 @@ tick_data_flush_limited_test() ->
 
     %% Even with lots of data, only MaxPull should be sent
     ?assert(ActualPulled =< MaxPull).
+
+%%====================================================================
+%% Large Message Tests
+%%====================================================================
+
+%% Test 1MB message framing and fragmentation
+large_message_1mb_framing_test() ->
+    %% 1MB message
+    Size = 1024 * 1024,
+    Payload = crypto:strong_rand_bytes(Size),
+
+    %% Frame it with 4-byte length prefix
+    Framed = <<Size:32/big-unsigned, Payload/binary>>,
+    ?assertEqual(Size + 4, byte_size(Framed)),
+
+    %% Verify we can parse it back
+    <<ParsedLen:32/big-unsigned, ParsedPayload/binary>> = Framed,
+    ?assertEqual(Size, ParsedLen),
+    ?assertEqual(Payload, ParsedPayload).
+
+%% Test 4MB message (max stream flow control window)
+large_message_4mb_framing_test() ->
+    %% 4MB - max stream data limit
+    Size = 4 * 1024 * 1024,
+    Payload = binary:copy(<<$X>>, Size),
+
+    %% Frame it
+    Framed = <<Size:32/big-unsigned, Payload/binary>>,
+    ?assertEqual(Size + 4, byte_size(Framed)),
+
+    %% Parse header
+    <<ParsedLen:32/big-unsigned, _/binary>> = Framed,
+    ?assertEqual(Size, ParsedLen).
+
+%% Test chunked reassembly of large message (simulates MTU fragmentation)
+large_message_chunked_reassembly_test() ->
+    %% 100KB message
+    Size = 100 * 1024,
+    Payload = crypto:strong_rand_bytes(Size),
+    Framed = <<Size:32/big-unsigned, Payload/binary>>,
+
+    %% Split into ~1100 byte chunks (typical QUIC MTU)
+    ChunkSize = 1100,
+    Chunks = chunk_binary(Framed, ChunkSize),
+
+    %% Verify we have multiple chunks
+    ?assert(length(Chunks) > 1),
+
+    %% Reassemble
+    Reassembled = iolist_to_binary(Chunks),
+    ?assertEqual(Framed, Reassembled),
+
+    %% Parse the reassembled data
+    <<ParsedLen:32/big-unsigned, ParsedPayload/binary>> = Reassembled,
+    ?assertEqual(Size, ParsedLen),
+    ?assertEqual(Payload, ParsedPayload).
+
+%% Test multiple large messages in sequence
+multiple_large_messages_test() ->
+    %% Three 100KB messages
+    Size = 100 * 1024,
+    M1 = crypto:strong_rand_bytes(Size),
+    M2 = crypto:strong_rand_bytes(Size),
+    M3 = crypto:strong_rand_bytes(Size),
+
+    %% Frame them
+    Buffer = <<
+        Size:32/big-unsigned,
+        M1/binary,
+        Size:32/big-unsigned,
+        M2/binary,
+        Size:32/big-unsigned,
+        M3/binary
+    >>,
+
+    %% Parse all three
+    {Msgs, <<>>} = parse_all_messages(Buffer, []),
+    ?assertEqual(3, length(Msgs)),
+    ?assertEqual([M1, M2, M3], Msgs).
+
+%% Test partial large message delivery (simulates network delay)
+partial_large_message_test() ->
+    %% 1MB message
+    Size = 1024 * 1024,
+    Payload = crypto:strong_rand_bytes(Size),
+    Framed = <<Size:32/big-unsigned, Payload/binary>>,
+
+    %% First chunk: header + 10KB
+    <<Chunk1:10244/binary, Rest/binary>> = Framed,
+
+    %% Verify chunk1 has complete header but incomplete payload
+    <<Len:32/big-unsigned, PartialPayload/binary>> = Chunk1,
+    ?assertEqual(Size, Len),
+    ?assertEqual(10240, byte_size(PartialPayload)),
+    ?assert(byte_size(PartialPayload) < Len),
+
+    %% After receiving rest, can parse complete message
+    Complete = <<Chunk1/binary, Rest/binary>>,
+    <<_:32/big-unsigned, FullPayload/binary>> = Complete,
+    ?assertEqual(Payload, FullPayload).
+
+%% Test interleaved large and small messages
+interleaved_large_small_test() ->
+    Small = <<"tiny">>,
+    Large = binary:copy(<<$L>>, 50000),
+
+    Buffer = <<
+        (byte_size(Small)):32/big-unsigned,
+        Small/binary,
+        (byte_size(Large)):32/big-unsigned,
+        Large/binary,
+        (byte_size(Small)):32/big-unsigned,
+        Small/binary
+    >>,
+
+    {Msgs, <<>>} = parse_all_messages(Buffer, []),
+    ?assertEqual(3, length(Msgs)),
+    ?assertEqual(Small, lists:nth(1, Msgs)),
+    ?assertEqual(Large, lists:nth(2, Msgs)),
+    ?assertEqual(Small, lists:nth(3, Msgs)).
+
+%% Test hash integrity for large message roundtrip
+large_message_hash_integrity_test() ->
+    %% 1MB of random data
+    Size = 1024 * 1024,
+    Original = crypto:strong_rand_bytes(Size),
+    OriginalHash = crypto:hash(sha256, Original),
+
+    %% Frame, chunk, reassemble, parse
+    Framed = <<Size:32/big-unsigned, Original/binary>>,
+    Chunks = chunk_binary(Framed, 1100),
+    Reassembled = iolist_to_binary(Chunks),
+    <<_:32/big-unsigned, Parsed/binary>> = Reassembled,
+
+    %% Verify hash matches
+    ParsedHash = crypto:hash(sha256, Parsed),
+    ?assertEqual(OriginalHash, ParsedHash).
+
+%% Helper: split binary into chunks
+chunk_binary(Bin, ChunkSize) ->
+    chunk_binary(Bin, ChunkSize, []).
+
+chunk_binary(<<>>, _ChunkSize, Acc) ->
+    lists:reverse(Acc);
+chunk_binary(Bin, ChunkSize, Acc) when byte_size(Bin) =< ChunkSize ->
+    lists:reverse([Bin | Acc]);
+chunk_binary(Bin, ChunkSize, Acc) ->
+    <<Chunk:ChunkSize/binary, Rest/binary>> = Bin,
+    chunk_binary(Rest, ChunkSize, [Chunk | Acc]).
+
+%% Helper: parse all complete messages from buffer
+parse_all_messages(<<>>, Acc) ->
+    {lists:reverse(Acc), <<>>};
+parse_all_messages(Buffer, Acc) when byte_size(Buffer) < 4 ->
+    {lists:reverse(Acc), Buffer};
+parse_all_messages(<<Len:32/big-unsigned, Rest/binary>> = Buffer, Acc) when byte_size(Rest) < Len ->
+    {lists:reverse(Acc), Buffer};
+parse_all_messages(<<Len:32/big-unsigned, Rest/binary>>, Acc) ->
+    <<Msg:Len/binary, Remaining/binary>> = Rest,
+    parse_all_messages(Remaining, [Msg | Acc]).
