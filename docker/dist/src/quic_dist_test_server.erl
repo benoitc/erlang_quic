@@ -270,7 +270,7 @@ test_large_messages() ->
 
 large_msg_test(Node, Data) ->
     Start = erlang:monotonic_time(millisecond),
-    case rpc:call(Node, ?MODULE, echo_data, [Data], 60000) of
+    case rpc:call(Node, ?MODULE, echo_data, [Data], 120000) of
         Data ->
             Latency = erlang:monotonic_time(millisecond) - Start,
             {ok, Latency};

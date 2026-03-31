@@ -244,10 +244,10 @@
 -define(DEFAULT_MAX_IDLE_TIMEOUT, 30000).
 -define(DEFAULT_MAX_STREAMS_BIDI, 100).
 -define(DEFAULT_MAX_STREAMS_UNI, 100).
-% 1MB
--define(DEFAULT_INITIAL_MAX_DATA, 1048576).
-% 256KB
--define(DEFAULT_INITIAL_MAX_STREAM_DATA, 262144).
+% 2MB - connection-level flow control (quic-go default for connection)
+-define(DEFAULT_INITIAL_MAX_DATA, 2097152).
+% 512KB - stream-level flow control (quic-go default for stream)
+-define(DEFAULT_INITIAL_MAX_STREAM_DATA, 524288).
 -define(DEFAULT_ACK_DELAY_EXPONENT, 3).
 % 25ms
 -define(DEFAULT_MAX_ACK_DELAY, 25).

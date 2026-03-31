@@ -71,9 +71,12 @@
 
 % Minimum QUIC packet size
 -define(MAX_DATAGRAM_SIZE, 1200).
-% 10 * 1472 or similar
--define(INITIAL_WINDOW, 14720).
--define(LOSS_REDUCTION_FACTOR, 0.5).
+% Initial cwnd: 32 packets like quic-go for better initial throughput
+% RFC 9002 suggests min(10*mds, max(14720, 2*mds)) but larger is common
+-define(INITIAL_WINDOW, 38400).
+% Loss reduction factor: 0.7 like quic-go for less aggressive backoff
+% Standard NewReno uses 0.5, but 0.7 gives better throughput recovery
+-define(LOSS_REDUCTION_FACTOR, 0.7).
 -define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 
 %% Congestion control state
@@ -700,9 +703,10 @@ refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now) ->
     min(MaxBurst, Tokens + Added).
 
 %% Calculate initial window
-%% kInitialWindow = min(10 * max_datagram_size, max(14720, 2 * max_datagram_size))
+%% Use 32 packets like quic-go for better initial throughput
+%% RFC 9002 suggests min(10*mds, max(14720, 2*mds)) but larger is common in practice
 initial_window(MaxDatagramSize) ->
-    min(10 * MaxDatagramSize, max(14720, 2 * MaxDatagramSize)).
+    32 * MaxDatagramSize.
 
 %% Calculate minimum window
 %% kMinimumWindow = 2 * max_datagram_size

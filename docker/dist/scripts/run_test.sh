@@ -123,7 +123,8 @@ fi
 # Step 6: Wait for tests to complete
 echo "Step 6: Waiting for tests to complete..."
 # Give extra time for mesh formation and test execution
-WAIT_TIME=$((30 + CLUSTER_SIZE * 10))
+# Large message test has 120s timeout, add buffer for mesh formation and basic tests
+WAIT_TIME=$((140 + CLUSTER_SIZE * 10))
 echo "Waiting ${WAIT_TIME}s for tests to run..."
 sleep "$WAIT_TIME"
 echo ""

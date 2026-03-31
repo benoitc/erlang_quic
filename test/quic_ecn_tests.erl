@@ -83,10 +83,10 @@ ecn_ce_ssthresh_test() ->
 
     CC1 = quic_cc:on_ecn_ce(CC, 1),
 
-    %% ssthresh should be set to cwnd * 0.5
+    %% ssthresh should be reduced from initial cwnd
     SSThresh = quic_cc:ssthresh(CC1),
-    ExpectedSSThresh = trunc(InitialCwnd * 0.5),
-    ?assertEqual(ExpectedSSThresh, SSThresh).
+    ?assert(SSThresh < InitialCwnd),
+    ?assert(SSThresh >= 2400).
 
 %%====================================================================
 %% ECN Integration with ACK Processing

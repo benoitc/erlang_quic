@@ -876,6 +876,10 @@ send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining) ->
                 {error, send_queue_full} ->
                     %% Stop pulling, queue is full
                     ok;
+                {error, {flow_control_blocked, _}} ->
+                    %% Flow control blocked - stop pulling to avoid data loss
+                    %% Will retry when MAX_DATA/MAX_STREAM_DATA is received
+                    ok;
                 {error, _} ->
                     %% Other error - continue trying
                     send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining - 1)
@@ -914,9 +918,12 @@ send_dist_data_loop_tick(DHandle, ConnRef, StreamId, Status, Remaining) ->
             case send_one_frame(ConnRef, StreamId, Data) of
                 ok ->
                     send_dist_data_loop_tick(DHandle, ConnRef, StreamId, sent, Remaining - 1);
+                {error, {flow_control_blocked, _}} ->
+                    %% Flow control blocked - stop to avoid data loss
+                    Status;
                 {error, _} ->
-                    %% Error sending - stop trying
-                    sent
+                    %% Other error - stop trying
+                    Status
             end
     end.
 
