@@ -52,6 +52,8 @@
 - [x] Recovery on packet loss
 - [x] Persistent congestion detection (resets cwnd after PTO * 3)
 - [x] ECN support (ECN-CE triggers congestion response)
+- [x] Packet pacing (RFC 9002 Section 7.7) to prevent bursts
+- [x] RTT-based flow control auto-tuning
 
 ## TLS 1.3 Integration (RFC 9001)
 
@@ -147,6 +149,38 @@
 - `pool_size` - Number of listener processes for server pools (default: 1)
 - `connection_handler` - Callback for handling new connections
 - `lb_config` - QUIC-LB configuration map for load balancer routing
+- `keep_alive_interval` - Keep-alive PING interval (`disabled`, `auto`, or milliseconds)
+
+## Erlang Distribution (quic_dist)
+
+QUIC-based Erlang distribution protocol implementation.
+
+### Features
+- [x] Full distribution protocol over QUIC transport
+- [x] TLS 1.3 encryption built-in (no separate SSL setup)
+- [x] 0-RTT session resumption for fast reconnection
+- [x] Multiple streams: control (urgency 0) + data (urgency 4-6)
+- [x] Stream prioritization for tick/control messages
+- [x] QUIC-level liveness detection (packet counts, not blocked by flow control)
+- [x] Keep-alive PING frames for transport liveness
+- [x] Backpressure mechanism for congestion control
+- [x] Session ticket storage for 0-RTT
+
+### Modules
+- `quic_dist` - Distribution protocol callbacks
+- `quic_dist_controller` - Per-connection state machine
+- `quic_dist_sup` - Distribution supervisor
+- `quic_dist_tickets` - Session ticket storage
+- `quic_epmd` - EPMD replacement module
+
+### Discovery Backends
+- `quic_discovery_static` - Static node configuration
+- `quic_discovery_dns` - DNS SRV-based discovery
+- Custom backends via `quic_discovery` behaviour
+
+### Distribution API
+- `quic:get_stats/1` - Get packet counts for liveness detection
+- `quic:send_ping/1` - Send transport-level PING frame
 
 ## Interop Runner Compliance
 

@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- QUIC-based Erlang distribution (`quic_dist`) for node communication over QUIC
+- Distribution modules: `quic_dist`, `quic_dist_controller`, `quic_dist_sup`
+- EPMD replacement module (`quic_epmd`) for QUIC-based node discovery
+- Discovery backends: `quic_discovery_static` (static config), `quic_discovery_dns` (DNS SRV)
+- Session ticket storage (`quic_dist_tickets`) for 0-RTT reconnection
+- Stream prioritization for distribution: control stream (urgency 0), data streams (urgency 4-6)
+- Backpressure mechanism for distribution congestion control
+- Keep-alive PING frames for transport-level liveness (configurable via `keep_alive_interval`)
+- `quic:get_stats/1` API for connection packet counts (used for liveness detection)
+- `quic:send_ping/1` API for transport-level PING frames
+- RTT-based flow control auto-tuning for improved throughput
+- Packet pacing (RFC 9002 Section 7.7) to prevent bursts
+
+### Changed
+- Distribution liveness detection now uses QUIC packet counts instead of application ticks
+- Improved congestion control with quic-go-inspired settings (larger initial cwnd)
+- Flow control windows auto-tune based on RTT measurements
+
+### Fixed
+- `net_tick_timeout` errors under heavy load by using QUIC-level activity as liveness proof
+- Stream flow control `recv_max_data` using wrong limits
+- Distribution controller backpressure data loss
+- Congestion control protocol compliance issues
+- Recovery exit when only non-ack-eliciting packets are ACKed
+- Tick timeout issues in distribution controller
+- Flow control blocking that caused deadlocks
+- Message framing for large message transfers
+
+### Removed
+- NAT traversal support from `quic_dist` (use standard QUIC connection migration instead)
+
 ## [0.10.2] - 2026-02-21
 
 ### Fixed
