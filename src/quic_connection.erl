@@ -3507,17 +3507,18 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                 {S, false};
             error ->
                 %% New stream from peer - use peer's limits for streams they initiate
-                SendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
+                InitSendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
+                InitRecvMaxData = get_local_recv_limit(bidi_peer_initiated, State),
                 {
                     #stream_state{
                         id = StreamId,
                         state = open,
                         send_offset = 0,
-                        send_max_data = SendMaxData,
+                        send_max_data = InitSendMaxData,
                         send_fin = false,
                         send_buffer = [],
                         recv_offset = 0,
-                        recv_max_data = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+                        recv_max_data = InitRecvMaxData,
                         recv_fin = false,
                         recv_buffer = #{},
                         final_size = undefined
@@ -4108,6 +4109,7 @@ do_open_stream(
         true ->
             %% Get peer's limit for streams WE initiate (bidi_remote from their perspective)
             SendMaxData = get_peer_stream_limit(bidi_local_initiated, State),
+            RecvMaxData = get_local_recv_limit(bidi_local_initiated, State),
             StreamState = #stream_state{
                 id = NextId,
                 state = open,
@@ -4116,7 +4118,7 @@ do_open_stream(
                 send_fin = false,
                 send_buffer = [],
                 recv_offset = 0,
-                recv_max_data = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+                recv_max_data = RecvMaxData,
                 recv_fin = false,
                 recv_buffer = #{},
                 final_size = undefined
@@ -4208,6 +4210,21 @@ get_peer_stream_limit(StreamType, #state{transport_params = TP}) ->
                 TP,
                 maps:get(initial_max_stream_data_uni, TP, ?DEFAULT_INITIAL_MAX_STREAM_DATA)
             )
+    end.
+
+%% Get our local receive limit for a stream (what we advertised to peer)
+%% - bidi_local_initiated: Bidi stream we opened, use our max_stream_data_bidi_remote
+%% - bidi_peer_initiated: Bidi stream peer opened, use our max_stream_data_bidi_local
+%% - uni_peer_initiated: Uni stream peer opened, use our max_stream_data_uni
+get_local_recv_limit(StreamType, #state{
+    max_stream_data_bidi_local = BidiLocal,
+    max_stream_data_bidi_remote = BidiRemote,
+    max_stream_data_uni = Uni
+}) ->
+    case StreamType of
+        bidi_local_initiated -> BidiRemote;
+        bidi_peer_initiated -> BidiLocal;
+        uni_peer_initiated -> Uni
     end.
 
 %% @doc Check if stream is locally or peer initiated.
