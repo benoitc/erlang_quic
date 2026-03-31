@@ -127,7 +127,10 @@
 
     %% Backpressure tuning (from quic_dist_config or defaults)
     max_pull = ?DEFAULT_MAX_PULL_PER_NOTIFICATION :: pos_integer(),
-    backpressure_retry = ?DEFAULT_BACKPRESSURE_RETRY_MS :: pos_integer()
+    backpressure_retry = ?DEFAULT_BACKPRESSURE_RETRY_MS :: pos_integer(),
+
+    %% Pending tick flag - set when tick send fails due to backpressure
+    pending_tick = false :: boolean()
 }).
 
 %%====================================================================
@@ -348,8 +351,8 @@ handshaking(enter, _OldState, _State) ->
     keep_state_and_data;
 %% Handle tick during handshake - send empty frame to keep connection alive
 handshaking(cast, tick, State) ->
-    send_tick_frame(State),
-    {keep_state, State};
+    State1 = do_send_tick_frame(State),
+    {keep_state, State1};
 %% Handle send during handshake
 handshaking({call, From}, {send, Data}, State) ->
     case do_send_control(Data, State) of
@@ -468,20 +471,23 @@ connected({call, From}, {recv, Length}, State) ->
 connected(cast, tick, #state{dhandle = DHandle, conn_ref = ConnRef} = State) when
     DHandle =/= undefined
 ->
-    %% ALWAYS send tick frame first - this is the liveness signal
-    send_tick_frame(State),
+    %% Try to drain any pending send queue first
+    State1 = drain_send_queue(State),
+    %% Send tick frame - track if it fails
+    State2 = do_send_tick_frame(State1),
     %% Then try to flush some data if not congested (best effort)
-    case quic:get_send_queue_info(ConnRef) of
-        {ok, #{congested := false}} ->
-            _ = send_dist_data_with_tick(State);
-        _ ->
-            ok
-    end,
-    {keep_state, State};
+    State3 =
+        case quic:get_send_queue_info(ConnRef) of
+            {ok, #{congested := false}} ->
+                send_dist_data_with_tick(State2);
+            _ ->
+                State2
+        end,
+    {keep_state, State3};
 connected(cast, tick, State) ->
     %% No DHandle yet, send empty frame to keep QUIC connection alive
-    send_tick_frame(State),
-    {keep_state, State};
+    State1 = do_send_tick_frame(State),
+    {keep_state, State1};
 %% Handle dist_data notification from VM
 %% This means the VM has data ready for us to send
 %% Uses backpressure to avoid overwhelming the QUIC send queue
@@ -492,23 +498,27 @@ connected(
 ) when
     DHandle =/= undefined
 ->
+    %% First drain any pending send queue
+    State1 = drain_send_queue(State),
+    %% Also retry pending tick if any
+    State2 = maybe_retry_pending_tick(State1),
     case quic:get_send_queue_info(ConnRef) of
         {ok, #{congested := true}} ->
             %% Queue is congested - don't pull more data
             %% Re-check after a delay
             erlang:send_after(RetryMs, self(), check_queue),
-            {keep_state, State};
+            {keep_state, State2};
         {ok, #{congested := false}} ->
             %% Queue has room - pull and send limited amount of data
-            send_dist_data_limited(State),
+            State3 = send_dist_data_limited(State2),
             %% Re-register for next notification
             erlang:dist_ctrl_get_data_notification(DHandle),
-            {keep_state, State};
+            {keep_state, State3};
         {error, _} ->
             %% Error getting info - try sending anyway to avoid deadlock
-            send_dist_data_limited(State),
+            State3 = send_dist_data_limited(State2),
             erlang:dist_ctrl_get_data_notification(DHandle),
-            {keep_state, State}
+            {keep_state, State3}
     end;
 %% Handle check_queue - retry sending after backpressure delay
 connected(
@@ -518,16 +528,20 @@ connected(
 ) when
     DHandle =/= undefined
 ->
+    %% First drain any pending send queue
+    State1 = drain_send_queue(State),
+    %% Also retry pending tick if any
+    State2 = maybe_retry_pending_tick(State1),
     case quic:get_send_queue_info(ConnRef) of
         {ok, #{congested := false}} ->
             %% Queue has room - pull and send data
-            send_dist_data_limited(State),
+            State3 = send_dist_data_limited(State2),
             erlang:dist_ctrl_get_data_notification(DHandle),
-            {keep_state, State};
+            {keep_state, State3};
         _ ->
             %% Still congested or error - retry later
             erlang:send_after(RetryMs, self(), check_queue),
-            {keep_state, State}
+            {keep_state, State2}
     end;
 connected(EventType, Event, State) ->
     handle_common_event(EventType, Event, connected, State).
@@ -673,8 +687,8 @@ handle_common_event(
     {keep_state, State};
 %% Handle tick in any state (fallback)
 handle_common_event(cast, tick, _StateName, State) ->
-    send_tick_frame(State),
-    {keep_state, State};
+    State1 = do_send_tick_frame(State),
+    {keep_state, State1};
 handle_common_event(_EventType, _Event, _StateName, State) ->
     {keep_state, State}.
 
@@ -826,104 +840,182 @@ do_send_data(Data, State) ->
 %% Send tick frame on control stream for priority delivery.
 %% Control stream has urgency 0 and separate flow control from data streams.
 %% This ensures ticks always get through even when data streams are blocked.
-send_tick_frame(#state{conn_ref = ConnRef, control_stream = CtrlStream}) when
+%% Returns updated state with pending_tick flag set if send failed.
+do_send_tick_frame(#state{conn_ref = ConnRef, control_stream = CtrlStream} = State) when
     CtrlStream =/= undefined
 ->
     %% Always use control stream first - highest priority, separate flow control
-    quic:send_data(ConnRef, CtrlStream, <<0:32/big-unsigned>>, false),
-    ok;
-send_tick_frame(#state{conn_ref = ConnRef, data_streams = [FirstStream | _]}) ->
+    case quic:send_data(ConnRef, CtrlStream, <<0:32/big-unsigned>>, false) of
+        ok ->
+            State#state{pending_tick = false};
+        {error, send_queue_full} ->
+            %% Tick blocked - mark as pending for retry
+            State#state{pending_tick = true};
+        {error, {flow_control_blocked, _}} ->
+            %% Flow control blocked - mark as pending for retry
+            State#state{pending_tick = true};
+        {error, _} ->
+            %% Other error - clear pending (connection may be broken)
+            State#state{pending_tick = false}
+    end;
+do_send_tick_frame(#state{conn_ref = ConnRef, data_streams = [FirstStream | _]} = State) ->
     %% Fallback to data stream only if no control stream
-    quic:send_data(ConnRef, FirstStream, <<0:32/big-unsigned>>, false),
-    ok;
-send_tick_frame(_State) ->
-    ok.
+    case quic:send_data(ConnRef, FirstStream, <<0:32/big-unsigned>>, false) of
+        ok ->
+            State#state{pending_tick = false};
+        {error, send_queue_full} ->
+            State#state{pending_tick = true};
+        {error, {flow_control_blocked, _}} ->
+            State#state{pending_tick = true};
+        {error, _} ->
+            State#state{pending_tick = false}
+    end;
+do_send_tick_frame(State) ->
+    State.
+
+%% @private
+%% Retry sending a pending tick if one is queued.
+maybe_retry_pending_tick(#state{pending_tick = false} = State) ->
+    State;
+maybe_retry_pending_tick(#state{pending_tick = true} = State) ->
+    do_send_tick_frame(State).
 
 %% @private
 %% Send distribution data from VM via QUIC with backpressure.
 %% Called when dist_data notification is received.
-%% Limits pulls to max_pull to prevent burst.
-send_dist_data_limited(#state{
-    dhandle = DHandle,
-    conn_ref = ConnRef,
-    data_streams = [FirstStream | _],
-    max_pull = MaxPull
-}) ->
+%% First drains any pending send_queue, then pulls from VM.
+%% Returns updated state (with any unsent data buffered in send_queue).
+send_dist_data_limited(
+    #state{
+        dhandle = DHandle,
+        conn_ref = ConnRef,
+        data_streams = [FirstStream | _],
+        max_pull = MaxPull
+    } = State
+) ->
     %% Use first data stream for all distribution data to maintain ordering
-    send_dist_data_limited_loop(DHandle, ConnRef, FirstStream, MaxPull);
-send_dist_data_limited(#state{
-    dhandle = DHandle,
-    conn_ref = ConnRef,
-    control_stream = CtrlStream,
-    max_pull = MaxPull
-}) ->
+    send_dist_data_limited_loop(DHandle, ConnRef, FirstStream, MaxPull, State);
+send_dist_data_limited(
+    #state{
+        dhandle = DHandle,
+        conn_ref = ConnRef,
+        control_stream = CtrlStream,
+        max_pull = MaxPull
+    } = State
+) ->
     %% Fallback: no data streams, use control stream
-    send_dist_data_limited_loop(DHandle, ConnRef, CtrlStream, MaxPull).
+    send_dist_data_limited_loop(DHandle, ConnRef, CtrlStream, MaxPull, State).
 
 %% @private
 %% Send distribution data with limited pulls per notification.
-send_dist_data_limited_loop(_DHandle, _ConnRef, _StreamId, 0) ->
+%% Buffers unsent data in send_queue instead of dropping it.
+send_dist_data_limited_loop(_DHandle, _ConnRef, _StreamId, 0, State) ->
     %% Pulled enough for now
-    ok;
-send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining) ->
+    State;
+send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining, State) ->
     case erlang:dist_ctrl_get_data(DHandle) of
         none ->
-            ok;
+            State;
         Data ->
             case send_one_frame(ConnRef, StreamId, Data) of
                 ok ->
-                    send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining - 1);
+                    send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining - 1, State);
                 {error, send_queue_full} ->
-                    %% Stop pulling, queue is full
-                    ok;
+                    %% Queue full - buffer the data we already pulled
+                    enqueue_send_data(Data, State);
                 {error, {flow_control_blocked, _}} ->
-                    %% Flow control blocked - stop pulling to avoid data loss
-                    %% Will retry when MAX_DATA/MAX_STREAM_DATA is received
-                    ok;
+                    %% Flow control blocked - buffer the data we already pulled
+                    enqueue_send_data(Data, State);
                 {error, _} ->
-                    %% Other error - continue trying
-                    send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining - 1)
+                    %% Other error - continue trying (don't lose the data)
+                    send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining - 1, State)
             end
     end.
 
 %% @private
-%% Send distribution data, returning `sent` if data was sent, `none` if nothing.
+%% Send distribution data during tick callback.
 %% Used by tick handler to flush limited data (best effort, not blocking).
 %% Respects max_pull to prevent unbounded loop during tick callback.
-send_dist_data_with_tick(#state{
-    dhandle = DHandle,
-    conn_ref = ConnRef,
-    data_streams = [FirstStream | _],
-    max_pull = MaxPull
-}) ->
-    send_dist_data_loop_tick(DHandle, ConnRef, FirstStream, none, MaxPull);
-send_dist_data_with_tick(#state{
-    dhandle = DHandle,
-    conn_ref = ConnRef,
-    control_stream = CtrlStream,
-    max_pull = MaxPull
-}) ->
-    send_dist_data_loop_tick(DHandle, ConnRef, CtrlStream, none, MaxPull).
+%% Returns updated state with any unsent data buffered.
+send_dist_data_with_tick(
+    #state{
+        dhandle = DHandle,
+        conn_ref = ConnRef,
+        data_streams = [FirstStream | _],
+        max_pull = MaxPull
+    } = State
+) ->
+    send_dist_data_loop_tick(DHandle, ConnRef, FirstStream, MaxPull, State);
+send_dist_data_with_tick(
+    #state{
+        dhandle = DHandle,
+        conn_ref = ConnRef,
+        control_stream = CtrlStream,
+        max_pull = MaxPull
+    } = State
+) ->
+    send_dist_data_loop_tick(DHandle, ConnRef, CtrlStream, MaxPull, State).
 
 %% @private
 %% Send distribution data with pull limit to prevent tick callback blocking.
-send_dist_data_loop_tick(_DHandle, _ConnRef, _StreamId, Status, 0) ->
+%% Buffers unsent data in send_queue instead of dropping it.
+send_dist_data_loop_tick(_DHandle, _ConnRef, _StreamId, 0, State) ->
     %% Reached pull limit - stop to avoid blocking tick callback
-    Status;
-send_dist_data_loop_tick(DHandle, ConnRef, StreamId, Status, Remaining) ->
+    State;
+send_dist_data_loop_tick(DHandle, ConnRef, StreamId, Remaining, State) ->
     case erlang:dist_ctrl_get_data(DHandle) of
         none ->
-            Status;
+            State;
         Data ->
             case send_one_frame(ConnRef, StreamId, Data) of
                 ok ->
-                    send_dist_data_loop_tick(DHandle, ConnRef, StreamId, sent, Remaining - 1);
+                    send_dist_data_loop_tick(DHandle, ConnRef, StreamId, Remaining - 1, State);
+                {error, send_queue_full} ->
+                    %% Queue full - buffer the data we already pulled
+                    enqueue_send_data(Data, State);
                 {error, {flow_control_blocked, _}} ->
-                    %% Flow control blocked - stop to avoid data loss
-                    Status;
+                    %% Flow control blocked - buffer the data we already pulled
+                    enqueue_send_data(Data, State);
                 {error, _} ->
-                    %% Other error - stop trying
-                    Status
+                    %% Other error - stop trying but don't lose data
+                    enqueue_send_data(Data, State)
+            end
+    end.
+
+%% @private
+%% Enqueue data that couldn't be sent due to backpressure.
+enqueue_send_data(Data, #state{send_queue = Queue} = State) ->
+    State#state{send_queue = queue:in(Data, Queue)}.
+
+%% @private
+%% Drain the send queue - try to send any buffered data.
+%% Returns updated state with remaining unsent data in queue.
+drain_send_queue(
+    #state{send_queue = Queue, conn_ref = ConnRef, data_streams = [FirstStream | _]} = State
+) ->
+    drain_send_queue_loop(Queue, ConnRef, FirstStream, State);
+drain_send_queue(
+    #state{send_queue = Queue, conn_ref = ConnRef, control_stream = CtrlStream} = State
+) when
+    CtrlStream =/= undefined
+->
+    drain_send_queue_loop(Queue, ConnRef, CtrlStream, State);
+drain_send_queue(State) ->
+    State.
+
+drain_send_queue_loop(Queue, ConnRef, StreamId, State) ->
+    case queue:out(Queue) of
+        {empty, _} ->
+            State#state{send_queue = Queue};
+        {{value, Data}, RestQueue} ->
+            case send_one_frame(ConnRef, StreamId, Data) of
+                ok ->
+                    %% Sent successfully, continue draining
+                    drain_send_queue_loop(RestQueue, ConnRef, StreamId, State);
+                {error, _} ->
+                    %% Failed to send - put data back and stop
+                    %% (data is already at front since we just dequeued it)
+                    State#state{send_queue = Queue}
             end
     end.
 
