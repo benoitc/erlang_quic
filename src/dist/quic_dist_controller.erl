@@ -45,6 +45,11 @@
 %% Prevents blocking on dist_ctrl_put_data during heavy incoming traffic.
 -define(INPUT_HANDLER_BATCH_SIZE, 32).
 
+%% Pending tick retry interval in milliseconds.
+%% When a tick send fails due to flow control or queue full, retry aggressively.
+%% Use short interval (10ms) to ensure tick gets through during brief congestion windows.
+-define(PENDING_TICK_RETRY_MS, 10).
+
 %% API
 -export([
     start_link/2,
@@ -130,7 +135,13 @@
     backpressure_retry = ?DEFAULT_BACKPRESSURE_RETRY_MS :: pos_integer(),
 
     %% Pending tick flag - set when tick send fails due to backpressure
-    pending_tick = false :: boolean()
+    pending_tick = false :: boolean(),
+    %% Timer for retrying pending tick sends
+    pending_tick_timer :: reference() | undefined,
+    %% Last time we sent data (for tick response rate limiting)
+    last_send_time = 0 :: integer(),
+    %% Last time we sent a tick response (to prevent feedback loops)
+    last_tick_response = 0 :: integer()
 }).
 
 %%====================================================================
@@ -256,7 +267,12 @@ get_dist_opt(Key, Opts, Default) when is_list(Opts) ->
 get_dist_opt(Key, Opts, Default) when is_map(Opts) ->
     maps:get(Key, Opts, Default).
 
-terminate(_Reason, _StateName, #state{conn_ref = ConnRef}) ->
+terminate(_Reason, _StateName, #state{conn_ref = ConnRef, pending_tick_timer = Timer}) ->
+    %% Cancel pending tick retry timer if running
+    case Timer of
+        undefined -> ok;
+        TimerRef -> erlang:cancel_timer(TimerRef)
+    end,
     try
         quic:close(ConnRef, normal)
     catch
@@ -337,11 +353,9 @@ setup_streams(#state{role = client} = State) ->
             {error, {control_stream_failed, Reason}}
     end;
 setup_streams(#state{role = server} = State) ->
-    %% Server uses stream 0 (opened by client) for control
-    %% We don't set priority on streams we don't own
-    %% Server-initiated data streams (1, 5, 9, ...) will be opened later if needed
-    State1 = State#state{control_stream = 0},
-    {ok, State1}.
+    %% Server uses stream 0 (opened by client) for control.
+    %% Priority is set in connected/enter once stream 0 exists in streams map.
+    {ok, State#state{control_stream = 0}}.
 
 %%====================================================================
 %% State: handshaking
@@ -381,18 +395,13 @@ handshaking(info, {handshake_complete, Node, DHandle}, State) ->
 
     %% Set up distribution control machinery
     %% This is required for process-based distribution to work properly
-
-    %% Server needs to open data streams too (server-initiated: 1, 5, 9, ...)
-    State0 =
-        case State#state.role of
-            server -> open_server_data_streams(State);
-            client -> State
-        end,
+    %% Note: Server opens data streams in connected/enter handler, not here,
+    %% so we can set control stream priority first (which requires data_streams = [])
 
     %% Spawn input handler to receive QUIC data and deliver to VM
     Self = self(),
-    ConnRef = State0#state.conn_ref,
-    ControlStream = State0#state.control_stream,
+    ConnRef = State#state.conn_ref,
+    ControlStream = State#state.control_stream,
     InputHandler = spawn_link(
         fun() ->
             input_handler_loop(DHandle, Self, ConnRef, ControlStream)
@@ -405,7 +414,7 @@ handshaking(info, {handshake_complete, Node, DHandle}, State) ->
     %% DON'T notify here - wait until we're in connected state
     %% The notification happens in the connected state's enter callback
 
-    State1 = State0#state{
+    State1 = State#state{
         node = Node,
         dhandle = DHandle,
         input_handler = InputHandler
@@ -428,6 +437,10 @@ connected(
 ) when
     DHandle =/= undefined
 ->
+    %% Set control stream (stream 0) priority now that stream exists in connection.
+    %% This must happen AFTER handshake (stream creation) but BEFORE we start sending.
+    %% Urgency 0 allows ticks to use control_allowance, bypassing congestion control.
+    _ = set_stream_priority(State, 0, ?QUIC_DIST_URGENCY_CONTROL),
     %% Server needs to open data streams for sending distribution data
     NewState = open_server_data_streams(State),
     %% Forward any pending data stream content to input handler
@@ -550,8 +563,18 @@ connected(EventType, Event, State) ->
 %% Common Event Handling
 %%====================================================================
 
-handle_common_event({call, From}, getstat, _StateName, State) ->
-    #state{recv_cnt = RecvCnt, send_cnt = SendCnt} = State,
+handle_common_event({call, From}, getstat, _StateName, #state{conn_ref = ConnRef} = State) ->
+    %% Use QUIC-level packet counts for liveness detection
+    %% This ensures any QUIC activity (ACKs, PINGs) counts as proof of liveness,
+    %% even when application-level data is blocked by flow control.
+    {RecvCnt, SendCnt} =
+        case quic:get_stats(ConnRef) of
+            {ok, #{packets_received := PR, packets_sent := PS}} ->
+                {PR, PS};
+            _ ->
+                %% Fallback to application-level counts if get_stats fails
+                {State#state.recv_cnt, State#state.send_cnt}
+        end,
     SendPend = queue:len(State#state.send_queue),
     {keep_state, State, [{reply, From, {ok, RecvCnt, SendCnt, SendPend}}]};
 handle_common_event(
@@ -689,6 +712,11 @@ handle_common_event(
 handle_common_event(cast, tick, _StateName, State) ->
     State1 = do_send_tick_frame(State),
     {keep_state, State1};
+%% Handle pending tick retry timer
+handle_common_event(info, pending_tick_retry, _StateName, State) ->
+    State1 = State#state{pending_tick_timer = undefined},
+    State2 = maybe_retry_pending_tick(State1),
+    {keep_state, State2};
 handle_common_event(_EventType, _Event, _StateName, State) ->
     {keep_state, State}.
 
@@ -795,8 +823,10 @@ do_send_control(
 
     case quic:send_data(ConnRef, StreamId, DataBin, false) of
         ok ->
+            Now = erlang:monotonic_time(millisecond),
             {ok, State#state{
                 send_cnt = SendCnt + 1,
+                last_send_time = Now,
                 send_oct = SendOct + Len
             }};
         Error ->
@@ -824,10 +854,12 @@ do_send_data(
 
     case quic:send_data(ConnRef, StreamId, DataBin, false) of
         ok ->
+            Now = erlang:monotonic_time(millisecond),
             {ok, State#state{
                 data_stream_idx = Idx + 1,
                 send_cnt = SendCnt + 1,
-                send_oct = SendOct + Len
+                send_oct = SendOct + Len,
+                last_send_time = Now
             }};
         Error ->
             Error
@@ -837,48 +869,79 @@ do_send_data(Data, State) ->
     do_send_control(Data, State).
 
 %% @private
-%% Send tick frame on control stream for priority delivery.
-%% Control stream has urgency 0 and separate flow control from data streams.
-%% This ensures ticks always get through even when data streams are blocked.
-%% Returns updated state with pending_tick flag set if send failed.
+%% Send tick frame on control stream with QUIC PING for reliability.
+%% We send both:
+%% 1. QUIC PING - bypasses congestion, keeps transport alive
+%% 2. Stream tick - needed for Erlang distribution response mechanism
+%% Returns updated state with pending_tick flag set if stream send failed.
+%% Starts a retry timer when tick is blocked to ensure retry during idle periods.
 do_send_tick_frame(#state{conn_ref = ConnRef, control_stream = CtrlStream} = State) when
     CtrlStream =/= undefined
 ->
-    %% Always use control stream first - highest priority, separate flow control
+    %% Send QUIC PING to keep transport alive (bypasses congestion)
+    _ = quic:send_ping(ConnRef),
+    %% Also send stream-based tick for Erlang distribution protocol
     case quic:send_data(ConnRef, CtrlStream, <<0:32/big-unsigned>>, false) of
         ok ->
-            State#state{pending_tick = false};
+            Now = erlang:monotonic_time(millisecond),
+            cancel_pending_tick_timer(State#state{pending_tick = false, last_send_time = Now});
         {error, send_queue_full} ->
-            %% Tick blocked - mark as pending for retry
-            State#state{pending_tick = true};
+            %% Stream blocked - mark pending, retry aggressively
+            start_pending_tick_timer(State#state{pending_tick = true});
         {error, {flow_control_blocked, _}} ->
-            %% Flow control blocked - mark as pending for retry
-            State#state{pending_tick = true};
+            %% Flow control blocked - mark pending, retry aggressively
+            start_pending_tick_timer(State#state{pending_tick = true});
         {error, _} ->
-            %% Other error - clear pending (connection may be broken)
-            State#state{pending_tick = false}
+            %% Other error - clear pending
+            cancel_pending_tick_timer(State#state{pending_tick = false})
     end;
 do_send_tick_frame(#state{conn_ref = ConnRef, data_streams = [FirstStream | _]} = State) ->
-    %% Fallback to data stream only if no control stream
+    %% Fallback to data stream if no control stream
+    _ = quic:send_ping(ConnRef),
     case quic:send_data(ConnRef, FirstStream, <<0:32/big-unsigned>>, false) of
         ok ->
-            State#state{pending_tick = false};
+            Now = erlang:monotonic_time(millisecond),
+            cancel_pending_tick_timer(State#state{pending_tick = false, last_send_time = Now});
         {error, send_queue_full} ->
-            State#state{pending_tick = true};
+            start_pending_tick_timer(State#state{pending_tick = true});
         {error, {flow_control_blocked, _}} ->
-            State#state{pending_tick = true};
+            start_pending_tick_timer(State#state{pending_tick = true});
         {error, _} ->
-            State#state{pending_tick = false}
+            cancel_pending_tick_timer(State#state{pending_tick = false})
     end;
 do_send_tick_frame(State) ->
     State.
+
+%% @private
+%% Start the pending tick retry timer if not already running.
+start_pending_tick_timer(#state{pending_tick_timer = undefined} = State) ->
+    TimerRef = erlang:send_after(?PENDING_TICK_RETRY_MS, self(), pending_tick_retry),
+    State#state{pending_tick_timer = TimerRef};
+start_pending_tick_timer(State) ->
+    %% Timer already running
+    State.
+
+%% @private
+%% Cancel the pending tick retry timer if running.
+cancel_pending_tick_timer(#state{pending_tick_timer = undefined} = State) ->
+    State;
+cancel_pending_tick_timer(#state{pending_tick_timer = TimerRef} = State) ->
+    erlang:cancel_timer(TimerRef),
+    State#state{pending_tick_timer = undefined}.
 
 %% @private
 %% Retry sending a pending tick if one is queued.
 maybe_retry_pending_tick(#state{pending_tick = false} = State) ->
     State;
 maybe_retry_pending_tick(#state{pending_tick = true} = State) ->
-    do_send_tick_frame(State).
+    State1 = do_send_tick_frame(State),
+    case State1#state.pending_tick of
+        false ->
+            ?LOG_WARNING(#{what => pending_tick_retry_success}, ?QUIC_LOG_META);
+        true ->
+            ok
+    end,
+    State1.
 
 %% @private
 %% Send distribution data from VM via QUIC with backpressure.
@@ -1204,12 +1267,37 @@ try_recv(_Length, State) ->
 %% Handle data received on control stream.
 %% During handshake: buffer data for f_recv (distribution handshake)
 %% After handshake: control stream only receives tick frames (<<0:32>>)
-%%                  which are ignored - NOT forwarded to input handler
+%%                  Send tick response to ensure bidirectional liveness.
 handle_control_data(<<>>, _StateName, State) ->
     %% Empty data - signals liveness, nothing to process
     {keep_state, State};
+handle_control_data(
+    <<0:32/big-unsigned, Rest/binary>>,
+    connected,
+    #state{last_send_time = LastSend, last_tick_response = LastResp} = State
+) ->
+    %% Tick frame received in connected state.
+    %% Send tick response only if:
+    %% 1. We've been idle (haven't sent data recently) - need to prove liveness
+    %% 2. We haven't sent a tick response recently - prevents feedback loops
+    Now = erlang:monotonic_time(millisecond),
+    IdleThreshold = 1000,
+    TickResponseCooldown = 5000,
+    IsIdle = (Now - LastSend) > IdleThreshold,
+    CanRespond = (Now - LastResp) > TickResponseCooldown,
+    State1 =
+        case IsIdle andalso CanRespond of
+            true ->
+                %% We're idle and cooldown passed - send tick response
+                State2 = do_send_tick_frame(State),
+                State2#state{last_tick_response = Now};
+            false ->
+                %% Either actively sending data or already responded recently
+                State
+        end,
+    handle_control_data(Rest, connected, State1);
 handle_control_data(<<0:32/big-unsigned, Rest/binary>>, StateName, State) ->
-    %% Tick frame on control stream - ignore payload, process rest
+    %% Tick frame during handshake - just consume, don't respond
     handle_control_data(Rest, StateName, State);
 handle_control_data(
     Data,

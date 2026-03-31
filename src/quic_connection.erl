@@ -80,6 +80,10 @@
     set_owner_sync/2,
     setopts/2,
     get_send_queue_info/1,
+    %% Connection statistics (for liveness detection)
+    get_stats/1,
+    %% Transport-level PING (bypasses congestion control)
+    send_ping/1,
     %% Key update (RFC 9001 Section 6)
     key_update/1,
     %% Connection migration (RFC 9000 Section 9)
@@ -242,6 +246,10 @@
     pto_timer :: reference() | undefined,
     idle_timer :: reference() | undefined,
 
+    %% Keep-alive (RFC 9000 - PING frames for liveness)
+    keep_alive_interval :: non_neg_integer() | disabled,
+    keep_alive_timer :: reference() | undefined,
+
     %% Pacing (RFC 9002 Section 7.7)
     pacing_timer :: reference() | undefined,
     pacing_enabled = true :: boolean(),
@@ -326,7 +334,12 @@
 
     %% Backpressure configuration (for distribution connections)
     %% Connection is congested when queue > cwnd * congestion_threshold
-    congestion_threshold = 2 :: pos_integer()
+    congestion_threshold = 2 :: pos_integer(),
+
+    %% Statistics - packet counts for liveness detection
+    %% These count actual QUIC packets (not bytes), used by net_kernel getstat
+    packets_received = 0 :: non_neg_integer(),
+    packets_sent = 0 :: non_neg_integer()
 }).
 
 %%====================================================================
@@ -519,6 +532,20 @@ setopts(Conn, Opts) ->
 get_send_queue_info(Conn) ->
     gen_statem:call(Conn, get_send_queue_info).
 
+%% @doc Get connection statistics for liveness detection.
+%% Returns packet counts that can be used by net_kernel for tick checking.
+%% Any QUIC packet (ACK, PING, data) counts as proof of peer liveness.
+-spec get_stats(pid()) -> {ok, map()} | {error, term()}.
+get_stats(Conn) ->
+    gen_statem:call(Conn, get_stats).
+
+%% @doc Send a PING frame (RFC 9000).
+%% PING frames bypass congestion control and are useful for liveness checks.
+%% The PING elicits an ACK from the peer, confirming the connection is alive.
+-spec send_ping(pid()) -> ok | {error, term()}.
+send_ping(Conn) ->
+    gen_statem:call(Conn, send_ping).
+
 %% @doc Initiate a key update (RFC 9001 Section 6).
 %% This triggers a key update cycle, deriving new encryption keys.
 %% Only valid when connection is in connected state.
@@ -625,6 +652,9 @@ init({server, Opts}) ->
     CCState = quic_cc:new(CCOpts),
     LossState = quic_loss:new(),
 
+    %% Get idle timeout for keep-alive calculation
+    IdleTimeout = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
+
     %% Initialize state
     State = #state{
         scid = SCID,
@@ -667,7 +697,9 @@ init({server, Opts}) ->
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
-        idle_timeout = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
+        idle_timeout = IdleTimeout,
+        keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
+        keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
         loss_state = LossState,
@@ -804,6 +836,9 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% Extract session ticket for resumption (if provided)
     SessionTicket = maps:get(session_ticket, Opts, undefined),
 
+    %% Get idle timeout for keep-alive calculation
+    IdleTimeoutClient = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
+
     %% Initialize state
     State = #state{
         scid = SCID,
@@ -843,7 +878,9 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
-        idle_timeout = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
+        idle_timeout = IdleTimeoutClient,
+        keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
+        keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
         loss_state = LossState,
@@ -864,6 +901,7 @@ terminate(_Reason, _StateName, #state{
     conn_ref = ConnRef,
     pto_timer = PtoTimer,
     idle_timer = IdleTimer,
+    keep_alive_timer = KeepAliveTimer,
     pacing_timer = PacingTimer,
     role = Role
 }) ->
@@ -871,6 +909,7 @@ terminate(_Reason, _StateName, #state{
     %% Cancel any active timers
     cancel_timer(PtoTimer),
     cancel_timer(IdleTimer),
+    cancel_timer(KeepAliveTimer),
     cancel_timer(PacingTimer),
     %% Cancel delayed ACK timer from process dictionary
     case erase(ack_timer) of
@@ -1174,6 +1213,29 @@ connected(
         congested => Congested
     },
     {keep_state, State, [{reply, From, {ok, Info}}]};
+connected(
+    {call, From},
+    get_stats,
+    #state{
+        packets_received = PacketsRecv,
+        packets_sent = PacketsSent,
+        data_received = DataRecv,
+        data_sent = DataSent
+    } = State
+) ->
+    %% Return packet counts for liveness detection
+    %% net_kernel uses recv count to verify peer is alive
+    Stats = #{
+        packets_received => PacketsRecv,
+        packets_sent => PacketsSent,
+        data_received => DataRecv,
+        data_sent => DataSent
+    },
+    {keep_state, State, [{reply, From, {ok, Stats}}]};
+connected({call, From}, send_ping, State) ->
+    %% Send PING frame - bypasses congestion control
+    NewState = send_keep_alive_ping(State),
+    {keep_state, NewState, [{reply, From, ok}]};
 connected({call, From}, key_update, #state{key_state = undefined} = State) ->
     {keep_state, State, [{reply, From, {error, no_keys}}]};
 connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
@@ -1309,6 +1371,13 @@ handle_common_event(info, idle_timeout, StateName, State) when
 handle_common_event(info, idle_timeout, _StateName, State) ->
     %% Ignore idle timeout in draining/closed states
     {keep_state, State};
+handle_common_event(info, keep_alive_timeout, connected, State) ->
+    %% Send keep-alive PING and reset timer
+    NewState = send_keep_alive_ping(State),
+    {keep_state, set_keep_alive_timer(NewState)};
+handle_common_event(info, keep_alive_timeout, _StateName, State) ->
+    %% Ignore keep-alive in non-connected states
+    {keep_state, State#state{keep_alive_timer = undefined}};
 handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     {keep_state, State};
 %% Return error for unhandled calls to prevent timeout
@@ -1815,9 +1884,12 @@ send_initial_packet(Payload, State) ->
     %% Send
     gen_udp:send(Socket, IP, Port, PaddedPacket),
 
-    %% Update packet number space
+    %% Update packet number space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State#state{pn_initial = NewPNSpace}.
+    State#state{
+        pn_initial = NewPNSpace,
+        packets_sent = State#state.packets_sent + 1
+    }.
 
 %% Send an Initial ACK packet
 send_initial_ack(State) ->
@@ -2001,9 +2073,12 @@ send_handshake_packet(Payload, State) ->
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     gen_udp:send(Socket, IP, Port, Packet),
 
-    %% Update PN space
+    %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State#state{pn_handshake = NewPNSpace}.
+    State#state{
+        pn_handshake = NewPNSpace,
+        packets_sent = State#state.packets_sent + 1
+    }.
 
 %% Send a 1-RTT (application) packet with frame for retransmission tracking
 %% Decodes the payload to extract frame info for loss tracking
@@ -2088,12 +2163,13 @@ send_app_packet_internal(Payload, Frames, State) ->
                     false -> CCState
                 end,
 
-            %% Update PN space
+            %% Update PN space and packet counter for liveness detection
             NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
             State1 = State#state{
                 pn_app = NewPNSpace,
                 cc_state = NewCCState,
-                loss_state = NewLossState
+                loss_state = NewLossState,
+                packets_sent = State#state.packets_sent + 1
             },
 
             %% Update activity timestamp on successful send
@@ -2156,8 +2232,13 @@ handle_packet_loop(<<>>, #state{role = server} = State) ->
 handle_packet_loop(Data, State) ->
     case decode_and_decrypt_packet(Data, State) of
         {ok, Type, Frames, RemainingData, NewState} ->
+            %% Increment packet counter for liveness detection
+            %% Any successfully decrypted packet proves peer is alive
+            NewState1 = NewState#state{
+                packets_received = NewState#state.packets_received + 1
+            },
             %% Process frames from this packet
-            State1 = process_frames_noreenbl(Type, Frames, NewState),
+            State1 = process_frames_noreenbl(Type, Frames, NewState1),
             %% Send ACK if packet contained ack-eliciting frames
             State2 = maybe_send_ack(Type, Frames, State1),
             %% Continue with remaining coalesced packets
@@ -4078,10 +4159,11 @@ merge_ack_ranges([{S1, E1}, {S2, E2} | Rest]) when E2 + 1 >= S1 ->
 merge_ack_ranges(Ranges) ->
     Ranges.
 
-%% Update last activity timestamp and reset idle timer
+%% Update last activity timestamp and reset idle/keep-alive timers
 update_last_activity(State) ->
     State1 = State#state{last_activity = erlang:monotonic_time(millisecond)},
-    set_idle_timer(State1).
+    State2 = set_idle_timer(State1),
+    set_keep_alive_timer(State2).
 
 %% Open a new stream
 %% Stream ID patterns: Bit 0=initiator (0=client, 1=server), Bit 1=type (0=bidi, 1=uni)
@@ -4449,9 +4531,12 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     gen_udp:send(Socket, IP, Port, Packet),
 
-    %% Update PN space
+    %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State#state{pn_app = NewPNSpace}.
+    State#state{
+        pn_app = NewPNSpace,
+        packets_sent = State#state.packets_sent + 1
+    }.
 
 %% Estimate packet overhead (header + AEAD tag + frame header)
 -define(PACKET_OVERHEAD, 50).
@@ -5008,6 +5093,15 @@ get_oldest_unacked_frames(#state{loss_state = LossState}) ->
             end
     end.
 
+%% Send keep-alive PING frame (RFC 9000 - transport-level liveness)
+%% PING frames bypass flow control and ensure connection stays alive
+send_keep_alive_ping(#state{app_keys = undefined} = State) ->
+    %% No app keys yet, skip PING
+    State;
+send_keep_alive_ping(State) ->
+    Payload = quic_frame:encode(ping),
+    send_app_packet_internal(Payload, [ping], State).
+
 %%====================================================================
 %% PTO Timer Management
 %%====================================================================
@@ -5082,6 +5176,36 @@ set_idle_timer(#state{idle_timeout = Timeout, idle_timer = OldTimer} = State) ->
     cancel_timer(OldTimer),
     TimerRef = erlang:send_after(Timeout, self(), idle_timeout),
     State#state{idle_timer = TimerRef}.
+
+%%====================================================================
+%% Keep-Alive Timer Management (RFC 9000 - PING frames)
+%%====================================================================
+
+%% Calculate keep-alive interval from options and idle timeout
+%% Default: disabled (opt-in to preserve idle_timeout semantics)
+%% Set to 'auto' for half of idle timeout, or specify explicit interval
+calculate_keep_alive_interval(Opts, IdleTimeout) ->
+    case maps:get(keep_alive_interval, Opts, disabled) of
+        disabled -> disabled;
+        0 -> disabled;
+        auto when IdleTimeout =:= 0 -> disabled;
+        auto -> max(5000, IdleTimeout div 2);
+        Interval when is_integer(Interval), Interval >= 5000 -> Interval;
+        Interval when is_integer(Interval) -> 5000
+    end.
+
+%% Set keep-alive timer
+set_keep_alive_timer(#state{keep_alive_interval = disabled} = State) ->
+    State#state{keep_alive_timer = undefined};
+set_keep_alive_timer(
+    #state{
+        keep_alive_interval = Interval,
+        keep_alive_timer = OldTimer
+    } = State
+) ->
+    cancel_timer(OldTimer),
+    TimerRef = erlang:send_after(Interval, self(), keep_alive_timeout),
+    State#state{keep_alive_timer = TimerRef}.
 
 %%====================================================================
 %% Pacing Timer Management (RFC 9002 §7.7)

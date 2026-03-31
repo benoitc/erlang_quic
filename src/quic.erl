@@ -75,7 +75,11 @@
     set_stream_priority/4,
     get_stream_priority/2,
     %% Congestion/backpressure status
-    get_send_queue_info/1
+    get_send_queue_info/1,
+    %% Connection statistics for liveness detection
+    get_stats/1,
+    %% Transport-level PING (bypasses congestion control)
+    send_ping/1
 ]).
 
 %% Server management API
@@ -422,6 +426,50 @@ get_send_queue_info(ConnRef) when is_reference(ConnRef) ->
 get_send_queue_info(ConnPid) when is_pid(ConnPid) ->
     quic_connection:get_send_queue_info(ConnPid);
 get_send_queue_info(_ConnRef) ->
+    {error, badarg}.
+
+%% @doc Get connection statistics for liveness detection.
+%%
+%% Returns packet counts that can be used by net_kernel for tick checking.
+%% Any QUIC packet (ACK, PING, data) counts as proof of peer liveness.
+%%
+%% Returns a map with:
+%% - `packets_received': Total QUIC packets successfully received
+%% - `packets_sent': Total QUIC packets sent
+%% - `data_received': Total bytes of application data received
+%% - `data_sent': Total bytes of application data sent
+%%
+%% @see quic_dist_controller for usage in distribution tick checking
+-spec get_stats(ConnRef) -> {ok, map()} | {error, term()} when
+    ConnRef :: reference() | pid().
+get_stats(ConnRef) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:get_stats(Pid);
+        error -> {error, not_found}
+    end;
+get_stats(ConnPid) when is_pid(ConnPid) ->
+    quic_connection:get_stats(ConnPid);
+get_stats(_ConnRef) ->
+    {error, badarg}.
+
+%% @doc Send a PING frame on the connection.
+%%
+%% PING frames are transport-level frames that bypass congestion control.
+%% They elicit an ACK from the peer and can be used for liveness checking.
+%% This is useful for distribution tick messages that must get through
+%% even when the connection is congested.
+%%
+%% Returns `ok' if the PING was sent, or `{error, Reason}' if it failed.
+-spec send_ping(ConnRef) -> ok | {error, term()} when
+    ConnRef :: reference() | pid().
+send_ping(ConnRef) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:send_ping(Pid);
+        error -> {error, not_found}
+    end;
+send_ping(ConnPid) when is_pid(ConnPid) ->
+    quic_connection:send_ping(ConnPid);
+send_ping(_ConnRef) ->
     {error, badarg}.
 
 %%====================================================================
