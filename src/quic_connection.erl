@@ -79,6 +79,11 @@
     set_owner/2,
     set_owner_sync/2,
     setopts/2,
+    get_send_queue_info/1,
+    %% Connection statistics (for liveness detection)
+    get_stats/1,
+    %% Transport-level PING (bypasses congestion control)
+    send_ping/1,
     %% Key update (RFC 9001 Section 6)
     key_update/1,
     %% Connection migration (RFC 9000 Section 9)
@@ -114,8 +119,8 @@
     merge_ack_ranges/1,
     convert_ack_ranges_for_encode/1,
     convert_rest_ranges/2,
-    check_send_queue_flow_control/3,
-    test_check_flow_control/5
+    check_send_queue_flow_control/4,
+    test_check_flow_control/6
 ]).
 -endif.
 
@@ -209,6 +214,14 @@
     max_data_remote :: non_neg_integer(),
     data_sent = 0 :: non_neg_integer(),
     data_received = 0 :: non_neg_integer(),
+    %% Per-stream flow control limits (advertised in transport params)
+    max_stream_data_bidi_local :: non_neg_integer(),
+    max_stream_data_bidi_remote :: non_neg_integer(),
+    max_stream_data_uni :: non_neg_integer(),
+    %% Flow control auto-tuning state
+    fc_last_stream_update :: integer() | undefined,
+    fc_last_conn_update :: integer() | undefined,
+    fc_max_receive_window :: non_neg_integer(),
 
     %% Stream management
     streams = #{} :: #{non_neg_integer() => #stream_state{}},
@@ -232,6 +245,14 @@
     loss_state :: quic_loss:loss_state() | undefined,
     pto_timer :: reference() | undefined,
     idle_timer :: reference() | undefined,
+
+    %% Keep-alive (RFC 9000 - PING frames for liveness)
+    keep_alive_interval :: non_neg_integer() | disabled,
+    keep_alive_timer :: reference() | undefined,
+
+    %% Pacing (RFC 9002 Section 7.7)
+    pacing_timer :: reference() | undefined,
+    pacing_enabled = true :: boolean(),
 
     %% Pending data - priority queue with 8 buckets (one per urgency 0-7)
     %% Each bucket is a queue:queue() for FIFO within same priority
@@ -309,7 +330,16 @@
     early_data_accepted = false :: boolean(),
 
     %% QUIC-LB CID configuration (RFC 9312)
-    cid_config :: #cid_config{} | undefined
+    cid_config :: #cid_config{} | undefined,
+
+    %% Backpressure configuration (for distribution connections)
+    %% Connection is congested when queue > cwnd * congestion_threshold
+    congestion_threshold = 2 :: pos_integer(),
+
+    %% Statistics - packet counts for liveness detection
+    %% These count actual QUIC packets (not bytes), used by net_kernel getstat
+    packets_received = 0 :: non_neg_integer(),
+    packets_sent = 0 :: non_neg_integer()
 }).
 
 %%====================================================================
@@ -479,8 +509,8 @@ peercert(Conn) ->
 set_owner(Conn, NewOwner) ->
     gen_statem:cast(Conn, {set_owner, NewOwner}).
 
-%% @doc Set new owner process (sync).
-%% Blocks until ownership is transferred.
+%% @doc Set new owner process (synchronous).
+%% Use this when you need to ensure ownership is transferred before continuing.
 -spec set_owner_sync(pid(), pid()) -> ok.
 set_owner_sync(Conn, NewOwner) ->
     gen_statem:call(Conn, {set_owner, NewOwner}).
@@ -494,6 +524,27 @@ send_datagram(Conn, Data) ->
 -spec setopts(pid(), [{atom(), term()}]) -> ok | {error, term()}.
 setopts(Conn, Opts) ->
     gen_statem:call(Conn, {setopts, Opts}).
+
+%% @doc Get send queue status for backpressure decisions.
+%% Returns information about the current send queue state including
+%% whether the connection is congested and should apply backpressure.
+-spec get_send_queue_info(pid()) -> {ok, quic:send_queue_info()} | {error, term()}.
+get_send_queue_info(Conn) ->
+    gen_statem:call(Conn, get_send_queue_info).
+
+%% @doc Get connection statistics for liveness detection.
+%% Returns packet counts that can be used by net_kernel for tick checking.
+%% Any QUIC packet (ACK, PING, data) counts as proof of peer liveness.
+-spec get_stats(pid()) -> {ok, map()} | {error, term()}.
+get_stats(Conn) ->
+    gen_statem:call(Conn, get_stats).
+
+%% @doc Send a PING frame (RFC 9000).
+%% PING frames bypass congestion control and are useful for liveness checks.
+%% The PING elicits an ACK from the peer, confirming the connection is alive.
+-spec send_ping(pid()) -> ok | {error, term()}.
+send_ping(Conn) ->
+    gen_statem:call(Conn, send_ping).
 
 %% @doc Initiate a key update (RFC 9001 Section 6).
 %% This triggers a key update cycle, deriving new encryption keys.
@@ -596,8 +647,13 @@ init({server, Opts}) ->
     register_conn(ConnRef, self()),
 
     %% Initialize congestion control and loss detection
-    CCState = quic_cc:new(),
+    %% Support configurable initial cwnd for distribution workloads
+    CCOpts = build_cc_opts(Opts),
+    CCState = quic_cc:new(CCOpts),
     LossState = quic_loss:new(),
+
+    %% Get idle timeout for keep-alive calculation
+    IdleTimeout = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
 
     %% Initialize state
     State = #state{
@@ -623,6 +679,16 @@ init({server, Opts}) ->
         pn_app = PNSpace,
         max_data_local = maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA),
         max_data_remote = ?DEFAULT_INITIAL_MAX_DATA,
+        max_stream_data_bidi_local = maps:get(
+            max_stream_data_bidi_local, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+        ),
+        max_stream_data_bidi_remote = maps:get(
+            max_stream_data_bidi_remote, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+        ),
+        max_stream_data_uni = maps:get(max_stream_data_uni, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA),
+        fc_last_stream_update = undefined,
+        fc_last_conn_update = undefined,
+        fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
         % Server-initiated bidi: 1, 5, 9, ...
         next_stream_id_bidi = 1,
         % Server-initiated uni: 3, 7, 11, ...
@@ -631,7 +697,9 @@ init({server, Opts}) ->
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
-        idle_timeout = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
+        idle_timeout = IdleTimeout,
+        keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
+        keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
         loss_state = LossState,
@@ -640,10 +708,33 @@ init({server, Opts}) ->
         server_cert_chain = CertChain,
         server_private_key = PrivateKey,
         server_preferred_address = build_server_preferred_address(Opts),
-        cid_config = maps:get(cid_config, Opts, undefined)
+        cid_config = maps:get(cid_config, Opts, undefined),
+        congestion_threshold = maps:get(congestion_threshold, Opts, 2),
+        pacing_enabled = maps:get(pacing_enabled, Opts, true)
     },
 
     {ok, idle, State}.
+
+%% Build congestion control options from connection options.
+%% Supports:
+%%   - initial_window: Initial congestion window in bytes (default: RFC 9002 formula)
+%%                     Higher values improve bulk transfer throughput.
+%%                     Recommended for distribution: 65536 (64KB) or higher.
+%%   - minimum_window: Lower bound for cwnd after congestion events.
+%%                     Defaults to RFC 9002 (2 * max_datagram_size).
+%%   - min_recovery_duration: Minimum time in recovery before exit (ms, default: 100)
+%%                            Prevents rapid cwnd oscillations on low-latency networks.
+build_cc_opts(Opts) ->
+    CCOpts = #{},
+    CCOpts1 = maybe_add_cc_opt(initial_window, Opts, CCOpts),
+    CCOpts2 = maybe_add_cc_opt(minimum_window, Opts, CCOpts1),
+    maybe_add_cc_opt(min_recovery_duration, Opts, CCOpts2).
+
+maybe_add_cc_opt(Key, Opts, CCOpts) ->
+    case maps:find(Key, Opts) of
+        {ok, V} when is_integer(V), V > 0 -> CCOpts#{Key => V};
+        _ -> CCOpts
+    end.
 
 %% Build preferred_address record from listener options (RFC 9000 Section 9.6)
 build_server_preferred_address(Opts) ->
@@ -737,11 +828,16 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     AlpnList = normalize_alpn_list(AlpnOpt),
 
     %% Initialize congestion control and loss detection
-    CCState = quic_cc:new(),
+    %% Support configurable initial cwnd for distribution workloads
+    CCOpts = build_cc_opts(Opts),
+    CCState = quic_cc:new(CCOpts),
     LossState = quic_loss:new(),
 
     %% Extract session ticket for resumption (if provided)
     SessionTicket = maps:get(session_ticket, Opts, undefined),
+
+    %% Get idle timeout for keep-alive calculation
+    IdleTimeoutClient = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
 
     %% Initialize state
     State = #state{
@@ -764,6 +860,16 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         pn_app = PNSpace,
         max_data_local = maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA),
         max_data_remote = ?DEFAULT_INITIAL_MAX_DATA,
+        max_stream_data_bidi_local = maps:get(
+            max_stream_data_bidi_local, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+        ),
+        max_stream_data_bidi_remote = maps:get(
+            max_stream_data_bidi_remote, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+        ),
+        max_stream_data_uni = maps:get(max_stream_data_uni, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA),
+        fc_last_stream_update = undefined,
+        fc_last_conn_update = undefined,
+        fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
         % Client-initiated bidi: 0, 4, 8, ...
         next_stream_id_bidi = 0,
         % Client-initiated uni: 2, 6, 10, ...
@@ -772,7 +878,9 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
-        idle_timeout = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
+        idle_timeout = IdleTimeoutClient,
+        keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
+        keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
         loss_state = LossState,
@@ -781,7 +889,9 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             case SessionTicket of
                 undefined -> quic_ticket:new_store();
                 Ticket -> quic_ticket:store_ticket(ServerName, Ticket, quic_ticket:new_store())
-            end
+            end,
+        congestion_threshold = maps:get(congestion_threshold, Opts, 2),
+        pacing_enabled = maps:get(pacing_enabled, Opts, true)
     },
 
     {ok, idle, State}.
@@ -791,12 +901,16 @@ terminate(_Reason, _StateName, #state{
     conn_ref = ConnRef,
     pto_timer = PtoTimer,
     idle_timer = IdleTimer,
+    keep_alive_timer = KeepAliveTimer,
+    pacing_timer = PacingTimer,
     role = Role
 }) ->
     unregister_conn(ConnRef),
     %% Cancel any active timers
     cancel_timer(PtoTimer),
     cancel_timer(IdleTimer),
+    cancel_timer(KeepAliveTimer),
+    cancel_timer(PacingTimer),
     %% Cancel delayed ACK timer from process dictionary
     case erase(ack_timer) of
         undefined -> ok;
@@ -1077,6 +1191,51 @@ connected({call, From}, {get_stream_priority, StreamId}, State) ->
     end;
 connected({call, From}, {setopts, _Opts}, State) ->
     {keep_state, State, [{reply, From, ok}]};
+connected(
+    {call, From},
+    get_send_queue_info,
+    #state{
+        send_queue_bytes = Bytes,
+        cc_state = CCState,
+        congestion_threshold = Threshold
+    } = State
+) ->
+    Cwnd = quic_cc:cwnd(CCState),
+    InFlight = quic_cc:bytes_in_flight(CCState),
+    InRecovery = quic_cc:in_recovery(CCState),
+    %% Congested if queue > cwnd * threshold OR in recovery with queue > cwnd
+    Congested = (Bytes > Cwnd * Threshold) orelse (InRecovery andalso Bytes > Cwnd),
+    Info = #{
+        bytes => Bytes,
+        cwnd => Cwnd,
+        in_flight => InFlight,
+        in_recovery => InRecovery,
+        congested => Congested
+    },
+    {keep_state, State, [{reply, From, {ok, Info}}]};
+connected(
+    {call, From},
+    get_stats,
+    #state{
+        packets_received = PacketsRecv,
+        packets_sent = PacketsSent,
+        data_received = DataRecv,
+        data_sent = DataSent
+    } = State
+) ->
+    %% Return packet counts for liveness detection
+    %% net_kernel uses recv count to verify peer is alive
+    Stats = #{
+        packets_received => PacketsRecv,
+        packets_sent => PacketsSent,
+        data_received => DataRecv,
+        data_sent => DataSent
+    },
+    {keep_state, State, [{reply, From, {ok, Stats}}]};
+connected({call, From}, send_ping, State) ->
+    %% Send PING frame - bypasses congestion control
+    NewState = send_keep_alive_ping(State),
+    {keep_state, NewState, [{reply, From, ok}]};
 connected({call, From}, key_update, #state{key_state = undefined} = State) ->
     {keep_state, State, [{reply, From, {error, no_keys}}]};
 connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
@@ -1187,6 +1346,13 @@ handle_common_event(info, pto_timeout, StateName, State) when
 handle_common_event(info, pto_timeout, _StateName, State) ->
     %% Ignore PTO in other states
     {keep_state, State};
+handle_common_event(info, pacing_timeout, connected, State) ->
+    %% Handle pacing timeout - process send queue
+    NewState = handle_pacing_timeout(State),
+    {keep_state, NewState};
+handle_common_event(info, pacing_timeout, _StateName, State) ->
+    %% Ignore pacing timeout in other states
+    {keep_state, clear_pacing_timer(State)};
 handle_common_event(info, idle_timeout, StateName, State) when
     StateName =/= draining, StateName =/= closed
 ->
@@ -1205,6 +1371,13 @@ handle_common_event(info, idle_timeout, StateName, State) when
 handle_common_event(info, idle_timeout, _StateName, State) ->
     %% Ignore idle timeout in draining/closed states
     {keep_state, State};
+handle_common_event(info, keep_alive_timeout, connected, State) ->
+    %% Send keep-alive PING and reset timer
+    NewState = send_keep_alive_ping(State),
+    {keep_state, set_keep_alive_timer(NewState)};
+handle_common_event(info, keep_alive_timeout, _StateName, State) ->
+    %% Ignore keep-alive in non-connected states
+    {keep_state, State#state{keep_alive_timer = undefined}};
 handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     {keep_state, State};
 %% Return error for unhandled calls to prevent timeout
@@ -1224,6 +1397,9 @@ send_client_hello(State) ->
         server_name = ServerName,
         alpn_list = AlpnList,
         max_data_local = MaxData,
+        max_stream_data_bidi_local = MaxStreamDataBidiLocal,
+        max_stream_data_bidi_remote = MaxStreamDataBidiRemote,
+        max_stream_data_uni = MaxStreamDataUni,
         max_streams_bidi_local = MaxStreamsBidi,
         max_streams_uni_local = MaxStreamsUni,
         ticket_store = TicketStore
@@ -1240,9 +1416,9 @@ send_client_hello(State) ->
     TransportParams = #{
         initial_scid => SCID,
         initial_max_data => MaxData,
-        initial_max_stream_data_bidi_local => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-        initial_max_stream_data_bidi_remote => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-        initial_max_stream_data_uni => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+        initial_max_stream_data_bidi_local => MaxStreamDataBidiLocal,
+        initial_max_stream_data_bidi_remote => MaxStreamDataBidiRemote,
+        initial_max_stream_data_uni => MaxStreamDataUni,
         initial_max_streams_bidi => MaxStreamsBidi,
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => State#state.idle_timeout,
@@ -1464,6 +1640,9 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         scid = SCID,
         alpn = ALPN,
         max_data_local = MaxData,
+        max_stream_data_bidi_local = MaxStreamDataBidiLocal,
+        max_stream_data_bidi_remote = MaxStreamDataBidiRemote,
+        max_stream_data_uni = MaxStreamDataUni,
         max_streams_bidi_local = MaxStreamsBidi,
         max_streams_uni_local = MaxStreamsUni,
         server_cert = Cert,
@@ -1480,9 +1659,9 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         original_dcid => State#state.original_dcid,
         initial_scid => SCID,
         initial_max_data => MaxData,
-        initial_max_stream_data_bidi_local => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-        initial_max_stream_data_bidi_remote => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-        initial_max_stream_data_uni => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+        initial_max_stream_data_bidi_local => MaxStreamDataBidiLocal,
+        initial_max_stream_data_bidi_remote => MaxStreamDataBidiRemote,
+        initial_max_stream_data_uni => MaxStreamDataUni,
         initial_max_streams_bidi => MaxStreamsBidi,
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => State#state.idle_timeout,
@@ -1705,9 +1884,12 @@ send_initial_packet(Payload, State) ->
     %% Send
     gen_udp:send(Socket, IP, Port, PaddedPacket),
 
-    %% Update packet number space
+    %% Update packet number space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State#state{pn_initial = NewPNSpace}.
+    State#state{
+        pn_initial = NewPNSpace,
+        packets_sent = State#state.packets_sent + 1
+    }.
 
 %% Send an Initial ACK packet
 send_initial_ack(State) ->
@@ -1891,9 +2073,12 @@ send_handshake_packet(Payload, State) ->
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     gen_udp:send(Socket, IP, Port, Packet),
 
-    %% Update PN space
+    %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State#state{pn_handshake = NewPNSpace}.
+    State#state{
+        pn_handshake = NewPNSpace,
+        packets_sent = State#state.packets_sent + 1
+    }.
 
 %% Send a 1-RTT (application) packet with frame for retransmission tracking
 %% Decodes the payload to extract frame info for loss tracking
@@ -1978,16 +2163,21 @@ send_app_packet_internal(Payload, Frames, State) ->
                     false -> CCState
                 end,
 
-            %% Update PN space
+            %% Update PN space and packet counter for liveness detection
             NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
             State1 = State#state{
                 pn_app = NewPNSpace,
                 cc_state = NewCCState,
-                loss_state = NewLossState
+                loss_state = NewLossState,
+                packets_sent = State#state.packets_sent + 1
             },
 
+            %% Update activity timestamp on successful send
+            %% This prevents idle timeout during long one-way transfers
+            State2 = update_last_activity(State1),
+
             %% Set PTO timer for retransmission
-            set_pto_timer(State1);
+            set_pto_timer(State2);
         {error, Reason} ->
             %% Send failed - do NOT track packet as sent to avoid CC/loss inconsistency
             %% The data will be re-sent via the PTO timeout mechanism
@@ -2042,8 +2232,13 @@ handle_packet_loop(<<>>, #state{role = server} = State) ->
 handle_packet_loop(Data, State) ->
     case decode_and_decrypt_packet(Data, State) of
         {ok, Type, Frames, RemainingData, NewState} ->
+            %% Increment packet counter for liveness detection
+            %% Any successfully decrypted packet proves peer is alive
+            NewState1 = NewState#state{
+                packets_received = NewState#state.packets_received + 1
+            },
             %% Process frames from this packet
-            State1 = process_frames_noreenbl(Type, Frames, NewState),
+            State1 = process_frames_noreenbl(Type, Frames, NewState1),
             %% Send ACK if packet contained ack-eliciting frames
             State2 = maybe_send_ack(Type, Frames, State1),
             %% Continue with remaining coalesced packets
@@ -2548,17 +2743,31 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     ?LOG_ERROR(#{what => invalid_ack_range}, ?QUIC_LOG_META),
                     State;
                 {NewLossState, AckedPackets, LostPackets} ->
-                    %% Calculate total bytes acked and lost
-                    AckedBytes = lists:sum([P#sent_packet.size || P <- AckedPackets]),
-                    LostBytes = lists:sum([P#sent_packet.size || P <- LostPackets]),
+                    %% Filter to only ack-eliciting packets for CC calculations
+                    %% since bytes_in_flight only tracks ack-eliciting packets (RFC 9002)
+                    AckElicitingAcked = [
+                        P
+                     || #sent_packet{ack_eliciting = true} = P <- AckedPackets
+                    ],
+                    AckedBytes = lists:sum([
+                        P#sent_packet.size
+                     || P <- AckElicitingAcked
+                    ]),
+                    LostBytes = lists:sum([
+                        P#sent_packet.size
+                     || #sent_packet{ack_eliciting = true} = P <- LostPackets
+                    ]),
 
-                    %% Find the largest acked packet's sent time for recovery exit detection
+                    %% Find largest acked sent time ONLY from ack-eliciting packets
+                    %% This ensures LargestAckedSentTime is consistent with AckedBytes
+                    %% to prevent deadlock in bidirectional transfer scenarios
                     LargestAckedSentTime =
-                        case AckedPackets of
+                        case AckElicitingAcked of
                             [] ->
+                                %% No ack-eliciting packets - use Now
                                 Now;
                             _ ->
-                                %% AckedPackets may not be sorted, find the one with largest PN
+                                %% AckElicitingAcked may not be sorted, find the one with largest PN
                                 LargestAckedPkt = lists:foldl(
                                     fun(P, Acc) ->
                                         case P#sent_packet.pn > Acc#sent_packet.pn of
@@ -2566,14 +2775,25 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                                             false -> Acc
                                         end
                                     end,
-                                    hd(AckedPackets),
-                                    tl(AckedPackets)
+                                    hd(AckElicitingAcked),
+                                    tl(AckElicitingAcked)
                                 ),
                                 LargestAckedPkt#sent_packet.time_sent
                         end,
 
-                    %% Update congestion control with largest acked sent time for proper recovery exit
-                    CCState1 = quic_cc:on_packets_acked(CCState, AckedBytes, LargestAckedSentTime),
+                    %% Only update CC ACK processing if there are ack-eliciting packets
+                    %% When only non-ack-eliciting packets are ACKed, skip on_packets_acked
+                    %% to prevent false recovery exit (LargestAckedSentTime=Now would always
+                    %% satisfy > RecoveryStart after min_duration). Loss handling is done
+                    %% separately by on_packets_lost and on_congestion_event.
+                    CCState1 =
+                        case AckElicitingAcked of
+                            [] ->
+                                %% No ack-eliciting acks - skip CC ACK update entirely
+                                CCState;
+                            _ ->
+                                quic_cc:on_packets_acked(CCState, AckedBytes, LargestAckedSentTime)
+                        end,
                     CCState2 = quic_cc:on_packets_lost(CCState1, LostBytes),
 
                     %% If there was loss, signal congestion event
@@ -2581,8 +2801,11 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                         case LostPackets of
                             [] ->
                                 CCState2;
-                            [#sent_packet{time_sent = SentTime} | _] ->
-                                quic_cc:on_congestion_event(CCState2, SentTime)
+                            [_ | _] ->
+                                quic_cc:on_congestion_event(
+                                    CCState2,
+                                    largest_lost_sent_time(LostPackets)
+                                )
                         end,
 
                     %% Process ECN counts if present (RFC 9002 Section 7.1)
@@ -2591,9 +2814,13 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% Check for persistent congestion (RFC 9002 Section 7.6)
                     CCState5 = check_persistent_congestion(LostPackets, NewLossState, CCState4),
 
+                    %% Update pacing rate based on new RTT estimate (RFC 9002 Section 7.7)
+                    SmoothedRTT = quic_loss:smoothed_rtt(NewLossState),
+                    CCState6 = quic_cc:update_pacing_rate(CCState5, SmoothedRTT),
+
                     State1 = State#state{
                         loss_state = NewLossState,
-                        cc_state = CCState5
+                        cc_state = CCState6
                     },
 
                     %% Retransmit lost packets
@@ -3361,17 +3588,18 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                 {S, false};
             error ->
                 %% New stream from peer - use peer's limits for streams they initiate
-                SendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
+                InitSendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
+                InitRecvMaxData = get_local_recv_limit(bidi_peer_initiated, State),
                 {
                     #stream_state{
                         id = StreamId,
                         state = open,
                         send_offset = 0,
-                        send_max_data = SendMaxData,
+                        send_max_data = InitSendMaxData,
                         send_fin = false,
                         send_buffer = [],
                         recv_offset = 0,
-                        recv_max_data = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+                        recv_max_data = InitRecvMaxData,
                         recv_fin = false,
                         recv_buffer = #{},
                         final_size = undefined
@@ -3506,17 +3734,39 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
 
             %% Check if we need to send MAX_STREAM_DATA to allow more data
             %% Send when we've consumed more than half our advertised limit
+            %% RTT-based auto-tuning: double if fast consumption, linear if slow
             State2 =
                 case NewRecvOffset > (RecvMaxData div 2) of
                     true ->
-                        %% Double the limit and send MAX_STREAM_DATA
-                        NewMaxStreamData = RecvMaxData * 2,
+                        Now = erlang:monotonic_time(millisecond),
+                        SmoothedRTT = quic_loss:smoothed_rtt(State1#state.loss_state),
+                        MaxWindow = State1#state.fc_max_receive_window,
+                        LastStreamUpdate = State1#state.fc_last_stream_update,
+                        InitialStreamWindow = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+                        %% Check if consumption is fast (< 4*RTT since last update)
+                        FastConsumption =
+                            case LastStreamUpdate of
+                                undefined ->
+                                    true;
+                                _ ->
+                                    (Now - LastStreamUpdate) < (SmoothedRTT * ?AUTO_TUNE_RTT_FACTOR)
+                            end,
+                        NewMaxStreamData =
+                            case FastConsumption of
+                                true ->
+                                    %% Double (aggressive growth for fast consumption)
+                                    min(RecvMaxData * 2, MaxWindow);
+                                false ->
+                                    %% Linear (conservative growth for slow consumption)
+                                    min(RecvMaxData + InitialStreamWindow, MaxWindow)
+                            end,
                         UpdatedStream = NewStream#stream_state{recv_max_data = NewMaxStreamData},
                         MaxStreamDataFrame = quic_frame:encode(
                             {max_stream_data, StreamId, NewMaxStreamData}
                         ),
                         State1a = State1#state{
-                            streams = maps:put(StreamId, UpdatedStream, Streams)
+                            streams = maps:put(StreamId, UpdatedStream, Streams),
+                            fc_last_stream_update = Now
                         },
                         send_app_packet(MaxStreamDataFrame, State1a);
                     false ->
@@ -3525,15 +3775,49 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
 
             %% Check if we need to send MAX_DATA for connection-level flow control
             %% Send when we've consumed more than 50% of our advertised connection window
+            %% RTT-based auto-tuning with connection/stream multiplier enforcement
             MaxDataLocalVal = State2#state.max_data_local,
             State3 =
                 case NewDataReceivedVal > (MaxDataLocalVal div 2) of
                     true ->
-                        %% Extend the connection-level window and send MAX_DATA
-                        NewMaxData = NewDataReceivedVal + MaxDataLocalVal,
+                        Now2 = erlang:monotonic_time(millisecond),
+                        SmoothedRTT2 = quic_loss:smoothed_rtt(State2#state.loss_state),
+                        MaxWindow2 = State2#state.fc_max_receive_window,
+                        LastConnUpdate = State2#state.fc_last_conn_update,
+                        InitialConnWindow = ?DEFAULT_INITIAL_MAX_DATA,
+                        %% Check if consumption is fast (< 4*RTT since last update)
+                        FastConsumption2 =
+                            case LastConnUpdate of
+                                undefined ->
+                                    true;
+                                _ ->
+                                    (Now2 - LastConnUpdate) < (SmoothedRTT2 * ?AUTO_TUNE_RTT_FACTOR)
+                            end,
+                        %% Calculate new window based on RTT-aware growth
+                        BaseNewMaxData =
+                            case FastConsumption2 of
+                                true ->
+                                    %% Double (aggressive growth)
+                                    min((NewDataReceivedVal + MaxDataLocalVal) * 2, MaxWindow2);
+                                false ->
+                                    %% Linear (conservative growth)
+                                    min(
+                                        NewDataReceivedVal + MaxDataLocalVal + InitialConnWindow,
+                                        MaxWindow2
+                                    )
+                            end,
+                        %% Ensure connection window >= 1.5x largest stream window
+                        MaxStreamWindow = get_max_stream_recv_window(State2),
+                        MinConnWindow = trunc(
+                            MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER
+                        ),
+                        NewMaxData = max(BaseNewMaxData, MinConnWindow),
                         MaxDataFrame = quic_frame:encode({max_data, NewMaxData}),
                         State2a = send_app_packet(MaxDataFrame, State2),
-                        State2a#state{max_data_local = NewMaxData};
+                        State2a#state{
+                            max_data_local = NewMaxData,
+                            fc_last_conn_update = Now2
+                        };
                     false ->
                         State2
                 end,
@@ -3558,6 +3842,17 @@ extract_contiguous_data(Buffer, Offset, Acc) ->
             DeliveredData = iolist_to_binary(lists:reverse(Acc)),
             {DeliveredData, Offset, Buffer}
     end.
+
+%% Get the maximum stream receive window across all streams.
+%% Used to ensure connection window >= 1.5x largest stream window.
+get_max_stream_recv_window(#state{streams = Streams}) ->
+    maps:fold(
+        fun(_StreamId, #stream_state{recv_max_data = RecvMaxData}, MaxSoFar) ->
+            max(RecvMaxData, MaxSoFar)
+        end,
+        ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+        Streams
+    ).
 
 %%====================================================================
 %% Internal Functions - Helpers
@@ -3636,6 +3931,21 @@ is_ack_eliciting_frame(_) -> true.
 %% Output for quic_loss: {FirstRange, [{Gap, Range}, ...]}
 ranges_to_ack_format([{_LargestAcked, FirstRange} | RestRanges]) ->
     {FirstRange, RestRanges}.
+
+%% RFC 9002 congestion events use the largest lost packet.
+%% Lost packet lists can be unordered, so pick the max packet number explicitly.
+largest_lost_sent_time([Packet | Rest]) ->
+    Largest = lists:foldl(
+        fun(P, Acc) ->
+            case P#sent_packet.pn > Acc#sent_packet.pn of
+                true -> P;
+                false -> Acc
+            end
+        end,
+        Packet,
+        Rest
+    ),
+    Largest#sent_packet.time_sent.
 
 %% Process ECN counts from ACK frame (RFC 9002 Section 7.1)
 %% ECN-CE indicates network congestion experienced
@@ -3849,10 +4159,11 @@ merge_ack_ranges([{S1, E1}, {S2, E2} | Rest]) when E2 + 1 >= S1 ->
 merge_ack_ranges(Ranges) ->
     Ranges.
 
-%% Update last activity timestamp and reset idle timer
+%% Update last activity timestamp and reset idle/keep-alive timers
 update_last_activity(State) ->
     State1 = State#state{last_activity = erlang:monotonic_time(millisecond)},
-    set_idle_timer(State1).
+    State2 = set_idle_timer(State1),
+    set_keep_alive_timer(State2).
 
 %% Open a new stream
 %% Stream ID patterns: Bit 0=initiator (0=client, 1=server), Bit 1=type (0=bidi, 1=uni)
@@ -3880,6 +4191,7 @@ do_open_stream(
         true ->
             %% Get peer's limit for streams WE initiate (bidi_remote from their perspective)
             SendMaxData = get_peer_stream_limit(bidi_local_initiated, State),
+            RecvMaxData = get_local_recv_limit(bidi_local_initiated, State),
             StreamState = #stream_state{
                 id = NextId,
                 state = open,
@@ -3888,7 +4200,7 @@ do_open_stream(
                 send_fin = false,
                 send_buffer = [],
                 recv_offset = 0,
-                recv_max_data = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+                recv_max_data = RecvMaxData,
                 recv_fin = false,
                 recv_buffer = #{},
                 final_size = undefined
@@ -3982,6 +4294,21 @@ get_peer_stream_limit(StreamType, #state{transport_params = TP}) ->
             )
     end.
 
+%% Get our local receive limit for a stream (what we advertised to peer)
+%% - bidi_local_initiated: Bidi stream we opened, use our max_stream_data_bidi_remote
+%% - bidi_peer_initiated: Bidi stream peer opened, use our max_stream_data_bidi_local
+%% - uni_peer_initiated: Uni stream peer opened, use our max_stream_data_uni
+get_local_recv_limit(StreamType, #state{
+    max_stream_data_bidi_local = BidiLocal,
+    max_stream_data_bidi_remote = BidiRemote,
+    max_stream_data_uni = Uni
+}) ->
+    case StreamType of
+        bidi_local_initiated -> BidiRemote;
+        bidi_peer_initiated -> BidiLocal;
+        uni_peer_initiated -> Uni
+    end.
+
 %% @doc Check if stream is locally or peer initiated.
 %% RFC 9000 Section 2.1: Stream ID format determines initiator and type.
 %% Bit 0: 0=client-initiated, 1=server-initiated
@@ -4046,7 +4373,10 @@ do_send_data(
                     case {DataSize =< ConnectionAllowed, DataSize =< StreamAllowed} of
                         {false, _} ->
                             %% Connection-level flow control blocked
-                            ?LOG_WARNING(
+                            %% RFC 9000: Don't queue data beyond flow control limits.
+                            %% Send DATA_BLOCKED and return error to caller.
+                            %% Caller should retry after receiving MAX_DATA from peer.
+                            ?LOG_DEBUG(
                                 #{
                                     what => connection_flow_control_blocked,
                                     need => DataSize,
@@ -4054,25 +4384,16 @@ do_send_data(
                                 },
                                 ?QUIC_LOG_META
                             ),
-                            %% Queue for later - MUST return the updated state with queued data!
-                            case queue_stream_data(StreamId, Offset, DataBin, Fin, State) of
-                                {ok, QueuedState} ->
-                                    %% Advance send_offset so subsequent sends use the correct offset.
-                                    %% Without this, multiple sends while blocked would all queue at
-                                    %% the same offset, causing stream data corruption on dequeue.
-                                    QueuedState2 = advance_stream_send_offset(
-                                        StreamId, Offset + DataSize, Fin, QueuedState
-                                    ),
-                                    %% RFC 9000 Section 19.12: DATA_BLOCKED reports the connection data limit
-                                    BlockedFrame = quic_frame:encode({data_blocked, MaxDataRemote}),
-                                    FinalState = send_app_packet(BlockedFrame, QueuedState2),
-                                    {ok, FinalState};
-                                {error, send_queue_full} ->
-                                    {error, send_queue_full}
-                            end;
+                            %% RFC 9000 Section 19.12: DATA_BLOCKED reports the connection data limit
+                            BlockedFrame = quic_frame:encode({data_blocked, MaxDataRemote}),
+                            _FinalState = send_app_packet(BlockedFrame, State),
+                            {error, {flow_control_blocked, connection}};
                         {_, false} ->
                             %% Stream-level flow control blocked
-                            ?LOG_WARNING(
+                            %% RFC 9000: Don't queue data beyond flow control limits.
+                            %% Send STREAM_DATA_BLOCKED and return error to caller.
+                            %% Caller should retry after receiving MAX_STREAM_DATA from peer.
+                            ?LOG_DEBUG(
                                 #{
                                     what => stream_flow_control_blocked,
                                     stream_id => StreamId,
@@ -4081,22 +4402,12 @@ do_send_data(
                                 },
                                 ?QUIC_LOG_META
                             ),
-                            %% Queue for later - MUST return the updated state with queued data!
-                            case queue_stream_data(StreamId, Offset, DataBin, Fin, State) of
-                                {ok, QueuedState} ->
-                                    %% Advance send_offset (see connection-blocked comment above)
-                                    QueuedState2 = advance_stream_send_offset(
-                                        StreamId, Offset + DataSize, Fin, QueuedState
-                                    ),
-                                    %% RFC 9000 Section 19.13: STREAM_DATA_BLOCKED reports the stream data limit
-                                    BlockedFrame = quic_frame:encode(
-                                        {stream_data_blocked, StreamId, SendMaxData}
-                                    ),
-                                    FinalState = send_app_packet(BlockedFrame, QueuedState2),
-                                    {ok, FinalState};
-                                {error, send_queue_full} ->
-                                    {error, send_queue_full}
-                            end;
+                            %% RFC 9000 Section 19.13: STREAM_DATA_BLOCKED reports the stream data limit
+                            BlockedFrame = quic_frame:encode(
+                                {stream_data_blocked, StreamId, SendMaxData}
+                            ),
+                            _FinalState = send_app_packet(BlockedFrame, State),
+                            {error, {flow_control_blocked, {stream, StreamId}}};
                         {true, true} ->
                             %% Flow control allows sending
                             %% Fragment and send data - congestion control may partially
@@ -4220,9 +4531,12 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     gen_udp:send(Socket, IP, Port, Packet),
 
-    %% Update PN space
+    %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State#state{pn_app = NewPNSpace}.
+    State#state{
+        pn_app = NewPNSpace,
+        packets_sent = State#state.packets_sent + 1
+    }.
 
 %% Estimate packet overhead (header + AEAD tag + frame header)
 -define(PACKET_OVERHEAD, 50).
@@ -4253,18 +4567,62 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State) ->
 send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) when
     byte_size(Data) =< ?MAX_STREAM_DATA_PER_PACKET
 ->
-    %% Data fits in one packet - check congestion window
-    #state{cc_state = CCState} = State,
+    %% Data fits in one packet - check congestion window and pacing
+    #state{cc_state = CCState, pacing_enabled = PacingEnabled, streams = Streams} = State,
     PacketSize = byte_size(Data) + ?PACKET_OVERHEAD,
-    CanSend = quic_cc:can_send(CCState, PacketSize),
+    %% Control streams (urgency 0) can exceed cwnd to prevent tick blocking
+    Urgency = get_stream_urgency(StreamId, Streams),
+    CanSend =
+        case Urgency of
+            0 -> quic_cc:can_send_control(CCState, PacketSize);
+            _ -> quic_cc:can_send(CCState, PacketSize)
+        end,
     case CanSend of
         true ->
-            Frame = {stream, StreamId, Offset, Data, Fin},
-            Payload = quic_frame:encode(Frame),
-            NewState = send_app_packet_internal(Payload, [Frame], State),
-            {NewState, BytesSentSoFar + byte_size(Data)};
+            %% Cwnd allows - check pacing
+            case PacingEnabled andalso not quic_cc:pacing_allows(CCState, PacketSize) of
+                true ->
+                    %% Pacing blocked - queue data and set pacing timer
+                    Delay = quic_cc:pacing_delay(CCState, PacketSize),
+                    ?LOG_DEBUG(
+                        #{
+                            what => stream_data_paced,
+                            stream_id => StreamId,
+                            data_size => byte_size(Data),
+                            pacing_delay_ms => Delay
+                        },
+                        ?QUIC_LOG_META
+                    ),
+                    case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+                        {ok, QueuedState} ->
+                            PacedState = maybe_set_pacing_timer(Delay, QueuedState),
+                            {PacedState, BytesSentSoFar};
+                        {error, send_queue_full} ->
+                            {error, send_queue_full}
+                    end;
+                false ->
+                    %% Pacing allows - send immediately and consume tokens
+                    {_Allowed, NewCCState} = quic_cc:get_pacing_tokens(CCState, PacketSize),
+                    State1 = State#state{cc_state = NewCCState},
+                    Frame = {stream, StreamId, Offset, Data, Fin},
+                    Payload = quic_frame:encode(Frame),
+                    NewState = send_app_packet_internal(Payload, [Frame], State1),
+                    {NewState, BytesSentSoFar + byte_size(Data)}
+            end;
         false ->
             %% Queue the data for later sending when cwnd allows
+            ?LOG_DEBUG(
+                #{
+                    what => stream_data_queued_cwnd,
+                    stream_id => StreamId,
+                    data_size => byte_size(Data),
+                    offset => Offset,
+                    cwnd => quic_cc:cwnd(CCState),
+                    bytes_in_flight => quic_cc:bytes_in_flight(CCState),
+                    available_cwnd => quic_cc:available_cwnd(CCState)
+                },
+                ?QUIC_LOG_META
+            ),
             case queue_stream_data(StreamId, Offset, Data, Fin, State) of
                 {ok, QueuedState} ->
                     % Return bytes sent so far, not including queued
@@ -4275,22 +4633,67 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSen
     end;
 send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
     %% Split data into chunks and send what we can
-    #state{cc_state = CCState} = State,
+    #state{cc_state = CCState, pacing_enabled = PacingEnabled, streams = Streams} = State,
     PacketSize = ?MAX_STREAM_DATA_PER_PACKET + ?PACKET_OVERHEAD,
-    CanSend = quic_cc:can_send(CCState, PacketSize),
+    %% Control streams (urgency 0) can exceed cwnd to prevent tick blocking
+    Urgency = get_stream_urgency(StreamId, Streams),
+    CanSend =
+        case Urgency of
+            0 -> quic_cc:can_send_control(CCState, PacketSize);
+            _ -> quic_cc:can_send(CCState, PacketSize)
+        end,
     case CanSend of
         true ->
-            <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
-            Frame = {stream, StreamId, Offset, Chunk, false},
-            Payload = quic_frame:encode(Frame),
-            State1 = send_app_packet_internal(Payload, [Frame], State),
-            NewOffset = Offset + ?MAX_STREAM_DATA_PER_PACKET,
-            NewBytesSent = BytesSentSoFar + ?MAX_STREAM_DATA_PER_PACKET,
-            send_stream_data_fragmented_tracked(
-                StreamId, NewOffset, Rest, Fin, State1, NewBytesSent
-            );
+            %% Cwnd allows - check pacing
+            case PacingEnabled andalso not quic_cc:pacing_allows(CCState, PacketSize) of
+                true ->
+                    %% Pacing blocked - queue remaining data and set timer
+                    Delay = quic_cc:pacing_delay(CCState, PacketSize),
+                    ?LOG_DEBUG(
+                        #{
+                            what => stream_data_paced_large,
+                            stream_id => StreamId,
+                            data_size => byte_size(Data),
+                            pacing_delay_ms => Delay
+                        },
+                        ?QUIC_LOG_META
+                    ),
+                    case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+                        {ok, QueuedState} ->
+                            PacedState = maybe_set_pacing_timer(Delay, QueuedState),
+                            {PacedState, BytesSentSoFar};
+                        {error, send_queue_full} ->
+                            {error, send_queue_full}
+                    end;
+                false ->
+                    %% Pacing allows - consume tokens and send
+                    {_Allowed, NewCCState} = quic_cc:get_pacing_tokens(CCState, PacketSize),
+                    State0 = State#state{cc_state = NewCCState},
+                    <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
+                    Frame = {stream, StreamId, Offset, Chunk, false},
+                    Payload = quic_frame:encode(Frame),
+                    State1 = send_app_packet_internal(Payload, [Frame], State0),
+                    NewOffset = Offset + ?MAX_STREAM_DATA_PER_PACKET,
+                    NewBytesSent = BytesSentSoFar + ?MAX_STREAM_DATA_PER_PACKET,
+                    send_stream_data_fragmented_tracked(
+                        StreamId, NewOffset, Rest, Fin, State1, NewBytesSent
+                    )
+            end;
         false ->
             %% Queue remaining data for later
+            ?LOG_DEBUG(
+                #{
+                    what => stream_data_queued_cwnd_large,
+                    stream_id => StreamId,
+                    total_data_size => byte_size(Data),
+                    offset => Offset,
+                    bytes_sent_so_far => BytesSentSoFar,
+                    cwnd => quic_cc:cwnd(CCState),
+                    bytes_in_flight => quic_cc:bytes_in_flight(CCState),
+                    available_cwnd => quic_cc:available_cwnd(CCState)
+                },
+                ?QUIC_LOG_META
+            ),
             case queue_stream_data(StreamId, Offset, Data, Fin, State) of
                 {ok, QueuedState} ->
                     % Return bytes sent so far
@@ -4332,20 +4735,6 @@ queue_stream_data(
             {ok, State#state{send_queue = NewPQ, send_queue_bytes = NewQueueBytes}}
     end.
 
-%% Advance a stream's send_offset without actually sending data.
-%% Called when data is queued so that subsequent sends use the correct offset.
-advance_stream_send_offset(StreamId, NewOffset, Fin, #state{streams = Streams} = State) ->
-    case maps:find(StreamId, Streams) of
-        {ok, Stream} ->
-            UpdatedStream = Stream#stream_state{
-                send_offset = NewOffset,
-                send_fin = Fin orelse Stream#stream_state.send_fin
-            },
-            State#state{streams = maps:put(StreamId, UpdatedStream, Streams)};
-        error ->
-            State
-    end.
-
 %% Get stream urgency (default 3 if stream not found)
 get_stream_urgency(StreamId, Streams) ->
     case maps:find(StreamId, Streams) of
@@ -4361,10 +4750,12 @@ process_send_queue(#state{send_queue = PQ} = State) ->
     case pqueue_peek(PQ) of
         empty ->
             State;
-        {value, {stream_data, StreamId, _Offset, Data, _Fin}} ->
+        {value, {stream_data, StreamId, Offset, Data, _Fin}} ->
             %% Check flow control BEFORE dequeuing
+            %% Use the Offset stored in the queue entry, not stream.send_offset,
+            %% because send_offset may have advanced past this queued data's position.
             DataSize = byte_size(Data),
-            case check_send_queue_flow_control(StreamId, DataSize, State) of
+            case check_send_queue_flow_control(StreamId, Offset, DataSize, State) of
                 ok ->
                     %% Flow control allows - dequeue and try to send
                     process_send_queue_entry(State);
@@ -4376,31 +4767,24 @@ process_send_queue(#state{send_queue = PQ} = State) ->
 
 %% Check flow control limits for queued data
 %% Returns ok | {blocked, connection | {stream, StreamId}}
-%% NOTE: Only blocks if we're already OVER the limit (negative allowed).
-%% Normal flow control blocking happens in do_send_data before queueing.
-check_send_queue_flow_control(StreamId, DataSize, #state{
+%% Takes the Offset from the queue entry since stream.send_offset may have
+%% advanced past queued data positions (per PR #16 fix).
+check_send_queue_flow_control(StreamId, Offset, DataSize, #state{
     max_data_remote = MaxDataRemote,
     data_sent = DataSent,
     streams = Streams
 }) ->
     %% Check connection-level flow control
-    %% Only block if we're already over limit (defensive check)
     ConnectionAllowed = MaxDataRemote - DataSent,
-    case ConnectionAllowed >= 0 andalso DataSize =< ConnectionAllowed of
-        false when ConnectionAllowed < 0 ->
-            %% Already over limit - this shouldn't happen but guard against it
-            {blocked, connection};
+    case DataSize =< ConnectionAllowed of
         false ->
-            %% Would exceed limit - block
             {blocked, connection};
         true ->
-            %% Check stream-level flow control
+            %% Check stream-level flow control using the queue entry's Offset
             case maps:find(StreamId, Streams) of
-                {ok, #stream_state{send_max_data = SendMaxData, send_offset = Offset}} ->
-                    StreamAllowed = SendMaxData - Offset,
-                    case StreamAllowed >= 0 andalso DataSize =< StreamAllowed of
-                        false when StreamAllowed < 0 ->
-                            {blocked, {stream, StreamId}};
+                {ok, #stream_state{send_max_data = SendMaxData}} ->
+                    %% Data at Offset with DataSize must fit within SendMaxData
+                    case Offset + DataSize =< SendMaxData of
                         false ->
                             {blocked, {stream, StreamId}};
                         true ->
@@ -4618,20 +5002,43 @@ check_timeouts(State) ->
 %%====================================================================
 
 %% Retransmit frames from lost packets
+%% IMPORTANT: Retransmissions must respect congestion control to prevent
+%% bytes_in_flight from exceeding cwnd. Packets that can't be sent immediately
+%% will be retried on the next PTO timeout or when cwnd allows.
 retransmit_lost_packets([], State) ->
     State;
 retransmit_lost_packets([#sent_packet{frames = Frames} | Rest], State) ->
     RetransmitFrames = quic_loss:retransmittable_frames(Frames),
-    State1 = send_retransmit_frames(RetransmitFrames, State),
+    State1 = send_retransmit_frames_cc(RetransmitFrames, State),
     retransmit_lost_packets(Rest, State1).
 
-%% Send frames for retransmission
-send_retransmit_frames([], State) ->
+%% Send frames for retransmission with congestion control check
+send_retransmit_frames_cc([], State) ->
     State;
-send_retransmit_frames(Frames, State) ->
-    %% Encode all frames and send in a single packet
+send_retransmit_frames_cc(Frames, #state{cc_state = CCState} = State) ->
+    %% Encode all frames and check size
     Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
-    send_app_packet_internal(Payload, Frames, State).
+    PacketSize = byte_size(Payload) + 50,
+
+    %% Check if CC allows sending this retransmission
+    %% Use can_send_control to allow small overage for retransmissions
+    case quic_cc:can_send_control(CCState, PacketSize) of
+        true ->
+            send_app_packet_internal(Payload, Frames, State);
+        false ->
+            %% CC doesn't allow - defer retransmission
+            %% The PTO mechanism will eventually retry this data
+            ?LOG_DEBUG(
+                #{
+                    what => retransmit_deferred_by_cc,
+                    packet_size => PacketSize,
+                    cwnd => quic_cc:cwnd(CCState),
+                    bytes_in_flight => quic_cc:bytes_in_flight(CCState)
+                },
+                ?QUIC_LOG_META
+            ),
+            State
+    end.
 
 %% Handle PTO timeout - send probe packet
 handle_pto_timeout(#state{loss_state = LossState} = State) ->
@@ -4646,13 +5053,14 @@ handle_pto_timeout(#state{loss_state = LossState} = State) ->
     set_pto_timer(State2).
 
 %% Send a probe packet for PTO
+%% PTO probes are allowed to use control_allowance per RFC 9002
 send_probe_packet(State) ->
     case get_oldest_unacked_frames(State) of
         {ok, Frames} ->
-            %% Retransmit oldest data as probe
-            send_retransmit_frames(Frames, State);
+            %% Retransmit oldest data as probe with CC check
+            send_retransmit_frames_cc(Frames, State);
         none ->
-            %% No data to retransmit, send PING
+            %% No data to retransmit, send PING (always allowed as control)
             Payload = quic_frame:encode(ping),
             send_app_packet_internal(Payload, [ping], State)
     end.
@@ -4685,6 +5093,15 @@ get_oldest_unacked_frames(#state{loss_state = LossState}) ->
             end
     end.
 
+%% Send keep-alive PING frame (RFC 9000 - transport-level liveness)
+%% PING frames bypass flow control and ensure connection stays alive
+send_keep_alive_ping(#state{app_keys = undefined} = State) ->
+    %% No app keys yet, skip PING
+    State;
+send_keep_alive_ping(State) ->
+    Payload = quic_frame:encode(ping),
+    send_app_packet_internal(Payload, [ping], State).
+
 %%====================================================================
 %% PTO Timer Management
 %%====================================================================
@@ -4705,6 +5122,49 @@ set_pto_timer(#state{loss_state = LossState, pto_timer = OldTimer} = State) ->
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
 
+%% Handle pacing timeout - drain queued data
+handle_pacing_timeout(#state{send_queue = PQ} = State) ->
+    %% Clear the expired timer first
+    State1 = State#state{pacing_timer = undefined},
+    %% Check if there's queued data
+    case pqueue_is_empty(PQ) of
+        true ->
+            State1;
+        false ->
+            %% Process the send queue
+            State2 = process_send_queue(State1),
+            %% If there's still queued data and pacing is blocking, set another timer
+            maybe_reschedule_pacing(State2)
+    end.
+
+%% Check if we need to reschedule pacing timer after processing queue
+maybe_reschedule_pacing(#state{send_queue = PQ, cc_state = CCState, pacing_enabled = true} = State) ->
+    case pqueue_is_empty(PQ) of
+        true ->
+            State;
+        false ->
+            %% Check if pacing would block the next send
+            PacketSize = ?MAX_STREAM_DATA_PER_PACKET + ?PACKET_OVERHEAD,
+            case quic_cc:can_send(CCState, PacketSize) of
+                true ->
+                    %% Cwnd allows, check pacing
+                    case quic_cc:pacing_allows(CCState, PacketSize) of
+                        true ->
+                            %% Can send now - no timer needed
+                            State;
+                        false ->
+                            %% Pacing blocked - set timer
+                            Delay = quic_cc:pacing_delay(CCState, PacketSize),
+                            maybe_set_pacing_timer(Delay, State)
+                    end;
+                false ->
+                    %% Cwnd blocked - no pacing timer needed
+                    State
+            end
+    end;
+maybe_reschedule_pacing(State) ->
+    State.
+
 %%====================================================================
 %% Idle Timer Management (RFC 9000 §10.1)
 %%====================================================================
@@ -4716,6 +5176,60 @@ set_idle_timer(#state{idle_timeout = Timeout, idle_timer = OldTimer} = State) ->
     cancel_timer(OldTimer),
     TimerRef = erlang:send_after(Timeout, self(), idle_timeout),
     State#state{idle_timer = TimerRef}.
+
+%%====================================================================
+%% Keep-Alive Timer Management (RFC 9000 - PING frames)
+%%====================================================================
+
+%% Calculate keep-alive interval from options and idle timeout
+%% Default: disabled (opt-in to preserve idle_timeout semantics)
+%% Set to 'auto' for half of idle timeout, or specify explicit interval
+calculate_keep_alive_interval(Opts, IdleTimeout) ->
+    case maps:get(keep_alive_interval, Opts, disabled) of
+        disabled -> disabled;
+        0 -> disabled;
+        auto when IdleTimeout =:= 0 -> disabled;
+        auto -> max(5000, IdleTimeout div 2);
+        Interval when is_integer(Interval), Interval >= 5000 -> Interval;
+        Interval when is_integer(Interval) -> 5000
+    end.
+
+%% Set keep-alive timer
+set_keep_alive_timer(#state{keep_alive_interval = disabled} = State) ->
+    State#state{keep_alive_timer = undefined};
+set_keep_alive_timer(
+    #state{
+        keep_alive_interval = Interval,
+        keep_alive_timer = OldTimer
+    } = State
+) ->
+    cancel_timer(OldTimer),
+    TimerRef = erlang:send_after(Interval, self(), keep_alive_timeout),
+    State#state{keep_alive_timer = TimerRef}.
+
+%%====================================================================
+%% Pacing Timer Management (RFC 9002 §7.7)
+%%====================================================================
+
+%% Set pacing timer if not already set
+%% Only sets a timer if there's data queued and no existing timer
+maybe_set_pacing_timer(0, State) ->
+    %% No delay - don't set timer
+    State;
+maybe_set_pacing_timer(_Delay, #state{pacing_timer = Ref} = State) when Ref =/= undefined ->
+    %% Timer already set - leave it
+    State;
+maybe_set_pacing_timer(Delay, #state{pacing_timer = undefined} = State) ->
+    %% Set new pacing timer
+    TimerRef = erlang:send_after(Delay, self(), pacing_timeout),
+    State#state{pacing_timer = TimerRef}.
+
+%% Clear pacing timer after processing
+clear_pacing_timer(#state{pacing_timer = undefined} = State) ->
+    State;
+clear_pacing_timer(#state{pacing_timer = Ref} = State) ->
+    cancel_timer(Ref),
+    State#state{pacing_timer = undefined}.
 
 %% Convert state to map for debugging
 state_to_map(#state{} = S) ->
@@ -4730,7 +5244,11 @@ state_to_map(#state{} = S) ->
         data_sent => S#state.data_sent,
         data_received => S#state.data_received,
         send_queue_bytes => S#state.send_queue_bytes,
-        recv_buffer_bytes => S#state.recv_buffer_bytes
+        recv_buffer_bytes => S#state.recv_buffer_bytes,
+        max_data_local => S#state.max_data_local,
+        fc_last_stream_update => S#state.fc_last_stream_update,
+        fc_last_conn_update => S#state.fc_last_conn_update,
+        fc_max_receive_window => S#state.fc_max_receive_window
     }.
 
 %% Normalize ALPN list - handles binary, list of binaries, list of strings
@@ -5226,12 +5744,13 @@ handle_retire_connection_id(SeqNum, State) ->
 %% RFC 9000 Section 4.1: Connection-level flow control (max_data)
 %% RFC 9000 Section 4.2: Stream-level flow control (max_stream_data)
 %% @param StreamId - Stream ID to check
+%% @param Offset - Offset of the queued data
 %% @param DataSize - Size of data to send
 %% @param MaxDataRemote - Peer's connection-level max_data limit
 %% @param DataSent - Bytes already sent on connection
 %% @param StreamsMap - Map of StreamId => {SendMaxData, SendOffset}
 %% @returns ok | {blocked, connection | {stream, StreamId}}
-test_check_flow_control(StreamId, DataSize, MaxDataRemote, DataSent, StreamsMap) ->
+test_check_flow_control(StreamId, Offset, DataSize, MaxDataRemote, DataSent, StreamsMap) ->
     Streams = maps:map(
         fun(_K, {SendMaxData, SendOffset}) ->
             #stream_state{send_max_data = SendMaxData, send_offset = SendOffset}
@@ -5243,5 +5762,5 @@ test_check_flow_control(StreamId, DataSize, MaxDataRemote, DataSent, StreamsMap)
         data_sent = DataSent,
         streams = Streams
     },
-    check_send_queue_flow_control(StreamId, DataSize, State).
+    check_send_queue_flow_control(StreamId, Offset, DataSize, State).
 -endif.

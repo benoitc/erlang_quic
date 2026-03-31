@@ -396,6 +396,7 @@ state_info_contains_queue_counters_test() ->
 %% Test that sending within connection-level limits is allowed
 flow_control_connection_within_limit_test() ->
     StreamId = 0,
+    Offset = 0,
     DataSize = 1000,
     MaxDataRemote = 10000,
     DataSent = 5000,
@@ -403,7 +404,7 @@ flow_control_connection_within_limit_test() ->
     ?assertEqual(
         ok,
         quic_connection:test_check_flow_control(
-            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+            StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
 
@@ -411,6 +412,7 @@ flow_control_connection_within_limit_test() ->
 %% RFC 9000 Section 4.1: Sender must not exceed max_data
 flow_control_connection_exceeds_limit_test() ->
     StreamId = 0,
+    Offset = 0,
     DataSize = 6000,
     MaxDataRemote = 10000,
     DataSent = 5000,
@@ -418,13 +420,14 @@ flow_control_connection_exceeds_limit_test() ->
     ?assertEqual(
         {blocked, connection},
         quic_connection:test_check_flow_control(
-            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+            StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
 
 %% Test that exactly at connection limit is allowed
 flow_control_connection_at_limit_test() ->
     StreamId = 0,
+    Offset = 0,
     DataSize = 5000,
     MaxDataRemote = 10000,
     DataSent = 5000,
@@ -432,7 +435,7 @@ flow_control_connection_at_limit_test() ->
     ?assertEqual(
         ok,
         quic_connection:test_check_flow_control(
-            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+            StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
 
@@ -440,6 +443,7 @@ flow_control_connection_at_limit_test() ->
 %% This is a defensive check - shouldn't happen but guards against it
 flow_control_connection_already_over_limit_test() ->
     StreamId = 0,
+    Offset = 0,
     DataSize = 1000,
     MaxDataRemote = 10000,
     DataSent = 11000,
@@ -447,7 +451,7 @@ flow_control_connection_already_over_limit_test() ->
     ?assertEqual(
         {blocked, connection},
         quic_connection:test_check_flow_control(
-            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+            StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
 
@@ -455,6 +459,7 @@ flow_control_connection_already_over_limit_test() ->
 %% RFC 9000 Section 4.2: max_stream_data limits per-stream
 flow_control_stream_exceeds_limit_test() ->
     StreamId = 0,
+    Offset = 4000,
     DataSize = 2000,
     MaxDataRemote = 100000,
     DataSent = 0,
@@ -462,13 +467,14 @@ flow_control_stream_exceeds_limit_test() ->
     ?assertEqual(
         {blocked, {stream, StreamId}},
         quic_connection:test_check_flow_control(
-            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+            StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
 
 %% Test that stream within limit is allowed
 flow_control_stream_within_limit_test() ->
     StreamId = 4,
+    Offset = 4000,
     DataSize = 500,
     MaxDataRemote = 100000,
     DataSent = 0,
@@ -476,13 +482,14 @@ flow_control_stream_within_limit_test() ->
     ?assertEqual(
         ok,
         quic_connection:test_check_flow_control(
-            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+            StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
 
 %% Test that unknown stream is allowed (will fail later in processing)
 flow_control_unknown_stream_allowed_test() ->
     StreamId = 99,
+    Offset = 0,
     DataSize = 1000,
     MaxDataRemote = 100000,
     DataSent = 0,
@@ -490,7 +497,7 @@ flow_control_unknown_stream_allowed_test() ->
     ?assertEqual(
         ok,
         quic_connection:test_check_flow_control(
-            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+            StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
 
@@ -498,6 +505,7 @@ flow_control_unknown_stream_allowed_test() ->
 %% Even if stream has capacity, connection limit blocks first
 flow_control_connection_blocks_before_stream_test() ->
     StreamId = 0,
+    Offset = 0,
     DataSize = 5000,
     MaxDataRemote = 1000,
     DataSent = 0,
@@ -505,6 +513,90 @@ flow_control_connection_blocks_before_stream_test() ->
     ?assertEqual(
         {blocked, connection},
         quic_connection:test_check_flow_control(
-            StreamId, DataSize, MaxDataRemote, DataSent, Streams
+            StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
+
+%%====================================================================
+%% Flow Control Auto-tuning Tests
+%% RTT-based auto-tuning for flow control windows
+%%====================================================================
+
+%% Test that auto-tuning constants are correctly defined
+auto_tune_constants_test() ->
+    ?assertEqual(1.5, ?CONNECTION_FLOW_CONTROL_MULTIPLIER),
+    ?assertEqual(8388608, ?DEFAULT_MAX_RECEIVE_WINDOW),
+    ?assertEqual(4, ?AUTO_TUNE_RTT_FACTOR).
+
+%% Test that default connection window is 1.5x stream window
+default_connection_stream_ratio_test() ->
+    %% DEFAULT_INITIAL_MAX_DATA should be 1.5x DEFAULT_INITIAL_MAX_STREAM_DATA
+    ExpectedConnWindow = trunc(
+        ?DEFAULT_INITIAL_MAX_STREAM_DATA * ?CONNECTION_FLOW_CONTROL_MULTIPLIER
+    ),
+    ?assertEqual(ExpectedConnWindow, ?DEFAULT_INITIAL_MAX_DATA).
+
+%% Test custom max_receive_window option
+custom_max_receive_window_test() ->
+    CustomMaxWindow = 4194304,
+    Opts = #{max_receive_window => CustomMaxWindow},
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {_State, Info} = quic_connection:get_state(Pid),
+
+    ?assertEqual(CustomMaxWindow, maps:get(fc_max_receive_window, Info)),
+
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% Test that state contains flow control auto-tuning fields
+state_contains_fc_auto_tune_fields_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {_State, Info} = quic_connection:get_state(Pid),
+
+    %% Should have auto-tuning fields
+    ?assert(maps:is_key(fc_last_stream_update, Info)),
+    ?assert(maps:is_key(fc_last_conn_update, Info)),
+    ?assert(maps:is_key(fc_max_receive_window, Info)),
+
+    %% Initial values
+    ?assertEqual(undefined, maps:get(fc_last_stream_update, Info)),
+    ?assertEqual(undefined, maps:get(fc_last_conn_update, Info)),
+    ?assertEqual(?DEFAULT_MAX_RECEIVE_WINDOW, maps:get(fc_max_receive_window, Info)),
+
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% Test that max_data_local uses new default (1.5x stream window)
+max_data_local_default_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {_State, Info} = quic_connection:get_state(Pid),
+
+    %% max_data_local should be 768KB (1.5 * 512KB)
+    ?assertEqual(?DEFAULT_INITIAL_MAX_DATA, maps:get(max_data_local, Info)),
+    ?assertEqual(786432, maps:get(max_data_local, Info)),
+
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% Test custom max_data option still works
+custom_max_data_overrides_default_test() ->
+    CustomMaxData = 2097152,
+    Opts = #{max_data => CustomMaxData},
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {_State, Info} = quic_connection:get_state(Pid),
+
+    ?assertEqual(CustomMaxData, maps:get(max_data_local, Info)),
+
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% Test that fc_max_receive_window defaults to 8MB
+fc_max_receive_window_default_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {_State, Info} = quic_connection:get_state(Pid),
+
+    %% 8MB = 8388608 bytes
+    ?assertEqual(8388608, maps:get(fc_max_receive_window, Info)),
+
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).

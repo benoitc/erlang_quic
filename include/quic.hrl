@@ -244,13 +244,46 @@
 -define(DEFAULT_MAX_IDLE_TIMEOUT, 30000).
 -define(DEFAULT_MAX_STREAMS_BIDI, 100).
 -define(DEFAULT_MAX_STREAMS_UNI, 100).
-% 1MB
--define(DEFAULT_INITIAL_MAX_DATA, 1048576).
-% 256KB
--define(DEFAULT_INITIAL_MAX_STREAM_DATA, 262144).
+% 512KB - stream-level flow control (quic-go default for stream)
+-define(DEFAULT_INITIAL_MAX_STREAM_DATA, 524288).
+% 768KB - connection = 1.5x stream window (512KB * 1.5)
+-define(DEFAULT_INITIAL_MAX_DATA, 786432).
 -define(DEFAULT_ACK_DELAY_EXPONENT, 3).
 % 25ms
 -define(DEFAULT_MAX_ACK_DELAY, 25).
+
+%% Auto-tuning constants
+% Connection window should be >= 1.5x largest stream window
+-define(CONNECTION_FLOW_CONTROL_MULTIPLIER, 1.5).
+% 8MB cap on receive window
+-define(DEFAULT_MAX_RECEIVE_WINDOW, 8388608).
+% Double window if consumed in < 4*RTT (aggressive), else linear growth
+-define(AUTO_TUNE_RTT_FACTOR, 4).
+
+%% Congestion Control - Initial Window
+%% RFC 9002 default: min(10 * max_datagram_size, max(14720, 2 * max_datagram_size))
+%% = ~14720 bytes for 1200 byte datagrams (~12 packets)
+%% For distribution/bulk transfer workloads, a higher initial window reduces
+%% slow start duration and improves throughput for large messages.
+% 64KB - recommended for distribution/LAN
+-define(INITIAL_WINDOW_DISTRIBUTION, 65536).
+% 16KB - conservative floor to avoid starvation in bursty virtual networks
+-define(MINIMUM_WINDOW_DISTRIBUTION, 16384).
+% 128KB - aggressive for high-bandwidth LAN
+
+%% Recovery Duration - Distribution-specific
+%% Longer minimum recovery duration for distribution to handle packet reordering
+%% in virtual networks (Docker bridge) without rapid recovery re-entry.
+-define(MIN_RECOVERY_DURATION_DISTRIBUTION, 200).
+
+%% Flow Control - Distribution-specific limits
+%% Higher limits for distribution to avoid flow control blocking during
+%% large message transfers (e.g., code loading, large term passing).
+% 16MB connection-level limit
+-define(DIST_INITIAL_MAX_DATA, 16777216).
+% 4MB per-stream limit
+-define(DIST_INITIAL_MAX_STREAM_DATA, 4194304).
+-define(INITIAL_WINDOW_AGGRESSIVE, 131072).
 
 %%====================================================================
 %% Records

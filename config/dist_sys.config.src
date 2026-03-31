@@ -1,0 +1,18 @@
+[
+    {quic, [
+        {dist, [
+            {cert_file, "${QUIC_CERT_FILE}"},
+            {key_file, "${QUIC_KEY_FILE}"},
+            {verify, verify_none},
+            {discovery_module, quic_discovery_static},
+            {nodes, []}
+        ]},
+        {dist_port, ${QUIC_DIST_PORT}}
+    ]},
+    {kernel, [
+        {logger_level, info}
+    ]},
+    {sasl, [
+        {sasl_error_logger, false}
+    ]}
+].

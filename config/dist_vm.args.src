@@ -1,0 +1,24 @@
+## Node name
+-sname ${NODE_NAME}
+
+## Cookie
+-setcookie ${ERLANG_COOKIE}
+
+## QUIC distribution
+-proto_dist quic
+-epmd_module quic_epmd
+-start_epmd false
+
+## QUIC credentials (init args for quic_dist)
+-quic_dist_cert ${QUIC_CERT_FILE}
+-quic_dist_key ${QUIC_KEY_FILE}
+-quic_dist_port ${QUIC_DIST_PORT}
+
+## Increase distribution buffer size
++zdbbl 32768
+
+## Enable kernel poll
++K true
+
+## Async threads
++A 10

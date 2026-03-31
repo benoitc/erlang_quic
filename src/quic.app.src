@@ -1,7 +1,14 @@
 {application, quic, [
     {description, "Pure Erlang QUIC implementation (RFC 9000)"},
     {vsn, "0.10.2"},
-    {registered, [quic_sup, quic_server_registry, quic_server_sup]},
+    {registered, [
+        quic_sup,
+        quic_server_registry,
+        quic_server_sup,
+        quic_dist_sup,
+        quic_dist_tickets,
+        quic_dist_nat
+    ]},
     {mod, {quic_app, []}},
     {applications, [
         kernel,
@@ -9,7 +16,18 @@
         crypto,
         ssl
     ]},
-    {env, []},
+    {env, [
+        %% Distribution configuration
+        %% {dist, [
+        %%   {cert_file, "/path/to/cert.pem"},
+        %%   {key_file, "/path/to/key.pem"},
+        %%   {cacert_file, "/path/to/ca.pem"},
+        %%   {verify, verify_peer},
+        %%   {discovery_module, quic_discovery_static},
+        %%   {nodes, [{'node1@host1', {"192.168.1.1", 4433}}]},
+        %%   {nat_enabled, false}
+        %% ]}
+    ]},
     {modules, []},
     {licenses, ["Apache-2.0"]},
     {links, [

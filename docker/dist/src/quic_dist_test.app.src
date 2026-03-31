@@ -1,0 +1,18 @@
+{application, quic_dist_test, [
+    {description, "QUIC Distribution Test Application"},
+    {vsn, "0.1.0"},
+    {registered, [quic_dist_test_server]},
+    {mod, {quic_dist_test_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        crypto,
+        quic
+    ]},
+    {env, []},
+    {modules, [
+        quic_dist_test_app,
+        quic_dist_test_sup,
+        quic_dist_test_server
+    ]}
+]}.

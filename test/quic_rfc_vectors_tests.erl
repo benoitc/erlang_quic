@@ -303,9 +303,10 @@ initial_window_test() ->
     CCState = quic_cc:new(),
     Cwnd = quic_cc:cwnd(CCState),
 
-    %% Initial window should be min(10 * max_datagram_size, max(14720, 2 * max_datagram_size))
-    %% With max_datagram_size = 1200: min(12000, max(14720, 2400)) = min(12000, 14720) = 12000
-    ?assertEqual(12000, Cwnd).
+    %% We use 32 packets like quic-go for better initial throughput
+    %% RFC 9002 suggests min(10*mds, max(14720, 2*mds)) but larger initial windows
+    %% are common in practice and improve throughput
+    ?assertEqual(32 * 1200, Cwnd).
 
 %% RFC 9002 - Minimum window is 2 * max_datagram_size
 minimum_window_test() ->

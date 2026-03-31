@@ -1,0 +1,33 @@
+## Node name
+-name ${NODE_NAME}
+
+## Cookie for cluster authentication
+-setcookie ${ERLANG_COOKIE}
+
+## QUIC distribution
+-proto_dist quic
+-epmd_module quic_epmd
+-start_epmd false
+
+## QUIC credentials
+-quic_dist_cert ${QUIC_CERT_FILE}
+-quic_dist_key ${QUIC_KEY_FILE}
+-quic_dist_port ${QUIC_DIST_PORT}
+
+## Increase distribution buffer size for large messages
++zdbbl 65536
+
+## Enable kernel poll
++K true
+
+## Async threads
++A 10
+
+## Max processes
++P 1000000
+
+## Max ports
++Q 65536
+
+## Enable crash dumps
+-env ERL_CRASH_DUMP /tmp/erl_crash.dump

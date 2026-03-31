@@ -150,11 +150,12 @@ on_packet_sent(
             true -> InFlight + Size;
             false -> InFlight
         end,
+    %% NOTE: pto_count is NOT reset here per RFC 9002.
+    %% PTO count is only reset when receiving an ACK (in on_ack_received).
+    %% Resetting on send would break exponential backoff for probe retransmissions.
     State#loss_state{
         sent_packets = maps:put(PacketNumber, SentPacket, Sent),
-        bytes_in_flight = NewInFlight,
-        % Reset PTO count on new packet
-        pto_count = 0
+        bytes_in_flight = NewInFlight
     }.
 
 %% @doc Process an ACK frame.
@@ -227,6 +228,8 @@ detect_lost_packets(
     {NewState, LostPackets}.
 
 %% Internal loss detection
+%% IMPORTANT: Only count ack-eliciting packet sizes in LostBytes since
+%% bytes_in_flight only tracks ack-eliciting packets (RFC 9002).
 detect_lost_packets(SentPackets, SmoothedRTT, LargestAcked, Now) ->
     %% Calculate loss delay
     LossDelay = max(trunc(?TIME_THRESHOLD * SmoothedRTT), ?GRANULARITY),
@@ -236,17 +239,30 @@ detect_lost_packets(SentPackets, SmoothedRTT, LargestAcked, Now) ->
         fun
             (
                 PN,
-                #sent_packet{time_sent = TimeSent, size = Size, in_flight = true} = Packet,
+                #sent_packet{
+                    time_sent = TimeSent,
+                    size = Size,
+                    in_flight = true,
+                    ack_eliciting = AckEliciting
+                } = Packet,
                 {LostAcc, RemAcc, BytesAcc}
             ) ->
-                %% Check packet threshold
+                %% Check packet threshold (RFC 9002 Section 6.1.1)
                 PacketLost = (LargestAcked - PN) >= ?PACKET_THRESHOLD,
-                %% Check time threshold
-                TimeLost = (Now - TimeSent) > LossDelay,
+                %% Check time threshold (RFC 9002 Section 6.1.2)
+                %% IMPORTANT: Time-based loss ONLY applies to packets with PN < LargestAcked
+                %% to prevent spurious loss when no later packet has been acknowledged
+                TimeLost = (PN < LargestAcked) andalso ((Now - TimeSent) > LossDelay),
 
                 case PacketLost orelse TimeLost of
                     true ->
-                        {[Packet | LostAcc], RemAcc, BytesAcc + Size};
+                        %% Only count ack-eliciting packet sizes for bytes_in_flight
+                        NewBytes =
+                            case AckEliciting of
+                                true -> BytesAcc + Size;
+                                false -> BytesAcc
+                            end,
+                        {[Packet | LostAcc], RemAcc, NewBytes};
                     false ->
                         {LostAcc, maps:put(PN, Packet, RemAcc), BytesAcc}
                 end;
@@ -392,12 +408,20 @@ pto_count(#loss_state{pto_count = C}) -> C.
 %%====================================================================
 
 %% Remove acknowledged packets from sent map
+%% IMPORTANT: Only count ack-eliciting packet sizes in AccBytes since
+%% bytes_in_flight only tracks ack-eliciting packets (RFC 9002).
 remove_acked_packets(AckedPNs, SentPackets) ->
     lists:foldl(
         fun(PN, {AccPackets, AccSent, AccBytes}) ->
             case maps:take(PN, AccSent) of
-                {#sent_packet{size = Size} = Packet, NewSent} ->
-                    {[Packet | AccPackets], NewSent, AccBytes + Size};
+                {#sent_packet{size = Size, ack_eliciting = AckEliciting} = Packet, NewSent} ->
+                    %% Only count ack-eliciting packet sizes for bytes_in_flight
+                    NewBytes =
+                        case AckEliciting of
+                            true -> AccBytes + Size;
+                            false -> AccBytes
+                        end,
+                    {[Packet | AccPackets], NewSent, NewBytes};
                 error ->
                     {AccPackets, AccSent, AccBytes}
             end

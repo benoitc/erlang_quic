@@ -1,0 +1,28 @@
+[
+    {quic, [
+        {dist, [
+            {cert_file, "${QUIC_CERT_FILE}"},
+            {key_file, "${QUIC_KEY_FILE}"},
+            {verify, verify_none},
+            {discovery_module, quic_discovery_static},
+            {nodes, ${CLUSTER_NODES_CONFIG}}
+        ]},
+        {dist_port, ${QUIC_DIST_PORT}}
+    ]},
+    {quic_dist_test, []},
+    {kernel, [
+        {logger_level, debug},
+        {logger, [
+            {handler, default, logger_std_h, #{
+                filters => [],
+                filter_default => log,
+                formatter => {logger_formatter, #{
+                    template => ["[", level, "] ", msg, "\n"]
+                }}
+            }}
+        ]}
+    ]},
+    {sasl, [
+        {sasl_error_logger, false}
+    ]}
+].

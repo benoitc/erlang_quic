@@ -32,6 +32,28 @@
 
 -module(quic).
 
+-include("quic.hrl").
+
+%% Send queue information for backpressure decisions.
+%% Used by distribution controllers and other high-level protocols
+%% to implement backpressure based on congestion state.
+%% Exported for pattern matching by consumers.
+-type send_queue_info() :: #{
+    %% Bytes currently queued
+    bytes := non_neg_integer(),
+    %% Congestion window size
+    cwnd := non_neg_integer(),
+    %% Bytes sent but not acked
+    in_flight := non_neg_integer(),
+    %% Currently in recovery mode
+    in_recovery := boolean(),
+    %% Whether backpressure should apply
+    congested := boolean()
+}.
+
+%% Export the send_queue_info type for external use
+-export_type([send_queue_info/0]).
+
 -export([
     connect/4,
     close/2,
@@ -51,7 +73,13 @@
     migrate/1,
     %% Stream prioritization (RFC 9218)
     set_stream_priority/4,
-    get_stream_priority/2
+    get_stream_priority/2,
+    %% Congestion/backpressure status
+    get_send_queue_info/1,
+    %% Connection statistics for liveness detection
+    get_stats/1,
+    %% Transport-level PING (bypasses congestion control)
+    send_ping/1
 ]).
 
 %% Server management API
@@ -283,9 +311,8 @@ set_owner(ConnPid, NewOwner) when is_pid(ConnPid), is_pid(NewOwner) ->
 set_owner(_ConnRef, _NewOwner) ->
     {error, badarg}.
 
-%% @doc Transfer ownership of a connection to a new process (synchronous).
-%% Blocks until ownership is transferred. Use this when you need to ensure
-%% the new owner receives all subsequent messages including {connected, Info}.
+%% @doc Set the owner process for a connection (synchronous).
+%% Use this when you need to ensure ownership is transferred before continuing.
 -spec set_owner_sync(ConnRef, NewOwner) -> ok | {error, term()} when
     ConnRef :: reference() | pid(),
     NewOwner :: pid().
@@ -375,6 +402,74 @@ get_stream_priority(ConnRef, StreamId) when is_reference(ConnRef) ->
 get_stream_priority(ConnPid, StreamId) when is_pid(ConnPid) ->
     quic_connection:get_stream_priority(ConnPid, StreamId);
 get_stream_priority(_ConnRef, _StreamId) ->
+    {error, badarg}.
+
+%% @doc Get send queue information for a connection.
+%% This can be used by distribution controllers or other high-level
+%% protocols to implement backpressure based on queue state.
+%%
+%% Returns a map with:
+%% - `bytes': Current bytes in send queue
+%% - `cwnd': Congestion window size
+%% - `in_flight': Bytes sent but not acknowledged
+%% - `in_recovery': Whether in congestion recovery
+%% - `congested': Whether backpressure should be applied
+%%
+%% @see quic_dist_controller for usage example
+-spec get_send_queue_info(ConnRef) -> {ok, send_queue_info()} | {error, term()} when
+    ConnRef :: reference() | pid().
+get_send_queue_info(ConnRef) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:get_send_queue_info(Pid);
+        error -> {error, not_found}
+    end;
+get_send_queue_info(ConnPid) when is_pid(ConnPid) ->
+    quic_connection:get_send_queue_info(ConnPid);
+get_send_queue_info(_ConnRef) ->
+    {error, badarg}.
+
+%% @doc Get connection statistics for liveness detection.
+%%
+%% Returns packet counts that can be used by net_kernel for tick checking.
+%% Any QUIC packet (ACK, PING, data) counts as proof of peer liveness.
+%%
+%% Returns a map with:
+%% - `packets_received': Total QUIC packets successfully received
+%% - `packets_sent': Total QUIC packets sent
+%% - `data_received': Total bytes of application data received
+%% - `data_sent': Total bytes of application data sent
+%%
+%% @see quic_dist_controller for usage in distribution tick checking
+-spec get_stats(ConnRef) -> {ok, map()} | {error, term()} when
+    ConnRef :: reference() | pid().
+get_stats(ConnRef) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:get_stats(Pid);
+        error -> {error, not_found}
+    end;
+get_stats(ConnPid) when is_pid(ConnPid) ->
+    quic_connection:get_stats(ConnPid);
+get_stats(_ConnRef) ->
+    {error, badarg}.
+
+%% @doc Send a PING frame on the connection.
+%%
+%% PING frames are transport-level frames that bypass congestion control.
+%% They elicit an ACK from the peer and can be used for liveness checking.
+%% This is useful for distribution tick messages that must get through
+%% even when the connection is congested.
+%%
+%% Returns `ok' if the PING was sent, or `{error, Reason}' if it failed.
+-spec send_ping(ConnRef) -> ok | {error, term()} when
+    ConnRef :: reference() | pid().
+send_ping(ConnRef) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:send_ping(Pid);
+        error -> {error, not_found}
+    end;
+send_ping(ConnPid) when is_pid(ConnPid) ->
+    quic_connection:send_ping(ConnPid);
+send_ping(_ConnRef) ->
     {error, badarg}.
 
 %%====================================================================
