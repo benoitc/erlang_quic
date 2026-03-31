@@ -244,13 +244,21 @@
 -define(DEFAULT_MAX_IDLE_TIMEOUT, 30000).
 -define(DEFAULT_MAX_STREAMS_BIDI, 100).
 -define(DEFAULT_MAX_STREAMS_UNI, 100).
-% 2MB - connection-level flow control (quic-go default for connection)
--define(DEFAULT_INITIAL_MAX_DATA, 2097152).
 % 512KB - stream-level flow control (quic-go default for stream)
 -define(DEFAULT_INITIAL_MAX_STREAM_DATA, 524288).
+% 768KB - connection = 1.5x stream window (512KB * 1.5)
+-define(DEFAULT_INITIAL_MAX_DATA, 786432).
 -define(DEFAULT_ACK_DELAY_EXPONENT, 3).
 % 25ms
 -define(DEFAULT_MAX_ACK_DELAY, 25).
+
+%% Auto-tuning constants
+% Connection window should be >= 1.5x largest stream window
+-define(CONNECTION_FLOW_CONTROL_MULTIPLIER, 1.5).
+% 8MB cap on receive window
+-define(DEFAULT_MAX_RECEIVE_WINDOW, 8388608).
+% Double window if consumed in < 4*RTT (aggressive), else linear growth
+-define(AUTO_TUNE_RTT_FACTOR, 4).
 
 %% Congestion Control - Initial Window
 %% RFC 9002 default: min(10 * max_datagram_size, max(14720, 2 * max_datagram_size))

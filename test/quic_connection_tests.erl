@@ -516,3 +516,87 @@ flow_control_connection_blocks_before_stream_test() ->
             StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
+
+%%====================================================================
+%% Flow Control Auto-tuning Tests
+%% RTT-based auto-tuning for flow control windows
+%%====================================================================
+
+%% Test that auto-tuning constants are correctly defined
+auto_tune_constants_test() ->
+    ?assertEqual(1.5, ?CONNECTION_FLOW_CONTROL_MULTIPLIER),
+    ?assertEqual(8388608, ?DEFAULT_MAX_RECEIVE_WINDOW),
+    ?assertEqual(4, ?AUTO_TUNE_RTT_FACTOR).
+
+%% Test that default connection window is 1.5x stream window
+default_connection_stream_ratio_test() ->
+    %% DEFAULT_INITIAL_MAX_DATA should be 1.5x DEFAULT_INITIAL_MAX_STREAM_DATA
+    ExpectedConnWindow = trunc(
+        ?DEFAULT_INITIAL_MAX_STREAM_DATA * ?CONNECTION_FLOW_CONTROL_MULTIPLIER
+    ),
+    ?assertEqual(ExpectedConnWindow, ?DEFAULT_INITIAL_MAX_DATA).
+
+%% Test custom max_receive_window option
+custom_max_receive_window_test() ->
+    CustomMaxWindow = 4194304,
+    Opts = #{max_receive_window => CustomMaxWindow},
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {_State, Info} = quic_connection:get_state(Pid),
+
+    ?assertEqual(CustomMaxWindow, maps:get(fc_max_receive_window, Info)),
+
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% Test that state contains flow control auto-tuning fields
+state_contains_fc_auto_tune_fields_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {_State, Info} = quic_connection:get_state(Pid),
+
+    %% Should have auto-tuning fields
+    ?assert(maps:is_key(fc_last_stream_update, Info)),
+    ?assert(maps:is_key(fc_last_conn_update, Info)),
+    ?assert(maps:is_key(fc_max_receive_window, Info)),
+
+    %% Initial values
+    ?assertEqual(undefined, maps:get(fc_last_stream_update, Info)),
+    ?assertEqual(undefined, maps:get(fc_last_conn_update, Info)),
+    ?assertEqual(?DEFAULT_MAX_RECEIVE_WINDOW, maps:get(fc_max_receive_window, Info)),
+
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% Test that max_data_local uses new default (1.5x stream window)
+max_data_local_default_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {_State, Info} = quic_connection:get_state(Pid),
+
+    %% max_data_local should be 768KB (1.5 * 512KB)
+    ?assertEqual(?DEFAULT_INITIAL_MAX_DATA, maps:get(max_data_local, Info)),
+    ?assertEqual(786432, maps:get(max_data_local, Info)),
+
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% Test custom max_data option still works
+custom_max_data_overrides_default_test() ->
+    CustomMaxData = 2097152,
+    Opts = #{max_data => CustomMaxData},
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {_State, Info} = quic_connection:get_state(Pid),
+
+    ?assertEqual(CustomMaxData, maps:get(max_data_local, Info)),
+
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% Test that fc_max_receive_window defaults to 8MB
+fc_max_receive_window_default_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {_State, Info} = quic_connection:get_state(Pid),
+
+    %% 8MB = 8388608 bytes
+    ?assertEqual(8388608, maps:get(fc_max_receive_window, Info)),
+
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).

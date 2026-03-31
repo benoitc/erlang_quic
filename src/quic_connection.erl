@@ -214,6 +214,10 @@
     max_stream_data_bidi_local :: non_neg_integer(),
     max_stream_data_bidi_remote :: non_neg_integer(),
     max_stream_data_uni :: non_neg_integer(),
+    %% Flow control auto-tuning state
+    fc_last_stream_update :: integer() | undefined,
+    fc_last_conn_update :: integer() | undefined,
+    fc_max_receive_window :: non_neg_integer(),
 
     %% Stream management
     streams = #{} :: #{non_neg_integer() => #stream_state{}},
@@ -652,6 +656,9 @@ init({server, Opts}) ->
             max_stream_data_bidi_remote, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
         ),
         max_stream_data_uni = maps:get(max_stream_data_uni, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA),
+        fc_last_stream_update = undefined,
+        fc_last_conn_update = undefined,
+        fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
         % Server-initiated bidi: 1, 5, 9, ...
         next_stream_id_bidi = 1,
         % Server-initiated uni: 3, 7, 11, ...
@@ -825,6 +832,9 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             max_stream_data_bidi_remote, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
         ),
         max_stream_data_uni = maps:get(max_stream_data_uni, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA),
+        fc_last_stream_update = undefined,
+        fc_last_conn_update = undefined,
+        fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
         % Client-initiated bidi: 0, 4, 8, ...
         next_stream_id_bidi = 0,
         % Client-initiated uni: 2, 6, 10, ...
@@ -3642,17 +3652,39 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
 
             %% Check if we need to send MAX_STREAM_DATA to allow more data
             %% Send when we've consumed more than half our advertised limit
+            %% RTT-based auto-tuning: double if fast consumption, linear if slow
             State2 =
                 case NewRecvOffset > (RecvMaxData div 2) of
                     true ->
-                        %% Double the limit and send MAX_STREAM_DATA
-                        NewMaxStreamData = RecvMaxData * 2,
+                        Now = erlang:monotonic_time(millisecond),
+                        SmoothedRTT = quic_loss:smoothed_rtt(State1#state.loss_state),
+                        MaxWindow = State1#state.fc_max_receive_window,
+                        LastStreamUpdate = State1#state.fc_last_stream_update,
+                        InitialStreamWindow = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+                        %% Check if consumption is fast (< 4*RTT since last update)
+                        FastConsumption =
+                            case LastStreamUpdate of
+                                undefined ->
+                                    true;
+                                _ ->
+                                    (Now - LastStreamUpdate) < (SmoothedRTT * ?AUTO_TUNE_RTT_FACTOR)
+                            end,
+                        NewMaxStreamData =
+                            case FastConsumption of
+                                true ->
+                                    %% Double (aggressive growth for fast consumption)
+                                    min(RecvMaxData * 2, MaxWindow);
+                                false ->
+                                    %% Linear (conservative growth for slow consumption)
+                                    min(RecvMaxData + InitialStreamWindow, MaxWindow)
+                            end,
                         UpdatedStream = NewStream#stream_state{recv_max_data = NewMaxStreamData},
                         MaxStreamDataFrame = quic_frame:encode(
                             {max_stream_data, StreamId, NewMaxStreamData}
                         ),
                         State1a = State1#state{
-                            streams = maps:put(StreamId, UpdatedStream, Streams)
+                            streams = maps:put(StreamId, UpdatedStream, Streams),
+                            fc_last_stream_update = Now
                         },
                         send_app_packet(MaxStreamDataFrame, State1a);
                     false ->
@@ -3661,15 +3693,49 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
 
             %% Check if we need to send MAX_DATA for connection-level flow control
             %% Send when we've consumed more than 50% of our advertised connection window
+            %% RTT-based auto-tuning with connection/stream multiplier enforcement
             MaxDataLocalVal = State2#state.max_data_local,
             State3 =
                 case NewDataReceivedVal > (MaxDataLocalVal div 2) of
                     true ->
-                        %% Extend the connection-level window and send MAX_DATA
-                        NewMaxData = NewDataReceivedVal + MaxDataLocalVal,
+                        Now2 = erlang:monotonic_time(millisecond),
+                        SmoothedRTT2 = quic_loss:smoothed_rtt(State2#state.loss_state),
+                        MaxWindow2 = State2#state.fc_max_receive_window,
+                        LastConnUpdate = State2#state.fc_last_conn_update,
+                        InitialConnWindow = ?DEFAULT_INITIAL_MAX_DATA,
+                        %% Check if consumption is fast (< 4*RTT since last update)
+                        FastConsumption2 =
+                            case LastConnUpdate of
+                                undefined ->
+                                    true;
+                                _ ->
+                                    (Now2 - LastConnUpdate) < (SmoothedRTT2 * ?AUTO_TUNE_RTT_FACTOR)
+                            end,
+                        %% Calculate new window based on RTT-aware growth
+                        BaseNewMaxData =
+                            case FastConsumption2 of
+                                true ->
+                                    %% Double (aggressive growth)
+                                    min((NewDataReceivedVal + MaxDataLocalVal) * 2, MaxWindow2);
+                                false ->
+                                    %% Linear (conservative growth)
+                                    min(
+                                        NewDataReceivedVal + MaxDataLocalVal + InitialConnWindow,
+                                        MaxWindow2
+                                    )
+                            end,
+                        %% Ensure connection window >= 1.5x largest stream window
+                        MaxStreamWindow = get_max_stream_recv_window(State2),
+                        MinConnWindow = trunc(
+                            MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER
+                        ),
+                        NewMaxData = max(BaseNewMaxData, MinConnWindow),
                         MaxDataFrame = quic_frame:encode({max_data, NewMaxData}),
                         State2a = send_app_packet(MaxDataFrame, State2),
-                        State2a#state{max_data_local = NewMaxData};
+                        State2a#state{
+                            max_data_local = NewMaxData,
+                            fc_last_conn_update = Now2
+                        };
                     false ->
                         State2
                 end,
@@ -3694,6 +3760,17 @@ extract_contiguous_data(Buffer, Offset, Acc) ->
             DeliveredData = iolist_to_binary(lists:reverse(Acc)),
             {DeliveredData, Offset, Buffer}
     end.
+
+%% Get the maximum stream receive window across all streams.
+%% Used to ensure connection window >= 1.5x largest stream window.
+get_max_stream_recv_window(#state{streams = Streams}) ->
+    maps:fold(
+        fun(_StreamId, #stream_state{recv_max_data = RecvMaxData}, MaxSoFar) ->
+            max(RecvMaxData, MaxSoFar)
+        end,
+        ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+        Streams
+    ).
 
 %%====================================================================
 %% Internal Functions - Helpers
@@ -5026,7 +5103,11 @@ state_to_map(#state{} = S) ->
         data_sent => S#state.data_sent,
         data_received => S#state.data_received,
         send_queue_bytes => S#state.send_queue_bytes,
-        recv_buffer_bytes => S#state.recv_buffer_bytes
+        recv_buffer_bytes => S#state.recv_buffer_bytes,
+        max_data_local => S#state.max_data_local,
+        fc_last_stream_update => S#state.fc_last_stream_update,
+        fc_last_conn_update => S#state.fc_last_conn_update,
+        fc_max_receive_window => S#state.fc_max_receive_window
     }.
 
 %% Normalize ALPN list - handles binary, list of binaries, list of strings
