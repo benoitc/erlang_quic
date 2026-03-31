@@ -5,9 +5,7 @@
             {key_file, "${QUIC_KEY_FILE}"},
             {verify, verify_none},
             {discovery_module, quic_discovery_static},
-            {nodes, []},
-            {nat_enabled, ${NAT_ENABLED}},
-            {stun_servers, []}
+            {nodes, []}
         ]},
         {dist_port, ${QUIC_DIST_PORT}}
     ]},

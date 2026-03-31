@@ -58,6 +58,10 @@
 %% Longer than default to allow for infrequent cluster traffic
 -define(QUIC_DIST_IDLE_TIMEOUT, 300000).
 
+%% Keep-alive interval for distribution connections (150 seconds = half of idle timeout)
+%% QUIC-level PING frames ensure liveness without relying on application-layer ticks
+-define(QUIC_DIST_KEEP_ALIVE_INTERVAL, 150000).
+
 %% Distribution backpressure thresholds (can be overridden via config)
 %% Congested when queue > cwnd * congestion threshold
 -define(DEFAULT_QUEUE_CONGESTION_THRESHOLD, 2).
@@ -99,10 +103,6 @@
     discovery_module = quic_discovery_static :: module(),
     nodes = [] :: [{node(), {inet:ip_address() | string(), inet:port_number()}}],
     dns_domain :: binary() | undefined,
-
-    %% NAT traversal
-    nat_enabled = false :: boolean(),
-    stun_servers = [] :: [string()],
 
     %% Load balancer
     lb_enabled = false :: boolean(),
