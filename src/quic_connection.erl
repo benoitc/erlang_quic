@@ -69,6 +69,7 @@
     close/2,
     close_stream/3,
     reset_stream/3,
+    stop_sending/3,
     handle_timeout/1,
     handle_timeout/2,
     process/1,
@@ -465,6 +466,13 @@ close_stream(Conn, StreamId, ErrorCode) ->
     ok | {error, term()}.
 reset_stream(Conn, StreamId, ErrorCode) ->
     gen_statem:call(Conn, {close_stream, StreamId, ErrorCode}).
+
+%% @doc Request peer to stop sending on a stream.
+%% Sends a STOP_SENDING frame (RFC 9000 Section 19.5).
+-spec stop_sending(pid(), non_neg_integer(), non_neg_integer()) ->
+    ok | {error, term()}.
+stop_sending(Conn, StreamId, ErrorCode) ->
+    gen_statem:call(Conn, {stop_sending, StreamId, ErrorCode}).
 
 %% @doc Handle a timeout event.
 -spec handle_timeout(pid()) -> ok.
@@ -1187,6 +1195,14 @@ connected({call, From}, open_unidirectional_stream, State) ->
     end;
 connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
     case do_close_stream(StreamId, ErrorCode, State) of
+        {ok, NewState} ->
+            {keep_state, NewState, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+%% STOP_SENDING: Request peer to stop sending on a stream (RFC 9000 Section 19.5)
+connected({call, From}, {stop_sending, StreamId, ErrorCode}, State) ->
+    case do_stop_sending(StreamId, ErrorCode, State) of
         {ok, NewState} ->
             {keep_state, NewState, [{reply, From, ok}]};
         {error, Reason} ->
@@ -5017,6 +5033,18 @@ do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
             {ok, NewState#state{
                 streams = maps:remove(StreamId, Streams)
             }};
+        error ->
+            {error, unknown_stream}
+    end.
+
+%% Request peer to stop sending on a stream (RFC 9000 Section 19.5)
+do_stop_sending(StreamId, ErrorCode, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, _StreamState} ->
+            %% Send STOP_SENDING frame
+            Frame = quic_frame:encode({stop_sending, StreamId, ErrorCode}),
+            NewState = send_app_packet(Frame, State),
+            {ok, NewState};
         error ->
             {error, unknown_stream}
     end.
