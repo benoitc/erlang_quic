@@ -728,7 +728,15 @@ build_cc_opts(Opts) ->
     CCOpts = #{},
     CCOpts1 = maybe_add_cc_opt(initial_window, Opts, CCOpts),
     CCOpts2 = maybe_add_cc_opt(minimum_window, Opts, CCOpts1),
-    maybe_add_cc_opt(min_recovery_duration, Opts, CCOpts2).
+    CCOpts3 = maybe_add_cc_opt(min_recovery_duration, Opts, CCOpts2),
+    maybe_add_cc_algorithm(Opts, CCOpts3).
+
+maybe_add_cc_algorithm(Opts, CCOpts) ->
+    case maps:find(cc_algorithm, Opts) of
+        {ok, newreno} -> CCOpts#{algorithm => newreno};
+        {ok, bbr} -> CCOpts#{algorithm => bbr};
+        _ -> CCOpts
+    end.
 
 maybe_add_cc_opt(Key, Opts, CCOpts) ->
     case maps:find(Key, Opts) of
