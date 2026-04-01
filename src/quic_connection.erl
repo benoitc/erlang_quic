@@ -896,15 +896,33 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
 
     {ok, idle, State}.
 
-terminate(_Reason, _StateName, #state{
-    socket = Socket,
-    conn_ref = ConnRef,
-    pto_timer = PtoTimer,
-    idle_timer = IdleTimer,
-    keep_alive_timer = KeepAliveTimer,
-    pacing_timer = PacingTimer,
-    role = Role
-}) ->
+terminate(
+    Reason,
+    StateName,
+    #state{
+        socket = Socket,
+        conn_ref = ConnRef,
+        pto_timer = PtoTimer,
+        idle_timer = IdleTimer,
+        keep_alive_timer = KeepAliveTimer,
+        pacing_timer = PacingTimer,
+        role = Role
+    } = State
+) ->
+    %% If we're not already draining/closed, try to send CONNECTION_CLOSE
+    %% No owner notification here - either already notified (draining) or owner is dead
+    case StateName of
+        draining ->
+            ok;
+        closed ->
+            ok;
+        _ ->
+            try
+                send_connection_close(Reason, State)
+            catch
+                _:_ -> ok
+            end
+    end,
     unregister_conn(ConnRef),
     %% Cancel any active timers
     cancel_timer(PtoTimer),
@@ -1379,6 +1397,8 @@ handle_common_event(info, keep_alive_timeout, _StateName, State) ->
     %% Ignore keep-alive in non-connected states
     {keep_state, State#state{keep_alive_timer = undefined}};
 handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
+    %% EXIT signals are handled in terminate/3 callback
+    %% Just ignore here - the process will terminate anyway if it's from parent
     {keep_state, State};
 %% Return error for unhandled calls to prevent timeout
 handle_common_event({call, From}, _Request, StateName, State) ->
@@ -5045,6 +5065,28 @@ initiate_close(Reason, State) ->
         _ ->
             send_app_packet(CloseFrame, State#state{close_reason = Reason})
     end.
+
+%% Send CONNECTION_CLOSE frame during terminate (best effort)
+%% This is called when the process is terminating unexpectedly
+send_connection_close(_Reason, #state{app_keys = undefined}) ->
+    %% No app keys yet, can't send encrypted close frame
+    ok;
+send_connection_close(Reason, State) ->
+    ErrorCode =
+        case Reason of
+            normal -> ?QUIC_NO_ERROR;
+            shutdown -> ?QUIC_NO_ERROR;
+            {shutdown, _} -> ?QUIC_NO_ERROR;
+            _ -> ?QUIC_APPLICATION_ERROR
+        end,
+    CloseFrame = quic_frame:encode({connection_close, application, ErrorCode, undefined, <<>>}),
+    %% Best effort send - ignore errors since we're terminating anyway
+    try
+        send_app_packet(CloseFrame, State)
+    catch
+        _:_ -> ok
+    end,
+    ok.
 
 %% Check timeouts
 check_timeouts(State) ->
