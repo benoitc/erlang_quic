@@ -2916,8 +2916,6 @@ process_frame(
     {reset_stream, StreamId, ErrorCode, FinalSize},
     #state{owner = Owner, conn_ref = Ref, streams = Streams} = State
 ) ->
-    %% Notify owner of stream reset
-    Owner ! {quic, Ref, {stream_reset, StreamId, ErrorCode}},
     %% Update stream state to reset
     NewStreams =
         case maps:find(StreamId, Streams) of
@@ -2932,7 +2930,8 @@ process_frame(
                     Streams
                 );
             error ->
-                %% Unknown stream - create minimal state to track reset
+                %% Unknown stream - notify owner and create minimal state to track reset
+                Owner ! {quic, Ref, {stream_opened, StreamId}},
                 maps:put(
                     StreamId,
                     #stream_state{
@@ -2943,6 +2942,8 @@ process_frame(
                     Streams
                 )
         end,
+    %% Notify owner of stream reset
+    Owner ! {quic, Ref, {stream_reset, StreamId, ErrorCode}},
     State#state{streams = NewStreams};
 %% STOP_SENDING: Peer wants us to stop sending on a stream
 %% RFC 9000 Section 19.5
@@ -2951,8 +2952,6 @@ process_frame(
     {stop_sending, StreamId, ErrorCode},
     #state{owner = Owner, conn_ref = Ref, streams = Streams} = State
 ) ->
-    %% Notify owner - they should stop sending and may send RESET_STREAM
-    Owner ! {quic, Ref, {stop_sending, StreamId, ErrorCode}},
     %% Clear any queued data for this stream and mark as stopped
     NewStreams =
         case maps:find(StreamId, Streams) of
@@ -2967,11 +2966,51 @@ process_frame(
                     Streams
                 );
             error ->
-                Streams
+                %% Unknown stream - notify owner and create minimal state
+                Owner ! {quic, Ref, {stream_opened, StreamId}},
+                maps:put(
+                    StreamId,
+                    #stream_state{
+                        id = StreamId,
+                        state = stopped
+                    },
+                    Streams
+                )
         end,
-    %% Also remove from send queue
-    NewSendQueue = remove_stream_from_queue(StreamId, State#state.send_queue),
-    State#state{streams = NewStreams, send_queue = NewSendQueue};
+    %% Notify owner - they should stop sending and may send RESET_STREAM
+    Owner ! {quic, Ref, {stop_sending, StreamId, ErrorCode}},
+    %% Also remove from send queue and adjust byte count
+    {NewSendQueue, RemovedBytes} = remove_stream_from_queue(StreamId, State#state.send_queue),
+    NewQueueBytes = State#state.send_queue_bytes - RemovedBytes,
+    State#state{streams = NewStreams, send_queue = NewSendQueue, send_queue_bytes = NewQueueBytes};
+%% STREAM_DATA_BLOCKED: Peer is blocked by stream-level flow control
+%% RFC 9000 Section 19.13: Receipt opens the stream (Section 3.2)
+process_frame(
+    app,
+    {stream_data_blocked, StreamId, _Limit},
+    #state{owner = Owner, conn_ref = Ref, streams = Streams} = State
+) ->
+    case maps:is_key(StreamId, Streams) of
+        true ->
+            %% Stream already exists, nothing to do (informational frame)
+            State;
+        false ->
+            %% New stream from peer - notify owner
+            Owner ! {quic, Ref, {stream_opened, StreamId}},
+            %% Create minimal stream state
+            InitSendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
+            InitRecvMaxData = get_local_recv_limit(bidi_peer_initiated, State),
+            NewStream = #stream_state{
+                id = StreamId,
+                state = open,
+                send_max_data = InitSendMaxData,
+                recv_max_data = InitRecvMaxData
+            },
+            State#state{streams = maps:put(StreamId, NewStream, Streams)}
+    end;
+%% DATA_BLOCKED: Peer is blocked by connection-level flow control (informational)
+process_frame(_Level, {data_blocked, _Limit}, State) ->
+    State;
 %% DATAGRAM frames (RFC 9221)
 process_frame(app, {datagram, Data}, #state{owner = Owner, conn_ref = Ref} = State) ->
     Owner ! {quic, Ref, {datagram, Data}},
@@ -2984,13 +3023,35 @@ process_frame(_Level, _Frame, State) ->
     State.
 
 %% Helper to remove a stream from the send queue (tuple of 8 queues)
+%% Returns {NewPQ, RemovedBytes} to allow adjusting send_queue_bytes
 remove_stream_from_queue(StreamId, PQ) ->
     %% Filter out entries for this stream from all 8 priority buckets
     %% Queue entries are 5-tuples: {stream_data, StreamId, Offset, Data, Fin}
-    list_to_tuple([
-        queue:filter(fun({stream_data, SId, _, _, _}) -> SId =/= StreamId end, element(I, PQ))
-     || I <- lists:seq(1, 8)
-    ]).
+    {NewQueues, RemovedBytes} =
+        lists:foldl(
+            fun(I, {Queues, Bytes}) ->
+                Q = element(I, PQ),
+                %% Calculate bytes to remove before filtering
+                BytesToRemove = queue:fold(
+                    fun({stream_data, SId, _, Data, _}, Acc) ->
+                        case SId of
+                            StreamId -> Acc + byte_size(Data);
+                            _ -> Acc
+                        end
+                    end,
+                    0,
+                    Q
+                ),
+                %% Filter to keep only other streams
+                Kept = queue:filter(
+                    fun({stream_data, SId, _, _, _}) -> SId =/= StreamId end, Q
+                ),
+                {[Kept | Queues], Bytes + BytesToRemove}
+            end,
+            {[], 0},
+            lists:seq(1, 8)
+        ),
+    {list_to_tuple(lists:reverse(NewQueues)), RemovedBytes}.
 
 %% Buffer CRYPTO data and process when complete messages are available
 buffer_crypto_data(Level, Offset, Data, State) ->
@@ -3582,29 +3643,28 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
     DataSize = byte_size(Data),
 
     %% Get or create stream state
-    {Stream, _IsNew} =
+    Stream =
         case maps:find(StreamId, Streams) of
             {ok, S} ->
-                {S, false};
+                S;
             error ->
-                %% New stream from peer - use peer's limits for streams they initiate
+                %% New stream from peer - notify owner
+                Owner ! {quic, Ref, {stream_opened, StreamId}},
+                %% Use peer's limits for streams they initiate
                 InitSendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
                 InitRecvMaxData = get_local_recv_limit(bidi_peer_initiated, State),
-                {
-                    #stream_state{
-                        id = StreamId,
-                        state = open,
-                        send_offset = 0,
-                        send_max_data = InitSendMaxData,
-                        send_fin = false,
-                        send_buffer = [],
-                        recv_offset = 0,
-                        recv_max_data = InitRecvMaxData,
-                        recv_fin = false,
-                        recv_buffer = #{},
-                        final_size = undefined
-                    },
-                    true
+                #stream_state{
+                    id = StreamId,
+                    state = open,
+                    send_offset = 0,
+                    send_max_data = InitSendMaxData,
+                    send_fin = false,
+                    send_buffer = [],
+                    recv_offset = 0,
+                    recv_max_data = InitRecvMaxData,
+                    recv_fin = false,
+                    recv_buffer = #{},
+                    final_size = undefined
                 }
         end,
 

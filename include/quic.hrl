@@ -417,7 +417,7 @@
 %% Stream state
 -record(stream_state, {
     id :: non_neg_integer(),
-    state :: idle | open | half_closed_local | half_closed_remote | closed,
+    state :: idle | open | half_closed_local | half_closed_remote | closed | reset | stopped,
 
     %% Send state
     send_offset :: non_neg_integer(),
