@@ -89,7 +89,24 @@ path_change_resets() ->
     ?assertEqual(base, quic_pmtu:get_state(State1)),
     ?assertEqual(1200, quic_pmtu:current_mtu(State1)),
     ?assertEqual(1200, State1#pmtu_state.search_low),
-    ?assertEqual(1500, State1#pmtu_state.search_high).
+    ?assertEqual(1500, State1#pmtu_state.search_high),
+    %% Migration should trigger probing on new path
+    ?assert(quic_pmtu:should_probe(State1)),
+
+    %% Path change during searching should also reset
+    State2 = #pmtu_state{
+        state = searching,
+        current_mtu = 1350,
+        base_mtu = 1200,
+        max_mtu = 1500,
+        probe_size = 1400,
+        probe_pn = 42
+    },
+    State3 = quic_pmtu:on_path_change(State2),
+    ?assertEqual(base, quic_pmtu:get_state(State3)),
+    ?assertEqual(1200, quic_pmtu:current_mtu(State3)),
+    ?assertEqual(undefined, State3#pmtu_state.probe_pn),
+    ?assert(quic_pmtu:should_probe(State3)).
 
 raise_timer_preserves_mtu() ->
     %% Start with search complete state at 1400 MTU
