@@ -80,7 +80,9 @@
     %% Connection statistics for liveness detection
     get_stats/1,
     %% Transport-level PING (bypasses congestion control)
-    send_ping/1
+    send_ping/1,
+    %% PMTU Discovery (RFC 8899)
+    get_mtu/1
 ]).
 
 %% Server management API
@@ -487,6 +489,26 @@ send_ping(ConnRef) when is_reference(ConnRef) ->
 send_ping(ConnPid) when is_pid(ConnPid) ->
     quic_connection:send_ping(ConnPid);
 send_ping(_ConnRef) ->
+    {error, badarg}.
+
+%% @doc Get the current MTU for a connection.
+%%
+%% Returns the effective MTU discovered via DPLPMTUD (RFC 8899).
+%% The MTU starts at 1200 bytes (QUIC minimum) and is probed up
+%% to the peer's max_udp_payload_size or local configuration.
+%%
+%% Returns `{ok, MTU}' where MTU is the current maximum packet size,
+%% or `{error, not_found}' if the connection doesn't exist.
+-spec get_mtu(ConnRef) -> {ok, pos_integer()} | {error, term()} when
+    ConnRef :: reference() | pid().
+get_mtu(ConnRef) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:get_mtu(Pid);
+        error -> {error, not_found}
+    end;
+get_mtu(ConnPid) when is_pid(ConnPid) ->
+    quic_connection:get_mtu(ConnPid);
+get_mtu(_ConnRef) ->
     {error, badarg}.
 
 %%====================================================================

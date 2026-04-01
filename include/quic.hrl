@@ -583,5 +583,63 @@
     reset_secret :: binary() | undefined
 }).
 
+%%====================================================================
+%% PMTU Discovery (RFC 8899 - DPLPMTUD)
+%%====================================================================
+
+%% PMTU Discovery state machine
+%% Implements Datagram Packetization Layer Path MTU Discovery
+-record(pmtu_state, {
+    %% State machine state (RFC 8899 Section 5.2)
+    %% disabled: PMTU discovery not active
+    %% base: Using base MTU (1200), ready to probe
+    %% searching: Binary search for optimal MTU in progress
+    %% search_complete: Found optimal MTU
+    %% error: Black hole detected, fell back to base MTU
+    state = disabled :: disabled | base | searching | search_complete | error,
+
+    %% Base MTU - minimum guaranteed to work (QUIC minimum)
+    base_mtu = 1200 :: pos_integer(),
+
+    %% Current effective MTU for sending
+    current_mtu = 1200 :: pos_integer(),
+
+    %% Maximum MTU to probe (from peer's max_udp_payload_size or config)
+    max_mtu = 1500 :: pos_integer(),
+
+    %% Current probe size being tested
+    probe_size = 0 :: non_neg_integer(),
+
+    %% Number of probe attempts at current size
+    probe_count = 0 :: non_neg_integer(),
+
+    %% Packet number of the last sent probe (for ACK matching)
+    probe_pn :: non_neg_integer() | undefined,
+
+    %% Timer reference for probe timeout
+    probe_timer :: reference() | undefined,
+
+    %% Binary search bounds
+    search_low = 1200 :: pos_integer(),
+    search_high = 1500 :: pos_integer(),
+
+    %% Maximum probe attempts before giving up on a size
+    max_probes = 3 :: pos_integer(),
+
+    %% Timer reference for periodic re-probing (raise timer)
+    raise_timer :: reference() | undefined,
+
+    %% Black hole detection: consecutive losses at current MTU
+    black_hole_count = 0 :: non_neg_integer(),
+
+    %% Threshold for black hole detection (consecutive losses)
+    black_hole_threshold = 6 :: pos_integer()
+}).
+
+%% PMTU Discovery configuration options
+-define(PMTU_DEFAULT_PROBE_TIMEOUT, 5000).
+-define(PMTU_DEFAULT_RAISE_INTERVAL, 600000).
+-define(PMTU_SEARCH_THRESHOLD, 10).
+
 % QUIC_HRL
 -endif.

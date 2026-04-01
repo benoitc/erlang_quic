@@ -89,6 +89,8 @@
     key_update/1,
     %% Connection migration (RFC 9000 Section 9)
     migrate/1,
+    %% PMTU Discovery (RFC 8899)
+    get_mtu/1,
     %% Server mode
     start_server/1,
     %% Stream prioritization (RFC 9218)
@@ -340,7 +342,12 @@
     %% Statistics - packet counts for liveness detection
     %% These count actual QUIC packets (not bytes), used by net_kernel getstat
     packets_received = 0 :: non_neg_integer(),
-    packets_sent = 0 :: non_neg_integer()
+    packets_sent = 0 :: non_neg_integer(),
+
+    %% PMTU Discovery (RFC 8899)
+    pmtu_state :: #pmtu_state{} | undefined,
+    pmtu_probe_timer :: reference() | undefined,
+    pmtu_raise_timer :: reference() | undefined
 }).
 
 %%====================================================================
@@ -554,6 +561,12 @@ get_stats(Conn) ->
 send_ping(Conn) ->
     gen_statem:call(Conn, send_ping).
 
+%% @doc Get the current MTU for the connection.
+%% Returns the effective MTU discovered via DPLPMTUD (RFC 8899).
+-spec get_mtu(pid()) -> {ok, pos_integer()} | {error, term()}.
+get_mtu(Conn) ->
+    gen_statem:call(Conn, get_mtu).
+
 %% @doc Initiate a key update (RFC 9001 Section 6).
 %% This triggers a key update cycle, deriving new encryption keys.
 %% Only valid when connection is in connected state.
@@ -718,7 +731,8 @@ init({server, Opts}) ->
         server_preferred_address = build_server_preferred_address(Opts),
         cid_config = maps:get(cid_config, Opts, undefined),
         congestion_threshold = maps:get(congestion_threshold, Opts, 2),
-        pacing_enabled = maps:get(pacing_enabled, Opts, true)
+        pacing_enabled = maps:get(pacing_enabled, Opts, true),
+        pmtu_state = init_pmtu_state(Opts)
     },
 
     {ok, idle, State}.
@@ -743,6 +757,17 @@ maybe_add_cc_opt(Key, Opts, CCOpts) ->
         {ok, V} when is_integer(V), V > 0 -> CCOpts#{Key => V};
         _ -> CCOpts
     end.
+
+%% Initialize PMTU discovery state from options.
+%% Options:
+%%   - pmtu_enabled: Enable PMTU discovery (default: true)
+%%   - pmtu_max_mtu: Maximum MTU to probe (default: 1500)
+init_pmtu_state(Opts) ->
+    PMTUOpts = #{
+        pmtu_enabled => maps:get(pmtu_enabled, Opts, true),
+        pmtu_max_mtu => maps:get(pmtu_max_mtu, Opts, 1500)
+    },
+    quic_pmtu:new(PMTUOpts).
 
 %% Build preferred_address record from listener options (RFC 9000 Section 9.6)
 build_server_preferred_address(Opts) ->
@@ -899,7 +924,8 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
                 Ticket -> quic_ticket:store_ticket(ServerName, Ticket, quic_ticket:new_store())
             end,
         congestion_threshold = maps:get(congestion_threshold, Opts, 2),
-        pacing_enabled = maps:get(pacing_enabled, Opts, true)
+        pacing_enabled = maps:get(pacing_enabled, Opts, true),
+        pmtu_state = init_pmtu_state(Opts)
     },
 
     {ok, idle, State}.
@@ -1148,7 +1174,9 @@ connected(
         end,
     %% RFC 9000 Section 10.1: Start idle timer when entering connected state
     State4 = update_last_activity(State3),
-    {keep_state, State4};
+    %% RFC 8899: Initialize PMTU discovery after handshake
+    State5 = init_pmtu_probing(TransportParams, State4),
+    {keep_state, State5};
 connected({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 connected({call, From}, get_state, State) ->
@@ -1270,6 +1298,9 @@ connected({call, From}, send_ping, State) ->
     %% Send PING frame - bypasses congestion control
     NewState = send_keep_alive_ping(State),
     {keep_state, NewState, [{reply, From, ok}]};
+connected({call, From}, get_mtu, State) ->
+    MTU = get_current_mtu(State),
+    {keep_state, State, [{reply, From, {ok, MTU}}]};
 connected({call, From}, key_update, #state{key_state = undefined} = State) ->
     {keep_state, State, [{reply, From, {error, no_keys}}]};
 connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
@@ -1317,6 +1348,26 @@ connected(info, {send_delayed_ack, app}, State) ->
     erase(ack_timer),
     NewState = send_app_ack(State),
     {keep_state, NewState};
+%% Handle PMTU probe timeout (RFC 8899)
+connected(info, pmtu_probe_timeout, #state{pmtu_state = PMTUState} = State) ->
+    NewPMTUState = quic_pmtu:on_probe_timeout(PMTUState),
+    State1 = State#state{
+        pmtu_state = NewPMTUState,
+        pmtu_probe_timer = undefined
+    },
+    %% Retry probing if needed
+    State2 = maybe_send_pmtu_probe(State1),
+    {keep_state, State2};
+%% Handle PMTU raise timer (periodic re-probing)
+connected(info, pmtu_raise_timeout, #state{pmtu_state = PMTUState} = State) ->
+    %% Reset to base state to start probing again
+    NewPMTUState = quic_pmtu:on_path_change(PMTUState),
+    State1 = State#state{
+        pmtu_state = NewPMTUState,
+        pmtu_raise_timer = undefined
+    },
+    State2 = maybe_send_pmtu_probe(State1),
+    {keep_state, State2};
 connected(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, connected, State).
 
@@ -2859,14 +2910,32 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                         cc_state = CCState6
                     },
 
+                    %% Handle PMTU probe ACKs
+                    State2 = lists:foldl(
+                        fun(#sent_packet{pn = PN}, S) ->
+                            handle_pmtu_probe_ack(PN, S)
+                        end,
+                        State1,
+                        AckedPackets
+                    ),
+
+                    %% Handle PMTU probe losses
+                    State3 = lists:foldl(
+                        fun(#sent_packet{pn = PN}, S) ->
+                            handle_pmtu_probe_loss(PN, S)
+                        end,
+                        State2,
+                        LostPackets
+                    ),
+
                     %% Retransmit lost packets
-                    State2 = retransmit_lost_packets(LostPackets, State1),
+                    State4 = retransmit_lost_packets(LostPackets, State3),
 
                     %% Reset PTO timer after ACK processing
-                    State3 = set_pto_timer(State2),
+                    State5 = set_pto_timer(State4),
 
                     %% Try to send queued data now that cwnd may have freed up
-                    process_send_queue(State3)
+                    process_send_queue(State5)
                 %% close inner case (on_ack_received)
             end
         %% close outer case (Ranges)
@@ -4359,9 +4428,21 @@ do_open_unidirectional_stream(
             {ok, NextId, NewState}
     end.
 
-%% Max stream data per packet (leave room for headers, frame overhead, AEAD tag)
-%% 1200 (min MTU for QUIC) - ~50 bytes overhead = ~1150 bytes
--define(MAX_STREAM_DATA_PER_PACKET, 1100).
+%% Default max stream data per packet (leave room for headers, frame overhead, AEAD tag)
+%% Used when PMTU discovery is disabled or not yet complete
+%% 1200 (min MTU for QUIC) - ~100 bytes overhead = 1100 bytes
+-define(DEFAULT_MAX_STREAM_DATA_PER_PACKET, 1100).
+
+%% Packet overhead: short header (1 + DCID ~8) + PN (1-4) + frame header (~10) + AEAD tag (16)
+-define(STREAM_PACKET_OVERHEAD, 100).
+
+%% @doc Calculate max stream data per packet based on current PMTU.
+-spec get_max_stream_data_per_packet(#state{}) -> pos_integer().
+get_max_stream_data_per_packet(#state{pmtu_state = undefined}) ->
+    ?DEFAULT_MAX_STREAM_DATA_PER_PACKET;
+get_max_stream_data_per_packet(#state{pmtu_state = PMTUState}) ->
+    MTU = quic_pmtu:current_mtu(PMTUState),
+    max(MTU - ?STREAM_PACKET_OVERHEAD, ?DEFAULT_MAX_STREAM_DATA_PER_PACKET).
 
 %% @doc Get the peer's stream data limit for a given stream type.
 %% RFC 9000 Section 4.1: Each endpoint independently sets flow control limits.
@@ -4660,10 +4741,22 @@ do_send_datagram(Data, #state{cc_state = CCState} = State) ->
 send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State) ->
     send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, 0).
 
-send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) when
-    byte_size(Data) =< ?MAX_STREAM_DATA_PER_PACKET
-->
-    %% Data fits in one packet - check congestion window and pacing
+send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
+    %% Calculate max chunk size based on current PMTU
+    MaxChunkSize = get_max_stream_data_per_packet(State),
+    DataSize = byte_size(Data),
+
+    case DataSize =< MaxChunkSize of
+        true ->
+            %% Data fits in one packet - check congestion window and pacing
+            send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar);
+        false ->
+            %% Split data into chunks and send what we can
+            send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize)
+    end.
+
+%% @doc Send stream data that fits in a single packet.
+send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
     #state{cc_state = CCState, pacing_enabled = PacingEnabled, streams = Streams} = State,
     PacketSize = byte_size(Data) + ?PACKET_OVERHEAD,
     %% Control streams (urgency 0) can exceed cwnd to prevent tick blocking
@@ -4726,11 +4819,12 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSen
                 {error, send_queue_full} ->
                     {error, send_queue_full}
             end
-    end;
-send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
-    %% Split data into chunks and send what we can
+    end.
+
+%% @doc Send stream data that requires chunking.
+send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize) ->
     #state{cc_state = CCState, pacing_enabled = PacingEnabled, streams = Streams} = State,
-    PacketSize = ?MAX_STREAM_DATA_PER_PACKET + ?PACKET_OVERHEAD,
+    PacketSize = MaxChunkSize + ?PACKET_OVERHEAD,
     %% Control streams (urgency 0) can exceed cwnd to prevent tick blocking
     Urgency = get_stream_urgency(StreamId, Streams),
     CanSend =
@@ -4765,12 +4859,12 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSen
                     %% Pacing allows - consume tokens and send
                     {_Allowed, NewCCState} = quic_cc:get_pacing_tokens(CCState, PacketSize),
                     State0 = State#state{cc_state = NewCCState},
-                    <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
+                    <<Chunk:MaxChunkSize/binary, Rest/binary>> = Data,
                     Frame = {stream, StreamId, Offset, Chunk, false},
                     Payload = quic_frame:encode(Frame),
                     State1 = send_app_packet_internal(Payload, [Frame], State0),
-                    NewOffset = Offset + ?MAX_STREAM_DATA_PER_PACKET,
-                    NewBytesSent = BytesSentSoFar + ?MAX_STREAM_DATA_PER_PACKET,
+                    NewOffset = Offset + MaxChunkSize,
+                    NewBytesSent = BytesSentSoFar + MaxChunkSize,
                     send_stream_data_fragmented_tracked(
                         StreamId, NewOffset, Rest, Fin, State1, NewBytesSent
                     )
@@ -5274,7 +5368,8 @@ maybe_reschedule_pacing(#state{send_queue = PQ, cc_state = CCState, pacing_enabl
             State;
         false ->
             %% Check if pacing would block the next send
-            PacketSize = ?MAX_STREAM_DATA_PER_PACKET + ?PACKET_OVERHEAD,
+            MaxChunkSize = get_max_stream_data_per_packet(State),
+            PacketSize = MaxChunkSize + ?PACKET_OVERHEAD,
             case quic_cc:can_send(CCState, PacketSize) of
                 true ->
                     %% Cwnd allows, check pacing
@@ -5733,12 +5828,23 @@ find_path_by_challenge(Data, [Path | Rest]) ->
 %% @doc Complete migration to a validated path.
 %% Updates the current path and DCID if necessary.
 -spec complete_migration(#path_state{}, #state{}) -> #state{}.
-complete_migration(#path_state{status = validated} = NewPath, State) ->
-    %% Update remote address
+complete_migration(
+    #path_state{status = validated} = NewPath,
+    #state{pmtu_state = PMTUState, pmtu_probe_timer = ProbeTimer, pmtu_raise_timer = RaiseTimer} =
+        State
+) ->
+    %% RFC 8899: Reset PMTU on path change
+    %% Cancel PMTU timers before resetting state
+    cancel_timer(ProbeTimer),
+    cancel_timer(RaiseTimer),
+    NewPMTUState = quic_pmtu:on_path_change(PMTUState),
     State#state{
         remote_addr = NewPath#path_state.remote_addr,
         current_path = NewPath,
-        alt_paths = lists:delete(NewPath, State#state.alt_paths)
+        alt_paths = lists:delete(NewPath, State#state.alt_paths),
+        pmtu_state = NewPMTUState,
+        pmtu_probe_timer = undefined,
+        pmtu_raise_timer = undefined
     };
 complete_migration(_, State) ->
     %% Can only migrate to validated paths
@@ -5863,6 +5969,213 @@ handle_retire_connection_id(SeqNum, State) ->
         Pool
     ),
     State#state{local_cid_pool = NewPool}.
+
+%%====================================================================
+%% PMTU Discovery (RFC 8899)
+%%====================================================================
+
+%% @doc Initialize PMTU probing after handshake completes.
+%% Uses peer's max_udp_payload_size from transport parameters.
+-spec init_pmtu_probing(map(), #state{}) -> #state{}.
+init_pmtu_probing(TransportParams, #state{pmtu_state = PMTUState} = State) ->
+    PeerMaxUdp = maps:get(max_udp_payload_size, TransportParams, undefined),
+    NewPMTUState = quic_pmtu:on_connection_established(PeerMaxUdp, PMTUState),
+    State1 = State#state{pmtu_state = NewPMTUState},
+    %% Start probing if enabled and should probe
+    maybe_send_pmtu_probe(State1).
+
+%% @doc Send a PMTU probe packet if conditions are met.
+-spec maybe_send_pmtu_probe(#state{}) -> #state{}.
+maybe_send_pmtu_probe(#state{pmtu_state = undefined} = State) ->
+    State;
+maybe_send_pmtu_probe(#state{pmtu_state = PMTUState} = State) ->
+    case quic_pmtu:should_probe(PMTUState) of
+        true ->
+            send_pmtu_probe(State);
+        false ->
+            %% Check if search is complete and set raise timer
+            case quic_pmtu:get_state(PMTUState) of
+                search_complete ->
+                    maybe_set_pmtu_raise_timer(State);
+                _ ->
+                    State
+            end
+    end.
+
+%% @doc Send a PMTU probe packet.
+-spec send_pmtu_probe(#state{}) -> #state{}.
+send_pmtu_probe(#state{pmtu_state = PMTUState, pn_app = PNSpace} = State) ->
+    %% Calculate header size (approximate)
+    HeaderSize = 50,
+    {ProbeSize, Frames} = quic_pmtu:create_probe_packet(PMTUState, HeaderSize),
+
+    case Frames of
+        [] ->
+            %% No frames to send
+            State;
+        _ ->
+            %% Get packet number for this probe
+            PacketNumber = PNSpace#pn_space.next_pn,
+
+            %% Record probe sent
+            NewPMTUState = quic_pmtu:on_probe_sent(PacketNumber, PMTUState),
+
+            %% Send the probe packet
+            State1 = State#state{pmtu_state = NewPMTUState},
+            State2 = send_pmtu_probe_packet(ProbeSize, Frames, State1),
+
+            %% Set probe timeout
+            set_pmtu_probe_timer(State2)
+    end.
+
+%% @doc Send the actual PMTU probe packet.
+%% Uses the existing send_app_packet infrastructure with PING + PADDING.
+-spec send_pmtu_probe_packet(pos_integer(), list(), #state{}) -> #state{}.
+send_pmtu_probe_packet(_ProbeSize, _Frames, #state{app_keys = undefined} = State) ->
+    %% No keys available yet
+    State;
+send_pmtu_probe_packet(ProbeSize, Frames, #state{dcid = DCID, pn_app = PNSpace} = State) ->
+    %% Encode PING + explicit PADDING frames
+    EncodedFrames = encode_pmtu_frames(Frames),
+
+    %% Calculate extra padding needed to reach target probe size
+    %% Account for: header (1 + DCID), PN (1-4), auth tag (16)
+    PN = PNSpace#pn_space.next_pn,
+    PNLen = quic_packet:pn_length(PN),
+    HeaderLen = 1 + byte_size(DCID),
+    AuthTagLen = 16,
+    PayloadLen = byte_size(EncodedFrames),
+    CurrentSize = HeaderLen + PNLen + PayloadLen + AuthTagLen,
+    ExtraPadding = max(0, ProbeSize - CurrentSize),
+
+    %% Add extra padding to frame payload
+    PaddedFrames = <<EncodedFrames/binary, (binary:copy(<<0>>, ExtraPadding))/binary>>,
+
+    %% Use existing send_app_packet which handles all encryption/tracking
+    send_app_packet(PaddedFrames, State).
+
+%% @doc Encode PMTU probe frames (PING + PADDING).
+-spec encode_pmtu_frames([term()]) -> binary().
+encode_pmtu_frames(Frames) ->
+    lists:foldl(
+        fun
+            (ping, Acc) ->
+                <<Acc/binary, ?FRAME_PING>>;
+            ({padding, N}, Acc) ->
+                Padding = binary:copy(<<0>>, N),
+                <<Acc/binary, Padding/binary>>
+        end,
+        <<>>,
+        Frames
+    ).
+
+%% @doc Set the PMTU probe timeout timer.
+-spec set_pmtu_probe_timer(#state{}) -> #state{}.
+set_pmtu_probe_timer(#state{pmtu_probe_timer = OldTimer, loss_state = LossState} = State) ->
+    cancel_timer(OldTimer),
+    %% Use 5x PTO as probe timeout (RFC 8899 recommendation)
+    PTO =
+        case LossState of
+            undefined -> ?PMTU_DEFAULT_PROBE_TIMEOUT;
+            _ -> max(?PMTU_DEFAULT_PROBE_TIMEOUT, 5 * quic_loss:get_pto(LossState))
+        end,
+    TimerRef = erlang:send_after(PTO, self(), pmtu_probe_timeout),
+    State#state{pmtu_probe_timer = TimerRef}.
+
+%% @doc Set the PMTU raise timer for periodic re-probing.
+-spec maybe_set_pmtu_raise_timer(#state{}) -> #state{}.
+maybe_set_pmtu_raise_timer(#state{pmtu_raise_timer = undefined} = State) ->
+    TimerRef = erlang:send_after(?PMTU_DEFAULT_RAISE_INTERVAL, self(), pmtu_raise_timeout),
+    State#state{pmtu_raise_timer = TimerRef};
+maybe_set_pmtu_raise_timer(State) ->
+    State.
+
+%% @doc Handle ACK of a potential PMTU probe packet.
+-spec handle_pmtu_probe_ack(non_neg_integer(), #state{}) -> #state{}.
+handle_pmtu_probe_ack(_PacketNumber, #state{pmtu_state = undefined} = State) ->
+    State;
+handle_pmtu_probe_ack(PacketNumber, #state{pmtu_state = PMTUState, cc_state = CCState} = State) ->
+    case quic_pmtu:get_state(PMTUState) of
+        searching ->
+            %% Check if this ACK is for our probe packet
+            case PMTUState#pmtu_state.probe_pn of
+                PacketNumber ->
+                    %% This is our probe - process it
+                    OldMTU = quic_pmtu:current_mtu(PMTUState),
+                    NewPMTUState = quic_pmtu:on_probe_acked(PacketNumber, PMTUState),
+                    NewMTU = quic_pmtu:current_mtu(NewPMTUState),
+
+                    %% Update congestion control if MTU changed
+                    NewCCState =
+                        case NewMTU > OldMTU of
+                            true -> quic_cc:update_mtu(CCState, NewMTU);
+                            false -> CCState
+                        end,
+
+                    %% Cancel probe timer and continue probing
+                    cancel_timer(State#state.pmtu_probe_timer),
+                    State1 = State#state{
+                        pmtu_state = NewPMTUState,
+                        cc_state = NewCCState,
+                        pmtu_probe_timer = undefined
+                    },
+                    maybe_send_pmtu_probe(State1);
+                _ ->
+                    %% ACK for non-probe packet - ignore for PMTU
+                    State
+            end;
+        _ ->
+            %% Not searching, just reset black hole counter on any ACK
+            NewPMTUState = quic_pmtu:on_packet_acked(PMTUState),
+            State#state{pmtu_state = NewPMTUState}
+    end.
+
+%% @doc Handle loss of a potential PMTU probe packet.
+-spec handle_pmtu_probe_loss(non_neg_integer(), #state{}) -> #state{}.
+handle_pmtu_probe_loss(_PacketNumber, #state{pmtu_state = undefined} = State) ->
+    State;
+handle_pmtu_probe_loss(PacketNumber, #state{pmtu_state = PMTUState, cc_state = CCState} = State) ->
+    case quic_pmtu:get_state(PMTUState) of
+        searching ->
+            %% Check if this loss is for our probe packet
+            case PMTUState#pmtu_state.probe_pn of
+                PacketNumber ->
+                    NewPMTUState = quic_pmtu:on_probe_lost(PacketNumber, PMTUState),
+                    State1 = State#state{pmtu_state = NewPMTUState},
+                    maybe_send_pmtu_probe(State1);
+                _ ->
+                    %% Loss of non-probe packet - ignore for PMTU
+                    State
+            end;
+        search_complete ->
+            %% Track loss for black hole detection
+            OldMTU = quic_pmtu:current_mtu(PMTUState),
+            NewPMTUState = quic_pmtu:on_packet_lost(PMTUState),
+            NewMTU = quic_pmtu:current_mtu(NewPMTUState),
+
+            %% Update congestion control if MTU decreased (black hole)
+            NewCCState =
+                case NewMTU < OldMTU of
+                    true ->
+                        quic_cc:update_mtu(CCState, NewMTU);
+                    false ->
+                        CCState
+                end,
+
+            State#state{
+                pmtu_state = NewPMTUState,
+                cc_state = NewCCState
+            };
+        _ ->
+            State
+    end.
+
+%% @doc Get the current MTU for sending.
+-spec get_current_mtu(#state{}) -> pos_integer().
+get_current_mtu(#state{pmtu_state = undefined}) ->
+    ?DEFAULT_MAX_UDP_PAYLOAD_SIZE;
+get_current_mtu(#state{pmtu_state = PMTUState}) ->
+    quic_pmtu:current_mtu(PMTUState).
 
 %%====================================================================
 %% Test Helpers
