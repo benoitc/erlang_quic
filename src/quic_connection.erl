@@ -1360,8 +1360,8 @@ connected(info, pmtu_probe_timeout, #state{pmtu_state = PMTUState} = State) ->
     {keep_state, State2};
 %% Handle PMTU raise timer (periodic re-probing)
 connected(info, pmtu_raise_timeout, #state{pmtu_state = PMTUState} = State) ->
-    %% Reset to base state to start probing again
-    NewPMTUState = quic_pmtu:on_path_change(PMTUState),
+    %% Probe higher from current MTU (don't reset to base)
+    NewPMTUState = quic_pmtu:on_raise_timer(PMTUState),
     State1 = State#state{
         pmtu_state = NewPMTUState,
         pmtu_raise_timer = undefined
@@ -5838,14 +5838,16 @@ complete_migration(
     cancel_timer(ProbeTimer),
     cancel_timer(RaiseTimer),
     NewPMTUState = quic_pmtu:on_path_change(PMTUState),
-    State#state{
+    State1 = State#state{
         remote_addr = NewPath#path_state.remote_addr,
         current_path = NewPath,
         alt_paths = lists:delete(NewPath, State#state.alt_paths),
         pmtu_state = NewPMTUState,
         pmtu_probe_timer = undefined,
         pmtu_raise_timer = undefined
-    };
+    },
+    %% Start probing on the new path
+    maybe_send_pmtu_probe(State1);
 complete_migration(_, State) ->
     %% Can only migrate to validated paths
     State.
@@ -6149,25 +6151,39 @@ handle_pmtu_probe_loss(PacketNumber, #state{pmtu_state = PMTUState, cc_state = C
             end;
         search_complete ->
             %% Track loss for black hole detection
-            OldMTU = quic_pmtu:current_mtu(PMTUState),
-            NewPMTUState = quic_pmtu:on_packet_lost(PMTUState),
-            NewMTU = quic_pmtu:current_mtu(NewPMTUState),
+            %% Only count losses of large packets (near current MTU)
+            case get_sent_packet_size(PacketNumber, State) of
+                {ok, PacketSize} ->
+                    OldMTU = quic_pmtu:current_mtu(PMTUState),
+                    NewPMTUState = quic_pmtu:on_packet_lost(PacketSize, PMTUState),
+                    NewMTU = quic_pmtu:current_mtu(NewPMTUState),
 
-            %% Update congestion control if MTU decreased (black hole)
-            NewCCState =
-                case NewMTU < OldMTU of
-                    true ->
-                        quic_cc:update_mtu(CCState, NewMTU);
-                    false ->
-                        CCState
-                end,
+                    %% Update congestion control if MTU decreased (black hole)
+                    NewCCState =
+                        case NewMTU < OldMTU of
+                            true ->
+                                quic_cc:update_mtu(CCState, NewMTU);
+                            false ->
+                                CCState
+                        end,
 
-            State#state{
-                pmtu_state = NewPMTUState,
-                cc_state = NewCCState
-            };
+                    State#state{
+                        pmtu_state = NewPMTUState,
+                        cc_state = NewCCState
+                    };
+                not_found ->
+                    State
+            end;
         _ ->
             State
+    end.
+
+%% @doc Get packet size from sent packets tracking.
+-spec get_sent_packet_size(non_neg_integer(), #state{}) -> {ok, pos_integer()} | not_found.
+get_sent_packet_size(PacketNumber, #state{pn_app = PNSpace}) ->
+    case maps:get(PacketNumber, PNSpace#pn_space.sent_packets, undefined) of
+        #sent_packet{size = Size} -> {ok, Size};
+        undefined -> not_found
     end.
 
 %% @doc Get the current MTU for sending.

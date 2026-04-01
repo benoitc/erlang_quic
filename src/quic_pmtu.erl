@@ -45,6 +45,7 @@
     %% Connection lifecycle
     on_connection_established/2,
     on_path_change/1,
+    on_raise_timer/1,
 
     %% Probe lifecycle
     should_probe/1,
@@ -55,7 +56,7 @@
     on_probe_timeout/1,
 
     %% Black hole detection
-    on_packet_lost/1,
+    on_packet_lost/2,
     on_packet_acked/1,
 
     %% Queries
@@ -193,6 +194,41 @@ on_path_change(#pmtu_state{base_mtu = BaseMTU, max_mtu = MaxMTU} = State) ->
         search_high = MaxMTU,
         black_hole_count = 0
     }.
+
+%% @doc Handle raise timer expiration for periodic re-probing.
+%%
+%% Unlike on_path_change, this keeps current_mtu and probes higher.
+%% Used for periodic attempts to increase MTU without dropping throughput.
+%%
+%% @param PMTUState Current PMTU state
+%% @returns Updated PMTU state ready to probe upward
+-spec on_raise_timer(#pmtu_state{}) -> #pmtu_state{}.
+on_raise_timer(#pmtu_state{state = disabled} = State) ->
+    State;
+on_raise_timer(#pmtu_state{state = searching} = State) ->
+    %% Already searching, just clear timer
+    State#pmtu_state{raise_timer = undefined};
+on_raise_timer(#pmtu_state{current_mtu = CurrentMTU, max_mtu = MaxMTU} = State) ->
+    case CurrentMTU >= MaxMTU of
+        true ->
+            %% Already at max, nothing to probe
+            State#pmtu_state{raise_timer = undefined};
+        false ->
+            %% Start probing from current MTU upward
+            ?LOG_DEBUG(
+                #{what => pmtu_raise_timer, current_mtu => CurrentMTU, max_mtu => MaxMTU},
+                ?QUIC_LOG_META
+            ),
+            State#pmtu_state{
+                state = searching,
+                search_low = CurrentMTU,
+                search_high = MaxMTU,
+                probe_size = 0,
+                probe_count = 0,
+                probe_pn = undefined,
+                raise_timer = undefined
+            }
+    end.
 
 %%====================================================================
 %% Probe Lifecycle
@@ -487,49 +523,58 @@ on_probe_timeout(PMTUState) ->
 
 %% @doc Track packet loss for black hole detection.
 %%
-%% If we see too many consecutive losses at the current MTU,
-%% fall back to base MTU.
+%% Only counts losses of packets near the current MTU size (within 100 bytes).
+%% Small packet losses are not indicative of MTU black holes.
 %%
+%% @param PacketSize Size of the lost packet
 %% @param PMTUState Current PMTU state
 %% @returns Updated PMTU state, possibly in error state
--spec on_packet_lost(#pmtu_state{}) -> #pmtu_state{}.
-on_packet_lost(#pmtu_state{state = disabled} = State) ->
+-spec on_packet_lost(pos_integer(), #pmtu_state{}) -> #pmtu_state{}.
+on_packet_lost(_PacketSize, #pmtu_state{state = disabled} = State) ->
     State;
-on_packet_lost(#pmtu_state{state = search_complete} = State) ->
-    #pmtu_state{
-        black_hole_count = Count,
-        black_hole_threshold = Threshold,
-        base_mtu = BaseMTU,
-        max_mtu = MaxMTU
-    } = State,
-    NewCount = Count + 1,
-    case NewCount >= Threshold of
+on_packet_lost(PacketSize, #pmtu_state{state = search_complete, current_mtu = CurrentMTU} = State) ->
+    %% Only count losses of large packets (within 100 bytes of current MTU)
+    case PacketSize >= CurrentMTU - 100 of
         true ->
-            %% Black hole detected - fall back to base MTU
-            ?LOG_WARNING(
-                #{
-                    what => pmtu_black_hole_detected,
-                    losses => NewCount,
-                    old_mtu => State#pmtu_state.current_mtu,
-                    new_mtu => BaseMTU
-                },
-                ?QUIC_LOG_META
-            ),
-            State1 = cancel_timers(State),
-            State1#pmtu_state{
-                state = error,
-                current_mtu = BaseMTU,
-                search_low = BaseMTU,
-                search_high = MaxMTU,
-                black_hole_count = 0,
-                probe_size = 0,
-                probe_count = 0,
-                probe_pn = undefined
-            };
+            #pmtu_state{
+                black_hole_count = Count,
+                black_hole_threshold = Threshold,
+                base_mtu = BaseMTU,
+                max_mtu = MaxMTU
+            } = State,
+            NewCount = Count + 1,
+            case NewCount >= Threshold of
+                true ->
+                    %% Black hole detected - fall back to base MTU
+                    ?LOG_WARNING(
+                        #{
+                            what => pmtu_black_hole_detected,
+                            losses => NewCount,
+                            packet_size => PacketSize,
+                            old_mtu => CurrentMTU,
+                            new_mtu => BaseMTU
+                        },
+                        ?QUIC_LOG_META
+                    ),
+                    State1 = cancel_timers(State),
+                    State1#pmtu_state{
+                        state = error,
+                        current_mtu = BaseMTU,
+                        search_low = BaseMTU,
+                        search_high = MaxMTU,
+                        black_hole_count = 0,
+                        probe_size = 0,
+                        probe_count = 0,
+                        probe_pn = undefined
+                    };
+                false ->
+                    State#pmtu_state{black_hole_count = NewCount}
+            end;
         false ->
-            State#pmtu_state{black_hole_count = NewCount}
+            %% Small packet loss - not indicative of MTU black hole
+            State
     end;
-on_packet_lost(State) ->
+on_packet_lost(_PacketSize, State) ->
     State.
 
 %% @doc Reset black hole counter on successful ACK.

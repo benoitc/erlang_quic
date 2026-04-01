@@ -19,13 +19,15 @@ pmtu_test_() ->
         {"Connection established", fun connection_established/0},
         {"Connection established disabled", fun connection_established_disabled/0},
         {"Path change resets state", fun path_change_resets/0},
+        {"Raise timer preserves MTU", fun raise_timer_preserves_mtu/0},
         {"Should probe logic", fun should_probe_logic/0},
         {"Probe packet creation", fun probe_packet_creation/0},
         {"Binary search convergence", fun binary_search_convergence/0},
         {"Probe ack success", fun probe_ack_success/0},
         {"Probe loss handling", fun probe_loss_handling/0},
         {"Probe timeout handling", fun probe_timeout_handling/0},
-        {"Black hole detection", fun black_hole_detection/0},
+        {"Black hole detection with large packets", fun black_hole_detection/0},
+        {"Black hole ignores small packet losses", fun black_hole_ignores_small_packets/0},
         {"MTU bounds validation", fun mtu_bounds_validation/0},
         {"Search threshold", fun search_threshold/0}
     ].
@@ -88,6 +90,51 @@ path_change_resets() ->
     ?assertEqual(1200, quic_pmtu:current_mtu(State1)),
     ?assertEqual(1200, State1#pmtu_state.search_low),
     ?assertEqual(1500, State1#pmtu_state.search_high).
+
+raise_timer_preserves_mtu() ->
+    %% Start with search complete state at 1400 MTU
+    State0 = #pmtu_state{
+        state = search_complete,
+        current_mtu = 1400,
+        base_mtu = 1200,
+        max_mtu = 1500,
+        search_low = 1400,
+        search_high = 1500,
+        raise_timer = make_ref()
+    },
+
+    %% Raise timer should preserve current MTU and start searching upward
+    State1 = quic_pmtu:on_raise_timer(State0),
+    ?assertEqual(searching, quic_pmtu:get_state(State1)),
+    ?assertEqual(1400, quic_pmtu:current_mtu(State1)),
+    ?assertEqual(1400, State1#pmtu_state.search_low),
+    ?assertEqual(1500, State1#pmtu_state.search_high),
+    ?assertEqual(undefined, State1#pmtu_state.raise_timer),
+
+    %% Disabled state should remain disabled
+    State2 = #pmtu_state{state = disabled},
+    ?assertEqual(disabled, quic_pmtu:get_state(quic_pmtu:on_raise_timer(State2))),
+
+    %% Already searching should just clear timer
+    State3 = #pmtu_state{
+        state = searching,
+        current_mtu = 1300,
+        raise_timer = make_ref()
+    },
+    State4 = quic_pmtu:on_raise_timer(State3),
+    ?assertEqual(searching, quic_pmtu:get_state(State4)),
+    ?assertEqual(undefined, State4#pmtu_state.raise_timer),
+
+    %% At max MTU should not start searching
+    State5 = #pmtu_state{
+        state = search_complete,
+        current_mtu = 1500,
+        max_mtu = 1500,
+        raise_timer = make_ref()
+    },
+    State6 = quic_pmtu:on_raise_timer(State5),
+    ?assertEqual(search_complete, quic_pmtu:get_state(State6)),
+    ?assertEqual(undefined, State6#pmtu_state.raise_timer).
 
 should_probe_logic() ->
     %% Disabled state - should not probe
@@ -283,9 +330,12 @@ black_hole_detection() ->
         black_hole_threshold = 6
     },
 
-    %% Simulate consecutive losses
+    %% Simulate consecutive losses of large packets (near current MTU)
+
+    %% Within 100 bytes of current MTU (1400)
+    LargePacketSize = 1350,
     State1 = lists:foldl(
-        fun(_, S) -> quic_pmtu:on_packet_lost(S) end,
+        fun(_, S) -> quic_pmtu:on_packet_lost(LargePacketSize, S) end,
         State0,
         lists:seq(1, 5)
     ),
@@ -293,10 +343,51 @@ black_hole_detection() ->
     ?assertEqual(5, State1#pmtu_state.black_hole_count),
 
     %% One more loss triggers black hole detection
-    State2 = quic_pmtu:on_packet_lost(State1),
+    State2 = quic_pmtu:on_packet_lost(LargePacketSize, State1),
     ?assertEqual(error, quic_pmtu:get_state(State2)),
     ?assertEqual(1200, quic_pmtu:current_mtu(State2)),
     ?assertEqual(0, State2#pmtu_state.black_hole_count).
+
+black_hole_ignores_small_packets() ->
+    State0 = #pmtu_state{
+        state = search_complete,
+        current_mtu = 1400,
+        base_mtu = 1200,
+        max_mtu = 1500,
+        black_hole_count = 0,
+        black_hole_threshold = 6
+    },
+
+    %% Small packet losses should not increment black hole counter
+
+    %% Much smaller than current MTU - 100 = 1300
+    SmallPacketSize = 200,
+    State1 = lists:foldl(
+        fun(_, S) -> quic_pmtu:on_packet_lost(SmallPacketSize, S) end,
+        State0,
+        lists:seq(1, 10)
+    ),
+    ?assertEqual(search_complete, quic_pmtu:get_state(State1)),
+    ?assertEqual(0, State1#pmtu_state.black_hole_count),
+
+    %% Losses of packets just under the threshold should also not count
+
+    %% Just under 1400 - 100 = 1300
+    BorderlineSize = 1299,
+    State2 = lists:foldl(
+        fun(_, S) -> quic_pmtu:on_packet_lost(BorderlineSize, S) end,
+        State0,
+        lists:seq(1, 10)
+    ),
+    ?assertEqual(search_complete, quic_pmtu:get_state(State2)),
+    ?assertEqual(0, State2#pmtu_state.black_hole_count),
+
+    %% Losses at the threshold should count
+
+    %% Exactly at 1400 - 100 = 1300
+    ThresholdSize = 1300,
+    State3 = quic_pmtu:on_packet_lost(ThresholdSize, State0),
+    ?assertEqual(1, State3#pmtu_state.black_hole_count).
 
 mtu_bounds_validation() ->
     %% MTU should never go below base

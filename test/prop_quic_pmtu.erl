@@ -158,15 +158,45 @@ prop_black_hole_resets_to_base() ->
                 black_hole_count = 0,
                 black_hole_threshold = Threshold
             },
+            %% Use a large packet size (near current MTU) for black hole detection
+            LargePacketSize = CurrentMTU - 50,
             %% Simulate losses up to threshold
             FinalState = lists:foldl(
-                fun(_, S) -> quic_pmtu:on_packet_lost(S) end,
+                fun(_, S) -> quic_pmtu:on_packet_lost(LargePacketSize, S) end,
                 State0,
                 lists:seq(1, Threshold)
             ),
             %% Should be in error state with base MTU
             quic_pmtu:get_state(FinalState) =:= error andalso
                 quic_pmtu:current_mtu(FinalState) =:= BaseMTU
+        end
+    ).
+
+%% Property: Small packet losses don't trigger black hole detection
+prop_small_packet_losses_ignored() ->
+    ?FORALL(
+        {BaseMTU, CurrentMTU, NumLosses},
+        ?SUCHTHAT({B, C, _N}, {base_mtu(), mtu(), integer(1, 20)}, C > B + 200),
+        begin
+            State0 = #pmtu_state{
+                state = search_complete,
+                base_mtu = BaseMTU,
+                current_mtu = CurrentMTU,
+                max_mtu = CurrentMTU + 100,
+                black_hole_count = 0,
+                black_hole_threshold = 6
+            },
+            %% Use a small packet size (well under threshold)
+            SmallPacketSize = CurrentMTU - 200,
+            %% Simulate many small packet losses
+            FinalState = lists:foldl(
+                fun(_, S) -> quic_pmtu:on_packet_lost(SmallPacketSize, S) end,
+                State0,
+                lists:seq(1, NumLosses)
+            ),
+            %% Should still be in search_complete with zero black hole count
+            quic_pmtu:get_state(FinalState) =:= search_complete andalso
+                FinalState#pmtu_state.black_hole_count =:= 0
         end
     ).
 
@@ -253,6 +283,9 @@ pmtu_prop_test_() ->
         end},
         {"Black hole resets to base", fun() ->
             ?assert(proper:quickcheck(prop_black_hole_resets_to_base(), [{numtests, 100}]))
+        end},
+        {"Small packet losses ignored", fun() ->
+            ?assert(proper:quickcheck(prop_small_packet_losses_ignored(), [{numtests, 100}]))
         end},
         {"Path change resets state", fun() ->
             ?assert(proper:quickcheck(prop_path_change_resets_state(), [{numtests, 100}]))
