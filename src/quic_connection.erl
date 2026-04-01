@@ -5785,12 +5785,15 @@ maybe_migrate_to_preferred_address(
     %% Check if validated path matches the preferred address
     case is_preferred_address_path(RemoteAddr, PA) of
         true ->
-            %% Migrate to preferred address using the new CID
+            %% Migrate to preferred address
             State1 = complete_migration(ValidatedPath, State),
-            %% Switch to preferred address CID
+            %% RFC 9000 Section 9.6: MUST use the new CID on the preferred address
+            %% Switch CID BEFORE sending any packets (including PMTU probes)
             State2 = switch_to_preferred_cid(PA, State1),
             %% Clear the preferred_address field since migration is complete
-            State2#state{preferred_address = undefined};
+            State3 = State2#state{preferred_address = undefined},
+            %% Now start PMTU probing on the new path with correct CID
+            maybe_send_pmtu_probe(State3);
         false ->
             State
     end.
@@ -5826,7 +5829,9 @@ find_path_by_challenge(Data, [Path | Rest]) ->
     end.
 
 %% @doc Complete migration to a validated path.
-%% Updates the current path and DCID if necessary.
+%% Updates the current path and resets PMTU state.
+%% Note: Does NOT start PMTU probing - caller must call maybe_send_pmtu_probe/1
+%% after any required CID switches (e.g., for preferred address migration).
 -spec complete_migration(#path_state{}, #state{}) -> #state{}.
 complete_migration(
     #path_state{status = validated} = NewPath,
@@ -5838,16 +5843,14 @@ complete_migration(
     cancel_timer(ProbeTimer),
     cancel_timer(RaiseTimer),
     NewPMTUState = quic_pmtu:on_path_change(PMTUState),
-    State1 = State#state{
+    State#state{
         remote_addr = NewPath#path_state.remote_addr,
         current_path = NewPath,
         alt_paths = lists:delete(NewPath, State#state.alt_paths),
         pmtu_state = NewPMTUState,
         pmtu_probe_timer = undefined,
         pmtu_raise_timer = undefined
-    },
-    %% Start probing on the new path
-    maybe_send_pmtu_probe(State1);
+    };
 complete_migration(_, State) ->
     %% Can only migrate to validated paths
     State.
@@ -6179,9 +6182,11 @@ handle_pmtu_probe_loss(PacketNumber, #state{pmtu_state = PMTUState, cc_state = C
     end.
 
 %% @doc Get packet size from sent packets tracking.
+%% Packet sizes are tracked in loss_state.sent_packets (quic_loss.erl).
 -spec get_sent_packet_size(non_neg_integer(), #state{}) -> {ok, pos_integer()} | not_found.
-get_sent_packet_size(PacketNumber, #state{pn_app = PNSpace}) ->
-    case maps:get(PacketNumber, PNSpace#pn_space.sent_packets, undefined) of
+get_sent_packet_size(PacketNumber, #state{loss_state = LossState}) ->
+    SentPackets = quic_loss:sent_packets(LossState),
+    case maps:get(PacketNumber, SentPackets, undefined) of
         #sent_packet{size = Size} -> {ok, Size};
         undefined -> not_found
     end.
