@@ -449,16 +449,7 @@
     ack_eliciting :: boolean(),
     in_flight :: boolean(),
     size :: non_neg_integer(),
-    frames :: [term()],
-    %% BBR per-packet tracking (undefined for NewReno)
-    %% Total bytes delivered when packet was sent
-    delivered :: non_neg_integer() | undefined,
-    %% Time when delivered count was last updated
-    delivered_time :: non_neg_integer() | undefined,
-    %% Time when first packet in current sending burst was sent
-    first_sent_time :: non_neg_integer() | undefined,
-    %% Whether sending was application-limited when packet was sent
-    is_app_limited :: boolean() | undefined
+    frames :: [term()]
 }).
 
 %% Packet number space
@@ -591,47 +582,6 @@
     %% Reset secret for stateless reset token generation
     reset_secret :: binary() | undefined
 }).
-
-%%====================================================================
-%% BBR Congestion Control Constants (draft-cardwell-iccrg-bbr-congestion-control)
-%%====================================================================
-
-%% Pacing gains
-%% STARTUP: 2/ln(2) = 2.89 to double sending rate each round
--define(BBR_STARTUP_PACING_GAIN, 2.89).
-%% DRAIN: 1/2.89 = 0.346 to drain queue
--define(BBR_DRAIN_PACING_GAIN, 0.346).
-%% PROBE_BW cycle gains: probe, drain, cruise phases
--define(BBR_PROBE_BW_GAINS, [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]).
-
-%% CWND gains
--define(BBR_STARTUP_CWND_GAIN, 2.0).
--define(BBR_PROBE_BW_CWND_GAIN, 2.0).
--define(BBR_PROBE_RTT_CWND_GAIN, 0.5).
-
-%% Timing constants (milliseconds)
-%% PROBE_RTT mode duration
--define(BBR_PROBE_RTT_DURATION, 200).
-%% RTprop filter window (10 seconds)
--define(BBR_RT_PROP_FILTER_LEN, 10000).
-
-%% BtlBw filter window (in round trips)
--define(BBR_BTL_BW_FILTER_LEN, 10).
-
-%% STARTUP exit thresholds
-%% Exit if BW growth less than 25% in a round
--define(BBR_FULL_BW_THRESHOLD, 1.25).
-%% Need 3 rounds without growth to exit STARTUP
--define(BBR_FULL_BW_COUNT, 3).
-
-%% Minimum cwnd (in packets) during PROBE_RTT
--define(BBR_MIN_PIPE_CWND_PACKETS, 4).
-
-%% High gain for initial probing
--define(BBR_HIGH_GAIN, 2.89).
-
-%% PROBE_BW cycle length
--define(BBR_CYCLE_LEN, 8).
 
 % QUIC_HRL
 -endif.
