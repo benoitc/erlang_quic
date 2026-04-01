@@ -61,6 +61,7 @@
     open_unidirectional_stream/1,
     send_data/4,
     reset_stream/3,
+    stop_sending/3,
     handle_timeout/2,
     process/1,
     peername/1,
@@ -231,6 +232,22 @@ reset_stream(ConnRef, StreamId, ErrorCode) when is_reference(ConnRef) ->
 reset_stream(ConnPid, StreamId, ErrorCode) when is_pid(ConnPid) ->
     quic_connection:reset_stream(ConnPid, StreamId, ErrorCode);
 reset_stream(_ConnRef, _StreamId, _ErrorCode) ->
+    {error, badarg}.
+
+%% @doc Request peer to stop sending on a stream.
+%% Sends a STOP_SENDING frame (RFC 9000 Section 19.5).
+-spec stop_sending(ConnRef, StreamId, ErrorCode) -> ok | {error, term()} when
+    ConnRef :: reference() | pid(),
+    StreamId :: non_neg_integer(),
+    ErrorCode :: non_neg_integer().
+stop_sending(ConnRef, StreamId, ErrorCode) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:stop_sending(Pid, StreamId, ErrorCode);
+        error -> {error, not_found}
+    end;
+stop_sending(ConnPid, StreamId, ErrorCode) when is_pid(ConnPid) ->
+    quic_connection:stop_sending(ConnPid, StreamId, ErrorCode);
+stop_sending(_ConnRef, _StreamId, _ErrorCode) ->
     {error, badarg}.
 
 %% @doc Handle connection timeout.
