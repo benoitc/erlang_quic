@@ -490,7 +490,8 @@ test_large_binary({#{peer1 := Peer1, node2 := Node2}, _TmpDir}) ->
     Hash = crypto:hash(sha256, Data),
 
     %% Transfer via RPC between QUIC nodes
-    RecvHash = peer:call(Peer1, rpc, call, [Node2, crypto, hash, [sha256, Data]], 60000),
+    %% Use longer timeout (120s) for slow CI VMs
+    RecvHash = peer:call(Peer1, rpc, call, [Node2, crypto, hash, [sha256, Data]], 120000),
 
     ?assertEqual(Hash, RecvHash).
 

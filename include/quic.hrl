@@ -283,6 +283,12 @@
 -define(DIST_INITIAL_MAX_DATA, 16777216).
 % 4MB per-stream limit
 -define(DIST_INITIAL_MAX_STREAM_DATA, 4194304).
+
+%% MTU - Distribution-specific
+%% Use known-safe MTU for LAN instead of PMTU probing.
+%% 1452 = 1500 (Ethernet) - 40 (IPv6 header) - 8 (UDP header)
+%% This is safe for both IPv4 and IPv6 over standard Ethernet.
+-define(DIST_MAX_UDP_PAYLOAD_SIZE, 1452).
 -define(INITIAL_WINDOW_AGGRESSIVE, 131072).
 
 %%====================================================================
