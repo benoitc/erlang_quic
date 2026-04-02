@@ -6023,8 +6023,8 @@ send_pmtu_probe(#state{pmtu_state = PMTUState, pn_app = PNSpace} = State) ->
             %% Get packet number for this probe
             PacketNumber = PNSpace#pn_space.next_pn,
 
-            %% Record probe sent
-            NewPMTUState = quic_pmtu:on_probe_sent(PacketNumber, PMTUState),
+            %% Record probe sent (returns generation for stale detection)
+            {_Gen, NewPMTUState} = quic_pmtu:on_probe_sent(PacketNumber, PMTUState),
 
             %% Send the probe packet
             State1 = State#state{pmtu_state = NewPMTUState},
@@ -6076,16 +6076,22 @@ encode_pmtu_frames(Frames) ->
     ).
 
 %% @doc Set the PMTU probe timeout timer.
+%% Uses 5x smoothed RTT as probe timeout (quic-go pattern).
+%% This is more responsive than 5x PTO and follows quic-go's approach.
 -spec set_pmtu_probe_timer(#state{}) -> #state{}.
 set_pmtu_probe_timer(#state{pmtu_probe_timer = OldTimer, loss_state = LossState} = State) ->
     cancel_timer(OldTimer),
-    %% Use 5x PTO as probe timeout (RFC 8899 recommendation)
-    PTO =
+    %% Use 5x smoothed RTT as probe timeout (quic-go pattern)
+    %% With reasonable minimum for very low RTT networks
+    Timeout =
         case LossState of
-            undefined -> ?PMTU_DEFAULT_PROBE_TIMEOUT;
-            _ -> max(?PMTU_DEFAULT_PROBE_TIMEOUT, 5 * quic_loss:get_pto(LossState))
+            undefined ->
+                ?PMTU_DEFAULT_PROBE_TIMEOUT;
+            _ ->
+                SRTT = quic_loss:smoothed_rtt(LossState),
+                max(1000, 5 * SRTT)
         end,
-    TimerRef = erlang:send_after(PTO, self(), pmtu_probe_timeout),
+    TimerRef = erlang:send_after(Timeout, self(), pmtu_probe_timeout),
     State#state{pmtu_probe_timer = TimerRef}.
 
 %% @doc Set the PMTU raise timer for periodic re-probing.
@@ -6106,9 +6112,10 @@ handle_pmtu_probe_ack(PacketNumber, #state{pmtu_state = PMTUState, cc_state = CC
             %% Check if this ACK is for our probe packet
             case PMTUState#pmtu_state.probe_pn of
                 PacketNumber ->
-                    %% This is our probe - process it
+                    %% This is our probe - process it with generation check
+                    Gen = quic_pmtu:get_generation(PMTUState),
                     OldMTU = quic_pmtu:current_mtu(PMTUState),
-                    NewPMTUState = quic_pmtu:on_probe_acked(PacketNumber, PMTUState),
+                    NewPMTUState = quic_pmtu:on_probe_acked(PacketNumber, Gen, PMTUState),
                     NewMTU = quic_pmtu:current_mtu(NewPMTUState),
 
                     %% Update congestion control if MTU changed
@@ -6150,7 +6157,8 @@ handle_pmtu_probe_loss(
             %% Check if this loss is for our probe packet
             case PMTUState#pmtu_state.probe_pn of
                 PacketNumber ->
-                    NewPMTUState = quic_pmtu:on_probe_lost(PacketNumber, PMTUState),
+                    Gen = quic_pmtu:get_generation(PMTUState),
+                    NewPMTUState = quic_pmtu:on_probe_lost(PacketNumber, Gen, PMTUState),
                     State1 = State#state{pmtu_state = NewPMTUState},
                     maybe_send_pmtu_probe(State1);
                 _ ->

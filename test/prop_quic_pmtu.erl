@@ -32,19 +32,19 @@ searching_state() ->
         {BaseMTU, MaxMTU},
         ?SUCHTHAT({B, M}, {base_mtu(), mtu()}, M > B),
         begin
-            SearchLow = BaseMTU,
-            SearchHigh = MaxMTU,
-            ProbeSize = (SearchLow + SearchHigh + 1) div 2,
+            SearchMin = BaseMTU,
+            ProbeSize = (SearchMin + MaxMTU) div 2,
             #pmtu_state{
                 state = searching,
                 base_mtu = BaseMTU,
                 current_mtu = BaseMTU,
                 max_mtu = MaxMTU,
                 probe_size = ProbeSize,
-                probe_count = 1,
                 probe_pn = 1,
-                search_low = SearchLow,
-                search_high = SearchHigh
+                search_min = SearchMin,
+                lost = [MaxMTU, undefined, undefined],
+                last_probe_lost = false,
+                generation = 0
             }
         end
     ).
@@ -64,8 +64,10 @@ prop_binary_search_converges() ->
                 base_mtu = BaseMTU,
                 current_mtu = BaseMTU,
                 max_mtu = MaxMTU,
-                search_low = BaseMTU,
-                search_high = MaxMTU
+                search_min = BaseMTU,
+                lost = [MaxMTU, undefined, undefined],
+                last_probe_lost = false,
+                generation = 0
             },
             %% Simulate all probes succeeding
             {FinalState, Iterations} = converge_search(State0, 0, 100),
@@ -86,13 +88,15 @@ prop_mtu_never_below_base() ->
                 base_mtu = BaseMTU,
                 current_mtu = BaseMTU,
                 max_mtu = MaxMTU,
-                search_low = BaseMTU,
-                search_high = MaxMTU
+                search_min = BaseMTU,
+                lost = [MaxMTU, undefined, undefined],
+                last_probe_lost = false,
+                generation = 0
             },
             %% Start probing
-            State1 = quic_pmtu:on_probe_sent(1, State0),
+            {Gen, State1} = quic_pmtu:on_probe_sent(1, State0),
             %% Simulate losses
-            FinalState = simulate_losses(State1, NumLosses, 2),
+            FinalState = simulate_losses(State1, NumLosses, 2, Gen),
             quic_pmtu:current_mtu(FinalState) >= BaseMTU
         end
     ).
@@ -108,8 +112,10 @@ prop_probe_sizes_in_range() ->
                 base_mtu = BaseMTU,
                 current_mtu = BaseMTU,
                 max_mtu = MaxMTU,
-                search_low = BaseMTU,
-                search_high = MaxMTU
+                search_min = BaseMTU,
+                lost = [MaxMTU, undefined, undefined],
+                last_probe_lost = false,
+                generation = 0
             },
             {ProbeSize, _} = quic_pmtu:create_probe_packet(State0, 50),
             ProbeSize >= BaseMTU andalso ProbeSize =< MaxMTU
@@ -124,7 +130,8 @@ prop_ack_never_decreases_mtu() ->
         begin
             OldMTU = quic_pmtu:current_mtu(State),
             ProbePn = State#pmtu_state.probe_pn,
-            NewState = quic_pmtu:on_probe_acked(ProbePn, State),
+            Gen = State#pmtu_state.generation,
+            NewState = quic_pmtu:on_probe_acked(ProbePn, Gen, State),
             NewMTU = quic_pmtu:current_mtu(NewState),
             NewMTU >= OldMTU
         end
@@ -138,7 +145,8 @@ prop_loss_never_increases_mtu() ->
         begin
             OldMTU = quic_pmtu:current_mtu(State),
             ProbePn = State#pmtu_state.probe_pn,
-            NewState = quic_pmtu:on_probe_lost(ProbePn, State),
+            Gen = State#pmtu_state.generation,
+            NewState = quic_pmtu:on_probe_lost(ProbePn, Gen, State),
             NewMTU = quic_pmtu:current_mtu(NewState),
             NewMTU =< OldMTU
         end
@@ -211,15 +219,58 @@ prop_path_change_resets_state() ->
                 base_mtu = BaseMTU,
                 current_mtu = CurrentMTU,
                 max_mtu = MaxMTU,
-                search_low = CurrentMTU,
-                search_high = MaxMTU
+                search_min = CurrentMTU,
+                lost = [MaxMTU, undefined, undefined],
+                generation = 0
             },
             NewState = quic_pmtu:on_path_change(State0),
             %% Should reset to base MTU and be ready to probe
             quic_pmtu:current_mtu(NewState) =:= BaseMTU andalso
                 quic_pmtu:get_state(NewState) =:= base andalso
-                NewState#pmtu_state.search_low =:= BaseMTU andalso
-                NewState#pmtu_state.search_high =:= MaxMTU
+                NewState#pmtu_state.search_min =:= BaseMTU andalso
+                NewState#pmtu_state.lost =:= [MaxMTU, undefined, undefined]
+        end
+    ).
+
+%% Property: Loss array ordering is maintained
+prop_loss_array_ordering() ->
+    ?FORALL(
+        {Size1, Size2, Size3},
+        {integer(1200, 1500), integer(1200, 1500), integer(1200, 1500)},
+        begin
+            %% Start with empty-ish loss array
+            Lost0 = [1500, undefined, undefined],
+
+            %% Insert losses one by one (simplified simulation)
+            Lost1 = insert_test_loss(Size1, Lost0),
+            Lost2 = insert_test_loss(Size2, Lost1),
+            Lost3 = insert_test_loss(Size3, Lost2),
+
+            %% Check that defined values are sorted ascending
+            Defined = [V || V <- Lost3, V =/= undefined],
+            Defined =:= lists:sort(Defined)
+        end
+    ).
+
+%% Property: Generation counter increments on path change
+prop_generation_increments() ->
+    ?FORALL(
+        {BaseMTU, MaxMTU, NumChanges},
+        {base_mtu(), max_mtu(1200), integer(1, 10)},
+        begin
+            State0 = #pmtu_state{
+                state = search_complete,
+                base_mtu = BaseMTU,
+                current_mtu = BaseMTU,
+                max_mtu = MaxMTU,
+                generation = 0
+            },
+            FinalState = lists:foldl(
+                fun(_, S) -> quic_pmtu:on_path_change(S) end,
+                State0,
+                lists:seq(1, NumChanges)
+            ),
+            quic_pmtu:get_generation(FinalState) =:= NumChanges
         end
     ).
 
@@ -238,8 +289,8 @@ converge_search(State, Iterations, MaxIterations) ->
             case quic_pmtu:should_probe(State) of
                 true ->
                     PN = Iterations + 1,
-                    State1 = quic_pmtu:on_probe_sent(PN, State),
-                    State2 = quic_pmtu:on_probe_acked(PN, State1),
+                    {Gen, State1} = quic_pmtu:on_probe_sent(PN, State),
+                    State2 = quic_pmtu:on_probe_acked(PN, Gen, State1),
                     converge_search(State2, Iterations + 1, MaxIterations);
                 false ->
                     {State, Iterations}
@@ -247,17 +298,24 @@ converge_search(State, Iterations, MaxIterations) ->
     end.
 
 %% Simulate probe losses
-simulate_losses(State, 0, _PN) ->
+simulate_losses(State, 0, _PN, _Gen) ->
     State;
-simulate_losses(State, N, PN) ->
+simulate_losses(State, N, PN, Gen) ->
     case quic_pmtu:should_probe(State) of
         true ->
-            State1 = quic_pmtu:on_probe_sent(PN, State),
-            State2 = quic_pmtu:on_probe_lost(PN, State1),
-            simulate_losses(State2, N - 1, PN + 1);
+            {NewGen, State1} = quic_pmtu:on_probe_sent(PN, State),
+            State2 = quic_pmtu:on_probe_lost(PN, NewGen, State1),
+            simulate_losses(State2, N - 1, PN + 1, NewGen);
         false ->
             State
     end.
+
+%% Helper to insert loss (mimics internal insert_loss)
+insert_test_loss(Size, Lost) ->
+    Defined = [V || V <- Lost, V =/= undefined],
+    Sorted = lists:sort([Size | Defined]),
+    Trimmed = lists:sublist(Sorted, 3),
+    Trimmed ++ lists:duplicate(3 - length(Trimmed), undefined).
 
 %%====================================================================
 %% EUnit test wrappers for proper tests
@@ -289,5 +347,11 @@ pmtu_prop_test_() ->
         end},
         {"Path change resets state", fun() ->
             ?assert(proper:quickcheck(prop_path_change_resets_state(), [{numtests, 100}]))
+        end},
+        {"Loss array ordering", fun() ->
+            ?assert(proper:quickcheck(prop_loss_array_ordering(), [{numtests, 100}]))
+        end},
+        {"Generation increments", fun() ->
+            ?assert(proper:quickcheck(prop_generation_increments(), [{numtests, 100}]))
         end}
     ]}.

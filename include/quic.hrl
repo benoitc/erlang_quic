@@ -589,6 +589,7 @@
 
 %% PMTU Discovery state machine
 %% Implements Datagram Packetization Layer Path MTU Discovery
+%% Uses quic-go's loss array algorithm for better random loss tolerance
 -record(pmtu_state, {
     %% State machine state (RFC 8899 Section 5.2)
     %% disabled: PMTU discovery not active
@@ -607,24 +608,32 @@
     %% Maximum MTU to probe (from peer's max_udp_payload_size or config)
     max_mtu = 1500 :: pos_integer(),
 
+    %% Binary search minimum (confirmed working size)
+    search_min = 1200 :: pos_integer(),
+
+    %% Loss array: up to 3 sizes that failed probing (quic-go algorithm)
+    %% Sorted ascending, 'undefined' for unused slots
+    %% Initialized with [max_mtu, undefined, undefined]
+    %% When full (3 losses), the largest becomes the new search max
+    lost = [1500, undefined, undefined] :: [pos_integer() | undefined],
+
+    %% Track if last probe was lost (affects next probe size calculation)
+    %% When true: probe (search_min + lost[0]) / 2
+    %% When false: probe (search_min + get_max()) / 2
+    last_probe_lost = false :: boolean(),
+
     %% Current probe size being tested
     probe_size = 0 :: non_neg_integer(),
-
-    %% Number of probe attempts at current size
-    probe_count = 0 :: non_neg_integer(),
 
     %% Packet number of the last sent probe (for ACK matching)
     probe_pn :: non_neg_integer() | undefined,
 
+    %% Generation counter for path migration (quic-go pattern)
+    %% Incremented on path change to ignore stale ACKs/losses
+    generation = 0 :: non_neg_integer(),
+
     %% Timer reference for probe timeout
     probe_timer :: reference() | undefined,
-
-    %% Binary search bounds
-    search_low = 1200 :: pos_integer(),
-    search_high = 1500 :: pos_integer(),
-
-    %% Maximum probe attempts before giving up on a size
-    max_probes = 3 :: pos_integer(),
 
     %% Timer reference for periodic re-probing (raise timer)
     raise_timer :: reference() | undefined,

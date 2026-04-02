@@ -51,8 +51,8 @@
     should_probe/1,
     create_probe_packet/2,
     on_probe_sent/2,
-    on_probe_acked/2,
-    on_probe_lost/2,
+    on_probe_acked/3,
+    on_probe_lost/3,
     on_probe_timeout/1,
 
     %% Black hole detection
@@ -63,6 +63,7 @@
     current_mtu/1,
     is_enabled/1,
     get_state/1,
+    get_generation/1,
 
     %% Timer management
     cancel_timers/1,
@@ -115,8 +116,10 @@ new(Opts) ->
         base_mtu = BaseMTU,
         current_mtu = BaseMTU,
         max_mtu = EffectiveMaxMTU,
-        search_low = BaseMTU,
-        search_high = EffectiveMaxMTU
+        search_min = BaseMTU,
+        lost = [EffectiveMaxMTU, undefined, undefined],
+        last_probe_lost = false,
+        generation = 0
     }.
 
 %%====================================================================
@@ -156,7 +159,7 @@ on_connection_established(PeerMax, #pmtu_state{max_mtu = ConfigMax, base_mtu = B
             State#pmtu_state{
                 state = base,
                 max_mtu = EffectiveMax,
-                search_high = EffectiveMax
+                lost = [EffectiveMax, undefined, undefined]
             };
         false ->
             %% No room to probe - stay disabled
@@ -173,14 +176,15 @@ on_connection_established(PeerMax, #pmtu_state{max_mtu = ConfigMax, base_mtu = B
 -spec on_path_change(#pmtu_state{}) -> #pmtu_state{}.
 on_path_change(#pmtu_state{state = disabled} = State) ->
     State;
-on_path_change(#pmtu_state{base_mtu = BaseMTU, max_mtu = MaxMTU} = State) ->
+on_path_change(#pmtu_state{base_mtu = BaseMTU, max_mtu = MaxMTU, generation = Gen} = State) ->
     %% Cancel any pending timers
     State1 = cancel_timers(State),
     ?LOG_DEBUG(
         #{
             what => pmtu_path_change,
             old_mtu => State#pmtu_state.current_mtu,
-            new_mtu => BaseMTU
+            new_mtu => BaseMTU,
+            generation => Gen + 1
         },
         ?QUIC_LOG_META
     ),
@@ -188,10 +192,11 @@ on_path_change(#pmtu_state{base_mtu = BaseMTU, max_mtu = MaxMTU} = State) ->
         state = base,
         current_mtu = BaseMTU,
         probe_size = 0,
-        probe_count = 0,
         probe_pn = undefined,
-        search_low = BaseMTU,
-        search_high = MaxMTU,
+        search_min = BaseMTU,
+        lost = [MaxMTU, undefined, undefined],
+        last_probe_lost = false,
+        generation = Gen + 1,
         black_hole_count = 0
     }.
 
@@ -221,10 +226,10 @@ on_raise_timer(#pmtu_state{current_mtu = CurrentMTU, max_mtu = MaxMTU} = State) 
             ),
             State#pmtu_state{
                 state = searching,
-                search_low = CurrentMTU,
-                search_high = MaxMTU,
+                search_min = CurrentMTU,
+                lost = [MaxMTU, undefined, undefined],
+                last_probe_lost = false,
                 probe_size = 0,
-                probe_count = 0,
                 probe_pn = undefined,
                 raise_timer = undefined
             }
@@ -284,9 +289,9 @@ create_probe_packet(PMTUState, _HeaderSize) ->
 %%
 %% @param PacketNumber Packet number of the sent probe
 %% @param PMTUState Current PMTU state
-%% @returns Updated PMTU state with probe in flight
--spec on_probe_sent(non_neg_integer(), #pmtu_state{}) -> #pmtu_state{}.
-on_probe_sent(PacketNumber, #pmtu_state{state = State} = PMTUState) when
+%% @returns {Generation, UpdatedPMTUState} tuple with generation for tracking
+-spec on_probe_sent(non_neg_integer(), #pmtu_state{}) -> {non_neg_integer(), #pmtu_state{}}.
+on_probe_sent(PacketNumber, #pmtu_state{state = State, generation = Gen} = PMTUState) when
     State =:= base; State =:= error
 ->
     ProbeSize = next_probe_size(PMTUState),
@@ -295,17 +300,19 @@ on_probe_sent(PacketNumber, #pmtu_state{state = State} = PMTUState) when
             what => pmtu_probe_sent,
             pn => PacketNumber,
             probe_size => ProbeSize,
-            state => State
+            state => State,
+            generation => Gen
         },
         ?QUIC_LOG_META
     ),
-    PMTUState#pmtu_state{
+    {Gen, PMTUState#pmtu_state{
         state = searching,
         probe_size = ProbeSize,
-        probe_count = 1,
         probe_pn = PacketNumber
-    };
-on_probe_sent(PacketNumber, #pmtu_state{state = searching, probe_size = 0} = PMTUState) ->
+    }};
+on_probe_sent(
+    PacketNumber, #pmtu_state{state = searching, probe_size = 0, generation = Gen} = PMTUState
+) ->
     %% Starting a new probe after previous succeeded
     ProbeSize = next_probe_size(PMTUState),
     ?LOG_DEBUG(
@@ -313,16 +320,16 @@ on_probe_sent(PacketNumber, #pmtu_state{state = searching, probe_size = 0} = PMT
             what => pmtu_probe_sent,
             pn => PacketNumber,
             probe_size => ProbeSize,
-            state => searching
+            state => searching,
+            generation => Gen
         },
         ?QUIC_LOG_META
     ),
-    PMTUState#pmtu_state{
+    {Gen, PMTUState#pmtu_state{
         probe_size = ProbeSize,
-        probe_count = 1,
         probe_pn = PacketNumber
-    };
-on_probe_sent(PacketNumber, #pmtu_state{state = searching, probe_count = Count} = PMTUState) ->
+    }};
+on_probe_sent(PacketNumber, #pmtu_state{state = searching, generation = Gen} = PMTUState) ->
     %% Retrying a probe that was lost or timed out
     ProbeSize = PMTUState#pmtu_state.probe_size,
     ?LOG_DEBUG(
@@ -330,188 +337,196 @@ on_probe_sent(PacketNumber, #pmtu_state{state = searching, probe_count = Count} 
             what => pmtu_probe_retry,
             pn => PacketNumber,
             probe_size => ProbeSize,
-            attempt => Count + 1
+            generation => Gen
         },
         ?QUIC_LOG_META
     ),
-    PMTUState#pmtu_state{
-        probe_count = Count + 1,
-        probe_pn = PacketNumber
-    };
-on_probe_sent(_PacketNumber, PMTUState) ->
-    PMTUState.
+    {Gen, PMTUState#pmtu_state{probe_pn = PacketNumber}};
+on_probe_sent(_PacketNumber, #pmtu_state{generation = Gen} = PMTUState) ->
+    {Gen, PMTUState}.
 
 %% @doc Handle probe packet ACK.
 %%
 %% Called when the probe packet is acknowledged.
-%% On success, updates search bounds and MTU.
+%% On success, updates search bounds and MTU using the loss array algorithm.
 %%
 %% @param PacketNumber Packet number that was ACKed
+%% @param Generation Generation when probe was sent (for stale detection)
 %% @param PMTUState Current PMTU state
 %% @returns Updated PMTU state
--spec on_probe_acked(non_neg_integer(), #pmtu_state{}) -> #pmtu_state{}.
-on_probe_acked(PacketNumber, #pmtu_state{state = searching, probe_pn = PacketNumber} = PMTUState) ->
+-spec on_probe_acked(non_neg_integer(), non_neg_integer(), #pmtu_state{}) -> #pmtu_state{}.
+on_probe_acked(
+    PacketNumber,
+    Gen,
     #pmtu_state{
-        probe_size = ProbeSize,
-        search_high = SearchHigh
-    } = PMTUState,
+        state = searching,
+        probe_pn = PacketNumber,
+        generation = Gen
+    } = PMTUState
+) ->
+    #pmtu_state{probe_size = ProbeSize, lost = Lost} = PMTUState,
 
-    %% Probe succeeded - update search_low and current_mtu
-    NewSearchLow = ProbeSize,
-    NewCurrentMTU = ProbeSize,
+    %% Probe succeeded - update search_min and remove smaller losses
+    NewLost = remove_losses_below(ProbeSize, Lost),
 
     ?LOG_DEBUG(
         #{
             what => pmtu_probe_acked,
             pn => PacketNumber,
             probe_size => ProbeSize,
-            new_mtu => NewCurrentMTU
+            new_mtu => ProbeSize,
+            generation => Gen
         },
         ?QUIC_LOG_META
     ),
 
-    %% Check if search is complete
     State1 = PMTUState#pmtu_state{
-        search_low = NewSearchLow,
-        current_mtu = NewCurrentMTU,
+        search_min = ProbeSize,
+        current_mtu = ProbeSize,
+        lost = NewLost,
+        last_probe_lost = false,
         probe_size = 0,
         probe_pn = undefined,
-        probe_count = 0,
         black_hole_count = 0
     },
 
-    case SearchHigh - NewSearchLow < ?PMTU_SEARCH_THRESHOLD of
+    case search_done(State1) of
         true ->
-            %% Search complete
             ?LOG_INFO(
-                #{
-                    what => pmtu_search_complete,
-                    final_mtu => NewCurrentMTU
-                },
+                #{what => pmtu_search_complete, final_mtu => ProbeSize},
                 ?QUIC_LOG_META
             ),
             State1#pmtu_state{state = search_complete};
         false ->
-            %% Continue searching
-            State1#pmtu_state{state = searching}
+            State1
     end;
-on_probe_acked(_PacketNumber, PMTUState) ->
+on_probe_acked(PacketNumber, Gen, #pmtu_state{generation = CurrentGen} = PMTUState) when
+    Gen =/= CurrentGen
+->
+    %% Stale ACK from previous generation - ignore
+    ?LOG_DEBUG(
+        #{
+            what => pmtu_probe_acked_stale,
+            pn => PacketNumber,
+            probe_gen => Gen,
+            current_gen => CurrentGen
+        },
+        ?QUIC_LOG_META
+    ),
+    PMTUState;
+on_probe_acked(_PacketNumber, _Gen, PMTUState) ->
     %% Not our probe packet
     PMTUState.
 
 %% @doc Handle probe packet loss.
 %%
 %% Called when the probe packet is detected as lost.
-%% On failure, updates search bounds or retries.
+%% Uses loss array algorithm: inserts loss into array and adjusts search.
 %%
 %% @param PacketNumber Packet number that was lost
+%% @param Generation Generation when probe was sent (for stale detection)
 %% @param PMTUState Current PMTU state
 %% @returns Updated PMTU state
--spec on_probe_lost(non_neg_integer(), #pmtu_state{}) -> #pmtu_state{}.
-on_probe_lost(PacketNumber, #pmtu_state{state = searching, probe_pn = PacketNumber} = PMTUState) ->
+-spec on_probe_lost(non_neg_integer(), non_neg_integer(), #pmtu_state{}) -> #pmtu_state{}.
+on_probe_lost(
+    PacketNumber,
+    Gen,
     #pmtu_state{
-        probe_size = ProbeSize,
-        probe_count = ProbeCount,
-        max_probes = MaxProbes,
-        search_low = SearchLow
-    } = PMTUState,
+        state = searching,
+        probe_pn = PacketNumber,
+        generation = Gen
+    } = PMTUState
+) ->
+    #pmtu_state{probe_size = ProbeSize, lost = Lost, search_min = Min} = PMTUState,
 
     ?LOG_DEBUG(
         #{
             what => pmtu_probe_lost,
             pn => PacketNumber,
             probe_size => ProbeSize,
-            attempt => ProbeCount
+            generation => Gen
         },
         ?QUIC_LOG_META
     ),
 
-    case ProbeCount >= MaxProbes of
-        true ->
-            %% Max retries reached - probe size doesn't work
-            NewSearchHigh = ProbeSize - 1,
-            State1 = PMTUState#pmtu_state{
-                search_high = NewSearchHigh,
-                probe_pn = undefined,
-                probe_count = 0
-            },
+    %% Insert this size into loss array
+    NewLost = insert_loss(ProbeSize, Lost),
 
-            %% Check if search is complete
-            case NewSearchHigh - SearchLow < ?PMTU_SEARCH_THRESHOLD of
-                true ->
-                    ?LOG_INFO(
-                        #{
-                            what => pmtu_search_complete,
-                            final_mtu => SearchLow
-                        },
-                        ?QUIC_LOG_META
-                    ),
-                    State1#pmtu_state{
-                        state = search_complete,
-                        current_mtu = SearchLow
-                    };
-                false ->
-                    State1
-            end;
+    State1 = PMTUState#pmtu_state{
+        lost = NewLost,
+        last_probe_lost = true,
+        probe_pn = undefined,
+        probe_size = 0
+    },
+
+    case search_done(State1) of
+        true ->
+            ?LOG_INFO(
+                #{what => pmtu_search_complete, final_mtu => Min},
+                ?QUIC_LOG_META
+            ),
+            State1#pmtu_state{state = search_complete, current_mtu = Min};
         false ->
-            %% Will retry - clear probe_pn to allow resend
-            PMTUState#pmtu_state{probe_pn = undefined}
+            State1
     end;
-on_probe_lost(_PacketNumber, PMTUState) ->
+on_probe_lost(PacketNumber, Gen, #pmtu_state{generation = CurrentGen} = PMTUState) when
+    Gen =/= CurrentGen
+->
+    %% Stale loss from previous generation - ignore
+    ?LOG_DEBUG(
+        #{
+            what => pmtu_probe_lost_stale,
+            pn => PacketNumber,
+            probe_gen => Gen,
+            current_gen => CurrentGen
+        },
+        ?QUIC_LOG_META
+    ),
+    PMTUState;
+on_probe_lost(_PacketNumber, _Gen, PMTUState) ->
     PMTUState.
 
 %% @doc Handle probe timeout.
 %%
 %% Called when the probe timer fires.
-%% Similar to loss handling but triggered by timer.
+%% Treats timeout as loss and uses loss array algorithm.
 %%
 %% @param PMTUState Current PMTU state
 %% @returns Updated PMTU state
 -spec on_probe_timeout(#pmtu_state{}) -> #pmtu_state{}.
 on_probe_timeout(#pmtu_state{state = searching} = PMTUState) ->
-    %% Treat timeout as loss
     #pmtu_state{
         probe_size = ProbeSize,
-        probe_count = ProbeCount,
-        max_probes = MaxProbes,
-        search_low = SearchLow,
+        lost = Lost,
+        search_min = Min,
         probe_pn = ProbePn
     } = PMTUState,
 
     ?LOG_DEBUG(
-        #{
-            what => pmtu_probe_timeout,
-            probe_size => ProbeSize,
-            attempt => ProbeCount
-        },
+        #{what => pmtu_probe_timeout, probe_size => ProbeSize},
         ?QUIC_LOG_META
     ),
 
     State1 = PMTUState#pmtu_state{probe_timer = undefined},
 
-    case ProbeCount >= MaxProbes of
-        true ->
-            %% Max retries reached
-            NewSearchHigh = ProbeSize - 1,
+    case ProbePn of
+        undefined ->
+            %% No probe in flight
+            State1;
+        _ ->
+            %% Treat timeout as loss - insert into loss array
+            NewLost = insert_loss(ProbeSize, Lost),
             State2 = State1#pmtu_state{
-                search_high = NewSearchHigh,
+                lost = NewLost,
+                last_probe_lost = true,
                 probe_pn = undefined,
-                probe_count = 0
+                probe_size = 0
             },
-            case NewSearchHigh - SearchLow < ?PMTU_SEARCH_THRESHOLD of
+            case search_done(State2) of
                 true ->
-                    State2#pmtu_state{
-                        state = search_complete,
-                        current_mtu = SearchLow
-                    };
+                    State2#pmtu_state{state = search_complete, current_mtu = Min};
                 false ->
                     State2
-            end;
-        false ->
-            %% Can retry - packet might still be in flight but treat as lost
-            case ProbePn of
-                undefined -> State1;
-                _ -> State1#pmtu_state{probe_pn = undefined}
             end
     end;
 on_probe_timeout(PMTUState) ->
@@ -560,11 +575,11 @@ on_packet_lost(PacketSize, #pmtu_state{state = search_complete, current_mtu = Cu
                     State1#pmtu_state{
                         state = error,
                         current_mtu = BaseMTU,
-                        search_low = BaseMTU,
-                        search_high = MaxMTU,
+                        search_min = BaseMTU,
+                        lost = [MaxMTU, undefined, undefined],
+                        last_probe_lost = false,
                         black_hole_count = 0,
                         probe_size = 0,
-                        probe_count = 0,
                         probe_pn = undefined
                     };
                 false ->
@@ -605,6 +620,11 @@ is_enabled(_) ->
 get_state(#pmtu_state{state = State}) ->
     State.
 
+%% @doc Get the current generation.
+-spec get_generation(#pmtu_state{}) -> non_neg_integer().
+get_generation(#pmtu_state{generation = Gen}) ->
+    Gen.
+
 %%====================================================================
 %% Timer Management
 %%====================================================================
@@ -635,14 +655,54 @@ set_raise_timer(TimerRef, State) ->
 %% Internal Functions
 %%====================================================================
 
-%% @private Calculate the next probe size using binary search.
+%% @private Get effective max from loss array (first defined value).
+%% The loss array is sorted ascending, so the first defined value is the smallest loss.
+-spec get_max(#pmtu_state{}) -> pos_integer().
+get_max(#pmtu_state{lost = Lost}) ->
+    hd([V || V <- Lost, V =/= undefined]).
+
+%% @private Check if search is done (within threshold).
+-spec search_done(#pmtu_state{}) -> boolean().
+search_done(#pmtu_state{search_min = Min} = State) ->
+    Max = get_max(State),
+    Max - Min =< ?PMTU_SEARCH_THRESHOLD.
+
+%% @private Calculate the next probe size using the quic-go loss array algorithm.
+%% If last probe was lost: probe (search_min + lost[0]) / 2
+%% Otherwise: probe (search_min + get_max()) / 2
 -spec next_probe_size(#pmtu_state{}) -> pos_integer().
 next_probe_size(#pmtu_state{state = searching, probe_size = ProbeSize}) when ProbeSize > 0 ->
     %% In active search - use current probe size
     ProbeSize;
-next_probe_size(#pmtu_state{search_low = Low, search_high = High}) ->
-    %% Binary search: try the midpoint (rounded up)
-    (Low + High + 1) div 2.
+next_probe_size(#pmtu_state{search_min = Min, last_probe_lost = true, lost = [Lost0 | _]}) when
+    Lost0 =/= undefined
+->
+    %% After loss, probe between min and smallest loss point
+    (Min + Lost0) div 2;
+next_probe_size(#pmtu_state{search_min = Min} = State) ->
+    %% Normal case: probe between min and max
+    Max = get_max(State),
+    (Min + Max) div 2.
+
+%% @private Insert loss into array (sorted ascending, max 3 elements).
+%% This implements the quic-go pattern where we track up to 3 loss points.
+-spec insert_loss(pos_integer(), [pos_integer() | undefined]) -> [pos_integer() | undefined].
+insert_loss(Size, Lost) ->
+    Defined = [V || V <- Lost, V =/= undefined],
+    %% Insert and sort
+    Sorted = lists:sort([Size | Defined]),
+    %% Keep only first 3 (smallest values)
+    Trimmed = lists:sublist(Sorted, 3),
+    %% Pad to 3 elements with undefined
+    Trimmed ++ lists:duplicate(3 - length(Trimmed), undefined).
+
+%% @private Remove losses smaller than confirmed size.
+%% When a probe succeeds at size S, all losses < S are no longer relevant.
+-spec remove_losses_below(pos_integer(), [pos_integer() | undefined]) ->
+    [pos_integer() | undefined].
+remove_losses_below(Size, Lost) ->
+    Filtered = [V || V <- Lost, V =/= undefined, V > Size],
+    Filtered ++ lists:duplicate(3 - length(Filtered), undefined).
 
 %% @private Cancel a timer if it's set.
 -spec cancel_timer(reference() | undefined) -> ok.
