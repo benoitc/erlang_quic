@@ -64,7 +64,11 @@
     %% State inspection
     in_slow_start/1,
     in_recovery/1,
-    min_recovery_duration/1
+    min_recovery_duration/1,
+
+    %% PMTU Discovery
+    update_mtu/2,
+    max_datagram_size/1
 ]).
 
 %% Constants from RFC 9002
@@ -562,6 +566,51 @@ in_recovery(#cc_state{in_recovery = R}) -> R.
 %% External CC implementations can use this to tune recovery behavior.
 -spec min_recovery_duration(cc_state()) -> non_neg_integer().
 min_recovery_duration(#cc_state{min_recovery_duration = D}) -> D.
+
+%% @doc Get the current max datagram size.
+-spec max_datagram_size(cc_state()) -> pos_integer().
+max_datagram_size(#cc_state{max_datagram_size = MDS}) -> MDS.
+
+%%====================================================================
+%% PMTU Discovery Support
+%%====================================================================
+
+%% @doc Update congestion control state when MTU changes.
+%%
+%% Called by PMTU discovery when a new MTU is discovered.
+%% Updates max_datagram_size, minimum_window, and pacing_max_burst.
+%%
+%% RFC 9002: When max_datagram_size changes, dependent parameters
+%% should be updated proportionally.
+-spec update_mtu(cc_state(), pos_integer()) -> cc_state().
+update_mtu(#cc_state{max_datagram_size = OldMDS} = State, NewMTU) when NewMTU =:= OldMDS ->
+    %% No change
+    State;
+update_mtu(#cc_state{max_datagram_size = OldMDS, minimum_window = OldMinWin} = State, NewMTU) ->
+    %% Scale minimum_window proportionally
+    %% minimum_window = 2 * max_datagram_size (RFC 9002)
+    NewMinimumWindow = max(2 * NewMTU, (OldMinWin * NewMTU) div OldMDS),
+
+    %% Update pacing_max_burst (12 * max_datagram_size)
+    NewPacingMaxBurst = 12 * NewMTU,
+
+    ?LOG_DEBUG(
+        #{
+            what => cc_mtu_updated,
+            old_mtu => OldMDS,
+            new_mtu => NewMTU,
+            old_minimum_window => OldMinWin,
+            new_minimum_window => NewMinimumWindow,
+            new_pacing_max_burst => NewPacingMaxBurst
+        },
+        ?QUIC_LOG_META
+    ),
+
+    State#cc_state{
+        max_datagram_size = NewMTU,
+        minimum_window = NewMinimumWindow,
+        pacing_max_burst = NewPacingMaxBurst
+    }.
 
 %%====================================================================
 %% Persistent Congestion (RFC 9002 Section 7.6)

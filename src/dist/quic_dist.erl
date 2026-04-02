@@ -415,6 +415,10 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
                 pacing_enabled => Config#quic_dist_config.pacing_enabled,
                 %% Longer recovery duration for virtual network packet reordering
                 min_recovery_duration => ?MIN_RECOVERY_DURATION_DISTRIBUTION,
+                %% Use known-safe MTU for LAN (1452 bytes, IPv4/IPv6 compatible)
+                %% instead of PMTU probing which adds overhead
+                max_udp_payload_size => ?DIST_MAX_UDP_PAYLOAD_SIZE,
+                pmtu_enabled => false,
                 connection_handler => fun(ConnPid, ConnRef) ->
                     handle_new_connection(ConnPid, ConnRef)
                 end
@@ -840,6 +844,10 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                 pacing_enabled => Config#quic_dist_config.pacing_enabled,
                 %% Longer recovery duration for virtual network packet reordering
                 min_recovery_duration => ?MIN_RECOVERY_DURATION_DISTRIBUTION,
+                %% Use known-safe MTU for LAN (1452 bytes, IPv4/IPv6 compatible)
+                %% instead of PMTU probing which adds overhead
+                max_udp_payload_size => ?DIST_MAX_UDP_PAYLOAD_SIZE,
+                pmtu_enabled => false,
                 % TODO: Enable proper verification
                 verify => false
             },

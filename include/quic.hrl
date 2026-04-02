@@ -283,6 +283,12 @@
 -define(DIST_INITIAL_MAX_DATA, 16777216).
 % 4MB per-stream limit
 -define(DIST_INITIAL_MAX_STREAM_DATA, 4194304).
+
+%% MTU - Distribution-specific
+%% Use known-safe MTU for LAN instead of PMTU probing.
+%% 1452 = 1500 (Ethernet) - 40 (IPv6 header) - 8 (UDP header)
+%% This is safe for both IPv4 and IPv6 over standard Ethernet.
+-define(DIST_MAX_UDP_PAYLOAD_SIZE, 1452).
 -define(INITIAL_WINDOW_AGGRESSIVE, 131072).
 
 %%====================================================================
@@ -582,6 +588,73 @@
     %% Reset secret for stateless reset token generation
     reset_secret :: binary() | undefined
 }).
+
+%%====================================================================
+%% PMTU Discovery (RFC 8899 - DPLPMTUD)
+%%====================================================================
+
+%% PMTU Discovery state machine
+%% Implements Datagram Packetization Layer Path MTU Discovery
+%% Uses quic-go's loss array algorithm for better random loss tolerance
+-record(pmtu_state, {
+    %% State machine state (RFC 8899 Section 5.2)
+    %% disabled: PMTU discovery not active
+    %% base: Using base MTU (1200), ready to probe
+    %% searching: Binary search for optimal MTU in progress
+    %% search_complete: Found optimal MTU
+    %% error: Black hole detected, fell back to base MTU
+    state = disabled :: disabled | base | searching | search_complete | error,
+
+    %% Base MTU - minimum guaranteed to work (QUIC minimum)
+    base_mtu = 1200 :: pos_integer(),
+
+    %% Current effective MTU for sending
+    current_mtu = 1200 :: pos_integer(),
+
+    %% Maximum MTU to probe (from peer's max_udp_payload_size or config)
+    max_mtu = 1500 :: pos_integer(),
+
+    %% Binary search minimum (confirmed working size)
+    search_min = 1200 :: pos_integer(),
+
+    %% Loss array: up to 3 sizes that failed probing (quic-go algorithm)
+    %% Sorted ascending, 'undefined' for unused slots
+    %% Initialized with [max_mtu, undefined, undefined]
+    %% When full (3 losses), the largest becomes the new search max
+    lost = [1500, undefined, undefined] :: [pos_integer() | undefined],
+
+    %% Track if last probe was lost (affects next probe size calculation)
+    %% When true: probe (search_min + lost[0]) / 2
+    %% When false: probe (search_min + get_max()) / 2
+    last_probe_lost = false :: boolean(),
+
+    %% Current probe size being tested
+    probe_size = 0 :: non_neg_integer(),
+
+    %% Packet number of the last sent probe (for ACK matching)
+    probe_pn :: non_neg_integer() | undefined,
+
+    %% Generation counter for path migration (quic-go pattern)
+    %% Incremented on path change to ignore stale ACKs/losses
+    generation = 0 :: non_neg_integer(),
+
+    %% Timer reference for probe timeout
+    probe_timer :: reference() | undefined,
+
+    %% Timer reference for periodic re-probing (raise timer)
+    raise_timer :: reference() | undefined,
+
+    %% Black hole detection: consecutive losses at current MTU
+    black_hole_count = 0 :: non_neg_integer(),
+
+    %% Threshold for black hole detection (consecutive losses)
+    black_hole_threshold = 6 :: pos_integer()
+}).
+
+%% PMTU Discovery configuration options
+-define(PMTU_DEFAULT_PROBE_TIMEOUT, 5000).
+-define(PMTU_DEFAULT_RAISE_INTERVAL, 600000).
+-define(PMTU_SEARCH_THRESHOLD, 10).
 
 % QUIC_HRL
 -endif.

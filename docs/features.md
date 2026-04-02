@@ -55,6 +55,15 @@
 - [x] Packet pacing (RFC 9002 Section 7.7) to prevent bursts
 - [x] RTT-based flow control auto-tuning
 
+## Path MTU Discovery (RFC 8899 - DPLPMTUD)
+
+- [x] Binary search probing for optimal MTU
+- [x] Integration with peer's `max_udp_payload_size` transport parameter
+- [x] Black hole detection and recovery
+- [x] Automatic MTU reset on connection migration
+- [x] Periodic re-probing for MTU increases
+- [x] Congestion control integration (updates cwnd-related parameters)
+
 ## TLS 1.3 Integration (RFC 9001)
 
 ### Handshake
@@ -150,6 +159,11 @@
 - `connection_handler` - Callback for handling new connections
 - `lb_config` - QUIC-LB configuration map for load balancer routing
 - `keep_alive_interval` - Keep-alive PING interval (`disabled`, `auto`, or milliseconds)
+- `pmtu_enabled` - Enable Path MTU Discovery (default: true)
+- `pmtu_max_mtu` - Maximum MTU to probe (default: 1500)
+
+### PMTU Discovery
+- `quic:get_mtu/1` - Get current effective MTU for a connection
 
 ## Erlang Distribution (quic_dist)
 
