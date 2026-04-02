@@ -2920,9 +2920,10 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     ),
 
                     %% Handle PMTU probe losses
+                    %% Pass packet size directly since packets are removed from sent_packets
                     State3 = lists:foldl(
-                        fun(#sent_packet{pn = PN}, S) ->
-                            handle_pmtu_probe_loss(PN, S)
+                        fun(#sent_packet{pn = PN, size = Size}, S) ->
+                            handle_pmtu_probe_loss(PN, Size, S)
                         end,
                         State2,
                         LostPackets
@@ -6136,10 +6137,14 @@ handle_pmtu_probe_ack(PacketNumber, #state{pmtu_state = PMTUState, cc_state = CC
     end.
 
 %% @doc Handle loss of a potential PMTU probe packet.
--spec handle_pmtu_probe_loss(non_neg_integer(), #state{}) -> #state{}.
-handle_pmtu_probe_loss(_PacketNumber, #state{pmtu_state = undefined} = State) ->
+%% PacketSize is passed directly since lost packets are removed from sent_packets
+%% before this function is called.
+-spec handle_pmtu_probe_loss(non_neg_integer(), non_neg_integer(), #state{}) -> #state{}.
+handle_pmtu_probe_loss(_PacketNumber, _PacketSize, #state{pmtu_state = undefined} = State) ->
     State;
-handle_pmtu_probe_loss(PacketNumber, #state{pmtu_state = PMTUState, cc_state = CCState} = State) ->
+handle_pmtu_probe_loss(
+    PacketNumber, PacketSize, #state{pmtu_state = PMTUState, cc_state = CCState} = State
+) ->
     case quic_pmtu:get_state(PMTUState) of
         searching ->
             %% Check if this loss is for our probe packet
@@ -6155,40 +6160,25 @@ handle_pmtu_probe_loss(PacketNumber, #state{pmtu_state = PMTUState, cc_state = C
         search_complete ->
             %% Track loss for black hole detection
             %% Only count losses of large packets (near current MTU)
-            case get_sent_packet_size(PacketNumber, State) of
-                {ok, PacketSize} ->
-                    OldMTU = quic_pmtu:current_mtu(PMTUState),
-                    NewPMTUState = quic_pmtu:on_packet_lost(PacketSize, PMTUState),
-                    NewMTU = quic_pmtu:current_mtu(NewPMTUState),
+            OldMTU = quic_pmtu:current_mtu(PMTUState),
+            NewPMTUState = quic_pmtu:on_packet_lost(PacketSize, PMTUState),
+            NewMTU = quic_pmtu:current_mtu(NewPMTUState),
 
-                    %% Update congestion control if MTU decreased (black hole)
-                    NewCCState =
-                        case NewMTU < OldMTU of
-                            true ->
-                                quic_cc:update_mtu(CCState, NewMTU);
-                            false ->
-                                CCState
-                        end,
+            %% Update congestion control if MTU decreased (black hole)
+            NewCCState =
+                case NewMTU < OldMTU of
+                    true ->
+                        quic_cc:update_mtu(CCState, NewMTU);
+                    false ->
+                        CCState
+                end,
 
-                    State#state{
-                        pmtu_state = NewPMTUState,
-                        cc_state = NewCCState
-                    };
-                not_found ->
-                    State
-            end;
+            State#state{
+                pmtu_state = NewPMTUState,
+                cc_state = NewCCState
+            };
         _ ->
             State
-    end.
-
-%% @doc Get packet size from sent packets tracking.
-%% Packet sizes are tracked in loss_state.sent_packets (quic_loss.erl).
--spec get_sent_packet_size(non_neg_integer(), #state{}) -> {ok, pos_integer()} | not_found.
-get_sent_packet_size(PacketNumber, #state{loss_state = LossState}) ->
-    SentPackets = quic_loss:sent_packets(LossState),
-    case maps:get(PacketNumber, SentPackets, undefined) of
-        #sent_packet{size = Size} -> {ok, Size};
-        undefined -> not_found
     end.
 
 %% @doc Get the current MTU for sending.
