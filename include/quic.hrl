@@ -92,6 +92,10 @@
 % 0x100-0x1ff for TLS alerts
 -define(QUIC_CRYPTO_ERROR_BASE, 16#100).
 
+%% Application-level error codes (for stream deadlines)
+%% Default error code when stream deadline expires
+-define(QUIC_STREAM_DEADLINE_EXCEEDED, 16#FF).
+
 %%====================================================================
 %% HTTP/3 Error Codes (RFC 9114 Section 8.1)
 %%====================================================================
@@ -445,7 +449,20 @@
     %% Urgency: 0-7 (lower = more urgent, default 3)
     %% Incremental: boolean (data can be processed incrementally)
     urgency = 3 :: 0..7,
-    incremental = false :: boolean()
+    incremental = false :: boolean(),
+
+    %% Stream Deadlines
+    %% deadline: absolute timestamp in ms (erlang:system_time(millisecond))
+    deadline :: non_neg_integer() | infinity | undefined,
+    %% deadline_timer: erlang timer reference for deadline expiry
+    deadline_timer :: reference() | undefined,
+    %% deadline_action: what to do when deadline expires
+    %% - notify: send {quic, ConnRef, {stream_deadline, StreamId}} to owner
+    %% - reset: send RESET_STREAM and clean up
+    %% - both: notify AND reset (default)
+    deadline_action = both :: reset | notify | both,
+    %% deadline_error_code: error code for RESET_STREAM on deadline expiry
+    deadline_error_code = 16#FF :: non_neg_integer()
 }).
 
 %% Sent packet info for loss detection
