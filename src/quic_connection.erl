@@ -762,6 +762,7 @@ init({server, Opts}) ->
 
 %% Build congestion control options from connection options.
 %% Supports:
+%%   - cc_algorithm: Congestion control algorithm (newreno | bbr, default: newreno)
 %%   - initial_window: Initial congestion window in bytes (default: RFC 9002 formula)
 %%                     Higher values improve bulk transfer throughput.
 %%                     Recommended for distribution: 65536 (64KB) or higher.
@@ -775,9 +776,17 @@ build_cc_opts(Opts) ->
     CCOpts2 = maybe_add_cc_opt(minimum_window, Opts, CCOpts1),
     CCOpts3 = maybe_add_cc_opt(min_recovery_duration, Opts, CCOpts2),
     %% Pass max_udp_payload_size as max_datagram_size to CC
-    case maps:find(max_udp_payload_size, Opts) of
-        {ok, Size} -> maps:put(max_datagram_size, Size, CCOpts3);
-        error -> CCOpts3
+    CCOpts4 =
+        case maps:find(max_udp_payload_size, Opts) of
+            {ok, Size} -> maps:put(max_datagram_size, Size, CCOpts3);
+            error -> CCOpts3
+        end,
+    %% Add algorithm selection (default: newreno)
+    case maps:find(cc_algorithm, Opts) of
+        {ok, Algo} when Algo =:= newreno; Algo =:= bbr ->
+            CCOpts4#{algorithm => Algo};
+        _ ->
+            CCOpts4
     end.
 
 maybe_add_cc_opt(Key, Opts, CCOpts) ->

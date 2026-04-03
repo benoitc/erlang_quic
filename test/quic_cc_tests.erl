@@ -33,6 +33,28 @@ new_state_with_minimum_window_opt_test() ->
     ?assertEqual(16000, quic_cc:cwnd(State)).
 
 %%====================================================================
+%% Algorithm Selection Tests
+%%====================================================================
+
+new_with_explicit_algorithm_test() ->
+    %% Create with explicit newreno algorithm
+    State = quic_cc:new(newreno, #{}),
+    ?assertEqual(newreno, quic_cc:algorithm(State)),
+    Cwnd = quic_cc:cwnd(State),
+    ?assert(Cwnd >= 12000).
+
+new_with_algorithm_option_test() ->
+    %% Create with algorithm in options map
+    State = quic_cc:new(#{algorithm => newreno}),
+    ?assertEqual(newreno, quic_cc:algorithm(State)).
+
+new_with_algorithm_and_opts_test() ->
+    %% Create with explicit algorithm and options
+    State = quic_cc:new(newreno, #{max_datagram_size => 1400}),
+    ?assertEqual(newreno, quic_cc:algorithm(State)),
+    ?assertEqual(32 * 1400, quic_cc:cwnd(State)).
+
+%%====================================================================
 %% Packet Sent Tests
 %%====================================================================
 
