@@ -148,7 +148,7 @@ get_fd(Socket) ->
 %%   <li>`socket_fd' - Use an existing UDP socket FD (see `get_fd/1')</li>
 %%   <li>`verify' - Verify server certificate (default: false)</li>
 %%   <li>`alpn' - ALPN protocols (default: [&lt;&lt;"h3"&gt;&gt;])</li>
-%%   <li>`sni' - Server Name Indication (default: Host)</li>
+%%   <li>`server_name' - Server Name Indication (default: Host)</li>
 %% </ul>
 -spec connect(Host, Port, Opts, Owner) -> {ok, reference()} | {error, term()} when
     Host :: binary() | string(),

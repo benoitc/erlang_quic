@@ -42,7 +42,7 @@ quic:close(ConnRef, normal).
 |--------|------|---------|-------------|
 | `alpn` | [binary()] | `[<<"h3">>]` | ALPN protocols to offer |
 | `verify` | boolean | false | Verify server certificate |
-| `sni` | binary | Host | Server Name Indication |
+| `server_name` | binary | Host | Server Name Indication |
 | `cert` | binary | - | Client certificate (for mTLS) |
 | `key` | term | - | Client private key (for mTLS) |
 
@@ -67,7 +67,6 @@ quic:close(ConnRef, normal).
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `keep_alive_interval` | integer/atom | `auto` | PING interval |
-| `socket_fd` | integer | - | Reuse existing UDP socket FD |
 | `pmtu_enabled` | boolean | true | Enable Path MTU Discovery |
 
 ## Features
