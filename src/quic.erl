@@ -27,6 +27,7 @@
 %%%   <li>`{quic, ConnRef, {send_ready, StreamId}}' - Stream ready to write</li>
 %%%   <li>`{quic, ConnRef, {timer, NextTimeoutMs}}' - Timer notification</li>
 %%%   <li>`{quic, ConnRef, {datagram, Data}}' - Datagram received (RFC 9221)</li>
+%%%   <li>`{quic, ConnRef, {stream_deadline, StreamId}}' - Stream deadline expired</li>
 %%% </ul>
 %%%
 
@@ -60,6 +61,7 @@
     open_stream/1,
     open_unidirectional_stream/1,
     send_data/4,
+    send_data/5,
     reset_stream/3,
     stop_sending/3,
     handle_timeout/2,
@@ -75,6 +77,11 @@
     %% Stream prioritization (RFC 9218)
     set_stream_priority/4,
     get_stream_priority/2,
+    %% Stream deadlines
+    set_stream_deadline/3,
+    set_stream_deadline/4,
+    cancel_stream_deadline/2,
+    get_stream_deadline/2,
     %% Congestion/backpressure status
     get_send_queue_info/1,
     %% Connection statistics for liveness detection
@@ -219,6 +226,35 @@ send_data(ConnRef, StreamId, Data, Fin) when is_reference(ConnRef) ->
 send_data(ConnPid, StreamId, Data, Fin) when is_pid(ConnPid) ->
     quic_connection:send_data(ConnPid, StreamId, Data, Fin);
 send_data(_ConnRef, _StreamId, _Data, _Fin) ->
+    {error, badarg}.
+
+%% @doc Send data on a stream with a timeout.
+%% Fin indicates if this is the final frame on the stream.
+%% Timeout is in milliseconds; if the operation takes longer, returns {error, timeout}.
+-spec send_data(ConnRef, StreamId, Data, Fin, Timeout) -> ok | {error, term()} when
+    ConnRef :: reference() | pid(),
+    StreamId :: non_neg_integer(),
+    Data :: iodata(),
+    Fin :: boolean(),
+    Timeout :: timeout().
+send_data(ConnRef, StreamId, Data, Fin, Timeout) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} ->
+            try
+                gen_statem:call(Pid, {send_data, StreamId, Data, Fin}, Timeout)
+            catch
+                exit:{timeout, _} -> {error, timeout}
+            end;
+        error ->
+            {error, not_found}
+    end;
+send_data(ConnPid, StreamId, Data, Fin, Timeout) when is_pid(ConnPid) ->
+    try
+        gen_statem:call(ConnPid, {send_data, StreamId, Data, Fin}, Timeout)
+    catch
+        exit:{timeout, _} -> {error, timeout}
+    end;
+send_data(_ConnRef, _StreamId, _Data, _Fin, _Timeout) ->
     {error, badarg}.
 
 %% @doc Reset a stream with an error code.
@@ -421,6 +457,76 @@ get_stream_priority(ConnRef, StreamId) when is_reference(ConnRef) ->
 get_stream_priority(ConnPid, StreamId) when is_pid(ConnPid) ->
     quic_connection:get_stream_priority(ConnPid, StreamId);
 get_stream_priority(_ConnRef, _StreamId) ->
+    {error, badarg}.
+
+%% @doc Set a deadline for a stream.
+%% TimeoutMs is the number of milliseconds from now until the deadline expires.
+%% When the deadline expires, the stream will be reset and/or the owner will be notified.
+%% Default action is 'both' (notify + reset).
+-spec set_stream_deadline(ConnRef, StreamId, TimeoutMs) -> ok | {error, term()} when
+    ConnRef :: reference() | pid(),
+    StreamId :: non_neg_integer(),
+    TimeoutMs :: pos_integer().
+set_stream_deadline(ConnRef, StreamId, TimeoutMs) ->
+    set_stream_deadline(ConnRef, StreamId, TimeoutMs, #{}).
+
+%% @doc Set a deadline for a stream with options.
+%% TimeoutMs is the number of milliseconds from now until the deadline expires.
+%%
+%% Options:
+%% - `action': What to do when deadline expires:
+%%   - `notify': Send `{quic, ConnRef, {stream_deadline, StreamId}}' to owner
+%%   - `reset': Send RESET_STREAM and clean up
+%%   - `both' (default): Notify AND reset
+%% - `error_code': Error code for RESET_STREAM (default: 16#FF)
+-spec set_stream_deadline(ConnRef, StreamId, TimeoutMs, Opts) -> ok | {error, term()} when
+    ConnRef :: reference() | pid(),
+    StreamId :: non_neg_integer(),
+    TimeoutMs :: pos_integer(),
+    Opts :: #{action => reset | notify | both, error_code => non_neg_integer()}.
+set_stream_deadline(ConnRef, StreamId, TimeoutMs, Opts) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} ->
+            quic_connection:set_stream_deadline(Pid, StreamId, TimeoutMs, Opts);
+        error ->
+            {error, not_found}
+    end;
+set_stream_deadline(ConnPid, StreamId, TimeoutMs, Opts) when is_pid(ConnPid) ->
+    quic_connection:set_stream_deadline(ConnPid, StreamId, TimeoutMs, Opts);
+set_stream_deadline(_ConnRef, _StreamId, _TimeoutMs, _Opts) ->
+    {error, badarg}.
+
+%% @doc Cancel a stream deadline.
+%% Returns ok if the deadline was cancelled, or {error, not_found} if no deadline exists.
+-spec cancel_stream_deadline(ConnRef, StreamId) -> ok | {error, term()} when
+    ConnRef :: reference() | pid(),
+    StreamId :: non_neg_integer().
+cancel_stream_deadline(ConnRef, StreamId) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:cancel_stream_deadline(Pid, StreamId);
+        error -> {error, not_found}
+    end;
+cancel_stream_deadline(ConnPid, StreamId) when is_pid(ConnPid) ->
+    quic_connection:cancel_stream_deadline(ConnPid, StreamId);
+cancel_stream_deadline(_ConnRef, _StreamId) ->
+    {error, badarg}.
+
+%% @doc Get the remaining time for a stream deadline.
+%% Returns {ok, {RemainingMs, Action}} where RemainingMs is milliseconds until expiry.
+%% Returns {error, no_deadline} if no deadline is set.
+-spec get_stream_deadline(ConnRef, StreamId) ->
+    {ok, {non_neg_integer() | infinity, reset | notify | both}} | {error, term()}
+when
+    ConnRef :: reference() | pid(),
+    StreamId :: non_neg_integer().
+get_stream_deadline(ConnRef, StreamId) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:get_stream_deadline(Pid, StreamId);
+        error -> {error, not_found}
+    end;
+get_stream_deadline(ConnPid, StreamId) when is_pid(ConnPid) ->
+    quic_connection:get_stream_deadline(ConnPid, StreamId);
+get_stream_deadline(_ConnRef, _StreamId) ->
     {error, badarg}.
 
 %% @doc Get send queue information for a connection.

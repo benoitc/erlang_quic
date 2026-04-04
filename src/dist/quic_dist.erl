@@ -398,8 +398,8 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
                 idle_timeout => ?QUIC_DIST_IDLE_TIMEOUT,
                 %% QUIC-level keep-alive via PING frames (bypasses flow control)
                 keep_alive_interval => ?QUIC_DIST_KEEP_ALIVE_INTERVAL,
-                %% Use higher initial cwnd for distribution bulk transfers
-                initial_window => ?INITIAL_WINDOW_DISTRIBUTION,
+                %% Use aggressive initial cwnd for distribution bulk transfers
+                initial_window => ?INITIAL_WINDOW_AGGRESSIVE,
                 %% Keep a higher congestion floor to avoid liveness stalls
                 %% on bursty virtual networks (e.g., Docker bridge).
                 minimum_window => ?MINIMUM_WINDOW_DISTRIBUTION,
@@ -827,8 +827,8 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                 idle_timeout => ?QUIC_DIST_IDLE_TIMEOUT,
                 %% QUIC-level keep-alive via PING frames (bypasses flow control)
                 keep_alive_interval => ?QUIC_DIST_KEEP_ALIVE_INTERVAL,
-                %% Use higher initial cwnd for distribution bulk transfers
-                initial_window => ?INITIAL_WINDOW_DISTRIBUTION,
+                %% Use aggressive initial cwnd for distribution bulk transfers
+                initial_window => ?INITIAL_WINDOW_AGGRESSIVE,
                 %% Keep a higher congestion floor to avoid liveness stalls
                 %% on bursty virtual networks (e.g., Docker bridge).
                 minimum_window => ?MINIMUM_WINDOW_DISTRIBUTION,

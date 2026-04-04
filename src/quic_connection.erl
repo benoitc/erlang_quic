@@ -32,6 +32,7 @@
 -behaviour(gen_statem).
 
 -include("quic.hrl").
+-include("quic_qlog.hrl").
 -include_lib("kernel/include/logger.hrl").
 -define(QUIC_LOG_META, #{
     domain => [erlang_quic, connection], report_cb => fun quic_log:format_report/2
@@ -95,7 +96,11 @@
     start_server/1,
     %% Stream prioritization (RFC 9218)
     set_stream_priority/4,
-    get_stream_priority/2
+    get_stream_priority/2,
+    %% Stream deadlines
+    set_stream_deadline/4,
+    cancel_stream_deadline/2,
+    get_stream_deadline/2
 ]).
 
 %% gen_statem callbacks
@@ -347,7 +352,10 @@
     %% PMTU Discovery (RFC 8899)
     pmtu_state :: #pmtu_state{} | undefined,
     pmtu_probe_timer :: reference() | undefined,
-    pmtu_raise_timer :: reference() | undefined
+    pmtu_raise_timer :: reference() | undefined,
+
+    %% QLOG Tracing (draft-ietf-quic-qlog-quic-events)
+    qlog_ctx :: #qlog_ctx{} | undefined
 }).
 
 %%====================================================================
@@ -596,6 +604,25 @@ set_stream_priority(Conn, StreamId, Urgency, Incremental) ->
 get_stream_priority(Conn, StreamId) ->
     gen_statem:call(Conn, {get_stream_priority, StreamId}).
 
+%% @doc Set a deadline for a stream.
+%% TimeoutMs is milliseconds from now until expiry.
+%% Options: action => reset | notify | both, error_code => non_neg_integer()
+-spec set_stream_deadline(pid(), non_neg_integer(), pos_integer(), map()) ->
+    ok | {error, term()}.
+set_stream_deadline(Conn, StreamId, TimeoutMs, Opts) ->
+    gen_statem:call(Conn, {set_stream_deadline, StreamId, TimeoutMs, Opts}).
+
+%% @doc Cancel a stream deadline.
+-spec cancel_stream_deadline(pid(), non_neg_integer()) -> ok | {error, term()}.
+cancel_stream_deadline(Conn, StreamId) ->
+    gen_statem:call(Conn, {cancel_stream_deadline, StreamId}).
+
+%% @doc Get remaining time for a stream deadline.
+-spec get_stream_deadline(pid(), non_neg_integer()) ->
+    {ok, {non_neg_integer() | infinity, reset | notify | both}} | {error, term()}.
+get_stream_deadline(Conn, StreamId) ->
+    gen_statem:call(Conn, {get_stream_deadline, StreamId}).
+
 %%====================================================================
 %% gen_statem callbacks
 %%====================================================================
@@ -732,13 +759,18 @@ init({server, Opts}) ->
         cid_config = maps:get(cid_config, Opts, undefined),
         congestion_threshold = maps:get(congestion_threshold, Opts, 2),
         pacing_enabled = maps:get(pacing_enabled, Opts, true),
-        pmtu_state = init_pmtu_state(Opts)
+        pmtu_state = init_pmtu_state(Opts),
+        qlog_ctx = quic_qlog:new(Opts, InitialDCID, server)
     },
+
+    %% Emit qlog connection_started event
+    quic_qlog:connection_started(State#state.qlog_ctx),
 
     {ok, idle, State}.
 
 %% Build congestion control options from connection options.
 %% Supports:
+%%   - cc_algorithm: Congestion control algorithm (newreno | bbr, default: newreno)
 %%   - initial_window: Initial congestion window in bytes (default: RFC 9002 formula)
 %%                     Higher values improve bulk transfer throughput.
 %%                     Recommended for distribution: 65536 (64KB) or higher.
@@ -750,7 +782,20 @@ build_cc_opts(Opts) ->
     CCOpts = #{},
     CCOpts1 = maybe_add_cc_opt(initial_window, Opts, CCOpts),
     CCOpts2 = maybe_add_cc_opt(minimum_window, Opts, CCOpts1),
-    maybe_add_cc_opt(min_recovery_duration, Opts, CCOpts2).
+    CCOpts3 = maybe_add_cc_opt(min_recovery_duration, Opts, CCOpts2),
+    %% Pass max_udp_payload_size as max_datagram_size to CC
+    CCOpts4 =
+        case maps:find(max_udp_payload_size, Opts) of
+            {ok, Size} -> maps:put(max_datagram_size, Size, CCOpts3);
+            error -> CCOpts3
+        end,
+    %% Add algorithm selection (default: newreno)
+    case maps:find(cc_algorithm, Opts) of
+        {ok, Algo} when Algo =:= newreno; Algo =:= bbr ->
+            CCOpts4#{algorithm => Algo};
+        _ ->
+            CCOpts4
+    end.
 
 maybe_add_cc_opt(Key, Opts, CCOpts) ->
     case maps:find(Key, Opts) of
@@ -925,8 +970,12 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             end,
         congestion_threshold = maps:get(congestion_threshold, Opts, 2),
         pacing_enabled = maps:get(pacing_enabled, Opts, true),
-        pmtu_state = init_pmtu_state(Opts)
+        pmtu_state = init_pmtu_state(Opts),
+        qlog_ctx = quic_qlog:new(Opts, DCID, client)
     },
+
+    %% Emit qlog connection_started event
+    quic_qlog:connection_started(State#state.qlog_ctx),
 
     {ok, idle, State}.
 
@@ -940,7 +989,8 @@ terminate(
         idle_timer = IdleTimer,
         keep_alive_timer = KeepAliveTimer,
         pacing_timer = PacingTimer,
-        role = Role
+        role = Role,
+        qlog_ctx = QlogCtx
     } = State
 ) ->
     %% If we're not already draining/closed, try to send CONNECTION_CLOSE
@@ -974,6 +1024,8 @@ terminate(
         {client, S} when S =/= undefined -> gen_udp:close(S);
         _ -> ok
     end,
+    %% Close QLOG trace file
+    quic_qlog:close(QlogCtx),
     ok.
 
 code_change(_OldVsn, StateName, State, _Extra) ->
@@ -1251,6 +1303,28 @@ connected({call, From}, {get_stream_priority, StreamId}, State) ->
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
+%% Stream deadlines
+connected({call, From}, {set_stream_deadline, StreamId, TimeoutMs, Opts}, State) ->
+    case do_set_stream_deadline(StreamId, TimeoutMs, Opts, State) of
+        {ok, NewState} ->
+            {keep_state, NewState, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+connected({call, From}, {cancel_stream_deadline, StreamId}, State) ->
+    case do_cancel_stream_deadline(StreamId, State) of
+        {ok, NewState} ->
+            {keep_state, NewState, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+connected({call, From}, {get_stream_deadline, StreamId}, State) ->
+    case do_get_stream_deadline(StreamId, State) of
+        {ok, Result} ->
+            {keep_state, State, [{reply, From, {ok, Result}}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
 connected({call, From}, {setopts, _Opts}, State) ->
     {keep_state, State, [{reply, From, ok}]};
 connected(
@@ -1368,6 +1442,15 @@ connected(info, pmtu_raise_timeout, #state{pmtu_state = PMTUState} = State) ->
     },
     State2 = maybe_send_pmtu_probe(State1),
     {keep_state, State2};
+%% Handle stream deadline expiry
+connected(info, {stream_deadline, StreamId}, State) ->
+    case handle_stream_deadline_expired(StreamId, State) of
+        {ok, NewState} ->
+            {keep_state, NewState};
+        {error, _Reason} ->
+            %% Stream already closed or doesn't exist
+            {keep_state, State}
+    end;
 connected(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, connected, State).
 
@@ -1380,9 +1463,13 @@ draining(
         owner = Owner,
         conn_ref = Ref,
         close_reason = Reason,
-        loss_state = LossState
+        loss_state = LossState,
+        qlog_ctx = QlogCtx
     } = State
 ) ->
+    %% Emit qlog connection_closed event
+    quic_qlog:connection_closed(QlogCtx, close_reason_to_code(Reason), undefined),
+
     Owner ! {quic, Ref, {closed, Reason}},
     %% Start drain timer (3 * PTO per RFC 9000 Section 10.2)
     DrainTimeout =
@@ -1971,6 +2058,13 @@ send_initial_packet(Payload, State) ->
     %% Send
     gen_udp:send(Socket, IP, Port, PaddedPacket),
 
+    %% Emit qlog packet_sent event
+    quic_qlog:packet_sent(State#state.qlog_ctx, #{
+        packet_type => initial,
+        packet_number => PN,
+        length => byte_size(PaddedPacket)
+    }),
+
     %% Update packet number space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
     State#state{
@@ -2160,6 +2254,13 @@ send_handshake_packet(Payload, State) ->
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     gen_udp:send(Socket, IP, Port, Packet),
 
+    %% Emit qlog packet_sent event
+    quic_qlog:packet_sent(State#state.qlog_ctx, #{
+        packet_type => handshake,
+        packet_number => PN,
+        length => byte_size(Packet)
+    }),
+
     %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
     State#state{
@@ -2237,6 +2338,14 @@ send_app_packet_internal(Payload, Frames, State) ->
     %% Handle send result - only track packet and update state if send succeeded
     case SendResult of
         ok ->
+            %% Emit qlog packet_sent event
+            quic_qlog:packet_sent(State#state.qlog_ctx, #{
+                packet_type => one_rtt,
+                packet_number => PN,
+                length => PacketSize,
+                frames => Frames
+            }),
+
             %% Track sent packet for loss detection and congestion control
             %% Determine if ack-eliciting by checking the actual frames list
             %% This properly handles coalesced packets with multiple frames
@@ -2319,6 +2428,12 @@ handle_packet_loop(<<>>, #state{role = server} = State) ->
 handle_packet_loop(Data, State) ->
     case decode_and_decrypt_packet(Data, State) of
         {ok, Type, Frames, RemainingData, NewState} ->
+            %% Emit qlog packet_received event
+            quic_qlog:packet_received(NewState#state.qlog_ctx, #{
+                packet_type => Type,
+                frames => Frames
+            }),
+
             %% Increment packet counter for liveness detection
             %% Any successfully decrypted packet proves peer is alive
             NewState1 = NewState#state{
@@ -2326,6 +2441,10 @@ handle_packet_loop(Data, State) ->
             },
             %% Process frames from this packet
             State1 = process_frames_noreenbl(Type, Frames, NewState1),
+
+            %% Emit qlog frames_processed event
+            quic_qlog:frames_processed(State1#state.qlog_ctx, Frames),
+
             %% Send ACK if packet contained ack-eliciting frames
             State2 = maybe_send_ack(Type, Frames, State1),
             %% Continue with remaining coalesced packets
@@ -2909,6 +3028,28 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                         loss_state = NewLossState,
                         cc_state = CCState6
                     },
+
+                    %% Emit qlog packets_acked event
+                    AckedPNs = [P#sent_packet.pn || P <- AckedPackets],
+                    RTTSample =
+                        case AckedPackets of
+                            [] -> undefined;
+                            _ -> Now - LargestAckedSentTime
+                        end,
+                    quic_qlog:packets_acked(State1#state.qlog_ctx, AckedPNs, #{
+                        rtt_sample => RTTSample
+                    }),
+
+                    %% Emit qlog packet_lost events
+                    lists:foreach(
+                        fun(#sent_packet{pn = LostPN}) ->
+                            quic_qlog:packet_lost(State1#state.qlog_ctx, #{
+                                packet_number => LostPN,
+                                reason => timeout
+                            })
+                        end,
+                        LostPackets
+                    ),
 
                     %% Handle PMTU probe ACKs
                     State2 = lists:foldl(
@@ -4208,30 +4349,51 @@ check_state_transition(CurrentState, State) ->
     case State#state.close_reason of
         connection_closed ->
             %% Peer sent CONNECTION_CLOSE, transition to draining
+            emit_qlog_state_change(CurrentState, draining, State),
             {next_state, draining, State};
         stateless_reset ->
             %% Received stateless reset, transition to draining
+            emit_qlog_state_change(CurrentState, draining, State),
             {next_state, draining, State};
         _ ->
             %% Check for TLS handshake state transitions
             case {CurrentState, State#state.tls_state, has_app_keys(State)} of
                 {idle, ?TLS_AWAITING_ENCRYPTED_EXT, _} ->
                     %% Got ServerHello, have handshake keys
+                    emit_qlog_state_change(idle, handshaking, State),
                     {next_state, handshaking, State};
                 {idle, ?TLS_AWAITING_CERT, _} ->
+                    emit_qlog_state_change(idle, handshaking, State),
                     {next_state, handshaking, State};
                 {idle, ?TLS_AWAITING_CERT_VERIFY, _} ->
+                    emit_qlog_state_change(idle, handshaking, State),
                     {next_state, handshaking, State};
                 {idle, ?TLS_AWAITING_FINISHED, _} ->
+                    emit_qlog_state_change(idle, handshaking, State),
                     {next_state, handshaking, State};
                 {idle, ?TLS_HANDSHAKE_COMPLETE, true} ->
+                    emit_qlog_state_change(idle, connected, State),
                     {next_state, connected, State};
                 {handshaking, ?TLS_HANDSHAKE_COMPLETE, true} ->
+                    emit_qlog_state_change(handshaking, connected, State),
                     {next_state, connected, State};
                 _ ->
                     {keep_state, State}
             end
     end.
+
+%% Helper to emit qlog connection_state_updated event
+emit_qlog_state_change(OldState, NewState, #state{qlog_ctx = Ctx}) ->
+    quic_qlog:connection_state_updated(Ctx, OldState, NewState).
+
+%% Convert close reason to error code for qlog
+close_reason_to_code(connection_closed) -> 0;
+close_reason_to_code(stateless_reset) -> stateless_reset;
+close_reason_to_code(idle_timeout) -> idle_timeout;
+close_reason_to_code({error, Code}) when is_integer(Code) -> Code;
+close_reason_to_code({application_error, Code, _}) when is_integer(Code) -> Code;
+close_reason_to_code(Reason) when is_atom(Reason) -> Reason;
+close_reason_to_code(_) -> unknown.
 
 has_app_keys(#state{app_keys = undefined}) -> false;
 has_app_keys(_) -> true.
@@ -5121,6 +5283,11 @@ send_pending_data([{StreamId, Data, Fin} | Rest], State) ->
 do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, StreamState} ->
+            %% Cancel deadline timer if any
+            case StreamState#stream_state.deadline_timer of
+                undefined -> ok;
+                Timer -> erlang:cancel_timer(Timer)
+            end,
             %% Send RESET_STREAM frame
             FinalSize = StreamState#stream_state.send_offset,
             ResetFrame = quic_frame:encode({reset_stream, StreamId, ErrorCode, FinalSize}),
@@ -5168,6 +5335,139 @@ do_get_stream_priority(StreamId, #state{streams = Streams}) ->
     case maps:find(StreamId, Streams) of
         {ok, StreamState} ->
             {ok, {StreamState#stream_state.urgency, StreamState#stream_state.incremental}};
+        error ->
+            {error, unknown_stream}
+    end.
+
+%% Set stream deadline
+do_set_stream_deadline(StreamId, TimeoutMs, Opts, #state{streams = Streams} = State) when
+    is_integer(TimeoutMs), TimeoutMs > 0
+->
+    case maps:find(StreamId, Streams) of
+        {ok, StreamState} ->
+            %% Cancel existing deadline timer if any
+            case StreamState#stream_state.deadline_timer of
+                undefined -> ok;
+                OldTimer -> erlang:cancel_timer(OldTimer)
+            end,
+            %% Calculate absolute deadline
+            Now = erlang:system_time(millisecond),
+            Deadline = Now + TimeoutMs,
+            %% Parse options
+            Action = maps:get(action, Opts, both),
+            ErrorCode = maps:get(error_code, Opts, ?QUIC_STREAM_DEADLINE_EXCEEDED),
+            %% Start new timer
+            TimerRef = erlang:send_after(TimeoutMs, self(), {stream_deadline, StreamId}),
+            NewStreamState = StreamState#stream_state{
+                deadline = Deadline,
+                deadline_timer = TimerRef,
+                deadline_action = Action,
+                deadline_error_code = ErrorCode
+            },
+            {ok, State#state{
+                streams = maps:put(StreamId, NewStreamState, Streams)
+            }};
+        error ->
+            {error, unknown_stream}
+    end;
+do_set_stream_deadline(_StreamId, _TimeoutMs, _Opts, _State) ->
+    {error, invalid_timeout}.
+
+%% Cancel stream deadline
+do_cancel_stream_deadline(StreamId, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, StreamState} ->
+            %% Cancel timer if exists
+            case StreamState#stream_state.deadline_timer of
+                undefined -> ok;
+                Timer -> erlang:cancel_timer(Timer)
+            end,
+            NewStreamState = StreamState#stream_state{
+                deadline = undefined,
+                deadline_timer = undefined
+            },
+            {ok, State#state{
+                streams = maps:put(StreamId, NewStreamState, Streams)
+            }};
+        error ->
+            {error, unknown_stream}
+    end.
+
+%% Get stream deadline info
+do_get_stream_deadline(StreamId, #state{streams = Streams}) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream_state{deadline = undefined}} ->
+            {error, no_deadline};
+        {ok, #stream_state{deadline = infinity, deadline_action = Action}} ->
+            {ok, {infinity, Action}};
+        {ok, #stream_state{deadline = Deadline, deadline_action = Action}} ->
+            Now = erlang:system_time(millisecond),
+            Remaining = max(0, Deadline - Now),
+            {ok, {Remaining, Action}};
+        error ->
+            {error, unknown_stream}
+    end.
+
+%% Handle stream deadline expiration
+handle_stream_deadline_expired(
+    StreamId,
+    #state{
+        streams = Streams,
+        owner = Owner,
+        conn_ref = Ref
+    } = State
+) ->
+    case maps:find(StreamId, Streams) of
+        {ok,
+            #stream_state{
+                deadline_action = Action,
+                deadline_error_code = ErrorCode,
+                state = StreamState
+            } = Stream} when StreamState =/= closed, StreamState =/= reset ->
+            %% Clear the deadline timer from stream state
+            Stream1 = Stream#stream_state{
+                deadline = undefined,
+                deadline_timer = undefined
+            },
+            Streams1 = maps:put(StreamId, Stream1, Streams),
+            State1 = State#state{streams = Streams1},
+            %% Notify owner if requested
+            case Action of
+                notify ->
+                    Owner ! {quic, Ref, {stream_deadline, StreamId}},
+                    {ok, State1};
+                reset ->
+                    do_close_stream_deadline(StreamId, ErrorCode, State1);
+                both ->
+                    Owner ! {quic, Ref, {stream_deadline, StreamId}},
+                    do_close_stream_deadline(StreamId, ErrorCode, State1)
+            end;
+        {ok, _ClosedStream} ->
+            %% Stream already closed
+            {error, stream_closed};
+        error ->
+            %% Stream doesn't exist
+            {error, unknown_stream}
+    end.
+
+%% Close stream due to deadline expiry (sends RESET_STREAM)
+do_close_stream_deadline(StreamId, ErrorCode, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, StreamState} ->
+            %% Send RESET_STREAM frame
+            FinalSize = StreamState#stream_state.send_offset,
+            ResetFrame = quic_frame:encode({reset_stream, StreamId, ErrorCode, FinalSize}),
+            NewState = send_app_packet(ResetFrame, State),
+            %% Mark stream as reset but keep in map for cleanup
+            NewStreamState = StreamState#stream_state{
+                state = reset,
+                send_buffer = [],
+                deadline = undefined,
+                deadline_timer = undefined
+            },
+            {ok, NewState#state{
+                streams = maps:put(StreamId, NewStreamState, Streams)
+            }};
         error ->
             {error, unknown_stream}
     end.
