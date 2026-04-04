@@ -145,7 +145,8 @@ get_fd(Socket) ->
 %%
 %% Options:
 %% <ul>
-%%   <li>`socket_fd' - Use an existing UDP socket FD (see `get_fd/1')</li>
+%%   <li>`socket' - Use an existing UDP socket (gen_udp:socket())</li>
+%%   <li>`extra_socket_opts' - Options for socket creation (e.g., [{ip, Addr}])</li>
 %%   <li>`verify' - Verify server certificate (default: false)</li>
 %%   <li>`alpn' - ALPN protocols (default: [&lt;&lt;"h3"&gt;&gt;])</li>
 %%   <li>`server_name' - Server Name Indication (default: Host)</li>
@@ -165,7 +166,9 @@ connect(Host, Port, Opts, Owner) when
     is_map(Opts),
     is_pid(Owner)
 ->
-    case quic_connection:start_link(Host, Port, Opts, Owner) of
+    %% Extract socket option for pre-opened socket support
+    Socket = maps:get(socket, Opts, undefined),
+    case quic_connection:start_link(Host, Port, Opts, Owner, Socket) of
         {ok, Pid} ->
             ConnRef = gen_statem:call(Pid, get_ref),
             {ok, ConnRef};

@@ -62,6 +62,13 @@ quic:close(ConnRef, normal).
 |--------|------|---------|-------------|
 | `max_datagram_frame_size` | integer | 0 | Max datagram size (0 = disabled) |
 
+### Socket Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `socket` | gen_udp:socket() | - | Pre-opened UDP socket |
+| `extra_socket_opts` | list() | `[]` | Options for socket creation |
+
 ### Advanced Options
 
 | Option | Type | Default | Description |
@@ -176,6 +183,24 @@ ok = quic:migrate(ConnRef).
 %% 2. Send PATH_CHALLENGE to peer
 %% 3. Wait for PATH_RESPONSE
 %% 4. Reset congestion controller for new path
+```
+
+### Socket Binding
+
+```erlang
+%% Bind to a specific local IP using extra_socket_opts
+{ok, ConnRef} = quic:connect(Host, Port, #{
+    extra_socket_opts => [{ip, {192,168,1,10}}]
+}, self()).
+
+%% Use a pre-opened socket for full control
+{ok, Sock} = gen_udp:open(0, [binary, inet, {ip, {192,168,1,10}}]),
+{ok, ConnRef} = quic:connect(Host, Port, #{
+    socket => Sock
+}, self()).
+
+%% Note: When using socket option, the connection does not own the socket.
+%% You must close it yourself after the connection terminates.
 ```
 
 ### 0-RTT Session Resumption
