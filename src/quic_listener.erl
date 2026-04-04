@@ -141,12 +141,19 @@ init({Port, Opts}) ->
     ReusePort = maps:get(reuseport, Opts, false),
     ExtraFlags = maps:get(extra_socket_opts, Opts, []),
 
+    %% UDP buffer sizing - larger buffers improve throughput significantly
+    %% OS may cap to lower values (check sysctl net.core.rmem_max on Linux)
+    RecBuf = maps:get(recbuf, Opts, ?DEFAULT_UDP_RECBUF),
+    SndBuf = maps:get(sndbuf, Opts, ?DEFAULT_UDP_SNDBUF),
+
     SocketOpts =
         [
             binary,
             inet,
             {active, ActiveN},
-            {reuseaddr, true}
+            {reuseaddr, true},
+            {recbuf, RecBuf},
+            {sndbuf, SndBuf}
         ] ++
             case ReusePort of
                 true -> [{reuseport, true}, {reuseport_lb, true}];

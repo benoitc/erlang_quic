@@ -57,6 +57,7 @@
 
 -export([
     connect/4,
+    close/1,
     close/2,
     open_stream/1,
     open_unidirectional_stream/1,
@@ -177,7 +178,13 @@ connect(Host, Port, Opts, Owner) when
 connect(_Host, _Port, _Opts, _Owner) ->
     {error, badarg}.
 
-%% @doc Close a QUIC connection.
+%% @doc Close a QUIC connection with normal reason.
+-spec close(Conn) -> ok when
+    Conn :: pid().
+close(Conn) when is_pid(Conn) ->
+    close(Conn, normal).
+
+%% @doc Close a QUIC connection with specified reason.
 -spec close(Conn, Reason) -> ok when
     Conn :: pid(),
     Reason :: term().

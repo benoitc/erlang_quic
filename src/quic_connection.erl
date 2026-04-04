@@ -604,7 +604,7 @@ init([Host, Port, Opts, Owner, Socket]) ->
     %% Pass RemoteAddr to match address family (IPv4 vs IPv6)
     %% Extra socket opts allow binding to specific address (fix for #28)
     ExtraOpts = maps:get(extra_socket_opts, Opts, []),
-    case open_client_socket(Socket, RemoteAddr, ExtraOpts) of
+    case open_client_socket(Socket, RemoteAddr, Opts, ExtraOpts) of
         {ok, Sock, LocalAddr, OwnsSocket} ->
             try
                 init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr)
@@ -817,10 +817,19 @@ build_server_preferred_address(Opts) ->
 
 %% Helper to open or use provided socket for client
 %% Match address family based on the remote address
-%% ExtraOpts allows passing socket options like {ip, Address} for binding
-open_client_socket(undefined, {IP, _Port}, ExtraOpts) ->
+%% Opts is the full options map, ExtraOpts allows socket options like {ip, Address}
+open_client_socket(undefined, {IP, _Port}, Opts, ExtraOpts) ->
     AddrFamily = address_family(IP),
-    BaseOpts = [binary, AddrFamily, {active, false}],
+    %% UDP buffer sizing - larger buffers improve throughput significantly
+    RecBuf = maps:get(recbuf, Opts, ?DEFAULT_UDP_RECBUF),
+    SndBuf = maps:get(sndbuf, Opts, ?DEFAULT_UDP_SNDBUF),
+    BaseOpts = [
+        binary,
+        AddrFamily,
+        {active, false},
+        {recbuf, RecBuf},
+        {sndbuf, SndBuf}
+    ],
     case gen_udp:open(0, BaseOpts ++ ExtraOpts) of
         {ok, S} ->
             case inet:sockname(S) of
@@ -833,7 +842,7 @@ open_client_socket(undefined, {IP, _Port}, ExtraOpts) ->
         {error, Reason} ->
             {error, Reason}
     end;
-open_client_socket(S, _RemoteAddr, _ExtraOpts) ->
+open_client_socket(S, _RemoteAddr, _Opts, _ExtraOpts) ->
     %% Pre-opened socket provided, ignore extra opts
     case inet:sockname(S) of
         {ok, LA} -> {ok, S, LA, false};

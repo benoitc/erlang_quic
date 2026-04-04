@@ -324,3 +324,59 @@ echo_loop(ConnPid) ->
 2. Tune `max_streams_*` limits
 3. Consider enabling BBR congestion control (if available)
 4. Use QLOG to identify bottlenecks
+5. Check UDP buffer sizes (see Performance Tuning below)
+
+## Performance Tuning
+
+### UDP Buffer Sizing
+
+QUIC performance depends heavily on UDP socket buffer sizes. By default, erlang_quic requests 7MB buffers (matching quic-go, quiche, lsquic). Undersized buffers can reduce throughput by 40%+.
+
+**Check actual buffer sizes:**
+```erlang
+%% After starting a server
+{ok, Socket} = gen_udp:open(0, [{recbuf, 7340032}, {sndbuf, 7340032}]),
+{ok, Opts} = inet:getopts(Socket, [recbuf, sndbuf]),
+io:format("Actual buffers: ~p~n", [Opts]).
+```
+
+**Linux: Increase system limits**
+```bash
+# Check current limits
+sysctl net.core.rmem_max
+sysctl net.core.wmem_max
+
+# Increase to 7MB (requires root)
+sudo sysctl -w net.core.rmem_max=7340032
+sudo sysctl -w net.core.wmem_max=7340032
+
+# Make persistent in /etc/sysctl.conf
+echo "net.core.rmem_max=7340032" | sudo tee -a /etc/sysctl.conf
+echo "net.core.wmem_max=7340032" | sudo tee -a /etc/sysctl.conf
+```
+
+**macOS: System limits**
+macOS typically caps UDP buffers at 2-4MB. While lower than Linux, this is still much better than the ~128KB defaults.
+
+**Custom buffer sizes:**
+```erlang
+%% Server with custom buffers
+quic:start_server(my_server, 4433, #{
+    cert => Cert,
+    key => Key,
+    recbuf => 4194304,  % 4MB
+    sndbuf => 4194304
+}).
+
+%% Client with custom buffers
+quic:connect("example.com", 4433, #{
+    recbuf => 4194304,
+    sndbuf => 4194304
+}).
+```
+
+**Benchmark buffer impact:**
+```erlang
+%% Compare different buffer sizes
+quic_throughput_bench:compare_buffer_sizes().
+```
