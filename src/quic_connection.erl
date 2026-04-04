@@ -655,7 +655,9 @@ init([Host, Port, Opts, Owner, Socket]) ->
 
     %% Create or use provided socket with proper cleanup on failure
     %% Pass RemoteAddr to match address family (IPv4 vs IPv6)
-    case open_client_socket(Socket, RemoteAddr) of
+    %% Extra socket opts allow binding to specific address (fix for #28)
+    ExtraOpts = maps:get(extra_socket_opts, Opts, []),
+    case open_client_socket(Socket, RemoteAddr, ExtraOpts) of
         {ok, Sock, LocalAddr, OwnsSocket} ->
             try
                 init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr)
@@ -716,6 +718,13 @@ init({server, Opts}) ->
     %% Get idle timeout for keep-alive calculation
     IdleTimeout = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
 
+    %% Query local address from socket (fix for #27)
+    LocalAddr =
+        case inet:sockname(Socket) of
+            {ok, Sockname} -> Sockname;
+            {error, _} -> undefined
+        end,
+
     %% Initialize state
     State = #state{
         scid = SCID,
@@ -727,7 +736,7 @@ init({server, Opts}) ->
         version = Version,
         socket = Socket,
         remote_addr = RemoteAddr,
-        local_addr = undefined,
+        local_addr = LocalAddr,
         % Listener is the owner for now
         owner = Listener,
         conn_ref = ConnRef,
@@ -862,9 +871,11 @@ build_server_preferred_address(Opts) ->
 
 %% Helper to open or use provided socket for client
 %% Match address family based on the remote address
-open_client_socket(undefined, {IP, _Port}) ->
+%% ExtraOpts allows passing socket options like {ip, Address} for binding
+open_client_socket(undefined, {IP, _Port}, ExtraOpts) ->
     AddrFamily = address_family(IP),
-    case gen_udp:open(0, [binary, AddrFamily, {active, false}]) of
+    BaseOpts = [binary, AddrFamily, {active, false}],
+    case gen_udp:open(0, BaseOpts ++ ExtraOpts) of
         {ok, S} ->
             case inet:sockname(S) of
                 {ok, LA} ->
@@ -876,7 +887,8 @@ open_client_socket(undefined, {IP, _Port}) ->
         {error, Reason} ->
             {error, Reason}
     end;
-open_client_socket(S, _RemoteAddr) ->
+open_client_socket(S, _RemoteAddr, _ExtraOpts) ->
+    %% Pre-opened socket provided, ignore extra opts
     case inet:sockname(S) of
         {ok, LA} -> {ok, S, LA, false};
         {error, Reason} -> {error, Reason}
