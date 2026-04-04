@@ -114,11 +114,11 @@ download_file(TestCase, Url, DownloadsDir) ->
 
             %% Connect
             case quic:connect(Host, Port, Opts, self()) of
-                {ok, ConnRef} ->
+                {ok, Conn} ->
                     Result = wait_for_connection_and_download(
-                        ConnRef, Path, DownloadsDir, TestCase
+                        Conn, Path, DownloadsDir, TestCase
                     ),
-                    quic:close(ConnRef, normal),
+                    quic:close(Conn, normal),
                     Result;
                 {error, Reason} ->
                     io:format("Connection failed: ~p~n", [Reason]),
@@ -158,38 +158,35 @@ build_opts(_) ->
         alpn => [<<"hq-interop">>, <<"h3">>]
     }.
 
-wait_for_connection_and_download(ConnRef, Path, DownloadsDir, TestCase) ->
+wait_for_connection_and_download(Conn, Path, DownloadsDir, TestCase) ->
     receive
-        {quic, ConnRef, {connected, _Info}} ->
+        {quic, Conn, {connected, _Info}} ->
             io:format("Connected~n"),
 
             %% Handle key update test case
             case TestCase of
                 "keyupdate" ->
                     %% Initiate key update before request
-                    case quic_connection:lookup(ConnRef) of
-                        {ok, Pid} -> quic_connection:key_update(Pid);
-                        _ -> ok
-                    end;
+                    quic_connection:key_update(Conn);
                 _ ->
                     ok
             end,
 
             %% Open stream and send request
-            case quic:open_stream(ConnRef) of
+            case quic:open_stream(Conn) of
                 {ok, StreamId} ->
                     %% Send HTTP/0.9 style request (for hq-interop)
                     Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
-                    ok = quic:send_data(ConnRef, StreamId, Request, true),
-                    receive_and_save(ConnRef, StreamId, Path, DownloadsDir);
+                    ok = quic:send_data(Conn, StreamId, Request, true),
+                    receive_and_save(Conn, StreamId, Path, DownloadsDir);
                 {error, StreamErr} ->
                     io:format("Failed to open stream: ~p~n", [StreamErr]),
                     error
             end;
-        {quic, ConnRef, {closed, Reason}} ->
+        {quic, Conn, {closed, Reason}} ->
             io:format("Connection closed: ~p~n", [Reason]),
             error;
-        {quic, ConnRef, {transport_error, Code, Msg}} ->
+        {quic, Conn, {transport_error, Code, Msg}} ->
             io:format("Transport error: ~p ~p~n", [Code, Msg]),
             error
     after 30000 ->
@@ -197,14 +194,14 @@ wait_for_connection_and_download(ConnRef, Path, DownloadsDir, TestCase) ->
         error
     end.
 
-receive_and_save(ConnRef, StreamId, Path, DownloadsDir) ->
+receive_and_save(Conn, StreamId, Path, DownloadsDir) ->
     %% Extract filename and open file for streaming writes
     Filename = filename:basename(Path),
     FilePath = filename:join(DownloadsDir, Filename),
 
     case file:open(FilePath, [write, binary, raw]) of
         {ok, FileHandle} ->
-            Result = receive_stream_data_streaming(ConnRef, StreamId, FileHandle, 0, 60000),
+            Result = receive_stream_data_streaming(Conn, StreamId, FileHandle, 0, 60000),
             file:close(FileHandle),
             case Result of
                 {ok, BytesWritten} ->
@@ -221,9 +218,9 @@ receive_and_save(ConnRef, StreamId, Path, DownloadsDir) ->
     end.
 
 %% Streaming version: write chunks to disk as they arrive (memory efficient for large files)
-receive_stream_data_streaming(ConnRef, StreamId, FileHandle, BytesWritten, Timeout) ->
+receive_stream_data_streaming(Conn, StreamId, FileHandle, BytesWritten, Timeout) ->
     receive
-        {quic, ConnRef, {stream_data, StreamId, Data, Fin}} ->
+        {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
             case file:write(FileHandle, Data) of
                 ok ->
                     NewBytesWritten = BytesWritten + byte_size(Data),
@@ -232,17 +229,17 @@ receive_stream_data_streaming(ConnRef, StreamId, FileHandle, BytesWritten, Timeo
                             {ok, NewBytesWritten};
                         false ->
                             receive_stream_data_streaming(
-                                ConnRef, StreamId, FileHandle, NewBytesWritten, Timeout
+                                Conn, StreamId, FileHandle, NewBytesWritten, Timeout
                             )
                     end;
                 {error, WriteErr} ->
                     io:format("Write error: ~p~n", [WriteErr]),
                     error
             end;
-        {quic, ConnRef, {stream_reset, StreamId, _Code}} ->
+        {quic, Conn, {stream_reset, StreamId, _Code}} ->
             io:format("Stream reset~n"),
             error;
-        {quic, ConnRef, {closed, _Reason}} ->
+        {quic, Conn, {closed, _Reason}} ->
             %% Connection closed, return what we have
             case BytesWritten of
                 0 -> error;
@@ -325,9 +322,9 @@ resumption_phase1(Host, Port, Path, DownloadsDir) ->
         alpn => [<<"hq-interop">>, <<"h3">>]
     },
     case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
-            Result = wait_for_ticket_and_download(ConnRef, Path, DownloadsDir),
-            quic:close(ConnRef, normal),
+        {ok, Conn} ->
+            Result = wait_for_ticket_and_download(Conn, Path, DownloadsDir),
+            quic:close(Conn, normal),
             Result;
         {error, Reason} ->
             io:format("Phase 1 connection failed: ~p~n", [Reason]),
@@ -335,21 +332,21 @@ resumption_phase1(Host, Port, Path, DownloadsDir) ->
     end.
 
 %% Wait for connection, download, and capture session ticket
-wait_for_ticket_and_download(ConnRef, Path, DownloadsDir) ->
+wait_for_ticket_and_download(Conn, Path, DownloadsDir) ->
     receive
-        {quic, ConnRef, {connected, _Info}} ->
+        {quic, Conn, {connected, _Info}} ->
             io:format("Phase 1: Connected~n"),
-            case quic:open_stream(ConnRef) of
+            case quic:open_stream(Conn) of
                 {ok, StreamId} ->
                     Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
-                    ok = quic:send_data(ConnRef, StreamId, Request, true),
+                    ok = quic:send_data(Conn, StreamId, Request, true),
                     %% Download and wait for ticket
-                    download_and_wait_for_ticket(ConnRef, StreamId, Path, DownloadsDir, undefined);
+                    download_and_wait_for_ticket(Conn, StreamId, Path, DownloadsDir, undefined);
                 {error, Err} ->
                     io:format("Failed to open stream: ~p~n", [Err]),
                     error
             end;
-        {quic, ConnRef, {closed, Reason}} ->
+        {quic, Conn, {closed, Reason}} ->
             io:format("Phase 1: Connection closed: ~p~n", [Reason]),
             error
     after 30000 ->
@@ -358,9 +355,9 @@ wait_for_ticket_and_download(ConnRef, Path, DownloadsDir) ->
     end.
 
 %% Download file and wait for session ticket
-download_and_wait_for_ticket(ConnRef, StreamId, Path, DownloadsDir, Ticket) ->
+download_and_wait_for_ticket(Conn, StreamId, Path, DownloadsDir, Ticket) ->
     receive
-        {quic, ConnRef, {stream_data, StreamId, Data, Fin}} ->
+        {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
             %% Accumulate data (could use streaming, but for resumption test this is fine)
             case Fin of
                 true ->
@@ -371,16 +368,16 @@ download_and_wait_for_ticket(ConnRef, StreamId, Path, DownloadsDir, Ticket) ->
                     io:format("Phase 1: Downloaded ~s~n", [FilePath]),
                     %% Continue waiting for ticket if we don't have one yet
                     case Ticket of
-                        undefined -> wait_for_ticket_only(ConnRef, 5000);
+                        undefined -> wait_for_ticket_only(Conn, 5000);
                         _ -> {ok, Ticket}
                     end;
                 false ->
-                    download_and_wait_for_ticket(ConnRef, StreamId, Path, DownloadsDir, Ticket)
+                    download_and_wait_for_ticket(Conn, StreamId, Path, DownloadsDir, Ticket)
             end;
-        {quic, ConnRef, {session_ticket, NewTicket}} ->
+        {quic, Conn, {session_ticket, NewTicket}} ->
             io:format("Phase 1: Received session ticket~n"),
-            download_and_wait_for_ticket(ConnRef, StreamId, Path, DownloadsDir, NewTicket);
-        {quic, ConnRef, {closed, _Reason}} ->
+            download_and_wait_for_ticket(Conn, StreamId, Path, DownloadsDir, NewTicket);
+        {quic, Conn, {closed, _Reason}} ->
             case Ticket of
                 undefined -> error;
                 _ -> {ok, Ticket}
@@ -394,12 +391,12 @@ download_and_wait_for_ticket(ConnRef, StreamId, Path, DownloadsDir, Ticket) ->
     end.
 
 %% Wait only for a session ticket (after download is complete)
-wait_for_ticket_only(ConnRef, Timeout) ->
+wait_for_ticket_only(Conn, Timeout) ->
     receive
-        {quic, ConnRef, {session_ticket, Ticket}} ->
+        {quic, Conn, {session_ticket, Ticket}} ->
             io:format("Received session ticket~n"),
             {ok, Ticket};
-        {quic, ConnRef, {closed, _Reason}} ->
+        {quic, Conn, {closed, _Reason}} ->
             io:format("Connection closed before ticket received~n"),
             error
     after Timeout ->
@@ -415,9 +412,9 @@ resumption_phase2(Host, Port, Path, DownloadsDir, Ticket) ->
         session_ticket => Ticket
     },
     case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
-            Result = wait_for_connection_and_download(ConnRef, Path, DownloadsDir, "resumption"),
-            quic:close(ConnRef, normal),
+        {ok, Conn} ->
+            Result = wait_for_connection_and_download(Conn, Path, DownloadsDir, "resumption"),
+            quic:close(Conn, normal),
             Result;
         {error, Reason} ->
             io:format("Phase 2 connection failed: ~p~n", [Reason]),
@@ -504,25 +501,25 @@ zerortt_with_ticket(Host, Port, Path, DownloadsDir, Ticket) ->
         enable_early_data => true
     },
     case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
+        {ok, Conn} ->
             %% Open stream and send request immediately (uses 0-RTT if available)
-            case quic:open_stream(ConnRef) of
+            case quic:open_stream(Conn) of
                 {ok, StreamId} ->
                     Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
                     io:format("Sending 0-RTT request~n"),
-                    ok = quic:send_data(ConnRef, StreamId, Request, true),
-                    Result = wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir),
-                    quic:close(ConnRef, normal),
+                    ok = quic:send_data(Conn, StreamId, Request, true),
+                    Result = wait_for_zerortt_response(Conn, StreamId, Path, DownloadsDir),
+                    quic:close(Conn, normal),
                     Result;
                 {error, not_connected} ->
                     %% Early keys not available, fall back to waiting for connection
                     io:format("0-RTT: Early keys not available, waiting for connection~n"),
-                    Result = wait_for_connection_then_request(ConnRef, Path, DownloadsDir),
-                    quic:close(ConnRef, normal),
+                    Result = wait_for_connection_then_request(Conn, Path, DownloadsDir),
+                    quic:close(Conn, normal),
                     Result;
                 {error, Err} ->
                     io:format("Failed to open stream: ~p~n", [Err]),
-                    quic:close(ConnRef, normal),
+                    quic:close(Conn, normal),
                     error
             end;
         {error, Reason} ->
@@ -531,20 +528,20 @@ zerortt_with_ticket(Host, Port, Path, DownloadsDir, Ticket) ->
     end.
 
 %% Fallback: wait for connection then send request
-wait_for_connection_then_request(ConnRef, Path, DownloadsDir) ->
+wait_for_connection_then_request(Conn, Path, DownloadsDir) ->
     receive
-        {quic, ConnRef, {connected, _Info}} ->
+        {quic, Conn, {connected, _Info}} ->
             io:format("0-RTT: Connected (fallback to 1-RTT)~n"),
-            case quic:open_stream(ConnRef) of
+            case quic:open_stream(Conn) of
                 {ok, StreamId} ->
                     Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
-                    ok = quic:send_data(ConnRef, StreamId, Request, true),
-                    wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir);
+                    ok = quic:send_data(Conn, StreamId, Request, true),
+                    wait_for_zerortt_response(Conn, StreamId, Path, DownloadsDir);
                 {error, Err} ->
                     io:format("Failed to open stream: ~p~n", [Err]),
                     error
             end;
-        {quic, ConnRef, {closed, Reason}} ->
+        {quic, Conn, {closed, Reason}} ->
             io:format("0-RTT: Connection closed: ~p~n", [Reason]),
             error
     after 30000 ->
@@ -553,10 +550,10 @@ wait_for_connection_then_request(ConnRef, Path, DownloadsDir) ->
     end.
 
 %% Wait for 0-RTT response (may receive before or after connected event)
-wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir) ->
-    wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir, false, false, <<>>).
+wait_for_zerortt_response(Conn, StreamId, Path, DownloadsDir) ->
+    wait_for_zerortt_response(Conn, StreamId, Path, DownloadsDir, false, false, <<>>).
 
-wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir, Connected, Retried, Acc) ->
+wait_for_zerortt_response(Conn, StreamId, Path, DownloadsDir, Connected, Retried, Acc) ->
     %% Use shorter timeout after handshake to detect rejected 0-RTT
     Timeout =
         case Connected andalso Acc =:= <<>> andalso not Retried of
@@ -565,10 +562,10 @@ wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir, Connected, Retr
             false -> 60000
         end,
     receive
-        {quic, ConnRef, {connected, _Info}} ->
+        {quic, Conn, {connected, _Info}} ->
             io:format("0-RTT: Handshake completed~n"),
-            wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir, true, Retried, Acc);
-        {quic, ConnRef, {stream_data, StreamId, Data, Fin}} ->
+            wait_for_zerortt_response(Conn, StreamId, Path, DownloadsDir, true, Retried, Acc);
+        {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
             NewAcc = <<Acc/binary, Data/binary>>,
             case Fin of
                 true ->
@@ -579,14 +576,14 @@ wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir, Connected, Retr
                     ok;
                 false ->
                     wait_for_zerortt_response(
-                        ConnRef, StreamId, Path, DownloadsDir, Connected, Retried, NewAcc
+                        Conn, StreamId, Path, DownloadsDir, Connected, Retried, NewAcc
                     )
             end;
-        {quic, ConnRef, {early_data_rejected, _}} ->
+        {quic, Conn, {early_data_rejected, _}} ->
             io:format("0-RTT: Early data rejected, resending as 1-RTT~n"),
             %% Resend request on new stream
-            resend_request_1rtt(ConnRef, Path, DownloadsDir);
-        {quic, ConnRef, {closed, Reason}} ->
+            resend_request_1rtt(Conn, Path, DownloadsDir);
+        {quic, Conn, {closed, Reason}} ->
             io:format("0-RTT: Connection closed: ~p~n", [Reason]),
             case Acc of
                 <<>> ->
@@ -602,7 +599,7 @@ wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir, Connected, Retr
             true ->
                 %% 0-RTT likely rejected (server couldn't decrypt), retry as 1-RTT
                 io:format("0-RTT: No response, resending as 1-RTT~n"),
-                resend_request_1rtt(ConnRef, Path, DownloadsDir);
+                resend_request_1rtt(Conn, Path, DownloadsDir);
             false ->
                 io:format("0-RTT: Timeout~n"),
                 error
@@ -610,21 +607,21 @@ wait_for_zerortt_response(ConnRef, StreamId, Path, DownloadsDir, Connected, Retr
     end.
 
 %% Resend the request using 1-RTT (after 0-RTT was rejected)
-resend_request_1rtt(ConnRef, Path, DownloadsDir) ->
-    case quic:open_stream(ConnRef) of
+resend_request_1rtt(Conn, Path, DownloadsDir) ->
+    case quic:open_stream(Conn) of
         {ok, NewStreamId} ->
             Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
-            ok = quic:send_data(ConnRef, NewStreamId, Request, true),
-            wait_for_1rtt_response(ConnRef, NewStreamId, Path, DownloadsDir, <<>>);
+            ok = quic:send_data(Conn, NewStreamId, Request, true),
+            wait_for_1rtt_response(Conn, NewStreamId, Path, DownloadsDir, <<>>);
         {error, Err} ->
             io:format("0-RTT: Failed to open 1-RTT stream: ~p~n", [Err]),
             error
     end.
 
 %% Wait for 1-RTT response
-wait_for_1rtt_response(ConnRef, StreamId, Path, DownloadsDir, Acc) ->
+wait_for_1rtt_response(Conn, StreamId, Path, DownloadsDir, Acc) ->
     receive
-        {quic, ConnRef, {stream_data, StreamId, Data, Fin}} ->
+        {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
             NewAcc = <<Acc/binary, Data/binary>>,
             case Fin of
                 true ->
@@ -636,9 +633,9 @@ wait_for_1rtt_response(ConnRef, StreamId, Path, DownloadsDir, Acc) ->
                     ]),
                     ok;
                 false ->
-                    wait_for_1rtt_response(ConnRef, StreamId, Path, DownloadsDir, NewAcc)
+                    wait_for_1rtt_response(Conn, StreamId, Path, DownloadsDir, NewAcc)
             end;
-        {quic, ConnRef, {closed, Reason}} ->
+        {quic, Conn, {closed, Reason}} ->
             io:format("0-RTT: Connection closed during 1-RTT: ~p~n", [Reason]),
             error
     after 60000 ->
@@ -681,9 +678,9 @@ run_migration_download(Host, Port, Path, DownloadsDir) ->
         alpn => [<<"hq-interop">>, <<"h3">>]
     },
     case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
-            Result = wait_and_migrate_download(ConnRef, Path, DownloadsDir),
-            quic:close(ConnRef, normal),
+        {ok, Conn} ->
+            Result = wait_and_migrate_download(Conn, Path, DownloadsDir),
+            quic:close(Conn, normal),
             Result;
         {error, Reason} ->
             io:format("Migration test connection failed: ~p~n", [Reason]),
@@ -691,20 +688,20 @@ run_migration_download(Host, Port, Path, DownloadsDir) ->
     end.
 
 %% Wait for connection, start download, trigger migration mid-transfer
-wait_and_migrate_download(ConnRef, Path, DownloadsDir) ->
+wait_and_migrate_download(Conn, Path, DownloadsDir) ->
     receive
-        {quic, ConnRef, {connected, _Info}} ->
+        {quic, Conn, {connected, _Info}} ->
             io:format("Migration test: Connected~n"),
-            case quic:open_stream(ConnRef) of
+            case quic:open_stream(Conn) of
                 {ok, StreamId} ->
                     Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
-                    ok = quic:send_data(ConnRef, StreamId, Request, true),
-                    receive_with_migration(ConnRef, StreamId, Path, DownloadsDir, false, <<>>);
+                    ok = quic:send_data(Conn, StreamId, Request, true),
+                    receive_with_migration(Conn, StreamId, Path, DownloadsDir, false, <<>>);
                 {error, Err} ->
                     io:format("Failed to open stream: ~p~n", [Err]),
                     error
             end;
-        {quic, ConnRef, {closed, Reason}} ->
+        {quic, Conn, {closed, Reason}} ->
             io:format("Migration test: Connection closed: ~p~n", [Reason]),
             error
     after 30000 ->
@@ -713,9 +710,9 @@ wait_and_migrate_download(ConnRef, Path, DownloadsDir) ->
     end.
 
 %% Receive data and trigger migration after first chunk
-receive_with_migration(ConnRef, StreamId, Path, DownloadsDir, Migrated, Acc) ->
+receive_with_migration(Conn, StreamId, Path, DownloadsDir, Migrated, Acc) ->
     receive
-        {quic, ConnRef, {stream_data, StreamId, Data, Fin}} ->
+        {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
             NewAcc = <<Acc/binary, Data/binary>>,
 
             %% Trigger migration after receiving some data (but before FIN)
@@ -726,7 +723,7 @@ receive_with_migration(ConnRef, StreamId, Path, DownloadsDir, Migrated, Acc) ->
                     false when byte_size(NewAcc) > 0 ->
                         io:format("Migration test: Triggering path migration~n"),
                         %% The migrate call initiates path validation
-                        case quic:migrate(ConnRef) of
+                        case quic:migrate(Conn) of
                             ok ->
                                 io:format("Migration test: Migration initiated~n"),
                                 true;
@@ -749,12 +746,12 @@ receive_with_migration(ConnRef, StreamId, Path, DownloadsDir, Migrated, Acc) ->
                     ]),
                     ok;
                 false ->
-                    receive_with_migration(ConnRef, StreamId, Path, DownloadsDir, Migrated1, NewAcc)
+                    receive_with_migration(Conn, StreamId, Path, DownloadsDir, Migrated1, NewAcc)
             end;
-        {quic, ConnRef, {path_validated, _PathInfo}} ->
+        {quic, Conn, {path_validated, _PathInfo}} ->
             io:format("Migration test: New path validated~n"),
-            receive_with_migration(ConnRef, StreamId, Path, DownloadsDir, Migrated, Acc);
-        {quic, ConnRef, {closed, Reason}} ->
+            receive_with_migration(Conn, StreamId, Path, DownloadsDir, Migrated, Acc);
+        {quic, Conn, {closed, Reason}} ->
             io:format("Migration test: Connection closed: ~p~n", [Reason]),
             case Acc of
                 <<>> ->

@@ -128,9 +128,8 @@
 
 %% Connection controller state
 -record(quic_dist_conn, {
-    %% Connection identity
-    conn_ref :: reference(),
-    conn_pid :: pid(),
+    %% Connection identity (Conn is the connection pid, receives {quic, Conn, Event} messages)
+    conn :: pid(),
     node :: node() | undefined,
     role :: client | server,
 

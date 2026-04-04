@@ -36,7 +36,6 @@ exports_test() ->
     Exports = quic_dist_controller:module_info(exports),
     %% Check key API functions are exported
     ?assert(lists:member({start_link, 2}, Exports)),
-    ?assert(lists:member({start_link, 3}, Exports)),
     ?assert(lists:member({send, 2}, Exports)),
     ?assert(lists:member({recv, 3}, Exports)),
     ?assert(lists:member({tick, 1}, Exports)),

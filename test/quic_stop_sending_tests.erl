@@ -13,16 +13,6 @@
 %% API Tests
 %%====================================================================
 
-%% Test that stop_sending returns badarg for invalid ConnRef
-stop_sending_badarg_test() ->
-    ?assertEqual({error, badarg}, quic:stop_sending(invalid, 0, 0)),
-    ?assertEqual({error, badarg}, quic:stop_sending("not_a_ref", 0, 0)).
-
-%% Test that stop_sending returns not_found for unknown reference
-stop_sending_not_found_test() ->
-    UnknownRef = make_ref(),
-    ?assertEqual({error, not_found}, quic:stop_sending(UnknownRef, 0, 0)).
-
 %% Test that stop_sending in idle state returns invalid_state error
 stop_sending_idle_state_test() ->
     {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
@@ -38,20 +28,7 @@ stop_sending_idle_state_test() ->
     quic_connection:close(Pid, normal),
     timer:sleep(100).
 
-%% Test that stop_sending API accepts reference and delegates correctly
-stop_sending_with_ref_test() ->
-    {ok, Ref, Pid} = quic_connection:connect("127.0.0.1", 4433, #{}, self()),
-    ?assert(is_reference(Ref)),
-
-    %% Connection is in idle state (not connected yet)
-    %% stop_sending should fail because we're not in connected state
-    Result = quic:stop_sending(Ref, 0, 0),
-    ?assertEqual({error, {invalid_state, idle}}, Result),
-
-    quic_connection:close(Pid, normal),
-    timer:sleep(100).
-
-%% Test that stop_sending API accepts pid directly
+%% Test that stop_sending API accepts pid
 stop_sending_with_pid_test() ->
     {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
 

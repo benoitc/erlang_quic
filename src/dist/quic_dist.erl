@@ -419,8 +419,8 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
                 %% instead of PMTU probing which adds overhead
                 max_udp_payload_size => ?DIST_MAX_UDP_PAYLOAD_SIZE,
                 pmtu_enabled => false,
-                connection_handler => fun(ConnPid, ConnRef) ->
-                    handle_new_connection(ConnPid, ConnRef)
+                connection_handler => fun(Conn) ->
+                    handle_new_connection(Conn)
                 end
             },
 
@@ -547,15 +547,15 @@ load_credentials(_) ->
 
 %% @private
 %% Handle a new incoming QUIC connection.
-handle_new_connection(ConnPid, ConnRef) ->
-    error_logger:info_msg(
-        "quic_dist: handle_new_connection called, ConnPid=~p, ConnRef=~p~n",
-        [ConnPid, ConnRef]
+handle_new_connection(Conn) ->
+    logger:info(
+        "quic_dist: handle_new_connection called, Conn=~p~n",
+        [Conn]
     ),
     %% Start distribution controller for this connection
-    case quic_dist_controller:start_link(ConnPid, ConnRef, server) of
+    case quic_dist_controller:start_link(Conn, server) of
         {ok, ControllerPid} ->
-            error_logger:info_msg("quic_dist: server controller started: ~p~n", [ControllerPid]),
+            logger:info("quic_dist: server controller started: ~p~n", [ControllerPid]),
             %% Notify the acceptor about the new connection
             %% The server name is based on the short node name (before @)
             NodeName = node(),
@@ -582,7 +582,7 @@ handle_new_connection(ConnPid, ConnRef) ->
             end,
             {ok, ControllerPid};
         Error ->
-            error_logger:error_msg("quic_dist: Failed to start controller: ~p~n", [Error]),
+            logger:error("quic_dist: Failed to start controller: ~p~n", [Error]),
             Error
     end.
 
@@ -662,35 +662,35 @@ acceptor_loop(Kernel, #quic_dist_listener{} = Listener, Pending) ->
 do_accept_connection(AcceptPid, DistCtrl, MyNode, Allowed, SetupTime, Kernel) ->
     %% Trap exits so we can handle the setup timer timeout properly
     process_flag(trap_exit, true),
-    error_logger:info_msg("do_accept_connection: waiting for controller message from ~p~n", [
+    logger:info("do_accept_connection: waiting for controller message from ~p~n", [
         AcceptPid
     ]),
     receive
         {AcceptPid, controller} ->
-            error_logger:info_msg(
+            logger:info(
                 "do_accept_connection: got controller, starting handshake. MyNode=~p, Kernel=~p~n",
                 [MyNode, Kernel]
             ),
             Timer = dist_util:start_timer(SetupTime),
             HSData = create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel),
-            error_logger:info_msg(
+            logger:info(
                 "do_accept_connection: HSData created, kernel_pid=~p~n",
                 [HSData#hs_data.kernel_pid]
             ),
             try
                 Result = dist_util:handshake_other_started(HSData),
-                error_logger:info_msg("do_accept_connection: handshake result: ~p~n", [Result]),
+                logger:info("do_accept_connection: handshake result: ~p~n", [Result]),
                 Result
             catch
                 Class:Reason:Stack ->
-                    error_logger:error_msg(
+                    logger:error(
                         "do_accept_connection: handshake crashed: ~p:~p~n~p~n",
                         [Class, Reason, Stack]
                     ),
                     erlang:raise(Class, Reason, Stack)
             end
     after 5000 ->
-        error_logger:error_msg("do_accept_connection: TIMEOUT waiting for controller from ~p~n", [
+        logger:error("do_accept_connection: TIMEOUT waiting for controller from ~p~n", [
             AcceptPid
         ]),
         exit(controller_timeout)
@@ -857,9 +857,9 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
 
             %% Attempt connection
             case quic:connect(Host, Port, Opts, self()) of
-                {ok, ConnRef} ->
+                {ok, Conn} ->
                     %% Wait for connection to be established
-                    wait_for_connection(Kernel, Node, ConnRef, MyNode, Type, Timer);
+                    wait_for_connection(Kernel, Node, Conn, MyNode, Type, Timer);
                 {error, Reason} ->
                     ?shutdown2(Node, {connect_failed, Reason})
             end;
@@ -868,11 +868,11 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
     end.
 
 %% @private
-wait_for_connection(Kernel, Node, ConnRef, MyNode, Type, Timer) ->
+wait_for_connection(Kernel, Node, Conn, MyNode, Type, Timer) ->
     receive
-        {quic, ConnRef, {connected, _Info}} ->
+        {quic, Conn, {connected, _Info}} ->
             %% Start distribution controller
-            case quic_dist_controller:start_link(ConnRef, client) of
+            case quic_dist_controller:start_link(Conn, client) of
                 {ok, DistCtrl} ->
                     %% Set kernel on controller and store node
                     quic_dist_controller:set_supervisor(DistCtrl, Kernel),
@@ -881,15 +881,15 @@ wait_for_connection(Kernel, Node, ConnRef, MyNode, Type, Timer) ->
                     HSData = create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer),
                     dist_util:handshake_we_started(HSData);
                 {error, Reason} ->
-                    quic:close(ConnRef, normal),
+                    quic:close(Conn, normal),
                     ?shutdown2(Node, {controller_failed, Reason})
             end;
-        {quic, ConnRef, {closed, Reason}} ->
+        {quic, Conn, {closed, Reason}} ->
             ?shutdown2(Node, {closed, Reason});
-        {quic, ConnRef, {transport_error, Code, Reason}} ->
+        {quic, Conn, {transport_error, Code, Reason}} ->
             ?shutdown2(Node, {transport_error, Code, Reason});
         {'EXIT', Timer, setup_timer_timeout} ->
-            quic:close(ConnRef, timeout),
+            quic:close(Conn, timeout),
             ?shutdown2(Node, connect_timeout)
     end.
 
@@ -902,7 +902,7 @@ wait_for_connection(Kernel, Node, ConnRef, MyNode, Type, Timer) ->
 create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel) ->
     %% Capture SetupPid (self) for dist_ctrlr message
     SetupPid = self(),
-    error_logger:info_msg(
+    logger:info(
         "create_hs_data: Kernel=~p, DistCtrl=~p, SetupPid=~p~n",
         [Kernel, DistCtrl, SetupPid]
     ),
@@ -930,7 +930,7 @@ create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel) ->
         f_setopts_pre_nodeup = fun(Ctrl) ->
             %% Just log and return ok - inet_tcp_dist doesn't do anything special here
             StoredNode = get_stored_node(Ctrl),
-            error_logger:info_msg(
+            logger:info(
                 "f_setopts_pre_nodeup (accept): Ctrl=~p, Node=~p, SetupPid=~p, linked=~p~n",
                 [
                     Ctrl,
@@ -953,7 +953,7 @@ create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel) ->
         mf_getopts = fun(_Ctrl, Opts) -> {ok, [{O, 0} || O <- Opts]} end,
         allowed = Allowed,
         f_handshake_complete = fun(Ctrl, HsNode, DHandle) ->
-            error_logger:info_msg(
+            logger:info(
                 "f_handshake_complete (accept): Ctrl=~p, Node=~p, DHandle=~p~n",
                 [Ctrl, HsNode, DHandle]
             ),
@@ -1007,7 +1007,7 @@ get_stored_node(Ctrl) ->
 create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer) ->
     %% Capture SetupPid (self) for dist_ctrlr message
     SetupPid = self(),
-    error_logger:info_msg(
+    logger:info(
         "create_hs_data_setup: Kernel=~p, DistCtrl=~p, Node=~p, SetupPid=~p~n",
         [Kernel, DistCtrl, Node, SetupPid]
     ),
@@ -1023,7 +1023,7 @@ create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer) ->
         f_recv = fun(Ctrl, Len, Timeout) -> quic_dist_controller:recv(Ctrl, Len, Timeout) end,
         f_setopts_pre_nodeup = fun(Ctrl) ->
             %% Just log and return ok - inet_tcp_dist doesn't do anything special here
-            error_logger:info_msg(
+            logger:info(
                 "f_setopts_pre_nodeup (setup): Ctrl=~p, Node=~p, SetupPid=~p, linked=~p~n",
                 [Ctrl, Node, SetupPid, lists:member(Ctrl, element(2, process_info(self(), links)))]
             ),
@@ -1040,7 +1040,7 @@ create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer) ->
         mf_setopts = fun(_Ctrl, _Opts) -> ok end,
         mf_getopts = fun(_Ctrl, Opts) -> {ok, [{O, 0} || O <- Opts]} end,
         f_handshake_complete = fun(Ctrl, HsNode, DHandle) ->
-            error_logger:info_msg(
+            logger:info(
                 "f_handshake_complete (setup): Ctrl=~p, Node=~p, DHandle=~p~n",
                 [Ctrl, HsNode, DHandle]
             ),

@@ -21,10 +21,10 @@
 %%%
 %%% == Messages to Owner ==
 %%%
-%%% {quic, ConnRef, {connected, Info}}
-%%% {quic, ConnRef, {stream_data, StreamId, Data, Fin}}
-%%% {quic, ConnRef, {stream_opened, StreamId}}
-%%% {quic, ConnRef, {closed, Reason}}
+%%% {quic, Conn, {connected, Info}}         where Conn is the connection pid
+%%% {quic, Conn, {stream_data, StreamId, Data, Fin}}
+%%% {quic, Conn, {stream_opened, StreamId}}
+%%% {quic, Conn, {closed, Reason}}
 %%%
 
 -module(quic_connection).
@@ -50,13 +50,6 @@
     ]}
 ).
 -dialyzer([no_match]).
-
-%% Registry API
--export([
-    register_conn/2,
-    unregister_conn/1,
-    lookup/1
-]).
 
 %% API
 -export([
@@ -133,9 +126,6 @@
 ]).
 -endif.
 
-%% Registry table name
--define(REGISTRY, quic_connection_registry).
-
 %% TLS handshake states (client)
 -define(TLS_AWAITING_SERVER_HELLO, awaiting_server_hello).
 -define(TLS_AWAITING_ENCRYPTED_EXT, awaiting_encrypted_extensions).
@@ -177,7 +167,7 @@
     remote_addr :: {inet:ip_address(), inet:port_number()},
     local_addr :: {inet:ip_address(), inet:port_number()} | undefined,
 
-    %% Owner process (receives {quic, Ref, Event} messages)
+    %% Owner process (receives {quic, Conn, Event} messages where Conn is pid())
     owner :: pid(),
     conn_ref :: reference(),
 
@@ -364,49 +354,6 @@
     %% QLOG Tracing (draft-ietf-quic-qlog-quic-events)
     qlog_ctx :: #qlog_ctx{} | undefined
 }).
-
-%%====================================================================
-%% Registry API
-%%====================================================================
-
-%% @doc Register a connection reference to a pid.
--spec register_conn(reference(), pid()) -> ok.
-register_conn(ConnRef, Pid) ->
-    ensure_registry(),
-    ets:insert(?REGISTRY, {ConnRef, Pid}),
-    ok.
-
-%% @doc Unregister a connection reference.
--spec unregister_conn(reference()) -> ok.
-unregister_conn(ConnRef) ->
-    (try
-        ets:delete(?REGISTRY, ConnRef)
-    catch
-        _:_ -> ok
-    end),
-    ok.
-
-%% @doc Lookup a connection pid by reference.
--spec lookup(reference()) -> {ok, pid()} | error.
-lookup(ConnRef) ->
-    ensure_registry(),
-    case ets:lookup(?REGISTRY, ConnRef) of
-        [{_, Pid}] -> {ok, Pid};
-        [] -> error
-    end.
-
-ensure_registry() ->
-    case ets:whereis(?REGISTRY) of
-        undefined ->
-            try
-                ets:new(?REGISTRY, [named_table, public, set, {read_concurrency, true}])
-            catch
-                % Already exists (race condition)
-                error:badarg -> ok
-            end;
-        _ ->
-            ok
-    end.
 
 %%====================================================================
 %% API
@@ -705,9 +652,8 @@ init({server, Opts}) ->
         sent_packets = #{}
     },
 
-    %% Create connection reference and register
+    %% Create connection reference (for internal use only)
     ConnRef = make_ref(),
-    register_conn(ConnRef, self()),
 
     %% Initialize congestion control and loss detection
     %% Support configurable initial cwnd for distribution workloads
@@ -915,9 +861,8 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         sent_packets = #{}
     },
 
-    %% Create connection reference and register
+    %% Create connection reference (for internal use only)
     ConnRef = make_ref(),
-    register_conn(ConnRef, self()),
 
     %% Get server name for SNI
     ServerName =
@@ -1011,7 +956,6 @@ terminate(
     StateName,
     #state{
         socket = Socket,
-        conn_ref = ConnRef,
         pto_timer = PtoTimer,
         idle_timer = IdleTimer,
         keep_alive_timer = KeepAliveTimer,
@@ -1034,7 +978,6 @@ terminate(
                 _:_ -> ok
             end
     end,
-    unregister_conn(ConnRef),
     %% Cancel any active timers
     cancel_timer(PtoTimer),
     cancel_timer(IdleTimer),
@@ -1211,7 +1154,6 @@ connected(
     OldState,
     #state{
         owner = Owner,
-        conn_ref = Ref,
         alpn = Alpn,
         socket = Socket,
         role = Role,
@@ -1226,7 +1168,7 @@ connected(
         alpn => Alpn,
         alpn_protocol => Alpn
     },
-    Owner ! {quic, Ref, {connected, Info}},
+    Owner ! {quic, self(), {connected, Info}},
     %% For client connections, ensure socket is active for receiving
     %% Server connections receive via listener (quic_packet messages)
     case Role of
@@ -1490,7 +1432,6 @@ draining(
     _OldState,
     #state{
         owner = Owner,
-        conn_ref = Ref,
         close_reason = Reason,
         loss_state = LossState,
         qlog_ctx = QlogCtx
@@ -1499,7 +1440,7 @@ draining(
     %% Emit qlog connection_closed event
     quic_qlog:connection_closed(QlogCtx, close_reason_to_code(Reason), undefined),
 
-    Owner ! {quic, Ref, {closed, Reason}},
+    Owner ! {quic, self(), {closed, Reason}},
     %% Start drain timer (3 * PTO per RFC 9000 Section 10.2)
     DrainTimeout =
         case LossState of
@@ -3204,7 +3145,7 @@ process_frame(_Level, {connection_close, _Type, _Code, _FrameType, _Reason}, Sta
 process_frame(
     app,
     {reset_stream, StreamId, ErrorCode, FinalSize},
-    #state{owner = Owner, conn_ref = Ref, streams = Streams} = State
+    #state{owner = Owner, streams = Streams} = State
 ) ->
     %% Update stream state to reset
     NewStreams =
@@ -3221,7 +3162,7 @@ process_frame(
                 );
             error ->
                 %% Unknown stream - notify owner and create minimal state to track reset
-                Owner ! {quic, Ref, {stream_opened, StreamId}},
+                Owner ! {quic, self(), {stream_opened, StreamId}},
                 maps:put(
                     StreamId,
                     #stream_state{
@@ -3233,14 +3174,14 @@ process_frame(
                 )
         end,
     %% Notify owner of stream reset
-    Owner ! {quic, Ref, {stream_reset, StreamId, ErrorCode}},
+    Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
     State#state{streams = NewStreams};
 %% STOP_SENDING: Peer wants us to stop sending on a stream
 %% RFC 9000 Section 19.5
 process_frame(
     app,
     {stop_sending, StreamId, ErrorCode},
-    #state{owner = Owner, conn_ref = Ref, streams = Streams} = State
+    #state{owner = Owner, streams = Streams} = State
 ) ->
     %% Clear any queued data for this stream and mark as stopped
     NewStreams =
@@ -3257,7 +3198,7 @@ process_frame(
                 );
             error ->
                 %% Unknown stream - notify owner and create minimal state
-                Owner ! {quic, Ref, {stream_opened, StreamId}},
+                Owner ! {quic, self(), {stream_opened, StreamId}},
                 maps:put(
                     StreamId,
                     #stream_state{
@@ -3268,7 +3209,7 @@ process_frame(
                 )
         end,
     %% Notify owner - they should stop sending and may send RESET_STREAM
-    Owner ! {quic, Ref, {stop_sending, StreamId, ErrorCode}},
+    Owner ! {quic, self(), {stop_sending, StreamId, ErrorCode}},
     %% Also remove from send queue and adjust byte count
     {NewSendQueue, RemovedBytes} = remove_stream_from_queue(StreamId, State#state.send_queue),
     NewQueueBytes = State#state.send_queue_bytes - RemovedBytes,
@@ -3278,7 +3219,7 @@ process_frame(
 process_frame(
     app,
     {stream_data_blocked, StreamId, _Limit},
-    #state{owner = Owner, conn_ref = Ref, streams = Streams} = State
+    #state{owner = Owner, streams = Streams} = State
 ) ->
     case maps:is_key(StreamId, Streams) of
         true ->
@@ -3286,7 +3227,7 @@ process_frame(
             State;
         false ->
             %% New stream from peer - notify owner
-            Owner ! {quic, Ref, {stream_opened, StreamId}},
+            Owner ! {quic, self(), {stream_opened, StreamId}},
             %% Create minimal stream state
             InitSendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
             InitRecvMaxData = get_local_recv_limit(bidi_peer_initiated, State),
@@ -3319,11 +3260,11 @@ process_frame(
     app, {datagram_with_length, Data}, #state{max_datagram_frame_size_local = Max} = State
 ) when byte_size(Data) > Max ->
     send_protocol_violation(<<"DATAGRAM frame too large">>, State);
-process_frame(app, {datagram, Data}, #state{owner = Owner, conn_ref = Ref} = State) ->
-    Owner ! {quic, Ref, {datagram, Data}},
+process_frame(app, {datagram, Data}, #state{owner = Owner} = State) ->
+    Owner ! {quic, self(), {datagram, Data}},
     State;
-process_frame(app, {datagram_with_length, Data}, #state{owner = Owner, conn_ref = Ref} = State) ->
-    Owner ! {quic, Ref, {datagram, Data}},
+process_frame(app, {datagram_with_length, Data}, #state{owner = Owner} = State) ->
+    Owner ! {quic, self(), {datagram, Data}},
     State;
 process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
@@ -3887,8 +3828,8 @@ process_tls_message(
             ),
 
             %% Notify owner about the new ticket
-            #state{owner = Owner, conn_ref = Ref} = State,
-            Owner ! {quic, Ref, {session_ticket, Ticket}},
+            #state{owner = Owner} = State,
+            Owner ! {quic, self(), {session_ticket, Ticket}},
 
             State#state{
                 ticket_store = TicketStore,
@@ -3940,7 +3881,6 @@ validate_receive_stream(StreamId, Role) ->
 process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
     #state{
         owner = Owner,
-        conn_ref = Ref,
         streams = Streams,
         max_data_local = MaxDataLocal,
         data_received = DataReceived,
@@ -3956,7 +3896,7 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                 S;
             error ->
                 %% New stream from peer - notify owner
-                Owner ! {quic, Ref, {stream_opened, StreamId}},
+                Owner ! {quic, self(), {stream_opened, StreamId}},
                 %% Use peer's limits for streams they initiate
                 InitSendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
                 InitRecvMaxData = get_local_recv_limit(bidi_peer_initiated, State),
@@ -4068,9 +4008,9 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                     ok;
                 {<<>>, true, _} ->
                     %% FIN-only delivery (all data already delivered)
-                    Owner ! {quic, Ref, {stream_data, StreamId, <<>>, true}};
+                    Owner ! {quic, self(), {stream_data, StreamId, <<>>, true}};
                 {_, _, _} ->
-                    Owner ! {quic, Ref, {stream_data, StreamId, DeliverData, DeliverFin}}
+                    Owner ! {quic, self(), {stream_data, StreamId, DeliverData, DeliverFin}}
             end,
 
             NewStream = Stream#stream_state{
@@ -5486,8 +5426,7 @@ handle_stream_deadline_expired(
     StreamId,
     #state{
         streams = Streams,
-        owner = Owner,
-        conn_ref = Ref
+        owner = Owner
     } = State
 ) ->
     case maps:find(StreamId, Streams) of
@@ -5507,12 +5446,12 @@ handle_stream_deadline_expired(
             %% Notify owner if requested
             case Action of
                 notify ->
-                    Owner ! {quic, Ref, {stream_deadline, StreamId}},
+                    Owner ! {quic, self(), {stream_deadline, StreamId}},
                     {ok, State1};
                 reset ->
                     do_close_stream_deadline(StreamId, ErrorCode, State1);
                 both ->
-                    Owner ! {quic, Ref, {stream_deadline, StreamId}},
+                    Owner ! {quic, self(), {stream_deadline, StreamId}},
                     do_close_stream_deadline(StreamId, ErrorCode, State1)
             end;
         {ok, _ClosedStream} ->

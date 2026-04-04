@@ -21,9 +21,10 @@
 %%% Opts = #{
 %%%     cert => Cert,
 %%%     key => Key,
-%%%     connection_handler => fun(ConnPid, ConnRef) ->
+%%%     connection_handler => fun(Conn) ->
+%%%         %% Conn is the connection pid
 %%%         %% Spawn your handler and return its pid
-%%%         HandlerPid = spawn(fun() -> my_handler(ConnPid, ConnRef) end),
+%%%         HandlerPid = spawn(fun() -> my_handler(Conn) end),
 %%%         %% Ownership will be transferred to HandlerPid
 %%%         {ok, HandlerPid}
 %%%     end
@@ -75,8 +76,8 @@
     owns_tables = true :: boolean(),
     %% Stateless reset secret (RFC 9000 Section 10.3)
     reset_secret :: binary(),
-    %% Connection handler callback: fun(ConnPid, ConnRef) -> {ok, HandlerPid}
-    connection_handler :: fun((pid(), reference()) -> {ok, pid()}) | undefined,
+    %% Connection handler callback: fun(Conn) -> {ok, HandlerPid} where Conn is pid()
+    connection_handler :: fun((pid()) -> {ok, pid()}) | undefined,
     %% QUIC-LB CID configuration (RFC 9312)
     cid_config :: #cid_config{} | undefined,
     %% Expected DCID length for short header packets
@@ -497,9 +498,6 @@ create_connection(
     case quic_connection:start_server(maps:merge(Opts, ConnOpts)) of
         {ok, ConnPid} ->
             ?LOG_INFO(#{what => connection_created, conn_pid => ConnPid}, ?QUIC_LOG_META),
-            %% Get connection reference
-            %% Note: ConnPid is already linked via start_link in start_server/1
-            ConnRef = gen_statem:call(ConnPid, get_ref),
 
             %% Register connection ID
             ets:insert(Conns, {DCID, ConnPid}),
@@ -510,19 +508,19 @@ create_connection(
             case ConnHandler of
                 undefined ->
                     ok;
-                Fun when is_function(Fun, 2) ->
-                    case Fun(ConnPid, ConnRef) of
+                Fun when is_function(Fun, 1) ->
+                    case Fun(ConnPid) of
                         {ok, HandlerPid} when is_pid(HandlerPid) ->
                             %% Transfer ownership to handler (sync to ensure it completes
                             %% before any packets trigger handshake completion)
-                            case quic:set_owner_sync(ConnRef, HandlerPid) of
+                            case quic:set_owner_sync(ConnPid, HandlerPid) of
                                 ok ->
                                     ok;
                                 {error, Reason} ->
                                     ?LOG_WARNING(
                                         #{
                                             what => set_owner_failed,
-                                            conn_ref => ConnRef,
+                                            conn => ConnPid,
                                             reason => Reason
                                         },
                                         ?QUIC_LOG_META
