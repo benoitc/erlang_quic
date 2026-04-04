@@ -53,7 +53,6 @@
 %% API
 -export([
     start_link/2,
-    start_link/3,
     send/2,
     recv/3,
     tick/1,
@@ -83,9 +82,8 @@
 
 %% Internal state
 -record(state, {
-    %% Connection
-    conn_ref :: reference(),
-    conn_pid :: pid() | undefined,
+    %% Connection (pid, receives {quic, Conn, Event} messages)
+    conn :: pid(),
     role :: client | server,
 
     %% Streams
@@ -148,17 +146,11 @@
 %% API
 %%====================================================================
 
-%% @doc Start a controller for a client connection.
--spec start_link(ConnRef :: reference(), Role :: client) ->
+%% @doc Start a controller for a QUIC distribution connection.
+-spec start_link(Conn :: pid(), Role :: client | server) ->
     {ok, pid()} | {error, term()}.
-start_link(ConnRef, client = Role) ->
-    gen_statem:start_link(?MODULE, {ConnRef, Role}, []).
-
-%% @doc Start a controller for a server connection.
--spec start_link(ConnPid :: pid(), ConnRef :: reference(), Role :: server) ->
-    {ok, pid()} | {error, term()}.
-start_link(ConnPid, ConnRef, server = Role) ->
-    gen_statem:start_link(?MODULE, {ConnPid, ConnRef, Role}, []).
+start_link(Conn, Role) when Role =:= client; Role =:= server ->
+    gen_statem:start_link(?MODULE, {Conn, Role}, []).
 
 %% @doc Send data on the control stream.
 -spec send(Controller :: pid(), Data :: iodata()) -> ok | {error, term()}.
@@ -226,24 +218,16 @@ callback_mode() ->
     [state_functions, state_enter].
 
 %% Initialize for client role
-init({ConnRef, client}) ->
-    %% Lookup connection PID
-    case quic_connection:lookup(ConnRef) of
-        {ok, ConnPid} ->
-            State = init_backpressure_config(#state{
-                conn_ref = ConnRef,
-                conn_pid = ConnPid,
-                role = client
-            }),
-            {ok, init_state, State};
-        error ->
-            {stop, connection_not_found}
-    end;
-%% Initialize for server role
-init({ConnPid, ConnRef, server}) ->
+init({Conn, client}) ->
     State = init_backpressure_config(#state{
-        conn_ref = ConnRef,
-        conn_pid = ConnPid,
+        conn = Conn,
+        role = client
+    }),
+    {ok, init_state, State};
+%% Initialize for server role
+init({Conn, server}) ->
+    State = init_backpressure_config(#state{
+        conn = Conn,
         role = server
     }),
     {ok, init_state, State}.
@@ -267,14 +251,14 @@ get_dist_opt(Key, Opts, Default) when is_list(Opts) ->
 get_dist_opt(Key, Opts, Default) when is_map(Opts) ->
     maps:get(Key, Opts, Default).
 
-terminate(_Reason, _StateName, #state{conn_ref = ConnRef, pending_tick_timer = Timer}) ->
+terminate(_Reason, _StateName, #state{conn = Conn, pending_tick_timer = Timer}) ->
     %% Cancel pending tick retry timer if running
     case Timer of
         undefined -> ok;
         TimerRef -> erlang:cancel_timer(TimerRef)
     end,
     try
-        quic:close(ConnRef, normal)
+        quic:close(Conn, normal)
     catch
         _:_ -> ok
     end,
@@ -287,10 +271,10 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %% State: init_state
 %%====================================================================
 
-init_state(enter, _OldState, #state{role = client, conn_ref = ConnRef} = State) ->
+init_state(enter, _OldState, #state{role = client, conn = Conn} = State) ->
     %% Client: connection is already established (we received connected message)
     %% Take over ownership synchronously to ensure we receive stream_data messages
-    ok = quic:set_owner_sync(ConnRef, self()),
+    ok = quic:set_owner_sync(Conn, self()),
     %% Can proceed to open streams immediately
     case setup_streams(State) of
         {ok, State1} ->
@@ -298,38 +282,32 @@ init_state(enter, _OldState, #state{role = client, conn_ref = ConnRef} = State) 
         {error, Reason} ->
             {stop, {stream_setup_failed, Reason}}
     end;
-init_state(enter, _OldState, #state{role = server, conn_ref = ConnRef} = State) ->
+init_state(enter, _OldState, #state{role = server, conn = Conn} = State) ->
     %% Server: take ownership synchronously and proceed immediately
     %% The connection_handler callback is called during QUIC handshake,
     %% and the listener transfers ownership to us. We don't need to wait
     %% for {connected, _} since we use stream 0 (client-initiated).
-    case quic_connection:lookup(ConnRef) of
-        {ok, ConnPid} ->
-            %% Take over as owner synchronously to ensure we receive stream_data
-            ok = quic:set_owner_sync(ConnRef, self()),
-            State1 = State#state{conn_pid = ConnPid},
-            %% Setup streams - transition via timeout since enter can't change state
-            case setup_streams(State1) of
-                {ok, State2} ->
-                    {keep_state, State2, [{state_timeout, 0, proceed_to_handshaking}]};
-                {error, Reason} ->
-                    {stop, {stream_setup_failed, Reason}}
-            end;
-        error ->
-            {stop, connection_not_found}
+    %% Take over as owner synchronously to ensure we receive stream_data
+    ok = quic:set_owner_sync(Conn, self()),
+    %% Setup streams - transition via timeout since enter can't change state
+    case setup_streams(State) of
+        {ok, State1} ->
+            {keep_state, State1, [{state_timeout, 0, proceed_to_handshaking}]};
+        {error, Reason} ->
+            {stop, {stream_setup_failed, Reason}}
     end;
 %% Server proceeds to handshaking after setup
 init_state(state_timeout, proceed_to_handshaking, State) ->
     {next_state, handshaking, State};
 %% Server receives connected message - just ignore, we already transitioned
-init_state(info, {quic, ConnRef, {connected, _Info}}, #state{conn_ref = ConnRef} = State) ->
+init_state(info, {quic, Conn, {connected, _Info}}, #state{conn = Conn} = State) ->
     {keep_state, State};
 init_state(state_timeout, start_handshake, State) ->
     {next_state, handshaking, State};
 %% Handle QUIC errors during init
-init_state(info, {quic, ConnRef, {closed, Reason}}, #state{conn_ref = ConnRef}) ->
+init_state(info, {quic, Conn, {closed, Reason}}, #state{conn = Conn}) ->
     {stop, {connection_closed, Reason}};
-init_state(info, {quic, ConnRef, {transport_error, Code, Reason}}, #state{conn_ref = ConnRef}) ->
+init_state(info, {quic, Conn, {transport_error, Code, Reason}}, #state{conn = Conn}) ->
     {stop, {transport_error, Code, Reason}};
 init_state(EventType, Event, State) ->
     handle_common_event(EventType, Event, init_state, State).
@@ -400,11 +378,11 @@ handshaking(info, {handshake_complete, Node, DHandle}, State) ->
 
     %% Spawn input handler to receive QUIC data and deliver to VM
     Self = self(),
-    ConnRef = State#state.conn_ref,
+    Conn = State#state.conn,
     ControlStream = State#state.control_stream,
     InputHandler = spawn_link(
         fun() ->
-            input_handler_loop(DHandle, Self, ConnRef, ControlStream)
+            input_handler_loop(DHandle, Self, Conn, ControlStream)
         end
     ),
 
@@ -481,7 +459,7 @@ connected({call, From}, {recv, Length}, State) ->
 %% The tick frame uses the control stream (urgency 0, separate flow control)
 %% to ensure it gets through even when data streams are congested.
 %% Then optionally flush limited data (best effort, not blocking).
-connected(cast, tick, #state{dhandle = DHandle, conn_ref = ConnRef} = State) when
+connected(cast, tick, #state{dhandle = DHandle, conn = Conn} = State) when
     DHandle =/= undefined
 ->
     %% Try to drain any pending send queue first
@@ -490,7 +468,7 @@ connected(cast, tick, #state{dhandle = DHandle, conn_ref = ConnRef} = State) whe
     State2 = do_send_tick_frame(State1),
     %% Then try to flush some data if not congested (best effort)
     State3 =
-        case quic:get_send_queue_info(ConnRef) of
+        case quic:get_send_queue_info(Conn) of
             {ok, #{congested := false}} ->
                 send_dist_data_with_tick(State2);
             _ ->
@@ -507,7 +485,7 @@ connected(cast, tick, State) ->
 connected(
     info,
     dist_data,
-    #state{dhandle = DHandle, conn_ref = ConnRef, backpressure_retry = RetryMs} = State
+    #state{dhandle = DHandle, conn = Conn, backpressure_retry = RetryMs} = State
 ) when
     DHandle =/= undefined
 ->
@@ -515,7 +493,7 @@ connected(
     State1 = drain_send_queue(State),
     %% Also retry pending tick if any
     State2 = maybe_retry_pending_tick(State1),
-    case quic:get_send_queue_info(ConnRef) of
+    case quic:get_send_queue_info(Conn) of
         {ok, #{congested := true}} ->
             %% Queue is congested - don't pull more data
             %% Re-check after a delay
@@ -537,7 +515,7 @@ connected(
 connected(
     info,
     check_queue,
-    #state{dhandle = DHandle, conn_ref = ConnRef, backpressure_retry = RetryMs} = State
+    #state{dhandle = DHandle, conn = Conn, backpressure_retry = RetryMs} = State
 ) when
     DHandle =/= undefined
 ->
@@ -545,7 +523,7 @@ connected(
     State1 = drain_send_queue(State),
     %% Also retry pending tick if any
     State2 = maybe_retry_pending_tick(State1),
-    case quic:get_send_queue_info(ConnRef) of
+    case quic:get_send_queue_info(Conn) of
         {ok, #{congested := false}} ->
             %% Queue has room - pull and send data
             State3 = send_dist_data_limited(State2),
@@ -563,12 +541,12 @@ connected(EventType, Event, State) ->
 %% Common Event Handling
 %%====================================================================
 
-handle_common_event({call, From}, getstat, _StateName, #state{conn_ref = ConnRef} = State) ->
+handle_common_event({call, From}, getstat, _StateName, #state{conn = Conn} = State) ->
     %% Use QUIC-level packet counts for liveness detection
     %% This ensures any QUIC activity (ACKs, PINGs) counts as proof of liveness,
     %% even when application-level data is blocked by flow control.
     {RecvCnt, SendCnt} =
-        case quic:get_stats(ConnRef) of
+        case quic:get_stats(Conn) of
             {ok, #{packets_received := PR, packets_sent := PS}} ->
                 {PR, PS};
             _ ->
@@ -581,10 +559,10 @@ handle_common_event(
     {call, From},
     {get_address, Node},
     _StateName,
-    #state{conn_ref = ConnRef} = State
+    #state{conn = Conn} = State
 ) ->
     Address =
-        case quic:peername(ConnRef) of
+        case quic:peername(Conn) of
             {ok, {IP, Port}} ->
                 #net_address{
                     address = {IP, Port},
@@ -637,10 +615,10 @@ handle_common_event(
 %% Handle incoming QUIC messages
 handle_common_event(
     info,
-    {quic, ConnRef, {stream_data, StreamId, Data, _Fin}},
+    {quic, Conn, {stream_data, StreamId, Data, _Fin}},
     StateName,
     #state{
-        conn_ref = ConnRef,
+        conn = Conn,
         control_stream = CtrlStream
     } = State
 ) ->
@@ -654,42 +632,42 @@ handle_common_event(
     end;
 handle_common_event(
     info,
-    {quic, ConnRef, {session_ticket, Ticket}},
+    {quic, Conn, {session_ticket, Ticket}},
     _StateName,
-    #state{conn_ref = ConnRef} = State
+    #state{conn = Conn} = State
 ) ->
     %% Store session ticket for 0-RTT
     {keep_state, State#state{session_ticket = Ticket}};
 handle_common_event(
     info,
-    {quic, ConnRef, {connected, _Info}},
+    {quic, Conn, {connected, _Info}},
     _StateName,
-    #state{conn_ref = ConnRef} = State
+    #state{conn = Conn} = State
 ) ->
     %% Connection fully established - we may receive this after transitioning
     %% to handshaking state, just acknowledge and continue
     {keep_state, State};
 handle_common_event(
     info,
-    {quic, ConnRef, {stream_opened, _StreamId}},
+    {quic, Conn, {stream_opened, _StreamId}},
     _StateName,
-    #state{conn_ref = ConnRef} = State
+    #state{conn = Conn} = State
 ) ->
     %% New stream opened by peer - for distribution, we primarily use stream 0
     {keep_state, State};
 handle_common_event(
     info,
-    {quic, ConnRef, {closed, Reason}},
+    {quic, Conn, {closed, Reason}},
     _StateName,
-    #state{conn_ref = ConnRef} = State
+    #state{conn = Conn} = State
 ) ->
     %% Connection closed
     {stop, {connection_closed, Reason}, State};
 handle_common_event(
     info,
-    {quic, ConnRef, {transport_error, Code, Reason}},
+    {quic, Conn, {transport_error, Code, Reason}},
     _StateName,
-    #state{conn_ref = ConnRef} = State
+    #state{conn = Conn} = State
 ) ->
     {stop, {transport_error, Code, Reason}, State};
 handle_common_event(
@@ -698,7 +676,7 @@ handle_common_event(
     _StateName,
     State
 ) ->
-    %% Stream data with non-matching ConnRef (should not happen)
+    %% Stream data with non-matching Conn (should not happen)
     ?LOG_WARNING(
         #{
             what => stream_data_conn_mismatch,
@@ -726,8 +704,8 @@ handle_common_event(_EventType, _Event, _StateName, State) ->
 
 %% @private
 %% Open the control stream (client only - server uses stream 0 from client).
-open_control_stream(#state{conn_ref = ConnRef} = State) ->
-    case quic:open_stream(ConnRef) of
+open_control_stream(#state{conn = Conn} = State) ->
+    case quic:open_stream(Conn) of
         {ok, StreamId} ->
             {ok, StreamId, State};
         Error ->
@@ -738,8 +716,8 @@ open_control_stream(#state{conn_ref = ConnRef} = State) ->
 %% Open data streams for message passing.
 open_data_streams(State, 0) ->
     {ok, State};
-open_data_streams(#state{conn_ref = ConnRef, data_streams = Streams} = State, N) ->
-    case quic:open_stream(ConnRef) of
+open_data_streams(#state{conn = Conn, data_streams = Streams} = State, N) ->
+    case quic:open_stream(Conn) of
         {ok, StreamId} ->
             %% Set priority (lower than control, but reasonable)
             ok = set_stream_priority(State, StreamId, ?QUIC_DIST_URGENCY_DATA_NORMAL),
@@ -751,8 +729,8 @@ open_data_streams(#state{conn_ref = ConnRef, data_streams = Streams} = State, N)
     end.
 
 %% @private
-set_stream_priority(#state{conn_ref = ConnRef}, StreamId, Urgency) ->
-    quic:set_stream_priority(ConnRef, StreamId, Urgency, false).
+set_stream_priority(#state{conn = Conn}, StreamId, Urgency) ->
+    quic:set_stream_priority(Conn, StreamId, Urgency, false).
 
 %% @private
 %% Open server-initiated data streams after handshake.
@@ -812,7 +790,7 @@ forward_pending_data(State) ->
 do_send_control(
     Data,
     #state{
-        conn_ref = ConnRef,
+        conn = Conn,
         control_stream = StreamId,
         send_cnt = SendCnt,
         send_oct = SendOct
@@ -821,7 +799,7 @@ do_send_control(
     DataBin = iolist_to_binary(Data),
     Len = byte_size(DataBin),
 
-    case quic:send_data(ConnRef, StreamId, DataBin, false) of
+    case quic:send_data(Conn, StreamId, DataBin, false) of
         ok ->
             Now = erlang:monotonic_time(millisecond),
             {ok, State#state{
@@ -839,7 +817,7 @@ do_send_control(
 do_send_data(
     Data,
     #state{
-        conn_ref = ConnRef,
+        conn = Conn,
         data_streams = Streams,
         data_stream_idx = Idx,
         send_cnt = SendCnt,
@@ -852,7 +830,7 @@ do_send_data(
     DataBin = iolist_to_binary(Data),
     Len = byte_size(DataBin),
 
-    case quic:send_data(ConnRef, StreamId, DataBin, false) of
+    case quic:send_data(Conn, StreamId, DataBin, false) of
         ok ->
             Now = erlang:monotonic_time(millisecond),
             {ok, State#state{
@@ -875,13 +853,13 @@ do_send_data(Data, State) ->
 %% 2. Stream tick - needed for Erlang distribution response mechanism
 %% Returns updated state with pending_tick flag set if stream send failed.
 %% Starts a retry timer when tick is blocked to ensure retry during idle periods.
-do_send_tick_frame(#state{conn_ref = ConnRef, control_stream = CtrlStream} = State) when
+do_send_tick_frame(#state{conn = Conn, control_stream = CtrlStream} = State) when
     CtrlStream =/= undefined
 ->
     %% Send QUIC PING to keep transport alive (bypasses congestion)
-    _ = quic:send_ping(ConnRef),
+    _ = quic:send_ping(Conn),
     %% Also send stream-based tick for Erlang distribution protocol
-    case quic:send_data(ConnRef, CtrlStream, <<0:32/big-unsigned>>, false) of
+    case quic:send_data(Conn, CtrlStream, <<0:32/big-unsigned>>, false) of
         ok ->
             Now = erlang:monotonic_time(millisecond),
             cancel_pending_tick_timer(State#state{pending_tick = false, last_send_time = Now});
@@ -895,10 +873,10 @@ do_send_tick_frame(#state{conn_ref = ConnRef, control_stream = CtrlStream} = Sta
             %% Other error - clear pending
             cancel_pending_tick_timer(State#state{pending_tick = false})
     end;
-do_send_tick_frame(#state{conn_ref = ConnRef, data_streams = [FirstStream | _]} = State) ->
+do_send_tick_frame(#state{conn = Conn, data_streams = [FirstStream | _]} = State) ->
     %% Fallback to data stream if no control stream
-    _ = quic:send_ping(ConnRef),
-    case quic:send_data(ConnRef, FirstStream, <<0:32/big-unsigned>>, false) of
+    _ = quic:send_ping(Conn),
+    case quic:send_data(Conn, FirstStream, <<0:32/big-unsigned>>, false) of
         ok ->
             Now = erlang:monotonic_time(millisecond),
             cancel_pending_tick_timer(State#state{pending_tick = false, last_send_time = Now});
@@ -951,38 +929,38 @@ maybe_retry_pending_tick(#state{pending_tick = true} = State) ->
 send_dist_data_limited(
     #state{
         dhandle = DHandle,
-        conn_ref = ConnRef,
+        conn = Conn,
         data_streams = [FirstStream | _],
         max_pull = MaxPull
     } = State
 ) ->
     %% Use first data stream for all distribution data to maintain ordering
-    send_dist_data_limited_loop(DHandle, ConnRef, FirstStream, MaxPull, State);
+    send_dist_data_limited_loop(DHandle, Conn, FirstStream, MaxPull, State);
 send_dist_data_limited(
     #state{
         dhandle = DHandle,
-        conn_ref = ConnRef,
+        conn = Conn,
         control_stream = CtrlStream,
         max_pull = MaxPull
     } = State
 ) ->
     %% Fallback: no data streams, use control stream
-    send_dist_data_limited_loop(DHandle, ConnRef, CtrlStream, MaxPull, State).
+    send_dist_data_limited_loop(DHandle, Conn, CtrlStream, MaxPull, State).
 
 %% @private
 %% Send distribution data with limited pulls per notification.
 %% Buffers unsent data in send_queue instead of dropping it.
-send_dist_data_limited_loop(_DHandle, _ConnRef, _StreamId, 0, State) ->
+send_dist_data_limited_loop(_DHandle, _Conn, _StreamId, 0, State) ->
     %% Pulled enough for now
     State;
-send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining, State) ->
+send_dist_data_limited_loop(DHandle, Conn, StreamId, Remaining, State) ->
     case erlang:dist_ctrl_get_data(DHandle) of
         none ->
             State;
         Data ->
-            case send_one_frame(ConnRef, StreamId, Data) of
+            case send_one_frame(Conn, StreamId, Data) of
                 ok ->
-                    send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining - 1, State);
+                    send_dist_data_limited_loop(DHandle, Conn, StreamId, Remaining - 1, State);
                 {error, send_queue_full} ->
                     %% Queue full - buffer the data we already pulled
                     enqueue_send_data(Data, State);
@@ -991,7 +969,7 @@ send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining, State) ->
                     enqueue_send_data(Data, State);
                 {error, _} ->
                     %% Other error - continue trying (don't lose the data)
-                    send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining - 1, State)
+                    send_dist_data_limited_loop(DHandle, Conn, StreamId, Remaining - 1, State)
             end
     end.
 
@@ -1003,36 +981,36 @@ send_dist_data_limited_loop(DHandle, ConnRef, StreamId, Remaining, State) ->
 send_dist_data_with_tick(
     #state{
         dhandle = DHandle,
-        conn_ref = ConnRef,
+        conn = Conn,
         data_streams = [FirstStream | _],
         max_pull = MaxPull
     } = State
 ) ->
-    send_dist_data_loop_tick(DHandle, ConnRef, FirstStream, MaxPull, State);
+    send_dist_data_loop_tick(DHandle, Conn, FirstStream, MaxPull, State);
 send_dist_data_with_tick(
     #state{
         dhandle = DHandle,
-        conn_ref = ConnRef,
+        conn = Conn,
         control_stream = CtrlStream,
         max_pull = MaxPull
     } = State
 ) ->
-    send_dist_data_loop_tick(DHandle, ConnRef, CtrlStream, MaxPull, State).
+    send_dist_data_loop_tick(DHandle, Conn, CtrlStream, MaxPull, State).
 
 %% @private
 %% Send distribution data with pull limit to prevent tick callback blocking.
 %% Buffers unsent data in send_queue instead of dropping it.
-send_dist_data_loop_tick(_DHandle, _ConnRef, _StreamId, 0, State) ->
+send_dist_data_loop_tick(_DHandle, _Conn, _StreamId, 0, State) ->
     %% Reached pull limit - stop to avoid blocking tick callback
     State;
-send_dist_data_loop_tick(DHandle, ConnRef, StreamId, Remaining, State) ->
+send_dist_data_loop_tick(DHandle, Conn, StreamId, Remaining, State) ->
     case erlang:dist_ctrl_get_data(DHandle) of
         none ->
             State;
         Data ->
-            case send_one_frame(ConnRef, StreamId, Data) of
+            case send_one_frame(Conn, StreamId, Data) of
                 ok ->
-                    send_dist_data_loop_tick(DHandle, ConnRef, StreamId, Remaining - 1, State);
+                    send_dist_data_loop_tick(DHandle, Conn, StreamId, Remaining - 1, State);
                 {error, send_queue_full} ->
                     %% Queue full - buffer the data we already pulled
                     enqueue_send_data(Data, State);
@@ -1054,27 +1032,27 @@ enqueue_send_data(Data, #state{send_queue = Queue} = State) ->
 %% Drain the send queue - try to send any buffered data.
 %% Returns updated state with remaining unsent data in queue.
 drain_send_queue(
-    #state{send_queue = Queue, conn_ref = ConnRef, data_streams = [FirstStream | _]} = State
+    #state{send_queue = Queue, conn = Conn, data_streams = [FirstStream | _]} = State
 ) ->
-    drain_send_queue_loop(Queue, ConnRef, FirstStream, State);
+    drain_send_queue_loop(Queue, Conn, FirstStream, State);
 drain_send_queue(
-    #state{send_queue = Queue, conn_ref = ConnRef, control_stream = CtrlStream} = State
+    #state{send_queue = Queue, conn = Conn, control_stream = CtrlStream} = State
 ) when
     CtrlStream =/= undefined
 ->
-    drain_send_queue_loop(Queue, ConnRef, CtrlStream, State);
+    drain_send_queue_loop(Queue, Conn, CtrlStream, State);
 drain_send_queue(State) ->
     State.
 
-drain_send_queue_loop(Queue, ConnRef, StreamId, State) ->
+drain_send_queue_loop(Queue, Conn, StreamId, State) ->
     case queue:out(Queue) of
         {empty, _} ->
             State#state{send_queue = Queue};
         {{value, Data}, RestQueue} ->
-            case send_one_frame(ConnRef, StreamId, Data) of
+            case send_one_frame(Conn, StreamId, Data) of
                 ok ->
                     %% Sent successfully, continue draining
-                    drain_send_queue_loop(RestQueue, ConnRef, StreamId, State);
+                    drain_send_queue_loop(RestQueue, Conn, StreamId, State);
                 {error, _} ->
                     %% Failed to send - put data back and stop
                     %% (data is already at front since we just dequeued it)
@@ -1086,13 +1064,13 @@ drain_send_queue_loop(Queue, ConnRef, StreamId, State) ->
 %% Send a single framed message.
 %% Adds 4-byte big-endian length prefix for message framing over QUIC.
 %% Returns ok on success or {error, Reason} on failure.
-send_one_frame(ConnRef, StreamId, Data) ->
+send_one_frame(Conn, StreamId, Data) ->
     %% dist_ctrl_get_data returns raw message data (no length prefix)
     %% We add 4-byte length prefix for framing over QUIC
     DataBin = iolist_to_binary(Data),
     Length = byte_size(DataBin),
     FramedData = <<Length:32/big-unsigned, DataBin/binary>>,
-    case quic:send_data(ConnRef, StreamId, FramedData, false) of
+    case quic:send_data(Conn, StreamId, FramedData, false) of
         ok -> ok;
         {error, Reason} -> {error, Reason}
     end.
@@ -1111,18 +1089,18 @@ send_one_frame(ConnRef, StreamId, Data) ->
 %% QUIC delivers data in arbitrary chunks (typically ~1100 bytes due to MTU).
 %% We MUST buffer incoming data and only pass complete messages to the VM.
 %% Passing partial messages causes "corrupted distribution header" errors.
-input_handler_loop(DHandle, Controller, ConnRef, ControlStream) ->
+input_handler_loop(DHandle, Controller, Conn, ControlStream) ->
     %% Start with empty buffer
-    input_handler_loop(DHandle, Controller, ConnRef, ControlStream, <<>>).
+    input_handler_loop(DHandle, Controller, Conn, ControlStream, <<>>).
 
-input_handler_loop(DHandle, Controller, ConnRef, ControlStream, Buffer) ->
+input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffer) ->
     receive
         {continue_delivery, PendingBuffer} ->
             %% Continue processing after batch yield
             case deliver_complete_messages(DHandle, PendingBuffer) of
                 {ok, RemainingBuffer} ->
                     input_handler_loop(
-                        DHandle, Controller, ConnRef, ControlStream, RemainingBuffer
+                        DHandle, Controller, Conn, ControlStream, RemainingBuffer
                     );
                 {error, _Reason} ->
                     exit(normal)
@@ -1133,7 +1111,7 @@ input_handler_loop(DHandle, Controller, ConnRef, ControlStream, Buffer) ->
             case deliver_complete_messages(DHandle, NewBuffer) of
                 {ok, RemainingBuffer} ->
                     input_handler_loop(
-                        DHandle, Controller, ConnRef, ControlStream, RemainingBuffer
+                        DHandle, Controller, Conn, ControlStream, RemainingBuffer
                     );
                 {error, _Reason} ->
                     %% Error delivering to VM, connection is broken
@@ -1142,25 +1120,25 @@ input_handler_loop(DHandle, Controller, ConnRef, ControlStream, Buffer) ->
         {'EXIT', Controller, Reason} ->
             %% Controller died, exit
             exit(Reason);
-        {quic, ConnRef, {stream_data, _StreamId, Data, _Fin}} ->
+        {quic, Conn, {stream_data, _StreamId, Data, _Fin}} ->
             %% Direct QUIC data (if we're receiving messages directly)
             NewBuffer = <<Buffer/binary, Data/binary>>,
             case deliver_complete_messages(DHandle, NewBuffer) of
                 {ok, RemainingBuffer} ->
                     input_handler_loop(
-                        DHandle, Controller, ConnRef, ControlStream, RemainingBuffer
+                        DHandle, Controller, Conn, ControlStream, RemainingBuffer
                     );
                 {error, _Reason} ->
                     exit(normal)
             end;
-        {quic, ConnRef, {closed, _Reason}} ->
+        {quic, Conn, {closed, _Reason}} ->
             exit(normal);
         Other ->
             logger:warning(
                 #{what => input_handler_unexpected_msg, msg => Other},
                 ?QUIC_LOG_META
             ),
-            input_handler_loop(DHandle, Controller, ConnRef, ControlStream, Buffer)
+            input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffer)
     end.
 
 %% @private

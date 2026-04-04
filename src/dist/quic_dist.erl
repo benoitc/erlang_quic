@@ -419,8 +419,8 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
                 %% instead of PMTU probing which adds overhead
                 max_udp_payload_size => ?DIST_MAX_UDP_PAYLOAD_SIZE,
                 pmtu_enabled => false,
-                connection_handler => fun(ConnPid, ConnRef) ->
-                    handle_new_connection(ConnPid, ConnRef)
+                connection_handler => fun(Conn) ->
+                    handle_new_connection(Conn)
                 end
             },
 
@@ -547,13 +547,13 @@ load_credentials(_) ->
 
 %% @private
 %% Handle a new incoming QUIC connection.
-handle_new_connection(ConnPid, ConnRef) ->
+handle_new_connection(Conn) ->
     error_logger:info_msg(
-        "quic_dist: handle_new_connection called, ConnPid=~p, ConnRef=~p~n",
-        [ConnPid, ConnRef]
+        "quic_dist: handle_new_connection called, Conn=~p~n",
+        [Conn]
     ),
     %% Start distribution controller for this connection
-    case quic_dist_controller:start_link(ConnPid, ConnRef, server) of
+    case quic_dist_controller:start_link(Conn, server) of
         {ok, ControllerPid} ->
             error_logger:info_msg("quic_dist: server controller started: ~p~n", [ControllerPid]),
             %% Notify the acceptor about the new connection
@@ -857,9 +857,9 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
 
             %% Attempt connection
             case quic:connect(Host, Port, Opts, self()) of
-                {ok, ConnRef} ->
+                {ok, Conn} ->
                     %% Wait for connection to be established
-                    wait_for_connection(Kernel, Node, ConnRef, MyNode, Type, Timer);
+                    wait_for_connection(Kernel, Node, Conn, MyNode, Type, Timer);
                 {error, Reason} ->
                     ?shutdown2(Node, {connect_failed, Reason})
             end;
@@ -868,11 +868,11 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
     end.
 
 %% @private
-wait_for_connection(Kernel, Node, ConnRef, MyNode, Type, Timer) ->
+wait_for_connection(Kernel, Node, Conn, MyNode, Type, Timer) ->
     receive
-        {quic, ConnRef, {connected, _Info}} ->
+        {quic, Conn, {connected, _Info}} ->
             %% Start distribution controller
-            case quic_dist_controller:start_link(ConnRef, client) of
+            case quic_dist_controller:start_link(Conn, client) of
                 {ok, DistCtrl} ->
                     %% Set kernel on controller and store node
                     quic_dist_controller:set_supervisor(DistCtrl, Kernel),
@@ -881,15 +881,15 @@ wait_for_connection(Kernel, Node, ConnRef, MyNode, Type, Timer) ->
                     HSData = create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer),
                     dist_util:handshake_we_started(HSData);
                 {error, Reason} ->
-                    quic:close(ConnRef, normal),
+                    quic:close(Conn, normal),
                     ?shutdown2(Node, {controller_failed, Reason})
             end;
-        {quic, ConnRef, {closed, Reason}} ->
+        {quic, Conn, {closed, Reason}} ->
             ?shutdown2(Node, {closed, Reason});
-        {quic, ConnRef, {transport_error, Code, Reason}} ->
+        {quic, Conn, {transport_error, Code, Reason}} ->
             ?shutdown2(Node, {transport_error, Code, Reason});
         {'EXIT', Timer, setup_timer_timeout} ->
-            quic:close(ConnRef, timeout),
+            quic:close(Conn, timeout),
             ?shutdown2(Node, connect_timeout)
     end.
 

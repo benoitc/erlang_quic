@@ -9,29 +9,29 @@ This guide covers connecting to QUIC servers and using client features.
 application:ensure_all_started(quic).
 
 %% Connect to a server
-{ok, ConnRef} = quic:connect("example.com", 443, #{
+{ok, Conn} = quic:connect("example.com", 443, #{
     alpn => [<<"h3">>],
     verify => false  % For testing only!
 }, self()).
 
 %% Wait for connection
 receive
-    {quic, ConnRef, {connected, Info}} ->
+    {quic, Conn, {connected, Info}} ->
         io:format("Connected! ALPN: ~p~n", [maps:get(alpn_protocol, Info)])
 end.
 
 %% Open a stream and send data
-{ok, StreamId} = quic:open_stream(ConnRef),
-ok = quic:send_data(ConnRef, StreamId, <<"Hello, QUIC!">>, true).
+{ok, StreamId} = quic:open_stream(Conn),
+ok = quic:send_data(Conn, StreamId, <<"Hello, QUIC!">>, true).
 
 %% Receive response
 receive
-    {quic, ConnRef, {stream_data, StreamId, Data, _Fin}} ->
+    {quic, Conn, {stream_data, StreamId, Data, _Fin}} ->
         io:format("Received: ~p~n", [Data])
 end.
 
 %% Close connection
-quic:close(ConnRef, normal).
+quic:close(Conn, normal).
 ```
 
 ## Connection Options
@@ -82,26 +82,26 @@ quic:close(ConnRef, normal).
 
 ```erlang
 %% Open bidirectional stream
-{ok, BidiStreamId} = quic:open_stream(ConnRef).
+{ok, BidiStreamId} = quic:open_stream(Conn).
 
 %% Open unidirectional stream (send-only)
-{ok, UniStreamId} = quic:open_unidirectional_stream(ConnRef).
+{ok, UniStreamId} = quic:open_unidirectional_stream(Conn).
 
 %% Send data (Fin=true closes the send side)
-ok = quic:send_data(ConnRef, StreamId, <<"data">>, false),
-ok = quic:send_data(ConnRef, StreamId, <<"more">>, true).  % Final
+ok = quic:send_data(Conn, StreamId, <<"data">>, false),
+ok = quic:send_data(Conn, StreamId, <<"more">>, true).  % Final
 
 %% Send with timeout
-case quic:send_data(ConnRef, StreamId, Data, true, 5000) of
+case quic:send_data(Conn, StreamId, Data, true, 5000) of
     ok -> sent;
     {error, timeout} -> handle_timeout()
 end.
 
 %% Reset a stream with error code
-ok = quic:reset_stream(ConnRef, StreamId, 0).
+ok = quic:reset_stream(Conn, StreamId, 0).
 
 %% Request peer to stop sending
-ok = quic:stop_sending(ConnRef, StreamId, 0).
+ok = quic:stop_sending(Conn, StreamId, 0).
 ```
 
 ### Stream Prioritization (RFC 9218)
@@ -110,33 +110,33 @@ ok = quic:stop_sending(ConnRef, StreamId, 0).
 %% Set stream priority
 %% Urgency: 0-7 (0 = most urgent, default 3)
 %% Incremental: true if data can be processed incrementally
-ok = quic:set_stream_priority(ConnRef, StreamId, 0, false).
+ok = quic:set_stream_priority(Conn, StreamId, 0, false).
 
 %% Get current priority
-{ok, {Urgency, Incremental}} = quic:get_stream_priority(ConnRef, StreamId).
+{ok, {Urgency, Incremental}} = quic:get_stream_priority(Conn, StreamId).
 ```
 
 ### Stream Deadlines
 
 ```erlang
 %% Set a 5-second deadline on a stream
-ok = quic:set_stream_deadline(ConnRef, StreamId, 5000).
+ok = quic:set_stream_deadline(Conn, StreamId, 5000).
 
 %% Set deadline with custom action
-ok = quic:set_stream_deadline(ConnRef, StreamId, 5000, #{
+ok = quic:set_stream_deadline(Conn, StreamId, 5000, #{
     action => notify,  % notify | reset | both
     error_code => 16#FF
 }).
 
 %% Check remaining time
-{ok, {RemainingMs, Action}} = quic:get_stream_deadline(ConnRef, StreamId).
+{ok, {RemainingMs, Action}} = quic:get_stream_deadline(Conn, StreamId).
 
 %% Cancel deadline
-ok = quic:cancel_stream_deadline(ConnRef, StreamId).
+ok = quic:cancel_stream_deadline(Conn, StreamId).
 
 %% Handle deadline expiration
 receive
-    {quic, ConnRef, {stream_deadline, StreamId}} ->
+    {quic, Conn, {stream_deadline, StreamId}} ->
         handle_deadline_expired(StreamId)
 end.
 ```
@@ -145,19 +145,19 @@ end.
 
 ```erlang
 %% Enable datagrams (both client and server must enable)
-{ok, ConnRef} = quic:connect(Host, Port, #{
+{ok, Conn} = quic:connect(Host, Port, #{
     max_datagram_frame_size => 65535  % Accept any size
 }, self()).
 
 %% Check if datagrams are supported
-MaxSize = quic:datagram_max_size(ConnRef),
+MaxSize = quic:datagram_max_size(Conn),
 case MaxSize of
     0 -> io:format("Datagrams not supported~n");
     _ -> io:format("Max datagram size: ~p~n", [MaxSize])
 end.
 
 %% Send a datagram (unreliable, not retransmitted)
-case quic:send_datagram(ConnRef, <<"game_state">>) of
+case quic:send_datagram(Conn, <<"game_state">>) of
     ok -> sent;
     {error, datagrams_not_supported} -> not_supported;
     {error, datagram_too_large} -> too_big;
@@ -166,7 +166,7 @@ end.
 
 %% Receive datagrams
 receive
-    {quic, ConnRef, {datagram, Data}} ->
+    {quic, Conn, {datagram, Data}} ->
         handle_datagram(Data)
 end.
 ```
@@ -176,7 +176,7 @@ end.
 ```erlang
 %% Trigger migration to a new local address
 %% (e.g., when switching from WiFi to cellular)
-ok = quic:migrate(ConnRef).
+ok = quic:migrate(Conn).
 
 %% The connection will:
 %% 1. Bind to a new local socket
@@ -189,13 +189,13 @@ ok = quic:migrate(ConnRef).
 
 ```erlang
 %% Bind to a specific local IP using extra_socket_opts
-{ok, ConnRef} = quic:connect(Host, Port, #{
+{ok, Conn} = quic:connect(Host, Port, #{
     extra_socket_opts => [{ip, {192,168,1,10}}]
 }, self()).
 
 %% Use a pre-opened socket for full control
 {ok, Sock} = gen_udp:open(0, [binary, inet, {ip, {192,168,1,10}}]),
-{ok, ConnRef} = quic:connect(Host, Port, #{
+{ok, Conn} = quic:connect(Host, Port, #{
     socket => Sock
 }, self()).
 
@@ -208,14 +208,14 @@ ok = quic:migrate(ConnRef).
 ```erlang
 %% First connection - receive session ticket
 receive
-    {quic, ConnRef, {session_ticket, Ticket}} ->
+    {quic, Conn, {session_ticket, Ticket}} ->
         %% Store ticket for later use
         store_ticket(Host, Ticket)
 end.
 
 %% Later connection - use stored ticket
 StoredTicket = get_ticket(Host),
-{ok, ConnRef2} = quic:connect(Host, Port, #{
+{ok, Conn2} = quic:connect(Host, Port, #{
     session_ticket => StoredTicket,
     early_data => <<"request">>  % Sent with 0-RTT
 }, self()).
@@ -225,19 +225,19 @@ StoredTicket = get_ticket(Host),
 
 ```erlang
 %% Get peer address
-{ok, {IP, Port}} = quic:peername(ConnRef).
+{ok, {IP, Port}} = quic:peername(Conn).
 
 %% Get local address
-{ok, {LocalIP, LocalPort}} = quic:sockname(ConnRef).
+{ok, {LocalIP, LocalPort}} = quic:sockname(Conn).
 
 %% Get peer certificate
-{ok, CertDer} = quic:peercert(ConnRef).
+{ok, CertDer} = quic:peercert(Conn).
 
 %% Get current MTU
-{ok, MTU} = quic:get_mtu(ConnRef).
+{ok, MTU} = quic:get_mtu(Conn).
 
 %% Get connection statistics
-{ok, Stats} = quic:get_stats(ConnRef).
+{ok, Stats} = quic:get_stats(Conn).
 %% Stats = #{
 %%     packets_sent => 150,
 %%     packets_received => 148,
@@ -250,7 +250,7 @@ StoredTicket = get_ticket(Host),
 
 ```erlang
 %% Check send queue status for backpressure
-{ok, Info} = quic:get_send_queue_info(ConnRef).
+{ok, Info} = quic:get_send_queue_info(Conn).
 %% Info = #{
 %%     bytes => 5000,        % Bytes queued
 %%     cwnd => 14720,        % Congestion window
@@ -271,31 +271,31 @@ Messages sent to the owner process:
 
 | Message | Description |
 |---------|-------------|
-| `{quic, Ref, {connected, Info}}` | Connection established |
-| `{quic, Ref, {stream_opened, StreamId}}` | Peer opened a stream |
-| `{quic, Ref, {stream_data, StreamId, Data, Fin}}` | Data received |
-| `{quic, Ref, {stream_reset, StreamId, Code}}` | Stream reset by peer |
-| `{quic, Ref, {stop_sending, StreamId, Code}}` | Stop sending requested |
-| `{quic, Ref, {datagram, Data}}` | Datagram received |
-| `{quic, Ref, {session_ticket, Ticket}}` | Session ticket for 0-RTT |
-| `{quic, Ref, {stream_deadline, StreamId}}` | Stream deadline expired |
-| `{quic, Ref, {send_ready, StreamId}}` | Stream ready to write |
-| `{quic, Ref, {closed, Reason}}` | Connection closed |
-| `{quic, Ref, {transport_error, Code, Reason}}` | Transport error |
+| `{quic, Conn, {connected, Info}}` | Connection established |
+| `{quic, Conn, {stream_opened, StreamId}}` | Peer opened a stream |
+| `{quic, Conn, {stream_data, StreamId, Data, Fin}}` | Data received |
+| `{quic, Conn, {stream_reset, StreamId, Code}}` | Stream reset by peer |
+| `{quic, Conn, {stop_sending, StreamId, Code}}` | Stop sending requested |
+| `{quic, Conn, {datagram, Data}}` | Datagram received |
+| `{quic, Conn, {session_ticket, Ticket}}` | Session ticket for 0-RTT |
+| `{quic, Conn, {stream_deadline, StreamId}}` | Stream deadline expired |
+| `{quic, Conn, {send_ready, StreamId}}` | Stream ready to write |
+| `{quic, Conn, {closed, Reason}}` | Connection closed |
+| `{quic, Conn, {transport_error, Code, Reason}}` | Transport error |
 
 ## Error Handling
 
 ```erlang
 %% Connection errors
 case quic:connect(Host, Port, Opts, self()) of
-    {ok, ConnRef} ->
-        wait_for_connection(ConnRef);
+    {ok, Conn} ->
+        wait_for_connection(Conn);
     {error, Reason} ->
         handle_connect_error(Reason)
 end.
 
 %% Stream errors
-case quic:send_data(ConnRef, StreamId, Data, true) of
+case quic:send_data(Conn, StreamId, Data, true) of
     ok -> ok;
     {error, not_found} -> connection_gone();
     {error, stream_closed} -> stream_gone();
@@ -304,11 +304,11 @@ end.
 
 %% Handle connection close
 receive
-    {quic, ConnRef, {closed, normal}} ->
+    {quic, Conn, {closed, normal}} ->
         ok;
-    {quic, ConnRef, {closed, idle_timeout}} ->
+    {quic, Conn, {closed, idle_timeout}} ->
         reconnect();
-    {quic, ConnRef, {transport_error, Code, Reason}} ->
+    {quic, Conn, {transport_error, Code, Reason}} ->
         log_error(Code, Reason)
 end.
 ```
@@ -333,12 +333,12 @@ end.
 ```erlang
 %% For multiple requests to same server, reuse connections
 %% Open multiple streams on single connection
-{ok, ConnRef} = quic:connect(Host, Port, Opts, self()),
+{ok, Conn} = quic:connect(Host, Port, Opts, self()),
 
 %% Concurrent requests on same connection
-{ok, Stream1} = quic:open_stream(ConnRef),
-{ok, Stream2} = quic:open_stream(ConnRef),
-{ok, Stream3} = quic:open_stream(ConnRef).
+{ok, Stream1} = quic:open_stream(Conn),
+{ok, Stream2} = quic:open_stream(Conn),
+{ok, Stream3} = quic:open_stream(Conn).
 ```
 
 ### 3. Graceful Shutdown
@@ -346,12 +346,12 @@ end.
 ```erlang
 %% Close streams before closing connection
 lists:foreach(fun(StreamId) ->
-    quic:send_data(ConnRef, StreamId, <<>>, true)
+    quic:send_data(Conn, StreamId, <<>>, true)
 end, OpenStreams),
 
 %% Wait for acknowledgment, then close
 timer:sleep(100),
-quic:close(ConnRef, normal).
+quic:close(Conn, normal).
 ```
 
 ### 4. Timeout Handling
@@ -359,15 +359,15 @@ quic:close(ConnRef, normal).
 ```erlang
 %% Set appropriate timeouts
 connect_with_timeout(Host, Port) ->
-    {ok, ConnRef} = quic:connect(Host, Port, #{
+    {ok, Conn} = quic:connect(Host, Port, #{
         idle_timeout => 30000
     }, self()),
 
     receive
-        {quic, ConnRef, {connected, _}} ->
-            {ok, ConnRef}
+        {quic, Conn, {connected, _}} ->
+            {ok, Conn}
     after 10000 ->
-        quic:close(ConnRef, timeout),
+        quic:close(Conn, timeout),
         {error, connection_timeout}
     end.
 ```
@@ -394,38 +394,38 @@ quic:connect(Host, Port, #{
 
 request(Host, Port, Path) ->
     %% Connect
-    {ok, ConnRef} = quic:connect(Host, Port, #{
+    {ok, Conn} = quic:connect(Host, Port, #{
         alpn => [<<"h3">>],
         verify => false
     }, self()),
 
     receive
-        {quic, ConnRef, {connected, _}} -> ok
+        {quic, Conn, {connected, _}} -> ok
     after 5000 ->
-        quic:close(ConnRef, timeout),
+        quic:close(Conn, timeout),
         exit(connection_timeout)
     end,
 
     %% Open request stream
-    {ok, StreamId} = quic:open_stream(ConnRef),
+    {ok, StreamId} = quic:open_stream(Conn),
 
     %% Send request (simplified, not real H3)
     Request = <<"GET ", Path/binary, " HTTP/3\r\n\r\n">>,
-    ok = quic:send_data(ConnRef, StreamId, Request, true),
+    ok = quic:send_data(Conn, StreamId, Request, true),
 
     %% Receive response
-    Response = receive_response(ConnRef, StreamId, <<>>),
+    Response = receive_response(Conn, StreamId, <<>>),
 
-    quic:close(ConnRef, normal),
+    quic:close(Conn, normal),
     Response.
 
-receive_response(ConnRef, StreamId, Acc) ->
+receive_response(Conn, StreamId, Acc) ->
     receive
-        {quic, ConnRef, {stream_data, StreamId, Data, false}} ->
-            receive_response(ConnRef, StreamId, <<Acc/binary, Data/binary>>);
-        {quic, ConnRef, {stream_data, StreamId, Data, true}} ->
+        {quic, Conn, {stream_data, StreamId, Data, false}} ->
+            receive_response(Conn, StreamId, <<Acc/binary, Data/binary>>);
+        {quic, Conn, {stream_data, StreamId, Data, true}} ->
             <<Acc/binary, Data/binary>>;
-        {quic, ConnRef, {closed, _}} ->
+        {quic, Conn, {closed, _}} ->
             Acc
     after 10000 ->
         Acc
@@ -444,8 +444,8 @@ receive_response(ConnRef, StreamId, Acc) ->
 ### Slow Performance
 
 1. Check for packet loss with QLOG
-2. Verify MTU discovery is working: `quic:get_mtu(ConnRef)`
-3. Monitor congestion: `quic:get_send_queue_info(ConnRef)`
+2. Verify MTU discovery is working: `quic:get_mtu(Conn)`
+3. Monitor congestion: `quic:get_send_queue_info(Conn)`
 4. Consider datagram API for latency-sensitive data
 
 ### Connection Drops
