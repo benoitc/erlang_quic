@@ -657,7 +657,6 @@ ecn_ce_counter(#bbr_state{ecn_ce_counter = C}) -> C.
 update_delivery_rate(
     #bbr_state{
         delivered_time = OldDeliveredTime,
-        first_sent_time = FirstSentTime,
         initial_rtt = InitialRtt,
         max_bw = MaxBw,
         max_bw_filter = Filter,
@@ -667,22 +666,22 @@ update_delivery_rate(
     _OldDeliveredTime,
     Now
 ) ->
-    %% Calculate time intervals
+    %% Calculate time since last delivery update (ACK interval).
+    %% BBR delivery rate should use ACK interval, not cumulative send time.
+    %% Per quiche BBR2: uses per-packet sent_time, not connection-level first_sent_time.
+    %% Using cumulative first_sent_time causes delivery rate to artificially decrease
+    %% over time as the interval keeps growing, leading to cwnd collapse.
     AckElapsed = Now - OldDeliveredTime,
-    SendElapsed = Now - FirstSentTime,
 
     %% For first ACK or when timing is unreliable (very small intervals),
     %% use initial_rtt as baseline to avoid spurious bandwidth estimates
     Interval =
-        case {AckElapsed, SendElapsed} of
-            {A, S} when A =< 0 andalso S =< 0 ->
-                %% First ACK - use initial_rtt
+        case AckElapsed of
+            A when A =< 1 ->
+                %% First ACK or burst - use initial_rtt
                 InitialRtt;
-            {A, S} when A =< 1 andalso S =< 1 ->
-                %% Very short interval, use initial_rtt
-                InitialRtt;
-            {A, S} ->
-                max(max(1, A), max(1, S))
+            A ->
+                max(1, A)
         end,
 
     %% delivery_rate = acked_bytes / interval (bytes per ms, then scaled to bytes/sec)
@@ -757,17 +756,29 @@ check_round_completion(
     #bbr_state{
         delivered = Delivered,
         next_round_delivered = NextRoundDelivered,
-        round_count = RoundCount
+        round_count = RoundCount,
+        in_recovery = WasInRecovery
     } = State
 ) ->
     case Delivered >= NextRoundDelivered of
         true ->
-            %% Round completed
+            %% Round completed - reset per-round state including recovery
+            %% BBRv3: Recovery state is reset per round, allowing fresh
+            %% loss detection in the next round.
+            %% Also reset inflight_hi when exiting recovery to allow
+            %% cwnd to grow again (per BBRv3 spec).
+            NewInflightHi =
+                case WasInRecovery of
+                    true -> infinity;
+                    false -> State#bbr_state.inflight_hi
+                end,
             State#bbr_state{
                 round_count = RoundCount + 1,
                 next_round_delivered = Delivered,
                 loss_in_round = 0,
-                bytes_in_round = 0
+                bytes_in_round = 0,
+                in_recovery = false,
+                inflight_hi = NewInflightHi
             };
         false ->
             State
@@ -788,20 +799,21 @@ run_state_machine(#bbr_state{state = probe_rtt} = State, Now) ->
     run_probe_rtt(State, Now).
 
 %% @private Startup state logic
+%% BBRv3: Only exit STARTUP when bandwidth plateaus (no 25% growth for 3 rounds).
+%% Loss is handled by reducing max_bw in on_congestion_event, NOT by exiting STARTUP.
+%% This prevents premature exit to DRAIN where pacing_gain drops to 0.35x.
 run_startup(
     #bbr_state{
         max_bw = MaxBw,
         startup_full_bw = FullBw,
-        startup_full_bw_count = FullBwCount,
-        in_recovery = InRecovery
+        startup_full_bw_count = FullBwCount
     } = State,
     _Now
 ) ->
-    %% Check for Startup exit conditions:
-    %% 1. Bandwidth hasn't grown by 25% for 3 consecutive rounds
-    %% 2. Or we've entered recovery (loss-based exit)
-
-    ExitForLoss = InRecovery,
+    %% Check for Startup exit condition:
+    %% Bandwidth hasn't grown by 25% for 3 consecutive rounds
+    %% Note: Loss does NOT cause STARTUP exit per BBRv3 spec.
+    %% Loss is handled separately by reducing max_bw in on_congestion_event.
 
     {NewFullBw, NewFullBwCount, ExitForBw} =
         case MaxBw >= trunc(FullBw * ?STARTUP_GROWTH_TARGET) of
@@ -820,17 +832,13 @@ run_startup(
         startup_full_bw_count = NewFullBwCount
     },
 
-    case ExitForLoss orelse ExitForBw of
+    case ExitForBw of
         true ->
             %% Exit Startup, enter Drain
             ?LOG_DEBUG(
                 #{
                     what => bbr_exit_startup,
-                    reason =>
-                        case ExitForLoss of
-                            true -> loss;
-                            false -> bandwidth_plateau
-                        end,
+                    reason => bandwidth_plateau,
                     max_bw => MaxBw
                 },
                 ?QUIC_LOG_META
@@ -1022,6 +1030,7 @@ calculate_bdp(MaxBw, MinRtt, #bbr_state{max_datagram_size = MDS}) ->
 %% @private Update cwnd based on current state
 update_cwnd(
     #bbr_state{
+        state = BbrState,
         max_bw = MaxBw,
         min_rtt = MinRtt,
         cwnd_gain = CwndGain,
@@ -1034,11 +1043,14 @@ update_cwnd(
     BDP = calculate_bdp(MaxBw, MinRtt, State),
     TargetCwnd = trunc(CwndGain * BDP),
 
-    %% Apply inflight_hi cap if set
+    %% Apply inflight_hi cap only in ProbeBW state (not in STARTUP/DRAIN)
+    %% BBRv3: During STARTUP we want to probe the full BDP without caps
     CappedCwnd =
-        case InflightHi of
-            infinity -> TargetCwnd;
-            _ -> min(TargetCwnd, InflightHi)
+        case {BbrState, InflightHi} of
+            {startup, _} -> TargetCwnd;
+            {drain, _} -> TargetCwnd;
+            {_, infinity} -> TargetCwnd;
+            {_, _} -> min(TargetCwnd, InflightHi)
         end,
 
     %% Ensure minimum

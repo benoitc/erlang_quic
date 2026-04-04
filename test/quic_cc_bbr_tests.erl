@@ -137,18 +137,59 @@ bbr_startup_processes_acks_test() ->
 %% State Transition Tests
 %%====================================================================
 
-bbr_startup_to_drain_on_loss_test() ->
-    %% When experiencing loss in startup, BBR should exit to drain
+bbr_loss_does_not_exit_startup_test() ->
+    %% BBRv3: Loss should NOT cause STARTUP exit.
+    %% STARTUP exits only on bandwidth plateau (no 25% growth for 3 rounds).
+    %% This prevents premature exit to DRAIN where pacing_gain drops to 0.35x.
     State = quic_cc_bbr:new(#{min_recovery_duration => 0}),
     S1 = quic_cc_bbr:on_packet_sent(State, 12000),
     Now = erlang:monotonic_time(millisecond),
     S2 = quic_cc_bbr:on_congestion_event(S1, Now),
     %% Should be in recovery
     ?assert(quic_cc_bbr:in_recovery(S2)),
-    %% After ACK processing, may transition out of startup
+    %% After ACK processing, should still be in STARTUP
     S3 = quic_cc_bbr:on_packets_acked(S2, 1000),
-    %% State machine should process the loss-based exit
-    ?assertNot(quic_cc_bbr:in_slow_start(S3)).
+    %% Should remain in STARTUP (not exited due to loss)
+    ?assert(quic_cc_bbr:in_slow_start(S3)).
+
+bbr_recovery_resets_after_round_test() ->
+    %% BBRv3: Recovery state should reset when a round completes.
+    %% This allows fresh loss detection in subsequent rounds.
+    State = quic_cc_bbr:new(#{min_recovery_duration => 0}),
+    %% Send data to establish next_round_delivered
+    S1 = quic_cc_bbr:on_packet_sent(State, 5000),
+    S2 = quic_cc_bbr:on_packets_acked(S1, 5000),
+    %% Enter recovery
+    Now = erlang:monotonic_time(millisecond),
+    S3 = quic_cc_bbr:on_congestion_event(S2, Now),
+    ?assert(quic_cc_bbr:in_recovery(S3)),
+    %% Send more data and ACK to complete a round
+    S4 = quic_cc_bbr:on_packet_sent(S3, 10000),
+    S5 = quic_cc_bbr:on_packets_acked(S4, 10000),
+    %% Recovery should be reset after round completion
+    ?assertNot(quic_cc_bbr:in_recovery(S5)).
+
+bbr_sustained_transfer_with_loss_test() ->
+    %% Simulate sustained transfer with occasional loss.
+    %% BBR should stay in STARTUP and continue sending at high rate.
+    State = quic_cc_bbr:new(#{min_recovery_duration => 0}),
+
+    %% Simulate multiple rounds of sending with loss events
+    S1 = simulate_transfer_round(State, 50000),
+    ?assert(quic_cc_bbr:in_slow_start(S1)),
+
+    %% Another round with congestion event
+    Now = erlang:monotonic_time(millisecond),
+    S2 = quic_cc_bbr:on_congestion_event(S1, Now),
+    ?assert(quic_cc_bbr:in_recovery(S2)),
+
+    S3 = simulate_transfer_round(S2, 50000),
+    %% Should still be in STARTUP, not prematurely exited to DRAIN
+    ?assert(quic_cc_bbr:in_slow_start(S3)),
+    %% Recovery should be cleared after round
+    ?assertNot(quic_cc_bbr:in_recovery(S3)),
+    %% Can still send data
+    ?assert(quic_cc_bbr:can_send(S3, 1200)).
 
 %%====================================================================
 %% Loss Handling Tests
@@ -412,6 +453,92 @@ bbr_sustained_pacing_test() ->
     ?assert(quic_cc_bbr:can_send(S4, 1200)).
 
 %%====================================================================
+%% Delivery Rate Stability Tests
+%%====================================================================
+
+bbr_delivery_rate_sustained_test() ->
+    %% Verify delivery rate doesn't degrade over multiple rounds.
+    %% This was the root cause of 500KB transfer timeouts.
+    State = quic_cc_bbr:new(#{}),
+    InitialCwnd = quic_cc_bbr:cwnd(State),
+
+    %% First round
+    S1 = quic_cc_bbr:on_packet_sent(State, 10000),
+    timer:sleep(50),
+    S2 = quic_cc_bbr:on_packets_acked(S1, 10000),
+    Cwnd1 = quic_cc_bbr:cwnd(S2),
+
+    %% Second round
+    S3 = quic_cc_bbr:on_packet_sent(S2, 10000),
+    timer:sleep(50),
+    S4 = quic_cc_bbr:on_packets_acked(S3, 10000),
+    Cwnd2 = quic_cc_bbr:cwnd(S4),
+
+    %% Third round
+    S5 = quic_cc_bbr:on_packet_sent(S4, 10000),
+    timer:sleep(50),
+    S6 = quic_cc_bbr:on_packets_acked(S5, 10000),
+    Cwnd3 = quic_cc_bbr:cwnd(S6),
+
+    %% cwnd should NOT decrease over rounds (bandwidth should be stable)
+    %% Allow 20% variance for timing jitter
+    ?assert(Cwnd1 >= InitialCwnd * 0.8),
+    ?assert(Cwnd2 >= Cwnd1 * 0.8),
+    ?assert(Cwnd3 >= Cwnd2 * 0.8).
+
+bbr_delivery_rate_does_not_degrade_test() ->
+    %% Simulate 10 rounds and verify max_bw estimate is stable.
+    %% Before the fix, cwnd would collapse as SendElapsed grew.
+    State = quic_cc_bbr:new(#{}),
+    InitialCwnd = quic_cc_bbr:cwnd(State),
+
+    FinalState = lists:foldl(
+        fun(_, S) ->
+            S1 = quic_cc_bbr:on_packet_sent(S, 12000),
+            timer:sleep(10),
+            quic_cc_bbr:on_packets_acked(S1, 12000)
+        end,
+        State,
+        lists:seq(1, 10)
+    ),
+
+    %% Should still be able to send at least initial cwnd
+    FinalCwnd = quic_cc_bbr:cwnd(FinalState),
+    %% At least 50% of initial (BBR may transition states affecting cwnd)
+    ?assert(FinalCwnd >= InitialCwnd * 0.5),
+    %% At least 4 packets (minimum window)
+    ?assert(FinalCwnd >= 4 * 1200).
+
+bbr_long_transfer_cwnd_stability_test() ->
+    %% Simulate a long transfer (like 500KB) and ensure cwnd stays stable.
+    %% This directly tests the scenario that was failing.
+    State = quic_cc_bbr:new(#{}),
+
+    %% Simulate 50 rounds of 10KB each (500KB total)
+    {FinalState, CwndHistory} = lists:foldl(
+        fun(_, {S, History}) ->
+            S1 = quic_cc_bbr:on_packet_sent(S, 10000),
+            timer:sleep(5),
+            S2 = quic_cc_bbr:on_packets_acked(S1, 10000),
+            {S2, [quic_cc_bbr:cwnd(S2) | History]}
+        end,
+        {State, []},
+        lists:seq(1, 50)
+    ),
+
+    %% Verify cwnd never collapsed to near-zero
+    MinCwnd = lists:min(CwndHistory),
+    MaxCwnd = lists:max(CwndHistory),
+    FinalCwnd = quic_cc_bbr:cwnd(FinalState),
+
+    %% MinCwnd should be at least 20% of MaxCwnd (no collapse)
+    ?assert(MinCwnd >= MaxCwnd * 0.2),
+    %% Final cwnd should be at least minimum window (4 packets)
+    ?assert(FinalCwnd >= 4 * 1200),
+    %% Should still allow sending
+    ?assert(quic_cc_bbr:can_send(FinalState, 1200)).
+
+%%====================================================================
 %% Helper Functions
 %%====================================================================
 
@@ -423,3 +550,8 @@ send_until_full(State, Sent) ->
         false ->
             {State, Sent}
     end.
+
+%% Simulate a round of transfer (send and ACK bytes)
+simulate_transfer_round(State, Bytes) ->
+    S1 = quic_cc_bbr:on_packet_sent(State, Bytes),
+    quic_cc_bbr:on_packets_acked(S1, Bytes).
