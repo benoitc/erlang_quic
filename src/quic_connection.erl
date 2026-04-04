@@ -65,6 +65,7 @@
     connect/4,
     send_data/4,
     send_datagram/2,
+    datagram_max_size/1,
     open_stream/1,
     open_unidirectional_stream/1,
     close/2,
@@ -239,6 +240,12 @@
     max_streams_bidi_remote :: non_neg_integer(),
     max_streams_uni_local :: non_neg_integer(),
     max_streams_uni_remote :: non_neg_integer(),
+
+    %% Datagram support (RFC 9221)
+    %% Local: our advertised max size (0 = disabled)
+    max_datagram_frame_size_local = 0 :: non_neg_integer(),
+    %% Remote: peer's advertised max size (0 = not supported)
+    max_datagram_frame_size_remote = 0 :: non_neg_integer(),
 
     %% Transport parameters (received from peer)
     transport_params = #{} :: map(),
@@ -543,6 +550,12 @@ set_owner_sync(Conn, NewOwner) ->
 send_datagram(Conn, Data) ->
     gen_statem:call(Conn, {send_datagram, Data}).
 
+%% @doc Get maximum datagram payload size.
+%% Returns 0 if peer doesn't support datagrams.
+-spec datagram_max_size(pid()) -> non_neg_integer().
+datagram_max_size(Conn) ->
+    gen_statem:call(Conn, datagram_max_size).
+
 %% @doc Set connection options.
 -spec setopts(pid(), [{atom(), term()}]) -> ok | {error, term()}.
 setopts(Conn, Opts) ->
@@ -745,6 +758,7 @@ init({server, Opts}) ->
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
+        max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
         idle_timeout = IdleTimeout,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
         keep_alive_timer = undefined,
@@ -956,6 +970,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
+        max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
         idle_timeout = IdleTimeoutClient,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
         keep_alive_timer = undefined,
@@ -1241,6 +1256,8 @@ connected({call, From}, peercert, #state{peer_cert = undefined} = State) ->
     {keep_state, State, [{reply, From, {error, no_peercert}}]};
 connected({call, From}, peercert, #state{peer_cert = Cert} = State) ->
     {keep_state, State, [{reply, From, {ok, Cert}}]};
+connected({call, From}, datagram_max_size, #state{max_datagram_frame_size_remote = Size} = State) ->
+    {keep_state, State, [{reply, From, Size}]};
 connected({call, From}, {set_owner, NewOwner}, State) ->
     {keep_state, State#state{owner = NewOwner}, [{reply, From, ok}]};
 connected(cast, {set_owner, NewOwner}, State) ->
@@ -1576,6 +1593,7 @@ send_client_hello(State) ->
         max_stream_data_uni = MaxStreamDataUni,
         max_streams_bidi_local = MaxStreamsBidi,
         max_streams_uni_local = MaxStreamsUni,
+        max_datagram_frame_size_local = MaxDatagramSize,
         ticket_store = TicketStore
     } = State,
 
@@ -1587,7 +1605,7 @@ send_client_hello(State) ->
         end,
 
     %% Build transport parameters
-    TransportParams = #{
+    TransportParams0 = #{
         initial_scid => SCID,
         initial_max_data => MaxData,
         initial_max_stream_data_bidi_local => MaxStreamDataBidiLocal,
@@ -1598,6 +1616,12 @@ send_client_hello(State) ->
         max_idle_timeout => State#state.idle_timeout,
         active_connection_id_limit => 2
     },
+    %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
+    TransportParams =
+        case MaxDatagramSize of
+            0 -> TransportParams0;
+            _ -> TransportParams0#{max_datagram_frame_size => MaxDatagramSize}
+        end,
 
     %% Build ClientHello (with or without PSK for resumption)
     ClientHelloOpts = #{
@@ -1819,6 +1843,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         max_stream_data_uni = MaxStreamDataUni,
         max_streams_bidi_local = MaxStreamsBidi,
         max_streams_uni_local = MaxStreamsUni,
+        max_datagram_frame_size_local = MaxDatagramSize,
         server_cert = Cert,
         server_cert_chain = CertChain,
         server_private_key = PrivateKey,
@@ -1841,14 +1866,20 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         max_idle_timeout => State#state.idle_timeout,
         active_connection_id_limit => 2
     },
+    %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
+    TransportParams1 =
+        case MaxDatagramSize of
+            0 -> TransportParams0;
+            _ -> TransportParams0#{max_datagram_frame_size => MaxDatagramSize}
+        end,
     %% Add preferred_address if configured (RFC 9000 Section 9.6)
     %% Server MUST NOT send preferred_address if disable_active_migration is set
     TransportParams =
         case State#state.server_preferred_address of
             #preferred_address{} = PA ->
-                TransportParams0#{preferred_address => PA};
+                TransportParams1#{preferred_address => PA};
             _ ->
-                TransportParams0
+                TransportParams1
         end,
 
     %% Build EncryptedExtensions
@@ -3259,6 +3290,23 @@ process_frame(
 process_frame(_Level, {data_blocked, _Limit}, State) ->
     State;
 %% DATAGRAM frames (RFC 9221)
+%% RFC 9221: MUST terminate with PROTOCOL_VIOLATION if receiving DATAGRAM
+%% without having advertised support (max_datagram_frame_size = 0)
+process_frame(app, {datagram, _Data}, #state{max_datagram_frame_size_local = 0} = State) ->
+    send_protocol_violation(<<"unexpected DATAGRAM frame">>, State);
+process_frame(
+    app, {datagram_with_length, _Data}, #state{max_datagram_frame_size_local = 0} = State
+) ->
+    send_protocol_violation(<<"unexpected DATAGRAM frame">>, State);
+%% RFC 9221: MUST terminate with PROTOCOL_VIOLATION if receiving oversized DATAGRAM
+process_frame(app, {datagram, Data}, #state{max_datagram_frame_size_local = Max} = State) when
+    byte_size(Data) > Max
+->
+    send_protocol_violation(<<"DATAGRAM frame too large">>, State);
+process_frame(
+    app, {datagram_with_length, Data}, #state{max_datagram_frame_size_local = Max} = State
+) when byte_size(Data) > Max ->
+    send_protocol_violation(<<"DATAGRAM frame too large">>, State);
 process_frame(app, {datagram, Data}, #state{owner = Owner, conn_ref = Ref} = State) ->
     Owner ! {quic, Ref, {datagram, Data}},
     State;
@@ -4882,20 +4930,33 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
 -define(PACKET_OVERHEAD, 50).
 
 %% Send a datagram (RFC 9221)
-do_send_datagram(Data, #state{cc_state = CCState} = State) ->
+%% RFC 9221: MUST NOT send DATAGRAM frames until receiving peer's max_datagram_frame_size
+%% and MUST NOT send frames larger than peer's advertised value
+do_send_datagram(_Data, #state{max_datagram_frame_size_remote = 0}) ->
+    %% Peer didn't advertise datagram support
+    {error, datagrams_not_supported};
+do_send_datagram(
+    Data, #state{max_datagram_frame_size_remote = MaxSize, cc_state = CCState} = State
+) ->
     DataBin = iolist_to_binary(Data),
-    PacketSize = byte_size(DataBin) + ?PACKET_OVERHEAD,
-
-    case quic_cc:can_send(CCState, PacketSize) of
+    DataSize = byte_size(DataBin),
+    case DataSize > MaxSize of
         true ->
-            %% Use datagram_with_length for better framing
-            Frame = {datagram_with_length, DataBin},
-            Payload = quic_frame:encode(Frame),
-            NewState = send_app_packet_internal(Payload, [Frame], State),
-            {ok, NewState};
+            %% Data exceeds peer's advertised max size
+            {error, datagram_too_large};
         false ->
-            %% Datagrams are unreliable - just drop if cwnd is full
-            {error, congestion_limited}
+            PacketSize = DataSize + ?PACKET_OVERHEAD,
+            case quic_cc:can_send(CCState, PacketSize) of
+                true ->
+                    %% Use datagram_with_length for better framing
+                    Frame = {datagram_with_length, DataBin},
+                    Payload = quic_frame:encode(Frame),
+                    NewState = send_app_packet_internal(Payload, [Frame], State),
+                    {ok, NewState};
+                false ->
+                    %% Datagrams are unreliable - just drop if cwnd is full
+                    {error, congestion_limited}
+            end
     end.
 
 %% Send stream data in fragments, tracking how many bytes were actually sent
@@ -5487,6 +5548,19 @@ initiate_close(Reason, State) ->
             State#state{close_reason = Reason};
         _ ->
             send_app_packet(CloseFrame, State#state{close_reason = Reason})
+    end.
+
+%% Send PROTOCOL_VIOLATION transport error (RFC 9000)
+%% Used when a peer violates the protocol (e.g., RFC 9221 datagram violations)
+send_protocol_violation(Reason, State) ->
+    CloseFrame = quic_frame:encode(
+        {connection_close, transport, ?QUIC_PROTOCOL_VIOLATION, 0, Reason}
+    ),
+    case State#state.app_keys of
+        undefined ->
+            State#state{close_reason = {protocol_violation, Reason}};
+        _ ->
+            send_app_packet(CloseFrame, State#state{close_reason = {protocol_violation, Reason}})
     end.
 
 %% Send CONNECTION_CLOSE frame during terminate (best effort)
@@ -6244,6 +6318,10 @@ apply_peer_transport_params(TransportParams, State) ->
     MaxStreamsBidi = maps:get(initial_max_streams_bidi, TransportParams, ?DEFAULT_MAX_STREAMS_BIDI),
     MaxStreamsUni = maps:get(initial_max_streams_uni, TransportParams, ?DEFAULT_MAX_STREAMS_UNI),
 
+    %% Extract max_datagram_frame_size (RFC 9221): peer's max datagram size
+    %% Default is 0 (datagrams not supported)
+    MaxDatagramFrameSize = maps:get(max_datagram_frame_size, TransportParams, 0),
+
     %% Store stream data limits in state for use when opening streams
     %% These tell us how much we can send on different stream types
     State#state{
@@ -6258,7 +6336,9 @@ apply_peer_transport_params(TransportParams, State) ->
         max_data_remote = MaxDataRemote,
         %% Stream limits (how many streams we can open)
         max_streams_bidi_remote = MaxStreamsBidi,
-        max_streams_uni_remote = MaxStreamsUni
+        max_streams_uni_remote = MaxStreamsUni,
+        %% Datagram size limit (RFC 9221)
+        max_datagram_frame_size_remote = MaxDatagramFrameSize
     }.
 
 %% @doc Handle RETIRE_CONNECTION_ID frame from peer.

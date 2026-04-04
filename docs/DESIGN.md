@@ -390,23 +390,67 @@ DATAGRAM frames provide unreliable message delivery:
 - No flow control (use connection-level limits)
 - Useful for latency-sensitive data (gaming, real-time media)
 
-### Transport Parameter
+### Transport Parameter Negotiation
 
-Negotiate via `max_datagram_frame_size` transport parameter:
-- 0 or absent: Datagrams not supported
-- Non-zero: Maximum datagram payload size
+Datagram support is negotiated via the `max_datagram_frame_size` transport parameter:
+
+| Value | Meaning |
+|-------|---------|
+| 0 or absent | Datagrams not supported (default) |
+| 1-65535 | Maximum datagram payload size accepted |
+
+Both endpoints must advertise support for datagrams to work. The effective
+maximum size is the minimum of what the peer advertises and what fits in
+a QUIC packet (path MTU minus overhead).
+
+### Configuration
+
+```erlang
+%% Enable datagram support (client)
+quic:connect(Host, Port, #{
+    max_datagram_frame_size => 65535  % Recommended: accept any size
+}, Owner).
+
+%% Enable datagram support (server)
+quic:start_server(my_server, Port, #{
+    max_datagram_frame_size => 65535,
+    cert => Cert,
+    key => Key
+}).
+```
 
 ### API
 
 ```erlang
-%% Send a datagram
-quic:send_datagram(ConnRef, Data).
+%% Check if datagrams are supported and get max size
+MaxSize = quic:datagram_max_size(ConnRef).
+%% Returns 0 if datagrams not supported, otherwise peer's max size
 
-%% Receive (owner process)
+%% Send a datagram (unreliable)
+ok = quic:send_datagram(ConnRef, Data).
+%% Returns {error, datagrams_not_supported} if peer didn't advertise
+%% Returns {error, datagram_too_large} if Data exceeds peer's limit
+%% Returns {error, congestion_limited} if cwnd is full (datagram dropped)
+
+%% Receive datagrams (owner process)
 receive
-    {quic, ConnRef, {datagram, Data}} -> ...
+    {quic, ConnRef, {datagram, Data}} -> handle_datagram(Data)
 end.
 ```
+
+### Error Handling
+
+| Error | Cause |
+|-------|-------|
+| `{error, datagrams_not_supported}` | Peer didn't advertise `max_datagram_frame_size` |
+| `{error, datagram_too_large}` | Data exceeds peer's advertised limit |
+| `{error, congestion_limited}` | Congestion window full (datagram dropped) |
+
+### Protocol Violations
+
+Per RFC 9221, the following result in `PROTOCOL_VIOLATION` connection close:
+- Receiving a DATAGRAM frame when we didn't advertise support
+- Receiving a DATAGRAM frame larger than our advertised limit
 
 ## Active Migration
 
