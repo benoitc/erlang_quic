@@ -32,6 +32,7 @@
 -behaviour(gen_statem).
 
 -include("quic.hrl").
+-include("quic_qlog.hrl").
 -include_lib("kernel/include/logger.hrl").
 -define(QUIC_LOG_META, #{
     domain => [erlang_quic, connection], report_cb => fun quic_log:format_report/2
@@ -351,7 +352,10 @@
     %% PMTU Discovery (RFC 8899)
     pmtu_state :: #pmtu_state{} | undefined,
     pmtu_probe_timer :: reference() | undefined,
-    pmtu_raise_timer :: reference() | undefined
+    pmtu_raise_timer :: reference() | undefined,
+
+    %% QLOG Tracing (draft-ietf-quic-qlog-quic-events)
+    qlog_ctx :: #qlog_ctx{} | undefined
 }).
 
 %%====================================================================
@@ -755,8 +759,12 @@ init({server, Opts}) ->
         cid_config = maps:get(cid_config, Opts, undefined),
         congestion_threshold = maps:get(congestion_threshold, Opts, 2),
         pacing_enabled = maps:get(pacing_enabled, Opts, true),
-        pmtu_state = init_pmtu_state(Opts)
+        pmtu_state = init_pmtu_state(Opts),
+        qlog_ctx = quic_qlog:new(Opts, InitialDCID, server)
     },
+
+    %% Emit qlog connection_started event
+    quic_qlog:connection_started(State#state.qlog_ctx),
 
     {ok, idle, State}.
 
@@ -962,8 +970,12 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             end,
         congestion_threshold = maps:get(congestion_threshold, Opts, 2),
         pacing_enabled = maps:get(pacing_enabled, Opts, true),
-        pmtu_state = init_pmtu_state(Opts)
+        pmtu_state = init_pmtu_state(Opts),
+        qlog_ctx = quic_qlog:new(Opts, DCID, client)
     },
+
+    %% Emit qlog connection_started event
+    quic_qlog:connection_started(State#state.qlog_ctx),
 
     {ok, idle, State}.
 
@@ -977,7 +989,8 @@ terminate(
         idle_timer = IdleTimer,
         keep_alive_timer = KeepAliveTimer,
         pacing_timer = PacingTimer,
-        role = Role
+        role = Role,
+        qlog_ctx = QlogCtx
     } = State
 ) ->
     %% If we're not already draining/closed, try to send CONNECTION_CLOSE
@@ -1011,6 +1024,8 @@ terminate(
         {client, S} when S =/= undefined -> gen_udp:close(S);
         _ -> ok
     end,
+    %% Close QLOG trace file
+    quic_qlog:close(QlogCtx),
     ok.
 
 code_change(_OldVsn, StateName, State, _Extra) ->
@@ -1448,9 +1463,13 @@ draining(
         owner = Owner,
         conn_ref = Ref,
         close_reason = Reason,
-        loss_state = LossState
+        loss_state = LossState,
+        qlog_ctx = QlogCtx
     } = State
 ) ->
+    %% Emit qlog connection_closed event
+    quic_qlog:connection_closed(QlogCtx, close_reason_to_code(Reason), undefined),
+
     Owner ! {quic, Ref, {closed, Reason}},
     %% Start drain timer (3 * PTO per RFC 9000 Section 10.2)
     DrainTimeout =
@@ -2039,6 +2058,13 @@ send_initial_packet(Payload, State) ->
     %% Send
     gen_udp:send(Socket, IP, Port, PaddedPacket),
 
+    %% Emit qlog packet_sent event
+    quic_qlog:packet_sent(State#state.qlog_ctx, #{
+        packet_type => initial,
+        packet_number => PN,
+        length => byte_size(PaddedPacket)
+    }),
+
     %% Update packet number space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
     State#state{
@@ -2228,6 +2254,13 @@ send_handshake_packet(Payload, State) ->
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     gen_udp:send(Socket, IP, Port, Packet),
 
+    %% Emit qlog packet_sent event
+    quic_qlog:packet_sent(State#state.qlog_ctx, #{
+        packet_type => handshake,
+        packet_number => PN,
+        length => byte_size(Packet)
+    }),
+
     %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
     State#state{
@@ -2305,6 +2338,14 @@ send_app_packet_internal(Payload, Frames, State) ->
     %% Handle send result - only track packet and update state if send succeeded
     case SendResult of
         ok ->
+            %% Emit qlog packet_sent event
+            quic_qlog:packet_sent(State#state.qlog_ctx, #{
+                packet_type => one_rtt,
+                packet_number => PN,
+                length => PacketSize,
+                frames => Frames
+            }),
+
             %% Track sent packet for loss detection and congestion control
             %% Determine if ack-eliciting by checking the actual frames list
             %% This properly handles coalesced packets with multiple frames
@@ -2387,6 +2428,12 @@ handle_packet_loop(<<>>, #state{role = server} = State) ->
 handle_packet_loop(Data, State) ->
     case decode_and_decrypt_packet(Data, State) of
         {ok, Type, Frames, RemainingData, NewState} ->
+            %% Emit qlog packet_received event
+            quic_qlog:packet_received(NewState#state.qlog_ctx, #{
+                packet_type => Type,
+                frames => Frames
+            }),
+
             %% Increment packet counter for liveness detection
             %% Any successfully decrypted packet proves peer is alive
             NewState1 = NewState#state{
@@ -2394,6 +2441,10 @@ handle_packet_loop(Data, State) ->
             },
             %% Process frames from this packet
             State1 = process_frames_noreenbl(Type, Frames, NewState1),
+
+            %% Emit qlog frames_processed event
+            quic_qlog:frames_processed(State1#state.qlog_ctx, Frames),
+
             %% Send ACK if packet contained ack-eliciting frames
             State2 = maybe_send_ack(Type, Frames, State1),
             %% Continue with remaining coalesced packets
@@ -2977,6 +3028,28 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                         loss_state = NewLossState,
                         cc_state = CCState6
                     },
+
+                    %% Emit qlog packets_acked event
+                    AckedPNs = [P#sent_packet.pn || P <- AckedPackets],
+                    RTTSample =
+                        case AckedPackets of
+                            [] -> undefined;
+                            _ -> Now - LargestAckedSentTime
+                        end,
+                    quic_qlog:packets_acked(State1#state.qlog_ctx, AckedPNs, #{
+                        rtt_sample => RTTSample
+                    }),
+
+                    %% Emit qlog packet_lost events
+                    lists:foreach(
+                        fun(#sent_packet{pn = LostPN}) ->
+                            quic_qlog:packet_lost(State1#state.qlog_ctx, #{
+                                packet_number => LostPN,
+                                reason => timeout
+                            })
+                        end,
+                        LostPackets
+                    ),
 
                     %% Handle PMTU probe ACKs
                     State2 = lists:foldl(
@@ -4276,30 +4349,51 @@ check_state_transition(CurrentState, State) ->
     case State#state.close_reason of
         connection_closed ->
             %% Peer sent CONNECTION_CLOSE, transition to draining
+            emit_qlog_state_change(CurrentState, draining, State),
             {next_state, draining, State};
         stateless_reset ->
             %% Received stateless reset, transition to draining
+            emit_qlog_state_change(CurrentState, draining, State),
             {next_state, draining, State};
         _ ->
             %% Check for TLS handshake state transitions
             case {CurrentState, State#state.tls_state, has_app_keys(State)} of
                 {idle, ?TLS_AWAITING_ENCRYPTED_EXT, _} ->
                     %% Got ServerHello, have handshake keys
+                    emit_qlog_state_change(idle, handshaking, State),
                     {next_state, handshaking, State};
                 {idle, ?TLS_AWAITING_CERT, _} ->
+                    emit_qlog_state_change(idle, handshaking, State),
                     {next_state, handshaking, State};
                 {idle, ?TLS_AWAITING_CERT_VERIFY, _} ->
+                    emit_qlog_state_change(idle, handshaking, State),
                     {next_state, handshaking, State};
                 {idle, ?TLS_AWAITING_FINISHED, _} ->
+                    emit_qlog_state_change(idle, handshaking, State),
                     {next_state, handshaking, State};
                 {idle, ?TLS_HANDSHAKE_COMPLETE, true} ->
+                    emit_qlog_state_change(idle, connected, State),
                     {next_state, connected, State};
                 {handshaking, ?TLS_HANDSHAKE_COMPLETE, true} ->
+                    emit_qlog_state_change(handshaking, connected, State),
                     {next_state, connected, State};
                 _ ->
                     {keep_state, State}
             end
     end.
+
+%% Helper to emit qlog connection_state_updated event
+emit_qlog_state_change(OldState, NewState, #state{qlog_ctx = Ctx}) ->
+    quic_qlog:connection_state_updated(Ctx, OldState, NewState).
+
+%% Convert close reason to error code for qlog
+close_reason_to_code(connection_closed) -> 0;
+close_reason_to_code(stateless_reset) -> stateless_reset;
+close_reason_to_code(idle_timeout) -> idle_timeout;
+close_reason_to_code({error, Code}) when is_integer(Code) -> Code;
+close_reason_to_code({application_error, Code, _}) when is_integer(Code) -> Code;
+close_reason_to_code(Reason) when is_atom(Reason) -> Reason;
+close_reason_to_code(_) -> unknown.
 
 has_app_keys(#state{app_keys = undefined}) -> false;
 has_app_keys(_) -> true.
