@@ -72,6 +72,7 @@
     set_owner/2,
     set_owner_sync/2,
     send_datagram/2,
+    datagram_max_size/1,
     setopts/2,
     migrate/1,
     %% Stream prioritization (RFC 9218)
@@ -394,6 +395,21 @@ send_datagram(ConnRef, Data) when is_reference(ConnRef) ->
 send_datagram(ConnPid, Data) when is_pid(ConnPid) ->
     quic_connection:send_datagram(ConnPid, Data);
 send_datagram(_ConnRef, _Data) ->
+    {error, badarg}.
+
+%% @doc Get maximum datagram payload size.
+%% Returns 0 if peer doesn't support datagrams (RFC 9221).
+%% The returned size is the peer's advertised max_datagram_frame_size.
+-spec datagram_max_size(ConnRef) -> non_neg_integer() | {error, term()} when
+    ConnRef :: reference() | pid().
+datagram_max_size(ConnRef) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:datagram_max_size(Pid);
+        error -> {error, not_found}
+    end;
+datagram_max_size(ConnPid) when is_pid(ConnPid) ->
+    quic_connection:datagram_max_size(ConnPid);
+datagram_max_size(_ConnRef) ->
     {error, badarg}.
 
 %% @doc Set connection options.

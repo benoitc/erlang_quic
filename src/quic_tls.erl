@@ -501,6 +501,8 @@ encode_transport_param(initial_scid, Value) ->
     encode_tp(?TP_INITIAL_SCID, Value);
 encode_transport_param(preferred_address, #preferred_address{} = PA) ->
     encode_tp(?TP_PREFERRED_ADDRESS, encode_preferred_address(PA));
+encode_transport_param(max_datagram_frame_size, Value) when Value > 0 ->
+    encode_tp(?TP_MAX_DATAGRAM_FRAME_SIZE, quic_varint:encode(Value));
 encode_transport_param(_, _) ->
     <<>>.
 
@@ -545,6 +547,7 @@ tp_id_to_key(?TP_PREFERRED_ADDRESS) -> preferred_address;
 tp_id_to_key(?TP_ACTIVE_CONNECTION_ID_LIMIT) -> active_connection_id_limit;
 tp_id_to_key(?TP_INITIAL_SCID) -> initial_scid;
 tp_id_to_key(?TP_RETRY_SCID) -> retry_scid;
+tp_id_to_key(?TP_MAX_DATAGRAM_FRAME_SIZE) -> max_datagram_frame_size;
 tp_id_to_key(Id) -> {unknown, Id}.
 
 decode_tp_value(?TP_ORIGINAL_DCID, Value) ->
@@ -571,7 +574,8 @@ decode_tp_value(Id, Value) when
     Id =:= ?TP_INITIAL_MAX_STREAMS_UNI;
     Id =:= ?TP_ACK_DELAY_EXPONENT;
     Id =:= ?TP_MAX_ACK_DELAY;
-    Id =:= ?TP_ACTIVE_CONNECTION_ID_LIMIT
+    Id =:= ?TP_ACTIVE_CONNECTION_ID_LIMIT;
+    Id =:= ?TP_MAX_DATAGRAM_FRAME_SIZE
 ->
     %% Known integer parameters are varints
     {Int, _} = quic_varint:decode(Value),

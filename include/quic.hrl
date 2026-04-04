@@ -140,6 +140,9 @@
 -define(TP_INITIAL_SCID, 16#0f).
 -define(TP_RETRY_SCID, 16#10).
 
+%% RFC 9221 - QUIC Datagrams
+-define(TP_MAX_DATAGRAM_FRAME_SIZE, 16#20).
+
 %%====================================================================
 %% Crypto Constants
 %%====================================================================

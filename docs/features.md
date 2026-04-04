@@ -117,6 +117,10 @@
 - `quic:peercert/1` - Get peer certificate
 - `quic:migrate/1` - Trigger connection migration
 
+### Datagrams (RFC 9221)
+- `quic:send_datagram/2` - Send unreliable datagram
+- `quic:datagram_max_size/1` - Get max datagram size (0 if unsupported)
+
 ### Streams
 - `quic:open_stream/1` - Open bidirectional stream
 - `quic:open_unidirectional_stream/1` - Open unidirectional stream
@@ -151,6 +155,7 @@
 - `idle_timeout` - Connection idle timeout in milliseconds (0 to disable)
 - `max_data` - Connection-level flow control limit
 - `max_stream_data` - Stream-level flow control limit
+- `max_datagram_frame_size` - Max datagram size to accept (0 = disabled, default: 0)
 - `alpn` - ALPN protocols list
 - `verify` - Certificate verification mode
 - `preferred_ipv4` - Server preferred IPv4 address
