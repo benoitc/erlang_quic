@@ -435,9 +435,20 @@ flush_gso(
     case socket:sendmsg(Socket, Msg) of
         ok ->
             {ok, State#socket_state{batch_buffer = [], batch_addr = undefined}};
-        {ok, _RestData} ->
-            %% Partial send - clear buffer anyway for now
-            {ok, State#socket_state{batch_buffer = [], batch_addr = undefined}};
+        {ok, RestData} ->
+            %% Partial send - GSO didn't send all data
+            %% Log warning and fall back to individual sends for remaining data
+            ?LOG_WARNING(#{
+                what => gso_partial_send,
+                sent => byte_size(CombinedData) - iolist_size(RestData),
+                remaining => iolist_size(RestData)
+            }),
+            %% Disable GSO and retry remaining data individually
+            State1 = State#socket_state{
+                gso_supported = false, batch_buffer = [], batch_addr = undefined
+            },
+            %% Send remaining data without GSO
+            send_remaining_individually(State1, IP, Port, RestData);
         {error, _} = Error ->
             Error
     end.
@@ -477,6 +488,14 @@ send_packets_individual(Socket, gen_udp, IP, Port, [Packet | Rest]) ->
             send_packets_individual(Socket, gen_udp, IP, Port, Rest);
         {error, _} = Error ->
             Error
+    end.
+
+%% Send remaining data after GSO partial write (RestData is iolist)
+send_remaining_individually(#socket_state{socket = Socket} = State, IP, Port, RestData) ->
+    Dest = #{family => inet, addr => IP, port => Port},
+    case socket:sendto(Socket, iolist_to_binary(RestData), Dest) of
+        ok -> {ok, State};
+        {error, _} = Error -> Error
     end.
 
 do_send_immediate(#socket_state{socket = Socket, backend = socket} = State, IP, Port, Data) ->

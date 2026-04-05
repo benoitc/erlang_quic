@@ -1417,7 +1417,8 @@ connected(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State)
     NewState = handle_packet(Data, State),
     check_state_transition(connected, NewState);
 connected(cast, {close, Reason}, State) ->
-    NewState = initiate_close(Reason, State),
+    State1 = initiate_close(Reason, State),
+    NewState = flush_socket_batch(State1),
     {next_state, draining, NewState};
 connected(cast, process, #state{role = client, socket = Socket} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
@@ -1429,7 +1430,8 @@ connected(cast, process, #state{role = server} = State) ->
 %% Handle delayed ACK timer (RFC 9221 Section 5.2)
 connected(info, {send_delayed_ack, app}, State) ->
     erase(ack_timer),
-    NewState = send_app_ack(State),
+    State1 = send_app_ack(State),
+    NewState = flush_socket_batch(State1),
     {keep_state, NewState};
 %% Handle PMTU probe timeout (RFC 8899)
 connected(info, pmtu_probe_timeout, #state{pmtu_state = PMTUState} = State) ->
@@ -1553,8 +1555,9 @@ handle_common_event(info, idle_timeout, _StateName, State) ->
     {keep_state, State};
 handle_common_event(info, keep_alive_timeout, connected, State) ->
     %% Send keep-alive PING and reset timer
-    NewState = send_keep_alive_ping(State),
-    {keep_state, set_keep_alive_timer(NewState)};
+    State1 = send_keep_alive_ping(State),
+    State2 = flush_socket_batch(State1),
+    {keep_state, set_keep_alive_timer(State2)};
 handle_common_event(info, keep_alive_timeout, _StateName, State) ->
     %% Ignore keep-alive in non-connected states
     {keep_state, State#state{keep_alive_timer = undefined}};
@@ -5676,8 +5679,11 @@ handle_pto_timeout(#state{loss_state = LossState} = State) ->
     %% Send probe packet (retransmit oldest unacked or send PING)
     State2 = send_probe_packet(State1),
 
+    %% Flush immediately - probe packets must not be batched
+    State3 = flush_socket_batch(State2),
+
     %% Set new PTO timer
-    set_pto_timer(State2).
+    set_pto_timer(State3).
 
 %% Send a probe packet for PTO
 %% PTO probes are allowed to use control_allowance per RFC 9002
