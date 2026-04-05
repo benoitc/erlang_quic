@@ -762,7 +762,7 @@ build_cc_opts(Opts) ->
         end,
     %% Add algorithm selection (default: newreno)
     case maps:find(cc_algorithm, Opts) of
-        {ok, Algo} when Algo =:= newreno; Algo =:= bbr ->
+        {ok, Algo} when Algo =:= newreno; Algo =:= bbr; Algo =:= cubic ->
             CCOpts4#{algorithm => Algo};
         _ ->
             CCOpts4
