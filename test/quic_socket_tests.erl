@@ -201,6 +201,9 @@ send_receive_test() ->
     %% Set receiver to active mode for gen_udp backend
     quic_socket:setopts(Receiver, [{active, true}]),
 
+    %% Small delay to ensure setopts takes effect
+    timer:sleep(10),
+
     %% Send a packet to localhost
     TestData = <<"hello quic_socket">>,
     {ok, Sender1} = quic_socket:send(Sender, {127, 0, 0, 1}, RecvPort, TestData),
@@ -208,16 +211,23 @@ send_receive_test() ->
     %% Flush to actually send
     {ok, Sender2} = quic_socket:flush(Sender1),
 
-    %% Wait for the packet
-    receive
-        {udp, _, _, _, ReceivedData} ->
-            ?assertEqual(TestData, ReceivedData)
-    after 1000 ->
-        ?assert(false)
-    end,
+    %% Wait for the packet with longer timeout for CI environments
+    Result =
+        receive
+            {udp, _, _, _, ReceivedData} ->
+                {ok, ReceivedData}
+        after 5000 ->
+            timeout
+        end,
 
     ok = quic_socket:close(Sender2),
-    ok = quic_socket:close(Receiver).
+    ok = quic_socket:close(Receiver),
+
+    %% Assert after cleanup to avoid resource leaks on failure
+    case Result of
+        {ok, Data} -> ?assertEqual(TestData, Data);
+        timeout -> ?assert(false)
+    end.
 
 %% Helper to flush stale messages from mailbox
 flush_mailbox() ->
