@@ -969,8 +969,8 @@ network_keyupdate(Config) ->
                             ok = quic:send_data(ConnRef, StreamId, <<"Before key update">>, false),
 
                             %% Initiate key update
-                            {ok, ConnPid} = quic_connection:lookup(ConnRef),
-                            Result = quic_connection:key_update(ConnPid),
+                            %% ConnRef is already the connection PID (PR #29)
+                            Result = quic_connection:key_update(ConnRef),
                             ct:pal("Key update result: ~p", [Result]),
 
                             %% Send more data after key update
