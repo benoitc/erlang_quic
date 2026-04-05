@@ -2044,7 +2044,7 @@ send_initial_packet(Payload, State) ->
     %% Pad payload if needed for header protection sampling
     PaddedPayload = pad_for_header_protection(Payload),
 
-    %% Build header (without packet number, for AAD)
+    %% Build header prefix (without packet number)
     HeaderBody = <<
         Version:32,
         (byte_size(DCID)):8,
@@ -2060,24 +2060,13 @@ send_initial_packet(Payload, State) ->
 
     %% First byte: 1100 0000 | (PNLen - 1)
     FirstByte = 16#C0 bor (PNLen - 1),
-    Header = <<FirstByte, HeaderBody/binary>>,
+    HeaderPrefix = <<FirstByte, HeaderBody/binary>>,
 
-    %% AAD is the header with encoded PN appended
-    PNBin = quic_packet:encode_pn(PN, PNLen),
-    AAD = <<Header/binary, PNBin/binary>>,
-
-    %% Encrypt payload
-    #crypto_keys{key = Key, iv = IV, hp = HP} = EncryptKeys,
-    Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPayload),
-
-    %% Apply header protection
-    PNOffset = byte_size(Header),
-    ProtectedHeader = quic_aead:protect_header(
-        HP, <<Header/binary, PNBin/binary>>, Encrypted, PNOffset
+    %% Protect packet (encrypt + header protection in single call)
+    #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
+    Packet = quic_aead:protect_long_packet(
+        Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
-
-    %% Build final packet
-    Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
 
     %% Pad Initial packets to at least 1200 bytes
     PaddedPacket = pad_initial_packet(Packet),
@@ -2131,68 +2120,59 @@ send_app_ack(State) ->
         [] ->
             State;
         Ranges ->
-            AckFrame = build_ack_frame(Ranges),
+            %% Build ACK frame tuple (not encoded yet)
+            AckFrameTuple = build_ack_frame_tuple(Ranges),
             %% Try to coalesce ACK with small pending stream data
-            maybe_coalesce_ack_with_data(AckFrame, State)
+            maybe_coalesce_ack_with_data(AckFrameTuple, State)
     end.
 
 %% Try to coalesce ACK frame with small pending stream data
-maybe_coalesce_ack_with_data(AckFrame, State) ->
-    case dequeue_small_stream_frame(State) of
-        {ok, StreamFrame, State1} ->
-            send_coalesced_frames([AckFrame, StreamFrame], State1);
+%% Takes frame tuples (not encoded) to avoid re-decode overhead
+maybe_coalesce_ack_with_data(AckFrameTuple, State) ->
+    case dequeue_small_stream_frame_tuple(State) of
+        {ok, StreamFrameTuple, State1} ->
+            %% Send coalesced frames - pass tuples directly
+            send_frame_tuples([AckFrameTuple, StreamFrameTuple], State1);
         none ->
-            send_app_packet(AckFrame, State)
+            %% Single frame - encode and send
+            send_app_packet_internal(quic_frame:encode(AckFrameTuple), [AckFrameTuple], State)
     end.
 
-%% Dequeue a small stream frame if available (< 500 bytes)
-%% This allows coalescing ACK with small stream data
+%% Dequeue a small stream frame tuple if available (< 500 bytes)
+%% Returns the frame tuple (not encoded) to avoid re-decode overhead
 -define(SMALL_FRAME_THRESHOLD, 500).
-dequeue_small_stream_frame(#state{send_queue = PQ} = State) ->
+dequeue_small_stream_frame_tuple(#state{send_queue = PQ} = State) ->
     case pqueue_peek(PQ) of
         {value, {stream_data, StreamId, Offset, Data, Fin}} when
             byte_size(Data) < ?SMALL_FRAME_THRESHOLD
         ->
-            %% Remove from queue and build STREAM frame
+            %% Remove from queue and return frame tuple (not encoded)
             {{value, _}, NewPQ} = pqueue_out(PQ),
-            StreamFrame = quic_frame:encode({stream, StreamId, Offset, Data, Fin}),
-            {ok, StreamFrame, State#state{send_queue = NewPQ}};
+            StreamFrameTuple = {stream, StreamId, Offset, Data, Fin},
+            {ok, StreamFrameTuple, State#state{send_queue = NewPQ}};
         _ ->
             none
     end.
 
-%% Send multiple frames in a single packet
-send_coalesced_frames(Frames, State) ->
-    Payload = iolist_to_binary(Frames),
-    %% Extract decoded frame info for loss tracking
-    %% Filter out unknown frames to avoid issues with retransmission
-    FrameInfo = lists:filtermap(fun decode_frame_for_tracking/1, Frames),
-    send_app_packet_internal(Payload, FrameInfo, State).
+%% Send multiple frame tuples in a single packet
+%% Takes frame tuples, encodes them, and passes directly to loss tracking
+send_frame_tuples(FrameTuples, State) ->
+    Payload = iolist_to_binary([quic_frame:encode(F) || F <- FrameTuples]),
+    send_app_packet_internal(Payload, FrameTuples, State).
 
-%% Extract frame info for loss detection tracking
-%% Returns {true, Frame} for valid frames, false for unknown/failed decodes
-decode_frame_for_tracking(FrameBin) when is_binary(FrameBin) ->
-    case quic_frame:decode(FrameBin) of
-        {Frame, _Rest} when is_tuple(Frame); is_atom(Frame) -> {true, Frame};
-        {error, _} ->
-            %% Log but don't include unknown frames in tracking
-            ?LOG_WARNING(#{what => frame_decode_failed, frame_bin => FrameBin}, ?QUIC_LOG_META),
-            false
-    end;
-decode_frame_for_tracking(_) ->
-    %% Non-binary input, skip
-    false.
+%% Build an ACK frame tuple (not encoded) from ranges
+%% Used by send_app_ack for coalescing without re-decode overhead
+build_ack_frame_tuple(Ranges) ->
+    EncoderRanges = convert_ack_ranges_for_encode(Ranges),
+    AckDelay = 0,
+    {ack, EncoderRanges, AckDelay, undefined}.
 
-%% Build an ACK frame from ranges
+%% Build an ACK frame from ranges (encoded)
 %% Our internal format is [{Start, End}, ...] where Start <= End
 %% quic_frame expects [{LargestAcked, FirstRange}, {Gap, Range}, ...]
 %% where FirstRange = LargestAcked - SmallestAcked (count)
 build_ack_frame(Ranges) ->
-    %% Convert from {Start, End} to encoder format
-    EncoderRanges = convert_ack_ranges_for_encode(Ranges),
-    % For simplicity
-    AckDelay = 0,
-    quic_frame:encode({ack, EncoderRanges, AckDelay, undefined}).
+    quic_frame:encode(build_ack_frame_tuple(Ranges)).
 
 %% Convert internal ACK ranges to encoder format
 %% Limits ranges to MAX_ACK_RANGE (65536) to prevent receiver rejection
@@ -2250,7 +2230,7 @@ send_handshake_packet(Payload, State) ->
     %% Pad payload if needed for header protection sampling
     PaddedPayload = pad_for_header_protection(Payload),
 
-    %% Build header (length includes PN + encrypted payload + AEAD tag)
+    %% Build header prefix (length includes PN + encrypted payload + AEAD tag)
     HeaderBody = <<
         Version:32,
         (byte_size(DCID)):8,
@@ -2259,24 +2239,13 @@ send_handshake_packet(Payload, State) ->
         SCID/binary,
         (quic_varint:encode(byte_size(PaddedPayload) + PNLen + 16))/binary
     >>,
-    Header = <<FirstByte, HeaderBody/binary>>,
+    HeaderPrefix = <<FirstByte, HeaderBody/binary>>,
 
-    %% AAD
-    PNBin = quic_packet:encode_pn(PN, PNLen),
-    AAD = <<Header/binary, PNBin/binary>>,
-
-    %% Encrypt
-    #crypto_keys{key = Key, iv = IV, hp = HP} = EncryptKeys,
-    Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPayload),
-
-    %% Header protection
-    PNOffset = byte_size(Header),
-    ProtectedHeader = quic_aead:protect_header(
-        HP, <<Header/binary, PNBin/binary>>, Encrypted, PNOffset
+    %% Protect packet (encrypt + header protection in single call)
+    #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
+    Packet = quic_aead:protect_long_packet(
+        Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
-
-    %% Build and send
-    Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     do_socket_send(Packet, State),
 
     %% Emit qlog packet_sent event
@@ -2333,28 +2302,14 @@ send_app_packet_internal(Payload, Frames, State) ->
     %% Bit 5 = spin bit (0), bits 3-4 reserved (0), bit 2 = key phase, bits 0-1 = PN length
     FirstByte = 16#40 bor (KeyPhase bsl 2) bor (PNLen - 1),
 
-    %% Header is just first byte + DCID
-    Header = <<FirstByte, DCID/binary>>,
-
-    %% AAD
-    PNBin = quic_packet:encode_pn(PN, PNLen),
-    AAD = <<Header/binary, PNBin/binary>>,
-
     %% Pad payload if needed for header protection sampling
     PaddedPayload = pad_for_header_protection(Payload),
 
-    %% Encrypt
-    #crypto_keys{key = Key, iv = IV, hp = HP} = EncryptKeys,
-    Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPayload),
-
-    %% Header protection
-    PNOffset = byte_size(Header),
-    ProtectedHeader = quic_aead:protect_header(
-        HP, <<Header/binary, PNBin/binary>>, Encrypted, PNOffset
+    %% Protect packet (encrypt + header protection in single call)
+    #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
+    Packet = quic_aead:protect_short_packet(
+        Cipher, Key, IV, HP, PN, FirstByte, DCID, PaddedPayload
     ),
-
-    %% Build and send
-    Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     PacketSize = byte_size(Packet),
     SendResult = do_socket_send(Packet, State),
 
@@ -2879,48 +2834,19 @@ decrypt_app_packet_continue(UnprotectedHeader, PNLen, EncryptedPayload, State) -
             {error, decryption_failed}
     end.
 
-%% Decrypt a packet
+%% Decrypt a long header packet (Initial/Handshake)
 %% RemainingData is the data after this packet (for coalesced packets)
 decrypt_packet(Level, Header, _FirstByte, EncryptedPayload, RemainingData, Keys, State) ->
-    #crypto_keys{key = Key, iv = IV, hp = HP} = Keys,
-
-    %% Remove header protection
-    %% unprotect_header returns UnprotectedHeader which includes the unprotected PN at the end
-    PNOffset = byte_size(Header),
-    case quic_aead:unprotect_header(HP, Header, EncryptedPayload, PNOffset) of
-        {error, Reason} ->
-            {error, {header_unprotect_failed, Reason}};
-        {UnprotectedHeader, PNLen} ->
-            decrypt_packet_continue(
-                Level,
-                UnprotectedHeader,
-                PNLen,
-                EncryptedPayload,
-                RemainingData,
-                Key,
-                IV,
-                State
-            )
-    end.
-
-decrypt_packet_continue(
-    Level, UnprotectedHeader, PNLen, EncryptedPayload, RemainingData, Key, IV, State
-) ->
-    %% Extract truncated PN and reconstruct full PN (RFC 9000 Appendix A)
-    UnprotHeaderLen = byte_size(UnprotectedHeader),
-    <<_:((UnprotHeaderLen - PNLen) * 8), TruncatedPN:PNLen/unit:8>> = UnprotectedHeader,
+    #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = Keys,
     LargestRecv = get_largest_recv(Level, State),
-    PN = reconstruct_pn(LargestRecv, TruncatedPN, PNLen),
 
-    %% AAD is the full unprotected header (already includes PN)
-    AAD = UnprotectedHeader,
-
-    %% Actual ciphertext starts after PN bytes in EncryptedPayload
-    <<_:PNLen/binary, Ciphertext/binary>> = EncryptedPayload,
-
-    %% Decrypt
-    case quic_aead:decrypt(Key, IV, PN, AAD, Ciphertext) of
-        {ok, Plaintext} ->
+    %% Unprotect and decrypt in single call
+    case
+        quic_aead:unprotect_long_packet(Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRecv)
+    of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, PN, _UnprotectedHeader, Plaintext} ->
             %% Decode frames
             case quic_frame:decode_all(Plaintext) of
                 {ok, Frames} ->
@@ -2930,9 +2856,7 @@ decrypt_packet_continue(
                     {ok, Level, Frames, RemainingData, NewState};
                 {error, Reason} ->
                     {error, {frame_decode_error, Reason}}
-            end;
-        {error, bad_tag} ->
-            {error, decryption_failed}
+            end
     end.
 
 %% Process decoded frames without re-enabling socket (for coalesced packets)
@@ -4493,6 +4417,11 @@ record_received_pn(app, PN, State) ->
     PNSpace = State#state.pn_app,
     NewPNSpace = update_pn_space_recv(PN, PNSpace),
     State#state{pn_app = NewPNSpace};
+record_received_pn(zero_rtt, PN, State) ->
+    %% 0-RTT uses the same PN space as 1-RTT (app)
+    PNSpace = State#state.pn_app,
+    NewPNSpace = update_pn_space_recv(PN, PNSpace),
+    State#state{pn_app = NewPNSpace};
 record_received_pn(_, _PN, State) ->
     State.
 
@@ -4502,6 +4431,9 @@ get_largest_recv(initial, State) ->
 get_largest_recv(handshake, State) ->
     (State#state.pn_handshake)#pn_space.largest_recv;
 get_largest_recv(app, State) ->
+    (State#state.pn_app)#pn_space.largest_recv;
+get_largest_recv(zero_rtt, State) ->
+    %% 0-RTT uses the same PN space as 1-RTT (app)
     (State#state.pn_app)#pn_space.largest_recv.
 
 %% RFC 9000 Appendix A: Packet Number Reconstruction
@@ -4914,41 +4846,28 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
     PN = PNSpace#pn_space.next_pn,
     PNLen = quic_packet:pn_length(PN),
 
-    %% Long header for 0-RTT (type 1)
-    %% First byte: 11XX XXXX where XX = type (01 for 0-RTT)
-
-    % 0xD0 base for 0-RTT
-    FirstByte = 16#C0 bor (1 bsl 4) bor (PNLen - 1),
-
-    %% Build long header
-    DCIDLen = byte_size(DCID),
-    SCIDLen = byte_size(SCID),
-    Header = <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary>>,
-
-    %% Encode packet number and length
-    PNBin = quic_packet:encode_pn(PN, PNLen),
-    % +16 for AEAD tag
-    PayloadLen = byte_size(Payload) + 16,
-    LengthEncoded = quic_varint:encode(PNLen + PayloadLen),
-
-    %% AAD includes header with length but unprotected PN
-    AAD = <<Header/binary, LengthEncoded/binary, PNBin/binary>>,
-
     %% Pad payload if needed for header protection sampling
     PaddedPayload = pad_for_header_protection(Payload),
 
-    %% Encrypt with early keys
-    #crypto_keys{key = Key, iv = IV, hp = HP} = EarlyKeys,
-    Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPayload),
+    %% Long header for 0-RTT (type 1)
+    %% First byte: 11XX XXXX where XX = type (01 for 0-RTT)
+    % 0xD0 base for 0-RTT
+    FirstByte = 16#C0 bor (1 bsl 4) bor (PNLen - 1),
 
-    %% Header protection
-    PNOffset = byte_size(Header) + byte_size(LengthEncoded),
-    ProtectedHeader = quic_aead:protect_header(
-        HP, <<Header/binary, LengthEncoded/binary, PNBin/binary>>, Encrypted, PNOffset
+    %% Build header prefix (includes Length field, but not PN)
+    DCIDLen = byte_size(DCID),
+    SCIDLen = byte_size(SCID),
+    % +16 for AEAD tag
+    PayloadLen = byte_size(PaddedPayload) + 16,
+    LengthEncoded = quic_varint:encode(PNLen + PayloadLen),
+    HeaderPrefix =
+        <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary, LengthEncoded/binary>>,
+
+    %% Protect packet (encrypt + header protection in single call)
+    #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EarlyKeys,
+    Packet = quic_aead:protect_long_packet(
+        Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
-
-    %% Build and send packet
-    Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     do_socket_send(Packet, State),
 
     %% Update PN space and packet counter
