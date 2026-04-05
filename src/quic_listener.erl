@@ -230,7 +230,7 @@ handle_info(
     {udp, Socket, SrcIP, SrcPort, Packet},
     #listener_state{socket = Socket} = State
 ) ->
-    ?LOG_INFO(
+    ?LOG_DEBUG(
         #{what => udp_received, src_ip => SrcIP, src_port => SrcPort, size => byte_size(Packet)},
         ?QUIC_LOG_META
     ),

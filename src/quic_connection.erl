@@ -2859,7 +2859,7 @@ decrypt_app_packet_continue(UnprotectedHeader, PNLen, EncryptedPayload, State) -
     LargestRecv = get_largest_recv(app, State1),
     PN = reconstruct_pn(LargestRecv, TruncatedPN, PNLen),
     AAD = UnprotectedHeader,
-    Ciphertext = binary:part(EncryptedPayload, PNLen, byte_size(EncryptedPayload) - PNLen),
+    <<_:PNLen/binary, Ciphertext/binary>> = EncryptedPayload,
 
     #crypto_keys{key = Key, iv = IV} = PeerDecryptKeys,
     case quic_aead:decrypt(Key, IV, PN, AAD, Ciphertext) of
@@ -2913,7 +2913,7 @@ decrypt_packet_continue(
     AAD = UnprotectedHeader,
 
     %% Actual ciphertext starts after PN bytes in EncryptedPayload
-    Ciphertext = binary:part(EncryptedPayload, PNLen, byte_size(EncryptedPayload) - PNLen),
+    <<_:PNLen/binary, Ciphertext/binary>> = EncryptedPayload,
 
     %% Decrypt
     case quic_aead:decrypt(Key, IV, PN, AAD, Ciphertext) of

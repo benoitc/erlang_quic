@@ -185,7 +185,13 @@ unprotect_header(HP, ProtectedHeader, EncryptedPayload, _PNOffset) ->
 
             %% PN is at the start of EncryptedPayload, unmask it
             <<ProtectedPN:PNLen/binary, _/binary>> = EncryptedPayload,
-            PNMask = binary:part(<<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>, 0, PNLen),
+            PNMask =
+                case PNLen of
+                    1 -> <<MaskByte1>>;
+                    2 -> <<MaskByte1, MaskByte2>>;
+                    3 -> <<MaskByte1, MaskByte2, MaskByte3>>;
+                    4 -> <<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>
+                end,
             PN = crypto:exor(ProtectedPN, PNMask),
 
             %% Return unprotected header (first byte + rest) with PN appended
@@ -197,10 +203,8 @@ unprotect_header(HP, ProtectedHeader, EncryptedPayload, _PNOffset) ->
 %% RFC 9001 Section 5.3: The 64 bits of the reconstructed QUIC packet number
 %% in network byte order are left-padded with zeros to the size of the IV.
 -spec compute_nonce(binary(), non_neg_integer()) -> binary().
-compute_nonce(IV, PN) when byte_size(IV) =:= 12 ->
-    %% Left-pad 64-bit PN to 12 bytes (96 bits) and XOR with IV
-    PNPadded = <<0:32, PN:64>>,
-    crypto:exor(IV, PNPadded).
+compute_nonce(<<IV0:32, IV1:64>>, PN) ->
+    <<IV0:32, (IV1 bxor PN):64>>.
 
 %%====================================================================
 %% Internal Functions
@@ -255,7 +259,13 @@ apply_header_mask(Header, Mask, PNOffset) ->
     <<BeforePN:BeforePNLen/binary, PN:PNLen/binary, AfterPN/binary>> = Rest,
 
     %% Mask PN bytes
-    PNMask = binary:part(<<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>, 0, PNLen),
+    PNMask =
+        case PNLen of
+            1 -> <<MaskByte1>>;
+            2 -> <<MaskByte1, MaskByte2>>;
+            3 -> <<MaskByte1, MaskByte2, MaskByte3>>;
+            4 -> <<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>
+        end,
     ProtectedPN = crypto:exor(PN, PNMask),
 
     <<ProtectedFirstByte, BeforePN/binary, ProtectedPN/binary, AfterPN/binary>>.
