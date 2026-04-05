@@ -1253,14 +1253,18 @@ connected(cast, {set_owner, NewOwner}, State) ->
 connected({call, From}, {send_datagram, Data}, State) ->
     case do_send_datagram(Data, State) of
         {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
+            %% Event-driven flush: flush batch after user API call
+            FlushedState = flush_socket_batch(NewState),
+            {keep_state, FlushedState, [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
 connected({call, From}, {send_data, StreamId, Data, Fin}, State) ->
     case do_send_data(StreamId, Data, Fin, State) of
         {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
+            %% Event-driven flush: flush batch after user API call
+            FlushedState = flush_socket_batch(NewState),
+            {keep_state, FlushedState, [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1427,10 +1431,6 @@ connected(info, {send_delayed_ack, app}, State) ->
     erase(ack_timer),
     NewState = send_app_ack(State),
     {keep_state, NewState};
-%% Handle batch flush timeout (quic_socket batching)
-connected(info, batch_flush_timeout, State) ->
-    NewState = flush_socket_batch(State),
-    {keep_state, NewState};
 %% Handle PMTU probe timeout (RFC 8899)
 connected(info, pmtu_probe_timeout, #state{pmtu_state = PMTUState} = State) ->
     NewPMTUState = quic_pmtu:on_probe_timeout(PMTUState),
@@ -1562,10 +1562,6 @@ handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     %% EXIT signals are handled in terminate/3 callback
     %% Just ignore here - the process will terminate anyway if it's from parent
     {keep_state, State};
-%% Handle batch flush timeout in any state (quic_socket batching)
-handle_common_event(info, batch_flush_timeout, _StateName, State) ->
-    NewState = flush_socket_batch(State),
-    {keep_state, NewState};
 %% Return error for unhandled calls to prevent timeout
 handle_common_event({call, From}, _Request, StateName, State) ->
     {keep_state, State, [{reply, From, {error, {invalid_state, StateName}}}]};
@@ -1665,10 +1661,14 @@ send_client_hello(State) ->
             end
     }),
 
-    %% Enable socket for receiving
-    inet:setopts(NewState#state.socket, [{active, once}]),
+    %% Event-driven flush: flush batch after sending ClientHello
+    %% Critical for handshake - must send immediately
+    FlushedState = flush_socket_batch(NewState),
 
-    NewState.
+    %% Enable socket for receiving
+    inet:setopts(FlushedState#state.socket, [{active, once}]),
+
+    FlushedState.
 
 %% Server: Select cipher suite from client's list (server preference)
 %% ClientCipherSuites is a list of TLS cipher suite codes (integers)
@@ -3097,7 +3097,9 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     State5 = set_pto_timer(State4),
 
                     %% Try to send queued data now that cwnd may have freed up
-                    process_send_queue(State5)
+                    State6 = process_send_queue(State5),
+                    %% Event-driven flush: flush batch after ACK processing
+                    flush_socket_batch(State6)
                 %% close inner case (on_ack_received)
             end
         %% close outer case (Ranges)
@@ -3115,7 +3117,9 @@ process_frame(_Level, {max_data, MaxData}, #state{max_data_remote = Current} = S
         true ->
             %% Limit increased - try to drain queued data
             State1 = State#state{max_data_remote = MaxData},
-            process_send_queue(State1);
+            State2 = process_send_queue(State1),
+            %% Event-driven flush: flush batch after flow control opens
+            flush_socket_batch(State2);
         false ->
             %% Monotonic: ignore if not increasing (per RFC 9000)
             State
@@ -3130,7 +3134,9 @@ process_frame(_Level, {max_stream_data, StreamId, MaxData}, #state{streams = Str
                     NewStream = Stream#stream_state{send_max_data = MaxData},
                     State1 = State#state{streams = maps:put(StreamId, NewStream, Streams)},
                     %% Limit increased - try to drain queued data
-                    process_send_queue(State1);
+                    State2 = process_send_queue(State1),
+                    %% Event-driven flush: flush batch after stream flow control opens
+                    flush_socket_batch(State2);
                 false ->
                     %% Monotonic: ignore if not increasing
                     State
@@ -5755,7 +5761,9 @@ handle_pacing_timeout(#state{send_queue = PQ} = State) ->
             %% Process the send queue
             State2 = process_send_queue(State1),
             %% If there's still queued data and pacing is blocking, set another timer
-            maybe_reschedule_pacing(State2)
+            State3 = maybe_reschedule_pacing(State2),
+            %% Event-driven flush: flush batch after pacing timeout processing
+            flush_socket_batch(State3)
     end.
 
 %% Check if we need to reschedule pacing timer after processing queue

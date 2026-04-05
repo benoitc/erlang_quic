@@ -56,8 +56,7 @@ open_with_custom_batch_config_test() ->
     {ok, State} = quic_socket:open(0, #{
         batching => #{
             enabled => true,
-            max_packets => 32,
-            flush_timeout_ms => 5
+            max_packets => 32
         }
     }),
     ?assertMatch({ok, {_, _}}, quic_socket:sockname(State)),

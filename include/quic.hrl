@@ -306,8 +306,6 @@
 -define(DEFAULT_UDP_SNDBUF, 7340032).
 
 %% UDP Packet Batching (GSO/GRO on Linux)
-%% Flush timeout in milliseconds - how long to accumulate packets before sending
--define(DEFAULT_BATCH_TIMEOUT_MS, 1).
 %% Maximum packets to batch before auto-flush
 -define(DEFAULT_MAX_BATCH_PACKETS, 64).
 %% Default GSO segment size (QUIC packet size for batching)

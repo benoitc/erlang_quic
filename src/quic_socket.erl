@@ -30,8 +30,7 @@
 %%% quic:start_server(Name, Port, #{
 %%%     batching => #{
 %%%         enabled => true,
-%%%         max_packets => 64,
-%%%         flush_timeout_ms => 1
+%%%         max_packets => 64
 %%%     }
 %%% }).
 %%% '''
@@ -79,11 +78,7 @@
     %% Current batch destination address
     batch_addr :: {inet:ip_address(), inet:port_number()} | undefined,
     %% Maximum packets per batch
-    max_batch_packets = ?DEFAULT_MAX_BATCH_PACKETS :: pos_integer(),
-    %% Flush timeout timer reference
-    flush_timer :: reference() | undefined,
-    %% Flush timeout in milliseconds
-    flush_timeout_ms = ?DEFAULT_BATCH_TIMEOUT_MS :: non_neg_integer()
+    max_batch_packets = ?DEFAULT_MAX_BATCH_PACKETS :: pos_integer()
 }).
 
 -opaque socket_state() :: #socket_state{}.
@@ -108,7 +103,6 @@ open(Port, Opts) ->
     BatchOpts = maps:get(batching, Opts, #{}),
     BatchingEnabled = maps:get(enabled, BatchOpts, true),
     MaxBatch = maps:get(max_packets, BatchOpts, ?DEFAULT_MAX_BATCH_PACKETS),
-    FlushTimeout = maps:get(flush_timeout_ms, BatchOpts, ?DEFAULT_BATCH_TIMEOUT_MS),
     GSOSize = maps:get(gso_size, BatchOpts, ?DEFAULT_GSO_SEGMENT_SIZE),
 
     case Backend of
@@ -118,14 +112,12 @@ open(Port, Opts) ->
                 gro_supported => GROSupported,
                 batching_enabled => BatchingEnabled,
                 max_batch => MaxBatch,
-                flush_timeout => FlushTimeout,
                 gso_size => GSOSize
             });
         gen_udp ->
             open_genudp_backend(Port, Opts, #{
                 batching_enabled => BatchingEnabled,
                 max_batch => MaxBatch,
-                flush_timeout => FlushTimeout,
                 gso_size => GSOSize
             })
     end.
@@ -138,7 +130,6 @@ wrap(Socket, Opts) ->
     BatchOpts = maps:get(batching, Opts, #{}),
     BatchingEnabled = maps:get(enabled, BatchOpts, true),
     MaxBatch = maps:get(max_packets, BatchOpts, ?DEFAULT_MAX_BATCH_PACKETS),
-    FlushTimeout = maps:get(flush_timeout_ms, BatchOpts, ?DEFAULT_BATCH_TIMEOUT_MS),
     GSOSize = maps:get(gso_size, BatchOpts, ?DEFAULT_GSO_SEGMENT_SIZE),
 
     State = #socket_state{
@@ -148,8 +139,7 @@ wrap(Socket, Opts) ->
         gso_size = GSOSize,
         gro_enabled = false,
         batching_enabled = BatchingEnabled,
-        max_batch_packets = MaxBatch,
-        flush_timeout_ms = FlushTimeout
+        max_batch_packets = MaxBatch
     },
     {ok, State}.
 
@@ -190,11 +180,11 @@ send(#socket_state{} = State, IP, Port, Data) ->
 -spec flush(socket_state()) -> {ok, socket_state()} | {error, term()}.
 flush(#socket_state{batch_buffer = []} = State) ->
     %% Nothing to flush
-    {ok, cancel_flush_timer(State)};
+    {ok, State};
 flush(#socket_state{batch_buffer = Buffer, batch_addr = undefined} = State) ->
     %% No address set but have data - shouldn't happen, but clear buffer
     ?LOG_WARNING(#{what => flush_no_addr, buffer_size => length(Buffer)}),
-    {ok, cancel_flush_timer(State#socket_state{batch_buffer = []})};
+    {ok, State#socket_state{batch_buffer = []}};
 flush(#socket_state{gso_supported = true} = State) ->
     %% GSO path - send all packets in one syscall
     flush_gso(State);
@@ -335,8 +325,7 @@ build_socket_state(Socket, BatchConfig) ->
         gso_size = maps:get(gso_size, BatchConfig),
         gro_enabled = GROEnabled,
         batching_enabled = maps:get(batching_enabled, BatchConfig),
-        max_batch_packets = maps:get(max_batch, BatchConfig),
-        flush_timeout_ms = maps:get(flush_timeout, BatchConfig)
+        max_batch_packets = maps:get(max_batch, BatchConfig)
     },
     {ok, State}.
 
@@ -402,8 +391,7 @@ build_genudp_state(Socket, BatchConfig) ->
         gso_size = maps:get(gso_size, BatchConfig),
         gro_enabled = false,
         batching_enabled = maps:get(batching_enabled, BatchConfig),
-        max_batch_packets = maps:get(max_batch, BatchConfig),
-        flush_timeout_ms = maps:get(flush_timeout, BatchConfig)
+        max_batch_packets = maps:get(max_batch, BatchConfig)
     }.
 
 %%====================================================================
@@ -420,27 +408,9 @@ add_to_batch(#socket_state{batch_buffer = Buffer, max_batch_packets = Max} = Sta
             %% Batch full - flush now
             flush(State1);
         false ->
-            %% Start or maintain flush timer
-            {ok, ensure_flush_timer(State1)}
+            %% Just accumulate - caller flushes at send cycle boundaries
+            {ok, State1}
     end.
-
-ensure_flush_timer(#socket_state{flush_timer = undefined, flush_timeout_ms = Timeout} = State) ->
-    Timer = erlang:send_after(Timeout, self(), batch_flush_timeout),
-    State#socket_state{flush_timer = Timer};
-ensure_flush_timer(State) ->
-    State.
-
-cancel_flush_timer(#socket_state{flush_timer = undefined} = State) ->
-    State;
-cancel_flush_timer(#socket_state{flush_timer = Timer} = State) ->
-    _ = erlang:cancel_timer(Timer),
-    %% Clear any pending message
-    receive
-        batch_flush_timeout -> ok
-    after 0 ->
-        ok
-    end,
-    State#socket_state{flush_timer = undefined}.
 
 flush_gso(
     #socket_state{
@@ -464,18 +434,10 @@ flush_gso(
 
     case socket:sendmsg(Socket, Msg) of
         ok ->
-            {ok,
-                cancel_flush_timer(State#socket_state{
-                    batch_buffer = [],
-                    batch_addr = undefined
-                })};
+            {ok, State#socket_state{batch_buffer = [], batch_addr = undefined}};
         {ok, _RestData} ->
             %% Partial send - clear buffer anyway for now
-            {ok,
-                cancel_flush_timer(State#socket_state{
-                    batch_buffer = [],
-                    batch_addr = undefined
-                })};
+            {ok, State#socket_state{batch_buffer = [], batch_addr = undefined}};
         {error, _} = Error ->
             Error
     end.
@@ -494,11 +456,7 @@ flush_individual(
 
     case Result of
         ok ->
-            {ok,
-                cancel_flush_timer(State#socket_state{
-                    batch_buffer = [],
-                    batch_addr = undefined
-                })};
+            {ok, State#socket_state{batch_buffer = [], batch_addr = undefined}};
         {error, _} = Error ->
             Error
     end.

@@ -107,8 +107,6 @@ test_get_stats_returns_counts() ->
                 {ok, Port} = quic:get_server_port(ServerName),
 
                 ClientOpts = #{
-                    cert => Cert,
-                    key => Key,
                     alpn => [<<"test">>],
                     verify => false
                 },
@@ -162,8 +160,6 @@ test_packets_sent_increments() ->
                 {ok, Port} = quic:get_server_port(ServerName),
 
                 ClientOpts = #{
-                    cert => Cert,
-                    key => Key,
                     alpn => [<<"test">>],
                     verify => false
                 },
@@ -216,8 +212,6 @@ test_counters_survive_handshake() ->
                 {ok, Port} = quic:get_server_port(ServerName),
 
                 ClientOpts = #{
-                    cert => Cert,
-                    key => Key,
                     alpn => [<<"test">>],
                     verify => false
                 },
