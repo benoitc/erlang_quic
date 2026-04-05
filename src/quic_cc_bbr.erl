@@ -112,8 +112,13 @@
 %% HyStart++ constants (RFC 9406)
 %% Minimum RTT samples before making slow start exit decision
 -define(HYSTART_MIN_SAMPLES, 8).
-%% RTT increase threshold in milliseconds
--define(HYSTART_RTT_THRESH, 4).
+%% Dynamic RTT threshold bounds (RFC 9406)
+%% Minimum RTT threshold in milliseconds
+-define(HYSTART_MIN_RTT_THRESH, 4).
+%% Maximum RTT threshold in milliseconds
+-define(HYSTART_MAX_RTT_THRESH, 16).
+%% Divisor for baseline RTT to calculate dynamic threshold
+-define(HYSTART_MIN_RTT_DIVISOR, 8).
 
 %%====================================================================
 %% BBRv3 State Record
@@ -1085,12 +1090,21 @@ hystart_should_exit(#bbr_state{
     Samples >= ?HYSTART_MIN_SAMPLES,
     is_integer(CurrRTT),
     CurrRTT > 0,
-    LastRTT > 0,
-    (CurrRTT - LastRTT) > ?HYSTART_RTT_THRESH
+    LastRTT > 0
 ->
-    true;
+    %% Calculate dynamic RTT threshold (RFC 9406)
+    RTTThresh = calculate_rtt_threshold(LastRTT),
+    (CurrRTT - LastRTT) > RTTThresh;
 hystart_should_exit(_) ->
     false.
+
+%% @private Calculate dynamic RTT threshold (RFC 9406)
+%% RttThresh = clamp(MIN, lastRTT/DIVISOR, MAX)
+calculate_rtt_threshold(LastRTT) when LastRTT > 0 ->
+    Threshold = LastRTT div ?HYSTART_MIN_RTT_DIVISOR,
+    max(?HYSTART_MIN_RTT_THRESH, min(Threshold, ?HYSTART_MAX_RTT_THRESH));
+calculate_rtt_threshold(_) ->
+    ?HYSTART_MIN_RTT_THRESH.
 
 %% @private Update HyStart++ RTT samples
 %% Called from update_pacing_rate when in startup

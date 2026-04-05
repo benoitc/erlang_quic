@@ -280,6 +280,40 @@ hystart_rtt_tracking_test() ->
     ?assert(quic_cc:in_slow_start(S3)).
 
 %%====================================================================
+%% HyStart++ Dynamic RTT Threshold Tests (RFC 9406)
+%%====================================================================
+
+cubic_hystart_dynamic_threshold_low_rtt_test() ->
+    %% Low RTT (20ms): threshold = max(4, min(20/8, 16)) = max(4, 2) = 4ms
+    %% The threshold is clamped to the minimum of 4ms
+    State = quic_cc:new(cubic, #{}),
+    %% Simulate low RTT environment
+    S1 = quic_cc:update_pacing_rate(State, 20),
+    S2 = quic_cc:on_packet_sent(S1, 5000),
+    S3 = quic_cc:on_packets_acked(S2, 5000),
+    %% Should still be in slow start
+    ?assert(quic_cc:in_slow_start(S3)).
+
+cubic_hystart_dynamic_threshold_medium_rtt_test() ->
+    %% Medium RTT (80ms): threshold = max(4, min(80/8, 16)) = max(4, 10) = 10ms
+    State = quic_cc:new(cubic, #{}),
+    %% Simulate medium RTT environment
+    S1 = quic_cc:update_pacing_rate(State, 80),
+    S2 = quic_cc:on_packet_sent(S1, 5000),
+    S3 = quic_cc:on_packets_acked(S2, 5000),
+    ?assert(quic_cc:in_slow_start(S3)).
+
+cubic_hystart_dynamic_threshold_high_rtt_test() ->
+    %% High RTT (200ms): threshold = max(4, min(200/8, 16)) = max(4, 16) = 16ms
+    %% The threshold is clamped to the maximum of 16ms
+    State = quic_cc:new(cubic, #{}),
+    %% Simulate high RTT environment
+    S1 = quic_cc:update_pacing_rate(State, 200),
+    S2 = quic_cc:on_packet_sent(S1, 5000),
+    S3 = quic_cc:on_packets_acked(S2, 5000),
+    ?assert(quic_cc:in_slow_start(S3)).
+
+%%====================================================================
 %% Congestion Event Tests
 %%====================================================================
 

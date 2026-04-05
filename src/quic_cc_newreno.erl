@@ -75,12 +75,17 @@
 %% HyStart++ constants (RFC 9406)
 %% Minimum RTT samples before making slow start exit decision
 -define(HYSTART_MIN_SAMPLES, 8).
-%% RTT increase threshold in milliseconds
--define(HYSTART_RTT_THRESH, 4).
 %% CSS growth divisor: grow cwnd by cwnd/divisor per RTT
 -define(HYSTART_CSS_GROWTH_DIV, 4).
 %% Number of rounds in CSS before entering congestion avoidance
 -define(HYSTART_CSS_ROUNDS, 5).
+%% Dynamic RTT threshold bounds (RFC 9406)
+%% Minimum RTT threshold in milliseconds
+-define(HYSTART_MIN_RTT_THRESH, 4).
+%% Maximum RTT threshold in milliseconds
+-define(HYSTART_MAX_RTT_THRESH, 16).
+%% Divisor for baseline RTT to calculate dynamic threshold
+-define(HYSTART_MIN_RTT_DIVISOR, 8).
 
 %% Congestion control state
 -record(cc_state, {
@@ -138,7 +143,9 @@
     %% Last round's minimum RTT (milliseconds)
     hystart_last_rtt = 0 :: non_neg_integer(),
     %% Current round's minimum RTT (milliseconds)
-    hystart_curr_rtt = infinity :: non_neg_integer() | infinity
+    hystart_curr_rtt = infinity :: non_neg_integer() | infinity,
+    %% CSS baseline RTT for potential reversion to slow start (RFC 9406)
+    hystart_css_baseline_rtt = infinity :: non_neg_integer() | infinity
 }).
 
 -opaque cc_state() :: #cc_state{}.
@@ -385,43 +392,77 @@ hystart_on_ack(
     NewCwnd = Cwnd + AckedBytes,
     State#cc_state{cwnd = NewCwnd};
 %% Clause 2: In Conservative Slow Start - grow by cwnd/CSS_GROWTH_DIV per RTT
+%% RFC 9406: Can revert to slow start if RTT drops below baseline
 hystart_on_ack(
     #cc_state{
         cwnd = Cwnd,
         max_datagram_size = MaxDS,
         hystart_in_css = true,
-        hystart_css_rounds = Rounds
+        hystart_css_rounds = Rounds,
+        hystart_css_baseline_rtt = BaselineRTT,
+        hystart_curr_rtt = CurrRTT,
+        hystart_rtt_sample_count = SampleCount
     } = State,
     AckedBytes
 ) ->
-    %% In Conservative Slow Start - grow by cwnd/CSS_GROWTH_DIV per RTT
-    Increment = max(MaxDS, (Cwnd * AckedBytes) div (max(Cwnd, 1) * ?HYSTART_CSS_GROWTH_DIV)),
-    NewCwnd = Cwnd + Increment,
+    NewSampleCount = SampleCount + 1,
 
-    %% Check if CSS rounds complete
-    NewRounds = Rounds + 1,
-    case NewRounds >= ?HYSTART_CSS_ROUNDS of
-        true ->
-            %% Exit slow start, enter congestion avoidance
+    %% Check for CSS reversion after enough samples (RFC 9406)
+    %% If RTT dropped below baseline, revert to slow start
+    case NewSampleCount >= ?HYSTART_MIN_SAMPLES of
+        true when is_integer(CurrRTT), is_integer(BaselineRTT), CurrRTT < BaselineRTT ->
+            %% RTT dropped below CSS entry point - revert to slow start
             ?LOG_DEBUG(
                 #{
-                    what => hystart_css_complete,
-                    cwnd => NewCwnd,
-                    rounds => NewRounds
+                    what => hystart_css_revert,
+                    cwnd => Cwnd,
+                    curr_rtt => CurrRTT,
+                    baseline_rtt => BaselineRTT
                 },
                 ?QUIC_LOG_META
             ),
+            NewCwnd = Cwnd + AckedBytes,
             State#cc_state{
                 cwnd = NewCwnd,
-                ssthresh = NewCwnd,
                 hystart_in_css = false,
-                hystart_css_rounds = 0
+                hystart_css_rounds = 0,
+                hystart_css_baseline_rtt = infinity,
+                hystart_rtt_sample_count = 0
             };
-        false ->
-            State#cc_state{
-                cwnd = NewCwnd,
-                hystart_css_rounds = NewRounds
-            }
+        _ ->
+            %% Continue CSS with linear growth
+            Increment = max(
+                MaxDS, (Cwnd * AckedBytes) div (max(Cwnd, 1) * ?HYSTART_CSS_GROWTH_DIV)
+            ),
+            NewCwnd = Cwnd + Increment,
+
+            %% Check if CSS rounds complete
+            NewRounds = Rounds + 1,
+            case NewRounds >= ?HYSTART_CSS_ROUNDS of
+                true ->
+                    %% Exit slow start, enter congestion avoidance
+                    ?LOG_DEBUG(
+                        #{
+                            what => hystart_css_complete,
+                            cwnd => NewCwnd,
+                            rounds => NewRounds
+                        },
+                        ?QUIC_LOG_META
+                    ),
+                    State#cc_state{
+                        cwnd = NewCwnd,
+                        ssthresh = NewCwnd,
+                        hystart_in_css = false,
+                        hystart_css_rounds = 0,
+                        hystart_css_baseline_rtt = infinity
+                    };
+                false ->
+                    State#cc_state{
+                        cwnd = NewCwnd,
+                        hystart_css_rounds = NewRounds,
+                        hystart_rtt_sample_count = NewSampleCount
+                    }
+            end
     end;
 %% Clause 3: Normal slow start with HyStart++ RTT monitoring
 hystart_on_ack(
@@ -446,16 +487,21 @@ hystart_on_ack(
     %% Check for RTT-based exit condition after minimum samples
     case NewSampleCount >= ?HYSTART_MIN_SAMPLES of
         true when LastRTT > 0, is_integer(CurrRTT), CurrRTT > 0 ->
+            %% Calculate dynamic RTT threshold (RFC 9406)
+            %% RttThresh = clamp(MIN, lastRTT/DIVISOR, MAX)
+            RTTThresh = calculate_rtt_threshold(LastRTT),
             %% Check if current RTT exceeds threshold
             RTTIncrease = CurrRTT - LastRTT,
-            case RTTIncrease > ?HYSTART_RTT_THRESH of
+            case RTTIncrease > RTTThresh of
                 true ->
                     %% Enter Conservative Slow Start
+                    %% Save current RTT as baseline for potential reversion
                     ?LOG_DEBUG(
                         #{
                             what => hystart_enter_css,
                             cwnd => NewCwnd,
                             rtt_increase => RTTIncrease,
+                            rtt_threshold => RTTThresh,
                             last_rtt => LastRTT,
                             curr_rtt => CurrRTT
                         },
@@ -463,7 +509,9 @@ hystart_on_ack(
                     ),
                     State1#cc_state{
                         hystart_in_css = true,
-                        hystart_css_rounds = 0
+                        hystart_css_rounds = 0,
+                        hystart_css_baseline_rtt = CurrRTT,
+                        hystart_rtt_sample_count = 0
                     };
                 false ->
                     State1
@@ -471,6 +519,14 @@ hystart_on_ack(
         _ ->
             State1
     end.
+
+%% @private Calculate dynamic RTT threshold (RFC 9406)
+%% RttThresh = clamp(MIN, lastRTT/DIVISOR, MAX)
+calculate_rtt_threshold(LastRTT) when LastRTT > 0 ->
+    Threshold = LastRTT div ?HYSTART_MIN_RTT_DIVISOR,
+    max(?HYSTART_MIN_RTT_THRESH, min(Threshold, ?HYSTART_MAX_RTT_THRESH));
+calculate_rtt_threshold(_) ->
+    ?HYSTART_MIN_RTT_THRESH.
 
 %% @private Update HyStart++ RTT samples
 %% Called from update_pacing_rate when in slow start
@@ -608,7 +664,8 @@ do_congestion_event(
         %% Reset HyStart++ state
         hystart_in_css = false,
         hystart_css_rounds = 0,
-        hystart_rtt_sample_count = 0
+        hystart_rtt_sample_count = 0,
+        hystart_css_baseline_rtt = infinity
     }.
 
 %%====================================================================
@@ -646,7 +703,8 @@ on_ecn_ce(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} = State, NewCEC
         %% Reset HyStart++ state
         hystart_in_css = false,
         hystart_css_rounds = 0,
-        hystart_rtt_sample_count = 0
+        hystart_rtt_sample_count = 0,
+        hystart_css_baseline_rtt = infinity
     }.
 
 %% @doc Get the current ECN-CE counter.
@@ -788,7 +846,8 @@ on_persistent_congestion(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} 
         hystart_css_rounds = 0,
         hystart_rtt_sample_count = 0,
         hystart_last_rtt = 0,
-        hystart_curr_rtt = infinity
+        hystart_curr_rtt = infinity,
+        hystart_css_baseline_rtt = infinity
     }.
 
 %%====================================================================
