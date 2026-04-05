@@ -164,6 +164,8 @@
 
     %% Socket
     socket :: gen_udp:socket() | undefined,
+    %% Socket state for batching (quic_socket abstraction)
+    socket_state :: quic_socket:socket_state() | undefined,
     remote_addr :: {inet:ip_address(), inet:port_number()},
     local_addr :: {inet:ip_address(), inet:port_number()} | undefined,
 
@@ -897,6 +899,16 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% Get idle timeout for keep-alive calculation
     IdleTimeoutClient = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
 
+    %% Initialize socket_state for batching (client connections only)
+    SocketState =
+        case maps:get(batching, Opts, #{}) of
+            #{enabled := false} ->
+                undefined;
+            BatchOpts ->
+                {ok, SS} = quic_socket:wrap(Sock, #{batching => BatchOpts}),
+                SS
+        end,
+
     %% Initialize state
     State = #state{
         scid = SCID,
@@ -904,6 +916,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         original_dcid = DCID,
         role = client,
         socket = Sock,
+        socket_state = SocketState,
         remote_addr = RemoteAddr,
         local_addr = LocalAddr,
         owner = Owner,
@@ -965,6 +978,7 @@ terminate(
     StateName,
     #state{
         socket = Socket,
+        socket_state = SocketState,
         pto_timer = PtoTimer,
         idle_timer = IdleTimer,
         keep_alive_timer = KeepAliveTimer,
@@ -983,6 +997,17 @@ terminate(
         _ ->
             try
                 send_connection_close(Reason, State)
+            catch
+                _:_ -> ok
+            end
+    end,
+    %% Flush any batched packets before closing
+    case SocketState of
+        undefined ->
+            ok;
+        _ ->
+            try
+                _ = quic_socket:flush(SocketState)
             catch
                 _:_ -> ok
             end
@@ -1402,6 +1427,10 @@ connected(info, {send_delayed_ack, app}, State) ->
     erase(ack_timer),
     NewState = send_app_ack(State),
     {keep_state, NewState};
+%% Handle batch flush timeout (quic_socket batching)
+connected(info, batch_flush_timeout, State) ->
+    NewState = flush_socket_batch(State),
+    {keep_state, NewState};
 %% Handle PMTU probe timeout (RFC 8899)
 connected(info, pmtu_probe_timeout, #state{pmtu_state = PMTUState} = State) ->
     NewPMTUState = quic_pmtu:on_probe_timeout(PMTUState),
@@ -1533,6 +1562,10 @@ handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     %% EXIT signals are handled in terminate/3 callback
     %% Just ignore here - the process will terminate anyway if it's from parent
     {keep_state, State};
+%% Handle batch flush timeout in any state (quic_socket batching)
+handle_common_event(info, batch_flush_timeout, _StateName, State) ->
+    NewState = flush_socket_batch(State),
+    {keep_state, NewState};
 %% Return error for unhandled calls to prevent timeout
 handle_common_event({call, From}, _Request, StateName, State) ->
     {keep_state, State, [{reply, From, {error, {invalid_state, StateName}}}]};
@@ -1982,8 +2015,6 @@ send_initial_packet(Payload, State) ->
         scid = SCID,
         dcid = DCID,
         version = Version,
-        socket = Socket,
-        remote_addr = {IP, Port},
         initial_keys = {ClientKeys, ServerKeys},
         role = Role,
         pn_initial = PNSpace,
@@ -2049,7 +2080,7 @@ send_initial_packet(Payload, State) ->
     PaddedPacket = pad_initial_packet(Packet),
 
     %% Send
-    gen_udp:send(Socket, IP, Port, PaddedPacket),
+    do_socket_send(PaddedPacket, State),
 
     %% Emit qlog packet_sent event
     quic_qlog:packet_sent(State#state.qlog_ctx, #{
@@ -2060,10 +2091,10 @@ send_initial_packet(Payload, State) ->
 
     %% Update packet number space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State#state{
+    apply_pending_socket_state(State#state{
         pn_initial = NewPNSpace,
         packets_sent = State#state.packets_sent + 1
-    }.
+    }).
 
 %% Send an Initial ACK packet
 send_initial_ack(State) ->
@@ -2195,8 +2226,6 @@ send_handshake_packet(Payload, State) ->
         scid = SCID,
         dcid = DCID,
         version = Version,
-        socket = Socket,
-        remote_addr = {IP, Port},
         handshake_keys = {ClientKeys, ServerKeys},
         role = Role,
         pn_handshake = PNSpace
@@ -2245,7 +2274,7 @@ send_handshake_packet(Payload, State) ->
 
     %% Build and send
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
-    gen_udp:send(Socket, IP, Port, Packet),
+    do_socket_send(Packet, State),
 
     %% Emit qlog packet_sent event
     quic_qlog:packet_sent(State#state.qlog_ctx, #{
@@ -2256,10 +2285,10 @@ send_handshake_packet(Payload, State) ->
 
     %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State#state{
+    apply_pending_socket_state(State#state{
         pn_handshake = NewPNSpace,
         packets_sent = State#state.packets_sent + 1
-    }.
+    }).
 
 %% Send a 1-RTT (application) packet with frame for retransmission tracking
 %% Decodes the payload to extract frame info for loss tracking
@@ -2277,8 +2306,6 @@ send_app_packet(Payload, State) when is_binary(Payload) ->
 send_app_packet_internal(Payload, Frames, State) ->
     #state{
         dcid = DCID,
-        socket = Socket,
-        remote_addr = {IP, Port},
         app_keys = {ClientKeys, ServerKeys},
         role = Role,
         pn_app = PNSpace,
@@ -2326,7 +2353,7 @@ send_app_packet_internal(Payload, Frames, State) ->
     %% Build and send
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     PacketSize = byte_size(Packet),
-    SendResult = gen_udp:send(Socket, IP, Port, Packet),
+    SendResult = do_socket_send(Packet, State),
 
     %% Handle send result - only track packet and update state if send succeeded
     case SendResult of
@@ -2354,12 +2381,12 @@ send_app_packet_internal(Payload, Frames, State) ->
 
             %% Update PN space and packet counter for liveness detection
             NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-            State1 = State#state{
+            State1 = apply_pending_socket_state(State#state{
                 pn_app = NewPNSpace,
                 cc_state = NewCCState,
                 loss_state = NewLossState,
                 packets_sent = State#state.packets_sent + 1
-            },
+            }),
 
             %% Update activity timestamp on successful send
             %% This prevents idle timeout during long one-way transfers
@@ -4174,6 +4201,43 @@ get_max_stream_recv_window(#state{streams = Streams}) ->
 %% Internal Functions - Helpers
 %%====================================================================
 
+%% Send a packet via quic_socket (with batching) or gen_udp fallback.
+%% For client connections with socket_state, uses quic_socket batching.
+%% For server connections (shared socket), sends directly via gen_udp.
+do_socket_send(Packet, #state{socket_state = undefined, socket = Socket, remote_addr = {IP, Port}}) ->
+    %% No socket_state - use gen_udp directly (server or legacy path)
+    gen_udp:send(Socket, IP, Port, Packet);
+do_socket_send(Packet, #state{socket_state = SocketState, remote_addr = {IP, Port}}) ->
+    %% Use quic_socket with batching
+    case quic_socket:send(SocketState, IP, Port, Packet) of
+        {ok, NewSocketState} ->
+            %% Update socket_state in process dictionary for later retrieval
+            put(pending_socket_state, NewSocketState),
+            ok;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Apply pending socket state updates after send operations
+apply_pending_socket_state(#state{socket_state = undefined} = State) ->
+    State;
+apply_pending_socket_state(State) ->
+    case erase(pending_socket_state) of
+        undefined -> State;
+        NewSocketState -> State#state{socket_state = NewSocketState}
+    end.
+
+%% Flush any batched packets (call before timers or idle periods)
+flush_socket_batch(#state{socket_state = undefined} = State) ->
+    State;
+flush_socket_batch(#state{socket_state = SocketState} = State) ->
+    case quic_socket:flush(SocketState) of
+        {ok, NewSocketState} ->
+            State#state{socket_state = NewSocketState};
+        {error, _} ->
+            State
+    end.
+
 %% Send ACK if packet contained any ack-eliciting frames.
 %% Per RFC 9221 Section 5.2: Receivers SHOULD support delaying ACK frames
 %% for packets that only contain DATAGRAM frames.
@@ -4833,8 +4897,6 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
     #state{
         scid = SCID,
         dcid = DCID,
-        socket = Socket,
-        remote_addr = {IP, Port},
         version = Version,
         % 0-RTT uses app PN space
         pn_app = PNSpace
@@ -4878,14 +4940,14 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
 
     %% Build and send packet
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
-    gen_udp:send(Socket, IP, Port, Packet),
+    do_socket_send(Packet, State),
 
     %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State#state{
+    apply_pending_socket_state(State#state{
         pn_app = NewPNSpace,
         packets_sent = State#state.packets_sent + 1
-    }.
+    }).
 
 %% Estimate packet overhead (header + AEAD tag + frame header)
 -define(PACKET_OVERHEAD, 50).

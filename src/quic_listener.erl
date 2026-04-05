@@ -64,6 +64,8 @@
 
 -record(listener_state, {
     socket :: gen_udp:socket(),
+    %% Socket state for quic_socket abstraction (optional, for future GRO support)
+    socket_state :: quic_socket:socket_state() | undefined,
     port :: inet:port_number(),
     cert :: binary(),
     cert_chain :: [binary()],
