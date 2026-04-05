@@ -178,7 +178,7 @@ node_failure_test(Config) ->
     ok.
 
 %% Test node rejoin after failure
-node_rejoin_test(Config) ->
+node_rejoin_test(_Config) ->
     %% This test would restart Node3 and verify it rejoins
     %% For now, we skip as it requires node restart capability
     {skip, requires_node_restart}.
@@ -191,7 +191,7 @@ broadcast_test(Config) ->
     connect_mesh(Nodes),
 
     %% Start receivers on all nodes except first
-    [Sender | Receivers] = Nodes,
+    [_Sender | Receivers] = Nodes,
     Self = self(),
 
     ReceiverPids = lists:map(
@@ -337,12 +337,12 @@ generate_certs(CertDir) ->
     os:cmd(lists:flatten(Cmd)),
     ok.
 
-start_cluster(N, CertDir) ->
+start_cluster(N, _CertDir) ->
     %% Start N nodes with QUIC distribution
     %% This is simplified - actual implementation would use peer module or docker
     BasePort = 14430,
 
-    Nodes = lists:map(
+    _Nodes = lists:map(
         fun(I) ->
             Name = list_to_atom("cluster_node" ++ integer_to_list(I)),
             Port = BasePort + I,
@@ -396,6 +396,6 @@ ring_process(NextPid, Parent) ->
     receive
         {ring, Hops, Max} when Hops < Max ->
             NextPid ! {ring, Hops + 1, Max};
-        {ring, Hops, Max} ->
+        {ring, Hops, _Max} ->
             Parent ! {ring_complete, Hops}
     end.

@@ -23,9 +23,9 @@ tick_blocked_by_cwnd_collapse_test() ->
     % 100KB message
     LargeMessageSize = 100000,
     % 60 seconds tick interval
-    TickInterval = 60000,
+    _TickInterval = 60000,
     % 240 seconds before net_tick_timeout
-    TickTimeout = 240000,
+    _TickTimeout = 240000,
 
     %% Start with 64KB cwnd
     CCState = quic_cc:new(#{
@@ -40,7 +40,7 @@ tick_blocked_by_cwnd_collapse_test() ->
     NumPackets = LargeMessageSize div PacketSize,
 
     %% Simulate bursting all packets
-    {CC1, BytesSent} = lists:foldl(
+    {CC1, _BytesSent} = lists:foldl(
         fun(_, {CC, Sent}) ->
             case quic_cc:can_send(CC, PacketSize) of
                 true ->
@@ -98,7 +98,7 @@ rapid_congestion_on_docker_network_test() ->
     %% Simulate 10 congestion events over 100ms (10ms apart)
     %% On Docker, this is realistic due to low RTT
     FinalCC = lists:foldl(
-        fun(I, CC) ->
+        fun(_I, CC) ->
             % Wait for min_recovery_duration
             timer:sleep(10),
             Now = erlang:monotonic_time(millisecond),
@@ -135,7 +135,7 @@ large_message_fragments_test() ->
     LossState = quic_loss:new(),
 
     %% Simulate sending 1MB with realistic loss pattern (1% loss)
-    {FinalCC, FinalLoss, Acked, Lost} = lists:foldl(
+    {FinalCC, _FinalLoss, _Acked, _Lost} = lists:foldl(
         fun(PN, {CC, Loss, A, L}) ->
             case quic_cc:can_send(CC, PacketSize) of
                 true ->
@@ -250,7 +250,7 @@ full_distribution_simulation_test() ->
     % Every 50 cycles
     LargeMessageInterval = 50,
 
-    {FinalCC, _FinalFlow, _FinalLoss, TicksSent, TicksBlocked, LargeSent} =
+    {FinalCC, _FinalFlow, _FinalLoss, TicksSent, TicksBlocked, _LargeSent} =
         lists:foldl(
             fun(Cycle, {CC, Flow, Loss, TSent, TBlocked, LSent}) ->
                 PN = Cycle * 10,
@@ -443,7 +443,7 @@ tick_blocked_after_loss_burst_test() ->
     %% Send many packets (simulate large message)
     NumPackets = 50,
     PacketSize = 1200,
-    {CC1, Loss1} = lists:foldl(
+    {CC1, _Loss1} = lists:foldl(
         fun(PN, {CC, L}) ->
             CC_new = quic_cc:on_packet_sent(CC, PacketSize),
             L_new = quic_loss:on_packet_sent(L, PN, PacketSize, true),

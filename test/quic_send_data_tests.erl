@@ -184,7 +184,7 @@ keys_required_for_send_test() ->
     Keys = {#crypto_keys{key = <<"k">>, iv = <<"iv">>, hp = <<"hp">>}, #crypto_keys{
         key = <<"k">>, iv = <<"iv">>, hp = <<"hp">>
     }},
-    ?assertNotEqual(undefined, Keys).
+    ?assertMatch({#crypto_keys{}, #crypto_keys{}}, Keys).
 
 %%====================================================================
 %% 5. Send Queue Tests

@@ -300,7 +300,7 @@ converge_search(State, Iterations, MaxIterations) ->
 %% Simulate probe losses
 simulate_losses(State, 0, _PN, _Gen) ->
     State;
-simulate_losses(State, N, PN, Gen) ->
+simulate_losses(State, N, PN, _Gen) ->
     case quic_pmtu:should_probe(State) of
         true ->
             {NewGen, State1} = quic_pmtu:on_probe_sent(PN, State),

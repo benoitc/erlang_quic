@@ -387,7 +387,7 @@ generate_test_certs(Config) ->
 
 start_peer_nodes(CertDir, Config) ->
     %% Write sys.config for nodes
-    PrivDir = proplists:get_value(priv_dir, Config),
+    _PrivDir = proplists:get_value(priv_dir, Config),
 
     Node1Name = list_to_atom(
         "quic_ct_node1_" ++ integer_to_list(erlang:unique_integer([positive]))
