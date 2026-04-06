@@ -68,8 +68,8 @@
 -define(TIME_THRESHOLD, 1.125).
 % 1 millisecond
 -define(GRANULARITY, 1).
-% 333 milliseconds
--define(INITIAL_RTT, 333).
+% RFC 9002 default is 333ms, but 100ms is more aggressive for faster ramp-up
+-define(DEFAULT_INITIAL_RTT, 100).
 
 %% Loss detection state
 -record(loss_state, {
@@ -78,8 +78,8 @@
 
     %% RTT estimation
     latest_rtt = 0 :: non_neg_integer(),
-    smoothed_rtt = ?INITIAL_RTT :: non_neg_integer(),
-    rtt_var = ?INITIAL_RTT div 2 :: non_neg_integer(),
+    smoothed_rtt = ?DEFAULT_INITIAL_RTT :: non_neg_integer(),
+    rtt_var = ?DEFAULT_INITIAL_RTT div 2 :: non_neg_integer(),
     min_rtt = infinity :: non_neg_integer() | infinity,
     first_rtt_sample = false :: boolean(),
 
@@ -110,9 +110,15 @@ new() ->
     new(#{}).
 
 %% @doc Create a new loss detection state with options.
+%% Options:
+%%   - max_ack_delay: Maximum ACK delay (default: 25ms)
+%%   - initial_rtt: Initial RTT estimate in ms (default: 100ms)
 -spec new(map()) -> loss_state().
 new(Opts) ->
+    InitialRTT = maps:get(initial_rtt, Opts, ?DEFAULT_INITIAL_RTT),
     #loss_state{
+        smoothed_rtt = InitialRTT,
+        rtt_var = InitialRTT div 2,
         max_ack_delay = maps:get(max_ack_delay, Opts, ?DEFAULT_MAX_ACK_DELAY)
     }.
 
@@ -169,7 +175,8 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
             Error;
         AckedRanges ->
             %% Find packets that were acknowledged using ranges
-            {AckedPackets, NewSent, RemovedBytes} = remove_acked_packets_ranges(
+            %% MaxAckEliciting is {PN, TimeSent} for largest ack-eliciting packet (not used here)
+            {AckedPackets, NewSent, RemovedBytes, _MaxAckEliciting} = remove_acked_packets_ranges(
                 AckedRanges, State#loss_state.sent_packets
             ),
 
@@ -422,36 +429,73 @@ pto_count(#loss_state{pto_count = C}) -> C.
 %% Iterates sent_packets once and checks each PN against ranges.
 %% IMPORTANT: Only count ack-eliciting packet sizes in AccBytes since
 %% bytes_in_flight only tracks ack-eliciting packets (RFC 9002).
-remove_acked_packets_ranges(AckedRanges, SentPackets) ->
-    %% Single pass through sent_packets map
-    {AckedPNs, AckedPackets, AckedBytes} = maps:fold(
-        fun(PN, Packet, {PNsAcc, PacketsAcc, BytesAcc}) ->
-            case pn_in_ranges(PN, AckedRanges) of
-                true ->
-                    #sent_packet{size = Size, ack_eliciting = AckEliciting} = Packet,
-                    NewBytes =
-                        case AckEliciting of
-                            true -> BytesAcc + Size;
-                            false -> BytesAcc
-                        end,
-                    {[PN | PNsAcc], [Packet | PacketsAcc], NewBytes};
-                false ->
-                    {PNsAcc, PacketsAcc, BytesAcc}
-            end
+%% Returns {AckedPackets, NewSent, AckedBytes, MaxAckElicitingInfo}
+%% where MaxAckElicitingInfo is {PN, TimeSent} for the largest ack-eliciting packet.
+%%
+%% Single range case (most common) - inline the check for better performance
+remove_acked_packets_ranges([{RangeStart, RangeEnd}], SentPackets) ->
+    {AckedPNs, AckedPackets, AckedBytes, MaxAckEliciting} = maps:fold(
+        fun
+            (PN, Packet, {PNsAcc, PacketsAcc, BytesAcc, MaxAE}) when
+                PN >= RangeStart, PN =< RangeEnd
+            ->
+                #sent_packet{size = Size, ack_eliciting = AckEliciting, time_sent = TimeSent} =
+                    Packet,
+                {NewBytes, NewMaxAE} = update_acked_stats(
+                    AckEliciting, Size, PN, TimeSent, BytesAcc, MaxAE
+                ),
+                {[PN | PNsAcc], [Packet | PacketsAcc], NewBytes, NewMaxAE};
+            (_PN, _Packet, Acc) ->
+                Acc
         end,
-        {[], [], 0},
+        {[], [], 0, undefined},
         SentPackets
     ),
-    %% Remove acked packets from map in one operation
     NewSent = maps:without(AckedPNs, SentPackets),
-    {AckedPackets, NewSent, AckedBytes}.
+    {AckedPackets, NewSent, AckedBytes, MaxAckEliciting};
+%% Multi-range case - use pn_in_ranges
+remove_acked_packets_ranges(AckedRanges, SentPackets) ->
+    {AckedPNs, AckedPackets, AckedBytes, MaxAckEliciting} = maps:fold(
+        fun(PN, Packet, {PNsAcc, PacketsAcc, BytesAcc, MaxAE}) ->
+            case pn_in_ranges(PN, AckedRanges) of
+                true ->
+                    #sent_packet{size = Size, ack_eliciting = AckEliciting, time_sent = TimeSent} =
+                        Packet,
+                    {NewBytes, NewMaxAE} = update_acked_stats(
+                        AckEliciting, Size, PN, TimeSent, BytesAcc, MaxAE
+                    ),
+                    {[PN | PNsAcc], [Packet | PacketsAcc], NewBytes, NewMaxAE};
+                false ->
+                    {PNsAcc, PacketsAcc, BytesAcc, MaxAE}
+            end
+        end,
+        {[], [], 0, undefined},
+        SentPackets
+    ),
+    NewSent = maps:without(AckedPNs, SentPackets),
+    {AckedPackets, NewSent, AckedBytes, MaxAckEliciting}.
+
+%% Update acked bytes and track largest ack-eliciting packet
+update_acked_stats(true, Size, PN, TimeSent, BytesAcc, undefined) ->
+    {BytesAcc + Size, {PN, TimeSent}};
+update_acked_stats(true, Size, PN, TimeSent, BytesAcc, {OldPN, _}) when PN > OldPN ->
+    {BytesAcc + Size, {PN, TimeSent}};
+update_acked_stats(true, Size, _PN, _TimeSent, BytesAcc, MaxAE) ->
+    {BytesAcc + Size, MaxAE};
+update_acked_stats(false, _Size, _PN, _TimeSent, BytesAcc, MaxAE) ->
+    {BytesAcc, MaxAE}.
 
 %% Check if a packet number is in any of the acknowledged ranges.
-%% Ranges is a list of {Start, End} tuples where Start =< End.
+%% Ranges is a list of {Start, End} tuples where Start =< End,
+%% sorted in descending order (highest PN first).
 pn_in_ranges(_PN, []) ->
     false;
 pn_in_ranges(PN, [{Start, End} | _Rest]) when PN >= Start, PN =< End ->
     true;
+pn_in_ranges(PN, [{_Start, End} | _Rest]) when PN > End ->
+    %% Early exit: ranges are sorted descending, so if PN > End of current range,
+    %% it can't be in any subsequent range (they all have lower End values)
+    false;
 pn_in_ranges(PN, [_Range | Rest]) ->
     pn_in_ranges(PN, Rest).
 

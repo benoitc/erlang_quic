@@ -52,7 +52,8 @@ non_ack_eliciting_no_bytes_test() ->
 
 initial_rtt_test() ->
     State = quic_loss:new(),
-    ?assertEqual(333, quic_loss:smoothed_rtt(State)).
+    %% Default initial RTT is 100ms (more aggressive than RFC 9002's 333ms)
+    ?assertEqual(100, quic_loss:smoothed_rtt(State)).
 
 first_rtt_sample_test() ->
     State = quic_loss:new(),
@@ -95,9 +96,9 @@ min_rtt_updates_test() ->
 initial_pto_test() ->
     State = quic_loss:new(),
     PTO = quic_loss:get_pto(State),
-    %% Initial: smoothed_rtt=333, rtt_var=166, max_ack_delay=25
-    %% PTO = 333 + max(4*166, 1) + 25 = 333 + 664 + 25 = 1022
-    ?assertEqual(1022, PTO).
+    %% Initial: smoothed_rtt=100, rtt_var=50, max_ack_delay=25
+    %% PTO = 100 + max(4*50, 1) + 25 = 100 + 200 + 25 = 325
+    ?assertEqual(325, PTO).
 
 pto_after_rtt_sample_test() ->
     State = quic_loss:new(),
