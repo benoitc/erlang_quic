@@ -163,12 +163,22 @@ start_server(Port, RecvBuf, SndBuf) ->
     case get_test_certs() of
         {ok, Cert, Key} ->
             ServerName = list_to_atom("throughput_bench_" ++ integer_to_list(Port)),
+            %% Large flow control windows for benchmarking (16MB)
+            FlowWindow = 16777216,
             ServerOpts = #{
                 cert => Cert,
                 key => Key,
                 alpn => [<<"bench">>],
                 recbuf => RecvBuf,
-                sndbuf => SndBuf
+                sndbuf => SndBuf,
+                max_data => FlowWindow,
+                max_stream_data_bidi_local => FlowWindow,
+                max_stream_data_bidi_remote => FlowWindow,
+                max_stream_data_uni => FlowWindow,
+                connection_handler => fun(Conn) ->
+                    Pid = spawn(fun() -> echo_handler(Conn) end),
+                    {ok, Pid}
+                end
             },
             case quic:start_server(ServerName, Port, ServerOpts) of
                 {ok, Pid} ->
@@ -187,10 +197,16 @@ stop_server({ServerName, _Pid}) ->
     quic:stop_server(ServerName).
 
 run_client_benchmark(Port, DataSize, RecvBuf, SndBuf) ->
+    %% Large flow control windows for benchmarking (16MB)
+    FlowWindow = 16777216,
     ClientOpts = #{
         alpn => [<<"bench">>],
         recbuf => RecvBuf,
-        sndbuf => SndBuf
+        sndbuf => SndBuf,
+        max_data => FlowWindow,
+        max_stream_data_bidi_local => FlowWindow,
+        max_stream_data_bidi_remote => FlowWindow,
+        max_stream_data_uni => FlowWindow
     },
 
     case quic:connect("127.0.0.1", Port, ClientOpts, self()) of
@@ -293,4 +309,21 @@ wait_stream_close(Conn, StreamId, Timeout) ->
             wait_stream_close(Conn, StreamId, Timeout)
     after Timeout ->
         {error, timeout}
+    end.
+
+%% Echo handler for benchmark server - echoes received data back
+echo_handler(Conn) ->
+    receive
+        {quic, Conn, {connected, _Info}} ->
+            echo_handler(Conn);
+        {quic, Conn, {stream_opened, _StreamId}} ->
+            echo_handler(Conn);
+        {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
+            %% Echo data back on the same stream
+            quic:send_data(Conn, StreamId, Data, Fin),
+            echo_handler(Conn);
+        {quic, Conn, {closed, _Reason}} ->
+            ok;
+        _Other ->
+            echo_handler(Conn)
     end.
