@@ -183,7 +183,7 @@ new(Opts) ->
     HystartEnabled = maps:get(hystart_enabled, Opts, true),
     %% Pacing: 10 packets burst allowance (12 with 1200 byte packets = 14400)
     PacingMaxBurst = 12 * MaxDatagramSize,
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     ?LOG_DEBUG(
         #{
             what => cc_state_initialized,
@@ -859,9 +859,10 @@ on_persistent_congestion(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} 
 %% Called when RTT estimate is updated.
 -spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
 update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTT) when SmoothedRTT > 0 ->
-    %% pacing_rate = cwnd / smoothed_rtt (bytes/ms)
-    %% Multiply by 1.25 to allow slightly faster than cwnd/RTT for efficiency
-    PacingRate = max(1, (Cwnd * 5) div (SmoothedRTT * 4)),
+    %% pacing_rate stored as milli-bytes per microsecond for precision with us timestamps
+    %% Formula: (cwnd * 1.25 * 1000) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
+    %% Simplified: (cwnd * 5 * 250) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
+    PacingRate = max(1, (Cwnd * 1250) div (SmoothedRTT * 1000)),
 
     %% Update HyStart++ RTT tracking
     State1 = update_hystart_rtt(State, SmoothedRTT),
@@ -887,7 +888,7 @@ pacing_allows(
     Size
 ) ->
     %% Refill tokens first, then check
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     RefreshedTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
     RefreshedTokens >= Size.
 
@@ -906,7 +907,7 @@ get_pacing_tokens(
     } = State,
     Size
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     %% Refill tokens based on elapsed time
     NewTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
     %% Consume up to available tokens
@@ -933,7 +934,7 @@ pacing_delay(
     },
     Size
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     %% Calculate current tokens
     CurrentTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
     case CurrentTokens >= Size of
@@ -950,10 +951,11 @@ pacing_delay(
 %% Internal Functions
 %%====================================================================
 
-%% Refill pacing tokens based on elapsed time
+%% Refill pacing tokens based on elapsed time (microsecond timestamps, rate in milli-bytes/us)
 refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now) ->
-    Elapsed = max(0, Now - LastUpdate),
-    Added = Elapsed * Rate,
+    ElapsedUs = max(0, Now - LastUpdate),
+    %% Rate is in milli-bytes per microsecond, so Added = (elapsed_us * rate) / 1000
+    Added = (ElapsedUs * Rate) div 1000,
     min(MaxBurst, Tokens + Added).
 
 %% Calculate initial window

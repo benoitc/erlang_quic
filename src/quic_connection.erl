@@ -5650,6 +5650,7 @@ cancel_timer(Ref) -> erlang:cancel_timer(Ref).
 
 %% Handle pacing timeout - drain queued data
 handle_pacing_timeout(#state{send_queue = PQ} = State) ->
+    ?LOG_DEBUG(#{what => pacing_timeout_fired, queue_empty => pqueue_is_empty(PQ)}, ?QUIC_LOG_META),
     %% Clear the expired timer first
     State1 = State#state{pacing_timer = undefined},
     %% Check if there's queued data
@@ -5750,6 +5751,7 @@ maybe_set_pacing_timer(_Delay, #state{pacing_timer = Ref} = State) when Ref =/= 
     State;
 maybe_set_pacing_timer(Delay, #state{pacing_timer = undefined} = State) ->
     %% Set new pacing timer
+    ?LOG_DEBUG(#{what => pacing_timer_set, delay_ms => Delay}, ?QUIC_LOG_META),
     TimerRef = erlang:send_after(Delay, self(), pacing_timeout),
     State#state{pacing_timer = TimerRef}.
 
