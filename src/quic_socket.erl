@@ -73,16 +73,24 @@
     gro_enabled = false :: boolean(),
     %% Batching enabled
     batching_enabled = true :: boolean(),
-    %% Batched packets waiting to be sent
-    batch_buffer = [] :: [binary()],
+    %% Batched packets waiting to be sent (stored as packet_view())
+    batch_buffer = [] :: [packet_view()],
+    %% Number of packets in batch (avoids O(n) length/1)
+    batch_count = 0 :: non_neg_integer(),
     %% Current batch destination address
     batch_addr :: {inet:ip_address(), inet:port_number()} | undefined,
     %% Maximum packets per batch
     max_batch_packets = ?DEFAULT_MAX_BATCH_PACKETS :: pos_integer()
 }).
 
+%% Packet can be:
+%%   - binary() - already flat
+%%   - {iov, [binary()]} - explicit iov parts (preferred for zero-copy)
+%%   - iodata() - any iolist (for backwards compatibility)
+-type packet_view() :: binary() | {iov, [binary()]} | iodata().
+
 -opaque socket_state() :: #socket_state{}.
--export_type([socket_state/0]).
+-export_type([socket_state/0, packet_view/0]).
 
 %%====================================================================
 %% API
@@ -153,38 +161,42 @@ close(#socket_state{socket = Socket, backend = gen_udp}) ->
     ok.
 
 %% @doc Send a packet, buffering for batch send if enabled.
+%% Packet can be:
+%%   - binary() - already flat packet
+%%   - {iov, [binary()]} - packet parts for scatter/gather (avoids copy)
+%%
 %% Returns updated state. Auto-flushes when:
 %% - Batch is full (max_batch_packets reached)
 %% - Destination address changes
--spec send(socket_state(), inet:ip_address(), inet:port_number(), iodata()) ->
+-spec send(socket_state(), inet:ip_address(), inet:port_number(), packet_view()) ->
     {ok, socket_state()} | {error, term()}.
-send(#socket_state{batching_enabled = false} = State, IP, Port, Data) ->
+send(#socket_state{batching_enabled = false} = State, IP, Port, Packet) ->
     %% Batching disabled - send immediately
-    do_send_immediate(State, IP, Port, Data);
-send(#socket_state{batch_addr = undefined} = State, IP, Port, Data) ->
+    do_send_immediate(State, IP, Port, Packet);
+send(#socket_state{batch_addr = undefined} = State, IP, Port, Packet) ->
     %% First packet in batch
-    add_to_batch(State#socket_state{batch_addr = {IP, Port}}, Data);
-send(#socket_state{batch_addr = {IP, Port}} = State, IP, Port, Data) ->
+    add_to_batch(State#socket_state{batch_addr = {IP, Port}}, Packet);
+send(#socket_state{batch_addr = {IP, Port}} = State, IP, Port, Packet) ->
     %% Same destination - add to batch
-    add_to_batch(State, Data);
-send(#socket_state{} = State, IP, Port, Data) ->
+    add_to_batch(State, Packet);
+send(#socket_state{} = State, IP, Port, Packet) ->
     %% Different destination - flush current batch first
     case flush(State) of
         {ok, State1} ->
-            add_to_batch(State1#socket_state{batch_addr = {IP, Port}}, Data);
+            add_to_batch(State1#socket_state{batch_addr = {IP, Port}}, Packet);
         {error, _} = Error ->
             Error
     end.
 
 %% @doc Flush all buffered packets.
 -spec flush(socket_state()) -> {ok, socket_state()} | {error, term()}.
-flush(#socket_state{batch_buffer = []} = State) ->
+flush(#socket_state{batch_count = 0} = State) ->
     %% Nothing to flush
     {ok, State};
-flush(#socket_state{batch_buffer = Buffer, batch_addr = undefined} = State) ->
+flush(#socket_state{batch_count = Count, batch_addr = undefined} = State) ->
     %% No address set but have data - shouldn't happen, but clear buffer
-    ?LOG_WARNING(#{what => flush_no_addr, buffer_size => length(Buffer)}),
-    {ok, State#socket_state{batch_buffer = []}};
+    ?LOG_WARNING(#{what => flush_no_addr, buffer_size => Count}),
+    {ok, clear_batch(State)};
 flush(#socket_state{gso_supported = true} = State) ->
     %% GSO path - send all packets in one syscall
     flush_gso(State);
@@ -398,12 +410,16 @@ build_genudp_state(Socket, BatchConfig) ->
 %% Internal Functions - Batching
 %%====================================================================
 
-add_to_batch(#socket_state{batch_buffer = Buffer, max_batch_packets = Max} = State, Data) ->
-    Packet = iolist_to_binary(Data),
+add_to_batch(
+    #socket_state{batch_buffer = Buffer, batch_count = Count, max_batch_packets = Max} = State,
+    Packet
+) ->
+    %% Store packet as-is (binary or {iov, Parts}) - no flattening yet
     NewBuffer = [Packet | Buffer],
-    State1 = State#socket_state{batch_buffer = NewBuffer},
+    NewCount = Count + 1,
+    State1 = State#socket_state{batch_buffer = NewBuffer, batch_count = NewCount},
 
-    case length(NewBuffer) >= Max of
+    case NewCount >= Max of
         true ->
             %% Batch full - flush now
             flush(State1);
@@ -422,93 +438,184 @@ flush_gso(
 ) ->
     %% Combine all packets into a single super-datagram
     %% Packets are in reverse order, so reverse them first
+    %% Normalize packet_view to binary for GSO (kernel needs contiguous buffer)
     Packets = lists:reverse(Buffer),
-    CombinedData = iolist_to_binary(Packets),
+    PacketBins = [normalize_packet(P) || P <- Packets],
+    CombinedData = iolist_to_binary(PacketBins),
 
     %% Build sendmsg with GSO control message
     Msg = #{
-        addr => #{family => inet, addr => IP, port => Port},
+        addr => #{family => family(IP), addr => IP, port => Port},
         iov => [CombinedData],
         ctrl => [#{level => udp, type => ?UDP_SEGMENT, data => <<SegmentSize:16/native>>}]
     },
 
     case socket:sendmsg(Socket, Msg) of
         ok ->
-            {ok, State#socket_state{batch_buffer = [], batch_addr = undefined}};
+            {ok, clear_batch(State)};
         {ok, RestData} ->
             %% Partial send - GSO didn't send all data
-            %% Log warning and fall back to individual sends for remaining data
             ?LOG_WARNING(#{
                 what => gso_partial_send,
                 sent => byte_size(CombinedData) - iolist_size(RestData),
                 remaining => iolist_size(RestData)
             }),
             %% Disable GSO and retry remaining data individually
-            State1 = State#socket_state{
-                gso_supported = false, batch_buffer = [], batch_addr = undefined
-            },
-            %% Send remaining data without GSO
+            State1 = clear_batch(State#socket_state{gso_supported = false}),
             send_remaining_individually(State1, IP, Port, RestData);
         {error, _} = Error ->
             Error
     end.
 
-flush_individual(
+flush_individual(#socket_state{backend = socket} = State) ->
+    flush_individual_socket(State);
+flush_individual(#socket_state{backend = gen_udp} = State) ->
+    flush_individual_genudp(State).
+
+flush_individual_socket(
     #socket_state{
         socket = Socket,
-        backend = Backend,
         batch_buffer = Buffer,
         batch_addr = {IP, Port}
     } = State
 ) ->
-    %% Send each packet individually
+    %% Send each packet using sendmsg with iov (no flattening)
     Packets = lists:reverse(Buffer),
-    Result = send_packets_individual(Socket, Backend, IP, Port, Packets),
-
-    case Result of
-        ok ->
-            {ok, State#socket_state{batch_buffer = [], batch_addr = undefined}};
-        {error, _} = Error ->
-            Error
+    Dest = #{family => family(IP), addr => IP, port => Port},
+    case send_packets_socket(Socket, Dest, Packets, 0) of
+        {ok, _Sent} ->
+            {ok, clear_batch(State)};
+        {error, Reason, _Sent} ->
+            {error, Reason}
     end.
 
-send_packets_individual(_Socket, _Backend, _IP, _Port, []) ->
-    ok;
-send_packets_individual(Socket, socket, IP, Port, [Packet | Rest]) ->
-    Dest = #{family => inet, addr => IP, port => Port},
-    case socket:sendto(Socket, Packet, Dest) of
+flush_individual_genudp(
+    #socket_state{
+        socket = Socket,
+        batch_buffer = Buffer,
+        batch_addr = {IP, Port}
+    } = State
+) ->
+    %% Send each packet using gen_udp (must flatten)
+    Packets = lists:reverse(Buffer),
+    case send_packets_genudp(Socket, IP, Port, Packets, 0) of
+        {ok, _Sent} ->
+            {ok, clear_batch(State)};
+        {error, Reason, _Sent} ->
+            {error, Reason}
+    end.
+
+%% Send packets using socket:sendmsg with iov (no flattening for socket backend)
+send_packets_socket(_Socket, _Dest, [], Sent) ->
+    {ok, Sent};
+send_packets_socket(Socket, Dest, [Packet | Rest], Sent) ->
+    Msg = #{
+        addr => Dest,
+        iov => packet_iov(Packet)
+    },
+    case socket:sendmsg(Socket, Msg) of
         ok ->
-            send_packets_individual(Socket, socket, IP, Port, Rest);
-        {error, _} = Error ->
-            Error
-    end;
-send_packets_individual(Socket, gen_udp, IP, Port, [Packet | Rest]) ->
-    case gen_udp:send(Socket, IP, Port, Packet) of
+            send_packets_socket(Socket, Dest, Rest, Sent + 1);
+        {ok, _Remaining} ->
+            {error, partial_send, Sent};
+        {error, Reason} ->
+            {error, Reason, Sent}
+    end.
+
+%% Send packets using gen_udp (must flatten to binary)
+send_packets_genudp(_Socket, _IP, _Port, [], Sent) ->
+    {ok, Sent};
+send_packets_genudp(Socket, IP, Port, [Packet | Rest], Sent) ->
+    Bin = normalize_packet(Packet),
+    case gen_udp:send(Socket, IP, Port, Bin) of
         ok ->
-            send_packets_individual(Socket, gen_udp, IP, Port, Rest);
-        {error, _} = Error ->
-            Error
+            send_packets_genudp(Socket, IP, Port, Rest, Sent + 1);
+        {error, Reason} ->
+            {error, Reason, Sent}
     end.
 
 %% Send remaining data after GSO partial write (RestData is iolist)
 send_remaining_individually(#socket_state{socket = Socket} = State, IP, Port, RestData) ->
-    Dest = #{family => inet, addr => IP, port => Port},
+    Dest = #{family => family(IP), addr => IP, port => Port},
     case socket:sendto(Socket, iolist_to_binary(RestData), Dest) of
         ok -> {ok, State};
         {error, _} = Error -> Error
     end.
 
-do_send_immediate(#socket_state{socket = Socket, backend = socket} = State, IP, Port, Data) ->
-    Dest = #{family => inet, addr => IP, port => Port},
-    case socket:sendto(Socket, iolist_to_binary(Data), Dest) of
+do_send_immediate(#socket_state{socket = Socket, backend = socket} = State, IP, Port, Packet) ->
+    %% Use sendmsg with iov - no flattening needed
+    Msg = #{
+        addr => #{family => family(IP), addr => IP, port => Port},
+        iov => packet_iov(Packet)
+    },
+    case socket:sendmsg(Socket, Msg) of
         ok -> {ok, State};
-        {error, _} = Error -> Error
+        {ok, _Remaining} -> {error, partial_send};
+        {error, Reason} -> {error, Reason}
     end;
-do_send_immediate(#socket_state{socket = Socket, backend = gen_udp} = State, IP, Port, Data) ->
-    case gen_udp:send(Socket, IP, Port, Data) of
+do_send_immediate(#socket_state{socket = Socket, backend = gen_udp} = State, IP, Port, Packet) ->
+    %% gen_udp needs flat binary
+    Bin = normalize_packet(Packet),
+    case gen_udp:send(Socket, IP, Port, Bin) of
         ok -> {ok, State};
         {error, _} = Error -> Error
     end.
+
+%%====================================================================
+%% Internal Functions - Packet View Helpers
+%%====================================================================
+
+%% Convert packet_view to iov list for sendmsg
+%% {iov, Parts} uses parts directly (zero-copy path)
+%% binary is wrapped in list
+%% iodata is flattened to list of binaries (preserves binary boundaries)
+packet_iov(Bin) when is_binary(Bin) ->
+    [Bin];
+packet_iov({iov, Parts}) ->
+    Parts;
+packet_iov(IoData) when is_list(IoData) ->
+    %% Flatten iolist to list of binaries (preserves binary boundaries)
+    flatten_iodata(IoData, []).
+
+%% Flatten iodata to list of binaries (for iov)
+%% Preserves binary boundaries, concatenates byte sequences
+flatten_iodata([], Acc) ->
+    lists:reverse(Acc);
+flatten_iodata([H | T], Acc) when is_binary(H) ->
+    flatten_iodata(T, [H | Acc]);
+flatten_iodata([H | T], Acc) when is_list(H) ->
+    %% Nested list - recurse
+    flatten_iodata(T, flatten_iodata(H, Acc));
+flatten_iodata([H | T], Acc) when is_integer(H), H >= 0, H =< 255 ->
+    %% Byte value - collect consecutive bytes into a binary
+    {Bytes, Rest} = collect_bytes([H | T], []),
+    flatten_iodata(Rest, [list_to_binary(Bytes) | Acc]).
+
+%% Collect consecutive byte integers
+collect_bytes([H | T], Acc) when is_integer(H), H >= 0, H =< 255 ->
+    collect_bytes(T, [H | Acc]);
+collect_bytes(Rest, Acc) ->
+    {lists:reverse(Acc), Rest}.
+
+%% Flatten packet_view to binary (for GSO and gen_udp)
+normalize_packet(Bin) when is_binary(Bin) ->
+    Bin;
+normalize_packet({iov, Parts}) ->
+    iolist_to_binary(Parts);
+normalize_packet(IoData) when is_list(IoData) ->
+    iolist_to_binary(IoData).
+
+%% Clear batch state
+clear_batch(State) ->
+    State#socket_state{
+        batch_buffer = [],
+        batch_count = 0,
+        batch_addr = undefined
+    }.
+
+%% Get address family
+family({_, _, _, _}) -> inet;
+family({_, _, _, _, _, _, _, _}) -> inet6.
 
 %%====================================================================
 %% Internal Functions - GRO Receive
