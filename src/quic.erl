@@ -63,6 +63,7 @@
     open_unidirectional_stream/1,
     send_data/4,
     send_data/5,
+    send_data_async/4,
     reset_stream/3,
     stop_sending/3,
     handle_timeout/2,
@@ -231,6 +232,18 @@ send_data(Conn, StreamId, Data, Fin, Timeout) when is_pid(Conn) ->
     catch
         exit:{timeout, _} -> {error, timeout}
     end.
+
+%% @doc Send data on a stream asynchronously (fire-and-forget).
+%% This is faster than send_data/4 because it uses cast instead of call,
+%% avoiding the round-trip latency. However, errors are silently dropped.
+%% Use this for high-throughput scenarios where occasional dropped data is acceptable.
+-spec send_data_async(Conn, StreamId, Data, Fin) -> ok when
+    Conn :: pid(),
+    StreamId :: non_neg_integer(),
+    Data :: iodata(),
+    Fin :: boolean().
+send_data_async(Conn, StreamId, Data, Fin) when is_pid(Conn) ->
+    quic_connection:send_data_async(Conn, StreamId, Data, Fin).
 
 %% @doc Reset a stream with an error code.
 -spec reset_stream(Conn, StreamId, ErrorCode) -> ok | {error, term()} when

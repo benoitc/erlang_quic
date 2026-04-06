@@ -57,6 +57,7 @@
     start_link/5,
     connect/4,
     send_data/4,
+    send_data_async/4,
     send_datagram/2,
     datagram_max_size/1,
     open_stream/1,
@@ -164,6 +165,9 @@
 
     %% Socket
     socket :: gen_udp:socket() | undefined,
+    %% Dedicated send socket for server connections (SO_REUSEPORT)
+    %% Allows each server connection to have its own batching state
+    send_socket :: gen_udp:socket() | undefined,
     %% Socket state for batching (quic_socket abstraction)
     socket_state :: quic_socket:socket_state() | undefined,
     remote_addr :: {inet:ip_address(), inet:port_number()},
@@ -348,6 +352,10 @@
     packets_received = 0 :: non_neg_integer(),
     packets_sent = 0 :: non_neg_integer(),
 
+    %% Socket active mode - number of packets before socket goes passive
+    %% Using {active, N} instead of {active, once} reduces inet:setopts overhead
+    active_n = 100 :: pos_integer(),
+
     %% PMTU Discovery (RFC 8899)
     pmtu_state :: #pmtu_state{} | undefined,
     pmtu_probe_timer :: reference() | undefined,
@@ -410,6 +418,14 @@ start_server(Opts) ->
     ok | {error, term()}.
 send_data(Conn, StreamId, Data, Fin) ->
     gen_statem:call(Conn, {send_data, StreamId, Data, Fin}).
+
+%% @doc Send data on a stream asynchronously.
+%% This is faster than send_data/4 because it uses cast instead of call,
+%% avoiding the round-trip latency. However, errors are silently dropped.
+%% Use this for high-throughput scenarios where occasional dropped data is acceptable.
+-spec send_data_async(pid(), non_neg_integer(), iodata(), boolean()) -> ok.
+send_data_async(Conn, StreamId, Data, Fin) ->
+    gen_statem:cast(Conn, {send_data_async, StreamId, Data, Fin}).
 
 %% @doc Open a new bidirectional stream.
 -spec open_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
@@ -673,6 +689,27 @@ init({server, Opts}) ->
             {error, _} -> undefined
         end,
 
+    %% Initialize send socket and batching for server connections.
+    %% Each server connection opens its own SO_REUSEPORT socket for sending,
+    %% which allows full batching support without conflicting with other connections.
+    %% The listener's socket is still used for DCID routing and reference.
+    {SendSocket, SocketState} =
+        case maps:get(batching, Opts, undefined) of
+            undefined ->
+                {undefined, undefined};
+            #{enabled := false} ->
+                {undefined, undefined};
+            BatchOpts when is_map(BatchOpts) ->
+                case open_send_socket(LocalAddr) of
+                    {ok, SS} ->
+                        {ok, SSState} = quic_socket:wrap(SS, #{batching => BatchOpts}),
+                        {SS, SSState};
+                    {error, _Reason} ->
+                        %% Fall back to direct sends without batching
+                        {undefined, undefined}
+                end
+        end,
+
     %% Initialize state
     State = #state{
         scid = SCID,
@@ -683,6 +720,8 @@ init({server, Opts}) ->
         % Use client's QUIC version
         version = Version,
         socket = Socket,
+        send_socket = SendSocket,
+        socket_state = SocketState,
         remote_addr = RemoteAddr,
         local_addr = LocalAddr,
         % Listener is the owner for now
@@ -964,6 +1003,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             end,
         congestion_threshold = maps:get(congestion_threshold, Opts, 2),
         pacing_enabled = maps:get(pacing_enabled, Opts, true),
+        active_n = maps:get(active_n, Opts, 100),
         pmtu_state = init_pmtu_state(Opts),
         qlog_ctx = quic_qlog:new(Opts, DCID, client)
     },
@@ -978,6 +1018,7 @@ terminate(
     StateName,
     #state{
         socket = Socket,
+        send_socket = SendSocket,
         socket_state = SocketState,
         pto_timer = PtoTimer,
         idle_timer = IdleTimer,
@@ -1021,6 +1062,11 @@ terminate(
     case erase(ack_timer) of
         undefined -> ok;
         AckTimerRef -> cancel_timer(AckTimerRef)
+    end,
+    %% Close dedicated send socket for server connections (SO_REUSEPORT socket)
+    case SendSocket of
+        undefined -> ok;
+        _ -> gen_udp:close(SendSocket)
     end,
     %% Only close socket for client connections (clients own their socket)
     %% Server connections share the listener's socket and must not close it
@@ -1100,9 +1146,9 @@ idle(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
 idle(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
     check_state_transition(idle, NewState);
-idle(cast, process, #state{role = client, socket = Socket} = State) ->
+idle(cast, process, #state{role = client, socket = Socket, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
-    inet:setopts(Socket, [{active, once}]),
+    inet:setopts(Socket, [{active, N}]),
     {keep_state, State};
 idle(cast, process, #state{role = server} = State) ->
     %% Server connections receive via listener, don't touch socket options
@@ -1171,9 +1217,9 @@ handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = Sta
 handshaking(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
     check_state_transition(handshaking, NewState);
-handshaking(cast, process, #state{role = client, socket = Socket} = State) ->
+handshaking(cast, process, #state{role = client, socket = Socket, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
-    inet:setopts(Socket, [{active, once}]),
+    inet:setopts(Socket, [{active, N}]),
     {keep_state, State};
 handshaking(cast, process, #state{role = server} = State) ->
     %% Server connections receive via listener, don't touch socket options
@@ -1192,7 +1238,8 @@ connected(
         socket = Socket,
         role = Role,
         pending_data = Pending,
-        transport_params = TransportParams
+        transport_params = TransportParams,
+        active_n = ActiveN
     } = State
 ) when
     OldState =:= handshaking; OldState =:= idle
@@ -1206,7 +1253,7 @@ connected(
     %% For client connections, ensure socket is active for receiving
     %% Server connections receive via listener (quic_packet messages)
     case Role of
-        client -> inet:setopts(Socket, [{active, once}]);
+        client -> inet:setopts(Socket, [{active, ActiveN}]);
         server -> ok
     end,
     %% Send any data that was queued before connection established
@@ -1420,9 +1467,20 @@ connected(cast, {close, Reason}, State) ->
     State1 = initiate_close(Reason, State),
     NewState = flush_socket_batch(State1),
     {next_state, draining, NewState};
-connected(cast, process, #state{role = client, socket = Socket} = State) ->
+%% Async send data - fire-and-forget for high throughput
+connected(cast, {send_data_async, StreamId, Data, Fin}, State) ->
+    case do_send_data(StreamId, Data, Fin, State) of
+        {ok, NewState} ->
+            %% Event-driven flush: flush batch after user API call
+            FlushedState = flush_socket_batch(NewState),
+            {keep_state, FlushedState};
+        {error, _Reason} ->
+            %% Silently drop errors in async mode
+            {keep_state, State}
+    end;
+connected(cast, process, #state{role = client, socket = Socket, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
-    inet:setopts(Socket, [{active, once}]),
+    inet:setopts(Socket, [{active, N}]),
     {keep_state, State};
 connected(cast, process, #state{role = server} = State) ->
     %% Server connections receive via listener, don't touch socket options
@@ -1561,6 +1619,19 @@ handle_common_event(info, keep_alive_timeout, connected, State) ->
 handle_common_event(info, keep_alive_timeout, _StateName, State) ->
     %% Ignore keep-alive in non-connected states
     {keep_state, State#state{keep_alive_timer = undefined}};
+%% Handle socket going passive ({active, N} exhausted)
+%% Re-enable socket to continue receiving packets
+handle_common_event(
+    info,
+    {udp_passive, Socket},
+    _StateName,
+    #state{role = client, socket = Socket, active_n = N} = State
+) ->
+    inet:setopts(Socket, [{active, N}]),
+    {keep_state, State};
+handle_common_event(info, {udp_passive, _Socket}, _StateName, State) ->
+    %% Server connections or different socket - ignore
+    {keep_state, State};
 handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     %% EXIT signals are handled in terminate/3 callback
     %% Just ignore here - the process will terminate anyway if it's from parent
@@ -1668,8 +1739,8 @@ send_client_hello(State) ->
     %% Critical for handshake - must send immediately
     FlushedState = flush_socket_batch(NewState),
 
-    %% Enable socket for receiving
-    inet:setopts(FlushedState#state.socket, [{active, once}]),
+    %% Enable socket for receiving (use {active, N} for better throughput)
+    inet:setopts(FlushedState#state.socket, [{active, FlushedState#state.active_n}]),
 
     FlushedState.
 
@@ -2396,9 +2467,11 @@ pad_for_header_protection(Payload) ->
 handle_packet(Data, State) ->
     handle_packet_loop(Data, State).
 
-handle_packet_loop(<<>>, #state{role = client, socket = Socket} = State) ->
-    %% No more data to process - re-enable socket for client connections only
-    inet:setopts(Socket, [{active, once}]),
+handle_packet_loop(<<>>, #state{role = client, socket = Socket, active_n = N} = State) ->
+    %% No more data to process - re-enable socket for client connections
+    %% Note: With {active, N}, calling setopts resets the counter, so this is optional
+    %% but provides safety in case socket went passive during processing
+    inet:setopts(Socket, [{active, N}]),
     State;
 handle_packet_loop(<<>>, #state{role = server} = State) ->
     %% No more data to process - server socket managed by listener
@@ -2459,8 +2532,9 @@ handle_packet_loop(Data, State) ->
 
 %% Re-enable socket for receiving - only for client connections.
 %% Server connections use listener's socket which is managed by the listener.
-maybe_reenable_socket(#state{role = client, socket = Socket}) ->
-    inet:setopts(Socket, [{active, once}]);
+%% With {active, N}, this resets the counter (provides safety margin).
+maybe_reenable_socket(#state{role = client, socket = Socket, active_n = N}) ->
+    inet:setopts(Socket, [{active, N}]);
 maybe_reenable_socket(#state{role = server}) ->
     ok.
 
@@ -4129,6 +4203,38 @@ get_max_stream_recv_window(#state{streams = Streams}) ->
 %%====================================================================
 %% Internal Functions - Helpers
 %%====================================================================
+
+%% Open a dedicated send socket for server connections using SO_REUSEPORT.
+%% This allows each server connection to have its own batching state without
+%% conflicting with other connections sharing the same listener port.
+%% Returns {ok, Socket} or {error, Reason}.
+open_send_socket({LocalIP, LocalPort}) ->
+    %% Build socket options for SO_REUSEPORT
+    BaseOpts = [binary, {active, false}],
+    %% SO_REUSEPORT allows multiple sockets on the same IP:port
+    ReuseOpts =
+        case os:type() of
+            {unix, darwin} ->
+                %% macOS uses reuseport
+                [{reuseaddr, true}, {raw, 65535, 512, <<1:32/native>>}];
+            {unix, linux} ->
+                %% Linux uses reuseport via raw socket option
+                %% SOL_SOCKET = 1, SO_REUSEPORT = 15
+                [{reuseaddr, true}, {raw, 1, 15, <<1:32/native>>}];
+            _ ->
+                %% Fallback: just reuseaddr
+                [{reuseaddr, true}]
+        end,
+    IPOpt =
+        case LocalIP of
+            {_, _, _, _} -> [{ip, LocalIP}];
+            {_, _, _, _, _, _, _, _} -> [{ip, LocalIP}, inet6];
+            _ -> []
+        end,
+    Opts = BaseOpts ++ ReuseOpts ++ IPOpt,
+    gen_udp:open(LocalPort, Opts);
+open_send_socket(undefined) ->
+    {error, no_local_addr}.
 
 %% Send a packet via quic_socket (with batching) or gen_udp fallback.
 %% For client connections with socket_state, uses quic_socket batching.
