@@ -227,6 +227,8 @@
     fc_last_stream_update :: integer() | undefined,
     fc_last_conn_update :: integer() | undefined,
     fc_max_receive_window :: non_neg_integer(),
+    %% Cached max stream recv window (avoids O(n) scan for connection flow control)
+    fc_max_stream_recv_window = ?DEFAULT_INITIAL_MAX_STREAM_DATA :: non_neg_integer(),
 
     %% Stream management
     streams = #{} :: #{non_neg_integer() => #stream_state{}},
@@ -2030,8 +2032,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
 %% Server: Send HANDSHAKE_DONE frame after receiving client Finished
 send_handshake_done(State) ->
     %% HANDSHAKE_DONE is frame type 0x1e with no payload
-    Frame = quic_frame:encode(handshake_done),
-    send_app_packet(Frame, State).
+    send_frame(handshake_done, State).
 
 %% Server: Send NewSessionTicket after handshake completes
 %% RFC 8446 Section 4.6.1: Server sends NewSessionTicket in post-handshake message
@@ -2079,9 +2080,9 @@ send_new_session_ticket(
     TLSMsg = quic_tls:encode_handshake_message(?TLS_NEW_SESSION_TICKET, TicketMsg),
 
     %% Send in CRYPTO frame (at application level)
-    CryptoFrame = quic_frame:encode({crypto, 0, TLSMsg}),
+    CryptoFrame = {crypto, 0, TLSMsg},
     State1 = State#state{ticket_store = NewTicketStore},
-    send_app_packet(CryptoFrame, State1).
+    send_frame(CryptoFrame, State1).
 
 %% Send an Initial packet
 send_initial_packet(Payload, State) ->
@@ -2333,8 +2334,15 @@ send_handshake_packet(Payload, State) ->
         packets_sent = State#state.packets_sent + 1
     }).
 
-%% Send a 1-RTT (application) packet with frame for retransmission tracking
+%% Send a 1-RTT (application) packet with a single frame (avoid encode/decode roundtrip)
+%% This is the preferred send function - encodes once and passes frame for loss tracking
+send_frame(Frame, State) ->
+    Payload = quic_frame:encode(Frame),
+    send_app_packet_internal(Payload, [Frame], State).
+
+%% Send a 1-RTT (application) packet with pre-encoded binary payload
 %% Decodes the payload to extract frame info for loss tracking
+%% Note: Prefer send_frame/2 when frame tuple is available
 send_app_packet(Payload, State) when is_binary(Payload) ->
     %% Try to decode the frame for proper loss tracking
     FrameInfo =
@@ -2965,44 +2973,21 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% RFC 9000: Invalid ACK range is a protocol violation
                     ?LOG_ERROR(#{what => invalid_ack_range}, ?QUIC_LOG_META),
                     State;
-                {NewLossState, AckedPackets, LostPackets} ->
-                    %% Filter to only ack-eliciting packets for CC calculations
-                    %% since bytes_in_flight only tracks ack-eliciting packets (RFC 9002)
-                    AckElicitingAcked = [
-                        P
-                     || #sent_packet{ack_eliciting = true} = P <- AckedPackets
-                    ],
-                    AckedBytes = lists:sum([
-                        P#sent_packet.size
-                     || P <- AckElicitingAcked
-                    ]),
-                    LostBytes = lists:sum([
-                        P#sent_packet.size
-                     || #sent_packet{ack_eliciting = true} = P <- LostPackets
-                    ]),
+                {NewLossState, AckedPackets, LostPackets, AckMeta} ->
+                    %% Use pre-computed metadata from quic_loss (avoids redundant scanning)
+                    AckedBytes = maps:get(acked_bytes, AckMeta, 0),
+                    LargestAckedSentTime = maps:get(largest_ae_time, AckMeta, Now),
+                    HasAckEliciting = maps:get(has_ack_eliciting, AckMeta, false),
 
-                    %% Find largest acked sent time ONLY from ack-eliciting packets
-                    %% This ensures LargestAckedSentTime is consistent with AckedBytes
-                    %% to prevent deadlock in bidirectional transfer scenarios
-                    LargestAckedSentTime =
-                        case AckElicitingAcked of
-                            [] ->
-                                %% No ack-eliciting packets - use Now
-                                Now;
-                            _ ->
-                                %% AckElicitingAcked may not be sorted, find the one with largest PN
-                                LargestAckedPkt = lists:foldl(
-                                    fun(P, Acc) ->
-                                        case P#sent_packet.pn > Acc#sent_packet.pn of
-                                            true -> P;
-                                            false -> Acc
-                                        end
-                                    end,
-                                    hd(AckElicitingAcked),
-                                    tl(AckElicitingAcked)
-                                ),
-                                LargestAckedPkt#sent_packet.time_sent
+                    %% Calculate lost bytes (still need to scan lost packets)
+                    LostBytes = lists:foldl(
+                        fun
+                            (#sent_packet{ack_eliciting = true, size = Size}, Acc) -> Acc + Size;
+                            (_, Acc) -> Acc
                         end,
+                        0,
+                        LostPackets
+                    ),
 
                     %% Only update CC ACK processing if there are ack-eliciting packets
                     %% When only non-ack-eliciting packets are ACKed, skip on_packets_acked
@@ -3010,11 +2995,11 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% satisfy > RecoveryStart after min_duration). Loss handling is done
                     %% separately by on_packets_lost and on_congestion_event.
                     CCState1 =
-                        case AckElicitingAcked of
-                            [] ->
+                        case HasAckEliciting of
+                            false ->
                                 %% No ack-eliciting acks - skip CC ACK update entirely
                                 CCState;
-                            _ ->
+                            true ->
                                 quic_cc:on_packets_acked(CCState, AckedBytes, LargestAckedSentTime)
                         end,
                     CCState2 = quic_cc:on_packets_lost(CCState1, LostBytes),
@@ -3160,8 +3145,7 @@ process_frame(_Level, {max_streams, uni, Max}, #state{max_streams_uni_remote = C
 %% PATH_CHALLENGE: Peer is probing the path, respond with PATH_RESPONSE
 process_frame(app, {path_challenge, ChallengeData}, State) ->
     %% Send PATH_RESPONSE with the same data
-    ResponseFrame = quic_frame:encode({path_response, ChallengeData}),
-    send_app_packet(ResponseFrame, State);
+    send_frame({path_response, ChallengeData}, State);
 %% PATH_RESPONSE: Response to our PATH_CHALLENGE
 process_frame(app, {path_response, ResponseData}, State) ->
     handle_path_response(ResponseData, State);
@@ -4013,11 +3997,10 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                 ?QUIC_LOG_META
             ),
             %% Send FLOW_CONTROL_ERROR and close connection
-            CloseFrame = quic_frame:encode(
+            CloseFrame =
                 {connection_close, transport, ?QUIC_FLOW_CONTROL_ERROR, 0,
-                    <<"recv buffer overflow">>}
-            ),
-            send_app_packet(CloseFrame, State#state{close_reason = recv_buffer_overflow});
+                    <<"recv buffer overflow">>},
+            send_frame(CloseFrame, State#state{close_reason = recv_buffer_overflow});
         _ ->
             %% Flow control OK - proceed with buffering
 
@@ -4107,14 +4090,17 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                                     min(RecvMaxData + InitialStreamWindow, MaxWindow)
                             end,
                         UpdatedStream = NewStream#stream_state{recv_max_data = NewMaxStreamData},
-                        MaxStreamDataFrame = quic_frame:encode(
-                            {max_stream_data, StreamId, NewMaxStreamData}
+                        MaxStreamDataFrame = {max_stream_data, StreamId, NewMaxStreamData},
+                        %% Update cached max stream recv window
+                        NewCachedMax = max(
+                            NewMaxStreamData, State1#state.fc_max_stream_recv_window
                         ),
                         State1a = State1#state{
                             streams = maps:put(StreamId, UpdatedStream, Streams),
-                            fc_last_stream_update = Now
+                            fc_last_stream_update = Now,
+                            fc_max_stream_recv_window = NewCachedMax
                         },
-                        send_app_packet(MaxStreamDataFrame, State1a);
+                        send_frame(MaxStreamDataFrame, State1a);
                     false ->
                         State1
                 end,
@@ -4158,8 +4144,8 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                             MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER
                         ),
                         NewMaxData = max(BaseNewMaxData, MinConnWindow),
-                        MaxDataFrame = quic_frame:encode({max_data, NewMaxData}),
-                        State2a = send_app_packet(MaxDataFrame, State2),
+                        MaxDataFrame = {max_data, NewMaxData},
+                        State2a = send_frame(MaxDataFrame, State2),
                         State2a#state{
                             max_data_local = NewMaxData,
                             fc_last_conn_update = Now2
@@ -4191,14 +4177,9 @@ extract_contiguous_data(Buffer, Offset, Acc) ->
 
 %% Get the maximum stream receive window across all streams.
 %% Used to ensure connection window >= 1.5x largest stream window.
-get_max_stream_recv_window(#state{streams = Streams}) ->
-    maps:fold(
-        fun(_StreamId, #stream_state{recv_max_data = RecvMaxData}, MaxSoFar) ->
-            max(RecvMaxData, MaxSoFar)
-        end,
-        ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-        Streams
-    ).
+%% Uses cached value to avoid O(n) scan on every call.
+get_max_stream_recv_window(#state{fc_max_stream_recv_window = CachedMax}) ->
+    CachedMax.
 
 %%====================================================================
 %% Internal Functions - Helpers
@@ -4819,8 +4800,8 @@ do_send_data(
                                 ?QUIC_LOG_META
                             ),
                             %% RFC 9000 Section 19.12: DATA_BLOCKED reports the connection data limit
-                            BlockedFrame = quic_frame:encode({data_blocked, MaxDataRemote}),
-                            _FinalState = send_app_packet(BlockedFrame, State),
+                            BlockedFrame = {data_blocked, MaxDataRemote},
+                            _FinalState = send_frame(BlockedFrame, State),
                             {error, {flow_control_blocked, connection}};
                         {_, false} ->
                             %% Stream-level flow control blocked
@@ -4837,10 +4818,8 @@ do_send_data(
                                 ?QUIC_LOG_META
                             ),
                             %% RFC 9000 Section 19.13: STREAM_DATA_BLOCKED reports the stream data limit
-                            BlockedFrame = quic_frame:encode(
-                                {stream_data_blocked, StreamId, SendMaxData}
-                            ),
-                            _FinalState = send_app_packet(BlockedFrame, State),
+                            BlockedFrame = {stream_data_blocked, StreamId, SendMaxData},
+                            _FinalState = send_frame(BlockedFrame, State),
                             {error, {flow_control_blocked, {stream, StreamId}}};
                         {true, true} ->
                             %% Flow control allows sending
@@ -5382,8 +5361,8 @@ do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
             end,
             %% Send RESET_STREAM frame
             FinalSize = StreamState#stream_state.send_offset,
-            ResetFrame = quic_frame:encode({reset_stream, StreamId, ErrorCode, FinalSize}),
-            NewState = send_app_packet(ResetFrame, State),
+            ResetFrame = {reset_stream, StreamId, ErrorCode, FinalSize},
+            NewState = send_frame(ResetFrame, State),
             {ok, NewState#state{
                 streams = maps:remove(StreamId, Streams)
             }};
@@ -5396,8 +5375,8 @@ do_stop_sending(StreamId, ErrorCode, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, _StreamState} ->
             %% Send STOP_SENDING frame
-            Frame = quic_frame:encode({stop_sending, StreamId, ErrorCode}),
-            NewState = send_app_packet(Frame, State),
+            StopFrame = {stop_sending, StreamId, ErrorCode},
+            NewState = send_frame(StopFrame, State),
             {ok, NewState};
         error ->
             {error, unknown_stream}
@@ -5547,8 +5526,8 @@ do_close_stream_deadline(StreamId, ErrorCode, #state{streams = Streams} = State)
         {ok, StreamState} ->
             %% Send RESET_STREAM frame
             FinalSize = StreamState#stream_state.send_offset,
-            ResetFrame = quic_frame:encode({reset_stream, StreamId, ErrorCode, FinalSize}),
-            NewState = send_app_packet(ResetFrame, State),
+            ResetFrame = {reset_stream, StreamId, ErrorCode, FinalSize},
+            NewState = send_frame(ResetFrame, State),
             %% Mark stream as reset but keep in map for cleanup
             NewStreamState = StreamState#stream_state{
                 state = reset,
@@ -5571,26 +5550,24 @@ initiate_close(Reason, State) ->
             normal -> ?QUIC_NO_ERROR;
             _ -> ?QUIC_APPLICATION_ERROR
         end,
-    CloseFrame = quic_frame:encode({connection_close, application, ErrorCode, undefined, <<>>}),
+    CloseFrame = {connection_close, application, ErrorCode, undefined, <<>>},
 
     case State#state.app_keys of
         undefined ->
             State#state{close_reason = Reason};
         _ ->
-            send_app_packet(CloseFrame, State#state{close_reason = Reason})
+            send_frame(CloseFrame, State#state{close_reason = Reason})
     end.
 
 %% Send PROTOCOL_VIOLATION transport error (RFC 9000)
 %% Used when a peer violates the protocol (e.g., RFC 9221 datagram violations)
 send_protocol_violation(Reason, State) ->
-    CloseFrame = quic_frame:encode(
-        {connection_close, transport, ?QUIC_PROTOCOL_VIOLATION, 0, Reason}
-    ),
+    CloseFrame = {connection_close, transport, ?QUIC_PROTOCOL_VIOLATION, 0, Reason},
     case State#state.app_keys of
         undefined ->
             State#state{close_reason = {protocol_violation, Reason}};
         _ ->
-            send_app_packet(CloseFrame, State#state{close_reason = {protocol_violation, Reason}})
+            send_frame(CloseFrame, State#state{close_reason = {protocol_violation, Reason}})
     end.
 
 %% Send CONNECTION_CLOSE frame during terminate (best effort)
@@ -5606,10 +5583,10 @@ send_connection_close(Reason, State) ->
             {shutdown, _} -> ?QUIC_NO_ERROR;
             _ -> ?QUIC_APPLICATION_ERROR
         end,
-    CloseFrame = quic_frame:encode({connection_close, application, ErrorCode, undefined, <<>>}),
+    CloseFrame = {connection_close, application, ErrorCode, undefined, <<>>},
     %% Best effort send - ignore errors since we're terminating anyway
     try
-        send_app_packet(CloseFrame, State)
+        send_frame(CloseFrame, State)
     catch
         _:_ -> ok
     end,
@@ -5698,26 +5675,12 @@ send_probe_packet(State) ->
     end.
 
 %% Get frames from the oldest unacked packet for probe retransmission
+%% Uses cached oldest_unacked from loss_state for O(1) lookup
 get_oldest_unacked_frames(#state{loss_state = LossState}) ->
-    SentPackets = quic_loss:sent_packets(LossState),
-    case maps:size(SentPackets) of
-        0 ->
+    case quic_loss:oldest_unacked(LossState) of
+        none ->
             none;
-        _ ->
-            %% Find the oldest packet (lowest PN)
-            {_MinPN, OldestPacket} = maps:fold(
-                fun
-                    (PN, Packet, undefined) ->
-                        {PN, Packet};
-                    (PN, Packet, {MinPN, _}) when PN < MinPN ->
-                        {PN, Packet};
-                    (_PN, _Packet, Acc) ->
-                        Acc
-                end,
-                undefined,
-                SentPackets
-            ),
-            #sent_packet{frames = Frames} = OldestPacket,
+        {ok, #sent_packet{frames = Frames}} ->
             RetransmitFrames = quic_loss:retransmittable_frames(Frames),
             case RetransmitFrames of
                 [] -> none;
@@ -6088,12 +6051,12 @@ initiate_path_validation(RemoteAddr, State) ->
     AltPaths = [PathState | State#state.alt_paths],
 
     %% Send PATH_CHALLENGE frame
-    ChallengeFrame = quic_frame:encode({path_challenge, ChallengeData}),
+    ChallengeFrame = {path_challenge, ChallengeData},
     State1 = State#state{alt_paths = AltPaths},
 
     %% Note: In a full implementation, we'd send to the specific path
     %% For now, send on the current path (for testing)
-    send_app_packet(ChallengeFrame, State1).
+    send_frame(ChallengeFrame, State1).
 
 %% @doc Initiate path validation for server's preferred address (RFC 9000 Section 9.6).
 %% Client validates the preferred address before migrating to it.

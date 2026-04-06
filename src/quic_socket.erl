@@ -535,10 +535,33 @@ send_packets_genudp(Socket, IP, Port, [Packet | Rest], Sent) ->
     end.
 
 %% Send remaining data after GSO partial write (RestData is iolist)
-send_remaining_individually(#socket_state{socket = Socket} = State, IP, Port, RestData) ->
+%% Split into segment-sized packets to preserve QUIC datagram boundaries
+send_remaining_individually(
+    #socket_state{socket = Socket, gso_size = SegmentSize} = State, IP, Port, RestData
+) ->
     Dest = #{family => family(IP), addr => IP, port => Port},
-    case socket:sendto(Socket, iolist_to_binary(RestData), Dest) of
-        ok -> {ok, State};
+    Data = iolist_to_binary(RestData),
+    Packets = split_into_segments(Data, SegmentSize),
+    send_segments(Socket, Dest, Packets, State).
+
+%% Split binary data into segment-sized chunks
+split_into_segments(Data, SegmentSize) ->
+    split_into_segments(Data, SegmentSize, []).
+
+split_into_segments(<<>>, _SegmentSize, Acc) ->
+    lists:reverse(Acc);
+split_into_segments(Data, SegmentSize, Acc) when byte_size(Data) =< SegmentSize ->
+    lists:reverse([Data | Acc]);
+split_into_segments(Data, SegmentSize, Acc) ->
+    <<Segment:SegmentSize/binary, Rest/binary>> = Data,
+    split_into_segments(Rest, SegmentSize, [Segment | Acc]).
+
+%% Send each segment as a separate datagram
+send_segments(_Socket, _Dest, [], State) ->
+    {ok, State};
+send_segments(Socket, Dest, [Packet | Rest], State) ->
+    case socket:sendto(Socket, Packet, Dest) of
+        ok -> send_segments(Socket, Dest, Rest, State);
         {error, _} = Error -> Error
     end.
 

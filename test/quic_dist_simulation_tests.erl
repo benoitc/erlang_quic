@@ -322,7 +322,7 @@ ack_processing_large_ranges_test() ->
     Now = erlang:monotonic_time(millisecond),
 
     %% This should be fast even with many packets
-    {S2, Acked, Lost} = quic_loss:on_ack_received(S1, AckFrame, Now),
+    {S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(S1, AckFrame, Now),
 
     ?assertEqual(NumPackets, length(Acked)),
     ?assertEqual(0, length(Lost)),

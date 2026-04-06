@@ -59,7 +59,8 @@
     %% Queries
     sent_packets/1,
     bytes_in_flight/1,
-    pto_count/1
+    pto_count/1,
+    oldest_unacked/1
 ]).
 
 %% Constants from RFC 9002
@@ -92,6 +93,9 @@
 
     %% Bytes in flight
     bytes_in_flight = 0 :: non_neg_integer(),
+
+    %% Cached oldest unacked packet (for O(1) PTO probe selection)
+    oldest_unacked_pn = undefined :: non_neg_integer() | undefined,
 
     %% Configuration
     max_ack_delay = ?DEFAULT_MAX_ACK_DELAY :: non_neg_integer()
@@ -136,7 +140,8 @@ on_packet_sent(State, PacketNumber, Size, AckEliciting) ->
 -spec on_packet_sent(loss_state(), non_neg_integer(), non_neg_integer(), boolean(), [term()]) ->
     loss_state().
 on_packet_sent(
-    #loss_state{sent_packets = Sent, bytes_in_flight = InFlight} = State,
+    #loss_state{sent_packets = Sent, bytes_in_flight = InFlight, oldest_unacked_pn = OldestPN} =
+        State,
     PacketNumber,
     Size,
     AckEliciting,
@@ -156,18 +161,29 @@ on_packet_sent(
             true -> InFlight + Size;
             false -> InFlight
         end,
+    %% Update oldest unacked packet number
+    NewOldestPN =
+        case OldestPN of
+            undefined -> PacketNumber;
+            _ when PacketNumber < OldestPN -> PacketNumber;
+            _ -> OldestPN
+        end,
     %% NOTE: pto_count is NOT reset here per RFC 9002.
     %% PTO count is only reset when receiving an ACK (in on_ack_received).
     %% Resetting on send would break exponential backoff for probe retransmissions.
     State#loss_state{
         sent_packets = maps:put(PacketNumber, SentPacket, Sent),
-        bytes_in_flight = NewInFlight
+        bytes_in_flight = NewInFlight,
+        oldest_unacked_pn = NewOldestPN
     }.
 
 %% @doc Process an ACK frame.
-%% Returns {NewState, AckedPackets, LostPackets} or {error, ack_range_too_large}
+%% Returns {NewState, AckedPackets, LostPackets, AckMeta} or {error, ack_range_too_large}
+%% AckMeta is a map containing:
+%%   - acked_bytes: total bytes from ack-eliciting packets that were acknowledged
+%%   - largest_ae_time: sent_time of the largest ack-eliciting packet acknowledged
 -spec on_ack_received(loss_state(), term(), non_neg_integer()) ->
-    {loss_state(), [#sent_packet{}], [#sent_packet{}]} | {error, ack_range_too_large}.
+    {loss_state(), [#sent_packet{}], [#sent_packet{}], map()} | {error, ack_range_too_large}.
 on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now) ->
     %% Get acknowledged ranges (more efficient than expanded list)
     case quic_ack:ack_frame_to_ranges(LargestAcked, FirstRange, AckRanges) of
@@ -175,8 +191,9 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
             Error;
         AckedRanges ->
             %% Find packets that were acknowledged using ranges
-            %% MaxAckEliciting is {PN, TimeSent} for largest ack-eliciting packet (not used here)
-            {AckedPackets, NewSent, RemovedBytes, _MaxAckEliciting} = remove_acked_packets_ranges(
+            %% MaxAckEliciting is {PN, TimeSent} for largest ack-eliciting packet
+            %% RemovedBytes only counts ack-eliciting packet sizes (per RFC 9002)
+            {AckedPackets, NewSent, AckedBytes, MaxAckEliciting} = remove_acked_packets_ranges(
                 AckedRanges, State#loss_state.sent_packets
             ),
 
@@ -201,16 +218,43 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
                 NewSent, NewState1#loss_state.smoothed_rtt, LargestAcked, Now
             ),
 
+            %% Update oldest unacked PN if needed
+            %% Only recalculate if the current oldest was removed
+            OldOldestPN = State#loss_state.oldest_unacked_pn,
+            NewOldestPN =
+                case OldOldestPN of
+                    undefined ->
+                        find_oldest_pn(NewSent2);
+                    _ ->
+                        case maps:is_key(OldOldestPN, NewSent2) of
+                            true -> OldOldestPN;
+                            false -> find_oldest_pn(NewSent2)
+                        end
+                end,
+
             %% Update state
-            NewInFlight = max(0, State#loss_state.bytes_in_flight - RemovedBytes - LostBytes),
+            NewInFlight = max(0, State#loss_state.bytes_in_flight - AckedBytes - LostBytes),
             NewState2 = NewState1#loss_state{
                 sent_packets = NewSent2,
                 bytes_in_flight = NewInFlight,
                 time_of_last_ack = Now,
-                pto_count = 0
+                pto_count = 0,
+                oldest_unacked_pn = NewOldestPN
             },
 
-            {NewState2, AckedPackets, LostPackets}
+            %% Build metadata for caller (avoids redundant scanning in quic_connection)
+            LargestAETime =
+                case MaxAckEliciting of
+                    undefined -> Now;
+                    {_AckPN, AckTimeSent} -> AckTimeSent
+                end,
+            AckMeta = #{
+                acked_bytes => AckedBytes,
+                largest_ae_time => LargestAETime,
+                has_ack_eliciting => MaxAckEliciting =/= undefined
+            },
+
+            {NewState2, AckedPackets, LostPackets, AckMeta}
     end;
 on_ack_received(State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, _, _, _}, Now) ->
     on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now).
@@ -421,9 +465,28 @@ bytes_in_flight(#loss_state{bytes_in_flight = B}) -> B.
 -spec pto_count(loss_state()) -> non_neg_integer().
 pto_count(#loss_state{pto_count = C}) -> C.
 
+%% @doc Get the oldest unacked packet (for PTO probe selection).
+%% Returns {ok, #sent_packet{}} or none.
+-spec oldest_unacked(loss_state()) -> {ok, #sent_packet{}} | none.
+oldest_unacked(#loss_state{oldest_unacked_pn = undefined}) ->
+    none;
+oldest_unacked(#loss_state{oldest_unacked_pn = PN, sent_packets = Sent}) ->
+    case maps:get(PN, Sent, undefined) of
+        undefined -> none;
+        Packet -> {ok, Packet}
+    end.
+
 %%====================================================================
 %% Internal Functions
 %%====================================================================
+
+%% Find the minimum packet number in sent_packets map.
+%% Returns undefined if map is empty.
+find_oldest_pn(Sent) when map_size(Sent) =:= 0 ->
+    undefined;
+find_oldest_pn(Sent) ->
+    Keys = maps:keys(Sent),
+    lists:min(Keys).
 
 %% Remove acknowledged packets using ranges - O(n) instead of O(n*k) where k is acked count.
 %% Iterates sent_packets once and checks each PN against ranges.
