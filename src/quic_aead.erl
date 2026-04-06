@@ -41,7 +41,10 @@
     protect_short_packet/8,
     protect_long_packet/7,
     unprotect_short_packet/7,
-    unprotect_long_packet/7
+    unprotect_long_packet/7,
+    %% 2-stage short header receive API (for key-phase handling)
+    unprotect_short_header/4,
+    decrypt_short_payload/8
 ]).
 
 -export_type([cipher/0]).
@@ -430,6 +433,88 @@ unprotect_packet_common(Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRe
                 error ->
                     {error, decryption_failed}
             end
+    end.
+
+%%====================================================================
+%% 2-Stage Short Header Receive API
+%%====================================================================
+%% For 1-RTT packets, key selection depends on the key_phase bit which
+%% is header-protected. This 2-stage API allows:
+%% 1. Unprotect header to recover key_phase, then select correct keys
+%% 2. Decrypt payload with selected keys
+
+%% @doc Stage 1: Unprotect short header to recover key_phase and PN info.
+%% Uses HP key (same regardless of key phase) to unprotect header.
+%%
+%% HP: Header protection key
+%% Header: Protected header (first byte + DCID)
+%% EncryptedPayload: PN bytes + ciphertext + tag
+%% PNOffset: Offset to packet number in header (= byte_size(Header))
+%%
+%% Returns: {ok, KeyPhase, PNLen, TruncatedPN, UnprotectedHeader} | {error, term()}
+-spec unprotect_short_header(binary(), binary(), binary(), non_neg_integer()) ->
+    {ok, 0 | 1, 1..4, non_neg_integer(), binary()} | {error, term()}.
+unprotect_short_header(HP, Header, EncryptedPayload, PNOffset) ->
+    case unprotect_header(HP, Header, EncryptedPayload, PNOffset) of
+        {error, Reason} ->
+            {error, {header_unprotect_failed, Reason}};
+        {UnprotectedHeader, PNLen} ->
+            %% Extract key_phase from unprotected first byte (bit 2)
+            <<FirstByte, _/binary>> = UnprotectedHeader,
+            KeyPhase = (FirstByte bsr 2) band 1,
+
+            %% Extract truncated PN
+            UnprotHeaderLen = byte_size(UnprotectedHeader),
+            <<_:((UnprotHeaderLen - PNLen) * 8), TruncatedPN:PNLen/unit:8>> = UnprotectedHeader,
+
+            {ok, KeyPhase, PNLen, TruncatedPN, UnprotectedHeader}
+    end.
+
+%% @doc Stage 2: Decrypt short packet payload after key selection.
+%% Called after unprotect_short_header with the correct keys based on key_phase.
+%%
+%% Cipher: AEAD cipher type
+%% Key: AEAD key (selected based on key_phase from stage 1)
+%% IV: AEAD IV (selected based on key_phase from stage 1)
+%% UnprotectedHeader: From stage 1 (used as AAD)
+%% PNLen: From stage 1
+%% TruncatedPN: From stage 1
+%% EncryptedPayload: PN bytes + ciphertext + tag
+%% LargestRecv: Largest received packet number for PN reconstruction
+%%
+%% Returns: {ok, PN, Plaintext} | {error, term()}
+-spec decrypt_short_payload(
+    cipher(),
+    binary(),
+    binary(),
+    binary(),
+    1..4,
+    non_neg_integer(),
+    binary(),
+    non_neg_integer() | undefined
+) ->
+    {ok, non_neg_integer(), binary()} | {error, term()}.
+decrypt_short_payload(
+    Cipher, Key, IV, UnprotectedHeader, PNLen, TruncatedPN, EncryptedPayload, LargestRecv
+) ->
+    %% Reconstruct full PN
+    PN = reconstruct_pn(LargestRecv, TruncatedPN, PNLen),
+
+    %% AAD is the full unprotected header
+    AAD = UnprotectedHeader,
+
+    %% Ciphertext starts after PN bytes
+    <<_:PNLen/binary, Ciphertext/binary>> = EncryptedPayload,
+
+    %% Decrypt
+    Nonce = compute_nonce(IV, PN),
+    CipherLen = byte_size(Ciphertext) - ?TAG_LEN,
+    <<CiphertextOnly:CipherLen/binary, Tag:?TAG_LEN/binary>> = Ciphertext,
+    case crypto:crypto_one_time_aead(Cipher, Key, Nonce, CiphertextOnly, AAD, Tag, false) of
+        Plaintext when is_binary(Plaintext) ->
+            {ok, PN, Plaintext};
+        error ->
+            {error, decryption_failed}
     end.
 
 %% Reconstruct full packet number from truncated PN (RFC 9000 Appendix A)

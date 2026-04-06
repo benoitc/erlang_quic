@@ -2781,57 +2781,53 @@ decode_short_header_packet(Data, State) ->
     end.
 
 %% Decrypt an application (1-RTT) packet with key phase handling
-decrypt_app_packet(Header, EncryptedPayload, ServerKeys, State) ->
-    #crypto_keys{hp = HP} = ServerKeys,
-
-    %% Remove header protection using current keys
+%% Uses 2-stage API: unprotect header to get key_phase, then decrypt with selected keys
+decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
+    #crypto_keys{hp = HP} = CurrentKeys,
     PNOffset = byte_size(Header),
-    case quic_aead:unprotect_header(HP, Header, EncryptedPayload, PNOffset) of
+
+    %% Stage 1: Unprotect header to get key_phase and PN info
+    case quic_aead:unprotect_short_header(HP, Header, EncryptedPayload, PNOffset) of
         {error, Reason} ->
-            {error, {header_unprotect_failed, Reason}};
-        {UnprotectedHeader, PNLen} ->
-            decrypt_app_packet_continue(UnprotectedHeader, PNLen, EncryptedPayload, State)
-    end.
+            {error, Reason};
+        {ok, KeyPhase, PNLen, TruncatedPN, UnprotectedHeader} ->
+            %% Select keys based on key_phase
+            {DecryptKeys, State1} = select_decrypt_keys(KeyPhase, State),
+            PeerDecryptKeys =
+                case State1#state.role of
+                    % ClientKeys
+                    server -> element(1, DecryptKeys);
+                    % ServerKeys
+                    client -> element(2, DecryptKeys)
+                end,
 
-decrypt_app_packet_continue(UnprotectedHeader, PNLen, EncryptedPayload, State) ->
-    %% Extract the unprotected first byte to get key_phase
-    <<UnprotectedFirstByte, _/binary>> = UnprotectedHeader,
-    ReceivedKeyPhase = quic_packet:decode_short_key_phase(UnprotectedFirstByte),
-
-    %% Select appropriate decryption keys based on key_phase
-    {DecryptKeys, State1} = select_decrypt_keys(ReceivedKeyPhase, State),
-    %% Select correct key based on role:
-    %% - Server decrypts with ClientKeys (data from client)
-    %% - Client decrypts with ServerKeys (data from server)
-    PeerDecryptKeys =
-        case State1#state.role of
-            % ClientKeys
-            server -> element(1, DecryptKeys);
-            % ServerKeys
-            client -> element(2, DecryptKeys)
-        end,
-
-    %% Extract truncated PN and reconstruct full PN (RFC 9000 Appendix A)
-    UnprotHeaderLen = byte_size(UnprotectedHeader),
-    <<_:((UnprotHeaderLen - PNLen) * 8), TruncatedPN:PNLen/unit:8>> = UnprotectedHeader,
-    LargestRecv = get_largest_recv(app, State1),
-    PN = reconstruct_pn(LargestRecv, TruncatedPN, PNLen),
-    AAD = UnprotectedHeader,
-    <<_:PNLen/binary, Ciphertext/binary>> = EncryptedPayload,
-
-    #crypto_keys{key = Key, iv = IV} = PeerDecryptKeys,
-    case quic_aead:decrypt(Key, IV, PN, AAD, Ciphertext) of
-        {ok, Plaintext} ->
-            case quic_frame:decode_all(Plaintext) of
-                {ok, Frames} ->
-                    State2 = record_received_pn(app, PN, State1),
-                    NewState = update_last_activity(State2),
-                    {ok, app, Frames, <<>>, NewState};
-                {error, Reason} ->
-                    {error, {frame_decode_error, Reason}}
-            end;
-        {error, bad_tag} ->
-            {error, decryption_failed}
+            %% Stage 2: Decrypt with selected keys
+            #crypto_keys{key = Key, iv = IV, cipher = Cipher} = PeerDecryptKeys,
+            LargestRecv = get_largest_recv(app, State1),
+            case
+                quic_aead:decrypt_short_payload(
+                    Cipher,
+                    Key,
+                    IV,
+                    UnprotectedHeader,
+                    PNLen,
+                    TruncatedPN,
+                    EncryptedPayload,
+                    LargestRecv
+                )
+            of
+                {ok, PN, Plaintext} ->
+                    case quic_frame:decode_all(Plaintext) of
+                        {ok, Frames} ->
+                            State2 = record_received_pn(app, PN, State1),
+                            NewState = update_last_activity(State2),
+                            {ok, app, Frames, <<>>, NewState};
+                        {error, Reason} ->
+                            {error, {frame_decode_error, Reason}}
+                    end;
+                {error, decryption_failed} ->
+                    {error, decryption_failed}
+            end
     end.
 
 %% Decrypt a long header packet (Initial/Handshake)
@@ -4435,28 +4431,6 @@ get_largest_recv(app, State) ->
 get_largest_recv(zero_rtt, State) ->
     %% 0-RTT uses the same PN space as 1-RTT (app)
     (State#state.pn_app)#pn_space.largest_recv.
-
-%% RFC 9000 Appendix A: Packet Number Reconstruction
-%% Reconstructs the full packet number from a truncated value
-reconstruct_pn(LargestPN, TruncatedPN, PNLen) ->
-    PNBits = PNLen * 8,
-    PNWin = 1 bsl PNBits,
-    PNHWin = PNWin bsr 1,
-    PNMask = PNWin - 1,
-    ExpectedPN =
-        case LargestPN of
-            undefined -> 0;
-            _ -> LargestPN + 1
-        end,
-    CandidatePN = (ExpectedPN band (bnot PNMask)) bor TruncatedPN,
-    if
-        CandidatePN =< ExpectedPN - PNHWin, CandidatePN < (1 bsl 62) - PNWin ->
-            CandidatePN + PNWin;
-        CandidatePN > ExpectedPN + PNHWin, CandidatePN >= PNWin ->
-            CandidatePN - PNWin;
-        true ->
-            CandidatePN
-    end.
 
 update_pn_space_recv(PN, PNSpace) ->
     #pn_space{largest_recv = LargestRecv, ack_ranges = Ranges} = PNSpace,
