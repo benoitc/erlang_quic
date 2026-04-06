@@ -46,6 +46,7 @@
 
     %% ACK frame utilities (shared with quic_loss)
     ack_frame_to_pn_list/3,
+    ack_frame_to_ranges/3,
 
     %% Queries
     largest_received/1,
@@ -342,6 +343,44 @@ ack_ranges_to_pn_list(PrevStart, [{Gap, Range} | Rest]) ->
             case ack_ranges_to_pn_list(Start, Rest) of
                 {error, _} = Error -> Error;
                 RestPNs -> PNs ++ RestPNs
+            end
+    end.
+
+%% @doc Convert ACK frame to list of ranges instead of expanded list.
+%% Returns a list of {Start, End} tuples where Start =< End.
+%% Much more efficient than ack_frame_to_pn_list for large ranges.
+%% Example: {100, 5, [{2, 3}]} -> [{95, 100}, {89, 92}]
+-spec ack_frame_to_ranges(non_neg_integer(), non_neg_integer(), list()) ->
+    [{non_neg_integer(), non_neg_integer()}] | {error, ack_range_too_large}.
+ack_frame_to_ranges(LargestAcked, FirstRange, AckRanges) ->
+    %% First range: LargestAcked - FirstRange to LargestAcked
+    FirstEnd = LargestAcked,
+    FirstStart = LargestAcked - FirstRange,
+    case FirstEnd - FirstStart > ?MAX_ACK_RANGE of
+        true ->
+            {error, ack_range_too_large};
+        false ->
+            FirstRangeT = {FirstStart, FirstEnd},
+            case ack_ranges_to_range_list(FirstStart, AckRanges) of
+                {error, _} = Error -> Error;
+                RestRanges -> [FirstRangeT | RestRanges]
+            end
+    end.
+
+ack_ranges_to_range_list(_PrevStart, []) ->
+    [];
+ack_ranges_to_range_list(PrevStart, [{Gap, Range} | Rest]) ->
+    %% End of this range
+    End = PrevStart - Gap - 2,
+    Start = End - Range,
+    case End - Start > ?MAX_ACK_RANGE of
+        true ->
+            {error, ack_range_too_large};
+        false ->
+            RangeT = {Start, End},
+            case ack_ranges_to_range_list(Start, Rest) of
+                {error, _} = Error -> Error;
+                RestRanges -> [RangeT | RestRanges]
             end
     end.
 

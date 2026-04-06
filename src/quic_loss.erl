@@ -163,19 +163,19 @@ on_packet_sent(
 -spec on_ack_received(loss_state(), term(), non_neg_integer()) ->
     {loss_state(), [#sent_packet{}], [#sent_packet{}]} | {error, ack_range_too_large}.
 on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now) ->
-    %% Get list of acknowledged packet numbers (use quic_ack for bounds-checked version)
-    case quic_ack:ack_frame_to_pn_list(LargestAcked, FirstRange, AckRanges) of
+    %% Get acknowledged ranges (more efficient than expanded list)
+    case quic_ack:ack_frame_to_ranges(LargestAcked, FirstRange, AckRanges) of
         {error, _} = Error ->
             Error;
-        AckedPNs ->
-            %% Find packets that were acknowledged
-            {AckedPackets, NewSent, RemovedBytes} = remove_acked_packets(
-                AckedPNs, State#loss_state.sent_packets
+        AckedRanges ->
+            %% Find packets that were acknowledged using ranges
+            {AckedPackets, NewSent, RemovedBytes} = remove_acked_packets_ranges(
+                AckedRanges, State#loss_state.sent_packets
             ),
 
             %% Update RTT if we got the largest acknowledged
             NewState1 =
-                case lists:member(LargestAcked, AckedPNs) of
+                case pn_in_ranges(LargestAcked, AckedRanges) of
                     true ->
                         case maps:get(LargestAcked, State#loss_state.sent_packets, undefined) of
                             #sent_packet{time_sent = TimeSent, ack_eliciting = true} ->
@@ -230,12 +230,19 @@ detect_lost_packets(
 %% Internal loss detection
 %% IMPORTANT: Only count ack-eliciting packet sizes in LostBytes since
 %% bytes_in_flight only tracks ack-eliciting packets (RFC 9002).
+%%
+%% Optimized: Instead of rebuilding the entire Remaining map during fold,
+%% we collect lost packet numbers and remove them with maps:without at the end.
+%% This reduces O(n²) map rebuilding to O(n) single-pass + O(k) removal.
 detect_lost_packets(SentPackets, SmoothedRTT, LargestAcked, Now) ->
     %% Calculate loss delay
     LossDelay = max(trunc(?TIME_THRESHOLD * SmoothedRTT), ?GRANULARITY),
 
-    %% Find lost packets
-    {Lost, Remaining, LostBytes} = maps:fold(
+    %% Packet threshold for loss detection (PN < LargestAcked - threshold)
+    LossThreshold = LargestAcked - ?PACKET_THRESHOLD + 1,
+
+    %% Find lost packets - collect lost PNs and packets without rebuilding map
+    {LostPNs, Lost, LostBytes} = maps:fold(
         fun
             (
                 PN,
@@ -245,10 +252,10 @@ detect_lost_packets(SentPackets, SmoothedRTT, LargestAcked, Now) ->
                     in_flight = true,
                     ack_eliciting = AckEliciting
                 } = Packet,
-                {LostAcc, RemAcc, BytesAcc}
+                {PNsAcc, LostAcc, BytesAcc}
             ) ->
                 %% Check packet threshold (RFC 9002 Section 6.1.1)
-                PacketLost = (LargestAcked - PN) >= ?PACKET_THRESHOLD,
+                PacketLost = PN < LossThreshold,
                 %% Check time threshold (RFC 9002 Section 6.1.2)
                 %% IMPORTANT: Time-based loss ONLY applies to packets with PN < LargestAcked
                 %% to prevent spurious loss when no later packet has been acknowledged
@@ -262,16 +269,20 @@ detect_lost_packets(SentPackets, SmoothedRTT, LargestAcked, Now) ->
                                 true -> BytesAcc + Size;
                                 false -> BytesAcc
                             end,
-                        {[Packet | LostAcc], RemAcc, NewBytes};
+                        {[PN | PNsAcc], [Packet | LostAcc], NewBytes};
                     false ->
-                        {LostAcc, maps:put(PN, Packet, RemAcc), BytesAcc}
+                        {PNsAcc, LostAcc, BytesAcc}
                 end;
-            (PN, Packet, {LostAcc, RemAcc, BytesAcc}) ->
-                {LostAcc, maps:put(PN, Packet, RemAcc), BytesAcc}
+            (_PN, _Packet, Acc) ->
+                %% Not in flight, skip
+                Acc
         end,
-        {[], #{}, 0},
+        {[], [], 0},
         SentPackets
     ),
+
+    %% Remove lost packets from sent map in one operation
+    Remaining = maps:without(LostPNs, SentPackets),
 
     {Lost, Remaining, LostBytes}.
 
@@ -407,28 +418,42 @@ pto_count(#loss_state{pto_count = C}) -> C.
 %% Internal Functions
 %%====================================================================
 
-%% Remove acknowledged packets from sent map
+%% Remove acknowledged packets using ranges - O(n) instead of O(n*k) where k is acked count.
+%% Iterates sent_packets once and checks each PN against ranges.
 %% IMPORTANT: Only count ack-eliciting packet sizes in AccBytes since
 %% bytes_in_flight only tracks ack-eliciting packets (RFC 9002).
-remove_acked_packets(AckedPNs, SentPackets) ->
-    lists:foldl(
-        fun(PN, {AccPackets, AccSent, AccBytes}) ->
-            case maps:take(PN, AccSent) of
-                {#sent_packet{size = Size, ack_eliciting = AckEliciting} = Packet, NewSent} ->
-                    %% Only count ack-eliciting packet sizes for bytes_in_flight
+remove_acked_packets_ranges(AckedRanges, SentPackets) ->
+    %% Single pass through sent_packets map
+    {AckedPNs, AckedPackets, AckedBytes} = maps:fold(
+        fun(PN, Packet, {PNsAcc, PacketsAcc, BytesAcc}) ->
+            case pn_in_ranges(PN, AckedRanges) of
+                true ->
+                    #sent_packet{size = Size, ack_eliciting = AckEliciting} = Packet,
                     NewBytes =
                         case AckEliciting of
-                            true -> AccBytes + Size;
-                            false -> AccBytes
+                            true -> BytesAcc + Size;
+                            false -> BytesAcc
                         end,
-                    {[Packet | AccPackets], NewSent, NewBytes};
-                error ->
-                    {AccPackets, AccSent, AccBytes}
+                    {[PN | PNsAcc], [Packet | PacketsAcc], NewBytes};
+                false ->
+                    {PNsAcc, PacketsAcc, BytesAcc}
             end
         end,
-        {[], SentPackets, 0},
-        AckedPNs
-    ).
+        {[], [], 0},
+        SentPackets
+    ),
+    %% Remove acked packets from map in one operation
+    NewSent = maps:without(AckedPNs, SentPackets),
+    {AckedPackets, NewSent, AckedBytes}.
+
+%% Check if a packet number is in any of the acknowledged ranges.
+%% Ranges is a list of {Start, End} tuples where Start =< End.
+pn_in_ranges(_PN, []) ->
+    false;
+pn_in_ranges(PN, [{Start, End} | _Rest]) when PN >= Start, PN =< End ->
+    true;
+pn_in_ranges(PN, [_Range | Rest]) ->
+    pn_in_ranges(PN, Rest).
 
 %% Convert encoded ACK delay to milliseconds
 ack_delay_to_ms(AckDelay, #loss_state{}) ->
