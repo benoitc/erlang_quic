@@ -215,8 +215,8 @@ run_client_benchmark(Port, DataSize, RecvBuf, SndBuf) ->
             Start = erlang:monotonic_time(millisecond),
             ok = quic:send_data(Conn, StreamId, Data, true),
 
-            %% Wait for acknowledgment (simplified - just measure send completion)
-            timer:sleep(100),
+            %% Wait for stream completion (FIN or close)
+            wait_stream_close(Conn, StreamId, 30000),
 
             End = erlang:monotonic_time(millisecond),
             Duration = max(1, End - Start),
@@ -280,4 +280,17 @@ get_actual_buffers(RequestedRecv, RequestedSnd) ->
             };
         {error, _} ->
             #{recbuf => 0, sndbuf => 0}
+    end.
+
+%% Wait for stream to close or receive final data
+wait_stream_close(Conn, StreamId, Timeout) ->
+    receive
+        {quic, Conn, {stream_data, StreamId, _Data, true}} ->
+            ok;
+        {quic, Conn, {stream_closed, StreamId}} ->
+            ok;
+        {quic, Conn, {stream_data, StreamId, _Data, false}} ->
+            wait_stream_close(Conn, StreamId, Timeout)
+    after Timeout ->
+        {error, timeout}
     end.
