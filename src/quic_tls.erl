@@ -512,10 +512,14 @@ encode_tp(Id, Value) ->
     <<IdBin/binary, LenBin/binary, Value/binary>>.
 
 %% @doc Decode QUIC transport parameters.
+%% RFC 9000 Section 7.4: Validates against duplicate parameters and semantic constraints
 -spec decode_transport_params(binary()) -> {ok, map()} | {error, term()}.
 decode_transport_params(Data) ->
     try
-        decode_transport_params_loop(Data, #{})
+        case decode_transport_params_loop(Data, #{}) of
+            {ok, Params} -> validate_transport_params(Params);
+            Error -> Error
+        end
     catch
         error:_ -> {error, invalid_transport_params}
     end.
@@ -527,8 +531,59 @@ decode_transport_params_loop(Data, Acc) ->
     {Len, Rest2} = quic_varint:decode(Rest1),
     <<Value:Len/binary, Rest3/binary>> = Rest2,
     Key = tp_id_to_key(Id),
-    DecodedValue = decode_tp_value(Id, Value),
-    decode_transport_params_loop(Rest3, maps:put(Key, DecodedValue, Acc)).
+    %% RFC 9000 Section 7.4: Duplicate transport parameters MUST be treated as error
+    case maps:is_key(Key, Acc) of
+        true ->
+            {error, {transport_parameter_error, duplicate_parameter, Key}};
+        false ->
+            DecodedValue = decode_tp_value(Id, Value),
+            decode_transport_params_loop(Rest3, maps:put(Key, DecodedValue, Acc))
+    end.
+
+%% @doc Validate transport parameter semantic constraints
+%% RFC 9000 Section 18.2
+-spec validate_transport_params(map()) -> {ok, map()} | {error, term()}.
+validate_transport_params(Params) ->
+    case validate_tp_constraints(Params) of
+        ok -> {ok, Params};
+        {error, _} = Error -> Error
+    end.
+
+validate_tp_constraints(Params) ->
+    %% RFC 9000 Section 18.2: active_connection_id_limit MUST be >= 2
+    case maps:get(active_connection_id_limit, Params, 2) of
+        N when N < 2 ->
+            {error, {transport_parameter_error, active_connection_id_limit_too_small, N}};
+        _ ->
+            validate_ack_delay_exponent(Params)
+    end.
+
+validate_ack_delay_exponent(Params) ->
+    %% RFC 9000 Section 18.2: ack_delay_exponent MUST be <= 20
+    case maps:get(ack_delay_exponent, Params, 3) of
+        N when N > 20 ->
+            {error, {transport_parameter_error, ack_delay_exponent_too_large, N}};
+        _ ->
+            validate_max_udp_payload_size(Params)
+    end.
+
+validate_max_udp_payload_size(Params) ->
+    %% RFC 9000 Section 18.2: max_udp_payload_size MUST be >= 1200
+    case maps:get(max_udp_payload_size, Params, 65527) of
+        N when N < 1200 ->
+            {error, {transport_parameter_error, max_udp_payload_size_too_small, N}};
+        _ ->
+            validate_max_ack_delay(Params)
+    end.
+
+validate_max_ack_delay(Params) ->
+    %% RFC 9000 Section 18.2: max_ack_delay MUST be < 2^14 (16384)
+    case maps:get(max_ack_delay, Params, 25) of
+        N when N >= 16384 ->
+            {error, {transport_parameter_error, max_ack_delay_too_large, N}};
+        _ ->
+            ok
+    end.
 
 tp_id_to_key(?TP_ORIGINAL_DCID) -> original_dcid;
 tp_id_to_key(?TP_MAX_IDLE_TIMEOUT) -> max_idle_timeout;

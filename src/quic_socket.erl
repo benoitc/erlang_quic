@@ -39,6 +39,7 @@
 
 -export([
     open/2,
+    open_for_send/2,
     wrap/2,
     close/1,
     send/4,
@@ -48,7 +49,9 @@
     controlling_process/2,
     setopts/2,
     detect_capabilities/0,
-    get_fd/1
+    get_fd/1,
+    get_socket/1,
+    gso_supported/1
 ]).
 
 -include("quic.hrl").
@@ -65,6 +68,9 @@
     socket :: socket:socket() | gen_udp:socket(),
     %% Which backend we're using
     backend :: socket | gen_udp,
+    %% Whether this socket_state owns the socket (true = close on cleanup)
+    %% When wrapping an existing socket, this is false to avoid closing caller's socket
+    owns_socket = true :: boolean(),
     %% GSO support detected and enabled
     gso_supported = false :: boolean(),
     %% GSO segment size for batching
@@ -130,9 +136,51 @@ open(Port, Opts) ->
             })
     end.
 
+%% @doc Open a UDP socket optimized for sending (client connections).
+%% Detects platform capabilities and enables GSO if available.
+%% Unlike open/2, this is optimized for a single destination.
+-spec open_for_send(inet:ip_address(), map()) ->
+    {ok, socket_state()} | {error, term()}.
+open_for_send(RemoteIP, Opts) ->
+    Capabilities = detect_capabilities(),
+    Backend = maps:get(backend, Capabilities, gen_udp),
+    GSOSupported = maps:get(gso, Capabilities, false),
+
+    BatchOpts = maps:get(batching, Opts, #{}),
+    BatchingEnabled = maps:get(enabled, BatchOpts, true),
+    MaxBatch = maps:get(max_packets, BatchOpts, ?DEFAULT_MAX_BATCH_PACKETS),
+    GSOSize = maps:get(gso_size, BatchOpts, ?DEFAULT_GSO_SEGMENT_SIZE),
+
+    case Backend of
+        socket ->
+            open_send_socket_backend(RemoteIP, Opts, #{
+                gso_supported => GSOSupported,
+                batching_enabled => BatchingEnabled,
+                max_batch => MaxBatch,
+                gso_size => GSOSize
+            });
+        gen_udp ->
+            open_send_genudp_backend(RemoteIP, Opts, #{
+                batching_enabled => BatchingEnabled,
+                max_batch => MaxBatch,
+                gso_size => GSOSize
+            })
+    end.
+
+%% @doc Get the underlying socket from a socket_state.
+-spec get_socket(socket_state()) -> socket:socket() | gen_udp:socket().
+get_socket(#socket_state{socket = Socket}) ->
+    Socket.
+
+%% @doc Check if GSO is supported for this socket_state.
+-spec gso_supported(socket_state()) -> boolean().
+gso_supported(#socket_state{gso_supported = Supported}) ->
+    Supported.
+
 %% @doc Wrap an existing gen_udp socket with batching support.
 %% This allows adding batching to connections that already have a socket.
 %% Note: GSO/GRO are not available when wrapping existing gen_udp sockets.
+%% The wrapped socket is NOT owned by this state - close/1 will not close it.
 -spec wrap(gen_udp:socket(), map()) -> {ok, socket_state()}.
 wrap(Socket, Opts) ->
     BatchOpts = maps:get(batching, Opts, #{}),
@@ -143,6 +191,7 @@ wrap(Socket, Opts) ->
     State = #socket_state{
         socket = Socket,
         backend = gen_udp,
+        owns_socket = false,
         gso_supported = false,
         gso_size = GSOSize,
         gro_enabled = false,
@@ -152,7 +201,11 @@ wrap(Socket, Opts) ->
     {ok, State}.
 
 %% @doc Close the socket and flush any pending packets.
+%% Only closes the socket if owns_socket is true (i.e., socket was created by us).
 -spec close(socket_state()) -> ok.
+close(#socket_state{owns_socket = false}) ->
+    %% Don't close wrapped sockets - caller owns them
+    ok;
 close(#socket_state{socket = Socket, backend = socket}) ->
     _ = socket:close(Socket),
     ok;
@@ -360,6 +413,60 @@ maybe_enable_gro(Socket, #{gro_supported := true}) ->
     end;
 maybe_enable_gro(_, _) ->
     false.
+
+%%====================================================================
+%% Internal Functions - Send-optimized Socket (for client connections)
+%%====================================================================
+
+%% Open socket backend optimized for sending (no binding to specific port)
+open_send_socket_backend(RemoteIP, Opts, BatchConfig) ->
+    Family = family(RemoteIP),
+    case socket:open(Family, dgram, udp) of
+        {ok, Socket} ->
+            configure_send_socket(Socket, Opts, BatchConfig);
+        {error, _} = Error ->
+            Error
+    end.
+
+configure_send_socket(Socket, Opts, BatchConfig) ->
+    ok = socket:setopt(Socket, {socket, reuseaddr}, true),
+    set_socket_buffer_sizes(Socket, Opts),
+    GSOEnabled = maybe_enable_gso(Socket, BatchConfig),
+    State = #socket_state{
+        socket = Socket,
+        backend = socket,
+        owns_socket = true,
+        gso_supported = GSOEnabled,
+        gso_size = maps:get(gso_size, BatchConfig),
+        gro_enabled = false,
+        batching_enabled = maps:get(batching_enabled, BatchConfig),
+        max_batch_packets = maps:get(max_batch, BatchConfig)
+    },
+    {ok, State}.
+
+%% Open gen_udp backend optimized for sending (ephemeral port)
+open_send_genudp_backend(_RemoteIP, Opts, BatchConfig) ->
+    SocketOpts = build_send_genudp_opts(Opts),
+    case gen_udp:open(0, SocketOpts) of
+        {ok, Socket} ->
+            {ok, build_genudp_state(Socket, BatchConfig)};
+        {error, _} = Error ->
+            Error
+    end.
+
+build_send_genudp_opts(Opts) ->
+    ActiveN = maps:get(active_n, Opts, 100),
+    ExtraFlags = maps:get(extra_socket_opts, Opts, []),
+    RecBuf = maps:get(recbuf, Opts, ?DEFAULT_UDP_RECBUF),
+    SndBuf = maps:get(sndbuf, Opts, ?DEFAULT_UDP_SNDBUF),
+    [
+        binary,
+        inet,
+        {active, ActiveN},
+        {reuseaddr, true},
+        {recbuf, RecBuf},
+        {sndbuf, SndBuf}
+    ] ++ ExtraFlags.
 
 %%====================================================================
 %% Internal Functions - gen_udp Backend

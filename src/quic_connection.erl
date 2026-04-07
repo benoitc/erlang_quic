@@ -95,7 +95,9 @@
     %% Stream deadlines
     set_stream_deadline/4,
     cancel_stream_deadline/2,
-    get_stream_deadline/2
+    get_stream_deadline/2,
+    %% Connection ID management (RFC 9000 Section 5.1)
+    issue_new_connection_ids/1
 ]).
 
 %% gen_statem callbacks
@@ -160,6 +162,8 @@
     retry_token = <<>> :: binary(),
     % Whether a Retry packet has been received
     retry_received = false :: boolean(),
+    % SCID from Retry packet (for transport param validation)
+    retry_scid :: binary() | undefined,
     role :: client | server,
     version = ?QUIC_VERSION_1 :: non_neg_integer(),
 
@@ -941,6 +945,9 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     IdleTimeoutClient = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
 
     %% Initialize socket_state for batching (client connections only)
+    %% Client connections use wrap() since they need the same socket for
+    %% both sending and receiving. GSO is not available through gen_udp,
+    %% but batching still provides significant throughput benefits.
     SocketState =
         case maps:get(batching, Opts, #{}) of
             #{enabled := false} ->
@@ -1044,13 +1051,15 @@ terminate(
                 _:_ -> ok
             end
     end,
-    %% Flush any batched packets before closing
+    %% Flush any batched packets before closing and close owned sockets
     case SocketState of
         undefined ->
             ok;
         _ ->
             try
-                _ = quic_socket:flush(SocketState)
+                _ = quic_socket:flush(SocketState),
+                %% Close socket_state (respects owns_socket flag)
+                _ = quic_socket:close(SocketState)
             catch
                 _:_ -> ok
             end
@@ -1488,13 +1497,25 @@ connected(cast, process, #state{role = server} = State) ->
     %% Server connections receive via listener, don't touch socket options
     {keep_state, State};
 %% Handle delayed ACK timer (RFC 9221 Section 5.2)
-connected(info, {send_delayed_ack, app}, State) ->
-    erase(ack_timer),
-    State1 = send_app_ack(State),
-    NewState = flush_socket_batch(State1),
-    {keep_state, NewState};
+%% Validates reference to ignore stale timer events
+connected(info, {send_delayed_ack, app, Ref}, State) ->
+    case get(ack_timer) of
+        Ref when Ref =/= undefined ->
+            erase(ack_timer),
+            State1 = send_app_ack(State),
+            NewState = flush_socket_batch(State1),
+            {keep_state, NewState};
+        _ ->
+            %% Stale timer - ignore
+            {keep_state, State}
+    end;
 %% Handle PMTU probe timeout (RFC 8899)
-connected(info, pmtu_probe_timeout, #state{pmtu_state = PMTUState} = State) ->
+%% Validates reference to ignore stale timer events
+connected(
+    info, {pmtu_probe_timeout, Ref}, #state{pmtu_probe_timer = Ref, pmtu_state = PMTUState} = State
+) when
+    Ref =/= undefined
+->
     NewPMTUState = quic_pmtu:on_probe_timeout(PMTUState),
     State1 = State#state{
         pmtu_state = NewPMTUState,
@@ -1503,8 +1524,16 @@ connected(info, pmtu_probe_timeout, #state{pmtu_state = PMTUState} = State) ->
     %% Retry probing if needed
     State2 = maybe_send_pmtu_probe(State1),
     {keep_state, State2};
+connected(info, {pmtu_probe_timeout, _StaleRef}, State) ->
+    %% Stale PMTU probe timer - ignore
+    {keep_state, State};
 %% Handle PMTU raise timer (periodic re-probing)
-connected(info, pmtu_raise_timeout, #state{pmtu_state = PMTUState} = State) ->
+%% Validates reference to ignore stale timer events
+connected(
+    info, {pmtu_raise_timeout, Ref}, #state{pmtu_raise_timer = Ref, pmtu_state = PMTUState} = State
+) when
+    Ref =/= undefined
+->
     %% Probe higher from current MTU (don't reset to base)
     NewPMTUState = quic_pmtu:on_raise_timer(PMTUState),
     State1 = State#state{
@@ -1513,6 +1542,9 @@ connected(info, pmtu_raise_timeout, #state{pmtu_state = PMTUState} = State) ->
     },
     State2 = maybe_send_pmtu_probe(State1),
     {keep_state, State2};
+connected(info, {pmtu_raise_timeout, _StaleRef}, State) ->
+    %% Stale PMTU raise timer - ignore
+    {keep_state, State};
 %% Handle stream deadline expiry
 connected(info, {stream_deadline, StreamId}, State) ->
     case handle_stream_deadline_expired(StreamId, State) of
@@ -1579,24 +1611,26 @@ handle_common_event(cast, handle_timeout, _StateName, State) ->
     %% Handle loss detection / idle timeout
     NewState = check_timeouts(State),
     {keep_state, NewState};
-handle_common_event(info, pto_timeout, StateName, State) when
-    StateName =:= connected; StateName =:= handshaking
+handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref} = State) when
+    Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
 ->
     %% Handle PTO timeout - send probe packet
-    NewState = handle_pto_timeout(State),
+    NewState = handle_pto_timeout(State#state{pto_timer = undefined}),
     {keep_state, NewState};
-handle_common_event(info, pto_timeout, _StateName, State) ->
-    %% Ignore PTO in other states
+handle_common_event(info, {pto_timeout, _StaleRef}, _StateName, State) ->
+    %% Ignore stale PTO timer (ref doesn't match or wrong state)
     {keep_state, State};
-handle_common_event(info, pacing_timeout, connected, State) ->
+handle_common_event(info, {pacing_timeout, Ref}, connected, #state{pacing_timer = Ref} = State) when
+    Ref =/= undefined
+->
     %% Handle pacing timeout - process send queue
-    NewState = handle_pacing_timeout(State),
+    NewState = handle_pacing_timeout(State#state{pacing_timer = undefined}),
     {keep_state, NewState};
-handle_common_event(info, pacing_timeout, _StateName, State) ->
-    %% Ignore pacing timeout in other states
-    {keep_state, clear_pacing_timer(State)};
-handle_common_event(info, idle_timeout, StateName, State) when
-    StateName =/= draining, StateName =/= closed
+handle_common_event(info, {pacing_timeout, _StaleRef}, _StateName, State) ->
+    %% Ignore stale pacing timer (ref doesn't match or wrong state)
+    {keep_state, State};
+handle_common_event(info, {idle_timeout, Ref}, StateName, #state{idle_timer = Ref} = State) when
+    Ref =/= undefined andalso StateName =/= draining andalso StateName =/= closed
 ->
     %% Handle idle timeout - check if we've truly been idle
     Now = erlang:monotonic_time(millisecond),
@@ -1604,23 +1638,27 @@ handle_common_event(info, idle_timeout, StateName, State) when
     case TimeSinceActivity >= State#state.idle_timeout of
         true ->
             %% Genuine idle timeout - initiate close
-            NewState = initiate_close(idle_timeout, State),
+            NewState = initiate_close(idle_timeout, State#state{idle_timer = undefined}),
             {next_state, draining, NewState};
         false ->
             %% Spurious timeout (activity occurred) - reset timer
-            {keep_state, set_idle_timer(State)}
+            {keep_state, set_idle_timer(State#state{idle_timer = undefined})}
     end;
-handle_common_event(info, idle_timeout, _StateName, State) ->
-    %% Ignore idle timeout in draining/closed states
+handle_common_event(info, {idle_timeout, _StaleRef}, _StateName, State) ->
+    %% Ignore stale idle timer (ref doesn't match or wrong state)
     {keep_state, State};
-handle_common_event(info, keep_alive_timeout, connected, State) ->
+handle_common_event(
+    info, {keep_alive_timeout, Ref}, connected, #state{keep_alive_timer = Ref} = State
+) when
+    Ref =/= undefined
+->
     %% Send keep-alive PING and reset timer
-    State1 = send_keep_alive_ping(State),
+    State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
     State2 = flush_socket_batch(State1),
     {keep_state, set_keep_alive_timer(State2)};
-handle_common_event(info, keep_alive_timeout, _StateName, State) ->
-    %% Ignore keep-alive in non-connected states
-    {keep_state, State#state{keep_alive_timer = undefined}};
+handle_common_event(info, {keep_alive_timeout, _StaleRef}, _StateName, State) ->
+    %% Ignore stale keep-alive timer (ref doesn't match or wrong state)
+    {keep_state, State};
 %% Handle socket going passive ({active, N} exhausted)
 %% Re-enable socket to continue receiving packets
 handle_common_event(
@@ -2763,10 +2801,12 @@ handle_retry_packet(
 handle_valid_retry(RetryToken, ServerSCID, State) ->
     %% RFC 9000 Section 8.1.2: Client MUST use the new SCID from the Retry
     %% as the DCID for subsequent packets
+    %% Store retry_scid for later validation of transport params (RFC 9000 Section 7.3)
     State1 = State#state{
         dcid = ServerSCID,
         retry_token = RetryToken,
-        retry_received = true
+        retry_received = true,
+        retry_scid = ServerSCID
     },
 
     %% Regenerate initial keys with the NEW DCID (ServerSCID) and current version
@@ -3086,15 +3126,26 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
             end
         %% close outer case (Ranges)
     end;
-process_frame(_Level, handshake_done, State) ->
-    %% Server confirmed handshake complete
+%% HANDSHAKE_DONE: Server confirms handshake complete
+%% RFC 9000 Section 19.20: Only server can send, only in 1-RTT (app level)
+process_frame(app, handshake_done, #state{role = client} = State) ->
+    %% Server confirmed handshake complete (client receiving from server)
     State;
+process_frame(app, handshake_done, #state{role = server} = State) ->
+    %% Protocol violation: server received HANDSHAKE_DONE (only client should receive)
+    ?LOG_WARNING(
+        #{what => invalid_handshake_done_frame, reason => server_received}, ?QUIC_LOG_META
+    ),
+    State#state{close_reason = {protocol_violation, handshake_done_from_client}};
+process_frame(Level, handshake_done, State) when Level =/= app ->
+    %% Protocol violation: HANDSHAKE_DONE must be in 1-RTT packets
+    ?LOG_WARNING(#{what => invalid_handshake_done_level, level => Level}, ?QUIC_LOG_META),
+    State#state{close_reason = {protocol_violation, handshake_done_wrong_level}};
 process_frame(app, {stream, StreamId, Offset, Data, Fin}, State) ->
     process_stream_data(StreamId, Offset, Data, Fin, State);
 %% MAX_DATA: Peer is increasing connection-level flow control limit
-%% RFC 9000 Section 19.9: The max_data field is an unsigned integer indicating the maximum
-%% amount of data that can be sent on the entire connection. This value MUST be >= previous.
-process_frame(_Level, {max_data, MaxData}, #state{max_data_remote = Current} = State) ->
+%% RFC 9000 Section 19.9: MAX_DATA is only allowed in 1-RTT packets
+process_frame(app, {max_data, MaxData}, #state{max_data_remote = Current} = State) ->
     case MaxData > Current of
         true ->
             %% Limit increased - try to drain queued data
@@ -3106,9 +3157,13 @@ process_frame(_Level, {max_data, MaxData}, #state{max_data_remote = Current} = S
             %% Monotonic: ignore if not increasing (per RFC 9000)
             State
     end;
+process_frame(Level, {max_data, _}, State) when Level =/= app ->
+    %% Protocol violation: MAX_DATA only allowed in 1-RTT packets
+    ?LOG_WARNING(#{what => invalid_max_data_level, level => Level}, ?QUIC_LOG_META),
+    State#state{close_reason = {protocol_violation, max_data_wrong_level}};
 %% MAX_STREAM_DATA: Peer is increasing stream-level flow control limit
-%% RFC 9000 Section 19.10: Receiving MAX_STREAM_DATA for a send-only stream is an error.
-process_frame(_Level, {max_stream_data, StreamId, MaxData}, #state{streams = Streams} = State) ->
+%% RFC 9000 Section 19.10: MAX_STREAM_DATA is only allowed in 1-RTT packets
+process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, #stream_state{send_max_data = Current} = Stream} ->
             case MaxData > Current of
@@ -3126,22 +3181,30 @@ process_frame(_Level, {max_stream_data, StreamId, MaxData}, #state{streams = Str
         error ->
             State
     end;
+process_frame(Level, {max_stream_data, _, _}, State) when Level =/= app ->
+    %% Protocol violation: MAX_STREAM_DATA only allowed in 1-RTT packets
+    ?LOG_WARNING(#{what => invalid_max_stream_data_level, level => Level}, ?QUIC_LOG_META),
+    State#state{close_reason = {protocol_violation, max_stream_data_wrong_level}};
 %% MAX_STREAMS: Peer is increasing the number of streams we can open
-%% RFC 9000 Section 19.11: The value MUST be >= previous value
-process_frame(_Level, {max_streams, bidi, Max}, #state{max_streams_bidi_remote = Current} = State) ->
+%% RFC 9000 Section 19.11: MAX_STREAMS is only allowed in 1-RTT packets
+process_frame(app, {max_streams, bidi, Max}, #state{max_streams_bidi_remote = Current} = State) ->
     case Max > Current of
         true ->
             State#state{max_streams_bidi_remote = Max};
         false ->
             State
     end;
-process_frame(_Level, {max_streams, uni, Max}, #state{max_streams_uni_remote = Current} = State) ->
+process_frame(app, {max_streams, uni, Max}, #state{max_streams_uni_remote = Current} = State) ->
     case Max > Current of
         true ->
             State#state{max_streams_uni_remote = Max};
         false ->
             State
     end;
+process_frame(Level, {max_streams, _, _}, State) when Level =/= app ->
+    %% Protocol violation: MAX_STREAMS only allowed in 1-RTT packets
+    ?LOG_WARNING(#{what => invalid_max_streams_level, level => Level}, ?QUIC_LOG_META),
+    State#state{close_reason = {protocol_violation, max_streams_wrong_level}};
 %% PATH_CHALLENGE: Peer is probing the path, respond with PATH_RESPONSE
 process_frame(app, {path_challenge, ChallengeData}, State) ->
     %% Send PATH_RESPONSE with the same data
@@ -3170,35 +3233,52 @@ process_frame(
     {reset_stream, StreamId, ErrorCode, FinalSize},
     #state{owner = Owner, streams = Streams} = State
 ) ->
-    %% Update stream state to reset
-    NewStreams =
-        case maps:find(StreamId, Streams) of
-            {ok, Stream} ->
-                %% Mark stream as reset, store final size for flow control accounting
-                maps:put(
-                    StreamId,
-                    Stream#stream_state{
-                        state = reset,
-                        final_size = FinalSize
-                    },
-                    Streams
-                );
-            error ->
-                %% Unknown stream - notify owner and create minimal state to track reset
-                Owner ! {quic, self(), {stream_opened, StreamId}},
-                maps:put(
-                    StreamId,
-                    #stream_state{
-                        id = StreamId,
-                        state = reset,
-                        final_size = FinalSize
-                    },
-                    Streams
-                )
-        end,
-    %% Notify owner of stream reset
-    Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-    State#state{streams = NewStreams};
+    %% RFC 9000 Section 4.5: Validate final size against any previously known value
+    case maps:find(StreamId, Streams) of
+        {ok, #stream_state{final_size = ExistingFinalSize}} when
+            ExistingFinalSize =/= undefined andalso ExistingFinalSize =/= FinalSize
+        ->
+            %% FINAL_SIZE_ERROR: RESET_STREAM has different final size than previously known
+            ?LOG_WARNING(
+                #{
+                    what => final_size_error,
+                    stream_id => StreamId,
+                    existing => ExistingFinalSize,
+                    reset_stream => FinalSize
+                },
+                ?QUIC_LOG_META
+            ),
+            CloseFrame =
+                {connection_close, transport, ?QUIC_FINAL_SIZE_ERROR, 0,
+                    <<"RESET_STREAM final size mismatch">>},
+            send_frame(CloseFrame, State#state{close_reason = final_size_error});
+        {ok, Stream} ->
+            %% Mark stream as reset, store final size for flow control accounting
+            NewStreams = maps:put(
+                StreamId,
+                Stream#stream_state{
+                    state = reset,
+                    final_size = FinalSize
+                },
+                Streams
+            ),
+            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+            State#state{streams = NewStreams};
+        error ->
+            %% Unknown stream - notify owner and create minimal state to track reset
+            Owner ! {quic, self(), {stream_opened, StreamId}},
+            NewStreams = maps:put(
+                StreamId,
+                #stream_state{
+                    id = StreamId,
+                    state = reset,
+                    final_size = FinalSize
+                },
+                Streams
+            ),
+            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+            State#state{streams = NewStreams}
+    end;
 %% STOP_SENDING: Peer wants us to stop sending on a stream
 %% RFC 9000 Section 19.5
 process_frame(
@@ -3263,8 +3343,14 @@ process_frame(
             State#state{streams = maps:put(StreamId, NewStream, Streams)}
     end;
 %% DATA_BLOCKED: Peer is blocked by connection-level flow control (informational)
-process_frame(_Level, {data_blocked, _Limit}, State) ->
+%% RFC 9000 Section 19.12: DATA_BLOCKED is only allowed in 1-RTT packets
+process_frame(app, {data_blocked, _Limit}, State) ->
+    %% Informational - no action needed
     State;
+process_frame(Level, {data_blocked, _}, State) when Level =/= app ->
+    %% Protocol violation: DATA_BLOCKED only allowed in 1-RTT packets
+    ?LOG_WARNING(#{what => invalid_data_blocked_level, level => Level}, ?QUIC_LOG_META),
+    State#state{close_reason = {protocol_violation, data_blocked_wrong_level}};
 %% DATAGRAM frames (RFC 9221)
 %% RFC 9221: MUST terminate with PROTOCOL_VIOLATION if receiving DATAGRAM
 %% without having advertised support (max_datagram_frame_size = 0)
@@ -3960,7 +4046,7 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
 
     case {EndOffset > RecvMaxData, DataReceived + DataSize > MaxDataLocal, BufferOverflow} of
         {true, _, _} ->
-            %% Stream-level flow control violation
+            %% Stream-level flow control violation - RFC 9000 Section 4.1
             ?LOG_WARNING(
                 #{
                     what => stream_flow_control_violation,
@@ -3970,10 +4056,13 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                 },
                 ?QUIC_LOG_META
             ),
-            % Could send FLOW_CONTROL_ERROR
-            State;
+            %% Send FLOW_CONTROL_ERROR and close connection
+            CloseFrame =
+                {connection_close, transport, ?QUIC_FLOW_CONTROL_ERROR, 0,
+                    <<"stream flow control violation">>},
+            send_frame(CloseFrame, State#state{close_reason = stream_flow_control_error});
         {_, true, _} ->
-            %% Connection-level flow control violation
+            %% Connection-level flow control violation - RFC 9000 Section 4.1
             ?LOG_WARNING(
                 #{
                     what => connection_flow_control_violation,
@@ -3982,8 +4071,11 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                 },
                 ?QUIC_LOG_META
             ),
-            % Could send FLOW_CONTROL_ERROR
-            State;
+            %% Send FLOW_CONTROL_ERROR and close connection
+            CloseFrame =
+                {connection_close, transport, ?QUIC_FLOW_CONTROL_ERROR, 0,
+                    <<"connection flow control violation">>},
+            send_frame(CloseFrame, State#state{close_reason = connection_flow_control_error});
         {_, _, true} ->
             %% Receive buffer overflow - malicious peer sending too much out-of-order data
             ?LOG_WARNING(
@@ -4002,160 +4094,196 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                     <<"recv buffer overflow">>},
             send_frame(CloseFrame, State#state{close_reason = recv_buffer_overflow});
         _ ->
-            %% Flow control OK - proceed with buffering
+            %% Flow control OK - check final size consistency before buffering
 
-            %% Store data in buffer (handles duplicates gracefully - overwrites)
-            UpdatedBuffer = maps:put(Offset, Data, RecvBuffer),
+            %% RFC 9000 Section 4.5: Validate final size when FIN received
+            ExistingFinalSize = Stream#stream_state.final_size,
+            FinalSizeError =
+                Fin andalso
+                    ExistingFinalSize =/= undefined andalso
+                    ExistingFinalSize =/= EndOffset,
 
-            %% Track FIN position if received
-            FinalSize =
-                case Fin of
-                    true -> EndOffset;
-                    false -> Stream#stream_state.final_size
-                end,
-
-            %% Extract contiguous data starting from recv_offset and deliver it
-            {DeliverData, NewRecvOffset, NewBuffer} = extract_contiguous_data(
-                UpdatedBuffer, CurrentOffset
-            ),
-
-            %% Determine if we should deliver FIN (all data up to FIN has been delivered)
-            DeliverFin = FinalSize =/= undefined andalso NewRecvOffset >= FinalSize,
-
-            %% Deliver contiguous data to owner
-            %% RFC 9000: Also deliver FIN-only notification when no data but FIN received
-            case {DeliverData, DeliverFin, Fin} of
-                {<<>>, false, _} ->
-                    %% No contiguous data to deliver yet
-                    ok;
-                {<<>>, true, _} ->
-                    %% FIN-only delivery (all data already delivered)
-                    Owner ! {quic, self(), {stream_data, StreamId, <<>>, true}};
-                {_, _, _} ->
-                    Owner ! {quic, self(), {stream_data, StreamId, DeliverData, DeliverFin}}
-            end,
-
-            NewStream = Stream#stream_state{
-                recv_offset = NewRecvOffset,
-                recv_fin = DeliverFin,
-                recv_buffer = NewBuffer,
-                final_size = FinalSize
-            },
-
-            %% Track connection-level data received - only count NEW bytes, not duplicates
-            NewBytesReceived =
-                case IsDuplicate of
-                    true -> 0;
-                    false -> DataSize
-                end,
-            NewDataReceivedVal = DataReceived + NewBytesReceived,
-
-            %% Update receive buffer bytes tracking
-            %% Net change: add new bytes, subtract delivered bytes
-            DeliveredBytes = byte_size(DeliverData),
-            NewRecvBufferBytes = max(0, RecvBufferBytes + NewBytesReceived - DeliveredBytes),
-
-            State1 = State#state{
-                streams = maps:put(StreamId, NewStream, Streams),
-                data_received = NewDataReceivedVal,
-                recv_buffer_bytes = NewRecvBufferBytes
-            },
-
-            %% Check if we need to send MAX_STREAM_DATA to allow more data
-            %% Send when we've consumed more than half our advertised limit
-            %% RTT-based auto-tuning: double if fast consumption, linear if slow
-            State2 =
-                case NewRecvOffset > (RecvMaxData div 2) of
-                    true ->
-                        Now = erlang:monotonic_time(millisecond),
-                        SmoothedRTT = quic_loss:smoothed_rtt(State1#state.loss_state),
-                        MaxWindow = State1#state.fc_max_receive_window,
-                        LastStreamUpdate = State1#state.fc_last_stream_update,
-                        InitialStreamWindow = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-                        %% Check if consumption is fast (< 4*RTT since last update)
-                        FastConsumption =
-                            case LastStreamUpdate of
-                                undefined ->
-                                    true;
-                                _ ->
-                                    (Now - LastStreamUpdate) < (SmoothedRTT * ?AUTO_TUNE_RTT_FACTOR)
-                            end,
-                        NewMaxStreamData =
-                            case FastConsumption of
-                                true ->
-                                    %% Double (aggressive growth for fast consumption)
-                                    min(RecvMaxData * 2, MaxWindow);
-                                false ->
-                                    %% Linear (conservative growth for slow consumption)
-                                    min(RecvMaxData + InitialStreamWindow, MaxWindow)
-                            end,
-                        UpdatedStream = NewStream#stream_state{recv_max_data = NewMaxStreamData},
-                        MaxStreamDataFrame = {max_stream_data, StreamId, NewMaxStreamData},
-                        %% Update cached max stream recv window
-                        NewCachedMax = max(
-                            NewMaxStreamData, State1#state.fc_max_stream_recv_window
-                        ),
-                        State1a = State1#state{
-                            streams = maps:put(StreamId, UpdatedStream, Streams),
-                            fc_last_stream_update = Now,
-                            fc_max_stream_recv_window = NewCachedMax
+            case FinalSizeError of
+                true ->
+                    %% FINAL_SIZE_ERROR: FIN indicates different final size
+                    ?LOG_WARNING(
+                        #{
+                            what => final_size_error,
+                            stream_id => StreamId,
+                            existing => ExistingFinalSize,
+                            fin_offset => EndOffset
                         },
-                        send_frame(MaxStreamDataFrame, State1a);
-                    false ->
-                        State1
-                end,
+                        ?QUIC_LOG_META
+                    ),
+                    CloseFrame =
+                        {connection_close, transport, ?QUIC_FINAL_SIZE_ERROR, 0,
+                            <<"FIN final size mismatch">>},
+                    send_frame(CloseFrame, State#state{close_reason = final_size_error});
+                false ->
+                    %% Store data in buffer (handles duplicates gracefully - overwrites)
+                    UpdatedBuffer = maps:put(Offset, Data, RecvBuffer),
 
-            %% Check if we need to send MAX_DATA for connection-level flow control
-            %% Send when we've consumed more than 50% of our advertised connection window
-            %% RTT-based auto-tuning with connection/stream multiplier enforcement
-            MaxDataLocalVal = State2#state.max_data_local,
-            State3 =
-                case NewDataReceivedVal > (MaxDataLocalVal div 2) of
-                    true ->
-                        Now2 = erlang:monotonic_time(millisecond),
-                        SmoothedRTT2 = quic_loss:smoothed_rtt(State2#state.loss_state),
-                        MaxWindow2 = State2#state.fc_max_receive_window,
-                        LastConnUpdate = State2#state.fc_last_conn_update,
-                        InitialConnWindow = ?DEFAULT_INITIAL_MAX_DATA,
-                        %% Check if consumption is fast (< 4*RTT since last update)
-                        FastConsumption2 =
-                            case LastConnUpdate of
-                                undefined ->
-                                    true;
-                                _ ->
-                                    (Now2 - LastConnUpdate) < (SmoothedRTT2 * ?AUTO_TUNE_RTT_FACTOR)
-                            end,
-                        %% Calculate new window based on RTT-aware growth
-                        BaseNewMaxData =
-                            case FastConsumption2 of
-                                true ->
-                                    %% Double (aggressive growth)
-                                    min((NewDataReceivedVal + MaxDataLocalVal) * 2, MaxWindow2);
-                                false ->
-                                    %% Linear (conservative growth)
-                                    min(
-                                        NewDataReceivedVal + MaxDataLocalVal + InitialConnWindow,
-                                        MaxWindow2
-                                    )
-                            end,
-                        %% Ensure connection window >= 1.5x largest stream window
-                        MaxStreamWindow = get_max_stream_recv_window(State2),
-                        MinConnWindow = trunc(
-                            MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER
-                        ),
-                        NewMaxData = max(BaseNewMaxData, MinConnWindow),
-                        MaxDataFrame = {max_data, NewMaxData},
-                        State2a = send_frame(MaxDataFrame, State2),
-                        State2a#state{
-                            max_data_local = NewMaxData,
-                            fc_last_conn_update = Now2
-                        };
-                    false ->
-                        State2
-                end,
+                    %% Track FIN position if received
+                    FinalSize =
+                        case Fin of
+                            true -> EndOffset;
+                            false -> ExistingFinalSize
+                        end,
 
-            %% ACK is sent at packet level by maybe_send_ack
-            State3
+                    %% Extract contiguous data starting from recv_offset and deliver it
+                    {DeliverData, NewRecvOffset, NewBuffer} = extract_contiguous_data(
+                        UpdatedBuffer, CurrentOffset
+                    ),
+
+                    %% Determine if we should deliver FIN (all data up to FIN has been delivered)
+                    DeliverFin = FinalSize =/= undefined andalso NewRecvOffset >= FinalSize,
+
+                    %% Deliver contiguous data to owner
+                    %% RFC 9000: Also deliver FIN-only notification when no data but FIN received
+                    case {DeliverData, DeliverFin, Fin} of
+                        {<<>>, false, _} ->
+                            %% No contiguous data to deliver yet
+                            ok;
+                        {<<>>, true, _} ->
+                            %% FIN-only delivery (all data already delivered)
+                            Owner ! {quic, self(), {stream_data, StreamId, <<>>, true}};
+                        {_, _, _} ->
+                            Owner ! {quic, self(), {stream_data, StreamId, DeliverData, DeliverFin}}
+                    end,
+
+                    NewStream = Stream#stream_state{
+                        recv_offset = NewRecvOffset,
+                        recv_fin = DeliverFin,
+                        recv_buffer = NewBuffer,
+                        final_size = FinalSize
+                    },
+
+                    %% Track connection-level data received - only count NEW bytes, not duplicates
+                    NewBytesReceived =
+                        case IsDuplicate of
+                            true -> 0;
+                            false -> DataSize
+                        end,
+                    NewDataReceivedVal = DataReceived + NewBytesReceived,
+
+                    %% Update receive buffer bytes tracking
+                    %% Net change: add new bytes, subtract delivered bytes
+                    DeliveredBytes = byte_size(DeliverData),
+                    NewRecvBufferBytes = max(
+                        0, RecvBufferBytes + NewBytesReceived - DeliveredBytes
+                    ),
+
+                    State1 = State#state{
+                        streams = maps:put(StreamId, NewStream, Streams),
+                        data_received = NewDataReceivedVal,
+                        recv_buffer_bytes = NewRecvBufferBytes
+                    },
+
+                    %% Check if we need to send MAX_STREAM_DATA to allow more data
+                    %% Send when we've consumed more than half our advertised limit
+                    %% RTT-based auto-tuning: double if fast consumption, linear if slow
+                    State2 =
+                        case NewRecvOffset > (RecvMaxData div 2) of
+                            true ->
+                                Now = erlang:monotonic_time(millisecond),
+                                SmoothedRTT = quic_loss:smoothed_rtt(State1#state.loss_state),
+                                MaxWindow = State1#state.fc_max_receive_window,
+                                LastStreamUpdate = State1#state.fc_last_stream_update,
+                                InitialStreamWindow = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+                                %% Check if consumption is fast (< 4*RTT since last update)
+                                FastConsumption =
+                                    case LastStreamUpdate of
+                                        undefined ->
+                                            true;
+                                        _ ->
+                                            (Now - LastStreamUpdate) <
+                                                (SmoothedRTT * ?AUTO_TUNE_RTT_FACTOR)
+                                    end,
+                                NewMaxStreamData =
+                                    case FastConsumption of
+                                        true ->
+                                            %% Double (aggressive growth for fast consumption)
+                                            min(RecvMaxData * 2, MaxWindow);
+                                        false ->
+                                            %% Linear (conservative growth for slow consumption)
+                                            min(RecvMaxData + InitialStreamWindow, MaxWindow)
+                                    end,
+                                UpdatedStream = NewStream#stream_state{
+                                    recv_max_data = NewMaxStreamData
+                                },
+                                MaxStreamDataFrame = {max_stream_data, StreamId, NewMaxStreamData},
+                                %% Update cached max stream recv window
+                                NewCachedMax = max(
+                                    NewMaxStreamData, State1#state.fc_max_stream_recv_window
+                                ),
+                                State1a = State1#state{
+                                    streams = maps:put(StreamId, UpdatedStream, Streams),
+                                    fc_last_stream_update = Now,
+                                    fc_max_stream_recv_window = NewCachedMax
+                                },
+                                send_frame(MaxStreamDataFrame, State1a);
+                            false ->
+                                State1
+                        end,
+
+                    %% Check if we need to send MAX_DATA for connection-level flow control
+                    %% Send when we've consumed more than 50% of our advertised connection window
+                    %% RTT-based auto-tuning with connection/stream multiplier enforcement
+                    MaxDataLocalVal = State2#state.max_data_local,
+                    State3 =
+                        case NewDataReceivedVal > (MaxDataLocalVal div 2) of
+                            true ->
+                                Now2 = erlang:monotonic_time(millisecond),
+                                SmoothedRTT2 = quic_loss:smoothed_rtt(State2#state.loss_state),
+                                MaxWindow2 = State2#state.fc_max_receive_window,
+                                LastConnUpdate = State2#state.fc_last_conn_update,
+                                InitialConnWindow = ?DEFAULT_INITIAL_MAX_DATA,
+                                %% Check if consumption is fast (< 4*RTT since last update)
+                                FastConsumption2 =
+                                    case LastConnUpdate of
+                                        undefined ->
+                                            true;
+                                        _ ->
+                                            (Now2 - LastConnUpdate) <
+                                                (SmoothedRTT2 * ?AUTO_TUNE_RTT_FACTOR)
+                                    end,
+                                %% Calculate new window based on RTT-aware growth
+                                BaseNewMaxData =
+                                    case FastConsumption2 of
+                                        true ->
+                                            %% Double (aggressive growth)
+                                            min(
+                                                (NewDataReceivedVal + MaxDataLocalVal) * 2,
+                                                MaxWindow2
+                                            );
+                                        false ->
+                                            %% Linear (conservative growth)
+                                            min(
+                                                NewDataReceivedVal + MaxDataLocalVal +
+                                                    InitialConnWindow,
+                                                MaxWindow2
+                                            )
+                                    end,
+                                %% Ensure connection window >= 1.5x largest stream window
+                                MaxStreamWindow = get_max_stream_recv_window(State2),
+                                MinConnWindow = trunc(
+                                    MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER
+                                ),
+                                NewMaxData = max(BaseNewMaxData, MinConnWindow),
+                                MaxDataFrame = {max_data, NewMaxData},
+                                State2a = send_frame(MaxDataFrame, State2),
+                                State2a#state{
+                                    max_data_local = NewMaxData,
+                                    fc_last_conn_update = Now2
+                                };
+                            false ->
+                                State2
+                        end,
+
+                    %% ACK is sent at packet level by maybe_send_ack
+                    State3
+                % end of FinalSizeError case
+            end
     end.
 
 %% Extract contiguous data from buffer starting at Offset
@@ -4292,14 +4420,16 @@ should_delay_ack(Frames) ->
     Retransmittable =:= [].
 
 %% Schedule a delayed ACK (up to max_ack_delay)
+%% Uses unique reference in message to detect stale timer events
 schedule_delayed_ack(app, State) ->
     %% Use max_ack_delay from transport params (default 25ms)
     MaxAckDelay = maps:get(max_ack_delay, State#state.transport_params, 25),
     %% Schedule ACK timer if not already set
     case get(ack_timer) of
         undefined ->
-            TimerRef = erlang:send_after(MaxAckDelay, self(), {send_delayed_ack, app}),
-            put(ack_timer, TimerRef),
+            Ref = make_ref(),
+            erlang:send_after(MaxAckDelay, self(), {send_delayed_ack, app, Ref}),
+            put(ack_timer, Ref),
             State;
         _ ->
             %% Timer already set, don't reschedule
@@ -5702,13 +5832,15 @@ send_keep_alive_ping(State) ->
 %%====================================================================
 
 %% Set PTO timer based on current loss state
+%% Uses unique reference in message to detect stale timer events
 set_pto_timer(#state{loss_state = LossState, pto_timer = OldTimer} = State) ->
     cancel_timer(OldTimer),
     case quic_loss:bytes_in_flight(LossState) > 0 of
         true ->
             PTO = quic_loss:get_pto(LossState),
-            TimerRef = erlang:send_after(PTO, self(), pto_timeout),
-            State#state{pto_timer = TimerRef};
+            Ref = make_ref(),
+            erlang:send_after(PTO, self(), {pto_timeout, Ref}),
+            State#state{pto_timer = Ref};
         false ->
             State#state{pto_timer = undefined}
     end.
@@ -5718,21 +5850,20 @@ cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
 
 %% Handle pacing timeout - drain queued data
+%% Note: pacing_timer is already set to undefined by the handler before calling this
 handle_pacing_timeout(#state{send_queue = PQ} = State) ->
     ?LOG_DEBUG(#{what => pacing_timeout_fired, queue_empty => pqueue_is_empty(PQ)}, ?QUIC_LOG_META),
-    %% Clear the expired timer first
-    State1 = State#state{pacing_timer = undefined},
     %% Check if there's queued data
     case pqueue_is_empty(PQ) of
         true ->
-            State1;
+            State;
         false ->
             %% Process the send queue
-            State2 = process_send_queue(State1),
+            State1 = process_send_queue(State),
             %% If there's still queued data and pacing is blocking, set another timer
-            State3 = maybe_reschedule_pacing(State2),
+            State2 = maybe_reschedule_pacing(State1),
             %% Event-driven flush: flush batch after pacing timeout processing
-            flush_socket_batch(State3)
+            flush_socket_batch(State2)
     end.
 
 %% Check if we need to reschedule pacing timer after processing queue
@@ -5769,12 +5900,14 @@ maybe_reschedule_pacing(State) ->
 %%====================================================================
 
 %% Set idle timer based on idle_timeout configuration
+%% Uses unique reference in message to detect stale timer events
 set_idle_timer(#state{idle_timeout = 0} = State) ->
     State#state{idle_timer = undefined};
 set_idle_timer(#state{idle_timeout = Timeout, idle_timer = OldTimer} = State) ->
     cancel_timer(OldTimer),
-    TimerRef = erlang:send_after(Timeout, self(), idle_timeout),
-    State#state{idle_timer = TimerRef}.
+    Ref = make_ref(),
+    erlang:send_after(Timeout, self(), {idle_timeout, Ref}),
+    State#state{idle_timer = Ref}.
 
 %%====================================================================
 %% Keep-Alive Timer Management (RFC 9000 - PING frames)
@@ -5794,6 +5927,7 @@ calculate_keep_alive_interval(Opts, IdleTimeout) ->
     end.
 
 %% Set keep-alive timer
+%% Uses unique reference in message to detect stale timer events
 set_keep_alive_timer(#state{keep_alive_interval = disabled} = State) ->
     State#state{keep_alive_timer = undefined};
 set_keep_alive_timer(
@@ -5803,8 +5937,9 @@ set_keep_alive_timer(
     } = State
 ) ->
     cancel_timer(OldTimer),
-    TimerRef = erlang:send_after(Interval, self(), keep_alive_timeout),
-    State#state{keep_alive_timer = TimerRef}.
+    Ref = make_ref(),
+    erlang:send_after(Interval, self(), {keep_alive_timeout, Ref}),
+    State#state{keep_alive_timer = Ref}.
 
 %%====================================================================
 %% Pacing Timer Management (RFC 9002 §7.7)
@@ -5812,6 +5947,7 @@ set_keep_alive_timer(
 
 %% Set pacing timer if not already set
 %% Only sets a timer if there's data queued and no existing timer
+%% Uses unique reference in message to detect stale timer events
 maybe_set_pacing_timer(0, State) ->
     %% No delay - don't set timer
     State;
@@ -5821,15 +5957,9 @@ maybe_set_pacing_timer(_Delay, #state{pacing_timer = Ref} = State) when Ref =/= 
 maybe_set_pacing_timer(Delay, #state{pacing_timer = undefined} = State) ->
     %% Set new pacing timer
     ?LOG_DEBUG(#{what => pacing_timer_set, delay_ms => Delay}, ?QUIC_LOG_META),
-    TimerRef = erlang:send_after(Delay, self(), pacing_timeout),
-    State#state{pacing_timer = TimerRef}.
-
-%% Clear pacing timer after processing
-clear_pacing_timer(#state{pacing_timer = undefined} = State) ->
-    State;
-clear_pacing_timer(#state{pacing_timer = Ref} = State) ->
-    cancel_timer(Ref),
-    State#state{pacing_timer = undefined}.
+    Ref = make_ref(),
+    erlang:send_after(Delay, self(), {pacing_timeout, Ref}),
+    State#state{pacing_timer = Ref}.
 
 %% Convert state to map for debugging
 state_to_map(#state{} = S) ->
@@ -6030,14 +6160,15 @@ get_current_key_phase(#state{key_state = KeyState}) -> KeyState#key_update_state
 %% Connection Migration (RFC 9000 Section 9)
 %%====================================================================
 
-%% @doc Initiate path validation by sending PATH_CHALLENGE.
+%% @doc Initiate path validation by sending PATH_CHALLENGE to the new path.
+%% RFC 9000 Section 8.2: PATH_CHALLENGE must be sent to the path being validated.
 %% Returns updated state with the path in validating status.
 -spec initiate_path_validation({inet:ip_address(), inet:port_number()}, #state{}) -> #state{}.
 initiate_path_validation(RemoteAddr, State) ->
     %% Generate 8-byte random challenge data
     ChallengeData = crypto:strong_rand_bytes(8),
 
-    %% Create or update path state
+    %% Create path state for the new path
     PathState = #path_state{
         remote_addr = RemoteAddr,
         status = validating,
@@ -6049,14 +6180,113 @@ initiate_path_validation(RemoteAddr, State) ->
 
     %% Add to alternative paths
     AltPaths = [PathState | State#state.alt_paths],
-
-    %% Send PATH_CHALLENGE frame
-    ChallengeFrame = {path_challenge, ChallengeData},
     State1 = State#state{alt_paths = AltPaths},
 
-    %% Note: In a full implementation, we'd send to the specific path
-    %% For now, send on the current path (for testing)
-    send_frame(ChallengeFrame, State1).
+    %% Send PATH_CHALLENGE to the new path address
+    send_path_challenge(RemoteAddr, ChallengeData, State1).
+
+%% @doc Send PATH_CHALLENGE frame to a specific address.
+%% This is used for path validation where the probe must go to the new path.
+%% Uses the same packet encoding as send_frame but sends to a different address.
+-spec send_path_challenge({inet:ip_address(), inet:port_number()}, binary(), #state{}) -> #state{}.
+send_path_challenge({IP, Port}, ChallengeData, #state{
+    socket = Socket,
+    dcid = DCID,
+    app_keys = AppKeys,
+    role = Role,
+    pn_app = PNSpace
+} = State) ->
+    %% Check we have app keys for encryption
+    case AppKeys of
+        {ClientKeys, ServerKeys} when ClientKeys =/= undefined, ServerKeys =/= undefined ->
+            %% Select correct keys based on role
+            EncryptKeys = case Role of
+                client -> ClientKeys;
+                server -> ServerKeys
+            end,
+
+            %% Build PATH_CHALLENGE frame
+            ChallengeFrame = {path_challenge, ChallengeData},
+            Payload = quic_frame:encode(ChallengeFrame),
+            PaddedPayload = pad_for_header_protection(Payload),
+
+            %% Get packet number and key phase
+            PN = PNSpace#pn_space.next_pn,
+            PNLen = quic_packet:pn_length(PN),
+            KeyPhase = get_current_key_phase(State),
+
+            %% Build first byte for short header
+            FirstByte = 16#40 bor (KeyPhase bsl 2) bor (PNLen - 1),
+
+            %% Encrypt packet
+            #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
+            Packet = quic_aead:protect_short_packet(
+                Cipher, Key, IV, HP, PN, FirstByte, DCID, PaddedPayload
+            ),
+
+            %% Send to the specific path address (not current remote_addr)
+            case gen_udp:send(Socket, IP, Port, Packet) of
+                ok ->
+                    %% Update path bytes_sent for anti-amplification tracking
+                    PacketSize = byte_size(Packet),
+                    State1 = update_path_bytes_sent(IP, Port, PacketSize, State),
+                    %% Increment packet number
+                    NewPnApp = PNSpace#pn_space{next_pn = PN + 1},
+                    State1#state{pn_app = NewPnApp};
+                {error, _Reason} ->
+                    State
+            end;
+        _ ->
+            %% No app keys yet, can't send path validation
+            ?LOG_DEBUG(#{what => path_challenge_no_keys}, ?QUIC_LOG_META),
+            State
+    end.
+
+%% @doc Update bytes_sent for anti-amplification tracking on a path.
+-spec update_path_bytes_sent(inet:ip_address(), inet:port_number(), non_neg_integer(), #state{}) ->
+    #state{}.
+update_path_bytes_sent(IP, Port, Bytes, #state{alt_paths = AltPaths} = State) ->
+    NewAltPaths = lists:map(
+        fun
+            (#path_state{remote_addr = {PathIP, PathPort}} = PS) when
+                PathIP =:= IP, PathPort =:= Port
+            ->
+                PS#path_state{bytes_sent = PS#path_state.bytes_sent + Bytes};
+            (PS) ->
+                PS
+        end,
+        AltPaths
+    ),
+    State#state{alt_paths = NewAltPaths}.
+
+%% @doc Update bytes_received for anti-amplification tracking on a path.
+-spec update_path_bytes_received(
+    inet:ip_address(), inet:port_number(), non_neg_integer(), #state{}
+) ->
+    #state{}.
+update_path_bytes_received(IP, Port, Bytes, #state{alt_paths = AltPaths} = State) ->
+    NewAltPaths = lists:map(
+        fun
+            (#path_state{remote_addr = {PathIP, PathPort}} = PS) when
+                PathIP =:= IP, PathPort =:= Port
+            ->
+                PS#path_state{bytes_received = PS#path_state.bytes_received + Bytes};
+            (PS) ->
+                PS
+        end,
+        AltPaths
+    ),
+    State#state{alt_paths = NewAltPaths}.
+
+%% @doc Check anti-amplification limit for sending on unvalidated path.
+%% RFC 9000 Section 8.1: Server MUST NOT send more than 3x data received until validated.
+-spec check_anti_amplification_limit(#path_state{}) -> boolean().
+check_anti_amplification_limit(#path_state{status = validated}) ->
+    %% Path is validated, no limit
+    true;
+check_anti_amplification_limit(#path_state{bytes_sent = Sent, bytes_received = Received}) ->
+    %% Unvalidated path: can send at most 3x what we've received
+    Sent < (Received * 3).
 
 %% @doc Initiate path validation for server's preferred address (RFC 9000 Section 9.6).
 %% Client validates the preferred address before migrating to it.
@@ -6278,15 +6508,178 @@ handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
     end.
 
 %% Send RETIRE_CONNECTION_ID frames for CIDs that need to be retired
-retire_peer_cids(_RetirePrior, State) ->
-    %% In a full implementation, send RETIRE_CONNECTION_ID frames
-    %% For now, just return state
-    State.
+%% RFC 9000 Section 19.16: Retires CIDs with sequence numbers less than RetirePrior
+retire_peer_cids(RetirePrior, #state{peer_cid_pool = Pool} = State) ->
+    %% Find CIDs to retire and send RETIRE_CONNECTION_ID for each
+    {NewPool, State1} = lists:foldl(
+        fun
+            (#cid_entry{seq_num = SeqNum, status = active} = Entry, {AccPool, AccState}) when
+                SeqNum < RetirePrior
+            ->
+                %% Send RETIRE_CONNECTION_ID frame
+                Frame = {retire_connection_id, SeqNum},
+                AccState1 = send_frame(Frame, AccState),
+                %% Mark as retired in pool
+                RetiredEntry = Entry#cid_entry{status = retired},
+                {[RetiredEntry | AccPool], AccState1};
+            (Entry, {AccPool, AccState}) ->
+                %% Keep as-is
+                {[Entry | AccPool], AccState}
+        end,
+        {[], State},
+        Pool
+    ),
+    State1#state{peer_cid_pool = lists:reverse(NewPool)}.
+
+%% @doc Issue new connection IDs to the peer.
+%% RFC 9000 Section 5.1.1: Generates new CIDs with stateless reset tokens.
+-spec issue_new_connection_ids(#state{}) -> #state{}.
+issue_new_connection_ids(
+    #state{
+        local_cid_pool = Pool,
+        peer_active_cid_limit = PeerLimit
+    } = State
+) ->
+    %% Count current active CIDs
+    ActiveCount = length([E || #cid_entry{status = active} = E <- Pool]),
+
+    %% Issue new CIDs up to peer's limit
+    case ActiveCount < PeerLimit of
+        true ->
+            %% Need to issue more CIDs
+            NumToIssue = PeerLimit - ActiveCount,
+            issue_cids(NumToIssue, State);
+        false ->
+            State
+    end.
+
+%% Helper to issue N new connection IDs
+issue_cids(0, State) ->
+    State;
+issue_cids(N, #state{local_cid_pool = Pool} = State) when N > 0 ->
+    %% Get next sequence number
+    NextSeqNum =
+        case Pool of
+            % seq 0 is the initial CID
+            [] -> 1;
+            _ -> lists:max([E#cid_entry.seq_num || E <- Pool]) + 1
+        end,
+
+    %% Generate new CID (8 bytes recommended by RFC 9000)
+    NewCID = crypto:strong_rand_bytes(8),
+
+    %% Generate stateless reset token (16 bytes)
+    ResetToken = generate_stateless_reset_token(NewCID, State),
+
+    %% Create entry
+    NewEntry = #cid_entry{
+        seq_num = NextSeqNum,
+        cid = NewCID,
+        stateless_reset_token = ResetToken,
+        status = active
+    },
+
+    %% Send NEW_CONNECTION_ID frame
+    Frame = {new_connection_id, NextSeqNum, 0, NewCID, ResetToken},
+    State1 = send_frame(Frame, State),
+
+    %% Add to pool and continue
+    NewPool = [NewEntry | Pool],
+    issue_cids(N - 1, State1#state{local_cid_pool = NewPool}).
+
+%% @doc Generate a stateless reset token for a connection ID.
+%% RFC 9000 Section 10.3: Token must be unpredictable to peers.
+-spec generate_stateless_reset_token(binary(), #state{}) -> binary().
+generate_stateless_reset_token(CID, _State) ->
+    %% In a production implementation, this should use a consistent secret key
+    %% so tokens can be regenerated. For now, generate random token.
+    %% TODO: Use HKDF with a static secret for consistent token generation
+    crypto:hash(sha256, <<CID/binary, (crypto:strong_rand_bytes(16))/binary>>),
+    crypto:strong_rand_bytes(16).
+
+%% @doc Validate connection ID parameters from peer transport params.
+%% RFC 9000 Section 7.3: Endpoints MUST validate connection ID parameters.
+%% - initial_source_connection_id must match SCID in Initial packet
+%% - original_destination_connection_id (server only) must match original DCID
+%% - retry_source_connection_id (if Retry used) must match Retry packet SCID
+-spec validate_connection_id_params(map(), #state{}) -> ok | {error, term()}.
+validate_connection_id_params(TransportParams, #state{role = client} = State) ->
+    %% Client validates server's transport params
+    #state{
+        original_dcid = OriginalDCID,
+        dcid = CurrentDCID,
+        retry_received = RetryReceived,
+        retry_scid = RetrySCID
+    } = State,
+
+    %% Server must include original_destination_connection_id matching our original DCID
+    case maps:get(original_dcid, TransportParams, undefined) of
+        undefined ->
+            {error, missing_original_dcid};
+        OriginalDCID ->
+            %% Matches - continue validation
+            validate_initial_scid(TransportParams, CurrentDCID, RetryReceived, RetrySCID);
+        Other ->
+            {error, {original_dcid_mismatch, expected, OriginalDCID, got, Other}}
+    end;
+validate_connection_id_params(TransportParams, #state{role = server} = State) ->
+    %% Server validates client's transport params
+    #state{dcid = ClientSCID} = State,
+
+    %% Client must include initial_source_connection_id matching their SCID
+    case maps:get(initial_scid, TransportParams, undefined) of
+        undefined ->
+            {error, missing_initial_scid};
+        ClientSCID ->
+            ok;
+        Other ->
+            {error, {initial_scid_mismatch, expected, ClientSCID, got, Other}}
+    end.
+
+%% Helper to validate initial_scid and retry_scid for client
+validate_initial_scid(TransportParams, CurrentDCID, RetryReceived, RetrySCID) ->
+    %% Server's initial_source_connection_id must match current DCID
+    case maps:get(initial_scid, TransportParams, undefined) of
+        undefined ->
+            {error, missing_initial_scid};
+        CurrentDCID ->
+            %% Matches - check retry_scid if Retry was used
+            validate_retry_scid(TransportParams, RetryReceived, RetrySCID);
+        Other ->
+            {error, {initial_scid_mismatch, expected, CurrentDCID, got, Other}}
+    end.
+
+validate_retry_scid(_TransportParams, false, _RetrySCID) ->
+    %% No Retry received - server MUST NOT include retry_source_connection_id
+    ok;
+validate_retry_scid(TransportParams, true, RetrySCID) ->
+    %% Retry was received - server MUST include matching retry_source_connection_id
+    case maps:get(retry_scid, TransportParams, undefined) of
+        undefined ->
+            {error, missing_retry_scid_after_retry};
+        RetrySCID ->
+            ok;
+        Other ->
+            {error, {retry_scid_mismatch, expected, RetrySCID, got, Other}}
+    end.
 
 %% @doc Apply peer transport parameters to connection state.
 %% Extracts flow control limits, stream limits, and CID limit from peer's transport params.
 %% RFC 9000 Section 7.4: Transport parameters are applied after the handshake completes.
+%% RFC 9000 Section 7.3: Validates connection ID parameters before applying.
 apply_peer_transport_params(TransportParams, State) ->
+    case validate_connection_id_params(TransportParams, State) of
+        ok ->
+            apply_peer_transport_params_internal(TransportParams, State);
+        {error, Reason} ->
+            ?LOG_ERROR(
+                #{what => connection_id_validation_failed, reason => Reason}, ?QUIC_LOG_META
+            ),
+            State#state{close_reason = {transport_parameter_error, Reason}}
+    end.
+
+%% Internal function to apply transport params after CID validation passes
+apply_peer_transport_params_internal(TransportParams, State) ->
     %% Extract peer's active_connection_id_limit (default: 2 per RFC 9000)
     PeerCIDLimit = maps:get(active_connection_id_limit, TransportParams, 2),
 
@@ -6458,6 +6851,7 @@ encode_pmtu_frames(Frames) ->
 %% @doc Set the PMTU probe timeout timer.
 %% Uses 5x smoothed RTT as probe timeout (quic-go pattern).
 %% This is more responsive than 5x PTO and follows quic-go's approach.
+%% Uses unique reference in message to detect stale timer events
 -spec set_pmtu_probe_timer(#state{}) -> #state{}.
 set_pmtu_probe_timer(#state{pmtu_probe_timer = OldTimer, loss_state = LossState} = State) ->
     cancel_timer(OldTimer),
@@ -6471,14 +6865,17 @@ set_pmtu_probe_timer(#state{pmtu_probe_timer = OldTimer, loss_state = LossState}
                 SRTT = quic_loss:smoothed_rtt(LossState),
                 max(1000, 5 * SRTT)
         end,
-    TimerRef = erlang:send_after(Timeout, self(), pmtu_probe_timeout),
-    State#state{pmtu_probe_timer = TimerRef}.
+    Ref = make_ref(),
+    erlang:send_after(Timeout, self(), {pmtu_probe_timeout, Ref}),
+    State#state{pmtu_probe_timer = Ref}.
 
 %% @doc Set the PMTU raise timer for periodic re-probing.
+%% Uses unique reference in message to detect stale timer events
 -spec maybe_set_pmtu_raise_timer(#state{}) -> #state{}.
 maybe_set_pmtu_raise_timer(#state{pmtu_raise_timer = undefined} = State) ->
-    TimerRef = erlang:send_after(?PMTU_DEFAULT_RAISE_INTERVAL, self(), pmtu_raise_timeout),
-    State#state{pmtu_raise_timer = TimerRef};
+    Ref = make_ref(),
+    erlang:send_after(?PMTU_DEFAULT_RAISE_INTERVAL, self(), {pmtu_raise_timeout, Ref}),
+    State#state{pmtu_raise_timer = Ref};
 maybe_set_pmtu_raise_timer(State) ->
     State.
 
