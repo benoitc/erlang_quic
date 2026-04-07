@@ -60,7 +60,8 @@
     sent_packets/1,
     bytes_in_flight/1,
     pto_count/1,
-    oldest_unacked/1
+    oldest_unacked/1,
+    has_rtt_sample/1
 ]).
 
 %% Constants from RFC 9002
@@ -475,6 +476,11 @@ oldest_unacked(#loss_state{oldest_unacked_pn = PN, sent_packets = Sent}) ->
         undefined -> none;
         Packet -> {ok, Packet}
     end.
+
+%% @doc Check if we have received a real RTT sample.
+%% Returns false until the first ACK provides a real RTT measurement.
+-spec has_rtt_sample(loss_state()) -> boolean().
+has_rtt_sample(#loss_state{first_rtt_sample = HasSample}) -> HasSample.
 
 %%====================================================================
 %% Internal Functions

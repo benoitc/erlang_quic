@@ -29,6 +29,7 @@
 -behaviour(quic_cc).
 
 -include_lib("kernel/include/logger.hrl").
+
 -define(QUIC_LOG_META, #{domain => [erlang_quic, congestion_control]}).
 
 -export([
@@ -863,6 +864,16 @@ update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTT) when SmoothedRTT
     %% Formula: (cwnd * 1.25 * 1000) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
     %% Simplified: (cwnd * 5 * 250) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
     PacingRate = max(1, (Cwnd * 1250) div (SmoothedRTT * 1000)),
+
+    ?LOG_DEBUG(
+        #{
+            what => pacing_rate_updated,
+            cwnd => Cwnd,
+            smoothed_rtt_ms => SmoothedRTT,
+            new_pacing_rate => PacingRate
+        },
+        ?QUIC_LOG_META
+    ),
 
     %% Update HyStart++ RTT tracking
     State1 = update_hystart_rtt(State, SmoothedRTT),

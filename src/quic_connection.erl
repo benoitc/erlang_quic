@@ -1154,11 +1154,15 @@ idle({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = _} = St
     end;
 idle(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
-    check_state_transition(idle, NewState);
+    %% Flush batched packets (including ACKs) after processing incoming data
+    FlushedState = flush_socket_batch(NewState),
+    check_state_transition(idle, FlushedState);
 %% Server receives packets from listener
 idle(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
-    check_state_transition(idle, NewState);
+    %% Flush batched packets (including ACKs) after processing incoming data
+    FlushedState = flush_socket_batch(NewState),
+    check_state_transition(idle, FlushedState);
 idle(cast, process, #state{role = client, socket = Socket, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
     inet:setopts(Socket, [{active, N}]),
@@ -1225,11 +1229,15 @@ handshaking({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = 
     end;
 handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
-    check_state_transition(handshaking, NewState);
+    %% Flush batched packets (including ACKs) after processing incoming data
+    FlushedState = flush_socket_batch(NewState),
+    check_state_transition(handshaking, FlushedState);
 %% Server receives packets from listener
 handshaking(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
-    check_state_transition(handshaking, NewState);
+    %% Flush batched packets (including ACKs) after processing incoming data
+    FlushedState = flush_socket_batch(NewState),
+    check_state_transition(handshaking, FlushedState);
 handshaking(cast, process, #state{role = client, socket = Socket, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
     inet:setopts(Socket, [{active, N}]),
@@ -1471,11 +1479,15 @@ connected({call, From}, migrate, #state{socket = Socket, remote_addr = RemoteAdd
     end;
 connected(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
-    check_state_transition(connected, NewState);
+    %% Flush batched packets (including ACKs) after processing incoming data
+    FlushedState = flush_socket_batch(NewState),
+    check_state_transition(connected, FlushedState);
 %% Server receives packets from listener
 connected(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
-    check_state_transition(connected, NewState);
+    %% Flush batched packets (including ACKs) after processing incoming data
+    FlushedState = flush_socket_batch(NewState),
+    check_state_transition(connected, FlushedState);
 connected(cast, {close, Reason}, State) ->
     State1 = initiate_close(Reason, State),
     NewState = flush_socket_batch(State1),
@@ -3065,8 +3077,15 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     CCState5 = check_persistent_congestion(LostPackets, NewLossState, CCState4),
 
                     %% Update pacing rate based on new RTT estimate (RFC 9002 Section 7.7)
-                    SmoothedRTT = quic_loss:smoothed_rtt(NewLossState),
-                    CCState6 = quic_cc:update_pacing_rate(CCState5, SmoothedRTT),
+                    %% Only update pacing when we have a real RTT sample to avoid
+                    %% using the default 100ms RTT which causes excessive pacing delays
+                    CCState6 = case quic_loss:has_rtt_sample(NewLossState) of
+                        true ->
+                            SmoothedRTT = quic_loss:smoothed_rtt(NewLossState),
+                            quic_cc:update_pacing_rate(CCState5, SmoothedRTT);
+                        false ->
+                            CCState5
+                    end,
 
                     State1 = State#state{
                         loss_state = NewLossState,
@@ -3168,6 +3187,16 @@ process_frame(Level, {max_data, _}, State) when Level =/= app ->
 process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, #stream_state{send_max_data = Current} = Stream} ->
+            ?LOG_DEBUG(
+                #{
+                    what => received_max_stream_data,
+                    stream_id => StreamId,
+                    new_limit => MaxData,
+                    current_limit => Current,
+                    will_update => MaxData > Current
+                },
+                ?QUIC_LOG_META
+            ),
             case MaxData > Current of
                 true ->
                     NewStream = Stream#stream_state{send_max_data = MaxData},
@@ -3181,6 +3210,14 @@ process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Stream
                     State
             end;
         error ->
+            ?LOG_DEBUG(
+                #{
+                    what => received_max_stream_data_unknown_stream,
+                    stream_id => StreamId,
+                    new_limit => MaxData
+                },
+                ?QUIC_LOG_META
+            ),
             State
     end;
 process_frame(Level, {max_stream_data, _, _}, State) when Level =/= app ->
@@ -4011,6 +4048,15 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                 %% Use peer's limits for streams they initiate
                 InitSendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
                 InitRecvMaxData = get_local_recv_limit(bidi_peer_initiated, State),
+                ?LOG_DEBUG(
+                    #{
+                        what => stream_created_peer_initiated,
+                        stream_id => StreamId,
+                        init_send_max_data => InitSendMaxData,
+                        init_recv_max_data => InitRecvMaxData
+                    },
+                    ?QUIC_LOG_META
+                ),
                 #stream_state{
                     id = StreamId,
                     state = open,
@@ -4190,8 +4236,21 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                     %% Check if we need to send MAX_STREAM_DATA to allow more data
                     %% Send when we've consumed more than half our advertised limit
                     %% RTT-based auto-tuning: double if fast consumption, linear if slow
+                    Threshold = RecvMaxData div 2,
+                    WillSendMaxStreamData = NewRecvOffset > Threshold,
+                    ?LOG_DEBUG(
+                        #{
+                            what => max_stream_data_check,
+                            stream_id => StreamId,
+                            recv_offset => NewRecvOffset,
+                            recv_max_data => RecvMaxData,
+                            threshold => Threshold,
+                            will_send => WillSendMaxStreamData
+                        },
+                        ?QUIC_LOG_META
+                    ),
                     State2 =
-                        case NewRecvOffset > (RecvMaxData div 2) of
+                        case WillSendMaxStreamData of
                             true ->
                                 Now = erlang:monotonic_time(millisecond),
                                 SmoothedRTT = quic_loss:smoothed_rtt(State1#state.loss_state),
@@ -4733,6 +4792,15 @@ do_open_stream(
             %% Get peer's limit for streams WE initiate (bidi_remote from their perspective)
             SendMaxData = get_peer_stream_limit(bidi_local_initiated, State),
             RecvMaxData = get_local_recv_limit(bidi_local_initiated, State),
+            ?LOG_DEBUG(
+                #{
+                    what => stream_created_local_initiated,
+                    stream_id => NextId,
+                    send_max_data => SendMaxData,
+                    recv_max_data => RecvMaxData
+                },
+                ?QUIC_LOG_META
+            ),
             StreamState = #stream_state{
                 id = NextId,
                 state = open,
@@ -4826,26 +4894,41 @@ get_max_stream_data_per_packet(#state{pmtu_state = PMTUState}) ->
 %% - bidi_peer_initiated: Bidi stream peer opened, use peer's initial_max_stream_data_bidi_local
 %% - uni_local_initiated: Uni stream we opened, use peer's initial_max_stream_data_uni
 get_peer_stream_limit(StreamType, #state{transport_params = TP}) ->
-    case StreamType of
-        bidi_local_initiated ->
-            maps:get(
-                peer_max_stream_data_bidi_remote,
-                TP,
-                maps:get(initial_max_stream_data_bidi_remote, TP, ?DEFAULT_INITIAL_MAX_STREAM_DATA)
-            );
-        bidi_peer_initiated ->
-            maps:get(
-                peer_max_stream_data_bidi_local,
-                TP,
-                maps:get(initial_max_stream_data_bidi_local, TP, ?DEFAULT_INITIAL_MAX_STREAM_DATA)
-            );
-        uni_local_initiated ->
-            maps:get(
-                peer_max_stream_data_uni,
-                TP,
-                maps:get(initial_max_stream_data_uni, TP, ?DEFAULT_INITIAL_MAX_STREAM_DATA)
-            )
-    end.
+    Result =
+        case StreamType of
+            bidi_local_initiated ->
+                maps:get(
+                    peer_max_stream_data_bidi_remote,
+                    TP,
+                    maps:get(
+                        initial_max_stream_data_bidi_remote, TP, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+                    )
+                );
+            bidi_peer_initiated ->
+                maps:get(
+                    peer_max_stream_data_bidi_local,
+                    TP,
+                    maps:get(
+                        initial_max_stream_data_bidi_local, TP, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+                    )
+                );
+            uni_local_initiated ->
+                maps:get(
+                    peer_max_stream_data_uni,
+                    TP,
+                    maps:get(initial_max_stream_data_uni, TP, ?DEFAULT_INITIAL_MAX_STREAM_DATA)
+                )
+        end,
+    ?LOG_DEBUG(
+        #{
+            what => get_peer_stream_limit,
+            stream_type => StreamType,
+            result => Result,
+            tp_keys => maps:keys(TP)
+        },
+        ?QUIC_LOG_META
+    ),
+    Result.
 
 %% Get our local receive limit for a stream (what we advertised to peer)
 %% - bidi_local_initiated: Bidi stream we opened, use our max_stream_data_bidi_remote
@@ -4921,7 +5004,21 @@ do_send_data(
                     %% Check stream-level flow control
                     StreamAllowed = SendMaxData - Offset,
 
-                    %% Log flow control status
+                    %% Log flow control status for debugging
+                    ?LOG_DEBUG(
+                        #{
+                            what => send_data_flow_check,
+                            stream_id => StreamId,
+                            data_size => DataSize,
+                            offset => Offset,
+                            send_max_data => SendMaxData,
+                            stream_allowed => StreamAllowed,
+                            max_data_remote => MaxDataRemote,
+                            data_sent => DataSent,
+                            connection_allowed => ConnectionAllowed
+                        },
+                        ?QUIC_LOG_META
+                    ),
 
                     case {DataSize =< ConnectionAllowed, DataSize =< StreamAllowed} of
                         {false, _} ->
@@ -6731,6 +6828,18 @@ apply_peer_transport_params_internal(TransportParams, State) ->
         initial_max_stream_data_uni,
         TransportParams,
         ?DEFAULT_INITIAL_MAX_STREAM_DATA
+    ),
+
+    ?LOG_DEBUG(
+        #{
+            what => apply_peer_transport_params,
+            max_data_remote => MaxDataRemote,
+            max_stream_data_bidi_remote => MaxStreamDataBidiRemote,
+            max_stream_data_bidi_local => MaxStreamDataBidiLocal,
+            max_stream_data_uni => MaxStreamDataUni,
+            raw_params => TransportParams
+        },
+        ?QUIC_LOG_META
     ),
 
     %% Extract stream limits: how many streams WE can open
