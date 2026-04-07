@@ -369,6 +369,11 @@
     pmtu_probe_timer :: reference() | undefined,
     pmtu_raise_timer :: reference() | undefined,
 
+    %% Timer batching dirty flags (reduce timer operations per packet)
+    %% These are flushed after batch boundaries via flush_dirty_timers/1
+    timer_dirty = false :: boolean(),
+    pto_dirty = false :: boolean(),
+
     %% QLOG Tracing (draft-ietf-quic-qlog-quic-events)
     qlog_ctx :: #qlog_ctx{} | undefined
 }).
@@ -701,10 +706,9 @@ init({server, Opts}) ->
     %% Each server connection opens its own SO_REUSEPORT socket for sending,
     %% which allows full batching support without conflicting with other connections.
     %% The listener's socket is still used for DCID routing and reference.
+    %% Default: batching enabled (#{}) for throughput parity with client connections.
     {SendSocket, SocketState} =
-        case maps:get(batching, Opts, undefined) of
-            undefined ->
-                {undefined, undefined};
+        case maps:get(batching, Opts, #{}) of
             #{enabled := false} ->
                 {undefined, undefined};
             BatchOpts when is_map(BatchOpts) ->
@@ -1154,14 +1158,14 @@ idle({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = _} = St
     end;
 idle(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
-    %% Flush batched packets (including ACKs) after processing incoming data
-    FlushedState = flush_socket_batch(NewState),
+    %% Flush batched packets and timers after processing incoming data
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(idle, FlushedState);
 %% Server receives packets from listener
 idle(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
-    %% Flush batched packets (including ACKs) after processing incoming data
-    FlushedState = flush_socket_batch(NewState),
+    %% Flush batched packets and timers after processing incoming data
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(idle, FlushedState);
 idle(cast, process, #state{role = client, socket = Socket, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
@@ -1229,14 +1233,14 @@ handshaking({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = 
     end;
 handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
-    %% Flush batched packets (including ACKs) after processing incoming data
-    FlushedState = flush_socket_batch(NewState),
+    %% Flush batched packets and timers after processing incoming data
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(handshaking, FlushedState);
 %% Server receives packets from listener
 handshaking(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
-    %% Flush batched packets (including ACKs) after processing incoming data
-    FlushedState = flush_socket_batch(NewState),
+    %% Flush batched packets and timers after processing incoming data
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(handshaking, FlushedState);
 handshaking(cast, process, #state{role = client, socket = Socket, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
@@ -1321,8 +1325,8 @@ connected(cast, {set_owner, NewOwner}, State) ->
 connected({call, From}, {send_datagram, Data}, State) ->
     case do_send_datagram(Data, State) of
         {ok, NewState} ->
-            %% Event-driven flush: flush batch after user API call
-            FlushedState = flush_socket_batch(NewState),
+            %% Event-driven flush: flush batch and timers after user API call
+            FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
             {keep_state, FlushedState, [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
@@ -1330,8 +1334,8 @@ connected({call, From}, {send_datagram, Data}, State) ->
 connected({call, From}, {send_data, StreamId, Data, Fin}, State) ->
     case do_send_data(StreamId, Data, Fin, State) of
         {ok, NewState} ->
-            %% Event-driven flush: flush batch after user API call
-            FlushedState = flush_socket_batch(NewState),
+            %% Event-driven flush: flush batch and timers after user API call
+            FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
             {keep_state, FlushedState, [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
@@ -1479,25 +1483,25 @@ connected({call, From}, migrate, #state{socket = Socket, remote_addr = RemoteAdd
     end;
 connected(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
-    %% Flush batched packets (including ACKs) after processing incoming data
-    FlushedState = flush_socket_batch(NewState),
+    %% Flush batched packets and timers after processing incoming data
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(connected, FlushedState);
 %% Server receives packets from listener
 connected(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
-    %% Flush batched packets (including ACKs) after processing incoming data
-    FlushedState = flush_socket_batch(NewState),
+    %% Flush batched packets and timers after processing incoming data
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(connected, FlushedState);
 connected(cast, {close, Reason}, State) ->
     State1 = initiate_close(Reason, State),
-    NewState = flush_socket_batch(State1),
+    NewState = flush_dirty_timers(flush_socket_batch(State1)),
     {next_state, draining, NewState};
 %% Async send data - fire-and-forget for high throughput
 connected(cast, {send_data_async, StreamId, Data, Fin}, State) ->
     case do_send_data(StreamId, Data, Fin, State) of
         {ok, NewState} ->
-            %% Event-driven flush: flush batch after user API call
-            FlushedState = flush_socket_batch(NewState),
+            %% Event-driven flush: flush batch and timers after user API call
+            FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
             {keep_state, FlushedState};
         {error, _Reason} ->
             %% Silently drop errors in async mode
@@ -1517,7 +1521,7 @@ connected(info, {send_delayed_ack, app, Ref}, State) ->
         Ref when Ref =/= undefined ->
             erase(ack_timer),
             State1 = send_app_ack(State),
-            NewState = flush_socket_batch(State1),
+            NewState = flush_dirty_timers(flush_socket_batch(State1)),
             {keep_state, NewState};
         _ ->
             %% Stale timer - ignore
@@ -1668,7 +1672,7 @@ handle_common_event(
 ->
     %% Send keep-alive PING and reset timer
     State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
-    State2 = flush_socket_batch(State1),
+    State2 = flush_dirty_timers(flush_socket_batch(State1)),
     {keep_state, set_keep_alive_timer(State2)};
 handle_common_event(info, {keep_alive_timeout, _StaleRef}, _StateName, State) ->
     %% Ignore stale keep-alive timer (ref doesn't match or wrong state)
@@ -1789,9 +1793,9 @@ send_client_hello(State) ->
             end
     }),
 
-    %% Event-driven flush: flush batch after sending ClientHello
+    %% Event-driven flush: flush batch and timers after sending ClientHello
     %% Critical for handshake - must send immediately
-    FlushedState = flush_socket_batch(NewState),
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
 
     %% Enable socket for receiving (use {active, N} for better throughput)
     inet:setopts(FlushedState#state.socket, [{active, FlushedState#state.active_n}]),
@@ -2267,8 +2271,8 @@ maybe_coalesce_ack_with_data(AckFrameTuple, State) ->
 -define(SMALL_FRAME_THRESHOLD, 500).
 dequeue_small_stream_frame_tuple(#state{send_queue = PQ} = State) ->
     case pqueue_peek(PQ) of
-        {value, {stream_data, StreamId, Offset, Data, Fin}} when
-            byte_size(Data) < ?SMALL_FRAME_THRESHOLD
+        {value, {stream_data, StreamId, Offset, Data, Fin, DataSize}} when
+            DataSize < ?SMALL_FRAME_THRESHOLD
         ->
             %% Remove from queue and return frame tuple (not encoded)
             {{value, _}, NewPQ} = pqueue_out(PQ),
@@ -2481,8 +2485,8 @@ send_app_packet_internal(Payload, Frames, State) ->
             %% This prevents idle timeout during long one-way transfers
             State2 = update_last_activity(State1),
 
-            %% Set PTO timer for retransmission
-            set_pto_timer(State2);
+            %% Mark PTO dirty for batched timer reset (actual reset at flush)
+            mark_pto_dirty(State2);
         {error, Reason} ->
             %% Send failed - do NOT track packet as sent to avoid CC/loss inconsistency
             %% The data will be re-sent via the PTO timeout mechanism
@@ -3079,13 +3083,14 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% Update pacing rate based on new RTT estimate (RFC 9002 Section 7.7)
                     %% Only update pacing when we have a real RTT sample to avoid
                     %% using the default 100ms RTT which causes excessive pacing delays
-                    CCState6 = case quic_loss:has_rtt_sample(NewLossState) of
-                        true ->
-                            SmoothedRTT = quic_loss:smoothed_rtt(NewLossState),
-                            quic_cc:update_pacing_rate(CCState5, SmoothedRTT);
-                        false ->
-                            CCState5
-                    end,
+                    CCState6 =
+                        case quic_loss:has_rtt_sample(NewLossState) of
+                            true ->
+                                SmoothedRTT = quic_loss:smoothed_rtt(NewLossState),
+                                quic_cc:update_pacing_rate(CCState5, SmoothedRTT);
+                            false ->
+                                CCState5
+                        end,
 
                     State1 = State#state{
                         loss_state = NewLossState,
@@ -3141,8 +3146,8 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
 
                     %% Try to send queued data now that cwnd may have freed up
                     State6 = process_send_queue(State5),
-                    %% Event-driven flush: flush batch after ACK processing
-                    flush_socket_batch(State6)
+                    %% Event-driven flush: flush batch and timers after ACK processing
+                    flush_dirty_timers(flush_socket_batch(State6))
                 %% close inner case (on_ack_received)
             end
         %% close outer case (Ranges)
@@ -3172,8 +3177,8 @@ process_frame(app, {max_data, MaxData}, #state{max_data_remote = Current} = Stat
             %% Limit increased - try to drain queued data
             State1 = State#state{max_data_remote = MaxData},
             State2 = process_send_queue(State1),
-            %% Event-driven flush: flush batch after flow control opens
-            flush_socket_batch(State2);
+            %% Event-driven flush: flush batch and timers after flow control opens
+            flush_dirty_timers(flush_socket_batch(State2));
         false ->
             %% Monotonic: ignore if not increasing (per RFC 9000)
             State
@@ -3203,8 +3208,8 @@ process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Stream
                     State1 = State#state{streams = maps:put(StreamId, NewStream, Streams)},
                     %% Limit increased - try to drain queued data
                     State2 = process_send_queue(State1),
-                    %% Event-driven flush: flush batch after stream flow control opens
-                    flush_socket_batch(State2);
+                    %% Event-driven flush: flush batch and timers after stream flow control opens
+                    flush_dirty_timers(flush_socket_batch(State2));
                 false ->
                     %% Monotonic: ignore if not increasing
                     State
@@ -3422,16 +3427,16 @@ process_frame(_Level, _Frame, State) ->
 %% Returns {NewPQ, RemovedBytes} to allow adjusting send_queue_bytes
 remove_stream_from_queue(StreamId, PQ) ->
     %% Filter out entries for this stream from all 8 priority buckets
-    %% Queue entries are 5-tuples: {stream_data, StreamId, Offset, Data, Fin}
+    %% Queue entries are 6-tuples: {stream_data, StreamId, Offset, Data, Fin, DataSize}
     {NewQueues, RemovedBytes} =
         lists:foldl(
             fun(I, {Queues, Bytes}) ->
                 Q = element(I, PQ),
-                %% Calculate bytes to remove before filtering
+                %% Calculate bytes to remove before filtering (use cached DataSize)
                 BytesToRemove = queue:fold(
-                    fun({stream_data, SId, _, Data, _}, Acc) ->
+                    fun({stream_data, SId, _, _Data, _, DataSize}, Acc) ->
                         case SId of
-                            StreamId -> Acc + byte_size(Data);
+                            StreamId -> Acc + DataSize;
                             _ -> Acc
                         end
                     end,
@@ -3440,7 +3445,7 @@ remove_stream_from_queue(StreamId, PQ) ->
                 ),
                 %% Filter to keep only other streams
                 Kept = queue:filter(
-                    fun({stream_data, SId, _, _, _}) -> SId =/= StreamId end, Q
+                    fun({stream_data, SId, _, _, _, _}) -> SId =/= StreamId end, Q
                 ),
                 {[Kept | Queues], Bytes + BytesToRemove}
             end,
@@ -4355,19 +4360,20 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
 
 %% Extract contiguous data from buffer starting at Offset
 %% Returns {Data, NewOffset, UpdatedBuffer}
+%% Uses binary append accumulator - O(1) amortized due to refc binary optimization
 extract_contiguous_data(Buffer, Offset) ->
-    extract_contiguous_data(Buffer, Offset, []).
+    extract_contiguous_data(Buffer, Offset, <<>>).
 
 extract_contiguous_data(Buffer, Offset, Acc) ->
     case maps:take(Offset, Buffer) of
         {Data, NewBuffer} ->
             %% Found data at this offset, continue looking for next chunk
+            %% Binary append is O(1) amortized due to Erlang's pre-allocation
             NextOffset = Offset + byte_size(Data),
-            extract_contiguous_data(NewBuffer, NextOffset, [Data | Acc]);
+            extract_contiguous_data(NewBuffer, NextOffset, <<Acc/binary, Data/binary>>);
         error ->
             %% No data at this offset (gap in stream)
-            DeliveredData = iolist_to_binary(lists:reverse(Acc)),
-            {DeliveredData, Offset, Buffer}
+            {Acc, Offset, Buffer}
     end.
 
 %% Get the maximum stream receive window across all streams.
@@ -4759,11 +4765,41 @@ merge_ack_ranges([{S1, E1}, {S2, E2} | Rest]) when E2 + 1 >= S1 ->
 merge_ack_ranges(Ranges) ->
     Ranges.
 
-%% Update last activity timestamp and reset idle/keep-alive timers
+%% Update last activity timestamp with dirty flag (batched timer reset)
+%% The actual timer reset happens in flush_dirty_timers/1 at batch boundaries
 update_last_activity(State) ->
-    State1 = State#state{last_activity = erlang:monotonic_time(millisecond)},
-    State2 = set_idle_timer(State1),
-    set_keep_alive_timer(State2).
+    mark_activity_dirty(State).
+
+%% Mark activity dirty - defers timer reset until batch flush
+mark_activity_dirty(State) ->
+    State#state{
+        last_activity = erlang:monotonic_time(millisecond),
+        timer_dirty = true
+    }.
+
+%% Mark PTO dirty - defers PTO timer reset until batch flush
+mark_pto_dirty(State) ->
+    State#state{pto_dirty = true}.
+
+%% Flush dirty timers at batch boundaries
+%% This batches multiple timer operations into a single reset per batch
+flush_dirty_timers(#state{timer_dirty = false, pto_dirty = false} = State) ->
+    State;
+flush_dirty_timers(State) ->
+    State1 =
+        case State#state.timer_dirty of
+            true ->
+                S1 = set_idle_timer(State),
+                set_keep_alive_timer(S1#state{timer_dirty = false});
+            false ->
+                State
+        end,
+    case State1#state.pto_dirty of
+        true ->
+            set_pto_timer(State1#state{pto_dirty = false});
+        false ->
+            State1
+    end.
 
 %% Open a new stream
 %% Stream ID patterns: Bit 0=initiator (0=client, 1=server), Bit 1=type (0=bidi, 1=uni)
@@ -5365,6 +5401,8 @@ send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunk
 %% Queue stream data when congestion window is full
 %% Uses bucket-based priority queue for O(1) insert (RFC 9218)
 %% Returns {ok, State} | {error, send_queue_full} if queue limit exceeded
+%% Entry format: {stream_data, StreamId, Offset, Data, Fin, DataSize}
+%% DataSize is cached to avoid repeated iolist_size calls
 queue_stream_data(
     StreamId,
     Offset,
@@ -5394,7 +5432,8 @@ queue_stream_data(
             {error, send_queue_full};
         false ->
             Urgency = get_stream_urgency(StreamId, Streams),
-            Entry = {stream_data, StreamId, Offset, Data, Fin},
+            %% Cache DataSize in entry to avoid repeated iolist_size calls
+            Entry = {stream_data, StreamId, Offset, Data, Fin, DataSize},
             NewPQ = pqueue_in(Entry, Urgency, PQ),
             NewVersion = Version + 1,
             {ok, State#state{
@@ -5419,11 +5458,11 @@ process_send_queue(#state{send_queue = PQ} = State) ->
     case pqueue_peek(PQ) of
         empty ->
             State;
-        {value, {stream_data, StreamId, Offset, Data, _Fin}} ->
+        {value, {stream_data, StreamId, Offset, _Data, _Fin, DataSize}} ->
             %% Check flow control BEFORE dequeuing
             %% Use the Offset stored in the queue entry, not stream.send_offset,
             %% because send_offset may have advanced past this queued data's position.
-            DataSize = byte_size(Data),
+            %% DataSize is cached in entry to avoid repeated iolist_size calls.
             case check_send_queue_flow_control(StreamId, Offset, DataSize, State) of
                 ok ->
                     %% Flow control allows - dequeue and try to send
@@ -5472,10 +5511,9 @@ process_send_queue_entry(
     case pqueue_out(PQ) of
         {empty, _} ->
             State;
-        {{value, {stream_data, StreamId, Offset, Data, Fin}}, NewPQ} ->
-            %% Decrement queue bytes for dequeued data
+        {{value, {stream_data, StreamId, Offset, Data, Fin, DataSize}}, NewPQ} ->
+            %% Decrement queue bytes for dequeued data (DataSize cached in entry)
             %% (if data is re-queued, queue_stream_data will increment appropriately)
-            DataSize = iolist_size(Data),
             DecrementedQueueBytes = max(0, QueueBytes - DataSize),
             State1 = State#state{send_queue = NewPQ, send_queue_bytes = DecrementedQueueBytes},
             case send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State1) of
@@ -5903,8 +5941,8 @@ handle_pto_timeout(#state{loss_state = LossState} = State) ->
     %% Send probe packet (retransmit oldest unacked or send PING)
     State2 = send_probe_packet(State1),
 
-    %% Flush immediately - probe packets must not be batched
-    State3 = flush_socket_batch(State2),
+    %% Flush immediately - probe packets and timers must not be batched
+    State3 = flush_dirty_timers(flush_socket_batch(State2)),
 
     %% Set new PTO timer
     set_pto_timer(State3).
@@ -5980,8 +6018,8 @@ handle_pacing_timeout(#state{send_queue = PQ} = State) ->
             State1 = process_send_queue(State),
             %% If there's still queued data and pacing is blocking, set another timer
             State2 = maybe_reschedule_pacing(State1),
-            %% Event-driven flush: flush batch after pacing timeout processing
-            flush_socket_batch(State2)
+            %% Event-driven flush: flush batch and timers after pacing timeout processing
+            flush_dirty_timers(flush_socket_batch(State2))
     end.
 
 %% Check if we need to reschedule pacing timer after processing queue
