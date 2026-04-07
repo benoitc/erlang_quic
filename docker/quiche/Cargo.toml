@@ -1,0 +1,11 @@
+[package]
+name = "quiche-bench-server"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+quiche = "0.23"
+ring = "0.17"
+log = "0.4"
+env_logger = "0.11"
+mio = { version = "1.0", features = ["net", "os-poll"] }
