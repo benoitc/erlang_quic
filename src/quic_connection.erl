@@ -703,22 +703,22 @@ init({server, Opts}) ->
         end,
 
     %% Initialize send socket and batching for server connections.
-    %% Each server connection opens its own SO_REUSEPORT socket for sending,
-    %% which allows full batching support without conflicting with other connections.
-    %% The listener's socket is still used for DCID routing and reference.
+    %% Uses quic_socket:open_server_send/2 which:
+    %% - Opens OTP socket with GSO support on Linux (not gen_udp)
+    %% - Binds to same local port with reuseport
+    %% - Enables sendmsg-based batching for high throughput
     %% Default: batching enabled (#{}) for throughput parity with client connections.
-    {SendSocket, SocketState} =
+    SocketState =
         case maps:get(batching, Opts, #{}) of
             #{enabled := false} ->
-                {undefined, undefined};
+                undefined;
             BatchOpts when is_map(BatchOpts) ->
-                case open_send_socket(LocalAddr) of
-                    {ok, SS} ->
-                        {ok, SSState} = quic_socket:wrap(SS, #{batching => BatchOpts}),
-                        {SS, SSState};
+                case quic_socket:open_server_send(LocalAddr, #{batching => BatchOpts}) of
+                    {ok, SSState} ->
+                        SSState;
                     {error, _Reason} ->
                         %% Fall back to direct sends without batching
-                        {undefined, undefined}
+                        undefined
                 end
         end,
 
@@ -732,7 +732,8 @@ init({server, Opts}) ->
         % Use client's QUIC version
         version = Version,
         socket = Socket,
-        send_socket = SendSocket,
+        %% send_socket is undefined - socket is in socket_state
+        send_socket = undefined,
         socket_state = SocketState,
         remote_addr = RemoteAddr,
         local_addr = LocalAddr,
@@ -4385,38 +4386,6 @@ get_max_stream_recv_window(#state{fc_max_stream_recv_window = CachedMax}) ->
 %%====================================================================
 %% Internal Functions - Helpers
 %%====================================================================
-
-%% Open a dedicated send socket for server connections using SO_REUSEPORT.
-%% This allows each server connection to have its own batching state without
-%% conflicting with other connections sharing the same listener port.
-%% Returns {ok, Socket} or {error, Reason}.
-open_send_socket({LocalIP, LocalPort}) ->
-    %% Build socket options for SO_REUSEPORT
-    BaseOpts = [binary, {active, false}],
-    %% SO_REUSEPORT allows multiple sockets on the same IP:port
-    ReuseOpts =
-        case os:type() of
-            {unix, darwin} ->
-                %% macOS uses reuseport
-                [{reuseaddr, true}, {raw, 65535, 512, <<1:32/native>>}];
-            {unix, linux} ->
-                %% Linux uses reuseport via raw socket option
-                %% SOL_SOCKET = 1, SO_REUSEPORT = 15
-                [{reuseaddr, true}, {raw, 1, 15, <<1:32/native>>}];
-            _ ->
-                %% Fallback: just reuseaddr
-                [{reuseaddr, true}]
-        end,
-    IPOpt =
-        case LocalIP of
-            {_, _, _, _} -> [{ip, LocalIP}];
-            {_, _, _, _, _, _, _, _} -> [{ip, LocalIP}, inet6];
-            _ -> []
-        end,
-    Opts = BaseOpts ++ ReuseOpts ++ IPOpt,
-    gen_udp:open(LocalPort, Opts);
-open_send_socket(undefined) ->
-    {error, no_local_addr}.
 
 %% Send a packet via quic_socket (with batching) or gen_udp fallback.
 %% For client connections with socket_state, uses quic_socket batching.

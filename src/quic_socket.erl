@@ -40,6 +40,7 @@
 -export([
     open/2,
     open_for_send/2,
+    open_server_send/2,
     wrap/2,
     close/1,
     send/4,
@@ -165,6 +166,114 @@ open_for_send(RemoteIP, Opts) ->
                 max_batch => MaxBatch,
                 gso_size => GSOSize
             })
+    end.
+
+%% @doc Open a server send socket bound to a local address with reuseport.
+%% Uses OTP socket backend with GSO support on Linux for high throughput.
+%% This is for server connections that need to send from a specific local port.
+-spec open_server_send({inet:ip_address(), inet:port_number()}, map()) ->
+    {ok, socket_state()} | {error, term()}.
+open_server_send({LocalIP, LocalPort}, Opts) ->
+    Capabilities = detect_capabilities(),
+    Backend = maps:get(backend, Capabilities, gen_udp),
+    GSOSupported = maps:get(gso, Capabilities, false),
+
+    BatchOpts = maps:get(batching, Opts, #{}),
+    BatchingEnabled = maps:get(enabled, BatchOpts, true),
+    MaxBatch = maps:get(max_packets, BatchOpts, ?DEFAULT_MAX_BATCH_PACKETS),
+    GSOSize = maps:get(gso_size, BatchOpts, ?DEFAULT_GSO_SEGMENT_SIZE),
+
+    BatchConfig = #{
+        gso_supported => GSOSupported,
+        batching_enabled => BatchingEnabled,
+        max_batch => MaxBatch,
+        gso_size => GSOSize
+    },
+
+    case Backend of
+        socket ->
+            open_server_send_socket(LocalIP, LocalPort, Opts, BatchConfig);
+        gen_udp ->
+            open_server_send_genudp(LocalIP, LocalPort, Opts, BatchConfig)
+    end.
+
+%% Open OTP socket for server send with reuseport binding
+open_server_send_socket(LocalIP, LocalPort, Opts, BatchConfig) ->
+    Family = family(LocalIP),
+    case socket:open(Family, dgram, udp) of
+        {ok, Socket} ->
+            configure_server_send_socket(Socket, LocalIP, LocalPort, Family, Opts, BatchConfig);
+        {error, _} = Error ->
+            Error
+    end.
+
+configure_server_send_socket(Socket, LocalIP, LocalPort, Family, Opts, BatchConfig) ->
+    %% Set reuseaddr and reuseport for binding to same port as listener
+    ok = socket:setopt(Socket, {socket, reuseaddr}, true),
+    _ = set_reuseport(Socket),
+    set_socket_buffer_sizes(Socket, Opts),
+
+    %% Bind to local address
+    SockAddr = #{family => Family, addr => LocalIP, port => LocalPort},
+    case socket:bind(Socket, SockAddr) of
+        ok ->
+            GSOEnabled = maybe_enable_gso(Socket, BatchConfig),
+            State = #socket_state{
+                socket = Socket,
+                backend = socket,
+                owns_socket = true,
+                gso_supported = GSOEnabled,
+                gso_size = maps:get(gso_size, BatchConfig),
+                gro_enabled = false,
+                batching_enabled = maps:get(batching_enabled, BatchConfig),
+                max_batch_packets = maps:get(max_batch, BatchConfig)
+            },
+            {ok, State};
+        {error, _} = Error ->
+            socket:close(Socket),
+            Error
+    end.
+
+%% Set SO_REUSEPORT if available
+set_reuseport(Socket) ->
+    case os:type() of
+        {unix, linux} ->
+            %% Linux: SOL_SOCKET=1, SO_REUSEPORT=15
+            socket:setopt_native(Socket, {1, 15}, <<1:32/native>>);
+        {unix, darwin} ->
+            %% macOS: SOL_SOCKET=0xFFFF, SO_REUSEPORT=0x200
+            socket:setopt_native(Socket, {16#FFFF, 16#200}, <<1:32/native>>);
+        _ ->
+            {error, not_supported}
+    end.
+
+%% Fallback to gen_udp for server send (non-Linux platforms)
+open_server_send_genudp(LocalIP, LocalPort, Opts, BatchConfig) ->
+    RecBuf = maps:get(recbuf, Opts, ?DEFAULT_UDP_RECBUF),
+    SndBuf = maps:get(sndbuf, Opts, ?DEFAULT_UDP_SNDBUF),
+    ReuseOpts =
+        case os:type() of
+            {unix, darwin} ->
+                [{raw, 16#FFFF, 16#200, <<1:32/native>>}];
+            {unix, linux} ->
+                [{raw, 1, 15, <<1:32/native>>}];
+            _ ->
+                []
+        end,
+    SocketOpts =
+        [
+            binary,
+            {ip, LocalIP},
+            {active, false},
+            {reuseaddr, true},
+            {recbuf, RecBuf},
+            {sndbuf, SndBuf}
+        ] ++ ReuseOpts,
+    case gen_udp:open(LocalPort, SocketOpts) of
+        {ok, Socket} ->
+            {ok, build_genudp_state(Socket, BatchConfig)};
+        {error, _} = Error ->
+            Error
     end.
 
 %% @doc Get the underlying socket from a socket_state.
