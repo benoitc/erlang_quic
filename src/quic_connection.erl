@@ -288,6 +288,8 @@
 
     %% Send queue byte tracking (prevents memory exhaustion)
     send_queue_bytes = 0 :: non_neg_integer(),
+    %% Send queue version counter (for fast change detection)
+    send_queue_version = 0 :: non_neg_integer(),
 
     %% Receive buffer byte tracking (protects against malicious peers)
     recv_buffer_bytes = 0 :: non_neg_integer(),
@@ -4120,9 +4122,6 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                             <<"FIN final size mismatch">>},
                     send_frame(CloseFrame, State#state{close_reason = final_size_error});
                 false ->
-                    %% Store data in buffer (handles duplicates gracefully - overwrites)
-                    UpdatedBuffer = maps:put(Offset, Data, RecvBuffer),
-
                     %% Track FIN position if received
                     FinalSize =
                         case Fin of
@@ -4130,13 +4129,22 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                             false -> ExistingFinalSize
                         end,
 
-                    %% Extract contiguous data starting from recv_offset and deliver it
-                    {DeliverData, NewRecvOffset, NewBuffer} = extract_contiguous_data(
-                        UpdatedBuffer, CurrentOffset
-                    ),
-
-                    %% Determine if we should deliver FIN (all data up to FIN has been delivered)
-                    DeliverFin = FinalSize =/= undefined andalso NewRecvOffset >= FinalSize,
+                    %% Fast path: in-order delivery with empty buffer
+                    %% Avoids maps:put and extract_contiguous_data for common case
+                    {DeliverData, NewRecvOffset, NewBuffer, DeliverFin} =
+                        case Offset =:= CurrentOffset andalso map_size(RecvBuffer) =:= 0 of
+                            true ->
+                                %% In-order with empty buffer: deliver directly
+                                {Data, EndOffset, RecvBuffer, Fin};
+                            false ->
+                                %% Out-of-order or buffer has data: use buffer path
+                                UpdatedBuffer = maps:put(Offset, Data, RecvBuffer),
+                                {ExtractedData, ExtractedOffset, ExtractedBuffer} =
+                                    extract_contiguous_data(UpdatedBuffer, CurrentOffset),
+                                ExtractedFin =
+                                    FinalSize =/= undefined andalso ExtractedOffset >= FinalSize,
+                                {ExtractedData, ExtractedOffset, ExtractedBuffer, ExtractedFin}
+                        end,
 
                     %% Deliver contiguous data to owner
                     %% RFC 9000: Also deliver FIN-only notification when no data but FIN received
@@ -5265,7 +5273,12 @@ queue_stream_data(
     Offset,
     Data,
     Fin,
-    #state{send_queue = PQ, streams = Streams, send_queue_bytes = QueueBytes} = State
+    #state{
+        send_queue = PQ,
+        streams = Streams,
+        send_queue_bytes = QueueBytes,
+        send_queue_version = Version
+    } = State
 ) ->
     DataSize = iolist_size(Data),
     NewQueueBytes = QueueBytes + DataSize,
@@ -5286,7 +5299,12 @@ queue_stream_data(
             Urgency = get_stream_urgency(StreamId, Streams),
             Entry = {stream_data, StreamId, Offset, Data, Fin},
             NewPQ = pqueue_in(Entry, Urgency, PQ),
-            {ok, State#state{send_queue = NewPQ, send_queue_bytes = NewQueueBytes}}
+            NewVersion = Version + 1,
+            {ok, State#state{
+                send_queue = NewPQ,
+                send_queue_bytes = NewQueueBytes,
+                send_queue_version = NewVersion
+            }}
     end.
 
 %% Get stream urgency (default 3 if stream not found)
@@ -5393,7 +5411,10 @@ process_send_queue_entry(
                             State3;
                         false ->
                             %% Check if we just queued more data (cwnd full)
-                            case State3#state.send_queue =:= State1#state.send_queue of
+                            %% Use version counter for fast comparison (avoids structural equality on 8-tuple)
+                            case
+                                State3#state.send_queue_version =:= State1#state.send_queue_version
+                            of
                                 % Keep processing (check flow control again)
                                 true -> process_send_queue(State3);
                                 % New data queued, cwnd full
@@ -6189,21 +6210,26 @@ initiate_path_validation(RemoteAddr, State) ->
 %% This is used for path validation where the probe must go to the new path.
 %% Uses the same packet encoding as send_frame but sends to a different address.
 -spec send_path_challenge({inet:ip_address(), inet:port_number()}, binary(), #state{}) -> #state{}.
-send_path_challenge({IP, Port}, ChallengeData, #state{
-    socket = Socket,
-    dcid = DCID,
-    app_keys = AppKeys,
-    role = Role,
-    pn_app = PNSpace
-} = State) ->
+send_path_challenge(
+    {IP, Port},
+    ChallengeData,
+    #state{
+        socket = Socket,
+        dcid = DCID,
+        app_keys = AppKeys,
+        role = Role,
+        pn_app = PNSpace
+    } = State
+) ->
     %% Check we have app keys for encryption
     case AppKeys of
         {ClientKeys, ServerKeys} when ClientKeys =/= undefined, ServerKeys =/= undefined ->
             %% Select correct keys based on role
-            EncryptKeys = case Role of
-                client -> ClientKeys;
-                server -> ServerKeys
-            end,
+            EncryptKeys =
+                case Role of
+                    client -> ClientKeys;
+                    server -> ServerKeys
+                end,
 
             %% Build PATH_CHALLENGE frame
             ChallengeFrame = {path_challenge, ChallengeData},
