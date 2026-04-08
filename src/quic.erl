@@ -59,6 +59,7 @@
     connect/4,
     close/1,
     close/2,
+    close/3,
     open_stream/1,
     open_unidirectional_stream/1,
     send_data/4,
@@ -191,6 +192,22 @@ close(Conn) when is_pid(Conn) ->
     Reason :: term().
 close(Conn, Reason) when is_pid(Conn) ->
     quic_connection:close(Conn, Reason).
+
+%% @doc Close a QUIC connection with application error code and reason phrase.
+%% ErrorCode is a 62-bit unsigned integer (RFC 9000).
+%% Reason is the reason phrase sent in the CONNECTION_CLOSE frame.
+-spec close(Conn, ErrorCode, Reason) -> ok when
+    Conn :: pid(),
+    ErrorCode :: 0..16#3FFFFFFFFFFFFFFF,
+    Reason :: binary().
+close(Conn, ErrorCode, Reason) when
+    is_pid(Conn),
+    is_integer(ErrorCode),
+    ErrorCode >= 0,
+    ErrorCode < (1 bsl 62),
+    is_binary(Reason)
+->
+    quic_connection:close(Conn, {app_error, ErrorCode, Reason}).
 
 %% @doc Open a new bidirectional stream.
 %% Returns {ok, StreamId} on success.

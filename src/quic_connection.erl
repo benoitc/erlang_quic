@@ -125,7 +125,8 @@
     convert_ack_ranges_for_encode/1,
     convert_rest_ranges/2,
     check_send_queue_flow_control/4,
-    test_check_flow_control/6
+    test_check_flow_control/6,
+    close_reason_to_code/1
 ]).
 -endif.
 
@@ -1068,7 +1069,13 @@ terminate(
             ok;
         _ ->
             try
-                send_connection_close(Reason, State)
+                %% Use close_reason from state if set, otherwise use terminate reason
+                CloseReason =
+                    case State#state.close_reason of
+                        undefined -> Reason;
+                        R -> R
+                    end,
+                send_connection_close(CloseReason, State)
             catch
                 _:_ -> ok
             end
@@ -1195,6 +1202,12 @@ idle(cast, process, #state{role = client, socket = Socket, active_n = N} = State
 idle(cast, process, #state{role = server} = State) ->
     %% Server connections receive via listener, don't touch socket options
     {keep_state, State};
+idle(cast, {close, Reason}, State) ->
+    %% Close in idle state - no keys yet, just transition to draining
+    emit_qlog_state_change(idle, draining, State),
+    State1 = initiate_close(Reason, State),
+    NewState = flush_dirty_timers(flush_socket_batch(State1)),
+    {next_state, draining, NewState};
 idle(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, idle, State).
 
@@ -1275,6 +1288,12 @@ handshaking(cast, process, #state{role = client, socket = Socket, active_n = N} 
 handshaking(cast, process, #state{role = server} = State) ->
     %% Server connections receive via listener, don't touch socket options
     {keep_state, State};
+handshaking(cast, {close, Reason}, State) ->
+    %% Close during handshake - may not have app keys yet
+    emit_qlog_state_change(handshaking, draining, State),
+    State1 = initiate_close(Reason, State),
+    NewState = flush_dirty_timers(flush_socket_batch(State1)),
+    {next_state, draining, NewState};
 handshaking(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, handshaking, State).
 
@@ -1524,6 +1543,7 @@ connected(info, {quic_packets, Packets, _RemoteAddr}, #state{role = server} = St
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(connected, FlushedState);
 connected(cast, {close, Reason}, State) ->
+    emit_qlog_state_change(connected, draining, State),
     State1 = initiate_close(Reason, State),
     NewState = flush_dirty_timers(flush_socket_batch(State1)),
     {next_state, draining, NewState};
@@ -1618,8 +1638,16 @@ draining(
         qlog_ctx = QlogCtx
     } = State
 ) ->
+    %% Extract reason phrase for qlog
+    ReasonPhrase =
+        case Reason of
+            {app_error, _, Phrase} -> Phrase;
+            {peer_closed, application, _, Phrase} -> Phrase;
+            {peer_closed, transport, _, _, Phrase} -> Phrase;
+            _ -> undefined
+        end,
     %% Emit qlog connection_closed event
-    quic_qlog:connection_closed(QlogCtx, close_reason_to_code(Reason), undefined),
+    quic_qlog:connection_closed(QlogCtx, close_reason_to_code(Reason), ReasonPhrase),
 
     Owner ! {quic, self(), {closed, Reason}},
     %% Start drain timer (3 * PTO per RFC 9000 Section 10.2)
@@ -1637,6 +1665,9 @@ draining(info, drain_timeout, State) ->
     {next_state, closed, State};
 draining(info, {udp, _Socket, _IP, _Port, _Data}, State) ->
     %% Ignore packets in draining state
+    {keep_state, State};
+draining(cast, {close, _Reason}, State) ->
+    %% Ignore duplicate close requests - already draining
     {keep_state, State};
 draining(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, draining, State).
@@ -3349,8 +3380,16 @@ process_frame(app, {new_connection_id, SeqNum, RetirePrior, CID, ResetToken}, St
 %% RETIRE_CONNECTION_ID: Peer is retiring one of our CIDs
 process_frame(app, {retire_connection_id, SeqNum}, State) ->
     handle_retire_connection_id(SeqNum, State);
-process_frame(_Level, {connection_close, _Type, _Code, _FrameType, _Reason}, State) ->
-    State#state{close_reason = connection_closed};
+process_frame(_Level, {connection_close, Type, Code, FrameType, ReasonPhrase}, State) ->
+    %% Preserve peer error details for owner notification
+    CloseReason =
+        case Type of
+            application ->
+                {peer_closed, application, Code, ReasonPhrase};
+            transport ->
+                {peer_closed, transport, Code, FrameType, ReasonPhrase}
+        end,
+    State#state{close_reason = CloseReason};
 %% RESET_STREAM: Peer is aborting a stream they initiated or we initiated for sending
 %% RFC 9000 Section 19.4
 process_frame(
@@ -4807,8 +4846,16 @@ select_signature_algorithm(_) ->
 check_state_transition(CurrentState, State) ->
     %% First check if connection should be closing (CONNECTION_CLOSE received)
     case State#state.close_reason of
+        {peer_closed, _, _, _} ->
+            %% Peer sent APPLICATION CONNECTION_CLOSE, transition to draining
+            emit_qlog_state_change(CurrentState, draining, State),
+            {next_state, draining, State};
+        {peer_closed, _, _, _, _} ->
+            %% Peer sent TRANSPORT CONNECTION_CLOSE, transition to draining
+            emit_qlog_state_change(CurrentState, draining, State),
+            {next_state, draining, State};
         connection_closed ->
-            %% Peer sent CONNECTION_CLOSE, transition to draining
+            %% Legacy: Peer sent CONNECTION_CLOSE, transition to draining
             emit_qlog_state_change(CurrentState, draining, State),
             {next_state, draining, State};
         stateless_reset ->
@@ -4850,7 +4897,12 @@ emit_qlog_state_change(OldState, NewState, #state{qlog_ctx = Ctx}) ->
 close_reason_to_code(connection_closed) -> 0;
 close_reason_to_code(stateless_reset) -> stateless_reset;
 close_reason_to_code(idle_timeout) -> idle_timeout;
+close_reason_to_code(normal) -> 0;
+close_reason_to_code({app_error, Code, _}) when is_integer(Code) -> Code;
+close_reason_to_code({peer_closed, application, Code, _}) when is_integer(Code) -> Code;
+close_reason_to_code({peer_closed, transport, Code, _, _}) when is_integer(Code) -> Code;
 close_reason_to_code({error, Code}) when is_integer(Code) -> Code;
+close_reason_to_code({error, application_error}) -> ?QUIC_APPLICATION_ERROR;
 close_reason_to_code({application_error, Code, _}) when is_integer(Code) -> Code;
 close_reason_to_code(Reason) when is_atom(Reason) -> Reason;
 close_reason_to_code(_) -> unknown.
@@ -6006,15 +6058,19 @@ do_close_stream_deadline(StreamId, ErrorCode, #state{streams = Streams} = State)
 %% Initiate connection close
 initiate_close(Reason, State) ->
     %% Send CONNECTION_CLOSE frame
-    ErrorCode =
+    {ErrorCode, ReasonPhrase} =
         case Reason of
-            normal -> ?QUIC_NO_ERROR;
-            _ -> ?QUIC_APPLICATION_ERROR
+            normal ->
+                {?QUIC_NO_ERROR, <<>>};
+            {app_error, Code, Phrase} when is_integer(Code), is_binary(Phrase) ->
+                {Code, Phrase};
+            _ ->
+                {?QUIC_APPLICATION_ERROR, <<>>}
         end,
-    CloseFrame = {connection_close, application, ErrorCode, undefined, <<>>},
-
+    CloseFrame = {connection_close, application, ErrorCode, undefined, ReasonPhrase},
     case State#state.app_keys of
         undefined ->
+            %% No keys yet - cannot send frame, just set close_reason
             State#state{close_reason = Reason};
         _ ->
             send_frame(CloseFrame, State#state{close_reason = Reason})
@@ -6037,14 +6093,20 @@ send_connection_close(_Reason, #state{app_keys = undefined}) ->
     %% No app keys yet, can't send encrypted close frame
     ok;
 send_connection_close(Reason, State) ->
-    ErrorCode =
+    {ErrorCode, ReasonPhrase} =
         case Reason of
-            normal -> ?QUIC_NO_ERROR;
-            shutdown -> ?QUIC_NO_ERROR;
-            {shutdown, _} -> ?QUIC_NO_ERROR;
-            _ -> ?QUIC_APPLICATION_ERROR
+            normal ->
+                {?QUIC_NO_ERROR, <<>>};
+            shutdown ->
+                {?QUIC_NO_ERROR, <<>>};
+            {shutdown, _} ->
+                {?QUIC_NO_ERROR, <<>>};
+            {app_error, Code, Phrase} when is_integer(Code), is_binary(Phrase) ->
+                {Code, Phrase};
+            _ ->
+                {?QUIC_APPLICATION_ERROR, <<>>}
         end,
-    CloseFrame = {connection_close, application, ErrorCode, undefined, <<>>},
+    CloseFrame = {connection_close, application, ErrorCode, undefined, ReasonPhrase},
     %% Best effort send - ignore errors since we're terminating anyway
     try
         send_frame(CloseFrame, State)
