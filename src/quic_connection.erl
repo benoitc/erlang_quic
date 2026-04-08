@@ -3833,8 +3833,13 @@ process_tls_message(_Level, ?TLS_ENCRYPTED_EXTENSIONS, Body, OriginalMsg, State)
             }
     end;
 %% Client receives server Certificate
-process_tls_message(_Level, ?TLS_CERTIFICATE, Body, OriginalMsg,
-        #state{role = client, tls_state = ?TLS_AWAITING_CERT} = State) ->
+process_tls_message(
+    _Level,
+    ?TLS_CERTIFICATE,
+    Body,
+    OriginalMsg,
+    #state{role = client, tls_state = ?TLS_AWAITING_CERT} = State
+) ->
     %% Update transcript (we don't verify certs if verify = false)
     Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
     %% Parse and store peer certificate
@@ -3854,8 +3859,13 @@ process_tls_message(_Level, ?TLS_CERTIFICATE, Body, OriginalMsg,
         peer_cert_chain = PeerCertChain
     };
 %% Client receives server CertificateVerify
-process_tls_message(_Level, ?TLS_CERTIFICATE_VERIFY, _Body, OriginalMsg,
-        #state{role = client, tls_state = ?TLS_AWAITING_CERT_VERIFY} = State) ->
+process_tls_message(
+    _Level,
+    ?TLS_CERTIFICATE_VERIFY,
+    _Body,
+    OriginalMsg,
+    #state{role = client, tls_state = ?TLS_AWAITING_CERT_VERIFY} = State
+) ->
     %% Update transcript
     Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
     State#state{
