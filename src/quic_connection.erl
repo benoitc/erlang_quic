@@ -1738,7 +1738,8 @@ send_client_hello(State) ->
         initial_max_streams_bidi => MaxStreamsBidi,
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => State#state.idle_timeout,
-        active_connection_id_limit => 2
+        active_connection_id_limit => 2,
+        max_udp_payload_size => get_local_max_udp_payload_size(State)
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
     TransportParams =
@@ -1992,7 +1993,8 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         initial_max_streams_bidi => MaxStreamsBidi,
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => State#state.idle_timeout,
-        active_connection_id_limit => 2
+        active_connection_id_limit => 2,
+        max_udp_payload_size => get_local_max_udp_payload_size(State)
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
     TransportParams1 =
@@ -7114,6 +7116,14 @@ get_current_mtu(#state{pmtu_state = undefined}) ->
     ?DEFAULT_MAX_UDP_PAYLOAD_SIZE;
 get_current_mtu(#state{pmtu_state = PMTUState}) ->
     quic_pmtu:current_mtu(PMTUState).
+
+%% @doc Get the local max UDP payload size for transport parameters.
+%% Returns the configured max MTU from PMTU state, or the default if not configured.
+-spec get_local_max_udp_payload_size(#state{}) -> pos_integer().
+get_local_max_udp_payload_size(#state{pmtu_state = undefined}) ->
+    ?DEFAULT_MAX_UDP_PAYLOAD_SIZE;
+get_local_max_udp_payload_size(#state{pmtu_state = PMTUState}) ->
+    PMTUState#pmtu_state.max_mtu.
 
 %%====================================================================
 %% Test Helpers
