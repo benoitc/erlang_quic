@@ -57,11 +57,13 @@
 
 -export([
     connect/4,
+    close/1,
     close/2,
     open_stream/1,
     open_unidirectional_stream/1,
     send_data/4,
     send_data/5,
+    send_data_async/4,
     reset_stream/3,
     stop_sending/3,
     handle_timeout/2,
@@ -177,7 +179,13 @@ connect(Host, Port, Opts, Owner) when
 connect(_Host, _Port, _Opts, _Owner) ->
     {error, badarg}.
 
-%% @doc Close a QUIC connection.
+%% @doc Close a QUIC connection with normal reason.
+-spec close(Conn) -> ok when
+    Conn :: pid().
+close(Conn) when is_pid(Conn) ->
+    close(Conn, normal).
+
+%% @doc Close a QUIC connection with specified reason.
 -spec close(Conn, Reason) -> ok when
     Conn :: pid(),
     Reason :: term().
@@ -224,6 +232,18 @@ send_data(Conn, StreamId, Data, Fin, Timeout) when is_pid(Conn) ->
     catch
         exit:{timeout, _} -> {error, timeout}
     end.
+
+%% @doc Send data on a stream asynchronously (fire-and-forget).
+%% This is faster than send_data/4 because it uses cast instead of call,
+%% avoiding the round-trip latency. However, errors are silently dropped.
+%% Use this for high-throughput scenarios where occasional dropped data is acceptable.
+-spec send_data_async(Conn, StreamId, Data, Fin) -> ok when
+    Conn :: pid(),
+    StreamId :: non_neg_integer(),
+    Data :: iodata(),
+    Fin :: boolean().
+send_data_async(Conn, StreamId, Data, Fin) when is_pid(Conn) ->
+    quic_connection:send_data_async(Conn, StreamId, Data, Fin).
 
 %% @doc Reset a stream with an error code.
 -spec reset_stream(Conn, StreamId, ErrorCode) -> ok | {error, term()} when

@@ -2,6 +2,7 @@
 %%%
 %%% QUIC BBRv3 Congestion Control
 %%% IETF Draft: draft-ietf-ccwg-bbr
+%%% RFC 9406 - HyStart++: Modified Slow Start for TCP
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
 %%% Apache License 2.0
@@ -12,9 +13,12 @@
 %%% model-based congestion control algorithm that aims to maximize throughput
 %%% while minimizing latency and packet loss.
 %%%
+%%% HyStart++ (RFC 9406) provides additional RTT-based startup exit detection
+%%% alongside BBR's bandwidth plateau detection for earlier, safer exits.
+%%%
 %%% == States ==
 %%%
-%%% 1. Startup: Exponential bandwidth probing (2.77x pacing gain)
+%%% 1. Startup: Exponential bandwidth probing (2.77x pacing gain) with HyStart++ RTT monitoring
 %%% 2. Drain: Reduce queue built during startup (0.35x pacing gain)
 %%% 3. ProbeBW: Steady-state with cycling phases (DOWN/CRUISE/REFILL/UP)
 %%% 4. ProbeRTT: Periodic RTT measurement with reduced cwnd
@@ -105,6 +109,17 @@
 -define(MAX_DATAGRAM_SIZE, 1200).
 -define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 
+%% HyStart++ constants (RFC 9406)
+%% Minimum RTT samples before making slow start exit decision
+-define(HYSTART_MIN_SAMPLES, 8).
+%% Dynamic RTT threshold bounds (RFC 9406)
+%% Minimum RTT threshold in milliseconds
+-define(HYSTART_MIN_RTT_THRESH, 4).
+%% Maximum RTT threshold in milliseconds
+-define(HYSTART_MAX_RTT_THRESH, 16).
+%% Divisor for baseline RTT to calculate dynamic threshold
+-define(HYSTART_MIN_RTT_DIVISOR, 8).
+
 %%====================================================================
 %% BBRv3 State Record
 %%====================================================================
@@ -177,7 +192,17 @@
     %% Pacing Tokens
     pacing_tokens = 0 :: non_neg_integer(),
     pacing_max_burst = 14400 :: non_neg_integer(),
-    last_pacing_update = 0 :: non_neg_integer()
+    last_pacing_update = 0 :: non_neg_integer(),
+
+    %% HyStart++ state (RFC 9406)
+    %% Whether HyStart++ is enabled
+    hystart_enabled = true :: boolean(),
+    %% RTT sample count in current round
+    hystart_rtt_sample_count = 0 :: non_neg_integer(),
+    %% Last round's minimum RTT (milliseconds)
+    hystart_last_rtt = 0 :: non_neg_integer(),
+    %% Current round's minimum RTT (milliseconds)
+    hystart_curr_rtt = infinity :: non_neg_integer() | infinity
 }).
 
 -opaque cc_state() :: #bbr_state{}.
@@ -194,6 +219,7 @@ new(Opts) ->
     MinimumWindow = maps:get(minimum_window, Opts, 2 * MaxDatagramSize),
     MinRecoveryDuration = maps:get(min_recovery_duration, Opts, 100),
     InitialRtt = maps:get(initial_rtt, Opts, ?INITIAL_RTT),
+    HystartEnabled = maps:get(hystart_enabled, Opts, true),
     PacingMaxBurst = 12 * MaxDatagramSize,
     Now = erlang:monotonic_time(millisecond),
 
@@ -220,7 +246,8 @@ new(Opts) ->
             max_datagram_size => MaxDatagramSize,
             initial_rtt => InitialRtt,
             initial_pacing_rate => InitialPacingRate,
-            initial_max_bw => InitialMaxBw
+            initial_max_bw => InitialMaxBw,
+            hystart_enabled => HystartEnabled
         },
         ?QUIC_LOG_META
     ),
@@ -242,7 +269,9 @@ new(Opts) ->
         min_rtt_stamp = Now,
         probe_rtt_min_stamp = Now,
         delivered_time = Now,
-        round_start = Now
+        round_start = Now,
+        %% HyStart++ initialization
+        hystart_enabled = HystartEnabled
     }.
 
 %%====================================================================
@@ -470,7 +499,11 @@ on_persistent_congestion(#bbr_state{minimum_window = MinimumWindow} = State) ->
         recovery_start_time = 0,
         startup_full_bw = 0,
         startup_full_bw_count = 0,
-        inflight_hi = infinity
+        inflight_hi = infinity,
+        %% Reset HyStart++ state
+        hystart_rtt_sample_count = 0,
+        hystart_last_rtt = 0,
+        hystart_curr_rtt = infinity
     }.
 
 %% @doc Detect persistent congestion from lost packets.
@@ -501,7 +534,9 @@ detect_persistent_congestion(LostPackets, PTO, _State) ->
 update_pacing_rate(State, SmoothedRTT) when SmoothedRTT > 0 ->
     %% Update min_rtt if this is better
     Now = erlang:monotonic_time(millisecond),
-    update_min_rtt(State, SmoothedRTT, Now);
+    State1 = update_min_rtt(State, SmoothedRTT, Now),
+    %% Update HyStart++ RTT tracking
+    update_hystart_rtt(State1, SmoothedRTT);
 update_pacing_rate(State, _SmoothedRTT) ->
     State.
 
@@ -757,7 +792,8 @@ check_round_completion(
         delivered = Delivered,
         next_round_delivered = NextRoundDelivered,
         round_count = RoundCount,
-        in_recovery = WasInRecovery
+        in_recovery = WasInRecovery,
+        hystart_curr_rtt = CurrRTT
     } = State
 ) ->
     case Delivered >= NextRoundDelivered of
@@ -772,13 +808,23 @@ check_round_completion(
                     true -> infinity;
                     false -> State#bbr_state.inflight_hi
                 end,
+            %% HyStart++: Save current round's min RTT as last RTT for next round comparison
+            NewLastRTT =
+                case CurrRTT of
+                    infinity -> 0;
+                    _ -> CurrRTT
+                end,
             State#bbr_state{
                 round_count = RoundCount + 1,
                 next_round_delivered = Delivered,
                 loss_in_round = 0,
                 bytes_in_round = 0,
                 in_recovery = false,
-                inflight_hi = NewInflightHi
+                inflight_hi = NewInflightHi,
+                %% HyStart++ round tracking
+                hystart_last_rtt = NewLastRTT,
+                hystart_curr_rtt = infinity,
+                hystart_rtt_sample_count = 0
             };
         false ->
             State
@@ -799,7 +845,8 @@ run_state_machine(#bbr_state{state = probe_rtt} = State, Now) ->
     run_probe_rtt(State, Now).
 
 %% @private Startup state logic
-%% BBRv3: Only exit STARTUP when bandwidth plateaus (no 25% growth for 3 rounds).
+%% BBRv3: Exit STARTUP when bandwidth plateaus (no 25% growth for 3 rounds)
+%% or when HyStart++ detects RTT increase (RFC 9406).
 %% Loss is handled by reducing max_bw in on_congestion_event, NOT by exiting STARTUP.
 %% This prevents premature exit to DRAIN where pacing_gain drops to 0.35x.
 run_startup(
@@ -811,7 +858,8 @@ run_startup(
     _Now
 ) ->
     %% Check for Startup exit condition:
-    %% Bandwidth hasn't grown by 25% for 3 consecutive rounds
+    %% 1. Bandwidth hasn't grown by 25% for 3 consecutive rounds
+    %% 2. HyStart++ RTT-based exit (RFC 9406)
     %% Note: Loss does NOT cause STARTUP exit per BBRv3 spec.
     %% Loss is handled separately by reducing max_bw in on_congestion_event.
 
@@ -832,25 +880,41 @@ run_startup(
         startup_full_bw_count = NewFullBwCount
     },
 
-    case ExitForBw of
+    %% Check HyStart++ RTT-based exit
+    ExitForHystart = hystart_should_exit(State1),
+
+    case ExitForBw orelse ExitForHystart of
         true ->
+            Reason =
+                case ExitForBw of
+                    true -> bandwidth_plateau;
+                    false -> hystart_rtt_increase
+                end,
             %% Exit Startup, enter Drain
             ?LOG_DEBUG(
                 #{
                     what => bbr_exit_startup,
-                    reason => bandwidth_plateau,
+                    reason => Reason,
                     max_bw => MaxBw
                 },
                 ?QUIC_LOG_META
             ),
-            State1#bbr_state{
-                state = drain,
-                pacing_gain = ?DRAIN_PACING_GAIN,
-                cwnd_gain = ?DEFAULT_CWND_GAIN
-            };
+            exit_startup(State1);
         false ->
             State1
     end.
+
+%% @private Exit startup and enter drain, resetting HyStart++ state
+exit_startup(State) ->
+    State#bbr_state{
+        state = drain,
+        pacing_gain = ?DRAIN_PACING_GAIN,
+        cwnd_gain = ?DEFAULT_CWND_GAIN,
+        %% Reset HyStart++ state
+        hystart_rtt_sample_count = 0,
+        hystart_last_rtt = 0,
+        hystart_curr_rtt = infinity
+    }.
 
 %% @private Drain state logic
 run_drain(
@@ -1011,6 +1075,60 @@ exit_probe_rtt(#bbr_state{prior_cwnd = PriorCwnd} = State, Now) ->
         pacing_gain = ?PROBE_BW_CRUISE_PACING_GAIN,
         min_rtt_stamp = Now
     }.
+
+%%====================================================================
+%% HyStart++ Implementation (RFC 9406)
+%%====================================================================
+
+%% @private Check if HyStart++ RTT-based exit should occur
+hystart_should_exit(#bbr_state{
+    hystart_enabled = true,
+    hystart_rtt_sample_count = Samples,
+    hystart_curr_rtt = CurrRTT,
+    hystart_last_rtt = LastRTT
+}) when
+    Samples >= ?HYSTART_MIN_SAMPLES,
+    is_integer(CurrRTT),
+    CurrRTT > 0,
+    LastRTT > 0
+->
+    %% Calculate dynamic RTT threshold (RFC 9406)
+    RTTThresh = calculate_rtt_threshold(LastRTT),
+    (CurrRTT - LastRTT) > RTTThresh;
+hystart_should_exit(_) ->
+    false.
+
+%% @private Calculate dynamic RTT threshold (RFC 9406)
+%% RttThresh = clamp(MIN, lastRTT/DIVISOR, MAX)
+calculate_rtt_threshold(LastRTT) when LastRTT > 0 ->
+    Threshold = LastRTT div ?HYSTART_MIN_RTT_DIVISOR,
+    max(?HYSTART_MIN_RTT_THRESH, min(Threshold, ?HYSTART_MAX_RTT_THRESH));
+calculate_rtt_threshold(_) ->
+    ?HYSTART_MIN_RTT_THRESH.
+
+%% @private Update HyStart++ RTT samples
+%% Called from update_pacing_rate when in startup
+update_hystart_rtt(
+    #bbr_state{
+        hystart_enabled = true,
+        hystart_curr_rtt = CurrRTT,
+        hystart_rtt_sample_count = SampleCount,
+        state = startup
+    } = State,
+    RTT
+) ->
+    %% In startup, track RTT samples
+    NewCurrRTT =
+        case CurrRTT of
+            infinity -> RTT;
+            _ -> min(CurrRTT, RTT)
+        end,
+    State#bbr_state{
+        hystart_curr_rtt = NewCurrRTT,
+        hystart_rtt_sample_count = SampleCount + 1
+    };
+update_hystart_rtt(State, _RTT) ->
+    State.
 
 %%====================================================================
 %% Internal Functions - CWND and Pacing

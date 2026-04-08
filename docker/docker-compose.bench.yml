@@ -1,0 +1,32 @@
+services:
+  quiche-server:
+    build:
+      context: ./quiche
+      dockerfile: Dockerfile
+    ports:
+      - "4435:4435/udp"
+    volumes:
+      - ../certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "nc", "-u", "-z", "-w1", "localhost", "4435"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  quic-go-server:
+    build:
+      context: ./go-bench
+      dockerfile: Dockerfile
+    ports:
+      - "4434:4434/udp"
+    volumes:
+      - ../certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "nc", "-u", "-z", "-w1", "localhost", "4434"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped

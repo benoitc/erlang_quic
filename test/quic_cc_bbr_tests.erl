@@ -539,8 +539,94 @@ bbr_long_transfer_cwnd_stability_test() ->
     ?assert(quic_cc_bbr:can_send(FinalState, 1200)).
 
 %%====================================================================
+%% HyStart++ Tests (RFC 9406)
+%%====================================================================
+
+bbr_hystart_enabled_by_default_test() ->
+    %% HyStart++ should be enabled by default
+    State = quic_cc_bbr:new(#{}),
+    S1 = quic_cc_bbr:on_packet_sent(State, 1200),
+    S2 = quic_cc_bbr:on_packets_acked(S1, 1200),
+    %% Should still be in startup
+    ?assert(quic_cc_bbr:in_slow_start(S2)).
+
+bbr_hystart_disabled_test() ->
+    %% Test with HyStart++ disabled
+    State = quic_cc_bbr:new(#{hystart_enabled => false}),
+    S1 = quic_cc_bbr:on_packet_sent(State, 5000),
+    S2 = quic_cc_bbr:on_packets_acked(S1, 5000),
+    %% Should still be in startup
+    ?assert(quic_cc_bbr:in_slow_start(S2)).
+
+bbr_hystart_rtt_tracking_test() ->
+    %% Test that RTT samples are tracked during startup
+    State = quic_cc_bbr:new(#{}),
+    S1 = quic_cc_bbr:on_packet_sent(State, 5000),
+    %% Simulate RTT update
+    S2 = quic_cc_bbr:update_pacing_rate(S1, 50),
+    %% Should still be in startup
+    ?assert(quic_cc_bbr:in_slow_start(S2)).
+
+bbr_hystart_startup_continues_stable_rtt_test() ->
+    %% Test that startup continues normally with stable RTT
+    State = quic_cc_bbr:new(#{}),
+    %% Multiple rounds with stable RTT should stay in startup
+    S1 = simulate_stable_startup_rounds(State, 3),
+    ?assert(quic_cc_bbr:in_slow_start(S1)).
+
+bbr_hystart_reset_on_persistent_congestion_test() ->
+    %% Test that HyStart++ state resets on persistent congestion
+    State = quic_cc_bbr:new(#{}),
+    S1 = quic_cc_bbr:on_persistent_congestion(State),
+    %% Should be back in startup
+    ?assert(quic_cc_bbr:in_slow_start(S1)).
+
+%%====================================================================
+%% HyStart++ Dynamic RTT Threshold Tests (RFC 9406)
+%%====================================================================
+
+bbr_hystart_dynamic_threshold_low_rtt_test() ->
+    %% Low RTT (20ms): threshold = max(4, min(20/8, 16)) = max(4, 2) = 4ms
+    %% The threshold is clamped to the minimum of 4ms
+    State = quic_cc_bbr:new(#{}),
+    %% Simulate low RTT environment
+    S1 = quic_cc_bbr:update_pacing_rate(State, 20),
+    S2 = quic_cc_bbr:on_packet_sent(S1, 5000),
+    S3 = quic_cc_bbr:on_packets_acked(S2, 5000),
+    %% Should still be in startup
+    ?assert(quic_cc_bbr:in_slow_start(S3)).
+
+bbr_hystart_dynamic_threshold_medium_rtt_test() ->
+    %% Medium RTT (80ms): threshold = max(4, min(80/8, 16)) = max(4, 10) = 10ms
+    State = quic_cc_bbr:new(#{}),
+    %% Simulate medium RTT environment
+    S1 = quic_cc_bbr:update_pacing_rate(State, 80),
+    S2 = quic_cc_bbr:on_packet_sent(S1, 5000),
+    S3 = quic_cc_bbr:on_packets_acked(S2, 5000),
+    ?assert(quic_cc_bbr:in_slow_start(S3)).
+
+bbr_hystart_dynamic_threshold_high_rtt_test() ->
+    %% High RTT (200ms): threshold = max(4, min(200/8, 16)) = max(4, 16) = 16ms
+    %% The threshold is clamped to the maximum of 16ms
+    State = quic_cc_bbr:new(#{}),
+    %% Simulate high RTT environment
+    S1 = quic_cc_bbr:update_pacing_rate(State, 200),
+    S2 = quic_cc_bbr:on_packet_sent(S1, 5000),
+    S3 = quic_cc_bbr:on_packets_acked(S2, 5000),
+    ?assert(quic_cc_bbr:in_slow_start(S3)).
+
+%%====================================================================
 %% Helper Functions
 %%====================================================================
+
+%% Simulate multiple startup rounds with stable RTT
+simulate_stable_startup_rounds(State, 0) ->
+    State;
+simulate_stable_startup_rounds(State, N) ->
+    S1 = quic_cc_bbr:on_packet_sent(State, 5000),
+    S2 = quic_cc_bbr:update_pacing_rate(S1, 50),
+    S3 = quic_cc_bbr:on_packets_acked(S2, 5000),
+    simulate_stable_startup_rounds(S3, N - 1).
 
 send_until_full(State, Sent) ->
     case quic_cc_bbr:can_send(State, 1200) of

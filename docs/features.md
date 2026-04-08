@@ -166,6 +166,8 @@
 - `keep_alive_interval` - Keep-alive PING interval (`disabled`, `auto`, or milliseconds)
 - `pmtu_enabled` - Enable Path MTU Discovery (default: true)
 - `pmtu_max_mtu` - Maximum MTU to probe (default: 1500)
+- `recbuf` - UDP receive buffer size in bytes (default: 7MB)
+- `sndbuf` - UDP send buffer size in bytes (default: 7MB)
 
 ### PMTU Discovery
 - `quic:get_mtu/1` - Get current effective MTU for a connection

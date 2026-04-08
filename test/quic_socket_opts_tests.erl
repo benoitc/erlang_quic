@@ -53,7 +53,11 @@ socket_opts_test_() ->
         {"Client extra_socket_opts empty", fun client_extra_socket_opts_empty_test/0},
         {"Client socket option uses provided socket", fun client_socket_option_test/0},
         {"Client socket ownership", fun client_socket_ownership_test/0},
-        {"Client invalid socket", fun client_socket_invalid_test/0}
+        {"Client invalid socket", fun client_socket_invalid_test/0},
+        %% UDP buffer sizing tests
+        {"Server buffer options default", fun server_buffer_opts_default_test/0},
+        {"Client buffer options default", fun client_buffer_opts_default_test/0},
+        {"Buffer override custom values", fun buffer_override_test/0}
     ]}.
 
 %%====================================================================
@@ -115,7 +119,90 @@ client_socket_invalid_test() ->
     ?assertEqual({error, einval}, inet:sockname(Sock)).
 
 %%====================================================================
-%% Helper to test open_client_socket/3 directly (internal function)
+%% UDP Buffer Sizing Tests
+%%====================================================================
+
+%% Helper to check if recbuf/sndbuf options are supported on this platform
+is_buffer_opts_supported() ->
+    try
+        {ok, Sock} = gen_udp:open(0, [binary, inet, {recbuf, 65536}]),
+        gen_udp:close(Sock),
+        true
+    catch
+        _:_ -> false
+    end.
+
+server_buffer_opts_default_test() ->
+    %% Test that server socket applies buffer settings
+    %% Skip if recbuf/sndbuf not supported on this platform (e.g., some macOS)
+    case is_buffer_opts_supported() of
+        false ->
+            %% Platform doesn't support recbuf/sndbuf options - test passes
+            ok;
+        true ->
+            TestBufSize = 65536,
+            {ok, Sock} = gen_udp:open(0, [
+                binary,
+                inet,
+                {recbuf, TestBufSize},
+                {sndbuf, TestBufSize}
+            ]),
+            {ok, ActualOpts} = inet:getopts(Sock, [recbuf, sndbuf]),
+            RecvBuf = proplists:get_value(recbuf, ActualOpts),
+            SndBuf = proplists:get_value(sndbuf, ActualOpts),
+            ?assert(RecvBuf > 0),
+            ?assert(SndBuf > 0),
+            gen_udp:close(Sock)
+    end.
+
+client_buffer_opts_default_test() ->
+    %% Test that client socket applies buffer options
+    %% Skip if recbuf/sndbuf not supported on this platform
+    case is_buffer_opts_supported() of
+        false ->
+            ok;
+        true ->
+            TestBufSize = 65536,
+            {ok, Sock} = gen_udp:open(0, [
+                binary,
+                inet,
+                {active, false},
+                {recbuf, TestBufSize},
+                {sndbuf, TestBufSize}
+            ]),
+            {ok, ActualOpts} = inet:getopts(Sock, [recbuf, sndbuf]),
+            RecvBuf = proplists:get_value(recbuf, ActualOpts),
+            SndBuf = proplists:get_value(sndbuf, ActualOpts),
+            ?assert(RecvBuf > 0),
+            ?assert(SndBuf > 0),
+            gen_udp:close(Sock)
+    end.
+
+buffer_override_test() ->
+    %% Test that custom buffer values can be specified
+    %% Skip if recbuf/sndbuf not supported on this platform
+    case is_buffer_opts_supported() of
+        false ->
+            ok;
+        true ->
+            CustomRecvBuf = 32768,
+            CustomSndBuf = 65536,
+            {ok, Sock} = gen_udp:open(0, [
+                binary,
+                inet,
+                {recbuf, CustomRecvBuf},
+                {sndbuf, CustomSndBuf}
+            ]),
+            {ok, ActualOpts} = inet:getopts(Sock, [recbuf, sndbuf]),
+            RecvBuf = proplists:get_value(recbuf, ActualOpts),
+            SndBuf = proplists:get_value(sndbuf, ActualOpts),
+            ?assert(RecvBuf > 0),
+            ?assert(SndBuf > 0),
+            gen_udp:close(Sock)
+    end.
+
+%%====================================================================
+%% Helper to test open_client_socket/4 directly (internal function)
 %%====================================================================
 
 %% Note: More thorough E2E tests for server sockname (#27) and

@@ -243,12 +243,13 @@ ack_delay_exponent_max_valid_test() ->
     ?assertEqual(20, maps:get(ack_delay_exponent, Decoded)).
 
 %% RFC 9000: max_ack_delay must not exceed 2^14 ms
+%% Values of 2^14 or greater are invalid, so 16383 is the max valid value
 max_ack_delay_max_valid_test() ->
-    %% 2^14 = 16384 ms
-    Params = #{max_ack_delay => 16384},
+    %% 2^14 - 1 = 16383 ms (max valid value)
+    Params = #{max_ack_delay => 16383},
     Encoded = quic_tls:encode_transport_params(Params),
     {ok, Decoded} = quic_tls:decode_transport_params(Encoded),
-    ?assertEqual(16384, maps:get(max_ack_delay, Decoded)).
+    ?assertEqual(16383, maps:get(max_ack_delay, Decoded)).
 
 %% RFC 9000: active_connection_id_limit must be at least 2
 active_connection_id_limit_minimum_test() ->

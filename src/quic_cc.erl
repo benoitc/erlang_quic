@@ -126,7 +126,7 @@
 %%====================================================================
 
 %% CC algorithm type
--type cc_algorithm() :: newreno | bbr.
+-type cc_algorithm() :: newreno | bbr | cubic.
 
 %% CC options type for implementations
 -type cc_opts() :: #{
@@ -332,9 +332,11 @@ algorithm(#cc_wrapper{algorithm = Mod}) ->
 %% Map algorithm atom to implementation module
 -spec algorithm_to_module(cc_algorithm()) -> module().
 algorithm_to_module(newreno) -> quic_cc_newreno;
-algorithm_to_module(bbr) -> quic_cc_bbr.
+algorithm_to_module(bbr) -> quic_cc_bbr;
+algorithm_to_module(cubic) -> quic_cc_cubic.
 
 %% Map implementation module to algorithm atom
 -spec module_to_algorithm(module()) -> cc_algorithm().
 module_to_algorithm(quic_cc_newreno) -> newreno;
-module_to_algorithm(quic_cc_bbr) -> bbr.
+module_to_algorithm(quic_cc_bbr) -> bbr;
+module_to_algorithm(quic_cc_cubic) -> cubic.

@@ -79,7 +79,7 @@ high_packet_rate_ack_processing_test() ->
     %% Process ACKs for all packets
     AckFrame = {ack, 999, 0, 999, []},
     Now = erlang:monotonic_time(millisecond),
-    {_Loss2, Acked, Lost} = quic_loss:on_ack_received(Loss1, AckFrame, Now),
+    {_Loss2, Acked, Lost, _Meta} = quic_loss:on_ack_received(Loss1, AckFrame, Now),
 
     ?assertEqual(1000, length(Acked)),
     ?assertEqual(0, length(Lost)).
@@ -100,7 +100,7 @@ high_packet_rate_with_loss_test() ->
     %% ACK only packets 50-99 (causing loss detection for 0-46)
     AckFrame = {ack, 99, 0, 49, []},
     Now = erlang:monotonic_time(millisecond),
-    {_Loss2, Acked, Lost} = quic_loss:on_ack_received(Loss1, AckFrame, Now),
+    {_Loss2, Acked, Lost, _Meta} = quic_loss:on_ack_received(Loss1, AckFrame, Now),
 
     ?assertEqual(50, length(Acked)),
     %% Loss detection by packet threshold (99 - 3 = 96, so 0-46 lost)
@@ -186,7 +186,7 @@ rtt_variation_test() ->
             timer:sleep(1),
             Now = erlang:monotonic_time(millisecond),
             AckFrame = {ack, PN, RTT, 0, []},
-            {S2, _, _} = quic_loss:on_ack_received(S1, AckFrame, Now),
+            {S2, _, _, _} = quic_loss:on_ack_received(S1, AckFrame, Now),
             S2
         end,
         LossState,
@@ -272,7 +272,7 @@ pto_backoff_test() ->
 
     %% ACK received resets PTO count
     Now = erlang:monotonic_time(millisecond) + 50,
-    {S5, _, _} = quic_loss:on_ack_received(S4, {ack, 0, 0, 0, []}, Now),
+    {S5, _, _, _} = quic_loss:on_ack_received(S4, {ack, 0, 0, 0, []}, Now),
     ?assertEqual(0, quic_loss:pto_count(S5)).
 
 %%====================================================================

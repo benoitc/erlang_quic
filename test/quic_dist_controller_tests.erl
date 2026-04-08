@@ -624,10 +624,9 @@ deliver_logic_complete_msg_test() ->
     Buffer = <<(byte_size(Payload)):32/big-unsigned, Payload/binary>>,
 
     case Buffer of
-        <<0:32/big-unsigned, Remaining/binary>> ->
-            %% Tick case
-            ?assertEqual(ok, tick_received),
-            Remaining;
+        <<0:32/big-unsigned, _Remaining/binary>> ->
+            %% Tick case - can't happen with non-zero payload
+            ?assert(false);
         <<Length:32/big-unsigned, Rest/binary>> when byte_size(Rest) >= Length ->
             %% Complete message
             <<Msg:Length/binary, Remaining/binary>> = Rest,
@@ -635,9 +634,6 @@ deliver_logic_complete_msg_test() ->
             ?assertEqual(<<>>, Remaining);
         <<_Length:32/big-unsigned, _Rest/binary>> ->
             %% Incomplete
-            ?assert(false);
-        _ when byte_size(Buffer) < 4 ->
-            %% Need header
             ?assert(false)
     end.
 
@@ -667,9 +663,7 @@ deliver_logic_incomplete_test() ->
             %% Incomplete - need more data
             ?assertEqual(10, Length),
             ?assertEqual(5, byte_size(Rest)),
-            ok;
-        _ when byte_size(Buffer) < 4 ->
-            ?assert(false)
+            ok
     end.
 
 %%====================================================================

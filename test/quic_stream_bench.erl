@@ -86,7 +86,7 @@ throughput(Host, Port, StreamCount, BytesPerStream) ->
     io:format("Throughput benchmark: ~p streams, ~p bytes each~n", [StreamCount, BytesPerStream]),
 
     case connect_with_timeout(Host, Port, 5000) of
-        {ok, _ConnRef, ConnPid} ->
+        {ok, ConnRef, ConnPid} ->
             Data = crypto:strong_rand_bytes(BytesPerStream),
 
             Start = erlang:monotonic_time(millisecond),
@@ -101,8 +101,8 @@ throughput(Host, Port, StreamCount, BytesPerStream) ->
                 lists:seq(1, StreamCount)
             ),
 
-            %% Wait for all data to be acknowledged (simplified: just wait a bit)
-            timer:sleep(1000),
+            %% Wait for all streams to complete
+            wait_all_streams_closed(ConnRef, StreamIds, 30000),
 
             End = erlang:monotonic_time(millisecond),
             Duration = max(1, End - Start),
@@ -141,49 +141,60 @@ latency(Host, Port, MessageCount) ->
     latency(Host, Port, MessageCount, ?DEFAULT_MESSAGE_SIZE).
 
 %% @doc Measure latency: small messages round-trip times
+%% Requires an echo server that echoes back received data.
 %% Returns: #{status, messages, p50_us, p99_us, max_us, avg_us}
 -spec latency(string() | binary(), inet:port_number(), pos_integer(), pos_integer()) -> map().
 latency(Host, Port, MessageCount, MessageSize) ->
     io:format("Latency benchmark: ~p messages, ~p bytes each~n", [MessageCount, MessageSize]),
+    io:format("  (requires echo server)~n"),
 
     case connect_with_timeout(Host, Port, 5000) of
-        {ok, _ConnRef, ConnPid} ->
+        {ok, ConnRef, ConnPid} ->
             {ok, StreamId} = quic_connection:open_stream(ConnPid),
             Data = crypto:strong_rand_bytes(MessageSize),
 
-            %% Measure round-trip times (note: this requires echo server)
-            Latencies = lists:map(
+            %% Measure round-trip times by sending and waiting for echo
+            Latencies = lists:filtermap(
                 fun(_) ->
-                    Start = erlang:monotonic_time(microsecond),
-                    ok = quic_connection:send_data(ConnPid, StreamId, Data, false),
-                    %% In a real benchmark, we'd wait for echo response
-                    %% For now, just measure send latency
-                    End = erlang:monotonic_time(microsecond),
-                    End - Start
+                    case measure_rtt(ConnRef, ConnPid, StreamId, Data, 5000) of
+                        {ok, RTT} -> {true, RTT};
+                        {error, _} -> false
+                    end
                 end,
                 lists:seq(1, MessageCount)
             ),
 
             quic_connection:close(ConnPid, normal),
 
-            Sorted = lists:sort(Latencies),
-            P50 = lists:nth(max(1, MessageCount div 2), Sorted),
-            P99 = lists:nth(max(1, round(MessageCount * 0.99)), Sorted),
-            Max = lists:last(Sorted),
-            Avg = lists:sum(Latencies) / MessageCount,
+            case Latencies of
+                [] ->
+                    io:format("  No echo responses received (server may not support echo)~n"),
+                    #{status => {error, no_echo}};
+                _ ->
+                    Sorted = lists:sort(Latencies),
+                    Len = length(Sorted),
+                    P50 = lists:nth(max(1, Len div 2), Sorted),
+                    P99 = lists:nth(max(1, round(Len * 0.99)), Sorted),
+                    Max = lists:last(Sorted),
+                    Avg = lists:sum(Latencies) / Len,
 
-            Result = #{
-                status => ok,
-                messages => MessageCount,
-                message_size => MessageSize,
-                p50_us => P50,
-                p99_us => P99,
-                max_us => Max,
-                avg_us => Avg
-            },
+                    Result = #{
+                        status => ok,
+                        messages => MessageCount,
+                        messages_received => Len,
+                        message_size => MessageSize,
+                        p50_us => P50,
+                        p99_us => P99,
+                        max_us => Max,
+                        avg_us => Avg
+                    },
 
-            io:format("  Result: p50=~p us, p99=~p us, max=~p us~n", [P50, P99, Max]),
-            Result;
+                    io:format(
+                        "  Result: p50=~p us, p99=~p us, max=~p us (~p/~p received)~n",
+                        [P50, P99, Max, Len, MessageCount]
+                    ),
+                    Result
+            end;
         {error, Reason} ->
             io:format("  Failed to connect: ~p~n", [Reason]),
             #{status => {error, Reason}}
@@ -279,7 +290,7 @@ priority_fairness(Host, Port, Opts) ->
     ),
 
     case connect_with_timeout(Host, Port, 5000) of
-        {ok, _ConnRef, ConnPid} ->
+        {ok, ConnRef, ConnPid} ->
             Data = crypto:strong_rand_bytes(BytesPerStream),
 
             %% Open and configure high-priority streams (urgency 0)
@@ -321,8 +332,10 @@ priority_fairness(Host, Port, Opts) ->
                 HighPrioStreams
             ),
 
-            %% Wait and measure
-            timer:sleep(500),
+            %% Wait for all streams to complete
+            AllStreams = HighPrioStreams ++ LowPrioStreams,
+            wait_all_streams_closed(ConnRef, AllStreams, 30000),
+
             End = erlang:monotonic_time(millisecond),
             Duration = End - Start,
 
@@ -423,4 +436,40 @@ connect_with_timeout(Host, Port, Timeout) ->
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% Wait for all streams to close or receive final data
+wait_all_streams_closed(ConnRef, StreamIds, Timeout) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    Pending = sets:from_list(StreamIds),
+    wait_streams_loop(ConnRef, Pending, Deadline).
+
+wait_streams_loop(ConnRef, Pending, Deadline) ->
+    case sets:is_empty(Pending) of
+        true ->
+            ok;
+        false ->
+            Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+            receive
+                {quic, ConnRef, {stream_closed, StreamId}} ->
+                    wait_streams_loop(ConnRef, sets:del_element(StreamId, Pending), Deadline);
+                {quic, ConnRef, {stream_data, StreamId, _Data, true}} ->
+                    wait_streams_loop(ConnRef, sets:del_element(StreamId, Pending), Deadline);
+                {quic, ConnRef, {stream_data, _StreamId, _Data, false}} ->
+                    wait_streams_loop(ConnRef, Pending, Deadline)
+            after Remaining ->
+                {error, {timeout, sets:to_list(Pending)}}
+            end
+    end.
+
+%% Measure round-trip time for a single message
+measure_rtt(ConnRef, ConnPid, StreamId, Data, Timeout) ->
+    Start = erlang:monotonic_time(microsecond),
+    ok = quic_connection:send_data(ConnPid, StreamId, Data, false),
+    receive
+        {quic, ConnRef, {stream_data, StreamId, _EchoData, _Fin}} ->
+            End = erlang:monotonic_time(microsecond),
+            {ok, End - Start}
+    after Timeout ->
+        {error, timeout}
     end.

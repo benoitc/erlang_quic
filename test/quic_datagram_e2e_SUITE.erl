@@ -192,6 +192,46 @@ connect_client(Port, ExtraOpts) ->
         {error, connection_timeout}
     end.
 
+%% @doc Wait for a server connection to be in connected state
+wait_for_server_connection(ServerName, Timeout) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    wait_for_server_connection_loop(ServerName, Deadline).
+
+wait_for_server_connection_loop(ServerName, Deadline) ->
+    Now = erlang:monotonic_time(millisecond),
+    case Now > Deadline of
+        true ->
+            {error, timeout};
+        false ->
+            case quic:get_server_connections(ServerName) of
+                {ok, []} ->
+                    timer:sleep(10),
+                    wait_for_server_connection_loop(ServerName, Deadline);
+                {ok, Conns} ->
+                    case find_connected(Conns) of
+                        {ok, ConnPid} ->
+                            {ok, ConnPid};
+                        not_found ->
+                            timer:sleep(10),
+                            wait_for_server_connection_loop(ServerName, Deadline)
+                    end;
+                {error, _} = Error ->
+                    Error
+            end
+    end.
+
+find_connected([]) ->
+    not_found;
+find_connected([Conn | Rest]) ->
+    try
+        case quic_connection:get_state(Conn) of
+            {connected, _} -> {ok, Conn};
+            _ -> find_connected(Rest)
+        end
+    catch
+        _:_ -> find_connected(Rest)
+    end.
+
 %%====================================================================
 %% Negotiation Tests
 %%====================================================================
@@ -317,11 +357,9 @@ receive_datagram(Config) ->
     {ok, ServerName, Port} = start_server(Config, #{max_datagram_frame_size => 65535}),
     {ok, ConnRef} = connect_client(Port, #{max_datagram_frame_size => 65535}),
 
-    %% Get server connections to send from server side
-    {ok, ServerConns} = quic:get_server_connections(ServerName),
-
-    case ServerConns of
-        [ServerConn | _] ->
+    %% Wait for server connection to be established
+    case wait_for_server_connection(ServerName, 5000) of
+        {ok, ServerConn} ->
             %% Server sends datagram to client
             TestData = <<"Hello from server!">>,
             ok = quic:send_datagram(ServerConn, TestData),
@@ -334,9 +372,8 @@ receive_datagram(Config) ->
             after 5000 ->
                 ct:fail("Timeout waiting for datagram")
             end;
-        [] ->
-            %% Server connection may not be established yet, skip
-            ct:log("No server connections available, skipping receive test")
+        {error, timeout} ->
+            ct:fail("Server connection not established within timeout")
     end,
 
     quic:close(ConnRef, normal),
@@ -347,18 +384,14 @@ bidirectional_datagrams(Config) ->
     {ok, ServerName, Port} = start_server(Config, #{max_datagram_frame_size => 65535}),
     {ok, ConnRef} = connect_client(Port, #{max_datagram_frame_size => 65535}),
 
-    %% Client sends datagram
-    ClientData = <<"Client to server">>,
-    ok = quic:send_datagram(ConnRef, ClientData),
+    %% Wait for server connection to be established
+    case wait_for_server_connection(ServerName, 5000) of
+        {ok, ServerConn} ->
+            %% Client sends datagram
+            ClientData = <<"Client to server">>,
+            ok = quic:send_datagram(ConnRef, ClientData),
 
-    %% Give server time to receive
-    timer:sleep(100),
-
-    %% Check server connections
-    {ok, ServerConns} = quic:get_server_connections(ServerName),
-    case ServerConns of
-        [ServerConn | _] ->
-            %% Server sends datagram back
+            %% Server sends datagram back (no artificial delay needed)
             ServerData = <<"Server to client">>,
             ok = quic:send_datagram(ServerConn, ServerData),
 
@@ -370,8 +403,8 @@ bidirectional_datagrams(Config) ->
             after 5000 ->
                 ct:fail("Timeout waiting for server datagram")
             end;
-        [] ->
-            ct:log("No server connections available, skipping bidirectional test")
+        {error, timeout} ->
+            ct:fail("Server connection not established within timeout")
     end,
 
     quic:close(ConnRef, normal),

@@ -250,7 +250,7 @@ loss_many_packets_in_flight_test() ->
     %% ACK all packets
     AckFrame = {ack, NumPackets - 1, 0, NumPackets - 1, []},
     Now = erlang:monotonic_time(millisecond),
-    {S2, Acked, Lost} = quic_loss:on_ack_received(S1, AckFrame, Now),
+    {S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(S1, AckFrame, Now),
 
     ?assertEqual(NumPackets, length(Acked)),
     ?assertEqual(0, length(Lost)),
@@ -273,7 +273,7 @@ loss_detection_with_gaps_test() ->
     %% With packet threshold of 3, packets 0,1,2 should be marked lost
     AckFrame = {ack, 9, 0, 4, []},
     Now = erlang:monotonic_time(millisecond) + 100,
-    {_S2, Acked, Lost} = quic_loss:on_ack_received(S1, AckFrame, Now),
+    {_S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(S1, AckFrame, Now),
 
     ?assertEqual(5, length(Acked)),
     %% Packets 0, 1, 2 should be lost (9 - 3 = 6, so 0-2 are lost)
@@ -293,7 +293,7 @@ loss_rtt_calculation_under_load_test() ->
             timer:sleep(1),
             Now = erlang:monotonic_time(millisecond),
             AckFrame = {ack, N, 0, 0, []},
-            {S2, _, _} = quic_loss:on_ack_received(S1, AckFrame, Now),
+            {S2, _, _, _} = quic_loss:on_ack_received(S1, AckFrame, Now),
             S2
         end,
         State,

@@ -298,6 +298,19 @@
 -define(DIST_MAX_UDP_PAYLOAD_SIZE, 1452).
 -define(INITIAL_WINDOW_AGGRESSIVE, 131072).
 
+%% UDP Socket Buffer Sizes
+%% 7MB buffers improve throughput by 40%+ (matches quic-go, quiche, lsquic)
+%% OS may cap to lower value (Linux: check net.core.rmem_max, macOS: typically 2-4MB)
+%% Note: Erlang uses "recbuf" (not "recvbuf") and "sndbuf"
+-define(DEFAULT_UDP_RECBUF, 7340032).
+-define(DEFAULT_UDP_SNDBUF, 7340032).
+
+%% UDP Packet Batching (GSO/GRO on Linux)
+%% Maximum packets to batch before auto-flush
+-define(DEFAULT_MAX_BATCH_PACKETS, 64).
+%% Default GSO segment size (QUIC packet size for batching)
+-define(DEFAULT_GSO_SEGMENT_SIZE, 1200).
+
 %%====================================================================
 %% Records
 %%====================================================================

@@ -59,7 +59,9 @@
     %% Queries
     sent_packets/1,
     bytes_in_flight/1,
-    pto_count/1
+    pto_count/1,
+    oldest_unacked/1,
+    has_rtt_sample/1
 ]).
 
 %% Constants from RFC 9002
@@ -68,18 +70,22 @@
 -define(TIME_THRESHOLD, 1.125).
 % 1 millisecond
 -define(GRANULARITY, 1).
-% 333 milliseconds
--define(INITIAL_RTT, 333).
+% RFC 9002 default is 333ms, but 100ms is more aggressive for faster ramp-up
+-define(DEFAULT_INITIAL_RTT, 100).
 
 %% Loss detection state
 -record(loss_state, {
     %% Sent packets: #{PN => #sent_packet{}}
     sent_packets = #{} :: #{non_neg_integer() => #sent_packet{}},
 
+    %% Sorted packet numbers for O(log n) range lookups
+    %% Used by ACK processing to avoid O(n) map fold
+    pn_set = gb_sets:new() :: gb_sets:set(non_neg_integer()),
+
     %% RTT estimation
     latest_rtt = 0 :: non_neg_integer(),
-    smoothed_rtt = ?INITIAL_RTT :: non_neg_integer(),
-    rtt_var = ?INITIAL_RTT div 2 :: non_neg_integer(),
+    smoothed_rtt = ?DEFAULT_INITIAL_RTT :: non_neg_integer(),
+    rtt_var = ?DEFAULT_INITIAL_RTT div 2 :: non_neg_integer(),
     min_rtt = infinity :: non_neg_integer() | infinity,
     first_rtt_sample = false :: boolean(),
 
@@ -92,6 +98,9 @@
 
     %% Bytes in flight
     bytes_in_flight = 0 :: non_neg_integer(),
+
+    %% Cached oldest unacked packet (for O(1) PTO probe selection)
+    oldest_unacked_pn = undefined :: non_neg_integer() | undefined,
 
     %% Configuration
     max_ack_delay = ?DEFAULT_MAX_ACK_DELAY :: non_neg_integer()
@@ -110,9 +119,15 @@ new() ->
     new(#{}).
 
 %% @doc Create a new loss detection state with options.
+%% Options:
+%%   - max_ack_delay: Maximum ACK delay (default: 25ms)
+%%   - initial_rtt: Initial RTT estimate in ms (default: 100ms)
 -spec new(map()) -> loss_state().
 new(Opts) ->
+    InitialRTT = maps:get(initial_rtt, Opts, ?DEFAULT_INITIAL_RTT),
     #loss_state{
+        smoothed_rtt = InitialRTT,
+        rtt_var = InitialRTT div 2,
         max_ack_delay = maps:get(max_ack_delay, Opts, ?DEFAULT_MAX_ACK_DELAY)
     }.
 
@@ -130,7 +145,12 @@ on_packet_sent(State, PacketNumber, Size, AckEliciting) ->
 -spec on_packet_sent(loss_state(), non_neg_integer(), non_neg_integer(), boolean(), [term()]) ->
     loss_state().
 on_packet_sent(
-    #loss_state{sent_packets = Sent, bytes_in_flight = InFlight} = State,
+    #loss_state{
+        sent_packets = Sent,
+        pn_set = PNSet,
+        bytes_in_flight = InFlight,
+        oldest_unacked_pn = OldestPN
+    } = State,
     PacketNumber,
     Size,
     AckEliciting,
@@ -150,32 +170,50 @@ on_packet_sent(
             true -> InFlight + Size;
             false -> InFlight
         end,
+    %% Update oldest unacked packet number
+    NewOldestPN =
+        case OldestPN of
+            undefined -> PacketNumber;
+            _ when PacketNumber < OldestPN -> PacketNumber;
+            _ -> OldestPN
+        end,
     %% NOTE: pto_count is NOT reset here per RFC 9002.
     %% PTO count is only reset when receiving an ACK (in on_ack_received).
     %% Resetting on send would break exponential backoff for probe retransmissions.
     State#loss_state{
         sent_packets = maps:put(PacketNumber, SentPacket, Sent),
-        bytes_in_flight = NewInFlight
+        pn_set = gb_sets:add_element(PacketNumber, PNSet),
+        bytes_in_flight = NewInFlight,
+        oldest_unacked_pn = NewOldestPN
     }.
 
 %% @doc Process an ACK frame.
-%% Returns {NewState, AckedPackets, LostPackets} or {error, ack_range_too_large}
+%% Returns {NewState, AckedPackets, LostPackets, AckMeta} or {error, ack_range_too_large}
+%% AckMeta is a map containing:
+%%   - acked_bytes: total bytes from ack-eliciting packets that were acknowledged
+%%   - largest_ae_time: sent_time of the largest ack-eliciting packet acknowledged
 -spec on_ack_received(loss_state(), term(), non_neg_integer()) ->
-    {loss_state(), [#sent_packet{}], [#sent_packet{}]} | {error, ack_range_too_large}.
+    {loss_state(), [#sent_packet{}], [#sent_packet{}], map()} | {error, ack_range_too_large}.
 on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now) ->
-    %% Get list of acknowledged packet numbers (use quic_ack for bounds-checked version)
-    case quic_ack:ack_frame_to_pn_list(LargestAcked, FirstRange, AckRanges) of
+    %% Get acknowledged ranges (more efficient than expanded list)
+    case quic_ack:ack_frame_to_ranges(LargestAcked, FirstRange, AckRanges) of
         {error, _} = Error ->
             Error;
-        AckedPNs ->
-            %% Find packets that were acknowledged
-            {AckedPackets, NewSent, RemovedBytes} = remove_acked_packets(
-                AckedPNs, State#loss_state.sent_packets
-            ),
+        AckedRanges ->
+            %% Find packets that were acknowledged using ranges
+            %% Uses pn_set for O(k log n) lookup instead of O(n) map fold
+            %% MaxAckEliciting is {PN, TimeSent} for largest ack-eliciting packet
+            %% RemovedBytes only counts ack-eliciting packet sizes (per RFC 9002)
+            {AckedPackets, NewSent, NewPNSet, AckedBytes, MaxAckEliciting} =
+                remove_acked_packets_ranges(
+                    AckedRanges,
+                    State#loss_state.sent_packets,
+                    State#loss_state.pn_set
+                ),
 
             %% Update RTT if we got the largest acknowledged
             NewState1 =
-                case lists:member(LargestAcked, AckedPNs) of
+                case pn_in_ranges(LargestAcked, AckedRanges) of
                     true ->
                         case maps:get(LargestAcked, State#loss_state.sent_packets, undefined) of
                             #sent_packet{time_sent = TimeSent, ack_eliciting = true} ->
@@ -190,20 +228,50 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
                 end,
 
             %% Detect lost packets
-            {LostPackets, NewSent2, LostBytes} = detect_lost_packets(
-                NewSent, NewState1#loss_state.smoothed_rtt, LargestAcked, Now
+            {LostPackets, NewSent2, NewPNSet2, LostBytes, LargestLostSentTime} = detect_lost_packets(
+                NewSent, NewPNSet, NewState1#loss_state.smoothed_rtt, LargestAcked, Now
             ),
 
+            %% Update oldest unacked PN if needed
+            %% Use pn_set for O(log n) lookup of smallest element
+            OldOldestPN = State#loss_state.oldest_unacked_pn,
+            NewOldestPN =
+                case OldOldestPN of
+                    undefined ->
+                        find_oldest_pn_set(NewPNSet2);
+                    _ ->
+                        case maps:is_key(OldOldestPN, NewSent2) of
+                            true -> OldOldestPN;
+                            false -> find_oldest_pn_set(NewPNSet2)
+                        end
+                end,
+
             %% Update state
-            NewInFlight = max(0, State#loss_state.bytes_in_flight - RemovedBytes - LostBytes),
+            NewInFlight = max(0, State#loss_state.bytes_in_flight - AckedBytes - LostBytes),
             NewState2 = NewState1#loss_state{
                 sent_packets = NewSent2,
+                pn_set = NewPNSet2,
                 bytes_in_flight = NewInFlight,
                 time_of_last_ack = Now,
-                pto_count = 0
+                pto_count = 0,
+                oldest_unacked_pn = NewOldestPN
             },
 
-            {NewState2, AckedPackets, LostPackets}
+            %% Build metadata for caller (avoids redundant scanning in quic_connection)
+            LargestAETime =
+                case MaxAckEliciting of
+                    undefined -> Now;
+                    {_AckPN, AckTimeSent} -> AckTimeSent
+                end,
+            AckMeta = #{
+                acked_bytes => AckedBytes,
+                largest_ae_time => LargestAETime,
+                has_ack_eliciting => MaxAckEliciting =/= undefined,
+                lost_bytes => LostBytes,
+                largest_lost_sent_time => LargestLostSentTime
+            },
+
+            {NewState2, AckedPackets, LostPackets, AckMeta}
     end;
 on_ack_received(State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, _, _, _}, Now) ->
     on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now).
@@ -216,64 +284,185 @@ on_ack_received(State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, 
 -spec detect_lost_packets(loss_state(), non_neg_integer()) ->
     {loss_state(), [#sent_packet{}]}.
 detect_lost_packets(
-    #loss_state{sent_packets = Sent, smoothed_rtt = SRTT} = State,
+    #loss_state{sent_packets = Sent, pn_set = PNSet, smoothed_rtt = SRTT} = State,
     LargestAcked
 ) ->
     Now = erlang:monotonic_time(millisecond),
-    {LostPackets, NewSent, LostBytes} = detect_lost_packets(Sent, SRTT, LargestAcked, Now),
+    {LostPackets, NewSent, NewPNSet, LostBytes, _LargestLostSentTime} =
+        detect_lost_packets(Sent, PNSet, SRTT, LargestAcked, Now),
     NewState = State#loss_state{
         sent_packets = NewSent,
+        pn_set = NewPNSet,
         bytes_in_flight = max(0, State#loss_state.bytes_in_flight - LostBytes)
     },
     {NewState, LostPackets}.
 
-%% Internal loss detection
+%% Internal loss detection with pn_set
 %% IMPORTANT: Only count ack-eliciting packet sizes in LostBytes since
 %% bytes_in_flight only tracks ack-eliciting packets (RFC 9002).
-detect_lost_packets(SentPackets, SmoothedRTT, LargestAcked, Now) ->
+%%
+%% Uses pn_set iterator to only check packets below LossThreshold for
+%% efficient O(k) loss detection where k is the number of lost packets.
+%% Returns {LostPackets, Remaining, NewPNSet, LostBytes, LargestLostSentTime}
+%% where LargestLostSentTime is the sent_time of the packet with highest PN.
+detect_lost_packets(SentPackets, PNSet, SmoothedRTT, LargestAcked, Now) ->
     %% Calculate loss delay
     LossDelay = max(trunc(?TIME_THRESHOLD * SmoothedRTT), ?GRANULARITY),
 
-    %% Find lost packets
-    {Lost, Remaining, LostBytes} = maps:fold(
-        fun
-            (
-                PN,
+    %% Packet threshold for loss detection (PN < LargestAcked - threshold)
+    LossThreshold = LargestAcked - ?PACKET_THRESHOLD + 1,
+
+    %% Iterate only packets below loss threshold for efficiency
+    %% Also check time-based loss for packets below LargestAcked
+    %% Track largest lost packet (by PN) for congestion event reporting
+    Iter = gb_sets:iterator(PNSet),
+    {LostPNs, Lost, LostBytes, LargestLost} = detect_lost_iter(
+        Iter, SentPackets, LossThreshold, LargestAcked, LossDelay, Now, [], [], 0, undefined
+    ),
+
+    %% Remove lost packets from sent map and pn_set
+    Remaining = maps:without(LostPNs, SentPackets),
+    %% Use foldl with delete_any for O(k * log n) instead of O(n) subtract
+    NewPNSet = lists:foldl(fun gb_sets:delete_any/2, PNSet, LostPNs),
+
+    %% Extract sent_time from largest lost packet (for congestion event)
+    LargestLostSentTime =
+        case LargestLost of
+            undefined -> undefined;
+            {_PN, TimeSent} -> TimeSent
+        end,
+
+    {Lost, Remaining, NewPNSet, LostBytes, LargestLostSentTime}.
+
+%% Iterator-based loss detection
+%% Also tracks largest lost packet (by PN) for congestion event reporting
+detect_lost_iter(
+    Iter,
+    SentPackets,
+    LossThreshold,
+    LargestAcked,
+    LossDelay,
+    Now,
+    PNsAcc,
+    LostAcc,
+    BytesAcc,
+    LargestLost
+) ->
+    case gb_sets:next(Iter) of
+        none ->
+            {PNsAcc, LostAcc, BytesAcc, LargestLost};
+        {PN, _NextIter} when PN >= LargestAcked ->
+            %% No more packets can be lost (packet number >= largest acked)
+            {PNsAcc, LostAcc, BytesAcc, LargestLost};
+        {PN, NextIter} ->
+            case maps:get(PN, SentPackets, undefined) of
                 #sent_packet{
                     time_sent = TimeSent,
                     size = Size,
                     in_flight = true,
                     ack_eliciting = AckEliciting
-                } = Packet,
-                {LostAcc, RemAcc, BytesAcc}
-            ) ->
-                %% Check packet threshold (RFC 9002 Section 6.1.1)
-                PacketLost = (LargestAcked - PN) >= ?PACKET_THRESHOLD,
-                %% Check time threshold (RFC 9002 Section 6.1.2)
-                %% IMPORTANT: Time-based loss ONLY applies to packets with PN < LargestAcked
-                %% to prevent spurious loss when no later packet has been acknowledged
-                TimeLost = (PN < LargestAcked) andalso ((Now - TimeSent) > LossDelay),
+                } = Packet ->
+                    %% Check packet threshold (RFC 9002 Section 6.1.1)
+                    PacketLost = PN < LossThreshold,
+                    %% Check time threshold (RFC 9002 Section 6.1.2)
+                    TimeLost = (Now - TimeSent) > LossDelay,
 
-                case PacketLost orelse TimeLost of
-                    true ->
-                        %% Only count ack-eliciting packet sizes for bytes_in_flight
-                        NewBytes =
-                            case AckEliciting of
-                                true -> BytesAcc + Size;
-                                false -> BytesAcc
-                            end,
-                        {[Packet | LostAcc], RemAcc, NewBytes};
-                    false ->
-                        {LostAcc, maps:put(PN, Packet, RemAcc), BytesAcc}
-                end;
-            (PN, Packet, {LostAcc, RemAcc, BytesAcc}) ->
-                {LostAcc, maps:put(PN, Packet, RemAcc), BytesAcc}
+                    IsLost = PacketLost orelse TimeLost,
+                    Ctx = {NextIter, SentPackets, LossThreshold, LargestAcked, LossDelay, Now},
+                    detect_lost_maybe(
+                        IsLost,
+                        Ctx,
+                        Packet,
+                        AckEliciting,
+                        Size,
+                        PN,
+                        TimeSent,
+                        PNsAcc,
+                        LostAcc,
+                        BytesAcc,
+                        LargestLost
+                    );
+                _ ->
+                    %% Not in flight or not found, skip
+                    detect_lost_iter(
+                        NextIter,
+                        SentPackets,
+                        LossThreshold,
+                        LargestAcked,
+                        LossDelay,
+                        Now,
+                        PNsAcc,
+                        LostAcc,
+                        BytesAcc,
+                        LargestLost
+                    )
+            end
+    end.
+
+%% Helper to reduce nesting in detect_lost_iter
+%% When a packet is lost, update LargestLost if this packet has a higher PN
+detect_lost_maybe(
+    true,
+    {NextIter, SentPackets, LossThreshold, LargestAcked, LossDelay, Now},
+    Packet,
+    AckEliciting,
+    Size,
+    PN,
+    TimeSent,
+    PNsAcc,
+    LostAcc,
+    BytesAcc,
+    LargestLost
+) ->
+    NewBytes =
+        case AckEliciting of
+            true -> BytesAcc + Size;
+            false -> BytesAcc
         end,
-        {[], #{}, 0},
-        SentPackets
-    ),
-
-    {Lost, Remaining, LostBytes}.
+    %% Update largest lost packet (by PN) for congestion event
+    NewLargestLost =
+        case LargestLost of
+            undefined -> {PN, TimeSent};
+            {OldPN, _} when PN > OldPN -> {PN, TimeSent};
+            _ -> LargestLost
+        end,
+    detect_lost_iter(
+        NextIter,
+        SentPackets,
+        LossThreshold,
+        LargestAcked,
+        LossDelay,
+        Now,
+        [PN | PNsAcc],
+        [Packet | LostAcc],
+        NewBytes,
+        NewLargestLost
+    );
+detect_lost_maybe(
+    false,
+    {NextIter, SentPackets, LossThreshold, LargestAcked, LossDelay, Now},
+    _Packet,
+    _AckEliciting,
+    _Size,
+    _PN,
+    _TimeSent,
+    PNsAcc,
+    LostAcc,
+    BytesAcc,
+    LargestLost
+) ->
+    detect_lost_iter(
+        NextIter,
+        SentPackets,
+        LossThreshold,
+        LargestAcked,
+        LossDelay,
+        Now,
+        PNsAcc,
+        LostAcc,
+        BytesAcc,
+        LargestLost
+    ).
 
 %% @doc Get the loss time for setting timers.
 -spec get_loss_time_and_space(loss_state()) ->
@@ -403,32 +592,156 @@ bytes_in_flight(#loss_state{bytes_in_flight = B}) -> B.
 -spec pto_count(loss_state()) -> non_neg_integer().
 pto_count(#loss_state{pto_count = C}) -> C.
 
+%% @doc Get the oldest unacked packet (for PTO probe selection).
+%% Returns {ok, #sent_packet{}} or none.
+-spec oldest_unacked(loss_state()) -> {ok, #sent_packet{}} | none.
+oldest_unacked(#loss_state{oldest_unacked_pn = undefined}) ->
+    none;
+oldest_unacked(#loss_state{oldest_unacked_pn = PN, sent_packets = Sent}) ->
+    case maps:get(PN, Sent, undefined) of
+        undefined -> none;
+        Packet -> {ok, Packet}
+    end.
+
+%% @doc Check if we have received a real RTT sample.
+%% Returns false until the first ACK provides a real RTT measurement.
+-spec has_rtt_sample(loss_state()) -> boolean().
+has_rtt_sample(#loss_state{first_rtt_sample = HasSample}) -> HasSample.
+
 %%====================================================================
 %% Internal Functions
 %%====================================================================
 
-%% Remove acknowledged packets from sent map
+%% Find the minimum packet number using pn_set.
+%% O(log n) using gb_sets:smallest instead of O(n) maps:keys + lists:min.
+find_oldest_pn_set(PNSet) ->
+    case gb_sets:is_empty(PNSet) of
+        true -> undefined;
+        false -> gb_sets:smallest(PNSet)
+    end.
+
+%% Remove acknowledged packets using ranges with pn_set for O(k log n) lookup.
+%% Uses the sorted pn_set to efficiently find packets in ACK ranges.
 %% IMPORTANT: Only count ack-eliciting packet sizes in AccBytes since
 %% bytes_in_flight only tracks ack-eliciting packets (RFC 9002).
-remove_acked_packets(AckedPNs, SentPackets) ->
-    lists:foldl(
-        fun(PN, {AccPackets, AccSent, AccBytes}) ->
-            case maps:take(PN, AccSent) of
-                {#sent_packet{size = Size, ack_eliciting = AckEliciting} = Packet, NewSent} ->
-                    %% Only count ack-eliciting packet sizes for bytes_in_flight
-                    NewBytes =
-                        case AckEliciting of
-                            true -> AccBytes + Size;
-                            false -> AccBytes
-                        end,
-                    {[Packet | AccPackets], NewSent, NewBytes};
-                error ->
-                    {AccPackets, AccSent, AccBytes}
+%% Returns {AckedPackets, NewSent, NewPNSet, AckedBytes, MaxAckElicitingInfo}
+%% where MaxAckElicitingInfo is {PN, TimeSent} for the largest ack-eliciting packet.
+%%
+%% Single range case (most common) - use iterator-based lookup
+remove_acked_packets_ranges([{RangeStart, RangeEnd}], SentPackets, PNSet) ->
+    %% Use pn_set iterator starting from RangeStart for efficiency
+    {AckedPNs, AckedPackets, AckedBytes, MaxAckEliciting} =
+        find_acked_in_range(RangeStart, RangeEnd, PNSet, SentPackets),
+    NewSent = maps:without(AckedPNs, SentPackets),
+    %% Use foldl with delete_any for O(k * log n) instead of O(n) subtract
+    NewPNSet = lists:foldl(fun gb_sets:delete_any/2, PNSet, AckedPNs),
+    {AckedPackets, NewSent, NewPNSet, AckedBytes, MaxAckEliciting};
+%% Multi-range case - process each range
+remove_acked_packets_ranges(AckedRanges, SentPackets, PNSet) ->
+    %% Process each range and accumulate results
+    {AckedPNs, AckedPackets, AckedBytes, MaxAckEliciting, _, _} =
+        lists:foldl(
+            fun ack_range_folder/2,
+            {[], [], 0, undefined, PNSet, SentPackets},
+            AckedRanges
+        ),
+    NewSent = maps:without(AckedPNs, SentPackets),
+    %% Use foldl with delete_any for O(k * log n) instead of O(n) subtract
+    NewPNSet = lists:foldl(fun gb_sets:delete_any/2, PNSet, AckedPNs),
+    {AckedPackets, NewSent, NewPNSet, AckedBytes, MaxAckEliciting}.
+
+%% Folder function for processing ACK ranges
+ack_range_folder({RangeStart, RangeEnd}, {PNsAcc, PacketsAcc, BytesAcc, MaxAE, PNSet, SentPackets}) ->
+    {RangePNs, RangePackets, RangeBytes, RangeMaxAE} =
+        find_acked_in_range(RangeStart, RangeEnd, PNSet, SentPackets),
+    NewMaxAE = merge_max_ae(MaxAE, RangeMaxAE),
+    {
+        RangePNs ++ PNsAcc,
+        RangePackets ++ PacketsAcc,
+        BytesAcc + RangeBytes,
+        NewMaxAE,
+        PNSet,
+        SentPackets
+    }.
+
+%% Find all acked packets in a single range using pn_set iterator
+find_acked_in_range(RangeStart, RangeEnd, PNSet, SentPackets) ->
+    %% Get iterator starting from RangeStart
+    Iter = gb_sets:iterator_from(RangeStart, PNSet),
+    find_acked_iter(Iter, RangeEnd, SentPackets, [], [], 0, undefined).
+
+find_acked_iter(Iter, RangeEnd, SentPackets, PNsAcc, PacketsAcc, BytesAcc, MaxAE) ->
+    case gb_sets:next(Iter) of
+        none ->
+            {PNsAcc, PacketsAcc, BytesAcc, MaxAE};
+        {PN, _NextIter} when PN > RangeEnd ->
+            %% Past the range, done
+            {PNsAcc, PacketsAcc, BytesAcc, MaxAE};
+        {PN, NextIter} ->
+            %% PN is in range [RangeStart, RangeEnd]
+            case maps:get(PN, SentPackets, undefined) of
+                #sent_packet{size = Size, ack_eliciting = AckEliciting, time_sent = TimeSent} =
+                        Packet ->
+                    {NewBytes, NewMaxAE} = update_acked_stats(
+                        AckEliciting, Size, PN, TimeSent, BytesAcc, MaxAE
+                    ),
+                    find_acked_iter(
+                        NextIter,
+                        RangeEnd,
+                        SentPackets,
+                        [PN | PNsAcc],
+                        [Packet | PacketsAcc],
+                        NewBytes,
+                        NewMaxAE
+                    );
+                undefined ->
+                    %% PN in set but not in sent_packets (shouldn't happen, but handle it)
+                    find_acked_iter(
+                        NextIter,
+                        RangeEnd,
+                        SentPackets,
+                        PNsAcc,
+                        PacketsAcc,
+                        BytesAcc,
+                        MaxAE
+                    )
             end
-        end,
-        {[], SentPackets, 0},
-        AckedPNs
-    ).
+    end.
+
+%% Merge max ack-eliciting info, keeping the larger PN
+merge_max_ae(undefined, New) ->
+    New;
+merge_max_ae(Old, undefined) ->
+    Old;
+merge_max_ae({OldPN, _} = Old, {NewPN, _} = New) ->
+    case NewPN > OldPN of
+        true -> New;
+        false -> Old
+    end.
+
+%% Update acked bytes and track largest ack-eliciting packet
+update_acked_stats(true, Size, PN, TimeSent, BytesAcc, undefined) ->
+    {BytesAcc + Size, {PN, TimeSent}};
+update_acked_stats(true, Size, PN, TimeSent, BytesAcc, {OldPN, _}) when PN > OldPN ->
+    {BytesAcc + Size, {PN, TimeSent}};
+update_acked_stats(true, Size, _PN, _TimeSent, BytesAcc, MaxAE) ->
+    {BytesAcc + Size, MaxAE};
+update_acked_stats(false, _Size, _PN, _TimeSent, BytesAcc, MaxAE) ->
+    {BytesAcc, MaxAE}.
+
+%% Check if a packet number is in any of the acknowledged ranges.
+%% Ranges is a list of {Start, End} tuples where Start =< End,
+%% sorted in descending order (highest PN first).
+pn_in_ranges(_PN, []) ->
+    false;
+pn_in_ranges(PN, [{Start, End} | _Rest]) when PN >= Start, PN =< End ->
+    true;
+pn_in_ranges(PN, [{_Start, End} | _Rest]) when PN > End ->
+    %% Early exit: ranges are sorted descending, so if PN > End of current range,
+    %% it can't be in any subsequent range (they all have lower End values)
+    false;
+pn_in_ranges(PN, [_Range | Rest]) ->
+    pn_in_ranges(PN, Rest).
 
 %% Convert encoded ACK delay to milliseconds
 ack_delay_to_ms(AckDelay, #loss_state{}) ->

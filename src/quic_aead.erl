@@ -36,7 +36,15 @@
     protect_header/4,
     unprotect_header/4,
     compute_nonce/2,
-    compute_hp_mask/3
+    compute_hp_mask/3,
+    %% Consolidated packet protection API
+    protect_short_packet/8,
+    protect_long_packet/7,
+    unprotect_short_packet/7,
+    unprotect_long_packet/7,
+    %% 2-stage short header receive API (for key-phase handling)
+    unprotect_short_header/4,
+    decrypt_short_payload/8
 ]).
 
 -export_type([cipher/0]).
@@ -185,7 +193,13 @@ unprotect_header(HP, ProtectedHeader, EncryptedPayload, _PNOffset) ->
 
             %% PN is at the start of EncryptedPayload, unmask it
             <<ProtectedPN:PNLen/binary, _/binary>> = EncryptedPayload,
-            PNMask = binary:part(<<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>, 0, PNLen),
+            PNMask =
+                case PNLen of
+                    1 -> <<MaskByte1>>;
+                    2 -> <<MaskByte1, MaskByte2>>;
+                    3 -> <<MaskByte1, MaskByte2, MaskByte3>>;
+                    4 -> <<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>
+                end,
             PN = crypto:exor(ProtectedPN, PNMask),
 
             %% Return unprotected header (first byte + rest) with PN appended
@@ -197,10 +211,8 @@ unprotect_header(HP, ProtectedHeader, EncryptedPayload, _PNOffset) ->
 %% RFC 9001 Section 5.3: The 64 bits of the reconstructed QUIC packet number
 %% in network byte order are left-padded with zeros to the size of the IV.
 -spec compute_nonce(binary(), non_neg_integer()) -> binary().
-compute_nonce(IV, PN) when byte_size(IV) =:= 12 ->
-    %% Left-pad 64-bit PN to 12 bytes (96 bits) and XOR with IV
-    PNPadded = <<0:32, PN:64>>,
-    crypto:exor(IV, PNPadded).
+compute_nonce(<<IV0:32, IV1:64>>, PN) ->
+    <<IV0:32, (IV1 bxor PN):64>>.
 
 %%====================================================================
 %% Internal Functions
@@ -255,7 +267,290 @@ apply_header_mask(Header, Mask, PNOffset) ->
     <<BeforePN:BeforePNLen/binary, PN:PNLen/binary, AfterPN/binary>> = Rest,
 
     %% Mask PN bytes
-    PNMask = binary:part(<<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>, 0, PNLen),
+    PNMask =
+        case PNLen of
+            1 -> <<MaskByte1>>;
+            2 -> <<MaskByte1, MaskByte2>>;
+            3 -> <<MaskByte1, MaskByte2, MaskByte3>>;
+            4 -> <<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>
+        end,
     ProtectedPN = crypto:exor(PN, PNMask),
 
     <<ProtectedFirstByte, BeforePN/binary, ProtectedPN/binary, AfterPN/binary>>.
+
+%%====================================================================
+%% Consolidated Packet Protection API
+%%====================================================================
+
+%% @doc Protect a short header (1-RTT) packet.
+%% Performs encryption and header protection in a single call.
+%%
+%% Cipher: AEAD cipher type
+%% Key: AEAD key
+%% IV: AEAD initialization vector
+%% HP: Header protection key
+%% PN: Packet number
+%% FirstByte: First byte of header (includes spin bit, key phase, etc.)
+%% DCID: Destination Connection ID
+%% Plaintext: Payload to encrypt
+%%
+%% Returns: Complete protected packet binary
+-spec protect_short_packet(
+    cipher(),
+    binary(),
+    binary(),
+    binary(),
+    non_neg_integer(),
+    byte(),
+    binary(),
+    binary()
+) -> binary().
+protect_short_packet(Cipher, Key, IV, HP, PN, FirstByte, DCID, Plaintext) ->
+    PNLen = pn_length(PN),
+    PNBin = encode_pn(PN, PNLen),
+    HeaderPrefix = <<FirstByte, DCID/binary>>,
+    protect_packet_common(Cipher, Key, IV, HP, PN, HeaderPrefix, PNBin, Plaintext).
+
+%% @doc Protect a long header (Initial/Handshake/0-RTT) packet.
+%% Performs encryption and header protection in a single call.
+%%
+%% Cipher: AEAD cipher type
+%% Key: AEAD key
+%% IV: AEAD initialization vector
+%% HP: Header protection key
+%% PN: Packet number
+%% HeaderPrefix: Long header up to (but not including) the packet number
+%% Plaintext: Payload to encrypt
+%%
+%% Returns: Complete protected packet binary
+-spec protect_long_packet(
+    cipher(),
+    binary(),
+    binary(),
+    binary(),
+    non_neg_integer(),
+    binary(),
+    binary()
+) -> binary().
+protect_long_packet(Cipher, Key, IV, HP, PN, HeaderPrefix, Plaintext) ->
+    PNLen = pn_length(PN),
+    PNBin = encode_pn(PN, PNLen),
+    protect_packet_common(Cipher, Key, IV, HP, PN, HeaderPrefix, PNBin, Plaintext).
+
+%% @doc Shared core for packet protection.
+%% Encrypts payload with AEAD, then applies header protection.
+protect_packet_common(Cipher, Key, IV, HP, PN, HeaderPrefix, PNBin, Plaintext) ->
+    AAD = <<HeaderPrefix/binary, PNBin/binary>>,
+    Nonce = compute_nonce(IV, PN),
+    {Ciphertext, Tag} = crypto:crypto_one_time_aead(
+        Cipher, Key, Nonce, Plaintext, AAD, ?TAG_LEN, true
+    ),
+    EncryptedPayload = <<Ciphertext/binary, Tag/binary>>,
+    PNOffset = byte_size(HeaderPrefix),
+    ProtectedHeader = protect_header(HP, AAD, EncryptedPayload, PNOffset),
+    <<ProtectedHeader/binary, EncryptedPayload/binary>>.
+
+%% @doc Unprotect and decrypt a short header (1-RTT) packet.
+%%
+%% Cipher: AEAD cipher type
+%% Key: AEAD key
+%% IV: AEAD initialization vector
+%% HP: Header protection key
+%% Header: Protected header (first byte + DCID, without PN)
+%% EncryptedPayload: PN bytes + ciphertext + tag
+%% LargestRecv: Largest received packet number for PN reconstruction
+%%
+%% Returns: {ok, PN, UnprotectedHeader, Plaintext} | {error, term()}
+-spec unprotect_short_packet(
+    cipher(),
+    binary(),
+    binary(),
+    binary(),
+    binary(),
+    binary(),
+    non_neg_integer() | undefined
+) ->
+    {ok, non_neg_integer(), binary(), binary()} | {error, term()}.
+unprotect_short_packet(Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRecv) ->
+    unprotect_packet_common(Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRecv).
+
+%% @doc Unprotect and decrypt a long header (Initial/Handshake/0-RTT) packet.
+%%
+%% Cipher: AEAD cipher type
+%% Key: AEAD key
+%% IV: AEAD initialization vector
+%% HP: Header protection key
+%% Header: Protected header up to (but not including) the PN
+%% EncryptedPayload: PN bytes + ciphertext + tag
+%% LargestRecv: Largest received packet number for PN reconstruction
+%%
+%% Returns: {ok, PN, UnprotectedHeader, Plaintext} | {error, term()}
+-spec unprotect_long_packet(
+    cipher(),
+    binary(),
+    binary(),
+    binary(),
+    binary(),
+    binary(),
+    non_neg_integer() | undefined
+) ->
+    {ok, non_neg_integer(), binary(), binary()} | {error, term()}.
+unprotect_long_packet(Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRecv) ->
+    unprotect_packet_common(Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRecv).
+
+%% @doc Shared core for packet unprotection.
+%% Removes header protection, reconstructs PN, and decrypts payload.
+unprotect_packet_common(Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRecv) ->
+    PNOffset = byte_size(Header),
+    case unprotect_header(HP, Header, EncryptedPayload, PNOffset) of
+        {error, Reason} ->
+            {error, {header_unprotect_failed, Reason}};
+        {UnprotectedHeader, PNLen} ->
+            %% Extract truncated PN
+            UnprotHeaderLen = byte_size(UnprotectedHeader),
+            <<_:((UnprotHeaderLen - PNLen) * 8), TruncatedPN:PNLen/unit:8>> = UnprotectedHeader,
+
+            %% Reconstruct full PN
+            PN = reconstruct_pn(LargestRecv, TruncatedPN, PNLen),
+
+            %% AAD is the full unprotected header
+            AAD = UnprotectedHeader,
+
+            %% Ciphertext starts after PN bytes
+            <<_:PNLen/binary, Ciphertext/binary>> = EncryptedPayload,
+
+            %% Decrypt
+            Nonce = compute_nonce(IV, PN),
+            CipherLen = byte_size(Ciphertext) - ?TAG_LEN,
+            <<CiphertextOnly:CipherLen/binary, Tag:?TAG_LEN/binary>> = Ciphertext,
+            case
+                crypto:crypto_one_time_aead(
+                    Cipher, Key, Nonce, CiphertextOnly, AAD, Tag, false
+                )
+            of
+                Plaintext when is_binary(Plaintext) ->
+                    {ok, PN, UnprotectedHeader, Plaintext};
+                error ->
+                    {error, decryption_failed}
+            end
+    end.
+
+%%====================================================================
+%% 2-Stage Short Header Receive API
+%%====================================================================
+%% For 1-RTT packets, key selection depends on the key_phase bit which
+%% is header-protected. This 2-stage API allows:
+%% 1. Unprotect header to recover key_phase, then select correct keys
+%% 2. Decrypt payload with selected keys
+
+%% @doc Stage 1: Unprotect short header to recover key_phase and PN info.
+%% Uses HP key (same regardless of key phase) to unprotect header.
+%%
+%% HP: Header protection key
+%% Header: Protected header (first byte + DCID)
+%% EncryptedPayload: PN bytes + ciphertext + tag
+%% PNOffset: Offset to packet number in header (= byte_size(Header))
+%%
+%% Returns: {ok, KeyPhase, PNLen, TruncatedPN, UnprotectedHeader} | {error, term()}
+-spec unprotect_short_header(binary(), binary(), binary(), non_neg_integer()) ->
+    {ok, 0 | 1, 1..4, non_neg_integer(), binary()} | {error, term()}.
+unprotect_short_header(HP, Header, EncryptedPayload, PNOffset) ->
+    case unprotect_header(HP, Header, EncryptedPayload, PNOffset) of
+        {error, Reason} ->
+            {error, {header_unprotect_failed, Reason}};
+        {UnprotectedHeader, PNLen} ->
+            %% Extract key_phase from unprotected first byte (bit 2)
+            <<FirstByte, _/binary>> = UnprotectedHeader,
+            KeyPhase = (FirstByte bsr 2) band 1,
+
+            %% Extract truncated PN
+            UnprotHeaderLen = byte_size(UnprotectedHeader),
+            <<_:((UnprotHeaderLen - PNLen) * 8), TruncatedPN:PNLen/unit:8>> = UnprotectedHeader,
+
+            {ok, KeyPhase, PNLen, TruncatedPN, UnprotectedHeader}
+    end.
+
+%% @doc Stage 2: Decrypt short packet payload after key selection.
+%% Called after unprotect_short_header with the correct keys based on key_phase.
+%%
+%% Cipher: AEAD cipher type
+%% Key: AEAD key (selected based on key_phase from stage 1)
+%% IV: AEAD IV (selected based on key_phase from stage 1)
+%% UnprotectedHeader: From stage 1 (used as AAD)
+%% PNLen: From stage 1
+%% TruncatedPN: From stage 1
+%% EncryptedPayload: PN bytes + ciphertext + tag
+%% LargestRecv: Largest received packet number for PN reconstruction
+%%
+%% Returns: {ok, PN, Plaintext} | {error, term()}
+-spec decrypt_short_payload(
+    cipher(),
+    binary(),
+    binary(),
+    binary(),
+    1..4,
+    non_neg_integer(),
+    binary(),
+    non_neg_integer() | undefined
+) ->
+    {ok, non_neg_integer(), binary()} | {error, term()}.
+decrypt_short_payload(
+    Cipher, Key, IV, UnprotectedHeader, PNLen, TruncatedPN, EncryptedPayload, LargestRecv
+) ->
+    %% Reconstruct full PN
+    PN = reconstruct_pn(LargestRecv, TruncatedPN, PNLen),
+
+    %% AAD is the full unprotected header
+    AAD = UnprotectedHeader,
+
+    %% Ciphertext starts after PN bytes
+    <<_:PNLen/binary, Ciphertext/binary>> = EncryptedPayload,
+
+    %% Decrypt
+    Nonce = compute_nonce(IV, PN),
+    CipherLen = byte_size(Ciphertext) - ?TAG_LEN,
+    <<CiphertextOnly:CipherLen/binary, Tag:?TAG_LEN/binary>> = Ciphertext,
+    case crypto:crypto_one_time_aead(Cipher, Key, Nonce, CiphertextOnly, AAD, Tag, false) of
+        Plaintext when is_binary(Plaintext) ->
+            {ok, PN, Plaintext};
+        error ->
+            {error, decryption_failed}
+    end.
+
+%% Reconstruct full packet number from truncated PN (RFC 9000 Appendix A)
+reconstruct_pn(undefined, TruncatedPN, _PNLen) ->
+    %% No previous packets, use truncated PN directly
+    TruncatedPN;
+reconstruct_pn(LargestRecv, TruncatedPN, PNLen) ->
+    %% RFC 9000 Appendix A: Packet Number Decoding
+    PNWin = 1 bsl (PNLen * 8),
+    PNHalfWin = PNWin div 2,
+    %% Expected PN is one more than largest received
+    ExpectedPN = LargestRecv + 1,
+    %% Candidate PN in the expected range
+    CandidatePN = (ExpectedPN band (bnot (PNWin - 1))) bor TruncatedPN,
+    %% Adjust candidate based on window
+    adjust_candidate_pn(CandidatePN, ExpectedPN, PNWin, PNHalfWin).
+
+%% Check if candidate is in the valid window and adjust
+adjust_candidate_pn(CandidatePN, ExpectedPN, PNWin, PNHalfWin) when
+    CandidatePN =< ExpectedPN - PNHalfWin, CandidatePN < (1 bsl 62) - PNWin
+->
+    CandidatePN + PNWin;
+adjust_candidate_pn(CandidatePN, ExpectedPN, PNWin, PNHalfWin) when
+    CandidatePN > ExpectedPN + PNHalfWin, CandidatePN >= PNWin
+->
+    CandidatePN - PNWin;
+adjust_candidate_pn(CandidatePN, _ExpectedPN, _PNWin, _PNHalfWin) ->
+    CandidatePN.
+
+%% Local packet number helpers (avoid circular dependency with quic_packet)
+pn_length(PN) when PN < 256 -> 1;
+pn_length(PN) when PN < 65536 -> 2;
+pn_length(PN) when PN < 16777216 -> 3;
+pn_length(_) -> 4.
+
+encode_pn(PN, 1) -> <<PN:8>>;
+encode_pn(PN, 2) -> <<PN:16>>;
+encode_pn(PN, 3) -> <<PN:24>>;
+encode_pn(PN, 4) -> <<PN:32>>.

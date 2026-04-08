@@ -63,7 +63,13 @@
 }).
 
 -record(listener_state, {
-    socket :: gen_udp:socket(),
+    socket :: gen_udp:socket() | socket:socket(),
+    %% Socket state for quic_socket abstraction (for GRO support on Linux)
+    socket_state :: quic_socket:socket_state() | undefined,
+    %% Which socket backend: gen_udp or socket (OTP 27+ with GRO)
+    socket_backend = gen_udp :: gen_udp | socket,
+    %% GRO receiver process (when using socket backend)
+    gro_receiver :: pid() | undefined,
     port :: inet:port_number(),
     cert :: binary(),
     cert_chain :: [binary()],
@@ -135,18 +141,47 @@ get_connections(Listener) ->
 init({Port, Opts}) ->
     process_flag(trap_exit, true),
 
-    %% Open UDP socket
-    %% Default to IPv4 for maximum compatibility
+    %% Check which socket backend to use
+    %% socket_backend => socket enables GRO on Linux (OTP 27+)
+    %% Default: gen_udp for backwards compatibility
+    Backend = maps:get(socket_backend, Opts, gen_udp),
+
+    case Backend of
+        socket ->
+            init_socket_backend(Port, Opts);
+        gen_udp ->
+            init_genudp_backend(Port, Opts)
+    end.
+
+%% Initialize with OTP socket backend (GRO support on Linux)
+init_socket_backend(Port, Opts) ->
+    case quic_socket:open(Port, Opts) of
+        {ok, SocketState} ->
+            Socket = quic_socket:get_socket(SocketState),
+            {ok, {Socket, SocketState, socket, Opts}, {continue, discover_manager}};
+        {error, Reason} ->
+            {stop, Reason}
+    end.
+
+%% Initialize with gen_udp backend (default, backwards compatible)
+init_genudp_backend(Port, Opts) ->
     ActiveN = maps:get(active_n, Opts, 100),
     ReusePort = maps:get(reuseport, Opts, false),
     ExtraFlags = maps:get(extra_socket_opts, Opts, []),
+
+    %% UDP buffer sizing - larger buffers improve throughput significantly
+    %% OS may cap to lower values (check sysctl net.core.rmem_max on Linux)
+    RecBuf = maps:get(recbuf, Opts, ?DEFAULT_UDP_RECBUF),
+    SndBuf = maps:get(sndbuf, Opts, ?DEFAULT_UDP_SNDBUF),
 
     SocketOpts =
         [
             binary,
             inet,
             {active, ActiveN},
-            {reuseaddr, true}
+            {reuseaddr, true},
+            {recbuf, RecBuf},
+            {sndbuf, SndBuf}
         ] ++
             case ReusePort of
                 true -> [{reuseport, true}, {reuseport_lb, true}];
@@ -154,13 +189,13 @@ init({Port, Opts}) ->
             end ++ ExtraFlags,
     case gen_udp:open(Port, SocketOpts) of
         {ok, Socket} ->
-            {ok, {Socket, Opts}, {continue, discover_manager}};
+            {ok, {Socket, undefined, gen_udp, Opts}, {continue, discover_manager}};
         {error, Reason} ->
             {stop, Reason}
     end.
 
 %% @doc false
-handle_continue(discover_manager, {Socket, Opts}) ->
+handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
     %% Extract required options
     #{cert := Cert, key := PrivateKey} = Opts,
     CertChain = maps:get(cert_chain, Opts, []),
@@ -170,7 +205,7 @@ handle_continue(discover_manager, {Socket, Opts}) ->
     {ConnTab, TicketTab, OwnsTables} = get_tables(Opts),
 
     %% Get actual port and bound address
-    {ok, {_BoundAddr, ActualPort}} = inet:sockname(Socket),
+    ActualPort = get_socket_port(Socket, SocketState, Backend),
 
     %% Generate or use provided stateless reset secret
     ResetSecret = maps:get(reset_secret, Opts, crypto:strong_rand_bytes(32)),
@@ -178,8 +213,14 @@ handle_continue(discover_manager, {Socket, Opts}) ->
     %% Initialize QUIC-LB CID configuration (RFC 9312)
     {CIDConfig, DCIDLen} = init_cid_config(Opts, ResetSecret),
 
+    %% Start GRO receiver if using socket backend
+    GROReceiver = maybe_start_gro_receiver(Backend, SocketState),
+
     State = #listener_state{
         socket = Socket,
+        socket_state = SocketState,
+        socket_backend = Backend,
+        gro_receiver = GROReceiver,
         port = ActualPort,
         cert = Cert,
         cert_chain = CertChain,
@@ -195,6 +236,40 @@ handle_continue(discover_manager, {Socket, Opts}) ->
         opts = Opts
     },
     {noreply, State}.
+
+%% Get socket port depending on backend
+get_socket_port(_Socket, SocketState, socket) when SocketState =/= undefined ->
+    case quic_socket:sockname(SocketState) of
+        {ok, {_IP, Port}} -> Port;
+        {error, _} -> 0
+    end;
+get_socket_port(Socket, _SocketState, gen_udp) ->
+    case inet:sockname(Socket) of
+        {ok, {_IP, Port}} -> Port;
+        {error, _} -> 0
+    end.
+
+%% Start GRO receiver process for socket backend
+maybe_start_gro_receiver(socket, SocketState) when SocketState =/= undefined ->
+    Listener = self(),
+    spawn_link(fun() -> gro_receive_loop(SocketState, Listener) end);
+maybe_start_gro_receiver(_, _) ->
+    undefined.
+
+%% GRO receiver loop - runs in separate process
+%% Does blocking recvmsg calls and forwards packets to listener
+gro_receive_loop(SocketState, Listener) ->
+    case quic_socket:recv(SocketState, infinity) of
+        {ok, {IP, Port}, Packets} ->
+            %% Send packets to listener (may be multiple with GRO)
+            Listener ! {gro_packets, IP, Port, Packets},
+            gro_receive_loop(SocketState, Listener);
+        {error, closed} ->
+            ok;
+        {error, _Reason} ->
+            %% Retry on transient errors
+            gro_receive_loop(SocketState, Listener)
+    end.
 
 %% @doc false
 -spec handle_call(term(), gen_server:from(), state()) -> {reply, term(), state()}.
@@ -216,42 +291,163 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 %% @doc false
-%% Handle incoming UDP packets
+%% Handle incoming UDP packets (gen_udp backend)
 handle_info(
     {udp, Socket, SrcIP, SrcPort, Packet},
-    #listener_state{socket = Socket} = State
+    #listener_state{socket = Socket, socket_backend = gen_udp} = State
 ) ->
-    ?LOG_INFO(
+    ?LOG_DEBUG(
         #{what => udp_received, src_ip => SrcIP, src_port => SrcPort, size => byte_size(Packet)},
         ?QUIC_LOG_META
     ),
     handle_packet(Packet, {SrcIP, SrcPort}, State),
     {noreply, State};
-%% TODO: this might still be accepting more packets
-%% than connection workers might be willing to accept
-%% Handle socket going passive (backpressure with {active, N})
-handle_info({udp_passive, Socket}, #listener_state{socket = Socket, opts = Opts} = State) ->
+%% Handle GRO packets (socket backend with GRO)
+%% May receive multiple packets in single recv call
+handle_info(
+    {gro_packets, SrcIP, SrcPort, Packets},
+    #listener_state{socket_backend = socket} = State
+) ->
+    ?LOG_DEBUG(
+        #{
+            what => gro_packets_received,
+            src_ip => SrcIP,
+            src_port => SrcPort,
+            count => length(Packets)
+        },
+        ?QUIC_LOG_META
+    ),
+    RemoteAddr = {SrcIP, SrcPort},
+    handle_gro_packets(Packets, RemoteAddr, State),
+    {noreply, State};
+%% Handle socket going passive (backpressure with {active, N}) - gen_udp only
+handle_info(
+    {udp_passive, Socket},
+    #listener_state{socket = Socket, opts = Opts, socket_backend = gen_udp} = State
+) ->
     N = maps:get(active_n, Opts, 100),
     inet:setopts(Socket, [{active, N}]),
     {noreply, State};
 %% Handle connection process exit
-handle_info({'EXIT', Pid, _Reason}, #listener_state{connections = Conns} = State) ->
-    cleanup_connection(Conns, Pid),
-    {noreply, State};
+handle_info(
+    {'EXIT', Pid, _Reason}, #listener_state{connections = Conns, gro_receiver = GROReceiver} = State
+) ->
+    case Pid of
+        GROReceiver ->
+            %% GRO receiver died - restart it
+            NewReceiver = maybe_start_gro_receiver(
+                State#listener_state.socket_backend,
+                State#listener_state.socket_state
+            ),
+            {noreply, State#listener_state{gro_receiver = NewReceiver}};
+        _ ->
+            cleanup_connection(Conns, Pid),
+            {noreply, State}
+    end;
 %% Handle UDP from different socket (shouldn't happen)
 handle_info({udp, _OtherSocket, _SrcIP, _SrcPort, _Packet}, State) ->
     {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
+%% Handle multiple packets received via GRO
+%% Groups packets by connection and sends batched messages
+handle_gro_packets([], _RemoteAddr, _State) ->
+    ok;
+handle_gro_packets([Packet], RemoteAddr, State) ->
+    %% Single packet - no need to batch
+    handle_packet(Packet, RemoteAddr, State);
+handle_gro_packets(Packets, RemoteAddr, State) ->
+    %% Multiple packets - group by connection ID and batch
+    dispatch_batched_packets(Packets, RemoteAddr, State).
+
+%% Group packets by connection ID and dispatch in batches
+dispatch_batched_packets(
+    Packets, RemoteAddr, #listener_state{dcid_len = DCIDLen, connections = Conns} = State
+) ->
+    %% Build map of ConnPid -> [Packets] (preserving order)
+    Groups = group_packets_by_conn(Packets, DCIDLen, Conns, #{}),
+    %% Dispatch each batch
+    maps:foreach(
+        fun
+            ({conn, ConnPid}, PacketList) ->
+                %% Reverse to restore original order (we prepended)
+                send_packets_to_connection(ConnPid, lists:reverse(PacketList), RemoteAddr);
+            ({new, DCID, Version}, PacketList) ->
+                %% Initial packets that need new connections
+                [FirstPacket | _] = lists:reverse(PacketList),
+                create_connection(FirstPacket, DCID, Version, RemoteAddr, State)
+        end,
+        Groups
+    ).
+
+%% Group packets by their destination connection
+group_packets_by_conn([], _DCIDLen, _Conns, Acc) ->
+    Acc;
+group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
+    case parse_packet_header(Packet, DCIDLen) of
+        {initial, DCID, _SCID, Version, _Rest} ->
+            case ets:lookup(Conns, DCID) of
+                [{DCID, ConnPid}] ->
+                    %% Existing connection
+                    Key = {conn, ConnPid},
+                    Acc1 = maps:update_with(Key, fun(L) -> [Packet | L] end, [Packet], Acc),
+                    group_packets_by_conn(Rest, DCIDLen, Conns, Acc1);
+                [] ->
+                    %% New connection - group by DCID
+                    Key = {new, DCID, Version},
+                    Acc1 = maps:update_with(Key, fun(L) -> [Packet | L] end, [Packet], Acc),
+                    group_packets_by_conn(Rest, DCIDLen, Conns, Acc1)
+            end;
+        {short, DCID, _Rest} ->
+            case ets:lookup(Conns, DCID) of
+                [{DCID, ConnPid}] ->
+                    Key = {conn, ConnPid},
+                    Acc1 = maps:update_with(Key, fun(L) -> [Packet | L] end, [Packet], Acc),
+                    group_packets_by_conn(Rest, DCIDLen, Conns, Acc1);
+                [] ->
+                    %% Unknown - skip (will be handled as stateless reset if needed)
+                    group_packets_by_conn(Rest, DCIDLen, Conns, Acc)
+            end;
+        {long, DCID, _SCID, _PacketType, _Rest} ->
+            case ets:lookup(Conns, DCID) of
+                [{DCID, ConnPid}] ->
+                    Key = {conn, ConnPid},
+                    Acc1 = maps:update_with(Key, fun(L) -> [Packet | L] end, [Packet], Acc),
+                    group_packets_by_conn(Rest, DCIDLen, Conns, Acc1);
+                [] ->
+                    %% Unknown long header - skip
+                    group_packets_by_conn(Rest, DCIDLen, Conns, Acc)
+            end;
+        {error, _Reason} ->
+            %% Skip invalid packets
+            group_packets_by_conn(Rest, DCIDLen, Conns, Acc)
+    end.
+
+%% Send batched packets to a connection
+send_packets_to_connection(ConnPid, [Packet], RemoteAddr) ->
+    %% Single packet - use existing message format
+    ConnPid ! {quic_packet, Packet, RemoteAddr};
+send_packets_to_connection(ConnPid, Packets, RemoteAddr) ->
+    %% Multiple packets - use batched message
+    ConnPid ! {quic_packets, Packets, RemoteAddr}.
+
 %% @doc false
 terminate(_Reason, #listener_state{
     connections = ConnTab,
     tickets_table = TicketTab,
     owns_tables = OwnsTables,
+    socket_state = SocketState,
+    socket_backend = Backend,
     socket = Socket
 }) ->
-    safe_close_socket(Socket),
+    %% Close socket based on backend
+    case Backend of
+        socket when SocketState =/= undefined ->
+            quic_socket:close(SocketState);
+        _ ->
+            safe_close_socket(Socket)
+    end,
     %% Only delete ETS tables if we own them (standalone mode, not pool mode)
     case OwnsTables of
         true ->
@@ -566,7 +762,12 @@ handle_unknown_packet(
     DCID,
     Packet,
     {IP, Port},
-    #listener_state{socket = Socket, reset_secret = Secret}
+    #listener_state{
+        socket = Socket,
+        socket_state = SocketState,
+        socket_backend = Backend,
+        reset_secret = Secret
+    }
 ) ->
     %% RFC 9000 Section 10.3.3: Don't send reset if packet might be a reset
     case is_potential_stateless_reset(Packet) of
@@ -582,12 +783,20 @@ handle_unknown_packet(
                     %% Generate and send stateless reset
                     Token = compute_stateless_reset_token(Secret, DCID),
                     ResetPacket = build_stateless_reset(Token, TriggerSize),
-                    gen_udp:send(Socket, IP, Port, ResetPacket);
+                    send_packet(Socket, SocketState, Backend, IP, Port, ResetPacket);
                 false ->
                     %% Packet too small to respond with reset
                     ok
             end
     end.
+
+%% Send a packet using the appropriate backend
+send_packet(_Socket, SocketState, socket, IP, Port, Packet) when SocketState =/= undefined ->
+    {ok, _} = quic_socket:send(SocketState, IP, Port, Packet),
+    quic_socket:flush(SocketState),
+    ok;
+send_packet(Socket, _SocketState, gen_udp, IP, Port, Packet) ->
+    gen_udp:send(Socket, IP, Port, Packet).
 
 %% Check if a packet might be a stateless reset
 %% RFC 9000 Section 10.3: A reset looks like a short header packet

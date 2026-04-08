@@ -2,6 +2,7 @@
 %%%
 %%% QUIC NewReno Congestion Control
 %%% RFC 9002 Section 7 - Congestion Control
+%%% RFC 9406 - HyStart++: Modified Slow Start for TCP
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
 %%% Apache License 2.0
@@ -10,15 +11,17 @@
 %%%
 %%% This module implements the NewReno congestion control algorithm:
 %%% - Slow Start: Exponential growth until threshold or loss
+%%% - HyStart++ (RFC 9406): Safer slow start exit via RTT monitoring
 %%% - Congestion Avoidance: Linear growth after threshold
 %%% - Recovery: Multiplicative decrease on loss
 %%% - Persistent Congestion: Reset on prolonged loss
 %%%
 %%% == Phases ==
 %%%
-%%% 1. Slow Start: cwnd += bytes_acked (exponential growth)
-%%% 2. Congestion Avoidance: cwnd += max_datagram_size * bytes_acked / cwnd
-%%% 3. Recovery: ssthresh = cwnd * 0.5, cwnd = max(ssthresh, min_window)
+%%% 1. Slow Start with HyStart++: cwnd += bytes_acked with RTT-based exit
+%%% 2. Conservative Slow Start (CSS): cwnd += cwnd/4 per RTT for 5 rounds
+%%% 3. Congestion Avoidance: cwnd += max_datagram_size * bytes_acked / cwnd
+%%% 4. Recovery: ssthresh = cwnd * 0.5, cwnd = max(ssthresh, min_window)
 %%%
 
 -module(quic_cc_newreno).
@@ -26,6 +29,7 @@
 -behaviour(quic_cc).
 
 -include_lib("kernel/include/logger.hrl").
+
 -define(QUIC_LOG_META, #{domain => [erlang_quic, congestion_control]}).
 
 -export([
@@ -69,6 +73,21 @@
 -define(LOSS_REDUCTION_FACTOR, 0.7).
 -define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 
+%% HyStart++ constants (RFC 9406)
+%% Minimum RTT samples before making slow start exit decision
+-define(HYSTART_MIN_SAMPLES, 8).
+%% CSS growth divisor: grow cwnd by cwnd/divisor per RTT
+-define(HYSTART_CSS_GROWTH_DIV, 4).
+%% Number of rounds in CSS before entering congestion avoidance
+-define(HYSTART_CSS_ROUNDS, 5).
+%% Dynamic RTT threshold bounds (RFC 9406)
+%% Minimum RTT threshold in milliseconds
+-define(HYSTART_MIN_RTT_THRESH, 4).
+%% Maximum RTT threshold in milliseconds
+-define(HYSTART_MAX_RTT_THRESH, 16).
+%% Divisor for baseline RTT to calculate dynamic threshold
+-define(HYSTART_MIN_RTT_DIVISOR, 8).
+
 %% Congestion control state
 -record(cc_state, {
     %% Congestion window
@@ -111,7 +130,25 @@
     % 12 packets burst allowance
     pacing_max_burst = 14400 :: non_neg_integer(),
     % timestamp (ms)
-    last_pacing_update = 0 :: non_neg_integer()
+    last_pacing_update = 0 :: non_neg_integer(),
+
+    %% HyStart++ state (RFC 9406)
+    %% Whether HyStart++ is enabled
+    hystart_enabled = true :: boolean(),
+    %% In Conservative Slow Start phase
+    hystart_in_css = false :: boolean(),
+    %% Number of CSS rounds completed
+    hystart_css_rounds = 0 :: non_neg_integer(),
+    %% RTT sample count in current round
+    hystart_rtt_sample_count = 0 :: non_neg_integer(),
+    %% Last round's minimum RTT (milliseconds)
+    hystart_last_rtt = 0 :: non_neg_integer(),
+    %% Current round's minimum RTT (milliseconds)
+    hystart_curr_rtt = infinity :: non_neg_integer() | infinity,
+    %% CSS baseline RTT for potential reversion to slow start (RFC 9406)
+    hystart_css_baseline_rtt = infinity :: non_neg_integer() | infinity,
+    %% Round start time for time-based round detection (RFC 9406)
+    hystart_round_start_time = 0 :: non_neg_integer()
 }).
 
 -opaque cc_state() :: #cc_state{}.
@@ -146,9 +183,10 @@ new(Opts) ->
     InitialWindow0 = maps:get(initial_window, Opts, DefaultWindow),
     InitialWindow = max(InitialWindow0, ConfiguredMinimumWindow),
     MinRecoveryDuration = maps:get(min_recovery_duration, Opts, 100),
+    HystartEnabled = maps:get(hystart_enabled, Opts, true),
     %% Pacing: 10 packets burst allowance (12 with 1200 byte packets = 14400)
     PacingMaxBurst = 12 * MaxDatagramSize,
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     ?LOG_DEBUG(
         #{
             what => cc_state_initialized,
@@ -159,7 +197,8 @@ new(Opts) ->
             default_minimum_window => DefaultMinimumWindow,
             max_datagram_size => MaxDatagramSize,
             min_recovery_duration => MinRecoveryDuration,
-            pacing_max_burst => PacingMaxBurst
+            pacing_max_burst => PacingMaxBurst,
+            hystart_enabled => HystartEnabled
         },
         ?QUIC_LOG_META
     ),
@@ -172,7 +211,9 @@ new(Opts) ->
         %% Initialize pacing with full burst allowance
         pacing_max_burst = PacingMaxBurst,
         pacing_tokens = PacingMaxBurst,
-        last_pacing_update = Now
+        last_pacing_update = Now,
+        %% HyStart++ initialization
+        hystart_enabled = HystartEnabled
     }.
 
 %%====================================================================
@@ -239,20 +280,29 @@ on_packets_acked(
             %% and minimum recovery duration has passed
             %% Now in congestion avoidance, can increase cwnd
             #cc_state{cwnd = Cwnd, ssthresh = SSThresh, max_datagram_size = MaxDS} = State,
-            NewCwnd =
+            State1 = State#cc_state{
+                bytes_in_flight = NewInFlight,
+                in_recovery = false,
+                recovery_start_time = Now
+            },
+            State2 =
                 case Cwnd < SSThresh of
                     true ->
-                        Cwnd + AckedBytes;
+                        %% Slow start with HyStart++ (RFC 9406)
+                        hystart_on_ack(State1, AckedBytes, LargestAckedSentTime);
                     false ->
+                        %% Congestion avoidance
                         Increment = (MaxDS * AckedBytes) div max(Cwnd, 1),
-                        Cwnd + max(Increment, 1)
+                        NewCwnd = Cwnd + max(Increment, 1),
+                        State1#cc_state{cwnd = NewCwnd}
                 end,
+            NewCwnd2 = State2#cc_state.cwnd,
             ?LOG_DEBUG(
                 #{
                     what => cc_ack_exit_recovery,
                     acked_bytes => AckedBytes,
                     old_cwnd => OldCwnd,
-                    new_cwnd => NewCwnd,
+                    new_cwnd => NewCwnd2,
                     old_in_flight => InFlight,
                     new_in_flight => NewInFlight,
                     ssthresh => SSThresh,
@@ -260,15 +310,7 @@ on_packets_acked(
                 },
                 ?QUIC_LOG_META
             ),
-            %% Update recovery_start_time to current time when exiting recovery.
-            %% This prevents re-entering recovery for packets sent during
-            %% the recovery period that are still in flight.
-            State#cc_state{
-                bytes_in_flight = NewInFlight,
-                in_recovery = false,
-                recovery_start_time = Now,
-                cwnd = NewCwnd
-            };
+            State2;
         false ->
             %% Still in recovery, don't increase cwnd
             ?LOG_DEBUG(
@@ -293,30 +335,33 @@ on_packets_acked(
         max_datagram_size = MaxDS
     } = State,
     AckedBytes,
-    _LargestAckedSentTime
+    LargestAckedSentTime
 ) ->
     NewInFlight = max(0, InFlight - AckedBytes),
+    State1 = State#cc_state{bytes_in_flight = NewInFlight},
 
     %% Increase cwnd based on phase
     InSlowStart = Cwnd < SSThresh,
-    NewCwnd =
+    State2 =
         case InSlowStart of
             true ->
-                %% Slow start: increase by bytes acked
-                Cwnd + AckedBytes;
+                %% Slow start with HyStart++ (RFC 9406)
+                hystart_on_ack(State1, AckedBytes, LargestAckedSentTime);
             false ->
                 %% Congestion avoidance: increase by ~1 MSS per RTT
                 %% cwnd += max_datagram_size * acked_bytes / cwnd
                 Increment = (MaxDS * AckedBytes) div max(Cwnd, 1),
-                Cwnd + max(Increment, 1)
+                NewCwnd = Cwnd + max(Increment, 1),
+                State1#cc_state{cwnd = NewCwnd}
         end,
 
+    NewCwnd2 = State2#cc_state.cwnd,
     ?LOG_DEBUG(
         #{
             what => cc_ack_processed,
             acked_bytes => AckedBytes,
             old_cwnd => Cwnd,
-            new_cwnd => NewCwnd,
+            new_cwnd => NewCwnd2,
             old_in_flight => InFlight,
             new_in_flight => NewInFlight,
             ssthresh => SSThresh,
@@ -325,10 +370,7 @@ on_packets_acked(
         ?QUIC_LOG_META
     ),
 
-    State#cc_state{
-        cwnd = NewCwnd,
-        bytes_in_flight = NewInFlight
-    }.
+    State2.
 
 %% @doc Process lost packets.
 %% LostBytes is the total size of lost packets.
@@ -336,6 +378,199 @@ on_packets_acked(
 on_packets_lost(#cc_state{bytes_in_flight = InFlight} = State, LostBytes) ->
     NewInFlight = max(0, InFlight - LostBytes),
     State#cc_state{bytes_in_flight = NewInFlight}.
+
+%%====================================================================
+%% HyStart++ Implementation (RFC 9406)
+%%====================================================================
+
+%% @private HyStart++ slow start processing (RFC 9406)
+%% Clause 1: HyStart++ disabled - standard slow start
+hystart_on_ack(
+    #cc_state{
+        cwnd = Cwnd,
+        hystart_enabled = false
+    } = State,
+    AckedBytes,
+    _LargestAckedSentTime
+) ->
+    NewCwnd = Cwnd + AckedBytes,
+    State#cc_state{cwnd = NewCwnd};
+%% Clause 2: In Conservative Slow Start - grow by cwnd/CSS_GROWTH_DIV per RTT
+%% RFC 9406: Can revert to slow start if RTT drops below baseline
+hystart_on_ack(
+    #cc_state{
+        cwnd = Cwnd,
+        max_datagram_size = MaxDS,
+        hystart_in_css = true,
+        hystart_css_rounds = Rounds,
+        hystart_css_baseline_rtt = BaselineRTT,
+        hystart_curr_rtt = CurrRTT,
+        hystart_rtt_sample_count = SampleCount,
+        hystart_round_start_time = RoundStartTime
+    } = State,
+    AckedBytes,
+    LargestAckedSentTime
+) ->
+    Now = erlang:monotonic_time(millisecond),
+    NewSampleCount = SampleCount + 1,
+
+    %% Check for CSS reversion after enough samples (RFC 9406)
+    %% If RTT dropped below baseline, revert to slow start
+    case NewSampleCount >= ?HYSTART_MIN_SAMPLES of
+        true when is_integer(CurrRTT), is_integer(BaselineRTT), CurrRTT < BaselineRTT ->
+            %% RTT dropped below CSS entry point - revert to slow start
+            ?LOG_DEBUG(
+                #{
+                    what => hystart_css_revert,
+                    cwnd => Cwnd,
+                    curr_rtt => CurrRTT,
+                    baseline_rtt => BaselineRTT
+                },
+                ?QUIC_LOG_META
+            ),
+            NewCwnd = Cwnd + AckedBytes,
+            State#cc_state{
+                cwnd = NewCwnd,
+                hystart_in_css = false,
+                hystart_css_rounds = 0,
+                hystart_css_baseline_rtt = infinity,
+                hystart_rtt_sample_count = 0,
+                hystart_round_start_time = Now
+            };
+        _ ->
+            %% Continue CSS with linear growth
+            Increment = max(
+                MaxDS, (Cwnd * AckedBytes) div (max(Cwnd, 1) * ?HYSTART_CSS_GROWTH_DIV)
+            ),
+            NewCwnd = Cwnd + Increment,
+
+            %% Time-based round detection (RFC 9406)
+            %% A new round begins when we ACK a packet sent after round started
+            {NewRounds, NewRoundStartTime} =
+                case LargestAckedSentTime > RoundStartTime of
+                    true ->
+                        %% ACK for packet sent after round started = new round
+                        {Rounds + 1, Now};
+                    false ->
+                        {Rounds, RoundStartTime}
+                end,
+
+            case NewRounds >= ?HYSTART_CSS_ROUNDS of
+                true ->
+                    %% Exit slow start, enter congestion avoidance
+                    ?LOG_DEBUG(
+                        #{
+                            what => hystart_css_complete,
+                            cwnd => NewCwnd,
+                            rounds => NewRounds
+                        },
+                        ?QUIC_LOG_META
+                    ),
+                    State#cc_state{
+                        cwnd = NewCwnd,
+                        ssthresh = NewCwnd,
+                        hystart_in_css = false,
+                        hystart_css_rounds = 0,
+                        hystart_css_baseline_rtt = infinity,
+                        hystart_round_start_time = 0
+                    };
+                false ->
+                    State#cc_state{
+                        cwnd = NewCwnd,
+                        hystart_css_rounds = NewRounds,
+                        hystart_rtt_sample_count = NewSampleCount,
+                        hystart_round_start_time = NewRoundStartTime
+                    }
+            end
+    end;
+%% Clause 3: Normal slow start with HyStart++ RTT monitoring
+hystart_on_ack(
+    #cc_state{
+        cwnd = Cwnd,
+        hystart_rtt_sample_count = SampleCount,
+        hystart_last_rtt = LastRTT,
+        hystart_curr_rtt = CurrRTT
+    } = State,
+    AckedBytes,
+    _LargestAckedSentTime
+) ->
+    %% Standard slow start with HyStart++ RTT monitoring
+    Now = erlang:monotonic_time(millisecond),
+    NewCwnd = Cwnd + AckedBytes,
+    NewSampleCount = SampleCount + 1,
+
+    %% Update state with new cwnd and sample count
+    State1 = State#cc_state{
+        cwnd = NewCwnd,
+        hystart_rtt_sample_count = NewSampleCount
+    },
+
+    %% Check for RTT-based exit condition after minimum samples
+    case NewSampleCount >= ?HYSTART_MIN_SAMPLES of
+        true when LastRTT > 0, is_integer(CurrRTT), CurrRTT > 0 ->
+            %% Calculate dynamic RTT threshold (RFC 9406)
+            %% RttThresh = clamp(MIN, lastRTT/DIVISOR, MAX)
+            RTTThresh = calculate_rtt_threshold(LastRTT),
+            %% Check if current RTT exceeds threshold
+            RTTIncrease = CurrRTT - LastRTT,
+            case RTTIncrease > RTTThresh of
+                true ->
+                    %% Enter Conservative Slow Start
+                    %% Save current RTT as baseline for potential reversion
+                    %% Initialize round_start_time for time-based round detection
+                    ?LOG_DEBUG(
+                        #{
+                            what => hystart_enter_css,
+                            cwnd => NewCwnd,
+                            rtt_increase => RTTIncrease,
+                            rtt_threshold => RTTThresh,
+                            last_rtt => LastRTT,
+                            curr_rtt => CurrRTT
+                        },
+                        ?QUIC_LOG_META
+                    ),
+                    State1#cc_state{
+                        hystart_in_css = true,
+                        hystart_css_rounds = 0,
+                        hystart_css_baseline_rtt = CurrRTT,
+                        hystart_rtt_sample_count = 0,
+                        hystart_round_start_time = Now
+                    };
+                false ->
+                    State1
+            end;
+        _ ->
+            State1
+    end.
+
+%% @private Calculate dynamic RTT threshold (RFC 9406)
+%% RttThresh = clamp(MIN, lastRTT/DIVISOR, MAX)
+calculate_rtt_threshold(LastRTT) when LastRTT > 0 ->
+    Threshold = LastRTT div ?HYSTART_MIN_RTT_DIVISOR,
+    max(?HYSTART_MIN_RTT_THRESH, min(Threshold, ?HYSTART_MAX_RTT_THRESH));
+calculate_rtt_threshold(_) ->
+    ?HYSTART_MIN_RTT_THRESH.
+
+%% @private Update HyStart++ RTT samples
+%% Called from update_pacing_rate when in slow start
+update_hystart_rtt(
+    #cc_state{
+        hystart_enabled = true,
+        hystart_curr_rtt = CurrRTT,
+        cwnd = Cwnd,
+        ssthresh = SSThresh
+    } = State,
+    RTT
+) when Cwnd < SSThresh ->
+    %% In slow start, track RTT samples
+    NewCurrRTT =
+        case CurrRTT of
+            infinity -> RTT;
+            _ -> min(CurrRTT, RTT)
+        end,
+    State#cc_state{hystart_curr_rtt = NewCurrRTT};
+update_hystart_rtt(State, _RTT) ->
+    State.
 
 %% @doc Handle a congestion event (packet loss detected).
 %% SentTime is the time when the lost packet was sent.
@@ -448,7 +683,13 @@ do_congestion_event(
         recovery_start_time = Now,
         in_recovery = true,
         % Track for persistent congestion
-        first_sent_time = SentTime
+        first_sent_time = SentTime,
+        %% Reset HyStart++ state
+        hystart_in_css = false,
+        hystart_css_rounds = 0,
+        hystart_rtt_sample_count = 0,
+        hystart_css_baseline_rtt = infinity,
+        hystart_round_start_time = 0
     }.
 
 %%====================================================================
@@ -482,7 +723,13 @@ on_ecn_ce(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} = State, NewCEC
         ssthresh = NewSSThresh,
         recovery_start_time = Now,
         in_recovery = true,
-        ecn_ce_counter = NewCECount
+        ecn_ce_counter = NewCECount,
+        %% Reset HyStart++ state
+        hystart_in_css = false,
+        hystart_css_rounds = 0,
+        hystart_rtt_sample_count = 0,
+        hystart_css_baseline_rtt = infinity,
+        hystart_round_start_time = 0
     }.
 
 %% @doc Get the current ECN-CE counter.
@@ -618,7 +865,15 @@ on_persistent_congestion(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} 
         ssthresh = NewSSThresh,
         in_recovery = false,
         recovery_start_time = undefined,
-        first_sent_time = undefined
+        first_sent_time = undefined,
+        %% Reset HyStart++ state
+        hystart_in_css = false,
+        hystart_css_rounds = 0,
+        hystart_rtt_sample_count = 0,
+        hystart_last_rtt = 0,
+        hystart_curr_rtt = infinity,
+        hystart_css_baseline_rtt = infinity,
+        hystart_round_start_time = 0
     }.
 
 %%====================================================================
@@ -630,10 +885,25 @@ on_persistent_congestion(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} 
 %% Called when RTT estimate is updated.
 -spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
 update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTT) when SmoothedRTT > 0 ->
-    %% pacing_rate = cwnd / smoothed_rtt (bytes/ms)
-    %% Multiply by 1.25 to allow slightly faster than cwnd/RTT for efficiency
-    PacingRate = max(1, (Cwnd * 5) div (SmoothedRTT * 4)),
-    State#cc_state{pacing_rate = PacingRate};
+    %% pacing_rate stored as milli-bytes per microsecond for precision with us timestamps
+    %% Formula: (cwnd * 1.25 * 1000) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
+    %% Simplified: (cwnd * 5 * 250) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
+    PacingRate = max(1, (Cwnd * 1250) div (SmoothedRTT * 1000)),
+
+    ?LOG_DEBUG(
+        #{
+            what => pacing_rate_updated,
+            cwnd => Cwnd,
+            smoothed_rtt_ms => SmoothedRTT,
+            new_pacing_rate => PacingRate
+        },
+        ?QUIC_LOG_META
+    ),
+
+    %% Update HyStart++ RTT tracking
+    State1 = update_hystart_rtt(State, SmoothedRTT),
+
+    State1#cc_state{pacing_rate = PacingRate};
 update_pacing_rate(State, _SmoothedRTT) ->
     %% No valid RTT yet, keep current state
     State.
@@ -654,7 +924,7 @@ pacing_allows(
     Size
 ) ->
     %% Refill tokens first, then check
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     RefreshedTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
     RefreshedTokens >= Size.
 
@@ -673,7 +943,7 @@ get_pacing_tokens(
     } = State,
     Size
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     %% Refill tokens based on elapsed time
     NewTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
     %% Consume up to available tokens
@@ -700,7 +970,7 @@ pacing_delay(
     },
     Size
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     %% Calculate current tokens
     CurrentTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
     case CurrentTokens >= Size of
@@ -717,10 +987,11 @@ pacing_delay(
 %% Internal Functions
 %%====================================================================
 
-%% Refill pacing tokens based on elapsed time
+%% Refill pacing tokens based on elapsed time (microsecond timestamps, rate in milli-bytes/us)
 refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now) ->
-    Elapsed = max(0, Now - LastUpdate),
-    Added = Elapsed * Rate,
+    ElapsedUs = max(0, Now - LastUpdate),
+    %% Rate is in milli-bytes per microsecond, so Added = (elapsed_us * rate) / 1000
+    Added = (ElapsedUs * Rate) div 1000,
     min(MaxBurst, Tokens + Added).
 
 %% Calculate initial window

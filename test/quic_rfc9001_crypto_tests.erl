@@ -250,12 +250,12 @@ packet_number_protection_test() ->
     UnprotectedPN = <<16#00, 16#00, 16#00, 16#02>>,
 
     %% PN protection: XOR with mask bytes
-    ProtectedPN = crypto:exor(UnprotectedPN, MaskBytes),
+    _ProtectedPN = crypto:exor(UnprotectedPN, MaskBytes),
 
     %% Expected from RFC 9001 A.2
 
     % Different due to PN length
-    ExpectedProtectedPN = hexstr_to_bin("7b9aee38"),
+    _ExpectedProtectedPN = hexstr_to_bin("7b9aee38"),
 
     %% Actually in A.2, with 2-byte PN (pn_len=01 in byte):
     %% Let's verify 2-byte case
@@ -510,7 +510,7 @@ rfc9001_a2_sample_position_test() ->
     %% PN offset = 18 (header before PN)
     %% So sample starts at byte 22 of the packet (or byte 0 of ciphertext after PN)
 
-    PNOffset = 18,
+    _PNOffset = 18,
     PNLen = 4,
 
     %% Sample offset from start of ciphertext = 4 - PNLen
@@ -579,6 +579,3 @@ hexstr_to_bin([], Acc) ->
 hexstr_to_bin([H1, H2 | Rest], Acc) ->
     Byte = list_to_integer([H1, H2], 16),
     hexstr_to_bin(Rest, <<Acc/binary, Byte>>).
-
-bin_to_hexstr(Bin) ->
-    lists:flatten([io_lib:format("~2.16.0b", [B]) || <<B>> <= Bin]).
