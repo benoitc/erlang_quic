@@ -22,6 +22,7 @@
 -module(quic_tls).
 
 -include("quic.hrl").
+-include_lib("public_key/include/public_key.hrl").
 
 -export([
     %% ClientHello
@@ -56,7 +57,13 @@
 
     %% TLS message framing
     encode_handshake_message/2,
-    decode_handshake_message/1
+    decode_handshake_message/1,
+
+    %% Client certificate support (mutual TLS)
+    build_certificate_request/1,
+    parse_certificate_request/1,
+    build_certificate_verify_client/3,
+    verify_certificate_verify/4
 ]).
 
 %%====================================================================
@@ -1138,3 +1145,126 @@ convert_private_key(rsa, Key) when is_list(Key) ->
     Key;
 convert_private_key(_, Key) ->
     Key.
+
+%%====================================================================
+%% Client Certificate Support (Mutual TLS)
+%%====================================================================
+
+%% @doc Build a CertificateRequest message (RFC 8446 Section 4.3.2).
+%% Context is the certificate_request_context (typically empty for TLS 1.3).
+-spec build_certificate_request(binary()) -> binary().
+build_certificate_request(Context) ->
+    %% RFC 8446 Section 4.3.2: signature_algorithms extension is required
+    SigAlgs = <<
+        ?SIG_ECDSA_SECP256R1_SHA256:16,
+        ?SIG_RSA_PSS_RSAE_SHA256:16,
+        ?SIG_RSA_PKCS1_SHA256:16
+    >>,
+    SigAlgsLen = byte_size(SigAlgs),
+    SigAlgsExt =
+        <<?EXT_SIGNATURE_ALGORITHMS:16, (SigAlgsLen + 2):16, SigAlgsLen:16, SigAlgs/binary>>,
+    ExtLen = byte_size(SigAlgsExt),
+    ContextLen = byte_size(Context),
+    Body = <<ContextLen:8, Context/binary, ExtLen:16, SigAlgsExt/binary>>,
+    encode_handshake_message(?TLS_CERTIFICATE_REQUEST, Body).
+
+%% @doc Parse a CertificateRequest message.
+-spec parse_certificate_request(binary()) -> {ok, map()} | {error, term()}.
+parse_certificate_request(
+    <<ContextLen:8, Context:ContextLen/binary, ExtLen:16, _Extensions:ExtLen/binary, _/binary>>
+) ->
+    {ok, #{context => Context}};
+parse_certificate_request(_) ->
+    {error, invalid_certificate_request}.
+
+%% @doc Build a CertificateVerify message for client (RFC 8446 Section 4.4.3).
+%% Uses "TLS 1.3, client CertificateVerify" context string.
+-spec build_certificate_verify_client(non_neg_integer(), term(), binary()) -> binary().
+build_certificate_verify_client(SignatureAlgorithm, PrivateKey, TranscriptHash) ->
+    %% RFC 8446 Section 4.4.3: Client uses different context string
+    Spaces = binary:copy(<<32>>, 64),
+    ContextString = <<"TLS 1.3, client CertificateVerify">>,
+    Content = <<Spaces/binary, ContextString/binary, 0, TranscriptHash/binary>>,
+
+    {SigAlg, HashAlg, SignOpts} = get_signature_params(SignatureAlgorithm),
+    CryptoKey = convert_private_key(SigAlg, PrivateKey),
+    Signature = crypto:sign(SigAlg, HashAlg, Content, CryptoKey, SignOpts),
+
+    SigLen = byte_size(Signature),
+    Body = <<SignatureAlgorithm:16, SigLen:16, Signature/binary>>,
+    encode_handshake_message(?TLS_CERTIFICATE_VERIFY, Body).
+
+%% @doc Verify CertificateVerify signature.
+%% Role is 'client' or 'server' - determines context string.
+-spec verify_certificate_verify(binary(), binary(), binary(), client | server) -> boolean().
+verify_certificate_verify(Body, PeerCertDER, TranscriptHash, Role) ->
+    case parse_certificate_verify(Body) of
+        {ok, #{algorithm := Algorithm, signature := Signature}} ->
+            case extract_public_key_for_verify(PeerCertDER, Algorithm) of
+                {ok, PublicKey} ->
+                    %% Build content that was signed
+                    Spaces = binary:copy(<<32>>, 64),
+                    ContextString =
+                        case Role of
+                            client -> <<"TLS 1.3, client CertificateVerify">>;
+                            server -> <<"TLS 1.3, server CertificateVerify">>
+                        end,
+                    Content = <<Spaces/binary, ContextString/binary, 0, TranscriptHash/binary>>,
+
+                    %% Verify signature
+                    {SigAlg, HashAlg, VerifyOpts} = get_signature_params(Algorithm),
+                    try
+                        crypto:verify(SigAlg, HashAlg, Content, Signature, PublicKey, VerifyOpts)
+                    catch
+                        _:_ -> false
+                    end;
+                {error, _} ->
+                    false
+            end;
+        {error, _} ->
+            false
+    end.
+
+%% @doc Extract public key from DER certificate and convert to crypto:verify format.
+-spec extract_public_key_for_verify(binary(), non_neg_integer()) ->
+    {ok, term()} | {error, term()}.
+extract_public_key_for_verify(CertDER, Algorithm) ->
+    try
+        OTPCert = public_key:pkix_decode_cert(CertDER, otp),
+        TBSCert = OTPCert#'OTPCertificate'.tbsCertificate,
+        SubjectPKInfo = TBSCert#'OTPTBSCertificate'.subjectPublicKeyInfo,
+        convert_public_key_for_verify(SubjectPKInfo, Algorithm)
+    catch
+        _:Reason -> {error, Reason}
+    end.
+
+%% Convert public key info to format expected by crypto:verify/6
+convert_public_key_for_verify(
+    #'OTPSubjectPublicKeyInfo'{
+        algorithm = #'PublicKeyAlgorithm'{algorithm = ?'id-ecPublicKey', parameters = Params},
+        subjectPublicKey = #'ECPoint'{point = ECPoint}
+    },
+    Algorithm
+) when
+    Algorithm =:= ?SIG_ECDSA_SECP256R1_SHA256;
+    Algorithm =:= ?SIG_ECDSA_SECP384R1_SHA384
+->
+    %% ECDSA: [ECPoint, NamedCurve]
+    Curve =
+        case Params of
+            {namedCurve, ?'secp256r1'} -> secp256r1;
+            {namedCurve, ?'secp384r1'} -> secp384r1;
+            _ -> secp256r1
+        end,
+    {ok, [ECPoint, Curve]};
+convert_public_key_for_verify(
+    #'OTPSubjectPublicKeyInfo'{
+        algorithm = #'PublicKeyAlgorithm'{algorithm = ?'rsaEncryption'},
+        subjectPublicKey = #'RSAPublicKey'{modulus = N, publicExponent = E}
+    },
+    _Algorithm
+) ->
+    %% RSA: [E, N]
+    {ok, [E, N]};
+convert_public_key_for_verify(_, _) ->
+    {error, unsupported_key_type}.

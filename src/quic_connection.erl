@@ -139,7 +139,12 @@
 
 %% TLS handshake states (server)
 -define(TLS_AWAITING_CLIENT_HELLO, awaiting_client_hello).
+-define(TLS_AWAITING_CLIENT_CERT, awaiting_client_cert).
+-define(TLS_AWAITING_CLIENT_CERT_VERIFY, awaiting_client_cert_verify).
 -define(TLS_AWAITING_CLIENT_FINISHED, awaiting_client_finished).
+
+%% TLS alert codes (RFC 8446 Section 6.2)
+-define(TLS_ALERT_DECRYPT_ERROR, 51).
 
 %% Max pending data entries before connection is established (prevents memory exhaustion)
 -define(MAX_PENDING_DATA_ENTRIES, 1000).
@@ -330,6 +335,13 @@
     %% Server preferred address config (RFC 9000 Section 9.6)
     %% Set from listener options: {IPv4, IPv6} where each is {Addr, Port} | undefined
     server_preferred_address :: #preferred_address{} | undefined,
+
+    %% Client certificate (for mutual TLS)
+    client_cert :: binary() | undefined,
+    client_cert_chain = [] :: [binary()],
+    client_private_key :: term() | undefined,
+    %% True if server sent CertificateRequest
+    cert_request_received = false :: boolean(),
 
     %% Session resumption (RFC 8446 Section 4.6)
     resumption_secret :: binary() | undefined,
@@ -740,7 +752,7 @@ init({server, Opts}) ->
         % Listener is the owner for now
         owner = Listener,
         conn_ref = ConnRef,
-        verify = false,
+        verify = maps:get(verify, Opts, false),
         initial_keys = InitialKeys,
         tls_state = ?TLS_AWAITING_CLIENT_HELLO,
         alpn_list = normalize_alpn_list(ALPNList),
@@ -978,6 +990,9 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         conn_ref = ConnRef,
         server_name = ServerName,
         verify = maps:get(verify, Opts, false),
+        client_cert = maps:get(cert, Opts, undefined),
+        client_cert_chain = maps:get(cert_chain, Opts, []),
+        client_private_key = maps:get(key, Opts, undefined),
         initial_keys = InitialKeys,
         tls_state = ?TLS_AWAITING_SERVER_HELLO,
         alpn_list = AlpnList,
@@ -1981,6 +1996,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     #state{
         scid = SCID,
         alpn = ALPN,
+        verify = Verify,
         max_data_local = MaxData,
         max_stream_data_bidi_local = MaxStreamDataBidiLocal,
         max_stream_data_bidi_remote = MaxStreamDataBidiRemote,
@@ -2033,12 +2049,20 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         transport_params => TransportParams
     }),
 
+    %% Build CertificateRequest if verify is enabled (RFC 8446 Section 4.3.2)
+    %% CertificateRequest MUST be sent between EncryptedExtensions and Certificate
+    CertReqMsg =
+        case Verify of
+            true -> quic_tls:build_certificate_request(<<>>);
+            false -> <<>>
+        end,
+
     %% Build Certificate
     AllCerts = [Cert | CertChain],
     CertMsg = quic_tls:build_certificate(<<>>, AllCerts),
 
-    %% Update transcript after EncryptedExtensions and Certificate
-    Transcript1 = <<Transcript/binary, EncExtMsg/binary, CertMsg/binary>>,
+    %% Update transcript after EncryptedExtensions, CertificateRequest, and Certificate
+    Transcript1 = <<Transcript/binary, EncExtMsg/binary, CertReqMsg/binary, CertMsg/binary>>,
     TranscriptHashForCV = quic_crypto:transcript_hash(Cipher, Transcript1),
 
     %% Build CertificateVerify - select signature algorithm based on key type
@@ -2088,12 +2112,24 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     },
 
     %% Combine all messages into CRYPTO frame payload
+    %% Include CertificateRequest if verify is enabled
     HandshakePayload =
-        <<EncExtMsg/binary, CertMsg/binary, CertVerifyMsg/binary, FinishedMsg/binary>>,
+        <<EncExtMsg/binary, CertReqMsg/binary, CertMsg/binary, CertVerifyMsg/binary,
+            FinishedMsg/binary>>,
     CryptoFrame = quic_frame:encode({crypto, 0, HandshakePayload}),
+
+    %% Determine next TLS state based on verify option
+    %% If verify=true, we expect Certificate from client next
+    %% If verify=false, we expect Finished from client next
+    NextTlsState =
+        case Verify of
+            true -> ?TLS_AWAITING_CLIENT_CERT;
+            false -> ?TLS_AWAITING_CLIENT_FINISHED
+        end,
 
     %% Update state with transcript and app keys
     State1 = State#state{
+        tls_state = NextTlsState,
         tls_transcript = Transcript3,
         master_secret = MasterSecret,
         app_keys = {ClientAppKeys, ServerAppKeys},
@@ -3796,7 +3832,9 @@ process_tls_message(_Level, ?TLS_ENCRYPTED_EXTENSIONS, Body, OriginalMsg, State)
                 tls_transcript = Transcript
             }
     end;
-process_tls_message(_Level, ?TLS_CERTIFICATE, Body, OriginalMsg, State) ->
+%% Client receives server Certificate
+process_tls_message(_Level, ?TLS_CERTIFICATE, Body, OriginalMsg,
+        #state{role = client, tls_state = ?TLS_AWAITING_CERT} = State) ->
     %% Update transcript (we don't verify certs if verify = false)
     Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
     %% Parse and store peer certificate
@@ -3815,7 +3853,9 @@ process_tls_message(_Level, ?TLS_CERTIFICATE, Body, OriginalMsg, State) ->
         peer_cert = PeerCert,
         peer_cert_chain = PeerCertChain
     };
-process_tls_message(_Level, ?TLS_CERTIFICATE_VERIFY, _Body, OriginalMsg, State) ->
+%% Client receives server CertificateVerify
+process_tls_message(_Level, ?TLS_CERTIFICATE_VERIFY, _Body, OriginalMsg,
+        #state{role = client, tls_state = ?TLS_AWAITING_CERT_VERIFY} = State) ->
     %% Update transcript
     Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
     State#state{
@@ -3884,26 +3924,66 @@ process_tls_message(
                         update_state = idle
                     },
 
-                    %% Send client Finished (cipher-aware)
-                    %% Client Finished uses transcript INCLUDING server Finished (RFC 8446 Section 4.4.4)
+                    %% If server requested client certificate (CertificateRequest received),
+                    %% send Certificate and optionally CertificateVerify before Finished
+                    %% RFC 8446 Section 4.4.2: client MUST send Certificate if server sent CertificateRequest
+                    {CertPayload, Transcript2} =
+                        case State#state.cert_request_received of
+                            true ->
+                                case State#state.client_cert of
+                                    undefined ->
+                                        %% No client cert - send empty Certificate, no CertificateVerify
+                                        EmptyCertMsg = quic_tls:build_certificate(<<>>, []),
+                                        {EmptyCertMsg, <<Transcript/binary, EmptyCertMsg/binary>>};
+                                    ClientCert ->
+                                        %% Have client cert - send Certificate + CertificateVerify
+                                        AllClientCerts = [
+                                            ClientCert | State#state.client_cert_chain
+                                        ],
+                                        ClientCertMsg = quic_tls:build_certificate(
+                                            <<>>, AllClientCerts
+                                        ),
+                                        T1 = <<Transcript/binary, ClientCertMsg/binary>>,
+                                        TranscriptHashCV = quic_crypto:transcript_hash(Cipher, T1),
+                                        SigAlg = select_signature_algorithm(
+                                            State#state.client_private_key
+                                        ),
+                                        ClientCertVerifyMsg = quic_tls:build_certificate_verify_client(
+                                            SigAlg, State#state.client_private_key, TranscriptHashCV
+                                        ),
+                                        {
+                                            <<ClientCertMsg/binary, ClientCertVerifyMsg/binary>>,
+                                            <<T1/binary, ClientCertVerifyMsg/binary>>
+                                        }
+                                end;
+                            false ->
+                                %% No CertificateRequest - send nothing before Finished
+                                {<<>>, Transcript}
+                        end,
+
+                    %% Compute client Finished using updated transcript
+                    TranscriptHash2 = quic_crypto:transcript_hash(Cipher, Transcript2),
                     ClientFinishedKey = quic_crypto:derive_finished_key(
                         Cipher, State#state.client_hs_secret
                     ),
                     ClientVerifyData = quic_crypto:compute_finished_verify(
-                        Cipher, ClientFinishedKey, TranscriptHashFinal
+                        Cipher, ClientFinishedKey, TranscriptHash2
                     ),
                     ClientFinishedMsg = quic_tls:build_finished(ClientVerifyData),
-                    CryptoFrame = quic_frame:encode({crypto, 0, ClientFinishedMsg}),
+
+                    %% Combine Certificate(+CertificateVerify) and Finished into one payload
+                    HandshakePayload = <<CertPayload/binary, ClientFinishedMsg/binary>>,
+                    CryptoFrame = quic_frame:encode({crypto, 0, HandshakePayload}),
 
                     State1 = State#state{
                         tls_state = ?TLS_HANDSHAKE_COMPLETE,
-                        tls_transcript = <<Transcript/binary, ClientFinishedMsg/binary>>,
+                        tls_transcript = <<Transcript2/binary, ClientFinishedMsg/binary>>,
                         master_secret = MasterSecret,
                         app_keys = {ClientAppKeys, ServerAppKeys},
                         key_state = KeyState
                     },
 
-                    %% Send client Finished in Handshake packet
+                    %% Send client Certificate(+CertificateVerify)+Finished in Handshake packet
                     send_handshake_packet(CryptoFrame, State1);
                 false ->
                     %% Verification failed
@@ -4035,6 +4115,86 @@ process_tls_message(
             };
         {error, _Reason} ->
             State
+    end;
+%% Client receives CertificateRequest from server (mutual TLS)
+process_tls_message(
+    _Level,
+    ?TLS_CERTIFICATE_REQUEST,
+    _Body,
+    OriginalMsg,
+    #state{role = client} = State
+) ->
+    %% Update transcript and mark that server wants client certificate
+    Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+    State#state{
+        tls_transcript = Transcript,
+        cert_request_received = true
+    };
+%% Server receives client Certificate (when verify=true)
+process_tls_message(
+    _Level,
+    ?TLS_CERTIFICATE,
+    Body,
+    OriginalMsg,
+    #state{role = server, tls_state = ?TLS_AWAITING_CLIENT_CERT} = State
+) ->
+    Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+    case quic_tls:parse_certificate(Body) of
+        {ok, #{certificates := [First | Rest]}} ->
+            %% Client sent certificate - expect CertificateVerify next
+            State#state{
+                tls_state = ?TLS_AWAITING_CLIENT_CERT_VERIFY,
+                tls_transcript = Transcript,
+                peer_cert = First,
+                peer_cert_chain = Rest
+            };
+        {ok, #{certificates := []}} ->
+            %% Empty certificate - no CertificateVerify, wait for Finished
+            State#state{
+                tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
+                tls_transcript = Transcript,
+                peer_cert = undefined,
+                peer_cert_chain = []
+            };
+        {error, _} ->
+            %% Parse error - treat as empty
+            State#state{
+                tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
+                tls_transcript = Transcript,
+                peer_cert = undefined,
+                peer_cert_chain = []
+            }
+    end;
+%% Server receives client CertificateVerify (when verify=true and client sent cert)
+process_tls_message(
+    _Level,
+    ?TLS_CERTIFICATE_VERIFY,
+    Body,
+    OriginalMsg,
+    #state{
+        role = server,
+        tls_state = ?TLS_AWAITING_CLIENT_CERT_VERIFY,
+        peer_cert = PeerCert
+    } = State
+) when PeerCert =/= undefined ->
+    %% Get cipher for transcript hash
+    {ClientHsKeys, _} = State#state.handshake_keys,
+    Cipher = ClientHsKeys#crypto_keys.cipher,
+
+    %% Verify signature (transcript is BEFORE CertificateVerify)
+    TranscriptHash = quic_crypto:transcript_hash(Cipher, State#state.tls_transcript),
+    case quic_tls:verify_certificate_verify(Body, PeerCert, TranscriptHash, client) of
+        true ->
+            Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+            State#state{
+                tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
+                tls_transcript = Transcript
+            };
+        false ->
+            %% Signature verification failed - send TLS decrypt_error alert
+            %% RFC 8446: decrypt_error (51) for signature verification failure
+            ?LOG_ERROR(#{what => client_cert_verify_failed}, ?QUIC_LOG_META),
+            send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
     end;
 process_tls_message(_Level, _Type, _Body, _OriginalMsg, State) ->
     State.
@@ -5882,6 +6042,18 @@ send_connection_close(Reason, State) ->
         _:_ -> ok
     end,
     ok.
+
+%% Send TLS alert as QUIC crypto error and close connection
+%% QUIC crypto errors are 0x100 + TLS alert code (RFC 9001 Section 4.8)
+send_tls_alert(AlertCode, State) ->
+    ErrorCode = ?QUIC_CRYPTO_ERROR_BASE + AlertCode,
+    CloseFrame = {connection_close, transport, ErrorCode, 0, <<"certificate verify failed">>},
+    case State#state.handshake_keys of
+        undefined ->
+            State#state{close_reason = {tls_alert, AlertCode}};
+        _ ->
+            send_frame(CloseFrame, State#state{close_reason = {tls_alert, AlertCode}})
+    end.
 
 %% Check timeouts
 check_timeouts(State) ->
