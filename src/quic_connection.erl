@@ -1168,6 +1168,11 @@ idle(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     %% Flush batched packets and timers after processing incoming data
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(idle, FlushedState);
+%% Server receives batched packets from listener (GRO optimization)
+idle(info, {quic_packets, Packets, _RemoteAddr}, #state{role = server} = State) ->
+    NewState = handle_packets_batch(Packets, State),
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    check_state_transition(idle, FlushedState);
 idle(cast, process, #state{role = client, socket = Socket, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
     inet:setopts(Socket, [{active, N}]),
@@ -1241,6 +1246,11 @@ handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = Sta
 handshaking(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
     %% Flush batched packets and timers after processing incoming data
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    check_state_transition(handshaking, FlushedState);
+%% Server receives batched packets from listener (GRO optimization)
+handshaking(info, {quic_packets, Packets, _RemoteAddr}, #state{role = server} = State) ->
+    NewState = handle_packets_batch(Packets, State),
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(handshaking, FlushedState);
 handshaking(cast, process, #state{role = client, socket = Socket, active_n = N} = State) ->
@@ -1491,6 +1501,11 @@ connected(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State
 connected(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
     %% Flush batched packets and timers after processing incoming data
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    check_state_transition(connected, FlushedState);
+%% Server receives batched packets from listener (GRO optimization)
+connected(info, {quic_packets, Packets, _RemoteAddr}, #state{role = server} = State) ->
+    NewState = handle_packets_batch(Packets, State),
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(connected, FlushedState);
 connected(cast, {close, Reason}, State) ->
@@ -2534,6 +2549,14 @@ pad_for_header_protection(Payload) ->
 handle_packet(Data, State) ->
     handle_packet_loop(Data, State).
 
+%% Handle batch of packets from GRO - process all without re-entering gen_statem
+%% This is more efficient than receiving multiple messages
+handle_packets_batch([], State) ->
+    State;
+handle_packets_batch([Packet | Rest], State) ->
+    NewState = handle_packet_loop(Packet, State),
+    handle_packets_batch(Rest, NewState).
+
 handle_packet_loop(<<>>, #state{role = client, socket = Socket, active_n = N} = State) ->
     %% No more data to process - re-enable socket for client connections
     %% Note: With {active, N}, calling setopts resets the counter, so this is optional
@@ -2545,7 +2568,8 @@ handle_packet_loop(<<>>, #state{role = server} = State) ->
     State;
 handle_packet_loop(Data, State) ->
     case decode_and_decrypt_packet(Data, State) of
-        {ok, Type, Frames, RemainingData, NewState} ->
+        {ok, Type, Frames, RemainingData, NewState, processed} ->
+            %% Frames already processed by streaming decode
             %% Emit qlog packet_received event
             quic_qlog:packet_received(NewState#state.qlog_ctx, #{
                 packet_type => Type,
@@ -2553,19 +2577,30 @@ handle_packet_loop(Data, State) ->
             }),
 
             %% Increment packet counter for liveness detection
-            %% Any successfully decrypted packet proves peer is alive
             NewState1 = NewState#state{
                 packets_received = NewState#state.packets_received + 1
             },
-            %% Process frames from this packet
-            State1 = process_frames_noreenbl(Type, Frames, NewState1),
 
             %% Emit qlog frames_processed event
-            quic_qlog:frames_processed(State1#state.qlog_ctx, Frames),
+            quic_qlog:frames_processed(NewState1#state.qlog_ctx, Frames),
 
             %% Send ACK if packet contained ack-eliciting frames
-            State2 = maybe_send_ack(Type, Frames, State1),
+            State2 = maybe_send_ack(Type, Frames, NewState1),
             %% Continue with remaining coalesced packets
+            handle_packet_loop(RemainingData, State2);
+        {ok, Type, Frames, RemainingData, NewState} ->
+            %% Legacy path - frames need to be processed
+            quic_qlog:packet_received(NewState#state.qlog_ctx, #{
+                packet_type => Type,
+                frames => Frames
+            }),
+
+            NewState1 = NewState#state{
+                packets_received = NewState#state.packets_received + 1
+            },
+            State1 = process_frames_noreenbl(Type, Frames, NewState1),
+            quic_qlog:frames_processed(State1#state.qlog_ctx, Frames),
+            State2 = maybe_send_ack(Type, Frames, State1),
             handle_packet_loop(RemainingData, State2);
         {error, stateless_reset} ->
             %% RFC 9000 Section 10.3: Stateless reset received
@@ -2960,13 +2995,14 @@ decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
                 )
             of
                 {ok, PN, Plaintext} ->
-                    case quic_frame:decode_all(Plaintext) of
-                        {ok, Frames} ->
-                            State2 = record_received_pn(app, PN, State1),
-                            NewState = update_last_activity(State2),
-                            {ok, app, Frames, <<>>, NewState};
+                    State2 = record_received_pn(app, PN, State1),
+                    State3 = update_last_activity(State2),
+                    %% Use streaming decode for efficiency
+                    case decode_and_process_streaming(app, Plaintext, State3) of
+                        {ok, NewState, Frames} ->
+                            {ok, app, Frames, <<>>, NewState, processed};
                         {error, Reason} ->
-                            {error, {frame_decode_error, Reason}}
+                            {error, Reason}
                     end;
                 {error, decryption_failed} ->
                     {error, decryption_failed}
@@ -2986,15 +3022,15 @@ decrypt_packet(Level, Header, _FirstByte, EncryptedPayload, RemainingData, Keys,
         {error, Reason} ->
             {error, Reason};
         {ok, PN, _UnprotectedHeader, Plaintext} ->
-            %% Decode frames
-            case quic_frame:decode_all(Plaintext) of
-                {ok, Frames} ->
-                    %% Track received packet number for ACK generation
-                    State1 = record_received_pn(Level, PN, State),
-                    NewState = update_last_activity(State1),
-                    {ok, Level, Frames, RemainingData, NewState};
+            %% Track received packet number for ACK generation
+            State1 = record_received_pn(Level, PN, State),
+            State2 = update_last_activity(State1),
+            %% Use streaming decode for efficiency
+            case decode_and_process_streaming(Level, Plaintext, State2) of
+                {ok, NewState, Frames} ->
+                    {ok, Level, Frames, RemainingData, NewState, processed};
                 {error, Reason} ->
-                    {error, {frame_decode_error, Reason}}
+                    {error, Reason}
             end
     end.
 
@@ -3004,6 +3040,23 @@ process_frames_noreenbl(_Level, [], State) ->
 process_frames_noreenbl(Level, [Frame | Rest], State) ->
     NewState = process_frame(Level, Frame, State),
     process_frames_noreenbl(Level, Rest, NewState).
+
+%% Streaming decode and process - decodes and processes frames without building intermediate list
+%% Returns {ok, State, FrameList} where FrameList is accumulated for qlog/ACK tracking
+%% This is more efficient than decode_all + process_frames for typical packets
+decode_and_process_streaming(Level, Plaintext, State) ->
+    decode_and_process_streaming(Level, Plaintext, State, []).
+
+decode_and_process_streaming(_Level, <<>>, State, Acc) ->
+    {ok, State, lists:reverse(Acc)};
+decode_and_process_streaming(Level, Data, State, Acc) ->
+    case quic_frame:decode(Data) of
+        {error, Reason} ->
+            {error, {frame_decode_error, Reason}};
+        {Frame, Rest} ->
+            NewState = process_frame(Level, Frame, State),
+            decode_and_process_streaming(Level, Rest, NewState, [Frame | Acc])
+    end.
 
 %% Process individual frames
 process_frame(_Level, padding, State) ->
@@ -3039,16 +3092,8 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     AckedBytes = maps:get(acked_bytes, AckMeta, 0),
                     LargestAckedSentTime = maps:get(largest_ae_time, AckMeta, Now),
                     HasAckEliciting = maps:get(has_ack_eliciting, AckMeta, false),
-
-                    %% Calculate lost bytes (still need to scan lost packets)
-                    LostBytes = lists:foldl(
-                        fun
-                            (#sent_packet{ack_eliciting = true, size = Size}, Acc) -> Acc + Size;
-                            (_, Acc) -> Acc
-                        end,
-                        0,
-                        LostPackets
-                    ),
+                    LostBytes = maps:get(lost_bytes, AckMeta, 0),
+                    LargestLostSentTime = maps:get(largest_lost_sent_time, AckMeta, undefined),
 
                     %% Only update CC ACK processing if there are ack-eliciting packets
                     %% When only non-ack-eliciting packets are ACKed, skip on_packets_acked
@@ -3065,16 +3110,13 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                         end,
                     CCState2 = quic_cc:on_packets_lost(CCState1, LostBytes),
 
-                    %% If there was loss, signal congestion event
+                    %% If there was loss, signal congestion event using pre-computed sent time
                     CCState3 =
-                        case LostPackets of
-                            [] ->
+                        case LargestLostSentTime of
+                            undefined ->
                                 CCState2;
-                            [_ | _] ->
-                                quic_cc:on_congestion_event(
-                                    CCState2,
-                                    largest_lost_sent_time(LostPackets)
-                                )
+                            _ ->
+                                quic_cc:on_congestion_event(CCState2, LargestLostSentTime)
                         end,
 
                     %% Process ECN counts if present (RFC 9002 Section 7.1)
@@ -4502,21 +4544,6 @@ is_ack_eliciting_frame(_) -> true.
 ranges_to_ack_format([{_LargestAcked, FirstRange} | RestRanges]) ->
     {FirstRange, RestRanges}.
 
-%% RFC 9002 congestion events use the largest lost packet.
-%% Lost packet lists can be unordered, so pick the max packet number explicitly.
-largest_lost_sent_time([Packet | Rest]) ->
-    Largest = lists:foldl(
-        fun(P, Acc) ->
-            case P#sent_packet.pn > Acc#sent_packet.pn of
-                true -> P;
-                false -> Acc
-            end
-        end,
-        Packet,
-        Rest
-    ),
-    Largest#sent_packet.time_sent.
-
 %% Process ECN counts from ACK frame (RFC 9002 Section 7.1)
 %% ECN-CE indicates network congestion experienced
 process_ecn_counts(undefined, CCState) ->
@@ -5001,8 +5028,9 @@ do_send_data(
                     ),
                     {error, stream_state_error};
                 true ->
-                    DataBin = iolist_to_binary(Data),
-                    DataSize = byte_size(DataBin),
+                    %% Use iolist_size to avoid premature flattening
+                    %% Data is only flattened when needed for chunking or frame encoding
+                    DataSize = iolist_size(Data),
                     Offset = StreamState#stream_state.send_offset,
                     SendMaxData = StreamState#stream_state.send_max_data,
 
@@ -5069,7 +5097,7 @@ do_send_data(
                             %% send and queue the remainder
                             case
                                 send_stream_data_fragmented_tracked(
-                                    StreamId, Offset, DataBin, Fin, State
+                                    StreamId, Offset, Data, Fin, State
                                 )
                             of
                                 {error, send_queue_full} ->
@@ -5220,21 +5248,25 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State) ->
 send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
     %% Calculate max chunk size based on current PMTU
     MaxChunkSize = get_max_stream_data_per_packet(State),
-    DataSize = byte_size(Data),
+    DataSize = iolist_size(Data),
 
     case DataSize =< MaxChunkSize of
         true ->
-            %% Data fits in one packet - check congestion window and pacing
+            %% Data fits in one packet - can pass iolist directly
+            %% Frame encoder will handle flattening
             send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar);
         false ->
-            %% Split data into chunks and send what we can
-            send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize)
+            %% Split data into chunks - need binary for pattern matching
+            DataBin = iolist_to_binary(Data),
+            send_stream_chunked(StreamId, Offset, DataBin, Fin, State, BytesSentSoFar, MaxChunkSize)
     end.
 
 %% @doc Send stream data that fits in a single packet.
+%% Data can be iolist - flattening deferred to frame encoder
 send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
     #state{cc_state = CCState, pacing_enabled = PacingEnabled, streams = Streams} = State,
-    PacketSize = byte_size(Data) + ?PACKET_OVERHEAD,
+    DataSize = iolist_size(Data),
+    PacketSize = DataSize + ?PACKET_OVERHEAD,
     %% Control streams (urgency 0) can exceed cwnd to prevent tick blocking
     Urgency = get_stream_urgency(StreamId, Streams),
     CanSend =
@@ -5253,7 +5285,7 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
                         #{
                             what => stream_data_paced,
                             stream_id => StreamId,
-                            data_size => byte_size(Data),
+                            data_size => DataSize,
                             pacing_delay_ms => Delay
                         },
                         ?QUIC_LOG_META
@@ -5269,10 +5301,12 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
                     %% Pacing allows - send immediately and consume tokens
                     {_Allowed, NewCCState} = quic_cc:get_pacing_tokens(CCState, PacketSize),
                     State1 = State#state{cc_state = NewCCState},
-                    Frame = {stream, StreamId, Offset, Data, Fin},
+                    %% Flatten data for frame encoding
+                    DataBin = iolist_to_binary(Data),
+                    Frame = {stream, StreamId, Offset, DataBin, Fin},
                     Payload = quic_frame:encode(Frame),
                     NewState = send_app_packet_internal(Payload, [Frame], State1),
-                    {NewState, BytesSentSoFar + byte_size(Data)}
+                    {NewState, BytesSentSoFar + DataSize}
             end;
         false ->
             %% Queue the data for later sending when cwnd allows
@@ -5280,7 +5314,7 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
                 #{
                     what => stream_data_queued_cwnd,
                     stream_id => StreamId,
-                    data_size => byte_size(Data),
+                    data_size => DataSize,
                     offset => Offset,
                     cwnd => quic_cc:cwnd(CCState),
                     bytes_in_flight => quic_cc:bytes_in_flight(CCState),
@@ -6390,35 +6424,6 @@ update_path_bytes_sent(IP, Port, Bytes, #state{alt_paths = AltPaths} = State) ->
         AltPaths
     ),
     State#state{alt_paths = NewAltPaths}.
-
-%% @doc Update bytes_received for anti-amplification tracking on a path.
--spec update_path_bytes_received(
-    inet:ip_address(), inet:port_number(), non_neg_integer(), #state{}
-) ->
-    #state{}.
-update_path_bytes_received(IP, Port, Bytes, #state{alt_paths = AltPaths} = State) ->
-    NewAltPaths = lists:map(
-        fun
-            (#path_state{remote_addr = {PathIP, PathPort}} = PS) when
-                PathIP =:= IP, PathPort =:= Port
-            ->
-                PS#path_state{bytes_received = PS#path_state.bytes_received + Bytes};
-            (PS) ->
-                PS
-        end,
-        AltPaths
-    ),
-    State#state{alt_paths = NewAltPaths}.
-
-%% @doc Check anti-amplification limit for sending on unvalidated path.
-%% RFC 9000 Section 8.1: Server MUST NOT send more than 3x data received until validated.
--spec check_anti_amplification_limit(#path_state{}) -> boolean().
-check_anti_amplification_limit(#path_state{status = validated}) ->
-    %% Path is validated, no limit
-    true;
-check_anti_amplification_limit(#path_state{bytes_sent = Sent, bytes_received = Received}) ->
-    %% Unvalidated path: can send at most 3x what we've received
-    Sent < (Received * 3).
 
 %% @doc Initiate path validation for server's preferred address (RFC 9000 Section 9.6).
 %% Client validates the preferred address before migrating to it.

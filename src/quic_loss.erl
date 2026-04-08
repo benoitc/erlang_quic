@@ -228,7 +228,7 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
                 end,
 
             %% Detect lost packets
-            {LostPackets, NewSent2, NewPNSet2, LostBytes} = detect_lost_packets(
+            {LostPackets, NewSent2, NewPNSet2, LostBytes, LargestLostSentTime} = detect_lost_packets(
                 NewSent, NewPNSet, NewState1#loss_state.smoothed_rtt, LargestAcked, Now
             ),
 
@@ -266,7 +266,9 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
             AckMeta = #{
                 acked_bytes => AckedBytes,
                 largest_ae_time => LargestAETime,
-                has_ack_eliciting => MaxAckEliciting =/= undefined
+                has_ack_eliciting => MaxAckEliciting =/= undefined,
+                lost_bytes => LostBytes,
+                largest_lost_sent_time => LargestLostSentTime
             },
 
             {NewState2, AckedPackets, LostPackets, AckMeta}
@@ -286,7 +288,7 @@ detect_lost_packets(
     LargestAcked
 ) ->
     Now = erlang:monotonic_time(millisecond),
-    {LostPackets, NewSent, NewPNSet, LostBytes} =
+    {LostPackets, NewSent, NewPNSet, LostBytes, _LargestLostSentTime} =
         detect_lost_packets(Sent, PNSet, SRTT, LargestAcked, Now),
     NewState = State#loss_state{
         sent_packets = NewSent,
@@ -301,6 +303,8 @@ detect_lost_packets(
 %%
 %% Uses pn_set iterator to only check packets below LossThreshold for
 %% efficient O(k) loss detection where k is the number of lost packets.
+%% Returns {LostPackets, Remaining, NewPNSet, LostBytes, LargestLostSentTime}
+%% where LargestLostSentTime is the sent_time of the packet with highest PN.
 detect_lost_packets(SentPackets, PNSet, SmoothedRTT, LargestAcked, Now) ->
     %% Calculate loss delay
     LossDelay = max(trunc(?TIME_THRESHOLD * SmoothedRTT), ?GRANULARITY),
@@ -310,9 +314,10 @@ detect_lost_packets(SentPackets, PNSet, SmoothedRTT, LargestAcked, Now) ->
 
     %% Iterate only packets below loss threshold for efficiency
     %% Also check time-based loss for packets below LargestAcked
+    %% Track largest lost packet (by PN) for congestion event reporting
     Iter = gb_sets:iterator(PNSet),
-    {LostPNs, Lost, LostBytes} = detect_lost_iter(
-        Iter, SentPackets, LossThreshold, LargestAcked, LossDelay, Now, [], [], 0
+    {LostPNs, Lost, LostBytes, LargestLost} = detect_lost_iter(
+        Iter, SentPackets, LossThreshold, LargestAcked, LossDelay, Now, [], [], 0, undefined
     ),
 
     %% Remove lost packets from sent map and pn_set
@@ -320,9 +325,17 @@ detect_lost_packets(SentPackets, PNSet, SmoothedRTT, LargestAcked, Now) ->
     %% Use foldl with delete_any for O(k * log n) instead of O(n) subtract
     NewPNSet = lists:foldl(fun gb_sets:delete_any/2, PNSet, LostPNs),
 
-    {Lost, Remaining, NewPNSet, LostBytes}.
+    %% Extract sent_time from largest lost packet (for congestion event)
+    LargestLostSentTime =
+        case LargestLost of
+            undefined -> undefined;
+            {_PN, TimeSent} -> TimeSent
+        end,
+
+    {Lost, Remaining, NewPNSet, LostBytes, LargestLostSentTime}.
 
 %% Iterator-based loss detection
+%% Also tracks largest lost packet (by PN) for congestion event reporting
 detect_lost_iter(
     Iter,
     SentPackets,
@@ -332,14 +345,15 @@ detect_lost_iter(
     Now,
     PNsAcc,
     LostAcc,
-    BytesAcc
+    BytesAcc,
+    LargestLost
 ) ->
     case gb_sets:next(Iter) of
         none ->
-            {PNsAcc, LostAcc, BytesAcc};
+            {PNsAcc, LostAcc, BytesAcc, LargestLost};
         {PN, _NextIter} when PN >= LargestAcked ->
             %% No more packets can be lost (packet number >= largest acked)
-            {PNsAcc, LostAcc, BytesAcc};
+            {PNsAcc, LostAcc, BytesAcc, LargestLost};
         {PN, NextIter} ->
             case maps:get(PN, SentPackets, undefined) of
                 #sent_packet{
@@ -362,9 +376,11 @@ detect_lost_iter(
                         AckEliciting,
                         Size,
                         PN,
+                        TimeSent,
                         PNsAcc,
                         LostAcc,
-                        BytesAcc
+                        BytesAcc,
+                        LargestLost
                     );
                 _ ->
                     %% Not in flight or not found, skip
@@ -377,12 +393,14 @@ detect_lost_iter(
                         Now,
                         PNsAcc,
                         LostAcc,
-                        BytesAcc
+                        BytesAcc,
+                        LargestLost
                     )
             end
     end.
 
 %% Helper to reduce nesting in detect_lost_iter
+%% When a packet is lost, update LargestLost if this packet has a higher PN
 detect_lost_maybe(
     true,
     {NextIter, SentPackets, LossThreshold, LargestAcked, LossDelay, Now},
@@ -390,14 +408,23 @@ detect_lost_maybe(
     AckEliciting,
     Size,
     PN,
+    TimeSent,
     PNsAcc,
     LostAcc,
-    BytesAcc
+    BytesAcc,
+    LargestLost
 ) ->
     NewBytes =
         case AckEliciting of
             true -> BytesAcc + Size;
             false -> BytesAcc
+        end,
+    %% Update largest lost packet (by PN) for congestion event
+    NewLargestLost =
+        case LargestLost of
+            undefined -> {PN, TimeSent};
+            {OldPN, _} when PN > OldPN -> {PN, TimeSent};
+            _ -> LargestLost
         end,
     detect_lost_iter(
         NextIter,
@@ -408,7 +435,8 @@ detect_lost_maybe(
         Now,
         [PN | PNsAcc],
         [Packet | LostAcc],
-        NewBytes
+        NewBytes,
+        NewLargestLost
     );
 detect_lost_maybe(
     false,
@@ -417,9 +445,11 @@ detect_lost_maybe(
     _AckEliciting,
     _Size,
     _PN,
+    _TimeSent,
     PNsAcc,
     LostAcc,
-    BytesAcc
+    BytesAcc,
+    LargestLost
 ) ->
     detect_lost_iter(
         NextIter,
@@ -430,7 +460,8 @@ detect_lost_maybe(
         Now,
         PNsAcc,
         LostAcc,
-        BytesAcc
+        BytesAcc,
+        LargestLost
     ).
 
 %% @doc Get the loss time for setting timers.
