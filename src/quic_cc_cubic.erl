@@ -145,8 +145,10 @@
     hystart_last_rtt = 0 :: non_neg_integer(),
     %% Current round's minimum RTT
     hystart_curr_rtt = infinity :: non_neg_integer() | infinity,
-    %% Round start packet number
+    %% Round start packet number (deprecated, kept for compatibility)
     hystart_round_start = 0 :: non_neg_integer(),
+    %% Round start time for time-based round detection (RFC 9406)
+    hystart_round_start_time = 0 :: non_neg_integer(),
     %% CSS baseline RTT for potential reversion to slow start (RFC 9406)
     hystart_css_baseline_rtt = infinity :: non_neg_integer() | infinity,
 
@@ -193,7 +195,7 @@ new(Opts) ->
     MinRecoveryDuration = maps:get(min_recovery_duration, Opts, 100),
     HystartEnabled = maps:get(hystart_enabled, Opts, true),
     PacingMaxBurst = 12 * MaxDatagramSize,
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     ?LOG_DEBUG(
         #{
             what => cc_state_initialized,
@@ -272,25 +274,27 @@ on_packets_acked(
                 recovery_start_time = Now
             },
             %% Reset epoch and continue cubic growth
-            cubic_on_ack(State1, AckedBytes);
+            cubic_on_ack(State1, AckedBytes, LargestAckedSentTime);
         false ->
             %% Still in recovery, don't increase cwnd
             State#cubic_state{bytes_in_flight = NewInFlight}
     end;
 on_packets_acked(
-    #cubic_state{bytes_in_flight = InFlight} = State, AckedBytes, _LargestAckedSentTime
+    #cubic_state{bytes_in_flight = InFlight} = State, AckedBytes, LargestAckedSentTime
 ) ->
     NewInFlight = max(0, InFlight - AckedBytes),
     State1 = State#cubic_state{bytes_in_flight = NewInFlight},
-    cubic_on_ack(State1, AckedBytes).
+    cubic_on_ack(State1, AckedBytes, LargestAckedSentTime).
 
 %% @private CUBIC ACK processing with HyStart++ and TCP-friendly mode
-cubic_on_ack(#cubic_state{cwnd = Cwnd, ssthresh = SSThresh} = State, AckedBytes) when
+cubic_on_ack(
+    #cubic_state{cwnd = Cwnd, ssthresh = SSThresh} = State, AckedBytes, LargestAckedSentTime
+) when
     Cwnd < SSThresh
 ->
     %% In slow start
-    hystart_on_ack(State, AckedBytes);
-cubic_on_ack(State, AckedBytes) ->
+    hystart_on_ack(State, AckedBytes, LargestAckedSentTime);
+cubic_on_ack(State, AckedBytes, _LargestAckedSentTime) ->
     %% In congestion avoidance - use CUBIC window function
     cubic_congestion_avoidance(State, AckedBytes).
 
@@ -300,7 +304,8 @@ hystart_on_ack(
         cwnd = Cwnd,
         hystart_enabled = false
     } = State,
-    AckedBytes
+    AckedBytes,
+    _LargestAckedSentTime
 ) ->
     %% HyStart++ disabled - standard slow start
     NewCwnd = Cwnd + AckedBytes,
@@ -313,10 +318,13 @@ hystart_on_ack(
         hystart_css_rounds = Rounds,
         hystart_css_baseline_rtt = BaselineRTT,
         hystart_curr_rtt = CurrRTT,
-        hystart_rtt_sample_count = SampleCount
+        hystart_rtt_sample_count = SampleCount,
+        hystart_round_start_time = RoundStartTime
     } = State,
-    AckedBytes
+    AckedBytes,
+    LargestAckedSentTime
 ) ->
+    Now = erlang:monotonic_time(millisecond),
     NewSampleCount = SampleCount + 1,
 
     %% Check for CSS reversion after enough samples (RFC 9406)
@@ -339,7 +347,8 @@ hystart_on_ack(
                 hystart_in_css = false,
                 hystart_css_rounds = 0,
                 hystart_css_baseline_rtt = infinity,
-                hystart_rtt_sample_count = 0
+                hystart_rtt_sample_count = 0,
+                hystart_round_start_time = Now
             };
         _ ->
             %% Continue CSS with linear growth
@@ -348,8 +357,17 @@ hystart_on_ack(
             ),
             NewCwnd = Cwnd + Increment,
 
-            %% Check if CSS rounds complete
-            NewRounds = Rounds + 1,
+            %% Time-based round detection (RFC 9406)
+            %% A new round begins when we ACK a packet sent after round started
+            {NewRounds, NewRoundStartTime} =
+                case LargestAckedSentTime > RoundStartTime of
+                    true ->
+                        %% ACK for packet sent after round started = new round
+                        {Rounds + 1, Now};
+                    false ->
+                        {Rounds, RoundStartTime}
+                end,
+
             case NewRounds >= ?HYSTART_CSS_ROUNDS of
                 true ->
                     %% Exit slow start, enter congestion avoidance
@@ -367,13 +385,15 @@ hystart_on_ack(
                         cwnd_prior = NewCwnd,
                         hystart_in_css = false,
                         hystart_css_rounds = 0,
-                        hystart_css_baseline_rtt = infinity
+                        hystart_css_baseline_rtt = infinity,
+                        hystart_round_start_time = 0
                     };
                 false ->
                     State#cubic_state{
                         cwnd = NewCwnd,
                         hystart_css_rounds = NewRounds,
-                        hystart_rtt_sample_count = NewSampleCount
+                        hystart_rtt_sample_count = NewSampleCount,
+                        hystart_round_start_time = NewRoundStartTime
                     }
             end
     end;
@@ -384,9 +404,11 @@ hystart_on_ack(
         hystart_last_rtt = LastRTT,
         hystart_curr_rtt = CurrRTT
     } = State,
-    AckedBytes
+    AckedBytes,
+    _LargestAckedSentTime
 ) ->
     %% Standard slow start with HyStart++ RTT monitoring
+    Now = erlang:monotonic_time(millisecond),
     NewCwnd = Cwnd + AckedBytes,
     NewSampleCount = SampleCount + 1,
 
@@ -407,6 +429,7 @@ hystart_on_ack(
                 true ->
                     %% Enter Conservative Slow Start
                     %% Save current RTT as baseline for potential reversion
+                    %% Initialize round_start_time for time-based round detection
                     ?LOG_DEBUG(
                         #{
                             what => hystart_enter_css,
@@ -423,7 +446,8 @@ hystart_on_ack(
                         hystart_css_rounds = 0,
                         cwnd_prior = NewCwnd,
                         hystart_css_baseline_rtt = CurrRTT,
-                        hystart_rtt_sample_count = 0
+                        hystart_rtt_sample_count = 0,
+                        hystart_round_start_time = Now
                     };
                 false ->
                     State1
@@ -657,7 +681,8 @@ do_congestion_event(
         hystart_in_css = false,
         hystart_css_rounds = 0,
         hystart_rtt_sample_count = 0,
-        hystart_css_baseline_rtt = infinity
+        hystart_css_baseline_rtt = infinity,
+        hystart_round_start_time = 0
     }.
 
 %%====================================================================
@@ -715,7 +740,8 @@ on_ecn_ce(
         hystart_in_css = false,
         hystart_css_rounds = 0,
         hystart_rtt_sample_count = 0,
-        hystart_css_baseline_rtt = infinity
+        hystart_css_baseline_rtt = infinity,
+        hystart_round_start_time = 0
     }.
 
 %% @doc Get the current ECN-CE counter.
@@ -766,7 +792,8 @@ on_persistent_congestion(#cubic_state{cwnd = Cwnd, minimum_window = MinimumWindo
         hystart_rtt_sample_count = 0,
         hystart_last_rtt = 0,
         hystart_curr_rtt = infinity,
-        hystart_css_baseline_rtt = infinity
+        hystart_css_baseline_rtt = infinity,
+        hystart_round_start_time = 0
     }.
 
 %%====================================================================
@@ -776,8 +803,9 @@ on_persistent_congestion(#cubic_state{cwnd = Cwnd, minimum_window = MinimumWindo
 %% @doc Update pacing rate based on smoothed RTT.
 -spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
 update_pacing_rate(#cubic_state{cwnd = Cwnd} = State, SmoothedRTT) when SmoothedRTT > 0 ->
-    %% pacing_rate = cwnd / smoothed_rtt * 1.25
-    PacingRate = max(1, (Cwnd * 5) div (SmoothedRTT * 4)),
+    %% pacing_rate stored as milli-bytes per microsecond for precision with us timestamps
+    %% Formula: (cwnd * 1.25 * 1000) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
+    PacingRate = max(1, (Cwnd * 1250) div (SmoothedRTT * 1000)),
 
     %% Update HyStart++ RTT tracking
     State1 = update_hystart_rtt(State, SmoothedRTT),
@@ -822,7 +850,7 @@ pacing_allows(
     },
     Size
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     RefreshedTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
     RefreshedTokens >= Size.
 
@@ -839,7 +867,7 @@ get_pacing_tokens(
     } = State,
     Size
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     NewTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
     Allowed = min(Size, NewTokens),
     RemainingTokens = max(0, NewTokens - Allowed),
@@ -862,7 +890,7 @@ pacing_delay(
     },
     Size
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     CurrentTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
     case CurrentTokens >= Size of
         true ->
@@ -954,10 +982,11 @@ max_datagram_size(#cubic_state{max_datagram_size = MDS}) -> MDS.
 %% Internal Functions
 %%====================================================================
 
-%% Refill pacing tokens based on elapsed time
+%% Refill pacing tokens based on elapsed time (microsecond timestamps, rate in milli-bytes/us)
 refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now) ->
-    Elapsed = max(0, Now - LastUpdate),
-    Added = Elapsed * Rate,
+    ElapsedUs = max(0, Now - LastUpdate),
+    %% Rate is in milli-bytes per microsecond, so Added = (elapsed_us * rate) / 1000
+    Added = (ElapsedUs * Rate) div 1000,
     min(MaxBurst, Tokens + Added).
 
 %% Calculate initial window (32 packets like quic-go)

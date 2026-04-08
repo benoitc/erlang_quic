@@ -146,7 +146,9 @@
     %% Current round's minimum RTT (milliseconds)
     hystart_curr_rtt = infinity :: non_neg_integer() | infinity,
     %% CSS baseline RTT for potential reversion to slow start (RFC 9406)
-    hystart_css_baseline_rtt = infinity :: non_neg_integer() | infinity
+    hystart_css_baseline_rtt = infinity :: non_neg_integer() | infinity,
+    %% Round start time for time-based round detection (RFC 9406)
+    hystart_round_start_time = 0 :: non_neg_integer()
 }).
 
 -opaque cc_state() :: #cc_state{}.
@@ -287,7 +289,7 @@ on_packets_acked(
                 case Cwnd < SSThresh of
                     true ->
                         %% Slow start with HyStart++ (RFC 9406)
-                        hystart_on_ack(State1, AckedBytes);
+                        hystart_on_ack(State1, AckedBytes, LargestAckedSentTime);
                     false ->
                         %% Congestion avoidance
                         Increment = (MaxDS * AckedBytes) div max(Cwnd, 1),
@@ -333,7 +335,7 @@ on_packets_acked(
         max_datagram_size = MaxDS
     } = State,
     AckedBytes,
-    _LargestAckedSentTime
+    LargestAckedSentTime
 ) ->
     NewInFlight = max(0, InFlight - AckedBytes),
     State1 = State#cc_state{bytes_in_flight = NewInFlight},
@@ -344,7 +346,7 @@ on_packets_acked(
         case InSlowStart of
             true ->
                 %% Slow start with HyStart++ (RFC 9406)
-                hystart_on_ack(State1, AckedBytes);
+                hystart_on_ack(State1, AckedBytes, LargestAckedSentTime);
             false ->
                 %% Congestion avoidance: increase by ~1 MSS per RTT
                 %% cwnd += max_datagram_size * acked_bytes / cwnd
@@ -388,7 +390,8 @@ hystart_on_ack(
         cwnd = Cwnd,
         hystart_enabled = false
     } = State,
-    AckedBytes
+    AckedBytes,
+    _LargestAckedSentTime
 ) ->
     NewCwnd = Cwnd + AckedBytes,
     State#cc_state{cwnd = NewCwnd};
@@ -402,10 +405,13 @@ hystart_on_ack(
         hystart_css_rounds = Rounds,
         hystart_css_baseline_rtt = BaselineRTT,
         hystart_curr_rtt = CurrRTT,
-        hystart_rtt_sample_count = SampleCount
+        hystart_rtt_sample_count = SampleCount,
+        hystart_round_start_time = RoundStartTime
     } = State,
-    AckedBytes
+    AckedBytes,
+    LargestAckedSentTime
 ) ->
+    Now = erlang:monotonic_time(millisecond),
     NewSampleCount = SampleCount + 1,
 
     %% Check for CSS reversion after enough samples (RFC 9406)
@@ -428,7 +434,8 @@ hystart_on_ack(
                 hystart_in_css = false,
                 hystart_css_rounds = 0,
                 hystart_css_baseline_rtt = infinity,
-                hystart_rtt_sample_count = 0
+                hystart_rtt_sample_count = 0,
+                hystart_round_start_time = Now
             };
         _ ->
             %% Continue CSS with linear growth
@@ -437,8 +444,17 @@ hystart_on_ack(
             ),
             NewCwnd = Cwnd + Increment,
 
-            %% Check if CSS rounds complete
-            NewRounds = Rounds + 1,
+            %% Time-based round detection (RFC 9406)
+            %% A new round begins when we ACK a packet sent after round started
+            {NewRounds, NewRoundStartTime} =
+                case LargestAckedSentTime > RoundStartTime of
+                    true ->
+                        %% ACK for packet sent after round started = new round
+                        {Rounds + 1, Now};
+                    false ->
+                        {Rounds, RoundStartTime}
+                end,
+
             case NewRounds >= ?HYSTART_CSS_ROUNDS of
                 true ->
                     %% Exit slow start, enter congestion avoidance
@@ -455,13 +471,15 @@ hystart_on_ack(
                         ssthresh = NewCwnd,
                         hystart_in_css = false,
                         hystart_css_rounds = 0,
-                        hystart_css_baseline_rtt = infinity
+                        hystart_css_baseline_rtt = infinity,
+                        hystart_round_start_time = 0
                     };
                 false ->
                     State#cc_state{
                         cwnd = NewCwnd,
                         hystart_css_rounds = NewRounds,
-                        hystart_rtt_sample_count = NewSampleCount
+                        hystart_rtt_sample_count = NewSampleCount,
+                        hystart_round_start_time = NewRoundStartTime
                     }
             end
     end;
@@ -473,9 +491,11 @@ hystart_on_ack(
         hystart_last_rtt = LastRTT,
         hystart_curr_rtt = CurrRTT
     } = State,
-    AckedBytes
+    AckedBytes,
+    _LargestAckedSentTime
 ) ->
     %% Standard slow start with HyStart++ RTT monitoring
+    Now = erlang:monotonic_time(millisecond),
     NewCwnd = Cwnd + AckedBytes,
     NewSampleCount = SampleCount + 1,
 
@@ -497,6 +517,7 @@ hystart_on_ack(
                 true ->
                     %% Enter Conservative Slow Start
                     %% Save current RTT as baseline for potential reversion
+                    %% Initialize round_start_time for time-based round detection
                     ?LOG_DEBUG(
                         #{
                             what => hystart_enter_css,
@@ -512,7 +533,8 @@ hystart_on_ack(
                         hystart_in_css = true,
                         hystart_css_rounds = 0,
                         hystart_css_baseline_rtt = CurrRTT,
-                        hystart_rtt_sample_count = 0
+                        hystart_rtt_sample_count = 0,
+                        hystart_round_start_time = Now
                     };
                 false ->
                     State1
@@ -666,7 +688,8 @@ do_congestion_event(
         hystart_in_css = false,
         hystart_css_rounds = 0,
         hystart_rtt_sample_count = 0,
-        hystart_css_baseline_rtt = infinity
+        hystart_css_baseline_rtt = infinity,
+        hystart_round_start_time = 0
     }.
 
 %%====================================================================
@@ -705,7 +728,8 @@ on_ecn_ce(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} = State, NewCEC
         hystart_in_css = false,
         hystart_css_rounds = 0,
         hystart_rtt_sample_count = 0,
-        hystart_css_baseline_rtt = infinity
+        hystart_css_baseline_rtt = infinity,
+        hystart_round_start_time = 0
     }.
 
 %% @doc Get the current ECN-CE counter.
@@ -848,7 +872,8 @@ on_persistent_congestion(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} 
         hystart_rtt_sample_count = 0,
         hystart_last_rtt = 0,
         hystart_curr_rtt = infinity,
-        hystart_css_baseline_rtt = infinity
+        hystart_css_baseline_rtt = infinity,
+        hystart_round_start_time = 0
     }.
 
 %%====================================================================

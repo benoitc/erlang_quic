@@ -154,6 +154,32 @@ newreno_hystart_reset_on_persistent_congestion_test() ->
     ?assert(quic_cc_newreno:in_slow_start(S1)).
 
 %%====================================================================
+%% HyStart++ CSS Round Counting Tests (Phase 3 Fix)
+%%====================================================================
+
+newreno_hystart_css_uses_time_based_rounds_test() ->
+    %% Verify that CSS rounds are counted per-RTT, not per-ACK
+    %% With time-based detection, multiple ACKs in the same RTT = same round
+    State = quic_cc:new(newreno, #{}),
+    %% 10ms RTT
+    S1 = quic_cc:update_pacing_rate(State, 10),
+
+    %% Send packets and get ACKs with same LargestAckedSentTime
+    %% This simulates multiple ACKs for packets sent at the same time
+    Now = erlang:monotonic_time(millisecond),
+    S2 = quic_cc:on_packet_sent(S1, 1200),
+    S3 = quic_cc:on_packets_acked(S2, 1200, Now),
+    S4 = quic_cc:on_packet_sent(S3, 1200),
+    %% Same sent time = same round
+    S5 = quic_cc:on_packets_acked(S4, 1200, Now),
+    S6 = quic_cc:on_packet_sent(S5, 1200),
+    %% Same sent time = same round
+    S7 = quic_cc:on_packets_acked(S6, 1200, Now),
+
+    %% Should still be in slow start (rounds not advancing without time progress)
+    ?assert(quic_cc:in_slow_start(S7)).
+
+%%====================================================================
 %% HyStart++ Dynamic RTT Threshold Tests (RFC 9406)
 %%====================================================================
 
