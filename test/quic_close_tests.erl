@@ -197,3 +197,123 @@ close_sends_closed_message_test() ->
 
     %% Wait for connection to finish
     timer:sleep(100).
+
+%%====================================================================
+%% Application Error Code Tests (Issue #31)
+%%====================================================================
+
+%% Test close/3 with custom error code and reason phrase
+close_with_app_error_code_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    Ref = gen_statem:call(Pid, get_ref),
+
+    %% Close with custom application error code
+    ErrorCode = 16#0100,
+    ReasonPhrase = <<"custom error reason">>,
+    quic_connection:close(Pid, {app_error, ErrorCode, ReasonPhrase}),
+
+    %% Wait for the closed message with the app_error reason
+    receive
+        {quic, Ref, {closed, {app_error, ErrorCode, ReasonPhrase}}} -> ok
+    after 500 ->
+        ok
+    end,
+
+    timer:sleep(100).
+
+%% Test close/3 API with zero error code (QUIC_NO_ERROR equivalent)
+close_with_zero_error_code_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    Ref = gen_statem:call(Pid, get_ref),
+
+    %% Close with error code 0 (no error)
+    quic_connection:close(Pid, {app_error, 0, <<>>}),
+
+    receive
+        {quic, Ref, {closed, {app_error, 0, <<>>}}} -> ok
+    after 500 ->
+        ok
+    end,
+
+    timer:sleep(100).
+
+%% Test close/3 API with maximum valid 62-bit error code
+close_with_max_error_code_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    Ref = gen_statem:call(Pid, get_ref),
+
+    %% Close with maximum 62-bit error code
+    MaxErrorCode = (1 bsl 62) - 1,
+    quic_connection:close(Pid, {app_error, MaxErrorCode, <<"max code">>}),
+
+    receive
+        {quic, Ref, {closed, {app_error, MaxErrorCode, <<"max code">>}}} -> ok
+    after 500 ->
+        ok
+    end,
+
+    timer:sleep(100).
+
+%% Test quic:close/3 public API
+quic_close_3_api_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+
+    %% Use the public API
+    ErrorCode = 42,
+    ReasonPhrase = <<"test reason">>,
+    ok = quic:close(Pid, ErrorCode, ReasonPhrase),
+
+    timer:sleep(100).
+
+%% Test that close/2 with legacy {error, application_error} still works
+close_legacy_application_error_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    Ref = gen_statem:call(Pid, get_ref),
+
+    %% Close with legacy pattern (used in E2E tests)
+    quic_connection:close(Pid, {error, application_error}),
+
+    receive
+        {quic, Ref, {closed, {error, application_error}}} -> ok
+    after 500 ->
+        ok
+    end,
+
+    timer:sleep(100).
+
+%%====================================================================
+%% close_reason_to_code Tests
+%%====================================================================
+
+%% Test close_reason_to_code for new app_error pattern
+close_reason_to_code_app_error_test() ->
+    %% app_error with code should return the code
+    ?assertEqual(256, quic_connection:close_reason_to_code({app_error, 256, <<"reason">>})),
+    ?assertEqual(0, quic_connection:close_reason_to_code({app_error, 0, <<>>})),
+    ?assertEqual(65535, quic_connection:close_reason_to_code({app_error, 65535, <<"test">>})).
+
+%% Test close_reason_to_code for peer_closed patterns
+close_reason_to_code_peer_closed_test() ->
+    %% Application close from peer
+    ?assertEqual(
+        100, quic_connection:close_reason_to_code({peer_closed, application, 100, <<"reason">>})
+    ),
+    %% Transport close from peer
+    ?assertEqual(
+        200, quic_connection:close_reason_to_code({peer_closed, transport, 200, 0, <<"reason">>})
+    ).
+
+%% Test close_reason_to_code for legacy patterns
+close_reason_to_code_legacy_test() ->
+    ?assertEqual(0, quic_connection:close_reason_to_code(connection_closed)),
+    ?assertEqual(0, quic_connection:close_reason_to_code(normal)),
+    ?assertEqual(stateless_reset, quic_connection:close_reason_to_code(stateless_reset)),
+    ?assertEqual(idle_timeout, quic_connection:close_reason_to_code(idle_timeout)),
+    ?assertEqual(42, quic_connection:close_reason_to_code({error, 42})),
+    ?assertEqual(
+        ?QUIC_APPLICATION_ERROR, quic_connection:close_reason_to_code({error, application_error})
+    ),
+    %% Atoms are returned as-is (for qlog compatibility)
+    ?assertEqual(some_atom_reason, quic_connection:close_reason_to_code(some_atom_reason)),
+    %% Non-atoms/non-matching patterns return 'unknown'
+    ?assertEqual(unknown, quic_connection:close_reason_to_code({some, tuple})).
