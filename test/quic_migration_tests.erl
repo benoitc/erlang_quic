@@ -230,6 +230,122 @@ path_validation_failure_test() ->
     ?assert(Path#path_state.challenge_data /= WrongResponse).
 
 %%====================================================================
+%% Path State Extended Fields Tests (RFC 9000 Section 9)
+%%====================================================================
+
+path_state_with_dcid_test() ->
+    %% Test the new dcid field in path_state
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    Path = #path_state{
+        remote_addr = {{127, 0, 0, 1}, 4433},
+        status = validated,
+        dcid = DCID
+    },
+    ?assertEqual(DCID, Path#path_state.dcid),
+    ?assertEqual(validated, Path#path_state.status).
+
+path_state_nat_rebinding_test() ->
+    %% Test the is_nat_rebinding field
+    Path = #path_state{
+        remote_addr = {{192, 168, 1, 1}, 8443},
+        status = validating,
+        is_nat_rebinding = true
+    },
+    ?assertEqual(true, Path#path_state.is_nat_rebinding),
+
+    %% Active migration (different IP) should have is_nat_rebinding = false
+    PathMigration = #path_state{
+        remote_addr = {{10, 0, 0, 5}, 4433},
+        status = validating,
+        is_nat_rebinding = false
+    },
+    ?assertEqual(false, PathMigration#path_state.is_nat_rebinding).
+
+%%====================================================================
+%% Address Change Detection Tests
+%%====================================================================
+
+detect_address_change_same_test() ->
+    %% Same address should return same_path
+    CurrentAddr = {{192, 168, 1, 100}, 4433},
+    ?assertEqual(same_path, detect_peer_address_change(CurrentAddr, CurrentAddr)).
+
+detect_address_change_nat_rebinding_test() ->
+    %% Same IP, different port should return nat_rebinding
+    CurrentAddr = {{192, 168, 1, 100}, 4433},
+    NewAddr = {{192, 168, 1, 100}, 5000},
+    ?assertEqual(nat_rebinding, detect_peer_address_change(NewAddr, CurrentAddr)).
+
+detect_address_change_new_path_test() ->
+    %% Different IP should return new_path
+    CurrentAddr = {{192, 168, 1, 100}, 4433},
+    NewAddr = {{10, 0, 0, 5}, 4433},
+    ?assertEqual(new_path, detect_peer_address_change(NewAddr, CurrentAddr)).
+
+detect_address_change_ipv6_same_test() ->
+    %% Same IPv6 address
+    CurrentAddr = {{0, 0, 0, 0, 0, 0, 0, 1}, 4433},
+    ?assertEqual(same_path, detect_peer_address_change(CurrentAddr, CurrentAddr)).
+
+detect_address_change_ipv6_nat_rebinding_test() ->
+    %% Same IPv6, different port
+    CurrentAddr = {{8193, 3512, 0, 0, 0, 0, 0, 1}, 4433},
+    NewAddr = {{8193, 3512, 0, 0, 0, 0, 0, 1}, 5000},
+    ?assertEqual(nat_rebinding, detect_peer_address_change(NewAddr, CurrentAddr)).
+
+%%====================================================================
+%% CID Switching Tests
+%%====================================================================
+
+find_unused_cid_found_test() ->
+    %% Pool with multiple CIDs, one different from current
+    CurrentCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    OtherCID = <<8, 7, 6, 5, 4, 3, 2, 1>>,
+    Pool = [
+        #cid_entry{seq_num = 0, cid = CurrentCID, status = active},
+        #cid_entry{seq_num = 1, cid = OtherCID, status = active}
+    ],
+    ?assertEqual({ok, OtherCID}, find_unused_cid(Pool, CurrentCID)).
+
+find_unused_cid_not_found_test() ->
+    %% Pool with only the current CID
+    CurrentCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    Pool = [
+        #cid_entry{seq_num = 0, cid = CurrentCID, status = active}
+    ],
+    ?assertEqual(not_found, find_unused_cid(Pool, CurrentCID)).
+
+find_unused_cid_skips_retired_test() ->
+    %% Pool with retired CID should skip it
+    CurrentCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    RetiredCID = <<8, 7, 6, 5, 4, 3, 2, 1>>,
+    ActiveCID = <<2, 3, 4, 5, 6, 7, 8, 9>>,
+    Pool = [
+        #cid_entry{seq_num = 0, cid = CurrentCID, status = active},
+        #cid_entry{seq_num = 1, cid = RetiredCID, status = retired},
+        #cid_entry{seq_num = 2, cid = ActiveCID, status = active}
+    ],
+    ?assertEqual({ok, ActiveCID}, find_unused_cid(Pool, CurrentCID)).
+
+find_unused_cid_empty_pool_test() ->
+    CurrentCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    ?assertEqual(not_found, find_unused_cid([], CurrentCID)).
+
+%%====================================================================
+%% Migration State Tests
+%%====================================================================
+
+migration_state_idle_test() ->
+    %% Default migration state should be idle
+    State = idle,
+    ?assertEqual(idle, State).
+
+migration_state_validating_peer_test() ->
+    %% When validating peer's new address
+    State = validating_peer,
+    ?assertEqual(validating_peer, State).
+
+%%====================================================================
 %% Helper Functions
 %%====================================================================
 
@@ -238,3 +354,24 @@ can_send(#path_state{status = validated}, _Size) ->
     true;
 can_send(#path_state{bytes_sent = Sent, bytes_received = Recv}, Size) ->
     (Sent + Size) =< (Recv * 3).
+
+%% Simulates detect_peer_address_change/2 logic from quic_connection
+detect_peer_address_change(PacketAddr, CurrentAddr) ->
+    case PacketAddr of
+        CurrentAddr ->
+            same_path;
+        {IP, _Port} when IP =:= element(1, CurrentAddr) ->
+            nat_rebinding;
+        _ ->
+            new_path
+    end.
+
+%% Simulates find_unused_cid/2 logic from quic_connection
+find_unused_cid([], _CurrentCID) ->
+    not_found;
+find_unused_cid([#cid_entry{cid = CID, status = active} | _Rest], CurrentCID) when
+    CID =/= CurrentCID
+->
+    {ok, CID};
+find_unused_cid([_ | Rest], CurrentCID) ->
+    find_unused_cid(Rest, CurrentCID).

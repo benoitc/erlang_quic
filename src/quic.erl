@@ -78,6 +78,7 @@
     datagram_max_size/1,
     setopts/2,
     migrate/1,
+    migrate/2,
     %% Stream prioritization (RFC 9218)
     set_stream_priority/4,
     get_stream_priority/2,
@@ -360,6 +361,21 @@ setopts(Conn, Opts) when is_pid(Conn), is_list(Opts) ->
     Conn :: pid().
 migrate(Conn) when is_pid(Conn) ->
     quic_connection:migrate(Conn).
+
+%% @doc Trigger connection migration with options.
+%% This initiates path validation on a new network path.
+%% The connection will send PATH_CHALLENGE and wait for PATH_RESPONSE.
+%%
+%% Options:
+%% <ul>
+%%   <li>`timeout' - Timeout in milliseconds for the gen_statem call (default: 5000)</li>
+%% </ul>
+-spec migrate(Conn, Opts) -> ok | {error, term()} when
+    Conn :: pid(),
+    Opts :: #{timeout => pos_integer()}.
+migrate(Conn, Opts) when is_pid(Conn), is_map(Opts) ->
+    Timeout = maps:get(timeout, Opts, 5000),
+    quic_connection:migrate(Conn, Timeout).
 
 %% @doc Set the priority for a stream.
 %% Urgency: 0-7 (lower = more urgent, default 3)

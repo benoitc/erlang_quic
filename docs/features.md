@@ -30,8 +30,13 @@
 
 ### Connection Migration (RFC 9000 Section 9)
 - [x] PATH_CHALLENGE / PATH_RESPONSE validation
-- [x] Active connection migration (`quic:migrate/1`)
+- [x] Active connection migration (`quic:migrate/1`, `quic:migrate/2`)
 - [x] Preferred address handling (RFC 9000 Section 9.6)
+- [x] Server-side address change detection (NAT rebinding and active migration)
+- [x] Congestion control reset on path change (RFC 9002 Section 9.4)
+- [x] CID rotation on migration for path unlinkability (RFC 9000 Section 9.5)
+- [x] `disable_active_migration` transport parameter support
+- [x] Path validation timeout with retry (3 * PTO, up to 3 attempts)
 
 ### Connection ID Management
 - [x] Multiple connection IDs
@@ -111,11 +116,11 @@
 
 ### Connection
 - `quic:connect/3,4` - Connect to server
-- `quic:close/1,2` - Close connection
+- `quic:close/1,2,3` - Close connection (with optional app error code)
 - `quic:peername/1` - Get peer address
 - `quic:sockname/1` - Get local address
 - `quic:peercert/1` - Get peer certificate
-- `quic:migrate/1` - Trigger connection migration
+- `quic:migrate/1,2` - Trigger connection migration (with optional timeout)
 
 ### Datagrams (RFC 9221)
 - `quic:send_datagram/2` - Send unreliable datagram

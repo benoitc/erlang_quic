@@ -372,7 +372,15 @@
     bytes_received = 0 :: non_neg_integer(),
 
     %% RTT estimation for this path
-    rtt :: non_neg_integer() | undefined
+    rtt :: non_neg_integer() | undefined,
+
+    %% CID used on this path (RFC 9000 Section 9.5)
+    dcid :: binary() | undefined,
+
+    %% NAT rebinding vs active migration (RFC 9000 Section 9.3)
+    %% NAT rebinding: only port changed, same IP
+    %% Active migration: different IP address
+    is_nat_rebinding = false :: boolean()
 }).
 
 %% Preferred Address for Server Migration (RFC 9000 Section 9.6)

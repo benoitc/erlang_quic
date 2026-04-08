@@ -171,18 +171,96 @@ receive
 end.
 ```
 
-### Connection Migration
+### Connection Migration (RFC 9000 Section 9)
+
+Connection migration allows a QUIC connection to survive network changes
+(e.g., WiFi to cellular, NAT rebinding) without reconnecting.
 
 ```erlang
 %% Trigger migration to a new local address
-%% (e.g., when switching from WiFi to cellular)
 ok = quic:migrate(Conn).
 
-%% The connection will:
-%% 1. Bind to a new local socket
-%% 2. Send PATH_CHALLENGE to peer
-%% 3. Wait for PATH_RESPONSE
-%% 4. Reset congestion controller for new path
+%% With custom timeout (default: 5000ms)
+ok = quic:migrate(Conn, #{timeout => 10000}).
+
+%% Migration can fail if peer disabled it
+case quic:migrate(Conn) of
+    ok ->
+        io:format("Migration initiated~n");
+    {error, migration_disabled} ->
+        io:format("Peer disabled active migration~n")
+end.
+```
+
+**Key concept: The server address stays the same.**
+
+Migration changes the *client's local address*, not the server's. The connection
+continues to the same server, just from a different local IP/port:
+
+```
+BEFORE: Client {192.168.1.10:54321} ───> Server {203.0.113.50:4433}
+
+AFTER:  Client {10.0.0.5:62000} ───────> Server {203.0.113.50:4433}
+               ▲                                (same server!)
+               └── Only the client's address changed
+```
+
+**What happens during migration:**
+
+1. **Pick fresh DCID** - Client selects an unused Connection ID from the pool
+   the server provided earlier (via NEW_CONNECTION_ID frames). This prevents
+   an observer from linking the old and new paths together.
+
+2. **Rebind local socket** - Client closes old socket, opens new one on a
+   different local port (simulating a network change like WiFi to cellular).
+
+3. **Send PATH_CHALLENGE** - Client sends a PATH_CHALLENGE frame to the
+   *same server address* but from its *new local address*.
+
+4. **Receive PATH_RESPONSE** - Server echoes the challenge data back,
+   proving it can reach the client's new address.
+
+5. **Reset path state** - Congestion control, RTT estimation, and PMTU
+   discovery are reset (the new path may have different characteristics).
+
+**Why use a fresh Connection ID?**
+
+RFC 9000 Section 9.5 requires using a new CID to prevent path linkability:
+
+```
+Old path: Client:54321 -> Server:4433, DCID=<<10,20,30,...>>
+New path: Client:62000 -> Server:4433, DCID=<<11,21,31,...>>
+```
+
+An observer cannot easily correlate these as the same connection.
+
+**Server-side detection:**
+
+The server automatically detects when a client sends from a new address:
+
+- **NAT rebinding**: Same IP, different port (e.g., NAT timeout)
+- **Active migration**: Different IP address (e.g., network change)
+
+In both cases, the server validates the new path before accepting it:
+
+```
+Client (new addr)                    Server
+       |                               |
+       |------- Data packet ---------->|  (from new address)
+       |                               |  detect_peer_address_change()
+       |<------ PATH_CHALLENGE --------|  initiate_peer_path_validation()
+       |------- PATH_RESPONSE -------->|
+       |                               |  complete_migration()
+       |<======= Connection OK =======>|  (new path active)
+```
+
+**Disabling migration:**
+
+To prevent migration (e.g., for server-side load balancing):
+
+```erlang
+%% Server advertises disable_active_migration in transport params
+%% Client will receive {error, migration_disabled} if it tries to migrate
 ```
 
 ### Socket Binding

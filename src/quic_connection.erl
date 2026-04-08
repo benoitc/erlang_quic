@@ -85,6 +85,7 @@
     key_update/1,
     %% Connection migration (RFC 9000 Section 9)
     migrate/1,
+    migrate/2,
     %% PMTU Discovery (RFC 8899)
     get_mtu/1,
     %% Server mode
@@ -311,6 +312,17 @@
     %% Preferred address being validated (RFC 9000 Section 9.6)
     %% Set when client is validating server's preferred address
     preferred_address :: #preferred_address{} | undefined,
+
+    %% Migration state machine (RFC 9000 Section 9)
+    %% idle: no migration in progress
+    %% validating_peer: server validating client's new address
+    migration_state = idle :: idle | validating_peer,
+    %% Path being validated when client sends from new address
+    pending_peer_validation :: #path_state{} | undefined,
+    %% Timer reference for path validation timeout
+    path_validation_timer :: reference() | undefined,
+    %% Peer's disable_active_migration transport param (RFC 9000 Section 18.2)
+    peer_disable_migration = false :: boolean(),
 
     %% Connection ID Pool (RFC 9000 Section 5.1)
     %% Our CIDs that we've issued to the peer (via NEW_CONNECTION_ID)
@@ -592,6 +604,12 @@ key_update(Conn) ->
 -spec migrate(pid()) -> ok | {error, term()}.
 migrate(Conn) ->
     gen_statem:call(Conn, migrate).
+
+%% @doc Trigger connection migration with timeout option.
+%% Simulates network change by rebinding the socket.
+-spec migrate(pid(), timeout()) -> ok | {error, term()}.
+migrate(Conn, Timeout) ->
+    gen_statem:call(Conn, {migrate, #{}}, Timeout).
 
 %% @doc Set stream priority (RFC 9218).
 %% Urgency: 0-7 (lower = more urgent, default 3)
@@ -1514,15 +1532,35 @@ connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
             {keep_state, State, [{reply, From, {error, key_update_in_progress}}]}
     end;
 %% Handle connection migration request (RFC 9000 Section 9)
+connected({call, From}, migrate, #state{peer_disable_migration = true} = State) ->
+    %% Peer disabled migration via transport params
+    {keep_state, State, [{reply, From, {error, migration_disabled}}]};
 connected({call, From}, migrate, #state{socket = Socket, remote_addr = RemoteAddr} = State) ->
     %% Simulate network change by rebinding socket to a new port
     %% In a real scenario, this would happen when the device changes networks
     case rebind_socket(Socket) of
         {ok, NewSocket} ->
+            %% RFC 9000 Section 9.5: Use fresh CID to prevent path linkability
+            State1 = switch_to_fresh_cid(State),
             %% Start path validation to the peer on the new path
-            NewState = State#state{socket = NewSocket},
-            State1 = initiate_path_validation(RemoteAddr, NewState),
-            {keep_state, State1, [{reply, From, ok}]};
+            State2 = State1#state{socket = NewSocket},
+            State3 = initiate_path_validation(RemoteAddr, State2),
+            {keep_state, State3, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+%% Handle migration with options
+connected({call, From}, {migrate, _Opts}, #state{peer_disable_migration = true} = State) ->
+    {keep_state, State, [{reply, From, {error, migration_disabled}}]};
+connected(
+    {call, From}, {migrate, _Opts}, #state{socket = Socket, remote_addr = RemoteAddr} = State
+) ->
+    case rebind_socket(Socket) of
+        {ok, NewSocket} ->
+            State1 = switch_to_fresh_cid(State),
+            State2 = State1#state{socket = NewSocket},
+            State3 = initiate_path_validation(RemoteAddr, State2),
+            {keep_state, State3, [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1532,16 +1570,26 @@ connected(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(connected, FlushedState);
 %% Server receives packets from listener
-connected(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
-    NewState = handle_packet(Data, State),
+connected(info, {quic_packet, Data, RemoteAddr}, #state{role = server} = State) ->
+    %% Check for address change and initiate path validation if needed
+    State1 = maybe_handle_address_change(RemoteAddr, Data, State),
+    NewState = handle_packet(Data, State1),
     %% Flush batched packets and timers after processing incoming data
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(connected, FlushedState);
 %% Server receives batched packets from listener (GRO optimization)
-connected(info, {quic_packets, Packets, _RemoteAddr}, #state{role = server} = State) ->
-    NewState = handle_packets_batch(Packets, State),
+connected(info, {quic_packets, Packets, RemoteAddr}, #state{role = server} = State) ->
+    %% Check for address change with first packet in batch
+    TotalSize = lists:sum([byte_size(P) || P <- Packets]),
+    State1 = maybe_handle_address_change(RemoteAddr, <<0:TotalSize/unit:8>>, State),
+    NewState = handle_packets_batch(Packets, State1),
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(connected, FlushedState);
+%% Path validation timeout - stay on current path if validation fails
+connected(
+    info, {path_validation_timeout, TimerRef}, #state{path_validation_timer = TimerRef} = State
+) ->
+    handle_path_validation_timeout(State);
 connected(cast, {close, Reason}, State) ->
     emit_qlog_state_change(connected, draining, State),
     State1 = initiate_close(Reason, State),
@@ -6056,7 +6104,10 @@ do_close_stream_deadline(StreamId, ErrorCode, #state{streams = Streams} = State)
     end.
 
 %% Initiate connection close
-initiate_close(Reason, State) ->
+initiate_close(Reason, #state{path_validation_timer = PathTimer} = State) ->
+    %% Cancel path validation timer if active
+    cancel_timer(PathTimer),
+    State1 = State#state{path_validation_timer = undefined},
     %% Send CONNECTION_CLOSE frame
     {ErrorCode, ReasonPhrase} =
         case Reason of
@@ -6068,12 +6119,12 @@ initiate_close(Reason, State) ->
                 {?QUIC_APPLICATION_ERROR, <<>>}
         end,
     CloseFrame = {connection_close, application, ErrorCode, undefined, ReasonPhrase},
-    case State#state.app_keys of
+    case State1#state.app_keys of
         undefined ->
             %% No keys yet - cannot send frame, just set close_reason
-            State#state{close_reason = Reason};
+            State1#state{close_reason = Reason};
         _ ->
-            send_frame(CloseFrame, State#state{close_reason = Reason})
+            send_frame(CloseFrame, State1#state{close_reason = Reason})
     end.
 
 %% Send PROTOCOL_VIOLATION transport error (RFC 9000)
@@ -6569,18 +6620,20 @@ get_current_key_phase(#state{key_state = KeyState}) -> KeyState#key_update_state
 %% RFC 9000 Section 8.2: PATH_CHALLENGE must be sent to the path being validated.
 %% Returns updated state with the path in validating status.
 -spec initiate_path_validation({inet:ip_address(), inet:port_number()}, #state{}) -> #state{}.
-initiate_path_validation(RemoteAddr, State) ->
+initiate_path_validation(RemoteAddr, #state{dcid = CurrentDCID} = State) ->
     %% Generate 8-byte random challenge data
     ChallengeData = crypto:strong_rand_bytes(8),
 
     %% Create path state for the new path
+    %% Track the CID being used on this path (RFC 9000 Section 9.5)
     PathState = #path_state{
         remote_addr = RemoteAddr,
         status = validating,
         challenge_data = ChallengeData,
         challenge_count = 1,
         bytes_sent = 0,
-        bytes_received = 0
+        bytes_received = 0,
+        dcid = CurrentDCID
     },
 
     %% Add to alternative paths
@@ -6728,35 +6781,229 @@ rebind_socket(OldSocket) ->
             {error, Reason}
     end.
 
+%%====================================================================
+%% Server-Side Address Change Detection (RFC 9000 Section 9)
+%%====================================================================
+
+%% @doc Detect type of peer address change.
+%% Returns same_path, nat_rebinding (port change only), or new_path (IP change).
+-spec detect_peer_address_change(
+    {inet:ip_address(), inet:port_number()},
+    #state{}
+) -> same_path | nat_rebinding | new_path.
+detect_peer_address_change(PacketAddr, #state{remote_addr = CurrentAddr}) ->
+    case PacketAddr of
+        CurrentAddr ->
+            same_path;
+        {IP, _Port} when IP =:= element(1, CurrentAddr) ->
+            %% Same IP, different port - NAT rebinding
+            nat_rebinding;
+        _ ->
+            %% Different IP - active migration
+            new_path
+    end.
+
+%% @doc Handle potential address change from peer.
+%% RFC 9000 Section 9: Server must validate new paths before accepting migration.
+-spec maybe_handle_address_change(
+    {inet:ip_address(), inet:port_number()},
+    binary(),
+    #state{}
+) -> #state{}.
+maybe_handle_address_change(RemoteAddr, _Data, #state{remote_addr = RemoteAddr} = State) ->
+    %% Same address, no change
+    State;
+maybe_handle_address_change(_NewAddr, _Data, #state{peer_disable_migration = true} = State) ->
+    %% Peer disabled migration via transport param - ignore address changes
+    State;
+maybe_handle_address_change(NewAddr, Data, #state{migration_state = validating_peer} = State) ->
+    %% Already validating a path - update bytes received for anti-amplification
+    update_pending_path_bytes_received(NewAddr, byte_size(Data), State);
+maybe_handle_address_change(NewAddr, Data, State) ->
+    %% New address detected - initiate path validation
+    case detect_peer_address_change(NewAddr, State) of
+        same_path ->
+            State;
+        nat_rebinding ->
+            initiate_peer_path_validation(NewAddr, true, Data, State);
+        new_path ->
+            initiate_peer_path_validation(NewAddr, false, Data, State)
+    end.
+
+%% @doc Update bytes_received for pending path validation (anti-amplification).
+-spec update_pending_path_bytes_received(
+    {inet:ip_address(), inet:port_number()},
+    non_neg_integer(),
+    #state{}
+) -> #state{}.
+update_pending_path_bytes_received(
+    NewAddr,
+    Size,
+    #state{pending_peer_validation = #path_state{remote_addr = NewAddr} = PathState} = State
+) ->
+    NewPath = PathState#path_state{
+        bytes_received = PathState#path_state.bytes_received + Size
+    },
+    State#state{pending_peer_validation = NewPath};
+update_pending_path_bytes_received(_NewAddr, _Size, State) ->
+    %% Address doesn't match pending validation
+    State.
+
+%% @doc Initiate path validation for peer's new address.
+%% RFC 9000 Section 8.2: Send PATH_CHALLENGE to validate the new path.
+-spec initiate_peer_path_validation(
+    {inet:ip_address(), inet:port_number()},
+    boolean(),
+    binary(),
+    #state{}
+) -> #state{}.
+initiate_peer_path_validation(NewAddr, IsNATRebinding, Data, State) ->
+    ChallengeData = crypto:strong_rand_bytes(8),
+    PathState = #path_state{
+        remote_addr = NewAddr,
+        status = validating,
+        challenge_data = ChallengeData,
+        challenge_count = 1,
+        bytes_sent = 0,
+        bytes_received = byte_size(Data),
+        is_nat_rebinding = IsNATRebinding
+    },
+    State1 = State#state{
+        pending_peer_validation = PathState,
+        migration_state = validating_peer
+    },
+    State2 = send_path_challenge_to_addr(NewAddr, ChallengeData, State1),
+    start_path_validation_timer(State2).
+
+%% @doc Send PATH_CHALLENGE to a specific address for peer validation.
+%% Similar to send_path_challenge but used for validating peer's new address.
+-spec send_path_challenge_to_addr(
+    {inet:ip_address(), inet:port_number()},
+    binary(),
+    #state{}
+) -> #state{}.
+send_path_challenge_to_addr(Addr, ChallengeData, State) ->
+    %% Reuse existing send_path_challenge logic
+    State1 = send_path_challenge(Addr, ChallengeData, State),
+    %% Update pending path bytes_sent for anti-amplification
+    case State1#state.pending_peer_validation of
+        #path_state{} = PathState ->
+            %% Estimate packet size (short header + PATH_CHALLENGE frame)
+            PacketSize = 50,
+            NewPath = PathState#path_state{
+                bytes_sent = PathState#path_state.bytes_sent + PacketSize
+            },
+            State1#state{pending_peer_validation = NewPath};
+        undefined ->
+            State1
+    end.
+
+%% @doc Start path validation timer (3 * PTO).
+%% RFC 9000 Section 8.2.4: Use PTO-based timeout for path validation.
+-spec start_path_validation_timer(#state{}) -> #state{}.
+start_path_validation_timer(
+    #state{loss_state = LossState, path_validation_timer = OldTimer} = State
+) ->
+    %% Cancel any existing timer
+    cancel_timer(OldTimer),
+    %% Calculate timeout as 3 * PTO
+    Timeout =
+        case LossState of
+            undefined -> 3000;
+            _ -> 3 * quic_loss:get_pto(LossState)
+        end,
+    TimerRef = erlang:send_after(Timeout, self(), {path_validation_timeout, make_ref()}),
+    State#state{path_validation_timer = TimerRef}.
+
+%% @doc Handle path validation timeout.
+%% RFC 9000 Section 8.2.4: Validation fails after timeout, stay on current path.
+-spec handle_path_validation_timeout(#state{}) -> {keep_state, #state{}}.
+handle_path_validation_timeout(#state{pending_peer_validation = PathState} = State) ->
+    %% Mark path as failed, stay on current path
+    case PathState of
+        #path_state{challenge_count = Count} when Count < 3 ->
+            %% Retry PATH_CHALLENGE
+            ChallengeData = crypto:strong_rand_bytes(8),
+            NewPathState = PathState#path_state{
+                challenge_data = ChallengeData,
+                challenge_count = Count + 1
+            },
+            State1 = State#state{pending_peer_validation = NewPathState},
+            State2 = send_path_challenge_to_addr(
+                PathState#path_state.remote_addr, ChallengeData, State1
+            ),
+            State3 = start_path_validation_timer(State2),
+            {keep_state, State3};
+        _ ->
+            %% Max retries reached, give up on this path
+            State1 = State#state{
+                pending_peer_validation = undefined,
+                migration_state = idle,
+                path_validation_timer = undefined
+            },
+            {keep_state, State1}
+    end.
+
 %% @doc Handle PATH_RESPONSE frame.
 %% Validates the response against pending challenges.
 %% RFC 9000 Section 9.6: Auto-migrate to preferred address on validation success.
 handle_path_response(ResponseData, State) ->
-    %% Find the path with matching challenge data
-    case find_path_by_challenge(ResponseData, State#state.alt_paths) of
-        {ok, PathState, OtherPaths} ->
-            %% Mark path as validated
-            ValidatedPath = PathState#path_state{
-                status = validated,
-                challenge_data = undefined
-            },
-            State1 = State#state{alt_paths = [ValidatedPath | OtherPaths]},
-            %% Check if this is a preferred address validation - auto-migrate
-            maybe_migrate_to_preferred_address(ValidatedPath, State1);
-        not_found ->
-            %% Check current path (if we sent challenge on current path)
-            case State#state.current_path of
-                #path_state{challenge_data = ResponseData} = CurrentPath ->
-                    ValidatedPath = CurrentPath#path_state{
+    %% First check if this is a response to peer address validation (server validating client)
+    case State#state.pending_peer_validation of
+        #path_state{challenge_data = ResponseData} = PendingPath ->
+            %% Peer path validated - complete migration to new address
+            handle_peer_path_validated(PendingPath, State);
+        _ ->
+            %% Check alt_paths (client validating paths)
+            case find_path_by_challenge(ResponseData, State#state.alt_paths) of
+                {ok, PathState, OtherPaths} ->
+                    %% Mark path as validated
+                    ValidatedPath = PathState#path_state{
                         status = validated,
                         challenge_data = undefined
                     },
-                    State#state{current_path = ValidatedPath};
-                _ ->
-                    %% Unknown response, ignore
-                    State
+                    State1 = State#state{alt_paths = [ValidatedPath | OtherPaths]},
+                    %% Check if this is a preferred address validation - auto-migrate
+                    maybe_migrate_to_preferred_address(ValidatedPath, State1);
+                not_found ->
+                    %% Check current path (if we sent challenge on current path)
+                    case State#state.current_path of
+                        #path_state{challenge_data = ResponseData} = CurrentPath ->
+                            ValidatedPath = CurrentPath#path_state{
+                                status = validated,
+                                challenge_data = undefined
+                            },
+                            State#state{current_path = ValidatedPath};
+                        _ ->
+                            %% Unknown response, ignore
+                            State
+                    end
             end
     end.
+
+%% @doc Handle successful peer path validation (server accepting client's new address).
+%% RFC 9000 Section 9: Complete migration to the validated peer address.
+-spec handle_peer_path_validated(#path_state{}, #state{}) -> #state{}.
+handle_peer_path_validated(PendingPath, #state{path_validation_timer = Timer} = State) ->
+    %% Cancel validation timer
+    cancel_timer(Timer),
+    %% RFC 9000 Section 9.5: Use fresh CID on new path for unlinkability
+    State1 = switch_to_fresh_cid(State),
+    NewDCID = State1#state.dcid,
+    %% Mark path as validated with the CID used on this path
+    ValidatedPath = PendingPath#path_state{
+        status = validated,
+        challenge_data = undefined,
+        dcid = NewDCID
+    },
+    %% Complete migration to the new peer address
+    State2 = complete_migration(ValidatedPath, State1),
+    %% Clear pending validation state
+    State2#state{
+        pending_peer_validation = undefined,
+        migration_state = idle,
+        path_validation_timer = undefined
+    }.
 
 %% @doc Auto-migrate to preferred address if the validated path matches.
 %% RFC 9000 Section 9.6: Client SHOULD migrate to validated preferred address.
@@ -6801,6 +7048,29 @@ switch_to_preferred_cid(#preferred_address{cid = CID}, State) ->
     %% RFC 9000 Section 9.6: MUST use the new CID on the preferred address
     State#state{dcid = CID}.
 
+%% @doc Switch to a fresh CID from the peer's CID pool.
+%% RFC 9000 Section 9.5: Using a fresh CID on a new path prevents linkability.
+-spec switch_to_fresh_cid(#state{}) -> #state{}.
+switch_to_fresh_cid(#state{peer_cid_pool = Pool, dcid = CurrentDCID} = State) ->
+    case find_unused_cid(Pool, CurrentDCID) of
+        {ok, NewCID} ->
+            State#state{dcid = NewCID};
+        not_found ->
+            %% No spare CID available, continue with current
+            State
+    end.
+
+%% @doc Find an unused CID from the pool (different from current DCID).
+-spec find_unused_cid([#cid_entry{}], binary()) -> {ok, binary()} | not_found.
+find_unused_cid([], _CurrentCID) ->
+    not_found;
+find_unused_cid([#cid_entry{cid = CID, status = active} | _Rest], CurrentCID) when
+    CID =/= CurrentCID
+->
+    {ok, CID};
+find_unused_cid([_ | Rest], CurrentCID) ->
+    find_unused_cid(Rest, CurrentCID).
+
 %% Find a path by challenge data
 find_path_by_challenge(_Data, []) ->
     not_found;
@@ -6829,13 +7099,22 @@ complete_migration(
     cancel_timer(ProbeTimer),
     cancel_timer(RaiseTimer),
     NewPMTUState = quic_pmtu:on_path_change(PMTUState),
+
+    %% RFC 9002 Section 9.4: Reset congestion controller on path change
+    %% The new path may have different RTT and bandwidth characteristics
+    NewCCState = quic_cc:new(#{}),
+    NewLossState = quic_loss:new(),
+
     State#state{
         remote_addr = NewPath#path_state.remote_addr,
         current_path = NewPath,
         alt_paths = lists:delete(NewPath, State#state.alt_paths),
         pmtu_state = NewPMTUState,
         pmtu_probe_timer = undefined,
-        pmtu_raise_timer = undefined
+        pmtu_raise_timer = undefined,
+        %% Reset CC and loss detection for new path
+        cc_state = NewCCState,
+        loss_state = NewLossState
     };
 complete_migration(_, State) ->
     %% Can only migrate to validated paths
@@ -7108,6 +7387,10 @@ apply_peer_transport_params_internal(TransportParams, State) ->
     %% Default is 0 (datagrams not supported)
     MaxDatagramFrameSize = maps:get(max_datagram_frame_size, TransportParams, 0),
 
+    %% Extract disable_active_migration (RFC 9000 Section 18.2)
+    %% If true, peer has indicated they don't want to receive traffic from different addresses
+    PeerDisableMigration = maps:get(disable_active_migration, TransportParams, false),
+
     %% Store stream data limits in state for use when opening streams
     %% These tell us how much we can send on different stream types
     State#state{
@@ -7124,7 +7407,9 @@ apply_peer_transport_params_internal(TransportParams, State) ->
         max_streams_bidi_remote = MaxStreamsBidi,
         max_streams_uni_remote = MaxStreamsUni,
         %% Datagram size limit (RFC 9221)
-        max_datagram_frame_size_remote = MaxDatagramFrameSize
+        max_datagram_frame_size_remote = MaxDatagramFrameSize,
+        %% Migration disabled by peer (RFC 9000 Section 18.2)
+        peer_disable_migration = PeerDisableMigration
     }.
 
 %% @doc Handle RETIRE_CONNECTION_ID frame from peer.
