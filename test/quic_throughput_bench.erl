@@ -9,6 +9,7 @@
 %%%   quic_throughput_bench:run().              % Run with defaults
 %%%   quic_throughput_bench:run(#{data_size => 10485760}).  % 10MB
 %%%   quic_throughput_bench:compare_buffer_sizes().  % Compare different sizes
+%%%   quic_throughput_bench:compare_cc().       % Compare CC algorithms
 %%%
 
 -module(quic_throughput_bench).
@@ -19,7 +20,9 @@
     run_sink/0,
     run_sink/1,
     compare_buffer_sizes/0,
-    compare_buffer_sizes/1
+    compare_buffer_sizes/1,
+    compare_cc/0,
+    compare_cc/1
 ]).
 
 -include("quic.hrl").
@@ -169,6 +172,52 @@ compare_buffer_sizes(Opts) ->
                     );
                 _ ->
                     io:format("~-12s | ERROR~n", [Name])
+            end
+        end,
+        Results
+    ),
+
+    Results.
+
+%% @doc Compare throughput across different congestion control algorithms
+-spec compare_cc() -> [map()].
+compare_cc() ->
+    compare_cc(#{}).
+
+%% @doc Compare CC algorithms with options
+-spec compare_cc(map()) -> [map()].
+compare_cc(Opts) ->
+    DataSize = maps:get(data_size, Opts, 10 * 1024 * 1024),
+
+    Algorithms = [newreno, cubic, bbr],
+
+    io:format("~n=== Congestion Control Algorithm Comparison ===~n"),
+    io:format("Data size: ~.2f MB~n~n", [DataSize / 1048576]),
+
+    Results = lists:map(
+        fun(Algo) ->
+            io:format("--- Testing: ~p ---~n", [Algo]),
+            RunOpts = #{data_size => DataSize, cc_opts => #{algorithm => Algo}},
+            Result = run_sink(RunOpts),
+            timer:sleep(500),
+            {Algo, Result}
+        end,
+        Algorithms
+    ),
+
+    io:format("~n=== Summary ===~n"),
+    io:format("~-12s | ~-10s | ~-15s~n", ["Algorithm", "MB/s", "Duration (ms)"]),
+    io:format("~s~n", [lists:duplicate(45, $-)]),
+
+    lists:foreach(
+        fun({Algo, Result}) ->
+            case maps:get(status, Result, error) of
+                ok ->
+                    MBps = maps:get(mb_per_sec, Result, 0),
+                    Duration = maps:get(duration_ms, Result, 0),
+                    io:format("~-12s | ~10.2f | ~15p~n", [Algo, MBps, Duration]);
+                _ ->
+                    io:format("~-12s | ERROR~n", [Algo])
             end
         end,
         Results
