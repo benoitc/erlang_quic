@@ -224,6 +224,117 @@ flow_control_starvation_test() ->
     ?assert(quic_flow:can_send(Flow2, 100)).
 
 %%====================================================================
+%% High Throughput Flow Control Test
+%%====================================================================
+
+high_throughput_flow_control_test() ->
+    %% Test: Rapid sending that would exceed flow control limits
+    %% This reproduces the scenario fixed in commit 16478f4:
+    %% - Send bursts faster than flow control allows
+    %% - Verify no deadlock (old bug: offsets advanced past limits)
+    %% - Verify MAX_DATA properly unblocks
+
+    %% Small limits to trigger flow control quickly
+    FlowState = quic_flow:new(#{
+        % 16KB limit
+        initial_max_data => 16384,
+        peer_initial_max_data => 16384
+    }),
+
+    %% Each burst is 4KB - should hit limit after 4 sends
+    BurstSize = 4096,
+
+    %% Send bursts until blocked - simulates high throughput
+    {Results, FinalFlow} = lists:foldl(
+        fun(N, {Acc, Flow}) ->
+            case quic_flow:can_send(Flow, BurstSize) of
+                true ->
+                    {Result, NewFlow} = quic_flow:on_data_sent(Flow, BurstSize),
+                    {[{N, {sent, Result}} | Acc], NewFlow};
+                false ->
+                    {[{N, flow_blocked} | Acc], Flow}
+            end
+        end,
+        {[], FlowState},
+        lists:seq(1, 10)
+    ),
+
+    %% Should have sent 4 bursts (16KB), then blocked by flow control
+    %% on_data_sent returns 'blocked' when hitting exactly the limit
+    SentCount = length([1 || {_, {sent, _}} <- Results]),
+    FlowBlockedCount = length([1 || {_, flow_blocked} <- Results]),
+    ?assertEqual(4, SentCount),
+    ?assertEqual(6, FlowBlockedCount),
+
+    %% Verify final state is blocked
+    ?assertNot(quic_flow:can_send(FinalFlow, BurstSize)),
+    ?assert(quic_flow:send_blocked(FinalFlow)),
+
+    %% KEY FIX VERIFICATION: MAX_DATA update properly unblocks
+    %% Old bug: queue had entries with offsets > limits, never drained
+
+    % 32KB
+    UpdatedFlow = quic_flow:on_max_data_received(FinalFlow, 32768),
+
+    %% Should be able to send again
+    ?assert(quic_flow:can_send(UpdatedFlow, BurstSize)),
+    ?assertNot(quic_flow:send_blocked(UpdatedFlow)),
+
+    %% Actually send to verify no deadlock
+    {ok, Flow2} = quic_flow:on_data_sent(UpdatedFlow, BurstSize),
+    % 16KB + 4KB = 20KB
+    ?assertEqual(20480, quic_flow:bytes_sent(Flow2)).
+
+repeated_block_unblock_cycles_test() ->
+    %% Test multiple block/unblock cycles under sustained load
+    %% Verifies no state corruption accumulates over time
+
+    FlowState = quic_flow:new(#{
+        initial_max_data => 8192,
+        peer_initial_max_data => 8192
+    }),
+
+    BurstSize = 2048,
+
+    %% Run 5 cycles of: fill to limit, receive MAX_DATA, continue
+    FinalFlow = lists:foldl(
+        fun(Cycle, Flow) ->
+            %% Send until blocked
+            {_, BlockedFlow} = send_until_blocked(Flow, BurstSize),
+            ?assert(quic_flow:send_blocked(BlockedFlow)),
+
+            %% Simulate peer sending MAX_DATA (increasing limit)
+            NewLimit = 8192 * (Cycle + 1),
+            UnblockedFlow = quic_flow:on_max_data_received(BlockedFlow, NewLimit),
+
+            %% Should be unblocked now
+            ?assertNot(quic_flow:send_blocked(UnblockedFlow)),
+            ?assert(quic_flow:can_send(UnblockedFlow, BurstSize)),
+
+            UnblockedFlow
+        end,
+        FlowState,
+        lists:seq(1, 5)
+    ),
+
+    %% After 5 cycles, should have sent significant data without deadlock
+    BytesSent = quic_flow:bytes_sent(FinalFlow),
+    ?assert(BytesSent >= 8192 * 5).
+
+%% Helper: send until blocked
+send_until_blocked(Flow, Size) ->
+    send_until_blocked(Flow, Size, 0).
+
+send_until_blocked(Flow, Size, Sent) ->
+    case quic_flow:can_send(Flow, Size) of
+        true ->
+            {_, NewFlow} = quic_flow:on_data_sent(Flow, Size),
+            send_until_blocked(NewFlow, Size, Sent + Size);
+        false ->
+            {Sent, Flow}
+    end.
+
+%%====================================================================
 %% Combined CC + Flow + Loss Simulation
 %%====================================================================
 
