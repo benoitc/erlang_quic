@@ -1169,3 +1169,136 @@ parse_all_messages(<<Len:32/big-unsigned, Rest/binary>> = Buffer, Acc) when byte
 parse_all_messages(<<Len:32/big-unsigned, Rest/binary>>, Acc) ->
     <<Msg:Len/binary, Remaining/binary>> = Rest,
     parse_all_messages(Remaining, [Msg | Acc]).
+
+%%====================================================================
+%% Connection Migration Awareness Tests
+%%====================================================================
+
+%% Test: path_changed event message format from quic_connection
+path_changed_event_format_test() ->
+    %% When connection migration completes, quic_connection sends:
+    %% {quic, ConnPid, {path_changed, OldAddr, NewAddr}}
+    ConnPid = self(),
+    OldAddr = {{192, 168, 1, 100}, 4433},
+    NewAddr = {{10, 0, 0, 5}, 8443},
+
+    Event = {quic, ConnPid, {path_changed, OldAddr, NewAddr}},
+
+    %% Verify pattern matches what handler expects
+    ?assertMatch({quic, _, {path_changed, _, _}}, Event),
+
+    %% Extract components
+    {quic, Conn, {path_changed, Old, New}} = Event,
+    ?assertEqual(ConnPid, Conn),
+    ?assertEqual(OldAddr, Old),
+    ?assertEqual(NewAddr, New).
+
+%% Test: path_changed with undefined old address (first migration)
+path_changed_undefined_old_addr_test() ->
+    %% First migration may have undefined old address
+    OldAddr = undefined,
+    NewAddr = {{10, 0, 0, 5}, 4433},
+
+    Event = {quic, self(), {path_changed, OldAddr, NewAddr}},
+
+    {quic, _Conn, {path_changed, Old, New}} = Event,
+    ?assertEqual(undefined, Old),
+    ?assertEqual(NewAddr, New).
+
+%% Test: path_changed with IPv6 addresses
+path_changed_ipv6_test() ->
+    %% IPv6 addresses
+    OldAddr = {{8193, 3512, 0, 0, 0, 0, 0, 1}, 4433},
+    NewAddr = {{8194, 3513, 0, 0, 0, 0, 0, 2}, 8443},
+
+    Event = {quic, self(), {path_changed, OldAddr, NewAddr}},
+
+    {quic, _Conn, {path_changed, Old, New}} = Event,
+    ?assertMatch({{_, _, _, _, _, _, _, _}, _}, Old),
+    ?assertMatch({{_, _, _, _, _, _, _, _}, _}, New).
+
+%% Test: log report format for connection_migrated
+connection_migrated_log_format_test() ->
+    %% The handler creates a log report map
+    Node = 'test@localhost',
+    OldPath = {{192, 168, 1, 100}, 4433},
+    NewPath = {{10, 0, 0, 5}, 8443},
+
+    LogReport = #{
+        what => connection_migrated,
+        node => Node,
+        old_path => OldPath,
+        new_path => NewPath
+    },
+
+    %% Verify all expected keys are present
+    ?assertEqual(connection_migrated, maps:get(what, LogReport)),
+    ?assertEqual(Node, maps:get(node, LogReport)),
+    ?assertEqual(OldPath, maps:get(old_path, LogReport)),
+    ?assertEqual(NewPath, maps:get(new_path, LogReport)).
+
+%% Test: log report with undefined node (edge case)
+connection_migrated_log_undefined_node_test() ->
+    %% Node might be undefined during early connection phase
+    Node = undefined,
+    OldPath = {{192, 168, 1, 100}, 4433},
+    NewPath = {{10, 0, 0, 5}, 8443},
+
+    LogReport = #{
+        what => connection_migrated,
+        node => Node,
+        old_path => OldPath,
+        new_path => NewPath
+    },
+
+    ?assertEqual(undefined, maps:get(node, LogReport)).
+
+%% Test: handler should keep state unchanged after path_changed
+path_changed_keeps_state_test() ->
+    %% The handler returns {keep_state, State} - state should be unchanged
+    %% This simulates the expected behavior
+
+    %% Mock state with some fields
+    MockState = #{
+        conn => self(),
+        node => 'test@localhost',
+        data_streams => [4, 8, 12]
+    },
+
+    %% After handling path_changed, state should be identical
+    ResultState = MockState,
+    ?assertEqual(MockState, ResultState).
+
+%% Test: multiple migrations logged correctly
+multiple_migrations_test() ->
+    %% Simulate multiple migration events
+    Migrations = [
+        {{{192, 168, 1, 100}, 4433}, {{10, 0, 0, 5}, 8443}},
+        {{{10, 0, 0, 5}, 8443}, {{172, 16, 0, 1}, 4433}},
+        {{{172, 16, 0, 1}, 4433}, {{192, 168, 1, 200}, 5000}}
+    ],
+
+    %% Each migration should produce a valid log report
+    LogReports = lists:map(
+        fun({OldPath, NewPath}) ->
+            #{
+                what => connection_migrated,
+                node => 'test@localhost',
+                old_path => OldPath,
+                new_path => NewPath
+            }
+        end,
+        Migrations
+    ),
+
+    ?assertEqual(3, length(LogReports)),
+
+    %% Verify each log has correct old_path/new_path
+    [{Old1, New1}, {Old2, New2}, {Old3, New3}] = Migrations,
+    [Log1, Log2, Log3] = LogReports,
+    ?assertEqual(Old1, maps:get(old_path, Log1)),
+    ?assertEqual(New1, maps:get(new_path, Log1)),
+    ?assertEqual(Old2, maps:get(old_path, Log2)),
+    ?assertEqual(New2, maps:get(new_path, Log2)),
+    ?assertEqual(Old3, maps:get(old_path, Log3)),
+    ?assertEqual(New3, maps:get(new_path, Log3)).

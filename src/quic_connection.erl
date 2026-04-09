@@ -131,7 +131,9 @@
     close_reason_to_code/1,
     %% Migration frame classification (RFC 9000 Section 9.1)
     is_probing_frame/1,
-    contains_non_probing_frame/1
+    contains_non_probing_frame/1,
+    %% Migration notification testing
+    test_complete_migration/3
 ]).
 -endif.
 
@@ -8231,4 +8233,32 @@ test_check_flow_control(StreamId, Offset, DataSize, MaxDataRemote, DataSent, Str
         streams = Streams
     },
     check_send_queue_flow_control(StreamId, Offset, DataSize, State).
+
+%% Test helper for complete_migration/2.
+%% Tests that path_changed notification is sent to owner on active migration.
+%% Returns {ok, notified} if notification was sent, {ok, not_notified} for NAT rebinding.
+-spec test_complete_migration(
+    Owner :: pid(),
+    OldPath :: #path_state{} | undefined,
+    NewPath :: #path_state{}
+) -> {ok, notified | not_notified}.
+test_complete_migration(Owner, OldPath, NewPath) ->
+    %% Create minimal state for testing
+    State = #state{
+        owner = Owner,
+        current_path = OldPath,
+        %% Minimal required fields for complete_migration
+        pmtu_state = quic_pmtu:new(),
+        pmtu_probe_timer = undefined,
+        pmtu_raise_timer = undefined,
+        alt_paths = []
+    },
+    %% Call complete_migration - it will send message to Owner if active migration
+    _ = complete_migration(NewPath, State),
+    %% Check if owner received the notification
+    receive
+        {quic, _, {path_changed, _, _}} -> {ok, notified}
+    after 0 ->
+        {ok, not_notified}
+    end.
 -endif.
