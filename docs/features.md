@@ -51,8 +51,13 @@
 - [x] Probe timeout (PTO)
 - [x] RTT measurement (smoothed RTT, RTT variance)
 
-### Congestion Control (NewReno)
-- [x] Slow start
+### Congestion Control
+- [x] Pluggable congestion control behavior
+- [x] NewReno (default, RFC 9002)
+- [x] CUBIC (RFC 9438)
+- [x] BBR (Bottleneck Bandwidth and RTT)
+- [x] HyStart++ slow start (RFC 9406) for all algorithms
+- [x] Slow start with improved exit detection
 - [x] Congestion avoidance
 - [x] Recovery on packet loss
 - [x] Persistent congestion detection (resets cwnd after PTO * 3)

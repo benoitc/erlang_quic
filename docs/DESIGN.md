@@ -236,12 +236,22 @@ Stream IDs encode initiator and directionality:
 
 ## Congestion Control
 
-The implementation uses NewReno congestion control (RFC 9002):
+The implementation supports pluggable congestion control algorithms:
+
+### Algorithms
+
+| Algorithm | Module | Description |
+|-----------|--------|-------------|
+| NewReno | `quic_cc` | RFC 9002 default, simple and robust |
+| CUBIC | `quic_cc_cubic` | RFC 9438, better high-bandwidth utilization |
+| BBR | `quic_cc_bbr` | Bottleneck Bandwidth and RTT-based |
+
+All algorithms support HyStart++ (RFC 9406) for improved slow start exit.
 
 ### States
 
-- **Slow Start**: Exponential growth until `ssthresh`
-- **Congestion Avoidance**: Linear growth after slow start
+- **Slow Start**: Exponential growth until `ssthresh` (with HyStart++ exit)
+- **Congestion Avoidance**: Linear growth (NewReno), cubic function (CUBIC), or pacing-based (BBR)
 - **Recovery**: After packet loss detection
 
 ### Key Variables
@@ -251,9 +261,11 @@ The implementation uses NewReno congestion control (RFC 9002):
 | `cwnd` | Congestion window (bytes) |
 | `ssthresh` | Slow start threshold |
 | `bytes_in_flight` | Unacknowledged bytes |
+| `pacing_rate` | Send rate limit (BBR) |
 
-### On ACK
+### NewReno (Default)
 
+**On ACK:**
 ```
 if bytes_acked > 0:
     if cwnd < ssthresh:
@@ -262,12 +274,37 @@ if bytes_acked > 0:
         cwnd += (bytes_acked * max_datagram_size) / cwnd  # Congestion avoidance
 ```
 
-### On Loss
-
+**On Loss:**
 ```
 ssthresh = max(cwnd / 2, 2 * max_datagram_size)
 cwnd = ssthresh
 ```
+
+### CUBIC (RFC 9438)
+
+Uses a cubic function for window growth that is more aggressive in high-bandwidth networks:
+
+```
+W(t) = C * (t - K)^3 + W_max
+```
+
+Where `K = cbrt(W_max * beta / C)` and `C = 0.4`, `beta = 0.7`.
+
+### BBR
+
+BBR probes for maximum bandwidth and minimum RTT:
+
+1. **Startup**: Doubles sending rate each RTT until bandwidth plateaus
+2. **Drain**: Reduces inflight to match BDP
+3. **ProbeBW**: Cycles through pacing gain phases
+4. **ProbeRTT**: Periodically reduces cwnd to measure min RTT
+
+### Packet Pacing
+
+All algorithms use packet pacing (RFC 9002 Section 7.7) to prevent bursts:
+- Packets are spaced based on pacing rate
+- Prevents buffer bloat at bottleneck links
+- Improves throughput on lossy networks
 
 ## Loss Detection
 
