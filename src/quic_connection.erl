@@ -7962,17 +7962,10 @@ get_local_max_udp_payload_size(#state{pmtu_state = PMTUState}) ->
 %%====================================================================
 
 -ifdef(TEST).
-%% @doc Test helper for check_send_queue_flow_control/3
+%% Test helper for check_send_queue_flow_control/3.
 %% Wraps the internal function to avoid exposing #state{} record.
 %% RFC 9000 Section 4.1: Connection-level flow control (max_data)
 %% RFC 9000 Section 4.2: Stream-level flow control (max_stream_data)
-%% @param StreamId - Stream ID to check
-%% @param Offset - Offset of the queued data
-%% @param DataSize - Size of data to send
-%% @param MaxDataRemote - Peer's connection-level max_data limit
-%% @param DataSent - Bytes already sent on connection
-%% @param StreamsMap - Map of StreamId => {SendMaxData, SendOffset}
-%% @returns ok | {blocked, connection | {stream, StreamId}}
 test_check_flow_control(StreamId, Offset, DataSize, MaxDataRemote, DataSent, StreamsMap) ->
     Streams = maps:map(
         fun(_K, {SendMaxData, SendOffset}) ->

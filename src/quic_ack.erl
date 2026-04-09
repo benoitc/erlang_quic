@@ -347,9 +347,9 @@ ack_ranges_to_pn_list(PrevStart, [{Gap, Range} | Rest]) ->
     end.
 
 %% @doc Convert ACK frame to list of ranges instead of expanded list.
-%% Returns a list of {Start, End} tuples where Start =< End.
+%% Returns a list of `{Start, End}' tuples where Start is less than or equal to End.
 %% Much more efficient than ack_frame_to_pn_list for large ranges.
-%% Example: {100, 5, [{2, 3}]} -> [{95, 100}, {89, 92}]
+%% Example: `{100, 5, [{2, 3}]}' becomes `[{95, 100}, {89, 92}]'
 -spec ack_frame_to_ranges(non_neg_integer(), non_neg_integer(), list()) ->
     [{non_neg_integer(), non_neg_integer()}] | {error, ack_range_too_large}.
 ack_frame_to_ranges(LargestAcked, FirstRange, AckRanges) ->

@@ -14,20 +14,18 @@
 %%% == State Machine ==
 %%%
 %%% The PMTU discovery follows RFC 8899 states:
-%%% - `disabled': PMTU discovery not active
-%%% - `base': Using base MTU (1200), ready to probe
-%%% - `searching': Binary search for optimal MTU in progress
-%%% - `search_complete': Found optimal MTU
-%%% - `error': Black hole detected, fell back to base MTU
+%%% <ul>
+%%% <li>`disabled' - PMTU discovery not active</li>
+%%% <li>`base' - Using base MTU (1200), ready to probe</li>
+%%% <li>`searching' - Binary search for optimal MTU in progress</li>
+%%% <li>`search_complete' - Found optimal MTU</li>
+%%% <li>`error' - Black hole detected, fell back to base MTU</li>
+%%% </ul>
 %%%
 %%% == Binary Search Algorithm ==
 %%%
-%%% The module uses binary search to find the optimal MTU:
-%%% 1. Start with search_low = 1200 (QUIC minimum), search_high = max_mtu
-%%% 2. Probe at (search_low + search_high + 1) / 2
-%%% 3. On success: search_low = probe_size, current_mtu = probe_size
-%%% 4. On failure: search_high = probe_size - 1
-%%% 5. Stop when search_high - search_low < SEARCH_THRESHOLD (10 bytes)
+%%% The module uses binary search between 1200 and max_mtu,
+%%% stopping when the search range is less than 10 bytes.
 %%%
 
 -module(quic_pmtu).
@@ -129,11 +127,7 @@ new(Opts) ->
 %% @doc Initialize PMTU probing after connection is established.
 %%
 %% Called when the QUIC handshake completes. Uses the peer's
-%% `max_udp_payload_size` transport parameter to set the upper bound.
-%%
-%% @param PeerMaxUdpPayloadSize Peer's advertised max UDP payload size
-%% @param PMTUState Current PMTU state
-%% @returns Updated PMTU state ready for probing
+%% `max_udp_payload_size' transport parameter to set the upper bound.
 -spec on_connection_established(pos_integer() | undefined, #pmtu_state{}) -> #pmtu_state{}.
 on_connection_established(PeerMax, #pmtu_state{max_mtu = ConfigMax, base_mtu = BaseMTU} = State) ->
     %% Determine effective max MTU

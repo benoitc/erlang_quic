@@ -4,12 +4,8 @@
 %%% Provides JSON-SEQ format trace files for debug visibility with
 %%% Wireshark/qvis compatibility.
 %%%
-%%% Usage:
-%%% ```
-%%% quic:connect(Host, Port, #{
-%%%     qlog => #{enabled => true, dir => "/tmp/qlog"}
-%%% }, Owner)
-%%% ```
+%%% Usage: pass `qlog' option to `quic:connect/4':
+%%% `#{qlog => #{enabled => true, dir => "/tmp/qlog"}}'
 %%% @end
 %%%-------------------------------------------------------------------
 -module(quic_qlog).

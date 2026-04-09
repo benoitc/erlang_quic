@@ -929,7 +929,7 @@ pacing_allows(
     RefreshedTokens >= Size.
 
 %% @doc Get tokens for sending, consuming them and returning updated state.
-%% Returns {AllowedBytes, UpdatedState} where AllowedBytes <= Size.
+%% Returns `{AllowedBytes, UpdatedState}' where AllowedBytes is at most Size.
 -spec get_pacing_tokens(cc_state(), non_neg_integer()) -> {non_neg_integer(), cc_state()}.
 get_pacing_tokens(#cc_state{pacing_rate = 0} = State, Size) ->
     %% Pacing not initialized - allow full send

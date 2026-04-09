@@ -455,7 +455,7 @@ get_stream_deadline(Conn, StreamId) when is_pid(Conn) ->
 %% - `in_recovery': Whether in congestion recovery
 %% - `congested': Whether backpressure should be applied
 %%
-%% @see quic_dist_controller for usage example
+%% See `quic_dist_controller' for usage example.
 -spec get_send_queue_info(Conn) -> {ok, send_queue_info()} | {error, term()} when
     Conn :: pid().
 get_send_queue_info(Conn) when is_pid(Conn) ->
@@ -472,7 +472,7 @@ get_send_queue_info(Conn) when is_pid(Conn) ->
 %% - `data_received': Total bytes of application data received
 %% - `data_sent': Total bytes of application data sent
 %%
-%% @see quic_dist_controller for usage in distribution tick checking
+%% See `quic_dist_controller' for usage in distribution tick checking.
 -spec get_stats(Conn) -> {ok, map()} | {error, term()} when
     Conn :: pid().
 get_stats(Conn) when is_pid(Conn) ->
