@@ -16,8 +16,12 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 - Retry packet handling for address validation (RFC 9000 Section 8.1)
 - Stateless reset support (RFC 9000 Section 10.3)
 - Flow control (connection and stream level)
-- Congestion control (NewReno with ECN support)
+- Congestion control (NewReno, CUBIC, BBR with ECN support)
+- HyStart++ slow start (RFC 9406)
 - Loss detection and packet retransmission (RFC 9002)
+- QLOG tracing support for debug visibility
+- UDP packet batching (GSO/GRO)
+- Client certificate verification
 
 ## Requirements
 

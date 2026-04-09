@@ -4,7 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-04-09
+
 ### Added
+- Full QUIC connection migration support (RFC 9000 Section 9)
+  - Server-side address change detection (NAT rebinding vs active migration)
+  - Path validation with PATH_CHALLENGE/PATH_RESPONSE
+  - CID rotation for path unlinkability
+  - `disable_active_migration` transport parameter
+- Application error code support for CONNECTION_CLOSE frames
+- Client certificate support (`verify` server option)
+- CUBIC congestion control (RFC 9438)
+- BBR congestion control
+- HyStart++ slow start (RFC 9406) for all CC algorithms
+- UDP packet batching with GSO/GRO support
+- Configurable UDP buffer sizing (recbuf/sndbuf options)
+- QLOG tracing for debug visibility
+- Pluggable congestion control behavior
+- Stream deadlines for per-stream timeout control
+- STOP_SENDING API (`quic:stop_sending/3`)
+- `max_udp_payload_size` transport parameter
+- Async send API and socket receive optimizations
+- Throughput benchmarks (`quic_throughput_bench`, `quic_batch_bench`)
 - QUIC-based Erlang distribution (`quic_dist`) for node communication over QUIC
 - Distribution modules: `quic_dist`, `quic_dist_controller`, `quic_dist_sup`
 - EPMD replacement module (`quic_epmd`) for QUIC-based node discovery
@@ -19,11 +40,21 @@ All notable changes to this project will be documented in this file.
 - Packet pacing (RFC 9002 Section 7.7) to prevent bursts
 
 ### Changed
+- ConnRef is now connection PID (simpler API)
+- Improved ACK processing performance (O(n^2) to O(n) with gb_sets)
+- Timer batching for reduced overhead
+- Zero-copy packet processing optimizations
 - Distribution liveness detection now uses QUIC packet counts instead of application ticks
 - Improved congestion control with quic-go-inspired settings (larger initial cwnd)
 - Flow control windows auto-tune based on RTT measurements
 
 ### Fixed
+- Throughput regression in connection migration (wasteful binary allocation)
+- CUBIC cwnd collapse issue
+- BBR delivery rate interval causing cwnd collapse
+- BBR initial pacing rate causing transfer hangs
+- Pacing precision loss causing transfer stalls
+- Various RFC compliance fixes for QUIC connection migration
 - `net_tick_timeout` errors under heavy load by using QUIC-level activity as liveness proof
 - Stream flow control `recv_max_data` using wrong limits
 - Distribution controller backpressure data loss
