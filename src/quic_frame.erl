@@ -32,6 +32,8 @@
         ECNCounts :: ecn_counts() | undefined}
     | {reset_stream, StreamId :: non_neg_integer(), ErrorCode :: non_neg_integer(),
         FinalSize :: non_neg_integer()}
+    | {reset_stream_at, StreamId :: non_neg_integer(), ErrorCode :: non_neg_integer(),
+        FinalSize :: non_neg_integer(), ReliableSize :: non_neg_integer()}
     | {stop_sending, StreamId :: non_neg_integer(), ErrorCode :: non_neg_integer()}
     | {crypto, Offset :: non_neg_integer(), Data :: binary()}
     | {new_token, Token :: binary()}
@@ -89,6 +91,11 @@ encode({ack, Ranges, AckDelay, {ECT0, ECT1, ECNCE}}) ->
 encode({reset_stream, StreamId, ErrorCode, FinalSize}) ->
     <<?FRAME_RESET_STREAM, (quic_varint:encode(StreamId))/binary,
         (quic_varint:encode(ErrorCode))/binary, (quic_varint:encode(FinalSize))/binary>>;
+%% RESET_STREAM_AT (0x24) - draft-ietf-quic-reliable-stream-reset-07
+encode({reset_stream_at, StreamId, ErrorCode, FinalSize, ReliableSize}) ->
+    <<?FRAME_RESET_STREAM_AT, (quic_varint:encode(StreamId))/binary,
+        (quic_varint:encode(ErrorCode))/binary, (quic_varint:encode(FinalSize))/binary,
+        (quic_varint:encode(ReliableSize))/binary>>;
 %% STOP_SENDING (0x05)
 encode({stop_sending, StreamId, ErrorCode}) ->
     <<?FRAME_STOP_SENDING, (quic_varint:encode(StreamId))/binary,
@@ -195,6 +202,12 @@ decode(<<?FRAME_RESET_STREAM, Rest/binary>>) ->
     {ErrorCode, Rest2} = quic_varint:decode(Rest1),
     {FinalSize, Rest3} = quic_varint:decode(Rest2),
     {{reset_stream, StreamId, ErrorCode, FinalSize}, Rest3};
+decode(<<?FRAME_RESET_STREAM_AT, Rest/binary>>) ->
+    {StreamId, Rest1} = quic_varint:decode(Rest),
+    {ErrorCode, Rest2} = quic_varint:decode(Rest1),
+    {FinalSize, Rest3} = quic_varint:decode(Rest2),
+    {ReliableSize, Rest4} = quic_varint:decode(Rest3),
+    {{reset_stream_at, StreamId, ErrorCode, FinalSize, ReliableSize}, Rest4};
 decode(<<?FRAME_STOP_SENDING, Rest/binary>>) ->
     {StreamId, Rest1} = quic_varint:decode(Rest),
     {ErrorCode, Rest2} = quic_varint:decode(Rest1),

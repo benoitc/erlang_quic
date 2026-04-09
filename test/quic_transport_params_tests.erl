@@ -310,3 +310,35 @@ roundtrip_all_params_test() ->
     ?assertEqual(25, maps:get(max_ack_delay, Decoded)),
     ?assertEqual(true, maps:get(disable_active_migration, Decoded)),
     ?assertEqual(8, maps:get(active_connection_id_limit, Decoded)).
+
+%%====================================================================
+%% RESET_STREAM_AT Transport Parameter Tests
+%% (draft-ietf-quic-reliable-stream-reset-07)
+%%====================================================================
+
+reset_stream_at_param_encode_decode_test() ->
+    %% reset_stream_at transport parameter (empty value)
+    Params = #{reset_stream_at => true},
+    Encoded = quic_tls:encode_transport_params(Params),
+    {ok, Decoded} = quic_tls:decode_transport_params(Encoded),
+    ?assertEqual(true, maps:get(reset_stream_at, Decoded)).
+
+reset_stream_at_param_with_others_test() ->
+    %% Test with other parameters to ensure proper TLV parsing
+    Params = #{
+        reset_stream_at => true,
+        initial_max_data => 1048576,
+        max_idle_timeout => 30000
+    },
+    Encoded = quic_tls:encode_transport_params(Params),
+    {ok, Decoded} = quic_tls:decode_transport_params(Encoded),
+    ?assertEqual(true, maps:get(reset_stream_at, Decoded)),
+    ?assertEqual(1048576, maps:get(initial_max_data, Decoded)),
+    ?assertEqual(30000, maps:get(max_idle_timeout, Decoded)).
+
+reset_stream_at_param_absent_default_test() ->
+    %% When not present, should default to false/not supported
+    Params = #{initial_max_data => 1048576},
+    Encoded = quic_tls:encode_transport_params(Params),
+    {ok, Decoded} = quic_tls:decode_transport_params(Encoded),
+    ?assertEqual(false, maps:get(reset_stream_at, Decoded, false)).

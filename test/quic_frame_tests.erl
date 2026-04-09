@@ -64,6 +64,41 @@ reset_stream_roundtrip_test() ->
     ?assertEqual(Frame, Decoded).
 
 %%====================================================================
+%% RESET_STREAM_AT Frame (0x24) - draft-ietf-quic-reliable-stream-reset-07
+%%====================================================================
+
+reset_stream_at_roundtrip_test() ->
+    Frame = {reset_stream_at, 4, 256, 1000, 500},
+    Encoded = quic_frame:encode(Frame),
+    %% Frame type should be 0x24
+    ?assertMatch(<<16#24, _/binary>>, Encoded),
+    {Decoded, <<>>} = quic_frame:decode(Encoded),
+    ?assertEqual(Frame, Decoded).
+
+reset_stream_at_zero_reliable_size_test() ->
+    %% ReliableSize=0 is equivalent to RESET_STREAM per spec
+    Frame = {reset_stream_at, 0, 0, 100, 0},
+    Encoded = quic_frame:encode(Frame),
+    {Decoded, <<>>} = quic_frame:decode(Encoded),
+    ?assertEqual(Frame, Decoded).
+
+reset_stream_at_max_reliable_equals_final_test() ->
+    %% ReliableSize == FinalSize is valid
+    Frame = {reset_stream_at, 1, 0, 1000, 1000},
+    Encoded = quic_frame:encode(Frame),
+    {Decoded, <<>>} = quic_frame:decode(Encoded),
+    ?assertEqual(Frame, Decoded).
+
+reset_stream_at_large_values_test() ->
+    %% Test with 62-bit values (max varint)
+    Frame =
+        {reset_stream_at, 16#3FFFFFFFFFFFFFFF, 16#3FFFFFFFFFFFFFFF, 16#3FFFFFFFFFFFFFFF,
+            16#1FFFFFFFFFFFFFFF},
+    Encoded = quic_frame:encode(Frame),
+    {Decoded, <<>>} = quic_frame:decode(Encoded),
+    ?assertEqual(Frame, Decoded).
+
+%%====================================================================
 %% STOP_SENDING Frame (0x05)
 %%====================================================================
 

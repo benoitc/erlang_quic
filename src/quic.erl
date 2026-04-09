@@ -66,6 +66,7 @@
     send_data/5,
     send_data_async/4,
     reset_stream/3,
+    reset_stream_at/4,
     stop_sending/3,
     handle_timeout/2,
     process/1,
@@ -270,6 +271,21 @@ send_data_async(Conn, StreamId, Data, Fin) when is_pid(Conn) ->
     ErrorCode :: non_neg_integer().
 reset_stream(Conn, StreamId, ErrorCode) when is_pid(Conn) ->
     quic_connection:reset_stream(Conn, StreamId, ErrorCode).
+
+%% @doc Reset a stream with reliable delivery up to specified size.
+%% Data up to ReliableSize will be delivered before the reset takes effect.
+%% Requires peer support for the reliable stream reset extension
+%% (draft-ietf-quic-reliable-stream-reset-07).
+%% ReliableSize must be less than or equal to the amount of data already sent.
+-spec reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) ->
+    ok | {error, term()}
+when
+    Conn :: pid(),
+    StreamId :: non_neg_integer(),
+    ErrorCode :: non_neg_integer(),
+    ReliableSize :: non_neg_integer().
+reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) when is_pid(Conn) ->
+    quic_connection:reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize).
 
 %% @doc Request peer to stop sending on a stream.
 %% Sends a STOP_SENDING frame (RFC 9000 Section 19.5).
