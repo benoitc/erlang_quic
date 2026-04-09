@@ -527,3 +527,91 @@ challenge_data_uniqueness_test() ->
     Challenge2 = crypto:strong_rand_bytes(8),
     %% Cryptographically random data should be unique
     ?assertNotEqual(Challenge1, Challenge2).
+
+%%====================================================================
+%% Path Changed Notification Tests (Owner Awareness)
+%%====================================================================
+
+%% Test: Active migration should notify owner with path_changed
+%% Uses quic_connection:test_complete_migration/3 to verify actual behavior
+path_changed_notification_active_migration_test() ->
+    %% Active migration path (different IP = is_nat_rebinding = false)
+    OldAddr = {{192, 168, 1, 100}, 4433},
+    NewAddr = {{10, 0, 0, 5}, 8443},
+
+    OldPath = #path_state{
+        remote_addr = OldAddr,
+        status = validated,
+        is_nat_rebinding = false
+    },
+    NewPath = #path_state{
+        remote_addr = NewAddr,
+        status = validated,
+        is_nat_rebinding = false
+    },
+
+    %% Call actual complete_migration via test helper
+    %% Owner is self(), so we receive the notification
+    Result = quic_connection:test_complete_migration(self(), OldPath, NewPath),
+
+    %% Active migration SHOULD notify owner
+    ?assertEqual({ok, notified}, Result).
+
+%% Test: NAT rebinding should NOT notify owner (no path_changed)
+%% NAT rebinding is minor (same IP, different port) - not worth notification
+path_changed_notification_nat_rebinding_test() ->
+    %% NAT rebinding: same IP, different port
+    OldAddr = {{192, 168, 1, 100}, 4433},
+    NewAddr = {{192, 168, 1, 100}, 5000},
+
+    OldPath = #path_state{
+        remote_addr = OldAddr,
+        status = validated,
+        is_nat_rebinding = false
+    },
+    NewPath = #path_state{
+        remote_addr = NewAddr,
+        status = validated,
+        is_nat_rebinding = true
+    },
+
+    %% Call actual complete_migration via test helper
+    Result = quic_connection:test_complete_migration(self(), OldPath, NewPath),
+
+    %% NAT rebinding should NOT notify owner
+    ?assertEqual({ok, not_notified}, Result).
+
+%% Test: path_changed with undefined old path (first migration)
+path_changed_undefined_old_path_test() ->
+    %% When current_path is undefined (first time), OldAddr should be undefined
+    NewAddr = {{10, 0, 0, 5}, 4433},
+
+    NewPath = #path_state{
+        remote_addr = NewAddr,
+        status = validated,
+        is_nat_rebinding = false
+    },
+
+    %% Call with undefined old path - should still notify
+    Result = quic_connection:test_complete_migration(self(), undefined, NewPath),
+    ?assertEqual({ok, notified}, Result).
+
+%% Test: IPv6 address migration notification
+path_changed_ipv6_migration_test() ->
+    OldAddr = {{8193, 3512, 0, 0, 0, 0, 0, 1}, 4433},
+    NewAddr = {{8194, 3513, 0, 0, 0, 0, 0, 2}, 8443},
+
+    OldPath = #path_state{
+        remote_addr = OldAddr,
+        status = validated,
+        is_nat_rebinding = false
+    },
+    NewPath = #path_state{
+        remote_addr = NewAddr,
+        status = validated,
+        is_nat_rebinding = false
+    },
+
+    %% Should notify for IPv6 active migration
+    Result = quic_connection:test_complete_migration(self(), OldPath, NewPath),
+    ?assertEqual({ok, notified}, Result).

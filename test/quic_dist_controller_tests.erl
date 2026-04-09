@@ -1169,3 +1169,4 @@ parse_all_messages(<<Len:32/big-unsigned, Rest/binary>> = Buffer, Acc) when byte
 parse_all_messages(<<Len:32/big-unsigned, Rest/binary>>, Acc) ->
     <<Msg:Len/binary, Remaining/binary>> = Rest,
     parse_all_messages(Remaining, [Msg | Acc]).
+

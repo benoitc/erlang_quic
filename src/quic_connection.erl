@@ -131,7 +131,9 @@
     close_reason_to_code/1,
     %% Migration frame classification (RFC 9000 Section 9.1)
     is_probing_frame/1,
-    contains_non_probing_frame/1
+    contains_non_probing_frame/1,
+    %% Migration notification testing
+    test_complete_migration/3
 ]).
 -endif.
 
@@ -7628,9 +7630,22 @@ complete_migration(
 %% RFC 9002 Section 9.4: Reset congestion state on path change
 complete_migration(
     #path_state{status = validated, is_nat_rebinding = false} = NewPath,
-    #state{pmtu_state = PMTUState, pmtu_probe_timer = ProbeTimer, pmtu_raise_timer = RaiseTimer} =
-        State
+    #state{
+        owner = Owner,
+        current_path = OldPath,
+        pmtu_state = PMTUState,
+        pmtu_probe_timer = ProbeTimer,
+        pmtu_raise_timer = RaiseTimer
+    } = State
 ) ->
+    %% Notify owner of path change (for logging/monitoring)
+    OldAddr =
+        case OldPath of
+            #path_state{remote_addr = A} -> A;
+            undefined -> undefined
+        end,
+    Owner ! {quic, self(), {path_changed, OldAddr, NewPath#path_state.remote_addr}},
+
     %% RFC 8899: Reset PMTU on path change
     %% Cancel PMTU timers before resetting state
     cancel_timer(ProbeTimer),
@@ -8218,4 +8233,32 @@ test_check_flow_control(StreamId, Offset, DataSize, MaxDataRemote, DataSent, Str
         streams = Streams
     },
     check_send_queue_flow_control(StreamId, Offset, DataSize, State).
+
+%% Test helper for complete_migration/2.
+%% Tests that path_changed notification is sent to owner on active migration.
+%% Returns {ok, notified} if notification was sent, {ok, not_notified} for NAT rebinding.
+-spec test_complete_migration(
+    Owner :: pid(),
+    OldPath :: #path_state{} | undefined,
+    NewPath :: #path_state{}
+) -> {ok, notified | not_notified}.
+test_complete_migration(Owner, OldPath, NewPath) ->
+    %% Create minimal state for testing
+    State = #state{
+        owner = Owner,
+        current_path = OldPath,
+        %% Minimal required fields for complete_migration
+        pmtu_state = quic_pmtu:new(),
+        pmtu_probe_timer = undefined,
+        pmtu_raise_timer = undefined,
+        alt_paths = []
+    },
+    %% Call complete_migration - it will send message to Owner if active migration
+    _ = complete_migration(NewPath, State),
+    %% Check if owner received the notification
+    receive
+        {quic, _, {path_changed, _, _}} -> {ok, notified}
+    after 0 ->
+        {ok, not_notified}
+    end.
 -endif.
