@@ -1598,7 +1598,7 @@ connected(info, {quic_packet, Data, RemoteAddr}, #state{role = server} = State) 
     %% RFC 9000 Section 9.1: Only trigger migration if packet contains non-probing frames
     NewState2 =
         case NewState#state.has_non_probing_frame of
-            true -> maybe_handle_address_change(RemoteAddr, Data, NewState);
+            true -> maybe_handle_address_change(RemoteAddr, byte_size(Data), NewState);
             false -> NewState
         end,
     %% Clear transient fields and flush
@@ -1615,11 +1615,13 @@ connected(info, {quic_packets, Packets, RemoteAddr}, #state{role = server} = Sta
     %% Process packets FIRST to classify frames
     NewState = handle_packets_batch(Packets, State1),
     %% RFC 9000 Section 9.1: Only trigger migration if any packet contains non-probing frames
-    TotalSize = lists:sum([byte_size(P) || P <- Packets]),
     NewState2 =
         case NewState#state.has_non_probing_frame of
-            true -> maybe_handle_address_change(RemoteAddr, <<0:TotalSize/unit:8>>, NewState);
-            false -> NewState
+            true ->
+                TotalSize = lists:sum([byte_size(P) || P <- Packets]),
+                maybe_handle_address_change(RemoteAddr, TotalSize, NewState);
+            false ->
+                NewState
         end,
     %% Clear transient fields and flush
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState2)),
@@ -3279,9 +3281,15 @@ decode_and_process_streaming(Level, Data, State, Acc) ->
 process_frame_track_probing(Level, Frame, State) ->
     %% Update has_non_probing_frame flag if this is a non-probing frame
     State1 =
-        case is_probing_frame(Frame) of
-            true -> State;
-            false -> State#state{has_non_probing_frame = true}
+        case State#state.has_non_probing_frame of
+            true ->
+                %% Already set, skip check
+                State;
+            false ->
+                case is_probing_frame(Frame) of
+                    true -> State;
+                    false -> State#state{has_non_probing_frame = true}
+                end
         end,
     process_frame(Level, Frame, State1).
 
@@ -6994,7 +7002,7 @@ detect_peer_address_change(PacketAddr, #state{remote_addr = CurrentAddr}) ->
 %% RFC 9000 Section 9: Server must validate new paths before accepting migration.
 -spec maybe_handle_address_change(
     {inet:ip_address(), inet:port_number()},
-    binary(),
+    non_neg_integer(),
     #state{}
 ) -> #state{}.
 maybe_handle_address_change(RemoteAddr, _Data, #state{remote_addr = RemoteAddr} = State) ->
@@ -7004,18 +7012,18 @@ maybe_handle_address_change(RemoteAddr, _Data, #state{remote_addr = RemoteAddr} 
 %% RFC 9000 Section 18.2: disable_active_migration only means the RECEIVER should
 %% not migrate to a new local address. It does NOT mean ignore peer address changes.
 %% The check for peer_disable_migration is correctly placed in migrate/1 API only.
-maybe_handle_address_change(NewAddr, Data, #state{migration_state = validating_peer} = State) ->
+maybe_handle_address_change(NewAddr, DataSize, #state{migration_state = validating_peer} = State) ->
     %% Already validating a path - update bytes received for anti-amplification
-    update_pending_path_bytes_received(NewAddr, byte_size(Data), State);
-maybe_handle_address_change(NewAddr, Data, State) ->
+    update_pending_path_bytes_received(NewAddr, DataSize, State);
+maybe_handle_address_change(NewAddr, DataSize, State) ->
     %% New address detected - initiate path validation
     case detect_peer_address_change(NewAddr, State) of
         same_path ->
             State;
         nat_rebinding ->
-            initiate_peer_path_validation(NewAddr, true, Data, State);
+            initiate_peer_path_validation(NewAddr, true, DataSize, State);
         new_path ->
-            initiate_peer_path_validation(NewAddr, false, Data, State)
+            initiate_peer_path_validation(NewAddr, false, DataSize, State)
     end.
 
 %% @doc Update bytes_received for pending path validation (anti-amplification).
@@ -7043,10 +7051,10 @@ update_pending_path_bytes_received(_NewAddr, _Size, State) ->
 -spec initiate_peer_path_validation(
     {inet:ip_address(), inet:port_number()},
     boolean(),
-    binary(),
+    non_neg_integer(),
     #state{}
 ) -> #state{}.
-initiate_peer_path_validation(NewAddr, IsNATRebinding, Data, State) ->
+initiate_peer_path_validation(NewAddr, IsNATRebinding, DataSize, State) ->
     %% Create path state for the new address
     NewChallengeData = crypto:strong_rand_bytes(8),
     NewPathState = #path_state{
@@ -7055,7 +7063,7 @@ initiate_peer_path_validation(NewAddr, IsNATRebinding, Data, State) ->
         challenge_data = NewChallengeData,
         challenge_count = 1,
         bytes_sent = 0,
-        bytes_received = byte_size(Data),
+        bytes_received = DataSize,
         is_nat_rebinding = IsNATRebinding
     },
 
