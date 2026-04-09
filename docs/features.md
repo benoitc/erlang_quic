@@ -14,6 +14,7 @@
 - [x] Unidirectional streams
 - [x] Stream prioritization (RFC 9218) with 8 urgency levels
 - [x] Incremental delivery flag support
+- [x] RESET_STREAM_AT extension (draft-ietf-quic-reliable-stream-reset-07)
 
 ### Flow Control
 - [x] Connection-level flow control (MAX_DATA)
@@ -117,6 +118,36 @@
   - Block Cipher: Feistel network for variable lengths
 - [x] LB-aware CID generation in listener and connection
 
+## Reliable Stream Reset (draft-ietf-quic-reliable-stream-reset-07)
+
+RESET_STREAM_AT allows resetting a stream while ensuring data up to a specified
+offset is reliably delivered. Required for WebTransport where stream headers
+must be received even if the stream is immediately reset.
+
+### Features
+- [x] Frame type 0x24 (RESET_STREAM_AT) encode/decode
+- [x] Transport parameter negotiation (0x17f7586d2cb571)
+- [x] Reliable delivery guarantee up to ReliableSize
+- [x] Retransmission filtering (data beyond ReliableSize not retransmitted)
+- [x] Validation: ReliableSize cannot exceed FinalSize
+- [x] Validation: ReliableSize cannot be increased after initial reset
+- [x] Validation: ErrorCode cannot change after initial reset
+
+### Usage
+
+```erlang
+%% Enable in connection options (both client and server)
+Opts = #{reset_stream_at => true, alpn => [<<"webtransport">>]},
+{ok, Conn} = quic:connect(Host, Port, Opts, self()),
+
+%% Send stream header (e.g., WebTransport session ID)
+{ok, StreamId} = quic:open_stream(Conn),
+ok = quic:send_data(Conn, StreamId, Header, false),
+
+%% Reset stream but ensure header is delivered
+ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
+```
+
 ## API
 
 ### Connection
@@ -136,6 +167,8 @@
 - `quic:open_unidirectional_stream/1` - Open unidirectional stream
 - `quic:send/3,4` - Send data on stream
 - `quic:close_stream/2,3` - Close stream
+- `quic:reset_stream/3` - Reset stream with error code
+- `quic:reset_stream_at/4` - Reset stream with reliable delivery up to specified size
 - `quic:set_stream_priority/4` - Set stream priority (urgency, incremental)
 - `quic:get_stream_priority/2` - Get stream priority
 
@@ -166,6 +199,7 @@
 - `max_data` - Connection-level flow control limit
 - `max_stream_data` - Stream-level flow control limit
 - `max_datagram_frame_size` - Max datagram size to accept (0 = disabled, default: 0)
+- `reset_stream_at` - Enable RESET_STREAM_AT extension (default: false)
 - `alpn` - ALPN protocols list
 - `verify` - Certificate verification mode
 - `preferred_ipv4` - Server preferred IPv4 address
