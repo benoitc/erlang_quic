@@ -534,6 +534,18 @@ connected(
             erlang:send_after(RetryMs, self(), check_queue),
             {keep_state, State2}
     end;
+%% Handle connection migration notification
+connected(info, {quic, _Conn, {path_changed, OldPath, NewPath}}, State) ->
+    ?LOG_INFO(
+        #{
+            what => connection_migrated,
+            node => State#state.node,
+            old_path => OldPath,
+            new_path => NewPath
+        },
+        ?QUIC_LOG_META
+    ),
+    {keep_state, State};
 connected(EventType, Event, State) ->
     handle_common_event(EventType, Event, connected, State).
 

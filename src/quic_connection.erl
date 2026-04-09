@@ -7628,9 +7628,22 @@ complete_migration(
 %% RFC 9002 Section 9.4: Reset congestion state on path change
 complete_migration(
     #path_state{status = validated, is_nat_rebinding = false} = NewPath,
-    #state{pmtu_state = PMTUState, pmtu_probe_timer = ProbeTimer, pmtu_raise_timer = RaiseTimer} =
-        State
+    #state{
+        owner = Owner,
+        current_path = OldPath,
+        pmtu_state = PMTUState,
+        pmtu_probe_timer = ProbeTimer,
+        pmtu_raise_timer = RaiseTimer
+    } = State
 ) ->
+    %% Notify owner of path change (for logging/monitoring)
+    OldAddr =
+        case OldPath of
+            #path_state{remote_addr = A} -> A;
+            undefined -> undefined
+        end,
+    Owner ! {quic, self(), {path_changed, OldAddr, NewPath#path_state.remote_addr}},
+
     %% RFC 8899: Reset PMTU on path change
     %% Cancel PMTU timers before resetting state
     cancel_timer(ProbeTimer),
