@@ -149,6 +149,21 @@ Key responsibilities:
 - Tick handling for liveness detection
 - Backpressure management
 - Statistics tracking for `net_kernel`
+- Connection migration logging
+
+### Connection Migration Logging
+
+When a QUIC connection migrates to a new network path (e.g., IP address change due to network switch), the controller logs the event:
+
+```
+=INFO REPORT====
+    what: connection_migrated
+    node: 'node@host'
+    old_path: {192.168.1.10, 54321}
+    new_path: {10.0.0.5, 62000}
+```
+
+This helps operators debug connectivity issues. Note that NAT rebinding (same IP, different port) is not logged as it represents minor network changes.
 
 ### Liveness Detection
 
