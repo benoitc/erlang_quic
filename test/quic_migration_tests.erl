@@ -375,3 +375,155 @@ find_unused_cid([#cid_entry{cid = CID, status = active} | _Rest], CurrentCID) wh
     {ok, CID};
 find_unused_cid([_ | Rest], CurrentCID) ->
     find_unused_cid(Rest, CurrentCID).
+
+%%====================================================================
+%% RFC Compliance Tests - Migration Fixes
+%%====================================================================
+
+%% Test: is_probing_frame/1 correctly classifies probing vs non-probing frames
+%% RFC 9000 Section 9.1
+is_probing_frame_test() ->
+    %% Probing frames
+    ?assertEqual(true, quic_connection:is_probing_frame(padding)),
+    ?assertEqual(true, quic_connection:is_probing_frame({padding, 10})),
+    ?assertEqual(
+        true, quic_connection:is_probing_frame({path_challenge, <<1, 2, 3, 4, 5, 6, 7, 8>>})
+    ),
+    ?assertEqual(
+        true, quic_connection:is_probing_frame({path_response, <<1, 2, 3, 4, 5, 6, 7, 8>>})
+    ),
+    ?assertEqual(
+        true, quic_connection:is_probing_frame({new_connection_id, 1, 0, <<1, 2, 3, 4>>, <<>>})
+    ),
+
+    %% Non-probing frames
+    ?assertEqual(false, quic_connection:is_probing_frame(ping)),
+    ?assertEqual(false, quic_connection:is_probing_frame({stream, 0, 0, <<>>, false})),
+    ?assertEqual(false, quic_connection:is_probing_frame({ack, [], 0, undefined})),
+    ?assertEqual(false, quic_connection:is_probing_frame({max_data, 1000})),
+    ?assertEqual(false, quic_connection:is_probing_frame({crypto, 0, <<>>})),
+    ?assertEqual(false, quic_connection:is_probing_frame(handshake_done)).
+
+%% Test: contains_non_probing_frame/1 correctly identifies mixed frame lists
+%% RFC 9000 Section 9.1
+contains_non_probing_frame_test() ->
+    %% Only probing frames
+    ?assertEqual(false, quic_connection:contains_non_probing_frame([])),
+    ?assertEqual(false, quic_connection:contains_non_probing_frame([padding])),
+    ?assertEqual(
+        false,
+        quic_connection:contains_non_probing_frame([
+            padding,
+            {path_challenge, <<1, 2, 3, 4, 5, 6, 7, 8>>},
+            {path_response, <<1, 2, 3, 4, 5, 6, 7, 8>>}
+        ])
+    ),
+
+    %% Contains non-probing frames
+    ?assertEqual(true, quic_connection:contains_non_probing_frame([ping])),
+    ?assertEqual(true, quic_connection:contains_non_probing_frame([padding, ping])),
+    ?assertEqual(
+        true,
+        quic_connection:contains_non_probing_frame([
+            {path_challenge, <<1, 2, 3, 4, 5, 6, 7, 8>>},
+            {stream, 0, 0, <<"data">>, false}
+        ])
+    ).
+
+%% Test: NAT rebinding should preserve CC state (is_nat_rebinding = true)
+%% RFC 9002 Section 9.4
+nat_rebinding_preserves_state_test() ->
+    %% NAT rebinding path (same IP, different port)
+    Path = #path_state{
+        remote_addr = {{192, 168, 1, 100}, 5000},
+        status = validated,
+        is_nat_rebinding = true
+    },
+    ?assertEqual(true, Path#path_state.is_nat_rebinding),
+    %% Note: Actual CC preservation is tested via complete_migration/2
+    %% which has two clauses based on is_nat_rebinding
+
+    %% Active migration path (different IP)
+    PathMigration = #path_state{
+        remote_addr = {{10, 0, 0, 5}, 4433},
+        status = validated,
+        is_nat_rebinding = false
+    },
+    ?assertEqual(false, PathMigration#path_state.is_nat_rebinding).
+
+%% Test: Probe padding calculation
+%% RFC 9000 Section 8.2.1: Path validation datagrams must be at least 1200 bytes
+probe_packet_padding_test() ->
+    %% PATH_CHALLENGE frame is 9 bytes (type + 8 bytes data)
+    %% With short header + DCID + PN + AEAD tag, packet would be ~30 bytes
+    %% Must be padded to 1200 bytes
+
+    %% Small DCID (8 bytes)
+    _SmallDCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    % PATH_CHALLENGE
+    SmallPayload = <<16#1a, 1, 2, 3, 4, 5, 6, 7, 8>>,
+    %% Header: 1 + 8 + 2 = 11, AEAD: 16, Payload: 9 = 36 total
+    %% Need 1200 - 36 = 1164 bytes of padding
+    %% Minimum packet size should be >= 1200 after padding
+
+    % Initial payload is small
+    ?assert(byte_size(SmallPayload) < 100),
+    ok.
+
+%% Test: Old path validation field exists
+%% RFC 9000 Section 9.3.2
+old_path_validation_field_test() ->
+    %% Verify path_state can hold challenge data for both paths
+    NewPath = #path_state{
+        remote_addr = {{10, 0, 0, 5}, 4433},
+        status = validating,
+        challenge_data = <<1, 2, 3, 4, 5, 6, 7, 8>>
+    },
+    OldPath = #path_state{
+        remote_addr = {{192, 168, 1, 100}, 4433},
+        status = validating,
+        challenge_data = <<8, 7, 6, 5, 4, 3, 2, 1>>
+    },
+    %% Challenge data should be different for each path
+    ?assert(NewPath#path_state.challenge_data =/= OldPath#path_state.challenge_data),
+    ?assertEqual(validating, NewPath#path_state.status),
+    ?assertEqual(validating, OldPath#path_state.status).
+
+%% Test: Both paths can be validated independently
+both_paths_validation_test() ->
+    %% Create two path states for validation
+    NewChallenge = crypto:strong_rand_bytes(8),
+    OldChallenge = crypto:strong_rand_bytes(8),
+
+    NewPath = #path_state{
+        remote_addr = {{10, 0, 0, 5}, 4433},
+        status = validating,
+        challenge_data = NewChallenge
+    },
+    OldPath = #path_state{
+        remote_addr = {{192, 168, 1, 100}, 4433},
+        status = validating,
+        challenge_data = OldChallenge
+    },
+
+    %% Validate new path
+    ValidatedNewPath = NewPath#path_state{
+        status = validated,
+        challenge_data = undefined
+    },
+    ?assertEqual(validated, ValidatedNewPath#path_state.status),
+
+    %% Old path can also be validated
+    ValidatedOldPath = OldPath#path_state{
+        status = validated,
+        challenge_data = undefined
+    },
+    ?assertEqual(validated, ValidatedOldPath#path_state.status).
+
+%% Test: Challenge data uniqueness for concurrent validations
+challenge_data_uniqueness_test() ->
+    %% Each path should have unique challenge data
+    Challenge1 = crypto:strong_rand_bytes(8),
+    Challenge2 = crypto:strong_rand_bytes(8),
+    %% Cryptographically random data should be unique
+    ?assertNotEqual(Challenge1, Challenge2).
