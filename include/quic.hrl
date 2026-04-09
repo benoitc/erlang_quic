@@ -57,6 +57,9 @@
 -define(FRAME_DATAGRAM, 16#30).
 -define(FRAME_DATAGRAM_WITH_LEN, 16#31).
 
+%% RESET_STREAM_AT Frame (draft-ietf-quic-reliable-stream-reset-07)
+-define(FRAME_RESET_STREAM_AT, 16#24).
+
 %%====================================================================
 %% Stream Frame Flags (bits 0-2 of frame type 0x08-0x0f)
 %%====================================================================
@@ -142,6 +145,9 @@
 
 %% RFC 9221 - QUIC Datagrams
 -define(TP_MAX_DATAGRAM_FRAME_SIZE, 16#20).
+
+%% draft-ietf-quic-reliable-stream-reset-07 - Reliable RESET_STREAM
+-define(TP_RESET_STREAM_AT, 16#17f7586d2cb571).
 
 %%====================================================================
 %% Crypto Constants
@@ -486,7 +492,13 @@
     %% - both: notify AND reset (default)
     deadline_action = both :: reset | notify | both,
     %% deadline_error_code: error code for RESET_STREAM on deadline expiry
-    deadline_error_code = 16#FF :: non_neg_integer()
+    deadline_error_code = 16#FF :: non_neg_integer(),
+
+    %% RESET_STREAM_AT reliable size (draft-ietf-quic-reliable-stream-reset-07)
+    %% When set, data up to this offset must be delivered before reset takes effect
+    reset_reliable_size :: non_neg_integer() | undefined,
+    %% Error code from RESET_STREAM_AT (must not change once set)
+    reset_error :: non_neg_integer() | undefined
 }).
 
 %% Sent packet info for loss detection

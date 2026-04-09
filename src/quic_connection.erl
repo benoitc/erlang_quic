@@ -65,6 +65,7 @@
     close/2,
     close_stream/3,
     reset_stream/3,
+    reset_stream_at/4,
     stop_sending/3,
     handle_timeout/1,
     handle_timeout/2,
@@ -258,6 +259,10 @@
     max_datagram_frame_size_local = 0 :: non_neg_integer(),
     %% Remote: peer's advertised max size (0 = not supported)
     max_datagram_frame_size_remote = 0 :: non_neg_integer(),
+
+    %% RESET_STREAM_AT support (draft-ietf-quic-reliable-stream-reset-07)
+    %% Local: whether we advertise support for RESET_STREAM_AT
+    reset_stream_at_enabled = false :: boolean(),
 
     %% Transport parameters (received from peer)
     transport_params = #{} :: map(),
@@ -507,6 +512,14 @@ close_stream(Conn, StreamId, ErrorCode) ->
     ok | {error, term()}.
 reset_stream(Conn, StreamId, ErrorCode) ->
     gen_statem:call(Conn, {close_stream, StreamId, ErrorCode}).
+
+%% @doc Reset a stream with reliable delivery up to ReliableSize.
+%% Data up to ReliableSize will be delivered before the reset takes effect.
+%% Requires peer support via the reset_stream_at transport parameter.
+-spec reset_stream_at(pid(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
+    ok | {error, term()}.
+reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) ->
+    gen_statem:call(Conn, {reset_stream_at, StreamId, ErrorCode, ReliableSize}).
 
 %% @doc Request peer to stop sending on a stream.
 %% Sends a STOP_SENDING frame (RFC 9000 Section 19.5).
@@ -803,6 +816,7 @@ init({server, Opts}) ->
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
         max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
+        reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeout,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
         keep_alive_timer = undefined,
@@ -1043,6 +1057,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
         max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
+        reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeoutClient,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
         keep_alive_timer = undefined,
@@ -1339,7 +1354,8 @@ connected(
     %% Notify owner that connection is established
     Info = #{
         alpn => Alpn,
-        alpn_protocol => Alpn
+        alpn_protocol => Alpn,
+        transport_params => TransportParams
     },
     Owner ! {quic, self(), {connected, Info}},
     %% For client connections, ensure socket is active for receiving
@@ -1423,6 +1439,15 @@ connected({call, From}, open_unidirectional_stream, State) ->
     end;
 connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
     case do_close_stream(StreamId, ErrorCode, State) of
+        {ok, NewState} ->
+            {keep_state, NewState, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+%% RESET_STREAM_AT: Reset with reliable delivery up to ReliableSize
+%% (draft-ietf-quic-reliable-stream-reset-07)
+connected({call, From}, {reset_stream_at, StreamId, ErrorCode, ReliableSize}, State) ->
+    case do_reset_stream_at(StreamId, ErrorCode, ReliableSize, State) of
         {ok, NewState} ->
             {keep_state, NewState, [{reply, From, ok}]};
         {error, Reason} ->
@@ -1892,10 +1917,16 @@ send_client_hello(State) ->
         max_udp_payload_size => get_local_max_udp_payload_size(State)
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
-    TransportParams =
+    TransportParams1 =
         case MaxDatagramSize of
             0 -> TransportParams0;
             _ -> TransportParams0#{max_datagram_frame_size => MaxDatagramSize}
+        end,
+    %% Add reset_stream_at if enabled (draft-ietf-quic-reliable-stream-reset-07)
+    TransportParams =
+        case State#state.reset_stream_at_enabled of
+            false -> TransportParams1;
+            true -> TransportParams1#{reset_stream_at => true}
         end,
 
     %% Build ClientHello (with or without PSK for resumption)
@@ -2153,14 +2184,20 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
             0 -> TransportParams0;
             _ -> TransportParams0#{max_datagram_frame_size => MaxDatagramSize}
         end,
+    %% Add reset_stream_at if enabled (draft-ietf-quic-reliable-stream-reset-07)
+    TransportParams2 =
+        case State#state.reset_stream_at_enabled of
+            false -> TransportParams1;
+            true -> TransportParams1#{reset_stream_at => true}
+        end,
     %% Add preferred_address if configured (RFC 9000 Section 9.6)
     %% Server MUST NOT send preferred_address if disable_active_migration is set
     TransportParams =
         case State#state.server_preferred_address of
             #preferred_address{} = PA ->
-                TransportParams1#{preferred_address => PA};
+                TransportParams2#{preferred_address => PA};
             _ ->
-                TransportParams1
+                TransportParams2
         end,
 
     %% Build EncryptedExtensions
@@ -3609,6 +3646,76 @@ process_frame(
             ),
             Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
             State#state{streams = NewStreams}
+    end;
+%% RESET_STREAM_AT: Peer is aborting a stream with reliable delivery guarantee
+%% draft-ietf-quic-reliable-stream-reset-07
+process_frame(
+    app,
+    {reset_stream_at, StreamId, ErrorCode, FinalSize, ReliableSize},
+    #state{owner = Owner, streams = Streams} = State
+) ->
+    %% Validate: ReliableSize <= FinalSize (FRAME_ENCODING_ERROR per spec)
+    case ReliableSize > FinalSize of
+        true ->
+            CloseFrame =
+                {connection_close, transport, ?QUIC_FRAME_ENCODING_ERROR, 0,
+                    <<"RESET_STREAM_AT reliable_size > final_size">>},
+            send_frame(CloseFrame, State#state{close_reason = frame_encoding_error});
+        false ->
+            case maps:find(StreamId, Streams) of
+                {ok, #stream_state{final_size = ExistingFinalSize}} when
+                    ExistingFinalSize =/= undefined andalso ExistingFinalSize =/= FinalSize
+                ->
+                    %% STREAM_STATE_ERROR: FinalSize changed
+                    CloseFrame =
+                        {connection_close, transport, ?QUIC_STREAM_STATE_ERROR, 0,
+                            <<"RESET_STREAM_AT final_size changed">>},
+                    send_frame(CloseFrame, State#state{close_reason = stream_state_error});
+                {ok, #stream_state{reset_error = ExistingError}} when
+                    ExistingError =/= undefined andalso ExistingError =/= ErrorCode
+                ->
+                    %% STREAM_STATE_ERROR: ErrorCode changed
+                    CloseFrame =
+                        {connection_close, transport, ?QUIC_STREAM_STATE_ERROR, 0,
+                            <<"RESET_STREAM_AT error_code changed">>},
+                    send_frame(CloseFrame, State#state{close_reason = stream_state_error});
+                {ok, #stream_state{reset_reliable_size = ExistingReliable}} when
+                    ExistingReliable =/= undefined andalso ReliableSize > ExistingReliable
+                ->
+                    %% Spec: Ignore if ReliableSize increased (not an error, just ignore)
+                    State;
+                {ok, Stream} ->
+                    %% Valid RESET_STREAM_AT - update stream state
+                    NewStreams = maps:put(
+                        StreamId,
+                        Stream#stream_state{
+                            state = reset,
+                            final_size = FinalSize,
+                            reset_reliable_size = ReliableSize,
+                            reset_error = ErrorCode
+                        },
+                        Streams
+                    ),
+                    %% Notify owner - same message as RESET_STREAM
+                    Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                    State#state{streams = NewStreams};
+                error ->
+                    %% Unknown stream - notify owner and create minimal state
+                    Owner ! {quic, self(), {stream_opened, StreamId}},
+                    NewStreams = maps:put(
+                        StreamId,
+                        #stream_state{
+                            id = StreamId,
+                            state = reset,
+                            final_size = FinalSize,
+                            reset_reliable_size = ReliableSize,
+                            reset_error = ErrorCode
+                        },
+                        Streams
+                    ),
+                    Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                    State#state{streams = NewStreams}
+            end
     end;
 %% STOP_SENDING: Peer wants us to stop sending on a stream
 %% RFC 9000 Section 19.5
@@ -6062,6 +6169,112 @@ do_stop_sending(StreamId, ErrorCode, #state{streams = Streams} = State) ->
             {error, unknown_stream}
     end.
 
+%% RESET_STREAM_AT: Reset stream with reliable delivery up to ReliableSize
+%% (draft-ietf-quic-reliable-stream-reset-07)
+do_reset_stream_at(
+    StreamId,
+    ErrorCode,
+    ReliableSize,
+    #state{streams = Streams, transport_params = TP} = State
+) ->
+    case maps:get(reset_stream_at, TP, false) of
+        false ->
+            {error, not_supported};
+        true ->
+            case maps:find(StreamId, Streams) of
+                {ok, StreamState} ->
+                    do_reset_stream_at_with_stream(
+                        StreamId, ErrorCode, ReliableSize, StreamState, State
+                    );
+                error ->
+                    {error, unknown_stream}
+            end
+    end.
+
+do_reset_stream_at_with_stream(StreamId, ErrorCode, ReliableSize, StreamState, State) ->
+    FinalSize = StreamState#stream_state.send_offset,
+    case validate_reset_stream_at(ReliableSize, FinalSize, ErrorCode, StreamState) of
+        ok ->
+            execute_reset_stream_at(
+                StreamId,
+                ErrorCode,
+                ReliableSize,
+                FinalSize,
+                StreamState,
+                State
+            );
+        {error, _} = Error ->
+            Error
+    end.
+
+validate_reset_stream_at(ReliableSize, FinalSize, ErrorCode, StreamState) ->
+    ExistingReliable = StreamState#stream_state.reset_reliable_size,
+    ExistingError = StreamState#stream_state.reset_error,
+    case ReliableSize > FinalSize of
+        true ->
+            {error, {invalid_reliable_size, ReliableSize, FinalSize}};
+        false ->
+            validate_reset_stream_at_constraints(
+                ReliableSize,
+                ErrorCode,
+                ExistingReliable,
+                ExistingError
+            )
+    end.
+
+validate_reset_stream_at_constraints(ReliableSize, ErrorCode, ExistingReliable, ExistingError) ->
+    case ExistingReliable =/= undefined andalso ReliableSize > ExistingReliable of
+        true ->
+            {error, cannot_increase_reliable_size};
+        false ->
+            case ExistingError =/= undefined andalso ErrorCode =/= ExistingError of
+                true ->
+                    {error, cannot_change_error_code};
+                false ->
+                    ok
+            end
+    end.
+
+execute_reset_stream_at(
+    StreamId,
+    ErrorCode,
+    ReliableSize,
+    FinalSize,
+    StreamState,
+    #state{streams = Streams} = State
+) ->
+    %% Cancel deadline timer if any
+    case StreamState#stream_state.deadline_timer of
+        undefined -> ok;
+        Timer -> erlang:cancel_timer(Timer)
+    end,
+    %% Send RESET_STREAM_AT frame
+    Frame = {reset_stream_at, StreamId, ErrorCode, FinalSize, ReliableSize},
+    NewState = send_frame(Frame, State),
+    %% Truncate send buffer beyond ReliableSize
+    TruncatedBuffer = truncate_send_buffer(StreamState#stream_state.send_buffer, ReliableSize),
+    UpdatedStream = StreamState#stream_state{
+        state = reset,
+        reset_reliable_size = ReliableSize,
+        reset_error = ErrorCode,
+        send_buffer = TruncatedBuffer,
+        deadline_timer = undefined
+    },
+    {ok, NewState#state{streams = maps:put(StreamId, UpdatedStream, Streams)}}.
+
+%% Truncate send buffer to only keep data up to ReliableSize
+truncate_send_buffer(Buffer, ReliableSize) when is_list(Buffer) ->
+    lists:filter(
+        fun({Offset, _Data}) ->
+            %% Keep chunk if it starts before ReliableSize
+            Offset < ReliableSize
+        end,
+        Buffer
+    );
+truncate_send_buffer(Buffer, _ReliableSize) ->
+    %% Empty or other buffer type - return as-is
+    Buffer.
+
 %% Set stream priority (RFC 9218)
 do_set_stream_priority(StreamId, Urgency, Incremental, #state{streams = Streams} = State) when
     Urgency >= 0, Urgency =< 7, is_boolean(Incremental)
@@ -6320,8 +6533,34 @@ retransmit_lost_packets([], State) ->
     State;
 retransmit_lost_packets([#sent_packet{frames = Frames} | Rest], State) ->
     RetransmitFrames = quic_loss:retransmittable_frames(Frames),
-    State1 = send_retransmit_frames_cc(RetransmitFrames, State),
+    %% Filter out stream data beyond ReliableSize (RESET_STREAM_AT spec requirement)
+    FilteredFrames = filter_reset_stream_at_data(RetransmitFrames, State),
+    State1 = send_retransmit_frames_cc(FilteredFrames, State),
     retransmit_lost_packets(Rest, State1).
+
+%% Filter stream data beyond ReliableSize for streams with RESET_STREAM_AT
+%% Per draft-ietf-quic-reliable-stream-reset-07: Data beyond ReliableSize
+%% SHOULD NOT be retransmitted
+filter_reset_stream_at_data(Frames, #state{streams = Streams}) ->
+    lists:filter(
+        fun(Frame) ->
+            case Frame of
+                {stream, StreamId, Offset, _Data, _Fin} ->
+                    case maps:find(StreamId, Streams) of
+                        {ok, #stream_state{reset_reliable_size = RS}} when RS =/= undefined ->
+                            %% Only retransmit if frame starts before ReliableSize
+                            Offset < RS;
+                        _ ->
+                            %% No RESET_STREAM_AT - always retransmit
+                            true
+                    end;
+                _ ->
+                    %% Non-stream frames - always retransmit
+                    true
+            end
+        end,
+        Frames
+    ).
 
 %% Send frames for retransmission with congestion control check
 send_retransmit_frames_cc([], State) ->

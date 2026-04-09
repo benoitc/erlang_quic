@@ -510,6 +510,9 @@ encode_transport_param(preferred_address, #preferred_address{} = PA) ->
     encode_tp(?TP_PREFERRED_ADDRESS, encode_preferred_address(PA));
 encode_transport_param(max_datagram_frame_size, Value) when Value > 0 ->
     encode_tp(?TP_MAX_DATAGRAM_FRAME_SIZE, quic_varint:encode(Value));
+%% draft-ietf-quic-reliable-stream-reset-07 - Reliable RESET_STREAM
+encode_transport_param(reset_stream_at, true) ->
+    encode_tp(?TP_RESET_STREAM_AT, <<>>);
 encode_transport_param(_, _) ->
     <<>>.
 
@@ -610,6 +613,7 @@ tp_id_to_key(?TP_ACTIVE_CONNECTION_ID_LIMIT) -> active_connection_id_limit;
 tp_id_to_key(?TP_INITIAL_SCID) -> initial_scid;
 tp_id_to_key(?TP_RETRY_SCID) -> retry_scid;
 tp_id_to_key(?TP_MAX_DATAGRAM_FRAME_SIZE) -> max_datagram_frame_size;
+tp_id_to_key(?TP_RESET_STREAM_AT) -> reset_stream_at;
 tp_id_to_key(Id) -> {unknown, Id}.
 
 decode_tp_value(?TP_ORIGINAL_DCID, Value) ->
@@ -622,6 +626,11 @@ decode_tp_value(?TP_RETRY_SCID, Value) ->
     Value;
 decode_tp_value(?TP_DISABLE_ACTIVE_MIGRATION, <<>>) ->
     true;
+decode_tp_value(?TP_RESET_STREAM_AT, <<>>) ->
+    true;
+decode_tp_value(?TP_RESET_STREAM_AT, _) ->
+    %% Non-empty value is a TRANSPORT_PARAMETER_ERROR per spec
+    error({transport_parameter_error, reset_stream_at_non_empty});
 decode_tp_value(?TP_PREFERRED_ADDRESS, Value) ->
     decode_preferred_address(Value);
 %% Known integer parameters (varints)
