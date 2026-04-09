@@ -260,6 +260,10 @@
     %% Remote: peer's advertised max size (0 = not supported)
     max_datagram_frame_size_remote = 0 :: non_neg_integer(),
 
+    %% RESET_STREAM_AT support (draft-ietf-quic-reliable-stream-reset-07)
+    %% Local: whether we advertise support for RESET_STREAM_AT
+    reset_stream_at_enabled = false :: boolean(),
+
     %% Transport parameters (received from peer)
     transport_params = #{} :: map(),
 
@@ -812,6 +816,7 @@ init({server, Opts}) ->
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
         max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
+        reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeout,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
         keep_alive_timer = undefined,
@@ -1052,6 +1057,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
         max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
+        reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeoutClient,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
         keep_alive_timer = undefined,
@@ -1348,7 +1354,8 @@ connected(
     %% Notify owner that connection is established
     Info = #{
         alpn => Alpn,
-        alpn_protocol => Alpn
+        alpn_protocol => Alpn,
+        transport_params => TransportParams
     },
     Owner ! {quic, self(), {connected, Info}},
     %% For client connections, ensure socket is active for receiving
@@ -1910,10 +1917,16 @@ send_client_hello(State) ->
         max_udp_payload_size => get_local_max_udp_payload_size(State)
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
-    TransportParams =
+    TransportParams1 =
         case MaxDatagramSize of
             0 -> TransportParams0;
             _ -> TransportParams0#{max_datagram_frame_size => MaxDatagramSize}
+        end,
+    %% Add reset_stream_at if enabled (draft-ietf-quic-reliable-stream-reset-07)
+    TransportParams =
+        case State#state.reset_stream_at_enabled of
+            false -> TransportParams1;
+            true -> TransportParams1#{reset_stream_at => true}
         end,
 
     %% Build ClientHello (with or without PSK for resumption)
@@ -2171,14 +2184,20 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
             0 -> TransportParams0;
             _ -> TransportParams0#{max_datagram_frame_size => MaxDatagramSize}
         end,
+    %% Add reset_stream_at if enabled (draft-ietf-quic-reliable-stream-reset-07)
+    TransportParams2 =
+        case State#state.reset_stream_at_enabled of
+            false -> TransportParams1;
+            true -> TransportParams1#{reset_stream_at => true}
+        end,
     %% Add preferred_address if configured (RFC 9000 Section 9.6)
     %% Server MUST NOT send preferred_address if disable_active_migration is set
     TransportParams =
         case State#state.server_preferred_address of
             #preferred_address{} = PA ->
-                TransportParams1#{preferred_address => PA};
+                TransportParams2#{preferred_address => PA};
             _ ->
-                TransportParams1
+                TransportParams2
         end,
 
     %% Build EncryptedExtensions
@@ -6514,8 +6533,34 @@ retransmit_lost_packets([], State) ->
     State;
 retransmit_lost_packets([#sent_packet{frames = Frames} | Rest], State) ->
     RetransmitFrames = quic_loss:retransmittable_frames(Frames),
-    State1 = send_retransmit_frames_cc(RetransmitFrames, State),
+    %% Filter out stream data beyond ReliableSize (RESET_STREAM_AT spec requirement)
+    FilteredFrames = filter_reset_stream_at_data(RetransmitFrames, State),
+    State1 = send_retransmit_frames_cc(FilteredFrames, State),
     retransmit_lost_packets(Rest, State1).
+
+%% Filter stream data beyond ReliableSize for streams with RESET_STREAM_AT
+%% Per draft-ietf-quic-reliable-stream-reset-07: Data beyond ReliableSize
+%% SHOULD NOT be retransmitted
+filter_reset_stream_at_data(Frames, #state{streams = Streams}) ->
+    lists:filter(
+        fun(Frame) ->
+            case Frame of
+                {stream, StreamId, Offset, _Data, _Fin} ->
+                    case maps:find(StreamId, Streams) of
+                        {ok, #stream_state{reset_reliable_size = RS}} when RS =/= undefined ->
+                            %% Only retransmit if frame starts before ReliableSize
+                            Offset < RS;
+                        _ ->
+                            %% No RESET_STREAM_AT - always retransmit
+                            true
+                    end;
+                _ ->
+                    %% Non-stream frames - always retransmit
+                    true
+            end
+        end,
+        Frames
+    ).
 
 %% Send frames for retransmission with congestion control check
 send_retransmit_frames_cc([], State) ->
