@@ -194,6 +194,110 @@ LBConfig = #{
 }).
 ```
 
+## Connection Migration (RFC 9000 Section 9)
+
+The server automatically handles connection migration when clients change
+their network addresses (e.g., WiFi to cellular, NAT rebinding).
+
+**Key concept: The server address stays the same.**
+
+Migration means the *client's address* changed, not the server's. The server
+receives packets from a new source address but continues listening on the
+same port:
+
+```
+BEFORE: Client {192.168.1.10:54321} ───> Server {203.0.113.50:4433}
+
+AFTER:  Client {10.0.0.5:62000} ───────> Server {203.0.113.50:4433}
+               ▲                                (same server!)
+               └── Client's address changed (NAT rebind or network switch)
+```
+
+### How It Works
+
+When the server receives a packet from an address different from the current
+`remote_addr`, it:
+
+1. **Detects the change type:**
+   - **NAT rebinding**: Same IP, different port (common with NAT timeouts)
+   - **Active migration**: Different IP address (network change)
+
+2. **Validates the new path** by sending PATH_CHALLENGE:
+
+```
+Server state machine:
+
+  idle ──────────────────────────────────────────────────────┐
+    │                                                        │
+    │ packet from new address                                │
+    ▼                                                        │
+  validating_peer ───────────────────────────────────────────┤
+    │                                                        │
+    │ PATH_RESPONSE received          │ timeout (3*PTO)     │
+    │ (matching challenge)            │ retry up to 3x      │
+    ▼                                 ▼                      │
+  complete_migration()            stay on current path ──────┘
+    │
+    │ - Reset congestion control
+    │ - Reset loss detection
+    │ - Reset PMTU to 1200
+    │ - Switch to fresh CID
+    ▼
+  idle (new path active)
+```
+
+3. **Completes migration** if PATH_RESPONSE matches:
+   - Updates `remote_addr` to the new address
+   - Resets congestion control (new path may have different RTT/bandwidth)
+   - Resets PMTU discovery (new path may have different MTU)
+   - Switches to a fresh Connection ID (prevents path linkability)
+
+### Preferred Address
+
+Servers can advertise a preferred address for clients to migrate to:
+
+```erlang
+%% Server advertises preferred address in transport params
+{ok, _} = quic:start_server(my_server, 4433, #{
+    cert => Cert,
+    key => Key,
+    %% Client will validate and migrate to this address
+    preferred_ipv4 => {{203, 0, 113, 10}, 4433},
+    preferred_ipv6 => {{16#2001, 16#db8, 0, 0, 0, 0, 0, 1}, 4433}
+}).
+
+%% Client automatically validates and migrates to preferred address
+%% after receiving server's transport parameters
+```
+
+### Disabling Migration
+
+To disable active migration (e.g., for load balancer compatibility):
+
+```erlang
+%% Advertise disable_active_migration in transport params
+{ok, _} = quic:start_server(my_server, 4433, #{
+    cert => Cert,
+    key => Key,
+    disable_active_migration => true
+}).
+
+%% Clients will receive {error, migration_disabled} if they call migrate/1
+%% Server will still handle NAT rebinding (port-only changes)
+```
+
+### State Tracking
+
+The server tracks migration state in the connection record:
+
+| Field | Description |
+|-------|-------------|
+| `migration_state` | `idle` or `validating_peer` |
+| `pending_peer_validation` | Path being validated |
+| `path_validation_timer` | Timer reference (3 * PTO timeout) |
+| `peer_disable_migration` | Peer's transport param setting |
+| `current_path` | Active path with dcid, bytes_sent/received |
+
 ## Best Practices
 
 ### 1. Certificate Management

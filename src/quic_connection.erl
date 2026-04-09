@@ -39,7 +39,7 @@
 }).
 
 %% Suppress warnings for helper functions prepared for future use
--compile([{nowarn_unused_function, [{send_handshake_ack, 1}]}]).
+-compile([{nowarn_unused_function, [{send_handshake_ack, 1}, {contains_non_probing_frame, 1}]}]).
 
 %% Dialyzer nowarn for functions prepared for future use and unreachable patterns
 %% (code structure supports multiple ciphers/paths not yet exercised)
@@ -85,6 +85,7 @@
     key_update/1,
     %% Connection migration (RFC 9000 Section 9)
     migrate/1,
+    migrate/2,
     %% PMTU Discovery (RFC 8899)
     get_mtu/1,
     %% Server mode
@@ -126,7 +127,10 @@
     convert_rest_ranges/2,
     check_send_queue_flow_control/4,
     test_check_flow_control/6,
-    close_reason_to_code/1
+    close_reason_to_code/1,
+    %% Migration frame classification (RFC 9000 Section 9.1)
+    is_probing_frame/1,
+    contains_non_probing_frame/1
 ]).
 -endif.
 
@@ -311,6 +315,30 @@
     %% Preferred address being validated (RFC 9000 Section 9.6)
     %% Set when client is validating server's preferred address
     preferred_address :: #preferred_address{} | undefined,
+
+    %% Migration state machine (RFC 9000 Section 9)
+    %% idle: no migration in progress
+    %% validating_peer: server validating client's new address
+    migration_state = idle :: idle | validating_peer,
+    %% Path being validated when client sends from new address
+    pending_peer_validation :: #path_state{} | undefined,
+    %% Old path validation for anti-spoofing defense (RFC 9000 Section 9.3.2)
+    %% When detecting apparent migration, probe both old and new paths
+    old_path_validation :: #path_state{} | undefined,
+    %% Timer reference for path validation timeout
+    path_validation_timer :: reference() | undefined,
+    %% Token for correlating path validation timeout messages
+    %% Used to ignore stale timeouts from canceled validations
+    path_validation_token :: reference() | undefined,
+    %% Peer's disable_active_migration transport param (RFC 9000 Section 18.2)
+    peer_disable_migration = false :: boolean(),
+    %% Transient field: source address of the current packet being processed
+    %% Set during packet processing, cleared after. Used to route PATH_RESPONSE
+    %% to the address that sent the PATH_CHALLENGE (RFC 9000 Section 8.2.2).
+    current_packet_source :: {inet:ip_address(), inet:port_number()} | undefined,
+    %% Transient field: set to true when a non-probing frame is processed
+    %% RFC 9000 Section 9.1: Only non-probing frames trigger migration
+    has_non_probing_frame = false :: boolean(),
 
     %% Connection ID Pool (RFC 9000 Section 5.1)
     %% Our CIDs that we've issued to the peer (via NEW_CONNECTION_ID)
@@ -592,6 +620,12 @@ key_update(Conn) ->
 -spec migrate(pid()) -> ok | {error, term()}.
 migrate(Conn) ->
     gen_statem:call(Conn, migrate).
+
+%% @doc Trigger connection migration with timeout option.
+%% Simulates network change by rebinding the socket.
+-spec migrate(pid(), timeout()) -> ok | {error, term()}.
+migrate(Conn, Timeout) ->
+    gen_statem:call(Conn, {migrate, #{}}, Timeout).
 
 %% @doc Set stream priority (RFC 9218).
 %% Urgency: 0-7 (lower = more urgent, default 3)
@@ -1514,34 +1548,101 @@ connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
             {keep_state, State, [{reply, From, {error, key_update_in_progress}}]}
     end;
 %% Handle connection migration request (RFC 9000 Section 9)
+connected({call, From}, migrate, #state{peer_disable_migration = true} = State) ->
+    %% Peer disabled migration via transport params
+    {keep_state, State, [{reply, From, {error, migration_disabled}}]};
 connected({call, From}, migrate, #state{socket = Socket, remote_addr = RemoteAddr} = State) ->
     %% Simulate network change by rebinding socket to a new port
     %% In a real scenario, this would happen when the device changes networks
     case rebind_socket(Socket) of
         {ok, NewSocket} ->
+            %% RFC 9000 Section 9.5: Use fresh CID to prevent path linkability
+            State1 = switch_to_fresh_cid(State),
             %% Start path validation to the peer on the new path
-            NewState = State#state{socket = NewSocket},
-            State1 = initiate_path_validation(RemoteAddr, NewState),
-            {keep_state, State1, [{reply, From, ok}]};
+            State2 = State1#state{socket = NewSocket},
+            State3 = initiate_path_validation(RemoteAddr, State2),
+            {keep_state, State3, [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
-connected(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
-    NewState = handle_packet(Data, State),
-    %% Flush batched packets and timers after processing incoming data
+%% Handle migration with options
+connected({call, From}, {migrate, _Opts}, #state{peer_disable_migration = true} = State) ->
+    {keep_state, State, [{reply, From, {error, migration_disabled}}]};
+connected(
+    {call, From}, {migrate, _Opts}, #state{socket = Socket, remote_addr = RemoteAddr} = State
+) ->
+    case rebind_socket(Socket) of
+        {ok, NewSocket} ->
+            State1 = switch_to_fresh_cid(State),
+            State2 = State1#state{socket = NewSocket},
+            State3 = initiate_path_validation(RemoteAddr, State2),
+            {keep_state, State3, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) ->
+    %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
+    State1 = State#state{current_packet_source = {IP, Port}},
+    NewState = handle_packet(Data, State1),
+    %% Clear packet source and flush
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
-    check_state_transition(connected, FlushedState);
+    FinalState = FlushedState#state{current_packet_source = undefined},
+    check_state_transition(connected, FinalState);
 %% Server receives packets from listener
-connected(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
-    NewState = handle_packet(Data, State),
-    %% Flush batched packets and timers after processing incoming data
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
-    check_state_transition(connected, FlushedState);
+connected(info, {quic_packet, Data, RemoteAddr}, #state{role = server} = State) ->
+    %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
+    %% Clear has_non_probing_frame before processing - will be set by process_frame_track_probing
+    State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
+    %% Process packet FIRST to classify frames
+    NewState = handle_packet(Data, State1),
+    %% RFC 9000 Section 9.1: Only trigger migration if packet contains non-probing frames
+    NewState2 =
+        case NewState#state.has_non_probing_frame of
+            true -> maybe_handle_address_change(RemoteAddr, byte_size(Data), NewState);
+            false -> NewState
+        end,
+    %% Clear transient fields and flush
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState2)),
+    FinalState = FlushedState#state{
+        current_packet_source = undefined, has_non_probing_frame = false
+    },
+    check_state_transition(connected, FinalState);
 %% Server receives batched packets from listener (GRO optimization)
-connected(info, {quic_packets, Packets, _RemoteAddr}, #state{role = server} = State) ->
-    NewState = handle_packets_batch(Packets, State),
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
-    check_state_transition(connected, FlushedState);
+connected(info, {quic_packets, Packets, RemoteAddr}, #state{role = server} = State) ->
+    %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
+    %% Clear has_non_probing_frame before processing - will be set by process_frame_track_probing
+    State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
+    %% Process packets FIRST to classify frames
+    NewState = handle_packets_batch(Packets, State1),
+    %% RFC 9000 Section 9.1: Only trigger migration if any packet contains non-probing frames
+    NewState2 =
+        case NewState#state.has_non_probing_frame of
+            true ->
+                TotalSize = lists:sum([byte_size(P) || P <- Packets]),
+                maybe_handle_address_change(RemoteAddr, TotalSize, NewState);
+            false ->
+                NewState
+        end,
+    %% Clear transient fields and flush
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState2)),
+    FinalState = FlushedState#state{
+        current_packet_source = undefined, has_non_probing_frame = false
+    },
+    check_state_transition(connected, FinalState);
+%% Path validation timeout - stay on current path if validation fails
+%% Match on token (not timer ref) to correlate with specific validation attempt
+connected(
+    info,
+    {path_validation_timeout, Token},
+    #state{path_validation_token = Token} = State
+) when Token =/= undefined ->
+    %% Token matches - this is the current validation attempt
+    _ = cancel_timer(State#state.path_validation_timer),
+    State1 = State#state{path_validation_timer = undefined, path_validation_token = undefined},
+    handle_path_validation_timeout(State1);
+connected(info, {path_validation_timeout, _StaleToken}, State) ->
+    %% Stale token from canceled validation - ignore
+    {keep_state, State};
 connected(cast, {close, Reason}, State) ->
     emit_qlog_state_change(connected, draining, State),
     State1 = initiate_close(Reason, State),
@@ -2608,6 +2709,55 @@ pad_for_header_protection(Payload) ->
     PadLen = 4 - byte_size(Payload),
     <<Payload/binary, 0:PadLen/unit:8>>.
 
+%% @doc Pad payload for path validation to reach 1200 bytes.
+%% RFC 9000 Section 8.2.1: Path validation packets MUST be padded to at least
+%% 1200 bytes to verify PMTU and prevent amplification attacks.
+%% PADDING frames (0x00 bytes) are added to the payload BEFORE AEAD protection.
+-spec pad_for_path_validation(binary(), binary()) -> binary().
+pad_for_path_validation(Payload, DCID) ->
+    %% Estimate final packet size after protection:
+    %% - Short header: 1 (flags) + DCID length + 1-4 (PN) ~= 1 + len(DCID) + 2
+    %% - Payload (with padding) + AEAD tag (16 bytes)
+    HeaderSize = 1 + byte_size(DCID) + 2,
+    AEADTagSize = 16,
+    MinPacketSize = 1200,
+    CurrentSize = HeaderSize + byte_size(Payload) + AEADTagSize,
+    case CurrentSize >= MinPacketSize of
+        true ->
+            Payload;
+        false ->
+            PadLen = MinPacketSize - CurrentSize,
+            %% PADDING frames are 0x00 bytes - add them to the payload
+            PaddingFrames = binary:copy(<<0>>, PadLen),
+            <<Payload/binary, PaddingFrames/binary>>
+    end.
+
+%%====================================================================
+%% Internal Functions - Frame Classification (RFC 9000 Section 9.1)
+%%====================================================================
+
+%% @doc Check if a frame is a probing frame.
+%% RFC 9000 Section 9.1: Probing frames are PATH_CHALLENGE, PATH_RESPONSE,
+%% NEW_CONNECTION_ID, and PADDING. Only non-probing frames trigger migration.
+-spec is_probing_frame(term()) -> boolean().
+is_probing_frame(padding) -> true;
+is_probing_frame({padding, _}) -> true;
+is_probing_frame({path_challenge, _}) -> true;
+is_probing_frame({path_response, _}) -> true;
+is_probing_frame({new_connection_id, _, _, _, _}) -> true;
+is_probing_frame(_) -> false.
+
+%% @doc Check if a list of frames contains any non-probing frame.
+%% RFC 9000 Section 9.1: Only packets containing non-probing frames trigger migration.
+-spec contains_non_probing_frame([term()]) -> boolean().
+contains_non_probing_frame([]) ->
+    false;
+contains_non_probing_frame([Frame | Rest]) ->
+    case is_probing_frame(Frame) of
+        true -> contains_non_probing_frame(Rest);
+        false -> true
+    end.
+
 %%====================================================================
 %% Internal Functions - Packet Processing
 %%====================================================================
@@ -3105,7 +3255,7 @@ decrypt_packet(Level, Header, _FirstByte, EncryptedPayload, RemainingData, Keys,
 process_frames_noreenbl(_Level, [], State) ->
     State;
 process_frames_noreenbl(Level, [Frame | Rest], State) ->
-    NewState = process_frame(Level, Frame, State),
+    NewState = process_frame_track_probing(Level, Frame, State),
     process_frames_noreenbl(Level, Rest, NewState).
 
 %% Streaming decode and process - decodes and processes frames without building intermediate list
@@ -3121,9 +3271,27 @@ decode_and_process_streaming(Level, Data, State, Acc) ->
         {error, Reason} ->
             {error, {frame_decode_error, Reason}};
         {Frame, Rest} ->
-            NewState = process_frame(Level, Frame, State),
+            NewState = process_frame_track_probing(Level, Frame, State),
             decode_and_process_streaming(Level, Rest, NewState, [Frame | Acc])
     end.
+
+%% @doc Process a frame and track if it's a non-probing frame.
+%% RFC 9000 Section 9.1: Only packets containing non-probing frames trigger migration.
+-spec process_frame_track_probing(atom(), term(), #state{}) -> #state{}.
+process_frame_track_probing(Level, Frame, State) ->
+    %% Update has_non_probing_frame flag if this is a non-probing frame
+    State1 =
+        case State#state.has_non_probing_frame of
+            true ->
+                %% Already set, skip check
+                State;
+            false ->
+                case is_probing_frame(Frame) of
+                    true -> State;
+                    false -> State#state{has_non_probing_frame = true}
+                end
+        end,
+    process_frame(Level, Frame, State1).
 
 %% Process individual frames
 process_frame(_Level, padding, State) ->
@@ -3362,9 +3530,20 @@ process_frame(Level, {max_streams, _, _}, State) when Level =/= app ->
     ?LOG_WARNING(#{what => invalid_max_streams_level, level => Level}, ?QUIC_LOG_META),
     State#state{close_reason = {protocol_violation, max_streams_wrong_level}};
 %% PATH_CHALLENGE: Peer is probing the path, respond with PATH_RESPONSE
+%% RFC 9000 Section 8.2.2: PATH_RESPONSE MUST be sent on the path where the
+%% PATH_CHALLENGE was received (to the source address of that packet).
 process_frame(app, {path_challenge, ChallengeData}, State) ->
-    %% Send PATH_RESPONSE with the same data
-    send_frame({path_response, ChallengeData}, State);
+    %% Send PATH_RESPONSE to the address that sent the PATH_CHALLENGE
+    SourceAddr = State#state.current_packet_source,
+    case SourceAddr of
+        {_IP, _Port} ->
+            %% Send padded PATH_RESPONSE to the source address
+            send_path_response_to_addr(SourceAddr, ChallengeData, State);
+        undefined ->
+            %% Fallback: no source tracked (shouldn't happen in normal flow)
+            %% Send via normal send_frame to current remote_addr
+            send_frame({path_response, ChallengeData}, State)
+    end;
 %% PATH_RESPONSE: Response to our PATH_CHALLENGE
 process_frame(app, {path_response, ResponseData}, State) ->
     handle_path_response(ResponseData, State);
@@ -6056,7 +6235,10 @@ do_close_stream_deadline(StreamId, ErrorCode, #state{streams = Streams} = State)
     end.
 
 %% Initiate connection close
-initiate_close(Reason, State) ->
+initiate_close(Reason, #state{path_validation_timer = PathTimer} = State) ->
+    %% Cancel path validation timer if active
+    cancel_timer(PathTimer),
+    State1 = State#state{path_validation_timer = undefined, path_validation_token = undefined},
     %% Send CONNECTION_CLOSE frame
     {ErrorCode, ReasonPhrase} =
         case Reason of
@@ -6068,12 +6250,12 @@ initiate_close(Reason, State) ->
                 {?QUIC_APPLICATION_ERROR, <<>>}
         end,
     CloseFrame = {connection_close, application, ErrorCode, undefined, ReasonPhrase},
-    case State#state.app_keys of
+    case State1#state.app_keys of
         undefined ->
             %% No keys yet - cannot send frame, just set close_reason
-            State#state{close_reason = Reason};
+            State1#state{close_reason = Reason};
         _ ->
-            send_frame(CloseFrame, State#state{close_reason = Reason})
+            send_frame(CloseFrame, State1#state{close_reason = Reason})
     end.
 
 %% Send PROTOCOL_VIOLATION transport error (RFC 9000)
@@ -6569,18 +6751,20 @@ get_current_key_phase(#state{key_state = KeyState}) -> KeyState#key_update_state
 %% RFC 9000 Section 8.2: PATH_CHALLENGE must be sent to the path being validated.
 %% Returns updated state with the path in validating status.
 -spec initiate_path_validation({inet:ip_address(), inet:port_number()}, #state{}) -> #state{}.
-initiate_path_validation(RemoteAddr, State) ->
+initiate_path_validation(RemoteAddr, #state{dcid = CurrentDCID} = State) ->
     %% Generate 8-byte random challenge data
     ChallengeData = crypto:strong_rand_bytes(8),
 
     %% Create path state for the new path
+    %% Track the CID being used on this path (RFC 9000 Section 9.5)
     PathState = #path_state{
         remote_addr = RemoteAddr,
         status = validating,
         challenge_data = ChallengeData,
         challenge_count = 1,
         bytes_sent = 0,
-        bytes_received = 0
+        bytes_received = 0,
+        dcid = CurrentDCID
     },
 
     %% Add to alternative paths
@@ -6618,7 +6802,8 @@ send_path_challenge(
             %% Build PATH_CHALLENGE frame
             ChallengeFrame = {path_challenge, ChallengeData},
             Payload = quic_frame:encode(ChallengeFrame),
-            PaddedPayload = pad_for_header_protection(Payload),
+            %% RFC 9000 Section 8.2.1: Pad to 1200 bytes for path validation
+            PaddedPayload = pad_for_path_validation(Payload, DCID),
 
             %% Get packet number and key phase
             PN = PNSpace#pn_space.next_pn,
@@ -6649,6 +6834,69 @@ send_path_challenge(
         _ ->
             %% No app keys yet, can't send path validation
             ?LOG_DEBUG(#{what => path_challenge_no_keys}, ?QUIC_LOG_META),
+            State
+    end.
+
+%% @doc Send PATH_RESPONSE to a specific address with proper 1200-byte padding.
+%% RFC 9000 Section 8.2.1: PATH_RESPONSE MUST be padded to at least 1200 bytes.
+%% RFC 9000 Section 8.2.2: PATH_RESPONSE MUST be sent to the source address of
+%% the packet containing the PATH_CHALLENGE.
+-spec send_path_response_to_addr(
+    {inet:ip_address(), inet:port_number()},
+    binary(),
+    #state{}
+) -> #state{}.
+send_path_response_to_addr(
+    {IP, Port},
+    ResponseData,
+    #state{
+        socket = Socket,
+        dcid = DCID,
+        app_keys = AppKeys,
+        role = Role,
+        pn_app = PNSpace
+    } = State
+) ->
+    case AppKeys of
+        {ClientKeys, ServerKeys} when ClientKeys =/= undefined, ServerKeys =/= undefined ->
+            EncryptKeys =
+                case Role of
+                    client -> ClientKeys;
+                    server -> ServerKeys
+                end,
+
+            %% Build PATH_RESPONSE frame
+            ResponseFrame = {path_response, ResponseData},
+            Payload = quic_frame:encode(ResponseFrame),
+            %% RFC 9000 Section 8.2.1: Pad to 1200 bytes for path validation
+            PaddedPayload = pad_for_path_validation(Payload, DCID),
+
+            %% Get packet number and key phase
+            PN = PNSpace#pn_space.next_pn,
+            PNLen = quic_packet:pn_length(PN),
+            KeyPhase = get_current_key_phase(State),
+
+            %% Build first byte for short header
+            FirstByte = 16#40 bor (KeyPhase bsl 2) bor (PNLen - 1),
+
+            %% Encrypt packet
+            #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
+            Packet = quic_aead:protect_short_packet(
+                Cipher, Key, IV, HP, PN, FirstByte, DCID, PaddedPayload
+            ),
+
+            %% Send to the address that sent the PATH_CHALLENGE (not current remote_addr)
+            case gen_udp:send(Socket, IP, Port, Packet) of
+                ok ->
+                    %% Increment packet number
+                    NewPnApp = PNSpace#pn_space{next_pn = PN + 1},
+                    State#state{pn_app = NewPnApp};
+                {error, _Reason} ->
+                    State
+            end;
+        _ ->
+            %% No app keys yet
+            ?LOG_DEBUG(#{what => path_response_no_keys}, ?QUIC_LOG_META),
             State
     end.
 
@@ -6728,35 +6976,328 @@ rebind_socket(OldSocket) ->
             {error, Reason}
     end.
 
+%%====================================================================
+%% Server-Side Address Change Detection (RFC 9000 Section 9)
+%%====================================================================
+
+%% @doc Detect type of peer address change.
+%% Returns same_path, nat_rebinding (port change only), or new_path (IP change).
+-spec detect_peer_address_change(
+    {inet:ip_address(), inet:port_number()},
+    #state{}
+) -> same_path | nat_rebinding | new_path.
+detect_peer_address_change(PacketAddr, #state{remote_addr = CurrentAddr}) ->
+    case PacketAddr of
+        CurrentAddr ->
+            same_path;
+        {IP, _Port} when IP =:= element(1, CurrentAddr) ->
+            %% Same IP, different port - NAT rebinding
+            nat_rebinding;
+        _ ->
+            %% Different IP - active migration
+            new_path
+    end.
+
+%% @doc Handle potential address change from peer.
+%% RFC 9000 Section 9: Server must validate new paths before accepting migration.
+-spec maybe_handle_address_change(
+    {inet:ip_address(), inet:port_number()},
+    non_neg_integer(),
+    #state{}
+) -> #state{}.
+maybe_handle_address_change(RemoteAddr, _Data, #state{remote_addr = RemoteAddr} = State) ->
+    %% Same address, no change
+    State;
+%% NOTE: peer_disable_migration does NOT affect handling peer address changes.
+%% RFC 9000 Section 18.2: disable_active_migration only means the RECEIVER should
+%% not migrate to a new local address. It does NOT mean ignore peer address changes.
+%% The check for peer_disable_migration is correctly placed in migrate/1 API only.
+maybe_handle_address_change(NewAddr, DataSize, #state{migration_state = validating_peer} = State) ->
+    %% Already validating a path - update bytes received for anti-amplification
+    update_pending_path_bytes_received(NewAddr, DataSize, State);
+maybe_handle_address_change(NewAddr, DataSize, State) ->
+    %% New address detected - initiate path validation
+    case detect_peer_address_change(NewAddr, State) of
+        same_path ->
+            State;
+        nat_rebinding ->
+            initiate_peer_path_validation(NewAddr, true, DataSize, State);
+        new_path ->
+            initiate_peer_path_validation(NewAddr, false, DataSize, State)
+    end.
+
+%% @doc Update bytes_received for pending path validation (anti-amplification).
+-spec update_pending_path_bytes_received(
+    {inet:ip_address(), inet:port_number()},
+    non_neg_integer(),
+    #state{}
+) -> #state{}.
+update_pending_path_bytes_received(
+    NewAddr,
+    Size,
+    #state{pending_peer_validation = #path_state{remote_addr = NewAddr} = PathState} = State
+) ->
+    NewPath = PathState#path_state{
+        bytes_received = PathState#path_state.bytes_received + Size
+    },
+    State#state{pending_peer_validation = NewPath};
+update_pending_path_bytes_received(_NewAddr, _Size, State) ->
+    %% Address doesn't match pending validation
+    State.
+
+%% @doc Initiate path validation for peer's new address.
+%% RFC 9000 Section 8.2: Send PATH_CHALLENGE to validate the new path.
+%% RFC 9000 Section 9.3.2: Also probe the old path to defend against spoofing.
+-spec initiate_peer_path_validation(
+    {inet:ip_address(), inet:port_number()},
+    boolean(),
+    non_neg_integer(),
+    #state{}
+) -> #state{}.
+initiate_peer_path_validation(NewAddr, IsNATRebinding, DataSize, State) ->
+    %% Create path state for the new address
+    NewChallengeData = crypto:strong_rand_bytes(8),
+    NewPathState = #path_state{
+        remote_addr = NewAddr,
+        status = validating,
+        challenge_data = NewChallengeData,
+        challenge_count = 1,
+        bytes_sent = 0,
+        bytes_received = DataSize,
+        is_nat_rebinding = IsNATRebinding
+    },
+
+    %% RFC 9000 Section 9.3.2: Also probe the old path to defend against spoofing
+    %% An attacker on-path could copy a packet with spoofed source address
+    OldAddr = State#state.remote_addr,
+    OldChallengeData = crypto:strong_rand_bytes(8),
+    OldPathState = #path_state{
+        remote_addr = OldAddr,
+        status = validating,
+        challenge_data = OldChallengeData,
+        challenge_count = 1,
+        bytes_sent = 0,
+        bytes_received = 0,
+        is_nat_rebinding = false
+    },
+
+    State1 = State#state{
+        pending_peer_validation = NewPathState,
+        old_path_validation = OldPathState,
+        migration_state = validating_peer
+    },
+
+    %% Send PATH_CHALLENGE to both addresses
+    State2 = send_path_challenge_to_addr(NewAddr, NewChallengeData, State1),
+    State3 = send_path_challenge_to_old_addr(OldAddr, OldChallengeData, State2),
+    start_path_validation_timer(State3).
+
+%% @doc Send PATH_CHALLENGE to old path address for anti-spoofing validation.
+-spec send_path_challenge_to_old_addr(
+    {inet:ip_address(), inet:port_number()},
+    binary(),
+    #state{}
+) -> #state{}.
+send_path_challenge_to_old_addr(Addr, ChallengeData, State) ->
+    %% Reuse existing send_path_challenge logic
+    State1 = send_path_challenge(Addr, ChallengeData, State),
+    %% Update old path bytes_sent for tracking
+    case State1#state.old_path_validation of
+        #path_state{} = PathState ->
+            % Padded probe packet
+            PacketSize = 1200,
+            NewPath = PathState#path_state{
+                bytes_sent = PathState#path_state.bytes_sent + PacketSize
+            },
+            State1#state{old_path_validation = NewPath};
+        undefined ->
+            State1
+    end.
+
+%% @doc Send PATH_CHALLENGE to a specific address for peer validation.
+%% Similar to send_path_challenge but used for validating peer's new address.
+-spec send_path_challenge_to_addr(
+    {inet:ip_address(), inet:port_number()},
+    binary(),
+    #state{}
+) -> #state{}.
+send_path_challenge_to_addr(Addr, ChallengeData, State) ->
+    %% Reuse existing send_path_challenge logic
+    State1 = send_path_challenge(Addr, ChallengeData, State),
+    %% Update pending path bytes_sent for anti-amplification
+    case State1#state.pending_peer_validation of
+        #path_state{} = PathState ->
+            %% Estimate packet size (short header + PATH_CHALLENGE frame)
+            PacketSize = 50,
+            NewPath = PathState#path_state{
+                bytes_sent = PathState#path_state.bytes_sent + PacketSize
+            },
+            State1#state{pending_peer_validation = NewPath};
+        undefined ->
+            State1
+    end.
+
+%% @doc Start path validation timer (3 * PTO).
+%% RFC 9000 Section 8.2.4: Use PTO-based timeout for path validation.
+%% Uses a token to correlate timeout messages with specific validation attempts,
+%% allowing stale timeouts from canceled validations to be ignored.
+-spec start_path_validation_timer(#state{}) -> #state{}.
+start_path_validation_timer(
+    #state{loss_state = LossState, path_validation_timer = OldTimer} = State
+) ->
+    %% Cancel any existing timer
+    cancel_timer(OldTimer),
+    %% Calculate timeout as 3 * PTO
+    Timeout =
+        case LossState of
+            undefined -> 3000;
+            _ -> 3 * quic_loss:get_pto(LossState)
+        end,
+    %% Use same token for both message and state - enables stale timeout detection
+    ValidationToken = make_ref(),
+    TimerRef = erlang:send_after(Timeout, self(), {path_validation_timeout, ValidationToken}),
+    State#state{
+        path_validation_timer = TimerRef,
+        path_validation_token = ValidationToken
+    }.
+
+%% @doc Handle path validation timeout.
+%% RFC 9000 Section 8.2.4: Validation fails after timeout, stay on current path.
+-spec handle_path_validation_timeout(#state{}) -> {keep_state, #state{}}.
+handle_path_validation_timeout(#state{pending_peer_validation = PathState} = State) ->
+    %% Mark path as failed, stay on current path
+    case PathState of
+        #path_state{challenge_count = Count} when Count < 3 ->
+            %% Retry PATH_CHALLENGE
+            ChallengeData = crypto:strong_rand_bytes(8),
+            NewPathState = PathState#path_state{
+                challenge_data = ChallengeData,
+                challenge_count = Count + 1
+            },
+            State1 = State#state{pending_peer_validation = NewPathState},
+            State2 = send_path_challenge_to_addr(
+                PathState#path_state.remote_addr, ChallengeData, State1
+            ),
+            State3 = start_path_validation_timer(State2),
+            {keep_state, State3};
+        _ ->
+            %% Max retries reached, give up on this path
+            State1 = State#state{
+                pending_peer_validation = undefined,
+                old_path_validation = undefined,
+                migration_state = idle,
+                path_validation_timer = undefined,
+                path_validation_token = undefined
+            },
+            {keep_state, State1}
+    end.
+
 %% @doc Handle PATH_RESPONSE frame.
 %% Validates the response against pending challenges.
 %% RFC 9000 Section 9.6: Auto-migrate to preferred address on validation success.
+%% RFC 9000 Section 9.3.2: Check both new and old path for anti-spoofing defense.
 handle_path_response(ResponseData, State) ->
-    %% Find the path with matching challenge data
-    case find_path_by_challenge(ResponseData, State#state.alt_paths) of
-        {ok, PathState, OtherPaths} ->
-            %% Mark path as validated
-            ValidatedPath = PathState#path_state{
-                status = validated,
-                challenge_data = undefined
-            },
-            State1 = State#state{alt_paths = [ValidatedPath | OtherPaths]},
-            %% Check if this is a preferred address validation - auto-migrate
-            maybe_migrate_to_preferred_address(ValidatedPath, State1);
-        not_found ->
-            %% Check current path (if we sent challenge on current path)
-            case State#state.current_path of
-                #path_state{challenge_data = ResponseData} = CurrentPath ->
-                    ValidatedPath = CurrentPath#path_state{
+    %% First check if this is a response to peer address validation (server validating client)
+    case check_peer_validation_response(ResponseData, State) of
+        {new_path_validated, PendingPath, State1} ->
+            %% New path validated - check migration decision
+            decide_migration_after_new_path_validated(PendingPath, State1);
+        {old_path_validated, State1} ->
+            %% Old path validated - confirms peer is real (anti-spoofing)
+            %% Wait for new path validation or timeout
+            State1;
+        no_match ->
+            %% Check alt_paths (client validating paths)
+            case find_path_by_challenge(ResponseData, State#state.alt_paths) of
+                {ok, PathState, OtherPaths} ->
+                    %% Mark path as validated
+                    ValidatedPath = PathState#path_state{
                         status = validated,
                         challenge_data = undefined
                     },
-                    State#state{current_path = ValidatedPath};
-                _ ->
-                    %% Unknown response, ignore
-                    State
+                    State1 = State#state{alt_paths = [ValidatedPath | OtherPaths]},
+                    %% Check if this is a preferred address validation - auto-migrate
+                    maybe_migrate_to_preferred_address(ValidatedPath, State1);
+                not_found ->
+                    %% Check current path (if we sent challenge on current path)
+                    case State#state.current_path of
+                        #path_state{challenge_data = ResponseData} = CurrentPath ->
+                            ValidatedPath = CurrentPath#path_state{
+                                status = validated,
+                                challenge_data = undefined
+                            },
+                            State#state{current_path = ValidatedPath};
+                        _ ->
+                            %% Unknown response, ignore
+                            State
+                    end
             end
     end.
+
+%% @doc Check if PATH_RESPONSE matches new or old path validation challenge.
+%% RFC 9000 Section 9.3.2: Both old and new paths are probed during migration.
+-spec check_peer_validation_response(binary(), #state{}) ->
+    {new_path_validated, #path_state{}, #state{}}
+    | {old_path_validated, #state{}}
+    | no_match.
+check_peer_validation_response(ResponseData, State) ->
+    %% Check new path (pending_peer_validation)
+    case State#state.pending_peer_validation of
+        #path_state{challenge_data = ResponseData} = PendingPath ->
+            %% New path validated
+            ValidatedPath = PendingPath#path_state{status = validated, challenge_data = undefined},
+            State1 = State#state{pending_peer_validation = ValidatedPath},
+            {new_path_validated, ValidatedPath, State1};
+        _ ->
+            %% Check old path
+            case State#state.old_path_validation of
+                #path_state{challenge_data = ResponseData} = OldPath ->
+                    %% Old path validated - confirms peer is real (anti-spoofing signal)
+                    ValidatedOldPath = OldPath#path_state{
+                        status = validated, challenge_data = undefined
+                    },
+                    State1 = State#state{old_path_validation = ValidatedOldPath},
+                    {old_path_validated, State1};
+                _ ->
+                    no_match
+            end
+    end.
+
+%% @doc Decide migration after new path is validated.
+%% RFC 9000 Section 9.3.2: Old path validation is an anti-spoofing signal.
+%% If both paths validate, accept migration (peer is legitimate).
+%% If new path validates but old fails/pending, accept migration (old path might have issues).
+-spec decide_migration_after_new_path_validated(#path_state{}, #state{}) -> #state{}.
+decide_migration_after_new_path_validated(ValidatedNewPath, State) ->
+    %% New path is validated - proceed with migration
+    %% Old path validation is informational (anti-spoofing defense)
+    handle_peer_path_validated(ValidatedNewPath, State).
+
+%% @doc Handle successful peer path validation (server accepting client's new address).
+%% RFC 9000 Section 9: Complete migration to the validated peer address.
+-spec handle_peer_path_validated(#path_state{}, #state{}) -> #state{}.
+handle_peer_path_validated(PendingPath, #state{path_validation_timer = Timer} = State) ->
+    %% Cancel validation timer
+    cancel_timer(Timer),
+    %% RFC 9000 Section 9.5: Use fresh CID on new path for unlinkability
+    State1 = switch_to_fresh_cid(State),
+    NewDCID = State1#state.dcid,
+    %% Mark path as validated with the CID used on this path
+    ValidatedPath = PendingPath#path_state{
+        status = validated,
+        challenge_data = undefined,
+        dcid = NewDCID
+    },
+    %% Complete migration to the new peer address
+    State2 = complete_migration(ValidatedPath, State1),
+    %% Clear pending validation state including old path validation
+    State2#state{
+        pending_peer_validation = undefined,
+        old_path_validation = undefined,
+        migration_state = idle,
+        path_validation_timer = undefined,
+        path_validation_token = undefined
+    }.
 
 %% @doc Auto-migrate to preferred address if the validated path matches.
 %% RFC 9000 Section 9.6: Client SHOULD migrate to validated preferred address.
@@ -6801,6 +7342,29 @@ switch_to_preferred_cid(#preferred_address{cid = CID}, State) ->
     %% RFC 9000 Section 9.6: MUST use the new CID on the preferred address
     State#state{dcid = CID}.
 
+%% @doc Switch to a fresh CID from the peer's CID pool.
+%% RFC 9000 Section 9.5: Using a fresh CID on a new path prevents linkability.
+-spec switch_to_fresh_cid(#state{}) -> #state{}.
+switch_to_fresh_cid(#state{peer_cid_pool = Pool, dcid = CurrentDCID} = State) ->
+    case find_unused_cid(Pool, CurrentDCID) of
+        {ok, NewCID} ->
+            State#state{dcid = NewCID};
+        not_found ->
+            %% No spare CID available, continue with current
+            State
+    end.
+
+%% @doc Find an unused CID from the pool (different from current DCID).
+-spec find_unused_cid([#cid_entry{}], binary()) -> {ok, binary()} | not_found.
+find_unused_cid([], _CurrentCID) ->
+    not_found;
+find_unused_cid([#cid_entry{cid = CID, status = active} | _Rest], CurrentCID) when
+    CID =/= CurrentCID
+->
+    {ok, CID};
+find_unused_cid([_ | Rest], CurrentCID) ->
+    find_unused_cid(Rest, CurrentCID).
+
 %% Find a path by challenge data
 find_path_by_challenge(_Data, []) ->
     not_found;
@@ -6815,12 +7379,28 @@ find_path_by_challenge(Data, [Path | Rest]) ->
     end.
 
 %% @doc Complete migration to a validated path.
-%% Updates the current path and resets PMTU state.
+%% Updates the current path and conditionally resets state based on migration type.
 %% Note: Does NOT start PMTU probing - caller must call maybe_send_pmtu_probe/1
 %% after any required CID switches (e.g., for preferred address migration).
 -spec complete_migration(#path_state{}, #state{}) -> #state{}.
+%% NAT rebinding: preserve CC, loss, and PMTU state (same network path)
+%% RFC 9002 Section 9.4: NAT rebinding does not indicate a new path
 complete_migration(
-    #path_state{status = validated} = NewPath,
+    #path_state{status = validated, is_nat_rebinding = true} = NewPath,
+    State
+) ->
+    %% Same network path (only port changed) - keep existing state
+    State#state{
+        remote_addr = NewPath#path_state.remote_addr,
+        current_path = NewPath,
+        alt_paths = lists:delete(NewPath, State#state.alt_paths),
+        migration_state = idle,
+        pending_peer_validation = undefined
+    };
+%% Active migration: reset CC, loss, and PMTU (different network path)
+%% RFC 9002 Section 9.4: Reset congestion state on path change
+complete_migration(
+    #path_state{status = validated, is_nat_rebinding = false} = NewPath,
     #state{pmtu_state = PMTUState, pmtu_probe_timer = ProbeTimer, pmtu_raise_timer = RaiseTimer} =
         State
 ) ->
@@ -6829,13 +7409,22 @@ complete_migration(
     cancel_timer(ProbeTimer),
     cancel_timer(RaiseTimer),
     NewPMTUState = quic_pmtu:on_path_change(PMTUState),
+
+    %% RFC 9002 Section 9.4: Reset congestion controller on path change
+    %% The new path may have different RTT and bandwidth characteristics
+    NewCCState = quic_cc:new(#{}),
+    NewLossState = quic_loss:new(),
+
     State#state{
         remote_addr = NewPath#path_state.remote_addr,
         current_path = NewPath,
         alt_paths = lists:delete(NewPath, State#state.alt_paths),
         pmtu_state = NewPMTUState,
         pmtu_probe_timer = undefined,
-        pmtu_raise_timer = undefined
+        pmtu_raise_timer = undefined,
+        %% Reset CC and loss detection for new path
+        cc_state = NewCCState,
+        loss_state = NewLossState
     };
 complete_migration(_, State) ->
     %% Can only migrate to validated paths
@@ -7108,6 +7697,10 @@ apply_peer_transport_params_internal(TransportParams, State) ->
     %% Default is 0 (datagrams not supported)
     MaxDatagramFrameSize = maps:get(max_datagram_frame_size, TransportParams, 0),
 
+    %% Extract disable_active_migration (RFC 9000 Section 18.2)
+    %% If true, peer has indicated they don't want to receive traffic from different addresses
+    PeerDisableMigration = maps:get(disable_active_migration, TransportParams, false),
+
     %% Store stream data limits in state for use when opening streams
     %% These tell us how much we can send on different stream types
     State#state{
@@ -7124,7 +7717,9 @@ apply_peer_transport_params_internal(TransportParams, State) ->
         max_streams_bidi_remote = MaxStreamsBidi,
         max_streams_uni_remote = MaxStreamsUni,
         %% Datagram size limit (RFC 9221)
-        max_datagram_frame_size_remote = MaxDatagramFrameSize
+        max_datagram_frame_size_remote = MaxDatagramFrameSize,
+        %% Migration disabled by peer (RFC 9000 Section 18.2)
+        peer_disable_migration = PeerDisableMigration
     }.
 
 %% @doc Handle RETIRE_CONNECTION_ID frame from peer.
