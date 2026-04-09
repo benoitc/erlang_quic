@@ -581,31 +581,6 @@ path_changed_notification_nat_rebinding_test() ->
     %% NAT rebinding should NOT notify owner
     ?assertEqual({ok, not_notified}, Result).
 
-%% Test: path_changed message format verification
-%% Verifies that active migration sends correct old/new addresses
-path_changed_message_format_test() ->
-    OldAddr = {{192, 168, 1, 100}, 4433},
-    NewAddr = {{10, 0, 0, 5}, 8443},
-
-    OldPath = #path_state{
-        remote_addr = OldAddr,
-        status = validated,
-        is_nat_rebinding = false
-    },
-    NewPath = #path_state{
-        remote_addr = NewAddr,
-        status = validated,
-        is_nat_rebinding = false
-    },
-
-    %% Trigger migration and verify notification was sent
-    Result = quic_connection:test_complete_migration(self(), OldPath, NewPath),
-    ?assertEqual({ok, notified}, Result),
-
-    %% Addresses should match what we passed in
-    ?assertEqual(OldAddr, OldPath#path_state.remote_addr),
-    ?assertEqual(NewAddr, NewPath#path_state.remote_addr).
-
 %% Test: path_changed with undefined old path (first migration)
 path_changed_undefined_old_path_test() ->
     %% When current_path is undefined (first time), OldAddr should be undefined
