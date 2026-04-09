@@ -749,25 +749,13 @@ init({server, Opts}) ->
             {error, _} -> undefined
         end,
 
-    %% Initialize send socket and batching for server connections.
-    %% Uses quic_socket:open_server_send/2 which:
-    %% - Opens OTP socket with GSO support on Linux (not gen_udp)
-    %% - Binds to same local port with reuseport
-    %% - Enables sendmsg-based batching for high throughput
-    %% Default: batching enabled (#{}) for throughput parity with client connections.
-    SocketState =
-        case maps:get(batching, Opts, #{}) of
-            #{enabled := false} ->
-                undefined;
-            BatchOpts when is_map(BatchOpts) ->
-                case quic_socket:open_server_send(LocalAddr, #{batching => BatchOpts}) of
-                    {ok, SSState} ->
-                        SSState;
-                    {error, _Reason} ->
-                        %% Fall back to direct sends without batching
-                        undefined
-                end
-        end,
+    %% Server connections use the listener's shared socket for sending.
+    %% This matches standard QUIC implementations (quic-go, quiche) where
+    %% all connections share a single UDP socket, demultiplexed by Connection ID.
+    %% We previously tried a separate send socket with reuseport for GSO batching,
+    %% but on Linux this caused kernel packet distribution to starve the listener.
+    %% For GSO optimization, the listener socket itself should be configured for it.
+    SocketState = undefined,
 
     %% Initialize state
     State = #state{

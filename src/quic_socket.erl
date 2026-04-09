@@ -208,9 +208,12 @@ open_server_send_socket(LocalIP, LocalPort, Opts, BatchConfig) ->
     end.
 
 configure_server_send_socket(Socket, LocalIP, LocalPort, Family, Opts, BatchConfig) ->
-    %% Set reuseaddr and reuseport for binding to same port as listener
+    %% Set reuseaddr for binding to same port as listener.
+    %% NOTE: Do NOT use reuseport here! With reuseport, the kernel distributes
+    %% incoming packets between all sockets bound to the port. Since this socket
+    %% is only for sending (nobody reads from it), any packets directed here would
+    %% be dropped, causing the listener to miss incoming data.
     ok = socket:setopt(Socket, {socket, reuseaddr}, true),
-    _ = set_reuseport(Socket),
     set_socket_buffer_sizes(Socket, Opts),
 
     %% Bind to local address
@@ -234,32 +237,13 @@ configure_server_send_socket(Socket, LocalIP, LocalPort, Family, Opts, BatchConf
             Error
     end.
 
-%% Set SO_REUSEPORT if available
-set_reuseport(Socket) ->
-    case os:type() of
-        {unix, linux} ->
-            %% Linux: SOL_SOCKET=1, SO_REUSEPORT=15
-            socket:setopt_native(Socket, {1, 15}, <<1:32/native>>);
-        {unix, darwin} ->
-            %% macOS: SOL_SOCKET=0xFFFF, SO_REUSEPORT=0x200
-            socket:setopt_native(Socket, {16#FFFF, 16#200}, <<1:32/native>>);
-        _ ->
-            {error, not_supported}
-    end.
-
 %% Fallback to gen_udp for server send (non-Linux platforms)
+%% NOTE: Do NOT use reuseport here! With reuseport, the kernel distributes
+%% incoming packets between all sockets bound to the port. Since this socket
+%% is only for sending, any packets directed here would be dropped.
 open_server_send_genudp(LocalIP, LocalPort, Opts, BatchConfig) ->
     RecBuf = maps:get(recbuf, Opts, ?DEFAULT_UDP_RECBUF),
     SndBuf = maps:get(sndbuf, Opts, ?DEFAULT_UDP_SNDBUF),
-    ReuseOpts =
-        case os:type() of
-            {unix, darwin} ->
-                [{raw, 16#FFFF, 16#200, <<1:32/native>>}];
-            {unix, linux} ->
-                [{raw, 1, 15, <<1:32/native>>}];
-            _ ->
-                []
-        end,
     SocketOpts =
         [
             binary,
@@ -268,7 +252,7 @@ open_server_send_genudp(LocalIP, LocalPort, Opts, BatchConfig) ->
             {reuseaddr, true},
             {recbuf, RecBuf},
             {sndbuf, SndBuf}
-        ] ++ ReuseOpts,
+        ],
     case gen_udp:open(LocalPort, SocketOpts) of
         {ok, Socket} ->
             {ok, build_genudp_state(Socket, BatchConfig)};
