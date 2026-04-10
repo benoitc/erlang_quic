@@ -94,6 +94,8 @@
     %% Stream prioritization (RFC 9218)
     set_stream_priority/4,
     get_stream_priority/2,
+    %% Congestion control
+    set_congestion_control/2,
     %% Stream deadlines
     set_stream_deadline/4,
     cancel_stream_deadline/2,
@@ -656,6 +658,12 @@ set_stream_priority(Conn, StreamId, Urgency, Incremental) ->
     {ok, {0..7, boolean()}} | {error, term()}.
 get_stream_priority(Conn, StreamId) ->
     gen_statem:call(Conn, {get_stream_priority, StreamId}).
+
+%% @doc Set the congestion control algorithm for a connection.
+%% Algorithm: newreno | bbr | cubic
+-spec set_congestion_control(pid(), quic_cc:cc_algorithm()) -> ok | {error, term()}.
+set_congestion_control(Conn, Algorithm) ->
+    gen_statem:call(Conn, {set_congestion_control, Algorithm}).
 
 %% @doc Set a deadline for a stream.
 %% TimeoutMs is milliseconds from now until expiry.
@@ -1475,6 +1483,14 @@ connected({call, From}, {get_stream_priority, StreamId}, State) ->
     case do_get_stream_priority(StreamId, State) of
         {ok, Priority} ->
             {keep_state, State, [{reply, From, {ok, Priority}}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+%% Congestion control
+connected({call, From}, {set_congestion_control, Algorithm}, State) ->
+    case do_set_congestion_control(Algorithm, State) of
+        {ok, NewState} ->
+            {keep_state, NewState, [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -6304,6 +6320,17 @@ do_get_stream_priority(StreamId, #state{streams = Streams}) ->
         error ->
             {error, unknown_stream}
     end.
+
+%% Set congestion control algorithm
+do_set_congestion_control(Algorithm, #state{cc_state = OldCC} = State) when
+    Algorithm =:= newreno; Algorithm =:= bbr; Algorithm =:= cubic
+->
+    NewCC = quic_cc:new(Algorithm, #{
+        max_datagram_size => quic_cc:max_datagram_size(OldCC)
+    }),
+    {ok, State#state{cc_state = NewCC}};
+do_set_congestion_control(_Algorithm, _State) ->
+    {error, invalid_algorithm}.
 
 %% Set stream deadline
 do_set_stream_deadline(StreamId, TimeoutMs, Opts, #state{streams = Streams} = State) when

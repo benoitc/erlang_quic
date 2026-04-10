@@ -83,6 +83,8 @@
     %% Stream prioritization (RFC 9218)
     set_stream_priority/4,
     get_stream_priority/2,
+    %% Congestion control
+    set_congestion_control/2,
     %% Stream deadlines
     set_stream_deadline/3,
     set_stream_deadline/4,
@@ -392,6 +394,18 @@ migrate(Conn) when is_pid(Conn) ->
 migrate(Conn, Opts) when is_pid(Conn), is_map(Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     quic_connection:migrate(Conn, Timeout).
+
+%% @doc Set the congestion control algorithm for a connection.
+%% This changes the algorithm on a live connection.
+%% The new algorithm starts fresh (cwnd, ssthresh reset to defaults).
+%% Only works in connected state.
+%%
+%% Algorithm: newreno | bbr | cubic
+-spec set_congestion_control(Conn, Algorithm) -> ok | {error, term()} when
+    Conn :: pid(),
+    Algorithm :: newreno | bbr | cubic.
+set_congestion_control(Conn, Algorithm) when is_pid(Conn) ->
+    quic_connection:set_congestion_control(Conn, Algorithm).
 
 %% @doc Set the priority for a stream.
 %% Urgency: 0-7 (lower = more urgent, default 3)
