@@ -69,6 +69,38 @@
     is_node_name/1
 ]).
 
+%% User stream API
+-export([
+    open_stream/1,
+    open_stream/2,
+    send/2,
+    send/3,
+    close_stream/1,
+    reset_stream/1,
+    reset_stream/2,
+    accept_streams/1,
+    stop_accepting/1,
+    controlling_process/2,
+    list_streams/0,
+    list_streams/1,
+    get_controller/1
+]).
+
+%% Types
+-export_type([stream_ref/0, stream_info/0, stream_opt/0]).
+
+-type stream_ref() :: {quic_dist_stream, node(), non_neg_integer()}.
+-type stream_opt() :: {priority, 16..255}.
+-type stream_info() :: #{
+    ref => stream_ref(),
+    node => node(),
+    stream_id => non_neg_integer(),
+    owner => pid(),
+    priority => 16..255,
+    recv_fin => boolean(),
+    send_fin => boolean()
+}.
+
 %% Internal exports
 -export([
     acceptor_loop/2,
@@ -1050,3 +1082,173 @@ create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer) ->
             ok
         end
     }.
+
+%%====================================================================
+%% User Stream API
+%%====================================================================
+
+%% @doc Open a bidirectional user stream to a connected node.
+%% Returns {ok, StreamRef} on success where StreamRef can be used with send/2,3 and close_stream/1.
+%% The caller becomes the stream owner.
+-spec open_stream(Node :: node()) -> {ok, stream_ref()} | {error, term()}.
+open_stream(Node) ->
+    open_stream(Node, []).
+
+%% @doc Open a bidirectional user stream with options.
+%% Options:
+%%   {priority, 16..255} - Stream priority (default: 128, lower = higher priority)
+%%                         Note: priorities 0-15 are reserved for distribution
+-spec open_stream(Node :: node(), Options :: [stream_opt()]) ->
+    {ok, stream_ref()} | {error, term()}.
+open_stream(Node, Options) ->
+    case get_controller(Node) of
+        {ok, Ctrl} ->
+            case quic_dist_controller:open_user_stream(Ctrl, self(), Options) of
+                {ok, StreamId} ->
+                    {ok, {quic_dist_stream, Node, StreamId}};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% @doc Send data on a user stream.
+%% Equivalent to send(StreamRef, Data, false).
+-spec send(StreamRef :: stream_ref(), Data :: iodata()) -> ok | {error, term()}.
+send(StreamRef, Data) ->
+    send(StreamRef, Data, false).
+
+%% @doc Send data on a user stream.
+%% When Fin is true, this marks the end of data on this stream (half-close).
+-spec send(StreamRef :: stream_ref(), Data :: iodata(), Fin :: boolean()) -> ok | {error, term()}.
+send({quic_dist_stream, Node, StreamId}, Data, Fin) ->
+    case get_controller(Node) of
+        {ok, Ctrl} ->
+            quic_dist_controller:send_user_data(Ctrl, StreamId, Data, Fin);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% @doc Close a user stream gracefully.
+%% This sends a FIN to the peer. When both sides have sent FIN, the owner
+%% receives {quic_dist_stream, StreamRef, closed}.
+-spec close_stream(StreamRef :: stream_ref()) -> ok | {error, term()}.
+close_stream({quic_dist_stream, Node, StreamId}) ->
+    case get_controller(Node) of
+        {ok, Ctrl} ->
+            quic_dist_controller:close_user_stream(Ctrl, StreamId);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% @doc Reset/cancel a user stream immediately (notifies peer).
+%% Uses default error code 0.
+-spec reset_stream(StreamRef :: stream_ref()) -> ok | {error, term()}.
+reset_stream(StreamRef) ->
+    reset_stream(StreamRef, 0).
+
+%% @doc Reset/cancel a user stream with a specific error code.
+%% The peer receives the reset notification immediately.
+-spec reset_stream(StreamRef :: stream_ref(), ErrorCode :: non_neg_integer()) ->
+    ok | {error, term()}.
+reset_stream({quic_dist_stream, Node, StreamId}, ErrorCode) ->
+    case get_controller(Node) of
+        {ok, Ctrl} ->
+            quic_dist_controller:reset_user_stream(Ctrl, StreamId, ErrorCode);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% @doc Register to accept incoming user streams from a node.
+%% Joins the acceptor pool for the node. Multiple processes can register as acceptors.
+%% Incoming streams are assigned to acceptors using round-robin selection.
+%%
+%% When a new stream arrives, one acceptor receives:
+%%   {quic_dist_stream, StreamRef, {data, Data, Fin}}
+%%
+%% The acceptor automatically becomes the stream owner (implicit ownership).
+%% Use controlling_process/2 to transfer ownership to a worker process.
+%%
+%% If no acceptors are registered, incoming streams are refused with RESET.
+-spec accept_streams(Node :: node()) -> ok | {error, term()}.
+accept_streams(Node) ->
+    case get_controller(Node) of
+        {ok, Ctrl} ->
+            quic_dist_controller:accept_user_streams(Ctrl, self());
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% @doc Stop accepting incoming user streams from a node.
+%% Removes the calling process from the acceptor pool.
+-spec stop_accepting(Node :: node()) -> ok | {error, term()}.
+stop_accepting(Node) ->
+    case get_controller(Node) of
+        {ok, Ctrl} ->
+            quic_dist_controller:stop_accepting_streams(Ctrl);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% @doc Transfer stream ownership to another process.
+%% The new owner will receive all subsequent messages for this stream.
+-spec controlling_process(StreamRef :: stream_ref(), NewOwner :: pid()) -> ok | {error, term()}.
+controlling_process({quic_dist_stream, Node, StreamId}, NewOwner) ->
+    case get_controller(Node) of
+        {ok, Ctrl} ->
+            quic_dist_controller:controlling_process(Ctrl, StreamId, NewOwner);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% @doc List all user streams across all connected nodes.
+-spec list_streams() -> [stream_info()].
+list_streams() ->
+    try
+        DistCtrls = erlang:system_info(dist_ctrl),
+        lists:flatmap(
+            fun
+                ({_Node, Ctrl}) when is_pid(Ctrl) ->
+                    quic_dist_controller:list_user_streams(Ctrl);
+                ({_Node, _Port}) ->
+                    []
+            end,
+            DistCtrls
+        )
+    catch
+        _:_ ->
+            []
+    end.
+
+%% @doc List user streams for a specific connected node.
+-spec list_streams(Node :: node()) -> [stream_info()].
+list_streams(Node) ->
+    case get_controller(Node) of
+        {ok, Ctrl} ->
+            quic_dist_controller:list_user_streams(Ctrl);
+        {error, _} ->
+            []
+    end.
+
+%% @doc Get the distribution controller for a connected node.
+%% Returns {ok, ControllerPid} if the node is connected, {error, not_connected} otherwise.
+-spec get_controller(Node :: node()) -> {ok, pid()} | {error, not_connected | not_quic_connection}.
+get_controller(Node) ->
+    %% Use erlang:system_info(dist_ctrl) to get the list of distribution controllers
+    %% This returns [{Node, CtrlPid}] for all connected nodes
+    try
+        DistCtrls = erlang:system_info(dist_ctrl),
+        case lists:keyfind(Node, 1, DistCtrls) of
+            {Node, Ctrl} when is_pid(Ctrl) ->
+                {ok, Ctrl};
+            {Node, Port} when is_port(Port) ->
+                %% TCP distribution uses ports, not pids - not supported
+                {error, not_quic_connection};
+            _ ->
+                {error, not_connected}
+        end
+    catch
+        _:_ ->
+            {error, not_connected}
+    end.

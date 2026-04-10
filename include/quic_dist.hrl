@@ -187,5 +187,37 @@
     fin = false :: boolean()
 }).
 
+%%====================================================================
+%% User Stream Support
+%%====================================================================
+
+%% User stream thresholds
+%% Distribution uses streams 0 (control) and 4,8,12,16 (client data) or 1,5,9,13 (server data)
+%% User streams start above these reserved ranges
+
+% Client-initiated user streams start at 20 (above 0,4,8,12,16)
+-define(USER_STREAM_THRESHOLD_CLIENT, 20).
+% Server-initiated user streams start at 17 (above 1,5,9,13)
+-define(USER_STREAM_THRESHOLD_SERVER, 17).
+
+%% Application error code for refused streams (no acceptor available)
+-define(STREAM_REFUSED, 16#100).
+
+%% User stream priority constraints
+%% User streams CANNOT have priority < 16 (reserved for distribution)
+-define(USER_STREAM_MIN_PRIORITY, 16).
+-define(USER_STREAM_DEFAULT_PRIORITY, 128).
+
+%% User stream state record
+-record(user_stream, {
+    id :: non_neg_integer(),
+    owner :: pid(),
+    monitor :: reference(),
+    %% Stream priority (16=highest user, 255=lowest)
+    priority = ?USER_STREAM_DEFAULT_PRIORITY :: 16..255,
+    recv_fin = false :: boolean(),
+    send_fin = false :: boolean()
+}).
+
 % QUIC_DIST_HRL
 -endif.

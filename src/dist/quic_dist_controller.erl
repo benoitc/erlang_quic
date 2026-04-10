@@ -65,6 +65,20 @@
     pre_nodeup/1
 ]).
 
+%% User stream API
+-export([
+    open_user_stream/2,
+    open_user_stream/3,
+    send_user_data/4,
+    close_user_stream/2,
+    reset_user_stream/2,
+    reset_user_stream/3,
+    accept_user_streams/2,
+    stop_accepting_streams/1,
+    controlling_process/3,
+    list_user_streams/1
+]).
+
 %% gen_statem callbacks
 -export([
     init/1,
@@ -139,7 +153,15 @@
     %% Last time we sent data (for tick response rate limiting)
     last_send_time = 0 :: integer(),
     %% Last time we sent a tick response (to prevent feedback loops)
-    last_tick_response = 0 :: integer()
+    last_tick_response = 0 :: integer(),
+
+    %% User stream support
+    %% Map of StreamId -> #user_stream{} for user-accessible streams
+    user_streams = #{} :: #{non_neg_integer() => #user_stream{}},
+    %% Acceptor pool: list of {Pid, MonitorRef} for processes accepting incoming streams
+    acceptor_pool = [] :: [{pid(), reference()}],
+    %% Round-robin index for acceptor selection
+    acceptor_idx = 0 :: non_neg_integer()
 }).
 
 %%====================================================================
@@ -211,6 +233,81 @@ pre_nodeup(Controller) ->
     gen_statem:call(Controller, {pre_nodeup, self()}).
 
 %%====================================================================
+%% User Stream API
+%%====================================================================
+
+%% @doc Open a user stream for application use.
+%% Returns {ok, StreamId} on success.
+-spec open_user_stream(Controller :: pid(), Owner :: pid()) ->
+    {ok, non_neg_integer()} | {error, term()}.
+open_user_stream(Controller, Owner) ->
+    open_user_stream(Controller, Owner, []).
+
+%% @doc Open a user stream with options.
+%% Options:
+%%   {priority, 16..255} - Stream priority (default: 128, lower = higher priority)
+-spec open_user_stream(Controller :: pid(), Owner :: pid(), Opts :: list()) ->
+    {ok, non_neg_integer()} | {error, term()}.
+open_user_stream(Controller, Owner, Opts) ->
+    gen_statem:call(Controller, {open_user_stream, Owner, Opts}).
+
+%% @doc Send data on a user stream.
+%% Fin=true marks the end of data on this stream.
+-spec send_user_data(
+    Controller :: pid(),
+    StreamId :: non_neg_integer(),
+    Data :: iodata(),
+    Fin :: boolean()
+) -> ok | {error, term()}.
+send_user_data(Controller, StreamId, Data, Fin) ->
+    gen_statem:call(Controller, {send_user_data, StreamId, Data, Fin}).
+
+%% @doc Close a user stream.
+-spec close_user_stream(Controller :: pid(), StreamId :: non_neg_integer()) ->
+    ok | {error, term()}.
+close_user_stream(Controller, StreamId) ->
+    gen_statem:call(Controller, {close_user_stream, StreamId}).
+
+%% @doc Reset/cancel a user stream (notifies peer immediately).
+%% Uses default error code 0.
+-spec reset_user_stream(Controller :: pid(), StreamId :: non_neg_integer()) ->
+    ok | {error, term()}.
+reset_user_stream(Controller, StreamId) ->
+    reset_user_stream(Controller, StreamId, 0).
+
+%% @doc Reset/cancel a user stream with a specific error code.
+-spec reset_user_stream(
+    Controller :: pid(), StreamId :: non_neg_integer(), ErrorCode :: non_neg_integer()
+) ->
+    ok | {error, term()}.
+reset_user_stream(Controller, StreamId, ErrorCode) ->
+    gen_statem:call(Controller, {reset_user_stream, StreamId, ErrorCode}).
+
+%% @doc Register to accept incoming user streams.
+%% The acceptor will receive {quic_dist_stream, Node, {incoming, StreamId}} messages.
+-spec accept_user_streams(Controller :: pid(), Acceptor :: pid()) ->
+    ok | {error, term()}.
+accept_user_streams(Controller, Acceptor) ->
+    gen_statem:call(Controller, {accept_user_streams, Acceptor}).
+
+%% @doc Stop accepting incoming user streams.
+-spec stop_accepting_streams(Controller :: pid()) -> ok.
+stop_accepting_streams(Controller) ->
+    gen_statem:call(Controller, stop_accepting_streams).
+
+%% @doc Transfer stream ownership to another process.
+-spec controlling_process(Controller :: pid(), StreamId :: non_neg_integer(), NewOwner :: pid()) ->
+    ok | {error, term()}.
+controlling_process(Controller, StreamId, NewOwner) ->
+    gen_statem:call(Controller, {controlling_process, StreamId, NewOwner}).
+
+%% @doc List all user streams.
+%% Returns a list of stream info maps.
+-spec list_user_streams(Controller :: pid()) -> [map()].
+list_user_streams(Controller) ->
+    gen_statem:call(Controller, list_user_streams).
+
+%%====================================================================
 %% gen_statem callbacks
 %%====================================================================
 
@@ -251,12 +348,28 @@ get_dist_opt(Key, Opts, Default) when is_list(Opts) ->
 get_dist_opt(Key, Opts, Default) when is_map(Opts) ->
     maps:get(Key, Opts, Default).
 
-terminate(_Reason, _StateName, #state{conn = Conn, pending_tick_timer = Timer}) ->
+terminate(_Reason, _StateName, #state{
+    conn = Conn, pending_tick_timer = Timer, user_streams = Streams, acceptor_pool = Pool
+}) ->
     %% Cancel pending tick retry timer if running
     case Timer of
         undefined -> ok;
         TimerRef -> erlang:cancel_timer(TimerRef)
     end,
+    %% Demonitor all user stream owners
+    maps:foreach(
+        fun(_StreamId, #user_stream{monitor = MonRef}) ->
+            erlang:demonitor(MonRef, [flush])
+        end,
+        Streams
+    ),
+    %% Demonitor all acceptors in pool
+    lists:foreach(
+        fun({_Pid, MonRef}) ->
+            erlang:demonitor(MonRef, [flush])
+        end,
+        Pool
+    ),
     try
         quic:close(Conn, normal)
     catch
@@ -546,6 +659,28 @@ connected(info, {quic, _Conn, {path_changed, OldPath, NewPath}}, State) ->
         ?QUIC_LOG_META
     ),
     {keep_state, State};
+%% Handle user stream operations
+connected({call, From}, {open_user_stream, Owner}, State) ->
+    handle_open_user_stream(From, Owner, [], State);
+connected({call, From}, {open_user_stream, Owner, Opts}, State) ->
+    handle_open_user_stream(From, Owner, Opts, State);
+connected({call, From}, {send_user_data, StreamId, Data, Fin}, State) ->
+    handle_send_user_data(From, StreamId, Data, Fin, State);
+connected({call, From}, {close_user_stream, StreamId}, State) ->
+    handle_close_user_stream(From, StreamId, State);
+connected({call, From}, {reset_user_stream, StreamId, ErrorCode}, State) ->
+    handle_reset_user_stream(From, StreamId, ErrorCode, State);
+connected({call, From}, {accept_user_streams, Acceptor}, State) ->
+    handle_accept_user_streams(From, Acceptor, State);
+connected({call, From}, stop_accepting_streams, State) ->
+    handle_stop_accepting_streams(From, State);
+connected({call, From}, {controlling_process, StreamId, NewOwner}, State) ->
+    handle_controlling_process(From, StreamId, NewOwner, State);
+connected({call, From}, list_user_streams, State) ->
+    handle_list_user_streams(From, State);
+%% Handle user stream owner DOWN
+connected(info, {'DOWN', MonRef, process, Pid, _Reason}, State) ->
+    handle_user_stream_owner_down(MonRef, Pid, State);
 connected(EventType, Event, State) ->
     handle_common_event(EventType, Event, connected, State).
 
@@ -627,7 +762,7 @@ handle_common_event(
 %% Handle incoming QUIC messages
 handle_common_event(
     info,
-    {quic, Conn, {stream_data, StreamId, Data, _Fin}},
+    {quic, Conn, {stream_data, StreamId, Data, Fin}},
     StateName,
     #state{
         conn = Conn,
@@ -639,8 +774,38 @@ handle_common_event(
             %% Data on control stream
             handle_control_data(Data, StateName, State);
         _ ->
-            %% Data on data stream
-            handle_stream_data(StreamId, Data, StateName, State)
+            %% Data on data stream - check if user stream and pass Fin
+            case StateName of
+                connected ->
+                    case is_user_stream(StreamId, State) of
+                        true ->
+                            handle_user_stream_data(StreamId, Data, Fin, State);
+                        false ->
+                            handle_stream_data(StreamId, Data, StateName, State)
+                    end;
+                _ ->
+                    handle_stream_data(StreamId, Data, StateName, State)
+            end
+    end;
+%% Handle stream reset for user streams
+handle_common_event(
+    info,
+    {quic, Conn, {stream_reset, StreamId, ErrorCode}},
+    _StateName,
+    #state{conn = Conn, node = Node, user_streams = Streams} = State
+) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #user_stream{owner = Owner, monitor = MonRef}} ->
+            %% Notify owner of reset
+            StreamRef = {quic_dist_stream, Node, StreamId},
+            Owner ! {quic_dist_stream, StreamRef, {reset, ErrorCode}},
+            %% Demonitor and remove from map
+            erlang:demonitor(MonRef, [flush]),
+            NewStreams = maps:remove(StreamId, Streams),
+            {keep_state, State#state{user_streams = NewStreams}};
+        error ->
+            %% Not a user stream or not known - ignore
+            {keep_state, State}
     end;
 handle_common_event(
     info,
@@ -1327,10 +1492,10 @@ handle_control_data(
 
 %% @private
 %% Handle data received on data streams.
-%% In connected state, forward to input handler for VM delivery.
+%% In connected state, forward to input handler for VM delivery or user stream owner.
 %% During handshake, buffer data (shouldn't happen for data streams).
 handle_stream_data(
-    _StreamId,
+    StreamId,
     Data,
     connected,
     #state{
@@ -1339,12 +1504,19 @@ handle_stream_data(
         recv_oct = RecvOct
     } = State
 ) when is_pid(InputHandler) ->
-    %% Forward data stream content to input handler
-    InputHandler ! {dist_data, Data},
-    {keep_state, State#state{
-        recv_cnt = RecvCnt + 1,
-        recv_oct = RecvOct + byte_size(Data)
-    }};
+    %% Check if this is a user stream
+    case is_user_stream(StreamId, State) of
+        true ->
+            %% User stream - route to owner or acceptor
+            handle_user_stream_data(StreamId, Data, false, State);
+        false ->
+            %% Distribution data stream - forward to input handler
+            InputHandler ! {dist_data, Data},
+            {keep_state, State#state{
+                recv_cnt = RecvCnt + 1,
+                recv_oct = RecvOct + byte_size(Data)
+            }}
+    end;
 handle_stream_data(
     _StreamId,
     Data,
@@ -1389,3 +1561,403 @@ satisfy_waiters([{From, _Ref, Length} | Rest], State, Actions) ->
             %% Put waiter back
             {State1#state{recv_waiters = [{From, _Ref, Length} | Rest]}, lists:reverse(Actions)}
     end.
+
+%%====================================================================
+%% User Stream Support
+%%====================================================================
+
+%% @private
+%% Check if a stream ID is a user stream (above distribution reserved streams).
+%% IMPORTANT: Check based on stream ID's initiator bit, NOT connection role.
+%% QUIC stream IDs encode the initiator: even=client-initiated, odd=server-initiated.
+is_user_stream(StreamId, _State) ->
+    case StreamId band 1 of
+        0 ->
+            %% Client-initiated stream (even IDs: 0, 4, 8, 12, 16, 20...)
+            StreamId >= ?USER_STREAM_THRESHOLD_CLIENT;
+        1 ->
+            %% Server-initiated stream (odd IDs: 1, 5, 9, 13, 17...)
+            StreamId >= ?USER_STREAM_THRESHOLD_SERVER
+    end.
+
+%% @private
+%% Handle open_user_stream call with options.
+handle_open_user_stream(From, Owner, Opts, #state{conn = Conn, user_streams = Streams} = State) ->
+    case quic:open_stream(Conn) of
+        {ok, StreamId} ->
+            %% Verify it's above the threshold
+            case is_user_stream(StreamId, State) of
+                true ->
+                    %% Extract and validate priority
+                    Priority = validate_priority(
+                        proplists:get_value(priority, Opts, ?USER_STREAM_DEFAULT_PRIORITY)
+                    ),
+                    %% Set stream priority (user streams always lower than distribution)
+                    _ = quic:set_stream_priority(Conn, StreamId, Priority, false),
+                    %% Monitor the owner
+                    MonRef = erlang:monitor(process, Owner),
+                    UserStream = #user_stream{
+                        id = StreamId,
+                        owner = Owner,
+                        monitor = MonRef,
+                        priority = Priority
+                    },
+                    NewStreams = maps:put(StreamId, UserStream, Streams),
+                    {keep_state, State#state{user_streams = NewStreams}, [
+                        {reply, From, {ok, StreamId}}
+                    ]};
+                false ->
+                    %% Shouldn't happen but handle gracefully
+                    ?LOG_WARNING(
+                        #{what => user_stream_below_threshold, stream_id => StreamId},
+                        ?QUIC_LOG_META
+                    ),
+                    quic:reset_stream(Conn, StreamId, 0),
+                    {keep_state, State, [{reply, From, {error, stream_below_threshold}}]}
+            end;
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end.
+
+%% @private
+%% Validate and clamp user priority to allowed range.
+validate_priority(P) when P < ?USER_STREAM_MIN_PRIORITY -> ?USER_STREAM_MIN_PRIORITY;
+validate_priority(P) when P > 255 -> 255;
+validate_priority(P) -> P.
+
+%% @private
+%% Handle send_user_data call.
+handle_send_user_data(
+    From, StreamId, Data, Fin, #state{conn = Conn, user_streams = Streams} = State
+) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #user_stream{owner = Owner} = US} ->
+            %% Verify caller is the owner
+            {CallerPid, _} = From,
+            case CallerPid =:= Owner of
+                true ->
+                    DataBin = iolist_to_binary(Data),
+                    case quic:send_data(Conn, StreamId, DataBin, Fin) of
+                        ok ->
+                            NewUS = US#user_stream{send_fin = Fin},
+                            NewStreams = maps:put(StreamId, NewUS, Streams),
+                            {keep_state, State#state{user_streams = NewStreams}, [
+                                {reply, From, ok}
+                            ]};
+                        {error, Reason} ->
+                            {keep_state, State, [{reply, From, {error, Reason}}]}
+                    end;
+                false ->
+                    {keep_state, State, [{reply, From, {error, not_owner}}]}
+            end;
+        error ->
+            {keep_state, State, [{reply, From, {error, unknown_stream}}]}
+    end.
+
+%% @private
+%% Handle close_user_stream call.
+handle_close_user_stream(
+    From, StreamId, #state{conn = Conn, node = Node, user_streams = Streams} = State
+) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #user_stream{owner = Owner, monitor = MonRef, recv_fin = RecvFin} = US} ->
+            %% Verify caller is the owner
+            {CallerPid, _} = From,
+            case CallerPid =:= Owner of
+                true ->
+                    %% Send FIN on the stream
+                    _ = quic:send_data(Conn, StreamId, <<>>, true),
+                    %% Check if stream is now fully closed
+                    case RecvFin of
+                        true ->
+                            %% Both sides closed - cleanup
+                            erlang:demonitor(MonRef, [flush]),
+                            StreamRef = {quic_dist_stream, Node, StreamId},
+                            Owner ! {quic_dist_stream, StreamRef, closed},
+                            NewStreams = maps:remove(StreamId, Streams),
+                            {keep_state, State#state{user_streams = NewStreams}, [
+                                {reply, From, ok}
+                            ]};
+                        false ->
+                            %% Only send side closed - update state
+                            NewUS = US#user_stream{send_fin = true},
+                            NewStreams = maps:put(StreamId, NewUS, Streams),
+                            {keep_state, State#state{user_streams = NewStreams}, [
+                                {reply, From, ok}
+                            ]}
+                    end;
+                false ->
+                    {keep_state, State, [{reply, From, {error, not_owner}}]}
+            end;
+        error ->
+            {keep_state, State, [{reply, From, {error, unknown_stream}}]}
+    end.
+
+%% @private
+%% Handle reset_user_stream call.
+handle_reset_user_stream(
+    From, StreamId, ErrorCode, #state{conn = Conn, node = Node, user_streams = Streams} = State
+) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #user_stream{owner = Owner, monitor = MonRef}} ->
+            %% Verify caller is the owner
+            {CallerPid, _} = From,
+            case CallerPid =:= Owner of
+                true ->
+                    %% Reset the stream
+                    _ = quic:reset_stream(Conn, StreamId, ErrorCode),
+                    %% Notify owner and cleanup
+                    erlang:demonitor(MonRef, [flush]),
+                    StreamRef = {quic_dist_stream, Node, StreamId},
+                    Owner ! {quic_dist_stream, StreamRef, {reset, ErrorCode}},
+                    NewStreams = maps:remove(StreamId, Streams),
+                    {keep_state, State#state{user_streams = NewStreams}, [
+                        {reply, From, ok}
+                    ]};
+                false ->
+                    {keep_state, State, [{reply, From, {error, not_owner}}]}
+            end;
+        error ->
+            {keep_state, State, [{reply, From, {error, unknown_stream}}]}
+    end.
+
+%% @private
+%% Handle accept_user_streams call.
+%% Adds the caller to the acceptor pool (multiple processes can accept streams).
+handle_accept_user_streams(From, Acceptor, #state{acceptor_pool = Pool} = State) ->
+    %% Check if already in pool
+    case lists:keyfind(Acceptor, 1, Pool) of
+        {Acceptor, _} ->
+            %% Already registered
+            {keep_state, State, [{reply, From, ok}]};
+        false ->
+            %% Add to pool with monitor
+            MonRef = erlang:monitor(process, Acceptor),
+            NewPool = [{Acceptor, MonRef} | Pool],
+            {keep_state, State#state{acceptor_pool = NewPool}, [{reply, From, ok}]}
+    end.
+
+%% @private
+%% Handle stop_accepting_streams call.
+%% Removes the caller from the acceptor pool.
+handle_stop_accepting_streams(From, #state{acceptor_pool = Pool} = State) ->
+    {CallerPid, _} = From,
+    case lists:keyfind(CallerPid, 1, Pool) of
+        {CallerPid, MonRef} ->
+            erlang:demonitor(MonRef, [flush]),
+            NewPool = lists:keydelete(CallerPid, 1, Pool),
+            {keep_state, State#state{acceptor_pool = NewPool}, [{reply, From, ok}]};
+        false ->
+            %% Not in pool - ok
+            {keep_state, State, [{reply, From, ok}]}
+    end.
+
+%% @private
+%% Handle controlling_process call - transfer stream ownership to another process.
+handle_controlling_process(From, StreamId, NewOwner, #state{user_streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #user_stream{owner = Owner, monitor = MonRef} = US} ->
+            %% Verify caller is the current owner
+            {CallerPid, _} = From,
+            case CallerPid =:= Owner of
+                true ->
+                    %% Transfer ownership
+                    erlang:demonitor(MonRef, [flush]),
+                    NewMonRef = erlang:monitor(process, NewOwner),
+                    NewUS = US#user_stream{owner = NewOwner, monitor = NewMonRef},
+                    NewStreams = maps:put(StreamId, NewUS, Streams),
+                    {keep_state, State#state{user_streams = NewStreams}, [
+                        {reply, From, ok}
+                    ]};
+                false ->
+                    {keep_state, State, [{reply, From, {error, not_owner}}]}
+            end;
+        error ->
+            {keep_state, State, [{reply, From, {error, unknown_stream}}]}
+    end.
+
+%% @private
+%% Handle list_user_streams call.
+handle_list_user_streams(From, #state{node = Node, user_streams = Streams} = State) ->
+    StreamList = maps:fold(
+        fun(
+            StreamId,
+            #user_stream{
+                owner = Owner, priority = Priority, recv_fin = RecvFin, send_fin = SendFin
+            },
+            Acc
+        ) ->
+            [
+                #{
+                    ref => {quic_dist_stream, Node, StreamId},
+                    node => Node,
+                    stream_id => StreamId,
+                    owner => Owner,
+                    priority => Priority,
+                    recv_fin => RecvFin,
+                    send_fin => SendFin
+                }
+                | Acc
+            ]
+        end,
+        [],
+        Streams
+    ),
+    {keep_state, State, [{reply, From, StreamList}]}.
+
+%% @private
+%% Handle user stream owner process going down.
+handle_user_stream_owner_down(
+    MonRef, Pid, #state{conn = Conn, user_streams = Streams, acceptor_pool = Pool} = State
+) ->
+    %% Check if this is an acceptor from the pool
+    case lists:keyfind(Pid, 1, Pool) of
+        {Pid, MonRef} ->
+            %% Acceptor died - remove from pool
+            %% Also reset any streams owned by this acceptor
+            {StreamsToReset, RemainingStreams} = maps:fold(
+                fun(StreamId, #user_stream{owner = O, monitor = M} = US, {ToReset, Keep}) ->
+                    case O =:= Pid of
+                        true ->
+                            erlang:demonitor(M, [flush]),
+                            {[StreamId | ToReset], Keep};
+                        false ->
+                            {ToReset, maps:put(StreamId, US, Keep)}
+                    end
+                end,
+                {[], #{}},
+                Streams
+            ),
+            %% Reset streams owned by dead acceptor
+            lists:foreach(
+                fun(StreamId) -> _ = quic:reset_stream(Conn, StreamId, 0) end,
+                StreamsToReset
+            ),
+            NewPool = lists:keydelete(Pid, 1, Pool),
+            {keep_state, State#state{acceptor_pool = NewPool, user_streams = RemainingStreams}};
+        false ->
+            %% Check if this is a stream owner
+            case find_stream_by_monitor(MonRef, Streams) of
+                {ok, StreamId, _UserStream} ->
+                    %% Reset the stream since owner died
+                    _ = quic:reset_stream(Conn, StreamId, 0),
+                    NewStreams = maps:remove(StreamId, Streams),
+                    {keep_state, State#state{user_streams = NewStreams}};
+                error ->
+                    %% Unknown monitor - ignore
+                    {keep_state, State}
+            end
+    end.
+
+%% @private
+%% Find a stream by its monitor reference.
+find_stream_by_monitor(MonRef, Streams) ->
+    maps:fold(
+        fun(StreamId, #user_stream{monitor = MRef} = US, Acc) ->
+            case MRef =:= MonRef of
+                true -> {ok, StreamId, US};
+                false -> Acc
+            end
+        end,
+        error,
+        Streams
+    ).
+
+%% @private
+%% Handle data received on a user stream.
+%% For existing streams: forward data to owner.
+%% For new streams: select acceptor from pool (round-robin), auto-assign ownership, deliver data.
+%% If no acceptor available: RESET stream immediately.
+handle_user_stream_data(
+    StreamId,
+    Data,
+    Fin,
+    #state{
+        conn = Conn,
+        node = Node,
+        user_streams = Streams,
+        acceptor_pool = Pool,
+        acceptor_idx = Idx,
+        recv_cnt = RecvCnt,
+        recv_oct = RecvOct
+    } = State
+) ->
+    StreamRef = {quic_dist_stream, Node, StreamId},
+    case maps:find(StreamId, Streams) of
+        {ok, #user_stream{owner = Owner, monitor = MonRef, send_fin = SendFin} = US} ->
+            %% Known stream - forward data to owner
+            Owner ! {quic_dist_stream, StreamRef, {data, Data, Fin}},
+            %% Update recv_fin if FIN received
+            case Fin of
+                true ->
+                    %% Check if stream is now fully closed
+                    case SendFin of
+                        true ->
+                            %% Both sides closed - send closed notification and cleanup
+                            Owner ! {quic_dist_stream, StreamRef, closed},
+                            erlang:demonitor(MonRef, [flush]),
+                            NewStreams = maps:remove(StreamId, Streams),
+                            {keep_state, State#state{
+                                user_streams = NewStreams,
+                                recv_cnt = RecvCnt + 1,
+                                recv_oct = RecvOct + byte_size(Data)
+                            }};
+                        false ->
+                            %% Only recv side closed
+                            NewUS = US#user_stream{recv_fin = true},
+                            NewStreams = maps:put(StreamId, NewUS, Streams),
+                            {keep_state, State#state{
+                                user_streams = NewStreams,
+                                recv_cnt = RecvCnt + 1,
+                                recv_oct = RecvOct + byte_size(Data)
+                            }}
+                    end;
+                false ->
+                    {keep_state, State#state{
+                        recv_cnt = RecvCnt + 1,
+                        recv_oct = RecvOct + byte_size(Data)
+                    }}
+            end;
+        error ->
+            %% New incoming stream - select acceptor from pool (round-robin)
+            case select_acceptor(Pool, Idx) of
+                {ok, AcceptorPid, NewIdx} ->
+                    %% Auto-assign ownership to selected acceptor
+                    OwnerMonRef = erlang:monitor(process, AcceptorPid),
+                    UserStream = #user_stream{
+                        id = StreamId,
+                        owner = AcceptorPid,
+                        monitor = OwnerMonRef,
+                        recv_fin = Fin
+                    },
+                    NewStreams = maps:put(StreamId, UserStream, Streams),
+                    %% Deliver data directly to acceptor (implicit ownership)
+                    AcceptorPid ! {quic_dist_stream, StreamRef, {data, Data, Fin}},
+                    {keep_state, State#state{
+                        user_streams = NewStreams,
+                        acceptor_idx = NewIdx,
+                        recv_cnt = RecvCnt + 1,
+                        recv_oct = RecvOct + byte_size(Data)
+                    }};
+                {error, no_acceptor} ->
+                    %% No acceptor available - RESET stream immediately
+                    ?LOG_WARNING(
+                        #{what => user_stream_no_acceptor, stream_id => StreamId, action => reset},
+                        ?QUIC_LOG_META
+                    ),
+                    _ = quic:reset_stream(Conn, StreamId, ?STREAM_REFUSED),
+                    {keep_state, State#state{
+                        recv_cnt = RecvCnt + 1,
+                        recv_oct = RecvOct + byte_size(Data)
+                    }}
+            end
+    end.
+
+%% @private
+%% Select an acceptor from the pool using round-robin.
+select_acceptor([], _Idx) ->
+    {error, no_acceptor};
+select_acceptor(Pool, Idx) ->
+    Len = length(Pool),
+    {Acceptor, _MonRef} = lists:nth((Idx rem Len) + 1, Pool),
+    {ok, Acceptor, Idx + 1}.
