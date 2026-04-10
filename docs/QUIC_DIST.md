@@ -105,6 +105,156 @@ The control stream (stream 0) has the highest priority (urgency 0), ensuring tha
 - Tick frames for liveness detection bypass congestion
 - Critical signals are not blocked by bulk data transfers
 
+### User Streams API
+
+QUIC distribution supports user-accessible streams, allowing applications to open bidirectional streams over existing distribution connections. This leverages QUIC's multiplexing while keeping distribution traffic separate.
+
+#### Stream ID Allocation
+
+QUIC stream IDs encode the initiator in bit 0:
+- Even IDs (0, 4, 8...): Client-initiated bidirectional
+- Odd IDs (1, 5, 9...): Server-initiated bidirectional
+
+Distribution reserves low stream IDs:
+- Stream 0: Control (handshake, ticks)
+- Streams 4, 8, 12, 16: Client data (4 streams)
+- Streams 1, 5, 9, 13: Server data (4 streams)
+
+User streams start at:
+- Client-initiated: StreamId >= 20 (first available: 20, 24, 28...)
+- Server-initiated: StreamId >= 17 (first available: 17, 21, 25...)
+
+#### API Reference
+
+**Opening and Closing Streams**
+
+```erlang
+%% Open a bidirectional stream to a connected node
+{ok, StreamRef} = quic_dist:open_stream(Node).
+
+%% Open with priority (16-255, lower = higher priority)
+{ok, StreamRef} = quic_dist:open_stream(Node, [{priority, 64}]).
+
+%% Close a stream gracefully (sends FIN)
+ok = quic_dist:close_stream(StreamRef).
+
+%% Reset a stream immediately (notifies peer)
+ok = quic_dist:reset_stream(StreamRef).
+ok = quic_dist:reset_stream(StreamRef, ErrorCode).
+```
+
+**Sending Data**
+
+```erlang
+%% Send data on a user stream
+ok = quic_dist:send(StreamRef, <<"Hello">>).
+
+%% Send data with FIN flag (marks end of stream)
+ok = quic_dist:send(StreamRef, <<"World">>, true).
+```
+
+**Receiving Streams**
+
+Register as an acceptor to receive incoming streams. Incoming streams are assigned to acceptors via round-robin:
+
+```erlang
+%% Join acceptor pool for a node
+ok = quic_dist:accept_streams(Node).
+
+%% Leave acceptor pool
+ok = quic_dist:stop_accepting(Node).
+
+%% Transfer stream ownership to another process
+ok = quic_dist:controlling_process(StreamRef, NewOwner).
+```
+
+**Listing Streams**
+
+```erlang
+%% List all user streams
+Streams = quic_dist:list_streams().
+
+%% List user streams for a specific node
+Streams = quic_dist:list_streams(Node).
+```
+
+Returns a list of maps:
+```erlang
+#{ref => StreamRef,
+  node => 'node@host',
+  stream_id => 20,
+  owner => <0.123.0>,
+  priority => 128,
+  recv_fin => false,
+  send_fin => false}
+```
+
+#### Messages to Owner
+
+Stream owners receive the following messages:
+
+```erlang
+%% Data received (Fin=true means end of stream from peer)
+{quic_dist_stream, StreamRef, {data, Data :: binary(), Fin :: boolean()}}
+
+%% Stream was reset by peer
+{quic_dist_stream, StreamRef, {reset, ErrorCode :: non_neg_integer()}}
+
+%% Stream fully closed (both sides sent FIN)
+{quic_dist_stream, StreamRef, closed}
+```
+
+#### Priority
+
+User streams have priority range 16-255 (lower = higher priority). Distribution reserves priority 0-15 for internal use:
+- Priority 0: Control stream (highest)
+- Priority 1-15: Distribution data streams
+- Priority 16-255: User streams (default: 128)
+
+#### Example: Request/Response
+
+```erlang
+%% Node A: Send request
+{ok, Stream} = quic_dist:open_stream('nodeB@host'),
+ok = quic_dist:send(Stream, <<"GET /data">>, true),
+receive
+    {quic_dist_stream, Stream, {data, Response, true}} ->
+        io:format("Response: ~p~n", [Response])
+end.
+
+%% Node B: Accept and respond
+ok = quic_dist:accept_streams('nodeA@host'),
+receive
+    {quic_dist_stream, Stream, {data, Request, true}} ->
+        Response = handle_request(Request),
+        quic_dist:send(Stream, Response, true)
+end.
+```
+
+#### Example: Acceptor Pool
+
+```erlang
+%% Start multiple acceptors for load distribution
+start_acceptor_pool(Node, N) ->
+    [spawn(fun() -> acceptor_loop(Node) end) || _ <- lists:seq(1, N)].
+
+acceptor_loop(Node) ->
+    ok = quic_dist:accept_streams(Node),
+    receive
+        {quic_dist_stream, Stream, {data, Data, Fin}} ->
+            handle_request(Stream, Data, Fin),
+            acceptor_loop(Node)
+    end.
+```
+
+#### Error Handling
+
+When no acceptor is available for an incoming stream, the stream is immediately reset with error code `0x100` (`STREAM_REFUSED`). The peer's owner receives:
+
+```erlang
+{quic_dist_stream, StreamRef, {reset, 16#100}}
+```
+
 ### Message Framing
 
 During handshake (stream 0):

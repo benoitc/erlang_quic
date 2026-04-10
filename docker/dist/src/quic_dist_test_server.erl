@@ -18,7 +18,8 @@
     broadcast_test/0,
     get_stats/0,
     echo/1,
-    echo_data/1
+    echo_data/1,
+    start_stream_acceptor/1
 ]).
 
 %% gen_server callbacks
@@ -236,13 +237,80 @@ get_cluster_nodes() ->
 
 run_all_tests() ->
     Results1 = test_basic_rpc(),
+    Results3 = test_throughput_benchmark(),
     Results2 = test_large_messages(),
+    Results4 = test_user_streams(),
 
     %% Log individual results
     log_test_results(basic, Results1),
     log_test_results(large_msg, Results2),
+    log_test_results(user_stream, Results4),
 
-    [{basic, Results1}, {large_msg, Results2}].
+    [{basic, Results1}, {throughput, Results3}, {large_msg, Results2}, {user_stream, Results4}].
+
+%% Test 3: Throughput benchmark
+test_throughput_benchmark() ->
+    Nodes = nodes(),
+    case Nodes of
+        [] -> [];
+        [TargetNode | _] ->
+            log_event(throughput_start, #{target => TargetNode}),
+            Results = run_throughput_bench(TargetNode),
+            log_event(throughput_complete, Results),
+            [{TargetNode, {ok, Results}}]
+    end.
+
+run_throughput_bench(TargetNode) ->
+    %% Spawn echo server on target
+    ServerPid = spawn(TargetNode, fun() -> bench_echo_loop() end),
+
+    Sizes = [64, 256, 1024, 4096, 16384, 65536],
+    Iterations = 2000,
+
+    Results = lists:map(fun(Size) ->
+        Data = crypto:strong_rand_bytes(Size),
+
+        %% Warmup
+        lists:foreach(fun(_) ->
+            Ref = make_ref(),
+            ServerPid ! {echo, self(), Ref, Data},
+            receive {echo_reply, Ref, _} -> ok after 5000 -> ok end
+        end, lists:seq(1, 50)),
+
+        %% Benchmark
+        Start = erlang:monotonic_time(microsecond),
+        lists:foreach(fun(_) ->
+            Ref = make_ref(),
+            ServerPid ! {echo, self(), Ref, Data},
+            receive {echo_reply, Ref, _} -> ok after 5000 -> ok end
+        end, lists:seq(1, Iterations)),
+        Elapsed = erlang:monotonic_time(microsecond) - Start,
+
+        Throughput = Iterations / (Elapsed / 1000000),
+        Bandwidth = Throughput * Size / 1048576,
+        AvgLatency = Elapsed / Iterations,
+
+        log_event(throughput_result, #{
+            size => Size,
+            throughput => round(Throughput),
+            bandwidth_mbps => round(Bandwidth * 100) / 100,
+            latency_us => round(AvgLatency * 10) / 10
+        }),
+
+        {Size, Throughput, Bandwidth, AvgLatency}
+    end, Sizes),
+
+    ServerPid ! stop,
+    Results.
+
+bench_echo_loop() ->
+    receive
+        {echo, From, Ref, Data} ->
+            From ! {echo_reply, Ref, Data},
+            bench_echo_loop();
+        stop ->
+            ok
+    end.
 
 %% Test 1: Basic RPC to all connected nodes
 test_basic_rpc() ->
@@ -301,6 +369,86 @@ count_results(AllResults) ->
             end
         end, {S, F}, Results)
     end, {0, 0}, AllResults).
+
+%% Test 4: User streams over QUIC distribution
+test_user_streams() ->
+    Nodes = nodes(),
+    [{Node, user_stream_test(Node)} || Node <- Nodes].
+
+user_stream_test(Node) ->
+    %% Start acceptor on remote node (pass our node name)
+    case rpc:call(Node, ?MODULE, start_stream_acceptor, [node()], 5000) of
+        {ok, _AcceptorPid} ->
+            %% Wait for acceptor to be ready
+            timer:sleep(100),
+            run_user_stream_test(Node);
+        {badrpc, Reason} ->
+            {error, {acceptor_start_failed, Reason}};
+        Error ->
+            {error, {acceptor_start_failed, Error}}
+    end.
+
+run_user_stream_test(Node) ->
+    Start = erlang:monotonic_time(millisecond),
+    case quic_dist:open_stream(Node) of
+        {ok, Stream} ->
+            TestData = <<"user_stream_test_", (crypto:strong_rand_bytes(32))/binary>>,
+            case quic_dist:send(Stream, TestData, true) of
+                ok ->
+                    %% Wait for echo response
+                    receive
+                        {quic_dist_stream, Stream, {data, Response, true}} ->
+                            quic_dist:close_stream(Stream),
+                            case Response of
+                                TestData ->
+                                    Latency = erlang:monotonic_time(millisecond) - Start,
+                                    {ok, Latency};
+                                _ ->
+                                    {error, data_mismatch}
+                            end;
+                        {quic_dist_stream, Stream, {reset, Code}} ->
+                            {error, {stream_reset, Code}}
+                    after 10000 ->
+                        quic_dist:close_stream(Stream),
+                        {error, timeout}
+                    end;
+                {error, Reason} ->
+                    quic_dist:close_stream(Stream),
+                    {error, {send_failed, Reason}}
+            end;
+        {error, Reason} ->
+            {error, {open_failed, Reason}}
+    end.
+
+%% Start a stream acceptor on this node (called via RPC)
+start_stream_acceptor(CallerNode) ->
+    Pid = spawn(fun() -> stream_acceptor_loop(CallerNode) end),
+    {ok, Pid}.
+
+stream_acceptor_loop(CallerNode) ->
+    ok = quic_dist:accept_streams(CallerNode),
+    stream_acceptor_receive().
+
+stream_acceptor_receive() ->
+    receive
+        {quic_dist_stream, Stream, {data, Data, true}} ->
+            %% Echo data back
+            quic_dist:send(Stream, Data, true),
+            stream_acceptor_receive();
+        {quic_dist_stream, Stream, {data, Data, false}} ->
+            %% Accumulate partial data (simplified: just echo immediately)
+            quic_dist:send(Stream, Data, false),
+            stream_acceptor_receive();
+        {quic_dist_stream, _Stream, closed} ->
+            stream_acceptor_receive();
+        {quic_dist_stream, _Stream, {reset, _Code}} ->
+            stream_acceptor_receive();
+        stop ->
+            ok
+    after 60000 ->
+        %% Timeout after 1 minute of inactivity
+        ok
+    end.
 
 log_event(Event, Data) ->
     Timestamp = calendar:system_time_to_rfc3339(erlang:system_time(millisecond), [{unit, millisecond}]),
