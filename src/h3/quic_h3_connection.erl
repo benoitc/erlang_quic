@@ -737,13 +737,20 @@ process_control_frames(Data, State) ->
                 {error, Reason} ->
                     {error, Reason}
             end;
+        {error, {frame_error, FrameType, Reason}} ->
+            %% Malformed frame - connection error (RFC 9114 Section 7)
+            {error,
+                {connection_error, ?H3_FRAME_ERROR,
+                    iolist_to_binary(io_lib:format("malformed ~p: ~p", [FrameType, Reason]))}};
         {more, _} ->
             {ok, Data, State}
     end.
 
 handle_control_frame({settings, Settings}, #state{settings_received = false} = State) ->
     %% First frame on control stream must be SETTINGS
-    {ok, State#state{
+    %% Apply peer settings to QPACK encoder (RFC 9114 Section 7.2.4.1)
+    State1 = apply_peer_settings(Settings, State),
+    {ok, State1#state{
         peer_settings = Settings,
         settings_received = true
     }};
@@ -917,6 +924,11 @@ process_request_frames(StreamId, Data, Fin, Stream, #state{quic_conn = QuicConn}
                 {error, Reason} ->
                     {error, Reason}
             end;
+        {error, {frame_error, FrameType, Reason}} ->
+            %% Malformed frame - connection error (RFC 9114 Section 7)
+            {error,
+                {connection_error, ?H3_FRAME_ERROR,
+                    iolist_to_binary(io_lib:format("malformed ~p: ~p", [FrameType, Reason]))}};
         {more, _} ->
             {ok, Data, Stream, State}
     end.
@@ -932,25 +944,34 @@ handle_request_frame(
         {{ok, Headers}, Decoder1} ->
             %% Send Section Acknowledgment on decoder stream (RFC 9204 Section 4.4)
             State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
-            Stream1 = update_stream_with_headers(Headers, Stream),
-            Stream2 =
-                case Fin of
-                    true -> Stream1#h3_stream{frame_state = complete, state = half_closed_remote};
-                    false -> Stream1#h3_stream{frame_state = expecting_data}
-                end,
-            %% Notify owner and optionally call handler
-            case Role of
-                server ->
-                    Method = Stream2#h3_stream.method,
-                    Path = Stream2#h3_stream.path,
-                    Owner ! {quic_h3, self(), {request, StreamId, Method, Path, Headers}},
-                    %% Call handler if set
-                    invoke_handler(self(), StreamId, Method, Path, Headers);
-                client ->
-                    Status = Stream2#h3_stream.status,
-                    Owner ! {quic_h3, self(), {response, StreamId, Status, Headers}}
-            end,
-            {ok, Stream2, State1};
+            case update_stream_with_headers(Headers, Stream) of
+                {ok, Stream1} ->
+                    Stream2 =
+                        case Fin of
+                            true ->
+                                Stream1#h3_stream{
+                                    frame_state = complete, state = half_closed_remote
+                                };
+                            false ->
+                                Stream1#h3_stream{frame_state = expecting_data}
+                        end,
+                    %% Notify owner and optionally call handler
+                    case Role of
+                        server ->
+                            Method = Stream2#h3_stream.method,
+                            Path = Stream2#h3_stream.path,
+                            Owner ! {quic_h3, self(), {request, StreamId, Method, Path, Headers}},
+                            %% Call handler if set
+                            invoke_handler(self(), StreamId, Method, Path, Headers);
+                        client ->
+                            Status = Stream2#h3_stream.status,
+                            Owner ! {quic_h3, self(), {response, StreamId, Status, Headers}}
+                    end,
+                    {ok, Stream2, State1};
+                {error, {invalid_field, _Field, _Value}} ->
+                    %% Malformed header field - stream reset (RFC 9114 Section 4.1.2)
+                    {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}}
+            end;
         {{blocked, RIC}, Decoder1} ->
             %% Stream blocked waiting for encoder instructions (RFC 9204 Section 2.2.2)
             %% Buffer the stream and wait for more encoder data
@@ -1071,28 +1092,42 @@ handle_request_frame(_StreamId, _Frame, _Fin, Stream, State) ->
     %% Unexpected frame in current state - skip for now
     {ok, Stream, State}.
 
+%% Update stream with headers, validating pseudo-headers and parsing values safely
+%% Returns {ok, Stream} | {error, Reason}
 update_stream_with_headers(Headers, Stream) ->
-    lists:foldl(
-        fun
-            ({<<":method">>, Value}, S) ->
-                S#h3_stream{method = Value};
-            ({<<":path">>, Value}, S) ->
-                S#h3_stream{path = Value};
-            ({<<":scheme">>, Value}, S) ->
-                S#h3_stream{scheme = Value};
-            ({<<":authority">>, Value}, S) ->
-                S#h3_stream{authority = Value};
-            ({<<":status">>, Value}, S) ->
-                Status = binary_to_integer(Value),
-                S#h3_stream{status = Status};
-            ({<<"content-length">>, Value}, S) ->
-                S#h3_stream{content_length = binary_to_integer(Value)};
-            (_, S) ->
-                S
-        end,
-        Stream#h3_stream{headers = Headers},
-        Headers
-    ).
+    try
+        {ok, do_update_stream_with_headers(Headers, Stream#h3_stream{headers = Headers})}
+    catch
+        throw:{header_error, Reason} -> {error, Reason}
+    end.
+
+do_update_stream_with_headers([], Stream) ->
+    Stream;
+do_update_stream_with_headers([{<<":method">>, Value} | Rest], Stream) ->
+    do_update_stream_with_headers(Rest, Stream#h3_stream{method = Value});
+do_update_stream_with_headers([{<<":path">>, Value} | Rest], Stream) ->
+    do_update_stream_with_headers(Rest, Stream#h3_stream{path = Value});
+do_update_stream_with_headers([{<<":scheme">>, Value} | Rest], Stream) ->
+    do_update_stream_with_headers(Rest, Stream#h3_stream{scheme = Value});
+do_update_stream_with_headers([{<<":authority">>, Value} | Rest], Stream) ->
+    do_update_stream_with_headers(Rest, Stream#h3_stream{authority = Value});
+do_update_stream_with_headers([{<<":status">>, Value} | Rest], Stream) ->
+    Status = safe_binary_to_integer(Value, <<":status">>),
+    do_update_stream_with_headers(Rest, Stream#h3_stream{status = Status});
+do_update_stream_with_headers([{<<"content-length">>, Value} | Rest], Stream) ->
+    CL = safe_binary_to_integer(Value, <<"content-length">>),
+    do_update_stream_with_headers(Rest, Stream#h3_stream{content_length = CL});
+do_update_stream_with_headers([_ | Rest], Stream) ->
+    do_update_stream_with_headers(Rest, Stream).
+
+%% Safe binary to integer conversion with proper error handling
+safe_binary_to_integer(Bin, FieldName) ->
+    try binary_to_integer(Bin) of
+        N when N >= 0 -> N;
+        _ -> throw({header_error, {invalid_field, FieldName, Bin}})
+    catch
+        error:badarg -> throw({header_error, {invalid_field, FieldName, Bin}})
+    end.
 
 handle_stream_closed(
     StreamId,
@@ -1139,7 +1174,8 @@ send_request(
 ) ->
     case quic:open_stream(QuicConn) of
         {ok, StreamId} ->
-            {Encoded, Encoder1} = quic_qpack:encode(Headers, Encoder),
+            %% Use encode/3 with StreamId for section ack tracking
+            {Encoded, Encoder1} = quic_qpack:encode(Headers, StreamId, Encoder),
             HeadersFrame = quic_h3_frame:encode_headers(Encoded),
             case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
                 ok ->
@@ -1178,7 +1214,8 @@ do_send_response(
         {ok, Stream} ->
             StatusHeader = {<<":status">>, integer_to_binary(Status)},
             AllHeaders = [StatusHeader | Headers],
-            {Encoded, Encoder1} = quic_qpack:encode(AllHeaders, Encoder),
+            %% Use encode/3 with StreamId for section ack tracking
+            {Encoded, Encoder1} = quic_qpack:encode(AllHeaders, StreamId, Encoder),
             HeadersFrame = quic_h3_frame:encode_headers(Encoded),
             case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
                 ok ->
@@ -1226,7 +1263,8 @@ do_send_trailers(
 ) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
-            {Encoded, Encoder1} = quic_qpack:encode(Trailers, Encoder),
+            %% Use encode/3 with StreamId for section ack tracking
+            {Encoded, Encoder1} = quic_qpack:encode(Trailers, StreamId, Encoder),
             TrailersFrame = quic_h3_frame:encode_headers(Encoded),
             case quic:send_data(QuicConn, StreamId, TrailersFrame, true) of
                 ok ->
@@ -1301,6 +1339,25 @@ send_section_ack(
 send_section_ack(_StreamId, State) ->
     %% Decoder stream not yet established
     State.
+
+%% Apply peer SETTINGS to QPACK encoder and connection state (RFC 9114 Section 7.2.4.1)
+apply_peer_settings(Settings, #state{qpack_encoder = Encoder} = State) ->
+    %% Configure QPACK encoder with peer's max table capacity
+    %% The encoder must not use more than this capacity
+    PeerMaxTableCapacity = maps:get(qpack_max_table_capacity, Settings, 0),
+    Encoder1 =
+        case PeerMaxTableCapacity > 0 of
+            true ->
+                %% Set encoder's dynamic table capacity to peer's limit
+                %% This generates a Set Dynamic Table Capacity instruction
+                quic_qpack:set_dynamic_capacity(PeerMaxTableCapacity, Encoder);
+            false ->
+                %% Peer doesn't support dynamic table - disable it
+                quic_qpack:set_dynamic_capacity(0, Encoder)
+        end,
+    %% Send any encoder instructions generated by capacity change
+    State1 = State#state{qpack_encoder = Encoder1},
+    send_encoder_instructions(State1).
 
 maybe_transition_connected(#state{settings_received = true} = State) ->
     {next_state, connected, State};

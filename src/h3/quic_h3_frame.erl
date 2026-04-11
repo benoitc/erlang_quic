@@ -136,39 +136,51 @@ encode_frame(Type, Payload) ->
 %%====================================================================
 
 %% @doc Decode an HTTP/3 frame from binary.
-%% Returns {ok, Frame, Rest} | {more, N}.
--spec decode(binary()) -> {ok, frame(), binary()} | {more, non_neg_integer()}.
+%% Returns {ok, Frame, Rest} | {error, Reason} | {more, N}.
+-spec decode(binary()) ->
+    {ok, frame(), binary()} | {error, term()} | {more, non_neg_integer()}.
 decode(Data) when byte_size(Data) < 2 ->
     %% Need at least 2 bytes for type and length
     {more, 2 - byte_size(Data)};
 decode(Data) ->
+    case decode_type_and_length(Data) of
+        {ok, Type, Length, Rest} ->
+            decode_with_payload(Type, Length, Rest);
+        Other ->
+            Other
+    end.
+
+%% Internal: decode frame type and length varints
+-spec decode_type_and_length(binary()) ->
+    {ok, non_neg_integer(), non_neg_integer(), binary()} | {more, non_neg_integer()}.
+decode_type_and_length(Data) ->
     try quic_varint:decode(Data) of
         {Type, Rest1} ->
             try quic_varint:decode(Rest1) of
-                {Length, Rest2} ->
-                    case byte_size(Rest2) >= Length of
-                        true ->
-                            <<Payload:Length/binary, Rest3/binary>> = Rest2,
-                            Frame = decode_frame_payload(Type, Payload),
-                            {ok, Frame, Rest3};
-                        false ->
-                            {more, Length - byte_size(Rest2)}
-                    end
+                {Length, Rest2} -> {ok, Type, Length, Rest2}
             catch
-                error:{incomplete, _} ->
-                    {more, 1};
-                error:badarg ->
-                    {more, 1}
+                error:{incomplete, _} -> {more, 1};
+                error:badarg -> {more, 1}
             end
     catch
-        error:{incomplete, _} ->
-            {more, 1};
-        error:badarg ->
-            {more, 1}
+        error:{incomplete, _} -> {more, 1};
+        error:badarg -> {more, 1}
     end.
 
+%% Internal: decode frame payload given type and length
+-spec decode_with_payload(non_neg_integer(), non_neg_integer(), binary()) ->
+    {ok, frame(), binary()} | {error, term()} | {more, non_neg_integer()}.
+decode_with_payload(Type, Length, Data) when byte_size(Data) >= Length ->
+    <<Payload:Length/binary, Rest/binary>> = Data,
+    case decode_frame_payload(Type, Payload) of
+        {error, _} = Err -> Err;
+        Frame -> {ok, Frame, Rest}
+    end;
+decode_with_payload(_Type, Length, Data) ->
+    {more, Length - byte_size(Data)}.
+
 %% @doc Decode all frames from binary buffer.
--spec decode_all(binary()) -> {ok, [frame()], binary()}.
+-spec decode_all(binary()) -> {ok, [frame()], binary()} | {error, term()}.
 decode_all(Data) ->
     decode_all(Data, []).
 
@@ -178,44 +190,49 @@ decode_all(Data, Acc) ->
     case decode(Data) of
         {ok, Frame, Rest} ->
             decode_all(Rest, [Frame | Acc]);
+        {error, _} = Err ->
+            Err;
         {more, _} ->
             {ok, lists:reverse(Acc), Data}
     end.
 
 %% Internal: decode frame payload by type
--spec decode_frame_payload(non_neg_integer(), binary()) -> frame().
+-spec decode_frame_payload(non_neg_integer(), binary()) -> frame() | {error, term()}.
 decode_frame_payload(?H3_FRAME_DATA, Payload) ->
     {data, Payload};
 decode_frame_payload(?H3_FRAME_HEADERS, Payload) ->
     {headers, Payload};
 decode_frame_payload(?H3_FRAME_CANCEL_PUSH, Payload) ->
     try quic_varint:decode(Payload) of
-        {PushId, _} -> {cancel_push, PushId}
+        {PushId, <<>>} -> {cancel_push, PushId};
+        {_PushId, _Extra} -> {error, {frame_error, cancel_push, extra_data}}
     catch
-        _:_ -> {cancel_push, 0}
+        _:_ -> {error, {frame_error, cancel_push, malformed_varint}}
     end;
 decode_frame_payload(?H3_FRAME_SETTINGS, Payload) ->
     case decode_settings_payload(Payload) of
         {ok, Settings} -> {settings, Settings};
-        {error, _} -> {settings, #{}}
+        {error, Reason} -> {error, {frame_error, settings, Reason}}
     end;
 decode_frame_payload(?H3_FRAME_PUSH_PROMISE, Payload) ->
     try quic_varint:decode(Payload) of
         {PushId, HeaderBlock} -> {push_promise, PushId, HeaderBlock}
     catch
-        _:_ -> {push_promise, 0, <<>>}
+        _:_ -> {error, {frame_error, push_promise, malformed_varint}}
     end;
 decode_frame_payload(?H3_FRAME_GOAWAY, Payload) ->
     try quic_varint:decode(Payload) of
-        {StreamId, _} -> {goaway, StreamId}
+        {StreamId, <<>>} -> {goaway, StreamId};
+        {_StreamId, _Extra} -> {error, {frame_error, goaway, extra_data}}
     catch
-        _:_ -> {goaway, 0}
+        _:_ -> {error, {frame_error, goaway, malformed_varint}}
     end;
 decode_frame_payload(?H3_FRAME_MAX_PUSH_ID, Payload) ->
     try quic_varint:decode(Payload) of
-        {PushId, _} -> {max_push_id, PushId}
+        {PushId, <<>>} -> {max_push_id, PushId};
+        {_PushId, _Extra} -> {error, {frame_error, max_push_id, extra_data}}
     catch
-        _:_ -> {max_push_id, 0}
+        _:_ -> {error, {frame_error, max_push_id, malformed_varint}}
     end;
 decode_frame_payload(Type, Payload) ->
     %% Unknown or reserved frame type
@@ -281,7 +298,11 @@ decode_settings_pairs(Data, Acc) ->
     {Id, Rest1} = quic_varint:decode(Data),
     {Value, Rest2} = quic_varint:decode(Rest1),
     Key = id_to_setting(Id),
-    decode_settings_pairs(Rest2, Acc#{Key => Value}).
+    %% RFC 9114 Section 7.2.4: duplicate setting identifiers MUST be treated as error
+    case maps:is_key(Key, Acc) of
+        true -> throw({duplicate_setting, Key});
+        false -> decode_settings_pairs(Rest2, Acc#{Key => Value})
+    end.
 
 -spec setting_to_id(atom() | non_neg_integer()) -> non_neg_integer().
 setting_to_id(qpack_max_table_capacity) -> ?H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY;
