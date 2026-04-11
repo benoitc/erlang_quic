@@ -1,0 +1,200 @@
+%%% -*- erlang -*-
+%%%
+%%% HTTP/3 protocol constants and records (RFC 9114)
+%%%
+%%% Copyright (c) 2024-2026 Benoit Chesneau
+%%% Apache License 2.0
+
+-ifndef(QUIC_H3_HRL).
+-define(QUIC_H3_HRL, true).
+
+%%====================================================================
+%% HTTP/3 Frame Types (RFC 9114 Section 7.2)
+%%====================================================================
+
+-define(H3_FRAME_DATA, 16#00).
+-define(H3_FRAME_HEADERS, 16#01).
+-define(H3_FRAME_CANCEL_PUSH, 16#03).
+-define(H3_FRAME_SETTINGS, 16#04).
+-define(H3_FRAME_PUSH_PROMISE, 16#05).
+-define(H3_FRAME_GOAWAY, 16#07).
+-define(H3_FRAME_MAX_PUSH_ID, 16#0D).
+
+%% Reserved frame types (RFC 9114 Section 7.2.8)
+%% 0x1f * N + 0x21 for any non-negative integer N
+
+%%====================================================================
+%% HTTP/3 Unidirectional Stream Types (RFC 9114 Section 6.2)
+%%====================================================================
+
+-define(H3_STREAM_CONTROL, 16#00).
+-define(H3_STREAM_PUSH, 16#01).
+-define(H3_STREAM_QPACK_ENCODER, 16#02).
+-define(H3_STREAM_QPACK_DECODER, 16#03).
+
+%%====================================================================
+%% HTTP/3 Settings (RFC 9114 Section 7.2.4.1)
+%%====================================================================
+
+-define(H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY, 16#01).
+-define(H3_SETTINGS_MAX_FIELD_SECTION_SIZE, 16#06).
+-define(H3_SETTINGS_QPACK_BLOCKED_STREAMS, 16#07).
+-define(H3_SETTINGS_ENABLE_CONNECT_PROTOCOL, 16#08).
+
+%% Reserved settings (RFC 9114 Section 7.2.4.1)
+%% 0x1f * N + 0x21 for any non-negative integer N
+
+%%====================================================================
+%% HTTP/3 Default Settings Values
+%%====================================================================
+
+-define(H3_DEFAULT_QPACK_MAX_TABLE_CAPACITY, 0).
+-define(H3_DEFAULT_MAX_FIELD_SECTION_SIZE, 65536).
+-define(H3_DEFAULT_QPACK_BLOCKED_STREAMS, 0).
+
+%%====================================================================
+%% QPACK Error Codes (RFC 9204 Section 8.2)
+%%====================================================================
+
+-define(H3_QPACK_DECOMPRESSION_FAILED, 16#200).
+-define(H3_QPACK_ENCODER_STREAM_ERROR, 16#201).
+-define(H3_QPACK_DECODER_STREAM_ERROR, 16#202).
+
+%%====================================================================
+%% HTTP/3 Stream State
+%%====================================================================
+
+-record(h3_stream, {
+    %% Stream ID
+    id :: non_neg_integer(),
+
+    %% Stream type
+    type :: request | push,
+
+    %% Stream state
+    state :: idle | open | half_closed_local | half_closed_remote | closed,
+
+    %% For request streams: method, path, and headers
+    method :: binary() | undefined,
+    path :: binary() | undefined,
+    scheme :: binary() | undefined,
+    authority :: binary() | undefined,
+
+    %% Headers (request or response)
+    headers = [] :: [{binary(), binary()}],
+    trailers = [] :: [{binary(), binary()}],
+
+    %% Response status (for client)
+    status :: non_neg_integer() | undefined,
+
+    %% Body data buffer
+    body = <<>> :: binary(),
+
+    %% Content-Length tracking
+    content_length :: non_neg_integer() | undefined,
+    body_received = 0 :: non_neg_integer(),
+
+    %% Frame parsing state
+    %% expecting_headers: waiting for HEADERS frame
+    %% expecting_data: received HEADERS, waiting for DATA/trailers
+    %% expecting_trailers: received DATA with fin, expecting trailers
+    %% complete: stream finished
+    frame_state = expecting_headers ::
+        expecting_headers | expecting_data | expecting_trailers | complete
+}).
+
+%%====================================================================
+%% HTTP/3 Connection State
+%%====================================================================
+
+-record(h3_conn, {
+    %% Underlying QUIC connection reference
+    quic_conn :: reference(),
+
+    %% Role: client or server
+    role :: client | server,
+
+    %% Connection state
+    state = connecting :: connecting | connected | goaway_sent | goaway_received | closing,
+
+    %% Critical unidirectional streams (RFC 9114 Section 6.2)
+    %% Local streams (we opened)
+    local_control_stream :: non_neg_integer() | undefined,
+    local_encoder_stream :: non_neg_integer() | undefined,
+    local_decoder_stream :: non_neg_integer() | undefined,
+
+    %% Remote streams (peer opened)
+    peer_control_stream :: non_neg_integer() | undefined,
+    peer_encoder_stream :: non_neg_integer() | undefined,
+    peer_decoder_stream :: non_neg_integer() | undefined,
+
+    %% QPACK state
+    qpack_encoder :: quic_qpack:state(),
+    qpack_decoder :: quic_qpack:state(),
+
+    %% Settings (local and peer)
+    local_settings :: map(),
+    peer_settings :: map() | undefined,
+    settings_sent = false :: boolean(),
+    settings_received = false :: boolean(),
+
+    %% Push state (server push)
+    max_push_id :: non_neg_integer() | undefined,
+    next_push_id = 0 :: non_neg_integer(),
+
+    %% GOAWAY state
+    goaway_id :: non_neg_integer() | undefined,
+
+    %% Request streams (bidirectional)
+    %% Maps StreamId -> stream state
+    streams = #{} :: #{non_neg_integer() => #h3_stream{}},
+
+    %% Next local stream ID for requests (client: 0, 4, 8, ...; server: 1, 5, 9, ...)
+    next_request_stream_id :: non_neg_integer(),
+
+    %% Owner process
+    owner :: pid(),
+
+    %% Pending data buffers for partial frame decoding per stream
+    stream_buffers = #{} :: #{non_neg_integer() => binary()}
+}).
+
+%%====================================================================
+%% HTTP/3 Frame Records
+%%====================================================================
+
+-record(h3_frame_data, {
+    payload :: binary()
+}).
+
+-record(h3_frame_headers, {
+    header_block :: binary()
+}).
+
+-record(h3_frame_cancel_push, {
+    push_id :: non_neg_integer()
+}).
+
+-record(h3_frame_settings, {
+    settings :: map()
+}).
+
+-record(h3_frame_push_promise, {
+    push_id :: non_neg_integer(),
+    header_block :: binary()
+}).
+
+-record(h3_frame_goaway, {
+    stream_id :: non_neg_integer()
+}).
+
+-record(h3_frame_max_push_id, {
+    push_id :: non_neg_integer()
+}).
+
+-record(h3_frame_unknown, {
+    type :: non_neg_integer(),
+    payload :: binary()
+}).
+
+-endif.

@@ -1,0 +1,314 @@
+%%% -*- erlang -*-
+%%%
+%%% HTTP/3 frame encoding and decoding (RFC 9114)
+%%%
+%%% Copyright (c) 2024-2026 Benoit Chesneau
+%%% Apache License 2.0
+%%%
+%%% @doc HTTP/3 frame encoding and decoding.
+%%%
+%%% HTTP/3 frames use QUIC variable-length integer encoding for
+%%% frame type and length fields.
+%%% @end
+
+-module(quic_h3_frame).
+
+-export([
+    %% Frame encoding
+    encode/1,
+    encode_data/1,
+    encode_headers/1,
+    encode_settings/1,
+    encode_goaway/1,
+    encode_max_push_id/1,
+    encode_cancel_push/1,
+    encode_push_promise/2,
+    %% Frame decoding
+    decode/1,
+    decode_all/1,
+    decode_stream_type/1,
+    %% Settings helpers
+    default_settings/0,
+    encode_settings_payload/1,
+    decode_settings_payload/1,
+    %% Stream type encoding
+    encode_stream_type/1,
+    %% Validation
+    is_reserved_frame_type/1,
+    is_reserved_setting/1
+]).
+
+-include("quic_h3.hrl").
+
+-type frame() ::
+    {data, binary()}
+    | {headers, binary()}
+    | {cancel_push, non_neg_integer()}
+    | {settings, map()}
+    | {push_promise, non_neg_integer(), binary()}
+    | {goaway, non_neg_integer()}
+    | {max_push_id, non_neg_integer()}
+    | {unknown, non_neg_integer(), binary()}.
+
+-export_type([frame/0]).
+
+%%====================================================================
+%% Frame Encoding
+%%====================================================================
+
+%% @doc Encode an HTTP/3 frame to binary.
+-spec encode(frame()) -> binary().
+encode({data, Payload}) ->
+    encode_data(Payload);
+encode({headers, Payload}) ->
+    encode_headers(Payload);
+encode({cancel_push, PushId}) ->
+    encode_cancel_push(PushId);
+encode({settings, Settings}) ->
+    encode_settings(Settings);
+encode({push_promise, PushId, HeaderBlock}) ->
+    encode_push_promise(PushId, HeaderBlock);
+encode({goaway, StreamId}) ->
+    encode_goaway(StreamId);
+encode({max_push_id, PushId}) ->
+    encode_max_push_id(PushId).
+
+%% @doc Encode a DATA frame.
+-spec encode_data(binary()) -> binary().
+encode_data(Payload) ->
+    encode_frame(?H3_FRAME_DATA, Payload).
+
+%% @doc Encode a HEADERS frame.
+-spec encode_headers(binary()) -> binary().
+encode_headers(HeaderBlock) ->
+    encode_frame(?H3_FRAME_HEADERS, HeaderBlock).
+
+%% @doc Encode a SETTINGS frame.
+-spec encode_settings(map()) -> binary().
+encode_settings(Settings) ->
+    Payload = encode_settings_payload(Settings),
+    encode_frame(?H3_FRAME_SETTINGS, Payload).
+
+%% @doc Encode a GOAWAY frame.
+-spec encode_goaway(non_neg_integer()) -> binary().
+encode_goaway(StreamId) ->
+    encode_frame(?H3_FRAME_GOAWAY, quic_varint:encode(StreamId)).
+
+%% @doc Encode a MAX_PUSH_ID frame.
+-spec encode_max_push_id(non_neg_integer()) -> binary().
+encode_max_push_id(PushId) ->
+    encode_frame(?H3_FRAME_MAX_PUSH_ID, quic_varint:encode(PushId)).
+
+%% @doc Encode a CANCEL_PUSH frame.
+-spec encode_cancel_push(non_neg_integer()) -> binary().
+encode_cancel_push(PushId) ->
+    encode_frame(?H3_FRAME_CANCEL_PUSH, quic_varint:encode(PushId)).
+
+%% @doc Encode a PUSH_PROMISE frame.
+-spec encode_push_promise(non_neg_integer(), binary()) -> binary().
+encode_push_promise(PushId, HeaderBlock) ->
+    PushIdEnc = quic_varint:encode(PushId),
+    encode_frame(?H3_FRAME_PUSH_PROMISE, <<PushIdEnc/binary, HeaderBlock/binary>>).
+
+%% @doc Encode stream type for unidirectional streams.
+-spec encode_stream_type(control | qpack_encoder | qpack_decoder | push | non_neg_integer()) ->
+    binary().
+encode_stream_type(control) ->
+    quic_varint:encode(?H3_STREAM_CONTROL);
+encode_stream_type(qpack_encoder) ->
+    quic_varint:encode(?H3_STREAM_QPACK_ENCODER);
+encode_stream_type(qpack_decoder) ->
+    quic_varint:encode(?H3_STREAM_QPACK_DECODER);
+encode_stream_type(push) ->
+    quic_varint:encode(?H3_STREAM_PUSH);
+encode_stream_type(Type) when is_integer(Type) ->
+    quic_varint:encode(Type).
+
+%% Internal: encode a frame with type and payload
+-spec encode_frame(non_neg_integer(), binary()) -> binary().
+encode_frame(Type, Payload) ->
+    TypeEnc = quic_varint:encode(Type),
+    LenEnc = quic_varint:encode(byte_size(Payload)),
+    <<TypeEnc/binary, LenEnc/binary, Payload/binary>>.
+
+%%====================================================================
+%% Frame Decoding
+%%====================================================================
+
+%% @doc Decode an HTTP/3 frame from binary.
+%% Returns {ok, Frame, Rest} | {more, N}.
+-spec decode(binary()) -> {ok, frame(), binary()} | {more, non_neg_integer()}.
+decode(Data) when byte_size(Data) < 2 ->
+    %% Need at least 2 bytes for type and length
+    {more, 2 - byte_size(Data)};
+decode(Data) ->
+    try quic_varint:decode(Data) of
+        {Type, Rest1} ->
+            try quic_varint:decode(Rest1) of
+                {Length, Rest2} ->
+                    case byte_size(Rest2) >= Length of
+                        true ->
+                            <<Payload:Length/binary, Rest3/binary>> = Rest2,
+                            Frame = decode_frame_payload(Type, Payload),
+                            {ok, Frame, Rest3};
+                        false ->
+                            {more, Length - byte_size(Rest2)}
+                    end
+            catch
+                error:{incomplete, _} ->
+                    {more, 1};
+                error:badarg ->
+                    {more, 1}
+            end
+    catch
+        error:{incomplete, _} ->
+            {more, 1};
+        error:badarg ->
+            {more, 1}
+    end.
+
+%% @doc Decode all frames from binary buffer.
+-spec decode_all(binary()) -> {ok, [frame()], binary()}.
+decode_all(Data) ->
+    decode_all(Data, []).
+
+decode_all(<<>>, Acc) ->
+    {ok, lists:reverse(Acc), <<>>};
+decode_all(Data, Acc) ->
+    case decode(Data) of
+        {ok, Frame, Rest} ->
+            decode_all(Rest, [Frame | Acc]);
+        {more, _} ->
+            {ok, lists:reverse(Acc), Data}
+    end.
+
+%% Internal: decode frame payload by type
+-spec decode_frame_payload(non_neg_integer(), binary()) -> frame().
+decode_frame_payload(?H3_FRAME_DATA, Payload) ->
+    {data, Payload};
+decode_frame_payload(?H3_FRAME_HEADERS, Payload) ->
+    {headers, Payload};
+decode_frame_payload(?H3_FRAME_CANCEL_PUSH, Payload) ->
+    try quic_varint:decode(Payload) of
+        {PushId, _} -> {cancel_push, PushId}
+    catch
+        _:_ -> {cancel_push, 0}
+    end;
+decode_frame_payload(?H3_FRAME_SETTINGS, Payload) ->
+    case decode_settings_payload(Payload) of
+        {ok, Settings} -> {settings, Settings};
+        {error, _} -> {settings, #{}}
+    end;
+decode_frame_payload(?H3_FRAME_PUSH_PROMISE, Payload) ->
+    try quic_varint:decode(Payload) of
+        {PushId, HeaderBlock} -> {push_promise, PushId, HeaderBlock}
+    catch
+        _:_ -> {push_promise, 0, <<>>}
+    end;
+decode_frame_payload(?H3_FRAME_GOAWAY, Payload) ->
+    try quic_varint:decode(Payload) of
+        {StreamId, _} -> {goaway, StreamId}
+    catch
+        _:_ -> {goaway, 0}
+    end;
+decode_frame_payload(?H3_FRAME_MAX_PUSH_ID, Payload) ->
+    try quic_varint:decode(Payload) of
+        {PushId, _} -> {max_push_id, PushId}
+    catch
+        _:_ -> {max_push_id, 0}
+    end;
+decode_frame_payload(Type, Payload) ->
+    %% Unknown or reserved frame type
+    {unknown, Type, Payload}.
+
+%% @doc Decode stream type from unidirectional stream.
+-spec decode_stream_type(binary()) ->
+    {ok, control | qpack_encoder | qpack_decoder | push | {unknown, non_neg_integer()}, binary()}
+    | {more, non_neg_integer()}.
+decode_stream_type(<<>>) ->
+    {more, 1};
+decode_stream_type(Data) ->
+    try quic_varint:decode(Data) of
+        {?H3_STREAM_CONTROL, Rest} -> {ok, control, Rest};
+        {?H3_STREAM_PUSH, Rest} -> {ok, push, Rest};
+        {?H3_STREAM_QPACK_ENCODER, Rest} -> {ok, qpack_encoder, Rest};
+        {?H3_STREAM_QPACK_DECODER, Rest} -> {ok, qpack_decoder, Rest};
+        {Type, Rest} -> {ok, {unknown, Type}, Rest}
+    catch
+        error:{incomplete, _} -> {more, 1};
+        error:badarg -> {more, 1}
+    end.
+
+%%====================================================================
+%% Settings Helpers
+%%====================================================================
+
+%% @doc Return default HTTP/3 settings.
+-spec default_settings() -> map().
+default_settings() ->
+    #{
+        qpack_max_table_capacity => ?H3_DEFAULT_QPACK_MAX_TABLE_CAPACITY,
+        max_field_section_size => ?H3_DEFAULT_MAX_FIELD_SECTION_SIZE,
+        qpack_blocked_streams => ?H3_DEFAULT_QPACK_BLOCKED_STREAMS,
+        enable_connect_protocol => 0
+    }.
+
+%% @doc Encode settings map to SETTINGS frame payload.
+-spec encode_settings_payload(map()) -> binary().
+encode_settings_payload(Settings) ->
+    encode_settings_pairs(maps:to_list(Settings), <<>>).
+
+encode_settings_pairs([], Acc) ->
+    Acc;
+encode_settings_pairs([{Key, Value} | Rest], Acc) ->
+    Id = setting_to_id(Key),
+    IdEnc = quic_varint:encode(Id),
+    ValueEnc = quic_varint:encode(Value),
+    encode_settings_pairs(Rest, <<Acc/binary, IdEnc/binary, ValueEnc/binary>>).
+
+%% @doc Decode SETTINGS frame payload to settings map.
+-spec decode_settings_payload(binary()) -> {ok, map()} | {error, term()}.
+decode_settings_payload(Data) ->
+    try
+        {ok, decode_settings_pairs(Data, #{})}
+    catch
+        _:Reason -> {error, Reason}
+    end.
+
+decode_settings_pairs(<<>>, Acc) ->
+    Acc;
+decode_settings_pairs(Data, Acc) ->
+    {Id, Rest1} = quic_varint:decode(Data),
+    {Value, Rest2} = quic_varint:decode(Rest1),
+    Key = id_to_setting(Id),
+    decode_settings_pairs(Rest2, Acc#{Key => Value}).
+
+-spec setting_to_id(atom() | non_neg_integer()) -> non_neg_integer().
+setting_to_id(qpack_max_table_capacity) -> ?H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY;
+setting_to_id(max_field_section_size) -> ?H3_SETTINGS_MAX_FIELD_SECTION_SIZE;
+setting_to_id(qpack_blocked_streams) -> ?H3_SETTINGS_QPACK_BLOCKED_STREAMS;
+setting_to_id(enable_connect_protocol) -> ?H3_SETTINGS_ENABLE_CONNECT_PROTOCOL;
+setting_to_id(Id) when is_integer(Id) -> Id.
+
+-spec id_to_setting(non_neg_integer()) -> atom() | non_neg_integer().
+id_to_setting(?H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY) -> qpack_max_table_capacity;
+id_to_setting(?H3_SETTINGS_MAX_FIELD_SECTION_SIZE) -> max_field_section_size;
+id_to_setting(?H3_SETTINGS_QPACK_BLOCKED_STREAMS) -> qpack_blocked_streams;
+id_to_setting(?H3_SETTINGS_ENABLE_CONNECT_PROTOCOL) -> enable_connect_protocol;
+id_to_setting(Id) -> Id.
+
+%%====================================================================
+%% Frame Validation (RFC 9114 Section 7.2.8)
+%%====================================================================
+
+%% @doc Check if a frame type is reserved (grease).
+%% Reserved types are 0x1f * N + 0x21 for any non-negative integer N.
+-spec is_reserved_frame_type(non_neg_integer()) -> boolean().
+is_reserved_frame_type(Type) ->
+    (Type - 16#21) rem 16#1f =:= 0.
+
+%% @doc Check if a settings identifier is reserved (grease).
+%% Reserved identifiers are 0x1f * N + 0x21 for any non-negative integer N.
+-spec is_reserved_setting(non_neg_integer()) -> boolean().
+is_reserved_setting(Id) ->
+    (Id - 16#21) rem 16#1f =:= 0.

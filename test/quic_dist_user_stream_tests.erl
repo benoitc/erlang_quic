@@ -12,6 +12,10 @@
 -include_lib("eunit/include/eunit.hrl").
 -include("quic_dist.hrl").
 
+%% Helper functions to avoid "no effect" compiler warnings
+test_pid() -> self().
+test_ref() -> make_ref().
+
 %%====================================================================
 %% Tests
 %%====================================================================
@@ -81,36 +85,36 @@ stream_ref_test_() ->
 user_stream_record_test_() ->
     [
         {"Default recv_fin is false", fun() ->
-            US = #user_stream{id = 20, owner = self(), monitor = make_ref()},
+            US = #user_stream{id = 20, owner = test_pid(), monitor = test_ref()},
             ?assertEqual(false, US#user_stream.recv_fin)
         end},
         {"Default send_fin is false", fun() ->
-            US = #user_stream{id = 20, owner = self(), monitor = make_ref()},
+            US = #user_stream{id = 20, owner = test_pid(), monitor = test_ref()},
             ?assertEqual(false, US#user_stream.send_fin)
         end},
         {"Default priority is USER_STREAM_DEFAULT_PRIORITY", fun() ->
-            US = #user_stream{id = 20, owner = self(), monitor = make_ref()},
+            US = #user_stream{id = 20, owner = test_pid(), monitor = test_ref()},
             ?assertEqual(?USER_STREAM_DEFAULT_PRIORITY, US#user_stream.priority)
         end},
         {"Can set recv_fin to true", fun() ->
-            US = #user_stream{id = 20, owner = self(), monitor = make_ref(), recv_fin = true},
+            US = #user_stream{id = 20, owner = test_pid(), monitor = test_ref(), recv_fin = true},
             ?assertEqual(true, US#user_stream.recv_fin)
         end},
         {"Can set send_fin to true", fun() ->
-            US = #user_stream{id = 20, owner = self(), monitor = make_ref(), send_fin = true},
+            US = #user_stream{id = 20, owner = test_pid(), monitor = test_ref(), send_fin = true},
             ?assertEqual(true, US#user_stream.send_fin)
         end},
         {"Can set custom priority", fun() ->
-            US = #user_stream{id = 20, owner = self(), monitor = make_ref(), priority = 64},
+            US = #user_stream{id = 20, owner = test_pid(), monitor = test_ref(), priority = 64},
             ?assertEqual(64, US#user_stream.priority)
         end},
         {"Record stores owner pid", fun() ->
-            Owner = self(),
-            US = #user_stream{id = 20, owner = Owner, monitor = make_ref()},
+            Owner = test_pid(),
+            US = #user_stream{id = 20, owner = Owner, monitor = test_ref()},
             ?assertEqual(Owner, US#user_stream.owner)
         end},
         {"Record stores stream id", fun() ->
-            US = #user_stream{id = 42, owner = self(), monitor = make_ref()},
+            US = #user_stream{id = 42, owner = test_pid(), monitor = test_ref()},
             ?assertEqual(42, US#user_stream.id)
         end}
     ].
