@@ -23,6 +23,10 @@
 %% Reserved frame types (RFC 9114 Section 7.2.8)
 %% 0x1f * N + 0x21 for any non-negative integer N
 
+%% PRIORITY_UPDATE frame (RFC 9218 Section 7)
+-define(H3_FRAME_PRIORITY_UPDATE_REQUEST, 16#0F0700).  %% For request streams
+-define(H3_FRAME_PRIORITY_UPDATE_PUSH, 16#0F0701).     %% For push streams
+
 %%====================================================================
 %% HTTP/3 Unidirectional Stream Types (RFC 9114 Section 6.2)
 %%====================================================================
@@ -100,7 +104,13 @@
     %% expecting_trailers: received DATA with fin, expecting trailers
     %% complete: stream finished
     frame_state = expecting_headers ::
-        expecting_headers | expecting_data | expecting_trailers | complete
+        expecting_headers | expecting_data | expecting_trailers | complete,
+
+    %% Priority (RFC 9218 Extensible Priorities)
+    %% urgency: 0-7 (lower = more urgent, default 3)
+    %% incremental: whether data can be processed incrementally
+    urgency = 3 :: 0..7,
+    incremental = false :: boolean()
 }).
 
 %%====================================================================
