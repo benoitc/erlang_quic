@@ -50,6 +50,21 @@
 %%%     quic_h3:send_response(Conn, StreamId, 200, [{<<"content-type">>, <<"text/plain">>}]),
 %%%     quic_h3:send_data(Conn, StreamId, <<"Hello, HTTP/3!">>, true).
 %%% '''
+%%%
+%%% == Limitations ==
+%%%
+%%% Server Push (RFC 9114 Section 4.6) is not supported. This is an intentional
+%%% design decision as server push has seen limited adoption and is disabled by
+%%% default in most browsers. The implementation:
+%%%
+%%% <ul>
+%%%   <li>Ignores incoming push streams on the client side</li>
+%%%   <li>Treats MAX_PUSH_ID frames as no-ops</li>
+%%%   <li>Treats CANCEL_PUSH frames as no-ops</li>
+%%%   <li>Rejects PUSH_PROMISE frames on control streams with H3_FRAME_UNEXPECTED</li>
+%%%   <li>Rejects push streams from clients with H3_STREAM_CREATION_ERROR</li>
+%%% </ul>
+%%%
 %%% @end
 
 -module(quic_h3).

@@ -703,10 +703,13 @@ assign_uni_stream(StreamId, qpack_decoder, #state{peer_decoder_stream = undefine
 assign_uni_stream(_StreamId, qpack_decoder, _State) ->
     {error, {connection_error, ?H3_STREAM_CREATION_ERROR, <<"duplicate decoder stream">>}};
 assign_uni_stream(_StreamId, push, #state{role = server}) ->
-    %% Server can't receive push streams
+    %% RFC 9114 Section 4.6: only servers can initiate push streams
     {error, {connection_error, ?H3_STREAM_CREATION_ERROR, <<"server received push stream">>}};
 assign_uni_stream(_StreamId, push, #state{role = client} = State) ->
-    %% We don't support push yet - ignore
+    %% Server Push intentionally not supported (RFC 9114 Section 4.6)
+    %% Push has seen limited adoption and is disabled by default in most browsers.
+    %% We silently ignore push streams rather than rejecting them to allow
+    %% interoperability with servers that send unsolicited pushes.
     {ok, State};
 assign_uni_stream(_StreamId, {unknown, _Type}, State) ->
     %% Unknown stream types are ignored per RFC 9114
@@ -770,10 +773,14 @@ handle_control_frame({goaway, NewId}, State) ->
     %% GOAWAY with same or lower ID - update
     {ok, State#state{goaway_id = NewId}};
 handle_control_frame({max_push_id, _PushId}, State) ->
-    %% We don't support push yet
+    %% Server Push intentionally not supported - ignore MAX_PUSH_ID
+    %% RFC 9114 Section 7.2.7: clients send MAX_PUSH_ID to limit server pushes.
+    %% Since we never initiate pushes, we accept but ignore this frame.
     {ok, State};
 handle_control_frame({cancel_push, _PushId}, State) ->
-    %% We don't support push yet
+    %% Server Push intentionally not supported - ignore CANCEL_PUSH
+    %% RFC 9114 Section 7.2.3: used to cancel promised server pushes.
+    %% Since we never initiate pushes, we accept but ignore this frame.
     {ok, State};
 handle_control_frame({data, _}, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"DATA on control stream">>}};
