@@ -80,6 +80,8 @@
     get_send_queue_info/1,
     %% Connection statistics (for liveness detection)
     get_stats/1,
+    %% Peer transport parameters
+    get_peer_transport_params/1,
     %% Transport-level PING (bypasses congestion control)
     send_ping/1,
     %% Key update (RFC 9001 Section 6)
@@ -610,6 +612,13 @@ get_send_queue_info(Conn) ->
 -spec get_stats(pid()) -> {ok, map()} | {error, term()}.
 get_stats(Conn) ->
     gen_statem:call(Conn, get_stats).
+
+%% @doc Get peer's transport parameters.
+%% Returns the transport parameters received from the peer during handshake.
+%% Useful for verifying peer capabilities (e.g., WebTransport support).
+-spec get_peer_transport_params(pid()) -> {ok, map()} | {error, term()}.
+get_peer_transport_params(Conn) ->
+    gen_statem:call(Conn, get_peer_transport_params).
 
 %% @doc Send a PING frame (RFC 9000).
 %% PING frames bypass congestion control and are useful for liveness checks.
@@ -1559,6 +1568,8 @@ connected(
         data_sent => DataSent
     },
     {keep_state, State, [{reply, From, {ok, Stats}}]};
+connected({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
+    {keep_state, State, [{reply, From, {ok, TP}}]};
 connected({call, From}, send_ping, State) ->
     %% Send PING frame - bypasses congestion control
     NewState = send_keep_alive_ping(State),

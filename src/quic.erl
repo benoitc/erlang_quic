@@ -97,7 +97,9 @@
     %% Transport-level PING (bypasses congestion control)
     send_ping/1,
     %% PMTU Discovery (RFC 8899)
-    get_mtu/1
+    get_mtu/1,
+    %% Peer transport parameters
+    get_peer_transport_params/1
 ]).
 
 %% Server management API
@@ -533,6 +535,19 @@ send_ping(Conn) when is_pid(Conn) ->
     Conn :: pid().
 get_mtu(Conn) when is_pid(Conn) ->
     quic_connection:get_mtu(Conn).
+
+%% @doc Get the peer's transport parameters.
+%%
+%% Returns the transport parameters received from the peer during handshake.
+%% Useful for verifying peer capabilities such as WebTransport support
+%% (e.g., checking for `reset_stream_at' transport parameter).
+%%
+%% Returns `{ok, TransportParams}' where TransportParams is a map of
+%% the peer's advertised transport parameters.
+-spec get_peer_transport_params(Conn) -> {ok, map()} | {error, term()} when
+    Conn :: pid().
+get_peer_transport_params(Conn) when is_pid(Conn) ->
+    quic_connection:get_peer_transport_params(Conn).
 
 %%====================================================================
 %% Server Management API
