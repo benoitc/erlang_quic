@@ -168,7 +168,16 @@ connect(Host, Port, Opts) ->
     case quic:connect(HostBin, Port, QuicOpts, self()) of
         {ok, QuicConn} ->
             H3Opts = maps:with([settings], Opts),
-            quic_h3_connection:start_link(QuicConn, HostBin, Port, H3Opts);
+            case quic_h3_connection:start_link(QuicConn, HostBin, Port, H3Opts) of
+                {ok, H3Conn} ->
+                    %% Transfer ownership to H3 process so it receives QUIC events
+                    %% including the {connected, Info} notification
+                    ok = quic:set_owner_sync(QuicConn, H3Conn),
+                    {ok, H3Conn};
+                {error, Reason} ->
+                    quic:close(QuicConn, 0, <<"h3 init failed">>),
+                    {error, Reason}
+            end;
         {error, Reason} ->
             {error, Reason}
     end.
@@ -372,7 +381,7 @@ build_server_quic_opts(Opts) ->
 
 %% @private
 %% Connection handler callback for QUIC server
-%% Called when a new QUIC connection is established
+%% Called when a new QUIC connection is established (before handshake completes)
 h3_connection_handler(QuicConnPid, Handler, Settings, _Owner) ->
     %% Start HTTP/3 connection handler for the server side
     H3Opts = #{
@@ -381,7 +390,9 @@ h3_connection_handler(QuicConnPid, Handler, Settings, _Owner) ->
     },
     case gen_statem:start_link(quic_h3_connection, {server, QuicConnPid, H3Opts, self()}, []) of
         {ok, H3Conn} ->
-            %% Return the H3 connection process as the handler
+            %% Transfer ownership to H3 process so it receives QUIC events
+            %% including the {connected, Info} notification after handshake completes
+            ok = quic:set_owner_sync(QuicConnPid, H3Conn),
             {ok, H3Conn};
         {error, Reason} ->
             {error, Reason}

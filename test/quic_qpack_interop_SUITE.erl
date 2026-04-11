@@ -62,16 +62,19 @@ init_per_suite(Config) ->
             [{qifs_dir, QifsDir} | Config];
         false ->
             ct:log("qifs dir not found at ~s", [QifsDir]),
-            {skip, "qifs directory not found - run: git submodule add https://github.com/qpackers/qifs test/qifs"}
+            {skip,
+                "qifs directory not found - run: git submodule add https://github.com/qpackers/qifs test/qifs"}
     end.
 
 find_project_root(Dir) ->
     case filelib:is_file(filename:join(Dir, "rebar.config")) of
-        true -> Dir;
+        true ->
+            Dir;
         false ->
             Parent = filename:dirname(Dir),
             case Parent of
-                Dir -> Dir; %% Reached root
+                %% Reached root
+                Dir -> Dir;
                 _ -> find_project_root(Parent)
             end
     end.
@@ -219,14 +222,14 @@ compare_blocks([Expected | RestE], [Decoded | RestD], N) ->
         true ->
             compare_blocks(RestE, RestD, N + 1);
         false ->
-            ct:log("Block ~p mismatch:~nExpected: ~p~nDecoded: ~p",
-                   [N, SortedExpected, SortedDecoded]),
+            ct:log(
+                "Block ~p mismatch:~nExpected: ~p~nDecoded: ~p",
+                [N, SortedExpected, SortedDecoded]
+            ),
             %% Find differences
             Missing = SortedExpected -- SortedDecoded,
             Extra = SortedDecoded -- SortedExpected,
-            ct:fail({block_mismatch, N,
-                     {missing, Missing},
-                     {extra, Extra}})
+            ct:fail({block_mismatch, N, {missing, Missing}, {extra, Extra}})
     end.
 
 %% Round-trip test: parse QIF, encode, decode, compare
@@ -251,8 +254,10 @@ roundtrip_blocks([Headers | Rest], State, N) ->
                 true ->
                     roundtrip_blocks(Rest, State2, N + 1);
                 false ->
-                    ct:log("Round-trip block ~p mismatch:~nOriginal: ~p~nDecoded: ~p",
-                           [N, Headers, Decoded]),
+                    ct:log(
+                        "Round-trip block ~p mismatch:~nOriginal: ~p~nDecoded: ~p",
+                        [N, Headers, Decoded]
+                    ),
                     ct:fail({roundtrip_mismatch, N})
             end;
         {{error, Reason}, _} ->

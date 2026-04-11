@@ -367,7 +367,9 @@ settings_connect_protocol_disabled_test() ->
 %% Test settings with GREASE values (reserved settings should be preserved)
 settings_with_grease_roundtrip_test() ->
     %% GREASE setting: 0x1f * N + 0x21
-    GREASEId = 16#21,  %% N=0
+
+    %% N=0
+    GREASEId = 16#21,
     Settings = #{GREASEId => 12345},
     Encoded = quic_h3_frame:encode_settings(Settings),
     {ok, {settings, Decoded}, <<>>} = quic_h3_frame:decode(Encoded),
@@ -379,7 +381,8 @@ settings_with_grease_roundtrip_test() ->
 
 %% Test DATA frame with 12-byte payload (like quiche data test)
 data_12_bytes_test() ->
-    Payload = <<"Hello World!">>,  %% 12 bytes
+    %% 12 bytes
+    Payload = <<"Hello World!">>,
     ?assertEqual(12, byte_size(Payload)),
     Encoded = quic_h3_frame:encode_data(Payload),
     {ok, {data, Decoded}, <<>>} = quic_h3_frame:decode(Encoded),
@@ -387,7 +390,8 @@ data_12_bytes_test() ->
 
 %% Test HEADERS frame with 12-byte header block
 headers_12_bytes_test() ->
-    HeaderBlock = <<"HeaderBlock!">>,  %% 12 bytes
+    %% 12 bytes
+    HeaderBlock = <<"HeaderBlock!">>,
     ?assertEqual(12, byte_size(HeaderBlock)),
     Encoded = quic_h3_frame:encode_headers(HeaderBlock),
     {ok, {headers, Decoded}, <<>>} = quic_h3_frame:decode(Encoded),
@@ -487,16 +491,19 @@ decode_no_crash_test_() ->
         crypto:strong_rand_bytes(100),
         crypto:strong_rand_bytes(256)
     ],
-    [{"Decode pattern " ++ integer_to_list(N) ++ " no crash",
-      fun() ->
-          Pattern = lists:nth(N, Patterns),
-          %% Should not crash, may return ok, more, or error
-          Result = try quic_h3_frame:decode(Pattern) of
-              {ok, _, _} -> ok;
-              {more, _} -> ok;
-              {error, _} -> ok
-          catch
-              _:_ -> crashed
-          end,
-          ?assertNotEqual(crashed, Result)
-      end} || N <- lists:seq(1, length(Patterns))].
+    [
+        {"Decode pattern " ++ integer_to_list(N) ++ " no crash", fun() ->
+            Pattern = lists:nth(N, Patterns),
+            %% Should not crash, may return ok, more, or error
+            Result =
+                try quic_h3_frame:decode(Pattern) of
+                    {ok, _, _} -> ok;
+                    {more, _} -> ok;
+                    {error, _} -> ok
+                catch
+                    _:_ -> crashed
+                end,
+            ?assertNotEqual(crashed, Result)
+        end}
+     || N <- lists:seq(1, length(Patterns))
+    ].

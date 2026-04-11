@@ -18,22 +18,25 @@ encode_decode_empty_test() ->
 
 encode_decode_simple_test() ->
     %% Common strings that should round-trip correctly
-    lists:foreach(fun(Str) ->
-        Encoded = quic_qpack_huffman:encode(Str),
-        Decoded = quic_qpack_huffman:decode(Encoded),
-        ?assertEqual(Str, Decoded)
-    end, [
-        <<"GET">>,
-        <<"POST">>,
-        <<"/index.html">>,
-        <<"www.example.com">>,
-        <<"text/html">>,
-        <<"application/json">>,
-        <<"200">>,
-        <<"404">>,
-        <<"content-type">>,
-        <<"accept-encoding">>
-    ]).
+    lists:foreach(
+        fun(Str) ->
+            Encoded = quic_qpack_huffman:encode(Str),
+            Decoded = quic_qpack_huffman:decode(Encoded),
+            ?assertEqual(Str, Decoded)
+        end,
+        [
+            <<"GET">>,
+            <<"POST">>,
+            <<"/index.html">>,
+            <<"www.example.com">>,
+            <<"text/html">>,
+            <<"application/json">>,
+            <<"200">>,
+            <<"404">>,
+            <<"content-type">>,
+            <<"accept-encoding">>
+        ]
+    ).
 
 encode_decode_lowercase_test() ->
     Str = <<"abcdefghijklmnopqrstuvwxyz">>,
@@ -71,17 +74,20 @@ encode_decode_http_header_test() ->
 
 encoded_size_test() ->
     %% Test that encoded_size matches actual encoded size
-    lists:foreach(fun(Str) ->
-        PredictedSize = quic_qpack_huffman:encoded_size(Str),
-        ActualSize = byte_size(quic_qpack_huffman:encode(Str)),
-        ?assertEqual(ActualSize, PredictedSize)
-    end, [
-        <<>>,
-        <<"a">>,
-        <<"GET">>,
-        <<"www.example.com">>,
-        <<"content-type: application/json">>
-    ]).
+    lists:foreach(
+        fun(Str) ->
+            PredictedSize = quic_qpack_huffman:encoded_size(Str),
+            ActualSize = byte_size(quic_qpack_huffman:encode(Str)),
+            ?assertEqual(ActualSize, PredictedSize)
+        end,
+        [
+            <<>>,
+            <<"a">>,
+            <<"GET">>,
+            <<"www.example.com">>,
+            <<"content-type: application/json">>
+        ]
+    ).
 
 %%====================================================================
 %% Compression ratio tests
@@ -110,10 +116,14 @@ known_encoding_test() ->
 %%====================================================================
 
 single_byte_test() ->
-    lists:foreach(fun(Byte) ->
-        Str = <<Byte>>,
-        ?assertEqual(Str, quic_qpack_huffman:decode(quic_qpack_huffman:encode(Str)))
-    end, lists:seq(32, 126)). %% Printable ASCII
+    lists:foreach(
+        fun(Byte) ->
+            Str = <<Byte>>,
+            ?assertEqual(Str, quic_qpack_huffman:decode(quic_qpack_huffman:encode(Str)))
+        %% Printable ASCII
+        end,
+        lists:seq(32, 126)
+    ).
 
 repeated_char_test() ->
     Str = <<"aaaaaaaaaa">>,
@@ -129,15 +139,18 @@ long_string_test() ->
 
 decode_safe_roundtrip_test() ->
     %% Valid encoded data should decode successfully with decode_safe
-    lists:foreach(fun(Str) ->
-        Encoded = quic_qpack_huffman:encode(Str),
-        ?assertMatch({ok, Str}, quic_qpack_huffman:decode_safe(Encoded))
-    end, [
-        <<"a">>,
-        <<"GET">>,
-        <<"www.example.com">>,
-        <<"application/json">>
-    ]).
+    lists:foreach(
+        fun(Str) ->
+            Encoded = quic_qpack_huffman:encode(Str),
+            ?assertMatch({ok, Str}, quic_qpack_huffman:decode_safe(Encoded))
+        end,
+        [
+            <<"a">>,
+            <<"GET">>,
+            <<"www.example.com">>,
+            <<"application/json">>
+        ]
+    ).
 
 decode_safe_empty_test() ->
     ?assertMatch({ok, <<>>}, quic_qpack_huffman:decode_safe(<<>>)).
@@ -145,13 +158,21 @@ decode_safe_empty_test() ->
 decode_safe_valid_padding_test() ->
     %% Test various strings that result in different padding amounts
     %% Each string will have different padding bits
-    lists:foreach(fun(Str) ->
-        Encoded = quic_qpack_huffman:encode(Str),
-        ?assertMatch({ok, Str}, quic_qpack_huffman:decode_safe(Encoded))
-    end, [
-        <<"a">>,     %% 5 bits -> 3 bits padding
-        <<"aa">>,    %% 10 bits -> 6 bits padding
-        <<"aaa">>,   %% 15 bits -> 1 bit padding
-        <<"aaaa">>,  %% 20 bits -> 4 bits padding
-        <<"aaaaa">>  %% 25 bits -> 7 bits padding
-    ]).
+    lists:foreach(
+        fun(Str) ->
+            Encoded = quic_qpack_huffman:encode(Str),
+            ?assertMatch({ok, Str}, quic_qpack_huffman:decode_safe(Encoded))
+        end,
+        [
+            %% 5 bits -> 3 bits padding
+            <<"a">>,
+            %% 10 bits -> 6 bits padding
+            <<"aa">>,
+            %% 15 bits -> 1 bit padding
+            <<"aaa">>,
+            %% 20 bits -> 4 bits padding
+            <<"aaaa">>,
+            %% 25 bits -> 7 bits padding
+            <<"aaaaa">>
+        ]
+    ).

@@ -44,7 +44,8 @@
 
 %% State functions
 -export([
-    connecting/3,
+    awaiting_quic/3,
+    h3_connecting/3,
     connected/3,
     goaway_sent/3,
     goaway_received/3,
@@ -53,6 +54,17 @@
 
 -include("quic.hrl").
 -include("quic_h3.hrl").
+
+%% Test exports - only available when compiled with TEST defined
+-ifdef(TEST).
+-export([
+    handle_stream_closed/2,
+    handle_control_frame/2,
+    handle_request_frame/5,
+    is_critical_stream/2,
+    partition_blocked_streams/2
+]).
+-endif.
 
 %%====================================================================
 %% Types
@@ -108,7 +120,15 @@
     stream_buffers = #{} :: #{stream_id() => binary()},
 
     %% Pending uni stream type detection
-    uni_stream_buffers = #{} :: #{stream_id() => binary()}
+    uni_stream_buffers = #{} :: #{stream_id() => binary()},
+
+    %% QPACK instruction buffers for partial instructions (RFC 9204 Section 4.5)
+    encoder_buffer = <<>> :: binary(),
+    decoder_buffer = <<>> :: binary(),
+
+    %% Blocked streams waiting for encoder instructions (RFC 9204 Section 2.2.2)
+    %% Maps StreamId -> {RequiredInsertCount, HeaderBlock, Fin}
+    blocked_streams = #{} :: #{stream_id() => {non_neg_integer(), binary(), boolean()}}
 }).
 
 %%====================================================================
@@ -217,7 +237,9 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
         next_stream_id = 0
     },
 
-    {ok, connecting, State};
+    %% Start in awaiting_quic - wait for QUIC connected notification
+    %% H3 streams should not be opened until QUIC connection is established
+    {ok, awaiting_quic, State};
 init({server, QuicConn, Opts, Owner}) ->
     process_flag(trap_exit, true),
     MonRef = monitor(process, Owner),
@@ -246,7 +268,9 @@ init({server, QuicConn, Opts, Owner}) ->
         _ -> put(h3_handler, Handler)
     end,
 
-    {ok, connecting, State}.
+    %% Start in awaiting_quic - wait for QUIC connected notification
+    %% H3 streams should not be opened until QUIC connection is established
+    {ok, awaiting_quic, State}.
 
 terminate(_Reason, _StateName, #state{quic_conn = QuicConn}) ->
     catch quic:close(QuicConn),
@@ -256,10 +280,43 @@ code_change(_OldVsn, StateName, State, _Extra) ->
     {ok, StateName, State}.
 
 %%====================================================================
-%% State: connecting
+%% State: awaiting_quic
+%% Wait for QUIC connection to be established before opening H3 streams
 %%====================================================================
 
-connecting(enter, _OldState, State) ->
+awaiting_quic(enter, _OldState, _State) ->
+    %% Wait for QUIC connected notification (ownership transferred by quic_h3:connect)
+    keep_state_and_data;
+%% Match on quic_conn pid, not quic_ref (which is a monitor reference)
+awaiting_quic(info, {quic, QuicConn, {connected, _Info}}, #state{quic_conn = QuicConn} = State) ->
+    %% QUIC is ready - transition to h3_connecting to open H3 streams
+    {next_state, h3_connecting, State};
+%% Postpone stream data received before we're ready
+awaiting_quic(info, {quic, QuicConn, {stream_data, _, _, _}}, #state{quic_conn = QuicConn}) ->
+    {keep_state_and_data, [postpone]};
+awaiting_quic(info, {quic, QuicConn, {new_stream, _, _}}, #state{quic_conn = QuicConn}) ->
+    {keep_state_and_data, [postpone]};
+awaiting_quic({call, From}, {request, _Headers, _Opts}, _State) ->
+    {keep_state_and_data, [{reply, From, {error, not_connected}}]};
+awaiting_quic({call, From}, get_settings, #state{local_settings = Settings}) ->
+    {keep_state_and_data, [{reply, From, Settings}]};
+awaiting_quic({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
+    {keep_state_and_data, [{reply, From, Settings}]};
+awaiting_quic(cast, close, State) ->
+    {next_state, closing, State};
+awaiting_quic(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
+    {next_state, closing, State};
+awaiting_quic(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
+    {stop, quic_closed, State};
+awaiting_quic(_EventType, _Event, _State) ->
+    keep_state_and_data.
+
+%%====================================================================
+%% State: h3_connecting
+%% Open critical H3 streams and exchange SETTINGS
+%%====================================================================
+
+h3_connecting(enter, _OldState, State) ->
     %% Open critical streams and send SETTINGS
     case open_critical_streams(State) of
         {ok, State1} ->
@@ -272,45 +329,52 @@ connecting(enter, _OldState, State) ->
         {error, Reason} ->
             {stop, {error, Reason}}
     end;
-connecting(
+h3_connecting(
     info,
-    {quic, QuicRef, {stream_data, StreamId, Data, Fin}},
-    #state{quic_ref = QuicRef} = State
+    {quic, QuicConn, {stream_data, StreamId, Data, Fin}},
+    #state{quic_conn = QuicConn} = State
 ) ->
     case handle_stream_data(StreamId, Data, Fin, State) of
         {ok, State1} ->
             maybe_transition_connected(State1);
+        {transition, goaway_received, State1} ->
+            %% GOAWAY received during connecting - transition to goaway_received
+            {next_state, goaway_received, State1};
         {error, Reason, State1} ->
             handle_connection_error(Reason, State1)
     end;
-connecting(
+h3_connecting(
     info,
-    {quic, QuicRef, {new_stream, StreamId, Type}},
-    #state{quic_ref = QuicRef} = State
+    {quic, QuicConn, {new_stream, StreamId, Type}},
+    #state{quic_conn = QuicConn} = State
 ) ->
     State1 = handle_new_stream(StreamId, Type, State),
     {keep_state, State1};
-connecting(
+h3_connecting(
     info,
-    {quic, QuicRef, {stream_closed, StreamId, _ErrorCode}},
-    #state{quic_ref = QuicRef} = State
+    {quic, QuicConn, {stream_closed, StreamId, _ErrorCode}},
+    #state{quic_conn = QuicConn} = State
 ) ->
-    State1 = handle_stream_closed(StreamId, State),
-    {keep_state, State1};
-connecting({call, From}, {request, _Headers, _Opts}, _State) ->
+    case handle_stream_closed(StreamId, State) of
+        {ok, State1} ->
+            {keep_state, State1};
+        {error, Reason} ->
+            handle_connection_error(Reason, State)
+    end;
+h3_connecting({call, From}, {request, _Headers, _Opts}, _State) ->
     %% Can't send requests until connected
     {keep_state_and_data, [{reply, From, {error, not_connected}}]};
-connecting({call, From}, get_settings, #state{local_settings = Settings}) ->
+h3_connecting({call, From}, get_settings, #state{local_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
-connecting({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
+h3_connecting({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
-connecting(cast, close, State) ->
+h3_connecting(cast, close, State) ->
     {next_state, closing, State};
-connecting(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
+h3_connecting(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     {next_state, closing, State};
-connecting(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
+h3_connecting(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
     {stop, quic_closed, State};
-connecting(_EventType, _Event, _State) ->
+h3_connecting(_EventType, _Event, _State) ->
     keep_state_and_data.
 
 %%====================================================================
@@ -322,30 +386,37 @@ connected(enter, _OldState, #state{owner = Owner} = State) ->
     {keep_state, State};
 connected(
     info,
-    {quic, QuicRef, {stream_data, StreamId, Data, Fin}},
-    #state{quic_ref = QuicRef} = State
+    {quic, QuicConn, {stream_data, StreamId, Data, Fin}},
+    #state{quic_conn = QuicConn} = State
 ) ->
     case handle_stream_data(StreamId, Data, Fin, State) of
         {ok, State1} ->
             {keep_state, State1};
+        {transition, goaway_received, State1} ->
+            %% GOAWAY received - transition to goaway_received
+            {next_state, goaway_received, State1};
         {error, Reason, State1} ->
             handle_connection_error(Reason, State1)
     end;
 connected(
     info,
-    {quic, QuicRef, {new_stream, StreamId, Type}},
-    #state{quic_ref = QuicRef} = State
+    {quic, QuicConn, {new_stream, StreamId, Type}},
+    #state{quic_conn = QuicConn} = State
 ) ->
     State1 = handle_new_stream(StreamId, Type, State),
     {keep_state, State1};
 connected(
     info,
-    {quic, QuicRef, {stream_closed, StreamId, ErrorCode}},
-    #state{quic_ref = QuicRef} = State
+    {quic, QuicConn, {stream_closed, StreamId, ErrorCode}},
+    #state{quic_conn = QuicConn} = State
 ) ->
-    State1 = handle_stream_closed(StreamId, State),
-    notify_stream_reset(StreamId, ErrorCode, State1),
-    {keep_state, State1};
+    case handle_stream_closed(StreamId, State) of
+        {ok, State1} ->
+            notify_stream_reset(StreamId, ErrorCode, State1),
+            {keep_state, State1};
+        {error, Reason} ->
+            handle_connection_error(Reason, State)
+    end;
 connected({call, From}, {request, Headers, Opts}, #state{role = client} = State) ->
     case send_request(Headers, Opts, State) of
         {ok, StreamId, State1} ->
@@ -408,8 +479,8 @@ goaway_sent(enter, _OldState, #state{owner = Owner, goaway_id = GoawayId}) ->
     keep_state_and_data;
 goaway_sent(
     info,
-    {quic, QuicRef, {stream_data, StreamId, Data, Fin}},
-    #state{quic_ref = QuicRef} = State
+    {quic, QuicConn, {stream_data, StreamId, Data, Fin}},
+    #state{quic_conn = QuicConn} = State
 ) ->
     %% Continue processing existing streams
     case handle_stream_data(StreamId, Data, Fin, State) of
@@ -446,8 +517,8 @@ goaway_received(enter, _OldState, #state{owner = Owner, goaway_id = GoawayId}) -
     keep_state_and_data;
 goaway_received(
     info,
-    {quic, QuicRef, {stream_data, StreamId, Data, Fin}},
-    #state{quic_ref = QuicRef} = State
+    {quic, QuicConn, {stream_data, StreamId, Data, Fin}},
+    #state{quic_conn = QuicConn} = State
 ) ->
     case handle_stream_data(StreamId, Data, Fin, State) of
         {ok, State1} ->
@@ -567,6 +638,7 @@ handle_stream_data(StreamId, Data, Fin, State) ->
         {uni, pending} ->
             handle_uni_stream_type(StreamId, Data, State);
         {uni, control} ->
+            %% Control stream may trigger state transition (GOAWAY)
             handle_control_stream_data(StreamId, Data, State);
         {uni, qpack_encoder} ->
             handle_encoder_stream_data(Data, State);
@@ -646,6 +718,9 @@ handle_control_stream_data(StreamId, Data, #state{stream_buffers = Buffers} = St
     case process_control_frames(Combined, State) of
         {ok, Rest, State1} ->
             {ok, State1#state{stream_buffers = Buffers#{StreamId => Rest}}};
+        {transition, NextState, Rest, State1} ->
+            %% State transition requested (e.g., GOAWAY received)
+            {transition, NextState, State1#state{stream_buffers = Buffers#{StreamId => Rest}}};
         {error, Reason} ->
             {error, Reason, State}
     end.
@@ -656,6 +731,9 @@ process_control_frames(Data, State) ->
             case handle_control_frame(Frame, State) of
                 {ok, State1} ->
                     process_control_frames(Rest, State1);
+                {transition, NextState, State1} ->
+                    %% Signal state transition (e.g., for GOAWAY)
+                    {transition, NextState, Rest, State1};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -675,8 +753,15 @@ handle_control_frame({settings, _Settings}, #state{settings_received = true}) ->
 handle_control_frame(_Frame, #state{settings_received = false}) ->
     %% SETTINGS must be first
     {error, {connection_error, ?H3_MISSING_SETTINGS, <<"expected SETTINGS">>}};
-handle_control_frame({goaway, StreamId}, State) ->
-    {ok, State#state{goaway_id = StreamId}};
+handle_control_frame({goaway, StreamId}, #state{goaway_id = undefined} = State) ->
+    %% First GOAWAY - signal state transition to goaway_received
+    {transition, goaway_received, State#state{goaway_id = StreamId}};
+handle_control_frame({goaway, NewId}, #state{goaway_id = OldId}) when NewId > OldId ->
+    %% GOAWAY with increasing ID is protocol error (RFC 9114 Section 5.2)
+    {error, {connection_error, ?H3_ID_ERROR, <<"GOAWAY ID increased">>}};
+handle_control_frame({goaway, NewId}, State) ->
+    %% GOAWAY with same or lower ID - update
+    {ok, State#state{goaway_id = NewId}};
 handle_control_frame({max_push_id, _PushId}, State) ->
     %% We don't support push yet
     {ok, State};
@@ -697,21 +782,101 @@ handle_control_frame({unknown, Type, _Payload}, State) ->
         false -> {ok, State}
     end.
 
-handle_encoder_stream_data(Data, #state{qpack_decoder = Decoder} = State) ->
-    case quic_qpack:process_encoder_instructions(Data, Decoder) of
+handle_encoder_stream_data(
+    Data,
+    #state{
+        encoder_buffer = Buffer,
+        qpack_decoder = Decoder
+    } = State
+) ->
+    FullData = <<Buffer/binary, Data/binary>>,
+    case quic_qpack:process_encoder_instructions(FullData, Decoder) of
         {ok, Decoder1} ->
-            {ok, State#state{qpack_decoder = Decoder1}};
-        {incomplete, _Rest, Decoder1} ->
-            %% Partial instruction, will continue with more data
-            {ok, State#state{qpack_decoder = Decoder1}};
+            %% All instructions processed - retry blocked streams
+            State1 = State#state{qpack_decoder = Decoder1, encoder_buffer = <<>>},
+            retry_blocked_streams(State1);
+        {incomplete, Rest, Decoder1} ->
+            %% Partial instruction, buffer remaining data
+            State1 = State#state{qpack_decoder = Decoder1, encoder_buffer = Rest},
+            %% Still retry blocked streams - some may have become unblocked
+            retry_blocked_streams(State1);
         {error, Reason} ->
             {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}, State}
     end.
 
-handle_decoder_stream_data(Data, #state{qpack_encoder = Encoder} = State) ->
-    case quic_qpack:process_decoder_instructions(Data, Encoder) of
+%% Retry blocked streams that may have become unblocked after encoder instructions
+retry_blocked_streams(#state{blocked_streams = Blocked} = State) when map_size(Blocked) =:= 0 ->
+    {ok, State};
+retry_blocked_streams(
+    #state{
+        blocked_streams = Blocked,
+        qpack_decoder = Decoder,
+        quic_conn = QuicConn
+    } = State
+) ->
+    InsertCount = quic_qpack:get_insert_count(Decoder),
+    %% Find streams that can be unblocked (RIC <= InsertCount)
+    {Ready, StillBlocked} = partition_blocked_streams(InsertCount, Blocked),
+    State1 = State#state{blocked_streams = StillBlocked},
+    %% Re-process each unblocked stream's headers
+    case retry_blocked_streams_fold(maps:to_list(Ready), State1) of
+        {ok, State2} ->
+            {ok, State2};
+        {error, {stream_reset, SId, Code}} ->
+            quic:reset_stream(QuicConn, SId, Code),
+            {ok, State1#state{streams = maps:remove(SId, State1#state.streams)}};
+        {error, Reason} ->
+            {error, Reason, State1}
+    end.
+
+%% Partition blocked streams into ready and still-blocked
+partition_blocked_streams(InsertCount, Blocked) ->
+    maps:fold(
+        fun(StreamId, {RIC, _, _} = Val, {ReadyAcc, BlockedAcc}) ->
+            case RIC =< InsertCount of
+                true -> {maps:put(StreamId, Val, ReadyAcc), BlockedAcc};
+                false -> {ReadyAcc, maps:put(StreamId, Val, BlockedAcc)}
+            end
+        end,
+        {#{}, #{}},
+        Blocked
+    ).
+
+retry_blocked_streams_fold([], State) ->
+    {ok, State};
+retry_blocked_streams_fold([{StreamId, {_RIC, HeaderBlock, Fin}} | Rest], State) ->
+    %% Get stream record with proper defaults
+    Stream = maps:get(
+        StreamId,
+        State#state.streams,
+        #h3_stream{id = StreamId, type = request, state = open}
+    ),
+    case handle_request_frame(StreamId, {headers, HeaderBlock}, Fin, Stream, State) of
+        {ok, Stream1, State1} ->
+            State2 = State1#state{streams = maps:put(StreamId, Stream1, State1#state.streams)},
+            retry_blocked_streams_fold(Rest, State2);
+        {error, {stream_reset, _, _} = Err} ->
+            %% Stream-level error - propagate to caller
+            {error, Err};
+        {error, Reason} ->
+            %% Connection error - stop processing
+            {error, Reason}
+    end.
+
+handle_decoder_stream_data(
+    Data,
+    #state{
+        decoder_buffer = Buffer,
+        qpack_encoder = Encoder
+    } = State
+) ->
+    FullData = <<Buffer/binary, Data/binary>>,
+    case quic_qpack:process_decoder_instructions(FullData, Encoder) of
         {ok, Encoder1} ->
-            {ok, State#state{qpack_encoder = Encoder1}};
+            {ok, State#state{qpack_encoder = Encoder1, decoder_buffer = <<>>}};
+        {incomplete, Rest, Encoder1} ->
+            %% Partial instruction, buffer remaining data
+            {ok, State#state{qpack_encoder = Encoder1, decoder_buffer = Rest}};
         {error, Reason} ->
             {error, {connection_error, ?H3_QPACK_DECODER_STREAM_ERROR, Reason}, State}
     end.
@@ -739,12 +904,16 @@ handle_request_stream_data(
             {error, Reason, State}
     end.
 
-process_request_frames(StreamId, Data, Fin, Stream, State) ->
+process_request_frames(StreamId, Data, Fin, Stream, #state{quic_conn = QuicConn} = State) ->
     case quic_h3_frame:decode(Data) of
         {ok, Frame, Rest} ->
             case handle_request_frame(StreamId, Frame, Fin andalso Rest =:= <<>>, Stream, State) of
                 {ok, Stream1, State1} ->
                     process_request_frames(StreamId, Rest, Fin, Stream1, State1);
+                {error, {stream_reset, SId, Code}} ->
+                    %% Stream-level error - reset the stream and remove from tracking
+                    quic:reset_stream(QuicConn, SId, Code),
+                    {ok, <<>>, Stream, State#state{streams = maps:remove(SId, State#state.streams)}};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -761,6 +930,8 @@ handle_request_frame(
 ) ->
     case quic_qpack:decode(HeaderBlock, Decoder) of
         {{ok, Headers}, Decoder1} ->
+            %% Send Section Acknowledgment on decoder stream (RFC 9204 Section 4.4)
+            State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
             Stream1 = update_stream_with_headers(Headers, Stream),
             Stream2 =
                 case Fin of
@@ -779,12 +950,57 @@ handle_request_frame(
                     Status = Stream2#h3_stream.status,
                     Owner ! {quic_h3, self(), {response, StreamId, Status, Headers}}
             end,
-            {ok, Stream2, State#state{qpack_decoder = Decoder1}};
-        {{blocked, _}, _Decoder1} ->
-            {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, <<"blocked">>}};
+            {ok, Stream2, State1};
+        {{blocked, RIC}, Decoder1} ->
+            %% Stream blocked waiting for encoder instructions (RFC 9204 Section 2.2.2)
+            %% Buffer the stream and wait for more encoder data
+            BlockedStreams = maps:put(
+                StreamId, {RIC, HeaderBlock, Fin}, State#state.blocked_streams
+            ),
+            {ok, Stream, State#state{blocked_streams = BlockedStreams, qpack_decoder = Decoder1}};
         {{error, Reason}, _Decoder1} ->
             {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
     end;
+%% DATA before HEADERS - stream error (RFC 9114 Section 4.1)
+handle_request_frame(
+    StreamId,
+    {data, _Payload},
+    _Fin,
+    #h3_stream{frame_state = expecting_headers},
+    _State
+) ->
+    {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}};
+%% DATA frame - validate content-length if present (RFC 9114 Section 4.1.2)
+handle_request_frame(
+    StreamId,
+    {data, Payload},
+    Fin,
+    #h3_stream{frame_state = expecting_data, content_length = CL, body_received = Received} =
+        Stream,
+    #state{owner = Owner} = State
+) when CL =/= undefined ->
+    NewReceived = Received + byte_size(Payload),
+    case NewReceived > CL of
+        true ->
+            %% Body exceeds content-length - stream error
+            {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}};
+        false when Fin, NewReceived < CL ->
+            %% Body shorter than content-length - stream error
+            {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}};
+        false ->
+            Stream1 = Stream#h3_stream{
+                body = <<(Stream#h3_stream.body)/binary, Payload/binary>>,
+                body_received = NewReceived
+            },
+            Owner ! {quic_h3, self(), {data, StreamId, Payload, Fin}},
+            Stream2 =
+                case Fin of
+                    true -> Stream1#h3_stream{frame_state = complete, state = half_closed_remote};
+                    false -> Stream1
+                end,
+            {ok, Stream2, State}
+    end;
+%% DATA frame - no content-length
 handle_request_frame(
     StreamId,
     {data, Payload},
@@ -803,6 +1019,16 @@ handle_request_frame(
             false -> Stream1
         end,
     {ok, Stream2, State};
+%% Non-trailer HEADERS after body started - stream error (RFC 9114 Section 4.1)
+handle_request_frame(
+    StreamId,
+    {headers, _HeaderBlock},
+    false,
+    #h3_stream{frame_state = expecting_data},
+    _State
+) ->
+    {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}};
+%% Trailers (HEADERS with FIN after expecting_data)
 handle_request_frame(
     StreamId,
     {headers, HeaderBlock},
@@ -810,18 +1036,23 @@ handle_request_frame(
     #h3_stream{frame_state = expecting_data} = Stream,
     #state{qpack_decoder = Decoder, owner = Owner} = State
 ) ->
-    %% Trailers
     case quic_qpack:decode(HeaderBlock, Decoder) of
         {{ok, Trailers}, Decoder1} ->
+            %% Send Section Acknowledgment for trailers
+            State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
             Stream1 = Stream#h3_stream{
                 trailers = Trailers,
                 frame_state = complete,
                 state = half_closed_remote
             },
             Owner ! {quic_h3, self(), {trailers, StreamId, Trailers}},
-            {ok, Stream1, State#state{qpack_decoder = Decoder1}};
-        {{blocked, _}, _Decoder1} ->
-            {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, <<"blocked">>}};
+            {ok, Stream1, State1};
+        {{blocked, RIC}, Decoder1} ->
+            %% Trailers blocked - buffer them
+            BlockedStreams = maps:put(
+                StreamId, {RIC, HeaderBlock, true}, State#state.blocked_streams
+            ),
+            {ok, Stream, State#state{blocked_streams = BlockedStreams, qpack_decoder = Decoder1}};
         {{error, Reason}, _Decoder1} ->
             {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
     end;
@@ -871,11 +1102,26 @@ handle_stream_closed(
         uni_stream_buffers = UniBuffers
     } = State
 ) ->
-    State#state{
-        streams = maps:remove(StreamId, Streams),
-        stream_buffers = maps:remove(StreamId, Buffers),
-        uni_stream_buffers = maps:remove(StreamId, UniBuffers)
-    }.
+    case is_critical_stream(StreamId, State) of
+        {true, Type} ->
+            %% Peer closed a critical stream - connection error (RFC 9114 Section 6.2.1)
+            {error,
+                {connection_error, ?H3_CLOSED_CRITICAL_STREAM,
+                    iolist_to_binary(io_lib:format("~p stream closed", [Type]))}};
+        false ->
+            %% Normal stream - remove from tracking
+            {ok, State#state{
+                streams = maps:remove(StreamId, Streams),
+                stream_buffers = maps:remove(StreamId, Buffers),
+                uni_stream_buffers = maps:remove(StreamId, UniBuffers)
+            }}
+    end.
+
+%% Check if a stream is a critical H3 stream
+is_critical_stream(StreamId, #state{peer_control_stream = StreamId}) -> {true, control};
+is_critical_stream(StreamId, #state{peer_encoder_stream = StreamId}) -> {true, qpack_encoder};
+is_critical_stream(StreamId, #state{peer_decoder_stream = StreamId}) -> {true, qpack_decoder};
+is_critical_stream(_, _) -> false.
 
 %%====================================================================
 %% Internal: Sending
@@ -1040,6 +1286,21 @@ send_encoder_instructions(
 %%====================================================================
 %% Internal: Helpers
 %%====================================================================
+
+%% Send Section Acknowledgment on decoder stream (RFC 9204 Section 4.4)
+send_section_ack(
+    StreamId,
+    #state{
+        quic_conn = QuicConn,
+        local_decoder_stream = DecoderStream
+    } = State
+) when DecoderStream =/= undefined ->
+    Ack = quic_qpack:encode_section_ack(StreamId),
+    quic:send_data(QuicConn, DecoderStream, Ack, false),
+    State;
+send_section_ack(_StreamId, State) ->
+    %% Decoder stream not yet established
+    State.
 
 maybe_transition_connected(#state{settings_received = true} = State) ->
     {next_state, connected, State};
