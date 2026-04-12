@@ -23,8 +23,12 @@ from aioquic.h3.events import (
     HeadersReceived,
     DataReceived,
     H3Event,
-    TrailersReceived,
 )
+# TrailersReceived may not exist in newer aioquic versions
+try:
+    from aioquic.h3.events import TrailersReceived
+except ImportError:
+    TrailersReceived = None
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import (
     ProtocolNegotiated,
@@ -79,7 +83,7 @@ class HttpServerProtocol(QuicConnectionProtocol):
             self._handle_headers(event.stream_id, event.headers, event.stream_ended)
         elif isinstance(event, DataReceived):
             self._handle_data(event.stream_id, event.data, event.stream_ended)
-        elif isinstance(event, TrailersReceived):
+        elif TrailersReceived is not None and isinstance(event, TrailersReceived):
             self._handle_trailers(event.stream_id, event.headers)
 
     def _handle_headers(
