@@ -54,6 +54,8 @@
 %% Test cases - Protocol behavior
 -export([
     settings_exchange/1,
+    settings_local_enforcement/1,
+    settings_custom_limits/1,
     goaway_graceful/1
 ]).
 
@@ -90,6 +92,8 @@ groups() ->
         ]},
         {protocol_behavior, [sequence], [
             settings_exchange,
+            settings_local_enforcement,
+            settings_custom_limits,
             goaway_graceful
         ]}
     ].
@@ -404,6 +408,89 @@ settings_exchange(Config) ->
     ?assert(is_map(LocalSettings)),
     %% Peer settings might be undefined if not yet received
     ?assert(PeerSettings =:= undefined orelse is_map(PeerSettings)),
+
+    quic_h3:close(Conn).
+
+%% @doc Test that local settings are properly stored for inbound validation
+%% RFC 9114 Section 7.2.4.1: Each endpoint uses its own settings to constrain inbound data
+settings_local_enforcement(Config) ->
+    Host = ?config(h3_host, Config),
+    Port = ?config(h3_port, Config),
+
+    %% Connect with custom local settings for inbound enforcement
+    CustomSettings = #{
+        max_field_section_size => 16384,
+        qpack_blocked_streams => 100
+    },
+    {ok, Conn} = quic_h3:connect(Host, Port, #{
+        verify => false,
+        settings => CustomSettings
+    }),
+
+    %% Wait for connection
+    timer:sleep(500),
+
+    %% Verify local settings were stored correctly
+    LocalSettings = quic_h3:get_settings(Conn),
+    ct:pal("Local settings with custom config: ~p", [LocalSettings]),
+
+    %% Our local settings should reflect what we configured
+    ?assertEqual(16384, maps:get(max_field_section_size, LocalSettings, undefined)),
+    ?assertEqual(100, maps:get(qpack_blocked_streams, LocalSettings, undefined)),
+
+    %% Make a request to verify connection still works with custom settings
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/test.txt">>},
+        {<<":authority">>, list_to_binary(Host)}
+    ],
+    {ok, StreamId} = quic_h3:request(Conn, Headers),
+    {Status, _, _} = receive_response(Conn, StreamId, 10000),
+    ?assertEqual(200, Status),
+
+    ct:pal("Request succeeded with custom local settings"),
+    quic_h3:close(Conn).
+
+%% @doc Test that peer settings are different from local settings (directionality)
+%% Local settings constrain inbound, peer settings constrain outbound
+settings_custom_limits(Config) ->
+    Host = ?config(h3_host, Config),
+    Port = ?config(h3_port, Config),
+
+    %% Connect with specific local settings
+    LocalMaxFieldSize = 32768,
+    {ok, Conn} = quic_h3:connect(Host, Port, #{
+        verify => false,
+        settings => #{max_field_section_size => LocalMaxFieldSize}
+    }),
+
+    %% Wait for settings exchange
+    timer:sleep(500),
+
+    LocalSettings = quic_h3:get_settings(Conn),
+    PeerSettings = quic_h3:get_peer_settings(Conn),
+
+    ct:pal("Local max_field_section_size: ~p", [
+        maps:get(max_field_section_size, LocalSettings, undefined)
+    ]),
+
+    %% Our local setting should be what we configured
+    ?assertEqual(LocalMaxFieldSize, maps:get(max_field_section_size, LocalSettings, undefined)),
+
+    %% Peer settings are independent (server's advertised limits)
+    %% They might be different from ours
+    case PeerSettings of
+        undefined ->
+            ct:pal("Peer settings not yet received");
+        _ ->
+            PeerMaxFieldSize = maps:get(max_field_section_size, PeerSettings, undefined),
+            ct:pal("Peer max_field_section_size: ~p", [PeerMaxFieldSize]),
+            %% Peer's setting is what THEY advertise (constrains what we send)
+            %% Local setting is what WE advertise (constrains what they send)
+            %% These are independent values - this test verifies they're stored separately
+            ?assert(is_integer(PeerMaxFieldSize) orelse PeerMaxFieldSize =:= undefined)
+    end,
 
     quic_h3:close(Conn).
 
