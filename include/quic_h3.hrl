@@ -24,8 +24,11 @@
 %% 0x1f * N + 0x21 for any non-negative integer N
 
 %% PRIORITY_UPDATE frame (RFC 9218 Section 7)
--define(H3_FRAME_PRIORITY_UPDATE_REQUEST, 16#0F0700).  %% For request streams
--define(H3_FRAME_PRIORITY_UPDATE_PUSH, 16#0F0701).     %% For push streams
+
+%% For request streams
+-define(H3_FRAME_PRIORITY_UPDATE_REQUEST, 16#0F0700).
+%% For push streams
+-define(H3_FRAME_PRIORITY_UPDATE_PUSH, 16#0F0701).
 
 %%====================================================================
 %% HTTP/3 Unidirectional Stream Types (RFC 9114 Section 6.2)

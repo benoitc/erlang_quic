@@ -67,7 +67,8 @@
     get_encoder_instructions/1,
     clear_encoder_instructions/1,
     encode_section_ack/1,
-    encode_insert_count_increment/1
+    encode_insert_count_increment/1,
+    encode_stream_cancel/1
 ]).
 
 %%====================================================================
@@ -261,6 +262,13 @@ encode_section_ack(StreamId) ->
 encode_insert_count_increment(Increment) ->
     %% Insert Count Increment: 00xxxxxx
     encode_prefixed_int(Increment, 6, 2#00).
+
+%% @doc Encode a Stream Cancellation for the decoder stream.
+%% Used when a stream is cancelled before headers are fully decoded.
+-spec encode_stream_cancel(non_neg_integer()) -> binary().
+encode_stream_cancel(StreamId) ->
+    %% Stream Cancellation: 01xxxxxx
+    encode_prefixed_int(StreamId, 6, 2#01).
 
 %%====================================================================
 %% Encoder Stream Processing
