@@ -1388,7 +1388,7 @@ is_critical_stream(_, _) -> false.
 
 send_request(
     Headers,
-    _Opts,
+    Opts,
     #state{
         quic_conn = QuicConn,
         qpack_encoder = Encoder,
@@ -1396,27 +1396,35 @@ send_request(
         streams = Streams
     } = State
 ) ->
+    %% end_stream defaults to true for requests without body (GET, HEAD, etc.)
+    EndStream = maps:get(end_stream, Opts, true),
     case quic:open_stream(QuicConn) of
         {ok, StreamId} ->
             %% Use encode/3 with StreamId for section ack tracking
             {Encoded, Encoder1} = quic_qpack:encode(Headers, StreamId, Encoder),
+            %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
+            %% so peer has dynamic table entries before receiving references
+            State1 = State#state{qpack_encoder = Encoder1},
+            State2 = send_encoder_instructions(State1),
             HeadersFrame = quic_h3_frame:encode_headers(Encoded),
-            case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
+            case quic:send_data(QuicConn, StreamId, HeadersFrame, EndStream) of
                 ok ->
+                    StreamState =
+                        case EndStream of
+                            true -> half_closed_local;
+                            false -> open
+                        end,
                     Stream = #h3_stream{
                         id = StreamId,
                         type = request,
-                        state = open,
+                        state = StreamState,
                         frame_state = expecting_headers
                     },
-                    State1 = State#state{
-                        qpack_encoder = Encoder1,
+                    State3 = State2#state{
                         next_stream_id = NextId + 4,
                         streams = Streams#{StreamId => Stream}
                     },
-                    %% Send encoder instructions if any
-                    send_encoder_instructions(State1),
-                    {ok, StreamId, State1};
+                    {ok, StreamId, State3};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -1440,16 +1448,15 @@ do_send_response(
             AllHeaders = [StatusHeader | Headers],
             %% Use encode/3 with StreamId for section ack tracking
             {Encoded, Encoder1} = quic_qpack:encode(AllHeaders, StreamId, Encoder),
+            %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
+            State1 = State#state{qpack_encoder = Encoder1},
+            State2 = send_encoder_instructions(State1),
             HeadersFrame = quic_h3_frame:encode_headers(Encoded),
             case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
                 ok ->
                     Stream1 = Stream#h3_stream{status = Status, headers = AllHeaders},
-                    State1 = State#state{
-                        qpack_encoder = Encoder1,
-                        streams = Streams#{StreamId => Stream1}
-                    },
-                    send_encoder_instructions(State1),
-                    {ok, State1};
+                    State3 = State2#state{streams = Streams#{StreamId => Stream1}},
+                    {ok, State3};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -1489,6 +1496,9 @@ do_send_trailers(
         {ok, Stream} ->
             %% Use encode/3 with StreamId for section ack tracking
             {Encoded, Encoder1} = quic_qpack:encode(Trailers, StreamId, Encoder),
+            %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
+            State1 = State#state{qpack_encoder = Encoder1},
+            State2 = send_encoder_instructions(State1),
             TrailersFrame = quic_h3_frame:encode_headers(Encoded),
             case quic:send_data(QuicConn, StreamId, TrailersFrame, true) of
                 ok ->
@@ -1496,12 +1506,8 @@ do_send_trailers(
                         trailers = Trailers,
                         state = half_closed_local
                     },
-                    State1 = State#state{
-                        qpack_encoder = Encoder1,
-                        streams = Streams#{StreamId => Stream1}
-                    },
-                    send_encoder_instructions(State1),
-                    {ok, State1};
+                    State3 = State2#state{streams = Streams#{StreamId => Stream1}},
+                    {ok, State3};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -1589,36 +1595,43 @@ send_encoder_instructions(
 %% Internal: Helpers
 %%====================================================================
 
-%% Send Section Acknowledgment on decoder stream (RFC 9204 Section 4.4)
+%% Send Section Acknowledgment on decoder stream (RFC 9204 Section 4.4.1)
+%% Only send when the field section could have referenced dynamic table entries.
+%% If our max table capacity is 0, peer cannot use dynamic entries, so RIC is always 0.
 send_section_ack(
     StreamId,
     #state{
         quic_conn = QuicConn,
-        local_decoder_stream = DecoderStream
+        local_decoder_stream = DecoderStream,
+        qpack_decoder = Decoder
     } = State
 ) when DecoderStream =/= undefined ->
-    Ack = quic_qpack:encode_section_ack(StreamId),
-    quic:send_data(QuicConn, DecoderStream, Ack, false),
-    State;
+    MaxCapacity = quic_qpack:get_dynamic_capacity(Decoder),
+    case MaxCapacity > 0 of
+        true ->
+            %% Dynamic table in use, send Section Ack
+            Ack = quic_qpack:encode_section_ack(StreamId),
+            quic:send_data(QuicConn, DecoderStream, Ack, false),
+            State;
+        false ->
+            %% No dynamic table, peer can't use dynamic entries, no ack needed
+            State
+    end;
 send_section_ack(_StreamId, State) ->
     %% Decoder stream not yet established
     State.
 
 %% Apply peer SETTINGS to QPACK encoder and connection state (RFC 9114 Section 7.2.4.1)
 apply_peer_settings(Settings, #state{qpack_encoder = Encoder} = State) ->
-    %% 1. Configure QPACK encoder with peer's max table capacity
-    %% The encoder must not use more than this capacity
-    PeerMaxTableCapacity = maps:get(qpack_max_table_capacity, Settings, 0),
-    Encoder1 =
-        case PeerMaxTableCapacity > 0 of
-            true ->
-                %% Set encoder's dynamic table capacity to peer's limit
-                %% This generates a Set Dynamic Table Capacity instruction
-                quic_qpack:set_dynamic_capacity(PeerMaxTableCapacity, Encoder);
-            false ->
-                %% Peer doesn't support dynamic table - disable it
-                quic_qpack:set_dynamic_capacity(0, Encoder)
-        end,
+    %% 1. QPACK encoder configuration
+    %% Set encoder dynamic table capacity based on peer's advertised max.
+    %% NOTE: The QPACK encoder (quic_qpack.erl) only references entries that
+    %% have been acknowledged by the peer (via Known Received Count). New entries
+    %% are added to the table and encoder instructions are sent, but we encode
+    %% as literals until the peer acknowledges receipt. This avoids the cross-stream
+    %% ordering issue where HEADERS might arrive before encoder instructions.
+    MaxCapacity = maps:get(qpack_max_table_capacity, Settings, 0),
+    Encoder1 = quic_qpack:set_dynamic_capacity(MaxCapacity, Encoder),
 
     %% 2. Max field section size - store for header block validation
     MaxFieldSectionSize = maps:get(

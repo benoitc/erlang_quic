@@ -1420,9 +1420,15 @@ connected({call, From}, peercert, #state{peer_cert = Cert} = State) ->
     {keep_state, State, [{reply, From, {ok, Cert}}]};
 connected({call, From}, datagram_max_size, #state{max_datagram_frame_size_remote = Size} = State) ->
     {keep_state, State, [{reply, From, Size}]};
-connected({call, From}, {set_owner, NewOwner}, State) ->
+connected({call, From}, {set_owner, NewOwner}, #state{alpn = Alpn, transport_params = TP} = State) ->
+    %% Notify new owner that connection is already established
+    Info = #{alpn => Alpn, alpn_protocol => Alpn, transport_params => TP},
+    NewOwner ! {quic, self(), {connected, Info}},
     {keep_state, State#state{owner = NewOwner}, [{reply, From, ok}]};
-connected(cast, {set_owner, NewOwner}, State) ->
+connected(cast, {set_owner, NewOwner}, #state{alpn = Alpn, transport_params = TP} = State) ->
+    %% Notify new owner that connection is already established
+    Info = #{alpn => Alpn, alpn_protocol => Alpn, transport_params => TP},
+    NewOwner ! {quic, self(), {connected, Info}},
     {keep_state, State#state{owner = NewOwner}};
 connected({call, From}, {send_datagram, Data}, State) ->
     case do_send_datagram(Data, State) of

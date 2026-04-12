@@ -554,25 +554,27 @@ can_reference(AbsIndex, #qpack{known_received_count = KRC}) ->
     AbsIndex < KRC.
 
 %% Decide whether to insert and encode header
+%% NOTE: Per RFC 9204, we MUST NOT reference dynamic table entries that the peer
+%% hasn't received yet. When we insert a new entry, we encode as literal because
+%% the encoder instruction hasn't been acknowledged. The entry is added to the
+%% dynamic table for future requests where it will be acknowledged.
 -spec encode_with_insertion(header(), state()) -> {binary(), state(), integer() | none}.
 encode_with_insertion({Name, Value}, State) ->
     case should_insert(Name, Value, State) of
         true ->
             %% Insert into dynamic table and generate encoder instruction
             {State1, Instruction} = generate_insert_instruction(Name, Value, State),
-            %% Insert the entry (State1 already has instruction queued)
+            %% Insert the entry
             {ok, State2} = insert_entry(Name, Value, State1),
-            %% Now encode using the newly inserted entry
-            AbsIndex = State2#qpack.insert_count - 1,
-            %% Most recently inserted
-            RelIndex = 0,
-            {
-                encode_indexed_dynamic(RelIndex),
-                State2#qpack{
-                    encoder_instructions = [Instruction | State2#qpack.encoder_instructions]
-                },
-                AbsIndex
-            };
+            %% Queue the encoder instruction
+            State3 = State2#qpack{
+                encoder_instructions = [Instruction | State2#qpack.encoder_instructions]
+            },
+            %% Encode as literal - we can't reference the entry yet because
+            %% the peer hasn't received the encoder instruction. The entry will
+            %% be available for future requests once acknowledged.
+            {Encoded, _} = encode_header_static({Name, Value}, State3),
+            {Encoded, State3, none};
         false ->
             %% Don't insert, encode as literal
             {Encoded, NewState} = encode_header_static({Name, Value}, State),

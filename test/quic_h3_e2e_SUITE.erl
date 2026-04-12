@@ -178,7 +178,7 @@ basic_post(Config) ->
         {<<":authority">>, list_to_binary(Host)},
         {<<"content-length">>, integer_to_binary(byte_size(PostBody))}
     ],
-    {ok, StreamId} = quic_h3:request(Conn, Headers),
+    {ok, StreamId} = quic_h3:request(Conn, Headers, #{end_stream => false}),
     ok = quic_h3:send_data(Conn, StreamId, PostBody, true),
 
     {Status, _, Body} = receive_response(Conn, StreamId, 10000),
@@ -281,7 +281,7 @@ post_echo(Config) ->
         {<<":authority">>, list_to_binary(Host)},
         {<<"content-length">>, integer_to_binary(byte_size(PostBody))}
     ],
-    {ok, StreamId} = quic_h3:request(Conn, Headers),
+    {ok, StreamId} = quic_h3:request(Conn, Headers, #{end_stream => false}),
     ok = quic_h3:send_data(Conn, StreamId, PostBody, true),
 
     {Status, _, Body} = receive_response(Conn, StreamId, 15000),
@@ -333,7 +333,7 @@ multiple_requests(Config) ->
         {<<":path">>, <<"/echo">>},
         {<<":authority">>, list_to_binary(Host)}
     ],
-    {ok, Stream3} = quic_h3:request(Conn, Headers3),
+    {ok, Stream3} = quic_h3:request(Conn, Headers3, #{end_stream => false}),
     ok = quic_h3:send_data(Conn, Stream3, PostBody, true),
     {Status3, _, Body3} = receive_response(Conn, Stream3, 10000),
     ?assertEqual(200, Status3),
