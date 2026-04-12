@@ -74,7 +74,8 @@
     connect/2,
     connect/3,
     request/2,
-    request/3
+    request/3,
+    wait_connected/2
 ]).
 
 %% Shared API (client and server)
@@ -173,6 +174,14 @@ connect(Host, Port) ->
     connect(Host, Port, #{}).
 
 %% @doc Connect to an HTTP/3 server with options.
+%%
+%% Options:
+%% <ul>
+%%   <li>`sync' - If `true', wait for H3 connection to be established before returning.
+%%                This ensures requests can be made immediately. Default: `false'.</li>
+%%   <li>`connect_timeout' - Timeout in ms for sync connect. Default: 5000.</li>
+%% </ul>
+%% @end
 -spec connect(Host, Port, Opts) -> {ok, conn()} | {error, term()} when
     Host :: binary() | string() | inet:ip_address(),
     Port :: inet:port_number(),
@@ -182,19 +191,36 @@ connect(Host, Port, Opts) ->
     QuicOpts = build_client_quic_opts(HostBin, Opts),
     case quic:connect(HostBin, Port, QuicOpts, self()) of
         {ok, QuicConn} ->
-            H3Opts = maps:with([settings], Opts),
-            case quic_h3_connection:start_link(QuicConn, HostBin, Port, H3Opts) of
-                {ok, H3Conn} ->
-                    %% Transfer ownership to H3 process so it receives QUIC events
-                    %% including the {connected, Info} notification
-                    ok = quic:set_owner_sync(QuicConn, H3Conn),
-                    {ok, H3Conn};
-                {error, Reason} ->
-                    quic:close(QuicConn, 0, <<"h3 init failed">>),
-                    {error, Reason}
-            end;
+            start_h3_connection(QuicConn, HostBin, Port, Opts);
         {error, Reason} ->
             {error, Reason}
+    end.
+
+start_h3_connection(QuicConn, HostBin, Port, Opts) ->
+    H3Opts = maps:with([settings], Opts),
+    case quic_h3_connection:start_link(QuicConn, HostBin, Port, H3Opts) of
+        {ok, H3Conn} ->
+            %% Transfer ownership to H3 process so it receives QUIC events
+            ok = quic:set_owner_sync(QuicConn, H3Conn),
+            maybe_wait_connected(H3Conn, Opts);
+        {error, Reason} ->
+            quic:close(QuicConn, 0, <<"h3 init failed">>),
+            {error, Reason}
+    end.
+
+maybe_wait_connected(H3Conn, Opts) ->
+    case maps:get(sync, Opts, false) of
+        true ->
+            Timeout = maps:get(connect_timeout, Opts, 5000),
+            case wait_connected(H3Conn, Timeout) of
+                ok ->
+                    {ok, H3Conn};
+                {error, timeout} ->
+                    quic_h3:close(H3Conn),
+                    {error, connect_timeout}
+            end;
+        false ->
+            {ok, H3Conn}
     end.
 
 %% @doc Send an HTTP request.
@@ -350,6 +376,19 @@ get_settings(Conn) ->
 -spec get_peer_settings(conn()) -> map() | undefined.
 get_peer_settings(Conn) ->
     quic_h3_connection:get_peer_settings(Conn).
+
+%% @doc Wait for H3 connection to be ready.
+%%
+%% Blocks until the connection is established and SETTINGS exchanged,
+%% or until the timeout expires.
+%% @end
+-spec wait_connected(conn(), timeout()) -> ok | {error, timeout}.
+wait_connected(Conn, Timeout) ->
+    receive
+        {quic_h3, Conn, connected} -> ok
+    after Timeout ->
+        {error, timeout}
+    end.
 
 %%====================================================================
 %% Internal Functions

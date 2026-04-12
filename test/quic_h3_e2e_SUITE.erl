@@ -145,7 +145,7 @@ basic_get(Config) ->
     Host = ?config(h3_host, Config),
     Port = ?config(h3_port, Config),
 
-    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false}),
+    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false, sync => true}),
 
     Headers = [
         {<<":method">>, <<"GET">>},
@@ -168,7 +168,7 @@ basic_post(Config) ->
     Host = ?config(h3_host, Config),
     Port = ?config(h3_port, Config),
 
-    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false}),
+    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false, sync => true}),
 
     PostBody = <<"hello world">>,
     Headers = [
@@ -194,7 +194,7 @@ head_request(Config) ->
     Host = ?config(h3_host, Config),
     Port = ?config(h3_port, Config),
 
-    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false}),
+    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false, sync => true}),
 
     Headers = [
         {<<":method">>, <<"HEAD">>},
@@ -218,7 +218,7 @@ get_index(Config) ->
     Host = ?config(h3_host, Config),
     Port = ?config(h3_port, Config),
 
-    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false}),
+    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false, sync => true}),
 
     Headers = [
         {<<":method">>, <<"GET">>},
@@ -245,7 +245,7 @@ large_response(Config) ->
     Host = ?config(h3_host, Config),
     Port = ?config(h3_port, Config),
 
-    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false}),
+    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false, sync => true}),
 
     Headers = [
         {<<":method">>, <<"GET">>},
@@ -270,7 +270,7 @@ post_echo(Config) ->
     Host = ?config(h3_host, Config),
     Port = ?config(h3_port, Config),
 
-    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false}),
+    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false, sync => true}),
 
     %% Send 64KB body
     PostBody = crypto:strong_rand_bytes(64 * 1024),
@@ -301,7 +301,7 @@ multiple_requests(Config) ->
     Host = ?config(h3_host, Config),
     Port = ?config(h3_port, Config),
 
-    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false}),
+    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false, sync => true}),
 
     %% Request 1
     Headers1 = [
@@ -347,7 +347,7 @@ concurrent_streams(Config) ->
     Host = ?config(h3_host, Config),
     Port = ?config(h3_port, Config),
 
-    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false}),
+    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false, sync => true}),
 
     %% Open multiple streams concurrently
     Paths = [<<"/test.txt">>, <<"/">>, <<"/test.txt">>],
@@ -485,7 +485,7 @@ goaway_graceful(Config) ->
     Host = ?config(h3_host, Config),
     Port = ?config(h3_port, Config),
 
-    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false}),
+    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false, sync => true}),
 
     %% Make a request first
     Headers = [
@@ -507,17 +507,6 @@ goaway_graceful(Config) ->
 %%====================================================================
 %% Helper Functions
 %%====================================================================
-
-%% @doc Wait for H3 connection to be ready
-wait_for_h3_connected(Conn, Timeout) ->
-    receive
-        {quic_h3, Conn, connected} ->
-            ok;
-        {quic_h3, Conn, {connected, _Info}} ->
-            ok
-    after Timeout ->
-        {error, timeout}
-    end.
 
 %% @doc Wait for server to be reachable
 wait_for_server(_Host, _Port, 0) ->
