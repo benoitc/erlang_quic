@@ -8,9 +8,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy server code
 COPY server/quic_server.py .
+COPY server/quic_h3_server.py .
 
-# Expose QUIC port
+# Expose QUIC ports
 EXPOSE 4433/udp
+EXPOSE 4435/udp
 
 # Run server
 CMD ["python", "quic_server.py", "--host", "0.0.0.0", "--port", "4433", \
