@@ -312,12 +312,35 @@ unknown_frame_after_complete_allowed_test() ->
 %% Push Promise on Request Stream Tests (RFC 9114 Section 7.2.5)
 %%====================================================================
 
-push_promise_on_request_stream_error_test() ->
+%% Server receiving PUSH_PROMISE is a protocol error
+push_promise_server_receives_error_test() ->
     Stream = #h3_stream{id = 0, frame_state = expecting_data},
-    State = make_test_state(#{}),
+    State = make_test_state(#{role => server}),
     Result = quic_h3_connection:handle_request_frame(
         0, {push_promise, 1, <<>>}, false, Stream, State
     ),
+    ?assertMatch({error, {connection_error, ?H3_FRAME_UNEXPECTED, _}}, Result).
+
+%%====================================================================
+%% MAX_PUSH_ID Control Frame Tests (RFC 9114 Section 7.2.7)
+%%====================================================================
+
+%% Server receives MAX_PUSH_ID - enables push
+max_push_id_enables_push_test() ->
+    State = make_test_state(#{role => server, settings_received => true}),
+    Result = quic_h3_connection:handle_control_frame({max_push_id, 10}, State),
+    ?assertMatch({ok, _}, Result).
+
+%% Server receives MAX_PUSH_ID - cannot decrease
+max_push_id_decrease_error_test() ->
+    State = make_test_state(#{role => server, max_push_id => 10, settings_received => true}),
+    Result = quic_h3_connection:handle_control_frame({max_push_id, 5}, State),
+    ?assertMatch({error, {connection_error, ?H3_ID_ERROR, _}}, Result).
+
+%% Client receives MAX_PUSH_ID - error (server should not send it)
+max_push_id_from_server_error_test() ->
+    State = make_test_state(#{role => client, settings_received => true}),
+    Result = quic_h3_connection:handle_control_frame({max_push_id, 10}, State),
     ?assertMatch({error, {connection_error, ?H3_FRAME_UNEXPECTED, _}}, Result).
 
 %%====================================================================
@@ -570,7 +593,17 @@ make_test_state(Overrides) ->
         peer_connect_enabled => false,
         %% RFC 9114 Section 7.2.4.1 local settings enforcement (inbound)
         local_max_field_section_size => 65536,
-        local_max_blocked_streams => 0
+        local_max_blocked_streams => 0,
+        %% Server-side push state (RFC 9114 Section 4.6)
+        max_push_id => undefined,
+        next_push_id => 0,
+        push_streams => #{},
+        cancelled_pushes => sets:new([{version, 2}]),
+        %% Client-side push state
+        local_max_push_id => undefined,
+        promised_pushes => #{},
+        received_pushes => #{},
+        local_cancelled_pushes => sets:new([{version, 2}])
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -588,4 +621,9 @@ make_test_state(Overrides) ->
         maps:get(decoder_buffer, Merged), maps:get(blocked_streams, Merged),
         maps:get(peer_max_field_section_size, Merged), maps:get(peer_max_blocked_streams, Merged),
         maps:get(peer_connect_enabled, Merged), maps:get(local_max_field_section_size, Merged),
-        maps:get(local_max_blocked_streams, Merged)}.
+        maps:get(local_max_blocked_streams, Merged),
+        %% Push fields
+        maps:get(max_push_id, Merged), maps:get(next_push_id, Merged),
+        maps:get(push_streams, Merged), maps:get(cancelled_pushes, Merged),
+        maps:get(local_max_push_id, Merged), maps:get(promised_pushes, Merged),
+        maps:get(received_pushes, Merged), maps:get(local_cancelled_pushes, Merged)}.

@@ -47,6 +47,32 @@ services:
               "--secrets-log", "/logs/h3_sslkeys.log", "-v"]
     restart: unless-stopped
 
+  # HTTP/3 server with push support for E2E testing
+  h3-push-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.quic-server
+    ports:
+      - "4436:4436/udp"
+    volumes:
+      - ../certs:/certs:ro
+      - ./www:/www:ro
+      - ./logs:/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('127.0.0.1', 4436)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    environment:
+      - PYTHONUNBUFFERED=1
+      - H3_PUSH_ENABLED=1
+    command: ["python", "quic_h3_server.py", "--host", "0.0.0.0", "--port", "4436",
+              "--cert", "/certs/cert.pem", "--key", "/certs/priv.key",
+              "--document-root", "/www", "--enable-push",
+              "--secrets-log", "/logs/h3_push_sslkeys.log", "-v"]
+    restart: unless-stopped
+
   # aioquic HTTP/3 client for testing our server
   aioquic-h3-client:
     build:

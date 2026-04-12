@@ -51,19 +51,42 @@
 %%%     quic_h3:send_data(Conn, StreamId, <<"Hello, HTTP/3!">>, true).
 %%% '''
 %%%
-%%% == Limitations ==
+%%% == Server Push (RFC 9114 Section 4.6) ==
 %%%
-%%% Server Push (RFC 9114 Section 4.6) is not supported. This is an intentional
-%%% design decision as server push has seen limited adoption and is disabled by
-%%% default in most browsers. The implementation:
+%%% Server push allows a server to pre-emptively send resources to a client.
 %%%
-%%% <ul>
-%%%   <li>Ignores incoming push streams on the client side</li>
-%%%   <li>Treats MAX_PUSH_ID frames as no-ops</li>
-%%%   <li>Treats CANCEL_PUSH frames as no-ops</li>
-%%%   <li>Rejects PUSH_PROMISE frames on control streams with H3_FRAME_UNEXPECTED</li>
-%%%   <li>Rejects push streams from clients with H3_STREAM_CREATION_ERROR</li>
-%%% </ul>
+%%% Server side:
+%%% ```
+%%% %% In request handler, push associated resources
+%%% {ok, PushId} = quic_h3:push(Conn, StreamId, [
+%%%     {<<":method">>, <<"GET">>},
+%%%     {<<":scheme">>, <<"https">>},
+%%%     {<<":authority">>, <<"example.com">>},
+%%%     {<<":path">>, <<"/style.css">>}
+%%% ]),
+%%% ok = quic_h3:send_push_response(Conn, PushId, 200,
+%%%     [{<<"content-type">>, <<"text/css">>}]),
+%%% ok = quic_h3:send_push_data(Conn, PushId, CssBody, true).
+%%% '''
+%%%
+%%% Client side:
+%%% ```
+%%% %% Enable push after connecting
+%%% ok = quic_h3:set_max_push_id(Conn, 10),
+%%%
+%%% %% Handle push notifications
+%%% receive
+%%%     {quic_h3, Conn, {push_promise, PushId, ReqStreamId, Headers}} ->
+%%%         %% Server announced it will push this resource
+%%%         ok;
+%%%     {quic_h3, Conn, {push_response, PushId, Status, Headers}} ->
+%%%         %% Push response headers received
+%%%         ok;
+%%%     {quic_h3, Conn, {push_data, PushId, Data, Fin}} ->
+%%%         %% Push response data received
+%%%         ok
+%%% end.
+%%% '''
 %%%
 %%% @end
 
@@ -96,6 +119,19 @@
     send_response/4
 ]).
 
+%% Server Push API (RFC 9114 Section 4.6)
+-export([
+    push/3,
+    send_push_response/4,
+    send_push_data/4
+]).
+
+%% Client Push API
+-export([
+    set_max_push_id/2,
+    cancel_push/2
+]).
+
 %% Internal callbacks
 -export([
     h3_connection_handler/4
@@ -115,7 +151,8 @@
     status/0,
     error_code/0,
     connect_opts/0,
-    server_opts/0
+    server_opts/0,
+    push_id/0
 ]).
 
 -include("quic.hrl").
@@ -127,6 +164,7 @@
 
 -type conn() :: pid().
 -type stream_id() :: non_neg_integer().
+-type push_id() :: non_neg_integer().
 -type headers() :: [{binary(), binary()}].
 -type status() :: 100..599.
 -type error_code() :: non_neg_integer().
@@ -359,6 +397,68 @@ stop_server(Name) ->
     ok | {error, term()}.
 send_response(Conn, StreamId, Status, Headers) ->
     quic_h3_connection:send_response(Conn, StreamId, Status, Headers).
+
+%%====================================================================
+%% Server Push API (RFC 9114 Section 4.6)
+%%====================================================================
+
+%% @doc Initiate a server push (server only).
+%%
+%% Sends a PUSH_PROMISE on the request stream and allocates a push ID.
+%% Returns the push ID for subsequent send_push_response/send_push_data calls.
+%%
+%% The Headers should contain the pseudo-headers for the pushed request:
+%% `:method', `:scheme', `:authority', and `:path'.
+%% @end
+-spec push(conn(), stream_id(), headers()) -> {ok, push_id()} | {error, term()}.
+push(Conn, RequestStreamId, Headers) ->
+    quic_h3_connection:push(Conn, RequestStreamId, Headers).
+
+%% @doc Send response headers on a push stream (server only).
+%%
+%% After push/3 returns a push ID, use this to send the response headers.
+%% The `:status' pseudo-header is added automatically.
+%% @end
+-spec send_push_response(conn(), push_id(), status(), headers()) -> ok | {error, term()}.
+send_push_response(Conn, PushId, Status, Headers) ->
+    quic_h3_connection:send_push_response(Conn, PushId, Status, Headers).
+
+%% @doc Send data on a push stream (server only).
+%%
+%% Set Fin to true to indicate this is the last data.
+%% @end
+-spec send_push_data(conn(), push_id(), binary(), boolean()) -> ok | {error, term()}.
+send_push_data(Conn, PushId, Data, Fin) ->
+    quic_h3_connection:send_push_data(Conn, PushId, Data, Fin).
+
+%%====================================================================
+%% Client Push API
+%%====================================================================
+
+%% @doc Set the maximum push ID (client only).
+%%
+%% This enables server push up to the specified push ID.
+%% Call this after connecting to allow the server to push resources.
+%% The MaxPushId cannot be decreased once set.
+%%
+%% Example:
+%% ```
+%% %% Enable push with up to 10 promised resources (push IDs 0-9)
+%% ok = quic_h3:set_max_push_id(Conn, 9).
+%% '''
+%% @end
+-spec set_max_push_id(conn(), push_id()) -> ok | {error, term()}.
+set_max_push_id(Conn, MaxPushId) ->
+    quic_h3_connection:set_max_push_id(Conn, MaxPushId).
+
+%% @doc Cancel a push (client only).
+%%
+%% Sends CANCEL_PUSH to tell the server we don't want this push.
+%% Can be called after receiving a push_promise notification.
+%% @end
+-spec cancel_push(conn(), push_id()) -> ok.
+cancel_push(Conn, PushId) ->
+    quic_h3_connection:cancel_push(Conn, PushId).
 
 %%====================================================================
 %% Query API

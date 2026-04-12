@@ -31,7 +31,14 @@
     goaway/1,
     close/1,
     get_settings/1,
-    get_peer_settings/1
+    get_peer_settings/1,
+    %% Server Push API (RFC 9114 Section 4.6)
+    push/3,
+    send_push_response/4,
+    send_push_data/4,
+    %% Client Push API
+    set_max_push_id/2,
+    cancel_push/2
 ]).
 
 %% gen_statem callbacks
@@ -123,7 +130,8 @@
     stream_buffers = #{} :: #{stream_id() => binary()},
 
     %% Pending uni stream type detection
-    uni_stream_buffers = #{} :: #{stream_id() => binary()},
+    %% Value is binary() for regular streams, or {push_pending, binary()} for push streams
+    uni_stream_buffers = #{} :: #{stream_id() => binary() | {push_pending, binary()}},
 
     %% QPACK instruction buffers for partial instructions (RFC 9204 Section 4.5)
     encoder_buffer = <<>> :: binary(),
@@ -140,7 +148,27 @@
 
     %% Local settings enforcement (validate inbound data - RFC 9114 Section 7.2.4.1)
     local_max_field_section_size = ?H3_DEFAULT_MAX_FIELD_SECTION_SIZE :: non_neg_integer(),
-    local_max_blocked_streams = 0 :: non_neg_integer()
+    local_max_blocked_streams = 0 :: non_neg_integer(),
+
+    %% Server-side push state (RFC 9114 Section 4.6)
+    %% max_push_id: Maximum push ID allowed by client (from MAX_PUSH_ID frame)
+    max_push_id :: non_neg_integer() | undefined,
+    %% next_push_id: Next push ID to allocate for server push
+    next_push_id = 0 :: non_neg_integer(),
+    %% push_streams: Active push streams - maps PushId to {StreamId, #h3_stream{}}
+    push_streams = #{} :: #{non_neg_integer() => {non_neg_integer(), #h3_stream{}}},
+    %% cancelled_pushes: Set of push IDs cancelled by client
+    cancelled_pushes = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
+
+    %% Client-side push state (RFC 9114 Section 4.6)
+    %% local_max_push_id: Maximum push ID we've sent to server
+    local_max_push_id :: non_neg_integer() | undefined,
+    %% promised_pushes: Push promises received - maps PushId to {RequestStreamId, Headers}
+    promised_pushes = #{} :: #{non_neg_integer() => {non_neg_integer(), [{binary(), binary()}]}},
+    %% received_pushes: Active push streams from server - maps PushId to StreamId
+    received_pushes = #{} :: #{non_neg_integer() => non_neg_integer()},
+    %% local_cancelled_pushes: Set of push IDs we've cancelled
+    local_cancelled_pushes = sets:new([{version, 2}]) :: sets:set(non_neg_integer())
 }).
 
 %%====================================================================
@@ -220,6 +248,46 @@ get_settings(Conn) ->
 -spec get_peer_settings(pid()) -> map() | undefined.
 get_peer_settings(Conn) ->
     gen_statem:call(Conn, get_peer_settings).
+
+%%====================================================================
+%% Server Push API (RFC 9114 Section 4.6)
+%%====================================================================
+
+%% @doc Initiate a server push (server only).
+%% Sends a PUSH_PROMISE on the request stream and allocates a push ID.
+%% Returns the push ID for subsequent send_push_response/send_push_data calls.
+-spec push(pid(), stream_id(), [{binary(), binary()}]) ->
+    {ok, non_neg_integer()} | {error, term()}.
+push(Conn, RequestStreamId, Headers) ->
+    gen_statem:call(Conn, {push, RequestStreamId, Headers}).
+
+%% @doc Send response headers on a push stream (server only).
+-spec send_push_response(pid(), non_neg_integer(), pos_integer(), [{binary(), binary()}]) ->
+    ok | {error, term()}.
+send_push_response(Conn, PushId, Status, Headers) ->
+    gen_statem:call(Conn, {send_push_response, PushId, Status, Headers}).
+
+%% @doc Send data on a push stream (server only).
+-spec send_push_data(pid(), non_neg_integer(), binary(), boolean()) ->
+    ok | {error, term()}.
+send_push_data(Conn, PushId, Data, Fin) ->
+    gen_statem:call(Conn, {send_push_data, PushId, Data, Fin}).
+
+%%====================================================================
+%% Client Push API
+%%====================================================================
+
+%% @doc Set the maximum push ID (client only).
+%% This enables server push up to the specified push ID.
+-spec set_max_push_id(pid(), non_neg_integer()) -> ok | {error, term()}.
+set_max_push_id(Conn, MaxPushId) ->
+    gen_statem:call(Conn, {set_max_push_id, MaxPushId}).
+
+%% @doc Cancel a push (client only).
+%% Sends CANCEL_PUSH to tell server we don't want this push.
+-spec cancel_push(pid(), non_neg_integer()) -> ok.
+cancel_push(Conn, PushId) ->
+    gen_statem:cast(Conn, {cancel_push, PushId}).
 
 %%====================================================================
 %% gen_statem callbacks
@@ -475,6 +543,52 @@ connected({call, From}, get_settings, #state{local_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
 connected({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
+%% Server Push API
+connected({call, From}, {push, RequestStreamId, Headers}, #state{role = server} = State) ->
+    case do_push(RequestStreamId, Headers, State) of
+        {ok, PushId, State1} ->
+            {keep_state, State1, [{reply, From, {ok, PushId}}]};
+        {error, Reason} ->
+            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+    end;
+connected({call, From}, {push, _RequestStreamId, _Headers}, #state{role = client}) ->
+    {keep_state_and_data, [{reply, From, {error, client_cannot_push}}]};
+connected(
+    {call, From}, {send_push_response, PushId, Status, Headers}, #state{role = server} = State
+) ->
+    case do_send_push_response(PushId, Status, Headers, State) of
+        {ok, State1} ->
+            {keep_state, State1, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+    end;
+connected({call, From}, {send_push_response, _PushId, _Status, _Headers}, #state{role = client}) ->
+    {keep_state_and_data, [{reply, From, {error, client_cannot_push}}]};
+connected({call, From}, {send_push_data, PushId, Data, Fin}, #state{role = server} = State) ->
+    case do_send_push_data(PushId, Data, Fin, State) of
+        {ok, State1} ->
+            {keep_state, State1, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+    end;
+connected({call, From}, {send_push_data, _PushId, _Data, _Fin}, #state{role = client}) ->
+    {keep_state_and_data, [{reply, From, {error, client_cannot_push}}]};
+%% Client Push API
+connected({call, From}, {set_max_push_id, MaxPushId}, #state{role = client} = State) ->
+    case do_set_max_push_id(MaxPushId, State) of
+        {ok, State1} ->
+            {keep_state, State1, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+    end;
+connected({call, From}, {set_max_push_id, _MaxPushId}, #state{role = server}) ->
+    {keep_state_and_data, [{reply, From, {error, server_cannot_set_max_push_id}}]};
+connected(cast, {cancel_push, PushId}, #state{role = client} = State) ->
+    State1 = do_cancel_push(PushId, State),
+    {keep_state, State1};
+connected(cast, {cancel_push, _PushId}, #state{role = server}) ->
+    %% Server can't cancel push as client would
+    keep_state_and_data;
 connected(cast, {cancel_stream, StreamId, ErrorCode}, State) ->
     State1 = do_cancel_stream(StreamId, ErrorCode, State),
     {keep_state, State1};
@@ -661,6 +775,12 @@ handle_stream_data(StreamId, Data, Fin, State) ->
     case classify_stream(StreamId, State) of
         {uni, pending} ->
             handle_uni_stream_type(StreamId, Data, State);
+        {uni, push_pending} ->
+            %% Push stream waiting for push ID parsing
+            handle_push_stream_id(StreamId, Data, State);
+        {uni, {push, PushId}} ->
+            %% Active push stream - process frames
+            handle_push_stream_data(StreamId, PushId, Data, Fin, State);
         {uni, control} ->
             %% Control stream may trigger state transition (GOAWAY)
             handle_control_stream_data(StreamId, Data, State);
@@ -681,16 +801,46 @@ classify_stream(StreamId, #state{peer_encoder_stream = StreamId}) ->
     {uni, qpack_encoder};
 classify_stream(StreamId, #state{peer_decoder_stream = StreamId}) ->
     {uni, qpack_decoder};
-classify_stream(StreamId, #state{uni_stream_buffers = Buffers}) ->
+classify_stream(StreamId, #state{uni_stream_buffers = Buffers, received_pushes = Received} = State) ->
     case maps:is_key(StreamId, Buffers) of
         true ->
-            {uni, pending};
+            %% Check if this is a push stream pending push ID parsing
+            case maps:get(StreamId, Buffers) of
+                {push_pending, _} -> {uni, push_pending};
+                _ -> {uni, pending}
+            end;
         false ->
-            %% Check if it's a bidirectional stream (bit 1 = 0 for bidi)
-            case StreamId band 2 of
-                0 -> {bidi, request};
-                2 -> unknown
+            %% Check if this is an active push stream (client-side)
+            case find_push_by_stream_id(StreamId, Received) of
+                {ok, PushId} -> {uni, {push, PushId}};
+                error -> classify_stream_type(StreamId, State)
             end
+    end.
+
+%% Helper to classify stream by ID pattern
+classify_stream_type(StreamId, _State) ->
+    %% Check if it's a bidirectional stream (bit 1 = 0 for bidi)
+    case StreamId band 2 of
+        0 -> {bidi, request};
+        2 -> unknown
+    end.
+
+%% Find push ID by stream ID in received_pushes map
+find_push_by_stream_id(StreamId, Received) ->
+    case
+        maps:fold(
+            fun(PushId, SId, Acc) ->
+                case SId of
+                    StreamId -> {ok, PushId};
+                    _ -> Acc
+                end
+            end,
+            error,
+            Received
+        )
+    of
+        {ok, PushId} -> {ok, PushId};
+        error -> error
     end.
 
 handle_uni_stream_type(StreamId, Data, #state{uni_stream_buffers = Buffers} = State) ->
@@ -729,12 +879,16 @@ assign_uni_stream(_StreamId, qpack_decoder, _State) ->
 assign_uni_stream(_StreamId, push, #state{role = server}) ->
     %% RFC 9114 Section 4.6: only servers can initiate push streams
     {error, {connection_error, ?H3_STREAM_CREATION_ERROR, <<"server received push stream">>}};
-assign_uni_stream(_StreamId, push, #state{role = client} = State) ->
-    %% Server Push intentionally not supported (RFC 9114 Section 4.6)
-    %% Push has seen limited adoption and is disabled by default in most browsers.
-    %% We silently ignore push streams rather than rejecting them to allow
-    %% interoperability with servers that send unsolicited pushes.
-    {ok, State};
+assign_uni_stream(_StreamId, push, #state{role = client, local_max_push_id = undefined}) ->
+    %% Client never sent MAX_PUSH_ID but server is pushing - protocol error
+    %% RFC 9114 Section 4.6: server MUST NOT use push until MAX_PUSH_ID received
+    {error, {connection_error, ?H3_ID_ERROR, <<"push without MAX_PUSH_ID">>}};
+assign_uni_stream(StreamId, push, #state{role = client, uni_stream_buffers = Buffers} = State) ->
+    %% Client receiving push stream - buffer for push ID parsing
+    %% Push stream format: Type(0x01) already parsed, next is Push ID (varint)
+    {ok, State#state{
+        uni_stream_buffers = maps:put(StreamId, {push_pending, <<>>}, Buffers)
+    }};
 assign_uni_stream(_StreamId, {unknown, _Type}, State) ->
     %% Unknown stream types are ignored per RFC 9114
     {ok, State}.
@@ -800,16 +954,26 @@ handle_control_frame({goaway, NewId}, #state{goaway_id = OldId}) when NewId > Ol
 handle_control_frame({goaway, NewId}, State) ->
     %% GOAWAY with same or lower ID - update
     {ok, State#state{goaway_id = NewId}};
-handle_control_frame({max_push_id, _PushId}, State) ->
-    %% Server Push intentionally not supported - ignore MAX_PUSH_ID
-    %% RFC 9114 Section 7.2.7: clients send MAX_PUSH_ID to limit server pushes.
-    %% Since we never initiate pushes, we accept but ignore this frame.
-    {ok, State};
-handle_control_frame({cancel_push, _PushId}, State) ->
-    %% Server Push intentionally not supported - ignore CANCEL_PUSH
-    %% RFC 9114 Section 7.2.3: used to cancel promised server pushes.
-    %% Since we never initiate pushes, we accept but ignore this frame.
-    {ok, State};
+%% Server receives MAX_PUSH_ID from client (RFC 9114 Section 7.2.7)
+handle_control_frame({max_push_id, PushId}, #state{role = server, max_push_id = Old} = State) when
+    Old =:= undefined; PushId >= Old
+->
+    %% Valid MAX_PUSH_ID - enables or extends push capability
+    {ok, State#state{max_push_id = PushId}};
+handle_control_frame({max_push_id, PushId}, #state{role = server, max_push_id = Old}) when
+    PushId < Old
+->
+    %% MAX_PUSH_ID cannot decrease (RFC 9114 Section 7.2.7)
+    {error, {connection_error, ?H3_ID_ERROR, <<"MAX_PUSH_ID decreased">>}};
+handle_control_frame({max_push_id, _}, #state{role = client}) ->
+    %% Server should never send MAX_PUSH_ID (RFC 9114 Section 7.2.7)
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"server sent MAX_PUSH_ID">>}};
+%% Server receives CANCEL_PUSH from client (RFC 9114 Section 7.2.3)
+handle_control_frame({cancel_push, PushId}, #state{role = server} = State) ->
+    handle_cancel_push_server(PushId, State);
+%% Client receives CANCEL_PUSH from server (server withdrawing promise)
+handle_control_frame({cancel_push, PushId}, #state{role = client} = State) ->
+    handle_cancel_push_client(PushId, State);
 handle_control_frame({data, _}, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"DATA on control stream">>}};
 handle_control_frame({headers, _}, _State) ->
@@ -926,6 +1090,284 @@ handle_decoder_stream_data(
             {ok, State#state{qpack_encoder = Encoder1, decoder_buffer = Rest}};
         {error, Reason} ->
             {error, {connection_error, ?H3_QPACK_DECODER_STREAM_ERROR, Reason}, State}
+    end.
+
+%%====================================================================
+%% Internal: Push Stream Handling (RFC 9114 Section 4.6)
+%%====================================================================
+
+%% Parse push ID from push stream header (client-side)
+%% Push stream format after type byte: Push ID (varint) + frames
+handle_push_stream_id(StreamId, Data, #state{uni_stream_buffers = Buffers} = State) ->
+    {push_pending, Buffer} = maps:get(StreamId, Buffers),
+    Combined = <<Buffer/binary, Data/binary>>,
+    try quic_varint:decode(Combined) of
+        {PushId, Rest} ->
+            process_push_stream_id(StreamId, PushId, Rest, State)
+    catch
+        error:badarg ->
+            %% Need more data for push ID (empty binary)
+            {ok, State#state{
+                uni_stream_buffers = maps:put(StreamId, {push_pending, Combined}, Buffers)
+            }};
+        error:{incomplete, _} ->
+            %% Need more data for push ID
+            {ok, State#state{
+                uni_stream_buffers = maps:put(StreamId, {push_pending, Combined}, Buffers)
+            }}
+    end.
+
+%% Process decoded push ID from push stream
+process_push_stream_id(
+    StreamId,
+    PushId,
+    Rest,
+    #state{
+        promised_pushes = Promised,
+        received_pushes = Received,
+        local_max_push_id = MaxPushId,
+        local_cancelled_pushes = Cancelled
+    } = State
+) ->
+    case validate_push_stream(PushId, MaxPushId, Promised, Received, Cancelled) of
+        ok ->
+            correlate_push_stream(StreamId, PushId, Rest, State);
+        {error, Reason} ->
+            {error, Reason, State}
+    end.
+
+%% Correlate push stream with PUSH_PROMISE
+correlate_push_stream(
+    StreamId,
+    PushId,
+    Rest,
+    #state{
+        uni_stream_buffers = Buffers,
+        promised_pushes = Promised,
+        received_pushes = Received,
+        owner = Owner
+    } = State
+) ->
+    case maps:find(PushId, Promised) of
+        {ok, {ReqStreamId, Headers}} ->
+            %% Valid push stream - register and process remaining data
+            State1 = State#state{
+                uni_stream_buffers = maps:remove(StreamId, Buffers),
+                received_pushes = maps:put(PushId, StreamId, Received),
+                promised_pushes = maps:remove(PushId, Promised)
+            },
+            %% Notify owner that push stream started
+            Owner ! {quic_h3, self(), {push_stream, PushId, ReqStreamId, Headers}},
+            %% Process remaining data as frames
+            maybe_process_push_rest(StreamId, PushId, Rest, State1);
+        error ->
+            %% Push stream without corresponding PUSH_PROMISE
+            {error, {connection_error, ?H3_ID_ERROR, <<"push stream without PUSH_PROMISE">>}, State}
+    end.
+
+%% Process remaining data on push stream if any
+maybe_process_push_rest(_StreamId, _PushId, <<>>, State) ->
+    {ok, State};
+maybe_process_push_rest(StreamId, PushId, Rest, State) ->
+    handle_push_stream_data(StreamId, PushId, Rest, false, State).
+
+%% Validate push stream constraints
+validate_push_stream(PushId, MaxPushId, _Promised, Received, Cancelled) ->
+    cond_validate([
+        {PushId > MaxPushId, {connection_error, ?H3_ID_ERROR, <<"push ID exceeds MAX_PUSH_ID">>}},
+        {
+            maps:is_key(PushId, Received),
+            {connection_error, ?H3_ID_ERROR, <<"duplicate push stream">>}
+        },
+        {
+            sets:is_element(PushId, Cancelled),
+            %% Cancelled push - ignore stream silently (already cancelled)
+            cancelled
+        }
+    ]).
+
+cond_validate([]) -> ok;
+cond_validate([{true, cancelled} | _]) -> {error, cancelled};
+cond_validate([{true, Error} | _]) -> {error, Error};
+cond_validate([{false, _} | Rest]) -> cond_validate(Rest).
+
+%% Process frames on push stream (client-side)
+%% Push streams can only contain HEADERS and DATA frames
+handle_push_stream_data(
+    StreamId,
+    PushId,
+    Data,
+    Fin,
+    #state{stream_buffers = Buffers} = State
+) ->
+    Buffer = maps:get(StreamId, Buffers, <<>>),
+    Combined = <<Buffer/binary, Data/binary>>,
+    case process_push_frames(StreamId, PushId, Combined, Fin, State) of
+        {ok, Rest, State1} ->
+            Buffers1 =
+                case Rest of
+                    <<>> -> maps:remove(StreamId, Buffers);
+                    _ -> Buffers#{StreamId => Rest}
+                end,
+            {ok, State1#state{stream_buffers = Buffers1}};
+        {error, Reason} ->
+            {error, Reason, State}
+    end.
+
+%% Process frames on push stream
+process_push_frames(StreamId, PushId, Data, Fin, State) ->
+    case quic_h3_frame:decode(Data) of
+        {ok, Frame, Rest} ->
+            case handle_push_frame(StreamId, PushId, Frame, Fin andalso Rest =:= <<>>, State) of
+                {ok, State1} ->
+                    process_push_frames(StreamId, PushId, Rest, Fin, State1);
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, {frame_error, FrameType, Reason}} ->
+            {error,
+                {connection_error, ?H3_FRAME_ERROR,
+                    iolist_to_binary(
+                        io_lib:format("malformed ~p on push: ~p", [FrameType, Reason])
+                    )}};
+        {more, _} ->
+            {ok, Data, State}
+    end.
+
+%% Handle individual frames on push stream
+%% RFC 9114 Section 4.6: Push streams only carry HEADERS and DATA
+handle_push_frame(
+    StreamId,
+    PushId,
+    {headers, HeaderBlock},
+    Fin,
+    #state{qpack_decoder = Decoder, owner = Owner} = State
+) ->
+    case quic_qpack:decode(HeaderBlock, Decoder) of
+        {{ok, Headers}, Decoder1} ->
+            State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
+            %% Extract status from headers
+            Status = proplists:get_value(<<":status">>, Headers),
+            Owner ! {quic_h3, self(), {push_response, PushId, Status, Headers}},
+            case Fin of
+                true ->
+                    %% Push complete
+                    Owner ! {quic_h3, self(), {push_complete, PushId}},
+                    cleanup_push_stream(PushId, StreamId, State1);
+                false ->
+                    {ok, State1}
+            end;
+        {{blocked, _RIC}, _Decoder1} ->
+            %% Push streams should not reference dynamic table entries
+            %% that haven't been acknowledged yet
+            {error,
+                {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED,
+                    <<"blocked push stream headers">>}};
+        {{error, Reason}, _Decoder1} ->
+            {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
+    end;
+handle_push_frame(_StreamId, PushId, {data, Payload}, Fin, #state{owner = Owner} = State) ->
+    Owner ! {quic_h3, self(), {push_data, PushId, Payload, Fin}},
+    case Fin of
+        true ->
+            Owner ! {quic_h3, self(), {push_complete, PushId}},
+            {ok, State};
+        false ->
+            {ok, State}
+    end;
+%% Invalid frames on push stream
+handle_push_frame(_StreamId, _PushId, {settings, _}, _Fin, _State) ->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"SETTINGS on push stream">>}};
+handle_push_frame(_StreamId, _PushId, {goaway, _}, _Fin, _State) ->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"GOAWAY on push stream">>}};
+handle_push_frame(_StreamId, _PushId, {push_promise, _, _}, _Fin, _State) ->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"PUSH_PROMISE on push stream">>}};
+handle_push_frame(_StreamId, _PushId, {max_push_id, _}, _Fin, _State) ->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"MAX_PUSH_ID on push stream">>}};
+handle_push_frame(_StreamId, _PushId, {cancel_push, _}, _Fin, _State) ->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"CANCEL_PUSH on push stream">>}};
+handle_push_frame(_StreamId, _PushId, {unknown, _Type, _Payload}, _Fin, State) ->
+    %% Unknown frame types are ignored per RFC 9114
+    {ok, State}.
+
+%% Clean up push stream state after completion
+cleanup_push_stream(
+    PushId,
+    StreamId,
+    #state{
+        received_pushes = Received,
+        stream_buffers = Buffers
+    } = State
+) ->
+    {ok, State#state{
+        received_pushes = maps:remove(PushId, Received),
+        stream_buffers = maps:remove(StreamId, Buffers)
+    }}.
+
+%% Handle CANCEL_PUSH from client (server-side)
+%% Client is cancelling a push they don't want
+handle_cancel_push_server(
+    PushId,
+    #state{
+        max_push_id = MaxPushId,
+        next_push_id = NextPushId,
+        push_streams = PushStreams,
+        cancelled_pushes = Cancelled,
+        quic_conn = QuicConn
+    } = State
+) ->
+    %% Validate push ID (RFC 9114 Section 7.2.3)
+    case PushId > MaxPushId orelse (MaxPushId =:= undefined) of
+        true ->
+            %% Invalid - push ID exceeds what we could use
+            {error, {connection_error, ?H3_ID_ERROR, <<"invalid CANCEL_PUSH ID">>}};
+        false ->
+            %% Check if push stream already exists
+            case maps:find(PushId, PushStreams) of
+                {ok, {StreamId, _Stream}} ->
+                    %% Push stream active - reset it
+                    quic:reset_stream(QuicConn, StreamId, ?H3_REQUEST_CANCELLED),
+                    {ok, State#state{
+                        push_streams = maps:remove(PushId, PushStreams),
+                        cancelled_pushes = sets:add_element(PushId, Cancelled)
+                    }};
+                error when PushId < NextPushId ->
+                    %% Push ID already used but stream closed - ignore
+                    {ok, State#state{
+                        cancelled_pushes = sets:add_element(PushId, Cancelled)
+                    }};
+                error ->
+                    %% Push ID not yet used - remember to skip it
+                    {ok, State#state{
+                        cancelled_pushes = sets:add_element(PushId, Cancelled)
+                    }}
+            end
+    end.
+
+%% Handle CANCEL_PUSH from server (client-side)
+%% Server is withdrawing a push promise
+handle_cancel_push_client(
+    PushId,
+    #state{
+        local_max_push_id = MaxPushId,
+        promised_pushes = Promised,
+        received_pushes = Received,
+        owner = Owner
+    } = State
+) ->
+    %% Validate push ID
+    case MaxPushId =:= undefined orelse PushId > MaxPushId of
+        true ->
+            %% Invalid push ID
+            {error, {connection_error, ?H3_ID_ERROR, <<"invalid CANCEL_PUSH ID">>}};
+        false ->
+            %% Remove from promised and received, notify owner
+            State1 = State#state{
+                promised_pushes = maps:remove(PushId, Promised),
+                received_pushes = maps:remove(PushId, Received)
+            },
+            Owner ! {quic_h3, self(), {push_cancelled, PushId}},
+            {ok, State1}
     end.
 
 handle_request_stream_data(
@@ -1109,12 +1551,84 @@ handle_request_frame(
     StreamId, {data, _}, _Fin, #h3_stream{frame_state = expecting_trailers}, _State
 ) ->
     {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}};
-%% Push promise not allowed on request streams for servers
-handle_request_frame(_StreamId, {push_promise, _, _}, _Fin, _Stream, _State) ->
+%% Client receives PUSH_PROMISE on request stream - process it (RFC 9114 Section 7.2.5)
+handle_request_frame(
+    StreamId,
+    {push_promise, PushId, HeaderBlock},
+    _Fin,
+    Stream,
+    #state{role = client} = State
+) ->
+    handle_push_promise(StreamId, PushId, HeaderBlock, Stream, State);
+%% Server should NEVER receive PUSH_PROMISE on request stream - error
+handle_request_frame(_StreamId, {push_promise, _, _}, _Fin, _Stream, #state{role = server}) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"PUSH_PROMISE on request stream">>}};
 %% Any other unexpected frame/state combination
 handle_request_frame(StreamId, _Frame, _Fin, _Stream, _State) ->
     {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}}.
+
+%% Handle PUSH_PROMISE on request stream (client-side, RFC 9114 Section 7.2.5)
+handle_push_promise(
+    StreamId,
+    PushId,
+    HeaderBlock,
+    Stream,
+    #state{
+        local_max_push_id = MaxPushId,
+        promised_pushes = Promised,
+        local_cancelled_pushes = Cancelled,
+        qpack_decoder = Decoder,
+        owner = Owner
+    } = State
+) ->
+    %% Validate push ID
+    case validate_push_promise(PushId, MaxPushId, Promised) of
+        ok ->
+            %% Decode the header block to get the promised request headers
+            case quic_qpack:decode(HeaderBlock, Decoder) of
+                {{ok, Headers}, Decoder1} ->
+                    State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
+                    %% Check if we've already cancelled this push
+                    case sets:is_element(PushId, Cancelled) of
+                        true ->
+                            %% Already cancelled - ignore promise
+                            {ok, Stream, State1};
+                        false ->
+                            %% Store the promise
+                            State2 = State1#state{
+                                promised_pushes = maps:put(PushId, {StreamId, Headers}, Promised)
+                            },
+                            %% Notify owner of push promise
+                            Owner ! {quic_h3, self(), {push_promise, PushId, StreamId, Headers}},
+                            {ok, Stream, State2}
+                    end;
+                {{blocked, _RIC}, _Decoder1} ->
+                    %% PUSH_PROMISE should not reference unacknowledged dynamic table entries
+                    {error,
+                        {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED,
+                            <<"blocked PUSH_PROMISE headers">>}};
+                {{error, Reason}, _Decoder1} ->
+                    {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Validate PUSH_PROMISE constraints (RFC 9114 Section 7.2.5)
+validate_push_promise(_PushId, MaxPushId, _Promised) when MaxPushId =:= undefined ->
+    %% Client never sent MAX_PUSH_ID
+    {error, {connection_error, ?H3_ID_ERROR, <<"PUSH_PROMISE without MAX_PUSH_ID">>}};
+validate_push_promise(PushId, MaxPushId, _Promised) when PushId > MaxPushId ->
+    %% Push ID exceeds MAX_PUSH_ID
+    {error, {connection_error, ?H3_ID_ERROR, <<"push ID exceeds MAX_PUSH_ID">>}};
+validate_push_promise(PushId, _MaxPushId, Promised) ->
+    case maps:is_key(PushId, Promised) of
+        true ->
+            %% Duplicate push ID
+            {error, {connection_error, ?H3_ID_ERROR, <<"duplicate push ID">>}};
+        false ->
+            ok
+    end.
 
 %% Decode and process headers
 handle_headers_decode(StreamId, HeaderBlock, Fin, Stream, Decoder, Owner, Role, State) ->
@@ -1520,6 +2034,229 @@ do_cancel_stream(StreamId, ErrorCode, #state{quic_conn = QuicConn, streams = Str
     %% RFC 9204 Section 4.4.2: Send Stream Cancellation if stream was blocked
     State1 = maybe_send_stream_cancel(StreamId, State),
     State1#state{streams = maps:remove(StreamId, Streams)}.
+
+%%====================================================================
+%% Internal: Server Push (RFC 9114 Section 4.6)
+%%====================================================================
+
+%% Initiate a server push
+%% 1. Allocate push ID
+%% 2. Send PUSH_PROMISE on request stream
+%% 3. Open push stream (unidirectional)
+%% 4. Return push ID for subsequent data sending
+do_push(
+    RequestStreamId,
+    Headers,
+    #state{
+        max_push_id = MaxPushId,
+        next_push_id = NextPushId,
+        cancelled_pushes = Cancelled,
+        streams = Streams
+    } = State
+) ->
+    %% Check if push is enabled
+    case MaxPushId of
+        undefined ->
+            {error, push_not_enabled};
+        _ when NextPushId > MaxPushId ->
+            {error, max_push_id_exceeded};
+        _ ->
+            %% Check if this push ID was cancelled
+            case sets:is_element(NextPushId, Cancelled) of
+                true ->
+                    %% Skip cancelled push ID
+                    {error, push_cancelled};
+                false ->
+                    %% Verify request stream exists
+                    case maps:is_key(RequestStreamId, Streams) of
+                        false ->
+                            {error, unknown_request_stream};
+                        true ->
+                            do_push_internal(RequestStreamId, Headers, NextPushId, State)
+                    end
+            end
+    end.
+
+do_push_internal(
+    RequestStreamId,
+    Headers,
+    PushId,
+    #state{
+        quic_conn = QuicConn,
+        qpack_encoder = Encoder,
+        push_streams = PushStreams,
+        next_push_id = NextPushId
+    } = State
+) ->
+    %% Encode headers for PUSH_PROMISE
+    {Encoded, Encoder1} = quic_qpack:encode(Headers, RequestStreamId, Encoder),
+    State1 = State#state{qpack_encoder = Encoder1},
+    State2 = send_encoder_instructions(State1),
+
+    %% Send PUSH_PROMISE on request stream
+    PushPromiseFrame = quic_h3_frame:encode_push_promise(PushId, Encoded),
+    case quic:send_data(QuicConn, RequestStreamId, PushPromiseFrame, false) of
+        ok ->
+            %% Open push stream (unidirectional, server-initiated)
+            case quic:open_unidirectional_stream(QuicConn) of
+                {ok, PushStreamId} ->
+                    %% Send push stream header: Type(0x01) + Push ID
+                    PushStreamType = quic_h3_frame:encode_stream_type(push),
+                    PushIdVarint = quic_varint:encode(PushId),
+                    PushStreamHeader = <<PushStreamType/binary, PushIdVarint/binary>>,
+                    case quic:send_data(QuicConn, PushStreamId, PushStreamHeader, false) of
+                        ok ->
+                            %% Track push stream
+                            Stream = #h3_stream{
+                                id = PushStreamId,
+                                type = push,
+                                state = open,
+                                frame_state = expecting_headers
+                            },
+                            State3 = State2#state{
+                                next_push_id = NextPushId + 1,
+                                push_streams = maps:put(PushId, {PushStreamId, Stream}, PushStreams)
+                            },
+                            {ok, PushId, State3};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Send response headers on a push stream
+do_send_push_response(
+    PushId,
+    Status,
+    Headers,
+    #state{
+        push_streams = PushStreams,
+        quic_conn = QuicConn,
+        qpack_encoder = Encoder
+    } = State
+) ->
+    case maps:find(PushId, PushStreams) of
+        {ok, {StreamId, Stream}} ->
+            StatusHeader = {<<":status">>, integer_to_binary(Status)},
+            AllHeaders = [StatusHeader | Headers],
+            {Encoded, Encoder1} = quic_qpack:encode(AllHeaders, StreamId, Encoder),
+            State1 = State#state{qpack_encoder = Encoder1},
+            State2 = send_encoder_instructions(State1),
+            HeadersFrame = quic_h3_frame:encode_headers(Encoded),
+            case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
+                ok ->
+                    Stream1 = Stream#h3_stream{
+                        status = Status,
+                        headers = AllHeaders,
+                        frame_state = expecting_data
+                    },
+                    State3 = State2#state{
+                        push_streams = maps:put(PushId, {StreamId, Stream1}, PushStreams)
+                    },
+                    {ok, State3};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        error ->
+            {error, unknown_push_id}
+    end.
+
+%% Send data on a push stream
+do_send_push_data(
+    PushId,
+    Data,
+    Fin,
+    #state{
+        push_streams = PushStreams,
+        quic_conn = QuicConn
+    } = State
+) ->
+    case maps:find(PushId, PushStreams) of
+        {ok, {StreamId, Stream}} ->
+            DataFrame = quic_h3_frame:encode_data(Data),
+            case quic:send_data(QuicConn, StreamId, DataFrame, Fin) of
+                ok ->
+                    case Fin of
+                        true ->
+                            %% Push complete - remove from tracking
+                            {ok, State#state{
+                                push_streams = maps:remove(PushId, PushStreams)
+                            }};
+                        false ->
+                            Stream1 = Stream#h3_stream{
+                                body = <<(Stream#h3_stream.body)/binary, Data/binary>>
+                            },
+                            {ok, State#state{
+                                push_streams = maps:put(PushId, {StreamId, Stream1}, PushStreams)
+                            }}
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        error ->
+            {error, unknown_push_id}
+    end.
+
+%%====================================================================
+%% Internal: Client Push (RFC 9114 Section 4.6)
+%%====================================================================
+
+%% Set MAX_PUSH_ID (client-side)
+do_set_max_push_id(
+    MaxPushId,
+    #state{
+        local_max_push_id = OldMaxPushId,
+        quic_conn = QuicConn,
+        local_control_stream = ControlStream
+    } = State
+) ->
+    %% Validate that MAX_PUSH_ID does not decrease
+    case OldMaxPushId =/= undefined andalso MaxPushId < OldMaxPushId of
+        true ->
+            {error, max_push_id_cannot_decrease};
+        false ->
+            %% Send MAX_PUSH_ID frame on control stream
+            MaxPushIdFrame = quic_h3_frame:encode_max_push_id(MaxPushId),
+            case quic:send_data(QuicConn, ControlStream, MaxPushIdFrame, false) of
+                ok ->
+                    {ok, State#state{local_max_push_id = MaxPushId}};
+                {error, Reason} ->
+                    {error, Reason}
+            end
+    end.
+
+%% Cancel a push (client-side)
+do_cancel_push(
+    PushId,
+    #state{
+        local_max_push_id = MaxPushId,
+        local_cancelled_pushes = Cancelled,
+        promised_pushes = Promised,
+        received_pushes = Received,
+        quic_conn = QuicConn,
+        local_control_stream = ControlStream
+    } = State
+) ->
+    %% Validate push ID
+    case MaxPushId =:= undefined orelse PushId > MaxPushId of
+        true ->
+            %% Invalid push ID - just ignore
+            State;
+        false ->
+            %% Send CANCEL_PUSH on control stream
+            CancelPushFrame = quic_h3_frame:encode_cancel_push(PushId),
+            quic:send_data(QuicConn, ControlStream, CancelPushFrame, false),
+            %% Update state
+            State#state{
+                local_cancelled_pushes = sets:add_element(PushId, Cancelled),
+                promised_pushes = maps:remove(PushId, Promised),
+                received_pushes = maps:remove(PushId, Received)
+            }
+    end.
 
 %% Send Stream Cancellation on decoder stream if stream was blocked (RFC 9204 Section 4.4.2)
 maybe_send_stream_cancel(

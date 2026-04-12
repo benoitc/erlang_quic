@@ -7,6 +7,7 @@ A full HTTP/3 server using aioquic that:
 - Serves files from document root
 - Echoes POST body for /echo endpoint
 - Supports trailers
+- Supports Server Push (RFC 9114 Section 4.6)
 - Logs all events for debugging
 """
 
@@ -23,6 +24,7 @@ from aioquic.h3.events import (
     HeadersReceived,
     DataReceived,
     H3Event,
+    PushPromiseReceived,
 )
 # TrailersReceived may not exist in newer aioquic versions
 try:
@@ -36,6 +38,12 @@ from aioquic.quic.events import (
     QuicEvent,
 )
 from aioquic.quic.logger import QuicFileLogger
+
+# Push mappings: path -> list of resources to push
+PUSH_MAPPINGS = {
+    "/index.html": ["/style.css", "/script.js"],
+    "/push-test": ["/pushed-resource-1.txt", "/pushed-resource-2.txt"],
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,11 +68,15 @@ class RequestState:
 class HttpServerProtocol(QuicConnectionProtocol):
     """HTTP/3 server protocol handler."""
 
-    def __init__(self, *args, document_root: str = "/www", **kwargs) -> None:
+    def __init__(
+        self, *args, document_root: str = "/www", enable_push: bool = False, **kwargs
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._http: Optional[H3Connection] = None
         self._requests: Dict[int, RequestState] = {}
         self._document_root = Path(document_root)
+        self._enable_push = enable_push
+        self._next_push_id = 0
 
     def quic_event_received(self, event: QuicEvent) -> None:
         """Handle QUIC events."""
@@ -152,6 +164,10 @@ class HttpServerProtocol(QuicConnectionProtocol):
 
         method = request.method or "GET"
         path = request.path or "/"
+
+        # Send push promises for associated resources before response
+        if self._enable_push and method == "GET" and path in PUSH_MAPPINGS:
+            self._send_push_promises(stream_id, path, request)
 
         # Route request
         if path == "/echo" and method == "POST":
@@ -273,6 +289,69 @@ class HttpServerProtocol(QuicConnectionProtocol):
         # Clean up
         self._requests.pop(stream_id, None)
 
+    def _send_push_promises(
+        self, stream_id: int, path: str, request: RequestState
+    ) -> None:
+        """Send push promises for associated resources."""
+        push_paths = PUSH_MAPPINGS.get(path, [])
+
+        for push_path in push_paths:
+            try:
+                # Get authority from request headers
+                authority = b"localhost"
+                scheme = b"https"
+                for name, value in request.headers:
+                    if name == b":authority":
+                        authority = value
+                    elif name == b":scheme":
+                        scheme = value
+
+                # Create push promise headers (the promised request)
+                push_headers = [
+                    (b":method", b"GET"),
+                    (b":scheme", scheme),
+                    (b":authority", authority),
+                    (b":path", push_path.encode()),
+                ]
+
+                # Send push promise on request stream
+                push_stream_id = self._http.send_push_promise(
+                    stream_id=stream_id, headers=push_headers
+                )
+
+                logger.info(
+                    f"Stream {stream_id}: sent PUSH_PROMISE for {push_path} "
+                    f"(push stream {push_stream_id})"
+                )
+
+                # Send the pushed response
+                self._send_push_response(push_stream_id, push_path)
+
+            except Exception as e:
+                logger.warning(f"Failed to send push promise for {push_path}: {e}")
+
+    def _send_push_response(self, push_stream_id: int, path: str) -> None:
+        """Send response on a push stream."""
+        body, status, content_type = self._read_file(path)
+
+        headers = [
+            (b":status", str(status).encode()),
+            (b"content-type", content_type),
+            (b"content-length", str(len(body)).encode()),
+        ]
+
+        self._http.send_headers(push_stream_id, headers)
+
+        if body:
+            self._http.send_data(push_stream_id, body, end_stream=True)
+        else:
+            self._http.send_data(push_stream_id, b"", end_stream=True)
+
+        self.transmit()
+        logger.info(
+            f"Push stream {push_stream_id}: sent {status} ({len(body)} bytes)"
+        )
+
 
 async def main(
     host: str,
@@ -280,6 +359,7 @@ async def main(
     certificate: str,
     private_key: str,
     document_root: str,
+    enable_push: bool = False,
     secrets_log: Optional[str] = None,
     quic_log: Optional[str] = None,
 ) -> None:
@@ -313,13 +393,14 @@ async def main(
     logger.info(f"ALPN protocols: {H3_ALPN}")
     logger.info(f"Certificate: {certificate}")
     logger.info(f"Document root: {document_root}")
+    logger.info(f"Server push: {'enabled' if enable_push else 'disabled'}")
 
     await serve(
         host,
         port,
         configuration=configuration,
         create_protocol=lambda *args, **kwargs: HttpServerProtocol(
-            *args, document_root=document_root, **kwargs
+            *args, document_root=document_root, enable_push=enable_push, **kwargs
         ),
         retry=False,
     )
@@ -371,6 +452,11 @@ if __name__ == "__main__":
         help="Path to QUIC event log directory",
     )
     parser.add_argument(
+        "--enable-push",
+        action="store_true",
+        help="Enable server push (RFC 9114 Section 4.6)",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose logging",
@@ -389,6 +475,7 @@ if __name__ == "__main__":
                 certificate=args.cert,
                 private_key=args.key,
                 document_root=args.document_root,
+                enable_push=args.enable_push,
                 secrets_log=args.secrets_log,
                 quic_log=args.quic_log,
             )
