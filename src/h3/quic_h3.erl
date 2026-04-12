@@ -109,7 +109,11 @@
     cancel/2,
     cancel/3,
     goaway/1,
-    close/1
+    close/1,
+    %% Per-stream handler registration
+    set_stream_handler/3,
+    set_stream_handler/4,
+    unset_stream_handler/2
 ]).
 
 %% Server API
@@ -338,6 +342,56 @@ goaway(Conn) ->
 -spec close(conn()) -> ok.
 close(Conn) ->
     quic_h3_connection:close(Conn).
+
+%% @doc Register a handler to receive stream body data.
+%%
+%% By default, body data messages are sent to the connection owner.
+%% For server handlers that need to receive body data (e.g., POST bodies),
+%% call this function to redirect data to the handler process.
+%%
+%% The handler will receive messages of the form:
+%% `{quic_h3, Conn, {data, StreamId, Data, Fin}}'
+%%
+%% If data arrived before registration, it is returned as a list of
+%% `{Data, Fin}' tuples that the handler should process.
+%%
+%% Example:
+%% ```
+%% handle_request(Conn, StreamId, <<"POST">>, _Path, _Headers) ->
+%%     case quic_h3:set_stream_handler(Conn, StreamId, self()) of
+%%         ok ->
+%%             receive_body(Conn, StreamId, <<>>);
+%%         {ok, BufferedChunks} ->
+%%             Body = process_chunks(BufferedChunks),
+%%             receive_body(Conn, StreamId, Body)
+%%     end.
+%% '''
+%% @end
+-spec set_stream_handler(conn(), stream_id(), pid()) ->
+    ok | {ok, [{binary(), boolean()}]} | {error, term()}.
+set_stream_handler(Conn, StreamId, HandlerPid) ->
+    quic_h3_connection:set_stream_handler(Conn, StreamId, HandlerPid).
+
+%% @doc Register a handler with options.
+%%
+%% Options:
+%% <ul>
+%%   <li>`drain_buffer' - If true (default), returns buffered data.
+%%       If false, sends buffered data as messages.</li>
+%% </ul>
+%% @end
+-spec set_stream_handler(conn(), stream_id(), pid(), map()) ->
+    ok | {ok, [{binary(), boolean()}]} | {error, term()}.
+set_stream_handler(Conn, StreamId, HandlerPid, Opts) ->
+    quic_h3_connection:set_stream_handler(Conn, StreamId, HandlerPid, Opts).
+
+%% @doc Unregister a stream handler.
+%%
+%% Future data will be sent to the connection owner.
+%% @end
+-spec unset_stream_handler(conn(), stream_id()) -> ok.
+unset_stream_handler(Conn, StreamId) ->
+    quic_h3_connection:unset_stream_handler(Conn, StreamId).
 
 %%====================================================================
 %% Server API

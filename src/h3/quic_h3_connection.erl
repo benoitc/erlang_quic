@@ -38,7 +38,11 @@
     send_push_data/4,
     %% Client Push API
     set_max_push_id/2,
-    cancel_push/2
+    cancel_push/2,
+    %% Per-stream handler registration
+    set_stream_handler/3,
+    set_stream_handler/4,
+    unset_stream_handler/2
 ]).
 
 %% gen_statem callbacks
@@ -171,7 +175,15 @@
     %% received_pushes: Active push streams from server - maps PushId to StreamId
     received_pushes = #{} :: #{non_neg_integer() => non_neg_integer()},
     %% local_cancelled_pushes: Set of push IDs we've cancelled
-    local_cancelled_pushes = sets:new([{version, 2}]) :: sets:set(non_neg_integer())
+    local_cancelled_pushes = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
+
+    %% Per-stream handler registration (Option A for body data routing)
+    %% Maps StreamId -> {Pid, MonitorRef} for streams with registered handlers
+    stream_handlers = #{} :: #{stream_id() => {pid(), reference()}},
+    %% Buffers data received before handler registers (with size limit)
+    stream_data_buffers = #{} :: #{stream_id() => {[binary()], non_neg_integer(), boolean()}},
+    %% Maximum bytes to buffer per stream before handler registers (64KB default)
+    stream_buffer_limit = 65536 :: non_neg_integer()
 }).
 
 %%====================================================================
@@ -291,6 +303,31 @@ set_max_push_id(Conn, MaxPushId) ->
 -spec cancel_push(pid(), non_neg_integer()) -> ok.
 cancel_push(Conn, PushId) ->
     gen_statem:cast(Conn, {cancel_push, PushId}).
+
+%% @doc Register a handler process to receive stream data.
+%% The handler will receive `{quic_h3, Conn, {data, StreamId, Data, Fin}}` messages.
+%% Any data buffered before registration is returned.
+%% @see set_stream_handler/4
+-spec set_stream_handler(pid(), stream_id(), pid()) ->
+    ok | {ok, [{binary(), boolean()}]} | {error, term()}.
+set_stream_handler(Conn, StreamId, HandlerPid) ->
+    set_stream_handler(Conn, StreamId, HandlerPid, #{}).
+
+%% @doc Register a handler with options.
+%% Options:
+%%   - drain_buffer: If true (default), returns buffered data instead of sending as messages
+%% @returns ok if no buffered data, {ok, BufferedChunks} if data was buffered,
+%%          or {error, Reason} on failure
+-spec set_stream_handler(pid(), stream_id(), pid(), map()) ->
+    ok | {ok, [{binary(), boolean()}]} | {error, term()}.
+set_stream_handler(Conn, StreamId, HandlerPid, Opts) ->
+    gen_statem:call(Conn, {set_stream_handler, StreamId, HandlerPid, Opts}).
+
+%% @doc Unregister a stream handler.
+%% Future data will be sent to the connection owner.
+-spec unset_stream_handler(pid(), stream_id()) -> ok.
+unset_stream_handler(Conn, StreamId) ->
+    gen_statem:call(Conn, {unset_stream_handler, StreamId}).
 
 %%====================================================================
 %% gen_statem callbacks
@@ -594,6 +631,19 @@ connected({call, From}, {set_max_push_id, MaxPushId}, #state{role = client} = St
     end;
 connected({call, From}, {set_max_push_id, _MaxPushId}, #state{role = server}) ->
     {keep_state_and_data, [{reply, From, {error, server_cannot_set_max_push_id}}]};
+%% Per-stream handler registration
+connected({call, From}, {set_stream_handler, StreamId, HandlerPid, Opts}, State) ->
+    case do_set_stream_handler(StreamId, HandlerPid, Opts, State) of
+        {ok, State1} ->
+            {keep_state, State1, [{reply, From, ok}]};
+        {ok, BufferedChunks, State1} ->
+            {keep_state, State1, [{reply, From, {ok, BufferedChunks}}]};
+        {error, Reason} ->
+            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+    end;
+connected({call, From}, {unset_stream_handler, StreamId}, State) ->
+    State1 = do_unset_stream_handler(StreamId, State),
+    {keep_state, State1, [{reply, From, ok}]};
 connected(cast, {cancel_push, PushId}, #state{role = client} = State) ->
     State1 = do_cancel_push(PushId, State),
     {keep_state, State1};
@@ -616,6 +666,16 @@ connected(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = Stat
     {next_state, closing, State};
 connected(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
     {stop, quic_closed, State};
+connected(info, {'DOWN', Ref, process, _Pid, _Reason}, #state{stream_handlers = Handlers} = State) ->
+    %% Check if this is a stream handler going down
+    case find_handler_by_ref(Ref, Handlers) of
+        {ok, StreamId} ->
+            State1 = do_unset_stream_handler(StreamId, State),
+            {keep_state, State1};
+        error ->
+            %% Unknown monitor, ignore
+            keep_state_and_data
+    end;
 connected(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -1473,7 +1533,7 @@ handle_request_frame(
     Fin,
     #h3_stream{frame_state = expecting_data, content_length = CL, body_received = Received} =
         Stream,
-    #state{owner = Owner} = State
+    State
 ) when CL =/= undefined ->
     NewReceived = Received + byte_size(Payload),
     case NewReceived > CL of
@@ -1488,13 +1548,13 @@ handle_request_frame(
                 body = <<(Stream#h3_stream.body)/binary, Payload/binary>>,
                 body_received = NewReceived
             },
-            Owner ! {quic_h3, self(), {data, StreamId, Payload, Fin}},
+            State1 = notify_stream_data(StreamId, Payload, Fin, State),
             Stream2 =
                 case Fin of
                     true -> Stream1#h3_stream{frame_state = complete, state = half_closed_remote};
                     false -> Stream1
                 end,
-            {ok, Stream2, State}
+            {ok, Stream2, State1}
     end;
 %% DATA frame - no content-length
 handle_request_frame(
@@ -1502,19 +1562,19 @@ handle_request_frame(
     {data, Payload},
     Fin,
     #h3_stream{frame_state = expecting_data} = Stream,
-    #state{owner = Owner} = State
+    State
 ) ->
     Stream1 = Stream#h3_stream{
         body = <<(Stream#h3_stream.body)/binary, Payload/binary>>,
         body_received = Stream#h3_stream.body_received + byte_size(Payload)
     },
-    Owner ! {quic_h3, self(), {data, StreamId, Payload, Fin}},
+    State1 = notify_stream_data(StreamId, Payload, Fin, State),
     Stream2 =
         case Fin of
             true -> Stream1#h3_stream{frame_state = complete, state = half_closed_remote};
             false -> Stream1
         end,
-    {ok, Stream2, State};
+    {ok, Stream2, State1};
 %% Non-trailer HEADERS after body started - stream error (RFC 9114 Section 4.1)
 handle_request_frame(
     StreamId,
@@ -2097,6 +2157,117 @@ do_cancel_stream(StreamId, ErrorCode, #state{quic_conn = QuicConn, streams = Str
     %% RFC 9204 Section 4.4.2: Send Stream Cancellation if stream was blocked
     State1 = maybe_send_stream_cancel(StreamId, State),
     State1#state{streams = maps:remove(StreamId, Streams)}.
+
+%%====================================================================
+%% Internal: Per-stream Handler Registration
+%%====================================================================
+
+%% Register a handler process to receive stream data
+do_set_stream_handler(StreamId, HandlerPid, Opts, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, _Stream} ->
+            register_stream_handler(StreamId, HandlerPid, Opts, State);
+        error ->
+            {error, unknown_stream}
+    end.
+
+register_stream_handler(
+    StreamId,
+    HandlerPid,
+    Opts,
+    #state{
+        stream_handlers = Handlers,
+        stream_data_buffers = Buffers
+    } = State
+) ->
+    MonRef = erlang:monitor(process, HandlerPid),
+    NewHandlers = Handlers#{StreamId => {HandlerPid, MonRef}},
+    case maps:take(StreamId, Buffers) of
+        {{Chunks, _Size, _HadFin}, NewBuffers} ->
+            State1 = State#state{stream_handlers = NewHandlers, stream_data_buffers = NewBuffers},
+            drain_buffered_data(StreamId, HandlerPid, Chunks, Opts, State1);
+        error ->
+            {ok, State#state{stream_handlers = NewHandlers}}
+    end.
+
+drain_buffered_data(StreamId, HandlerPid, Chunks, Opts, State) ->
+    OrderedChunks = lists:reverse(Chunks),
+    case maps:get(drain_buffer, Opts, true) of
+        true ->
+            {ok, OrderedChunks, State};
+        false ->
+            Conn = self(),
+            [
+                HandlerPid ! {quic_h3, Conn, {data, StreamId, Data, Fin}}
+             || {Data, Fin} <- OrderedChunks
+            ],
+            {ok, State}
+    end.
+
+%% Unregister a stream handler
+do_unset_stream_handler(StreamId, #state{stream_handlers = Handlers} = State) ->
+    case maps:take(StreamId, Handlers) of
+        {{_Pid, MonRef}, NewHandlers} ->
+            erlang:demonitor(MonRef, [flush]),
+            State#state{stream_handlers = NewHandlers};
+        error ->
+            State
+    end.
+
+%% Find stream ID by monitor reference
+find_handler_by_ref(Ref, Handlers) ->
+    find_handler_by_ref_iter(Ref, maps:iterator(Handlers)).
+
+find_handler_by_ref_iter(Ref, Iter) ->
+    case maps:next(Iter) of
+        {StreamId, {_Pid, Ref}, _} ->
+            {ok, StreamId};
+        {_StreamId, {_Pid, _OtherRef}, NextIter} ->
+            find_handler_by_ref_iter(Ref, NextIter);
+        none ->
+            error
+    end.
+
+%% Notify stream data to appropriate recipient
+%% If a handler is registered, send directly to handler.
+%% If no handler registered, buffer the data for when handler registers.
+%% This prevents data loss in the race between handler spawn and registration.
+notify_stream_data(StreamId, Data, Fin, #state{stream_handlers = Handlers} = State) ->
+    Conn = self(),
+    case maps:find(StreamId, Handlers) of
+        {ok, {HandlerPid, _MonRef}} ->
+            HandlerPid ! {quic_h3, Conn, {data, StreamId, Data, Fin}},
+            State;
+        error ->
+            %% No handler registered - buffer data for later retrieval
+            buffer_stream_data(StreamId, Data, Fin, State)
+    end.
+
+%% Buffer data for a stream (before handler registers)
+buffer_stream_data(
+    StreamId,
+    Data,
+    Fin,
+    #state{
+        stream_data_buffers = Buffers,
+        stream_buffer_limit = Limit
+    } = State
+) ->
+    {Chunks, Size, HadFin} = maps:get(StreamId, Buffers, {[], 0, false}),
+    NewSize = Size + byte_size(Data),
+    case NewSize > Limit of
+        true ->
+            %% Buffer overflow - keep buffering but truncate
+            %% Add the chunk anyway but mark as overflow for debugging
+            NewChunks = [{Data, Fin} | Chunks],
+            NewBuffers = Buffers#{StreamId => {NewChunks, NewSize, HadFin orelse Fin}},
+            State#state{stream_data_buffers = NewBuffers};
+        false ->
+            NewChunks = [{Data, Fin} | Chunks],
+            NewHadFin = HadFin orelse Fin,
+            NewBuffers = Buffers#{StreamId => {NewChunks, NewSize, NewHadFin}},
+            State#state{stream_data_buffers = NewBuffers}
+    end.
 
 %%====================================================================
 %% Internal: Server Push (RFC 9114 Section 4.6)

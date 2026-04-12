@@ -145,7 +145,11 @@ make_test_state(Overrides) ->
         local_max_push_id => undefined,
         promised_pushes => #{},
         received_pushes => #{},
-        local_cancelled_pushes => sets:new([{version, 2}])
+        local_cancelled_pushes => sets:new([{version, 2}]),
+        %% Per-stream handler registration
+        stream_handlers => #{},
+        stream_data_buffers => #{},
+        stream_buffer_limit => 65536
     },
     Merged = maps:merge(Default, Overrides),
     {state, maps:get(quic_conn, Merged), maps:get(quic_ref, Merged), maps:get(role, Merged),
@@ -166,4 +170,5 @@ make_test_state(Overrides) ->
         maps:get(next_push_id, Merged), maps:get(push_streams, Merged),
         maps:get(cancelled_pushes, Merged), maps:get(local_max_push_id, Merged),
         maps:get(promised_pushes, Merged), maps:get(received_pushes, Merged),
-        maps:get(local_cancelled_pushes, Merged)}.
+        maps:get(local_cancelled_pushes, Merged), maps:get(stream_handlers, Merged),
+        maps:get(stream_data_buffers, Merged), maps:get(stream_buffer_limit, Merged)}.

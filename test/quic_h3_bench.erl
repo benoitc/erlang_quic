@@ -508,31 +508,63 @@ start_h3_server(Port) ->
 
 handle_bench_request(Conn, StreamId, _Method, <<"/echo">>) ->
     %% Echo: collect body then send it back
-    spawn(fun() -> echo_body(Conn, StreamId, <<>>) end);
+    spawn(fun() -> echo_handler(Conn, StreamId) end);
 handle_bench_request(Conn, StreamId, _Method, _Path) ->
     %% Simple OK response
     quic_h3:send_response(Conn, StreamId, 200, [{<<"content-type">>, <<"text/plain">>}]),
     quic_h3:send_data(Conn, StreamId, <<"OK">>, true).
 
-echo_body(Conn, StreamId, Acc) ->
+echo_handler(Conn, StreamId) ->
+    %% Register to receive body data
+    case quic_h3:set_stream_handler(Conn, StreamId, self()) of
+        ok ->
+            %% No buffered data, wait for messages
+            echo_body(Conn, StreamId, <<>>, false);
+        {ok, BufferedChunks} ->
+            %% Process buffered data first
+            {Acc, HadFin} = process_buffered_chunks(BufferedChunks),
+            case HadFin of
+                true ->
+                    %% All data received, send response
+                    send_echo_response(Conn, StreamId, Acc);
+                false ->
+                    %% More data expected
+                    echo_body(Conn, StreamId, Acc, false)
+            end;
+        {error, _Reason} ->
+            ok
+    end.
+
+process_buffered_chunks(Chunks) ->
+    lists:foldl(
+        fun({Data, Fin}, {Acc, _HadFin}) ->
+            {<<Acc/binary, Data/binary>>, Fin}
+        end,
+        {<<>>, false},
+        Chunks
+    ).
+
+echo_body(Conn, StreamId, Acc, true) ->
+    %% Already received FIN
+    send_echo_response(Conn, StreamId, Acc);
+echo_body(Conn, StreamId, Acc, false) ->
     receive
         {quic_h3, Conn, {data, StreamId, Data, false}} ->
-            echo_body(Conn, StreamId, <<Acc/binary, Data/binary>>);
+            echo_body(Conn, StreamId, <<Acc/binary, Data/binary>>, false);
         {quic_h3, Conn, {data, StreamId, Data, true}} ->
-            Body = <<Acc/binary, Data/binary>>,
-            quic_h3:send_response(Conn, StreamId, 200, [
-                {<<"content-type">>, <<"application/octet-stream">>}
-            ]),
-            quic_h3:send_data(Conn, StreamId, Body, true);
+            send_echo_response(Conn, StreamId, <<Acc/binary, Data/binary>>);
         {quic_h3, Conn, {stream_closed, StreamId}} ->
             %% Stream closed without FIN, send what we have
-            quic_h3:send_response(Conn, StreamId, 200, [
-                {<<"content-type">>, <<"application/octet-stream">>}
-            ]),
-            quic_h3:send_data(Conn, StreamId, Acc, true)
+            send_echo_response(Conn, StreamId, Acc)
     after 30000 ->
         ok
     end.
+
+send_echo_response(Conn, StreamId, Body) ->
+    quic_h3:send_response(Conn, StreamId, 200, [
+        {<<"content-type">>, <<"application/octet-stream">>}
+    ]),
+    quic_h3:send_data(Conn, StreamId, Body, true).
 
 do_request(Conn, Path, Body) ->
     Headers = [

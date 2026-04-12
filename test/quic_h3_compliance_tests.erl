@@ -633,6 +633,85 @@ stream_id_parity_client_accepts_odd_test() ->
     ?assertMatch({ok, _}, Result).
 
 %%====================================================================
+%% Per-stream Handler Registration Tests
+%%====================================================================
+
+%% Test that data is buffered when no handler is registered
+data_buffered_when_no_handler_test() ->
+    Stream = #h3_stream{
+        id = 0,
+        frame_state = expecting_data,
+        content_length = undefined,
+        body_received = 0,
+        body = <<>>
+    },
+    State = make_test_state(#{
+        streams => #{0 => Stream},
+        stream_handlers => #{}
+    }),
+    %% Send data - should be buffered, not sent to owner
+    {ok, _Stream2, State2} = quic_h3_connection:handle_request_frame(
+        0, {data, <<"hello">>}, false, Stream, State
+    ),
+    %% Check that data was buffered (tuple position 42 for stream_data_buffers)
+    StreamDataBuffers = element(42, State2),
+    ?assertMatch(#{0 := {[{<<"hello">>, false}], 5, false}}, StreamDataBuffers).
+
+%% Test that data is sent to handler when registered
+data_sent_to_handler_when_registered_test() ->
+    Stream = #h3_stream{
+        id = 0,
+        frame_state = expecting_data,
+        content_length = undefined,
+        body_received = 0,
+        body = <<>>
+    },
+    HandlerPid = self(),
+    MonRef = make_ref(),
+    State = make_test_state(#{
+        streams => #{0 => Stream},
+        stream_handlers => #{0 => {HandlerPid, MonRef}}
+    }),
+    %% Send data - should go to handler
+    {ok, _Stream2, _State2} = quic_h3_connection:handle_request_frame(
+        0, {data, <<"hello">>}, false, Stream, State
+    ),
+    %% Check that we received the data message
+    receive
+        {quic_h3, _, {data, 0, <<"hello">>, false}} -> ok
+    after 100 ->
+        ?assert(false)
+    end.
+
+%% Test that multiple buffered chunks are preserved in order
+multiple_chunks_buffered_in_order_test() ->
+    Stream = #h3_stream{
+        id = 0,
+        frame_state = expecting_data,
+        content_length = undefined,
+        body_received = 0,
+        body = <<>>
+    },
+    State0 = make_test_state(#{
+        streams => #{0 => Stream},
+        stream_handlers => #{}
+    }),
+    %% Send first chunk
+    {ok, Stream1, State1} = quic_h3_connection:handle_request_frame(
+        0, {data, <<"chunk1">>}, false, Stream, State0
+    ),
+    %% Send second chunk
+    {ok, _Stream2, State2} = quic_h3_connection:handle_request_frame(
+        0, {data, <<"chunk2">>}, true, Stream1, State1
+    ),
+    %% Check buffered data (stored in reverse order internally)
+    StreamDataBuffers = element(42, State2),
+    {Chunks, Size, HadFin} = maps:get(0, StreamDataBuffers),
+    ?assertEqual([{<<"chunk2">>, true}, {<<"chunk1">>, false}], Chunks),
+    ?assertEqual(12, Size),
+    ?assertEqual(true, HadFin).
+
+%%====================================================================
 %% Helper Functions
 %%====================================================================
 
@@ -681,7 +760,11 @@ make_test_state(Overrides) ->
         local_max_push_id => undefined,
         promised_pushes => #{},
         received_pushes => #{},
-        local_cancelled_pushes => sets:new([{version, 2}])
+        local_cancelled_pushes => sets:new([{version, 2}]),
+        %% Per-stream handler registration
+        stream_handlers => #{},
+        stream_data_buffers => #{},
+        stream_buffer_limit => 65536
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -704,4 +787,7 @@ make_test_state(Overrides) ->
         maps:get(max_push_id, Merged), maps:get(next_push_id, Merged),
         maps:get(push_streams, Merged), maps:get(cancelled_pushes, Merged),
         maps:get(local_max_push_id, Merged), maps:get(promised_pushes, Merged),
-        maps:get(received_pushes, Merged), maps:get(local_cancelled_pushes, Merged)}.
+        maps:get(received_pushes, Merged), maps:get(local_cancelled_pushes, Merged),
+        %% Per-stream handler registration
+        maps:get(stream_handlers, Merged), maps:get(stream_data_buffers, Merged),
+        maps:get(stream_buffer_limit, Merged)}.
