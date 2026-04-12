@@ -704,6 +704,40 @@ create_connection(
             case ConnHandler of
                 undefined ->
                     ok;
+                Fun when is_function(Fun, 2) ->
+                    %% Handler takes (ConnPid, DCID)
+                    case Fun(ConnPid, DCID) of
+                        {ok, HandlerPid} when is_pid(HandlerPid) ->
+                            case quic:set_owner_sync(ConnPid, HandlerPid) of
+                                ok ->
+                                    ok;
+                                {error, Reason} ->
+                                    ?LOG_WARNING(
+                                        #{
+                                            what => set_owner_failed,
+                                            conn => ConnPid,
+                                            reason => Reason
+                                        },
+                                        ?QUIC_LOG_META
+                                    )
+                            end;
+                        {error, HandlerError} ->
+                            ?LOG_WARNING(
+                                #{
+                                    what => connection_handler_failed,
+                                    error => HandlerError
+                                },
+                                ?QUIC_LOG_META
+                            );
+                        Other ->
+                            ?LOG_WARNING(
+                                #{
+                                    what => connection_handler_unexpected,
+                                    result => Other
+                                },
+                                ?QUIC_LOG_META
+                            )
+                    end;
                 Fun when is_function(Fun, 1) ->
                     case Fun(ConnPid) of
                         {ok, HandlerPid} when is_pid(HandlerPid) ->
