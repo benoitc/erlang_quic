@@ -68,10 +68,13 @@
     handle_stream_closed/2,
     handle_control_frame/2,
     handle_request_frame/5,
+    handle_new_stream/3,
     is_critical_stream/2,
     partition_blocked_streams/2,
     validate_trailer_headers/2,
+    validate_request_headers/2,
     calculate_field_section_size/1,
+    validate_outbound_headers/2,
     cleanup_blocked_streams_on_goaway/1
 ]).
 -endif.
@@ -440,8 +443,12 @@ h3_connecting(
     {quic, QuicConn, {new_stream, StreamId, Type}},
     #state{quic_conn = QuicConn} = State
 ) ->
-    State1 = handle_new_stream(StreamId, Type, State),
-    {keep_state, State1};
+    case handle_new_stream(StreamId, Type, State) of
+        {ok, State1} ->
+            {keep_state, State1};
+        {error, Reason} ->
+            handle_connection_error(Reason, State)
+    end;
 h3_connecting(
     info,
     {quic, QuicConn, {stream_closed, StreamId, _ErrorCode}},
@@ -495,8 +502,12 @@ connected(
     {quic, QuicConn, {new_stream, StreamId, Type}},
     #state{quic_conn = QuicConn} = State
 ) ->
-    State1 = handle_new_stream(StreamId, Type, State),
-    {keep_state, State1};
+    case handle_new_stream(StreamId, Type, State) of
+        {ok, State1} ->
+            {keep_state, State1};
+        {error, Reason} ->
+            handle_connection_error(Reason, State)
+    end;
 connected(
     info,
     {quic, QuicConn, {stream_closed, StreamId, ErrorCode}},
@@ -753,22 +764,37 @@ send_settings(
 
 handle_new_stream(StreamId, unidirectional, State) ->
     %% Unidirectional stream - need to read type first
-    State#state{uni_stream_buffers = maps:put(StreamId, <<>>, State#state.uni_stream_buffers)};
+    {ok, State#state{uni_stream_buffers = maps:put(StreamId, <<>>, State#state.uni_stream_buffers)}};
 handle_new_stream(StreamId, bidirectional, #state{streams = Streams, role = Role} = State) ->
-    %% Bidirectional stream is a request stream
-    Stream = #h3_stream{
-        id = StreamId,
-        type = request,
-        state = open
-    },
-    %% For server, this is an incoming request
-    %% For client, we opened it ourselves
-    NewState = State#state{streams = Streams#{StreamId => Stream}},
-    case Role of
-        server ->
-            NewState#state{last_stream_id = max(StreamId, State#state.last_stream_id)};
-        client ->
-            NewState
+    %% RFC 9114 Section 4.1: Validate stream ID parity
+    %% Client-initiated streams are even (0, 4, 8...)
+    %% Server-initiated streams are odd (1, 5, 9...)
+    ExpectedParity =
+        case Role of
+            %% We're server, peer (client) uses even IDs
+            server -> 0;
+            %% We're client, peer (server) uses odd IDs
+            client -> 1
+        end,
+    case (StreamId rem 4) =:= ExpectedParity of
+        false ->
+            {error, {connection_error, ?H3_STREAM_CREATION_ERROR, <<"invalid stream ID parity">>}};
+        true ->
+            %% Bidirectional stream is a request stream
+            Stream = #h3_stream{
+                id = StreamId,
+                type = request,
+                state = open
+            },
+            %% For server, this is an incoming request
+            %% For client, we opened it ourselves
+            NewState = State#state{streams = Streams#{StreamId => Stream}},
+            case Role of
+                server ->
+                    {ok, NewState#state{last_stream_id = max(StreamId, State#state.last_stream_id)}};
+                client ->
+                    {ok, NewState}
+            end
     end.
 
 handle_stream_data(StreamId, Data, Fin, State) ->
@@ -1779,6 +1805,11 @@ validate_request_headers(#h3_stream{path = undefined}, _State) ->
     throw({header_error, {missing_pseudo_header, <<":path">>}});
 validate_request_headers(#h3_stream{path = <<>>}, _State) ->
     throw({header_error, {invalid_pseudo_header, <<":path">>, empty}});
+%% RFC 9114 Section 4.3.1: :authority required for non-CONNECT requests
+validate_request_headers(#h3_stream{method = Method, authority = undefined}, _State) when
+    Method =/= <<"CONNECT">>
+->
+    throw({header_error, {missing_pseudo_header, <<":authority">>}});
 validate_request_headers(_, _State) ->
     ok.
 
@@ -1834,6 +1865,17 @@ calculate_field_section_size(Headers) ->
         0,
         Headers
     ).
+
+%% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
+-spec validate_outbound_headers([{binary(), binary()}], #state{}) -> ok | {error, term()}.
+validate_outbound_headers(Headers, #state{peer_max_field_section_size = MaxSize}) ->
+    Size = calculate_field_section_size(Headers),
+    case Size > MaxSize of
+        true ->
+            {error, {header_error, field_section_too_large}};
+        false ->
+            ok
+    end.
 
 %% Parse RFC 9218 Priority header field value
 %% Format: "u=N" or "u=N, i" where N is urgency 0-7, i means incremental
@@ -1910,6 +1952,15 @@ send_request(
         streams = Streams
     } = State
 ) ->
+    %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
+    case validate_outbound_headers(Headers, State) of
+        {error, Reason} ->
+            {error, Reason};
+        ok ->
+            send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, Streams, State)
+    end.
+
+send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, Streams, State) ->
     %% end_stream defaults to true for requests without body (GET, HEAD, etc.)
     EndStream = maps:get(end_stream, Opts, true),
     case quic:open_stream(QuicConn) of
@@ -1956,26 +2007,32 @@ do_send_response(
         streams = Streams
     } = State
 ) ->
-    case maps:find(StreamId, Streams) of
-        {ok, Stream} ->
-            StatusHeader = {<<":status">>, integer_to_binary(Status)},
-            AllHeaders = [StatusHeader | Headers],
-            %% Use encode/3 with StreamId for section ack tracking
-            {Encoded, Encoder1} = quic_qpack:encode(AllHeaders, StreamId, Encoder),
-            %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
-            State1 = State#state{qpack_encoder = Encoder1},
-            State2 = send_encoder_instructions(State1),
-            HeadersFrame = quic_h3_frame:encode_headers(Encoded),
-            case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
-                ok ->
-                    Stream1 = Stream#h3_stream{status = Status, headers = AllHeaders},
-                    State3 = State2#state{streams = Streams#{StreamId => Stream1}},
-                    {ok, State3};
-                {error, Reason} ->
-                    {error, Reason}
-            end;
-        error ->
-            {error, unknown_stream}
+    StatusHeader = {<<":status">>, integer_to_binary(Status)},
+    AllHeaders = [StatusHeader | Headers],
+    %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
+    case validate_outbound_headers(AllHeaders, State) of
+        {error, Reason} ->
+            {error, Reason};
+        ok ->
+            case maps:find(StreamId, Streams) of
+                {ok, Stream} ->
+                    %% Use encode/3 with StreamId for section ack tracking
+                    {Encoded, Encoder1} = quic_qpack:encode(AllHeaders, StreamId, Encoder),
+                    %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
+                    State1 = State#state{qpack_encoder = Encoder1},
+                    State2 = send_encoder_instructions(State1),
+                    HeadersFrame = quic_h3_frame:encode_headers(Encoded),
+                    case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
+                        ok ->
+                            Stream1 = Stream#h3_stream{status = Status, headers = AllHeaders},
+                            State3 = State2#state{streams = Streams#{StreamId => Stream1}},
+                            {ok, State3};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
+                error ->
+                    {error, unknown_stream}
+            end
     end.
 
 do_send_data(StreamId, Data, Fin, #state{quic_conn = QuicConn, streams = Streams} = State) ->
@@ -2006,27 +2063,33 @@ do_send_trailers(
         streams = Streams
     } = State
 ) ->
-    case maps:find(StreamId, Streams) of
-        {ok, Stream} ->
-            %% Use encode/3 with StreamId for section ack tracking
-            {Encoded, Encoder1} = quic_qpack:encode(Trailers, StreamId, Encoder),
-            %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
-            State1 = State#state{qpack_encoder = Encoder1},
-            State2 = send_encoder_instructions(State1),
-            TrailersFrame = quic_h3_frame:encode_headers(Encoded),
-            case quic:send_data(QuicConn, StreamId, TrailersFrame, true) of
-                ok ->
-                    Stream1 = Stream#h3_stream{
-                        trailers = Trailers,
-                        state = half_closed_local
-                    },
-                    State3 = State2#state{streams = Streams#{StreamId => Stream1}},
-                    {ok, State3};
-                {error, Reason} ->
-                    {error, Reason}
-            end;
-        error ->
-            {error, unknown_stream}
+    %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
+    case validate_outbound_headers(Trailers, State) of
+        {error, Reason} ->
+            {error, Reason};
+        ok ->
+            case maps:find(StreamId, Streams) of
+                {ok, Stream} ->
+                    %% Use encode/3 with StreamId for section ack tracking
+                    {Encoded, Encoder1} = quic_qpack:encode(Trailers, StreamId, Encoder),
+                    %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
+                    State1 = State#state{qpack_encoder = Encoder1},
+                    State2 = send_encoder_instructions(State1),
+                    TrailersFrame = quic_h3_frame:encode_headers(Encoded),
+                    case quic:send_data(QuicConn, StreamId, TrailersFrame, true) of
+                        ok ->
+                            Stream1 = Stream#h3_stream{
+                                trailers = Trailers,
+                                state = half_closed_local
+                            },
+                            State3 = State2#state{streams = Streams#{StreamId => Stream1}},
+                            {ok, State3};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
+                error ->
+                    {error, unknown_stream}
+            end
     end.
 
 do_cancel_stream(StreamId, ErrorCode, #state{quic_conn = QuicConn, streams = Streams} = State) ->
@@ -2088,13 +2151,24 @@ do_push_internal(
         next_push_id = NextPushId
     } = State
 ) ->
-    %% Encode headers for PUSH_PROMISE
-    {Encoded, Encoder1} = quic_qpack:encode(Headers, RequestStreamId, Encoder),
-    State1 = State#state{qpack_encoder = Encoder1},
-    State2 = send_encoder_instructions(State1),
+    %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
+    case validate_outbound_headers(Headers, State) of
+        {error, Reason} ->
+            {error, Reason};
+        ok ->
+            %% Encode headers for PUSH_PROMISE
+            {Encoded, Encoder1} = quic_qpack:encode(Headers, RequestStreamId, Encoder),
+            State1 = State#state{qpack_encoder = Encoder1},
+            State2 = send_encoder_instructions(State1),
 
-    %% Send PUSH_PROMISE on request stream
-    PushPromiseFrame = quic_h3_frame:encode_push_promise(PushId, Encoded),
+            %% Send PUSH_PROMISE on request stream
+            PushPromiseFrame = quic_h3_frame:encode_push_promise(PushId, Encoded),
+            do_push_send(
+                QuicConn, RequestStreamId, PushPromiseFrame, PushId, NextPushId, PushStreams, State2
+            )
+    end.
+
+do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, PushId, NextPushId, PushStreams, State) ->
     case quic:send_data(QuicConn, RequestStreamId, PushPromiseFrame, false) of
         ok ->
             %% Open push stream (unidirectional, server-initiated)
@@ -2113,7 +2187,7 @@ do_push_internal(
                                 state = open,
                                 frame_state = expecting_headers
                             },
-                            State3 = State2#state{
+                            State3 = State#state{
                                 next_push_id = NextPushId + 1,
                                 push_streams = maps:put(PushId, {PushStreamId, Stream}, PushStreams)
                             },
@@ -2139,30 +2213,36 @@ do_send_push_response(
         qpack_encoder = Encoder
     } = State
 ) ->
-    case maps:find(PushId, PushStreams) of
-        {ok, {StreamId, Stream}} ->
-            StatusHeader = {<<":status">>, integer_to_binary(Status)},
-            AllHeaders = [StatusHeader | Headers],
-            {Encoded, Encoder1} = quic_qpack:encode(AllHeaders, StreamId, Encoder),
-            State1 = State#state{qpack_encoder = Encoder1},
-            State2 = send_encoder_instructions(State1),
-            HeadersFrame = quic_h3_frame:encode_headers(Encoded),
-            case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
-                ok ->
-                    Stream1 = Stream#h3_stream{
-                        status = Status,
-                        headers = AllHeaders,
-                        frame_state = expecting_data
-                    },
-                    State3 = State2#state{
-                        push_streams = maps:put(PushId, {StreamId, Stream1}, PushStreams)
-                    },
-                    {ok, State3};
-                {error, Reason} ->
-                    {error, Reason}
-            end;
-        error ->
-            {error, unknown_push_id}
+    StatusHeader = {<<":status">>, integer_to_binary(Status)},
+    AllHeaders = [StatusHeader | Headers],
+    %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
+    case validate_outbound_headers(AllHeaders, State) of
+        {error, Reason} ->
+            {error, Reason};
+        ok ->
+            case maps:find(PushId, PushStreams) of
+                {ok, {StreamId, Stream}} ->
+                    {Encoded, Encoder1} = quic_qpack:encode(AllHeaders, StreamId, Encoder),
+                    State1 = State#state{qpack_encoder = Encoder1},
+                    State2 = send_encoder_instructions(State1),
+                    HeadersFrame = quic_h3_frame:encode_headers(Encoded),
+                    case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
+                        ok ->
+                            Stream1 = Stream#h3_stream{
+                                status = Status,
+                                headers = AllHeaders,
+                                frame_state = expecting_data
+                            },
+                            State3 = State2#state{
+                                push_streams = maps:put(PushId, {StreamId, Stream1}, PushStreams)
+                            },
+                            {ok, State3};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
+                error ->
+                    {error, unknown_push_id}
+            end
     end.
 
 %% Send data on a push stream

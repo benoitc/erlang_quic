@@ -555,6 +555,84 @@ settings_directionality_state_fields_test() ->
     ?assertEqual(10, PeerBlocked).
 
 %%====================================================================
+%% :authority Validation Tests (RFC 9114 Section 4.3.1)
+%%====================================================================
+
+authority_required_non_connect_test() ->
+    Stream = #h3_stream{
+        id = 0,
+        method = <<"GET">>,
+        scheme = <<"https">>,
+        path = <<"/">>,
+        authority = undefined
+    },
+    State = make_test_state(#{role => server}),
+    ?assertThrow(
+        {header_error, {missing_pseudo_header, <<":authority">>}},
+        quic_h3_connection:validate_request_headers(Stream, State)
+    ).
+
+authority_not_required_connect_test() ->
+    Stream = #h3_stream{
+        id = 0,
+        method = <<"CONNECT">>,
+        scheme = undefined,
+        path = undefined,
+        authority = <<"example.com:443">>
+    },
+    %% CONNECT requires peer_connect_enabled = true
+    State = make_test_state(#{role => server, peer_connect_enabled => true}),
+    ?assertEqual(ok, quic_h3_connection:validate_request_headers(Stream, State)).
+
+%%====================================================================
+%% Outbound Field Section Size Tests (RFC 9114 Section 4.2.2)
+%%====================================================================
+
+outbound_field_section_size_limit_test() ->
+    %% Peer's limit is 100 bytes
+    State = make_test_state(#{peer_max_field_section_size => 100}),
+    %% Headers that exceed 100 bytes decoded size
+    LargeHeaders = [
+        {<<":status">>, <<"200">>},
+        {<<"x-large">>, binary:copy(<<"x">>, 200)}
+    ],
+    Result = quic_h3_connection:validate_outbound_headers(LargeHeaders, State),
+    ?assertMatch({error, {header_error, field_section_too_large}}, Result).
+
+outbound_field_section_size_ok_test() ->
+    State = make_test_state(#{peer_max_field_section_size => 65536}),
+    SmallHeaders = [
+        {<<":status">>, <<"200">>},
+        {<<"content-type">>, <<"text/plain">>}
+    ],
+    ?assertEqual(ok, quic_h3_connection:validate_outbound_headers(SmallHeaders, State)).
+
+%%====================================================================
+%% Stream ID Parity Tests (RFC 9114 Section 4.1)
+%%====================================================================
+
+stream_id_parity_server_rejects_odd_test() ->
+    %% Server should reject odd-numbered streams (server-initiated parity)
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:handle_new_stream(1, bidirectional, State),
+    ?assertMatch({error, {connection_error, ?H3_STREAM_CREATION_ERROR, _}}, Result).
+
+stream_id_parity_server_accepts_even_test() ->
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:handle_new_stream(0, bidirectional, State),
+    ?assertMatch({ok, _}, Result).
+
+stream_id_parity_client_rejects_even_test() ->
+    State = make_test_state(#{role => client}),
+    Result = quic_h3_connection:handle_new_stream(0, bidirectional, State),
+    ?assertMatch({error, {connection_error, ?H3_STREAM_CREATION_ERROR, _}}, Result).
+
+stream_id_parity_client_accepts_odd_test() ->
+    State = make_test_state(#{role => client}),
+    Result = quic_h3_connection:handle_new_stream(1, bidirectional, State),
+    ?assertMatch({ok, _}, Result).
+
+%%====================================================================
 %% Helper Functions
 %%====================================================================
 
