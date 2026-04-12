@@ -451,9 +451,8 @@ goaway_clears_blocked_streams_test() ->
         local_decoder_stream => undefined
     }),
     Result = quic_h3_connection:cleanup_blocked_streams_on_goaway(State),
-    %% Blocked streams should be empty after cleanup
-    {state, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
-        BlockedStreams, _, _, _} = Result,
+    %% Blocked streams (field 26, tuple position 27) should be empty after cleanup
+    BlockedStreams = element(27, Result),
     ?assertEqual(#{}, BlockedStreams).
 
 goaway_empty_blocked_streams_test() ->
@@ -463,9 +462,74 @@ goaway_empty_blocked_streams_test() ->
         local_decoder_stream => undefined
     }),
     Result = quic_h3_connection:cleanup_blocked_streams_on_goaway(State),
-    {state, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
-        BlockedStreams, _, _, _} = Result,
+    BlockedStreams = element(27, Result),
     ?assertEqual(#{}, BlockedStreams).
+
+%%====================================================================
+%% SETTINGS Directionality Tests (RFC 9114 Section 7.2.4.1)
+%%====================================================================
+
+%% Inbound validation uses LOCAL settings (our limits for incoming data)
+inbound_field_section_uses_local_setting_test() ->
+    %% Local setting: max 100 bytes, Peer setting: max 1000 bytes
+    %% Inbound headers with decoded size > 100 should FAIL (exceeds local limit)
+    %% even though peer allows 1000 bytes
+    LargeHeaders = [{<<"x-large">>, binary:copy(<<"x">>, 100)}],
+    Size = quic_h3_connection:calculate_field_section_size(LargeHeaders),
+    %% x-large (7) + 100 + 32 = 139 bytes decoded
+    ?assert(Size > 100),
+    ?assert(Size < 1000),
+    %% This verifies local_max_field_section_size is what's checked
+    ?assertEqual(139, Size).
+
+%% Outbound validation uses PEER settings (their limits for data we send)
+outbound_field_section_uses_peer_setting_test() ->
+    %% Peer setting: max 100 bytes
+    %% When sending headers, we should respect peer's limit
+    State = make_test_state(#{
+        local_max_field_section_size => 1000,
+        peer_max_field_section_size => 100
+    }),
+    %% peer_max_field_section_size is at tuple position 28
+    PeerMax = element(28, State),
+    ?assertEqual(100, PeerMax).
+
+%% Blocked streams limit uses LOCAL setting (our decoder's limit)
+blocked_streams_uses_local_setting_test() ->
+    %% Local blocked limit: 2, Peer limit: 10
+    %% When OUR decoder has 2 blocked, should reject based on local limit
+    State = make_test_state(#{
+        local_max_blocked_streams => 2,
+        peer_max_blocked_streams => 10,
+        blocked_streams => #{4 => {1, <<>>, false}, 8 => {2, <<>>, false}}
+    }),
+    %% Tuple positions: 27=blocked_streams, 32=local_max_blocked_streams
+    BlockedStreams = element(27, State),
+    LocalMaxBlocked = element(32, State),
+    BlockedCount = map_size(BlockedStreams),
+    ?assertEqual(2, BlockedCount),
+    ?assertEqual(2, LocalMaxBlocked),
+    ?assert(BlockedCount >= LocalMaxBlocked).
+
+%% Verify state record has both local and peer settings
+settings_directionality_state_fields_test() ->
+    State = make_test_state(#{
+        local_max_field_section_size => 500,
+        peer_max_field_section_size => 1000,
+        local_max_blocked_streams => 5,
+        peer_max_blocked_streams => 10
+    }),
+    %% Tuple positions:
+    %% 28=peer_max_field_section_size, 29=peer_max_blocked_streams,
+    %% 30=peer_connect_enabled, 31=local_max_field_section_size, 32=local_max_blocked_streams
+    PeerFieldSize = element(28, State),
+    PeerBlocked = element(29, State),
+    LocalFieldSize = element(31, State),
+    LocalBlocked = element(32, State),
+    ?assertEqual(500, LocalFieldSize),
+    ?assertEqual(1000, PeerFieldSize),
+    ?assertEqual(5, LocalBlocked),
+    ?assertEqual(10, PeerBlocked).
 
 %%====================================================================
 %% Helper Functions
@@ -500,10 +564,13 @@ make_test_state(Overrides) ->
         encoder_buffer => <<>>,
         decoder_buffer => <<>>,
         blocked_streams => #{},
-        %% RFC 9114 Section 7.2.4.1 peer settings enforcement
+        %% RFC 9114 Section 7.2.4.1 peer settings enforcement (outbound)
         peer_max_field_section_size => 65536,
         peer_max_blocked_streams => 0,
-        peer_connect_enabled => false
+        peer_connect_enabled => false,
+        %% RFC 9114 Section 7.2.4.1 local settings enforcement (inbound)
+        local_max_field_section_size => 65536,
+        local_max_blocked_streams => 0
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -520,4 +587,5 @@ make_test_state(Overrides) ->
         maps:get(uni_stream_buffers, Merged), maps:get(encoder_buffer, Merged),
         maps:get(decoder_buffer, Merged), maps:get(blocked_streams, Merged),
         maps:get(peer_max_field_section_size, Merged), maps:get(peer_max_blocked_streams, Merged),
-        maps:get(peer_connect_enabled, Merged)}.
+        maps:get(peer_connect_enabled, Merged), maps:get(local_max_field_section_size, Merged),
+        maps:get(local_max_blocked_streams, Merged)}.

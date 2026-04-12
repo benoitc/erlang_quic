@@ -136,7 +136,11 @@
     %% Peer settings enforcement (RFC 9114 Section 7.2.4.1)
     peer_max_field_section_size = ?H3_DEFAULT_MAX_FIELD_SECTION_SIZE :: non_neg_integer(),
     peer_max_blocked_streams = 0 :: non_neg_integer(),
-    peer_connect_enabled = false :: boolean()
+    peer_connect_enabled = false :: boolean(),
+
+    %% Local settings enforcement (validate inbound data - RFC 9114 Section 7.2.4.1)
+    local_max_field_section_size = ?H3_DEFAULT_MAX_FIELD_SECTION_SIZE :: non_neg_integer(),
+    local_max_blocked_streams = 0 :: non_neg_integer()
 }).
 
 %%====================================================================
@@ -231,6 +235,10 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
 
     LocalSettings = maps:merge(quic_h3_frame:default_settings(), maps:get(settings, Opts, #{})),
     MaxTableCapacity = maps:get(qpack_max_table_capacity, LocalSettings, 0),
+    LocalMaxFieldSize = maps:get(
+        max_field_section_size, LocalSettings, ?H3_DEFAULT_MAX_FIELD_SECTION_SIZE
+    ),
+    LocalMaxBlocked = maps:get(qpack_blocked_streams, LocalSettings, 0),
 
     State = #state{
         quic_conn = QuicConn,
@@ -242,7 +250,9 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
         qpack_encoder = quic_qpack:new(#{max_dynamic_size => MaxTableCapacity}),
         qpack_decoder = quic_qpack:new(#{max_dynamic_size => MaxTableCapacity}),
         % Client uses even stream IDs (0, 4, 8, ...)
-        next_stream_id = 0
+        next_stream_id = 0,
+        local_max_field_section_size = LocalMaxFieldSize,
+        local_max_blocked_streams = LocalMaxBlocked
     },
 
     %% Start in awaiting_quic - wait for QUIC connected notification
@@ -255,6 +265,10 @@ init({server, QuicConn, Opts, Owner}) ->
 
     LocalSettings = maps:merge(quic_h3_frame:default_settings(), maps:get(settings, Opts, #{})),
     MaxTableCapacity = maps:get(qpack_max_table_capacity, LocalSettings, 0),
+    LocalMaxFieldSize = maps:get(
+        max_field_section_size, LocalSettings, ?H3_DEFAULT_MAX_FIELD_SECTION_SIZE
+    ),
+    LocalMaxBlocked = maps:get(qpack_blocked_streams, LocalSettings, 0),
     Handler = maps:get(handler, Opts, undefined),
 
     State = #state{
@@ -267,7 +281,9 @@ init({server, QuicConn, Opts, Owner}) ->
         qpack_encoder = quic_qpack:new(#{max_dynamic_size => MaxTableCapacity}),
         qpack_decoder = quic_qpack:new(#{max_dynamic_size => MaxTableCapacity}),
         % Server uses odd stream IDs (1, 5, 9, ...)
-        next_stream_id = 1
+        next_stream_id = 1,
+        local_max_field_section_size = LocalMaxFieldSize,
+        local_max_blocked_streams = LocalMaxBlocked
     },
 
     %% Store handler in process dictionary for server
@@ -1105,8 +1121,9 @@ handle_headers_decode(StreamId, HeaderBlock, Fin, Stream, Decoder, Owner, Role, 
     case quic_qpack:decode(HeaderBlock, Decoder) of
         {{ok, Headers}, Decoder1} ->
             %% RFC 9114 Section 4.2.2: Check decoded field section size
+            %% Use LOCAL setting - we enforce our own limit on inbound headers
             DecodedSize = calculate_field_section_size(Headers),
-            MaxSize = State#state.peer_max_field_section_size,
+            MaxSize = State#state.local_max_field_section_size,
             case DecodedSize > MaxSize of
                 true ->
                     {error,
@@ -1119,8 +1136,9 @@ handle_headers_decode(StreamId, HeaderBlock, Fin, Stream, Decoder, Owner, Role, 
         {{blocked, RIC}, Decoder1} ->
             %% Stream blocked waiting for encoder instructions (RFC 9204 Section 2.2.2)
             %% Check blocked streams limit (RFC 9204 Section 2.1.2)
+            %% Use LOCAL setting - we enforce our own decoder's blocked stream limit
             BlockedCount = map_size(State#state.blocked_streams),
-            MaxBlocked = State#state.peer_max_blocked_streams,
+            MaxBlocked = State#state.local_max_blocked_streams,
             case BlockedCount >= MaxBlocked andalso MaxBlocked > 0 of
                 true ->
                     %% Exceeds blocked streams limit - reject the request
