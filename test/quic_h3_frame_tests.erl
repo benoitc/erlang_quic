@@ -184,13 +184,31 @@ encode_generic_push_promise_test() ->
 %%====================================================================
 
 decode_unknown_frame_test() ->
-    %% Type 0x02 is not defined in HTTP/3 (was used in HTTP/2)
-    Type = 16#02,
+    %% Non-reserved, non-standard frame type (greased): 0x40 is not used by
+    %% HTTP/3 and not in the HTTP/2 reserved set, so it should decode as
+    %% {unknown, ...}.
+    Type = 16#40,
     Payload = <<"unknown">>,
     TypeEnc = quic_varint:encode(Type),
     LenEnc = quic_varint:encode(byte_size(Payload)),
     Encoded = <<TypeEnc/binary, LenEnc/binary, Payload/binary>>,
-    ?assertMatch({ok, {unknown, 16#02, <<"unknown">>}, <<>>}, quic_h3_frame:decode(Encoded)).
+    ?assertMatch({ok, {unknown, 16#40, <<"unknown">>}, <<>>}, quic_h3_frame:decode(Encoded)).
+
+%% RFC 9114 §7.2.8: HTTP/2 reserved frame types must be rejected.
+decode_h2_reserved_frame_rejected_test_() ->
+    lists:map(
+        fun(Type) ->
+            Payload = <<>>,
+            TypeEnc = quic_varint:encode(Type),
+            LenEnc = quic_varint:encode(0),
+            Encoded = <<TypeEnc/binary, LenEnc/binary, Payload/binary>>,
+            {
+                iolist_to_binary(io_lib:format("h2_reserved_~.16B", [Type])),
+                ?_assertMatch({error, {h2_reserved_frame, Type}}, quic_h3_frame:decode(Encoded))
+            }
+        end,
+        [16#02, 16#06, 16#08, 16#09]
+    ).
 
 decode_reserved_frame_test() ->
     %% Reserved frame type: 0x1f * N + 0x21
@@ -470,6 +488,63 @@ decode_truncated_length_test() ->
 decode_missing_payload_test() ->
     %% DATA frame with length 100 but no payload
     ?assertMatch({more, 100}, quic_h3_frame:decode(<<0, 16#40, 100>>)).
+
+%%====================================================================
+%% Forbidden HTTP/2 Settings Tests (RFC 9114 Section 7.2.4.1)
+%%====================================================================
+
+%% HTTP/2 settings must be rejected in HTTP/3
+forbidden_http2_settings_enable_push_test() ->
+    %% 0x02 = ENABLE_PUSH (HTTP/2 only)
+    Payload = <<(quic_varint:encode(16#02))/binary, (quic_varint:encode(1))/binary>>,
+    ?assertEqual(
+        {error, {forbidden_setting, 16#02}}, quic_h3_frame:decode_settings_payload(Payload)
+    ).
+
+forbidden_http2_settings_max_concurrent_streams_test() ->
+    %% 0x03 = MAX_CONCURRENT_STREAMS (HTTP/2 only)
+    Payload = <<(quic_varint:encode(16#03))/binary, (quic_varint:encode(100))/binary>>,
+    ?assertEqual(
+        {error, {forbidden_setting, 16#03}}, quic_h3_frame:decode_settings_payload(Payload)
+    ).
+
+forbidden_http2_settings_initial_window_size_test() ->
+    %% 0x04 = INITIAL_WINDOW_SIZE (HTTP/2 only)
+    Payload = <<(quic_varint:encode(16#04))/binary, (quic_varint:encode(65535))/binary>>,
+    ?assertEqual(
+        {error, {forbidden_setting, 16#04}}, quic_h3_frame:decode_settings_payload(Payload)
+    ).
+
+forbidden_http2_settings_max_frame_size_test() ->
+    %% 0x05 = MAX_FRAME_SIZE (HTTP/2 only)
+    Payload = <<(quic_varint:encode(16#05))/binary, (quic_varint:encode(16384))/binary>>,
+    ?assertEqual(
+        {error, {forbidden_setting, 16#05}}, quic_h3_frame:decode_settings_payload(Payload)
+    ).
+
+%% Test all forbidden settings in a batch
+forbidden_http2_settings_all_test() ->
+    ForbiddenIds = [16#02, 16#03, 16#04, 16#05],
+    lists:foreach(
+        fun(Id) ->
+            Payload = <<(quic_varint:encode(Id))/binary, (quic_varint:encode(0))/binary>>,
+            ?assertEqual(
+                {error, {forbidden_setting, Id}}, quic_h3_frame:decode_settings_payload(Payload)
+            )
+        end,
+        ForbiddenIds
+    ).
+
+%% Valid HTTP/3 settings should still work
+valid_h3_settings_after_forbidden_check_test() ->
+    Settings = #{
+        qpack_max_table_capacity => 4096,
+        max_field_section_size => 8192
+    },
+    Encoded = quic_h3_frame:encode_settings(Settings),
+    {ok, {settings, Decoded}, <<>>} = quic_h3_frame:decode(Encoded),
+    ?assertEqual(4096, maps:get(qpack_max_table_capacity, Decoded)),
+    ?assertEqual(8192, maps:get(max_field_section_size, Decoded)).
 
 %%====================================================================
 %% Binary Pattern Tests (Fuzzing-like)

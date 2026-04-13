@@ -296,3 +296,38 @@ multiple_encodes_test() ->
     ?assert(is_binary(Encoded1)),
     ?assert(is_binary(Encoded2)),
     ?assertNotEqual(Encoded1, Encoded2).
+
+%%====================================================================
+%% Huffman string encoding / EOS validation (RFC 7541 §5.2)
+%%====================================================================
+
+%% Literal values that compress should round-trip through Huffman encoding.
+huffman_encoded_roundtrip_test() ->
+    Headers = [
+        {<<"x-long-header">>, <<"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">>}
+    ],
+    Encoded = quic_qpack:encode(Headers),
+    {ok, Decoded} = quic_qpack:decode(Encoded),
+    ?assertEqual(Headers, Decoded).
+
+%% Short values should remain non-Huffman (encoded_size >= raw).
+huffman_skip_for_small_value_test() ->
+    Headers = [{<<"x-s">>, <<"a">>}],
+    Encoded = quic_qpack:encode(Headers),
+    {ok, Decoded} = quic_qpack:decode(Encoded),
+    ?assertEqual(Headers, Decoded).
+
+%% RFC 7541 §5.2: EOS symbol or over-long padding must be rejected on decode.
+huffman_invalid_eos_rejected_test() ->
+    %% Build a literal with huffman flag=1 but with an EOS-only encoded byte
+    %% stream (all-ones), which contains EOS and must fail validation.
+    Prefix = <<0:2, 0:6>>,
+    %% Literal with literal name, huffman name = 0, name len = 1
+    NameLenByte = <<0:1, 1:3, 1:4>>,
+    Name = <<"x">>,
+    %% Value: huffman flag=1, 4 bytes of 0xFF (will contain EOS symbol)
+    ValueLenByte = <<1:1, 4:7>>,
+    Value = <<16#FF, 16#FF, 16#FF, 16#FF>>,
+    Header = <<NameLenByte/binary, Name/binary, ValueLenByte/binary, Value/binary>>,
+    Block = <<Prefix/binary, Header/binary>>,
+    ?assertMatch({error, _}, quic_qpack:decode(Block)).

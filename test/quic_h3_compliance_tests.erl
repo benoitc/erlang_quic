@@ -741,8 +741,8 @@ duplicate_status_pseudo_header_rejected_test() ->
     Result = quic_h3_connection:update_stream_with_headers(Headers, Stream, client, State),
     ?assertMatch({error, {duplicate_header, <<":status">>}}, Result).
 
-%% Duplicate regular headers must be rejected
-duplicate_regular_header_rejected_test() ->
+%% RFC 9110 §5.2-§5.3: duplicate regular (non-pseudo) headers are legal.
+duplicate_regular_header_accepted_test() ->
     Headers = [
         {<<":status">>, <<"200">>},
         {<<"x-custom">>, <<"value1">>},
@@ -751,9 +751,9 @@ duplicate_regular_header_rejected_test() ->
     Stream = #h3_stream{id = 0},
     State = make_test_state(#{role => client}),
     Result = quic_h3_connection:update_stream_with_headers(Headers, Stream, client, State),
-    ?assertMatch({error, {duplicate_header, <<"x-custom">>}}, Result).
+    ?assertMatch({ok, _}, Result).
 
-duplicate_content_type_rejected_test() ->
+duplicate_content_type_accepted_test() ->
     Headers = [
         {<<":status">>, <<"200">>},
         {<<"content-type">>, <<"text/html">>},
@@ -762,7 +762,7 @@ duplicate_content_type_rejected_test() ->
     Stream = #h3_stream{id = 0},
     State = make_test_state(#{role => client}),
     Result = quic_h3_connection:update_stream_with_headers(Headers, Stream, client, State),
-    ?assertMatch({error, {duplicate_header, <<"content-type">>}}, Result).
+    ?assertMatch({ok, _}, Result).
 
 %% set-cookie is explicitly allowed to have multiple values
 set_cookie_duplicates_allowed_test() ->
@@ -787,6 +787,458 @@ no_duplicates_accepted_test() ->
     State = make_test_state(#{role => client}),
     Result = quic_h3_connection:update_stream_with_headers(Headers, Stream, client, State),
     ?assertMatch({ok, _}, Result).
+
+%%====================================================================
+%% GOAWAY Role-Aware Identifier Tests (RFC 9114 Section 7.2.6)
+%%====================================================================
+
+%% A client receiving GOAWAY must reject identifiers that are not
+%% client-initiated bidirectional stream IDs (Id rem 4 =/= 0).
+goaway_client_receives_non_bidi_id_rejected_test() ->
+    State = make_test_state(#{role => client, settings_received => true}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_ID_ERROR, _}},
+        quic_h3_connection:handle_control_frame({goaway, 2}, State)
+    ),
+    ?assertMatch(
+        {error, {connection_error, ?H3_ID_ERROR, _}},
+        quic_h3_connection:handle_control_frame({goaway, 3}, State)
+    ).
+
+goaway_client_receives_bidi_id_accepted_test() ->
+    State = make_test_state(#{role => client, settings_received => true}),
+    ?assertMatch(
+        {transition, goaway_received, _},
+        quic_h3_connection:handle_control_frame({goaway, 0}, State)
+    ),
+    ?assertMatch(
+        {transition, goaway_received, _},
+        quic_h3_connection:handle_control_frame({goaway, 8}, State)
+    ).
+
+%% Server receives GOAWAY carrying a push ID - no modular constraint.
+goaway_server_receives_any_push_id_accepted_test() ->
+    State = make_test_state(#{role => server, settings_received => true}),
+    ?assertMatch(
+        {transition, goaway_received, _},
+        quic_h3_connection:handle_control_frame({goaway, 3}, State)
+    ).
+
+%%====================================================================
+%% PUSH_PROMISE Duplicate Handling Tests (RFC 9114 Section 7.2.5)
+%%====================================================================
+
+%% Duplicate push ID with identical headers is allowed (idempotent).
+push_promise_duplicate_same_headers_accepted_test() ->
+    Headers = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/a">>}],
+    Promised = #{5 => {0, Headers}},
+    ?assertEqual(
+        duplicate_ok,
+        quic_h3_connection:validate_push_promise_duplicate(5, Headers, Promised)
+    ).
+
+%% Duplicate push ID with different headers is a protocol error.
+push_promise_duplicate_different_headers_rejected_test() ->
+    Headers1 = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/a">>}],
+    Headers2 = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/b">>}],
+    Promised = #{5 => {0, Headers1}},
+    ?assertMatch(
+        {error, {connection_error, ?H3_GENERAL_PROTOCOL_ERROR, _}},
+        quic_h3_connection:validate_push_promise_duplicate(5, Headers2, Promised)
+    ).
+
+push_promise_new_id_ok_test() ->
+    Headers = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/a">>}],
+    ?assertEqual(
+        ok,
+        quic_h3_connection:validate_push_promise_duplicate(7, Headers, #{})
+    ).
+
+%%====================================================================
+%% Malformed Message Tests (RFC 9114 Section 4.2)
+%%====================================================================
+
+uppercase_header_name_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"Content-Type">>, <<"text/plain">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, {invalid_field, <<"Content-Type">>, _}}, Result).
+
+connection_header_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"connection">>, <<"close">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, {invalid_field, <<"connection">>, _}}, Result).
+
+te_non_trailers_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"te">>, <<"gzip">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, {invalid_field, <<"te">>, <<"gzip">>}}, Result).
+
+te_trailers_accepted_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"te">>, <<"trailers">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({ok, _}, Result).
+
+invalid_field_value_ctl_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"x-custom">>, <<"a\nb">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, {invalid_field, <<"x-custom">>, _}}, Result).
+
+%%====================================================================
+%% Response Validation Tests (RFC 9114 Section 4.3.2)
+%%====================================================================
+
+response_status_out_of_range_rejected_test() ->
+    Headers = [{<<":status">>, <<"42">>}],
+    State = make_test_state(#{role => client}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, client, State
+    ),
+    ?assertMatch({error, {invalid_field, <<":status">>, _}}, Result).
+
+response_with_request_pseudo_rejected_test() ->
+    Headers = [{<<":status">>, <<"200">>}, {<<":method">>, <<"GET">>}],
+    State = make_test_state(#{role => client}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, client, State
+    ),
+    ?assertMatch({error, {invalid_field, <<":method">>, _}}, Result).
+
+response_valid_status_accepted_test() ->
+    Headers = [{<<":status">>, <<"200">>}],
+    State = make_test_state(#{role => client}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, client, State
+    ),
+    ?assertMatch({ok, _}, Result).
+
+%%====================================================================
+%% Authority / Host Interplay Tests (RFC 9110 Section 7.2)
+%%====================================================================
+
+authority_only_accepted_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({ok, _}, Result).
+
+host_only_accepted_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<"host">>, <<"example.com">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({ok, _}, Result).
+
+host_matching_authority_accepted_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"host">>, <<"example.com">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({ok, _}, Result).
+
+host_mismatching_authority_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"host">>, <<"other.com">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, {invalid_field, <<"host">>, _}}, Result).
+
+neither_authority_nor_host_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, {missing_pseudo_header, <<":authority">>}}, Result).
+
+%%====================================================================
+%% GOAWAY Identifier Computation (RFC 9114 §5.2)
+%%====================================================================
+
+%% Server sends LastId + 4 so the ID marks the first rejected stream.
+goaway_server_sends_next_stream_test() ->
+    State = make_test_state(#{role => server, last_stream_id => 4}),
+    ?assertEqual(8, quic_h3_connection:goaway_id_to_send(State)).
+
+goaway_server_sends_4_when_none_processed_test() ->
+    State = make_test_state(#{role => server, last_stream_id => 0}),
+    ?assertEqual(4, quic_h3_connection:goaway_id_to_send(State)).
+
+%% Client sends the next push ID it will refuse.
+goaway_client_sends_next_push_id_test() ->
+    Promised = #{0 => {0, []}, 3 => {0, []}},
+    State = make_test_state(#{role => client, promised_pushes => Promised}),
+    ?assertEqual(4, quic_h3_connection:goaway_id_to_send(State)).
+
+goaway_client_sends_zero_when_no_pushes_test() ->
+    State = make_test_state(#{role => client, promised_pushes => #{}}),
+    ?assertEqual(0, quic_h3_connection:goaway_id_to_send(State)).
+
+%%====================================================================
+%% Interim 1xx Responses (RFC 9114 §4.1)
+%%====================================================================
+
+interim_1xx_response_keeps_expecting_headers_test() ->
+    %% Client receives 103 Early Hints without FIN; stream must remain in
+    %% expecting_headers so the final response is accepted next.
+    Headers = [{<<":status">>, <<"103">>}],
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    State = make_test_state(#{role => client}),
+    {ok, Stream1} = quic_h3_connection:update_stream_with_headers(
+        Headers, Stream, client, State
+    ),
+    ?assertEqual(103, Stream1#h3_stream.status).
+
+final_2xx_response_moves_to_expecting_data_test() ->
+    Headers = [{<<":status">>, <<"200">>}],
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    State = make_test_state(#{role => client}),
+    {ok, Stream1} = quic_h3_connection:update_stream_with_headers(
+        Headers, Stream, client, State
+    ),
+    ?assertEqual(200, Stream1#h3_stream.status).
+
+%%====================================================================
+%% PUSH_PROMISE Validation (RFC 9114 §4.2 + §7.2.5)
+%%====================================================================
+
+push_promise_headers_malformed_rejected_test() ->
+    %% Uppercase header name in promised request headers must be rejected.
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"X-Custom">>, <<"v">>}
+    ],
+    State = make_test_state(#{role => client}),
+    ?assertMatch(
+        {error, _},
+        quic_h3_connection:validate_promised_request_headers(Headers, State)
+    ).
+
+push_promise_headers_forbidden_connection_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"connection">>, <<"close">>}
+    ],
+    State = make_test_state(#{role => client}),
+    ?assertMatch(
+        {error, _},
+        quic_h3_connection:validate_promised_request_headers(Headers, State)
+    ).
+
+push_promise_headers_well_formed_accepted_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>}
+    ],
+    State = make_test_state(#{role => client}),
+    ?assertEqual(
+        ok,
+        quic_h3_connection:validate_promised_request_headers(Headers, State)
+    ).
+
+%%====================================================================
+%% CONNECT Tunnel (RFC 9114 §4.4)
+%%====================================================================
+
+connect_tunnel_rejects_trailers_test() ->
+    %% Only DATA frames allowed after CONNECT; HEADERS with FIN is rejected.
+    Stream = #h3_stream{id = 0, frame_state = expecting_data, is_connect = true},
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:handle_request_frame(
+        0, {headers, <<>>}, true, Stream, State
+    ),
+    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+
+connect_tunnel_rejects_push_promise_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_data, is_connect = true},
+    State = make_test_state(#{role => client}),
+    Result = quic_h3_connection:handle_request_frame(
+        0, {push_promise, 1, <<>>}, false, Stream, State
+    ),
+    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+
+connect_tunnel_send_trailers_rejected_test() ->
+    Stream = #h3_stream{id = 0, is_connect = true},
+    State = make_test_state(#{
+        role => server,
+        streams => #{0 => Stream}
+    }),
+    Result = quic_h3_connection:do_send_trailers(0, [{<<"foo">>, <<"bar">>}], State),
+    ?assertMatch({error, connect_tunnel}, Result).
+
+%%====================================================================
+%% Authority / Host validation (RFC 9114 §4.3.1)
+%%====================================================================
+
+empty_authority_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<>>},
+        {<<":path">>, <<"/">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, {invalid_field, <<":authority">>, _}}, Result).
+
+authority_with_userinfo_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"user@example.com">>},
+        {<<":path">>, <<"/">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, {invalid_field, <<":authority">>, _}}, Result).
+
+empty_host_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<"host">>, <<>>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, {invalid_field, <<"host">>, _}}, Result).
+
+%%====================================================================
+%% Duplicate Content-Length (RFC 9110 §8.6)
+%%====================================================================
+
+duplicate_content_length_match_accepted_test() ->
+    Headers = [
+        {<<":method">>, <<"POST">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"content-length">>, <<"10">>},
+        {<<"content-length">>, <<"10">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({ok, _}, Result).
+
+duplicate_content_length_mismatch_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"POST">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"content-length">>, <<"10">>},
+        {<<"content-length">>, <<"20">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, {invalid_field, <<"content-length">>, <<"20">>}}, Result).
+
+%%====================================================================
+%% PRIORITY_UPDATE on push (RFC 9218 §7.2)
+%%====================================================================
+
+priority_update_push_unknown_id_ignored_test() ->
+    State = make_test_state(#{role => server, push_streams => #{}}),
+    Payload = <<(quic_varint:encode(42))/binary, "u=0">>,
+    ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_push_frame(Payload, State)).
+
+priority_update_push_client_ignored_test() ->
+    State = make_test_state(#{role => client}),
+    Payload = <<(quic_varint:encode(5))/binary, "u=1">>,
+    ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_push_frame(Payload, State)).
 
 %%====================================================================
 %% Helper Functions

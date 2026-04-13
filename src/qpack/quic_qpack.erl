@@ -93,6 +93,10 @@
     dyn_entries = [] :: [{pos_integer(), header(), non_neg_integer()}],
     dyn_size = 0 :: non_neg_integer(),
     dyn_max_size = 0 :: non_neg_integer(),
+    %% RFC 9204 §3.2.1: the encoder MUST NOT set the dynamic table capacity
+    %% higher than the decoder's advertised SETTINGS_QPACK_MAX_TABLE_CAPACITY.
+    %% For a decoder state, this is our advertised ceiling.
+    max_allowed_capacity = 0 :: non_neg_integer(),
     %% Insert count (absolute index for next entry)
     insert_count = 0 :: non_neg_integer(),
     %% Known received count - decoder has acked up to this
@@ -140,7 +144,8 @@ new(Opts) ->
     MaxDynSize = maps:get(max_dynamic_size, Opts, 0),
     #qpack{
         use_dynamic = MaxDynSize > 0,
-        dyn_max_size = MaxDynSize
+        dyn_max_size = MaxDynSize,
+        max_allowed_capacity = MaxDynSize
     }.
 
 %% @doc Encode headers using QPACK with state.
@@ -394,6 +399,10 @@ apply_encoder_instruction({duplicate, Index}, State) ->
         undefined ->
             {error, invalid_dynamic_index}
     end;
+apply_encoder_instruction(
+    {set_capacity, Capacity}, #qpack{max_allowed_capacity = Max} = _State
+) when Capacity > Max ->
+    {error, {set_capacity_exceeds_max, Capacity, Max}};
 apply_encoder_instruction({set_capacity, Capacity}, State) ->
     {ok, evict_to_fit(0, State#qpack{dyn_max_size = Capacity, use_dynamic = Capacity > 0})}.
 
@@ -698,9 +707,16 @@ encode_literal(Name, Value) ->
 
 -spec encode_string(binary()) -> binary().
 encode_string(Str) ->
-    Len = byte_size(Str),
-    LenEnc = encode_prefixed_int(Len, 7, 0),
-    <<LenEnc/binary, Str/binary>>.
+    HuffSize = quic_qpack_huffman:encoded_size(Str),
+    case HuffSize < byte_size(Str) of
+        true ->
+            Encoded = quic_qpack_huffman:encode(Str),
+            LenEnc = encode_prefixed_int(HuffSize, 7, 1),
+            <<LenEnc/binary, Encoded/binary>>;
+        false ->
+            LenEnc = encode_prefixed_int(byte_size(Str), 7, 0),
+            <<LenEnc/binary, Str/binary>>
+    end.
 
 -spec encode_prefixed_int(non_neg_integer(), 1..8, non_neg_integer()) -> binary().
 encode_prefixed_int(Value, PrefixBits, Prefix) when Value < (1 bsl PrefixBits) - 1 ->
@@ -917,7 +933,7 @@ decode_string(<<1:1, 127:7, Rest/binary>>) ->
     case byte_size(Rest2) >= ActualLen of
         true ->
             <<Encoded:ActualLen/binary, Rest3/binary>> = Rest2,
-            Decoded = quic_qpack_huffman:decode(Encoded),
+            Decoded = huffman_decode_validated(Encoded),
             {Decoded, Rest3};
         false ->
             throw(incomplete)
@@ -939,13 +955,22 @@ decode_string_with_huffman(HuffFlag, Len, Data) when byte_size(Data) >= Len ->
     <<Encoded:Len/binary, Rest/binary>> = Data,
     case HuffFlag of
         1 ->
-            Decoded = quic_qpack_huffman:decode(Encoded),
+            Decoded = huffman_decode_validated(Encoded),
             {Decoded, Rest};
         0 ->
             {Encoded, Rest}
     end;
 decode_string_with_huffman(_HuffFlag, _Len, _Data) ->
     throw(incomplete).
+
+%% RFC 7541 §5.2: reject EOS symbol and padding violations. Raise a thrown
+%% {qpack_decompression_failed, Reason} so the parent try/catch (in
+%% decode/encode instruction handlers) maps it to QPACK_DECOMPRESSION_FAILED.
+huffman_decode_validated(Encoded) ->
+    case quic_qpack_huffman:decode_safe(Encoded) of
+        {ok, Decoded} -> Decoded;
+        {error, Reason} -> throw({qpack_decompression_failed, Reason})
+    end.
 
 %%====================================================================
 %% Internal - Static Table Lookup (O(1))

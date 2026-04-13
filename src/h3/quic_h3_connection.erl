@@ -84,7 +84,14 @@
     update_stream_with_headers/4,
     allocate_push_id/1,
     validate_push_response_headers/1,
-    cleanup_push_stream/3
+    cleanup_push_stream/3,
+    validate_push_promise_duplicate/3,
+    goaway_id_to_send/1,
+    validate_promised_request_headers/2,
+    handle_push_frame/5,
+    handle_priority_update_frame/2,
+    handle_priority_update_push_frame/2,
+    do_send_trailers/3
 ]).
 -endif.
 
@@ -1017,6 +1024,11 @@ process_control_frames(Data, State) ->
             {error,
                 {connection_error, ?H3_SETTINGS_ERROR,
                     iolist_to_binary(io_lib:format("forbidden HTTP/2 setting: 0x~.16B", [Id]))}};
+        %% RFC 9114 §7.2.8: HTTP/2 reserved frame types
+        {error, {h2_reserved_frame, Type}} ->
+            {error,
+                {connection_error, ?H3_FRAME_UNEXPECTED,
+                    iolist_to_binary(io_lib:format("reserved HTTP/2 frame type: 0x~.16B", [Type]))}};
         {error, {frame_error, FrameType, Reason}} ->
             %% Other frame errors use H3_FRAME_ERROR
             {error,
@@ -1040,16 +1052,25 @@ handle_control_frame({settings, _Settings}, #state{settings_received = true}) ->
 handle_control_frame(_Frame, #state{settings_received = false}) ->
     %% SETTINGS must be first
     {error, {connection_error, ?H3_MISSING_SETTINGS, <<"expected SETTINGS">>}};
-handle_control_frame({goaway, StreamId}, #state{goaway_id = undefined} = State) ->
-    %% First GOAWAY - clean up blocked streams and signal state transition
-    State1 = cleanup_blocked_streams_on_goaway(State),
-    {transition, goaway_received, State1#state{goaway_id = StreamId}};
-handle_control_frame({goaway, NewId}, #state{goaway_id = OldId}) when NewId > OldId ->
-    %% GOAWAY with increasing ID is protocol error (RFC 9114 Section 5.2)
-    {error, {connection_error, ?H3_ID_ERROR, <<"GOAWAY ID increased">>}};
-handle_control_frame({goaway, NewId}, State) ->
-    %% GOAWAY with same or lower ID - update
-    {ok, State#state{goaway_id = NewId}};
+handle_control_frame({goaway, Id}, #state{role = Role} = State) ->
+    %% RFC 9114 Section 7.2.6: GOAWAY identifier type depends on sender
+    %%   server-to-client: client-initiated bidirectional stream ID (Id rem 4 =:= 0)
+    %%   client-to-server: push ID (no modular constraint)
+    case validate_goaway_id(Role, Id) of
+        ok ->
+            case State#state.goaway_id of
+                undefined ->
+                    State1 = cleanup_blocked_streams_on_goaway(State),
+                    {transition, goaway_received, State1#state{goaway_id = Id}};
+                Old when Id > Old ->
+                    %% RFC 9114 Section 5.2: GOAWAY ID MUST NOT increase
+                    {error, {connection_error, ?H3_ID_ERROR, <<"GOAWAY ID increased">>}};
+                _ ->
+                    {ok, State#state{goaway_id = Id}}
+            end;
+        {error, Reason} ->
+            {error, {connection_error, ?H3_ID_ERROR, Reason}}
+    end;
 %% Server receives MAX_PUSH_ID from client (RFC 9114 Section 7.2.7)
 handle_control_frame({max_push_id, PushId}, #state{role = server, max_push_id = Old} = State) when
     Old =:= undefined; PushId >= Old
@@ -1082,8 +1103,7 @@ handle_control_frame({unknown, Type, Payload}, State) ->
         ?H3_FRAME_PRIORITY_UPDATE_REQUEST ->
             handle_priority_update_frame(Payload, State);
         ?H3_FRAME_PRIORITY_UPDATE_PUSH ->
-            %% Push priority update - ignored since push not supported
-            {ok, State};
+            handle_priority_update_push_frame(Payload, State);
         _ ->
             %% Unknown frame types are ignored (reserved or otherwise)
             {ok, State}
@@ -1108,7 +1128,9 @@ handle_encoder_stream_data(
             %% Still retry blocked streams - some may have become unblocked
             retry_blocked_streams(State1);
         {error, Reason} ->
-            {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}, State}
+            %% RFC 9204 §6: errors decoding peer's encoder stream instructions
+            %% are QPACK_ENCODER_STREAM_ERROR (0x201), not decompression-failed.
+            {error, {connection_error, ?H3_QPACK_ENCODER_STREAM_ERROR, Reason}, State}
     end.
 
 %% Retry blocked streams that may have become unblocked after encoder instructions
@@ -1326,6 +1348,10 @@ process_push_frames(StreamId, PushId, Data, Fin, State) ->
                 {error, Reason} ->
                     {error, Reason}
             end;
+        {error, {h2_reserved_frame, Type}} ->
+            {error,
+                {connection_error, ?H3_FRAME_UNEXPECTED,
+                    iolist_to_binary(io_lib:format("reserved HTTP/2 frame type: 0x~.16B", [Type]))}};
         {error, {frame_error, FrameType, Reason}} ->
             {error,
                 {connection_error, ?H3_FRAME_ERROR,
@@ -1338,7 +1364,8 @@ process_push_frames(StreamId, PushId, Data, Fin, State) ->
 
 %% Handle individual frames on push stream
 %% RFC 9114 Section 4.6: Push streams only carry HEADERS and DATA
-%% HEADERS must come first, then DATA
+%% HEADERS must come first, then DATA. Zero or more interim 1xx responses
+%% may precede the final response.
 handle_push_frame(
     StreamId,
     PushId,
@@ -1346,15 +1373,19 @@ handle_push_frame(
     Fin,
     #state{qpack_decoder = Decoder, owner = Owner, received_pushes = Received} = State
 ) ->
-    %% Check frame sequencing - HEADERS must be first
     case maps:get(PushId, Received, undefined) of
         {StreamId, expecting_headers} ->
-            %% Valid - first HEADERS on push stream
             handle_push_headers(StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, State);
         {StreamId, expecting_data} ->
-            %% Duplicate HEADERS after we already received one
-            {error,
-                {connection_error, ?H3_FRAME_UNEXPECTED, <<"duplicate HEADERS on push stream">>}};
+            %% Only trailers (HEADERS with FIN) are allowed once body has started
+            case Fin of
+                true ->
+                    handle_push_trailers(StreamId, PushId, HeaderBlock, Decoder, Owner, State);
+                false ->
+                    {error,
+                        {connection_error, ?H3_FRAME_UNEXPECTED,
+                            <<"non-trailer HEADERS on push stream">>}}
+            end;
         undefined ->
             %% Push stream not correlated (should not happen in normal flow)
             {error, {connection_error, ?H3_ID_ERROR, <<"unknown push stream">>}}
@@ -1400,35 +1431,28 @@ handle_push_frame(_StreamId, _PushId, {unknown, _Type, _Payload}, _Fin, State) -
     %% Unknown frame types are ignored per RFC 9114
     {ok, State}.
 
-%% Helper to handle HEADERS frame on push stream
+%% Helper to handle HEADERS frame on push stream.
+%% Applies the same validation as regular response headers (size, field names,
+%% pseudo-headers, request-pseudo rejection, status range) and supports
+%% interim 1xx responses (RFC 9114 §4.1).
 handle_push_headers(
     StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, #state{received_pushes = Received} = State
 ) ->
     case quic_qpack:decode(HeaderBlock, Decoder) of
         {{ok, Headers}, Decoder1} ->
-            State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
-            %% Validate push response headers (RFC 9114 Section 4.6)
-            case validate_push_response_headers(Headers) of
-                {ok, Status} ->
-                    Owner ! {quic_h3, self(), {push_response, PushId, Status, Headers}},
-                    case Fin of
-                        true ->
-                            %% Push complete
-                            Owner ! {quic_h3, self(), {push_complete, PushId}},
-                            cleanup_push_stream(PushId, StreamId, State1);
-                        false ->
-                            %% Update state to expecting_data
-                            State2 = State1#state{
-                                received_pushes = Received#{PushId => {StreamId, expecting_data}}
-                            },
-                            {ok, State2}
-                    end;
-                {error, Reason} ->
-                    {error, {connection_error, ?H3_MESSAGE_ERROR, Reason}}
+            MaxSize = State#state.local_max_field_section_size,
+            case calculate_field_section_size(Headers) > MaxSize of
+                true ->
+                    {error,
+                        {connection_error, ?H3_EXCESSIVE_LOAD,
+                            <<"push field section exceeds SETTINGS_MAX_FIELD_SECTION_SIZE">>}};
+                false ->
+                    State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
+                    validate_and_deliver_push_response(
+                        StreamId, PushId, Headers, Fin, Owner, Received, State1
+                    )
             end;
         {{blocked, _RIC}, _Decoder1} ->
-            %% Push streams should not reference dynamic table entries
-            %% that haven't been acknowledged yet
             {error,
                 {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED,
                     <<"blocked push stream headers">>}};
@@ -1436,27 +1460,83 @@ handle_push_headers(
             {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
     end.
 
-%% Validate push response headers (RFC 9114 Section 4.6)
-%% Push responses must have :status and must NOT have request pseudo-headers
-validate_push_response_headers(Headers) ->
-    case proplists:get_value(<<":status">>, Headers) of
-        undefined ->
-            {error, <<"missing :status in push response">>};
-        StatusBin ->
-            try binary_to_integer(StatusBin) of
-                Status when Status >= 100, Status < 600 ->
-                    %% Check for forbidden request pseudo-headers
-                    case has_request_pseudo_headers(Headers) of
-                        true ->
-                            {error, <<"request pseudo-header in push response">>};
-                        false ->
-                            {ok, Status}
-                    end;
-                _ ->
-                    {error, <<"invalid :status value">>}
+validate_and_deliver_push_response(StreamId, PushId, Headers, Fin, Owner, Received, State) ->
+    case validate_push_response_headers(Headers) of
+        {ok, Status} ->
+            Owner ! {quic_h3, self(), {push_response, PushId, Status, Headers}},
+            deliver_push_response_finalize(StreamId, PushId, Status, Fin, Owner, Received, State);
+        {error, Reason} ->
+            {error, {connection_error, ?H3_MESSAGE_ERROR, Reason}}
+    end.
+
+deliver_push_response_finalize(StreamId, PushId, _Status, true, Owner, _Received, State) ->
+    Owner ! {quic_h3, self(), {push_complete, PushId}},
+    cleanup_push_stream(PushId, StreamId, State);
+deliver_push_response_finalize(StreamId, PushId, Status, false, _Owner, Received, State) when
+    is_integer(Status), Status >= 100, Status < 200
+->
+    %% Interim response - keep expecting_headers so the next HEADERS frame is
+    %% handled as either another interim or the final response.
+    {ok, State#state{received_pushes = Received#{PushId => {StreamId, expecting_headers}}}};
+deliver_push_response_finalize(StreamId, PushId, _Status, false, _Owner, Received, State) ->
+    {ok, State#state{received_pushes = Received#{PushId => {StreamId, expecting_data}}}}.
+
+%% Handle trailers on a push stream (HEADERS with FIN after DATA).
+handle_push_trailers(StreamId, PushId, HeaderBlock, Decoder, Owner, State) ->
+    case quic_qpack:decode(HeaderBlock, Decoder) of
+        {{ok, Trailers}, Decoder1} ->
+            State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
+            %% Validate trailers: no pseudo-headers, no forbidden fields
+            try
+                validate_field_names_and_values(Trailers),
+                case has_pseudo_header(Trailers) of
+                    true -> throw({header_error, pseudo_header_in_trailer});
+                    false -> ok
+                end,
+                Owner ! {quic_h3, self(), {push_trailers, PushId, Trailers}},
+                Owner ! {quic_h3, self(), {push_complete, PushId}},
+                cleanup_push_stream(PushId, StreamId, State1)
             catch
-                _:_ -> {error, <<"invalid :status value">>}
-            end
+                throw:{header_error, _} ->
+                    {error, {connection_error, ?H3_MESSAGE_ERROR, <<"malformed push trailers">>}}
+            end;
+        {{blocked, _RIC}, _Decoder1} ->
+            {error,
+                {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, <<"blocked push trailers">>}};
+        {{error, Reason}, _Decoder1} ->
+            {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
+    end.
+
+%% Validate push response headers (RFC 9114 §4.6 + §4.2).
+%% Applies the same malformed-message rules as regular responses.
+validate_push_response_headers(Headers) ->
+    try
+        validate_field_names_and_values(Headers),
+        check_duplicate_headers(Headers),
+        case proplists:get_value(<<":status">>, Headers) of
+            undefined ->
+                {error, <<"missing :status in push response">>};
+            StatusBin ->
+                validate_push_response_status(StatusBin, Headers)
+        end
+    catch
+        throw:{header_error, {invalid_field, _, _}} ->
+            {error, <<"malformed push response header">>};
+        throw:{header_error, _} ->
+            {error, <<"invalid push response header">>}
+    end.
+
+validate_push_response_status(StatusBin, Headers) ->
+    try binary_to_integer(StatusBin) of
+        Status when Status >= 100, Status < 600 ->
+            case has_request_pseudo_headers(Headers) of
+                true -> {error, <<"request pseudo-header in push response">>};
+                false -> {ok, Status}
+            end;
+        _ ->
+            {error, <<"invalid :status value">>}
+    catch
+        _:_ -> {error, <<"invalid :status value">>}
     end.
 
 %% Check if headers contain request pseudo-headers (forbidden in responses)
@@ -1596,6 +1676,11 @@ process_request_frames(StreamId, Data, Fin, Stream, #state{quic_conn = QuicConn}
             {error,
                 {connection_error, ?H3_SETTINGS_ERROR,
                     iolist_to_binary(io_lib:format("forbidden HTTP/2 setting: 0x~.16B", [Id]))}};
+        %% RFC 9114 §7.2.8: HTTP/2 reserved frame types
+        {error, {h2_reserved_frame, Type}} ->
+            {error,
+                {connection_error, ?H3_FRAME_UNEXPECTED,
+                    iolist_to_binary(io_lib:format("reserved HTTP/2 frame type: 0x~.16B", [Type]))}};
         {error, {frame_error, FrameType, Reason}} ->
             %% Other frame errors use H3_FRAME_ERROR
             {error,
@@ -1676,6 +1761,25 @@ handle_request_frame(
             false -> Stream1
         end,
     {ok, Stream2, State1};
+%% RFC 9114 §4.4: once a CONNECT tunnel is established, only DATA frames are
+%% allowed on the stream. Reject any HEADERS (including trailers) or
+%% PUSH_PROMISE frames.
+handle_request_frame(
+    StreamId,
+    {headers, _HeaderBlock},
+    _Fin,
+    #h3_stream{frame_state = expecting_data, is_connect = true},
+    _State
+) ->
+    {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}};
+handle_request_frame(
+    StreamId,
+    {push_promise, _, _},
+    _Fin,
+    #h3_stream{is_connect = true},
+    _State
+) ->
+    {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}};
 %% Non-trailer HEADERS after body started - stream error (RFC 9114 Section 4.1)
 handle_request_frame(
     StreamId,
@@ -1768,53 +1872,115 @@ handle_push_promise(
         owner = Owner
     } = State
 ) ->
-    %% Validate push ID
-    case validate_push_promise(PushId, MaxPushId, Promised) of
+    %% Validate push ID bounds (duplicate handling happens after QPACK decode,
+    %% since it requires the decompressed headers to compare).
+    case validate_push_promise_id(PushId, MaxPushId) of
         ok ->
-            %% Decode the header block to get the promised request headers
-            case quic_qpack:decode(HeaderBlock, Decoder) of
-                {{ok, Headers}, Decoder1} ->
-                    State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
-                    %% Check if we've already cancelled this push
-                    case sets:is_element(PushId, Cancelled) of
-                        true ->
-                            %% Already cancelled - ignore promise
-                            {ok, Stream, State1};
-                        false ->
-                            %% Store the promise
-                            State2 = State1#state{
-                                promised_pushes = maps:put(PushId, {StreamId, Headers}, Promised)
-                            },
-                            %% Notify owner of push promise
-                            Owner ! {quic_h3, self(), {push_promise, PushId, StreamId, Headers}},
-                            {ok, Stream, State2}
-                    end;
-                {{blocked, _RIC}, _Decoder1} ->
-                    %% PUSH_PROMISE should not reference unacknowledged dynamic table entries
-                    {error,
-                        {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED,
-                            <<"blocked PUSH_PROMISE headers">>}};
-                {{error, Reason}, _Decoder1} ->
-                    {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
-            end;
+            decode_push_promise_headers(
+                StreamId, PushId, HeaderBlock, Stream, Cancelled, Decoder, Owner, Promised, State
+            );
         {error, Reason} ->
             {error, Reason}
     end.
 
-%% Validate PUSH_PROMISE constraints (RFC 9114 Section 7.2.5)
-validate_push_promise(_PushId, MaxPushId, _Promised) when MaxPushId =:= undefined ->
-    %% Client never sent MAX_PUSH_ID
-    {error, {connection_error, ?H3_ID_ERROR, <<"PUSH_PROMISE without MAX_PUSH_ID">>}};
-validate_push_promise(PushId, MaxPushId, _Promised) when PushId > MaxPushId ->
-    %% Push ID exceeds MAX_PUSH_ID
-    {error, {connection_error, ?H3_ID_ERROR, <<"push ID exceeds MAX_PUSH_ID">>}};
-validate_push_promise(PushId, _MaxPushId, Promised) ->
-    case maps:is_key(PushId, Promised) of
+decode_push_promise_headers(
+    StreamId, PushId, HeaderBlock, Stream, Cancelled, Decoder, Owner, Promised, State
+) ->
+    case quic_qpack:decode(HeaderBlock, Decoder) of
+        {{ok, Headers}, Decoder1} ->
+            MaxSize = State#state.local_max_field_section_size,
+            case calculate_field_section_size(Headers) > MaxSize of
+                true ->
+                    {error,
+                        {connection_error, ?H3_EXCESSIVE_LOAD,
+                            <<"PUSH_PROMISE field section exceeds limit">>}};
+                false ->
+                    State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
+                    validate_and_apply_push_promise(
+                        StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised, State1
+                    )
+            end;
+        {{blocked, _RIC}, _Decoder1} ->
+            {error,
+                {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED,
+                    <<"blocked PUSH_PROMISE headers">>}};
+        {{error, Reason}, _Decoder1} ->
+            {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
+    end.
+
+validate_and_apply_push_promise(
+    StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised, State
+) ->
+    case validate_promised_request_headers(Headers, State) of
+        ok ->
+            apply_push_promise(
+                StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised, State
+            );
+        {error, Reason} ->
+            {error, {connection_error, ?H3_MESSAGE_ERROR, Reason}}
+    end.
+
+%% RFC 9114 §7.2.5 + §4.2 + §4.3.1: promised request headers MUST be a
+%% well-formed request field section.
+-spec validate_promised_request_headers([{binary(), binary()}], #state{}) ->
+    ok | {error, binary()}.
+validate_promised_request_headers(Headers, State) ->
+    try
+        validate_field_names_and_values(Headers),
+        check_duplicate_headers(Headers),
+        Template = #h3_stream{id = 0, type = request, state = open, headers = Headers},
+        Stream = do_update_stream_with_headers(Headers, Template, false),
+        validate_request_headers(Stream, State),
+        ok
+    catch
+        throw:{header_error, _} ->
+            {error, <<"malformed PUSH_PROMISE headers">>}
+    end.
+
+apply_push_promise(StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised, State) ->
+    case validate_push_promise_duplicate(PushId, Headers, Promised) of
+        ok ->
+            store_push_promise(
+                StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised, State
+            );
+        duplicate_ok ->
+            %% RFC 9114 §7.2.5: repeat with identical headers is allowed
+            {ok, Stream, State};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+store_push_promise(StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised, State) ->
+    case sets:is_element(PushId, Cancelled) of
         true ->
-            %% Duplicate push ID
-            {error, {connection_error, ?H3_ID_ERROR, <<"duplicate push ID">>}};
+            {ok, Stream, State};
         false ->
-            ok
+            Promised1 = maps:put(PushId, {StreamId, Headers}, Promised),
+            Owner ! {quic_h3, self(), {push_promise, PushId, StreamId, Headers}},
+            {ok, Stream, State#state{promised_pushes = Promised1}}
+    end.
+
+%% Validate PUSH_PROMISE push-ID bounds (RFC 9114 Section 7.2.5)
+validate_push_promise_id(_PushId, MaxPushId) when MaxPushId =:= undefined ->
+    {error, {connection_error, ?H3_ID_ERROR, <<"PUSH_PROMISE without MAX_PUSH_ID">>}};
+validate_push_promise_id(PushId, MaxPushId) when PushId > MaxPushId ->
+    {error, {connection_error, ?H3_ID_ERROR, <<"push ID exceeds MAX_PUSH_ID">>}};
+validate_push_promise_id(_PushId, _MaxPushId) ->
+    ok.
+
+%% RFC 9114 Section 7.2.5: same push ID may be promised on multiple request
+%% streams only if the decompressed headers are identical. Mismatched repeat
+%% promises MUST be treated as H3_GENERAL_PROTOCOL_ERROR.
+validate_push_promise_duplicate(PushId, Headers, Promised) ->
+    case maps:find(PushId, Promised) of
+        error ->
+            ok;
+        {ok, {_StreamId, Headers}} ->
+            duplicate_ok;
+        {ok, {_StreamId, _Other}} ->
+            {error,
+                {connection_error, ?H3_GENERAL_PROTOCOL_ERROR,
+                    <<"PUSH_PROMISE headers mismatch for repeated push ID">>}}
     end.
 
 %% Decode and process headers
@@ -1840,9 +2006,11 @@ handle_headers_decode(StreamId, HeaderBlock, Fin, Stream, Decoder, Owner, Role, 
             %% Use LOCAL setting - we enforce our own decoder's blocked stream limit
             BlockedCount = map_size(State#state.blocked_streams),
             MaxBlocked = State#state.local_max_blocked_streams,
-            case BlockedCount >= MaxBlocked andalso MaxBlocked > 0 of
+            case BlockedCount >= MaxBlocked of
                 true ->
-                    %% Exceeds blocked streams limit - reject the request
+                    %% RFC 9204 §2.1.2: if MaxBlocked is 0 the peer's encoder
+                    %% must not produce blocking references at all; any blocked
+                    %% stream here violates the advertised limit.
                     {error, {stream_reset, StreamId, ?H3_REQUEST_REJECTED}};
                 false ->
                     BlockedStreams = maps:put(
@@ -1864,7 +2032,7 @@ process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State) ->
         {ok, Stream1} ->
             %% Apply RFC 9218 priority to underlying QUIC stream
             apply_stream_priority(StreamId, Stream1, State1),
-            Stream2 = finalize_stream_state(Stream1, Fin),
+            Stream2 = finalize_stream_state(Stream1, Fin, Role),
             notify_headers_received(StreamId, Headers, Stream2, Owner, Role),
             {ok, Stream2, State1};
         {error, {invalid_field, _Field, _Value}} ->
@@ -1875,10 +2043,17 @@ process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State) ->
             {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}}
     end.
 
-%% Update stream state based on FIN flag
-finalize_stream_state(Stream, true) ->
+%% RFC 9114 §4.1: the client may receive zero or more interim 1xx responses
+%% before a single final response. Interim responses leave the stream in
+%% expecting_headers so subsequent HEADERS frames are accepted as either
+%% another interim or the final response.
+finalize_stream_state(Stream, true, _Role) ->
     Stream#h3_stream{frame_state = complete, state = half_closed_remote};
-finalize_stream_state(Stream, false) ->
+finalize_stream_state(#h3_stream{status = Status} = Stream, false, client) when
+    is_integer(Status), Status >= 100, Status < 200
+->
+    Stream#h3_stream{frame_state = expecting_headers};
+finalize_stream_state(Stream, false, _Role) ->
     Stream#h3_stream{frame_state = expecting_data}.
 
 %% Notify owner and invoke handler for received headers
@@ -1895,7 +2070,9 @@ notify_headers_received(StreamId, Headers, Stream, Owner, client) ->
 %% Returns {ok, Stream} | {error, Reason}
 update_stream_with_headers(Headers, Stream, Role, State) ->
     try
-        %% RFC 9110 Section 5.3: Check for duplicate header names first
+        %% RFC 9114 Section 4.2: validate field names/values for malformed messages
+        validate_field_names_and_values(Headers),
+        %% RFC 9110 Section 5.3: only pseudo-headers must be unique
         check_duplicate_headers(Headers),
         Stream1 = do_update_stream_with_headers(
             Headers, Stream#h3_stream{headers = Headers}, false
@@ -1903,34 +2080,128 @@ update_stream_with_headers(Headers, Stream, Role, State) ->
         %% Validate pseudo-headers based on role
         case Role of
             server -> validate_request_headers(Stream1, State);
-            client -> validate_response_headers(Stream1)
+            client -> validate_response_headers(Stream1, Headers)
         end,
         {ok, Stream1}
     catch
         throw:{header_error, Reason} -> {error, Reason}
     end.
 
-%% RFC 9110 Section 5.3: Check for duplicate header names
-%% Pseudo-headers: only one of each allowed
-%% Regular headers: only set-cookie can be duplicated
+%% RFC 9114 Section 4.2 / RFC 9110 Section 5.1: validate field names and values.
+%% Detect uppercase names, invalid characters, and reject connection-specific
+%% fields that are disallowed in HTTP/3.
+validate_field_names_and_values(Headers) ->
+    lists:foreach(fun validate_field/1, Headers).
+
+validate_field({Name, Value}) ->
+    validate_field_name(Name),
+    validate_field_value(Name, Value),
+    validate_forbidden_field(Name, Value).
+
+%% Field names: must be lowercase tchar (RFC 9114 §4.2, RFC 7230 §3.2.6).
+%% Pseudo-headers (leading ":") use the same char class after the colon.
+validate_field_name(<<>>) ->
+    throw({header_error, {invalid_field, <<>>, <<>>}});
+validate_field_name(<<$:, Rest/binary>>) ->
+    validate_field_name_chars(Rest, <<":", Rest/binary>>);
+validate_field_name(Name) ->
+    validate_field_name_chars(Name, Name).
+
+validate_field_name_chars(<<>>, Full) ->
+    %% empty after ":" is invalid
+    case Full of
+        <<":">> -> throw({header_error, {invalid_field, Full, <<>>}});
+        _ -> ok
+    end;
+validate_field_name_chars(<<C, Rest/binary>>, Full) ->
+    case is_tchar_lowercase(C) of
+        true -> validate_field_name_chars(Rest, Full);
+        false -> throw({header_error, {invalid_field, Full, <<>>}})
+    end.
+
+%% tchar per RFC 7230 §3.2.6, restricted to lowercase letters.
+is_tchar_lowercase(C) when C >= $a, C =< $z -> true;
+is_tchar_lowercase(C) when C >= $0, C =< $9 -> true;
+is_tchar_lowercase($!) -> true;
+is_tchar_lowercase($#) -> true;
+is_tchar_lowercase($$) -> true;
+is_tchar_lowercase($%) -> true;
+is_tchar_lowercase($&) -> true;
+is_tchar_lowercase($') -> true;
+is_tchar_lowercase($*) -> true;
+is_tchar_lowercase($+) -> true;
+is_tchar_lowercase($-) -> true;
+is_tchar_lowercase($.) -> true;
+is_tchar_lowercase($^) -> true;
+is_tchar_lowercase($_) -> true;
+is_tchar_lowercase($`) -> true;
+is_tchar_lowercase($|) -> true;
+is_tchar_lowercase($~) -> true;
+is_tchar_lowercase(_) -> false.
+
+%% Field values: VCHAR / SP / HTAB / obs-text, no leading/trailing whitespace,
+%% no CR/LF/NUL (RFC 9110 §5.5).
+validate_field_value(Name, Value) ->
+    case Value of
+        <<>> ->
+            ok;
+        <<C, _/binary>> when C =:= $\s; C =:= $\t ->
+            throw({header_error, {invalid_field, Name, Value}});
+        _ ->
+            Last = binary:last(Value),
+            case Last of
+                $\s -> throw({header_error, {invalid_field, Name, Value}});
+                $\t -> throw({header_error, {invalid_field, Name, Value}});
+                _ -> ok
+            end,
+            validate_field_value_chars(Value, Name)
+    end.
+
+validate_field_value_chars(<<>>, _Name) ->
+    ok;
+validate_field_value_chars(<<C, Rest/binary>>, Name) ->
+    case is_field_value_char(C) of
+        true -> validate_field_value_chars(Rest, Name);
+        false -> throw({header_error, {invalid_field, Name, <<C>>}})
+    end.
+
+is_field_value_char($\s) -> true;
+is_field_value_char($\t) -> true;
+is_field_value_char(C) when C >= 16#21, C =< 16#7E -> true;
+is_field_value_char(C) when C >= 16#80, C =< 16#FF -> true;
+is_field_value_char(_) -> false.
+
+%% RFC 9114 §4.2: connection-specific fields MUST NOT appear in HTTP/3.
+%% te is allowed only with value "trailers".
+validate_forbidden_field(<<"connection">>, _) ->
+    throw({header_error, {invalid_field, <<"connection">>, <<>>}});
+validate_forbidden_field(<<"keep-alive">>, _) ->
+    throw({header_error, {invalid_field, <<"keep-alive">>, <<>>}});
+validate_forbidden_field(<<"proxy-connection">>, _) ->
+    throw({header_error, {invalid_field, <<"proxy-connection">>, <<>>}});
+validate_forbidden_field(<<"upgrade">>, _) ->
+    throw({header_error, {invalid_field, <<"upgrade">>, <<>>}});
+validate_forbidden_field(<<"transfer-encoding">>, _) ->
+    throw({header_error, {invalid_field, <<"transfer-encoding">>, <<>>}});
+validate_forbidden_field(<<"te">>, Value) when Value =/= <<"trailers">> ->
+    throw({header_error, {invalid_field, <<"te">>, Value}});
+validate_forbidden_field(_, _) ->
+    ok.
+
+%% RFC 9114 §4.3: pseudo-headers MUST NOT be duplicated. Regular fields MAY
+%% repeat (per RFC 9110 §5.2-§5.3, list-based fields are legal to combine).
 check_duplicate_headers(Headers) ->
     check_duplicate_headers(Headers, #{}).
 
 check_duplicate_headers([], _Seen) ->
     ok;
-check_duplicate_headers([{Name, _Value} | Rest], Seen) ->
+check_duplicate_headers([{<<$:, _/binary>> = Name, _Value} | Rest], Seen) ->
     case maps:is_key(Name, Seen) of
-        true ->
-            %% set-cookie is allowed to have multiple values (RFC 9110 Section 5.3)
-            case Name of
-                <<"set-cookie">> ->
-                    check_duplicate_headers(Rest, Seen);
-                _ ->
-                    throw({header_error, {duplicate_header, Name}})
-            end;
-        false ->
-            check_duplicate_headers(Rest, Seen#{Name => true})
-    end.
+        true -> throw({header_error, {duplicate_header, Name}});
+        false -> check_duplicate_headers(Rest, Seen#{Name => true})
+    end;
+check_duplicate_headers([{_Name, _Value} | Rest], Seen) ->
+    check_duplicate_headers(Rest, Seen).
 
 %% SeenRegular tracks whether we've seen non-pseudo headers (for ordering check)
 do_update_stream_with_headers([], Stream, _SeenRegular) ->
@@ -1939,7 +2210,10 @@ do_update_stream_with_headers([], Stream, _SeenRegular) ->
 do_update_stream_with_headers([{<<$:, _/binary>>, _} | _], _Stream, true) ->
     throw({header_error, pseudo_header_after_regular});
 do_update_stream_with_headers([{<<":method">>, Value} | Rest], Stream, _SeenRegular) ->
-    do_update_stream_with_headers(Rest, Stream#h3_stream{method = Value}, false);
+    IsConnect = (Value =:= <<"CONNECT">>),
+    do_update_stream_with_headers(
+        Rest, Stream#h3_stream{method = Value, is_connect = IsConnect}, false
+    );
 do_update_stream_with_headers([{<<":path">>, Value} | Rest], Stream, _SeenRegular) ->
     do_update_stream_with_headers(Rest, Stream#h3_stream{path = Value}, false);
 do_update_stream_with_headers([{<<":scheme">>, Value} | Rest], Stream, _SeenRegular) ->
@@ -1951,7 +2225,16 @@ do_update_stream_with_headers([{<<":status">>, Value} | Rest], Stream, _SeenRegu
     do_update_stream_with_headers(Rest, Stream#h3_stream{status = Status}, false);
 do_update_stream_with_headers([{<<"content-length">>, Value} | Rest], Stream, _SeenRegular) ->
     CL = safe_binary_to_integer(Value, <<"content-length">>),
-    do_update_stream_with_headers(Rest, Stream#h3_stream{content_length = CL}, true);
+    case Stream#h3_stream.content_length of
+        undefined ->
+            do_update_stream_with_headers(Rest, Stream#h3_stream{content_length = CL}, true);
+        CL ->
+            %% RFC 9110 §8.6: multiple Content-Length fields are allowed only
+            %% when all values are identical; otherwise the message is invalid.
+            do_update_stream_with_headers(Rest, Stream, true);
+        _Other ->
+            throw({header_error, {invalid_field, <<"content-length">>, Value}})
+    end;
 do_update_stream_with_headers([{<<"priority">>, Value} | Rest], Stream, _SeenRegular) ->
     %% RFC 9218 Extensible Priorities: parse "u=N, i" format
     {Urgency, Incremental} = parse_priority_header(Value),
@@ -1990,19 +2273,88 @@ validate_request_headers(#h3_stream{path = undefined}, _State) ->
     throw({header_error, {missing_pseudo_header, <<":path">>}});
 validate_request_headers(#h3_stream{path = <<>>}, _State) ->
     throw({header_error, {invalid_pseudo_header, <<":path">>, empty}});
-%% RFC 9114 Section 4.3.1: :authority required for non-CONNECT requests
-validate_request_headers(#h3_stream{method = Method, authority = undefined}, _State) when
+%% RFC 9114 §4.3.1 / RFC 9110 §7.2: non-CONNECT requests need an authority,
+%% provided by either :authority or Host. When both are present, they must
+%% match.
+validate_request_headers(#h3_stream{method = Method} = Stream, _State) when
     Method =/= <<"CONNECT">>
 ->
-    throw({header_error, {missing_pseudo_header, <<":authority">>}});
+    validate_authority_and_host(Stream),
+    ok;
 validate_request_headers(_, _State) ->
     ok.
 
-%% Validate response pseudo-headers (client receiving responses - RFC 9114 Section 4.3.2)
-validate_response_headers(#h3_stream{status = undefined}) ->
-    throw({header_error, {missing_pseudo_header, <<":status">>}});
-validate_response_headers(_) ->
+validate_authority_and_host(#h3_stream{authority = Authority, headers = Headers}) ->
+    Host = lookup_host_header(Headers),
+    check_authority_value(Authority),
+    check_host_value(Host),
+    case {Authority, Host} of
+        {undefined, undefined} ->
+            throw({header_error, {missing_pseudo_header, <<":authority">>}});
+        {undefined, _} ->
+            ok;
+        {_, undefined} ->
+            ok;
+        {Same, Same} ->
+            ok;
+        {_, _} ->
+            throw({header_error, {invalid_field, <<"host">>, Host}})
+    end.
+
+%% RFC 9114 §4.3.1 / RFC 9110 §7.2: :authority, when present, MUST NOT be empty
+%% and MUST NOT contain userinfo ("user@host"-style) for http/https URIs.
+check_authority_value(undefined) ->
+    ok;
+check_authority_value(<<>>) ->
+    throw({header_error, {invalid_field, <<":authority">>, <<>>}});
+check_authority_value(Value) ->
+    case binary:match(Value, <<"@">>) of
+        nomatch -> ok;
+        _ -> throw({header_error, {invalid_field, <<":authority">>, Value}})
+    end.
+
+check_host_value(undefined) ->
+    ok;
+check_host_value(<<>>) ->
+    throw({header_error, {invalid_field, <<"host">>, <<>>}});
+check_host_value(_Value) ->
     ok.
+
+lookup_host_header([]) ->
+    undefined;
+lookup_host_header([{<<"host">>, Value} | _]) ->
+    Value;
+lookup_host_header([_ | Rest]) ->
+    lookup_host_header(Rest).
+
+%% Validate response pseudo-headers (client receiving responses - RFC 9114 §4.3.2).
+%% Rejects request pseudo-headers in responses, requires :status in 100..599.
+validate_response_headers(#h3_stream{status = undefined}, _Headers) ->
+    throw({header_error, {missing_pseudo_header, <<":status">>}});
+validate_response_headers(#h3_stream{status = Status}, _Headers) when
+    Status < 100; Status > 599
+->
+    throw({header_error, {invalid_field, <<":status">>, integer_to_binary(Status)}});
+validate_response_headers(_Stream, Headers) ->
+    case response_has_request_pseudo(Headers) of
+        {true, Name} -> throw({header_error, {invalid_field, Name, <<>>}});
+        false -> ok
+    end.
+
+response_has_request_pseudo([]) ->
+    false;
+response_has_request_pseudo([{<<":method">>, _} | _]) ->
+    {true, <<":method">>};
+response_has_request_pseudo([{<<":scheme">>, _} | _]) ->
+    {true, <<":scheme">>};
+response_has_request_pseudo([{<<":path">>, _} | _]) ->
+    {true, <<":path">>};
+response_has_request_pseudo([{<<":authority">>, _} | _]) ->
+    {true, <<":authority">>};
+response_has_request_pseudo([{<<":protocol">>, _} | _]) ->
+    {true, <<":protocol">>};
+response_has_request_pseudo([_ | Rest]) ->
+    response_has_request_pseudo(Rest).
 
 %% Safe binary to integer conversion with proper error handling
 safe_binary_to_integer(Bin, FieldName) ->
@@ -2108,7 +2460,10 @@ handle_stream_closed(
                 {connection_error, ?H3_CLOSED_CRITICAL_STREAM,
                     iolist_to_binary(io_lib:format("~p stream closed", [Type]))}};
         false ->
-            %% Normal stream - send cancellation if blocked, then remove from tracking
+            %% RFC 9114 Section 4.1.1: server-side request stream that ends
+            %% before a complete request is received MUST be reset with
+            %% H3_REQUEST_INCOMPLETE.
+            maybe_reset_incomplete_request(StreamId, State),
             State1 = maybe_send_stream_cancel(StreamId, State),
             {ok, State1#state{
                 streams = maps:remove(StreamId, Streams),
@@ -2116,6 +2471,21 @@ handle_stream_closed(
                 uni_stream_buffers = maps:remove(StreamId, UniBuffers)
             }}
     end.
+
+maybe_reset_incomplete_request(StreamId, #state{role = server, quic_conn = QuicConn} = State) when
+    StreamId rem 4 =:= 0
+->
+    case maps:find(StreamId, State#state.streams) of
+        {ok, #h3_stream{frame_state = complete}} ->
+            ok;
+        {ok, _Incomplete} ->
+            quic:reset_stream(QuicConn, StreamId, ?H3_REQUEST_INCOMPLETE),
+            ok;
+        error ->
+            ok
+    end;
+maybe_reset_incomplete_request(_StreamId, _State) ->
+    ok.
 
 %% Check if a stream is a critical H3 stream
 is_critical_stream(StreamId, #state{peer_control_stream = StreamId}) -> {true, control};
@@ -2164,11 +2534,15 @@ send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, Streams, State)
                             true -> half_closed_local;
                             false -> open
                         end,
+                    IsConnect =
+                        (lists:keyfind(<<":method">>, 1, Headers) =:=
+                            {<<":method">>, <<"CONNECT">>}),
                     Stream = #h3_stream{
                         id = StreamId,
                         type = request,
                         state = StreamState,
-                        frame_state = expecting_headers
+                        frame_state = expecting_headers,
+                        is_connect = IsConnect
                     },
                     State3 = State2#state{
                         next_stream_id = NextId + 4,
@@ -2254,6 +2628,9 @@ do_send_trailers(
             {error, Reason};
         ok ->
             case maps:find(StreamId, Streams) of
+                {ok, #h3_stream{is_connect = true}} ->
+                    %% RFC 9114 §4.4: no trailers on CONNECT tunnel streams
+                    {error, connect_tunnel};
                 {ok, Stream} ->
                     %% Use encode/3 with StreamId for section ack tracking
                     {Encoded, Encoder1} = quic_qpack:encode(Trailers, StreamId, Encoder),
@@ -2693,17 +3070,35 @@ cleanup_blocked_streams_on_goaway(State) ->
 send_goaway(
     #state{
         quic_conn = QuicConn,
-        local_control_stream = ControlStream,
-        last_stream_id = LastId
+        local_control_stream = ControlStream
     } = State
 ) ->
-    GoawayFrame = quic_h3_frame:encode_goaway(LastId),
+    Id = goaway_id_to_send(State),
+    GoawayFrame = quic_h3_frame:encode_goaway(Id),
     case quic:send_data(QuicConn, ControlStream, GoawayFrame, false) of
         ok ->
-            {ok, State#state{goaway_id = LastId}};
+            {ok, State#state{goaway_id = Id}};
         {error, Reason} ->
             {error, Reason}
     end.
+
+%% RFC 9114 §5.2 / §7.2.6: GOAWAY identifier marks the first stream/push that
+%% will NOT be processed. Server sends LastId + 4 (next client-initiated bidi).
+%% Client sends the next push ID it will refuse.
+goaway_id_to_send(#state{role = server, last_stream_id = LastId}) ->
+    LastId + 4;
+goaway_id_to_send(#state{role = client, promised_pushes = Promised}) ->
+    case maps:size(Promised) of
+        0 -> 0;
+        _ -> lists:max(maps:keys(Promised)) + 1
+    end.
+
+%% RFC 9114 Section 7.2.6: validate GOAWAY identifier by our role (we are the
+%% receiver). A client receives a stream ID (client-initiated bidi, rem 4 =:= 0);
+%% a server receives a push ID.
+validate_goaway_id(client, Id) when Id rem 4 =:= 0 -> ok;
+validate_goaway_id(client, _Id) -> {error, <<"GOAWAY stream ID not client-initiated bidi">>};
+validate_goaway_id(server, _Id) -> ok.
 
 send_encoder_instructions(
     #state{
@@ -2812,6 +3207,28 @@ handle_priority_update_frame(Payload, #state{streams = Streams} = State) ->
         %% Malformed frame - ignore
         _:_ -> {ok, State}
     end.
+
+%% RFC 9218 §7.2: PRIORITY_UPDATE targeting a push stream. Server-side only;
+%% client sends it to reprioritize a push stream.
+handle_priority_update_push_frame(Payload, #state{role = server, push_streams = Pushes} = State) ->
+    try quic_varint:decode(Payload) of
+        {PushId, PriorityFieldValue} ->
+            case maps:find(PushId, Pushes) of
+                {ok, {StreamId, Stream}} ->
+                    {Urgency, Incremental} = parse_priority_field_value(PriorityFieldValue),
+                    Stream1 = Stream#h3_stream{urgency = Urgency, incremental = Incremental},
+                    apply_stream_priority(StreamId, Stream1, State),
+                    {ok, State#state{push_streams = Pushes#{PushId => {StreamId, Stream1}}}};
+                error ->
+                    %% Push ID unknown - ignore per RFC 9218
+                    {ok, State}
+            end
+    catch
+        _:_ -> {ok, State}
+    end;
+handle_priority_update_push_frame(_Payload, #state{role = client} = State) ->
+    %% RFC 9218: client should not receive PRIORITY_UPDATE for push; ignore.
+    {ok, State}.
 
 %% Parse RFC 9218 Priority Field Value (Structured Fields format)
 %% Same format as Priority header: "u=N, i" or just parameters

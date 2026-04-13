@@ -101,6 +101,227 @@ push_stream_to_server_error_test() ->
     ok.
 
 %%====================================================================
+%% Cancelled Push Stream Tests (RFC 9114 Section 7.2.3)
+%%====================================================================
+
+%% When a cancelled push stream arrives, it should be silently ignored
+%% without crashing the connection
+cancelled_push_stream_ignored_test() ->
+    %% Push ID 5 was cancelled by the client
+    State = make_test_state(#{
+        role => client,
+        local_max_push_id => 10,
+        local_cancelled_pushes => sets:from_list([5], [{version, 2}]),
+        uni_stream_buffers => #{100 => {push_pending, <<>>}},
+        promised_pushes => #{},
+        received_pushes => #{}
+    }),
+    %% Push stream arrives with cancelled push ID (5)
+    %% This should return {ok, State} not {error, ...}
+    Result = quic_h3_connection:process_push_stream_id(100, 5, <<>>, State),
+    ?assertMatch({ok, _}, Result),
+    %% Verify the stream buffer was removed
+    {ok, State1} = Result,
+    Buffers = element(24, State1),
+    ?assertNot(maps:is_key(100, Buffers)).
+
+%% Non-cancelled push should still work normally
+non_cancelled_push_works_test() ->
+    %% Push ID 5 is NOT cancelled
+    State = make_test_state(#{
+        role => client,
+        local_max_push_id => 10,
+        local_cancelled_pushes => sets:new([{version, 2}]),
+        uni_stream_buffers => #{100 => {push_pending, <<>>}},
+        promised_pushes => #{5 => {4, [{<<":status">>, <<"200">>}]}},
+        received_pushes => #{}
+    }),
+    %% Push stream should be processed normally
+    Result = quic_h3_connection:process_push_stream_id(100, 5, <<>>, State),
+    ?assertMatch({ok, _}, Result).
+
+%% Push ID exceeds MAX_PUSH_ID should still error
+push_exceeds_max_id_error_test() ->
+    State = make_test_state(#{
+        role => client,
+        local_max_push_id => 10,
+        local_cancelled_pushes => sets:new([{version, 2}]),
+        uni_stream_buffers => #{100 => {push_pending, <<>>}},
+        promised_pushes => #{},
+        received_pushes => #{}
+    }),
+    %% Push ID 15 exceeds max_push_id of 10
+    Result = quic_h3_connection:process_push_stream_id(100, 15, <<>>, State),
+    ?assertMatch({error, {connection_error, ?H3_ID_ERROR, _}, _}, Result).
+
+%%====================================================================
+%% Push ID Allocation Tests (RFC 9114 Section 4.6)
+%%====================================================================
+
+%% Allocate push ID skips cancelled IDs
+push_skips_cancelled_ids_test() ->
+    State = make_test_state(#{
+        role => server,
+        max_push_id => 10,
+        next_push_id => 0,
+        cancelled_pushes => sets:from_list([0, 1, 2], [{version, 2}])
+    }),
+    %% Should allocate push ID 3 (skipping 0, 1, 2)
+    {ok, PushId, _State1} = quic_h3_connection:allocate_push_id(State),
+    ?assertEqual(3, PushId).
+
+%% Allocate push ID returns first non-cancelled
+push_allocates_first_non_cancelled_test() ->
+    State = make_test_state(#{
+        role => server,
+        max_push_id => 10,
+        next_push_id => 5,
+        cancelled_pushes => sets:from_list([5, 6], [{version, 2}])
+    }),
+    %% Should allocate push ID 7 (skipping 5, 6)
+    {ok, PushId, _State1} = quic_h3_connection:allocate_push_id(State),
+    ?assertEqual(7, PushId).
+
+%% Allocate push ID fails when all remaining are cancelled
+push_allocation_exceeds_max_test() ->
+    State = make_test_state(#{
+        role => server,
+        max_push_id => 2,
+        next_push_id => 0,
+        cancelled_pushes => sets:from_list([0, 1, 2], [{version, 2}])
+    }),
+    %% All IDs up to max are cancelled
+    Result = quic_h3_connection:allocate_push_id(State),
+    ?assertEqual({error, max_push_id_exceeded}, Result).
+
+%% Allocate push ID fails when push not enabled
+push_allocation_not_enabled_test() ->
+    State = make_test_state(#{
+        role => server,
+        max_push_id => undefined,
+        next_push_id => 0
+    }),
+    Result = quic_h3_connection:allocate_push_id(State),
+    ?assertEqual({error, push_not_enabled}, Result).
+
+%% Allocate push ID cleans up cancelled set as it skips
+push_allocation_cleans_cancelled_set_test() ->
+    State = make_test_state(#{
+        role => server,
+        max_push_id => 10,
+        next_push_id => 0,
+        cancelled_pushes => sets:from_list([0, 1], [{version, 2}])
+    }),
+    {ok, 2, State1} = quic_h3_connection:allocate_push_id(State),
+    %% cancelled_pushes is at position 36
+    Cancelled = element(36, State1),
+    %% IDs 0 and 1 should have been removed
+    ?assertNot(sets:is_element(0, Cancelled)),
+    ?assertNot(sets:is_element(1, Cancelled)).
+
+%%====================================================================
+%% Push Frame Sequencing Tests (RFC 9114 Section 4.6)
+%%====================================================================
+
+%% Push stream frame state is tracked in received_pushes
+push_stream_tracks_frame_state_test() ->
+    State = make_test_state(#{
+        role => client,
+        local_max_push_id => 10,
+        uni_stream_buffers => #{100 => {push_pending, <<>>}},
+        promised_pushes => #{5 => {4, [{<<":status">>, <<"200">>}]}},
+        received_pushes => #{}
+    }),
+    %% Correlate push stream - should set state to expecting_headers
+    {ok, State1} = quic_h3_connection:process_push_stream_id(100, 5, <<>>, State),
+    %% received_pushes is at position 39
+    Received = element(39, State1),
+    ?assertEqual({100, expecting_headers}, maps:get(5, Received)).
+
+%%====================================================================
+%% Push Response Header Validation Tests (RFC 9114 Section 4.6)
+%%====================================================================
+
+%% validate_push_response_headers unit tests
+push_response_missing_status_test() ->
+    Headers = [{<<"content-type">>, <<"text/html">>}],
+    Result = quic_h3_connection:validate_push_response_headers(Headers),
+    ?assertMatch({error, <<"missing :status in push response">>}, Result).
+
+push_response_invalid_status_value_test() ->
+    Headers = [{<<":status">>, <<"abc">>}],
+    Result = quic_h3_connection:validate_push_response_headers(Headers),
+    ?assertMatch({error, <<"invalid :status value">>}, Result).
+
+push_response_status_out_of_range_test() ->
+    Headers = [{<<":status">>, <<"999">>}],
+    Result = quic_h3_connection:validate_push_response_headers(Headers),
+    ?assertMatch({error, <<"invalid :status value">>}, Result).
+
+push_response_with_method_pseudo_header_test() ->
+    Headers = [{<<":status">>, <<"200">>}, {<<":method">>, <<"GET">>}],
+    Result = quic_h3_connection:validate_push_response_headers(Headers),
+    ?assertMatch({error, <<"request pseudo-header in push response">>}, Result).
+
+push_response_with_path_pseudo_header_test() ->
+    Headers = [{<<":status">>, <<"200">>}, {<<":path">>, <<"/">>}],
+    Result = quic_h3_connection:validate_push_response_headers(Headers),
+    ?assertMatch({error, <<"request pseudo-header in push response">>}, Result).
+
+push_response_valid_test() ->
+    Headers = [{<<":status">>, <<"200">>}, {<<"content-type">>, <<"text/html">>}],
+    Result = quic_h3_connection:validate_push_response_headers(Headers),
+    ?assertMatch({ok, 200}, Result).
+
+push_response_valid_redirect_test() ->
+    Headers = [{<<":status">>, <<"302">>}, {<<"location">>, <<"http://example.com">>}],
+    Result = quic_h3_connection:validate_push_response_headers(Headers),
+    ?assertMatch({ok, 302}, Result).
+
+%%====================================================================
+%% Push Cleanup Tests (RFC 9114 Section 4.6)
+%%====================================================================
+
+%% Client-side cleanup removes from local_cancelled_pushes
+push_cleanup_removes_local_cancelled_test() ->
+    State = make_test_state(#{
+        role => client,
+        received_pushes => #{5 => {100, expecting_data}},
+        local_cancelled_pushes => sets:from_list([5], [{version, 2}]),
+        stream_buffers => #{100 => <<>>}
+    }),
+    {ok, State1} = quic_h3_connection:cleanup_push_stream(5, 100, State),
+    %% local_cancelled_pushes is at position 40
+    LocalCancelled = element(40, State1),
+    ?assertNot(sets:is_element(5, LocalCancelled)).
+
+%% Client-side cleanup removes from received_pushes
+push_cleanup_removes_received_pushes_test() ->
+    State = make_test_state(#{
+        role => client,
+        received_pushes => #{5 => {100, expecting_data}},
+        local_cancelled_pushes => sets:new([{version, 2}]),
+        stream_buffers => #{100 => <<>>}
+    }),
+    {ok, State1} = quic_h3_connection:cleanup_push_stream(5, 100, State),
+    %% received_pushes is at position 39
+    Received = element(39, State1),
+    ?assertNot(maps:is_key(5, Received)).
+
+%% Cleanup removes stream buffers
+push_cleanup_removes_stream_buffers_test() ->
+    State = make_test_state(#{
+        role => client,
+        received_pushes => #{5 => {100, expecting_data}},
+        local_cancelled_pushes => sets:new([{version, 2}]),
+        stream_buffers => #{100 => <<"buffered data">>}
+    }),
+    {ok, State1} = quic_h3_connection:cleanup_push_stream(5, 100, State),
+    %% stream_buffers is at position 23
+    Buffers = element(23, State1),
+    ?assertNot(maps:is_key(100, Buffers)).
+
+%%====================================================================
 %% Helper Functions
 %%====================================================================
 

@@ -234,8 +234,18 @@ decode_frame_payload(?H3_FRAME_MAX_PUSH_ID, Payload) ->
     catch
         _:_ -> {error, {frame_error, max_push_id, malformed_varint}}
     end;
+%% RFC 9114 §7.2.8: frame types used by HTTP/2 that are reserved in HTTP/3
+%% MUST be treated as a connection error of type H3_FRAME_UNEXPECTED.
+decode_frame_payload(16#02, _Payload) ->
+    {error, {h2_reserved_frame, 16#02}};
+decode_frame_payload(16#06, _Payload) ->
+    {error, {h2_reserved_frame, 16#06}};
+decode_frame_payload(16#08, _Payload) ->
+    {error, {h2_reserved_frame, 16#08}};
+decode_frame_payload(16#09, _Payload) ->
+    {error, {h2_reserved_frame, 16#09}};
 decode_frame_payload(Type, Payload) ->
-    %% Unknown or reserved frame type
+    %% Unknown or reserved grease frame type (0x1f*N+0x21) - ignore per §9
     {unknown, Type, Payload}.
 
 %% @doc Decode stream type from unidirectional stream.
@@ -297,12 +307,31 @@ decode_settings_pairs(<<>>, Acc) ->
 decode_settings_pairs(Data, Acc) ->
     {Id, Rest1} = quic_varint:decode(Data),
     {Value, Rest2} = quic_varint:decode(Rest1),
-    Key = id_to_setting(Id),
-    %% RFC 9114 Section 7.2.4: duplicate setting identifiers MUST be treated as error
-    case maps:is_key(Key, Acc) of
-        true -> throw({duplicate_setting, Key});
-        false -> decode_settings_pairs(Rest2, Acc#{Key => Value})
+    %% RFC 9114 Section 7.2.4.1: Reject HTTP/2 settings that have no meaning in HTTP/3
+    case is_forbidden_setting(Id) of
+        true ->
+            throw({forbidden_setting, Id});
+        false ->
+            Key = id_to_setting(Id),
+            %% RFC 9114 Section 7.2.4: duplicate setting identifiers MUST be treated as error
+            case maps:is_key(Key, Acc) of
+                true -> throw({duplicate_setting, Key});
+                false -> decode_settings_pairs(Rest2, Acc#{Key => Value})
+            end
     end.
+
+%% RFC 9114 Section 7.2.4.1: HTTP/2 settings forbidden in HTTP/3
+%% These settings are defined for HTTP/2 but have no meaning in HTTP/3
+-spec is_forbidden_setting(non_neg_integer()) -> boolean().
+%% ENABLE_PUSH (HTTP/2)
+is_forbidden_setting(16#02) -> true;
+%% MAX_CONCURRENT_STREAMS (HTTP/2)
+is_forbidden_setting(16#03) -> true;
+%% INITIAL_WINDOW_SIZE (HTTP/2)
+is_forbidden_setting(16#04) -> true;
+%% MAX_FRAME_SIZE (HTTP/2)
+is_forbidden_setting(16#05) -> true;
+is_forbidden_setting(_) -> false.
 
 -spec setting_to_id(atom() | non_neg_integer()) -> non_neg_integer().
 setting_to_id(qpack_max_table_capacity) -> ?H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY;

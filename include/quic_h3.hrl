@@ -113,7 +113,11 @@
     %% urgency: 0-7 (lower = more urgent, default 3)
     %% incremental: whether data can be processed incrementally
     urgency = 3 :: 0..7,
-    incremental = false :: boolean()
+    incremental = false :: boolean(),
+
+    %% RFC 9114 §4.4 CONNECT: once the request/response succeeds, the stream
+    %% becomes a raw tunnel carrying only DATA frames.
+    is_connect = false :: boolean()
 }).
 
 %%====================================================================
