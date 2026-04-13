@@ -1,6 +1,6 @@
 # erlang_quic
 
-Pure Erlang QUIC implementation (RFC 9000/9001).
+Pure Erlang QUIC + HTTP/3 implementation (RFC 9000/9001/9114).
 
 ## Features
 
@@ -22,6 +22,8 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 - QLOG tracing support for debug visibility
 - UDP packet batching (GSO/GRO)
 - Client certificate verification
+- HTTP/3 client and server (RFC 9114) with QPACK (RFC 9204), extensible
+  priorities (RFC 9218), server push, extended CONNECT (RFC 9220)
 
 ## Requirements
 
@@ -107,6 +109,34 @@ Alternatively, use the low-level listener API directly:
 Port = quic_listener:get_port(Listener).
 ```
 
+### HTTP/3
+
+```erlang
+application:ensure_all_started(quic),
+
+%% Client
+{ok, Conn} = quic_h3:connect(<<"example.com">>, 443,
+    #{sync => true, verify => verify_none}),
+{ok, Sid} = quic_h3:request(Conn,
+    [{<<":method">>,    <<"GET">>},
+     {<<":scheme">>,    <<"https">>},
+     {<<":authority">>, <<"example.com">>},
+     {<<":path">>,      <<"/">>}]),
+%% Owner receives {quic_h3, Conn, {response, Sid, Status, Headers}}
+%% followed by {quic_h3, Conn, {data, Sid, Chunk, Fin}} events.
+quic_h3:close(Conn).
+
+%% Server
+Handler = fun(Conn, Sid, _Method, _Path, _Headers) ->
+    quic_h3:send_response(Conn, Sid, 200, [{<<"content-type">>, <<"text/plain">>}]),
+    quic_h3:send_data(Conn, Sid, <<"hello">>, true)
+end,
+{ok, _} = quic_h3:start_server(my_h3, 4433,
+    #{cert => CertDer, key => KeyDer, handler => Handler}).
+```
+
+Full API and internals: [docs/HTTP3.md](docs/HTTP3.md).
+
 ## Messages
 
 The owner process receives messages in the format `{quic, ConnRef, Event}`:
@@ -139,6 +169,9 @@ See [docs/features.md](docs/features.md) for the complete API reference and feat
 **Datagrams:** `quic:send_datagram/2` (RFC 9221)
 
 **Load Balancer:** `quic_lb:new_config/1`, `quic_lb:generate_cid/1` (RFC 9312)
+
+**HTTP/3:** `quic_h3:connect/3`, `quic_h3:request/3`, `quic_h3:send_data/4`,
+`quic_h3:send_response/4`, `quic_h3:start_server/3`, `quic_h3:push/3` (RFC 9114/9204/9218/9220)
 
 ## Building
 

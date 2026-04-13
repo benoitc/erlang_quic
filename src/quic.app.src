@@ -1,5 +1,5 @@
 {application, quic, [
-    {description, "Pure Erlang QUIC implementation (RFC 9000)"},
+    {description, "Pure Erlang QUIC and HTTP/3 implementation (RFC 9000/9001/9114)"},
     {vsn, "0.11.0"},
     {registered, [
         quic_sup,

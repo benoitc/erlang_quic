@@ -203,6 +203,7 @@ Opts = #{
 
 - [Developer Guide](DEVELOPER_GUIDE.md) - Detailed API usage and patterns
 - [Features](features.md) - Complete feature list and API reference
+- [HTTP/3](HTTP3.md) - HTTP/3 client/server API, internals, benchmarks
 - [Design](DESIGN.md) - Architecture and protocol details
 - [QUIC Distribution](QUIC_DIST.md) - Using QUIC for Erlang distribution
 - [QLOG Guide](QLOG_GUIDE.md) - Debugging with QLOG tracing

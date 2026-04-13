@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- HTTP/3 client and server (RFC 9114): `quic_h3`, `quic_h3_connection`,
+  `quic_h3_frame`, state machine for control / QPACK / request / push streams
+- QPACK header compression (RFC 9204): static + dynamic table, Huffman
+  encode/decode with EOS padding validation, Set-Capacity bounds,
+  blocked-streams limit enforcement, encoder eviction guard against
+  unacknowledged sections
+- Server push: MAX_PUSH_ID, PUSH_PROMISE, CANCEL_PUSH, cacheable-method
+  enforcement, duplicate PUSH_PROMISE handling per RFC 9114 §7.2.5
+- Extensible priorities (RFC 9218): `priority` header and PRIORITY_UPDATE
+  frames (request and push), strict structured-fields framing
+- Extended CONNECT (RFC 9220): `:protocol` pseudo-header and
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL` negotiation
+- Interim 1xx responses on request and push streams
+- CONNECT tunnel state: HEADERS/PUSH_PROMISE and trailers rejected on
+  tunnels
+- Per-stream handler registration for body-data routing
+- HTTP/3 benchmark suite (`quic_h3_bench`): connection_setup, latency,
+  throughput, concurrent, qpack micro-benchmarks
+- `docs/HTTP3.md` API reference, internals guide, and benchmark results
+
+### Changed
+- QUIC: send MAX_STREAMS as peer-initiated streams complete so connections
+  reusing a single channel are not capped by the initial credit
+  (RFC 9000 §4.6)
+- H3: emit trailing empty `{data, _, <<>>, true}` event when a response
+  carries FIN on the HEADERS frame so callers see end-of-stream uniformly
+
+### Fixed
+- GOAWAY identifier semantics per RFC 9114 §5.2 / §7.2.6 (server sends
+  next-stream-ID, client sends next push ID, receivers validate direction)
+- Strict malformed-message rules (uppercase names, invalid field chars,
+  forbidden connection-specific fields, te: trailers, :status range,
+  request pseudo on response, host/authority interplay, duplicate
+  content-length match, empty/userinfo authority)
+- Server-side incomplete request streams reset with H3_REQUEST_INCOMPLETE
+- Reserved HTTP/2 frame types (0x02/0x06/0x08/0x09) rejected with
+  H3_FRAME_UNEXPECTED
+- DoS hardening: 1 MiB max frame size, QPACK prefixed-int shift cap,
+  SETTINGS value ceilings, unknown SETTINGS IDs silently dropped
+
 ## [0.11.0] - 2026-04-09
 
 ### Added

@@ -148,6 +148,53 @@ ok = quic:send_data(Conn, StreamId, Header, false),
 ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 ```
 
+## HTTP/3 (RFC 9114)
+
+### Core
+- [x] HTTP/3 client and server (`quic_h3`, `quic_h3_connection`)
+- [x] ALPN `h3` negotiation, SETTINGS, control stream, GOAWAY
+- [x] Request/response streams with trailers
+- [x] Interim 1xx responses (request and push streams)
+- [x] CONNECT tunnels (§4.4) and extended CONNECT (`:protocol`, RFC 9220)
+- [x] Per-stream handler registration for body-data routing
+
+### QPACK header compression (RFC 9204)
+- [x] Static and dynamic tables
+- [x] Huffman encoding + EOS-padding-validated decoding
+- [x] Encoder-stream instructions (Set Dynamic Table Capacity, Insert,
+      Duplicate) with capacity bounded by advertised limit
+- [x] Decoder-stream instructions (Section Ack, Stream Cancellation,
+      Insert Count Increment)
+- [x] Blocked-streams limit enforcement per `SETTINGS_QPACK_BLOCKED_STREAMS`
+- [x] Eviction guard against entries referenced by unacknowledged sections
+
+### Server push (RFC 9114 §4.6)
+- [x] `MAX_PUSH_ID`, `PUSH_PROMISE`, `CANCEL_PUSH`, push streams
+- [x] Cacheable-method enforcement (only GET/HEAD may be pushed)
+- [x] Duplicate `PUSH_PROMISE` allowed when headers identical,
+      `H3_GENERAL_PROTOCOL_ERROR` when they differ
+
+### Extensible priorities (RFC 9218)
+- [x] `priority` request/response header
+- [x] `PRIORITY_UPDATE_REQUEST` and `PRIORITY_UPDATE_PUSH` frames with
+      strict Structured-Fields framing
+
+### Malformed-message enforcement (RFC 9114 §4.1.2, §4.2)
+- [x] Uppercase field names rejected
+- [x] Invalid field name/value characters rejected
+- [x] Connection-specific fields (`connection`, `keep-alive`, `upgrade`,
+      `proxy-connection`, `transfer-encoding`) rejected
+- [x] `te` restricted to `trailers`
+- [x] `:status` limited to 100..599, request pseudo-headers rejected on
+      responses
+- [x] `:authority` / `Host` consistency, empty values and userinfo rejected
+- [x] Duplicate `Content-Length` must match; incomplete server-side
+      requests reset with `H3_REQUEST_INCOMPLETE`
+- [x] Reserved HTTP/2 frame types (0x02/0x06/0x08/0x09) and HTTP/2
+      settings IDs rejected
+- [x] 1 MiB frame-size ceiling, QPACK prefixed-int shift cap,
+      unknown SETTINGS IDs silently dropped
+
 ## API
 
 ### Connection
