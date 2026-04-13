@@ -707,6 +707,17 @@ goaway_sent(enter, _OldState, #state{owner = Owner, goaway_id = GoawayId}) ->
     keep_state_and_data;
 goaway_sent(
     info,
+    {quic, QuicConn, {new_stream, StreamId, Type}},
+    #state{quic_conn = QuicConn} = State
+) ->
+    %% Route through handle_new_stream so the GOAWAY rejection in
+    %% stream_blocked_by_goaway/3 fires for in-progress drain.
+    case handle_new_stream(StreamId, Type, State) of
+        {ok, State1} -> {keep_state, State1};
+        {error, Reason} -> handle_connection_error(Reason, State)
+    end;
+goaway_sent(
+    info,
     {quic, QuicConn, {stream_data, StreamId, Data, Fin}},
     #state{quic_conn = QuicConn} = State
 ) ->
@@ -743,6 +754,15 @@ goaway_sent(_EventType, _Event, _State) ->
 goaway_received(enter, _OldState, #state{owner = Owner, goaway_id = GoawayId}) ->
     Owner ! {quic_h3, self(), {goaway, GoawayId}},
     keep_state_and_data;
+goaway_received(
+    info,
+    {quic, QuicConn, {new_stream, StreamId, Type}},
+    #state{quic_conn = QuicConn} = State
+) ->
+    case handle_new_stream(StreamId, Type, State) of
+        {ok, State1} -> {keep_state, State1};
+        {error, Reason} -> handle_connection_error(Reason, State)
+    end;
 goaway_received(
     info,
     {quic, QuicConn, {stream_data, StreamId, Data, Fin}},
@@ -859,22 +879,44 @@ handle_new_stream(StreamId, bidirectional, #state{streams = Streams, role = Role
         false ->
             {error, {connection_error, ?H3_STREAM_CREATION_ERROR, <<"invalid stream ID parity">>}};
         true ->
-            %% Bidirectional stream is a request stream
-            Stream = #h3_stream{
-                id = StreamId,
-                type = request,
-                state = open
-            },
-            %% For server, this is an incoming request
-            %% For client, we opened it ourselves
-            NewState = State#state{streams = Streams#{StreamId => Stream}},
-            case Role of
-                server ->
-                    {ok, NewState#state{last_stream_id = max(StreamId, State#state.last_stream_id)}};
-                client ->
-                    {ok, NewState}
+            case stream_blocked_by_goaway(StreamId, Role, State) of
+                true ->
+                    %% RFC 9114 §5.2: streams at or beyond the GOAWAY ID
+                    %% MUST NOT be processed - reset the new stream and keep
+                    %% the connection.
+                    quic:reset_stream(
+                        State#state.quic_conn, StreamId, ?H3_REQUEST_REJECTED
+                    ),
+                    {ok, State};
+                false ->
+                    Stream = #h3_stream{
+                        id = StreamId,
+                        type = request,
+                        state = open
+                    },
+                    NewState = State#state{streams = Streams#{StreamId => Stream}},
+                    case Role of
+                        server ->
+                            {ok, NewState#state{
+                                last_stream_id = max(StreamId, State#state.last_stream_id)
+                            }};
+                        client ->
+                            {ok, NewState}
+                    end
             end
     end.
+
+%% RFC 9114 §5.2: a sender MUST NOT initiate, and a receiver MUST treat as
+%% rejected, request streams whose ID is at or beyond the locally-sent
+%% GOAWAY identifier (server) or the received GOAWAY identifier (client).
+stream_blocked_by_goaway(_StreamId, _Role, #state{goaway_id = undefined}) ->
+    false;
+stream_blocked_by_goaway(StreamId, server, #state{goaway_id = GoawayId}) ->
+    StreamId >= GoawayId;
+stream_blocked_by_goaway(_StreamId, client, _State) ->
+    %% Client receives GOAWAY carrying a push ID; bidi stream IDs are
+    %% client-initiated and not constrained by the goaway_id value.
+    false.
 
 handle_stream_data(StreamId, Data, Fin, State) ->
     case classify_stream(StreamId, State) of

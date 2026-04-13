@@ -1242,6 +1242,53 @@ priority_update_push_client_ignored_test() ->
     ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_push_frame(Payload, State)).
 
 %%====================================================================
+%% Theme B: GOAWAY drain enforcement
+%%====================================================================
+
+%% Server with goaway_id set rejects new bidi streams >= goaway_id by
+%% RESET_STREAM, leaving the connection intact.
+goaway_blocks_new_request_stream_test() ->
+    Stub = spawn_quic_stub(),
+    State = make_test_state(#{
+        role => server,
+        goaway_id => 8,
+        quic_conn => Stub
+    }),
+    Result = quic_h3_connection:handle_new_stream(8, bidirectional, State),
+    ?assertMatch({ok, _}, Result),
+    {ok, State1} = Result,
+    Streams = element(21, State1),
+    ?assertNot(maps:is_key(8, Streams)),
+    exit(Stub, normal).
+
+%% Streams below the goaway_id are still accepted.
+goaway_allows_in_progress_streams_test() ->
+    Stub = spawn_quic_stub(),
+    State = make_test_state(#{
+        role => server,
+        goaway_id => 12,
+        quic_conn => Stub
+    }),
+    Result = quic_h3_connection:handle_new_stream(4, bidirectional, State),
+    ?assertMatch({ok, _}, Result),
+    {ok, State1} = Result,
+    Streams = element(21, State1),
+    ?assert(maps:is_key(4, Streams)),
+    exit(Stub, normal).
+
+spawn_quic_stub() ->
+    spawn(fun stub_loop/0).
+
+stub_loop() ->
+    receive
+        {'$gen_call', From, _} ->
+            gen:reply(From, ok),
+            stub_loop();
+        _ ->
+            stub_loop()
+    end.
+
+%%====================================================================
 %% Theme A: Push lifecycle correctness
 %%====================================================================
 
