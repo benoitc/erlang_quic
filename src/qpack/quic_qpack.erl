@@ -842,7 +842,11 @@ decode_headers(<<2#0010:4, H:1, NameLenPrefix:3, Rest0/binary>>, RIC, Base, Stat
     {Value, Rest3} = decode_string(Rest2),
     decode_headers(Rest3, RIC, Base, State, [{Name, Value} | Acc]);
 decode_headers(<<2#0011:4, H:1, NameLenPrefix:3, Rest0/binary>>, RIC, Base, State, Acc) ->
-    %% Literal with literal name, N=1 (never indexed) - 0011Hxxx
+    %% Literal with literal name, N=1 (never indexed) - 0011Hxxx.
+    %% RFC 9204 §4.5.6: this representation MUST NOT be added to the
+    %% dynamic table by any party. Our decoder never auto-inserts literals,
+    %% so the bit is preserved by simply emitting the field as-is. A
+    %% future proxy use-case will need to surface this bit to callers.
     {NameLen, Rest1} =
         case NameLenPrefix < 7 of
             true -> {NameLenPrefix, Rest0};
@@ -1048,6 +1052,11 @@ entry_size(Name, Value) ->
     byte_size(Name) + byte_size(Value) + ?ENTRY_OVERHEAD.
 
 %% @doc Evict entries until there's room for an entry of the given size.
+%% RFC 9204 §3.2.1: an entry MUST NOT be evicted while still referenced by
+%% an unacknowledged section. We approximate this on the encoder by refusing
+%% to evict any entry whose absolute index is >= the smallest RIC across all
+%% pending sections. If no eviction is possible, leave the table as-is so
+%% the new insert is silently dropped.
 -spec evict_to_fit(non_neg_integer(), state()) -> state().
 evict_to_fit(RequiredSize, #qpack{dyn_size = Size, dyn_max_size = MaxSize} = State) when
     Size + RequiredSize =< MaxSize
@@ -1057,17 +1066,25 @@ evict_to_fit(_RequiredSize, #qpack{dyn_entries = []} = State) ->
     %% No entries to evict
     State;
 evict_to_fit(RequiredSize, #qpack{dyn_entries = Entries} = State) ->
-    %% Evict oldest entry (last in list)
+    [{AbsIndex, _Header, _Sz} | _] = lists:reverse(Entries),
+    case is_entry_pinned(AbsIndex, State) of
+        true ->
+            %% Oldest entry is still referenced by an unacknowledged section;
+            %% bail out without evicting (§3.2.1).
+            State;
+        false ->
+            evict_oldest(RequiredSize, Entries, State)
+    end.
+
+evict_oldest(RequiredSize, Entries, State) ->
     {Oldest, RestEntries} = lists:split(length(Entries) - 1, Entries),
     [{AbsIndex, Header, EntrySize}] = RestEntries,
     {Name, _Value} = Header,
-    %% Only remove from field index if this entry is the current one
     NewFieldIndex =
         case maps:get(Header, State#qpack.dyn_field_index, undefined) of
             AbsIndex -> maps:remove(Header, State#qpack.dyn_field_index);
             _ -> State#qpack.dyn_field_index
         end,
-    %% Only remove from name index if this was the entry for that name
     NewNameIndex =
         case maps:get(Name, State#qpack.dyn_name_index, undefined) of
             AbsIndex -> maps:remove(Name, State#qpack.dyn_name_index);
@@ -1080,6 +1097,28 @@ evict_to_fit(RequiredSize, #qpack{dyn_entries = Entries} = State) ->
         dyn_size = State#qpack.dyn_size - EntrySize
     },
     evict_to_fit(RequiredSize, State1).
+
+%% True if AbsIndex is referenced by any pending (unacked) section. A section
+%% with RIC R references entries [0..R-1], so entries with AbsIndex < R are
+%% pinned. We pin if AbsIndex < smallest pending RIC across all streams.
+is_entry_pinned(AbsIndex, #qpack{pending_sections = Pending}) when map_size(Pending) =:= 0 ->
+    AbsIndex >= 0 andalso false;
+is_entry_pinned(AbsIndex, #qpack{pending_sections = Pending}) ->
+    MinRIC = maps:fold(
+        fun(_StreamId, Q, Acc) ->
+            case queue:peek(Q) of
+                empty -> Acc;
+                {value, R} when Acc =:= undefined orelse R < Acc -> R;
+                _ -> Acc
+            end
+        end,
+        undefined,
+        Pending
+    ),
+    case MinRIC of
+        undefined -> false;
+        _ -> AbsIndex < MinRIC
+    end.
 
 %% @doc Get dynamic table entry by relative index.
 %% Relative index 0 is the most recently inserted entry.

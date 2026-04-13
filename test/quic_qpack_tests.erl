@@ -317,6 +317,14 @@ huffman_skip_for_small_value_test() ->
     {ok, Decoded} = quic_qpack:decode(Encoded),
     ?assertEqual(Headers, Decoded).
 
+%% RFC 9204 §4.4.3: Insert Count Increment with value 0 is a decoder-stream
+%% error.
+insert_count_increment_zero_rejected_test() ->
+    %% Encoded form of an Insert Count Increment with value 0: prefix 00 + 0.
+    Instruction = <<0:8>>,
+    State = quic_qpack:new(),
+    ?assertMatch({error, _}, quic_qpack:process_decoder_instructions(Instruction, State)).
+
 %% RFC 7541 §5.2: EOS symbol or over-long padding must be rejected on decode.
 huffman_invalid_eos_rejected_test() ->
     %% Build a literal with huffman flag=1 but with an EOS-only encoded byte
