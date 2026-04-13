@@ -1242,6 +1242,65 @@ priority_update_push_client_ignored_test() ->
     ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_push_frame(Payload, State)).
 
 %%====================================================================
+%% Theme C: Header / trailer / path / status symmetry
+%%====================================================================
+
+trailer_with_connection_field_rejected_test() ->
+    %% Trailers must reject forbidden connection-specific fields, just like
+    %% regular header sections (§4.1.2 + §4.2).
+    Trailers = [{<<"connection">>, <<"close">>}],
+    ?assertMatch(
+        {error, {invalid_field, <<"connection">>, _}},
+        quic_h3_connection:validate_trailer_headers(Trailers, #h3_stream{id = 0})
+    ).
+
+trailer_with_uppercase_field_rejected_test() ->
+    Trailers = [{<<"X-Tag">>, <<"v">>}],
+    ?assertMatch(
+        {error, {invalid_field, <<"X-Tag">>, _}},
+        quic_h3_connection:validate_trailer_headers(Trailers, #h3_stream{id = 0})
+    ).
+
+scheme_uppercase_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"HTTPS">>},
+        {<<":authority">>, <<"x">>},
+        {<<":path">>, <<"/">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, {invalid_field, <<":scheme">>, _}}, Result).
+
+path_absolute_uri_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"x">>},
+        {<<":path">>, <<"http://example.com/x">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, {invalid_field, <<":path">>, _}}, Result).
+
+path_options_asterisk_accepted_test() ->
+    Headers = [
+        {<<":method">>, <<"OPTIONS">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"x">>},
+        {<<":path">>, <<"*">>}
+    ],
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({ok, _}, Result).
+
+%%====================================================================
 %% Theme B: GOAWAY drain enforcement
 %%====================================================================
 

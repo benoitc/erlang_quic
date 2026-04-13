@@ -2419,10 +2419,47 @@ validate_request_headers(#h3_stream{path = <<>>}, _State) ->
 validate_request_headers(#h3_stream{method = Method} = Stream, _State) when
     Method =/= <<"CONNECT">>
 ->
+    validate_scheme_value(Stream#h3_stream.scheme),
+    validate_path_form(Method, Stream#h3_stream.path),
     validate_authority_and_host(Stream),
     ok;
 validate_request_headers(_, _State) ->
     ok.
+
+%% RFC 9110 §4.2 / RFC 3986 §3.1: scheme must be ALPHA *(ALPHA / DIGIT / "+" /
+%% "-" / "."), HTTP/3 mandates lowercase. We require at least one lowercase
+%% letter and no other characters. Caller has already ensured Scheme is a
+%% non-undefined binary.
+validate_scheme_value(<<>>) ->
+    throw({header_error, {invalid_field, <<":scheme">>, <<>>}});
+validate_scheme_value(<<C, _/binary>> = Scheme) when C >= $a, C =< $z ->
+    case scheme_chars_ok(Scheme) of
+        true -> ok;
+        false -> throw({header_error, {invalid_field, <<":scheme">>, Scheme}})
+    end;
+validate_scheme_value(Scheme) ->
+    throw({header_error, {invalid_field, <<":scheme">>, Scheme}}).
+
+scheme_chars_ok(<<>>) ->
+    true;
+scheme_chars_ok(<<C, Rest/binary>>) when
+    (C >= $a andalso C =< $z) orelse
+        (C >= $0 andalso C =< $9) orelse
+        C =:= $+ orelse C =:= $- orelse C =:= $.
+->
+    scheme_chars_ok(Rest);
+scheme_chars_ok(_) ->
+    false.
+
+%% RFC 9114 §4.3.1: for OPTIONS, :path may be "*". Otherwise it MUST be
+%% origin-form (start with "/"). Absolute URI (scheme://...) is forbidden.
+%% Caller has already ensured Path is a non-undefined, non-empty binary.
+validate_path_form(<<"OPTIONS">>, <<"*">>) ->
+    ok;
+validate_path_form(_Method, <<$/, _/binary>>) ->
+    ok;
+validate_path_form(_Method, Path) ->
+    throw({header_error, {invalid_field, <<":path">>, Path}}).
 
 validate_authority_and_host(#h3_stream{authority = Authority, headers = Headers}) ->
     Host = lookup_host_header(Headers),
@@ -2508,11 +2545,18 @@ safe_binary_to_integer(Bin, FieldName) ->
 %% Validate trailer headers (RFC 9114 Section 4.1.2)
 %% Trailers MUST NOT contain pseudo-headers or duplicate Content-Length
 validate_trailer_headers(Trailers, Stream) ->
-    case has_pseudo_header(Trailers) of
-        true ->
-            {error, pseudo_header_in_trailer};
-        false ->
-            validate_trailer_content_length(Trailers, Stream)
+    %% RFC 9114 §4.1.2: trailers MUST NOT contain pseudo-headers nor any
+    %% connection-specific fields. Reuse the malformed-message validators
+    %% so the rules are symmetric with regular header sections.
+    try
+        validate_field_names_and_values(Trailers),
+        case has_pseudo_header(Trailers) of
+            true -> throw({header_error, pseudo_header_in_trailer});
+            false -> ok
+        end,
+        validate_trailer_content_length(Trailers, Stream)
+    catch
+        throw:{header_error, Reason} -> {error, Reason}
     end.
 
 %% Check if headers contain any pseudo-headers
@@ -2647,12 +2691,34 @@ send_request(
         streams = Streams
     } = State
 ) ->
-    %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
+    %% RFC 9114 §4.2.2: enforce peer's max field section size.
     case validate_outbound_headers(Headers, State) of
         {error, Reason} ->
             {error, Reason};
         ok ->
-            send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, Streams, State)
+            %% RFC 9114 §4.2 / §4.3.1: apply the same malformed-message and
+            %% pseudo-header rules used on inbound, so we never emit a
+            %% request that we would reject on receive.
+            case validate_outbound_request_headers(Headers, State) of
+                {error, Reason} ->
+                    {error, Reason};
+                ok ->
+                    send_request_validated(
+                        Headers, Opts, QuicConn, Encoder, NextId, Streams, State
+                    )
+            end
+    end.
+
+validate_outbound_request_headers(Headers, State) ->
+    try
+        validate_field_names_and_values(Headers),
+        check_duplicate_headers(Headers),
+        Template = #h3_stream{id = 0, type = request, state = open, headers = Headers},
+        Stream = do_update_stream_with_headers(Headers, Template, false),
+        validate_request_headers(Stream, State),
+        ok
+    catch
+        throw:{header_error, Reason} -> {error, Reason}
     end.
 
 send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, Streams, State) ->
@@ -2696,6 +2762,14 @@ send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, Streams, State)
             {error, Reason}
     end.
 
+do_send_response(
+    _StreamId,
+    Status,
+    _Headers,
+    _State
+) when not is_integer(Status); Status < 100; Status > 599 ->
+    %% RFC 9114 §4.3.2: :status must be a valid HTTP status code.
+    {error, {invalid_status, Status}};
 do_send_response(
     StreamId,
     Status,
