@@ -2213,7 +2213,16 @@ notify_headers_received(StreamId, Headers, Stream, Owner, server) ->
     invoke_handler(self(), StreamId, Method, Path, Headers);
 notify_headers_received(StreamId, Headers, Stream, Owner, client) ->
     Status = Stream#h3_stream.status,
-    Owner ! {quic_h3, self(), {response, StreamId, Status, Headers}}.
+    Owner ! {quic_h3, self(), {response, StreamId, Status, Headers}},
+    %% RFC 9114: if the peer half-closed the stream with the HEADERS frame
+    %% (HEAD, 204, 304, or any response without a body) deliver an empty
+    %% final DATA event so callers see end-of-stream.
+    case Stream#h3_stream.frame_state of
+        complete ->
+            Owner ! {quic_h3, self(), {data, StreamId, <<>>, true}};
+        _ ->
+            ok
+    end.
 
 %% Update stream with headers, validating pseudo-headers and parsing values safely
 %% Returns {ok, Stream} | {error, Reason}
