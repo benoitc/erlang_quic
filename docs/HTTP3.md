@@ -727,3 +727,35 @@ loop(Conn) ->
             done
     end.
 ```
+
+## Benchmarks
+
+`test/quic_h3_bench.erl` exercises five sub-benchmarks against an
+in-process server. Run via:
+
+```bash
+rebar3 as test shell
+1> quic_h3_bench:run().
+```
+
+Latest run on Erlang/OTP 28, Apple M-series, loopback (single-core
+loopback path; numbers are not network-representative and meant for
+relative comparison across changes):
+
+| Benchmark         | Result                                        |
+|-------------------|-----------------------------------------------|
+| connection_setup  | 100 iterations, p50 2.5 ms, p99 3.0 ms        |
+| latency           | 1000/1000 GETs, p50 149 µs, p99 266 µs        |
+| throughput        | 5 MiB POST + 5 MiB echo in 219 ms (45.7 MB/s) |
+| concurrent        | 50/50 streams in 6 ms (8333 streams/s)        |
+| qpack             | small encode 0.9 µs, large 33.8 µs, decode 36.9 µs |
+
+Individual benchmarks can be invoked directly:
+
+```erlang
+quic_h3_bench:latency(1000).         % N requests on one connection
+quic_h3_bench:throughput(5242880).   % POST + echo of N bytes
+quic_h3_bench:concurrent(100).       % N in-flight streams
+quic_h3_bench:connection_setup(100). % N fresh connections
+quic_h3_bench:qpack_bench().         % header (de)compression micro-bench
+```
