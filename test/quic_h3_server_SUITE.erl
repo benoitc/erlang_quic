@@ -63,6 +63,7 @@ groups() ->
 init_per_suite(Config) ->
     application:ensure_all_started(crypto),
     application:ensure_all_started(ssl),
+    application:ensure_all_started(quic),
 
     %% Check if docker is available
     case os:find_executable("docker") of
@@ -283,21 +284,61 @@ create_tmp_dir() ->
     file:make_dir(TmpBase),
     TmpBase.
 
-%% @doc Build aioquic client command
+%% @doc Build aioquic client command using docker-compose service
 build_aioquic_cmd(Port, TmpDir, UrlPattern, ExtraArgs) ->
-    %% Format URL with port
-    Url = io_lib:format(UrlPattern, [Port, Port, Port]),
+    %% Count ~p placeholders and build port argument list
+    PlaceholderCount = count_format_placeholders(UrlPattern),
+    PortArgs = lists:duplicate(PlaceholderCount, Port),
 
-    %% Build command with docker
+    %% Format URL with ports
+    Url = io_lib:format(UrlPattern, PortArgs),
+
+    %% Find docker directory
+    DockerDir = find_docker_dir(),
+
+    %% Build command using docker compose run
+    %% Use the aioquic-h3-client service which has aioquic properly installed
     BaseCmd = io_lib:format(
-        "docker run --rm --network host "
+        "cd ~s && docker compose run --rm "
         "-v ~s:/tmp/output "
-        "python:3.11-slim "
-        "sh -c 'pip install -q aioquic && python -m aioquic.h3.client ~s "
-        "--insecure --output-dir /tmp/output ~s'",
-        [TmpDir, Url, string:join(ExtraArgs, " ")]
+        "aioquic-h3-client "
+        "~s --insecure --output-dir /tmp/output ~s 2>&1",
+        [DockerDir, TmpDir, Url, string:join(ExtraArgs, " ")]
     ),
     lists:flatten(BaseCmd).
+
+%% @doc Find the docker directory containing docker-compose.yml
+find_docker_dir() ->
+    Candidates = [
+        filename:join([code:lib_dir(quic), "..", "docker"]),
+        "docker",
+        "/Users/benoitc/Projects/erlang_quic/docker"
+    ],
+    find_docker_dir(Candidates).
+
+find_docker_dir([]) ->
+    ct:fail(docker_dir_not_found);
+find_docker_dir([Dir | Rest]) ->
+    AbsDir = filename:absname(Dir),
+    ComposeFile = filename:join(AbsDir, "docker-compose.yml"),
+    case filelib:is_file(ComposeFile) of
+        true -> AbsDir;
+        false -> find_docker_dir(Rest)
+    end.
+
+%% @doc Count format placeholders (~p, ~s, etc.) in a string
+count_format_placeholders(Str) ->
+    count_format_placeholders(Str, 0).
+
+count_format_placeholders([], Count) ->
+    Count;
+count_format_placeholders([$~, C | Rest], Count) when C >= $a, C =< $z; C >= $A, C =< $Z ->
+    count_format_placeholders(Rest, Count + 1);
+count_format_placeholders([$~, $~ | Rest], Count) ->
+    %% Escaped tilde, don't count
+    count_format_placeholders(Rest, Count);
+count_format_placeholders([_ | Rest], Count) ->
+    count_format_placeholders(Rest, Count).
 
 %% @doc Execute command with timeout
 exec_cmd(Cmd, Timeout) ->

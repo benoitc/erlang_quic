@@ -79,7 +79,12 @@
     validate_request_headers/2,
     calculate_field_section_size/1,
     validate_outbound_headers/2,
-    cleanup_blocked_streams_on_goaway/1
+    cleanup_blocked_streams_on_goaway/1,
+    process_push_stream_id/4,
+    update_stream_with_headers/4,
+    allocate_push_id/1,
+    validate_push_response_headers/1,
+    cleanup_push_stream/3
 ]).
 -endif.
 
@@ -1007,6 +1012,11 @@ process_control_frames(Data, State) ->
         %% RFC 9114 Section 7.2.4: duplicate settings use H3_SETTINGS_ERROR
         {error, {frame_error, settings, {duplicate_setting, _Key}}} ->
             {error, {connection_error, ?H3_SETTINGS_ERROR, <<"duplicate setting identifier">>}};
+        %% RFC 9114 Section 7.2.4.1: HTTP/2 settings forbidden in HTTP/3
+        {error, {frame_error, settings, {forbidden_setting, Id}}} ->
+            {error,
+                {connection_error, ?H3_SETTINGS_ERROR,
+                    iolist_to_binary(io_lib:format("forbidden HTTP/2 setting: 0x~.16B", [Id]))}};
         {error, {frame_error, FrameType, Reason}} ->
             %% Other frame errors use H3_FRAME_ERROR
             {error,
@@ -1207,17 +1217,22 @@ handle_push_stream_id(StreamId, Data, #state{uni_stream_buffers = Buffers} = Sta
 process_push_stream_id(
     StreamId,
     PushId,
-    Rest,
+    _Rest,
     #state{
         promised_pushes = Promised,
         received_pushes = Received,
         local_max_push_id = MaxPushId,
-        local_cancelled_pushes = Cancelled
+        local_cancelled_pushes = Cancelled,
+        uni_stream_buffers = Buffers
     } = State
 ) ->
     case validate_push_stream(PushId, MaxPushId, Promised, Received, Cancelled) of
         ok ->
-            correlate_push_stream(StreamId, PushId, Rest, State);
+            correlate_push_stream(StreamId, PushId, _Rest, State);
+        {error, cancelled} ->
+            %% RFC 9114 Section 7.2.3: Cancelled push - silently ignore stream
+            %% Just remove the buffer and continue without processing
+            {ok, State#state{uni_stream_buffers = maps:remove(StreamId, Buffers)}};
         {error, Reason} ->
             {error, Reason, State}
     end.
@@ -1236,10 +1251,11 @@ correlate_push_stream(
 ) ->
     case maps:find(PushId, Promised) of
         {ok, {ReqStreamId, Headers}} ->
-            %% Valid push stream - register and process remaining data
+            %% Valid push stream - register with frame state tracking
+            %% Push streams must receive HEADERS first, then DATA (RFC 9114 Section 4.6)
             State1 = State#state{
                 uni_stream_buffers = maps:remove(StreamId, Buffers),
-                received_pushes = maps:put(PushId, StreamId, Received),
+                received_pushes = maps:put(PushId, {StreamId, expecting_headers}, Received),
                 promised_pushes = maps:remove(PushId, Promised)
             },
             %% Notify owner that push stream started
@@ -1322,44 +1338,52 @@ process_push_frames(StreamId, PushId, Data, Fin, State) ->
 
 %% Handle individual frames on push stream
 %% RFC 9114 Section 4.6: Push streams only carry HEADERS and DATA
+%% HEADERS must come first, then DATA
 handle_push_frame(
     StreamId,
     PushId,
     {headers, HeaderBlock},
     Fin,
-    #state{qpack_decoder = Decoder, owner = Owner} = State
+    #state{qpack_decoder = Decoder, owner = Owner, received_pushes = Received} = State
 ) ->
-    case quic_qpack:decode(HeaderBlock, Decoder) of
-        {{ok, Headers}, Decoder1} ->
-            State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
-            %% Extract status from headers
-            Status = proplists:get_value(<<":status">>, Headers),
-            Owner ! {quic_h3, self(), {push_response, PushId, Status, Headers}},
+    %% Check frame sequencing - HEADERS must be first
+    case maps:get(PushId, Received, undefined) of
+        {StreamId, expecting_headers} ->
+            %% Valid - first HEADERS on push stream
+            handle_push_headers(StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, State);
+        {StreamId, expecting_data} ->
+            %% Duplicate HEADERS after we already received one
+            {error,
+                {connection_error, ?H3_FRAME_UNEXPECTED, <<"duplicate HEADERS on push stream">>}};
+        undefined ->
+            %% Push stream not correlated (should not happen in normal flow)
+            {error, {connection_error, ?H3_ID_ERROR, <<"unknown push stream">>}}
+    end;
+handle_push_frame(
+    StreamId,
+    PushId,
+    {data, Payload},
+    Fin,
+    #state{owner = Owner, received_pushes = Received} = State
+) ->
+    %% Check frame sequencing - DATA must come after HEADERS
+    case maps:get(PushId, Received, undefined) of
+        {StreamId, expecting_headers} ->
+            %% DATA before HEADERS - protocol error
+            {error,
+                {connection_error, ?H3_FRAME_UNEXPECTED, <<"DATA before HEADERS on push stream">>}};
+        {StreamId, expecting_data} ->
+            %% Valid - DATA after HEADERS
+            Owner ! {quic_h3, self(), {push_data, PushId, Payload, Fin}},
             case Fin of
                 true ->
-                    %% Push complete
                     Owner ! {quic_h3, self(), {push_complete, PushId}},
-                    cleanup_push_stream(PushId, StreamId, State1);
+                    cleanup_push_stream(PushId, StreamId, State);
                 false ->
-                    {ok, State1}
+                    {ok, State}
             end;
-        {{blocked, _RIC}, _Decoder1} ->
-            %% Push streams should not reference dynamic table entries
-            %% that haven't been acknowledged yet
-            {error,
-                {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED,
-                    <<"blocked push stream headers">>}};
-        {{error, Reason}, _Decoder1} ->
-            {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
-    end;
-handle_push_frame(_StreamId, PushId, {data, Payload}, Fin, #state{owner = Owner} = State) ->
-    Owner ! {quic_h3, self(), {push_data, PushId, Payload, Fin}},
-    case Fin of
-        true ->
-            Owner ! {quic_h3, self(), {push_complete, PushId}},
-            {ok, State};
-        false ->
-            {ok, State}
+        undefined ->
+            {error, {connection_error, ?H3_ID_ERROR, <<"unknown push stream">>}}
     end;
 %% Invalid frames on push stream
 handle_push_frame(_StreamId, _PushId, {settings, _}, _Fin, _State) ->
@@ -1376,18 +1400,90 @@ handle_push_frame(_StreamId, _PushId, {unknown, _Type, _Payload}, _Fin, State) -
     %% Unknown frame types are ignored per RFC 9114
     {ok, State}.
 
-%% Clean up push stream state after completion
+%% Helper to handle HEADERS frame on push stream
+handle_push_headers(
+    StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, #state{received_pushes = Received} = State
+) ->
+    case quic_qpack:decode(HeaderBlock, Decoder) of
+        {{ok, Headers}, Decoder1} ->
+            State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
+            %% Validate push response headers (RFC 9114 Section 4.6)
+            case validate_push_response_headers(Headers) of
+                {ok, Status} ->
+                    Owner ! {quic_h3, self(), {push_response, PushId, Status, Headers}},
+                    case Fin of
+                        true ->
+                            %% Push complete
+                            Owner ! {quic_h3, self(), {push_complete, PushId}},
+                            cleanup_push_stream(PushId, StreamId, State1);
+                        false ->
+                            %% Update state to expecting_data
+                            State2 = State1#state{
+                                received_pushes = Received#{PushId => {StreamId, expecting_data}}
+                            },
+                            {ok, State2}
+                    end;
+                {error, Reason} ->
+                    {error, {connection_error, ?H3_MESSAGE_ERROR, Reason}}
+            end;
+        {{blocked, _RIC}, _Decoder1} ->
+            %% Push streams should not reference dynamic table entries
+            %% that haven't been acknowledged yet
+            {error,
+                {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED,
+                    <<"blocked push stream headers">>}};
+        {{error, Reason}, _Decoder1} ->
+            {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
+    end.
+
+%% Validate push response headers (RFC 9114 Section 4.6)
+%% Push responses must have :status and must NOT have request pseudo-headers
+validate_push_response_headers(Headers) ->
+    case proplists:get_value(<<":status">>, Headers) of
+        undefined ->
+            {error, <<"missing :status in push response">>};
+        StatusBin ->
+            try binary_to_integer(StatusBin) of
+                Status when Status >= 100, Status < 600 ->
+                    %% Check for forbidden request pseudo-headers
+                    case has_request_pseudo_headers(Headers) of
+                        true ->
+                            {error, <<"request pseudo-header in push response">>};
+                        false ->
+                            {ok, Status}
+                    end;
+                _ ->
+                    {error, <<"invalid :status value">>}
+            catch
+                _:_ -> {error, <<"invalid :status value">>}
+            end
+    end.
+
+%% Check if headers contain request pseudo-headers (forbidden in responses)
+has_request_pseudo_headers(Headers) ->
+    lists:any(
+        fun({K, _}) ->
+            K =:= <<":method">> orelse K =:= <<":path">> orelse
+                K =:= <<":scheme">> orelse K =:= <<":authority">>
+        end,
+        Headers
+    ).
+
+%% Clean up push stream state after completion (client-side)
+%% Also cleans local_cancelled_pushes to prevent unbounded set growth
 cleanup_push_stream(
     PushId,
     StreamId,
     #state{
         received_pushes = Received,
-        stream_buffers = Buffers
+        stream_buffers = Buffers,
+        local_cancelled_pushes = LocalCancelled
     } = State
 ) ->
     {ok, State#state{
         received_pushes = maps:remove(PushId, Received),
-        stream_buffers = maps:remove(StreamId, Buffers)
+        stream_buffers = maps:remove(StreamId, Buffers),
+        local_cancelled_pushes = sets:del_element(PushId, LocalCancelled)
     }}.
 
 %% Handle CANCEL_PUSH from client (server-side)
@@ -1495,6 +1591,11 @@ process_request_frames(StreamId, Data, Fin, Stream, #state{quic_conn = QuicConn}
         %% RFC 9114 Section 7.2.4: duplicate settings use H3_SETTINGS_ERROR
         {error, {frame_error, settings, {duplicate_setting, _Key}}} ->
             {error, {connection_error, ?H3_SETTINGS_ERROR, <<"duplicate setting identifier">>}};
+        %% RFC 9114 Section 7.2.4.1: HTTP/2 settings forbidden in HTTP/3
+        {error, {frame_error, settings, {forbidden_setting, Id}}} ->
+            {error,
+                {connection_error, ?H3_SETTINGS_ERROR,
+                    iolist_to_binary(io_lib:format("forbidden HTTP/2 setting: 0x~.16B", [Id]))}};
         {error, {frame_error, FrameType, Reason}} ->
             %% Other frame errors use H3_FRAME_ERROR
             {error,
@@ -1794,6 +1895,8 @@ notify_headers_received(StreamId, Headers, Stream, Owner, client) ->
 %% Returns {ok, Stream} | {error, Reason}
 update_stream_with_headers(Headers, Stream, Role, State) ->
     try
+        %% RFC 9110 Section 5.3: Check for duplicate header names first
+        check_duplicate_headers(Headers),
         Stream1 = do_update_stream_with_headers(
             Headers, Stream#h3_stream{headers = Headers}, false
         ),
@@ -1805,6 +1908,28 @@ update_stream_with_headers(Headers, Stream, Role, State) ->
         {ok, Stream1}
     catch
         throw:{header_error, Reason} -> {error, Reason}
+    end.
+
+%% RFC 9110 Section 5.3: Check for duplicate header names
+%% Pseudo-headers: only one of each allowed
+%% Regular headers: only set-cookie can be duplicated
+check_duplicate_headers(Headers) ->
+    check_duplicate_headers(Headers, #{}).
+
+check_duplicate_headers([], _Seen) ->
+    ok;
+check_duplicate_headers([{Name, _Value} | Rest], Seen) ->
+    case maps:is_key(Name, Seen) of
+        true ->
+            %% set-cookie is allowed to have multiple values (RFC 9110 Section 5.3)
+            case Name of
+                <<"set-cookie">> ->
+                    check_duplicate_headers(Rest, Seen);
+                _ ->
+                    throw({header_error, {duplicate_header, Name}})
+            end;
+        false ->
+            check_duplicate_headers(Rest, Seen#{Name => true})
     end.
 
 %% SeenRegular tracks whether we've seen non-pseudo headers (for ordering check)
@@ -2230,16 +2355,22 @@ find_handler_by_ref_iter(Ref, Iter) ->
 
 %% Notify stream data to appropriate recipient
 %% If a handler is registered, send directly to handler.
-%% If no handler registered, buffer the data for when handler registers.
-%% This prevents data loss in the race between handler spawn and registration.
-notify_stream_data(StreamId, Data, Fin, #state{stream_handlers = Handlers} = State) ->
+%% If no handler registered and role is client, send to owner (default client behavior).
+%% If no handler registered and role is server, buffer the data for when handler registers.
+notify_stream_data(
+    StreamId, Data, Fin, #state{stream_handlers = Handlers, owner = Owner, role = Role} = State
+) ->
     Conn = self(),
     case maps:find(StreamId, Handlers) of
         {ok, {HandlerPid, _MonRef}} ->
             HandlerPid ! {quic_h3, Conn, {data, StreamId, Data, Fin}},
             State;
+        error when Role =:= client ->
+            %% Client mode: send data to owner by default (typical client usage pattern)
+            Owner ! {quic_h3, Conn, {data, StreamId, Data, Fin}},
+            State;
         error ->
-            %% No handler registered - buffer data for later retrieval
+            %% Server mode: buffer data for later retrieval when handler registers
             buffer_stream_data(StreamId, Data, Fin, State)
     end.
 
@@ -2274,41 +2405,51 @@ buffer_stream_data(
 %%====================================================================
 
 %% Initiate a server push
-%% 1. Allocate push ID
+%% 1. Allocate push ID (skipping cancelled IDs)
 %% 2. Send PUSH_PROMISE on request stream
 %% 3. Open push stream (unidirectional)
 %% 4. Return push ID for subsequent data sending
-do_push(
-    RequestStreamId,
-    Headers,
-    #state{
-        max_push_id = MaxPushId,
-        next_push_id = NextPushId,
-        cancelled_pushes = Cancelled,
-        streams = Streams
-    } = State
-) ->
-    %% Check if push is enabled
-    case MaxPushId of
-        undefined ->
-            {error, push_not_enabled};
-        _ when NextPushId > MaxPushId ->
-            {error, max_push_id_exceeded};
-        _ ->
-            %% Check if this push ID was cancelled
-            case sets:is_element(NextPushId, Cancelled) of
-                true ->
-                    %% Skip cancelled push ID
-                    {error, push_cancelled};
+do_push(RequestStreamId, Headers, #state{streams = Streams} = State) ->
+    %% First allocate a push ID (skipping cancelled ones)
+    case allocate_push_id(State) of
+        {ok, PushId, State1} ->
+            %% Verify request stream exists
+            case maps:is_key(RequestStreamId, Streams) of
                 false ->
-                    %% Verify request stream exists
-                    case maps:is_key(RequestStreamId, Streams) of
-                        false ->
-                            {error, unknown_request_stream};
-                        true ->
-                            do_push_internal(RequestStreamId, Headers, NextPushId, State)
-                    end
-            end
+                    {error, unknown_request_stream};
+                true ->
+                    do_push_internal(RequestStreamId, Headers, PushId, State1)
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Allocate the next available push ID, skipping cancelled ones
+%% Returns {ok, PushId, State} | {error, Reason}
+allocate_push_id(#state{max_push_id = undefined}) ->
+    {error, push_not_enabled};
+allocate_push_id(#state{next_push_id = Next, max_push_id = Max}) when Next > Max ->
+    {error, max_push_id_exceeded};
+allocate_push_id(
+    #state{next_push_id = Next, max_push_id = Max, cancelled_pushes = Cancelled} = State
+) ->
+    case sets:is_element(Next, Cancelled) of
+        true ->
+            %% Skip cancelled ID, try next
+            %% Remove from cancelled set since we're skipping it
+            State1 = State#state{
+                next_push_id = Next + 1,
+                cancelled_pushes = sets:del_element(Next, Cancelled)
+            },
+            %% Recursively find next available (but check bounds)
+            case Next + 1 > Max of
+                true ->
+                    {error, max_push_id_exceeded};
+                false ->
+                    allocate_push_id(State1)
+            end;
+        false ->
+            {ok, Next, State#state{next_push_id = Next + 1}}
     end.
 
 do_push_internal(
@@ -2318,8 +2459,7 @@ do_push_internal(
     #state{
         quic_conn = QuicConn,
         qpack_encoder = Encoder,
-        push_streams = PushStreams,
-        next_push_id = NextPushId
+        push_streams = PushStreams
     } = State
 ) ->
     %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
@@ -2335,11 +2475,11 @@ do_push_internal(
             %% Send PUSH_PROMISE on request stream
             PushPromiseFrame = quic_h3_frame:encode_push_promise(PushId, Encoded),
             do_push_send(
-                QuicConn, RequestStreamId, PushPromiseFrame, PushId, NextPushId, PushStreams, State2
+                QuicConn, RequestStreamId, PushPromiseFrame, PushId, PushStreams, State2
             )
     end.
 
-do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, PushId, NextPushId, PushStreams, State) ->
+do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, PushId, PushStreams, State) ->
     case quic:send_data(QuicConn, RequestStreamId, PushPromiseFrame, false) of
         ok ->
             %% Open push stream (unidirectional, server-initiated)
@@ -2358,8 +2498,8 @@ do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, PushId, NextPushId, Pu
                                 state = open,
                                 frame_state = expecting_headers
                             },
+                            %% next_push_id already incremented by allocate_push_id
                             State3 = State#state{
-                                next_push_id = NextPushId + 1,
                                 push_streams = maps:put(PushId, {PushStreamId, Stream}, PushStreams)
                             },
                             {ok, PushId, State3};
@@ -2423,6 +2563,7 @@ do_send_push_data(
     Fin,
     #state{
         push_streams = PushStreams,
+        cancelled_pushes = Cancelled,
         quic_conn = QuicConn
     } = State
 ) ->
@@ -2434,8 +2575,10 @@ do_send_push_data(
                     case Fin of
                         true ->
                             %% Push complete - remove from tracking
+                            %% Also clean cancelled_pushes to prevent unbounded set growth
                             {ok, State#state{
-                                push_streams = maps:remove(PushId, PushStreams)
+                                push_streams = maps:remove(PushId, PushStreams),
+                                cancelled_pushes = sets:del_element(PushId, Cancelled)
                             }};
                         false ->
                             Stream1 = Stream#h3_stream{

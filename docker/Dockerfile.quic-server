@@ -6,9 +6,10 @@ WORKDIR /app
 COPY server/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy server code
+# Copy server and client code
 COPY server/quic_server.py .
 COPY server/quic_h3_server.py .
+COPY server/http3_client.py .
 
 # Expose QUIC ports
 EXPOSE 4433/udp

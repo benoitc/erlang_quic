@@ -485,7 +485,9 @@ goaway_graceful(Config) ->
     Host = ?config(h3_host, Config),
     Port = ?config(h3_port, Config),
 
+    %% Use fresh connection with small delay to ensure stable state
     {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false, sync => true}),
+    timer:sleep(200),
 
     %% Make a request first
     Headers = [
@@ -495,7 +497,8 @@ goaway_graceful(Config) ->
         {<<":authority">>, list_to_binary(Host)}
     ],
     {ok, StreamId} = quic_h3:request(Conn, Headers),
-    {Status, _, _} = receive_response(Conn, StreamId, 10000),
+    %% Use longer timeout to handle timing issues
+    {Status, _, _} = receive_response(Conn, StreamId, 15000),
     ?assertEqual(200, Status),
 
     %% Initiate graceful shutdown

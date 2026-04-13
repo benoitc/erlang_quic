@@ -638,6 +638,7 @@ stream_id_parity_client_accepts_odd_test() ->
 
 %% Test that data is buffered when no handler is registered
 data_buffered_when_no_handler_test() ->
+    %% In server mode, data is buffered when no handler is registered
     Stream = #h3_stream{
         id = 0,
         frame_state = expecting_data,
@@ -646,10 +647,11 @@ data_buffered_when_no_handler_test() ->
         body = <<>>
     },
     State = make_test_state(#{
+        role => server,
         streams => #{0 => Stream},
         stream_handlers => #{}
     }),
-    %% Send data - should be buffered, not sent to owner
+    %% Send data - should be buffered in server mode
     {ok, _Stream2, State2} = quic_h3_connection:handle_request_frame(
         0, {data, <<"hello">>}, false, Stream, State
     ),
@@ -683,8 +685,9 @@ data_sent_to_handler_when_registered_test() ->
         ?assert(false)
     end.
 
-%% Test that multiple buffered chunks are preserved in order
+%% Test that multiple buffered chunks are preserved in order (server mode)
 multiple_chunks_buffered_in_order_test() ->
+    %% In server mode, data is buffered when no handler is registered
     Stream = #h3_stream{
         id = 0,
         frame_state = expecting_data,
@@ -693,6 +696,7 @@ multiple_chunks_buffered_in_order_test() ->
         body = <<>>
     },
     State0 = make_test_state(#{
+        role => server,
         streams => #{0 => Stream},
         stream_handlers => #{}
     }),
@@ -710,6 +714,79 @@ multiple_chunks_buffered_in_order_test() ->
     ?assertEqual([{<<"chunk2">>, true}, {<<"chunk1">>, false}], Chunks),
     ?assertEqual(12, Size),
     ?assertEqual(true, HadFin).
+
+%%====================================================================
+%% Duplicate Header Name Tests (RFC 9110 Section 5.3)
+%%====================================================================
+
+%% Duplicate pseudo-headers must be rejected
+duplicate_method_pseudo_header_rejected_test() ->
+    Headers = [{<<":method">>, <<"GET">>}, {<<":method">>, <<"POST">>}],
+    Stream = #h3_stream{id = 0},
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State),
+    ?assertMatch({error, {duplicate_header, <<":method">>}}, Result).
+
+duplicate_path_pseudo_header_rejected_test() ->
+    Headers = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>}, {<<":path">>, <<"/other">>}],
+    Stream = #h3_stream{id = 0},
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State),
+    ?assertMatch({error, {duplicate_header, <<":path">>}}, Result).
+
+duplicate_status_pseudo_header_rejected_test() ->
+    Headers = [{<<":status">>, <<"200">>}, {<<":status">>, <<"404">>}],
+    Stream = #h3_stream{id = 0},
+    State = make_test_state(#{role => client}),
+    Result = quic_h3_connection:update_stream_with_headers(Headers, Stream, client, State),
+    ?assertMatch({error, {duplicate_header, <<":status">>}}, Result).
+
+%% Duplicate regular headers must be rejected
+duplicate_regular_header_rejected_test() ->
+    Headers = [
+        {<<":status">>, <<"200">>},
+        {<<"x-custom">>, <<"value1">>},
+        {<<"x-custom">>, <<"value2">>}
+    ],
+    Stream = #h3_stream{id = 0},
+    State = make_test_state(#{role => client}),
+    Result = quic_h3_connection:update_stream_with_headers(Headers, Stream, client, State),
+    ?assertMatch({error, {duplicate_header, <<"x-custom">>}}, Result).
+
+duplicate_content_type_rejected_test() ->
+    Headers = [
+        {<<":status">>, <<"200">>},
+        {<<"content-type">>, <<"text/html">>},
+        {<<"content-type">>, <<"application/json">>}
+    ],
+    Stream = #h3_stream{id = 0},
+    State = make_test_state(#{role => client}),
+    Result = quic_h3_connection:update_stream_with_headers(Headers, Stream, client, State),
+    ?assertMatch({error, {duplicate_header, <<"content-type">>}}, Result).
+
+%% set-cookie is explicitly allowed to have multiple values
+set_cookie_duplicates_allowed_test() ->
+    Headers = [
+        {<<":status">>, <<"200">>},
+        {<<"set-cookie">>, <<"session=abc; Path=/">>},
+        {<<"set-cookie">>, <<"tracking=xyz; Path=/">>}
+    ],
+    Stream = #h3_stream{id = 0},
+    State = make_test_state(#{role => client}),
+    Result = quic_h3_connection:update_stream_with_headers(Headers, Stream, client, State),
+    ?assertMatch({ok, _}, Result).
+
+%% Valid headers without duplicates should pass
+no_duplicates_accepted_test() ->
+    Headers = [
+        {<<":status">>, <<"200">>},
+        {<<"content-type">>, <<"text/html">>},
+        {<<"content-length">>, <<"100">>}
+    ],
+    Stream = #h3_stream{id = 0},
+    State = make_test_state(#{role => client}),
+    Result = quic_h3_connection:update_stream_with_headers(Headers, Stream, client, State),
+    ?assertMatch({ok, _}, Result).
 
 %%====================================================================
 %% Helper Functions

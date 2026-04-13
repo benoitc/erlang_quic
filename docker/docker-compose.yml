@@ -81,7 +81,7 @@ services:
     volumes:
       - ../certs:/certs:ro
       - ./logs:/logs
-    entrypoint: ["python", "-m", "aioquic.h3.client"]
+    entrypoint: ["python", "http3_client.py"]
     network_mode: host
     profiles:
       - tools
