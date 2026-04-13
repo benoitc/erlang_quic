@@ -1242,6 +1242,22 @@ priority_update_push_client_ignored_test() ->
     ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_push_frame(Payload, State)).
 
 %%====================================================================
+%% Theme G: PRIORITY_UPDATE strict frame parsing (RFC 9218 §7)
+%%====================================================================
+
+%% Empty PRIORITY_UPDATE payload (no varint) is a frame-level error.
+priority_update_empty_payload_rejected_test() ->
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:handle_priority_update_frame(<<>>, State),
+    ?assertMatch({error, {connection_error, ?H3_FRAME_ERROR, _}}, Result).
+
+%% Well-formed PRIORITY_UPDATE for an unknown stream is silently ignored.
+priority_update_unknown_stream_ignored_test() ->
+    State = make_test_state(#{role => server}),
+    Payload = <<(quic_varint:encode(99))/binary, "u=3">>,
+    ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_frame(Payload, State)).
+
+%%====================================================================
 %% Theme F: Extended CONNECT (RFC 9220)
 %%====================================================================
 

@@ -3466,8 +3466,8 @@ apply_stream_priority(StreamId, Stream, #state{quic_conn = QuicConn}) ->
 %% Handle PRIORITY_UPDATE frame payload (RFC 9218 Section 7)
 %% Payload format: Prioritized Element ID (varint) + Priority Field Value (rest)
 handle_priority_update_frame(Payload, #state{streams = Streams} = State) ->
-    try quic_varint:decode(Payload) of
-        {StreamId, PriorityFieldValue} ->
+    case decode_priority_update_payload(Payload) of
+        {ok, StreamId, PriorityFieldValue} ->
             case maps:find(StreamId, Streams) of
                 {ok, Stream} ->
                     {Urgency, Incremental} = parse_priority_field_value(PriorityFieldValue),
@@ -3475,19 +3475,28 @@ handle_priority_update_frame(Payload, #state{streams = Streams} = State) ->
                     apply_stream_priority(StreamId, Stream1, State),
                     {ok, State#state{streams = maps:put(StreamId, Stream1, Streams)}};
                 error ->
-                    %% Stream doesn't exist - ignore per RFC 9218
+                    %% Stream doesn't exist - ignore per RFC 9218 §7
                     {ok, State}
-            end
+            end;
+        {error, Reason} ->
+            {error, {connection_error, ?H3_FRAME_ERROR, Reason}}
+    end.
+
+%% RFC 9218 §7: PRIORITY_UPDATE payload = Prioritized Element ID (varint) +
+%% Priority Field Value (bytes). The varint MUST decode successfully; the
+%% value bytes are forgiving (parsed as Structured Fields per §5).
+decode_priority_update_payload(Payload) ->
+    try quic_varint:decode(Payload) of
+        {ElementId, FieldValue} -> {ok, ElementId, FieldValue}
     catch
-        %% Malformed frame - ignore
-        _:_ -> {ok, State}
+        _:_ -> {error, <<"malformed PRIORITY_UPDATE payload">>}
     end.
 
 %% RFC 9218 §7.2: PRIORITY_UPDATE targeting a push stream. Server-side only;
 %% client sends it to reprioritize a push stream.
 handle_priority_update_push_frame(Payload, #state{role = server, push_streams = Pushes} = State) ->
-    try quic_varint:decode(Payload) of
-        {PushId, PriorityFieldValue} ->
+    case decode_priority_update_payload(Payload) of
+        {ok, PushId, PriorityFieldValue} ->
             case maps:find(PushId, Pushes) of
                 {ok, {StreamId, Stream}} ->
                     {Urgency, Incremental} = parse_priority_field_value(PriorityFieldValue),
@@ -3497,9 +3506,9 @@ handle_priority_update_push_frame(Payload, #state{role = server, push_streams = 
                 error ->
                     %% Push ID unknown - ignore per RFC 9218
                     {ok, State}
-            end
-    catch
-        _:_ -> {ok, State}
+            end;
+        {error, Reason} ->
+            {error, {connection_error, ?H3_FRAME_ERROR, Reason}}
     end;
 handle_priority_update_push_frame(_Payload, #state{role = client} = State) ->
     %% RFC 9218: client should not receive PRIORITY_UPDATE for push; ignore.
