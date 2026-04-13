@@ -170,6 +170,9 @@ decode_type_and_length(Data) ->
 %% Internal: decode frame payload given type and length
 -spec decode_with_payload(non_neg_integer(), non_neg_integer(), binary()) ->
     {ok, frame(), binary()} | {error, term()} | {more, non_neg_integer()}.
+decode_with_payload(_Type, Length, _Data) when Length > ?H3_MAX_FRAME_SIZE ->
+    %% RFC 9114 §7.1 / §7.2: bound payload size to avoid resource exhaustion.
+    {error, {frame_error, oversized, Length}};
 decode_with_payload(Type, Length, Data) when byte_size(Data) >= Length ->
     <<Payload:Length/binary, Rest/binary>> = Data,
     case decode_frame_payload(Type, Payload) of
@@ -313,10 +316,17 @@ decode_settings_pairs(Data, Acc) ->
             throw({forbidden_setting, Id});
         false ->
             Key = id_to_setting(Id),
-            %% RFC 9114 Section 7.2.4: duplicate setting identifiers MUST be treated as error
-            case maps:is_key(Key, Acc) of
-                true -> throw({duplicate_setting, Key});
-                false -> decode_settings_pairs(Rest2, Acc#{Key => Value})
+            %% RFC 9114 §7.2.4.1: unknown setting IDs (those not mapped to
+            %% a known atom) MUST be ignored. Drop them from the result map
+            %% so they cannot influence later peer-settings application.
+            case is_atom(Key) of
+                true ->
+                    case maps:is_key(Key, Acc) of
+                        true -> throw({duplicate_setting, Key});
+                        false -> decode_settings_pairs(Rest2, Acc#{Key => Value})
+                    end;
+                false ->
+                    decode_settings_pairs(Rest2, Acc)
             end
     end.
 

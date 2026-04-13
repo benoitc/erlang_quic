@@ -382,16 +382,16 @@ settings_connect_protocol_disabled_test() ->
     {ok, {settings, Decoded}, <<>>} = quic_h3_frame:decode(Encoded),
     ?assertEqual(0, maps:get(enable_connect_protocol, Decoded)).
 
-%% Test settings with GREASE values (reserved settings should be preserved)
-settings_with_grease_roundtrip_test() ->
-    %% GREASE setting: 0x1f * N + 0x21
-
-    %% N=0
+%% RFC 9114 §7.2.4.1: unknown setting identifiers (including grease values
+%% per §7.2.8) MUST be ignored on the receiving side. Encoding still emits
+%% them; decoding drops them from the result map.
+settings_grease_dropped_on_decode_test() ->
+    %% N=0 grease setting (0x1f*0 + 0x21)
     GREASEId = 16#21,
     Settings = #{GREASEId => 12345},
     Encoded = quic_h3_frame:encode_settings(Settings),
     {ok, {settings, Decoded}, <<>>} = quic_h3_frame:decode(Encoded),
-    ?assertEqual(12345, maps:get(GREASEId, Decoded)).
+    ?assertNot(maps:is_key(GREASEId, Decoded)).
 
 %%====================================================================
 %% Edge Case Tests (inspired by quiche)

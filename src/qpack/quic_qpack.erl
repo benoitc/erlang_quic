@@ -909,6 +909,11 @@ decode_prefixed_int(Data, PrefixBits) ->
     {non_neg_integer(), binary()}.
 decode_multi_byte_int(<<>>, _Acc, _Shift) ->
     throw(incomplete);
+decode_multi_byte_int(_Data, _Acc, Shift) when Shift > 56 ->
+    %% RFC 9204 / RFC 7541 §5.1 prefixed integers are unbounded in spec but
+    %% bounded in practice; cap at 8 continuation bytes (>= 2^63) to prevent
+    %% resource exhaustion via crafted continuation chains.
+    throw({qpack_decompression_failed, prefixed_int_too_long});
 decode_multi_byte_int(<<Byte, Rest/binary>>, Acc, Shift) ->
     NewAcc = Acc + ((Byte band 127) bsl Shift),
     case Byte band 128 of

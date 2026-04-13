@@ -60,6 +60,15 @@
 -define(H3_DEFAULT_QPACK_BLOCKED_STREAMS, 0).
 
 %%====================================================================
+%% DoS-bounded ceilings (RFC 9114 §7.1 + §7.2.4 reasonable limits)
+%%====================================================================
+
+%% Maximum accepted frame payload size. Anything larger is rejected with
+%% H3_EXCESSIVE_LOAD before allocation, to prevent unbounded memory use
+%% when peers craft pathological Length varints (up to 2^62 - 1).
+-define(H3_MAX_FRAME_SIZE, 16#100000).
+
+%%====================================================================
 %% QPACK Error Codes (RFC 9204 Section 8.2)
 %%====================================================================
 

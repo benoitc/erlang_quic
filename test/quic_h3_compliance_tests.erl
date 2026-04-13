@@ -1242,6 +1242,17 @@ priority_update_push_client_ignored_test() ->
     ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_push_frame(Payload, State)).
 
 %%====================================================================
+%% Theme D: DoS hardening
+%%====================================================================
+
+oversized_frame_rejected_test() ->
+    %% Build a frame header claiming 2 MiB payload (> H3_MAX_FRAME_SIZE).
+    Type = quic_varint:encode(0),
+    Len = quic_varint:encode(?H3_MAX_FRAME_SIZE + 1),
+    Encoded = <<Type/binary, Len/binary>>,
+    ?assertMatch({error, {frame_error, oversized, _}}, quic_h3_frame:decode(Encoded)).
+
+%%====================================================================
 %% Theme C: Header / trailer / path / status symmetry
 %%====================================================================
 

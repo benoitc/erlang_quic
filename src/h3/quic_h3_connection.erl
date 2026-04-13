@@ -3385,11 +3385,12 @@ apply_peer_settings(Settings, #state{qpack_encoder = Encoder} = State) ->
     MaxCapacity = maps:get(qpack_max_table_capacity, Settings, 0),
     Encoder1 = quic_qpack:set_dynamic_capacity(MaxCapacity, Encoder),
 
-    %% 2. Max field section size - store for header block validation
-    MaxFieldSectionSize = maps:get(
-        max_field_section_size,
-        Settings,
-        ?H3_DEFAULT_MAX_FIELD_SECTION_SIZE
+    %% 2. Max field section size - store for header block validation. Cap
+    %% the peer-advertised value at our local frame ceiling so an attacker
+    %% cannot inflate per-block memory budgets via SETTINGS.
+    MaxFieldSectionSize = min(
+        maps:get(max_field_section_size, Settings, ?H3_DEFAULT_MAX_FIELD_SECTION_SIZE),
+        ?H3_MAX_FRAME_SIZE
     ),
 
     %% 3. QPACK blocked streams limit
