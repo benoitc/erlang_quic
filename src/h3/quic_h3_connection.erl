@@ -184,10 +184,17 @@
     local_max_push_id :: non_neg_integer() | undefined,
     %% promised_pushes: Push promises received - maps PushId to {RequestStreamId, Headers}
     promised_pushes = #{} :: #{non_neg_integer() => {non_neg_integer(), [{binary(), binary()}]}},
-    %% received_pushes: Active push streams from server - maps PushId to StreamId
-    received_pushes = #{} :: #{non_neg_integer() => non_neg_integer()},
+    %% received_pushes: Active push streams from server - maps PushId to a
+    %% full #h3_stream{} so content-length / body / frame_state tracking
+    %% matches regular request streams (RFC 9114 §4.1.2, §4.6).
+    received_pushes = #{} :: #{non_neg_integer() => #h3_stream{}},
     %% local_cancelled_pushes: Set of push IDs we've cancelled
     local_cancelled_pushes = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
+    %% last_accepted_push_id: highest push ID we have validated a
+    %% PUSH_PROMISE for. Used on client-sent GOAWAY to compute the
+    %% first-refused push ID monotonically, independent of whether the
+    %% entry is still in promised_pushes or received_pushes.
+    last_accepted_push_id :: non_neg_integer() | undefined,
 
     %% Per-stream handler registration (Option A for body data routing)
     %% Maps StreamId -> {Pid, MonitorRef} for streams with registered handlers
@@ -923,23 +930,18 @@ classify_stream_type(StreamId, _State) ->
         2 -> unknown
     end.
 
-%% Find push ID by stream ID in received_pushes map
+%% Find push ID by stream ID in received_pushes map (values are #h3_stream{}).
 find_push_by_stream_id(StreamId, Received) ->
-    case
-        maps:fold(
-            fun(PushId, SId, Acc) ->
-                case SId of
-                    StreamId -> {ok, PushId};
-                    _ -> Acc
-                end
-            end,
-            error,
-            Received
-        )
-    of
-        {ok, PushId} -> {ok, PushId};
-        error -> error
-    end.
+    maps:fold(
+        fun
+            (PushId, #h3_stream{id = SId}, _Acc) when SId =:= StreamId ->
+                {ok, PushId};
+            (_, _, Acc) ->
+                Acc
+        end,
+        error,
+        Received
+    ).
 
 handle_uni_stream_type(StreamId, Data, #state{uni_stream_buffers = Buffers} = State) ->
     Buffer = maps:get(StreamId, Buffers, <<>>),
@@ -1275,9 +1277,15 @@ correlate_push_stream(
         {ok, {ReqStreamId, Headers}} ->
             %% Valid push stream - register with frame state tracking
             %% Push streams must receive HEADERS first, then DATA (RFC 9114 Section 4.6)
+            PushStream = #h3_stream{
+                id = StreamId,
+                type = push,
+                state = open,
+                frame_state = expecting_headers
+            },
             State1 = State#state{
                 uni_stream_buffers = maps:remove(StreamId, Buffers),
-                received_pushes = maps:put(PushId, {StreamId, expecting_headers}, Received),
+                received_pushes = maps:put(PushId, PushStream, Received),
                 promised_pushes = maps:remove(PushId, Promised)
             },
             %% Notify owner that push stream started
@@ -1374,13 +1382,15 @@ handle_push_frame(
     #state{qpack_decoder = Decoder, owner = Owner, received_pushes = Received} = State
 ) ->
     case maps:get(PushId, Received, undefined) of
-        {StreamId, expecting_headers} ->
+        #h3_stream{id = StreamId, frame_state = expecting_headers} ->
             handle_push_headers(StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, State);
-        {StreamId, expecting_data} ->
+        #h3_stream{id = StreamId, frame_state = expecting_data} = Stream ->
             %% Only trailers (HEADERS with FIN) are allowed once body has started
             case Fin of
                 true ->
-                    handle_push_trailers(StreamId, PushId, HeaderBlock, Decoder, Owner, State);
+                    handle_push_trailers(
+                        StreamId, PushId, HeaderBlock, Decoder, Owner, Stream, State
+                    );
                 false ->
                     {error,
                         {connection_error, ?H3_FRAME_UNEXPECTED,
@@ -1397,22 +1407,13 @@ handle_push_frame(
     Fin,
     #state{owner = Owner, received_pushes = Received} = State
 ) ->
-    %% Check frame sequencing - DATA must come after HEADERS
     case maps:get(PushId, Received, undefined) of
-        {StreamId, expecting_headers} ->
+        #h3_stream{id = StreamId, frame_state = expecting_headers} ->
             %% DATA before HEADERS - protocol error
             {error,
                 {connection_error, ?H3_FRAME_UNEXPECTED, <<"DATA before HEADERS on push stream">>}};
-        {StreamId, expecting_data} ->
-            %% Valid - DATA after HEADERS
-            Owner ! {quic_h3, self(), {push_data, PushId, Payload, Fin}},
-            case Fin of
-                true ->
-                    Owner ! {quic_h3, self(), {push_complete, PushId}},
-                    cleanup_push_stream(PushId, StreamId, State);
-                false ->
-                    {ok, State}
-            end;
+        #h3_stream{id = StreamId, frame_state = expecting_data} = Stream ->
+            apply_push_data(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State);
         undefined ->
             {error, {connection_error, ?H3_ID_ERROR, <<"unknown push stream">>}}
     end;
@@ -1464,41 +1465,122 @@ validate_and_deliver_push_response(StreamId, PushId, Headers, Fin, Owner, Receiv
     case validate_push_response_headers(Headers) of
         {ok, Status} ->
             Owner ! {quic_h3, self(), {push_response, PushId, Status, Headers}},
-            deliver_push_response_finalize(StreamId, PushId, Status, Fin, Owner, Received, State);
+            deliver_push_response_finalize(
+                StreamId, PushId, Status, Headers, Fin, Owner, Received, State
+            );
         {error, Reason} ->
             {error, {connection_error, ?H3_MESSAGE_ERROR, Reason}}
     end.
 
-deliver_push_response_finalize(StreamId, PushId, _Status, true, Owner, _Received, State) ->
+deliver_push_response_finalize(StreamId, PushId, _Status, _Headers, true, Owner, _Received, State) ->
     Owner ! {quic_h3, self(), {push_complete, PushId}},
     cleanup_push_stream(PushId, StreamId, State);
-deliver_push_response_finalize(StreamId, PushId, Status, false, _Owner, Received, State) when
+deliver_push_response_finalize(
+    StreamId, PushId, Status, _Headers, false, _Owner, Received, State
+) when
     is_integer(Status), Status >= 100, Status < 200
 ->
-    %% Interim response - keep expecting_headers so the next HEADERS frame is
-    %% handled as either another interim or the final response.
-    {ok, State#state{received_pushes = Received#{PushId => {StreamId, expecting_headers}}}};
-deliver_push_response_finalize(StreamId, PushId, _Status, false, _Owner, Received, State) ->
-    {ok, State#state{received_pushes = Received#{PushId => {StreamId, expecting_data}}}}.
+    %% Interim response - keep expecting_headers for another interim or final.
+    Stream = push_stream_with_state(StreamId, Received, PushId, expecting_headers),
+    Stream1 = Stream#h3_stream{status = Status},
+    {ok, State#state{received_pushes = Received#{PushId => Stream1}}};
+deliver_push_response_finalize(
+    StreamId, PushId, Status, Headers, false, _Owner, Received, State
+) ->
+    Stream = push_stream_with_state(StreamId, Received, PushId, expecting_data),
+    CL = extract_content_length(Headers),
+    Stream1 = Stream#h3_stream{
+        status = Status,
+        headers = Headers,
+        content_length = CL
+    },
+    {ok, State#state{received_pushes = Received#{PushId => Stream1}}}.
 
-%% Handle trailers on a push stream (HEADERS with FIN after DATA).
-handle_push_trailers(StreamId, PushId, HeaderBlock, Decoder, Owner, State) ->
+push_stream_with_state(StreamId, Received, PushId, FrameState) ->
+    Existing =
+        case maps:find(PushId, Received) of
+            {ok, S} -> S;
+            error -> #h3_stream{id = StreamId, type = push, state = open}
+        end,
+    Existing#h3_stream{frame_state = FrameState}.
+
+extract_content_length(Headers) ->
+    case lists:keyfind(<<"content-length">>, 1, Headers) of
+        {_, Value} ->
+            try binary_to_integer(Value) of
+                N when N >= 0 -> N;
+                _ -> undefined
+            catch
+                _:_ -> undefined
+            end;
+        false ->
+            undefined
+    end.
+
+%% RFC 9114 §4.1.2: push DATA must respect content-length if advertised.
+apply_push_data(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State) ->
+    Received0 = Received,
+    Size = byte_size(Payload),
+    NewReceived = Stream#h3_stream.body_received + Size,
+    CL = Stream#h3_stream.content_length,
+    case cl_data_check(CL, NewReceived, Fin) of
+        ok ->
+            Owner ! {quic_h3, self(), {push_data, PushId, Payload, Fin}},
+            Stream1 = Stream#h3_stream{body_received = NewReceived},
+            case Fin of
+                true ->
+                    Owner ! {quic_h3, self(), {push_complete, PushId}},
+                    cleanup_push_stream(PushId, StreamId, State);
+                false ->
+                    {ok, State#state{received_pushes = Received0#{PushId => Stream1}}}
+            end;
+        {error, Code} ->
+            {error, {connection_error, Code, <<"push content-length violated">>}}
+    end.
+
+cl_data_check(undefined, _Received, _Fin) ->
+    ok;
+cl_data_check(CL, Received, _Fin) when Received > CL ->
+    {error, ?H3_MESSAGE_ERROR};
+cl_data_check(CL, Received, true) when Received < CL ->
+    {error, ?H3_MESSAGE_ERROR};
+cl_data_check(_, _, _) ->
+    ok.
+
+%% Handle trailers on a push stream. Applies the same validation as regular
+%% stream trailers (§4.1.2): no pseudo-headers, no forbidden connection-
+%% specific fields, Content-Length matches response headers, body size
+%% agrees with advertised content-length.
+handle_push_trailers(StreamId, PushId, HeaderBlock, Decoder, Owner, Stream, State) ->
     case quic_qpack:decode(HeaderBlock, Decoder) of
         {{ok, Trailers}, Decoder1} ->
             State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
-            %% Validate trailers: no pseudo-headers, no forbidden fields
             try
                 validate_field_names_and_values(Trailers),
-                case has_pseudo_header(Trailers) of
-                    true -> throw({header_error, pseudo_header_in_trailer});
-                    false -> ok
+                case validate_trailer_headers(Trailers, Stream) of
+                    ok -> ok;
+                    {error, Reason} -> throw({trailer_error, Reason})
                 end,
-                Owner ! {quic_h3, self(), {push_trailers, PushId, Trailers}},
-                Owner ! {quic_h3, self(), {push_complete, PushId}},
-                cleanup_push_stream(PushId, StreamId, State1)
+                case
+                    cl_data_check(
+                        Stream#h3_stream.content_length,
+                        Stream#h3_stream.body_received,
+                        true
+                    )
+                of
+                    ok ->
+                        Owner ! {quic_h3, self(), {push_trailers, PushId, Trailers}},
+                        Owner ! {quic_h3, self(), {push_complete, PushId}},
+                        cleanup_push_stream(PushId, StreamId, State1);
+                    {error, Code} ->
+                        {error,
+                            {connection_error, Code, <<"push body length mismatch at trailers">>}}
+                end
             catch
                 throw:{header_error, _} ->
-                    {error, {connection_error, ?H3_MESSAGE_ERROR, <<"malformed push trailers">>}}
+                    {error, {connection_error, ?H3_MESSAGE_ERROR, <<"malformed push trailers">>}};
+                throw:{trailer_error, _} ->
+                    {error, {connection_error, ?H3_MESSAGE_ERROR, <<"invalid push trailer">>}}
             end;
         {{blocked, _RIC}, _Decoder1} ->
             {error,
@@ -1928,6 +2010,10 @@ validate_promised_request_headers(Headers, State) ->
     try
         validate_field_names_and_values(Headers),
         check_duplicate_headers(Headers),
+        case cacheable_promised_method(Headers) of
+            ok -> ok;
+            {error, _} -> throw({header_error, non_cacheable_method})
+        end,
         Template = #h3_stream{id = 0, type = request, state = open, headers = Headers},
         Stream = do_update_stream_with_headers(Headers, Template, false),
         validate_request_headers(Stream, State),
@@ -1951,14 +2037,26 @@ apply_push_promise(StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised
     end.
 
 store_push_promise(StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised, State) ->
+    State1 = bump_last_accepted_push_id(PushId, State),
     case sets:is_element(PushId, Cancelled) of
         true ->
-            {ok, Stream, State};
+            {ok, Stream, State1};
         false ->
             Promised1 = maps:put(PushId, {StreamId, Headers}, Promised),
             Owner ! {quic_h3, self(), {push_promise, PushId, StreamId, Headers}},
-            {ok, Stream, State#state{promised_pushes = Promised1}}
+            {ok, Stream, State1#state{promised_pushes = Promised1}}
     end.
+
+%% Maintain a monotonic watermark of the highest validated push ID so
+%% client-sent GOAWAY does not under-report after promises drain.
+bump_last_accepted_push_id(PushId, #state{last_accepted_push_id = undefined} = State) ->
+    State#state{last_accepted_push_id = PushId};
+bump_last_accepted_push_id(PushId, #state{last_accepted_push_id = Current} = State) when
+    PushId > Current
+->
+    State#state{last_accepted_push_id = PushId};
+bump_last_accepted_push_id(_PushId, State) ->
+    State.
 
 %% Validate PUSH_PROMISE push-ID bounds (RFC 9114 Section 7.2.5)
 validate_push_promise_id(_PushId, MaxPushId) when MaxPushId =:= undefined ->
@@ -2787,18 +2885,31 @@ buffer_stream_data(
 %% 3. Open push stream (unidirectional)
 %% 4. Return push ID for subsequent data sending
 do_push(RequestStreamId, Headers, #state{streams = Streams} = State) ->
-    %% First allocate a push ID (skipping cancelled ones)
-    case allocate_push_id(State) of
-        {ok, PushId, State1} ->
-            %% Verify request stream exists
-            case maps:is_key(RequestStreamId, Streams) of
-                false ->
-                    {error, unknown_request_stream};
-                true ->
-                    do_push_internal(RequestStreamId, Headers, PushId, State1)
-            end;
+    %% RFC 9114 §4.6: server MUST NOT push for a non-cacheable method.
+    case cacheable_promised_method(Headers) of
         {error, Reason} ->
-            {error, Reason}
+            {error, Reason};
+        ok ->
+            case allocate_push_id(State) of
+                {ok, PushId, State1} ->
+                    case maps:is_key(RequestStreamId, Streams) of
+                        false ->
+                            {error, unknown_request_stream};
+                        true ->
+                            do_push_internal(RequestStreamId, Headers, PushId, State1)
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end
+    end.
+
+%% RFC 9114 §4.6: only safe & cacheable methods (GET, HEAD) may be pushed.
+cacheable_promised_method(Headers) ->
+    case lists:keyfind(<<":method">>, 1, Headers) of
+        {_, <<"GET">>} -> ok;
+        {_, <<"HEAD">>} -> ok;
+        {_, Method} -> {error, {non_cacheable_method, Method}};
+        false -> {error, missing_method}
     end.
 
 %% Allocate the next available push ID, skipping cancelled ones
@@ -3087,11 +3198,10 @@ send_goaway(
 %% Client sends the next push ID it will refuse.
 goaway_id_to_send(#state{role = server, last_stream_id = LastId}) ->
     LastId + 4;
-goaway_id_to_send(#state{role = client, promised_pushes = Promised}) ->
-    case maps:size(Promised) of
-        0 -> 0;
-        _ -> lists:max(maps:keys(Promised)) + 1
-    end.
+goaway_id_to_send(#state{role = client, last_accepted_push_id = undefined}) ->
+    0;
+goaway_id_to_send(#state{role = client, last_accepted_push_id = Last}) ->
+    Last + 1.
 
 %% RFC 9114 Section 7.2.6: validate GOAWAY identifier by our role (we are the
 %% receiver). A client receives a stream ID (client-initiated bidi, rem 4 =:= 0);

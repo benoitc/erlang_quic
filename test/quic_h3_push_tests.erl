@@ -234,9 +234,11 @@ push_stream_tracks_frame_state_test() ->
     }),
     %% Correlate push stream - should set state to expecting_headers
     {ok, State1} = quic_h3_connection:process_push_stream_id(100, 5, <<>>, State),
-    %% received_pushes is at position 39
+    %% received_pushes is at position 39 and stores #h3_stream{}.
     Received = element(39, State1),
-    ?assertEqual({100, expecting_headers}, maps:get(5, Received)).
+    PushStream = maps:get(5, Received),
+    ?assertEqual(100, element(2, PushStream)),
+    ?assertEqual(expecting_headers, element(15, PushStream)).
 
 %%====================================================================
 %% Push Response Header Validation Tests (RFC 9114 Section 4.6)
@@ -367,6 +369,7 @@ make_test_state(Overrides) ->
         promised_pushes => #{},
         received_pushes => #{},
         local_cancelled_pushes => sets:new([{version, 2}]),
+        last_accepted_push_id => undefined,
         %% Per-stream handler registration
         stream_handlers => #{},
         stream_data_buffers => #{},
@@ -391,5 +394,6 @@ make_test_state(Overrides) ->
         maps:get(next_push_id, Merged), maps:get(push_streams, Merged),
         maps:get(cancelled_pushes, Merged), maps:get(local_max_push_id, Merged),
         maps:get(promised_pushes, Merged), maps:get(received_pushes, Merged),
-        maps:get(local_cancelled_pushes, Merged), maps:get(stream_handlers, Merged),
-        maps:get(stream_data_buffers, Merged), maps:get(stream_buffer_limit, Merged)}.
+        maps:get(local_cancelled_pushes, Merged), maps:get(last_accepted_push_id, Merged),
+        maps:get(stream_handlers, Merged), maps:get(stream_data_buffers, Merged),
+        maps:get(stream_buffer_limit, Merged)}.

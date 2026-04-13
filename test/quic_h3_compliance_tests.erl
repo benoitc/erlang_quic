@@ -655,8 +655,8 @@ data_buffered_when_no_handler_test() ->
     {ok, _Stream2, State2} = quic_h3_connection:handle_request_frame(
         0, {data, <<"hello">>}, false, Stream, State
     ),
-    %% Check that data was buffered (tuple position 42 for stream_data_buffers)
-    StreamDataBuffers = element(42, State2),
+    %% Check that data was buffered (tuple position 43 for stream_data_buffers)
+    StreamDataBuffers = element(43, State2),
     ?assertMatch(#{0 := {[{<<"hello">>, false}], 5, false}}, StreamDataBuffers).
 
 %% Test that data is sent to handler when registered
@@ -709,7 +709,7 @@ multiple_chunks_buffered_in_order_test() ->
         0, {data, <<"chunk2">>}, true, Stream1, State1
     ),
     %% Check buffered data (stored in reverse order internally)
-    StreamDataBuffers = element(42, State2),
+    StreamDataBuffers = element(43, State2),
     {Chunks, Size, HadFin} = maps:get(0, StreamDataBuffers),
     ?assertEqual([{<<"chunk2">>, true}, {<<"chunk1">>, false}], Chunks),
     ?assertEqual(12, Size),
@@ -1039,14 +1039,15 @@ goaway_server_sends_4_when_none_processed_test() ->
     State = make_test_state(#{role => server, last_stream_id => 0}),
     ?assertEqual(4, quic_h3_connection:goaway_id_to_send(State)).
 
-%% Client sends the next push ID it will refuse.
+%% Client sends the next push ID it will refuse based on the watermark of
+%% the highest validated PUSH_PROMISE; this is independent of whether the
+%% promise has since been correlated/cancelled.
 goaway_client_sends_next_push_id_test() ->
-    Promised = #{0 => {0, []}, 3 => {0, []}},
-    State = make_test_state(#{role => client, promised_pushes => Promised}),
+    State = make_test_state(#{role => client, last_accepted_push_id => 3}),
     ?assertEqual(4, quic_h3_connection:goaway_id_to_send(State)).
 
 goaway_client_sends_zero_when_no_pushes_test() ->
-    State = make_test_state(#{role => client, promised_pushes => #{}}),
+    State = make_test_state(#{role => client, last_accepted_push_id => undefined}),
     ?assertEqual(0, quic_h3_connection:goaway_id_to_send(State)).
 
 %%====================================================================
@@ -1241,6 +1242,54 @@ priority_update_push_client_ignored_test() ->
     ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_push_frame(Payload, State)).
 
 %%====================================================================
+%% Theme A: Push lifecycle correctness
+%%====================================================================
+
+%% PUSH_PROMISE bumps last_accepted_push_id; subsequent client GOAWAY
+%% reports a stable boundary even after the entry leaves promised_pushes.
+push_watermark_monotonic_after_drain_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/a">>}
+    ],
+    State0 = make_test_state(#{role => client, last_accepted_push_id => 7}),
+    ?assertEqual(8, quic_h3_connection:goaway_id_to_send(State0)),
+    %% Validate a higher promise via the validator (used inside store_push_promise).
+    ?assertEqual(
+        ok,
+        quic_h3_connection:validate_promised_request_headers(Headers, State0)
+    ).
+
+%% Server push must refuse non-cacheable methods (RFC 9114 §4.6).
+push_promise_post_method_rejected_client_test() ->
+    Headers = [
+        {<<":method">>, <<"POST">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/x">>}
+    ],
+    State = make_test_state(#{role => client}),
+    ?assertMatch(
+        {error, _},
+        quic_h3_connection:validate_promised_request_headers(Headers, State)
+    ).
+
+push_promise_get_accepted_client_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/x">>}
+    ],
+    State = make_test_state(#{role => client}),
+    ?assertEqual(
+        ok,
+        quic_h3_connection:validate_promised_request_headers(Headers, State)
+    ).
+
+%%====================================================================
 %% Helper Functions
 %%====================================================================
 
@@ -1290,6 +1339,7 @@ make_test_state(Overrides) ->
         promised_pushes => #{},
         received_pushes => #{},
         local_cancelled_pushes => sets:new([{version, 2}]),
+        last_accepted_push_id => undefined,
         %% Per-stream handler registration
         stream_handlers => #{},
         stream_data_buffers => #{},
@@ -1317,6 +1367,7 @@ make_test_state(Overrides) ->
         maps:get(push_streams, Merged), maps:get(cancelled_pushes, Merged),
         maps:get(local_max_push_id, Merged), maps:get(promised_pushes, Merged),
         maps:get(received_pushes, Merged), maps:get(local_cancelled_pushes, Merged),
+        maps:get(last_accepted_push_id, Merged),
         %% Per-stream handler registration
         maps:get(stream_handlers, Merged), maps:get(stream_data_buffers, Merged),
         maps:get(stream_buffer_limit, Merged)}.
