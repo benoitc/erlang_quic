@@ -80,6 +80,8 @@
     get_send_queue_info/1,
     %% Connection statistics (for liveness detection)
     get_stats/1,
+    %% Peer transport parameters
+    get_peer_transport_params/1,
     %% Transport-level PING (bypasses congestion control)
     send_ping/1,
     %% Key update (RFC 9001 Section 6)
@@ -257,6 +259,11 @@
     max_streams_bidi_remote :: non_neg_integer(),
     max_streams_uni_local :: non_neg_integer(),
     max_streams_uni_remote :: non_neg_integer(),
+    %% RFC 9000 §4.6: peer-initiated streams already credited via
+    %% MAX_STREAMS, tracked so we do not double-issue credit when state
+    %% transitions are observed twice (e.g. recv-FIN then send-FIN).
+    credited_peer_bidi = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
+    credited_peer_uni = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
 
     %% Datagram support (RFC 9221)
     %% Local: our advertised max size (0 = disabled)
@@ -610,6 +617,13 @@ get_send_queue_info(Conn) ->
 -spec get_stats(pid()) -> {ok, map()} | {error, term()}.
 get_stats(Conn) ->
     gen_statem:call(Conn, get_stats).
+
+%% @doc Get peer's transport parameters.
+%% Returns the transport parameters received from the peer during handshake.
+%% Useful for verifying peer capabilities (e.g., WebTransport support).
+-spec get_peer_transport_params(pid()) -> {ok, map()} | {error, term()}.
+get_peer_transport_params(Conn) ->
+    gen_statem:call(Conn, get_peer_transport_params).
 
 %% @doc Send a PING frame (RFC 9000).
 %% PING frames bypass congestion control and are useful for liveness checks.
@@ -1411,9 +1425,15 @@ connected({call, From}, peercert, #state{peer_cert = Cert} = State) ->
     {keep_state, State, [{reply, From, {ok, Cert}}]};
 connected({call, From}, datagram_max_size, #state{max_datagram_frame_size_remote = Size} = State) ->
     {keep_state, State, [{reply, From, Size}]};
-connected({call, From}, {set_owner, NewOwner}, State) ->
+connected({call, From}, {set_owner, NewOwner}, #state{alpn = Alpn, transport_params = TP} = State) ->
+    %% Notify new owner that connection is already established
+    Info = #{alpn => Alpn, alpn_protocol => Alpn, transport_params => TP},
+    NewOwner ! {quic, self(), {connected, Info}},
     {keep_state, State#state{owner = NewOwner}, [{reply, From, ok}]};
-connected(cast, {set_owner, NewOwner}, State) ->
+connected(cast, {set_owner, NewOwner}, #state{alpn = Alpn, transport_params = TP} = State) ->
+    %% Notify new owner that connection is already established
+    Info = #{alpn => Alpn, alpn_protocol => Alpn, transport_params => TP},
+    NewOwner ! {quic, self(), {connected, Info}},
     {keep_state, State#state{owner = NewOwner}};
 connected({call, From}, {send_datagram, Data}, State) ->
     case do_send_datagram(Data, State) of
@@ -1559,6 +1579,8 @@ connected(
         data_sent => DataSent
     },
     {keep_state, State, [{reply, From, {ok, Stats}}]};
+connected({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
+    {keep_state, State, [{reply, From, {ok, TP}}]};
 connected({call, From}, send_ping, State) ->
     %% Send PING frame - bypasses congestion control
     NewState = send_keep_alive_ping(State),
@@ -4778,11 +4800,14 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                         0, RecvBufferBytes + NewBytesReceived - DeliveredBytes
                     ),
 
-                    State1 = State#state{
+                    State1Pre = State#state{
                         streams = maps:put(StreamId, NewStream, Streams),
                         data_received = NewDataReceivedVal,
                         recv_buffer_bytes = NewRecvBufferBytes
                     },
+                    %% RFC 9000 §4.6: extend MAX_STREAMS when the peer-
+                    %% initiated stream becomes fully closed.
+                    State1 = maybe_credit_peer_stream(StreamId, State1Pre),
 
                     %% Check if we need to send MAX_STREAM_DATA to allow more data
                     %% Send when we've consumed more than half our advertised limit
@@ -5313,6 +5338,83 @@ flush_dirty_timers(State) ->
             State1
     end.
 
+%% RFC 9000 §4.6: as peer-initiated streams reach their final state we
+%% extend the MAX_STREAMS credit by one and send a MAX_STREAMS frame so
+%% the peer can keep opening streams. Each stream is credited at most
+%% once (tracked via credited_peer_bidi/credited_peer_uni sets).
+maybe_credit_peer_stream(StreamId, State) ->
+    case maps:find(StreamId, State#state.streams) of
+        error ->
+            State;
+        {ok, Stream} ->
+            case classify_peer_stream(StreamId, State#state.role) of
+                {peer, bidi} ->
+                    case stream_fully_closed_bidi(Stream) of
+                        true -> credit_peer_bidi(StreamId, State);
+                        false -> State
+                    end;
+                {peer, uni} ->
+                    case stream_fully_closed_uni(Stream) of
+                        true -> credit_peer_uni(StreamId, State);
+                        false -> State
+                    end;
+                local ->
+                    State
+            end
+    end.
+
+%% Bidi stream is final when both directions have FIN'd.
+stream_fully_closed_bidi(#stream_state{recv_fin = true, send_fin = true}) -> true;
+stream_fully_closed_bidi(_) -> false.
+
+%% Peer-initiated uni streams are receive-only on our side; FIN from peer
+%% closes them.
+stream_fully_closed_uni(#stream_state{recv_fin = true}) -> true;
+stream_fully_closed_uni(_) -> false.
+
+%% Stream ID layout (RFC 9000 §2.1):
+%%   bit 0 = initiator (0 client, 1 server)
+%%   bit 1 = direction (0 bidi, 1 uni)
+classify_peer_stream(StreamId, Role) ->
+    Initiator = StreamId band 1,
+    Uni = (StreamId band 2) =/= 0,
+    PeerInitiated =
+        case Role of
+            server -> Initiator =:= 0;
+            client -> Initiator =:= 1
+        end,
+    case {PeerInitiated, Uni} of
+        {true, false} -> {peer, bidi};
+        {true, true} -> {peer, uni};
+        _ -> local
+    end.
+
+credit_peer_bidi(StreamId, #state{credited_peer_bidi = Set} = State) ->
+    case sets:is_element(StreamId, Set) of
+        true ->
+            State;
+        false ->
+            NewMax = State#state.max_streams_bidi_local + 1,
+            State1 = State#state{
+                max_streams_bidi_local = NewMax,
+                credited_peer_bidi = sets:add_element(StreamId, Set)
+            },
+            send_frame({max_streams, bidi, NewMax}, State1)
+    end.
+
+credit_peer_uni(StreamId, #state{credited_peer_uni = Set} = State) ->
+    case sets:is_element(StreamId, Set) of
+        true ->
+            State;
+        false ->
+            NewMax = State#state.max_streams_uni_local + 1,
+            State1 = State#state{
+                max_streams_uni_local = NewMax,
+                credited_peer_uni = sets:add_element(StreamId, Set)
+            },
+            send_frame({max_streams, uni, NewMax}, State1)
+    end.
+
 %% Open a new stream
 %% Stream ID patterns: Bit 0=initiator (0=client, 1=server), Bit 1=type (0=bidi, 1=uni)
 %% Client bidi=0x00, Server bidi=0x01, Client uni=0x02, Server uni=0x03
@@ -5626,12 +5728,17 @@ do_send_data(
                                                 send_offset = Offset + DataSize,
                                                 send_fin = (Fin andalso BytesSent =:= DataSize)
                                             },
-                                            FinalState = NewState#state{
+                                            FinalState0 = NewState#state{
                                                 streams = maps:put(
                                                     StreamId, FinalStream, NewState#state.streams
                                                 ),
                                                 data_sent = NewState#state.data_sent + BytesSent
                                             },
+                                            %% RFC 9000 §4.6: extend MAX_STREAMS when this
+                                            %% peer-initiated stream is now fully closed.
+                                            FinalState = maybe_credit_peer_stream(
+                                                StreamId, FinalState0
+                                            ),
                                             {ok, FinalState};
                                         error ->
                                             {ok, NewState}
@@ -5667,10 +5774,13 @@ do_send_zero_rtt_data(
             },
             EarlyDataSent = State#state.early_data_sent + byte_size(DataBin),
 
-            {ok, NewState#state{
+            FinalState0 = NewState#state{
                 streams = maps:put(StreamId, NewStreamState, Streams),
                 early_data_sent = EarlyDataSent
-            }};
+            },
+            %% RFC 9000 §4.6: extend MAX_STREAMS once this stream is fully
+            %% closed (covers the rare 0-RTT FIN-from-server case).
+            {ok, maybe_credit_peer_stream(StreamId, FinalState0)};
         error ->
             {error, unknown_stream}
     end.

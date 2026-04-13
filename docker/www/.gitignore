@@ -1,0 +1,3 @@
+# Large binary test file - generate with:
+# dd if=/dev/urandom of=large.bin bs=1024 count=1024
+large.bin
