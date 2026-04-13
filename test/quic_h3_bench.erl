@@ -33,6 +33,7 @@
     concurrent/2,
     connection_setup/0,
     connection_setup/1,
+    connection_setup/2,
     qpack_bench/0,
     qpack_bench/1
 ]).
@@ -77,6 +78,7 @@ run(Opts) ->
             Results = [
                 run_bench(connection_setup, fun() ->
                     connection_setup(
+                        ActualPort,
                         maps:get(connection_iterations, Opts, ?DEFAULT_CONNECTION_ITERATIONS)
                     )
                 end),
@@ -269,7 +271,9 @@ concurrent(StreamCount) ->
             #{status => error, reason => Reason}
     end.
 
-%% @doc Measure concurrent streams against running server
+%% @doc Measure concurrent in-flight streams against a running server. All
+%% requests are issued before any response is collected; the H3 connection
+%% sends events to its owner (this pid), so we collect everything here.
 -spec concurrent(inet:port_number(), pos_integer()) -> map().
 concurrent(Port, StreamCount) ->
     io:format("Concurrent streams benchmark: ~p streams~n", [StreamCount]),
@@ -277,43 +281,32 @@ concurrent(Port, StreamCount) ->
     case quic_h3:connect("127.0.0.1", Port, #{verify => none}) of
         {ok, Conn} ->
             wait_connected(Conn),
-
-            Parent = self(),
+            Headers = [
+                {<<":method">>, <<"GET">>},
+                {<<":path">>, <<"/">>},
+                {<<":scheme">>, <<"https">>},
+                {<<":authority">>, <<"127.0.0.1">>}
+            ],
             Start = erlang:monotonic_time(millisecond),
-
-            %% Launch concurrent requests
-            Pids = [
-                spawn_link(fun() ->
-                    Result = do_request(Conn, <<"/">>, <<>>),
-                    Parent ! {done, self(), Result}
-                end)
-             || _ <- lists:seq(1, StreamCount)
-            ],
-
-            %% Collect results
-            Results = [
-                receive
-                    {done, Pid, Result} -> Result
-                after 30000 ->
-                    {error, timeout}
-                end
-             || Pid <- Pids
-            ],
-
+            StreamIds = lists:filtermap(
+                fun(_) ->
+                    case quic_h3:request(Conn, Headers, #{end_stream => true}) of
+                        {ok, Sid} -> {true, Sid};
+                        {error, _} -> false
+                    end
+                end,
+                lists:seq(1, StreamCount)
+            ),
+            Successful = collect_concurrent_responses(Conn, sets:from_list(StreamIds), 0, 30000),
             End = erlang:monotonic_time(millisecond),
             Duration = max(1, End - Start),
-
             quic_h3:close(Conn),
-
-            Successful = length([R || R <- Results, element(1, R) =:= ok]),
             Failed = StreamCount - Successful,
             StreamsPerSec = (Successful * 1000) / Duration,
-
             io:format(
                 "  Completed: ~p/~p in ~p ms (~.1f streams/sec)~n",
                 [Successful, StreamCount, Duration, StreamsPerSec]
             ),
-
             #{
                 status => ok,
                 stream_count => StreamCount,
@@ -326,6 +319,35 @@ concurrent(Port, StreamCount) ->
             #{status => error, reason => Reason}
     end.
 
+collect_concurrent_responses(_Conn, Pending, Done, _Timeout) when Pending =:= [] ->
+    Done;
+collect_concurrent_responses(Conn, Pending, Done, Timeout) ->
+    case sets:size(Pending) of
+        0 ->
+            Done;
+        _ ->
+            receive
+                {quic_h3, Conn, {response, Sid, _Status, _Headers}} ->
+                    case sets:is_element(Sid, Pending) of
+                        true -> collect_concurrent_responses(Conn, Pending, Done, Timeout);
+                        false -> collect_concurrent_responses(Conn, Pending, Done, Timeout)
+                    end;
+                {quic_h3, Conn, {data, Sid, _Data, true}} ->
+                    case sets:is_element(Sid, Pending) of
+                        true ->
+                            collect_concurrent_responses(
+                                Conn, sets:del_element(Sid, Pending), Done + 1, Timeout
+                            );
+                        false ->
+                            collect_concurrent_responses(Conn, Pending, Done, Timeout)
+                    end;
+                {quic_h3, Conn, _Other} ->
+                    collect_concurrent_responses(Conn, Pending, Done, Timeout)
+            after Timeout ->
+                Done
+            end
+    end.
+
 %%====================================================================
 %% Connection Setup Benchmark
 %%====================================================================
@@ -335,54 +357,56 @@ concurrent(Port, StreamCount) ->
 connection_setup() ->
     connection_setup(?DEFAULT_CONNECTION_ITERATIONS).
 
-%% @doc Measure connection setup time over N iterations
+%% @doc Measure connection setup time over N iterations (starts its own server).
 -spec connection_setup(pos_integer()) -> map().
 connection_setup(Iterations) ->
-    io:format("Connection setup benchmark: ~p iterations~n", [Iterations]),
-
     case start_h3_server(?DEFAULT_PORT) of
         {ok, ServerName, ActualPort} ->
-            %% Measure connection setup times
-            Times = lists:filtermap(
-                fun(_) ->
-                    Start = erlang:monotonic_time(microsecond),
-                    case quic_h3:connect("127.0.0.1", ActualPort, #{verify => none}) of
-                        {ok, Conn} ->
-                            case wait_connected_timeout(Conn, 5000) of
-                                ok ->
-                                    End = erlang:monotonic_time(microsecond),
-                                    quic_h3:close(Conn),
-                                    {true, End - Start};
-                                {error, _} ->
-                                    quic_h3:close(Conn),
-                                    false
-                            end;
-                        {error, _} ->
-                            false
-                    end
-                end,
-                lists:seq(1, Iterations)
-            ),
-
+            Result = connection_setup(ActualPort, Iterations),
             quic_h3:stop_server(ServerName),
-
-            case Times of
-                [] ->
-                    #{status => error, reason => no_successful_connections};
-                _ ->
-                    Stats = calculate_stats(Times),
-                    io:format(
-                        "  p50: ~p us, p99: ~p us, avg: ~.1f us~n",
-                        [maps:get(p50, Stats), maps:get(p99, Stats), maps:get(avg, Stats)]
-                    ),
-                    Stats#{
-                        status => ok,
-                        iterations => length(Times),
-                        failed => Iterations - length(Times)
-                    }
-            end;
+            Result;
         {error, Reason} ->
             #{status => error, reason => Reason}
+    end.
+
+%% @doc Measure connection setup time against an already-running server.
+-spec connection_setup(inet:port_number(), pos_integer()) -> map().
+connection_setup(Port, Iterations) ->
+    io:format("Connection setup benchmark: ~p iterations~n", [Iterations]),
+    Times = lists:filtermap(
+        fun(_) ->
+            Start = erlang:monotonic_time(microsecond),
+            case quic_h3:connect("127.0.0.1", Port, #{verify => none}) of
+                {ok, Conn} ->
+                    case wait_connected_timeout(Conn, 5000) of
+                        ok ->
+                            End = erlang:monotonic_time(microsecond),
+                            quic_h3:close(Conn),
+                            {true, End - Start};
+                        {error, _} ->
+                            quic_h3:close(Conn),
+                            false
+                    end;
+                {error, _} ->
+                    false
+            end
+        end,
+        lists:seq(1, Iterations)
+    ),
+    case Times of
+        [] ->
+            #{status => error, reason => no_successful_connections};
+        _ ->
+            Stats = calculate_stats(Times),
+            io:format(
+                "  p50: ~p us, p99: ~p us, avg: ~.1f us~n",
+                [maps:get(p50, Stats), maps:get(p99, Stats), maps:get(avg, Stats)]
+            ),
+            Stats#{
+                status => ok,
+                iterations => length(Times),
+                failed => Iterations - length(Times)
+            }
     end.
 
 %%====================================================================
@@ -564,7 +588,9 @@ send_echo_response(Conn, StreamId, Body) ->
     quic_h3:send_response(Conn, StreamId, 200, [
         {<<"content-type">>, <<"application/octet-stream">>}
     ]),
-    quic_h3:send_data(Conn, StreamId, Body, true).
+    %% Same chunking discipline as the client so the response body can grow
+    %% past the initial outbound stream window.
+    send_chunked(Conn, StreamId, Body).
 
 do_request(Conn, Path, Body) ->
     Headers = [
@@ -580,15 +606,46 @@ do_request(Conn, Path, Body) ->
     EndStream = Body =:= <<>>,
     case quic_h3:request(Conn, Headers, #{end_stream => EndStream}) of
         {ok, StreamId} ->
-            %% Send body if present
             case Body of
-                <<>> -> ok;
-                _ -> quic_h3:send_data(Conn, StreamId, Body, true)
-            end,
-            %% Wait for response
-            wait_response(Conn, StreamId, <<>>, 10000);
+                <<>> ->
+                    wait_response(Conn, StreamId, <<>>, 30000);
+                _ ->
+                    case send_chunked(Conn, StreamId, Body) of
+                        ok -> wait_response(Conn, StreamId, <<>>, 30000);
+                        {error, Reason} -> {error, {send_body, Reason}}
+                    end
+            end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% Send a payload in chunks small enough to fit within QUIC's initial
+%% per-stream flow-control window. Retries briefly on flow_control_blocked
+%% so MAX_STREAM_DATA from the peer can grant more credit.
+-define(BENCH_CHUNK, 65536).
+send_chunked(Conn, StreamId, Body) ->
+    send_chunked(Conn, StreamId, Body, 0).
+
+send_chunked(_Conn, _StreamId, <<>>, _Retries) ->
+    ok;
+send_chunked(Conn, StreamId, Body, Retries) when byte_size(Body) =< ?BENCH_CHUNK ->
+    do_send_chunk(Conn, StreamId, Body, true, Retries);
+send_chunked(Conn, StreamId, Body, Retries) ->
+    <<Chunk:?BENCH_CHUNK/binary, Rest/binary>> = Body,
+    case do_send_chunk(Conn, StreamId, Chunk, false, Retries) of
+        ok -> send_chunked(Conn, StreamId, Rest, 0);
+        {error, _} = E -> E
+    end.
+
+do_send_chunk(Conn, StreamId, Chunk, Fin, Retries) ->
+    case quic_h3:send_data(Conn, StreamId, Chunk, Fin) of
+        ok ->
+            ok;
+        {error, {flow_control_blocked, _}} when Retries < 500 ->
+            timer:sleep(10),
+            do_send_chunk(Conn, StreamId, Chunk, Fin, Retries + 1);
+        {error, _} = E ->
+            E
     end.
 
 wait_response(Conn, StreamId, AccBody, Timeout) ->
