@@ -202,7 +202,12 @@
     %% Buffers data received before handler registers (with size limit)
     stream_data_buffers = #{} :: #{stream_id() => {[binary()], non_neg_integer(), boolean()}},
     %% Maximum bytes to buffer per stream before handler registers (64KB default)
-    stream_buffer_limit = 65536 :: non_neg_integer()
+    stream_buffer_limit = 65536 :: non_neg_integer(),
+
+    %% RFC 9220: extended CONNECT enabled locally (advertised in our SETTINGS).
+    %% Used on the server side to validate inbound :protocol pseudo-headers.
+    %% Placed at the end so prior tuple positions stay stable for tests.
+    local_connect_enabled = false :: boolean()
 }).
 
 %%====================================================================
@@ -366,6 +371,7 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
         max_field_section_size, LocalSettings, ?H3_DEFAULT_MAX_FIELD_SECTION_SIZE
     ),
     LocalMaxBlocked = maps:get(qpack_blocked_streams, LocalSettings, 0),
+    LocalConnectEnabled = maps:get(enable_connect_protocol, LocalSettings, 0) =:= 1,
 
     State = #state{
         quic_conn = QuicConn,
@@ -379,7 +385,8 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
         % Client uses even stream IDs (0, 4, 8, ...)
         next_stream_id = 0,
         local_max_field_section_size = LocalMaxFieldSize,
-        local_max_blocked_streams = LocalMaxBlocked
+        local_max_blocked_streams = LocalMaxBlocked,
+        local_connect_enabled = LocalConnectEnabled
     },
 
     %% Start in awaiting_quic - wait for QUIC connected notification
@@ -396,6 +403,7 @@ init({server, QuicConn, Opts, Owner}) ->
         max_field_section_size, LocalSettings, ?H3_DEFAULT_MAX_FIELD_SECTION_SIZE
     ),
     LocalMaxBlocked = maps:get(qpack_blocked_streams, LocalSettings, 0),
+    LocalConnectEnabled = maps:get(enable_connect_protocol, LocalSettings, 0) =:= 1,
     Handler = maps:get(handler, Opts, undefined),
 
     State = #state{
@@ -410,7 +418,8 @@ init({server, QuicConn, Opts, Owner}) ->
         % Server uses odd stream IDs (1, 5, 9, ...)
         next_stream_id = 1,
         local_max_field_section_size = LocalMaxFieldSize,
-        local_max_blocked_streams = LocalMaxBlocked
+        local_max_blocked_streams = LocalMaxBlocked,
+        local_connect_enabled = LocalConnectEnabled
     },
 
     %% Store handler in process dictionary for server
@@ -2360,6 +2369,8 @@ do_update_stream_with_headers([{<<":scheme">>, Value} | Rest], Stream, _SeenRegu
     do_update_stream_with_headers(Rest, Stream#h3_stream{scheme = Value}, false);
 do_update_stream_with_headers([{<<":authority">>, Value} | Rest], Stream, _SeenRegular) ->
     do_update_stream_with_headers(Rest, Stream#h3_stream{authority = Value}, false);
+do_update_stream_with_headers([{<<":protocol">>, Value} | Rest], Stream, _SeenRegular) ->
+    do_update_stream_with_headers(Rest, Stream#h3_stream{protocol = Value}, false);
 do_update_stream_with_headers([{<<":status">>, Value} | Rest], Stream, _SeenRegular) ->
     Status = safe_binary_to_integer(Value, <<":status">>),
     do_update_stream_with_headers(Rest, Stream#h3_stream{status = Status}, false);
@@ -2387,7 +2398,41 @@ do_update_stream_with_headers([_ | Rest], Stream, _SeenRegular) ->
 %% Validate request pseudo-headers (server receiving requests - RFC 9114 Section 4.3.1)
 validate_request_headers(#h3_stream{method = undefined}, _State) ->
     throw({header_error, {missing_pseudo_header, <<":method">>}});
-%% CONNECT requests have special validation (RFC 9114 Section 4.4)
+%% RFC 9220 extended CONNECT: :method=CONNECT + :protocol requires
+%% local SETTINGS_ENABLE_CONNECT_PROTOCOL=1 (we are the receiver) and
+%% includes :scheme/:path/:authority (the opposite of plain CONNECT).
+validate_request_headers(
+    #h3_stream{method = <<"CONNECT">>, protocol = Protocol},
+    #state{local_connect_enabled = false}
+) when Protocol =/= undefined ->
+    throw({header_error, extended_connect_not_enabled});
+validate_request_headers(
+    #h3_stream{
+        method = <<"CONNECT">>,
+        protocol = Protocol,
+        scheme = Scheme,
+        path = Path,
+        authority = Authority
+    } = Stream,
+    _State
+) when
+    Protocol =/= undefined
+->
+    case {Scheme, Path, Authority} of
+        {undefined, _, _} ->
+            throw({header_error, {missing_pseudo_header, <<":scheme">>}});
+        {_, undefined, _} ->
+            throw({header_error, {missing_pseudo_header, <<":path">>}});
+        {_, <<>>, _} ->
+            throw({header_error, {invalid_pseudo_header, <<":path">>, empty}});
+        {_, _, undefined} ->
+            throw({header_error, {missing_pseudo_header, <<":authority">>}});
+        _ ->
+            validate_authority_and_host(Stream),
+            ok
+    end;
+%% Plain CONNECT (RFC 9114 Section 4.4): no scheme/path/protocol; authority required;
+%% peer must have advertised CONNECT support if we are the originator.
 validate_request_headers(#h3_stream{method = <<"CONNECT">>, scheme = Scheme}, _State) when
     Scheme =/= undefined
 ->
@@ -2406,6 +2451,9 @@ validate_request_headers(#h3_stream{method = <<"CONNECT">>, authority = undefine
 validate_request_headers(#h3_stream{method = <<"CONNECT">>}, _State) ->
     %% CONNECT request is valid
     ok;
+%% Non-CONNECT must not carry :protocol (RFC 9220).
+validate_request_headers(#h3_stream{protocol = Protocol}, _State) when Protocol =/= undefined ->
+    throw({header_error, {invalid_field, <<":protocol">>, Protocol}});
 %% Non-CONNECT requests
 validate_request_headers(#h3_stream{scheme = undefined}, _State) ->
     throw({header_error, {missing_pseudo_header, <<":scheme">>}});

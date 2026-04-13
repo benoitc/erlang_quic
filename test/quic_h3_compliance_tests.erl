@@ -1242,6 +1242,56 @@ priority_update_push_client_ignored_test() ->
     ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_push_frame(Payload, State)).
 
 %%====================================================================
+%% Theme F: Extended CONNECT (RFC 9220)
+%%====================================================================
+
+%% Server with SETTINGS_ENABLE_CONNECT_PROTOCOL=1 accepts an extended
+%% CONNECT carrying :protocol/:scheme/:path/:authority.
+extended_connect_accepted_when_enabled_test() ->
+    Headers = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":protocol">>, <<"websocket">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/chat">>}
+    ],
+    State = make_test_state(#{role => server, local_connect_enabled => true}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({ok, _}, Result).
+
+%% Same request rejected when extended CONNECT is not enabled locally.
+extended_connect_rejected_when_disabled_test() ->
+    Headers = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":protocol">>, <<"websocket">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/chat">>}
+    ],
+    State = make_test_state(#{role => server, local_connect_enabled => false}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, extended_connect_not_enabled}, Result).
+
+%% :protocol on non-CONNECT methods is rejected (RFC 9220).
+protocol_pseudo_on_get_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":protocol">>, <<"websocket">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>}
+    ],
+    State = make_test_state(#{role => server, local_connect_enabled => true}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        Headers, #h3_stream{id = 0}, server, State
+    ),
+    ?assertMatch({error, {invalid_field, <<":protocol">>, _}}, Result).
+
+%%====================================================================
 %% Theme D: DoS hardening
 %%====================================================================
 
@@ -1446,6 +1496,7 @@ make_test_state(Overrides) ->
         %% RFC 9114 Section 7.2.4.1 local settings enforcement (inbound)
         local_max_field_section_size => 65536,
         local_max_blocked_streams => 0,
+        local_connect_enabled => false,
         %% Server-side push state (RFC 9114 Section 4.6)
         max_push_id => undefined,
         next_push_id => 0,
@@ -1487,4 +1538,4 @@ make_test_state(Overrides) ->
         maps:get(last_accepted_push_id, Merged),
         %% Per-stream handler registration
         maps:get(stream_handlers, Merged), maps:get(stream_data_buffers, Merged),
-        maps:get(stream_buffer_limit, Merged)}.
+        maps:get(stream_buffer_limit, Merged), maps:get(local_connect_enabled, Merged)}.

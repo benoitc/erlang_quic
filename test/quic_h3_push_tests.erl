@@ -360,6 +360,7 @@ make_test_state(Overrides) ->
         peer_connect_enabled => false,
         local_max_field_section_size => 65536,
         local_max_blocked_streams => 0,
+        local_connect_enabled => false,
         %% Push fields
         max_push_id => undefined,
         next_push_id => 0,
@@ -396,4 +397,4 @@ make_test_state(Overrides) ->
         maps:get(promised_pushes, Merged), maps:get(received_pushes, Merged),
         maps:get(local_cancelled_pushes, Merged), maps:get(last_accepted_push_id, Merged),
         maps:get(stream_handlers, Merged), maps:get(stream_data_buffers, Merged),
-        maps:get(stream_buffer_limit, Merged)}.
+        maps:get(stream_buffer_limit, Merged), maps:get(local_connect_enabled, Merged)}.

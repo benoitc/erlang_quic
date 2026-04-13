@@ -126,7 +126,12 @@
 
     %% RFC 9114 §4.4 CONNECT: once the request/response succeeds, the stream
     %% becomes a raw tunnel carrying only DATA frames.
-    is_connect = false :: boolean()
+    is_connect = false :: boolean(),
+
+    %% RFC 9220 extended CONNECT: :protocol pseudo-header (e.g. websocket).
+    %% Set when SETTINGS_ENABLE_CONNECT_PROTOCOL is negotiated and the
+    %% client sends method=CONNECT with :protocol.
+    protocol :: binary() | undefined
 }).
 
 %%====================================================================
