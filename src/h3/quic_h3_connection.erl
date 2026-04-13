@@ -32,6 +32,7 @@
     close/1,
     get_settings/1,
     get_peer_settings/1,
+    get_quic_conn/1,
     %% Server Push API (RFC 9114 Section 4.6)
     push/3,
     send_push_response/4,
@@ -288,6 +289,11 @@ get_settings(Conn) ->
 get_peer_settings(Conn) ->
     gen_statem:call(Conn, get_peer_settings).
 
+%% @doc Get the underlying QUIC connection pid.
+-spec get_quic_conn(pid()) -> pid().
+get_quic_conn(Conn) ->
+    gen_statem:call(Conn, get_quic_conn).
+
 %%====================================================================
 %% Server Push API (RFC 9114 Section 4.6)
 %%====================================================================
@@ -462,6 +468,8 @@ awaiting_quic({call, From}, get_settings, #state{local_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
 awaiting_quic({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
+awaiting_quic({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
+    {keep_state_and_data, [{reply, From, QuicConn}]};
 awaiting_quic(cast, close, State) ->
     {next_state, closing, State};
 awaiting_quic(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
@@ -532,6 +540,8 @@ h3_connecting({call, From}, get_settings, #state{local_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
 h3_connecting({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
+h3_connecting({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
+    {keep_state_and_data, [{reply, From, QuicConn}]};
 h3_connecting(cast, close, State) ->
     {next_state, closing, State};
 h3_connecting(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
@@ -619,6 +629,8 @@ connected({call, From}, get_settings, #state{local_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
 connected({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
+connected({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
+    {keep_state_and_data, [{reply, From, QuicConn}]};
 %% Server Push API
 connected({call, From}, {push, RequestStreamId, Headers}, #state{role = server} = State) ->
     case do_push(RequestStreamId, Headers, State) of

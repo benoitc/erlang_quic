@@ -144,7 +144,8 @@
 %% Query API
 -export([
     get_settings/1,
-    get_peer_settings/1
+    get_peer_settings/1,
+    get_quic_conn/1
 ]).
 
 %% Types
@@ -530,6 +531,14 @@ get_settings(Conn) ->
 -spec get_peer_settings(conn()) -> map() | undefined.
 get_peer_settings(Conn) ->
     quic_h3_connection:get_peer_settings(Conn).
+
+%% @doc Get the underlying QUIC connection for an H3 connection.
+%%
+%% Needed for WebTransport which uses native QUIC streams alongside H3.
+%% @end
+-spec get_quic_conn(conn()) -> pid().
+get_quic_conn(Conn) ->
+    quic_h3_connection:get_quic_conn(Conn).
 
 %% @doc Wait for H3 connection to be ready.
 %%
