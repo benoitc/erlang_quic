@@ -179,7 +179,7 @@
 -type error_code() :: non_neg_integer().
 
 -type stream_type_handler() ::
-    fun((uni, stream_id(), non_neg_integer()) -> claim | ignore).
+    fun((uni | bidi, stream_id(), non_neg_integer()) -> claim | ignore).
 
 -type connect_opts() :: #{
     %% TLS options
@@ -195,6 +195,19 @@
     stream_type_handler => stream_type_handler()
 }.
 
+%% Override function invoked once per newly accepted QUIC connection.
+%% Keys absent from the returned map inherit the listener-wide values.
+-type connection_handler_fun() ::
+    fun((QuicConnPid :: pid()) -> per_connection_opts()).
+
+-type per_connection_opts() :: #{
+    owner => pid(),
+    handler => fun((conn(), stream_id(), binary(), binary(), headers()) -> any()) | module(),
+    settings => map(),
+    stream_type_handler => stream_type_handler(),
+    h3_datagram_enabled => boolean()
+}.
+
 -type server_opts() :: #{
     %% TLS (required)
     cert := binary(),
@@ -206,7 +219,13 @@
     %% QUIC options
     quic_opts => map(),
     %% Extension hook for unknown uni-stream types (e.g. WebTransport).
-    stream_type_handler => stream_type_handler()
+    stream_type_handler => stream_type_handler(),
+    %% Per-connection configuration override; the returned map's
+    %% `owner', `handler', `stream_type_handler', `h3_datagram_enabled',
+    %% and `settings' keys replace the listener-wide defaults for that
+    %% single connection. Useful for spawning a dedicated router pid
+    %% per H3 connection rather than sharing one global owner.
+    connection_handler => connection_handler_fun()
 }.
 
 %%====================================================================
@@ -442,24 +461,34 @@ start_server(Name, Port, Opts) ->
     H3Settings = maps:get(settings, Opts, #{}),
     StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
     H3DatagramEnabled = maps:get(h3_datagram_enabled, Opts, false),
+    PerConn = maps:get(connection_handler, Opts, undefined),
     QuicOpts0 = build_server_quic_opts(Opts),
-    %% Set up connection handler that starts H3 connection for each QUIC connection
-    Owner = self(),
+    Listener = self(),
+    ListenerDefaults = #{
+        handler => Handler,
+        settings => H3Settings,
+        stream_type_handler => StreamTypeHandler,
+        h3_datagram_enabled => H3DatagramEnabled,
+        owner => Listener
+    },
     QuicOpts = QuicOpts0#{
         connection_handler => fun(ConnPid, _ConnRef) ->
             h3_connection_handler(
-                ConnPid,
-                #{
-                    handler => Handler,
-                    settings => H3Settings,
-                    stream_type_handler => StreamTypeHandler,
-                    h3_datagram_enabled => H3DatagramEnabled,
-                    owner => Owner
-                }
+                ConnPid, resolve_per_conn_opts(ListenerDefaults, PerConn, ConnPid)
             )
         end
     },
     quic:start_server(Name, Port, QuicOpts).
+
+%% Merge per-connection overrides (returned by the caller-supplied
+%% connection_handler fun) over the listener defaults. Keeps the
+%% no-hook behaviour identical to the listener-wide setup.
+resolve_per_conn_opts(Defaults, undefined, _ConnPid) ->
+    Defaults;
+resolve_per_conn_opts(Defaults, Fun, ConnPid) when is_function(Fun, 1) ->
+    Overrides = Fun(ConnPid),
+    true = is_map(Overrides),
+    maps:merge(Defaults, Overrides).
 
 %% @doc Stop an HTTP/3 server.
 -spec stop_server(atom()) -> ok | {error, term()}.

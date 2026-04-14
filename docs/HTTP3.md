@@ -393,9 +393,87 @@ To send on a claimed stream, retrieve the QUIC connection with
 `quic_h3:get_quic_conn/1` and call `quic:send_data/4` directly; H3 does
 not frame or encode the payload.
 
-Bidirectional streams are always handled as HTTP/3 request streams
-today — WebTransport's `WT_BIDI_SIGNAL` (varint `0x41`) is not yet
-claimable through this hook.
+Bidirectional streams go through the same claim hook. The handler is
+consulted on the first varint of every peer-initiated bidi stream,
+before HTTP/3 request parsing kicks in. WebTransport's
+`WT_BIDI_SIGNAL` (varint `0x41`) is the canonical use:
+
+```erlang
+Claim = fun
+    (uni,  _StreamId, 16#54) -> claim;   %% WT_STREAM
+    (bidi, _StreamId, 16#41) -> claim;   %% WT_BIDI_SIGNAL
+    (_, _, _)                -> ignore
+end,
+```
+
+On claim, the owner sees bidi versions of the same events:
+
+| Event | Description |
+|-------|-------------|
+| `{stream_type_open, bidi, StreamId, VarintType}` | Claim accepted; no payload yet |
+| `{stream_type_data, bidi, StreamId, Data, Fin}` | Raw bytes on the claimed stream |
+| `{stream_type_closed, bidi, StreamId}` | Peer closed the stream |
+| `{stream_type_reset, bidi, StreamId, ErrorCode}` | Peer reset the stream with a non-zero code |
+| `{stream_type_stop_sending, bidi, StreamId, ErrorCode}` | Peer sent STOP_SENDING |
+
+On `ignore`, the bidi stream falls back to the HTTP/3 request path
+exactly as if the hook had never fired — every buffered byte
+(including the varint that was peeked) is replayed through the
+request parser, so legitimate `HEADERS`-starting peers are
+unaffected.
+
+The same claimed-stream reset/stop_sending events fire on uni
+streams too.
+
+### Per-connection owner
+
+By default every H3 connection spawned by `start_server/3` delivers
+extension-stream events (claimed streams, H3 datagrams) to the single
+process that called `start_server/3`. Extension libraries that host
+many concurrent sessions on one listener can pick a dedicated owner
+pid per H3 connection via the `connection_handler` option:
+
+```erlang
+{ok, _} = quic_h3:start_server(my_server, 4433, #{
+    cert => Cert, key => Key,
+    stream_type_handler => Claim,
+    h3_datagram_enabled => true,
+    connection_handler => fun(_QuicConnPid) ->
+        #{owner => spawn(fun my_router:loop/0)}
+    end
+}).
+```
+
+The returned map's `owner`, `handler`, `stream_type_handler`,
+`h3_datagram_enabled`, and `settings` keys replace the listener
+defaults for that single connection; absent keys inherit.
+
+#### `connection_handler` vs `set_stream_handler/3`
+
+These solve different problems and compose rather than overlap.
+
+- `set_stream_handler/3,4` reroutes the body `{data, StreamId, Data,
+  Fin}` events of an *already-classified HTTP/3 request stream* to a
+  chosen pid, returning any bytes buffered before registration. It
+  only works on streams already present in the connection's request
+  map; extension-claimed streams (WT uni `0x54`, WT bidi `0x41`)
+  aren't request streams and can't be registered this way. Other
+  events on the same request stream (`{request, ...}`,
+  `{trailers, ...}`, `{stream_reset, ...}`) still reach the
+  connection owner.
+- `connection_handler` picks the *connection's* owner pid at
+  construction, before any stream exists. Every connection-level
+  event — `{connected, ...}`, `{request, ...}`,
+  `{stream_type_*, ...}`, `{datagram, StreamId, ...}` — is routed to
+  it. Use this to spawn one router process per H3 connection when
+  hosting many concurrent extension sessions on a single listener.
+
+A WebTransport or CONNECT-UDP server uses `connection_handler` to
+create a per-connection router and then simply consumes
+`{stream_type_*, ...}` or `{datagram, ...}` events directly.
+`set_stream_handler` isn't involved unless the same connection is
+also serving plain HTTP/3 requests whose bodies benefit from
+streaming to a different process.
 
 ### HTTP Datagrams (RFC 9297)
 
@@ -460,6 +538,48 @@ Registered capsule type constants are in `include/quic_h3.hrl`:
 `?H3_CAPSULE_DATAGRAM` (`0x00`) and `?H3_CAPSULE_LEGACY_DATAGRAM`
 (`0xff37a0`). Unknown types are returned as their varint value so
 extensions can claim their own codepoints.
+
+### Building extension libraries
+
+The primitives above are designed to support both WebTransport and
+CONNECT-UDP (RFC 9298) as separate libraries. Here's which hook
+each one relies on:
+
+| Hook | WebTransport | CONNECT-UDP |
+|------|--------------|-------------|
+| Extended CONNECT (`enable_connect_protocol`) | `:protocol = webtransport` | `:protocol = connect-udp` |
+| H3 datagrams (`h3_datagram_enabled`) | WT datagrams keyed by the CONNECT stream | UDP payloads keyed by the CONNECT stream + Context ID |
+| Capsule codec (`quic_h3_capsule`) | `CLOSE_WEBTRANSPORT_SESSION`, `DRAIN_WEBTRANSPORT_SESSION` | RFC 9298 §3.5 DATAGRAM capsules |
+| Bidi 0x41 claim (`stream_type_handler`) | `WT_BIDI_SIGNAL` on new peer-initiated bidi streams | not used — one extended-CONNECT bidi stream per session is all |
+| Uni 0x54 claim (`stream_type_handler`) | `WT_STREAM` on new peer-initiated uni streams | not used |
+| Per-connection owner (`connection_handler`) | Dedicated session manager per H3 connection | Dedicated session manager per H3 connection |
+| Reset / STOP_SENDING (`stream_type_reset`, `stream_type_stop_sending`) | Propagates to WT stream FSM | Only fires on claimed streams, so unused by CONNECT-UDP |
+
+A CONNECT-UDP server looks like:
+
+```erlang
+{ok, _} = quic_h3:start_server(udp_proxy, 443, #{
+    cert => C, key => K,
+    settings => #{enable_connect_protocol => 1},
+    h3_datagram_enabled => true,
+    connection_handler => fun(_) ->
+        #{owner => spawn(fun udp_proxy_conn:loop/0)}
+    end,
+    handler => fun handle_connect_udp_request/5
+}).
+```
+
+The per-connection owner process receives
+`{quic_h3, Conn, {datagram, StreamId, Payload}}` and demultiplexes by
+`StreamId` (= CONNECT request stream id). It decodes RFC 9298's
+Context ID prefix out of `Payload`, then forwards the UDP bytes. Body
+capsules on the same stream go through `quic_h3_capsule:decode/1`.
+No `stream_type_handler` involvement at all.
+
+A WebTransport server adds a `stream_type_handler` that claims uni
+(`0x54`) and bidi (`0x41`) streams, mapping session-id bytes to its
+own router. Same `connection_handler` + `h3_datagram_enabled`
+pattern; the two extensions coexist on the same listener if needed.
 
 ### Messages to Owner
 
