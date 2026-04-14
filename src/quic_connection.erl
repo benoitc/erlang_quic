@@ -143,7 +143,10 @@
     update_spin_from_recv/3,
     short_header_first_byte/3,
     test_spin_state/1,
-    test_spin_state_for/2
+    test_spin_state_for/2,
+    %% Stateless reset token derivation (RFC 9000 §10.3.2)
+    generate_stateless_reset_token/2,
+    test_state_with_secret/1
 ]).
 -endif.
 
@@ -297,6 +300,12 @@
     spin_recv = 0 :: 0 | 1,
     spin_recv_largest_pn = -1 :: integer(),
     spin_bit_enabled = true :: boolean(),
+
+    %% Server-wide secret used to HMAC stateless-reset tokens over a
+    %% connection id (RFC 9000 §10.3.2). `undefined' preserves today's
+    %% per-CID random-token fallback — acceptable for clients and for
+    %% single-instance servers that don't need post-restart recovery.
+    stateless_reset_secret = undefined :: binary() | undefined,
 
     %% RESET_STREAM_AT support (draft-ietf-quic-reliable-stream-reset-07)
     %% Local: whether we advertise support for RESET_STREAM_AT
@@ -879,6 +888,7 @@ init({server, Opts}) ->
         max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
         datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
         spin_bit_enabled = maps:get(spin_bit, Opts, true),
+        stateless_reset_secret = maps:get(stateless_reset_secret, Opts, undefined),
         reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeout,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
@@ -1122,6 +1132,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
         datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
         spin_bit_enabled = maps:get(spin_bit, Opts, true),
+        stateless_reset_secret = maps:get(stateless_reset_secret, Opts, undefined),
         reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeoutClient,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
@@ -8094,14 +8105,20 @@ issue_cids(N, #state{local_cid_pool = Pool} = State) when N > 0 ->
     issue_cids(N - 1, State1#state{local_cid_pool = NewPool}).
 
 %% @doc Generate a stateless reset token for a connection ID.
-%% RFC 9000 Section 10.3: Token must be unpredictable to peers.
+%% RFC 9000 §10.3.2 requires the token to be hard for an external
+%% observer to guess. When a server-wide secret is configured, derive
+%% the token deterministically via HMAC-SHA256 so the same CID always
+%% maps to the same token — letting a listener reply with a matching
+%% stateless reset for a CID whose per-connection state it no longer
+%% holds. Without a secret we fall back to per-CID random bytes.
 -spec generate_stateless_reset_token(binary(), #state{}) -> binary().
-generate_stateless_reset_token(CID, _State) ->
-    %% In a production implementation, this should use a consistent secret key
-    %% so tokens can be regenerated. For now, generate random token.
-    %% TODO: Use HKDF with a static secret for consistent token generation
-    crypto:hash(sha256, <<CID/binary, (crypto:strong_rand_bytes(16))/binary>>),
-    crypto:strong_rand_bytes(16).
+generate_stateless_reset_token(_CID, #state{stateless_reset_secret = undefined}) ->
+    crypto:strong_rand_bytes(16);
+generate_stateless_reset_token(CID, #state{stateless_reset_secret = Secret}) when
+    is_binary(Secret), byte_size(Secret) >= 32
+->
+    <<Token:16/binary, _/binary>> = crypto:mac(hmac, sha256, Secret, CID),
+    Token.
 
 %% @doc Validate connection ID parameters from peer transport params.
 %% RFC 9000 Section 7.3: Endpoints MUST validate connection ID parameters.
@@ -8531,6 +8548,11 @@ test_spin_state(#state{
 -spec test_spin_state_for(client | server, boolean()) -> #state{}.
 test_spin_state_for(Role, Enabled) ->
     #state{role = Role, spin_bit_enabled = Enabled}.
+
+%% Minimal #state{} for stateless-reset tests.
+-spec test_state_with_secret(binary() | undefined) -> #state{}.
+test_state_with_secret(Secret) ->
+    #state{stateless_reset_secret = Secret}.
 
 %% Test helper for check_send_queue_flow_control/3.
 %% Wraps the internal function to avoid exposing #state{} record.
