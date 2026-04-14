@@ -161,6 +161,15 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 ### Datagrams (RFC 9221)
 - `quic:send_datagram/2` - Send unreliable datagram
 - `quic:datagram_max_size/1` - Get max datagram size (0 if unsupported)
+- `quic:datagram_stats/1` - Delivered / dropped / sent counters (backpressure)
+
+### HTTP Datagrams (RFC 9297)
+- `quic_h3:send_datagram/3` - Send an HTTP datagram bound to a request stream
+- `quic_h3:h3_datagrams_enabled/1` - Whether both sides negotiated support
+- `quic_h3:max_datagram_size/2` - Max payload per datagram for a given stream
+- Owner event: `{quic_h3, Conn, {datagram, StreamId, Payload}}`
+- Set `h3_datagram_enabled => true` on `connect/3` / `start_server/3` to enable.
+  CONNECT-UDP (RFC 9298) builds on this in a separate library.
 
 ### Streams
 - `quic:open_stream/1` - Open bidirectional stream
@@ -199,6 +208,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `max_data` - Connection-level flow control limit
 - `max_stream_data` - Stream-level flow control limit
 - `max_datagram_frame_size` - Max datagram size to accept (0 = disabled, default: 0)
+- `datagram_recv_queue_len` - Bounded receive queue for inbound datagrams (default: `infinity`; drops oldest on overflow, tracked via `datagram_stats/1`)
 - `reset_stream_at` - Enable RESET_STREAM_AT extension (default: false)
 - `alpn` - ALPN protocols list
 - `verify` - Certificate verification mode

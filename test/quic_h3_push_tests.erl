@@ -377,7 +377,9 @@ make_test_state(Overrides) ->
         stream_data_buffers => #{},
         stream_buffer_limit => 65536,
         stream_type_handler => undefined,
-        claimed_uni_streams => #{}
+        claimed_uni_streams => #{},
+        h3_datagram_enabled => false,
+        peer_h3_datagram_enabled => false
     },
     Merged = maps:merge(Default, Overrides),
     {state, maps:get(quic_conn, Merged), maps:get(quic_ref, Merged), maps:get(role, Merged),
@@ -402,4 +404,5 @@ make_test_state(Overrides) ->
         maps:get(last_accepted_push_id, Merged), maps:get(stream_handlers, Merged),
         maps:get(stream_data_buffers, Merged), maps:get(stream_buffer_limit, Merged),
         maps:get(local_connect_enabled, Merged), maps:get(stream_type_handler, Merged),
-        maps:get(claimed_uni_streams, Merged)}.
+        maps:get(claimed_uni_streams, Merged), maps:get(h3_datagram_enabled, Merged),
+        maps:get(peer_h3_datagram_enabled, Merged)}.

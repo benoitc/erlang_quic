@@ -113,7 +113,11 @@
     %% Per-stream handler registration
     set_stream_handler/3,
     set_stream_handler/4,
-    unset_stream_handler/2
+    unset_stream_handler/2,
+    %% HTTP Datagrams (RFC 9297)
+    send_datagram/3,
+    h3_datagrams_enabled/1,
+    max_datagram_size/2
 ]).
 
 %% Server API
@@ -138,7 +142,7 @@
 
 %% Internal callbacks
 -export([
-    h3_connection_handler/5
+    h3_connection_handler/2
 ]).
 
 %% Query API
@@ -247,7 +251,7 @@ connect(Host, Port, Opts) ->
     end.
 
 start_h3_connection(QuicConn, HostBin, Port, Opts) ->
-    H3Opts = maps:with([settings, stream_type_handler], Opts),
+    H3Opts = maps:with([settings, stream_type_handler, h3_datagram_enabled], Opts),
     case quic_h3_connection:start_link(QuicConn, HostBin, Port, H3Opts) of
         {ok, H3Conn} ->
             %% Transfer ownership to H3 process so it receives QUIC events
@@ -437,13 +441,21 @@ start_server(Name, Port, Opts) ->
     Handler = maps:get(handler, Opts, fun default_handler/5),
     H3Settings = maps:get(settings, Opts, #{}),
     StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
+    H3DatagramEnabled = maps:get(h3_datagram_enabled, Opts, false),
     QuicOpts0 = build_server_quic_opts(Opts),
     %% Set up connection handler that starts H3 connection for each QUIC connection
     Owner = self(),
     QuicOpts = QuicOpts0#{
         connection_handler => fun(ConnPid, _ConnRef) ->
             h3_connection_handler(
-                ConnPid, Handler, H3Settings, StreamTypeHandler, Owner
+                ConnPid,
+                #{
+                    handler => Handler,
+                    settings => H3Settings,
+                    stream_type_handler => StreamTypeHandler,
+                    h3_datagram_enabled => H3DatagramEnabled,
+                    owner => Owner
+                }
             )
         end
     },
@@ -527,6 +539,44 @@ cancel_push(Conn, PushId) ->
     quic_h3_connection:cancel_push(Conn, PushId).
 
 %%====================================================================
+%% HTTP Datagrams (RFC 9297)
+%%====================================================================
+
+%% @doc Send an HTTP Datagram bound to a request stream.
+%%
+%% Enabled by passing `h3_datagram_enabled => true' to
+%% {@link connect/3} or {@link start_server/3}; the underlying QUIC
+%% connection must also advertise a non-zero `max_datagram_frame_size'
+%% (RFC 9221) for the H3 extension to go live.
+%%
+%% Returns `{error, h3_datagrams_disabled}' when the extension was not
+%% negotiated, `{error, unknown_stream}' when the stream id is not a
+%% known request stream, or one of the RFC 9221 error atoms
+%% (`datagrams_not_supported', `datagram_too_large',
+%% `datagram_too_large_for_path', `congestion_limited') forwarded from
+%% the QUIC layer.
+%%
+%% Payload for a WebTransport-style CONNECT session is typically handed
+%% over unmodified; the quarter-stream-id prefix is added automatically.
+%% @end
+-spec send_datagram(conn(), stream_id(), iodata()) -> ok | {error, term()}.
+send_datagram(Conn, StreamId, Data) ->
+    quic_h3_connection:send_datagram(Conn, StreamId, Data).
+
+%% @doc Whether both sides negotiated RFC 9297 support and the
+%% extension is live on this connection.
+-spec h3_datagrams_enabled(conn()) -> boolean().
+h3_datagrams_enabled(Conn) ->
+    quic_h3_connection:h3_datagrams_enabled(Conn).
+
+%% @doc Max payload we can fit in one H3 DATAGRAM for the given stream.
+%% Returns 0 if RFC 9297 isn't live or the peer advertised 0 for
+%% `max_datagram_frame_size'.
+-spec max_datagram_size(conn(), stream_id()) -> non_neg_integer().
+max_datagram_size(Conn, StreamId) ->
+    quic_h3_connection:max_datagram_size(Conn, StreamId).
+
+%%====================================================================
 %% Query API
 %%====================================================================
 
@@ -595,7 +645,8 @@ build_client_quic_opts(Host, Opts) ->
     TlsOpts = maps:with([cert, key, cacerts, verify], Opts),
     %% Add any custom QUIC options
     QuicOpts = maps:get(quic_opts, Opts, #{}),
-    maps:merge(maps:merge(BaseOpts, TlsOpts), QuicOpts).
+    Merged = maps:merge(maps:merge(BaseOpts, TlsOpts), QuicOpts),
+    maybe_enable_quic_datagrams(Opts, Merged).
 
 build_server_quic_opts(Opts) ->
     BaseOpts = #{
@@ -605,20 +656,42 @@ build_server_quic_opts(Opts) ->
     TlsOpts = maps:with([cert, key, cacerts], Opts),
     %% Custom QUIC options
     QuicOpts = maps:get(quic_opts, Opts, #{}),
-    maps:merge(maps:merge(BaseOpts, TlsOpts), QuicOpts).
+    Merged = maps:merge(maps:merge(BaseOpts, TlsOpts), QuicOpts),
+    maybe_enable_quic_datagrams(Opts, Merged).
+
+%% When the caller opts into H3 datagrams but hasn't explicitly set
+%% max_datagram_frame_size, default it to 65535 so the QUIC layer
+%% advertises support. An explicit caller value is respected.
+maybe_enable_quic_datagrams(Opts, QuicOpts) ->
+    case maps:get(h3_datagram_enabled, Opts, false) of
+        true ->
+            case maps:is_key(max_datagram_frame_size, QuicOpts) of
+                true -> QuicOpts;
+                false -> QuicOpts#{max_datagram_frame_size => 65535}
+            end;
+        false ->
+            QuicOpts
+    end.
 
 %% @private
 %% Connection handler callback for QUIC server.
 %% Called when a new QUIC connection is established (before handshake completes).
-%% When `StreamTypeHandler' is set, the claimed stream events are
-%% delivered to `Owner' (the process that called `start_server/3').
-h3_connection_handler(QuicConnPid, Handler, Settings, StreamTypeHandler, Owner) ->
-    %% Start HTTP/3 connection handler for the server side
-    H3Opts = base_server_h3_opts(Settings, Handler, StreamTypeHandler),
+%% `Opts' carries the per-server configuration captured in start_server/3:
+%% `handler', `settings', `stream_type_handler', `h3_datagram_enabled',
+%% and the calling process pid as `owner' (used when any extension hook
+%% needs owner-delivered messages).
+h3_connection_handler(QuicConnPid, #{handler := Handler, settings := Settings} = Opts) ->
+    StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
+    H3DatagramEnabled = maps:get(h3_datagram_enabled, Opts, false),
+    Owner = maps:get(owner, Opts, self()),
+    H3Opts = build_h3_opts(Settings, Handler, StreamTypeHandler, H3DatagramEnabled),
+    %% When an extension hook is active, owner-addressed events need to
+    %% reach the caller of start_server/3 rather than this transient
+    %% callback process.
     OwnerForH3 =
-        case StreamTypeHandler of
-            undefined -> self();
-            _ -> Owner
+        case (StreamTypeHandler =/= undefined) orelse H3DatagramEnabled of
+            true -> Owner;
+            false -> self()
         end,
     case
         gen_statem:start_link(
@@ -634,14 +707,16 @@ h3_connection_handler(QuicConnPid, Handler, Settings, StreamTypeHandler, Owner) 
             {error, Reason}
     end.
 
-base_server_h3_opts(Settings, Handler, undefined) ->
+build_h3_opts(Settings, Handler, undefined, false) ->
     #{settings => Settings, handler => Handler};
-base_server_h3_opts(Settings, Handler, StreamTypeHandler) ->
-    #{
-        settings => Settings,
-        handler => Handler,
-        stream_type_handler => StreamTypeHandler
-    }.
+build_h3_opts(Settings, Handler, StreamTypeHandler, H3DatagramEnabled) ->
+    Base = #{settings => Settings, handler => Handler},
+    Base1 =
+        case StreamTypeHandler of
+            undefined -> Base;
+            _ -> Base#{stream_type_handler => StreamTypeHandler}
+        end,
+    Base1#{h3_datagram_enabled => H3DatagramEnabled}.
 
 default_handler(Conn, StreamId, _Method, _Path, _Headers) ->
     send_response(Conn, StreamId, 404, [{<<"content-type">>, <<"text/plain">>}]),

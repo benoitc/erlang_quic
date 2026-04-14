@@ -77,6 +77,7 @@
     set_owner_sync/2,
     send_datagram/2,
     datagram_max_size/1,
+    datagram_stats/1,
     setopts/2,
     migrate/1,
     migrate/2,
@@ -366,6 +367,22 @@ send_datagram(Conn, Data) when is_pid(Conn) ->
     Conn :: pid().
 datagram_max_size(Conn) when is_pid(Conn) ->
     quic_connection:datagram_max_size(Conn).
+
+%% @doc Get datagram accounting counters.
+%% Returns delivered / dropped_recv / sent / dropped_send counters so
+%% callers can detect back-pressure when `datagram_recv_queue_len'
+%% has been set to a finite value.
+-spec datagram_stats(Conn) ->
+    #{
+        delivered := non_neg_integer(),
+        dropped_recv := non_neg_integer(),
+        sent := non_neg_integer(),
+        dropped_send := non_neg_integer()
+    }
+when
+    Conn :: pid().
+datagram_stats(Conn) when is_pid(Conn) ->
+    quic_connection:datagram_stats(Conn).
 
 %% @doc Set connection options.
 -spec setopts(Conn, Opts) -> ok | {error, term()} when

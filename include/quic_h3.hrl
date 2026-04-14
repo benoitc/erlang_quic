@@ -47,6 +47,12 @@
 -define(H3_SETTINGS_MAX_FIELD_SECTION_SIZE, 16#06).
 -define(H3_SETTINGS_QPACK_BLOCKED_STREAMS, 16#07).
 -define(H3_SETTINGS_ENABLE_CONNECT_PROTOCOL, 16#08).
+%% RFC 9297 §2.1
+-define(H3_SETTINGS_H3_DATAGRAM, 16#33).
+
+%% RFC 9297 §3.2 registered capsule types
+-define(H3_CAPSULE_DATAGRAM, 16#00).
+-define(H3_CAPSULE_LEGACY_DATAGRAM, 16#ff37a0).
 
 %% Reserved settings (RFC 9114 Section 7.2.4.1)
 %% 0x1f * N + 0x21 for any non-negative integer N

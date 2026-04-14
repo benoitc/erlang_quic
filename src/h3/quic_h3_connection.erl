@@ -43,7 +43,11 @@
     %% Per-stream handler registration
     set_stream_handler/3,
     set_stream_handler/4,
-    unset_stream_handler/2
+    unset_stream_handler/2,
+    %% HTTP Datagrams (RFC 9297)
+    send_datagram/3,
+    h3_datagrams_enabled/1,
+    max_datagram_size/2
 ]).
 
 %% gen_statem callbacks
@@ -228,7 +232,13 @@
     %% Uni streams that the stream_type_handler claimed; maps StreamId
     %% to the advertised varint stream type so owner messages can
     %% include it.
-    claimed_uni_streams = #{} :: #{stream_id() => non_neg_integer()}
+    claimed_uni_streams = #{} :: #{stream_id() => non_neg_integer()},
+
+    %% RFC 9297 HTTP Datagrams. Both sides must advertise
+    %% SETTINGS_H3_DATAGRAM = 1 AND non-zero max_datagram_frame_size on
+    %% their QUIC transport parameters for the extension to go live.
+    h3_datagram_enabled = false :: boolean(),
+    peer_h3_datagram_enabled = false :: boolean()
 }).
 
 %%====================================================================
@@ -354,6 +364,23 @@ set_max_push_id(Conn, MaxPushId) ->
 cancel_push(Conn, PushId) ->
     gen_statem:cast(Conn, {cancel_push, PushId}).
 
+%% @doc Send an HTTP Datagram (RFC 9297) associated with a request stream.
+-spec send_datagram(pid(), stream_id(), iodata()) -> ok | {error, term()}.
+send_datagram(Conn, StreamId, Data) ->
+    gen_statem:call(Conn, {send_h3_datagram, StreamId, Data}).
+
+%% @doc Whether both sides negotiated RFC 9297 support.
+-spec h3_datagrams_enabled(pid()) -> boolean().
+h3_datagrams_enabled(Conn) ->
+    gen_statem:call(Conn, h3_datagrams_enabled).
+
+%% @doc Max payload we can fit in one H3 DATAGRAM for this stream, given
+%% the peer's max_datagram_frame_size minus the quarter-stream-id prefix.
+%% Returns 0 if RFC 9297 isn't live.
+-spec max_datagram_size(pid(), stream_id()) -> non_neg_integer().
+max_datagram_size(Conn, StreamId) ->
+    gen_statem:call(Conn, {h3_max_datagram_size, StreamId}).
+
 %% @doc Register a handler process to receive stream data.
 %% The handler will receive `{quic_h3, Conn, {data, StreamId, Data, Fin}}` messages.
 %% Any data buffered before registration is returned.
@@ -399,6 +426,7 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
     LocalMaxBlocked = maps:get(qpack_blocked_streams, LocalSettings, 0),
     LocalConnectEnabled = maps:get(enable_connect_protocol, LocalSettings, 0) =:= 1,
     StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
+    H3DatagramEnabled = maps:get(h3_datagram_enabled, Opts, false),
 
     State = #state{
         quic_conn = QuicConn,
@@ -414,7 +442,8 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
         local_max_field_section_size = LocalMaxFieldSize,
         local_max_blocked_streams = LocalMaxBlocked,
         local_connect_enabled = LocalConnectEnabled,
-        stream_type_handler = StreamTypeHandler
+        stream_type_handler = StreamTypeHandler,
+        h3_datagram_enabled = H3DatagramEnabled
     },
 
     %% Start in awaiting_quic - wait for QUIC connected notification
@@ -434,6 +463,7 @@ init({server, QuicConn, Opts, Owner}) ->
     LocalConnectEnabled = maps:get(enable_connect_protocol, LocalSettings, 0) =:= 1,
     Handler = maps:get(handler, Opts, undefined),
     StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
+    H3DatagramEnabled = maps:get(h3_datagram_enabled, Opts, false),
 
     State = #state{
         quic_conn = QuicConn,
@@ -449,7 +479,8 @@ init({server, QuicConn, Opts, Owner}) ->
         local_max_field_section_size = LocalMaxFieldSize,
         local_max_blocked_streams = LocalMaxBlocked,
         local_connect_enabled = LocalConnectEnabled,
-        stream_type_handler = StreamTypeHandler
+        stream_type_handler = StreamTypeHandler,
+        h3_datagram_enabled = H3DatagramEnabled
     },
 
     %% Store handler in process dictionary for server
@@ -619,6 +650,33 @@ connected(
         {error, Reason} ->
             handle_connection_error(Reason, State)
     end;
+connected(
+    info,
+    {quic, QuicConn, {datagram, Data}},
+    #state{quic_conn = QuicConn} = State
+) ->
+    deliver_h3_datagram(Data, State),
+    {keep_state, State};
+connected({call, From}, {send_h3_datagram, StreamId, Data}, State) ->
+    {keep_state, State, [{reply, From, h3_send_datagram(StreamId, Data, State)}]};
+connected({call, From}, h3_datagrams_enabled, State) ->
+    {keep_state, State, [{reply, From, h3_datagrams_live(State)}]};
+connected(
+    {call, From},
+    {h3_max_datagram_size, StreamId},
+    #state{quic_conn = QuicConn} = State
+) ->
+    Reply =
+        case h3_datagrams_live(State) of
+            false ->
+                0;
+            true ->
+                case quic:datagram_max_size(QuicConn) of
+                    0 -> 0;
+                    Max -> max(0, Max - byte_size(quic_varint:encode(StreamId bsr 2)))
+                end
+        end,
+    {keep_state, State, [{reply, From, Reply}]};
 connected({call, From}, {request, Headers, Opts}, #state{role = client} = State) ->
     case send_request(Headers, Opts, State) of
         {ok, StreamId, State1} ->
@@ -891,9 +949,19 @@ send_settings(
     #state{
         quic_conn = QuicConn,
         local_control_stream = ControlStream,
-        local_settings = Settings
+        local_settings = Settings0,
+        h3_datagram_enabled = H3DatagramEnabled
     } = State
 ) ->
+    %% RFC 9297 §2.1: advertise SETTINGS_H3_DATAGRAM only when the
+    %% caller opted in AND the underlying QUIC connection actually
+    %% negotiated a non-zero max_datagram_frame_size. Advertising the
+    %% setting without QUIC datagrams is an H3_SETTINGS_ERROR per spec.
+    Settings =
+        case H3DatagramEnabled andalso quic:datagram_max_size(QuicConn) > 0 of
+            true -> Settings0#{h3_datagram => 1};
+            false -> Settings0
+        end,
     SettingsFrame = quic_h3_frame:encode_settings(Settings),
     case quic:send_data(QuicConn, ControlStream, SettingsFrame, false) of
         ok ->
@@ -3569,14 +3637,89 @@ apply_peer_settings(Settings, #state{qpack_encoder = Encoder} = State) ->
     %% 4. Connect protocol enabled (RFC 9220)
     ConnectEnabled = maps:get(enable_connect_protocol, Settings, 0) =:= 1,
 
+    %% 5. H3 DATAGRAM (RFC 9297). Value must be 0 or 1; anything else is
+    %% a SETTINGS_ERROR. A peer advertising h3_datagram = 1 without a
+    %% non-zero QUIC max_datagram_frame_size is also an error.
+    H3DatagramEnabled =
+        case maps:find(h3_datagram, Settings) of
+            {ok, 0} ->
+                false;
+            {ok, 1} ->
+                validate_peer_h3_datagram(State);
+            {ok, _Other} ->
+                throw({connection_error, ?H3_SETTINGS_ERROR, <<"invalid h3_datagram">>});
+            error ->
+                false
+        end,
+
     %% Send any encoder instructions generated by capacity change
     State1 = State#state{
         qpack_encoder = Encoder1,
         peer_max_field_section_size = MaxFieldSectionSize,
         peer_max_blocked_streams = MaxBlockedStreams,
-        peer_connect_enabled = ConnectEnabled
+        peer_connect_enabled = ConnectEnabled,
+        peer_h3_datagram_enabled = H3DatagramEnabled
     },
     send_encoder_instructions(State1).
+
+%% RFC 9297 §2.1: peer SETTINGS_H3_DATAGRAM = 1 requires non-zero
+%% max_datagram_frame_size on the QUIC connection. Return `true' when
+%% the precondition holds, otherwise raise H3_SETTINGS_ERROR.
+validate_peer_h3_datagram(#state{quic_conn = QuicConn}) ->
+    case quic:datagram_max_size(QuicConn) of
+        0 ->
+            throw(
+                {connection_error, ?H3_SETTINGS_ERROR,
+                    <<"h3_datagram without max_datagram_frame_size">>}
+            );
+        _ ->
+            true
+    end.
+
+%% RFC 9297 §2.1 inbound datagram. Peel the quarter-stream-id varint
+%% and deliver the payload tagged with the full stream id to the owner.
+%% Datagrams for unknown streams are dropped silently per §5.
+deliver_h3_datagram(Data, #state{owner = Owner} = State) ->
+    case decode_h3_datagram(Data) of
+        {ok, StreamId, Payload} ->
+            case maps:is_key(StreamId, State#state.streams) of
+                true -> Owner ! {quic_h3, self(), {datagram, StreamId, Payload}};
+                false -> ok
+            end;
+        error ->
+            ok
+    end.
+
+decode_h3_datagram(Bin) ->
+    try
+        {QSID, Rest} = quic_varint:decode(Bin),
+        {ok, QSID bsl 2, Rest}
+    catch
+        _:_ -> error
+    end.
+
+%% RFC 9297 §2.1 outbound. Caller provides the request stream id; we
+%% prepend QSID = StreamId bsr 2 and hand the framed bytes to the QUIC
+%% DATAGRAM send path. Errors from the QUIC layer (datagrams_not_supported,
+%% datagram_too_large, datagram_too_large_for_path, congestion_limited)
+%% bubble up unchanged.
+h3_send_datagram(StreamId, Data, State) ->
+    case h3_datagrams_live(State) of
+        false ->
+            {error, h3_datagrams_disabled};
+        true ->
+            case maps:is_key(StreamId, State#state.streams) of
+                false ->
+                    {error, unknown_stream};
+                true ->
+                    QSID = quic_varint:encode(StreamId bsr 2),
+                    Framed = <<QSID/binary, (iolist_to_binary(Data))/binary>>,
+                    quic:send_datagram(State#state.quic_conn, Framed)
+            end
+    end.
+
+h3_datagrams_live(#state{h3_datagram_enabled = L, peer_h3_datagram_enabled = R}) ->
+    L andalso R.
 
 %% Apply RFC 9218 priority to underlying QUIC stream
 apply_stream_priority(StreamId, Stream, #state{quic_conn = QuicConn}) ->

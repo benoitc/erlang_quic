@@ -60,6 +60,7 @@
     send_data_async/4,
     send_datagram/2,
     datagram_max_size/1,
+    datagram_stats/1,
     open_stream/1,
     open_unidirectional_stream/1,
     close/2,
@@ -270,6 +271,17 @@
     max_datagram_frame_size_local = 0 :: non_neg_integer(),
     %% Remote: peer's advertised max size (0 = not supported)
     max_datagram_frame_size_remote = 0 :: non_neg_integer(),
+    %% Bounded receive queue for DATAGRAM frames. `infinity' disables
+    %% the cap entirely (default). When finite, we still push each
+    %% datagram to the owner process, but we also drop the oldest entry
+    %% in this queue when the limit is hit so that `datagram_stats/1'
+    %% surfaces dropped counts for backpressure decisions.
+    datagram_recv_queue_len = infinity :: non_neg_integer() | infinity,
+    datagram_recv_queue = queue:new() :: queue:queue(binary()),
+    datagram_recv_delivered = 0 :: non_neg_integer(),
+    datagram_recv_dropped = 0 :: non_neg_integer(),
+    datagram_sent = 0 :: non_neg_integer(),
+    datagram_send_dropped = 0 :: non_neg_integer(),
 
     %% RESET_STREAM_AT support (draft-ietf-quic-reliable-stream-reset-07)
     %% Local: whether we advertise support for RESET_STREAM_AT
@@ -599,6 +611,16 @@ send_datagram(Conn, Data) ->
 datagram_max_size(Conn) ->
     gen_statem:call(Conn, datagram_max_size).
 
+-spec datagram_stats(pid()) ->
+    #{
+        delivered := non_neg_integer(),
+        dropped_recv := non_neg_integer(),
+        sent := non_neg_integer(),
+        dropped_send := non_neg_integer()
+    }.
+datagram_stats(Conn) ->
+    gen_statem:call(Conn, datagram_stats).
+
 %% @doc Set connection options.
 -spec setopts(pid(), [{atom(), term()}]) -> ok | {error, term()}.
 setopts(Conn, Opts) ->
@@ -840,6 +862,7 @@ init({server, Opts}) ->
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
         max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
+        datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
         reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeout,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
@@ -1081,6 +1104,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
         max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
+        datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
         reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeoutClient,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
@@ -1425,6 +1449,8 @@ connected({call, From}, peercert, #state{peer_cert = Cert} = State) ->
     {keep_state, State, [{reply, From, {ok, Cert}}]};
 connected({call, From}, datagram_max_size, #state{max_datagram_frame_size_remote = Size} = State) ->
     {keep_state, State, [{reply, From, Size}]};
+connected({call, From}, datagram_stats, State) ->
+    {keep_state, State, [{reply, From, datagram_stats_snapshot(State)}]};
 connected({call, From}, {set_owner, NewOwner}, #state{alpn = Alpn, transport_params = TP} = State) ->
     %% Notify new owner that connection is already established
     Info = #{alpn => Alpn, alpn_protocol => Alpn, transport_params => TP},
@@ -1441,6 +1467,8 @@ connected({call, From}, {send_datagram, Data}, State) ->
             %% Event-driven flush: flush batch and timers after user API call
             FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
             {keep_state, FlushedState, [{reply, From, ok}]};
+        {error, Reason, NewState} ->
+            {keep_state, NewState, [{reply, From, {error, Reason}}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -3847,12 +3875,10 @@ process_frame(
     app, {datagram_with_length, Data}, #state{max_datagram_frame_size_local = Max} = State
 ) when byte_size(Data) > Max ->
     send_protocol_violation(<<"DATAGRAM frame too large">>, State);
-process_frame(app, {datagram, Data}, #state{owner = Owner} = State) ->
-    Owner ! {quic, self(), {datagram, Data}},
-    State;
-process_frame(app, {datagram_with_length, Data}, #state{owner = Owner} = State) ->
-    Owner ! {quic, self(), {datagram, Data}},
-    State;
+process_frame(app, {datagram, Data}, State) ->
+    deliver_datagram(Data, State);
+process_frame(app, {datagram_with_length, Data}, State) ->
+    deliver_datagram(Data, State);
 process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
     State.
@@ -5830,36 +5856,110 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
         packets_sent = State#state.packets_sent + 1
     }).
 
-%% Estimate packet overhead (header + AEAD tag + frame header)
+%% Estimate packet overhead (header + AEAD tag + frame header).
+%% Kept as a macro for the stream-chunking paths that sized themselves
+%% against it historically.
 -define(PACKET_OVERHEAD, 50).
+
+%% Short-header packet overhead for a DATAGRAM frame on the 1-RTT level:
+%%   1 byte flags
+%%   + DCID length (no length byte on short header)
+%%   + up to 4 bytes packet number
+%%   + 16 bytes AEAD tag
+%%   + 1 byte frame type (0x31 DATAGRAM_WITH_LEN)
+%%   + up to 2 bytes length varint (covers lengths up to 16383).
+%% That leaves `pmtu - datagram_overhead(State)` as the upper bound on
+%% the payload we can fit in a single UDP datagram without fragmenting.
+datagram_overhead(#state{dcid = Dcid}) ->
+    1 + byte_size(Dcid) + 4 + 16 + 1 + 2.
+
+%% Deliver an inbound DATAGRAM to the owner and account for it in the
+%% bounded recv queue. When the queue has no cap (`infinity') we keep
+%% today's zero-overhead push-to-mailbox behaviour. With a finite cap
+%% the oldest entry is dropped so a slow owner can detect back-pressure
+%% via datagram_stats/1 without the mailbox growing unbounded.
+deliver_datagram(
+    Data,
+    #state{
+        owner = Owner,
+        datagram_recv_queue = Queue,
+        datagram_recv_queue_len = Cap,
+        datagram_recv_delivered = Delivered,
+        datagram_recv_dropped = Dropped
+    } = State
+) ->
+    Owner ! {quic, self(), {datagram, Data}},
+    case Cap of
+        infinity ->
+            State#state{datagram_recv_delivered = Delivered + 1};
+        Max when is_integer(Max), Max >= 0 ->
+            {Queue1, Dropped1} =
+                case queue:len(Queue) >= Max of
+                    true ->
+                        Trimmed = queue_drop_oldest(Queue),
+                        {queue:in(Data, Trimmed), Dropped + 1};
+                    false ->
+                        {queue:in(Data, Queue), Dropped}
+                end,
+            State#state{
+                datagram_recv_queue = Queue1,
+                datagram_recv_delivered = Delivered + 1,
+                datagram_recv_dropped = Dropped1
+            }
+    end.
+
+queue_drop_oldest(Q) ->
+    case queue:out(Q) of
+        {{value, _}, Rest} -> Rest;
+        {empty, _} -> Q
+    end.
+
+%% Stats snapshot used by quic:datagram_stats/1.
+datagram_stats_snapshot(#state{
+    datagram_recv_delivered = Delivered,
+    datagram_recv_dropped = RDropped,
+    datagram_sent = Sent,
+    datagram_send_dropped = SDropped
+}) ->
+    #{
+        delivered => Delivered,
+        dropped_recv => RDropped,
+        sent => Sent,
+        dropped_send => SDropped
+    }.
 
 %% Send a datagram (RFC 9221)
 %% RFC 9221: MUST NOT send DATAGRAM frames until receiving peer's max_datagram_frame_size
-%% and MUST NOT send frames larger than peer's advertised value
+%% and MUST NOT send frames larger than peer's advertised value.
+%% Additionally clamp to the current PMTU budget so we don't emit a UDP
+%% payload the network will black-hole.
 do_send_datagram(_Data, #state{max_datagram_frame_size_remote = 0}) ->
     %% Peer didn't advertise datagram support
     {error, datagrams_not_supported};
 do_send_datagram(
-    Data, #state{max_datagram_frame_size_remote = MaxSize, cc_state = CCState} = State
+    Data, #state{max_datagram_frame_size_remote = PeerMax, cc_state = CCState} = State
 ) ->
     DataBin = iolist_to_binary(Data),
     DataSize = byte_size(DataBin),
-    case DataSize > MaxSize of
-        true ->
-            %% Data exceeds peer's advertised max size
+    PmtuBudget = max(0, get_local_max_udp_payload_size(State) - datagram_overhead(State)),
+    if
+        DataSize > PeerMax ->
             {error, datagram_too_large};
-        false ->
-            PacketSize = DataSize + ?PACKET_OVERHEAD,
-            case quic_cc:can_send(CCState, PacketSize) of
+        DataSize > PmtuBudget ->
+            {error, datagram_too_large_for_path};
+        true ->
+            case quic_cc:can_send(CCState, DataSize + datagram_overhead(State)) of
                 true ->
                     %% Use datagram_with_length for better framing
                     Frame = {datagram_with_length, DataBin},
                     Payload = quic_frame:encode(Frame),
-                    NewState = send_app_packet_internal(Payload, [Frame], State),
-                    {ok, NewState};
+                    State1 = send_app_packet_internal(Payload, [Frame], State),
+                    {ok, State1#state{datagram_sent = State#state.datagram_sent + 1}};
                 false ->
                     %% Datagrams are unreliable - just drop if cwnd is full
-                    {error, congestion_limited}
+                    {error, congestion_limited, State#state{
+                        datagram_send_dropped = State#state.datagram_send_dropped + 1
+                    }}
             end
     end.
 
