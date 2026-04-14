@@ -22,3 +22,38 @@ erlang.mk:
 endif
 
 include $(if $(ERLANG_MK_FILENAME),$(ERLANG_MK_FILENAME),erlang.mk)
+
+##
+## Test convenience targets layered on top of rebar3.
+##
+## `make test-local` runs everything that doesn't need Docker.
+## `make test-docker` runs the h3spec conformance suite, which drives
+## the kazu-yamamoto/h3spec container against our in-process server.
+## `make test-all` runs both stages followed by static checks.
+##
+
+.PHONY: test-local test-docker test-all test-static
+
+test-static:
+	rebar3 fmt --check
+	rebar3 xref
+	rebar3 lint
+	rebar3 dialyzer
+
+test-local:
+	rebar3 eunit
+	rebar3 proper
+	rebar3 ct --suite=quic_e2e_SUITE,\
+	quic_e2e_bbr_SUITE,\
+	quic_e2e_cubic_SUITE,\
+	quic_h3_e2e_SUITE,\
+	quic_datagram_e2e_SUITE,\
+	quic_lb_e2e_SUITE,\
+	quic_client_compliance_SUITE,\
+	quic_interop_SUITE,\
+	quic_h3_server_SUITE
+
+test-docker:
+	rebar3 ct --suite=quic_h3_h3spec_SUITE
+
+test-all: test-local test-docker test-static
