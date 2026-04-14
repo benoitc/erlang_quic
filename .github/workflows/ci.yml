@@ -105,41 +105,11 @@ jobs:
           chmod +x ./certs/generate_certs.sh
           ./certs/generate_certs.sh
 
-      - name: Build Docker images
-        run: docker compose -f docker/docker-compose.yml build
-
-      - name: Start QUIC servers
-        run: |
-          docker compose -f docker/docker-compose.yml up -d
-          for i in {1..30}; do
-            if docker compose -f docker/docker-compose.yml ps | grep -q "healthy"; then
-              echo "Servers are healthy"
-              break
-            fi
-            echo "Waiting for servers... ($i/30)"
-            sleep 2
-          done
-
       - name: Compile
         run: rebar3 compile
 
       - name: Run E2E tests
         run: rebar3 ct --suite=quic_e2e_SUITE
-        env:
-          QUIC_SERVER_HOST: 127.0.0.1
-          QUIC_SERVER_PORT: 4433
-
-      - name: Collect server logs
-        if: failure()
-        run: |
-          echo "=== QUIC Server Logs (aioquic) ==="
-          docker compose -f docker/docker-compose.yml logs quic-server
-          echo "=== QUIC Server Logs (quic-go) ==="
-          docker compose -f docker/docker-compose.yml logs quic-go-server || true
-
-      - name: Stop QUIC servers
-        if: always()
-        run: docker compose -f docker/docker-compose.yml down -v
 
   h3-e2e:
     name: HTTP/3 E2E Tests
@@ -170,42 +140,11 @@ jobs:
           chmod +x ./certs/generate_certs.sh
           ./certs/generate_certs.sh
 
-      - name: Generate large test file
-        run: dd if=/dev/urandom of=docker/www/large.bin bs=1024 count=1024
-
-      - name: Build Docker images
-        run: docker compose -f docker/docker-compose.yml build
-
-      - name: Start H3 server
-        run: |
-          docker compose -f docker/docker-compose.yml up -d h3-server
-          for i in {1..30}; do
-            if docker compose -f docker/docker-compose.yml ps | grep -q "healthy"; then
-              echo "H3 server is healthy"
-              break
-            fi
-            echo "Waiting for H3 server... ($i/30)"
-            sleep 2
-          done
-
       - name: Compile
         run: rebar3 compile
 
       - name: Run H3 E2E tests
         run: rebar3 ct --suite=quic_h3_e2e_SUITE
-        env:
-          H3_SERVER_HOST: 127.0.0.1
-          H3_SERVER_PORT: 4435
-
-      - name: Collect server logs
-        if: failure()
-        run: |
-          echo "=== H3 Server Logs ==="
-          docker compose -f docker/docker-compose.yml logs h3-server
-
-      - name: Stop H3 server
-        if: always()
-        run: docker compose -f docker/docker-compose.yml down -v
 
   interop:
     name: Interop Tests
