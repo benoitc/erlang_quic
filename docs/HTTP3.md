@@ -397,6 +397,49 @@ Bidirectional streams are always handled as HTTP/3 request streams
 today — WebTransport's `WT_BIDI_SIGNAL` (varint `0x41`) is not yet
 claimable through this hook.
 
+### HTTP Datagrams (RFC 9297)
+
+Enable with `h3_datagram_enabled => true` on either
+`quic_h3:connect/3` or `quic_h3:start_server/3`. The H3 layer then
+advertises `SETTINGS_H3_DATAGRAM = 1`, and — unless you explicitly set
+`max_datagram_frame_size` in your QUIC options — automatically opens
+RFC 9221 datagram support with a 65535-byte cap. Both sides must
+negotiate for the extension to go live; check with
+`quic_h3:h3_datagrams_enabled/1`.
+
+Each datagram is bound to a request stream via a quarter-stream-id
+varint prefix; that encoding is applied automatically. Callers just
+supply the stream id and payload:
+
+```erlang
+{ok, _} = quic_h3:start_server(my_server, 4433, #{
+    cert => Cert, key => Key,
+    handler => fun my_http_handler/5,
+    h3_datagram_enabled => true
+}).
+
+%% Inside a handler, once you have a StreamId for the request:
+ok = quic_h3:send_datagram(Conn, StreamId, <<"ping">>).
+```
+
+The owner process receives one event per inbound datagram:
+
+| Event | Description |
+|-------|-------------|
+| `{datagram, StreamId, Payload}` | H3 datagram delivered on the given request stream |
+
+Datagrams for unknown stream ids are dropped silently per RFC 9297 §5.
+`quic_h3:max_datagram_size/2` reports the largest payload that fits
+under the peer's cap minus the quarter-stream-id prefix. Everything
+else — loss, congestion drops, PMTU clamping — surfaces as the
+RFC 9221 error atoms from the QUIC layer (`datagram_too_large`,
+`datagram_too_large_for_path`, `congestion_limited`, etc.).
+
+This is the layer a CONNECT-UDP (RFC 9298) library builds on: once
+HTTP Datagrams are live on an extended CONNECT stream, the library
+adds its Context ID prefix and forwards UDP payloads through
+`send_datagram/3`.
+
 ### Messages to Owner
 
 The connection owner process receives messages in the form `{quic_h3, Conn, Event}`.
@@ -439,6 +482,15 @@ Emitted only when a `stream_type_handler` has claimed the stream — see
 | `{stream_type_open, uni, StreamId, VarintType}` | Extension claimed a new uni stream |
 | `{stream_type_data, uni, StreamId, Data, Fin}` | Raw bytes on a claimed stream |
 | `{stream_type_closed, uni, StreamId}` | Peer closed a claimed stream |
+
+#### HTTP Datagram Events (RFC 9297)
+
+Emitted only when `h3_datagram_enabled => true` was negotiated by both
+sides — see [HTTP Datagrams (RFC 9297)](#http-datagrams-rfc-9297) above.
+
+| Event | Description |
+|-------|-------------|
+| `{datagram, StreamId, Payload}` | H3 datagram delivered on the given request stream |
 
 #### Error Events
 

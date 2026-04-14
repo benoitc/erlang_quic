@@ -348,6 +348,7 @@ setting_to_id(qpack_max_table_capacity) -> ?H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY
 setting_to_id(max_field_section_size) -> ?H3_SETTINGS_MAX_FIELD_SECTION_SIZE;
 setting_to_id(qpack_blocked_streams) -> ?H3_SETTINGS_QPACK_BLOCKED_STREAMS;
 setting_to_id(enable_connect_protocol) -> ?H3_SETTINGS_ENABLE_CONNECT_PROTOCOL;
+setting_to_id(h3_datagram) -> ?H3_SETTINGS_H3_DATAGRAM;
 setting_to_id(Id) when is_integer(Id) -> Id.
 
 -spec id_to_setting(non_neg_integer()) -> atom() | non_neg_integer().
@@ -355,6 +356,7 @@ id_to_setting(?H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY) -> qpack_max_table_capacity
 id_to_setting(?H3_SETTINGS_MAX_FIELD_SECTION_SIZE) -> max_field_section_size;
 id_to_setting(?H3_SETTINGS_QPACK_BLOCKED_STREAMS) -> qpack_blocked_streams;
 id_to_setting(?H3_SETTINGS_ENABLE_CONNECT_PROTOCOL) -> enable_connect_protocol;
+id_to_setting(?H3_SETTINGS_H3_DATAGRAM) -> h3_datagram;
 id_to_setting(Id) -> Id.
 
 %%====================================================================
