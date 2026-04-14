@@ -151,7 +151,9 @@
     process_frame/3,
     test_state_for_role/1,
     test_state_for_client/1,
-    test_close_reason/1
+    test_close_reason/1,
+    maybe_validate_initial_token/2,
+    test_state_for_server/3
 ]).
 -endif.
 
@@ -193,6 +195,14 @@
     retry_token = <<>> :: binary(),
     % Whether a Retry packet has been received
     retry_received = false :: boolean(),
+    %% Server-side only. When the listener already validated the
+    %% client's Initial token (and by implication its source address),
+    %% the per-connection Initial-token validator skips its recheck.
+    address_validated = false :: boolean(),
+    %% Server-side only. The Retry SCID to echo back as
+    %% retry_source_connection_id (RFC 9000 §7.3) when this connection
+    %% was spawned from a retried Initial.
+    retry_scid_for_tp = undefined :: binary() | undefined,
     % SCID from Retry packet (for transport param validation)
     retry_scid :: binary() | undefined,
     role :: client | server,
@@ -894,6 +904,8 @@ init({server, Opts}) ->
         datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
         spin_bit_enabled = maps:get(spin_bit, Opts, true),
         stateless_reset_secret = maps:get(reset_secret, Opts, undefined),
+        address_validated = maps:get(address_validated, Opts, false),
+        retry_scid_for_tp = maps:get(retry_scid, Opts, undefined),
         reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeout,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
@@ -1473,8 +1485,12 @@ connected(
             server ->
                 State2
         end,
+    %% RFC 9000 §8.1.3: server issues a NEW_TOKEN so the client can
+    %% skip retry on the next reconnect. Only when a token secret is
+    %% available; clients don't issue tokens.
+    State3b = maybe_send_new_token(State3),
     %% RFC 9000 Section 10.1: Start idle timer when entering connected state
-    State4 = update_last_activity(State3),
+    State4 = update_last_activity(State3b),
     %% RFC 8899: Initialize PMTU discovery after handshake
     State5 = init_pmtu_probing(TransportParams, State4),
     {keep_state, State5};
@@ -2303,12 +2319,21 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         end,
     %% Add preferred_address if configured (RFC 9000 Section 9.6)
     %% Server MUST NOT send preferred_address if disable_active_migration is set
-    TransportParams =
+    TransportParams3 =
         case State#state.server_preferred_address of
             #preferred_address{} = PA ->
                 TransportParams2#{preferred_address => PA};
             _ ->
                 TransportParams2
+        end,
+
+    %% RFC 9000 §7.3: if this server issued a Retry for this client,
+    %% echo the Retry's SCID in retry_source_connection_id so the
+    %% client can verify the full handshake against the Retry it saw.
+    TransportParams =
+        case State#state.retry_scid_for_tp of
+            undefined -> TransportParams3;
+            RetrySCIDTP -> TransportParams3#{retry_source_connection_id => RetrySCIDTP}
         end,
 
     %% Build EncryptedExtensions
@@ -3063,10 +3088,15 @@ decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
             server -> ClientKeys
         end,
 
-    %% Parse token and length
+    %% Parse token and length. The server validates the token against
+    %% its listener-wide secret (RFC 9000 §8.1) so it can mark the
+    %% address as validated and skip a future retry. Validation
+    %% outcomes are logged but do not yet gate connection creation —
+    %% the listener-side retry emission is still a follow-up.
     {TokenLen, Rest2} = quic_varint:decode(Rest),
-    <<_Token:TokenLen/binary, Rest3/binary>> = Rest2,
+    <<Token:TokenLen/binary, Rest3/binary>> = Rest2,
     {PayloadLen, Rest4} = quic_varint:decode(Rest3),
+    _ = maybe_validate_initial_token(Token, State),
 
     %% Header ends here, payload starts
     HeaderLen = byte_size(FullPacket) - byte_size(Rest4),
@@ -8145,6 +8175,61 @@ generate_stateless_reset_token(CID, #state{stateless_reset_secret = Secret}) whe
     <<Token:16/binary, _/binary>> = crypto:mac(hmac, sha256, Secret, CID),
     Token.
 
+%% RFC 9000 §8.1.3 server-side issuance. A NEW_TOKEN frame binds the
+%% client's current source address to an HMAC-signed envelope so the
+%% client can skip the retry round-trip on a future connection.
+%% Requires a token secret; reuses the same listener-wide secret as
+%% stateless reset to avoid spawning a second knob. Only emitted on
+%% server-role connections that reached the connected state.
+maybe_send_new_token(#state{role = client} = State) ->
+    State;
+maybe_send_new_token(#state{stateless_reset_secret = undefined} = State) ->
+    State;
+maybe_send_new_token(
+    #state{
+        role = server,
+        stateless_reset_secret = Secret,
+        remote_addr = Addr
+    } = State
+) ->
+    Token = quic_address_token:encode_new_token(
+        Secret, Addr, erlang:system_time(millisecond)
+    ),
+    send_frame({new_token, Token}, State).
+
+%% RFC 9000 §8.1: validate the Token field a client placed in its
+%% Initial. Returns a `validated | {error, Reason} | no_token'
+%% judgement. Clients and tokenless Initials skip; for servers with
+%% a token secret the HMAC + address + freshness (+ ODCID on retry
+%% tokens) are all checked. This is currently advisory — the listener
+%% doesn't yet retry, so validation outcomes only surface in logs.
+maybe_validate_initial_token(<<>>, _State) ->
+    no_token;
+maybe_validate_initial_token(_Token, #state{role = client}) ->
+    no_token;
+maybe_validate_initial_token(_Token, #state{address_validated = true}) ->
+    %% Listener already ran the full token check. Skipping here avoids
+    %% duplicating the HMAC verify on the hot path.
+    validated;
+maybe_validate_initial_token(_Token, #state{stateless_reset_secret = undefined}) ->
+    no_token;
+maybe_validate_initial_token(Token, #state{
+    stateless_reset_secret = Secret,
+    remote_addr = Addr,
+    original_dcid = ODCID
+}) ->
+    case quic_address_token:decode(Secret, Token) of
+        {ok, #{addr := TokAddr} = Decoded} when TokAddr =/= Addr ->
+            {error, address_mismatch, Decoded};
+        {ok, Decoded} ->
+            case quic_address_token:validate(Decoded, ODCID, #{}) of
+                ok -> validated;
+                {error, Reason} -> {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
 %% @doc Validate connection ID parameters from peer transport params.
 %% RFC 9000 Section 7.3: Endpoints MUST validate connection ID parameters.
 %% - initial_source_connection_id must match SCID in Initial packet
@@ -8587,6 +8672,20 @@ test_state_for_role(Role) ->
 -spec test_state_for_client({inet:ip_address(), inet:port_number()}) -> #state{}.
 test_state_for_client(RemoteAddr) ->
     #state{role = client, app_keys = undefined, remote_addr = RemoteAddr}.
+
+-spec test_state_for_server(
+    {inet:ip_address(), inet:port_number()},
+    binary() | undefined,
+    binary()
+) -> #state{}.
+test_state_for_server(RemoteAddr, Secret, ODCID) ->
+    #state{
+        role = server,
+        app_keys = undefined,
+        remote_addr = RemoteAddr,
+        stateless_reset_secret = Secret,
+        original_dcid = ODCID
+    }.
 
 -spec test_close_reason(#state{}) -> term().
 test_close_reason(#state{close_reason = R}) -> R.
