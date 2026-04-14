@@ -85,6 +85,18 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
+    %% This suite talks to an external QUIC echo server (see
+    %% docker/docker-compose.yml). Skip unless the operator explicitly
+    %% opts in via QUIC_SERVER_HOST so local runs don't report false
+    %% failures against whatever happens to be on port 4433.
+    case os:getenv("QUIC_SERVER_HOST") of
+        false ->
+            {skip, "set QUIC_SERVER_HOST (e.g. via docker compose up) to run"};
+        _ ->
+            do_init_per_suite(Config)
+    end.
+
+do_init_per_suite(Config) ->
     % Ensure crypto is started
     application:ensure_all_started(crypto),
     application:ensure_all_started(ssl),
@@ -115,7 +127,7 @@ init_per_suite(Config) ->
             ct:pal("Server is reachable"),
             [{host, Host}, {port, Port}, {ca_cert, CaCert} | Config];
         {error, Reason} ->
-            ct:fail("Server not reachable: ~p", [Reason])
+            {skip, {server_unavailable, Reason}}
     end.
 
 end_per_suite(_Config) ->

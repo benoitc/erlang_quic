@@ -99,6 +99,14 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
+    case os:getenv("H3_SERVER_HOST") of
+        false ->
+            {skip, "set H3_SERVER_HOST (e.g. via docker compose up) to run"};
+        _ ->
+            do_init_per_suite(Config)
+    end.
+
+do_init_per_suite(Config) ->
     % Ensure crypto is started
     application:ensure_all_started(crypto),
     application:ensure_all_started(ssl),
