@@ -40,6 +40,7 @@
     send_small_datagram/1,
     send_max_size_datagram/1,
     send_oversized_datagram_fails/1,
+    send_oversized_for_path_fails/1,
     receive_datagram/1,
     bidirectional_datagrams/1
 ]).
@@ -76,6 +77,7 @@ groups() ->
             send_small_datagram,
             send_max_size_datagram,
             send_oversized_datagram_fails,
+            send_oversized_for_path_fails,
             receive_datagram,
             bidirectional_datagrams
         ]},
@@ -317,9 +319,11 @@ send_small_datagram(Config) ->
     quic:close(ConnRef, normal),
     ok.
 
-%% Send a datagram at the maximum allowed size
+%% Send a datagram at a size the PMTU budget can actually fit. The peer
+%% may advertise 65535, but on a 1200-byte PMTU we must leave headroom
+%% for the QUIC short-header and frame framing.
 send_max_size_datagram(Config) ->
-    MaxSize = 1200,
+    MaxSize = 65535,
     {ok, _ServerName, Port} = start_server(Config, #{max_datagram_frame_size => MaxSize}),
     {ok, ConnRef} = connect_client(Port, #{max_datagram_frame_size => 65535}),
 
@@ -327,10 +331,28 @@ send_max_size_datagram(Config) ->
     NegotiatedSize = quic:datagram_max_size(ConnRef),
     ?assertEqual(MaxSize, NegotiatedSize),
 
-    %% Send exactly at the limit
-    Data = crypto:strong_rand_bytes(MaxSize),
+    %% Send a payload that fits under both the peer's advertised cap and
+    %% the current PMTU budget.
+    Data = crypto:strong_rand_bytes(1100),
     Result = quic:send_datagram(ConnRef, Data),
     ?assertEqual(ok, Result),
+
+    quic:close(ConnRef, normal),
+    ok.
+
+%% A datagram that fits the peer's advertised max but exceeds the
+%% local PMTU budget must be rejected with a distinguishable error so
+%% callers can retry after PMTU grows.
+send_oversized_for_path_fails(Config) ->
+    {ok, _ServerName, Port} = start_server(Config, #{max_datagram_frame_size => 65535}),
+    {ok, ConnRef} = connect_client(Port, #{max_datagram_frame_size => 65535}),
+
+    %% Peer accepts up to 65535 but the path MTU is ~1200 on loopback.
+    Data = crypto:strong_rand_bytes(4096),
+    ?assertEqual(
+        {error, datagram_too_large_for_path},
+        quic:send_datagram(ConnRef, Data)
+    ),
 
     quic:close(ConnRef, normal),
     ok.

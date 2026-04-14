@@ -5830,27 +5830,44 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
         packets_sent = State#state.packets_sent + 1
     }).
 
-%% Estimate packet overhead (header + AEAD tag + frame header)
+%% Estimate packet overhead (header + AEAD tag + frame header).
+%% Kept as a macro for the stream-chunking paths that sized themselves
+%% against it historically.
 -define(PACKET_OVERHEAD, 50).
+
+%% Short-header packet overhead for a DATAGRAM frame on the 1-RTT level:
+%%   1 byte flags
+%%   + DCID length (no length byte on short header)
+%%   + up to 4 bytes packet number
+%%   + 16 bytes AEAD tag
+%%   + 1 byte frame type (0x31 DATAGRAM_WITH_LEN)
+%%   + up to 2 bytes length varint (covers lengths up to 16383).
+%% That leaves `pmtu - datagram_overhead(State)` as the upper bound on
+%% the payload we can fit in a single UDP datagram without fragmenting.
+datagram_overhead(#state{dcid = Dcid}) ->
+    1 + byte_size(Dcid) + 4 + 16 + 1 + 2.
 
 %% Send a datagram (RFC 9221)
 %% RFC 9221: MUST NOT send DATAGRAM frames until receiving peer's max_datagram_frame_size
-%% and MUST NOT send frames larger than peer's advertised value
+%% and MUST NOT send frames larger than peer's advertised value.
+%% Additionally clamp to the current PMTU budget so we don't emit a UDP
+%% payload the network will black-hole.
 do_send_datagram(_Data, #state{max_datagram_frame_size_remote = 0}) ->
     %% Peer didn't advertise datagram support
     {error, datagrams_not_supported};
 do_send_datagram(
-    Data, #state{max_datagram_frame_size_remote = MaxSize, cc_state = CCState} = State
+    Data, #state{max_datagram_frame_size_remote = PeerMax, cc_state = CCState} = State
 ) ->
     DataBin = iolist_to_binary(Data),
     DataSize = byte_size(DataBin),
-    case DataSize > MaxSize of
-        true ->
-            %% Data exceeds peer's advertised max size
+    PmtuBudget = max(0, get_local_max_udp_payload_size(State) - datagram_overhead(State)),
+    if
+        DataSize > PeerMax ->
             {error, datagram_too_large};
-        false ->
-            PacketSize = DataSize + ?PACKET_OVERHEAD,
-            case quic_cc:can_send(CCState, PacketSize) of
+        DataSize > PmtuBudget ->
+            {error, datagram_too_large_for_path};
+        true ->
+            case quic_cc:can_send(CCState, DataSize + datagram_overhead(State)) of
                 true ->
                     %% Use datagram_with_length for better framing
                     Frame = {datagram_with_length, DataBin},
