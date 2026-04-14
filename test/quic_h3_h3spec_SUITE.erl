@@ -48,6 +48,7 @@ all() ->
 init_per_suite(Config) ->
     application:ensure_all_started(crypto),
     application:ensure_all_started(ssl),
+    {ok, _} = application:ensure_all_started(quic),
 
     %% Check if docker is available
     case os:find_executable("docker") of
