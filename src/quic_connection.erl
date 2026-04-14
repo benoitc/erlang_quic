@@ -150,6 +150,7 @@
     %% NEW_TOKEN frame dispatch (RFC 9000 §8.1.3)
     process_frame/3,
     test_state_for_role/1,
+    test_state_for_client/1,
     test_close_reason/1
 ]).
 -endif.
@@ -1090,6 +1091,15 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
                 SS
         end,
 
+    %% If we've previously received a NEW_TOKEN from this endpoint,
+    %% reuse it in the Initial so the server can skip retry-based
+    %% address validation (RFC 9000 §8.1.3).
+    InitialRetryToken =
+        case quic_token_cache:take(RemoteAddr) of
+            {ok, CachedToken} -> CachedToken;
+            empty -> <<>>
+        end,
+
     %% Initialize state
     State = #state{
         scid = SCID,
@@ -1108,6 +1118,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         client_cert_chain = maps:get(cert_chain, Opts, []),
         client_private_key = maps:get(key, Opts, undefined),
         initial_keys = InitialKeys,
+        retry_token = InitialRetryToken,
         tls_state = ?TLS_AWAITING_SERVER_HELLO,
         alpn_list = AlpnList,
         pn_initial = PNSpace,
@@ -3921,7 +3932,8 @@ process_frame(app, {datagram_with_length, Data}, State) ->
 %% tracked as a follow-up.
 process_frame(app, {new_token, _}, #state{role = server} = State) ->
     send_protocol_violation(<<"NEW_TOKEN received by server">>, State);
-process_frame(app, {new_token, _}, #state{role = client} = State) ->
+process_frame(app, {new_token, Token}, #state{role = client, remote_addr = Addr} = State) ->
+    ok = quic_token_cache:put(Addr, Token),
     State;
 process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
@@ -8571,6 +8583,10 @@ test_state_with_secret(Secret) ->
 -spec test_state_for_role(client | server) -> #state{}.
 test_state_for_role(Role) ->
     #state{role = Role, app_keys = undefined}.
+
+-spec test_state_for_client({inet:ip_address(), inet:port_number()}) -> #state{}.
+test_state_for_client(RemoteAddr) ->
+    #state{role = client, app_keys = undefined, remote_addr = RemoteAddr}.
 
 -spec test_close_reason(#state{}) -> term().
 test_close_reason(#state{close_reason = R}) -> R.

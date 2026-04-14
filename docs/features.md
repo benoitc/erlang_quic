@@ -9,9 +9,9 @@
 - [x] Version negotiation
 - [x] Retry packets for address validation
 - [x] Latency spin bit (RFC 9000 §17.4) with `spin_bit => true | false`
-- [x] NEW_TOKEN frame dispatch (server rejects per §8.1.3)
+- [x] NEW_TOKEN frame dispatch (server rejects per §8.1.3); client caches received tokens keyed by `{Host, Port}` and reuses them in the Initial of the next connect to the same endpoint
 - [x] Stateless reset (RFC 9000 §10.3): listener emits resets for orphan packets; per-connection `NEW_CONNECTION_ID` tokens share the listener's HMAC secret so they match orphan-path tokens
-- [ ] NEW_TOKEN cache + reconnect-without-retry — follow-up
+- [ ] Server-side NEW_TOKEN issuance + retry-skipping validation — depends on server-side retry not yet implemented, follow-up
 
 ### Streams
 - [x] Bidirectional streams (client and server initiated)

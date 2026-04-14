@@ -18,7 +18,11 @@ server_rejects_new_token_with_protocol_violation_test() ->
         quic_connection:test_close_reason(S1)
     ).
 
-client_accepts_new_token_without_state_change_test() ->
-    S0 = quic_connection:test_state_for_role(client),
-    S1 = quic_connection:process_frame(app, {new_token, <<"opaque">>}, S0),
-    ?assertEqual(S0, S1).
+client_caches_new_token_keyed_by_remote_addr_test() ->
+    application:ensure_all_started(quic),
+    ok = quic_token_cache:clear(),
+    Addr = {{127, 0, 0, 1}, 4433},
+    S0 = quic_connection:test_state_for_client(Addr),
+    S1 = quic_connection:process_frame(app, {new_token, <<"tok">>}, S0),
+    ?assertEqual(S0, S1),
+    ?assertEqual({ok, <<"tok">>}, quic_token_cache:take(Addr)).
