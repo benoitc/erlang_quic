@@ -138,7 +138,7 @@
 
 %% Internal callbacks
 -export([
-    h3_connection_handler/4
+    h3_connection_handler/5
 ]).
 
 %% Query API
@@ -174,6 +174,9 @@
 -type status() :: 100..599.
 -type error_code() :: non_neg_integer().
 
+-type stream_type_handler() ::
+    fun((uni, stream_id(), non_neg_integer()) -> claim | ignore).
+
 -type connect_opts() :: #{
     %% TLS options
     cert => binary(),
@@ -183,7 +186,9 @@
     %% HTTP/3 settings
     settings => map(),
     %% QUIC options
-    quic_opts => map()
+    quic_opts => map(),
+    %% Extension hook for unknown uni-stream types (e.g. WebTransport).
+    stream_type_handler => stream_type_handler()
 }.
 
 -type server_opts() :: #{
@@ -195,7 +200,9 @@
     %% HTTP/3 settings
     settings => map(),
     %% QUIC options
-    quic_opts => map()
+    quic_opts => map(),
+    %% Extension hook for unknown uni-stream types (e.g. WebTransport).
+    stream_type_handler => stream_type_handler()
 }.
 
 %%====================================================================
@@ -240,7 +247,7 @@ connect(Host, Port, Opts) ->
     end.
 
 start_h3_connection(QuicConn, HostBin, Port, Opts) ->
-    H3Opts = maps:with([settings], Opts),
+    H3Opts = maps:with([settings, stream_type_handler], Opts),
     case quic_h3_connection:start_link(QuicConn, HostBin, Port, H3Opts) of
         {ok, H3Conn} ->
             %% Transfer ownership to H3 process so it receives QUIC events
@@ -429,11 +436,15 @@ unset_stream_handler(Conn, StreamId) ->
 start_server(Name, Port, Opts) ->
     Handler = maps:get(handler, Opts, fun default_handler/5),
     H3Settings = maps:get(settings, Opts, #{}),
+    StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
     QuicOpts0 = build_server_quic_opts(Opts),
     %% Set up connection handler that starts H3 connection for each QUIC connection
+    Owner = self(),
     QuicOpts = QuicOpts0#{
         connection_handler => fun(ConnPid, _ConnRef) ->
-            h3_connection_handler(ConnPid, Handler, H3Settings, self())
+            h3_connection_handler(
+                ConnPid, Handler, H3Settings, StreamTypeHandler, Owner
+            )
         end
     },
     quic:start_server(Name, Port, QuicOpts).
@@ -597,15 +608,23 @@ build_server_quic_opts(Opts) ->
     maps:merge(maps:merge(BaseOpts, TlsOpts), QuicOpts).
 
 %% @private
-%% Connection handler callback for QUIC server
-%% Called when a new QUIC connection is established (before handshake completes)
-h3_connection_handler(QuicConnPid, Handler, Settings, _Owner) ->
+%% Connection handler callback for QUIC server.
+%% Called when a new QUIC connection is established (before handshake completes).
+%% When `StreamTypeHandler' is set, the claimed stream events are
+%% delivered to `Owner' (the process that called `start_server/3').
+h3_connection_handler(QuicConnPid, Handler, Settings, StreamTypeHandler, Owner) ->
     %% Start HTTP/3 connection handler for the server side
-    H3Opts = #{
-        settings => Settings,
-        handler => Handler
-    },
-    case gen_statem:start_link(quic_h3_connection, {server, QuicConnPid, H3Opts, self()}, []) of
+    H3Opts = base_server_h3_opts(Settings, Handler, StreamTypeHandler),
+    OwnerForH3 =
+        case StreamTypeHandler of
+            undefined -> self();
+            _ -> Owner
+        end,
+    case
+        gen_statem:start_link(
+            quic_h3_connection, {server, QuicConnPid, H3Opts, OwnerForH3}, []
+        )
+    of
         {ok, H3Conn} ->
             %% Transfer ownership to H3 process so it receives QUIC events
             %% including the {connected, Info} notification after handshake completes
@@ -614,6 +633,15 @@ h3_connection_handler(QuicConnPid, Handler, Settings, _Owner) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+base_server_h3_opts(Settings, Handler, undefined) ->
+    #{settings => Settings, handler => Handler};
+base_server_h3_opts(Settings, Handler, StreamTypeHandler) ->
+    #{
+        settings => Settings,
+        handler => Handler,
+        stream_type_handler => StreamTypeHandler
+    }.
 
 default_handler(Conn, StreamId, _Method, _Path, _Headers) ->
     send_response(Conn, StreamId, 404, [{<<"content-type">>, <<"text/plain">>}]),
