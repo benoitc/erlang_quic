@@ -664,6 +664,7 @@ create_connection(
         connections = Conns,
         connection_handler = ConnHandler,
         cid_config = CIDConfig,
+        reset_secret = ResetSecret,
         opts = Opts
     }
 ) ->
@@ -674,7 +675,11 @@ create_connection(
             #cid_config{} -> quic_lb:generate_cid(CIDConfig)
         end,
 
-    %% Start connection process with client's QUIC version
+    %% Start connection process with client's QUIC version.
+    %% `reset_secret' is propagated so this connection's
+    %% NEW_CONNECTION_ID tokens match the ones the listener will emit
+    %% for orphan packets after the connection goes away (RFC 9000
+    %% §10.3.2).
     ConnOpts = #{
         role => server,
         socket => Socket,
@@ -687,6 +692,7 @@ create_connection(
         alpn => ALPNList,
         listener => self(),
         cid_config => CIDConfig,
+        reset_secret => ResetSecret,
         version => Version
     },
 
