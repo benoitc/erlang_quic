@@ -92,11 +92,17 @@
 %% Minimum cwnd in packets
 -define(MIN_PIPE_CWND, 4).
 
-%% Timing constants (milliseconds)
--define(PROBE_RTT_DURATION, 200).
--define(PROBE_RTT_INTERVAL, 5000).
--define(MIN_RTT_FILTER_LEN, 10000).
+%% Timing constants (microseconds internally; loopback RTTs lose
+%% signal at ms granularity so every timestamp field below is µs).
+-define(PROBE_RTT_DURATION, 200 * 1000).
+-define(PROBE_RTT_INTERVAL, 5000 * 1000).
+-define(MIN_RTT_FILTER_LEN, 10000 * 1000).
 -define(MAX_BW_FILTER_LEN, 2).
+
+%% Minimum ACK interval before falling back to initial_rtt (µs).
+%% Below this, delivery-rate samples are unreliable (e.g. coalesced
+%% ACKs on loopback) and would artificially depress max_bw.
+-define(MIN_ACK_INTERVAL_US, 200).
 
 %% Pacing margin (1% headroom)
 -define(PACING_MARGIN, 0.99).
@@ -217,11 +223,13 @@
 new(Opts) ->
     MaxDatagramSize = maps:get(max_datagram_size, Opts, ?MAX_DATAGRAM_SIZE),
     MinimumWindow = maps:get(minimum_window, Opts, 2 * MaxDatagramSize),
-    MinRecoveryDuration = maps:get(min_recovery_duration, Opts, 100),
+    %% Public option is milliseconds; store as µs internally.
+    MinRecoveryDurationMs = maps:get(min_recovery_duration, Opts, 100),
+    MinRecoveryDuration = MinRecoveryDurationMs * 1000,
     InitialRtt = maps:get(initial_rtt, Opts, ?INITIAL_RTT),
     HystartEnabled = maps:get(hystart_enabled, Opts, true),
     PacingMaxBurst = 12 * MaxDatagramSize,
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
 
     %% Initial cwnd: 10 packets or BDP estimate
     InitialCwnd = max(
@@ -229,13 +237,12 @@ new(Opts) ->
         ?MIN_PIPE_CWND * MaxDatagramSize
     ),
 
-    %% Calculate initial pacing rate like quiche:
-    %% pacing_rate = startup_gain * cwnd / rtt (in bytes/ms)
-    InitialPacingRate = trunc(?STARTUP_PACING_GAIN * InitialCwnd / InitialRtt),
-
-    %% Initial max_bw estimate: cwnd / rtt (in bytes/sec)
-    %% This provides a baseline bandwidth estimate until ACKs arrive
+    %% Initial bandwidth estimate: cwnd / rtt in bytes/sec.
+    %% InitialRtt is ms, so multiply by 1000 to get bytes/sec.
     InitialMaxBw = (InitialCwnd * 1000) div InitialRtt,
+
+    %% Initial pacing rate (bytes/sec): startup_gain * max_bw.
+    InitialPacingRate = trunc(?STARTUP_PACING_GAIN * InitialMaxBw),
 
     ?LOG_DEBUG(
         #{
@@ -287,7 +294,7 @@ on_packet_sent(
     } = State,
     Size
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     State#bbr_state{
         bytes_in_flight = InFlight + Size,
         first_sent_time = Now
@@ -307,21 +314,32 @@ on_packet_sent(
 %% @doc Process acknowledged packets (2-arg version).
 -spec on_packets_acked(cc_state(), non_neg_integer()) -> cc_state().
 on_packets_acked(State, AckedBytes) ->
-    Now = erlang:monotonic_time(millisecond),
-    on_packets_acked(State, AckedBytes, Now).
+    %% 2-arg path has no sent-time info; use current time so the RTT
+    %% sample on this ACK would be 0 and gets ignored downstream.
+    Now = erlang:monotonic_time(microsecond),
+    do_on_packets_acked(State, AckedBytes, Now, Now).
 
 %% @doc Process acknowledged packets with timing info.
+%% AckTime is the sent-time of the largest acked packet, in ms
+%% (supplied by quic_connection). We convert to µs on entry and work
+%% in microsecond precision throughout — loopback RTTs round to 0 ms
+%% otherwise, which collapses BDP.
 -spec on_packets_acked(cc_state(), non_neg_integer(), non_neg_integer()) -> cc_state().
-on_packets_acked(
+on_packets_acked(State, AckedBytes, AckTimeMs) ->
+    Now = erlang:monotonic_time(microsecond),
+    AckTimeUs = AckTimeMs * 1000,
+    do_on_packets_acked(State, AckedBytes, AckTimeUs, Now).
+
+do_on_packets_acked(
     #bbr_state{
         bytes_in_flight = InFlight,
         delivered = Delivered,
         delivered_time = DeliveredTime
     } = State,
     AckedBytes,
-    AckTime
+    AckTime,
+    Now
 ) ->
-    Now = erlang:monotonic_time(millisecond),
     NewInFlight = max(0, InFlight - AckedBytes),
     NewDelivered = Delivered + AckedBytes,
 
@@ -334,10 +352,11 @@ on_packets_acked(
     %% Update delivery rate and bandwidth
     State2 = update_delivery_rate(State1, AckedBytes, DeliveredTime, Now),
 
-    %% Update RTT if we have timing info
+    %% Update RTT if we have timing info. RttSample = Now - AckTime, µs.
+    RttSample = Now - AckTime,
     State3 =
-        case AckTime > 0 of
-            true -> update_min_rtt(State2, AckTime, Now);
+        case RttSample > 0 of
+            true -> update_min_rtt(State2, RttSample, Now);
             false -> State2
         end,
 
@@ -368,13 +387,14 @@ on_packets_lost(
 
 %% @doc Handle a congestion event (packet loss detected).
 -spec on_congestion_event(cc_state(), non_neg_integer()) -> cc_state().
+%% SentTime is ms (from quic_connection); compare in µs internally.
 on_congestion_event(
     #bbr_state{
         in_recovery = true,
         recovery_start_time = RecoveryStart
     } = State,
-    SentTime
-) when SentTime =< RecoveryStart ->
+    SentTimeMs
+) when (SentTimeMs * 1000) =< RecoveryStart ->
     %% Already in recovery for packets sent before recovery started
     State;
 on_congestion_event(
@@ -383,9 +403,9 @@ on_congestion_event(
         recovery_start_time = RecoveryStart,
         min_recovery_duration = MinDuration
     } = State,
-    _SentTime
+    _SentTimeMs
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     case Now - RecoveryStart < MinDuration of
         true ->
             %% Still within protected recovery period
@@ -393,7 +413,7 @@ on_congestion_event(
         false ->
             do_bbr_congestion_event(State)
     end;
-on_congestion_event(State, _SentTime) ->
+on_congestion_event(State, _SentTimeMs) ->
     do_bbr_congestion_event(State).
 
 %% @private BBRv3 congestion response
@@ -406,7 +426,7 @@ do_bbr_congestion_event(
         inflight_hi = InflightHi
     } = State
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
 
     %% Check if loss rate exceeds threshold (2%)
     LossRate =
@@ -458,7 +478,7 @@ on_ecn_ce(#bbr_state{ecn_ce_counter = OldCount} = State, NewCECount) when NewCEC
     State;
 on_ecn_ce(#bbr_state{max_bw = MaxBw} = State, NewCECount) ->
     %% BBRv3: Treat ECN-CE similar to loss
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     NewMaxBw = trunc(MaxBw * ?BETA),
     ?LOG_DEBUG(
         #{
@@ -532,10 +552,12 @@ detect_persistent_congestion(LostPackets, PTO, _State) ->
 %% but this callback allows external RTT info integration.
 -spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
 update_pacing_rate(State, SmoothedRTT) when SmoothedRTT > 0 ->
-    %% Update min_rtt if this is better
-    Now = erlang:monotonic_time(millisecond),
-    State1 = update_min_rtt(State, SmoothedRTT, Now),
-    %% Update HyStart++ RTT tracking
+    %% SmoothedRTT is ms from quic_loss; convert to µs internally.
+    Now = erlang:monotonic_time(microsecond),
+    RttUs = SmoothedRTT * 1000,
+    State1 = update_min_rtt(State, RttUs, Now),
+    %% HyStart++ threshold math is expressed in ms in RFC 9406 —
+    %% keep the hystart tracker ms-based.
     update_hystart_rtt(State1, SmoothedRTT);
 update_pacing_rate(State, _SmoothedRTT) ->
     State.
@@ -553,7 +575,7 @@ pacing_allows(
     },
     Size
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     RefreshedTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
     RefreshedTokens >= Size.
 
@@ -570,7 +592,7 @@ get_pacing_tokens(
     } = State,
     Size
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     NewTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
     Allowed = min(Size, NewTokens),
     RemainingTokens = max(0, NewTokens - Allowed),
@@ -593,14 +615,17 @@ pacing_delay(
     },
     Size
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     CurrentTokens = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
     case CurrentTokens >= Size of
         true ->
             0;
         false ->
+            %% Rate is bytes/sec; return delay in ms (timer granularity).
+            %% Delay = deficit_bytes * 1000 / rate_bps (rounded up, min 1).
             Deficit = Size - CurrentTokens,
-            max(1, (Deficit + Rate - 1) div max(Rate, 1))
+            SafeRate = max(Rate, 1),
+            max(1, (Deficit * 1000 + SafeRate - 1) div SafeRate)
     end.
 
 %%====================================================================
@@ -676,9 +701,10 @@ in_recovery(#bbr_state{in_recovery = R}) -> R.
 -spec max_datagram_size(cc_state()) -> pos_integer().
 max_datagram_size(#bbr_state{max_datagram_size = MDS}) -> MDS.
 
-%% @doc Get minimum recovery duration setting.
+%% @doc Get minimum recovery duration setting (milliseconds, matching
+%% the public option contract; stored internally as microseconds).
 -spec min_recovery_duration(cc_state()) -> non_neg_integer().
-min_recovery_duration(#bbr_state{min_recovery_duration = D}) -> D.
+min_recovery_duration(#bbr_state{min_recovery_duration = D}) -> D div 1000.
 
 %% @doc Get the current ECN-CE counter.
 -spec ecn_ce_counter(cc_state()) -> non_neg_integer().
@@ -688,7 +714,10 @@ ecn_ce_counter(#bbr_state{ecn_ce_counter = C}) -> C.
 %% Internal Functions - Delivery Rate
 %%====================================================================
 
-%% @private Update delivery rate from ACK feedback
+%% @private Update delivery rate from ACK feedback.
+%% Works in microseconds: loopback ACK intervals are ~100-500 µs and
+%% the old ms-granularity code rounded them to 0–1 ms, wedging
+%% Interval to InitialRtt (100 ms) on every sample.
 update_delivery_rate(
     #bbr_state{
         delivered_time = OldDeliveredTime,
@@ -701,26 +730,20 @@ update_delivery_rate(
     _OldDeliveredTime,
     Now
 ) ->
-    %% Calculate time since last delivery update (ACK interval).
-    %% BBR delivery rate should use ACK interval, not cumulative send time.
-    %% Per quiche BBR2: uses per-packet sent_time, not connection-level first_sent_time.
-    %% Using cumulative first_sent_time causes delivery rate to artificially decrease
-    %% over time as the interval keeps growing, leading to cwnd collapse.
     AckElapsed = Now - OldDeliveredTime,
 
-    %% For first ACK or when timing is unreliable (very small intervals),
-    %% use initial_rtt as baseline to avoid spurious bandwidth estimates
+    %% Below 200 µs the sample is unreliable (coalesced ACKs, burst
+    %% arrivals); fall back to initial_rtt scaled to µs.
     Interval =
         case AckElapsed of
-            A when A =< 1 ->
-                %% First ACK or burst - use initial_rtt
-                InitialRtt;
+            A when A =< ?MIN_ACK_INTERVAL_US ->
+                InitialRtt * 1000;
             A ->
-                max(1, A)
+                A
         end,
 
-    %% delivery_rate = acked_bytes / interval (bytes per ms, then scaled to bytes/sec)
-    DeliveryRate = (AckedBytes * 1000) div Interval,
+    %% delivery_rate = acked_bytes * 1_000_000 / interval_us → bytes/sec
+    DeliveryRate = (AckedBytes * 1_000_000) div Interval,
 
     %% Update max_bw filter (windowed max over last 2 cycles)
     {NewMaxBw, NewFilter} = update_bw_filter(DeliveryRate, RoundCount, MaxBw, Filter),
@@ -1134,15 +1157,12 @@ update_hystart_rtt(State, _RTT) ->
 %% Internal Functions - CWND and Pacing
 %%====================================================================
 
-%% @private Calculate BDP
+%% @private Calculate BDP. max_bw is bytes/sec, min_rtt is µs.
 calculate_bdp(_MaxBw, infinity, #bbr_state{max_datagram_size = MDS}) ->
     %% No RTT sample yet, use minimum
     ?MIN_PIPE_CWND * MDS;
-calculate_bdp(MaxBw, MinRtt, #bbr_state{max_datagram_size = MDS}) ->
-    %% BDP = max_bw * min_rtt
-    %% max_bw is in bytes/sec, min_rtt is in ms
-    %% Result is in bytes
-    BDP = (MaxBw * MinRtt) div 1000,
+calculate_bdp(MaxBw, MinRttUs, #bbr_state{max_datagram_size = MDS}) ->
+    BDP = (MaxBw * MinRttUs) div 1_000_000,
     max(BDP, ?MIN_PIPE_CWND * MDS).
 
 %% @private Update cwnd based on current state
@@ -1177,24 +1197,23 @@ update_cwnd(
 
     State#bbr_state{cwnd = NewCwnd}.
 
-%% @private Update BBR's pacing rate
+%% @private Update BBR's pacing rate (bytes/sec, matches max_bw unit).
 update_bbr_pacing_rate(
     #bbr_state{
         max_bw = MaxBw,
         pacing_gain = PacingGain
     } = State
 ) ->
-    %% pacing_rate = pacing_gain * max_bw * PACING_MARGIN
-    %% Result in bytes/ms
-    PacingRate = trunc(PacingGain * MaxBw * ?PACING_MARGIN / 1000),
+    PacingRate = trunc(PacingGain * MaxBw * ?PACING_MARGIN),
     State#bbr_state{pacing_rate = max(1, PacingRate)}.
 
 %%====================================================================
 %% Internal Functions - Pacing Token Bucket
 %%====================================================================
 
-%% @private Refill pacing tokens based on elapsed time
+%% @private Refill pacing tokens based on elapsed time.
+%% Elapsed is µs, Rate is bytes/sec; Added = Elapsed * Rate / 1e6.
 refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now) ->
     Elapsed = max(0, Now - LastUpdate),
-    Added = Elapsed * Rate,
+    Added = (Elapsed * Rate) div 1_000_000,
     min(MaxBurst, Tokens + Added).
