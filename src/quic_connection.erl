@@ -146,7 +146,11 @@
     test_spin_state_for/2,
     %% Stateless reset token derivation (RFC 9000 §10.3.2)
     generate_stateless_reset_token/2,
-    test_state_with_secret/1
+    test_state_with_secret/1,
+    %% NEW_TOKEN frame dispatch (RFC 9000 §8.1.3)
+    process_frame/3,
+    test_state_for_role/1,
+    test_close_reason/1
 ]).
 -endif.
 
@@ -3910,6 +3914,15 @@ process_frame(app, {datagram, Data}, State) ->
     deliver_datagram(Data, State);
 process_frame(app, {datagram_with_length, Data}, State) ->
     deliver_datagram(Data, State);
+%% NEW_TOKEN (RFC 9000 §8.1.3): servers MUST treat receipt as
+%% PROTOCOL_VIOLATION. Clients accept and currently discard; caching
+%% the token for reconnect-without-retry reuse depends on server-side
+%% token issuance + validation, which aren't implemented yet and are
+%% tracked as a follow-up.
+process_frame(app, {new_token, _}, #state{role = server} = State) ->
+    send_protocol_violation(<<"NEW_TOKEN received by server">>, State);
+process_frame(app, {new_token, _}, #state{role = client} = State) ->
+    State;
 process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
     State.
@@ -8553,6 +8566,14 @@ test_spin_state_for(Role, Enabled) ->
 -spec test_state_with_secret(binary() | undefined) -> #state{}.
 test_state_with_secret(Secret) ->
     #state{stateless_reset_secret = Secret}.
+
+%% Minimal #state{} scoped to role for frame-dispatch tests.
+-spec test_state_for_role(client | server) -> #state{}.
+test_state_for_role(Role) ->
+    #state{role = Role, app_keys = undefined}.
+
+-spec test_close_reason(#state{}) -> term().
+test_close_reason(#state{close_reason = R}) -> R.
 
 %% Test helper for check_send_queue_flow_control/3.
 %% Wraps the internal function to avoid exposing #state{} record.

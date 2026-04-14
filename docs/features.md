@@ -8,6 +8,10 @@
 - [x] Idle timeout enforcement (configurable via `idle_timeout` option)
 - [x] Version negotiation
 - [x] Retry packets for address validation
+- [x] Latency spin bit (RFC 9000 §17.4) with `spin_bit => true | false`
+- [x] NEW_TOKEN frame dispatch (server rejects per §8.1.3)
+- [ ] NEW_TOKEN cache + reconnect-without-retry — follow-up
+- [ ] Stateless reset token derivation uses a server-wide secret when `stateless_reset_secret` is provided (RFC 9000 §10.3.2); listener-side orphan-reset emission is follow-up
 
 ### Streams
 - [x] Bidirectional streams (client and server initiated)
