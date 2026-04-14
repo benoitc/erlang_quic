@@ -1646,6 +1646,83 @@ stream_type_handler_zero_close_stays_closed_test() ->
     after 100 -> ?assert(false)
     end.
 
+%% R1: WT_BIDI_SIGNAL (varint 0x41) on a fresh peer-initiated bidi
+%% stream is claimed; subsequent bytes surface as bidi stream_type_data
+%% events without hitting the HTTP/3 request parser.
+stream_type_handler_claims_bidi_stream_test() ->
+    Claim = fun(bidi, _StreamId, 16#41) -> claim end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Claim}),
+    StreamId = 0,
+    {ok, State1} = quic_h3_connection:handle_new_stream(
+        StreamId, bidirectional, State0
+    ),
+    flush_mailbox(),
+    {ok, _State2} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#40, 16#41, "payload">>, false, State1
+    ),
+    Self = self(),
+    receive
+        {quic_h3, Self, {stream_type_open, bidi, StreamId, 16#41}} -> ok
+    after 100 -> ?assert(false)
+    end,
+    receive
+        {quic_h3, Self, {stream_type_data, bidi, StreamId, <<"payload">>, false}} -> ok
+    after 100 -> ?assert(false)
+    end.
+
+%% R1: when the handler returns ignore, the bidi stream falls back to
+%% the HTTP/3 request path and every buffered byte (varint included)
+%% is re-fed so the request parser sees the raw stream.
+stream_type_handler_bidi_ignore_falls_through_test() ->
+    Ignore = fun(bidi, _StreamId, _Type) -> ignore end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Ignore}),
+    StreamId = 0,
+    {ok, State1} = quic_h3_connection:handle_new_stream(
+        StreamId, bidirectional, State0
+    ),
+    %% Feed a bogus first varint that's NOT a valid HEADERS frame. The
+    %% fall-through path forwards bytes to the request stream parser;
+    %% we only assert no crash and that the stream is now a request
+    %% stream (present in #state.streams at tuple position 21).
+    Result = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#40, 16#41>>, false, State1
+    ),
+    ?assertMatch({ok, _}, Result),
+    {ok, State2} = Result,
+    ?assert(maps:is_key(StreamId, element(21, State2))).
+
+%% R1: bidi header split across two messages triggers the handler only
+%% once the varint is complete; intermediate delivery returns {more}.
+stream_type_handler_bidi_split_varint_test() ->
+    Claim = fun(bidi, _StreamId, 16#41) -> claim end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Claim}),
+    StreamId = 0,
+    {ok, State1} = quic_h3_connection:handle_new_stream(
+        StreamId, bidirectional, State0
+    ),
+    flush_mailbox(),
+    %% Send one byte of the 2-byte varint; handler must not fire yet.
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#40>>, false, State1
+    ),
+    receive
+        {quic_h3, _, {stream_type_open, bidi, _, _}} -> ?assert(false)
+    after 50 -> ok
+    end,
+    %% Completion byte plus payload → handler fires with type 0x41.
+    {ok, _State3} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#41, "rest">>, true, State2
+    ),
+    Self = self(),
+    receive
+        {quic_h3, Self, {stream_type_open, bidi, StreamId, 16#41}} -> ok
+    after 100 -> ?assert(false)
+    end,
+    receive
+        {quic_h3, Self, {stream_type_data, bidi, StreamId, <<"rest">>, true}} -> ok
+    after 100 -> ?assert(false)
+    end.
+
 flush_mailbox() ->
     receive
         _ -> flush_mailbox()
@@ -1712,7 +1789,9 @@ make_test_state(Overrides) ->
         stream_type_handler => undefined,
         claimed_uni_streams => #{},
         h3_datagram_enabled => false,
-        peer_h3_datagram_enabled => false
+        peer_h3_datagram_enabled => false,
+        bidi_type_buffers => #{},
+        claimed_bidi_streams => #{}
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -1741,4 +1820,5 @@ make_test_state(Overrides) ->
         maps:get(stream_handlers, Merged), maps:get(stream_data_buffers, Merged),
         maps:get(stream_buffer_limit, Merged), maps:get(local_connect_enabled, Merged),
         maps:get(stream_type_handler, Merged), maps:get(claimed_uni_streams, Merged),
-        maps:get(h3_datagram_enabled, Merged), maps:get(peer_h3_datagram_enabled, Merged)}.
+        maps:get(h3_datagram_enabled, Merged), maps:get(peer_h3_datagram_enabled, Merged),
+        maps:get(bidi_type_buffers, Merged), maps:get(claimed_bidi_streams, Merged)}.

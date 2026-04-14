@@ -179,7 +179,7 @@
 -type error_code() :: non_neg_integer().
 
 -type stream_type_handler() ::
-    fun((uni, stream_id(), non_neg_integer()) -> claim | ignore).
+    fun((uni | bidi, stream_id(), non_neg_integer()) -> claim | ignore).
 
 -type connect_opts() :: #{
     %% TLS options

@@ -228,7 +228,7 @@
     %% subsequent bytes to the owner as `{stream_type_*, ...}` events
     %% instead of discarding them.
     stream_type_handler ::
-        fun((uni, stream_id(), non_neg_integer()) -> claim | ignore) | undefined,
+        fun((uni | bidi, stream_id(), non_neg_integer()) -> claim | ignore) | undefined,
 
     %% Uni streams that the stream_type_handler claimed; maps StreamId
     %% to the advertised varint stream type so owner messages can
@@ -239,7 +239,17 @@
     %% SETTINGS_H3_DATAGRAM = 1 AND non-zero max_datagram_frame_size on
     %% their QUIC transport parameters for the extension to go live.
     h3_datagram_enabled = false :: boolean(),
-    peer_h3_datagram_enabled = false :: boolean()
+    peer_h3_datagram_enabled = false :: boolean(),
+
+    %% Peer-initiated bidi streams pending varint-peek classification.
+    %% Populated when stream_type_handler is set so the handler can
+    %% decide whether to claim the stream (e.g. WebTransport
+    %% WT_BIDI_SIGNAL 0x41) or fall through to HTTP/3 request parsing.
+    bidi_type_buffers = #{} :: #{stream_id() => binary()},
+
+    %% Bidi streams the stream_type_handler claimed; maps StreamId to
+    %% the advertised varint type.
+    claimed_bidi_streams = #{} :: #{stream_id() => non_neg_integer()}
 }).
 
 %%====================================================================
@@ -649,9 +659,9 @@ connected(
             %% For non-claimed streams keep today's generic event;
             %% claimed streams already got stream_type_reset/closed
             %% inside handle_stream_closed/3.
-            case maps:is_key(StreamId, State#state.claimed_uni_streams) of
-                true -> ok;
-                false -> notify_stream_reset(StreamId, ErrorCode, State1)
+            case claimed_stream_direction(StreamId, State) of
+                {ok, _Dir} -> ok;
+                error -> notify_stream_reset(StreamId, ErrorCode, State1)
             end,
             {keep_state, State1};
         {error, Reason} ->
@@ -660,11 +670,14 @@ connected(
 connected(
     info,
     {quic, QuicConn, {stop_sending, StreamId, ErrorCode}},
-    #state{quic_conn = QuicConn, claimed_uni_streams = Claimed, owner = Owner} = State
+    #state{quic_conn = QuicConn, owner = Owner} = State
 ) ->
-    case maps:is_key(StreamId, Claimed) of
-        true -> Owner ! {quic_h3, self(), {stream_type_stop_sending, uni, StreamId, ErrorCode}};
-        false -> ok
+    case claimed_stream_direction(StreamId, State) of
+        {ok, Direction} ->
+            Owner !
+                {quic_h3, self(), {stream_type_stop_sending, Direction, StreamId, ErrorCode}};
+        error ->
+            ok
     end,
     {keep_state, State};
 connected(
@@ -994,7 +1007,7 @@ send_settings(
 handle_new_stream(StreamId, unidirectional, State) ->
     %% Unidirectional stream - need to read type first
     {ok, State#state{uni_stream_buffers = maps:put(StreamId, <<>>, State#state.uni_stream_buffers)}};
-handle_new_stream(StreamId, bidirectional, #state{streams = Streams, role = Role} = State) ->
+handle_new_stream(StreamId, bidirectional, #state{role = Role} = State) ->
     %% RFC 9114 Section 4.1: Validate stream ID parity
     %% Client-initiated streams are even (0, 4, 8...)
     %% Server-initiated streams are odd (1, 5, 9...)
@@ -1019,21 +1032,36 @@ handle_new_stream(StreamId, bidirectional, #state{streams = Streams, role = Role
                     ),
                     {ok, State};
                 false ->
-                    Stream = #h3_stream{
-                        id = StreamId,
-                        type = request,
-                        state = open
-                    },
-                    NewState = State#state{streams = Streams#{StreamId => Stream}},
-                    case Role of
-                        server ->
-                            {ok, NewState#state{
-                                last_stream_id = max(StreamId, State#state.last_stream_id)
-                            }};
-                        client ->
-                            {ok, NewState}
+                    case State#state.stream_type_handler of
+                        undefined ->
+                            open_bidi_request_stream(StreamId, State);
+                        _Fun ->
+                            %% Defer request-stream creation until we can
+                            %% peek the first varint and ask the handler.
+                            Buffers = State#state.bidi_type_buffers,
+                            {ok, State#state{
+                                bidi_type_buffers = Buffers#{StreamId => <<>>}
+                            }}
                     end
             end
+    end.
+
+open_bidi_request_stream(
+    StreamId, #state{streams = Streams, role = Role} = State
+) ->
+    Stream = #h3_stream{
+        id = StreamId,
+        type = request,
+        state = open
+    },
+    NewState = State#state{streams = Streams#{StreamId => Stream}},
+    case Role of
+        server ->
+            {ok, NewState#state{
+                last_stream_id = max(StreamId, State#state.last_stream_id)
+            }};
+        client ->
+            {ok, NewState}
     end.
 
 %% RFC 9114 §5.2: a sender MUST NOT initiate, and a receiver MUST treat as
@@ -1073,6 +1101,11 @@ handle_stream_data(StreamId, Data, Fin, State) ->
             handle_encoder_stream_data(Data, State);
         {uni, qpack_decoder} ->
             handle_decoder_stream_data(Data, State);
+        {bidi, pending_type} ->
+            handle_bidi_stream_type(StreamId, Data, Fin, State);
+        {bidi, {claimed, _Type}} ->
+            forward_claimed_bidi_data(StreamId, Data, Fin, State),
+            {ok, State};
         {bidi, request} ->
             handle_request_stream_data(StreamId, Data, Fin, State);
         unknown ->
@@ -1095,7 +1128,19 @@ classify_stream(StreamId, #state{uni_stream_buffers = Buffers, received_pushes =
                 {ok, Type} ->
                     {uni, {claimed, Type}};
                 error ->
-                    classify_fresh_uni_stream(StreamId, Buffers, Received, State)
+                    case maps:find(StreamId, State#state.claimed_bidi_streams) of
+                        {ok, BType} ->
+                            {bidi, {claimed, BType}};
+                        error ->
+                            case maps:is_key(StreamId, State#state.bidi_type_buffers) of
+                                true ->
+                                    {bidi, pending_type};
+                                false ->
+                                    classify_fresh_uni_stream(
+                                        StreamId, Buffers, Received, State
+                                    )
+                            end
+                    end
             end
     end.
 
@@ -1197,6 +1242,81 @@ forward_claimed_uni_data(_StreamId, <<>>, false, _State) ->
 forward_claimed_uni_data(StreamId, Data, Fin, #state{owner = Owner}) ->
     Owner ! {quic_h3, self(), {stream_type_data, uni, StreamId, Data, Fin}},
     ok.
+
+%% First bytes of a peer-initiated bidi stream arrive here when a
+%% stream_type_handler is set. Buffer until a full varint is available,
+%% then consult the handler. On `claim' record the stream and forward
+%% the remainder + any future bytes to the owner. On `ignore' create
+%% the HTTP/3 request stream lazily and re-feed every buffered byte
+%% (including the already-decoded varint) so HTTP/3 parsing sees a
+%% brand-new stream.
+handle_bidi_stream_type(StreamId, Data, Fin, State) ->
+    Buffers = State#state.bidi_type_buffers,
+    Buffer = maps:get(StreamId, Buffers, <<>>),
+    Combined = <<Buffer/binary, Data/binary>>,
+    case quic_h3_frame:decode_stream_type(Combined) of
+        {more, _} ->
+            {ok, State#state{bidi_type_buffers = Buffers#{StreamId => Combined}}};
+        {ok, Decoded, Rest} ->
+            VarintType = stream_type_varint(Decoded),
+            case consult_stream_type_handler(bidi, StreamId, VarintType, State) of
+                claim ->
+                    State1 = claim_bidi_stream(StreamId, VarintType, State),
+                    forward_claimed_bidi_data(StreamId, Rest, Fin, State1),
+                    {ok, State1};
+                ignore ->
+                    fall_back_to_request_stream(StreamId, Combined, Fin, State)
+            end
+    end.
+
+%% decode_stream_type surfaces known codepoints as atoms (control,
+%% qpack_encoder, ...) so convert them back to the numeric value the
+%% handler contract expects.
+stream_type_varint(control) -> ?H3_STREAM_CONTROL;
+stream_type_varint(push) -> ?H3_STREAM_PUSH;
+stream_type_varint(qpack_encoder) -> ?H3_STREAM_QPACK_ENCODER;
+stream_type_varint(qpack_decoder) -> ?H3_STREAM_QPACK_DECODER;
+stream_type_varint({unknown, V}) -> V.
+
+claim_bidi_stream(StreamId, Type, #state{owner = Owner} = State) ->
+    Owner ! {quic_h3, self(), {stream_type_open, bidi, StreamId, Type}},
+    State#state{
+        bidi_type_buffers = maps:remove(StreamId, State#state.bidi_type_buffers),
+        claimed_bidi_streams = maps:put(
+            StreamId, Type, State#state.claimed_bidi_streams
+        )
+    }.
+
+forward_claimed_bidi_data(_StreamId, <<>>, false, _State) ->
+    ok;
+forward_claimed_bidi_data(StreamId, Data, Fin, #state{owner = Owner}) ->
+    Owner ! {quic_h3, self(), {stream_type_data, bidi, StreamId, Data, Fin}},
+    ok.
+
+%% Handler said `ignore' on the first varint. Promote the pending bidi
+%% to a normal H3 request stream and replay every byte we'd buffered,
+%% including the varint itself, so the request parser sees the raw
+%% original stream.
+fall_back_to_request_stream(StreamId, Combined, Fin, State) ->
+    Buffers = State#state.bidi_type_buffers,
+    {ok, State1} = open_bidi_request_stream(StreamId, State#state{
+        bidi_type_buffers = maps:remove(StreamId, Buffers)
+    }),
+    handle_request_stream_data(StreamId, Combined, Fin, State1).
+
+%% Returns the direction a claimed stream was classified under, if any.
+claimed_stream_direction(StreamId, #state{
+    claimed_uni_streams = U, claimed_bidi_streams = B
+}) ->
+    case maps:is_key(StreamId, U) of
+        true ->
+            {ok, uni};
+        false ->
+            case maps:is_key(StreamId, B) of
+                true -> {ok, bidi};
+                false -> error
+            end
+    end.
 
 assign_uni_stream(StreamId, control, #state{peer_control_stream = undefined} = State) ->
     {ok, State#state{peer_control_stream = StreamId}};
@@ -2884,7 +3004,9 @@ handle_stream_closed(
         stream_buffers = Buffers,
         uni_stream_buffers = UniBuffers,
         discarded_uni_streams = Discarded,
-        claimed_uni_streams = Claimed,
+        claimed_uni_streams = ClaimedUni,
+        claimed_bidi_streams = ClaimedBidi,
+        bidi_type_buffers = BidiBuffers,
         owner = Owner
     } = State
 ) ->
@@ -2895,15 +3017,15 @@ handle_stream_closed(
                 {connection_error, ?H3_CLOSED_CRITICAL_STREAM,
                     iolist_to_binary(io_lib:format("~p stream closed", [Type]))}};
         false ->
-            case maps:is_key(StreamId, Claimed) of
-                true ->
+            case claimed_stream_direction(StreamId, State) of
+                {ok, Direction} ->
                     Event =
                         case ErrorCode of
-                            0 -> {stream_type_closed, uni, StreamId};
-                            _ -> {stream_type_reset, uni, StreamId, ErrorCode}
+                            0 -> {stream_type_closed, Direction, StreamId};
+                            _ -> {stream_type_reset, Direction, StreamId, ErrorCode}
                         end,
                     Owner ! {quic_h3, self(), Event};
-                false ->
+                error ->
                     ok
             end,
             %% RFC 9114 Section 4.1.1: server-side request stream that ends
@@ -2916,7 +3038,9 @@ handle_stream_closed(
                 stream_buffers = maps:remove(StreamId, Buffers),
                 uni_stream_buffers = maps:remove(StreamId, UniBuffers),
                 discarded_uni_streams = sets:del_element(StreamId, Discarded),
-                claimed_uni_streams = maps:remove(StreamId, Claimed)
+                claimed_uni_streams = maps:remove(StreamId, ClaimedUni),
+                claimed_bidi_streams = maps:remove(StreamId, ClaimedBidi),
+                bidi_type_buffers = maps:remove(StreamId, BidiBuffers)
             }}
     end.
 
