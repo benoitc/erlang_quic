@@ -10,7 +10,7 @@
 
 -module(quic_test_echo_server).
 
--export([start/0, start/1, stop/1]).
+-export([start/0, start/1, stop/1, client_opts/0]).
 
 -type handle() :: #{name := atom(), port := inet:port_number()}.
 
@@ -37,6 +37,12 @@ start(Extra) when is_map(Extra) ->
             cert => Cert,
             key => Key,
             alpn => [<<"echo">>, <<"h3">>, <<"hq-interop">>],
+            %% Generous flow-control windows so large-transfer tests
+            %% don't stall against the in-process server's defaults.
+            max_data => 16 * 1024 * 1024,
+            max_stream_data_bidi_local => 4 * 1024 * 1024,
+            max_stream_data_bidi_remote => 4 * 1024 * 1024,
+            max_stream_data_uni => 4 * 1024 * 1024,
             connection_handler => fun(ConnPid, _ConnRef) ->
                 Echo = spawn_link(fun() -> echo_loop(ConnPid) end),
                 ok = quic:set_owner_sync(ConnPid, Echo),
@@ -55,6 +61,20 @@ stop(#{name := Name}) ->
     catch quic:stop_server(Name),
     ok.
 
+%% @doc Recommended client connect options for talking to the echo
+%% server. Advertises the same generous flow-control windows the
+%% server does so large-transfer tests aren't bottlenecked by a
+%% 768 KiB default on the client side.
+-spec client_opts() -> map().
+client_opts() ->
+    #{
+        verify => false,
+        max_data => 16 * 1024 * 1024,
+        max_stream_data_bidi_local => 4 * 1024 * 1024,
+        max_stream_data_bidi_remote => 4 * 1024 * 1024,
+        max_stream_data_uni => 4 * 1024 * 1024
+    }.
+
 %%====================================================================
 %% Internal
 %%====================================================================
@@ -67,10 +87,10 @@ echo_loop(Conn) ->
         {quic, Conn, {connected, _Info}} ->
             echo_loop(Conn);
         {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
-            case quic:send_data(Conn, StreamId, Data, Fin) of
-                ok -> ok;
-                {error, _} -> ok
-            end,
+            %% Async send so this process doesn't block waiting on
+            %% congestion control while more stream_data events are
+            %% still being delivered.
+            _ = quic:send_data_async(Conn, StreamId, Data, Fin),
             echo_loop(Conn);
         {quic, Conn, {stream_closed, _StreamId, _Code}} ->
             echo_loop(Conn);
