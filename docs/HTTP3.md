@@ -440,6 +440,27 @@ HTTP Datagrams are live on an extended CONNECT stream, the library
 adds its Context ID prefix and forwards UDP payloads through
 `send_datagram/3`.
 
+### Capsule Protocol (RFC 9297 §3.2)
+
+RFC 9297 also defines a reliable framing for the request stream body
+itself — capsules. A capsule is `Type(varint) | Length(varint) | Value`
+and is the channel CONNECT-UDP uses for session-level signalling
+distinct from unreliable datagrams.
+
+`quic_h3_capsule` is a primitive codec; it does not own the request
+stream body. Buffer bytes as they arrive and feed them to `decode/1`
+until the result is no longer `{more, _}`:
+
+```erlang
+Encoded = quic_h3_capsule:encode(16#00, <<"payload">>),
+{ok, {Type, Value, Rest}} = quic_h3_capsule:decode(iolist_to_binary(Encoded)).
+```
+
+Registered capsule type constants are in `include/quic_h3.hrl`:
+`?H3_CAPSULE_DATAGRAM` (`0x00`) and `?H3_CAPSULE_LEGACY_DATAGRAM`
+(`0xff37a0`). Unknown types are returned as their varint value so
+extensions can claim their own codepoints.
+
 ### Messages to Owner
 
 The connection owner process receives messages in the form `{quic_h3, Conn, Event}`.
