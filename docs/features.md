@@ -8,6 +8,10 @@
 - [x] Idle timeout enforcement (configurable via `idle_timeout` option)
 - [x] Version negotiation
 - [x] Retry packets for address validation
+- [x] Latency spin bit (RFC 9000 §17.4) with `spin_bit => true | false`
+- [x] NEW_TOKEN frame dispatch (server rejects peer-received tokens per §8.1.3); client caches received tokens keyed by `{Host, Port}` and reuses them in the Initial of the next connect to the same endpoint
+- [x] Stateless reset (RFC 9000 §10.3): listener emits resets for orphan packets; per-connection `NEW_CONNECTION_ID` tokens share the listener's HMAC secret so they match orphan-path tokens
+- [x] Server-side address validation (RFC 9000 §8.1): opt in with `address_validation => always` on `quic:start_server/3`. Listener emits a Retry packet with an HMAC-signed retry token when a client Initial arrives without one; subsequent Initials carrying a valid token skip retry and spawn a connection that echoes `retry_source_connection_id`. Server issues a NEW_TOKEN after handshake so the next reconnect skips retry entirely
 
 ### Streams
 - [x] Bidirectional streams (client and server initiated)

@@ -138,7 +138,22 @@
     is_probing_frame/1,
     contains_non_probing_frame/1,
     %% Migration notification testing
-    test_complete_migration/3
+    test_complete_migration/3,
+    %% Spin bit (RFC 9000 §17.4)
+    update_spin_from_recv/3,
+    short_header_first_byte/3,
+    test_spin_state/1,
+    test_spin_state_for/2,
+    %% Stateless reset token derivation (RFC 9000 §10.3.2)
+    generate_stateless_reset_token/2,
+    test_state_with_secret/1,
+    %% NEW_TOKEN frame dispatch (RFC 9000 §8.1.3)
+    process_frame/3,
+    test_state_for_role/1,
+    test_state_for_client/1,
+    test_close_reason/1,
+    maybe_validate_initial_token/2,
+    test_state_for_server/3
 ]).
 -endif.
 
@@ -180,6 +195,14 @@
     retry_token = <<>> :: binary(),
     % Whether a Retry packet has been received
     retry_received = false :: boolean(),
+    %% Server-side only. When the listener already validated the
+    %% client's Initial token (and by implication its source address),
+    %% the per-connection Initial-token validator skips its recheck.
+    address_validated = false :: boolean(),
+    %% Server-side only. The Retry SCID to echo back as
+    %% retry_source_connection_id (RFC 9000 §7.3) when this connection
+    %% was spawned from a retried Initial.
+    retry_scid_for_tp = undefined :: binary() | undefined,
     % SCID from Retry packet (for transport param validation)
     retry_scid :: binary() | undefined,
     role :: client | server,
@@ -282,6 +305,22 @@
     datagram_recv_dropped = 0 :: non_neg_integer(),
     datagram_sent = 0 :: non_neg_integer(),
     datagram_send_dropped = 0 :: non_neg_integer(),
+
+    %% Latency spin bit (RFC 9000 §17.4). `spin_outgoing' is the bit
+    %% we set on outbound 1-RTT packets; updated from `spin_recv' on
+    %% receipt of a 1-RTT packet whose PN exceeds
+    %% `spin_recv_largest_pn' so reordering doesn't flip the bit
+    %% back. `spin_bit_enabled = false' opts out (always emit 0).
+    spin_outgoing = 0 :: 0 | 1,
+    spin_recv = 0 :: 0 | 1,
+    spin_recv_largest_pn = -1 :: integer(),
+    spin_bit_enabled = true :: boolean(),
+
+    %% Server-wide secret used to HMAC stateless-reset tokens over a
+    %% connection id (RFC 9000 §10.3.2). `undefined' preserves today's
+    %% per-CID random-token fallback — acceptable for clients and for
+    %% single-instance servers that don't need post-restart recovery.
+    stateless_reset_secret = undefined :: binary() | undefined,
 
     %% RESET_STREAM_AT support (draft-ietf-quic-reliable-stream-reset-07)
     %% Local: whether we advertise support for RESET_STREAM_AT
@@ -863,6 +902,10 @@ init({server, Opts}) ->
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
         max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
         datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
+        spin_bit_enabled = maps:get(spin_bit, Opts, true),
+        stateless_reset_secret = maps:get(reset_secret, Opts, undefined),
+        address_validated = maps:get(address_validated, Opts, false),
+        retry_scid_for_tp = maps:get(retry_scid, Opts, undefined),
         reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeout,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
@@ -1060,6 +1103,15 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
                 SS
         end,
 
+    %% If we've previously received a NEW_TOKEN from this endpoint,
+    %% reuse it in the Initial so the server can skip retry-based
+    %% address validation (RFC 9000 §8.1.3).
+    InitialRetryToken =
+        case quic_token_cache:take(RemoteAddr) of
+            {ok, CachedToken} -> CachedToken;
+            empty -> <<>>
+        end,
+
     %% Initialize state
     State = #state{
         scid = SCID,
@@ -1078,6 +1130,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         client_cert_chain = maps:get(cert_chain, Opts, []),
         client_private_key = maps:get(key, Opts, undefined),
         initial_keys = InitialKeys,
+        retry_token = InitialRetryToken,
         tls_state = ?TLS_AWAITING_SERVER_HELLO,
         alpn_list = AlpnList,
         pn_initial = PNSpace,
@@ -1105,6 +1158,8 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
         max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
         datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
+        spin_bit_enabled = maps:get(spin_bit, Opts, true),
+        stateless_reset_secret = maps:get(reset_secret, Opts, undefined),
         reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeoutClient,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
@@ -1430,8 +1485,12 @@ connected(
             server ->
                 State2
         end,
+    %% RFC 9000 §8.1.3: server issues a NEW_TOKEN so the client can
+    %% skip retry on the next reconnect. Only when a token secret is
+    %% available; clients don't issue tokens.
+    State3b = maybe_send_new_token(State3),
     %% RFC 9000 Section 10.1: Start idle timer when entering connected state
-    State4 = update_last_activity(State3),
+    State4 = update_last_activity(State3b),
     %% RFC 8899: Initialize PMTU discovery after handshake
     State5 = init_pmtu_probing(TransportParams, State4),
     {keep_state, State5};
@@ -2260,12 +2319,21 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         end,
     %% Add preferred_address if configured (RFC 9000 Section 9.6)
     %% Server MUST NOT send preferred_address if disable_active_migration is set
-    TransportParams =
+    TransportParams3 =
         case State#state.server_preferred_address of
             #preferred_address{} = PA ->
                 TransportParams2#{preferred_address => PA};
             _ ->
                 TransportParams2
+        end,
+
+    %% RFC 9000 §7.3: if this server issued a Retry for this client,
+    %% echo the Retry's SCID in retry_source_connection_id so the
+    %% client can verify the full handshake against the Retry it saw.
+    TransportParams =
+        case State#state.retry_scid_for_tp of
+            undefined -> TransportParams3;
+            RetrySCIDTP -> TransportParams3#{retry_source_connection_id => RetrySCIDTP}
         end,
 
     %% Build EncryptedExtensions
@@ -2714,7 +2782,7 @@ send_app_packet_internal(Payload, Frames, State) ->
 
     %% First byte for short header: 01XX XXXX
     %% Bit 5 = spin bit (0), bits 3-4 reserved (0), bit 2 = key phase, bits 0-1 = PN length
-    FirstByte = 16#40 bor (KeyPhase bsl 2) bor (PNLen - 1),
+    FirstByte = short_header_first_byte(KeyPhase, PNLen, State),
 
     %% Pad payload if needed for header protection sampling
     PaddedPayload = pad_for_header_protection(Payload),
@@ -3020,10 +3088,15 @@ decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
             server -> ClientKeys
         end,
 
-    %% Parse token and length
+    %% Parse token and length. The server validates the token against
+    %% its listener-wide secret (RFC 9000 §8.1) so it can mark the
+    %% address as validated and skip a future retry. Validation
+    %% outcomes are logged but do not yet gate connection creation —
+    %% the listener-side retry emission is still a follow-up.
     {TokenLen, Rest2} = quic_varint:decode(Rest),
-    <<_Token:TokenLen/binary, Rest3/binary>> = Rest2,
+    <<Token:TokenLen/binary, Rest3/binary>> = Rest2,
     {PayloadLen, Rest4} = quic_varint:decode(Rest3),
+    _ = maybe_validate_initial_token(Token, State),
 
     %% Header ends here, payload starts
     HeaderLen = byte_size(FullPacket) - byte_size(Rest4),
@@ -3305,7 +3378,10 @@ decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
                 )
             of
                 {ok, PN, Plaintext} ->
-                    State2 = record_received_pn(app, PN, State1),
+                    <<UnprotectedFirstByte, _/binary>> = UnprotectedHeader,
+                    State2 = update_spin_from_recv(
+                        UnprotectedFirstByte, PN, record_received_pn(app, PN, State1)
+                    ),
                     State3 = update_last_activity(State2),
                     %% Use streaming decode for efficiency
                     case decode_and_process_streaming(app, Plaintext, State3) of
@@ -3879,6 +3955,16 @@ process_frame(app, {datagram, Data}, State) ->
     deliver_datagram(Data, State);
 process_frame(app, {datagram_with_length, Data}, State) ->
     deliver_datagram(Data, State);
+%% NEW_TOKEN (RFC 9000 §8.1.3): servers MUST treat receipt as
+%% PROTOCOL_VIOLATION. Clients accept and currently discard; caching
+%% the token for reconnect-without-retry reuse depends on server-side
+%% token issuance + validation, which aren't implemented yet and are
+%% tracked as a follow-up.
+process_frame(app, {new_token, _}, #state{role = server} = State) ->
+    send_protocol_violation(<<"NEW_TOKEN received by server">>, State);
+process_frame(app, {new_token, Token}, #state{role = client, remote_addr = Addr} = State) ->
+    ok = quic_token_cache:put(Addr, Token),
+    State;
 process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
     State.
@@ -5861,6 +5947,43 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
 %% against it historically.
 -define(PACKET_OVERHEAD, 50).
 
+%% Build the short-header first byte, folding in the outgoing spin
+%% bit (RFC 9000 §17.4) when enabled. Bit layout:
+%%   bit 7 = 0        (fixed header form)
+%%   bit 6 = 1        (fixed 1-RTT marker)
+%%   bit 5 = spin     (RFC 9000 §17.4)
+%%   bits 4-3 = reserved (0)
+%%   bit 2   = key phase
+%%   bits 1-0 = PN length - 1
+short_header_first_byte(KeyPhase, PNLen, #state{
+    spin_outgoing = Spin, spin_bit_enabled = true
+}) ->
+    16#40 bor (Spin bsl 5) bor (KeyPhase bsl 2) bor (PNLen - 1);
+short_header_first_byte(KeyPhase, PNLen, #state{spin_bit_enabled = false}) ->
+    16#40 bor (KeyPhase bsl 2) bor (PNLen - 1).
+
+%% Update the spin-bit tracking state from a received 1-RTT packet.
+%% RFC 9000 §17.4 only updates on packets whose PN is greater than any
+%% previously received on this path so that reorderings don't flip the
+%% edge. Client mirrors the received bit; server inverts it.
+update_spin_from_recv(
+    FirstByte, PN, #state{spin_recv_largest_pn = Largest, role = Role} = State
+) when PN > Largest ->
+    RecvSpin = (FirstByte bsr 5) band 1,
+    Outgoing =
+        case State#state.spin_bit_enabled of
+            false -> State#state.spin_outgoing;
+            true when Role =:= client -> RecvSpin;
+            true when Role =:= server -> 1 - RecvSpin
+        end,
+    State#state{
+        spin_recv = RecvSpin,
+        spin_recv_largest_pn = PN,
+        spin_outgoing = Outgoing
+    };
+update_spin_from_recv(_FirstByte, _PN, State) ->
+    State.
+
 %% Short-header packet overhead for a DATAGRAM frame on the 1-RTT level:
 %%   1 byte flags
 %%   + DCID length (no length byte on short header)
@@ -7277,7 +7400,7 @@ send_path_challenge(
             KeyPhase = get_current_key_phase(State),
 
             %% Build first byte for short header
-            FirstByte = 16#40 bor (KeyPhase bsl 2) bor (PNLen - 1),
+            FirstByte = short_header_first_byte(KeyPhase, PNLen, State),
 
             %% Encrypt packet
             #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
@@ -7343,7 +7466,7 @@ send_path_response_to_addr(
             KeyPhase = get_current_key_phase(State),
 
             %% Build first byte for short header
-            FirstByte = 16#40 bor (KeyPhase bsl 2) bor (PNLen - 1),
+            FirstByte = short_header_first_byte(KeyPhase, PNLen, State),
 
             %% Encrypt packet
             #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
@@ -8037,14 +8160,75 @@ issue_cids(N, #state{local_cid_pool = Pool} = State) when N > 0 ->
     issue_cids(N - 1, State1#state{local_cid_pool = NewPool}).
 
 %% @doc Generate a stateless reset token for a connection ID.
-%% RFC 9000 Section 10.3: Token must be unpredictable to peers.
+%% RFC 9000 §10.3.2 requires the token to be hard for an external
+%% observer to guess. When a server-wide secret is configured, derive
+%% the token deterministically via HMAC-SHA256 so the same CID always
+%% maps to the same token — letting a listener reply with a matching
+%% stateless reset for a CID whose per-connection state it no longer
+%% holds. Without a secret we fall back to per-CID random bytes.
 -spec generate_stateless_reset_token(binary(), #state{}) -> binary().
-generate_stateless_reset_token(CID, _State) ->
-    %% In a production implementation, this should use a consistent secret key
-    %% so tokens can be regenerated. For now, generate random token.
-    %% TODO: Use HKDF with a static secret for consistent token generation
-    crypto:hash(sha256, <<CID/binary, (crypto:strong_rand_bytes(16))/binary>>),
-    crypto:strong_rand_bytes(16).
+generate_stateless_reset_token(_CID, #state{stateless_reset_secret = undefined}) ->
+    crypto:strong_rand_bytes(16);
+generate_stateless_reset_token(CID, #state{stateless_reset_secret = Secret}) when
+    is_binary(Secret), byte_size(Secret) >= 32
+->
+    <<Token:16/binary, _/binary>> = crypto:mac(hmac, sha256, Secret, CID),
+    Token.
+
+%% RFC 9000 §8.1.3 server-side issuance. A NEW_TOKEN frame binds the
+%% client's current source address to an HMAC-signed envelope so the
+%% client can skip the retry round-trip on a future connection.
+%% Requires a token secret; reuses the same listener-wide secret as
+%% stateless reset to avoid spawning a second knob. Only emitted on
+%% server-role connections that reached the connected state.
+maybe_send_new_token(#state{role = client} = State) ->
+    State;
+maybe_send_new_token(#state{stateless_reset_secret = undefined} = State) ->
+    State;
+maybe_send_new_token(
+    #state{
+        role = server,
+        stateless_reset_secret = Secret,
+        remote_addr = Addr
+    } = State
+) ->
+    Token = quic_address_token:encode_new_token(
+        Secret, Addr, erlang:system_time(millisecond)
+    ),
+    send_frame({new_token, Token}, State).
+
+%% RFC 9000 §8.1: validate the Token field a client placed in its
+%% Initial. Returns a `validated | {error, Reason} | no_token'
+%% judgement. Clients and tokenless Initials skip; for servers with
+%% a token secret the HMAC + address + freshness (+ ODCID on retry
+%% tokens) are all checked. This is currently advisory — the listener
+%% doesn't yet retry, so validation outcomes only surface in logs.
+maybe_validate_initial_token(<<>>, _State) ->
+    no_token;
+maybe_validate_initial_token(_Token, #state{role = client}) ->
+    no_token;
+maybe_validate_initial_token(_Token, #state{address_validated = true}) ->
+    %% Listener already ran the full token check. Skipping here avoids
+    %% duplicating the HMAC verify on the hot path.
+    validated;
+maybe_validate_initial_token(_Token, #state{stateless_reset_secret = undefined}) ->
+    no_token;
+maybe_validate_initial_token(Token, #state{
+    stateless_reset_secret = Secret,
+    remote_addr = Addr,
+    original_dcid = ODCID
+}) ->
+    case quic_address_token:decode(Secret, Token) of
+        {ok, #{addr := TokAddr} = Decoded} when TokAddr =/= Addr ->
+            {error, address_mismatch, Decoded};
+        {ok, Decoded} ->
+            case quic_address_token:validate(Decoded, ODCID, #{}) of
+                ok -> validated;
+                {error, Reason} -> {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 %% @doc Validate connection ID parameters from peer transport params.
 %% RFC 9000 Section 7.3: Endpoints MUST validate connection ID parameters.
@@ -8453,6 +8637,59 @@ get_local_max_udp_payload_size(#state{pmtu_state = PMTUState}) ->
 %%====================================================================
 
 -ifdef(TEST).
+%% Inspect the spin-bit state of a #state{} from tests without
+%% exposing the record definition.
+-spec test_spin_state(#state{}) ->
+    #{
+        outgoing := 0 | 1,
+        recv := 0 | 1,
+        largest_pn := integer(),
+        enabled := boolean()
+    }.
+test_spin_state(#state{
+    spin_outgoing = O,
+    spin_recv = R,
+    spin_recv_largest_pn = L,
+    spin_bit_enabled = E
+}) ->
+    #{outgoing => O, recv => R, largest_pn => L, enabled => E}.
+
+%% Minimal #state{} for spin-bit unit tests.
+-spec test_spin_state_for(client | server, boolean()) -> #state{}.
+test_spin_state_for(Role, Enabled) ->
+    #state{role = Role, spin_bit_enabled = Enabled}.
+
+%% Minimal #state{} for stateless-reset tests.
+-spec test_state_with_secret(binary() | undefined) -> #state{}.
+test_state_with_secret(Secret) ->
+    #state{stateless_reset_secret = Secret}.
+
+%% Minimal #state{} scoped to role for frame-dispatch tests.
+-spec test_state_for_role(client | server) -> #state{}.
+test_state_for_role(Role) ->
+    #state{role = Role, app_keys = undefined}.
+
+-spec test_state_for_client({inet:ip_address(), inet:port_number()}) -> #state{}.
+test_state_for_client(RemoteAddr) ->
+    #state{role = client, app_keys = undefined, remote_addr = RemoteAddr}.
+
+-spec test_state_for_server(
+    {inet:ip_address(), inet:port_number()},
+    binary() | undefined,
+    binary()
+) -> #state{}.
+test_state_for_server(RemoteAddr, Secret, ODCID) ->
+    #state{
+        role = server,
+        app_keys = undefined,
+        remote_addr = RemoteAddr,
+        stateless_reset_secret = Secret,
+        original_dcid = ODCID
+    }.
+
+-spec test_close_reason(#state{}) -> term().
+test_close_reason(#state{close_reason = R}) -> R.
+
 %% Test helper for check_send_queue_flow_control/3.
 %% Wraps the internal function to avoid exposing #state{} record.
 %% RFC 9000 Section 4.1: Connection-level flow control (max_data)

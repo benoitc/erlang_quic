@@ -80,10 +80,21 @@
     tickets_table :: ets:tid(),
     %% Whether this listener owns the ETS tables (false in pool mode)
     owns_tables = true :: boolean(),
-    %% Stateless reset secret (RFC 9000 Section 10.3)
+    %% Stateless reset secret (RFC 9000 Section 10.3). Also serves as
+    %% the HMAC key for RFC 9000 §8.1 retry / NEW_TOKEN envelopes so
+    %% operators only have to manage one rotating secret.
     reset_secret :: binary(),
+    %% Address validation policy (RFC 9000 §8.1.2). `never' preserves
+    %% the legacy no-retry behaviour; `always' makes the listener emit
+    %% a Retry packet whenever a client's Initial arrives without a
+    %% valid token. Token freshness bound is `token_max_age_ms'.
+    address_validation = never :: never | always,
+    token_max_age_ms = 600000 :: non_neg_integer(),
     %% Connection handler callback: fun(Conn) -> {ok, HandlerPid} where Conn is pid()
-    connection_handler :: fun((pid()) -> {ok, pid()}) | undefined,
+    connection_handler ::
+        fun((pid()) -> {ok, pid()} | {error, term()})
+        | fun((pid(), binary()) -> {ok, pid()} | {error, term()})
+        | undefined,
     %% QUIC-LB CID configuration (RFC 9312)
     cid_config :: #cid_config{} | undefined,
     %% Expected DCID length for short header packets
@@ -230,6 +241,8 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
         tickets_table = TicketTab,
         owns_tables = OwnsTables,
         reset_secret = ResetSecret,
+        address_validation = maps:get(address_validation, Opts, never),
+        token_max_age_ms = maps:get(address_token_max_age_ms, Opts, 600000),
         connection_handler = ConnHandler,
         cid_config = CIDConfig,
         dcid_len = DCIDLen,
@@ -657,6 +670,43 @@ create_connection(
     RemoteAddr,
     #listener_state{
         socket = Socket,
+        socket_state = SocketState,
+        socket_backend = Backend,
+        cid_config = CIDConfig,
+        reset_secret = ResetSecret,
+        address_validation = Policy,
+        token_max_age_ms = MaxAge
+    } = State
+) ->
+    {IP, Port} = RemoteAddr,
+    case decide_address_validation(Packet, Version, RemoteAddr, ResetSecret, Policy, MaxAge) of
+        {send_retry, ClientSCID, RetryToken} ->
+            %% Fresh server-chosen CID the client must use as DCID on
+            %% its next Initial.
+            RetrySCID =
+                case CIDConfig of
+                    undefined -> crypto:strong_rand_bytes(8);
+                    #cid_config{} -> quic_lb:generate_cid(CIDConfig)
+                end,
+            RetryPacket = quic_packet:encode_retry(
+                DCID, ClientSCID, RetrySCID, RetryToken, Version
+            ),
+            send_packet(Socket, SocketState, Backend, IP, Port, RetryPacket),
+            ok;
+        Verdict when Verdict =:= spawn_validated orelse Verdict =:= spawn_unvalidated ->
+            create_connection_unconditional(
+                Verdict, Packet, DCID, Version, RemoteAddr, State
+            )
+    end.
+
+create_connection_unconditional(
+    Verdict,
+    Packet,
+    DCID,
+    Version,
+    RemoteAddr,
+    #listener_state{
+        socket = Socket,
         cert = Cert,
         cert_chain = CertChain,
         private_key = PrivateKey,
@@ -664,6 +714,7 @@ create_connection(
         connections = Conns,
         connection_handler = ConnHandler,
         cid_config = CIDConfig,
+        reset_secret = ResetSecret,
         opts = Opts
     }
 ) ->
@@ -674,7 +725,11 @@ create_connection(
             #cid_config{} -> quic_lb:generate_cid(CIDConfig)
         end,
 
-    %% Start connection process with client's QUIC version
+    %% Start connection process with client's QUIC version.
+    %% `reset_secret' is propagated so this connection's
+    %% NEW_CONNECTION_ID tokens match the ones the listener will emit
+    %% for orphan packets after the connection goes away (RFC 9000
+    %% §10.3.2).
     ConnOpts = #{
         role => server,
         socket => Socket,
@@ -687,6 +742,21 @@ create_connection(
         alpn => ALPNList,
         listener => self(),
         cid_config => CIDConfig,
+        reset_secret => ResetSecret,
+        %% For Verdict = spawn_validated the listener already checked
+        %% the client's retry token; skip the per-connection
+        %% re-validation to avoid redundant work.
+        address_validated => (Verdict =:= spawn_validated),
+        %% When spawn_validated is reached, the DCID on the accepted
+        %% Initial is the SCID the listener issued in its Retry
+        %% (RFC 9000 §7.3 client behaviour). Echo it back to the
+        %% client as retry_source_connection_id in our transport
+        %% parameters.
+        retry_scid =>
+            case Verdict of
+                spawn_validated -> DCID;
+                _ -> undefined
+            end,
         version => Version
     },
 
@@ -708,32 +778,12 @@ create_connection(
                     %% Handler takes (ConnPid, DCID)
                     case Fun(ConnPid, DCID) of
                         {ok, HandlerPid} when is_pid(HandlerPid) ->
-                            case quic:set_owner_sync(ConnPid, HandlerPid) of
-                                ok ->
-                                    ok;
-                                {error, Reason} ->
-                                    ?LOG_WARNING(
-                                        #{
-                                            what => set_owner_failed,
-                                            conn => ConnPid,
-                                            reason => Reason
-                                        },
-                                        ?QUIC_LOG_META
-                                    )
-                            end;
+                            ok = quic:set_owner_sync(ConnPid, HandlerPid);
                         {error, HandlerError} ->
                             ?LOG_WARNING(
                                 #{
                                     what => connection_handler_failed,
                                     error => HandlerError
-                                },
-                                ?QUIC_LOG_META
-                            );
-                        Other ->
-                            ?LOG_WARNING(
-                                #{
-                                    what => connection_handler_unexpected,
-                                    result => Other
                                 },
                                 ?QUIC_LOG_META
                             )
@@ -743,32 +793,12 @@ create_connection(
                         {ok, HandlerPid} when is_pid(HandlerPid) ->
                             %% Transfer ownership to handler (sync to ensure it completes
                             %% before any packets trigger handshake completion)
-                            case quic:set_owner_sync(ConnPid, HandlerPid) of
-                                ok ->
-                                    ok;
-                                {error, Reason} ->
-                                    ?LOG_WARNING(
-                                        #{
-                                            what => set_owner_failed,
-                                            conn => ConnPid,
-                                            reason => Reason
-                                        },
-                                        ?QUIC_LOG_META
-                                    )
-                            end;
+                            ok = quic:set_owner_sync(ConnPid, HandlerPid);
                         {error, HandlerError} ->
                             ?LOG_WARNING(
                                 #{
                                     what => connection_handler_failed,
                                     error => HandlerError
-                                },
-                                ?QUIC_LOG_META
-                            );
-                        Other ->
-                            ?LOG_WARNING(
-                                #{
-                                    what => connection_handler_unexpected,
-                                    result => Other
                                 },
                                 ?QUIC_LOG_META
                             )
@@ -822,6 +852,76 @@ handle_unknown_packet(
                     %% Packet too small to respond with reset
                     ok
             end
+    end.
+
+%% Decide whether a freshly arrived Initial gets a Retry, spawns a
+%% validated connection, or spawns an unvalidated one per the
+%% listener's `address_validation' policy.
+%%
+%% The caller passes the *whole* Initial packet; this helper peels the
+%% Long Header off and inspects the Token field.
+%%
+%% Returns:
+%%   spawn_unvalidated — policy is `never' or token was missing on a
+%%     `never' server; pass through.
+%%   spawn_validated   — token present + signature + addr + freshness
+%%     all validated; connection is exempt from re-validation.
+%%   {send_retry, ClientSCID, Token} — emit a Retry addressed back to
+%%     ClientSCID (which we took from the Initial's SCID) carrying
+%%     Token for the client to echo back.
+decide_address_validation(_Packet, _Version, _Addr, _Secret, never, _MaxAge) ->
+    spawn_unvalidated;
+decide_address_validation(Packet, _Version, Addr, Secret, always, MaxAge) ->
+    case parse_initial_token(Packet) of
+        {ok, <<>>, ClientSCID, ODCID} ->
+            %% No token → mint one and require the client to echo it.
+            Token = quic_address_token:encode_retry(
+                Secret, Addr, ODCID, erlang:system_time(millisecond)
+            ),
+            {send_retry, ClientSCID, Token};
+        {ok, Token, ClientSCID, ExpectedODCID} ->
+            case validate_initial_token(Secret, Token, Addr, ExpectedODCID, MaxAge) of
+                ok ->
+                    spawn_validated;
+                {error, _} ->
+                    Fresh = quic_address_token:encode_retry(
+                        Secret, Addr, ExpectedODCID, erlang:system_time(millisecond)
+                    ),
+                    {send_retry, ClientSCID, Fresh}
+            end;
+        {error, _} ->
+            %% Malformed Initial — fall back to unvalidated spawn so
+            %% the connection's own decoder reports the real error.
+            spawn_unvalidated
+    end.
+
+%% Extract the Token field from a Long Header Initial packet. Also
+%% returns the client's SCID and the DCID (which the client chose as
+%% the original destination CID before any retry).
+parse_initial_token(
+    <<FirstByte, _Version:32, DCIDLen:8, DCID:DCIDLen/binary, SCIDLen:8, SCID:SCIDLen/binary,
+        Rest/binary>>
+) when
+    FirstByte band 16#F0 =:= 16#C0
+->
+    try
+        {TokenLen, Rest1} = quic_varint:decode(Rest),
+        <<Token:TokenLen/binary, _/binary>> = Rest1,
+        {ok, Token, SCID, DCID}
+    catch
+        _:_ -> {error, malformed_initial}
+    end;
+parse_initial_token(_) ->
+    {error, not_initial}.
+
+validate_initial_token(Secret, Token, Addr, ExpectedODCID, MaxAge) ->
+    case quic_address_token:decode(Secret, Token) of
+        {ok, #{addr := TokAddr} = Decoded} when TokAddr =:= Addr ->
+            quic_address_token:validate(Decoded, ExpectedODCID, #{max_age_ms => MaxAge});
+        {ok, _} ->
+            {error, address_mismatch};
+        {error, _} = Err ->
+            Err
     end.
 
 %% Send a packet using the appropriate backend

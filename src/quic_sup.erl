@@ -75,6 +75,14 @@ init([]) ->
             modules => [quic_server_registry]
         },
         #{
+            id => quic_token_cache,
+            start => {quic_token_cache, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [quic_token_cache]
+        },
+        #{
             id => quic_server_sup,
             start => {quic_server_sup, start_link, []},
             restart => permanent,

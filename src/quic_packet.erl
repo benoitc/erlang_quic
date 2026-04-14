@@ -49,6 +49,7 @@
     encode_long/5,
     encode_short/4,
     encode_short/5,
+    encode_retry/5,
     encode_version_negotiation/3,
     decode/2,
     decode_short_key_phase/1,
@@ -124,6 +125,41 @@ encode_long(Type, Version, DCID, SCID, Opts) ->
             %% Payload contains Retry Token + Retry Integrity Tag
             <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary, Payload/binary>>
     end.
+
+%% @doc Encode a QUIC Retry packet (RFC 9000 §17.2.5).
+%%
+%% `OriginalDCID' is the DCID from the Initial that triggered this
+%% Retry; it's mixed into the integrity tag per RFC 9001 §5.8 and is
+%% NOT part of the wire image. `DCID' is the client's SCID (the
+%% client expects us to address it by that), `SCID' is the fresh
+%% server-side connection ID the client must use as DCID on its
+%% retried Initial. `Token' is opaque; the server later validates
+%% its own HMAC over it when the client returns it in the next
+%% Initial. Returns the fully signed on-wire packet.
+-spec encode_retry(OriginalDCID, DCID, SCID, Token, Version) -> binary() when
+    OriginalDCID :: binary(),
+    DCID :: binary(),
+    SCID :: binary(),
+    Token :: binary(),
+    Version :: non_neg_integer().
+encode_retry(OriginalDCID, DCID, SCID, Token, Version) ->
+    %% 1 | 1 | Type (2 = 11 retry) | Unused (4). Lower 4 bits are
+    %% covered by the integrity tag so they can be anything; pick a
+    %% fixed value so packet captures are stable.
+    FirstByte = 16#F0,
+    PacketWithoutTag = <<
+        FirstByte,
+        Version:32,
+        (byte_size(DCID)):8,
+        DCID/binary,
+        (byte_size(SCID)):8,
+        SCID/binary,
+        Token/binary
+    >>,
+    Tag = quic_crypto:compute_retry_integrity_tag(
+        OriginalDCID, PacketWithoutTag, Version
+    ),
+    <<PacketWithoutTag/binary, Tag/binary>>.
 
 %% @doc Encode a Version Negotiation packet.
 %% RFC 9000 Section 17.2.1 - Version Negotiation Packet
