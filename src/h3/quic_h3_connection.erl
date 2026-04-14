@@ -1120,28 +1120,37 @@ classify_stream(StreamId, #state{peer_encoder_stream = StreamId}) ->
 classify_stream(StreamId, #state{peer_decoder_stream = StreamId}) ->
     {uni, qpack_decoder};
 classify_stream(StreamId, #state{uni_stream_buffers = Buffers, received_pushes = Received} = State) ->
+    case classify_by_extension_tables(StreamId, State) of
+        {ok, Classification} -> Classification;
+        error -> classify_fresh_uni_stream(StreamId, Buffers, Received, State)
+    end.
+
+%% Walk the extension bookkeeping (discarded / claimed uni / claimed
+%% bidi / pending bidi) once, keeping classify_stream/2 flat so elvis's
+%% no_deep_nesting rule stays happy.
+classify_by_extension_tables(StreamId, State) ->
     case sets:is_element(StreamId, State#state.discarded_uni_streams) of
         true ->
-            {uni, discarded};
+            {ok, {uni, discarded}};
         false ->
-            case maps:find(StreamId, State#state.claimed_uni_streams) of
-                {ok, Type} ->
-                    {uni, {claimed, Type}};
-                error ->
-                    case maps:find(StreamId, State#state.claimed_bidi_streams) of
-                        {ok, BType} ->
-                            {bidi, {claimed, BType}};
-                        error ->
-                            case maps:is_key(StreamId, State#state.bidi_type_buffers) of
-                                true ->
-                                    {bidi, pending_type};
-                                false ->
-                                    classify_fresh_uni_stream(
-                                        StreamId, Buffers, Received, State
-                                    )
-                            end
-                    end
+            classify_by_claim_tables(StreamId, State)
+    end.
+
+classify_by_claim_tables(StreamId, State) ->
+    case maps:find(StreamId, State#state.claimed_uni_streams) of
+        {ok, Type} ->
+            {ok, {uni, {claimed, Type}}};
+        error ->
+            case maps:find(StreamId, State#state.claimed_bidi_streams) of
+                {ok, BType} -> {ok, {bidi, {claimed, BType}}};
+                error -> classify_pending_bidi(StreamId, State)
             end
+    end.
+
+classify_pending_bidi(StreamId, State) ->
+    case maps:is_key(StreamId, State#state.bidi_type_buffers) of
+        true -> {ok, {bidi, pending_type}};
+        false -> error
     end.
 
 classify_fresh_uni_stream(StreamId, Buffers, Received, State) ->
