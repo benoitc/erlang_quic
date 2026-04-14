@@ -85,36 +85,15 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    application:ensure_all_started(crypto),
-    application:ensure_all_started(ssl),
+    {ok, Echo} = quic_test_echo_server:start(),
+    ct:pal("CUBIC echo server: 127.0.0.1:~p", [maps:get(port, Echo)]),
+    [{host, "127.0.0.1"}, {port, maps:get(port, Echo)}, {echo_server, Echo} | Config].
 
-    Host = os:getenv("QUIC_SERVER_HOST", "127.0.0.1"),
-    Port = list_to_integer(os:getenv("QUIC_SERVER_PORT", "4433")),
-
-    PrivDir = code:priv_dir(quic),
-    CertsDir =
-        case PrivDir of
-            {error, _} ->
-                filename:join([code:lib_dir(quic), "..", "certs"]);
-            _ ->
-                filename:join([PrivDir, "..", "certs"])
-        end,
-    CaCert = filename:join(CertsDir, "ca.pem"),
-
-    ct:pal("CUBIC E2E Test Configuration:"),
-    ct:pal("  Server: ~s:~p", [Host, Port]),
-    ct:pal("  CA Cert: ~s", [CaCert]),
-    ct:pal("  CC Algorithm: CUBIC (RFC 9438)"),
-
-    case wait_for_server(Host, Port, 30) of
-        ok ->
-            ct:pal("Server is reachable"),
-            [{host, Host}, {port, Port}, {ca_cert, CaCert} | Config];
-        {error, Reason} ->
-            ct:fail("Server not reachable: ~p", [Reason])
-    end.
-
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
+    case ?config(echo_server, Config) of
+        undefined -> ok;
+        Echo -> quic_test_echo_server:stop(Echo)
+    end,
     ok.
 
 init_per_group(_GroupName, Config) ->
@@ -140,7 +119,9 @@ cubic_basic_handshake(Config) ->
     Host = ?config(host, Config),
     Port = ?config(port, Config),
 
-    Opts = #{verify => false, alpn => [<<"echo">>], cc_algorithm => cubic},
+    Opts = maps:merge(quic_test_echo_server:client_opts(), #{
+        alpn => [<<"echo">>], cc_algorithm => cubic
+    }),
     {ok, ConnRef} = quic:connect(Host, Port, Opts, self()),
 
     receive
@@ -159,7 +140,9 @@ cubic_stream_send_receive(Config) ->
     Host = ?config(host, Config),
     Port = ?config(port, Config),
 
-    Opts = #{verify => false, alpn => [<<"echo">>], cc_algorithm => cubic},
+    Opts = maps:merge(quic_test_echo_server:client_opts(), #{
+        alpn => [<<"echo">>], cc_algorithm => cubic
+    }),
     {ok, ConnRef} = quic:connect(Host, Port, Opts, self()),
 
     receive
@@ -189,7 +172,9 @@ cubic_stream_large_data(Config) ->
     Host = ?config(host, Config),
     Port = ?config(port, Config),
 
-    Opts = #{verify => false, alpn => [<<"echo">>], cc_algorithm => cubic},
+    Opts = maps:merge(quic_test_echo_server:client_opts(), #{
+        alpn => [<<"echo">>], cc_algorithm => cubic
+    }),
     {ok, ConnRef} = quic:connect(Host, Port, Opts, self()),
 
     receive
@@ -229,7 +214,9 @@ cubic_stream_very_large_data(Config) ->
     Host = ?config(host, Config),
     Port = ?config(port, Config),
 
-    Opts = #{verify => false, alpn => [<<"echo">>], cc_algorithm => cubic},
+    Opts = maps:merge(quic_test_echo_server:client_opts(), #{
+        alpn => [<<"echo">>], cc_algorithm => cubic
+    }),
     {ok, ConnRef} = quic:connect(Host, Port, Opts, self()),
 
     receive
@@ -269,7 +256,9 @@ cubic_multiple_streams(Config) ->
     Host = ?config(host, Config),
     Port = ?config(port, Config),
 
-    Opts = #{verify => false, alpn => [<<"echo">>], cc_algorithm => cubic},
+    Opts = maps:merge(quic_test_echo_server:client_opts(), #{
+        alpn => [<<"echo">>], cc_algorithm => cubic
+    }),
     {ok, ConnRef} = quic:connect(Host, Port, Opts, self()),
 
     receive
@@ -309,7 +298,9 @@ cubic_hystart_enabled(Config) ->
     Port = ?config(port, Config),
 
     %% HyStart++ is enabled by default
-    Opts = #{verify => false, alpn => [<<"echo">>], cc_algorithm => cubic},
+    Opts = maps:merge(quic_test_echo_server:client_opts(), #{
+        alpn => [<<"echo">>], cc_algorithm => cubic
+    }),
     {ok, ConnRef} = quic:connect(Host, Port, Opts, self()),
 
     receive
@@ -480,30 +471,6 @@ compare_cubic_bbr_large(Config) ->
 %% Helper Functions
 %%====================================================================
 
-wait_for_server(_Host, _Port, 0) ->
-    {error, timeout};
-wait_for_server(Host, Port, Retries) ->
-    case gen_udp:open(0, [binary, {active, false}]) of
-        {ok, Socket} ->
-            HostAddr =
-                case inet:parse_address(Host) of
-                    {ok, Addr} -> Addr;
-                    {error, _} -> Host
-                end,
-            Result = gen_udp:send(Socket, HostAddr, Port, <<0:32>>),
-            gen_udp:close(Socket),
-            case Result of
-                ok ->
-                    ok;
-                {error, _} ->
-                    timer:sleep(1000),
-                    wait_for_server(Host, Port, Retries - 1)
-            end;
-        {error, _} ->
-            timer:sleep(1000),
-            wait_for_server(Host, Port, Retries - 1)
-    end.
-
 collect_stream_data(ConnRef, StreamId, Acc, Timeout) ->
     receive
         {quic, ConnRef, {stream_data, StreamId, Data, true}} ->
@@ -533,7 +500,9 @@ collect_multiple_streams(ConnRef, Responses, Remaining, Timeout) ->
     end.
 
 transfer_with_algorithm(Host, Port, Data, Algorithm) ->
-    Opts = #{verify => false, alpn => [<<"echo">>], cc_algorithm => Algorithm},
+    Opts = maps:merge(quic_test_echo_server:client_opts(), #{
+        alpn => [<<"echo">>], cc_algorithm => Algorithm
+    }),
     {ok, ConnRef} = quic:connect(Host, Port, Opts, self()),
 
     Result =

@@ -85,40 +85,19 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    % Ensure crypto is started
-    application:ensure_all_started(crypto),
-    application:ensure_all_started(ssl),
+    %% Spin an in-process echo server on an ephemeral port. Matches
+    %% the behaviour of docker/server/quic_server.py so these tests
+    %% used to require `docker compose up'; the helper removes that
+    %% dependency entirely.
+    {ok, Echo} = quic_test_echo_server:start(),
+    ct:pal("E2E echo server: 127.0.0.1:~p", [maps:get(port, Echo)]),
+    [{host, "127.0.0.1"}, {port, maps:get(port, Echo)}, {echo_server, Echo} | Config].
 
-    % Get server configuration
-    Host = os:getenv("QUIC_SERVER_HOST", "127.0.0.1"),
-    Port = list_to_integer(os:getenv("QUIC_SERVER_PORT", "4433")),
-
-    % Path to CA certificate for verification
-    PrivDir = code:priv_dir(quic),
-    CertsDir =
-        case PrivDir of
-            {error, _} ->
-                % Fallback to relative path from test directory
-                filename:join([code:lib_dir(quic), "..", "certs"]);
-            _ ->
-                filename:join([PrivDir, "..", "certs"])
-        end,
-    CaCert = filename:join(CertsDir, "ca.pem"),
-
-    ct:pal("E2E Test Configuration:"),
-    ct:pal("  Server: ~s:~p", [Host, Port]),
-    ct:pal("  CA Cert: ~s", [CaCert]),
-
-    % Verify server is reachable
-    case wait_for_server(Host, Port, 30) of
-        ok ->
-            ct:pal("Server is reachable"),
-            [{host, Host}, {port, Port}, {ca_cert, CaCert} | Config];
-        {error, Reason} ->
-            ct:fail("Server not reachable: ~p", [Reason])
-    end.
-
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
+    case ?config(echo_server, Config) of
+        undefined -> ok;
+        Echo -> quic_test_echo_server:stop(Echo)
+    end,
     ok.
 
 init_per_group(_GroupName, Config) ->
@@ -322,7 +301,7 @@ stream_large_data(Config) ->
     Host = ?config(host, Config),
     Port = ?config(port, Config),
 
-    Opts = #{verify => false, alpn => [<<"echo">>]},
+    Opts = maps:merge(quic_test_echo_server:client_opts(), #{alpn => [<<"echo">>]}),
     {ok, ConnRef} = quic:connect(Host, Port, Opts, self()),
 
     receive
@@ -437,36 +416,6 @@ connection_idle_timeout(Config) ->
     after 10000 ->
         quic:close(ConnRef, timeout),
         ct:fail("Connection timeout")
-    end.
-
-%%====================================================================
-%% Helper Functions
-%%====================================================================
-
-%% @doc Wait for server to be reachable
-wait_for_server(_Host, _Port, 0) ->
-    {error, timeout};
-wait_for_server(Host, Port, Retries) ->
-    case gen_udp:open(0, [binary, {active, false}]) of
-        {ok, Socket} ->
-            % Try to send a packet (won't get response, but verifies route)
-            HostAddr =
-                case inet:parse_address(Host) of
-                    {ok, Addr} -> Addr;
-                    {error, _} -> Host
-                end,
-            Result = gen_udp:send(Socket, HostAddr, Port, <<0:32>>),
-            gen_udp:close(Socket),
-            case Result of
-                ok ->
-                    ok;
-                {error, _} ->
-                    timer:sleep(1000),
-                    wait_for_server(Host, Port, Retries - 1)
-            end;
-        {error, _} ->
-            timer:sleep(1000),
-            wait_for_server(Host, Port, Retries - 1)
     end.
 
 %% @doc Collect stream data until fin flag

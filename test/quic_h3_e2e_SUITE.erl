@@ -99,27 +99,17 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    % Ensure crypto is started
-    application:ensure_all_started(crypto),
-    application:ensure_all_started(ssl),
+    {ok, Server} = quic_test_h3_server:start(),
+    Host = "127.0.0.1",
+    Port = maps:get(port, Server),
+    ct:pal("H3 E2E server: ~s:~p", [Host, Port]),
+    [{h3_host, Host}, {h3_port, Port}, {h3_server, Server} | Config].
 
-    % Get server configuration from environment
-    Host = os:getenv("H3_SERVER_HOST", "127.0.0.1"),
-    Port = list_to_integer(os:getenv("H3_SERVER_PORT", "4435")),
-
-    ct:pal("HTTP/3 E2E Test Configuration:"),
-    ct:pal("  Server: ~s:~p", [Host, Port]),
-
-    % Verify server is reachable
-    case wait_for_server(Host, Port, 30) of
-        ok ->
-            ct:pal("H3 Server is reachable"),
-            [{h3_host, Host}, {h3_port, Port} | Config];
-        {error, Reason} ->
-            {skip, {h3_server_unavailable, Reason}}
-    end.
-
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
+    case ?config(h3_server, Config) of
+        undefined -> ok;
+        Server -> quic_test_h3_server:stop(Server)
+    end,
     ok.
 
 init_per_group(_GroupName, Config) ->
@@ -245,7 +235,9 @@ large_response(Config) ->
     Host = ?config(h3_host, Config),
     Port = ?config(h3_port, Config),
 
-    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false, sync => true}),
+    {ok, Conn} = quic_h3:connect(Host, Port, #{
+        verify => false, sync => true, quic_opts => large_transfer_quic_opts()
+    }),
 
     Headers = [
         {<<":method">>, <<"GET">>},
@@ -270,7 +262,9 @@ post_echo(Config) ->
     Host = ?config(h3_host, Config),
     Port = ?config(h3_port, Config),
 
-    {ok, Conn} = quic_h3:connect(Host, Port, #{verify => false, sync => true}),
+    {ok, Conn} = quic_h3:connect(Host, Port, #{
+        verify => false, sync => true, quic_opts => large_transfer_quic_opts()
+    }),
 
     %% Send 64KB body
     PostBody = crypto:strong_rand_bytes(64 * 1024),
@@ -511,30 +505,16 @@ goaway_graceful(Config) ->
 %% Helper Functions
 %%====================================================================
 
-%% @doc Wait for server to be reachable
-wait_for_server(_Host, _Port, 0) ->
-    {error, timeout};
-wait_for_server(Host, Port, Retries) ->
-    case gen_udp:open(0, [binary, {active, false}]) of
-        {ok, Socket} ->
-            HostAddr =
-                case inet:parse_address(Host) of
-                    {ok, Addr} -> Addr;
-                    {error, _} -> Host
-                end,
-            Result = gen_udp:send(Socket, HostAddr, Port, <<0:32>>),
-            gen_udp:close(Socket),
-            case Result of
-                ok ->
-                    ok;
-                {error, _} ->
-                    timer:sleep(1000),
-                    wait_for_server(Host, Port, Retries - 1)
-            end;
-        {error, _} ->
-            timer:sleep(1000),
-            wait_for_server(Host, Port, Retries - 1)
-    end.
+%% QUIC flow-control windows sized for the 1 MB / 64 KB transfers
+%% exercised by large_response / post_echo. The default windows are
+%% tuned for interactive H3 requests and are too tight for these.
+large_transfer_quic_opts() ->
+    #{
+        max_data => 16 * 1024 * 1024,
+        max_stream_data_bidi_local => 4 * 1024 * 1024,
+        max_stream_data_bidi_remote => 4 * 1024 * 1024,
+        max_stream_data_uni => 4 * 1024 * 1024
+    }.
 
 %% @doc Receive HTTP/3 response (headers + body)
 receive_response(Conn, StreamId, Timeout) ->
