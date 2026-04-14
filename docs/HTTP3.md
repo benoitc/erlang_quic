@@ -350,6 +350,53 @@ Cancel a push (client only).
 
 Sends CANCEL_PUSH to tell the server we don't want this push. Can be called after receiving a `push_promise` notification.
 
+### Extension Streams (stream_type_handler)
+
+HTTP/3 layers extensions on top of unidirectional streams by assigning
+them new type codepoints — WebTransport's `WT_STREAM` (varint `0x54`) is
+the canonical example. By default, RFC 9114 §6.2.3 says the server MUST
+ignore unknown types: the bytes are discarded and the stream is left
+alone. Set `stream_type_handler` to take them over instead.
+
+The handler is a function the connection calls whenever it sees a new
+uni stream with a type it doesn't recognise:
+
+```erlang
+stream_type_handler => fun((uni, StreamId, VarintType) -> claim | ignore)
+```
+
+Return `claim` to take ownership of the stream, or `ignore` to fall back
+to the default discard. The option can be passed to either
+`quic_h3:connect/3` or `quic_h3:start_server/3`.
+
+```erlang
+Claim = fun
+    (uni, _StreamId, 16#54) -> claim;   %% WebTransport WT_STREAM
+    (_, _, _)               -> ignore
+end,
+{ok, _} = quic_h3:start_server(my_server, 4433, #{
+    cert => Cert, key => Key,
+    handler => fun my_http_handler/5,
+    stream_type_handler => Claim
+}).
+```
+
+Once a stream is claimed, the connection owner receives these events:
+
+| Event | Description |
+|-------|-------------|
+| `{stream_type_open, uni, StreamId, VarintType}` | Claim accepted; no payload yet |
+| `{stream_type_data, uni, StreamId, Data, Fin}` | Raw bytes received on the claimed stream |
+| `{stream_type_closed, uni, StreamId}` | Peer closed the stream |
+
+To send on a claimed stream, retrieve the QUIC connection with
+`quic_h3:get_quic_conn/1` and call `quic:send_data/4` directly; H3 does
+not frame or encode the payload.
+
+Bidirectional streams are always handled as HTTP/3 request streams
+today — WebTransport's `WT_BIDI_SIGNAL` (varint `0x41`) is not yet
+claimable through this hook.
+
 ### Messages to Owner
 
 The connection owner process receives messages in the form `{quic_h3, Conn, Event}`.
@@ -381,6 +428,17 @@ The connection owner process receives messages in the form `{quic_h3, Conn, Even
 | `{push_data, PushId, Data, Fin}` | Push response data (client) |
 | `{push_complete, PushId}` | Push stream completed (client) |
 | `{push_cancelled, PushId}` | Push was cancelled (client) |
+
+#### Extension Stream Events
+
+Emitted only when a `stream_type_handler` has claimed the stream — see
+[Extension Streams](#extension-streams-stream_type_handler) above.
+
+| Event | Description |
+|-------|-------------|
+| `{stream_type_open, uni, StreamId, VarintType}` | Extension claimed a new uni stream |
+| `{stream_type_data, uni, StreamId, Data, Fin}` | Raw bytes on a claimed stream |
+| `{stream_type_closed, uni, StreamId}` | Peer closed a claimed stream |
 
 #### Error Events
 
