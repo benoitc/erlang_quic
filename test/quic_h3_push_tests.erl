@@ -375,7 +375,9 @@ make_test_state(Overrides) ->
         %% Per-stream handler registration
         stream_handlers => #{},
         stream_data_buffers => #{},
-        stream_buffer_limit => 65536
+        stream_buffer_limit => 65536,
+        stream_type_handler => undefined,
+        claimed_uni_streams => #{}
     },
     Merged = maps:merge(Default, Overrides),
     {state, maps:get(quic_conn, Merged), maps:get(quic_ref, Merged), maps:get(role, Merged),
@@ -399,4 +401,5 @@ make_test_state(Overrides) ->
         maps:get(received_pushes, Merged), maps:get(local_cancelled_pushes, Merged),
         maps:get(last_accepted_push_id, Merged), maps:get(stream_handlers, Merged),
         maps:get(stream_data_buffers, Merged), maps:get(stream_buffer_limit, Merged),
-        maps:get(local_connect_enabled, Merged)}.
+        maps:get(local_connect_enabled, Merged), maps:get(stream_type_handler, Merged),
+        maps:get(claimed_uni_streams, Merged)}.

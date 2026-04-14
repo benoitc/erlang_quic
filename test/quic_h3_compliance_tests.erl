@@ -1501,7 +1501,7 @@ unknown_uni_stream_subsequent_data_is_ignored_test() ->
     StreamId = 3,
     State1 = mark_uni_stream_open(StreamId, State0),
     {ok, State2} = quic_h3_connection:handle_stream_data(
-        StreamId, <<16#54>>, false, State1
+        StreamId, <<16#40, 16#54>>, false, State1
     ),
     %% Feeding more bytes on the already-discarded stream must succeed
     %% silently and must not re-enter classification.
@@ -1519,7 +1519,7 @@ unknown_uni_stream_closure_clears_discard_state_test() ->
     StreamId = 3,
     State1 = mark_uni_stream_open(StreamId, State0),
     {ok, State2} = quic_h3_connection:handle_stream_data(
-        StreamId, <<16#54, 0>>, false, State1
+        StreamId, <<16#40, 16#54, 0>>, false, State1
     ),
     ?assert(
         sets:is_element(
@@ -1538,6 +1538,83 @@ mark_uni_stream_open(StreamId, State) ->
         StreamId, unidirectional, State
     ),
     State1.
+
+%%====================================================================
+%% stream_type_handler extension hook
+%%====================================================================
+
+stream_type_handler_claims_uni_stream_test() ->
+    Claim = fun(uni, _StreamId, 16#54) -> claim end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Claim}),
+    StreamId = 3,
+    State1 = mark_uni_stream_open(StreamId, State0),
+    flush_mailbox(),
+    {ok, _State2} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#40, 16#54, 0, "hello">>, false, State1
+    ),
+    Self = self(),
+    receive
+        {quic_h3, Self, {stream_type_open, uni, StreamId, 16#54}} -> ok
+    after 100 -> ?assert(false)
+    end,
+    receive
+        {quic_h3, Self, {stream_type_data, uni, StreamId, <<0, "hello">>, false}} -> ok
+    after 100 -> ?assert(false)
+    end.
+
+stream_type_handler_follow_up_data_forwarded_test() ->
+    Claim = fun(uni, _StreamId, _Type) -> claim end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Claim}),
+    StreamId = 3,
+    State1 = mark_uni_stream_open(StreamId, State0),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#40, 16#54>>, false, State1
+    ),
+    flush_mailbox(),
+    {ok, _State3} = quic_h3_connection:handle_stream_data(
+        StreamId, <<0, "body">>, true, State2
+    ),
+    Self = self(),
+    receive
+        {quic_h3, Self, {stream_type_data, uni, StreamId, <<0, "body">>, true}} -> ok
+    after 100 -> ?assert(false)
+    end.
+
+stream_type_handler_ignore_falls_back_to_discard_test() ->
+    Ignore = fun(uni, _StreamId, _Type) -> ignore end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Ignore}),
+    StreamId = 3,
+    State1 = mark_uni_stream_open(StreamId, State0),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#40, 16#54, 0, "payload">>, false, State1
+    ),
+    ?assert(
+        sets:is_element(
+            StreamId, quic_h3_connection:test_discarded_uni_streams(State2)
+        )
+    ).
+
+stream_type_handler_closure_notifies_owner_test() ->
+    Claim = fun(uni, _StreamId, _Type) -> claim end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Claim}),
+    StreamId = 3,
+    State1 = mark_uni_stream_open(StreamId, State0),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#40, 16#54, 0>>, false, State1
+    ),
+    flush_mailbox(),
+    {ok, _State3} = quic_h3_connection:handle_stream_closed(StreamId, State2),
+    Self = self(),
+    receive
+        {quic_h3, Self, {stream_type_closed, uni, StreamId}} -> ok
+    after 100 -> ?assert(false)
+    end.
+
+flush_mailbox() ->
+    receive
+        _ -> flush_mailbox()
+    after 0 -> ok
+    end.
 
 %%====================================================================
 %% Helper Functions
@@ -1595,7 +1672,9 @@ make_test_state(Overrides) ->
         %% Per-stream handler registration
         stream_handlers => #{},
         stream_data_buffers => #{},
-        stream_buffer_limit => 65536
+        stream_buffer_limit => 65536,
+        stream_type_handler => undefined,
+        claimed_uni_streams => #{}
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -1622,4 +1701,5 @@ make_test_state(Overrides) ->
         maps:get(last_accepted_push_id, Merged),
         %% Per-stream handler registration
         maps:get(stream_handlers, Merged), maps:get(stream_data_buffers, Merged),
-        maps:get(stream_buffer_limit, Merged), maps:get(local_connect_enabled, Merged)}.
+        maps:get(stream_buffer_limit, Merged), maps:get(local_connect_enabled, Merged),
+        maps:get(stream_type_handler, Merged), maps:get(claimed_uni_streams, Merged)}.

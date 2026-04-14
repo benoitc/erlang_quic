@@ -216,7 +216,19 @@
     %% RFC 9220: extended CONNECT enabled locally (advertised in our SETTINGS).
     %% Used on the server side to validate inbound :protocol pseudo-headers.
     %% Placed at the end so prior tuple positions stay stable for tests.
-    local_connect_enabled = false :: boolean()
+    local_connect_enabled = false :: boolean(),
+
+    %% Extension hook. When set, `handle_uni_stream_type/3` consults
+    %% this function for unknown stream types and, on `claim`, routes
+    %% subsequent bytes to the owner as `{stream_type_*, ...}` events
+    %% instead of discarding them.
+    stream_type_handler ::
+        fun((uni, stream_id(), non_neg_integer()) -> claim | ignore) | undefined,
+
+    %% Uni streams that the stream_type_handler claimed; maps StreamId
+    %% to the advertised varint stream type so owner messages can
+    %% include it.
+    claimed_uni_streams = #{} :: #{stream_id() => non_neg_integer()}
 }).
 
 %%====================================================================
@@ -386,6 +398,7 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
     ),
     LocalMaxBlocked = maps:get(qpack_blocked_streams, LocalSettings, 0),
     LocalConnectEnabled = maps:get(enable_connect_protocol, LocalSettings, 0) =:= 1,
+    StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
 
     State = #state{
         quic_conn = QuicConn,
@@ -400,7 +413,8 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
         next_stream_id = 0,
         local_max_field_section_size = LocalMaxFieldSize,
         local_max_blocked_streams = LocalMaxBlocked,
-        local_connect_enabled = LocalConnectEnabled
+        local_connect_enabled = LocalConnectEnabled,
+        stream_type_handler = StreamTypeHandler
     },
 
     %% Start in awaiting_quic - wait for QUIC connected notification
@@ -419,6 +433,7 @@ init({server, QuicConn, Opts, Owner}) ->
     LocalMaxBlocked = maps:get(qpack_blocked_streams, LocalSettings, 0),
     LocalConnectEnabled = maps:get(enable_connect_protocol, LocalSettings, 0) =:= 1,
     Handler = maps:get(handler, Opts, undefined),
+    StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
 
     State = #state{
         quic_conn = QuicConn,
@@ -433,7 +448,8 @@ init({server, QuicConn, Opts, Owner}) ->
         next_stream_id = 1,
         local_max_field_section_size = LocalMaxFieldSize,
         local_max_blocked_streams = LocalMaxBlocked,
-        local_connect_enabled = LocalConnectEnabled
+        local_connect_enabled = LocalConnectEnabled,
+        stream_type_handler = StreamTypeHandler
     },
 
     %% Store handler in process dictionary for server
@@ -954,6 +970,9 @@ handle_stream_data(StreamId, Data, Fin, State) ->
             _ = Data,
             _ = Fin,
             {ok, State};
+        {uni, {claimed, _Type}} ->
+            forward_claimed_uni_data(StreamId, Data, Fin, State),
+            {ok, State};
         {uni, pending} ->
             handle_uni_stream_type(StreamId, Data, State);
         {uni, push_pending} ->
@@ -987,19 +1006,27 @@ classify_stream(StreamId, #state{uni_stream_buffers = Buffers, received_pushes =
         true ->
             {uni, discarded};
         false ->
-            case maps:is_key(StreamId, Buffers) of
-                true ->
-                    %% Check if this is a push stream pending push ID parsing
-                    case maps:get(StreamId, Buffers) of
-                        {push_pending, _} -> {uni, push_pending};
-                        _ -> {uni, pending}
-                    end;
-                false ->
-                    %% Check if this is an active push stream (client-side)
-                    case find_push_by_stream_id(StreamId, Received) of
-                        {ok, PushId} -> {uni, {push, PushId}};
-                        error -> classify_stream_type(StreamId, State)
-                    end
+            case maps:find(StreamId, State#state.claimed_uni_streams) of
+                {ok, Type} ->
+                    {uni, {claimed, Type}};
+                error ->
+                    classify_fresh_uni_stream(StreamId, Buffers, Received, State)
+            end
+    end.
+
+classify_fresh_uni_stream(StreamId, Buffers, Received, State) ->
+    case maps:is_key(StreamId, Buffers) of
+        true ->
+            %% Check if this is a push stream pending push ID parsing
+            case maps:get(StreamId, Buffers) of
+                {push_pending, _} -> {uni, push_pending};
+                _ -> {uni, pending}
+            end;
+        false ->
+            %% Check if this is an active push stream (client-side)
+            case find_push_by_stream_id(StreamId, Received) of
+                {ok, PushId} -> {uni, {push, PushId}};
+                error -> classify_stream_type(StreamId, State)
             end
     end.
 
@@ -1040,17 +1067,51 @@ handle_uni_stream_type(StreamId, Data, #state{uni_stream_buffers = Buffers} = St
             {ok, State#state{uni_stream_buffers = Buffers#{StreamId => Combined}}}
     end.
 
-%% After classifying a uni stream, either discard the rest (unknown
-%% types, RFC 9114 §6.2.3) or re-enter stream dispatch so known types
-%% process their payload.
-dispatch_remaining_uni_data(StreamId, {unknown, _Type}, _Rest, State) ->
-    {ok, State#state{
-        discarded_uni_streams = sets:add_element(StreamId, State#state.discarded_uni_streams)
-    }};
+%% After classifying a uni stream, either hand off to an extension
+%% handler (when one claims the type), discard the rest (unknown types
+%% with no handler, RFC 9114 §6.2.3), or re-enter stream dispatch so
+%% known types process their payload.
+dispatch_remaining_uni_data(StreamId, {unknown, Type}, Rest, State) ->
+    case consult_stream_type_handler(uni, StreamId, Type, State) of
+        claim ->
+            State1 = claim_uni_stream(StreamId, Type, State),
+            forward_claimed_uni_data(StreamId, Rest, false, State1),
+            {ok, State1};
+        ignore ->
+            {ok, State#state{
+                discarded_uni_streams = sets:add_element(
+                    StreamId, State#state.discarded_uni_streams
+                )
+            }}
+    end;
 dispatch_remaining_uni_data(_StreamId, _Type, <<>>, State) ->
     {ok, State};
 dispatch_remaining_uni_data(StreamId, _Type, Rest, State) ->
     handle_stream_data(StreamId, Rest, false, State).
+
+consult_stream_type_handler(_Direction, _StreamId, _Type, #state{
+    stream_type_handler = undefined
+}) ->
+    ignore;
+consult_stream_type_handler(Direction, StreamId, Type, #state{
+    stream_type_handler = Fun
+}) ->
+    case Fun(Direction, StreamId, Type) of
+        claim -> claim;
+        _ -> ignore
+    end.
+
+claim_uni_stream(StreamId, Type, #state{owner = Owner} = State) ->
+    Owner ! {quic_h3, self(), {stream_type_open, uni, StreamId, Type}},
+    State#state{
+        claimed_uni_streams = maps:put(StreamId, Type, State#state.claimed_uni_streams)
+    }.
+
+forward_claimed_uni_data(_StreamId, <<>>, false, _State) ->
+    ok;
+forward_claimed_uni_data(StreamId, Data, Fin, #state{owner = Owner}) ->
+    Owner ! {quic_h3, self(), {stream_type_data, uni, StreamId, Data, Fin}},
+    ok.
 
 assign_uni_stream(StreamId, control, #state{peer_control_stream = undefined} = State) ->
     {ok, State#state{peer_control_stream = StreamId}};
@@ -2730,7 +2791,9 @@ handle_stream_closed(
         streams = Streams,
         stream_buffers = Buffers,
         uni_stream_buffers = UniBuffers,
-        discarded_uni_streams = Discarded
+        discarded_uni_streams = Discarded,
+        claimed_uni_streams = Claimed,
+        owner = Owner
     } = State
 ) ->
     case is_critical_stream(StreamId, State) of
@@ -2740,6 +2803,12 @@ handle_stream_closed(
                 {connection_error, ?H3_CLOSED_CRITICAL_STREAM,
                     iolist_to_binary(io_lib:format("~p stream closed", [Type]))}};
         false ->
+            case maps:is_key(StreamId, Claimed) of
+                true ->
+                    Owner ! {quic_h3, self(), {stream_type_closed, uni, StreamId}};
+                false ->
+                    ok
+            end,
             %% RFC 9114 Section 4.1.1: server-side request stream that ends
             %% before a complete request is received MUST be reset with
             %% H3_REQUEST_INCOMPLETE.
@@ -2749,7 +2818,8 @@ handle_stream_closed(
                 streams = maps:remove(StreamId, Streams),
                 stream_buffers = maps:remove(StreamId, Buffers),
                 uni_stream_buffers = maps:remove(StreamId, UniBuffers),
-                discarded_uni_streams = sets:del_element(StreamId, Discarded)
+                discarded_uni_streams = sets:del_element(StreamId, Discarded),
+                claimed_uni_streams = maps:remove(StreamId, Claimed)
             }}
     end.
 
