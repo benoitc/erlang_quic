@@ -1610,6 +1610,42 @@ stream_type_handler_closure_notifies_owner_test() ->
     after 100 -> ?assert(false)
     end.
 
+%% R4: non-zero close code on a claimed uni stream surfaces as
+%% stream_type_reset with the peer's error code.
+stream_type_handler_non_zero_close_is_reset_test() ->
+    Claim = fun(uni, _StreamId, _Type) -> claim end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Claim}),
+    StreamId = 3,
+    State1 = mark_uni_stream_open(StreamId, State0),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#40, 16#54, 0>>, false, State1
+    ),
+    flush_mailbox(),
+    {ok, _State3} = quic_h3_connection:handle_stream_closed(StreamId, 42, State2),
+    Self = self(),
+    receive
+        {quic_h3, Self, {stream_type_reset, uni, StreamId, 42}} -> ok
+    after 100 -> ?assert(false)
+    end.
+
+%% R4: zero close code keeps the stream_type_closed shape so graceful
+%% halves stay distinguishable from resets for callers.
+stream_type_handler_zero_close_stays_closed_test() ->
+    Claim = fun(uni, _StreamId, _Type) -> claim end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Claim}),
+    StreamId = 3,
+    State1 = mark_uni_stream_open(StreamId, State0),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#40, 16#54, 0>>, false, State1
+    ),
+    flush_mailbox(),
+    {ok, _State3} = quic_h3_connection:handle_stream_closed(StreamId, 0, State2),
+    Self = self(),
+    receive
+        {quic_h3, Self, {stream_type_closed, uni, StreamId}} -> ok
+    after 100 -> ?assert(false)
+    end.
+
 flush_mailbox() ->
     receive
         _ -> flush_mailbox()

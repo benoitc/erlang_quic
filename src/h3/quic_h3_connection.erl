@@ -76,6 +76,7 @@
 -export([
     handle_stream_data/4,
     handle_stream_closed/2,
+    handle_stream_closed/3,
     handle_control_frame/2,
     handle_request_frame/5,
     handle_new_stream/3,
@@ -579,10 +580,10 @@ h3_connecting(
     end;
 h3_connecting(
     info,
-    {quic, QuicConn, {stream_closed, StreamId, _ErrorCode}},
+    {quic, QuicConn, {stream_closed, StreamId, ErrorCode}},
     #state{quic_conn = QuicConn} = State
 ) ->
-    case handle_stream_closed(StreamId, State) of
+    case handle_stream_closed(StreamId, ErrorCode, State) of
         {ok, State1} ->
             {keep_state, State1};
         {error, Reason} ->
@@ -643,13 +644,29 @@ connected(
     {quic, QuicConn, {stream_closed, StreamId, ErrorCode}},
     #state{quic_conn = QuicConn} = State
 ) ->
-    case handle_stream_closed(StreamId, State) of
+    case handle_stream_closed(StreamId, ErrorCode, State) of
         {ok, State1} ->
-            notify_stream_reset(StreamId, ErrorCode, State1),
+            %% For non-claimed streams keep today's generic event;
+            %% claimed streams already got stream_type_reset/closed
+            %% inside handle_stream_closed/3.
+            case maps:is_key(StreamId, State#state.claimed_uni_streams) of
+                true -> ok;
+                false -> notify_stream_reset(StreamId, ErrorCode, State1)
+            end,
             {keep_state, State1};
         {error, Reason} ->
             handle_connection_error(Reason, State)
     end;
+connected(
+    info,
+    {quic, QuicConn, {stop_sending, StreamId, ErrorCode}},
+    #state{quic_conn = QuicConn, claimed_uni_streams = Claimed, owner = Owner} = State
+) ->
+    case maps:is_key(StreamId, Claimed) of
+        true -> Owner ! {quic_h3, self(), {stream_type_stop_sending, uni, StreamId, ErrorCode}};
+        false -> ok
+    end,
+    {keep_state, State};
 connected(
     info,
     {quic, QuicConn, {datagram, Data}},
@@ -2853,8 +2870,15 @@ parse_priority_params([Param | Rest], Urgency, Incremental) ->
             parse_priority_params(Rest, Urgency, Incremental)
     end.
 
+-ifdef(TEST).
+%% Legacy test entry point; production code always has the error code.
+handle_stream_closed(StreamId, State) ->
+    handle_stream_closed(StreamId, 0, State).
+-endif.
+
 handle_stream_closed(
     StreamId,
+    ErrorCode,
     #state{
         streams = Streams,
         stream_buffers = Buffers,
@@ -2873,7 +2897,12 @@ handle_stream_closed(
         false ->
             case maps:is_key(StreamId, Claimed) of
                 true ->
-                    Owner ! {quic_h3, self(), {stream_type_closed, uni, StreamId}};
+                    Event =
+                        case ErrorCode of
+                            0 -> {stream_type_closed, uni, StreamId};
+                            _ -> {stream_type_reset, uni, StreamId, ErrorCode}
+                        end,
+                    Owner ! {quic_h3, self(), Event};
                 false ->
                     ok
             end,
