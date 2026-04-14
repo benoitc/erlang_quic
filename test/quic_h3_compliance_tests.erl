@@ -474,8 +474,8 @@ goaway_clears_blocked_streams_test() ->
         local_decoder_stream => undefined
     }),
     Result = quic_h3_connection:cleanup_blocked_streams_on_goaway(State),
-    %% Blocked streams (field 26, tuple position 27) should be empty after cleanup
-    BlockedStreams = element(27, Result),
+    %% Blocked streams (tuple position 28) should be empty after cleanup
+    BlockedStreams = element(28, Result),
     ?assertEqual(#{}, BlockedStreams).
 
 goaway_empty_blocked_streams_test() ->
@@ -485,7 +485,7 @@ goaway_empty_blocked_streams_test() ->
         local_decoder_stream => undefined
     }),
     Result = quic_h3_connection:cleanup_blocked_streams_on_goaway(State),
-    BlockedStreams = element(27, Result),
+    BlockedStreams = element(28, Result),
     ?assertEqual(#{}, BlockedStreams).
 
 %%====================================================================
@@ -513,8 +513,8 @@ outbound_field_section_uses_peer_setting_test() ->
         local_max_field_section_size => 1000,
         peer_max_field_section_size => 100
     }),
-    %% peer_max_field_section_size is at tuple position 28
-    PeerMax = element(28, State),
+    %% peer_max_field_section_size is at tuple position 29
+    PeerMax = element(29, State),
     ?assertEqual(100, PeerMax).
 
 %% Blocked streams limit uses LOCAL setting (our decoder's limit)
@@ -526,9 +526,9 @@ blocked_streams_uses_local_setting_test() ->
         peer_max_blocked_streams => 10,
         blocked_streams => #{4 => {1, <<>>, false}, 8 => {2, <<>>, false}}
     }),
-    %% Tuple positions: 27=blocked_streams, 32=local_max_blocked_streams
-    BlockedStreams = element(27, State),
-    LocalMaxBlocked = element(32, State),
+    %% Tuple positions: 28=blocked_streams, 33=local_max_blocked_streams
+    BlockedStreams = element(28, State),
+    LocalMaxBlocked = element(33, State),
     BlockedCount = map_size(BlockedStreams),
     ?assertEqual(2, BlockedCount),
     ?assertEqual(2, LocalMaxBlocked),
@@ -543,12 +543,12 @@ settings_directionality_state_fields_test() ->
         peer_max_blocked_streams => 10
     }),
     %% Tuple positions:
-    %% 28=peer_max_field_section_size, 29=peer_max_blocked_streams,
-    %% 30=peer_connect_enabled, 31=local_max_field_section_size, 32=local_max_blocked_streams
-    PeerFieldSize = element(28, State),
-    PeerBlocked = element(29, State),
-    LocalFieldSize = element(31, State),
-    LocalBlocked = element(32, State),
+    %% 29=peer_max_field_section_size, 30=peer_max_blocked_streams,
+    %% 31=peer_connect_enabled, 32=local_max_field_section_size, 33=local_max_blocked_streams
+    PeerFieldSize = element(29, State),
+    PeerBlocked = element(30, State),
+    LocalFieldSize = element(32, State),
+    LocalBlocked = element(33, State),
     ?assertEqual(500, LocalFieldSize),
     ?assertEqual(1000, PeerFieldSize),
     ?assertEqual(5, LocalBlocked),
@@ -655,8 +655,8 @@ data_buffered_when_no_handler_test() ->
     {ok, _Stream2, State2} = quic_h3_connection:handle_request_frame(
         0, {data, <<"hello">>}, false, Stream, State
     ),
-    %% Check that data was buffered (tuple position 43 for stream_data_buffers)
-    StreamDataBuffers = element(43, State2),
+    %% Check that data was buffered (tuple position 44 for stream_data_buffers)
+    StreamDataBuffers = element(44, State2),
     ?assertMatch(#{0 := {[{<<"hello">>, false}], 5, false}}, StreamDataBuffers).
 
 %% Test that data is sent to handler when registered
@@ -709,7 +709,7 @@ multiple_chunks_buffered_in_order_test() ->
         0, {data, <<"chunk2">>}, true, Stream1, State1
     ),
     %% Check buffered data (stored in reverse order internally)
-    StreamDataBuffers = element(43, State2),
+    StreamDataBuffers = element(44, State2),
     {Chunks, Size, HadFin} = maps:get(0, StreamDataBuffers),
     ?assertEqual([{<<"chunk2">>, true}, {<<"chunk1">>, false}], Chunks),
     ?assertEqual(12, Size),
@@ -1473,6 +1473,73 @@ push_promise_get_accepted_client_test() ->
     ).
 
 %%====================================================================
+%% Unknown unidirectional stream discard (RFC 9114 §6.2.3)
+%%====================================================================
+
+%% Regression: an unknown uni-stream type used to be re-parsed as a new
+%% stream-type prefix, which for WebTransport's WT_STREAM (0x54)
+%% followed by a zero session-id byte meant the server classified the
+%% next byte (0x00) as a second control stream and closed the
+%% connection.
+unknown_uni_stream_wt_session_id_zero_is_discarded_test() ->
+    State0 = make_test_state(#{role => server}),
+    StreamId = 3,
+    State1 = mark_uni_stream_open(StreamId, State0),
+    Result = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#54, 0, "GET /\n">>, false, State1
+    ),
+    ?assertMatch({ok, _}, Result),
+    {ok, State2} = Result,
+    ?assert(
+        sets:is_element(
+            StreamId, quic_h3_connection:test_discarded_uni_streams(State2)
+        )
+    ).
+
+unknown_uni_stream_subsequent_data_is_ignored_test() ->
+    State0 = make_test_state(#{role => server}),
+    StreamId = 3,
+    State1 = mark_uni_stream_open(StreamId, State0),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#54>>, false, State1
+    ),
+    %% Feeding more bytes on the already-discarded stream must succeed
+    %% silently and must not re-enter classification.
+    {ok, State3} = quic_h3_connection:handle_stream_data(
+        StreamId, <<0, 0, 0, "payload">>, false, State2
+    ),
+    ?assert(
+        sets:is_element(
+            StreamId, quic_h3_connection:test_discarded_uni_streams(State3)
+        )
+    ).
+
+unknown_uni_stream_closure_clears_discard_state_test() ->
+    State0 = make_test_state(#{role => server}),
+    StreamId = 3,
+    State1 = mark_uni_stream_open(StreamId, State0),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#54, 0>>, false, State1
+    ),
+    ?assert(
+        sets:is_element(
+            StreamId, quic_h3_connection:test_discarded_uni_streams(State2)
+        )
+    ),
+    {ok, State3} = quic_h3_connection:handle_stream_closed(StreamId, State2),
+    ?assertNot(
+        sets:is_element(
+            StreamId, quic_h3_connection:test_discarded_uni_streams(State3)
+        )
+    ).
+
+mark_uni_stream_open(StreamId, State) ->
+    {ok, State1} = quic_h3_connection:handle_new_stream(
+        StreamId, unidirectional, State
+    ),
+    State1.
+
+%%====================================================================
 %% Helper Functions
 %%====================================================================
 
@@ -1502,6 +1569,7 @@ make_test_state(Overrides) ->
         next_stream_id => 0,
         stream_buffers => #{},
         uni_stream_buffers => #{},
+        discarded_uni_streams => sets:new([{version, 2}]),
         encoder_buffer => <<>>,
         decoder_buffer => <<>>,
         blocked_streams => #{},
@@ -1541,11 +1609,11 @@ make_test_state(Overrides) ->
         maps:get(settings_sent, Merged), maps:get(settings_received, Merged),
         maps:get(goaway_id, Merged), maps:get(last_stream_id, Merged), maps:get(streams, Merged),
         maps:get(next_stream_id, Merged), maps:get(stream_buffers, Merged),
-        maps:get(uni_stream_buffers, Merged), maps:get(encoder_buffer, Merged),
-        maps:get(decoder_buffer, Merged), maps:get(blocked_streams, Merged),
-        maps:get(peer_max_field_section_size, Merged), maps:get(peer_max_blocked_streams, Merged),
-        maps:get(peer_connect_enabled, Merged), maps:get(local_max_field_section_size, Merged),
-        maps:get(local_max_blocked_streams, Merged),
+        maps:get(uni_stream_buffers, Merged), maps:get(discarded_uni_streams, Merged),
+        maps:get(encoder_buffer, Merged), maps:get(decoder_buffer, Merged),
+        maps:get(blocked_streams, Merged), maps:get(peer_max_field_section_size, Merged),
+        maps:get(peer_max_blocked_streams, Merged), maps:get(peer_connect_enabled, Merged),
+        maps:get(local_max_field_section_size, Merged), maps:get(local_max_blocked_streams, Merged),
         %% Push fields
         maps:get(max_push_id, Merged), maps:get(next_push_id, Merged),
         maps:get(push_streams, Merged), maps:get(cancelled_pushes, Merged),

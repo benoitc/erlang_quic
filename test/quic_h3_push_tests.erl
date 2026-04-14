@@ -23,8 +23,8 @@ allocate_push_id_test() ->
         max_push_id => 10,
         next_push_id => 0
     }),
-    %% next_push_id is at position 34 (0-indexed: 33)
-    NextPushId = element(34, State),
+    %% next_push_id is at position 35
+    NextPushId = element(35, State),
     ?assertEqual(0, NextPushId).
 
 %%====================================================================
@@ -35,15 +35,15 @@ allocate_push_id_test() ->
 max_push_id_enables_push_test() ->
     State = make_test_state(#{role => server, settings_received => true}),
     {ok, State1} = quic_h3_connection:handle_control_frame({max_push_id, 10}, State),
-    %% max_push_id is at position 33
-    MaxPushId = element(33, State1),
+    %% max_push_id is at position 34
+    MaxPushId = element(34, State1),
     ?assertEqual(10, MaxPushId).
 
 %% MAX_PUSH_ID can increase
 max_push_id_increase_ok_test() ->
     State = make_test_state(#{role => server, max_push_id => 5, settings_received => true}),
     {ok, State1} = quic_h3_connection:handle_control_frame({max_push_id, 10}, State),
-    MaxPushId = element(33, State1),
+    MaxPushId = element(34, State1),
     ?assertEqual(10, MaxPushId).
 
 %% MAX_PUSH_ID cannot decrease
@@ -71,8 +71,8 @@ cancel_push_server_receives_test() ->
     }),
     {ok, State1} = quic_h3_connection:handle_control_frame({cancel_push, 5}, State),
     %% cancelled_pushes should contain push ID 5
-    %% cancelled_pushes is at position 36 (1-indexed, after push_streams at 35)
-    CancelledPushes = element(36, State1),
+    %% cancelled_pushes is at position 37 (1-indexed, after push_streams at 36)
+    CancelledPushes = element(37, State1),
     ?assert(sets:is_element(5, CancelledPushes)).
 
 %%====================================================================
@@ -213,8 +213,8 @@ push_allocation_cleans_cancelled_set_test() ->
         cancelled_pushes => sets:from_list([0, 1], [{version, 2}])
     }),
     {ok, 2, State1} = quic_h3_connection:allocate_push_id(State),
-    %% cancelled_pushes is at position 36
-    Cancelled = element(36, State1),
+    %% cancelled_pushes is at position 37
+    Cancelled = element(37, State1),
     %% IDs 0 and 1 should have been removed
     ?assertNot(sets:is_element(0, Cancelled)),
     ?assertNot(sets:is_element(1, Cancelled)).
@@ -234,8 +234,8 @@ push_stream_tracks_frame_state_test() ->
     }),
     %% Correlate push stream - should set state to expecting_headers
     {ok, State1} = quic_h3_connection:process_push_stream_id(100, 5, <<>>, State),
-    %% received_pushes is at position 39 and stores #h3_stream{}.
-    Received = element(39, State1),
+    %% received_pushes is at position 40 and stores #h3_stream{}.
+    Received = element(40, State1),
     PushStream = maps:get(5, Received),
     ?assertEqual(100, element(2, PushStream)),
     ?assertEqual(expecting_headers, element(15, PushStream)).
@@ -293,8 +293,8 @@ push_cleanup_removes_local_cancelled_test() ->
         stream_buffers => #{100 => <<>>}
     }),
     {ok, State1} = quic_h3_connection:cleanup_push_stream(5, 100, State),
-    %% local_cancelled_pushes is at position 40
-    LocalCancelled = element(40, State1),
+    %% local_cancelled_pushes is at position 41
+    LocalCancelled = element(41, State1),
     ?assertNot(sets:is_element(5, LocalCancelled)).
 
 %% Client-side cleanup removes from received_pushes
@@ -306,8 +306,8 @@ push_cleanup_removes_received_pushes_test() ->
         stream_buffers => #{100 => <<>>}
     }),
     {ok, State1} = quic_h3_connection:cleanup_push_stream(5, 100, State),
-    %% received_pushes is at position 39
-    Received = element(39, State1),
+    %% received_pushes is at position 40
+    Received = element(40, State1),
     ?assertNot(maps:is_key(5, Received)).
 
 %% Cleanup removes stream buffers
@@ -352,6 +352,7 @@ make_test_state(Overrides) ->
         next_stream_id => 0,
         stream_buffers => #{},
         uni_stream_buffers => #{},
+        discarded_uni_streams => sets:new([{version, 2}]),
         encoder_buffer => <<>>,
         decoder_buffer => <<>>,
         blocked_streams => #{},
@@ -387,14 +388,15 @@ make_test_state(Overrides) ->
         maps:get(settings_sent, Merged), maps:get(settings_received, Merged),
         maps:get(goaway_id, Merged), maps:get(last_stream_id, Merged), maps:get(streams, Merged),
         maps:get(next_stream_id, Merged), maps:get(stream_buffers, Merged),
-        maps:get(uni_stream_buffers, Merged), maps:get(encoder_buffer, Merged),
-        maps:get(decoder_buffer, Merged), maps:get(blocked_streams, Merged),
-        maps:get(peer_max_field_section_size, Merged), maps:get(peer_max_blocked_streams, Merged),
-        maps:get(peer_connect_enabled, Merged), maps:get(local_max_field_section_size, Merged),
-        maps:get(local_max_blocked_streams, Merged), maps:get(max_push_id, Merged),
-        maps:get(next_push_id, Merged), maps:get(push_streams, Merged),
-        maps:get(cancelled_pushes, Merged), maps:get(local_max_push_id, Merged),
-        maps:get(promised_pushes, Merged), maps:get(received_pushes, Merged),
-        maps:get(local_cancelled_pushes, Merged), maps:get(last_accepted_push_id, Merged),
-        maps:get(stream_handlers, Merged), maps:get(stream_data_buffers, Merged),
-        maps:get(stream_buffer_limit, Merged), maps:get(local_connect_enabled, Merged)}.
+        maps:get(uni_stream_buffers, Merged), maps:get(discarded_uni_streams, Merged),
+        maps:get(encoder_buffer, Merged), maps:get(decoder_buffer, Merged),
+        maps:get(blocked_streams, Merged), maps:get(peer_max_field_section_size, Merged),
+        maps:get(peer_max_blocked_streams, Merged), maps:get(peer_connect_enabled, Merged),
+        maps:get(local_max_field_section_size, Merged), maps:get(local_max_blocked_streams, Merged),
+        maps:get(max_push_id, Merged), maps:get(next_push_id, Merged),
+        maps:get(push_streams, Merged), maps:get(cancelled_pushes, Merged),
+        maps:get(local_max_push_id, Merged), maps:get(promised_pushes, Merged),
+        maps:get(received_pushes, Merged), maps:get(local_cancelled_pushes, Merged),
+        maps:get(last_accepted_push_id, Merged), maps:get(stream_handlers, Merged),
+        maps:get(stream_data_buffers, Merged), maps:get(stream_buffer_limit, Merged),
+        maps:get(local_connect_enabled, Merged)}.

@@ -70,6 +70,7 @@
 %% Test exports - only available when compiled with TEST defined
 -ifdef(TEST).
 -export([
+    handle_stream_data/4,
     handle_stream_closed/2,
     handle_control_frame/2,
     handle_request_frame/5,
@@ -95,6 +96,9 @@
     do_send_trailers/3
 ]).
 -endif.
+
+%% Exposed for tests and introspection; not part of the public H3 API.
+-export([test_discarded_uni_streams/1]).
 
 %%====================================================================
 %% Types
@@ -152,6 +156,10 @@
     %% Pending uni stream type detection
     %% Value is binary() for regular streams, or {push_pending, binary()} for push streams
     uni_stream_buffers = #{} :: #{stream_id() => binary() | {push_pending, binary()}},
+
+    %% Uni streams classified as unknown type; subsequent bytes are
+    %% discarded per RFC 9114 §6.2.3.
+    discarded_uni_streams = sets:new([{version, 2}]) :: sets:set(stream_id()),
 
     %% QPACK instruction buffers for partial instructions (RFC 9204 Section 4.5)
     encoder_buffer = <<>> :: binary(),
@@ -941,6 +949,11 @@ stream_blocked_by_goaway(_StreamId, client, _State) ->
 
 handle_stream_data(StreamId, Data, Fin, State) ->
     case classify_stream(StreamId, State) of
+        {uni, discarded} ->
+            %% RFC 9114 §6.2.3: unknown uni-stream bytes are ignored.
+            _ = Data,
+            _ = Fin,
+            {ok, State};
         {uni, pending} ->
             handle_uni_stream_type(StreamId, Data, State);
         {uni, push_pending} ->
@@ -970,18 +983,23 @@ classify_stream(StreamId, #state{peer_encoder_stream = StreamId}) ->
 classify_stream(StreamId, #state{peer_decoder_stream = StreamId}) ->
     {uni, qpack_decoder};
 classify_stream(StreamId, #state{uni_stream_buffers = Buffers, received_pushes = Received} = State) ->
-    case maps:is_key(StreamId, Buffers) of
+    case sets:is_element(StreamId, State#state.discarded_uni_streams) of
         true ->
-            %% Check if this is a push stream pending push ID parsing
-            case maps:get(StreamId, Buffers) of
-                {push_pending, _} -> {uni, push_pending};
-                _ -> {uni, pending}
-            end;
+            {uni, discarded};
         false ->
-            %% Check if this is an active push stream (client-side)
-            case find_push_by_stream_id(StreamId, Received) of
-                {ok, PushId} -> {uni, {push, PushId}};
-                error -> classify_stream_type(StreamId, State)
+            case maps:is_key(StreamId, Buffers) of
+                true ->
+                    %% Check if this is a push stream pending push ID parsing
+                    case maps:get(StreamId, Buffers) of
+                        {push_pending, _} -> {uni, push_pending};
+                        _ -> {uni, pending}
+                    end;
+                false ->
+                    %% Check if this is an active push stream (client-side)
+                    case find_push_by_stream_id(StreamId, Received) of
+                        {ok, PushId} -> {uni, {push, PushId}};
+                        error -> classify_stream_type(StreamId, State)
+                    end
             end
     end.
 
@@ -1014,17 +1032,25 @@ handle_uni_stream_type(StreamId, Data, #state{uni_stream_buffers = Buffers} = St
             State1 = State#state{uni_stream_buffers = maps:remove(StreamId, Buffers)},
             case assign_uni_stream(StreamId, Type, State1) of
                 {ok, State2} ->
-                    %% Process remaining data if any
-                    case Rest of
-                        <<>> -> {ok, State2};
-                        _ -> handle_stream_data(StreamId, Rest, false, State2)
-                    end;
+                    dispatch_remaining_uni_data(StreamId, Type, Rest, State2);
                 {error, Reason} ->
                     {error, Reason, State1}
             end;
         {more, _} ->
             {ok, State#state{uni_stream_buffers = Buffers#{StreamId => Combined}}}
     end.
+
+%% After classifying a uni stream, either discard the rest (unknown
+%% types, RFC 9114 §6.2.3) or re-enter stream dispatch so known types
+%% process their payload.
+dispatch_remaining_uni_data(StreamId, {unknown, _Type}, _Rest, State) ->
+    {ok, State#state{
+        discarded_uni_streams = sets:add_element(StreamId, State#state.discarded_uni_streams)
+    }};
+dispatch_remaining_uni_data(_StreamId, _Type, <<>>, State) ->
+    {ok, State};
+dispatch_remaining_uni_data(StreamId, _Type, Rest, State) ->
+    handle_stream_data(StreamId, Rest, false, State).
 
 assign_uni_stream(StreamId, control, #state{peer_control_stream = undefined} = State) ->
     {ok, State#state{peer_control_stream = StreamId}};
@@ -2703,7 +2729,8 @@ handle_stream_closed(
     #state{
         streams = Streams,
         stream_buffers = Buffers,
-        uni_stream_buffers = UniBuffers
+        uni_stream_buffers = UniBuffers,
+        discarded_uni_streams = Discarded
     } = State
 ) ->
     case is_critical_stream(StreamId, State) of
@@ -2721,7 +2748,8 @@ handle_stream_closed(
             {ok, State1#state{
                 streams = maps:remove(StreamId, Streams),
                 stream_buffers = maps:remove(StreamId, Buffers),
-                uni_stream_buffers = maps:remove(StreamId, UniBuffers)
+                uni_stream_buffers = maps:remove(StreamId, UniBuffers),
+                discarded_uni_streams = sets:del_element(StreamId, Discarded)
             }}
     end.
 
@@ -2739,6 +2767,9 @@ maybe_reset_incomplete_request(StreamId, #state{role = server, quic_conn = QuicC
     end;
 maybe_reset_incomplete_request(_StreamId, _State) ->
     ok.
+
+test_discarded_uni_streams(#state{discarded_uni_streams = D}) ->
+    D.
 
 %% Check if a stream is a critical H3 stream
 is_critical_stream(StreamId, #state{peer_control_stream = StreamId}) -> {true, control};
