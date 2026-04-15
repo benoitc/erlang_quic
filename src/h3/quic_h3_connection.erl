@@ -1027,6 +1027,10 @@ handle_new_stream(StreamId, unidirectional, State) ->
     %% Unidirectional stream - need to read type first
     {ok, State#state{uni_stream_buffers = maps:put(StreamId, <<>>, State#state.uni_stream_buffers)}};
 handle_new_stream(StreamId, bidirectional, #state{role = Role} = State) ->
+    %% Note: quic_connection does not emit {new_stream, _, _} in
+    %% production, so this clause is currently only exercised by
+    %% eunit. Real dispatch for fresh peer-initiated bidi streams
+    %% flows through classify_stream_type/2 → handle_bidi_stream_type/4.
     %% RFC 9114 Section 4.1: Validate stream ID parity
     %% Client-initiated streams are even (0, 4, 8...)
     %% Server-initiated streams are odd (1, 5, 9...)
@@ -1188,10 +1192,15 @@ classify_fresh_uni_stream(StreamId, Buffers, Received, State) ->
             end
     end.
 
-%% Helper to classify stream by ID pattern
-classify_stream_type(StreamId, _State) ->
+%% Helper to classify stream by ID pattern. For peer-initiated bidi
+%% streams with a stream_type_handler configured, return
+%% {bidi, pending_type} so the dispatcher lets handle_bidi_stream_type/4
+%% peek the first varint and consult the handler (claim vs. ignore).
+%% Without a handler the stream goes straight to the HTTP/3 request path.
+classify_stream_type(StreamId, #state{stream_type_handler = Handler}) ->
     %% Check if it's a bidirectional stream (bit 1 = 0 for bidi)
     case StreamId band 2 of
+        0 when Handler =/= undefined -> {bidi, pending_type};
         0 -> {bidi, request};
         2 -> unknown
     end.

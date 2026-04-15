@@ -1691,6 +1691,50 @@ stream_type_handler_bidi_ignore_falls_through_test() ->
     {ok, State2} = Result,
     ?assert(maps:is_key(StreamId, element(21, State2))).
 
+%% Real dispatch path: fresh peer-initiated bidi stream arrives via
+%% handle_stream_data/4 without a prior handle_new_stream/3 call
+%% (quic_connection never emits new_stream in production). The
+%% classifier must still consult stream_type_handler and claim the
+%% stream, not drop it into the HTTP/3 request parser.
+stream_type_handler_claims_bidi_stream_via_dispatch_test() ->
+    Claim = fun(bidi, _StreamId, 16#41) -> claim end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Claim}),
+    StreamId = 0,
+    flush_mailbox(),
+    {ok, _State1} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#40, 16#41, "payload">>, false, State0
+    ),
+    Self = self(),
+    receive
+        {quic_h3, Self, {stream_type_open, bidi, StreamId, 16#41}} -> ok
+    after 100 -> ?assert(false)
+    end,
+    receive
+        {quic_h3, Self, {stream_type_data, bidi, StreamId, <<"payload">>, false}} -> ok
+    after 100 -> ?assert(false)
+    end.
+
+%% Same dispatch-path entry for the ignore case: handler declines,
+%% varint + payload replay through the request parser, no
+%% stream_type_open message fires.
+stream_type_handler_bidi_ignore_via_dispatch_test() ->
+    Ignore = fun(bidi, _StreamId, _Type) -> ignore end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Ignore}),
+    StreamId = 0,
+    flush_mailbox(),
+    Result = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#40, 16#41>>, false, State0
+    ),
+    ?assertMatch({ok, _}, Result),
+    {ok, State1} = Result,
+    %% Stream recorded in #state.streams (tuple position 21, same
+    %% as the pre-existing *_falls_through_test assertion).
+    ?assert(maps:is_key(StreamId, element(21, State1))),
+    receive
+        {quic_h3, _, {stream_type_open, bidi, _, _}} -> ?assert(false)
+    after 50 -> ok
+    end.
+
 %% R1: bidi header split across two messages triggers the handler only
 %% once the varint is complete; intermediate delivery returns {more}.
 stream_type_handler_bidi_split_varint_test() ->
