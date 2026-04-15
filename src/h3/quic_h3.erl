@@ -98,6 +98,8 @@
     connect/3,
     request/2,
     request/3,
+    open_bidi_stream/1,
+    open_bidi_stream/2,
     wait_connected/2
 ]).
 
@@ -317,6 +319,39 @@ request(Conn, Headers) ->
 -spec request(conn(), headers(), map()) -> {ok, stream_id()} | {error, term()}.
 request(Conn, Headers, Opts) ->
     quic_h3_connection:request(Conn, Headers, Opts).
+
+%% @doc Open a client-initiated bidirectional stream outside the H3
+%% request/response flow. Equivalent to `open_bidi_stream(Conn, undefined)'
+%% — the stream is a plain request stream and the caller is responsible
+%% for HEADERS/DATA framing (typically not useful on its own; prefer the
+%% `/2' form below).
+%% @end
+-spec open_bidi_stream(conn()) -> {ok, stream_id()} | {error, term()}.
+open_bidi_stream(Conn) ->
+    quic_h3_connection:open_bidi_stream(Conn, undefined).
+
+%% @doc Open a client-initiated bidirectional stream and pre-claim it
+%% with an extension signal type (e.g. WebTransport's `16#41').
+%%
+%% When `SignalType' is a non-negative integer, the stream is recorded
+%% in the H3 connection's claimed-bidi table. Subsequent inbound data
+%% on that stream bypasses the HTTP/3 request parser and is delivered
+%% to the connection owner as
+%% `{quic_h3, Conn, {stream_type_data, bidi, StreamId, Data, Fin}}'.
+%% The owner also receives
+%% `{quic_h3, Conn, {stream_type_open, bidi, StreamId, SignalType}}'
+%% at open time, mirroring the peer-initiated claimed-bidi path.
+%%
+%% The caller sends the extension signal varint (and any session/header
+%% prefix) itself via `send_data/4' — this API is extension-agnostic.
+%%
+%% When `SignalType' is `undefined', no claim is recorded and the stream
+%% behaves as a normal H3 request stream.
+%% @end
+-spec open_bidi_stream(conn(), non_neg_integer() | undefined) ->
+    {ok, stream_id()} | {error, term()}.
+open_bidi_stream(Conn, SignalType) ->
+    quic_h3_connection:open_bidi_stream(Conn, SignalType).
 
 %%====================================================================
 %% Shared API (Client and Server)

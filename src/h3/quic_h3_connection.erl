@@ -22,6 +22,7 @@
     start_link/4,
     request/2,
     request/3,
+    open_bidi_stream/2,
     send_response/4,
     send_data/3,
     send_data/4,
@@ -98,7 +99,8 @@
     handle_push_frame/5,
     handle_priority_update_frame/2,
     handle_priority_update_push_frame/2,
-    do_send_trailers/3
+    do_send_trailers/3,
+    pre_claim_bidi_stream/3
 ]).
 -endif.
 
@@ -279,6 +281,16 @@ request(Conn, Headers) ->
     {ok, stream_id()} | {error, term()}.
 request(Conn, Headers, Opts) ->
     gen_statem:call(Conn, {request, Headers, Opts}).
+
+%% @doc Open a client-initiated bidirectional stream outside the H3
+%% request/response flow. When `SignalType' is a non-negative integer,
+%% the stream is pre-claimed so inbound data is delivered as
+%% `stream_type_data' owner messages. When `undefined', behaves as a
+%% plain unclaimed stream.
+-spec open_bidi_stream(pid(), non_neg_integer() | undefined) ->
+    {ok, stream_id()} | {error, term()}.
+open_bidi_stream(Conn, SignalType) ->
+    gen_statem:call(Conn, {open_bidi_stream, SignalType}).
 
 %% @doc Send a response (server only).
 -spec send_response(pid(), stream_id(), pos_integer(), [{binary(), binary()}]) ->
@@ -716,6 +728,13 @@ connected({call, From}, {request, Headers, Opts}, #state{role = client} = State)
     end;
 connected({call, From}, {request, _Headers, _Opts}, #state{role = server}) ->
     {keep_state_and_data, [{reply, From, {error, server_cannot_request}}]};
+connected({call, From}, {open_bidi_stream, SignalType}, State) ->
+    case do_open_bidi_stream(SignalType, State) of
+        {ok, StreamId, State1} ->
+            {keep_state, State1, [{reply, From, {ok, StreamId}}]};
+        {error, Reason} ->
+            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+    end;
 connected({call, From}, {send_response, StreamId, Status, Headers}, State) ->
     case do_send_response(StreamId, Status, Headers, State) of
         {ok, State1} ->
@@ -1291,6 +1310,32 @@ claim_bidi_stream(StreamId, Type, #state{owner = Owner} = State) ->
     Owner ! {quic_h3, self(), {stream_type_open, bidi, StreamId, Type}},
     State#state{
         bidi_type_buffers = maps:remove(StreamId, State#state.bidi_type_buffers),
+        claimed_bidi_streams = maps:put(
+            StreamId, Type, State#state.claimed_bidi_streams
+        )
+    }.
+
+%% Local-open counterpart of claim_bidi_stream/3. Opens a client-initiated
+%% bidi stream on the underlying QUIC connection and, when SignalType is
+%% set, pre-claims it so inbound bytes bypass the H3 request parser and
+%% land as {stream_type_data, bidi, ...} owner messages.
+do_open_bidi_stream(SignalType, #state{quic_conn = QuicConn} = State) ->
+    case quic:open_stream(QuicConn) of
+        {ok, StreamId} ->
+            {ok, StreamId, pre_claim_bidi_stream(StreamId, SignalType, State)};
+        {error, _} = Err ->
+            Err
+    end.
+
+%% Pure half of do_open_bidi_stream/2: given a freshly opened StreamId,
+%% record the claim (if any) and notify the owner.
+pre_claim_bidi_stream(_StreamId, undefined, State) ->
+    State;
+pre_claim_bidi_stream(StreamId, Type, #state{owner = Owner} = State) when
+    is_integer(Type), Type >= 0
+->
+    Owner ! {quic_h3, self(), {stream_type_open, bidi, StreamId, Type}},
+    State#state{
         claimed_bidi_streams = maps:put(
             StreamId, Type, State#state.claimed_bidi_streams
         )
