@@ -1723,6 +1723,43 @@ stream_type_handler_bidi_split_varint_test() ->
     after 100 -> ?assert(false)
     end.
 
+%% Local-open: pre-claiming a client-initiated bidi stream registers
+%% the type and notifies the owner, mirroring the peer-initiated claim.
+open_bidi_stream_pre_claims_stream_test() ->
+    State0 = make_test_state(#{role => client}),
+    flush_mailbox(),
+    StreamId = 4,
+    Type = 16#41,
+    State1 = quic_h3_connection:pre_claim_bidi_stream(StreamId, Type, State0),
+    %% claimed_bidi_streams is record field — accessed via map gymnastics
+    %% would require knowing the position; instead verify behavior end-
+    %% to-end by feeding data and asserting the claimed-bidi dispatch.
+    {ok, _State2} = quic_h3_connection:handle_stream_data(
+        StreamId, <<"payload">>, false, State1
+    ),
+    Self = self(),
+    receive
+        {quic_h3, Self, {stream_type_open, bidi, StreamId, Type}} -> ok
+    after 100 -> ?assert(false)
+    end,
+    receive
+        {quic_h3, Self, {stream_type_data, bidi, StreamId, <<"payload">>, false}} -> ok
+    after 100 -> ?assert(false)
+    end.
+
+%% Local-open with SignalType = undefined skips the claim entirely:
+%% no owner notification, no claimed-bidi entry. State must be untouched.
+open_bidi_stream_undefined_passthrough_test() ->
+    State0 = make_test_state(#{role => client}),
+    flush_mailbox(),
+    StreamId = 4,
+    State1 = quic_h3_connection:pre_claim_bidi_stream(StreamId, undefined, State0),
+    ?assertEqual(State0, State1),
+    receive
+        {quic_h3, _, {stream_type_open, _, _, _}} -> ?assert(false)
+    after 50 -> ok
+    end.
+
 flush_mailbox() ->
     receive
         _ -> flush_mailbox()
