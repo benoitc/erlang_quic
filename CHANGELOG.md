@@ -6,100 +6,124 @@ All notable changes to this project will be documented in this file.
 
 ## [1.0.0] - 2026-04-15
 
-### Added
-- HTTP/3 implementation (RFC 9114) with QPACK (RFC 9204):
-  client + server, request/response, body data, trailers, GOAWAY,
+First release with HTTP/3. Brings full client + server HTTP/3
+(RFC 9114) with QPACK (RFC 9204), HTTP Datagrams (RFC 9297),
+Server Push, Extensible Priorities, Extended CONNECT, and the
+extension-stream hooks WebTransport needs. Also a critical
+flow-control deadlock fix in the QUIC core, a BBR loopback
+throughput fix, and the H3 server owner default change.
+
+### HTTP/3 (`quic_h3`, new module)
+
+#### Added
+- HTTP/3 client and server (RFC 9114) with QPACK header compression
+  (RFC 9204): request/response, body data, trailers, GOAWAY,
   cancellation, CLI tools (`bin/quic_h3c`, `bin/quic_h3d`)
-- HTTP/3 Server Push (RFC 9114 Section 4.6): `push/3`,
-  `send_push_response/4`, `send_push_data/4`, `set_max_push_id/2`,
-  `cancel_push/2`
-- HTTP/3 Extensible Priorities (RFC 9218): `priority` request option,
-  PRIORITY_UPDATE frames, urgency/incremental hints
-- HTTP/3 Extended CONNECT (RFC 9220) for WebTransport-style upgrades
-- HTTP Datagrams (RFC 9297): `send_datagram/3`, `h3_datagrams_enabled/1`,
-  `max_datagram_size/2`, capsule framing
-- HTTP/3 extension-stream hook: `stream_type_handler` option on
+- Server Push (RFC 9114 §4.6): `push/3`, `send_push_response/4`,
+  `send_push_data/4`, `set_max_push_id/2`, `cancel_push/2`
+- Extensible Priorities (RFC 9218): `priority` request option,
+  PRIORITY_UPDATE frames, urgency / incremental hints
+- Extended CONNECT (RFC 9220) for WebTransport-style upgrades
+- HTTP Datagrams (RFC 9297): `send_datagram/3`,
+  `h3_datagrams_enabled/1`, `max_datagram_size/2`, capsule framing
+- Extension-stream hook: `stream_type_handler` option on
   `start_server/3` claims peer-initiated uni and bidi streams whose
   first varint matches a caller-supplied filter; claimed bytes are
   delivered as `{stream_type_data, ...}` owner messages instead of
   being parsed as HTTP/3 requests. Owner also receives
   `stream_type_open`, `stream_type_closed`, `stream_type_reset`,
   `stream_type_stop_sending` events
-- HTTP/3 client-initiated extension streams: `quic_h3:open_bidi_stream/1,2`
-  pre-claims a bidi stream with a signal-type varint (e.g. WebTransport's
-  `0x41`) so inbound echoes route through the claimed-bidi path
-- HTTP/3 per-connection owner override via `connection_handler` callback
-  on `start_server/3` for hosting many sessions per listener
-- HTTP/3 per-stream handler registration: `set_stream_handler/3,4`,
-  `unset_stream_handler/2` to redirect stream body data to a worker pid
-- HTTP/3 query API: `get_settings/1`, `get_peer_settings/1`,
+- Client-initiated extension streams: `quic_h3:open_bidi_stream/1,2`
+  pre-claims a bidi stream with a signal-type varint (e.g.
+  WebTransport's `0x41`) so inbound bytes route through the
+  claimed-bidi path
+- Per-connection owner override via `connection_handler` callback on
+  `start_server/3` for hosting many sessions per listener
+- Per-stream handler registration: `set_stream_handler/3,4`,
+  `unset_stream_handler/2` to redirect body data to a worker pid
+- Query API: `get_settings/1`, `get_peer_settings/1`,
   `get_quic_conn/1`
-- HTTP/3 documentation: `docs/HTTP3.md` reference + benchmarks section
-- HTTP/3 end-to-end test infrastructure (`quic_h3_e2e_SUITE`,
-  `quic_h3_h3spec_SUITE`, `quic_h3_owner_SUITE`); CI job for HTTP/3 E2E
-- HTTP/3 performance benchmark (`quic_h3_bench`)
-- QUIC spin bit (RFC 9000 §17.4), stateless-reset, full NEW_TOKEN
-  issuance/validation loop
-- QUIC `RESET_STREAM_AT` transport parameter and frame plumbing
+- Documentation: `docs/HTTP3.md` reference + benchmarks section
+- E2E test infrastructure: `quic_h3_e2e_SUITE`, `quic_h3_h3spec_SUITE`,
+  `quic_h3_owner_SUITE`; dedicated CI job
+- Performance benchmark: `quic_h3_bench`
+
+#### Changed
+- Server connection owner now defaults to the listener gen_server
+  (long-lived, trap_exit'ed) instead of the `start_server` caller
+  pid; durable owners for datagram / stream-type events should be
+  supplied via the per-connection `connection_handler` callback
+- SETTINGS directionality validation tightened to RFC 9114
+
+#### Fixed
+- Server connections wedged with `connect_timeout` when the process
+  that called `start_server/3` exited before a client arrived and
+  either `h3_datagram_enabled` or `stream_type_handler` was set
+- Discard unknown unidirectional stream payload (RFC 9114 §6.2
+  unknown-stream-type rule) instead of erroring the connection
+- Emit trailing empty DATA event when response carries FIN so owners
+  always see `Fin = true` exactly once
+- Strict PRIORITY_UPDATE frame parsing per RFC 9218
+- DoS hardening on header / capsule / frame parsing
+- Header / trailer / `:path` / `:status` symmetry between client and
+  server validation
+- GOAWAY drain enforcement: reject new requests after a GOAWAY is
+  sent or received
+- Server push lifecycle correctness (PUSH_PROMISE pairing, duplicate
+  detection, MAX_PUSH_ID enforcement)
+- Tighten RFC 9114 / 9204 compliance across multiple parsers
+- `sync` option on `connect/3` resolves an E2E race where the client
+  tried to send before SETTINGS exchange completed
+- Improved frame error handling and header validation
+- aioquic SETTINGS compatibility
+- QPACK: encoder eviction guard prevents references to
+  unacknowledged dynamic-table entries; rejects `Increment = 0`
+
+### QUIC transport
+
+#### Added
+- Spin bit (RFC 9000 §17.4)
+- Stateless reset support (RFC 9000 §10.3)
+- Full NEW_TOKEN issuance and validation loop
+- `RESET_STREAM_AT` transport parameter and frame plumbing
 - `quic:set_congestion_control/2` runtime CC switch API
 - `quic:get_peer_transport_params/1` introspection API
-- Distribution: user-accessible streams API
-  (`quic_dist:open_stream/1,2`, `send/3`, `close_stream/1`,
-  `reset_stream/1,2`, `controlling_process/2`, `list_streams/0,1`)
-  with acceptor pool and stream priorities
-- Distribution: connection migration logging
-- Distribution: distributed Erlang benchmarks + multi-node test scripts
-- E2E suite migration: `quic_e2e_*_SUITE` and `quic_h3_e2e_SUITE` run
-  against in-process servers; Docker no longer required for these jobs
-- Per-iteration latency stats in distribution throughput benchmark
-  (min/p50/p99/max + timeout counts)
 
-### Changed
-- HTTP/3 server connection owner now defaults to the listener
-  gen_server (long-lived, trap_exit'ed) instead of the start_server
-  caller pid; durable owners for datagram / stream-type events should
-  be supplied via the per-connection `connection_handler` callback
-- BBR congestion control internal clock switched to microseconds;
-  loopback transfers no longer pin to the InitialRtt fallback
-- Distribution test runner logs each test's results as it returns
-  rather than at the end, so a stalled middle test no longer hides
-  the others
-- HTTP/3 SETTINGS directionality validation tightened to RFC 9114
+#### Changed
+- BBR internal clock switched to microseconds; loopback transfers no
+  longer pin to the InitialRtt fallback
 
-### Fixed
+#### Fixed
 - Stream-level `MAX_STREAM_DATA` window stopped sliding once
   `recv_max_data` reached `fc_max_receive_window` (8 MB default).
   Past the cap, the auto-tune re-sent the same value forever and the
   sender stalled at 8 MB lifetime per stream. The window now slides
   past `recv_offset` like the connection-level window already does
-- HTTP/3 server connections wedged with `connect_timeout` when the
-  process that called `start_server/3` exited before a client arrived
-  and either `h3_datagram_enabled` or `stream_type_handler` was set
 - BBR loopback throughput regression: ms-precision clock collapsed
   delivery-rate intervals to 0/1 ms and clamped BDP to the 4-packet
   minimum, holding throughput at ~0.03 Mbps. Microsecond-precision
   internal clock restores expected behavior
-- QUIC: send `MAX_STREAMS` as peer-initiated streams complete
+- Send `MAX_STREAMS` as peer-initiated streams complete
   (RFC 9000 §4.6); previously peers could exhaust the stream-id space
-- QPACK: encoder eviction guard prevents references to
-  unacknowledged dynamic-table entries; rejects `Increment = 0`
-- HTTP/3: discard unknown unidirectional stream payload (RFC 9114
-  §6.2 unknown-stream-type rule) instead of erroring the connection
-- HTTP/3: emit trailing empty DATA event when response carries FIN
-  so owners always see `Fin = true` exactly once
-- HTTP/3: strict PRIORITY_UPDATE frame parsing per RFC 9218
-- HTTP/3: DoS hardening on header / capsule / frame parsing
-- HTTP/3: header / trailer / `:path` / `:status` symmetry between
-  client and server validation
-- HTTP/3: GOAWAY drain enforcement — reject new requests after a
-  GOAWAY is sent or received
-- HTTP/3: server push lifecycle correctness (PUSH_PROMISE pairing,
-  duplicate detection, MAX_PUSH_ID enforcement)
-- HTTP/3: tighten RFC 9114 / 9204 compliance across multiple parsers
-- HTTP/3: `sync` option on `connect/3` resolves an E2E race where the
-  client tried to send before SETTINGS exchange completed
-- HTTP/3: improved frame error handling and header validation
-- HTTP/3: aioquic SETTINGS compatibility
+
+### Distribution (`quic_dist`)
+
+#### Added
+- User-accessible streams API: `quic_dist:open_stream/1,2`, `send/3`,
+  `close_stream/1`, `reset_stream/1,2`, `controlling_process/2`,
+  `list_streams/0,1`, with acceptor pool and stream priorities
+- Connection migration logging
+- Distributed Erlang benchmarks + multi-node test scripts
+- Per-iteration latency stats in throughput benchmark (min/p50/p99/max
+  + timeout counts)
+
+#### Changed
+- Test runner logs each test's results as it returns rather than at
+  the end, so a stalled middle test no longer hides the others
+
+### Tests and infrastructure
+- `quic_e2e_*_SUITE` and `quic_h3_e2e_SUITE` run against in-process
+  servers; Docker no longer required for these jobs
 
 ## [0.11.0] - 2026-04-09
 
