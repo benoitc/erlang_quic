@@ -451,7 +451,14 @@ unset_stream_handler(Conn, StreamId) ->
 %%%     end
 %%% }).
 %%% '''
-%%% @end
+%%
+%% Receiving datagrams / stream-type events: when `h3_datagram_enabled'
+%% or `stream_type_handler' is used, owner-addressed messages are
+%% emitted per connection. Supply a durable receiver by returning
+%% `#{owner => Pid}' from the per-connection `connection_handler'
+%% callback. Without an explicit owner those messages route to the
+%% listener process, where they are discarded.
+%% @end
 -spec start_server(Name, Port, Opts) -> {ok, pid()} | {error, term()} when
     Name :: atom(),
     Port :: inet:port_number(),
@@ -463,13 +470,11 @@ start_server(Name, Port, Opts) ->
     H3DatagramEnabled = maps:get(h3_datagram_enabled, Opts, false),
     PerConn = maps:get(connection_handler, Opts, undefined),
     QuicOpts0 = build_server_quic_opts(Opts),
-    Listener = self(),
     ListenerDefaults = #{
         handler => Handler,
         settings => H3Settings,
         stream_type_handler => StreamTypeHandler,
-        h3_datagram_enabled => H3DatagramEnabled,
-        owner => Listener
+        h3_datagram_enabled => H3DatagramEnabled
     },
     QuicOpts = QuicOpts0#{
         connection_handler => fun(ConnPid, _ConnRef) ->
@@ -705,26 +710,20 @@ maybe_enable_quic_datagrams(Opts, QuicOpts) ->
 %% @private
 %% Connection handler callback for QUIC server.
 %% Called when a new QUIC connection is established (before handshake completes).
-%% `Opts' carries the per-server configuration captured in start_server/3:
-%% `handler', `settings', `stream_type_handler', `h3_datagram_enabled',
-%% and the calling process pid as `owner' (used when any extension hook
-%% needs owner-delivered messages).
+%% Runs inside the listener gen_server process, so `self()' is the listener
+%% pid — long-lived and trap_exit'ed, suitable as the default H3 owner.
+%% `Opts' carries the per-server configuration: `handler', `settings',
+%% `stream_type_handler', `h3_datagram_enabled'. A per-connection
+%% `connection_handler' callback may supply `owner => Pid' to route
+%% extension events (datagrams, stream-type) to a durable receiver.
 h3_connection_handler(QuicConnPid, #{handler := Handler, settings := Settings} = Opts) ->
     StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
     H3DatagramEnabled = maps:get(h3_datagram_enabled, Opts, false),
     Owner = maps:get(owner, Opts, self()),
     H3Opts = build_h3_opts(Settings, Handler, StreamTypeHandler, H3DatagramEnabled),
-    %% When an extension hook is active, owner-addressed events need to
-    %% reach the caller of start_server/3 rather than this transient
-    %% callback process.
-    OwnerForH3 =
-        case (StreamTypeHandler =/= undefined) orelse H3DatagramEnabled of
-            true -> Owner;
-            false -> self()
-        end,
     case
         gen_statem:start_link(
-            quic_h3_connection, {server, QuicConnPid, H3Opts, OwnerForH3}, []
+            quic_h3_connection, {server, QuicConnPid, H3Opts, Owner}, []
         )
     of
         {ok, H3Conn} ->
