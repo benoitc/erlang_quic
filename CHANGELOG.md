@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-04-15
+
+### Fixed
+- h3: consult `stream_type_handler` on fresh peer-initiated bidi
+  streams so extensions can claim them before default request
+  handling (#62)
+- docs: `rebar3 ex_doc` now runs clean (#63)
+
 ## [1.0.0] - 2026-04-15
 
 First release with HTTP/3. Brings full client + server HTTP/3
