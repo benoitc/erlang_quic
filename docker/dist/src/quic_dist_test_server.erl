@@ -236,14 +236,18 @@ get_cluster_nodes() ->
     end.
 
 run_all_tests() ->
+    %% Log each test's result as soon as it returns. Logging at the end
+    %% caused later tests (and the verify script) to miss earlier results
+    %% whenever a middle test stalled.
     Results1 = test_basic_rpc(),
-    Results3 = test_throughput_benchmark(),
-    Results2 = test_large_messages(),
-    Results4 = test_user_streams(),
-
-    %% Log individual results
     log_test_results(basic, Results1),
+
+    Results3 = test_throughput_benchmark(),
+
+    Results2 = test_large_messages(),
     log_test_results(large_msg, Results2),
+
+    Results4 = test_user_streams(),
     log_test_results(user_stream, Results4),
 
     [{basic, Results1}, {throughput, Results3}, {large_msg, Results2}, {user_stream, Results4}].
@@ -266,42 +270,70 @@ run_throughput_bench(TargetNode) ->
 
     Sizes = [64, 256, 1024, 4096, 16384, 65536],
     Iterations = 2000,
+    PerRtTimeoutMs = 5000,
 
     Results = lists:map(fun(Size) ->
         Data = crypto:strong_rand_bytes(Size),
 
-        %% Warmup
+        %% Warmup (10 RTs, no measurement)
         lists:foreach(fun(_) ->
             Ref = make_ref(),
             ServerPid ! {echo, self(), Ref, Data},
-            receive {echo_reply, Ref, _} -> ok after 5000 -> ok end
-        end, lists:seq(1, 50)),
+            receive {echo_reply, Ref, _} -> ok after PerRtTimeoutMs -> ok end
+        end, lists:seq(1, 10)),
 
-        %% Benchmark
+        %% Benchmark — record per-RT latency, count timeouts
         Start = erlang:monotonic_time(microsecond),
-        lists:foreach(fun(_) ->
+        Latencies = lists:map(fun(_) ->
             Ref = make_ref(),
+            T0 = erlang:monotonic_time(microsecond),
             ServerPid ! {echo, self(), Ref, Data},
-            receive {echo_reply, Ref, _} -> ok after 5000 -> ok end
+            receive
+                {echo_reply, Ref, _} ->
+                    erlang:monotonic_time(microsecond) - T0
+            after PerRtTimeoutMs ->
+                timeout
+            end
         end, lists:seq(1, Iterations)),
         Elapsed = erlang:monotonic_time(microsecond) - Start,
 
+        {Stats, Timeouts} = summarize_latencies(Latencies),
         Throughput = Iterations / (Elapsed / 1000000),
         Bandwidth = Throughput * Size / 1048576,
-        AvgLatency = Elapsed / Iterations,
 
         log_event(throughput_result, #{
             size => Size,
-            throughput => round(Throughput),
+            iterations => Iterations,
+            timeouts => Timeouts,
+            elapsed_ms => round(Elapsed / 1000),
             bandwidth_mbps => round(Bandwidth * 100) / 100,
-            latency_us => round(AvgLatency * 10) / 10
+            min_us => maps:get(min, Stats, none),
+            p50_us => maps:get(p50, Stats, none),
+            p99_us => maps:get(p99, Stats, none),
+            max_us => maps:get(max, Stats, none)
         }),
 
-        {Size, Throughput, Bandwidth, AvgLatency}
+        {Size, Throughput, Bandwidth, Stats}
     end, Sizes),
 
     ServerPid ! stop,
     Results.
+
+summarize_latencies(Latencies) ->
+    {OK, Timeouts} = lists:partition(fun(timeout) -> false; (_) -> true end, Latencies),
+    case OK of
+        [] -> {#{}, length(Timeouts)};
+        _ ->
+            Sorted = lists:sort(OK),
+            N = length(Sorted),
+            Stats = #{
+                min => hd(Sorted),
+                p50 => lists:nth(max(1, N div 2), Sorted),
+                p99 => lists:nth(max(1, (N * 99) div 100), Sorted),
+                max => lists:last(Sorted)
+            },
+            {Stats, length(Timeouts)}
+    end.
 
 bench_echo_loop() ->
     receive
