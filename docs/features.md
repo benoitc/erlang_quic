@@ -175,6 +175,21 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - Set `h3_datagram_enabled => true` on `connect/3` / `start_server/3` to enable.
   CONNECT-UDP (RFC 9298) builds on this in a separate library.
 
+### HTTP/3 Extension Streams
+- `quic_h3:open_bidi_stream/1,2` - Open a client-initiated bidi stream;
+  with a non-negative `SignalType` varint the stream is pre-claimed and
+  inbound bytes route as `{stream_type_data, bidi, ...}` owner messages
+  instead of HTTP/3 request frames (e.g. WebTransport's `0x41`)
+- `stream_type_handler` option on `start_server/3` claims peer-initiated
+  uni / bidi streams whose first varint matches a caller-supplied filter
+- Owner events: `{stream_type_open, Direction, StreamId, VarintType}`,
+  `{stream_type_data, Direction, StreamId, Data, Fin}`,
+  `{stream_type_closed, Direction, StreamId}`,
+  `{stream_type_reset, Direction, StreamId, ErrorCode}`,
+  `{stream_type_stop_sending, Direction, StreamId, ErrorCode}`
+- Per-connection owner override via `connection_handler` callback on
+  `start_server/3` for hosting many sessions on one listener
+
 ### Streams
 - `quic:open_stream/1` - Open bidirectional stream
 - `quic:open_unidirectional_stream/1` - Open unidirectional stream

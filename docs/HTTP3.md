@@ -425,6 +425,34 @@ unaffected.
 The same claimed-stream reset/stop_sending events fire on uni
 streams too.
 
+### Client-initiated claimed bidi streams
+
+The peer-initiated path above covers streams the remote opens. A
+client that needs to *open* a bidi stream with its own extension
+signal (e.g. WebTransport's `WT_BIDI_SIGNAL` `0x41`) uses
+`quic_h3:open_bidi_stream/1,2`:
+
+```erlang
+{ok, StreamId} = quic_h3:open_bidi_stream(H3Conn, 16#41),
+QuicConn = quic_h3:get_quic_conn(H3Conn),
+ok = quic:send_data(QuicConn, StreamId,
+                    <<SignalVarint/binary, SessionVarint/binary, Payload/binary>>,
+                    false).
+```
+
+The H3 connection records the claim in the same table peer-initiated
+claims use, emits `{stream_type_open, bidi, StreamId, SignalType}`
+to the owner at open time, and routes inbound bytes on the stream
+as `{stream_type_data, bidi, ...}` events instead of HTTP/3 request
+frames.
+
+`open_bidi_stream/1` and `open_bidi_stream(Conn, undefined)` skip
+the claim and return a plain bidi stream that the H3 layer will
+treat as a normal request.
+
+The caller is responsible for writing the signal-type varint and
+any session/header prefix; this API is extension-agnostic.
+
 ### Per-connection owner
 
 By default every H3 connection spawned by `start_server/3` delivers

@@ -4,6 +4,7 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 
 ## Features
 
+### QUIC transport (RFC 9000 / 9001)
 - TLS 1.3 handshake (RFC 8446)
 - Stream multiplexing (bidirectional and unidirectional)
 - Key update support (RFC 9001 Section 6)
@@ -15,13 +16,38 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 - QUIC-LB load balancer support with routable CIDs (RFC 9312)
 - Retry packet handling for address validation (RFC 9000 Section 8.1)
 - Stateless reset support (RFC 9000 Section 10.3)
-- Flow control (connection and stream level)
+- Spin bit (RFC 9000 §17.4) and full NEW_TOKEN issuance/validation
+- `RESET_STREAM_AT` extension
+- Flow control (connection and stream level) with RTT-based auto-tune
 - Congestion control (NewReno, CUBIC, BBR with ECN support)
 - HyStart++ slow start (RFC 9406)
+- Packet pacing (RFC 9002 Section 7.7)
 - Loss detection and packet retransmission (RFC 9002)
 - QLOG tracing support for debug visibility
 - UDP packet batching (GSO/GRO)
 - Client certificate verification
+
+### HTTP/3 (`quic_h3`)
+- Full HTTP/3 client and server (RFC 9114) with QPACK header compression (RFC 9204)
+- HTTP Datagrams (RFC 9297) with capsule framing
+- Server Push (RFC 9114 Section 4.6)
+- Extensible Priorities (RFC 9218): PRIORITY_UPDATE frames, urgency / incremental
+- Extended CONNECT (RFC 9220) for WebTransport-style upgrades
+- Extension stream hooks: `stream_type_handler` (peer-claimed uni/bidi)
+  and `quic_h3:open_bidi_stream/1,2` (client-initiated, pre-claimed
+  with a signal-type varint)
+- Per-connection owner override via `connection_handler` callback for
+  multi-tenant servers
+- Per-stream handler registration to redirect body data to worker pids
+- CLI tools: `bin/quic_h3c` (client), `bin/quic_h3d` (server)
+- See [docs/HTTP3.md](docs/HTTP3.md) for the full guide
+
+### Distributed Erlang over QUIC (`quic_dist`)
+- EPMD-less node discovery (`quic_discovery_static`, `quic_discovery_dns`)
+- Session-ticket cache for 0-RTT reconnection
+- User-accessible streams API on top of dist connections
+- Stream prioritization (control vs data) and connection-level backpressure
+- See [docs/QUIC_DIST.md](docs/QUIC_DIST.md) for setup
 
 ## Requirements
 
@@ -107,6 +133,42 @@ Alternatively, use the low-level listener API directly:
 Port = quic_listener:get_port(Listener).
 ```
 
+### HTTP/3
+
+```erlang
+%% Server
+{ok, _} = quic_h3:start_server(my_h3, 4433, #{
+    cert => CertDer,
+    key => KeyDer,
+    handler => fun(Conn, StreamId, <<"GET">>, Path, _Headers) ->
+        Body = <<"hello from ", Path/binary>>,
+        quic_h3:send_response(Conn, StreamId, 200,
+                              [{<<"content-type">>, <<"text/plain">>}]),
+        quic_h3:send_data(Conn, StreamId, Body, true)
+    end
+}).
+
+%% Client
+{ok, H3} = quic_h3:connect("example.com", 4433, #{verify => false, sync => true}),
+{ok, StreamId} = quic_h3:request(H3, [
+    {<<":method">>, <<"GET">>},
+    {<<":scheme">>, <<"https">>},
+    {<<":path">>, <<"/hi">>},
+    {<<":authority">>, <<"example.com">>}
+]),
+receive
+    {quic_h3, H3, {response, StreamId, 200, _Headers}} -> ok
+end,
+receive
+    {quic_h3, H3, {data, StreamId, Body, true}} ->
+        io:format("got ~p~n", [Body])
+end,
+quic_h3:close(H3).
+```
+
+See [docs/HTTP3.md](docs/HTTP3.md) for datagrams, push, priorities,
+extended CONNECT, extension streams, and per-connection owners.
+
 ## Messages
 
 The owner process receives messages in the format `{quic, ConnRef, Event}`:
@@ -137,6 +199,10 @@ See [docs/features.md](docs/features.md) for the complete API reference and feat
 **Server:** `quic:start_server/3`, `quic:stop_server/1`, `quic:get_server_port/1`
 
 **Datagrams:** `quic:send_datagram/2` (RFC 9221)
+
+**HTTP/3:** `quic_h3:connect/3`, `quic_h3:request/2,3`, `quic_h3:send_response/4`,
+`quic_h3:send_data/3,4`, `quic_h3:start_server/3`, `quic_h3:open_bidi_stream/1,2`,
+`quic_h3:send_datagram/3` (RFC 9114 / 9204 / 9297)
 
 **Load Balancer:** `quic_lb:new_config/1`, `quic_lb:generate_cid/1` (RFC 9312)
 
