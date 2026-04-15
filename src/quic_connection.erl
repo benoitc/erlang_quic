@@ -4921,11 +4921,16 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                     %% initiated stream becomes fully closed.
                     State1 = maybe_credit_peer_stream(StreamId, State1Pre),
 
-                    %% Check if we need to send MAX_STREAM_DATA to allow more data
-                    %% Send when we've consumed more than half our advertised limit
-                    %% RTT-based auto-tuning: double if fast consumption, linear if slow
-                    Threshold = RecvMaxData div 2,
-                    WillSendMaxStreamData = NewRecvOffset > Threshold,
+                    %% Check if we need to send MAX_STREAM_DATA to allow more data.
+                    %% Trigger when remaining sender headroom (max - delivered) drops
+                    %% below half the configured per-stream window. Using the absolute
+                    %% recv_max_data alone deadlocks once it reaches MaxWindow because
+                    %% NewRecvOffset will eventually catch up but the threshold stops
+                    %% advancing.
+                    MaxWindowForStream = State#state.fc_max_receive_window,
+                    Headroom = max(0, RecvMaxData - NewRecvOffset),
+                    WillSendMaxStreamData = Headroom < (MaxWindowForStream div 2),
+                    Threshold = RecvMaxData - (MaxWindowForStream div 2),
                     ?LOG_DEBUG(
                         #{
                             what => max_stream_data_check,
@@ -4954,14 +4959,21 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                                             (Now - LastStreamUpdate) <
                                                 (SmoothedRTT * ?AUTO_TUNE_RTT_FACTOR)
                                     end,
+                                %% Slide the window forward relative to the
+                                %% delivered offset, capped at MaxWindow. Without
+                                %% the offset relativization we'd hit MaxWindow
+                                %% once and never advance again — sender stalls.
                                 NewMaxStreamData =
                                     case FastConsumption of
                                         true ->
-                                            %% Double (aggressive growth for fast consumption)
-                                            min(RecvMaxData * 2, MaxWindow);
+                                            %% Double the live window (aggressive)
+                                            NewRecvOffset + min(RecvMaxData * 2, MaxWindow);
                                         false ->
-                                            %% Linear (conservative growth for slow consumption)
-                                            min(RecvMaxData + InitialStreamWindow, MaxWindow)
+                                            %% Add one initial window (conservative)
+                                            NewRecvOffset +
+                                                min(
+                                                    RecvMaxData + InitialStreamWindow, MaxWindow
+                                                )
                                     end,
                                 UpdatedStream = NewStream#stream_state{
                                     recv_max_data = NewMaxStreamData
