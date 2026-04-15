@@ -200,12 +200,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `quic:set_stream_priority/4` - Set stream priority (urgency, incremental)
 - `quic:get_stream_priority/2` - Get stream priority
 
-### Server
-- `quic:listen/2` - Start listener
-- `quic:accept/1,2` - Accept connection
-- `quic:close_listener/1` - Close listener
-
-### Multi-Pool Server Management
+### Server / Multi-Pool Server Management
 - `quic:start_server/3` - Start named server pool
 - `quic:stop_server/1` - Stop named server
 - `quic:get_server_info/1` - Get server information
