@@ -405,7 +405,7 @@ max_datagram_size(Conn, StreamId) ->
     gen_statem:call(Conn, {h3_max_datagram_size, StreamId}).
 
 %% @doc Register a handler process to receive stream data.
-%% The handler will receive `{quic_h3, Conn, {data, StreamId, Data, Fin}}` messages.
+%% The handler will receive `{quic_h3, Conn, {data, StreamId, Data, Fin}}' messages.
 %% Any data buffered before registration is returned.
 %% @see set_stream_handler/4
 -spec set_stream_handler(pid(), stream_id(), pid()) ->
