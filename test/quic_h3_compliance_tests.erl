@@ -1580,6 +1580,54 @@ stream_type_handler_follow_up_data_forwarded_test() ->
     after 100 -> ?assert(false)
     end.
 
+%% Regression: a peer that packs type-varint + payload + FIN into a
+%% single STREAM frame must surface exactly one
+%% {stream_type_data, uni, _, _, true} event to the owner.
+stream_type_handler_claims_uni_stream_with_fin_test() ->
+    Claim = fun(uni, _StreamId, 16#54) -> claim end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Claim}),
+    StreamId = 3,
+    State1 = mark_uni_stream_open(StreamId, State0),
+    flush_mailbox(),
+    {ok, _State2} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#40, 16#54, 0, "hello">>, true, State1
+    ),
+    Self = self(),
+    receive
+        {quic_h3, Self, {stream_type_open, uni, StreamId, 16#54}} -> ok
+    after 100 -> ?assert(false)
+    end,
+    receive
+        {quic_h3, Self, {stream_type_data, uni, StreamId, <<0, "hello">>, true}} -> ok
+    after 100 -> ?assert(false)
+    end,
+    receive
+        {quic_h3, Self, _Extra} -> ?assert(false)
+    after 50 -> ok
+    end.
+
+%% Peer sends only the type varint with FIN set (zero payload after
+%% the type). The owner still needs a fin event so it knows the stream
+%% is done.
+stream_type_handler_claims_uni_stream_type_only_fin_test() ->
+    Claim = fun(uni, _StreamId, 16#54) -> claim end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Claim}),
+    StreamId = 3,
+    State1 = mark_uni_stream_open(StreamId, State0),
+    flush_mailbox(),
+    {ok, _State2} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#40, 16#54>>, true, State1
+    ),
+    Self = self(),
+    receive
+        {quic_h3, Self, {stream_type_open, uni, StreamId, 16#54}} -> ok
+    after 100 -> ?assert(false)
+    end,
+    receive
+        {quic_h3, Self, {stream_type_data, uni, StreamId, <<>>, true}} -> ok
+    after 100 -> ?assert(false)
+    end.
+
 stream_type_handler_ignore_falls_back_to_discard_test() ->
     Ignore = fun(uni, _StreamId, _Type) -> ignore end,
     State0 = make_test_state(#{role => server, stream_type_handler => Ignore}),
