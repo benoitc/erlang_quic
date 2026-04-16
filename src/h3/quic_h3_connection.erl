@@ -225,7 +225,7 @@
     %% Placed at the end so prior tuple positions stay stable for tests.
     local_connect_enabled = false :: boolean(),
 
-    %% Extension hook. When set, `handle_uni_stream_type/3` consults
+    %% Extension hook. When set, `handle_uni_stream_type/4` consults
     %% this function for unknown stream types and, on `claim`, routes
     %% subsequent bytes to the owner as `{stream_type_*, ...}` events
     %% instead of discarding them.
@@ -1110,7 +1110,7 @@ handle_stream_data(StreamId, Data, Fin, State) ->
             forward_claimed_uni_data(StreamId, Data, Fin, State),
             {ok, State};
         {uni, pending} ->
-            handle_uni_stream_type(StreamId, Data, State);
+            handle_uni_stream_type(StreamId, Data, Fin, State);
         {uni, push_pending} ->
             %% Push stream waiting for push ID parsing
             handle_push_stream_id(StreamId, Data, State);
@@ -1133,7 +1133,7 @@ handle_stream_data(StreamId, Data, Fin, State) ->
             handle_request_stream_data(StreamId, Data, Fin, State);
         unknown ->
             %% New unidirectional stream
-            handle_uni_stream_type(StreamId, Data, State)
+            handle_uni_stream_type(StreamId, Data, Fin, State)
     end.
 
 classify_stream(StreamId, #state{peer_control_stream = StreamId}) ->
@@ -1218,7 +1218,7 @@ find_push_by_stream_id(StreamId, Received) ->
         Received
     ).
 
-handle_uni_stream_type(StreamId, Data, #state{uni_stream_buffers = Buffers} = State) ->
+handle_uni_stream_type(StreamId, Data, Fin, #state{uni_stream_buffers = Buffers} = State) ->
     Buffer = maps:get(StreamId, Buffers, <<>>),
     Combined = <<Buffer/binary, Data/binary>>,
     case quic_h3_frame:decode_stream_type(Combined) of
@@ -1226,7 +1226,7 @@ handle_uni_stream_type(StreamId, Data, #state{uni_stream_buffers = Buffers} = St
             State1 = State#state{uni_stream_buffers = maps:remove(StreamId, Buffers)},
             case assign_uni_stream(StreamId, Type, State1) of
                 {ok, State2} ->
-                    dispatch_remaining_uni_data(StreamId, Type, Rest, State2);
+                    dispatch_remaining_uni_data(StreamId, Type, Rest, Fin, State2);
                 {error, Reason} ->
                     {error, Reason, State1}
             end;
@@ -1237,12 +1237,14 @@ handle_uni_stream_type(StreamId, Data, #state{uni_stream_buffers = Buffers} = St
 %% After classifying a uni stream, either hand off to an extension
 %% handler (when one claims the type), discard the rest (unknown types
 %% with no handler, RFC 9114 §6.2.3), or re-enter stream dispatch so
-%% known types process their payload.
-dispatch_remaining_uni_data(StreamId, {unknown, Type}, Rest, State) ->
+%% known types process their payload. Fin propagates so a single
+%% STREAM frame carrying type-varint + payload + FIN surfaces as one
+%% {stream_type_data, uni, _, _, true} event.
+dispatch_remaining_uni_data(StreamId, {unknown, Type}, Rest, Fin, State) ->
     case consult_stream_type_handler(uni, StreamId, Type, State) of
         claim ->
             State1 = claim_uni_stream(StreamId, Type, State),
-            forward_claimed_uni_data(StreamId, Rest, false, State1),
+            forward_claimed_uni_data(StreamId, Rest, Fin, State1),
             {ok, State1};
         ignore ->
             {ok, State#state{
@@ -1251,10 +1253,11 @@ dispatch_remaining_uni_data(StreamId, {unknown, Type}, Rest, State) ->
                 )
             }}
     end;
-dispatch_remaining_uni_data(_StreamId, _Type, <<>>, State) ->
+dispatch_remaining_uni_data(_StreamId, _Type, <<>>, Fin, State) ->
+    _ = Fin,
     {ok, State};
-dispatch_remaining_uni_data(StreamId, _Type, Rest, State) ->
-    handle_stream_data(StreamId, Rest, false, State).
+dispatch_remaining_uni_data(StreamId, _Type, Rest, Fin, State) ->
+    handle_stream_data(StreamId, Rest, Fin, State).
 
 consult_stream_type_handler(_Direction, _StreamId, _Type, #state{
     stream_type_handler = undefined
