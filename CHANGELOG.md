@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-04-16
+
+### Fixed
+- h3: thread FIN through the peer uni stream-type dispatch so a
+  STREAM frame carrying type-varint + payload + FIN surfaces as one
+  `{stream_type_data, uni, _, _, true}` event to claimed-stream
+  owners (#64)
+
 ## [1.0.1] - 2026-04-15
 
 ### Fixed
