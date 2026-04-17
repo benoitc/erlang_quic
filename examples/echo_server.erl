@@ -57,11 +57,16 @@ stop() ->
     io:format("Echo server stopped~n"),
     ok.
 
-%% @doc Handle new connections.
-handle_connection(ConnPid, Info) ->
-    PeerAddr = maps:get(peer_address, Info, unknown),
+%% @doc Handle new connections. Second arg is the DCID binary.
+handle_connection(ConnPid, _DCID) ->
+    PeerAddr =
+        case quic:peername(ConnPid) of
+            {ok, Addr} -> Addr;
+            _ -> unknown
+        end,
     io:format("New connection from ~p~n", [PeerAddr]),
-    spawn(fun() -> echo_loop(ConnPid) end).
+    HandlerPid = spawn(fun() -> echo_loop(ConnPid) end),
+    {ok, HandlerPid}.
 
 %%====================================================================
 %% Internal Functions
@@ -69,26 +74,25 @@ handle_connection(ConnPid, Info) ->
 
 echo_loop(ConnPid) ->
     receive
+        {quic, _, {connected, Info}} ->
+            io:format("Handshake complete: ~p~n", [maps:get(alpn_protocol, Info, undefined)]),
+            echo_loop(ConnPid);
         {quic, _, {stream_data, StreamId, Data, Fin}} ->
             %% Echo the data back
             io:format("Echoing ~p bytes on stream ~p~n", [byte_size(Data), StreamId]),
             quic:send_data(ConnPid, StreamId, Data, Fin),
             echo_loop(ConnPid);
-
         {quic, _, {datagram, Data}} ->
             %% Echo datagrams too
             io:format("Echoing datagram: ~p bytes~n", [byte_size(Data)]),
             quic:send_datagram(ConnPid, Data),
             echo_loop(ConnPid);
-
         {quic, _, {stream_opened, StreamId}} ->
             io:format("Stream ~p opened by peer~n", [StreamId]),
             echo_loop(ConnPid);
-
         {quic, _, {closed, Reason}} ->
             io:format("Connection closed: ~p~n", [Reason]),
             ok;
-
         Other ->
             io:format("Unhandled message: ~p~n", [Other]),
             echo_loop(ConnPid)
@@ -99,8 +103,7 @@ load_certs() ->
     Locations = [
         {"certs/cert.pem", "certs/priv.key"},
         {"../certs/cert.pem", "../certs/priv.key"},
-        {code:priv_dir(quic) ++ "/../certs/cert.pem",
-         code:priv_dir(quic) ++ "/../certs/priv.key"}
+        {code:priv_dir(quic) ++ "/../certs/cert.pem", code:priv_dir(quic) ++ "/../certs/priv.key"}
     ],
     load_certs_from_locations(Locations).
 
