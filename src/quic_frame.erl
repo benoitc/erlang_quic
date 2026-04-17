@@ -18,6 +18,7 @@
 
 -export([
     encode/1,
+    encode_iodata/1,
     decode/1,
     decode_all/1
 ]).
@@ -109,24 +110,8 @@ encode({new_token, Token}) ->
     <<?FRAME_NEW_TOKEN, (quic_varint:encode(byte_size(Token)))/binary, Token/binary>>;
 %% STREAM (0x08-0x0f)
 encode({stream, StreamId, Offset, Data, Fin}) ->
-    Type =
-        ?FRAME_STREAM bor
-            (case Offset of
-                0 -> 0;
-                _ -> ?STREAM_FLAG_OFF
-            end) bor
-            ?STREAM_FLAG_LEN bor
-            (case Fin of
-                true -> ?STREAM_FLAG_FIN;
-                false -> 0
-            end),
-    OffsetBin =
-        case Offset of
-            0 -> <<>>;
-            _ -> quic_varint:encode(Offset)
-        end,
-    <<Type, (quic_varint:encode(StreamId))/binary, OffsetBin/binary,
-        (quic_varint:encode(byte_size(Data)))/binary, Data/binary>>;
+    Header = stream_frame_header(StreamId, Offset, byte_size(Data), Fin),
+    <<Header/binary, Data/binary>>;
 %% MAX_DATA (0x10)
 encode({max_data, MaxData}) ->
     <<?FRAME_MAX_DATA, (quic_varint:encode(MaxData))/binary>>;
@@ -184,6 +169,42 @@ encode({datagram, Data}) ->
 %% DATAGRAM_WITH_LENGTH (0x31 - includes length)
 encode({datagram_with_length, Data}) ->
     <<?FRAME_DATAGRAM_WITH_LEN, (quic_varint:encode(byte_size(Data)))/binary, Data/binary>>.
+
+%% @doc Encode a frame as iodata. For STREAM frames with a binary Data
+%% this returns `[Header, Data]' without copying the payload into the
+%% frame binary, avoiding one full copy per chunk on the bulk-send hot
+%% path. For all other frame types (and STREAM with iolist Data) this
+%% falls back to `encode/1' wrapped in a list — `iolist_to_binary/1'
+%% over the result equals `encode/1' for any frame.
+-spec encode_iodata(frame()) -> iodata().
+encode_iodata({stream, StreamId, Offset, Data, Fin}) when is_binary(Data) ->
+    Header = stream_frame_header(StreamId, Offset, byte_size(Data), Fin),
+    [Header, Data];
+encode_iodata(Frame) ->
+    [encode(Frame)].
+
+%% Build the STREAM frame header (everything before Data). Shared by
+%% encode/1 (flat-binary output) and encode_iodata/1 (zero-copy output)
+%% so the wire format stays identical.
+stream_frame_header(StreamId, Offset, Length, Fin) ->
+    Type =
+        ?FRAME_STREAM bor
+            (case Offset of
+                0 -> 0;
+                _ -> ?STREAM_FLAG_OFF
+            end) bor
+            ?STREAM_FLAG_LEN bor
+            (case Fin of
+                true -> ?STREAM_FLAG_FIN;
+                false -> 0
+            end),
+    OffsetBin =
+        case Offset of
+            0 -> <<>>;
+            _ -> quic_varint:encode(Offset)
+        end,
+    <<Type, (quic_varint:encode(StreamId))/binary, OffsetBin/binary,
+        (quic_varint:encode(Length))/binary>>.
 
 %% @doc Decode a single frame from binary.
 %% Returns {Frame, Rest} or {error, Reason}.

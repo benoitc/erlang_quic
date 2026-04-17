@@ -19,6 +19,8 @@
     run/1,
     run_sink/0,
     run_sink/1,
+    run_download_sink/0,
+    run_download_sink/1,
     compare_buffer_sizes/0,
     compare_buffer_sizes/1,
     compare_cc/0,
@@ -53,6 +55,190 @@ run_sink() ->
 -spec run_sink(map()) -> map().
 run_sink(Opts) ->
     run(Opts#{mode => sink}).
+
+%% @doc Run a server-to-client download benchmark and report MB/s plus
+%% the server connection's batch_flushes and packets_coalesced counters
+%% so the batching behaviour is visible on the same line as throughput.
+-spec run_download_sink() -> map().
+run_download_sink() ->
+    run_download_sink(#{}).
+
+-spec run_download_sink(map()) -> map().
+run_download_sink(Opts) ->
+    application:ensure_all_started(quic),
+    Size = maps:get(data_size, Opts, ?DEFAULT_DATA_SIZE),
+    ServerExtra = maps:with([socket_backend, server_send_batching], Opts),
+    {ok, Srv} = start_download_server(ServerExtra),
+    try
+        Start = erlang:monotonic_time(microsecond),
+        {Received, ServerStats} = do_download(Srv, Size),
+        End = erlang:monotonic_time(microsecond),
+
+        Duration = max(1, End - Start),
+        MBps = (byte_size(Received) / 1048576) / (Duration / 1000000),
+        Flushes = maps:get(batch_flushes, ServerStats),
+        Coalesced = maps:get(packets_coalesced, ServerStats),
+        Ratio =
+            case Flushes of
+                0 -> 0.0;
+                _ -> Coalesced / Flushes
+            end,
+
+        io:format(
+            "Download ~.2f MB: ~.2f MB/s (~p ms) flushes=~p coalesced=~p ratio=~.2f~n",
+            [
+                byte_size(Received) / 1048576,
+                MBps,
+                Duration div 1000,
+                Flushes,
+                Coalesced,
+                float(Ratio)
+            ]
+        ),
+
+        #{
+            status => ok,
+            data_size => byte_size(Received),
+            duration_ms => Duration div 1000,
+            mb_per_sec => MBps,
+            batch_flushes => Flushes,
+            packets_coalesced => Coalesced,
+            coalesce_ratio => Ratio
+        }
+    after
+        catch quic_test_echo_server:stop(Srv)
+    end.
+
+start_download_server(Extra) ->
+    DownloadHandler = fun(ConnPid, _ConnRef) ->
+        Handler = spawn_link(fun() -> download_loop(ConnPid, #{}) end),
+        ok = quic:set_owner_sync(ConnPid, Handler),
+        {ok, Handler}
+    end,
+    %% Raise server-side flow-control windows so multi-MB downloads do
+    %% not stall waiting for the client to advance MAX_STREAM_DATA.
+    Override = maps:merge(
+        #{
+            connection_handler => DownloadHandler,
+            max_data => 64 * 1024 * 1024,
+            max_stream_data_bidi_local => 32 * 1024 * 1024,
+            max_stream_data_bidi_remote => 32 * 1024 * 1024,
+            max_stream_data_uni => 32 * 1024 * 1024
+        },
+        Extra
+    ),
+    quic_test_echo_server:start(Override).
+
+download_loop(Conn, Pending) ->
+    receive
+        {quic, Conn, {connected, _}} ->
+            download_loop(Conn, Pending);
+        {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
+            Prev = maps:get(StreamId, Pending, <<>>),
+            Buffer = <<Prev/binary, Data/binary>>,
+            case Buffer of
+                <<Size:64/big-unsigned-integer, _/binary>> when Fin ->
+                    %% Strict match so a send failure crashes the
+                    %% handler fast instead of bleeding into the
+                    %% client's collect_download timeout. The prior
+                    %% `_ =' silently dropped errors and made diagnosis
+                    %% harder.
+                    ok = quic:send_data(Conn, StreamId, binary:copy(<<16#42>>, Size), true),
+                    download_loop(Conn, maps:remove(StreamId, Pending));
+                _ when Fin ->
+                    download_loop(Conn, maps:remove(StreamId, Pending));
+                _ ->
+                    download_loop(Conn, Pending#{StreamId => Buffer})
+            end;
+        {quic, Conn, {closed, _}} ->
+            ok;
+        {quic, Conn, _} ->
+            download_loop(Conn, Pending);
+        _ ->
+            download_loop(Conn, Pending)
+    end.
+
+do_download(#{name := Name, port := Port}, Size) ->
+    %% Override echo_server's 4 MB stream window so multi-MB downloads
+    %% do not stall on MAX_STREAM_DATA. Keep verify=false from the base.
+    ClientOpts = maps:merge(quic_test_echo_server:client_opts(), #{
+        max_data => 64 * 1024 * 1024,
+        max_stream_data_bidi_local => 32 * 1024 * 1024,
+        max_stream_data_bidi_remote => 32 * 1024 * 1024,
+        max_stream_data_uni => 32 * 1024 * 1024
+    }),
+    {ok, Conn} = quic:connect("127.0.0.1", Port, ClientOpts, self()),
+    try
+        receive
+            {quic, Conn, {connected, _}} -> ok
+        after 10000 ->
+            throw({error, connect_timeout})
+        end,
+
+        %% Snapshot baseline server-connection stats BEFORE the download
+        %% request so the returned counters describe the download only,
+        %% not lifetime traffic (which folds in handshake packets).
+        %% The server gen_statem can still be in idle for a few ms after
+        %% the client sees {connected, _} (two-way handshake timing);
+        %% poll_stats/1 retries briefly to cover that race.
+        %% quic_server_batching_SUITE has identical helpers.
+        ServerPid = server_connection_pid(Name),
+        {ok, Before} = poll_stats(ServerPid),
+
+        {ok, StreamId} = quic:open_stream(Conn),
+        ok = quic:send_data(Conn, StreamId, <<Size:64/big-unsigned-integer>>, true),
+        Received = collect_download(Conn, StreamId, <<>>, 30000),
+
+        {ok, After} = poll_stats(ServerPid),
+        {Received, stats_delta(After, Before)}
+    after
+        quic:close(Conn)
+    end.
+
+server_connection_pid(Name) ->
+    {ok, ConnPids} = quic:get_server_connections(Name),
+    [Pid | _] = lists:usort(ConnPids),
+    Pid.
+
+%% Retry get_stats while the server connection is still transitioning
+%% out of idle. Bounded to ~1s total.
+poll_stats(Pid) ->
+    poll_stats(Pid, 200).
+
+poll_stats(_Pid, 0) ->
+    {error, stats_timeout};
+poll_stats(Pid, N) ->
+    case quic:get_stats(Pid) of
+        {ok, _} = R ->
+            R;
+        {error, {invalid_state, _}} ->
+            timer:sleep(5),
+            poll_stats(Pid, N - 1);
+        {error, _} = Err ->
+            Err
+    end.
+
+stats_delta(After, Before) ->
+    maps:from_list(
+        [
+            {K, maps:get(K, After, 0) - maps:get(K, Before, 0)}
+         || K <- [packets_sent, batch_flushes, packets_coalesced]
+        ]
+    ).
+
+collect_download(Conn, StreamId, Acc, Timeout) ->
+    receive
+        {quic, Conn, {stream_data, StreamId, Data, true}} ->
+            <<Acc/binary, Data/binary>>;
+        {quic, Conn, {stream_data, StreamId, Data, false}} ->
+            collect_download(Conn, StreamId, <<Acc/binary, Data/binary>>, Timeout);
+        {quic, Conn, {stream_closed, StreamId, _Code}} ->
+            Acc;
+        {quic, Conn, {closed, _}} ->
+            Acc
+    after Timeout ->
+        error({download_timeout, byte_size(Acc)})
+    end.
 
 %% @doc Run throughput benchmark with custom options
 %% Options:

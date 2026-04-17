@@ -303,7 +303,7 @@ apply_header_mask(Header, Mask, PNOffset) ->
     non_neg_integer(),
     byte(),
     binary(),
-    binary()
+    iodata()
 ) -> binary().
 protect_short_packet(Cipher, Key, IV, HP, PN, FirstByte, DCID, Plaintext) ->
     PNLen = pn_length(PN),
@@ -330,7 +330,7 @@ protect_short_packet(Cipher, Key, IV, HP, PN, FirstByte, DCID, Plaintext) ->
     binary(),
     non_neg_integer(),
     binary(),
-    binary()
+    iodata()
 ) -> binary().
 protect_long_packet(Cipher, Key, IV, HP, PN, HeaderPrefix, Plaintext) ->
     PNLen = pn_length(PN),

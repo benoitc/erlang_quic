@@ -272,3 +272,91 @@ iolist_send_test() ->
     {ok, State2} = quic_socket:flush(State1),
 
     ok = quic_socket:close(State2).
+
+%%====================================================================
+%% info/1 and observability tests
+%%====================================================================
+
+info_reports_config_and_counters_test() ->
+    {ok, State} = quic_socket:open(0, #{batching => #{enabled => true, max_packets => 16}}),
+    Info = quic_socket:info(State),
+
+    ?assert(is_map(Info)),
+    %% Config keys
+    ?assert(maps:is_key(backend, Info)),
+    ?assert(maps:is_key(gso_supported, Info)),
+    ?assert(maps:is_key(gso_size, Info)),
+    ?assert(maps:is_key(batching_enabled, Info)),
+    ?assert(maps:is_key(max_batch_packets, Info)),
+    %% Counters start at zero
+    ?assertEqual(0, maps:get(batch_flushes, Info)),
+    ?assertEqual(0, maps:get(packets_coalesced, Info)),
+    ?assertEqual(true, maps:get(batching_enabled, Info)),
+    ?assertEqual(16, maps:get(max_batch_packets, Info)),
+
+    ok = quic_socket:close(State).
+
+info_batching_disabled_test() ->
+    {ok, State} = quic_socket:open(0, #{batching => #{enabled => false}}),
+    Info = quic_socket:info(State),
+    ?assertEqual(false, maps:get(batching_enabled, Info)),
+    ok = quic_socket:close(State).
+
+info_wrap_reports_gen_udp_no_gso_test() ->
+    %% wrap/2 wraps an existing gen_udp socket - never enables GSO.
+    {ok, RawSocket} = gen_udp:open(0, [binary, {active, false}]),
+    {ok, State} = quic_socket:wrap(RawSocket, #{}),
+    Info = quic_socket:info(State),
+    ?assertEqual(gen_udp, maps:get(backend, Info)),
+    ?assertEqual(false, maps:get(gso_supported, Info)),
+    ok = quic_socket:close(State),
+    ok = gen_udp:close(RawSocket).
+
+batch_counters_advance_on_flush_test() ->
+    %% Send three packets via the batch, flush once, assert one flush
+    %% and three coalesced packets counted.
+    {ok, State} = quic_socket:open(0, #{batching => #{enabled => true, max_packets => 64}}),
+    {ok, {_LocalIP, LocalPort}} = quic_socket:sockname(State),
+
+    Dest = {127, 0, 0, 1},
+    {ok, S1} = quic_socket:send(State, Dest, LocalPort, <<"one">>),
+    {ok, S2} = quic_socket:send(S1, Dest, LocalPort, <<"two">>),
+    {ok, S3} = quic_socket:send(S2, Dest, LocalPort, <<"three">>),
+    {ok, S4} = quic_socket:flush(S3),
+
+    Info = quic_socket:info(S4),
+    ?assertEqual(1, maps:get(batch_flushes, Info)),
+    ?assertEqual(3, maps:get(packets_coalesced, Info)),
+
+    ok = quic_socket:close(S4).
+
+batch_counters_zero_with_batching_disabled_test() ->
+    %% With batching disabled, packets go out via do_send_immediate and
+    %% must NOT count as coalesced.
+    {ok, State} = quic_socket:open(0, #{batching => #{enabled => false}}),
+    {ok, {_LocalIP, LocalPort}} = quic_socket:sockname(State),
+
+    Dest = {127, 0, 0, 1},
+    {ok, S1} = quic_socket:send(State, Dest, LocalPort, <<"a">>),
+    {ok, S2} = quic_socket:send(S1, Dest, LocalPort, <<"b">>),
+
+    Info = quic_socket:info(S2),
+    ?assertEqual(0, maps:get(batch_flushes, Info)),
+    ?assertEqual(0, maps:get(packets_coalesced, Info)),
+
+    ok = quic_socket:close(S2).
+
+send_immediate_bypasses_batch_test() ->
+    %% send_immediate/4 must send directly regardless of batching state
+    %% and must NOT bump packets_coalesced.
+    {ok, State} = quic_socket:open(0, #{batching => #{enabled => true}}),
+    {ok, {_LocalIP, LocalPort}} = quic_socket:sockname(State),
+
+    Dest = {127, 0, 0, 1},
+    {ok, S1} = quic_socket:send_immediate(State, Dest, LocalPort, <<"direct">>),
+
+    Info = quic_socket:info(S1),
+    ?assertEqual(0, maps:get(batch_flushes, Info)),
+    ?assertEqual(0, maps:get(packets_coalesced, Info)),
+
+    ok = quic_socket:close(S1).

@@ -42,8 +42,10 @@
     open_for_send/2,
     open_server_send/2,
     wrap/2,
+    new_sender/2,
     close/1,
     send/4,
+    send_immediate/4,
     flush/1,
     recv/2,
     sockname/1,
@@ -52,7 +54,8 @@
     detect_capabilities/0,
     get_fd/1,
     get_socket/1,
-    gso_supported/1
+    gso_supported/1,
+    info/1
 ]).
 
 -include("quic.hrl").
@@ -87,7 +90,13 @@
     %% Current batch destination address
     batch_addr :: {inet:ip_address(), inet:port_number()} | undefined,
     %% Maximum packets per batch
-    max_batch_packets = ?DEFAULT_MAX_BATCH_PACKETS :: pos_integer()
+    max_batch_packets = ?DEFAULT_MAX_BATCH_PACKETS :: pos_integer(),
+    %% Observability counters: bumped on successful flush only. Skip
+    %% immediate (unbatched) sends so packets_coalesced strictly measures
+    %% the batching win. batch_flushes counts each flush that actually
+    %% transmitted something.
+    batch_flushes = 0 :: non_neg_integer(),
+    packets_coalesced = 0 :: non_neg_integer()
 }).
 
 %% Packet can be:
@@ -270,6 +279,41 @@ get_socket(#socket_state{socket = Socket}) ->
 gso_supported(#socket_state{gso_supported = Supported}) ->
     Supported.
 
+%% @doc Return a map describing the socket_state's configuration and
+%% observability counters. Intended for debugging, benchmarking, and
+%% test assertions.
+-spec info(socket_state()) ->
+    #{
+        backend := gen_udp | socket,
+        gso_supported := boolean(),
+        gso_size := non_neg_integer(),
+        gro_enabled := boolean(),
+        batching_enabled := boolean(),
+        max_batch_packets := pos_integer(),
+        batch_flushes := non_neg_integer(),
+        packets_coalesced := non_neg_integer()
+    }.
+info(#socket_state{
+    backend = Backend,
+    gso_supported = GSO,
+    gso_size = GSOSize,
+    gro_enabled = GRO,
+    batching_enabled = Batching,
+    max_batch_packets = MaxBatch,
+    batch_flushes = Flushes,
+    packets_coalesced = Coalesced
+}) ->
+    #{
+        backend => Backend,
+        gso_supported => GSO,
+        gso_size => GSOSize,
+        gro_enabled => GRO,
+        batching_enabled => Batching,
+        max_batch_packets => MaxBatch,
+        batch_flushes => Flushes,
+        packets_coalesced => Coalesced
+    }.
+
 %% @doc Wrap an existing gen_udp socket with batching support.
 %% This allows adding batching to connections that already have a socket.
 %% Note: GSO/GRO are not available when wrapping existing gen_udp sockets.
@@ -293,6 +337,34 @@ wrap(Socket, Opts) ->
     },
     {ok, State}.
 
+%% @doc Create a fresh per-connection sender that reuses an existing
+%% socket (e.g. the listener's shared UDP socket on the server side).
+%% Each caller gets its own batch buffer so multiple connections can
+%% accumulate packets independently before flush. GSO is inherited from
+%% the underlying backend when requested.
+%% The socket is NOT owned by the returned state - close/1 will not close it.
+-spec new_sender(gen_udp:socket() | socket:socket(), map()) ->
+    {ok, socket_state()}.
+new_sender(Socket, Opts) ->
+    Backend = maps:get(backend, Opts, gen_udp),
+    GSOSupported = maps:get(gso_supported, Opts, false),
+    BatchOpts = maps:get(batching, Opts, #{}),
+    BatchingEnabled = maps:get(enabled, BatchOpts, true),
+    MaxBatch = maps:get(max_packets, BatchOpts, ?DEFAULT_MAX_BATCH_PACKETS),
+    GSOSize = maps:get(gso_size, BatchOpts, ?DEFAULT_GSO_SEGMENT_SIZE),
+
+    State = #socket_state{
+        socket = Socket,
+        backend = Backend,
+        owns_socket = false,
+        gso_supported = GSOSupported andalso (Backend =:= socket),
+        gso_size = GSOSize,
+        gro_enabled = false,
+        batching_enabled = BatchingEnabled,
+        max_batch_packets = MaxBatch
+    },
+    {ok, State}.
+
 %% @doc Close the socket and flush any pending packets.
 %% Only closes the socket if owns_socket is true (i.e., socket was created by us).
 -spec close(socket_state()) -> ok.
@@ -305,6 +377,15 @@ close(#socket_state{socket = Socket, backend = socket}) ->
 close(#socket_state{socket = Socket, backend = gen_udp}) ->
     _ = gen_udp:close(Socket),
     ok.
+
+%% @doc Send a packet immediately, bypassing the batch buffer.
+%% Intended for one-shot control-plane sends (version negotiation,
+%% retry, stateless reset) where batching adds no value and persisting
+%% the returned state is awkward.
+-spec send_immediate(socket_state(), inet:ip_address(), inet:port_number(), packet_view()) ->
+    {ok, socket_state()} | {error, term()}.
+send_immediate(State, IP, Port, Packet) ->
+    do_send_immediate(State, IP, Port, Packet).
 
 %% @doc Send a packet, buffering for batch send if enabled.
 %% Packet can be:
@@ -488,9 +569,9 @@ build_socket_state(Socket, BatchConfig) ->
     {ok, State}.
 
 maybe_enable_gso(Socket, #{gso_supported := true, gso_size := Size}) ->
-    %% Try to set GSO segment size
-    %% UDP_SEGMENT = 103
-    case socket:setopt_native(Socket, {udp, ?UDP_SEGMENT}, <<Size:16/native>>) of
+    %% UDP_SEGMENT setsockopt expects sizeof(int); the cmsg variant
+    %% (see flush path) is the one that takes u16.
+    case socket:setopt_native(Socket, {udp, ?UDP_SEGMENT}, <<Size:32/native>>) of
         ok -> true;
         {error, _} -> false
     end;
@@ -652,7 +733,7 @@ flush_gso(
 
     case socket:sendmsg(Socket, Msg) of
         ok ->
-            {ok, clear_batch(State)};
+            {ok, record_flush(State)};
         {ok, RestData} ->
             %% Partial send - GSO didn't send all data
             ?LOG_WARNING(#{
@@ -660,7 +741,9 @@ flush_gso(
                 sent => byte_size(CombinedData) - iolist_size(RestData),
                 remaining => iolist_size(RestData)
             }),
-            %% Disable GSO and retry remaining data individually
+            %% Disable GSO and retry remaining data individually. The
+            %% retry path accounts for the coalesced packets itself, so
+            %% clear batch state here without bumping counters.
             State1 = clear_batch(State#socket_state{gso_supported = false}),
             send_remaining_individually(State1, IP, Port, RestData);
         {error, _} = Error ->
@@ -684,7 +767,7 @@ flush_individual_socket(
     Dest = #{family => family(IP), addr => IP, port => Port},
     case send_packets_socket(Socket, Dest, Packets, 0) of
         {ok, _Sent} ->
-            {ok, clear_batch(State)};
+            {ok, record_flush(State)};
         {error, Reason, _Sent} ->
             {error, Reason}
     end.
@@ -700,7 +783,7 @@ flush_individual_genudp(
     Packets = lists:reverse(Buffer),
     case send_packets_genudp(Socket, IP, Port, Packets, 0) of
         {ok, _Sent} ->
-            {ok, clear_batch(State)};
+            {ok, record_flush(State)};
         {error, Reason, _Sent} ->
             {error, Reason}
     end.
@@ -828,12 +911,33 @@ normalize_packet({iov, Parts}) ->
 normalize_packet(IoData) when is_list(IoData) ->
     iolist_to_binary(IoData).
 
-%% Clear batch state
+%% Clear batch state without bumping observability counters. Used by
+%% error / partial-send paths where we do not want to count as a
+%% successful flush.
 clear_batch(State) ->
     State#socket_state{
         batch_buffer = [],
         batch_count = 0,
         batch_addr = undefined
+    }.
+
+%% Record a successful flush and clear the batch state. Increments
+%% batch_flushes by one and packets_coalesced by the number of packets
+%% that were coalesced before the send. Use this only when the send
+%% actually transmitted the full batch.
+record_flush(
+    #socket_state{
+        batch_count = Count,
+        batch_flushes = Flushes,
+        packets_coalesced = Coalesced
+    } = State
+) ->
+    State#socket_state{
+        batch_buffer = [],
+        batch_count = 0,
+        batch_addr = undefined,
+        batch_flushes = Flushes + 1,
+        packets_coalesced = Coalesced + Count
     }.
 
 %% Get address family
@@ -927,8 +1031,10 @@ test_linux_socket_capabilities() ->
     end.
 
 test_gso(Socket) ->
-    %% Try to set UDP_SEGMENT option
-    case socket:setopt_native(Socket, {udp, ?UDP_SEGMENT}, <<1200:16/native>>) of
+    %% UDP_SEGMENT setsockopt expects sizeof(int) on Linux; passing 2
+    %% bytes makes the kernel reject with EINVAL and GSO is reported as
+    %% unsupported even on kernels that have it.
+    case socket:setopt_native(Socket, {udp, ?UDP_SEGMENT}, <<1200:32/native>>) of
         ok -> true;
         {error, _} -> false
     end.

@@ -600,3 +600,31 @@ fc_max_receive_window_default_test() ->
 
     quic_connection:close(Pid, normal),
     timer:sleep(100).
+
+%% Regression: the ACK-coalesce path must decrement send_queue_bytes
+%% and send_queue_count when it dequeues a small stream frame. Prior to
+%% the fix the byte counter leaked on every coalesce and eventually
+%% tripped ?MAX_SEND_QUEUE_BYTES, blocking further sends on long-lived
+%% connections.
+dequeue_small_stream_frame_decrements_bytes_test() ->
+    Result = quic_connection:test_coalesce_small_stream(120),
+    ?assertEqual(true, maps:get(dequeued, Result)),
+    ?assertEqual(0, maps:get(send_queue_bytes, Result)),
+    ?assertEqual(0, maps:get(send_queue_count, Result)),
+    ?assertEqual(2, maps:get(send_queue_version, Result)).
+
+%% Regression: an empty FIN-only stream send (iodata <<>>, Fin=true) can
+%% be enqueued under pacing or cwnd blocking. The O(1) emptiness check
+%% used by process_send_queue/1 and handle_pacing_timeout/1 must be based
+%% on send_queue_count rather than send_queue_bytes; otherwise a zero-byte
+%% FIN-only entry is stranded forever because send_queue_bytes stays at 0.
+%% The benchmark itself triggers this pattern with
+%% quic:send_data(Conn, StreamId, <<>>, true).
+zero_byte_fin_not_stranded_test() ->
+    Result = quic_connection:test_zero_byte_fin_in_queue(),
+    %% Queue has a real entry
+    ?assertEqual(false, maps:get(queue_empty, Result)),
+    %% Byte-based check would incorrectly call it empty
+    ?assertEqual(true, maps:get(empty_by_bytes, Result)),
+    %% Count-based check correctly reports non-empty
+    ?assertEqual(false, maps:get(empty_by_count, Result)).
