@@ -2933,11 +2933,16 @@ pad_initial_packet(Packet) ->
 %% With worst-case PNLen=1, we need at least 3 + 16 = 19 bytes of ciphertext.
 %% Since AEAD adds a 16-byte tag, plaintext needs to be >= 3 bytes.
 %% We pad to 4 bytes to be safe (using PADDING frames which are 0x00).
-pad_for_header_protection(Payload) when byte_size(Payload) >= 4 ->
-    Payload;
+%% Accepts iodata so the hot stream-send path can avoid flattening the
+%% per-chunk payload for frame encoding.
 pad_for_header_protection(Payload) ->
-    PadLen = 4 - byte_size(Payload),
-    <<Payload/binary, 0:PadLen/unit:8>>.
+    case iolist_size(Payload) of
+        N when N >= 4 ->
+            Payload;
+        N ->
+            PadLen = 4 - N,
+            [Payload, <<0:PadLen/unit:8>>]
+    end.
 
 %% @doc Pad payload for path validation to reach 1200 bytes.
 %% RFC 9000 Section 8.2.1: Path validation packets MUST be padded to at least
@@ -6245,10 +6250,13 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) wh
                 false ->
                     %% Pacing allows - send immediately and consume tokens.
                     %% Data is already binary (invariant from fragmented_tracked/5).
+                    %% encode_iodata/1 returns [Header, Data] so the payload
+                    %% flows as iodata through AEAD without copying Data
+                    %% into a fresh frame binary.
                     {_Allowed, NewCCState} = quic_cc:get_pacing_tokens(CCState, PacketSize),
                     State1 = State#state{cc_state = NewCCState},
                     Frame = {stream, StreamId, Offset, Data, Fin},
-                    Payload = quic_frame:encode(Frame),
+                    Payload = quic_frame:encode_iodata(Frame),
                     NewState = send_app_packet_internal(Payload, [Frame], State1),
                     {NewState, BytesSentSoFar + DataSize}
             end;
@@ -6310,12 +6318,15 @@ send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunk
                             {error, send_queue_full}
                     end;
                 false ->
-                    %% Pacing allows - consume tokens and send
+                    %% Pacing allows - consume tokens and send.
+                    %% encode_iodata/1 returns [Header, Chunk] where Chunk
+                    %% is a sub-binary slice of Data; no per-chunk copy
+                    %% into a fresh frame binary.
                     {_Allowed, NewCCState} = quic_cc:get_pacing_tokens(CCState, PacketSize),
                     State0 = State#state{cc_state = NewCCState},
                     <<Chunk:MaxChunkSize/binary, Rest/binary>> = Data,
                     Frame = {stream, StreamId, Offset, Chunk, false},
-                    Payload = quic_frame:encode(Frame),
+                    Payload = quic_frame:encode_iodata(Frame),
                     State1 = send_app_packet_internal(Payload, [Frame], State0),
                     NewOffset = Offset + MaxChunkSize,
                     NewBytesSent = BytesSentSoFar + MaxChunkSize,

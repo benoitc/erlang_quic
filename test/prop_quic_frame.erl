@@ -279,6 +279,15 @@ prop_decode_preserves_rest() ->
         end
     ).
 
+%% encode_iodata/1 returns iodata that, when flattened, equals encode/1.
+%% Proves the zero-copy-header stream encoder has identical bytes.
+prop_encode_iodata_equivalent_to_encode() ->
+    ?FORALL(
+        Frame,
+        any_frame(),
+        iolist_to_binary(quic_frame:encode_iodata(Frame)) =:= quic_frame:encode(Frame)
+    ).
+
 %% Multiple frames can be decoded sequentially
 prop_decode_multiple() ->
     ?FORALL(
@@ -336,6 +345,11 @@ proper_test_() ->
             proper:quickcheck(prop_crypto_frame_roundtrip(), [{numtests, 200}, {to_file, user}])
         ),
         ?_assert(proper:quickcheck(prop_ack_frame_roundtrip(), [{numtests, 200}, {to_file, user}])),
+        ?_assert(
+            proper:quickcheck(
+                prop_encode_iodata_equivalent_to_encode(), [{numtests, 300}, {to_file, user}]
+            )
+        ),
         ?_assert(
             proper:quickcheck(prop_encode_deterministic(), [{numtests, 300}, {to_file, user}])
         ),
