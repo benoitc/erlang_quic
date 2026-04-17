@@ -869,11 +869,35 @@ init({server, Opts}) ->
 
     %% Server connections use the listener's shared socket for sending.
     %% This matches standard QUIC implementations (quic-go, quiche) where
-    %% all connections share a single UDP socket, demultiplexed by Connection ID.
-    %% We previously tried a separate send socket with reuseport for GSO batching,
-    %% but on Linux this caused kernel packet distribution to starve the listener.
-    %% For GSO optimization, the listener socket itself should be configured for it.
-    SocketState = undefined,
+    %% all connections share a single UDP socket, demultiplexed by
+    %% Connection ID. We previously tried a separate send socket with
+    %% reuseport for GSO batching, but on Linux this caused kernel packet
+    %% distribution to starve the listener.
+    %%
+    %% Instead, each server connection now gets its own per-connection
+    %% batch buffer via quic_socket:new_sender/2, which reuses (without
+    %% owning) the listener's socket. This keeps the single-socket model
+    %% intact while letting each connection's ACKs/data be coalesced and,
+    %% on Linux with socket backend, use GSO via sendmsg. Gated on
+    %% server_send_batching (default true) so operators can fall back to
+    %% the direct gen_udp:send/4 path if needed.
+    SocketState =
+        case maps:get(server_send_batching, Opts, true) of
+            true ->
+                ListenerBackend = maps:get(listener_socket_backend, Opts, gen_udp),
+                ListenerGSO = maps:get(listener_gso_supported, Opts, false),
+                SenderOpts = #{
+                    backend => ListenerBackend,
+                    gso_supported => ListenerGSO,
+                    batching => maps:get(batching, Opts, #{})
+                },
+                case quic_socket:new_sender(Socket, SenderOpts) of
+                    {ok, S} -> S;
+                    {error, _} -> undefined
+                end;
+            false ->
+                undefined
+        end,
 
     %% Initialize state
     State = #state{
@@ -7260,6 +7284,7 @@ state_to_map(#state{} = S) ->
         data_received => S#state.data_received,
         send_queue_bytes => S#state.send_queue_bytes,
         send_queue_count => S#state.send_queue_count,
+        send_batching => (S#state.socket_state =/= undefined),
         recv_buffer_bytes => S#state.recv_buffer_bytes,
         max_data_local => S#state.max_data_local,
         fc_last_stream_update => S#state.fc_last_stream_update,

@@ -707,6 +707,8 @@ create_connection_unconditional(
     RemoteAddr,
     #listener_state{
         socket = Socket,
+        socket_state = SocketState,
+        socket_backend = Backend,
         cert = Cert,
         cert_chain = CertChain,
         private_key = PrivateKey,
@@ -730,9 +732,21 @@ create_connection_unconditional(
     %% NEW_CONNECTION_ID tokens match the ones the listener will emit
     %% for orphan packets after the connection goes away (RFC 9000
     %% §10.3.2).
+    %% Capabilities of the listener's underlying UDP socket. The server
+    %% connection uses these to build a per-connection sender socket_state
+    %% that reuses the shared socket but owns its own batch buffer (so
+    %% each connection's outgoing packets can be coalesced via GSO on
+    %% Linux + socket backend, or just in-memory batched otherwise).
+    ListenerGSO =
+        case SocketState of
+            undefined -> false;
+            _ -> quic_socket:gso_supported(SocketState)
+        end,
     ConnOpts = #{
         role => server,
         socket => Socket,
+        listener_socket_backend => Backend,
+        listener_gso_supported => ListenerGSO,
         remote_addr => RemoteAddr,
         initial_dcid => DCID,
         scid => ServerCID,

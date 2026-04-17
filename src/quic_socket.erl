@@ -42,6 +42,7 @@
     open_for_send/2,
     open_server_send/2,
     wrap/2,
+    new_sender/2,
     close/1,
     send/4,
     flush/1,
@@ -286,6 +287,34 @@ wrap(Socket, Opts) ->
         backend = gen_udp,
         owns_socket = false,
         gso_supported = false,
+        gso_size = GSOSize,
+        gro_enabled = false,
+        batching_enabled = BatchingEnabled,
+        max_batch_packets = MaxBatch
+    },
+    {ok, State}.
+
+%% @doc Create a fresh per-connection sender that reuses an existing
+%% socket (e.g. the listener's shared UDP socket on the server side).
+%% Each caller gets its own batch buffer so multiple connections can
+%% accumulate packets independently before flush. GSO is inherited from
+%% the underlying backend when requested.
+%% The socket is NOT owned by the returned state - close/1 will not close it.
+-spec new_sender(gen_udp:socket() | socket:socket(), map()) ->
+    {ok, socket_state()}.
+new_sender(Socket, Opts) ->
+    Backend = maps:get(backend, Opts, gen_udp),
+    GSOSupported = maps:get(gso_supported, Opts, false),
+    BatchOpts = maps:get(batching, Opts, #{}),
+    BatchingEnabled = maps:get(enabled, BatchOpts, true),
+    MaxBatch = maps:get(max_packets, BatchOpts, ?DEFAULT_MAX_BATCH_PACKETS),
+    GSOSize = maps:get(gso_size, BatchOpts, ?DEFAULT_GSO_SEGMENT_SIZE),
+
+    State = #socket_state{
+        socket = Socket,
+        backend = Backend,
+        owns_socket = false,
+        gso_supported = GSOSupported andalso (Backend =:= socket),
         gso_size = GSOSize,
         gro_enabled = false,
         batching_enabled = BatchingEnabled,

@@ -28,7 +28,9 @@
 %% Test cases
 -export([
     listener_start_stop/1,
-    listener_get_port/1
+    listener_get_port/1,
+    server_connection_batches_by_default/1,
+    server_connection_batching_opt_out/1
 ]).
 
 %%====================================================================
@@ -45,7 +47,9 @@ groups() ->
     [
         {listener_tests, [sequence], [
             listener_start_stop,
-            listener_get_port
+            listener_get_port,
+            server_connection_batches_by_default,
+            server_connection_batching_opt_out
         ]}
     ].
 
@@ -118,4 +122,52 @@ listener_get_port(Config) ->
     ct:log("Listener bound to port ~p", [Port]),
 
     ok = quic_listener:stop(Listener),
+    Config.
+
+%% Regression: server connections get a per-connection sender socket_state
+%% by default so ACKs and data are coalesced before flush (and use GSO on
+%% Linux when the listener runs the socket backend). Verify by connecting
+%% a client to an in-process echo server and inspecting the server-side
+%% connection state.
+server_connection_batches_by_default(Config) ->
+    {ok, Echo} = quic_test_echo_server:start(),
+    #{name := Name, port := Port} = Echo,
+    try
+        {ok, Conn} = quic:connect("127.0.0.1", Port, quic_test_echo_server:client_opts(), self()),
+        receive
+            {quic, Conn, {connected, _Info}} -> ok
+        after 5000 ->
+            ct:fail("client handshake timed out")
+        end,
+        {ok, ConnPids} = quic:get_server_connections(Name),
+        [ServerPid | _] = lists:usort(ConnPids),
+        {_State, Info} = quic_connection:get_state(ServerPid),
+        ?assertEqual(true, maps:get(send_batching, Info)),
+        quic:close(Conn)
+    after
+        quic_test_echo_server:stop(Echo)
+    end,
+    Config.
+
+%% Regression: operators can disable server-side batching via
+%% server_send_batching => false, restoring the direct gen_udp:send/4
+%% path. Verify socket_state is undefined in that case.
+server_connection_batching_opt_out(Config) ->
+    {ok, Echo} = quic_test_echo_server:start(#{server_send_batching => false}),
+    #{name := Name, port := Port} = Echo,
+    try
+        {ok, Conn} = quic:connect("127.0.0.1", Port, quic_test_echo_server:client_opts(), self()),
+        receive
+            {quic, Conn, {connected, _Info}} -> ok
+        after 5000 ->
+            ct:fail("client handshake timed out")
+        end,
+        {ok, ConnPids} = quic:get_server_connections(Name),
+        [ServerPid | _] = lists:usort(ConnPids),
+        {_State, Info} = quic_connection:get_state(ServerPid),
+        ?assertEqual(false, maps:get(send_batching, Info)),
+        quic:close(Conn)
+    after
+        quic_test_echo_server:stop(Echo)
+    end,
     Config.
