@@ -16,6 +16,7 @@
 -export([start_server/1, stop_server/0]).
 -export([run_client/2]).
 -export([analyze/1, list_qlogs/0, list_qlogs/1]).
+-export([handle_connection/2]).
 
 -define(QLOG_DIR, "/tmp/qlog").
 
@@ -33,6 +34,7 @@ start_server(Port) ->
                 cert => Cert,
                 key => Key,
                 alpn => [<<"echo">>],
+                connection_handler => fun ?MODULE:handle_connection/2,
                 %% Enable QLOG
                 qlog => #{
                     enabled => true,
@@ -98,11 +100,14 @@ list_qlogs() ->
 list_qlogs(Dir) ->
     Pattern = filename:join(Dir, "*.qlog"),
     Files = filelib:wildcard(Pattern),
-    lists:foreach(fun(F) ->
-        {ok, Info} = file:read_file_info(F),
-        Size = element(2, Info),
-        io:format("~s (~p bytes)~n", [F, Size])
-    end, Files),
+    lists:foreach(
+        fun(F) ->
+            {ok, Info} = file:read_file_info(F),
+            Size = element(2, Info),
+            io:format("~s (~p bytes)~n", [F, Size])
+        end,
+        Files
+    ),
     Files.
 
 %% @doc Analyze a QLOG file and print summary.
@@ -112,54 +117,69 @@ analyze(Filename) ->
     Lines = binary:split(Data, <<"\n">>, [global, trim]),
 
     %% Parse each line as JSON (simple parsing)
-    Events = lists:filtermap(fun(Line) ->
-        case Line of
-            <<>> -> false;
-            _ ->
-                case parse_json_line(Line) of
-                    {ok, Map} -> {true, Map};
-                    error -> false
-                end
-        end
-    end, Lines),
+    Events = lists:filtermap(
+        fun(Line) ->
+            case Line of
+                <<>> ->
+                    false;
+                _ ->
+                    case parse_json_line(Line) of
+                        {ok, Map} -> {true, Map};
+                        error -> false
+                    end
+            end
+        end,
+        Lines
+    ),
 
     %% Count events by type
-    Counts = lists:foldl(fun(Event, Acc) ->
-        Name = maps:get(<<"name">>, Event, <<"unknown">>),
-        maps:update_with(Name, fun(V) -> V + 1 end, 1, Acc)
-    end, #{}, Events),
+    Counts = lists:foldl(
+        fun(Event, Acc) ->
+            Name = maps:get(<<"name">>, Event, <<"unknown">>),
+            maps:update_with(Name, fun(V) -> V + 1 end, 1, Acc)
+        end,
+        #{},
+        Events
+    ),
 
     %% Find lost packets
     LostCount = maps:get(<<"quic:packet_lost">>, Counts, 0),
 
     %% Extract RTT samples
-    RTTs = lists:filtermap(fun(Event) ->
-        case maps:get(<<"name">>, Event, undefined) of
-            <<"quic:metrics_updated">> ->
-                Data1 = maps:get(<<"data">>, Event, #{}),
-                case maps:get(<<"smoothed_rtt">>, Data1, undefined) of
-                    undefined -> false;
-                    RTT when is_number(RTT) -> {true, RTT};
-                    _ -> false
-                end;
-            _ ->
-                false
-        end
-    end, Events),
+    RTTs = lists:filtermap(
+        fun(Event) ->
+            case maps:get(<<"name">>, Event, undefined) of
+                <<"quic:metrics_updated">> ->
+                    Data1 = maps:get(<<"data">>, Event, #{}),
+                    case maps:get(<<"smoothed_rtt">>, Data1, undefined) of
+                        undefined -> false;
+                        RTT when is_number(RTT) -> {true, RTT};
+                        _ -> false
+                    end;
+                _ ->
+                    false
+            end
+        end,
+        Events
+    ),
 
-    AvgRTT = case RTTs of
-        [] -> undefined;
-        _ -> lists:sum(RTTs) / length(RTTs)
-    end,
+    AvgRTT =
+        case RTTs of
+            [] -> undefined;
+            _ -> lists:sum(RTTs) / length(RTTs)
+        end,
 
     %% Print summary
     io:format("~nQLOG Analysis: ~s~n", [Filename]),
     io:format("=====================================~n"),
     io:format("Total events: ~p~n", [length(Events)]),
     io:format("~nEvent counts:~n"),
-    lists:foreach(fun({Name, Count}) ->
-        io:format("  ~s: ~p~n", [Name, Count])
-    end, lists:sort(maps:to_list(Counts))),
+    lists:foreach(
+        fun({Name, Count}) ->
+            io:format("  ~s: ~p~n", [Name, Count])
+        end,
+        lists:sort(maps:to_list(Counts))
+    ),
     io:format("~nPackets lost: ~p~n", [LostCount]),
     case AvgRTT of
         undefined -> ok;
@@ -173,9 +193,25 @@ analyze(Filename) ->
         average_rtt => AvgRTT
     }.
 
+%% @doc Server-side handler: echoes stream data back to the peer.
+handle_connection(ConnPid, _DCID) ->
+    HandlerPid = spawn(fun() -> echo_loop(ConnPid) end),
+    {ok, HandlerPid}.
+
 %%====================================================================
 %% Internal Functions
 %%====================================================================
+
+echo_loop(ConnPid) ->
+    receive
+        {quic, _, {stream_data, StreamId, Data, Fin}} ->
+            quic:send_data(ConnPid, StreamId, Data, Fin),
+            echo_loop(ConnPid);
+        {quic, _, {closed, _}} ->
+            ok;
+        _Other ->
+            echo_loop(ConnPid)
+    end.
 
 run_client_session(ConnRef) ->
     %% Wait for connection
@@ -201,8 +237,16 @@ run_client_session(ConnRef) ->
         io:format("Timeout waiting for response~n")
     end,
 
-    %% Close connection
+    %% Close connection and wait for the connection process to terminate
+    %% so the QLOG writer flushes before we return.
+    MRef = erlang:monitor(process, ConnRef),
     quic:close(ConnRef, normal),
+    receive
+        {'DOWN', MRef, process, ConnRef, _} -> ok
+    after 2000 ->
+        erlang:demonitor(MRef, [flush]),
+        ok
+    end,
     io:format("~nConnection closed. QLOG file written to: ~s~n", [?QLOG_DIR]),
     io:format("Run qlog_example:list_qlogs() to see files~n"),
     io:format("Run qlog_example:analyze(\"<filename>\") to analyze~n"),
