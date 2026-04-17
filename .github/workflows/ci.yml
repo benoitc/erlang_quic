@@ -111,6 +111,42 @@ jobs:
       - name: Run E2E tests
         run: rebar3 ct --suite=quic_e2e_SUITE
 
+  server-batching-gso:
+    name: Server Batching + Linux GSO
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24.0'
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: ${{ runner.os }}-batching-otp28-${{ hashFiles('rebar.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-batching-otp28-
+
+      - name: Generate certificates
+        run: |
+          chmod +x ./certs/generate_certs.sh
+          ./certs/generate_certs.sh
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: Run batching CT suite (with GSO)
+        env:
+          QUIC_ENABLE_GSO_TEST: "1"
+        run: rebar3 ct --suite=quic_server_batching_SUITE
+
   h3-e2e:
     name: HTTP/3 E2E Tests
     needs: unit-tests
