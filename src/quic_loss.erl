@@ -36,6 +36,7 @@
     %% Packet tracking
     on_packet_sent/4,
     on_packet_sent/5,
+    on_packet_sent/6,
     on_ack_received/3,
 
     %% Retransmission
@@ -141,9 +142,27 @@ new(Opts) ->
 on_packet_sent(State, PacketNumber, Size, AckEliciting) ->
     on_packet_sent(State, PacketNumber, Size, AckEliciting, []).
 
-%% @doc Record that a packet was sent with frames.
+%% @doc Record that a packet was sent with frames. Samples the send
+%% time itself. Callers that already hold a Now should use
+%% on_packet_sent/6 to avoid a duplicate monotonic_time/1 BIF call.
 -spec on_packet_sent(loss_state(), non_neg_integer(), non_neg_integer(), boolean(), [term()]) ->
     loss_state().
+on_packet_sent(State, PacketNumber, Size, AckEliciting, Frames) ->
+    Now = erlang:monotonic_time(millisecond),
+    on_packet_sent(State, PacketNumber, Size, AckEliciting, Frames, Now).
+
+%% @doc Like on_packet_sent/5 but uses the caller-supplied monotonic
+%% millisecond timestamp. The connection send loop reuses one Now
+%% per packet for both loss tracking and last_activity, saving a
+%% BIF call.
+-spec on_packet_sent(
+    loss_state(),
+    non_neg_integer(),
+    non_neg_integer(),
+    boolean(),
+    [term()],
+    integer()
+) -> loss_state().
 on_packet_sent(
     #loss_state{
         sent_packets = Sent,
@@ -154,9 +173,9 @@ on_packet_sent(
     PacketNumber,
     Size,
     AckEliciting,
-    Frames
+    Frames,
+    Now
 ) ->
-    Now = erlang:monotonic_time(millisecond),
     SentPacket = #sent_packet{
         pn = PacketNumber,
         time_sent = Now,

@@ -2893,12 +2893,17 @@ send_app_packet_internal(Payload, Frames, State) ->
                 frames => Frames
             }),
 
-            %% Track sent packet for loss detection and congestion control
+            %% Single monotonic_time sample shared between loss
+            %% tracking and last_activity; saves one BIF call per
+            %% packet on the bulk-send hot path.
+            Now = erlang:monotonic_time(millisecond),
+
+            %% Track sent packet for loss detection and congestion control.
             %% Determine if ack-eliciting by checking the actual frames list
-            %% This properly handles coalesced packets with multiple frames
+            %% so coalesced packets with multiple frames are handled.
             AckEliciting = contains_ack_eliciting_frames(Frames),
             NewLossState = quic_loss:on_packet_sent(
-                LossState, PN, PacketSize, AckEliciting, Frames
+                LossState, PN, PacketSize, AckEliciting, Frames, Now
             ),
             NewCCState =
                 case AckEliciting of
@@ -2921,7 +2926,7 @@ send_app_packet_internal(Payload, Frames, State) ->
                 loss_state = NewLossState,
                 packets_sent = State#state.packets_sent + 1,
                 socket_state = NewSocketState,
-                last_activity = erlang:monotonic_time(millisecond),
+                last_activity = Now,
                 timer_dirty = true,
                 pto_dirty = true
             };
