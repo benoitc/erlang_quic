@@ -114,7 +114,11 @@ jobs:
   server-batching-gso:
     name: Server Batching + Linux GSO
     needs: unit-tests
-    runs-on: ubuntu-latest
+    # Pinned to ubuntu-24.04 (kernel 6.x) so UDP_SEGMENT / GSO is
+    # guaranteed available; the suite hard-fails when GSO is expected
+    # but missing, so we must not let the runner label drift onto a
+    # kernel without UDP GSO support.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 

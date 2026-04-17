@@ -150,16 +150,21 @@ opt_out_still_completes_transfer(Config) ->
     Config.
 
 %% Linux-only: proves GSO actually kicks in on a capable host.
-%% Skipped on non-Linux, on Linux without UDP_SEGMENT support, or when
-%% the opt-in env var QUIC_ENABLE_GSO_TEST is not set. Starts the
-%% listener with socket_backend => socket so the quic_socket abstraction
-%% is active on the listener's UDP socket and GSO propagates into each
-%% server connection's per-connection sender.
+%% Skipped when the opt-in env var QUIC_ENABLE_GSO_TEST is not set.
+%% When the env var IS set (as in the dedicated CI job), the test hard
+%% fails if we are not on Linux or if UDP_SEGMENT is unsupported, so a
+%% silent skip in CI cannot mask a regression in GSO detection.
+%% Starts the listener with socket_backend => socket so the quic_socket
+%% abstraction is active on the listener's UDP socket and GSO propagates
+%% into each server connection's per-connection sender.
 server_download_uses_gso_on_linux(Config) ->
-    case should_run_gso_test() of
+    case os:getenv("QUIC_ENABLE_GSO_TEST") of
         false ->
-            {skip, "Linux + GSO capability + QUIC_ENABLE_GSO_TEST required"};
-        true ->
+            {skip, "QUIC_ENABLE_GSO_TEST not set"};
+        _ ->
+            ?assertEqual({unix, linux}, os:type()),
+            Caps = quic_socket:detect_capabilities(),
+            ?assertEqual(true, maps:get(gso, Caps, false)),
             {ok, Srv} = start_download_server(#{socket_backend => socket}),
             try
                 {Received, Delta} = run_download(Srv, ?DOWNLOAD_SIZE),
@@ -190,11 +195,6 @@ server_download_uses_gso_on_linux(Config) ->
             end,
             Config
     end.
-
-should_run_gso_test() ->
-    os:type() =:= {unix, linux} andalso
-        maps:get(gso, quic_socket:detect_capabilities(), false) andalso
-        os:getenv("QUIC_ENABLE_GSO_TEST") =/= false.
 
 %%====================================================================
 %% Download server
