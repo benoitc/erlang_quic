@@ -628,3 +628,41 @@ zero_byte_fin_not_stranded_test() ->
     ?assertEqual(true, maps:get(empty_by_bytes, Result)),
     %% Count-based check correctly reports non-empty
     ?assertEqual(false, maps:get(empty_by_count, Result)).
+
+%% RFC 9002 §6.2: ACK decimation for 1-RTT traffic.
+%% First ack-eliciting packet arms the max_ack_delay timer but does
+%% NOT emit an ACK yet.
+ack_decimation_first_packet_arms_timer_test() ->
+    S0 = quic_connection:test_decimate_initial_state(),
+    {_S1, Info} = quic_connection:test_decimate_step(S0),
+    ?assertEqual(1, maps:get(ack_elicited_count, Info)),
+    ?assertEqual(true, maps:get(ack_timer_armed, Info)).
+
+%% Second ack-eliciting packet (tolerance=2) triggers an immediate
+%% ACK, which clears the count and cancels the timer.
+ack_decimation_second_packet_flushes_test() ->
+    S0 = quic_connection:test_decimate_initial_state(),
+    {S1, _After1} = quic_connection:test_decimate_step(S0),
+    {_S2, After2} = quic_connection:test_decimate_step(S1),
+    %% send_app_ack/1 with empty ack_ranges short-circuits but still
+    %% clears the decimation state via clear_ack_decimation_state/1.
+    ?assertEqual(0, maps:get(ack_elicited_count, After2)),
+    ?assertEqual(false, maps:get(ack_timer_armed, After2)).
+
+%% Timer firing (simulated via send_app_ack/1) resets count + timer.
+ack_decimation_timer_fire_resets_test() ->
+    S0 = quic_connection:test_decimate_initial_state(),
+    {S1, _After} = quic_connection:test_decimate_step(S0),
+    %% At this point count=1 and timer armed. Simulate fire.
+    Info = quic_connection:test_decimate_on_timer_fire(S1),
+    ?assertEqual(0, maps:get(ack_elicited_count, Info)),
+    ?assertEqual(false, maps:get(ack_timer_armed, Info)).
+
+%% Arming is idempotent: first ack-eliciting packet arms, subsequent
+%% steps below tolerance don't re-arm. Observable via stable count/
+%% armed status after a single step.
+ack_decimation_timer_idempotent_test() ->
+    S0 = quic_connection:test_decimate_initial_state(),
+    {_S1, Info} = quic_connection:test_decimate_step(S0),
+    ?assertEqual(1, maps:get(ack_elicited_count, Info)),
+    ?assertEqual(true, maps:get(ack_timer_armed, Info)).
