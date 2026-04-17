@@ -138,11 +138,12 @@ download_loop(Conn, Pending) ->
             Buffer = <<Prev/binary, Data/binary>>,
             case Buffer of
                 <<Size:64/big-unsigned-integer, _/binary>> when Fin ->
-                    %% Synchronous send so flow-control / send-queue
-                    %% errors surface instead of being dropped by a
-                    %% cast. For bench purposes the blocking cost here
-                    %% is negligible next to the actual transfer.
-                    _ = quic:send_data(Conn, StreamId, binary:copy(<<16#42>>, Size), true),
+                    %% Strict match so a send failure crashes the
+                    %% handler fast instead of bleeding into the
+                    %% client's collect_download timeout. The prior
+                    %% `_ =' silently dropped errors and made diagnosis
+                    %% harder.
+                    ok = quic:send_data(Conn, StreamId, binary:copy(<<16#42>>, Size), true),
                     download_loop(Conn, maps:remove(StreamId, Pending));
                 _ when Fin ->
                     download_loop(Conn, maps:remove(StreamId, Pending));
@@ -173,15 +174,57 @@ do_download(#{name := Name, port := Port}, Size) ->
         after 10000 ->
             throw({error, connect_timeout})
         end,
+
+        %% Snapshot baseline server-connection stats BEFORE the download
+        %% request so the returned counters describe the download only,
+        %% not lifetime traffic (which folds in handshake packets).
+        %% The server gen_statem can still be in idle for a few ms after
+        %% the client sees {connected, _} (two-way handshake timing);
+        %% poll_stats/1 retries briefly to cover that race.
+        %% quic_server_batching_SUITE has identical helpers.
+        ServerPid = server_connection_pid(Name),
+        {ok, Before} = poll_stats(ServerPid),
+
         {ok, StreamId} = quic:open_stream(Conn),
         ok = quic:send_data(Conn, StreamId, <<Size:64/big-unsigned-integer>>, true),
         Received = collect_download(Conn, StreamId, <<>>, 30000),
-        {ok, [ServerPid | _]} = quic:get_server_connections(Name),
-        {ok, Stats} = quic:get_stats(ServerPid),
-        {Received, Stats}
+
+        {ok, After} = poll_stats(ServerPid),
+        {Received, stats_delta(After, Before)}
     after
         quic:close(Conn)
     end.
+
+server_connection_pid(Name) ->
+    {ok, ConnPids} = quic:get_server_connections(Name),
+    [Pid | _] = lists:usort(ConnPids),
+    Pid.
+
+%% Retry get_stats while the server connection is still transitioning
+%% out of idle. Bounded to ~1s total.
+poll_stats(Pid) ->
+    poll_stats(Pid, 200).
+
+poll_stats(_Pid, 0) ->
+    {error, stats_timeout};
+poll_stats(Pid, N) ->
+    case quic:get_stats(Pid) of
+        {ok, _} = R ->
+            R;
+        {error, {invalid_state, _}} ->
+            timer:sleep(5),
+            poll_stats(Pid, N - 1);
+        {error, _} = Err ->
+            Err
+    end.
+
+stats_delta(After, Before) ->
+    maps:from_list(
+        [
+            {K, maps:get(K, After, 0) - maps:get(K, Before, 0)}
+         || K <- [packets_sent, batch_flushes, packets_coalesced]
+        ]
+    ).
 
 collect_download(Conn, StreamId, Acc, Timeout) ->
     receive
