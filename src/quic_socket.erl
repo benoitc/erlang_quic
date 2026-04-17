@@ -569,9 +569,9 @@ build_socket_state(Socket, BatchConfig) ->
     {ok, State}.
 
 maybe_enable_gso(Socket, #{gso_supported := true, gso_size := Size}) ->
-    %% Try to set GSO segment size
-    %% UDP_SEGMENT = 103
-    case socket:setopt_native(Socket, {udp, ?UDP_SEGMENT}, <<Size:16/native>>) of
+    %% UDP_SEGMENT setsockopt expects sizeof(int); the cmsg variant
+    %% (see flush path) is the one that takes u16.
+    case socket:setopt_native(Socket, {udp, ?UDP_SEGMENT}, <<Size:32/native>>) of
         ok -> true;
         {error, _} -> false
     end;
@@ -1031,8 +1031,10 @@ test_linux_socket_capabilities() ->
     end.
 
 test_gso(Socket) ->
-    %% Try to set UDP_SEGMENT option
-    case socket:setopt_native(Socket, {udp, ?UDP_SEGMENT}, <<1200:16/native>>) of
+    %% UDP_SEGMENT setsockopt expects sizeof(int) on Linux; passing 2
+    %% bytes makes the kernel reject with EINVAL and GSO is reported as
+    %% unsupported even on kernels that have it.
+    case socket:setopt_native(Socket, {udp, ?UDP_SEGMENT}, <<1200:32/native>>) of
         ok -> true;
         {error, _} -> false
     end.
