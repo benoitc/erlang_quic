@@ -938,10 +938,16 @@ validate_initial_token(Secret, Token, Addr, ExpectedODCID, MaxAge) ->
             Err
     end.
 
-%% Send a packet using the appropriate backend
+%% Send a packet using the appropriate backend.
+%% Listener self-sends are one-shot control-plane packets (version
+%% negotiation, retry, stateless reset) that never benefit from
+%% batching. Use send_immediate/4 so the returned state (which has
+%% the listener's batch buffer updated) does not need to be
+%% persisted back on #listener_state{}; before, send/4's returned
+%% state was dropped on the floor and the packet was lost when
+%% batching_enabled was true on the socket backend.
 send_packet(_Socket, SocketState, socket, IP, Port, Packet) when SocketState =/= undefined ->
-    {ok, _} = quic_socket:send(SocketState, IP, Port, Packet),
-    quic_socket:flush(SocketState),
+    _ = quic_socket:send_immediate(SocketState, IP, Port, Packet),
     ok;
 send_packet(Socket, _SocketState, gen_udp, IP, Port, Packet) ->
     gen_udp:send(Socket, IP, Port, Packet).

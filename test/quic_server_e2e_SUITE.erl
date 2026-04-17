@@ -142,7 +142,12 @@ server_connection_batches_by_default(Config) ->
         {ok, ConnPids} = quic:get_server_connections(Name),
         [ServerPid | _] = lists:usort(ConnPids),
         {_State, Info} = quic_connection:get_state(ServerPid),
-        ?assertEqual(true, maps:get(send_batching, Info)),
+        %% With default opts, a socket_state is attached and batching
+        %% is enabled. send_backend reports gen_udp or socket depending
+        %% on listener configuration (gen_udp by default).
+        ?assertNotEqual(direct, maps:get(send_backend, Info)),
+        ?assertEqual(true, maps:get(send_batching_enabled, Info)),
+        ?assert(is_boolean(maps:get(send_gso_supported, Info))),
         quic:close(Conn)
     after
         quic_test_echo_server:stop(Echo)
@@ -165,7 +170,11 @@ server_connection_batching_opt_out(Config) ->
         {ok, ConnPids} = quic:get_server_connections(Name),
         [ServerPid | _] = lists:usort(ConnPids),
         {_State, Info} = quic_connection:get_state(ServerPid),
-        ?assertEqual(false, maps:get(send_batching, Info)),
+        %% Opt-out: no socket_state, so direct send path with no
+        %% batching wrapper.
+        ?assertEqual(direct, maps:get(send_backend, Info)),
+        ?assertEqual(false, maps:get(send_batching_enabled, Info)),
+        ?assertEqual(false, maps:get(send_gso_supported, Info)),
         quic:close(Conn)
     after
         quic_test_echo_server:stop(Echo)

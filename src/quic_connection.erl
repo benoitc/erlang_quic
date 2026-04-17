@@ -1698,16 +1698,21 @@ connected(
         packets_received = PacketsRecv,
         packets_sent = PacketsSent,
         data_received = DataRecv,
-        data_sent = DataSent
+        data_sent = DataSent,
+        socket_state = SocketState
     } = State
 ) ->
-    %% Return packet counts for liveness detection
-    %% net_kernel uses recv count to verify peer is alive
+    %% Return packet counts for liveness detection (net_kernel uses
+    %% recv count to verify peer is alive) plus send-path batching
+    %% counters for benchmarks and tests.
+    {Flushes, Coalesced} = send_batch_counters(SocketState),
     Stats = #{
         packets_received => PacketsRecv,
         packets_sent => PacketsSent,
         data_received => DataRecv,
-        data_sent => DataSent
+        data_sent => DataSent,
+        batch_flushes => Flushes,
+        packets_coalesced => Coalesced
     },
     {keep_state, State, [{reply, From, {ok, Stats}}]};
 connected({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
@@ -7284,13 +7289,43 @@ state_to_map(#state{} = S) ->
         data_received => S#state.data_received,
         send_queue_bytes => S#state.send_queue_bytes,
         send_queue_count => S#state.send_queue_count,
-        send_batching => (S#state.socket_state =/= undefined),
+        %% Per-connection send-path observability. send_backend is
+        %% `direct' when the connection bypasses quic_socket (typical
+        %% server connections before the batching opt-in landed).
+        send_backend => send_backend(S#state.socket_state),
+        send_batching_enabled => send_batching_enabled(S#state.socket_state),
+        send_gso_supported => send_gso_supported(S#state.socket_state),
         recv_buffer_bytes => S#state.recv_buffer_bytes,
         max_data_local => S#state.max_data_local,
         fc_last_stream_update => S#state.fc_last_stream_update,
         fc_last_conn_update => S#state.fc_last_conn_update,
         fc_max_receive_window => S#state.fc_max_receive_window
     }.
+
+%% Send-path observability helpers. Each reads one field from the
+%% current #socket_state{} via quic_socket:info/1 (single map lookup),
+%% or returns the "no batching wrapper" value when socket_state is
+%% undefined.
+send_backend(undefined) ->
+    direct;
+send_backend(SocketState) ->
+    maps:get(backend, quic_socket:info(SocketState)).
+
+send_batching_enabled(undefined) ->
+    false;
+send_batching_enabled(SocketState) ->
+    maps:get(batching_enabled, quic_socket:info(SocketState)).
+
+send_gso_supported(undefined) ->
+    false;
+send_gso_supported(SocketState) ->
+    maps:get(gso_supported, quic_socket:info(SocketState)).
+
+send_batch_counters(undefined) ->
+    {0, 0};
+send_batch_counters(SocketState) ->
+    Info = quic_socket:info(SocketState),
+    {maps:get(batch_flushes, Info), maps:get(packets_coalesced, Info)}.
 
 %% Normalize ALPN list - handles binary, list of binaries, list of strings
 normalize_alpn_list(undefined) ->
