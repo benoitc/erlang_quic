@@ -31,7 +31,8 @@
 -export([
     server_download_coalesces_by_default/1,
     server_download_no_batching_when_disabled/1,
-    opt_out_still_completes_transfer/1
+    opt_out_still_completes_transfer/1,
+    server_download_uses_gso_on_linux/1
 ]).
 
 -define(DOWNLOAD_SIZE, 262144).
@@ -48,7 +49,8 @@ all() ->
     [
         server_download_coalesces_by_default,
         server_download_no_batching_when_disabled,
-        opt_out_still_completes_transfer
+        opt_out_still_completes_transfer,
+        server_download_uses_gso_on_linux
     ].
 
 init_per_suite(Config) ->
@@ -133,6 +135,52 @@ opt_out_still_completes_transfer(Config) ->
         stop_server(Srv)
     end,
     Config.
+
+%% Linux-only: proves GSO actually kicks in on a capable host.
+%% Skipped on non-Linux, on Linux without UDP_SEGMENT support, or when
+%% the opt-in env var QUIC_ENABLE_GSO_TEST is not set. Starts the
+%% listener with socket_backend => socket so the quic_socket abstraction
+%% is active on the listener's UDP socket and GSO propagates into each
+%% server connection's per-connection sender.
+server_download_uses_gso_on_linux(Config) ->
+    case should_run_gso_test() of
+        false ->
+            {skip, "Linux + GSO capability + QUIC_ENABLE_GSO_TEST required"};
+        true ->
+            {ok, Srv} = start_download_server(#{socket_backend => socket}),
+            try
+                {Received, ServerStats} = run_download(Srv, ?DOWNLOAD_SIZE),
+                ?assertEqual(?DOWNLOAD_SIZE, byte_size(Received)),
+
+                {ok, ConnPids} = quic:get_server_connections(maps:get(name, Srv)),
+                [ServerPid | _] = lists:usort(ConnPids),
+                {_State, Info} = quic_connection:get_state(ServerPid),
+                ?assertEqual(true, maps:get(send_gso_supported, Info)),
+
+                Flushes = maps:get(batch_flushes, ServerStats),
+                Coalesced = maps:get(packets_coalesced, ServerStats),
+                Ratio =
+                    case Flushes of
+                        0 -> 0.0;
+                        _ -> Coalesced / Flushes
+                    end,
+                ct:log(
+                    "GSO stats: flushes=~p coalesced=~p ratio=~.2f",
+                    [Flushes, Coalesced, float(Ratio)]
+                ),
+                %% Real coalescing means average batch size > 1. A
+                %% per-packet flush path would give ratio == 1.
+                ?assert(Ratio > 1.5)
+            after
+                stop_server(Srv)
+            end,
+            Config
+    end.
+
+should_run_gso_test() ->
+    os:type() =:= {unix, linux} andalso
+        maps:get(gso, quic_socket:detect_capabilities(), false) andalso
+        os:getenv("QUIC_ENABLE_GSO_TEST") =/= false.
 
 %%====================================================================
 %% Download server
