@@ -157,7 +157,11 @@
     %% Regression helper for send_queue_bytes accounting during ACK coalesce
     test_coalesce_small_stream/1,
     %% Regression helper for zero-byte FIN entries stranded in the send queue
-    test_zero_byte_fin_in_queue/0
+    test_zero_byte_fin_in_queue/0,
+    %% Test helpers for 1-RTT ACK decimation (RFC 9002 §6.2)
+    test_decimate_initial_state/0,
+    test_decimate_step/1,
+    test_decimate_on_timer_fire/1
 ]).
 -endif.
 
@@ -190,6 +194,12 @@
 %% Stays well below the RFC 9002 minimum PTO so it does not break
 %% retransmission semantics.
 -define(PTO_RESET_TOLERANCE_MS, 2).
+
+%% ACK packet tolerance for 1-RTT (RFC 9002 §6.2).
+%% The receiver SHOULD send an ACK frame in response to at least every
+%% second ack-eliciting packet. 2 is the RFC floor; higher values trade
+%% ACK traffic for RTT-sample granularity.
+-define(ACK_PACKET_TOLERANCE, 2).
 
 %% Max receive buffer size in bytes (32 MB total across all streams) - protects against malicious peers
 -define(MAX_RECV_BUFFER_BYTES, 33554432).
@@ -501,6 +511,15 @@
     %% These are flushed after batch boundaries via flush_dirty_timers/1
     timer_dirty = false :: boolean(),
     pto_dirty = false :: boolean(),
+
+    %% 1-RTT ACK decimation (RFC 9002 §6.2). Count of ack-eliciting
+    %% 1-RTT packets received since the last emitted ACK. When it
+    %% reaches ?ACK_PACKET_TOLERANCE (default 2) the ACK is sent
+    %% immediately; otherwise a max_ack_delay timer (ack_timer) is
+    %% armed so the peer sees an ACK at worst max_ack_delay ms after
+    %% the first ack-eliciting packet in the window.
+    ack_elicited_count = 0 :: non_neg_integer(),
+    ack_timer = undefined :: reference() | undefined,
 
     %% QLOG Tracing (draft-ietf-quic-qlog-quic-events)
     qlog_ctx :: #qlog_ctx{} | undefined
@@ -1240,6 +1259,7 @@ terminate(
         idle_timer = IdleTimer,
         keep_alive_timer = KeepAliveTimer,
         pacing_timer = PacingTimer,
+        ack_timer = AckTimer,
         role = Role,
         qlog_ctx = QlogCtx
     } = State
@@ -1282,11 +1302,7 @@ terminate(
     cancel_timer(IdleTimer),
     cancel_timer(KeepAliveTimer),
     cancel_timer(PacingTimer),
-    %% Cancel delayed ACK timer from process dictionary
-    case erase(ack_timer) of
-        undefined -> ok;
-        AckTimerRef -> cancel_timer(AckTimerRef)
-    end,
+    cancel_timer(AckTimer),
     %% Close dedicated send socket for server connections (SO_REUSEPORT socket)
     case SendSocket of
         undefined -> ok;
@@ -1855,19 +1871,16 @@ connected(cast, process, #state{role = client, socket = Socket, active_n = N} = 
 connected(cast, process, #state{role = server} = State) ->
     %% Server connections receive via listener, don't touch socket options
     {keep_state, State};
-%% Handle delayed ACK timer (RFC 9221 Section 5.2)
-%% Validates reference to ignore stale timer events
-connected(info, {send_delayed_ack, app, Ref}, State) ->
-    case get(ack_timer) of
-        Ref when Ref =/= undefined ->
-            erase(ack_timer),
-            State1 = send_app_ack(State),
-            NewState = flush_dirty_timers(flush_socket_batch(State1)),
-            {keep_state, NewState};
-        _ ->
-            %% Stale timer - ignore
-            {keep_state, State}
-    end;
+%% Handle delayed ACK timer (RFC 9000 §13.2.1 / RFC 9221 §5.2).
+%% Validates reference to ignore stale timer events.
+connected(info, {send_delayed_ack, app, Ref}, #state{ack_timer = Ref} = State) ->
+    %% send_app_ack/1 clears ack_timer + ack_elicited_count.
+    State1 = send_app_ack(State),
+    NewState = flush_dirty_timers(flush_socket_batch(State1)),
+    {keep_state, NewState};
+connected(info, {send_delayed_ack, app, _StaleRef}, State) ->
+    %% Stale timer — ignore.
+    {keep_state, State};
 %% Handle PMTU probe timeout (RFC 8899)
 %% Validates reference to ignore stale timer events
 connected(
@@ -2637,18 +2650,27 @@ send_handshake_ack(State) ->
     end.
 
 %% Send an app-level ACK packet (1-RTT)
-%% Coalesces ACK with small pending stream data when possible
+%% Coalesces ACK with small pending stream data when possible.
+%% Always resets the decimation counter + cancels any armed ack_timer
+%% so the next ack-eliciting batch starts a fresh window.
 send_app_ack(State) ->
-    #state{pn_app = PNSpace} = State,
+    State1 = clear_ack_decimation_state(State),
+    #state{pn_app = PNSpace} = State1,
     case PNSpace#pn_space.ack_ranges of
         [] ->
-            State;
+            State1;
         Ranges ->
-            %% Build ACK frame tuple (not encoded yet)
             AckFrameTuple = build_ack_frame_tuple(Ranges),
-            %% Try to coalesce ACK with small pending stream data
-            maybe_coalesce_ack_with_data(AckFrameTuple, State)
+            maybe_coalesce_ack_with_data(AckFrameTuple, State1)
     end.
+
+%% Cancel any armed ACK timer and zero the decimation counter. Called
+%% from every 1-RTT ACK emission path.
+clear_ack_decimation_state(#state{ack_timer = undefined} = State) ->
+    State#state{ack_elicited_count = 0};
+clear_ack_decimation_state(#state{ack_timer = Ref} = State) ->
+    cancel_timer(Ref),
+    State#state{ack_timer = undefined, ack_elicited_count = 0}.
 
 %% Try to coalesce ACK frame with small pending stream data
 %% Takes frame tuples (not encoded) to avoid re-decode overhead
@@ -5202,17 +5224,27 @@ flush_socket_batch(#state{socket_state = SocketState} = State) ->
     end.
 
 %% Send ACK if packet contained any ack-eliciting frames.
-%% Per RFC 9221 Section 5.2: Receivers SHOULD support delaying ACK frames
-%% for packets that only contain DATAGRAM frames.
+%%
+%% For 1-RTT (`app') traffic the receiver delays ACKs per RFC 9002 §6.2
+%% and RFC 9000 §13.2.1: send an ACK after every `?ACK_PACKET_TOLERANCE'
+%% ack-eliciting packets, or after `max_ack_delay' ms (whichever comes
+%% first). This roughly halves ACK traffic on bulk flows compared to
+%% the previous "ACK every packet" policy. Handshake / Initial spaces
+%% still ACK immediately (latency-sensitive, short exchange).
+%%
+%% Datagram-only packets (RFC 9221 §5.2) continue to take the existing
+%% delayed-ACK path, which also sits on max_ack_delay.
 maybe_send_ack(app, Frames, State) ->
     case contains_ack_eliciting_frames(Frames) of
         true ->
             case should_delay_ack(Frames) of
                 true ->
-                    %% Delay ACK for datagram-only packets (up to max_ack_delay)
+                    %% Datagram-only packets: delay up to max_ack_delay.
                     schedule_delayed_ack(app, State);
                 false ->
-                    send_app_ack(State)
+                    %% Normal stream / control traffic: count-based
+                    %% decimation + max_ack_delay timer.
+                    maybe_decimate_app_ack(State)
             end;
         false ->
             State
@@ -5230,6 +5262,28 @@ maybe_send_ack(initial, Frames, State) ->
 maybe_send_ack(_, _, State) ->
     State.
 
+%% Count-based 1-RTT ACK decimation.
+%% When `?ACK_PACKET_TOLERANCE' ack-eliciting packets have been seen
+%% since the last emitted ACK, flush immediately. Otherwise increment
+%% the counter and arm a max_ack_delay timer (if not already armed).
+maybe_decimate_app_ack(State) ->
+    NewCount = State#state.ack_elicited_count + 1,
+    case NewCount >= ?ACK_PACKET_TOLERANCE of
+        true ->
+            send_app_ack(State);
+        false ->
+            arm_ack_timer(State#state{ack_elicited_count = NewCount})
+    end.
+
+%% Arm the max_ack_delay timer if not already armed.
+arm_ack_timer(#state{ack_timer = Ref} = State) when Ref =/= undefined ->
+    State;
+arm_ack_timer(#state{ack_timer = undefined} = State) ->
+    MaxAckDelay = maps:get(max_ack_delay, State#state.transport_params, 25),
+    NewRef = make_ref(),
+    erlang:send_after(MaxAckDelay, self(), {send_delayed_ack, app, NewRef}),
+    State#state{ack_timer = NewRef}.
+
 %% Per RFC 9221 Section 5.2: Delay ACKs for packets containing only
 %% non-retransmittable ack-eliciting frames (like DATAGRAM).
 should_delay_ack(Frames) ->
@@ -5238,22 +5292,11 @@ should_delay_ack(Frames) ->
     %% If all ack-eliciting frames are non-retransmittable, delay ACK
     Retransmittable =:= [].
 
-%% Schedule a delayed ACK (up to max_ack_delay)
-%% Uses unique reference in message to detect stale timer events
+%% Schedule a delayed ACK (datagram-only path; RFC 9221 §5.2).
+%% Shares the same ack_timer field with the count-based decimation
+%% path so both end at the next max_ack_delay fire.
 schedule_delayed_ack(app, State) ->
-    %% Use max_ack_delay from transport params (default 25ms)
-    MaxAckDelay = maps:get(max_ack_delay, State#state.transport_params, 25),
-    %% Schedule ACK timer if not already set
-    case get(ack_timer) of
-        undefined ->
-            Ref = make_ref(),
-            erlang:send_after(MaxAckDelay, self(), {send_delayed_ack, app, Ref}),
-            put(ack_timer, Ref),
-            State;
-        _ ->
-            %% Timer already set, don't reschedule
-            State
-    end.
+    arm_ack_timer(State).
 
 %% Check if any frame in the list is ack-eliciting
 contains_ack_eliciting_frames([]) ->
@@ -8999,4 +9042,56 @@ test_coalesce_small_stream(DataSize) when DataSize < ?SMALL_FRAME_THRESHOLD ->
                 send_queue_version => 1
             }
     end.
+
+%% Initial #state{} for ACK-decimation unit tests. ack_ranges is
+%% intentionally empty so send_app_ack/1 short-circuits without a
+%% full pn_space + encrypt keys; tests observe the decimation
+%% state transitions, not the actual ACK packet on the wire.
+-spec test_decimate_initial_state() -> #state{}.
+test_decimate_initial_state() ->
+    PN = #pn_space{
+        next_pn = 0,
+        largest_acked = undefined,
+        largest_recv = undefined,
+        recv_time = undefined,
+        ack_ranges = [],
+        ack_eliciting_in_flight = 0,
+        loss_time = undefined,
+        sent_packets = #{}
+    },
+    #state{
+        pn_app = PN,
+        transport_params = #{max_ack_delay => 25},
+        ack_elicited_count = 0,
+        ack_timer = undefined
+    }.
+
+%% Run one ack-eliciting-packet step through maybe_decimate_app_ack/1
+%% and return the observable decimation fields.
+-spec test_decimate_step(#state{}) ->
+    {#state{}, #{
+        ack_elicited_count := non_neg_integer(),
+        ack_timer_armed := boolean()
+    }}.
+test_decimate_step(State) ->
+    NewState = maybe_decimate_app_ack(State),
+    {NewState, #{
+        ack_elicited_count => NewState#state.ack_elicited_count,
+        ack_timer_armed => NewState#state.ack_timer =/= undefined
+    }}.
+
+%% Simulate the delayed-ack timer firing by routing through
+%% send_app_ack/1 (which clears the decimation state). Returns the
+%% post-fire state fields for assertion.
+-spec test_decimate_on_timer_fire(#state{}) ->
+    #{
+        ack_elicited_count := non_neg_integer(),
+        ack_timer_armed := boolean()
+    }.
+test_decimate_on_timer_fire(State) ->
+    NewState = send_app_ack(State),
+    #{
+        ack_elicited_count => NewState#state.ack_elicited_count,
+        ack_timer_armed => NewState#state.ack_timer =/= undefined
+    }.
 -endif.
