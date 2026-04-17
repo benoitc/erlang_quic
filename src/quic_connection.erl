@@ -153,7 +153,11 @@
     test_state_for_client/1,
     test_close_reason/1,
     maybe_validate_initial_token/2,
-    test_state_for_server/3
+    test_state_for_server/3,
+    %% Regression helper for send_queue_bytes accounting during ACK coalesce
+    test_coalesce_small_stream/1,
+    %% Regression helper for zero-byte FIN entries stranded in the send queue
+    test_zero_byte_fin_in_queue/0
 ]).
 -endif.
 
@@ -179,6 +183,13 @@
 
 %% Max send queue size in bytes (16 MB default) - prevents memory exhaustion from queued data
 -define(MAX_SEND_QUEUE_BYTES, 16777216).
+
+%% PTO reset tolerance in milliseconds.
+%% set_pto_timer/1 skips the cancel + reschedule cycle when the new PTO
+%% deadline is within this many ms of the currently scheduled deadline.
+%% Stays well below the RFC 9002 minimum PTO so it does not break
+%% retransmission semantics.
+-define(PTO_RESET_TOLERANCE_MS, 2).
 
 %% Max receive buffer size in bytes (32 MB total across all streams) - protects against malicious peers
 -define(MAX_RECV_BUFFER_BYTES, 33554432).
@@ -338,6 +349,11 @@
     cc_state :: quic_cc:cc_state() | undefined,
     loss_state :: quic_loss:loss_state() | undefined,
     pto_timer :: reference() | undefined,
+    %% Absolute monotonic millisecond deadline for the currently armed
+    %% PTO timer. Used by set_pto_timer/1 to skip the cancel + reschedule
+    %% cycle when the new deadline is within ?PTO_RESET_TOLERANCE_MS of
+    %% the existing one.
+    pto_scheduled_at = undefined :: integer() | undefined,
     idle_timer :: reference() | undefined,
 
     %% Keep-alive (RFC 9000 - PING frames for liveness)
@@ -365,6 +381,10 @@
 
     %% Send queue byte tracking (prevents memory exhaustion)
     send_queue_bytes = 0 :: non_neg_integer(),
+    %% Send queue entry count. Used as an O(1) emptiness check because
+    %% send_queue_bytes can legitimately be 0 while an entry is queued
+    %% (e.g. an empty FIN-only stream send enqueued under pacing).
+    send_queue_count = 0 :: non_neg_integer(),
     %% Send queue version counter (for fast change detection)
     send_queue_version = 0 :: non_neg_integer(),
 
@@ -2616,15 +2636,31 @@ maybe_coalesce_ack_with_data(AckFrameTuple, State) ->
 %% Dequeue a small stream frame tuple if available (< 500 bytes)
 %% Returns the frame tuple (not encoded) to avoid re-decode overhead
 -define(SMALL_FRAME_THRESHOLD, 500).
-dequeue_small_stream_frame_tuple(#state{send_queue = PQ} = State) ->
+dequeue_small_stream_frame_tuple(
+    #state{
+        send_queue = PQ,
+        send_queue_bytes = QueueBytes,
+        send_queue_count = QueueCount,
+        send_queue_version = Version
+    } = State
+) ->
     case pqueue_peek(PQ) of
         {value, {stream_data, StreamId, Offset, Data, Fin, DataSize}} when
             DataSize < ?SMALL_FRAME_THRESHOLD
         ->
-            %% Remove from queue and return frame tuple (not encoded)
+            %% Remove from queue and return frame tuple (not encoded).
+            %% send_queue_bytes must be decremented here to match the
+            %% accounting done in process_send_queue_entry/1; otherwise
+            %% the counter leaks until it crosses ?MAX_SEND_QUEUE_BYTES.
             {{value, _}, NewPQ} = pqueue_out(PQ),
             StreamFrameTuple = {stream, StreamId, Offset, Data, Fin},
-            {ok, StreamFrameTuple, State#state{send_queue = NewPQ}};
+            NewState = State#state{
+                send_queue = NewPQ,
+                send_queue_bytes = max(0, QueueBytes - DataSize),
+                send_queue_count = max(0, QueueCount - 1),
+                send_queue_version = Version + 1
+            },
+            {ok, StreamFrameTuple, NewState};
         _ ->
             none
     end.
@@ -2819,21 +2855,25 @@ send_app_packet_internal(Payload, Frames, State) ->
                     false -> CCState
                 end,
 
-            %% Update PN space and packet counter for liveness detection
+            %% Update PN space, counters, socket state and dirty bits in
+            %% a single record update to avoid copying #state{} multiple
+            %% times per packet on the bulk-send hot path.
             NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-            State1 = apply_pending_socket_state(State#state{
+            NewSocketState =
+                case erase(pending_socket_state) of
+                    undefined -> State#state.socket_state;
+                    PendingSocketState -> PendingSocketState
+                end,
+            State#state{
                 pn_app = NewPNSpace,
                 cc_state = NewCCState,
                 loss_state = NewLossState,
-                packets_sent = State#state.packets_sent + 1
-            }),
-
-            %% Update activity timestamp on successful send
-            %% This prevents idle timeout during long one-way transfers
-            State2 = update_last_activity(State1),
-
-            %% Mark PTO dirty for batched timer reset (actual reset at flush)
-            mark_pto_dirty(State2);
+                packets_sent = State#state.packets_sent + 1,
+                socket_state = NewSocketState,
+                last_activity = erlang:monotonic_time(millisecond),
+                timer_dirty = true,
+                pto_dirty = true
+            };
         {error, Reason} ->
             %% Send failed - do NOT track packet as sent to avoid CC/loss inconsistency
             %% The data will be re-sent via the PTO timeout mechanism
@@ -3895,10 +3935,17 @@ process_frame(
         end,
     %% Notify owner - they should stop sending and may send RESET_STREAM
     Owner ! {quic, self(), {stop_sending, StreamId, ErrorCode}},
-    %% Also remove from send queue and adjust byte count
-    {NewSendQueue, RemovedBytes} = remove_stream_from_queue(StreamId, State#state.send_queue),
-    NewQueueBytes = State#state.send_queue_bytes - RemovedBytes,
-    State#state{streams = NewStreams, send_queue = NewSendQueue, send_queue_bytes = NewQueueBytes};
+    %% Also remove from send queue and adjust byte / entry count
+    {NewSendQueue, RemovedBytes, RemovedCount} =
+        remove_stream_from_queue(StreamId, State#state.send_queue),
+    NewQueueBytes = max(0, State#state.send_queue_bytes - RemovedBytes),
+    NewQueueCount = max(0, State#state.send_queue_count - RemovedCount),
+    State#state{
+        streams = NewStreams,
+        send_queue = NewSendQueue,
+        send_queue_bytes = NewQueueBytes,
+        send_queue_count = NewQueueCount
+    };
 %% STREAM_DATA_BLOCKED: Peer is blocked by stream-level flow control
 %% RFC 9000 Section 19.13: Receipt opens the stream (Section 3.2)
 process_frame(
@@ -3970,35 +4017,37 @@ process_frame(_Level, _Frame, State) ->
     State.
 
 %% Helper to remove a stream from the send queue (tuple of 8 queues)
-%% Returns {NewPQ, RemovedBytes} to allow adjusting send_queue_bytes
+%% Returns {NewPQ, RemovedBytes, RemovedCount} to allow adjusting the
+%% send_queue_bytes (for memory cap) and send_queue_count (for O(1)
+%% emptiness check) counters.
 remove_stream_from_queue(StreamId, PQ) ->
     %% Filter out entries for this stream from all 8 priority buckets
     %% Queue entries are 6-tuples: {stream_data, StreamId, Offset, Data, Fin, DataSize}
-    {NewQueues, RemovedBytes} =
+    {NewQueues, RemovedBytes, RemovedCount} =
         lists:foldl(
-            fun(I, {Queues, Bytes}) ->
+            fun(I, {Queues, Bytes, Count}) ->
                 Q = element(I, PQ),
-                %% Calculate bytes to remove before filtering (use cached DataSize)
-                BytesToRemove = queue:fold(
-                    fun({stream_data, SId, _, _Data, _, DataSize}, Acc) ->
+                %% Calculate bytes + entry count to remove before filtering
+                {BytesToRemove, CountToRemove} = queue:fold(
+                    fun({stream_data, SId, _, _Data, _, DataSize}, {BAcc, CAcc}) ->
                         case SId of
-                            StreamId -> Acc + DataSize;
-                            _ -> Acc
+                            StreamId -> {BAcc + DataSize, CAcc + 1};
+                            _ -> {BAcc, CAcc}
                         end
                     end,
-                    0,
+                    {0, 0},
                     Q
                 ),
                 %% Filter to keep only other streams
                 Kept = queue:filter(
                     fun({stream_data, SId, _, _, _, _}) -> SId =/= StreamId end, Q
                 ),
-                {[Kept | Queues], Bytes + BytesToRemove}
+                {[Kept | Queues], Bytes + BytesToRemove, Count + CountToRemove}
             end,
-            {[], 0},
+            {[], 0, 0},
             lists:seq(1, 8)
         ),
-    {list_to_tuple(lists:reverse(NewQueues)), RemovedBytes}.
+    {list_to_tuple(lists:reverse(NewQueues)), RemovedBytes, RemovedCount}.
 
 %% Buffer CRYPTO data and process when complete messages are available
 buffer_crypto_data(Level, Offset, Data, State) ->
@@ -5438,10 +5487,6 @@ mark_activity_dirty(State) ->
         timer_dirty = true
     }.
 
-%% Mark PTO dirty - defers PTO timer reset until batch flush
-mark_pto_dirty(State) ->
-    State#state{pto_dirty = true}.
-
 %% Flush dirty timers at batch boundaries
 %% This batches multiple timer operations into a single reset per batch
 flush_dirty_timers(#state{timer_dirty = false, pto_dirty = false} = State) ->
@@ -6101,30 +6146,42 @@ do_send_datagram(
 %% Send stream data in fragments, tracking how many bytes were actually sent
 %% Returns {NewState, BytesSent} where BytesSent is the count of bytes actually transmitted
 %% (not queued due to congestion)
+%%
+%% Normalises the payload to binary once at the entry. For binary inputs
+%% (the common bulk-send case) this is O(1): iolist_to_binary/1 returns
+%% the same refc binary unchanged. For iolist inputs this is one flatten;
+%% subsequent chunking reuses the same binary via sub-binary slices and
+%% downstream helpers can rely on the binary invariant without re-flattening.
 send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State) ->
-    send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, 0).
+    DataBin =
+        case is_binary(Data) of
+            true -> Data;
+            false -> iolist_to_binary(Data)
+        end,
+    send_stream_data_fragmented_tracked(StreamId, Offset, DataBin, Fin, State, 0).
 
-send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
+send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) when
+    is_binary(Data)
+->
     %% Calculate max chunk size based on current PMTU
     MaxChunkSize = get_max_stream_data_per_packet(State),
-    DataSize = iolist_size(Data),
+    DataSize = byte_size(Data),
 
     case DataSize =< MaxChunkSize of
         true ->
-            %% Data fits in one packet - can pass iolist directly
-            %% Frame encoder will handle flattening
             send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar);
         false ->
-            %% Split data into chunks - need binary for pattern matching
-            DataBin = iolist_to_binary(Data),
-            send_stream_chunked(StreamId, Offset, DataBin, Fin, State, BytesSentSoFar, MaxChunkSize)
+            %% Data is already a flat binary; chunk via sub-binary slices.
+            send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize)
     end.
 
 %% @doc Send stream data that fits in a single packet.
-%% Data can be iolist - flattening deferred to frame encoder
-send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
+%% Data is a binary (normalised by send_stream_data_fragmented_tracked/5).
+send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) when
+    is_binary(Data)
+->
     #state{cc_state = CCState, pacing_enabled = PacingEnabled, streams = Streams} = State,
-    DataSize = iolist_size(Data),
+    DataSize = byte_size(Data),
     PacketSize = DataSize + ?PACKET_OVERHEAD,
     %% Control streams (urgency 0) can exceed cwnd to prevent tick blocking
     Urgency = get_stream_urgency(StreamId, Streams),
@@ -6157,12 +6214,11 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
                             {error, send_queue_full}
                     end;
                 false ->
-                    %% Pacing allows - send immediately and consume tokens
+                    %% Pacing allows - send immediately and consume tokens.
+                    %% Data is already binary (invariant from fragmented_tracked/5).
                     {_Allowed, NewCCState} = quic_cc:get_pacing_tokens(CCState, PacketSize),
                     State1 = State#state{cc_state = NewCCState},
-                    %% Flatten data for frame encoding
-                    DataBin = iolist_to_binary(Data),
-                    Frame = {stream, StreamId, Offset, DataBin, Fin},
+                    Frame = {stream, StreamId, Offset, Data, Fin},
                     Payload = quic_frame:encode(Frame),
                     NewState = send_app_packet_internal(Payload, [Frame], State1),
                     {NewState, BytesSentSoFar + DataSize}
@@ -6276,6 +6332,7 @@ queue_stream_data(
         send_queue = PQ,
         streams = Streams,
         send_queue_bytes = QueueBytes,
+        send_queue_count = QueueCount,
         send_queue_version = Version
     } = State
 ) ->
@@ -6303,6 +6360,7 @@ queue_stream_data(
             {ok, State#state{
                 send_queue = NewPQ,
                 send_queue_bytes = NewQueueBytes,
+                send_queue_count = QueueCount + 1,
                 send_queue_version = NewVersion
             }}
     end.
@@ -6318,6 +6376,13 @@ get_stream_urgency(StreamId, Streams) ->
 %% Process send queue when congestion window frees up
 %% Processes streams in priority order (lower urgency = higher priority)
 %% IMPORTANT: Must check BOTH congestion control AND flow control before sending
+%% Fast path: if send_queue_count is 0 the queue is empty, so skip the
+%% O(8) bucket walk in pqueue_peek/1. We cannot use send_queue_bytes for
+%% this check because a zero-byte FIN-only stream send (iodata of <<>>
+%% with Fin=true) can be enqueued under pacing or congestion, leaving
+%% bytes at 0 while a real entry is pending.
+process_send_queue(#state{send_queue_count = 0} = State) ->
+    State;
 process_send_queue(#state{send_queue = PQ} = State) ->
     case pqueue_peek(PQ) of
         empty ->
@@ -6370,16 +6435,26 @@ check_send_queue_flow_control(StreamId, Offset, DataSize, #state{
 
 %% Actually process the queue entry (called after flow control check passes)
 process_send_queue_entry(
-    #state{send_queue = PQ, send_queue_bytes = QueueBytes} = State
+    #state{
+        send_queue = PQ,
+        send_queue_bytes = QueueBytes,
+        send_queue_count = QueueCount
+    } = State
 ) ->
     case pqueue_out(PQ) of
         {empty, _} ->
             State;
         {{value, {stream_data, StreamId, Offset, Data, Fin, DataSize}}, NewPQ} ->
-            %% Decrement queue bytes for dequeued data (DataSize cached in entry)
-            %% (if data is re-queued, queue_stream_data will increment appropriately)
+            %% Decrement queue bytes and entry count for dequeued data.
+            %% DataSize is cached in entry; if data is re-queued,
+            %% queue_stream_data will increment appropriately.
             DecrementedQueueBytes = max(0, QueueBytes - DataSize),
-            State1 = State#state{send_queue = NewPQ, send_queue_bytes = DecrementedQueueBytes},
+            DecrementedQueueCount = max(0, QueueCount - 1),
+            State1 = State#state{
+                send_queue = NewPQ,
+                send_queue_bytes = DecrementedQueueBytes,
+                send_queue_count = DecrementedQueueCount
+            },
             case send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State1) of
                 {error, send_queue_full} ->
                     ?LOG_WARNING(
@@ -7020,17 +7095,39 @@ send_keep_alive_ping(State) ->
 %%====================================================================
 
 %% Set PTO timer based on current loss state
-%% Uses unique reference in message to detect stale timer events
-set_pto_timer(#state{loss_state = LossState, pto_timer = OldTimer} = State) ->
-    cancel_timer(OldTimer),
+%% Uses unique reference in message to detect stale timer events.
+%% Skips the cancel + reschedule cycle when the timer is already armed
+%% and the new deadline is within ?PTO_RESET_TOLERANCE_MS of the existing
+%% one; this eliminates most per-ACK timer churn in steady-state bulk
+%% transfers where bytes_in_flight and smoothed RTT are stable.
+set_pto_timer(
+    #state{
+        loss_state = LossState,
+        pto_timer = OldTimer,
+        pto_scheduled_at = OldDeadline
+    } = State
+) ->
     case quic_loss:bytes_in_flight(LossState) > 0 of
         true ->
             PTO = quic_loss:get_pto(LossState),
-            Ref = make_ref(),
-            erlang:send_after(PTO, self(), {pto_timeout, Ref}),
-            State#state{pto_timer = Ref};
+            Now = erlang:monotonic_time(millisecond),
+            NewDeadline = Now + PTO,
+            Stable =
+                (OldTimer =/= undefined) andalso
+                    (OldDeadline =/= undefined) andalso
+                    (abs(NewDeadline - OldDeadline) < ?PTO_RESET_TOLERANCE_MS),
+            case Stable of
+                true ->
+                    State;
+                false ->
+                    cancel_timer(OldTimer),
+                    Ref = make_ref(),
+                    erlang:send_after(PTO, self(), {pto_timeout, Ref}),
+                    State#state{pto_timer = Ref, pto_scheduled_at = NewDeadline}
+            end;
         false ->
-            State#state{pto_timer = undefined}
+            cancel_timer(OldTimer),
+            State#state{pto_timer = undefined, pto_scheduled_at = undefined}
     end.
 
 %% Helper to cancel a timer reference
@@ -7039,20 +7136,20 @@ cancel_timer(Ref) -> erlang:cancel_timer(Ref).
 
 %% Handle pacing timeout - drain queued data
 %% Note: pacing_timer is already set to undefined by the handler before calling this
-handle_pacing_timeout(#state{send_queue = PQ} = State) ->
-    ?LOG_DEBUG(#{what => pacing_timeout_fired, queue_empty => pqueue_is_empty(PQ)}, ?QUIC_LOG_META),
-    %% Check if there's queued data
-    case pqueue_is_empty(PQ) of
-        true ->
-            State;
-        false ->
-            %% Process the send queue
-            State1 = process_send_queue(State),
-            %% If there's still queued data and pacing is blocking, set another timer
-            State2 = maybe_reschedule_pacing(State1),
-            %% Event-driven flush: flush batch and timers after pacing timeout processing
-            flush_dirty_timers(flush_socket_batch(State2))
-    end.
+%% Fast path: send_queue_count == 0 implies queue is empty, avoiding the
+%% O(8) bucket walk in pqueue_is_empty/1. Byte count is NOT safe here
+%% because zero-byte FIN-only entries can sit in the queue with bytes=0.
+handle_pacing_timeout(#state{send_queue_count = 0} = State) ->
+    ?LOG_DEBUG(#{what => pacing_timeout_fired, queue_empty => true}, ?QUIC_LOG_META),
+    State;
+handle_pacing_timeout(State) ->
+    ?LOG_DEBUG(#{what => pacing_timeout_fired, queue_empty => false}, ?QUIC_LOG_META),
+    %% Process the send queue
+    State1 = process_send_queue(State),
+    %% If there's still queued data and pacing is blocking, set another timer
+    State2 = maybe_reschedule_pacing(State1),
+    %% Event-driven flush: flush batch and timers after pacing timeout processing
+    flush_dirty_timers(flush_socket_batch(State2)).
 
 %% Check if we need to reschedule pacing timer after processing queue
 maybe_reschedule_pacing(#state{send_queue = PQ, cc_state = CCState, pacing_enabled = true} = State) ->
@@ -7162,6 +7259,7 @@ state_to_map(#state{} = S) ->
         data_sent => S#state.data_sent,
         data_received => S#state.data_received,
         send_queue_bytes => S#state.send_queue_bytes,
+        send_queue_count => S#state.send_queue_count,
         recv_buffer_bytes => S#state.recv_buffer_bytes,
         max_data_local => S#state.max_data_local,
         fc_last_stream_update => S#state.fc_last_stream_update,
@@ -8746,5 +8844,73 @@ test_complete_migration(Owner, OldPath, NewPath) ->
         {quic, _, {path_changed, _, _}} -> {ok, notified}
     after 0 ->
         {ok, not_notified}
+    end.
+
+%% Exercise dequeue_small_stream_frame_tuple/1 on a crafted #state{} that
+%% has a single small stream frame queued, and return the resulting
+%% counters. Used by the regression test for the coalesce-path
+%% accounting fix.
+-spec test_coalesce_small_stream(non_neg_integer()) ->
+    #{
+        dequeued := boolean(),
+        send_queue_bytes := non_neg_integer(),
+        send_queue_count := non_neg_integer(),
+        send_queue_version := non_neg_integer()
+    }.
+%% Regression helper: simulate an empty FIN-only send (iodata <<>>,
+%% Fin=true) that was queued while the connection was pacing/cwnd-blocked.
+%% Demonstrates why the fast-path emptiness check must use
+%% send_queue_count and not send_queue_bytes: with a FIN-only entry
+%% present, send_queue_bytes is 0 but the queue is non-empty.
+-spec test_zero_byte_fin_in_queue() ->
+    #{
+        empty_by_count := boolean(),
+        empty_by_bytes := boolean(),
+        queue_empty := boolean()
+    }.
+test_zero_byte_fin_in_queue() ->
+    Entry = {stream_data, 0, 0, <<>>, true, 0},
+    PQ = pqueue_in(Entry, 3, empty_pqueue()),
+    State = #state{
+        send_queue = PQ,
+        send_queue_bytes = 0,
+        send_queue_count = 1,
+        send_queue_version = 1
+    },
+    #{
+        empty_by_count => (State#state.send_queue_count =:= 0),
+        empty_by_bytes => (State#state.send_queue_bytes =:= 0),
+        queue_empty => pqueue_is_empty(State#state.send_queue)
+    }.
+
+test_coalesce_small_stream(DataSize) when DataSize < ?SMALL_FRAME_THRESHOLD ->
+    Data = binary:copy(<<0>>, DataSize),
+    Entry = {stream_data, 0, 0, Data, false, DataSize},
+    PQ = pqueue_in(Entry, 3, empty_pqueue()),
+    State0 = #state{
+        send_queue = PQ,
+        send_queue_bytes = DataSize,
+        send_queue_count = 1,
+        send_queue_version = 1
+    },
+    case dequeue_small_stream_frame_tuple(State0) of
+        {ok, _FrameTuple, #state{
+            send_queue_bytes = NewBytes,
+            send_queue_count = NewCount,
+            send_queue_version = NewVersion
+        }} ->
+            #{
+                dequeued => true,
+                send_queue_bytes => NewBytes,
+                send_queue_count => NewCount,
+                send_queue_version => NewVersion
+            };
+        none ->
+            #{
+                dequeued => false,
+                send_queue_bytes => DataSize,
+                send_queue_count => 1,
+                send_queue_version => 1
+            }
     end.
 -endif.

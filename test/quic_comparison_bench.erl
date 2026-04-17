@@ -5,10 +5,23 @@
 %%% Compares throughput across erlang_quic, quiche, and quic-go with
 %%% web-typical transfer sizes in both directions.
 %%%
+%%% Two methodologies are exposed:
+%%%
+%%%   run/0,1 - Per-connection: each iteration opens a fresh connection,
+%%%             so small-size results are dominated by handshake cost.
+%%%
+%%%   run_persistent/0,1 - Persistent-connection: one connection per
+%%%             (implementation, direction, size) test, reused across
+%%%             iterations via separate streams. Excludes handshake cost
+%%%             from the measured duration and amortises setup over N
+%%%             iterations, giving a cleaner steady-state transport
+%%%             throughput number.
+%%%
 %%% Usage:
-%%%   quic_comparison_bench:run().              % Run with defaults
-%%%   quic_comparison_bench:run(#{sizes => [1024, 10240]}).  % Custom sizes
-%%%   quic_comparison_bench:run(#{iterations => 10}).  % More iterations
+%%%   quic_comparison_bench:run().
+%%%   quic_comparison_bench:run_persistent().
+%%%   quic_comparison_bench:run_persistent(#{sizes => [1024, 10240]}).
+%%%   quic_comparison_bench:run_persistent(#{iterations => 20}).
 %%%
 %%% Prerequisites:
 %%%   docker compose -f docker/docker-compose.bench.yml up -d
@@ -17,7 +30,9 @@
 
 -export([
     run/0,
-    run/1
+    run/1,
+    run_persistent/0,
+    run_persistent/1
 ]).
 
 -include("quic.hrl").
@@ -69,6 +84,39 @@ run(Opts) ->
     stop_erlang_server(ErlangServer),
 
     %% Print results
+    print_results(Results, Sizes, Directions),
+
+    ok.
+
+%% @doc Run persistent-connection throughput benchmark with defaults.
+-spec run_persistent() -> ok.
+run_persistent() ->
+    run_persistent(#{}).
+
+%% @doc Run persistent-connection throughput benchmark with custom options.
+%% One connection is opened per (implementation, direction, size) and reused
+%% across Iterations via separate streams. A warm-up iteration is performed
+%% before timing to avoid cold-start (slow-start) effects. Total bytes over
+%% the timed window are divided by its duration to report MB/s.
+-spec run_persistent(map()) -> ok.
+run_persistent(Opts) ->
+    application:ensure_all_started(quic),
+
+    Sizes = maps:get(sizes, Opts, ?DEFAULT_SIZES),
+    Iterations = maps:get(iterations, Opts, ?DEFAULT_ITERATIONS),
+    Directions = maps:get(directions, Opts, [upload, download]),
+
+    io:format("~n=== QUIC Persistent-Connection Throughput ===~n"),
+    io:format("Sizes: ~s~n", [string:join([format_size(S) || S <- Sizes], ", ")]),
+    io:format("Iterations: ~p (streams reused on one connection)~n", [Iterations]),
+    io:format("~n"),
+
+    {ok, ErlangServer} = start_erlang_server(?DEFAULT_ERLANG_PORT),
+
+    Results = run_all_persistent(Sizes, Iterations, Directions),
+
+    stop_erlang_server(ErlangServer),
+
     print_results(Results, Sizes, Directions),
 
     ok.
@@ -184,6 +232,116 @@ run_single_iteration(Host, Port, ClientOpts, Size, Direction) ->
             Result;
         {error, Reason} ->
             {error, {connect_failed, Reason}}
+    end.
+
+run_all_persistent(Sizes, Iterations, Directions) ->
+    Implementations = [
+        {erlang, "127.0.0.1", ?DEFAULT_ERLANG_PORT},
+        {quiche, ?QUICHE_HOST, ?QUICHE_PORT},
+        {quic_go, ?QUIC_GO_HOST, ?QUIC_GO_PORT}
+    ],
+
+    lists:foldl(
+        fun({Name, Host, Port}, Acc) ->
+            io:format("Testing ~p (~s:~p)...~n", [Name, Host, Port]),
+            ImplResults = run_impl_persistent(Host, Port, Sizes, Iterations, Directions),
+            maps:put(Name, ImplResults, Acc)
+        end,
+        #{},
+        Implementations
+    ).
+
+run_impl_persistent(Host, Port, Sizes, Iterations, Directions) ->
+    lists:foldl(
+        fun(Direction, Acc) ->
+            DirResults = lists:foldl(
+                fun(Size, DAcc) ->
+                    io:format("  ~s ~s... ", [Direction, format_size(Size)]),
+                    case run_persistent_benchmark(Host, Port, Size, Direction, Iterations) of
+                        {ok, MBps} ->
+                            io:format("~.2f MB/s~n", [MBps]),
+                            maps:put(Size, MBps, DAcc);
+                        {error, Reason} ->
+                            io:format("ERROR: ~p~n", [Reason]),
+                            maps:put(Size, error, DAcc)
+                    end
+                end,
+                #{},
+                Sizes
+            ),
+            maps:put(Direction, DirResults, Acc)
+        end,
+        #{},
+        Directions
+    ).
+
+run_persistent_benchmark(Host, Port, Size, Direction, Iterations) ->
+    FlowWindow = 16777216,
+    ClientOpts = #{
+        alpn => [<<"bench">>],
+        recbuf => 7340032,
+        sndbuf => 7340032,
+        max_data => FlowWindow,
+        max_stream_data_bidi_local => FlowWindow,
+        max_stream_data_bidi_remote => FlowWindow,
+        max_stream_data_uni => FlowWindow
+    },
+
+    case quic:connect(Host, Port, ClientOpts, self()) of
+        {ok, Conn} ->
+            Result =
+                try
+                    receive
+                        {quic, Conn, {connected, _Info}} -> ok
+                    after 5000 ->
+                        throw({error, connect_timeout})
+                    end,
+
+                    %% Warm-up iteration (not timed) to avoid slow-start
+                    %% effects on the first stream of the connection.
+                    case transfer_once(Conn, Size, Direction) of
+                        ok -> ok;
+                        {error, WErr} -> throw({error, {warmup, WErr}})
+                    end,
+
+                    Start = erlang:monotonic_time(microsecond),
+                    lists:foreach(
+                        fun(_) ->
+                            case transfer_once(Conn, Size, Direction) of
+                                ok -> ok;
+                                {error, Err} -> throw({error, Err})
+                            end
+                        end,
+                        lists:seq(1, Iterations)
+                    ),
+                    End = erlang:monotonic_time(microsecond),
+                    Duration = max(1, End - Start),
+                    Total = Size * Iterations,
+                    MBps = (Total / 1048576) / (Duration / 1000000),
+                    {ok, MBps}
+                catch
+                    throw:Err -> Err
+                after
+                    quic:close(Conn)
+                end,
+            Result;
+        {error, Reason} ->
+            {error, {connect_failed, Reason}}
+    end.
+
+transfer_once(Conn, Size, upload) ->
+    {ok, StreamId} = quic:open_stream(Conn),
+    Data = crypto:strong_rand_bytes(Size),
+    ok = quic:send_data(Conn, StreamId, Data, true),
+    wait_for_completion(Conn, StreamId, 30000);
+transfer_once(Conn, Size, download) ->
+    {ok, StreamId} = quic:open_stream(Conn),
+    SizeReq = <<Size:64/big-unsigned-integer>>,
+    ok = quic:send_data(Conn, StreamId, SizeReq, true),
+    Timeout = max(60000, Size div 1000),
+    case wait_for_data(Conn, StreamId, Size, Timeout) of
+        {ok, _} -> ok;
+        Err -> Err
     end.
 
 run_upload(Conn, StreamId, Size) ->
