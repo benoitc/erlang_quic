@@ -717,17 +717,17 @@ flush_gso(
         gso_size = SegmentSize
     } = State
 ) ->
-    %% Combine all packets into a single super-datagram
-    %% Packets are in reverse order, so reverse them first
-    %% Normalize packet_view to binary for GSO (kernel needs contiguous buffer)
+    %% Pass the batch as a multi-iov to socket:sendmsg/2. The kernel
+    %% treats concatenated iov buffers as a single logical payload and
+    %% segments at SegmentSize byte boundaries via the UDP_SEGMENT
+    %% cmsg, so the wire bytes are identical to the old flatten-first
+    %% shape. We save a full user-space copy per flush (up to ~76 KB
+    %% at a 64-packet batch of 1200-byte segments).
     Packets = lists:reverse(Buffer),
-    PacketBins = [normalize_packet(P) || P <- Packets],
-    CombinedData = iolist_to_binary(PacketBins),
-
-    %% Build sendmsg with GSO control message
+    PacketIov = [normalize_packet(P) || P <- Packets],
     Msg = #{
         addr => #{family => family(IP), addr => IP, port => Port},
-        iov => [CombinedData],
+        iov => PacketIov,
         ctrl => [#{level => udp, type => ?UDP_SEGMENT, data => <<SegmentSize:16/native>>}]
     },
 
@@ -735,11 +735,13 @@ flush_gso(
         ok ->
             {ok, record_flush(State)};
         {ok, RestData} ->
-            %% Partial send - GSO didn't send all data
+            %% Partial send - GSO didn't send all data.
+            TotalBytes = iolist_size(PacketIov),
+            Remaining = iolist_size(RestData),
             ?LOG_WARNING(#{
                 what => gso_partial_send,
-                sent => byte_size(CombinedData) - iolist_size(RestData),
-                remaining => iolist_size(RestData)
+                sent => TotalBytes - Remaining,
+                remaining => Remaining
             }),
             %% Disable GSO and retry remaining data individually. The
             %% retry path accounts for the coalesced packets itself, so
