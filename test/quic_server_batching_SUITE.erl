@@ -275,14 +275,14 @@ run_download(#{name := Name, port := Port}, Size) ->
         %% trivially pass. Taking a before/after delta scopes the
         %% assertion to the download-path traffic only.
         ServerPid = server_connection_pid(Name),
-        {ok, Before} = quic:get_stats(ServerPid),
+        {ok, Before} = poll_stats(ServerPid),
 
         {ok, StreamId} = quic:open_stream(Conn),
         Request = <<Size:64/big-unsigned-integer>>,
         ok = quic:send_data(Conn, StreamId, Request, true),
         Received = collect_stream_data(Conn, StreamId, <<>>),
 
-        {ok, After} = quic:get_stats(ServerPid),
+        {ok, After} = poll_stats(ServerPid),
         {Received, stats_delta(After, Before)}
     after
         quic:close(Conn)
@@ -302,6 +302,26 @@ stats_delta(After, Before) ->
          || K <- [packets_sent, batch_flushes, packets_coalesced]
         ]
     ).
+
+%% Retry get_stats while the server connection is still transitioning
+%% out of idle. The client sees {connected, _} before the server
+%% gen_statem finishes its side of the handshake, so a fresh
+%% get_stats can briefly return {error, {invalid_state, idle}}.
+poll_stats(Pid) ->
+    poll_stats(Pid, 200).
+
+poll_stats(_Pid, 0) ->
+    {error, stats_timeout};
+poll_stats(Pid, N) ->
+    case quic:get_stats(Pid) of
+        {ok, _} = R ->
+            R;
+        {error, {invalid_state, _}} ->
+            timer:sleep(5),
+            poll_stats(Pid, N - 1);
+        {error, _} = Err ->
+            Err
+    end.
 
 collect_stream_data(Conn, StreamId, Acc) ->
     receive
