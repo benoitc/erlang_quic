@@ -561,7 +561,12 @@ bind_and_finalize_socket(Socket, Port, BatchConfig) ->
     end.
 
 build_socket_state(Socket, BatchConfig) ->
-    GSOEnabled = maybe_enable_gso(Socket, BatchConfig),
+    %% GSO is applied per-message via the UDP_SEGMENT cmsg in
+    %% flush_gso/1, never as a socket-level setsockopt. A socket-level
+    %% UDP_SEGMENT would force GSO segmentation on every outbound
+    %% datagram including the short handshake packets and fallback
+    %% sends, which stalled the handshake on ubuntu-24.04.
+    GSOEnabled = maps:get(gso_supported, BatchConfig, false),
     GROEnabled = maybe_enable_gro(Socket, BatchConfig),
     State = #socket_state{
         socket = Socket,
@@ -574,9 +579,10 @@ build_socket_state(Socket, BatchConfig) ->
     },
     {ok, State}.
 
+%% Retained for open_server_send's separate-socket path, which still
+%% uses a dedicated socket where a socket-level UDP_SEGMENT is safe
+%% (it is a send-only socket, never used for short handshake packets).
 maybe_enable_gso(Socket, #{gso_supported := true, gso_size := Size}) ->
-    %% UDP_SEGMENT setsockopt expects sizeof(int); the cmsg variant
-    %% (see flush path) is the one that takes u16.
     case socket:setopt_native(Socket, {udp, ?UDP_SEGMENT}, <<Size:32/native>>) of
         ok -> true;
         {error, _} -> false
