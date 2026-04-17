@@ -56,6 +56,10 @@
     code_change/3
 ]).
 
+-ifdef(TEST).
+-export([send_packet/6]).
+-endif.
+
 -include("quic.hrl").
 -include_lib("kernel/include/logger.hrl").
 -define(QUIC_LOG_META, #{
@@ -941,16 +945,44 @@ validate_initial_token(Secret, Token, Addr, ExpectedODCID, MaxAge) ->
 %% Send a packet using the appropriate backend.
 %% Listener self-sends are one-shot control-plane packets (version
 %% negotiation, retry, stateless reset) that never benefit from
-%% batching. Use send_immediate/4 so the returned state (which has
-%% the listener's batch buffer updated) does not need to be
-%% persisted back on #listener_state{}; before, send/4's returned
-%% state was dropped on the floor and the packet was lost when
-%% batching_enabled was true on the socket backend.
+%% batching. Uses send_immediate/4 on the socket backend to bypass the
+%% batch buffer entirely. Both branches return ok | {error, Reason} and
+%% log the error at WARNING level so operators see it even when the
+%% Retry / Stateless Reset call sites discard the return value.
 send_packet(_Socket, SocketState, socket, IP, Port, Packet) when SocketState =/= undefined ->
-    _ = quic_socket:send_immediate(SocketState, IP, Port, Packet),
-    ok;
+    case quic_socket:send_immediate(SocketState, IP, Port, Packet) of
+        {ok, _} ->
+            ok;
+        {error, Reason} = Err ->
+            ?LOG_WARNING(
+                #{
+                    what => listener_send_failed,
+                    backend => socket,
+                    reason => Reason,
+                    peer => {IP, Port},
+                    size => iolist_size(Packet)
+                },
+                ?QUIC_LOG_META
+            ),
+            Err
+    end;
 send_packet(Socket, _SocketState, gen_udp, IP, Port, Packet) ->
-    gen_udp:send(Socket, IP, Port, Packet).
+    case gen_udp:send(Socket, IP, Port, Packet) of
+        ok ->
+            ok;
+        {error, Reason} = Err ->
+            ?LOG_WARNING(
+                #{
+                    what => listener_send_failed,
+                    backend => gen_udp,
+                    reason => Reason,
+                    peer => {IP, Port},
+                    size => iolist_size(Packet)
+                },
+                ?QUIC_LOG_META
+            ),
+            Err
+    end.
 
 %% Check if a packet might be a stateless reset
 %% RFC 9000 Section 10.3: A reset looks like a short header packet

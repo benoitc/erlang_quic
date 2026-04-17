@@ -297,9 +297,21 @@ run_persistent_benchmark(Host, Port, Size, Direction, Iterations) ->
                         throw({error, connect_timeout})
                     end,
 
+                    %% Pre-generate the upload payload ONCE, outside
+                    %% the timed window. crypto:strong_rand_bytes/1
+                    %% used to run per-iteration inside the timing
+                    %% loop; a constant fill is sufficient for
+                    %% throughput measurement and keeps the window
+                    %% transport-only.
+                    UploadPayload =
+                        case Direction of
+                            upload -> binary:copy(<<16#42>>, Size);
+                            download -> undefined
+                        end,
+
                     %% Warm-up iteration (not timed) to avoid slow-start
                     %% effects on the first stream of the connection.
-                    case transfer_once(Conn, Size, Direction) of
+                    case transfer_once(Conn, Size, Direction, UploadPayload) of
                         ok -> ok;
                         {error, WErr} -> throw({error, {warmup, WErr}})
                     end,
@@ -307,7 +319,7 @@ run_persistent_benchmark(Host, Port, Size, Direction, Iterations) ->
                     Start = erlang:monotonic_time(microsecond),
                     lists:foreach(
                         fun(_) ->
-                            case transfer_once(Conn, Size, Direction) of
+                            case transfer_once(Conn, Size, Direction, UploadPayload) of
                                 ok -> ok;
                                 {error, Err} -> throw({error, Err})
                             end
@@ -329,12 +341,11 @@ run_persistent_benchmark(Host, Port, Size, Direction, Iterations) ->
             {error, {connect_failed, Reason}}
     end.
 
-transfer_once(Conn, Size, upload) ->
+transfer_once(Conn, _Size, upload, Payload) when is_binary(Payload) ->
     {ok, StreamId} = quic:open_stream(Conn),
-    Data = crypto:strong_rand_bytes(Size),
-    ok = quic:send_data(Conn, StreamId, Data, true),
+    ok = quic:send_data(Conn, StreamId, Payload, true),
     wait_for_completion(Conn, StreamId, 30000);
-transfer_once(Conn, Size, download) ->
+transfer_once(Conn, Size, download, _Payload) ->
     {ok, StreamId} = quic:open_stream(Conn),
     SizeReq = <<Size:64/big-unsigned-integer>>,
     ok = quic:send_data(Conn, StreamId, SizeReq, true),

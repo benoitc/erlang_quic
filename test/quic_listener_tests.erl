@@ -6,6 +6,10 @@
 
 -module(quic_listener_tests).
 
+%% Logger handler callback for the send_packet error-visibility tests.
+%% Referenced via `?MODULE' in logger:add_handler/3.
+-export([log/2]).
+
 -include_lib("eunit/include/eunit.hrl").
 -include("quic.hrl").
 
@@ -290,3 +294,69 @@ cleanup_connection_match_spec_variants_test() ->
     %% Cleanup
     Pid ! stop,
     ets:delete(Conns).
+
+%%====================================================================
+%% send_packet/6 error handling + logger visibility
+%%====================================================================
+
+%% Minimal logger handler that forwards only the listener_send_failed
+%% report to the configured pid. Any other log event is silently
+%% ignored so the test process mailbox is not polluted by unrelated
+%% warnings from concurrent eunit tests.
+log(
+    #{level := warning, msg := {report, #{what := listener_send_failed} = R}},
+    #{config := #{pid := Pid}}
+) ->
+    Pid ! {listener_send_failed, R};
+log(_Event, _Config) ->
+    ok.
+
+install_capture() ->
+    Id = list_to_atom(
+        "quic_listener_capture_" ++
+            integer_to_list(erlang:unique_integer([positive, monotonic]))
+    ),
+    ok = logger:add_handler(Id, ?MODULE, #{
+        level => warning,
+        config => #{pid => self()}
+    }),
+    Id.
+
+remove_capture(Id) ->
+    logger:remove_handler(Id).
+
+wait_for_listener_warning(Timeout) ->
+    receive
+        {listener_send_failed, R} -> {ok, R}
+    after Timeout ->
+        timeout
+    end.
+
+send_packet_gen_udp_surfaces_and_logs_error_test() ->
+    Id = install_capture(),
+    try
+        {ok, Sock} = gen_udp:open(0, [binary, {active, false}]),
+        ok = gen_udp:close(Sock),
+        Result = quic_listener:send_packet(
+            Sock, undefined, gen_udp, {127, 0, 0, 1}, 65535, <<"x">>
+        ),
+        ?assertMatch({error, _}, Result),
+        ?assertMatch({ok, #{backend := gen_udp}}, wait_for_listener_warning(1000))
+    after
+        remove_capture(Id)
+    end.
+
+send_packet_socket_backend_surfaces_and_logs_error_test() ->
+    Id = install_capture(),
+    try
+        {ok, Raw} = socket:open(inet, dgram, udp),
+        {ok, State} = quic_socket:new_sender(Raw, #{backend => socket}),
+        ok = socket:close(Raw),
+        Result = quic_listener:send_packet(
+            undefined, State, socket, {127, 0, 0, 1}, 65535, <<"x">>
+        ),
+        ?assertMatch({error, _}, Result),
+        ?assertMatch({ok, #{backend := socket}}, wait_for_listener_warning(1000))
+    after
+        remove_capture(Id)
+    end.

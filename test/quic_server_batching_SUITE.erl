@@ -78,20 +78,26 @@ end_per_testcase(_TestCase, _Config) ->
 server_download_coalesces_by_default(Config) ->
     {ok, Srv} = start_download_server(#{}),
     try
-        {Received, ServerStats} = run_download(Srv, ?DOWNLOAD_SIZE),
+        {Received, Delta} = run_download(Srv, ?DOWNLOAD_SIZE),
 
         ?assertEqual(?DOWNLOAD_SIZE, byte_size(Received)),
 
-        Flushes = maps:get(batch_flushes, ServerStats),
-        Coalesced = maps:get(packets_coalesced, ServerStats),
-        ct:log("server batch stats: flushes=~p coalesced=~p", [Flushes, Coalesced]),
+        Flushes = maps:get(batch_flushes, Delta),
+        Coalesced = maps:get(packets_coalesced, Delta),
+        PacketsSent = maps:get(packets_sent, Delta),
+        ct:log(
+            "download delta: flushes=~p coalesced=~p packets_sent=~p",
+            [Flushes, Coalesced, PacketsSent]
+        ),
 
-        %% Must have at least one successful flush and the batch must
-        %% have coalesced more than one packet somewhere along the way.
+        %% Download produced real server -> client traffic.
         ?assert(Flushes >= 1),
-        ?assert(Coalesced > 1),
-        %% Sanity: total coalesced cannot exceed total packets sent.
-        PacketsSent = maps:get(packets_sent, ServerStats),
+        ?assert(PacketsSent > 1),
+        %% Strict: any single-packet-only flush pattern would give
+        %% Coalesced == Flushes. Coalesced > Flushes proves at least one
+        %% flush combined multiple packets on the download path.
+        ?assert(Coalesced > Flushes),
+        %% Sanity: never claim more coalesced than actually sent.
         ?assert(Coalesced =< PacketsSent)
     after
         stop_server(Srv)
@@ -105,12 +111,16 @@ server_download_coalesces_by_default(Config) ->
 server_download_no_batching_when_disabled(Config) ->
     {ok, Srv} = start_download_server(#{server_send_batching => false}),
     try
-        {Received, ServerStats} = run_download(Srv, ?DOWNLOAD_SIZE),
+        {Received, Delta} = run_download(Srv, ?DOWNLOAD_SIZE),
 
         ?assertEqual(?DOWNLOAD_SIZE, byte_size(Received)),
 
-        ?assertEqual(0, maps:get(batch_flushes, ServerStats)),
-        ?assertEqual(0, maps:get(packets_coalesced, ServerStats))
+        %% Data actually flowed on the download path before we assert
+        %% the counters stayed at zero (otherwise the zeros would be
+        %% trivial).
+        ?assert(maps:get(packets_sent, Delta) > 1),
+        ?assertEqual(0, maps:get(batch_flushes, Delta)),
+        ?assertEqual(0, maps:get(packets_coalesced, Delta))
     after
         stop_server(Srv)
     end,
@@ -123,14 +133,17 @@ opt_out_still_completes_transfer(Config) ->
     {ok, Srv} = start_download_server(#{server_send_batching => false}),
     try
         Size = ?DOWNLOAD_SIZE,
-        {Received, _Stats} = run_download(Srv, Size),
+        {Received, Delta} = run_download(Srv, Size),
         ?assertEqual(Size, byte_size(Received)),
         %% Spot-check payload integrity: every byte should be 0x42 per
         %% send_download/3. Verify a sample of bytes rather than the
         %% whole buffer to keep the failure message small.
         ?assertEqual(<<16#42>>, binary:part(Received, 0, 1)),
         ?assertEqual(<<16#42>>, binary:part(Received, Size - 1, 1)),
-        ?assertEqual(<<16#42>>, binary:part(Received, Size div 2, 1))
+        ?assertEqual(<<16#42>>, binary:part(Received, Size div 2, 1)),
+        %% Opt-out path is actually the direct-send path, not batched.
+        ?assertEqual(0, maps:get(batch_flushes, Delta)),
+        ?assertEqual(0, maps:get(packets_coalesced, Delta))
     after
         stop_server(Srv)
     end,
@@ -149,27 +162,28 @@ server_download_uses_gso_on_linux(Config) ->
         true ->
             {ok, Srv} = start_download_server(#{socket_backend => socket}),
             try
-                {Received, ServerStats} = run_download(Srv, ?DOWNLOAD_SIZE),
+                {Received, Delta} = run_download(Srv, ?DOWNLOAD_SIZE),
                 ?assertEqual(?DOWNLOAD_SIZE, byte_size(Received)),
 
-                {ok, ConnPids} = quic:get_server_connections(maps:get(name, Srv)),
-                [ServerPid | _] = lists:usort(ConnPids),
+                ServerPid = server_connection_pid(maps:get(name, Srv)),
                 {_State, Info} = quic_connection:get_state(ServerPid),
                 ?assertEqual(true, maps:get(send_gso_supported, Info)),
 
-                Flushes = maps:get(batch_flushes, ServerStats),
-                Coalesced = maps:get(packets_coalesced, ServerStats),
+                Flushes = maps:get(batch_flushes, Delta),
+                Coalesced = maps:get(packets_coalesced, Delta),
                 Ratio =
                     case Flushes of
                         0 -> 0.0;
                         _ -> Coalesced / Flushes
                     end,
                 ct:log(
-                    "GSO stats: flushes=~p coalesced=~p ratio=~.2f",
+                    "GSO delta: flushes=~p coalesced=~p ratio=~.2f",
                     [Flushes, Coalesced, float(Ratio)]
                 ),
-                %% Real coalescing means average batch size > 1. A
-                %% per-packet flush path would give ratio == 1.
+                %% On Linux + GSO the download-path batches should
+                %% coalesce significantly. A ratio > 1.5 proves real
+                %% coalescing on top of the Coalesced > Flushes check.
+                ?assert(Coalesced > Flushes),
                 ?assert(Ratio > 1.5)
             after
                 stop_server(Srv)
@@ -253,20 +267,41 @@ run_download(#{name := Name, port := Port}, Size) ->
         after ?REQUEST_TIMEOUT_MS ->
             error(connect_timeout)
         end,
+
+        %% Snapshot baseline stats on the server connection BEFORE the
+        %% download request. Using the post-transfer lifetime counters
+        %% would fold in handshake traffic (handshake alone can produce
+        %% coalesced > 1, flushes > 1), making any coalescing assertion
+        %% trivially pass. Taking a before/after delta scopes the
+        %% assertion to the download-path traffic only.
+        ServerPid = server_connection_pid(Name),
+        {ok, Before} = quic:get_stats(ServerPid),
+
         {ok, StreamId} = quic:open_stream(Conn),
         Request = <<Size:64/big-unsigned-integer>>,
         ok = quic:send_data(Conn, StreamId, Request, true),
         Received = collect_stream_data(Conn, StreamId, <<>>),
 
-        %% Find the server-side connection pid; register has both DCID
-        %% and SCID mapped to the same pid, so usort collapses to one.
-        {ok, ConnPids} = quic:get_server_connections(Name),
-        [ServerPid | _] = lists:usort(ConnPids),
-        {ok, Stats} = quic:get_stats(ServerPid),
-        {Received, Stats}
+        {ok, After} = quic:get_stats(ServerPid),
+        {Received, stats_delta(After, Before)}
     after
         quic:close(Conn)
     end.
+
+server_connection_pid(Name) ->
+    {ok, ConnPids} = quic:get_server_connections(Name),
+    %% register has both DCID and SCID mapped to the same pid, so
+    %% usort collapses the list to one entry per connection.
+    [Pid | _] = lists:usort(ConnPids),
+    Pid.
+
+stats_delta(After, Before) ->
+    maps:from_list(
+        [
+            {K, maps:get(K, After, 0) - maps:get(K, Before, 0)}
+         || K <- [packets_sent, batch_flushes, packets_coalesced]
+        ]
+    ).
 
 collect_stream_data(Conn, StreamId, Acc) ->
     receive
