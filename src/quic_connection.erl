@@ -860,12 +860,12 @@ init({server, Opts}) ->
     %% Get idle timeout for keep-alive calculation
     IdleTimeout = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
 
-    %% Query local address from socket (fix for #27)
-    LocalAddr =
-        case inet:sockname(Socket) of
-            {ok, Sockname} -> Sockname;
-            {error, _} -> undefined
-        end,
+    %% Query local address from socket (fix for #27).
+    %% When the listener runs with socket_backend => socket, the handle
+    %% is a `{'$socket', Ref}' from the OTP socket module and
+    %% `inet:sockname/1' crashes with function_clause. Branch on the
+    %% handle shape to use the right API.
+    LocalAddr = query_local_addr(Socket),
 
     %% Server connections use the listener's shared socket for sending.
     %% This matches standard QUIC implementations (quic-go, quiche) where
@@ -7241,6 +7241,21 @@ set_idle_timer(#state{idle_timeout = Timeout, idle_timer = OldTimer} = State) ->
 %% Calculate keep-alive interval from options and idle timeout
 %% Default: disabled (opt-in to preserve idle_timeout semantics)
 %% Set to 'auto' for half of idle timeout, or specify explicit interval
+%% Query the local address for either a gen_udp port or an OTP
+%% socket handle ({'$socket', Ref}). inet:sockname/1 only accepts
+%% the gen_udp port shape, socket:sockname/1 the other. Returns
+%% undefined if neither succeeds.
+query_local_addr({'$socket', _} = Socket) ->
+    case socket:sockname(Socket) of
+        {ok, #{addr := IP, port := Port}} -> {IP, Port};
+        {error, _} -> undefined
+    end;
+query_local_addr(Socket) ->
+    case inet:sockname(Socket) of
+        {ok, Sockname} -> Sockname;
+        {error, _} -> undefined
+    end.
+
 calculate_keep_alive_interval(Opts, IdleTimeout) ->
     case maps:get(keep_alive_interval, Opts, disabled) of
         disabled -> disabled;
