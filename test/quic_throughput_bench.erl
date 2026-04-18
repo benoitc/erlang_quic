@@ -78,6 +78,8 @@ run_download_sink(Opts) ->
         MBps = (byte_size(Received) / 1048576) / (Duration / 1000000),
         Flushes = maps:get(batch_flushes, ServerStats),
         Coalesced = maps:get(packets_coalesced, ServerStats),
+        AckSent = maps:get(ack_sent, ServerStats, 0),
+        Retransmits = maps:get(retransmits, ServerStats, 0),
         Ratio =
             case Flushes of
                 0 -> 0.0;
@@ -85,14 +87,17 @@ run_download_sink(Opts) ->
             end,
 
         io:format(
-            "Download ~.2f MB: ~.2f MB/s (~p ms) flushes=~p coalesced=~p ratio=~.2f~n",
+            "Download ~.2f MB: ~.2f MB/s (~p ms) flushes=~p coalesced=~p ratio=~.2f "
+            "ack_sent=~p retransmits=~p~n",
             [
                 byte_size(Received) / 1048576,
                 MBps,
                 Duration div 1000,
                 Flushes,
                 Coalesced,
-                float(Ratio)
+                float(Ratio),
+                AckSent,
+                Retransmits
             ]
         ),
 
@@ -103,7 +108,9 @@ run_download_sink(Opts) ->
             mb_per_sec => MBps,
             batch_flushes => Flushes,
             packets_coalesced => Coalesced,
-            coalesce_ratio => Ratio
+            coalesce_ratio => Ratio,
+            ack_sent => AckSent,
+            retransmits => Retransmits
         }
     after
         catch quic_test_echo_server:stop(Srv)
