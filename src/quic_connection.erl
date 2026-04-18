@@ -497,6 +497,11 @@
     %% These count actual QUIC packets (not bytes), used by net_kernel getstat
     packets_received = 0 :: non_neg_integer(),
     packets_sent = 0 :: non_neg_integer(),
+    %% ACK packets actually emitted on the wire (Initial + Handshake + 1-RTT).
+    %% Used by benches/tests to reason about ACK-to-data ratios.
+    ack_sent = 0 :: non_neg_integer(),
+    %% Retransmission packets emitted (CC-permitted branch of loss recovery).
+    retransmits = 0 :: non_neg_integer(),
 
     %% Socket active mode - number of packets before socket goes passive
     %% Using {active, N} instead of {active, once} reduces inet:setopts overhead
@@ -1715,6 +1720,8 @@ connected(
         packets_sent = PacketsSent,
         data_received = DataRecv,
         data_sent = DataSent,
+        ack_sent = AckSent,
+        retransmits = Retransmits,
         socket_state = SocketState
     } = State
 ) ->
@@ -1727,6 +1734,8 @@ connected(
         packets_sent => PacketsSent,
         data_received => DataRecv,
         data_sent => DataSent,
+        ack_sent => AckSent,
+        retransmits => Retransmits,
         batch_flushes => Flushes,
         packets_coalesced => Coalesced
     },
@@ -2635,7 +2644,7 @@ send_initial_ack(State) ->
         Ranges ->
             %% Build ACK frame
             AckFrame = build_ack_frame(Ranges),
-            send_initial_packet(AckFrame, State)
+            send_initial_packet(AckFrame, bump_ack_sent(State))
     end.
 
 %% Send a Handshake ACK packet
@@ -2646,7 +2655,7 @@ send_handshake_ack(State) ->
             State;
         Ranges ->
             AckFrame = build_ack_frame(Ranges),
-            send_handshake_packet(AckFrame, State)
+            send_handshake_packet(AckFrame, bump_ack_sent(State))
     end.
 
 %% Send an app-level ACK packet (1-RTT)
@@ -2661,8 +2670,13 @@ send_app_ack(State) ->
             State1;
         Ranges ->
             AckFrameTuple = build_ack_frame_tuple(Ranges),
-            maybe_coalesce_ack_with_data(AckFrameTuple, State1)
+            maybe_coalesce_ack_with_data(AckFrameTuple, bump_ack_sent(State1))
     end.
+
+%% Bump the ack_sent counter. Called once per ACK packet that is about
+%% to hit the wire (after the ack_ranges non-empty check).
+bump_ack_sent(#state{ack_sent = N} = State) ->
+    State#state{ack_sent = N + 1}.
 
 %% Cancel any armed ACK timer and zero the decimation counter. Called
 %% from every 1-RTT ACK emission path.
@@ -7102,7 +7116,7 @@ filter_reset_stream_at_data(Frames, #state{streams = Streams}) ->
 %% Send frames for retransmission with congestion control check
 send_retransmit_frames_cc([], State) ->
     State;
-send_retransmit_frames_cc(Frames, #state{cc_state = CCState} = State) ->
+send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = State) ->
     %% Encode all frames and check size
     Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
     PacketSize = byte_size(Payload) + 50,
@@ -7111,7 +7125,7 @@ send_retransmit_frames_cc(Frames, #state{cc_state = CCState} = State) ->
     %% Use can_send_control to allow small overage for retransmissions
     case quic_cc:can_send_control(CCState, PacketSize) of
         true ->
-            send_app_packet_internal(Payload, Frames, State);
+            send_app_packet_internal(Payload, Frames, State#state{retransmits = R + 1});
         false ->
             %% CC doesn't allow - defer retransmission
             %% The PTO mechanism will eventually retry this data
