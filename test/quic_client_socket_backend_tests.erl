@@ -12,6 +12,9 @@
 client_socket_backend_roundtrip_test_() ->
     {timeout, 30, fun client_socket_backend_roundtrip/0}.
 
+client_socket_backend_migrate_test_() ->
+    {timeout, 30, fun client_socket_backend_migrate/0}.
+
 client_socket_backend_roundtrip() ->
     {ok, Srv} = quic_test_echo_server:start(#{
         max_data => 16 * 1024 * 1024,
@@ -37,6 +40,45 @@ client_socket_backend_roundtrip() ->
             end,
             {ok, StreamId} = quic:open_stream(Conn),
             Payload = crypto:strong_rand_bytes(64 * 1024),
+            ok = quic:send_data(Conn, StreamId, Payload, true),
+            Received = collect_echo(Conn, StreamId, <<>>, 10000),
+            ?assertEqual(Payload, Received)
+        after
+            catch quic:close(Conn)
+        end
+    after
+        quic_test_echo_server:stop(Srv)
+    end.
+
+%% Migration on the socket backend must rebind the OTP socket + its
+%% receiver process and still exchange traffic on the new path.
+client_socket_backend_migrate() ->
+    {ok, Srv} = quic_test_echo_server:start(#{
+        max_data => 16 * 1024 * 1024,
+        max_stream_data_bidi_local => 8 * 1024 * 1024,
+        max_stream_data_bidi_remote => 8 * 1024 * 1024,
+        max_stream_data_uni => 8 * 1024 * 1024
+    }),
+    try
+        #{port := Port} = Srv,
+        ClientOpts = maps:merge(quic_test_echo_server:client_opts(), #{
+            socket_backend => socket,
+            max_data => 16 * 1024 * 1024,
+            max_stream_data_bidi_local => 8 * 1024 * 1024,
+            max_stream_data_bidi_remote => 8 * 1024 * 1024,
+            max_stream_data_uni => 8 * 1024 * 1024
+        }),
+        {ok, Conn} = quic:connect("127.0.0.1", Port, ClientOpts, self()),
+        try
+            receive
+                {quic, Conn, {connected, _}} -> ok
+            after 5000 ->
+                ?assert(false)
+            end,
+            ?assertEqual(ok, quic:migrate(Conn)),
+            %% After migration the stream should still echo.
+            {ok, StreamId} = quic:open_stream(Conn),
+            Payload = crypto:strong_rand_bytes(4096),
             ok = quic:send_data(Conn, StreamId, Payload, true),
             Received = collect_echo(Conn, StreamId, <<>>, 10000),
             ?assertEqual(Payload, Received)
