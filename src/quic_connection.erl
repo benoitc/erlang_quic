@@ -161,7 +161,9 @@
     %% Test helpers for 1-RTT ACK decimation (RFC 9002 §6.2)
     test_decimate_initial_state/0,
     test_decimate_step/1,
-    test_decimate_on_timer_fire/1
+    test_decimate_on_timer_fire/1,
+    test_maybe_send_ack_app/2,
+    test_classify_recv_trigger/2
 ]).
 -endif.
 
@@ -525,6 +527,12 @@
     %% the first ack-eliciting packet in the window.
     ack_elicited_count = 0 :: non_neg_integer(),
     ack_timer = undefined :: reference() | undefined,
+    %% Transient: classification of the most recently received 1-RTT
+    %% packet. Set by `record_received_pn/3` and consumed once by
+    %% `maybe_send_ack(app, ...)` to choose between immediate ACK
+    %% (RFC 9002 §6.2 reordering recommendation) and count-based
+    %% decimation.
+    last_recv_trigger = sequential :: sequential | reordered,
 
     %% QLOG Tracing (draft-ietf-quic-qlog-quic-events)
     qlog_ctx :: #qlog_ctx{} | undefined
@@ -5261,9 +5269,13 @@ maybe_send_ack(app, Frames, State) ->
                     %% Datagram-only packets: delay up to max_ack_delay.
                     schedule_delayed_ack(app, State);
                 false ->
-                    %% Normal stream / control traffic: count-based
-                    %% decimation + max_ack_delay timer.
-                    maybe_decimate_app_ack(State)
+                    %% Normal stream / control traffic: ACK immediately when
+                    %% the last received packet was reordered (RFC 9002 §6.2);
+                    %% otherwise count-based decimation + max_ack_delay timer.
+                    case State#state.last_recv_trigger of
+                        reordered -> send_app_ack(State);
+                        sequential -> maybe_decimate_app_ack(State)
+                    end
             end;
         false ->
             State
@@ -5496,7 +5508,12 @@ close_reason_to_code(_) -> unknown.
 has_app_keys(#state{app_keys = undefined}) -> false;
 has_app_keys(_) -> true.
 
-%% Record a received packet number for ACK generation
+%% Record a received packet number for ACK generation.
+%% For the 1-RTT (`app') space we also classify whether the PN is
+%% sequential (= largest_recv + 1 or the very first packet) or
+%% reordered, and stash that on `last_recv_trigger' so the subsequent
+%% `maybe_send_ack(app, ...)' can honour RFC 9002 §6.2's recommendation
+%% to ACK reordered packets immediately instead of delaying.
 record_received_pn(initial, PN, State) ->
     PNSpace = State#state.pn_initial,
     NewPNSpace = update_pn_space_recv(PN, PNSpace),
@@ -5507,15 +5524,29 @@ record_received_pn(handshake, PN, State) ->
     State#state{pn_handshake = NewPNSpace};
 record_received_pn(app, PN, State) ->
     PNSpace = State#state.pn_app,
+    Trigger = classify_recv_trigger(PN, PNSpace),
     NewPNSpace = update_pn_space_recv(PN, PNSpace),
-    State#state{pn_app = NewPNSpace};
+    State#state{pn_app = NewPNSpace, last_recv_trigger = Trigger};
 record_received_pn(zero_rtt, PN, State) ->
     %% 0-RTT uses the same PN space as 1-RTT (app)
     PNSpace = State#state.pn_app,
+    Trigger = classify_recv_trigger(PN, PNSpace),
     NewPNSpace = update_pn_space_recv(PN, PNSpace),
-    State#state{pn_app = NewPNSpace};
+    State#state{pn_app = NewPNSpace, last_recv_trigger = Trigger};
 record_received_pn(_, _PN, State) ->
     State.
+
+%% Classify a received PN as sequential (monotonic continuation of the
+%% largest received) or reordered (gap above, or filling a gap below).
+%% Duplicates (PN =:= largest_recv) are treated as reordered so a
+%% duplicate in the middle of a flow still forces an immediate ACK;
+%% the duplicate itself is filtered elsewhere.
+classify_recv_trigger(_PN, #pn_space{largest_recv = undefined}) ->
+    sequential;
+classify_recv_trigger(PN, #pn_space{largest_recv = L}) when PN =:= L + 1 ->
+    sequential;
+classify_recv_trigger(_PN, _PNSpace) ->
+    reordered.
 
 %% Get largest received PN for a given encryption level
 get_largest_recv(initial, State) ->
@@ -9171,4 +9202,28 @@ test_decimate_on_timer_fire(State) ->
         ack_elicited_count => NewState#state.ack_elicited_count,
         ack_timer_armed => NewState#state.ack_timer =/= undefined
     }.
+
+%% Run `maybe_send_ack(app, Frames, State)' under a given
+%% `last_recv_trigger' and return the observable post-state so tests
+%% can assert reordered → immediate ACK, sequential → decimate.
+-spec test_maybe_send_ack_app(sequential | reordered, #state{}) ->
+    #{
+        ack_elicited_count := non_neg_integer(),
+        ack_timer_armed := boolean()
+    }.
+test_maybe_send_ack_app(Trigger, State) ->
+    Frame = {stream, 0, 0, <<"x">>, false},
+    NewState = maybe_send_ack(app, [Frame], State#state{last_recv_trigger = Trigger}),
+    #{
+        ack_elicited_count => NewState#state.ack_elicited_count,
+        ack_timer_armed => NewState#state.ack_timer =/= undefined
+    }.
+
+%% Expose `classify_recv_trigger/2' for direct unit coverage of the
+%% sequential / reordered classifier without going through the full
+%% receive path.
+-spec test_classify_recv_trigger(non_neg_integer(), non_neg_integer() | undefined) ->
+    sequential | reordered.
+test_classify_recv_trigger(PN, LargestRecv) ->
+    classify_recv_trigger(PN, #pn_space{largest_recv = LargestRecv}).
 -endif.

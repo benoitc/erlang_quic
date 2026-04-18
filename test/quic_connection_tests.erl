@@ -666,3 +666,31 @@ ack_decimation_timer_idempotent_test() ->
     {_S1, Info} = quic_connection:test_decimate_step(S0),
     ?assertEqual(1, maps:get(ack_elicited_count, Info)),
     ?assertEqual(true, maps:get(ack_timer_armed, Info)).
+
+%% RFC 9002 §6.2: reordered 1-RTT packets should elicit an immediate
+%% ACK instead of being decimated. First ack-eliciting packet is still
+%% decimated when classified as sequential.
+ack_reorder_triggers_immediate_ack_test() ->
+    S0 = quic_connection:test_decimate_initial_state(),
+    Info = quic_connection:test_maybe_send_ack_app(reordered, S0),
+    %% send_app_ack/1 runs its decimation-clear branch even when
+    %% ack_ranges is empty, so count stays at 0 and timer stays unarmed.
+    ?assertEqual(0, maps:get(ack_elicited_count, Info)),
+    ?assertEqual(false, maps:get(ack_timer_armed, Info)).
+
+ack_sequential_uses_decimation_test() ->
+    S0 = quic_connection:test_decimate_initial_state(),
+    Info = quic_connection:test_maybe_send_ack_app(sequential, S0),
+    %% Sequential first packet arms the timer, count goes to 1.
+    ?assertEqual(1, maps:get(ack_elicited_count, Info)),
+    ?assertEqual(true, maps:get(ack_timer_armed, Info)).
+
+%% `classify_recv_trigger/2' returns sequential for the first packet
+%% (largest_recv = undefined) and for PN = largest_recv + 1; every other
+%% PN (gap above, dup, below) is reordered.
+ack_classify_recv_trigger_test() ->
+    ?assertEqual(sequential, quic_connection:test_classify_recv_trigger(0, undefined)),
+    ?assertEqual(sequential, quic_connection:test_classify_recv_trigger(7, 6)),
+    ?assertEqual(reordered, quic_connection:test_classify_recv_trigger(9, 6)),
+    ?assertEqual(reordered, quic_connection:test_classify_recv_trigger(3, 6)),
+    ?assertEqual(reordered, quic_connection:test_classify_recv_trigger(6, 6)).
