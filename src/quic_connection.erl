@@ -6281,49 +6281,38 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) wh
     PacketSize = DataSize + ?PACKET_OVERHEAD,
     %% Control streams (urgency 0) can exceed cwnd to prevent tick blocking
     Urgency = get_stream_urgency(StreamId, Streams),
-    CanSend =
-        case Urgency of
-            0 -> quic_cc:can_send_control(CCState, PacketSize);
-            _ -> quic_cc:can_send(CCState, PacketSize)
+    %% Fused cwnd + pacing check (Phase 1). With pacing disabled the
+    %% check degenerates to cwnd-only in one record match.
+    Check =
+        case PacingEnabled of
+            true -> quic_cc:send_check(CCState, PacketSize, Urgency);
+            false -> cwnd_only_check(CCState, PacketSize, Urgency)
         end,
-    case CanSend of
-        true ->
-            %% Cwnd allows - check pacing
-            case PacingEnabled andalso not quic_cc:pacing_allows(CCState, PacketSize) of
-                true ->
-                    %% Pacing blocked - queue data and set pacing timer
-                    Delay = quic_cc:pacing_delay(CCState, PacketSize),
-                    ?LOG_DEBUG(
-                        #{
-                            what => stream_data_paced,
-                            stream_id => StreamId,
-                            data_size => DataSize,
-                            pacing_delay_ms => Delay
-                        },
-                        ?QUIC_LOG_META
-                    ),
-                    case queue_stream_data(StreamId, Offset, Data, Fin, State) of
-                        {ok, QueuedState} ->
-                            PacedState = maybe_set_pacing_timer(Delay, QueuedState),
-                            {PacedState, BytesSentSoFar};
-                        {error, send_queue_full} ->
-                            {error, send_queue_full}
-                    end;
-                false ->
-                    %% Pacing allows - send immediately and consume tokens.
-                    %% Data is already binary (invariant from fragmented_tracked/5).
-                    %% encode_iodata/1 returns [Header, Data] so the payload
-                    %% flows as iodata through AEAD without copying Data
-                    %% into a fresh frame binary.
-                    {_Allowed, NewCCState} = quic_cc:get_pacing_tokens(CCState, PacketSize),
-                    State1 = State#state{cc_state = NewCCState},
-                    Frame = {stream, StreamId, Offset, Data, Fin},
-                    Payload = quic_frame:encode_iodata(Frame),
-                    NewState = send_app_packet_internal(Payload, [Frame], State1),
-                    {NewState, BytesSentSoFar + DataSize}
+    case Check of
+        {ok, NewCCState} ->
+            State1 = State#state{cc_state = NewCCState},
+            Frame = {stream, StreamId, Offset, Data, Fin},
+            Payload = quic_frame:encode_iodata(Frame),
+            NewState = send_app_packet_internal(Payload, [Frame], State1),
+            {NewState, BytesSentSoFar + DataSize};
+        {blocked_pacing, Delay} ->
+            ?LOG_DEBUG(
+                #{
+                    what => stream_data_paced,
+                    stream_id => StreamId,
+                    data_size => DataSize,
+                    pacing_delay_ms => Delay
+                },
+                ?QUIC_LOG_META
+            ),
+            case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+                {ok, QueuedState} ->
+                    PacedState = maybe_set_pacing_timer(Delay, QueuedState),
+                    {PacedState, BytesSentSoFar};
+                {error, send_queue_full} ->
+                    {error, send_queue_full}
             end;
-        false ->
-            %% Queue the data for later sending when cwnd allows
+        {blocked_cwnd, _Available} ->
             ?LOG_DEBUG(
                 #{
                     what => stream_data_queued_cwnd,
@@ -6332,17 +6321,29 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) wh
                     offset => Offset,
                     cwnd => quic_cc:cwnd(CCState),
                     bytes_in_flight => quic_cc:bytes_in_flight(CCState),
-                    available_cwnd => quic_cc:available_cwnd(CCState)
+                    available_cwnd => _Available
                 },
                 ?QUIC_LOG_META
             ),
             case queue_stream_data(StreamId, Offset, Data, Fin, State) of
                 {ok, QueuedState} ->
-                    % Return bytes sent so far, not including queued
                     {QueuedState, BytesSentSoFar};
                 {error, send_queue_full} ->
                     {error, send_queue_full}
             end
+    end.
+
+%% Cwnd-only check used when pacing is disabled. Keeps the call sites
+%% uniform with {ok,_} / {blocked_cwnd,_} while avoiding any pacing work.
+cwnd_only_check(CCState, Size, Urgency) ->
+    CanSend =
+        case Urgency of
+            0 -> quic_cc:can_send_control(CCState, Size);
+            _ -> quic_cc:can_send(CCState, Size)
+        end,
+    case CanSend of
+        true -> {ok, CCState};
+        false -> {blocked_cwnd, quic_cc:available_cwnd(CCState)}
     end.
 
 %% @doc Send stream data that requires chunking.
@@ -6351,52 +6352,41 @@ send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunk
     PacketSize = MaxChunkSize + ?PACKET_OVERHEAD,
     %% Control streams (urgency 0) can exceed cwnd to prevent tick blocking
     Urgency = get_stream_urgency(StreamId, Streams),
-    CanSend =
-        case Urgency of
-            0 -> quic_cc:can_send_control(CCState, PacketSize);
-            _ -> quic_cc:can_send(CCState, PacketSize)
+    Check =
+        case PacingEnabled of
+            true -> quic_cc:send_check(CCState, PacketSize, Urgency);
+            false -> cwnd_only_check(CCState, PacketSize, Urgency)
         end,
-    case CanSend of
-        true ->
-            %% Cwnd allows - check pacing
-            case PacingEnabled andalso not quic_cc:pacing_allows(CCState, PacketSize) of
-                true ->
-                    %% Pacing blocked - queue remaining data and set timer
-                    Delay = quic_cc:pacing_delay(CCState, PacketSize),
-                    ?LOG_DEBUG(
-                        #{
-                            what => stream_data_paced_large,
-                            stream_id => StreamId,
-                            data_size => byte_size(Data),
-                            pacing_delay_ms => Delay
-                        },
-                        ?QUIC_LOG_META
-                    ),
-                    case queue_stream_data(StreamId, Offset, Data, Fin, State) of
-                        {ok, QueuedState} ->
-                            PacedState = maybe_set_pacing_timer(Delay, QueuedState),
-                            {PacedState, BytesSentSoFar};
-                        {error, send_queue_full} ->
-                            {error, send_queue_full}
-                    end;
-                false ->
-                    %% Pacing allows - consume tokens and send.
-                    %% encode_iodata/1 returns [Header, Chunk] where Chunk
-                    %% is a sub-binary slice of Data; no per-chunk copy
-                    %% into a fresh frame binary.
-                    {_Allowed, NewCCState} = quic_cc:get_pacing_tokens(CCState, PacketSize),
-                    State0 = State#state{cc_state = NewCCState},
-                    <<Chunk:MaxChunkSize/binary, Rest/binary>> = Data,
-                    Frame = {stream, StreamId, Offset, Chunk, false},
-                    Payload = quic_frame:encode_iodata(Frame),
-                    State1 = send_app_packet_internal(Payload, [Frame], State0),
-                    NewOffset = Offset + MaxChunkSize,
-                    NewBytesSent = BytesSentSoFar + MaxChunkSize,
-                    send_stream_data_fragmented_tracked(
-                        StreamId, NewOffset, Rest, Fin, State1, NewBytesSent
-                    )
+    case Check of
+        {ok, NewCCState} ->
+            State0 = State#state{cc_state = NewCCState},
+            <<Chunk:MaxChunkSize/binary, Rest/binary>> = Data,
+            Frame = {stream, StreamId, Offset, Chunk, false},
+            Payload = quic_frame:encode_iodata(Frame),
+            State1 = send_app_packet_internal(Payload, [Frame], State0),
+            NewOffset = Offset + MaxChunkSize,
+            NewBytesSent = BytesSentSoFar + MaxChunkSize,
+            send_stream_data_fragmented_tracked(
+                StreamId, NewOffset, Rest, Fin, State1, NewBytesSent
+            );
+        {blocked_pacing, Delay} ->
+            ?LOG_DEBUG(
+                #{
+                    what => stream_data_paced_large,
+                    stream_id => StreamId,
+                    data_size => byte_size(Data),
+                    pacing_delay_ms => Delay
+                },
+                ?QUIC_LOG_META
+            ),
+            case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+                {ok, QueuedState} ->
+                    PacedState = maybe_set_pacing_timer(Delay, QueuedState),
+                    {PacedState, BytesSentSoFar};
+                {error, send_queue_full} ->
+                    {error, send_queue_full}
             end;
-        false ->
+        {blocked_cwnd, Available} ->
             %% Queue remaining data for later
             ?LOG_DEBUG(
                 #{
@@ -6407,7 +6397,7 @@ send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunk
                     bytes_sent_so_far => BytesSentSoFar,
                     cwnd => quic_cc:cwnd(CCState),
                     bytes_in_flight => quic_cc:bytes_in_flight(CCState),
-                    available_cwnd => quic_cc:available_cwnd(CCState)
+                    available_cwnd => Available
                 },
                 ?QUIC_LOG_META
             ),

@@ -65,6 +65,7 @@
     pacing_allows/2,
     get_pacing_tokens/2,
     pacing_delay/2,
+    send_check/3,
     max_datagram_size/1,
     min_recovery_duration/1,
     ecn_ce_counter/1
@@ -104,6 +105,21 @@
 -callback get_pacing_tokens(State :: term(), Size :: non_neg_integer()) ->
     {non_neg_integer(), State :: term()}.
 -callback pacing_delay(State :: term(), Size :: non_neg_integer()) -> non_neg_integer().
+
+%% Fused send check (cwnd + pacing) used by the hot send path.
+%% Urgency 0 uses the control-allowance variant of the cwnd check.
+%% Returns one of:
+%%   {ok, NewState}          — cwnd + pacing both allow; tokens consumed
+%%   {blocked_cwnd, Avail}   — cwnd would overflow; Avail = max(0, cwnd - inflight)
+%%   {blocked_pacing, Delay} — pacing blocks for Delay ms
+-callback send_check(
+    State :: term(),
+    Size :: non_neg_integer(),
+    Urgency :: non_neg_integer()
+) ->
+    {ok, State :: term()}
+    | {blocked_cwnd, non_neg_integer()}
+    | {blocked_pacing, non_neg_integer()}.
 
 %% MTU update
 -callback update_mtu(State :: term(), NewMTU :: pos_integer()) -> State :: term().
@@ -304,6 +320,18 @@ get_pacing_tokens(#cc_wrapper{algorithm = Mod, state = State} = W, Size) ->
 -spec pacing_delay(cc_state(), non_neg_integer()) -> non_neg_integer().
 pacing_delay(#cc_wrapper{algorithm = Mod, state = State}, Size) ->
     Mod:pacing_delay(State, Size).
+
+%% @doc Fused send check (cwnd + pacing) for the hot send path.
+%% See the behavior callback for the return shape.
+-spec send_check(cc_state(), non_neg_integer(), non_neg_integer()) ->
+    {ok, cc_state()}
+    | {blocked_cwnd, non_neg_integer()}
+    | {blocked_pacing, non_neg_integer()}.
+send_check(#cc_wrapper{algorithm = Mod, state = State} = W, Size, Urgency) ->
+    case Mod:send_check(State, Size, Urgency) of
+        {ok, NewState} -> {ok, W#cc_wrapper{state = NewState}};
+        Other -> Other
+    end.
 
 %% @doc Get the current max datagram size.
 -spec max_datagram_size(cc_state()) -> pos_integer().
