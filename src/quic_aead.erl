@@ -191,21 +191,29 @@ unprotect_header(HP, ProtectedHeader, EncryptedPayload, _PNOffset) ->
             %% Get PN length from unmasked first byte
             PNLen = (FirstByte band 16#03) + 1,
 
-            %% PN is at the start of EncryptedPayload, unmask it
-            <<ProtectedPN:PNLen/binary, _/binary>> = EncryptedPayload,
-            PNMask =
-                case PNLen of
-                    1 -> <<MaskByte1>>;
-                    2 -> <<MaskByte1, MaskByte2>>;
-                    3 -> <<MaskByte1, MaskByte2, MaskByte3>>;
-                    4 -> <<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>
-                end,
-            PN = crypto:exor(ProtectedPN, PNMask),
+            %% PN is at the start of EncryptedPayload. Unmask inline
+            %% to avoid a crypto:exor/2 NIF call per packet — the PN
+            %% is only 1-4 bytes so pure-Erlang XOR is cheaper.
+            PN = xor_pn_bytes(
+                EncryptedPayload, PNLen, MaskByte1, MaskByte2, MaskByte3, MaskByte4
+            ),
 
             %% Return unprotected header (first byte + rest) with PN appended
             UnprotectedHeader = <<FirstByte, HeaderRest/binary, PN/binary>>,
             {UnprotectedHeader, PNLen}
     end.
+
+%% Pure-Erlang XOR for the 1-4 byte packet-number mask. Replaces
+%% crypto:exor/2 on the hot send/receive paths; only the first PNLen
+%% bytes of the input are consumed.
+xor_pn_bytes(<<B1, _/binary>>, 1, M1, _M2, _M3, _M4) ->
+    <<(B1 bxor M1)>>;
+xor_pn_bytes(<<B1, B2, _/binary>>, 2, M1, M2, _M3, _M4) ->
+    <<(B1 bxor M1), (B2 bxor M2)>>;
+xor_pn_bytes(<<B1, B2, B3, _/binary>>, 3, M1, M2, M3, _M4) ->
+    <<(B1 bxor M1), (B2 bxor M2), (B3 bxor M3)>>;
+xor_pn_bytes(<<B1, B2, B3, B4, _/binary>>, 4, M1, M2, M3, M4) ->
+    <<(B1 bxor M1), (B2 bxor M2), (B3 bxor M3), (B4 bxor M4)>>.
 
 %% @doc Compute the nonce for AEAD by XORing IV with packet number.
 %% RFC 9001 Section 5.3: The 64 bits of the reconstructed QUIC packet number
@@ -266,15 +274,10 @@ apply_header_mask(Header, Mask, PNOffset) ->
     BeforePNLen = PNOffset - 1,
     <<BeforePN:BeforePNLen/binary, PN:PNLen/binary, AfterPN/binary>> = Rest,
 
-    %% Mask PN bytes
-    PNMask =
-        case PNLen of
-            1 -> <<MaskByte1>>;
-            2 -> <<MaskByte1, MaskByte2>>;
-            3 -> <<MaskByte1, MaskByte2, MaskByte3>>;
-            4 -> <<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>
-        end,
-    ProtectedPN = crypto:exor(PN, PNMask),
+    %% Inline pure-Erlang XOR for the PN bytes (see xor_pn_bytes/6).
+    ProtectedPN = xor_pn_bytes(
+        PN, PNLen, MaskByte1, MaskByte2, MaskByte3, MaskByte4
+    ),
 
     <<ProtectedFirstByte, BeforePN/binary, ProtectedPN/binary, AfterPN/binary>>.
 
