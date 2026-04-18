@@ -1145,7 +1145,19 @@ open_client_socket_genudp(IP, Opts, ExtraOpts) ->
 %% returned by `open_client_socket/4'. Migration / rebind are disabled
 %% on this path.
 open_client_socket_backend({IP, _Port}, Opts) ->
-    case quic_socket:open_for_send(IP, Opts#{backend => socket}) of
+    %% Disable batching + GSO on the opt-in socket path for now. The
+    %% multi-packet coalesced UDP_SEGMENT flush path needs more
+    %% validation against gen_udp servers (see Phase 1b follow-up);
+    %% direct `socket:sendmsg' one packet at a time keeps the MVP
+    %% simple and matches what every QUIC server on the wire expects.
+    BatchingOpt = maps:get(batching, Opts, #{}),
+    BatchingOff = BatchingOpt#{enabled => false},
+    OpenOpts = Opts#{
+        backend => socket,
+        gso => false,
+        batching => BatchingOff
+    },
+    case quic_socket:open_for_send(IP, OpenOpts) of
         {ok, SocketState} ->
             case quic_socket:sockname(SocketState) of
                 {ok, LA} ->

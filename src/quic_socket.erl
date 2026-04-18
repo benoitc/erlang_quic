@@ -158,10 +158,14 @@ open_for_send(RemoteIP, Opts) ->
     %% Allow the caller to force a backend (via `backend => socket'
     %% in Opts) so the opt-in client path can request the OTP socket
     %% NIF even on platforms where capability detection would pick
-    %% `gen_udp' by default.
+    %% `gen_udp' by default. Similarly `gso => false' lets the caller
+    %% opt out of GSO even when the platform supports it — the opt-in
+    %% client path uses that to avoid UDP_SEGMENT until the batched
+    %% send path is validated against gen_udp servers.
     DetectedBackend = maps:get(backend, Capabilities, gen_udp),
     Backend = maps:get(backend, Opts, DetectedBackend),
-    GSOSupported = maps:get(gso, Capabilities, false),
+    DetectedGSO = maps:get(gso, Capabilities, false),
+    GSOSupported = maps:get(gso, Opts, DetectedGSO),
 
     BatchOpts = maps:get(batching, Opts, #{}),
     BatchingEnabled = maps:get(enabled, BatchOpts, true),

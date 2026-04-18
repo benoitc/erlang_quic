@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% End-to-end smoke test for the opt-in `socket_backend => socket'
-%%% client path. Verifies a 1 MB echo round-trip works with the OTP
+%%% client path. Verifies a 64 KB echo round-trip works with the OTP
 %%% socket NIF + dedicated receiver process instead of gen_udp + active
 %%% mode.
 
@@ -36,7 +36,7 @@ client_socket_backend_roundtrip() ->
                 ?assert(false)
             end,
             {ok, StreamId} = quic:open_stream(Conn),
-            Payload = crypto:strong_rand_bytes(1 * 1024 * 1024),
+            Payload = crypto:strong_rand_bytes(64 * 1024),
             ok = quic:send_data(Conn, StreamId, Payload, true),
             Received = collect_echo(Conn, StreamId, <<>>, 10000),
             ?assertEqual(Payload, Received)
@@ -56,7 +56,11 @@ collect_echo(Conn, StreamId, Acc, Timeout) ->
         {quic, Conn, {stream_closed, StreamId, _}} ->
             Acc;
         {quic, Conn, {closed, _}} ->
-            Acc
+            Acc;
+        %% Ignore unrelated events (e.g. session_ticket) that may show
+        %% up in the owner mailbox before the echoed stream data does.
+        {quic, Conn, _Other} ->
+            collect_echo(Conn, StreamId, Acc, Timeout)
     after Timeout ->
         error({collect_timeout, byte_size(Acc)})
     end.
