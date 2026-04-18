@@ -1849,15 +1849,14 @@ connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
 connected({call, From}, migrate, #state{peer_disable_migration = true} = State) ->
     %% Peer disabled migration via transport params
     {keep_state, State, [{reply, From, {error, migration_disabled}}]};
-connected({call, From}, migrate, #state{socket = Socket, remote_addr = RemoteAddr} = State) ->
-    %% Simulate network change by rebinding socket to a new port
-    %% In a real scenario, this would happen when the device changes networks
-    case rebind_socket(Socket) of
-        {ok, NewSocket} ->
+connected({call, From}, migrate, #state{remote_addr = RemoteAddr} = State) ->
+    %% Simulate network change by rebinding the client socket on a new
+    %% ephemeral port. Backend-agnostic: `rebind_client_socket/1' keeps
+    %% the OTP socket + receiver process together on the opt-in path.
+    case rebind_client_socket(State) of
+        {ok, State1} ->
             %% RFC 9000 Section 9.5: Use fresh CID to prevent path linkability
-            State1 = switch_to_fresh_cid(State),
-            %% Start path validation to the peer on the new path
-            State2 = State1#state{socket = NewSocket},
+            State2 = switch_to_fresh_cid(State1),
             State3 = initiate_path_validation(RemoteAddr, State2),
             {keep_state, State3, [{reply, From, ok}]};
         {error, Reason} ->
@@ -1866,13 +1865,10 @@ connected({call, From}, migrate, #state{socket = Socket, remote_addr = RemoteAdd
 %% Handle migration with options
 connected({call, From}, {migrate, _Opts}, #state{peer_disable_migration = true} = State) ->
     {keep_state, State, [{reply, From, {error, migration_disabled}}]};
-connected(
-    {call, From}, {migrate, _Opts}, #state{socket = Socket, remote_addr = RemoteAddr} = State
-) ->
-    case rebind_socket(Socket) of
-        {ok, NewSocket} ->
-            State1 = switch_to_fresh_cid(State),
-            State2 = State1#state{socket = NewSocket},
+connected({call, From}, {migrate, _Opts}, #state{remote_addr = RemoteAddr} = State) ->
+    case rebind_client_socket(State) of
+        {ok, State1} ->
+            State2 = switch_to_fresh_cid(State1),
             State3 = initiate_path_validation(RemoteAddr, State2),
             {keep_state, State3, [{reply, From, ok}]};
         {error, Reason} ->
@@ -5327,6 +5323,21 @@ send_and_take_socket_state(Packet, State) ->
         {error, _} -> State#state.socket_state
     end.
 
+%% Send a packet to an explicit address (not `remote_addr'). Used by
+%% path-validation frames (PATH_CHALLENGE / PATH_RESPONSE). Dispatches
+%% on the socket backend so it works whether the client is on the
+%% gen_udp path (raw `gen_udp:send/4') or the opt-in socket path
+%% (`socket:sendmsg/2' via `quic_socket:send_immediate/4').
+send_packet_to_addr(IP, Port, Packet, #state{socket_state = SocketState}) when
+    SocketState =/= undefined
+->
+    case quic_socket:send_immediate(SocketState, IP, Port, Packet) of
+        {ok, _} -> ok;
+        {error, _} = Err -> Err
+    end;
+send_packet_to_addr(IP, Port, Packet, #state{socket = Socket}) ->
+    gen_udp:send(Socket, IP, Port, Packet).
+
 %% Re-arm active-N on the client socket. No-op on the `socket' backend
 %% which delivers messages via the dedicated receiver process — see
 %% `quic_socket:start_client_receiver/2'.
@@ -7841,7 +7852,6 @@ send_path_challenge(
     {IP, Port},
     ChallengeData,
     #state{
-        socket = Socket,
         dcid = DCID,
         app_keys = AppKeys,
         role = Role,
@@ -7879,7 +7889,7 @@ send_path_challenge(
             ),
 
             %% Send to the specific path address (not current remote_addr)
-            case gen_udp:send(Socket, IP, Port, Packet) of
+            case send_packet_to_addr(IP, Port, Packet, State) of
                 ok ->
                     %% Update path bytes_sent for anti-amplification tracking
                     PacketSize = byte_size(Packet),
@@ -7909,7 +7919,6 @@ send_path_response_to_addr(
     {IP, Port},
     ResponseData,
     #state{
-        socket = Socket,
         dcid = DCID,
         app_keys = AppKeys,
         role = Role,
@@ -7945,7 +7954,7 @@ send_path_response_to_addr(
             ),
 
             %% Send to the address that sent the PATH_CHALLENGE (not current remote_addr)
-            case gen_udp:send(Socket, IP, Port, Packet) of
+            case send_packet_to_addr(IP, Port, Packet, State) of
                 ok ->
                     %% Increment packet number
                     NewPnApp = PNSpace#pn_space{next_pn = PN + 1},
@@ -8033,6 +8042,69 @@ rebind_socket(OldSocket) ->
             {ok, NewSocket};
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% @doc Rebind the client's UDP socket for migration. Dispatches on
+%% `#state.client_socket_backend' so both the gen_udp and opt-in
+%% socket paths pick up a fresh local port without the other path's
+%% primitives crashing on the wrong handle.
+-spec rebind_client_socket(#state{}) -> {ok, #state{}} | {error, term()}.
+rebind_client_socket(#state{client_socket_backend = socket} = State) ->
+    rebind_client_socket_otp(State);
+rebind_client_socket(#state{socket = OldSocket} = State) ->
+    case rebind_socket(OldSocket) of
+        {ok, NewSocket} -> {ok, State#state{socket = NewSocket}};
+        {error, _} = Error -> Error
+    end.
+
+%% Socket-NIF rebind: stop the old receiver, close the old OTP socket
+%% via its `#socket_state{}' wrapper, open a fresh socket with the
+%% same opt-in profile (batching + GSO off — see
+%% `open_client_socket_backend/2'), and start a new receiver linked
+%% to this connection process.
+rebind_client_socket_otp(
+    #state{
+        remote_addr = {RemoteIP, _},
+        socket_state = OldSocketState,
+        client_receiver = OldReceiver
+    } = State
+) ->
+    ok = quic_socket:stop_client_receiver(OldReceiver),
+    case OldSocketState of
+        undefined ->
+            ok;
+        _ ->
+            try quic_socket:close(OldSocketState) of
+                _ -> ok
+            catch
+                _:_ -> ok
+            end
+    end,
+    OpenOpts = #{
+        backend => socket,
+        gso => false,
+        batching => #{enabled => false}
+    },
+    case quic_socket:open_for_send(RemoteIP, OpenOpts) of
+        {ok, NewSocketState} ->
+            case quic_socket:start_client_receiver(NewSocketState, self()) of
+                {ok, NewReceiver} ->
+                    NewSocket = quic_socket:get_socket(NewSocketState),
+                    {ok, State#state{
+                        socket = NewSocket,
+                        socket_state = NewSocketState,
+                        client_receiver = NewReceiver
+                    }};
+                {error, _} = Error ->
+                    try quic_socket:close(NewSocketState) of
+                        _ -> ok
+                    catch
+                        _:_ -> ok
+                    end,
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
     end.
 
 %%====================================================================
