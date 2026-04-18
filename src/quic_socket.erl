@@ -694,7 +694,13 @@ open_send_socket_backend(RemoteIP, Opts, BatchConfig) ->
 configure_send_socket(Socket, Opts, BatchConfig) ->
     ok = socket:setopt(Socket, {socket, reuseaddr}, true),
     set_socket_buffer_sizes(Socket, Opts),
-    GSOEnabled = maybe_enable_gso(Socket, BatchConfig),
+    %% GSO is applied per-message via the UDP_SEGMENT cmsg in
+    %% flush_gso/1, never as a socket-level setsockopt. A socket-level
+    %% UDP_SEGMENT would force GSO segmentation on every outbound
+    %% datagram, including short handshake packets and non-uniform
+    %% fallback sends, which stalled handshakes and mis-segmented
+    %% coalesced Initial+Handshake flights against gen_udp servers.
+    GSOEnabled = maps:get(gso_supported, BatchConfig, false),
     State = #socket_state{
         socket = Socket,
         backend = socket,
