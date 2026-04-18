@@ -2626,7 +2626,7 @@ send_initial_packet(Payload, State) ->
     PaddedPacket = pad_initial_packet(Packet),
 
     %% Send
-    do_socket_send(PaddedPacket, State),
+    NewSocketState = send_and_take_socket_state(PaddedPacket, State),
 
     %% Emit qlog packet_sent event
     quic_qlog:packet_sent(State#state.qlog_ctx, #{
@@ -2637,10 +2637,11 @@ send_initial_packet(Payload, State) ->
 
     %% Update packet number space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    apply_pending_socket_state(State#state{
+    State#state{
         pn_initial = NewPNSpace,
-        packets_sent = State#state.packets_sent + 1
-    }).
+        packets_sent = State#state.packets_sent + 1,
+        socket_state = NewSocketState
+    }.
 
 %% Send an Initial ACK packet
 send_initial_ack(State) ->
@@ -2830,7 +2831,7 @@ send_handshake_packet(Payload, State) ->
     Packet = quic_aead:protect_long_packet(
         Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
-    do_socket_send(Packet, State),
+    NewSocketState = send_and_take_socket_state(Packet, State),
 
     %% Emit qlog packet_sent event
     quic_qlog:packet_sent(State#state.qlog_ctx, #{
@@ -2841,10 +2842,11 @@ send_handshake_packet(Payload, State) ->
 
     %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    apply_pending_socket_state(State#state{
+    State#state{
         pn_handshake = NewPNSpace,
-        packets_sent = State#state.packets_sent + 1
-    }).
+        packets_sent = State#state.packets_sent + 1,
+        socket_state = NewSocketState
+    }.
 
 %% Send a 1-RTT (application) packet with a single frame (avoid encode/decode roundtrip)
 %% This is the preferred send function - encodes once and passes frame for loss tracking
@@ -2906,7 +2908,7 @@ send_app_packet_internal(Payload, Frames, State) ->
 
     %% Handle send result - only track packet and update state if send succeeded
     case SendResult of
-        ok ->
+        {ok, NewSocketState} ->
             %% Emit qlog packet_sent event
             quic_qlog:packet_sent(State#state.qlog_ctx, #{
                 packet_type => one_rtt,
@@ -2937,17 +2939,17 @@ send_app_packet_internal(Payload, Frames, State) ->
             %% a single record update to avoid copying #state{} multiple
             %% times per packet on the bulk-send hot path.
             NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-            NewSocketState =
-                case erase(pending_socket_state) of
+            EffectiveSocketState =
+                case NewSocketState of
                     undefined -> State#state.socket_state;
-                    PendingSocketState -> PendingSocketState
+                    _ -> NewSocketState
                 end,
             State#state{
                 pn_app = NewPNSpace,
                 cc_state = NewCCState,
                 loss_state = NewLossState,
                 packets_sent = State#state.packets_sent + 1,
-                socket_state = NewSocketState,
+                socket_state = EffectiveSocketState,
                 last_activity = Now,
                 timer_dirty = true,
                 pto_dirty = true
@@ -5216,27 +5218,30 @@ get_max_stream_recv_window(#state{fc_max_stream_recv_window = CachedMax}) ->
 %% Send a packet via quic_socket (with batching) or gen_udp fallback.
 %% For client connections with socket_state, uses quic_socket batching.
 %% For server connections (shared socket), sends directly via gen_udp.
+%%
+%% Returns `{ok, SocketState}' where `SocketState' is the updated
+%% `#socket_state{}' to replace `State#state.socket_state' (or
+%% `undefined' to leave the state unchanged). Callers thread the
+%% returned state into their subsequent `#state{}' record update.
+-spec do_socket_send(iodata(), #state{}) ->
+    {ok, undefined | quic_socket:socket_state()} | {error, term()}.
 do_socket_send(Packet, #state{socket_state = undefined, socket = Socket, remote_addr = {IP, Port}}) ->
-    %% No socket_state - use gen_udp directly (server or legacy path)
-    gen_udp:send(Socket, IP, Port, Packet);
+    case gen_udp:send(Socket, IP, Port, Packet) of
+        ok -> {ok, undefined};
+        {error, _} = Err -> Err
+    end;
 do_socket_send(Packet, #state{socket_state = SocketState, remote_addr = {IP, Port}}) ->
-    %% Use quic_socket with batching
-    case quic_socket:send(SocketState, IP, Port, Packet) of
-        {ok, NewSocketState} ->
-            %% Update socket_state in process dictionary for later retrieval
-            put(pending_socket_state, NewSocketState),
-            ok;
-        {error, Reason} ->
-            {error, Reason}
-    end.
+    quic_socket:send(SocketState, IP, Port, Packet).
 
-%% Apply pending socket state updates after send operations
-apply_pending_socket_state(#state{socket_state = undefined} = State) ->
-    State;
-apply_pending_socket_state(State) ->
-    case erase(pending_socket_state) of
-        undefined -> State;
-        NewSocketState -> State#state{socket_state = NewSocketState}
+%% Wrapper used by the fire-and-forget senders (Initial / Handshake /
+%% 0-RTT). Returns the socket_state to carry forward: the new one on
+%% successful batching, or the existing one unchanged when the send
+%% went through the raw gen_udp path or failed.
+send_and_take_socket_state(Packet, State) ->
+    case do_socket_send(Packet, State) of
+        {ok, undefined} -> State#state.socket_state;
+        {ok, NewSocketState} -> NewSocketState;
+        {error, _} -> State#state.socket_state
     end.
 
 %% Flush any batched packets (call before timers or idle periods)
@@ -6122,14 +6127,15 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
     Packet = quic_aead:protect_long_packet(
         Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
-    do_socket_send(Packet, State),
+    NewSocketState = send_and_take_socket_state(Packet, State),
 
     %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    apply_pending_socket_state(State#state{
+    State#state{
         pn_app = NewPNSpace,
-        packets_sent = State#state.packets_sent + 1
-    }).
+        packets_sent = State#state.packets_sent + 1,
+        socket_state = NewSocketState
+    }.
 
 %% Estimate packet overhead (header + AEAD tag + frame header).
 %% Kept as a macro for the stream-chunking paths that sized themselves
