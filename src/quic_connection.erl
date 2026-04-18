@@ -2909,8 +2909,8 @@ send_app_packet_internal(Payload, Frames, State) ->
     %% Handle send result - only track packet and update state if send succeeded
     case SendResult of
         {ok, NewSocketState} ->
-            %% Emit qlog packet_sent event
-            quic_qlog:packet_sent(State#state.qlog_ctx, #{
+            %% Emit qlog packet_sent event (no-op when qlog disabled)
+            ?QLOG_EMIT_PACKET_SENT(State#state.qlog_ctx, #{
                 packet_type => one_rtt,
                 packet_number => PN,
                 length => PacketSize,
@@ -3073,8 +3073,7 @@ handle_packet_loop(Data, State) ->
     case decode_and_decrypt_packet(Data, State) of
         {ok, Type, Frames, RemainingData, NewState, processed} ->
             %% Frames already processed by streaming decode
-            %% Emit qlog packet_received event
-            quic_qlog:packet_received(NewState#state.qlog_ctx, #{
+            ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
                 packet_type => Type,
                 frames => Frames
             }),
@@ -3084,8 +3083,7 @@ handle_packet_loop(Data, State) ->
                 packets_received = NewState#state.packets_received + 1
             },
 
-            %% Emit qlog frames_processed event
-            quic_qlog:frames_processed(NewState1#state.qlog_ctx, Frames),
+            ?QLOG_EMIT_FRAMES_PROCESSED(NewState1#state.qlog_ctx, Frames),
 
             %% Send ACK if packet contained ack-eliciting frames
             State2 = maybe_send_ack(Type, Frames, NewState1),
@@ -3093,7 +3091,7 @@ handle_packet_loop(Data, State) ->
             handle_packet_loop(RemainingData, State2);
         {ok, Type, Frames, RemainingData, NewState} ->
             %% Legacy path - frames need to be processed
-            quic_qlog:packet_received(NewState#state.qlog_ctx, #{
+            ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
                 packet_type => Type,
                 frames => Frames
             }),
@@ -3102,7 +3100,7 @@ handle_packet_loop(Data, State) ->
                 packets_received = NewState#state.packets_received + 1
             },
             State1 = process_frames_noreenbl(Type, Frames, NewState1),
-            quic_qlog:frames_processed(State1#state.qlog_ctx, Frames),
+            ?QLOG_EMIT_FRAMES_PROCESSED(State1#state.qlog_ctx, Frames),
             State2 = maybe_send_ack(Type, Frames, State1),
             handle_packet_loop(RemainingData, State2);
         {error, stateless_reset} ->
@@ -3678,14 +3676,14 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                             [] -> undefined;
                             _ -> Now - LargestAckedSentTime
                         end,
-                    quic_qlog:packets_acked(State1#state.qlog_ctx, AckedPNs, #{
+                    ?QLOG_EMIT_PACKETS_ACKED(State1#state.qlog_ctx, AckedPNs, #{
                         rtt_sample => RTTSample
                     }),
 
                     %% Emit qlog packet_lost events
                     lists:foreach(
                         fun(#sent_packet{pn = LostPN}) ->
-                            quic_qlog:packet_lost(State1#state.qlog_ctx, #{
+                            ?QLOG_EMIT_PACKET_LOST(State1#state.qlog_ctx, #{
                                 packet_number => LostPN,
                                 reason => timeout
                             })
