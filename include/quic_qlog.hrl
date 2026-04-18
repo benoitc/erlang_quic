@@ -64,6 +64,46 @@
             lists:member(Event, Ctx#qlog_ctx.events)))
 ).
 
+%% Hot-path emit wrappers. The `Info' / `Frames' / `PNs' argument is
+%% only evaluated when qlog is enabled, so the common disabled-by-
+%% default path does not pay for map / list construction at every
+%% sent / received packet. Use these at any send/recv/ack site that
+%% fires on the per-packet hot path.
+-define(QLOG_EMIT_PACKET_SENT(Ctx, Info),
+    case ?QLOG_ENABLED(Ctx) of
+        true -> quic_qlog:packet_sent(Ctx, Info);
+        false -> ok
+    end
+).
+
+-define(QLOG_EMIT_PACKET_RECEIVED(Ctx, Info),
+    case ?QLOG_ENABLED(Ctx) of
+        true -> quic_qlog:packet_received(Ctx, Info);
+        false -> ok
+    end
+).
+
+-define(QLOG_EMIT_FRAMES_PROCESSED(Ctx, Frames),
+    case ?QLOG_ENABLED(Ctx) of
+        true -> quic_qlog:frames_processed(Ctx, Frames);
+        false -> ok
+    end
+).
+
+-define(QLOG_EMIT_PACKETS_ACKED(Ctx, PNs, Info),
+    case ?QLOG_ENABLED(Ctx) of
+        true -> quic_qlog:packets_acked(Ctx, PNs, Info);
+        false -> ok
+    end
+).
+
+-define(QLOG_EMIT_PACKET_LOST(Ctx, Info),
+    case ?QLOG_ENABLED(Ctx) of
+        true -> quic_qlog:packet_lost(Ctx, Info);
+        false -> ok
+    end
+).
+
 %%====================================================================
 %% Writer Configuration
 %%====================================================================
