@@ -1,0 +1,15 @@
+services:
+  gso-debug:
+    build:
+      context: ../..
+      dockerfile: docker/gso-debug/Dockerfile
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ../..:/app
+      - ./out:/logs
+    working_dir: /app
+    environment:
+      QUIC_ENABLE_GSO_TEST: "1"
+    tty: true
