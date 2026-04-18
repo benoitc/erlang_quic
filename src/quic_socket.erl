@@ -57,7 +57,8 @@
     gso_supported/1,
     info/1,
     start_client_receiver/2,
-    stop_client_receiver/1
+    stop_client_receiver/1,
+    set_socket/2
 ]).
 
 -include("quic.hrl").
@@ -284,6 +285,16 @@ open_server_send_genudp(LocalIP, LocalPort, Opts, BatchConfig) ->
 -spec get_socket(socket_state()) -> socket:socket() | gen_udp:socket().
 get_socket(#socket_state{socket = Socket}) ->
     Socket.
+
+%% @doc Swap the underlying socket handle without rebuilding the
+%% `#socket_state{}'. Used by client-migration rebind so batching
+%% configuration is preserved while the handle points at a fresh
+%% ephemeral port. Callers must flush any pending batch before
+%% swapping; packets buffered under the old handle cannot migrate to
+%% the new one.
+-spec set_socket(socket_state(), gen_udp:socket() | socket:socket()) -> socket_state().
+set_socket(#socket_state{} = State, NewSocket) ->
+    State#socket_state{socket = NewSocket}.
 
 %% @doc Check if GSO is supported for this socket_state.
 -spec gso_supported(socket_state()) -> boolean().

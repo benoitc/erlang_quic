@@ -8046,10 +8046,30 @@ rebind_socket(OldSocket) ->
 -spec rebind_client_socket(#state{}) -> {ok, #state{}} | {error, term()}.
 rebind_client_socket(#state{client_socket_backend = socket} = State) ->
     rebind_client_socket_otp(State);
-rebind_client_socket(#state{socket = OldSocket} = State) ->
+rebind_client_socket(#state{socket = OldSocket, socket_state = OldSocketState} = State) ->
+    %% Flush any pending batch to the old socket before rebinding so
+    %% already-sequenced packets reach the server under the pre-migrate
+    %% path. Without this flush, encrypted packets sitting in
+    %% `#socket_state.batch_buffer' would either be silently dropped
+    %% (old closed socket) or replayed from the new addr with stale
+    %% CIDs (mis-routed on the server side).
+    State0 = flush_socket_batch(State),
     case rebind_socket(OldSocket) of
-        {ok, NewSocket} -> {ok, State#state{socket = NewSocket}};
-        {error, _} = Error -> Error
+        {ok, NewSocket} ->
+            %% `#socket_state{}' kept its reference to the now-closed
+            %% old socket. Swap the handle while preserving batching
+            %% configuration; the clean batch buffer (from the flush
+            %% above) starts fresh for post-migrate traffic.
+            NewSocketState =
+                case OldSocketState of
+                    undefined ->
+                        undefined;
+                    _ ->
+                        quic_socket:set_socket(State0#state.socket_state, NewSocket)
+                end,
+            {ok, State0#state{socket = NewSocket, socket_state = NewSocketState}};
+        {error, _} = Error ->
+            Error
     end.
 
 %% Socket-NIF rebind: stop the old receiver, close the old OTP socket
