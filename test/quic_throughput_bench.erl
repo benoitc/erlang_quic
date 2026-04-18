@@ -71,7 +71,8 @@ run_download_sink(Opts) ->
     {ok, Srv} = start_download_server(ServerExtra),
     try
         Start = erlang:monotonic_time(microsecond),
-        {Received, ServerStats} = do_download(Srv, Size),
+        ClientExtra = maps:with([socket_backend], Opts),
+        {Received, ServerStats} = do_download(Srv, Size, ClientExtra),
         End = erlang:monotonic_time(microsecond),
 
         Duration = max(1, End - Start),
@@ -165,15 +166,20 @@ download_loop(Conn, Pending) ->
             download_loop(Conn, Pending)
     end.
 
-do_download(#{name := Name, port := Port}, Size) ->
+do_download(#{name := Name, port := Port}, Size, ClientExtra) ->
     %% Override echo_server's 4 MB stream window so multi-MB downloads
     %% do not stall on MAX_STREAM_DATA. Keep verify=false from the base.
-    ClientOpts = maps:merge(quic_test_echo_server:client_opts(), #{
-        max_data => 64 * 1024 * 1024,
-        max_stream_data_bidi_local => 32 * 1024 * 1024,
-        max_stream_data_bidi_remote => 32 * 1024 * 1024,
-        max_stream_data_uni => 32 * 1024 * 1024
-    }),
+    %% `ClientExtra' carries optional client-side overrides (e.g.
+    %% `socket_backend') from the caller.
+    ClientOpts = maps:merge(
+        maps:merge(quic_test_echo_server:client_opts(), #{
+            max_data => 64 * 1024 * 1024,
+            max_stream_data_bidi_local => 32 * 1024 * 1024,
+            max_stream_data_bidi_remote => 32 * 1024 * 1024,
+            max_stream_data_uni => 32 * 1024 * 1024
+        }),
+        ClientExtra
+    ),
     {ok, Conn} = quic:connect("127.0.0.1", Port, ClientOpts, self()),
     try
         receive
@@ -282,8 +288,13 @@ run(Opts) ->
                 [maps:get(recbuf, ServerBufs), maps:get(sndbuf, ServerBufs)]
             ),
 
-            %% Run client benchmark
-            Result = run_client_benchmark(ActualPort, DataSize, RecvBuf, SndBuf, Mode),
+            %% Run client benchmark. Plumb client-relevant options
+            %% (currently just `socket_backend') so callers can compare
+            %% the gen_udp vs socket client paths.
+            ClientExtra = maps:with([socket_backend], Opts),
+            Result = run_client_benchmark(
+                ActualPort, DataSize, RecvBuf, SndBuf, Mode, ClientExtra
+            ),
 
             %% Stop server
             stop_server(ServerPid),
@@ -471,18 +482,21 @@ start_server(Port, RecvBuf, SndBuf, Mode) ->
 stop_server({ServerName, _Pid}) ->
     quic:stop_server(ServerName).
 
-run_client_benchmark(Port, DataSize, RecvBuf, SndBuf, Mode) ->
+run_client_benchmark(Port, DataSize, RecvBuf, SndBuf, Mode, ClientExtra) ->
     %% Large flow control windows for benchmarking (16MB)
     FlowWindow = 16777216,
-    ClientOpts = #{
-        alpn => [<<"bench">>],
-        recbuf => RecvBuf,
-        sndbuf => SndBuf,
-        max_data => FlowWindow,
-        max_stream_data_bidi_local => FlowWindow,
-        max_stream_data_bidi_remote => FlowWindow,
-        max_stream_data_uni => FlowWindow
-    },
+    ClientOpts = maps:merge(
+        #{
+            alpn => [<<"bench">>],
+            recbuf => RecvBuf,
+            sndbuf => SndBuf,
+            max_data => FlowWindow,
+            max_stream_data_bidi_local => FlowWindow,
+            max_stream_data_bidi_remote => FlowWindow,
+            max_stream_data_uni => FlowWindow
+        },
+        ClientExtra
+    ),
 
     case quic:connect("127.0.0.1", Port, ClientOpts, self()) of
         {ok, Conn} ->
