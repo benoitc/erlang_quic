@@ -146,11 +146,9 @@ jobs:
       - name: Compile
         run: rebar3 compile
 
-      - name: Run batching CT suite
-        # GSO case still skipped: handshake on socket_backend stalls
-        # on ubuntu-24.04 even after the UDP_SEGMENT sockopt + single-
-        # packet skip fixes. Root cause not yet identified; needs
-        # direct Linux-host qlog debug.
+      - name: Run batching CT suite (with GSO)
+        env:
+          QUIC_ENABLE_GSO_TEST: "1"
         run: rebar3 ct --suite=quic_server_batching_SUITE
 
   h3-e2e:
