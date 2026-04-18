@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-04-19
+
 Post-1.1.0 work split across three tracks: a client-side socket-backend
 opt-in, a round of hot-path micro-optimisations on the send and
 receive paths, and a migration fix for the default gen_udp client.
