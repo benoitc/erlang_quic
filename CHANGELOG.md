@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [1.1.0] - Unreleased
+## [1.1.0] - 2026-04-18
 
 Server-side throughput work. Per-connection send batching over the
 shared listener socket on Linux + socket backend coalesces outgoing
