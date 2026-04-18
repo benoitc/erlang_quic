@@ -3502,10 +3502,16 @@ decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
             of
                 {ok, PN, Plaintext} ->
                     <<UnprotectedFirstByte, _/binary>> = UnprotectedHeader,
+                    %% Single monotonic_time sample shared by
+                    %% recv_time and last_activity to save one BIF
+                    %% call per received packet on the hot path.
+                    Now = erlang:monotonic_time(millisecond),
                     State2 = update_spin_from_recv(
-                        UnprotectedFirstByte, PN, record_received_pn(app, PN, State1)
+                        UnprotectedFirstByte,
+                        PN,
+                        record_received_pn(app, PN, State1, Now)
                     ),
-                    State3 = update_last_activity(State2),
+                    State3 = update_last_activity(State2, Now),
                     %% Use streaming decode for efficiency
                     case decode_and_process_streaming(app, Plaintext, State3) of
                         {ok, NewState, Frames} ->
@@ -3531,9 +3537,12 @@ decrypt_packet(Level, Header, _FirstByte, EncryptedPayload, RemainingData, Keys,
         {error, Reason} ->
             {error, Reason};
         {ok, PN, _UnprotectedHeader, Plaintext} ->
-            %% Track received packet number for ACK generation
-            State1 = record_received_pn(Level, PN, State),
-            State2 = update_last_activity(State1),
+            %% Track received packet number for ACK generation.
+            %% Single monotonic_time sample shared by recv_time and
+            %% last_activity.
+            Now = erlang:monotonic_time(millisecond),
+            State1 = record_received_pn(Level, PN, State, Now),
+            State2 = update_last_activity(State1, Now),
             %% Use streaming decode for efficiency
             case decode_and_process_streaming(Level, Plaintext, State2) of
                 {ok, NewState, Frames} ->
@@ -5522,26 +5531,29 @@ has_app_keys(_) -> true.
 %% reordered, and stash that on `last_recv_trigger' so the subsequent
 %% `maybe_send_ack(app, ...)' can honour RFC 9002 §6.2's recommendation
 %% to ACK reordered packets immediately instead of delaying.
-record_received_pn(initial, PN, State) ->
+%% Single `monotonic_time/1' sample supplied by the caller covers
+%% both `recv_time' (below) and the immediately-following
+%% `last_activity' write, saving one BIF call per received packet.
+record_received_pn(initial, PN, State, Now) ->
     PNSpace = State#state.pn_initial,
-    NewPNSpace = update_pn_space_recv(PN, PNSpace),
+    NewPNSpace = update_pn_space_recv(PN, PNSpace, Now),
     State#state{pn_initial = NewPNSpace};
-record_received_pn(handshake, PN, State) ->
+record_received_pn(handshake, PN, State, Now) ->
     PNSpace = State#state.pn_handshake,
-    NewPNSpace = update_pn_space_recv(PN, PNSpace),
+    NewPNSpace = update_pn_space_recv(PN, PNSpace, Now),
     State#state{pn_handshake = NewPNSpace};
-record_received_pn(app, PN, State) ->
+record_received_pn(app, PN, State, Now) ->
     PNSpace = State#state.pn_app,
     Trigger = classify_recv_trigger(PN, PNSpace),
-    NewPNSpace = update_pn_space_recv(PN, PNSpace),
+    NewPNSpace = update_pn_space_recv(PN, PNSpace, Now),
     State#state{pn_app = NewPNSpace, last_recv_trigger = Trigger};
-record_received_pn(zero_rtt, PN, State) ->
+record_received_pn(zero_rtt, PN, State, Now) ->
     %% 0-RTT uses the same PN space as 1-RTT (app)
     PNSpace = State#state.pn_app,
     Trigger = classify_recv_trigger(PN, PNSpace),
-    NewPNSpace = update_pn_space_recv(PN, PNSpace),
+    NewPNSpace = update_pn_space_recv(PN, PNSpace, Now),
     State#state{pn_app = NewPNSpace, last_recv_trigger = Trigger};
-record_received_pn(_, _PN, State) ->
+record_received_pn(_, _PN, State, _Now) ->
     State.
 
 %% Classify a received PN as sequential (monotonic continuation of the
@@ -5567,7 +5579,7 @@ get_largest_recv(zero_rtt, State) ->
     %% 0-RTT uses the same PN space as 1-RTT (app)
     (State#state.pn_app)#pn_space.largest_recv.
 
-update_pn_space_recv(PN, PNSpace) ->
+update_pn_space_recv(PN, PNSpace, Now) ->
     #pn_space{largest_recv = LargestRecv, ack_ranges = Ranges} = PNSpace,
     NewLargest =
         case LargestRecv of
@@ -5579,7 +5591,7 @@ update_pn_space_recv(PN, PNSpace) ->
     NewRanges = add_to_ack_ranges(PN, Ranges),
     PNSpace#pn_space{
         largest_recv = NewLargest,
-        recv_time = erlang:monotonic_time(millisecond),
+        recv_time = Now,
         ack_ranges = NewRanges
     }.
 
@@ -5613,12 +5625,16 @@ merge_ack_ranges(Ranges) ->
 %% Update last activity timestamp with dirty flag (batched timer reset)
 %% The actual timer reset happens in flush_dirty_timers/1 at batch boundaries
 update_last_activity(State) ->
-    mark_activity_dirty(State).
+    update_last_activity(State, erlang:monotonic_time(millisecond)).
+
+%% Now-accepting variant used by the receive hot path.
+update_last_activity(State, Now) ->
+    mark_activity_dirty(State, Now).
 
 %% Mark activity dirty - defers timer reset until batch flush
-mark_activity_dirty(State) ->
+mark_activity_dirty(State, Now) ->
     State#state{
-        last_activity = erlang:monotonic_time(millisecond),
+        last_activity = Now,
         timer_dirty = true
     }.
 
