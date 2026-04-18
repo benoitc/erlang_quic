@@ -63,6 +63,20 @@ application:ensure_all_started(quic).
 | `preferred_ipv4` | tuple | - | Preferred IPv4 address for migration |
 | `preferred_ipv6` | tuple | - | Preferred IPv6 address for migration |
 | `lb_config` | map | - | QUIC-LB configuration (RFC 9312) |
+| `server_send_batching` | boolean | true | Per-connection send batching over the shared listener socket. On Linux + `socket_backend => socket` with UDP_SEGMENT, coalesces outgoing packets into GSO super-datagrams; no-op on macOS / gen_udp. Set to `false` to fall back to direct `gen_udp:send/4`. |
+
+## Observability
+
+Server connections expose batching counters via `quic_connection:get_stats/1`:
+
+- `batch_flushes` — number of times the per-connection batch was flushed
+- `packets_coalesced` — packets that left the socket in a multi-packet flush
+
+On `socket_backend => socket` + Linux with UDP_SEGMENT support,
+`packets_coalesced / batch_flushes` is the effective coalesce ratio
+(GSO super-datagrams). `quic_socket:info/1` exposes the same counters
+plus `backend`, `gso_supported`, `gso_size`, `gro_enabled`, and
+`max_batch_packets`.
 
 ## Loading Certificates
 

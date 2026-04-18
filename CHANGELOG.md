@@ -4,6 +4,113 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-04-18
+
+Server-side throughput work. Per-connection send batching over the
+shared listener socket on Linux + socket backend coalesces outgoing
+packets into sendmsg super-datagrams via UDP_SEGMENT (GSO); on macOS /
+gen_udp it is functionally neutral. Several GSO correctness fixes
+after CI surfaced a handshake stall. Extra observability so tests and
+operators can see the batching win directly.
+
+### Added
+- Per-connection send batching on the server. Each server connection
+  owns a `quic_socket` batch buffer that reuses the listener's UDP
+  socket. Gated by the new `server_send_batching` option on
+  `start_server/3` (default `true`); set to `false` to fall back to
+  the previous direct `gen_udp:send/4` path. (#66)
+- `quic_socket:info/1` — map with `backend`, `gso_supported`,
+  `gso_size`, `gro_enabled`, `batching_enabled`, `max_batch_packets`,
+  and the new `batch_flushes` / `packets_coalesced` counters.
+- `quic_socket:send_immediate/4` — public wrapper that bypasses the
+  per-connection batch for one-shot control-plane sends.
+- `quic_socket:new_sender/2` — build a per-connection sender that
+  inherits backend + GSO capability from the listener without owning
+  the socket.
+- `quic_connection:get_stats/1` now returns `batch_flushes` and
+  `packets_coalesced` so tests and benchmarks can assert batching
+  behaviour rather than just wiring.
+- `quic_server_batching_SUITE` — behaviour-level regression: real
+  256 KB server-to-client downloads assert `packets_coalesced > 1`
+  when batching is on, and both counters stay at 0 when disabled.
+- `docker/gso-debug/` — Erlang 28 + tcpdump + strace container that
+  reproduces the GSO handshake stall against a bind-mounted tree.
+  (#74)
+- `bench/run_download_bench.erl` and
+  `quic_throughput_bench:run_download_sink/0,1` drive server-to-client
+  bulk transfers and report MB/s alongside `batch_flushes` /
+  `packets_coalesced` so the batching effect is visible next to
+  throughput.
+
+### Changed
+- Stream send path is iovec-native. `quic_frame:encode_iodata/1`
+  returns `[Header, Data]` and threads iodata through header
+  protection and `quic_aead` without copying `Data` into a fresh
+  binary. AEAD specs relaxed to accept iodata.
+- 1-RTT ACKs delayed to every 2nd packet or `max_ack_delay` per
+  RFC 9002 §6.2. Halves receiver ACK traffic on the server and
+  sender event-processing on the client. Measured on macOS gen_udp:
+  10 MB upload 45 → 56 MB/s. (#69)
+- `quic_loss` switched to a single `queue:queue(#sent_packet{})` for
+  outstanding packets. Per-ACK work scales with the ACK window, not
+  the full outstanding queue. Measured on macOS gen_udp: 10 MB
+  upload 55 → 59 MB/s, 5 MB download 34 → 50 MB/s. (#72)
+- `flush_gso/1` passes the batch as an iov list directly to
+  `socket:sendmsg/2` with the UDP_SEGMENT cmsg, saving up to
+  ~76 KB of user-space copy per flush on a 64-packet batch. (#70)
+- `send_app_packet_internal/3` samples `monotonic_time` once per
+  packet and reuses it for loss tracking and `last_activity`. (#71)
+- Per-packet overhead on the bulk-send path reduced: single
+  `#state{}` update, PTO timer reschedule skipped when within
+  tolerance, `process_send_queue` and pacing timeout short-circuit
+  on empty queue, stream data normalised to binary once at the
+  fragmentation boundary.
+- `state_to_map/1` replaces the coarse `send_batching` boolean with
+  three explicit fields: `send_backend` (`direct` | `gen_udp` |
+  `socket`), `send_batching_enabled`, `send_gso_supported`.
+
+### Fixed
+- Server connection crashed with `function_clause` when the listener
+  was on `socket_backend => socket` because `inet:sockname/1` rejects
+  `{'$socket', Ref}` handles. Branch on socket shape:
+  `socket:sockname/1` for OTP socket handles, `inet:sockname/1` for
+  `gen_udp` ports.
+- UDP_SEGMENT `setsockopt` now uses `sizeof(int)` (32-bit native)
+  instead of u16, which Linux rejected with `EINVAL`; GSO capability
+  detection silently returned false and the GSO CT job was skipping.
+  The cmsg path already used u16 correctly. (#67)
+- GSO skipped for single-packet batches: UDP_SEGMENT with a
+  sub-`gso_size` single-packet payload drops silently on
+  ubuntu-24.04. `batch_count == 1` has no segmentation work; fall
+  through to `flush_individual`. (#73)
+- Listener no longer sets UDP_SEGMENT at socket level. A socket-wide
+  UDP_SEGMENT forces segmentation on every outbound datagram,
+  including short handshake packets that can't be segmented. GSO is
+  now applied only via the per-message cmsg in `flush_gso`. (#73)
+- GSO bypassed when a batch mixes packet sizes (padded 1200-byte
+  Initial + ~400-byte Handshake). UDP_SEGMENT requires every segment
+  except the last to be exactly `gso_size`, otherwise the client
+  sees undecodable datagrams and stalls at
+  `awaiting_encrypted_extensions`. `flush/1` checks uniformity and
+  falls through to `flush_individual` when it fails. (#75)
+- Listener self-send: `send_packet/6` was calling `quic_socket:send/4`
+  and dropping the returned state, so version-negotiation / retry /
+  stateless-reset packets were buffered then lost on the socket
+  backend with `batching_enabled=true`. Switched to
+  `send_immediate/4`.
+- `send_queue_bytes` accounting leaked on ACK-coalesce dequeues and
+  could eventually trip `?MAX_SEND_QUEUE_BYTES` on long-lived
+  connections. Added `send_queue_count` as an explicit O(1)
+  emptiness predicate so zero-byte FIN-only sends enqueued under
+  pacing are no longer stranded.
+- `examples/echo_server.erl`: `handle_connection/2` expects a DCID
+  binary, not an info map; returns `{ok, HandlerPid}` so the listener
+  transfers ownership; peer address fetched via `quic:peername/1`.
+  (#65)
+- `examples/qlog_example.erl`: added a `connection_handler` so the
+  server echoes client data; waits for the client connection to
+  terminate before returning so the qlog writer flushes. (#68)
+
 ## [1.0.2] - 2026-04-16
 
 ### Fixed
