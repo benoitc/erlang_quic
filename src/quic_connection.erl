@@ -6539,11 +6539,11 @@ cwnd_only_check(CCState, Size, Urgency) ->
 
 %% @doc Send stream data that requires chunking.
 %%
-%% Per-drain constants — `Urgency`, `MaxChunkSize`, `PacketSize` — are cached
-%% here once and threaded through `send_stream_chunked_loop/9` instead of being
-%% re-looked-up for every chunk via a tail-call back into
-%% `send_stream_data_fragmented_tracked/6`. For a 10 MB upload this cuts
-%% thousands of `get_stream_urgency/2` / `get_max_stream_data_per_packet/1`
+%% Per-drain constants (Urgency, MaxChunkSize, PacketSize) are cached
+%% here once and threaded through send_stream_chunked_loop/9 instead of
+%% being re-looked-up for every chunk via a tail-call back into
+%% send_stream_data_fragmented_tracked/6. For a 10 MB upload this cuts
+%% thousands of get_stream_urgency/2 / get_max_stream_data_per_packet/1
 %% calls and record-pattern matches out of the hot send loop.
 send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize) ->
     Urgency = get_stream_urgency(StreamId, State#state.streams),

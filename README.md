@@ -245,7 +245,20 @@ This implementation passes all 10 [QUIC Interop Runner](https://github.com/quic-
 
 ## Documentation
 
-Generate documentation with:
+Topic guides under `docs/`:
+
+- [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md): first-connection walkthrough
+- [docs/CLIENT_GUIDE.md](docs/CLIENT_GUIDE.md): client API reference
+- [docs/SERVER_GUIDE.md](docs/SERVER_GUIDE.md): server API reference
+- [docs/HTTP3.md](docs/HTTP3.md): HTTP/3 and datagrams
+- [docs/QUIC_DIST.md](docs/QUIC_DIST.md): Erlang distribution over QUIC
+- [docs/QLOG_GUIDE.md](docs/QLOG_GUIDE.md): qlog tracing
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md): throughput characteristics, socket-backend rationale, roadmap
+- [docs/DESIGN.md](docs/DESIGN.md): architecture, state machine, packet flow
+- [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md): contributing
+- [docs/features.md](docs/features.md): feature matrix and API reference
+
+Generate API documentation with:
 
 ```bash
 rebar3 ex_doc
