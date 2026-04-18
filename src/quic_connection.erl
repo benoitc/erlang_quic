@@ -6347,11 +6347,73 @@ cwnd_only_check(CCState, Size, Urgency) ->
     end.
 
 %% @doc Send stream data that requires chunking.
+%%
+%% Per-drain constants — `Urgency`, `MaxChunkSize`, `PacketSize` — are cached
+%% here once and threaded through `send_stream_chunked_loop/9` instead of being
+%% re-looked-up for every chunk via a tail-call back into
+%% `send_stream_data_fragmented_tracked/6`. For a 10 MB upload this cuts
+%% thousands of `get_stream_urgency/2` / `get_max_stream_data_per_packet/1`
+%% calls and record-pattern matches out of the hot send loop.
 send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize) ->
-    #state{cc_state = CCState, pacing_enabled = PacingEnabled, streams = Streams} = State,
+    Urgency = get_stream_urgency(StreamId, State#state.streams),
     PacketSize = MaxChunkSize + ?PACKET_OVERHEAD,
-    %% Control streams (urgency 0) can exceed cwnd to prevent tick blocking
-    Urgency = get_stream_urgency(StreamId, Streams),
+    send_stream_chunked_loop(
+        StreamId,
+        Offset,
+        Data,
+        Fin,
+        State,
+        BytesSentSoFar,
+        MaxChunkSize,
+        Urgency,
+        PacketSize
+    ).
+
+%% Inner chunked-send loop. Cached values never change within a single drain.
+%% The final sub-MaxChunkSize remainder falls through to
+%% `send_stream_single_packet/6` so a partial last chunk gets a correctly
+%% sized packet (Length != MaxChunkSize) and can also carry a FIN.
+send_stream_chunked_loop(
+    StreamId,
+    Offset,
+    Data,
+    Fin,
+    State,
+    BytesSentSoFar,
+    MaxChunkSize,
+    Urgency,
+    PacketSize
+) ->
+    DataSize = byte_size(Data),
+    case DataSize =< MaxChunkSize of
+        true ->
+            send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar);
+        false ->
+            send_stream_chunked_step(
+                StreamId,
+                Offset,
+                Data,
+                Fin,
+                State,
+                BytesSentSoFar,
+                MaxChunkSize,
+                Urgency,
+                PacketSize
+            )
+    end.
+
+send_stream_chunked_step(
+    StreamId,
+    Offset,
+    Data,
+    Fin,
+    State,
+    BytesSentSoFar,
+    MaxChunkSize,
+    Urgency,
+    PacketSize
+) ->
+    #state{cc_state = CCState, pacing_enabled = PacingEnabled} = State,
     Check =
         case PacingEnabled of
             true -> quic_cc:send_check(CCState, PacketSize, Urgency);
@@ -6364,10 +6426,16 @@ send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunk
             Frame = {stream, StreamId, Offset, Chunk, false},
             Payload = quic_frame:encode_iodata(Frame),
             State1 = send_app_packet_internal(Payload, [Frame], State0),
-            NewOffset = Offset + MaxChunkSize,
-            NewBytesSent = BytesSentSoFar + MaxChunkSize,
-            send_stream_data_fragmented_tracked(
-                StreamId, NewOffset, Rest, Fin, State1, NewBytesSent
+            send_stream_chunked_loop(
+                StreamId,
+                Offset + MaxChunkSize,
+                Rest,
+                Fin,
+                State1,
+                BytesSentSoFar + MaxChunkSize,
+                MaxChunkSize,
+                Urgency,
+                PacketSize
             );
         {blocked_pacing, Delay} ->
             ?LOG_DEBUG(
