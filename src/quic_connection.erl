@@ -2763,8 +2763,15 @@ maybe_coalesce_ack_with_data(AckFrameTuple, State) ->
             %% Send coalesced frames - pass tuples directly
             send_frame_tuples([AckFrameTuple, StreamFrameTuple], State1);
         none ->
-            %% Single frame - encode and send
-            send_app_packet_internal(quic_frame:encode(AckFrameTuple), [AckFrameTuple], State)
+            %% Flush the pending stream-data batch first: the ACK-only
+            %% packet is ~60 bytes and would break GSO uniformity on the
+            %% opt-in socket backend (see `quic_socket:gso_batch_uniform/2'),
+            %% pushing the whole flush onto `flush_individual'. A
+            %% preemptive flush keeps the stream batch uniform and lets
+            %% the ACK start a fresh batch that flushes at the next
+            %% send-cycle boundary.
+            State1 = flush_socket_batch(State),
+            send_app_packet_internal(quic_frame:encode(AckFrameTuple), [AckFrameTuple], State1)
     end.
 
 %% Dequeue a small stream frame tuple if available (< 500 bytes)
