@@ -55,7 +55,9 @@
     get_fd/1,
     get_socket/1,
     gso_supported/1,
-    info/1
+    info/1,
+    start_client_receiver/2,
+    stop_client_receiver/1
 ]).
 
 -include("quic.hrl").
@@ -153,8 +155,17 @@ open(Port, Opts) ->
     {ok, socket_state()} | {error, term()}.
 open_for_send(RemoteIP, Opts) ->
     Capabilities = detect_capabilities(),
-    Backend = maps:get(backend, Capabilities, gen_udp),
-    GSOSupported = maps:get(gso, Capabilities, false),
+    %% Allow the caller to force a backend (via `backend => socket'
+    %% in Opts) so the opt-in client path can request the OTP socket
+    %% NIF even on platforms where capability detection would pick
+    %% `gen_udp' by default. Similarly `gso => false' lets the caller
+    %% opt out of GSO even when the platform supports it — the opt-in
+    %% client path uses that to avoid UDP_SEGMENT until the batched
+    %% send path is validated against gen_udp servers.
+    DetectedBackend = maps:get(backend, Capabilities, gen_udp),
+    Backend = maps:get(backend, Opts, DetectedBackend),
+    DetectedGSO = maps:get(gso, Capabilities, false),
+    GSOSupported = maps:get(gso, Opts, DetectedGSO),
 
     BatchOpts = maps:get(batching, Opts, #{}),
     BatchingEnabled = maps:get(enabled, BatchOpts, true),
@@ -520,6 +531,59 @@ get_fd(#socket_state{socket = Socket, backend = socket}) ->
         end
     catch
         _:_ -> {error, not_supported}
+    end.
+
+%% @doc Spawn a client-side receiver process for the `socket' backend.
+%%
+%% The OTP `socket' module does not support `{active, N}' semantics,
+%% so instead we spawn a dedicated process that loops on
+%% `socket:recvfrom/4' and forwards each datagram as
+%% `{udp, Owner, IP, Port, Data}' to the owning connection process.
+%% This lets the existing `quic_connection' receive path keep
+%% pattern-matching on the gen_udp-style message shape without
+%% any branching.
+%%
+%% Returns the receiver pid, linked to the caller so it terminates
+%% when the connection process exits.
+-spec start_client_receiver(socket_state(), pid()) -> {ok, pid()} | {error, term()}.
+start_client_receiver(#socket_state{backend = socket} = SocketState, Owner) when is_pid(Owner) ->
+    Pid = spawn_link(fun() -> client_recv_loop(SocketState, Owner) end),
+    {ok, Pid};
+start_client_receiver(#socket_state{backend = gen_udp}, _Owner) ->
+    {error, not_supported_on_gen_udp}.
+
+%% @doc Stop a client receiver process previously returned by
+%% `start_client_receiver/2'. Safe to call with `undefined'.
+-spec stop_client_receiver(pid() | undefined) -> ok.
+stop_client_receiver(undefined) ->
+    ok;
+stop_client_receiver(Pid) when is_pid(Pid) ->
+    case is_process_alive(Pid) of
+        true ->
+            unlink(Pid),
+            exit(Pid, shutdown),
+            ok;
+        false ->
+            ok
+    end.
+
+%% Blocking recvfrom loop. Forwards each datagram as a gen_udp-shaped
+%% `{udp, Socket, IP, Port, Data}' tuple so the owner's existing
+%% receive handlers work unchanged — `Socket' here matches the OTP
+%% socket handle stored in `#state.socket'. Uses a 100ms timeout so
+%% exit signals from the linked owner are processed promptly rather
+%% than blocking forever in the NIF.
+client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
+    case socket:recvfrom(Socket, 0, [], 100) of
+        {ok, {#{addr := IP, port := Port}, Data}} ->
+            Owner ! {udp, Socket, IP, Port, Data},
+            client_recv_loop(SocketState, Owner);
+        {error, timeout} ->
+            client_recv_loop(SocketState, Owner);
+        {error, closed} ->
+            ok;
+        {error, _Reason} ->
+            client_recv_loop(SocketState, Owner)
     end.
 
 %% @doc Detect platform capabilities for GSO/GRO.

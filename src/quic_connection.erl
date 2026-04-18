@@ -232,12 +232,20 @@
     version = ?QUIC_VERSION_1 :: non_neg_integer(),
 
     %% Socket
-    socket :: gen_udp:socket() | undefined,
+    socket :: gen_udp:socket() | socket:socket() | undefined,
     %% Dedicated send socket for server connections (SO_REUSEPORT)
     %% Allows each server connection to have its own batching state
     send_socket :: gen_udp:socket() | undefined,
     %% Socket state for batching (quic_socket abstraction)
     socket_state :: quic_socket:socket_state() | undefined,
+    %% Client socket backend selector (gen_udp | socket). When `socket'
+    %% the client uses the OTP socket NIF via open_for_send/2 and a
+    %% dedicated receiver process forwards {udp, ...} messages to this
+    %% connection. Ignored for server connections (the listener picks).
+    client_socket_backend = gen_udp :: gen_udp | socket,
+    %% Pid of the client-side receiver process when
+    %% client_socket_backend = socket; undefined otherwise.
+    client_receiver :: pid() | undefined,
     remote_addr :: {inet:ip_address(), inet:port_number()},
     local_addr :: {inet:ip_address(), inet:port_number()} | undefined,
 
@@ -838,11 +846,16 @@ init([Host, Port, Opts, Owner, Socket]) ->
                 init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr)
             catch
                 Class:Reason:Stack ->
-                    %% Clean up socket on initialization failure
+                    %% Clean up socket on initialization failure — pick the
+                    %% right close based on the socket_backend option.
                     case OwnsSocket of
-                        true -> gen_udp:close(Sock);
+                        true -> close_raw_client_socket(Opts, Sock);
                         false -> ok
                     end,
+                    %% Drop any stashed socket_state left by
+                    %% open_client_socket_backend/2 (process dict)
+                    %% so we don't leak it across retries.
+                    _ = erase(client_socket_state),
                     erlang:raise(Class, Reason, Stack)
             end;
         {error, Reason} ->
@@ -1087,9 +1100,22 @@ build_server_preferred_address(Opts) ->
 %% Helper to open or use provided socket for client
 %% Match address family based on the remote address
 %% Opts is the full options map, ExtraOpts allows socket options like {ip, Address}
-open_client_socket(undefined, {IP, _Port}, Opts, ExtraOpts) ->
+open_client_socket(undefined, {IP, _Port} = RemoteAddr, Opts, ExtraOpts) ->
+    case maps:get(socket_backend, Opts, gen_udp) of
+        socket ->
+            open_client_socket_backend(RemoteAddr, Opts);
+        _ ->
+            open_client_socket_genudp(IP, Opts, ExtraOpts)
+    end;
+open_client_socket(S, _RemoteAddr, _Opts, _ExtraOpts) ->
+    %% Pre-opened socket provided, ignore extra opts
+    case inet:sockname(S) of
+        {ok, LA} -> {ok, S, LA, false};
+        {error, Reason} -> {error, Reason}
+    end.
+
+open_client_socket_genudp(IP, Opts, ExtraOpts) ->
     AddrFamily = address_family(IP),
-    %% UDP buffer sizing - larger buffers improve throughput significantly
     RecBuf = maps:get(recbuf, Opts, ?DEFAULT_UDP_RECBUF),
     SndBuf = maps:get(sndbuf, Opts, ?DEFAULT_UDP_SNDBUF),
     BaseOpts = [
@@ -1110,12 +1136,39 @@ open_client_socket(undefined, {IP, _Port}, Opts, ExtraOpts) ->
             end;
         {error, Reason} ->
             {error, Reason}
-    end;
-open_client_socket(S, _RemoteAddr, _Opts, _ExtraOpts) ->
-    %% Pre-opened socket provided, ignore extra opts
-    case inet:sockname(S) of
-        {ok, LA} -> {ok, S, LA, false};
-        {error, Reason} -> {error, Reason}
+    end.
+
+%% Opt-in socket-backend path. Uses `quic_socket:open_for_send/2' so
+%% the connection gets an OTP socket with GSO enabled on Linux. The
+%% wrapping `#socket_state{}' is stashed in the process dictionary for
+%% `init_client_state/8' to adopt without widening the tuple shape
+%% returned by `open_client_socket/4'. Migration / rebind are disabled
+%% on this path.
+open_client_socket_backend({IP, _Port}, Opts) ->
+    %% Disable batching + GSO on the opt-in socket path for now. The
+    %% multi-packet coalesced UDP_SEGMENT flush path needs more
+    %% validation against gen_udp servers (see Phase 1b follow-up);
+    %% direct `socket:sendmsg' one packet at a time keeps the MVP
+    %% simple and matches what every QUIC server on the wire expects.
+    BatchingOpt = maps:get(batching, Opts, #{}),
+    BatchingOff = BatchingOpt#{enabled => false},
+    OpenOpts = Opts#{
+        backend => socket,
+        gso => false,
+        batching => BatchingOff
+    },
+    case quic_socket:open_for_send(IP, OpenOpts) of
+        {ok, SocketState} ->
+            case quic_socket:sockname(SocketState) of
+                {ok, LA} ->
+                    put(client_socket_state, SocketState),
+                    {ok, quic_socket:get_socket(SocketState), LA, true};
+                {error, Reason} ->
+                    quic_socket:close(SocketState),
+                    {error, Reason}
+            end;
+        {error, _} = Error ->
+            Error
     end.
 
 %% Determine address family from IP tuple
@@ -1166,17 +1219,36 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% Get idle timeout for keep-alive calculation
     IdleTimeoutClient = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
 
-    %% Initialize socket_state for batching (client connections only)
-    %% Client connections use wrap() since they need the same socket for
-    %% both sending and receiving. GSO is not available through gen_udp,
-    %% but batching still provides significant throughput benefits.
+    %% Initialize socket_state for batching (client connections only).
+    %% On the opt-in `socket_backend => socket' path, `open_client_socket'
+    %% already built a `#socket_state{}' with `backend = socket' and
+    %% stashed it via the process dictionary — adopt it here so we don't
+    %% wrap the raw handle twice. Otherwise (gen_udp default), wrap for
+    %% batching unless the caller explicitly disabled it.
+    ClientSocketBackend = maps:get(socket_backend, Opts, gen_udp),
     SocketState =
-        case maps:get(batching, Opts, #{}) of
-            #{enabled := false} ->
-                undefined;
-            BatchOpts ->
-                {ok, SS} = quic_socket:wrap(Sock, #{batching => BatchOpts}),
-                SS
+        case erase(client_socket_state) of
+            undefined ->
+                case maps:get(batching, Opts, #{}) of
+                    #{enabled := false} ->
+                        undefined;
+                    BatchOpts ->
+                        {ok, SS} = quic_socket:wrap(Sock, #{batching => BatchOpts}),
+                        SS
+                end;
+            StashedSS ->
+                StashedSS
+        end,
+    %% Socket-backend clients get a dedicated receiver process that
+    %% forwards `{udp, Owner, IP, Port, Data}' messages to this
+    %% connection — the `socket' NIF has no `{active, N}' mode.
+    ClientReceiver =
+        case ClientSocketBackend of
+            socket when SocketState =/= undefined ->
+                {ok, RPid} = quic_socket:start_client_receiver(SocketState, self()),
+                RPid;
+            _ ->
+                undefined
         end,
 
     %% If we've previously received a NEW_TOKEN from this endpoint,
@@ -1196,6 +1268,8 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         role = client,
         socket = Sock,
         socket_state = SocketState,
+        client_socket_backend = ClientSocketBackend,
+        client_receiver = ClientReceiver,
         remote_addr = RemoteAddr,
         local_addr = LocalAddr,
         owner = Owner,
@@ -1265,7 +1339,6 @@ terminate(
     Reason,
     StateName,
     #state{
-        socket = Socket,
         send_socket = SendSocket,
         socket_state = SocketState,
         pto_timer = PtoTimer,
@@ -1321,10 +1394,14 @@ terminate(
         undefined -> ok;
         _ -> gen_udp:close(SendSocket)
     end,
-    %% Only close socket for client connections (clients own their socket)
-    %% Server connections share the listener's socket and must not close it
-    case {Role, Socket} of
-        {client, S} when S =/= undefined -> gen_udp:close(S);
+    %% Only close socket for client connections (clients own their socket).
+    %% Server connections share the listener's socket and must not close it.
+    %% `close_client_socket/1' handles both the gen_udp and socket
+    %% backends (the OTP socket was already closed above via
+    %% `quic_socket:close(SocketState)'; the receiver process is stopped
+    %% here).
+    case Role of
+        client -> close_client_socket(State);
         _ -> ok
     end,
     %% Close QLOG trace file
@@ -1408,9 +1485,9 @@ idle(info, {quic_packets, Packets, _RemoteAddr}, #state{role = server} = State) 
     NewState = handle_packets_batch(Packets, State),
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(idle, FlushedState);
-idle(cast, process, #state{role = client, socket = Socket, active_n = N} = State) ->
+idle(cast, process, #state{role = client, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
-    inet:setopts(Socket, [{active, N}]),
+    client_rearm_active(State, N),
     {keep_state, State};
 idle(cast, process, #state{role = server} = State) ->
     %% Server connections receive via listener, don't touch socket options
@@ -1494,9 +1571,9 @@ handshaking(info, {quic_packets, Packets, _RemoteAddr}, #state{role = server} = 
     NewState = handle_packets_batch(Packets, State),
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(handshaking, FlushedState);
-handshaking(cast, process, #state{role = client, socket = Socket, active_n = N} = State) ->
+handshaking(cast, process, #state{role = client, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
-    inet:setopts(Socket, [{active, N}]),
+    client_rearm_active(State, N),
     {keep_state, State};
 handshaking(cast, process, #state{role = server} = State) ->
     %% Server connections receive via listener, don't touch socket options
@@ -1518,7 +1595,6 @@ connected(
     #state{
         owner = Owner,
         alpn = Alpn,
-        socket = Socket,
         role = Role,
         pending_data = Pending,
         transport_params = TransportParams,
@@ -1537,7 +1613,7 @@ connected(
     %% For client connections, ensure socket is active for receiving
     %% Server connections receive via listener (quic_packet messages)
     case Role of
-        client -> inet:setopts(Socket, [{active, ActiveN}]);
+        client -> client_rearm_active(State, ActiveN);
         server -> ok
     end,
     %% Send any data that was queued before connection established
@@ -1881,9 +1957,9 @@ connected(cast, {send_data_async, StreamId, Data, Fin}, State) ->
             %% Silently drop errors in async mode
             {keep_state, State}
     end;
-connected(cast, process, #state{role = client, socket = Socket, active_n = N} = State) ->
+connected(cast, process, #state{role = client, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
-    inet:setopts(Socket, [{active, N}]),
+    client_rearm_active(State, N),
     {keep_state, State};
 connected(cast, process, #state{role = server} = State) ->
     %% Server connections receive via listener, don't touch socket options
@@ -2067,7 +2143,7 @@ handle_common_event(
     _StateName,
     #state{role = client, socket = Socket, active_n = N} = State
 ) ->
-    inet:setopts(Socket, [{active, N}]),
+    client_rearm_active(State, N),
     {keep_state, State};
 handle_common_event(info, {udp_passive, _Socket}, _StateName, State) ->
     %% Server connections or different socket - ignore
@@ -2187,7 +2263,7 @@ send_client_hello(State) ->
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
 
     %% Enable socket for receiving (use {active, N} for better throughput)
-    inet:setopts(FlushedState#state.socket, [{active, FlushedState#state.active_n}]),
+    client_rearm_active(FlushedState, FlushedState#state.active_n),
 
     FlushedState.
 
@@ -3060,11 +3136,11 @@ handle_packets_batch([Packet | Rest], State) ->
     NewState = handle_packet_loop(Packet, State),
     handle_packets_batch(Rest, NewState).
 
-handle_packet_loop(<<>>, #state{role = client, socket = Socket, active_n = N} = State) ->
+handle_packet_loop(<<>>, #state{role = client, active_n = N} = State) ->
     %% No more data to process - re-enable socket for client connections
     %% Note: With {active, N}, calling setopts resets the counter, so this is optional
     %% but provides safety in case socket went passive during processing
-    inet:setopts(Socket, [{active, N}]),
+    client_rearm_active(State, N),
     State;
 handle_packet_loop(<<>>, #state{role = server} = State) ->
     %% No more data to process - server socket managed by listener
@@ -3136,8 +3212,8 @@ handle_packet_loop(Data, State) ->
 %% Re-enable socket for receiving - only for client connections.
 %% Server connections use listener's socket which is managed by the listener.
 %% With {active, N}, this resets the counter (provides safety margin).
-maybe_reenable_socket(#state{role = client, socket = Socket, active_n = N}) ->
-    inet:setopts(Socket, [{active, N}]);
+maybe_reenable_socket(#state{role = client, active_n = N} = State) ->
+    client_rearm_active(State, N);
 maybe_reenable_socket(#state{role = server}) ->
     ok.
 
@@ -5249,6 +5325,48 @@ send_and_take_socket_state(Packet, State) ->
         {ok, undefined} -> State#state.socket_state;
         {ok, NewSocketState} -> NewSocketState;
         {error, _} -> State#state.socket_state
+    end.
+
+%% Re-arm active-N on the client socket. No-op on the `socket' backend
+%% which delivers messages via the dedicated receiver process — see
+%% `quic_socket:start_client_receiver/2'.
+client_rearm_active(#state{client_socket_backend = socket}, _N) ->
+    ok;
+client_rearm_active(#state{socket = Socket}, N) ->
+    inet:setopts(Socket, [{active, N}]).
+
+%% Close the client's raw socket + receiver process on `terminate/3'.
+%% `quic_socket:close(SocketState)' in the caller already closed the
+%% OTP socket on the socket-backend path; here we only stop the
+%% dedicated receiver. For gen_udp we still need to close the raw
+%% `gen_udp:socket()' — nothing else owns it.
+close_client_socket(#state{client_socket_backend = socket, client_receiver = Receiver}) ->
+    quic_socket:stop_client_receiver(Receiver);
+close_client_socket(#state{socket = undefined}) ->
+    ok;
+close_client_socket(#state{socket = Socket}) ->
+    try gen_udp:close(Socket) of
+        _ -> ok
+    catch
+        _:_ -> ok
+    end.
+
+%% Close a raw client socket handle (no `#state{}' available yet) based
+%% on the `socket_backend' option. Used on init-failure rollback.
+close_raw_client_socket(Opts, Socket) ->
+    case maps:get(socket_backend, Opts, gen_udp) of
+        socket ->
+            try socket:close(Socket) of
+                _ -> ok
+            catch
+                _:_ -> ok
+            end;
+        _ ->
+            try gen_udp:close(Socket) of
+                _ -> ok
+            catch
+                _:_ -> ok
+            end
     end.
 
 %% Flush any batched packets (call before timers or idle periods)
