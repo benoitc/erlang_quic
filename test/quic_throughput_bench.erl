@@ -229,7 +229,7 @@ stats_delta(After, Before) ->
     maps:from_list(
         [
             {K, maps:get(K, After, 0) - maps:get(K, Before, 0)}
-         || K <- [packets_sent, batch_flushes, packets_coalesced]
+         || K <- [packets_sent, batch_flushes, packets_coalesced, ack_sent, retransmits]
         ]
     ).
 
