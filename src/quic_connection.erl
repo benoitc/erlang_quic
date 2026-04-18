@@ -5329,7 +5329,12 @@ should_delay_ack(Frames) ->
 schedule_delayed_ack(app, State) ->
     arm_ack_timer(State).
 
-%% Check if any frame in the list is ack-eliciting
+%% Check if any frame in the list is ack-eliciting. Fast-path the
+%% single-stream-frame list produced by every chunked / single stream
+%% send on the hot path — skips the `is_ack_eliciting_frame/1' dispatch
+%% plus list tail-walk.
+contains_ack_eliciting_frames([{stream, _, _, _, _}]) ->
+    true;
 contains_ack_eliciting_frames([]) ->
     false;
 contains_ack_eliciting_frames([Frame | Rest]) ->
