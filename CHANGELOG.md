@@ -4,6 +4,67 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-04-19
+
+Post-1.1.0 work split across three tracks: a client-side socket-backend
+opt-in, a round of hot-path micro-optimisations on the send and
+receive paths, and a migration fix for the default gen_udp client.
+
+### Added
+- Opt-in `socket_backend => socket` for client connections. Routes
+  the client through `quic_socket:open_for_send/2` so it picks up the
+  OTP socket NIF on Linux with GSO available per-message via cmsg,
+  instead of the `gen_udp` port driver. +18% download throughput on
+  arm64 Linux docker (10 MB bench); upload is neutral. (#88, #91)
+- Client migration (`quic:migrate/1`) now works on the opt-in socket
+  backend. Rebind closes the old OTP socket, stops its dedicated
+  receiver process, opens a fresh one, and threads the new handle
+  through the connection state. (#90)
+- `quic_socket:start_client_receiver/2` / `stop_client_receiver/1`:
+  dedicated receiver process for the socket-backend client path
+  (the OTP socket NIF has no `{active, N}` mode). (#88)
+- `quic_socket:set_socket/2` swaps the underlying socket handle
+  inside a `#socket_state{}` while preserving batching configuration.
+  Used by the migration rebind path. (#93)
+- Instrumentation counters `ack_sent` and `retransmits` on
+  `quic_connection:get_stats/1` and the throughput bench output
+  (Phase 0a). (#77, #78)
+
+### Fixed
+- `quic:migrate/1` on the default gen_udp client no longer drops
+  post-migrate traffic. Rebinding previously left
+  `#state.socket_state` pointing at the just-closed old socket; every
+  send went through the dead handle and was silently dropped. Also
+  flushes any pending batch to the old socket before rebind so
+  pre-migrate packets reach the server under their original CID.
+  (#93)
+
+### Performance
+- Fuse per-packet cwnd + pacing check into `quic_cc:send_check/3`
+  (one BIF call and one record match instead of the previous four).
+  (#79)
+- Hoist per-chunk lookups (`stream_urgency`, `max_stream_data_per_packet`,
+  pre-computed stream-frame header prefix) out of the chunked send
+  loop. (#80, #85)
+- ACK 1-RTT packets immediately on reorder (RFC 9002 §6.2) while
+  keeping the decimation window for in-order traffic. (#81)
+- Fast-path single-stream-frame in `contains_ack_eliciting_frames/1`
+  on the bulk-upload hot path. (#82)
+- Thread the updated `socket_state` back from `do_socket_send` via
+  the return value, dropping the process-dictionary roundtrip. (#83)
+- Replace the `crypto:exor/2` NIF call with inline Erlang XOR for
+  the 1-4 byte header-protection mask. (#84)
+- Inline the `?QLOG_ENABLED` check at packet/frame event call
+  sites so the event-map is never built when qlog is off. (#86)
+- Coalesce the `monotonic_time` samples on the receive hot path
+  (one BIF call per received datagram instead of three). (#87)
+- Flush the pending stream-data batch before emitting an ACK-only
+  packet so it does not break GSO uniformity on the opt-in socket
+  backend. +6.4% upload throughput on arm64 Linux docker. (#92)
+- Re-enable GSO on the opt-in socket-backend client: drop the
+  socket-level `UDP_SEGMENT` setsockopt and rely on per-message cmsg
+  via `flush_gso/1`. (#91)
+
 ## [1.1.0] - 2026-04-18
 
 Server-side throughput work. Per-connection send batching over the
