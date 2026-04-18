@@ -193,30 +193,43 @@ get_expected_node_count() ->
 connect_to_cluster() ->
     SeedNode = get_seed_node(),
     ExpectedCount = get_expected_node_count(),
+    Self = node(),
 
-    %% Only try to connect to seed node for non-seed nodes
-    %% This avoids simultaneous connection attempts
+    %% The seed waits for others to come to it. Every other node
+    %% connects to the seed first, then to every remaining peer listed
+    %% in CLUSTER_NODES. Erlang distribution does not auto-mesh when a
+    %% third node joins, so each node has to dial every other node
+    %% explicitly for a 3+ node cluster to form correctly.
     case SeedNode of
         undefined ->
-            %% This is the seed node, wait for others to connect
-            log_event(seed_node_waiting, #{expected => ExpectedCount}),
-            ok;
-        Seed when Seed =/= node() ->
-            %% Only connect to seed, let the mesh form naturally
-            ConnectedNodes = nodes(),
-            case lists:member(Seed, ConnectedNodes) of
-                true ->
-                    log_event(already_connected, Seed),
-                    ok;
-                false ->
-                    log_event(connecting, Seed),
-                    case net_kernel:connect_node(Seed) of
-                        true -> log_event(connected, Seed);
-                        false -> log_event(connect_failed, Seed);
-                        ignored -> log_event(connect_ignored, Seed)
-                    end
-            end;
-        _ -> ok
+            log_event(seed_node_waiting, #{expected => ExpectedCount});
+        Seed when Seed =/= Self ->
+            ensure_connected(Seed)
+    end,
+
+    %% Dial every non-self peer from CLUSTER_NODES that we do not
+    %% already know about. Trim the list to the expected cluster size
+    %% so a 3-node test does not try to reach node4/node5 entries that
+    %% were seeded into the env for the 5-node profile.
+    PeersExpected = max(0, ExpectedCount - 1),
+    Peers = lists:sublist(
+        [N || N <- get_cluster_nodes(), N =/= Self], PeersExpected
+    ),
+    lists:foreach(fun ensure_connected/1, Peers).
+
+ensure_connected(Node) when Node =:= undefined ->
+    ok;
+ensure_connected(Node) ->
+    case lists:member(Node, nodes()) of
+        true ->
+            log_event(already_connected, Node);
+        false ->
+            log_event(connecting, Node),
+            case net_kernel:connect_node(Node) of
+                true -> log_event(connected, Node);
+                false -> log_event(connect_failed, Node);
+                ignored -> log_event(connect_ignored, Node)
+            end
     end.
 
 get_seed_node() ->
