@@ -425,17 +425,30 @@ flush(#socket_state{batch_count = Count, batch_addr = undefined} = State) ->
     ?LOG_WARNING(#{what => flush_no_addr, buffer_size => Count}),
     {ok, clear_batch(State)};
 flush(#socket_state{gso_supported = true, batch_count = 1} = State) ->
-    %% Single-packet batch adds no segmentation work, and on some Linux
-    %% kernels sendmsg with UDP_SEGMENT + a sub-gso_size payload stalls
-    %% the handshake (server's ServerHello is shorter than gso_size and
-    %% always alone in the batch). Take the direct-send path.
+    %% Single-packet batch has no segmentation work; direct send.
     flush_individual(State);
-flush(#socket_state{gso_supported = true} = State) ->
-    %% GSO path - send all packets in one syscall
-    flush_gso(State);
+flush(#socket_state{gso_supported = true, batch_buffer = Buffer, gso_size = GSO} = State) ->
+    %% UDP_SEGMENT requires every segment except the last to be
+    %% exactly gso_size. Handshake flights coalesce Initial-padded-to-
+    %% 1200 with a ~400 byte Handshake packet; a naive GSO split
+    %% mis-aligns those boundaries and the client cannot decode. When
+    %% the batch is not uniform, fall through to individual sends.
+    case gso_batch_uniform(Buffer, GSO) of
+        true -> flush_gso(State);
+        false -> flush_individual(State)
+    end;
 flush(#socket_state{} = State) ->
     %% Fallback path - send packets individually
     flush_individual(State).
+
+%% Batch buffer is stored newest-first (head was last added). For GSO
+%% correctness we need all packets EXCEPT the last-transmitted one
+%% (which is the head of the buffer) to be exactly gso_size. The
+%% last-transmitted packet may be shorter.
+gso_batch_uniform([], _GSO) ->
+    true;
+gso_batch_uniform([_Last | Earlier], GSO) ->
+    lists:all(fun(P) -> iolist_size(P) =:= GSO end, Earlier).
 
 %% @doc Receive packets from the socket.
 %% On Linux with GRO, may return multiple coalesced packets.
