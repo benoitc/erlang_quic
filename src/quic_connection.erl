@@ -1139,24 +1139,12 @@ open_client_socket_genudp(IP, Opts, ExtraOpts) ->
     end.
 
 %% Opt-in socket-backend path. Uses `quic_socket:open_for_send/2' so
-%% the connection gets an OTP socket with GSO enabled on Linux. The
-%% wrapping `#socket_state{}' is stashed in the process dictionary for
-%% `init_client_state/8' to adopt without widening the tuple shape
-%% returned by `open_client_socket/4'. Migration / rebind are disabled
-%% on this path.
+%% the connection gets an OTP socket with GSO available per-message via
+%% cmsg on uniform batches. The wrapping `#socket_state{}' is stashed
+%% in the process dictionary for `init_client_state/8' to adopt without
+%% widening the tuple shape returned by `open_client_socket/4'.
 open_client_socket_backend({IP, _Port}, Opts) ->
-    %% Disable batching + GSO on the opt-in socket path for now. The
-    %% multi-packet coalesced UDP_SEGMENT flush path needs more
-    %% validation against gen_udp servers (see Phase 1b follow-up);
-    %% direct `socket:sendmsg' one packet at a time keeps the MVP
-    %% simple and matches what every QUIC server on the wire expects.
-    BatchingOpt = maps:get(batching, Opts, #{}),
-    BatchingOff = BatchingOpt#{enabled => false},
-    OpenOpts = Opts#{
-        backend => socket,
-        gso => false,
-        batching => BatchingOff
-    },
+    OpenOpts = Opts#{backend => socket},
     case quic_socket:open_for_send(IP, OpenOpts) of
         {ok, SocketState} ->
             case quic_socket:sockname(SocketState) of
@@ -8058,10 +8046,8 @@ rebind_client_socket(#state{socket = OldSocket} = State) ->
     end.
 
 %% Socket-NIF rebind: stop the old receiver, close the old OTP socket
-%% via its `#socket_state{}' wrapper, open a fresh socket with the
-%% same opt-in profile (batching + GSO off — see
-%% `open_client_socket_backend/2'), and start a new receiver linked
-%% to this connection process.
+%% via its `#socket_state{}' wrapper, open a fresh send socket, and
+%% start a new receiver linked to this connection process.
 rebind_client_socket_otp(
     #state{
         remote_addr = {RemoteIP, _},
@@ -8080,11 +8066,7 @@ rebind_client_socket_otp(
                 _:_ -> ok
             end
     end,
-    OpenOpts = #{
-        backend => socket,
-        gso => false,
-        batching => #{enabled => false}
-    },
+    OpenOpts = #{backend => socket},
     case quic_socket:open_for_send(RemoteIP, OpenOpts) of
         {ok, NewSocketState} ->
             case quic_socket:start_client_receiver(NewSocketState, self()) of
