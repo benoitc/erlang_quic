@@ -236,6 +236,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `pmtu_max_mtu` - Maximum MTU to probe (default: 1500)
 - `recbuf` - UDP receive buffer size in bytes (default: 7MB)
 - `sndbuf` - UDP send buffer size in bytes (default: 7MB)
+- `server_send_batching` - Per-connection send batching on the server (default: true). On Linux + `socket_backend => socket` with UDP_SEGMENT, outgoing packets are coalesced into GSO super-datagrams via `sendmsg` cmsg; neutral on macOS / gen_udp. Set to `false` to fall back to direct `gen_udp:send/4`
 
 ### PMTU Discovery
 - `quic:get_mtu/1` - Get current effective MTU for a connection
