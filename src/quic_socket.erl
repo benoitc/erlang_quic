@@ -424,6 +424,12 @@ flush(#socket_state{batch_count = Count, batch_addr = undefined} = State) ->
     %% No address set but have data - shouldn't happen, but clear buffer
     ?LOG_WARNING(#{what => flush_no_addr, buffer_size => Count}),
     {ok, clear_batch(State)};
+flush(#socket_state{gso_supported = true, batch_count = 1} = State) ->
+    %% Single-packet batch adds no segmentation work, and on some Linux
+    %% kernels sendmsg with UDP_SEGMENT + a sub-gso_size payload stalls
+    %% the handshake (server's ServerHello is shorter than gso_size and
+    %% always alone in the batch). Take the direct-send path.
+    flush_individual(State);
 flush(#socket_state{gso_supported = true} = State) ->
     %% GSO path - send all packets in one syscall
     flush_gso(State);
@@ -555,7 +561,12 @@ bind_and_finalize_socket(Socket, Port, BatchConfig) ->
     end.
 
 build_socket_state(Socket, BatchConfig) ->
-    GSOEnabled = maybe_enable_gso(Socket, BatchConfig),
+    %% GSO is applied per-message via the UDP_SEGMENT cmsg in
+    %% flush_gso/1, never as a socket-level setsockopt. A socket-level
+    %% UDP_SEGMENT would force GSO segmentation on every outbound
+    %% datagram including the short handshake packets and fallback
+    %% sends, which stalled the handshake on ubuntu-24.04.
+    GSOEnabled = maps:get(gso_supported, BatchConfig, false),
     GROEnabled = maybe_enable_gro(Socket, BatchConfig),
     State = #socket_state{
         socket = Socket,
@@ -568,9 +579,10 @@ build_socket_state(Socket, BatchConfig) ->
     },
     {ok, State}.
 
+%% Retained for open_server_send's separate-socket path, which still
+%% uses a dedicated socket where a socket-level UDP_SEGMENT is safe
+%% (it is a send-only socket, never used for short handshake packets).
 maybe_enable_gso(Socket, #{gso_supported := true, gso_size := Size}) ->
-    %% UDP_SEGMENT setsockopt expects sizeof(int); the cmsg variant
-    %% (see flush path) is the one that takes u16.
     case socket:setopt_native(Socket, {udp, ?UDP_SEGMENT}, <<Size:32/native>>) of
         ok -> true;
         {error, _} -> false
