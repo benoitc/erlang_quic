@@ -61,6 +61,7 @@
     pacing_allows/2,
     get_pacing_tokens/2,
     pacing_delay/2,
+    send_check/3,
     max_datagram_size/1,
     min_recovery_duration/1,
     ecn_ce_counter/1
@@ -626,6 +627,54 @@ pacing_delay(
             Deficit = Size - CurrentTokens,
             SafeRate = max(Rate, 1),
             max(1, (Deficit * 1000 + SafeRate - 1) div SafeRate)
+    end.
+
+%% @doc Fused cwnd + pacing check for the hot send path.
+-spec send_check(cc_state(), non_neg_integer(), non_neg_integer()) ->
+    {ok, cc_state()}
+    | {blocked_cwnd, non_neg_integer()}
+    | {blocked_pacing, non_neg_integer()}.
+send_check(
+    #bbr_state{
+        cwnd = Cwnd,
+        bytes_in_flight = InFlight,
+        control_allowance = Allowance,
+        pacing_rate = Rate
+    } = State,
+    Size,
+    Urgency
+) ->
+    CwndLimit =
+        case Urgency of
+            0 -> Cwnd + Allowance;
+            _ -> Cwnd
+        end,
+    case InFlight + Size =< CwndLimit of
+        false ->
+            {blocked_cwnd, max(0, Cwnd - InFlight)};
+        true when Rate =:= 0 ->
+            {ok, State};
+        true ->
+            #bbr_state{
+                pacing_tokens = Tokens,
+                pacing_max_burst = MaxBurst,
+                last_pacing_update = LastUpdate
+            } = State,
+            Now = erlang:monotonic_time(microsecond),
+            Refreshed = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
+            case Refreshed >= Size of
+                true ->
+                    {ok, State#bbr_state{
+                        pacing_tokens = Refreshed - Size,
+                        last_pacing_update = Now
+                    }};
+                false ->
+                    %% BBR pacing rate is bytes/sec; return delay in ms.
+                    Deficit = Size - Refreshed,
+                    SafeRate = max(Rate, 1),
+                    DelayMs = max(1, (Deficit * 1000 + SafeRate - 1) div SafeRate),
+                    {blocked_pacing, DelayMs}
+            end
     end.
 
 %%====================================================================
