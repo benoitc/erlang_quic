@@ -10,7 +10,13 @@
 -include_lib("eunit/include/eunit.hrl").
 
 server_socket_backend_batching_off_test_() ->
-    {timeout, 15, fun server_socket_backend_batching_off/0}.
+    %% Linux-only: detect_capabilities/0 only exposes the OTP socket
+    %% NIF as the listener backend there. Elsewhere the bug this test
+    %% targets (gen_udp:send/4 on an OTP socket handle) cannot fire.
+    case os:type() of
+        {unix, linux} -> [{timeout, 15, fun server_socket_backend_batching_off/0}];
+        _ -> []
+    end.
 
 server_socket_backend_batching_off() ->
     {ok, Srv} = quic_test_echo_server:start(#{

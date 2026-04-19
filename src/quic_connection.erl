@@ -926,23 +926,11 @@ init({server, Opts}) ->
     %% on Linux with socket backend, use GSO via sendmsg. Gated on
     %% server_send_batching (default true) so operators can fall back to
     %% the direct gen_udp:send/4 path if needed.
-    SocketState =
-        case maps:get(server_send_batching, Opts, true) of
-            true ->
-                ListenerBackend = maps:get(listener_socket_backend, Opts, gen_udp),
-                ListenerGSO = maps:get(listener_gso_supported, Opts, false),
-                SenderOpts = #{
-                    backend => ListenerBackend,
-                    gso_supported => ListenerGSO,
-                    batching => maps:get(batching, Opts, #{})
-                },
-                case quic_socket:new_sender(Socket, SenderOpts) of
-                    {ok, S} -> S;
-                    {error, _} -> undefined
-                end;
-            false ->
-                undefined
-        end,
+    %% Build a per-connection sender even with batching off so sends
+    %% dispatch on `#socket_state.backend'. On the socket listener,
+    %% `#state.socket' is an OTP socket handle that `gen_udp:send/4'
+    %% cannot accept.
+    SocketState = build_server_socket_state(Socket, Opts),
 
     %% Initialize state
     State = #state{
@@ -1112,6 +1100,22 @@ open_client_socket(S, _RemoteAddr, _Opts, _ExtraOpts) ->
     case inet:sockname(S) of
         {ok, LA} -> {ok, S, LA, false};
         {error, Reason} -> {error, Reason}
+    end.
+
+build_server_socket_state(Socket, Opts) ->
+    BatchOpts =
+        case maps:get(server_send_batching, Opts, true) of
+            true -> maps:get(batching, Opts, #{});
+            false -> #{enabled => false}
+        end,
+    SenderOpts = #{
+        backend => maps:get(listener_socket_backend, Opts, gen_udp),
+        gso_supported => maps:get(listener_gso_supported, Opts, false),
+        batching => BatchOpts
+    },
+    case quic_socket:new_sender(Socket, SenderOpts) of
+        {ok, S} -> S;
+        {error, _} -> undefined
     end.
 
 open_client_socket_genudp(IP, Opts, ExtraOpts) ->
