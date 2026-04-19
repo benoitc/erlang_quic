@@ -3021,21 +3021,29 @@ send_app_packet_internal(Payload, Frames, State) ->
                 timer_dirty = true,
                 pto_dirty = true
             };
+        {error, Reason, ClearedSocketState} ->
+            send_app_packet_internal_error(
+                Reason, PN, PacketSize, PNSpace, State, ClearedSocketState
+            );
         {error, Reason} ->
-            %% Send failed - do NOT track packet as sent to avoid CC/loss inconsistency
-            %% The data will be re-sent via the PTO timeout mechanism
-            ?LOG_WARNING(
-                #{
-                    what => udp_send_failed,
-                    reason => Reason,
-                    pn => PN,
-                    size => PacketSize
-                },
-                ?QUIC_LOG_META
-            ),
-            %% Still bump PN to avoid reusing packet numbers
-            NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-            State#state{pn_app = NewPNSpace}
+            send_app_packet_internal_error(Reason, PN, PacketSize, PNSpace, State, undefined)
+    end.
+
+%% Common error handling for send_app_packet_internal: bump PN without
+%% tracking the packet (PTO owns retransmission) and, on the 3-tuple
+%% error path, write back the cleared socket_state so the stale batch
+%% does not linger.
+send_app_packet_internal_error(Reason, PN, PacketSize, PNSpace, State, ClearedSocketState) ->
+    ?LOG_WARNING(
+        #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
+        ?QUIC_LOG_META
+    ),
+    NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
+    case ClearedSocketState of
+        undefined ->
+            State#state{pn_app = NewPNSpace};
+        _ ->
+            State#state{pn_app = NewPNSpace, socket_state = ClearedSocketState}
     end.
 
 %% Pad Initial packet to minimum 1200 bytes
@@ -5298,7 +5306,9 @@ get_max_stream_recv_window(#state{fc_max_stream_recv_window = CachedMax}) ->
 %% `undefined' to leave the state unchanged). Callers thread the
 %% returned state into their subsequent `#state{}' record update.
 -spec do_socket_send(iodata(), #state{}) ->
-    {ok, undefined | quic_socket:socket_state()} | {error, term()}.
+    {ok, undefined | quic_socket:socket_state()}
+    | {error, term()}
+    | {error, term(), undefined | quic_socket:socket_state()}.
 do_socket_send(Packet, #state{socket_state = undefined, socket = Socket, remote_addr = {IP, Port}}) ->
     case gen_udp:send(Socket, IP, Port, Packet) of
         ok -> {ok, undefined};
@@ -5315,6 +5325,7 @@ send_and_take_socket_state(Packet, State) ->
     case do_socket_send(Packet, State) of
         {ok, undefined} -> State#state.socket_state;
         {ok, NewSocketState} -> NewSocketState;
+        {error, _, NewSocketState} -> NewSocketState;
         {error, _} -> State#state.socket_state
     end.
 
@@ -5382,8 +5393,8 @@ flush_socket_batch(#state{socket_state = SocketState} = State) ->
     case quic_socket:flush(SocketState) of
         {ok, NewSocketState} ->
             State#state{socket_state = NewSocketState};
-        {error, _} ->
-            State
+        {error, _, ClearedSocketState} ->
+            State#state{socket_state = ClearedSocketState}
     end.
 
 %% Send ACK if packet contained any ack-eliciting frames.

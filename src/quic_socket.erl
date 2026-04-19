@@ -418,7 +418,7 @@ send_immediate(State, IP, Port, Packet) ->
 %% - Batch is full (max_batch_packets reached)
 %% - Destination address changes
 -spec send(socket_state(), inet:ip_address(), inet:port_number(), packet_view()) ->
-    {ok, socket_state()} | {error, term()}.
+    {ok, socket_state()} | {error, term()} | {error, term(), socket_state()}.
 send(#socket_state{batching_enabled = false} = State, IP, Port, Packet) ->
     %% Batching disabled - send immediately
     do_send_immediate(State, IP, Port, Packet);
@@ -433,12 +433,16 @@ send(#socket_state{} = State, IP, Port, Packet) ->
     case flush(State) of
         {ok, State1} ->
             add_to_batch(State1#socket_state{batch_addr = {IP, Port}}, Packet);
-        {error, _} = Error ->
+        {error, _, _} = Error ->
             Error
     end.
 
-%% @doc Flush all buffered packets.
--spec flush(socket_state()) -> {ok, socket_state()} | {error, term()}.
+%% @doc Flush all buffered packets. On hard send error the batch is
+%% cleared in the returned state so callers thread a clean buffer;
+%% PTO-driven retransmission owns recovery of any packets the CC has
+%% already tracked.
+-spec flush(socket_state()) ->
+    {ok, socket_state()} | {error, term(), socket_state()}.
 flush(#socket_state{batch_count = 0} = State) ->
     %% Nothing to flush
     {ok, State};
@@ -842,22 +846,24 @@ flush_gso(
         ok ->
             {ok, record_flush(State)};
         {ok, RestData} ->
-            %% Partial send - GSO didn't send all data.
-            TotalBytes = iolist_size(PacketIov),
-            Remaining = iolist_size(RestData),
-            ?LOG_WARNING(#{
-                what => gso_partial_send,
-                sent => TotalBytes - Remaining,
-                remaining => Remaining
-            }),
-            %% Disable GSO and retry remaining data individually. The
-            %% retry path accounts for the coalesced packets itself, so
-            %% clear batch state here without bumping counters.
-            State1 = clear_batch(State#socket_state{gso_supported = false}),
-            send_remaining_individually(State1, IP, Port, RestData);
-        {error, _} = Error ->
-            Error
+            flush_gso_partial(State, IP, Port, PacketIov, RestData);
+        {error, Reason} ->
+            ?LOG_WARNING(#{what => gso_send_error, reason => Reason}),
+            {error, Reason, clear_batch(State)}
     end.
+
+%% Partial GSO send: log, disable GSO on this socket, and retry the
+%% remaining bytes segment-by-segment.
+flush_gso_partial(State, IP, Port, PacketIov, RestData) ->
+    TotalBytes = iolist_size(PacketIov),
+    Remaining = iolist_size(RestData),
+    ?LOG_WARNING(#{
+        what => gso_partial_send,
+        sent => TotalBytes - Remaining,
+        remaining => Remaining
+    }),
+    State1 = clear_batch(State#socket_state{gso_supported = false}),
+    send_remaining_individually(State1, IP, Port, RestData).
 
 flush_individual(#socket_state{backend = socket} = State) ->
     flush_individual_socket(State);
@@ -878,7 +884,7 @@ flush_individual_socket(
         {ok, _Sent} ->
             {ok, record_flush(State)};
         {error, Reason, _Sent} ->
-            {error, Reason}
+            {error, Reason, clear_batch(State)}
     end.
 
 flush_individual_genudp(
@@ -894,7 +900,7 @@ flush_individual_genudp(
         {ok, _Sent} ->
             {ok, record_flush(State)};
         {error, Reason, _Sent} ->
-            {error, Reason}
+            {error, Reason, clear_batch(State)}
     end.
 
 %% Send packets using socket:sendmsg with iov (no flattening for socket backend)
@@ -954,7 +960,7 @@ send_segments(_Socket, _Dest, [], State) ->
 send_segments(Socket, Dest, [Packet | Rest], State) ->
     case socket:sendto(Socket, Packet, Dest) of
         ok -> send_segments(Socket, Dest, Rest, State);
-        {error, _} = Error -> Error
+        {error, Reason} -> {error, Reason, State}
     end.
 
 do_send_immediate(#socket_state{socket = Socket, backend = socket} = State, IP, Port, Packet) ->
