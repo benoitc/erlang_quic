@@ -178,14 +178,27 @@ connect(Host, Port, Opts, Owner) when
 ->
     %% Extract socket option for pre-opened socket support
     Socket = maps:get(socket, Opts, undefined),
-    case quic_connection:start_link(Host, Port, Opts, Owner, Socket) of
-        {ok, Pid} ->
-            {ok, Pid};
-        Error ->
+    case validate_connect_opts(Socket, Opts) of
+        ok ->
+            case quic_connection:start_link(Host, Port, Opts, Owner, Socket) of
+                {ok, Pid} -> {ok, Pid};
+                Error -> Error
+            end;
+        {error, _} = Error ->
             Error
     end;
 connect(_Host, _Port, _Opts, _Owner) ->
     {error, badarg}.
+
+%% A pre-opened `socket' is always a gen_udp handle; requesting the
+%% OTP socket NIF backend at the same time cannot be honoured.
+validate_connect_opts(Socket, Opts) when Socket =/= undefined ->
+    case maps:get(socket_backend, Opts, gen_udp) of
+        socket -> {error, {incompatible_options, [socket, {socket_backend, socket}]}};
+        _ -> ok
+    end;
+validate_connect_opts(undefined, _Opts) ->
+    ok.
 
 %% @doc Close a QUIC connection with normal reason.
 -spec close(Conn) -> ok when
