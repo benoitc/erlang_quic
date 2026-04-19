@@ -8022,21 +8022,17 @@ select_preferred_addr(_) ->
     undefined.
 
 %% @doc Rebind socket to a new local port (simulates network change).
-%% Closes the old socket and creates a new one with a different ephemeral port.
+%% Open new before closing old so an allocation failure leaves the
+%% caller's handle usable.
 -spec rebind_socket(gen_udp:socket()) -> {ok, gen_udp:socket()} | {error, term()}.
 rebind_socket(OldSocket) ->
-    %% Get current socket options
     {ok, [{active, Active}]} = inet:getopts(OldSocket, [active]),
-
-    %% Close old socket
-    gen_udp:close(OldSocket),
-
-    %% Open new socket on a different ephemeral port
     case gen_udp:open(0, [binary, {active, Active}]) of
         {ok, NewSocket} ->
+            gen_udp:close(OldSocket),
             {ok, NewSocket};
-        {error, Reason} ->
-            {error, Reason}
+        {error, _} = Error ->
+            Error
     end.
 
 %% @doc Rebind the client's UDP socket for migration. Dispatches on
@@ -8072,9 +8068,7 @@ rebind_client_socket(#state{socket = OldSocket, socket_state = OldSocketState} =
             Error
     end.
 
-%% Socket-NIF rebind: stop the old receiver, close the old OTP socket
-%% via its `#socket_state{}' wrapper, open a fresh send socket, and
-%% start a new receiver linked to this connection process.
+%% Socket-NIF rebind. Open new first; tear down old only after new is up.
 rebind_client_socket_otp(
     #state{
         remote_addr = {RemoteIP, _},
@@ -8082,22 +8076,13 @@ rebind_client_socket_otp(
         client_receiver = OldReceiver
     } = State
 ) ->
-    ok = quic_socket:stop_client_receiver(OldReceiver),
-    case OldSocketState of
-        undefined ->
-            ok;
-        _ ->
-            try quic_socket:close(OldSocketState) of
-                _ -> ok
-            catch
-                _:_ -> ok
-            end
-    end,
     OpenOpts = #{backend => socket},
     case quic_socket:open_for_send(RemoteIP, OpenOpts) of
         {ok, NewSocketState} ->
             case quic_socket:start_client_receiver(NewSocketState, self()) of
                 {ok, NewReceiver} ->
+                    ok = quic_socket:stop_client_receiver(OldReceiver),
+                    close_socket_state_quietly(OldSocketState),
                     NewSocket = quic_socket:get_socket(NewSocketState),
                     {ok, State#state{
                         socket = NewSocket,
@@ -8105,15 +8090,20 @@ rebind_client_socket_otp(
                         client_receiver = NewReceiver
                     }};
                 {error, _} = Error ->
-                    try quic_socket:close(NewSocketState) of
-                        _ -> ok
-                    catch
-                        _:_ -> ok
-                    end,
+                    close_socket_state_quietly(NewSocketState),
                     Error
             end;
         {error, _} = Error ->
             Error
+    end.
+
+close_socket_state_quietly(undefined) ->
+    ok;
+close_socket_state_quietly(SocketState) ->
+    try quic_socket:close(SocketState) of
+        _ -> ok
+    catch
+        _:_ -> ok
     end.
 
 %%====================================================================
