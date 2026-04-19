@@ -284,7 +284,10 @@ reset_user_stream(Controller, StreamId, ErrorCode) ->
     gen_statem:call(Controller, {reset_user_stream, StreamId, ErrorCode}).
 
 %% @doc Register to accept incoming user streams.
-%% The acceptor will receive {quic_dist_stream, Node, {incoming, StreamId}} messages.
+%% The controller auto-assigns ownership of each new incoming stream
+%% to the registered acceptor and delivers data directly as
+%% `{quic_dist_stream, StreamRef, {data, Data, Fin}}' messages. No
+%% prior `{incoming, StreamId}' handshake.
 -spec accept_user_streams(Controller :: pid(), Acceptor :: pid()) ->
     ok | {error, term()}.
 accept_user_streams(Controller, Acceptor) ->

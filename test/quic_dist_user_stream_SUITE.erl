@@ -158,20 +158,17 @@ send_receive_test(Config) ->
     %% Set up receiver on Node2
     ok = rpc:call(Node2, quic_dist, accept_streams, [Node1]),
 
-    %% Spawn receiver process on Node2
+    %% Spawn receiver process on Node2. The controller auto-assigns
+    %% ownership of incoming streams to the registered acceptor and
+    %% delivers `{data, _, _}' directly — no prior `{incoming, _}'
+    %% handshake.
     ReceiverPid = rpc:call(Node2, erlang, spawn, [
         fun() ->
             receive
-                {quic_dist_stream, Node1, {incoming, StreamId}} ->
-                    {ok, StreamRef} = quic_dist:accept_incoming_stream(Node1, StreamId),
-                    receive
-                        {quic_dist_stream, StreamRef, {data, Data, _Fin}} ->
-                            Self ! {received, Data}
-                    after 5000 ->
-                        Self ! timeout
-                    end
+                {quic_dist_stream, _StreamRef, {data, Data, _Fin}} ->
+                    Self ! {received, Data}
             after 5000 ->
-                Self ! no_incoming
+                Self ! timeout
             end
         end
     ]),
@@ -214,20 +211,12 @@ bidirectional_test(Config) ->
     ReceiverPid = rpc:call(Node2, erlang, spawn, [
         fun() ->
             receive
-                {quic_dist_stream, Node1, {incoming, StreamId}} ->
-                    {ok, StreamRef} = quic_dist:accept_incoming_stream(Node1, StreamId),
-                    %% Receive data
-                    receive
-                        {quic_dist_stream, StreamRef, {data, Data, _}} ->
-                            %% Echo back with modification
-                            Response = <<"Echo: ", Data/binary>>,
-                            ok = quic_dist:send(StreamRef, Response),
-                            Self ! echoed
-                    after 5000 ->
-                        Self ! timeout
-                    end
+                {quic_dist_stream, StreamRef, {data, Data, _}} ->
+                    Response = <<"Echo: ", Data/binary>>,
+                    ok = quic_dist:send(StreamRef, Response),
+                    Self ! echoed
             after 5000 ->
-                Self ! no_incoming
+                Self ! timeout
             end
         end
     ]),
@@ -241,8 +230,7 @@ bidirectional_test(Config) ->
     %% Wait for echo confirmation
     receive
         echoed -> ok;
-        timeout -> ct:fail(echo_timeout);
-        no_incoming -> ct:fail(no_incoming)
+        timeout -> ct:fail(echo_timeout)
     after 10000 ->
         ct:fail(bidirectional_timeout)
     end,
@@ -267,9 +255,11 @@ large_data_test(Config) ->
     ReceiverPid = rpc:call(Node2, erlang, spawn, [
         fun() ->
             receive
-                {quic_dist_stream, Node1, {incoming, StreamId}} ->
-                    {ok, StreamRef} = quic_dist:accept_incoming_stream(Node1, StreamId),
-                    collect_data(StreamRef, [], Self)
+                {quic_dist_stream, StreamRef, {data, Data, true}} ->
+                    Hash = crypto:hash(sha256, Data),
+                    Self ! {collected, Hash};
+                {quic_dist_stream, StreamRef, {data, Data, false}} ->
+                    collect_data(StreamRef, [Data], Self)
             after 10000 ->
                 Self ! no_incoming
             end
@@ -372,7 +362,7 @@ accept_streams_test(Config) ->
     AcceptorPid = rpc:call(Node2, erlang, spawn, [
         fun() ->
             receive
-                {quic_dist_stream, Node1, {incoming, StreamId}} ->
+                {quic_dist_stream, {quic_dist_stream, _, StreamId}, {data, _, _}} ->
                     Self ! {got_incoming, StreamId}
             after 5000 ->
                 Self ! timeout
@@ -385,10 +375,10 @@ accept_streams_test(Config) ->
     %% Open stream from Node1
     {ok, Stream} = rpc:call(Node1, quic_dist, open_stream, [Node2]),
 
-    %% Send some data to trigger the incoming notification
+    %% Send some data; the controller auto-assigns ownership to the
+    %% registered acceptor and delivers the first `{data, _, _}' event.
     ok = rpc:call(Node1, quic_dist, send, [Stream, <<"trigger">>]),
 
-    %% Verify acceptor got notification
     receive
         {got_incoming, StreamId} ->
             {quic_dist_stream, _, ExpectedId} = Stream,
@@ -416,9 +406,8 @@ fin_flag_test(Config) ->
     ReceiverPid = rpc:call(Node2, erlang, spawn, [
         fun() ->
             receive
-                {quic_dist_stream, Node1, {incoming, StreamId}} ->
-                    {ok, StreamRef} = quic_dist:accept_incoming_stream(Node1, StreamId),
-                    fin_receiver_loop(StreamRef, Self)
+                {quic_dist_stream, StreamRef, {data, Data, Fin}} ->
+                    fin_receiver_loop(StreamRef, Self, [{Data, Fin}])
             after 5000 ->
                 Self ! no_incoming
             end
