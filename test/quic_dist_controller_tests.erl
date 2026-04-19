@@ -1007,6 +1007,58 @@ drain_mailbox() ->
         ok
     end.
 
+%% Exercise the full input_handler_loop under a backlog: while the
+%% loop is still inside `deliver_complete_messages`, a second
+%% `{dist_data, _}' lands in the mailbox. The batch yield must keep
+%% the dist byte stream in FIFO order and deliver every payload exactly
+%% once.
+input_handler_mailbox_ordering_test() ->
+    process_flag(trap_exit, true),
+    %% Test delivery fn records payloads in order into a test process.
+    Self = self(),
+    Deliver = fun(_DH, Payload) ->
+        Self ! {recorded, Payload},
+        ok
+    end,
+    %% Build N complete length-prefixed frames, bigger than
+    %% INPUT_HANDLER_BATCH_SIZE (32) to force a yield.
+    N = 64,
+    Frames = [frame(I) || I <- lists:seq(1, N)],
+    AllBytes = iolist_to_binary(Frames),
+    Split = byte_size(AllBytes) div 2,
+    <<Part1:Split/binary, Part2/binary>> = AllBytes,
+    %% Spawn the loop with a dummy DHandle; it never reaches
+    %% dist_ctrl_put_data/2 because Deliver takes its place.
+    Controller = self(),
+    Loop = spawn_link(fun() ->
+        quic_dist_controller:input_handler_loop(
+            test_dhandle, Controller, test_conn, test_stream, <<>>, Deliver
+        )
+    end),
+    Loop ! {dist_data, Part1},
+    Loop ! {dist_data, Part2},
+    Received = collect_payloads(N, []),
+    exit(Loop, shutdown),
+    Expected = [payload(I) || I <- lists:seq(1, N)],
+    ?assertEqual(Expected, Received).
+
+frame(I) ->
+    Payload = payload(I),
+    <<(byte_size(Payload)):32/big-unsigned, Payload/binary>>.
+
+payload(I) ->
+    integer_to_binary(I).
+
+collect_payloads(0, Acc) ->
+    lists:reverse(Acc);
+collect_payloads(N, Acc) ->
+    receive
+        {recorded, Payload} ->
+            collect_payloads(N - 1, [Payload | Acc])
+    after 2000 ->
+        error({collect_timeout, {remaining, N}, {got, lists:reverse(Acc)}})
+    end.
+
 %% Test tick frame independent of congestion (Fix 1 + Fix 2)
 tick_independent_of_congestion_test() ->
     %% The tick frame should be sent regardless of congestion state
