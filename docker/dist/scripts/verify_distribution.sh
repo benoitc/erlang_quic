@@ -19,8 +19,11 @@ EXPECTED_PEERS=$((EXPECTED_NODES - 1))
 for i in $(seq 1 $EXPECTED_NODES); do
     NODE="node$i"
 
-    # Count nodeup events
-    CONNECTED=$(docker compose logs "$NODE" 2>&1 | grep -c "\[DIST_TEST\].*nodeup" || echo 0)
+    # Count nodeup events. `grep -c | tail -1` coerces the non-match
+    # case (grep exits 1, stdout "0") to a single-line integer so
+    # `-lt` does not trip on multi-line output.
+    CONNECTED=$(docker compose logs "$NODE" 2>&1 | grep -c "\[DIST_TEST\].*nodeup" | tail -1)
+    CONNECTED=${CONNECTED:-0}
 
     if [ "$CONNECTED" -lt "$EXPECTED_PEERS" ]; then
         echo "  FAIL: $NODE connected to $CONNECTED peers (expected $EXPECTED_PEERS)"
@@ -36,7 +39,8 @@ echo "Phase 2: Checking mesh completion..."
 for i in $(seq 1 $EXPECTED_NODES); do
     NODE="node$i"
 
-    MESH_COMPLETE=$(docker compose logs "$NODE" 2>&1 | grep -c "\[DIST_TEST\].*mesh_complete" || echo 0)
+    MESH_COMPLETE=$(docker compose logs "$NODE" 2>&1 | grep -c "\[DIST_TEST\].*mesh_complete" | tail -1)
+    MESH_COMPLETE=${MESH_COMPLETE:-0}
 
     if [ "$MESH_COMPLETE" -lt 1 ]; then
         echo "  FAIL: $NODE did not report mesh_complete"
@@ -91,7 +95,11 @@ echo "Phase 5: Checking test completion..."
 for i in $(seq 1 $EXPECTED_NODES); do
     NODE="node$i"
 
-    TEST_COMPLETE=$(docker compose logs "$NODE" 2>&1 | grep -c "\[DIST_TEST\].*test_complete" || echo 0)
+    # `grep -c` exits non-zero with a count of 0 on no match; the
+    # previous `|| echo 0` then produced "0\n0" which tripped `-lt`.
+    # Keep only the last line so we always get a single integer.
+    TEST_COMPLETE=$(docker compose logs "$NODE" 2>&1 | grep -c "\[DIST_TEST\].*test_complete" | tail -1)
+    TEST_COMPLETE=${TEST_COMPLETE:-0}
 
     if [ "$TEST_COMPLETE" -lt 1 ]; then
         echo "  FAIL: $NODE did not complete tests"
