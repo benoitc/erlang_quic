@@ -593,8 +593,9 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
             client_recv_loop(SocketState, Owner);
         {error, closed} ->
             ok;
-        {error, _Reason} ->
-            client_recv_loop(SocketState, Owner)
+        {error, Reason} ->
+            ?LOG_WARNING(#{what => client_recv_loop_exit, reason => Reason}),
+            ok
     end.
 
 %% @doc Detect platform capabilities for GSO/GRO.
