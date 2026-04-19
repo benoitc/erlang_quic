@@ -50,6 +50,12 @@
 %% RFC 9297 §2.1
 -define(H3_SETTINGS_H3_DATAGRAM, 16#33).
 
+%% WebTransport over HTTP/3 (draft-ietf-webtrans-http3-15 §9.2)
+-define(H3_SETTINGS_WT_ENABLED, 16#2c7cf000).
+-define(H3_SETTINGS_WT_INITIAL_MAX_DATA, 16#2b61).
+-define(H3_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI, 16#2b64).
+-define(H3_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, 16#2b65).
+
 %% RFC 9297 §3.2 registered capsule types
 -define(H3_CAPSULE_DATAGRAM, 16#00).
 -define(H3_CAPSULE_LEGACY_DATAGRAM, 16#ff37a0).
