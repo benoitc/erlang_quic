@@ -89,6 +89,71 @@ client_socket_backend_migrate() ->
         quic_test_echo_server:stop(Srv)
     end.
 
+client_receiver_crash_closes_connection_test_() ->
+    {timeout, 15, fun client_receiver_crash_closes_connection/0}.
+
+%% If the dedicated receiver process dies, the connection has no way
+%% to receive datagrams and must close promptly rather than sit idle
+%% until max_idle_timeout fires.
+client_receiver_crash_closes_connection() ->
+    {ok, Srv} = quic_test_echo_server:start(#{}),
+    try
+        #{port := Port} = Srv,
+        ClientOpts = maps:merge(quic_test_echo_server:client_opts(), #{
+            socket_backend => socket
+        }),
+        {ok, Conn} = quic:connect("127.0.0.1", Port, ClientOpts, self()),
+        try
+            receive
+                {quic, Conn, {connected, _}} -> ok
+            after 5000 ->
+                ?assert(false)
+            end,
+            Receiver = find_receiver(Conn),
+            ?assertNotEqual(undefined, Receiver),
+            exit(Receiver, kill),
+            receive
+                {quic, Conn, {closed, {receiver_exit, _}}} ->
+                    ok;
+                {quic, Conn, {closed, _Other}} ->
+                    ?assert(false)
+            after 3000 ->
+                error(no_close_event)
+            end
+        after
+            catch quic:close(Conn)
+        end
+    after
+        quic_test_echo_server:stop(Srv)
+    end.
+
+%% Locate the client's recv-loop process by scanning links of the
+%% connection and matching on `quic_socket:client_recv_loop' anywhere
+%% in the process's current stacktrace. The loop blocks inside
+%% `socket:recvfrom_deadline/4' between ticks, so `current_function'
+%% alone is not enough.
+find_receiver(Conn) ->
+    {links, Links} = process_info(Conn, links),
+    Candidates = [P || P <- Links, is_pid(P), is_client_recv_loop(P)],
+    case Candidates of
+        [Pid | _] -> Pid;
+        [] -> undefined
+    end.
+
+is_client_recv_loop(Pid) ->
+    case process_info(Pid, current_stacktrace) of
+        {current_stacktrace, Stack} ->
+            lists:any(
+                fun
+                    ({quic_socket, client_recv_loop, _, _}) -> true;
+                    (_) -> false
+                end,
+                Stack
+            );
+        _ ->
+            false
+    end.
+
 collect_echo(Conn, StreamId, Acc, Timeout) ->
     receive
         {quic, Conn, {stream_data, StreamId, Data, true}} ->
