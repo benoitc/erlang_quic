@@ -315,18 +315,16 @@ decode_settings_pairs(Data, Acc) ->
         true ->
             throw({forbidden_setting, Id});
         false ->
+            %% RFC 9114 §7.2.4.1: unknown setting IDs MUST be ignored.
+            %% "Ignored" means not applied to connection behaviour; the
+            %% identifier is still surfaced in the decoded map (as its
+            %% integer ID) so upper layers can observe extension settings
+            %% (e.g. WebTransport over HTTP/3, draft-15 §9.2) without
+            %% requiring a new atom mapping for every draft revision.
             Key = id_to_setting(Id),
-            %% RFC 9114 §7.2.4.1: unknown setting IDs (those not mapped to
-            %% a known atom) MUST be ignored. Drop them from the result map
-            %% so they cannot influence later peer-settings application.
-            case is_atom(Key) of
-                true ->
-                    case maps:is_key(Key, Acc) of
-                        true -> throw({duplicate_setting, Key});
-                        false -> decode_settings_pairs(Rest2, Acc#{Key => Value})
-                    end;
-                false ->
-                    decode_settings_pairs(Rest2, Acc)
+            case maps:is_key(Key, Acc) of
+                true -> throw({duplicate_setting, Key});
+                false -> decode_settings_pairs(Rest2, Acc#{Key => Value})
             end
     end.
 
@@ -349,6 +347,10 @@ setting_to_id(max_field_section_size) -> ?H3_SETTINGS_MAX_FIELD_SECTION_SIZE;
 setting_to_id(qpack_blocked_streams) -> ?H3_SETTINGS_QPACK_BLOCKED_STREAMS;
 setting_to_id(enable_connect_protocol) -> ?H3_SETTINGS_ENABLE_CONNECT_PROTOCOL;
 setting_to_id(h3_datagram) -> ?H3_SETTINGS_H3_DATAGRAM;
+setting_to_id(wt_enabled) -> ?H3_SETTINGS_WT_ENABLED;
+setting_to_id(wt_initial_max_data) -> ?H3_SETTINGS_WT_INITIAL_MAX_DATA;
+setting_to_id(wt_initial_max_streams_uni) -> ?H3_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI;
+setting_to_id(wt_initial_max_streams_bidi) -> ?H3_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI;
 setting_to_id(Id) when is_integer(Id) -> Id.
 
 -spec id_to_setting(non_neg_integer()) -> atom() | non_neg_integer().
@@ -357,6 +359,10 @@ id_to_setting(?H3_SETTINGS_MAX_FIELD_SECTION_SIZE) -> max_field_section_size;
 id_to_setting(?H3_SETTINGS_QPACK_BLOCKED_STREAMS) -> qpack_blocked_streams;
 id_to_setting(?H3_SETTINGS_ENABLE_CONNECT_PROTOCOL) -> enable_connect_protocol;
 id_to_setting(?H3_SETTINGS_H3_DATAGRAM) -> h3_datagram;
+id_to_setting(?H3_SETTINGS_WT_ENABLED) -> wt_enabled;
+id_to_setting(?H3_SETTINGS_WT_INITIAL_MAX_DATA) -> wt_initial_max_data;
+id_to_setting(?H3_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI) -> wt_initial_max_streams_uni;
+id_to_setting(?H3_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI) -> wt_initial_max_streams_bidi;
 id_to_setting(Id) -> Id.
 
 %%====================================================================

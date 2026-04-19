@@ -85,6 +85,59 @@ settings_payload_test() ->
     {ok, DecodedSettings} = quic_h3_frame:decode_settings_payload(Payload),
     ?assertEqual(1024, maps:get(qpack_max_table_capacity, DecodedSettings)).
 
+%% WebTransport setting IDs (draft-ietf-webtrans-http3-15 §9.2) round-trip
+%% through the SETTINGS frame as dedicated atoms.
+settings_wt_atoms_roundtrip_test() ->
+    Settings = #{
+        wt_enabled => 1,
+        wt_initial_max_data => 1048576,
+        wt_initial_max_streams_uni => 100,
+        wt_initial_max_streams_bidi => 50
+    },
+    Encoded = quic_h3_frame:encode_settings(Settings),
+    {ok, {settings, Decoded}, <<>>} = quic_h3_frame:decode(Encoded),
+    ?assertEqual(1, maps:get(wt_enabled, Decoded)),
+    ?assertEqual(1048576, maps:get(wt_initial_max_data, Decoded)),
+    ?assertEqual(100, maps:get(wt_initial_max_streams_uni, Decoded)),
+    ?assertEqual(50, maps:get(wt_initial_max_streams_bidi, Decoded)).
+
+%% Unknown (non-forbidden) setting IDs are preserved in the decoded map
+%% under their integer key so upper layers can observe future IETF
+%% extensions without waiting for a code change.
+settings_unknown_id_preserved_test() ->
+    Payload = quic_h3_frame:encode_settings_payload(#{16#4abc => 42}),
+    {ok, Decoded} = quic_h3_frame:decode_settings_payload(Payload),
+    ?assertEqual(42, maps:get(16#4abc, Decoded)).
+
+%% Forbidden HTTP/2 settings (RFC 9114 §7.2.4.1) must still be rejected.
+%% `decode_settings_payload/1' catches the internal throw and returns
+%% `{error, {forbidden_setting, Id}}'.
+settings_forbidden_still_rejected_test() ->
+    Forbidden = [16#02, 16#03, 16#04, 16#05],
+    lists:foreach(
+        fun(Id) ->
+            Payload = quic_h3_frame:encode_settings_payload(#{Id => 1}),
+            ?assertEqual(
+                {error, {forbidden_setting, Id}},
+                quic_h3_frame:decode_settings_payload(Payload)
+            )
+        end,
+        Forbidden
+    ).
+
+%% Duplicate detection applies to unknown integer IDs too, not only
+%% known atoms.
+settings_duplicate_integer_id_rejected_test() ->
+    Id = 16#4abc,
+    IdVarint = quic_varint:encode(Id),
+    Payload =
+        <<IdVarint/binary, (quic_varint:encode(1))/binary, IdVarint/binary,
+            (quic_varint:encode(2))/binary>>,
+    ?assertEqual(
+        {error, {duplicate_setting, Id}},
+        quic_h3_frame:decode_settings_payload(Payload)
+    ).
+
 %%====================================================================
 %% GOAWAY Frame Tests
 %%====================================================================
@@ -382,16 +435,20 @@ settings_connect_protocol_disabled_test() ->
     {ok, {settings, Decoded}, <<>>} = quic_h3_frame:decode(Encoded),
     ?assertEqual(0, maps:get(enable_connect_protocol, Decoded)).
 
-%% RFC 9114 §7.2.4.1: unknown setting identifiers (including grease values
-%% per §7.2.8) MUST be ignored on the receiving side. Encoding still emits
-%% them; decoding drops them from the result map.
-settings_grease_dropped_on_decode_test() ->
+%% RFC 9114 §7.2.4.1 / §7.2.8: unknown setting identifiers (including
+%% grease values) MUST be ignored on the receiving side. "Ignored"
+%% means not applied to connection behaviour; the identifier is still
+%% surfaced in the decoded map under its integer key so upper layers
+%% can observe extension settings. See `apply_peer_settings/2' in
+%% `quic_h3_connection' — it pattern-matches known atoms and never
+%% consults integer keys.
+settings_grease_preserved_on_decode_test() ->
     %% N=0 grease setting (0x1f*0 + 0x21)
     GREASEId = 16#21,
     Settings = #{GREASEId => 12345},
     Encoded = quic_h3_frame:encode_settings(Settings),
     {ok, {settings, Decoded}, <<>>} = quic_h3_frame:decode(Encoded),
-    ?assertNot(maps:is_key(GREASEId, Decoded)).
+    ?assertEqual(12345, maps:get(GREASEId, Decoded)).
 
 %%====================================================================
 %% Edge Case Tests (inspired by quiche)
