@@ -94,6 +94,10 @@
     connected/3
 ]).
 
+-ifdef(TEST).
+-export([deliver_complete_messages/3, deliver_complete_messages/4, input_handler_loop/6]).
+-endif.
+
 %% Internal state
 -record(state, {
     %% Connection (pid, receives {quic, Conn, Event} messages)
@@ -1267,43 +1271,45 @@ send_one_frame(Conn, StreamId, Data) ->
 %% We MUST buffer incoming data and only pass complete messages to the VM.
 %% Passing partial messages causes "corrupted distribution header" errors.
 input_handler_loop(DHandle, Controller, Conn, ControlStream) ->
-    %% Start with empty buffer
-    input_handler_loop(DHandle, Controller, Conn, ControlStream, <<>>).
+    input_handler_loop(
+        DHandle, Controller, Conn, ControlStream, <<>>, fun erlang:dist_ctrl_put_data/2
+    ).
 
-input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffer) ->
+input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffer, Deliver) ->
     receive
-        {continue_delivery, PendingBuffer} ->
-            %% Continue processing after batch yield
-            case deliver_complete_messages(DHandle, PendingBuffer) of
+        continue_delivery ->
+            %% Resume processing whatever is already in Buffer after a
+            %% prior batch yield.
+            case deliver_complete_messages(DHandle, Buffer, ?INPUT_HANDLER_BATCH_SIZE, Deliver) of
                 {ok, RemainingBuffer} ->
                     input_handler_loop(
-                        DHandle, Controller, Conn, ControlStream, RemainingBuffer
+                        DHandle, Controller, Conn, ControlStream, RemainingBuffer, Deliver
                     );
                 {error, _Reason} ->
                     exit(normal)
             end;
         {dist_data, Data} ->
-            %% Data received from QUIC - buffer and deliver complete messages
             NewBuffer = <<Buffer/binary, Data/binary>>,
-            case deliver_complete_messages(DHandle, NewBuffer) of
+            case
+                deliver_complete_messages(DHandle, NewBuffer, ?INPUT_HANDLER_BATCH_SIZE, Deliver)
+            of
                 {ok, RemainingBuffer} ->
                     input_handler_loop(
-                        DHandle, Controller, Conn, ControlStream, RemainingBuffer
+                        DHandle, Controller, Conn, ControlStream, RemainingBuffer, Deliver
                     );
                 {error, _Reason} ->
-                    %% Error delivering to VM, connection is broken
                     exit(normal)
             end;
         {'EXIT', Controller, Reason} ->
-            %% Controller died, exit
             exit(Reason);
         {quic, Conn, {stream_data, _StreamId, Data, _Fin}} ->
-            %% Direct QUIC data (if we're receiving messages directly)
             NewBuffer = <<Buffer/binary, Data/binary>>,
-            case deliver_complete_messages(DHandle, NewBuffer) of
+            case
+                deliver_complete_messages(DHandle, NewBuffer, ?INPUT_HANDLER_BATCH_SIZE, Deliver)
+            of
                 {ok, RemainingBuffer} ->
                     input_handler_loop(
-                        DHandle, Controller, Conn, ControlStream, RemainingBuffer
+                        DHandle, Controller, Conn, ControlStream, RemainingBuffer, Deliver
                     );
                 {error, _Reason} ->
                     exit(normal)
@@ -1315,7 +1321,7 @@ input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffer) ->
                 #{what => input_handler_unexpected_msg, msg => Other},
                 ?QUIC_LOG_META
             ),
-            input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffer)
+            input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffer, Deliver)
     end.
 
 %% @private
@@ -1324,23 +1330,28 @@ input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffer) ->
 %% The payload (WITHOUT length header) is passed to dist_ctrl_put_data.
 %% Empty frames (Length=0) are tick signals - no payload to deliver.
 %% Returns {ok, RemainingBuffer} or {error, Reason}
-deliver_complete_messages(DHandle, Buffer) ->
-    deliver_complete_messages(DHandle, Buffer, ?INPUT_HANDLER_BATCH_SIZE).
+-ifdef(TEST).
+%% Test-only convenience: exercised by
+%% `quic_dist_controller_tests:deliver_yield_returns_remainder_test/0'.
+%% Production code calls the /4 arity directly.
+deliver_complete_messages(DHandle, Buffer, Remaining) ->
+    deliver_complete_messages(DHandle, Buffer, Remaining, fun erlang:dist_ctrl_put_data/2).
+-endif.
 
 %% @private
 %% Deliver complete messages with batch limit to prevent blocking.
-%% After processing batch limit messages, yields back to receive loop
-%% via continue_delivery message to allow processing incoming ticks.
-deliver_complete_messages(_DHandle, Buffer, 0) ->
-    %% Reached batch limit - yield to allow processing other messages (e.g., ticks)
-    self() ! {continue_delivery, Buffer},
-    {ok, <<>>};
-deliver_complete_messages(DHandle, Buffer, Remaining) ->
+%% The unprocessed remnant comes back via `{ok, RemainingBuffer}`; the
+%% yield signal is a tag-only `continue_delivery' atom so the buffer
+%% cannot race against an incoming `{dist_data, _}' message.
+deliver_complete_messages(_DHandle, Buffer, 0, _Deliver) ->
+    self() ! continue_delivery,
+    {ok, Buffer};
+deliver_complete_messages(DHandle, Buffer, Remaining, Deliver) ->
     case Buffer of
         <<0:32/big-unsigned, Rest/binary>> ->
             %% Empty frame = tick signal - just continue (ticks don't count against batch limit)
             logger:debug(#{what => tick_frame_received}, ?QUIC_LOG_META),
-            deliver_complete_messages(DHandle, Rest, Remaining);
+            deliver_complete_messages(DHandle, Rest, Remaining, Deliver);
         <<Length:32/big-unsigned, Rest/binary>> when byte_size(Rest) >= Length ->
             %% We have a complete message - extract payload only
             <<Payload:Length/binary, Tail/binary>> = Rest,
@@ -1353,10 +1364,12 @@ deliver_complete_messages(DHandle, Buffer, Remaining) ->
                 ?QUIC_LOG_META
             ),
             try
-                %% Pass ONLY the payload to dist_ctrl_put_data (no length header)
-                erlang:dist_ctrl_put_data(DHandle, Payload),
-                %% Continue with remaining data, decrement batch counter
-                deliver_complete_messages(DHandle, Tail, Remaining - 1)
+                %% Pass ONLY the payload (no length header) to the
+                %% delivery fn. Production default is
+                %% `erlang:dist_ctrl_put_data/2'; tests inject a fn
+                %% that records payloads for assertion.
+                Deliver(DHandle, Payload),
+                deliver_complete_messages(DHandle, Tail, Remaining - 1, Deliver)
             catch
                 Class:Reason ->
                     logger:error(
