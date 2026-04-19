@@ -974,6 +974,39 @@ continue_delivery_format_test() ->
     {continue_delivery, Buffer} = Msg,
     ?assertEqual(<<"remaining data">>, Buffer).
 
+%% Regression: the batch-yield base case must return the unprocessed
+%% remnant through the normal {ok, _} channel instead of stashing it
+%% inside a self-message. On main, the remnant rides on
+%% {continue_delivery, Buffer} and any {dist_data, _} that lands in
+%% the mailbox first gets concatenated against an empty Buffer,
+%% reordering the dist byte stream.
+deliver_yield_returns_remainder_test() ->
+    %% Drain any earlier messages so we only observe what the call
+    %% under test posts.
+    _ = drain_mailbox(),
+    Remainder = <<"pending-dist-bytes">>,
+    Result = quic_dist_controller:deliver_complete_messages(
+        test_dhandle, Remainder, 0
+    ),
+    ?assertEqual({ok, Remainder}, Result),
+    %% The yield must be a tag-only atom so the mailbox cannot carry
+    %% a stale buffer.
+    receive
+        continue_delivery ->
+            ok;
+        {continue_delivery, _} = Wrong ->
+            ?assertEqual(continue_delivery, Wrong)
+    after 200 ->
+        error(no_yield_signal)
+    end.
+
+drain_mailbox() ->
+    receive
+        _ -> drain_mailbox()
+    after 0 ->
+        ok
+    end.
+
 %% Test tick frame independent of congestion (Fix 1 + Fix 2)
 tick_independent_of_congestion_test() ->
     %% The tick frame should be sent regardless of congestion state

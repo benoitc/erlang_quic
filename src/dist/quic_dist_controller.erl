@@ -94,6 +94,10 @@
     connected/3
 ]).
 
+-ifdef(TEST).
+-export([deliver_complete_messages/3]).
+-endif.
+
 %% Internal state
 -record(state, {
     %% Connection (pid, receives {quic, Conn, Event} messages)
