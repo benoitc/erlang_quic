@@ -89,6 +89,33 @@ client_socket_backend_migrate() ->
         quic_test_echo_server:stop(Srv)
     end.
 
+client_pre_opened_socket_rejects_socket_backend_test_() ->
+    {timeout, 10, fun client_pre_opened_socket_rejects_socket_backend/0}.
+
+%% A caller that passes a pre-opened gen_udp socket via the `socket'
+%% option *and* requests `socket_backend => socket' asks for two
+%% incompatible things: the pre-opened handle is a gen_udp port, not
+%% an OTP socket NIF handle. `quic:connect/4' must reject the
+%% combination with an error, not crash inside init.
+client_pre_opened_socket_rejects_socket_backend() ->
+    {ok, Srv} = quic_test_echo_server:start(#{}),
+    try
+        #{port := Port} = Srv,
+        {ok, UdpSocket} = gen_udp:open(0, [binary, {active, false}]),
+        try
+            Opts = maps:merge(quic_test_echo_server:client_opts(), #{
+                socket => UdpSocket,
+                socket_backend => socket
+            }),
+            Result = quic:connect("127.0.0.1", Port, Opts, self()),
+            ?assertMatch({error, {incompatible_options, _}}, Result)
+        after
+            catch gen_udp:close(UdpSocket)
+        end
+    after
+        quic_test_echo_server:stop(Srv)
+    end.
+
 collect_echo(Conn, StreamId, Acc, Timeout) ->
     receive
         {quic, Conn, {stream_data, StreamId, Data, true}} ->
