@@ -96,6 +96,7 @@ client_receiver_crash_closes_connection_test_() ->
 %% to receive datagrams and must close promptly rather than sit idle
 %% until max_idle_timeout fires.
 client_receiver_crash_closes_connection() ->
+    process_flag(trap_exit, true),
     {ok, Srv} = quic_test_echo_server:start(#{}),
     try
         #{port := Port} = Srv,

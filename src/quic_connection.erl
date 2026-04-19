@@ -2132,6 +2132,16 @@ handle_common_event(
 handle_common_event(info, {udp_passive, _Socket}, _StateName, State) ->
     %% Server connections or different socket - ignore
     {keep_state, State};
+%% Dedicated client receiver died. Without it the socket-backend
+%% client is deaf; close instead of sitting idle until max_idle_timeout.
+handle_common_event(
+    info,
+    {'EXIT', Pid, Reason},
+    _StateName,
+    #state{role = client, client_receiver = Pid, owner = Owner} = State
+) when Reason =/= normal andalso Reason =/= shutdown ->
+    Owner ! {quic, self(), {closed, {receiver_exit, Reason}}},
+    {stop, {shutdown, {receiver_exit, Reason}}, State};
 handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     %% EXIT signals are handled in terminate/3 callback
     %% Just ignore here - the process will terminate anyway if it's from parent
