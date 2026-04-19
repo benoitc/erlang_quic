@@ -170,9 +170,10 @@ server_connection_batching_opt_out(Config) ->
         {ok, ConnPids} = quic:get_server_connections(Name),
         [ServerPid | _] = lists:usort(ConnPids),
         {_State, Info} = quic_connection:get_state(ServerPid),
-        %% Opt-out: no socket_state, so direct send path with no
-        %% batching wrapper.
-        ?assertEqual(direct, maps:get(send_backend, Info)),
+        %% Opt-out: per-connection socket_state wraps the listener
+        %% backend but batching is disabled. `send_backend' reports
+        %% the actual backend (gen_udp or socket); the visible contract
+        %% is `send_batching_enabled = false'.
         ?assertEqual(false, maps:get(send_batching_enabled, Info)),
         ?assertEqual(false, maps:get(send_gso_supported, Info)),
         quic:close(Conn)
