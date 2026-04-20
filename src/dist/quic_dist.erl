@@ -48,13 +48,8 @@
 -include_lib("kernel/include/net_address.hrl").
 
 %% Dialyzer suppressions:
-%% - accept/do_accept_connection: handshake functions have complex control flow
--dialyzer(
-    {nowarn_function, [
-        accept_connection/5,
-        do_accept_connection/6
-    ]}
-).
+%% - accept_connection: handshake functions have complex control flow
+-dialyzer({nowarn_function, [accept_connection/5]}).
 
 %% Distribution module callbacks
 -export([
@@ -226,14 +221,23 @@ accept(#quic_dist_listener{server_name = ServerName} = Listener) ->
     Allowed :: term(),
     SetupTime :: non_neg_integer()
 ) -> pid().
-accept_connection(AcceptPid, DistCtrl, MyNode, Allowed, SetupTime) ->
-    %% IMPORTANT: self() here is net_kernel - capture it before spawning
+accept_connection(_AcceptPid, DistCtrl, MyNode, Allowed, SetupTime) ->
+    %% self() is net_kernel here - capture before spawning.
     Kernel = self(),
     spawn_opt(
         fun() ->
-            %% Register with acceptor so we receive the controller message
-            AcceptPid ! {register_pending, DistCtrl, self()},
-            do_accept_connection(AcceptPid, DistCtrl, MyNode, Allowed, SetupTime, Kernel)
+            %% The controller already owns the QUIC connection (listener
+            %% transferred ownership in handle_new_connection), so there
+            %% is no socket-handoff rendezvous to wait for. Proceed
+            %% straight to the dist handshake - reaching mark_pending
+            %% fast is what lets dist_util resolve simultaneous connects.
+            %%
+            %% Do NOT trap exits: dist_util:start_timer/1 spawns a linked
+            %% timer whose exit must kill this process on timeout.
+            ok = quic_dist_controller:set_supervisor(DistCtrl, Kernel),
+            Timer = dist_util:start_timer(SetupTime),
+            HSData = create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel),
+            dist_util:handshake_other_started(HSData)
         end,
         [link, {priority, max}]
     ).
@@ -623,109 +627,22 @@ handle_new_connection(Conn) ->
 %%====================================================================
 
 %% @private
-%% Acceptor loop - waits for distribution controller to report connections.
+%% Acceptor loop - forwards new QUIC connections to net_kernel.
+%%
+%% The spawn created by accept_connection/5 handshakes directly with
+%% dist_util; we do not serialize controller handoff through this loop.
+%% net_kernel still sends `{self(), controller, Pid}' on every accept
+%% (see net_kernel.erl handle_info({accept, ...})); those messages
+%% are ignored by the catch-all clause below so they don't pile up.
 acceptor_loop(Kernel, #quic_dist_listener{} = Listener) ->
-    acceptor_loop(Kernel, Listener, #{}).
-
-acceptor_loop(Kernel, #quic_dist_listener{} = Listener, Pending) ->
-    %% Pending maps SpawnedPid -> {waiting, DistCtrl} | {ready, DistCtrl}
-    %% - {waiting, DistCtrl} = do_accept_connection (SpawnedPid) waiting for controller message
-    %% - {ready, DistCtrl} = controller message received, waiting for registration
-    %% Note: Kernel uses SpawnedPid (return value of accept_connection) in controller message
     receive
         {accept, DistCtrl, _NodeName} ->
-            %% Report accepted connection to kernel
             Kernel ! {accept, self(), DistCtrl, inet, quic},
-            %% Continue accepting
-            acceptor_loop(Kernel, Listener, Pending);
-        {Kernel, controller, SpawnedPid} ->
-            %% Kernel notifying us about the controller process - SpawnedPid is the do_accept_connection process
-            %% Lookup by SpawnedPid to find the waiting entry
-            %% Note: We only respond to SpawnedPid, NOT to Kernel (kernel doesn't expect a response)
-            case maps:get(SpawnedPid, Pending, undefined) of
-                undefined ->
-                    %% No registration yet - buffer with ready state
-                    acceptor_loop(
-                        Kernel, Listener, maps:put(SpawnedPid, {ready, undefined}, Pending)
-                    );
-                {waiting, DistCtrl} ->
-                    %% Someone waiting - set supervisor and respond only to SpawnedPid
-                    ok = quic_dist_controller:set_supervisor(DistCtrl, Kernel),
-                    SpawnedPid ! {self(), controller},
-                    acceptor_loop(Kernel, Listener, maps:remove(SpawnedPid, Pending));
-                {ready, _} ->
-                    %% Already ready (shouldn't happen), just continue
-                    acceptor_loop(Kernel, Listener, Pending)
-            end;
-        {register_pending, DistCtrl, SpawnedPid} ->
-            %% Register a pending do_accept_connection process
-            %% SpawnedPid is self() of do_accept_connection, DistCtrl is the controller
-            case maps:get(SpawnedPid, Pending, undefined) of
-                undefined ->
-                    %% Not ready yet - register as waiting
-                    acceptor_loop(
-                        Kernel, Listener, maps:put(SpawnedPid, {waiting, DistCtrl}, Pending)
-                    );
-                {ready, _} ->
-                    %% Kernel already sent controller message - set supervisor and respond only to SpawnedPid
-                    ok = quic_dist_controller:set_supervisor(DistCtrl, Kernel),
-                    SpawnedPid ! {self(), controller},
-                    acceptor_loop(Kernel, Listener, maps:remove(SpawnedPid, Pending));
-                {waiting, _} ->
-                    %% Already waiting (shouldn't happen), replace
-                    acceptor_loop(
-                        Kernel, Listener, maps:put(SpawnedPid, {waiting, DistCtrl}, Pending)
-                    )
-            end;
-        {_From, {accept_pending, _Controller, _MyNode, _Allowed, _SetupTime}} ->
-            %% Connection pending, continue
-            acceptor_loop(Kernel, Listener, Pending);
+            acceptor_loop(Kernel, Listener);
         stop ->
             ok;
         _Other ->
-            acceptor_loop(Kernel, Listener, Pending)
-    end.
-
-%%====================================================================
-%% Internal Functions - Accept Connection
-%%====================================================================
-
-%% @private
-do_accept_connection(AcceptPid, DistCtrl, MyNode, Allowed, SetupTime, Kernel) ->
-    %% Trap exits so we can handle the setup timer timeout properly
-    process_flag(trap_exit, true),
-    logger:info("do_accept_connection: waiting for controller message from ~p~n", [
-        AcceptPid
-    ]),
-    receive
-        {AcceptPid, controller} ->
-            logger:info(
-                "do_accept_connection: got controller, starting handshake. MyNode=~p, Kernel=~p~n",
-                [MyNode, Kernel]
-            ),
-            Timer = dist_util:start_timer(SetupTime),
-            HSData = create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel),
-            logger:info(
-                "do_accept_connection: HSData created, kernel_pid=~p~n",
-                [HSData#hs_data.kernel_pid]
-            ),
-            try
-                Result = dist_util:handshake_other_started(HSData),
-                logger:info("do_accept_connection: handshake result: ~p~n", [Result]),
-                Result
-            catch
-                Class:Reason:Stack ->
-                    logger:error(
-                        "do_accept_connection: handshake crashed: ~p:~p~n~p~n",
-                        [Class, Reason, Stack]
-                    ),
-                    erlang:raise(Class, Reason, Stack)
-            end
-    after 5000 ->
-        logger:error("do_accept_connection: TIMEOUT waiting for controller from ~p~n", [
-            AcceptPid
-        ]),
-        exit(controller_timeout)
+            acceptor_loop(Kernel, Listener)
     end.
 
 %%====================================================================

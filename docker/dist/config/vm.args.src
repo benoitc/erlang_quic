@@ -4,6 +4,11 @@
 ## Cookie for cluster authentication
 -setcookie ${ERLANG_COOKIE}
 
+## Disable automatic mesh connections. global would otherwise
+## cross-connect nodes that hear about each other, creating
+## simultaneous-connect races on top of the explicit test topology.
+-connect_all false
+
 ## QUIC distribution
 -proto_dist quic
 -epmd_module quic_epmd

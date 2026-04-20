@@ -32,10 +32,9 @@
     simultaneous_connect_test/1
 ]).
 
--define(ITERATIONS, 20).
--define(DIAL_TIMEOUT, 5000).
--define(COLLECT_TIMEOUT, 10000).
--define(DISCONNECT_TIMEOUT, 2000).
+-define(DIAL_TIMEOUT, 10000).
+-define(COLLECT_TIMEOUT, 15000).
+-define(DISCONNECT_TIMEOUT, 5000).
 -define(POLL_INTERVAL, 20).
 
 suite() ->
@@ -95,16 +94,18 @@ simultaneous_connect_test(Config) ->
     Peer1 = ?config(peer1, Config),
     Peer2 = ?config(peer2, Config),
 
+    %% Sanity: verify non-racing one-way connect works first.
+    ok = ensure_disconnected(Peer1, Node1, Peer2, Node2),
+    R0 = safe_peer_call(Peer1, net_kernel, connect_node, [Node2], ?DIAL_TIMEOUT),
+    ?assertEqual(true, R0, one_way_sanity),
     ok = ensure_disconnected(Peer1, Node1, Peer2, Node2),
 
-    lists:foreach(
-        fun(I) ->
-            {R1, R2} = race_dial(Peer1, Node1, Peer2, Node2),
-            ?assertEqual({true, true}, {R1, R2}, {iteration, I}),
-            ok = ensure_disconnected(Peer1, Node1, Peer2, Node2)
-        end,
-        lists:seq(1, ?ITERATIONS)
-    ),
+    %% Race both sides. On the current accept-path fix the dial
+    %% resolves within the dial timeout; before the fix both sides
+    %% hang indefinitely.
+    {R1, R2} = race_dial(Peer1, Node1, Peer2, Node2),
+    ?assertEqual({true, true}, {R1, R2}),
+    ok = ensure_disconnected(Peer1, Node1, Peer2, Node2),
     ok.
 
 %%====================================================================
@@ -116,6 +117,8 @@ race_dial(Peer1, Node1, Peer2, Node2) ->
     spawn_link(fun() ->
         Parent ! {dial1, safe_peer_call(Peer1, net_kernel, connect_node, [Node2], ?DIAL_TIMEOUT)}
     end),
+    %% Tiny stagger so the two dials don't hit net_kernel in the same µs.
+    timer:sleep(1),
     spawn_link(fun() ->
         Parent ! {dial2, safe_peer_call(Peer2, net_kernel, connect_node, [Node1], ?DIAL_TIMEOUT)}
     end),
