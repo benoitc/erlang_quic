@@ -209,62 +209,59 @@ echo_handler(Conn, StreamId, Method, Path, Headers) ->
 
 %% @doc Run h3spec via Docker
 run_h3spec(Port, _Config) ->
-    %% Build docker command
-    %% h3spec tests against localhost with insecure mode
+    ok = ensure_h3spec_image(),
     Cmd = lists:flatten(
         io_lib:format(
             "docker run --rm --network host "
-            "ghcr.io/kazu-yamamoto/h3spec:latest "
-            "h3spec -h 127.0.0.1 -p ~p --insecure 2>&1",
+            "erlang_quic/h3spec:local "
+            "127.0.0.1 ~p -n 2>&1",
             [Port]
         )
     ),
-
     ct:pal("Running: ~s", [Cmd]),
-
-    %% Execute with timeout
     Output = os:cmd(Cmd),
     ct:pal("h3spec output:~n~s", [Output]),
-
-    %% Parse output for results
-    %% h3spec outputs: "X examples, Y failures"
     case parse_h3spec_output(Output) of
         {ok, Examples, 0} ->
             ct:pal("h3spec passed: ~p examples, 0 failures", [Examples]),
             ok;
         {ok, Examples, Failures} ->
-            %% For now, log failures but don't fail the test
-            %% as we may not implement all h3spec requirements yet
             ct:pal("h3spec: ~p examples, ~p failures", [Examples, Failures]),
             case Failures > Examples div 2 of
-                true ->
-                    %% Fail if more than 50% failures
-                    ct:fail({h3spec_failures, Failures, Examples});
-                false ->
-                    %% Log warning but continue
-                    ct:pal("WARNING: ~p h3spec failures (acceptable for now)", [Failures]),
-                    ok
-            end;
-        {error, docker_not_found} ->
-            %% Docker image not found, try to pull it
-            ct:pal("h3spec image not found, attempting to pull..."),
-            os:cmd("docker pull ghcr.io/kazu-yamamoto/h3spec:latest"),
-            %% Retry once
-            Output2 = os:cmd(Cmd),
-            ct:pal("h3spec output (retry):~n~s", [Output2]),
-            case parse_h3spec_output(Output2) of
-                {ok, Ex, 0} ->
-                    ct:pal("h3spec passed: ~p examples, 0 failures", [Ex]),
-                    ok;
-                {ok, Ex, Fail} ->
-                    ct:pal("h3spec: ~p examples, ~p failures", [Ex, Fail]),
-                    % Don't fail on retry
-                    ok;
-                {error, Reason} ->
-                    ct:fail({h3spec_error, Reason})
+                true -> ct:fail({h3spec_failures, Failures, Examples});
+                false -> ok
             end;
         {error, Reason} ->
             ct:fail({h3spec_error, Reason})
+    end.
+
+%% @doc Build erlang_quic/h3spec:local from docker/h3spec if it is not
+%% already present. The h3spec binary is vendored via the Dockerfile so
+%% this is a one-time build per host.
+ensure_h3spec_image() ->
+    case os:cmd("docker image inspect erlang_quic/h3spec:local > /dev/null 2>&1; echo $?") of
+        "0\n" ->
+            ok;
+        _ ->
+            ct:pal("Building erlang_quic/h3spec:local ..."),
+            Out = os:cmd(
+                "docker build --platform linux/amd64 "
+                "-t erlang_quic/h3spec:local docker/h3spec 2>&1"
+            ),
+            ct:pal("h3spec build output:~n~s", [Out]),
+            case re:run(Out, "^Successfully tagged|writing image", [multiline]) of
+                {match, _} ->
+                    ok;
+                nomatch ->
+                    case
+                        os:cmd(
+                            "docker image inspect erlang_quic/h3spec:local > /dev/null 2>&1; echo $?"
+                        )
+                    of
+                        "0\n" -> ok;
+                        _ -> ct:fail({h3spec_build_failed, Out})
+                    end
+            end
     end.
 
 %% @doc Parse h3spec output to extract results
