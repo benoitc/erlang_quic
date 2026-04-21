@@ -1335,23 +1335,20 @@ input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffer, Deliver) ->
 
 %% @private
 %% Deliver complete messages to the VM with batch limiting.
-%% We use 4-byte length-prefixed framing: <<Length:32/big, Payload:Length/binary>>
-%% The payload (WITHOUT length header) is passed to dist_ctrl_put_data.
+%% 4-byte length-prefixed framing: <<Length:32/big, Payload:Length/binary>>.
+%% The payload (without the length header) is passed to the Deliver fn.
 %% Empty frames (Length=0) are tick signals - no payload to deliver.
-%% Returns {ok, RemainingBuffer} or {error, Reason}
+%% The unprocessed remnant comes back via `{ok, RemainingBuffer}'; the
+%% yield signal is a tag-only `continue_delivery' atom so the buffer
+%% cannot race against an incoming `{dist_data, _}' message.
 -ifdef(TEST).
-%% Test-only convenience: exercised by
+%% Test-only /3 convenience, exercised by
 %% `quic_dist_controller_tests:deliver_yield_returns_remainder_test/0'.
 %% Production code calls the /4 arity directly.
 deliver_complete_messages(DHandle, Buffer, Remaining) ->
     deliver_complete_messages(DHandle, Buffer, Remaining, fun erlang:dist_ctrl_put_data/2).
 -endif.
 
-%% @private
-%% Deliver complete messages with batch limit to prevent blocking.
-%% The unprocessed remnant comes back via `{ok, RemainingBuffer}`; the
-%% yield signal is a tag-only `continue_delivery' atom so the buffer
-%% cannot race against an incoming `{dist_data, _}' message.
 deliver_complete_messages(_DHandle, Buffer, 0, _Deliver) ->
     self() ! continue_delivery,
     {ok, Buffer};

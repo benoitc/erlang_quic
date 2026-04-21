@@ -8,7 +8,7 @@ Add to your `rebar.config`:
 
 ```erlang
 {deps, [
-    {quic, {git, "https://github.com/benoitc/erlang_quic.git", {tag, "0.11.0"}}}
+    {quic, {git, "https://github.com/benoitc/erlang_quic.git", {tag, "1.2.0"}}}
 ]}.
 ```
 
