@@ -191,30 +191,18 @@ get_expected_node_count() ->
     end.
 
 connect_to_cluster() ->
-    SeedNode = get_seed_node(),
     ExpectedCount = get_expected_node_count(),
     Self = node(),
 
-    %% The seed waits for others to come to it. Every other node
-    %% connects to the seed first, then to every remaining peer listed
-    %% in CLUSTER_NODES. Erlang distribution does not auto-mesh when a
-    %% third node joins, so each node has to dial every other node
-    %% explicitly for a 3+ node cluster to form correctly.
-    case SeedNode of
-        undefined ->
-            log_event(seed_node_waiting, #{expected => ExpectedCount});
-        Seed when Seed =/= Self ->
-            ensure_connected(Seed)
-    end,
-
-    %% Dial every non-self peer from CLUSTER_NODES that we do not
-    %% already know about. Trim the list to the expected cluster size
-    %% so a 3-node test does not try to reach node4/node5 entries that
-    %% were seeded into the env for the 5-node profile.
+    %% Only dial peers whose name sorts greater than self. Each pair
+    %% is dialled by exactly one side, so simultaneous-connect never
+    %% happens. Erlang dist links are bidirectional: when lowerN dials
+    %% higherN, both sides see the peer in nodes() and get nodeup.
     PeersExpected = max(0, ExpectedCount - 1),
-    Peers = lists:sublist(
+    Candidates = lists:sublist(
         [N || N <- get_cluster_nodes(), N =/= Self], PeersExpected
     ),
+    Peers = [N || N <- Candidates, N > Self],
     lists:foreach(fun ensure_connected/1, Peers).
 
 ensure_connected(Node) when Node =:= undefined ->
@@ -230,13 +218,6 @@ ensure_connected(Node) ->
                 false -> log_event(connect_failed, Node);
                 ignored -> log_event(connect_ignored, Node)
             end
-    end.
-
-get_seed_node() ->
-    case os:getenv("SEED_NODE") of
-        false -> undefined;
-        "" -> undefined;
-        NodeStr -> list_to_atom(NodeStr)
     end.
 
 get_cluster_nodes() ->

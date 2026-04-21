@@ -424,6 +424,13 @@ init_state(info, {quic, Conn, {connected, _Info}}, #state{conn = Conn} = State) 
     {keep_state, State};
 init_state(state_timeout, start_handshake, State) ->
     {next_state, handshaking, State};
+%% Dist handshake calls can arrive before we finish transitioning to
+%% handshaking (accept_connection spawns the dist worker which calls
+%% f_send/f_recv immediately). Defer them until the state transition.
+init_state({call, _From}, {send, _Data}, State) ->
+    {keep_state, State, [postpone]};
+init_state({call, _From}, {recv, _Length}, State) ->
+    {keep_state, State, [postpone]};
 %% Handle QUIC errors during init
 init_state(info, {quic, Conn, {closed, Reason}}, #state{conn = Conn}) ->
     {stop, {connection_closed, Reason}};
@@ -734,7 +741,6 @@ handle_common_event(
         end,
     {keep_state, State, [{reply, From, {ok, Address}}]};
 handle_common_event(cast, {set_supervisor, Pid}, _StateName, State) ->
-    %% Store both as supervisor and kernel (net_kernel)
     {keep_state, State#state{supervisor = Pid, kernel = Pid}};
 handle_common_event(cast, {set_node, Node}, _StateName, State) ->
     {keep_state, State#state{node = Node}};
