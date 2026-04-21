@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [1.2.0] - 2026-04-19
+## [1.2.0] - 2026-04-21
 
 Post-1.1.0 work split across three tracks: a client-side socket-backend
 opt-in, a round of hot-path micro-optimisations on the send and
@@ -38,6 +38,44 @@ receive paths, and a migration fix for the default gen_udp client.
   flushes any pending batch to the old socket before rebind so
   pre-migrate packets reach the server under their original CID.
   (#93)
+- `quic_dist`: simultaneous-connect deadlock in the accept path.
+  Two nodes dialling each other within a tight window wedged both
+  `net_kernel:connect_node/1` calls indefinitely. The old accept
+  path ran the dist worker through a nine-hop handoff
+  (register_pending / controller rendezvous in acceptor_loop) before
+  reaching `dist_util:mark_pending`, so net_kernel's tie-breaker
+  arbitration never ran in time. Collapsed to the TCP-dist shape:
+  `accept_connection/5` runs `set_supervisor` + `start_timer` +
+  `handshake_other_started` inline. Docker 5-node regression now
+  passes 5/5. (#106)
+- `quic_dist`: batch-yield path in `input_handler_loop` could lose
+  or reorder buffered dist bytes when the mailbox had backlog.
+  Yield now threads the buffer remnant through the normal return
+  channel instead of piggybacking on the self-message. (#104)
+- `quic_dist_user_stream_SUITE` / `accept_user_streams/2` doc:
+  refreshed to match the auto-assign / direct
+  `{quic_dist_stream, _, {data, _, _}}` delivery shape. (#105)
+- `docker/dist`: 3+ node cluster mesh formation. Each node now dials
+  only higher-named peers and boots with `-connect_all false`, so
+  `global` does not re-introduce cross-dials behind the explicit
+  test topology. (#95, #106)
+- h3: preserve WebTransport and unknown SETTINGS identifiers in the
+  peer settings map so extension-stream hooks can read them. (#96)
+- `quic_socket`: client migrate path opens the new socket before
+  closing the old one, avoiding a window where the client has no
+  valid send handle. (#97)
+- `quic_socket`: `client_recv_loop` exits cleanly on unexpected
+  socket errors instead of spinning. (#98)
+- `quic_socket`: clear the pending batch buffer on flush error so
+  stale frames do not get retried on the next flush. (#99)
+- `quic:connect/4`: reject the `socket` + `{socket_backend, socket}`
+  option combination with a clear error instead of silently
+  overriding one. (#100)
+- Client connection: treat receiver-process exit as a fatal error
+  and close the connection, matching server behaviour. (#101)
+- Server: build a per-connection sender even when
+  `server_send_batching` is `false` so the direct-send path uses the
+  same `quic_socket` shape as the batched path. (#102, #103)
 
 ### Performance
 - Fuse per-packet cwnd + pacing check into `quic_cc:send_check/3`
