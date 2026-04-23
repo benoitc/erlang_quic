@@ -3867,15 +3867,29 @@ process_frame(app, handshake_done, #state{role = client} = State) ->
     %% Server confirmed handshake complete (client receiving from server)
     State;
 process_frame(app, handshake_done, #state{role = server} = State) ->
-    %% Protocol violation: server received HANDSHAKE_DONE (only client should receive)
+    %% RFC 9000 §19.20: clients MUST NOT send HANDSHAKE_DONE.
     ?LOG_WARNING(
         #{what => invalid_handshake_done_frame, reason => server_received}, ?QUIC_LOG_META
     ),
-    State#state{close_reason = {protocol_violation, handshake_done_from_client}};
+    close_with_error(
+        app,
+        transport,
+        ?QUIC_PROTOCOL_VIOLATION,
+        0,
+        <<"HANDSHAKE_DONE received by server">>,
+        State
+    );
 process_frame(Level, handshake_done, State) when Level =/= app ->
-    %% Protocol violation: HANDSHAKE_DONE must be in 1-RTT packets
+    %% RFC 9000 §19.20: HANDSHAKE_DONE MUST be sent in a 1-RTT packet.
     ?LOG_WARNING(#{what => invalid_handshake_done_level, level => Level}, ?QUIC_LOG_META),
-    State#state{close_reason = {protocol_violation, handshake_done_wrong_level}};
+    close_with_error(
+        level_for_close(Level),
+        transport,
+        ?QUIC_PROTOCOL_VIOLATION,
+        0,
+        <<"HANDSHAKE_DONE at wrong encryption level">>,
+        State
+    );
 process_frame(app, {stream, StreamId, Offset, Data, Fin}, State) ->
     process_stream_data(StreamId, Offset, Data, Fin, State);
 %% MAX_DATA: Peer is increasing connection-level flow control limit
@@ -4228,7 +4242,14 @@ process_frame(app, {datagram_with_length, Data}, State) ->
 %% token issuance + validation, which aren't implemented yet and are
 %% tracked as a follow-up.
 process_frame(app, {new_token, _}, #state{role = server} = State) ->
-    send_protocol_violation(<<"NEW_TOKEN received by server">>, State);
+    close_with_error(
+        app,
+        transport,
+        ?QUIC_PROTOCOL_VIOLATION,
+        0,
+        <<"NEW_TOKEN received by server">>,
+        State
+    );
 process_frame(app, {new_token, Token}, #state{role = client, remote_addr = Addr} = State) ->
     ok = quic_token_cache:put(Addr, Token),
     State;

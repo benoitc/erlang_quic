@@ -9,12 +9,12 @@
 -include("quic.hrl").
 
 server_rejects_new_token_with_protocol_violation_test() ->
+    %% RFC 9000 §19.7: a server MUST treat receipt of a NEW_TOKEN frame as
+    %% a connection error of type PROTOCOL_VIOLATION.
     S0 = quic_connection:test_state_for_role(server),
     S1 = quic_connection:process_frame(app, {new_token, <<"opaque">>}, S0),
-    %% No app keys in this minimal state, so send_protocol_violation
-    %% sets close_reason directly rather than writing a CLOSE frame.
     ?assertMatch(
-        {protocol_violation, <<"NEW_TOKEN received by server">>},
+        {transport, ?QUIC_PROTOCOL_VIOLATION, <<"NEW_TOKEN received by server">>},
         quic_connection:test_close_reason(S1)
     ).
 
