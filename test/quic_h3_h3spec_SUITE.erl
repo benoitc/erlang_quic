@@ -227,8 +227,11 @@ run_h3spec(Port, _Config) ->
             ok;
         {ok, Examples, Failures} ->
             ct:pal("h3spec: ~p examples, ~p failures", [Examples, Failures]),
-            case Failures > Examples div 2 of
-                true -> ct:fail({h3spec_failures, Failures, Examples});
+            %% Hard cap on failures. Ratcheted down as each conformance PR
+            %% lands. Target is 0.
+            MaxFailures = 48,
+            case Failures > MaxFailures of
+                true -> ct:fail({h3spec_failures, Failures, Examples, {max, MaxFailures}});
                 false -> ok
             end;
         {error, Reason} ->
