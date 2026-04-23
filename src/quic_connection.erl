@@ -153,6 +153,7 @@
     test_state_for_client/1,
     test_close_reason/1,
     apply_peer_transport_params/2,
+    decode_and_process_streaming/3,
     maybe_validate_initial_token/2,
     test_state_for_server/3,
     %% Regression helper for send_queue_bytes accounting during ACK coalesce
