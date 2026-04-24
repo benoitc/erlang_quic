@@ -2054,6 +2054,16 @@ extended_connect_missing_scheme_rejected_test() ->
         )
     ).
 
+%% RFC 9114 §4.3.2: response `:status` MUST parse as an integer.
+response_status_non_numeric_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [{<<":status">>, <<"NaN">>}],
+    State = make_test_state(#{role => client}),
+    ?assertMatch(
+        {error, {invalid_field, <<":status">>, <<"NaN">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, client, State)
+    ).
+
 %% RFC 9114 §4.3.2: every response MUST include `:status`.
 response_missing_status_rejected_test() ->
     Stream = #h3_stream{id = 0, frame_state = expecting_headers},

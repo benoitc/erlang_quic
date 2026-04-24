@@ -41,6 +41,7 @@ All tests live under `test/`; module names in the table are bare
 | §4.3.2 | Response with request pseudo-header → reject | `quic_h3_compliance_tests:response_with_request_pseudo_rejected_test` ✓ |
 | §4.3.2 | Response `:status` out of 100..599 → reject | `quic_h3_compliance_tests:response_status_out_of_range_rejected_test` ✓ |
 | §4.3.2 | Response missing `:status` → reject | `quic_h3_compliance_tests:response_missing_status_rejected_test` ✓ |
+| §4.3.2 | Response `:status` non-numeric → reject | `quic_h3_compliance_tests:response_status_non_numeric_rejected_test` ✓ |
 | §4.4 | CONNECT without peer-enabled → reject | `quic_h3_compliance_tests:extended_connect_rejected_when_disabled_test` ✓ |
 | §4.4 / RFC 9220 | Extended CONNECT missing `:scheme` → reject | `quic_h3_compliance_tests:extended_connect_missing_scheme_rejected_test` ✓ |
 | §4.4 / RFC 9220 | Extended CONNECT empty `:path` → reject | `quic_h3_compliance_tests:extended_connect_empty_path_rejected_test` ✓ |
