@@ -118,9 +118,9 @@
 -type error_code() :: non_neg_integer().
 
 -record(state, {
-    %% Underlying QUIC connection
-    quic_conn :: pid(),
-    quic_ref :: reference(),
+    %% Underlying QUIC connection. `undefined' only in test state.
+    quic_conn :: pid() | undefined,
+    quic_ref :: reference() | undefined,
 
     %% Role: client or server
     role :: role(),
