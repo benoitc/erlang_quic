@@ -74,8 +74,7 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    %% Ensure quic application is compiled
-    ok = application:load(quic),
+    _ = application:load(quic),
     Config.
 
 end_per_suite(_Config) ->
