@@ -54,9 +54,12 @@ All tests live under `test/`; module names in the table are bare
 
 | Section | Requirement | Test |
 |---|---|---|
-| §6.2 / §7.2.4.1 | Duplicate unidirectional stream of same type → `H3_STREAM_CREATION_ERROR` | covered at frame-decoder level (`quic_h3_compliance_tests:duplicate_setting_error_code_test`) ✓ |
+| §6.2.1 | Only one control stream per direction → `H3_STREAM_CREATION_ERROR` | `quic_h3_compliance_tests:duplicate_control_stream_is_stream_creation_error_test` ✓ |
 | §6.2.1 | Control stream closure → `H3_CLOSED_CRITICAL_STREAM` | `quic_h3_compliance_tests:critical_stream_closure_returns_error_test`, `is_critical_stream_*_test` ✓ |
 | §6.2.1 | First control-stream frame MUST be SETTINGS | `quic_h3_compliance_tests:first_control_frame_not_settings_is_missing_settings_test` ✓ |
+| §6.2.2 | Only one QPACK encoder stream per direction → `H3_STREAM_CREATION_ERROR` | `quic_h3_compliance_tests:duplicate_encoder_stream_is_stream_creation_error_test` ✓ |
+| §6.2.3 | Only one QPACK decoder stream per direction → `H3_STREAM_CREATION_ERROR` | `quic_h3_compliance_tests:duplicate_decoder_stream_is_stream_creation_error_test` ✓ |
+| §4.6 | Only server may initiate a push stream → `H3_STREAM_CREATION_ERROR` | `quic_h3_compliance_tests:push_stream_to_server_is_stream_creation_error_test` ✓ |
 
 ### §7 HTTP Framing Layer
 

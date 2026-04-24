@@ -100,7 +100,8 @@
     handle_priority_update_frame/2,
     handle_priority_update_push_frame/2,
     do_send_trailers/3,
-    pre_claim_bidi_stream/3
+    pre_claim_bidi_stream/3,
+    assign_uni_stream/3
 ]).
 -endif.
 

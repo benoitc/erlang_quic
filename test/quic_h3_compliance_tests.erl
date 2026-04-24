@@ -1922,6 +1922,46 @@ cancel_push_on_request_stream_is_frame_unexpected_test() ->
         quic_h3_connection:handle_request_frame(0, {cancel_push, 1}, false, Stream, State)
     ).
 
+%%====================================================================
+%% Unidirectional Stream Uniqueness (RFC 9114 Sections 6.2.1, 6.2.2, 6.2.3)
+%%====================================================================
+
+%% RFC 9114 §6.2.1: exactly one control stream per direction.
+duplicate_control_stream_is_stream_creation_error_test() ->
+    State = make_test_state(#{peer_control_stream => 2}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_STREAM_CREATION_ERROR, _}},
+        quic_h3_connection:assign_uni_stream(6, control, State)
+    ).
+
+%% RFC 9114 §6.2.2: exactly one QPACK encoder stream per direction.
+duplicate_encoder_stream_is_stream_creation_error_test() ->
+    State = make_test_state(#{peer_encoder_stream => 2}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_STREAM_CREATION_ERROR, _}},
+        quic_h3_connection:assign_uni_stream(6, qpack_encoder, State)
+    ).
+
+%% RFC 9114 §6.2.3: exactly one QPACK decoder stream per direction.
+duplicate_decoder_stream_is_stream_creation_error_test() ->
+    State = make_test_state(#{peer_decoder_stream => 2}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_STREAM_CREATION_ERROR, _}},
+        quic_h3_connection:assign_uni_stream(6, qpack_decoder, State)
+    ).
+
+%% RFC 9114 §4.6: only servers may initiate push streams.
+push_stream_to_server_is_stream_creation_error_test() ->
+    State = make_test_state(#{role => server}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_STREAM_CREATION_ERROR, _}},
+        quic_h3_connection:assign_uni_stream(3, push, State)
+    ).
+
+%%====================================================================
+%% Push ID Bounds (RFC 9114 Sections 4.6, 7.2.3)
+%%====================================================================
+
 %% RFC 9114 §7.2.3: CANCEL_PUSH with a push ID greater than the value
 %% the server has issued via MAX_PUSH_ID is an `H3_ID_ERROR`.
 cancel_push_above_max_push_id_is_id_error_test() ->
