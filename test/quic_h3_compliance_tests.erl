@@ -1922,6 +1922,19 @@ cancel_push_on_request_stream_is_frame_unexpected_test() ->
         quic_h3_connection:handle_request_frame(0, {cancel_push, 1}, false, Stream, State)
     ).
 
+%% RFC 9114 §7.2.3: CANCEL_PUSH with a push ID greater than the value
+%% the server has issued via MAX_PUSH_ID is an `H3_ID_ERROR`.
+cancel_push_above_max_push_id_is_id_error_test() ->
+    State = make_test_state(#{
+        role => server,
+        settings_received => true,
+        max_push_id => 4
+    }),
+    ?assertMatch(
+        {error, {connection_error, ?H3_ID_ERROR, _}},
+        quic_h3_connection:handle_control_frame({cancel_push, 16}, State)
+    ).
+
 %%====================================================================
 %% Pseudo-header Rules (RFC 9114 Section 4.3.1 / RFC 9110 Section 6.2)
 %%====================================================================
