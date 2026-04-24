@@ -116,7 +116,7 @@ depends on these primitives.
 | §2.1 | `SETTINGS_H3_DATAGRAM` codepoint = 0x33 | `quic_h3_datagram_tests:settings_h3_datagram_constant_test` ✓ |
 | §2.1 | SETTINGS carrying `h3_datagram=1` round-trips | `quic_h3_datagram_tests:settings_encode_decode_h3_datagram_test` ✓ |
 | §2.1 | SETTINGS carrying `h3_datagram=0` round-trips | `quic_h3_datagram_tests:settings_decode_zero_is_disabled_test` ✓ |
-| §2.1 | `SETTINGS_H3_DATAGRAM=1` without QUIC datagram support → `H3_SETTINGS_ERROR` | emitted by `validate_peer_h3_datagram/1` at `src/h3/quic_h3_connection.erl:3891-3900`; no standalone unit test (driven via a live connection) |
+| §2.1 | `SETTINGS_H3_DATAGRAM=1` without QUIC datagram support → `H3_SETTINGS_ERROR` | `quic_h3_datagram_tests:peer_h3_datagram_without_quic_datagram_is_settings_error_test` ✓ |
 | §2.1 | Quarter-stream-id encoding (StreamId bsr 2) round-trips | `quic_h3_datagram_tests:qsid_roundtrip_test_`, `qsid_varint_sizes_test_` ✓ |
 
 ## RFC 9204 — QPACK
