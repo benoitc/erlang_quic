@@ -1984,6 +1984,21 @@ priority_update_request_stream_updates_state_test() ->
     ?assertEqual(5, Updated#h3_stream.urgency),
     ?assertEqual(true, Updated#h3_stream.incremental).
 
+%% RFC 9218 §7.2: PRIORITY_UPDATE for a push stream rewrites the
+%% push stream's urgency / incremental. Server-side only.
+priority_update_push_stream_updates_state_test() ->
+    Stream = #h3_stream{id = 10, urgency = 3, incremental = false, type = push},
+    State = make_test_state(#{
+        role => server,
+        settings_received => true,
+        push_streams => #{0 => {10, Stream}}
+    }),
+    Payload = <<0, "u=7, i">>,
+    {ok, State1} = quic_h3_connection:handle_priority_update_push_frame(Payload, State),
+    {_StreamId, Updated} = quic_h3_connection:test_push_stream(0, State1),
+    ?assertEqual(7, Updated#h3_stream.urgency),
+    ?assertEqual(true, Updated#h3_stream.incremental).
+
 %% Default urgency per RFC 9218 §4.1 is 3 when no `priority` header is
 %% present. Incremental defaults to false.
 priority_defaults_when_no_header_test() ->
