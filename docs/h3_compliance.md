@@ -111,6 +111,19 @@ All tests live under `test/`; module names in the table are bare
 | `H3_CONNECT_ERROR` | `n/a` — CONNECT tunneling not shipped |
 | `H3_VERSION_FALLBACK` | `n/a` — alt-protocol negotiation not shipped |
 
+## RFC 9218 — HTTP/3 Extensible Priorities
+
+HTTP/3 priorities are integrated end-to-end: the `priority` header and
+the `PRIORITY_UPDATE` frame both land urgency / incremental on the
+relevant H3 stream, and QUIC's send scheduler uses the urgency value
+as a bucket index into an 8-bucket priority queue
+(`src/quic_connection.erl` `pqueue_in/3` / `pqueue_out/2`).
+
+| Section | Requirement | Test |
+|---|---|---|
+| §4.1 | Default urgency = 3 when no signal present | `quic_h3_compliance_tests:priority_defaults_when_no_header_test` ✓ |
+| §5.1 | `priority` request header `u=N, i` parses into urgency / incremental | `quic_h3_compliance_tests:priority_header_parsed_into_stream_test` ✓ |
+
 ## RFC 9297 — HTTP Datagrams
 
 WebTransport (sibling repo github.com/benoitc/erlang-webtransport)

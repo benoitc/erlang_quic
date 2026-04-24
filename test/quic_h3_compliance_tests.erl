@@ -1947,6 +1947,46 @@ cancel_push_on_request_stream_is_frame_unexpected_test() ->
     ).
 
 %%====================================================================
+%% HTTP/3 Extensible Priorities (RFC 9218)
+%%====================================================================
+
+%% RFC 9218 §5.1: the `priority` header carries `u=N, i` parameters.
+%% Parsing must land on the #h3_stream urgency / incremental fields.
+priority_header_parsed_into_stream_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"priority">>, <<"u=1, i">>}
+    ],
+    State = make_test_state(#{role => server}),
+    {ok, Updated} = quic_h3_connection:update_stream_with_headers(
+        Headers, Stream, server, State
+    ),
+    ?assertEqual(1, Updated#h3_stream.urgency),
+    ?assertEqual(true, Updated#h3_stream.incremental).
+
+%% Default urgency per RFC 9218 §4.1 is 3 when no `priority` header is
+%% present. Incremental defaults to false.
+priority_defaults_when_no_header_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>}
+    ],
+    State = make_test_state(#{role => server}),
+    {ok, Updated} = quic_h3_connection:update_stream_with_headers(
+        Headers, Stream, server, State
+    ),
+    %% #h3_stream record defaults: urgency=3, incremental=false.
+    ?assertEqual(3, Updated#h3_stream.urgency),
+    ?assertEqual(false, Updated#h3_stream.incremental).
+
+%%====================================================================
 %% Unidirectional Stream Uniqueness (RFC 9114 Sections 6.2.1, 6.2.2, 6.2.3)
 %%====================================================================
 
