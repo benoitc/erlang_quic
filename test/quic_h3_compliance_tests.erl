@@ -1974,6 +1974,15 @@ duplicate_decoder_stream_is_stream_creation_error_test() ->
         quic_h3_connection:assign_uni_stream(6, qpack_decoder, State)
     ).
 
+%% RFC 9114 §4.6: a server MUST NOT push until the client has sent
+%% MAX_PUSH_ID. A push stream before any MAX_PUSH_ID is `H3_ID_ERROR`.
+push_stream_without_max_push_id_is_id_error_test() ->
+    State = make_test_state(#{role => client, local_max_push_id => undefined}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_ID_ERROR, _}},
+        quic_h3_connection:assign_uni_stream(3, push, State)
+    ).
+
 %% RFC 9114 §4.6: only servers may initiate push streams.
 push_stream_to_server_is_stream_creation_error_test() ->
     State = make_test_state(#{role => server}),
