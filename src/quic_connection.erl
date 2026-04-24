@@ -152,6 +152,8 @@
     test_state_for_role/1,
     test_state_for_client/1,
     test_close_reason/1,
+    apply_peer_transport_params/2,
+    decode_and_process_streaming/3,
     maybe_validate_initial_token/2,
     test_state_for_server/3,
     %% Regression helper for send_queue_bytes accounting during ACK coalesce
@@ -3654,16 +3656,53 @@ process_frames_noreenbl(Level, [Frame | Rest], State) ->
 decode_and_process_streaming(Level, Plaintext, State) ->
     decode_and_process_streaming(Level, Plaintext, State, []).
 
+decode_and_process_streaming(Level, <<>>, State, []) ->
+    %% RFC 9000 Section 12.4: a packet with zero frames is a PROTOCOL_VIOLATION.
+    ?LOG_WARNING(
+        #{what => packet_with_no_frames, level => Level}, ?QUIC_LOG_META
+    ),
+    NewState = close_with_error(
+        level_for_close(Level),
+        transport,
+        ?QUIC_PROTOCOL_VIOLATION,
+        0,
+        <<"packet contained no frames">>,
+        State
+    ),
+    {ok, NewState, []};
 decode_and_process_streaming(_Level, <<>>, State, Acc) ->
     {ok, State, lists:reverse(Acc)};
 decode_and_process_streaming(Level, Data, State, Acc) ->
     case quic_frame:decode(Data) of
+        {error, {unknown_frame_type, Type}} ->
+            %% RFC 9000 Section 12.4: unknown frame type is FRAME_ENCODING_ERROR.
+            ?LOG_WARNING(
+                #{what => unknown_frame_type, type => Type, level => Level}, ?QUIC_LOG_META
+            ),
+            ReasonBin = list_to_binary(io_lib:format("unknown frame type 0x~.16b", [Type])),
+            NewState = close_with_error(
+                level_for_close(Level),
+                transport,
+                ?QUIC_FRAME_ENCODING_ERROR,
+                Type,
+                ReasonBin,
+                State
+            ),
+            {ok, NewState, lists:reverse(Acc)};
         {error, Reason} ->
             {error, {frame_decode_error, Reason}};
         {Frame, Rest} ->
             NewState = process_frame_track_probing(Level, Frame, State),
             decode_and_process_streaming(Level, Rest, NewState, [Frame | Acc])
     end.
+
+%% Map a packet-processing level atom to the level atom expected by
+%% close_with_error/6. Initial and Handshake packets emit CLOSE at their own
+%% level; 1-RTT (app) packets emit at app level.
+level_for_close(initial) -> initial;
+level_for_close(handshake) -> handshake;
+level_for_close(app) -> app;
+level_for_close(_) -> app.
 
 %% @doc Process a frame and track if it's a non-probing frame.
 %% RFC 9000 Section 9.1: Only packets containing non-probing frames trigger migration.
@@ -3828,15 +3867,29 @@ process_frame(app, handshake_done, #state{role = client} = State) ->
     %% Server confirmed handshake complete (client receiving from server)
     State;
 process_frame(app, handshake_done, #state{role = server} = State) ->
-    %% Protocol violation: server received HANDSHAKE_DONE (only client should receive)
+    %% RFC 9000 §19.20: clients MUST NOT send HANDSHAKE_DONE.
     ?LOG_WARNING(
         #{what => invalid_handshake_done_frame, reason => server_received}, ?QUIC_LOG_META
     ),
-    State#state{close_reason = {protocol_violation, handshake_done_from_client}};
+    close_with_error(
+        app,
+        transport,
+        ?QUIC_PROTOCOL_VIOLATION,
+        0,
+        <<"HANDSHAKE_DONE received by server">>,
+        State
+    );
 process_frame(Level, handshake_done, State) when Level =/= app ->
-    %% Protocol violation: HANDSHAKE_DONE must be in 1-RTT packets
+    %% RFC 9000 §19.20: HANDSHAKE_DONE MUST be sent in a 1-RTT packet.
     ?LOG_WARNING(#{what => invalid_handshake_done_level, level => Level}, ?QUIC_LOG_META),
-    State#state{close_reason = {protocol_violation, handshake_done_wrong_level}};
+    close_with_error(
+        level_for_close(Level),
+        transport,
+        ?QUIC_PROTOCOL_VIOLATION,
+        0,
+        <<"HANDSHAKE_DONE at wrong encryption level">>,
+        State
+    );
 process_frame(app, {stream, StreamId, Offset, Data, Fin}, State) ->
     process_stream_data(StreamId, Offset, Data, Fin, State);
 %% MAX_DATA: Peer is increasing connection-level flow control limit
@@ -4189,7 +4242,14 @@ process_frame(app, {datagram_with_length, Data}, State) ->
 %% token issuance + validation, which aren't implemented yet and are
 %% tracked as a follow-up.
 process_frame(app, {new_token, _}, #state{role = server} = State) ->
-    send_protocol_violation(<<"NEW_TOKEN received by server">>, State);
+    close_with_error(
+        app,
+        transport,
+        ?QUIC_PROTOCOL_VIOLATION,
+        0,
+        <<"NEW_TOKEN received by server">>,
+        State
+    );
 process_frame(app, {new_token, Token}, #state{role = client, remote_addr = Addr} = State) ->
     ok = quic_token_cache:put(Addr, Token),
     State;
@@ -4438,14 +4498,17 @@ process_tls_message(
                 early_keys = EarlyKeys,
                 early_data_accepted = (EarlyKeys =/= undefined andalso WantsEarlyData)
             },
-            %% Apply peer transport params (extracts active_connection_id_limit)
+            %% Apply peer transport params (extracts active_connection_id_limit).
+            %% Always send ServerHello + handshake flight so the peer can
+            %% derive handshake keys; if a TP violation was flagged,
+            %% maybe_emit_pending_close/1 emits CONNECTION_CLOSE afterward.
+            %% Always send ServerHello + handshake flight so the peer can
+            %% derive handshake keys; if a TP violation was flagged,
+            %% maybe_emit_pending_close/1 emits CONNECTION_CLOSE afterward.
             State1 = apply_peer_transport_params(TP, State0),
-
-            %% Send ServerHello in Initial packet
             State2 = send_server_hello(ServerHello, State1),
-
-            %% Send EncryptedExtensions, Certificate, CertificateVerify, Finished in Handshake packet
-            send_server_handshake_flight(Cipher, TranscriptHash, State2);
+            State3 = send_server_handshake_flight(Cipher, TranscriptHash, State2),
+            maybe_emit_pending_close(State3);
         {error, Reason} ->
             ?LOG_ERROR(#{what => client_hello_parse_failed, reason => Reason}, ?QUIC_LOG_META),
             State
@@ -4519,8 +4582,10 @@ process_tls_message(_Level, ?TLS_ENCRYPTED_EXTENSIONS, Body, OriginalMsg, State)
                 tls_transcript = Transcript,
                 alpn = Alpn
             },
-            %% Apply peer transport params (extracts active_connection_id_limit)
-            apply_peer_transport_params(TP, State0);
+            %% Apply peer transport params (extracts active_connection_id_limit).
+            %% Client already has handshake keys at this point, so the CLOSE
+            %% (if any) can be emitted immediately.
+            maybe_emit_pending_close(apply_peer_transport_params(TP, State0));
         _ ->
             State#state{
                 tls_state = ?TLS_AWAITING_CERT,
@@ -5626,6 +5691,14 @@ check_state_transition(CurrentState, State) ->
             %% Received stateless reset, transition to draining
             emit_qlog_state_change(CurrentState, draining, State),
             {next_state, draining, State};
+        {transport, _Code, _Reason} ->
+            %% We sent a transport-level CONNECTION_CLOSE; enter draining.
+            emit_qlog_state_change(CurrentState, draining, State),
+            {next_state, draining, State};
+        {application, _Code, _Reason} ->
+            %% We sent an application-level CONNECTION_CLOSE; enter draining.
+            emit_qlog_state_change(CurrentState, draining, State),
+            {next_state, draining, State};
         _ ->
             %% Check for TLS handshake state transitions
             case {CurrentState, State#state.tls_state, has_app_keys(State)} of
@@ -5668,6 +5741,8 @@ close_reason_to_code({peer_closed, transport, Code, _, _}) when is_integer(Code)
 close_reason_to_code({error, Code}) when is_integer(Code) -> Code;
 close_reason_to_code({error, application_error}) -> ?QUIC_APPLICATION_ERROR;
 close_reason_to_code({application_error, Code, _}) when is_integer(Code) -> Code;
+close_reason_to_code({transport, Code, _}) when is_integer(Code) -> Code;
+close_reason_to_code({application, Code, _}) when is_integer(Code) -> Code;
 close_reason_to_code(Reason) when is_atom(Reason) -> Reason;
 close_reason_to_code(_) -> unknown.
 
@@ -7263,6 +7338,39 @@ send_protocol_violation(Reason, State) ->
         _ ->
             send_frame(CloseFrame, State#state{close_reason = {protocol_violation, Reason}})
     end.
+
+%% Emit CONNECTION_CLOSE at the requested encryption level.
+%% Picks the right keys (initial/handshake/app) and encodes the frame in a
+%% packet of that level. Falls back to the next-lower available level when
+%% the preferred one has no keys yet (app -> handshake -> initial).
+%% This fixes the case where a handshake-time violation used to silently drop
+%% the CLOSE frame because only the 1-RTT send path was wired.
+close_with_error(Level, Class, Code, FrameType, Reason, State) ->
+    CloseFrame = {connection_close, Class, Code, FrameType, Reason},
+    CloseState = State#state{close_reason = {Class, Code, Reason}},
+    emit_close_at_level(select_close_level(Level, State), CloseFrame, CloseState).
+
+select_close_level(app, #state{app_keys = AppKeys}) when AppKeys =/= undefined ->
+    app;
+select_close_level(app, State) ->
+    select_close_level(handshake, State);
+select_close_level(handshake, #state{handshake_keys = HSKeys}) when HSKeys =/= undefined ->
+    handshake;
+select_close_level(handshake, State) ->
+    select_close_level(initial, State);
+select_close_level(initial, #state{initial_keys = InitKeys}) when InitKeys =/= undefined ->
+    initial;
+select_close_level(_, _) ->
+    none.
+
+emit_close_at_level(app, CloseFrame, State) ->
+    send_frame(CloseFrame, State);
+emit_close_at_level(handshake, CloseFrame, State) ->
+    send_handshake_packet(quic_frame:encode(CloseFrame), State);
+emit_close_at_level(initial, CloseFrame, State) ->
+    send_initial_packet(quic_frame:encode(CloseFrame), State);
+emit_close_at_level(none, _CloseFrame, State) ->
+    State.
 
 %% Send CONNECTION_CLOSE frame during terminate (best effort)
 %% This is called when the process is terminating unexpectedly
@@ -8867,15 +8975,89 @@ validate_retry_scid(TransportParams, true, RetrySCID) ->
 %% RFC 9000 Section 7.4: Transport parameters are applied after the handshake completes.
 %% RFC 9000 Section 7.3: Validates connection ID parameters before applying.
 apply_peer_transport_params(TransportParams, State) ->
-    case validate_connection_id_params(TransportParams, State) of
+    case validate_peer_transport_params(TransportParams, State) of
         ok ->
             apply_peer_transport_params_internal(TransportParams, State);
         {error, Reason} ->
             ?LOG_ERROR(
-                #{what => connection_id_validation_failed, reason => Reason}, ?QUIC_LOG_META
+                #{what => transport_parameter_validation_failed, reason => Reason},
+                ?QUIC_LOG_META
             ),
-            State#state{close_reason = {transport_parameter_error, Reason}}
+            ReasonBin = tp_reason_to_binary(Reason),
+            %% Mark the violation. `maybe_emit_pending_close/1` picks this up
+            %% after the server flight so the peer has handshake keys to
+            %% decrypt the CLOSE. The `{pending_close, ...}' tag is distinct
+            %% from `{transport, ...}' so check_state_transition does not
+            %% move us to draining before the flight is sent.
+            State#state{
+                close_reason =
+                    {pending_close, transport, ?QUIC_TRANSPORT_PARAMETER_ERROR, ReasonBin}
+            }
     end.
+
+%% Run all peer-transport-parameter validation checks: connection-id params,
+%% role-specific disallowed-parameter rejection, and range checks on
+%% numeric parameters per RFC 9000 Section 18.2.
+validate_peer_transport_params(TransportParams, State) ->
+    case validate_connection_id_params(TransportParams, State) of
+        ok ->
+            case validate_role_specific_params(TransportParams, State) of
+                ok -> validate_tp_ranges(TransportParams);
+                Error -> Error
+            end;
+        Error ->
+            Error
+    end.
+
+validate_role_specific_params(TransportParams, #state{role = server}) ->
+    %% Per RFC 9000 Section 18.2, these parameters MUST NOT be sent by a client.
+    ServerOnly = [
+        original_dcid,
+        preferred_address,
+        retry_scid,
+        stateless_reset_token
+    ],
+    case [K || K <- ServerOnly, maps:is_key(K, TransportParams)] of
+        [] -> ok;
+        [Forbidden | _] -> {error, {forbidden_client_param, Forbidden}}
+    end;
+validate_role_specific_params(_TransportParams, #state{role = client}) ->
+    ok.
+
+%% RFC 9000 Section 18.2: numeric transport parameters carry range
+%% constraints that an endpoint MUST treat as TRANSPORT_PARAMETER_ERROR.
+validate_tp_ranges(TP) ->
+    Checks = [
+        {max_udp_payload_size, fun(V) -> V >= 1200 end, max_udp_payload_size_too_small},
+        {ack_delay_exponent, fun(V) -> V =< 20 end, ack_delay_exponent_too_large},
+        {max_ack_delay, fun(V) -> V < 16384 end, max_ack_delay_too_large}
+    ],
+    run_tp_checks(Checks, TP).
+
+run_tp_checks([], _TP) ->
+    ok;
+run_tp_checks([{Key, Pred, ErrTag} | Rest], TP) ->
+    case maps:find(Key, TP) of
+        {ok, Value} ->
+            case Pred(Value) of
+                true -> run_tp_checks(Rest, TP);
+                false -> {error, {ErrTag, Value}}
+            end;
+        error ->
+            run_tp_checks(Rest, TP)
+    end.
+
+tp_reason_to_binary(Reason) ->
+    list_to_binary(io_lib:format("~p", [Reason])).
+
+%% After the server flight is sent, emit a pending CONNECTION_CLOSE at
+%% handshake level so the peer can decrypt it (peer has just derived
+%% handshake keys from ServerHello). Flips the close_reason to the final
+%% {Class, Code, Reason} tuple so check_state_transition moves to draining.
+maybe_emit_pending_close(#state{close_reason = {pending_close, Class, Code, Reason}} = State) ->
+    close_with_error(handshake, Class, Code, 0, Reason, State);
+maybe_emit_pending_close(State) ->
+    State.
 
 %% Internal function to apply transport params after CID validation passes
 apply_peer_transport_params_internal(TransportParams, State) ->
