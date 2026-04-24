@@ -1338,6 +1338,20 @@ trailer_with_uppercase_field_rejected_test() ->
         quic_h3_connection:validate_trailer_headers(Trailers, #h3_stream{id = 0})
     ).
 
+scheme_starts_with_digit_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"3http">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>}
+    ],
+    State = make_test_state(#{role => server}),
+    ?assertMatch(
+        {error, {invalid_field, <<":scheme">>, <<"3http">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
 scheme_uppercase_rejected_test() ->
     Headers = [
         {<<":method">>, <<"GET">>},

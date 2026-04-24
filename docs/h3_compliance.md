@@ -36,6 +36,7 @@ All tests live under `test/`; module names in the table are bare
 | §4.3 | Duplicate pseudo-header → reject | `quic_h3_compliance_tests:duplicate_method_pseudo_header_rejected_test`, `duplicate_path_pseudo_header_rejected_test`, `duplicate_status_pseudo_header_rejected_test` ✓ |
 | §4.3.1 | Request missing `:method` → reject | `quic_h3_compliance_tests:request_missing_method_rejected_test` ✓ |
 | §4.3.1 | Request with empty `:path` → reject | `quic_h3_compliance_tests:request_empty_path_rejected_test` ✓ |
+| §4.3.1 / RFC 3986 §3.1 | `:scheme` MUST start with ALPHA → digit-first rejected | `quic_h3_compliance_tests:scheme_starts_with_digit_rejected_test` ✓ |
 | §4.3.1 | Request missing `:scheme` / `:path` / `:authority` | `quic_h3_compliance_tests:authority_required_non_connect_test`, `neither_authority_nor_host_rejected_test` ✓ |
 | §4.3.1 | Request with response pseudo-header (`:status`) → reject | `quic_h3_compliance_tests:request_with_status_pseudo_header_rejected_test` ✓ |
 | §4.3.2 | Response with request pseudo-header → reject | `quic_h3_compliance_tests:response_with_request_pseudo_rejected_test` ✓ |
