@@ -86,7 +86,8 @@ All tests live under `test/`; module names in the table are bare
 | §7.2.5 | CANCEL_PUSH on request stream → `H3_FRAME_UNEXPECTED` | `quic_h3_compliance_tests:cancel_push_on_request_stream_is_frame_unexpected_test` ✓ |
 | §7.2.5 | Server receiving PUSH_PROMISE → `H3_FRAME_UNEXPECTED` | `quic_h3_compliance_tests:push_promise_server_receives_error_test` ✓ |
 | §7.2.7 | MAX_PUSH_ID from server → `H3_FRAME_UNEXPECTED` | `quic_h3_compliance_tests:max_push_id_from_server_error_test` ✓ |
-| §7.2.8 | HTTP/2-reserved frame type (0x02/0x06/0x08/0x09) → `H3_FRAME_UNEXPECTED` | covered by `quic_h3_frame` decode returning `{h2_reserved_frame, _}`; `quic_h3_compliance_tests:unknown_frame_after_complete_allowed_test` confirms unknown ≠ reserved ✓ |
+| §7.2.8 | HTTP/2-reserved frame type (0x02/0x06/0x08/0x09) → `H3_FRAME_UNEXPECTED` | `quic_h3_frame_tests:decode_h2_reserved_frame_rejected_test_` ✓ |
+| §9 | Reserved frame type (0x1f*N+0x21) accepted and ignored | `quic_h3_frame_tests:decode_reserved_frame_test`, `is_reserved_frame_type_test` ✓ |
 
 ### Error-code emission coverage
 
