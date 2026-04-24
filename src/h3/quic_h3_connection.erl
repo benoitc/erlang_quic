@@ -2775,6 +2775,9 @@ do_update_stream_with_headers([_ | Rest], Stream, _SeenRegular) ->
     do_update_stream_with_headers(Rest, Stream, true).
 
 %% Validate request pseudo-headers (server receiving requests - RFC 9114 Section 4.3.1)
+%% RFC 9114 §4.3.1: request MUST NOT contain response pseudo-headers (e.g. :status).
+validate_request_headers(#h3_stream{status = Status}, _State) when Status =/= undefined ->
+    throw({header_error, {prohibited_pseudo_header, <<":status">>}});
 validate_request_headers(#h3_stream{method = undefined}, _State) ->
     throw({header_error, {missing_pseudo_header, <<":method">>}});
 %% RFC 9220 extended CONNECT: :method=CONNECT + :protocol requires

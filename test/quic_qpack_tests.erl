@@ -127,12 +127,18 @@ new_state_with_capacity_test() ->
     State = quic_qpack:new(#{max_dynamic_size => 4096}),
     ?assertEqual(4096, quic_qpack:get_dynamic_capacity(State)).
 
-%% Note: set_dynamic_capacity has a bug in the QPACK implementation
-%% that needs to be fixed. Skipping this test for now.
-%% set_dynamic_capacity_test() ->
-%%     State0 = quic_qpack:new(#{max_dynamic_size => 4096}),
-%%     State1 = quic_qpack:set_dynamic_capacity(State0, 2048),
-%%     ?assertEqual(2048, quic_qpack:get_dynamic_capacity(State1)).
+set_dynamic_capacity_under_max_test() ->
+    State0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    State1 = quic_qpack:set_dynamic_capacity(2048, State0),
+    ?assertEqual(2048, quic_qpack:get_dynamic_capacity(State1)).
+
+%% RFC 9204 §4.3: the encoder's Set Dynamic Table Capacity instruction
+%% MUST NOT advertise a capacity greater than the peer's maximum. The
+%% API clamps so a caller can't produce a non-conformant instruction.
+set_dynamic_capacity_clamps_to_max_test() ->
+    State0 = quic_qpack:new(#{max_dynamic_size => 1024}),
+    State1 = quic_qpack:set_dynamic_capacity(4096, State0),
+    ?assertEqual(1024, quic_qpack:get_dynamic_capacity(State1)).
 
 stateful_encode_decode_test() ->
     Encoder = quic_qpack:new(),
@@ -339,3 +345,39 @@ huffman_invalid_eos_rejected_test() ->
     Header = <<NameLenByte/binary, Name/binary, ValueLenByte/binary, Value/binary>>,
     Block = <<Prefix/binary, Header/binary>>,
     ?assertMatch({error, _}, quic_qpack:decode(Block)).
+
+%%====================================================================
+%% QPACK Compliance Checks (RFC 9204)
+%%====================================================================
+
+%% RFC 9204 §4.3: a decoder that receives a Set Dynamic Table Capacity
+%% instruction whose value exceeds its advertised maximum MUST treat
+%% this as QPACK_ENCODER_STREAM_ERROR. `process_encoder_instructions'
+%% propagates {set_capacity_exceeds_max, _, _} which the H3 connection
+%% layer maps to the H3 error.
+encoder_set_capacity_over_max_rejected_test() ->
+    %% Build Set Dynamic Table Capacity with value 2048. Prefix 001,
+    %% 5-bit value: 2048 does not fit, so first byte is 0b00111111 = 0x3F
+    %% then the varint continuation for (2048 - 31) = 2017 = 0xE1 0x0F.
+    Instruction = <<2#00111111, 16#E1, 16#0F>>,
+    State = quic_qpack:new(#{max_dynamic_size => 1024}),
+    ?assertMatch(
+        {error, {set_capacity_exceeds_max, 2048, 1024}},
+        quic_qpack:process_encoder_instructions(Instruction, State)
+    ).
+
+%% RFC 9204 §3.1: static-table references MUST use a valid index
+%% (0..98 in the v1 table). A reference to 99+ is undefined; the
+%% decoder throws and the error surfaces as a decode error.
+invalid_static_index_rejected_test() ->
+    %% Field section prefix is 2 bytes: Encoded RIC (8-bit prefix) + S-flag
+    %% + DeltaBase (7-bit prefix). Both zero means RIC=0, Base=0 (no
+    %% dynamic entries referenced).
+    Prefix = <<0, 0>>,
+    %% Indexed Field Line with name reference to the static table:
+    %% first byte is 11xxxxxx (6-bit index prefix). For index 99:
+    %%   prefix bits 11, low 6 bits = 63 (max) = 0xFF
+    %%   continuation byte carrying 99 - 63 = 36
+    FieldLine = <<16#FF, 36>>,
+    Block = <<Prefix/binary, FieldLine/binary>>,
+    ?assertMatch({error, {invalid_static_index, _}}, quic_qpack:decode(Block)).

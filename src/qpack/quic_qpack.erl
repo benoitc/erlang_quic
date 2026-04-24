@@ -211,15 +211,17 @@ decode(Data, State) ->
 %%====================================================================
 
 %% @doc Set dynamic table capacity.
-%% This generates a Set Dynamic Table Capacity instruction for the encoder stream.
+%% This generates a Set Dynamic Table Capacity instruction for the encoder
+%% stream. RFC 9204 §4.3: the capacity MUST NOT exceed the peer-advertised
+%% maximum (`max_allowed_capacity'). Values above the max are clamped to
+%% the max so callers cannot produce a non-conformant instruction.
 -spec set_dynamic_capacity(non_neg_integer(), state()) -> state().
-set_dynamic_capacity(Capacity, State) ->
-    %% Generate instruction: 001xxxxx
-    Instruction = encode_prefixed_int(Capacity, 5, 2#001),
-    %% Update state and evict if needed
+set_dynamic_capacity(Capacity, #qpack{max_allowed_capacity = Max} = State) ->
+    Effective = min(Capacity, Max),
+    Instruction = encode_prefixed_int(Effective, 5, 2#001),
     State1 = State#qpack{
-        dyn_max_size = Capacity,
-        use_dynamic = Capacity > 0,
+        dyn_max_size = Effective,
+        use_dynamic = Effective > 0,
         encoder_instructions = [Instruction | State#qpack.encoder_instructions]
     },
     evict_to_fit(0, State1).

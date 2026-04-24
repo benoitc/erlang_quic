@@ -1859,6 +1859,122 @@ flush_mailbox() ->
     end.
 
 %%====================================================================
+%% Control Stream Frame Rules (RFC 9114 Sections 6.2.1, 7.2.1, 7.2.2, 7.2.4)
+%%====================================================================
+
+%% RFC 9114 §6.2.1: the first frame on a control stream MUST be SETTINGS.
+%% Anything else is H3_MISSING_SETTINGS.
+first_control_frame_not_settings_is_missing_settings_test() ->
+    State = make_test_state(#{settings_received => false}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_MISSING_SETTINGS, _}},
+        quic_h3_connection:handle_control_frame({data, <<>>}, State)
+    ).
+
+%% RFC 9114 §7.2.4: only one SETTINGS frame per control stream.
+second_settings_frame_is_frame_unexpected_test() ->
+    State = make_test_state(#{settings_received => true}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+        quic_h3_connection:handle_control_frame({settings, #{}}, State)
+    ).
+
+%% RFC 9114 §7.2.4.1: HTTP/2-only SETTINGS MUST be rejected.
+%% ENABLE_PUSH (0x02), MAX_CONCURRENT_STREAMS (0x03), INITIAL_WINDOW_SIZE
+%% (0x04), and MAX_FRAME_SIZE (0x05) all qualify. The decoder surfaces
+%% this as {forbidden_setting, Id} which the control-frame pipeline
+%% turns into H3_SETTINGS_ERROR.
+http2_setting_rejected_at_frame_level_test() ->
+    %% SETTINGS frame with ENABLE_PUSH = 0.
+    %% Frame: type=0x04, length=0x02, id=0x02, value=0x00.
+    Frame = <<16#04, 16#02, 16#02, 16#00>>,
+    ?assertMatch(
+        {error, {frame_error, settings, {forbidden_setting, 16#02}}},
+        quic_h3_frame:decode(Frame)
+    ).
+
+%% RFC 9114 §7.2.1: DATA is not valid on a control stream.
+data_on_control_stream_is_frame_unexpected_test() ->
+    State = make_test_state(#{settings_received => true}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+        quic_h3_connection:handle_control_frame({data, <<"x">>}, State)
+    ).
+
+%% RFC 9114 §7.2.2: HEADERS is not valid on a control stream.
+headers_on_control_stream_is_frame_unexpected_test() ->
+    State = make_test_state(#{settings_received => true}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+        quic_h3_connection:handle_control_frame({headers, <<>>}, State)
+    ).
+
+%%====================================================================
+%% Request Stream Frame Rules (RFC 9114 Sections 7.2.5)
+%%====================================================================
+
+%% RFC 9114 §7.2.5: CANCEL_PUSH is a control-stream-only frame.
+cancel_push_on_request_stream_is_frame_unexpected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    State = make_test_state(#{}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+        quic_h3_connection:handle_request_frame(0, {cancel_push, 1}, false, Stream, State)
+    ).
+
+%%====================================================================
+%% Pseudo-header Rules (RFC 9114 Section 4.3.1 / RFC 9110 Section 6.2)
+%%====================================================================
+
+%% Response-only pseudo-header on a request is malformed (MESSAGE_ERROR).
+request_with_status_pseudo_header_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<":status">>, <<"200">>}
+    ],
+    State = make_test_state(#{}),
+    ?assertMatch(
+        {error, {prohibited_pseudo_header, <<":status">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+%% RFC 9114 §4.3: pseudo-header fields MUST appear before any regular
+%% field in the header section.
+pseudo_header_after_regular_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<"accept">>, <<"*/*">>},
+        {<<":path">>, <<"/late">>}
+    ],
+    State = make_test_state(#{}),
+    ?assertMatch(
+        {error, pseudo_header_after_regular},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+%% RFC 9114 §4.3.1: a request MUST contain exactly one each of :method,
+%% :scheme and :path.
+request_missing_method_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>}
+    ],
+    State = make_test_state(#{}),
+    ?assertMatch(
+        {error, {missing_pseudo_header, <<":method">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+%%====================================================================
 %% Helper Functions
 %%====================================================================
 
