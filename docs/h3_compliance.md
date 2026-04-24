@@ -70,6 +70,7 @@ All tests live under `test/`; module names in the table are bare
 | §7.2.2 | HEADERS on control stream → `H3_FRAME_UNEXPECTED` | `quic_h3_compliance_tests:headers_on_control_stream_is_frame_unexpected_test` ✓ |
 | §7.2.4 | Duplicate SETTINGS → `H3_FRAME_UNEXPECTED` | `quic_h3_compliance_tests:second_settings_frame_is_frame_unexpected_test` ✓ |
 | §7.2.4 | Duplicate setting id inside one SETTINGS → `H3_SETTINGS_ERROR` | `quic_h3_compliance_tests:duplicate_setting_error_code_test` ✓ |
+| §7.2.4 | Unknown setting identifier MUST be ignored | `quic_h3_compliance_tests:unknown_setting_id_ignored_test` ✓ |
 | §7.2.4.1 | HTTP/2-only setting → `H3_SETTINGS_ERROR` | `quic_h3_compliance_tests:http2_setting_rejected_at_frame_level_test` ✓ |
 | §7.2.5 | CANCEL_PUSH on request stream → `H3_FRAME_UNEXPECTED` | `quic_h3_compliance_tests:cancel_push_on_request_stream_is_frame_unexpected_test` ✓ |
 | §7.2.5 | Server receiving PUSH_PROMISE → `H3_FRAME_UNEXPECTED` | `quic_h3_compliance_tests:push_promise_server_receives_error_test` ✓ |

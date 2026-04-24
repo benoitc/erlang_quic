@@ -1893,6 +1893,16 @@ http2_setting_rejected_at_frame_level_test() ->
         quic_h3_frame:decode(Frame)
     ).
 
+%% RFC 9114 §7.2.4: setting identifiers not understood MUST be ignored.
+%% Guards against a future tightening that would inadvertently turn
+%% unknown ids into errors.
+unknown_setting_id_ignored_test() ->
+    %% SETTINGS frame with a single reserved/unknown id = 0x40 value=1.
+    %% Length is 2 bytes: one varint for id (0x40 encodes in 2 bytes
+    %% as <<16#40, 16#40>>), one for value (0x01). Payload = 3 bytes.
+    Frame = <<16#04, 16#03, 16#40, 16#40, 16#01>>,
+    ?assertMatch({ok, {settings, _}, <<>>}, quic_h3_frame:decode(Frame)).
+
 %% RFC 9114 §7.2.1: DATA is not valid on a control stream.
 data_on_control_stream_is_frame_unexpected_test() ->
     State = make_test_state(#{settings_received => true}),
