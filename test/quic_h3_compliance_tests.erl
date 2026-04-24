@@ -2022,6 +2022,98 @@ pseudo_header_after_regular_rejected_test() ->
         quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
     ).
 
+%% RFC 9114 §4.3.1: `:path` MUST NOT be empty for non-CONNECT.
+request_empty_path_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<>>}
+    ],
+    State = make_test_state(#{role => server}),
+    ?assertMatch(
+        {error, {invalid_pseudo_header, <<":path">>, empty}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+%% RFC 9220 §3: extended CONNECT (with :protocol) requires :scheme,
+%% :path and :authority. Missing :scheme is an error.
+extended_connect_missing_scheme_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":protocol">>, <<"websocket">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/chat">>}
+    ],
+    State = make_test_state(#{role => server, local_connect_enabled => true}),
+    ?assertMatch(
+        {error, {missing_pseudo_header, <<":scheme">>}},
+        quic_h3_connection:update_stream_with_headers(
+            Headers, #h3_stream{id = 0}, server, State
+        )
+    ).
+
+%% RFC 9114 §4.3.2: every response MUST include `:status`.
+response_missing_status_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [{<<"content-type">>, <<"text/plain">>}],
+    State = make_test_state(#{role => client}),
+    ?assertMatch(
+        {error, {missing_pseudo_header, <<":status">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, client, State)
+    ).
+
+%% RFC 9110 §8.6 / §6.4.3: content-length value MUST be a non-negative
+%% integer. Our decoder treats non-digits, negatives and empty as
+%% `H3_MESSAGE_ERROR`.
+content_length_negative_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"POST">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"content-length">>, <<"-1">>}
+    ],
+    State = make_test_state(#{role => server}),
+    ?assertMatch(
+        {error, {invalid_field, <<"content-length">>, <<"-1">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+content_length_non_numeric_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"POST">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"content-length">>, <<"abc">>}
+    ],
+    State = make_test_state(#{role => server}),
+    ?assertMatch(
+        {error, {invalid_field, <<"content-length">>, <<"abc">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+%% RFC 9220 §3: extended CONNECT with empty :path is malformed.
+extended_connect_empty_path_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":protocol">>, <<"websocket">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<>>}
+    ],
+    State = make_test_state(#{role => server, local_connect_enabled => true}),
+    ?assertMatch(
+        {error, {invalid_pseudo_header, <<":path">>, empty}},
+        quic_h3_connection:update_stream_with_headers(
+            Headers, #h3_stream{id = 0}, server, State
+        )
+    ).
+
 %% RFC 9114 §4.3.1: a request MUST contain exactly one each of :method,
 %% :scheme and :path.
 request_missing_method_rejected_test() ->

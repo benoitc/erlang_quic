@@ -26,6 +26,8 @@ All tests live under `test/`; module names in the table are bare
 | §4.1.2 | Content-Length vs received body: overflow → `H3_MESSAGE_ERROR` | `quic_h3_compliance_tests:content_length_overflow_returns_reset_test` ✓ |
 | §4.1.2 | Content-Length vs received body: underflow → `H3_MESSAGE_ERROR` | `quic_h3_compliance_tests:content_length_underflow_returns_reset_test` ✓ |
 | §4.1.2 | Trailers duplicate Content-Length mismatch → reject | `quic_h3_compliance_tests:duplicate_content_length_mismatch_rejected_test` ✓ |
+| RFC 9110 §8.6 | `content-length` value negative → reject | `quic_h3_compliance_tests:content_length_negative_rejected_test` ✓ |
+| RFC 9110 §8.6 | `content-length` value non-numeric → reject | `quic_h3_compliance_tests:content_length_non_numeric_rejected_test` ✓ |
 | §4.2 | Forbidden request field (`connection`, `keep-alive`, `upgrade`, `transfer-encoding`, `te` ≠ trailers) | `quic_h3_compliance_tests:connection_header_rejected_test`, `te_non_trailers_rejected_test` ✓ |
 | §4.2 | Field name uppercase → reject | `quic_h3_compliance_tests:uppercase_header_name_rejected_test` ✓ |
 | §4.2 | Invalid field value (CTL) → reject | `quic_h3_compliance_tests:invalid_field_value_ctl_rejected_test` ✓ |
@@ -33,11 +35,15 @@ All tests live under `test/`; module names in the table are bare
 | §4.3 | Pseudo-header after regular header → `H3_MESSAGE_ERROR` | `quic_h3_compliance_tests:pseudo_header_after_regular_rejected_test` ✓ |
 | §4.3 | Duplicate pseudo-header → reject | `quic_h3_compliance_tests:duplicate_method_pseudo_header_rejected_test`, `duplicate_path_pseudo_header_rejected_test`, `duplicate_status_pseudo_header_rejected_test` ✓ |
 | §4.3.1 | Request missing `:method` → reject | `quic_h3_compliance_tests:request_missing_method_rejected_test` ✓ |
+| §4.3.1 | Request with empty `:path` → reject | `quic_h3_compliance_tests:request_empty_path_rejected_test` ✓ |
 | §4.3.1 | Request missing `:scheme` / `:path` / `:authority` | `quic_h3_compliance_tests:authority_required_non_connect_test`, `neither_authority_nor_host_rejected_test` ✓ |
 | §4.3.1 | Request with response pseudo-header (`:status`) → reject | `quic_h3_compliance_tests:request_with_status_pseudo_header_rejected_test` ✓ |
 | §4.3.2 | Response with request pseudo-header → reject | `quic_h3_compliance_tests:response_with_request_pseudo_rejected_test` ✓ |
 | §4.3.2 | Response `:status` out of 100..599 → reject | `quic_h3_compliance_tests:response_status_out_of_range_rejected_test` ✓ |
+| §4.3.2 | Response missing `:status` → reject | `quic_h3_compliance_tests:response_missing_status_rejected_test` ✓ |
 | §4.4 | CONNECT without peer-enabled → reject | `quic_h3_compliance_tests:extended_connect_rejected_when_disabled_test` ✓ |
+| §4.4 / RFC 9220 | Extended CONNECT missing `:scheme` → reject | `quic_h3_compliance_tests:extended_connect_missing_scheme_rejected_test` ✓ |
+| §4.4 / RFC 9220 | Extended CONNECT empty `:path` → reject | `quic_h3_compliance_tests:extended_connect_empty_path_rejected_test` ✓ |
 | §4.6 | PUSH: MAX_PUSH_ID MUST NOT decrease | `quic_h3_compliance_tests:max_push_id_decrease_error_test` ✓ |
 
 ### §5 Connection Management
