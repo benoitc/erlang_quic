@@ -2121,6 +2121,36 @@ content_length_non_numeric_rejected_test() ->
         quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
     ).
 
+%% RFC 9114 §4.4: plain CONNECT (no `:protocol`) MUST NOT carry `:scheme`.
+plain_connect_with_scheme_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com:443">>}
+    ],
+    State = make_test_state(#{role => server, peer_connect_enabled => true}),
+    ?assertMatch(
+        {error, {invalid_connect, scheme_present}},
+        quic_h3_connection:update_stream_with_headers(
+            Headers, #h3_stream{id = 0}, server, State
+        )
+    ).
+
+%% RFC 9114 §4.4: plain CONNECT MUST NOT carry `:path`.
+plain_connect_with_path_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"example.com:443">>}
+    ],
+    State = make_test_state(#{role => server, peer_connect_enabled => true}),
+    ?assertMatch(
+        {error, {invalid_connect, path_present}},
+        quic_h3_connection:update_stream_with_headers(
+            Headers, #h3_stream{id = 0}, server, State
+        )
+    ).
+
 %% RFC 9220 §3: extended CONNECT with empty :path is malformed.
 extended_connect_empty_path_rejected_test() ->
     Headers = [
