@@ -123,6 +123,7 @@ as a bucket index into an 8-bucket priority queue
 |---|---|---|
 | §4.1 | Default urgency = 3 when no signal present | `quic_h3_compliance_tests:priority_defaults_when_no_header_test` ✓ |
 | §5.1 | `priority` request header `u=N, i` parses into urgency / incremental | `quic_h3_compliance_tests:priority_header_parsed_into_stream_test` ✓ |
+| §7.1 | PRIORITY_UPDATE for a request stream rewrites urgency / incremental | `quic_h3_compliance_tests:priority_update_request_stream_updates_state_test` ✓ |
 
 ## RFC 9297 — HTTP Datagrams
 

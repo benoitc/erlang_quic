@@ -107,7 +107,7 @@
 -endif.
 
 %% Exposed for tests and introspection; not part of the public H3 API.
--export([test_discarded_uni_streams/1]).
+-export([test_discarded_uni_streams/1, test_stream/2, test_push_stream/2]).
 
 %%====================================================================
 %% Types
@@ -3133,6 +3133,12 @@ maybe_reset_incomplete_request(_StreamId, _State) ->
 test_discarded_uni_streams(#state{discarded_uni_streams = D}) ->
     D.
 
+test_stream(StreamId, #state{streams = Streams}) ->
+    maps:get(StreamId, Streams).
+
+test_push_stream(PushId, #state{push_streams = Pushes}) ->
+    maps:get(PushId, Pushes).
+
 %% Check if a stream is a critical H3 stream
 is_critical_stream(StreamId, #state{peer_control_stream = StreamId}) -> {true, control};
 is_critical_stream(StreamId, #state{peer_encoder_stream = StreamId}) -> {true, qpack_encoder};
@@ -3947,6 +3953,8 @@ h3_datagrams_live(#state{h3_datagram_enabled = L, peer_h3_datagram_enabled = R})
     L andalso R.
 
 %% Apply RFC 9218 priority to underlying QUIC stream
+apply_stream_priority(_StreamId, _Stream, #state{quic_conn = undefined}) ->
+    ok;
 apply_stream_priority(StreamId, Stream, #state{quic_conn = QuicConn}) ->
     #h3_stream{urgency = Urgency, incremental = Incremental} = Stream,
     %% Set QUIC stream priority - ignore errors (stream might be closed)
