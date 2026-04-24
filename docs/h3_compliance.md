@@ -106,6 +106,19 @@ All tests live under `test/`; module names in the table are bare
 | `H3_CONNECT_ERROR` | `n/a` — CONNECT tunneling not shipped |
 | `H3_VERSION_FALLBACK` | `n/a` — alt-protocol negotiation not shipped |
 
+## RFC 9297 — HTTP Datagrams
+
+WebTransport (sibling repo github.com/benoitc/erlang-webtransport)
+depends on these primitives.
+
+| Section | Requirement | Test |
+|---|---|---|
+| §2.1 | `SETTINGS_H3_DATAGRAM` codepoint = 0x33 | `quic_h3_datagram_tests:settings_h3_datagram_constant_test` ✓ |
+| §2.1 | SETTINGS carrying `h3_datagram=1` round-trips | `quic_h3_datagram_tests:settings_encode_decode_h3_datagram_test` ✓ |
+| §2.1 | SETTINGS carrying `h3_datagram=0` round-trips | `quic_h3_datagram_tests:settings_decode_zero_is_disabled_test` ✓ |
+| §2.1 | `SETTINGS_H3_DATAGRAM=1` without QUIC datagram support → `H3_SETTINGS_ERROR` | emitted by `validate_peer_h3_datagram/1` at `src/h3/quic_h3_connection.erl:3891-3900`; no standalone unit test (driven via a live connection) |
+| §2.1 | Quarter-stream-id encoding (StreamId bsr 2) round-trips | `quic_h3_datagram_tests:qsid_roundtrip_test_`, `qsid_varint_sizes_test_` ✓ |
+
 ## RFC 9204 — QPACK
 
 | Section | Requirement | Test |
