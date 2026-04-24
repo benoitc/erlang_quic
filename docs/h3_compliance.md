@@ -151,15 +151,32 @@ depends on these primitives.
 | §4.4.3 | Decoder-stream Insert Count Increment = 0 → `H3_QPACK_DECODER_STREAM_ERROR` | `quic_qpack_tests:insert_count_increment_zero_rejected_test` ✓ |
 | §5 | Huffman EOS / over-long padding → reject | `quic_qpack_tests:huffman_invalid_eos_rejected_test` ✓ |
 
+## Scheduler behaviour
+
+The QUIC send queue (`src/quic_connection.erl`) uses an 8-bucket
+priority queue. `pqueue_in/3` inserts at `element(Urgency+1, PQ)`;
+`pqueue_out/1` scans buckets 0..7 and dequeues the first non-empty
+one. Streams without a PRIORITY_UPDATE signal default to urgency 3
+per RFC 9218 §4.1. The H3 layer propagates per-stream urgency into
+the QUIC stream via `quic:set_stream_priority/4`, so enqueues of
+stream data land in the correct bucket.
+
+One known behaviour difference from a strict RFC 9218 §4.2 read:
+within a single urgency bucket, entries are served FIFO by enqueue
+order. RFC 9218 allows an implementation to serve `incremental=0`
+streams in strict per-stream order (finish stream A fully before
+starting stream B) — we do not. Head-of-line risk is bounded
+because streams sharing an urgency ordinarily fan out in bursts of
+comparable size. Future work: per-urgency per-stream sub-queues.
+
 ## Out of scope / deferred
 
-- **HTTP/3 priority (RFC 9218)**: partial parse exists; not a compliance
-  target until we negotiate priorities end-to-end.
-- **HTTP/3 datagrams (RFC 9297)**: SETTINGS-gated path exists; no
-  datagram-specific compliance tests beyond the SETTINGS requirement
-  check (`h3_datagram_enabled` → SETTINGS `H3_DATAGRAM=1`).
-- **WebTransport over HTTP/3** (draft-15): out of scope for this
-  matrix — validated via its own dedicated tests.
-- **CONNECT**: not shipped; `H3_CONNECT_ERROR` unused.
-- **Alt-protocol negotiation**: not shipped; `H3_VERSION_FALLBACK`
-  unused.
+- **WebTransport over HTTP/3**: implemented in the sibling
+  `github.com/benoitc/erlang-webtransport` library. This repo
+  provides the primitives (extended CONNECT, datagrams, stream-type
+  claim hook) the WebTransport library builds on.
+- **Plain CONNECT tunnel dataplane**: request-side validation is
+  tested (§4.4 rows above); the actual tunnel byte-forwarding path
+  is not shipped. `H3_CONNECT_ERROR` stays reserved until it lands.
+- **Alt-protocol negotiation**: not shipped. `H3_VERSION_FALLBACK`
+  reserved.
