@@ -1338,6 +1338,20 @@ trailer_with_uppercase_field_rejected_test() ->
         quic_h3_connection:validate_trailer_headers(Trailers, #h3_stream{id = 0})
     ).
 
+scheme_starts_with_digit_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"3http">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>}
+    ],
+    State = make_test_state(#{role => server}),
+    ?assertMatch(
+        {error, {invalid_field, <<":scheme">>, <<"3http">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
 scheme_uppercase_rejected_test() ->
     Headers = [
         {<<":method">>, <<"GET">>},
@@ -1857,6 +1871,397 @@ flush_mailbox() ->
         _ -> flush_mailbox()
     after 0 -> ok
     end.
+
+%%====================================================================
+%% Control Stream Frame Rules (RFC 9114 Sections 6.2.1, 7.2.1, 7.2.2, 7.2.4)
+%%====================================================================
+
+%% RFC 9114 §6.2.1: the first frame on a control stream MUST be SETTINGS.
+%% Anything else is H3_MISSING_SETTINGS.
+first_control_frame_not_settings_is_missing_settings_test() ->
+    State = make_test_state(#{settings_received => false}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_MISSING_SETTINGS, _}},
+        quic_h3_connection:handle_control_frame({data, <<>>}, State)
+    ).
+
+%% RFC 9114 §7.2.4: only one SETTINGS frame per control stream.
+second_settings_frame_is_frame_unexpected_test() ->
+    State = make_test_state(#{settings_received => true}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+        quic_h3_connection:handle_control_frame({settings, #{}}, State)
+    ).
+
+%% RFC 9114 §7.2.4.1: HTTP/2-only SETTINGS MUST be rejected.
+%% ENABLE_PUSH (0x02), MAX_CONCURRENT_STREAMS (0x03), INITIAL_WINDOW_SIZE
+%% (0x04), and MAX_FRAME_SIZE (0x05) all qualify. The decoder surfaces
+%% this as {forbidden_setting, Id} which the control-frame pipeline
+%% turns into H3_SETTINGS_ERROR.
+http2_setting_rejected_at_frame_level_test() ->
+    %% SETTINGS frame with ENABLE_PUSH = 0.
+    %% Frame: type=0x04, length=0x02, id=0x02, value=0x00.
+    Frame = <<16#04, 16#02, 16#02, 16#00>>,
+    ?assertMatch(
+        {error, {frame_error, settings, {forbidden_setting, 16#02}}},
+        quic_h3_frame:decode(Frame)
+    ).
+
+%% RFC 9114 §7.2.4: setting identifiers not understood MUST be ignored.
+%% Guards against a future tightening that would inadvertently turn
+%% unknown ids into errors.
+unknown_setting_id_ignored_test() ->
+    %% SETTINGS frame with a single reserved/unknown id = 0x40 value=1.
+    %% Length is 2 bytes: one varint for id (0x40 encodes in 2 bytes
+    %% as <<16#40, 16#40>>), one for value (0x01). Payload = 3 bytes.
+    Frame = <<16#04, 16#03, 16#40, 16#40, 16#01>>,
+    ?assertMatch({ok, {settings, _}, <<>>}, quic_h3_frame:decode(Frame)).
+
+%% RFC 9114 §7.2.1: DATA is not valid on a control stream.
+data_on_control_stream_is_frame_unexpected_test() ->
+    State = make_test_state(#{settings_received => true}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+        quic_h3_connection:handle_control_frame({data, <<"x">>}, State)
+    ).
+
+%% RFC 9114 §7.2.2: HEADERS is not valid on a control stream.
+headers_on_control_stream_is_frame_unexpected_test() ->
+    State = make_test_state(#{settings_received => true}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+        quic_h3_connection:handle_control_frame({headers, <<>>}, State)
+    ).
+
+%%====================================================================
+%% Request Stream Frame Rules (RFC 9114 Sections 7.2.5)
+%%====================================================================
+
+%% RFC 9114 §7.2.5: CANCEL_PUSH is a control-stream-only frame.
+cancel_push_on_request_stream_is_frame_unexpected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    State = make_test_state(#{}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+        quic_h3_connection:handle_request_frame(0, {cancel_push, 1}, false, Stream, State)
+    ).
+
+%%====================================================================
+%% HTTP/3 Extensible Priorities (RFC 9218)
+%%====================================================================
+
+%% RFC 9218 §5.1: the `priority` header carries `u=N, i` parameters.
+%% Parsing must land on the #h3_stream urgency / incremental fields.
+priority_header_parsed_into_stream_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"priority">>, <<"u=1, i">>}
+    ],
+    State = make_test_state(#{role => server}),
+    {ok, Updated} = quic_h3_connection:update_stream_with_headers(
+        Headers, Stream, server, State
+    ),
+    ?assertEqual(1, Updated#h3_stream.urgency),
+    ?assertEqual(true, Updated#h3_stream.incremental).
+
+%% RFC 9218 §7: PRIORITY_UPDATE for a request stream rewrites the
+%% stream's urgency and incremental flag.
+priority_update_request_stream_updates_state_test() ->
+    Stream = #h3_stream{id = 0, urgency = 3, incremental = false},
+    State = make_test_state(#{
+        role => server,
+        settings_received => true,
+        streams => #{0 => Stream}
+    }),
+    %% Payload: varint(0) = <<0>>, then priority field value "u=5, i".
+    Payload = <<0, "u=5, i">>,
+    {ok, State1} = quic_h3_connection:handle_priority_update_frame(Payload, State),
+    Updated = quic_h3_connection:test_stream(0, State1),
+    ?assertEqual(5, Updated#h3_stream.urgency),
+    ?assertEqual(true, Updated#h3_stream.incremental).
+
+%% RFC 9218 §7.2: PRIORITY_UPDATE for a push stream rewrites the
+%% push stream's urgency / incremental. Server-side only.
+priority_update_push_stream_updates_state_test() ->
+    Stream = #h3_stream{id = 10, urgency = 3, incremental = false, type = push},
+    State = make_test_state(#{
+        role => server,
+        settings_received => true,
+        push_streams => #{0 => {10, Stream}}
+    }),
+    Payload = <<0, "u=7, i">>,
+    {ok, State1} = quic_h3_connection:handle_priority_update_push_frame(Payload, State),
+    {_StreamId, Updated} = quic_h3_connection:test_push_stream(0, State1),
+    ?assertEqual(7, Updated#h3_stream.urgency),
+    ?assertEqual(true, Updated#h3_stream.incremental).
+
+%% Default urgency per RFC 9218 §4.1 is 3 when no `priority` header is
+%% present. Incremental defaults to false.
+priority_defaults_when_no_header_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>}
+    ],
+    State = make_test_state(#{role => server}),
+    {ok, Updated} = quic_h3_connection:update_stream_with_headers(
+        Headers, Stream, server, State
+    ),
+    %% #h3_stream record defaults: urgency=3, incremental=false.
+    ?assertEqual(3, Updated#h3_stream.urgency),
+    ?assertEqual(false, Updated#h3_stream.incremental).
+
+%%====================================================================
+%% Unidirectional Stream Uniqueness (RFC 9114 Sections 6.2.1, 6.2.2, 6.2.3)
+%%====================================================================
+
+%% RFC 9114 §6.2.1: exactly one control stream per direction.
+duplicate_control_stream_is_stream_creation_error_test() ->
+    State = make_test_state(#{peer_control_stream => 2}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_STREAM_CREATION_ERROR, _}},
+        quic_h3_connection:assign_uni_stream(6, control, State)
+    ).
+
+%% RFC 9114 §6.2.2: exactly one QPACK encoder stream per direction.
+duplicate_encoder_stream_is_stream_creation_error_test() ->
+    State = make_test_state(#{peer_encoder_stream => 2}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_STREAM_CREATION_ERROR, _}},
+        quic_h3_connection:assign_uni_stream(6, qpack_encoder, State)
+    ).
+
+%% RFC 9114 §6.2.3: exactly one QPACK decoder stream per direction.
+duplicate_decoder_stream_is_stream_creation_error_test() ->
+    State = make_test_state(#{peer_decoder_stream => 2}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_STREAM_CREATION_ERROR, _}},
+        quic_h3_connection:assign_uni_stream(6, qpack_decoder, State)
+    ).
+
+%% RFC 9114 §4.6: a server MUST NOT push until the client has sent
+%% MAX_PUSH_ID. A push stream before any MAX_PUSH_ID is `H3_ID_ERROR`.
+push_stream_without_max_push_id_is_id_error_test() ->
+    State = make_test_state(#{role => client, local_max_push_id => undefined}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_ID_ERROR, _}},
+        quic_h3_connection:assign_uni_stream(3, push, State)
+    ).
+
+%% RFC 9114 §4.6: only servers may initiate push streams.
+push_stream_to_server_is_stream_creation_error_test() ->
+    State = make_test_state(#{role => server}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_STREAM_CREATION_ERROR, _}},
+        quic_h3_connection:assign_uni_stream(3, push, State)
+    ).
+
+%%====================================================================
+%% Push ID Bounds (RFC 9114 Sections 4.6, 7.2.3)
+%%====================================================================
+
+%% RFC 9114 §7.2.3: CANCEL_PUSH with a push ID greater than the value
+%% the server has issued via MAX_PUSH_ID is an `H3_ID_ERROR`.
+cancel_push_above_max_push_id_is_id_error_test() ->
+    State = make_test_state(#{
+        role => server,
+        settings_received => true,
+        max_push_id => 4
+    }),
+    ?assertMatch(
+        {error, {connection_error, ?H3_ID_ERROR, _}},
+        quic_h3_connection:handle_control_frame({cancel_push, 16}, State)
+    ).
+
+%%====================================================================
+%% Pseudo-header Rules (RFC 9114 Section 4.3.1 / RFC 9110 Section 6.2)
+%%====================================================================
+
+%% Response-only pseudo-header on a request is malformed (MESSAGE_ERROR).
+request_with_status_pseudo_header_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<":status">>, <<"200">>}
+    ],
+    State = make_test_state(#{}),
+    ?assertMatch(
+        {error, {prohibited_pseudo_header, <<":status">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+%% RFC 9114 §4.3: pseudo-header fields MUST appear before any regular
+%% field in the header section.
+pseudo_header_after_regular_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<"accept">>, <<"*/*">>},
+        {<<":path">>, <<"/late">>}
+    ],
+    State = make_test_state(#{}),
+    ?assertMatch(
+        {error, pseudo_header_after_regular},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+%% RFC 9114 §4.3.1: `:path` MUST NOT be empty for non-CONNECT.
+request_empty_path_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<>>}
+    ],
+    State = make_test_state(#{role => server}),
+    ?assertMatch(
+        {error, {invalid_pseudo_header, <<":path">>, empty}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+%% RFC 9220 §3: extended CONNECT (with :protocol) requires :scheme,
+%% :path and :authority. Missing :scheme is an error.
+extended_connect_missing_scheme_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":protocol">>, <<"websocket">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/chat">>}
+    ],
+    State = make_test_state(#{role => server, local_connect_enabled => true}),
+    ?assertMatch(
+        {error, {missing_pseudo_header, <<":scheme">>}},
+        quic_h3_connection:update_stream_with_headers(
+            Headers, #h3_stream{id = 0}, server, State
+        )
+    ).
+
+%% RFC 9114 §4.3.2: response `:status` MUST parse as an integer.
+response_status_non_numeric_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [{<<":status">>, <<"NaN">>}],
+    State = make_test_state(#{role => client}),
+    ?assertMatch(
+        {error, {invalid_field, <<":status">>, <<"NaN">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, client, State)
+    ).
+
+%% RFC 9114 §4.3.2: every response MUST include `:status`.
+response_missing_status_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [{<<"content-type">>, <<"text/plain">>}],
+    State = make_test_state(#{role => client}),
+    ?assertMatch(
+        {error, {missing_pseudo_header, <<":status">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, client, State)
+    ).
+
+%% RFC 9110 §8.6 / §6.4.3: content-length value MUST be a non-negative
+%% integer. Our decoder treats non-digits, negatives and empty as
+%% `H3_MESSAGE_ERROR`.
+content_length_negative_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"POST">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"content-length">>, <<"-1">>}
+    ],
+    State = make_test_state(#{role => server}),
+    ?assertMatch(
+        {error, {invalid_field, <<"content-length">>, <<"-1">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+content_length_non_numeric_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":method">>, <<"POST">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>},
+        {<<"content-length">>, <<"abc">>}
+    ],
+    State = make_test_state(#{role => server}),
+    ?assertMatch(
+        {error, {invalid_field, <<"content-length">>, <<"abc">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+%% RFC 9114 §4.4: plain CONNECT (no `:protocol`) MUST NOT carry `:scheme`.
+plain_connect_with_scheme_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com:443">>}
+    ],
+    State = make_test_state(#{role => server, peer_connect_enabled => true}),
+    ?assertMatch(
+        {error, {invalid_connect, scheme_present}},
+        quic_h3_connection:update_stream_with_headers(
+            Headers, #h3_stream{id = 0}, server, State
+        )
+    ).
+
+%% RFC 9114 §4.4: plain CONNECT MUST NOT carry `:path`.
+plain_connect_with_path_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"example.com:443">>}
+    ],
+    State = make_test_state(#{role => server, peer_connect_enabled => true}),
+    ?assertMatch(
+        {error, {invalid_connect, path_present}},
+        quic_h3_connection:update_stream_with_headers(
+            Headers, #h3_stream{id = 0}, server, State
+        )
+    ).
+
+%% RFC 9220 §3: extended CONNECT with empty :path is malformed.
+extended_connect_empty_path_rejected_test() ->
+    Headers = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":protocol">>, <<"websocket">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<>>}
+    ],
+    State = make_test_state(#{role => server, local_connect_enabled => true}),
+    ?assertMatch(
+        {error, {invalid_pseudo_header, <<":path">>, empty}},
+        quic_h3_connection:update_stream_with_headers(
+            Headers, #h3_stream{id = 0}, server, State
+        )
+    ).
+
+%% RFC 9114 §4.3.1: a request MUST contain exactly one each of :method,
+%% :scheme and :path.
+request_missing_method_rejected_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    Headers = [
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>}
+    ],
+    State = make_test_state(#{}),
+    ?assertMatch(
+        {error, {missing_pseudo_header, <<":method">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
 
 %%====================================================================
 %% Helper Functions

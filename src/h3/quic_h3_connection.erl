@@ -100,12 +100,14 @@
     handle_priority_update_frame/2,
     handle_priority_update_push_frame/2,
     do_send_trailers/3,
-    pre_claim_bidi_stream/3
+    pre_claim_bidi_stream/3,
+    assign_uni_stream/3,
+    validate_peer_h3_datagram_with/1
 ]).
 -endif.
 
 %% Exposed for tests and introspection; not part of the public H3 API.
--export([test_discarded_uni_streams/1]).
+-export([test_discarded_uni_streams/1, test_stream/2, test_push_stream/2]).
 
 %%====================================================================
 %% Types
@@ -116,9 +118,9 @@
 -type error_code() :: non_neg_integer().
 
 -record(state, {
-    %% Underlying QUIC connection
-    quic_conn :: pid(),
-    quic_ref :: reference(),
+    %% Underlying QUIC connection. `undefined' only in test state.
+    quic_conn :: pid() | undefined,
+    quic_ref :: reference() | undefined,
 
     %% Role: client or server
     role :: role(),
@@ -2775,6 +2777,9 @@ do_update_stream_with_headers([_ | Rest], Stream, _SeenRegular) ->
     do_update_stream_with_headers(Rest, Stream, true).
 
 %% Validate request pseudo-headers (server receiving requests - RFC 9114 Section 4.3.1)
+%% RFC 9114 §4.3.1: request MUST NOT contain response pseudo-headers (e.g. :status).
+validate_request_headers(#h3_stream{status = Status}, _State) when Status =/= undefined ->
+    throw({header_error, {prohibited_pseudo_header, <<":status">>}});
 validate_request_headers(#h3_stream{method = undefined}, _State) ->
     throw({header_error, {missing_pseudo_header, <<":method">>}});
 %% RFC 9220 extended CONNECT: :method=CONNECT + :protocol requires
@@ -3127,6 +3132,12 @@ maybe_reset_incomplete_request(_StreamId, _State) ->
 
 test_discarded_uni_streams(#state{discarded_uni_streams = D}) ->
     D.
+
+test_stream(StreamId, #state{streams = Streams}) ->
+    maps:get(StreamId, Streams).
+
+test_push_stream(PushId, #state{push_streams = Pushes}) ->
+    maps:get(PushId, Pushes).
 
 %% Check if a stream is a critical H3 stream
 is_critical_stream(StreamId, #state{peer_control_stream = StreamId}) -> {true, control};
@@ -3883,17 +3894,18 @@ apply_peer_settings(Settings, #state{qpack_encoder = Encoder} = State) ->
 
 %% RFC 9297 §2.1: peer SETTINGS_H3_DATAGRAM = 1 requires non-zero
 %% max_datagram_frame_size on the QUIC connection. Return `true' when
-%% the precondition holds, otherwise raise H3_SETTINGS_ERROR.
+%% the precondition holds, otherwise raise H3_SETTINGS_ERROR. Takes
+%% the QUIC-level max datagram size directly so the check can be
+%% unit-tested without a live connection.
+validate_peer_h3_datagram_with(0) ->
+    throw(
+        {connection_error, ?H3_SETTINGS_ERROR, <<"h3_datagram without max_datagram_frame_size">>}
+    );
+validate_peer_h3_datagram_with(_) ->
+    true.
+
 validate_peer_h3_datagram(#state{quic_conn = QuicConn}) ->
-    case quic:datagram_max_size(QuicConn) of
-        0 ->
-            throw(
-                {connection_error, ?H3_SETTINGS_ERROR,
-                    <<"h3_datagram without max_datagram_frame_size">>}
-            );
-        _ ->
-            true
-    end.
+    validate_peer_h3_datagram_with(quic:datagram_max_size(QuicConn)).
 
 %% RFC 9297 §2.1 inbound datagram. Peel the quarter-stream-id varint
 %% and deliver the payload tagged with the full stream id to the owner.
@@ -3941,6 +3953,8 @@ h3_datagrams_live(#state{h3_datagram_enabled = L, peer_h3_datagram_enabled = R})
     L andalso R.
 
 %% Apply RFC 9218 priority to underlying QUIC stream
+apply_stream_priority(_StreamId, _Stream, #state{quic_conn = undefined}) ->
+    ok;
 apply_stream_priority(StreamId, Stream, #state{quic_conn = QuicConn}) ->
     #h3_stream{urgency = Urgency, incremental = Incremental} = Stream,
     %% Set QUIC stream priority - ignore errors (stream might be closed)

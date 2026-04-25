@@ -74,8 +74,7 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    %% Ensure quic application is compiled
-    ok = application:load(quic),
+    _ = application:load(quic),
     Config.
 
 end_per_suite(_Config) ->
@@ -211,10 +210,12 @@ quic_app_starts(_Config) ->
 
 %% Test that listen/1 creates a QUIC server
 listen_creates_server(_Config) ->
-    %% This test requires certificates
-    PrivDir = code:priv_dir(quic),
-    CertFile = filename:join([PrivDir, "..", "test", "e2e", "certs", "cert.pem"]),
-    KeyFile = filename:join([PrivDir, "..", "test", "e2e", "certs", "key.pem"]),
+    %% This test requires certificates. `code:lib_dir(quic)' resolves to
+    %% the rebar build app dir which actually contains test/, unlike
+    %% `code:priv_dir/1' (the rebar-shimmed `priv' is a dangling symlink).
+    LibDir = code:lib_dir(quic),
+    CertFile = filename:join([LibDir, "test", "e2e", "certs", "cert.pem"]),
+    KeyFile = filename:join([LibDir, "test", "e2e", "certs", "key.pem"]),
 
     %% Check if test certs exist
     case {filelib:is_file(CertFile), filelib:is_file(KeyFile)} of

@@ -9,6 +9,7 @@
 -module(quic_h3_datagram_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("quic.hrl").
 -include("quic_h3.hrl").
 
 %%====================================================================
@@ -64,3 +65,18 @@ id_to_setting_h3_datagram_test() ->
     Encoded = quic_h3_frame:encode_settings_payload(#{h3_datagram => 1}),
     {ok, Decoded} = quic_h3_frame:decode_settings_payload(Encoded),
     ?assertEqual(1, maps:get(h3_datagram, Decoded)).
+
+%%====================================================================
+%% Peer SETTINGS enforcement (RFC 9297 §2.1)
+%%====================================================================
+
+%% Peer advertising SETTINGS_H3_DATAGRAM=1 without a non-zero QUIC
+%% max_datagram_frame_size MUST be treated as H3_SETTINGS_ERROR.
+peer_h3_datagram_without_quic_datagram_is_settings_error_test() ->
+    ?assertThrow(
+        {connection_error, ?H3_SETTINGS_ERROR, _},
+        quic_h3_connection:validate_peer_h3_datagram_with(0)
+    ).
+
+peer_h3_datagram_with_quic_datagram_ok_test() ->
+    ?assertEqual(true, quic_h3_connection:validate_peer_h3_datagram_with(1200)).
