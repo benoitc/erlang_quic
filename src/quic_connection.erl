@@ -6995,21 +6995,27 @@ send_pending_data([{StreamId, Data, Fin} | Rest], State) ->
             send_pending_data(Rest, State)
     end.
 
-%% Close a stream
+%% Send RESET_STREAM (RFC 9000 §3.2): closes the SEND direction only.
+%% The recv side stays alive so the caller can still issue
+%% stop_sending and receive frames from the peer until the peer
+%% closes its own send side. Drop the stream from the map only when
+%% both directions are terminated.
 do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, StreamState} ->
-            %% Cancel deadline timer if any
             case StreamState#stream_state.deadline_timer of
                 undefined -> ok;
                 Timer -> erlang:cancel_timer(Timer)
             end,
-            %% Send RESET_STREAM frame
             FinalSize = StreamState#stream_state.send_offset,
             ResetFrame = {reset_stream, StreamId, ErrorCode, FinalSize},
             NewState = send_frame(ResetFrame, State),
+            UpdatedStream = StreamState#stream_state{
+                state = reset,
+                deadline_timer = undefined
+            },
             {ok, NewState#state{
-                streams = maps:remove(StreamId, Streams)
+                streams = maps:put(StreamId, UpdatedStream, Streams)
             }};
         error ->
             {error, unknown_stream}
