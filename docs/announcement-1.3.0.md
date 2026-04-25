@@ -77,18 +77,7 @@ circuit for a low-latency RPC channel, and a circuit for a streaming
 subscription, without any of them blocking the others or interfering
 with the standard `gen_server:call` traffic.
 
-```text
-            +----------------------------+
-node1@host1 |  one QUIC connection       | node2@host2
-   ●────────┤  (TLS 1.3, encrypted)      ├────────●
-            |                            |
-            |  ── dist control stream ── |   gen_server, monitors,
-            |                            |   global, ...
-            |  ── circuit #1 ─────────── |   bulk transfer
-            |  ── circuit #2 ─────────── |   RPC channel
-            |  ── circuit #3 ─────────── |   subscription stream
-            +----------------------------+
-```
+![QUIC distribution: one connection between two Erlang nodes carrying the dist control stream alongside three independent user circuits](images/quic_dist_circuits.svg)
 
 Circuits are a `quic_dist:open_user_stream/2` call away; each one is a
 plain Erlang stream reference that the owner sends and receives on, and
