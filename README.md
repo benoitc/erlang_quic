@@ -264,6 +264,10 @@ Generate API documentation with:
 rebar3 ex_doc
 ```
 
+## Sponsors
+
+<a href="https://enki-multimedia.eu"><img src="docs/images/enki-multimedia.svg" alt="Enki Multimedia" height="50" /></a>
+
 ## License
 
 Apache License 2.0
