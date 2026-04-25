@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-04-25
+
+QUIC and HTTP/3 protocol-conformance hardening: closes the silent-drop
+of CONNECTION_CLOSE at handshake-time violations, replaces the
+unmaintained h3spec runner with an in-tree RFC 9114 / 9204 compliance
+suite, and fixes two externally-reported stream-API bugs.
+
+### Added
+- `close_with_error/6` emits CONNECTION_CLOSE at the right encryption level (initial / handshake / app), with fallback to the lower available level. (#111)
+- Server-side validation of peer transport parameters per RFC 9000 §18.2: server-only ids (`original_dcid`, `preferred_address`, `retry_scid`, `stateless_reset_token`) and numeric ranges (`max_udp_payload_size` ≥ 1200, `ack_delay_exponent` ≤ 20, `max_ack_delay` < 2^14). (#111)
+- Frame-pipeline guards: zero-frame packet → `PROTOCOL_VIOLATION`; unknown frame type → `FRAME_ENCODING_ERROR`. (#111)
+- HTTP/3 RFC 9114 + 9204 conformance: 30 in-tree unit tests covering control-stream rules, pseudo-headers, stream-type uniqueness, push-id bounds, CONNECT validation, QPACK static-index and capacity limits, RFC 9218 priority signal, RFC 9297 SETTINGS_H3_DATAGRAM. (#112)
+- `docs/h3_compliance.md`: RFC 9114 / 9204 / 9218 / 9297 matrix mapping every MUST and SHOULD to its test. (#112)
+
+### Fixed
+- Reject request streams carrying `:status` pseudo-header (RFC 9114 §4.3.1). (#112)
+- `quic_qpack:set_dynamic_capacity/2` clamps to `max_allowed_capacity` per RFC 9204 §4.3. (#112)
+- `quic:reset_stream/3` keeps the stream entry alive so subsequent `quic:stop_sending/3` emits STOP_SENDING instead of returning `{error, unknown_stream}`. (#113, #115)
+- `quic:close/2` with an integer reason propagates that integer as the application error code; previously every input fell through to `?QUIC_APPLICATION_ERROR` (0x0c). (#114, #116)
+- NEW_TOKEN received by a server and HANDSHAKE_DONE at the wrong level now route through `close_with_error/6` so the CLOSE frame reaches the peer when app keys are absent. (#111)
+
+### Removed
+- `quic_h3_h3spec_SUITE` and `docker/h3spec/`. The corpus is ported into `quic_h3_compliance_tests` as deterministic state-machine tests. (#112)
+
 ## [1.2.0] - 2026-04-21
 
 Post-1.1.0 work split across three tracks: a client-side socket-backend
