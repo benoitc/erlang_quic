@@ -11,6 +11,8 @@ Two things make it interesting:
 
 • Erlang distribution over QUIC: a -proto_dist quic mode that replaces the standard TCP dist. Encrypted by default, no head-of-line blocking between unrelated streams, connection migration across IP changes, and per-node-pair circuits for bulk transfer or RPC alongside the dist control plane.
 
+The ecosystem builds on it: erlang-webtransport gives you WebTransport-over-HTTP/3 sessions, and hackney now speaks HTTP/3 through the same stack with no API change.
+
 Full write-up, architecture, and code samples in the article below.
 
 #Erlang #QUIC #HTTP3 #BEAM #OTP

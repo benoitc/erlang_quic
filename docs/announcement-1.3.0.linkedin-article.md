@@ -94,6 +94,26 @@ erl -proto_dist quic -epmd_module quic_epmd -start_epmd false \
     -quic_dist_key  /etc/quic/key.pem
 ```
 
+## Companion libraries
+
+Two existing Erlang libraries already build on erlang_quic and ship the
+parts of the ecosystem that sit above HTTP/3.
+
+**erlang-webtransport** (github.com/benoitc/erlang-webtransport)
+implements WebTransport over HTTP/3. It consumes the extended CONNECT
+primitive, the bidirectional and unidirectional stream claim hook, and
+the HTTP/3 datagram dispatch from erlang_quic, and exposes a session
+API that mirrors the W3C WebTransport interface so the same code can
+run server-side in Erlang and client-side in a browser.
+
+**hackney** (github.com/benoitc/hackney), the long-running HTTP client
+for Erlang, now speaks HTTP/3 through erlang_quic. The standard
+hackney:request/5 API is unchanged: passing {transport, http3} (or
+letting Alt-Svc upgrade the connection) routes the request through
+quic_h3 instead of the TCP / TLS pool. Connection reuse, pool sizing,
+redirects, and the body-streaming API behave the same as on HTTP/1.1
+and HTTP/2.
+
 ## About 1.3.0
 
 This release closes the remaining RFC 9114 / 9204 conformance gap, and
