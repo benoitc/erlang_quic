@@ -206,10 +206,20 @@ validate_connect_opts(undefined, _Opts) ->
 close(Conn) when is_pid(Conn) ->
     close(Conn, normal).
 
-%% @doc Close a QUIC connection with specified reason.
+%% @doc Close a QUIC connection with the given reason. An integer is
+%% treated as an application error code (RFC 9000 §19.19) and sent
+%% verbatim in the CONNECTION_CLOSE frame; any other term keeps its
+%% historical pass-through behaviour.
 -spec close(Conn, Reason) -> ok when
     Conn :: pid(),
-    Reason :: term().
+    Reason :: non_neg_integer() | term().
+close(Conn, ErrorCode) when
+    is_pid(Conn),
+    is_integer(ErrorCode),
+    ErrorCode >= 0,
+    ErrorCode < (1 bsl 62)
+->
+    quic_connection:close(Conn, {app_error, ErrorCode, <<>>});
 close(Conn, Reason) when is_pid(Conn) ->
     quic_connection:close(Conn, Reason).
 
