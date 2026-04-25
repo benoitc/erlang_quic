@@ -1,58 +1,66 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 360" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="14">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
   <style>
-    .node-box { fill: #1f2937; stroke: #111827; stroke-width: 2; }
-    .node-text { fill: #f9fafb; font-weight: 600; font-size: 14px; }
-    .conn-box { fill: #f3f4f6; stroke: #6b7280; stroke-width: 1.5; stroke-dasharray: none; }
-    .conn-label { fill: #374151; font-size: 12px; }
-    .stream-line { stroke: #2563eb; stroke-width: 2.5; }
-    .circuit-line { stroke: #059669; stroke-width: 2.5; }
-    .stream-label { fill: #1f2937; font-size: 13px; }
-    .stream-tag { fill: #6b7280; font-size: 11px; }
-    .arrow { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .node-box     { fill: #1f2937; stroke: #111827; stroke-width: 3; }
+    .node-name    { fill: #f9fafb; font-weight: 700; font-size: 28px; }
+    .node-host    { fill: #d1d5db; font-weight: 400; font-size: 18px; }
+
+    .conn-box     { fill: #f3f4f6; stroke: #9ca3af; stroke-width: 2; }
+    .conn-title   { fill: #1f2937; font-weight: 700; font-size: 22px; }
+
+    .stream-line  { stroke: #2563eb; stroke-width: 4; }
+    .circuit-line { stroke: #059669; stroke-width: 4; }
+
+    .stream-label { fill: #111827; font-weight: 600; font-size: 22px; }
+    .stream-tag   { fill: #4b5563; font-weight: 400; font-size: 18px; }
+
+    .caption      { fill: #374151; font-size: 16px; font-style: italic; }
   </style>
 
   <!-- Nodes -->
-  <rect class="node-box" x="20" y="120" width="120" height="120" rx="10" ry="10"/>
-  <text class="node-text" x="80" y="175" text-anchor="middle">node1</text>
-  <text class="node-text" x="80" y="195" text-anchor="middle" font-weight="400" font-size="12">@host1</text>
+  <rect class="node-box" x="30" y="240" width="200" height="200" rx="14"/>
+  <text class="node-name" x="130" y="335" text-anchor="middle">node1</text>
+  <text class="node-host" x="130" y="365" text-anchor="middle">@host1</text>
 
-  <rect class="node-box" x="680" y="120" width="120" height="120" rx="10" ry="10"/>
-  <text class="node-text" x="740" y="175" text-anchor="middle">node2</text>
-  <text class="node-text" x="740" y="195" text-anchor="middle" font-weight="400" font-size="12">@host2</text>
+  <rect class="node-box" x="970" y="240" width="200" height="200" rx="14"/>
+  <text class="node-name" x="1070" y="335" text-anchor="middle">node2</text>
+  <text class="node-host" x="1070" y="365" text-anchor="middle">@host2</text>
 
   <!-- QUIC connection envelope -->
-  <rect class="conn-box" x="160" y="60" width="500" height="240" rx="14" ry="14"/>
-  <text class="conn-label" x="410" y="84" text-anchor="middle" font-weight="600">one QUIC connection &#8226; TLS 1.3 &#8226; encrypted</text>
+  <rect class="conn-box" x="240" y="80" width="720" height="600" rx="20"/>
+  <text class="conn-title" x="600" y="120" text-anchor="middle">one QUIC connection &#8226; TLS 1.3 &#8226; encrypted</text>
 
-  <!-- Streams -->
-  <line class="stream-line" x1="170" y1="120" x2="650" y2="120"/>
-  <text class="stream-label" x="410" y="115" text-anchor="middle">dist control stream</text>
-  <text class="stream-tag" x="410" y="135" text-anchor="middle">gen_server, monitors, global, &#8230;</text>
+  <!-- dist control stream -->
+  <line class="stream-line" x1="260" y1="200" x2="940" y2="200"/>
+  <text class="stream-label" x="600" y="190" text-anchor="middle">dist control stream</text>
+  <text class="stream-tag"   x="600" y="222" text-anchor="middle">gen_server, monitors, global, &#8230;</text>
 
-  <line class="circuit-line" x1="170" y1="175" x2="650" y2="175"/>
-  <text class="stream-label" x="410" y="170" text-anchor="middle">circuit #1</text>
-  <text class="stream-tag" x="410" y="190" text-anchor="middle">bulk transfer</text>
+  <!-- circuit #1 -->
+  <line class="circuit-line" x1="260" y1="320" x2="940" y2="320"/>
+  <text class="stream-label" x="600" y="310" text-anchor="middle">circuit #1</text>
+  <text class="stream-tag"   x="600" y="342" text-anchor="middle">bulk transfer</text>
 
-  <line class="circuit-line" x1="170" y1="225" x2="650" y2="225"/>
-  <text class="stream-label" x="410" y="220" text-anchor="middle">circuit #2</text>
-  <text class="stream-tag" x="410" y="240" text-anchor="middle">low-latency RPC</text>
+  <!-- circuit #2 -->
+  <line class="circuit-line" x1="260" y1="440" x2="940" y2="440"/>
+  <text class="stream-label" x="600" y="430" text-anchor="middle">circuit #2</text>
+  <text class="stream-tag"   x="600" y="462" text-anchor="middle">low-latency RPC</text>
 
-  <line class="circuit-line" x1="170" y1="275" x2="650" y2="275"/>
-  <text class="stream-label" x="410" y="270" text-anchor="middle">circuit #3</text>
-  <text class="stream-tag" x="410" y="290" text-anchor="middle">streaming subscription</text>
+  <!-- circuit #3 -->
+  <line class="circuit-line" x1="260" y1="560" x2="940" y2="560"/>
+  <text class="stream-label" x="600" y="550" text-anchor="middle">circuit #3</text>
+  <text class="stream-tag"   x="600" y="582" text-anchor="middle">streaming subscription</text>
 
   <!-- Connectors from nodes to streams -->
-  <path class="arrow" stroke="#2563eb" stroke-width="2" d="M140 120 H170"/>
-  <path class="arrow" stroke="#2563eb" stroke-width="2" d="M650 120 H680"/>
-  <path class="arrow" stroke="#059669" stroke-width="2" d="M140 175 H170"/>
-  <path class="arrow" stroke="#059669" stroke-width="2" d="M650 175 H680"/>
-  <path class="arrow" stroke="#059669" stroke-width="2" d="M140 225 H170"/>
-  <path class="arrow" stroke="#059669" stroke-width="2" d="M650 225 H680"/>
-  <path class="arrow" stroke="#059669" stroke-width="2" d="M140 275 H170"/>
-  <path class="arrow" stroke="#059669" stroke-width="2" d="M650 275 H680"/>
+  <line stroke="#2563eb" stroke-width="3" x1="230" y1="200" x2="260" y2="200"/>
+  <line stroke="#2563eb" stroke-width="3" x1="940" y1="200" x2="970" y2="200"/>
+  <line stroke="#059669" stroke-width="3" x1="230" y1="320" x2="260" y2="320"/>
+  <line stroke="#059669" stroke-width="3" x1="940" y1="320" x2="970" y2="320"/>
+  <line stroke="#059669" stroke-width="3" x1="230" y1="440" x2="260" y2="440"/>
+  <line stroke="#059669" stroke-width="3" x1="940" y1="440" x2="970" y2="440"/>
+  <line stroke="#059669" stroke-width="3" x1="230" y1="560" x2="260" y2="560"/>
+  <line stroke="#059669" stroke-width="3" x1="940" y1="560" x2="970" y2="560"/>
 
   <!-- Caption -->
-  <text x="410" y="335" text-anchor="middle" fill="#374151" font-size="12" font-style="italic">
+  <text class="caption" x="600" y="725" text-anchor="middle">
     Multiple streams over a single QUIC connection. Independent flow control, no head-of-line blocking between them.
   </text>
 </svg>
