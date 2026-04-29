@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-04-30
+
+### Added
+- `socket_backend => adapter` lets callers plug their own datagram transport (for example a MASQUE CONNECT-UDP session) under a QUIC client. The adapter map carries `send_fun` (and optional `close_fun`, `socket_ref`); batching, GSO and GRO are forced off, and connection migration is rejected on this path. (#121)
+
 ## [1.3.0] - 2026-04-25
 
 QUIC and HTTP/3 protocol-conformance hardening: closes the silent-drop
