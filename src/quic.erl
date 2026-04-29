@@ -157,6 +157,13 @@ get_fd(Socket) ->
 %% <ul>
 %%   <li>`socket' - Use an existing UDP socket (gen_udp:socket())</li>
 %%   <li>`extra_socket_opts' - Options for socket creation (e.g., [{ip, Addr}])</li>
+%%   <li>`socket_backend' - `gen_udp' (default), `socket' (OTP NIF) or
+%%       `adapter' (caller-supplied datagram callbacks)</li>
+%%   <li>`socket_adapter' - Required when `socket_backend = adapter'.
+%%       Map with `send_fun => fun((IP, Port, Packet) -> ok | {error,_})'
+%%       and optional `close_fun', `local'. Inbound packets must be
+%%       delivered to the owning connection as `{udp, Socket, IP, Port,
+%%       Data}' messages.</li>
 %%   <li>`verify' - Verify server certificate (default: false)</li>
 %%   <li>`alpn' - ALPN protocols (default: [&lt;&lt;"h3"&gt;&gt;])</li>
 %%   <li>`server_name' - Server Name Indication (default: Host)</li>
@@ -191,14 +198,31 @@ connect(_Host, _Port, _Opts, _Owner) ->
     {error, badarg}.
 
 %% A pre-opened `socket' is always a gen_udp handle; requesting the
-%% OTP socket NIF backend at the same time cannot be honoured.
+%% OTP socket NIF backend or the callback adapter at the same time
+%% cannot be honoured.
 validate_connect_opts(Socket, Opts) when Socket =/= undefined ->
     case maps:get(socket_backend, Opts, gen_udp) of
-        socket -> {error, {incompatible_options, [socket, {socket_backend, socket}]}};
-        _ -> ok
+        socket  -> {error, {incompatible_options, [socket, {socket_backend, socket}]}};
+        adapter -> {error, {incompatible_options, [socket, {socket_backend, adapter}]}};
+        _       -> ok
     end;
-validate_connect_opts(undefined, _Opts) ->
-    ok.
+validate_connect_opts(undefined, Opts) ->
+    case maps:get(socket_backend, Opts, gen_udp) of
+        adapter ->
+            validate_adapter_opts(maps:get(socket_adapter, Opts, undefined));
+        _ ->
+            ok
+    end.
+
+validate_adapter_opts(undefined) ->
+    {error, missing_socket_adapter};
+validate_adapter_opts(A) when is_map(A) ->
+    case maps:get(send_fun, A, undefined) of
+        F when is_function(F, 3) -> ok;
+        _ -> {error, badarg_socket_adapter}
+    end;
+validate_adapter_opts(_) ->
+    {error, badarg_socket_adapter}.
 
 %% @doc Close a QUIC connection with normal reason.
 -spec close(Conn) -> ok when
