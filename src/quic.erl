@@ -202,9 +202,9 @@ connect(_Host, _Port, _Opts, _Owner) ->
 %% cannot be honoured.
 validate_connect_opts(Socket, Opts) when Socket =/= undefined ->
     case maps:get(socket_backend, Opts, gen_udp) of
-        socket  -> {error, {incompatible_options, [socket, {socket_backend, socket}]}};
+        socket -> {error, {incompatible_options, [socket, {socket_backend, socket}]}};
         adapter -> {error, {incompatible_options, [socket, {socket_backend, adapter}]}};
-        _       -> ok
+        _ -> ok
     end;
 validate_connect_opts(undefined, Opts) ->
     case maps:get(socket_backend, Opts, gen_udp) of

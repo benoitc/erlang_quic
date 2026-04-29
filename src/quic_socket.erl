@@ -82,9 +82,9 @@
     %% Inbound packets must be delivered as
     %%   `{udp, Socket, IP, Port, Data}' to the connection owner pid,
     %% same shape as the gen_udp backend.
-    adapter_send_fun :: undefined |
-                        fun((inet:ip_address(), inet:port_number(), iodata()) ->
-                            ok | {error, term()}),
+    adapter_send_fun ::
+        undefined
+        | fun((inet:ip_address(), inet:port_number(), iodata()) -> ok | {error, term()}),
     adapter_close_fun :: undefined | fun(() -> ok),
     %% Adapter-only: cached local address (sockname has no real socket).
     adapter_local :: undefined | {inet:ip_address(), inet:port_number()},
@@ -376,15 +376,15 @@ info(#socket_state{
 -spec open_adapter(map()) -> {ok, socket_state()} | {error, term()}.
 open_adapter(#{send_fun := SendFun} = Opts) when is_function(SendFun, 3) ->
     State = #socket_state{
-        socket             = maps:get(socket_ref, Opts, make_ref()),
-        backend            = adapter,
-        owns_socket        = true,
-        gso_supported      = false,
-        gro_enabled        = false,
-        batching_enabled   = false,
-        adapter_send_fun   = SendFun,
-        adapter_close_fun  = maps:get(close_fun, Opts, undefined),
-        adapter_local      = maps:get(local, Opts, undefined)
+        socket = maps:get(socket_ref, Opts, make_ref()),
+        backend = adapter,
+        owns_socket = true,
+        gso_supported = false,
+        gro_enabled = false,
+        batching_enabled = false,
+        adapter_send_fun = SendFun,
+        adapter_close_fun = maps:get(close_fun, Opts, undefined),
+        adapter_local = maps:get(local, Opts, undefined)
     },
     {ok, State};
 open_adapter(_) ->
@@ -446,8 +446,11 @@ new_sender(Socket, Opts) ->
 -spec close(socket_state()) -> ok.
 close(#socket_state{backend = adapter, adapter_close_fun = Fun}) ->
     case Fun of
-        undefined -> ok;
-        F when is_function(F, 0) -> _ = catch F(), ok
+        undefined ->
+            ok;
+        F when is_function(F, 0) ->
+            _ = catch F(),
+            ok
     end;
 close(#socket_state{owns_socket = false}) ->
     %% Don't close wrapped sockets - caller owns them
@@ -1046,7 +1049,9 @@ send_segments(Socket, Dest, [Packet | Rest], State) ->
         {error, Reason} -> {error, Reason, State}
     end.
 
-do_send_immediate(#socket_state{backend = adapter, adapter_send_fun = Fun} = State, IP, Port, Packet) ->
+do_send_immediate(
+    #socket_state{backend = adapter, adapter_send_fun = Fun} = State, IP, Port, Packet
+) ->
     Bin = normalize_packet(Packet),
     case Fun(IP, Port, Bin) of
         ok -> {ok, State};

@@ -67,12 +67,15 @@ connect_via_adapter(Config) ->
             Bridge ! {send, IP, P, Pkt},
             ok
         end,
-    CloseFun = fun() -> Bridge ! stop, ok end,
+    CloseFun = fun() ->
+        Bridge ! stop,
+        ok
+    end,
 
     Adapter = #{
-        send_fun   => SendFun,
-        close_fun  => CloseFun,
-        local      => {{127, 0, 0, 1}, 0},
+        send_fun => SendFun,
+        close_fun => CloseFun,
+        local => {{127, 0, 0, 1}, 0},
         socket_ref => SocketRef
     },
 
