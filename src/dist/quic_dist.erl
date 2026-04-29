@@ -102,6 +102,13 @@
     do_setup/6
 ]).
 
+%% Per-node connect-time option overrides
+-export([
+    set_connect_options/2,
+    get_connect_options/1,
+    clear_connect_options/1
+]).
+
 %%====================================================================
 %% Distribution Module Callbacks
 %%====================================================================
@@ -323,12 +330,26 @@ ensure_quic_minimal() ->
 %% Create the discovery ETS table used by quic_discovery_static.
 %% This is normally created by quic_sup:init/1.
 ensure_discovery_table() ->
-    case ets:info(quic_discovery_static_nodes) of
+    ensure_named_set(quic_discovery_static_nodes).
+
+%% @private
+%% Idempotently create a named, public ETS set with read_concurrency.
+%% Returns ok regardless of whether the table already existed or was
+%% created by a racing process.
+ensure_named_set(Name) ->
+    case ets:info(Name) of
         undefined ->
-            ets:new(
-                quic_discovery_static_nodes,
-                [named_table, public, set, {read_concurrency, true}]
-            );
+            try
+                _ = ets:new(
+                    Name,
+                    [named_table, public, set, {read_concurrency, true}]
+                ),
+                ok
+            catch
+                error:badarg ->
+                    %% Lost the create race; fine.
+                    ok
+            end;
         _ ->
             ok
     end.
@@ -760,6 +781,66 @@ ip_to_host(IP) when is_binary(IP) ->
 ip_to_host(IP) when is_list(IP) ->
     IP.
 
+%% @doc Register per-node connect-time option overrides for the next
+%% `setup/5' attempt against `Node'. The map is merged on top of the
+%% defaults that `connect_to_node/7' builds, so callers can override
+%% any key, including `socket_backend' and `socket_adapter' to route
+%% the underlying UDP packets through a custom transport (for example
+%% a MASQUE CONNECT-UDP tunnel).
+%%
+%% The entry is consumed once (the first matching `connect_to_node'
+%% call clears it). Use `clear_connect_options/1' to drop it without
+%% triggering a connect.
+-spec set_connect_options(node(), map()) -> ok.
+set_connect_options(Node, Opts) when is_atom(Node), is_map(Opts) ->
+    ensure_connect_opts_table(),
+    true = ets:insert(quic_dist_connect_opts, {Node, Opts}),
+    ok.
+
+%% @doc Look up the pending connect-option overrides for `Node' without
+%% consuming them. Returns an empty map if none are registered.
+-spec get_connect_options(node()) -> map().
+get_connect_options(Node) when is_atom(Node) ->
+    case ets:info(quic_dist_connect_opts) of
+        undefined ->
+            #{};
+        _ ->
+            case ets:lookup(quic_dist_connect_opts, Node) of
+                [{Node, Opts}] -> Opts;
+                [] -> #{}
+            end
+    end.
+
+%% @doc Drop any pending connect-option overrides for `Node'.
+-spec clear_connect_options(node()) -> ok.
+clear_connect_options(Node) when is_atom(Node) ->
+    case ets:info(quic_dist_connect_opts) of
+        undefined ->
+            ok;
+        _ ->
+            _ = ets:delete(quic_dist_connect_opts, Node),
+            ok
+    end.
+
+%% @private
+%% Atomically read and remove the override for `Node'. Used by the
+%% setup path so a registered override applies once.
+take_connect_options(Node) ->
+    case ets:info(quic_dist_connect_opts) of
+        undefined ->
+            #{};
+        _ ->
+            case ets:take(quic_dist_connect_opts, Node) of
+                [{Node, Opts}] -> Opts;
+                [] -> #{}
+            end
+    end.
+
+%% @private
+%% Create the per-node connect-options table on first use.
+ensure_connect_opts_table() ->
+    ensure_named_set(quic_dist_connect_opts).
+
 %% @private
 %% Connect to the target node.
 connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
@@ -769,7 +850,7 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
     case load_credentials(Config) of
         {ok, Cert, Key, _CACert} ->
             CongestionThreshold = Config#quic_dist_config.congestion_threshold,
-            Opts = #{
+            BaseOpts = #{
                 cert => Cert,
                 key => Key,
                 alpn => [?QUIC_DIST_ALPN],
@@ -800,6 +881,12 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                 % TODO: Enable proper verification
                 verify => false
             },
+
+            %% Per-node overrides registered via set_connect_options/2.
+            %% Merged on top of the defaults so callers can swap the
+            %% socket backend, adjust flow control, etc.
+            Overrides = take_connect_options(Node),
+            Opts = maps:merge(BaseOpts, Overrides),
 
             %% Convert IP to host format expected by QUIC
             Host = ip_to_host(IP),
