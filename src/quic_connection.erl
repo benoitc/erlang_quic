@@ -244,7 +244,7 @@
     %% the client uses the OTP socket NIF via open_for_send/2 and a
     %% dedicated receiver process forwards {udp, ...} messages to this
     %% connection. Ignored for server connections (the listener picks).
-    client_socket_backend = gen_udp :: gen_udp | socket,
+    client_socket_backend = gen_udp :: gen_udp | socket | adapter,
     %% Pid of the client-side receiver process when
     %% client_socket_backend = socket; undefined otherwise.
     client_receiver :: pid() | undefined,
@@ -1094,6 +1094,8 @@ open_client_socket(undefined, {IP, _Port} = RemoteAddr, Opts, ExtraOpts) ->
     case maps:get(socket_backend, Opts, gen_udp) of
         socket ->
             open_client_socket_backend(RemoteAddr, Opts);
+        adapter ->
+            open_client_socket_adapter(Opts);
         _ ->
             open_client_socket_genudp(IP, Opts, ExtraOpts)
     end;
@@ -1149,6 +1151,30 @@ open_client_socket_genudp(IP, Opts, ExtraOpts) ->
 %% cmsg on uniform batches. The wrapping `#socket_state{}' is stashed
 %% in the process dictionary for `init_client_state/8' to adopt without
 %% widening the tuple shape returned by `open_client_socket/4'.
+%% Caller-supplied datagram adapter. The connection delegates outbound
+%% sends to `send_fun' inside the adapter map; inbound packets must be
+%% delivered to the connection owner as `{udp, Socket, IP, Port, Data}'
+%% by the caller's recv loop, where `Socket' is the reference returned
+%% in the socket_state. Stash the socket_state via the process dict so
+%% `init_client_state/8' adopts it without changing return shapes.
+open_client_socket_adapter(Opts) ->
+    AdapterOpts = maps:get(socket_adapter, Opts, undefined),
+    case AdapterOpts of
+        undefined ->
+            {error, missing_socket_adapter};
+        _ when is_map(AdapterOpts) ->
+            case quic_socket:open_adapter(AdapterOpts) of
+                {ok, SocketState} ->
+                    {ok, LA} = quic_socket:sockname(SocketState),
+                    put(client_socket_state, SocketState),
+                    {ok, quic_socket:get_socket(SocketState), LA, true};
+                {error, _} = Err ->
+                    Err
+            end;
+        _ ->
+            {error, badarg_socket_adapter}
+    end.
+
 open_client_socket_backend({IP, _Port}, Opts) ->
     OpenOpts = Opts#{backend => socket},
     case quic_socket:open_for_send(IP, OpenOpts) of
@@ -5428,6 +5454,10 @@ send_packet_to_addr(IP, Port, Packet, #state{socket = Socket}) ->
 %% `quic_socket:start_client_receiver/2'.
 client_rearm_active(#state{client_socket_backend = socket}, _N) ->
     ok;
+client_rearm_active(#state{client_socket_backend = adapter}, _N) ->
+    %% Adapter callers manage their own delivery; there is no UDP
+    %% socket whose active counter we could rearm.
+    ok;
 client_rearm_active(#state{socket = Socket}, N) ->
     inet:setopts(Socket, [{active, N}]).
 
@@ -5438,6 +5468,11 @@ client_rearm_active(#state{socket = Socket}, N) ->
 %% `gen_udp:socket()' — nothing else owns it.
 close_client_socket(#state{client_socket_backend = socket, client_receiver = Receiver}) ->
     quic_socket:stop_client_receiver(Receiver);
+close_client_socket(#state{client_socket_backend = adapter, socket_state = SocketState}) ->
+    case SocketState of
+        undefined -> ok;
+        _ -> quic_socket:close(SocketState)
+    end;
 close_client_socket(#state{socket = undefined}) ->
     ok;
 close_client_socket(#state{socket = Socket}) ->
@@ -5457,6 +5492,9 @@ close_raw_client_socket(Opts, Socket) ->
             catch
                 _:_ -> ok
             end;
+        adapter ->
+            %% Adapter holds its own callbacks; nothing native to close.
+            ok;
         _ ->
             try gen_udp:close(Socket) of
                 _ -> ok
@@ -7664,6 +7702,9 @@ set_idle_timer(#state{idle_timeout = Timeout, idle_timer = OldTimer} = State) ->
 %% socket handle ({'$socket', Ref}). inet:sockname/1 only accepts
 %% the gen_udp port shape, socket:sockname/1 the other. Returns
 %% undefined if neither succeeds.
+query_local_addr(Ref) when is_reference(Ref) ->
+    %% Adapter backend: no real socket, no kernel-known sockname.
+    undefined;
 query_local_addr({'$socket', _} = Socket) ->
     case socket:sockname(Socket) of
         {ok, #{addr := IP, port := Port}} -> {IP, Port};
@@ -8181,6 +8222,10 @@ rebind_socket(OldSocket) ->
 -spec rebind_client_socket(#state{}) -> {ok, #state{}} | {error, term()}.
 rebind_client_socket(#state{client_socket_backend = socket} = State) ->
     rebind_client_socket_otp(State);
+rebind_client_socket(#state{client_socket_backend = adapter}) ->
+    %% Connection migration via fresh local UDP port has no analogue
+    %% when the transport is a caller-supplied adapter.
+    {error, not_supported_on_adapter};
 rebind_client_socket(#state{socket = OldSocket, socket_state = OldSocketState} = State) ->
     %% Flush any pending batch to the old socket before rebinding so
     %% already-sequenced packets reach the server under the pre-migrate

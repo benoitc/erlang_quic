@@ -41,6 +41,7 @@
     open/2,
     open_for_send/2,
     open_server_send/2,
+    open_adapter/1,
     wrap/2,
     new_sender/2,
     close/1,
@@ -71,10 +72,22 @@
 -define(UDP_GRO, 104).
 
 -record(socket_state, {
-    %% The underlying socket
-    socket :: socket:socket() | gen_udp:socket(),
+    %% The underlying socket. For the `adapter' backend this is an
+    %% opaque reference() used only for pattern matching against the
+    %% owning connection's #state.socket field.
+    socket :: socket:socket() | gen_udp:socket() | reference(),
     %% Which backend we're using
-    backend :: socket | gen_udp,
+    backend :: socket | gen_udp | adapter,
+    %% Adapter backend: caller-supplied datagram send and close callbacks.
+    %% Inbound packets must be delivered as
+    %%   `{udp, Socket, IP, Port, Data}' to the connection owner pid,
+    %% same shape as the gen_udp backend.
+    adapter_send_fun ::
+        undefined
+        | fun((inet:ip_address(), inet:port_number(), iodata()) -> ok | {error, term()}),
+    adapter_close_fun :: undefined | fun(() -> ok),
+    %% Adapter-only: cached local address (sockname has no real socket).
+    adapter_local :: undefined | {inet:ip_address(), inet:port_number()},
     %% Whether this socket_state owns the socket (true = close on cleanup)
     %% When wrapping an existing socket, this is false to avoid closing caller's socket
     owns_socket = true :: boolean(),
@@ -336,6 +349,47 @@ info(#socket_state{
         packets_coalesced => Coalesced
     }.
 
+%% @doc Build a socket_state backed by caller-supplied callbacks instead
+%% of a real UDP socket. Useful for tunnelling QUIC packets over an
+%% alternate transport (for example a MASQUE CONNECT-UDP session).
+%%
+%% Required options:
+%% <ul>
+%%   <li>`send_fun' - `fun((IP, Port, Packet) -> ok | {error, _})'.
+%%       Called for every outbound packet. The caller is responsible
+%%       for delivering inbound packets to the connection owner as
+%%       `{udp, Socket, IP, Port, Data}' messages, where `Socket' is
+%%       the reference returned in the `socket_state'.</li>
+%% </ul>
+%% Optional options:
+%% <ul>
+%%   <li>`close_fun' - `fun(() -> ok)' invoked on socket close.</li>
+%%   <li>`local' - `{IP, Port}' returned by `sockname/1'.</li>
+%%   <li>`socket_ref' - `reference()' to use as the opaque socket
+%%       handle. Defaults to a fresh `make_ref/0'. Callers that need
+%%       to forward inbound packets as `{udp, Ref, IP, Port, Data}'
+%%       should supply their own ref so they know which value to use
+%%       before the connection starts.</li>
+%% </ul>
+%% Batching, GSO and GRO are unconditionally disabled for this backend
+%% because the underlying transport handles its own framing.
+-spec open_adapter(map()) -> {ok, socket_state()} | {error, term()}.
+open_adapter(#{send_fun := SendFun} = Opts) when is_function(SendFun, 3) ->
+    State = #socket_state{
+        socket = maps:get(socket_ref, Opts, make_ref()),
+        backend = adapter,
+        owns_socket = true,
+        gso_supported = false,
+        gro_enabled = false,
+        batching_enabled = false,
+        adapter_send_fun = SendFun,
+        adapter_close_fun = maps:get(close_fun, Opts, undefined),
+        adapter_local = maps:get(local, Opts, undefined)
+    },
+    {ok, State};
+open_adapter(_) ->
+    {error, {missing, send_fun}}.
+
 %% @doc Wrap an existing gen_udp socket with batching support.
 %% This allows adding batching to connections that already have a socket.
 %% Note: GSO/GRO are not available when wrapping existing gen_udp sockets.
@@ -390,6 +444,14 @@ new_sender(Socket, Opts) ->
 %% @doc Close the socket and flush any pending packets.
 %% Only closes the socket if owns_socket is true (i.e., socket was created by us).
 -spec close(socket_state()) -> ok.
+close(#socket_state{backend = adapter, adapter_close_fun = Fun}) ->
+    case Fun of
+        undefined ->
+            ok;
+        F when is_function(F, 0) ->
+            _ = catch F(),
+            ok
+    end;
 close(#socket_state{owns_socket = false}) ->
     %% Don't close wrapped sockets - caller owns them
     ok;
@@ -498,6 +560,14 @@ recv(#socket_state{socket = Socket, backend = gen_udp}, Timeout) ->
             {ok, {IP, Port}, [Data]}
     after Timeout ->
         {error, timeout}
+    end;
+recv(#socket_state{socket = Socket, backend = adapter}, Timeout) ->
+    %% Adapter backend: caller delivers gen_udp-shaped messages.
+    receive
+        {udp, Socket, IP, Port, Data} ->
+            {ok, {IP, Port}, [Data]}
+    after Timeout ->
+        {error, timeout}
     end.
 
 %% @doc Get the local address and port.
@@ -511,7 +581,12 @@ sockname(#socket_state{socket = Socket, backend = socket}) ->
             Error
     end;
 sockname(#socket_state{socket = Socket, backend = gen_udp}) ->
-    inet:sockname(Socket).
+    inet:sockname(Socket);
+sockname(#socket_state{backend = adapter, adapter_local = Local}) ->
+    case Local of
+        undefined -> {ok, {{0, 0, 0, 0}, 0}};
+        {_, _} -> {ok, Local}
+    end.
 
 %% @doc Set the controlling process.
 -spec controlling_process(socket_state(), pid()) -> ok | {error, term()}.
@@ -519,6 +594,9 @@ controlling_process(#socket_state{socket = Socket, backend = gen_udp}, Pid) ->
     gen_udp:controlling_process(Socket, Pid);
 controlling_process(#socket_state{backend = socket}, _Pid) ->
     %% socket module doesn't have controlling_process concept
+    ok;
+controlling_process(#socket_state{backend = adapter}, _Pid) ->
+    %% Caller manages its own delivery pid.
     ok.
 
 %% @doc Set socket options.
@@ -527,7 +605,10 @@ setopts(#socket_state{socket = Socket, backend = gen_udp}, Opts) ->
     inet:setopts(Socket, Opts);
 setopts(#socket_state{socket = Socket, backend = socket}, Opts) ->
     %% Convert gen_udp style opts to socket module
-    set_socket_opts(Socket, Opts).
+    set_socket_opts(Socket, Opts);
+setopts(#socket_state{backend = adapter}, _Opts) ->
+    %% No socket options to configure on a callback-based adapter.
+    ok.
 
 %% @doc Get the underlying file descriptor.
 -spec get_fd(socket_state()) -> {ok, integer()} | {error, term()}.
@@ -546,7 +627,9 @@ get_fd(#socket_state{socket = Socket, backend = socket}) ->
         end
     catch
         _:_ -> {error, not_supported}
-    end.
+    end;
+get_fd(#socket_state{backend = adapter}) ->
+    {error, not_supported}.
 
 %% @doc Spawn a client-side receiver process for the `socket' backend.
 %%
@@ -565,7 +648,10 @@ start_client_receiver(#socket_state{backend = socket} = SocketState, Owner) when
     Pid = spawn_link(fun() -> client_recv_loop(SocketState, Owner) end),
     {ok, Pid};
 start_client_receiver(#socket_state{backend = gen_udp}, _Owner) ->
-    {error, not_supported_on_gen_udp}.
+    {error, not_supported_on_gen_udp};
+start_client_receiver(#socket_state{backend = adapter}, _Owner) ->
+    %% Adapter callers deliver `{udp, ...}' messages themselves.
+    {error, not_supported_on_adapter}.
 
 %% @doc Stop a client receiver process previously returned by
 %% `start_client_receiver/2'. Safe to call with `undefined'.
@@ -963,6 +1049,14 @@ send_segments(Socket, Dest, [Packet | Rest], State) ->
         {error, Reason} -> {error, Reason, State}
     end.
 
+do_send_immediate(
+    #socket_state{backend = adapter, adapter_send_fun = Fun} = State, IP, Port, Packet
+) ->
+    Bin = normalize_packet(Packet),
+    case Fun(IP, Port, Bin) of
+        ok -> {ok, State};
+        {error, _} = Error -> Error
+    end;
 do_send_immediate(#socket_state{socket = Socket, backend = socket} = State, IP, Port, Packet) ->
     %% Use sendmsg with iov - no flattening needed
     Msg = #{
