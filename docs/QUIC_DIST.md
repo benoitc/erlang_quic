@@ -76,6 +76,40 @@ nodes().
 %% => ['node2@host2']
 ```
 
+### Debugging a Running Node
+
+`erl_call` only speaks `inet_tcp_dist`, so it cannot attach to a node
+running with `-proto_dist quic`. Two replacements work over QUIC:
+
+**Interactive remote shell** — same as `erl_call -i`:
+
+```bash
+erl -name debug@host \
+    -proto_dist quic -epmd_module quic_epmd -start_epmd false \
+    -quic_dist_cert /path/to/cert.pem \
+    -quic_dist_key  /path/to/key.pem \
+    -setcookie <cookie> \
+    -config sys.config \
+    -pa _build/default/lib/quic/ebin \
+    -remsh node1@host1
+```
+
+**One-shot RPC** — same role as `erl_call -a`. The hex package ships
+`priv/bin/quic_call.sh`:
+
+```bash
+SCRIPT="$(erl -noshell -eval \
+    'io:format("~s",[filename:join([code:priv_dir(quic),"bin","quic_call.sh"])]),halt().')"
+
+"$SCRIPT" -c <cookie> -C sys.config \
+    node1@host1 erlang memory '[]'
+```
+
+The script auto-parses `cert_file` and `key_file` from the `sys.config`
+you pass via `-C`; pass `--cert` / `--key` directly to override. Output
+is the Erlang term as printed by `io:format("~p~n", [Result])`. See
+`quic_call.sh -h` for the full flag list.
+
 ## Architecture
 
 ### Module Overview
