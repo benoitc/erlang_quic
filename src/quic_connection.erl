@@ -79,6 +79,7 @@
     set_owner_sync/2,
     setopts/2,
     get_send_queue_info/1,
+    get_path_stats/1,
     %% Connection statistics (for liveness detection)
     get_stats/1,
     %% Peer transport parameters
@@ -733,6 +734,11 @@ setopts(Conn, Opts) ->
 -spec get_send_queue_info(pid()) -> {ok, quic:send_queue_info()} | {error, term()}.
 get_send_queue_info(Conn) ->
     gen_statem:call(Conn, get_send_queue_info).
+
+%% @doc Path metrics snapshot. See `quic:get_path_stats/1'.
+-spec get_path_stats(pid()) -> {ok, quic:path_stats()} | {error, term()}.
+get_path_stats(Conn) ->
+    gen_statem:call(Conn, get_path_stats).
 
 %% @doc Get connection statistics for liveness detection.
 %% Returns packet counts that can be used by net_kernel for tick checking.
@@ -1818,6 +1824,40 @@ connected(
     {keep_state, State, [{reply, From, {ok, Info}}]};
 connected(
     {call, From},
+    get_path_stats,
+    #state{
+        send_queue_bytes = Bytes,
+        cc_state = CCState,
+        loss_state = LossState,
+        congestion_threshold = Threshold
+    } = State
+) ->
+    Cwnd = quic_cc:cwnd(CCState),
+    InFlight = quic_cc:bytes_in_flight(CCState),
+    InRecovery = quic_cc:in_recovery(CCState),
+    Congested = (Bytes > Cwnd * Threshold) orelse (InRecovery andalso Bytes > Cwnd),
+    %% quic_loss tracks RTT in milliseconds; the public contract is
+    %% microseconds. Convert at read time so the underlying state
+    %% stays untouched. min_rtt is `infinity' before the first sample
+    %% lands; surface it as 0 so callers can rely on non_neg_integer.
+    MinRttMs =
+        case quic_loss:min_rtt(LossState) of
+            infinity -> 0;
+            M -> M
+        end,
+    Stats = #{
+        srtt => quic_loss:smoothed_rtt(LossState) * 1000,
+        latest_rtt => quic_loss:latest_rtt(LossState) * 1000,
+        min_rtt => MinRttMs * 1000,
+        rtt_var => quic_loss:rtt_var(LossState) * 1000,
+        cwnd => Cwnd,
+        bytes_in_flight => InFlight,
+        in_recovery => InRecovery,
+        congested => Congested
+    },
+    {keep_state, State, [{reply, From, {ok, Stats}}]};
+connected(
+    {call, From},
     get_stats,
     #state{
         packets_received = PacketsRecv,
@@ -2099,6 +2139,8 @@ closed(_EventType, _EventContent, State) ->
 
 handle_common_event({call, From}, get_ref, _StateName, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
+handle_common_event({call, From}, get_path_stats, _StateName, State) ->
+    {keep_state, State, [{reply, From, {error, not_connected}}]};
 handle_common_event(cast, handle_timeout, _StateName, State) ->
     %% Handle loss detection / idle timeout
     NewState = check_timeouts(State),
