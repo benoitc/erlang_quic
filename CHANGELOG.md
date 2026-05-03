@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-05-03
+
+### Added
+- `quic:get_path_stats/1` returns a snapshot of the connection's path metrics (srtt / latest_rtt / min_rtt / rtt_var in microseconds, plus cwnd, bytes_in_flight, in_recovery, congested) for downstream routing layers. Backward-compatible; off the packet-processing path. (#127)
+- `quic_dist` `auth_callback` option runs a custom `{Mod,Fun}` (or `fun/3`) on both sides between the QUIC handshake and the dist_util handshake. `{error, _}` closes the connection without ever starting the dist controller. New `quic_dist_auth` behaviour. (#126)
+- `quic_dist` `register_with_epmd` option (default `false`) registers the listening port via the configured `epmd_module` so external tooling (e.g. `epmd -names`) can resolve the node. (#126)
+
 ## [1.3.2] - 2026-05-03
 
 ### Added
