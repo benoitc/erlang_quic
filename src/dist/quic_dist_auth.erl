@@ -26,7 +26,7 @@
 
 -module(quic_dist_auth).
 
-%% @doc Implementations validate the freshly-established QUIC connection
+%% Implementations validate the freshly-established QUIC connection
 %% (e.g. inspect peer certificates, run a challenge/response on a user
 %% stream) and return `{ok, Info}' on success or `{error, Reason}' to
 %% refuse it. `Timeout' is the deadline configured via
