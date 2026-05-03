@@ -107,8 +107,11 @@ SCRIPT="$(erl -noshell -eval \
 
 The script auto-parses `cert_file` and `key_file` from the `sys.config`
 you pass via `-C`; pass `--cert` / `--key` directly to override. Output
-is the Erlang term as printed by `io:format("~p~n", [Result])`. See
-`quic_call.sh -h` for the full flag list.
+is the Erlang term as printed by `io:format("~p~n", [Result])`. Before
+halting, the probe asks the target to disconnect it (an RPC of
+`erlang:disconnect_node/1` against the probe's own name) so the target
+reaps the hidden-node entry synchronously rather than waiting on the
+QUIC idle timeout. See `quic_call.sh -h` for the full flag list.
 
 ## Architecture
 

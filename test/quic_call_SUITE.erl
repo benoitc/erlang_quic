@@ -29,7 +29,8 @@
     rpc_with_args/1,
     rpc_badrpc/1,
     rpc_bad_cookie/1,
-    rpc_hidden/1
+    rpc_hidden/1,
+    target_drops_probe/1
 ]).
 
 -define(TARGET_PORT, 14530).
@@ -48,6 +49,7 @@ groups() ->
             rpc_with_args,
             rpc_badrpc,
             rpc_hidden,
+            target_drops_probe,
             rpc_bad_cookie
         ]}
     ].
@@ -185,9 +187,56 @@ rpc_hidden(Config) ->
     ?assertNotEqual(nomatch, string:find(Hidden, "quic_call_")),
     ok.
 
+target_drops_probe(Config) ->
+    %% After the probe halts, the target must reap the hidden-node entry
+    %% promptly. Without erlang:disconnect_node/1 in the script, the entry
+    %% lingers for ~5 minutes (QUIC_DIST_IDLE_TIMEOUT).
+    {_, _, 0} = run_call(Config, "erlang node '[]'"),
+    ?assertEqual(ok, wait_until_no_probe_hidden(Config, 5000)).
+
 %%====================================================================
 %% Helpers
 %%====================================================================
+
+wait_until_no_probe_hidden(Config, MaxMs) ->
+    wait_until_no_probe_hidden(Config, MaxMs, 0).
+
+wait_until_no_probe_hidden(_Config, MaxMs, Elapsed) when Elapsed >= MaxMs ->
+    {error, timeout};
+wait_until_no_probe_hidden(Config, MaxMs, Elapsed) ->
+    case run_call(Config, "erlang nodes '[hidden]'") of
+        {Stdout, _, 0} ->
+            %% The polling probe itself appears in its own snapshot; that
+            %% probe will then disconnect cleanly on its way out. We're
+            %% checking that no *prior* probe is still listed. The output
+            %% contains the polling probe's name; everything else means
+            %% an earlier connection was not reaped.
+            Trimmed = string:trim(Stdout),
+            Names = parse_node_names(Trimmed),
+            Self =
+                case Names of
+                    [Only] -> Only;
+                    _ -> none
+                end,
+            Lingering = [N || N <- Names, N =/= Self],
+            case Lingering of
+                [] ->
+                    ok;
+                _ ->
+                    timer:sleep(200),
+                    wait_until_no_probe_hidden(Config, MaxMs, Elapsed + 200)
+            end;
+        _ ->
+            timer:sleep(200),
+            wait_until_no_probe_hidden(Config, MaxMs, Elapsed + 200)
+    end.
+
+parse_node_names(Str) ->
+    %% Strip leading "[" and trailing "]", split on commas/whitespace,
+    %% drop empties.
+    Inner = string:trim(Str, both, "[]\n\r "),
+    Parts = string:split(Inner, ",", all),
+    [string:trim(P) || P <- Parts, string:trim(P) =/= ""].
 
 locate_script() ->
     case code:priv_dir(quic) of

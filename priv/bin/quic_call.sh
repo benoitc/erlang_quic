@@ -159,7 +159,12 @@ case net_kernel:connect_node('${NODE}') of
         io:format(standard_error, "connect failed: ~p~n", [ConnErr]),
         erlang:halt(4)
 end,
-case rpc:call('${NODE}', '${MOD}', '${FUN}', ${ARGS}, ${TIMEOUT}) of
+RpcResult = rpc:call('${NODE}', '${MOD}', '${FUN}', ${ARGS}, ${TIMEOUT}),
+%% Local disconnect_node + halt races the CONNECTION_CLOSE; have the
+%% target drop us instead so the hidden-node entry is reaped now.
+Self = node(),
+_ = (catch rpc:call('${NODE}', erlang, disconnect_node, [Self], 2000)),
+case RpcResult of
     {badrpc, BadRpc} ->
         io:format(standard_error, "badrpc: ~p~n", [BadRpc]),
         erlang:halt(5);
