@@ -26,6 +26,7 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 - QLOG tracing support for debug visibility
 - UDP packet batching (GSO/GRO)
 - Client certificate verification
+- Path-metrics snapshot (`quic:get_path_stats/1`) for routing layers
 
 ### HTTP/3 (`quic_h3`)
 - Full HTTP/3 client and server (RFC 9114) with QPACK header compression (RFC 9204)
@@ -48,6 +49,7 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 - User-accessible streams API on top of dist connections
 - Stream prioritization (control vs data) and connection-level backpressure
 - `priv/bin/quic_call.sh`: `erl_call`-style one-shot RPC against a `-proto_dist quic` node
+- Optional `auth_callback` for an app-level handshake between TLS and `dist_util`, plus `register_with_epmd` for stock-EPMD discoverability
 - See [docs/QUIC_DIST.md](docs/QUIC_DIST.md) for setup
 
 ## Requirements
