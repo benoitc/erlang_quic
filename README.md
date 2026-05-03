@@ -47,6 +47,7 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 - Session-ticket cache for 0-RTT reconnection
 - User-accessible streams API on top of dist connections
 - Stream prioritization (control vs data) and connection-level backpressure
+- `priv/bin/quic_call.sh`: `erl_call`-style one-shot RPC against a `-proto_dist quic` node
 - See [docs/QUIC_DIST.md](docs/QUIC_DIST.md) for setup
 
 ## Requirements

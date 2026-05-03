@@ -4,8 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-05-03
+
 ### Added
-- `priv/bin/quic_call.sh`, an `erl_call`-style one-shot RPC helper for `quic_dist` clusters. Boots a hidden probe node with `-proto_dist quic`, runs `rpc:call/5` against the target, prints the result, and exits. Reuses the cluster's `sys.config` (`-C`) for credentials and discovery; cert/key can also be passed via `--cert`/`--key`.
+- `priv/bin/quic_call.sh`, an `erl_call`-style one-shot RPC helper for `quic_dist` clusters. Boots a hidden probe node with `-proto_dist quic`, runs `rpc:call/5` against the target, asks the target to disconnect so the hidden-node entry is reaped immediately, and halts. Reuses the cluster's `sys.config` (`-C`) for credentials and discovery; cert/key can also be passed via `--cert`/`--key`. (#123, #124)
 
 ## [1.3.1] - 2026-04-30
 
