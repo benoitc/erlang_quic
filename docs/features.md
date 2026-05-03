@@ -262,6 +262,7 @@ QUIC-based Erlang distribution protocol implementation.
 - `quic_dist_sup` - Distribution supervisor
 - `quic_dist_tickets` - Session ticket storage
 - `quic_epmd` - EPMD replacement module
+- `quic_dist_auth` - Optional auth-handshake behaviour
 
 ### Discovery Backends
 - `quic_discovery_static` - Static node configuration
@@ -271,6 +272,16 @@ QUIC-based Erlang distribution protocol implementation.
 ### Distribution API
 - `quic:get_stats/1` - Get packet counts for liveness detection
 - `quic:send_ping/1` - Send transport-level PING frame
+
+### Extension Hooks
+- `auth_callback` (default `undefined`): `{Mod, Fun}` or `fun/3` invoked
+  on both sides after the QUIC handshake but before the dist_util
+  handshake. Returning `{error, _}` closes the connection without ever
+  starting the dist controller. See `quic_dist_auth` and the
+  Configuration Reference in `docs/QUIC_DIST.md`.
+- `register_with_epmd` (default `false`): when `true`, the listener
+  registers its port via the configured `epmd_module` so external
+  tooling (e.g. `epmd -names`) can resolve the node.
 
 ## Interop Runner Compliance
 

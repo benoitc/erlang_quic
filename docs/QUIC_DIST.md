@@ -441,6 +441,46 @@ The input handler:
 | `max_data` | integer | 10485760 | Connection flow control limit (bytes) |
 | `max_stream_data` | integer | 1048576 | Stream flow control limit (bytes) |
 
+### Extension Hooks
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `auth_callback` | `{Mod,Fun}` \| `fun/3` | `undefined` | Optional auth handshake run after the QUIC handshake but before `dist_util` |
+| `auth_handshake_timeout` | integer | 10000 | Deadline (ms) passed to the callback; gatekeeper aborts at expiry |
+| `register_with_epmd` | boolean | `false` | When `true`, register the listening port via the configured `epmd_module` so external tooling (e.g. `epmd -names`) can resolve it |
+
+#### `auth_callback`
+
+The callback runs on both sides with the freshly-established QUIC
+connection pid:
+
+```erlang
+authenticate(Conn, Side :: client | server, Timeout) ->
+    {ok, Info :: term()} | {error, Reason :: term()}.
+```
+
+`{error, Reason}` closes the QUIC connection without ever starting
+the dist controller; the peer's `net_kernel:connect_node/1` returns
+`false`. Implementations typically open a user stream
+(`quic_dist:open_stream/2`) for a challenge/response. See the
+`quic_dist_auth` behaviour module.
+
+On the server, the callback is hosted by a short-lived gatekeeper
+process that owns the connection until the callback resolves. Any
+QUIC events buffered in its mailbox (e.g. the first stream-data) are
+forwarded to the dist controller after a successful handoff.
+
+Boot-arg form: `-quic_dist auth_callback Mod:Fun`.
+
+#### `register_with_epmd`
+
+By default, `quic_dist` skips `epmd` registration entirely and uses
+its own discovery. With `register_with_epmd = true`, the listener
+calls `EpmdMod:register_node/3` (where `EpmdMod` is whatever
+`net_kernel:epmd_module/0` returns) so the node appears in the
+configured registry. Useful in mixed-protocol clusters and for
+tools that scrape `epmd` directly.
+
 ## Discovery Backends
 
 ### Static Discovery (`quic_discovery_static`)

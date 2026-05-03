@@ -115,7 +115,20 @@
     backpressure_retry_ms = ?DEFAULT_BACKPRESSURE_RETRY_MS :: pos_integer(),
 
     %% Pacing
-    pacing_enabled = true :: boolean()
+    pacing_enabled = true :: boolean(),
+
+    %% Authentication callback invoked after the QUIC handshake but
+    %% before the dist_util handshake. Either side may refuse the
+    %% connection. Default undefined preserves the existing behaviour.
+    auth_callback = undefined ::
+        undefined
+        | {module(), atom()}
+        | fun((pid(), client | server, timeout()) -> {ok, term()} | {error, term()}),
+    auth_handshake_timeout = 10000 :: timeout(),
+
+    %% When true, register the listening port with the configured
+    %% epmd_module so external tooling (e.g. epmd -names) can find it.
+    register_with_epmd = false :: boolean()
 }).
 
 %% Listener state

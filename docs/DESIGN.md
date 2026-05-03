@@ -506,3 +506,42 @@ The `quic:migrate/1` API triggers active connection migration:
 - Network handover (WiFi to cellular)
 - NAT rebinding recovery
 - Load balancing
+
+## Distribution Extension Hooks
+
+`quic_dist` exposes two optional hooks for embedding custom behaviour
+in the distribution layer.
+
+### `auth_callback`
+
+A `{Mod, Fun}` pair (or `fun/3`) invoked on both sides between TLS
+completion (the `{quic, Conn, {connected, _}}` event) and the
+`dist_util` handshake. The callback can run any application-level
+challenge / response on the freshly secured QUIC connection — open a
+user stream, send a token, validate certificates — and return `{ok, _}`
+to admit the connection or `{error, Reason}` to refuse it.
+
+On the server side, the callback is hosted by a short-lived
+*gatekeeper* process. The listener installs the gatekeeper as the
+QUIC connection owner via the existing `connection_handler` contract,
+so it receives the `{connected, _}` event and any subsequent stream
+data. After a successful callback, the gatekeeper starts the dist
+controller (which takes ownership atomically via
+`quic:set_owner_sync/2`) and *drains its mailbox* of any QUIC events
+that arrived before the ownership swap, forwarding them to the
+controller. This guarantees the first stream-data event sent by the
+peer cannot be lost between the callback returning and the controller
+becoming the owner. On failure the gatekeeper closes the connection
+and exits; the listener is unaffected.
+
+On the client side, the callback runs inline in the setup process
+that already owns the connection — no gatekeeper is needed.
+
+### `register_with_epmd`
+
+Boolean. When `false` (default), `quic_dist` keeps the historical
+behaviour of synthesising its own creation number and skipping
+`epmd` entirely. When `true`, `listen/1` calls
+`(net_kernel:epmd_module()):register_node/3` so the listening port
+appears in the configured registry. Useful for mixed-protocol
+clusters and external tooling.

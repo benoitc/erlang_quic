@@ -184,30 +184,54 @@ listen(Name, ExtraOpts) ->
             Port = get_listen_port(),
             case start_quic_server(Name, Port, Config, ExtraOpts) of
                 {ok, ServerName, ActualPort} ->
-                    %% Create listener record
                     Listener = #quic_dist_listener{
                         server_name = ServerName,
                         port = ActualPort,
                         config = Config
                     },
-
-                    %% Build net_address record
                     Address = #net_address{
                         address = {{0, 0, 0, 0}, ActualPort},
                         host = localhost,
                         family = inet,
                         protocol = quic
                     },
-
-                    %% Creation number (1-3, different for each instance)
-                    Creation = get_creation(Name),
-
-                    {ok, {Listener, Address, Creation}};
+                    case resolve_creation(Name, ActualPort, Config) of
+                        {ok, Creation} ->
+                            {ok, {Listener, Address, Creation}};
+                        {error, EpmdReason} ->
+                            close(Listener),
+                            {error, EpmdReason}
+                    end;
                 {error, Reason} ->
                     {error, Reason}
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% @private
+%% Resolve the creation number. Either a synthetic one (default), or the
+%% one returned by registering with the configured epmd_module so that
+%% external tooling (e.g. `epmd -names') can find this node.
+resolve_creation(Name, _Port, #quic_dist_config{register_with_epmd = false}) ->
+    {ok, get_creation(Name)};
+resolve_creation(Name, Port, #quic_dist_config{
+    register_with_epmd = true,
+    discovery_module = DiscoveryModule
+}) ->
+    %% quic_discovery dispatches via erlang:function_exported/3, which
+    %% only sees exports of *loaded* modules. listen/1 runs before the
+    %% normal application boot, so force the discovery backend in now.
+    _ = code:ensure_loaded(DiscoveryModule),
+    NameStr =
+        case Name of
+            N when is_atom(N) -> atom_to_list(N);
+            N when is_list(N) -> N
+        end,
+    EpmdMod = net_kernel:epmd_module(),
+    case EpmdMod:register_node(NameStr, Port, inet) of
+        {ok, Creation} -> {ok, Creation};
+        {error, _} = Err -> Err
     end.
 
 %% @doc Accept a connection from the distribution listener.
@@ -386,8 +410,65 @@ load_config() ->
             backpressure_retry_ms, DistOpts, ?DEFAULT_BACKPRESSURE_RETRY_MS
         ),
         %% Pacing
-        pacing_enabled = get_opt(pacing_enabled, DistOpts, true)
+        pacing_enabled = get_opt(pacing_enabled, DistOpts, true),
+        %% Optional post-QUIC, pre-dist auth handshake
+        auth_callback = parse_auth_callback(
+            get_init_arg(auth_callback, get_opt(auth_callback, DistOpts))
+        ),
+        auth_handshake_timeout = parse_timeout(
+            get_init_arg(auth_handshake_timeout, get_opt(auth_handshake_timeout, DistOpts)),
+            10000
+        ),
+        %% Stock-EPMD registration of the listener port
+        register_with_epmd = parse_bool(
+            get_init_arg(register_with_epmd, get_opt(register_with_epmd, DistOpts)),
+            false
+        )
     }.
+
+%% @private
+parse_auth_callback(undefined) ->
+    undefined;
+parse_auth_callback({M, F}) when is_atom(M), is_atom(F) ->
+    {M, F};
+parse_auth_callback(F) when is_function(F, 3) ->
+    F;
+parse_auth_callback(Str) when is_list(Str) ->
+    case string:split(Str, ":") of
+        [M, F] when M =/= "", F =/= "" ->
+            {list_to_atom(M), list_to_atom(F)};
+        _ ->
+            undefined
+    end;
+parse_auth_callback(_) ->
+    undefined.
+
+%% @private
+parse_timeout(undefined, Default) ->
+    Default;
+parse_timeout(N, _Default) when is_integer(N), N > 0 ->
+    N;
+parse_timeout(infinity, _Default) ->
+    infinity;
+parse_timeout("infinity", _Default) ->
+    infinity;
+parse_timeout(Str, Default) when is_list(Str) ->
+    try list_to_integer(Str) of
+        N when N > 0 -> N;
+        _ -> Default
+    catch
+        _:_ -> Default
+    end;
+parse_timeout(_, Default) ->
+    Default.
+
+%% @private
+parse_bool(undefined, Default) -> Default;
+parse_bool(true, _) -> true;
+parse_bool(false, _) -> false;
+parse_bool("true", _) -> true;
+parse_bool("false", _) -> false;
+parse_bool(_, Default) -> Default.
 
 %% @private
 %% Get value from init argument -quic_dist_Key Value
@@ -604,43 +685,138 @@ load_credentials(_) ->
 
 %% @private
 %% Handle a new incoming QUIC connection.
+%%
+%% Two paths:
+%% - No auth_callback configured (default): start the dist controller
+%%   immediately, hand it ownership of the QUIC connection, and notify
+%%   the acceptor.
+%% - auth_callback configured: spawn a short-lived gatekeeper process
+%%   that takes ownership, waits for `{quic, Conn, {connected, _}}',
+%%   runs the callback, and only on `{ok, _}' starts the dist
+%%   controller. Any QUIC events the gatekeeper buffered between the
+%%   `connected' event and the ownership swap are forwarded to the
+%%   controller so the first stream-data event is not lost.
 handle_new_connection(Conn) ->
-    logger:info(
-        "quic_dist: handle_new_connection called, Conn=~p~n",
-        [Conn]
-    ),
-    %% Start distribution controller for this connection
+    Config = load_config(),
+    case Config#quic_dist_config.auth_callback of
+        undefined ->
+            handle_new_connection_direct(Conn);
+        Callback ->
+            handle_new_connection_with_auth(
+                Conn, Callback, Config#quic_dist_config.auth_handshake_timeout
+            )
+    end.
+
+%% @private
+handle_new_connection_direct(Conn) ->
     case quic_dist_controller:start_link(Conn, server) of
         {ok, ControllerPid} ->
-            logger:info("quic_dist: server controller started: ~p~n", [ControllerPid]),
-            %% Notify the acceptor about the new connection
-            %% The server name is based on the short node name (before @)
-            NodeName = node(),
-            ShortName =
-                case NodeName of
-                    nonode@nohost ->
-                        nonode;
-                    _ ->
-                        NodeStr = atom_to_list(NodeName),
-                        case string:split(NodeStr, "@") of
-                            [Name, _Host] -> list_to_atom(Name);
-                            [Name] -> list_to_atom(Name)
-                        end
-                end,
-            ServerName = dist_server_name(ShortName),
-            case persistent_term:get({quic_dist_acceptor, ServerName}, undefined) of
-                undefined ->
-                    %% No acceptor registered yet, this is normal during early boot
-                    %% The kernel will eventually call accept/1
-                    ok;
-                AcceptorPid when is_pid(AcceptorPid) ->
-                    %% Notify acceptor - NodeName will be extracted during handshake
-                    AcceptorPid ! {accept, ControllerPid, undefined}
-            end,
+            notify_acceptor(ControllerPid),
             {ok, ControllerPid};
         Error ->
-            logger:error("quic_dist: Failed to start controller: ~p~n", [Error]),
+            logger:error("quic_dist: failed to start controller: ~p~n", [Error]),
             Error
+    end.
+
+%% @private
+%% Spawn the gatekeeper unlinked: a crash here must not propagate to
+%% the listener. It owns the connection, so if it dies the QUIC
+%% connection process will clean up on owner DOWN.
+handle_new_connection_with_auth(Conn, Callback, Timeout) ->
+    Gatekeeper = spawn(fun() ->
+        gatekeeper(Conn, Callback, Timeout)
+    end),
+    {ok, Gatekeeper}.
+
+%% @private
+gatekeeper(Conn, Callback, Timeout) ->
+    receive
+        {quic, Conn, {connected, _Info}} ->
+            case run_auth_callback(Callback, Conn, server, Timeout) of
+                {ok, _} ->
+                    finalize_server_handoff(Conn);
+                {error, Reason} ->
+                    catch quic:close(Conn, normal),
+                    exit({auth_failed, Reason})
+            end;
+        {quic, Conn, {closed, Reason}} ->
+            exit({connection_closed, Reason});
+        {quic, Conn, {transport_error, Code, Reason}} ->
+            exit({transport_error, Code, Reason})
+    after Timeout ->
+        catch quic:close(Conn, normal),
+        exit({auth_failed, handshake_timeout})
+    end.
+
+%% @private
+%% Start the dist controller (which takes ownership of the connection),
+%% drain any QUIC events that arrived in our mailbox before the
+%% ownership swap and forward them to the controller, then notify the
+%% acceptor and exit normally.
+finalize_server_handoff(Conn) ->
+    case quic_dist_controller:start_link(Conn, server) of
+        {ok, ControllerPid} ->
+            drain_quic_events(Conn, ControllerPid),
+            notify_acceptor(ControllerPid);
+        {error, Reason} ->
+            catch quic:close(Conn, normal),
+            exit({controller_failed, Reason})
+    end.
+
+%% @private
+drain_quic_events(Conn, Target) ->
+    receive
+        {quic, Conn, _} = Msg ->
+            Target ! Msg,
+            drain_quic_events(Conn, Target)
+    after 0 ->
+        ok
+    end.
+
+%% @private
+notify_acceptor(ControllerPid) ->
+    NodeName = node(),
+    ShortName =
+        case NodeName of
+            nonode@nohost ->
+                nonode;
+            _ ->
+                NodeStr = atom_to_list(NodeName),
+                case string:split(NodeStr, "@") of
+                    [Name, _Host] -> list_to_atom(Name);
+                    [Name] -> list_to_atom(Name)
+                end
+        end,
+    ServerName = dist_server_name(ShortName),
+    case persistent_term:get({quic_dist_acceptor, ServerName}, undefined) of
+        undefined ->
+            %% No acceptor registered yet (early boot). net_kernel will
+            %% eventually call accept/1.
+            ok;
+        AcceptorPid when is_pid(AcceptorPid) ->
+            AcceptorPid ! {accept, ControllerPid, undefined},
+            ok
+    end.
+
+%% @private
+%% Invoke the configured auth callback. Crashes are turned into
+%% `{error, {crash, _}}' so a buggy callback cannot bring down the
+%% process running it. Callers must filter out `undefined' before
+%% calling.
+run_auth_callback({Mod, Fun}, Conn, Side, Timeout) when is_atom(Mod), is_atom(Fun) ->
+    safe_call(fun() -> Mod:Fun(Conn, Side, Timeout) end);
+run_auth_callback(F, Conn, Side, Timeout) when is_function(F, 3) ->
+    safe_call(fun() -> F(Conn, Side, Timeout) end).
+
+%% @private
+safe_call(Thunk) ->
+    try Thunk() of
+        {ok, _} = Ok -> Ok;
+        {error, _} = Err -> Err;
+        Other -> {error, {auth_callback_bad_return, Other}}
+    catch
+        Class:Reason:Stack ->
+            {error, {auth_callback_crash, Class, Reason, Stack}}
     end.
 
 %%====================================================================
@@ -895,7 +1071,7 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
             case quic:connect(Host, Port, Opts, self()) of
                 {ok, Conn} ->
                     %% Wait for connection to be established
-                    wait_for_connection(Kernel, Node, Conn, MyNode, Type, Timer);
+                    wait_for_connection(Kernel, Node, Conn, MyNode, Type, Timer, Config);
                 {error, Reason} ->
                     ?shutdown2(Node, {connect_failed, Reason})
             end;
@@ -904,21 +1080,17 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
     end.
 
 %% @private
-wait_for_connection(Kernel, Node, Conn, MyNode, Type, Timer) ->
+wait_for_connection(Kernel, Node, Conn, MyNode, Type, Timer, Config) ->
     receive
         {quic, Conn, {connected, _Info}} ->
-            %% Start distribution controller
-            case quic_dist_controller:start_link(Conn, client) of
-                {ok, DistCtrl} ->
-                    %% Set kernel on controller and store node
-                    quic_dist_controller:set_supervisor(DistCtrl, Kernel),
-                    quic_dist_controller:set_node(DistCtrl, Node),
-                    %% Perform distribution handshake
-                    HSData = create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer),
-                    dist_util:handshake_we_started(HSData);
-                {error, Reason} ->
-                    quic:close(Conn, normal),
-                    ?shutdown2(Node, {controller_failed, Reason})
+            %% Optional auth handshake before the dist controller
+            %% takes ownership.
+            case maybe_run_client_auth(Conn, Config) of
+                ok ->
+                    start_client_controller(Kernel, Node, Conn, MyNode, Type, Timer);
+                {error, AuthReason} ->
+                    catch quic:close(Conn, normal),
+                    ?shutdown2(Node, {auth_failed, AuthReason})
             end;
         {quic, Conn, {closed, Reason}} ->
             ?shutdown2(Node, {closed, Reason});
@@ -927,6 +1099,31 @@ wait_for_connection(Kernel, Node, Conn, MyNode, Type, Timer) ->
         {'EXIT', Timer, setup_timer_timeout} ->
             quic:close(Conn, timeout),
             ?shutdown2(Node, connect_timeout)
+    end.
+
+%% @private
+maybe_run_client_auth(_Conn, #quic_dist_config{auth_callback = undefined}) ->
+    ok;
+maybe_run_client_auth(Conn, #quic_dist_config{
+    auth_callback = Callback,
+    auth_handshake_timeout = Timeout
+}) ->
+    case run_auth_callback(Callback, Conn, client, Timeout) of
+        {ok, _} -> ok;
+        {error, _} = Err -> Err
+    end.
+
+%% @private
+start_client_controller(Kernel, Node, Conn, MyNode, Type, Timer) ->
+    case quic_dist_controller:start_link(Conn, client) of
+        {ok, DistCtrl} ->
+            quic_dist_controller:set_supervisor(DistCtrl, Kernel),
+            quic_dist_controller:set_node(DistCtrl, Node),
+            HSData = create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer),
+            dist_util:handshake_we_started(HSData);
+        {error, Reason} ->
+            quic:close(Conn, normal),
+            ?shutdown2(Node, {controller_failed, Reason})
     end.
 
 %%====================================================================
