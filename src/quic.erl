@@ -55,6 +55,24 @@
 %% Export the send_queue_info type for external use
 -export_type([send_queue_info/0]).
 
+%% Path metrics snapshot for routing decisions (e.g. multipath
+%% selection). All RTT values are in microseconds. `min_rtt' is `0'
+%% before any RTT sample has been taken (i.e. before the handshake
+%% provides one); callers should treat `min_rtt =:= 0' as "no sample
+%% yet".
+-type path_stats() :: #{
+    srtt := non_neg_integer(),
+    latest_rtt := non_neg_integer(),
+    min_rtt := non_neg_integer(),
+    rtt_var := non_neg_integer(),
+    cwnd := non_neg_integer(),
+    bytes_in_flight := non_neg_integer(),
+    in_recovery := boolean(),
+    congested := boolean()
+}.
+
+-export_type([path_stats/0]).
+
 -export([
     connect/4,
     close/1,
@@ -93,6 +111,8 @@
     get_stream_deadline/2,
     %% Congestion/backpressure status
     get_send_queue_info/1,
+    %% Path metrics (RTT + congestion control snapshot)
+    get_path_stats/1,
     %% Connection statistics for liveness detection
     get_stats/1,
     %% Transport-level PING (bypasses congestion control)
@@ -556,6 +576,20 @@ get_stream_deadline(Conn, StreamId) when is_pid(Conn) ->
     Conn :: pid().
 get_send_queue_info(Conn) when is_pid(Conn) ->
     quic_connection:get_send_queue_info(Conn).
+
+%% @doc Return a snapshot of the connection's path metrics.
+%%
+%% The map combines RTT estimates from `quic_loss' with congestion
+%% control state from `quic_cc'. Intended for routing layers that need
+%% per-connection path quality without poking at internal records via
+%% `sys:get_state/1'.
+%%
+%% Returns `{error, not_connected}' if the connection has not yet
+%% completed the handshake.
+-spec get_path_stats(Conn) -> {ok, path_stats()} | {error, term()} when
+    Conn :: pid().
+get_path_stats(Conn) when is_pid(Conn) ->
+    quic_connection:get_path_stats(Conn).
 
 %% @doc Get connection statistics for liveness detection.
 %%
