@@ -37,8 +37,10 @@
 % Low priority data
 -define(QUIC_DIST_URGENCY_DATA_LOW, 6).
 
-%% Default number of data streams
--define(QUIC_DIST_DATA_STREAMS, 4).
+%% Default number of data streams (compile-time constant — see plan §7).
+%% Both peers must use the same N; changing it is a coordinated wire-protocol
+%% change.
+-define(QUIC_DIST_DATA_STREAMS, 16).
 
 %% Message length prefixes
 
@@ -208,10 +210,13 @@
 %% Distribution uses streams 0 (control) and 4,8,12,16 (client data) or 1,5,9,13 (server data)
 %% User streams start above these reserved ranges
 
-% Client-initiated user streams start at 20 (above 0,4,8,12,16)
--define(USER_STREAM_THRESHOLD_CLIENT, 20).
-% Server-initiated user streams start at 17 (above 1,5,9,13)
--define(USER_STREAM_THRESHOLD_SERVER, 17).
+%% Client-initiated user streams start above the reserved dist range.
+%% Dist uses client-initiated IDs 0, 4, ..., 4*N (N+1 ids); user streams
+%% start at the next client-initiated id.
+-define(USER_STREAM_THRESHOLD_CLIENT, (4 * (?QUIC_DIST_DATA_STREAMS + 1))).
+%% Server-initiated dist IDs are 1, 5, ..., 4*N - 3 (N ids); user streams
+%% start at the next server-initiated id.
+-define(USER_STREAM_THRESHOLD_SERVER, (4 * ?QUIC_DIST_DATA_STREAMS + 1)).
 
 %% Application error code for refused streams (no acceptor available)
 -define(STREAM_REFUSED, 16#100).

@@ -292,8 +292,15 @@
 %% Flow Control - Distribution-specific limits
 %% Higher limits for distribution to avoid flow control blocking during
 %% large message transfers (e.g., code loading, large term passing).
-% 16MB connection-level limit
--define(DIST_INITIAL_MAX_DATA, 16777216).
+%% Connection-level limit must comfortably exceed
+%% ?QUIC_DIST_DATA_STREAMS * ?DIST_INITIAL_MAX_STREAM_DATA so per-pair
+%% multi-stream routing doesn't hit connection backpressure before
+%% per-stream windows do. With N=16 data streams + 1 control, the
+%% per-stream budget alone is 16 * 4 MB = 64 MB; the connection
+%% budget is 4× that so a single-RTT burst can't deplete the window
+%% before MAX_DATA frames replenish it.
+% 256MB connection-level limit
+-define(DIST_INITIAL_MAX_DATA, 268435456).
 % 4MB per-stream limit
 -define(DIST_INITIAL_MAX_STREAM_DATA, 4194304).
 

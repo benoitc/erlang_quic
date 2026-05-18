@@ -20,22 +20,26 @@ test_ref() -> make_ref().
 %% Tests
 %%====================================================================
 
-%% Test user stream thresholds
+%% Test user stream thresholds. Thresholds derive from
+%% ?QUIC_DIST_DATA_STREAMS, so use the same formula here.
 user_stream_threshold_test_() ->
+    N = ?QUIC_DIST_DATA_STREAMS,
+    ExpectedClient = 4 * (N + 1),
+    ExpectedServer = 4 * N + 1,
+    HighestClientDist = 4 * N,
+    HighestServerDist = 4 * N - 3,
     [
-        {"Client threshold is 20", fun() ->
-            ?assertEqual(20, ?USER_STREAM_THRESHOLD_CLIENT)
+        {"Client threshold matches derived value", fun() ->
+            ?assertEqual(ExpectedClient, ?USER_STREAM_THRESHOLD_CLIENT)
         end},
-        {"Server threshold is 17", fun() ->
-            ?assertEqual(17, ?USER_STREAM_THRESHOLD_SERVER)
+        {"Server threshold matches derived value", fun() ->
+            ?assertEqual(ExpectedServer, ?USER_STREAM_THRESHOLD_SERVER)
         end},
-        {"Client threshold above highest dist stream (16)", fun() ->
-            %% Client dist streams: 0, 4, 8, 12, 16
-            ?assert(?USER_STREAM_THRESHOLD_CLIENT > 16)
+        {"Client threshold above highest client dist stream", fun() ->
+            ?assert(?USER_STREAM_THRESHOLD_CLIENT > HighestClientDist)
         end},
-        {"Server threshold above highest dist stream (13)", fun() ->
-            %% Server dist streams: 1, 5, 9, 13
-            ?assert(?USER_STREAM_THRESHOLD_SERVER > 13)
+        {"Server threshold above highest server dist stream", fun() ->
+            ?assert(?USER_STREAM_THRESHOLD_SERVER > HighestServerDist)
         end}
     ].
 
@@ -155,6 +159,12 @@ message_format_test_() ->
 %% Even IDs (bit 0 = 0): client-initiated, use CLIENT threshold
 %% Odd IDs (bit 0 = 1): server-initiated, use SERVER threshold
 stream_id_classification_test_() ->
+    N = ?QUIC_DIST_DATA_STREAMS,
+    %% First user-stream id on each side is the threshold itself.
+    UserClient = ?USER_STREAM_THRESHOLD_CLIENT,
+    UserServer = ?USER_STREAM_THRESHOLD_SERVER,
+    HighestClientDist = 4 * N,
+    HighestServerDist = 4 * N - 3,
     [
         {"Control stream (0) is client-initiated (even), not user stream", fun() ->
             % bit 0 = 0, client-initiated
@@ -170,29 +180,31 @@ stream_id_classification_test_() ->
             ?assertEqual(0, 4 band 1),
             ?assert(4 < ?USER_STREAM_THRESHOLD_CLIENT)
         end},
-        {"Client data stream 16 (even) is not user stream", fun() ->
-            ?assertEqual(0, 16 band 1),
-            ?assert(16 < ?USER_STREAM_THRESHOLD_CLIENT)
+        {"Highest client dist stream is not user stream", fun() ->
+            ?assertEqual(0, HighestClientDist band 1),
+            ?assert(HighestClientDist < ?USER_STREAM_THRESHOLD_CLIENT)
         end},
-        {"Server data stream 13 (odd) is not user stream", fun() ->
-            ?assertEqual(1, 13 band 1),
-            ?assert(13 < ?USER_STREAM_THRESHOLD_SERVER)
+        {"Highest server dist stream is not user stream", fun() ->
+            ?assertEqual(1, HighestServerDist band 1),
+            ?assert(HighestServerDist < ?USER_STREAM_THRESHOLD_SERVER)
         end},
-        {"Stream 20 (even, client-initiated) is user stream", fun() ->
-            ?assertEqual(0, 20 band 1),
-            ?assert(20 >= ?USER_STREAM_THRESHOLD_CLIENT)
+        {"First client user-stream id is user stream", fun() ->
+            ?assertEqual(0, UserClient band 1),
+            ?assert(UserClient >= ?USER_STREAM_THRESHOLD_CLIENT)
         end},
-        {"Stream 17 (odd, server-initiated) is user stream", fun() ->
-            ?assertEqual(1, 17 band 1),
-            ?assert(17 >= ?USER_STREAM_THRESHOLD_SERVER)
+        {"First server user-stream id is user stream", fun() ->
+            ?assertEqual(1, UserServer band 1),
+            ?assert(UserServer >= ?USER_STREAM_THRESHOLD_SERVER)
         end},
-        {"Stream 100 (even) uses client threshold", fun() ->
-            ?assertEqual(0, 100 band 1),
-            ?assert(100 >= ?USER_STREAM_THRESHOLD_CLIENT)
+        {"High client id uses client threshold", fun() ->
+            HighClient = UserClient + 32,
+            ?assertEqual(0, HighClient band 1),
+            ?assert(HighClient >= ?USER_STREAM_THRESHOLD_CLIENT)
         end},
-        {"Stream 101 (odd) uses server threshold", fun() ->
-            ?assertEqual(1, 101 band 1),
-            ?assert(101 >= ?USER_STREAM_THRESHOLD_SERVER)
+        {"High server id uses server threshold", fun() ->
+            HighServer = UserServer + 32,
+            ?assertEqual(1, HighServer band 1),
+            ?assert(HighServer >= ?USER_STREAM_THRESHOLD_SERVER)
         end}
     ].
 
@@ -207,6 +219,11 @@ is_user_stream_logic_test_() ->
             1 -> StreamId >= ?USER_STREAM_THRESHOLD_SERVER
         end
     end,
+    N = ?QUIC_DIST_DATA_STREAMS,
+    HighestClientDist = 4 * N,
+    HighestServerDist = 4 * N - 3,
+    UserClient = ?USER_STREAM_THRESHOLD_CLIENT,
+    UserServer = ?USER_STREAM_THRESHOLD_SERVER,
     [
         {"Stream 0 (control, client-initiated) is not user stream", fun() ->
             ?assertNot(IsUserStream(0))
@@ -220,22 +237,22 @@ is_user_stream_logic_test_() ->
         {"Stream 5 (server data) is not user stream", fun() ->
             ?assertNot(IsUserStream(5))
         end},
-        {"Stream 16 (client data) is not user stream", fun() ->
-            ?assertNot(IsUserStream(16))
+        {"Highest client dist stream is not user stream", fun() ->
+            ?assertNot(IsUserStream(HighestClientDist))
         end},
-        {"Stream 13 (server data) is not user stream", fun() ->
-            ?assertNot(IsUserStream(13))
+        {"Highest server dist stream is not user stream", fun() ->
+            ?assertNot(IsUserStream(HighestServerDist))
         end},
-        {"Stream 17 (server-initiated) IS user stream", fun() ->
-            ?assert(IsUserStream(17))
+        {"First client user-stream id IS user stream", fun() ->
+            ?assert(IsUserStream(UserClient))
         end},
-        {"Stream 20 (client-initiated) IS user stream", fun() ->
-            ?assert(IsUserStream(20))
+        {"First server user-stream id IS user stream", fun() ->
+            ?assert(IsUserStream(UserServer))
         end},
-        {"Stream 21 (server-initiated) IS user stream", fun() ->
-            ?assert(IsUserStream(21))
+        {"Higher client id IS user stream", fun() ->
+            ?assert(IsUserStream(UserClient + 4))
         end},
-        {"Stream 24 (client-initiated) IS user stream", fun() ->
-            ?assert(IsUserStream(24))
+        {"Higher server id IS user stream", fun() ->
+            ?assert(IsUserStream(UserServer + 4))
         end}
     ].

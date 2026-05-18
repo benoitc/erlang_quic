@@ -1147,6 +1147,11 @@ create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel) ->
         timer = Timer,
         this_flags = 0,
         other_flags = 0,
+        %% Reject the connection-wide atom cache so it cannot create
+        %% cross-stream decoder-state dependencies. Fragments stay on
+        %% (routed per SeqId by quic_dist_dispatch). strict_order_flags/0
+        %% returns DFLAG_DIST_HDR_ATOM_CACHE (0x2000).
+        reject_flags = dist_util:strict_order_flags(),
         f_send = fun(Ctrl, Data) -> quic_dist_controller:send(Ctrl, Data) end,
         f_recv = fun(Ctrl, Len, Timeout) ->
             %% Receive data and try to extract node name if this is the name message
@@ -1252,6 +1257,8 @@ create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer) ->
         timer = Timer,
         this_flags = 0,
         other_flags = 0,
+        %% Reject the connection-wide atom cache — see create_hs_data/5 comment.
+        reject_flags = dist_util:strict_order_flags(),
         f_send = fun(Ctrl, Data) -> quic_dist_controller:send(Ctrl, Data) end,
         f_recv = fun(Ctrl, Len, Timeout) -> quic_dist_controller:recv(Ctrl, Len, Timeout) end,
         f_setopts_pre_nodeup = fun(Ctrl) ->

@@ -989,13 +989,14 @@ deliver_yield_returns_remainder_test() ->
         test_dhandle, Remainder, 0
     ),
     ?assertEqual({ok, Remainder}, Result),
-    %% The yield must be a tag-only atom so the mailbox cannot carry
-    %% a stale buffer.
+    %% The yield carries the stream id so the input handler can resume
+    %% on the right per-stream buffer; the /3 test entry uses the
+    %% no_stream sentinel.
     receive
-        continue_delivery ->
+        {continue_delivery, no_stream} ->
             ok;
-        {continue_delivery, _} = Wrong ->
-            ?assertEqual(continue_delivery, Wrong)
+        Wrong ->
+            ?assertEqual({continue_delivery, no_stream}, Wrong)
     after 200 ->
         error(no_yield_signal)
     end.
@@ -1032,11 +1033,12 @@ input_handler_mailbox_ordering_test() ->
     Controller = self(),
     Loop = spawn_link(fun() ->
         quic_dist_controller:input_handler_loop(
-            test_dhandle, Controller, test_conn, test_stream, <<>>, Deliver
+            test_dhandle, Controller, test_conn, test_stream, #{}, Deliver
         )
     end),
-    Loop ! {dist_data, Part1},
-    Loop ! {dist_data, Part2},
+    TestSid = 4,
+    Loop ! {dist_data, TestSid, Part1},
+    Loop ! {dist_data, TestSid, Part2},
     Received = collect_payloads(N, []),
     exit(Loop, shutdown),
     Expected = [payload(I) || I <- lists:seq(1, N)],

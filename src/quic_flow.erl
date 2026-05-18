@@ -52,8 +52,16 @@
 
 %% Default values
 
-% Send MAX_DATA when 50% consumed
--define(WINDOW_UPDATE_THRESHOLD, 0.5).
+%% Threshold encodes "fraction of window REMAINING when MAX_DATA fires":
+%% fires when bytes_received > recv_max_data_sent - (Initial * THRESHOLD).
+%% So 0.5 fires after 50% consumed, 0.75 fires after 25% consumed.
+%%
+%% Bumped from 0.5 to 0.75 so MAX_DATA updates arrive twice as often
+%% under sustained high-throughput. The previous 0.5 threshold stalled
+%% sustained single-stream transfers because the sender would deplete
+%% the remaining half of the window before the next MAX_DATA frame
+%% arrived.
+-define(WINDOW_UPDATE_THRESHOLD, 0.75).
 
 %% Flow control state
 -record(flow_state, {
