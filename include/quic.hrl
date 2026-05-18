@@ -208,6 +208,42 @@
 -define(EXT_QUIC_TRANSPORT_PARAMS, 57).
 
 %%====================================================================
+%% TLS 1.3 PSK Key Exchange Modes (RFC 8446 Section 4.2.9)
+%%====================================================================
+
+%% PSK-only key establishment (no (EC)DHE; no forward secrecy)
+-define(PSK_KE_MODE_KE, 0).
+%% PSK with (EC)DHE key establishment (forward-secret)
+-define(PSK_KE_MODE_DHE_KE, 1).
+
+%%====================================================================
+%% TLS 1.3 Alerts (RFC 8446 Section 6)
+%%====================================================================
+
+-define(TLS_ALERT_ILLEGAL_PARAMETER, 47).
+-define(TLS_ALERT_DECRYPT_ERROR, 51).
+-define(TLS_ALERT_UNKNOWN_PSK_IDENTITY, 115).
+
+%%====================================================================
+%% PSK offer record (client-side, fed into ClientHello PSK builder)
+%%====================================================================
+
+-record(psk_offer, {
+    %% resumption | external
+    type :: resumption | external,
+    %% binary identity sent on the wire
+    identity :: binary(),
+    %% obfuscated_ticket_age:32 — 0 for external PSKs (RFC 8446 §4.2.11)
+    age = 0 :: non_neg_integer(),
+    %% raw PSK secret (passed to HKDF unchanged)
+    secret :: binary(),
+    %% cipher whose hash determines binder length & key schedule
+    cipher :: atom(),
+    %% offered modes in client preference order
+    modes = [psk_dhe_ke] :: [psk_dhe_ke | psk_ke]
+}).
+
+%%====================================================================
 %% TLS 1.3 Named Groups (RFC 8446 Section 4.2.7)
 %%====================================================================
 

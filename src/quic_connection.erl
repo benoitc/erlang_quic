@@ -184,8 +184,7 @@
 -define(TLS_AWAITING_CLIENT_CERT_VERIFY, awaiting_client_cert_verify).
 -define(TLS_AWAITING_CLIENT_FINISHED, awaiting_client_finished).
 
-%% TLS alert codes (RFC 8446 Section 6.2)
--define(TLS_ALERT_DECRYPT_ERROR, 51).
+%% TLS alert codes live in include/quic.hrl now (?TLS_ALERT_*).
 
 %% Max pending data entries before connection is established (prevents memory exhaustion)
 -define(MAX_PENDING_DATA_ENTRIES, 1000).
