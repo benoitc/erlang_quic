@@ -112,10 +112,9 @@
 - [x] Identity lookup via callback and/or static map
 - [x] Cert + PSK coexistence on the same listener
 - [x] Client downgrade protection
-- [ ] 0-RTT on external PSK (v1 limitation)
-- [ ] `NewSessionTicket` on PSK-auth handshakes (v1 limitation)
 
-See [docs/PSK.md](PSK.md).
+See [docs/PSK.md](PSK.md). Pending follow-ups tracked in the
+[Roadmap](#roadmap) below.
 
 ## QUIC Version 2 (RFC 9369)
 
@@ -294,6 +293,22 @@ QUIC-based Erlang distribution protocol implementation.
 - `register_with_epmd` (default `false`): when `true`, the listener
   registers its port via the configured `epmd_module` so external
   tooling (e.g. `epmd -names`) can resolve the node.
+
+## Roadmap
+
+Tracked future work. Items here are not committed deliverables; they
+mark known gaps that may land in a later release.
+
+### TLS 1.3 external PSK follow-ups
+- [ ] 0-RTT on external PSK. The server currently ignores `early_data`
+  on PSK handshakes; full EndOfEarlyData state-machine support is
+  deferred.
+- [ ] `NewSessionTicket` on PSK-authenticated handshakes. Suppressed
+  in v1 to avoid binding-identity ambiguity; revisit when a concrete
+  use case appears.
+- [ ] RFC 9258 PSK Importer. The current API consumes the secret as
+  raw IKM; an importer layer would derive an `epsk -> psk` mapping
+  bound to a target protocol/KDF.
 
 ## Interop Runner Compliance
 
