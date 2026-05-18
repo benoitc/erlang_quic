@@ -489,6 +489,21 @@
     %% Client-side ticket storage for session resumption
     ticket_store = #{} :: quic_ticket:ticket_store(),
 
+    %% TLS 1.3 External PSK (RFC 8446 §4.2.11)
+    %% Client-side: {Identity, Secret, Modes} offered to the peer.
+    external_psk :: {binary(), binary(), [psk_dhe_ke | psk_ke]} | undefined,
+    %% Server-side: configured PSK lookup (callback wins, map as fallback).
+    psk_config :: #{
+        psk_callback => fun((binary()) -> {ok, binary()} | not_found) | undefined,
+        psks => #{binary() => binary()} | undefined
+    } | undefined,
+    %% Per-handshake: identity/secret/mode the server selected, or undefined.
+    selected_psk :: undefined | #{
+        identity => binary(),
+        secret => binary(),
+        mode => psk_dhe_ke | psk_ke
+    },
+
     %% 0-RTT / Early Data (RFC 9001 Section 4.6)
 
     % {Keys, EarlySecret}
@@ -960,6 +975,13 @@ init({server, Opts}) ->
         verify = maps:get(verify, Opts, false),
         initial_keys = InitialKeys,
         tls_state = ?TLS_AWAITING_CLIENT_HELLO,
+        %% TLS 1.3 external PSK config (RFC 8446 §4.2.11). Either or
+        %% both may be `undefined`; if both are undefined the server
+        %% only accepts cert-authenticated handshakes.
+        psk_config = #{
+            psk_callback => maps:get(psk_callback, Opts, undefined),
+            psks => maps:get(psks, Opts, undefined)
+        },
         alpn_list = normalize_alpn_list(ALPNList),
         pn_initial = PNSpace,
         pn_handshake = PNSpace,
@@ -1241,6 +1263,10 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% Extract session ticket for resumption (if provided)
     SessionTicket = maps:get(session_ticket, Opts, undefined),
 
+    %% Extract external PSK (RFC 8446 §4.2.11). Mutually exclusive
+    %% with session_ticket; validated when ClientHello is built.
+    ExternalPsk = maps:get(external_psk, Opts, undefined),
+
     %% Get idle timeout for keep-alive calculation
     IdleTimeoutClient = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
 
@@ -1348,6 +1374,9 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
                 undefined -> quic_ticket:new_store();
                 Ticket -> quic_ticket:store_ticket(ServerName, Ticket, quic_ticket:new_store())
             end,
+        %% TLS 1.3 external PSK (RFC 8446 §4.2.11) — mutually exclusive
+        %% with session_ticket; conflict raised by build_client_hello/1.
+        external_psk = ExternalPsk,
         congestion_threshold = maps:get(congestion_threshold, Opts, 2),
         pacing_enabled = maps:get(pacing_enabled, Opts, true),
         active_n = maps:get(active_n, Opts, 100),
@@ -2245,11 +2274,18 @@ send_client_hello(State) ->
         ticket_store = TicketStore
     } = State,
 
-    %% Look up session ticket for resumption
+    %% Look up session ticket for resumption — but skip if the caller
+    %% supplied an external PSK; build_client_hello/1 will raise
+    %% {bad_opts, psk_conflict} if both end up in Opts.
     SessionTicket =
-        case quic_ticket:lookup_ticket(ServerName, TicketStore) of
-            {ok, Ticket} -> Ticket;
-            error -> undefined
+        case State#state.external_psk of
+            undefined ->
+                case quic_ticket:lookup_ticket(ServerName, TicketStore) of
+                    {ok, Ticket} -> Ticket;
+                    error -> undefined
+                end;
+            _ ->
+                undefined
         end,
 
     %% Build transport parameters
@@ -2278,13 +2314,20 @@ send_client_hello(State) ->
             true -> TransportParams1#{reset_stream_at => true}
         end,
 
-    %% Build ClientHello (with or without PSK for resumption)
-    ClientHelloOpts = #{
+    %% Build ClientHello (with or without PSK for resumption / external).
+    %% session_ticket and external_psk are mutually exclusive; build_client_hello/1
+    %% raises {bad_opts, psk_conflict} if both are present.
+    ClientHelloOpts0 = #{
         server_name => ServerName,
         alpn => AlpnList,
         transport_params => TransportParams,
         session_ticket => SessionTicket
     },
+    ClientHelloOpts =
+        case State#state.external_psk of
+            undefined -> ClientHelloOpts0;
+            Ext -> ClientHelloOpts0#{external_psk => Ext}
+        end,
     {ClientHello, PrivKey, _Random} = quic_tls:build_client_hello(ClientHelloOpts),
 
     %% Update transcript
