@@ -423,8 +423,39 @@ load_config() ->
         register_with_epmd = parse_bool(
             get_init_arg(register_with_epmd, get_opt(register_with_epmd, DistOpts)),
             false
-        )
+        ),
+        %% TLS 1.3 external PSK config — see docs/PSK.md
+        psks = validate_psks(get_opt(psks, DistOpts)),
+        psk_callback = parse_auth_callback(
+            get_init_arg(psk_callback, get_opt(psk_callback, DistOpts))
+        ),
+        external_psk = validate_external_psk(get_opt(external_psk, DistOpts))
     }.
+
+%% @private
+validate_psks(undefined) -> undefined;
+validate_psks(Map) when is_map(Map) ->
+    %% Require all keys/values to be binaries; reject loudly so
+    %% dist startup fails rather than silently dropping the list.
+    case lists:all(
+        fun({K, V}) -> is_binary(K) andalso is_binary(V) end, maps:to_list(Map)
+    ) of
+        true -> Map;
+        false -> error({bad_config, {psks, malformed_entries}})
+    end;
+validate_psks(Other) ->
+    error({bad_config, {psks, Other}}).
+
+%% @private
+validate_external_psk(undefined) -> undefined;
+validate_external_psk({Id, Secret}) when is_binary(Id), is_binary(Secret) ->
+    {Id, Secret};
+validate_external_psk({Id, Secret, Modes}) when
+    is_binary(Id), is_binary(Secret), is_list(Modes), Modes =/= []
+->
+    {Id, Secret, Modes};
+validate_external_psk(Other) ->
+    error({bad_config, {external_psk, Other}}).
 
 %% @private
 parse_auth_callback(undefined) ->
@@ -525,13 +556,11 @@ get_listen_port() ->
 %% 1. Early boot mode: Start standalone quic_listener directly (no supervision)
 %% 2. Normal mode: Use quic:start_server through the supervisor tree
 start_quic_server(Name, Port, Config, _ExtraOpts) ->
-    %% Load certificate and key
+    %% Load certificate and key (or fall through to PSK-only auth)
     case load_credentials(Config) of
         {ok, Cert, Key, _CACert} ->
             CongestionThreshold = Config#quic_dist_config.congestion_threshold,
-            Opts = #{
-                cert => Cert,
-                key => Key,
+            BaseOpts0 = #{
                 alpn => [?QUIC_DIST_ALPN],
                 idle_timeout => ?QUIC_DIST_IDLE_TIMEOUT,
                 %% QUIC-level keep-alive via PING frames (bypasses flow control)
@@ -561,6 +590,14 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
                     handle_new_connection(Conn)
                 end
             },
+            %% Add cert/key when present (PSK-only listeners omit them).
+            BaseOpts1 =
+                case {Cert, Key} of
+                    {undefined, undefined} -> BaseOpts0;
+                    {_, _} -> BaseOpts0#{cert => Cert, key => Key}
+                end,
+            %% Add PSK auth when configured.
+            Opts = add_psk_listener_opts(BaseOpts1, Config),
 
             case whereis(quic_sup) of
                 Pid when is_pid(Pid) ->
@@ -680,8 +717,54 @@ load_credentials(#quic_dist_config{
         _:Reason ->
             {error, {load_credentials, Reason}}
     end;
+load_credentials(#quic_dist_config{} = Config) ->
+    %% PSK-only configuration: either psks or psk_callback configured
+    %% and no cert/key path supplied. Return undefined slots so the
+    %% caller (start_quic_server / connect_to_node) builds Opts
+    %% without cert/key keys.
+    case psk_only_credentials_ok(Config) of
+        true -> {ok, undefined, undefined, undefined};
+        false -> {error, no_credentials}
+    end;
 load_credentials(_) ->
     {error, no_credentials}.
+
+%% @private
+psk_only_credentials_ok(#quic_dist_config{
+    psks = Psks, psk_callback = Cb
+}) when Psks =/= undefined; Cb =/= undefined ->
+    true;
+psk_only_credentials_ok(_) ->
+    false.
+
+%% @private
+%% Add psk_callback and/or psks to a listener Opts map when configured.
+add_psk_listener_opts(Opts, #quic_dist_config{psks = Psks, psk_callback = Cb}) ->
+    Opts1 = case Psks of
+        undefined -> Opts;
+        _ -> Opts#{psks => Psks}
+    end,
+    case Cb of
+        undefined -> Opts1;
+        _ -> Opts1#{psk_callback => resolve_psk_callback(Cb)}
+    end.
+
+%% @private
+%% Add external_psk to a client Opts map when configured.
+add_psk_client_opts(Opts, #quic_dist_config{external_psk = undefined}) ->
+    Opts;
+add_psk_client_opts(Opts, #quic_dist_config{external_psk = Ext}) ->
+    Opts#{external_psk => Ext}.
+
+%% @private
+%% parse_auth_callback stores {Module, Function} or fun/3 — we need
+%% to expose a fun/1 to the TLS layer. Wrap the {M, F} case.
+resolve_psk_callback({Mod, Fun}) when is_atom(Mod), is_atom(Fun) ->
+    fun(Identity) -> Mod:Fun(Identity) end;
+resolve_psk_callback(Fn) when is_function(Fn, 1) ->
+    Fn;
+resolve_psk_callback(_) ->
+    undefined.
 
 %% @private
 %% Handle a new incoming QUIC connection.
@@ -1026,9 +1109,7 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
     case load_credentials(Config) of
         {ok, Cert, Key, _CACert} ->
             CongestionThreshold = Config#quic_dist_config.congestion_threshold,
-            BaseOpts = #{
-                cert => Cert,
-                key => Key,
+            BaseOpts0 = #{
                 alpn => [?QUIC_DIST_ALPN],
                 idle_timeout => ?QUIC_DIST_IDLE_TIMEOUT,
                 %% QUIC-level keep-alive via PING frames (bypasses flow control)
@@ -1057,6 +1138,14 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                 % TODO: Enable proper verification
                 verify => false
             },
+            %% Add cert/key when present (PSK-only clients omit them).
+            BaseOpts1 =
+                case {Cert, Key} of
+                    {undefined, undefined} -> BaseOpts0;
+                    {_, _} -> BaseOpts0#{cert => Cert, key => Key}
+                end,
+            %% Add external_psk when configured.
+            BaseOpts = add_psk_client_opts(BaseOpts1, Config),
 
             %% Per-node overrides registered via set_connect_options/2.
             %% Merged on top of the defaults so callers can swap the
