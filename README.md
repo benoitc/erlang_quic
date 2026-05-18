@@ -26,6 +26,8 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 - QLOG tracing support for debug visibility
 - UDP packet batching (GSO/GRO)
 - Client certificate verification
+- TLS 1.3 external PSK authentication (RFC 8446 §4.2.11, both `psk_dhe_ke`
+  and `psk_ke`). See [docs/PSK.md](docs/PSK.md).
 - Path-metrics snapshot (`quic:get_path_stats/1`) for routing layers
 
 ### HTTP/3 (`quic_h3`)

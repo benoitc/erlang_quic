@@ -34,6 +34,8 @@
     derive_early_secret/2,
     derive_handshake_secret/2,
     derive_handshake_secret/3,
+    derive_handshake_secret_psk_only/1,
+    derive_handshake_secret_psk_only/2,
     derive_master_secret/1,
     derive_master_secret/2,
 
@@ -126,6 +128,24 @@ derive_handshake_secret(Cipher, EarlySecret, SharedSecret) ->
     Hash = cipher_to_hash(Cipher),
     Salt = derive_secret(Hash, EarlySecret, <<"derived">>, <<>>),
     quic_hkdf:extract(Hash, Salt, SharedSecret).
+
+%% @doc Derive handshake secret for psk_ke (PSK-only, no DHE).
+%% RFC 8446 §7.1: when (EC)DHE is not used, the IKM is a zero-vector
+%% of the negotiated hash's length.
+-spec derive_handshake_secret_psk_only(binary()) -> binary().
+derive_handshake_secret_psk_only(EarlySecret) ->
+    Salt = derive_secret(EarlySecret, <<"derived">>, <<>>),
+    IKM = <<0:?HASH_LEN/unit:8>>,
+    quic_hkdf:extract(Salt, IKM).
+
+%% @doc Derive handshake secret for psk_ke with cipher-specific hash.
+-spec derive_handshake_secret_psk_only(atom(), binary()) -> binary().
+derive_handshake_secret_psk_only(Cipher, EarlySecret) ->
+    Hash = cipher_to_hash(Cipher),
+    HashLen = hash_len(Hash),
+    Salt = derive_secret(Hash, EarlySecret, <<"derived">>, <<>>),
+    IKM = <<0:HashLen/unit:8>>,
+    quic_hkdf:extract(Hash, Salt, IKM).
 
 %% @doc Derive master secret from handshake secret.
 %% master_secret = HKDF-Extract(

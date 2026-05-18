@@ -130,7 +130,20 @@
 
     %% When true, register the listening port with the configured
     %% epmd_module so external tooling (e.g. epmd -names) can find it.
-    register_with_epmd = false :: boolean()
+    register_with_epmd = false :: boolean(),
+
+    %% TLS 1.3 external PSK (RFC 8446 §4.2.11). When set, the dist
+    %% listener and/or client uses these instead of (or alongside) the
+    %% cert+key pair above. See docs/PSK.md.
+    psks = undefined :: undefined | #{binary() => binary()},
+    psk_callback = undefined ::
+        undefined
+        | {module(), atom()}
+        | fun((binary()) -> {ok, binary()} | not_found),
+    external_psk = undefined ::
+        undefined
+        | {binary(), binary()}
+        | {binary(), binary(), [psk_dhe_ke | psk_ke]}
 }).
 
 %% Listener state

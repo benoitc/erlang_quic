@@ -187,6 +187,11 @@ get_fd(Socket) ->
 %%   <li>`verify' - Verify server certificate (default: false)</li>
 %%   <li>`alpn' - ALPN protocols (default: [&lt;&lt;"h3"&gt;&gt;])</li>
 %%   <li>`server_name' - Server Name Indication (default: Host)</li>
+%%   <li>`external_psk' - TLS 1.3 external PSK (RFC 8446 §4.2.11).
+%%       `{Identity, Secret}' defaults to modes `[psk_dhe_ke]';
+%%       `{Identity, Secret, Modes}' takes an explicit non-empty
+%%       list (`psk_dhe_ke | psk_ke'). Mutually exclusive with
+%%       `session_ticket'. See docs/PSK.md.</li>
 %% </ul>
 -spec connect(Host, Port, Opts, Owner) -> {ok, pid()} | {error, term()} when
     Host :: binary() | string(),
@@ -656,10 +661,19 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %% Creates a listener pool that accepts incoming QUIC connections.
 %% Multiple named servers can run on different ports.
 %%
+%% At least one authentication method must be configured: either a
+%% `cert' + `key' pair for X.509 auth, or `psks' / `psk_callback' for
+%% TLS 1.3 external PSK (RFC 8446 §4.2.11). Both may coexist; the
+%% per-handshake selection rules are documented in docs/PSK.md.
+%%
 %% Options:
 %% <ul>
-%%   <li>`cert' - DER-encoded certificate (required)</li>
-%%   <li>`key' - Private key term (required)</li>
+%%   <li>`cert' - DER-encoded certificate</li>
+%%   <li>`key' - Private key term</li>
+%%   <li>`psks' - `#{Identity :: binary() => Secret :: binary()}'
+%%       static PSK table</li>
+%%   <li>`psk_callback' - `fun((Identity :: binary()) -> {ok, Secret} | not_found)';
+%%       takes precedence over `psks'</li>
 %%   <li>`alpn' - List of ALPN protocols (default: [&lt;&lt;"h3"&gt;&gt;])</li>
 %%   <li>`pool_size' - Number of listener processes (default: 1)</li>
 %%   <li>`connection_handler' - Fun(Conn) -> {ok, HandlerPid} where Conn is the pid</li>

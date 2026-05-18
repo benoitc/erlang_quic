@@ -63,7 +63,11 @@
     build_certificate_request/1,
     parse_certificate_request/1,
     build_certificate_verify_client/3,
-    verify_certificate_verify/4
+    verify_certificate_verify/4,
+
+    %% TLS 1.3 External PSK (RFC 8446 §4.2.11)
+    select_psk/4,
+    parse_extensions_ordered/1
 ]).
 
 %%====================================================================
@@ -86,14 +90,70 @@ build_client_hello(Opts) ->
     %% Generate ECDHE key pair (x25519)
     {PubKey, PrivKey} = crypto:generate_key(ecdh, x25519),
 
-    %% Check if we have a session ticket for PSK resumption
-    case maps:get(session_ticket, Opts, undefined) of
+    %% Resolve PSK offer (resumption ticket or external PSK). The
+    %% caller is responsible for ensuring at most one is supplied;
+    %% psk_offer_from_opts/1 raises {bad_opts, psk_conflict} otherwise.
+    case psk_offer_from_opts(Opts) of
         undefined ->
-            %% Standard ClientHello without PSK
             build_client_hello_standard(Random, PubKey, PrivKey, Opts);
-        Ticket ->
-            %% ClientHello with pre_shared_key extension for resumption
-            build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, Ticket)
+        #psk_offer{} = Offer ->
+            build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, Offer)
+    end.
+
+%% @private Resolve external_psk/session_ticket into a #psk_offer{}.
+psk_offer_from_opts(Opts) ->
+    Ticket = maps:get(session_ticket, Opts, undefined),
+    Ext = maps:get(external_psk, Opts, undefined),
+    case {Ticket, Ext} of
+        {undefined, undefined} -> undefined;
+        {_, undefined} -> psk_offer_from_ticket(Ticket);
+        {undefined, _} -> psk_offer_from_external(Ext);
+        {_, _} -> error({bad_opts, psk_conflict})
+    end.
+
+psk_offer_from_ticket(#session_ticket{} = Ticket) ->
+    Secret = quic_ticket:derive_psk(Ticket#session_ticket.resumption_secret, Ticket),
+    Now = erlang:system_time(second),
+    TicketAge = (Now - Ticket#session_ticket.received_at) * 1000,
+    Age = (TicketAge + Ticket#session_ticket.age_add) band 16#FFFFFFFF,
+    #psk_offer{
+        type = resumption,
+        identity = Ticket#session_ticket.ticket,
+        age = Age,
+        secret = Secret,
+        cipher = Ticket#session_ticket.cipher,
+        modes = [psk_dhe_ke]
+    }.
+
+psk_offer_from_external({Identity, Secret}) ->
+    psk_offer_from_external({Identity, Secret, [psk_dhe_ke]});
+psk_offer_from_external({Identity, Secret, Modes}) when
+    is_binary(Identity),
+    byte_size(Identity) > 0,
+    is_binary(Secret),
+    byte_size(Secret) > 0,
+    is_list(Modes),
+    Modes =/= []
+->
+    %% Currently only TLS_AES_128_GCM_SHA256 is supported; binder
+    %% length, key schedule hash and HKDF all key off this. When more
+    %% suites land, surface a `cipher` option here.
+    #psk_offer{
+        type = external,
+        identity = Identity,
+        age = 0,
+        secret = Secret,
+        cipher = aes_128_gcm,
+        modes = validate_psk_modes(Modes)
+    };
+psk_offer_from_external(Other) ->
+    error({bad_opts, {external_psk, Other}}).
+
+validate_psk_modes(Modes) ->
+    Allowed = [psk_dhe_ke, psk_ke],
+    case [M || M <- Modes, not lists:member(M, Allowed)] of
+        [] -> Modes;
+        Bad -> error({bad_opts, {unsupported_psk_modes, Bad}})
     end.
 
 %% Build standard ClientHello without PSK
@@ -136,56 +196,51 @@ build_client_hello_standard(Random, PubKey, PrivKey, Opts) ->
     Msg = encode_handshake_message(?TLS_CLIENT_HELLO, ClientHello),
     {Msg, PrivKey, Random}.
 
-%% Build ClientHello with PSK for session resumption
-%% RFC 8446 Section 4.2.11: pre_shared_key MUST be the last extension
-%% The binder is computed over the truncated ClientHello (everything before binders)
-build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, Ticket) ->
-    %% Build base extensions (without pre_shared_key)
-    BaseExtensions = build_client_hello_extensions(PubKey, Opts),
+%% Build ClientHello with `pre_shared_key` extension for either a
+%% resumption ticket or an external PSK.
+%% RFC 8446 §4.2.11: pre_shared_key MUST be the last extension; the
+%% binder is computed over the truncated ClientHello (everything
+%% before the binders section).
+build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer) ->
+    #psk_offer{
+        identity = Identity,
+        age = Age,
+        secret = Secret,
+        cipher = Cipher,
+        modes = Modes,
+        type = OfferType
+    } = Offer,
 
-    %% Derive PSK from resumption secret
-    PSK = quic_ticket:derive_psk(Ticket#session_ticket.resumption_secret, Ticket),
-    Cipher = Ticket#session_ticket.cipher,
+    %% Base extensions advertise the configured PSK modes (drives the
+    %% server's `psk_key_exchange_modes` decision).
+    OptsWithModes = Opts#{psk_modes => Modes},
+    BaseExtensions = build_client_hello_extensions(PubKey, OptsWithModes),
 
-    %% Compute obfuscated ticket age
-    %% RFC 8446 4.2.11.1: obfuscated_ticket_age = (now - received_at) * 1000 + age_add
-    Now = erlang:system_time(second),
-    TicketAge = (Now - Ticket#session_ticket.received_at) * 1000,
-    ObfuscatedAge = (TicketAge + Ticket#session_ticket.age_add) band 16#FFFFFFFF,
+    %% Binder length comes from the negotiated hash (32 for SHA-256, 48 for SHA-384).
+    Hash = quic_crypto:cipher_to_hash(Cipher),
+    BinderLen = quic_crypto:hash_len(Hash),
 
-    %% Build pre_shared_key extension identities (without binder yet)
-    TicketData = Ticket#session_ticket.ticket,
-    TicketLen = byte_size(TicketData),
-
-    %% PskIdentity: identity<1..2^16-1>, obfuscated_ticket_age
-    PskIdentity = <<TicketLen:16, TicketData/binary, ObfuscatedAge:32>>,
+    %% PskIdentity: identity<1..2^16-1>, obfuscated_ticket_age.
+    %% External PSK uses age = 0 per RFC 8446 §4.2.11.
+    IdentityLen = byte_size(Identity),
+    PskIdentity = <<IdentityLen:16, Identity/binary, Age:32>>,
     IdentitiesLen = byte_size(PskIdentity),
     Identities = <<IdentitiesLen:16, PskIdentity/binary>>,
 
-    %% Binder placeholder (32 bytes for SHA-256, will be filled in)
-    BinderLen = 32,
     BinderPlaceholder = <<0:BinderLen/unit:8>>,
     BindersSection = <<(BinderLen + 1):16, BinderLen:8, BinderPlaceholder/binary>>,
 
-    %% Build pre_shared_key extension with placeholder binder
     PskExtBody = <<Identities/binary, BindersSection/binary>>,
     PskExtLen = byte_size(PskExtBody),
     PskExt = <<?EXT_PRE_SHARED_KEY:16, PskExtLen:16, PskExtBody/binary>>,
 
-    %% Calculate total extensions length with PSK
     AllExtensions = <<BaseExtensions/binary, PskExt/binary>>,
     ExtensionsLen = byte_size(AllExtensions),
 
-    %% Legacy session ID (empty for TLS 1.3)
     SessionId = <<>>,
-
-    %% Cipher suites
     CipherSuites = <<?TLS_AES_128_GCM_SHA256:16>>,
-
-    %% Legacy compression methods (null only)
     CompressionMethods = <<1, 0>>,
 
-    %% Build full ClientHello with placeholder binder
     ClientHelloBody = <<
         ?TLS_VERSION_1_2:16,
         Random:32/binary,
@@ -198,29 +253,19 @@ build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, Ticket) ->
         AllExtensions/binary
     >>,
 
-    %% Build truncated ClientHello for binder computation
-    %% Truncated = full ClientHello up to but not including the binders
-    %% The binders section starts at: end - binders_len
+    %% Truncate before the binders section to feed the binder HMAC.
     BindersSectionLen = byte_size(BindersSection),
     TruncatedLen = byte_size(ClientHelloBody) - BindersSectionLen,
     <<TruncatedBody:TruncatedLen/binary, _/binary>> = ClientHelloBody,
-
-    %% Wrap truncated ClientHello for hash computation
     TruncatedMsg = encode_handshake_message(?TLS_CLIENT_HELLO, TruncatedBody),
 
-    %% Compute PSK binder
-    %% binder = HMAC(binder_key, Transcript-Hash(truncated ClientHello))
-    EarlySecret = quic_crypto:derive_early_secret(Cipher, PSK),
+    EarlySecret = quic_crypto:derive_early_secret(Cipher, Secret),
     TruncatedHash = quic_crypto:transcript_hash(Cipher, TruncatedMsg),
-    Binder = quic_crypto:compute_psk_binder(Cipher, EarlySecret, TruncatedHash, resumption),
+    Binder = quic_crypto:compute_psk_binder(Cipher, EarlySecret, TruncatedHash, OfferType),
 
-    %% Build final binders section with real binder
     FinalBindersSection = <<(BinderLen + 1):16, BinderLen:8, Binder/binary>>,
-
-    %% Build final ClientHello with real binder
     FinalClientHello = <<TruncatedBody/binary, FinalBindersSection/binary>>,
 
-    %% Wrap in handshake message
     Msg = encode_handshake_message(?TLS_CLIENT_HELLO, FinalClientHello),
     {Msg, PrivKey, Random}.
 
@@ -291,11 +336,14 @@ build_client_hello_extensions(PubKey, Opts) ->
         TransportParamsData
     ),
 
-    %% PSK Key Exchange Modes (psk_dhe_ke only)
+    %% PSK Key Exchange Modes — list of bytes per RFC 8446 §4.2.9.
+    %% Defaults to `psk_dhe_ke` only; callers offering external PSK
+    %% may pass `psk_modes => [psk_ke, psk_dhe_ke]` etc.
+    Modes = maps:get(psk_modes, Opts, [psk_dhe_ke]),
+    ModeBytes = iolist_to_binary([encode_psk_mode(M) || M <- Modes]),
     PskModes = encode_extension(
         ?EXT_PSK_KEY_EXCHANGE_MODES,
-        % psk_dhe_ke = 1
-        <<1, 1>>
+        <<(byte_size(ModeBytes)):8, ModeBytes/binary>>
     ),
 
     iolist_to_binary([
@@ -319,7 +367,12 @@ encode_alpn_list(Protocols) ->
 %% @doc Parse a ServerHello message.
 %% Returns server's public key and selected cipher suite.
 -spec parse_server_hello(binary()) ->
-    {ok, #{public_key := binary(), cipher := atom(), random := binary()}}
+    {ok, #{
+        public_key := binary() | undefined,
+        cipher := atom(),
+        random := binary(),
+        selected_psk_identity => non_neg_integer()
+    }}
     | {error, term()}.
 parse_server_hello(<<
     % legacy_version
@@ -334,26 +387,41 @@ parse_server_hello(<<
     Extensions:ExtensionsLen/binary,
     _Rest/binary
 >>) ->
-    %% Parse extensions to get key_share
     case parse_extensions(Extensions) of
         {ok, ExtMap} ->
-            case maps:find(?EXT_KEY_SHARE, ExtMap) of
-                {ok, KeyShareData} ->
-                    case parse_server_key_share(KeyShareData) of
-                        {ok, PubKey} ->
-                            Cipher = cipher_from_suite(CipherSuite),
-                            {ok, #{
-                                public_key => PubKey,
-                                cipher => Cipher,
-                                random => Random,
-                                session_id => SessionId,
-                                extensions => ExtMap
-                            }};
-                        Error ->
-                            Error
-                    end;
-                error ->
-                    {error, missing_key_share}
+            Cipher = cipher_from_suite(CipherSuite),
+            SelectedPsk =
+                case maps:find(?EXT_PRE_SHARED_KEY, ExtMap) of
+                    {ok, <<Idx:16>>} -> Idx;
+                    _ -> undefined
+                end,
+            KeyShareResult =
+                case maps:find(?EXT_KEY_SHARE, ExtMap) of
+                    {ok, KeyShareData} ->
+                        parse_server_key_share(KeyShareData);
+                    error when SelectedPsk =/= undefined ->
+                        %% psk_ke handshake: no DHE → public_key=undefined.
+                        {ok, undefined};
+                    error ->
+                        {error, missing_key_share}
+                end,
+            case KeyShareResult of
+                {ok, PubKey} ->
+                    Base = #{
+                        public_key => PubKey,
+                        cipher => Cipher,
+                        random => Random,
+                        session_id => SessionId,
+                        extensions => ExtMap
+                    },
+                    Result =
+                        case SelectedPsk of
+                            undefined -> Base;
+                            Idx2 -> Base#{selected_psk_identity => Idx2}
+                        end,
+                    {ok, Result};
+                Error ->
+                    Error
             end;
         Error ->
             Error
@@ -764,19 +832,43 @@ encode_extension(Type, Data) ->
     <<Type:16, (byte_size(Data)):16, Data/binary>>.
 
 parse_extensions(Data) ->
-    parse_extensions(Data, #{}).
+    case parse_extensions_ordered(Data) of
+        {ok, Ordered} ->
+            {ok, maps:from_list([{T, D} || {T, D, _Off, _Sz} <- Ordered])};
+        Error ->
+            Error
+    end.
 
-parse_extensions(<<>>, Acc) ->
-    {ok, Acc};
-parse_extensions(<<Type:16, Len:16, Data:Len/binary, Rest/binary>>, Acc) ->
-    parse_extensions(Rest, maps:put(Type, Data, Acc));
-parse_extensions(<<Type:16, Len:16, Data/binary>>, _Acc) when byte_size(Data) < Len ->
-    %% Extension data is truncated
+%% @doc Parse an extensions blob preserving order and byte offsets.
+%% Returns [{Type, Data, ByteOffset, ByteSize}] where ByteOffset is the
+%% position of `Type` within `Data`. Rejects duplicate extension types
+%% per RFC 8446 §4.2 with {error, {duplicate_extension, Type}}; the
+%% caller maps that to an illegal_parameter alert.
+-spec parse_extensions_ordered(binary()) ->
+    {ok, [{non_neg_integer(), binary(), non_neg_integer(), non_neg_integer()}]}
+    | {error, term()}.
+parse_extensions_ordered(Data) ->
+    parse_extensions_ordered(Data, 0, [], #{}).
+
+parse_extensions_ordered(<<>>, _Off, Acc, _Seen) ->
+    {ok, lists:reverse(Acc)};
+parse_extensions_ordered(<<Type:16, Len:16, ExtData:Len/binary, Rest/binary>>, Off, Acc, Seen) ->
+    case maps:is_key(Type, Seen) of
+        true ->
+            {error, {duplicate_extension, Type}};
+        false ->
+            Entry = {Type, ExtData, Off, 4 + Len},
+            parse_extensions_ordered(
+                Rest, Off + 4 + Len, [Entry | Acc], maps:put(Type, true, Seen)
+            )
+    end;
+parse_extensions_ordered(<<Type:16, Len:16, Data/binary>>, _Off, _Acc, _Seen) when
+    byte_size(Data) < Len
+->
     {error, {extension_truncated, Type, Len, byte_size(Data)}};
-parse_extensions(Data, _Acc) when byte_size(Data) < 4 ->
-    %% Not enough data for extension header (type + length)
+parse_extensions_ordered(Data, _Off, _Acc, _Seen) when byte_size(Data) < 4 ->
     {error, {extension_header_incomplete, byte_size(Data)}};
-parse_extensions(_, _) ->
+parse_extensions_ordered(_, _, _, _) ->
     {error, invalid_extensions}.
 
 parse_server_key_share(<<?GROUP_X25519:16, 32:16, PubKey:32/binary, _/binary>>) ->
@@ -790,6 +882,10 @@ cipher_from_suite(?TLS_AES_128_GCM_SHA256) -> aes_128_gcm;
 cipher_from_suite(?TLS_AES_256_GCM_SHA384) -> aes_256_gcm;
 cipher_from_suite(?TLS_CHACHA20_POLY1305_SHA256) -> chacha20_poly1305;
 cipher_from_suite(_) -> aes_128_gcm.
+
+%% @private Encode a single psk_key_exchange_mode byte (RFC 8446 §4.2.9).
+encode_psk_mode(psk_ke) -> <<?PSK_KE_MODE_KE:8>>;
+encode_psk_mode(psk_dhe_ke) -> <<?PSK_KE_MODE_DHE_KE:8>>.
 
 %%====================================================================
 %% Server-side TLS Functions
@@ -824,64 +920,22 @@ parse_client_hello(<<
     %% Parse cipher suites
     Ciphers = parse_cipher_suites(CipherSuites),
 
-    %% Parse extensions
-    case parse_extensions(Extensions) of
-        {ok, ExtMap} ->
-            %% Extract key_share
-            KeyShare =
-                case maps:find(?EXT_KEY_SHARE, ExtMap) of
-                    {ok, KsData} -> parse_client_key_shares(KsData);
-                    error -> undefined
-                end,
+    %% Parse extensions preserving order so PSK validation can assert
+    %% pre_shared_key is the last extension and capture the binders
+    %% offset for binder verification.
+    case parse_extensions_ordered(Extensions) of
+        {ok, OrderedExts} ->
+            ExtMap = maps:from_list([{T, D} || {T, D, _Off, _Sz} <- OrderedExts]),
 
-            %% Extract SNI
-            ServerName =
-                case maps:find(?EXT_SERVER_NAME, ExtMap) of
-                    {ok, SniData} -> parse_server_name_ext(SniData);
-                    error -> undefined
-                end,
-
-            %% Extract ALPN
-            ALPNProtocols =
-                case maps:find(?EXT_ALPN, ExtMap) of
-                    {ok, AlpnData} -> parse_alpn_ext(AlpnData);
-                    error -> []
-                end,
-
-            %% Extract QUIC transport parameters
-            TransportParams =
-                case maps:find(?EXT_QUIC_TRANSPORT_PARAMS, ExtMap) of
-                    {ok, TpData} ->
-                        case decode_transport_params(TpData) of
-                            {ok, TP} -> TP;
-                            {error, _} -> #{}
-                        end;
-                    error ->
-                        #{}
-                end,
-
-            %% Extract pre_shared_key extension (for resumption)
-            PSK =
-                case maps:find(?EXT_PRE_SHARED_KEY, ExtMap) of
-                    {ok, PskData} -> parse_pre_shared_key_ext(PskData);
-                    error -> undefined
-                end,
-
-            %% Extract early_data extension (client wants to send 0-RTT)
-            EarlyData = maps:is_key(?EXT_EARLY_DATA, ExtMap),
-
-            {ok, #{
-                random => Random,
-                session_id => SessionId,
-                cipher_suites => Ciphers,
-                extensions => ExtMap,
-                key_share => KeyShare,
-                server_name => ServerName,
-                alpn_protocols => ALPNProtocols,
-                transport_params => TransportParams,
-                pre_shared_key => PSK,
-                early_data => EarlyData
-            }};
+            %% Validate pre_shared_key placement (must be last per RFC 8446 §4.2.11).
+            case validate_psk_extension_placement(OrderedExts) of
+                ok ->
+                    finalise_client_hello(
+                        Random, SessionId, Ciphers, OrderedExts, ExtMap, Extensions
+                    );
+                {error, _} = Err ->
+                    Err
+            end;
         {error, Reason} ->
             {error, Reason}
     end;
@@ -1052,6 +1106,310 @@ parse_pre_shared_key_ext(
 parse_pre_shared_key_ext(_) ->
     undefined.
 
+%% @private
+%% Reject ClientHellos where pre_shared_key is not the final extension
+%% (RFC 8446 §4.2.11). Mapping `{error, psk_not_last}` to an
+%% illegal_parameter alert is the caller's responsibility.
+validate_psk_extension_placement(OrderedExts) ->
+    case lists:reverse(OrderedExts) of
+        [] ->
+            ok;
+        [{Last, _, _, _} | RestRev] ->
+            case lists:keyfind(?EXT_PRE_SHARED_KEY, 1, RestRev) of
+                false when Last =:= ?EXT_PRE_SHARED_KEY -> ok;
+                false -> ok;
+                _Found -> {error, psk_not_last}
+            end
+    end.
+
+%% @private
+%% Continue building the ClientHello map once extension order has
+%% been validated. Captures the binders-section offset *within the
+%% extensions blob* so the caller can compute the truncated
+%% ClientHello for binder verification.
+finalise_client_hello(Random, SessionId, Ciphers, OrderedExts, ExtMap, ExtBlob) ->
+    KeyShare =
+        case maps:find(?EXT_KEY_SHARE, ExtMap) of
+            {ok, KsData} -> parse_client_key_shares(KsData);
+            error -> undefined
+        end,
+    ServerName =
+        case maps:find(?EXT_SERVER_NAME, ExtMap) of
+            {ok, SniData} -> parse_server_name_ext(SniData);
+            error -> undefined
+        end,
+    ALPNProtocols =
+        case maps:find(?EXT_ALPN, ExtMap) of
+            {ok, AlpnData} -> parse_alpn_ext(AlpnData);
+            error -> []
+        end,
+    TransportParams =
+        case maps:find(?EXT_QUIC_TRANSPORT_PARAMS, ExtMap) of
+            {ok, TpData} ->
+                case decode_transport_params(TpData) of
+                    {ok, TP} -> TP;
+                    {error, _} -> #{}
+                end;
+            error ->
+                #{}
+        end,
+    PSK =
+        case maps:find(?EXT_PRE_SHARED_KEY, ExtMap) of
+            {ok, PskData} -> parse_pre_shared_key_ext(PskData);
+            error -> undefined
+        end,
+    PskModes =
+        case maps:find(?EXT_PSK_KEY_EXCHANGE_MODES, ExtMap) of
+            {ok, ModesData} -> parse_psk_modes_ext(ModesData);
+            error -> []
+        end,
+    EarlyData = maps:is_key(?EXT_EARLY_DATA, ExtMap),
+
+    %% Binders-section offset within the extension data of the PSK
+    %% extension, plus the absolute offset within ExtBlob. The
+    %% caller combines these with the handshake-message header to
+    %% truncate the ClientHello for binder verification.
+    PskBinders = psk_binders_offset(OrderedExts, ExtBlob),
+
+    {ok, #{
+        random => Random,
+        session_id => SessionId,
+        cipher_suites => Ciphers,
+        extensions => ExtMap,
+        ordered_extensions => OrderedExts,
+        key_share => KeyShare,
+        server_name => ServerName,
+        alpn_protocols => ALPNProtocols,
+        transport_params => TransportParams,
+        pre_shared_key => PSK,
+        psk_key_exchange_modes => PskModes,
+        psk_binders => PskBinders,
+        early_data => EarlyData
+    }}.
+
+%% @private
+%% Parse the psk_key_exchange_modes extension into a list of atoms.
+%% RFC 8446 §4.2.9: <<Len:8, Modes:Len/binary>>.
+parse_psk_modes_ext(<<Len:8, Modes:Len/binary, _/binary>>) ->
+    [decode_psk_mode(M) || <<M:8>> <= Modes];
+parse_psk_modes_ext(_) ->
+    [].
+
+decode_psk_mode(?PSK_KE_MODE_KE) -> psk_ke;
+decode_psk_mode(?PSK_KE_MODE_DHE_KE) -> psk_dhe_ke;
+decode_psk_mode(Other) -> {unknown, Other}.
+
+%% @private
+%% Locate the pre_shared_key extension and compute the offset (within
+%% the extensions blob) of the binders-length field. Returns a map
+%% `#{ext_offset, binders_offset, binders_size}` or `undefined` if no
+%% PSK was offered.
+psk_binders_offset(OrderedExts, _ExtBlob) ->
+    case lists:keyfind(?EXT_PRE_SHARED_KEY, 1, OrderedExts) of
+        false ->
+            undefined;
+        {?EXT_PRE_SHARED_KEY, PskData, ExtOffset, _ExtSize} ->
+            %% PskData = <<IdentitiesLen:16, Identities..., BindersLen:16, Binders...>>
+            case PskData of
+                <<IdentitiesLen:16, _Identities:IdentitiesLen/binary, BindersLen:16,
+                    _Binders:BindersLen/binary>> ->
+                    %% Header of pre_shared_key extension is type(2)+len(2) = 4 bytes,
+                    %% so the binders-length field sits at:
+                    %%   ext_offset (start of type:16) + 4 (skip header)
+                    %%                                 + 2 (skip IdentitiesLen:16)
+                    %%                                 + IdentitiesLen
+                    BindersOff = ExtOffset + 4 + 2 + IdentitiesLen,
+                    BindersTotal = 2 + BindersLen,
+                    #{
+                        ext_offset => ExtOffset,
+                        binders_offset => BindersOff,
+                        binders_size => BindersTotal
+                    };
+                _ ->
+                    undefined
+            end
+    end.
+
+%% @doc Select a PSK from a ClientHello and verify the binder.
+%%
+%% `ClientHelloMap` is the result of `parse_client_hello/1`.
+%% `FullHandshakeMsg` is the raw 4-byte-headered handshake bytes for
+%%   ClientHello (msg_type + length + body) — needed to compute the
+%%   truncated ClientHello hash for binder verification.
+%% `PskConfig` is `#{psk_callback => Fn | undefined,
+%%                   psks => Map | undefined}`.
+%% `ServerModes` is the list of psk_key_exchange modes the server is
+%%   willing to negotiate (defaults to `[psk_dhe_ke]`).
+%%
+%% Returns:
+%%   `{ok, #{identity_idx => N, secret => Secret, mode => Mode}}` on
+%%   successful selection (identity found, binder verified, modes
+%%   compatible);
+%%   `none` when the client didn't offer pre_shared_key OR offered
+%%   identities don't match local config OR no compatible mode
+%%   (caller falls through to cert path or sends
+%%   unknown_psk_identity);
+%%   `{error, bad_binder}` when an identity matched but the binder
+%%   didn't verify — caller MUST send decrypt_error (no cert fallback).
+-spec select_psk(map(), binary(), map(), [psk_dhe_ke | psk_ke]) ->
+    {ok, map()} | none | {error, bad_binder}.
+select_psk(#{pre_shared_key := undefined}, _FullMsg, _PskConfig, _ServerModes) ->
+    none;
+select_psk(#{pre_shared_key := #{identities := []}}, _FullMsg, _PskConfig, _ServerModes) ->
+    none;
+select_psk(
+    #{
+        pre_shared_key := #{identities := Identities, binders := Binders},
+        psk_key_exchange_modes := ClientModes,
+        psk_binders := PskBindersInfo,
+        cipher_suites := CipherSuites
+    },
+    FullHandshakeMsg,
+    PskConfig,
+    ServerModes
+) ->
+    case mode_intersection(ClientModes, ServerModes) of
+        [] ->
+            none;
+        [SelectedMode | _] ->
+            Cipher = select_cipher(CipherSuites),
+            TruncatedHash = truncated_client_hello_hash(
+                FullHandshakeMsg, PskBindersInfo, Cipher
+            ),
+            try_psk_identities(
+                Identities,
+                Binders,
+                0,
+                PskConfig,
+                SelectedMode,
+                Cipher,
+                TruncatedHash
+            )
+    end;
+select_psk(_, _, _, _) ->
+    none.
+
+mode_intersection(Client, Server) ->
+    [M || M <- Client, lists:member(M, Server)].
+
+select_cipher(CipherSuites) ->
+    case lists:member(?TLS_AES_128_GCM_SHA256, CipherSuites) of
+        true -> aes_128_gcm;
+        false -> aes_128_gcm
+    end.
+
+%% @private
+%% Slice the full handshake bytes down to the truncated ClientHello
+%% and compute its transcript hash.
+truncated_client_hello_hash(FullHandshakeMsg, #{binders_offset := BindersOffInExt}, Cipher) ->
+    %% Handshake header = 4 bytes (msg_type:8, length:24).
+    %% After that comes the body: legacy_version(2) + random(32) +
+    %% session_id(1+N) + cipher_suites(2+N) + compression(1+N) +
+    %% extensions(2+N). The binders offset is relative to the start
+    %% of the extensions blob, so we need the absolute offset within
+    %% FullHandshakeMsg.
+    <<_MsgType:8, _Len:24, Body/binary>> = FullHandshakeMsg,
+    ExtBlobOffsetInBody = extensions_offset_in_body(Body),
+    AbsoluteBindersOff = 4 + ExtBlobOffsetInBody + BindersOffInExt,
+    <<TruncatedBytes:AbsoluteBindersOff/binary, _/binary>> = FullHandshakeMsg,
+    %% Rebuild handshake header with the truncated length per RFC 8446
+    %% §4.2.11.2 — the length reflects the truncated body.
+    TruncatedBodyLen = AbsoluteBindersOff - 4,
+    <<MsgType:8, _:24, TruncBody/binary>> = TruncatedBytes,
+    Rewrapped = <<MsgType:8, TruncatedBodyLen:24, TruncBody/binary>>,
+    quic_crypto:transcript_hash(Cipher, Rewrapped).
+
+%% @private — find where the extensions blob starts within a
+%% ClientHello body.
+extensions_offset_in_body(
+    <<_LegacyVersion:16, _Random:32/binary, SessionIdLen:8, _SessionId:SessionIdLen/binary,
+        CipherSuitesLen:16, _CipherSuites:CipherSuitesLen/binary, CompressionLen:8,
+        _Compression:CompressionLen/binary, _ExtLen:16, _/binary>>
+) ->
+    2 + 32 + 1 + SessionIdLen + 2 + CipherSuitesLen + 1 + CompressionLen + 2.
+
+try_psk_identities([], _Binders, _Idx, _PskConfig, _Mode, _Cipher, _TruncatedHash) ->
+    none;
+try_psk_identities(
+    [{Identity, _Age} | RestIds],
+    [Binder | RestBinders],
+    Idx,
+    PskConfig,
+    Mode,
+    Cipher,
+    TruncatedHash
+) ->
+    case lookup_psk_secret(Identity, PskConfig) of
+        {ok, Secret} ->
+            case verify_psk_binder(Secret, Cipher, TruncatedHash, Binder) of
+                true ->
+                    {ok, #{
+                        identity_idx => Idx,
+                        identity => Identity,
+                        secret => Secret,
+                        mode => Mode
+                    }};
+                false ->
+                    %% Identity matched but binder failed: per plan rule
+                    %% 3, this is fatal — no cert-path fallback.
+                    {error, bad_binder}
+            end;
+        not_found ->
+            try_psk_identities(
+                RestIds,
+                RestBinders,
+                Idx + 1,
+                PskConfig,
+                Mode,
+                Cipher,
+                TruncatedHash
+            )
+    end;
+try_psk_identities(_, _, _, _, _, _, _) ->
+    none.
+
+lookup_psk_secret(Identity, #{psk_callback := Fn} = Config) when is_function(Fn, 1) ->
+    case safe_callback(Fn, Identity) of
+        {ok, Secret} when is_binary(Secret) ->
+            {ok, Secret};
+        _ ->
+            lookup_in_psk_map(Identity, Config)
+    end;
+lookup_psk_secret(Identity, Config) ->
+    lookup_in_psk_map(Identity, Config).
+
+lookup_in_psk_map(Identity, #{psks := Map}) when is_map(Map) ->
+    case maps:find(Identity, Map) of
+        {ok, Secret} when is_binary(Secret) -> {ok, Secret};
+        _ -> not_found
+    end;
+lookup_in_psk_map(_Identity, _) ->
+    not_found.
+
+safe_callback(Fn, Identity) ->
+    try Fn(Identity) of
+        Result -> Result
+    catch
+        Class:Reason:Stack ->
+            logger:warning(
+                #{
+                    what => psk_callback_failed,
+                    class => Class,
+                    reason => Reason,
+                    stack => Stack
+                },
+                #{domain => [erlang_quic, tls]}
+            ),
+            not_found
+    end.
+
+verify_psk_binder(Secret, Cipher, TruncatedHash, OfferedBinder) ->
+    EarlySecret = quic_crypto:derive_early_secret(Cipher, Secret),
+    Expected = quic_crypto:compute_psk_binder(
+        Cipher, EarlySecret, TruncatedHash, external
+    ),
+    crypto:hash_equals(Expected, OfferedBinder).
+
 parse_psk_identities(<<>>) ->
     [];
 parse_psk_identities(
@@ -1068,17 +1426,35 @@ parse_psk_binders(<<BinderLen:8, Binder:BinderLen/binary, Rest/binary>>) ->
 parse_psk_binders(_) ->
     [].
 
-build_server_hello_extensions(PubKey, _Opts) ->
+build_server_hello_extensions(PubKey, Opts) ->
     %% Supported versions extension (mandatory for TLS 1.3)
     SupportedVersions = encode_extension(?EXT_SUPPORTED_VERSIONS, <<?TLS_VERSION_1_3:16>>),
 
-    %% Key share extension
-    KeyShare = encode_extension(
-        ?EXT_KEY_SHARE,
-        <<?GROUP_X25519:16, 32:16, PubKey:32/binary>>
-    ),
+    %% Key share extension — included for psk_dhe_ke and standard
+    %% handshakes; omitted for psk_ke (PSK-only, no DHE per RFC 8446
+    %% §4.2.9).
+    KeyShare =
+        case maps:get(selected_psk_mode, Opts, undefined) of
+            psk_ke ->
+                <<>>;
+            _ ->
+                encode_extension(
+                    ?EXT_KEY_SHARE,
+                    <<?GROUP_X25519:16, 32:16, PubKey:32/binary>>
+                )
+        end,
 
-    <<SupportedVersions/binary, KeyShare/binary>>.
+    %% pre_shared_key extension echo when a PSK was selected
+    %% (RFC 8446 §4.2.11 — ServerHello carries just selected_identity).
+    PskExt =
+        case maps:find(selected_psk_identity, Opts) of
+            {ok, Idx} when is_integer(Idx) ->
+                encode_extension(?EXT_PRE_SHARED_KEY, <<Idx:16>>);
+            _ ->
+                <<>>
+        end,
+
+    <<SupportedVersions/binary, KeyShare/binary, PskExt/binary>>.
 
 build_encrypted_extensions_list(Opts) ->
     %% ALPN extension (if ALPN was negotiated)
