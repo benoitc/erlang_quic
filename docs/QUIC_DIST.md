@@ -113,6 +113,56 @@ halting, the probe asks the target to disconnect it (an RPC of
 reaps the hidden-node entry synchronously rather than waiting on the
 QUIC idle timeout. See `quic_call.sh -h` for the full flag list.
 
+### PSK-only authentication
+
+For closed clusters where running a CA is overkill, dist can
+authenticate via TLS 1.3 external PSK ([RFC 8446 §4.2.11][rfc8446])
+instead of X.509 certs. Configure `psks` and/or `psk_callback` on
+the listener side and `external_psk` on the dialer side.
+
+[rfc8446]: https://www.rfc-editor.org/rfc/rfc8446#section-4.2.11
+
+```erlang
+%% sys.config: every node has the same shared secret
+[
+    {quic, [
+        {dist, [
+            {psks, #{<<"cluster">> => <<"32-byte-shared-secret-...">>}},
+            {external_psk, {<<"cluster">>, <<"32-byte-shared-secret-...">>}},
+            {verify, verify_none},
+            {discovery_module, quic_discovery_static},
+            {nodes, [
+                {'node1@host1', {"192.168.1.1", 4433}},
+                {'node2@host2', {"192.168.1.2", 4433}}
+            ]}
+        ]}
+    ]}
+].
+```
+
+`psks` is a `#{Identity => Secret}` map; both keys and values must
+be binaries. `psk_callback` accepts a literal `fun/1`, a
+`{Module, Function}` tuple, or a `"Module:Function"` string from
+`vm.args`. `external_psk` accepts `{Id, Secret}` (defaults to
+`psk_dhe_ke`) or `{Id, Secret, Modes}`.
+
+`cert_file` / `key_file` may be omitted entirely; a PSK-only
+listener registers without an X.509 chain. Cert and PSK may also
+coexist, in which case the per-handshake selection rules in
+[PSK.md](PSK.md#mixed-cert--psk-servers) apply.
+
+For per-peer overrides (e.g., different identity for different
+target nodes), use `quic_dist:set_connect_options/2`:
+
+```erlang
+ok = quic_dist:set_connect_options(
+    'node2@host2',
+    #{external_psk => {<<"per-peer-id">>, <<"per-peer-secret-...">>}}
+).
+```
+
+Full guide: [PSK.md](PSK.md).
+
 ## Architecture
 
 ### Module Overview

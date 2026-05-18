@@ -424,7 +424,7 @@ load_config() ->
             get_init_arg(register_with_epmd, get_opt(register_with_epmd, DistOpts)),
             false
         ),
-        %% TLS 1.3 external PSK config — see docs/PSK.md
+        %% TLS 1.3 external PSK config (see docs/PSK.md)
         psks = validate_psks(get_opt(psks, DistOpts)),
         psk_callback = parse_psk_callback(
             get_init_arg(psk_callback, get_opt(psk_callback, DistOpts))
@@ -462,7 +462,7 @@ validate_external_psk(Other) ->
     error({bad_config, {external_psk, Other}}).
 
 %% @private
-%% Parse psk_callback config — accepts literal anonymous funs,
+%% Parse psk_callback config. Accepts literal anonymous funs,
 %% {Module, Function} tuples, and "Module:Function" strings from
 %% vm.args. Mirrors parse_auth_callback/1 but for arity-1 funs.
 parse_psk_callback(undefined) ->
@@ -1068,7 +1068,9 @@ ip_to_host(IP) when is_list(IP) ->
 %% defaults that `connect_to_node/7' builds, so callers can override
 %% any key, including `socket_backend' and `socket_adapter' to route
 %% the underlying UDP packets through a custom transport (for example
-%% a MASQUE CONNECT-UDP tunnel).
+%% a MASQUE CONNECT-UDP tunnel), or `external_psk' to authenticate
+%% this peer with a different identity/secret than the cluster-wide
+%% default. See docs/PSK.md for the PSK option shapes.
 %%
 %% The entry is consumed once (the first matching `connect_to_node'
 %% call clears it). Use `clear_connect_options/1' to drop it without

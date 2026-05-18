@@ -105,6 +105,18 @@
 - [x] PSK-based resumption
 - [x] 0-RTT early data
 
+### External PSK (RFC 8446 §4.2.11)
+- [x] `psk_dhe_ke` mode (forward-secret)
+- [x] `psk_ke` mode (no DHE)
+- [x] Server-side binder verification (constant-time)
+- [x] Identity lookup via callback and/or static map
+- [x] Cert + PSK coexistence on the same listener
+- [x] Client downgrade protection
+- [ ] 0-RTT on external PSK (v1 limitation)
+- [ ] `NewSessionTicket` on PSK-auth handshakes (v1 limitation)
+
+See [docs/PSK.md](PSK.md).
+
 ## QUIC Version 2 (RFC 9369)
 
 - [x] Version 2 (0x6b3343cf) support
