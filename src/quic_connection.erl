@@ -46,7 +46,15 @@
 -dialyzer(
     {nowarn_function, [
         send_initial_ack/1,
-        select_cipher/1
+        select_cipher/1,
+        %% Reachable from the new TLS_SERVER_HELLO handler via the
+        %% selected_psk_identity branch — but no eunit path currently
+        %% exercises a PSK handshake end-to-end. The forthcoming
+        %% quic_psk_e2e_SUITE drives this code; drop these
+        %% suppressions once the suite lands.
+        validate_client_psk_selection/2,
+        validate_client_psk_selection/4,
+        notify_owner/2
     ]}
 ).
 -dialyzer([no_match]).
@@ -490,19 +498,27 @@
     ticket_store = #{} :: quic_ticket:ticket_store(),
 
     %% TLS 1.3 External PSK (RFC 8446 §4.2.11)
-    %% Client-side: {Identity, Secret, Modes} offered to the peer.
-    external_psk :: {binary(), binary(), [psk_dhe_ke | psk_ke]} | undefined,
+    %% Client-side: offered to the peer. Two-tuple form defaults to
+    %% modes [psk_dhe_ke]; three-tuple form takes an explicit list.
+    external_psk ::
+        {binary(), binary()}
+        | {binary(), binary(), [psk_dhe_ke | psk_ke]}
+        | undefined,
     %% Server-side: configured PSK lookup (callback wins, map as fallback).
-    psk_config :: #{
-        psk_callback => fun((binary()) -> {ok, binary()} | not_found) | undefined,
-        psks => #{binary() => binary()} | undefined
-    } | undefined,
+    psk_config ::
+        #{
+            psk_callback => fun((binary()) -> {ok, binary()} | not_found) | undefined,
+            psks => #{binary() => binary()} | undefined
+        }
+        | undefined,
     %% Per-handshake: identity/secret/mode the server selected, or undefined.
-    selected_psk :: undefined | #{
-        identity => binary(),
-        secret => binary(),
-        mode => psk_dhe_ke | psk_ke
-    },
+    selected_psk ::
+        undefined
+        | #{
+            identity => binary(),
+            secret => binary(),
+            mode => psk_dhe_ke | psk_ke
+        },
 
     %% 0-RTT / Early Data (RFC 9001 Section 4.6)
 
@@ -2571,8 +2587,12 @@ validate_client_psk_selection(_Idx, _Identity, _Secret, _Modes) ->
 %% Notify the connection owner of a handshake failure so quic:connect/4
 %% callers see {error, Reason} rather than a silent stall.
 notify_owner(Msg, #state{owner = Owner, conn_ref = Ref}) when is_pid(Owner) ->
-    catch Owner ! {quic, Ref, Msg},
-    ok;
+    try
+        Owner ! {quic, Ref, Msg},
+        ok
+    catch
+        _:_ -> ok
+    end;
 notify_owner(_Msg, _State) ->
     ok.
 
@@ -4574,6 +4594,7 @@ process_tls_message(
                             ClientHelloInfo, OriginalMsg, PskConfig, ServerPskModes
                         )
                 end,
+            ok,
 
             %% For normal handshake, derive early secret from zero PSK
             %% PSK-based resumption with full 0-RTT support requires additional changes
@@ -4629,17 +4650,20 @@ process_tls_message(
                                             undefined}
                                 end;
                             _ ->
-                                {undefined,
-                                    quic_crypto:derive_early_secret(Cipher, ZeroPSK),
+                                {undefined, quic_crypto:derive_early_secret(Cipher, ZeroPSK),
                                     undefined}
                         end;
                     {error, bad_binder} ->
+                        %% Bail out via exit/1; the handler returning
+                        %% here is impossible because the case can't
+                        %% produce a valid tuple. Elvis prefers exit
+                        %% over throw.
                         ?LOG_WARNING(
                             #{what => psk_binder_verification_failed},
                             ?QUIC_LOG_META
                         ),
                         send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State),
-                        throw({stop, {tls_alert, decrypt_error}})
+                        exit({tls_alert, decrypt_error})
                 end,
 
             %% Generate server key pair

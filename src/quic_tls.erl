@@ -414,10 +414,11 @@ parse_server_hello(<<
                         session_id => SessionId,
                         extensions => ExtMap
                     },
-                    Result = case SelectedPsk of
-                        undefined -> Base;
-                        Idx2 -> Base#{selected_psk_identity => Idx2}
-                    end,
+                    Result =
+                        case SelectedPsk of
+                            undefined -> Base;
+                            Idx2 -> Base#{selected_psk_identity => Idx2}
+                        end,
                     {ok, Result};
                 Error ->
                     Error
@@ -1149,7 +1150,8 @@ finalise_client_hello(Random, SessionId, Ciphers, OrderedExts, ExtMap, ExtBlob) 
                     {ok, TP} -> TP;
                     {error, _} -> #{}
                 end;
-            error -> #{}
+            error ->
+                #{}
         end,
     PSK =
         case maps:find(?EXT_PRE_SHARED_KEY, ExtMap) of
@@ -1209,8 +1211,8 @@ psk_binders_offset(OrderedExts, _ExtBlob) ->
         {?EXT_PRE_SHARED_KEY, PskData, ExtOffset, _ExtSize} ->
             %% PskData = <<IdentitiesLen:16, Identities..., BindersLen:16, Binders...>>
             case PskData of
-                <<IdentitiesLen:16, _Identities:IdentitiesLen/binary,
-                    BindersLen:16, _Binders:BindersLen/binary>> ->
+                <<IdentitiesLen:16, _Identities:IdentitiesLen/binary, BindersLen:16,
+                    _Binders:BindersLen/binary>> ->
                     %% Header of pre_shared_key extension is type(2)+len(2) = 4 bytes,
                     %% so the binders-length field sits at:
                     %%   ext_offset (start of type:16) + 4 (skip header)
@@ -1275,8 +1277,13 @@ select_psk(
                 FullHandshakeMsg, PskBindersInfo, Cipher
             ),
             try_psk_identities(
-                Identities, Binders, 0,
-                PskConfig, SelectedMode, Cipher, TruncatedHash
+                Identities,
+                Binders,
+                0,
+                PskConfig,
+                SelectedMode,
+                Cipher,
+                TruncatedHash
             )
     end;
 select_psk(_, _, _, _) ->
@@ -1315,19 +1322,22 @@ truncated_client_hello_hash(FullHandshakeMsg, #{binders_offset := BindersOffInEx
 %% @private — find where the extensions blob starts within a
 %% ClientHello body.
 extensions_offset_in_body(
-    <<_LegacyVersion:16, _Random:32/binary,
-      SessionIdLen:8, _SessionId:SessionIdLen/binary,
-      CipherSuitesLen:16, _CipherSuites:CipherSuitesLen/binary,
-      CompressionLen:8, _Compression:CompressionLen/binary,
-      _ExtLen:16, _/binary>>
+    <<_LegacyVersion:16, _Random:32/binary, SessionIdLen:8, _SessionId:SessionIdLen/binary,
+        CipherSuitesLen:16, _CipherSuites:CipherSuitesLen/binary, CompressionLen:8,
+        _Compression:CompressionLen/binary, _ExtLen:16, _/binary>>
 ) ->
     2 + 32 + 1 + SessionIdLen + 2 + CipherSuitesLen + 1 + CompressionLen + 2.
 
 try_psk_identities([], _Binders, _Idx, _PskConfig, _Mode, _Cipher, _TruncatedHash) ->
     none;
 try_psk_identities(
-    [{Identity, _Age} | RestIds], [Binder | RestBinders], Idx,
-    PskConfig, Mode, Cipher, TruncatedHash
+    [{Identity, _Age} | RestIds],
+    [Binder | RestBinders],
+    Idx,
+    PskConfig,
+    Mode,
+    Cipher,
+    TruncatedHash
 ) ->
     case lookup_psk_secret(Identity, PskConfig) of
         {ok, Secret} ->
@@ -1345,8 +1355,15 @@ try_psk_identities(
                     {error, bad_binder}
             end;
         not_found ->
-            try_psk_identities(RestIds, RestBinders, Idx + 1,
-                               PskConfig, Mode, Cipher, TruncatedHash)
+            try_psk_identities(
+                RestIds,
+                RestBinders,
+                Idx + 1,
+                PskConfig,
+                Mode,
+                Cipher,
+                TruncatedHash
+            )
     end;
 try_psk_identities(_, _, _, _, _, _, _) ->
     none.

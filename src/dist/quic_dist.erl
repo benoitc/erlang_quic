@@ -426,20 +426,23 @@ load_config() ->
         ),
         %% TLS 1.3 external PSK config — see docs/PSK.md
         psks = validate_psks(get_opt(psks, DistOpts)),
-        psk_callback = parse_auth_callback(
+        psk_callback = parse_psk_callback(
             get_init_arg(psk_callback, get_opt(psk_callback, DistOpts))
         ),
         external_psk = validate_external_psk(get_opt(external_psk, DistOpts))
     }.
 
 %% @private
-validate_psks(undefined) -> undefined;
+validate_psks(undefined) ->
+    undefined;
 validate_psks(Map) when is_map(Map) ->
     %% Require all keys/values to be binaries; reject loudly so
     %% dist startup fails rather than silently dropping the list.
-    case lists:all(
-        fun({K, V}) -> is_binary(K) andalso is_binary(V) end, maps:to_list(Map)
-    ) of
+    case
+        lists:all(
+            fun({K, V}) -> is_binary(K) andalso is_binary(V) end, maps:to_list(Map)
+        )
+    of
         true -> Map;
         false -> error({bad_config, {psks, malformed_entries}})
     end;
@@ -447,7 +450,8 @@ validate_psks(Other) ->
     error({bad_config, {psks, Other}}).
 
 %% @private
-validate_external_psk(undefined) -> undefined;
+validate_external_psk(undefined) ->
+    undefined;
 validate_external_psk({Id, Secret}) when is_binary(Id), is_binary(Secret) ->
     {Id, Secret};
 validate_external_psk({Id, Secret, Modes}) when
@@ -456,6 +460,26 @@ validate_external_psk({Id, Secret, Modes}) when
     {Id, Secret, Modes};
 validate_external_psk(Other) ->
     error({bad_config, {external_psk, Other}}).
+
+%% @private
+%% Parse psk_callback config — accepts literal anonymous funs,
+%% {Module, Function} tuples, and "Module:Function" strings from
+%% vm.args. Mirrors parse_auth_callback/1 but for arity-1 funs.
+parse_psk_callback(undefined) ->
+    undefined;
+parse_psk_callback({M, F}) when is_atom(M), is_atom(F) ->
+    {M, F};
+parse_psk_callback(F) when is_function(F, 1) ->
+    F;
+parse_psk_callback(Str) when is_list(Str) ->
+    case string:split(Str, ":") of
+        [M, F] when M =/= "", F =/= "" ->
+            {list_to_atom(M), list_to_atom(F)};
+        _ ->
+            undefined
+    end;
+parse_psk_callback(_) ->
+    undefined.
 
 %% @private
 parse_auth_callback(undefined) ->
@@ -725,9 +749,7 @@ load_credentials(#quic_dist_config{} = Config) ->
     case psk_only_credentials_ok(Config) of
         true -> {ok, undefined, undefined, undefined};
         false -> {error, no_credentials}
-    end;
-load_credentials(_) ->
-    {error, no_credentials}.
+    end.
 
 %% @private
 psk_only_credentials_ok(#quic_dist_config{
@@ -740,10 +762,11 @@ psk_only_credentials_ok(_) ->
 %% @private
 %% Add psk_callback and/or psks to a listener Opts map when configured.
 add_psk_listener_opts(Opts, #quic_dist_config{psks = Psks, psk_callback = Cb}) ->
-    Opts1 = case Psks of
-        undefined -> Opts;
-        _ -> Opts#{psks => Psks}
-    end,
+    Opts1 =
+        case Psks of
+            undefined -> Opts;
+            _ -> Opts#{psks => Psks}
+        end,
     case Cb of
         undefined -> Opts1;
         _ -> Opts1#{psk_callback => resolve_psk_callback(Cb)}
