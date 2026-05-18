@@ -109,13 +109,14 @@ should_send_max_data_initially_false_test() ->
     ?assertNot(quic_flow:should_send_max_data(State)).
 
 should_send_max_data_after_threshold_test() ->
-    %% With 50% threshold and initial_max_data=10000
+    %% Threshold encodes window-remaining: 0.75 fires after 25% consumed.
     State = quic_flow:new(#{initial_max_data => 10000}),
-    {ok, S1} = quic_flow:on_data_received(State, 4000),
+    %% 2000 received = 20% consumed, below 25% trigger.
+    {ok, S1} = quic_flow:on_data_received(State, 2000),
     ?assertNot(quic_flow:should_send_max_data(S1)),
 
-    % 6000 total > 50%
-    {ok, S2} = quic_flow:on_data_received(S1, 2000),
+    %% 3000 total > 25% → triggers.
+    {ok, S2} = quic_flow:on_data_received(S1, 1000),
     ?assert(quic_flow:should_send_max_data(S2)).
 
 generate_max_data_test() ->
@@ -190,23 +191,23 @@ full_send_cycle_test() ->
 full_recv_cycle_test() ->
     State = quic_flow:new(#{initial_max_data => 10000}),
 
-    %% Receive some data (less than 50% threshold)
-    {ok, S1} = quic_flow:on_data_received(State, 4000),
+    %% Receive some data (less than 25% consumed = 2500).
+    {ok, S1} = quic_flow:on_data_received(State, 2000),
     ?assertNot(quic_flow:should_send_max_data(S1)),
 
-    %% Receive more, triggering threshold (>50%)
-    {ok, S2} = quic_flow:on_data_received(S1, 2000),
+    %% Receive more, triggering threshold (>25% consumed)
+    {ok, S2} = quic_flow:on_data_received(S1, 1000),
     ?assert(quic_flow:should_send_max_data(S2)),
 
-    %% Generate MAX_DATA
+    %% Generate MAX_DATA — new max = bytes_received + initial_max_data.
     {NewMax, S3} = quic_flow:generate_max_data(S2),
-    % 6000 + 10000
-    ?assertEqual(16000, NewMax),
+    % 3000 + 10000
+    ?assertEqual(13000, NewMax),
     ?assertNot(quic_flow:should_send_max_data(S3)),
 
     %% Can receive more now
     {ok, S4} = quic_flow:on_data_received(S3, 5000),
-    ?assertEqual(11000, quic_flow:bytes_received(S4)).
+    ?assertEqual(8000, quic_flow:bytes_received(S4)).
 
 bidirectional_flow_test() ->
     State = quic_flow:new(#{

@@ -107,7 +107,6 @@
     %% Streams
     control_stream :: non_neg_integer() | undefined,
     data_streams = [] :: [non_neg_integer()],
-    data_stream_idx = 0 :: non_neg_integer(),
 
     %% Receive buffer for control stream (handshake only)
     recv_buffer = <<>> :: binary(),
@@ -115,12 +114,22 @@
     recv_waiters = [] :: [{pid(), reference(), non_neg_integer()}],
 
     %% Pending data stream buffer (for data arriving before connected state)
-    %% This handles the race where peer sends distribution data before we
-    %% have finished transitioning to connected state with input handler
-    pending_data_buffer = <<>> :: binary(),
+    %% Per-stream: framing must NOT interleave bytes from different streams.
+    pending_data_buffers = #{} ::
+        #{StreamId :: non_neg_integer() => binary()},
 
-    %% Send queue for pending messages
-    send_queue = queue:new() :: queue:queue(),
+    %% Send queues for pending messages — per-stream so a backpressure
+    %% stall on one stream cannot let later sends to that stream
+    %% overtake older queued ones.
+    send_queues = #{} ::
+        #{StreamId :: non_neg_integer() => queue:queue(iodata())},
+
+    %% In-flight fragmented messages: maps the SeqId from the FRAGMENT
+    %% header (tag 69 = 'E') to the stream id chosen for the first
+    %% fragment, so every continuation (tag 70 = 'F') of the same
+    %% logical message routes to the same stream.
+    in_flight_fragments = #{} ::
+        #{SeqId :: non_neg_integer() => StreamId :: non_neg_integer()},
 
     %% Supervision
     supervisor :: pid() | undefined,
@@ -547,12 +556,20 @@ connected(
     %% Urgency 0 allows ticks to use control_allowance, bypassing congestion control.
     _ = set_stream_priority(State, 0, ?QUIC_DIST_URGENCY_CONTROL),
     %% Server needs to open data streams for sending distribution data
-    NewState = open_server_data_streams(State),
-    %% Forward any pending data stream content to input handler
-    NewState2 = forward_pending_data(NewState),
-    %% Notify VM we're ready for data
-    erlang:dist_ctrl_get_data_notification(DHandle),
-    {keep_state, NewState2};
+    case open_server_data_streams(State) of
+        {ok, NewState} ->
+            %% Forward any pending data stream content to input handler
+            NewState2 = forward_pending_data(NewState),
+            %% Notify VM we're ready for data
+            erlang:dist_ctrl_get_data_notification(DHandle),
+            {keep_state, NewState2};
+        {error, Reason} ->
+            ?LOG_ERROR(
+                #{what => server_open_data_streams_failed, reason => Reason},
+                ?QUIC_LOG_META
+            ),
+            {stop, {stream_setup_failed, Reason}, State}
+    end;
 connected(enter, _OldState, #state{dhandle = DHandle} = State) when DHandle =/= undefined ->
     %% Client already has data streams, just notify VM we're ready
     %% Forward any pending data stream content to input handler
@@ -562,13 +579,31 @@ connected(enter, _OldState, #state{dhandle = DHandle} = State) when DHandle =/= 
 connected(enter, _OldState, _State) ->
     %% No DHandle (shouldn't happen in normal flow)
     keep_state_and_data;
-%% Handle send in connected state (direct send, not from VM)
-connected({call, From}, {send, Data}, State) ->
-    case do_send_data(Data, State) of
-        {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
+%% Handle send in connected state (direct send, not from VM).
+%% `send/2` is bound to f_send in #hs_data{} and only used by dist_util
+%% during the handshake — under normal post-handshake operation this
+%% handler is unreachable. The function is exported, so route any caller
+%% through the same picker + framing + per-stream queue as the VM path.
+connected({call, From}, {send, DataIO}, State) ->
+    #state{
+        conn = Conn,
+        data_streams = DataStreams,
+        control_stream = Ctrl,
+        in_flight_fragments = Frags
+    } = State,
+    Data = iolist_to_binary(DataIO),
+    case quic_dist_dispatch:pick_stream(Data, DataStreams, Ctrl, Frags) of
+        {{ok, Sid}, Frags1} ->
+            State1 = State#state{in_flight_fragments = Frags1},
+            case try_send(Conn, Sid, Data, State1) of
+                {ok, State2} ->
+                    {keep_state, State2, [{reply, From, ok}]};
+                {queued, State2} ->
+                    {keep_state, State2, [{reply, From, ok}]}
+            end;
+        {{fatal, Why}, _} ->
+            log_routing_fatal(Why, Data),
+            exit({dist_routing_fatal, Why})
     end;
 %% Handle recv in connected state (for backward compatibility)
 connected({call, From}, {recv, Length}, State) ->
@@ -590,7 +625,7 @@ connected(cast, tick, #state{dhandle = DHandle, conn = Conn} = State) when
     DHandle =/= undefined
 ->
     %% Try to drain any pending send queue first
-    State1 = drain_send_queue(State),
+    State1 = drain_send_queues(State),
     %% Send tick frame - track if it fails
     State2 = do_send_tick_frame(State1),
     %% Then try to flush some data if not congested (best effort)
@@ -617,7 +652,7 @@ connected(
     DHandle =/= undefined
 ->
     %% First drain any pending send queue
-    State1 = drain_send_queue(State),
+    State1 = drain_send_queues(State),
     %% Also retry pending tick if any
     State2 = maybe_retry_pending_tick(State1),
     case quic:get_send_queue_info(Conn) of
@@ -647,7 +682,7 @@ connected(
     DHandle =/= undefined
 ->
     %% First drain any pending send queue
-    State1 = drain_send_queue(State),
+    State1 = drain_send_queues(State),
     %% Also retry pending tick if any
     State2 = maybe_retry_pending_tick(State1),
     case quic:get_send_queue_info(Conn) of
@@ -714,7 +749,7 @@ handle_common_event({call, From}, getstat, _StateName, #state{conn = Conn} = Sta
                 %% Fallback to application-level counts if get_stats fails
                 {State#state.recv_cnt, State#state.send_cnt}
         end,
-    SendPend = queue:len(State#state.send_queue),
+    SendPend = pending_total(State#state.send_queues),
     {keep_state, State, [{reply, From, {ok, RecvCnt, SendCnt, SendPend}}]};
 handle_common_event(
     {call, From},
@@ -904,18 +939,28 @@ open_control_stream(#state{conn = Conn} = State) ->
 
 %% @private
 %% Open data streams for message passing.
+%%
+%% Partial reservation is fatal: the user-stream threshold macros assume
+%% exactly N reserved IDs. If fewer open, subsequent user-stream opens
+%% get IDs below the threshold and are rejected for the connection's
+%% lifetime. Same goes for priority-set failure.
 open_data_streams(State, 0) ->
     {ok, State};
 open_data_streams(#state{conn = Conn, data_streams = Streams} = State, N) ->
     case quic:open_stream(Conn) of
         {ok, StreamId} ->
-            %% Set priority (lower than control, but reasonable)
-            ok = set_stream_priority(State, StreamId, ?QUIC_DIST_URGENCY_DATA_NORMAL),
-            open_data_streams(State#state{data_streams = [StreamId | Streams]}, N - 1);
+            case set_stream_priority(State, StreamId, ?QUIC_DIST_URGENCY_DATA_NORMAL) of
+                ok ->
+                    open_data_streams(
+                        State#state{data_streams = [StreamId | Streams]},
+                        N - 1
+                    );
+                {error, PrioReason} ->
+                    {error,
+                        {set_stream_priority_failed, StreamId, PrioReason, opened, length(Streams)}}
+            end;
         {error, Reason} ->
-            %% Log but continue with available streams
-            ?LOG_WARNING(#{what => open_data_stream_failed, reason => Reason}, ?QUIC_LOG_META),
-            {ok, State}
+            {error, {open_data_stream_failed, Reason, opened, length(Streams)}}
     end.
 
 %% @private
@@ -925,49 +970,56 @@ set_stream_priority(#state{conn = Conn}, StreamId, Urgency) ->
 %% @private
 %% Open server-initiated data streams after handshake.
 %% Server-initiated bidirectional streams have IDs 1, 5, 9, ...
+%% Returns {ok, NewState} | {error, Reason}; the server-enter clause
+%% in connected/3 stops the controller on error.
 open_server_data_streams(State) ->
-    {ok, NewState} = open_data_streams(State, ?QUIC_DIST_DATA_STREAMS),
-    NewState.
+    case open_data_streams(State, ?QUIC_DIST_DATA_STREAMS) of
+        {ok, NewState} -> {ok, NewState};
+        {error, _} = Err -> Err
+    end.
 
 %% @private
 %% Forward any pending data stream content to the input handler.
 %% This handles the race condition where the peer starts sending distribution
 %% data before we've finished processing our handshake_complete message and
 %% transitioning to connected state.
-forward_pending_data(#state{pending_data_buffer = <<>>, input_handler = InputHandler} = State) when
-    is_pid(InputHandler)
-->
-    %% No pending data
-    State;
 forward_pending_data(
-    #state{pending_data_buffer = PendingData, input_handler = InputHandler} = State
-) when
-    is_pid(InputHandler), byte_size(PendingData) > 0
-->
-    %% Forward buffered data to input handler
+    #state{pending_data_buffers = Buffers, input_handler = InputHandler} = State
+) when is_pid(InputHandler), map_size(Buffers) > 0 ->
     ?LOG_INFO(
         #{
             what => forwarding_pending_data,
-            size => byte_size(PendingData)
+            slots => map_size(Buffers),
+            total_size => maps:fold(
+                fun(_, B, A) -> A + byte_size(B) end, 0, Buffers
+            )
         },
         ?QUIC_LOG_META
     ),
-    InputHandler ! {dist_data, PendingData},
-    State#state{pending_data_buffer = <<>>};
-forward_pending_data(#state{pending_data_buffer = PendingData} = State) when
-    byte_size(PendingData) > 0
+    maps:foreach(
+        fun
+            (Sid, B) when byte_size(B) > 0 ->
+                InputHandler ! {dist_data, Sid, B};
+            (_, _) ->
+                ok
+        end,
+        Buffers
+    ),
+    State#state{pending_data_buffers = #{}};
+forward_pending_data(#state{pending_data_buffers = Buffers} = State) when
+    map_size(Buffers) > 0
 ->
-    %% No input handler yet - this shouldn't happen but log warning
+    %% No input handler yet — this shouldn't happen but warn.
     ?LOG_WARNING(
         #{
             what => pending_data_no_handler,
-            size => byte_size(PendingData)
+            slots => map_size(Buffers)
         },
         ?QUIC_LOG_META
     ),
     State;
 forward_pending_data(State) ->
-    %% No pending data and no handler
+    %% No pending data.
     State.
 
 %%====================================================================
@@ -1000,41 +1052,6 @@ do_send_control(
         Error ->
             Error
     end.
-
-%% @private
-%% Send data on a data stream (round-robin).
-%% Note: No framing needed - dist_util handles its own protocol framing.
-do_send_data(
-    Data,
-    #state{
-        conn = Conn,
-        data_streams = Streams,
-        data_stream_idx = Idx,
-        send_cnt = SendCnt,
-        send_oct = SendOct
-    } = State
-) when Streams =/= [] ->
-    %% Select stream via round-robin
-    StreamId = lists:nth((Idx rem length(Streams)) + 1, Streams),
-
-    DataBin = iolist_to_binary(Data),
-    Len = byte_size(DataBin),
-
-    case quic:send_data(Conn, StreamId, DataBin, false) of
-        ok ->
-            Now = erlang:monotonic_time(millisecond),
-            {ok, State#state{
-                data_stream_idx = Idx + 1,
-                send_cnt = SendCnt + 1,
-                send_oct = SendOct + Len,
-                last_send_time = Now
-            }};
-        Error ->
-            Error
-    end;
-%% Fall back to control stream if no data streams
-do_send_data(Data, State) ->
-    do_send_control(Data, State).
 
 %% @private
 %% Send tick frame on control stream with QUIC PING for reliability.
@@ -1114,141 +1131,192 @@ maybe_retry_pending_tick(#state{pending_tick = true} = State) ->
 %% @private
 %% Send distribution data from VM via QUIC with backpressure.
 %% Called when dist_data notification is received.
-%% First drains any pending send_queue, then pulls from VM.
-%% Returns updated state (with any unsent data buffered in send_queue).
+%% Each message returned by dist_ctrl_get_data/1 is routed to a stream
+%% by quic_dist_dispatch:pick_stream/4 — fragments of the same logical
+%% message stay on the same stream via the in_flight_fragments map.
 send_dist_data_limited(
     #state{
         dhandle = DHandle,
         conn = Conn,
-        data_streams = [FirstStream | _],
+        data_streams = DataStreams,
         max_pull = MaxPull
     } = State
-) ->
-    %% Use first data stream for all distribution data to maintain ordering
-    send_dist_data_limited_loop(DHandle, Conn, FirstStream, MaxPull, State);
-send_dist_data_limited(
-    #state{
-        dhandle = DHandle,
-        conn = Conn,
-        control_stream = CtrlStream,
-        max_pull = MaxPull
-    } = State
-) ->
-    %% Fallback: no data streams, use control stream
-    send_dist_data_limited_loop(DHandle, Conn, CtrlStream, MaxPull, State).
+) when DataStreams =/= [] ->
+    send_dist_data_limited_loop(DHandle, Conn, DataStreams, MaxPull, State);
+send_dist_data_limited(_State) ->
+    %% Setup guarantees N data streams (see open_data_streams/2). A
+    %% post-setup empty pool is an invariant violation — fail loud.
+    exit({dist_routing_fatal, no_data_streams}).
 
 %% @private
-%% Send distribution data with limited pulls per notification.
-%% Buffers unsent data in send_queue instead of dropping it.
-send_dist_data_limited_loop(_DHandle, _Conn, _StreamId, 0, State) ->
-    %% Pulled enough for now
-    State;
-send_dist_data_limited_loop(DHandle, Conn, StreamId, Remaining, State) ->
-    case erlang:dist_ctrl_get_data(DHandle) of
-        none ->
-            State;
-        Data ->
-            case send_one_frame(Conn, StreamId, Data) of
-                ok ->
-                    send_dist_data_limited_loop(DHandle, Conn, StreamId, Remaining - 1, State);
-                {error, send_queue_full} ->
-                    %% Queue full - buffer the data we already pulled
-                    enqueue_send_data(Data, State);
-                {error, {flow_control_blocked, _}} ->
-                    %% Flow control blocked - buffer the data we already pulled
-                    enqueue_send_data(Data, State);
-                {error, _} ->
-                    %% Other error - continue trying (don't lose the data)
-                    send_dist_data_limited_loop(DHandle, Conn, StreamId, Remaining - 1, State)
-            end
-    end.
-
-%% @private
-%% Send distribution data during tick callback.
-%% Used by tick handler to flush limited data (best effort, not blocking).
-%% Respects max_pull to prevent unbounded loop during tick callback.
-%% Returns updated state with any unsent data buffered.
-send_dist_data_with_tick(
-    #state{
-        dhandle = DHandle,
-        conn = Conn,
-        data_streams = [FirstStream | _],
-        max_pull = MaxPull
-    } = State
-) ->
-    send_dist_data_loop_tick(DHandle, Conn, FirstStream, MaxPull, State);
-send_dist_data_with_tick(
-    #state{
-        dhandle = DHandle,
-        conn = Conn,
-        control_stream = CtrlStream,
-        max_pull = MaxPull
-    } = State
-) ->
-    send_dist_data_loop_tick(DHandle, Conn, CtrlStream, MaxPull, State).
-
-%% @private
-%% Send distribution data with pull limit to prevent tick callback blocking.
-%% Buffers unsent data in send_queue instead of dropping it.
-send_dist_data_loop_tick(_DHandle, _Conn, _StreamId, 0, State) ->
-    %% Reached pull limit - stop to avoid blocking tick callback
-    State;
-send_dist_data_loop_tick(DHandle, Conn, StreamId, Remaining, State) ->
-    case erlang:dist_ctrl_get_data(DHandle) of
-        none ->
-            State;
-        Data ->
-            case send_one_frame(Conn, StreamId, Data) of
-                ok ->
-                    send_dist_data_loop_tick(DHandle, Conn, StreamId, Remaining - 1, State);
-                {error, send_queue_full} ->
-                    %% Queue full - buffer the data we already pulled
-                    enqueue_send_data(Data, State);
-                {error, {flow_control_blocked, _}} ->
-                    %% Flow control blocked - buffer the data we already pulled
-                    enqueue_send_data(Data, State);
-                {error, _} ->
-                    %% Other error - stop trying but don't lose data
-                    enqueue_send_data(Data, State)
-            end
-    end.
-
-%% @private
-%% Enqueue data that couldn't be sent due to backpressure.
-enqueue_send_data(Data, #state{send_queue = Queue} = State) ->
-    State#state{send_queue = queue:in(Data, Queue)}.
-
-%% @private
-%% Drain the send queue - try to send any buffered data.
-%% Returns updated state with remaining unsent data in queue.
-drain_send_queue(
-    #state{send_queue = Queue, conn = Conn, data_streams = [FirstStream | _]} = State
-) ->
-    drain_send_queue_loop(Queue, Conn, FirstStream, State);
-drain_send_queue(
-    #state{send_queue = Queue, conn = Conn, control_stream = CtrlStream} = State
-) when
-    CtrlStream =/= undefined
+%% Send up to Remaining messages from the VM, routing each to its
+%% target stream. Buffers unsent data in send_queues on backpressure.
+send_dist_data_limited_loop(_DHandle, _Conn, _Streams, Remaining, State) when
+    Remaining =< 0
 ->
-    drain_send_queue_loop(Queue, Conn, CtrlStream, State);
-drain_send_queue(State) ->
+    State;
+send_dist_data_limited_loop(DHandle, Conn, Streams, Remaining, State) ->
+    case erlang:dist_ctrl_get_data(DHandle) of
+        none ->
+            State;
+        DataIO ->
+            %% dist_ctrl_get_data/1 returns iovec form (or {Size, Iovec});
+            %% flatten so the dispatcher can pattern-match on the leading
+            %% bytes.
+            Data = iolist_to_binary(payload_bytes(DataIO)),
+            #state{control_stream = Ctrl, in_flight_fragments = Frags} = State,
+            case quic_dist_dispatch:pick_stream(Data, Streams, Ctrl, Frags) of
+                {{ok, Sid}, Frags1} ->
+                    State1 = State#state{in_flight_fragments = Frags1},
+                    case try_send(Conn, Sid, Data, State1) of
+                        {ok, State2} ->
+                            send_dist_data_limited_loop(
+                                DHandle, Conn, Streams, Remaining - 1, State2
+                            );
+                        {queued, State2} ->
+                            send_dist_data_limited_loop(
+                                DHandle, Conn, Streams, Remaining - 1, State2
+                            )
+                    end;
+                {{fatal, Why}, _} ->
+                    log_routing_fatal(Why, Data),
+                    exit({dist_routing_fatal, Why})
+            end
+    end.
+
+%% @private
+%% dist_ctrl_get_data/1 may return `Data` (iovec) or `{Size, Data}'
+%% (iovec with precomputed size); peel the size off.
+payload_bytes({_Size, Data}) -> Data;
+payload_bytes(Data) -> Data.
+
+%% @private
+%% Send distribution data during tick callback. Same routing as
+%% send_dist_data_limited but with a tighter pull budget so the tick
+%% doesn't block.
+send_dist_data_with_tick(
+    #state{
+        dhandle = DHandle,
+        conn = Conn,
+        data_streams = DataStreams,
+        max_pull = MaxPull
+    } = State
+) when DataStreams =/= [] ->
+    send_dist_data_loop_tick(DHandle, Conn, DataStreams, MaxPull, State);
+send_dist_data_with_tick(State) ->
+    %% No data streams reserved yet — skip (tick is best-effort).
     State.
 
-drain_send_queue_loop(Queue, Conn, StreamId, State) ->
-    case queue:out(Queue) of
-        {empty, _} ->
-            State#state{send_queue = Queue};
-        {{value, Data}, RestQueue} ->
-            case send_one_frame(Conn, StreamId, Data) of
-                ok ->
-                    %% Sent successfully, continue draining
-                    drain_send_queue_loop(RestQueue, Conn, StreamId, State);
-                {error, _} ->
-                    %% Failed to send - put data back and stop
-                    %% (data is already at front since we just dequeued it)
-                    State#state{send_queue = Queue}
+send_dist_data_loop_tick(_DHandle, _Conn, _Streams, Remaining, State) when
+    Remaining =< 0
+->
+    State;
+send_dist_data_loop_tick(DHandle, Conn, Streams, Remaining, State) ->
+    case erlang:dist_ctrl_get_data(DHandle) of
+        none ->
+            State;
+        DataIO ->
+            Data = iolist_to_binary(payload_bytes(DataIO)),
+            #state{control_stream = Ctrl, in_flight_fragments = Frags} = State,
+            case quic_dist_dispatch:pick_stream(Data, Streams, Ctrl, Frags) of
+                {{ok, Sid}, Frags1} ->
+                    State1 = State#state{in_flight_fragments = Frags1},
+                    case try_send(Conn, Sid, Data, State1) of
+                        {ok, State2} ->
+                            send_dist_data_loop_tick(
+                                DHandle, Conn, Streams, Remaining - 1, State2
+                            );
+                        {queued, State2} ->
+                            send_dist_data_loop_tick(
+                                DHandle, Conn, Streams, Remaining - 1, State2
+                            )
+                    end;
+                {{fatal, Why}, _} ->
+                    log_routing_fatal(Why, Data),
+                    exit({dist_routing_fatal, Why})
             end
     end.
+
+%% @private
+%% Try to send Data on StreamId. Returns {ok, State} on success or
+%% {queued, State} if backpressure made us buffer. Fatal send errors
+%% (closed stream, transport error, invalid id) exit the controller —
+%% we must not silently drop dist bytes.
+try_send(Conn, StreamId, Data, State) ->
+    case has_pending(StreamId, State) of
+        true ->
+            {queued, enqueue(StreamId, Data, State)};
+        false ->
+            case send_one_frame(Conn, StreamId, Data) of
+                ok ->
+                    {ok, State};
+                {error, send_queue_full} ->
+                    {queued, enqueue(StreamId, Data, State)};
+                {error, {flow_control_blocked, _}} ->
+                    {queued, enqueue(StreamId, Data, State)};
+                {error, Reason} ->
+                    exit({dist_send_failed, StreamId, Reason})
+            end
+    end.
+
+%% @private
+has_pending(StreamId, #state{send_queues = Qs}) ->
+    case maps:get(StreamId, Qs, undefined) of
+        undefined -> false;
+        Q -> not queue:is_empty(Q)
+    end.
+
+%% @private
+enqueue(StreamId, Data, #state{send_queues = Qs} = State) ->
+    Q = maps:get(StreamId, Qs, queue:new()),
+    State#state{send_queues = maps:put(StreamId, queue:in(Data, Q), Qs)}.
+
+%% @private
+%% Drain every per-stream queue, head-first. A blocked head leaves
+%% the whole queue intact so per-pair ordering is preserved.
+drain_send_queues(#state{conn = Conn, send_queues = Qs} = State) ->
+    maps:fold(
+        fun(Sid, Q, S0) -> drain_one(Conn, Sid, Q, S0) end,
+        State,
+        Qs
+    ).
+
+drain_one(Conn, Sid, Q, #state{send_queues = Qs} = State) ->
+    case queue:out(Q) of
+        {empty, _} ->
+            %% Fully drained — remove the entry.
+            State#state{send_queues = maps:remove(Sid, Qs)};
+        {{value, Data}, Rest} ->
+            case send_one_frame(Conn, Sid, Data) of
+                ok ->
+                    drain_one(Conn, Sid, Rest, State);
+                {error, send_queue_full} ->
+                    %% Backpressure: leave full queue in place so later
+                    %% sends to Sid keep enqueueing behind it.
+                    State#state{send_queues = maps:put(Sid, Q, Qs)};
+                {error, {flow_control_blocked, _}} ->
+                    State#state{send_queues = maps:put(Sid, Q, Qs)};
+                {error, Reason} ->
+                    %% Fatal: closed stream, transport error, invalid id.
+                    exit({dist_drain_failed, Sid, Reason})
+            end
+    end.
+
+%% @private
+pending_total(SendQueues) ->
+    maps:fold(fun(_, Q, Acc) -> Acc + queue:len(Q) end, 0, SendQueues).
+
+%% @private
+log_routing_fatal(Reason, Data) ->
+    Head = binary:part(Data, 0, min(32, byte_size(Data))),
+    ?LOG_WARNING(
+        #{
+            what => dist_routing_fatal,
+            reason => Reason,
+            first_bytes => Head
+        },
+        ?QUIC_LOG_META
+    ).
 
 %% @private
 %% Send a single framed message.
@@ -1281,48 +1349,36 @@ send_one_frame(Conn, StreamId, Data) ->
 %% Passing partial messages causes "corrupted distribution header" errors.
 input_handler_loop(DHandle, Controller, Conn, ControlStream) ->
     input_handler_loop(
-        DHandle, Controller, Conn, ControlStream, <<>>, fun erlang:dist_ctrl_put_data/2
+        DHandle, Controller, Conn, ControlStream, #{}, fun erlang:dist_ctrl_put_data/2
     ).
 
-input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffer, Deliver) ->
+%% Buffers :: #{StreamId :: non_neg_integer() => binary()}
+%% Each dist stream has its own framing buffer; inter-stream delivery
+%% order is free under the atom-cache-off handshake (each message is
+%% self-contained).
+input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffers, Deliver) ->
     receive
-        continue_delivery ->
-            %% Resume processing whatever is already in Buffer after a
-            %% prior batch yield.
-            case deliver_complete_messages(DHandle, Buffer, ?INPUT_HANDLER_BATCH_SIZE, Deliver) of
-                {ok, RemainingBuffer} ->
+        {continue_delivery, Sid} ->
+            B0 = maps:get(Sid, Buffers, <<>>),
+            case deliver_complete_messages(DHandle, B0, ?INPUT_HANDLER_BATCH_SIZE, Deliver, Sid) of
+                {ok, Remaining} ->
+                    Buffers1 = update_buffer(Sid, Remaining, Buffers),
                     input_handler_loop(
-                        DHandle, Controller, Conn, ControlStream, RemainingBuffer, Deliver
+                        DHandle, Controller, Conn, ControlStream, Buffers1, Deliver
                     );
                 {error, _Reason} ->
                     exit(normal)
             end;
-        {dist_data, Data} ->
-            NewBuffer = <<Buffer/binary, Data/binary>>,
-            case
-                deliver_complete_messages(DHandle, NewBuffer, ?INPUT_HANDLER_BATCH_SIZE, Deliver)
-            of
-                {ok, RemainingBuffer} ->
-                    input_handler_loop(
-                        DHandle, Controller, Conn, ControlStream, RemainingBuffer, Deliver
-                    );
-                {error, _Reason} ->
-                    exit(normal)
-            end;
+        {dist_data, Sid, Data} ->
+            input_handle_chunk(
+                DHandle, Controller, Conn, ControlStream, Buffers, Deliver, Sid, Data
+            );
         {'EXIT', Controller, Reason} ->
             exit(Reason);
-        {quic, Conn, {stream_data, _StreamId, Data, _Fin}} ->
-            NewBuffer = <<Buffer/binary, Data/binary>>,
-            case
-                deliver_complete_messages(DHandle, NewBuffer, ?INPUT_HANDLER_BATCH_SIZE, Deliver)
-            of
-                {ok, RemainingBuffer} ->
-                    input_handler_loop(
-                        DHandle, Controller, Conn, ControlStream, RemainingBuffer, Deliver
-                    );
-                {error, _Reason} ->
-                    exit(normal)
-            end;
+        {quic, Conn, {stream_data, Sid, Data, _Fin}} ->
+            input_handle_chunk(
+                DHandle, Controller, Conn, ControlStream, Buffers, Deliver, Sid, Data
+            );
         {quic, Conn, {closed, _Reason}} ->
             exit(normal);
         Other ->
@@ -1330,8 +1386,26 @@ input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffer, Deliver) ->
                 #{what => input_handler_unexpected_msg, msg => Other},
                 ?QUIC_LOG_META
             ),
-            input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffer, Deliver)
+            input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffers, Deliver)
     end.
+
+%% @private
+input_handle_chunk(DHandle, Controller, Conn, ControlStream, Buffers, Deliver, Sid, Data) ->
+    B0 = maps:get(Sid, Buffers, <<>>),
+    B1 = <<B0/binary, Data/binary>>,
+    case deliver_complete_messages(DHandle, B1, ?INPUT_HANDLER_BATCH_SIZE, Deliver, Sid) of
+        {ok, Remaining} ->
+            Buffers1 = update_buffer(Sid, Remaining, Buffers),
+            input_handler_loop(
+                DHandle, Controller, Conn, ControlStream, Buffers1, Deliver
+            );
+        {error, _Reason} ->
+            exit(normal)
+    end.
+
+%% @private
+update_buffer(Sid, <<>>, Buffers) -> maps:remove(Sid, Buffers);
+update_buffer(Sid, Bin, Buffers) -> maps:put(Sid, Bin, Buffers).
 
 %% @private
 %% Deliver complete messages to the VM with batch limiting.
@@ -1344,20 +1418,28 @@ input_handler_loop(DHandle, Controller, Conn, ControlStream, Buffer, Deliver) ->
 -ifdef(TEST).
 %% Test-only /3 convenience, exercised by
 %% `quic_dist_controller_tests:deliver_yield_returns_remainder_test/0'.
-%% Production code calls the /4 arity directly.
+%% Production code calls the /5 arity (which threads StreamId for the
+%% continue_delivery yield).
 deliver_complete_messages(DHandle, Buffer, Remaining) ->
     deliver_complete_messages(DHandle, Buffer, Remaining, fun erlang:dist_ctrl_put_data/2).
 -endif.
 
-deliver_complete_messages(_DHandle, Buffer, 0, _Deliver) ->
-    self() ! continue_delivery,
-    {ok, Buffer};
+%% Backwards-compatible /4 entry (test only): uses a sentinel stream
+%% id for the yield message. Production code calls the /5 arity.
+-ifdef(TEST).
 deliver_complete_messages(DHandle, Buffer, Remaining, Deliver) ->
+    deliver_complete_messages(DHandle, Buffer, Remaining, Deliver, no_stream).
+-endif.
+
+deliver_complete_messages(_DHandle, Buffer, 0, _Deliver, Sid) ->
+    self() ! {continue_delivery, Sid},
+    {ok, Buffer};
+deliver_complete_messages(DHandle, Buffer, Remaining, Deliver, Sid) ->
     case Buffer of
         <<0:32/big-unsigned, Rest/binary>> ->
             %% Empty frame = tick signal - just continue (ticks don't count against batch limit)
             logger:debug(#{what => tick_frame_received}, ?QUIC_LOG_META),
-            deliver_complete_messages(DHandle, Rest, Remaining, Deliver);
+            deliver_complete_messages(DHandle, Rest, Remaining, Deliver, Sid);
         <<Length:32/big-unsigned, Rest/binary>> when byte_size(Rest) >= Length ->
             %% We have a complete message - extract payload only
             <<Payload:Length/binary, Tail/binary>> = Rest,
@@ -1375,7 +1457,7 @@ deliver_complete_messages(DHandle, Buffer, Remaining, Deliver) ->
                 %% `erlang:dist_ctrl_put_data/2'; tests inject a fn
                 %% that records payloads for assertion.
                 Deliver(DHandle, Payload),
-                deliver_complete_messages(DHandle, Tail, Remaining - 1, Deliver)
+                deliver_complete_messages(DHandle, Tail, Remaining - 1, Deliver, Sid)
             catch
                 Class:Reason ->
                     logger:error(
@@ -1529,39 +1611,44 @@ handle_stream_data(
             %% User stream - route to owner or acceptor
             handle_user_stream_data(StreamId, Data, false, State);
         false ->
-            %% Distribution data stream - forward to input handler
-            InputHandler ! {dist_data, Data},
+            %% Distribution data stream — forward to input handler
+            %% tagged with the stream id so per-stream framing is
+            %% maintained.
+            InputHandler ! {dist_data, StreamId, Data},
             {keep_state, State#state{
                 recv_cnt = RecvCnt + 1,
                 recv_oct = RecvOct + byte_size(Data)
             }}
     end;
 handle_stream_data(
-    _StreamId,
+    StreamId,
     Data,
     _StateName,
     #state{
-        pending_data_buffer = PendingBuffer,
+        pending_data_buffers = Buffers,
         recv_cnt = RecvCnt,
         recv_oct = RecvOct
     } = State
 ) ->
-    %% Data stream content arrived before we transitioned to connected state.
-    %% This can happen due to race condition where peer sends distribution data
-    %% before we've finished processing our handshake_complete message.
-    %% Buffer it separately (NOT in recv_buffer which is for handshake) and
-    %% forward to input handler once we transition to connected state.
+    %% Data stream content arrived before we transitioned to connected.
+    %% Buffer per-stream so multi-stream framing isn't corrupted when
+    %% forward_pending_data flushes on transition.
     ?LOG_DEBUG(
         #{
             what => buffering_early_data_stream,
-            size => byte_size(Data),
-            pending_buffer_size => byte_size(PendingBuffer)
+            stream_id => StreamId,
+            size => byte_size(Data)
         },
         ?QUIC_LOG_META
     ),
-    NewPendingBuffer = <<PendingBuffer/binary, Data/binary>>,
+    NewBuffers = maps:update_with(
+        StreamId,
+        fun(B) -> <<B/binary, Data/binary>> end,
+        Data,
+        Buffers
+    ),
     {keep_state, State#state{
-        pending_data_buffer = NewPendingBuffer,
+        pending_data_buffers = NewBuffers,
         recv_cnt = RecvCnt + 1,
         recv_oct = RecvOct + byte_size(Data)
     }}.
