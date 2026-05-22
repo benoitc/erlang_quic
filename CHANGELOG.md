@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-05-22
+
+### Added
+- TLS 1.3 external PSK (RFC 8446 §4.2.11). Client `external_psk` and server `psks` / `psk_callback` options, both `psk_dhe_ke` and `psk_ke` modes, constant-time server-side binder verification, cert and PSK coexistence on one listener, and client downgrade protection. `quic_dist` can authenticate node-to-node with a shared PSK and no certificates. See `docs/PSK.md`. (#133)
+- TLS 1.3 HelloRetryRequest with multi-group key exchange. The `groups` option advertises `x25519`, `secp256r1` and `secp384r1`; a server that prefers a group the client did not key-share triggers a HelloRetryRequest and the client retries transparently. (#135)
+- Per-handshake signature negotiation via the `signature_algs` option, adding ECDSA secp384r1-SHA384, RSA-PSS-RSAE SHA384/512 and Ed25519 sign/verify. The `connected` event now reports `negotiated_group` and `negotiated_scheme`. (#135)
+- Per-pair multi-stream routing for Erlang distribution over QUIC. Dist messages are hashed by `{From, To}` across 16 streams to send concurrently while preserving order within each sender/receiver pair. (#132)
+- `SECURITY.md` with a private vulnerability reporting policy.
+
+### Changed
+- HTTP/3 header field-character validation inlines the character class into the scanner clause guards, removing a per-byte predicate call from a request hot path. (#136)
+
+### Fixed
+- The server now segments its TLS handshake flight so no datagram exceeds `max_udp_payload_size`. The 3-5 KB flight previously went out as one UDP datagram that clients enforcing their advertised limit (Chromium) dropped, stalling the handshake until idle timeout. (#134, #137)
+- ex_doc generation no longer breaks on a `@doc` tag preceding a `-callback`. (#129)
+
 ## [1.3.3] - 2026-05-03
 
 ### Added
