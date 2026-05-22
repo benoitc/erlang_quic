@@ -2637,37 +2637,40 @@ validate_field_name(<<$:, Rest/binary>>) ->
 validate_field_name(Name) ->
     validate_field_name_chars(Name, Name).
 
+%% The char class is inlined as clause guards so each byte is a single
+%% (tail-recursive) call rather than a call plus a separate predicate;
+%% the common lowercase-letter case matches the first guard immediately.
+%% tchar per RFC 7230 §3.2.6, restricted to lowercase letters.
 validate_field_name_chars(<<>>, Full) ->
     %% empty after ":" is invalid
     case Full of
         <<":">> -> throw({header_error, {invalid_field, Full, <<>>}});
         _ -> ok
     end;
-validate_field_name_chars(<<C, Rest/binary>>, Full) ->
-    case is_tchar_lowercase(C) of
-        true -> validate_field_name_chars(Rest, Full);
-        false -> throw({header_error, {invalid_field, Full, <<>>}})
-    end.
-
-%% tchar per RFC 7230 §3.2.6, restricted to lowercase letters.
-is_tchar_lowercase(C) when C >= $a, C =< $z -> true;
-is_tchar_lowercase(C) when C >= $0, C =< $9 -> true;
-is_tchar_lowercase($!) -> true;
-is_tchar_lowercase($#) -> true;
-is_tchar_lowercase($$) -> true;
-is_tchar_lowercase($%) -> true;
-is_tchar_lowercase($&) -> true;
-is_tchar_lowercase($') -> true;
-is_tchar_lowercase($*) -> true;
-is_tchar_lowercase($+) -> true;
-is_tchar_lowercase($-) -> true;
-is_tchar_lowercase($.) -> true;
-is_tchar_lowercase($^) -> true;
-is_tchar_lowercase($_) -> true;
-is_tchar_lowercase($`) -> true;
-is_tchar_lowercase($|) -> true;
-is_tchar_lowercase($~) -> true;
-is_tchar_lowercase(_) -> false.
+validate_field_name_chars(<<C, Rest/binary>>, Full) when C >= $a, C =< $z ->
+    validate_field_name_chars(Rest, Full);
+validate_field_name_chars(<<C, Rest/binary>>, Full) when C >= $0, C =< $9 ->
+    validate_field_name_chars(Rest, Full);
+validate_field_name_chars(<<C, Rest/binary>>, Full) when
+    C =:= $!;
+    C =:= $#;
+    C =:= $$;
+    C =:= $%;
+    C =:= $&;
+    C =:= $';
+    C =:= $*;
+    C =:= $+;
+    C =:= $-;
+    C =:= $.;
+    C =:= $^;
+    C =:= $_;
+    C =:= $`;
+    C =:= $|;
+    C =:= $~
+->
+    validate_field_name_chars(Rest, Full);
+validate_field_name_chars(<<_, _/binary>>, Full) ->
+    throw({header_error, {invalid_field, Full, <<>>}}).
 
 %% Field values: VCHAR / SP / HTAB / obs-text, no leading/trailing whitespace,
 %% no CR/LF/NUL (RFC 9110 §5.5).
@@ -2687,19 +2690,17 @@ validate_field_value(Name, Value) ->
             validate_field_value_chars(Value, Name)
     end.
 
+%% Char class inlined as clause guards (see validate_field_name_chars/2).
 validate_field_value_chars(<<>>, _Name) ->
     ok;
-validate_field_value_chars(<<C, Rest/binary>>, Name) ->
-    case is_field_value_char(C) of
-        true -> validate_field_value_chars(Rest, Name);
-        false -> throw({header_error, {invalid_field, Name, <<C>>}})
-    end.
-
-is_field_value_char($\s) -> true;
-is_field_value_char($\t) -> true;
-is_field_value_char(C) when C >= 16#21, C =< 16#7E -> true;
-is_field_value_char(C) when C >= 16#80, C =< 16#FF -> true;
-is_field_value_char(_) -> false.
+validate_field_value_chars(<<C, Rest/binary>>, Name) when C >= 16#21, C =< 16#7E ->
+    validate_field_value_chars(Rest, Name);
+validate_field_value_chars(<<C, Rest/binary>>, Name) when C >= 16#80, C =< 16#FF ->
+    validate_field_value_chars(Rest, Name);
+validate_field_value_chars(<<C, Rest/binary>>, Name) when C =:= $\s; C =:= $\t ->
+    validate_field_value_chars(Rest, Name);
+validate_field_value_chars(<<C, _/binary>>, Name) ->
+    throw({header_error, {invalid_field, Name, <<C>>}}).
 
 %% RFC 9114 §4.2: connection-specific fields MUST NOT appear in HTTP/3.
 %% te is allowed only with value "trailers".

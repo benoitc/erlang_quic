@@ -789,6 +789,69 @@ no_duplicates_accepted_test() ->
     ?assertMatch({ok, _}, Result).
 
 %%====================================================================
+%% Field-character validation (table-lookup path)
+%%====================================================================
+%% Each case starts from a complete valid request pseudo-header set so
+%% the failure is attributable to character validation, not a missing
+%% or malformed pseudo-header. Char validation runs before pseudo-header
+%% checks, so name/value rejections fire first.
+
+valid_request_field_chars_accepted_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    State = make_test_state(#{role => server}),
+    Result = quic_h3_connection:update_stream_with_headers(
+        valid_request_headers(), Stream, server, State
+    ),
+    ?assertMatch({ok, _}, Result).
+
+invalid_field_name_char_rejected_test() ->
+    %% Uppercase in a regular field name is not a lowercase tchar.
+    Headers = valid_request_headers() ++ [{<<"x-Bad">>, <<"v">>}],
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    State = make_test_state(#{role => server}),
+    ?assertEqual(
+        {error, {invalid_field, <<"x-Bad">>, <<>>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+invalid_field_value_char_rejected_test() ->
+    %% A control char (LF) is not a valid field-value char; the
+    %% offending byte is reported.
+    Headers = valid_request_headers() ++ [{<<"x-h">>, <<"a\nb">>}],
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    State = make_test_state(#{role => server}),
+    ?assertEqual(
+        {error, {invalid_field, <<"x-h">>, <<"\n">>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+empty_field_name_rejected_test() ->
+    Headers = valid_request_headers() ++ [{<<>>, <<"v">>}],
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    State = make_test_state(#{role => server}),
+    ?assertEqual(
+        {error, {invalid_field, <<>>, <<>>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+bare_colon_field_name_rejected_test() ->
+    Headers = valid_request_headers() ++ [{<<":">>, <<"v">>}],
+    Stream = #h3_stream{id = 0, frame_state = expecting_headers},
+    State = make_test_state(#{role => server}),
+    ?assertEqual(
+        {error, {invalid_field, <<":">>, <<>>}},
+        quic_h3_connection:update_stream_with_headers(Headers, Stream, server, State)
+    ).
+
+valid_request_headers() ->
+    [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>}
+    ].
+
+%%====================================================================
 %% GOAWAY Role-Aware Identifier Tests (RFC 9114 Section 7.2.6)
 %%====================================================================
 
