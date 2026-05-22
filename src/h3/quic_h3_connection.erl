@@ -227,8 +227,8 @@
     %% Placed at the end so prior tuple positions stay stable for tests.
     local_connect_enabled = false :: boolean(),
 
-    %% Extension hook. When set, `handle_uni_stream_type/4` consults
-    %% this function for unknown stream types and, on `claim`, routes
+    %% Extension hook. When set, `handle_uni_stream_type/4' consults
+    %% this function for unknown stream types and, on `claim', routes
     %% subsequent bytes to the owner as `{stream_type_*, ...}` events
     %% instead of discarding them.
     stream_type_handler ::

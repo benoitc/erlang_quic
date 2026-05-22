@@ -580,7 +580,7 @@ connected(enter, _OldState, _State) ->
     %% No DHandle (shouldn't happen in normal flow)
     keep_state_and_data;
 %% Handle send in connected state (direct send, not from VM).
-%% `send/2` is bound to f_send in #hs_data{} and only used by dist_util
+%% `send/2' is bound to f_send in #hs_data{} and only used by dist_util
 %% during the handshake — under normal post-handshake operation this
 %% handler is unreachable. The function is exported, so route any caller
 %% through the same picker + framing + per-stream queue as the VM path.
@@ -1185,7 +1185,7 @@ send_dist_data_limited_loop(DHandle, Conn, Streams, Remaining, State) ->
     end.
 
 %% @private
-%% dist_ctrl_get_data/1 may return `Data` (iovec) or `{Size, Data}'
+%% dist_ctrl_get_data/1 may return `Data' (iovec) or `{Size, Data}'
 %% (iovec with precomputed size); peel the size off.
 payload_bytes({_Size, Data}) -> Data;
 payload_bytes(Data) -> Data.

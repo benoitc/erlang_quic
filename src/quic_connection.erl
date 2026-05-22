@@ -594,7 +594,7 @@
     ack_elicited_count = 0 :: non_neg_integer(),
     ack_timer = undefined :: reference() | undefined,
     %% Transient: classification of the most recently received 1-RTT
-    %% packet. Set by `record_received_pn/3` and consumed once by
+    %% packet. Set by `record_received_pn/3' and consumed once by
     %% `maybe_send_ack(app, ...)` to choose between immediate ACK
     %% (RFC 9002 §6.2 reordering recommendation) and count-based
     %% decimation.
@@ -1017,7 +1017,7 @@ init({server, Opts}) ->
         initial_keys = InitialKeys,
         tls_state = ?TLS_AWAITING_CLIENT_HELLO,
         %% TLS 1.3 external PSK config (RFC 8446 §4.2.11). Either or
-        %% both may be `undefined`; if both are undefined the server
+        %% both may be `undefined'; if both are undefined the server
         %% only accepts cert-authenticated handshakes.
         psk_config = #{
             psk_callback => maps:get(psk_callback, Opts, undefined),
@@ -4738,7 +4738,7 @@ process_tls_message(_Level, ?TLS_SERVER_HELLO, Body, OriginalMsg, State) ->
         {ok, #{cipher := Cipher} = ServerHelloMap} ->
             %% Determine handshake type: PSK (with or without DHE) vs
             %% standard cert-auth. PSK selection is signalled by the
-            %% `selected_psk_identity` extension echoed in ServerHello.
+            %% `selected_psk_identity' extension echoed in ServerHello.
             ServerPubKey = maps:get(public_key, ServerHelloMap),
             SelectedPskIdx = maps:get(selected_psk_identity, ServerHelloMap, undefined),
             case validate_client_psk_selection(SelectedPskIdx, State) of
@@ -5359,7 +5359,7 @@ do_server_client_hello(SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, Ori
     ALPN = negotiate_alpn(ClientALPN, State#state.alpn_list),
 
     %% Build ServerHello. For PSK handshakes the ServerHello
-    %% carries `selected_psk_identity`; for psk_ke it also
+    %% carries `selected_psk_identity'; for psk_ke it also
     %% omits key_share (RFC 8446 §4.2.9).
     ServerHelloOpts0 = #{
         cipher_suite => cipher_atom_to_code(Cipher),
@@ -9673,7 +9673,7 @@ apply_peer_transport_params(TransportParams, State) ->
                 ?QUIC_LOG_META
             ),
             ReasonBin = tp_reason_to_binary(Reason),
-            %% Mark the violation. `maybe_emit_pending_close/1` picks this up
+            %% Mark the violation. `maybe_emit_pending_close/1' picks this up
             %% after the server flight so the peer has handshake keys to
             %% decrypt the CLOSE. The `{pending_close, ...}' tag is distinct
             %% from `{transport, ...}' so check_state_transition does not
