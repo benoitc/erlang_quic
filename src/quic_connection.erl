@@ -136,6 +136,7 @@
 %% Test exports
 -ifdef(TEST).
 -export([
+    chunk_crypto/3,
     add_to_ack_ranges/2,
     merge_ack_ranges/1,
     convert_ack_ranges_for_encode/1,
@@ -2820,12 +2821,11 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         update_state = idle
     },
 
-    %% Combine all messages into CRYPTO frame payload
-    %% Include CertificateRequest if verify is enabled
+    %% Combine all messages into the handshake CRYPTO payload.
+    %% Include CertificateRequest if verify is enabled.
     HandshakePayload =
         <<EncExtMsg/binary, CertReqMsg/binary, CertMsg/binary, CertVerifyMsg/binary,
             FinishedMsg/binary>>,
-    CryptoFrame = quic_frame:encode({crypto, 0, HandshakePayload}),
 
     %% Determine next TLS state based on verify option
     %% If verify=true, we expect Certificate from client next
@@ -2845,8 +2845,55 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         key_state = KeyState
     },
 
-    %% Send in Handshake packet
-    send_handshake_packet(CryptoFrame, State1).
+    %% Send the flight, segmented so no datagram exceeds the peer's
+    %% max_udp_payload_size (issue #134).
+    send_handshake_crypto(HandshakePayload, State1).
+
+%% @private Send a handshake CRYPTO payload as one or more packets,
+%% each sized to stay within max_udp_payload_size (RFC 9000 §14.1).
+%% A single oversized datagram is dropped by strict clients (Chromium),
+%% stalling the handshake.
+send_handshake_crypto(Payload, State) ->
+    Max = handshake_crypto_budget(State),
+    lists:foldl(
+        fun({Offset, Chunk}, AccState) ->
+            Frame = quic_frame:encode({crypto, Offset, Chunk}),
+            send_handshake_packet(Frame, AccState)
+        end,
+        State,
+        chunk_crypto(Payload, 0, Max)
+    ).
+
+%% @private Conservative per-chunk CRYPTO data budget for a Handshake
+%% packet. The ceiling is the QUIC baseline (1200): PMTU is unvalidated
+%% mid-handshake and every peer's max_udp_payload_size is >= 1200, so
+%% 1200 is universally safe. Overhead covers the long header, packet
+%% number, AEAD tag and CRYPTO frame header (generous varints).
+handshake_crypto_budget(#state{dcid = DCID, scid = SCID} = State) ->
+    PeerMax = maps:get(
+        max_udp_payload_size,
+        State#state.transport_params,
+        ?DEFAULT_MAX_UDP_PAYLOAD_SIZE
+    ),
+    Ceiling = min(PeerMax, ?DEFAULT_MAX_UDP_PAYLOAD_SIZE),
+    Overhead =
+        %% long header: first byte + version + DCID len/bytes + SCID len/bytes
+        1 + 4 + 1 + byte_size(DCID) + 1 + byte_size(SCID) +
+            %% length varint + packet number + AEAD tag
+            2 + 4 + 16 +
+            %% CRYPTO frame header: type + offset varint + length varint
+            1 + 8 + 4,
+    max(1, Ceiling - Overhead).
+
+%% @private Split a handshake CRYPTO payload into {Offset, Chunk}
+%% pieces, each Chunk =< Max, with contiguous offsets from Offset.
+%% The concatenation of the chunks equals the original payload.
+chunk_crypto(<<>>, _Offset, _Max) ->
+    [];
+chunk_crypto(Payload, Offset, Max) ->
+    Take = min(byte_size(Payload), Max),
+    <<Chunk:Take/binary, Rest/binary>> = Payload,
+    [{Offset, Chunk} | chunk_crypto(Rest, Offset + Take, Max)].
 
 %% Server: Send HANDSHAKE_DONE frame after receiving client Finished
 send_handshake_done(State) ->
@@ -4965,7 +5012,6 @@ process_tls_message(
 
                     %% Combine Certificate(+CertificateVerify) and Finished into one payload
                     HandshakePayload = <<CertPayload/binary, ClientFinishedMsg/binary>>,
-                    CryptoFrame = quic_frame:encode({crypto, 0, HandshakePayload}),
 
                     State1 = State#state{
                         tls_state = ?TLS_HANDSHAKE_COMPLETE,
@@ -4975,8 +5021,9 @@ process_tls_message(
                         key_state = KeyState
                     },
 
-                    %% Send client Certificate(+CertificateVerify)+Finished in Handshake packet
-                    send_handshake_packet(CryptoFrame, State1);
+                    %% Send client Certificate(+CertificateVerify)+Finished,
+                    %% segmented so no datagram exceeds max_udp_payload_size.
+                    send_handshake_crypto(HandshakePayload, State1);
                 false ->
                     %% Verification failed
                     State
