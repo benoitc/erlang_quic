@@ -192,6 +192,14 @@ get_fd(Socket) ->
 %%       `{Identity, Secret, Modes}' takes an explicit non-empty
 %%       list (`psk_dhe_ke | psk_ke'). Mutually exclusive with
 %%       `session_ticket'. See docs/PSK.md.</li>
+%%   <li>`groups' - key-exchange groups in preference order
+%%       (`x25519 | secp256r1 | secp384r1'; default `[x25519]').
+%%       The head gets a `key_share'; the rest are HelloRetryRequest
+%%       eligible.</li>
+%%   <li>`signature_algs' - advertised signature schemes
+%%       (`ecdsa_secp256r1_sha256 | ecdsa_secp384r1_sha384 |
+%%       rsa_pss_rsae_sha256|384|512 | ed25519 | rsa_pkcs1_sha256').
+%%       Defaults to the historical wire list.</li>
 %% </ul>
 -spec connect(Host, Port, Opts, Owner) -> {ok, pid()} | {error, term()} when
     Host :: binary() | string(),
@@ -675,6 +683,15 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %%   <li>`psk_callback' - `fun((Identity :: binary()) -> {ok, Secret} | not_found)';
 %%       takes precedence over `psks'</li>
 %%   <li>`alpn' - List of ALPN protocols (default: [&lt;&lt;"h3"&gt;&gt;])</li>
+%%   <li>`groups' - accepted key-exchange groups in preference order
+%%       (`x25519 | secp256r1 | secp384r1'; default `[x25519]'). When
+%%       the client's `key_share' matches none of these but a
+%%       `supported_groups' entry does, the server sends a
+%%       HelloRetryRequest.</li>
+%%   <li>`signature_algs' - accepted/advertised signature schemes; the
+%%       CertificateVerify scheme is the server's first choice the
+%%       client also offered. `rsa_pkcs1_*' is never selected for
+%%       CertificateVerify (RFC 8446 §4.4.3).</li>
 %%   <li>`pool_size' - Number of listener processes (default: 1)</li>
 %%   <li>`connection_handler' - Fun(Conn) -> {ok, HandlerPid} where Conn is the pid</li>
 %% </ul>

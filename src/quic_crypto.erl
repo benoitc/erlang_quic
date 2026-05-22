@@ -69,6 +69,7 @@
     %% Transcript hash
     transcript_hash/1,
     transcript_hash/2,
+    hrr_transcript_prefix/2,
 
     %% Cipher to hash mapping
     cipher_to_hash/1,
@@ -340,6 +341,16 @@ transcript_hash(HashOrCipher, Messages) ->
     %% Always go through cipher_to_hash which passes through sha256/sha384 unchanged
     Hash = cipher_to_hash(HashOrCipher),
     crypto:hash(Hash, Messages).
+
+%% @doc Synthetic `message_hash` handshake message that replaces
+%% ClientHello1 in the transcript after a HelloRetryRequest
+%% (RFC 8446 §4.4.1). `HashClientHello1` is the digest over the
+%% complete CH1 handshake message. Both peers prepend the result
+%% to the post-HRR transcript.
+-spec hrr_transcript_prefix(atom(), binary()) -> binary().
+hrr_transcript_prefix(HashOrCipher, HashClientHello1) ->
+    HashLen = hash_len(cipher_to_hash(HashOrCipher)),
+    <<254:8, HashLen:24, HashClientHello1/binary>>.
 
 %%====================================================================
 %% Cipher to Hash Mapping

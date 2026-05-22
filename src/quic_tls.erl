@@ -43,6 +43,7 @@
     %% Server-side message building
     parse_client_hello/1,
     build_server_hello/1,
+    build_hello_retry_request/3,
     build_encrypted_extensions/1,
     build_certificate/2,
     build_certificate_verify/3,
@@ -61,6 +62,7 @@
 
     %% Client certificate support (mutual TLS)
     build_certificate_request/1,
+    build_certificate_request/2,
     parse_certificate_request/1,
     build_certificate_verify_client/3,
     verify_certificate_verify/4,
@@ -84,21 +86,62 @@
 %% Returns: {ClientHelloMsg, PrivateKey, Random}
 -spec build_client_hello(map()) -> {binary(), binary(), binary()}.
 build_client_hello(Opts) ->
-    %% Generate client random (32 bytes)
-    Random = crypto:strong_rand_bytes(32),
+    %% Key-share group: the head of `groups` (default x25519). The
+    %% remaining groups are advertised in supported_groups so the
+    %% server can request one via HelloRetryRequest.
+    Groups = maps:get(groups, Opts, default_groups()),
+    %% Group that gets the key_share entry: the head of `groups`, or an
+    %% explicit override (used by a HelloRetryRequest retry where
+    %% supported_groups is unchanged but the share moves to the
+    %% server-selected group).
+    HeadGroup = maps:get(key_share_group, Opts, hd(Groups)),
+    {PubKey, PrivKey} = quic_crypto:generate_key_pair(HeadGroup),
 
-    %% Generate ECDHE key pair (x25519)
-    {PubKey, PrivKey} = crypto:generate_key(ecdh, x25519),
+    %% On a HelloRetryRequest retry, CH2 MUST reuse CH1's random and
+    %% legacy_session_id (RFC 8446 §4.1.2).
+    Random =
+        case maps:get(retry_random, Opts, undefined) of
+            undefined -> crypto:strong_rand_bytes(32);
+            R when is_binary(R) -> R
+        end,
+    Opts1 = Opts#{
+        groups => Groups,
+        head_group => HeadGroup,
+        session_id => maps:get(retry_session_id, Opts, <<>>)
+    },
 
     %% Resolve PSK offer (resumption ticket or external PSK). The
     %% caller is responsible for ensuring at most one is supplied;
     %% psk_offer_from_opts/1 raises {bad_opts, psk_conflict} otherwise.
-    case psk_offer_from_opts(Opts) of
+    case psk_offer_from_opts(Opts1) of
         undefined ->
-            build_client_hello_standard(Random, PubKey, PrivKey, Opts);
+            build_client_hello_standard(Random, PubKey, PrivKey, Opts1);
         #psk_offer{} = Offer ->
-            build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, Offer)
+            build_client_hello_with_psk(Random, PubKey, PrivKey, Opts1, Offer)
     end.
+
+%% @private Default key-exchange groups (wire-compatible with the
+%% pre-multigroup behaviour: x25519 only).
+default_groups() -> [x25519].
+
+%% @private Default advertised signature schemes, identical to the
+%% historical hardcoded ClientHello list.
+default_sig_algs() ->
+    [ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256, rsa_pkcs1_sha256, ed25519].
+
+%% @private Named-group atom to RFC 8446 §4.2.7 wire code.
+group_to_code(x25519) -> ?GROUP_X25519;
+group_to_code(secp256r1) -> ?GROUP_SECP256R1;
+group_to_code(secp384r1) -> ?GROUP_SECP384R1.
+
+%% @private Signature-scheme atom to RFC 8446 §4.2.3 wire code.
+sig_alg_to_code(ecdsa_secp256r1_sha256) -> ?SIG_ECDSA_SECP256R1_SHA256;
+sig_alg_to_code(ecdsa_secp384r1_sha384) -> ?SIG_ECDSA_SECP384R1_SHA384;
+sig_alg_to_code(rsa_pss_rsae_sha256) -> ?SIG_RSA_PSS_RSAE_SHA256;
+sig_alg_to_code(rsa_pss_rsae_sha384) -> ?SIG_RSA_PSS_RSAE_SHA384;
+sig_alg_to_code(rsa_pss_rsae_sha512) -> ?SIG_RSA_PSS_RSAE_SHA512;
+sig_alg_to_code(ed25519) -> ?SIG_ED25519;
+sig_alg_to_code(rsa_pkcs1_sha256) -> ?SIG_RSA_PKCS1_SHA256.
 
 %% @private Resolve external_psk/session_ticket into a #psk_offer{}.
 psk_offer_from_opts(Opts) ->
@@ -161,8 +204,8 @@ build_client_hello_standard(Random, PubKey, PrivKey, Opts) ->
     %% Build extensions
     Extensions = build_client_hello_extensions(PubKey, Opts),
 
-    %% Legacy session ID (empty for TLS 1.3)
-    SessionId = <<>>,
+    %% Legacy session ID (empty for TLS 1.3, or CH1's value on retry)
+    SessionId = maps:get(session_id, Opts, <<>>),
 
     %% Cipher suites (TLS 1.3 only)
     CipherSuites = <<?TLS_AES_128_GCM_SHA256:16>>,
@@ -237,7 +280,7 @@ build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer)
     AllExtensions = <<BaseExtensions/binary, PskExt/binary>>,
     ExtensionsLen = byte_size(AllExtensions),
 
-    SessionId = <<>>,
+    SessionId = maps:get(session_id, Opts, <<>>),
     CipherSuites = <<?TLS_AES_128_GCM_SHA256:16>>,
     CompressionMethods = <<1, 0>>,
 
@@ -282,21 +325,27 @@ build_client_hello_extensions(PubKey, Opts) ->
         <<2, ?TLS_VERSION_1_3:16>>
     ),
 
-    %% Supported groups (x25519)
+    %% Supported groups: every entry the client offers (head gets a
+    %% key_share below; the rest are HRR-eligible).
+    Groups = maps:get(groups, Opts, default_groups()),
+    GroupCodes = iolist_to_binary([<<(group_to_code(G)):16>> || G <- Groups]),
     SupportedGroups = encode_extension(
         ?EXT_SUPPORTED_GROUPS,
-        <<2:16, ?GROUP_X25519:16>>
+        <<(byte_size(GroupCodes)):16, GroupCodes/binary>>
     ),
 
-    %% Signature algorithms
+    %% Signature algorithms (caller-configurable; defaults to the
+    %% historical wire list).
+    SigAlgAtoms = maps:get(signature_algs, Opts, default_sig_algs()),
+    SigAlgCodes = iolist_to_binary([<<(sig_alg_to_code(A)):16>> || A <- SigAlgAtoms]),
     SigAlgs = encode_extension(
         ?EXT_SIGNATURE_ALGORITHMS,
-        <<8:16, ?SIG_ECDSA_SECP256R1_SHA256:16, ?SIG_RSA_PSS_RSAE_SHA256:16,
-            ?SIG_RSA_PKCS1_SHA256:16, ?SIG_ED25519:16>>
+        <<(byte_size(SigAlgCodes)):16, SigAlgCodes/binary>>
     ),
 
-    %% Key share (x25519 public key)
-    KeyShareEntry = <<?GROUP_X25519:16, 32:16, PubKey:32/binary>>,
+    %% Key share: single entry for the head group.
+    HeadGroup = maps:get(head_group, Opts, hd(Groups)),
+    KeyShareEntry = <<(group_to_code(HeadGroup)):16, (byte_size(PubKey)):16, PubKey/binary>>,
     KeyShare = encode_extension(
         ?EXT_KEY_SHARE,
         <<(byte_size(KeyShareEntry)):16, KeyShareEntry/binary>>
@@ -373,6 +422,7 @@ encode_alpn_list(Protocols) ->
         random := binary(),
         selected_psk_identity => non_neg_integer()
     }}
+    | {hrr, #{cipher := atom(), selected_group := atom() | unknown, extensions := map()}}
     | {error, term()}.
 parse_server_hello(<<
     % legacy_version
@@ -388,6 +438,21 @@ parse_server_hello(<<
     _Rest/binary
 >>) ->
     case parse_extensions(Extensions) of
+        {ok, ExtMap} when Random =:= ?TLS_HRR_RANDOM ->
+            %% HelloRetryRequest (RFC 8446 §4.1.4): a ServerHello whose
+            %% random is the HRR sentinel. Its key_share extension
+            %% carries only the selected group (KeyShareHelloRetryRequest).
+            Cipher = cipher_from_suite(CipherSuite),
+            case maps:find(?EXT_KEY_SHARE, ExtMap) of
+                {ok, <<GroupCode:16>>} ->
+                    {hrr, #{
+                        cipher => Cipher,
+                        selected_group => code_to_group(GroupCode),
+                        extensions => ExtMap
+                    }};
+                _ ->
+                    {error, hrr_missing_key_share}
+            end;
         {ok, ExtMap} ->
             Cipher = cipher_from_suite(CipherSuite),
             SelectedPsk =
@@ -1007,6 +1072,34 @@ build_server_hello(Opts) ->
     Message = encode_handshake_message(?TLS_SERVER_HELLO, ServerHello),
     {Message, PrivKey}.
 
+%% @doc Build a HelloRetryRequest (RFC 8446 §4.1.4). Wire-encoded as
+%% a ServerHello with the HRR sentinel random; its key_share carries
+%% only the selected group (no public key). Echoes the client's
+%% legacy_session_id and the negotiated cipher suite.
+-spec build_hello_retry_request(binary(), non_neg_integer(), atom()) -> binary().
+build_hello_retry_request(SessionId, CipherSuite, SelectedGroup) ->
+    SessionIdLen = byte_size(SessionId),
+    SupportedVersions = encode_extension(
+        ?EXT_SUPPORTED_VERSIONS,
+        <<?TLS_VERSION_1_3:16>>
+    ),
+    KeyShare = encode_extension(
+        ?EXT_KEY_SHARE,
+        <<(group_to_code(SelectedGroup)):16>>
+    ),
+    Extensions = <<SupportedVersions/binary, KeyShare/binary>>,
+    Body = <<
+        ?TLS_VERSION_1_2:16,
+        (?TLS_HRR_RANDOM)/binary,
+        SessionIdLen:8,
+        SessionId/binary,
+        CipherSuite:16,
+        0:8,
+        (byte_size(Extensions)):16,
+        Extensions/binary
+    >>,
+    encode_handshake_message(?TLS_SERVER_HELLO, Body).
+
 %% @doc Build EncryptedExtensions message.
 %% Options:
 %%   - alpn: Selected ALPN protocol
@@ -1163,6 +1256,16 @@ finalise_client_hello(Random, SessionId, Ciphers, OrderedExts, ExtMap, ExtBlob) 
             {ok, ModesData} -> parse_psk_modes_ext(ModesData);
             error -> []
         end,
+    SupportedGroups =
+        case maps:find(?EXT_SUPPORTED_GROUPS, ExtMap) of
+            {ok, SgData} -> parse_supported_groups_ext(SgData);
+            error -> []
+        end,
+    SignatureAlgs =
+        case maps:find(?EXT_SIGNATURE_ALGORITHMS, ExtMap) of
+            {ok, SaData} -> parse_signature_algorithms_ext(SaData);
+            error -> []
+        end,
     EarlyData = maps:is_key(?EXT_EARLY_DATA, ExtMap),
 
     %% Binders-section offset within the extension data of the PSK
@@ -1184,8 +1287,30 @@ finalise_client_hello(Random, SessionId, Ciphers, OrderedExts, ExtMap, ExtBlob) 
         pre_shared_key => PSK,
         psk_key_exchange_modes => PskModes,
         psk_binders => PskBinders,
+        supported_groups => SupportedGroups,
+        signature_algorithms => SignatureAlgs,
         early_data => EarlyData
     }}.
+
+%% @private Parse supported_groups (RFC 8446 §4.2.7) into recognised
+%% group atoms; unknown codes are dropped (they can't be selected).
+parse_supported_groups_ext(<<ListLen:16, Codes:ListLen/binary, _/binary>>) ->
+    [code_to_group(C) || <<C:16>> <= Codes, code_to_group(C) =/= unknown];
+parse_supported_groups_ext(_) ->
+    [].
+
+%% @private Parse signature_algorithms (RFC 8446 §4.2.3) into the
+%% list of wire codes (integers) in the order offered.
+parse_signature_algorithms_ext(<<ListLen:16, Codes:ListLen/binary, _/binary>>) ->
+    [C || <<C:16>> <= Codes];
+parse_signature_algorithms_ext(_) ->
+    [].
+
+%% @private Named-group wire code to atom (unknown -> unknown).
+code_to_group(?GROUP_X25519) -> x25519;
+code_to_group(?GROUP_SECP256R1) -> secp256r1;
+code_to_group(?GROUP_SECP384R1) -> secp384r1;
+code_to_group(_) -> unknown.
 
 %% @private
 %% Parse the psk_key_exchange_modes extension into a list of atoms.
@@ -1438,9 +1563,10 @@ build_server_hello_extensions(PubKey, Opts) ->
             psk_ke ->
                 <<>>;
             _ ->
+                Group = maps:get(key_share_group, Opts, x25519),
                 encode_extension(
                     ?EXT_KEY_SHARE,
-                    <<?GROUP_X25519:16, 32:16, PubKey:32/binary>>
+                    <<(group_to_code(Group)):16, (byte_size(PubKey)):16, PubKey/binary>>
                 )
         end,
 
@@ -1507,8 +1633,14 @@ get_signature_params(?SIG_ECDSA_SECP256R1_SHA256) ->
     {ecdsa, sha256, []};
 get_signature_params(?SIG_ECDSA_SECP384R1_SHA384) ->
     {ecdsa, sha384, []};
-get_signature_params(_) ->
-    {rsa, sha256, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]}.
+get_signature_params(?SIG_ED25519) ->
+    %% EdDSA pre-hashes internally; no separate hash and no padding.
+    %% The curve atom rides in the key list (see convert_private_key).
+    {eddsa, none, []};
+get_signature_params(Scheme) ->
+    %% No silent fallback — an unsupported scheme must fail loudly
+    %% rather than sign/verify with the wrong algorithm.
+    error({unsupported_signature_scheme, Scheme}).
 
 %% Convert private key to format expected by crypto:sign
 convert_private_key(
@@ -1528,6 +1660,11 @@ convert_private_key(rsa, {'RSAPrivateKey', _, N, E, D, _P, _Q, _Dp, _Dq, _Qi, _}
 convert_private_key(rsa, Key) when is_list(Key) ->
     %% Already in list format
     Key;
+convert_private_key(eddsa, {ed_pri, ed25519, _Pub, Priv}) ->
+    %% crypto:sign(eddsa, none, Msg, [PrivKeyBin, ed25519])
+    [Priv, ed25519];
+convert_private_key(eddsa, {'ECPrivateKey', _, PrivKeyBin, {namedCurve, {1, 3, 101, 112}}, _, _}) ->
+    [PrivKeyBin, ed25519];
 convert_private_key(_, Key) ->
     Key.
 
@@ -1535,16 +1672,19 @@ convert_private_key(_, Key) ->
 %% Client Certificate Support (Mutual TLS)
 %%====================================================================
 
-%% @doc Build a CertificateRequest message (RFC 8446 Section 4.3.2).
-%% Context is the certificate_request_context (typically empty for TLS 1.3).
+%% @doc Build a CertificateRequest message (RFC 8446 §4.3.2) with the
+%% default advertised signature schemes.
 -spec build_certificate_request(binary()) -> binary().
 build_certificate_request(Context) ->
-    %% RFC 8446 Section 4.3.2: signature_algorithms extension is required
-    SigAlgs = <<
-        ?SIG_ECDSA_SECP256R1_SHA256:16,
-        ?SIG_RSA_PSS_RSAE_SHA256:16,
-        ?SIG_RSA_PKCS1_SHA256:16
-    >>,
+    build_certificate_request(Context, [
+        ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256, rsa_pkcs1_sha256, ed25519
+    ]).
+
+%% @doc Build a CertificateRequest advertising the given signature
+%% schemes (RFC 8446 §4.3.2; signature_algorithms is required).
+-spec build_certificate_request(binary(), [atom()]) -> binary().
+build_certificate_request(Context, SigAlgAtoms) ->
+    SigAlgs = iolist_to_binary([<<(sig_alg_to_code(A)):16>> || A <- SigAlgAtoms]),
     SigAlgsLen = byte_size(SigAlgs),
     SigAlgsExt =
         <<?EXT_SIGNATURE_ALGORITHMS:16, (SigAlgsLen + 2):16, SigAlgsLen:16, SigAlgs/binary>>,
@@ -1553,12 +1693,24 @@ build_certificate_request(Context) ->
     Body = <<ContextLen:8, Context/binary, ExtLen:16, SigAlgsExt/binary>>,
     encode_handshake_message(?TLS_CERTIFICATE_REQUEST, Body).
 
-%% @doc Parse a CertificateRequest message.
+%% @doc Parse a CertificateRequest message. Returns the context and
+%% the advertised signature_algorithms (wire codes) so an mTLS client
+%% can pick a compatible CertificateVerify scheme.
 -spec parse_certificate_request(binary()) -> {ok, map()} | {error, term()}.
 parse_certificate_request(
-    <<ContextLen:8, Context:ContextLen/binary, ExtLen:16, _Extensions:ExtLen/binary, _/binary>>
+    <<ContextLen:8, Context:ContextLen/binary, ExtLen:16, Extensions:ExtLen/binary, _/binary>>
 ) ->
-    {ok, #{context => Context}};
+    SigAlgs =
+        case parse_extensions(Extensions) of
+            {ok, ExtMap} ->
+                case maps:find(?EXT_SIGNATURE_ALGORITHMS, ExtMap) of
+                    {ok, SaData} -> parse_signature_algorithms_ext(SaData);
+                    error -> []
+                end;
+            _ ->
+                []
+        end,
+    {ok, #{context => Context, signature_algorithms => SigAlgs}};
 parse_certificate_request(_) ->
     {error, invalid_certificate_request}.
 
@@ -1651,5 +1803,23 @@ convert_public_key_for_verify(
 ) ->
     %% RSA: [E, N]
     {ok, [E, N]};
+convert_public_key_for_verify(
+    #'OTPSubjectPublicKeyInfo'{
+        algorithm = #'PublicKeyAlgorithm'{algorithm = {1, 3, 101, 112}},
+        subjectPublicKey = #'ECPoint'{point = PubKey}
+    },
+    ?SIG_ED25519
+) ->
+    %% Ed25519 (OID 1.3.101.112): OTP wraps the 32-byte public key in
+    %% an ECPoint.
+    {ok, [PubKey, ed25519]};
+convert_public_key_for_verify(
+    #'OTPSubjectPublicKeyInfo'{
+        algorithm = #'PublicKeyAlgorithm'{algorithm = {1, 3, 101, 112}},
+        subjectPublicKey = PubKey
+    },
+    ?SIG_ED25519
+) when is_binary(PubKey) ->
+    {ok, [PubKey, ed25519]};
 convert_public_key_for_verify(_, _) ->
     {error, unsupported_key_type}.

@@ -285,6 +285,30 @@
     server_hs_secret :: binary() | undefined,
     client_hs_secret :: binary() | undefined,
 
+    %% Key-exchange + signature negotiation (RFC 8446 §4.1.4 / §4.2.3)
+    tls_groups = [x25519] :: [atom()],
+    tls_sig_algs :: [atom()] | undefined,
+    %% Peer's offered signature_algorithms (wire codes), set on the
+    %% server when the ClientHello is parsed.
+    peer_sig_algs = [] :: [non_neg_integer()],
+    %% CertificateVerify scheme chosen for this handshake (wire code).
+    cert_verify_code :: non_neg_integer() | undefined,
+    %% Group of the key_share we sent (client) / selected (server)
+    tls_group = x25519 :: atom(),
+    %% HelloRetryRequest bookkeeping
+    hrr_sent = false :: boolean(),
+    hrr_group :: atom() | undefined,
+    %% Outgoing Initial-level CRYPTO stream offset. Stays 0 for a
+    %% one-shot flight; bumps after HRR so CH2 / ServerHello continue
+    %% the stream (RFC 9001 §4.1.3).
+    initial_tx_off = 0 :: non_neg_integer(),
+    %% Client-side: CH1 random + build opts, needed to rebuild CH2
+    tls_ch1_random :: binary() | undefined,
+    tls_ch1_opts :: map() | undefined,
+    %% Negotiated values surfaced in the connected event
+    negotiated_group :: atom() | undefined,
+    negotiated_scheme :: atom() | undefined,
+
     %% CRYPTO frame buffer (per level: initial, handshake, app)
     crypto_buffer = #{initial => #{}, handshake => #{}, app => #{}} :: map(),
     crypto_offset = #{initial => 0, handshake => 0, app => 0} :: map(),
@@ -998,6 +1022,8 @@ init({server, Opts}) ->
             psk_callback => maps:get(psk_callback, Opts, undefined),
             psks => maps:get(psks, Opts, undefined)
         },
+        tls_groups = maps:get(groups, Opts, [x25519]),
+        tls_sig_algs = maps:get(signature_algs, Opts, undefined),
         alpn_list = normalize_alpn_list(ALPNList),
         pn_initial = PNSpace,
         pn_handshake = PNSpace,
@@ -1349,6 +1375,9 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         initial_keys = InitialKeys,
         retry_token = InitialRetryToken,
         tls_state = ?TLS_AWAITING_SERVER_HELLO,
+        tls_groups = maps:get(groups, Opts, [x25519]),
+        tls_sig_algs = maps:get(signature_algs, Opts, undefined),
+        tls_group = hd(maps:get(groups, Opts, [x25519])),
         alpn_list = AlpnList,
         pn_initial = PNSpace,
         pn_handshake = PNSpace,
@@ -1668,6 +1697,8 @@ connected(
         role = Role,
         pending_data = Pending,
         transport_params = TransportParams,
+        negotiated_group = NegGroup,
+        negotiated_scheme = NegScheme,
         active_n = ActiveN
     } = State
 ) when
@@ -1677,7 +1708,9 @@ connected(
     Info = #{
         alpn => Alpn,
         alpn_protocol => Alpn,
-        transport_params => TransportParams
+        transport_params => TransportParams,
+        negotiated_group => NegGroup,
+        negotiated_scheme => NegScheme
     },
     Owner ! {quic, self(), {connected, Info}},
     %% For client connections, ensure socket is active for receiving
@@ -2337,14 +2370,20 @@ send_client_hello(State) ->
         server_name => ServerName,
         alpn => AlpnList,
         transport_params => TransportParams,
-        session_ticket => SessionTicket
+        session_ticket => SessionTicket,
+        groups => State#state.tls_groups
     },
+    ClientHelloOpts1 =
+        case State#state.tls_sig_algs of
+            undefined -> ClientHelloOpts0;
+            SigAlgs -> ClientHelloOpts0#{signature_algs => SigAlgs}
+        end,
     ClientHelloOpts =
         case State#state.external_psk of
-            undefined -> ClientHelloOpts0;
-            Ext -> ClientHelloOpts0#{external_psk => Ext}
+            undefined -> ClientHelloOpts1;
+            Ext -> ClientHelloOpts1#{external_psk => Ext}
         end,
-    {ClientHello, PrivKey, _Random} = quic_tls:build_client_hello(ClientHelloOpts),
+    {ClientHello, PrivKey, ClientRandom} = quic_tls:build_client_hello(ClientHelloOpts),
 
     %% Update transcript
     Transcript = ClientHello,
@@ -2376,6 +2415,9 @@ send_client_hello(State) ->
     NewState = send_initial_packet(CryptoFrame, State#state{
         tls_private_key = PrivKey,
         tls_transcript = Transcript,
+        tls_ch1_random = ClientRandom,
+        tls_ch1_opts = ClientHelloOpts,
+        initial_tx_off = byte_size(ClientHello),
         early_keys = EarlyKeys,
         max_early_data =
             case SessionTicket of
@@ -2431,11 +2473,50 @@ negotiate_alpn(ClientALPN, ServerALPN) ->
         [] -> undefined
     end.
 
-%% Extract x25519 public key from key share entries list
-extract_x25519_key(undefined) -> undefined;
-extract_x25519_key([]) -> undefined;
-extract_x25519_key([{?GROUP_X25519, PubKey} | _]) -> PubKey;
-extract_x25519_key([_ | Rest]) -> extract_x25519_key(Rest).
+%% Extract the client's key_share public key for a given group atom.
+extract_group_key(_Group, undefined) ->
+    undefined;
+extract_group_key(_Group, []) ->
+    undefined;
+extract_group_key(Group, [{Code, PubKey} | Rest]) ->
+    case group_atom(Code) of
+        Group -> PubKey;
+        _ -> extract_group_key(Group, Rest)
+    end.
+
+%% Named-group wire code -> atom (unknown stays as the integer).
+group_atom(?GROUP_X25519) -> x25519;
+group_atom(?GROUP_SECP256R1) -> secp256r1;
+group_atom(?GROUP_SECP384R1) -> secp384r1;
+group_atom(Other) -> Other.
+
+%% Decide the key-exchange group for a ClientHello (RFC 8446 §4.1.4).
+%% Returns {direct, Group} when the client already sent a usable
+%% key_share, {hrr, Group} when a HelloRetryRequest is needed, or
+%% none when there is no group both sides support.
+select_key_share_group(ServerGroups, KeyShareEntries, SupportedGroups) ->
+    Offered = [group_atom(C) || {C, _} <- entries_or_empty(KeyShareEntries)],
+    case first_in(ServerGroups, Offered) of
+        {ok, G} ->
+            {direct, G};
+        none ->
+            case first_in(ServerGroups, SupportedGroups) of
+                {ok, G} -> {hrr, G};
+                none -> none
+            end
+    end.
+
+entries_or_empty(undefined) -> [];
+entries_or_empty(L) when is_list(L) -> L.
+
+%% First element of Prefs that also appears in Avail.
+first_in([], _Avail) ->
+    none;
+first_in([P | Rest], Avail) ->
+    case lists:member(P, Avail) of
+        true -> {ok, P};
+        false -> first_in(Rest, Avail)
+    end.
 
 %% Validate PSK from client's pre_shared_key extension
 %% Returns {ok, PSK, ResumptionSecret} if valid, error otherwise
@@ -2545,10 +2626,13 @@ ensure_ticket_table() ->
             ok
     end.
 
-%% Server: Send ServerHello in Initial packet
+%% Server: Send ServerHello in Initial packet. Uses the tracked
+%% Initial CRYPTO offset (non-zero only after a HelloRetryRequest).
 send_server_hello(ServerHelloMsg, State) ->
-    CryptoFrame = quic_frame:encode({crypto, 0, ServerHelloMsg}),
-    send_initial_packet(CryptoFrame, State).
+    Off = State#state.initial_tx_off,
+    CryptoFrame = quic_frame:encode({crypto, Off, ServerHelloMsg}),
+    State1 = State#state{initial_tx_off = Off + byte_size(ServerHelloMsg)},
+    send_initial_packet(CryptoFrame, State1).
 
 %% Server: Send EncryptedExtensions, Certificate, CertificateVerify, Finished
 %% @private
@@ -2677,14 +2761,15 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
                 %% Cert path
                 CertReq =
                     case Verify of
-                        true -> quic_tls:build_certificate_request(<<>>);
+                        true -> build_cert_request(State);
                         false -> <<>>
                     end,
                 AllCerts = [Cert | CertChain],
                 Cert0 = quic_tls:build_certificate(<<>>, AllCerts),
                 T1 = <<Transcript/binary, EncExtMsg/binary, CertReq/binary, Cert0/binary>>,
                 HashForCV = quic_crypto:transcript_hash(Cipher, T1),
-                SigAlg = select_signature_algorithm(PrivateKey),
+                %% Scheme negotiated in do_server_client_hello.
+                SigAlg = State#state.cert_verify_code,
                 CV = quic_tls:build_certificate_verify(SigAlg, PrivateKey, HashForCV),
                 T2 = <<T1/binary, CV/binary>>,
                 HashForFin = quic_crypto:transcript_hash(Cipher, T2),
@@ -4566,203 +4651,34 @@ process_tls_message(
                 random := _ClientRandom,
                 key_share := KeyShareEntries,
                 cipher_suites := CipherSuites,
-                alpn_protocols := ClientALPN,
-                transport_params := TP,
                 session_id := SessionId
             } = ClientHelloInfo} ->
-            %% Extract x25519 public key from key share entries
-            ClientPubKey = extract_x25519_key(KeyShareEntries),
             %% Select cipher suite (prefer server's order)
             Cipher = select_cipher(CipherSuites),
-
-            %% Check for PSK (0-RTT/resumption/external)
-            PSKInfo = maps:get(pre_shared_key, ClientHelloInfo, undefined),
-            WantsEarlyData = maps:get(early_data, ClientHelloInfo, false),
-
-            %% TLS 1.3 external PSK selection (RFC 8446 §4.2.11).
-            %% Validate pre_shared_key placement, lookup identity, verify
-            %% binder. On match the server skips the cert path and uses
-            %% the PSK secret in the early_secret derivation below.
-            PskConfig = State#state.psk_config,
-            ServerPskModes = [psk_dhe_ke, psk_ke],
-            ExternalPskResult =
-                case PskConfig of
-                    undefined ->
-                        none;
-                    _ ->
-                        quic_tls:select_psk(
-                            ClientHelloInfo, OriginalMsg, PskConfig, ServerPskModes
-                        )
-                end,
-            ok,
-
-            %% For normal handshake, derive early secret from zero PSK
-            %% PSK-based resumption with full 0-RTT support requires additional changes
-            %% to skip Certificate/CertificateVerify - implementing basic 0-RTT decryption only
-            HashLen0 =
-                case Cipher of
-                    aes_256_gcm -> 48;
-                    _ -> 32
-                end,
-            ZeroPSK = <<0:HashLen0/unit:8>>,
-
-            %% Derive early secret. External-PSK selection wins over both
-            %% resumption-PSK 0-RTT and the standard zero-PSK path.
-            {EarlyKeys, EarlySecret, SelectedPsk} =
-                case ExternalPskResult of
-                    {ok, #{secret := PSKSecret, mode := Mode} = Sel} ->
-                        Selected = #{
-                            identity => maps:get(identity, Sel),
-                            secret => PSKSecret,
-                            mode => Mode
-                        },
-                        {
-                            undefined,
-                            quic_crypto:derive_early_secret(Cipher, PSKSecret),
-                            Selected
-                        };
-                    none ->
-                        case PSKInfo of
-                            #{identities := [{Identity, _Age}], binders := [_Binder]} when
-                                WantsEarlyData
-                            ->
-                                case validate_psk(Identity, Cipher, OriginalMsg, State) of
-                                    {ok, PSK, ResumptionSecret} ->
-                                        ES = quic_crypto:derive_early_secret(Cipher, PSK),
-                                        ClientHelloHash = quic_crypto:transcript_hash(
-                                            Cipher, OriginalMsg
-                                        ),
-                                        ETS = quic_crypto:derive_client_early_traffic_secret(
-                                            Cipher, ES, ClientHelloHash
-                                        ),
-                                        {Key, IV, HP} = quic_keys:derive_keys(ETS, Cipher),
-                                        EK = #crypto_keys{
-                                            key = Key, iv = IV, hp = HP, cipher = Cipher
-                                        },
-                                        {
-                                            {EK, ResumptionSecret},
-                                            quic_crypto:derive_early_secret(Cipher, ZeroPSK),
-                                            undefined
-                                        };
-                                    error ->
-                                        {undefined,
-                                            quic_crypto:derive_early_secret(Cipher, ZeroPSK),
-                                            undefined}
-                                end;
-                            _ ->
-                                {undefined, quic_crypto:derive_early_secret(Cipher, ZeroPSK),
-                                    undefined}
-                        end;
-                    {error, bad_binder} ->
-                        %% Bail out via exit/1; the handler returning
-                        %% here is impossible because the case can't
-                        %% produce a valid tuple. Elvis prefers exit
-                        %% over throw.
-                        ?LOG_WARNING(
-                            #{what => psk_binder_verification_failed},
-                            ?QUIC_LOG_META
-                        ),
-                        send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State),
-                        exit({tls_alert, decrypt_error})
-                end,
-
-            %% Generate server key pair
-            {ServerPubKey, ServerPrivKey} = quic_crypto:generate_key_pair(x25519),
-
-            %% Compute shared secret
-            SharedSecret = quic_crypto:compute_shared_secret(
-                x25519, ServerPrivKey, ClientPubKey
-            ),
-
-            %% Negotiate ALPN
-            ALPN = negotiate_alpn(ClientALPN, State#state.alpn_list),
-
-            %% Build ServerHello. For PSK handshakes the ServerHello
-            %% carries `selected_psk_identity`; for psk_ke it also
-            %% omits key_share (RFC 8446 §4.2.9).
-            ServerHelloOpts0 = #{
-                cipher_suite => cipher_atom_to_code(Cipher),
-                key_pair => {ServerPubKey, ServerPrivKey},
-                session_id => SessionId
-            },
-            ServerHelloOpts =
-                case {SelectedPsk, ExternalPskResult} of
-                    {undefined, _} ->
-                        ServerHelloOpts0;
-                    {_, {ok, #{identity_idx := Idx, mode := SelMode}}} ->
-                        ServerHelloOpts0#{
-                            selected_psk_identity => Idx,
-                            selected_psk_mode => SelMode
-                        }
-                end,
-            {ServerHello, _ServerPrivKey2} = quic_tls:build_server_hello(ServerHelloOpts),
-
-            %% Update transcript with ClientHello
-            Transcript0 = <<OriginalMsg/binary>>,
-            %% Add ServerHello to transcript
-            Transcript = <<Transcript0/binary, ServerHello/binary>>,
-            TranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
-
-            %% Derive handshake secrets. psk_ke (PSK-only) uses zero IKM
-            %% per RFC 8446 §7.1; psk_dhe_ke and standard handshakes use
-            %% the ECDHE shared secret.
-            HandshakeSecret =
-                case SelectedPsk of
-                    #{mode := psk_ke} ->
-                        quic_crypto:derive_handshake_secret_psk_only(Cipher, EarlySecret);
-                    _ ->
-                        quic_crypto:derive_handshake_secret(
-                            Cipher, EarlySecret, SharedSecret
-                        )
-                end,
-
-            ClientHsSecret = quic_crypto:derive_client_handshake_secret(
-                Cipher, HandshakeSecret, TranscriptHash
-            ),
-            ServerHsSecret = quic_crypto:derive_server_handshake_secret(
-                Cipher, HandshakeSecret, TranscriptHash
-            ),
-
-            %% Derive handshake keys
-            {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientHsSecret, Cipher),
-            {ServerKey, ServerIV, ServerHP} = quic_keys:derive_keys(ServerHsSecret, Cipher),
-
-            ClientHsKeys = #crypto_keys{
-                key = ClientKey, iv = ClientIV, hp = ClientHP, cipher = Cipher
-            },
-            ServerHsKeys = #crypto_keys{
-                key = ServerKey, iv = ServerIV, hp = ServerHP, cipher = Cipher
-            },
-
-            %% Update DCID from ClientHello SCID
-            %% quic_tls decodes the initial_source_connection_id param as initial_scid
-            ClientSCID = maps:get(initial_scid, TP, <<>>),
-
-            State0 = State#state{
-                dcid = ClientSCID,
-                tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
-                tls_transcript = Transcript,
-                tls_private_key = ServerPrivKey,
-                handshake_secret = HandshakeSecret,
-                client_hs_secret = ClientHsSecret,
-                server_hs_secret = ServerHsSecret,
-                handshake_keys = {ClientHsKeys, ServerHsKeys},
-                alpn = ALPN,
-                early_keys = EarlyKeys,
-                early_data_accepted = (EarlyKeys =/= undefined andalso WantsEarlyData),
-                selected_psk = SelectedPsk
-            },
-            %% Apply peer transport params (extracts active_connection_id_limit).
-            %% Always send ServerHello + handshake flight so the peer can
-            %% derive handshake keys; if a TP violation was flagged,
-            %% maybe_emit_pending_close/1 emits CONNECTION_CLOSE afterward.
-            %% Always send ServerHello + handshake flight so the peer can
-            %% derive handshake keys; if a TP violation was flagged,
-            %% maybe_emit_pending_close/1 emits CONNECTION_CLOSE afterward.
-            State1 = apply_peer_transport_params(TP, State0),
-            State2 = send_server_hello(ServerHello, State1),
-            State3 = send_server_handshake_flight(Cipher, TranscriptHash, State2),
-            maybe_emit_pending_close(State3);
+            %% RFC 8446 §4.1.4 group negotiation: use the client's
+            %% key_share directly when possible, otherwise send a
+            %% HelloRetryRequest for a mutually-supported group.
+            SupportedGroups = maps:get(supported_groups, ClientHelloInfo, []),
+            case
+                select_key_share_group(
+                    State#state.tls_groups, KeyShareEntries, SupportedGroups
+                )
+            of
+                {direct, SelGroup} ->
+                    ClientPubKey = extract_group_key(SelGroup, KeyShareEntries),
+                    do_server_client_hello(
+                        SelGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
+                    );
+                {hrr, HrrGroup} when not State#state.hrr_sent ->
+                    send_hello_retry_request(HrrGroup, Cipher, SessionId, OriginalMsg, State);
+                {hrr, _} ->
+                    %% Client ignored our HRR group selection.
+                    send_tls_alert(
+                        ?TLS_ALERT_ILLEGAL_PARAMETER, <<"bad retry key_share">>, State
+                    );
+                none ->
+                    send_tls_alert(?TLS_ALERT_HANDSHAKE_FAILURE, <<"no common group">>, State)
+            end;
         {error, Reason} ->
             ?LOG_ERROR(#{what => client_hello_parse_failed, reason => Reason}, ?QUIC_LOG_META),
             State
@@ -4770,6 +4686,8 @@ process_tls_message(
 %% Client receives ServerHello
 process_tls_message(_Level, ?TLS_SERVER_HELLO, Body, OriginalMsg, State) ->
     case quic_tls:parse_server_hello(Body) of
+        {hrr, HrrInfo} ->
+            handle_hello_retry_request(HrrInfo, OriginalMsg, State);
         {ok, #{cipher := Cipher} = ServerHelloMap} ->
             %% Determine handshake type: PSK (with or without DHE) vs
             %% standard cert-auth. PSK selection is signalled by the
@@ -4792,7 +4710,7 @@ process_tls_message(_Level, ?TLS_SERVER_HELLO, Body, OriginalMsg, State) ->
                                 <<>>;
                             _ ->
                                 quic_crypto:compute_shared_secret(
-                                    x25519,
+                                    State#state.tls_group,
                                     State#state.tls_private_key,
                                     ServerPubKey
                                 )
@@ -4850,6 +4768,7 @@ process_tls_message(_Level, ?TLS_SERVER_HELLO, Body, OriginalMsg, State) ->
                         client_hs_secret = ClientHsSecret,
                         server_hs_secret = ServerHsSecret,
                         handshake_keys = {ClientHsKeys, ServerHsKeys},
+                        negotiated_group = State#state.tls_group,
                         selected_psk = ClientSelectedPsk
                     },
                     send_initial_ack(State1)
@@ -4917,15 +4836,22 @@ process_tls_message(
 process_tls_message(
     _Level,
     ?TLS_CERTIFICATE_VERIFY,
-    _Body,
+    Body,
     OriginalMsg,
     #state{role = client, tls_state = ?TLS_AWAITING_CERT_VERIFY} = State
 ) ->
-    %% Update transcript
+    %% Update transcript and record the server's CertificateVerify
+    %% scheme for the connected event.
     Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+    Scheme =
+        case quic_tls:parse_certificate_verify(Body) of
+            {ok, #{algorithm := Alg}} -> code_to_sig_alg(Alg);
+            _ -> undefined
+        end,
     State#state{
         tls_state = ?TLS_AWAITING_FINISHED,
-        tls_transcript = Transcript
+        tls_transcript = Transcript,
+        negotiated_scheme = Scheme
     };
 %% Client receives server's Finished
 process_tls_message(
@@ -5010,9 +4936,10 @@ process_tls_message(
                                         ),
                                         T1 = <<Transcript/binary, ClientCertMsg/binary>>,
                                         TranscriptHashCV = quic_crypto:transcript_hash(Cipher, T1),
-                                        SigAlg = select_signature_algorithm(
-                                            State#state.client_private_key
-                                        ),
+                                        %% Pick a scheme the server offered and our
+                                        %% key can produce; fall back to the key's
+                                        %% natural scheme if the offer is empty.
+                                        SigAlg = client_cert_verify_code(State),
                                         ClientCertVerifyMsg = quic_tls:build_certificate_verify_client(
                                             SigAlg, State#state.client_private_key, TranscriptHashCV
                                         ),
@@ -5185,15 +5112,23 @@ process_tls_message(
 process_tls_message(
     _Level,
     ?TLS_CERTIFICATE_REQUEST,
-    _Body,
+    Body,
     OriginalMsg,
     #state{role = client} = State
 ) ->
-    %% Update transcript and mark that server wants client certificate
+    %% Update transcript and mark that server wants client certificate.
+    %% Capture the advertised signature_algorithms so the client can
+    %% pick a compatible CertificateVerify scheme.
     Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+    PeerSigAlgs =
+        case quic_tls:parse_certificate_request(Body) of
+            {ok, #{signature_algorithms := SA}} -> SA;
+            _ -> []
+        end,
     State#state{
         tls_transcript = Transcript,
-        cert_request_received = true
+        cert_request_received = true,
+        peer_sig_algs = PeerSigAlgs
     };
 %% Server receives client Certificate (when verify=true)
 process_tls_message(
@@ -5263,6 +5198,316 @@ process_tls_message(
     end;
 process_tls_message(_Level, _Type, _Body, _OriginalMsg, State) ->
     State.
+
+%% @private Continue a server-side ClientHello once the key-exchange
+%% group is settled (direct or post-HRR). SelectedGroup is the agreed
+%% named group; ClientPubKey is the client's key_share for it.
+do_server_client_hello(SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State0In) ->
+    ClientALPN = maps:get(alpn_protocols, ClientHelloInfo, []),
+    TP = maps:get(transport_params, ClientHelloInfo, #{}),
+    SessionId = maps:get(session_id, ClientHelloInfo, <<>>),
+    %% Remember the client's offered signature schemes for the
+    %% server's CertificateVerify negotiation.
+    State = State0In#state{
+        peer_sig_algs = maps:get(signature_algorithms, ClientHelloInfo, [])
+    },
+    %% Check for PSK (0-RTT/resumption/external)
+    PSKInfo = maps:get(pre_shared_key, ClientHelloInfo, undefined),
+    WantsEarlyData = maps:get(early_data, ClientHelloInfo, false),
+
+    %% TLS 1.3 external PSK selection (RFC 8446 §4.2.11).
+    %% Validate pre_shared_key placement, lookup identity, verify
+    %% binder. On match the server skips the cert path and uses
+    %% the PSK secret in the early_secret derivation below.
+    PskConfig = State#state.psk_config,
+    ServerPskModes = [psk_dhe_ke, psk_ke],
+    ExternalPskResult =
+        case PskConfig of
+            undefined ->
+                none;
+            _ ->
+                quic_tls:select_psk(
+                    ClientHelloInfo, OriginalMsg, PskConfig, ServerPskModes
+                )
+        end,
+    ok,
+
+    %% For normal handshake, derive early secret from zero PSK
+    %% PSK-based resumption with full 0-RTT support requires additional changes
+    %% to skip Certificate/CertificateVerify - implementing basic 0-RTT decryption only
+    HashLen0 =
+        case Cipher of
+            aes_256_gcm -> 48;
+            _ -> 32
+        end,
+    ZeroPSK = <<0:HashLen0/unit:8>>,
+
+    %% Derive early secret. External-PSK selection wins over both
+    %% resumption-PSK 0-RTT and the standard zero-PSK path.
+    {EarlyKeys, EarlySecret, SelectedPsk} =
+        case ExternalPskResult of
+            {ok, #{secret := PSKSecret, mode := Mode} = Sel} ->
+                Selected = #{
+                    identity => maps:get(identity, Sel),
+                    secret => PSKSecret,
+                    mode => Mode
+                },
+                {
+                    undefined,
+                    quic_crypto:derive_early_secret(Cipher, PSKSecret),
+                    Selected
+                };
+            none ->
+                case PSKInfo of
+                    #{identities := [{Identity, _Age}], binders := [_Binder]} when
+                        WantsEarlyData
+                    ->
+                        case validate_psk(Identity, Cipher, OriginalMsg, State) of
+                            {ok, PSK, ResumptionSecret} ->
+                                ES = quic_crypto:derive_early_secret(Cipher, PSK),
+                                ClientHelloHash = quic_crypto:transcript_hash(
+                                    Cipher, OriginalMsg
+                                ),
+                                ETS = quic_crypto:derive_client_early_traffic_secret(
+                                    Cipher, ES, ClientHelloHash
+                                ),
+                                {Key, IV, HP} = quic_keys:derive_keys(ETS, Cipher),
+                                EK = #crypto_keys{
+                                    key = Key, iv = IV, hp = HP, cipher = Cipher
+                                },
+                                {
+                                    {EK, ResumptionSecret},
+                                    quic_crypto:derive_early_secret(Cipher, ZeroPSK),
+                                    undefined
+                                };
+                            error ->
+                                {undefined, quic_crypto:derive_early_secret(Cipher, ZeroPSK),
+                                    undefined}
+                        end;
+                    _ ->
+                        {undefined, quic_crypto:derive_early_secret(Cipher, ZeroPSK), undefined}
+                end;
+            {error, bad_binder} ->
+                %% Bail out via exit/1; the handler returning
+                %% here is impossible because the case can't
+                %% produce a valid tuple. Elvis prefers exit
+                %% over throw.
+                ?LOG_WARNING(
+                    #{what => psk_binder_verification_failed},
+                    ?QUIC_LOG_META
+                ),
+                send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State),
+                exit({tls_alert, decrypt_error})
+        end,
+
+    %% Generate server key pair for the negotiated group
+    {ServerPubKey, ServerPrivKey} = quic_crypto:generate_key_pair(SelectedGroup),
+
+    %% Compute shared secret
+    SharedSecret = quic_crypto:compute_shared_secret(
+        SelectedGroup, ServerPrivKey, ClientPubKey
+    ),
+
+    %% Negotiate ALPN
+    ALPN = negotiate_alpn(ClientALPN, State#state.alpn_list),
+
+    %% Build ServerHello. For PSK handshakes the ServerHello
+    %% carries `selected_psk_identity`; for psk_ke it also
+    %% omits key_share (RFC 8446 §4.2.9).
+    ServerHelloOpts0 = #{
+        cipher_suite => cipher_atom_to_code(Cipher),
+        key_pair => {ServerPubKey, ServerPrivKey},
+        key_share_group => SelectedGroup,
+        session_id => SessionId
+    },
+    ServerHelloOpts =
+        case {SelectedPsk, ExternalPskResult} of
+            {undefined, _} ->
+                ServerHelloOpts0;
+            {_, {ok, #{identity_idx := Idx, mode := SelMode}}} ->
+                ServerHelloOpts0#{
+                    selected_psk_identity => Idx,
+                    selected_psk_mode => SelMode
+                }
+        end,
+    {ServerHello, _ServerPrivKey2} = quic_tls:build_server_hello(ServerHelloOpts),
+
+    %% Transcript base: empty for a first ClientHello, or the
+    %% synthetic-message_hash + HRR prefix on a post-HRR retry
+    %% (already stored in tls_transcript when the HRR was sent).
+    Transcript0 =
+        case State#state.hrr_sent of
+            true -> State#state.tls_transcript;
+            false -> <<>>
+        end,
+    Transcript = <<Transcript0/binary, OriginalMsg/binary, ServerHello/binary>>,
+    TranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
+
+    %% Derive handshake secrets. psk_ke (PSK-only) uses zero IKM
+    %% per RFC 8446 §7.1; psk_dhe_ke and standard handshakes use
+    %% the ECDHE shared secret.
+    HandshakeSecret =
+        case SelectedPsk of
+            #{mode := psk_ke} ->
+                quic_crypto:derive_handshake_secret_psk_only(Cipher, EarlySecret);
+            _ ->
+                quic_crypto:derive_handshake_secret(
+                    Cipher, EarlySecret, SharedSecret
+                )
+        end,
+
+    ClientHsSecret = quic_crypto:derive_client_handshake_secret(
+        Cipher, HandshakeSecret, TranscriptHash
+    ),
+    ServerHsSecret = quic_crypto:derive_server_handshake_secret(
+        Cipher, HandshakeSecret, TranscriptHash
+    ),
+
+    %% Derive handshake keys
+    {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientHsSecret, Cipher),
+    {ServerKey, ServerIV, ServerHP} = quic_keys:derive_keys(ServerHsSecret, Cipher),
+
+    ClientHsKeys = #crypto_keys{
+        key = ClientKey, iv = ClientIV, hp = ClientHP, cipher = Cipher
+    },
+    ServerHsKeys = #crypto_keys{
+        key = ServerKey, iv = ServerIV, hp = ServerHP, cipher = Cipher
+    },
+
+    %% Update DCID from ClientHello SCID
+    %% quic_tls decodes the initial_source_connection_id param as initial_scid
+    ClientSCID = maps:get(initial_scid, TP, <<>>),
+
+    State0 = State#state{
+        dcid = ClientSCID,
+        tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
+        tls_transcript = Transcript,
+        tls_private_key = ServerPrivKey,
+        tls_group = SelectedGroup,
+        negotiated_group = SelectedGroup,
+        handshake_secret = HandshakeSecret,
+        client_hs_secret = ClientHsSecret,
+        server_hs_secret = ServerHsSecret,
+        handshake_keys = {ClientHsKeys, ServerHsKeys},
+        alpn = ALPN,
+        early_keys = EarlyKeys,
+        early_data_accepted = (EarlyKeys =/= undefined andalso WantsEarlyData),
+        selected_psk = SelectedPsk
+    },
+    %% Negotiate the CertificateVerify scheme up front (cert
+    %% path only). No common scheme is fatal (RFC 8446 §4.4.3).
+    case negotiate_cert_verify(SelectedPsk, State0) of
+        {error, no_common_sig_alg} ->
+            send_tls_alert(
+                ?TLS_ALERT_HANDSHAKE_FAILURE,
+                <<"no common signature algorithm">>,
+                State0
+            );
+        {ok, CVCode, CVScheme} ->
+            State0b = State0#state{
+                cert_verify_code = CVCode,
+                negotiated_scheme = CVScheme
+            },
+            State1 = apply_peer_transport_params(TP, State0b),
+            State2 = send_server_hello(ServerHello, State1),
+            State3 = send_server_handshake_flight(Cipher, TranscriptHash, State2),
+            maybe_emit_pending_close(State3)
+    end.
+
+%% @private Choose the server's CertificateVerify scheme. PSK
+%% handshakes need none. Cert handshakes intersect the key's schemes
+%% with the client's offer; no overlap is fatal.
+negotiate_cert_verify(SelectedPsk, _State) when SelectedPsk =/= undefined ->
+    {ok, undefined, undefined};
+negotiate_cert_verify(_None, #state{server_private_key = undefined}) ->
+    {ok, undefined, undefined};
+negotiate_cert_verify(_None, State) ->
+    case
+        select_signature_algorithm(
+            State#state.server_private_key,
+            State#state.tls_sig_algs,
+            State#state.peer_sig_algs
+        )
+    of
+        error -> {error, no_common_sig_alg};
+        Code -> {ok, Code, code_to_sig_alg(Code)}
+    end.
+
+%% @private Send a HelloRetryRequest for SelectedGroup and arm the
+%% server to receive the client's second ClientHello. The transcript
+%% is reset to the synthetic message_hash(CH1) + HRR per RFC 8446
+%% §4.4.1. No handshake keys exist yet, so HRR ships at Initial level.
+send_hello_retry_request(SelectedGroup, Cipher, SessionId, OriginalMsg, State) ->
+    CH1Hash = quic_crypto:transcript_hash(Cipher, OriginalMsg),
+    Prefix = quic_crypto:hrr_transcript_prefix(Cipher, CH1Hash),
+    HRR = quic_tls:build_hello_retry_request(
+        SessionId, cipher_atom_to_code(Cipher), SelectedGroup
+    ),
+    Transcript = <<Prefix/binary, HRR/binary>>,
+    State1 = State#state{
+        hrr_sent = true,
+        hrr_group = SelectedGroup,
+        tls_transcript = Transcript,
+        initial_tx_off = byte_size(HRR)
+    },
+    send_initial_packet(quic_frame:encode({crypto, 0, HRR}), State1).
+
+%% @private Client-side HelloRetryRequest handling (RFC 8446 §4.1.4).
+%% Validates the one-HRR and group rules, rebuilds CH2 reusing CH1's
+%% random + session_id, and rewrites the transcript to the synthetic
+%% message_hash(CH1) + HRR prefix.
+handle_hello_retry_request(
+    #{cipher := Cipher, selected_group := SelGroup}, HrrMsg, State
+) ->
+    Ch1Opts = State#state.tls_ch1_opts,
+    PskOffered =
+        Ch1Opts =/= undefined andalso
+            (maps:get(external_psk, Ch1Opts, undefined) =/= undefined orelse
+                maps:get(session_ticket, Ch1Opts, undefined) =/= undefined),
+    GroupOffered = lists:member(SelGroup, State#state.tls_groups),
+    case {State#state.hrr_sent, PskOffered, GroupOffered} of
+        {true, _, _} ->
+            %% A second HRR is illegal (RFC 8446 §4.1.4).
+            notify_owner({error, {tls_alert, unexpected_message}}, State),
+            send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State);
+        {_, true, _} ->
+            %% PSK + HRR is out of scope for v1; aborting avoids a
+            %% silent binder-recompute gap.
+            notify_owner({error, {tls_alert, unexpected_message}}, State),
+            send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State);
+        {_, _, false} ->
+            %% Server picked a group we never offered.
+            notify_owner({error, {tls_alert, illegal_parameter}}, State),
+            send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
+        {false, false, true} ->
+            %% Synthetic transcript: message_hash(CH1) || HRR. The
+            %% current transcript holds exactly CH1.
+            CH1Hash = quic_crypto:transcript_hash(Cipher, State#state.tls_transcript),
+            Prefix = quic_crypto:hrr_transcript_prefix(Cipher, CH1Hash),
+            BaseTranscript = <<Prefix/binary, HrrMsg/binary>>,
+
+            %% Rebuild CH2: same random + session_id, key_share moved
+            %% to the server-selected group. supported_groups stays.
+            Ch2Opts = Ch1Opts#{
+                key_share_group => SelGroup,
+                retry_random => State#state.tls_ch1_random,
+                retry_session_id => <<>>
+            },
+            {CH2, PrivKey, _Random} = quic_tls:build_client_hello(Ch2Opts),
+            Transcript = <<BaseTranscript/binary, CH2/binary>>,
+
+            Off = State#state.initial_tx_off,
+            CryptoFrame = quic_frame:encode({crypto, Off, CH2}),
+            State1 = State#state{
+                hrr_sent = true,
+                hrr_group = SelGroup,
+                tls_group = SelGroup,
+                tls_private_key = PrivKey,
+                tls_transcript = Transcript,
+                initial_tx_off = Off + byte_size(CH2)
+            },
+            send_initial_packet(CryptoFrame, State1)
+    end.
 
 %%====================================================================
 %% Internal Functions - Stream Processing
@@ -5962,21 +6207,87 @@ derive_initial_keys(DCID, Version) ->
     },
     {ClientKeys, ServerKeys}.
 
-%% Select signature algorithm based on private key type
-select_signature_algorithm({'ECPrivateKey', _, _, {namedCurve, {1, 2, 840, 10045, 3, 1, 7}}, _, _}) ->
-    %% secp256r1 / P-256
-    ?SIG_ECDSA_SECP256R1_SHA256;
-select_signature_algorithm({'ECPrivateKey', _, _, {namedCurve, {1, 3, 132, 0, 34}}, _, _}) ->
-    %% secp384r1 / P-384
-    ?SIG_ECDSA_SECP384R1_SHA384;
-select_signature_algorithm({'ECPrivateKey', _, _, _, _, _}) ->
-    %% Default EC to P-256
-    ?SIG_ECDSA_SECP256R1_SHA256;
-select_signature_algorithm({'RSAPrivateKey', _, _, _, _, _, _, _, _, _, _}) ->
-    ?SIG_RSA_PSS_RSAE_SHA256;
-select_signature_algorithm(_) ->
-    %% Default to RSA PSS
-    ?SIG_RSA_PSS_RSAE_SHA256.
+%% Pick the client's CertificateVerify scheme for mTLS: intersect the
+%% server's advertised schemes with the client key's schemes, falling
+%% back to the key's natural scheme when the server offered none.
+client_cert_verify_code(#state{client_private_key = Key, peer_sig_algs = Offered}) ->
+    case Offered of
+        [] ->
+            select_signature_algorithm(Key);
+        _ ->
+            case select_signature_algorithm(Key, undefined, Offered) of
+                error -> select_signature_algorithm(Key);
+                Code -> Code
+            end
+    end.
+
+%% Build a CertificateRequest advertising the server's configured
+%% signature schemes (defaults when none set).
+build_cert_request(#state{tls_sig_algs = undefined}) ->
+    quic_tls:build_certificate_request(<<>>);
+build_cert_request(#state{tls_sig_algs = SigAlgs}) ->
+    quic_tls:build_certificate_request(<<>>, SigAlgs).
+
+%% Select signature algorithm based on private key type (mTLS client
+%% path, no negotiation; picks the key's natural scheme).
+select_signature_algorithm(PrivateKey) ->
+    hd(compatible_sig_schemes_codes(PrivateKey) ++ [?SIG_RSA_PSS_RSAE_SHA256]).
+
+%% CertificateVerify scheme negotiation (RFC 8446 §4.4.3). Intersects
+%% the schemes the private key can produce (server preference order,
+%% optionally narrowed by `signature_algs') with the peer's offered
+%% list. `rsa_pkcs1_*` is never selected for CertificateVerify.
+%% Returns the wire code, or `error' when there is no common scheme.
+select_signature_algorithm(PrivateKey, ServerSigAlgs, ClientOfferedCodes) ->
+    KeyCodes = compatible_sig_schemes_codes(PrivateKey),
+    Allowed =
+        case ServerSigAlgs of
+            undefined -> KeyCodes;
+            Atoms -> [C || C <- KeyCodes, lists:member(code_to_sig_alg(C), Atoms)]
+        end,
+    case [C || C <- Allowed, lists:member(C, ClientOfferedCodes)] of
+        [Code | _] -> Code;
+        [] -> error
+    end.
+
+%% Wire codes the given private key can sign CertificateVerify with,
+%% in preference order. Excludes rsa_pkcs1_* (RFC 8446 §4.4.3).
+%% Ed25519 decodes to an ECPrivateKey tuple carrying OID 1.3.101.112;
+%% match it before the generic EC clauses.
+compatible_sig_schemes_codes({'ECPrivateKey', _, _, {namedCurve, {1, 3, 101, 112}}, _, _}) ->
+    [?SIG_ED25519];
+compatible_sig_schemes_codes(
+    {'ECPrivateKey', _, _, {namedCurve, {1, 2, 840, 10045, 3, 1, 7}}, _, _}
+) ->
+    [?SIG_ECDSA_SECP256R1_SHA256];
+compatible_sig_schemes_codes({'ECPrivateKey', _, _, {namedCurve, {1, 3, 132, 0, 34}}, _, _}) ->
+    [?SIG_ECDSA_SECP384R1_SHA384];
+compatible_sig_schemes_codes({'ECPrivateKey', _, _, _, _, _}) ->
+    [?SIG_ECDSA_SECP256R1_SHA256];
+compatible_sig_schemes_codes({'RSAPrivateKey', _, _, _, _, _, _, _, _, _, _}) ->
+    [?SIG_RSA_PSS_RSAE_SHA256, ?SIG_RSA_PSS_RSAE_SHA384, ?SIG_RSA_PSS_RSAE_SHA512];
+compatible_sig_schemes_codes(Key) ->
+    case is_ed25519_key(Key) of
+        true -> [?SIG_ED25519];
+        false -> [?SIG_RSA_PSS_RSAE_SHA256]
+    end.
+
+%% Recognise an Ed25519 private key across the OTP representations
+%% (tagged tuple, or an ECPrivateKey tuple carrying the Ed25519 OID
+%% 1.3.101.112). Tuple form avoids depending on the public_key hrl.
+is_ed25519_key({ed_pri, ed25519, _Pub, _Priv}) -> true;
+is_ed25519_key({'ECPrivateKey', _, _, {namedCurve, {1, 3, 101, 112}}, _, _}) -> true;
+is_ed25519_key(_) -> false.
+
+%% Map a signature-scheme wire code to its atom.
+code_to_sig_alg(?SIG_ECDSA_SECP256R1_SHA256) -> ecdsa_secp256r1_sha256;
+code_to_sig_alg(?SIG_ECDSA_SECP384R1_SHA384) -> ecdsa_secp384r1_sha384;
+code_to_sig_alg(?SIG_RSA_PSS_RSAE_SHA256) -> rsa_pss_rsae_sha256;
+code_to_sig_alg(?SIG_RSA_PSS_RSAE_SHA384) -> rsa_pss_rsae_sha384;
+code_to_sig_alg(?SIG_RSA_PSS_RSAE_SHA512) -> rsa_pss_rsae_sha512;
+code_to_sig_alg(?SIG_ED25519) -> ed25519;
+code_to_sig_alg(?SIG_RSA_PKCS1_SHA256) -> rsa_pkcs1_sha256;
+code_to_sig_alg(_) -> unknown.
 
 %% Check if we should transition to a new state
 check_state_transition(CurrentState, State) ->
@@ -7713,17 +8024,28 @@ send_connection_close(Reason, State) ->
     end,
     ok.
 
-%% Send TLS alert as QUIC crypto error and close connection
-%% QUIC crypto errors are 0x100 + TLS alert code (RFC 9001 Section 4.8)
+%% Send TLS alert as QUIC crypto error and close connection.
+%% QUIC crypto errors are 0x100 + TLS alert code (RFC 9001 §4.8).
+%% The /2 form defaults the close reason phrase per alert code.
 send_tls_alert(AlertCode, State) ->
+    send_tls_alert(AlertCode, default_alert_phrase(AlertCode), State).
+
+%% Emit the alert at the highest available encryption level
+%% (app -> handshake -> initial). Pre-handshake negotiation errors
+%% (HRR-phase) ship at the Initial level, where only initial_keys
+%% exist, instead of being silently dropped.
+send_tls_alert(AlertCode, Phrase, State) ->
     ErrorCode = ?QUIC_CRYPTO_ERROR_BASE + AlertCode,
-    CloseFrame = {connection_close, transport, ErrorCode, 0, <<"certificate verify failed">>},
-    case State#state.handshake_keys of
-        undefined ->
-            State#state{close_reason = {tls_alert, AlertCode}};
-        _ ->
-            send_frame(CloseFrame, State#state{close_reason = {tls_alert, AlertCode}})
-    end.
+    CloseState = State#state{close_reason = {tls_alert, AlertCode}},
+    CloseFrame = {connection_close, transport, ErrorCode, 0, Phrase},
+    emit_close_at_level(select_close_level(app, CloseState), CloseFrame, CloseState).
+
+default_alert_phrase(?TLS_ALERT_HANDSHAKE_FAILURE) -> <<"handshake failure">>;
+default_alert_phrase(?TLS_ALERT_ILLEGAL_PARAMETER) -> <<"illegal parameter">>;
+default_alert_phrase(?TLS_ALERT_UNEXPECTED_MESSAGE) -> <<"unexpected message">>;
+default_alert_phrase(?TLS_ALERT_DECRYPT_ERROR) -> <<"decrypt error">>;
+default_alert_phrase(?TLS_ALERT_UNKNOWN_PSK_IDENTITY) -> <<"unknown psk identity">>;
+default_alert_phrase(_) -> <<"tls alert">>.
 
 %% Check timeouts
 check_timeouts(State) ->

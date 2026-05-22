@@ -86,6 +86,20 @@
 - [x] ALPN negotiation
 - [x] Transport parameters exchange
 - [x] Certificate verification
+- [x] HelloRetryRequest (RFC 8446 §4.1.4)
+
+### Key-exchange groups
+- [x] x25519 (default)
+- [x] secp256r1, secp384r1 (opt-in via `groups`)
+- [x] Multi-group `key_share` + `supported_groups` negotiation
+- [ ] secp521r1, x448 (constants only; see Roadmap)
+
+### Signature algorithms
+- [x] ECDSA secp256r1-SHA256, secp384r1-SHA384
+- [x] RSA-PSS-RSAE SHA256/384/512
+- [x] Ed25519
+- [x] Per-handshake `signature_algorithms` negotiation (`signature_algs`)
+- [ ] Ed448, ECDSA secp521r1-SHA512 (constants only; see Roadmap)
 
 ### Encryption
 - [x] AES-128-GCM cipher suite
@@ -309,6 +323,15 @@ mark known gaps that may land in a later release.
 - [ ] RFC 9258 PSK Importer. The current API consumes the secret as
   raw IKM; an importer layer would derive an `epsk -> psk` mapping
   bound to a target protocol/KDF.
+
+### TLS 1.3 negotiation follow-ups
+- [ ] secp521r1 / x448 key-exchange groups (constants defined; key
+  generation and key_share wiring deferred).
+- [ ] Ed448 / ECDSA secp521r1-SHA512 signature schemes (constants
+  defined; sign/verify branches deferred).
+- [ ] PSK + HelloRetryRequest in one handshake. Currently the client
+  aborts if HRR follows a PSK ClientHello (binder recompute over the
+  synthetic transcript is not implemented).
 
 ## Interop Runner Compliance
 

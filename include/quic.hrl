@@ -220,6 +220,8 @@
 %% TLS 1.3 Alerts (RFC 8446 Section 6)
 %%====================================================================
 
+-define(TLS_ALERT_UNEXPECTED_MESSAGE, 10).
+-define(TLS_ALERT_HANDSHAKE_FAILURE, 40).
 -define(TLS_ALERT_ILLEGAL_PARAMETER, 47).
 -define(TLS_ALERT_DECRYPT_ERROR, 51).
 -define(TLS_ALERT_UNKNOWN_PSK_IDENTITY, 115).
@@ -242,6 +244,43 @@
     %% offered modes in client preference order
     modes = [psk_dhe_ke] :: [psk_dhe_ke | psk_ke]
 }).
+
+%% HelloRetryRequest sentinel random (RFC 8446 §4.1.3): SHA-256 of
+%% "HelloRetryRequest". A ServerHello carrying this random IS an HRR.
+-define(TLS_HRR_RANDOM, <<
+    16#CF,
+    16#21,
+    16#AD,
+    16#74,
+    16#E5,
+    16#9A,
+    16#61,
+    16#11,
+    16#BE,
+    16#1D,
+    16#8C,
+    16#02,
+    16#1E,
+    16#65,
+    16#B8,
+    16#91,
+    16#C2,
+    16#A2,
+    16#11,
+    16#16,
+    16#7A,
+    16#BB,
+    16#8C,
+    16#5E,
+    16#07,
+    16#9E,
+    16#09,
+    16#E2,
+    16#C8,
+    16#A8,
+    16#33,
+    16#9C
+>>).
 
 %%====================================================================
 %% TLS 1.3 Named Groups (RFC 8446 Section 4.2.7)

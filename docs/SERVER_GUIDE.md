@@ -34,6 +34,15 @@ application:ensure_all_started(quic).
 |--------|------|---------|-------------|
 | `alpn` | [binary()] | `[<<"h3">>]` | ALPN protocols to advertise |
 | `cert_chain` | [binary()] | `[]` | Additional certificate chain |
+| `groups` | [atom()] | `[x25519]` | Accepted key-exchange groups in preference order (`x25519`, `secp256r1`, `secp384r1`). A client whose `key_share` matches none of these but whose `supported_groups` does triggers a HelloRetryRequest. |
+| `signature_algs` | [atom()] | historical list | Accepted/advertised signature schemes. The CertificateVerify scheme is the server's first choice the client also offered (`rsa_pkcs1_*` is never used for CertificateVerify). |
+| `psks` / `psk_callback` | map / fun | - | TLS 1.3 external PSK; see [PSK.md](PSK.md). |
+
+The signature scheme is derived from the server's key type by
+default; `signature_algs` only needs setting to restrict or reorder
+the advertised set. A server pinned to `groups => [secp256r1]`
+exercises the HelloRetryRequest path for x25519-only clients that
+also advertise `secp256r1`.
 
 ### Connection Options
 
