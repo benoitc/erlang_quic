@@ -76,7 +76,7 @@
     gro_receiver :: pid() | undefined,
     port :: inet:port_number(),
     %% Cert + private_key are optional; PSK-only listeners run with
-    %% both `undefined` and rely on `psks` / `psk_callback`.
+    %% both `undefined' and rely on `psks' / `psk_callback'.
     cert :: binary() | undefined,
     cert_chain :: [binary()],
     private_key :: term() | undefined,

@@ -342,9 +342,9 @@ transcript_hash(HashOrCipher, Messages) ->
     Hash = cipher_to_hash(HashOrCipher),
     crypto:hash(Hash, Messages).
 
-%% @doc Synthetic `message_hash` handshake message that replaces
+%% @doc Synthetic `message_hash' handshake message that replaces
 %% ClientHello1 in the transcript after a HelloRetryRequest
-%% (RFC 8446 §4.4.1). `HashClientHello1` is the digest over the
+%% (RFC 8446 §4.4.1). `HashClientHello1' is the digest over the
 %% complete CH1 handshake message. Both peers prepend the result
 %% to the post-HRR transcript.
 -spec hrr_transcript_prefix(atom(), binary()) -> binary().

@@ -86,11 +86,11 @@
 %% Returns: {ClientHelloMsg, PrivateKey, Random}
 -spec build_client_hello(map()) -> {binary(), binary(), binary()}.
 build_client_hello(Opts) ->
-    %% Key-share group: the head of `groups` (default x25519). The
+    %% Key-share group: the head of `groups' (default x25519). The
     %% remaining groups are advertised in supported_groups so the
     %% server can request one via HelloRetryRequest.
     Groups = maps:get(groups, Opts, default_groups()),
-    %% Group that gets the key_share entry: the head of `groups`, or an
+    %% Group that gets the key_share entry: the head of `groups', or an
     %% explicit override (used by a HelloRetryRequest retry where
     %% supported_groups is unchanged but the share moves to the
     %% server-selected group).
@@ -180,7 +180,7 @@ psk_offer_from_external({Identity, Secret, Modes}) when
 ->
     %% Currently only TLS_AES_128_GCM_SHA256 is supported; binder
     %% length, key schedule hash and HKDF all key off this. When more
-    %% suites land, surface a `cipher` option here.
+    %% suites land, surface a `cipher' option here.
     #psk_offer{
         type = external,
         identity = Identity,
@@ -239,7 +239,7 @@ build_client_hello_standard(Random, PubKey, PrivKey, Opts) ->
     Msg = encode_handshake_message(?TLS_CLIENT_HELLO, ClientHello),
     {Msg, PrivKey, Random}.
 
-%% Build ClientHello with `pre_shared_key` extension for either a
+%% Build ClientHello with `pre_shared_key' extension for either a
 %% resumption ticket or an external PSK.
 %% RFC 8446 §4.2.11: pre_shared_key MUST be the last extension; the
 %% binder is computed over the truncated ClientHello (everything
@@ -255,7 +255,7 @@ build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer)
     } = Offer,
 
     %% Base extensions advertise the configured PSK modes (drives the
-    %% server's `psk_key_exchange_modes` decision).
+    %% server's `psk_key_exchange_modes' decision).
     OptsWithModes = Opts#{psk_modes => Modes},
     BaseExtensions = build_client_hello_extensions(PubKey, OptsWithModes),
 
@@ -386,7 +386,7 @@ build_client_hello_extensions(PubKey, Opts) ->
     ),
 
     %% PSK Key Exchange Modes — list of bytes per RFC 8446 §4.2.9.
-    %% Defaults to `psk_dhe_ke` only; callers offering external PSK
+    %% Defaults to `psk_dhe_ke' only; callers offering external PSK
     %% may pass `psk_modes => [psk_ke, psk_dhe_ke]` etc.
     Modes = maps:get(psk_modes, Opts, [psk_dhe_ke]),
     ModeBytes = iolist_to_binary([encode_psk_mode(M) || M <- Modes]),
@@ -906,7 +906,7 @@ parse_extensions(Data) ->
 
 %% @doc Parse an extensions blob preserving order and byte offsets.
 %% Returns [{Type, Data, ByteOffset, ByteSize}] where ByteOffset is the
-%% position of `Type` within `Data`. Rejects duplicate extension types
+%% position of `Type' within `Data'. Rejects duplicate extension types
 %% per RFC 8446 §4.2 with {error, {duplicate_extension, Type}}; the
 %% caller maps that to an illegal_parameter alert.
 -spec parse_extensions_ordered(binary()) ->
@@ -1327,7 +1327,7 @@ decode_psk_mode(Other) -> {unknown, Other}.
 %% @private
 %% Locate the pre_shared_key extension and compute the offset (within
 %% the extensions blob) of the binders-length field. Returns a map
-%% `#{ext_offset, binders_offset, binders_size}` or `undefined` if no
+%% `#{ext_offset, binders_offset, binders_size}` or `undefined' if no
 %% PSK was offered.
 psk_binders_offset(OrderedExts, _ExtBlob) ->
     case lists:keyfind(?EXT_PRE_SHARED_KEY, 1, OrderedExts) of
@@ -1357,20 +1357,20 @@ psk_binders_offset(OrderedExts, _ExtBlob) ->
 
 %% @doc Select a PSK from a ClientHello and verify the binder.
 %%
-%% `ClientHelloMap` is the result of `parse_client_hello/1`.
-%% `FullHandshakeMsg` is the raw 4-byte-headered handshake bytes for
+%% `ClientHelloMap' is the result of `parse_client_hello/1'.
+%% `FullHandshakeMsg' is the raw 4-byte-headered handshake bytes for
 %%   ClientHello (msg_type + length + body) — needed to compute the
 %%   truncated ClientHello hash for binder verification.
-%% `PskConfig` is `#{psk_callback => Fn | undefined,
+%% `PskConfig' is `#{psk_callback => Fn | undefined,
 %%                   psks => Map | undefined}`.
-%% `ServerModes` is the list of psk_key_exchange modes the server is
+%% `ServerModes' is the list of psk_key_exchange modes the server is
 %%   willing to negotiate (defaults to `[psk_dhe_ke]`).
 %%
 %% Returns:
 %%   `{ok, #{identity_idx => N, secret => Secret, mode => Mode}}` on
 %%   successful selection (identity found, binder verified, modes
 %%   compatible);
-%%   `none` when the client didn't offer pre_shared_key OR offered
+%%   `none' when the client didn't offer pre_shared_key OR offered
 %%   identities don't match local config OR no compatible mode
 %%   (caller falls through to cert path or sends
 %%   unknown_psk_identity);

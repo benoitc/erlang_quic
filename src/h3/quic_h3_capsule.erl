@@ -4,7 +4,7 @@
 %%%
 %%% A capsule is a reliable framed unit carried on the body of an
 %%% extended-CONNECT request stream, distinct from the unreliable HTTP
-%%% Datagrams delivered via `quic_h3:send_datagram/3`. The wire format
+%%% Datagrams delivered via `quic_h3:send_datagram/3'. The wire format
 %%% is simply `Type (varint) | Length (varint) | Value`.
 %%%
 %%% We expose encode/2 and decode/1 as low-level primitives. Higher
