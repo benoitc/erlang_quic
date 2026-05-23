@@ -3275,18 +3275,27 @@ do_send_response(
             end
     end.
 
-%% Final response (>= 200): buffer the HEADERS so they coalesce into the same
-%% QUIC packet as the first body chunk (flushed by do_send_data/4 or
-%% do_send_trailers/3). The QPACK encoder instructions were already sent,
-%% preserving RFC 9204 ordering. Informational (1xx) responses are sent
-%% promptly and never buffered.
-finish_send_response(StreamId, Status, HeadersFrame, Stream1, State) when Status >= 200 ->
+%% Final response (>= 200) on a normal request: buffer the HEADERS so they
+%% coalesce into the same QUIC packet as the first body chunk (flushed by
+%% do_send_data/4 or do_send_trailers/3). The QPACK encoder instructions were
+%% already sent, preserving RFC 9204 ordering.
+%%
+%% A CONNECT response and informational (1xx) responses are sent immediately,
+%% never buffered: a CONNECT tunnel's 200 must reach the client before any
+%% tunnel DATA (and the server may send none until the client does), so
+%% buffering it would deadlock the tunnel.
+finish_send_response(StreamId, Status, HeadersFrame, Stream1, State) when
+    Status >= 200, not Stream1#h3_stream.is_connect
+->
     Pending = maps:put(StreamId, HeadersFrame, State#state.pending_response_headers),
     {ok, State#state{
         streams = (State#state.streams)#{StreamId => Stream1},
         pending_response_headers = Pending
     }};
 finish_send_response(StreamId, _Status, HeadersFrame, Stream1, State) ->
+    send_response_headers_now(StreamId, HeadersFrame, Stream1, State).
+
+send_response_headers_now(StreamId, HeadersFrame, Stream1, State) ->
     case quic:send_data(State#state.quic_conn, StreamId, HeadersFrame, false) of
         ok ->
             {ok, State#state{streams = (State#state.streams)#{StreamId => Stream1}}};
