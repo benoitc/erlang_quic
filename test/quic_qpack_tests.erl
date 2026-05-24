@@ -91,6 +91,39 @@ static_table_content_type_test() ->
     ?assertEqual(Headers, Decoded).
 
 %%====================================================================
+%% Byte-vector Tests (RFC 9204 wire format)
+%%
+%% The round-trip tests above pass even when the encoder emits a
+%% malformed prefix, because the bundled decoder is lenient. These
+%% assert the exact bytes a conformant peer (e.g. nghttp3) would see.
+%%====================================================================
+
+field_section_prefix_static_only_test() ->
+    %% RFC 9204 Section 4.5.1: a static-only field section carries
+    %% Required Insert Count 0 and Base 0, encoded as S=0, DeltaBase=0.
+    %% The two-byte prefix is therefore `00 00`. A Base byte of 0x80
+    %% (S=1) would mean Base = RIC - DeltaBase - 1 = -1 and is rejected
+    %% as QPACK_DECOMPRESSION_FAILED.
+    Encoded = quic_qpack:encode([{<<":status">>, <<"200">>}]),
+    ?assertMatch(<<16#00, 16#00, _/binary>>, Encoded).
+
+encode_status_200_bytes_test() ->
+    %% Prefix `00 00` + `:status 200` as static index 25 (indexed field
+    %% line `11011001` = 0xD9).
+    Encoded = quic_qpack:encode([{<<":status">>, <<"200">>}]),
+    ?assertEqual(<<16#00, 16#00, 16#D9>>, Encoded).
+
+encode_response_headers_bytes_test() ->
+    %% Prefix `00 00` + `:status 200` (0xD9) + `content-length 1`:
+    %% literal with name reference to static index 4 (`01010100` = 0x54),
+    %% value "1" as a one-byte literal string (`01` length, `31`).
+    Encoded = quic_qpack:encode([
+        {<<":status">>, <<"200">>},
+        {<<"content-length">>, <<"1">>}
+    ]),
+    ?assertEqual(<<16#00, 16#00, 16#D9, 16#54, 16#01, 16#31>>, Encoded).
+
+%%====================================================================
 %% Literal Header Tests
 %%====================================================================
 

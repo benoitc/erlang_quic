@@ -162,12 +162,16 @@ encode(Headers, State) ->
             false -> 0
         end,
 
-    %% Encode prefix: Required Insert Count + Base (Section 4.5.1)
-    %% Per RFC 9204 Section 4.5.1.2:
-    %% S=1, DeltaBase=0 means Base = RIC + DeltaBase = RIC
+    %% Encode prefix: Required Insert Count + Base (RFC 9204 Section 4.5.1).
+    %% This encoder always sets Base = Required Insert Count. Per Section
+    %% 4.5.1.2 that is the S=0 case (Base = RIC + DeltaBase) with DeltaBase = 0,
+    %% i.e. a Base byte of 0x00. Encoding S=1 (0x80) instead means
+    %% Base = RIC - DeltaBase - 1 = RIC - 1, so for the static-only RIC = 0
+    %% it yields Base = -1 and a conformant decoder (e.g. nghttp3) rejects
+    %% the field section with QPACK_DECOMPRESSION_FAILED.
     RICEncoded = encode_ric(RIC, State#qpack.dyn_max_size),
-    %% S=1 (bit 7), DeltaBase=0 (bits 0-6)
-    BaseEncoded = 16#80,
+    %% S=0 (bit 7), DeltaBase=0 (bits 0-6) -> Base = RIC.
+    BaseEncoded = 16#00,
     Prefix = <<RICEncoded, BaseEncoded>>,
 
     {<<Prefix/binary, EncodedHeaders/binary>>, NewState#qpack{last_ric = RIC}}.
