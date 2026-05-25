@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-05-25
+
+### Fixed
+- QPACK Encoded Field Section Prefix and dynamic table now follow RFC 9204, so the encoder interoperates with strict decoders such as nghttp3. The Base is signalled as S=0 (Base = Required Insert Count), the Required Insert Count is written as an 8-bit prefix integer, and the Insert With Literal Name opcode and dynamic-table field-section encoding are corrected. (#142)
+
 ## [1.4.2] - 2026-05-23
 
 ### Fixed
