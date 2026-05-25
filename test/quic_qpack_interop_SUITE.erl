@@ -29,6 +29,10 @@
     decode_nghttp3_fb_req_static/1,
     decode_nghttp3_fb_resp_static/1,
     decode_ls_qpack_netbsd_static/1,
+    decode_nghttp3_netbsd_dynamic/1,
+    decode_nghttp3_netbsd_dynamic_small/1,
+    decode_nghttp3_fb_req_dynamic/1,
+    decode_nghttp3_fb_resp_dynamic/1,
     roundtrip_netbsd_qif/1,
     roundtrip_fb_req_qif/1
 ]).
@@ -46,6 +50,10 @@ all() ->
         decode_nghttp3_fb_req_static,
         decode_nghttp3_fb_resp_static,
         decode_ls_qpack_netbsd_static,
+        decode_nghttp3_netbsd_dynamic,
+        decode_nghttp3_netbsd_dynamic_small,
+        decode_nghttp3_fb_req_dynamic,
+        decode_nghttp3_fb_resp_dynamic,
         roundtrip_netbsd_qif,
         roundtrip_fb_req_qif
     ].
@@ -122,6 +130,28 @@ decode_ls_qpack_netbsd_static(Config) ->
         true -> decode_and_compare(EncodedFile, QifFile);
         false -> {skip, "ls-qpack encoded file not found"}
     end.
+
+%%====================================================================
+%% Test Cases - Decode nghttp3 dynamic-table output (capacity > 0)
+%%
+%% Stream 0 carries the encoder-stream instructions (inserts / set
+%% capacity); other streams carry field sections that reference the
+%% dynamic table. These fixtures use maxblocked = 0, so an entry's
+%% encoder-stream insert always precedes the field section using it.
+%%====================================================================
+
+decode_nghttp3_netbsd_dynamic(Config) ->
+    decode_dynamic_fixture(Config, "netbsd", 4096).
+
+%% Small capacity forces eviction on the decoder's dynamic table.
+decode_nghttp3_netbsd_dynamic_small(Config) ->
+    decode_dynamic_fixture(Config, "netbsd", 256).
+
+decode_nghttp3_fb_req_dynamic(Config) ->
+    decode_dynamic_fixture(Config, "fb-req", 4096).
+
+decode_nghttp3_fb_resp_dynamic(Config) ->
+    decode_dynamic_fixture(Config, "fb-resp", 4096).
 
 %%====================================================================
 %% Test Cases - Round-trip our own encoding
@@ -209,6 +239,46 @@ decode_encoded_blocks(<<_StreamId:64/big, Length:32/big, Rest/binary>>, State, A
             ct:fail({decode_error, Reason, byte_size(EncodedBlock)})
     end;
 decode_encoded_blocks(Bin, _State, _Acc) ->
+    ct:fail({invalid_encoded_format, byte_size(Bin)}).
+
+%% Decode a dynamic-table fixture (capacity > 0) and compare with the QIF.
+decode_dynamic_fixture(Config, Name, Capacity) ->
+    QifsDir = ?config(qifs_dir, Config),
+    Encoded = Name ++ ".out." ++ integer_to_list(Capacity) ++ ".0.0",
+    EncodedFile = filename:join([QifsDir, "encoded", "qpack-06", "nghttp3", Encoded]),
+    QifFile = filename:join([QifsDir, "qifs", Name ++ ".qif"]),
+    {ok, EncodedBin} = file:read_file(EncodedFile),
+    {ok, QifBin} = file:read_file(QifFile),
+    ExpectedBlocks = parse_qif(QifBin),
+    DecodedBlocks = decode_dynamic_encoded_file(EncodedBin, Capacity),
+    ?assertEqual(length(ExpectedBlocks), length(DecodedBlocks)),
+    compare_blocks(ExpectedBlocks, DecodedBlocks, 1),
+    ok.
+
+%% Like decode_encoded_file/1 but threads a dynamic-table state: stream 0 is
+%% the encoder stream (process_encoder_instructions), every other stream is a
+%% field section (decode). Only field sections yield comparable header blocks.
+decode_dynamic_encoded_file(Bin, Capacity) ->
+    State = quic_qpack:new(#{max_dynamic_size => Capacity}),
+    decode_dynamic_blocks(Bin, State, []).
+
+decode_dynamic_blocks(<<>>, _State, Acc) ->
+    lists:reverse(Acc);
+decode_dynamic_blocks(<<0:64/big, Length:32/big, Rest/binary>>, State, Acc) ->
+    <<Block:Length/binary, Rest2/binary>> = Rest,
+    {ok, State1} = quic_qpack:process_encoder_instructions(Block, State),
+    decode_dynamic_blocks(Rest2, State1, Acc);
+decode_dynamic_blocks(<<_StreamId:64/big, Length:32/big, Rest/binary>>, State, Acc) ->
+    <<Block:Length/binary, Rest2/binary>> = Rest,
+    case quic_qpack:decode(Block, State) of
+        {{ok, Headers}, State1} ->
+            decode_dynamic_blocks(Rest2, State1, [Headers | Acc]);
+        {{blocked, RIC}, _} ->
+            ct:fail({unexpected_blocked, RIC});
+        {{error, Reason}, _} ->
+            ct:fail({decode_error, Reason})
+    end;
+decode_dynamic_blocks(Bin, _State, _Acc) ->
     ct:fail({invalid_encoded_format, byte_size(Bin)}).
 
 %% Compare two lists of header blocks

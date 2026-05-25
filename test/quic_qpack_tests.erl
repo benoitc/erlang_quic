@@ -91,6 +91,62 @@ static_table_content_type_test() ->
     ?assertEqual(Headers, Decoded).
 
 %%====================================================================
+%% Byte-vector Tests (RFC 9204 wire format)
+%%
+%% The round-trip tests above pass even when the encoder emits a
+%% malformed prefix, because the bundled decoder is lenient. These
+%% assert the exact bytes a conformant peer (e.g. nghttp3) would see.
+%%====================================================================
+
+field_section_prefix_static_only_test() ->
+    %% RFC 9204 Section 4.5.1: a static-only field section carries
+    %% Required Insert Count 0 and Base 0, encoded as S=0, DeltaBase=0.
+    %% The two-byte prefix is therefore `00 00`. A Base byte of 0x80
+    %% (S=1) would mean Base = RIC - DeltaBase - 1 = -1 and is rejected
+    %% as QPACK_DECOMPRESSION_FAILED.
+    Encoded = quic_qpack:encode([{<<":status">>, <<"200">>}]),
+    ?assertMatch(<<16#00, 16#00, _/binary>>, Encoded).
+
+encode_status_200_bytes_test() ->
+    %% Prefix `00 00` + `:status 200` as static index 25 (indexed field
+    %% line `11011001` = 0xD9).
+    Encoded = quic_qpack:encode([{<<":status">>, <<"200">>}]),
+    ?assertEqual(<<16#00, 16#00, 16#D9>>, Encoded).
+
+encode_response_headers_bytes_test() ->
+    %% Prefix `00 00` + `:status 200` (0xD9) + `content-length 1`:
+    %% literal with name reference to static index 4 (`01010100` = 0x54),
+    %% value "1" as a one-byte literal string (`01` length, `31`).
+    Encoded = quic_qpack:encode([
+        {<<":status">>, <<"200">>},
+        {<<"content-length">>, <<"1">>}
+    ]),
+    ?assertEqual(<<16#00, 16#00, 16#D9, 16#54, 16#01, 16#31>>, Encoded).
+
+%%====================================================================
+%% Field Section Prefix Base reconstruction (RFC 9204 Section 4.5.1.2)
+%%
+%%   if Sign == 0: Base = ReqInsertCount + DeltaBase
+%%   else:         Base = ReqInsertCount - DeltaBase - 1
+%%====================================================================
+
+decode_base_sign_zero_test() ->
+    %% S=0: Base = Required Insert Count + Delta Base.
+    ?assertEqual(13, quic_qpack:decode_base(0, 10, 3)).
+
+decode_base_sign_one_test() ->
+    %% S=1: Base = Required Insert Count - Delta Base - 1.
+    ?assertEqual(6, quic_qpack:decode_base(1, 10, 3)).
+
+decode_base_static_only_test() ->
+    %% Static-only prefix (00 00): RIC=0, S=0, DeltaBase=0 -> Base=0.
+    ?assertEqual(0, quic_qpack:decode_base(0, 0, 0)).
+
+decode_base_sign_one_boundary_test() ->
+    %% S=1 with DeltaBase=0 -> Base = RIC - 1.
+    ?assertEqual(4, quic_qpack:decode_base(1, 5, 0)).
+
+%%====================================================================
 %% Literal Header Tests
 %%====================================================================
 
@@ -158,6 +214,98 @@ dynamic_table_capacity_test() ->
     State = quic_qpack:new(#{max_dynamic_size => 4096}),
     ?assertEqual(4096, quic_qpack:get_dynamic_capacity(State)),
     ?assertEqual(0, quic_qpack:get_insert_count(State)).
+
+%%====================================================================
+%% Dynamic Table round-trip (encoder stream + field section)
+%%
+%% Full flow: encode (insert + literal) -> feed encoder instructions to
+%% the decoder -> acknowledge -> re-encode (dynamic reference) -> decode.
+%%====================================================================
+
+%% Insert one entry, acknowledge it, then reference it (RIC = insert_count).
+dynamic_reference_newest_roundtrip_test() ->
+    H = [{<<"x-custom">>, <<"value">>}],
+    E0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    D0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    {_Literal, E1} = quic_qpack:encode(H, 0, E0),
+    {ok, D1} = quic_qpack:process_encoder_instructions(
+        quic_qpack:get_encoder_instructions(E1), D0
+    ),
+    {ok, E2} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(1), quic_qpack:clear_encoder_instructions(E1)
+    ),
+    {Ref, _E3} = quic_qpack:encode(H, 4, E2),
+    %% The re-encode is a dynamic Indexed Field Line (10xxxxxx) after the
+    %% 2-byte prefix, not another literal.
+    <<_Prefix:2/binary, Tag:2, _/bitstring>> = Ref,
+    ?assertEqual(2#10, Tag),
+    ?assertEqual({ok, H}, element(1, quic_qpack:decode(Ref, D1))).
+
+%% Reference a NON-newest entry (RIC < insert_count). The field section must
+%% signal Base = insert_count (DeltaBase = insert_count - RIC); signalling
+%% Base = RIC made the decoder resolve the wrong absolute index.
+dynamic_reference_older_entry_roundtrip_test() ->
+    A = {<<"a">>, <<"1">>},
+    B = {<<"b">>, <<"2">>},
+    E0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    D0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    {_, E1} = quic_qpack:encode([A], 0, E0),
+    {ok, D1} = quic_qpack:process_encoder_instructions(
+        quic_qpack:get_encoder_instructions(E1), D0
+    ),
+    {_, E2} = quic_qpack:encode([B], 4, quic_qpack:clear_encoder_instructions(E1)),
+    {ok, D2} = quic_qpack:process_encoder_instructions(
+        quic_qpack:get_encoder_instructions(E2), D1
+    ),
+    {ok, E3} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(2), quic_qpack:clear_encoder_instructions(E2)
+    ),
+    {Ref, _E4} = quic_qpack:encode([A], 8, E3),
+    ?assertEqual({ok, [A]}, element(1, quic_qpack:decode(Ref, D2))).
+
+%% A field section that arrives before its encoder-stream inserts decodes as
+%% {blocked, RIC}; once the inserts are processed, the retry succeeds.
+dynamic_blocked_stream_recovery_test() ->
+    H = [{<<"x-custom">>, <<"value">>}],
+    E0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    D0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    {_, E1} = quic_qpack:encode(H, 0, E0),
+    Instr = quic_qpack:get_encoder_instructions(E1),
+    {ok, E2} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(1), quic_qpack:clear_encoder_instructions(E1)
+    ),
+    {Ref, _E3} = quic_qpack:encode(H, 4, E2),
+    ?assertMatch({blocked, 1}, element(1, quic_qpack:decode(Ref, D0))),
+    {ok, D1} = quic_qpack:process_encoder_instructions(Instr, D0),
+    ?assertEqual({ok, H}, element(1, quic_qpack:decode(Ref, D1))).
+
+%% A Required Insert Count whose encoded value reaches 255 must use the
+%% 8-bit prefix-integer continuation encoding (RFC 9204 Section 4.5.1.1);
+%% packing it as a raw byte truncated the prefix and silently dropped the
+%% section. Insert 254 entries, then reference entry 253 (RIC = 254 ->
+%% encoded insert count 255).
+dynamic_large_insert_count_roundtrip_test() ->
+    Cap = 4096,
+    E0 = quic_qpack:new(#{max_dynamic_size => Cap}),
+    D0 = quic_qpack:new(#{max_dynamic_size => Cap}),
+    {Ef, Df} = lists:foldl(
+        fun(I, {E, D}) ->
+            H = [{<<"h", (integer_to_binary(I))/binary>>, <<"v">>}],
+            {_, E1} = quic_qpack:encode(H, I, E),
+            {ok, D1} = quic_qpack:process_encoder_instructions(
+                quic_qpack:get_encoder_instructions(E1), D
+            ),
+            {quic_qpack:clear_encoder_instructions(E1), D1}
+        end,
+        {E0, D0},
+        lists:seq(0, 253)
+    ),
+    {ok, Eack} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(254), Ef
+    ),
+    H = [{<<"h253">>, <<"v">>}],
+    {Ref, _E} = quic_qpack:encode(H, 999, Eack),
+    ?assertEqual({ok, H}, element(1, quic_qpack:decode(Ref, Df))).
 
 %%====================================================================
 %% Huffman Encoding Tests

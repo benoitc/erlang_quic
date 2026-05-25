@@ -71,6 +71,11 @@
     encode_stream_cancel/1
 ]).
 
+%% Exported for unit tests only.
+-ifdef(TEST).
+-export([decode_base/3]).
+-endif.
+
 %%====================================================================
 %% Types
 %%====================================================================
@@ -151,24 +156,39 @@ new(Opts) ->
 %% @doc Encode headers using QPACK with state.
 -spec encode(headers(), state()) -> {binary(), state()}.
 encode(Headers, State) ->
-    %% First pass: encode headers and track max dynamic table index referenced
-    {EncodedHeaders, NewState, MaxRefIndex} = encode_headers_tracking(Headers, State, <<>>, -1),
+    %% Base is the reference frame for the dynamic relative indices in this
+    %% field section (RFC 9204 Section 3.2.6). The field lines below encode
+    %% each RelIndex relative to the insert count at section start, so snapshot
+    %% it and signal it as the Base. Entries referenced here were inserted (and
+    %% acknowledged) before this section, so their absolute index < BaseIC; the
+    %% running insert count must not be used, as inserts during this section
+    %% would shift the frame between field lines.
+    BaseIC = State#qpack.insert_count,
+    {EncodedHeaders, NewState, MaxRefIndex} = encode_headers_tracking(
+        Headers, BaseIC, State, <<>>, -1
+    ),
 
-    %% Calculate Required Insert Count (RIC)
-    %% RIC = MaxRefIndex + 1 if any dynamic entry was referenced, else 0
+    %% Required Insert Count: 1 + the largest absolute index referenced, or 0
+    %% when no dynamic entry was referenced (RFC 9204 Section 4.5.1.1).
     RIC =
         case MaxRefIndex >= 0 of
             true -> MaxRefIndex + 1;
             false -> 0
         end,
 
-    %% Encode prefix: Required Insert Count + Base (Section 4.5.1)
-    %% Per RFC 9204 Section 4.5.1.2:
-    %% S=1, DeltaBase=0 means Base = RIC + DeltaBase = RIC
-    RICEncoded = encode_ric(RIC, State#qpack.dyn_max_size),
-    %% S=1 (bit 7), DeltaBase=0 (bits 0-6)
-    BaseEncoded = 16#80,
-    Prefix = <<RICEncoded, BaseEncoded>>,
+    %% Encoded Field Section Prefix (RFC 9204 Section 4.5.1): the Required
+    %% Insert Count, then the Base as a Sign bit and Delta Base. Base = BaseIC
+    %% >= RIC, so per Section 4.5.1.2 the Sign bit is 0 and DeltaBase =
+    %% BaseIC - RIC. A static-only section has BaseIC = RIC = 0, giving the
+    %% two prefix bytes 00 00.
+    %% Both fields are prefix integers (Section 4.5.1.1: 8-bit prefix for the
+    %% Required Insert Count, 7-bit for Delta Base). Encoding them as raw bytes
+    %% silently corrupts the section once a value reaches the prefix maximum
+    %% (e.g. an encoded insert count of 255 on a long-lived dynamic table),
+    %% because the decoder then reads a continuation byte that was never sent.
+    RICEncoded = encode_prefixed_int(encode_ric(RIC, State#qpack.dyn_max_size), 8, 0),
+    BaseEncoded = encode_prefixed_int(BaseIC - RIC, 7, 0),
+    Prefix = <<RICEncoded/binary, BaseEncoded/binary>>,
 
     {<<Prefix/binary, EncodedHeaders/binary>>, NewState#qpack{last_ric = RIC}}.
 
@@ -513,30 +533,33 @@ encode_ric(RIC, MaxSize) ->
     MaxEntries = max(1, MaxSize div ?ENTRY_OVERHEAD),
     (RIC rem (2 * MaxEntries)) + 1.
 
-%% Encode headers while tracking maximum dynamic table index referenced
--spec encode_headers_tracking(headers(), state(), binary(), integer()) ->
+%% Encode headers while tracking the maximum dynamic table index referenced.
+%% `BaseIC` is the fixed Base (insert count at section start) that every
+%% dynamic relative index is encoded against.
+-spec encode_headers_tracking(headers(), non_neg_integer(), state(), binary(), integer()) ->
     {binary(), state(), integer()}.
-encode_headers_tracking([], State, Acc, MaxRef) ->
+encode_headers_tracking([], _BaseIC, State, Acc, MaxRef) ->
     {Acc, State, MaxRef};
-encode_headers_tracking([Header | Rest], State, Acc, MaxRef) ->
-    {Encoded, NewState, RefIndex} = encode_header_tracking(Header, State),
+encode_headers_tracking([Header | Rest], BaseIC, State, Acc, MaxRef) ->
+    {Encoded, NewState, RefIndex} = encode_header_tracking(Header, BaseIC, State),
     NewMaxRef =
         case RefIndex of
             none -> MaxRef;
             Idx -> max(MaxRef, Idx)
         end,
-    encode_headers_tracking(Rest, NewState, <<Acc/binary, Encoded/binary>>, NewMaxRef).
+    encode_headers_tracking(Rest, BaseIC, NewState, <<Acc/binary, Encoded/binary>>, NewMaxRef).
 
 %% Encode header with tracking of referenced dynamic index
 %% This function also inserts entries into the dynamic table when appropriate
--spec encode_header_tracking(header(), state()) -> {binary(), state(), integer() | none}.
-encode_header_tracking({Name, Value}, #qpack{use_dynamic = true} = State) ->
+-spec encode_header_tracking(header(), non_neg_integer(), state()) ->
+    {binary(), state(), integer() | none}.
+encode_header_tracking({Name, Value}, BaseIC, #qpack{use_dynamic = true} = State) ->
     case find_dynamic_match(Name, Value, State) of
         {exact, AbsIndex} ->
             %% Check if peer has received this entry (can reference)
             case can_reference(AbsIndex, State) of
                 true ->
-                    RelIndex = State#qpack.insert_count - AbsIndex - 1,
+                    RelIndex = BaseIC - AbsIndex - 1,
                     {encode_indexed_dynamic(RelIndex), State, AbsIndex};
                 false ->
                     %% Entry exists but peer hasn't acked, use literal
@@ -545,7 +568,7 @@ encode_header_tracking({Name, Value}, #qpack{use_dynamic = true} = State) ->
         {name, AbsIndex} ->
             case can_reference(AbsIndex, State) of
                 true ->
-                    RelIndex = State#qpack.insert_count - AbsIndex - 1,
+                    RelIndex = BaseIC - AbsIndex - 1,
                     {encode_literal_with_dynamic_name_ref(RelIndex, Value), State, AbsIndex};
                 false ->
                     encode_with_insertion({Name, Value}, State)
@@ -554,7 +577,7 @@ encode_header_tracking({Name, Value}, #qpack{use_dynamic = true} = State) ->
             %% No match in dynamic table, try to insert
             encode_with_insertion({Name, Value}, State)
     end;
-encode_header_tracking({Name, Value}, State) ->
+encode_header_tracking({Name, Value}, _BaseIC, State) ->
     {Encoded, NewState} = encode_header_static({Name, Value}, State),
     {Encoded, NewState, none}.
 
@@ -649,7 +672,11 @@ encode_insert_with_dynamic_name_ref(RelIndex, Value) ->
 -spec encode_insert_with_literal_name(binary(), binary()) -> binary().
 encode_insert_with_literal_name(Name, Value) ->
     NameLen = byte_size(Name),
-    NameLenEnc = encode_prefixed_int(NameLen, 5, 2#01),
+    %% Opcode bits 010 (01 = Insert With Literal Name, H=0): the 3-bit
+    %% prefix pattern is 2#010, i.e. 2#10 left of the 5-bit name length.
+    %% 2#01 here produced 001xxxxx, which the decoder reads as Set
+    %% Dynamic Table Capacity (RFC 9204 Section 4.3.3 vs 4.3.1).
+    NameLenEnc = encode_prefixed_int(NameLen, 5, 2#10),
     ValueEnc = encode_string(Value),
     <<NameLenEnc/binary, Name/binary, ValueEnc/binary>>.
 
@@ -760,16 +787,20 @@ decode_prefix(Data, State) ->
             %% Reconstruct RIC using modulo arithmetic
             MaxEntries = max(1, State#qpack.dyn_max_size div ?ENTRY_OVERHEAD),
             RIC = decode_ric(ERIC, MaxEntries, State#qpack.insert_count),
-            %% Reconstruct Base per RFC 9204 Section 4.5.1.2
-            Base =
-                case SBit of
-                    %% Pre-base: DeltaBase = RIC - Base - 1
-                    0 -> RIC - DeltaBase - 1;
-                    %% Post-base: DeltaBase = Base - RIC
-                    1 -> RIC + DeltaBase
-                end,
+            %% Reconstruct Base per RFC 9204 Section 4.5.1.2.
+            Base = decode_base(SBit, RIC, DeltaBase),
             {{RIC, Base}, Rest2}
     end.
+
+%% Reconstruct the Base from the field section prefix Sign bit and Delta
+%% Base (RFC 9204 Section 4.5.1.2):
+%%   S=0 -> Base = ReqInsertCount + DeltaBase     (Base >= Required Insert Count)
+%%   S=1 -> Base = ReqInsertCount - DeltaBase - 1  (Base < Required Insert Count)
+-spec decode_base(0 | 1, non_neg_integer(), non_neg_integer()) -> integer().
+decode_base(0, RIC, DeltaBase) ->
+    RIC + DeltaBase;
+decode_base(1, RIC, DeltaBase) ->
+    RIC - DeltaBase - 1.
 
 %% Decode Required Insert Count per RFC 9204 Section 4.5.1.1
 -spec decode_ric(non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
