@@ -436,7 +436,11 @@
     %% idle: normal operation, no key update in progress
     %% initiated: we sent a packet with new key phase, awaiting response
     %% responding: we received a packet with new key phase, transitioning
-    update_state = idle :: idle | initiated | responding
+    update_state = idle :: idle | initiated | responding,
+
+    %% Packets encrypted under the current key phase; forces a key update
+    %% at the AEAD confidentiality limit (RFC 9001 §6.6).
+    send_count = 0 :: non_neg_integer()
 }).
 
 %% Path State for Connection Migration (RFC 9000 Section 9)

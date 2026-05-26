@@ -469,3 +469,14 @@ parse_server_hello_aes_256_test() ->
     %% Verify that a cipher was parsed (exact value depends on implementation)
     Cipher = maps:get(cipher, Parsed),
     ?assert(Cipher =:= aes_128_gcm orelse Cipher =:= aes_256_gcm).
+
+%% RFC 9001 §4.6 / RFC 8446 §4.2.11.2: resumption PSK binder verification
+%% fails closed when the binder offset is unavailable. (The positive path,
+%% which needs a real ClientHello structure, is covered by the PSK e2e
+%% suite.)
+verify_resumption_binder_fails_closed_without_offset_test() ->
+    ?assertNot(
+        quic_tls:verify_resumption_binder(
+            crypto:strong_rand_bytes(32), aes_128_gcm, <<"ch">>, undefined, <<"binder">>
+        )
+    ).

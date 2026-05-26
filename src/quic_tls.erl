@@ -69,6 +69,7 @@
 
     %% TLS 1.3 External PSK (RFC 8446 §4.2.11)
     select_psk/4,
+    verify_resumption_binder/5,
     parse_extensions_ordered/1
 ]).
 
@@ -1534,6 +1535,24 @@ verify_psk_binder(Secret, Cipher, TruncatedHash, OfferedBinder) ->
         Cipher, EarlySecret, TruncatedHash, external
     ),
     crypto:hash_equals(Expected, OfferedBinder).
+
+%% @doc Verify a resumption PSK binder against a parsed ClientHello.
+%% `Secret' is the resumption PSK, `PskBindersInfo' is the `psk_binders'
+%% map from `parse_client_hello/1', and `OfferedBinder' is the binder the
+%% client sent. Uses the "res binder" label (RFC 8446 §4.2.11.2).
+-spec verify_resumption_binder(binary(), atom(), binary(), map(), binary()) -> boolean().
+verify_resumption_binder(Secret, Cipher, FullClientHello, PskBindersInfo, OfferedBinder) when
+    is_map(PskBindersInfo)
+->
+    TruncatedHash = truncated_client_hello_hash(FullClientHello, PskBindersInfo, Cipher),
+    EarlySecret = quic_crypto:derive_early_secret(Cipher, Secret),
+    Expected = quic_crypto:compute_psk_binder(
+        Cipher, EarlySecret, TruncatedHash, resumption
+    ),
+    crypto:hash_equals(Expected, OfferedBinder);
+verify_resumption_binder(_Secret, _Cipher, _FullClientHello, _PskBindersInfo, _OfferedBinder) ->
+    %% Missing binder offset info — cannot verify, fail closed.
+    false.
 
 parse_psk_identities(<<>>) ->
     [];

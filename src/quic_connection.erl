@@ -235,6 +235,11 @@
 -define(MAX_CRYPTO_BUFFER_BYTES, 262144).
 -define(MAX_CRYPTO_BUFFER_ENTRIES, 2048).
 
+%% RFC 9001 §6.6 / Appendix B AEAD confidentiality limit for the AES-GCM
+%% suites (the only ones negotiated): force a key update before
+%% encrypting 2^23 packets under one key.
+-define(AEAD_CONFIDENTIALITY_LIMIT, 16#800000).
+
 %% Connection state record
 -record(state, {
     %% Connection identity
@@ -2657,6 +2662,12 @@ lookup_ticket_globally(TicketIdentity) ->
             error
     end.
 
+%% Remove a ticket from the global store after it is used for resumption
+%% (single-use 0-RTT anti-replay). Issued tickets live in the global ETS.
+consume_ticket_globally(TicketIdentity) ->
+    ensure_ticket_table(),
+    ets:delete(?TICKET_TABLE, TicketIdentity).
+
 cleanup_expired_tickets(Now) ->
     %% Delete all tickets older than TTL
     ets:select_delete(?TICKET_TABLE, [
@@ -3397,7 +3408,7 @@ send_app_packet_internal(Payload, Frames, State) ->
                     undefined -> State#state.socket_state;
                     _ -> NewSocketState
                 end,
-            State#state{
+            maybe_force_key_update(State#state{
                 pn_app = NewPNSpace,
                 cc_state = NewCCState,
                 loss_state = NewLossState,
@@ -3405,7 +3416,7 @@ send_app_packet_internal(Payload, Frames, State) ->
                 socket_state = EffectiveSocketState,
                 last_activity = Now,
                 pto_dirty = true
-            };
+            });
         {error, Reason, ClearedSocketState} ->
             send_app_packet_internal_error(
                 Reason, PN, PacketSize, PNSpace, State, ClearedSocketState
@@ -3645,12 +3656,13 @@ handle_packet_loop(Data, State) ->
         try
             decode_and_decrypt_packet(Data, State)
         catch
-            %% Catch-all on purpose: the security invariant is that no
-            %% datagram can crash the process, so we must not depend on
-            %% enumerating every exception shape the parsers can raise.
-            %% Class/Reason are surfaced to the warning log below (no
-            %% stacktrace, to avoid a log-flood vector).
-            ErrClass:ErrReason ->
+            %% Catch every parser failure class (badmatch/badarg are
+            %% `error', the varint truncation guard is `throw') so no
+            %% datagram can crash the process. `exit' is deliberately not
+            %% caught: it is how the handshake signals an intentional
+            %% abort (e.g. a failed PSK binder), which must terminate the
+            %% connection rather than be swallowed as a dropped datagram.
+            ErrClass:ErrReason when ErrClass =:= error; ErrClass =:= throw ->
                 {error, {malformed, ErrClass, ErrReason}}
         end,
     case Decoded of
@@ -4959,7 +4971,13 @@ process_tls_message(
             State
     end;
 %% Client receives ServerHello
-process_tls_message(_Level, ?TLS_SERVER_HELLO, Body, OriginalMsg, State) ->
+process_tls_message(
+    _Level,
+    ?TLS_SERVER_HELLO,
+    Body,
+    OriginalMsg,
+    #state{role = client, tls_state = ?TLS_AWAITING_SERVER_HELLO} = State
+) ->
     case quic_tls:parse_server_hello(Body) of
         {hrr, HrrInfo} ->
             handle_hello_retry_request(HrrInfo, OriginalMsg, State);
@@ -5051,7 +5069,13 @@ process_tls_message(_Level, ?TLS_SERVER_HELLO, Body, OriginalMsg, State) ->
         {error, _} ->
             State
     end;
-process_tls_message(_Level, ?TLS_ENCRYPTED_EXTENSIONS, Body, OriginalMsg, State) ->
+process_tls_message(
+    _Level,
+    ?TLS_ENCRYPTED_EXTENSIONS,
+    Body,
+    OriginalMsg,
+    #state{role = client, tls_state = ?TLS_AWAITING_ENCRYPTED_EXT} = State
+) ->
     %% Update transcript - USE ORIGINAL BYTES
     Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
 
@@ -5408,7 +5432,7 @@ process_tls_message(
     ?TLS_CERTIFICATE_REQUEST,
     Body,
     OriginalMsg,
-    #state{role = client} = State
+    #state{role = client, tls_state = ?TLS_AWAITING_CERT} = State
 ) ->
     %% Update transcript and mark that server wants client certificate.
     %% Capture the advertised signature_algorithms so the client can
@@ -5553,27 +5577,46 @@ do_server_client_hello(SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, Ori
                 };
             none ->
                 case PSKInfo of
-                    #{identities := [{Identity, _Age}], binders := [_Binder]} when
+                    #{identities := [{Identity, _Age}], binders := [Binder]} when
                         WantsEarlyData
                     ->
                         case validate_psk(Identity, Cipher, OriginalMsg, State) of
                             {ok, PSK, ResumptionSecret} ->
-                                ES = quic_crypto:derive_early_secret(Cipher, PSK),
-                                ClientHelloHash = quic_crypto:transcript_hash(
-                                    Cipher, OriginalMsg
-                                ),
-                                ETS = quic_crypto:derive_client_early_traffic_secret(
-                                    Cipher, ES, ClientHelloHash
-                                ),
-                                {Key, IV, HP} = quic_keys:derive_keys(ETS, Cipher),
-                                EK = #crypto_keys{
-                                    key = Key, iv = IV, hp = HP, cipher = Cipher
-                                },
-                                {
-                                    {EK, ResumptionSecret},
-                                    quic_crypto:derive_early_secret(Cipher, ZeroPSK),
-                                    undefined
-                                };
+                                PskBindersInfo = maps:get(psk_binders, ClientHelloInfo, undefined),
+                                case
+                                    quic_tls:verify_resumption_binder(
+                                        PSK, Cipher, OriginalMsg, PskBindersInfo, Binder
+                                    )
+                                of
+                                    true ->
+                                        %% Single-use: consume the ticket so a
+                                        %% captured 0-RTT flight cannot be
+                                        %% replayed (RFC 9001 §9.2).
+                                        consume_ticket_globally(Identity),
+                                        ES = quic_crypto:derive_early_secret(Cipher, PSK),
+                                        ClientHelloHash = quic_crypto:transcript_hash(
+                                            Cipher, OriginalMsg
+                                        ),
+                                        ETS = quic_crypto:derive_client_early_traffic_secret(
+                                            Cipher, ES, ClientHelloHash
+                                        ),
+                                        {Key, IV, HP} = quic_keys:derive_keys(ETS, Cipher),
+                                        EK = #crypto_keys{
+                                            key = Key, iv = IV, hp = HP, cipher = Cipher
+                                        },
+                                        {
+                                            {EK, ResumptionSecret},
+                                            quic_crypto:derive_early_secret(Cipher, ZeroPSK),
+                                            undefined
+                                        };
+                                    false ->
+                                        ?LOG_WARNING(
+                                            #{what => resumption_psk_binder_failed},
+                                            ?QUIC_LOG_META
+                                        ),
+                                        send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State),
+                                        exit({tls_alert, decrypt_error})
+                                end;
                             error ->
                                 {undefined, quic_crypto:derive_early_secret(Cipher, ZeroPSK),
                                     undefined}
@@ -8801,6 +8844,23 @@ normalize_alpn_list(_) ->
 %% @doc Initiate a key update.
 %% Derives new application secrets and keys, switches to the new key phase.
 %% RFC 9001 Section 6.6: HP keys are NOT rotated during key updates.
+%% Count an outgoing 1-RTT packet toward the AEAD confidentiality limit
+%% and force a key update before it is reached (RFC 9001 §6.6). Only the
+%% first over-limit packet in an idle phase triggers the update; the
+%% counter resets when the new phase begins.
+maybe_force_key_update(#state{key_state = undefined} = State) ->
+    State;
+maybe_force_key_update(#state{key_state = KeyState} = State) ->
+    NewCount = KeyState#key_update_state.send_count + 1,
+    State1 = State#state{key_state = KeyState#key_update_state{send_count = NewCount}},
+    case
+        NewCount >= ?AEAD_CONFIDENTIALITY_LIMIT andalso
+            KeyState#key_update_state.update_state =:= idle
+    of
+        true -> initiate_key_update(State1);
+        false -> State1
+    end.
+
 initiate_key_update(#state{key_state = KeyState} = State) ->
     #key_update_state{
         current_phase = CurrentPhase,
@@ -8846,7 +8906,9 @@ initiate_key_update(#state{key_state = KeyState} = State) ->
         prev_keys = CurrentKeys,
         client_app_secret = NewClientSecret,
         server_app_secret = NewServerSecret,
-        update_state = initiated
+        update_state = initiated,
+        % New phase: reset the AEAD send counter.
+        send_count = 0
     },
 
     State#state{
@@ -8908,7 +8970,8 @@ handle_peer_key_update(#state{key_state = KeyState} = State) ->
                 prev_keys = CurrentKeys,
                 client_app_secret = NewClientSecret,
                 server_app_secret = NewServerSecret,
-                update_state = responding
+                update_state = responding,
+                send_count = 0
             },
             State#state{
                 app_keys = {NewClientKeys, NewServerKeys},
@@ -8928,13 +8991,25 @@ select_decrypt_keys(ReceivedKeyPhase, #state{key_state = KeyState} = State) ->
     #key_update_state{
         current_phase = CurrentPhase,
         current_keys = CurrentKeys,
-        prev_keys = PrevKeys
+        prev_keys = PrevKeys,
+        update_state = UpdateState
     } = KeyState,
 
     case ReceivedKeyPhase of
-        CurrentPhase ->
-            %% Same phase, use current keys
+        CurrentPhase when UpdateState =:= idle ->
+            %% Same phase, no update in progress.
             {CurrentKeys, State};
+        CurrentPhase ->
+            %% A packet in the current phase confirms the in-progress key
+            %% update: return to idle so the next update (ours or, after a
+            %% peer update, the peer's) can proceed (RFC 9001 §6.1). We keep
+            %% prev_keys for the transition so a delayed old-phase packet
+            %% still decrypts, while never re-deriving keys for an old phase
+            %% (that path requires prev_keys = undefined), which avoids a
+            %% replayed old-phase packet flipping keys backward.
+            {CurrentKeys, State#state{
+                key_state = KeyState#key_update_state{update_state = idle}
+            }};
         _ ->
             %% Different phase - could be peer initiating update or using prev keys
             case PrevKeys of
