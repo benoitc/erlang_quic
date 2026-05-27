@@ -64,7 +64,7 @@ func main() {
 	}
 }
 
-func handleConnection(conn quic.Connection) {
+func handleConnection(conn *quic.Conn) {
 	defer conn.CloseWithError(0, "done")
 	log.Printf("New connection from %s", conn.RemoteAddr())
 
@@ -78,7 +78,7 @@ func handleConnection(conn quic.Connection) {
 	}
 }
 
-func handleStream(stream quic.Stream) {
+func handleStream(stream *quic.Stream) {
 	defer stream.Close()
 	streamID := stream.StreamID()
 
@@ -115,7 +115,7 @@ func handleStream(stream quic.Stream) {
 	}
 }
 
-func sinkData(stream quic.Stream) int64 {
+func sinkData(stream *quic.Stream) int64 {
 	buf := make([]byte, 64*1024)
 	var total int64
 	for {
@@ -131,7 +131,7 @@ func sinkData(stream quic.Stream) int64 {
 	return total
 }
 
-func sendData(stream quic.Stream, size int) {
+func sendData(stream *quic.Stream, size int) {
 	buf := make([]byte, 32*1024)
 	for i := range buf {
 		buf[i] = 0x42
