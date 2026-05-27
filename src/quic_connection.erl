@@ -8422,6 +8422,7 @@ normalize_verify(true) -> true;
 normalize_verify(false) -> false;
 normalize_verify(verify_peer) -> true;
 normalize_verify(verify_none) -> false;
+normalize_verify(none) -> false;
 normalize_verify(_) -> true.
 
 %% Verify the server's authentication: the CertificateVerify signature
