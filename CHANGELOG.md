@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-05-28
+
+### Security
+- The QUIC client now authenticates the server. It verifies the CertificateVerify signature, validates the certificate chain against the trust store (`cacerts` option, OS store by default), and checks the hostname. Previously `verify` was a no-op on the client, so any certificate was accepted and a man-in-the-middle on the network path could impersonate any server. `verify` now defaults to on for clients; set `verify => false` to accept any certificate (for example self-signed test servers). HTTP/3 uses the same client and is fixed too. (GHSA-2r8v-p65x-3663, CWE-295). Reported by benmmurphy.
+- Hardening from a full security review: 3x anti-amplification limit with Initial retransmission, CRYPTO-buffer and listener connection caps, MAX_STREAMS and connection-ID limit enforcement, resumption PSK binder verification with single-use 0-RTT, TLS 1.3 handshake state guards, AEAD usage-limit key update, working address-validation Retry with constant-time token compares, and stricter HTTP/3 and QPACK decoding.
+
 ## [1.4.3] - 2026-05-25
 
 ### Fixed
