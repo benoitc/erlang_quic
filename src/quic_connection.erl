@@ -8449,11 +8449,16 @@ verify_server_authentication(Body, TranscriptHash, Advance, State) ->
                         #{what => server_cert_invalid, reason => Reason}, ?QUIC_LOG_META
                     ),
                     notify_owner({error, {certificate_invalid, Reason}}, State),
+                    %% Synchronous close event so callers waiting on
+                    %% `{closed, _}' fail fast, not after the alert
+                    %% round-trips through the state machine.
+                    notify_owner({closed, {certificate_invalid, Reason}}, State),
                     send_tls_alert(cert_alert_code(Reason), State)
             end;
         false ->
             ?LOG_ERROR(#{what => server_cert_verify_failed}, ?QUIC_LOG_META),
             notify_owner({error, {certificate_invalid, bad_signature}}, State),
+            notify_owner({closed, {certificate_invalid, bad_signature}}, State),
             send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
     end.
 

@@ -50,6 +50,51 @@ validate_server_test_() ->
             []
     end.
 
+%% Regression: a server commonly sends an extra or cross-signed cert
+%% above the cert that actually chains to a trust anchor (e.g.
+%% cloudflare.com over Google Trust Services with the Mozilla NSS /
+%% certifi bundle). The topmost-only anchor lookup used to reject these
+%% chains with `unknown_ca'.
+cross_signed_chain_test_() ->
+    case gen_ca_files("/CN=RootA") of
+        {ok, RootA} ->
+            {ok, Int} = gen_signed_cert(
+                "/CN=IntA", "basicConstraints=critical,CA:true", RootA
+            ),
+            {ok, Leaf} = gen_signed_cert(
+                "/CN=leaf.test", "subjectAltName=DNS:leaf.test", Int
+            ),
+            {ok, Extra, _} = gen_cert("/CN=Extra", "subjectAltName=DNS:extra"),
+            #{cert := RootADer} = RootA,
+            #{cert := IntDer} = Int,
+            #{cert := LeafDer} = Leaf,
+            [
+                {"extra cross-signed cert above the anchored intermediate is accepted",
+                    ?_assertEqual(
+                        ok,
+                        quic_cert:validate_server(
+                            LeafDer, [IntDer, Extra], [RootADer], <<"leaf.test">>
+                        )
+                    )},
+                {"chain with only the unrelated root as anchor is rejected",
+                    ?_assertMatch(
+                        {error, _},
+                        quic_cert:validate_server(
+                            LeafDer, [IntDer, Extra], [Extra], <<"leaf.test">>
+                        )
+                    )},
+                {"two-cert chain without the extra cert validates",
+                    ?_assertEqual(
+                        ok,
+                        quic_cert:validate_server(
+                            LeafDer, [IntDer], [RootADer], <<"leaf.test">>
+                        )
+                    )}
+            ];
+        {error, _} ->
+            []
+    end.
+
 %%====================================================================
 %% End-to-end client behaviour
 %%====================================================================
@@ -303,6 +348,67 @@ gen_cert(Subject, SanExt) ->
             {ok, KeyPem} = file:read_file(KeyFile),
             [{'Certificate', CertDer, _}] = public_key:pem_decode(CertPem),
             {ok, CertDer, decode_key(KeyPem)};
+        _ ->
+            {error, cert_generation_failed}
+    end.
+
+%% Make a self-signed CA cert (CA:true). Returns the DER plus the
+%% openssl files so other certs can be signed by it.
+gen_ca_files(Subject) ->
+    Dir = filename:join("/tmp", "quic_cert_test_" ++ suffix()),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    KeyFile = filename:join(Dir, "ca.key"),
+    CertFile = filename:join(Dir, "ca.pem"),
+    Cmd = lists:flatten(
+        io_lib:format(
+            "openssl req -x509 -newkey rsa:2048 -keyout ~s -out ~s "
+            "-days 1 -nodes -subj '~s' "
+            "-addext basicConstraints=critical,CA:true 2>/dev/null",
+            [KeyFile, CertFile, Subject]
+        )
+    ),
+    _ = os:cmd(Cmd),
+    case {filelib:is_file(CertFile), filelib:is_file(KeyFile)} of
+        {true, true} ->
+            {ok, CertPem} = file:read_file(CertFile),
+            [{'Certificate', CertDer, _}] = public_key:pem_decode(CertPem),
+            {ok, #{cert => CertDer, cert_file => CertFile, key_file => KeyFile}};
+        _ ->
+            {error, cert_generation_failed}
+    end.
+
+%% CSR for `Subject', signed by `Parent's' files with `Ext' as the
+%% x509v3 extensions. Returns the DER plus openssl files so further
+%% intermediates can chain off it.
+gen_signed_cert(Subject, Ext, #{cert_file := ParentCert, key_file := ParentKey}) ->
+    Dir = filename:join("/tmp", "quic_cert_test_" ++ suffix()),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    KeyFile = filename:join(Dir, "key.pem"),
+    CsrFile = filename:join(Dir, "csr.pem"),
+    CertFile = filename:join(Dir, "cert.pem"),
+    ExtFile = filename:join(Dir, "ext.cnf"),
+    ok = file:write_file(ExtFile, Ext),
+    CsrCmd = lists:flatten(
+        io_lib:format(
+            "openssl req -newkey rsa:2048 -keyout ~s -out ~s "
+            "-nodes -subj '~s' 2>/dev/null",
+            [KeyFile, CsrFile, Subject]
+        )
+    ),
+    SignCmd = lists:flatten(
+        io_lib:format(
+            "openssl x509 -req -in ~s -CA ~s -CAkey ~s -CAcreateserial "
+            "-out ~s -days 1 -extfile ~s 2>/dev/null",
+            [CsrFile, ParentCert, ParentKey, CertFile, ExtFile]
+        )
+    ),
+    _ = os:cmd(CsrCmd),
+    _ = os:cmd(SignCmd),
+    case {filelib:is_file(CertFile), filelib:is_file(KeyFile)} of
+        {true, true} ->
+            {ok, CertPem} = file:read_file(CertFile),
+            [{'Certificate', CertDer, _}] = public_key:pem_decode(CertPem),
+            {ok, #{cert => CertDer, cert_file => CertFile, key_file => KeyFile}};
         _ ->
             {error, cert_generation_failed}
     end.
