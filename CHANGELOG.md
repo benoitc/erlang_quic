@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.5] - 2026-05-28
+
+### Fixed
+- Server certificate chain validation accepts chains where the server sends an extra or cross-signed cert above the cert that actually anchors. The previous topmost-only anchor lookup rejected valid chains (notably `cloudflare.com` over Google Trust Services on Mozilla NSS, `certifi` and FreeBSD `ca_root_nss`) with `unknown_ca`. The client now walks the served chain for the highest cert whose issuer is in the trust store and validates the sub-path from there.
+- Server certificate verification failures reach the QUIC owner as a synchronous `{closed, {certificate_invalid, _}}` event alongside the existing `{error, {certificate_invalid, _}}` notification, so HTTP/3 clients waiting on the close fail fast instead of stalling until their connect timeout fires.
+
 ## [1.4.4] - 2026-05-28
 
 ### Security
