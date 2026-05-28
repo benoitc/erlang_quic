@@ -67,12 +67,11 @@ verify_chain(Leaf, Intermediates, Anchors) ->
     %% issued by the anchor down to the leaf; the wire order is the
     %% reverse (leaf first).
     Path = lists:reverse([Leaf | Intermediates]),
-    Top = hd(Path),
-    case find_anchor(Top, Anchors) of
-        {ok, Anchor} ->
+    case anchored_subpath(Path, Anchors) of
+        {ok, Anchor, SubPath} ->
             try
                 public_key:pkix_path_validation(
-                    Anchor, Path, [{max_path_length, ?MAX_PATH_LENGTH}]
+                    Anchor, SubPath, [{max_path_length, ?MAX_PATH_LENGTH}]
                 )
             of
                 {ok, _} -> ok;
@@ -82,6 +81,17 @@ verify_chain(Leaf, Intermediates, Anchors) ->
             end;
         error ->
             {error, unknown_ca}
+    end.
+
+%% Highest cert in the path whose issuer is a trust anchor, plus the
+%% sub-path from that cert down to the leaf. Lets the server send extra
+%% or cross-signed certs above the cert that actually chains.
+anchored_subpath([], _Anchors) ->
+    error;
+anchored_subpath([Cert | Rest] = SubPath, Anchors) ->
+    case find_anchor(Cert, Anchors) of
+        {ok, Anchor} -> {ok, Anchor, SubPath};
+        error -> anchored_subpath(Rest, Anchors)
     end.
 
 %% Find the anchor that issued `Cert' (a self-signed cert is its own
