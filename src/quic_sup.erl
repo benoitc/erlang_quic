@@ -91,6 +91,22 @@ init([]) ->
             modules => [quic_server_sup]
         },
         #{
+            id => quic_conn_sup,
+            start => {quic_conn_sup, start_link, []},
+            restart => permanent,
+            shutdown => infinity,
+            type => supervisor,
+            modules => [quic_conn_sup]
+        },
+        #{
+            id => quic_happy_sup,
+            start => {quic_happy_sup, start_link, []},
+            restart => permanent,
+            shutdown => infinity,
+            type => supervisor,
+            modules => [quic_happy_sup]
+        },
+        #{
             id => quic_dist_sup,
             start => {quic_dist_sup, start_link, [DistOpts]},
             restart => permanent,

@@ -169,12 +169,29 @@ get_fd(Socket) ->
     end.
 
 %% @doc Connect to a QUIC server.
-%% Returns {ok, Conn} on success where Conn is a pid().
+%% Returns {ok, Conn} on success where Conn is a pid(). `Host' may be a
+%% hostname, an IP-literal string (IPv4 or IPv6, optionally bracketed),
+%% or an `inet:ip_address()' tuple.
 %% The owner process will receive {quic, Conn, {connected, Info}}
 %% when the connection is established.
 %%
+%% For a hostname that resolves to both IPv4 and IPv6 addresses, RFC 8305
+%% Happy Eyeballs is used: the addresses are raced IPv6-first and the
+%% first to complete its handshake is returned. In that case `connect/4'
+%% blocks until the first attempt connects (or all fail / time out); a
+%% single address, IP literal/tuple, or pre-opened `socket' keeps the
+%% immediate, asynchronous return.
+%%
 %% Options:
 %% <ul>
+%%   <li>`happy_eyeballs' - Race IPv6/IPv4 for multi-address hostnames
+%%       (default: `true'). `false' forces the legacy IPv4-first resolver.</li>
+%%   <li>`family' - `inet | inet6 | any' (default `any'); restricts
+%%       resolution to one address family.</li>
+%%   <li>`connection_attempt_delay' - RFC 8305 stagger between attempts in
+%%       milliseconds (default: 250).</li>
+%%   <li>`connect_timeout' - Overall Happy Eyeballs deadline in
+%%       milliseconds (default: 5000).</li>
 %%   <li>`socket' - Use an existing UDP socket (gen_udp:socket())</li>
 %%   <li>`extra_socket_opts' - Options for socket creation (e.g., [{ip, Addr}])</li>
 %%   <li>`socket_backend' - `gen_udp' (default), `socket' (OTP NIF) or
@@ -207,14 +224,23 @@ get_fd(Socket) ->
 %%       Defaults to the historical wire list.</li>
 %% </ul>
 -spec connect(Host, Port, Opts, Owner) -> {ok, pid()} | {error, term()} when
-    Host :: binary() | string(),
+    Host :: binary() | string() | inet:ip_address(),
     Port :: inet:port_number(),
     Opts :: map(),
     Owner :: pid().
 connect(Host, Port, Opts, Owner) when is_list(Host) ->
     connect(list_to_binary(Host), Port, Opts, Owner);
 connect(Host, Port, Opts, Owner) when
-    is_binary(Host),
+    is_binary(Host), is_integer(Port), Port > 0, Port =< 65535, is_map(Opts), is_pid(Owner);
+    is_tuple(Host),
+    tuple_size(Host) =:= 4,
+    is_integer(Port),
+    Port > 0,
+    Port =< 65535,
+    is_map(Opts),
+    is_pid(Owner);
+    is_tuple(Host),
+    tuple_size(Host) =:= 8,
     is_integer(Port),
     Port > 0,
     Port =< 65535,
@@ -225,10 +251,10 @@ connect(Host, Port, Opts, Owner) when
     Socket = maps:get(socket, Opts, undefined),
     case validate_connect_opts(Socket, Opts) of
         ok ->
-            case quic_connection:start_link(Host, Port, Opts, Owner, Socket) of
-                {ok, Pid} -> {ok, Pid};
-                Error -> Error
-            end;
+            %% Resolution (and RFC 8305 Happy Eyeballs for hostnames) runs in
+            %% the caller process so a resolution failure returns {error, _}
+            %% instead of crashing the caller via the start_link.
+            quic_happy:connect(Host, Port, Opts, Owner, Socket);
         {error, _} = Error ->
             Error
     end;

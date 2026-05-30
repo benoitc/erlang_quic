@@ -12,12 +12,33 @@ client_gen_udp_migrate_test_() ->
     {timeout, 30, fun client_gen_udp_migrate/0}.
 
 client_gen_udp_migrate() ->
-    {ok, Srv} = quic_test_echo_server:start(#{
-        max_data => 16 * 1024 * 1024,
-        max_stream_data_bidi_local => 8 * 1024 * 1024,
-        max_stream_data_bidi_remote => 8 * 1024 * 1024,
-        max_stream_data_uni => 8 * 1024 * 1024
-    }),
+    do_migrate(#{}, "127.0.0.1").
+
+%% Regression for the IPv6 client path: migration rebind must reopen an
+%% IPv6 socket, not silently fall back to inet.
+client_gen_udp_migrate_ipv6_test_() ->
+    {timeout, 30, fun client_gen_udp_migrate_ipv6/0}.
+
+client_gen_udp_migrate_ipv6() ->
+    case ipv6_available() of
+        false ->
+            ok;
+        true ->
+            do_migrate(#{extra_socket_opts => [{ip, {0, 0, 0, 0, 0, 0, 0, 1}}]}, "::1")
+    end.
+
+do_migrate(ServerExtra, Host) ->
+    {ok, Srv} = quic_test_echo_server:start(
+        maps:merge(
+            #{
+                max_data => 16 * 1024 * 1024,
+                max_stream_data_bidi_local => 8 * 1024 * 1024,
+                max_stream_data_bidi_remote => 8 * 1024 * 1024,
+                max_stream_data_uni => 8 * 1024 * 1024
+            },
+            ServerExtra
+        )
+    ),
     try
         #{port := Port} = Srv,
         ClientOpts = maps:merge(quic_test_echo_server:client_opts(), #{
@@ -26,7 +47,7 @@ client_gen_udp_migrate() ->
             max_stream_data_bidi_remote => 8 * 1024 * 1024,
             max_stream_data_uni => 8 * 1024 * 1024
         }),
-        {ok, Conn} = quic:connect("127.0.0.1", Port, ClientOpts, self()),
+        {ok, Conn} = quic:connect(Host, Port, ClientOpts, self()),
         try
             receive
                 {quic, Conn, {connected, _}} -> ok
@@ -44,6 +65,15 @@ client_gen_udp_migrate() ->
         end
     after
         quic_test_echo_server:stop(Srv)
+    end.
+
+ipv6_available() ->
+    case gen_udp:open(0, [binary, inet6, {ip, {0, 0, 0, 0, 0, 0, 0, 1}}]) of
+        {ok, S} ->
+            gen_udp:close(S),
+            true;
+        {error, _} ->
+            false
     end.
 
 collect_echo(Conn, StreamId, Acc, Timeout) ->

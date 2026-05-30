@@ -297,6 +297,10 @@
 
     %% Owner process (receives {quic, Conn, Event} messages where Conn is pid())
     owner :: pid(),
+    %% Monitor of the owner for client connections that are not linked to
+    %% their owner (e.g. Happy Eyeballs winners supervised by quic_conn_sup);
+    %% undefined for server connections.
+    owner_mon :: reference() | undefined,
     conn_ref :: reference(),
 
     %% Options
@@ -933,33 +937,39 @@ init([Host, Port, Opts, Owner, Socket]) ->
     SCID = generate_connection_id(),
     DCID = generate_connection_id(),
 
-    %% Determine remote address
-    RemoteAddr = resolve_address(Host, Port),
-
-    %% Create or use provided socket with proper cleanup on failure
-    %% Pass RemoteAddr to match address family (IPv4 vs IPv6)
-    %% Extra socket opts allow binding to specific address (fix for #28)
-    ExtraOpts = maps:get(extra_socket_opts, Opts, []),
-    case open_client_socket(Socket, RemoteAddr, Opts, ExtraOpts) of
-        {ok, Sock, LocalAddr, OwnsSocket} ->
-            try
-                init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr)
-            catch
-                Class:Reason:Stack ->
-                    %% Clean up socket on initialization failure — pick the
-                    %% right close based on the socket_backend option.
-                    case OwnsSocket of
-                        true -> close_raw_client_socket(Opts, Sock);
-                        false -> ok
-                    end,
-                    %% Drop any stashed socket_state left by
-                    %% open_client_socket_backend/2 (process dict)
-                    %% so we don't leak it across retries.
-                    _ = erase(client_socket_state),
-                    erlang:raise(Class, Reason, Stack)
-            end;
-        {error, Reason} ->
-            {stop, Reason}
+    %% Determine remote address (Happy Eyeballs / multi-address resolution is
+    %% handled upstream in quic_happy; here Host is a single address or name).
+    case resolve_address(Host, Port, maps:get(family, Opts, any)) of
+        {error, ResolveErr} ->
+            {stop, {resolve_failed, ResolveErr}};
+        {ok, RemoteAddr} ->
+            %% Create or use provided socket with proper cleanup on failure
+            %% Pass RemoteAddr to match address family (IPv4 vs IPv6)
+            %% Extra socket opts allow binding to specific address (fix for #28)
+            ExtraOpts = maps:get(extra_socket_opts, Opts, []),
+            case open_client_socket(Socket, RemoteAddr, Opts, ExtraOpts) of
+                {ok, Sock, LocalAddr, OwnsSocket} ->
+                    try
+                        init_client_state(
+                            Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr
+                        )
+                    catch
+                        Class:Reason:Stack ->
+                            %% Clean up socket on initialization failure — pick the
+                            %% right close based on the socket_backend option.
+                            case OwnsSocket of
+                                true -> close_raw_client_socket(Opts, Sock);
+                                false -> ok
+                            end,
+                            %% Drop any stashed socket_state left by
+                            %% open_client_socket_backend/2 (process dict)
+                            %% so we don't leak it across retries.
+                            _ = erase(client_socket_state),
+                            erlang:raise(Class, Reason, Stack)
+                    end;
+                {error, Reason} ->
+                    {stop, Reason}
+            end
     end;
 %% Server-side initialization
 init({server, Opts}) ->
@@ -1307,6 +1317,15 @@ open_client_socket_backend({IP, _Port}, Opts) ->
 address_family(IP) when tuple_size(IP) =:= 4 -> inet;
 address_family(IP) when tuple_size(IP) =:= 8 -> inet6.
 
+%% Swap the owner, re-pointing the owner monitor when one exists. Client
+%% connections monitor their owner (set in init_client_state); server
+%% connections do not (owner_mon =:= undefined) and keep that behavior.
+reown(#state{owner_mon = undefined} = State, NewOwner) ->
+    State#state{owner = NewOwner};
+reown(#state{owner_mon = OldMon} = State, NewOwner) ->
+    _ = erlang:demonitor(OldMon, [flush]),
+    State#state{owner = NewOwner, owner_mon = erlang:monitor(process, NewOwner)}.
+
 %% Continue client initialization after socket is ready
 init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% Generate initial keys
@@ -1409,6 +1428,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         remote_addr = RemoteAddr,
         local_addr = LocalAddr,
         owner = Owner,
+        owner_mon = erlang:monitor(process, Owner),
         conn_ref = ConnRef,
         server_name = ServerName,
         verify = normalize_verify(maps:get(verify, Opts, true)),
@@ -1581,9 +1601,9 @@ idle({call, From}, peername, #state{remote_addr = Addr} = State) ->
 idle({call, From}, sockname, #state{local_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
 idle({call, From}, {set_owner, NewOwner}, State) ->
-    {keep_state, State#state{owner = NewOwner}, [{reply, From, ok}]};
+    {keep_state, reown(State, NewOwner), [{reply, From, ok}]};
 idle(cast, {set_owner, NewOwner}, State) ->
-    {keep_state, State#state{owner = NewOwner}};
+    {keep_state, reown(State, NewOwner)};
 %% 0-RTT: Allow opening streams in idle state if early keys are available
 idle({call, From}, open_stream, #state{early_keys = undefined} = State) ->
     {keep_state, State, [{reply, From, {error, not_connected}}]};
@@ -1666,9 +1686,9 @@ handshaking({call, From}, peername, #state{remote_addr = Addr} = State) ->
 handshaking({call, From}, sockname, #state{local_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
 handshaking({call, From}, {set_owner, NewOwner}, State) ->
-    {keep_state, State#state{owner = NewOwner}, [{reply, From, ok}]};
+    {keep_state, reown(State, NewOwner), [{reply, From, ok}]};
 handshaking(cast, {set_owner, NewOwner}, State) ->
-    {keep_state, State#state{owner = NewOwner}};
+    {keep_state, reown(State, NewOwner)};
 %% 0-RTT: Allow opening streams during handshake if early keys are available
 handshaking({call, From}, open_stream, #state{early_keys = undefined} = State) ->
     %% No early keys, must wait for handshake to complete
@@ -1821,12 +1841,12 @@ connected({call, From}, {set_owner, NewOwner}, #state{alpn = Alpn, transport_par
     %% Notify new owner that connection is already established
     Info = #{alpn => Alpn, alpn_protocol => Alpn, transport_params => TP},
     NewOwner ! {quic, self(), {connected, Info}},
-    {keep_state, State#state{owner = NewOwner}, [{reply, From, ok}]};
+    {keep_state, reown(State, NewOwner), [{reply, From, ok}]};
 connected(cast, {set_owner, NewOwner}, #state{alpn = Alpn, transport_params = TP} = State) ->
     %% Notify new owner that connection is already established
     Info = #{alpn => Alpn, alpn_protocol => Alpn, transport_params => TP},
     NewOwner ! {quic, self(), {connected, Info}},
-    {keep_state, State#state{owner = NewOwner}};
+    {keep_state, reown(State, NewOwner)};
 connected({call, From}, {send_datagram, Data}, State) ->
     case do_send_datagram(Data, State) of
         {ok, NewState} ->
@@ -2357,6 +2377,15 @@ handle_common_event(
 ) when Reason =/= normal andalso Reason =/= shutdown ->
     Owner ! {quic, self(), {closed, {receiver_exit, Reason}}},
     {stop, {shutdown, {receiver_exit, Reason}}, State};
+%% Owner process gone (client connections monitor their owner). Tear down
+%% so a supervised connection that is not linked to its owner doesn't leak.
+handle_common_event(
+    info,
+    {'DOWN', Mon, process, _Pid, _Reason},
+    _StateName,
+    #state{owner_mon = Mon} = State
+) ->
+    {stop, {shutdown, owner_down}, State};
 handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     %% EXIT signals are handled in terminate/3 callback
     %% Just ignore here - the process will terminate anyway if it's from parent
@@ -6521,21 +6550,48 @@ generate_connection_id(undefined) ->
 generate_connection_id(#cid_config{} = Config) ->
     quic_lb:generate_cid(Config).
 
-%% Resolve hostname to IP address
-resolve_address(Host, Port) when is_tuple(Host) ->
-    {Host, Port};
-resolve_address(Host, Port) when is_list(Host) ->
-    case inet:getaddr(Host, inet) of
+%% Resolve a host to a single {IP, Port}. `Family' (inet | inet6 | any) sets the
+%% lookup order; `any' is IPv4-first then IPv6 for backward compatibility.
+%% Multi-address Happy Eyeballs lives in quic_happy; this resolves one address.
+-spec resolve_address(
+    inet:ip_address() | binary() | string(), inet:port_number(), inet | inet6 | any
+) ->
+    {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+resolve_address(Host, Port, _Family) when is_tuple(Host) ->
+    {ok, {Host, Port}};
+resolve_address(Host, Port, Family) when is_binary(Host) ->
+    resolve_address(binary_to_list(Host), Port, Family);
+resolve_address(Host, Port, Family) when is_list(Host) ->
+    Stripped = strip_brackets(Host),
+    case inet:parse_address(Stripped) of
         {ok, IP} ->
-            {IP, Port};
-        _ ->
-            case inet:getaddr(Host, inet6) of
-                {ok, IP} -> {IP, Port};
-                _ -> {{127, 0, 0, 1}, Port}
+            {ok, {IP, Port}};
+        {error, _} ->
+            case getaddr_family(Stripped, Family) of
+                {ok, IP} -> {ok, {IP, Port}};
+                {error, _} = Error -> Error
             end
+    end.
+
+%% Family-ordered name resolution. `any' tries IPv4 then IPv6.
+getaddr_family(Host, inet) ->
+    inet:getaddr(Host, inet);
+getaddr_family(Host, inet6) ->
+    inet:getaddr(Host, inet6);
+getaddr_family(Host, any) ->
+    case inet:getaddr(Host, inet) of
+        {ok, _} = Ok -> Ok;
+        {error, _} -> inet:getaddr(Host, inet6)
+    end.
+
+%% Drop a single pair of surrounding brackets from an IPv6 literal ("[::1]").
+strip_brackets([$[ | Rest]) ->
+    case lists:reverse(Rest) of
+        [$] | RevInner] -> lists:reverse(RevInner);
+        _ -> [$[ | Rest]
     end;
-resolve_address(Host, Port) when is_binary(Host) ->
-    resolve_address(binary_to_list(Host), Port).
+strip_brackets(Host) ->
+    Host.
 
 %% Derive initial encryption keys
 derive_initial_keys(DCID) ->
@@ -9263,10 +9319,10 @@ select_preferred_addr(_) ->
 %% @doc Rebind socket to a new local port (simulates network change).
 %% Open new before closing old so an allocation failure leaves the
 %% caller's handle usable.
--spec rebind_socket(gen_udp:socket()) -> {ok, gen_udp:socket()} | {error, term()}.
-rebind_socket(OldSocket) ->
+-spec rebind_socket(gen_udp:socket(), inet | inet6) -> {ok, gen_udp:socket()} | {error, term()}.
+rebind_socket(OldSocket, Family) ->
     {ok, [{active, Active}]} = inet:getopts(OldSocket, [active]),
-    case gen_udp:open(0, [binary, {active, Active}]) of
+    case gen_udp:open(0, [binary, Family, {active, Active}]) of
         {ok, NewSocket} ->
             gen_udp:close(OldSocket),
             {ok, NewSocket};
@@ -9285,7 +9341,9 @@ rebind_client_socket(#state{client_socket_backend = adapter}) ->
     %% Connection migration via fresh local UDP port has no analogue
     %% when the transport is a caller-supplied adapter.
     {error, not_supported_on_adapter};
-rebind_client_socket(#state{socket = OldSocket, socket_state = OldSocketState} = State) ->
+rebind_client_socket(
+    #state{socket = OldSocket, socket_state = OldSocketState, remote_addr = {RemoteIP, _}} = State
+) ->
     %% Flush any pending batch to the old socket before rebinding so
     %% already-sequenced packets reach the server under the pre-migrate
     %% path. Without this flush, encrypted packets sitting in
@@ -9293,7 +9351,7 @@ rebind_client_socket(#state{socket = OldSocket, socket_state = OldSocketState} =
     %% (old closed socket) or replayed from the new addr with stale
     %% CIDs (mis-routed on the server side).
     State0 = flush_socket_batch(State),
-    case rebind_socket(OldSocket) of
+    case rebind_socket(OldSocket, address_family(RemoteIP)) of
         {ok, NewSocket} ->
             %% `#socket_state{}' kept its reference to the now-closed
             %% old socket. Swap the handle while preserving batching
