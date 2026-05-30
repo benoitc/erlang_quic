@@ -313,8 +313,14 @@ h3_cleanup(#{name := Name}) ->
 %% Connect over HTTP/3 to localhost and report whether the handshake
 %% completed. `server_name' is set by quic_h3 to the connect host.
 h3_connect(Port, Opts0) ->
-    Opts = Opts0#{sync => true, connect_timeout => ?CONNECT_TIMEOUT},
-    case quic_h3:connect("localhost", Port, Opts) of
+    %% Connect to the IPv4 loopback directly (deterministic, no Happy Eyeballs
+    %% race) while keeping the SNI/hostname as localhost for cert validation.
+    Opts = Opts0#{
+        sync => true,
+        connect_timeout => ?CONNECT_TIMEOUT,
+        quic_opts => #{server_name => <<"localhost">>}
+    },
+    case quic_h3:connect("127.0.0.1", Port, Opts) of
         {ok, Conn} ->
             catch quic_h3:close(Conn),
             connected;

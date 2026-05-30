@@ -109,7 +109,7 @@ custom_owner_receives_datagram(Config) ->
     {ok, Port} = quic:get_server_port(Name),
 
     try
-        {ok, Conn} = quic_h3:connect("localhost", Port, #{
+        {ok, Conn} = quic_h3:connect("127.0.0.1", Port, #{
             verify => false,
             sync => true,
             h3_datagram_enabled => true
@@ -149,7 +149,7 @@ handle_hello(Conn, StreamId, _Method, _Path, _Headers) ->
     quic_h3:send_data(Conn, StreamId, <<"hello">>, true).
 
 do_get(Port) ->
-    {ok, Conn} = quic_h3:connect("localhost", Port, #{verify => false, sync => true}),
+    {ok, Conn} = quic_h3:connect("127.0.0.1", Port, #{verify => false, sync => true}),
     Headers = [
         {<<":method">>, <<"GET">>},
         {<<":scheme">>, <<"https">>},
