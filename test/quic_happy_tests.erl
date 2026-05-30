@@ -109,6 +109,51 @@ he_ipv6_winner() ->
             end
     end.
 
+%% A supervised Happy Eyeballs winner is linked to quic_conn_sup, not the
+%% caller, so it must close via owner-monitoring when its owner dies.
+he_winner_dies_with_owner_test_() ->
+    {timeout, 30, fun he_winner_dies_with_owner/0}.
+
+he_winner_dies_with_owner() ->
+    {ok, Srv} = quic_test_echo_server:start(#{}),
+    try
+        #{port := Port} = Srv,
+        Tester = self(),
+        %% "localhost" resolves to both ::1 and 127.0.0.1, so the connect goes
+        %% through the supervised race rather than the caller-linked fast path.
+        Owner = spawn(fun() ->
+            {ok, Conn} = quic:connect(
+                "localhost", Port, quic_test_echo_server:client_opts(), self()
+            ),
+            receive
+                {quic, Conn, {connected, _}} -> ok
+            after 5000 -> ok
+            end,
+            Tester ! {conn, self(), Conn},
+            receive
+                stop -> ok
+            end
+        end),
+        Conn =
+            receive
+                {conn, Owner, C} -> C
+            after 10000 -> error(no_conn)
+            end,
+        ?assert(is_process_alive(Conn)),
+        %% The winner is a supervised child, not linked to the owner.
+        ?assert(
+            lists:member(Conn, [P || {_, P, _, _} <- supervisor:which_children(quic_conn_sup)])
+        ),
+        MRef = erlang:monitor(process, Conn),
+        exit(Owner, kill),
+        receive
+            {'DOWN', MRef, process, Conn, _} -> ok
+        after 5000 -> error(winner_not_killed_with_owner)
+        end
+    after
+        quic_test_echo_server:stop(Srv)
+    end.
+
 %% No server: every raced attempt fails, connect returns an error within
 %% the (shortened) overall timeout rather than hanging or dialing localhost.
 he_all_fail_test_() ->
