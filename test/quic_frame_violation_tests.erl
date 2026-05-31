@@ -48,6 +48,17 @@ server_rejects_over_limit_stream_test() ->
         quic_connection:test_close_reason(S1)
     ).
 
+%% RFC 9000 §3.2: the peer cannot open our locally-initiated streams. STREAM
+%% data for one we never opened (stream 1 is server-initiated bidi #0) is a
+%% STREAM_STATE_ERROR, not a new stream.
+server_rejects_data_for_unopened_local_stream_test() ->
+    S0 = quic_connection:test_state_for_role(server),
+    S1 = quic_connection:process_frame(app, {stream, 1, 0, <<"x">>, false}, S0),
+    ?assertMatch(
+        {transport, ?QUIC_STREAM_STATE_ERROR, _},
+        quic_connection:test_close_reason(S1)
+    ).
+
 %% RFC 9000 §19.15: NEW_CONNECTION_ID with retire_prior_to greater than the
 %% sequence number is a FRAME_ENCODING_ERROR.
 new_connection_id_retire_prior_to_exceeds_seq_test() ->

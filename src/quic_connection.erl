@@ -5972,18 +5972,34 @@ validate_receive_stream(StreamId, Role) ->
     end.
 
 process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
-    case
-        (not is_map_key(StreamId, State#state.streams)) andalso
-            stream_reclaimed(StreamId, State#state.role, State)
-    of
+    NotInMap = not is_map_key(StreamId, State#state.streams),
+    case NotInMap andalso stream_reclaimed(StreamId, State#state.role, State) of
         true ->
             %% Late/retransmitted frame for an already-reclaimed stream. Stream
             %% ids are never reused (RFC 9000 §2.1), so this is never a new
             %% stream; ignore it rather than resurrecting the record.
             State;
         false ->
-            do_process_stream_data_validated(StreamId, Offset, Data, Fin, State)
+            case NotInMap andalso stream_locally_initiated(StreamId, State#state.role) of
+                true ->
+                    %% The peer sent STREAM data for one of our locally-initiated
+                    %% stream ids that we never opened (RFC 9000 §3.2). The peer
+                    %% cannot open our streams: STREAM_STATE_ERROR.
+                    stream_state_error_close(
+                        StreamId, <<"data for unopened local stream">>, State
+                    );
+                false ->
+                    do_process_stream_data_validated(StreamId, Offset, Data, Fin, State)
+            end
     end.
+
+%% Close the connection with STREAM_STATE_ERROR for a frame that references a
+%% stream in a way the peer is not allowed to.
+stream_state_error_close(StreamId, Reason, State) ->
+    ?LOG_WARNING(
+        #{what => stream_state_error, stream_id => StreamId, reason => Reason}, ?QUIC_LOG_META
+    ),
+    close_with_transport_error(?QUIC_STREAM_STATE_ERROR, Reason, State).
 
 do_process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
     #state{
