@@ -222,6 +222,28 @@ set_dynamic_capacity_clamps_to_max_test() ->
     State1 = quic_qpack:set_dynamic_capacity(4096, State0),
     ?assertEqual(1024, quic_qpack:get_dynamic_capacity(State1)).
 
+%% RFC 9114 §7.2.4.2: a 0-RTT client encoder must not use the dynamic
+%% table before the server's SETTINGS are known. `max_allowed_capacity'
+%% seeds the negotiation ceiling while leaving the table disabled, so
+%% early-data requests stay static-only (no encoder-stream inserts a
+%% default-capacity-0 server would reject).
+new_with_allowed_capacity_starts_static_test() ->
+    E0 = quic_qpack:new(#{max_allowed_capacity => 4096}),
+    ?assertEqual(0, quic_qpack:get_dynamic_capacity(E0)),
+    {Encoded, E1} = quic_qpack:encode([{<<"x-custom">>, <<"value">>}], 0, E0),
+    ?assertEqual(<<>>, quic_qpack:get_encoder_instructions(E1)),
+    %% Static-only field section prefix is 00 00 (RIC = 0, Base = 0).
+    ?assertMatch(<<0, 0, _/binary>>, Encoded).
+
+%% Once the peer's SETTINGS arrive, set_dynamic_capacity raises the table
+%% up to the seeded ceiling and the encoder begins inserting entries.
+allowed_capacity_enables_dynamic_after_negotiation_test() ->
+    E0 = quic_qpack:new(#{max_allowed_capacity => 4096}),
+    E1 = quic_qpack:set_dynamic_capacity(4096, E0),
+    ?assertEqual(4096, quic_qpack:get_dynamic_capacity(E1)),
+    {_Encoded, E2} = quic_qpack:encode([{<<"x-custom">>, <<"value">>}], 0, E1),
+    ?assertNotEqual(<<>>, quic_qpack:get_encoder_instructions(E2)).
+
 stateful_encode_decode_test() ->
     Encoder = quic_qpack:new(),
     Decoder = quic_qpack:new(),

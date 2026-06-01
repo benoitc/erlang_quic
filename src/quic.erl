@@ -115,6 +115,9 @@
     get_path_stats/1,
     %% Connection statistics for liveness detection
     get_stats/1,
+    %% 0-RTT accessors (RFC 9001 §4.6)
+    has_early_keys/1,
+    early_data_accepted/1,
     %% Transport-level PING (bypasses congestion control)
     send_ping/1,
     %% PMTU Discovery (RFC 8899)
@@ -651,6 +654,22 @@ get_path_stats(Conn) when is_pid(Conn) ->
     Conn :: pid().
 get_stats(Conn) when is_pid(Conn) ->
     quic_connection:get_stats(Conn).
+
+%% @doc Returns whether the connection has derived early keys (i.e. a
+%% session ticket was provided and 0-RTT is possible). Used by the H3
+%% layer to choose between the fresh-handshake and 0-RTT paths.
+-spec has_early_keys(Conn) -> boolean() when
+    Conn :: pid().
+has_early_keys(Conn) when is_pid(Conn) ->
+    quic_connection:has_early_keys(Conn).
+
+%% @doc Returns whether the server accepted early data, or `unknown' if
+%% the handshake has not yet completed. Use after the connection enters
+%% the connected state to confirm 0-RTT was actually used.
+-spec early_data_accepted(Conn) -> boolean() | unknown when
+    Conn :: pid().
+early_data_accepted(Conn) when is_pid(Conn) ->
+    quic_connection:early_data_accepted(Conn).
 
 %% @doc Send a PING frame on the connection.
 %%

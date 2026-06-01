@@ -255,7 +255,7 @@ large_data_test(Config) ->
     ReceiverPid = rpc:call(Node2, erlang, spawn, [
         fun() ->
             receive
-                {quic_dist_stream, StreamRef, {data, Data, true}} ->
+                {quic_dist_stream, _StreamRef, {data, Data, true}} ->
                     Hash = crypto:hash(sha256, Data),
                     Self ! {collected, Hash};
                 {quic_dist_stream, StreamRef, {data, Data, false}} ->
@@ -561,9 +561,6 @@ collect_data(StreamRef, Acc, Parent) ->
     end.
 
 %% Helper to receive data and track FIN flags
-fin_receiver_loop(StreamRef, Parent) ->
-    fin_receiver_loop(StreamRef, Parent, []).
-
 fin_receiver_loop(StreamRef, Parent, Acc) ->
     receive
         {quic_dist_stream, StreamRef, {data, Data, Fin}} ->

@@ -733,3 +733,49 @@ keep_alive_not_armed_before_connected_test() ->
     ?assertNot(maps:get(keep_alive_timer_armed, Info)),
     quic_connection:close(Pid, normal),
     timer:sleep(100).
+
+%%====================================================================
+%% 0-RTT Accessors (has_early_keys/1, early_data_accepted/1)
+%%====================================================================
+
+%% Without a session ticket the client never derives early keys.
+has_early_keys_initially_false_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    ?assertEqual(false, quic_connection:has_early_keys(Pid)),
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% Supplying a valid session ticket causes send_client_hello to derive
+%% early keys, so the accessor reports true while still in idle.
+has_early_keys_true_with_ticket_test() ->
+    Ticket = make_test_session_ticket(<<"127.0.0.1">>),
+    Opts = #{session_ticket => Ticket, server_name => <<"127.0.0.1">>},
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    ?assertEqual(true, quic_connection:has_early_keys(Pid)),
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% Before the handshake completes the connection can't know whether the
+%% server accepted early data; the accessor returns `unknown`.
+early_data_accepted_unknown_pre_handshake_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    ?assertEqual(unknown, quic_connection:early_data_accepted(Pid)),
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% Helper: minimal valid #session_ticket{} record sufficient for
+%% send_client_hello to derive early keys via quic_ticket:derive_psk/2 +
+%% quic_crypto:derive_early_secret/2.
+make_test_session_ticket(ServerName) ->
+    #session_ticket{
+        server_name = ServerName,
+        ticket = <<"test-ticket">>,
+        lifetime = 86400,
+        age_add = 0,
+        nonce = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+        resumption_secret = crypto:strong_rand_bytes(32),
+        max_early_data = 16384,
+        received_at = erlang:system_time(second),
+        cipher = aes_128_gcm,
+        alpn = <<"h3">>
+    }.

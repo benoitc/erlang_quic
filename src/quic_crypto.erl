@@ -265,10 +265,16 @@ compute_psk_binder(Cipher, EarlySecret, TruncatedClientHelloHash, Type) ->
             external -> <<"ext binder">>
         end,
     %% binder_key = Derive-Secret(early_secret, label, "")
-    %% For empty context, derive_secret uses Hash("") as per RFC 8446
+    %% For empty context, derive_secret uses Hash("") as per RFC 8446.
     BinderKey = derive_secret(Hash, EarlySecret, Label, <<>>),
-    %% binder = HMAC(binder_key, TruncatedClientHelloHash)
-    crypto:mac(hmac, Hash, BinderKey, TruncatedClientHelloHash).
+    %% The binder is a Finished MAC keyed by binder_key (RFC 8446 §4.2.11.2:
+    %% computed "in the same way as the Finished message", §4.4.4), so the
+    %% HMAC key is the finished_key derived from binder_key, not binder_key
+    %% itself:
+    %%   finished_key = HKDF-Expand-Label(binder_key, "finished", "", Hash.len)
+    %%   binder       = HMAC(finished_key, Transcript-Hash(Truncated ClientHello))
+    FinishedKey = derive_finished_key(Cipher, BinderKey),
+    crypto:mac(hmac, Hash, FinishedKey, TruncatedClientHelloHash).
 
 %%====================================================================
 %% Derive-Secret Function

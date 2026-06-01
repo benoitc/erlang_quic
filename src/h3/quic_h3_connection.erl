@@ -20,6 +20,7 @@
 -export([
     start_link/3,
     start_link/4,
+    prime/1,
     request/2,
     request/3,
     open_bidi_stream/2,
@@ -61,7 +62,9 @@
 
 %% State functions
 -export([
+    bootstrapping/3,
     awaiting_quic/3,
+    early_data/3,
     h3_connecting/3,
     connected/3,
     goaway_sent/3,
@@ -258,7 +261,14 @@
     %% Final-response HEADERS frames buffered until the first body chunk so
     %% they coalesce into one QUIC packet (StreamId -> encoded HEADERS frame).
     %% Placed at the end so prior tuple positions stay stable for tests.
-    pending_response_headers = #{} :: #{stream_id() => binary()}
+    pending_response_headers = #{} :: #{stream_id() => binary()},
+
+    %% Set in bootstrapping(cast, prime, ...) from quic:has_early_keys/1.
+    has_early_keys = false :: boolean(),
+
+    %% Set when {quic, _, {connected, _}} arrives. Used by early_data
+    %% convergence logic to detect when 1-RTT is up.
+    quic_connected = false :: boolean()
 }).
 
 %%====================================================================
@@ -276,6 +286,16 @@ start_link(QuicConn, Host, Port) ->
     {ok, pid()} | {error, term()}.
 start_link(QuicConn, Host, Port, Opts) ->
     gen_statem:start_link(?MODULE, {client, QuicConn, Host, Port, Opts, self()}, []).
+
+%% @doc Prime a client H3 connection after ownership transfer.
+%%
+%% Called by `quic_h3:connect/3' once `quic:set_owner_sync/2' returns
+%% so the H3 process can inspect the underlying QUIC connection (via
+%% `quic:has_early_keys/1') and route to either the 0-RTT `early_data'
+%% path or the regular `awaiting_quic' wait.
+-spec prime(pid()) -> ok.
+prime(Conn) ->
+    gen_statem:cast(Conn, prime).
 
 %% @doc Send a request (client only).
 %% Returns the stream ID for tracking the response.
@@ -465,7 +485,12 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
         owner = Owner,
         owner_monitor = MonRef,
         local_settings = LocalSettings,
-        qpack_encoder = quic_qpack:new(#{max_dynamic_size => MaxTableCapacity}),
+        %% Encoder starts static: its dynamic table is enabled only once the
+        %% peer's SETTINGS are applied (apply_peer_settings/2), never from our
+        %% local settings, so 0-RTT early-data requests stay static-only until
+        %% the server's remembered capacity is known (RFC 9114 §7.2.4.2). The
+        %% decoder is sized by the capacity we advertise, which we must honour.
+        qpack_encoder = quic_qpack:new(#{max_allowed_capacity => MaxTableCapacity}),
         qpack_decoder = quic_qpack:new(#{max_dynamic_size => MaxTableCapacity}),
         % Client uses even stream IDs (0, 4, 8, ...)
         next_stream_id = 0,
@@ -476,9 +501,11 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
         h3_datagram_enabled = H3DatagramEnabled
     },
 
-    %% Start in awaiting_quic - wait for QUIC connected notification
-    %% H3 streams should not be opened until QUIC connection is established
-    {ok, awaiting_quic, State};
+    %% Client starts in `bootstrapping' and waits for the
+    %% `prime' cast from quic_h3:connect/3 (sent after
+    %% quic:set_owner_sync/2 completes). The prime handler
+    %% then routes to early_data (0-RTT) or awaiting_quic.
+    {ok, bootstrapping, State};
 init({server, QuicConn, Opts, Owner}) ->
     process_flag(trap_exit, true),
     MonRef = monitor(process, Owner),
@@ -502,7 +529,12 @@ init({server, QuicConn, Opts, Owner}) ->
         owner = Owner,
         owner_monitor = MonRef,
         local_settings = LocalSettings,
-        qpack_encoder = quic_qpack:new(#{max_dynamic_size => MaxTableCapacity}),
+        %% Encoder starts static: its dynamic table is enabled only once the
+        %% peer's SETTINGS are applied (apply_peer_settings/2), never from our
+        %% local settings, so 0-RTT early-data requests stay static-only until
+        %% the server's remembered capacity is known (RFC 9114 §7.2.4.2). The
+        %% decoder is sized by the capacity we advertise, which we must honour.
+        qpack_encoder = quic_qpack:new(#{max_allowed_capacity => MaxTableCapacity}),
         qpack_decoder = quic_qpack:new(#{max_dynamic_size => MaxTableCapacity}),
         % Server uses odd stream IDs (1, 5, 9, ...)
         next_stream_id = 1,
@@ -529,6 +561,179 @@ terminate(_Reason, _StateName, #state{quic_conn = QuicConn}) ->
 
 code_change(_OldVsn, StateName, State, _Extra) ->
     {ok, StateName, State}.
+
+%%====================================================================
+%% State: bootstrapping
+%% Wait for `prime' cast from quic_h3:connect/3 (sent after
+%% set_owner_sync returns) before deciding between 0-RTT and
+%% fresh-handshake paths.
+%%====================================================================
+
+bootstrapping(enter, _OldState, _State) ->
+    keep_state_and_data;
+bootstrapping(cast, prime, #state{quic_conn = QuicConn} = State) ->
+    case quic:has_early_keys(QuicConn) of
+        true ->
+            {next_state, early_data, State#state{has_early_keys = true}};
+        false ->
+            {next_state, awaiting_quic, State}
+    end;
+bootstrapping({call, _From}, {request, _Headers, _Opts}, _State) ->
+    {keep_state_and_data, [postpone]};
+bootstrapping({call, From}, get_settings, #state{local_settings = Settings}) ->
+    {keep_state_and_data, [{reply, From, Settings}]};
+bootstrapping({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
+    {keep_state_and_data, [{reply, From, Settings}]};
+bootstrapping({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
+    {keep_state_and_data, [{reply, From, QuicConn}]};
+bootstrapping(cast, close, State) ->
+    {next_state, closing, State};
+bootstrapping(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
+    {next_state, closing, State};
+bootstrapping(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
+    {stop, quic_closed, State};
+bootstrapping(
+    info,
+    {quic, QC, {early_data_rejected, StreamIds}},
+    #state{quic_conn = QC} = State
+) ->
+    {keep_state, forward_early_data_rejected(StreamIds, State)};
+bootstrapping(
+    info,
+    {quic, QC, {session_ticket, T}},
+    #state{quic_conn = QC} = State
+) ->
+    ok = forward_session_ticket(T, State),
+    keep_state_and_data;
+bootstrapping(
+    {call, From},
+    early_data_accepted,
+    #state{quic_conn = QC} = _State
+) ->
+    {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
+%% Postpone QUIC events that can race ahead of `prime' when QUIC resumes
+%% (0-RTT/1-RTT handshake completes) before the application has had a
+%% chance to cast `prime'. Without postponing, the catch-all clause
+%% below would silently drop these and strand the H3 FSM in a state
+%% that waits for them to arrive again. RFC 9114 §3.3 ordering.
+bootstrapping(info, {quic, QC, {connected, _}}, #state{quic_conn = QC}) ->
+    {keep_state_and_data, [postpone]};
+bootstrapping(info, {quic, QC, {stream_data, _, _, _}}, #state{quic_conn = QC}) ->
+    {keep_state_and_data, [postpone]};
+bootstrapping(info, {quic, QC, {new_stream, _, _}}, #state{quic_conn = QC}) ->
+    {keep_state_and_data, [postpone]};
+bootstrapping(_EventType, _Event, _State) ->
+    keep_state_and_data.
+
+%%====================================================================
+%% State: early_data
+%% Open critical H3 streams and send SETTINGS as 0-RTT data. Accept
+%% request calls and forward HEADERS as 0-RTT. Converge to connected
+%% when both QUIC has handshaked AND peer SETTINGS has arrived.
+%% RFC 9114 §6.2.1 (SETTINGS-first), §7.2.4.2 (0-RTT initialization).
+%%====================================================================
+
+early_data(enter, _OldState, State) ->
+    case open_critical_streams(State) of
+        {ok, State1} ->
+            case send_settings(State1) of
+                {ok, State2} -> {keep_state, State2};
+                {error, Reason} -> {stop, {error, Reason}}
+            end;
+        {error, Reason} ->
+            {stop, {error, Reason}}
+    end;
+early_data({call, From}, {request, Headers, Opts}, #state{role = client} = State) ->
+    case send_request(Headers, Opts, State) of
+        {ok, StreamId, State1} ->
+            {keep_state, State1, [{reply, From, {ok, StreamId}}]};
+        {error, Reason} ->
+            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+    end;
+early_data({call, From}, {request, _Headers, _Opts}, #state{role = server}) ->
+    {keep_state_and_data, [{reply, From, {error, server_cannot_request}}]};
+early_data(
+    info,
+    {quic, QuicConn, {stream_data, StreamId, Data, Fin}},
+    #state{quic_conn = QuicConn} = State
+) ->
+    case handle_stream_data(StreamId, Data, Fin, State) of
+        {ok, State1} ->
+            maybe_transition_from_early_data(State1);
+        {transition, goaway_received, State1} ->
+            {next_state, goaway_received, State1};
+        {error, Reason, State1} ->
+            handle_connection_error(Reason, State1)
+    end;
+early_data(
+    info,
+    {quic, QuicConn, {new_stream, StreamId, Type}},
+    #state{quic_conn = QuicConn} = State
+) ->
+    case handle_new_stream(StreamId, Type, State) of
+        {ok, State1} ->
+            {keep_state, State1};
+        {error, Reason} ->
+            handle_connection_error(Reason, State)
+    end;
+early_data(
+    info,
+    {quic, QuicConn, {stream_closed, StreamId, ErrorCode}},
+    #state{quic_conn = QuicConn} = State
+) ->
+    case handle_stream_closed(StreamId, ErrorCode, State) of
+        {ok, State1} ->
+            {keep_state, State1};
+        {error, Reason} ->
+            handle_connection_error(Reason, State)
+    end;
+early_data(info, {quic, QuicConn, {connected, _Info}}, #state{quic_conn = QuicConn} = State) ->
+    maybe_transition_from_early_data(State#state{quic_connected = true});
+early_data({call, From}, get_settings, #state{local_settings = Settings}) ->
+    {keep_state_and_data, [{reply, From, Settings}]};
+early_data({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
+    {keep_state_and_data, [{reply, From, Settings}]};
+early_data({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
+    {keep_state_and_data, [{reply, From, QuicConn}]};
+early_data(cast, close, State) ->
+    {next_state, closing, State};
+early_data(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
+    {next_state, closing, State};
+early_data(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
+    {stop, quic_closed, State};
+early_data(
+    info,
+    {quic, QC, {session_ticket, T}},
+    #state{quic_conn = QC} = State
+) ->
+    ok = forward_session_ticket(T, State),
+    keep_state_and_data;
+early_data(
+    info,
+    {quic, QC, {early_data_rejected, StreamIds}},
+    #state{quic_conn = QC} = State
+) ->
+    {keep_state, forward_early_data_rejected(StreamIds, State)};
+early_data(
+    {call, From},
+    early_data_accepted,
+    #state{quic_conn = QC} = _State
+) ->
+    {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
+early_data(_EventType, _Event, _State) ->
+    keep_state_and_data.
+
+%% Convergence helper. Both flags must be true to advance to connected;
+%% if only quic_connected is true, hand off to h3_connecting which
+%% already knows how to wait for peer SETTINGS.
+maybe_transition_from_early_data(
+    #state{quic_connected = true, settings_received = true} = State
+) ->
+    {next_state, connected, State};
+maybe_transition_from_early_data(#state{quic_connected = true} = State) ->
+    {next_state, h3_connecting, State};
+maybe_transition_from_early_data(State) ->
+    {keep_state, State}.
 
 %%====================================================================
 %% State: awaiting_quic
@@ -561,6 +766,25 @@ awaiting_quic(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = 
     {next_state, closing, State};
 awaiting_quic(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
     {stop, quic_closed, State};
+awaiting_quic(
+    info,
+    {quic, QC, {session_ticket, T}},
+    #state{quic_conn = QC} = State
+) ->
+    ok = forward_session_ticket(T, State),
+    keep_state_and_data;
+awaiting_quic(
+    info,
+    {quic, QC, {early_data_rejected, StreamIds}},
+    #state{quic_conn = QC} = State
+) ->
+    {keep_state, forward_early_data_rejected(StreamIds, State)};
+awaiting_quic(
+    {call, From},
+    early_data_accepted,
+    #state{quic_conn = QC} = _State
+) ->
+    {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
 awaiting_quic(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -569,6 +793,13 @@ awaiting_quic(_EventType, _Event, _State) ->
 %% Open critical H3 streams and exchange SETTINGS
 %%====================================================================
 
+h3_connecting(enter, _OldState, #state{settings_sent = true} = _State) ->
+    %% Critical streams were already opened and SETTINGS already sent
+    %% during the early_data state. Re-running open_critical_streams/1
+    %% here would open a second control stream (plus extra QPACK
+    %% streams) and emit a second SETTINGS frame, which RFC 9114 §6.2.1
+    %% forbids (H3_STREAM_CREATION_ERROR).
+    keep_state_and_data;
 h3_connecting(enter, _OldState, State) ->
     %% Open critical streams and send SETTINGS
     case open_critical_streams(State) of
@@ -633,6 +864,25 @@ h3_connecting(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = 
     {next_state, closing, State};
 h3_connecting(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
     {stop, quic_closed, State};
+h3_connecting(
+    info,
+    {quic, QC, {session_ticket, T}},
+    #state{quic_conn = QC} = State
+) ->
+    ok = forward_session_ticket(T, State),
+    keep_state_and_data;
+h3_connecting(
+    info,
+    {quic, QC, {early_data_rejected, StreamIds}},
+    #state{quic_conn = QC} = State
+) ->
+    {keep_state, forward_early_data_rejected(StreamIds, State)};
+h3_connecting(
+    {call, From},
+    early_data_accepted,
+    #state{quic_conn = QC} = _State
+) ->
+    {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
 h3_connecting(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -854,6 +1104,25 @@ connected(info, {'DOWN', Ref, process, _Pid, _Reason}, #state{stream_handlers = 
             %% Unknown monitor, ignore
             keep_state_and_data
     end;
+connected(
+    info,
+    {quic, QC, {session_ticket, T}},
+    #state{quic_conn = QC} = State
+) ->
+    ok = forward_session_ticket(T, State),
+    keep_state_and_data;
+connected(
+    info,
+    {quic, QC, {early_data_rejected, StreamIds}},
+    #state{quic_conn = QC} = State
+) ->
+    {keep_state, forward_early_data_rejected(StreamIds, State)};
+connected(
+    {call, From},
+    early_data_accepted,
+    #state{quic_conn = QC} = _State
+) ->
+    {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
 connected(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -903,6 +1172,25 @@ goaway_sent(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = St
     {next_state, closing, State};
 goaway_sent(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
     {stop, quic_closed, State};
+goaway_sent(
+    info,
+    {quic, QC, {session_ticket, T}},
+    #state{quic_conn = QC} = State
+) ->
+    ok = forward_session_ticket(T, State),
+    keep_state_and_data;
+goaway_sent(
+    info,
+    {quic, QC, {early_data_rejected, StreamIds}},
+    #state{quic_conn = QC} = State
+) ->
+    {keep_state, forward_early_data_rejected(StreamIds, State)};
+goaway_sent(
+    {call, From},
+    early_data_accepted,
+    #state{quic_conn = QC} = _State
+) ->
+    {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
 goaway_sent(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -948,6 +1236,25 @@ goaway_received(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} 
     {next_state, closing, State};
 goaway_received(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
     {stop, quic_closed, State};
+goaway_received(
+    info,
+    {quic, QC, {session_ticket, T}},
+    #state{quic_conn = QC} = State
+) ->
+    ok = forward_session_ticket(T, State),
+    keep_state_and_data;
+goaway_received(
+    info,
+    {quic, QC, {early_data_rejected, StreamIds}},
+    #state{quic_conn = QC} = State
+) ->
+    {keep_state, forward_early_data_rejected(StreamIds, State)};
+goaway_received(
+    {call, From},
+    early_data_accepted,
+    #state{quic_conn = QC} = _State
+) ->
+    {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
 goaway_received(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -959,6 +1266,25 @@ closing(enter, _OldState, #state{quic_conn = QuicConn, owner = Owner}) ->
     catch quic:close(QuicConn),
     Owner ! {quic_h3, self(), closed},
     {stop, normal};
+closing(
+    info,
+    {quic, QC, {session_ticket, T}},
+    #state{quic_conn = QC} = State
+) ->
+    ok = forward_session_ticket(T, State),
+    keep_state_and_data;
+closing(
+    info,
+    {quic, QC, {early_data_rejected, StreamIds}},
+    #state{quic_conn = QC} = State
+) ->
+    {keep_state, forward_early_data_rejected(StreamIds, State)};
+closing(
+    {call, From},
+    early_data_accepted,
+    #state{quic_conn = QC} = _State
+) ->
+    {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
 closing(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -4116,6 +4442,23 @@ handle_connection_error(
 
 notify_stream_reset(StreamId, ErrorCode, #state{owner = Owner}) ->
     Owner ! {quic_h3, self(), {stream_reset, StreamId, ErrorCode}}.
+
+%% Forward a session ticket from the QUIC layer to the H3 owner.
+%% RFC 8446 Section 4.6.1: tickets may be issued at any time post-handshake;
+%% consumers need this to populate per-origin session caches.
+forward_session_ticket(T, #state{owner = Owner}) ->
+    Owner ! {quic_h3, self(), {session_ticket, T}},
+    ok.
+
+%% Forward an early_data_rejected notification from the QUIC layer to
+%% the H3 owner and drop the affected streams. RFC 9001 Section 4.6.2.
+forward_early_data_rejected(StreamIds, #state{owner = Owner, streams = Streams} = State) ->
+    NewStreams = lists:foldl(fun maps:remove/2, Streams, rejected_ids_list(StreamIds)),
+    Owner ! {quic_h3, self(), {early_data_rejected, StreamIds}},
+    State#state{streams = NewStreams}.
+
+rejected_ids_list(L) when is_list(L) -> L;
+rejected_ids_list(S) -> sets:to_list(S).
 
 invoke_handler(Conn, StreamId, Method, Path, Headers) ->
     case get(h3_handler) of

@@ -258,7 +258,18 @@ build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer)
     %% Base extensions advertise the configured PSK modes (drives the
     %% server's `psk_key_exchange_modes' decision).
     OptsWithModes = Opts#{psk_modes => Modes},
-    BaseExtensions = build_client_hello_extensions(PubKey, OptsWithModes),
+    BaseExtensions0 = build_client_hello_extensions(PubKey, OptsWithModes),
+    %% RFC 8446 §4.2.10 / RFC 9001 §4.6.1: offer 0-RTT by carrying an empty
+    %% early_data extension in the ClientHello (before pre_shared_key, which
+    %% must remain the last extension). A resumption offer always derives
+    %% early keys here, so it always offers 0-RTT.
+    BaseExtensions =
+        case OfferType of
+            resumption ->
+                <<BaseExtensions0/binary, (encode_extension(?EXT_EARLY_DATA, <<>>))/binary>>;
+            _ ->
+                BaseExtensions0
+        end,
 
     %% Binder length comes from the negotiated hash (32 for SHA-256, 48 for SHA-384).
     Hash = quic_crypto:cipher_to_hash(Cipher),
@@ -301,7 +312,12 @@ build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer)
     BindersSectionLen = byte_size(BindersSection),
     TruncatedLen = byte_size(ClientHelloBody) - BindersSectionLen,
     <<TruncatedBody:TruncatedLen/binary, _/binary>> = ClientHelloBody,
-    TruncatedMsg = encode_handshake_message(?TLS_CLIENT_HELLO, TruncatedBody),
+    %% RFC 8446 §4.2.11.2: the binder transcript keeps every length field
+    %% (including the handshake-message length) at its final post-binder
+    %% value; only the binder bytes are removed. So encode the full body and
+    %% strip the binders off the end, preserving the full-length header.
+    FullMsg = encode_handshake_message(?TLS_CLIENT_HELLO, ClientHelloBody),
+    TruncatedMsg = binary:part(FullMsg, 0, byte_size(FullMsg) - BindersSectionLen),
 
     EarlySecret = quic_crypto:derive_early_secret(Cipher, Secret),
     TruncatedHash = quic_crypto:transcript_hash(Cipher, TruncatedMsg),
@@ -496,8 +512,12 @@ parse_server_hello(_) ->
     {error, invalid_server_hello}.
 
 %% @doc Parse EncryptedExtensions message.
+%% The `early_data' field signals whether the server accepted 0-RTT by
+%% echoing an empty `early_data' extension (RFC 8446 §4.2.10, RFC 9001
+%% §4.6.2). Presence is the entire signal; the extension body is empty
+%% on the EE path.
 -spec parse_encrypted_extensions(binary()) ->
-    {ok, #{alpn => binary(), transport_params => map()}}
+    {ok, #{alpn => binary(), transport_params => map(), early_data => boolean()}}
     | {error, term()}.
 parse_encrypted_extensions(<<ExtensionsLen:16, Extensions:ExtensionsLen/binary, _Rest/binary>>) ->
     case parse_extensions(Extensions) of
@@ -519,7 +539,12 @@ parse_encrypted_extensions(<<ExtensionsLen:16, Extensions:ExtensionsLen/binary, 
                     _ ->
                         #{}
                 end,
-            {ok, #{alpn => Alpn, transport_params => TransportParams}};
+            EarlyData = maps:is_key(?EXT_EARLY_DATA, ExtMap),
+            {ok, #{
+                alpn => Alpn,
+                transport_params => TransportParams,
+                early_data => EarlyData
+            }};
         Error ->
             Error
     end;
@@ -1439,13 +1464,12 @@ truncated_client_hello_hash(FullHandshakeMsg, #{binders_offset := BindersOffInEx
     <<_MsgType:8, _Len:24, Body/binary>> = FullHandshakeMsg,
     ExtBlobOffsetInBody = extensions_offset_in_body(Body),
     AbsoluteBindersOff = 4 + ExtBlobOffsetInBody + BindersOffInExt,
+    %% RFC 8446 §4.2.11.2: keep every length field (including the
+    %% handshake-message length) at its final post-binder value; only the
+    %% binder bytes are removed. FullHandshakeMsg already carries the
+    %% full-length header, so hash its prefix as-is without rewrapping.
     <<TruncatedBytes:AbsoluteBindersOff/binary, _/binary>> = FullHandshakeMsg,
-    %% Rebuild handshake header with the truncated length per RFC 8446
-    %% §4.2.11.2 — the length reflects the truncated body.
-    TruncatedBodyLen = AbsoluteBindersOff - 4,
-    <<MsgType:8, _:24, TruncBody/binary>> = TruncatedBytes,
-    Rewrapped = <<MsgType:8, TruncatedBodyLen:24, TruncBody/binary>>,
-    quic_crypto:transcript_hash(Cipher, Rewrapped).
+    quic_crypto:transcript_hash(Cipher, TruncatedBytes).
 
 %% @private — find where the extensions blob starts within a
 %% ClientHello body.

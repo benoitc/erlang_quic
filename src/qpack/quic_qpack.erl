@@ -139,13 +139,20 @@ new() ->
 %% @doc Initialize QPACK state with options.
 %% Options:
 %%   max_dynamic_size - Enable dynamic table with given max size (default: 0 = disabled)
+%%   max_allowed_capacity - Negotiation ceiling (SETTINGS_QPACK_MAX_TABLE_CAPACITY)
+%%       without enabling the table (default: max_dynamic_size). Used by an
+%%       encoder to seed the ceiling while staying static until a capacity is
+%%       negotiated via set_dynamic_capacity/2, so 0-RTT early-data requests
+%%       remain static-only until the peer's real SETTINGS arrive
+%%       (RFC 9114 §7.2.4.2).
 -spec new(#{atom() => term()}) -> state().
 new(Opts) ->
     MaxDynSize = maps:get(max_dynamic_size, Opts, 0),
+    MaxAllowed = maps:get(max_allowed_capacity, Opts, MaxDynSize),
     #qpack{
         use_dynamic = MaxDynSize > 0,
         dyn_max_size = MaxDynSize,
-        max_allowed_capacity = MaxDynSize
+        max_allowed_capacity = MaxAllowed
     }.
 
 %% @doc Encode headers using QPACK with state.

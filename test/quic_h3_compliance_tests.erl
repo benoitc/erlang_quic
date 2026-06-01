@@ -370,9 +370,7 @@ duplicate_setting_error_code_test() ->
     %% The duplicate_setting error is thrown by quic_h3_frame:decode_settings_payload
     %% and should be converted to H3_SETTINGS_ERROR by quic_h3_connection
     ?assertEqual(?H3_SETTINGS_ERROR, 16#109),
-    ?assertEqual(?H3_FRAME_ERROR, 16#106),
-    %% Verify they are different error codes
-    ?assertNotEqual(?H3_SETTINGS_ERROR, ?H3_FRAME_ERROR).
+    ?assertEqual(?H3_FRAME_ERROR, 16#106).
 
 %%====================================================================
 %% Trailer Pseudo-Header Validation Tests (RFC 9114 Section 4.1.2)
@@ -2396,7 +2394,9 @@ make_test_state(Overrides) ->
         h3_datagram_enabled => false,
         peer_h3_datagram_enabled => false,
         bidi_type_buffers => #{},
-        claimed_bidi_streams => #{}
+        claimed_bidi_streams => #{},
+        has_early_keys => false,
+        quic_connected => false
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -2427,4 +2427,6 @@ make_test_state(Overrides) ->
         maps:get(stream_type_handler, Merged), maps:get(claimed_uni_streams, Merged),
         maps:get(h3_datagram_enabled, Merged), maps:get(peer_h3_datagram_enabled, Merged),
         maps:get(bidi_type_buffers, Merged), maps:get(claimed_bidi_streams, Merged),
-        maps:get(pending_response_headers, Merged)}.
+        maps:get(pending_response_headers, Merged),
+        %% 0-RTT bootstrap fields
+        maps:get(has_early_keys, Merged), maps:get(quic_connected, Merged)}.

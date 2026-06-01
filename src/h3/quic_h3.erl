@@ -151,7 +151,8 @@
 -export([
     get_settings/1,
     get_peer_settings/1,
-    get_quic_conn/1
+    get_quic_conn/1,
+    early_data_accepted/1
 ]).
 
 %% Types
@@ -277,6 +278,9 @@ start_h3_connection(QuicConn, HostBin, Port, Opts) ->
         {ok, H3Conn} ->
             %% Transfer ownership to H3 process so it receives QUIC events
             ok = quic:set_owner_sync(QuicConn, H3Conn),
+            %% Prime the H3 process so it can choose between the 0-RTT
+            %% `early_data' path and the regular `awaiting_quic' wait.
+            ok = quic_h3_connection:prime(H3Conn),
             maybe_wait_connected(H3Conn, Opts);
         {error, Reason} ->
             quic:close(QuicConn, 0, <<"h3 init failed">>),
@@ -669,6 +673,16 @@ get_peer_settings(Conn) ->
 -spec get_quic_conn(conn()) -> pid().
 get_quic_conn(Conn) ->
     quic_h3_connection:get_quic_conn(Conn).
+
+%% @doc Report whether the peer accepted 0-RTT early data.
+%%
+%% Returns `true' if the server accepted 0-RTT, `false' if it rejected
+%% the early data, or `unknown' before the handshake reaches a state
+%% where the outcome is known. RFC 9001 Section 4.6.
+%% @end
+-spec early_data_accepted(conn()) -> boolean() | unknown.
+early_data_accepted(Conn) ->
+    gen_statem:call(Conn, early_data_accepted).
 
 %% @doc Wait for H3 connection to be ready.
 %%
