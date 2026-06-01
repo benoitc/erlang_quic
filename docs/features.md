@@ -194,6 +194,8 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `quic:sockname/1` - Get local address
 - `quic:peercert/1` - Get peer certificate
 - `quic:migrate/1,2` - Trigger connection migration (with optional timeout)
+- `quic:has_early_keys/1` - Whether 0-RTT (early data) keys are available
+- `quic:early_data_accepted/1` - Whether the server accepted 0-RTT early data
 
 ### Datagrams (RFC 9221)
 - `quic:send_datagram/2` - Send unreliable datagram

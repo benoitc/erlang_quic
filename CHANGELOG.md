@@ -4,9 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-06-02
+
+### Added
+- 0-RTT (early data) support. On resumption a client can send application data in its first flight, and HTTP/3 can issue an early request, before the handshake completes. `quic:has_early_keys/1` reports whether 0-RTT keys are available, and `quic:early_data_accepted/1` / `quic_h3:early_data_accepted/1` report whether the server accepted the early data. (#148)
+- `quic_listener:get_sockname/1` and `quic:get_server_sockname/1` return the listener's bound `{IP, Port}`, resolved live from the socket so it is correct when the listener was opened with `inet6`, `{ip, _}` or `{ifaddr, _}`. (#153)
+
 ### Fixed
 - Streams aborted with RESET_STREAM_AT are reclaimed from the connection's stream map once their reliable obligation is met (local reset: reliable bytes acked; incoming reset: reliable bytes delivered), instead of being retained for the life of the connection. Data beyond the reliable size is trimmed from the send queue and retransmit path, and dropped on receive. (#152)
 - A lost-packet retransmission deferred by congestion control is re-queued and resent when the window reopens, instead of being dropped (it had already been removed from the sent queue, so it was never retried).
+- STREAM data referencing a locally-initiated stream that was never opened is rejected with STREAM_STATE_ERROR instead of creating the stream. (#152)
+- Erlang distribution over QUIC: the keep-alive PING is paced off `net_ticktime` instead of the QUIC idle timeout, so a healthy connection is no longer declared down by `net_kernel` under load. (#157)
 
 ## [1.5.0] - 2026-05-30
 
