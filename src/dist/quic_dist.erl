@@ -81,6 +81,9 @@
     get_controller/1
 ]).
 
+%% Keep-alive cadence derivation (exported for testing the net_ticktime logic)
+-export([keep_alive_interval/0, keep_alive_interval_for/1]).
+
 %% Types
 -export_type([stream_ref/0, stream_info/0, stream_opt/0]).
 
@@ -574,6 +577,34 @@ get_listen_port() ->
     end.
 
 %% @private
+%% @doc QUIC keep-alive interval for distribution connections, in milliseconds.
+%%
+%% net_kernel declares a peer down after net_ticktime with no received QUIC
+%% packets (the transport's getstat reports packets_received), so the PING
+%% keep-alive — which bypasses stream flow control — must fire well within that
+%% window even when a post-burst flow-control stall delays the dist tick. We pace
+%% it at net_ticktime/4, matching net_kernel's own tick cadence (~4 chances per
+%% window), so a healthy link (latency well under net_ticktime) never trips a
+%% false timeout.
+%%
+%% net_ticktime is read from the kernel application env, NOT via
+%% net_kernel:get_net_ticktime/0: this runs inside the dist listen/connect
+%% callback, which executes in the net_kernel process, so calling net_kernel
+%% would deadlock ({calling_self,...}). The env holds the configured value
+%% net_kernel itself uses at startup (a runtime set_net_ticktime/1 is not
+%% reflected, which is acceptable for picking a keep-alive cadence).
+-spec keep_alive_interval() -> pos_integer().
+keep_alive_interval() ->
+    keep_alive_interval_for(application:get_env(kernel, net_ticktime, 60)).
+
+%% @private Pure derivation, split out so the net_ticktime cases are testable.
+-spec keep_alive_interval_for(term()) -> pos_integer().
+keep_alive_interval_for(Ticktime) when is_integer(Ticktime), Ticktime > 0 ->
+    max(?QUIC_DIST_KEEP_ALIVE_MIN, (Ticktime * 1000) div 4);
+keep_alive_interval_for(_Other) ->
+    %% net_ticktime unset or invalid - use the configured fallback.
+    ?QUIC_DIST_KEEP_ALIVE_INTERVAL.
+
 %% Start QUIC server for distribution.
 %%
 %% Two modes of operation:
@@ -587,8 +618,10 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
             BaseOpts0 = #{
                 alpn => [?QUIC_DIST_ALPN],
                 idle_timeout => ?QUIC_DIST_IDLE_TIMEOUT,
-                %% QUIC-level keep-alive via PING frames (bypasses flow control)
-                keep_alive_interval => ?QUIC_DIST_KEEP_ALIVE_INTERVAL,
+                %% QUIC-level keep-alive via PING frames (bypasses flow control).
+                %% Paced off net_ticktime so net_kernel never sees a stale
+                %% connection under load.
+                keep_alive_interval => keep_alive_interval(),
                 %% Use aggressive initial cwnd for distribution bulk transfers
                 initial_window => ?INITIAL_WINDOW_AGGRESSIVE,
                 %% Keep a higher congestion floor to avoid liveness stalls
@@ -1137,8 +1170,10 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
             BaseOpts0 = #{
                 alpn => [?QUIC_DIST_ALPN],
                 idle_timeout => ?QUIC_DIST_IDLE_TIMEOUT,
-                %% QUIC-level keep-alive via PING frames (bypasses flow control)
-                keep_alive_interval => ?QUIC_DIST_KEEP_ALIVE_INTERVAL,
+                %% QUIC-level keep-alive via PING frames (bypasses flow control).
+                %% Paced off net_ticktime so net_kernel never sees a stale
+                %% connection under load.
+                keep_alive_interval => keep_alive_interval(),
                 %% Use aggressive initial cwnd for distribution bulk transfers
                 initial_window => ?INITIAL_WINDOW_AGGRESSIVE,
                 %% Keep a higher congestion floor to avoid liveness stalls

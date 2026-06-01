@@ -60,9 +60,15 @@
 %% Longer than default to allow for infrequent cluster traffic
 -define(QUIC_DIST_IDLE_TIMEOUT, 300000).
 
-%% Keep-alive interval for distribution connections (150 seconds = half of idle timeout)
-%% QUIC-level PING frames ensure liveness without relying on application-layer ticks
--define(QUIC_DIST_KEEP_ALIVE_INTERVAL, 150000).
+%% Keep-alive cadence for distribution connections. net_kernel declares a peer
+%% down after net_ticktime (default 60s) of no received QUIC packets (getstat
+%% reports packets_received), so the PING keep-alive (which bypasses stream flow
+%% control) must fire several times per net_ticktime window. The interval is
+%% derived from net_ticktime by quic_dist:keep_alive_interval/0; this value is
+%% the fallback when net_ticktime is unavailable (60s / 4).
+-define(QUIC_DIST_KEEP_ALIVE_INTERVAL, 15000).
+%% Floor for the derived interval (matches the connection layer's 5s minimum).
+-define(QUIC_DIST_KEEP_ALIVE_MIN, 5000).
 
 %% Distribution backpressure thresholds (can be overridden via config)
 %% Congested when queue > cwnd * congestion threshold
