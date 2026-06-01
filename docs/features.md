@@ -238,6 +238,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `quic:stop_server/1` - Stop named server
 - `quic:get_server_info/1` - Get server information
 - `quic:get_server_port/1` - Get server listening port
+- `quic:get_server_sockname/1` - Get server bound address (`{IP, Port}`)
 - `quic:get_server_connections/1` - Get server connection PIDs
 - `quic:which_servers/0` - List all running servers
 

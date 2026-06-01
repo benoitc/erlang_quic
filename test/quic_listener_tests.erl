@@ -56,6 +56,22 @@ get_port_test() ->
     ?assert(Port > 0),
     ok = quic_listener:stop(Listener).
 
+get_sockname_test() ->
+    {Cert, PrivKey} = generate_test_cert(),
+    Opts = #{
+        cert => Cert,
+        key => PrivKey,
+        alpn => [<<"h3">>]
+    },
+    {ok, Listener} = quic_listener:start_link(0, Opts),
+    {ok, {IP, Port}} = quic_listener:get_sockname(Listener),
+    ?assert(is_tuple(IP)),
+    ?assert(is_integer(Port)),
+    ?assert(Port > 0),
+    %% The sockname port must match the cached get_port/1 value.
+    ?assertEqual(quic_listener:get_port(Listener), Port),
+    ok = quic_listener:stop(Listener).
+
 specific_port_test() ->
     {Cert, PrivKey} = generate_test_cert(),
     Opts = #{

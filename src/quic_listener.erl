@@ -42,6 +42,7 @@
     start/2,
     stop/1,
     get_port/1,
+    get_sockname/1,
     get_connections/1,
     register_cid/3,
     retire_cid/2
@@ -149,6 +150,14 @@ stop(Listener) ->
 -spec get_port(pid()) -> inet:port_number().
 get_port(Listener) ->
     gen_server:call(Listener, get_port).
+
+%% @doc Get the address the listener is bound to. Resolves the actual bound
+%% address from the socket, so it reflects the real value even when the listener
+%% was opened with `inet6', `{ip, Addr}' or `{ifaddr, Addr}'.
+-spec get_sockname(pid()) ->
+    {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+get_sockname(Listener) ->
+    gen_server:call(Listener, get_sockname).
 
 %% @doc Get list of active connections.
 -spec get_connections(pid()) -> [pid()].
@@ -322,6 +331,12 @@ get_socket_port(Socket, _SocketState, gen_udp) ->
         {error, _} -> 0
     end.
 
+%% Get the bound {IP, Port} depending on backend.
+get_socket_sockname(_Socket, SocketState, socket) when SocketState =/= undefined ->
+    quic_socket:sockname(SocketState);
+get_socket_sockname(Socket, _SocketState, gen_udp) ->
+    inet:sockname(Socket).
+
 %% Start GRO receiver process for socket backend
 maybe_start_gro_receiver(socket, SocketState) when SocketState =/= undefined ->
     Listener = self(),
@@ -348,6 +363,15 @@ gro_receive_loop(SocketState, Listener) ->
 -spec handle_call(term(), gen_server:from(), state()) -> {reply, term(), state()}.
 handle_call(get_port, _From, #listener_state{port = Port} = State) ->
     {reply, Port, State};
+%% @doc false
+handle_call(
+    get_sockname,
+    _From,
+    #listener_state{
+        socket = Socket, socket_state = SocketState, socket_backend = Backend
+    } = State
+) ->
+    {reply, get_socket_sockname(Socket, SocketState, Backend), State};
 %% @doc false
 handle_call(get_socket_info, _From, #listener_state{socket = Socket, port = Port} = State) ->
     SockInfo = inet:info(Socket),

@@ -35,6 +35,7 @@
     lookup/1,
     list/0,
     get_port/1,
+    get_sockname/1,
     update_port/2,
     get_connections/1
 ]).
@@ -104,6 +105,28 @@ get_port(Name) ->
             end;
         {ok, #{port := Port}} ->
             {ok, Port};
+        {error, not_found} ->
+            {error, not_found}
+    end.
+
+%% @doc Get the bound address of a named server's listener.
+%% Queried live from the listening socket, so it reflects the real address even
+%% when the server was started with port 0, `inet6', `{ip, _}' or `{ifaddr, _}'.
+-spec get_sockname(atom()) ->
+    {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+get_sockname(Name) ->
+    case lookup(Name) of
+        {ok, #{pid := Pid}} ->
+            %% Mirror get_actual_port_from_listener/1: catch a teardown-race
+            %% exception into an {error, _} rather than letting it propagate.
+            try
+                case first_listener_pid(Pid) of
+                    {ok, ListenerPid} -> quic_listener:get_sockname(ListenerPid);
+                    Error -> Error
+                end
+            catch
+                _:_ -> {error, failed_to_get_sockname}
+            end;
         {error, not_found} ->
             {error, not_found}
     end.
@@ -244,24 +267,29 @@ find_monitor_by_pid(Pid, Monitors) ->
 %% @doc Get actual bound port from a listener when server was started with port 0.
 %% Navigates the supervision tree: listener_sup -> listener_sup_sup -> quic_listener
 get_actual_port_from_listener(ListenerSupPid) ->
+    %% Keep the catch wrapping BOTH the listener lookup and the get_port call so
+    %% the historical {error, failed_to_get_port} return is preserved.
     try
-        %% Get children of listener_sup - includes quic_listener_sup_sup
-        Children = supervisor:which_children(ListenerSupPid),
-        %% Find the listener_sup_sup
-        case lists:keyfind(quic_listener_sup_sup, 1, Children) of
-            {quic_listener_sup_sup, SupSupPid, _, _} when is_pid(SupSupPid) ->
-                %% Get listeners from sup_sup
-                ListenerChildren = supervisor:which_children(SupSupPid),
-                case [P || {{quic_listener, _}, P, _, _} <- ListenerChildren, is_pid(P)] of
-                    [ListenerPid | _] ->
-                        {ok, quic_listener:get_port(ListenerPid)};
-                    [] ->
-                        {error, no_listeners}
-                end;
-            _ ->
-                {error, no_listener_sup}
+        case first_listener_pid(ListenerSupPid) of
+            {ok, ListenerPid} -> {ok, quic_listener:get_port(ListenerPid)};
+            Error -> Error
         end
     catch
         _:_ ->
             {error, failed_to_get_port}
+    end.
+
+%% Resolve the first live listener pid under a server's listener supervisor.
+first_listener_pid(ListenerSupPid) ->
+    %% Get children of listener_sup - includes quic_listener_sup_sup
+    Children = supervisor:which_children(ListenerSupPid),
+    case lists:keyfind(quic_listener_sup_sup, 1, Children) of
+        {quic_listener_sup_sup, SupSupPid, _, _} when is_pid(SupSupPid) ->
+            ListenerChildren = supervisor:which_children(SupSupPid),
+            case [P || {{quic_listener, _}, P, _, _} <- ListenerChildren, is_pid(P)] of
+                [ListenerPid | _] -> {ok, ListenerPid};
+                [] -> {error, no_listeners}
+            end;
+        _ ->
+            {error, no_listener_sup}
     end.

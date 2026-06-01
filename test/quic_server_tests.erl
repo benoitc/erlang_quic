@@ -71,6 +71,7 @@ server_test_() ->
         {"Pool size option", fun pool_size_test/0},
         {"Which servers", fun which_servers_test/0},
         {"Get server port", fun get_server_port_test/0},
+        {"Get server sockname", fun get_server_sockname_test/0},
         {"Badarg tests", fun badarg_test/0}
     ]}.
 
@@ -154,6 +155,7 @@ get_server_info_test() ->
 server_not_found_test() ->
     ?assertEqual({error, not_found}, quic:get_server_info(nonexistent)),
     ?assertEqual({error, not_found}, quic:get_server_port(nonexistent)),
+    ?assertEqual({error, not_found}, quic:get_server_sockname(nonexistent)),
     ?assertEqual({error, not_found}, quic:get_server_connections(nonexistent)).
 
 pool_size_test() ->
@@ -204,12 +206,25 @@ get_server_port_test() ->
     {ok, Port2} = quic:get_server_port(port_server),
     ?assertEqual(Port, Port2).
 
+get_server_sockname_test() ->
+    {ok, _} = quic:start_server(sockname_server, 0, base_opts()),
+
+    %% Resolved live from the socket; port matches get_server_port/1.
+    {ok, {IP, Port}} = quic:get_server_sockname(sockname_server),
+    ?assert(is_tuple(IP)),
+    ?assert(is_integer(Port)),
+    ?assert(Port > 0),
+    ?assert(Port < 65536),
+    {ok, PortViaPort} = quic:get_server_port(sockname_server),
+    ?assertEqual(PortViaPort, Port).
+
 badarg_test() ->
     %% Invalid name
     ?assertEqual({error, badarg}, quic:start_server("not_atom", 0, #{})),
     ?assertEqual({error, badarg}, quic:stop_server("not_atom")),
     ?assertEqual({error, badarg}, quic:get_server_info("not_atom")),
     ?assertEqual({error, badarg}, quic:get_server_port("not_atom")),
+    ?assertEqual({error, badarg}, quic:get_server_sockname("not_atom")),
     ?assertEqual({error, badarg}, quic:get_server_connections("not_atom")),
 
     %% Invalid port

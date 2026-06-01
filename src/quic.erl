@@ -133,6 +133,7 @@
     server_spec/3,
     get_server_info/1,
     get_server_port/1,
+    get_server_sockname/1,
     get_server_connections/1,
     which_servers/0
 ]).
@@ -835,6 +836,20 @@ get_server_info(_Name) ->
 get_server_port(Name) when is_atom(Name) ->
     quic_server_registry:get_port(Name);
 get_server_port(_Name) ->
+    {error, badarg}.
+
+%% @doc Get the bound address of a named server.
+%%
+%% Returns the listener's actual `{IP, Port}', resolved from the socket, so it is
+%% correct even when the server was started with port 0, `inet6', `{ip, _}' or
+%% `{ifaddr, _}'.
+-spec get_server_sockname(Name) ->
+    {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}
+when
+    Name :: atom().
+get_server_sockname(Name) when is_atom(Name) ->
+    quic_server_registry:get_sockname(Name);
+get_server_sockname(_Name) ->
     {error, badarg}.
 
 %% @doc Get the list of connection PIDs for a named server.

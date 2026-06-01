@@ -17,6 +17,9 @@ application:ensure_all_started(quic).
 
 %% Get the listening port (useful when using port 0)
 {ok, Port} = quic:get_server_port(my_server).
+
+%% Get the full bound address (resolves inet6 / {ip, _} / {ifaddr, _})
+{ok, {IP, Port}} = quic:get_server_sockname(my_server).
 ```
 
 ## Server Configuration Options
@@ -72,6 +75,10 @@ quic:start_server(my_server, 4433, Opts#{extra_socket_opts => [inet6]}).
 quic:start_server(my_server, 4433,
     Opts#{extra_socket_opts => [{ip, {16#2001, 16#db8, 0, 0, 0, 0, 0, 1}}]}).
 ```
+
+Use `quic:get_server_sockname/1` to read the resolved `{IP, Port}` the listener
+actually bound to, which is the reliable way to learn the address when it depends
+on `inet6`, `{ip, _}` or `{ifaddr, _}`.
 
 ### Server Pool Options
 
