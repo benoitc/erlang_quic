@@ -589,6 +589,13 @@ bootstrapping(
 ) ->
     {keep_state, forward_early_data_rejected(StreamIds, State)};
 bootstrapping(
+    info,
+    {quic, QC, {session_ticket, T}},
+    #state{quic_conn = QC} = State
+) ->
+    ok = forward_session_ticket(T, State),
+    keep_state_and_data;
+bootstrapping(
     {call, From},
     early_data_accepted,
     #state{quic_conn = QC} = _State

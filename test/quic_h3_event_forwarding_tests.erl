@@ -39,6 +39,17 @@ teardown(_) ->
 %% session_ticket forwarding
 %%====================================================================
 
+session_ticket_forwarded_from_bootstrapping_test_() ->
+    {setup, fun setup/0, fun teardown/1, fun() ->
+        FakeQuicConn = spawn_link(fun fake_quic_loop/0),
+        {ok, H3Conn} = start_client_h3(FakeQuicConn),
+        wait_state(H3Conn, bootstrapping, 500),
+        Ticket = {ticket, <<"boot-ticket">>},
+        H3Conn ! {quic, FakeQuicConn, {session_ticket, Ticket}},
+        assert_owner_message({session_ticket, Ticket}, H3Conn, 500),
+        stop_h3(H3Conn, FakeQuicConn)
+    end}.
+
 session_ticket_forwarded_from_early_data_test_() ->
     {setup, fun setup/0, fun teardown/1, fun() ->
         FakeQuicConn = spawn_link(fun fake_quic_loop/0),
