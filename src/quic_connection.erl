@@ -2942,7 +2942,8 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     %% Build EncryptedExtensions
     EncExtMsg = quic_tls:build_encrypted_extensions(#{
         alpn => ALPN,
-        transport_params => TransportParams
+        transport_params => TransportParams,
+        early_data => State#state.early_data_accepted
     }),
 
     %% PSK handshakes (RFC 8446 §4.6) skip CertificateRequest / Certificate /

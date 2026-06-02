@@ -48,6 +48,7 @@
     session_ticket_emitted_inproc/1,
     session_ticket_emitted_aioquic/1,
     session_ticket_emitted_quic_go/1,
+    resumed_connection_0rtt_inproc/1,
     resumed_connection_0rtt_aioquic/1,
     rejected_emits_event_and_does_not_auto_retry/1,
     multiple_session_tickets_emitted/1,
@@ -66,6 +67,7 @@ all() ->
         session_ticket_emitted_inproc,
         session_ticket_emitted_aioquic,
         session_ticket_emitted_quic_go,
+        resumed_connection_0rtt_inproc,
         resumed_connection_0rtt_aioquic,
         rejected_emits_event_and_does_not_auto_retry,
         multiple_session_tickets_emitted,
@@ -167,6 +169,27 @@ run_session_ticket_emitted(Host, Port) ->
 %%====================================================================
 %% Test cases - resumed connection with 0-RTT
 %%====================================================================
+
+%% Full in-process round trip against the shipped quic_test_h3_server:
+%% connect once and capture a ticket, reconnect with that ticket, send a
+%% bodyless 0-RTT request, and assert the server signalled acceptance
+%% (early_data_accepted/1 =:= true) and answered normally. This is the
+%% server-side companion to resumed_connection_0rtt_aioquic and the case
+%% that exercises the EncryptedExtensions early_data echo.
+resumed_connection_0rtt_inproc(Config) ->
+    Host = ?config(h3_host, Config),
+    Port = ?config(h3_port, Config),
+    case run_resumption_cycle(Host, Port, 5000) of
+        {ok, EarlyData, Status} ->
+            ct:pal("Resumed in-proc: early_data_accepted=~p status=~p", [EarlyData, Status]),
+            ?assertEqual(true, EarlyData),
+            ?assertEqual(200, Status),
+            ok;
+        no_ticket ->
+            {skip, "in-proc server did not emit a session ticket"};
+        {error, Reason} ->
+            ct:fail({resumption_failed, Reason})
+    end.
 
 resumed_connection_0rtt_aioquic(_Config) ->
     case discover_external(aioquic) of
