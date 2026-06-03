@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-06-03
+
+### Fixed
+- Happy Eyeballs + HTTP/3: a client connecting to a hostname that resolves to more than one address (so the race path runs) could hang in `quic_h3:connect/3` until `connect_timeout`. The QUIC connection completes its handshake while owned by the race coordinator, so the server's HTTP/3 control stream and SETTINGS were delivered to the transient owner and dropped before the H3 connection process existed. `set_owner` re-delivers `{connected}` but not that already-arrived stream data; the race coordinator and `quic_h3:connect/3` now forward the buffered `{quic, Conn, _}` backlog to the new owner at each ownership handoff.
+
 ## [1.6.1] - 2026-06-02
 
 ### Fixed

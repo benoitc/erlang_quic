@@ -278,6 +278,12 @@ start_h3_connection(QuicConn, HostBin, Port, Opts) ->
         {ok, H3Conn} ->
             %% Transfer ownership to H3 process so it receives QUIC events
             ok = quic:set_owner_sync(QuicConn, H3Conn),
+            %% With Happy Eyeballs the connection can already be `connected'
+            %% by the time we get here, so the server's control stream and
+            %% SETTINGS may have been delivered to us (the prior owner) before
+            %% H3Conn existed. set_owner_sync re-delivers {connected} but not
+            %% that backlog, so forward it on in order.
+            forward_quic_backlog(QuicConn, H3Conn),
             %% Prime the H3 process so it can choose between the 0-RTT
             %% `early_data' path and the regular `awaiting_quic' wait.
             ok = quic_h3_connection:prime(H3Conn),
@@ -285,6 +291,20 @@ start_h3_connection(QuicConn, HostBin, Port, Opts) ->
         {error, Reason} ->
             quic:close(QuicConn, 0, <<"h3 init failed">>),
             {error, Reason}
+    end.
+
+%% Drain this process's mailbox of `{quic, Conn, _}' messages and forward them
+%% to H3Conn in arrival order. {connected} is skipped: set_owner re-delivers it
+%% to the new owner already, so forwarding it too would duplicate it.
+forward_quic_backlog(Conn, H3Conn) ->
+    receive
+        {quic, Conn, {connected, _}} ->
+            forward_quic_backlog(Conn, H3Conn);
+        {quic, Conn, _} = Msg ->
+            H3Conn ! Msg,
+            forward_quic_backlog(Conn, H3Conn)
+    after 0 ->
+        ok
     end.
 
 maybe_wait_connected(H3Conn, Opts) ->

@@ -208,11 +208,31 @@ on_connected(#{owner := Owner, caller := Caller} = St, Pid, _Info) ->
     %% {connected} and here raises, and we continue the race.
     try quic_connection:set_owner_sync(Pid, Owner) of
         ok ->
+            %% The connection handshaked while we owned it, so any peer data
+            %% it already delivered (e.g. the server's HTTP/3 control stream
+            %% and SETTINGS) is sitting in our mailbox and would be lost when
+            %% we exit. set_owner_sync re-delivers {connected} but not that
+            %% backlog, so hand it to the new owner in order.
+            forward_quic_backlog(Pid, Owner),
             Caller ! {quic_happy_result, self(), {ok, Pid}},
             ok
     catch
         _:_ ->
             loop(drop_attempt(St, Pid))
+    end.
+
+%% Drain this process's mailbox of `{quic, Conn, _}' messages and forward them
+%% to NewOwner in arrival order. {connected} is skipped: set_owner re-delivers
+%% it to the new owner already, so forwarding it too would duplicate it.
+forward_quic_backlog(Conn, NewOwner) ->
+    receive
+        {quic, Conn, {connected, _}} ->
+            forward_quic_backlog(Conn, NewOwner);
+        {quic, Conn, _} = Msg ->
+            NewOwner ! Msg,
+            forward_quic_backlog(Conn, NewOwner)
+    after 0 ->
+        ok
     end.
 
 finish(#{caller := Caller}, Result) ->
