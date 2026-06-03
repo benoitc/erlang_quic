@@ -27,6 +27,9 @@ jobs:
           - os: ubuntu-24.04
             otp: '28'
             rebar3: 'nightly'
+          - os: ubuntu-24.04
+            otp: '29'
+            rebar3: 'nightly'
 
     steps:
       - uses: actions/checkout@v4
