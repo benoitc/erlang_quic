@@ -278,6 +278,15 @@ start_h3_connection(QuicConn, HostBin, Port, Opts) ->
         {ok, H3Conn} ->
             %% Transfer ownership to H3 process so it receives QUIC events
             ok = quic:set_owner_sync(QuicConn, H3Conn),
+            %% The QUIC connection was opened with this (caller) process as
+            %% owner, so any owner events emitted before set_owner_sync took
+            %% effect — the `connected' notification and, on fast handshakes,
+            %% the peer's control-stream SETTINGS — were delivered here.
+            %% set_owner_sync re-emits `connected' to the new owner but cannot
+            %% replay those stream events, so drain and forward every such
+            %% `{quic, QuicConn, _}' message to the H3 process, in order,
+            %% before priming. RFC 9114 Section 3.3 ordering.
+            ok = forward_pretransfer_quic_events(QuicConn, H3Conn),
             %% Prime the H3 process so it can choose between the 0-RTT
             %% `early_data' path and the regular `awaiting_quic' wait.
             ok = quic_h3_connection:prime(H3Conn),
@@ -300,6 +309,28 @@ maybe_wait_connected(H3Conn, Opts) ->
             end;
         false ->
             {ok, H3Conn}
+    end.
+
+%% @private
+%% Drain QUIC owner events delivered to this (caller) process during the
+%% window between quic:connect/4 and quic:set_owner_sync/2 and forward
+%% them, in arrival order, to the H3 connection process.
+%%
+%% This is race-free: set_owner_sync/2 is a synchronous call to the QUIC
+%% connection process and every `{quic, QuicConn, _}' owner message
+%% originates from that single process, so Erlang's per-pair message
+%% ordering guarantees that once set_owner_sync/2 returns, all events that
+%% reached us before the transfer are already in our mailbox; events emitted
+%% afterwards are delivered straight to the new owner. The H3 FSM's
+%% `bootstrapping' state postpones these until `prime', so wire order is
+%% preserved.
+forward_pretransfer_quic_events(QuicConn, H3Conn) ->
+    receive
+        {quic, QuicConn, _} = Msg ->
+            H3Conn ! Msg,
+            forward_pretransfer_quic_events(QuicConn, H3Conn)
+    after 0 ->
+        ok
     end.
 
 %% @doc Send an HTTP request.
