@@ -67,43 +67,77 @@ verify_chain(Leaf, Intermediates, Anchors) ->
     %% issued by the anchor down to the leaf; the wire order is the
     %% reverse (leaf first).
     Path = lists:reverse([Leaf | Intermediates]),
-    case anchored_subpath(Path, Anchors) of
-        {ok, Anchor, SubPath} ->
-            try
-                public_key:pkix_path_validation(
-                    Anchor, SubPath, [{max_path_length, ?MAX_PATH_LENGTH}]
-                )
-            of
-                {ok, _} -> ok;
-                {error, {bad_cert, Reason}} -> {error, {bad_cert, Reason}}
-            catch
-                _:_ -> {error, {bad_cert, validation_failed}}
-            end;
-        error ->
-            {error, unknown_ca}
+    case candidate_anchorings(Path, Anchors) of
+        [] ->
+            {error, unknown_ca};
+        [Primary | Alternatives] ->
+            validate_anchored(Primary, Alternatives)
     end.
 
-%% Highest cert in the path whose issuer is a trust anchor, plus the
-%% sub-path from that cert down to the leaf. Lets the server send extra
-%% or cross-signed certs above the cert that actually chains.
-anchored_subpath([], _Anchors) ->
+%% Every `{Anchor, SubPath}' pairing, highest anchorable cert first. The
+%% head is the pairing the single-anchor lookup would have chosen (lets
+%% the server send extra or cross-signed certs above the cert that
+%% actually chains); the tail anchors lower in the served chain, or at a
+%% different trust anchor for the same cert.
+candidate_anchorings([], _Anchors) ->
+    [];
+candidate_anchorings([Cert | Rest] = SubPath, Anchors) ->
+    [{Anchor, SubPath} || Anchor <- Anchors, is_issuer(Cert, Anchor)] ++
+        candidate_anchorings(Rest, Anchors).
+
+%% Validate the primary anchoring; on an expired-cert failure, recover by
+%% trying the alternatives. Mirrors OTP's
+%% `ssl_certificate:find_cross_sign_root_paths/4': an expired cross-signed
+%% root (e.g. Let's Encrypt ISRG Root X2 cross-signed by the expired X1)
+%% is dropped for a still-valid trust anchor with the same key, reached
+%% lower in the chain. Recovery only moves the anchor; an expired leaf or
+%% intermediate stays in every remaining sub-path, so it still fails as
+%% `cert_expired'.
+validate_anchored(Primary, Alternatives) ->
+    case validate_path(Primary) of
+        ok ->
+            ok;
+        {error, {bad_cert, Reason}} = Error ->
+            case is_expiry(Reason) of
+                true ->
+                    case try_anchorings(Alternatives) of
+                        ok -> ok;
+                        error -> {error, {bad_cert, cert_expired}}
+                    end;
+                false ->
+                    Error
+            end
+    end.
+
+%% First anchoring that validates wins. Returns a bare `error' on
+%% exhaustion, discarding each alternative's reason, so a failing
+%% alternative never replaces the caller's expiry outcome.
+try_anchorings([]) ->
     error;
-anchored_subpath([Cert | Rest] = SubPath, Anchors) ->
-    case find_anchor(Cert, Anchors) of
-        {ok, Anchor} -> {ok, Anchor, SubPath};
-        error -> anchored_subpath(Rest, Anchors)
+try_anchorings([Candidate | Rest]) ->
+    case validate_path(Candidate) of
+        ok -> ok;
+        {error, _} -> try_anchorings(Rest)
     end.
 
-%% Find the anchor that issued `Cert' (a self-signed cert is its own
-%% issuer, which covers self-signed leaves supplied as anchors).
-find_anchor(_Cert, []) ->
-    error;
-find_anchor(Cert, [Anchor | Rest]) ->
-    case is_issuer(Cert, Anchor) of
-        true -> {ok, Anchor};
-        false -> find_anchor(Cert, Rest)
+validate_path({Anchor, SubPath}) ->
+    try
+        public_key:pkix_path_validation(
+            Anchor, SubPath, [{max_path_length, ?MAX_PATH_LENGTH}]
+        )
+    of
+        {ok, _} -> ok;
+        {error, {bad_cert, Reason}} -> {error, {bad_cert, Reason}}
+    catch
+        _:_ -> {error, {bad_cert, validation_failed}}
     end.
 
+is_expiry(cert_expired) -> true;
+is_expiry(root_cert_expired) -> true;
+is_expiry(_) -> false.
+
+%% A self-signed cert is its own issuer, which covers self-signed leaves
+%% supplied as anchors.
 is_issuer(Cert, Anchor) ->
     try
         public_key:pkix_is_issuer(Cert, Anchor)
