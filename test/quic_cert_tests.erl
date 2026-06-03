@@ -9,6 +9,7 @@
 -module(quic_cert_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("public_key/include/public_key.hrl").
 
 -define(CONNECT_TIMEOUT, 3000).
 
@@ -94,6 +95,56 @@ cross_signed_chain_test_() ->
         {error, _} ->
             []
     end.
+
+%% Regression: a chain anchored by an expired cross-signed root must
+%% still validate when the trust store holds a still-valid root with the
+%% same public key (Let's Encrypt ISRG Root X2 cross-signed by the expired
+%% X1). Recovery only swaps the trust anchor: a genuinely expired leaf or
+%% intermediate must still fail.
+cross_signed_expired_root_test_() ->
+    Kx1 = gen_key(),
+    Kx2 = gen_key(),
+    Ke5 = gen_key(),
+    Kleaf = gen_key(),
+    %% Two self-signed roots in the store; X2 shares its key with the
+    %% expired cross-signed X2.
+    X1self = mint("Root X1", "Root X1", Kx1, Kx1, valid, ca),
+    X2self = mint("Root X2", "Root X2", Kx2, Kx2, valid, ca),
+    %% X2 cross-signed by X1 (same subject + key as X2self), expired.
+    X2cross = mint("Root X2", "Root X1", Kx2, Kx1, expired, ca),
+    X2crossValid = mint("Root X2", "Root X1", Kx2, Kx1, valid, ca),
+    E5 = mint("Int E5", "Root X2", Ke5, Kx2, valid, ca),
+    E5exp = mint("Int E5", "Root X2", Ke5, Kx2, expired, ca),
+    Leaf = mint("leaf.test", "Int E5", Kleaf, Ke5, valid, leaf),
+    LeafExp = mint("leaf.test", "Int E5", Kleaf, Ke5, expired, leaf),
+    Expired = {error, {bad_cert, cert_expired}},
+    [
+        {"chain anchored at the expired cross-signed root recovers via the same-key root",
+            ?_assertEqual(
+                ok,
+                quic_cert:validate_server(Leaf, [E5, X2cross], [X1self, X2self], undefined)
+            )},
+        {"a genuinely expired leaf still fails",
+            ?_assertEqual(
+                Expired,
+                quic_cert:validate_server(LeafExp, [E5, X2cross], [X1self, X2self], undefined)
+            )},
+        {"a genuinely expired intermediate still fails",
+            ?_assertEqual(
+                Expired,
+                quic_cert:validate_server(Leaf, [E5exp, X2crossValid], [X1self, X2self], undefined)
+            )},
+        {"no still-valid same-key anchor leaves the expiry result",
+            ?_assertEqual(
+                Expired,
+                quic_cert:validate_server(Leaf, [E5, X2cross], [X1self], undefined)
+            )},
+        {"a valid cross-signed root anchors on the first try",
+            ?_assertEqual(
+                ok,
+                quic_cert:validate_server(Leaf, [E5, X2crossValid], [X1self, X2self], undefined)
+            )}
+    ].
 
 %%====================================================================
 %% End-to-end client behaviour
@@ -433,3 +484,72 @@ decode_key(KeyPem) ->
 
 suffix() ->
     integer_to_list(erlang:unique_integer([positive, monotonic])).
+
+%%--------------------------------------------------------------------
+%% In-process certificate minting. Lets a test reuse one key across two
+%% roots and backdate a cert to expired, which openssl can't do
+%% portably. Builds an `#'OTPTBSCertificate'{}' and signs it with
+%% `public_key:pkix_sign/2'.
+%%--------------------------------------------------------------------
+
+gen_key() ->
+    public_key:generate_key({rsa, 2048, 65537}).
+
+%% DER of a cert with the given subject/issuer CNs, holding `KeyPair's
+%% public key and signed by `SignKeyPair'. `Window' is `valid' or
+%% `expired'; `Kind' is `ca' or `leaf'.
+mint(Subject, Issuer, KeyPair, SignKeyPair, Window, Kind) ->
+    TBS = #'OTPTBSCertificate'{
+        version = v3,
+        serialNumber = erlang:unique_integer([positive, monotonic]) + 1,
+        signature = #'SignatureAlgorithm'{algorithm = ?'sha256WithRSAEncryption'},
+        issuer = cert_name(Issuer),
+        validity = cert_validity(Window),
+        subject = cert_name(Subject),
+        subjectPublicKeyInfo = #'OTPSubjectPublicKeyInfo'{
+            algorithm = #'PublicKeyAlgorithm'{algorithm = ?'rsaEncryption', parameters = 'NULL'},
+            subjectPublicKey = cert_pub_key(KeyPair)
+        },
+        extensions = cert_extensions(Kind)
+    },
+    public_key:pkix_sign(TBS, SignKeyPair).
+
+cert_pub_key(#'RSAPrivateKey'{modulus = M, publicExponent = E}) ->
+    #'RSAPublicKey'{modulus = M, publicExponent = E}.
+
+cert_name(CN) ->
+    {rdnSequence, [
+        [#'AttributeTypeAndValue'{type = ?'id-at-commonName', value = {utf8String, CN}}]
+    ]}.
+
+cert_validity(valid) ->
+    #'Validity'{notBefore = {utcTime, "200101000000Z"}, notAfter = {utcTime, "350101000000Z"}};
+cert_validity(expired) ->
+    #'Validity'{notBefore = {utcTime, "200101000000Z"}, notAfter = {utcTime, "210101000000Z"}}.
+
+cert_extensions(ca) ->
+    [
+        #'Extension'{
+            extnID = ?'id-ce-basicConstraints',
+            critical = true,
+            extnValue = #'BasicConstraints'{cA = true}
+        },
+        #'Extension'{
+            extnID = ?'id-ce-keyUsage',
+            critical = true,
+            extnValue = [keyCertSign, cRLSign, digitalSignature]
+        }
+    ];
+cert_extensions(leaf) ->
+    [
+        #'Extension'{
+            extnID = ?'id-ce-basicConstraints',
+            critical = true,
+            extnValue = #'BasicConstraints'{cA = false}
+        },
+        #'Extension'{
+            extnID = ?'id-ce-keyUsage',
+            critical = true,
+            extnValue = [digitalSignature, keyEncipherment]
+        }
+    ].
