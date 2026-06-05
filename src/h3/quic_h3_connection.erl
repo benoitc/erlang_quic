@@ -4059,6 +4059,7 @@ do_send_push_data(
                             }};
                         false ->
                             Stream1 = Stream#h3_stream{
+                                %% Sent-side accounting; push stream is dropped on FIN.
                                 body_received = Stream#h3_stream.body_received + byte_size(Data)
                             },
                             {ok, State#state{
