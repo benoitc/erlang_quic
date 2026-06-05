@@ -120,7 +120,8 @@
     %% Response status (for client)
     status :: non_neg_integer() | undefined,
 
-    %% Body data buffer
+    %% Retained for compatibility; DATA payloads are delivered through
+    %% events/handlers and are not accumulated in the stream record.
     body = <<>> :: binary(),
 
     %% Content-Length tracking

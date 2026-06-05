@@ -157,6 +157,26 @@ no_content_length_allows_any_size_test() ->
     ),
     ?assertMatch({ok, _, _}, Result).
 
+data_frames_track_size_without_accumulating_body_test() ->
+    Stream = #h3_stream{
+        id = 0,
+        frame_state = expecting_data,
+        content_length = undefined,
+        body_received = 5,
+        body = <<>>
+    },
+    State = make_test_state(#{owner => self()}),
+    {ok, Stream1, _State1} = quic_h3_connection:handle_request_frame(
+        0, {data, <<"hello">>}, false, Stream, State
+    ),
+    ?assertEqual(10, Stream1#h3_stream.body_received),
+    ?assertEqual(<<>>, Stream1#h3_stream.body),
+    receive
+        {quic_h3, _, {data, 0, <<"hello">>, false}} -> ok
+    after 100 ->
+        ?assert(false)
+    end.
+
 %%====================================================================
 %% QPACK Section Acknowledgment Tests (RFC 9204 Section 4.4)
 %%====================================================================

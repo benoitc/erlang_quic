@@ -2567,7 +2567,6 @@ handle_request_frame(
             {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}};
         false ->
             Stream1 = Stream#h3_stream{
-                body = <<(Stream#h3_stream.body)/binary, Payload/binary>>,
                 body_received = NewReceived
             },
             State1 = notify_stream_data(StreamId, Payload, Fin, State),
@@ -2585,9 +2584,9 @@ handle_request_frame(
     _Fin,
     #h3_stream{frame_state = expecting_data} = Stream,
     _State
-) when (byte_size(Stream#h3_stream.body) + byte_size(Payload)) > ?H3_MAX_BUFFERED_BODY ->
-    %% Without a Content-Length the body buffer would otherwise grow with
-    %% the stream; cap it (RFC 9114 §4.1 allows H3_EXCESSIVE_LOAD).
+) when (Stream#h3_stream.body_received + byte_size(Payload)) > ?H3_MAX_BUFFERED_BODY ->
+    %% Without Content-Length, cap the total received body bytes so a peer
+    %% cannot keep an unbounded application stream open indefinitely.
     {error, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}};
 handle_request_frame(
     StreamId,
@@ -2597,7 +2596,6 @@ handle_request_frame(
     State
 ) ->
     Stream1 = Stream#h3_stream{
-        body = <<(Stream#h3_stream.body)/binary, Payload/binary>>,
         body_received = Stream#h3_stream.body_received + byte_size(Payload)
     },
     State1 = notify_stream_data(StreamId, Payload, Fin, State),
@@ -4061,7 +4059,7 @@ do_send_push_data(
                             }};
                         false ->
                             Stream1 = Stream#h3_stream{
-                                body = <<(Stream#h3_stream.body)/binary, Data/binary>>
+                                body_received = Stream#h3_stream.body_received + byte_size(Data)
                             },
                             {ok, State#state{
                                 push_streams = maps:put(PushId, {StreamId, Stream1}, PushStreams)
