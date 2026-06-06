@@ -25,6 +25,7 @@
     request/3,
     open_bidi_stream/2,
     send_response/4,
+    respond/5,
     send_data/3,
     send_data/4,
     send_trailers/3,
@@ -103,6 +104,7 @@
     handle_priority_update_frame/2,
     handle_priority_update_push_frame/2,
     do_send_trailers/3,
+    do_respond/5,
     pre_claim_bidi_stream/3,
     assign_uni_stream/3,
     validate_peer_h3_datagram_with/1
@@ -324,6 +326,12 @@ open_bidi_stream(Conn, SignalType) ->
     ok | {error, term()}.
 send_response(Conn, StreamId, Status, Headers) ->
     gen_statem:call(Conn, {send_response, StreamId, Status, Headers}).
+
+%% @doc Send a full response (status, headers and body) in one call (server only).
+-spec respond(pid(), stream_id(), pos_integer(), [{binary(), binary()}], binary()) ->
+    ok | {error, term()}.
+respond(Conn, StreamId, Status, Headers, Body) ->
+    gen_statem:call(Conn, {respond, StreamId, Status, Headers, Body}).
 
 %% @doc Send body data on a stream.
 -spec send_data(pid(), stream_id(), binary()) -> ok | {error, term()}.
@@ -1001,6 +1009,13 @@ connected({call, From}, {send_response, StreamId, Status, Headers}, State) ->
     end;
 connected({call, From}, {send_data, StreamId, Data, Fin}, State) ->
     case do_send_data(StreamId, Data, Fin, State) of
+        {ok, State1} ->
+            {keep_state, State1, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+    end;
+connected({call, From}, {respond, StreamId, Status, Headers, Body}, State) ->
+    case do_respond(StreamId, Status, Headers, Body, State) of
         {ok, State1} ->
             {keep_state, State1, [{reply, From, ok}]};
         {error, Reason} ->
@@ -3577,6 +3592,32 @@ send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, Streams, State)
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% Coalesce a full response: send_response then a final send_data with end-stream
+%% in one connection call. Reuses do_send_response/4 (validation, QPACK, HEADERS
+%% buffering) and do_send_data/4 (which prepends the buffered HEADERS so they ride
+%% in the same QUIC packet as the body). HEAD, 204 and 304 send no body.
+do_respond(StreamId, Status, Headers, Body, State) ->
+    case do_send_response(StreamId, Status, Headers, State) of
+        {ok, State1} ->
+            Data =
+                case response_body_allowed(StreamId, Status, State1) of
+                    true -> Body;
+                    false -> <<>>
+                end,
+            do_send_data(StreamId, Data, true, State1);
+        {error, _} = Err ->
+            Err
+    end.
+
+%% RFC 9110: HEAD requests and 204/304 responses carry no body.
+response_body_allowed(_StreamId, Status, _State) when Status =:= 204; Status =:= 304 ->
+    false;
+response_body_allowed(StreamId, _Status, #state{streams = Streams}) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #h3_stream{method = <<"HEAD">>}} -> false;
+        _ -> true
     end.
 
 do_send_response(

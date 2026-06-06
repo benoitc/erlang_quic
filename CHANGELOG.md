@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `quic_h3:respond/5` sends an HTTP/3 response status, headers and full body with end-stream in a single connection call, coalescing what previously took `send_response/4` plus `send_data/4`. HEAD, 204 and 304 responses send no body.
+
 ## [1.6.4] - 2026-06-05
 
 ### Changed

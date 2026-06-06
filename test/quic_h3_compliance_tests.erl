@@ -178,6 +178,127 @@ data_frames_track_size_without_accumulating_body_test() ->
     end.
 
 %%====================================================================
+%% Coalesced response: quic_h3:respond/5 (do_respond/5)
+%%====================================================================
+
+%% Drive do_respond/5 against a fake quic_conn that captures the emitted
+%% transport writes. Returns {Result, Sends} where Sends is the list of
+%% {StreamId, Payload, Fin} captured on the request stream (id 0).
+respond_capture(Status, Headers, Body, Method) ->
+    Conn = spawn_capture_conn(self()),
+    Stream = #h3_stream{
+        id = 0,
+        type = request,
+        state = open,
+        method = Method,
+        frame_state = expecting_data
+    },
+    State = make_test_state(#{
+        role => server,
+        quic_conn => Conn,
+        streams => #{0 => Stream}
+    }),
+    Result = quic_h3_connection:do_respond(0, Status, Headers, Body, State),
+    Sends = collect_sends(0, []),
+    Conn ! stop,
+    {Result, Sends}.
+
+spawn_capture_conn(Reporter) ->
+    spawn(fun() -> capture_loop(Reporter) end).
+
+capture_loop(Reporter) ->
+    receive
+        {'$gen_call', From, {send_data, StreamId, Data, Fin}} ->
+            Reporter ! {sent, StreamId, Data, Fin},
+            gen_statem:reply(From, ok),
+            capture_loop(Reporter);
+        stop ->
+            ok;
+        _Other ->
+            capture_loop(Reporter)
+    end.
+
+%% Collect the sends emitted for the request stream; ignore any encoder-stream
+%% instruction writes (different stream id).
+collect_sends(StreamId, Acc) ->
+    receive
+        {sent, StreamId, Data, Fin} -> collect_sends(StreamId, [{StreamId, Data, Fin} | Acc]);
+        {sent, _Other, _Data, _Fin} -> collect_sends(StreamId, Acc)
+    after 100 ->
+        lists:reverse(Acc)
+    end.
+
+respond_sends_headers_and_body_with_fin_test() ->
+    {Result, Sends} = respond_capture(
+        200,
+        [{<<"content-type">>, <<"text/plain">>}],
+        <<"hello">>,
+        <<"GET">>
+    ),
+    ?assertMatch({ok, _}, Result),
+    ?assertMatch([{0, _Payload, true}], Sends),
+    [{0, Payload, true}] = Sends,
+    DataFrame = quic_h3_frame:encode_data(<<"hello">>),
+    ?assertEqual(
+        DataFrame,
+        binary:part(
+            Payload,
+            byte_size(Payload) - byte_size(DataFrame),
+            byte_size(DataFrame)
+        )
+    ),
+    %% A HEADERS frame rode in front of the DATA frame in the same write.
+    ?assert(byte_size(Payload) > byte_size(DataFrame)),
+    {ok, State1} = Result,
+    Stream1 = quic_h3_connection:test_stream(0, State1),
+    ?assertEqual(half_closed_local, Stream1#h3_stream.state).
+
+respond_head_suppresses_body_test() ->
+    {Result, Sends} = respond_capture(
+        200,
+        [{<<"content-length">>, <<"5">>}],
+        <<"hello">>,
+        <<"HEAD">>
+    ),
+    ?assertMatch({ok, _}, Result),
+    assert_empty_body(Sends).
+
+respond_204_suppresses_body_test() ->
+    {Result, Sends} = respond_capture(204, [], <<"hello">>, <<"GET">>),
+    ?assertMatch({ok, _}, Result),
+    assert_empty_body(Sends).
+
+respond_304_suppresses_body_test() ->
+    {Result, Sends} = respond_capture(304, [], <<"hello">>, <<"GET">>),
+    ?assertMatch({ok, _}, Result),
+    assert_empty_body(Sends).
+
+assert_empty_body(Sends) ->
+    ?assertMatch([{0, _Payload, true}], Sends),
+    [{0, Payload, true}] = Sends,
+    EmptyData = quic_h3_frame:encode_data(<<>>),
+    ?assertEqual(
+        EmptyData,
+        binary:part(
+            Payload,
+            byte_size(Payload) - byte_size(EmptyData),
+            byte_size(EmptyData)
+        )
+    ).
+
+respond_invalid_status_test() ->
+    {Result, Sends} = respond_capture(700, [], <<"hello">>, <<"GET">>),
+    ?assertEqual({error, {invalid_status, 700}}, Result),
+    ?assertEqual([], Sends).
+
+respond_unknown_stream_test() ->
+    Conn = spawn_capture_conn(self()),
+    State = make_test_state(#{role => server, quic_conn => Conn, streams => #{}}),
+    Result = quic_h3_connection:do_respond(0, 200, [], <<"hello">>, State),
+    Conn ! stop,
+    ?assertEqual({error, unknown_stream}, Result).
+
+%%====================================================================
 %% QPACK Section Acknowledgment Tests (RFC 9204 Section 4.4)
 %%====================================================================
 
