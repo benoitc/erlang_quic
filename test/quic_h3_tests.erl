@@ -48,7 +48,8 @@ server_api_exists_test_() ->
     [
         ?_assert(erlang:function_exported(quic_h3, start_server, 3)),
         ?_assert(erlang:function_exported(quic_h3, stop_server, 1)),
-        ?_assert(erlang:function_exported(quic_h3, send_response, 4))
+        ?_assert(erlang:function_exported(quic_h3, send_response, 4)),
+        ?_assert(erlang:function_exported(quic_h3, respond, 5))
     ].
 
 query_api_exists_test_() ->

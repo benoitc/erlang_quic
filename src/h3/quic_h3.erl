@@ -126,7 +126,8 @@
 -export([
     start_server/3,
     stop_server/1,
-    send_response/4
+    send_response/4,
+    respond/5
 ]).
 
 %% Server Push API (RFC 9114 Section 4.6)
@@ -568,6 +569,16 @@ stop_server(Name) ->
     ok | {error, term()}.
 send_response(Conn, StreamId, Status, Headers) ->
     quic_h3_connection:send_response(Conn, StreamId, Status, Headers).
+
+%% @doc Send a full HTTP response (status, headers and body) in one call.
+%%
+%% Coalesces the work of `send_response/4' plus a final `send_data/4' with
+%% end-stream. HEAD, 204 and 304 responses send no body.
+%% @end
+-spec respond(conn(), stream_id(), status(), headers(), binary()) ->
+    ok | {error, term()}.
+respond(Conn, StreamId, Status, Headers, Body) ->
+    quic_h3_connection:respond(Conn, StreamId, Status, Headers, Body).
 
 %%====================================================================
 %% Server Push API (RFC 9114 Section 4.6)
