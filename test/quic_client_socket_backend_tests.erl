@@ -190,8 +190,6 @@ collect_echo(Conn, StreamId, Acc, Timeout) ->
             <<Acc/binary, Data/binary>>;
         {quic, Conn, {stream_data, StreamId, Data, false}} ->
             collect_echo(Conn, StreamId, <<Acc/binary, Data/binary>>, Timeout);
-        {quic, Conn, {stream_closed, StreamId, _}} ->
-            Acc;
         {quic, Conn, {closed, _}} ->
             Acc;
         %% Ignore unrelated events (e.g. session_ticket) that may show

@@ -96,8 +96,6 @@ echo_loop(Conn) ->
             %% still being delivered.
             _ = quic:send_data_async(Conn, StreamId, Data, Fin),
             echo_loop(Conn);
-        {quic, Conn, {stream_closed, _StreamId, _Code}} ->
-            echo_loop(Conn);
         {quic, Conn, {closed, _Reason}} ->
             ok;
         {quic, Conn, _Other} ->

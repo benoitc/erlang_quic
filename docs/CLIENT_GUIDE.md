@@ -418,6 +418,13 @@ Messages sent to the owner process:
 | `{quic, Conn, {closed, Reason}}` | Connection closed |
 | `{quic, Conn, {transport_error, Code, Reason}}` | Transport error |
 
+### Detecting stream closure
+
+There is no separate `stream_closed` message. A stream ends in one of two ways:
+
+- Graceful: `{stream_data, StreamId, _, true}` - the `Fin` flag marks the end of the receive side.
+- Abrupt: `{stream_reset, StreamId, Code}` (peer reset) or `{stop_sending, StreamId, Code}` (peer asked us to stop).
+
 ## Error Handling
 
 ```erlang

@@ -249,8 +249,6 @@ collect_download(Conn, StreamId, Acc, Timeout) ->
             <<Acc/binary, Data/binary>>;
         {quic, Conn, {stream_data, StreamId, Data, false}} ->
             collect_download(Conn, StreamId, <<Acc/binary, Data/binary>>, Timeout);
-        {quic, Conn, {stream_closed, StreamId, _Code}} ->
-            Acc;
         {quic, Conn, {closed, _}} ->
             Acc
     after Timeout ->
@@ -604,8 +602,6 @@ wait_stream_close(Conn, StreamId, Timeout) ->
     receive
         {quic, Conn, {stream_data, StreamId, _Data, true}} ->
             ok;
-        {quic, Conn, {stream_closed, StreamId}} ->
-            ok;
         {quic, Conn, {stream_data, StreamId, _Data, false}} ->
             wait_stream_close(Conn, StreamId, Timeout)
     after Timeout ->
@@ -615,8 +611,6 @@ wait_stream_close(Conn, StreamId, Timeout) ->
 %% Wait for stream to close (sink mode - server closes stream after receiving FIN)
 wait_stream_close_sink(Conn, StreamId, Timeout) ->
     receive
-        {quic, Conn, {stream_closed, StreamId}} ->
-            ok;
         {quic, Conn, {stream_data, StreamId, _Data, true}} ->
             %% Server sent FIN (empty response)
             ok;

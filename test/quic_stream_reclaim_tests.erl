@@ -48,8 +48,6 @@ drain_fins(Conn, Pending, Timeout) ->
     receive
         {quic, Conn, {stream_data, Sid, _Data, true}} ->
             drain_fins(Conn, lists:delete(Sid, Pending), Timeout);
-        {quic, Conn, {stream_closed, Sid, _}} ->
-            drain_fins(Conn, lists:delete(Sid, Pending), Timeout);
         {quic, Conn, _Other} ->
             drain_fins(Conn, Pending, Timeout)
     after Timeout ->

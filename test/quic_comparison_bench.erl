@@ -395,8 +395,6 @@ wait_for_completion(Conn, StreamId, Timeout) ->
     receive
         {quic, Conn, {stream_data, StreamId, _Data, true}} ->
             ok;
-        {quic, Conn, {stream_closed, StreamId}} ->
-            ok;
         {quic, Conn, {stream_data, StreamId, _Data, false}} ->
             wait_for_completion(Conn, StreamId, Timeout);
         {quic, Conn, {closed, _Reason}} ->
@@ -414,8 +412,6 @@ wait_for_data_loop(Conn, StreamId, BytesRecv, Timeout) ->
             {ok, BytesRecv + byte_size(Data)};
         {quic, Conn, {stream_data, StreamId, Data, false}} ->
             wait_for_data_loop(Conn, StreamId, BytesRecv + byte_size(Data), Timeout);
-        {quic, Conn, {stream_closed, StreamId}} ->
-            {ok, BytesRecv};
         {quic, Conn, {closed, _Reason}} ->
             {ok, BytesRecv}
     after Timeout ->

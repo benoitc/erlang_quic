@@ -235,8 +235,6 @@ download_loop(Conn, PendingReq) ->
                 _ ->
                     download_loop(Conn, PendingReq#{StreamId => Buffer})
             end;
-        {quic, Conn, {stream_closed, _StreamId, _Code}} ->
-            download_loop(Conn, PendingReq);
         {quic, Conn, {closed, _Reason}} ->
             ok;
         {quic, Conn, _Other} ->
@@ -329,8 +327,6 @@ collect_stream_data(Conn, StreamId, Acc) ->
             <<Acc/binary, Data/binary>>;
         {quic, Conn, {stream_data, StreamId, Data, false}} ->
             collect_stream_data(Conn, StreamId, <<Acc/binary, Data/binary>>);
-        {quic, Conn, {stream_closed, StreamId, _Code}} ->
-            Acc;
         {quic, Conn, {closed, _Reason}} ->
             Acc
     after ?REQUEST_TIMEOUT_MS ->

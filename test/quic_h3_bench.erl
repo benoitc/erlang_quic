@@ -576,10 +576,7 @@ echo_body(Conn, StreamId, Acc, false) ->
         {quic_h3, Conn, {data, StreamId, Data, false}} ->
             echo_body(Conn, StreamId, <<Acc/binary, Data/binary>>, false);
         {quic_h3, Conn, {data, StreamId, Data, true}} ->
-            send_echo_response(Conn, StreamId, <<Acc/binary, Data/binary>>);
-        {quic_h3, Conn, {stream_closed, StreamId}} ->
-            %% Stream closed without FIN, send what we have
-            send_echo_response(Conn, StreamId, Acc)
+            send_echo_response(Conn, StreamId, <<Acc/binary, Data/binary>>)
     after 30000 ->
         ok
     end.
@@ -655,9 +652,7 @@ wait_response(Conn, StreamId, AccBody, Timeout) ->
         {quic_h3, Conn, {data, StreamId, Data, false}} ->
             wait_response(Conn, StreamId, <<AccBody/binary, Data/binary>>, Timeout);
         {quic_h3, Conn, {data, StreamId, Data, true}} ->
-            {ok, undefined, [], <<AccBody/binary, Data/binary>>};
-        {quic_h3, Conn, {stream_closed, StreamId}} ->
-            {ok, undefined, [], AccBody}
+            {ok, undefined, [], <<AccBody/binary, Data/binary>>}
     after Timeout ->
         {error, timeout}
     end.
@@ -669,9 +664,7 @@ wait_response_body(Conn, StreamId, Status, Headers, AccBody, Timeout) ->
                 Conn, StreamId, Status, Headers, <<AccBody/binary, Data/binary>>, Timeout
             );
         {quic_h3, Conn, {data, StreamId, Data, true}} ->
-            {ok, Status, Headers, <<AccBody/binary, Data/binary>>};
-        {quic_h3, Conn, {stream_closed, StreamId}} ->
-            {ok, Status, Headers, AccBody}
+            {ok, Status, Headers, <<AccBody/binary, Data/binary>>}
     after Timeout ->
         {ok, Status, Headers, AccBody}
     end.

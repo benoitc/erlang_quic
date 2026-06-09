@@ -462,8 +462,6 @@ wait_streams_loop(ConnRef, Pending, Deadline) ->
         false ->
             Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
             receive
-                {quic, ConnRef, {stream_closed, StreamId}} ->
-                    wait_streams_loop(ConnRef, sets:del_element(StreamId, Pending), Deadline);
                 {quic, ConnRef, {stream_data, StreamId, _Data, true}} ->
                     wait_streams_loop(ConnRef, sets:del_element(StreamId, Pending), Deadline);
                 {quic, ConnRef, {stream_data, _StreamId, _Data, false}} ->
