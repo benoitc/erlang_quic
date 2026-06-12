@@ -783,6 +783,14 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %%       CertificateVerify (RFC 8446 §4.4.3).</li>
 %%   <li>`pool_size' - Number of listener processes (default: 1)</li>
 %%   <li>`connection_handler' - Fun(Conn) -> {ok, HandlerPid} where Conn is the pid</li>
+%%   <li>`sni_callback' -
+%%       `fun((ServerName :: binary() | undefined) -> {ok, CertMap} | {error, term()})'
+%%       where `CertMap :: #{cert := binary(), key := term(), cert_chain => [binary()]}'.
+%%       Invoked per connection with the ClientHello SNI (RFC 6066 §3);
+%%       the returned cert/key override the static `cert'/`key' for that
+%%       handshake. `cert'/`key' may be omitted when this is set. An
+%%       `{error, _}', a malformed result, or a raised exception fails the
+%%       handshake with a `handshake_failure' alert.</li>
 %% </ul>
 %%
 %% Example:

@@ -557,6 +557,10 @@
     server_cert :: binary() | undefined,
     server_cert_chain = [] :: [binary()],
     server_private_key :: term() | undefined,
+    %% Per-SNI cert selection (RFC 6066 §3). When set, invoked on the
+    %% ClientHello server_name to override the cert fields above.
+    sni_callback ::
+        fun((binary() | undefined) -> {ok, map()} | {error, term()}) | undefined,
     %% Server preferred address config (RFC 9000 Section 9.6)
     %% Set from listener options: {IPv4, IPv6} where each is {Addr, Port} | undefined
     server_preferred_address :: #preferred_address{} | undefined,
@@ -1013,9 +1017,12 @@ init({server, Opts}) ->
     RemoteAddr = maps:get(remote_addr, Opts),
     InitialDCID = maps:get(initial_dcid, Opts),
     SCID = maps:get(scid, Opts),
-    Cert = maps:get(cert, Opts),
+    %% Cert/key are optional: a `sni_callback' may supply them per
+    %% handshake from the ClientHello server_name.
+    Cert = maps:get(cert, Opts, undefined),
     CertChain = maps:get(cert_chain, Opts, []),
-    PrivateKey = maps:get(private_key, Opts),
+    PrivateKey = maps:get(private_key, Opts, undefined),
+    SniCallback = maps:get(sni_callback, Opts, undefined),
     ALPNList = maps:get(alpn, Opts, [<<"h3">>]),
     Listener = maps:get(listener, Opts),
     %% Use client's QUIC version for key derivation (defaults to v1)
@@ -1148,6 +1155,7 @@ init({server, Opts}) ->
         server_cert = Cert,
         server_cert_chain = CertChain,
         server_private_key = PrivateKey,
+        sni_callback = SniCallback,
         server_preferred_address = build_server_preferred_address(Opts),
         cid_config = maps:get(cid_config, Opts, undefined),
         congestion_threshold = maps:get(congestion_threshold, Opts, 2),
@@ -5735,14 +5743,28 @@ process_tls_message(_Level, _Type, _Body, _OriginalMsg, State) ->
 %% group is settled (direct or post-HRR). SelectedGroup is the agreed
 %% named group; ClientPubKey is the client's key_share for it.
 do_server_client_hello(SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State0In) ->
+    %% Remember the client's offered signature schemes for the server's
+    %% CertificateVerify negotiation, then resolve the server cert (static
+    %% or via the per-SNI callback) before any cert-path work runs.
+    StateSig = State0In#state{
+        peer_sig_algs = maps:get(signature_algorithms, ClientHelloInfo, [])
+    },
+    case resolve_server_cert(ClientHelloInfo, StateSig) of
+        {error, Phrase} ->
+            send_tls_alert(?TLS_ALERT_HANDSHAKE_FAILURE, Phrase, StateSig);
+        {ok, State} ->
+            do_server_client_hello_cont(
+                SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
+            )
+    end.
+
+%% @private Continue the ClientHello once the server cert/key are settled.
+do_server_client_hello_cont(
+    SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
+) ->
     ClientALPN = maps:get(alpn_protocols, ClientHelloInfo, []),
     TP = maps:get(transport_params, ClientHelloInfo, #{}),
     SessionId = maps:get(session_id, ClientHelloInfo, <<>>),
-    %% Remember the client's offered signature schemes for the
-    %% server's CertificateVerify negotiation.
-    State = State0In#state{
-        peer_sig_algs = maps:get(signature_algorithms, ClientHelloInfo, [])
-    },
     %% Check for PSK (0-RTT/resumption/external)
     PSKInfo = maps:get(pre_shared_key, ClientHelloInfo, undefined),
     WantsEarlyData = maps:get(early_data, ClientHelloInfo, false),
@@ -5963,6 +5985,43 @@ do_server_client_hello(SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, Ori
             State2 = send_server_hello(ServerHello, State1),
             State3 = send_server_handshake_flight(Cipher, TranscriptHash, State2),
             maybe_emit_pending_close(State3)
+    end.
+
+%% @private Select the server cert/key for this handshake. With no
+%% `sni_callback' the static cert configured on the listener is kept.
+%% Otherwise the callback is invoked with the ClientHello server_name
+%% (RFC 6066 §3); its cert/key/chain override the static ones. A
+%% rejection, malformed result, or raised exception fails the handshake.
+resolve_server_cert(_ClientHelloInfo, #state{sni_callback = undefined} = State) ->
+    {ok, State};
+resolve_server_cert(ClientHelloInfo, #state{sni_callback = Fn} = State) ->
+    ServerName = maps:get(server_name, ClientHelloInfo, undefined),
+    try Fn(ServerName) of
+        {ok, #{cert := Cert, key := Key} = CertMap} when is_binary(Cert) ->
+            {ok, State#state{
+                server_cert = Cert,
+                server_private_key = Key,
+                server_cert_chain = maps:get(cert_chain, CertMap, [])
+            }};
+        Other ->
+            ?LOG_WARNING(
+                #{what => sni_callback_rejected, server_name => ServerName, result => Other},
+                ?QUIC_LOG_META
+            ),
+            {error, <<"sni callback rejected server name">>}
+    catch
+        Class:Reason:Stack ->
+            ?LOG_WARNING(
+                #{
+                    what => sni_callback_failed,
+                    server_name => ServerName,
+                    class => Class,
+                    reason => Reason,
+                    stacktrace => Stack
+                },
+                ?QUIC_LOG_META
+            ),
+            {error, <<"sni callback failed">>}
     end.
 
 %% @private Choose the server's CertificateVerify scheme. PSK

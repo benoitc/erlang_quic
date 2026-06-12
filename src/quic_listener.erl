@@ -87,6 +87,10 @@
     %% independently; per-handshake selection happens in quic_connection.
     psks :: #{binary() => binary()} | undefined,
     psk_callback :: fun((binary()) -> {ok, binary()} | not_found) | undefined,
+    %% Per-SNI cert selection (RFC 6066 §3). Invoked with the ClientHello
+    %% server_name; its returned cert/key override the static ones above.
+    sni_callback ::
+        fun((binary() | undefined) -> {ok, map()} | {error, term()}) | undefined,
     alpn_list :: [binary()],
     %% Connection ID -> Pid mapping
     connections :: ets:tid(),
@@ -263,7 +267,8 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
     PrivateKey = maps:get(key, Opts, undefined),
     Psks = maps:get(psks, Opts, undefined),
     PskCallback = maps:get(psk_callback, Opts, undefined),
-    case has_auth_method(Cert, PrivateKey, Psks, PskCallback) of
+    SniCallback = maps:get(sni_callback, Opts, undefined),
+    case has_auth_method(Cert, PrivateKey, Psks, PskCallback, SniCallback) of
         ok -> ok;
         {error, no_auth_method} -> exit({listener_init_failed, no_auth_method})
     end,
@@ -296,6 +301,7 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
         private_key = PrivateKey,
         psks = Psks,
         psk_callback = PskCallback,
+        sni_callback = SniCallback,
         alpn_list = ALPNList,
         connections = ConnTab,
         tickets_table = TicketTab,
@@ -314,10 +320,13 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
 %% Validate that the listener has at least one viable auth method.
 %% Either a cert+key pair for X.509 auth or PSK config for TLS 1.3
 %% external PSK (RFC 8446 §4.2.11) must be present. Both may coexist.
-has_auth_method(Cert, Key, _Psks, _Cb) when Cert =/= undefined, Key =/= undefined -> ok;
-has_auth_method(_Cert, _Key, Psks, _Cb) when is_map(Psks), map_size(Psks) > 0 -> ok;
-has_auth_method(_Cert, _Key, _Psks, Cb) when is_function(Cb, 1) -> ok;
-has_auth_method(_, _, _, _) -> {error, no_auth_method}.
+%% A `sni_callback' supplies the cert/key per handshake, so it counts as
+%% an auth method even when no static cert/key is configured.
+has_auth_method(Cert, Key, _Psks, _Cb, _Sni) when Cert =/= undefined, Key =/= undefined -> ok;
+has_auth_method(_Cert, _Key, Psks, _Cb, _Sni) when is_map(Psks), map_size(Psks) > 0 -> ok;
+has_auth_method(_Cert, _Key, _Psks, Cb, _Sni) when is_function(Cb, 1) -> ok;
+has_auth_method(_Cert, _Key, _Psks, _Cb, Sni) when is_function(Sni, 1) -> ok;
+has_auth_method(_, _, _, _, _) -> {error, no_auth_method}.
 
 %% Get socket port depending on backend
 get_socket_port(_Socket, SocketState, socket) when SocketState =/= undefined ->
@@ -831,6 +840,7 @@ create_connection_unconditional(
         private_key = PrivateKey,
         psks = Psks,
         psk_callback = PskCallback,
+        sni_callback = SniCallback,
         alpn_list = ALPNList,
         connections = Conns,
         connection_handler = ConnHandler,
@@ -877,6 +887,7 @@ create_connection_unconditional(
         private_key => PrivateKey,
         psks => Psks,
         psk_callback => PskCallback,
+        sni_callback => SniCallback,
         alpn => ALPNList,
         listener => self(),
         cid_config => CIDConfig,
