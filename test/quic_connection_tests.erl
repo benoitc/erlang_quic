@@ -536,6 +536,55 @@ default_connection_stream_ratio_test() ->
     ),
     ?assertEqual(ExpectedConnWindow, ?DEFAULT_INITIAL_MAX_DATA).
 
+%% Connection-level MAX_DATA sliding-window regression (RFC 9000 §4)
+%%
+%% The connection-level MAX_DATA limit must SLIDE forward relative to bytes
+%% received, staying a full window ahead of data_received. The original code
+%% capped the *absolute* limit at fc_max_receive_window, so once cumulative
+%% bytes reached the ceiling the window collapsed to zero headroom and the
+%% publisher was blocked forever (deadlock).
+
+%% At the ceiling, the recomputed limit must still leave the sender headroom.
+connection_max_data_stays_ahead_of_received_test() ->
+    MaxWindow = ?DEFAULT_MAX_RECEIVE_WINDOW,
+    MaxStreamWindow = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+    %% Cumulative bytes received have already reached the 8 MiB ceiling.
+    Received = MaxWindow,
+    NewMaxData = quic_connection:compute_connection_max_data(
+        Received, MaxWindow, true, MaxWindow, MaxStreamWindow
+    ),
+    ?assert(NewMaxData > Received).
+
+%% Feedback-loop simulation: ingest 64 MiB in 256 KiB chunks with the sender
+%% clamped by the advertised limit, recomputing the limit each round. The
+%% advertised limit must always stay strictly ahead of cumulative bytes
+%% received, or the sender deadlocks.
+connection_max_data_slides_past_ceiling_test() ->
+    MaxWindow = ?DEFAULT_MAX_RECEIVE_WINDOW,
+    MaxStreamWindow = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+    InitialMaxData = ?DEFAULT_INITIAL_MAX_DATA,
+    ChunkSize = 262144,
+    NumChunks = 256,
+    {FinalReceived, FinalMaxData} =
+        lists:foldl(
+            fun(_Round, {Recv0, Local0}) ->
+                %% Flow control: sender may not send past the advertised limit.
+                Recv1 = min(Recv0 + ChunkSize, Local0),
+                %% Receiver recomputes the advertised limit (code under test).
+                Local1 = quic_connection:compute_connection_max_data(
+                    Recv1, Local0, true, MaxWindow, MaxStreamWindow
+                ),
+                %% Invariant: positive headroom must remain, or the sender stalls.
+                ?assert(Local1 > Recv1),
+                {Recv1, Local1}
+            end,
+            {0, InitialMaxData},
+            lists:seq(1, NumChunks)
+        ),
+    %% A correctly sliding window lets ingest run past the old 8 MiB ceiling.
+    ?assert(FinalReceived > MaxWindow),
+    ?assert(FinalMaxData > FinalReceived).
+
 %% Test custom max_receive_window option
 custom_max_receive_window_test() ->
     CustomMaxWindow = 4194304,

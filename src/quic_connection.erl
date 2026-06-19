@@ -178,7 +178,9 @@
     test_decimate_step/1,
     test_decimate_on_timer_fire/1,
     test_maybe_send_ack_app/2,
-    test_classify_recv_trigger/2
+    test_classify_recv_trigger/2,
+    %% Connection-level MAX_DATA sliding-window computation (RFC 9000 §4)
+    compute_connection_max_data/5
 ]).
 -endif.
 
@@ -6514,7 +6516,6 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                 SmoothedRTT2 = quic_loss:smoothed_rtt(State2#state.loss_state),
                                 MaxWindow2 = State2#state.fc_max_receive_window,
                                 LastConnUpdate = State2#state.fc_last_conn_update,
-                                InitialConnWindow = ?DEFAULT_INITIAL_MAX_DATA,
                                 %% Check if consumption is fast (< 4*RTT since last update)
                                 FastConsumption2 =
                                     case LastConnUpdate of
@@ -6524,29 +6525,17 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                             (Now2 - LastConnUpdate) <
                                                 (SmoothedRTT2 * ?AUTO_TUNE_RTT_FACTOR)
                                     end,
-                                %% Calculate new window based on RTT-aware growth
-                                BaseNewMaxData =
-                                    case FastConsumption2 of
-                                        true ->
-                                            %% Double (aggressive growth)
-                                            min(
-                                                (NewDataReceivedVal + MaxDataLocalVal) * 2,
-                                                MaxWindow2
-                                            );
-                                        false ->
-                                            %% Linear (conservative growth)
-                                            min(
-                                                NewDataReceivedVal + MaxDataLocalVal +
-                                                    InitialConnWindow,
-                                                MaxWindow2
-                                            )
-                                    end,
-                                %% Ensure connection window >= 1.5x largest stream window
+                                %% Slide the connection window forward relative to
+                                %% bytes received, capped at MaxWindow (see
+                                %% compute_connection_max_data/5).
                                 MaxStreamWindow = get_max_stream_recv_window(State2),
-                                MinConnWindow = trunc(
-                                    MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER
+                                NewMaxData = compute_connection_max_data(
+                                    NewDataReceivedVal,
+                                    MaxDataLocalVal,
+                                    FastConsumption2,
+                                    MaxWindow2,
+                                    MaxStreamWindow
                                 ),
-                                NewMaxData = max(BaseNewMaxData, MinConnWindow),
                                 MaxDataFrame = {max_data, NewMaxData},
                                 State2a = send_frame(MaxDataFrame, State2),
                                 State2a#state{
@@ -6564,6 +6553,36 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                 % end of FinalSizeError case
             end
     end.
+
+%% Compute the new connection-level MAX_DATA limit (RFC 9000 §4).
+-spec compute_connection_max_data(
+    DataReceived :: non_neg_integer(),
+    MaxDataLocal :: non_neg_integer(),
+    FastConsumption :: boolean(),
+    MaxWindow :: non_neg_integer(),
+    MaxStreamWindow :: non_neg_integer()
+) -> non_neg_integer().
+compute_connection_max_data(
+    DataReceived, MaxDataLocal, FastConsumption, MaxWindow, MaxStreamWindow
+) ->
+    InitialConnWindow = ?DEFAULT_INITIAL_MAX_DATA,
+    %% Slide the absolute limit forward relative to bytes received, capping
+    %% only the *window size* at MaxWindow (mirrors the stream-level logic in
+    %% do_process_stream_data_buffered/5). Keeping DataReceived outside the
+    %% min is what makes the window slide: with it inside, max_data_local
+    %% freezes at MaxWindow and the sender deadlocks once received catches up.
+    BaseNewMaxData =
+        case FastConsumption of
+            true ->
+                %% Double the window (aggressive growth)
+                DataReceived + min(MaxDataLocal * 2, MaxWindow);
+            false ->
+                %% Grow by one initial window (conservative growth)
+                DataReceived + min(MaxDataLocal + InitialConnWindow, MaxWindow)
+        end,
+    %% Ensure connection window >= 1.5x largest stream window
+    MinConnWindow = trunc(MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER),
+    max(BaseNewMaxData, MinConnWindow).
 
 %% Extract contiguous data from buffer starting at Offset
 %% Returns {Data, NewOffset, UpdatedBuffer}
