@@ -678,7 +678,10 @@ get_tables(_) ->
 handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) ->
     case parse_packet_header(Packet, DCIDLen) of
         {initial, DCID, _SCID, Version, _Rest} ->
-            ?LOG_INFO(
+            %% Per-packet routing trace. Logged at debug: every received packet
+            %% hits this path (a short-header packet per 1-RTT datagram), so at
+            %% info level a busy listener floods the log and burns CPU.
+            ?LOG_DEBUG(
                 #{
                     what => initial_packet,
                     remote_addr => RemoteAddr,
@@ -689,10 +692,10 @@ handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) -
             ),
             handle_initial_packet(Packet, DCID, Version, RemoteAddr, State);
         {short, DCID, _Rest} ->
-            ?LOG_INFO(#{what => short_header_packet, dcid => DCID}, ?QUIC_LOG_META),
+            ?LOG_DEBUG(#{what => short_header_packet, dcid => DCID}, ?QUIC_LOG_META),
             route_to_connection(DCID, Packet, RemoteAddr, State);
         {long, DCID, _SCID, PacketType, _Rest} ->
-            ?LOG_INFO(
+            ?LOG_DEBUG(
                 #{what => long_header_packet, packet_type => PacketType, dcid => DCID},
                 ?QUIC_LOG_META
             ),
