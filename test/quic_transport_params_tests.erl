@@ -24,6 +24,15 @@ encode_original_dcid_test() ->
     {ok, Decoded} = quic_tls:decode_transport_params(Encoded),
     ?assertEqual(DCID, maps:get(original_dcid, Decoded)).
 
+encode_stateless_reset_token_test() ->
+    %% stateless_reset_token (0x02) - 16 bytes, server-sent (RFC 9000 §10.3)
+    Token = crypto:strong_rand_bytes(16),
+    Params = #{stateless_reset_token => Token},
+    Encoded = quic_tls:encode_transport_params(Params),
+    ?assert(byte_size(Encoded) > 0),
+    {ok, Decoded} = quic_tls:decode_transport_params(Encoded),
+    ?assertEqual(Token, maps:get(stateless_reset_token, Decoded)).
+
 encode_max_idle_timeout_test() ->
     %% max_idle_timeout (0x01)
     Params = #{max_idle_timeout => 30000},

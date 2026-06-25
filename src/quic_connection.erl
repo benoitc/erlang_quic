@@ -160,6 +160,10 @@
     %% Stateless reset token derivation (RFC 9000 §10.3.2)
     generate_stateless_reset_token/2,
     test_state_with_secret/1,
+    %% Stateless reset recognition (RFC 9000 §10.3)
+    maybe_store_initial_reset_token/2,
+    check_stateless_reset/2,
+    test_state_for_reset/3,
     %% NEW_TOKEN frame dispatch (RFC 9000 §8.1.3)
     process_frame/3,
     test_state_for_role/1,
@@ -2941,10 +2945,25 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     %% RFC 9000 §7.3: if this server issued a Retry for this client,
     %% echo the Retry's SCID in retry_source_connection_id so the
     %% client can verify the full handshake against the Retry it saw.
-    TransportParams =
+    TransportParams4 =
         case State#state.retry_scid_for_tp of
             undefined -> TransportParams3;
             RetrySCIDTP -> TransportParams3#{retry_scid => RetrySCIDTP}
+        end,
+
+    %% RFC 9000 §10.3: advertise a stateless_reset_token bound to our initial
+    %% SCID, so the peer can recognise a stateless reset for this connection if
+    %% we later lose its state (e.g. after a restart) and reply with a reset
+    %% derived from the same server-wide secret + CID. Only sent when a secret
+    %% is configured.
+    TransportParams =
+        case State#state.stateless_reset_secret of
+            undefined ->
+                TransportParams4;
+            _ ->
+                TransportParams4#{
+                    stateless_reset_token => generate_stateless_reset_token(SCID, State)
+                }
         end,
 
     %% Build EncryptedExtensions
@@ -10995,6 +11014,12 @@ apply_peer_transport_params_internal(TransportParams, State) ->
     %% If true, peer has indicated they don't want to receive traffic from different addresses
     PeerDisableMigration = maps:get(disable_active_migration, TransportParams, false),
 
+    %% RFC 9000 §10.3: the peer's stateless_reset_token applies to the CID it
+    %% chose as its initial source CID — i.e. our current DCID. Record it so a
+    %% later stateless reset for this connection is recognised by
+    %% check_stateless_reset/2 (only servers send this, so only clients store it).
+    PeerCIDPool = maybe_store_initial_reset_token(TransportParams, State),
+
     %% Store stream data limits in state for use when opening streams
     %% These tell us how much we can send on different stream types
     State#state{
@@ -11004,6 +11029,7 @@ apply_peer_transport_params_internal(TransportParams, State) ->
             peer_max_stream_data_bidi_local => MaxStreamDataBidiLocal,
             peer_max_stream_data_uni => MaxStreamDataUni
         }),
+        peer_cid_pool = PeerCIDPool,
         peer_active_cid_limit = PeerCIDLimit,
         %% Connection-level send limit
         max_data_remote = MaxDataRemote,
@@ -11015,6 +11041,30 @@ apply_peer_transport_params_internal(TransportParams, State) ->
         %% Migration disabled by peer (RFC 9000 Section 18.2)
         peer_disable_migration = PeerDisableMigration
     }.
+
+%% Record the peer's transport-parameter stateless_reset_token (RFC 9000 §10.3)
+%% against our current DCID (the peer's initial source CID), as a sequence-0
+%% entry in the peer CID pool. This is what lets check_stateless_reset/2 match a
+%% reset for the initial connection ID — a steady connection never receives a
+%% NEW_CONNECTION_ID frame, so without this the token is never stored.
+maybe_store_initial_reset_token(TransportParams, #state{dcid = DCID, peer_cid_pool = Pool}) ->
+    case maps:get(stateless_reset_token, TransportParams, undefined) of
+        Token when is_binary(Token), byte_size(Token) =:= 16, is_binary(DCID) ->
+            case lists:keyfind(0, #cid_entry.seq_num, Pool) of
+                false ->
+                    Entry = #cid_entry{
+                        seq_num = 0,
+                        cid = DCID,
+                        stateless_reset_token = Token,
+                        status = active
+                    },
+                    [Entry | Pool];
+                _ ->
+                    Pool
+            end;
+        _ ->
+            Pool
+    end.
 
 %% @doc Handle RETIRE_CONNECTION_ID frame from peer.
 %% Marks the specified CID in our local pool as retired.
@@ -11310,6 +11360,17 @@ test_spin_state_for(Role, Enabled) ->
 -spec test_state_with_secret(binary() | undefined) -> #state{}.
 test_state_with_secret(Secret) ->
     #state{stateless_reset_secret = Secret}.
+
+%% Minimal client #state{} for stateless-reset recognition tests: a current DCID
+%% and an explicit peer CID pool.
+-spec test_state_for_reset(binary(), [#cid_entry{}], binary() | undefined) -> #state{}.
+test_state_for_reset(DCID, PeerCIDPool, Secret) ->
+    #state{
+        role = client,
+        dcid = DCID,
+        peer_cid_pool = PeerCIDPool,
+        stateless_reset_secret = Secret
+    }.
 
 %% Minimal #state{} scoped to role for frame-dispatch tests.
 -spec test_state_for_role(client | server) -> #state{}.
