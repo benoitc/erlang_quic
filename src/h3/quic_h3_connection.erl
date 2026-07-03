@@ -1810,13 +1810,22 @@ process_control_frames(Data, State) ->
     end.
 
 handle_control_frame({settings, Settings}, #state{settings_received = false} = State) ->
-    %% First frame on control stream must be SETTINGS
-    %% Apply peer settings to QPACK encoder (RFC 9114 Section 7.2.4.1)
-    State1 = apply_peer_settings(Settings, State),
-    {ok, State1#state{
-        peer_settings = Settings,
-        settings_received = true
-    }};
+    %% First frame on control stream must be SETTINGS.
+    %% apply_peer_settings/2 signals SETTINGS violations with
+    %% throw({connection_error, ...}); gen_statem treats a throw from a state
+    %% callback as its return value, so let it escape and it crashes the
+    %% process with bad_return_from_state_function. Convert it to a returned
+    %% error that flows through handle_connection_error/2 for a clean close.
+    try apply_peer_settings(Settings, State) of
+        State1 ->
+            {ok, State1#state{
+                peer_settings = Settings,
+                settings_received = true
+            }}
+    catch
+        throw:{connection_error, _Code, _Reason} = Err ->
+            {error, Err}
+    end;
 handle_control_frame({settings, _Settings}, #state{settings_received = true}) ->
     %% Duplicate SETTINGS frame
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"duplicate SETTINGS">>}};
