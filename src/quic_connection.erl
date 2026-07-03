@@ -452,6 +452,10 @@
     %% Timers
     idle_timeout :: non_neg_integer(),
     last_activity :: non_neg_integer(),
+    %% RFC 9000 §10.1: true once an ack-eliciting packet has been sent since the
+    %% last received packet. Gates the send-side idle-timer restart so it fires
+    %% at most once per received packet (a black-holed sender still times out).
+    ack_eliciting_since_recv = false :: boolean(),
     timer_ref :: reference() | undefined,
 
     %% Congestion control and loss detection
@@ -2429,8 +2433,9 @@ handle_common_event(
             %% no PING needed.
             {keep_state, set_keep_alive_timer(State#state{keep_alive_timer = undefined})};
         false ->
-            %% Idle for a full interval: send a PING (which refreshes
-            %% last_activity via the send path) and re-arm a full interval.
+            %% Idle for a full interval: send a PING. Being ack-eliciting, it
+            %% refreshes last_activity if it is the first such packet since our
+            %% last receive (RFC 9000 §10.1); re-arm a full interval.
             State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
             State2 = flush_dirty_timers(flush_socket_batch(State1)),
             {keep_state, set_keep_alive_timer(State2)}
@@ -3541,19 +3546,28 @@ send_app_packet_internal(Payload, Frames, State) ->
                     undefined -> State#state.socket_state;
                     _ -> NewSocketState
                 end,
-            %% Note: `last_activity' is deliberately NOT updated here. It tracks
-            %% activity *received from the peer* and drives the idle timer
-            %% (RFC 9000 §10.1) and keep-alive. Bumping it on every send meant a
-            %% peer that kept sending keep-alive PINGs / PTO retransmits into a
-            %% black hole reset its own idle timer forever and never timed out a
-            %% dead path. On a healthy path the peer's ACK is a received packet
-            %% that restarts the timer, so genuine activity is still covered.
+            %% RFC 9000 §10.1: restart the idle timer (by bumping last_activity)
+            %% only on the first ack-eliciting packet sent since we last received
+            %% one. Restarting on every send let a peer sending keep-alive PINGs /
+            %% PTO retransmits into a black hole hold its own idle timer open
+            %% forever; never restarting would spuriously close a reactivated idle
+            %% connection before its first ack returns. The flag is cleared on
+            %% every receive (update_last_activity/2).
+            RestartIdle = AckEliciting andalso (not State#state.ack_eliciting_since_recv),
+            NewLastActivity =
+                case RestartIdle of
+                    true -> Now;
+                    false -> State#state.last_activity
+                end,
             maybe_force_key_update(State#state{
                 pn_app = NewPNSpace,
                 cc_state = NewCCState,
                 loss_state = NewLossState,
                 packets_sent = State#state.packets_sent + 1,
                 socket_state = EffectiveSocketState,
+                last_activity = NewLastActivity,
+                ack_eliciting_since_recv =
+                    AckEliciting orelse State#state.ack_eliciting_since_recv,
                 pto_dirty = true
             });
         {error, Reason, ClearedSocketState} ->
@@ -7179,9 +7193,11 @@ merge_ack_ranges(Ranges) ->
 update_last_activity(State) ->
     update_last_activity(State, erlang:monotonic_time(millisecond)).
 
-%% Now-accepting variant used by the receive hot path.
+%% Now-accepting variant used by the receive hot path. Clears
+%% ack_eliciting_since_recv so the next ack-eliciting send restarts the idle
+%% timer (RFC 9000 §10.1).
 update_last_activity(State, Now) ->
-    State#state{last_activity = Now}.
+    State#state{last_activity = Now, ack_eliciting_since_recv = false}.
 
 %% Flush the deferred PTO timer reset at batch boundaries. The idle and
 %% keep-alive timers are lazy (armed once, re-armed only on fire), so the

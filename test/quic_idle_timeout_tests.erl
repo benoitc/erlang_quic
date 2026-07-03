@@ -102,15 +102,17 @@ just_below_timeout_boundary_test() ->
     ?assertNot(TimeSinceActivity >= IdleTimeout).
 
 %%====================================================================
-%% Behavioural tests: the idle timer is driven by *received* activity
-%% (RFC 9000 §10.1), not by our own sends.
+%% Behavioural tests: the idle timer follows RFC 9000 §10.1 — restarted on
+%% every receive and on the first ack-eliciting send since the last receive,
+%% but not on subsequent sends.
 %%
 %% These run a real client (over a controllable in-process datagram bridge)
 %% against the in-process echo server, then black-hole the path. The client
 %% keeps sending keep-alive PINGs the whole time; the connection must still
-%% idle-close, because a peer that sends into a black hole must not keep its
-%% own idle timer alive forever. (Regression test for the bug where every send
-%% reset last_activity, so a sending-but-deaf connection never timed out.)
+%% idle-close, because after the one permitted send-side restart a peer sending
+%% into a black hole gets no further restarts. (Regression test for the bug
+%% where every send reset last_activity, so a sending-but-deaf connection never
+%% timed out.)
 %%====================================================================
 
 %% keep_alive_interval is floored to 5000ms by the implementation
@@ -120,8 +122,9 @@ just_below_timeout_boundary_test() ->
 -define(IDLE_TIMEOUT, 7000).
 -define(KEEP_ALIVE, 5000).
 
-%% A black-holed path must idle-close within ~IDLE_TIMEOUT despite the client
-%% still emitting keep-alive PINGs.
+%% A black-holed path must idle-close within ~IDLE_TIMEOUT plus one keep-alive
+%% interval (the single §10.1 send-side restart) despite the client still
+%% emitting keep-alive PINGs.
 silent_path_idle_closes_test_() ->
     {timeout, 30, fun silent_path_idle_closes/0}.
 
@@ -141,7 +144,7 @@ silent_path_idle_closes() ->
         receive
             {quic, Conn, {closed, _Reason}} ->
                 ok
-        after ?IDLE_TIMEOUT + 5000 ->
+        after ?IDLE_TIMEOUT + ?KEEP_ALIVE + 5000 ->
             erlang:error(idle_timeout_did_not_fire)
         end
     after
