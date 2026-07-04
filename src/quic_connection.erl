@@ -157,6 +157,8 @@
     short_header_first_byte/3,
     test_spin_state/1,
     test_spin_state_for/2,
+    %% Connection-level receive-window auto-tuning (RFC 9000 §4.1)
+    next_conn_max_data/5,
     %% Stateless reset token derivation (RFC 9000 §10.3.2)
     generate_stateless_reset_token/2,
     test_state_with_secret/1,
@@ -6524,23 +6526,14 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                             (Now2 - LastConnUpdate) <
                                                 (SmoothedRTT2 * ?AUTO_TUNE_RTT_FACTOR)
                                     end,
-                                %% Calculate new window based on RTT-aware growth
-                                BaseNewMaxData =
-                                    case FastConsumption2 of
-                                        true ->
-                                            %% Double (aggressive growth)
-                                            min(
-                                                (NewDataReceivedVal + MaxDataLocalVal) * 2,
-                                                MaxWindow2
-                                            );
-                                        false ->
-                                            %% Linear (conservative growth)
-                                            min(
-                                                NewDataReceivedVal + MaxDataLocalVal +
-                                                    InitialConnWindow,
-                                                MaxWindow2
-                                            )
-                                    end,
+                                %% Calculate new window based on RTT-aware growth.
+                                BaseNewMaxData = next_conn_max_data(
+                                    NewDataReceivedVal,
+                                    MaxDataLocalVal,
+                                    MaxWindow2,
+                                    InitialConnWindow,
+                                    FastConsumption2
+                                ),
                                 %% Ensure connection window >= 1.5x largest stream window
                                 MaxStreamWindow = get_max_stream_recv_window(State2),
                                 MinConnWindow = trunc(
@@ -10716,6 +10709,29 @@ maybe_retire_cid(CID, #state{role = server, listener = Listener}) when is_pid(Li
     quic_listener:retire_cid(Listener, CID);
 maybe_retire_cid(_CID, _State) ->
     ok.
+
+%% @doc Compute the next connection-level MAX_DATA limit during receive-window
+%% auto-tuning. The limit is anchored at the bytes already received and a window
+%% is added on top, with only the *window size* capped at MaxWindow (the largest
+%% buffer we are willing to hold). This makes MAX_DATA slide forward as data is
+%% consumed — exactly as the per-stream MAX_STREAM_DATA update does.
+%%
+%% Capping the *absolute* limit at MaxWindow instead (the previous behaviour)
+%% froze MAX_DATA once the connection had received MaxWindow bytes in total: the
+%% sender then exhausted the connection window and stalled permanently on any
+%% transfer larger than MaxWindow, regardless of how fast the receiver consumed.
+%% Fast consumption doubles the window; otherwise it grows by one initial window.
+-spec next_conn_max_data(
+    non_neg_integer(),
+    non_neg_integer(),
+    non_neg_integer(),
+    non_neg_integer(),
+    boolean()
+) -> non_neg_integer().
+next_conn_max_data(DataReceived, MaxDataLocal, MaxWindow, _InitialWindow, true) ->
+    DataReceived + min(MaxDataLocal * 2, MaxWindow);
+next_conn_max_data(DataReceived, MaxDataLocal, MaxWindow, InitialWindow, false) ->
+    DataReceived + min(MaxDataLocal + InitialWindow, MaxWindow).
 
 %% @doc Generate a stateless reset token for a connection ID.
 %% RFC 9000 §10.3.2 requires the token to be hard for an external

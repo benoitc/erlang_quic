@@ -779,3 +779,53 @@ make_test_session_ticket(ServerName) ->
         cipher = aes_128_gcm,
         alpn = <<"h3">>
     }.
+
+%%====================================================================
+%% Connection-level receive-window auto-tuning (next_conn_max_data/5)
+%%
+%% Regression: the limit must keep sliding forward past MaxWindow as data is
+%% received, so a sustained sender is never permanently blocked once the
+%% connection has received MaxWindow bytes in total.
+%%====================================================================
+
+%% The advertised limit must always stay ahead of what has been received,
+%% even when total bytes received far exceed the max receive window.
+conn_max_data_slides_past_window_test() ->
+    MaxWindow = 8 * 1024 * 1024,
+    %% A long transfer: 100 MiB already received, well beyond MaxWindow.
+    Received = 100 * 1024 * 1024,
+    MaxDataLocal = Received,
+    NewMax = quic_connection:next_conn_max_data(
+        Received, MaxDataLocal, MaxWindow, 768 * 1024, true
+    ),
+    ?assert(NewMax > Received),
+    %% Headroom offered to the sender is bounded by MaxWindow...
+    ?assert(NewMax - Received =< MaxWindow),
+    %% ...and the absolute limit is far above MaxWindow (it slid forward).
+    ?assert(NewMax > MaxWindow).
+
+%% Window size is capped at MaxWindow; the limit equals received + MaxWindow
+%% once the doubling/linear growth has saturated the cap.
+conn_max_data_window_capped_test() ->
+    MaxWindow = 8 * 1024 * 1024,
+    Received = 50 * 1024 * 1024,
+    %% MaxDataLocal large enough that *2 and +Initial both exceed MaxWindow.
+    MaxDataLocal = 20 * 1024 * 1024,
+    Fast = quic_connection:next_conn_max_data(Received, MaxDataLocal, MaxWindow, 768 * 1024, true),
+    Slow = quic_connection:next_conn_max_data(Received, MaxDataLocal, MaxWindow, 768 * 1024, false),
+    ?assertEqual(Received + MaxWindow, Fast),
+    ?assertEqual(Received + MaxWindow, Slow).
+
+%% Early in a connection the window grows: fast consumption doubles the current
+%% limit, slow consumption adds one initial window — both anchored at received.
+conn_max_data_growth_modes_test() ->
+    MaxWindow = 8 * 1024 * 1024,
+    Received = 100 * 1024,
+    MaxDataLocal = 1024 * 1024,
+    Initial = 768 * 1024,
+    Fast = quic_connection:next_conn_max_data(Received, MaxDataLocal, MaxWindow, Initial, true),
+    Slow = quic_connection:next_conn_max_data(Received, MaxDataLocal, MaxWindow, Initial, false),
+    ?assertEqual(Received + MaxDataLocal * 2, Fast),
+    ?assertEqual(Received + MaxDataLocal + Initial, Slow),
+    %% Fast (doubling) grows the window more aggressively than slow (linear).
+    ?assert(Fast > Slow).
