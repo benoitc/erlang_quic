@@ -231,7 +231,14 @@ verify_certificate_verify_wrong_role_test() ->
 %% Integration Tests - Mutual TLS Handshake
 %%====================================================================
 
-%% Test server with verify=true, client without cert (empty Certificate)
+%% Test server with verify=true, client without cert (empty Certificate).
+%% RFC 8446 4.4.2.4: once the server has sent a CertificateRequest, an empty
+%% client Certificate is a failure (certificate_required) rather than an
+%% anonymous-but-accepted handshake, so the server must reject the connection
+%% instead of completing it. The client may reach `connected' locally (it
+%% has already sent its own Finished) before the server's rejection arrives,
+%% so wait_for_rejection/1 tolerates an interleaved `connected' event instead
+%% of treating it as the final outcome.
 server_verify_client_no_cert_test() ->
     ensure_started(),
     case generate_certs() of
@@ -261,29 +268,27 @@ server_verify_client_no_cert_test() ->
                     self()
                 ),
 
-                %% Wait for connection with extended timeout
-                receive
-                    {quic, Conn, {connected, _Info}} ->
-                        %% Add a small delay to ensure connection is fully established
-                        timer:sleep(100),
-                        %% Verify peercert works and contains the server cert
-                        case quic:peercert(Conn) of
-                            {ok, ServerCert} ->
-                                quic:close(Conn, normal);
-                            {ok, _OtherCert} ->
-                                quic:close(Conn, normal);
-                            {error, Reason} ->
-                                quic:close(Conn, normal),
-                                ct:fail(io_lib:format("peercert failed: ~p", [Reason]))
-                        end
-                after 10000 ->
-                    ct:fail("Connection timeout")
-                end
+                ?assertMatch(
+                    {peer_closed, transport, _Code, _FrameType, _Phrase},
+                    wait_for_rejection(Conn)
+                )
             after
                 cleanup_server_only(TmpDir, ServerName)
             end;
         {error, cert_generation_failed} ->
             {skip, "OpenSSL not available"}
+    end.
+
+%% Read events off a connection until it closes, ignoring a `connected'
+%% event that may arrive first (see server_verify_client_no_cert_test/0).
+wait_for_rejection(Conn) ->
+    receive
+        {quic, Conn, {connected, _Info}} ->
+            wait_for_rejection(Conn);
+        {quic, Conn, {closed, Reason}} ->
+            Reason
+    after 10000 ->
+        ct:fail("expected connection to be rejected for missing client certificate")
     end.
 
 %% Test server with verify=true, client with cert
