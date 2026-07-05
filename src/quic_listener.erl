@@ -60,7 +60,7 @@
 ]).
 
 -ifdef(TEST).
--export([send_packet/6]).
+-export([send_packet/6, compute_stateless_reset_token/2, build_stateless_reset/2]).
 -endif.
 
 -include("quic.hrl").
@@ -978,25 +978,28 @@ handle_unknown_packet(
         reset_secret = Secret
     }
 ) ->
-    %% RFC 9000 Section 10.3.3: Don't send reset if packet might be a reset
-    case is_potential_stateless_reset(Packet) of
+    %% RFC 9000 §10.3: reply to a 1-RTT (short-header) packet we cannot route to
+    %% any connection with a stateless reset, so a peer whose connection state we
+    %% have lost (e.g. after a restart) tears the connection down and reconnects
+    %% instead of retransmitting into a black hole until its idle timer fires.
+    %%
+    %% Constraints (RFC 9000 §10.3.3):
+    %%   * Only short-header packets — long-header (handshake) packets are part of
+    %%     connection setup and are handled elsewhere.
+    %%   * Only packets larger than 21 bytes, so the reset can be made strictly
+    %%     smaller than the trigger (build_stateless_reset/2). This both avoids
+    %%     amplification and bounds any reset loop: each reply shrinks until it is
+    %%     too small to trigger another, so the exchange terminates.
+    %%   * Only when a reset secret is configured, so the token is verifiable by a
+    %%     peer that received it during the original handshake.
+    TriggerSize = byte_size(Packet),
+    case is_short_header_packet(Packet) andalso TriggerSize > 21 andalso is_binary(Secret) of
         true ->
-            %% Don't respond to avoid reset loops
-            ok;
+            Token = compute_stateless_reset_token(Secret, DCID),
+            ResetPacket = build_stateless_reset(Token, TriggerSize),
+            send_packet(Socket, SocketState, Backend, IP, Port, ResetPacket);
         false ->
-            %% RFC 9000 Section 10.3.3: Reset must be smaller than triggering packet
-            %% and at least 21 bytes (minimum QUIC packet size)
-            TriggerSize = byte_size(Packet),
-            case TriggerSize > 21 of
-                true ->
-                    %% Generate and send stateless reset
-                    Token = compute_stateless_reset_token(Secret, DCID),
-                    ResetPacket = build_stateless_reset(Token, TriggerSize),
-                    send_packet(Socket, SocketState, Backend, IP, Port, ResetPacket);
-                false ->
-                    %% Packet too small to respond with reset
-                    ok
-            end
+            ok
     end.
 
 %% Decide whether a freshly arrived Initial gets a Retry, spawns a
@@ -1124,12 +1127,12 @@ send_packet(Socket, _SocketState, gen_udp, IP, Port, Packet) ->
 %% Check if a packet might be a stateless reset
 %% RFC 9000 Section 10.3: A reset looks like a short header packet
 %% ending with a 16-byte token
-is_potential_stateless_reset(<<0:1, _:7, _Rest/binary>> = Packet) ->
-    %% Short header - could be a stateless reset
-    %% A stateless reset is at least 21 bytes (1 header + 4 random + 16 token)
-    byte_size(Packet) >= 21;
-is_potential_stateless_reset(_) ->
-    %% Long header packets are not stateless resets
+%% RFC 9000 §17.3: a short header has the most-significant bit of the first byte
+%% clear (long headers set it). 1-RTT packets and stateless resets use short
+%% headers; Initial/Handshake/Retry/0-RTT use long headers.
+is_short_header_packet(<<0:1, _/bitstring>>) ->
+    true;
+is_short_header_packet(_) ->
     false.
 
 %% Compute stateless reset token from secret and CID
