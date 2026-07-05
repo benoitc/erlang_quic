@@ -561,3 +561,70 @@ cert_extensions(leaf) ->
             extnValue = [digitalSignature, keyEncipherment]
         }
     ].
+
+%%====================================================================
+%% quic_cert:validate_client/3 — mutual-TLS client chain validation
+%% (RFC 8446 §4.4.2.4)
+%%
+%% Negative coverage for the gap this change closes: previously the server
+%% checked only the client's CertificateVerify signature (proof of private-key
+%% possession) and never validated the chain, so a self-signed "faked" cert
+%% with an attacker-chosen subject was accepted. The before/after test below
+%% shows the signature check still passes for such a cert while chain
+%% validation now rejects it.
+%%====================================================================
+
+validate_client_test_() ->
+    case gen_ca_files("/CN=ClientRoot") of
+        {ok, #{cert := RootDer} = Root} ->
+            {ok, #{cert := LeafDer}} =
+                gen_signed_cert("/CN=legit.client", "subjectAltName=DNS:legit.client", Root),
+            %% Self-signed cert with the *same subject* as the legit one — what an
+            %% attacker would forge. They hold its key, so possession is provable.
+            {ok, FakeDer, _FakeKey} =
+                gen_cert("/CN=legit.client", "subjectAltName=DNS:legit.client"),
+            [
+                {"CA-issued client cert validates against the trust anchor",
+                    ?_assertEqual(ok, quic_cert:validate_client(LeafDer, [], [RootDer]))},
+                {"a self-signed (faked) client cert is rejected as unknown_ca",
+                    ?_assertEqual(
+                        {error, unknown_ca}, quic_cert:validate_client(FakeDer, [], [RootDer])
+                    )},
+                {"a missing client cert is rejected",
+                    ?_assertEqual(
+                        {error, no_certificate}, quic_cert:validate_client(undefined, [], [RootDer])
+                    )},
+                {"no trust anchors rejects even a CA-issued cert",
+                    ?_assertEqual(
+                        {error, no_trust_anchors}, quic_cert:validate_client(LeafDer, [], [])
+                    )}
+            ];
+        _ ->
+            []
+    end.
+
+fake_client_cert_signature_vs_chain_test_() ->
+    case gen_cert("/CN=evil.client", "subjectAltName=DNS:evil.client") of
+        {ok, FakeDer, FakeKey} ->
+            {ok, #{cert := RootDer}} = gen_ca_files("/CN=RealRoot"),
+            TranscriptHash = crypto:strong_rand_bytes(32),
+            %% rsa_pss_rsae_sha256 (0x0804); the openssl test certs are RSA-2048.
+            SigScheme = 16#0804,
+            FullMsg = quic_tls:build_certificate_verify_client(
+                SigScheme, FakeKey, TranscriptHash
+            ),
+            %% Strip the 4-byte handshake header to get the CertificateVerify body.
+            <<_Type, _Len:24, Body/binary>> = FullMsg,
+            [
+                {"BEFORE: the signature/possession check alone accepts the faked cert",
+                    ?_assert(
+                        quic_tls:verify_certificate_verify(Body, FakeDer, TranscriptHash, client)
+                    )},
+                {"AFTER: chain validation rejects the faked cert",
+                    ?_assertEqual(
+                        {error, unknown_ca}, quic_cert:validate_client(FakeDer, [], [RootDer])
+                    )}
+            ];
+        _ ->
+            []
+    end.

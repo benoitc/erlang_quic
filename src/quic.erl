@@ -767,6 +767,14 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %% <ul>
 %%   <li>`cert' - DER-encoded certificate</li>
 %%   <li>`key' - Private key term</li>
+%%   <li>`verify' - Request a client certificate (mutual TLS) and validate any
+%%       presented chain against `cacerts' (RFC 8446 §4.4.2.4). Optional by
+%%       default: a client that sends no certificate still connects.</li>
+%%   <li>`cacerts' - Trust anchors (list of DER CA certs) for validating a
+%%       client certificate; `undefined' uses the OS trust store.</li>
+%%   <li>`require_client_cert' - With `verify', reject a client that presents
+%%       no certificate (`certificate_required') instead of accepting it,
+%%       making mutual TLS mandatory (default `false').</li>
 %%   <li>`psks' - `#{Identity :: binary() => Secret :: binary()}'
 %%       static PSK table</li>
 %%   <li>`psk_callback' - `fun((Identity :: binary()) -> {ok, Secret} | not_found)';

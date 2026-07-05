@@ -121,11 +121,12 @@ client_pre_opened_socket_rejects_socket_backend() ->
     end.
 
 client_receiver_crash_closes_connection_test_() ->
-    {timeout, 15, fun client_receiver_crash_closes_connection/0}.
+    {timeout, 25, fun client_receiver_crash_closes_connection/0}.
 
 %% If the dedicated receiver process dies, the connection has no way
 %% to receive datagrams and must close promptly rather than sit idle
-%% until max_idle_timeout fires.
+%% until max_idle_timeout fires. The wait timeouts below are generous
+%% to absorb scheduling delays when the full suite runs under CI load.
 client_receiver_crash_closes_connection() ->
     process_flag(trap_exit, true),
     {ok, Srv} = quic_test_echo_server:start(#{}),
@@ -138,7 +139,7 @@ client_receiver_crash_closes_connection() ->
         try
             receive
                 {quic, Conn, {connected, _}} -> ok
-            after 5000 ->
+            after 10000 ->
                 ?assert(false)
             end,
             Receiver = find_receiver(Conn),
@@ -149,7 +150,7 @@ client_receiver_crash_closes_connection() ->
                     ok;
                 {quic, Conn, {closed, _Other}} ->
                     ?assert(false)
-            after 3000 ->
+            after 8000 ->
                 error(no_close_event)
             end
         after

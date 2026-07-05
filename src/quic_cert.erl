@@ -13,7 +13,7 @@
 
 -include_lib("public_key/include/public_key.hrl").
 
--export([validate_server/4]).
+-export([validate_server/4, validate_client/3]).
 
 -define(MAX_PATH_LENGTH, 10).
 
@@ -38,6 +38,22 @@ validate_server(Leaf, Intermediates, CaCerts, ServerName) when is_binary(Leaf) -
         ok -> verify_hostname(Leaf, ServerName);
         {error, _} = Error -> Error
     end.
+
+%% @doc Validate a client's certificate chain (mutual TLS, RFC 8446 §4.4.2.4).
+%%
+%% Same trust-anchor chain validation as {@link validate_server/4}, but with no
+%% identity/hostname check: a client certificate is not bound to a server name,
+%% and the peer's application identity is established separately (e.g. from the
+%% certificate subject plus an out-of-band token). `Leaf' is the client's
+%% end-entity certificate (DER), `Intermediates' the rest of the chain in
+%% wire (leaf-to-root) order, and `CaCerts' the trust anchors (DER list, or
+%% `undefined' for the OS trust store).
+-spec validate_client(binary() | undefined, [binary()], [binary()] | undefined) ->
+    ok | {error, term()}.
+validate_client(undefined, _Intermediates, _CaCerts) ->
+    {error, no_certificate};
+validate_client(Leaf, Intermediates, CaCerts) when is_binary(Leaf) ->
+    verify_chain(Leaf, Intermediates, trust_anchors(CaCerts)).
 
 %%====================================================================
 %% Chain validation
