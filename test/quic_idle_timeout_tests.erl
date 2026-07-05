@@ -122,6 +122,9 @@ just_below_timeout_boundary_test() ->
 -define(IDLE_TIMEOUT, 7000).
 -define(KEEP_ALIVE, 5000).
 
+%% Shorter timeout for the send-restart test, which runs keep-alive off.
+-define(SHORT_IDLE, 4000).
+
 %% A black-holed path must idle-close within ~IDLE_TIMEOUT plus one keep-alive
 %% interval (the single §10.1 send-side restart) despite the client still
 %% emitting keep-alive PINGs.
@@ -133,6 +136,13 @@ silent_path_idle_closes_test_() ->
 %% too aggressive.
 live_path_stays_open_test_() ->
     {timeout, 30, fun live_path_stays_open/0}.
+
+%% Sending an ack-eliciting packet on an otherwise idle, black-holed connection
+%% must restart the idle timer (RFC 9000 §10.1), so the connection survives past
+%% its original deadline. Without the send-side restart it would close
+%% prematurely at the original deadline, mid-activity.
+send_restarts_idle_timer_test_() ->
+    {timeout, 30, fun send_restarts_idle_timer/0}.
 
 silent_path_idle_closes() ->
     {ok, Echo} = quic_test_echo_server:start(),
@@ -174,9 +184,50 @@ live_path_stays_open() ->
         quic_test_echo_server:stop(Echo)
     end.
 
+send_restarts_idle_timer() ->
+    {ok, Echo} = quic_test_echo_server:start(),
+    %% Keep-alive off, so the only thing that can move the idle deadline is the
+    %% PING we send explicitly.
+    {Conn, Bridge} = connect_via_bridge(maps:get(port, Echo), ?SHORT_IDLE, disabled),
+    try
+        %% Let the handshake fully settle (Finished acked) over the live path so
+        %% the connection is quiescent, then black-hole it: no receives, and no
+        %% in-flight packets to trigger a PTO probe.
+        timer:sleep(300),
+        Bridge ! block,
+        %% Idle for half the timeout, then send an ack-eliciting PING.
+        timer:sleep(?SHORT_IDLE div 2),
+        ok = quic:send_ping(Conn),
+        %% The PING restarted the idle timer, so the connection must survive past
+        %% its original deadline (~?SHORT_IDLE from the last receive). Without the
+        %% send-side restart it would idle-close about here, mid-activity.
+        receive
+            {quic, Conn, {closed, Reason}} ->
+                erlang:error({premature_idle_close, Reason})
+        after ?SHORT_IDLE - 1000 ->
+            ok
+        end,
+        %% It must still idle-close once the timeout elapses from the PING: the
+        %% restart fires once per receive, and there are no further receives.
+        receive
+            {quic, Conn, {closed, _}} ->
+                ok
+        after ?SHORT_IDLE + 2000 ->
+            erlang:error(idle_timeout_did_not_fire)
+        end
+    after
+        Bridge ! stop,
+        quic_test_echo_server:stop(Echo)
+    end.
+
 %% Connect to the echo server through a datagram bridge we control, with a short
 %% idle timeout and aggressive keep-alive. Returns once {connected} is received.
 connect_via_bridge(Port) ->
+    connect_via_bridge(Port, ?IDLE_TIMEOUT, ?KEEP_ALIVE).
+
+%% As connect_via_bridge/1, with an explicit idle timeout and keep-alive
+%% interval. `disabled' omits keep_alive_interval (keep-alive off).
+connect_via_bridge(Port, IdleTimeout, KeepAlive) ->
     ServerIP = {127, 0, 0, 1},
     SocketRef = make_ref(),
     Owner = self(),
@@ -193,13 +244,17 @@ connect_via_bridge(Port) ->
         local => {{127, 0, 0, 1}, 0},
         socket_ref => SocketRef
     },
-    Opts = (quic_test_echo_server:client_opts())#{
+    BaseOpts = (quic_test_echo_server:client_opts())#{
         alpn => [<<"echo">>],
         socket_backend => adapter,
         socket_adapter => Adapter,
-        idle_timeout => ?IDLE_TIMEOUT,
-        keep_alive_interval => ?KEEP_ALIVE
+        idle_timeout => IdleTimeout
     },
+    Opts =
+        case KeepAlive of
+            disabled -> BaseOpts;
+            _ -> BaseOpts#{keep_alive_interval => KeepAlive}
+        end,
     {ok, Conn} = quic:connect(<<"127.0.0.1">>, Port, Opts, Owner),
     Bridge ! {set_conn, Conn},
     receive
