@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-07-06
+
+### Added
+- Stateless reset on restart (RFC 9000 §10.3). A server advertises a `stateless_reset_token` transport parameter bound to its initial connection ID and, after losing connection state (for example a restart), replies to an unroutable 1-RTT packet with a stateless reset derived from the same secret. A client stores the advertised token and recognises the reset, tearing the dead connection down promptly instead of waiting for its idle timer. Contributed by sstrollo (#177).
+- `require_client_cert` server option for mutual TLS. With `verify => true` the server requests a client certificate and validates any presented chain against `cacerts`; `require_client_cert => true` additionally rejects a client that sends no certificate (`certificate_required`), making mutual TLS mandatory. Contributed by sstrollo (#178).
+
+### Security
+- The server now validates the client certificate chain in mutual TLS. With `verify => true` a presented client certificate is checked against the configured trust anchors (`cacerts`, OS store by default) in addition to the CertificateVerify signature, so a self-signed or otherwise untrusted certificate is rejected instead of accepted. An empty client certificate is still accepted by default (optional mTLS, RFC 8446 §4.4.2.4); set `require_client_cert => true` to require one. Contributed by sstrollo (#178).
+
+### Fixed
+- HTTP/3 client connections close cleanly on an invalid peer SETTINGS frame instead of crashing the connection process. A SETTINGS violation (for example `SETTINGS_H3_DATAGRAM` advertised without the QUIC `max_datagram_frame_size` transport parameter) is reported to the owner as `{error, 265, _}` (H3_SETTINGS_ERROR) and the connection closes, rather than the state machine terminating with `bad_return_from_state_function` and taking the owner's request down. (#172)
+- The connection idle timer is driven by received activity (RFC 9000 §10.1): it restarts on every received packet and on the first ack-eliciting packet sent since the last receive, but not on subsequent sends. A connection sending keep-alive PINGs or PTO retransmits into a black hole now idle-closes instead of holding its own timer open forever, while a reactivated idle connection is not closed before its first ack returns. Contributed by sstrollo (#174).
+- Connection-level MAX_DATA slides forward with received bytes instead of capping the absolute limit at the receive window, so a sustained transfer no longer stalls permanently once the connection has received `fc_max_receive_window` (8 MiB) bytes in total. Contributed by sstrollo (#176), reported independently by maslowalex (#173).
+
+### Changed
+- Per-packet routing traces in the listener are logged at debug instead of info, so a busy or post-restart listener no longer floods the log. Contributed by sstrollo (#175).
+
 ## [1.6.5] - 2026-06-12
 
 ### Added
