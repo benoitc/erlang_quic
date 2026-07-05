@@ -207,7 +207,13 @@ get_fd(Socket) ->
 %%       Map with `send_fun => fun((IP, Port, Packet) -> ok | {error,_})'
 %%       and optional `close_fun', `local'. Inbound packets must be
 %%       delivered to the owning connection as `{udp, Socket, IP, Port,
-%%       Data}' messages.</li>
+%%       Data}' messages. `send_fun' runs in the connection process, so
+%%       `self()' inside it is the connection pid: capture it there to learn
+%%       the delivery target from the first outbound packet (the ClientHello).
+%%       Waiting for `connect/4' to return the pid races the handshake's first
+%%       flight, so the peer's reply can be dropped before the return path is
+%%       wired up (most visible with 0-RTT/PSK, where retransmits do not mask
+%%       it).</li>
 %%   <li>`verify' - Validate the server certificate chain, signature
 %%       and hostname (default: `true'). Set to `false' to skip
 %%       validation (e.g. self-signed test servers).</li>
