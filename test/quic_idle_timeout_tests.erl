@@ -100,3 +100,144 @@ just_below_timeout_boundary_test() ->
     TimeSinceActivity = Now - LastActivity,
 
     ?assertNot(TimeSinceActivity >= IdleTimeout).
+
+%%====================================================================
+%% Behavioural tests: the idle timer follows RFC 9000 §10.1 — restarted on
+%% every receive and on the first ack-eliciting send since the last receive,
+%% but not on subsequent sends.
+%%
+%% These run a real client (over a controllable in-process datagram bridge)
+%% against the in-process echo server, then black-hole the path. The client
+%% keeps sending keep-alive PINGs the whole time; the connection must still
+%% idle-close, because after the one permitted send-side restart a peer sending
+%% into a black hole gets no further restarts. (Regression test for the bug
+%% where every send reset last_activity, so a sending-but-deaf connection never
+%% timed out.)
+%%====================================================================
+
+%% keep_alive_interval is floored to 5000ms by the implementation
+%% (calculate_keep_alive_interval/2), so the idle timeout must sit above that
+%% for keep-alive to hold a live connection open. Keep it just above so the
+%% tests stay reasonably quick.
+-define(IDLE_TIMEOUT, 7000).
+-define(KEEP_ALIVE, 5000).
+
+%% A black-holed path must idle-close within ~IDLE_TIMEOUT plus one keep-alive
+%% interval (the single §10.1 send-side restart) despite the client still
+%% emitting keep-alive PINGs.
+silent_path_idle_closes_test_() ->
+    {timeout, 30, fun silent_path_idle_closes/0}.
+
+%% A live path must NOT idle-close: keep-alive PINGs are answered, and the
+%% received ACKs keep the idle timer from firing. Guards against the fix being
+%% too aggressive.
+live_path_stays_open_test_() ->
+    {timeout, 30, fun live_path_stays_open/0}.
+
+silent_path_idle_closes() ->
+    {ok, Echo} = quic_test_echo_server:start(),
+    {Conn, Bridge} = connect_via_bridge(maps:get(port, Echo)),
+    try
+        %% Black-hole the path in both directions. The client carries on sending
+        %% keep-alive PINGs (every ?KEEP_ALIVE ms) but receives nothing.
+        Bridge ! block,
+        receive
+            {quic, Conn, {closed, _Reason}} ->
+                ok
+        after ?IDLE_TIMEOUT + ?KEEP_ALIVE + 5000 ->
+            erlang:error(idle_timeout_did_not_fire)
+        end
+    after
+        Bridge ! stop,
+        quic_test_echo_server:stop(Echo)
+    end.
+
+live_path_stays_open() ->
+    {ok, Echo} = quic_test_echo_server:start(),
+    {Conn, Bridge} = connect_via_bridge(maps:get(port, Echo)),
+    try
+        %% Path stays up; keep-alive PING/ACK exchanges keep the idle timer from
+        %% firing well past several idle-timeout windows.
+        %% Wait past the idle timeout. A keep-alive PING fires at ~?KEEP_ALIVE
+        %% and its ACK (a received packet) pushes the idle deadline out, so the
+        %% connection must still be open here. If keep-alive did not hold it
+        %% open, the idle timer would have fired at ?IDLE_TIMEOUT (< this wait).
+        receive
+            {quic, Conn, {closed, Reason}} ->
+                erlang:error({unexpected_idle_close, Reason})
+        after ?IDLE_TIMEOUT + 2000 ->
+            ok
+        end
+    after
+        quic:safe_close(Conn, normal),
+        Bridge ! stop,
+        quic_test_echo_server:stop(Echo)
+    end.
+
+%% Connect to the echo server through a datagram bridge we control, with a short
+%% idle timeout and aggressive keep-alive. Returns once {connected} is received.
+connect_via_bridge(Port) ->
+    ServerIP = {127, 0, 0, 1},
+    SocketRef = make_ref(),
+    Owner = self(),
+    Bridge = spawn_link(fun() -> bridge_init(ServerIP, Port, SocketRef) end),
+    Adapter = #{
+        send_fun => fun(IP, P, Pkt) ->
+            Bridge ! {send, IP, P, Pkt},
+            ok
+        end,
+        close_fun => fun() ->
+            Bridge ! stop,
+            ok
+        end,
+        local => {{127, 0, 0, 1}, 0},
+        socket_ref => SocketRef
+    },
+    Opts = (quic_test_echo_server:client_opts())#{
+        alpn => [<<"echo">>],
+        socket_backend => adapter,
+        socket_adapter => Adapter,
+        idle_timeout => ?IDLE_TIMEOUT,
+        keep_alive_interval => ?KEEP_ALIVE
+    },
+    {ok, Conn} = quic:connect(<<"127.0.0.1">>, Port, Opts, Owner),
+    Bridge ! {set_conn, Conn},
+    receive
+        {quic, Conn, {connected, _Info}} -> ok
+    after 10000 ->
+        erlang:error(connect_timeout)
+    end,
+    {Conn, Bridge}.
+
+%% Datagram bridge: shuttles packets between the client's adapter callbacks and
+%% a gen_udp socket to the echo server. `block' drops datagrams in both
+%% directions, simulating a dead path.
+bridge_init(ServerIP, ServerPort, SocketRef) ->
+    {ok, Sock} = gen_udp:open(0, [binary, {active, true}]),
+    bridge_loop(Sock, undefined, ServerIP, ServerPort, SocketRef, false).
+
+bridge_loop(Sock, Conn, ServerIP, ServerPort, SocketRef, Blocked) ->
+    Loop = fun(C, B) -> bridge_loop(Sock, C, ServerIP, ServerPort, SocketRef, B) end,
+    receive
+        {set_conn, NewConn} ->
+            Loop(NewConn, Blocked);
+        block ->
+            Loop(Conn, true);
+        {send, _IP, _Port, _Pkt} when Blocked ->
+            Loop(Conn, Blocked);
+        {send, _IP, _Port, Pkt} ->
+            ok = gen_udp:send(Sock, ServerIP, ServerPort, Pkt),
+            Loop(Conn, Blocked);
+        {udp, Sock, _IP, _Port, _Data} when Blocked ->
+            Loop(Conn, Blocked);
+        {udp, Sock, _IP, _Port, Data} when is_pid(Conn) ->
+            Conn ! {udp, SocketRef, ServerIP, ServerPort, Data},
+            Loop(Conn, Blocked);
+        {udp, Sock, _IP, _Port, _Data} ->
+            Loop(Conn, Blocked);
+        stop ->
+            gen_udp:close(Sock),
+            ok;
+        _ ->
+            Loop(Conn, Blocked)
+    end.

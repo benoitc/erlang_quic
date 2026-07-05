@@ -779,3 +779,144 @@ make_test_session_ticket(ServerName) ->
         cipher = aes_128_gcm,
         alpn = <<"h3">>
     }.
+
+%%====================================================================
+%% Stateless reset recognition (RFC 9000 §10.3)
+%%
+%% A connection must recognise a stateless reset for its initial connection ID
+%% so that, after the peer (server) loses connection state and restarts, the
+%% client tears the dead connection down promptly instead of waiting for its
+%% idle timer. The server advertises a stateless_reset_token transport param for
+%% its initial SCID; the client stores it against that CID; the restarted
+%% listener, sharing the secret, derives the same token and replies with a
+%% stateless reset that the client then recognises.
+%%====================================================================
+
+%% The peer's transport-parameter reset token is stored against our DCID as a
+%% sequence-0 peer CID pool entry.
+store_initial_reset_token_test() ->
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    Token = crypto:strong_rand_bytes(16),
+    State = quic_connection:test_state_for_reset(DCID, [], undefined),
+    Pool = quic_connection:maybe_store_initial_reset_token(
+        #{stateless_reset_token => Token}, State
+    ),
+    ?assertMatch(
+        [#cid_entry{seq_num = 0, cid = DCID, stateless_reset_token = Token, status = active}],
+        Pool
+    ).
+
+%% No token in the transport params leaves the pool untouched.
+store_initial_reset_token_absent_test() ->
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    State = quic_connection:test_state_for_reset(DCID, [], undefined),
+    ?assertEqual([], quic_connection:maybe_store_initial_reset_token(#{}, State)).
+
+%% An existing sequence-0 entry is not duplicated.
+store_initial_reset_token_idempotent_test() ->
+    DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    Existing = #cid_entry{
+        seq_num = 0, cid = DCID, stateless_reset_token = <<9:128>>, status = active
+    },
+    State = quic_connection:test_state_for_reset(DCID, [Existing], undefined),
+    Pool = quic_connection:maybe_store_initial_reset_token(
+        #{stateless_reset_token => crypto:strong_rand_bytes(16)}, State
+    ),
+    ?assertEqual([Existing], Pool).
+
+%% Token derivation is identical on both sides (connection advertises, listener
+%% recomputes after restart): both are HMAC-SHA256(secret, CID)[0:16].
+reset_token_derivation_parity_test() ->
+    Secret = crypto:strong_rand_bytes(32),
+    CID = <<10, 11, 12, 13, 14, 15, 16, 17>>,
+    Advertised = quic_connection:generate_stateless_reset_token(
+        CID, quic_connection:test_state_with_secret(Secret)
+    ),
+    Recomputed = quic_listener:compute_stateless_reset_token(Secret, CID),
+    ?assertEqual(Advertised, Recomputed).
+
+%% End-to-end: a stateless reset built by a restarted listener (same secret) for
+%% the connection's initial CID is recognised by the client that stored the
+%% advertised token.
+recognize_stateless_reset_after_restart_test() ->
+    Secret = crypto:strong_rand_bytes(32),
+    DCID = <<10, 11, 12, 13, 14, 15, 16, 17>>,
+    %% Server advertised this token; client stores it against the initial DCID.
+    Advertised = quic_connection:generate_stateless_reset_token(
+        DCID, quic_connection:test_state_with_secret(Secret)
+    ),
+    Pool = quic_connection:maybe_store_initial_reset_token(
+        #{stateless_reset_token => Advertised},
+        quic_connection:test_state_for_reset(DCID, [], undefined)
+    ),
+    State = quic_connection:test_state_for_reset(DCID, Pool, undefined),
+    %% Restarted listener derives the token and builds a real reset packet.
+    ListenerToken = quic_listener:compute_stateless_reset_token(Secret, DCID),
+    Reset = quic_listener:build_stateless_reset(ListenerToken, 1200),
+    ?assertEqual({error, stateless_reset}, quic_connection:check_stateless_reset(Reset, State)).
+
+%% A short-header packet whose trailing bytes are not a known token is a plain
+%% decryption failure, not a stateless reset.
+reject_non_reset_packet_test() ->
+    Secret = crypto:strong_rand_bytes(32),
+    DCID = <<10, 11, 12, 13, 14, 15, 16, 17>>,
+    Advertised = quic_connection:generate_stateless_reset_token(
+        DCID, quic_connection:test_state_with_secret(Secret)
+    ),
+    Pool = quic_connection:maybe_store_initial_reset_token(
+        #{stateless_reset_token => Advertised},
+        quic_connection:test_state_for_reset(DCID, [], undefined)
+    ),
+    State = quic_connection:test_state_for_reset(DCID, Pool, undefined),
+    Bogus = <<64, (crypto:strong_rand_bytes(40))/binary>>,
+    ?assertEqual({error, decryption_failed}, quic_connection:check_stateless_reset(Bogus, State)).
+
+%%====================================================================
+%% Connection-level receive-window auto-tuning (next_conn_max_data/5)
+%%
+%% Regression: the limit must keep sliding forward past MaxWindow as data is
+%% received, so a sustained sender is never permanently blocked once the
+%% connection has received MaxWindow bytes in total.
+%%====================================================================
+
+%% The advertised limit must always stay ahead of what has been received,
+%% even when total bytes received far exceed the max receive window.
+conn_max_data_slides_past_window_test() ->
+    MaxWindow = 8 * 1024 * 1024,
+    %% A long transfer: 100 MiB already received, well beyond MaxWindow.
+    Received = 100 * 1024 * 1024,
+    MaxDataLocal = Received,
+    NewMax = quic_connection:next_conn_max_data(
+        Received, MaxDataLocal, MaxWindow, 768 * 1024, true
+    ),
+    ?assert(NewMax > Received),
+    %% Headroom offered to the sender is bounded by MaxWindow...
+    ?assert(NewMax - Received =< MaxWindow),
+    %% ...and the absolute limit is far above MaxWindow (it slid forward).
+    ?assert(NewMax > MaxWindow).
+
+%% Window size is capped at MaxWindow; the limit equals received + MaxWindow
+%% once the doubling/linear growth has saturated the cap.
+conn_max_data_window_capped_test() ->
+    MaxWindow = 8 * 1024 * 1024,
+    Received = 50 * 1024 * 1024,
+    %% MaxDataLocal large enough that *2 and +Initial both exceed MaxWindow.
+    MaxDataLocal = 20 * 1024 * 1024,
+    Fast = quic_connection:next_conn_max_data(Received, MaxDataLocal, MaxWindow, 768 * 1024, true),
+    Slow = quic_connection:next_conn_max_data(Received, MaxDataLocal, MaxWindow, 768 * 1024, false),
+    ?assertEqual(Received + MaxWindow, Fast),
+    ?assertEqual(Received + MaxWindow, Slow).
+
+%% Early in a connection the window grows: fast consumption doubles the current
+%% limit, slow consumption adds one initial window — both anchored at received.
+conn_max_data_growth_modes_test() ->
+    MaxWindow = 8 * 1024 * 1024,
+    Received = 100 * 1024,
+    MaxDataLocal = 1024 * 1024,
+    Initial = 768 * 1024,
+    Fast = quic_connection:next_conn_max_data(Received, MaxDataLocal, MaxWindow, Initial, true),
+    Slow = quic_connection:next_conn_max_data(Received, MaxDataLocal, MaxWindow, Initial, false),
+    ?assertEqual(Received + MaxDataLocal * 2, Fast),
+    ?assertEqual(Received + MaxDataLocal + Initial, Slow),
+    %% Fast (doubling) grows the window more aggressively than slow (linear).
+    ?assert(Fast > Slow).
