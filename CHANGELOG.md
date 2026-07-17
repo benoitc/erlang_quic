@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-07-17
+
+### Fixed
+- An HTTP/3 connection process now stops with `normal` when the underlying QUIC connection closes cleanly (graceful drain, idle timeout, shutdown), instead of the abnormal reason `quic_closed`. Clean closes no longer emit ERROR and CRASH reports or kill non-trapping linked owners; an abnormal QUIC exit still stops the H3 process, now as `{quic_closed, Reason}`. The owner also receives the `{quic_h3, Conn, closed}` notification on this path, which was previously skipped. (#186)
+
 ## [1.7.0] - 2026-07-06
 
 ### Added
