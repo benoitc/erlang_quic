@@ -598,8 +598,8 @@ bootstrapping(cast, close, State) ->
     {next_state, closing, State};
 bootstrapping(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     {next_state, closing, State};
-bootstrapping(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
-    {stop, quic_closed, State};
+bootstrapping(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
+    handle_quic_down(Reason, State);
 bootstrapping(
     info,
     {quic, QC, {early_data_rejected, StreamIds}},
@@ -707,8 +707,8 @@ early_data(cast, close, State) ->
     {next_state, closing, State};
 early_data(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     {next_state, closing, State};
-early_data(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
-    {stop, quic_closed, State};
+early_data(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
+    handle_quic_down(Reason, State);
 early_data(
     info,
     {quic, QC, {session_ticket, T}},
@@ -772,8 +772,8 @@ awaiting_quic(cast, close, State) ->
     {next_state, closing, State};
 awaiting_quic(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     {next_state, closing, State};
-awaiting_quic(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
-    {stop, quic_closed, State};
+awaiting_quic(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
+    handle_quic_down(Reason, State);
 awaiting_quic(
     info,
     {quic, QC, {session_ticket, T}},
@@ -870,8 +870,8 @@ h3_connecting(cast, close, State) ->
     {next_state, closing, State};
 h3_connecting(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     {next_state, closing, State};
-h3_connecting(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
-    {stop, quic_closed, State};
+h3_connecting(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
+    handle_quic_down(Reason, State);
 h3_connecting(
     info,
     {quic, QC, {session_ticket, T}},
@@ -1107,8 +1107,8 @@ connected(cast, close, State) ->
     {next_state, closing, State};
 connected(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     {next_state, closing, State};
-connected(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
-    {stop, quic_closed, State};
+connected(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
+    handle_quic_down(Reason, State);
 connected(info, {'DOWN', Ref, process, _Pid, _Reason}, #state{stream_handlers = Handlers} = State) ->
     %% Check if this is a stream handler going down
     case find_handler_by_ref(Ref, Handlers) of
@@ -1185,8 +1185,8 @@ goaway_sent(cast, close, State) ->
     {next_state, closing, State};
 goaway_sent(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     {next_state, closing, State};
-goaway_sent(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
-    {stop, quic_closed, State};
+goaway_sent(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
+    handle_quic_down(Reason, State);
 goaway_sent(
     info,
     {quic, QC, {session_ticket, T}},
@@ -1249,8 +1249,8 @@ goaway_received(cast, close, State) ->
     {next_state, closing, State};
 goaway_received(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     {next_state, closing, State};
-goaway_received(info, {'DOWN', Ref, process, _, _}, #state{quic_ref = Ref} = State) ->
-    {stop, quic_closed, State};
+goaway_received(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
+    handle_quic_down(Reason, State);
 goaway_received(
     info,
     {quic, QC, {session_ticket, T}},
@@ -1302,6 +1302,22 @@ closing(
     {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
 closing(_EventType, _Event, _State) ->
     keep_state_and_data.
+
+%%====================================================================
+%% Internal: QUIC connection DOWN
+%%====================================================================
+
+%% A cleanly closed QUIC connection must not crash the H3 process:
+%% only an abnormal QUIC exit is propagated as {quic_closed, Reason}.
+handle_quic_down(Reason, #state{owner = Owner} = State) ->
+    Owner ! {quic_h3, self(), closed},
+    case Reason of
+        normal -> {stop, normal, State};
+        shutdown -> {stop, normal, State};
+        {shutdown, _} -> {stop, normal, State};
+        noproc -> {stop, normal, State};
+        _ -> {stop, {quic_closed, Reason}, State}
+    end.
 
 %%====================================================================
 %% Internal: Critical Streams
