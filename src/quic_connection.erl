@@ -3883,6 +3883,11 @@ handle_packet_loop(Data, State) ->
             %% Immediately close the connection
             maybe_reenable_socket(State),
             State#state{close_reason = stateless_reset};
+        {error, {version_negotiation, _} = Reason} ->
+            %% RFC 9000 Section 6.2: the server speaks no version we do.
+            %% Nothing may be sent in response, so just abandon the attempt.
+            maybe_reenable_socket(State),
+            State#state{close_reason = Reason};
         {error, Reason} when
             Reason =:= padding_only;
             Reason =:= empty_packet;
@@ -3957,6 +3962,12 @@ decode_long_header_packet(Data, State) ->
 
     Type = (FirstByte bsr 4) band 2#11,
 
+    case Version of
+        0 -> handle_version_negotiation(DCID, Rest3, State);
+        _ -> decode_long_header_type(Type, Data, FirstByte, Version, DCID, SCID, Rest3, State)
+    end.
+
+decode_long_header_type(Type, Data, FirstByte, Version, DCID, SCID, Rest3, State) ->
     case Type of
         %% Initial
         0 ->
@@ -3973,6 +3984,39 @@ decode_long_header_packet(Data, State) ->
         _ ->
             {error, unsupported_packet_type}
     end.
+
+%% Version Negotiation (RFC 9000 §6.2). Version 0 in a long header: the
+%% server does not speak the version we sent and lists what it does speak.
+%% A server never receives one, and a client only acts on it before it has
+%% processed any packet from this server; later ones are attacks or stale.
+handle_version_negotiation(_DCID, _Versions, #state{role = server}) ->
+    {error, unexpected_version_negotiation};
+handle_version_negotiation(_DCID, _Versions, #state{packets_received = N}) when N > 0 ->
+    {error, late_version_negotiation};
+handle_version_negotiation(DCID, _Versions, #state{scid = SCID}) when DCID =/= SCID ->
+    {error, version_negotiation_cid_mismatch};
+handle_version_negotiation(_DCID, VersionsBin, #state{version = Ours}) ->
+    Versions = decode_versions(VersionsBin),
+    case lists:member(Ours, Versions) of
+        true ->
+            %% RFC 9000 §6.2: a Version Negotiation offering the version we
+            %% already sent is bogus; the server would have answered it.
+            {error, version_negotiation_echoes_our_version};
+        false ->
+            %% Nothing to negotiate down to: this build speaks version 1
+            %% only. Abandon the connection with the offered list rather
+            %% than retransmitting the Initial until the timeout.
+            ?LOG_WARNING(
+                #{what => version_negotiation, ours => Ours, offered => Versions},
+                ?QUIC_LOG_META
+            ),
+            {error, {version_negotiation, Versions}}
+    end.
+
+%% Version list of a Version Negotiation packet. A trailing partial entry
+%% (a truncated or padded packet) is ignored.
+decode_versions(<<Version:32, Rest/binary>>) -> [Version | decode_versions(Rest)];
+decode_versions(_) -> [].
 
 decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
     #state{initial_keys = {ClientKeys, ServerKeys}, role = Role} = State,
@@ -7059,6 +7103,10 @@ check_state_transition(CurrentState, State) ->
             {next_state, draining, State};
         stateless_reset ->
             %% Received stateless reset, transition to draining
+            emit_qlog_state_change(CurrentState, draining, State),
+            {next_state, draining, State};
+        {version_negotiation, _} ->
+            %% No mutually supported version (RFC 9000 §6.2); give up.
             emit_qlog_state_change(CurrentState, draining, State),
             {next_state, draining, State};
         {transport, _Code, _Reason} ->

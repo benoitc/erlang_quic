@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- A client now acts on a Version Negotiation packet (RFC 9000 §6.2). The version field was never inspected, so the packet was decoded as whatever its type bits said and dropped, leaving the client to retransmit its Initial until it timed out with no reason. A server that shares no version with us now closes the connection as `{version_negotiation, Versions}`; a Version Negotiation that arrives late, carries someone else's connection ID, or offers back the version we sent is discarded as the RFC requires.
+
 ## [1.7.1] - 2026-07-17
 
 ### Fixed
