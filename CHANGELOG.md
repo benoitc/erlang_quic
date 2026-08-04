@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- A client connection now reports a handshake failure to its owner as `{quic, Conn, {error, Reason}}`, tagged with the connection handle like every other owner event; it used to be tagged with the connection reference, which no owner matches on. `quic_h3:connect/3` passes the reason on, so a rejected certificate returns `{error, {certificate_invalid, _}}` instead of `{error, connect_timeout}`, and a Happy Eyeballs race that exhausts its addresses returns the last attempt's reason instead of `all_attempts_failed`.
+
 ## [1.7.1] - 2026-07-17
 
 ### Fixed
