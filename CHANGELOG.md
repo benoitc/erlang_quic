@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- A client that receives a Retry now keeps counting Initial packet numbers up (RFC 9000 §17.2.5.3) instead of restarting at 0, so the retried Initial is a new packet to the server rather than a replay of the one it answered with the Retry. The Initials sent before the Retry are dropped from loss detection rather than left charged as bytes in flight.
+
 ## [1.7.1] - 2026-07-17
 
 ### Fixed
