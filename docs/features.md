@@ -271,6 +271,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `keep_alive_interval` - Keep-alive PING interval (`disabled`, `auto`, or milliseconds)
 - `pmtu_enabled` - Enable Path MTU Discovery (default: true)
 - `pmtu_max_mtu` - Maximum MTU to probe (default: 1500)
+- `max_udp_payload_size` - Largest UDP payload this endpoint is willing to receive, advertised as the RFC 9000 §18.2 transport parameter (minimum 1200; default: what a 1500-byte path carries for the address family, 1472 over IPv4 and 1452 over IPv6)
 - `recbuf` - UDP receive buffer size in bytes (default: 7MB)
 - `sndbuf` - UDP send buffer size in bytes (default: 7MB)
 - `server_send_batching` - Per-connection send batching on the server (default: true). On Linux + `socket_backend => socket` with UDP_SEGMENT, outgoing packets are coalesced into GSO super-datagrams via `sendmsg` cmsg; neutral on macOS / gen_udp. Set to `false` to fall back to direct `gen_udp:send/4`

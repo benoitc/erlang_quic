@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- The advertised `max_udp_payload_size` transport parameter is the largest UDP payload the endpoint is willing to receive, not the PMTU probing ceiling. Both roles used to advertise the ceiling, 1500 by default, which does not fit a 1500-byte path once the IP and UDP headers are counted, and the `max_udp_payload_size` option never reached the wire. The option is now advertised when set, and otherwise the default is what a 1500-byte path carries for the address family: 1472 over IPv4, 1452 over IPv6. (#184)
+
 ## [1.7.1] - 2026-07-17
 
 ### Fixed

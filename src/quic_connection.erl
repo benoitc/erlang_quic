@@ -419,6 +419,11 @@
     %% through the CC-checked retransmit path when cwnd reopens.
     deferred_ctrl_retransmits = [] :: [term()],
 
+    %% Largest UDP payload we advertise being willing to receive
+    %% (RFC 9000 §18.2). `undefined' means "derive it from the local
+    %% address family" rather than the PMTU probing ceiling.
+    max_udp_payload_size_local = undefined :: pos_integer() | undefined,
+
     %% Datagram support (RFC 9221)
     %% Local: our advertised max size (0 = disabled)
     max_datagram_frame_size_local = 0 :: non_neg_integer(),
@@ -1154,6 +1159,7 @@ init({server, Opts}) ->
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
+        max_udp_payload_size_local = maps:get(max_udp_payload_size, Opts, undefined),
         max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
         datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
         spin_bit_enabled = maps:get(spin_bit, Opts, true),
@@ -1534,6 +1540,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
+        max_udp_payload_size_local = maps:get(max_udp_payload_size, Opts, undefined),
         max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
         datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
         spin_bit_enabled = maps:get(spin_bit, Opts, true),
@@ -2542,7 +2549,7 @@ send_client_hello(State) ->
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => State#state.idle_timeout,
         active_connection_id_limit => 2,
-        max_udp_payload_size => get_local_max_udp_payload_size(State)
+        max_udp_payload_size => advertised_max_udp_payload_size(State)
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
     TransportParams1 =
@@ -2931,7 +2938,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => State#state.idle_timeout,
         active_connection_id_limit => 2,
-        max_udp_payload_size => get_local_max_udp_payload_size(State)
+        max_udp_payload_size => advertised_max_udp_payload_size(State)
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
     TransportParams1 =
@@ -11391,6 +11398,25 @@ get_local_max_udp_payload_size(#state{pmtu_state = undefined}) ->
     ?DEFAULT_MAX_UDP_PAYLOAD_SIZE;
 get_local_max_udp_payload_size(#state{pmtu_state = PMTUState}) ->
     PMTUState#pmtu_state.max_mtu.
+
+%% The `max_udp_payload_size' transport parameter (RFC 9000 §18.2): the
+%% largest UDP payload we are willing to receive. Distinct from the PMTU
+%% ceiling, which bounds what we send. Defaults to what a 1500-byte path
+%% delivers for the local address family, since a peer that takes the
+%% parameter at face value and sends more would have it dropped.
+-spec advertised_max_udp_payload_size(#state{}) -> pos_integer().
+advertised_max_udp_payload_size(#state{max_udp_payload_size_local = Size}) when
+    is_integer(Size)
+->
+    Size;
+advertised_max_udp_payload_size(#state{remote_addr = {IP, _Port}}) when is_tuple(IP) ->
+    default_max_udp_payload_size(address_family(IP));
+advertised_max_udp_payload_size(_State) ->
+    default_max_udp_payload_size(inet6).
+
+%% 1500-byte IP MTU less the IP and UDP headers.
+default_max_udp_payload_size(inet) -> 1500 - 20 - 8;
+default_max_udp_payload_size(inet6) -> 1500 - 40 - 8.
 
 %%====================================================================
 %% Test Helpers
