@@ -132,7 +132,8 @@ coordinator_entry(Args) ->
         owner => maps:get(owner, Args),
         caller => maps:get(caller, Args),
         delay => maps:get(delay, Args),
-        attempts => #{}
+        attempts => #{},
+        backlog => #{}
     },
     %% Overall deadline. Messages to this process after it exits are dropped,
     %% so no explicit timer cancellation is needed.
@@ -155,6 +156,8 @@ loop(St) ->
                         true -> on_connected(St, Pid, Info);
                         false -> loop(St)
                     end;
+                {quic, Pid, _} = Msg ->
+                    loop(buffer_owner_msg(St, Pid, Msg));
                 {'DOWN', _MRef, process, Pid, _Reason} ->
                     loop(drop_attempt(St, Pid));
                 _Other ->
@@ -191,28 +194,44 @@ start_attempt({IP, _Fam}, #{port := Port, opts := Opts, attempts := Attempts} = 
             St
     end.
 
-drop_attempt(#{attempts := Attempts} = St, Pid) ->
+drop_attempt(#{attempts := Attempts, backlog := Backlog} = St, Pid) ->
     case maps:take(Pid, Attempts) of
         {MRef, Rest} ->
             _ = erlang:demonitor(MRef, [flush]),
-            St#{attempts := Rest};
+            St#{attempts := Rest, backlog := maps:remove(Pid, Backlog)};
         error ->
+            St
+    end.
+
+%% Owner events an attempt delivers before it reports `connected' (a server
+%% that opens its HTTP/3 control stream in the same flight as the handshake
+%% sends SETTINGS here). They belong to the winner's owner, so hold them per
+%% attempt instead of discarding, and drop them with the attempt that loses.
+%% The peer's initial flow-control window bounds what can pile up.
+buffer_owner_msg(#{attempts := Attempts, backlog := Backlog} = St, Pid, Msg) ->
+    case maps:is_key(Pid, Attempts) of
+        true ->
+            Buffered = maps:get(Pid, Backlog, []),
+            St#{backlog := maps:put(Pid, [Msg | Buffered], Backlog)};
+        false ->
             St
     end.
 
 %% First attempt to finish its handshake wins. Hand it to the real owner
 %% (re-delivers {connected}); the remaining attempts are still owned by this
 %% coordinator and self-close on owner-DOWN when we exit below.
-on_connected(#{owner := Owner, caller := Caller} = St, Pid, _Info) ->
+on_connected(#{owner := Owner, caller := Caller, backlog := Backlog} = St, Pid, _Info) ->
     %% set_owner_sync is a gen_statem:call; a winner that died between
     %% {connected} and here raises, and we continue the race.
     try quic_connection:set_owner_sync(Pid, Owner) of
         ok ->
             %% The connection handshaked while we owned it, so any peer data
             %% it already delivered (e.g. the server's HTTP/3 control stream
-            %% and SETTINGS) is sitting in our mailbox and would be lost when
-            %% we exit. set_owner_sync re-delivers {connected} but not that
-            %% backlog, so hand it to the new owner in order.
+            %% and SETTINGS) was buffered here or is still sitting in our
+            %% mailbox, and would be lost when we exit. set_owner_sync
+            %% re-delivers {connected} but not that backlog, so hand it to the
+            %% new owner in order.
+            [Owner ! M || M <- lists:reverse(maps:get(Pid, Backlog, []))],
             forward_quic_backlog(Pid, Owner),
             Caller ! {quic_happy_result, self(), {ok, Pid}},
             ok
