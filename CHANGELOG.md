@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- The client hostname check now applies the RFC 6125 HTTPS rules, so a leftmost-label wildcard SAN such as `*.example.com` matches `host.example.com`. Servers behind a wildcard-only certificate, `www.google.com` among them, were rejected with `{certificate_invalid, {hostname_mismatch, _}}` and, through `quic_h3:connect/3`, surfaced as a connect timeout. (#188)
 ## [1.7.1] - 2026-07-17
 
 ### Fixed
