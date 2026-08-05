@@ -2888,9 +2888,9 @@ validate_client_psk_selection(_Idx, _Identity, _Secret, _Modes) ->
 %% @private
 %% Notify the connection owner of a handshake failure so quic:connect/4
 %% callers see {error, Reason} rather than a silent stall.
-notify_owner(Msg, #state{owner = Owner, conn_ref = Ref}) when is_pid(Owner) ->
+notify_owner(Msg, #state{owner = Owner}) when is_pid(Owner) ->
     try
-        Owner ! {quic, Ref, Msg},
+        Owner ! {quic, self(), Msg},
         ok
     catch
         _:_ -> ok

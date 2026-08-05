@@ -18,6 +18,8 @@
 %%%   <li>`{quic, Conn, {connected, Info}}' - Connection established</li>
 %%%   <li>`{quic, Conn, {stream_opened, StreamId}}' - Stream opened</li>
 %%%   <li>`{quic, Conn, {closed, Reason}}' - Connection closed</li>
+%%%   <li>`{quic, Conn, {error, Reason}}' - Handshake failed, e.g.
+%%%       `{certificate_invalid, _}'</li>
 %%%   <li>`{quic, Conn, {transport_error, Code, Reason}}' - Transport error</li>
 %%%   <li>`{quic, Conn, {stream_data, StreamId, Bin, Fin}}' - Data received</li>
 %%%   <li>`{quic, Conn, {stream_reset, StreamId, ErrorCode}}' - Stream reset</li>
