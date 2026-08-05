@@ -9,7 +9,7 @@
 - [x] Lazy idle and keep-alive timers: armed once and re-armed only when they
   fire, using the `last_activity` timestamp, so steady-state traffic does not
   cancel and reschedule a timer on every packet
-- [x] Version negotiation
+- [x] Version negotiation: server emits a Version Negotiation packet for an unknown version; a client that receives one and shares no version closes with `{version_negotiation, Versions}` (RFC 9000 §6.2)
 - [x] Retry packets for address validation
 - [x] IPv6 client connections: hostname, IP-literal (bracketed or bare), or `inet:ip_address()` tuple host
 - [x] Happy Eyeballs v2 (RFC 8305): dual-stack hostnames race IPv6-first, with `happy_eyeballs`, `family`, `connection_attempt_delay` and `connect_timeout` options on `quic:connect/4`

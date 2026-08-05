@@ -453,6 +453,9 @@ receive
         ok;
     {quic, Conn, {closed, idle_timeout}} ->
         reconnect();
+    {quic, Conn, {closed, {version_negotiation, Versions}}} ->
+        %% The server speaks none of the QUIC versions we do
+        log_versions(Versions);
     {quic, Conn, {transport_error, Code, Reason}} ->
         log_error(Code, Reason)
 end.
