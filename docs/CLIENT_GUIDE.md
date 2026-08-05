@@ -103,6 +103,7 @@ transparently.
 |--------|------|---------|-------------|
 | `keep_alive_interval` | integer/atom | `auto` | PING interval |
 | `pmtu_enabled` | boolean | true | Enable Path MTU Discovery |
+| `max_udp_payload_size` | integer | 1472 (IPv4) / 1452 (IPv6) | Largest UDP payload we advertise being willing to receive |
 
 ## Features
 
