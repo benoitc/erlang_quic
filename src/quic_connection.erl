@@ -2895,9 +2895,9 @@ validate_client_psk_selection(_Idx, _Identity, _Secret, _Modes) ->
 %% @private
 %% Notify the connection owner of a handshake failure so quic:connect/4
 %% callers see {error, Reason} rather than a silent stall.
-notify_owner(Msg, #state{owner = Owner, conn_ref = Ref}) when is_pid(Owner) ->
+notify_owner(Msg, #state{owner = Owner}) when is_pid(Owner) ->
     try
-        Owner ! {quic, Ref, Msg},
+        Owner ! {quic, self(), Msg},
         ok
     catch
         _:_ -> ok
@@ -3890,6 +3890,11 @@ handle_packet_loop(Data, State) ->
             %% Immediately close the connection
             maybe_reenable_socket(State),
             State#state{close_reason = stateless_reset};
+        {error, {version_negotiation, _} = Reason} ->
+            %% RFC 9000 Section 6.2: the server speaks no version we do.
+            %% Nothing may be sent in response, so just abandon the attempt.
+            maybe_reenable_socket(State),
+            State#state{close_reason = Reason};
         {error, Reason} when
             Reason =:= padding_only;
             Reason =:= empty_packet;
@@ -3964,6 +3969,12 @@ decode_long_header_packet(Data, State) ->
 
     Type = (FirstByte bsr 4) band 2#11,
 
+    case Version of
+        0 -> handle_version_negotiation(DCID, Rest3, State);
+        _ -> decode_long_header_type(Type, Data, FirstByte, Version, DCID, SCID, Rest3, State)
+    end.
+
+decode_long_header_type(Type, Data, FirstByte, Version, DCID, SCID, Rest3, State) ->
     case Type of
         %% Initial
         0 ->
@@ -3980,6 +3991,39 @@ decode_long_header_packet(Data, State) ->
         _ ->
             {error, unsupported_packet_type}
     end.
+
+%% Version Negotiation (RFC 9000 §6.2). Version 0 in a long header: the
+%% server does not speak the version we sent and lists what it does speak.
+%% A server never receives one, and a client only acts on it before it has
+%% processed any packet from this server; later ones are attacks or stale.
+handle_version_negotiation(_DCID, _Versions, #state{role = server}) ->
+    {error, unexpected_version_negotiation};
+handle_version_negotiation(_DCID, _Versions, #state{packets_received = N}) when N > 0 ->
+    {error, late_version_negotiation};
+handle_version_negotiation(DCID, _Versions, #state{scid = SCID}) when DCID =/= SCID ->
+    {error, version_negotiation_cid_mismatch};
+handle_version_negotiation(_DCID, VersionsBin, #state{version = Ours}) ->
+    Versions = decode_versions(VersionsBin),
+    case lists:member(Ours, Versions) of
+        true ->
+            %% RFC 9000 §6.2: a Version Negotiation offering the version we
+            %% already sent is bogus; the server would have answered it.
+            {error, version_negotiation_echoes_our_version};
+        false ->
+            %% Nothing to negotiate down to: this build speaks version 1
+            %% only. Abandon the connection with the offered list rather
+            %% than retransmitting the Initial until the timeout.
+            ?LOG_WARNING(
+                #{what => version_negotiation, ours => Ours, offered => Versions},
+                ?QUIC_LOG_META
+            ),
+            {error, {version_negotiation, Versions}}
+    end.
+
+%% Version list of a Version Negotiation packet. A trailing partial entry
+%% (a truncated or padded packet) is ignored.
+decode_versions(<<Version:32, Rest/binary>>) -> [Version | decode_versions(Rest)];
+decode_versions(_) -> [].
 
 decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
     #state{initial_keys = {ClientKeys, ServerKeys}, role = Role} = State,
@@ -4178,10 +4222,14 @@ handle_valid_retry(RetryToken, ServerSCID, State) ->
     %% Return state with retry info, no frames to process
     {ok, retry_handled, [], <<>>, State5}.
 
-%% Reset the initial packet number space after a Retry
-reset_initial_pn_space(State) ->
+%% Clear the Initial packet number space after a Retry. RFC 9000 §17.2.5.3:
+%% the packet number keeps counting up, so the retried Initial is a new
+%% packet to the server rather than a replay of the one it answered with the
+%% Retry. Everything else in the space describes packets protected by the
+%% keys we just replaced.
+reset_initial_pn_space(#state{pn_initial = #pn_space{next_pn = NextPN}} = State) ->
     PNSpace = #pn_space{
-        next_pn = 0,
+        next_pn = NextPN,
         largest_acked = undefined,
         largest_recv = undefined,
         recv_time = undefined,
@@ -4190,7 +4238,11 @@ reset_initial_pn_space(State) ->
         loss_time = undefined,
         sent_packets = #{}
     },
-    State#state{pn_initial = PNSpace}.
+    %% RFC 9002 §6.2.1: the Initials sent before the Retry can be treated as
+    %% lost. Only Initials can have been sent at this point, so dropping the
+    %% loss state clears them all rather than leaving bytes charged in flight
+    %% for packets that can never be acknowledged.
+    State#state{pn_initial = PNSpace, loss_state = quic_loss:new()}.
 
 %% Check if a packet is a stateless reset (RFC 9000 Section 10.3)
 check_stateless_reset(Data, _State) when byte_size(Data) < 21 ->
@@ -7066,6 +7118,10 @@ check_state_transition(CurrentState, State) ->
             {next_state, draining, State};
         stateless_reset ->
             %% Received stateless reset, transition to draining
+            emit_qlog_state_change(CurrentState, draining, State),
+            {next_state, draining, State};
+        {version_negotiation, _} ->
+            %% No mutually supported version (RFC 9000 §6.2); give up.
             emit_qlog_state_change(CurrentState, draining, State),
             {next_state, draining, State};
         {transport, _Code, _Reason} ->

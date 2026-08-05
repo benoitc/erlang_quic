@@ -9,7 +9,7 @@
 - [x] Lazy idle and keep-alive timers: armed once and re-armed only when they
   fire, using the `last_activity` timestamp, so steady-state traffic does not
   cancel and reschedule a timer on every packet
-- [x] Version negotiation
+- [x] Version negotiation: server emits a Version Negotiation packet for an unknown version; a client that receives one and shares no version closes with `{version_negotiation, Versions}` (RFC 9000 §6.2)
 - [x] Retry packets for address validation
 - [x] IPv6 client connections: hostname, IP-literal (bracketed or bare), or `inet:ip_address()` tuple host
 - [x] Happy Eyeballs v2 (RFC 8305): dual-stack hostnames race IPv6-first, with `happy_eyeballs`, `family`, `connection_attempt_delay` and `connect_timeout` options on `quic:connect/4`
@@ -261,7 +261,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `datagram_recv_queue_len` - Bounded receive queue for inbound datagrams (default: `infinity`; drops oldest on overflow, tracked via `datagram_stats/1`)
 - `reset_stream_at` - Enable RESET_STREAM_AT extension (default: false)
 - `alpn` - ALPN protocols list
-- `verify` - Server certificate verification on the client (default: `true`; verifies the CertificateVerify signature, the chain, and the hostname). Set `false` to accept any certificate, e.g. a self-signed test server.
+- `verify` - Server certificate verification on the client (default: `true`; verifies the CertificateVerify signature, the chain, and the hostname). The hostname check follows the RFC 6125 HTTPS rules, so a leftmost-label wildcard SAN such as `*.example.com` matches `host.example.com`. Set `false` to accept any certificate, e.g. a self-signed test server.
 - `cacerts` - Trust anchors for client chain validation, as a list of DER-encoded certificates (default: the operating system trust store)
 - `preferred_ipv4` - Server preferred IPv4 address
 - `preferred_ipv6` - Server preferred IPv6 address

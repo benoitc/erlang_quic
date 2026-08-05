@@ -630,6 +630,10 @@ bootstrapping(info, {quic, QC, {stream_data, _, _, _}}, #state{quic_conn = QC}) 
     {keep_state_and_data, [postpone]};
 bootstrapping(info, {quic, QC, {new_stream, _, _}}, #state{quic_conn = QC}) ->
     {keep_state_and_data, [postpone]};
+bootstrapping(info, {quic, QC, {error, Reason}}, #state{quic_conn = QC} = State) ->
+    handle_quic_failed(Reason, State);
+bootstrapping(info, {quic, QC, {closed, Reason}}, #state{quic_conn = QC} = State) ->
+    handle_quic_failed(Reason, State);
 bootstrapping(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -728,6 +732,10 @@ early_data(
     #state{quic_conn = QC} = _State
 ) ->
     {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
+early_data(info, {quic, QC, {error, Reason}}, #state{quic_conn = QC} = State) ->
+    handle_quic_failed(Reason, State);
+early_data(info, {quic, QC, {closed, Reason}}, #state{quic_conn = QC} = State) ->
+    handle_quic_failed(Reason, State);
 early_data(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -793,6 +801,10 @@ awaiting_quic(
     #state{quic_conn = QC} = _State
 ) ->
     {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
+awaiting_quic(info, {quic, QC, {error, Reason}}, #state{quic_conn = QC} = State) ->
+    handle_quic_failed(Reason, State);
+awaiting_quic(info, {quic, QC, {closed, Reason}}, #state{quic_conn = QC} = State) ->
+    handle_quic_failed(Reason, State);
 awaiting_quic(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -891,6 +903,10 @@ h3_connecting(
     #state{quic_conn = QC} = _State
 ) ->
     {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
+h3_connecting(info, {quic, QC, {error, Reason}}, #state{quic_conn = QC} = State) ->
+    handle_quic_failed(Reason, State);
+h3_connecting(info, {quic, QC, {closed, Reason}}, #state{quic_conn = QC} = State) ->
+    handle_quic_failed(Reason, State);
 h3_connecting(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -1306,6 +1322,13 @@ closing(_EventType, _Event, _State) ->
 %%====================================================================
 %% Internal: QUIC connection DOWN
 %%====================================================================
+
+%% The QUIC connection reported a failure (bad certificate, TLS alert, peer
+%% close) before HTTP/3 came up. Pass the reason to the owner so a caller in
+%% `quic_h3:wait_connected/2' fails with it instead of timing out.
+handle_quic_failed(Reason, #state{owner = Owner} = State) ->
+    Owner ! {quic_h3, self(), {closed, Reason}},
+    {stop, normal, State}.
 
 %% A cleanly closed QUIC connection must not crash the H3 process:
 %% only an abnormal QUIC exit is propagated as {quic_closed, Reason}.
