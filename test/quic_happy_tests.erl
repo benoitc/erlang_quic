@@ -204,6 +204,37 @@ he_pre_connected_backlog() ->
         exit(Coord, kill)
     end.
 
+%% An attempt that reports why it gave up (a rejected certificate, a peer
+%% close) hands that reason to the caller once the race is exhausted, instead
+%% of the bare `all_attempts_failed'.
+he_reports_attempt_error_test_() ->
+    {timeout, 30, fun he_reports_attempt_error/0}.
+
+he_reports_attempt_error() ->
+    {ok, _} = application:ensure_all_started(quic),
+    Reason = {certificate_invalid, {hostname_mismatch, <<"example.com">>}},
+    Before = conn_children(),
+    {ok, Coord} = quic_happy:start_coordinator(#{
+        addrs => [{{127, 0, 0, 1}, inet}],
+        port => 1,
+        opts => #{verify => false},
+        owner => self(),
+        caller => self(),
+        delay => 100,
+        timeout => 10000
+    }),
+    try
+        Attempt = wait_new_child(Before, 50),
+        Coord ! {quic, Attempt, {error, Reason}},
+        exit(Attempt, kill),
+        receive
+            {quic_happy_result, Coord, Result} -> ?assertEqual({error, Reason}, Result)
+        after 5000 -> error(no_result)
+        end
+    after
+        exit(Coord, kill)
+    end.
+
 conn_children() ->
     [P || {_, P, _, _} <- supervisor:which_children(quic_conn_sup), is_pid(P)].
 

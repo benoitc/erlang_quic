@@ -185,18 +185,15 @@ draining_handles_owner_exit_test() ->
 %% Test that close triggers draining state and sends closed message
 close_sends_closed_message_test() ->
     {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
-    Ref = gen_statem:call(Pid, get_ref),
 
     %% Close the connection (doesn't need to be connected to test close behavior)
     quic_connection:close(Pid, normal),
 
     %% Wait for the closed message - should be sent when entering draining
     receive
-        {quic, Ref, {closed, normal}} -> ok
-    after 500 ->
-        %% If we don't get the message, it might be because we're in idle state
-        %% which is fine - the test is about not crashing
-        ok
+        {quic, Pid, {closed, normal}} -> ok
+    after 1000 ->
+        error(no_closed_event)
     end,
 
     %% Wait for connection to finish
@@ -209,7 +206,6 @@ close_sends_closed_message_test() ->
 %% Test close/3 with custom error code and reason phrase
 close_with_app_error_code_test() ->
     {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
-    Ref = gen_statem:call(Pid, get_ref),
 
     %% Close with custom application error code
     ErrorCode = 16#0100,
@@ -218,9 +214,9 @@ close_with_app_error_code_test() ->
 
     %% Wait for the closed message with the app_error reason
     receive
-        {quic, Ref, {closed, {app_error, ErrorCode, ReasonPhrase}}} -> ok
-    after 500 ->
-        ok
+        {quic, Pid, {closed, {app_error, ErrorCode, ReasonPhrase}}} -> ok
+    after 1000 ->
+        error(no_closed_event)
     end,
 
     timer:sleep(100).
@@ -228,15 +224,14 @@ close_with_app_error_code_test() ->
 %% Test close/3 API with zero error code (QUIC_NO_ERROR equivalent)
 close_with_zero_error_code_test() ->
     {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
-    Ref = gen_statem:call(Pid, get_ref),
 
     %% Close with error code 0 (no error)
     quic_connection:close(Pid, {app_error, 0, <<>>}),
 
     receive
-        {quic, Ref, {closed, {app_error, 0, <<>>}}} -> ok
-    after 500 ->
-        ok
+        {quic, Pid, {closed, {app_error, 0, <<>>}}} -> ok
+    after 1000 ->
+        error(no_closed_event)
     end,
 
     timer:sleep(100).
@@ -244,16 +239,15 @@ close_with_zero_error_code_test() ->
 %% Test close/3 API with maximum valid 62-bit error code
 close_with_max_error_code_test() ->
     {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
-    Ref = gen_statem:call(Pid, get_ref),
 
     %% Close with maximum 62-bit error code
     MaxErrorCode = (1 bsl 62) - 1,
     quic_connection:close(Pid, {app_error, MaxErrorCode, <<"max code">>}),
 
     receive
-        {quic, Ref, {closed, {app_error, MaxErrorCode, <<"max code">>}}} -> ok
-    after 500 ->
-        ok
+        {quic, Pid, {closed, {app_error, MaxErrorCode, <<"max code">>}}} -> ok
+    after 1000 ->
+        error(no_closed_event)
     end,
 
     timer:sleep(100).
@@ -272,15 +266,14 @@ quic_close_3_api_test() ->
 %% Test that close/2 with legacy {error, application_error} still works
 close_legacy_application_error_test() ->
     {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
-    Ref = gen_statem:call(Pid, get_ref),
 
     %% Close with legacy pattern (used in E2E tests)
     quic_connection:close(Pid, {error, application_error}),
 
     receive
-        {quic, Ref, {closed, {error, application_error}}} -> ok
-    after 500 ->
-        ok
+        {quic, Pid, {closed, {error, application_error}}} -> ok
+    after 1000 ->
+        error(no_closed_event)
     end,
 
     timer:sleep(100).

@@ -416,7 +416,10 @@ Messages sent to the owner process:
 | `{quic, Conn, {stream_deadline, StreamId}}` | Stream deadline expired |
 | `{quic, Conn, {send_ready, StreamId}}` | Stream ready to write |
 | `{quic, Conn, {closed, Reason}}` | Connection closed |
+| `{quic, Conn, {error, Reason}}` | Handshake failed, e.g. `{certificate_invalid, _}` |
 | `{quic, Conn, {transport_error, Code, Reason}}` | Transport error |
+
+`Conn` is always the connection handle returned by `quic:connect/4`.
 
 ### Detecting stream closure
 

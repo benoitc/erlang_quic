@@ -133,7 +133,8 @@ coordinator_entry(Args) ->
         caller => maps:get(caller, Args),
         delay => maps:get(delay, Args),
         attempts => #{},
-        backlog => #{}
+        backlog => #{},
+        last_error => undefined
     },
     %% Overall deadline. Messages to this process after it exits are dropped,
     %% so no explicit timer cancellation is needed.
@@ -144,7 +145,7 @@ loop(St) ->
     #{remaining := Remaining, attempts := Attempts} = St,
     case (map_size(Attempts) =:= 0) andalso (Remaining =:= []) of
         true ->
-            finish(St, {error, all_attempts_failed});
+            finish(St, {error, exhausted_reason(St)});
         false ->
             receive
                 {timeout, _Ref, next_attempt} ->
@@ -156,6 +157,12 @@ loop(St) ->
                         true -> on_connected(St, Pid, Info);
                         false -> loop(St)
                     end;
+                %% Before the generic buffer clause: a failure belongs to the
+                %% attempt that reported it, not to the winner's owner.
+                {quic, Pid, {error, Reason}} ->
+                    loop(note_error(St, Pid, Reason));
+                {quic, Pid, {closed, Reason}} ->
+                    loop(note_error(St, Pid, Reason));
                 {quic, Pid, _} = Msg ->
                     loop(buffer_owner_msg(St, Pid, Msg));
                 {'DOWN', _MRef, process, Pid, _Reason} ->
@@ -193,6 +200,18 @@ start_attempt({IP, _Fam}, #{port := Port, opts := Opts, attempts := Attempts} = 
             %% termination check / next timer handles progress.
             St
     end.
+
+%% Why an attempt gave up, kept so the caller sees the real reason (a bad
+%% certificate, a peer close) rather than only `all_attempts_failed'. The
+%% last one wins: the attempts race, and any of them explains the failure.
+note_error(#{attempts := Attempts} = St, Pid, Reason) ->
+    case maps:is_key(Pid, Attempts) of
+        true -> St#{last_error := Reason};
+        false -> St
+    end.
+
+exhausted_reason(#{last_error := undefined}) -> all_attempts_failed;
+exhausted_reason(#{last_error := Reason}) -> Reason.
 
 drop_attempt(#{attempts := Attempts, backlog := Backlog} = St, Pid) ->
     case maps:take(Pid, Attempts) of

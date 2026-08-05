@@ -317,7 +317,10 @@ maybe_wait_connected(H3Conn, Opts) ->
                     {ok, H3Conn};
                 {error, timeout} ->
                     quic_h3:close(H3Conn),
-                    {error, connect_timeout}
+                    {error, connect_timeout};
+                {error, Reason} ->
+                    quic_h3:close(H3Conn),
+                    {error, Reason}
             end;
         false ->
             {ok, H3Conn}
@@ -718,12 +721,14 @@ early_data_accepted(Conn) ->
 %% @doc Wait for H3 connection to be ready.
 %%
 %% Blocks until the connection is established and SETTINGS exchanged,
-%% or until the timeout expires.
+%% until the QUIC connection fails (the failure reason is returned, e.g.
+%% `{certificate_invalid, _}'), or until the timeout expires.
 %% @end
--spec wait_connected(conn(), timeout()) -> ok | {error, timeout}.
+-spec wait_connected(conn(), timeout()) -> ok | {error, timeout | term()}.
 wait_connected(Conn, Timeout) ->
     receive
-        {quic_h3, Conn, connected} -> ok
+        {quic_h3, Conn, connected} -> ok;
+        {quic_h3, Conn, {closed, Reason}} -> {error, Reason}
     after Timeout ->
         {error, timeout}
     end.
