@@ -4,13 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-08-05
+
 ### Fixed
-- The client hostname check now applies the RFC 6125 HTTPS rules, so a leftmost-label wildcard SAN such as `*.example.com` matches `host.example.com`. Servers behind a wildcard-only certificate, `www.google.com` among them, were rejected with `{certificate_invalid, {hostname_mismatch, _}}` and, through `quic_h3:connect/3`, surfaced as a connect timeout. (#188)
-- A Happy Eyeballs winner now hands its owner every event it delivered before reporting `connected`. A server that sends its HTTP/3 SETTINGS in the same flight as the handshake had that data dropped by the coordinator, so `quic_h3:connect/3` waited for SETTINGS that never arrived and returned `connect_timeout` for a multi-address host. (#188)
-- A client connection now reports a handshake failure to its owner as `{quic, Conn, {error, Reason}}`, tagged with the connection handle like every other owner event; it used to be tagged with the connection reference, which no owner matches on. `quic_h3:connect/3` passes the reason on, so a rejected certificate returns `{error, {certificate_invalid, _}}` instead of `{error, connect_timeout}`, and a Happy Eyeballs race that exhausts its addresses returns the last attempt's reason instead of `all_attempts_failed`.
-- A client that receives a Retry now keeps counting Initial packet numbers up (RFC 9000 §17.2.5.3) instead of restarting at 0, so the retried Initial is a new packet to the server rather than a replay of the one it answered with the Retry. The Initials sent before the Retry are dropped from loss detection rather than left charged as bytes in flight.
-- A client now acts on a Version Negotiation packet (RFC 9000 §6.2). The version field was never inspected, so the packet was decoded as whatever its type bits said and dropped, leaving the client to retransmit its Initial until it timed out with no reason. A server that shares no version with us now closes the connection as `{version_negotiation, Versions}`; a Version Negotiation that arrives late, carries someone else's connection ID, or offers back the version we sent is discarded as the RFC requires.
-- The advertised `max_udp_payload_size` transport parameter is the largest UDP payload the endpoint is willing to receive, not the PMTU probing ceiling. Both roles used to advertise the ceiling, 1500 by default, which does not fit a 1500-byte path once the IP and UDP headers are counted, and the `max_udp_payload_size` option never reached the wire. The option is now advertised when set, and otherwise the default is what a 1500-byte path carries for the address family: 1472 over IPv4, 1452 over IPv6. (#184)
+- The client hostname check applies the RFC 6125 HTTPS rules, so a wildcard SAN such as `*.example.com` matches `host.example.com`. Servers behind a wildcard-only certificate, `www.google.com` among them, were rejected as `{hostname_mismatch, _}`. (#188)
+- A Happy Eyeballs winner hands its owner the events it delivered before reporting `connected`. A server that sends its HTTP/3 SETTINGS in the same flight as the handshake had them dropped, so `quic_h3:connect/3` timed out for a multi-address host. (#188)
+- A client that receives a Retry keeps counting Initial packet numbers up (RFC 9000 §17.2.5.3) instead of restarting at 0, so the retried Initial is not a replay of the packet the Retry answered. The pre-Retry Initials leave loss detection instead of staying charged as bytes in flight.
+- A client acts on a Version Negotiation packet (RFC 9000 §6.2) instead of misparsing and dropping it: no shared version closes the connection as `{version_negotiation, Versions}`, and a packet that arrives late, carries a foreign connection ID, or offers back our own version is discarded.
+- The advertised `max_udp_payload_size` is what we are willing to receive rather than the PMTU probing ceiling: the `max_udp_payload_size` option when set, otherwise 1472 over IPv4 and 1452 over IPv6. Both roles used to advertise 1500, which does not fit a 1500-byte path. (#184)
+
+### Changed
+- A handshake failure reaches the owner as `{quic, Conn, {error, Reason}}`, tagged with the connection handle like every other owner event; the connection reference used to be the tag and nothing matched it. `quic_h3:connect/3` passes the reason through, so a rejected certificate returns `{error, {certificate_invalid, _}}` rather than `{error, connect_timeout}`, and an exhausted Happy Eyeballs race returns the last attempt's reason rather than `all_attempts_failed`. Owners matching `{quic, ConnRef, {error, _}}` must match the handle instead.
 
 ## [1.7.1] - 2026-07-17
 
