@@ -473,6 +473,10 @@ end.
 #{verify => false}
 ```
 
+The name in `server_name` (or the host you passed to `quic:connect/4`) is
+matched against the certificate under the RFC 6125 HTTPS rules: a `*.example.com`
+SAN matches `host.example.com`, but not `example.com` and not `a.b.example.com`.
+
 ### 2. Connection Pooling
 
 ```erlang
