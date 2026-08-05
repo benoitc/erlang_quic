@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
 - The client hostname check now applies the RFC 6125 HTTPS rules, so a leftmost-label wildcard SAN such as `*.example.com` matches `host.example.com`. Servers behind a wildcard-only certificate, `www.google.com` among them, were rejected with `{certificate_invalid, {hostname_mismatch, _}}` and, through `quic_h3:connect/3`, surfaced as a connect timeout. (#188)
 - A Happy Eyeballs winner now hands its owner every event it delivered before reporting `connected`. A server that sends its HTTP/3 SETTINGS in the same flight as the handshake had that data dropped by the coordinator, so `quic_h3:connect/3` waited for SETTINGS that never arrived and returned `connect_timeout` for a multi-address host. (#188)
 - A client connection now reports a handshake failure to its owner as `{quic, Conn, {error, Reason}}`, tagged with the connection handle like every other owner event; it used to be tagged with the connection reference, which no owner matches on. `quic_h3:connect/3` passes the reason on, so a rejected certificate returns `{error, {certificate_invalid, _}}` instead of `{error, connect_timeout}`, and a Happy Eyeballs race that exhausts its addresses returns the last attempt's reason instead of `all_attempts_failed`.
+- A client that receives a Retry now keeps counting Initial packet numbers up (RFC 9000 §17.2.5.3) instead of restarting at 0, so the retried Initial is a new packet to the server rather than a replay of the one it answered with the Retry. The Initials sent before the Retry are dropped from loss detection rather than left charged as bytes in flight.
+
 ## [1.7.1] - 2026-07-17
 
 ### Fixed
