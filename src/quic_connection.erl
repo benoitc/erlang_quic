@@ -2888,9 +2888,9 @@ validate_client_psk_selection(_Idx, _Identity, _Secret, _Modes) ->
 %% @private
 %% Notify the connection owner of a handshake failure so quic:connect/4
 %% callers see {error, Reason} rather than a silent stall.
-notify_owner(Msg, #state{owner = Owner, conn_ref = Ref}) when is_pid(Owner) ->
+notify_owner(Msg, #state{owner = Owner}) when is_pid(Owner) ->
     try
-        Owner ! {quic, Ref, Msg},
+        Owner ! {quic, self(), Msg},
         ok
     catch
         _:_ -> ok
@@ -4215,10 +4215,14 @@ handle_valid_retry(RetryToken, ServerSCID, State) ->
     %% Return state with retry info, no frames to process
     {ok, retry_handled, [], <<>>, State5}.
 
-%% Reset the initial packet number space after a Retry
-reset_initial_pn_space(State) ->
+%% Clear the Initial packet number space after a Retry. RFC 9000 §17.2.5.3:
+%% the packet number keeps counting up, so the retried Initial is a new
+%% packet to the server rather than a replay of the one it answered with the
+%% Retry. Everything else in the space describes packets protected by the
+%% keys we just replaced.
+reset_initial_pn_space(#state{pn_initial = #pn_space{next_pn = NextPN}} = State) ->
     PNSpace = #pn_space{
-        next_pn = 0,
+        next_pn = NextPN,
         largest_acked = undefined,
         largest_recv = undefined,
         recv_time = undefined,
@@ -4227,7 +4231,11 @@ reset_initial_pn_space(State) ->
         loss_time = undefined,
         sent_packets = #{}
     },
-    State#state{pn_initial = PNSpace}.
+    %% RFC 9002 §6.2.1: the Initials sent before the Retry can be treated as
+    %% lost. Only Initials can have been sent at this point, so dropping the
+    %% loss state clears them all rather than leaving bytes charged in flight
+    %% for packets that can never be acknowledged.
+    State#state{pn_initial = PNSpace, loss_state = quic_loss:new()}.
 
 %% Check if a packet is a stateless reset (RFC 9000 Section 10.3)
 check_stateless_reset(Data, _State) when byte_size(Data) < 21 ->

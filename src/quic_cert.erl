@@ -179,9 +179,13 @@ verify_hostname(Leaf, ServerName) when is_binary(ServerName) ->
         false -> {error, {hostname_mismatch, ServerName}}
     end.
 
+%% The `https' match fun applies the RFC 6125 §6.4.3 wildcard rules, which
+%% OTP's default match fun leaves out: without it a leftmost-label wildcard
+%% (`*.example.com') never matches, so wildcard-only servers are rejected.
 safe_verify_hostname(Leaf, RefId) ->
     try
-        public_key:pkix_verify_hostname(Leaf, [RefId])
+        MatchFun = public_key:pkix_verify_hostname_match_fun(https),
+        public_key:pkix_verify_hostname(Leaf, [RefId], [{match_fun, MatchFun}])
     catch
         _:_ -> false
     end.
