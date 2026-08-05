@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- The client hostname check now applies the RFC 6125 HTTPS rules, so a leftmost-label wildcard SAN such as `*.example.com` matches `host.example.com`. Servers behind a wildcard-only certificate, `www.google.com` among them, were rejected with `{certificate_invalid, {hostname_mismatch, _}}` and, through `quic_h3:connect/3`, surfaced as a connect timeout. (#188)
+- A Happy Eyeballs winner now hands its owner every event it delivered before reporting `connected`. A server that sends its HTTP/3 SETTINGS in the same flight as the handshake had that data dropped by the coordinator, so `quic_h3:connect/3` waited for SETTINGS that never arrived and returned `connect_timeout` for a multi-address host. (#188)
 ## [1.7.1] - 2026-07-17
 
 ### Fixed

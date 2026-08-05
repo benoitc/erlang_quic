@@ -51,6 +51,58 @@ validate_server_test_() ->
             []
     end.
 
+%% Regression (#188): a wildcard-only certificate (`*.example.test', no
+%% exact SAN) is what most large sites serve, www.google.com included.
+%% The hostname check used to reject every one of them.
+wildcard_hostname_test_() ->
+    case gen_cert("/CN=*.example.test", "subjectAltName=DNS:*.example.test") of
+        {ok, Leaf, _Key} ->
+            [
+                {"leftmost-label wildcard matches",
+                    ?_assertEqual(
+                        ok,
+                        quic_cert:validate_server(Leaf, [], [Leaf], <<"host.example.test">>)
+                    )},
+                {"wildcard does not match the bare domain",
+                    ?_assertMatch(
+                        {error, {hostname_mismatch, _}},
+                        quic_cert:validate_server(Leaf, [], [Leaf], <<"example.test">>)
+                    )},
+                {"wildcard does not span labels",
+                    ?_assertMatch(
+                        {error, {hostname_mismatch, _}},
+                        quic_cert:validate_server(Leaf, [], [Leaf], <<"a.b.example.test">>)
+                    )},
+                {"unrelated domain is still rejected",
+                    ?_assertMatch(
+                        {error, {hostname_mismatch, _}},
+                        quic_cert:validate_server(Leaf, [], [Leaf], <<"host.evil.test">>)
+                    )}
+            ];
+        {error, _} ->
+            []
+    end.
+
+%% An IP-literal server name keeps matching on iPAddress SANs; the
+%% wildcard match fun only applies to dNSName reference ids.
+ip_literal_hostname_test_() ->
+    case gen_cert("/CN=localhost", "subjectAltName=DNS:localhost,IP:127.0.0.1") of
+        {ok, Leaf, _Key} ->
+            [
+                {"IP literal matches an iPAddress SAN",
+                    ?_assertEqual(
+                        ok, quic_cert:validate_server(Leaf, [], [Leaf], <<"127.0.0.1">>)
+                    )},
+                {"other IP literal is rejected",
+                    ?_assertMatch(
+                        {error, {hostname_mismatch, _}},
+                        quic_cert:validate_server(Leaf, [], [Leaf], <<"127.0.0.2">>)
+                    )}
+            ];
+        {error, _} ->
+            []
+    end.
+
 %% Regression: a server commonly sends an extra or cross-signed cert
 %% above the cert that actually chains to a trust anchor (e.g.
 %% cloudflare.com over Google Trust Services with the Mozilla NSS /
