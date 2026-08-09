@@ -27,6 +27,12 @@
 
 -module(quic_crypto).
 
+-type group() :: x25519 | x448 | secp256r1 | secp384r1 | x25519mlkem768.
+%% Private key material for a key exchange: raw curve key for ECDHE,
+%% opaque {MlKemDecapsKey, X25519Priv} for the hybrid group.
+-type kex_private() :: binary() | {binary(), binary()}.
+-export_type([group/0, kex_private/0]).
+
 -export([
     %% Key Schedule
     derive_early_secret/0,
@@ -78,6 +84,8 @@
     %% ECDHE
     generate_key_pair/1,
     compute_shared_secret/3,
+    server_key_exchange/2,
+    group_supported/1,
 
     %% Retry Packet Integrity (RFC 9001 Section 5.8)
     verify_retry_integrity_tag/3,
@@ -377,23 +385,62 @@ cipher_to_hash(_) -> sha256.
 %% ECDHE Key Exchange
 %%====================================================================
 
-%% @doc Generate an ECDHE key pair for the specified curve.
-%% Returns {PublicKey, PrivateKey}
--spec generate_key_pair(x25519 | x448 | secp256r1 | secp384r1) ->
-    {binary(), binary()}.
+%% @doc Generate a key-exchange key pair for the specified group.
+%% Returns {PublicShare, PrivateKey}. For the classical ECDHE groups
+%% PublicShare/PrivateKey are the raw curve keys. For the post-quantum
+%% hybrid group x25519mlkem768 (draft-ietf-tls-ecdhe-mlkem) the public
+%% share is the 1216-byte concatenation of the ML-KEM-768 encapsulation
+%% key and the X25519 public key, and the private key is an opaque
+%% {MlKemDecapsKey, X25519Priv} pair; both are only ever consumed by
+%% compute_shared_secret/3.
+-spec generate_key_pair(group()) -> {binary(), kex_private()}.
+generate_key_pair(x25519mlkem768) ->
+    {MlKemEK, MlKemDK} = crypto:generate_key(mlkem768, []),
+    {XPub, XPriv} = crypto:generate_key(ecdh, x25519),
+    {<<MlKemEK/binary, XPub/binary>>, {MlKemDK, XPriv}};
 generate_key_pair(Curve) ->
     {PubKey, PrivKey} = crypto:generate_key(ecdh, Curve),
     {PubKey, PrivKey}.
 
-%% @doc Compute ECDHE shared secret.
-%% shared_secret = ECDH(our_private, their_public)
--spec compute_shared_secret(
-    x25519 | x448 | secp256r1 | secp384r1,
-    binary(),
-    binary()
-) -> binary().
+%% @doc Compute the key-exchange shared secret (client side for the
+%% hybrid group). For ECDHE groups: ECDH(our_private, their_public).
+%% For x25519mlkem768 the peer share is the server's 1120-byte
+%% concatenation of the ML-KEM ciphertext and X25519 public key, and
+%% the shared secret is mlkem_secret || x25519_secret (64 bytes).
+-spec compute_shared_secret(group(), kex_private(), binary()) -> binary().
+compute_shared_secret(x25519mlkem768, {MlKemDK, XPriv}, <<CipherText:1088/binary, SXPub:32/binary>>) ->
+    MlKemSecret = crypto:decapsulate_key(mlkem768, MlKemDK, CipherText),
+    XSecret = crypto:compute_key(ecdh, SXPub, XPriv, x25519),
+    <<MlKemSecret/binary, XSecret/binary>>;
 compute_shared_secret(Curve, OurPrivate, TheirPublic) ->
     crypto:compute_key(ecdh, TheirPublic, OurPrivate, Curve).
+
+%% @doc Server-side key exchange against a client key share.
+%% Returns {ServerShare, ServerPrivate, SharedSecret}. For ECDHE groups
+%% this generates a server key pair and computes ECDH; ServerPrivate is
+%% the curve private key (kept for parity with the previous behaviour).
+%% For x25519mlkem768 the server encapsulates against the client's
+%% ML-KEM encapsulation key: the server share is ciphertext || x25519
+%% public (1120 bytes), the shared secret is mlkem || x25519 (64 bytes),
+%% and there is no retained private key (the exchange is complete).
+-spec server_key_exchange(group(), binary()) ->
+    {binary(), kex_private() | undefined, binary()}.
+server_key_exchange(x25519mlkem768, <<MlKemEK:1184/binary, CXPub:32/binary>>) ->
+    {MlKemSecret, CipherText} = crypto:encapsulate_key(mlkem768, MlKemEK),
+    {SXPub, SXPriv} = crypto:generate_key(ecdh, x25519),
+    XSecret = crypto:compute_key(ecdh, CXPub, SXPriv, x25519),
+    {<<CipherText/binary, SXPub/binary>>, undefined, <<MlKemSecret/binary, XSecret/binary>>};
+server_key_exchange(Curve, ClientPub) ->
+    {PubKey, PrivKey} = generate_key_pair(Curve),
+    {PubKey, PrivKey, compute_shared_secret(Curve, PrivKey, ClientPub)}.
+
+%% @doc Whether this runtime can negotiate the given group. The hybrid
+%% group needs ML-KEM-768 support in crypto (OTP 28+).
+-spec group_supported(group()) -> boolean().
+group_supported(x25519mlkem768) ->
+    lists:member(mlkem768, proplists:get_value(kems, crypto:supports(), []));
+group_supported(Group) ->
+    lists:member(Group, [x25519, x448, secp256r1, secp384r1]).
 
 %%====================================================================
 %% Retry Packet Integrity (RFC 9001 Section 5.8)

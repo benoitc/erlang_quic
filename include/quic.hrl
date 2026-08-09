@@ -294,6 +294,8 @@
 -define(GROUP_SECP521R1, 16#0019).
 -define(GROUP_X25519, 16#001d).
 -define(GROUP_X448, 16#001e).
+%% Post-quantum hybrid X25519MLKEM768 (draft-ietf-tls-ecdhe-mlkem)
+-define(GROUP_X25519MLKEM768, 16#11ec).
 
 %%====================================================================
 %% TLS 1.3 Signature Algorithms (RFC 8446 Section 4.2.3)

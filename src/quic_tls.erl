@@ -85,7 +85,7 @@
 %%   - session_ticket: #session_ticket{} for resumption with PSK (optional)
 %%
 %% Returns: {ClientHelloMsg, PrivateKey, Random}
--spec build_client_hello(map()) -> {binary(), binary(), binary()}.
+-spec build_client_hello(map()) -> {binary(), quic_crypto:kex_private(), binary()}.
 build_client_hello(Opts) ->
     %% Key-share group: the head of `groups' (default x25519). The
     %% remaining groups are advertised in supported_groups so the
@@ -133,7 +133,8 @@ default_sig_algs() ->
 %% @private Named-group atom to RFC 8446 §4.2.7 wire code.
 group_to_code(x25519) -> ?GROUP_X25519;
 group_to_code(secp256r1) -> ?GROUP_SECP256R1;
-group_to_code(secp384r1) -> ?GROUP_SECP384R1.
+group_to_code(secp384r1) -> ?GROUP_SECP384R1;
+group_to_code(x25519mlkem768) -> ?GROUP_X25519MLKEM768.
 
 %% @private Signature-scheme atom to RFC 8446 §4.2.3 wire code.
 sig_alg_to_code(ecdsa_secp256r1_sha256) -> ?SIG_ECDSA_SECP256R1_SHA256;
@@ -970,6 +971,9 @@ parse_server_key_share(<<?GROUP_X25519:16, 32:16, PubKey:32/binary, _/binary>>) 
     {ok, PubKey};
 parse_server_key_share(<<?GROUP_SECP256R1:16, Len:16, PubKey:Len/binary, _/binary>>) ->
     {ok, PubKey};
+parse_server_key_share(<<?GROUP_X25519MLKEM768:16, 1120:16, Share:1120/binary, _/binary>>) ->
+    %% ML-KEM-768 ciphertext (1088) || X25519 public (32)
+    {ok, Share};
 parse_server_key_share(_) ->
     {error, unsupported_key_share}.
 
@@ -1340,6 +1344,7 @@ parse_signature_algorithms_ext(_) ->
 code_to_group(?GROUP_X25519) -> x25519;
 code_to_group(?GROUP_SECP256R1) -> secp256r1;
 code_to_group(?GROUP_SECP384R1) -> secp384r1;
+code_to_group(?GROUP_X25519MLKEM768) -> x25519mlkem768;
 code_to_group(_) -> unknown.
 
 %% @private

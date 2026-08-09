@@ -333,7 +333,7 @@
 
     %% TLS state
     tls_state :: atom(),
-    tls_private_key :: binary() | undefined,
+    tls_private_key :: quic_crypto:kex_private() | undefined,
     tls_transcript = <<>> :: binary(),
     handshake_secret :: binary() | undefined,
     master_secret :: binary() | undefined,
@@ -2690,6 +2690,7 @@ extract_group_key(Group, [{Code, PubKey} | Rest]) ->
 group_atom(?GROUP_X25519) -> x25519;
 group_atom(?GROUP_SECP256R1) -> secp256r1;
 group_atom(?GROUP_SECP384R1) -> secp384r1;
+group_atom(?GROUP_X25519MLKEM768) -> x25519mlkem768;
 group_atom(Other) -> Other.
 
 %% Decide the key-exchange group for a ClientHello (RFC 8446 §4.1.4).
@@ -5989,13 +5990,11 @@ do_server_client_hello_cont(
                 exit({tls_alert, decrypt_error})
         end,
 
-    %% Generate server key pair for the negotiated group
-    {ServerPubKey, ServerPrivKey} = quic_crypto:generate_key_pair(SelectedGroup),
-
-    %% Compute shared secret
-    SharedSecret = quic_crypto:compute_shared_secret(
-        SelectedGroup, ServerPrivKey, ClientPubKey
-    ),
+    %% Server side of the key exchange for the negotiated group: an
+    %% ECDHE keygen + ECDH for classical groups, an ML-KEM
+    %% encapsulation + ECDH for the hybrid group.
+    {ServerPubKey, ServerPrivKey, SharedSecret} =
+        quic_crypto:server_key_exchange(SelectedGroup, ClientPubKey),
 
     %% Negotiate ALPN
     ALPN = negotiate_alpn(ClientALPN, State#state.alpn_list),
