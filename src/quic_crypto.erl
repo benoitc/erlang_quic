@@ -408,7 +408,9 @@ generate_key_pair(Curve) ->
 %% concatenation of the ML-KEM ciphertext and X25519 public key, and
 %% the shared secret is mlkem_secret || x25519_secret (64 bytes).
 -spec compute_shared_secret(group(), kex_private(), binary()) -> binary().
-compute_shared_secret(x25519mlkem768, {MlKemDK, XPriv}, <<CipherText:1088/binary, SXPub:32/binary>>) ->
+compute_shared_secret(
+    x25519mlkem768, {MlKemDK, XPriv}, <<CipherText:1088/binary, SXPub:32/binary>>
+) ->
     MlKemSecret = crypto:decapsulate_key(mlkem768, MlKemDK, CipherText),
     XSecret = crypto:compute_key(ecdh, SXPub, XPriv, x25519),
     <<MlKemSecret/binary, XSecret/binary>>;

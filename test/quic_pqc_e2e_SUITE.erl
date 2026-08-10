@@ -26,14 +26,21 @@
     hybrid_direct/1,
     classical_client_interop/1,
     hybrid_via_hrr/1,
-    hybrid_share_sizes/1
+    hybrid_share_sizes/1,
+    unsupported_group_rejected/1
 ]).
 
 suite() ->
     [{timetrap, {minutes, 2}}].
 
 all() ->
-    [hybrid_direct, classical_client_interop, hybrid_via_hrr, hybrid_share_sizes].
+    [
+        hybrid_direct,
+        classical_client_interop,
+        hybrid_via_hrr,
+        hybrid_share_sizes,
+        unsupported_group_rejected
+    ].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -122,6 +129,22 @@ hybrid_share_sizes(_Config) ->
         x25519mlkem768, ClientPriv, ServerShare
     ),
     ?assertEqual(ServerSecret, ClientSecret),
+    ok.
+
+%% A group the runtime cannot perform is rejected up front with a
+%% clean error from both connect/4 and start_server/3, rather than
+%% crashing inside crypto during the handshake. `unknown_group_xyz'
+%% stands in for a group unsupported on any release (the same path an
+%% OTP 27 node hits for x25519mlkem768).
+unsupported_group_rejected(_Config) ->
+    ?assertEqual(
+        {error, {unsupported_group, unknown_group_xyz}},
+        quic:connect(<<"127.0.0.1">>, 12345, #{groups => [unknown_group_xyz]}, self())
+    ),
+    ?assertEqual(
+        {error, {unsupported_group, unknown_group_xyz}},
+        quic:start_server(pqc_bad_group_srv, 0, #{groups => [unknown_group_xyz]})
+    ),
     ok.
 
 %%====================================================================

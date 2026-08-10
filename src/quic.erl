@@ -264,12 +264,17 @@ connect(Host, Port, Opts, Owner) when
 ->
     %% Extract socket option for pre-opened socket support
     Socket = maps:get(socket, Opts, undefined),
-    case validate_connect_opts(Socket, Opts) of
+    case validate_groups(Opts) of
         ok ->
-            %% Resolution (and RFC 8305 Happy Eyeballs for hostnames) runs in
-            %% the caller process so a resolution failure returns {error, _}
-            %% instead of crashing the caller via the start_link.
-            quic_happy:connect(Host, Port, Opts, Owner, Socket);
+            case validate_connect_opts(Socket, Opts) of
+                ok ->
+                    %% Resolution (and RFC 8305 Happy Eyeballs for hostnames) runs in
+                    %% the caller process so a resolution failure returns {error, _}
+                    %% instead of crashing the caller via the start_link.
+                    quic_happy:connect(Host, Port, Opts, Owner, Socket);
+                {error, _} = Error ->
+                    Error
+            end;
         {error, _} = Error ->
             Error
     end;
@@ -829,9 +834,24 @@ start_server(Name, Port, Opts) when
     Port =< 65535,
     is_map(Opts)
 ->
-    quic_server_sup:start_server(Name, Port, Opts);
+    case validate_groups(Opts) of
+        ok -> quic_server_sup:start_server(Name, Port, Opts);
+        {error, _} = Error -> Error
+    end;
 start_server(_Name, _Port, _Opts) ->
     {error, badarg}.
+
+%% @private Reject a `groups' option naming a key-exchange group this
+%% runtime cannot perform, up front with a clean error, rather than
+%% crashing later inside crypto:generate_key/2 during the handshake.
+%% The hybrid x25519mlkem768 group needs ML-KEM-768 support in crypto
+%% (OTP 28+); on OTP 27 group_supported/1 returns false.
+validate_groups(Opts) ->
+    Groups = maps:get(groups, Opts, []),
+    case [G || G <- Groups, not quic_crypto:group_supported(G)] of
+        [] -> ok;
+        [G | _] -> {error, {unsupported_group, G}}
+    end.
 
 %% @doc Stop a named QUIC server.
 %%
