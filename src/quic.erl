@@ -264,22 +264,26 @@ connect(Host, Port, Opts, Owner) when
 ->
     %% Extract socket option for pre-opened socket support
     Socket = maps:get(socket, Opts, undefined),
-    case validate_groups(Opts) of
+    case validate_client_opts(Socket, Opts) of
         ok ->
-            case validate_connect_opts(Socket, Opts) of
-                ok ->
-                    %% Resolution (and RFC 8305 Happy Eyeballs for hostnames) runs in
-                    %% the caller process so a resolution failure returns {error, _}
-                    %% instead of crashing the caller via the start_link.
-                    quic_happy:connect(Host, Port, Opts, Owner, Socket);
-                {error, _} = Error ->
-                    Error
-            end;
+            %% Resolution (and RFC 8305 Happy Eyeballs for hostnames) runs in
+            %% the caller process so a resolution failure returns {error, _}
+            %% instead of crashing the caller via the start_link.
+            quic_happy:connect(Host, Port, Opts, Owner, Socket);
         {error, _} = Error ->
             Error
     end;
 connect(_Host, _Port, _Opts, _Owner) ->
     {error, badarg}.
+
+%% @private All client-side option checks that must run before the
+%% connection process is started, so a bad option returns {error, _}
+%% to the caller instead of crashing mid-handshake.
+validate_client_opts(Socket, Opts) ->
+    case validate_groups(Opts) of
+        ok -> validate_connect_opts(Socket, Opts);
+        {error, _} = Error -> Error
+    end.
 
 %% A pre-opened `socket' is always a gen_udp handle; requesting the
 %% OTP socket NIF backend or the callback adapter at the same time
