@@ -99,6 +99,8 @@
 ### Key-exchange groups
 - [x] x25519 (default)
 - [x] secp256r1, secp384r1 (opt-in via `groups`)
+- [x] x25519mlkem768 post-quantum hybrid (draft-ietf-tls-ecdhe-mlkem;
+      opt-in via `groups`, needs the ML-KEM APIs in `crypto`, OTP 28.1+)
 - [x] Multi-group `key_share` + `supported_groups` negotiation
 - [ ] secp521r1, x448 (constants only; see Roadmap)
 

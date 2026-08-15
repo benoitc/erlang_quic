@@ -264,7 +264,7 @@ connect(Host, Port, Opts, Owner) when
 ->
     %% Extract socket option for pre-opened socket support
     Socket = maps:get(socket, Opts, undefined),
-    case validate_connect_opts(Socket, Opts) of
+    case validate_client_opts(Socket, Opts) of
         ok ->
             %% Resolution (and RFC 8305 Happy Eyeballs for hostnames) runs in
             %% the caller process so a resolution failure returns {error, _}
@@ -275,6 +275,15 @@ connect(Host, Port, Opts, Owner) when
     end;
 connect(_Host, _Port, _Opts, _Owner) ->
     {error, badarg}.
+
+%% @private All client-side option checks that must run before the
+%% connection process is started, so a bad option returns {error, _}
+%% to the caller instead of crashing mid-handshake.
+validate_client_opts(Socket, Opts) ->
+    case validate_groups(Opts) of
+        ok -> validate_connect_opts(Socket, Opts);
+        {error, _} = Error -> Error
+    end.
 
 %% A pre-opened `socket' is always a gen_udp handle; requesting the
 %% OTP socket NIF backend or the callback adapter at the same time
@@ -831,12 +840,41 @@ start_server(Name, Port, Opts) when
     Port =< 65535,
     is_map(Opts)
 ->
-    case quic_listener:has_auth_method(Opts) of
+    case validate_server_opts(Opts) of
         ok -> quic_server_sup:start_server(Name, Port, Opts);
         {error, _} = Error -> Error
     end;
 start_server(_Name, _Port, _Opts) ->
     {error, badarg}.
+
+%% @private All listener option checks that must run before the
+%% listener pool is started, so a bad option returns {error, _} to the
+%% caller instead of taking the pool down after it has been created.
+validate_server_opts(Opts) ->
+    case validate_groups(Opts) of
+        ok -> quic_listener:has_auth_method(Opts);
+        {error, _} = Error -> Error
+    end.
+
+%% @private Reject a `groups' option naming a key-exchange group this
+%% runtime cannot perform, up front with a clean error, rather than
+%% crashing later inside crypto:generate_key/2 during the handshake.
+%% The hybrid x25519mlkem768 group needs ML-KEM-768 support in crypto
+%% (OTP 28.1+); on older OTP releases group_supported/1 returns false.
+%% An explicit `groups' must be a non-empty list; the head group is the
+%% one that gets a key_share, so an empty list has no meaning.
+validate_groups(Opts) ->
+    case maps:find(groups, Opts) of
+        error ->
+            ok;
+        {ok, Groups} when is_list(Groups), Groups =/= [] ->
+            case [G || G <- Groups, not quic_crypto:group_supported(G)] of
+                [] -> ok;
+                [G | _] -> {error, {unsupported_group, G}}
+            end;
+        {ok, _} ->
+            {error, badarg}
+    end.
 
 %% @doc Stop a named QUIC server.
 %%

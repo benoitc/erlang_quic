@@ -111,7 +111,11 @@ jobs:
         run: rebar3 compile
 
       - name: Run E2E tests
-        run: rebar3 ct --suite=quic_e2e_SUITE
+        run: rebar3 ct --suite=quic_e2e_SUITE,quic_trusted_network_SUITE
+
+      # The current OTP 28 release has the ML-KEM APIs (introduced in 28.1).
+      - name: Run PQC tests
+        run: rebar3 ct --suite=quic_pqc_e2e_SUITE,quic_pqc_mtu_SUITE
 
   server-batching-gso:
     name: Server Batching + Linux GSO

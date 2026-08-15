@@ -275,7 +275,10 @@
     %% Client-side: the Initial CRYPTO frame (ClientHello) buffered so a
     %% stalled handshake can re-send it, and the retransmission attempt
     %% count for backoff. See ?HS_RTX_* and retransmit_initial_flight/1.
-    initial_crypto_frame :: binary() | undefined,
+    %% Every CRYPTO chunk of the current Initial flight, in send order,
+    %% so the whole flight is replayed on retransmit -- a hybrid
+    %% (ML-KEM) ClientHello spans more than one Initial packet.
+    initial_crypto_frames = [] :: [binary()],
     hs_rtx_attempts = 0 :: non_neg_integer(),
     %% Server-side only. The Retry SCID to echo back as
     %% retry_source_connection_id (RFC 9000 §7.3) when this connection
@@ -333,7 +336,7 @@
 
     %% TLS state
     tls_state :: atom(),
-    tls_private_key :: binary() | undefined,
+    tls_private_key :: quic_crypto:kex_private() | undefined,
     tls_transcript = <<>> :: binary(),
     handshake_secret :: binary() | undefined,
     master_secret :: binary() | undefined,
@@ -2609,16 +2612,13 @@ send_client_hello(State) ->
                 {Keys, EarlySecret}
         end,
 
-    %% Create CRYPTO frame
-    CryptoFrame = quic_frame:encode({crypto, 0, ClientHello}),
-
-    %% Encrypt and send Initial packet
-    NewState = send_initial_packet(CryptoFrame, State#state{
+    %% Encrypt and send the ClientHello, chunked across Initial packets
+    %% when it exceeds one datagram (hybrid ML-KEM key share).
+    State0 = State#state{
         tls_private_key = PrivKey,
         tls_transcript = Transcript,
         tls_ch1_random = ClientRandom,
         tls_ch1_opts = ClientHelloOpts,
-        initial_crypto_frame = CryptoFrame,
         initial_tx_off = byte_size(ClientHello),
         early_keys = EarlyKeys,
         max_early_data =
@@ -2626,7 +2626,9 @@ send_client_hello(State) ->
                 undefined -> 0;
                 #session_ticket{max_early_data = MaxEarly} -> MaxEarly
             end
-    }),
+    },
+    {Frames, NewState0} = send_initial_crypto(ClientHello, 0, State0),
+    NewState = NewState0#state{initial_crypto_frames = Frames},
 
     %% Event-driven flush: flush batch and timers after sending ClientHello
     %% Critical for handshake - must send immediately
@@ -2690,6 +2692,7 @@ extract_group_key(Group, [{Code, PubKey} | Rest]) ->
 group_atom(?GROUP_X25519) -> x25519;
 group_atom(?GROUP_SECP256R1) -> secp256r1;
 group_atom(?GROUP_SECP384R1) -> secp384r1;
+group_atom(?GROUP_X25519MLKEM768) -> x25519mlkem768;
 group_atom(Other) -> Other.
 
 %% Decide the key-exchange group for a ClientHello (RFC 8446 §4.1.4).
@@ -2838,9 +2841,11 @@ ensure_ticket_table() ->
 %% Initial CRYPTO offset (non-zero only after a HelloRetryRequest).
 send_server_hello(ServerHelloMsg, State) ->
     Off = State#state.initial_tx_off,
-    CryptoFrame = quic_frame:encode({crypto, Off, ServerHelloMsg}),
     State1 = State#state{initial_tx_off = Off + byte_size(ServerHelloMsg)},
-    send_initial_packet(CryptoFrame, State1).
+    %% Chunk across Initial packets: a hybrid ServerHello Initial is
+    %% ~1225 bytes and no longer fits one datagram.
+    {_Frames, NewState} = send_initial_crypto(ServerHelloMsg, Off, State1),
+    NewState.
 
 %% Server: Send EncryptedExtensions, Certificate, CertificateVerify, Finished
 %% @private
@@ -3134,6 +3139,48 @@ chunk_crypto(Payload, Offset, Max) ->
     Take = min(byte_size(Payload), Max),
     <<Chunk:Take/binary, Rest/binary>> = Payload,
     [{Offset, Chunk} | chunk_crypto(Rest, Offset + Take, Max)].
+
+%% @private Send an Initial-level CRYPTO payload (ClientHello,
+%% ServerHello, or a HelloRetryRequest CH2) as one or more Initial
+%% packets, each sized to stay within the 1200-byte pre-PMTU limit
+%% (RFC 9000 §14.1). A hybrid ML-KEM ClientHello is ~1360 bytes and no
+%% longer fits one datagram; a single oversized Initial is dropped on
+%% paths with an MTU below ~1470 (PPPoE, WireGuard, mobile). Returns
+%% the encoded chunk frames (for the retransmit buffer) and the state.
+send_initial_crypto(Payload, Offset0, State) ->
+    Max = initial_crypto_budget(State),
+    lists:mapfoldl(
+        fun({Offset, Chunk}, AccState) ->
+            Frame = quic_frame:encode({crypto, Offset, Chunk}),
+            {Frame, send_initial_packet(Frame, AccState)}
+        end,
+        State,
+        chunk_crypto(Payload, Offset0, Max)
+    ).
+
+%% @private Conservative per-chunk CRYPTO data budget for an Initial
+%% packet. Mirrors handshake_crypto_budget/1 but includes the Retry
+%% token field, which Initial packets carry (RFC 9000 §17.2.2). Each
+%% Initial packet is separately padded to 1200 bytes downstream, so
+%% the budget bounds the pre-padding size and keeps every datagram
+%% within the universally safe 1200-byte ceiling.
+initial_crypto_budget(#state{dcid = DCID, scid = SCID, retry_token = Token} = State) ->
+    PeerMax = maps:get(
+        max_udp_payload_size,
+        State#state.transport_params,
+        ?DEFAULT_MAX_UDP_PAYLOAD_SIZE
+    ),
+    Ceiling = min(PeerMax, ?DEFAULT_MAX_UDP_PAYLOAD_SIZE),
+    Overhead =
+        %% long header: first byte + version + DCID len/bytes + SCID len/bytes
+        1 + 4 + 1 + byte_size(DCID) + 1 + byte_size(SCID) +
+            %% token length varint + token bytes
+            byte_size(quic_varint:encode(byte_size(Token))) + byte_size(Token) +
+            %% length varint + packet number + AEAD tag
+            2 + 4 + 16 +
+            %% CRYPTO frame header: type + offset varint + length varint
+            1 + 8 + 4,
+    max(1, Ceiling - Overhead).
 
 %% Server: Send HANDSHAKE_DONE frame after receiving client Finished
 send_handshake_done(State) ->
@@ -3785,9 +3832,9 @@ amp_flush_budget(#state{amp_deferred = [Packet | Rest]} = State) ->
 hs_rtx_actions(#state{
     role = client,
     app_keys = undefined,
-    initial_crypto_frame = Frame,
+    initial_crypto_frames = Frames,
     hs_rtx_attempts = Attempts
-}) when Frame =/= undefined, Attempts < ?HS_RTX_MAX_ATTEMPTS ->
+}) when Frames =/= [], Attempts < ?HS_RTX_MAX_ATTEMPTS ->
     Delay = min(?HS_RTX_BASE_MS bsl Attempts, ?HS_RTX_MAX_MS),
     [{state_timeout, Delay, retransmit_initial}];
 hs_rtx_actions(_State) ->
@@ -3798,8 +3845,8 @@ hs_rtx_actions(_State) ->
 %% server's anti-amplification budget so it can flush a deferred flight.
 retransmit_initial_flight(
     StateName,
-    #state{role = client, app_keys = undefined, initial_crypto_frame = Frame} = State
-) when Frame =/= undefined ->
+    #state{role = client, app_keys = undefined, initial_crypto_frames = Frames} = State
+) when Frames =/= [] ->
     ?LOG_DEBUG(
         #{
             what => handshake_initial_retransmit,
@@ -3808,9 +3855,12 @@ retransmit_initial_flight(
         },
         ?QUIC_LOG_META
     ),
-    State1 = send_initial_packet(Frame, State#state{
-        hs_rtx_attempts = State#state.hs_rtx_attempts + 1
-    }),
+    %% Replay every chunk of the flight, each in its own Initial packet.
+    State1 = lists:foldl(
+        fun send_initial_packet/2,
+        State#state{hs_rtx_attempts = State#state.hs_rtx_attempts + 1},
+        Frames
+    ),
     Flushed = flush_dirty_timers(flush_socket_batch(State1)),
     client_rearm_active(Flushed, Flushed#state.active_n),
     {keep_state, Flushed, hs_rtx_actions(Flushed)};
@@ -5301,6 +5351,7 @@ process_tls_message(
             %% standard cert-auth. PSK selection is signalled by the
             %% `selected_psk_identity' extension echoed in ServerHello.
             ServerPubKey = maps:get(public_key, ServerHelloMap),
+            ServerGroup = maps:get(selected_group, ServerHelloMap),
             SelectedPskIdx = maps:get(selected_psk_identity, ServerHelloMap, undefined),
             case validate_client_psk_selection(SelectedPskIdx, State) of
                 {error, Reason} ->
@@ -5313,16 +5364,32 @@ process_tls_message(
                 {ok, ClientSelectedPsk} ->
                     %% psk_ke = ServerHello omits key_share; ECDHE is skipped.
                     SharedSecret =
-                        case ServerPubKey of
-                            undefined ->
+                        case {ServerPubKey, ServerGroup} of
+                            {undefined, undefined} ->
                                 <<>>;
-                            _ ->
+                            {_, Group} when Group =:= State#state.tls_group ->
                                 quic_crypto:compute_shared_secret(
                                     State#state.tls_group,
                                     State#state.tls_private_key,
                                     ServerPubKey
-                                )
+                                );
+                            _ ->
+                                {error, illegal_parameter}
                         end,
+                    %% A key_share that doesn't fit the negotiated group
+                    %% (wrong length, or a group we didn't pick).
+                    case SharedSecret of
+                        {error, illegal_parameter} ->
+                            notify_owner({error, {tls_alert, illegal_parameter}}, State),
+                            send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State),
+                            exit({tls_alert, illegal_parameter});
+                        {error, internal_error} ->
+                            notify_owner({error, {tls_alert, internal_error}}, State),
+                            send_tls_alert(?TLS_ALERT_INTERNAL_ERROR, State),
+                            exit({tls_alert, internal_error});
+                        _ ->
+                            ok
+                    end,
 
                     Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
                     TranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
@@ -5381,6 +5448,9 @@ process_tls_message(
                     },
                     send_initial_ack(State1)
             end;
+        {error, illegal_parameter} ->
+            notify_owner({error, {tls_alert, illegal_parameter}}, State),
+            send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
         {error, _} ->
             State
     end;
@@ -5989,13 +6059,22 @@ do_server_client_hello_cont(
                 exit({tls_alert, decrypt_error})
         end,
 
-    %% Generate server key pair for the negotiated group
-    {ServerPubKey, ServerPrivKey} = quic_crypto:generate_key_pair(SelectedGroup),
-
-    %% Compute shared secret
-    SharedSecret = quic_crypto:compute_shared_secret(
-        SelectedGroup, ServerPrivKey, ClientPubKey
-    ),
+    %% Server side of the key exchange for the negotiated group: an
+    %% ECDHE keygen + ECDH for classical groups, an ML-KEM
+    %% encapsulation + ECDH for the hybrid group.
+    {ServerPubKey, ServerPrivKey, SharedSecret} =
+        case quic_crypto:server_key_exchange(SelectedGroup, ClientPubKey) of
+            {error, illegal_parameter} ->
+                %% Client share doesn't fit the group it named.
+                ?LOG_WARNING(
+                    #{what => bad_key_share, group => SelectedGroup},
+                    ?QUIC_LOG_META
+                ),
+                send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State),
+                exit({tls_alert, illegal_parameter});
+            Exchange ->
+                Exchange
+        end,
 
     %% Negotiate ALPN
     ALPN = negotiate_alpn(ClientALPN, State#state.alpn_list),
@@ -6223,7 +6302,6 @@ handle_hello_retry_request(
             Transcript = <<BaseTranscript/binary, CH2/binary>>,
 
             Off = State#state.initial_tx_off,
-            CryptoFrame = quic_frame:encode({crypto, Off, CH2}),
             State1 = State#state{
                 hrr_sent = true,
                 hrr_group = SelGroup,
@@ -6232,7 +6310,11 @@ handle_hello_retry_request(
                 tls_transcript = Transcript,
                 initial_tx_off = Off + byte_size(CH2)
             },
-            send_initial_packet(CryptoFrame, State1)
+            %% CH2 carries the hybrid key share now, so it chunks too;
+            %% replace the retransmit buffer with the CH2 chunks (the
+            %% outstanding Initial flight after HRR is CH2, not CH1).
+            {Frames, State2} = send_initial_crypto(CH2, Off, State1),
+            State2#state{initial_crypto_frames = Frames}
     end.
 
 %%====================================================================
@@ -9157,6 +9239,7 @@ default_alert_phrase(?TLS_ALERT_HANDSHAKE_FAILURE) -> <<"handshake failure">>;
 default_alert_phrase(?TLS_ALERT_ILLEGAL_PARAMETER) -> <<"illegal parameter">>;
 default_alert_phrase(?TLS_ALERT_UNEXPECTED_MESSAGE) -> <<"unexpected message">>;
 default_alert_phrase(?TLS_ALERT_DECRYPT_ERROR) -> <<"decrypt error">>;
+default_alert_phrase(?TLS_ALERT_INTERNAL_ERROR) -> <<"internal error">>;
 default_alert_phrase(?TLS_ALERT_UNKNOWN_PSK_IDENTITY) -> <<"unknown psk identity">>;
 default_alert_phrase(?TLS_ALERT_BAD_CERTIFICATE) -> <<"bad certificate">>;
 default_alert_phrase(?TLS_ALERT_UNKNOWN_CA) -> <<"unknown ca">>;

@@ -27,6 +27,12 @@
 
 -module(quic_crypto).
 
+-type group() :: x25519 | secp256r1 | secp384r1 | x25519mlkem768.
+%% Private key material for a key exchange: raw curve key for ECDHE,
+%% opaque {MlKemDecapsKey, X25519Priv} for the hybrid group.
+-type kex_private() :: binary() | {binary(), binary()}.
+-export_type([group/0, kex_private/0]).
+
 -export([
     %% Key Schedule
     derive_early_secret/0,
@@ -78,6 +84,8 @@
     %% ECDHE
     generate_key_pair/1,
     compute_shared_secret/3,
+    server_key_exchange/2,
+    group_supported/1,
 
     %% Retry Packet Integrity (RFC 9001 Section 5.8)
     verify_retry_integrity_tag/3,
@@ -377,23 +385,162 @@ cipher_to_hash(_) -> sha256.
 %% ECDHE Key Exchange
 %%====================================================================
 
-%% @doc Generate an ECDHE key pair for the specified curve.
-%% Returns {PublicKey, PrivateKey}
--spec generate_key_pair(x25519 | x448 | secp256r1 | secp384r1) ->
-    {binary(), binary()}.
+%% @doc Generate a key-exchange key pair for the specified group.
+%% Returns {PublicShare, PrivateKey}. For the classical ECDHE groups
+%% PublicShare/PrivateKey are the raw curve keys. For the post-quantum
+%% hybrid group x25519mlkem768 (draft-ietf-tls-ecdhe-mlkem) the public
+%% share is the 1216-byte concatenation of the ML-KEM-768 encapsulation
+%% key and the X25519 public key, and the private key is an opaque
+%% {MlKemDecapsKey, X25519Priv} pair; both are only ever consumed by
+%% compute_shared_secret/3.
+-spec generate_key_pair(group()) -> {binary(), kex_private()}.
+generate_key_pair(x25519mlkem768) ->
+    {MlKemEK, MlKemDK} = crypto:generate_key(mlkem768, []),
+    {XPub, XPriv} = crypto:generate_key(ecdh, x25519),
+    {<<MlKemEK/binary, XPub/binary>>, {MlKemDK, XPriv}};
 generate_key_pair(Curve) ->
     {PubKey, PrivKey} = crypto:generate_key(ecdh, Curve),
     {PubKey, PrivKey}.
 
-%% @doc Compute ECDHE shared secret.
-%% shared_secret = ECDH(our_private, their_public)
--spec compute_shared_secret(
-    x25519 | x448 | secp256r1 | secp384r1,
-    binary(),
-    binary()
-) -> binary().
-compute_shared_secret(Curve, OurPrivate, TheirPublic) ->
-    crypto:compute_key(ecdh, TheirPublic, OurPrivate, Curve).
+%% @doc Compute the key-exchange shared secret (client side for the
+%% hybrid group). For ECDHE groups: ECDH(our_private, their_public).
+%% For x25519mlkem768 the peer share is the server's 1120-byte
+%% concatenation of the ML-KEM ciphertext and X25519 public key, and
+%% the shared secret is mlkem_secret || x25519_secret (64 bytes).
+%% A peer share whose length does not match the group, or a group that
+%% does not match the private key we hold, is `{error,
+%% illegal_parameter}': the caller turns it into a TLS alert rather
+%% than letting crypto raise mid-handshake.
+-spec compute_shared_secret(group(), kex_private(), binary()) ->
+    binary() | {error, illegal_parameter | internal_error}.
+compute_shared_secret(
+    x25519mlkem768, {MlKemDK, XPriv}, <<CipherText:1088/binary, SXPub:32/binary>>
+) ->
+    case safe_mlkem_decapsulate(MlKemDK, CipherText) of
+        {ok, MlKemSecret} ->
+            case safe_ecdh(x25519, XPriv, SXPub) of
+                {ok, XSecret} -> <<MlKemSecret/binary, XSecret/binary>>;
+                {error, illegal_parameter} = Error -> Error
+            end;
+        {error, internal_error} = Error ->
+            Error
+    end;
+compute_shared_secret(Curve, OurPrivate, TheirPublic) when is_binary(OurPrivate) ->
+    case peer_share_size(Curve) =:= byte_size(TheirPublic) of
+        true ->
+            case safe_ecdh(Curve, OurPrivate, TheirPublic) of
+                {ok, SharedSecret} -> SharedSecret;
+                {error, illegal_parameter} = Error -> Error
+            end;
+        false ->
+            {error, illegal_parameter}
+    end;
+compute_shared_secret(_Group, _OurPrivate, _TheirPublic) ->
+    {error, illegal_parameter}.
+
+%% @doc Server-side key exchange against a client key share.
+%% Returns {ServerShare, ServerPrivate, SharedSecret}. For ECDHE groups
+%% this generates a server key pair and computes ECDH; ServerPrivate is
+%% the curve private key (kept for parity with the previous behaviour).
+%% For x25519mlkem768 the server encapsulates against the client's
+%% ML-KEM encapsulation key: the server share is ciphertext || x25519
+%% public (1120 bytes), the shared secret is mlkem || x25519 (64 bytes),
+%% and there is no retained private key (the exchange is complete).
+%% A client share whose length does not match the group is `{error,
+%% illegal_parameter}'.
+-spec server_key_exchange(group(), binary()) ->
+    {binary(), kex_private() | undefined, binary()} | {error, illegal_parameter}.
+server_key_exchange(x25519mlkem768, <<MlKemEK:1184/binary, CXPub:32/binary>>) ->
+    case safe_mlkem_encapsulate(MlKemEK) of
+        {ok, MlKemSecret, CipherText} ->
+            {SXPub, SXPriv} = crypto:generate_key(ecdh, x25519),
+            case safe_ecdh(x25519, SXPriv, CXPub) of
+                {ok, XSecret} ->
+                    ServerShare = <<CipherText/binary, SXPub/binary>>,
+                    {ServerShare, undefined, <<MlKemSecret/binary, XSecret/binary>>};
+                {error, illegal_parameter} = Error ->
+                    Error
+            end;
+        {error, illegal_parameter} = Error ->
+            Error
+    end;
+server_key_exchange(x25519mlkem768, _Malformed) ->
+    {error, illegal_parameter};
+server_key_exchange(Curve, ClientPub) ->
+    case peer_share_size(Curve) =:= byte_size(ClientPub) of
+        true ->
+            {PubKey, PrivKey} = generate_key_pair(Curve),
+            case compute_shared_secret(Curve, PrivKey, ClientPub) of
+                SharedSecret when is_binary(SharedSecret) ->
+                    {PubKey, PrivKey, SharedSecret};
+                {error, _} = Error ->
+                    Error
+            end;
+        false ->
+            {error, illegal_parameter}
+    end.
+
+%% @private The hybrid draft assigns peer-controlled validation failures
+%% to precise TLS alerts. Normalise crypto backend exceptions here so the
+%% connection process can send those alerts instead of terminating.
+safe_mlkem_encapsulate(EncapsulationKey) ->
+    try crypto:encapsulate_key(mlkem768, EncapsulationKey) of
+        {Secret, CipherText} when byte_size(Secret) =:= 32, byte_size(CipherText) =:= 1088 ->
+            {ok, Secret, CipherText};
+        _ ->
+            {error, illegal_parameter}
+    catch
+        _:_ -> {error, illegal_parameter}
+    end.
+
+safe_mlkem_decapsulate(DecapsulationKey, CipherText) ->
+    try crypto:decapsulate_key(mlkem768, DecapsulationKey, CipherText) of
+        Secret when byte_size(Secret) =:= 32 -> {ok, Secret};
+        _ -> {error, internal_error}
+    catch
+        _:_ -> {error, internal_error}
+    end.
+
+safe_ecdh(Curve, PrivateKey, PeerPublic) ->
+    try crypto:compute_key(ecdh, PeerPublic, PrivateKey, Curve) of
+        SharedSecret when is_binary(SharedSecret) ->
+            case is_all_zero(SharedSecret) of
+                true -> {error, illegal_parameter};
+                false -> {ok, SharedSecret}
+            end
+    catch
+        _:_ -> {error, illegal_parameter}
+    end.
+
+%% Constant-time: hash_equals/2 does not short-circuit, so the comparison
+%% cannot leak how many leading bytes of the secret are zero.
+is_all_zero(Binary) ->
+    crypto:hash_equals(Binary, binary:copy(<<0>>, byte_size(Binary))).
+
+%% @private Length of a peer's key share for a classical group. TLS 1.3
+%% mandates the uncompressed point format (RFC 8446 §4.2.8.2), so each
+%% group has exactly one valid length. `undefined' for anything we
+%% cannot negotiate, which never matches a share size.
+peer_share_size(x25519) -> 32;
+peer_share_size(secp256r1) -> 65;
+peer_share_size(secp384r1) -> 97;
+peer_share_size(_) -> undefined.
+
+%% @doc Whether this runtime can negotiate the given group: it must be
+%% one quic_tls has a wire code for, and the hybrid group also needs
+%% ML-KEM-768 support in crypto (OTP 28.1+).
+-spec group_supported(group()) -> boolean().
+group_supported(x25519mlkem768) ->
+    case code:ensure_loaded(crypto) of
+        {module, crypto} ->
+            erlang:function_exported(crypto, encapsulate_key, 2) andalso
+                erlang:function_exported(crypto, decapsulate_key, 3) andalso
+                lists:member(mlkem768, proplists:get_value(kems, crypto:supports(), []));
+        _ ->
+            false
+    end;
+group_supported(Group) ->
+    lists:member(Group, [x25519, secp256r1, secp384r1]).
 
 %%====================================================================
 %% Retry Packet Integrity (RFC 9001 Section 5.8)
