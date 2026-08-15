@@ -85,14 +85,20 @@ hybrid_initial_within_1200(_Config) ->
         quic:close(Conn, normal),
 
         Sizes = collect_sizes([]),
-        Initials = [Sz || {initial, Sz} <- Sizes],
+        Initials = [Sz || {initial, Sz, _Phase} <- Sizes],
         Oversized = [Sz || Sz <- Initials, Sz > ?SAFE_INITIAL],
         ct:pal("client Initial datagram sizes: ~p", [Initials]),
         ?assertEqual([], Oversized),
-        %% The hybrid ClientHello alone must occupy more than one
-        %% Initial datagram: without chunking it would be a single
-        %% ~1445-byte datagram and this list would have one big entry.
-        ?assert(length(Initials) >= 2)
+        %% The ClientHello flight is what the client sends before the
+        %% server has answered; later Initials are ACK-only and would
+        %% make a plain count of Initials meaningless.
+        Hello = [Sz || {initial, Sz, pre_response} <- Sizes],
+        ct:pal("ClientHello Initial sizes: ~p", [Hello]),
+        %% Chunking engaged: the hybrid ClientHello spans more than one
+        %% Initial, and the first chunk is a full one rather than a
+        %% truncated hello that happens to fit.
+        ?assert(length(Hello) >= 2),
+        ?assert(hd(Hello) >= 1100)
     after
         quic_test_echo_server:stop(Server)
     end.
@@ -100,35 +106,66 @@ hybrid_initial_within_1200(_Config) ->
 %% Drain the size reports the bridge forwarded.
 collect_sizes(Acc) ->
     receive
-        {dgram, Type, Size} -> collect_sizes([{Type, Size} | Acc])
+        {dgram, Type, Size, Phase} -> collect_sizes([{Type, Size, Phase} | Acc])
     after 200 -> lists:reverse(Acc)
     end.
 
 %% Relay between the client adapter and a real UDP socket to the
-%% server, reporting each client-egress datagram's size and header
-%% type back to the test. QUIC header protection masks only the low 4
-%% bits of the first byte for long headers, so the form bit (0x80) and
-%% the packet-type bits (0x30) are readable in the clear.
+%% server, reporting each client-egress datagram's size, header type
+%% and whether the server had answered yet. QUIC header protection
+%% masks only the low 4 bits of the first byte for long headers, so the
+%% form bit (0x80) and the packet-type bits (0x30) are readable in the
+%% clear.
+%%
+%% The connection pid only arrives once `quic:connect/4' returns, which
+%% is after the ClientHello is on the wire, so datagrams that beat it
+%% are buffered rather than dropped.
 bridge_init(ServerIP, ServerPort, SocketRef, Reporter) ->
     {ok, Sock} = gen_udp:open(0, [binary, {active, true}]),
-    bridge_loop(Sock, undefined, ServerIP, ServerPort, SocketRef, Reporter).
+    Bridge = #{
+        sock => Sock,
+        conn => undefined,
+        pending => [],
+        answered => false,
+        server => {ServerIP, ServerPort},
+        socket_ref => SocketRef,
+        reporter => Reporter
+    },
+    bridge_loop(Bridge).
 
-bridge_loop(Sock, Conn, ServerIP, ServerPort, SocketRef, Reporter) ->
+bridge_loop(#{sock := Sock, server := {ServerIP, ServerPort}} = Bridge) ->
     receive
-        {set_conn, NewConn} ->
-            bridge_loop(Sock, NewConn, ServerIP, ServerPort, SocketRef, Reporter);
+        {set_conn, Conn} ->
+            Pending = maps:get(pending, Bridge),
+            [deliver(Bridge, Conn, Data) || Data <- lists:reverse(Pending)],
+            bridge_loop(Bridge#{conn := Conn, pending := []});
         {send, _IP, _Port, Pkt} ->
-            Reporter ! {dgram, header_type(Pkt), iolist_size(Pkt)},
+            Phase =
+                case maps:get(answered, Bridge) of
+                    true -> post_response;
+                    false -> pre_response
+                end,
+            maps:get(reporter, Bridge) ! {dgram, header_type(Pkt), iolist_size(Pkt), Phase},
             ok = gen_udp:send(Sock, ServerIP, ServerPort, Pkt),
-            bridge_loop(Sock, Conn, ServerIP, ServerPort, SocketRef, Reporter);
-        {udp, Sock, _IP, _Port, Data} when is_pid(Conn) ->
-            Conn ! {udp, SocketRef, ServerIP, ServerPort, Data},
-            bridge_loop(Sock, Conn, ServerIP, ServerPort, SocketRef, Reporter);
+            bridge_loop(Bridge);
+        {udp, Sock, _IP, _Port, Data} ->
+            Bridge1 = Bridge#{answered := true},
+            case maps:get(conn, Bridge) of
+                undefined ->
+                    Pending = maps:get(pending, Bridge),
+                    bridge_loop(Bridge1#{pending := [Data | Pending]});
+                Conn ->
+                    deliver(Bridge, Conn, Data),
+                    bridge_loop(Bridge1)
+            end;
         stop ->
             gen_udp:close(Sock);
         _ ->
-            bridge_loop(Sock, Conn, ServerIP, ServerPort, SocketRef, Reporter)
+            bridge_loop(Bridge)
     end.
+
+deliver(#{server := {ServerIP, ServerPort}, socket_ref := SocketRef}, Conn, Data) ->
+    Conn ! {udp, SocketRef, ServerIP, ServerPort, Data}.
 
 header_type(Pkt) ->
     <<First:8, _/binary>> = iolist_to_binary(Pkt),
