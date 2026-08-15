@@ -60,7 +60,25 @@ with_connection(ServerOpts, ClientOpts, Fun) ->
         quic_test_echo_server:stop(Srv)
     end.
 
+%% The client reports `connected' a flight before the server does, so
+%% the server-side connection can still be handshaking here.
 client_params_seen_by_server(Name) ->
-    {ok, [ServerConn | _]} = quic:get_server_connections(Name),
-    {ok, TPs} = quic:get_peer_transport_params(ServerConn),
-    TPs.
+    client_params_seen_by_server(Name, 100).
+
+client_params_seen_by_server(_Name, 0) ->
+    error(server_params_unavailable);
+client_params_seen_by_server(Name, Retries) ->
+    case server_params(Name) of
+        {ok, TPs} ->
+            TPs;
+        {error, _} ->
+            timer:sleep(20),
+            client_params_seen_by_server(Name, Retries - 1)
+    end.
+
+server_params(Name) ->
+    case quic:get_server_connections(Name) of
+        {ok, [ServerConn | _]} -> quic:get_peer_transport_params(ServerConn);
+        {ok, []} -> {error, no_connection};
+        {error, _} = Error -> Error
+    end.
