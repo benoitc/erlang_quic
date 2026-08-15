@@ -79,6 +79,10 @@ PSK config and without `cert`/`key`, `start_server/3` returns
 A callback that raises is treated as `not_found` and logged at
 warning level. It will not crash the handshake.
 
+Running without a CA on a trusted subnet, including the Erlang
+distribution case, is covered in
+[INTERNAL_NETWORKS.md](INTERNAL_NETWORKS.md).
+
 ## Modes
 
 - **`psk_dhe_ke`** (default): PSK authentication with (EC)DHE.

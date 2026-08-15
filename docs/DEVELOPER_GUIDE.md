@@ -325,7 +325,7 @@ handle_quic_event({quic, Conn, Event}) ->
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `alpn` | `[binary()]` | `[]` | ALPN protocols |
-| `verify` | `verify_none \| verify_peer` | `verify_none` | Certificate verification |
+| `verify` | `verify_none \| verify_peer` | `verify_peer` | Certificate verification |
 | `idle_timeout` | `integer()` | `30000` | Idle timeout (ms), 0 to disable |
 | `max_data` | `integer()` | `10485760` | Connection flow control (bytes) |
 | `max_stream_data` | `integer()` | `1048576` | Stream flow control (bytes) |

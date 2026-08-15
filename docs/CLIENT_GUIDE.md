@@ -41,7 +41,7 @@ quic:close(Conn, normal).
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `alpn` | [binary()] | `[<<"h3">>]` | ALPN protocols to offer |
-| `verify` | boolean | false | Verify server certificate |
+| `verify` | boolean | true | Verify server certificate (`verify_peer` / `verify_none` also accepted) |
 | `server_name` | binary | Host | Server Name Indication |
 | `cert` | binary | - | Client certificate (for mTLS) |
 | `key` | term | - | Client private key (for mTLS) |
