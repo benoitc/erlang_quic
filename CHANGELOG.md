@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
-- Post-quantum hybrid key exchange `x25519mlkem768` (draft-ietf-tls-ecdhe-mlkem, ML-KEM-768 + X25519), opt-in via `groups`. Negotiable only when the crypto library provides ML-KEM-768 (OTP 28+); a `groups` option naming an unsupported group is rejected up front from `connect/4` and `start_server/3` as `{error, {unsupported_group, _}}` instead of crashing during the handshake. (#195)
+- Post-quantum hybrid key exchange `x25519mlkem768` (draft-ietf-tls-ecdhe-mlkem, ML-KEM-768 + X25519), opt-in via `groups`. Negotiable only when the crypto library provides the ML-KEM APIs (OTP 28.1+); a `groups` option naming an unsupported group is rejected up front from `connect/4` and `start_server/3` as `{error, {unsupported_group, _}}` instead of crashing during the handshake. (#195)
 
 ### Fixed
 - Initial-level CRYPTO is now chunked across Initial packets, each within the 1200-byte pre-PMTU limit, and the whole flight is replayed on retransmit. A hybrid `x25519mlkem768` ClientHello (~1360 bytes) or ServerHello Initial (~1225 bytes) no longer leaves as a single oversized datagram that is dropped on paths with an MTU below ~1470 (IPv6-over-PPPoE, WireGuard, mobile). (#195)

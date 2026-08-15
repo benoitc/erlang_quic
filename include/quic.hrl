@@ -227,6 +227,7 @@
 -define(TLS_ALERT_ILLEGAL_PARAMETER, 47).
 -define(TLS_ALERT_UNKNOWN_CA, 48).
 -define(TLS_ALERT_DECRYPT_ERROR, 51).
+-define(TLS_ALERT_INTERNAL_ERROR, 80).
 -define(TLS_ALERT_UNKNOWN_PSK_IDENTITY, 115).
 
 %%====================================================================

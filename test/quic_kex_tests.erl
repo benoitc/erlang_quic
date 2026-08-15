@@ -49,6 +49,11 @@ compute_shared_secret_rejects_bad_share_test() ->
     ?assertEqual(
         {error, illegal_parameter},
         quic_crypto:compute_shared_secret(x25519, Priv, <<1, 2, 3>>)
+    ),
+    %% RFC 8446 §7.4.2 requires the X25519 all-zero check.
+    ?assertEqual(
+        {error, illegal_parameter},
+        quic_crypto:compute_shared_secret(x25519, Priv, <<0:32/unit:8>>)
     ).
 
 compute_shared_secret_rejects_group_mismatch_test_() ->
@@ -100,6 +105,91 @@ hybrid_exchange_still_agrees_test_() ->
                         quic_crypto:compute_shared_secret(
                             x25519mlkem768, ClientPriv, ServerPub
                         )
+                    )
+            end
+        end
+    ]}.
+
+hybrid_invalid_input_alerts_test_() ->
+    {setup, fun() -> ok end, fun(_) -> ok end, [
+        fun() ->
+            case hybrid_supported() of
+                false ->
+                    ok;
+                true ->
+                    %% FIPS 203 encapsulation-key check failure.
+                    InvalidEK = binary:copy(<<16#ff>>, 1184),
+                    ?assertEqual(
+                        {error, illegal_parameter},
+                        quic_crypto:server_key_exchange(
+                            x25519mlkem768, <<InvalidEK/binary, 9:256>>
+                        )
+                    ),
+
+                    %% Both hybrid peers must reject an invalid/all-zero
+                    %% X25519 component with illegal_parameter.
+                    {EK, _DK} = crypto:generate_key(mlkem768, []),
+                    ?assertEqual(
+                        {error, illegal_parameter},
+                        quic_crypto:server_key_exchange(
+                            x25519mlkem768, <<EK/binary, 0:256>>
+                        )
+                    ),
+                    {_ClientShare, {MlKemDK, XPriv}} =
+                        quic_crypto:generate_key_pair(x25519mlkem768),
+                    ?assertEqual(
+                        {error, illegal_parameter},
+                        quic_crypto:compute_shared_secret(
+                            x25519mlkem768,
+                            {MlKemDK, XPriv},
+                            <<0:1088/unit:8, 0:256>>
+                        )
+                    ),
+
+                    %% A non-length ML-KEM decapsulation failure is a
+                    %% local/internal error under draft §4.2.
+                    ?assertEqual(
+                        {error, internal_error},
+                        quic_crypto:compute_shared_secret(
+                            x25519mlkem768,
+                            {<<>>, XPriv},
+                            <<0:1088/unit:8, 9:256>>
+                        )
+                    )
+            end
+        end
+    ]}.
+
+server_hello_preserves_and_validates_group_test_() ->
+    {setup, fun() -> ok end, fun(_) -> ok end, [
+        fun() ->
+            case hybrid_supported() of
+                false ->
+                    ok;
+                true ->
+                    {ClientShare, _ClientPriv} =
+                        quic_crypto:generate_key_pair(x25519mlkem768),
+                    {ServerShare, undefined, _Secret} =
+                        quic_crypto:server_key_exchange(x25519mlkem768, ClientShare),
+                    {Msg, _} = quic_tls:build_server_hello(#{
+                        key_pair => {ServerShare, undefined},
+                        key_share_group => x25519mlkem768
+                    }),
+                    <<_:8, _:24, Body/binary>> = Msg,
+                    {ok, Parsed} = quic_tls:parse_server_hello(Body),
+                    ?assertEqual(x25519mlkem768, maps:get(selected_group, Parsed)),
+
+                    %% The same bytes labeled as a different group do not
+                    %% become acceptable merely because the parser used to
+                    %% discard the NamedGroup code.
+                    {Mislabeled, _} = quic_tls:build_server_hello(#{
+                        key_pair => {ServerShare, undefined},
+                        key_share_group => secp256r1
+                    }),
+                    <<_:8, _:24, BadBody/binary>> = Mislabeled,
+                    ?assertEqual(
+                        {error, illegal_parameter},
+                        quic_tls:parse_server_hello(BadBody)
                     )
             end
         end

@@ -85,14 +85,14 @@ hybrid_initial_within_1200(_Config) ->
         quic:close(Conn, normal),
 
         Sizes = collect_sizes([]),
-        Initials = [Sz || {initial, Sz, _Phase} <- Sizes],
+        Initials = [Sz || {_Direction, initial, Sz, _Phase} <- Sizes],
         Oversized = [Sz || Sz <- Initials, Sz > ?SAFE_INITIAL],
-        ct:pal("client Initial datagram sizes: ~p", [Initials]),
+        ct:pal("Initial datagram sizes: ~p", [Initials]),
         ?assertEqual([], Oversized),
         %% The ClientHello flight is what the client sends before the
         %% server has answered; later Initials are ACK-only and would
         %% make a plain count of Initials meaningless.
-        Hello = [Sz || {initial, Sz, pre_response} <- Sizes],
+        Hello = [Sz || {client, initial, Sz, pre_response} <- Sizes],
         ct:pal("ClientHello Initial sizes: ~p", [Hello]),
         %% Chunking engaged: the hybrid ClientHello spans more than one
         %% Initial, and the first chunk is a full one rather than a
@@ -106,13 +106,14 @@ hybrid_initial_within_1200(_Config) ->
 %% Drain the size reports the bridge forwarded.
 collect_sizes(Acc) ->
     receive
-        {dgram, Type, Size, Phase} -> collect_sizes([{Type, Size, Phase} | Acc])
+        {dgram, Direction, Type, Size, Phase} ->
+            collect_sizes([{Direction, Type, Size, Phase} | Acc])
     after 200 -> lists:reverse(Acc)
     end.
 
 %% Relay between the client adapter and a real UDP socket to the
-%% server, reporting each client-egress datagram's size, header type
-%% and whether the server had answered yet. QUIC header protection
+%% server, reporting each datagram's direction, size, header type and,
+%% for client egress, whether the server had answered yet. QUIC header protection
 %% masks only the low 4 bits of the first byte for long headers, so the
 %% form bit (0x80) and the packet-type bits (0x30) are readable in the
 %% clear.
@@ -145,11 +146,14 @@ bridge_loop(#{sock := Sock, server := {ServerIP, ServerPort}} = Bridge) ->
                     true -> post_response;
                     false -> pre_response
                 end,
-            maps:get(reporter, Bridge) ! {dgram, header_type(Pkt), iolist_size(Pkt), Phase},
+            maps:get(reporter, Bridge) !
+                {dgram, client, header_type(Pkt), iolist_size(Pkt), Phase},
             ok = gen_udp:send(Sock, ServerIP, ServerPort, Pkt),
             bridge_loop(Bridge);
         {udp, Sock, _IP, _Port, Data} ->
             Bridge1 = Bridge#{answered := true},
+            maps:get(reporter, Bridge) !
+                {dgram, server, header_type(Data), byte_size(Data), post_response},
             case maps:get(conn, Bridge) of
                 undefined ->
                     Pending = maps:get(pending, Bridge),

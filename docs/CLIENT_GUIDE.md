@@ -45,7 +45,7 @@ quic:close(Conn, normal).
 | `server_name` | binary | Host | Server Name Indication |
 | `cert` | binary | - | Client certificate (for mTLS) |
 | `key` | term | - | Client private key (for mTLS) |
-| `groups` | [atom()] | `[x25519]` | Key-exchange groups in preference order (`x25519`, `secp256r1`, `secp384r1`, `x25519mlkem768`). The head gets a `key_share`; the rest are HelloRetryRequest-eligible. `x25519mlkem768` is the post-quantum hybrid group (needs OTP 28+); naming an unsupported group returns `{error, {unsupported_group, _}}`. |
+| `groups` | [atom()] | `[x25519]` | Key-exchange groups in preference order (`x25519`, `secp256r1`, `secp384r1`, `x25519mlkem768`). The head gets a `key_share`; the rest are HelloRetryRequest-eligible. `x25519mlkem768` is the post-quantum hybrid group (needs OTP 28.1+); naming an unsupported group returns `{error, {unsupported_group, _}}`. |
 | `signature_algs` | [atom()] | historical list | Advertised signature schemes (`ecdsa_secp256r1_sha256`, `ecdsa_secp384r1_sha384`, `rsa_pss_rsae_sha256\|384\|512`, `ed25519`, `rsa_pkcs1_sha256`). |
 | `external_psk` | tuple | - | TLS 1.3 external PSK; see [PSK.md](PSK.md). |
 

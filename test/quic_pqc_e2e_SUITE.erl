@@ -8,7 +8,7 @@
 %%% classical-only, to prove interop is unaffected.
 %%%
 %%% The whole suite is skipped when the crypto library has no
-%%% ML-KEM-768 support (OTP < 28 or restricted crypto builds).
+%%% ML-KEM-768 support (OTP < 28.1 or restricted crypto builds).
 
 -module(quic_pqc_e2e_SUITE).
 
@@ -135,7 +135,7 @@ hybrid_share_sizes(_Config) ->
 %% clean error from both connect/4 and start_server/3, rather than
 %% crashing inside crypto during the handshake. `unknown_group_xyz'
 %% stands in for a group unsupported on any release (the same path an
-%% OTP 27 node hits for x25519mlkem768).
+%% older OTP node hits for x25519mlkem768).
 unsupported_group_rejected(_Config) ->
     ?assertEqual(
         {error, {unsupported_group, unknown_group_xyz}},

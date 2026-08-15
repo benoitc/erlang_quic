@@ -5351,6 +5351,7 @@ process_tls_message(
             %% standard cert-auth. PSK selection is signalled by the
             %% `selected_psk_identity' extension echoed in ServerHello.
             ServerPubKey = maps:get(public_key, ServerHelloMap),
+            ServerGroup = maps:get(selected_group, ServerHelloMap),
             SelectedPskIdx = maps:get(selected_psk_identity, ServerHelloMap, undefined),
             case validate_client_psk_selection(SelectedPskIdx, State) of
                 {error, Reason} ->
@@ -5363,15 +5364,17 @@ process_tls_message(
                 {ok, ClientSelectedPsk} ->
                     %% psk_ke = ServerHello omits key_share; ECDHE is skipped.
                     SharedSecret =
-                        case ServerPubKey of
-                            undefined ->
+                        case {ServerPubKey, ServerGroup} of
+                            {undefined, undefined} ->
                                 <<>>;
-                            _ ->
+                            {_, Group} when Group =:= State#state.tls_group ->
                                 quic_crypto:compute_shared_secret(
                                     State#state.tls_group,
                                     State#state.tls_private_key,
                                     ServerPubKey
-                                )
+                                );
+                            _ ->
+                                {error, illegal_parameter}
                         end,
                     %% A key_share that doesn't fit the negotiated group
                     %% (wrong length, or a group we didn't pick).
@@ -5380,6 +5383,10 @@ process_tls_message(
                             notify_owner({error, {tls_alert, illegal_parameter}}, State),
                             send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State),
                             exit({tls_alert, illegal_parameter});
+                        {error, internal_error} ->
+                            notify_owner({error, {tls_alert, internal_error}}, State),
+                            send_tls_alert(?TLS_ALERT_INTERNAL_ERROR, State),
+                            exit({tls_alert, internal_error});
                         _ ->
                             ok
                     end,
@@ -5441,6 +5448,9 @@ process_tls_message(
                     },
                     send_initial_ack(State1)
             end;
+        {error, illegal_parameter} ->
+            notify_owner({error, {tls_alert, illegal_parameter}}, State),
+            send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
         {error, _} ->
             State
     end;
@@ -6062,6 +6072,13 @@ do_server_client_hello_cont(
                 ),
                 send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State),
                 exit({tls_alert, illegal_parameter});
+            {error, internal_error} ->
+                ?LOG_ERROR(
+                    #{what => key_exchange_failed, group => SelectedGroup},
+                    ?QUIC_LOG_META
+                ),
+                send_tls_alert(?TLS_ALERT_INTERNAL_ERROR, State),
+                exit({tls_alert, internal_error});
             Exchange ->
                 Exchange
         end,
@@ -9229,6 +9246,7 @@ default_alert_phrase(?TLS_ALERT_HANDSHAKE_FAILURE) -> <<"handshake failure">>;
 default_alert_phrase(?TLS_ALERT_ILLEGAL_PARAMETER) -> <<"illegal parameter">>;
 default_alert_phrase(?TLS_ALERT_UNEXPECTED_MESSAGE) -> <<"unexpected message">>;
 default_alert_phrase(?TLS_ALERT_DECRYPT_ERROR) -> <<"decrypt error">>;
+default_alert_phrase(?TLS_ALERT_INTERNAL_ERROR) -> <<"internal error">>;
 default_alert_phrase(?TLS_ALERT_UNKNOWN_PSK_IDENTITY) -> <<"unknown psk identity">>;
 default_alert_phrase(?TLS_ALERT_BAD_CERTIFICATE) -> <<"bad certificate">>;
 default_alert_phrase(?TLS_ALERT_UNKNOWN_CA) -> <<"unknown ca">>;

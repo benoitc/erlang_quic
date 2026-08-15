@@ -860,7 +860,7 @@ validate_server_opts(Opts) ->
 %% runtime cannot perform, up front with a clean error, rather than
 %% crashing later inside crypto:generate_key/2 during the handshake.
 %% The hybrid x25519mlkem768 group needs ML-KEM-768 support in crypto
-%% (OTP 28+); on OTP 27 group_supported/1 returns false.
+%% (OTP 28.1+); on older OTP releases group_supported/1 returns false.
 %% An explicit `groups' must be a non-empty list; the head group is the
 %% one that gets a key_share, so an empty list has no meaning.
 validate_groups(Opts) ->

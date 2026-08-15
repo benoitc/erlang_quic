@@ -436,6 +436,7 @@ encode_alpn_list(Protocols) ->
 -spec parse_server_hello(binary()) ->
     {ok, #{
         public_key := binary() | undefined,
+        selected_group := atom() | undefined,
         cipher := atom(),
         random := binary(),
         selected_psk_identity => non_neg_integer()
@@ -484,14 +485,15 @@ parse_server_hello(<<
                         parse_server_key_share(KeyShareData);
                     error when SelectedPsk =/= undefined ->
                         %% psk_ke handshake: no DHE → public_key=undefined.
-                        {ok, undefined};
+                        {ok, {undefined, undefined}};
                     error ->
                         {error, missing_key_share}
                 end,
             case KeyShareResult of
-                {ok, PubKey} ->
+                {ok, {SelectedGroup, PubKey}} ->
                     Base = #{
                         public_key => PubKey,
+                        selected_group => SelectedGroup,
                         cipher => Cipher,
                         random => Random,
                         session_id => SessionId,
@@ -967,15 +969,17 @@ parse_extensions_ordered(Data, _Off, _Acc, _Seen) when byte_size(Data) < 4 ->
 parse_extensions_ordered(_, _, _, _) ->
     {error, invalid_extensions}.
 
-parse_server_key_share(<<?GROUP_X25519:16, 32:16, PubKey:32/binary, _/binary>>) ->
-    {ok, PubKey};
-parse_server_key_share(<<?GROUP_SECP256R1:16, Len:16, PubKey:Len/binary, _/binary>>) ->
-    {ok, PubKey};
-parse_server_key_share(<<?GROUP_X25519MLKEM768:16, 1120:16, Share:1120/binary, _/binary>>) ->
+parse_server_key_share(<<?GROUP_X25519:16, 32:16, PubKey:32/binary>>) ->
+    {ok, {x25519, PubKey}};
+parse_server_key_share(<<?GROUP_SECP256R1:16, 65:16, PubKey:65/binary>>) ->
+    {ok, {secp256r1, PubKey}};
+parse_server_key_share(<<?GROUP_SECP384R1:16, 97:16, PubKey:97/binary>>) ->
+    {ok, {secp384r1, PubKey}};
+parse_server_key_share(<<?GROUP_X25519MLKEM768:16, 1120:16, Share:1120/binary>>) ->
     %% ML-KEM-768 ciphertext (1088) || X25519 public (32)
-    {ok, Share};
+    {ok, {x25519mlkem768, Share}};
 parse_server_key_share(_) ->
-    {error, unsupported_key_share}.
+    {error, illegal_parameter}.
 
 cipher_from_suite(?TLS_AES_128_GCM_SHA256) -> aes_128_gcm;
 cipher_from_suite(?TLS_AES_256_GCM_SHA384) -> aes_256_gcm;

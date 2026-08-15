@@ -412,17 +412,28 @@ generate_key_pair(Curve) ->
 %% illegal_parameter}': the caller turns it into a TLS alert rather
 %% than letting crypto raise mid-handshake.
 -spec compute_shared_secret(group(), kex_private(), binary()) ->
-    binary() | {error, illegal_parameter}.
+    binary() | {error, illegal_parameter | internal_error}.
 compute_shared_secret(
     x25519mlkem768, {MlKemDK, XPriv}, <<CipherText:1088/binary, SXPub:32/binary>>
 ) ->
-    MlKemSecret = crypto:decapsulate_key(mlkem768, MlKemDK, CipherText),
-    XSecret = crypto:compute_key(ecdh, SXPub, XPriv, x25519),
-    <<MlKemSecret/binary, XSecret/binary>>;
+    case safe_mlkem_decapsulate(MlKemDK, CipherText) of
+        {ok, MlKemSecret} ->
+            case safe_ecdh(x25519, XPriv, SXPub) of
+                {ok, XSecret} -> <<MlKemSecret/binary, XSecret/binary>>;
+                {error, illegal_parameter} = Error -> Error
+            end;
+        {error, internal_error} = Error ->
+            Error
+    end;
 compute_shared_secret(Curve, OurPrivate, TheirPublic) when is_binary(OurPrivate) ->
     case peer_share_size(Curve) =:= byte_size(TheirPublic) of
-        true -> crypto:compute_key(ecdh, TheirPublic, OurPrivate, Curve);
-        false -> {error, illegal_parameter}
+        true ->
+            case safe_ecdh(Curve, OurPrivate, TheirPublic) of
+                {ok, SharedSecret} -> SharedSecret;
+                {error, illegal_parameter} = Error -> Error
+            end;
+        false ->
+            {error, illegal_parameter}
     end;
 compute_shared_secret(_Group, _OurPrivate, _TheirPublic) ->
     {error, illegal_parameter}.
@@ -438,22 +449,72 @@ compute_shared_secret(_Group, _OurPrivate, _TheirPublic) ->
 %% A client share whose length does not match the group is `{error,
 %% illegal_parameter}'.
 -spec server_key_exchange(group(), binary()) ->
-    {binary(), kex_private() | undefined, binary()} | {error, illegal_parameter}.
+    {binary(), kex_private() | undefined, binary()}
+    | {error, illegal_parameter | internal_error}.
 server_key_exchange(x25519mlkem768, <<MlKemEK:1184/binary, CXPub:32/binary>>) ->
-    {MlKemSecret, CipherText} = crypto:encapsulate_key(mlkem768, MlKemEK),
-    {SXPub, SXPriv} = crypto:generate_key(ecdh, x25519),
-    XSecret = crypto:compute_key(ecdh, CXPub, SXPriv, x25519),
-    {<<CipherText/binary, SXPub/binary>>, undefined, <<MlKemSecret/binary, XSecret/binary>>};
+    case safe_mlkem_encapsulate(MlKemEK) of
+        {ok, MlKemSecret, CipherText} ->
+            {SXPub, SXPriv} = crypto:generate_key(ecdh, x25519),
+            case safe_ecdh(x25519, SXPriv, CXPub) of
+                {ok, XSecret} ->
+                    ServerShare = <<CipherText/binary, SXPub/binary>>,
+                    {ServerShare, undefined, <<MlKemSecret/binary, XSecret/binary>>};
+                {error, illegal_parameter} = Error ->
+                    Error
+            end;
+        {error, illegal_parameter} = Error ->
+            Error
+    end;
 server_key_exchange(x25519mlkem768, _Malformed) ->
     {error, illegal_parameter};
 server_key_exchange(Curve, ClientPub) ->
     case peer_share_size(Curve) =:= byte_size(ClientPub) of
         true ->
             {PubKey, PrivKey} = generate_key_pair(Curve),
-            {PubKey, PrivKey, compute_shared_secret(Curve, PrivKey, ClientPub)};
+            case compute_shared_secret(Curve, PrivKey, ClientPub) of
+                SharedSecret when is_binary(SharedSecret) ->
+                    {PubKey, PrivKey, SharedSecret};
+                {error, _} = Error ->
+                    Error
+            end;
         false ->
             {error, illegal_parameter}
     end.
+
+%% @private The hybrid draft assigns peer-controlled validation failures
+%% to precise TLS alerts. Normalise crypto backend exceptions here so the
+%% connection process can send those alerts instead of terminating.
+safe_mlkem_encapsulate(EncapsulationKey) ->
+    try crypto:encapsulate_key(mlkem768, EncapsulationKey) of
+        {Secret, CipherText} when byte_size(Secret) =:= 32, byte_size(CipherText) =:= 1088 ->
+            {ok, Secret, CipherText};
+        _ ->
+            {error, illegal_parameter}
+    catch
+        _:_ -> {error, illegal_parameter}
+    end.
+
+safe_mlkem_decapsulate(DecapsulationKey, CipherText) ->
+    try crypto:decapsulate_key(mlkem768, DecapsulationKey, CipherText) of
+        Secret when byte_size(Secret) =:= 32 -> {ok, Secret};
+        _ -> {error, internal_error}
+    catch
+        _:_ -> {error, internal_error}
+    end.
+
+safe_ecdh(Curve, PrivateKey, PeerPublic) ->
+    try crypto:compute_key(ecdh, PeerPublic, PrivateKey, Curve) of
+        SharedSecret when is_binary(SharedSecret) ->
+            case is_all_zero(SharedSecret) of
+                true -> {error, illegal_parameter};
+                false -> {ok, SharedSecret}
+            end
+    catch
+        _:_ -> {error, illegal_parameter}
+    end.
+
+is_all_zero(Binary) ->
+    Binary =:= binary:copy(<<0>>, byte_size(Binary)).
 
 %% @private Length of a peer's key share for a classical group. TLS 1.3
 %% mandates the uncompressed point format (RFC 8446 §4.2.8.2), so each
@@ -466,10 +527,17 @@ peer_share_size(_) -> undefined.
 
 %% @doc Whether this runtime can negotiate the given group: it must be
 %% one quic_tls has a wire code for, and the hybrid group also needs
-%% ML-KEM-768 support in crypto (OTP 28+).
+%% ML-KEM-768 support in crypto (OTP 28.1+).
 -spec group_supported(group()) -> boolean().
 group_supported(x25519mlkem768) ->
-    lists:member(mlkem768, proplists:get_value(kems, crypto:supports(), []));
+    case code:ensure_loaded(crypto) of
+        {module, crypto} ->
+            erlang:function_exported(crypto, encapsulate_key, 2) andalso
+                erlang:function_exported(crypto, decapsulate_key, 3) andalso
+                lists:member(mlkem768, proplists:get_value(kems, crypto:supports(), []));
+        _ ->
+            false
+    end;
 group_supported(Group) ->
     lists:member(Group, [x25519, secp256r1, secp384r1]).
 
