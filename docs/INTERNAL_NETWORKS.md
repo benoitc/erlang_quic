@@ -37,7 +37,8 @@ A listener with neither certificates nor a PSK is refused up front:
 
 Use this when you already have a certificate on the server (a
 self-signed one is fine) and just do not want to distribute a CA to
-clients. This is the default in this library.
+clients. Clients validate by default, so this is opt-in.
+`verify_none`, `none` and `false` all mean the same thing.
 
 ```erlang
 {ok, Conn} = quic:connect(Host, Port, #{

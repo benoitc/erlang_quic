@@ -28,7 +28,9 @@
     relay_captures_cleartext/1,
     verify_none_encrypts_wire/1,
     psk_only_encrypts_wire/1,
-    no_auth_method_rejected/1
+    no_auth_method_rejected/1,
+    verify_defaults_to_validating/1,
+    verify_none_spellings_equivalent/1
 ]).
 
 -define(IDENTITY, <<"alice">>).
@@ -43,7 +45,9 @@ all() ->
         relay_captures_cleartext,
         verify_none_encrypts_wire,
         psk_only_encrypts_wire,
-        no_auth_method_rejected
+        no_auth_method_rejected,
+        verify_defaults_to_validating,
+        verify_none_spellings_equivalent
     ].
 
 init_per_suite(Config) ->
@@ -101,6 +105,28 @@ no_auth_method_rejected(_Config) ->
         {error, no_auth_method},
         quic:start_server(Name, 0, #{alpn => [<<"echo">>]})
     ).
+
+%% Skipping validation is opt-in: with no `verify' option the client
+%% validates and rejects the server's self-signed certificate.
+verify_defaults_to_validating(_Config) ->
+    {ok, Server} = quic_test_echo_server:start(#{}),
+    try
+        ?assertMatch({error, _}, try_connect(Server, #{}))
+    after
+        stop_server(Server)
+    end.
+
+%% `verify_none', `none' and `false' are the same option value.
+verify_none_spellings_equivalent(_Config) ->
+    {ok, Server} = quic_test_echo_server:start(#{}),
+    try
+        [
+            ?assertEqual(ok, try_connect(Server, #{verify => V}))
+         || V <- [verify_none, none, false]
+        ]
+    after
+        stop_server(Server)
+    end.
 
 %%====================================================================
 %% Encrypted-echo driver
@@ -235,6 +261,28 @@ echo_loop(Conn) ->
 %%====================================================================
 %% Client helpers
 %%====================================================================
+
+%% Drive a connect that may legitimately fail. `ok' on a completed
+%% handshake, `{error, Reason}' otherwise.
+try_connect(#{port := Port}, ExtraOpts) ->
+    Opts = maps:merge(#{alpn => [<<"echo">>]}, ExtraOpts),
+    case quic:connect(<<"127.0.0.1">>, Port, Opts, self()) of
+        {error, _} = Error ->
+            Error;
+        {ok, ConnRef} ->
+            receive
+                {quic, ConnRef, {connected, _Info}} ->
+                    quic:close(ConnRef, normal),
+                    ok;
+                {quic, ConnRef, {error, Reason}} ->
+                    {error, Reason};
+                {quic, ConnRef, {closed, Reason}} ->
+                    {error, Reason}
+            after 10000 ->
+                quic:safe_close(ConnRef, timeout),
+                {error, timeout}
+            end
+    end.
 
 wait_connected(ConnRef) ->
     receive
