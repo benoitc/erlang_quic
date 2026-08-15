@@ -779,6 +779,8 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %% `cert' + `key' pair for X.509 auth, or `psks' / `psk_callback' for
 %% TLS 1.3 external PSK (RFC 8446 §4.2.11). Both may coexist; the
 %% per-handshake selection rules are documented in docs/PSK.md.
+%% Without either, this returns `{error, no_auth_method}': QUIC has no
+%% unauthenticated mode (RFC 9001 §3).
 %%
 %% Options:
 %% <ul>
@@ -838,12 +840,21 @@ start_server(Name, Port, Opts) when
     Port =< 65535,
     is_map(Opts)
 ->
-    case validate_groups(Opts) of
+    case validate_server_opts(Opts) of
         ok -> quic_server_sup:start_server(Name, Port, Opts);
         {error, _} = Error -> Error
     end;
 start_server(_Name, _Port, _Opts) ->
     {error, badarg}.
+
+%% @private All listener option checks that must run before the
+%% listener pool is started, so a bad option returns {error, _} to the
+%% caller instead of taking the pool down after it has been created.
+validate_server_opts(Opts) ->
+    case quic_listener:has_auth_method(Opts) of
+        ok -> validate_groups(Opts);
+        {error, _} = Error -> Error
+    end.
 
 %% @private Reject a `groups' option naming a key-exchange group this
 %% runtime cannot perform, up front with a clean error, rather than
