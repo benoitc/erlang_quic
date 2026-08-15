@@ -45,7 +45,8 @@
     get_sockname/1,
     get_connections/1,
     register_cid/3,
-    retire_cid/2
+    retire_cid/2,
+    has_auth_method/1
 ]).
 
 %% gen_server callbacks
@@ -268,7 +269,7 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
     Psks = maps:get(psks, Opts, undefined),
     PskCallback = maps:get(psk_callback, Opts, undefined),
     SniCallback = maps:get(sni_callback, Opts, undefined),
-    case has_auth_method(Cert, PrivateKey, Psks, PskCallback, SniCallback) of
+    case has_auth_method(Opts) of
         ok -> ok;
         {error, no_auth_method} -> exit({listener_init_failed, no_auth_method})
     end,
@@ -317,7 +318,20 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
     {noreply, State}.
 
 %% @private
-%% Validate that the listener has at least one viable auth method.
+%% Validate that listener options carry at least one viable auth
+%% method. Callers check this before starting a listener so the
+%% failure surfaces as an error return rather than a supervisor crash.
+-spec has_auth_method(map()) -> ok | {error, no_auth_method}.
+has_auth_method(Opts) when is_map(Opts) ->
+    has_auth_method(
+        maps:get(cert, Opts, undefined),
+        maps:get(key, Opts, undefined),
+        maps:get(psks, Opts, undefined),
+        maps:get(psk_callback, Opts, undefined),
+        maps:get(sni_callback, Opts, undefined)
+    ).
+
+%% @private
 %% Either a cert+key pair for X.509 auth or PSK config for TLS 1.3
 %% external PSK (RFC 8446 §4.2.11) must be present. Both may coexist.
 %% A `sni_callback' supplies the cert/key per handshake, so it counts as
