@@ -176,20 +176,26 @@ server_download_uses_gso_on_linux(Config) ->
 
                 Flushes = maps:get(batch_flushes, Delta),
                 Coalesced = maps:get(packets_coalesced, Delta),
+                GSOFlushes = maps:get(gso_flushes, Delta),
                 Ratio =
                     case Flushes of
                         0 -> 0.0;
                         _ -> Coalesced / Flushes
                     end,
                 ct:log(
-                    "GSO delta: flushes=~p coalesced=~p ratio=~.2f",
-                    [Flushes, Coalesced, float(Ratio)]
+                    "GSO delta: flushes=~p coalesced=~p gso_flushes=~p ratio=~.2f",
+                    [Flushes, Coalesced, GSOFlushes, float(Ratio)]
                 ),
                 %% On Linux + GSO the download-path batches should
                 %% coalesce significantly. A ratio > 1.5 proves real
                 %% coalescing on top of the Coalesced > Flushes check.
                 ?assert(Coalesced > Flushes),
-                ?assert(Ratio > 1.5)
+                ?assert(Ratio > 1.5),
+                %% Coalescing alone only proves packets were batched:
+                %% both flush paths bump those counters. gso_flushes
+                %% counts the batches the kernel actually segmented, so
+                %% this is what fails if the GSO path stops running.
+                ?assert(GSOFlushes > 0)
             after
                 stop_server(Srv)
             end,
@@ -297,7 +303,7 @@ stats_delta(After, Before) ->
     maps:from_list(
         [
             {K, maps:get(K, After, 0) - maps:get(K, Before, 0)}
-         || K <- [packets_sent, batch_flushes, packets_coalesced]
+         || K <- [packets_sent, batch_flushes, packets_coalesced, gso_flushes]
         ]
     ).
 

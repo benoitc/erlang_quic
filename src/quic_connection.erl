@@ -2122,7 +2122,7 @@ connected(
     %% Return packet counts for liveness detection (net_kernel uses
     %% recv count to verify peer is alive) plus send-path batching
     %% counters for benchmarks and tests.
-    {Flushes, Coalesced} = send_batch_counters(SocketState),
+    {Flushes, Coalesced, GSOFlushes} = send_batch_counters(SocketState),
     Stats = #{
         packets_received => PacketsRecv,
         packets_sent => PacketsSent,
@@ -2131,7 +2131,8 @@ connected(
         ack_sent => AckSent,
         retransmits => Retransmits,
         batch_flushes => Flushes,
-        packets_coalesced => Coalesced
+        packets_coalesced => Coalesced,
+        gso_flushes => GSOFlushes
     },
     {keep_state, State, [{reply, From, {ok, Stats}}]};
 connected({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
@@ -9768,10 +9769,14 @@ send_gso_supported(SocketState) ->
     maps:get(gso_supported, quic_socket:info(SocketState)).
 
 send_batch_counters(undefined) ->
-    {0, 0};
+    {0, 0, 0};
 send_batch_counters(SocketState) ->
     Info = quic_socket:info(SocketState),
-    {maps:get(batch_flushes, Info), maps:get(packets_coalesced, Info)}.
+    {
+        maps:get(batch_flushes, Info),
+        maps:get(packets_coalesced, Info),
+        maps:get(gso_flushes, Info)
+    }.
 
 %% Normalize ALPN list - handles binary, list of binaries, list of strings
 normalize_alpn_list(undefined) ->
