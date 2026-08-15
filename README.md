@@ -257,6 +257,8 @@ Topic guides under `docs/`:
 - [docs/SERVER_GUIDE.md](docs/SERVER_GUIDE.md): server API reference
 - [docs/HTTP3.md](docs/HTTP3.md): HTTP/3 and datagrams
 - [docs/QUIC_DIST.md](docs/QUIC_DIST.md): Erlang distribution over QUIC
+- [docs/PSK.md](docs/PSK.md): TLS 1.3 external PSK
+- [docs/INTERNAL_NETWORKS.md](docs/INTERNAL_NETWORKS.md): running without a CA on a trusted subnet
 - [docs/QLOG_GUIDE.md](docs/QLOG_GUIDE.md): qlog tracing
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md): throughput characteristics, socket-backend rationale, roadmap
 - [docs/DESIGN.md](docs/DESIGN.md): architecture, state machine, packet flow
