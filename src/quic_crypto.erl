@@ -449,8 +449,7 @@ compute_shared_secret(_Group, _OurPrivate, _TheirPublic) ->
 %% A client share whose length does not match the group is `{error,
 %% illegal_parameter}'.
 -spec server_key_exchange(group(), binary()) ->
-    {binary(), kex_private() | undefined, binary()}
-    | {error, illegal_parameter | internal_error}.
+    {binary(), kex_private() | undefined, binary()} | {error, illegal_parameter}.
 server_key_exchange(x25519mlkem768, <<MlKemEK:1184/binary, CXPub:32/binary>>) ->
     case safe_mlkem_encapsulate(MlKemEK) of
         {ok, MlKemSecret, CipherText} ->
@@ -513,8 +512,10 @@ safe_ecdh(Curve, PrivateKey, PeerPublic) ->
         _:_ -> {error, illegal_parameter}
     end.
 
+%% Constant-time: hash_equals/2 does not short-circuit, so the comparison
+%% cannot leak how many leading bytes of the secret are zero.
 is_all_zero(Binary) ->
-    Binary =:= binary:copy(<<0>>, byte_size(Binary)).
+    crypto:hash_equals(Binary, binary:copy(<<0>>, byte_size(Binary))).
 
 %% @private Length of a peer's key share for a classical group. TLS 1.3
 %% mandates the uncompressed point format (RFC 8446 §4.2.8.2), so each

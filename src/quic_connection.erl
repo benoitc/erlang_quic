@@ -6072,13 +6072,6 @@ do_server_client_hello_cont(
                 ),
                 send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State),
                 exit({tls_alert, illegal_parameter});
-            {error, internal_error} ->
-                ?LOG_ERROR(
-                    #{what => key_exchange_failed, group => SelectedGroup},
-                    ?QUIC_LOG_META
-                ),
-                send_tls_alert(?TLS_ALERT_INTERNAL_ERROR, State),
-                exit({tls_alert, internal_error});
             Exchange ->
                 Exchange
         end,
