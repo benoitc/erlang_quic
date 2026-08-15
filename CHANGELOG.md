@@ -4,11 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-08-15
+
 ### Added
-- Post-quantum hybrid key exchange `x25519mlkem768` (draft-ietf-tls-ecdhe-mlkem, ML-KEM-768 + X25519), opt-in via `groups`. Negotiable only when the crypto library provides the ML-KEM APIs (OTP 28.1+); a `groups` option naming an unsupported group is rejected up front from `connect/4` and `start_server/3` as `{error, {unsupported_group, _}}` instead of crashing during the handshake. (#195)
+- Post-quantum hybrid key exchange `x25519mlkem768` (draft-ietf-tls-ecdhe-mlkem, ML-KEM-768 + X25519), opt-in via `groups`. Negotiable only when the crypto library provides the ML-KEM APIs (OTP 28.1+); a `groups` option naming an unsupported group is rejected up front from `connect/4` and `start_server/3` as `{error, {unsupported_group, _}}` instead of crashing during the handshake. (#195, #198)
+- `docs/INTERNAL_NETWORKS.md` covers running without a CA on a trusted subnet: why TLS cannot be disabled, and the `verify_none` and PSK-only setups for both QUIC and Erlang distribution. (#197)
 
 ### Fixed
-- Initial-level CRYPTO is now chunked across Initial packets, each within the 1200-byte pre-PMTU limit, and the whole flight is replayed on retransmit. A hybrid `x25519mlkem768` ClientHello (~1360 bytes) or ServerHello Initial (~1225 bytes) no longer leaves as a single oversized datagram that is dropped on paths with an MTU below ~1470 (IPv6-over-PPPoE, WireGuard, mobile). (#195)
+- Initial-level CRYPTO is now chunked across Initial packets, each within the 1200-byte pre-PMTU limit, and the whole flight is replayed on retransmit. A hybrid `x25519mlkem768` ClientHello (~1360 bytes) or ServerHello Initial (~1225 bytes) no longer leaves as a single oversized datagram that is dropped on paths with an MTU below ~1470 (IPv6-over-PPPoE, WireGuard, mobile). (#195, #198)
+- A peer key share that does not fit the negotiated group is answered with an `illegal_parameter` alert instead of raising inside `crypto` and taking the connection process down. The ServerHello key_share group is kept and checked against the negotiated one, each group accepts exactly one share length, and an all-zero ECDH shared secret is rejected (RFC 8446 §7.4.2). (#198)
+- `start_server/3` returns `{error, no_auth_method}` when a listener has neither `cert`/`key` nor PSK configuration, as documented. The check ran after the listener had started, so the call returned `{ok, Pid}` and the pool then collapsed. (#197)
+- `connect/4` and `start_server/3` reject a `groups` option that is not a non-empty list rather than failing later inside the connection. (#198)
+
+### Changed
+- The `verify` default is documented correctly as `verify_peer`: clients validate the server certificate unless told otherwise. `docs/CLIENT_GUIDE.md` and `docs/DEVELOPER_GUIDE.md` both listed the default as no verification. (#197)
 
 ## [1.8.0] - 2026-08-05
 
