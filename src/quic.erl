@@ -851,8 +851,8 @@ start_server(_Name, _Port, _Opts) ->
 %% listener pool is started, so a bad option returns {error, _} to the
 %% caller instead of taking the pool down after it has been created.
 validate_server_opts(Opts) ->
-    case quic_listener:has_auth_method(Opts) of
-        ok -> validate_groups(Opts);
+    case validate_groups(Opts) of
+        ok -> quic_listener:has_auth_method(Opts);
         {error, _} = Error -> Error
     end.
 
@@ -861,11 +861,19 @@ validate_server_opts(Opts) ->
 %% crashing later inside crypto:generate_key/2 during the handshake.
 %% The hybrid x25519mlkem768 group needs ML-KEM-768 support in crypto
 %% (OTP 28+); on OTP 27 group_supported/1 returns false.
+%% An explicit `groups' must be a non-empty list; the head group is the
+%% one that gets a key_share, so an empty list has no meaning.
 validate_groups(Opts) ->
-    Groups = maps:get(groups, Opts, []),
-    case [G || G <- Groups, not quic_crypto:group_supported(G)] of
-        [] -> ok;
-        [G | _] -> {error, {unsupported_group, G}}
+    case maps:find(groups, Opts) of
+        error ->
+            ok;
+        {ok, Groups} when is_list(Groups), Groups =/= [] ->
+            case [G || G <- Groups, not quic_crypto:group_supported(G)] of
+                [] -> ok;
+                [G | _] -> {error, {unsupported_group, G}}
+            end;
+        {ok, _} ->
+            {error, badarg}
     end.
 
 %% @doc Stop a named QUIC server.

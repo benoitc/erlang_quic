@@ -27,7 +27,7 @@
 
 -module(quic_crypto).
 
--type group() :: x25519 | x448 | secp256r1 | secp384r1 | x25519mlkem768.
+-type group() :: x25519 | secp256r1 | secp384r1 | x25519mlkem768.
 %% Private key material for a key exchange: raw curve key for ECDHE,
 %% opaque {MlKemDecapsKey, X25519Priv} for the hybrid group.
 -type kex_private() :: binary() | {binary(), binary()}.
@@ -407,15 +407,25 @@ generate_key_pair(Curve) ->
 %% For x25519mlkem768 the peer share is the server's 1120-byte
 %% concatenation of the ML-KEM ciphertext and X25519 public key, and
 %% the shared secret is mlkem_secret || x25519_secret (64 bytes).
--spec compute_shared_secret(group(), kex_private(), binary()) -> binary().
+%% A peer share whose length does not match the group, or a group that
+%% does not match the private key we hold, is `{error,
+%% illegal_parameter}': the caller turns it into a TLS alert rather
+%% than letting crypto raise mid-handshake.
+-spec compute_shared_secret(group(), kex_private(), binary()) ->
+    binary() | {error, illegal_parameter}.
 compute_shared_secret(
     x25519mlkem768, {MlKemDK, XPriv}, <<CipherText:1088/binary, SXPub:32/binary>>
 ) ->
     MlKemSecret = crypto:decapsulate_key(mlkem768, MlKemDK, CipherText),
     XSecret = crypto:compute_key(ecdh, SXPub, XPriv, x25519),
     <<MlKemSecret/binary, XSecret/binary>>;
-compute_shared_secret(Curve, OurPrivate, TheirPublic) ->
-    crypto:compute_key(ecdh, TheirPublic, OurPrivate, Curve).
+compute_shared_secret(Curve, OurPrivate, TheirPublic) when is_binary(OurPrivate) ->
+    case peer_share_size(Curve) =:= byte_size(TheirPublic) of
+        true -> crypto:compute_key(ecdh, TheirPublic, OurPrivate, Curve);
+        false -> {error, illegal_parameter}
+    end;
+compute_shared_secret(_Group, _OurPrivate, _TheirPublic) ->
+    {error, illegal_parameter}.
 
 %% @doc Server-side key exchange against a client key share.
 %% Returns {ServerShare, ServerPrivate, SharedSecret}. For ECDHE groups
@@ -425,24 +435,43 @@ compute_shared_secret(Curve, OurPrivate, TheirPublic) ->
 %% ML-KEM encapsulation key: the server share is ciphertext || x25519
 %% public (1120 bytes), the shared secret is mlkem || x25519 (64 bytes),
 %% and there is no retained private key (the exchange is complete).
+%% A client share whose length does not match the group is `{error,
+%% illegal_parameter}'.
 -spec server_key_exchange(group(), binary()) ->
-    {binary(), kex_private() | undefined, binary()}.
+    {binary(), kex_private() | undefined, binary()} | {error, illegal_parameter}.
 server_key_exchange(x25519mlkem768, <<MlKemEK:1184/binary, CXPub:32/binary>>) ->
     {MlKemSecret, CipherText} = crypto:encapsulate_key(mlkem768, MlKemEK),
     {SXPub, SXPriv} = crypto:generate_key(ecdh, x25519),
     XSecret = crypto:compute_key(ecdh, CXPub, SXPriv, x25519),
     {<<CipherText/binary, SXPub/binary>>, undefined, <<MlKemSecret/binary, XSecret/binary>>};
+server_key_exchange(x25519mlkem768, _Malformed) ->
+    {error, illegal_parameter};
 server_key_exchange(Curve, ClientPub) ->
-    {PubKey, PrivKey} = generate_key_pair(Curve),
-    {PubKey, PrivKey, compute_shared_secret(Curve, PrivKey, ClientPub)}.
+    case peer_share_size(Curve) =:= byte_size(ClientPub) of
+        true ->
+            {PubKey, PrivKey} = generate_key_pair(Curve),
+            {PubKey, PrivKey, compute_shared_secret(Curve, PrivKey, ClientPub)};
+        false ->
+            {error, illegal_parameter}
+    end.
 
-%% @doc Whether this runtime can negotiate the given group. The hybrid
-%% group needs ML-KEM-768 support in crypto (OTP 28+).
+%% @private Length of a peer's key share for a classical group. TLS 1.3
+%% mandates the uncompressed point format (RFC 8446 §4.2.8.2), so each
+%% group has exactly one valid length. `undefined' for anything we
+%% cannot negotiate, which never matches a share size.
+peer_share_size(x25519) -> 32;
+peer_share_size(secp256r1) -> 65;
+peer_share_size(secp384r1) -> 97;
+peer_share_size(_) -> undefined.
+
+%% @doc Whether this runtime can negotiate the given group: it must be
+%% one quic_tls has a wire code for, and the hybrid group also needs
+%% ML-KEM-768 support in crypto (OTP 28+).
 -spec group_supported(group()) -> boolean().
 group_supported(x25519mlkem768) ->
     lists:member(mlkem768, proplists:get_value(kems, crypto:supports(), []));
 group_supported(Group) ->
-    lists:member(Group, [x25519, x448, secp256r1, secp384r1]).
+    lists:member(Group, [x25519, secp256r1, secp384r1]).
 
 %%====================================================================
 %% Retry Packet Integrity (RFC 9001 Section 5.8)

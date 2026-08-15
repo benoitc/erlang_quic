@@ -5373,6 +5373,16 @@ process_tls_message(
                                     ServerPubKey
                                 )
                         end,
+                    %% A key_share that doesn't fit the negotiated group
+                    %% (wrong length, or a group we didn't pick).
+                    case SharedSecret of
+                        {error, illegal_parameter} ->
+                            notify_owner({error, {tls_alert, illegal_parameter}}, State),
+                            send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State),
+                            exit({tls_alert, illegal_parameter});
+                        _ ->
+                            ok
+                    end,
 
                     Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
                     TranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
@@ -6043,7 +6053,18 @@ do_server_client_hello_cont(
     %% ECDHE keygen + ECDH for classical groups, an ML-KEM
     %% encapsulation + ECDH for the hybrid group.
     {ServerPubKey, ServerPrivKey, SharedSecret} =
-        quic_crypto:server_key_exchange(SelectedGroup, ClientPubKey),
+        case quic_crypto:server_key_exchange(SelectedGroup, ClientPubKey) of
+            {error, illegal_parameter} ->
+                %% Client share doesn't fit the group it named.
+                ?LOG_WARNING(
+                    #{what => bad_key_share, group => SelectedGroup},
+                    ?QUIC_LOG_META
+                ),
+                send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State),
+                exit({tls_alert, illegal_parameter});
+            Exchange ->
+                Exchange
+        end,
 
     %% Negotiate ALPN
     ALPN = negotiate_alpn(ClientALPN, State#state.alpn_list),
