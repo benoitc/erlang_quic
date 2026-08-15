@@ -333,6 +333,10 @@ info_reports_config_and_counters_test() ->
     ?assertEqual(0, maps:get(packets_coalesced, Info)),
     ?assertEqual(true, maps:get(batching_enabled, Info)),
     ?assertEqual(16, maps:get(max_batch_packets, Info)),
+    %% Segment size is per-flush telemetry now, not configuration: it
+    %% reports what the kernel was told, and there has been no flush.
+    ?assertEqual(0, maps:get(gso_size, Info)),
+    ?assertEqual(0, maps:get(gso_flushes, Info)),
 
     ok = quic_socket:close(State).
 
@@ -367,6 +371,9 @@ batch_counters_advance_on_flush_test() ->
     Info = quic_socket:info(S4),
     ?assertEqual(1, maps:get(batch_flushes, Info)),
     ?assertEqual(3, maps:get(packets_coalesced, Info)),
+    %% A batch that went out packet by packet must not be reported as
+    %% offloaded; batch_flushes alone cannot tell the two apart.
+    ?assertEqual(0, maps:get(gso_flushes, Info)),
 
     ok = quic_socket:close(S4).
 
