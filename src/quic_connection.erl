@@ -2501,6 +2501,33 @@ handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     %% EXIT signals are handled in terminate/3 callback
     %% Just ignore here - the process will terminate anyway if it's from parent
     {keep_state, State};
+%% Async sends can arrive before the state machine reaches `connected':
+%% the owner is told `connected' a flight before the server confirms, and
+%% send_data_async is fire-and-forget so the caller cannot retry. Queue
+%% them like the synchronous handshaking-state path does (flushed by
+%% send_pending_data/2 on entering `connected'); falling through to the
+%% catch-all below silently loses the data.
+handle_common_event(
+    cast,
+    {send_data_async, StreamId, Data, Fin},
+    StateName,
+    #state{pending_data = Pending} = State
+) ->
+    case length(Pending) >= ?MAX_PENDING_DATA_ENTRIES of
+        true ->
+            ?LOG_WARNING(
+                #{
+                    what => async_send_dropped_pending_limit,
+                    state => StateName,
+                    stream_id => StreamId
+                },
+                ?QUIC_LOG_META
+            ),
+            {keep_state, State};
+        false ->
+            NewPending = Pending ++ [{StreamId, Data, Fin}],
+            {keep_state, State#state{pending_data = NewPending}}
+    end;
 %% Return error for unhandled calls to prevent timeout
 handle_common_event({call, From}, _Request, StateName, State) ->
     {keep_state, State, [{reply, From, {error, {invalid_state, StateName}}}]};
@@ -7825,8 +7852,8 @@ do_send_data(
                             ),
                             %% RFC 9000 Section 19.12: DATA_BLOCKED reports the connection data limit
                             BlockedFrame = {data_blocked, MaxDataRemote},
-                            _FinalState = send_frame(BlockedFrame, State),
-                            {error, {flow_control_blocked, connection}};
+                            State1 = send_frame(BlockedFrame, State),
+                            queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State1);
                         {_, false} ->
                             %% Stream-level flow control blocked
                             %% RFC 9000: Don't queue data beyond flow control limits.
@@ -7843,8 +7870,8 @@ do_send_data(
                             ),
                             %% RFC 9000 Section 19.13: STREAM_DATA_BLOCKED reports the stream data limit
                             BlockedFrame = {stream_data_blocked, StreamId, SendMaxData},
-                            _FinalState = send_frame(BlockedFrame, State),
-                            {error, {flow_control_blocked, {stream, StreamId}}};
+                            State1 = send_frame(BlockedFrame, State),
+                            queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State1);
                         {true, true} ->
                             %% Flow control allows sending
                             %% Fragment and send data - congestion control may partially
@@ -8394,6 +8421,31 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
 %% Queue stream data when congestion window is full
 %% Uses bucket-based priority queue for O(1) insert (RFC 9218)
 %% Returns {ok, State} | {error, send_queue_full} if queue limit exceeded
+%% Flow-control-blocked sends are queued rather than dropped and are
+%% retried by process_send_queue/1 when MAX_DATA / MAX_STREAM_DATA
+%% arrives. Returning an error here silently loses data for
+%% send_data_async callers, which have no way to retry: the send offset
+%% stays untouched, so later sends close the gap at the QUIC layer while
+%% the application stream is missing a chunk. The offset is advanced
+%% when queueing so subsequent sends on the stream order consistently
+%% behind this entry; QUIC reassembly is offset-based, so transmission
+%% order across entries does not matter.
+queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State) ->
+    case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+        {ok, QState} ->
+            case maps:find(StreamId, QState#state.streams) of
+                {ok, Stream} ->
+                    NewStream = Stream#stream_state{send_offset = Offset + DataSize},
+                    {ok, QState#state{
+                        streams = maps:put(StreamId, NewStream, QState#state.streams)
+                    }};
+                error ->
+                    {ok, QState}
+            end;
+        {error, send_queue_full} = Error ->
+            Error
+    end.
+
 %% Entry format: {stream_data, StreamId, Offset, Data, Fin, DataSize}
 %% DataSize is cached to avoid repeated iolist_size calls
 queue_stream_data(
