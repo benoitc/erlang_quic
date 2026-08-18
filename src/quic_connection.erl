@@ -8476,7 +8476,15 @@ queue_stream_data(
     } = State,
     Where
 ) ->
-    DataSize = iolist_size(Data),
+    %% Normalise to a binary: consumers like
+    %% dequeue_small_stream_frame_tuple/1 hand the entry's data straight
+    %% to quic_frame:encode/1, which requires a binary.
+    DataBin =
+        case is_binary(Data) of
+            true -> Data;
+            false -> iolist_to_binary(Data)
+        end,
+    DataSize = byte_size(DataBin),
     NewQueueBytes = QueueBytes + DataSize,
     case NewQueueBytes > ?MAX_SEND_QUEUE_BYTES of
         true ->
@@ -8494,7 +8502,7 @@ queue_stream_data(
         false ->
             Urgency = get_stream_urgency(StreamId, Streams),
             %% Cache DataSize in entry to avoid repeated iolist_size calls
-            Entry = {stream_data, StreamId, Offset, Data, Fin, DataSize},
+            Entry = {stream_data, StreamId, Offset, DataBin, Fin, DataSize},
             NewPQ =
                 case Where of
                     back -> pqueue_in(Entry, Urgency, PQ);
