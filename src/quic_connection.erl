@@ -8209,14 +8209,23 @@ do_send_datagram(
 %% subsequent chunking reuses the same binary via sub-binary slices and
 %% downstream helpers can rely on the binary invariant without re-flattening.
 send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State) ->
+    send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, back).
+
+%% Where selects the queue position when a congestion/pacing block forces
+%% the unsent remainder back onto the send queue: `back' for fresh sends
+%% (their offset is highest, so appending keeps per-stream offset order),
+%% `front' when draining the queue (the popped entry's remainder must go
+%% back in front of higher-offset entries, or a later flow-control block
+%% at the head strands it behind them, leaving a permanent data hole).
+send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, Where) ->
     DataBin =
         case is_binary(Data) of
             true -> Data;
             false -> iolist_to_binary(Data)
         end,
-    send_stream_data_fragmented_tracked(StreamId, Offset, DataBin, Fin, State, 0).
+    send_stream_fragments(StreamId, Offset, DataBin, Fin, State, 0, Where).
 
-send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) when
+send_stream_fragments(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where) when
     is_binary(Data)
 ->
     %% Calculate max chunk size based on current PMTU
@@ -8225,15 +8234,17 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSen
 
     case DataSize =< MaxChunkSize of
         true ->
-            send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar);
+            send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where);
         false ->
             %% Data is already a flat binary; chunk via sub-binary slices.
-            send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize)
+            send_stream_chunked(
+                StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize, Where
+            )
     end.
 
 %% @doc Send stream data that fits in a single packet.
 %% Data is a binary (normalised by send_stream_data_fragmented_tracked/5).
-send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) when
+send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where) when
     is_binary(Data)
 ->
     #state{cc_state = CCState, pacing_enabled = PacingEnabled, streams = Streams} = State,
@@ -8265,7 +8276,7 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) wh
                 },
                 ?QUIC_LOG_META
             ),
-            case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
                 {ok, QueuedState} ->
                     PacedState = maybe_set_pacing_timer(Delay, QueuedState),
                     {PacedState, BytesSentSoFar};
@@ -8285,7 +8296,7 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) wh
                 },
                 ?QUIC_LOG_META
             ),
-            case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
                 {ok, QueuedState} ->
                     {QueuedState, BytesSentSoFar};
                 {error, send_queue_full} ->
@@ -8325,7 +8336,7 @@ cwnd_only_check(CCState, Size, Urgency) ->
 %% send_stream_data_fragmented_tracked/6. For a 10 MB upload this cuts
 %% thousands of get_stream_urgency/2 / get_max_stream_data_per_packet/1
 %% calls and record-pattern matches out of the hot send loop.
-send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize) ->
+send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize, Where) ->
     Urgency = get_stream_urgency(StreamId, State#state.streams),
     PacketSize = MaxChunkSize + ?PACKET_OVERHEAD,
     %% Pre-compute the stream-frame header parts that stay constant
@@ -8336,7 +8347,7 @@ send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunk
     LengthVarint = quic_varint:encode(MaxChunkSize),
     HeaderPrefix =
         <<(?FRAME_STREAM bor ?STREAM_FLAG_OFF bor ?STREAM_FLAG_LEN):8, StreamIdVarint/binary>>,
-    Ctx = {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint},
+    Ctx = {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint, Where},
     send_stream_chunked_loop(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx).
 
 %% Inner chunked-send loop. Cached values in `Ctx' never change within a
@@ -8344,17 +8355,17 @@ send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunk
 %% `send_stream_single_packet/6' so a partial last chunk gets a correctly
 %% sized packet (Length != MaxChunkSize) and can also carry a FIN.
 send_stream_chunked_loop(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
-    {chunked_ctx, MaxChunkSize, _Urgency, _PacketSize, _HeaderPrefix, _LengthVarint} = Ctx,
+    {chunked_ctx, MaxChunkSize, _Urgency, _PacketSize, _HeaderPrefix, _LengthVarint, Where} = Ctx,
     DataSize = byte_size(Data),
     case DataSize =< MaxChunkSize of
         true ->
-            send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar);
+            send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where);
         false ->
             send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx)
     end.
 
 send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
-    {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint} = Ctx,
+    {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint, Where} = Ctx,
     #state{cc_state = CCState, pacing_enabled = PacingEnabled} = State,
     Check =
         case PacingEnabled of
@@ -8387,7 +8398,7 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
                 },
                 ?QUIC_LOG_META
             ),
-            case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
                 {ok, QueuedState} ->
                     PacedState = maybe_set_pacing_timer(Delay, QueuedState),
                     {PacedState, BytesSentSoFar};
@@ -8409,7 +8420,7 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
                 },
                 ?QUIC_LOG_META
             ),
-            case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
                 {ok, QueuedState} ->
                     % Return bytes sent so far
                     {QueuedState, BytesSentSoFar};
@@ -8448,6 +8459,9 @@ queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State) ->
 
 %% Entry format: {stream_data, StreamId, Offset, Data, Fin, DataSize}
 %% DataSize is cached to avoid repeated iolist_size calls
+queue_stream_data(StreamId, Offset, Data, Fin, State) ->
+    queue_stream_data(StreamId, Offset, Data, Fin, State, back).
+
 queue_stream_data(
     StreamId,
     Offset,
@@ -8459,7 +8473,8 @@ queue_stream_data(
         send_queue_bytes = QueueBytes,
         send_queue_count = QueueCount,
         send_queue_version = Version
-    } = State
+    } = State,
+    Where
 ) ->
     DataSize = iolist_size(Data),
     NewQueueBytes = QueueBytes + DataSize,
@@ -8480,7 +8495,11 @@ queue_stream_data(
             Urgency = get_stream_urgency(StreamId, Streams),
             %% Cache DataSize in entry to avoid repeated iolist_size calls
             Entry = {stream_data, StreamId, Offset, Data, Fin, DataSize},
-            NewPQ = pqueue_in(Entry, Urgency, PQ),
+            NewPQ =
+                case Where of
+                    back -> pqueue_in(Entry, Urgency, PQ);
+                    front -> pqueue_in_front(Entry, Urgency, PQ)
+                end,
             NewVersion = Version + 1,
             {ok, State#state{
                 send_queue = NewPQ,
@@ -8612,7 +8631,7 @@ process_send_queue_entry(
                 send_queue_bytes = DecrementedQueueBytes,
                 send_queue_count = DecrementedQueueCount
             },
-            case send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State1) of
+            case send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State1, front) of
                 {error, send_queue_full} ->
                     ?LOG_WARNING(
                         #{
@@ -8662,6 +8681,16 @@ process_send_queue_entry(
 pqueue_in(Entry, Urgency, PQ) when Urgency >= 0, Urgency =< 7 ->
     Bucket = element(Urgency + 1, PQ),
     NewBucket = queue:in(Entry, Bucket),
+    setelement(Urgency + 1, PQ, NewBucket).
+
+%% Insert at the front of the urgency bucket. Used when a drain pops an
+%% entry and must put back an unsent remainder: appending it at the back
+%% would order it behind higher-offset entries of the same stream, and a
+%% later stream-flow-control block at the head then strands it forever
+%% (the peer cannot extend the window across the resulting data hole).
+pqueue_in_front(Entry, Urgency, PQ) when Urgency >= 0, Urgency =< 7 ->
+    Bucket = element(Urgency + 1, PQ),
+    NewBucket = queue:in_r(Entry, Bucket),
     setelement(Urgency + 1, PQ, NewBucket).
 
 %% Remove and return highest priority (lowest urgency) entry
@@ -9475,6 +9504,9 @@ defer_retransmit_frames(Frames, State) ->
 %% Queue a lost STREAM frame for retransmission. Exempt from flow control and
 %% data_sent (those were counted on the original send); bytes/count/version are
 %% updated like queue_stream_data/5 so the drain and reclaim-gate scans see it.
+%% Front-inserted: retransmits fill receiver-side holes, so they must not sit
+%% behind a flow-control-blocked head whose window can only grow once the hole
+%% is filled.
 enqueue_retransmit_stream(StreamId, Offset, Data, Fin, State) ->
     #state{
         send_queue = PQ,
@@ -9487,7 +9519,7 @@ enqueue_retransmit_stream(StreamId, Offset, Data, Fin, State) ->
     Urgency = get_stream_urgency(StreamId, Streams),
     Entry = {retransmit_stream, StreamId, Offset, Data, Fin, DataSize},
     State#state{
-        send_queue = pqueue_in(Entry, Urgency, PQ),
+        send_queue = pqueue_in_front(Entry, Urgency, PQ),
         send_queue_bytes = QueueBytes + DataSize,
         send_queue_count = QueueCount + 1,
         send_queue_version = Version + 1
