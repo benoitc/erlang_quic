@@ -1208,7 +1208,14 @@ recv_gro(Socket, Timeout) ->
 
 extract_gro_segment_size([]) ->
     undefined;
-extract_gro_segment_size([#{level := udp, type := ?UDP_GRO, data := <<Size:16/native>>} | _]) ->
+extract_gro_segment_size([
+    #{level := udp, type := ?UDP_GRO, data := <<Size:16/native, _/binary>>} | _
+]) ->
+    %% The kernel's UDP_GRO cmsg payload is an int (4 bytes); matching
+    %% exactly 2 bytes made every lookup fail, so a GRO-coalesced buffer
+    %% was passed up unsplit as one giant datagram and dropped by the
+    %% QUIC layer (short-header packets cannot be re-split). Accept the
+    %% int and read the low 16 bits.
     Size;
 extract_gro_segment_size([_ | Rest]) ->
     extract_gro_segment_size(Rest).
