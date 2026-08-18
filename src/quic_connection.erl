@@ -140,6 +140,8 @@
 -ifdef(TEST).
 -export([
     chunk_crypto/3,
+    buffer_stream_data/4,
+    extract_contiguous_data/2,
     add_to_ack_ranges/2,
     merge_ack_ranges/1,
     convert_ack_ranges_for_encode/1,
@@ -6472,7 +6474,17 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
             _ -> #{}
         end,
     CurrentOffset = Stream#stream_state.recv_offset,
-    IsDuplicate = Offset < CurrentOffset orelse maps:is_key(Offset, RecvBuffer),
+    %% A frame only counts as duplicate when it carries nothing new: its
+    %% range ends at or below the delivered point, or an equal-or-longer
+    %% frame is already buffered at the same offset. A frame that merely
+    %% STARTS below the delivered point can still carry new tail bytes
+    %% (senders repacketize on retransmission).
+    IsDuplicate =
+        EndOffset =< CurrentOffset orelse
+            (case RecvBuffer of
+                #{Offset := Dup} -> byte_size(Dup) >= DataSize;
+                _ -> false
+            end),
 
     %% Only check buffer limit for new (non-duplicate) data
     BufferOverflow =
@@ -6572,8 +6584,15 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                 %% In-order with empty buffer: deliver directly
                                 {Data, EndOffset, RecvBuffer, Fin};
                             false ->
-                                %% Out-of-order or buffer has data: use buffer path
-                                UpdatedBuffer = maps:put(Offset, Data, RecvBuffer),
+                                %% Out-of-order or buffer has data: use buffer path.
+                                %% Senders may repacketize on retransmission, so a
+                                %% frame can overlap already-delivered data
+                                %% (RFC 9000 §2.2); trim before buffering or the
+                                %% unseen tail gets buried at an offset the
+                                %% extraction loop never visits.
+                                UpdatedBuffer = buffer_stream_data(
+                                    Offset, Data, CurrentOffset, RecvBuffer
+                                ),
                                 {ExtractedData, ExtractedOffset, ExtractedBuffer} =
                                     extract_contiguous_data(UpdatedBuffer, CurrentOffset),
                                 ExtractedFin =
@@ -6606,10 +6625,11 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                     },
 
                     %% Track connection-level data received - only count NEW bytes, not duplicates
+                    %% (for a partial overlap, only the part past the delivered point)
                     NewBytesReceived =
                         case IsDuplicate of
                             true -> 0;
-                            false -> DataSize
+                            false -> EndOffset - max(Offset, CurrentOffset)
                         end,
                     NewDataReceivedVal = DataReceived + NewBytesReceived,
 
@@ -6754,6 +6774,28 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
             end
     end.
 
+%% Buffer an out-of-order stream frame, trimming any part that overlaps
+%% already-delivered data. On an exact offset collision keep the longer
+%% payload (a repacketized retransmit can extend a previously seen frame).
+buffer_stream_data(Offset, Data, CurrentOffset, Buffer) when Offset < CurrentOffset ->
+    Skip = CurrentOffset - Offset,
+    case byte_size(Data) of
+        Sz when Sz =< Skip ->
+            %% Entirely below the delivered point: true duplicate
+            Buffer;
+        Sz ->
+            buffer_stream_data(
+                CurrentOffset, binary:part(Data, Skip, Sz - Skip), CurrentOffset, Buffer
+            )
+    end;
+buffer_stream_data(Offset, Data, _CurrentOffset, Buffer) ->
+    case Buffer of
+        #{Offset := Existing} when byte_size(Existing) >= byte_size(Data) ->
+            Buffer;
+        _ ->
+            Buffer#{Offset => Data}
+    end.
+
 %% Extract contiguous data from buffer starting at Offset
 %% Returns {Data, NewOffset, UpdatedBuffer}
 %% Uses binary append accumulator - O(1) amortized due to refc binary optimization
@@ -6768,8 +6810,52 @@ extract_contiguous_data(Buffer, Offset, Acc) ->
             NextOffset = Offset + byte_size(Data),
             extract_contiguous_data(NewBuffer, NextOffset, <<Acc/binary, Data/binary>>);
         error ->
-            %% No data at this offset (gap in stream)
-            {Acc, Offset, Buffer}
+            %% No frame starts exactly here, but one buffered earlier may
+            %% reach past this point (overlapping retransmission): deliver
+            %% its undelivered tail, or stop at a genuine gap.
+            case take_covering(Buffer, Offset) of
+                {Tail, NewBuffer} ->
+                    extract_contiguous_data(
+                        NewBuffer, Offset + byte_size(Tail), <<Acc/binary, Tail/binary>>
+                    );
+                none ->
+                    {Acc, Offset, prune_delivered(Buffer, Offset)}
+            end
+    end.
+
+%% Find the buffered frame that starts at or before Offset and reaches
+%% furthest past it; return its undelivered tail.
+take_covering(Buffer, Offset) ->
+    Best = maps:fold(
+        fun(K, V, Acc) ->
+            End = K + byte_size(V),
+            case K =< Offset andalso End > Offset of
+                true ->
+                    case Acc of
+                        {BK, BV} when BK + byte_size(BV) >= End -> Acc;
+                        _ -> {K, V}
+                    end;
+                false ->
+                    Acc
+            end
+        end,
+        none,
+        Buffer
+    ),
+    case Best of
+        none ->
+            none;
+        {K2, V2} ->
+            Skip = Offset - K2,
+            {binary:part(V2, Skip, byte_size(V2) - Skip), maps:remove(K2, Buffer)}
+    end.
+
+%% Drop buffered frames whose whole range is below the delivered point
+%% (leftovers of overlapping deliveries); they can never be extracted.
+prune_delivered(Buffer, Offset) ->
+    case map_size(Buffer) of
+        0 -> Buffer;
+        _ -> maps:filter(fun(K, V) -> K + byte_size(V) > Offset end, Buffer)
     end.
 
 %% Get the maximum stream receive window across all streams.
