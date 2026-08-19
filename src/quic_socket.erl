@@ -682,9 +682,14 @@ stop_client_receiver(Pid) when is_pid(Pid) ->
 %% exit signals from the linked owner are processed promptly rather
 %% than blocking forever in the NIF.
 client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
-    case socket:recvfrom(Socket, 0, [], 100) of
-        {ok, {#{addr := IP, port := Port}, Data}} ->
-            Owner ! {udp, Socket, IP, Port, Data},
+    %% recv_gro splits GRO-coalesced trains and sizes the read buffer
+    %% for a maximal train. A plain recvfrom here had two problems:
+    %% the default 8 KiB buffer silently truncates coalesced input,
+    %% and an unsplit train is one datagram of which the QUIC layer
+    %% can only parse the first packet.
+    case recv_gro(Socket, 100) of
+        {ok, {IP, Port}, Packets} ->
+            [Owner ! {udp, Socket, IP, Port, Data} || Data <- Packets],
             client_recv_loop(SocketState, Owner);
         {error, timeout} ->
             client_recv_loop(SocketState, Owner);
@@ -1186,8 +1191,11 @@ extra_socket_family(Extra) ->
 %%====================================================================
 
 recv_gro(Socket, Timeout) ->
-    %% Receive with GRO - may get coalesced packets
-    case socket:recvmsg(Socket, 0, 128, [], Timeout) of
+    %% Receive with GRO - may get coalesced packets. The buffer must
+    %% hold a maximally coalesced train (64 KiB): passing 0 uses the
+    %% OTP default read buffer (8 KiB) and recvmsg silently TRUNCATES
+    %% any larger train, discarding every segment past the first few.
+    case socket:recvmsg(Socket, 65535, 128, [], Timeout) of
         {ok, #{addr := #{addr := IP, port := Port}, iov := [Data], ctrl := Ctrl}} ->
             %% Check for GRO segment size in control messages
             case extract_gro_segment_size(Ctrl) of
