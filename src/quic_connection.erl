@@ -711,7 +711,7 @@ start_link(Host, Port, Opts, Owner) ->
     gen_udp:socket() | undefined
 ) -> {ok, pid()} | {error, term()}.
 start_link(Host, Port, Opts, Owner, Socket) ->
-    gen_statem:start_link(?MODULE, [Host, Port, Opts, Owner, Socket], []).
+    gen_statem:start_link(?MODULE, [Host, Port, Opts, Owner, Socket], statem_opts(Opts)).
 
 %% @doc Initiate a connection to a QUIC server.
 %% This is a convenience wrapper that starts the process and initiates handshake.
@@ -734,7 +734,22 @@ connect(Host, Port, Opts, Owner) ->
 %% Called by quic_listener when a new connection is accepted.
 -spec start_server(map()) -> {ok, pid()} | {error, term()}.
 start_server(Opts) ->
-    gen_statem:start_link(?MODULE, {server, Opts}, []).
+    gen_statem:start_link(?MODULE, {server, Opts}, statem_opts(Opts)).
+
+%% An idle connection process never garbage-collects on its own, so the
+%% garbage produced by the handshake (~170 KiB measured) stays pinned to
+%% its heap indefinitely; with tens of thousands of mostly-idle
+%% connections that dominates the VM footprint. Hibernating after a
+%% quiet period runs a fullsweep GC and shrinks the process to a few
+%% KiB. Busy connections are unaffected (the timer only fires after
+%% `hibernate_after' ms without any event).
+statem_opts(Opts) ->
+    case maps:get(hibernate_after, Opts, 5000) of
+        infinity ->
+            [];
+        T when is_integer(T), T > 0 ->
+            [{hibernate_after, T}]
+    end.
 
 %% @doc Send data on a stream.
 -spec send_data(pid(), non_neg_integer(), iodata(), boolean()) ->
