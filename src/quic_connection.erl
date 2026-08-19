@@ -234,6 +234,10 @@
 %% ACK traffic for RTT-sample granularity.
 -define(ACK_PACKET_TOLERANCE, 2).
 
+%% Default per-drain send burst budget in packets (max_burst_packets
+%% option). See the burst_budget field.
+-define(DEFAULT_MAX_BURST_PACKETS, 64).
+
 %% Max receive buffer size in bytes (32 MB total across all streams) - protects against malicious peers
 -define(MAX_RECV_BUFFER_BYTES, 33554432).
 
@@ -675,6 +679,15 @@
     %% immediately; otherwise a max_ack_delay timer (ack_timer) is
     %% armed so the peer sees an ACK at worst max_ack_delay ms after
     %% the first ack-eliciting packet in the window.
+    %% Per-drain send burst budget (max_burst_packets option). Bounds
+    %% how many packets one drain emits before the remainder is queued
+    %% and a zero-delay pacing continuation is armed, yielding to the
+    %% event loop so ACK/loss feedback interleaves with bulk sending.
+    %% Without the bound a large cwnd lets a single send event emit
+    %% hundreds of packets back-to-back, which overflows slow receivers
+    %% (GSO bursts especially) before any loss signal is seen.
+    burst_budget = ?DEFAULT_MAX_BURST_PACKETS :: pos_integer(),
+    burst_sent = 0 :: non_neg_integer(),
     ack_elicited_count = 0 :: non_neg_integer(),
     ack_timer = undefined :: reference() | undefined,
     %% Transient: classification of the most recently received 1-RTT
@@ -1154,6 +1167,7 @@ init({server, Opts}) ->
         fc_last_stream_update = undefined,
         fc_last_conn_update = undefined,
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
+        burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
         % Server-initiated bidi: 1, 5, 9, ...
         next_stream_id_bidi = 1,
         % Server-initiated uni: 3, 7, 11, ...
@@ -1535,6 +1549,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         fc_last_stream_update = undefined,
         fc_last_conn_update = undefined,
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
+        burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
         % Client-initiated bidi: 0, 4, 8, ...
         next_stream_id_bidi = 0,
         % Client-initiated uni: 2, 6, 10, ...
@@ -3551,7 +3566,8 @@ send_app_packet(Payload, State) when is_binary(Payload) ->
     send_app_packet_internal(Payload, FrameInfo, State).
 
 %% Send a 1-RTT packet with explicit frames list for retransmission tracking
-send_app_packet_internal(Payload, Frames, State) ->
+send_app_packet_internal(Payload, Frames, State0) ->
+    State = State0#state{burst_sent = State0#state.burst_sent + 1},
     #state{
         dcid = DCID,
         app_keys = {ClientKeys, ServerKeys},
@@ -8327,6 +8343,21 @@ send_stream_chunked_loop(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
     end.
 
 send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
+    case burst_exhausted(State) of
+        true ->
+            case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+                {ok, QueuedState} ->
+                    {arm_burst_continuation(QueuedState), BytesSentSoFar};
+                {error, send_queue_full} ->
+                    {error, send_queue_full}
+            end;
+        false ->
+            send_stream_chunked_step_unbudgeted(
+                StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
+            )
+    end.
+
+send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
     {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint} = Ctx,
     #state{cc_state = CCState, pacing_enabled = PacingEnabled} = State,
     Check =
@@ -8456,7 +8487,13 @@ get_stream_urgency(StreamId, Streams) ->
 %% bytes at 0 while a real entry is pending.
 process_send_queue(#state{send_queue_count = 0} = State) ->
     State;
-process_send_queue(#state{send_queue = PQ} = State) ->
+process_send_queue(State) ->
+    case burst_exhausted(State) of
+        true -> arm_burst_continuation(State);
+        false -> process_send_queue_unbudgeted(State)
+    end.
+
+process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
     case pqueue_peek(PQ) of
         empty ->
             State;
@@ -9583,11 +9620,11 @@ cancel_timer(Ref) -> erlang:cancel_timer(Ref).
 %% because zero-byte FIN-only entries can sit in the queue with bytes=0.
 handle_pacing_timeout(#state{send_queue_count = 0} = State) ->
     ?LOG_DEBUG(#{what => pacing_timeout_fired, queue_empty => true}, ?QUIC_LOG_META),
-    State;
+    State#state{burst_sent = 0};
 handle_pacing_timeout(State) ->
     ?LOG_DEBUG(#{what => pacing_timeout_fired, queue_empty => false}, ?QUIC_LOG_META),
-    %% Process the send queue
-    State1 = process_send_queue(State),
+    %% Fresh drain: reset the burst budget, then process the send queue
+    State1 = process_send_queue(State#state{burst_sent = 0}),
     %% If there's still queued data and pacing is blocking, set another timer
     State2 = maybe_reschedule_pacing(State1),
     %% Event-driven flush: flush batch and timers after pacing timeout processing
@@ -9717,6 +9754,21 @@ maybe_set_pacing_timer(Delay, #state{pacing_timer = undefined} = State) ->
     ?LOG_DEBUG(#{what => pacing_timer_set, delay_ms => Delay}, ?QUIC_LOG_META),
     Ref = make_ref(),
     erlang:send_after(Delay, self(), {pacing_timeout, Ref}),
+    State#state{pacing_timer = Ref}.
+
+%% Burst budget: bounds packets emitted per drain (see burst_budget).
+burst_exhausted(#state{burst_sent = Sent, burst_budget = Budget}) ->
+    Sent >= Budget.
+
+%% Arm a zero-delay pacing continuation so the queued remainder is
+%% drained in the next event-loop pass, after any pending ACK / loss
+%% feedback in the mailbox. Reuses the pacing timer and message so the
+%% drain and stale-reference handling are shared with real pacing.
+arm_burst_continuation(#state{pacing_timer = Ref} = State) when Ref =/= undefined ->
+    State;
+arm_burst_continuation(State) ->
+    Ref = make_ref(),
+    erlang:send_after(0, self(), {pacing_timeout, Ref}),
     State#state{pacing_timer = Ref}.
 
 %% Convert state to map for debugging
