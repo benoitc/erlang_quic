@@ -61,6 +61,7 @@
     %% Queries
     sent_packets/1,
     bytes_in_flight/1,
+    last_progress/1,
     pto_count/1,
     oldest_unacked/1,
     has_rtt_sample/1
@@ -100,6 +101,12 @@
     %% Loss detection
     loss_time = undefined :: non_neg_integer() | undefined,
     time_of_last_ack = undefined :: non_neg_integer() | undefined,
+
+    %% When the current outstanding burst started: set whenever an
+    %% ack-eliciting packet is sent while nothing was in flight. Used
+    %% together with time_of_last_ack as the anchor for the disconnect
+    %% timeout, so a fresh send after a quiet period cannot trip it.
+    outstanding_since = undefined :: non_neg_integer() | undefined,
 
     %% PTO
     pto_count = 0 :: non_neg_integer(),
@@ -191,12 +198,18 @@ on_packet_sent(
             true -> InFlight + Size;
             false -> InFlight
         end,
+    OutstandingSince =
+        case AckEliciting andalso InFlight =:= 0 of
+            true -> Now;
+            false -> State#loss_state.outstanding_since
+        end,
     %% NOTE: pto_count is NOT reset here per RFC 9002.
     %% PTO count is only reset when receiving an ACK (in on_ack_received).
     %% Resetting on send would break exponential backoff for probe retransmissions.
     State#loss_state{
         sent_q = queue:in(SentPacket, Q),
-        bytes_in_flight = NewInFlight
+        bytes_in_flight = NewInFlight,
+        outstanding_since = OutstandingSince
     }.
 
 %% @doc Process an ACK frame.
@@ -523,6 +536,14 @@ bytes_in_flight(#loss_state{bytes_in_flight = B}) -> B.
 %% @doc Get current PTO count.
 -spec pto_count(loss_state()) -> non_neg_integer().
 pto_count(#loss_state{pto_count = C}) -> C.
+
+%% @doc Latest sign of forward progress for the disconnect timeout: the
+%% last received ACK, or the start of the current outstanding burst,
+%% whichever is later. undefined until either has happened.
+-spec last_progress(loss_state()) -> non_neg_integer() | undefined.
+last_progress(#loss_state{time_of_last_ack = undefined, outstanding_since = O}) -> O;
+last_progress(#loss_state{time_of_last_ack = A, outstanding_since = undefined}) -> A;
+last_progress(#loss_state{time_of_last_ack = A, outstanding_since = O}) -> max(A, O).
 
 %% @doc Get the oldest unacked packet (for PTO probe selection).
 %% Returns {ok, #sent_packet{}} or none. Head of the sent queue is
