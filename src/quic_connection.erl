@@ -682,6 +682,12 @@
     %% armed so the peer sees an ACK at worst max_ack_delay ms after
     %% the first ack-eliciting packet in the window.
     ack_elicited_count = 0 :: non_neg_integer(),
+    %% How many ack-eliciting 1-RTT packets to accumulate before
+    %% flushing an ACK. 2 is the RFC 9000 §13.2.1 recommendation;
+    %% higher values trade ACK traffic (and receiver CPU) for RTT
+    %% sample granularity and slower loss feedback, bounded by the
+    %% max_ack_delay timer either way.
+    ack_packet_tolerance = ?ACK_PACKET_TOLERANCE :: pos_integer(),
     ack_timer = undefined :: reference() | undefined,
     %% Transient: classification of the most recently received 1-RTT
     %% packet. Set by `record_received_pn/3' and consumed once by
@@ -1171,6 +1177,7 @@ init({server, Opts}) ->
         fc_last_stream_update = undefined,
         fc_last_conn_update = undefined,
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
+        ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
         % Server-initiated bidi: 1, 5, 9, ...
         next_stream_id_bidi = 1,
         % Server-initiated uni: 3, 7, 11, ...
@@ -1553,6 +1560,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         fc_last_stream_update = undefined,
         fc_last_conn_update = undefined,
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
+        ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
         % Client-initiated bidi: 0, 4, 8, ...
         next_stream_id_bidi = 0,
         % Client-initiated uni: 2, 6, 10, ...
@@ -4726,14 +4734,22 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                         LostPackets
                     ),
 
-                    %% Handle PMTU probe ACKs
-                    State2 = lists:foldl(
-                        fun(#sent_packet{pn = PN}, S) ->
-                            handle_pmtu_probe_ack(PN, S)
+                    %% Handle PMTU probe ACKs. Only walk the acked list when a
+                    %% probe is actually outstanding - the common bulk-ACK case
+                    %% has none and skips the per-packet fold.
+                    State2 =
+                        case pmtu_probe_outstanding(State1) of
+                            true ->
+                                lists:foldl(
+                                    fun(#sent_packet{pn = PN}, S) ->
+                                        handle_pmtu_probe_ack(PN, S)
+                                    end,
+                                    State1,
+                                    AckedPackets
+                                );
+                            false ->
+                                State1
                         end,
-                        State1,
-                        AckedPackets
-                    ),
 
                     %% Handle PMTU probe losses
                     %% Pass packet size directly since packets are removed from sent_packets
@@ -7017,7 +7033,7 @@ maybe_send_ack(_, _, State) ->
 %% the counter and arm a max_ack_delay timer (if not already armed).
 maybe_decimate_app_ack(State) ->
     NewCount = State#state.ack_elicited_count + 1,
-    case NewCount >= ?ACK_PACKET_TOLERANCE of
+    case NewCount >= State#state.ack_packet_tolerance of
         true ->
             send_app_ack(State);
         false ->
@@ -11547,6 +11563,13 @@ maybe_set_pmtu_raise_timer(#state{pmtu_raise_timer = undefined} = State) ->
     State#state{pmtu_raise_timer = Ref};
 maybe_set_pmtu_raise_timer(State) ->
     State.
+
+%% Whether a PMTU probe packet is in flight awaiting ACK/loss.
+-spec pmtu_probe_outstanding(#state{}) -> boolean().
+pmtu_probe_outstanding(#state{pmtu_state = undefined}) ->
+    false;
+pmtu_probe_outstanding(#state{pmtu_state = #pmtu_state{probe_pn = ProbePN}}) ->
+    ProbePN =/= undefined.
 
 %% @doc Handle ACK of a potential PMTU probe packet.
 -spec handle_pmtu_probe_ack(non_neg_integer(), #state{}) -> #state{}.
