@@ -527,10 +527,13 @@ flush(#socket_state{gso_supported = true, batch_buffer = Buffer, gso_size = GSO}
     %% exactly gso_size. Handshake flights coalesce Initial-padded-to-
     %% 1200 with a ~400 byte Handshake packet; a naive GSO split
     %% mis-aligns those boundaries and the client cannot decode. When
-    %% the batch is not uniform, fall through to individual sends.
+    %% the batch is not uniform, split it into runs of equal-sized
+    %% packets and GSO each run: a single odd-sized packet (an ACK or a
+    %% flow-control update between data packets) otherwise degrades the
+    %% whole batch to one sendmsg per packet.
     case gso_batch_uniform(Buffer, GSO) of
         true -> flush_gso(State);
-        false -> flush_individual(State)
+        false -> flush_gso_runs(State)
     end;
 flush(#socket_state{} = State) ->
     %% Fallback path - send packets individually
@@ -970,6 +973,97 @@ flush_individual(#socket_state{backend = socket} = State) ->
     flush_individual_socket(State);
 flush_individual(#socket_state{backend = gen_udp} = State) ->
     flush_individual_genudp(State).
+
+%% Mixed-size batch on a GSO socket: send it as runs of equal-sized
+%% packets, each run in one UDP_SEGMENT sendmsg, odd-sized packets
+%% individually, preserving wire order. A run may absorb one shorter
+%% trailing packet (the kernel allows a short final segment).
+flush_gso_runs(
+    #socket_state{
+        socket = Socket,
+        batch_buffer = Buffer,
+        batch_addr = {IP, Port}
+    } = State
+) ->
+    Packets = lists:reverse(Buffer),
+    Dest = #{family => family(IP), addr => IP, port => Port},
+    case send_runs(Socket, Dest, split_uniform_runs(Packets)) of
+        ok ->
+            {ok, record_flush(State)};
+        {error, Reason} ->
+            ?LOG_WARNING(#{what => gso_run_send_error, reason => Reason}),
+            {error, Reason, clear_batch(State)}
+    end.
+
+%% Group an oldest-first packet list into {gso, SegmentSize, Packets}
+%% runs (>= 2 packets, all SegmentSize except possibly a shorter last)
+%% and {single, Packet} entries, preserving order.
+split_uniform_runs([]) ->
+    [];
+split_uniform_runs([P | Rest]) ->
+    split_uniform_runs(Rest, iolist_size(P), [P]).
+
+split_uniform_runs([], _Size, [Single]) ->
+    [{single, Single}];
+split_uniform_runs([], Size, RunAcc) ->
+    [{gso, Size, lists:reverse(RunAcc)}];
+split_uniform_runs([P | Rest], Size, RunAcc) ->
+    PSize = iolist_size(P),
+    if
+        PSize =:= Size ->
+            split_uniform_runs(Rest, Size, [P | RunAcc]);
+        PSize < Size ->
+            %% Shorter packet closes this run as its final segment
+            %% (the kernel permits a short last segment).
+            [{gso, Size, lists:reverse([P | RunAcc])} | split_uniform_runs(Rest)];
+        true ->
+            Head =
+                case RunAcc of
+                    [Single] -> {single, Single};
+                    _ -> {gso, Size, lists:reverse(RunAcc)}
+                end,
+            [Head | split_uniform_runs(Rest, PSize, [P])]
+    end.
+
+send_runs(_Socket, _Dest, []) ->
+    ok;
+send_runs(Socket, Dest, [{single, Packet} | Rest]) ->
+    Msg = #{addr => Dest, iov => [normalize_packet(Packet)]},
+    case socket:sendmsg(Socket, Msg) of
+        ok -> send_runs(Socket, Dest, Rest);
+        {ok, _RestData} -> send_runs(Socket, Dest, Rest);
+        {error, _} = Error -> Error
+    end;
+send_runs(Socket, Dest, [{gso, SegmentSize, Packets} | Rest]) ->
+    PacketIov = [normalize_packet(P) || P <- Packets],
+    Msg = #{
+        addr => Dest,
+        iov => PacketIov,
+        ctrl => [#{level => udp, type => ?UDP_SEGMENT, data => <<SegmentSize:16/native>>}]
+    },
+    case socket:sendmsg(Socket, Msg) of
+        ok ->
+            send_runs(Socket, Dest, Rest);
+        {ok, RestData} ->
+            %% Kernel refused part of the segmented write: send the
+            %% remainder segment-by-segment, then continue with the
+            %% remaining runs (mirrors flush_gso_partial).
+            Data = iolist_to_binary(RestData),
+            case send_run_segments(Socket, Dest, split_into_segments(Data, SegmentSize)) of
+                ok -> send_runs(Socket, Dest, Rest);
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+send_run_segments(_Socket, _Dest, []) ->
+    ok;
+send_run_segments(Socket, Dest, [Packet | Rest]) ->
+    case socket:sendto(Socket, Packet, Dest) of
+        ok -> send_run_segments(Socket, Dest, Rest);
+        {error, _} = Error -> Error
+    end.
 
 flush_individual_socket(
     #socket_state{
