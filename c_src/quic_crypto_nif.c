@@ -13,7 +13,7 @@
  * whose NIF calls are sequential.
  *
  * The pure-Erlang code path remains the fallback when this NIF is not
- * built or fails to load; see quic_crypto.erl.
+ * built or fails to load; see quic_aead_ctx.erl.
  */
 
 #include <erl_nif.h>
@@ -162,8 +162,8 @@ seal(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     (void)argc;
     if (enif_get_resource(env, argv[0], qc_ctx_type, (void **)&c) == 0 || c->enc != 1 ||
         enif_inspect_binary(env, argv[1], &nonce) == 0 || nonce.size != NONCE_LEN ||
-        enif_inspect_binary(env, argv[2], &aad) == 0 ||
-        enif_inspect_binary(env, argv[3], &plain) == 0)
+        enif_inspect_iolist_as_binary(env, argv[2], &aad) == 0 ||
+        enif_inspect_iolist_as_binary(env, argv[3], &plain) == 0)
         return enif_make_tuple2(env, am_error, am_badarg);
 
     out = enif_make_new_binary(env, plain.size + TAG_LEN, &out_term);
@@ -196,8 +196,8 @@ open_(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     (void)argc;
     if (enif_get_resource(env, argv[0], qc_ctx_type, (void **)&c) == 0 || c->enc != 0 ||
         enif_inspect_binary(env, argv[1], &nonce) == 0 || nonce.size != NONCE_LEN ||
-        enif_inspect_binary(env, argv[2], &aad) == 0 ||
-        enif_inspect_binary(env, argv[3], &ct) == 0 ||
+        enif_inspect_iolist_as_binary(env, argv[2], &aad) == 0 ||
+        enif_inspect_iolist_as_binary(env, argv[3], &ct) == 0 ||
         enif_inspect_binary(env, argv[4], &tag) == 0 || tag.size != TAG_LEN)
         return enif_make_tuple2(env, am_error, am_badarg);
 
