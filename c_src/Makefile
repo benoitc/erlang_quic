@@ -3,6 +3,12 @@
 # loading this NIF never pins an incompatible OpenSSL into the VM
 # before crypto.so loads. Falls back to plain -lcrypto when the
 # lookup fails.
+#
+# Best effort by design: the NIF is a pure accelerator with a
+# pure-Erlang fallback, so a missing toolchain or missing OpenSSL
+# headers must not fail the build of a project that embeds this
+# library (erlang.mk runs this Makefile unconditionally when it
+# exists). A failed compile prints a warning and succeeds.
 
 ERTS_INCLUDE := $(shell erl -noshell -eval 'io:format("~ts/erts-~ts/include", [code:root_dir(), erlang:system_info(version)]), halt().')
 CRYPTO_SO := $(shell erl -noshell -eval 'io:format("~ts", [filename:join([code:lib_dir(crypto), "priv", "lib", "crypto.so"])]), halt().')
@@ -18,11 +24,18 @@ LDFLAGS += -L$(OPENSSL_LIBDIR) -Wl,-rpath,$(OPENSSL_LIBDIR)
 CFLAGS += -I$(OPENSSL_LIBDIR)../include
 endif
 
+all: $(PRIV)/quic_crypto_nif.so
+
 $(PRIV)/quic_crypto_nif.so: quic_crypto_nif.c
-	mkdir -p $(PRIV)
-	$(CC) $(CFLAGS) -fPIC -shared -o $@ $< -I"$(ERTS_INCLUDE)" $(LDFLAGS) $(LDLIBS)
+	@mkdir -p $(PRIV)
+	@if $(CC) $(CFLAGS) -fPIC -shared -o $@ $< -I"$(ERTS_INCLUDE)" $(LDFLAGS) $(LDLIBS); then \
+	    echo "quic_crypto_nif: built $@"; \
+	else \
+	    echo "quic_crypto_nif: build failed (missing toolchain or OpenSSL headers?);" \
+	         "the pure-Erlang crypto path will be used" >&2; \
+	fi
 
 clean:
 	rm -f $(PRIV)/quic_crypto_nif.so
 
-.PHONY: clean
+.PHONY: all clean
