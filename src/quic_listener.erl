@@ -111,8 +111,15 @@
 ]).
 
 -ifdef(TEST).
--export([send_packet/6, compute_stateless_reset_token/2, build_stateless_reset/2]).
+-export([
+    send_packet/6,
+    compute_stateless_reset_token/2,
+    build_stateless_reset/2,
+    send_packets_to_connection/3
+]).
 -endif.
+
+-export([recv_drops/0]).
 
 -include("quic.hrl").
 -include_lib("kernel/include/logger.hrl").
@@ -600,13 +607,60 @@ group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
             group_packets_by_conn(Rest, DCIDLen, Conns, Acc)
     end.
 
-%% Send batched packets to a connection
-send_packets_to_connection(ConnPid, [Packet], RemoteAddr) ->
-    %% Single packet - use existing message format
-    ConnPid ! {quic_packet, Packet, RemoteAddr};
+%% Send batched packets to a connection. Tail-drops when the
+%% connection's mailbox is over ?MAX_CONN_RECV_QUEUE_MSGS - see the
+%% define for rationale.
 send_packets_to_connection(ConnPid, Packets, RemoteAddr) ->
-    %% Multiple packets - use batched message
-    ConnPid ! {quic_packets, Packets, RemoteAddr}.
+    case erlang:process_info(ConnPid, message_queue_len) of
+        {message_queue_len, QLen} when QLen > ?MAX_CONN_RECV_QUEUE_MSGS ->
+            %% Over the bound: keep one packet of the train so the peer
+            %% still gets a timely (dup-)ACK carrying the loss signal,
+            %% drop the rest - per-packet-ish drops beat losing whole
+            %% GRO trains, which fragments ACK ranges and provokes
+            %% retransmit storms.
+            count_recv_drop(length(Packets) - 1),
+            ConnPid ! {quic_packet, hd(Packets), RemoteAddr},
+            ok;
+        _ ->
+            forward_packet_chunks(ConnPid, Packets, RemoteAddr)
+    end.
+
+%% Forward a train in =< ?MAX_PACKETS_PER_CONN_MSG chunks so the
+%% mailbox bound above translates to a bounded packet backlog.
+forward_packet_chunks(ConnPid, [Packet], RemoteAddr) ->
+    ConnPid ! {quic_packet, Packet, RemoteAddr},
+    ok;
+forward_packet_chunks(ConnPid, Packets, RemoteAddr) ->
+    case length(Packets) =< ?MAX_PACKETS_PER_CONN_MSG of
+        true ->
+            ConnPid ! {quic_packets, Packets, RemoteAddr},
+            ok;
+        false ->
+            {Chunk, Rest} = lists:split(?MAX_PACKETS_PER_CONN_MSG, Packets),
+            ConnPid ! {quic_packets, Chunk, RemoteAddr},
+            forward_packet_chunks(ConnPid, Rest, RemoteAddr)
+    end.
+
+%% Bench diagnostic: global tail-drop counter, readable via
+%% quic_listener:recv_drops/0.
+count_recv_drop(N) ->
+    Ref =
+        case persistent_term:get({?MODULE, recv_drops}, undefined) of
+            undefined ->
+                R = atomics:new(1, []),
+                persistent_term:put({?MODULE, recv_drops}, R),
+                R;
+            R ->
+                R
+        end,
+    atomics:add(Ref, 1, N).
+
+-spec recv_drops() -> non_neg_integer().
+recv_drops() ->
+    case persistent_term:get({?MODULE, recv_drops}, undefined) of
+        undefined -> 0;
+        Ref -> atomics:get(Ref, 1)
+    end.
 
 %% @doc false
 terminate(_Reason, #listener_state{

@@ -224,6 +224,17 @@ All notable changes to this project will be documented in this file.
   millisecond resolution, so the fixed bucket capped throughput at 12
   packets per wakeup whenever the sender outran the ACK clock,
   regardless of the configured rate. Contributed by jbevemyr (#219).
+- The connected-state receive pass drains the datagram messages already
+  queued in the connection's mailbox (up to 64) before flushing ACKs,
+  socket batches and timers, so those flushes amortize over a train
+  instead of running once per datagram. On the socket backend the
+  listener and the client receiver now emulate a bounded kernel receive
+  buffer: trains are forwarded in chunks of at most 8 packets and
+  tail-dropped once the connection's mailbox holds more than 32
+  messages, keeping the head packet so the peer still gets a timely
+  ACK. An unbounded mailbox turned receiver overload into queueing
+  delay instead of loss, which inflated the peer's RTT samples and
+  destabilized its loss detector.
 ### Changed
 - A server with no explicit `groups` option now offers every classical
   group the crypto layer supports (x25519, secp256r1, secp384r1) instead

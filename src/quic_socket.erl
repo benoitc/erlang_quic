@@ -59,7 +59,8 @@
     info/1,
     start_client_receiver/2,
     stop_client_receiver/1,
-    set_socket/2
+    set_socket/2,
+    client_recv_drops/0
 ]).
 
 -include("quic.hrl").
@@ -135,7 +136,8 @@
 -export([
     extract_gro_segment_size/1,
     split_gro_packets/2,
-    split_uniform_runs/1
+    split_uniform_runs/1,
+    forward_to_owner/5
 ]).
 -endif.
 
@@ -688,11 +690,8 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
     %% trains, not packets, and the whole train is processed in one
     %% receive pass.
     case recv_gro(Socket, 100) of
-        {ok, {IP, Port}, [Single]} ->
-            Owner ! {udp, Socket, IP, Port, Single},
-            client_recv_loop(SocketState, Owner);
         {ok, {IP, Port}, Packets} ->
-            Owner ! {udp_batch, Socket, IP, Port, Packets},
+            forward_to_owner(Owner, Socket, IP, Port, Packets),
             client_recv_loop(SocketState, Owner);
         {error, timeout} ->
             client_recv_loop(SocketState, Owner);
@@ -701,6 +700,40 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
         {error, Reason} ->
             ?LOG_WARNING(#{what => client_recv_loop_exit, reason => Reason}),
             ok
+    end.
+
+%% Bench diagnostic: client-receiver tail-drop counter.
+%% Tail-drop over ?MAX_CONN_RECV_QUEUE_MSGS, emulating a bounded
+%% kernel rcvbuf (see the define for rationale).
+forward_to_owner(Owner, Socket, IP, Port, Packets) ->
+    case erlang:process_info(Owner, message_queue_len) of
+        {message_queue_len, QLen} when QLen > ?MAX_CONN_RECV_QUEUE_MSGS ->
+            count_client_recv_drop(length(Packets));
+        _ ->
+            case Packets of
+                [Single] -> Owner ! {udp, Socket, IP, Port, Single};
+                _ -> Owner ! {udp_batch, Socket, IP, Port, Packets}
+            end,
+            ok
+    end.
+
+count_client_recv_drop(N) ->
+    Ref =
+        case persistent_term:get({?MODULE, recv_drops}, undefined) of
+            undefined ->
+                R = atomics:new(1, []),
+                persistent_term:put({?MODULE, recv_drops}, R),
+                R;
+            R ->
+                R
+        end,
+    atomics:add(Ref, 1, N).
+
+-spec client_recv_drops() -> non_neg_integer().
+client_recv_drops() ->
+    case persistent_term:get({?MODULE, recv_drops}, undefined) of
+        undefined -> 0;
+        Ref -> atomics:get(Ref, 1)
     end.
 
 %% @doc Detect platform capabilities for GSO/GRO. Context-free wrapper that

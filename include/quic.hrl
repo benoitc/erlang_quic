@@ -409,6 +409,23 @@
 -define(DEFAULT_MAX_BATCH_PACKETS, 64).
 %% Default GSO segment size (QUIC packet size for batching)
 -define(DEFAULT_GSO_SEGMENT_SIZE, 1200).
+
+%% Max messages allowed in a connection process mailbox before the
+%% socket-backend receive path tail-drops incoming datagrams, emulating
+%% a bounded kernel receive buffer. Without a bound a fast sender turns
+%% receiver overload into unbounded queueing delay instead of loss;
+%% inflated RTT samples and spurious loss detection then destabilize
+%% the peer's congestion controller. Early tail drop gives it a clean
+%% loss signal at a bounded queue depth, like gen_udp + kernel rcvbuf.
+-define(MAX_CONN_RECV_QUEUE_MSGS, 32).
+
+%% Max packets per {quic_packets, ...} message forwarded to a
+%% connection. GRO can aggregate trains of ~44 packets; forwarded
+%% whole, the mailbox bound above cannot cap queueing DELAY (a message
+%% may be 1 or 44 packets). Splitting trains keeps the worst-case
+%% queued backlog, and thus the RTT inflation seen by the peer's loss
+%% detector, small and predictable.
+-define(MAX_PACKETS_PER_CONN_MSG, 8).
 %% Kernel limits on a single UDP_SEGMENT write: UDP_MAX_SEGMENTS segments,
 %% and a payload that still fits a 16-bit UDP length. A run larger than
 %% either is split across writes.
