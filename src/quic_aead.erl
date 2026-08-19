@@ -88,10 +88,7 @@ encrypt(Key, IV, PN, AAD, Plaintext) ->
     binary().
 encrypt(Key, IV, PN, AAD, Plaintext, Cipher) ->
     Nonce = compute_nonce(IV, PN),
-    {Ciphertext, Tag} = crypto:crypto_one_time_aead(
-        Cipher, Key, Nonce, Plaintext, AAD, ?TAG_LEN, true
-    ),
-    <<Ciphertext/binary, Tag/binary>>.
+    quic_aead_ctx:aead_encrypt(Cipher, Key, Nonce, Plaintext, AAD).
 
 %% @doc Decrypt a QUIC packet payload using AEAD.
 %%
@@ -110,11 +107,7 @@ decrypt(Key, IV, PN, AAD, CiphertextWithTag, Cipher) ->
     Nonce = compute_nonce(IV, PN),
     CipherLen = byte_size(CiphertextWithTag) - ?TAG_LEN,
     <<Ciphertext:CipherLen/binary, Tag:?TAG_LEN/binary>> = CiphertextWithTag,
-    case
-        crypto:crypto_one_time_aead(
-            Cipher, Key, Nonce, Ciphertext, AAD, Tag, false
-        )
-    of
+    case quic_aead_ctx:aead_decrypt(Cipher, Key, Nonce, Ciphertext, AAD, Tag) of
         Plaintext when is_binary(Plaintext) ->
             {ok, Plaintext};
         error ->
@@ -252,11 +245,10 @@ cipher_for_key(Key) when byte_size(Key) =:= 32 -> aes_256_gcm.
 %% Compute header protection mask
 compute_hp_mask(aes_128_gcm, HP, Sample) ->
     %% AES-ECB encryption of sample
-    crypto:crypto_one_time(aes_128_ecb, HP, Sample, true);
+    quic_aead_ctx:hp_block(aes_128_ecb, HP, Sample);
 compute_hp_mask(aes_256_gcm, HP, Sample) ->
-    %% AES-ECB encryption of sample (use first 16 bytes of 32-byte key)
-    %% Actually, HP for AES-256 is 32 bytes, use aes_256_ecb
-    crypto:crypto_one_time(aes_256_ecb, HP, Sample, true);
+    %% HP for AES-256 is 32 bytes, use aes_256_ecb
+    quic_aead_ctx:hp_block(aes_256_ecb, HP, Sample);
 compute_hp_mask(chacha20_poly1305, HP, Sample) ->
     %% ChaCha20 with counter=0 and the sample as nonce
     %% Sample is 16 bytes: first 4 = counter, last 12 = nonce
@@ -362,10 +354,7 @@ protect_long_packet(Cipher, Key, IV, HP, PN, HeaderPrefix, Plaintext) ->
 protect_packet_common(Cipher, Key, IV, HP, PN, HeaderPrefix, PNBin, Plaintext) ->
     AAD = <<HeaderPrefix/binary, PNBin/binary>>,
     Nonce = compute_nonce(IV, PN),
-    {Ciphertext, Tag} = crypto:crypto_one_time_aead(
-        Cipher, Key, Nonce, Plaintext, AAD, ?TAG_LEN, true
-    ),
-    EncryptedPayload = <<Ciphertext/binary, Tag/binary>>,
+    EncryptedPayload = quic_aead_ctx:aead_encrypt(Cipher, Key, Nonce, Plaintext, AAD),
     PNOffset = byte_size(HeaderPrefix),
     ProtectedHeader = protect_header(Cipher, HP, AAD, EncryptedPayload, PNOffset),
     <<ProtectedHeader/binary, EncryptedPayload/binary>>.
@@ -443,11 +432,7 @@ unprotect_packet_common(Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRe
             Nonce = compute_nonce(IV, PN),
             CipherLen = byte_size(Ciphertext) - ?TAG_LEN,
             <<CiphertextOnly:CipherLen/binary, Tag:?TAG_LEN/binary>> = Ciphertext,
-            case
-                crypto:crypto_one_time_aead(
-                    Cipher, Key, Nonce, CiphertextOnly, AAD, Tag, false
-                )
-            of
+            case quic_aead_ctx:aead_decrypt(Cipher, Key, Nonce, CiphertextOnly, AAD, Tag) of
                 Plaintext when is_binary(Plaintext) ->
                     {ok, PN, UnprotectedHeader, Plaintext};
                 error ->
@@ -530,7 +515,7 @@ decrypt_short_payload(
     Nonce = compute_nonce(IV, PN),
     CipherLen = byte_size(Ciphertext) - ?TAG_LEN,
     <<CiphertextOnly:CipherLen/binary, Tag:?TAG_LEN/binary>> = Ciphertext,
-    case crypto:crypto_one_time_aead(Cipher, Key, Nonce, CiphertextOnly, AAD, Tag, false) of
+    case quic_aead_ctx:aead_decrypt(Cipher, Key, Nonce, CiphertextOnly, AAD, Tag) of
         Plaintext when is_binary(Plaintext) ->
             {ok, PN, Plaintext};
         error ->

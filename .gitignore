@@ -33,3 +33,4 @@ certs/*.pem
 certs/*.key
 doc/
 rebar3.crashdump
+/priv/quic_crypto_nif.so
