@@ -30,7 +30,8 @@
     listener_start_stop/1,
     listener_get_port/1,
     server_connection_batches_by_default/1,
-    server_connection_batching_opt_out/1
+    server_connection_batching_opt_out/1,
+    disconnect_timeout_on_unresponsive_peer/1
 ]).
 
 %%====================================================================
@@ -49,7 +50,8 @@ groups() ->
             listener_start_stop,
             listener_get_port,
             server_connection_batches_by_default,
-            server_connection_batching_opt_out
+            server_connection_batching_opt_out,
+            disconnect_timeout_on_unresponsive_peer
         ]}
     ].
 
@@ -177,6 +179,50 @@ server_connection_batching_opt_out(Config) ->
         ?assertEqual(false, maps:get(send_batching_enabled, Info)),
         ?assertEqual(false, maps:get(send_gso_supported, Info)),
         quic:close(Conn)
+    after
+        quic_test_echo_server:stop(Echo)
+    end,
+    Config.
+
+%% A peer that stops responding while we have data in flight must be
+%% declared dead by the disconnect timeout, well before the idle
+%% timeout. A restarted peer's stateless resets are unrecognisable
+%% (issue #202), so without this the connection lingers for the whole
+%% idle timeout.
+disconnect_timeout_on_unresponsive_peer(Config) ->
+    {ok, Echo} = quic_test_echo_server:start(),
+    #{name := Name, port := Port} = Echo,
+    try
+        Opts = maps:merge(quic_test_echo_server:client_opts(), #{
+            disconnect_timeout => 2000,
+            idle_timeout => 60000
+        }),
+        {ok, Conn} = quic:connect("127.0.0.1", Port, Opts, self()),
+        receive
+            {quic, Conn, {connected, _}} -> ok
+        after 5000 ->
+            ct:fail("client handshake timed out")
+        end,
+        {ok, [ServerPid | _]} = quic:get_server_connections(Name),
+        %% Freeze the server side: packets pile up in its mailbox but
+        %% nothing is processed or acknowledged.
+        ok = sys:suspend(ServerPid),
+        {ok, Sid} = quic:open_stream(Conn),
+        ok = quic:send_data(Conn, Sid, <<"are you there?">>, false),
+        T0 = erlang:monotonic_time(millisecond),
+        Reason =
+            receive
+                {quic, Conn, {closed, R}} -> R
+            after 20000 ->
+                ct:fail("connection not closed by disconnect timeout")
+            end,
+        Elapsed = erlang:monotonic_time(millisecond) - T0,
+        ct:log("closed after ~b ms with reason ~p", [Elapsed, Reason]),
+        %% Must fire on the 2 s disconnect timeout (plus PTO cadence),
+        %% far below the 60 s idle timeout.
+        ?assertEqual(disconnect_timeout, Reason),
+        ?assert(Elapsed < 15000),
+        ok = sys:resume(ServerPid)
     after
         quic_test_echo_server:stop(Echo)
     end,
