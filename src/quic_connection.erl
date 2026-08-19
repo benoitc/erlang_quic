@@ -3955,13 +3955,35 @@ handle_packet_loop(Data, State) ->
             maybe_reenable_socket(State),
             State;
         {error, Reason} ->
-            %% Log decryption failure for debugging
+            %% Log decryption failure for debugging. Include the packet
+            %% source, our CID expectation and the datagram head/tail so
+            %% a misrouted datagram, a foreign connection's packet or a
+            %% stateless reset can be told apart from a key/nonce bug.
             ?LOG_WARNING(
                 #{
                     what => packet_decode_decrypt_failed,
                     role => State#state.role,
                     reason => Reason,
-                    size => byte_size(Data)
+                    size => byte_size(Data),
+                    source => State#state.current_packet_source,
+                    scid => binhex(State#state.scid),
+                    dcid => binhex(State#state.dcid),
+                    known_reset_tokens => [
+                        {
+                            E#cid_entry.seq_num,
+                            binhex(E#cid_entry.cid),
+                            binhex(E#cid_entry.stateless_reset_token)
+                        }
+                     || E <- State#state.peer_cid_pool
+                    ],
+                    head => binhex(binary:part(Data, 0, min(16, byte_size(Data)))),
+                    tail => binhex(
+                        binary:part(
+                            Data,
+                            byte_size(Data) - min(16, byte_size(Data)),
+                            min(16, byte_size(Data))
+                        )
+                    )
                 },
                 ?QUIC_LOG_META
             ),
@@ -3969,6 +3991,9 @@ handle_packet_loop(Data, State) ->
             maybe_reenable_socket(State),
             State
     end.
+
+binhex(Bin) when is_binary(Bin) -> binary:encode_hex(Bin);
+binhex(Other) -> Other.
 
 %% Re-enable socket for receiving - only for client connections.
 %% Server connections use listener's socket which is managed by the listener.
@@ -10809,10 +10834,36 @@ add_peer_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
                 State
             );
         false ->
+            %% RFC 9000 §5.1.2: if the CID we are sending with is among
+            %% the retired ones, switch to an active CID BEFORE retiring.
+            %% Keeping a retired DCID makes the peer eventually treat our
+            %% packets as unroutable and answer with stateless resets
+            %% whose token we discarded with the pruned pool entry - the
+            %% connection goes irrecoverably deaf.
+            State0 = maybe_replace_retired_dcid(State#state{peer_cid_pool = NewPool}),
             %% Send RETIRE_CONNECTION_ID for the now-retired CIDs, then drop
             %% them from the pool so it cannot grow without bound.
-            State1 = retire_peer_cids(RetirePrior, State#state{peer_cid_pool = NewPool}),
+            State1 = retire_peer_cids(RetirePrior, State0),
             prune_retired_peer_cids(State1)
+    end.
+
+maybe_replace_retired_dcid(#state{peer_cid_pool = Pool, dcid = DCID} = State) ->
+    case lists:keyfind(DCID, #cid_entry.cid, Pool) of
+        #cid_entry{status = retired} ->
+            case find_unused_cid(Pool, DCID) of
+                {ok, NewCID} ->
+                    ?LOG_DEBUG(
+                        #{what => dcid_retired_switching, new_cid => NewCID},
+                        ?QUIC_LOG_META
+                    ),
+                    State#state{dcid = NewCID};
+                not_found ->
+                    %% Peer retired every CID we hold without providing a
+                    %% replacement; keep the old one (peer protocol error).
+                    State
+            end;
+        _ ->
+            State
     end.
 
 retire_if_below(RetirePrior, #cid_entry{seq_num = S} = Entry) when S < RetirePrior ->
