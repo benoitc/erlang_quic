@@ -24,6 +24,15 @@ All notable changes to this project will be documented in this file.
   ACK. An unbounded mailbox turned receiver overload into queueing
   delay instead of loss, which inflated the peer's RTT samples and
   destabilized its loss detector.
+- Count-based ACK decimation defers its flush while a receive pass is
+  active, so one ACK covers the whole drained train instead of one per
+  `ack_packet_tolerance` packets. A 64-packet pass previously emitted
+  about 32 ACKs, each costing a packet build, an AEAD seal and a send
+  on the receiver and a decrypt plus ACK-frame pass on the sender; it
+  also released the sender's window in 2-3 packet quanta, which kept
+  GSO batches near size 1. The max_ack_delay timer still bounds ACK
+  latency for below-tolerance remainders and the reordering
+  immediate-ACK path is unchanged.
 
 ## [1.8.2] - 2026-09-05
 
