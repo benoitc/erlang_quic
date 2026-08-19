@@ -550,6 +550,13 @@
     keep_alive_interval :: non_neg_integer() | disabled,
     keep_alive_timer :: reference() | undefined,
 
+    %% Give up on an unresponsive peer: close the connection when
+    %% ack-eliciting data has been in flight with no ACK for this long
+    %% (RFC 9000 permits idle-timeout-only, but a stateless-reset-blind
+    %% peer then lingers for the whole idle timeout; msquic uses a 16 s
+    %% disconnect timeout for the same reason).
+    disconnect_timeout = 16000 :: pos_integer() | infinity,
+
     %% Pacing (RFC 9002 Section 7.7)
     pacing_timer :: reference() | undefined,
     pacing_enabled = true :: boolean(),
@@ -1281,6 +1288,7 @@ init({server, Opts}) ->
         reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeout,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
+        disconnect_timeout = disconnect_timeout_opt(Opts),
         keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
@@ -1669,6 +1677,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeoutClient,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
+        disconnect_timeout = disconnect_timeout_opt(Opts),
         keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
@@ -2563,9 +2572,28 @@ handle_common_event(info, {hs_flight_timeout, _Ref}, _StateName, State) ->
 handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref} = State) when
     Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
 ->
-    %% Handle PTO timeout - send probe packet
-    NewState = handle_pto_timeout(State#state{pto_timer = undefined}),
-    {keep_state, NewState};
+    case disconnect_timeout_expired(State) of
+        true ->
+            %% The peer has not acknowledged anything for the whole
+            %% disconnect timeout while we had data in flight: declare
+            %% it dead instead of probing until the idle timeout. This
+            %% is how a client escapes a restarted peer whose stateless
+            %% resets it cannot recognise.
+            ?LOG_NOTICE(
+                #{
+                    what => disconnect_timeout,
+                    in_flight => quic_loss:bytes_in_flight(State#state.loss_state),
+                    pto_count => quic_loss:pto_count(State#state.loss_state)
+                },
+                ?QUIC_LOG_META
+            ),
+            NewState = initiate_close(disconnect_timeout, State#state{pto_timer = undefined}),
+            {next_state, draining, NewState};
+        false ->
+            %% Handle PTO timeout - send probe packet
+            NewState = handle_pto_timeout(State#state{pto_timer = undefined}),
+            {keep_state, NewState}
+    end;
 handle_common_event(info, {pto_timeout, _StaleRef}, _StateName, State) ->
     %% Ignore stale PTO timer (ref doesn't match or wrong state)
     {keep_state, State};
@@ -10517,6 +10545,26 @@ query_local_addr(Socket) ->
     case inet:sockname(Socket) of
         {ok, Sockname} -> Sockname;
         {error, _} -> undefined
+    end.
+
+disconnect_timeout_expired(#state{disconnect_timeout = infinity}) ->
+    false;
+disconnect_timeout_expired(#state{disconnect_timeout = DT, loss_state = LossState}) ->
+    quic_loss:bytes_in_flight(LossState) > 0 andalso
+        case quic_loss:last_progress(LossState) of
+            undefined ->
+                false;
+            T ->
+                erlang:monotonic_time(millisecond) - T >= DT
+        end.
+
+%% Disconnect-timeout option: how long ack-eliciting data may stay in
+%% flight without any ACK before the peer is declared dead.
+disconnect_timeout_opt(Opts) ->
+    case maps:get(disconnect_timeout, Opts, 16000) of
+        infinity -> infinity;
+        T when is_integer(T), T >= 1000 -> T;
+        _ -> 16000
     end.
 
 calculate_keep_alive_interval(Opts, IdleTimeout) ->
