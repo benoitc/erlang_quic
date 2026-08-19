@@ -811,6 +811,7 @@ open_send_socket_backend(Family, Opts, BatchConfig) ->
 configure_send_socket(Socket, Opts, BatchConfig) ->
     ok = socket:setopt(Socket, {socket, reuseaddr}, true),
     set_socket_buffer_sizes(Socket, Opts),
+    maybe_bind_source(Socket, Opts),
     %% GSO is applied per-message via the UDP_SEGMENT cmsg in
     %% flush_gso/1, never as a socket-level setsockopt. A socket-level
     %% UDP_SEGMENT would force GSO segmentation on every outbound
@@ -829,6 +830,32 @@ configure_send_socket(Socket, Opts, BatchConfig) ->
         max_batch_packets = maps:get(max_batch, BatchConfig)
     },
     {ok, State}.
+
+%% Honor a specific source address from extra_socket_opts {ip, Addr},
+%% as the gen_udp client path does. Without the bind the kernel
+%% picks the source per route (127.0.0.1 for loopback), which
+%% misidentifies the sender on multi-address hosts.
+maybe_bind_source(Socket, Opts) ->
+    case proplists:get_value(ip, maps:get(extra_socket_opts, Opts, []), undefined) of
+        undefined ->
+            ok;
+        BindAddr ->
+            case
+                socket:bind(Socket, #{
+                    family => family(BindAddr), addr => BindAddr, port => 0
+                })
+            of
+                ok ->
+                    ok;
+                {error, BindErr} ->
+                    ?LOG_WARNING(#{
+                        what => client_source_bind_failed,
+                        addr => BindAddr,
+                        reason => BindErr
+                    }),
+                    ok
+            end
+    end.
 
 %% Open gen_udp backend optimized for sending (ephemeral port)
 open_send_genudp_backend(Family, Opts, BatchConfig) ->
