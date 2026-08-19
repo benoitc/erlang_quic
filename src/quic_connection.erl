@@ -9374,14 +9374,25 @@ filter_reset_stream_at_data(Frames, #state{streams = Streams}) ->
 %% Send frames for retransmission with congestion control check
 send_retransmit_frames_cc([], State) ->
     State;
-send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = State) ->
+send_retransmit_frames_cc(Frames, State) ->
+    send_retransmit_frames_cc(Frames, State, normal).
+
+%% Mode `probe' (PTO) may exceed the congestion window per RFC 9002
+%% §7.5. Mode `normal' (loss retransmission) is subject to cwnd like
+%% any other send: cwnd-exempt retransmits keep pressure on the very
+%% congestion that caused the loss, and under sustained overload the
+%% retransmit traffic itself drives the drop/retransmit spiral.
+send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = State, Mode) ->
     %% Encode all frames and check size
     Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
     PacketSize = byte_size(Payload) + 50,
 
-    %% Check if CC allows sending this retransmission
-    %% Use can_send_control to allow small overage for retransmissions
-    case quic_cc:can_send_control(CCState, PacketSize) of
+    Allowed =
+        case Mode of
+            probe -> quic_cc:can_send_control(CCState, PacketSize);
+            normal -> quic_cc:can_send(CCState, PacketSize)
+        end,
+    case Allowed of
         true ->
             send_app_packet_internal(Payload, Frames, State#state{retransmits = R + 1});
         false ->
@@ -9502,7 +9513,7 @@ send_probe_packet(State) ->
     case get_oldest_unacked_frames(State) of
         {ok, Frames} ->
             %% Retransmit oldest data as probe with CC check
-            send_retransmit_frames_cc(Frames, State);
+            send_retransmit_frames_cc(Frames, State, probe);
         none ->
             %% No data to retransmit, send PING (always allowed as control)
             Payload = quic_frame:encode(ping),
