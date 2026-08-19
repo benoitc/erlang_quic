@@ -186,6 +186,10 @@
     decode_and_process_streaming/3,
     maybe_validate_initial_token/2,
     test_state_for_server/3,
+    %% Mailbox drain of the connected-state receive pass
+    drain_recv_msgs/2,
+    test_state_closing/2,
+    test_state_with_socket/2,
     %% Regression helper for send_queue_bytes accounting during ACK coalesce
     test_coalesce_small_stream/1,
     %% Regression helper for zero-byte FIN entries stranded in the send queue
@@ -260,6 +264,10 @@
 %% from parking the flight past the idle timeout.
 -define(HS_FLIGHT_MIN_INTERVAL, 100).
 -define(HS_FLIGHT_MAX_INTERVAL, 3000).
+
+%% Max additional datagram messages drained from the mailbox in one
+%% connected-state receive pass (see drain_recv_msgs/2).
+-define(RECV_DRAIN_MAX, 64).
 
 %% Max ACK ranges retained per PN space (RFC 9000 §13.2.4 allows the
 %% receiver to limit these). Under burst loss an unbounded list
@@ -2365,8 +2373,10 @@ connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) 
     %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
     State1 = State#state{current_packet_source = {IP, Port}},
     NewState = handle_packet(Data, State1),
-    %% Clear packet source and flush
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    %% Drain any further datagrams already in the mailbox into this
+    %% pass, then flush ACKs / batches / timers once for the lot.
+    DrainedState = drain_recv_msgs(NewState, ?RECV_DRAIN_MAX),
+    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{current_packet_source = undefined},
     check_state_transition(connected, FinalState);
 %% Client receives a whole GRO train from the receiver process as one
@@ -2375,46 +2385,24 @@ connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) 
 connected(info, {udp_batch, Socket, IP, Port, Packets}, #state{socket = Socket} = State) ->
     State1 = State#state{current_packet_source = {IP, Port}},
     NewState = handle_packets_batch(Packets, State1),
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    DrainedState = drain_recv_msgs(NewState, ?RECV_DRAIN_MAX),
+    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{current_packet_source = undefined},
     check_state_transition(connected, FinalState);
 %% Server receives packets from listener
 connected(info, {quic_packet, Data, RemoteAddr}, #state{role = server} = State) ->
-    %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
-    %% Clear has_non_probing_frame before processing - will be set by process_frame_track_probing
-    State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
-    %% Process packet FIRST to classify frames
-    NewState = handle_packet(Data, State1),
-    %% RFC 9000 Section 9.1: Only trigger migration if packet contains non-probing frames
-    NewState2 =
-        case NewState#state.has_non_probing_frame of
-            true -> maybe_handle_address_change(RemoteAddr, byte_size(Data), NewState);
-            false -> NewState
-        end,
-    %% Clear transient fields and flush
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState2)),
+    NewState = server_recv_pass([Data], RemoteAddr, State),
+    DrainedState = drain_recv_msgs(NewState, ?RECV_DRAIN_MAX),
+    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{
         current_packet_source = undefined, has_non_probing_frame = false
     },
     check_state_transition(connected, FinalState);
 %% Server receives batched packets from listener (GRO optimization)
 connected(info, {quic_packets, Packets, RemoteAddr}, #state{role = server} = State) ->
-    %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
-    %% Clear has_non_probing_frame before processing - will be set by process_frame_track_probing
-    State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
-    %% Process packets FIRST to classify frames
-    NewState = handle_packets_batch(Packets, State1),
-    %% RFC 9000 Section 9.1: Only trigger migration if any packet contains non-probing frames
-    NewState2 =
-        case NewState#state.has_non_probing_frame of
-            true ->
-                TotalSize = lists:sum([byte_size(P) || P <- Packets]),
-                maybe_handle_address_change(RemoteAddr, TotalSize, NewState);
-            false ->
-                NewState
-        end,
-    %% Clear transient fields and flush
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState2)),
+    NewState = server_recv_pass(Packets, RemoteAddr, State),
+    DrainedState = drain_recv_msgs(NewState, ?RECV_DRAIN_MAX),
+    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{
         current_packet_source = undefined, has_non_probing_frame = false
     },
@@ -4287,6 +4275,52 @@ do_handle_packets_batch([], State) ->
 do_handle_packets_batch([Packet | Rest], State) ->
     NewState = handle_packet_loop(Packet, State),
     do_handle_packets_batch(Rest, NewState).
+
+%% One server receive pass: process the packets of a listener message
+%% (source tracking, frame classification, RFC 9000 §9.1 migration
+%% check) without the per-message flushes - the caller flushes once
+%% per drain.
+server_recv_pass(Packets, RemoteAddr, State) ->
+    State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
+    NewState = handle_packets_batch(Packets, State1),
+    case NewState#state.has_non_probing_frame of
+        true ->
+            TotalSize = lists:sum([byte_size(P) || P <- Packets]),
+            maybe_handle_address_change(RemoteAddr, TotalSize, NewState);
+        false ->
+            NewState
+    end.
+
+%% Drain datagram messages already queued in the mailbox into the
+%% current receive pass, so ACK emission, socket-batch flushing and
+%% timer resets amortize over the whole train instead of running per
+%% datagram. Stops as soon as a close is initiated (the remaining
+%% messages are handled as ordinary events by the next state) or the
+%% cap is hit (bounds time away from the event loop).
+drain_recv_msgs(#state{close_reason = CR} = State, _N) when CR =/= undefined ->
+    State;
+drain_recv_msgs(State, 0) ->
+    State;
+drain_recv_msgs(#state{role = client, socket = Socket} = State, N) ->
+    receive
+        {udp, Socket, IP, Port, Data} ->
+            State1 = State#state{current_packet_source = {IP, Port}},
+            drain_recv_msgs(handle_packet(Data, State1), N - 1);
+        {udp_batch, Socket, IP, Port, Packets} ->
+            State1 = State#state{current_packet_source = {IP, Port}},
+            drain_recv_msgs(handle_packets_batch(Packets, State1), N - 1)
+    after 0 ->
+        State
+    end;
+drain_recv_msgs(#state{role = server} = State, N) ->
+    receive
+        {quic_packet, Data, RemoteAddr} ->
+            drain_recv_msgs(server_recv_pass([Data], RemoteAddr, State), N - 1);
+        {quic_packets, Packets, RemoteAddr} ->
+            drain_recv_msgs(server_recv_pass(Packets, RemoteAddr, State), N - 1)
+    after 0 ->
+        State
+    end.
 
 handle_packet_loop(<<>>, #state{role = client, active_n = N} = State) ->
     %% No more data to process - re-enable socket for client connections
@@ -12859,6 +12893,12 @@ test_state_for_server(RemoteAddr, Secret, ODCID) ->
 
 -spec test_close_reason(#state{}) -> term().
 test_close_reason(#state{close_reason = R}) -> R.
+
+-spec test_state_closing(#state{}, term()) -> #state{}.
+test_state_closing(State, Reason) -> State#state{close_reason = Reason}.
+
+-spec test_state_with_socket(#state{}, gen_udp:socket()) -> #state{}.
+test_state_with_socket(State, Socket) -> State#state{socket = Socket}.
 
 %% Minimal #state{} carrying a caller-supplied loss tracker, for tests
 %% that need to observe what an incoming frame does to it.

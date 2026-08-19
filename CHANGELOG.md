@@ -13,6 +13,17 @@ All notable changes to this project will be documented in this file.
   endpoints so the blackhole case can outlast its outage, waits 60 s per
   download, and the server loads the full certificate chain from
   cert.pem.
+- The connected-state receive pass drains the datagram messages already
+  queued in the connection's mailbox (up to 64) before flushing ACKs,
+  socket batches and timers, so those flushes amortize over a train
+  instead of running once per datagram. On the socket backend the
+  listener and the client receiver now emulate a bounded kernel receive
+  buffer: trains are forwarded in chunks of at most 8 packets and
+  tail-dropped once the connection's mailbox holds more than 32
+  messages, keeping the head packet so the peer still gets a timely
+  ACK. An unbounded mailbox turned receiver overload into queueing
+  delay instead of loss, which inflated the peer's RTT samples and
+  destabilized its loss detector.
 
 ## [1.8.2] - 2026-09-05
 
