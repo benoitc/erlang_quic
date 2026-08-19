@@ -257,6 +257,15 @@
 -define(HS_FLIGHT_MIN_INTERVAL, 100).
 -define(HS_FLIGHT_MAX_INTERVAL, 3000).
 
+%% Max ACK ranges retained per PN space (RFC 9000 §13.2.4 allows the
+%% receiver to limit these). Under burst loss an unbounded list
+%% fragments into hundreds of ranges, and since every outgoing ACK
+%% encodes the full list (and the peer decodes it), ACK processing
+%% cost grows O(ranges) per packet on both ends. Packets below the
+%% lowest retained range are retransmitted by the peer and dropped
+%% here as duplicates.
+-define(MAX_ACK_RANGES, 64).
+
 %% Max receive buffer size in bytes (32 MB total across all streams) - protects against malicious peers
 -define(MAX_RECV_BUFFER_BYTES, 33554432).
 
@@ -7642,12 +7651,21 @@ update_pn_space_recv(PN, PNSpace, Now) ->
             L -> L
         end,
     %% Add to ack_ranges maintaining descending order and merging adjacent ranges
-    NewRanges = add_to_ack_ranges(PN, Ranges),
+    NewRanges = cap_ack_ranges(add_to_ack_ranges(PN, Ranges)),
     PNSpace#pn_space{
         largest_recv = NewLargest,
         recv_time = Now,
         ack_ranges = NewRanges
     }.
+
+%% Drop the lowest ranges beyond ?MAX_ACK_RANGES (list is descending).
+cap_ack_ranges([_, _ | Tail] = Ranges) when Tail =/= [] ->
+    case length(Ranges) > ?MAX_ACK_RANGES of
+        true -> lists:sublist(Ranges, ?MAX_ACK_RANGES);
+        false -> Ranges
+    end;
+cap_ack_ranges(Ranges) ->
+    Ranges.
 
 %% Add a packet number to ACK ranges, maintaining descending order by Start
 %% and merging adjacent/overlapping ranges
