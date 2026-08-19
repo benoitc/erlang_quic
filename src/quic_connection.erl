@@ -6991,9 +6991,12 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                     recv_max_data = NewMaxStreamData
                                 },
                                 MaxStreamDataFrame = {max_stream_data, StreamId, NewMaxStreamData},
-                                %% Update cached max stream recv window
+                                %% Cache the granted window *size* (not the
+                                %% absolute limit) for the connection-window
+                                %% multiplier below.
                                 NewCachedMax = max(
-                                    NewMaxStreamData, State1#state.fc_max_stream_recv_window
+                                    NewMaxStreamData - NewRecvOffset,
+                                    State1#state.fc_max_stream_recv_window
                                 ),
                                 State1a = State1#state{
                                     streams = maps:put(StreamId, UpdatedStream, Streams),
@@ -7005,12 +7008,16 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                 State1
                         end,
 
-                    %% Check if we need to send MAX_DATA for connection-level flow control
-                    %% Send when we've consumed more than 50% of our advertised connection window
-                    %% RTT-based auto-tuning with connection/stream multiplier enforcement
+                    %% Check if we need to send MAX_DATA for connection-level flow
+                    %% control. Trigger on remaining headroom (limit - received),
+                    %% like the per-stream update above: comparing cumulative
+                    %% received bytes against the absolute limit becomes
+                    %% permanently true once total received exceeds one window,
+                    %% spraying an ack-eliciting MAX_DATA on every packet.
                     MaxDataLocalVal = State2#state.max_data_local,
+                    ConnHeadroom = max(0, MaxDataLocalVal - NewDataReceivedVal),
                     State3 =
-                        case NewDataReceivedVal > (MaxDataLocalVal div 2) of
+                        case ConnHeadroom < (State2#state.fc_max_receive_window div 2) of
                             true ->
                                 Now2 = erlang:monotonic_time(millisecond),
                                 SmoothedRTT2 = quic_loss:smoothed_rtt(State2#state.loss_state),
@@ -7034,11 +7041,15 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                     InitialConnWindow,
                                     FastConsumption2
                                 ),
-                                %% Ensure connection window >= 1.5x largest stream window
+                                %% Ensure connection window >= 1.5x largest stream
+                                %% window. MaxStreamWindow is a window size; anchor
+                                %% it at the delivered offset to compare limits.
                                 MaxStreamWindow = get_max_stream_recv_window(State2),
-                                MinConnWindow = trunc(
-                                    MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER
-                                ),
+                                MinConnWindow =
+                                    NewDataReceivedVal +
+                                        trunc(
+                                            MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER
+                                        ),
                                 NewMaxData = max(BaseNewMaxData, MinConnWindow),
                                 MaxDataFrame = {max_data, NewMaxData},
                                 State2a = send_frame(MaxDataFrame, State2),
