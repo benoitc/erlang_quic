@@ -239,7 +239,7 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
             {LostList, SurvHeadQ, LostBytes, LargestLostSentTime} =
                 detect_lost_q(
                     KeptList,
-                    NewState1#loss_state.smoothed_rtt,
+                    max(NewState1#loss_state.smoothed_rtt, NewState1#loss_state.latest_rtt),
                     LargestAcked,
                     Now,
                     [],
@@ -329,13 +329,19 @@ maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now) ->
 -spec detect_lost_packets(loss_state(), non_neg_integer()) ->
     {loss_state(), [#sent_packet{}]}.
 detect_lost_packets(
-    #loss_state{sent_q = Q, smoothed_rtt = SRTT} = State,
+    #loss_state{sent_q = Q, smoothed_rtt = SRTT, latest_rtt = LatestRTT} = State,
     LargestAcked
 ) ->
     Now = erlang:monotonic_time(millisecond),
     SentList = queue:to_list(Q),
+    %% RFC 9002 §6.1.2: the time threshold uses max(smoothed_rtt,
+    %% latest_rtt). With the EWMA alone, an RTT spike that outruns it
+    %% (receiver queueing, bufferbloat) mass-declares in-flight packets
+    %% lost while their ACKs are merely late; each spurious loss both
+    %% retransmits data and collapses the congestion window.
+    RTT = max(SRTT, LatestRTT),
     {LostPackets, SurvQ, LostBytes, _LargestLostSentTime} =
-        detect_lost_q(SentList, SRTT, LargestAcked, Now, [], queue:new(), 0, undefined),
+        detect_lost_q(SentList, RTT, LargestAcked, Now, [], queue:new(), 0, undefined),
     NewState = State#loss_state{
         sent_q = SurvQ,
         bytes_in_flight = max(0, State#loss_state.bytes_in_flight - LostBytes)
@@ -408,8 +414,8 @@ largest_lost_ts({_PN, TS}) -> TS.
 %% peek in the common case (head is in_flight).
 -spec get_loss_time_and_space(loss_state()) ->
     {non_neg_integer() | undefined, atom()}.
-get_loss_time_and_space(#loss_state{sent_q = Q, smoothed_rtt = SRTT}) ->
-    LossDelay = max(trunc(?TIME_THRESHOLD * SRTT), ?GRANULARITY),
+get_loss_time_and_space(#loss_state{sent_q = Q, smoothed_rtt = SRTT, latest_rtt = LatestRTT}) ->
+    LossDelay = max(trunc(?TIME_THRESHOLD * max(SRTT, LatestRTT)), ?GRANULARITY),
     case earliest_in_flight_time(queue:to_list(Q)) of
         undefined -> {undefined, initial};
         TimeSent -> {TimeSent + LossDelay, initial}
