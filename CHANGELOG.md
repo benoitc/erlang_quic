@@ -39,6 +39,18 @@ All notable changes to this project will be documented in this file.
   transfer in 16 writes, against 0 once ordered). Throughput on loopback
   is unchanged; the cost is the reassembly buffer, and any real path where
   reordering matters.
+- Pacing no longer freezes on sub-millisecond links. RTT samples are
+  whole milliseconds, so such a link reports a smoothed RTT of 0 and
+  `update_pacing_rate` treated that as "no RTT yet" and skipped the
+  update: the rate stayed at its handshake-time value while cwnd kept
+  growing, clocking the connection at that stale rate forever. The RTT
+  is floored at 1 ms for the rate computation instead.
+- Burst continuations are sent to the connection directly rather than
+  through `erlang:send_after(0, ...)`. The timer wheel's ~1 ms service
+  tick turned every 64-packet burst continuation into a 64 packets per
+  millisecond clock, capping bulk streams at roughly 85 MB/s regardless
+  of the paced rate. Together with the previous fix, a verified
+  single-stream loopback bulk transfer went from 83 to 194 MiB/s.
 - An authenticated distribution connection no longer drops the peer's
   first handshake message about half the time. The `auth_callback` path
   put a short-lived gatekeeper process in front of the dist controller

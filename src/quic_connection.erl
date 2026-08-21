@@ -203,6 +203,8 @@
     test_state_with_socket/2,
     test_state_in_recv_pass/1,
     test_state_coalescing/2,
+    arm_burst_continuation/1,
+    test_pacing_timer/1,
     test_pending_delivery/1,
     test_finish_recv_pass/1,
     %% Regression helper for send_queue_bytes accounting during ACK coalesce
@@ -11068,13 +11070,16 @@ burst_exhausted(#state{burst_sent = Sent, burst_budget = Budget}) ->
 
 %% Arm a zero-delay pacing continuation so the queued remainder is
 %% drained in the next event-loop pass, after any pending ACK / loss
-%% feedback in the mailbox. Reuses the pacing timer and message so the
-%% drain and stale-reference handling are shared with real pacing.
+%% feedback in the mailbox. Reuses the pacing message so the drain and
+%% stale-reference handling are shared with real pacing, but sends it
+%% directly: send_after(0) goes through the timer wheel, whose ~1 ms
+%% service tick would clock every burst continuation (64 packets/ms
+%% caps bulk streams at ~85 MB/s regardless of rate).
 arm_burst_continuation(#state{pacing_timer = Ref} = State) when Ref =/= undefined ->
     State;
 arm_burst_continuation(State) ->
     Ref = make_ref(),
-    erlang:send_after(0, self(), {pacing_timeout, Ref}),
+    self() ! {pacing_timeout, Ref},
     State#state{pacing_timer = Ref}.
 
 %% Convert state to map for debugging
@@ -13339,6 +13344,9 @@ test_decimate_step(State) ->
 -spec test_state_in_recv_pass(#state{}) -> #state{}.
 test_state_in_recv_pass(State) ->
     State#state{recv_pass = true}.
+
+-spec test_pacing_timer(#state{}) -> undefined | reference().
+test_pacing_timer(#state{pacing_timer = Ref}) -> Ref.
 
 -spec test_state_coalescing(#state{}, boolean()) -> #state{}.
 test_state_coalescing(State, On) ->

@@ -885,7 +885,13 @@ on_persistent_congestion(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} 
 %% RFC 9002: pacing_rate = cwnd / smoothed_rtt
 %% Called when RTT estimate is updated.
 -spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
-update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTT) when SmoothedRTT > 0 ->
+update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTT0) ->
+    %% RTT samples are whole milliseconds, so a sub-millisecond link
+    %% reports 0. Skipping the update then freezes the rate at its
+    %% handshake-time value while cwnd keeps growing, clocking the
+    %% connection at that stale rate forever. Floor at 1 ms so the
+    %% rate keeps tracking cwnd and the congestion controller governs.
+    SmoothedRTT = max(1, SmoothedRTT0),
     %% pacing_rate stored as milli-bytes per microsecond for precision with us timestamps
     %% Formula: (cwnd * 1.25 * 1000) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
     %% Simplified: (cwnd * 5 * 250) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
@@ -914,10 +920,7 @@ update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTT) when SmoothedRTT
     %% the rate.
     MaxBurst = max(12 * State1#cc_state.max_datagram_size, 2 * PacingRate),
 
-    State1#cc_state{pacing_rate = PacingRate, pacing_max_burst = MaxBurst};
-update_pacing_rate(State, _SmoothedRTT) ->
-    %% No valid RTT yet, keep current state
-    State.
+    State1#cc_state{pacing_rate = PacingRate, pacing_max_burst = MaxBurst}.
 
 %% @doc Check if pacing allows sending Size bytes.
 %% Returns true if enough tokens are available (including burst allowance).
