@@ -15,6 +15,20 @@ All notable changes to this project will be documented in this file.
   one complete application message break when deliveries merge, so it
   is opt-in.
 
+### Fixed
+- Pacing no longer freezes on sub-millisecond links. RTT samples are
+  whole milliseconds, so such a link reports a smoothed RTT of 0 and
+  `update_pacing_rate` treated that as "no RTT yet" and skipped the
+  update: the rate stayed at its handshake-time value while cwnd kept
+  growing, clocking the connection at that stale rate forever. The RTT
+  is floored at 1 ms for the rate computation instead.
+- Burst continuations are sent to the connection directly rather than
+  through `erlang:send_after(0, ...)`. The timer wheel's ~1 ms service
+  tick turned every 64-packet burst continuation into a 64 packets per
+  millisecond clock, capping bulk streams at roughly 85 MB/s regardless
+  of the paced rate. Together with the previous fix, a verified
+  single-stream loopback bulk transfer went from 83 to 194 MiB/s.
+
 ### Changed
 - The interop runner declares the passive robustness cases (longrtt,
   blackhole, amplificationlimit, handshakeloss, transferloss,

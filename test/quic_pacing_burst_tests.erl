@@ -130,8 +130,18 @@ update_mtu_keeps_the_floor_at_low_rates_test() ->
 %% Degenerate input
 %%====================================================================
 
-zero_rtt_leaves_pacing_untouched_test() ->
-    %% No RTT sample yet: update_pacing_rate is a no-op, so the state is
-    %% returned unchanged and sends stay unpaced.
-    State = quic_cc_newreno:new(#{max_datagram_size => ?MDS}),
-    ?assertEqual(State, quic_cc_newreno:update_pacing_rate(State, 0)).
+zero_rtt_paces_as_one_millisecond_test() ->
+    %% RTT samples are whole milliseconds, so a sub-millisecond link
+    %% reports 0. Treating that as "no RTT yet" froze the pacing rate at
+    %% its handshake-time value while cwnd kept growing. The rate is
+    %% computed as for a 1 ms RTT instead, so it keeps tracking cwnd.
+    Small = 12000,
+    Large = 4000000,
+    ?assertEqual(
+        max(12 * ?MDS, 2 * rate(Small, 1)),
+        burst_ceiling(paced(Small, 0))
+    ),
+    ?assertEqual(
+        max(12 * ?MDS, 2 * rate(Large, 1)),
+        burst_ceiling(paced(Large, 0))
+    ).
