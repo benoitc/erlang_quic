@@ -2455,12 +2455,21 @@ handle_common_event(
             %% no PING needed.
             {keep_state, set_keep_alive_timer(State#state{keep_alive_timer = undefined})};
         false ->
-            %% Idle for a full interval: send a PING. Being ack-eliciting, it
-            %% refreshes last_activity if it is the first such packet since our
-            %% last receive (RFC 9000 §10.1); re-arm a full interval.
+            %% Idle for a full interval: send a PING, then wait a full
+            %% interval before the next one.
+            %%
+            %% The re-arm must count from now, not from last_activity:
+            %% last_activity only moves on the FIRST ack-eliciting packet
+            %% sent since the last receive (RFC 9000 §10.1), so on a
+            %% connection whose peer stays quiet every later PING leaves it
+            %% untouched. Deriving the delay from it then yields
+            %% max(0, past + interval - now) = 0, the timer fires straight
+            %% back, and the connection spins sending PINGs at timer-wheel
+            %% rate (measured: ~930/s per connection, 46k/s across 50 idle
+            %% connections) until the peer happens to send something.
             State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
             State2 = flush_dirty_timers(flush_socket_batch(State1)),
-            {keep_state, set_keep_alive_timer(State2)}
+            {keep_state, arm_keep_alive_timer(State2, State2#state.keep_alive_interval)}
     end;
 handle_common_event(info, {keep_alive_timeout, _StaleRef}, _StateName, State) ->
     %% Ignore stale keep-alive timer (ref doesn't match or wrong state)
@@ -9686,15 +9695,19 @@ set_keep_alive_timer(#state{keep_alive_interval = disabled} = State) ->
 set_keep_alive_timer(
     #state{
         keep_alive_interval = Interval,
-        keep_alive_timer = OldTimer,
         last_activity = LastActivity
     } = State
 ) ->
-    cancel_timer(OldTimer),
     %% Lazy re-arm against last_activity (same model as the idle timer):
     %% full interval on the initial arm, the remainder on a spurious fire.
     Now = erlang:monotonic_time(millisecond),
-    Delay = max(0, (LastActivity + Interval) - Now),
+    arm_keep_alive_timer(State, max(0, (LastActivity + Interval) - Now)).
+
+%% Arm the keep-alive timer with an explicit delay.
+arm_keep_alive_timer(#state{keep_alive_interval = disabled} = State, _Delay) ->
+    State#state{keep_alive_timer = undefined};
+arm_keep_alive_timer(#state{keep_alive_timer = OldTimer} = State, Delay) ->
+    cancel_timer(OldTimer),
     Ref = make_ref(),
     erlang:send_after(Delay, self(), {keep_alive_timeout, Ref}),
     State#state{keep_alive_timer = Ref}.
