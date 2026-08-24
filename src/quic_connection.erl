@@ -148,6 +148,9 @@
     test_check_flow_control/6,
     test_queue_blocked_send/5,
     close_reason_to_code/1,
+    %% Out-of-order reassembly (RFC 9000 §2.2, §13.3)
+    extract_contiguous_data/2,
+    trim_reassembly_buffer/2,
     %% Migration frame classification (RFC 9000 Section 9.1)
     is_probing_frame/1,
     contains_non_probing_frame/1,
@@ -5526,8 +5529,9 @@ buffer_crypto_data(Level, Offset, Data, State) ->
                     false ->
                         State
                 end,
-            %% Add data to buffer
-            NewBuffer = maps:put(Offset, Data, Buffer),
+            %% Add data to buffer, keeping the longer chunk if the peer
+            %% already sent one at this offset.
+            NewBuffer = keep_longest_chunk(Offset, Data, Buffer),
             NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State0#state.crypto_buffer),
 
             State1 = State0#state{crypto_buffer = NewCryptoBuffer},
@@ -5560,7 +5564,21 @@ process_crypto_buffer(Level, State) ->
             %% Try to process more
             process_crypto_buffer(Level, State2);
         error ->
-            State
+            %% Nothing keyed exactly at ExpectedOffset, which does not mean a
+            %% gap: a peer may re-frame CRYPTO data it retransmits (RFC 9000
+            %% §13.3), so the bytes we need can sit inside a chunk that starts
+            %% earlier. Drop what is already consumed, re-key what straddles
+            %% the offset, then retry once. Storing the trimmed buffer also
+            %% stops duplicate retransmissions from accumulating against
+            %% ?MAX_CRYPTO_BUFFER_BYTES and closing a healthy connection.
+            Trimmed = trim_reassembly_buffer(Buffer, ExpectedOffset),
+            State1 = State#state{
+                crypto_buffer = maps:put(Level, Trimmed, State#state.crypto_buffer)
+            },
+            case maps:is_key(ExpectedOffset, Trimmed) of
+                true -> process_crypto_buffer(Level, State1);
+                false -> State1
+            end
     end.
 
 %% Process TLS handshake data from CRYPTO frames
@@ -6886,7 +6904,7 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                 {Data, EndOffset, RecvBuffer, Fin};
                             false ->
                                 %% Out-of-order or buffer has data: use buffer path
-                                UpdatedBuffer = maps:put(Offset, Data, RecvBuffer),
+                                UpdatedBuffer = keep_longest_chunk(Offset, Data, RecvBuffer),
                                 {ExtractedData, ExtractedOffset, ExtractedBuffer} =
                                     extract_contiguous_data(UpdatedBuffer, CurrentOffset),
                                 ExtractedFin =
@@ -6926,11 +6944,16 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                         end,
                     NewDataReceivedVal = DataReceived + NewBytesReceived,
 
-                    %% Update receive buffer bytes tracking
-                    %% Net change: add new bytes, subtract delivered bytes
-                    DeliveredBytes = byte_size(DeliverData),
+                    %% Update receive buffer bytes tracking from the buffer
+                    %% itself. The new-minus-delivered estimate drifts upward
+                    %% once retransmissions overlap, because the overlapping
+                    %% bytes count as new but are never delivered twice, and
+                    %% that drift would eventually trip the cap on a stream
+                    %% holding nothing.
                     NewRecvBufferBytes = max(
-                        0, RecvBufferBytes + NewBytesReceived - DeliveredBytes
+                        0,
+                        RecvBufferBytes - reassembly_buffer_bytes(RecvBuffer) +
+                            reassembly_buffer_bytes(NewBuffer)
                     ),
 
                     State1 = State#state{
@@ -7092,9 +7115,48 @@ extract_contiguous_data(Buffer, Offset, Acc) ->
             NextOffset = Offset + byte_size(Data),
             extract_contiguous_data(NewBuffer, NextOffset, <<Acc/binary, Data/binary>>);
         error ->
-            %% No data at this offset (gap in stream)
-            {Acc, Offset, Buffer}
+            %% Nothing keyed exactly at Offset, which does not mean a gap:
+            %% a peer may split or coalesce retransmitted data differently
+            %% (RFC 9000 §2.2, §13.3), so the bytes we want can sit inside
+            %% a chunk that starts earlier. Drop what is already delivered,
+            %% re-key what straddles Offset, then retry once.
+            Trimmed = trim_reassembly_buffer(Buffer, Offset),
+            case maps:is_key(Offset, Trimmed) of
+                true -> extract_contiguous_data(Trimmed, Offset, Acc);
+                false -> {Acc, Offset, Trimmed}
+            end
     end.
+
+%% Drop buffered chunks that end at or before Offset and trim those that
+%% straddle it, re-keying them to Offset. Keeps the longest chunk at each
+%% offset, so overlapping retransmissions collapse instead of accumulating.
+trim_reassembly_buffer(Buffer, Offset) ->
+    maps:fold(
+        fun(Off, Data, Acc) ->
+            End = Off + byte_size(Data),
+            if
+                End =< Offset ->
+                    Acc;
+                Off >= Offset ->
+                    keep_longest_chunk(Off, Data, Acc);
+                true ->
+                    Kept = binary:part(Data, Offset - Off, End - Offset),
+                    keep_longest_chunk(Offset, Kept, Acc)
+            end
+        end,
+        #{},
+        Buffer
+    ).
+
+keep_longest_chunk(Off, Data, Acc) ->
+    case Acc of
+        #{Off := Existing} when byte_size(Existing) >= byte_size(Data) -> Acc;
+        _ -> Acc#{Off => Data}
+    end.
+
+%% Total bytes held in a reassembly buffer.
+reassembly_buffer_bytes(Buffer) ->
+    maps:fold(fun(_, Data, Acc) -> Acc + byte_size(Data) end, 0, Buffer).
 
 %% Get the maximum stream receive window across all streams.
 %% Used to ensure connection window >= 1.5x largest stream window.
