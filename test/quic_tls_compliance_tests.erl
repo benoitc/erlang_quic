@@ -480,3 +480,21 @@ verify_resumption_binder_fails_closed_without_offset_test() ->
             crypto:strong_rand_bytes(32), aes_128_gcm, <<"ch">>, undefined, <<"binder">>
         )
     ).
+
+%% A CRYPTO frame may end anywhere, including inside the four-byte
+%% handshake message header. Every short prefix must report `incomplete'
+%% so the caller buffers it and waits: reporting `invalid' made the
+%% server discard a split client Finished and wedge the handshake.
+split_handshake_header_is_incomplete_test() ->
+    Body = binary:copy(<<$v>>, 32),
+    Msg = <<?TLS_FINISHED:8, 32:24, Body/binary>>,
+    lists:foreach(
+        fun(N) ->
+            ?assertEqual(
+                {N, {error, incomplete}},
+                {N, quic_tls:decode_handshake_message(binary:part(Msg, 0, N))}
+            )
+        end,
+        lists:seq(0, byte_size(Msg) - 1)
+    ),
+    ?assertEqual({ok, {?TLS_FINISHED, Body}, <<>>}, quic_tls:decode_handshake_message(Msg)).
