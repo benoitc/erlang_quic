@@ -919,8 +919,11 @@ decode_handshake_message(<<Type:8, Length:24, Body:Length/binary, Rest/binary>>)
     {ok, {Type, Body}, Rest};
 decode_handshake_message(<<_Type:8, Length:24, Data/binary>>) when byte_size(Data) < Length ->
     {error, incomplete};
+%% Fewer than 4 bytes: the message header itself is split across CRYPTO
+%% frames. There is no invalid framing at this layer, only insufficient
+%% data; malformed content is rejected by the per-message parsers.
 decode_handshake_message(_) ->
-    {error, invalid}.
+    {error, incomplete}.
 
 %%====================================================================
 %% Internal Functions
