@@ -556,6 +556,10 @@
     %% peer then lingers for the whole idle timeout; msquic uses a 16 s
     %% disconnect timeout for the same reason).
     disconnect_timeout = 16000 :: pos_integer() | infinity,
+    %% Dedicated timer for the above. Checking it only when a PTO happened
+    %% to fire made the effective timeout the next PTO after the deadline,
+    %% and PTO backoff doubles, so a nominal 16 s took 24 s or more.
+    disconnect_timer :: reference() | undefined,
 
     %% Pacing (RFC 9002 Section 7.7)
     pacing_timer :: reference() | undefined,
@@ -1906,7 +1910,7 @@ idle(EventType, EventContent, State) ->
 handshaking(enter, idle, State) ->
     %% Continue handshake; (re)arm the client Initial-retransmission timer
     %% (no-op for the server).
-    {keep_state, State, hs_rtx_actions(State)};
+    {keep_state, arm_disconnect_timer(State), hs_rtx_actions(State)};
 handshaking(state_timeout, retransmit_initial, State) ->
     retransmit_initial_flight(handshaking, State);
 handshaking({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
@@ -2039,7 +2043,7 @@ connected(
         server -> ok
     end,
     %% Send any data that was queued before connection established
-    State1 = State#state{pending_data = []},
+    State1 = arm_disconnect_timer(State#state{pending_data = []}),
     State2 = send_pending_data(Pending, State1),
     %% RFC 9000 Section 9.6: Client validates server's preferred address
     State3 =
@@ -2574,26 +2578,27 @@ handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref}
 ->
     case disconnect_timeout_expired(State) of
         true ->
-            %% The peer has not acknowledged anything for the whole
-            %% disconnect timeout while we had data in flight: declare
-            %% it dead instead of probing until the idle timeout. This
-            %% is how a client escapes a restarted peer whose stateless
-            %% resets it cannot recognise.
-            ?LOG_NOTICE(
-                #{
-                    what => disconnect_timeout,
-                    in_flight => quic_loss:bytes_in_flight(State#state.loss_state),
-                    pto_count => quic_loss:pto_count(State#state.loss_state)
-                },
-                ?QUIC_LOG_META
-            ),
-            NewState = initiate_close(disconnect_timeout, State#state{pto_timer = undefined}),
-            {next_state, draining, NewState};
+            {next_state, draining, declare_peer_dead(State#state{pto_timer = undefined})};
         false ->
             %% Handle PTO timeout - send probe packet
             NewState = handle_pto_timeout(State#state{pto_timer = undefined}),
             {keep_state, NewState}
     end;
+handle_common_event(
+    info, {disconnect_check, Ref}, StateName, #state{disconnect_timer = Ref} = State
+) when
+    Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
+->
+    State1 = State#state{disconnect_timer = undefined},
+    case disconnect_timeout_expired(State1) of
+        true ->
+            {next_state, draining, declare_peer_dead(State1)};
+        false ->
+            {keep_state, arm_disconnect_timer(State1)}
+    end;
+handle_common_event(info, {disconnect_check, _StaleRef}, _StateName, State) ->
+    %% Stale disconnect timer (ref doesn't match or wrong state)
+    {keep_state, State};
 handle_common_event(info, {pto_timeout, _StaleRef}, _StateName, State) ->
     %% Ignore stale PTO timer (ref doesn't match or wrong state)
     {keep_state, State};
@@ -10557,6 +10562,49 @@ disconnect_timeout_expired(#state{disconnect_timeout = DT, loss_state = LossStat
             T ->
                 erlang:monotonic_time(millisecond) - T >= DT
         end.
+
+%% The disconnect timeout elapsed with ack-eliciting data in flight and
+%% no ACK: declare the peer dead instead of probing until the idle
+%% timeout. This is how a client escapes a restarted peer whose stateless
+%% resets it cannot recognise.
+declare_peer_dead(State) ->
+    ?LOG_NOTICE(
+        #{
+            what => disconnect_timeout,
+            in_flight => quic_loss:bytes_in_flight(State#state.loss_state),
+            pto_count => quic_loss:pto_count(State#state.loss_state)
+        },
+        ?QUIC_LOG_META
+    ),
+    initiate_close(disconnect_timeout, cancel_disconnect_timer(State)).
+
+cancel_disconnect_timer(#state{disconnect_timer = undefined} = State) ->
+    State;
+cancel_disconnect_timer(#state{disconnect_timer = Ref} = State) ->
+    cancel_timer(Ref),
+    State#state{disconnect_timer = undefined}.
+
+%% Arm the disconnect check at the deadline itself. Lazy, like the idle
+%% timer: a fire that finds the deadline moved re-arms the remainder.
+%% The delay is never zero, so this cannot spin the way a re-arm derived
+%% from a stale timestamp would.
+arm_disconnect_timer(#state{disconnect_timeout = infinity} = State) ->
+    cancel_disconnect_timer(State);
+arm_disconnect_timer(#state{disconnect_timeout = DT, loss_state = LossState} = State) ->
+    Delay =
+        case quic_loss:last_progress(LossState) of
+            undefined ->
+                DT;
+            T ->
+                case quic_loss:bytes_in_flight(LossState) > 0 of
+                    true -> max(1, (T + DT) - erlang:monotonic_time(millisecond));
+                    false -> DT
+                end
+        end,
+    State1 = cancel_disconnect_timer(State),
+    Ref = make_ref(),
+    erlang:send_after(Delay, self(), {disconnect_check, Ref}),
+    State1#state{disconnect_timer = Ref}.
 
 %% Disconnect-timeout option: how long ack-eliciting data may stay in
 %% flight without any ACK before the peer is declared dead.
