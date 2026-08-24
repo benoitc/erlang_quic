@@ -146,6 +146,7 @@
     convert_rest_ranges/2,
     check_send_queue_flow_control/4,
     test_check_flow_control/6,
+    test_queue_blocked_send/5,
     close_reason_to_code/1,
     %% Migration frame classification (RFC 9000 Section 9.1)
     is_probing_frame/1,
@@ -2501,6 +2502,32 @@ handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     %% EXIT signals are handled in terminate/3 callback
     %% Just ignore here - the process will terminate anyway if it's from parent
     {keep_state, State};
+%% An async send can arrive before the state machine reaches `connected':
+%% the owner is told the connection is up a flight before the handshake
+%% concludes, so this is an ordinary race rather than misuse. Queue it the
+%% way the synchronous handshaking-state clause does, to be flushed by
+%% send_pending_data/2 on entering `connected'. Falling through to the
+%% catch-all below would discard it, and send_data_async cannot retry.
+handle_common_event(
+    cast,
+    {send_data_async, StreamId, Data, Fin},
+    StateName,
+    #state{pending_data = Pending} = State
+) ->
+    case length(Pending) >= ?MAX_PENDING_DATA_ENTRIES of
+        true ->
+            ?LOG_WARNING(
+                #{
+                    what => async_send_dropped_pending_limit,
+                    state => StateName,
+                    stream_id => StreamId
+                },
+                ?QUIC_LOG_META
+            ),
+            {keep_state, State};
+        false ->
+            {keep_state, State#state{pending_data = Pending ++ [{StreamId, Data, Fin}]}}
+    end;
 %% Return error for unhandled calls to prevent timeout
 handle_common_event({call, From}, _Request, StateName, State) ->
     {keep_state, State, [{reply, From, {error, {invalid_state, StateName}}}]};
@@ -7825,13 +7852,12 @@ do_send_data(
                             ),
                             %% RFC 9000 Section 19.12: DATA_BLOCKED reports the connection data limit
                             BlockedFrame = {data_blocked, MaxDataRemote},
-                            _FinalState = send_frame(BlockedFrame, State),
-                            {error, {flow_control_blocked, connection}};
+                            State1 = send_frame(BlockedFrame, State),
+                            queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State1);
                         {_, false} ->
-                            %% Stream-level flow control blocked
-                            %% RFC 9000: Don't queue data beyond flow control limits.
-                            %% Send STREAM_DATA_BLOCKED and return error to caller.
-                            %% Caller should retry after receiving MAX_STREAM_DATA from peer.
+                            %% Stream-level flow control blocked. Send
+                            %% STREAM_DATA_BLOCKED and queue; the send queue is
+                            %% drained when MAX_STREAM_DATA arrives.
                             ?LOG_DEBUG(
                                 #{
                                     what => stream_flow_control_blocked,
@@ -7843,8 +7869,8 @@ do_send_data(
                             ),
                             %% RFC 9000 Section 19.13: STREAM_DATA_BLOCKED reports the stream data limit
                             BlockedFrame = {stream_data_blocked, StreamId, SendMaxData},
-                            _FinalState = send_frame(BlockedFrame, State),
-                            {error, {flow_control_blocked, {stream, StreamId}}};
+                            State1 = send_frame(BlockedFrame, State),
+                            queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State1);
                         {true, true} ->
                             %% Flow control allows sending
                             %% Fragment and send data - congestion control may partially
@@ -8389,6 +8415,33 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
                 {error, send_queue_full} ->
                     {error, send_queue_full}
             end
+    end.
+
+%% Queue a send the peer's flow-control window has no room for, rather
+%% than returning an error. process_send_queue/1 drains it when MAX_DATA
+%% or MAX_STREAM_DATA arrives. An error here is silently lost for
+%% send_data_async callers, which are fire-and-forget and have no way to
+%% retry, and the loss is invisible to both ends: the bytes never reach
+%% the wire, so the peer cannot detect a gap, and the next send on the
+%% stream simply continues from a later offset.
+%%
+%% The send offset is advanced at queue time so later sends on the stream
+%% order behind this entry. QUIC reassembly is offset-based, so the order
+%% the queued entries actually go out in does not matter.
+queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State) ->
+    case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+        {ok, QState} ->
+            case maps:find(StreamId, QState#state.streams) of
+                {ok, Stream} ->
+                    NewStream = Stream#stream_state{send_offset = Offset + DataSize},
+                    {ok, QState#state{
+                        streams = maps:put(StreamId, NewStream, QState#state.streams)
+                    }};
+                error ->
+                    {ok, QState}
+            end;
+        {error, send_queue_full} = Error ->
+            Error
     end.
 
 %% Queue stream data when congestion window is full
@@ -11648,6 +11701,21 @@ test_check_flow_control(StreamId, Offset, DataSize, MaxDataRemote, DataSent, Str
         streams = Streams
     },
     check_send_queue_flow_control(StreamId, Offset, DataSize, State).
+
+%% Test helper for queue_blocked_send/6. A send the peer's window has no
+%% room for must be queued, not dropped, and the stream offset must
+%% advance so later sends order behind it.
+%% Returns {ok, NewSendOffset, QueuedCount} | {error, Reason}.
+test_queue_blocked_send(StreamId, Offset, Data, Fin, SendOffset) ->
+    Stream = #stream_state{send_offset = SendOffset, send_max_data = 0},
+    State = #state{streams = #{StreamId => Stream}},
+    case queue_blocked_send(StreamId, Offset, Data, Fin, iolist_size(Data), State) of
+        {ok, S2} ->
+            #{StreamId := S} = S2#state.streams,
+            {ok, S#stream_state.send_offset, S2#state.send_queue_count};
+        Error ->
+            Error
+    end.
 
 %% Test helper for complete_migration/2.
 %% Tests that path_changed notification is sent to owner on active migration.
