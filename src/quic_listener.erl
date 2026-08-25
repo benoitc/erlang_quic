@@ -691,7 +691,7 @@ get_tables(_) ->
 
 handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) ->
     case parse_packet_header(Packet, DCIDLen) of
-        {initial, DCID, _SCID, Version, _Rest} ->
+        {initial, DCID, SCID, Version, _Rest} ->
             %% Per-packet routing trace. Logged at debug: every received packet
             %% hits this path (a short-header packet per 1-RTT datagram), so at
             %% info level a busy listener floods the log and burns CPU.
@@ -704,7 +704,12 @@ handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) -
                 },
                 ?QUIC_LOG_META
             ),
-            handle_initial_packet(Packet, DCID, Version, RemoteAddr, State);
+            case supported_version(Version) of
+                true ->
+                    handle_initial_packet(Packet, DCID, Version, RemoteAddr, State);
+                false ->
+                    send_version_negotiation(DCID, SCID, Version, RemoteAddr, State)
+            end;
         {short, DCID, _Rest} ->
             ?LOG_DEBUG(#{what => short_header_packet, dcid => DCID}, ?QUIC_LOG_META),
             route_to_connection(DCID, Packet, RemoteAddr, State);
@@ -718,6 +723,33 @@ handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) -
             ?LOG_WARNING(#{what => packet_parse_failed, reason => Reason}, ?QUIC_LOG_META),
             ok
     end.
+
+%% RFC 9000 Section 6.1: a server that receives a long-header packet with a
+%% version it does not support MUST respond with a Version Negotiation packet
+%% listing the versions it does support. Without this a peer probing with a
+%% reserved version, which is how readiness checks and the QUIC Interop
+%% Runner detect a live server, gets silence.
+supported_version(?QUIC_VERSION_1) -> true;
+supported_version(?QUIC_VERSION_2) -> true;
+supported_version(_) -> false.
+
+send_version_negotiation(_DCID, _SCID, 0, _RemoteAddr, _State) ->
+    %% Version 0 is itself a Version Negotiation packet; never reply to one
+    %% (RFC 9000 Section 6.1), or two servers can trade them forever.
+    ok;
+send_version_negotiation(DCID, SCID, _Version, {IP, Port}, State) ->
+    #listener_state{
+        socket = Socket,
+        socket_state = SocketState,
+        socket_backend = Backend
+    } = State,
+    %% The connection IDs are swapped: our DCID is what the client used as
+    %% its source, so the client can match the reply to its attempt.
+    Packet = quic_packet:encode_version_negotiation(
+        SCID, DCID, [?QUIC_VERSION_1, ?QUIC_VERSION_2]
+    ),
+    send_packet(Socket, SocketState, Backend, IP, Port, Packet),
+    ok.
 
 %% Parse packet header to extract DCID for routing
 %% DCIDLen parameter specifies expected DCID length for short header packets
