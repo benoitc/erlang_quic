@@ -7966,7 +7966,30 @@ do_send_data(
                         ?QUIC_LOG_META
                     ),
 
+                    Allowed = min(ConnectionAllowed, StreamAllowed),
                     case {DataSize =< ConnectionAllowed, DataSize =< StreamAllowed} of
+                        Fits when Fits =/= {true, true}, Allowed > 0 ->
+                            %% Part of this write fits in the peer's window.
+                            %% Send that part and queue the rest: queuing the
+                            %% whole write instead deadlocks the transfer,
+                            %% because the peer only extends the window as it
+                            %% consumes data, so sending nothing means nothing
+                            %% ever arrives to open it.
+                            Bin = iolist_to_binary(Data),
+                            <<Head:Allowed/binary, Tail/binary>> = Bin,
+                            case do_send_data(StreamId, Head, false, State) of
+                                {ok, SentState} ->
+                                    queue_blocked_send(
+                                        StreamId,
+                                        Offset + Allowed,
+                                        Tail,
+                                        Fin,
+                                        byte_size(Tail),
+                                        SentState
+                                    );
+                                Other ->
+                                    Other
+                            end;
                         {false, _} ->
                             %% Connection-level flow control blocked
                             %% RFC 9000: Don't queue data beyond flow control limits.
