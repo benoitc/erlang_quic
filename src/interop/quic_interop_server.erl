@@ -144,50 +144,52 @@ decode_key_entry('PrivateKeyInfo', Der) ->
 decode_key_entry(Type, _Der) ->
     error({unsupported_key_type, Type}).
 
-spawn_handler(ConnPid, Conn, WwwDir, TestCase) ->
+spawn_handler(ConnPid, _DCID, WwwDir, TestCase) ->
+    %% The arity-2 connection_handler is called as Fun(ConnPid, DCID); the
+    %% connection handle in every quic message and API call is the pid.
     HandlerPid = spawn(fun() ->
-        connection_handler(ConnPid, Conn, WwwDir, TestCase)
+        connection_handler(ConnPid, WwwDir, TestCase)
     end),
     {ok, HandlerPid}.
 
-connection_handler(ConnPid, Conn, WwwDir, TestCase) ->
+connection_handler(Conn, WwwDir, TestCase) ->
     io:format("Handler started, waiting for messages...~n"),
     %% Wait for stream data
     receive
         {quic, Conn, {connected, Info}} ->
             io:format("Handler got connected: ~p~n", [Info]),
-            connection_handler(ConnPid, Conn, WwwDir, TestCase);
+            connection_handler(Conn, WwwDir, TestCase);
         {quic, Conn, {stream_opened, StreamId}} ->
             io:format("Handler got stream_opened: ~p~n", [StreamId]),
-            handle_stream(ConnPid, Conn, StreamId, WwwDir, TestCase);
+            handle_stream(Conn, StreamId, WwwDir, TestCase);
         {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
             io:format(
                 "Handler got stream_data: stream=~p size=~p fin=~p~n",
                 [StreamId, byte_size(Data), Fin]
             ),
             %% Handle request
-            handle_request(ConnPid, Conn, StreamId, Data, WwwDir, TestCase);
+            handle_request(Conn, StreamId, Data, WwwDir, TestCase);
         {quic, Conn, {closed, Reason}} ->
             io:format("Handler got closed: ~p~n", [Reason]),
             ok;
         Other ->
             io:format("Handler got unexpected: ~p~n", [Other]),
-            connection_handler(ConnPid, Conn, WwwDir, TestCase)
+            connection_handler(Conn, WwwDir, TestCase)
     after 60000 ->
         io:format("Handler timeout~n"),
         ok
     end.
 
-handle_stream(_ConnPid, Conn, StreamId, WwwDir, TestCase) ->
+handle_stream(Conn, StreamId, WwwDir, TestCase) ->
     %% Wait for request on this stream
     receive
         {quic, Conn, {stream_data, StreamId, Data, _Fin}} ->
-            handle_request(undefined, Conn, StreamId, Data, WwwDir, TestCase)
+            handle_request(Conn, StreamId, Data, WwwDir, TestCase)
     after 30000 ->
         ok
     end.
 
-handle_request(_ConnPid, Conn, StreamId, Data, WwwDir, TestCase) ->
+handle_request(Conn, StreamId, Data, WwwDir, TestCase) ->
     io:format("handle_request: stream=~p data=~p~n", [StreamId, Data]),
     %% Parse simple HTTP/0.9 request: "GET /path\r\n"
     case parse_request(Data) of
