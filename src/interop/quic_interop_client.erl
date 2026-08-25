@@ -229,8 +229,14 @@ build_opts(_) ->
 %% MAX_STREAMS only as earlier streams close.
 collect_streams(Conn, Paths, DownloadsDir) ->
     {Open, Pending} = fill_streams(Conn, Paths, #{}, DownloadsDir),
-    Done = collect_loop(Conn, Open, Pending, DownloadsDir, #{}, 180000),
-    [Result || {_StreamId, Result} <- maps:to_list(Done)].
+    Deadline = erlang:monotonic_time(millisecond) + 180000,
+    {Done, PendingLeft} = collect_loop(Conn, Open, Pending, DownloadsDir, #{}, Deadline),
+    case PendingLeft of
+        [] -> ok;
+        _ -> io:format("~p request(s) never got a stream~n", [length(PendingLeft)])
+    end,
+    [Result || {_StreamId, Result} <- maps:to_list(Done)] ++
+        [error || _ <- PendingLeft].
 
 fill_streams(_Conn, [], Open, _DownloadsDir) ->
     {Open, []};
@@ -261,9 +267,19 @@ open_target(Path, DownloadsDir) ->
         {error, Err} -> {error, FilePath, Err}
     end.
 
-collect_loop(_Conn, Open, [], _DownloadsDir, Done, _Timeout) when map_size(Open) =:= 0 ->
-    Done;
-collect_loop(Conn, Open, Pending, DownloadsDir, Done, Timeout) ->
+collect_loop(_Conn, Open, [], _DownloadsDir, Done, _Deadline) when map_size(Open) =:= 0 ->
+    {Done, []};
+collect_loop(Conn, Open, Pending, DownloadsDir, Done, Deadline) ->
+    TimeLeft = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    %% With requests waiting for stream credit, poll: MAX_STREAMS
+    %% arriving at the connection process produces no message here, so
+    %% waiting only for stream events deadlocks when the last grant
+    %% lands after the last completion event has been handled.
+    Timeout =
+        case Pending of
+            [] -> TimeLeft;
+            _ -> min(200, TimeLeft)
+        end,
     receive
         {quic, Conn, {stream_data, Sid, Data, Fin}} ->
             case maps:find(Sid, Open) of
@@ -278,7 +294,7 @@ collect_loop(Conn, Open, Pending, DownloadsDir, Done, Timeout) ->
                                 Conn, Pending, maps:remove(Sid, Open), DownloadsDir
                             ),
                             collect_loop(
-                                Conn, Open2, Pending2, DownloadsDir, Done#{Sid => ok}, Timeout
+                                Conn, Open2, Pending2, DownloadsDir, Done#{Sid => ok}, Deadline
                             );
                         false ->
                             collect_loop(
@@ -287,20 +303,26 @@ collect_loop(Conn, Open, Pending, DownloadsDir, Done, Timeout) ->
                                 Pending,
                                 DownloadsDir,
                                 Done,
-                                Timeout
+                                Deadline
                             )
                     end;
                 error ->
-                    collect_loop(Conn, Open, Pending, DownloadsDir, Done, Timeout)
+                    collect_loop(Conn, Open, Pending, DownloadsDir, Done, Deadline)
             end;
         {quic, Conn, {stream_reset, Sid, _Code}} ->
             {Open2, Pending2} = fill_streams(Conn, Pending, maps:remove(Sid, Open), DownloadsDir),
-            collect_loop(Conn, Open2, Pending2, DownloadsDir, Done#{Sid => error}, Timeout);
+            collect_loop(Conn, Open2, Pending2, DownloadsDir, Done#{Sid => error}, Deadline);
         {quic, Conn, {closed, _Reason}} ->
-            close_remaining(Open, Done)
+            {close_remaining(Open, Done), Pending}
     after Timeout ->
-        io:format("Stream timeout with ~p stream(s) outstanding~n", [map_size(Open)]),
-        close_remaining(Open, Done)
+        case TimeLeft > 0 andalso Pending =/= [] of
+            true ->
+                {Open2, Pending2} = fill_streams(Conn, Pending, Open, DownloadsDir),
+                collect_loop(Conn, Open2, Pending2, DownloadsDir, Done, Deadline);
+            false ->
+                io:format("Stream timeout with ~p stream(s) outstanding~n", [map_size(Open)]),
+                {close_remaining(Open, Done), Pending}
+        end
     end.
 
 close_remaining(Open, Done) ->
