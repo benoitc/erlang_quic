@@ -621,6 +621,7 @@
         undefined
         | #{
             identity => binary(),
+            identity_idx => non_neg_integer(),
             secret => binary(),
             mode => psk_dhe_ke | psk_ke
         },
@@ -5972,9 +5973,6 @@ do_server_client_hello_cont(
         end,
     ok,
 
-    %% For normal handshake, derive early secret from zero PSK
-    %% PSK-based resumption with full 0-RTT support requires additional changes
-    %% to skip Certificate/CertificateVerify - implementing basic 0-RTT decryption only
     HashLen0 =
         case Cipher of
             aes_256_gcm -> 48;
@@ -5982,13 +5980,14 @@ do_server_client_hello_cont(
         end,
     ZeroPSK = <<0:HashLen0/unit:8>>,
 
-    %% Derive early secret. External-PSK selection wins over both
-    %% resumption-PSK 0-RTT and the standard zero-PSK path.
+    %% Derive early secret. External-PSK selection wins over
+    %% resumption-PSK, which wins over the standard zero-PSK path.
     {EarlyKeys, EarlySecret, SelectedPsk} =
         case ExternalPskResult of
             {ok, #{secret := PSKSecret, mode := Mode} = Sel} ->
                 Selected = #{
                     identity => maps:get(identity, Sel),
+                    identity_idx => maps:get(identity_idx, Sel),
                     secret => PSKSecret,
                     mode => Mode
                 },
@@ -5999,9 +5998,7 @@ do_server_client_hello_cont(
                 };
             none ->
                 case PSKInfo of
-                    #{identities := [{Identity, _Age}], binders := [Binder]} when
-                        WantsEarlyData
-                    ->
+                    #{identities := [{Identity, _Age} | _], binders := [Binder | _]} ->
                         case validate_psk(Identity, Cipher, OriginalMsg, State) of
                             {ok, PSK, ResumptionSecret} ->
                                 PskBindersInfo = maps:get(psk_binders, ClientHelloInfo, undefined),
@@ -6016,21 +6013,42 @@ do_server_client_hello_cont(
                                         %% replayed (RFC 9001 §9.2).
                                         consume_ticket_globally(Identity),
                                         ES = quic_crypto:derive_early_secret(Cipher, PSK),
-                                        ClientHelloHash = quic_crypto:transcript_hash(
-                                            Cipher, OriginalMsg
-                                        ),
-                                        ETS = quic_crypto:derive_client_early_traffic_secret(
-                                            Cipher, ES, ClientHelloHash
-                                        ),
-                                        {Key, IV, HP} = quic_keys:derive_keys(ETS, Cipher),
-                                        EK = #crypto_keys{
-                                            key = Key, iv = IV, hp = HP, cipher = Cipher
+                                        %% The ticket's PSK carries the whole
+                                        %% handshake (psk_dhe_ke), so the cert
+                                        %% flight is skipped; before, it only
+                                        %% fed the 0-RTT keys and the
+                                        %% handshake fell back to a full
+                                        %% cert exchange on a zero PSK.
+                                        Selected = #{
+                                            identity => Identity,
+                                            identity_idx => 0,
+                                            secret => PSK,
+                                            mode => psk_dhe_ke
                                         },
-                                        {
-                                            {EK, ResumptionSecret},
-                                            quic_crypto:derive_early_secret(Cipher, ZeroPSK),
-                                            undefined
-                                        };
+                                        EK =
+                                            case WantsEarlyData of
+                                                true ->
+                                                    ClientHelloHash =
+                                                        quic_crypto:transcript_hash(
+                                                            Cipher, OriginalMsg
+                                                        ),
+                                                    ETS =
+                                                        quic_crypto:derive_client_early_traffic_secret(
+                                                            Cipher, ES, ClientHelloHash
+                                                        ),
+                                                    {Key, IV, HP} =
+                                                        quic_keys:derive_keys(ETS, Cipher),
+                                                    EKeys = #crypto_keys{
+                                                        key = Key,
+                                                        iv = IV,
+                                                        hp = HP,
+                                                        cipher = Cipher
+                                                    },
+                                                    {EKeys, ResumptionSecret};
+                                                false ->
+                                                    undefined
+                                            end,
+                                        {EK, ES, Selected};
                                     false ->
                                         ?LOG_WARNING(
                                             #{what => resumption_psk_binder_failed},
@@ -6040,6 +6058,8 @@ do_server_client_hello_cont(
                                         exit({tls_alert, decrypt_error})
                                 end;
                             error ->
+                                %% Unknown or expired ticket: fall back to a
+                                %% full handshake (RFC 8446 §4.2.11).
                                 {undefined, quic_crypto:derive_early_secret(Cipher, ZeroPSK),
                                     undefined}
                         end;
@@ -6089,10 +6109,10 @@ do_server_client_hello_cont(
         session_id => SessionId
     },
     ServerHelloOpts =
-        case {SelectedPsk, ExternalPskResult} of
-            {undefined, _} ->
+        case SelectedPsk of
+            undefined ->
                 ServerHelloOpts0;
-            {_, {ok, #{identity_idx := Idx, mode := SelMode}}} ->
+            #{identity_idx := Idx, mode := SelMode} ->
                 ServerHelloOpts0#{
                     selected_psk_identity => Idx,
                     selected_psk_mode => SelMode
