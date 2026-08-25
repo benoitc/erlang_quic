@@ -6637,7 +6637,13 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                     %% advancing.
                     MaxWindowForStream = State#state.fc_max_receive_window,
                     Headroom = max(0, RecvMaxData - NewRecvOffset),
-                    WillSendMaxStreamData = Headroom < (MaxWindowForStream div 2),
+                    %% A stream whose final size is known can never use more
+                    %% credit (RFC 9000 §19.10), so widening its window only
+                    %% spends bytes: one frame per completed stream adds up
+                    %% in request/response traffic.
+                    WillSendMaxStreamData =
+                        Headroom < (MaxWindowForStream div 2) andalso
+                            NewStream#stream_state.final_size =:= undefined,
                     Threshold = RecvMaxData - (MaxWindowForStream div 2),
                     ?LOG_DEBUG(
                         #{
