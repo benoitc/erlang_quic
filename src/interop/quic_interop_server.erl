@@ -126,15 +126,22 @@ build_server_opts(TestCase, Cert, Key, WwwDir) ->
 
 %% Decode PEM-encoded private key to internal format
 decode_private_key(PemData) ->
-    case public_key:pem_decode(PemData) of
-        [{Type, Der, not_encrypted}] ->
+    %% A key file may carry more than the key: `openssl ecparam -genkey',
+    %% which is how the interop runner generates its certificates, emits
+    %% EC PARAMETERS ahead of EC PRIVATE KEY. Pick the key entry out of
+    %% the list rather than insisting the file holds exactly one.
+    case [E || {Type, _, _} = E <- public_key:pem_decode(PemData), is_key_entry(Type)] of
+        [{Type, Der, _} | _] ->
             decode_key_entry(Type, Der);
-        [{Type, Der, _Cipher}] ->
-            %% Encrypted key - not supported yet
-            decode_key_entry(Type, Der);
-        _ ->
+        [] ->
             error(invalid_private_key)
     end.
+
+is_key_entry('RSAPrivateKey') -> true;
+is_key_entry('DSAPrivateKey') -> true;
+is_key_entry('ECPrivateKey') -> true;
+is_key_entry('PrivateKeyInfo') -> true;
+is_key_entry(_) -> false.
 
 decode_key_entry('RSAPrivateKey', Der) ->
     public_key:der_decode('RSAPrivateKey', Der);
