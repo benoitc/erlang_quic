@@ -88,10 +88,11 @@ run_test(TestCase, RequestsStr, DownloadsDir) ->
             io:format("No requests specified~n"),
             halt(?EXIT_FAILURE);
         _ ->
-            Results = lists:map(
-                fun(Url) -> download_file(TestCase, Url, DownloadsDir) end,
-                Requests
-            ),
+            %% The runner asks for several files and requires them on ONE
+            %% connection: the transfer test counts handshakes and fails on
+            %% more than one, and multiplexing expects concurrent streams.
+            %% Connect once per host and reuse it for every path.
+            Results = download_all(TestCase, Requests, DownloadsDir),
 
             case lists:all(fun(R) -> R =:= ok end, Results) of
                 true ->
@@ -103,29 +104,92 @@ run_test(TestCase, RequestsStr, DownloadsDir) ->
             end
     end.
 
-download_file(TestCase, Url, DownloadsDir) ->
-    io:format("Downloading: ~s~n", [Url]),
+download_all(TestCase, Requests, DownloadsDir) ->
+    ByHost = lists:foldl(
+        fun(Url, Acc) ->
+            case parse_url(Url) of
+                {ok, Host, Port, Path} ->
+                    maps:update_with(
+                        {Host, Port}, fun(Ps) -> Ps ++ [Path] end, [Path], Acc
+                    );
+                error ->
+                    io:format("Invalid URL: ~s~n", [Url]),
+                    Acc
+            end
+        end,
+        #{},
+        Requests
+    ),
+    lists:append(
+        maps:fold(
+            fun({Host, Port}, Paths, Acc) ->
+                [download_from(TestCase, Host, Port, Paths, DownloadsDir) | Acc]
+            end,
+            [],
+            ByHost
+        )
+    ).
 
-    %% Parse URL
-    case parse_url(Url) of
-        {ok, Host, Port, Path} ->
-            %% Build connection options based on test case
-            Opts = build_opts(TestCase),
-
-            %% Connect
-            case quic:connect(Host, Port, Opts, self()) of
-                {ok, Conn} ->
-                    Result = wait_for_connection_and_download(
-                        Conn, Path, DownloadsDir, TestCase
-                    ),
+download_from(TestCase, Host, Port, Paths, DownloadsDir) ->
+    Opts = build_opts(TestCase),
+    case quic:connect(Host, Port, Opts, self()) of
+        {ok, Conn} ->
+            case wait_connected(Conn, TestCase) of
+                ok ->
+                    Results = [
+                        begin
+                            io:format("Downloading: https://~s:~p/~s~n", [Host, Port, Path]),
+                            request_path(Conn, Path, DownloadsDir)
+                        end
+                     || Path <- Paths
+                    ],
                     quic:close(Conn, normal),
-                    Result;
-                {error, Reason} ->
-                    io:format("Connection failed: ~p~n", [Reason]),
-                    error
+                    Results;
+                error ->
+                    quic:close(Conn, normal),
+                    [error || _ <- Paths]
             end;
-        error ->
-            io:format("Invalid URL: ~s~n", [Url]),
+        {error, Reason} ->
+            io:format("Connection failed: ~p~n", [Reason]),
+            [error || _ <- Paths]
+    end.
+
+wait_connected(Conn, TestCase) ->
+    receive
+        {quic, Conn, {connected, _Info}} ->
+            io:format("Connected~n"),
+            case TestCase of
+                "keyupdate" -> quic_connection:key_update(Conn);
+                _ -> ok
+            end,
+            ok;
+        {quic, Conn, {closed, Reason}} ->
+            io:format("Connection closed: ~p~n", [Reason]),
+            error;
+        {quic, Conn, {transport_error, Code, Msg}} ->
+            io:format("Transport error: ~p ~p~n", [Code, Msg]),
+            error
+    after 30000 ->
+        io:format("Connection timeout~n"),
+        error
+    end.
+
+%% Kept for the resumption/zerortt paths, which connect per attempt by
+%% design: one connection, one request.
+wait_for_connection_and_download(Conn, Path, DownloadsDir, TestCase) ->
+    case wait_connected(Conn, TestCase) of
+        ok -> request_path(Conn, Path, DownloadsDir);
+        error -> error
+    end.
+
+request_path(Conn, Path, DownloadsDir) ->
+    case quic:open_stream(Conn) of
+        {ok, StreamId} ->
+            Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
+            ok = quic:send_data(Conn, StreamId, Request, true),
+            receive_and_save(Conn, StreamId, Path, DownloadsDir);
+        {error, StreamErr} ->
+            io:format("Failed to open stream: ~p~n", [StreamErr]),
             error
     end.
 
@@ -157,42 +221,6 @@ build_opts(_) ->
         verify => false,
         alpn => [<<"hq-interop">>, <<"h3">>]
     }.
-
-wait_for_connection_and_download(Conn, Path, DownloadsDir, TestCase) ->
-    receive
-        {quic, Conn, {connected, _Info}} ->
-            io:format("Connected~n"),
-
-            %% Handle key update test case
-            case TestCase of
-                "keyupdate" ->
-                    %% Initiate key update before request
-                    quic_connection:key_update(Conn);
-                _ ->
-                    ok
-            end,
-
-            %% Open stream and send request
-            case quic:open_stream(Conn) of
-                {ok, StreamId} ->
-                    %% Send HTTP/0.9 style request (for hq-interop)
-                    Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
-                    ok = quic:send_data(Conn, StreamId, Request, true),
-                    receive_and_save(Conn, StreamId, Path, DownloadsDir);
-                {error, StreamErr} ->
-                    io:format("Failed to open stream: ~p~n", [StreamErr]),
-                    error
-            end;
-        {quic, Conn, {closed, Reason}} ->
-            io:format("Connection closed: ~p~n", [Reason]),
-            error;
-        {quic, Conn, {transport_error, Code, Msg}} ->
-            io:format("Transport error: ~p ~p~n", [Code, Msg]),
-            error
-    after 30000 ->
-        io:format("Connection timeout~n"),
-        error
-    end.
 
 receive_and_save(Conn, StreamId, Path, DownloadsDir) ->
     %% Extract filename and open file for streaming writes
