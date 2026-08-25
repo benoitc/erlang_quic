@@ -1799,26 +1799,33 @@ handshaking({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) 
 handshaking(
     {call, From},
     {send_data, StreamId, Data, Fin},
-    #state{
-        early_keys = undefined,
-        pending_data = Pending
-    } = State
+    #state{role = client, early_keys = EarlyKeys} = State
+) when EarlyKeys =/= undefined ->
+    %% Send as 0-RTT data. 0-RTT sending is a client-only affair (RFC
+    %% 9000 §17.2.3): a server also holds early keys, but only for
+    %% receiving. Answering early data before the handshake completes
+    %% must not go out in a 0-RTT packet the client can never decrypt,
+    %% so the server queues below and the data goes out 1-RTT on
+    %% connected.
+    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
+        {ok, NewState} ->
+            {keep_state, NewState, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+handshaking(
+    {call, From},
+    {send_data, StreamId, Data, Fin},
+    #state{pending_data = Pending} = State
 ) ->
-    %% No early keys, queue the data for later (with limit to prevent memory exhaustion)
+    %% No usable send keys yet, queue the data for later (with limit to
+    %% prevent memory exhaustion)
     case length(Pending) >= ?MAX_PENDING_DATA_ENTRIES of
         true ->
             {keep_state, State, [{reply, From, {error, pending_data_limit}}]};
         false ->
             NewPending = Pending ++ [{StreamId, Data, Fin}],
             {keep_state, State#state{pending_data = NewPending}, [{reply, From, ok}]}
-    end;
-handshaking({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = _} = State) ->
-    %% Send as 0-RTT data
-    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
-        {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
 handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
@@ -7907,7 +7914,7 @@ do_send_zero_rtt_data(
             Payload = quic_frame:encode(Frame),
 
             %% Send as 0-RTT packet
-            NewState = send_zero_rtt_packet(Payload, EarlyKeys, State),
+            NewState = send_zero_rtt_packet(Payload, [Frame], EarlyKeys, State),
 
             %% Update stream state and track early data sent
             NewStreamState = StreamState#stream_state{
@@ -7934,7 +7941,7 @@ do_send_zero_rtt_data(
 
 %% Send a 0-RTT packet (long header, type 1)
 %% RFC 9001 Section 5.3: 0-RTT packets use early traffic keys
-send_zero_rtt_packet(Payload, EarlyKeys, State) ->
+send_zero_rtt_packet(Payload, Frames, EarlyKeys, State) ->
     #state{
         scid = SCID,
         dcid = DCID,
@@ -7970,12 +7977,25 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
     ),
     NewSocketState = send_and_take_socket_state(Packet, State),
 
+    %% 0-RTT shares the application PN space, so it must be tracked for
+    %% loss detection like any 1-RTT packet: a dropped 0-RTT request was
+    %% otherwise never retransmitted and the stream hung forever (RFC
+    %% 9001 §4.1.1 expects lost 0-RTT data to be resent).
+    Now = erlang:monotonic_time(millisecond),
+    NewLossState = quic_loss:on_packet_sent(
+        State#state.loss_state, PN, byte_size(Packet), true, Frames, Now
+    ),
+    NewCCState = quic_cc:on_packet_sent(State#state.cc_state, byte_size(Packet)),
+
     %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
     State#state{
         pn_app = NewPNSpace,
         packets_sent = State#state.packets_sent + 1,
-        socket_state = NewSocketState
+        socket_state = NewSocketState,
+        loss_state = NewLossState,
+        cc_state = NewCCState,
+        pto_dirty = true
     }.
 
 %% Reset local state for all streams that carried 0-RTT data when the
@@ -9498,6 +9518,12 @@ handle_pto_timeout(#state{loss_state = LossState} = State) ->
 
 %% Send a probe packet for PTO
 %% PTO probes are allowed to use control_allowance per RFC 9002
+%% App-space PTO can fire before 1-RTT keys exist when tracked 0-RTT
+%% packets are outstanding. Handshake-space recovery drives progress
+%% until the keys arrive; sending nothing here avoids building an app
+%% packet without keys.
+send_probe_packet(#state{app_keys = undefined} = State) ->
+    State;
 send_probe_packet(State) ->
     case get_oldest_unacked_frames(State) of
         {ok, Frames} ->
