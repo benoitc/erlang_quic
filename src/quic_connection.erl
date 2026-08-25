@@ -473,6 +473,8 @@
     %% StreamId => send reliable size, for local RESET_STREAM_AT streams whose
     %% data below the reliable size is not yet fully acked. Drained as acks arrive.
     pending_send_reset_at = #{} :: #{non_neg_integer() => non_neg_integer()},
+    %% FIN acked but earlier bytes still queued or in flight
+    pending_fin_reclaim = #{} :: #{non_neg_integer() => non_neg_integer()},
     %% Lost control-frame retransmissions deferred by congestion control, replayed
     %% through the CC-checked retransmit path when cwnd reopens.
     deferred_ctrl_retransmits = [] :: [term()],
@@ -4964,8 +4966,25 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% Retransmit lost packets
                     State4 = retransmit_lost_packets(LostPackets, State3),
 
+                    %% Close the send side of streams whose FIN the peer just
+                    %% acked (RFC 9000 §3.1 "Data Recvd"). Reclaiming here, and
+                    %% not at send time, paces MAX_STREAMS credit to what the
+                    %% peer has actually consumed; granting at send time let a
+                    %% peer run far ahead of its own completions.
+                    State4a =
+                        case
+                            lists:usort([
+                                Sid
+                             || #sent_packet{frames = Fs} <- AckedPackets,
+                                {stream, Sid, _O, _D, true} <- Fs
+                            ])
+                        of
+                            [] -> State4;
+                            FinSids -> lists:foldl(fun settle_fin_ack/2, State4, FinSids)
+                        end,
+
                     %% Reset PTO timer after ACK processing
-                    State5 = set_pto_timer(State4),
+                    State5 = set_pto_timer(State4a),
 
                     %% Try to send queued data now that cwnd may have freed up.
                     %% This also drains retransmit_stream entries deferred by CC.
@@ -4974,7 +4993,7 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% complete any local reset-at reclaim whose reliable bytes are
                     %% now acked.
                     State7 = flush_deferred_retransmits(State6),
-                    State8 = complete_send_reset_at(State7),
+                    State8 = complete_fin_reclaims(complete_send_reset_at(State7)),
                     %% Event-driven flush: flush batch and timers after ACK processing
                     flush_dirty_timers(flush_socket_batch(State8))
                 %% close inner case (on_ack_received)
@@ -8280,12 +8299,14 @@ do_send_data(
                                     case maps:find(StreamId, NewState#state.streams) of
                                         {ok, UpdatedStream} ->
                                             SendFin = (Fin andalso BytesSent =:= DataSize),
+                                            %% send_done is NOT set here: RFC 9000 §3.1
+                                            %% ends the send side at "Data Recvd", which
+                                            %% requires the peer's acks. Reclaim (and the
+                                            %% MAX_STREAMS credit it returns) happens in
+                                            %% the ack path via settle_fin_ack/2.
                                             FinalStream = UpdatedStream#stream_state{
                                                 send_offset = Offset + DataSize,
-                                                send_fin = SendFin,
-                                                send_done =
-                                                    SendFin orelse
-                                                        UpdatedStream#stream_state.send_done
+                                                send_fin = SendFin
                                             },
                                             FinalState0 = NewState#state{
                                                 streams = maps:put(
@@ -9113,7 +9134,7 @@ process_send_queue_entry(
                     %% Only update data_sent for connection-level flow control accounting.
                     %% send_offset was already advanced when the data was first queued
                     %% (in do_send_data) to prevent offset overlap bugs.
-                    State3 =
+                    State3a =
                         case BytesSent > 0 of
                             true ->
                                 State2#state{
@@ -9121,6 +9142,18 @@ process_send_queue_entry(
                                 };
                             false ->
                                 State2
+                        end,
+                    %% A queued write that carried FIN closes the send side only
+                    %% here: do_send_data could not mark it (the write was still
+                    %% queued). The queue-count check rules out a zero-length FIN
+                    %% entry that was re-queued rather than sent (0 =:= 0 lies).
+                    EntrySent =
+                        BytesSent =:= DataSize andalso
+                            State3a#state.send_queue_count =:= DecrementedQueueCount,
+                    State3 =
+                        case Fin andalso EntrySent of
+                            true -> mark_fin_sent(StreamId, State3a);
+                            false -> State3a
                         end,
                     %% If data was queued again (cwnd still full), stop processing
                     case pqueue_is_empty(State3#state.send_queue) of
@@ -10045,6 +10078,76 @@ complete_send_reset_at(#state{pending_send_reset_at = P} = State) ->
     ).
 
 %% Handle PTO timeout - send probe packet
+%% The drain-path counterpart of do_send_data's inline FIN bookkeeping.
+%% send_done is deliberately not set: that happens when the FIN is acked.
+mark_fin_sent(StreamId, State) ->
+    case maps:find(StreamId, State#state.streams) of
+        {ok, S} ->
+            State#state{
+                streams = maps:put(
+                    StreamId,
+                    S#stream_state{send_fin = true},
+                    State#state.streams
+                )
+            };
+        error ->
+            State
+    end.
+
+%% The peer acked a FIN-bearing STREAM frame. The send side is done once
+%% nothing below the final offset remains queued or in flight; otherwise
+%% park it for complete_fin_reclaims/1 to finish on a later ack.
+settle_fin_ack(StreamId, State) ->
+    case maps:find(StreamId, State#state.streams) of
+        {ok, #stream_state{send_done = true}} ->
+            State;
+        {ok, #stream_state{send_offset = Final}} ->
+            Pending =
+                stream_has_queued_below(StreamId, Final, State#state.send_queue) orelse
+                    quic_loss:stream_has_unacked_below(
+                        State#state.loss_state, StreamId, Final
+                    ),
+            case Pending of
+                false ->
+                    mark_send_done_and_reclaim(StreamId, State);
+                true ->
+                    State#state{
+                        pending_fin_reclaim =
+                            maps:put(StreamId, Final, State#state.pending_fin_reclaim)
+                    }
+            end;
+        error ->
+            State
+    end.
+
+%% Finish parked FIN reclaims whose remaining bytes are now acked.
+complete_fin_reclaims(#state{pending_fin_reclaim = P} = State) when map_size(P) =:= 0 ->
+    State;
+complete_fin_reclaims(#state{pending_fin_reclaim = P} = State) ->
+    maps:fold(
+        fun(StreamId, Final, Acc) ->
+            Pending =
+                stream_has_queued_below(StreamId, Final, Acc#state.send_queue) orelse
+                    quic_loss:stream_has_unacked_below(
+                        Acc#state.loss_state, StreamId, Final
+                    ),
+            case Pending of
+                true ->
+                    Acc;
+                false ->
+                    mark_send_done_and_reclaim(
+                        StreamId,
+                        Acc#state{
+                            pending_fin_reclaim =
+                                maps:remove(StreamId, Acc#state.pending_fin_reclaim)
+                        }
+                    )
+            end
+        end,
+        State,
+        P
+    ).
+
 handle_pto_timeout(#state{loss_state = LossState} = State) ->
     %% Increment PTO count
     NewLossState = quic_loss:on_pto_expired(LossState),
