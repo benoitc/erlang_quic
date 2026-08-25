@@ -4651,11 +4651,14 @@ decode_short_header_packet(Data, State) ->
 %% Decrypt an application (1-RTT) packet with key phase handling
 %% Uses 2-stage API: unprotect header to get key_phase, then decrypt with selected keys
 decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
-    #crypto_keys{hp = HP} = CurrentKeys,
+    %% The cipher must come from the negotiated keys: inferring it from
+    %% the HP key length mistakes ChaCha20-Poly1305 for AES-256-GCM and
+    %% drops every received 1-RTT packet on such connections.
+    #crypto_keys{hp = HP, cipher = HpCipher} = CurrentKeys,
     PNOffset = byte_size(Header),
 
     %% Stage 1: Unprotect header to get key_phase and PN info
-    case quic_aead:unprotect_short_header(HP, Header, EncryptedPayload, PNOffset) of
+    case quic_aead:unprotect_short_header(HpCipher, HP, Header, EncryptedPayload, PNOffset) of
         {error, Reason} ->
             {error, Reason};
         {ok, KeyPhase, PNLen, TruncatedPN, UnprotectedHeader} ->
