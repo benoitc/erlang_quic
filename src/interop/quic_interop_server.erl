@@ -113,7 +113,9 @@ build_server_opts(TestCase, Cert, Key, WwwDir) ->
     %% Test case specific options
     case TestCase of
         "retry" ->
-            BaseOpts#{retry => true};
+            %% The listener reads address_validation; `retry' was set here
+            %% but nothing ever looked at it, so no Retry was sent.
+            BaseOpts#{address_validation => always};
         "chacha20" ->
             BaseOpts#{ciphers => [chacha20_poly1305]};
         "v2" ->
