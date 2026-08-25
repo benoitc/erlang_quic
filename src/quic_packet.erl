@@ -47,6 +47,8 @@
 
 -export([
     encode_long/5,
+    type_to_bits/2,
+    bits_to_type/2,
     encode_short/4,
     encode_short/5,
     encode_retry/5,
@@ -86,7 +88,7 @@
 ) ->
     binary().
 encode_long(Type, Version, DCID, SCID, Opts) ->
-    TypeBits = type_to_bits(Type),
+    TypeBits = type_to_bits(Type, Version),
     Token = maps:get(token, Opts, <<>>),
     PN = maps:get(pn, Opts, 0),
     Payload = maps:get(payload, Opts, <<>>),
@@ -143,10 +145,11 @@ encode_long(Type, Version, DCID, SCID, Opts) ->
     Token :: binary(),
     Version :: non_neg_integer().
 encode_retry(OriginalDCID, DCID, SCID, Token, Version) ->
-    %% 1 | 1 | Type (2 = 11 retry) | Unused (4). Lower 4 bits are
-    %% covered by the integrity tag so they can be anything; pick a
+    %% 1 | 1 | Type | Unused (4). The type bits are version-specific
+    %% (v1 retry = 0b11, v2 retry = 0b00, RFC 9369 §3.2). Lower 4 bits
+    %% are covered by the integrity tag so they can be anything; pick a
     %% fixed value so packet captures are stable.
-    FirstByte = 16#F0,
+    FirstByte = 16#C0 bor (type_to_bits(retry, Version) bsl 4),
     PacketWithoutTag = <<
         FirstByte,
         Version:32,
@@ -272,7 +275,7 @@ decode_long(<<FirstByte, Version:32, DCIDLen, Rest/binary>>) when
             SCIDLen =< ?MAX_CID_LEN
         ->
             <<SCID:SCIDLen/binary, Rest3/binary>> = Rest2,
-            Type = bits_to_type((FirstByte bsr 4) band 2#11),
+            Type = bits_to_type((FirstByte bsr 4) band 2#11, Version),
             PNLenBits = FirstByte band 2#11,
             PNLen = PNLenBits + 1,
             decode_long_body(Type, Version, DCID, SCID, PNLen, Rest3);
@@ -364,15 +367,27 @@ decode_short(<<FirstByte, Rest/binary>>, DCIDLen) ->
     },
     {ok, Packet, <<>>}.
 
-type_to_bits(initial) -> 0;
-type_to_bits(zero_rtt) -> 1;
-type_to_bits(handshake) -> 2;
-type_to_bits(retry) -> 3.
+%% Long-header packet type bits are version-specific: QUIC v2 rotates
+%% them (RFC 9369 §3.2) precisely so that v1-only middleboxes cannot
+%% classify v2 packets. Encoding v1 bits under a v2 version field
+%% produces packets no conforming peer will parse.
+type_to_bits(initial, ?QUIC_VERSION_2) -> 1;
+type_to_bits(zero_rtt, ?QUIC_VERSION_2) -> 2;
+type_to_bits(handshake, ?QUIC_VERSION_2) -> 3;
+type_to_bits(retry, ?QUIC_VERSION_2) -> 0;
+type_to_bits(initial, _) -> 0;
+type_to_bits(zero_rtt, _) -> 1;
+type_to_bits(handshake, _) -> 2;
+type_to_bits(retry, _) -> 3.
 
-bits_to_type(0) -> initial;
-bits_to_type(1) -> zero_rtt;
-bits_to_type(2) -> handshake;
-bits_to_type(3) -> retry.
+bits_to_type(1, ?QUIC_VERSION_2) -> initial;
+bits_to_type(2, ?QUIC_VERSION_2) -> zero_rtt;
+bits_to_type(3, ?QUIC_VERSION_2) -> handshake;
+bits_to_type(0, ?QUIC_VERSION_2) -> retry;
+bits_to_type(0, _) -> initial;
+bits_to_type(1, _) -> zero_rtt;
+bits_to_type(2, _) -> handshake;
+bits_to_type(3, _) -> retry.
 
 %% Encode a list of versions for VN packet
 encode_vn_versions([]) ->

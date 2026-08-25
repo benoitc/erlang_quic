@@ -142,6 +142,8 @@
 -define(TP_ACTIVE_CONNECTION_ID_LIMIT, 16#0e).
 -define(TP_INITIAL_SCID, 16#0f).
 -define(TP_RETRY_SCID, 16#10).
+%% RFC 9368 version_information
+-define(TP_VERSION_INFORMATION, 16#11).
 
 %% RFC 9221 - QUIC Datagrams
 -define(TP_MAX_DATAGRAM_FRAME_SIZE, 16#20).
@@ -161,9 +163,12 @@
 ).
 
 %% Initial salt for QUIC v2 (RFC 9369 Section 5.2)
+%% RFC 9369 §3.3.2: first 20 bytes of sha256("QUICv2 salt"). The old
+%% value here was from a pre-RFC draft, so v2 worked against ourselves
+%% and no one else.
 -define(QUIC_V2_INITIAL_SALT,
-    <<16#0d, 16#be, 16#91, 16#3e, 16#26, 16#56, 16#d1, 16#93, 16#83, 16#14, 16#86, 16#ac, 16#d1,
-        16#64, 16#9b, 16#f5, 16#77, 16#95, 16#c0, 16#80>>
+    <<16#0d, 16#ed, 16#e3, 16#de, 16#f7, 16#00, 16#a6, 16#db, 16#81, 16#93, 16#81, 16#be, 16#6e,
+        16#26, 16#9d, 16#cb, 16#f9, 16#bd, 16#2e, 16#d9>>
 ).
 
 %% HKDF labels
