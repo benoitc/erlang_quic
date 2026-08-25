@@ -728,11 +728,12 @@ parse_packet_header(
 ) when
     FirstByte band 16#80 =:= 16#80
 ->
-    %% Long header - extract packet type from bits 4-5 of first byte
-    %% Type: 00=Initial, 01=0-RTT, 10=Handshake, 11=Retry
+    %% Long header - extract packet type from bits 4-5 of first byte.
+    %% The bit patterns are version-specific (RFC 9369 §3.2), so map
+    %% through the version before classifying.
     PacketType = (FirstByte bsr 4) band 2#11,
-    case PacketType of
-        0 -> {initial, DCID, SCID, Version, Rest};
+    case quic_packet:bits_to_type(PacketType, Version) of
+        initial -> {initial, DCID, SCID, Version, Rest};
         _ -> {long, DCID, SCID, PacketType, Rest}
     end;
 parse_packet_header(<<0:1, _:7, Rest/binary>>, DCIDLen) ->
@@ -1068,12 +1069,14 @@ decide_address_validation(Packet, _Version, Addr, Secret, always, MaxAge) ->
 %% returns the client's SCID and the DCID (which the client chose as
 %% the original destination CID before any retry).
 parse_initial_token(
-    <<FirstByte, _Version:32, DCIDLen:8, DCID:DCIDLen/binary, SCIDLen:8, SCID:SCIDLen/binary,
+    <<FirstByte, Version:32, DCIDLen:8, DCID:DCIDLen/binary, SCIDLen:8, SCID:SCIDLen/binary,
         Rest/binary>>
 ) when
-    FirstByte band 16#F0 =:= 16#C0
+    FirstByte band 16#C0 =:= 16#C0
 ->
     try
+        %% Accept only Initial packets; the type bits differ per version.
+        initial = quic_packet:bits_to_type((FirstByte bsr 4) band 2#11, Version),
         {TokenLen, Rest1} = quic_varint:decode(Rest),
         <<Token:TokenLen/binary, _/binary>> = Rest1,
         {ok, Token, SCID, DCID}

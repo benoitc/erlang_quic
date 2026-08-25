@@ -324,6 +324,9 @@
     retry_scid :: binary() | undefined,
     role :: client | server,
     version = ?QUIC_VERSION_1 :: non_neg_integer(),
+    %% Acceptable versions in preference order (RFC 9368); the head of
+    %% the list is what we advertise as most preferred.
+    supported_versions = [?QUIC_VERSION_1] :: [non_neg_integer()],
 
     %% Socket
     socket :: gen_udp:socket() | socket:socket() | undefined,
@@ -363,6 +366,10 @@
 
     %% Encryption keys per level
     initial_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
+    %% Pre-switch Initial keys kept through compatible version
+    %% negotiation, so first-flight packets in the original version
+    %% still decrypt (RFC 9368 §2.2).
+    initial_keys_alt :: {non_neg_integer(), {#crypto_keys{}, #crypto_keys{}}} | undefined,
     handshake_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
     % Convenience accessor (= key_state.current_keys)
     app_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
@@ -1162,6 +1169,11 @@ init({server, Opts}) ->
     Listener = maps:get(listener, Opts),
     %% Use client's QUIC version for key derivation (defaults to v1)
     Version = maps:get(version, Opts, ?QUIC_VERSION_1),
+    SupportedVersions =
+        case maps:get(versions, Opts, [Version]) of
+            [] -> [Version];
+            Vs -> Vs
+        end,
 
     %% Generate initial keys using client's DCID and version
     InitialKeys = derive_initial_keys(InitialDCID, Version),
@@ -1228,6 +1240,7 @@ init({server, Opts}) ->
         role = server,
         % Use client's QUIC version
         version = Version,
+        supported_versions = SupportedVersions,
         socket = Socket,
         %% send_socket is undefined - socket is in socket_state
         send_socket = undefined,
@@ -1529,6 +1542,12 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% option with nothing to do: both the salt and the version in our own
     %% Initial stayed v1 however the connection was configured.
     Version = maps:get(version, Opts, ?QUIC_VERSION_1),
+    %% Versions we would also accept (RFC 9368).
+    SupportedVersions =
+        case maps:get(versions, Opts, [Version]) of
+            [] -> [Version];
+            Vs -> Vs
+        end,
     InitialKeys = derive_initial_keys(DCID, Version),
 
     %% Initialize packet number spaces
@@ -1622,6 +1641,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         original_dcid = DCID,
         role = client,
         version = Version,
+        supported_versions = SupportedVersions,
         socket = Sock,
         socket_state = SocketState,
         client_socket_backend = ClientSocketBackend,
@@ -2845,7 +2865,9 @@ send_client_hello(State) ->
                     Cipher, EarlySecret, ClientHelloHash
                 ),
                 %% Derive traffic keys
-                {Key, IV, HP} = quic_keys:derive_keys(EarlyTrafficSecret, Cipher),
+                {Key, IV, HP} = quic_keys:derive_keys(
+                    EarlyTrafficSecret, Cipher, State#state.version
+                ),
                 Keys = #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher},
                 {Keys, EarlySecret}
         end,
@@ -3188,7 +3210,11 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => State#state.idle_timeout,
         active_connection_id_limit => 2,
-        max_udp_payload_size => advertised_max_udp_payload_size(State)
+        max_udp_payload_size => advertised_max_udp_payload_size(State),
+        %% RFC 9368: the versions we would also accept; the server may
+        %% switch the connection to one of them.
+        version_information =>
+            {State#state.version, State#state.supported_versions}
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
     TransportParams1 =
@@ -3215,11 +3241,16 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     %% RFC 9000 §7.3: if this server issued a Retry for this client,
     %% echo the Retry's SCID in retry_source_connection_id so the
     %% client can verify the full handshake against the Retry it saw.
-    TransportParams4 =
+    TransportParams3b =
         case State#state.retry_scid_for_tp of
             undefined -> TransportParams3;
             RetrySCIDTP -> TransportParams3#{retry_scid => RetrySCIDTP}
         end,
+    %% RFC 9368: echo the negotiated version and our acceptable set.
+    TransportParams4 = TransportParams3b#{
+        version_information =>
+            {State#state.version, State#state.supported_versions}
+    },
 
     %% RFC 9000 §10.3: advertise a stateless_reset_token bound to our initial
     %% SCID, so the peer can recognise a stateless reset for this connection if
@@ -3296,8 +3327,12 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     keylog_application(State#state.tls_ch1_random, ClientAppSecret, ServerAppSecret),
 
     %% Derive app keys
-    {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientAppSecret, Cipher),
-    {ServerKey, ServerIV, ServerHP} = quic_keys:derive_keys(ServerAppSecret, Cipher),
+    {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(
+        ClientAppSecret, Cipher, State#state.version
+    ),
+    {ServerKey, ServerIV, ServerHP} = quic_keys:derive_keys(
+        ServerAppSecret, Cipher, State#state.version
+    ),
 
     ClientAppKeys = #crypto_keys{key = ClientKey, iv = ClientIV, hp = ClientHP, cipher = Cipher},
     ServerAppKeys = #crypto_keys{key = ServerKey, iv = ServerIV, hp = ServerHP, cipher = Cipher},
@@ -3544,8 +3579,10 @@ send_initial_packet(Payload, State) ->
         (quic_varint:encode(byte_size(PaddedPayload) + PNLen + 16))/binary
     >>,
 
-    %% First byte: 1100 0000 | (PNLen - 1)
-    FirstByte = 16#C0 bor (PNLen - 1),
+    %% First byte: long header form/fixed bits, version-specific Initial
+    %% type bits, PN length
+    FirstByte =
+        16#C0 bor (quic_packet:type_to_bits(initial, Version) bsl 4) bor (PNLen - 1),
     HeaderPrefix = <<FirstByte, HeaderBody/binary>>,
 
     %% Protect packet (encrypt + header protection in single call)
@@ -3748,7 +3785,8 @@ send_handshake_packet(Payload, State) ->
     PNLen = quic_packet:pn_length(PN),
 
     %% First byte for Handshake: 1110 0000 | (PNLen - 1)
-    FirstByte = 16#E0 bor (PNLen - 1),
+    FirstByte =
+        16#C0 bor (quic_packet:type_to_bits(handshake, Version) bsl 4) bor (PNLen - 1),
 
     %% Pad payload if needed for header protection sampling
     PaddedPayload = pad_for_header_protection(Payload),
@@ -4414,26 +4452,49 @@ decode_long_header_packet(Data, State) ->
     <<DCID:DCIDLen/binary, SCIDLen, Rest2/binary>> = Rest,
     <<SCID:SCIDLen/binary, Rest3/binary>> = Rest2,
 
-    Type = (FirstByte bsr 4) band 2#11,
+    TypeBits = (FirstByte bsr 4) band 2#11,
 
     case Version of
-        0 -> handle_version_negotiation(DCID, Rest3, State);
-        _ -> decode_long_header_type(Type, Data, FirstByte, Version, DCID, SCID, Rest3, State)
+        0 ->
+            handle_version_negotiation(DCID, Rest3, State);
+        _ ->
+            %% RFC 9368: a client that offered other acceptable versions
+            %% adopts the one the server switched to.
+            State1 = maybe_adopt_peer_version(Version, State),
+            %% The type bits are version-specific (RFC 9369 §3.2)
+            Type = quic_packet:bits_to_type(TypeBits, Version),
+            decode_long_header_type(Type, Data, FirstByte, Version, DCID, SCID, Rest3, State1)
     end.
+
+%% Client side of compatible version negotiation: the first long-header
+%% packet from the server carrying a version we offered (but did not
+%% start with) moves the connection there. Only before the ServerHello
+%% is processed; later mismatches are left to the normal decode path.
+maybe_adopt_peer_version(
+    Version,
+    #state{
+        role = client,
+        version = Current,
+        tls_state = ?TLS_AWAITING_SERVER_HELLO
+    } = State
+) when Version =/= Current ->
+    case lists:member(Version, State#state.supported_versions) of
+        true -> switch_version(Version, State);
+        false -> State
+    end;
+maybe_adopt_peer_version(_Version, State) ->
+    State.
 
 decode_long_header_type(Type, Data, FirstByte, Version, DCID, SCID, Rest3, State) ->
     case Type of
-        %% Initial
-        0 ->
+        initial ->
             decode_initial_packet(Data, FirstByte, DCID, SCID, Rest3, State);
-        %% 0-RTT
-        1 ->
+        zero_rtt ->
             decode_zero_rtt_packet(Data, FirstByte, DCID, SCID, Rest3, State);
-        %% Handshake
-        2 ->
+        handshake ->
             decode_handshake_packet(Data, FirstByte, DCID, SCID, Rest3, State);
         %% Retry (RFC 9000 Section 17.2.5)
-        3 ->
+        retry ->
             handle_retry_packet(Data, Version, SCID, Rest3, State);
         _ ->
             {error, unsupported_packet_type}
@@ -4473,7 +4534,9 @@ decode_versions(<<Version:32, Rest/binary>>) -> [Version | decode_versions(Rest)
 decode_versions(_) -> [].
 
 decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
-    #state{initial_keys = {ClientKeys, ServerKeys}, role = Role} = State,
+    <<_:8, PacketVersion:32, _/binary>> = FullPacket,
+    {ClientKeys, ServerKeys} = initial_keys_for_version(PacketVersion, State),
+    #state{role = Role} = State,
 
     %% Select correct keys based on role:
     %% - Client receives from server -> use ServerKeys
@@ -5914,9 +5977,9 @@ process_tls_message(
                         Cipher, HandshakeSecret, TranscriptHash
                     ),
                     {ClientKey, ClientIV, ClientHP} =
-                        quic_keys:derive_keys(ClientHsSecret, Cipher),
+                        quic_keys:derive_keys(ClientHsSecret, Cipher, State#state.version),
                     {ServerKey, ServerIV, ServerHP} =
-                        quic_keys:derive_keys(ServerHsSecret, Cipher),
+                        quic_keys:derive_keys(ServerHsSecret, Cipher, State#state.version),
                     ClientHsKeys = #crypto_keys{
                         key = ClientKey, iv = ClientIV, hp = ClientHP, cipher = Cipher
                     },
@@ -6099,10 +6162,10 @@ process_tls_message(
 
                     %% Derive app keys
                     {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(
-                        ClientAppSecret, Cipher
+                        ClientAppSecret, Cipher, State#state.version
                     ),
                     {ServerKey, ServerIV, ServerHP} = quic_keys:derive_keys(
-                        ServerAppSecret, Cipher
+                        ServerAppSecret, Cipher, State#state.version
                     ),
 
                     ClientAppKeys = #crypto_keys{
@@ -6443,7 +6506,7 @@ do_server_client_hello(SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, Ori
 
 %% @private Continue the ClientHello once the server cert/key are settled.
 do_server_client_hello_cont(
-    SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
+    SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, StateVNIn
 ) ->
     ClientALPN = maps:get(alpn_protocols, ClientHelloInfo, []),
     ClientRandom = maps:get(random, ClientHelloInfo, undefined),
@@ -6452,6 +6515,12 @@ do_server_client_hello_cont(
     %% Check for PSK (0-RTT/resumption/external)
     PSKInfo = maps:get(pre_shared_key, ClientHelloInfo, undefined),
     WantsEarlyData = maps:get(early_data, ClientHelloInfo, false),
+
+    %% RFC 9368 compatible version negotiation, before any
+    %% version-dependent derivation (v2 has its own HKDF labels).
+    %% Skipped when the client offers early data: 0-RTT is bound to the
+    %% version of the first flight.
+    State = maybe_negotiate_compatible_version(TP, WantsEarlyData, StateVNIn),
 
     %% TLS 1.3 external PSK selection (RFC 8446 §4.2.11).
     %% Validate pre_shared_key placement, lookup identity, verify
@@ -6534,7 +6603,9 @@ do_server_client_hello_cont(
                                                             Cipher, ES, ClientHelloHash
                                                         ),
                                                     {Key, IV, HP} =
-                                                        quic_keys:derive_keys(ETS, Cipher),
+                                                        quic_keys:derive_keys(
+                                                            ETS, Cipher, State#state.version
+                                                        ),
                                                     EKeys = #crypto_keys{
                                                         key = Key,
                                                         iv = IV,
@@ -6649,8 +6720,12 @@ do_server_client_hello_cont(
     ),
 
     %% Derive handshake keys
-    {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientHsSecret, Cipher),
-    {ServerKey, ServerIV, ServerHP} = quic_keys:derive_keys(ServerHsSecret, Cipher),
+    {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(
+        ClientHsSecret, Cipher, State#state.version
+    ),
+    {ServerKey, ServerIV, ServerHP} = quic_keys:derive_keys(
+        ServerHsSecret, Cipher, State#state.version
+    ),
 
     ClientHsKeys = #crypto_keys{
         key = ClientKey, iv = ClientIV, hp = ClientHP, cipher = Cipher
@@ -7660,6 +7735,59 @@ strip_brackets(Host) ->
 
 %% Derive initial encryption keys with specific QUIC version
 %% Version determines which salt to use (v1 vs v2)
+%% RFC 9368: adopt the best mutually acceptable version offered by the
+%% client. v1 and v2 are compatible with each other (RFC 9369 §6).
+maybe_negotiate_compatible_version(_TP, true, State) ->
+    State;
+maybe_negotiate_compatible_version(TP, false, State) ->
+    case maps:get(version_information, TP, undefined) of
+        {_Chosen, Available} when is_list(Available) ->
+            Mutual = [
+                V
+             || V <- State#state.supported_versions,
+                lists:member(V, Available)
+            ],
+            case Mutual of
+                [Best | _] when Best =/= State#state.version ->
+                    switch_version(Best, State);
+                _ ->
+                    State
+            end;
+        _ ->
+            State
+    end.
+
+%% Move the connection to another compatible version mid-handshake. The
+%% Initial keys are version-specific, so re-derive them from the
+%% original DCID for our own sends, keeping the old set so in-flight
+%% packets in the previous version still decrypt.
+switch_version(NewVersion, State) ->
+    ?LOG_INFO(
+        #{
+            what => compatible_version_negotiation,
+            from => State#state.version,
+            to => NewVersion
+        },
+        ?QUIC_LOG_META
+    ),
+    OldVersion = State#state.version,
+    NewKeys = derive_initial_keys(State#state.original_dcid, NewVersion),
+    State#state{
+        version = NewVersion,
+        initial_keys = NewKeys,
+        initial_keys_alt = {OldVersion, State#state.initial_keys}
+    }.
+
+%% Initial keys matching a received packet's version: through a
+%% compatible version switch the peer's first flight is still protected
+%% with the pre-switch version's keys.
+initial_keys_for_version(V, #state{version = V, initial_keys = Keys}) ->
+    Keys;
+initial_keys_for_version(V, #state{initial_keys_alt = {V, Keys}}) ->
+    Keys;
+initial_keys_for_version(_, #state{initial_keys = Keys}) ->
+    Keys.
+
 derive_initial_keys(DCID, Version) ->
     {ClientKey, ClientIV, ClientHP} = quic_keys:derive_initial_client(DCID, Version),
     {ServerKey, ServerIV, ServerHP} = quic_keys:derive_initial_server(DCID, Version),
@@ -8572,10 +8700,9 @@ send_zero_rtt_packet(Payload, Frames, EarlyKeys, State) ->
     %% Pad payload if needed for header protection sampling
     PaddedPayload = pad_for_header_protection(Payload),
 
-    %% Long header for 0-RTT (type 1)
-    %% First byte: 11XX XXXX where XX = type (01 for 0-RTT)
-    % 0xD0 base for 0-RTT
-    FirstByte = 16#C0 bor (1 bsl 4) bor (PNLen - 1),
+    %% Long header for 0-RTT; the type bits are version-specific
+    FirstByte =
+        16#C0 bor (quic_packet:type_to_bits(zero_rtt, Version) bsl 4) bor (PNLen - 1),
 
     %% Build header prefix (includes Length field, but not PN)
     DCIDLen = byte_size(DCID),
@@ -10805,9 +10932,9 @@ initiate_key_update(#state{key_state = KeyState} = State) ->
 
     %% Derive new secrets using "quic ku" label
     {NewClientSecret, {NewClientKey, NewClientIV, _}} =
-        quic_keys:derive_updated_keys(ClientSecret, Cipher),
+        quic_keys:derive_updated_keys(ClientSecret, Cipher, State#state.version),
     {NewServerSecret, {NewServerKey, NewServerIV, _}} =
-        quic_keys:derive_updated_keys(ServerSecret, Cipher),
+        quic_keys:derive_updated_keys(ServerSecret, Cipher, State#state.version),
 
     %% Create new crypto_keys records (preserve HP keys per RFC 9001 Section 6.6)
     NewClientKeys = #crypto_keys{
@@ -10874,9 +11001,9 @@ handle_peer_key_update(#state{key_state = KeyState} = State) ->
 
             %% Derive new secrets
             {NewClientSecret, {NewClientKey, NewClientIV, _}} =
-                quic_keys:derive_updated_keys(ClientSecret, Cipher),
+                quic_keys:derive_updated_keys(ClientSecret, Cipher, State#state.version),
             {NewServerSecret, {NewServerKey, NewServerIV, _}} =
-                quic_keys:derive_updated_keys(ServerSecret, Cipher),
+                quic_keys:derive_updated_keys(ServerSecret, Cipher, State#state.version),
 
             NewClientKeys = #crypto_keys{
                 key = NewClientKey,

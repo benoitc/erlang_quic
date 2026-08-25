@@ -556,12 +556,13 @@ group_supported(Group) ->
 ).
 
 %% RFC 9001 Section 5.8 - Retry Integrity Key and Nonce for QUIC v2
+%% RFC 9369 §3.3.3; the previous values were from a pre-RFC draft.
 -define(RETRY_INTEGRITY_KEY_V2,
     <<16#8f, 16#b4, 16#b0, 16#1b, 16#56, 16#ac, 16#48, 16#e2, 16#60, 16#fb, 16#cb, 16#ce, 16#ad,
-        16#7c, 16#ba, 16#00>>
+        16#7c, 16#cc, 16#92>>
 ).
 -define(RETRY_INTEGRITY_NONCE_V2,
-    <<16#d8, 16#69, 16#69, 16#50, 16#c9, 16#06, 16#79, 16#a4, 16#da, 16#88, 16#7e, 16#ce>>
+    <<16#d8, 16#69, 16#69, 16#bc, 16#2d, 16#7c, 16#6d, 16#99, 16#90, 16#ef, 16#b0, 16#4a>>
 ).
 
 %% @doc Verify the integrity tag of a Retry packet.
