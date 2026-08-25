@@ -41,9 +41,13 @@
 ]).
 
 main(_Args) ->
-    %% Start required applications
+    %% Start required applications. The quic app supervision matters:
+    %% the resumption ticket table is owned by the server registry, and
+    %% without it the table dies with the first connection that created
+    %% it, so a client resuming after a pause never finds its ticket.
     application:ensure_all_started(crypto),
     application:ensure_all_started(ssl),
+    application:ensure_all_started(quic),
 
     %% Get environment variables
     TestCase = os:getenv("TESTCASE", "handshake"),
