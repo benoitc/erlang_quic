@@ -2583,7 +2583,8 @@ send_client_hello(State) ->
         alpn => AlpnList,
         transport_params => TransportParams,
         session_ticket => SessionTicket,
-        groups => State#state.tls_groups
+        groups => State#state.tls_groups,
+        ciphers => State#state.cipher_preference
     },
     ClientHelloOpts1 =
         case State#state.tls_sig_algs of
@@ -5359,6 +5360,15 @@ process_tls_message(
         {hrr, HrrInfo} ->
             handle_hello_retry_request(HrrInfo, OriginalMsg, State);
         {ok, #{cipher := Cipher} = ServerHelloMap} ->
+            %% RFC 8446 §4.1.3: the selected suite must be one we offered.
+            case lists:member(Cipher, State#state.cipher_preference) of
+                false ->
+                    notify_owner({error, {tls_alert, illegal_parameter}}, State),
+                    send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State),
+                    exit({tls_alert, illegal_parameter});
+                true ->
+                    ok
+            end,
             %% Determine handshake type: PSK (with or without DHE) vs
             %% standard cert-auth. PSK selection is signalled by the
             %% `selected_psk_identity' extension echoed in ServerHello.
