@@ -163,49 +163,45 @@ spawn_handler(ConnPid, _DCID, WwwDir, TestCase) ->
 
 connection_handler(Conn, WwwDir, TestCase) ->
     io:format("Handler started, waiting for messages...~n"),
-    %% Wait for stream data
+    connection_handler(Conn, WwwDir, TestCase, #{}).
+
+%% A request may arrive split across several STREAM frames, so buffer per
+%% stream until FIN before parsing. Serving each fragment as if it were a
+%% whole request answered twice on one stream: two responses, two FINs at
+%% different offsets, and a correct peer kills the connection with
+%% FINAL_SIZE_ERROR.
+connection_handler(Conn, WwwDir, TestCase, Bufs) ->
     receive
         {quic, Conn, {connected, Info}} ->
             io:format("Handler got connected: ~p~n", [Info]),
-            connection_handler(Conn, WwwDir, TestCase);
+            connection_handler(Conn, WwwDir, TestCase, Bufs);
         {quic, Conn, {stream_opened, StreamId}} ->
             io:format("Handler got stream_opened: ~p~n", [StreamId]),
-            handle_stream(Conn, StreamId, WwwDir, TestCase);
+            connection_handler(Conn, WwwDir, TestCase, Bufs);
         {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
-            io:format(
-                "Handler got stream_data: stream=~p size=~p fin=~p~n",
-                [StreamId, byte_size(Data), Fin]
-            ),
-            %% Handle request
-            handle_request(Conn, StreamId, Data, WwwDir, TestCase);
+            Acc = [maps:get(StreamId, Bufs, []) | Data],
+            case Fin of
+                true ->
+                    Request = iolist_to_binary(Acc),
+                    _ = serve_request(Conn, StreamId, Request, WwwDir, TestCase),
+                    connection_handler(
+                        Conn, WwwDir, TestCase, maps:remove(StreamId, Bufs)
+                    );
+                false ->
+                    connection_handler(
+                        Conn, WwwDir, TestCase, Bufs#{StreamId => Acc}
+                    )
+            end;
         {quic, Conn, {closed, Reason}} ->
             io:format("Handler got closed: ~p~n", [Reason]),
             ok;
         Other ->
             io:format("Handler got unexpected: ~p~n", [Other]),
-            connection_handler(Conn, WwwDir, TestCase)
+            connection_handler(Conn, WwwDir, TestCase, Bufs)
     after 60000 ->
         io:format("Handler timeout~n"),
         ok
     end.
-
-handle_stream(Conn, StreamId, WwwDir, TestCase) ->
-    %% Wait for the request on this stream, then resume the handler loop.
-    receive
-        {quic, Conn, {stream_data, StreamId, Data, _Fin}} ->
-            handle_request(Conn, StreamId, Data, WwwDir, TestCase)
-    after 30000 ->
-        connection_handler(Conn, WwwDir, TestCase)
-    end.
-
-%% Serve one request, then go back to waiting: a client may issue several
-%% requests on the same connection, and the interop runner's transfer and
-%% multiplexing tests require exactly that. Returning here instead ended
-%% the handler process after the first file and tore the connection down,
-%% so a second request met {invalid_state,draining}.
-handle_request(Conn, StreamId, Data, WwwDir, TestCase) ->
-    _ = serve_request(Conn, StreamId, Data, WwwDir, TestCase),
-    connection_handler(Conn, WwwDir, TestCase).
 
 serve_request(Conn, StreamId, Data, WwwDir, TestCase) ->
     io:format("handle_request: stream=~p data=~p~n", [StreamId, Data]),
