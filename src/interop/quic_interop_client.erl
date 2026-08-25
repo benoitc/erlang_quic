@@ -141,14 +141,8 @@ download_from(TestCase, Host, Port, Paths, DownloadsDir) ->
                     %% streams in flight at the same time; issuing them one
                     %% after another looks like a series of single-stream
                     %% transfers no matter how many files are requested.
-                    Streams = [
-                        begin
-                            io:format("Downloading: https://~s:~p/~s~n", [Host, Port, Path]),
-                            open_and_request(Conn, Path)
-                        end
-                     || Path <- Paths
-                    ],
-                    Results = collect_streams(Conn, Streams, DownloadsDir),
+                    io:format("Requesting ~p file(s)~n", [length(Paths)]),
+                    Results = collect_streams(Conn, Paths, DownloadsDir),
                     quic:close(Conn, normal),
                     Results;
                 error ->
@@ -228,28 +222,37 @@ build_opts(_) ->
         alpn => [<<"hq-interop">>, <<"h3">>]
     }.
 
-open_and_request(Conn, Path) ->
+%% Keep as many streams in flight as the peer's stream credit allows and
+%% refill as they finish. The multiplexing test asks for close to 2000
+%% files while the default bidi stream limit is 100, so opening them all
+%% up front fails all but the first hundred; the peer extends credit with
+%% MAX_STREAMS only as earlier streams close.
+collect_streams(Conn, Paths, DownloadsDir) ->
+    {Open, Pending} = fill_streams(Conn, Paths, #{}, DownloadsDir),
+    Done = collect_loop(Conn, Open, Pending, DownloadsDir, #{}, 180000),
+    [Result || {_StreamId, Result} <- maps:to_list(Done)].
+
+fill_streams(_Conn, [], Open, _DownloadsDir) ->
+    {Open, []};
+fill_streams(Conn, [Path | Rest] = Pending, Open, DownloadsDir) ->
     case quic:open_stream(Conn) of
         {ok, StreamId} ->
             Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
             case quic:send_data(Conn, StreamId, Request, true) of
-                ok -> {StreamId, Path};
-                Err -> {error, Path, Err}
+                ok ->
+                    fill_streams(
+                        Conn,
+                        Rest,
+                        Open#{StreamId => open_target(Path, DownloadsDir)},
+                        DownloadsDir
+                    );
+                _Err ->
+                    {Open, Pending}
             end;
-        {error, StreamErr} ->
-            {error, Path, StreamErr}
+        {error, _} ->
+            %% Out of stream credit for now; the rest wait for MAX_STREAMS.
+            {Open, Pending}
     end.
-
-%% Collect concurrently: one file handle per stream, fed by whichever
-%% stream_data arrives next, until every stream has seen its FIN.
-collect_streams(Conn, Streams, DownloadsDir) ->
-    Open = maps:from_list([
-        {Sid, open_target(Path, DownloadsDir)}
-     || {Sid, Path} <- Streams, is_integer(Sid)
-    ]),
-    Failed = [error || {error, _, _} <- Streams],
-    Done = collect_loop(Conn, Open, #{}, 120000),
-    Failed ++ [R || {_Sid, R} <- maps:to_list(Done)].
 
 open_target(Path, DownloadsDir) ->
     FilePath = filename:join(DownloadsDir, filename:basename(Path)),
@@ -258,9 +261,9 @@ open_target(Path, DownloadsDir) ->
         {error, Err} -> {error, FilePath, Err}
     end.
 
-collect_loop(_Conn, Open, Done, _Timeout) when map_size(Open) =:= 0 ->
+collect_loop(_Conn, Open, [], _DownloadsDir, Done, _Timeout) when map_size(Open) =:= 0 ->
     Done;
-collect_loop(Conn, Open, Done, Timeout) ->
+collect_loop(Conn, Open, Pending, DownloadsDir, Done, Timeout) ->
     receive
         {quic, Conn, {stream_data, Sid, Data, Fin}} ->
             case maps:find(Sid, Open) of
@@ -271,25 +274,28 @@ collect_loop(Conn, Open, Done, Timeout) ->
                         true ->
                             file:close(Handle),
                             io:format("Saved: ~s (~p bytes)~n", [FilePath, NewWritten]),
+                            {Open2, Pending2} = fill_streams(
+                                Conn, Pending, maps:remove(Sid, Open), DownloadsDir
+                            ),
                             collect_loop(
-                                Conn,
-                                maps:remove(Sid, Open),
-                                Done#{Sid => ok},
-                                Timeout
+                                Conn, Open2, Pending2, DownloadsDir, Done#{Sid => ok}, Timeout
                             );
                         false ->
                             collect_loop(
                                 Conn,
                                 Open#{Sid => {Handle, FilePath, NewWritten}},
+                                Pending,
+                                DownloadsDir,
                                 Done,
                                 Timeout
                             )
                     end;
                 error ->
-                    collect_loop(Conn, Open, Done, Timeout)
+                    collect_loop(Conn, Open, Pending, DownloadsDir, Done, Timeout)
             end;
         {quic, Conn, {stream_reset, Sid, _Code}} ->
-            collect_loop(Conn, maps:remove(Sid, Open), Done#{Sid => error}, Timeout);
+            {Open2, Pending2} = fill_streams(Conn, Pending, maps:remove(Sid, Open), DownloadsDir),
+            collect_loop(Conn, Open2, Pending2, DownloadsDir, Done#{Sid => error}, Timeout);
         {quic, Conn, {closed, _Reason}} ->
             close_remaining(Open, Done)
     after Timeout ->
