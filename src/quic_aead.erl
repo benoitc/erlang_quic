@@ -46,6 +46,7 @@
     unprotect_long_packet/7,
     %% 2-stage short header receive API (for key-phase handling)
     unprotect_short_header/4,
+    unprotect_short_header/5,
     decrypt_short_payload/8
 ]).
 
@@ -475,7 +476,18 @@ unprotect_packet_common(Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRe
 -spec unprotect_short_header(binary(), binary(), binary(), non_neg_integer()) ->
     {ok, 0 | 1, 1..4, non_neg_integer(), binary()} | {error, term()}.
 unprotect_short_header(HP, Header, EncryptedPayload, PNOffset) ->
-    case unprotect_header(HP, Header, EncryptedPayload, PNOffset) of
+    %% Guesses the cipher from the HP key length, which cannot tell
+    %% AES-256-GCM from ChaCha20-Poly1305. Prefer the /5 variant.
+    unprotect_short_header(cipher_for_key(HP), HP, Header, EncryptedPayload, PNOffset).
+
+%% @doc Like unprotect_short_header/4 but with the cipher given by the
+%% caller, which is required when ChaCha20-Poly1305 is negotiated: its
+%% 32-byte HP key is indistinguishable from AES-256-GCM's, and the two
+%% mask constructions are unrelated.
+-spec unprotect_short_header(cipher(), binary(), binary(), binary(), non_neg_integer()) ->
+    {ok, 0 | 1, 1..4, non_neg_integer(), binary()} | {error, term()}.
+unprotect_short_header(Cipher, HP, Header, EncryptedPayload, PNOffset) ->
+    case unprotect_header(Cipher, HP, Header, EncryptedPayload, PNOffset) of
         {error, Reason} ->
             {error, {header_unprotect_failed, Reason}};
         {UnprotectedHeader, PNLen} ->

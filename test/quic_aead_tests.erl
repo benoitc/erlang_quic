@@ -267,6 +267,38 @@ header_protection_roundtrip_short_test() ->
     ?assertEqual(PNLen, UnprotPNLen),
     ?assertEqual(Header, Unprotected).
 
+%% RFC 9001 Appendix A.5: ChaCha20-Poly1305 short header packet.
+%% The HP key is 32 bytes, so the cipher cannot be inferred from its
+%% length; the caller has to supply it or the AES-256 mask is used.
+rfc9001_chacha20_short_header_test() ->
+    Key = hexstr_to_bin(
+        "c6d98ff3441c3fe1b2182094f69caa2e"
+        "d4b716b65488960a7a984979fb23e1c8"
+    ),
+    IV = hexstr_to_bin("e0459b3474bdd0e44a41c144"),
+    HP = hexstr_to_bin(
+        "25a282b9e82f06f21f488917a4fc8f1b"
+        "73573685608597d0efcb076b0ab7a7a4"
+    ),
+    Packet = hexstr_to_bin("4cfe4189655e5cd55c41f69080575d7999c25a5bfb"),
+
+    %% Zero-length DCID: the header before the PN is just the first byte
+    <<Header:1/binary, EncryptedPayload/binary>> = Packet,
+    {ok, KeyPhase, PNLen, TruncPN, UnprotHdr} =
+        quic_aead:unprotect_short_header(
+            chacha20_poly1305, HP, Header, EncryptedPayload, 1
+        ),
+    ?assertEqual(0, KeyPhase),
+    ?assertEqual(3, PNLen),
+    ?assertEqual(49140, TruncPN),
+    ?assertEqual(hexstr_to_bin("4200bff4"), UnprotHdr),
+
+    {ok, PN, Plaintext} = quic_aead:decrypt_short_payload(
+        chacha20_poly1305, Key, IV, UnprotHdr, PNLen, TruncPN, EncryptedPayload, 654360563
+    ),
+    ?assertEqual(654360564, PN),
+    ?assertEqual(<<16#01>>, Plaintext).
+
 %%====================================================================
 %% Helper Functions
 %%====================================================================
