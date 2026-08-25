@@ -188,15 +188,24 @@ connection_handler(Conn, WwwDir, TestCase) ->
     end.
 
 handle_stream(Conn, StreamId, WwwDir, TestCase) ->
-    %% Wait for request on this stream
+    %% Wait for the request on this stream, then resume the handler loop.
     receive
         {quic, Conn, {stream_data, StreamId, Data, _Fin}} ->
             handle_request(Conn, StreamId, Data, WwwDir, TestCase)
     after 30000 ->
-        ok
+        connection_handler(Conn, WwwDir, TestCase)
     end.
 
+%% Serve one request, then go back to waiting: a client may issue several
+%% requests on the same connection, and the interop runner's transfer and
+%% multiplexing tests require exactly that. Returning here instead ended
+%% the handler process after the first file and tore the connection down,
+%% so a second request met {invalid_state,draining}.
 handle_request(Conn, StreamId, Data, WwwDir, TestCase) ->
+    _ = serve_request(Conn, StreamId, Data, WwwDir, TestCase),
+    connection_handler(Conn, WwwDir, TestCase).
+
+serve_request(Conn, StreamId, Data, WwwDir, TestCase) ->
     io:format("handle_request: stream=~p data=~p~n", [StreamId, Data]),
     %% Parse simple HTTP/0.9 request: "GET /path\r\n"
     case parse_request(Data) of
