@@ -46,7 +46,7 @@
 -dialyzer(
     {nowarn_function, [
         send_initial_ack/1,
-        select_cipher/1,
+        select_cipher/2,
         %% Reachable from the new TLS_SERVER_HELLO handler via the
         %% selected_psk_identity branch — but no eunit path currently
         %% exercises a PSK handshake end-to-end. The forthcoming
@@ -418,6 +418,7 @@
     %% PTO, so a lost Finished had no schedule to resend it on.
     hs_flight_timer = undefined :: reference() | undefined,
     hs_flight_tries = 0 :: non_neg_integer(),
+    cipher_preference = [aes_128_gcm, aes_256_gcm, chacha20_poly1305] :: [atom()],
     tls_ch1_opts :: map() | undefined,
     %% Negotiated values surfaced in the connected event
     negotiated_group :: atom() | undefined,
@@ -1245,6 +1246,7 @@ init({server, Opts}) ->
         next_stream_id_bidi = 1,
         % Server-initiated uni: 3, 7, 11, ...
         next_stream_id_uni = 3,
+        cipher_preference = maps:get(ciphers, Opts, default_cipher_preference()),
         max_streams_bidi_local = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
@@ -1629,6 +1631,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         next_stream_id_bidi = 0,
         % Client-initiated uni: 2, 6, 10, ...
         next_stream_id_uni = 2,
+        cipher_preference = maps:get(ciphers, Opts, default_cipher_preference()),
         max_streams_bidi_local = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
@@ -2789,11 +2792,15 @@ send_client_hello(State) ->
 %% Server: Select cipher suite from client's list (server preference)
 %% ClientCipherSuites is a list of TLS cipher suite codes (integers)
 %% Convert to atoms for internal use
-select_cipher(ClientCipherSuites) ->
-    %% Convert client's cipher suite codes to atoms
+%% The server's own order decides, so a deployment that must not negotiate
+%% a particular suite can say so; without this the preference was fixed in
+%% code and a `ciphers' option had nowhere to take effect.
+select_cipher(ClientCipherSuites, ServerPreference) ->
     ClientCiphers = [cipher_code_to_atom(C) || C <- ClientCipherSuites],
-    ServerPreference = [aes_128_gcm, aes_256_gcm, chacha20_poly1305],
     select_first_match(ServerPreference, ClientCiphers).
+
+default_cipher_preference() ->
+    [aes_128_gcm, aes_256_gcm, chacha20_poly1305].
 
 % Default
 select_first_match([], _) ->
@@ -5659,7 +5666,7 @@ process_tls_message(
                 session_id := SessionId
             } = ClientHelloInfo} ->
             %% Select cipher suite (prefer server's order)
-            Cipher = select_cipher(CipherSuites),
+            Cipher = select_cipher(CipherSuites, State#state.cipher_preference),
             %% RFC 8446 §4.1.4 group negotiation: use the client's
             %% key_share directly when possible, otherwise send a
             %% HelloRetryRequest for a mutually-supported group.
