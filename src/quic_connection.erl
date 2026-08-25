@@ -3198,6 +3198,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     ServerAppSecret = quic_crypto:derive_server_app_secret(
         Cipher, MasterSecret, TranscriptHashFinal
     ),
+    keylog_application(State#state.tls_ch1_random, ClientAppSecret, ServerAppSecret),
 
     %% Derive app keys
     {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientAppSecret, Cipher),
@@ -5601,6 +5602,16 @@ process_crypto_buffer(Level, State) ->
             end
     end.
 
+%% Key logging is opt-in via SSLKEYLOGFILE and off otherwise; see
+%% quic_keylog for why it exists and what it exposes.
+keylog_handshake(ClientRandom, ClientSecret, ServerSecret) ->
+    quic_keylog:log(client_handshake, ClientRandom, ClientSecret),
+    quic_keylog:log(server_handshake, ClientRandom, ServerSecret).
+
+keylog_application(ClientRandom, ClientSecret, ServerSecret) ->
+    quic_keylog:log(client_application, ClientRandom, ClientSecret),
+    quic_keylog:log(server_application, ClientRandom, ServerSecret).
+
 %% Process TLS handshake data from CRYPTO frames
 process_tls_data(Level, Data, State) ->
     %% Prepend any buffered incomplete TLS data
@@ -5949,6 +5960,9 @@ process_tls_message(
                     ),
                     ServerAppSecret = quic_crypto:derive_server_app_secret(
                         Cipher, MasterSecret, TranscriptHashFinal
+                    ),
+                    keylog_application(
+                        State#state.tls_ch1_random, ClientAppSecret, ServerAppSecret
                     ),
 
                     %% Derive app keys
@@ -6300,6 +6314,7 @@ do_server_client_hello_cont(
     SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
 ) ->
     ClientALPN = maps:get(alpn_protocols, ClientHelloInfo, []),
+    ClientRandom = maps:get(random, ClientHelloInfo, undefined),
     TP = maps:get(transport_params, ClientHelloInfo, #{}),
     SessionId = maps:get(session_id, ClientHelloInfo, <<>>),
     %% Check for PSK (0-RTT/resumption/external)
@@ -6506,6 +6521,7 @@ do_server_client_hello_cont(
         negotiated_group = SelectedGroup,
         handshake_secret = HandshakeSecret,
         client_hs_secret = ClientHsSecret,
+        tls_ch1_random = ClientRandom,
         server_hs_secret = ServerHsSecret,
         handshake_keys = {ClientHsKeys, ServerHsKeys},
         alpn = ALPN,
@@ -6513,6 +6529,8 @@ do_server_client_hello_cont(
         early_data_accepted = (EarlyKeys =/= undefined andalso WantsEarlyData),
         selected_psk = SelectedPsk
     },
+    keylog_handshake(State#state.tls_ch1_random, ClientHsSecret, ServerHsSecret),
+    keylog_handshake(ClientRandom, ClientHsSecret, ServerHsSecret),
     %% Negotiate the CertificateVerify scheme up front (cert
     %% path only). No common scheme is fatal (RFC 8446 §4.4.3).
     case negotiate_cert_verify(SelectedPsk, State0) of
