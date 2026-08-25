@@ -8962,8 +8962,15 @@ process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
                     %% Flow control allows - dequeue and try to send
                     process_send_queue_entry(State);
                 {blocked, _Reason} ->
-                    %% Flow control blocked - leave in queue, wait for MAX_DATA
-                    State
+                    %% An entry larger than the current window still has a
+                    %% sendable prefix. Waiting for one grant big enough for
+                    %% the whole entry stalls against a peer that extends its
+                    %% window in small steps as it reads, because it sizes the
+                    %% grant to what it consumed, never to what we have queued.
+                    case split_blocked_head(State) of
+                        {ok, SplitState} -> process_send_queue_entry(SplitState);
+                        false -> State
+                    end
             end;
         {value, {retransmit_stream, _StreamId, _Offset, _Data, _Fin, DataSize}} ->
             %% Retransmits are exempt from flow control (bytes already counted),
@@ -9007,6 +9014,45 @@ check_send_queue_flow_control(StreamId, Offset, DataSize, #state{
                     ok
             end
     end.
+
+%% Replace a flow-control-blocked head entry with the prefix that fits plus
+%% the remainder, both at the front so stream order is preserved. Returns
+%% false when nothing fits, when the whole entry fits (the caller should not
+%% have been blocked), or for a zero-length FIN-only entry.
+split_blocked_head(#state{send_queue = PQ, send_queue_count = QueueCount} = State) ->
+    case pqueue_peek(PQ) of
+        {value, {stream_data, StreamId, Offset, Data, Fin, DataSize}} ->
+            case blocked_head_allowance(StreamId, Offset, State) of
+                Allowed when Allowed > 0, Allowed < DataSize ->
+                    {{value, _}, PQ1} = pqueue_out(PQ),
+                    <<Head:Allowed/binary, Tail/binary>> = Data,
+                    Urgency = get_stream_urgency(StreamId, State#state.streams),
+                    TailEntry =
+                        {stream_data, StreamId, Offset + Allowed, Tail, Fin, DataSize - Allowed},
+                    HeadEntry = {stream_data, StreamId, Offset, Head, false, Allowed},
+                    PQ2 = pqueue_in_front(TailEntry, Urgency, PQ1),
+                    PQ3 = pqueue_in_front(HeadEntry, Urgency, PQ2),
+                    {ok, State#state{send_queue = PQ3, send_queue_count = QueueCount + 1}};
+                _ ->
+                    false
+            end;
+        _ ->
+            false
+    end.
+
+%% Bytes of the entry at Offset that both connection and stream windows admit.
+blocked_head_allowance(StreamId, Offset, #state{
+    max_data_remote = MaxDataRemote,
+    data_sent = DataSent,
+    streams = Streams
+}) ->
+    ConnectionAllowed = MaxDataRemote - DataSent,
+    StreamAllowed =
+        case maps:find(StreamId, Streams) of
+            {ok, #stream_state{send_max_data = SendMaxData}} -> SendMaxData - Offset;
+            error -> ConnectionAllowed
+        end,
+    min(ConnectionAllowed, StreamAllowed).
 
 %% Actually process the queue entry (called after flow control check passes)
 process_send_queue_entry(
