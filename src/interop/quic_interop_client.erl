@@ -136,13 +136,19 @@ download_from(TestCase, Host, Port, Paths, DownloadsDir) ->
         {ok, Conn} ->
             case wait_connected(Conn, TestCase) of
                 ok ->
-                    Results = [
+                    %% Open every stream and send every request before
+                    %% collecting any of them. The multiplexing test wants the
+                    %% streams in flight at the same time; issuing them one
+                    %% after another looks like a series of single-stream
+                    %% transfers no matter how many files are requested.
+                    Streams = [
                         begin
                             io:format("Downloading: https://~s:~p/~s~n", [Host, Port, Path]),
-                            request_path(Conn, Path, DownloadsDir)
+                            open_and_request(Conn, Path)
                         end
                      || Path <- Paths
                     ],
+                    Results = collect_streams(Conn, Streams, DownloadsDir),
                     quic:close(Conn, normal),
                     Results;
                 error ->
@@ -224,6 +230,89 @@ build_opts(_) ->
         verify => false,
         alpn => [<<"hq-interop">>, <<"h3">>]
     }.
+
+open_and_request(Conn, Path) ->
+    case quic:open_stream(Conn) of
+        {ok, StreamId} ->
+            Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
+            case quic:send_data(Conn, StreamId, Request, true) of
+                ok -> {StreamId, Path};
+                Err -> {error, Path, Err}
+            end;
+        {error, StreamErr} ->
+            {error, Path, StreamErr}
+    end.
+
+%% Collect concurrently: one file handle per stream, fed by whichever
+%% stream_data arrives next, until every stream has seen its FIN.
+collect_streams(Conn, Streams, DownloadsDir) ->
+    Open = maps:from_list([
+        {Sid, open_target(Path, DownloadsDir)}
+     || {Sid, Path} <- Streams, is_integer(Sid)
+    ]),
+    Failed = [error || {error, _, _} <- Streams],
+    Done = collect_loop(Conn, Open, #{}, 120000),
+    Failed ++ [R || {_Sid, R} <- maps:to_list(Done)].
+
+open_target(Path, DownloadsDir) ->
+    FilePath = filename:join(DownloadsDir, filename:basename(Path)),
+    case file:open(FilePath, [write, binary, raw]) of
+        {ok, Handle} -> {Handle, FilePath, 0};
+        {error, Err} -> {error, FilePath, Err}
+    end.
+
+collect_loop(_Conn, Open, Done, _Timeout) when map_size(Open) =:= 0 ->
+    Done;
+collect_loop(Conn, Open, Done, Timeout) ->
+    receive
+        {quic, Conn, {stream_data, Sid, Data, Fin}} ->
+            case maps:find(Sid, Open) of
+                {ok, {Handle, FilePath, Written}} ->
+                    ok = file:write(Handle, Data),
+                    NewWritten = Written + byte_size(Data),
+                    case Fin of
+                        true ->
+                            file:close(Handle),
+                            io:format("Saved: ~s (~p bytes)~n", [FilePath, NewWritten]),
+                            collect_loop(
+                                Conn,
+                                maps:remove(Sid, Open),
+                                Done#{Sid => ok},
+                                Timeout
+                            );
+                        false ->
+                            collect_loop(
+                                Conn,
+                                Open#{Sid => {Handle, FilePath, NewWritten}},
+                                Done,
+                                Timeout
+                            )
+                    end;
+                error ->
+                    collect_loop(Conn, Open, Done, Timeout)
+            end;
+        {quic, Conn, {stream_reset, Sid, _Code}} ->
+            collect_loop(Conn, maps:remove(Sid, Open), Done#{Sid => error}, Timeout);
+        {quic, Conn, {closed, _Reason}} ->
+            close_remaining(Open, Done)
+    after Timeout ->
+        io:format("Stream timeout with ~p stream(s) outstanding~n", [map_size(Open)]),
+        close_remaining(Open, Done)
+    end.
+
+close_remaining(Open, Done) ->
+    maps:fold(
+        fun
+            (Sid, {Handle, FilePath, _}, Acc) when is_pid(Handle) orelse is_tuple(Handle) ->
+                file:close(Handle),
+                file:delete(FilePath),
+                Acc#{Sid => error};
+            (Sid, _, Acc) ->
+                Acc#{Sid => error}
+        end,
+        Done,
+        Open
+    ).
 
 receive_and_save(Conn, StreamId, Path, DownloadsDir) ->
     %% Extract filename and open file for streaming writes
