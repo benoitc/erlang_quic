@@ -1404,8 +1404,12 @@ reown(#state{owner_mon = OldMon} = State, NewOwner) ->
 
 %% Continue client initialization after socket is ready
 init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
-    %% Generate initial keys
-    InitialKeys = derive_initial_keys(DCID),
+    %% The version decides the Initial salt, so it has to be settled before
+    %% any key is derived. This was fixed at v1, which left the `version'
+    %% option with nothing to do: both the salt and the version in our own
+    %% Initial stayed v1 however the connection was configured.
+    Version = maps:get(version, Opts, ?QUIC_VERSION_1),
+    InitialKeys = derive_initial_keys(DCID, Version),
 
     %% Initialize packet number spaces
     PNSpace = #pn_space{
@@ -1497,6 +1501,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         dcid = DCID,
         original_dcid = DCID,
         role = client,
+        version = Version,
         socket = Sock,
         socket_state = SocketState,
         client_socket_backend = ClientSocketBackend,
@@ -7083,10 +7088,6 @@ strip_brackets([$[ | Rest]) ->
     end;
 strip_brackets(Host) ->
     Host.
-
-%% Derive initial encryption keys
-derive_initial_keys(DCID) ->
-    derive_initial_keys(DCID, ?QUIC_VERSION_1).
 
 %% Derive initial encryption keys with specific QUIC version
 %% Version determines which salt to use (v1 vs v2)
