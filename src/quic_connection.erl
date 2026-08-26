@@ -5835,7 +5835,7 @@ process_tls_message(
     ?TLS_CLIENT_HELLO,
     Body,
     OriginalMsg,
-    #state{role = server, tls_state = ?TLS_AWAITING_CLIENT_HELLO} = State
+    #state{role = server, tls_state = ?TLS_AWAITING_CLIENT_HELLO} = StateChIn
 ) ->
     case quic_tls:parse_client_hello(Body) of
         {ok,
@@ -5845,6 +5845,16 @@ process_tls_message(
                 cipher_suites := CipherSuites,
                 session_id := SessionId
             } = ClientHelloInfo} ->
+            %% RFC 9368 compatible version negotiation must be settled on
+            %% the FIRST ClientHello, before any response goes out: a
+            %% HelloRetryRequest sent in the old version followed by a
+            %% ServerHello in the new one leaves the client mid-handshake
+            %% with packets it cannot make sense of.
+            State = maybe_negotiate_compatible_version(
+                maps:get(transport_params, ClientHelloInfo, #{}),
+                maps:get(early_data, ClientHelloInfo, false),
+                StateChIn
+            ),
             %% Select cipher suite (prefer server's order)
             Cipher = select_cipher(CipherSuites, State#state.cipher_preference),
             %% RFC 8446 §4.1.4 group negotiation: use the client's
@@ -5876,7 +5886,7 @@ process_tls_message(
             end;
         {error, Reason} ->
             ?LOG_ERROR(#{what => client_hello_parse_failed, reason => Reason}, ?QUIC_LOG_META),
-            State
+            StateChIn
     end;
 %% Client receives ServerHello
 process_tls_message(
@@ -6507,7 +6517,7 @@ do_server_client_hello(SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, Ori
 
 %% @private Continue the ClientHello once the server cert/key are settled.
 do_server_client_hello_cont(
-    SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, StateVNIn
+    SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
 ) ->
     ClientALPN = maps:get(alpn_protocols, ClientHelloInfo, []),
     ClientRandom = maps:get(random, ClientHelloInfo, undefined),
@@ -6516,12 +6526,6 @@ do_server_client_hello_cont(
     %% Check for PSK (0-RTT/resumption/external)
     PSKInfo = maps:get(pre_shared_key, ClientHelloInfo, undefined),
     WantsEarlyData = maps:get(early_data, ClientHelloInfo, false),
-
-    %% RFC 9368 compatible version negotiation, before any
-    %% version-dependent derivation (v2 has its own HKDF labels).
-    %% Skipped when the client offers early data: 0-RTT is bound to the
-    %% version of the first flight.
-    State = maybe_negotiate_compatible_version(TP, WantsEarlyData, StateVNIn),
 
     %% TLS 1.3 external PSK selection (RFC 8446 §4.2.11).
     %% Validate pre_shared_key placement, lookup identity, verify
