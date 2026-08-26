@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- ACKs arriving at the Initial or Handshake encryption level no longer
+  reach the 1-RTT loss tracker. Packet numbers restart per space
+  (RFC 9000 §12.3), so a Handshake-space ACK of packet numbers 0..N was
+  retiring the first N 1-RTT packets from the sent queue without the peer
+  having received them: nothing retransmitted them and the peer kept a
+  permanent hole in the stream. A path that drops a full window and then
+  returns (WiFi-to-cellular handover, VPN reconnect, NAT rebind) left the
+  transfer stalled for good. Contributed by jbevemyr (#250).
+
 ## [1.8.1] - 2026-08-15
 
 ### Added
