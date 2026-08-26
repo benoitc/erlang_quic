@@ -186,7 +186,10 @@
     test_decimate_step/1,
     test_decimate_on_timer_fire/1,
     test_maybe_send_ack_app/2,
-    test_classify_recv_trigger/2
+    test_classify_recv_trigger/2,
+    %% Per-space ACK isolation (RFC 9000 Section 12.3)
+    test_state_with_loss/1,
+    test_loss_state/1
 ]).
 -endif.
 
@@ -11658,6 +11661,21 @@ test_state_for_server(RemoteAddr, Secret, ODCID) ->
 
 -spec test_close_reason(#state{}) -> term().
 test_close_reason(#state{close_reason = R}) -> R.
+
+%% Minimal #state{} carrying a caller-supplied loss tracker, for tests
+%% that need to observe what an incoming frame does to it.
+-spec test_state_with_loss(quic_loss:loss_state()) -> #state{}.
+test_state_with_loss(LossState) ->
+    #state{
+        role = client,
+        app_keys = undefined,
+        loss_state = LossState,
+        cc_state = quic_cc:new(#{})
+    }.
+
+%% Read the loss tracker back out without exposing the record.
+-spec test_loss_state(#state{}) -> quic_loss:loss_state().
+test_loss_state(#state{loss_state = L}) -> L.
 
 %% Test helper for check_send_queue_flow_control/3.
 %% Wraps the internal function to avoid exposing #state{} record.
