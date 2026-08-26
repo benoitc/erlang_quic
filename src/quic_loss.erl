@@ -72,6 +72,7 @@
 % 9/8
 -define(TIME_THRESHOLD, 1.125).
 % 1 millisecond
+-define(MAX_PTO_MS, 5000).
 -define(GRANULARITY, 1).
 % RFC 9002 default is 333ms, but 100ms is more aggressive for faster ramp-up
 -define(DEFAULT_INITIAL_RTT, 100).
@@ -518,7 +519,12 @@ get_pto(#loss_state{
 }) ->
     PTO = SRTT + max(4 * RTTVAR, ?GRANULARITY) + MaxAckDelay,
     %% Exponential backoff
-    PTO bsl PTOCount.
+    %% Exponential backoff, capped: uncapped doubling reaches tens of
+    %% seconds after a loss streak, and a probe that arrives after the
+    %% peer's patience is a probe that never happened. Probes are tiny,
+    %% so a bounded worst-case interval costs nothing while keeping
+    %% recovery inside real-world request timeouts.
+    min(PTO bsl PTOCount, ?MAX_PTO_MS).
 
 %% @doc Handle PTO expiration.
 -spec on_pto_expired(loss_state()) -> loss_state().
