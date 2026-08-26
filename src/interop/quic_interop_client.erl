@@ -20,6 +20,7 @@
 
 %% Suppress dialyzer warnings for escript functions that call halt()
 -dialyzer({no_return, [main/1, run_test/3]}).
+-dialyzer({nowarn_function, [run_http3_test/2]}).
 -dialyzer({nowarn_function, [run_resumption_test/2, run_zerortt_test/2, run_migration_test/2]}).
 
 -define(EXIT_SUCCESS, 0).
@@ -663,7 +664,7 @@ run_http3_test(RequestsStr, DownloadsDir) ->
             io:format("No valid requests~n"),
             halt(?EXIT_FAILURE);
         [{Host, Port, _} | _] = Parsed ->
-            case quic_h3:connect(Host, Port, #{verify => false}) of
+            case quic_h3:connect(Host, Port, #{quic_opts => #{verify => false}}) of
                 {ok, Conn} ->
                     ok = quic_h3:wait_connected(Conn, 30000),
                     Results = [

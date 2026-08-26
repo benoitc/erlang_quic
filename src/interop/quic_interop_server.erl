@@ -21,6 +21,7 @@
 
 %% Suppress dialyzer warnings for escript functions that call halt()
 -dialyzer({nowarn_function, [main/1, run_server/4]}).
+-dialyzer({nowarn_function, [run_h3_server/4, run_hq_server/5]}).
 
 -define(EXIT_SUCCESS, 0).
 -define(EXIT_FAILURE, 1).
@@ -97,20 +98,7 @@ run_server(TestCase, Port, CertsDir, WwwDir) ->
 %% other case speaks hq-interop over a bare listener.
 run_h3_server(Port, CertDer, PrivateKey, WwwDir) ->
     Handler = fun(Conn, StreamId, _Method, Path, _Headers) ->
-        CleanPath =
-            case Path of
-                <<"/", Rest/binary>> -> Rest;
-                _ -> Path
-            end,
-        FilePath = filename:join(WwwDir, binary_to_list(CleanPath)),
-        case file:read_file(FilePath) of
-            {ok, Content} ->
-                io:format("h3: 200 ~s (~p bytes)~n", [Path, byte_size(Content)]),
-                quic_h3:respond(Conn, StreamId, 200, [], Content);
-            {error, _} ->
-                io:format("h3: 404 ~s~n", [Path]),
-                quic_h3:respond(Conn, StreamId, 404, [], <<"not found">>)
-        end
+        serve_h3_request(Conn, StreamId, Path, WwwDir)
     end,
     case
         quic_h3:start_server(interop_h3, Port, #{
@@ -127,6 +115,22 @@ run_h3_server(Port, CertDer, PrivateKey, WwwDir) ->
         {error, Reason} ->
             io:format("Failed to start H3 server: ~p~n", [Reason]),
             halt(?EXIT_FAILURE)
+    end.
+
+serve_h3_request(Conn, StreamId, Path, WwwDir) ->
+    CleanPath =
+        case Path of
+            <<"/", Rest/binary>> -> Rest;
+            _ -> Path
+        end,
+    FilePath = filename:join(WwwDir, binary_to_list(CleanPath)),
+    case file:read_file(FilePath) of
+        {ok, Content} ->
+            io:format("h3: 200 ~s (~p bytes)~n", [Path, byte_size(Content)]),
+            quic_h3:respond(Conn, StreamId, 200, [], Content);
+        {error, _} ->
+            io:format("h3: 404 ~s~n", [Path]),
+            quic_h3:respond(Conn, StreamId, 404, [], <<"not found">>)
     end.
 
 run_hq_server(TestCase, Port, CertDer, PrivateKey, WwwDir) ->
@@ -226,19 +230,8 @@ connection_handler(Conn, WwwDir, TestCase, Bufs) ->
             io:format("Handler got stream_opened: ~p~n", [StreamId]),
             connection_handler(Conn, WwwDir, TestCase, Bufs);
         {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
-            Acc = [maps:get(StreamId, Bufs, []) | Data],
-            case Fin of
-                true ->
-                    Request = iolist_to_binary(Acc),
-                    _ = serve_request(Conn, StreamId, Request, WwwDir, TestCase),
-                    connection_handler(
-                        Conn, WwwDir, TestCase, maps:remove(StreamId, Bufs)
-                    );
-                false ->
-                    connection_handler(
-                        Conn, WwwDir, TestCase, Bufs#{StreamId => Acc}
-                    )
-            end;
+            Bufs1 = buffer_stream_data(Conn, WwwDir, TestCase, Bufs, StreamId, Data, Fin),
+            connection_handler(Conn, WwwDir, TestCase, Bufs1);
         {quic, Conn, {closed, Reason}} ->
             io:format("Handler got closed: ~p~n", [Reason]),
             ok;
@@ -248,6 +241,17 @@ connection_handler(Conn, WwwDir, TestCase, Bufs) ->
     after 60000 ->
         io:format("Handler timeout~n"),
         ok
+    end.
+
+buffer_stream_data(Conn, WwwDir, TestCase, Bufs, StreamId, Data, Fin) ->
+    Acc = [maps:get(StreamId, Bufs, []) | Data],
+    case Fin of
+        true ->
+            Request = iolist_to_binary(Acc),
+            _ = serve_request(Conn, StreamId, Request, WwwDir, TestCase),
+            maps:remove(StreamId, Bufs);
+        false ->
+            Bufs#{StreamId => Acc}
     end.
 
 serve_request(Conn, StreamId, Data, WwwDir, TestCase) ->
