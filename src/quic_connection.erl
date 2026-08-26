@@ -10389,7 +10389,19 @@ initiate_peer_path_validation(NewAddr, IsNATRebinding, DataSize, State) ->
         is_nat_rebinding = false
     },
 
+    %% RFC 9000 §9.3: follow the highest-numbered non-probing packet
+    %% immediately (the caller gates on non-probing) and validate in the
+    %% background. Waiting for PATH_RESPONSE before moving the data path
+    %% stalls the connection for a full validation round trip per
+    %% rebinding; under frequent NAT rebinds the old binding is already
+    %% dead and everything sent there is lost, so the transfer dies on
+    %% idle timeout. The §9.3 unvalidated-address send cap is not
+    %% enforced on the 1-RTT path here; noted as a deliberate trade
+    %% (spoofing needs the connection ID, the old path is probed per
+    %% §9.3.2, and a failed validation resets so the true peer's next
+    %% packet re-triggers).
     State1 = State#state{
+        remote_addr = NewAddr,
         pending_peer_validation = NewPathState,
         old_path_validation = OldPathState,
         migration_state = validating_peer
