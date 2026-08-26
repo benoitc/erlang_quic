@@ -1732,6 +1732,10 @@ idle(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     %% Flush batched packets and timers after processing incoming data
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(idle, FlushedState);
+idle(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Socket} = State) ->
+    NewState = handle_packets_batch(Packets, State),
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    check_state_transition(idle, FlushedState);
 %% Server receives packets from listener
 idle(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
@@ -1823,6 +1827,10 @@ handshaking({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = 
 handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
     %% Flush batched packets and timers after processing incoming data
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    check_state_transition(handshaking, FlushedState);
+handshaking(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Socket} = State) ->
+    NewState = handle_packets_batch(Packets, State),
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(handshaking, FlushedState);
 %% Server receives packets from listener
@@ -2189,6 +2197,15 @@ connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) 
     State1 = State#state{current_packet_source = {IP, Port}},
     NewState = handle_packet(Data, State1),
     %% Clear packet source and flush
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FinalState = FlushedState#state{current_packet_source = undefined},
+    check_state_transition(connected, FinalState);
+%% Client receives a whole GRO train from the receiver process as one
+%% message; processing it in one pass amortizes the per-event flushes
+%% over the train.
+connected(info, {udp_batch, Socket, IP, Port, Packets}, #state{socket = Socket} = State) ->
+    State1 = State#state{current_packet_source = {IP, Port}},
+    NewState = handle_packets_batch(Packets, State1),
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     FinalState = FlushedState#state{current_packet_source = undefined},
     check_state_transition(connected, FinalState);

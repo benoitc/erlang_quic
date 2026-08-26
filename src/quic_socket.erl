@@ -182,6 +182,8 @@ open_for_send(RemoteIP, Opts) ->
     Backend = maps:get(backend, Opts, DetectedBackend),
     DetectedGSO = maps:get(gso, Capabilities, false),
     GSOSupported = maps:get(gso, Opts, DetectedGSO),
+    DetectedGRO = maps:get(gro, Capabilities, false),
+    GROSupported = maps:get(gro, Opts, DetectedGRO),
 
     BatchOpts = maps:get(batching, Opts, #{}),
     BatchingEnabled = maps:get(enabled, BatchOpts, true),
@@ -192,6 +194,7 @@ open_for_send(RemoteIP, Opts) ->
         socket ->
             open_send_socket_backend(Family, Opts, #{
                 gso_supported => GSOSupported,
+                gro_supported => GROSupported,
                 batching_enabled => BatchingEnabled,
                 max_batch => MaxBatch,
                 gso_size => GSOSize
@@ -682,9 +685,18 @@ stop_client_receiver(Pid) when is_pid(Pid) ->
 %% exit signals from the linked owner are processed promptly rather
 %% than blocking forever in the NIF.
 client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
-    case socket:recvfrom(Socket, 0, [], 100) of
-        {ok, {#{addr := IP, port := Port}, Data}} ->
-            Owner ! {udp, Socket, IP, Port, Data},
+    %% recv_gro splits GRO-coalesced trains and sizes the read buffer
+    %% for a maximal train; a plain recvfrom with the default 8 KiB
+    %% buffer would silently truncate coalesced input. A multi-packet
+    %% train goes to the owner as ONE message so the mailbox holds
+    %% trains, not packets, and the whole train is processed in one
+    %% receive pass.
+    case recv_gro(Socket, 100) of
+        {ok, {IP, Port}, [Single]} ->
+            Owner ! {udp, Socket, IP, Port, Single},
+            client_recv_loop(SocketState, Owner);
+        {ok, {IP, Port}, Packets} ->
+            Owner ! {udp_batch, Socket, IP, Port, Packets},
             client_recv_loop(SocketState, Owner);
         {error, timeout} ->
             client_recv_loop(SocketState, Owner);
@@ -818,13 +830,19 @@ configure_send_socket(Socket, Opts, BatchConfig) ->
     %% fallback sends, which stalled handshakes and mis-segmented
     %% coalesced Initial+Handshake flights against gen_udp servers.
     GSOEnabled = maps:get(gso_supported, BatchConfig, false),
+    %% Enable GRO so a GSO-batching peer's trains arrive as one
+    %% recvmsg with a UDP_GRO cmsg instead of one syscall per segment;
+    %% recv_gro/2 already handles both shapes.
+    GROEnabled = maybe_enable_gro(Socket, #{
+        gro_supported => maps:get(gro_supported, BatchConfig, false)
+    }),
     State = #socket_state{
         socket = Socket,
         backend = socket,
         owns_socket = true,
         gso_supported = GSOEnabled,
+        gro_enabled = GROEnabled,
         gso_size = maps:get(gso_size, BatchConfig),
-        gro_enabled = false,
         batching_enabled = maps:get(batching_enabled, BatchConfig),
         max_batch_packets = maps:get(max_batch, BatchConfig)
     },
@@ -1186,8 +1204,11 @@ extra_socket_family(Extra) ->
 %%====================================================================
 
 recv_gro(Socket, Timeout) ->
-    %% Receive with GRO - may get coalesced packets
-    case socket:recvmsg(Socket, 0, 128, [], Timeout) of
+    %% Receive with GRO - may get coalesced packets. The buffer must
+    %% hold a maximally coalesced train (64 KiB): passing 0 uses the
+    %% OTP default read buffer (8 KiB) and recvmsg silently truncates
+    %% any larger train, discarding every segment past the first few.
+    case socket:recvmsg(Socket, 65535, 128, [], Timeout) of
         {ok, #{addr := #{addr := IP, port := Port}, iov := [Data], ctrl := Ctrl}} ->
             %% Check for GRO segment size in control messages
             case extract_gro_segment_size(Ctrl) of
