@@ -375,6 +375,10 @@
     initial_tx_off = 0 :: non_neg_integer(),
     %% Client-side: CH1 random + build opts, needed to rebuild CH2
     tls_ch1_random :: binary() | undefined,
+    %% Client-side: the Certificate(+CertificateVerify)+Finished payload,
+    %% retained until HANDSHAKE_DONE so a lost Finished can be resent -
+    %% nothing else retransmits it once the statem has left `handshaking'.
+    client_hs_flight = undefined :: undefined | binary(),
     tls_ch1_opts :: map() | undefined,
     %% Negotiated values surfaced in the connected event
     negotiated_group :: atom() | undefined,
@@ -4850,7 +4854,9 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
     end;
 %% HANDSHAKE_DONE: Server confirms handshake complete
 %% RFC 9000 Section 19.20: Only server can send, only in 1-RTT (app level)
-process_frame(app, handshake_done, #state{role = client} = State) ->
+process_frame(app, handshake_done, #state{role = client} = State0) ->
+    %% Handshake confirmed: the retained Finished flight is done.
+    State = State0#state{client_hs_flight = undefined},
     %% Server confirmed handshake complete (client receiving from server)
     State;
 process_frame(app, handshake_done, #state{role = server} = State) ->
@@ -5376,11 +5382,29 @@ buffer_crypto_data(Level, Offset, Data, State) ->
                 ?QUIC_CRYPTO_BUFFER_EXCEEDED, <<"crypto buffer exceeded">>, State
             );
         false ->
+            %% A handshake-level CRYPTO duplicate from offset 0 at a
+            %% client that has sent its Finished means the server's
+            %% retransmission timer fired: the Finished was lost, and
+            %% nothing else retransmits it once the statem has left
+            %% `handshaking'. Resend it (CRYPTO offsets are idempotent).
+            Expected = maps:get(LevelAtom, State#state.crypto_offset, 0),
+            State0 =
+                case
+                    LevelAtom =:= handshake andalso
+                        State#state.role =:= client andalso
+                        State#state.client_hs_flight =/= undefined andalso
+                        Offset =:= 0 andalso Expected > 0
+                of
+                    true ->
+                        send_handshake_crypto(State#state.client_hs_flight, State);
+                    false ->
+                        State
+                end,
             %% Add data to buffer
             NewBuffer = maps:put(Offset, Data, Buffer),
-            NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State#state.crypto_buffer),
+            NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State0#state.crypto_buffer),
 
-            State1 = State#state{crypto_buffer = NewCryptoBuffer},
+            State1 = State0#state{crypto_buffer = NewCryptoBuffer},
 
             %% Try to process contiguous data
             process_crypto_buffer(LevelAtom, State1)
@@ -5841,6 +5865,7 @@ process_tls_message(
 
                     State1 = State#state{
                         tls_state = ?TLS_HANDSHAKE_COMPLETE,
+                        client_hs_flight = HandshakePayload,
                         tls_transcript = <<Transcript2/binary, ClientFinishedMsg/binary>>,
                         master_secret = MasterSecret,
                         app_keys = {ClientAppKeys, ServerAppKeys},
@@ -9726,8 +9751,23 @@ handle_pto_timeout(#state{loss_state = LossState} = State) ->
     NewLossState = quic_loss:on_pto_expired(LossState),
     State1 = State#state{loss_state = NewLossState},
 
+    %% RFC 9002 §6.2.1: until the handshake is confirmed the PTO probes
+    %% the handshake space too. The retained Finished flight is exactly
+    %% that: a client whose Finished was lost against a server that has
+    %% stopped retransmitting its own flight would otherwise probe only
+    %% 1-RTT data the server cannot act on before handshake completion.
+    State1a =
+        case State1 of
+            #state{role = client, client_hs_flight = Flight, handshake_keys = HsKeys} when
+                Flight =/= undefined, HsKeys =/= undefined
+            ->
+                send_handshake_crypto(Flight, State1);
+            _ ->
+                State1
+        end,
+
     %% Send probe packet (retransmit oldest unacked or send PING)
-    State2 = send_probe_packet(State1),
+    State2 = send_probe_packet(State1a),
 
     %% Probes use the control allowance, so retry any CC-deferred control
     %% retransmits here too (they are not in sent_q for the probe to pick up).
