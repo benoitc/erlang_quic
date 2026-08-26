@@ -2542,17 +2542,40 @@ handle_request_stream_data(
     Combined = <<Buffer/binary, Data/binary>>,
 
     case process_request_frames(StreamId, Combined, Fin, Stream, State) of
+        {ok, Rest, _Stream1, _State1} when Fin, Rest =/= <<>> ->
+            %% Stream ended inside an H3 frame: truncated (RFC 9114 §7.1).
+            {error, {connection_error, ?H3_FRAME_ERROR, <<"stream ended mid-frame">>}};
         {ok, Rest, Stream1, State1} ->
+            %% RFC 9114 §4.1: the message ends when the stream ends, not at
+            %% a frame boundary. A peer that sends its FIN in a bare final
+            %% QUIC frame (quic-go does) otherwise leaves the application
+            %% waiting for a fin-marked delivery that never comes.
+            {Stream2, State2} =
+                case Fin of
+                    true -> finish_request_stream(StreamId, Stream1, State1);
+                    false -> {Stream1, State1}
+                end,
             Buffers1 =
                 case Rest of
                     <<>> -> maps:remove(StreamId, Buffers);
                     _ -> Buffers#{StreamId => Rest}
                 end,
-            Streams1 = Streams#{StreamId => Stream1},
-            {ok, State1#state{streams = Streams1, stream_buffers = Buffers1}};
+            Streams1 = Streams#{StreamId => Stream2},
+            {ok, State2#state{streams = Streams1, stream_buffers = Buffers1}};
         {error, Reason} ->
             {error, Reason, State}
     end.
+
+%% The stream's FIN arrived after the last complete frame. If the body
+%% was already closed by a fin-marked frame delivery this is a no-op;
+%% an open body gets its final empty fin-marked delivery here.
+finish_request_stream(
+    StreamId, #h3_stream{frame_state = expecting_data} = Stream, State
+) ->
+    State1 = notify_stream_data(StreamId, <<>>, true, State),
+    {Stream#h3_stream{frame_state = complete, state = half_closed_remote}, State1};
+finish_request_stream(_StreamId, Stream, State) ->
+    {Stream, State}.
 
 process_request_frames(StreamId, Data, Fin, Stream, #state{quic_conn = QuicConn} = State) ->
     case quic_h3_frame:decode(Data) of
