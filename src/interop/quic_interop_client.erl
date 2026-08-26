@@ -37,7 +37,8 @@
     "v2",
     "resumption",
     "zerortt",
-    "connectionmigration"
+    "connectionmigration",
+    "http3"
 ]).
 
 %% Include for session_ticket record
@@ -49,9 +50,12 @@
 -define(TICKET_FILE, "/tmp/session_ticket.dat").
 
 main(_Args) ->
-    %% Start required applications
+    %% Start required applications. The h3 path needs the quic app's
+    %% supervision (connection registry etc.); the hq path merely
+    %% tolerates its absence.
     application:ensure_all_started(crypto),
     application:ensure_all_started(ssl),
+    application:ensure_all_started(quic),
 
     %% Get environment variables
     TestCase = os:getenv("TESTCASE", "handshake"),
@@ -72,6 +76,8 @@ main(_Args) ->
             run_test(TestCase, RequestsStr, DownloadsDir)
     end.
 
+run_test("http3", RequestsStr, DownloadsDir) ->
+    run_http3_test(RequestsStr, DownloadsDir);
 run_test("resumption", RequestsStr, DownloadsDir) ->
     %% Resumption test: two connections, second uses session ticket
     run_resumption_test(RequestsStr, DownloadsDir);
@@ -649,6 +655,85 @@ run_zerortt_test(RequestsStr, DownloadsDir) ->
                     io:format("Invalid URL~n"),
                     halt(?EXIT_FAILURE)
             end
+    end.
+
+%% Fetch every file over one HTTP/3 connection (RFC 9114); the runner
+%% requires exactly one handshake, so all requests share the connection.
+run_http3_test(RequestsStr, DownloadsDir) ->
+    Requests = string:tokens(RequestsStr, " "),
+    case [{H, Po, Pa} || U <- Requests, {ok, H, Po, Pa} <- [parse_url(U)]] of
+        [] ->
+            io:format("No valid requests~n"),
+            halt(?EXIT_FAILURE);
+        [{Host, Port, _} | _] = Parsed ->
+            case quic_h3:connect(Host, Port, #{verify => false}) of
+                {ok, Conn} ->
+                    ok = quic_h3:wait_connected(Conn, 30000),
+                    Results = [
+                        h3_fetch(Conn, Host, Path, DownloadsDir)
+                     || {_, _, Path} <- Parsed
+                    ],
+                    quic_h3:close(Conn),
+                    case lists:all(fun(R) -> R =:= ok end, Results) of
+                        true ->
+                            io:format("All H3 downloads successful~n"),
+                            halt(?EXIT_SUCCESS);
+                        false ->
+                            io:format("Some H3 downloads failed~n"),
+                            halt(?EXIT_FAILURE)
+                    end;
+                {error, Reason} ->
+                    io:format("H3 connect failed: ~p~n", [Reason]),
+                    halt(?EXIT_FAILURE)
+            end
+    end.
+
+h3_fetch(Conn, Host, Path, DownloadsDir) ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>,
+            case list_to_binary(Path) of
+                <<"/", _/binary>> = P -> P;
+                P -> <<"/", P/binary>>
+            end},
+        {<<":authority">>, list_to_binary(Host)}
+    ],
+    case quic_h3:request(Conn, Headers) of
+        {ok, StreamId} ->
+            h3_collect(Conn, StreamId, Path, DownloadsDir, undefined, <<>>);
+        {error, Reason} ->
+            io:format("H3 request failed: ~p~n", [Reason]),
+            error
+    end.
+
+h3_collect(Conn, StreamId, Path, DownloadsDir, Status, Acc) ->
+    receive
+        {quic_h3, Conn, {response, StreamId, RespStatus, _Headers}} ->
+            h3_collect(Conn, StreamId, Path, DownloadsDir, RespStatus, Acc);
+        {quic_h3, Conn, {data, StreamId, Data, Fin}} ->
+            Acc1 = <<Acc/binary, Data/binary>>,
+            case Fin of
+                true when Status =:= 200 ->
+                    FilePath = filename:join(DownloadsDir, filename:basename(Path)),
+                    ok = file:write_file(FilePath, Acc1),
+                    io:format("H3 saved: ~s (~p bytes)~n", [FilePath, byte_size(Acc1)]),
+                    ok;
+                true ->
+                    io:format("H3 status ~p for ~s~n", [Status, Path]),
+                    error;
+                false ->
+                    h3_collect(Conn, StreamId, Path, DownloadsDir, Status, Acc1)
+            end;
+        {quic_h3, Conn, {error, StreamId, Reason}} ->
+            io:format("H3 stream error: ~p~n", [Reason]),
+            error;
+        {quic_h3, Conn, {closed, Reason}} ->
+            io:format("H3 connection closed: ~p~n", [Reason]),
+            error
+    after 60000 ->
+        io:format("H3 timeout for ~s~n", [Path]),
+        error
     end.
 
 %% First connection: handshake, wait for a session ticket, download nothing.
