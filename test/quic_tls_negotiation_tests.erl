@@ -189,3 +189,22 @@ unsupported_scheme_errors_test() ->
         {unsupported_signature_scheme, _},
         quic_tls:build_certificate_verify(16#FFFF, Key, crypto:hash(sha256, <<"x">>))
     ).
+
+%% SHA-384 suites use 48-byte verify_data; parse_finished must not
+%% truncate it and verify_finished must not badarg on length mismatch.
+sha384_finished_roundtrip_test() ->
+    Secret = crypto:strong_rand_bytes(48),
+    Transcript = crypto:strong_rand_bytes(48),
+    Key = quic_crypto:derive_finished_key(aes_256_gcm, Secret),
+    VerifyData = quic_crypto:compute_finished_verify(aes_256_gcm, Key, Transcript),
+    ?assertEqual(48, byte_size(VerifyData)),
+    ?assertEqual({ok, VerifyData}, quic_tls:parse_finished(VerifyData)),
+    ?assert(quic_tls:verify_finished(VerifyData, Secret, Transcript, aes_256_gcm)).
+
+wrong_length_finished_is_false_not_badarg_test() ->
+    Secret = crypto:strong_rand_bytes(48),
+    Transcript = crypto:strong_rand_bytes(48),
+    Key = quic_crypto:derive_finished_key(aes_256_gcm, Secret),
+    VerifyData = quic_crypto:compute_finished_verify(aes_256_gcm, Key, Transcript),
+    <<Truncated:32/binary, _/binary>> = VerifyData,
+    ?assertNot(quic_tls:verify_finished(Truncated, Secret, Transcript, aes_256_gcm)).
