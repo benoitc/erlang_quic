@@ -21,6 +21,8 @@
 -type label() ::
     client_handshake | server_handshake | client_application | server_application.
 
+-export_type([label/0]).
+
 -spec enabled() -> boolean().
 enabled() ->
     case os:getenv("SSLKEYLOGFILE") of
