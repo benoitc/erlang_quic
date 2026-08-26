@@ -1136,7 +1136,11 @@ init({server, Opts}) ->
             psk_callback => maps:get(psk_callback, Opts, undefined),
             psks => maps:get(psks, Opts, undefined)
         },
-        tls_groups = maps:get(groups, Opts, [x25519]),
+        %% Accept every group the crypto layer supports: a preference
+        %% list holding only x25519 forced a HelloRetryRequest round
+        %% trip on any client whose key_share leads with another group
+        %% (picoquic shares P-256 first).
+        tls_groups = maps:get(groups, Opts, [x25519, secp256r1, secp384r1]),
         tls_sig_algs = maps:get(signature_algs, Opts, undefined),
         alpn_list = normalize_alpn_list(ALPNList),
         pn_initial = PNSpace,
