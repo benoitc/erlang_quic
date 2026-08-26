@@ -39,7 +39,18 @@
     "resumption",
     "zerortt",
     "connectionmigration",
-    "http3"
+    "http3",
+    %% Passive robustness cases: the simulator induces the loss,
+    %% corruption, latency or rebinding; the endpoint just transfers.
+    "longrtt",
+    "blackhole",
+    "amplificationlimit",
+    "handshakeloss",
+    "transferloss",
+    "handshakecorruption",
+    "transfercorruption",
+    "rebind-port",
+    "rebind-addr"
 ]).
 
 main(_Args) ->
@@ -158,6 +169,9 @@ build_server_opts(TestCase, Cert, Key, WwwDir) ->
         cert => Cert,
         key => Key,
         alpn => [<<"hq-interop">>, <<"h3">>],
+        %% The blackhole case blacks the network out on purpose and
+        %% expects the connection to outlast it.
+        disconnect_timeout => infinity,
         connection_handler => fun(ConnPid, Conn) ->
             spawn_handler(ConnPid, Conn, WwwDir, TestCase)
         end

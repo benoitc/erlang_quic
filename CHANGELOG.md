@@ -194,6 +194,14 @@ All notable changes to this project will be documented in this file.
 - A server handshake flight lost on the wire is retransmitted on the client-Initial backoff schedule until the client's Finished arrives. Initial/Handshake packets are not loss-tracked, so a lost flight previously wedged the handshake permanently: the client's Initial retransmits only elicited ACKs once the server TLS state had advanced. (#263)
 
 ### Changed
+- The interop runner declares the passive robustness cases (longrtt,
+  blackhole, amplificationlimit, handshakeloss, transferloss,
+  handshakecorruption, transfercorruption, rebind-port, rebind-addr),
+  runs the multiconnect case as one connection per file so the runner's
+  handshake count matches, disables `disconnect_timeout` in both
+  endpoints so the blackhole case can outlast its outage, waits 60 s per
+  download, and the server loads the full certificate chain from
+  cert.pem.
 - Header protection reuses a cipher context instead of re-running the key
   schedule on every packet. Measured on an 8 MB transfer, the `crypto:*`
   share of connection-process time drops from 10.95% to 8.30%; header
