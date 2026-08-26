@@ -37,7 +37,8 @@
     "v2",
     "resumption",
     "zerortt",
-    "connectionmigration"
+    "connectionmigration",
+    "http3"
 ]).
 
 main(_Args) ->
@@ -81,26 +82,70 @@ run_server(TestCase, Port, CertsDir, WwwDir) ->
             [{_, CertDer, _}] = public_key:pem_decode(CertPem),
             PrivateKey = decode_private_key(KeyPem),
 
-            %% Build server options
-            Opts = build_server_opts(TestCase, CertDer, PrivateKey, WwwDir),
-
-            %% Start listener
-            case quic_listener:start_link(Port, Opts) of
-                {ok, Listener} ->
-                    io:format("Server listening on port ~p~n", [Port]),
-
-                    %% Wait forever (or until killed)
-                    receive
-                        stop ->
-                            quic_listener:stop(Listener),
-                            halt(?EXIT_SUCCESS)
-                    end;
-                {error, Reason} ->
-                    io:format("Failed to start listener: ~p~n", [Reason]),
-                    halt(?EXIT_FAILURE)
+            case TestCase of
+                "http3" ->
+                    run_h3_server(Port, CertDer, PrivateKey, WwwDir);
+                _ ->
+                    run_hq_server(TestCase, Port, CertDer, PrivateKey, WwwDir)
             end;
         _ ->
             io:format("Failed to read certificates~n"),
+            halt(?EXIT_FAILURE)
+    end.
+
+%% The http3 case serves real HTTP/3 (RFC 9114) through quic_h3; every
+%% other case speaks hq-interop over a bare listener.
+run_h3_server(Port, CertDer, PrivateKey, WwwDir) ->
+    Handler = fun(Conn, StreamId, _Method, Path, _Headers) ->
+        CleanPath =
+            case Path of
+                <<"/", Rest/binary>> -> Rest;
+                _ -> Path
+            end,
+        FilePath = filename:join(WwwDir, binary_to_list(CleanPath)),
+        case file:read_file(FilePath) of
+            {ok, Content} ->
+                io:format("h3: 200 ~s (~p bytes)~n", [Path, byte_size(Content)]),
+                quic_h3:respond(Conn, StreamId, 200, [], Content);
+            {error, _} ->
+                io:format("h3: 404 ~s~n", [Path]),
+                quic_h3:respond(Conn, StreamId, 404, [], <<"not found">>)
+        end
+    end,
+    case
+        quic_h3:start_server(interop_h3, Port, #{
+            cert => CertDer,
+            key => PrivateKey,
+            handler => Handler
+        })
+    of
+        {ok, _} ->
+            io:format("H3 server listening on port ~p~n", [Port]),
+            receive
+                stop -> halt(?EXIT_SUCCESS)
+            end;
+        {error, Reason} ->
+            io:format("Failed to start H3 server: ~p~n", [Reason]),
+            halt(?EXIT_FAILURE)
+    end.
+
+run_hq_server(TestCase, Port, CertDer, PrivateKey, WwwDir) ->
+    %% Build server options
+    Opts = build_server_opts(TestCase, CertDer, PrivateKey, WwwDir),
+
+    %% Start listener
+    case quic_listener:start_link(Port, Opts) of
+        {ok, Listener} ->
+            io:format("Server listening on port ~p~n", [Port]),
+
+            %% Wait forever (or until killed)
+            receive
+                stop ->
+                    quic_listener:stop(Listener),
+                    halt(?EXIT_SUCCESS)
+            end;
+        {error, Reason} ->
+            io:format("Failed to start listener: ~p~n", [Reason]),
             halt(?EXIT_FAILURE)
     end.
 
