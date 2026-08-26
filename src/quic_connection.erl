@@ -214,9 +214,12 @@
 %% so it can flush the deferred flight. Backoff doubles from the base up
 %% to the cap. Localhost handshakes complete well under the base, so the
 %% timer is cancelled by the state change and never fires.
--define(HS_RTX_BASE_MS, 500).
--define(HS_RTX_MAX_MS, 4000).
--define(HS_RTX_MAX_ATTEMPTS, 8).
+%% 200 ms base keeps a lossy handshake moving at something closer to
+%% PTO cadence on low-RTT paths; 12 attempts bound the total effort to
+%% roughly half a minute before the connect timeout owns the outcome.
+-define(HS_RTX_BASE_MS, 200).
+-define(HS_RTX_MAX_MS, 3000).
+-define(HS_RTX_MAX_ATTEMPTS, 12).
 
 %% Max send queue size in bytes (16 MB default) - prevents memory exhaustion from queued data
 -define(MAX_SEND_QUEUE_BYTES, 16777216).
