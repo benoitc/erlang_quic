@@ -1804,12 +1804,25 @@ idle({call, From}, open_unidirectional_stream, #state{early_keys = _EarlyKeys} =
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
-%% 0-RTT: Allow sending data in idle state if early keys are available
+%% 0-RTT sending is client-only (RFC 9000 §17.2.3), here as in the
+%% handshaking state: a server handler answering early data delivered
+%% before the handshake completes must queue, or the response goes out
+%% as a 0-RTT packet the client can never decrypt.
+idle(
+    {call, From},
+    {send_data, StreamId, Data, Fin},
+    #state{role = client, early_keys = EarlyKeys} = State
+) when EarlyKeys =/= undefined ->
+    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
+        {ok, NewState} ->
+            {keep_state, NewState, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
 idle(
     {call, From},
     {send_data, StreamId, Data, Fin},
     #state{
-        early_keys = undefined,
         pending_data = Pending
     } = State
 ) ->
@@ -1819,13 +1832,6 @@ idle(
         false ->
             NewPending = Pending ++ [{StreamId, Data, Fin}],
             {keep_state, State#state{pending_data = NewPending}, [{reply, From, ok}]}
-    end;
-idle({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = _} = State) ->
-    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
-        {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
 idle(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
@@ -8413,12 +8419,13 @@ do_send_zero_rtt_data(
             DataBin = iolist_to_binary(Data),
             Offset = StreamState#stream_state.send_offset,
 
-            %% Build STREAM frame
-            Frame = {stream, StreamId, Offset, DataBin, Fin},
-            Payload = quic_frame:encode(Frame),
-
-            %% Send as 0-RTT packet
-            NewState = send_zero_rtt_packet(Payload, [Frame], EarlyKeys, State),
+            %% A write larger than one packet must be split like any
+            %% 1-RTT send; a single oversized 0-RTT packet leaves as one
+            %% IP-fragmented datagram, which QUIC forbids (RFC 9000 §14).
+            MaxChunk = get_max_stream_data_per_packet(State),
+            NewState = send_zero_rtt_chunks(
+                StreamId, Offset, DataBin, Fin, MaxChunk, EarlyKeys, State
+            ),
 
             %% Update stream state and track early data sent
             NewStreamState = StreamState#stream_state{
@@ -8442,6 +8449,18 @@ do_send_zero_rtt_data(
         error ->
             {error, unknown_stream}
     end.
+
+%% Split a 0-RTT write into per-packet STREAM frames, FIN on the last.
+send_zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk, EarlyKeys, State) when
+    byte_size(Data) =< MaxChunk
+->
+    Frame = {stream, StreamId, Offset, Data, Fin},
+    send_zero_rtt_packet(quic_frame:encode(Frame), [Frame], EarlyKeys, State);
+send_zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk, EarlyKeys, State) ->
+    <<Chunk:MaxChunk/binary, Rest/binary>> = Data,
+    Frame = {stream, StreamId, Offset, Chunk, false},
+    State1 = send_zero_rtt_packet(quic_frame:encode(Frame), [Frame], EarlyKeys, State),
+    send_zero_rtt_chunks(StreamId, Offset + MaxChunk, Rest, Fin, MaxChunk, EarlyKeys, State1).
 
 %% Send a 0-RTT packet (long header, type 1)
 %% RFC 9001 Section 5.3: 0-RTT packets use early traffic keys
