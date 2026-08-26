@@ -1013,15 +1013,14 @@ split_uniform_runs([], _Size, [Single]) ->
 split_uniform_runs([], Size, RunAcc) ->
     [{gso, Size, lists:reverse(RunAcc)}];
 split_uniform_runs([P | Rest], Size, RunAcc) ->
-    PSize = iolist_size(P),
-    if
-        PSize =:= Size ->
+    case iolist_size(P) of
+        Size ->
             split_uniform_runs(Rest, Size, [P | RunAcc]);
-        PSize < Size ->
+        PSize when PSize < Size ->
             %% Shorter packet closes this run as its final segment
             %% (the kernel permits a short last segment).
             [{gso, Size, lists:reverse([P | RunAcc])} | split_uniform_runs(Rest)];
-        true ->
+        PSize ->
             Head =
                 case RunAcc of
                     [Single] -> {single, Single};
