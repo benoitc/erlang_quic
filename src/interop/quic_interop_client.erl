@@ -39,7 +39,18 @@
     "resumption",
     "zerortt",
     "connectionmigration",
-    "http3"
+    "http3",
+    %% Passive robustness cases: the simulator induces the loss,
+    %% corruption, latency or rebinding; the endpoint just transfers.
+    "longrtt",
+    "blackhole",
+    "amplificationlimit",
+    "handshakeloss",
+    "transferloss",
+    "handshakecorruption",
+    "transfercorruption",
+    "rebind-port",
+    "rebind-addr"
 ]).
 
 %% Include for session_ticket record
@@ -88,6 +99,23 @@ run_test("zerortt", RequestsStr, DownloadsDir) ->
 run_test("connectionmigration", RequestsStr, DownloadsDir) ->
     %% Connection migration: simulate path change during transfer
     run_migration_test(RequestsStr, DownloadsDir);
+run_test("multiconnect", RequestsStr, DownloadsDir) ->
+    %% One connection per file, sequentially: the runner maps the
+    %% handshakeloss and handshakecorruption cases to this testcase
+    %% name and counts one handshake per requested file.
+    Requests = string:tokens(RequestsStr, " "),
+    Results = lists:append([
+        download_all("multiconnect", [R], DownloadsDir)
+     || R <- Requests
+    ]),
+    case lists:all(fun(R) -> R =:= ok end, Results) of
+        true ->
+            io:format("All downloads successful~n"),
+            halt(?EXIT_SUCCESS);
+        false ->
+            io:format("Some downloads failed~n"),
+            halt(?EXIT_FAILURE)
+    end;
 run_test(TestCase, RequestsStr, DownloadsDir) ->
     %% Standard test case
     Requests = string:tokens(RequestsStr, " "),
@@ -178,7 +206,7 @@ wait_connected(Conn, TestCase) ->
         {quic, Conn, {transport_error, Code, Msg}} ->
             io:format("Transport error: ~p ~p~n", [Code, Msg]),
             error
-    after 30000 ->
+    after 60000 ->
         io:format("Connection timeout~n"),
         error
     end.
@@ -228,10 +256,13 @@ build_opts("v2") ->
         versions => [16#6b3343cf, 16#00000001]
     };
 build_opts(_) ->
-    %% Default options
+    %% Default options. disconnect_timeout is off: the blackhole case
+    %% blacks the network out on purpose and expects the transfer to
+    %% outlast it.
     #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>]
+        alpn => [<<"hq-interop">>, <<"h3">>],
+        disconnect_timeout => infinity
     }.
 
 %% Keep as many streams in flight as the peer's stream credit allows and

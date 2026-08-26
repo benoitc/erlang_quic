@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- The interop runner declares the passive robustness cases (longrtt,
+  blackhole, amplificationlimit, handshakeloss, transferloss,
+  handshakecorruption, transfercorruption, rebind-port, rebind-addr),
+  runs the multiconnect case as one connection per file so the runner's
+  handshake count matches, disables `disconnect_timeout` in both
+  endpoints so the blackhole case can outlast its outage, waits 60 s per
+  download, and the server loads the full certificate chain from
+  cert.pem.
+
 ## [1.8.2] - 2026-09-05
 
 ### Added
