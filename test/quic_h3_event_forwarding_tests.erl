@@ -234,6 +234,44 @@ wait_settings_received(Pid, Timeout) ->
             ok
     end.
 
+%%====================================================================
+%% Body end signalled by bare stream FIN (RFC 9114 §4.1)
+%%====================================================================
+
+%% quic-go ends the response body with an empty final QUIC frame rather
+%% than fin-marking the last DATA chunk. The message ends at stream end,
+%% so the owner must still get a fin-marked delivery.
+bare_fin_ends_body_test_() ->
+    {setup, fun setup/0, fun teardown/1, fun() ->
+        meck:expect(quic, set_stream_priority, fun(_, _, _, _) -> ok end),
+        meck:expect(quic, reset_stream, fun(_, _, _) -> ok end),
+        FakeQuicConn = spawn_link(fun fake_quic_loop/0),
+        {ok, H3Conn} = start_client_h3(FakeQuicConn),
+        drive_to_connected(H3Conn, FakeQuicConn),
+        {ok, StreamId} = quic_h3_connection:request(H3Conn, [
+            {<<":method">>, <<"GET">>},
+            {<<":scheme">>, <<"https">>},
+            {<<":path">>, <<"/f">>},
+            {<<":authority">>, <<"example.com">>}
+        ]),
+        RespHeaders = quic_h3_frame:encode(
+            {headers, quic_qpack:encode([{<<":status">>, <<"200">>}])}
+        ),
+        Body = <<"hello h3 body">>,
+        RespData = quic_h3_frame:encode({data, Body}),
+        H3Conn ! {quic, FakeQuicConn, {stream_data, StreamId, RespHeaders, false}},
+        H3Conn ! {quic, FakeQuicConn, {stream_data, StreamId, RespData, false}},
+        %% The peer's FIN arrives on its own, after the last complete frame.
+        H3Conn ! {quic, FakeQuicConn, {stream_data, StreamId, <<>>, true}},
+        receive
+            {quic_h3, H3Conn, {response, StreamId, 200, _}} -> ok
+        after 500 -> erlang:error(no_response)
+        end,
+        assert_owner_message({data, StreamId, Body, false}, H3Conn, 500),
+        assert_owner_message({data, StreamId, <<>>, true}, H3Conn, 500),
+        stop_h3(H3Conn, FakeQuicConn)
+    end}.
+
 drive_to_connected(H3Conn, FakeQuicConn) ->
     ok = quic_h3_connection:prime(H3Conn),
     wait_state(H3Conn, early_data, 500),
