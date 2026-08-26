@@ -4554,6 +4554,15 @@ process_frame(_Level, ping, State) ->
     State;
 process_frame(Level, {crypto, Offset, Data}, State) ->
     buffer_crypto_data(Level, Offset, Data, State);
+process_frame(Level, {ack, _Ranges, _AckDelay, _ECN}, State) when Level =/= app ->
+    %% Initial/Handshake ACKs must never touch the loss tracker: only
+    %% 1-RTT packets are registered there, and packet numbers restart
+    %% per space, so a Handshake-space ACK of PN 0..N silently "acks"
+    %% the first N 1-RTT packets out of sent_q. If those carried data
+    %% the peer never received, nothing retransmits them and the peer
+    %% stalls on a permanent stream hole. Handshake flights have their
+    %% own retransmission machinery.
+    State;
 process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
     %% Process ACK - update loss detection and congestion control
     #state{loss_state = LossState, cc_state = CCState} = State,
