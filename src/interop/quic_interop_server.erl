@@ -177,19 +177,8 @@ connection_handler(Conn, WwwDir, TestCase, Bufs) ->
             io:format("Handler got stream_opened: ~p~n", [StreamId]),
             connection_handler(Conn, WwwDir, TestCase, Bufs);
         {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
-            Acc = [maps:get(StreamId, Bufs, []) | Data],
-            case Fin of
-                true ->
-                    Request = iolist_to_binary(Acc),
-                    _ = serve_request(Conn, StreamId, Request, WwwDir, TestCase),
-                    connection_handler(
-                        Conn, WwwDir, TestCase, maps:remove(StreamId, Bufs)
-                    );
-                false ->
-                    connection_handler(
-                        Conn, WwwDir, TestCase, Bufs#{StreamId => Acc}
-                    )
-            end;
+            Bufs1 = buffer_stream_data(Conn, WwwDir, TestCase, Bufs, StreamId, Data, Fin),
+            connection_handler(Conn, WwwDir, TestCase, Bufs1);
         {quic, Conn, {closed, Reason}} ->
             io:format("Handler got closed: ~p~n", [Reason]),
             ok;
@@ -199,6 +188,17 @@ connection_handler(Conn, WwwDir, TestCase, Bufs) ->
     after 60000 ->
         io:format("Handler timeout~n"),
         ok
+    end.
+
+buffer_stream_data(Conn, WwwDir, TestCase, Bufs, StreamId, Data, Fin) ->
+    Acc = [maps:get(StreamId, Bufs, []) | Data],
+    case Fin of
+        true ->
+            Request = iolist_to_binary(Acc),
+            _ = serve_request(Conn, StreamId, Request, WwwDir, TestCase),
+            maps:remove(StreamId, Bufs);
+        false ->
+            Bufs#{StreamId => Acc}
     end.
 
 serve_request(Conn, StreamId, Data, WwwDir, TestCase) ->
