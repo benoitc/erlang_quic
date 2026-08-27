@@ -29,6 +29,7 @@
 -include("quic.hrl").
 
 -export([
+    reset_for_new_path/1,
     %% Loss detection state
     new/0,
     new/1,
@@ -114,6 +115,25 @@
 
 -opaque loss_state() :: #loss_state{}.
 -export_type([loss_state/0]).
+
+%% RFC 9002 §9.4 path-change reset: RTT and PTO state belong to the
+%% old path, but the sent-packet tracking must survive - dropping it
+%% orphans every in-flight packet (no ACK match, no loss declaration,
+%% no PTO since bytes_in_flight reads 0) and any lost data in that set
+%% is never retransmitted.
+-spec reset_for_new_path(loss_state() | undefined) -> loss_state().
+reset_for_new_path(undefined) ->
+    new();
+reset_for_new_path(#loss_state{} = S) ->
+    S#loss_state{
+        latest_rtt = 0,
+        smoothed_rtt = ?DEFAULT_INITIAL_RTT,
+        rtt_var = ?DEFAULT_INITIAL_RTT div 2,
+        min_rtt = infinity,
+        first_rtt_sample = false,
+        pto_count = 0,
+        loss_time = undefined
+    }.
 
 %%====================================================================
 %% Loss Detection State

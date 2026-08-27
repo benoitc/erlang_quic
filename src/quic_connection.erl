@@ -10739,9 +10739,18 @@ complete_migration(
     NewPMTUState = quic_pmtu:on_path_change(PMTUState),
 
     %% RFC 9002 Section 9.4: Reset congestion controller on path change
-    %% The new path may have different RTT and bandwidth characteristics
-    NewCCState = quic_cc:new(#{}),
-    NewLossState = quic_loss:new(),
+    %% The new path may have different RTT and bandwidth characteristics.
+    %% The loss tracker's sent_q must SURVIVE the switch: replacing it
+    %% orphans every in-flight packet (no ACK match, no loss detection,
+    %% no PTO since bytes_in_flight reads 0) and their data is never
+    %% retransmitted - the peer then stalls on a permanent stream hole.
+    NewLossState = quic_loss:reset_for_new_path(State#state.loss_state),
+    NewCCState0 = quic_cc:new(#{}),
+    NewCCState =
+        case quic_loss:bytes_in_flight(NewLossState) of
+            0 -> NewCCState0;
+            Outstanding -> quic_cc:on_packet_sent(NewCCState0, Outstanding)
+        end,
 
     State#state{
         remote_addr = NewPath#path_state.remote_addr,
@@ -10752,7 +10761,8 @@ complete_migration(
         pmtu_raise_timer = undefined,
         %% Reset CC and loss detection for new path
         cc_state = NewCCState,
-        loss_state = NewLossState
+        loss_state = NewLossState,
+        pto_dirty = true
     };
 complete_migration(_, State) ->
     %% Can only migrate to validated paths
