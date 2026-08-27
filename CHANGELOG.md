@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- The UDP_GRO control message is read as the int the kernel sends.
+  Matching exactly two bytes meant the lookup never succeeded, so a
+  GRO-coalesced buffer was passed up unsplit as one oversized datagram
+  and dropped by the QUIC layer, which cannot re-split short-header
+  packets. GRO was therefore silently losing every coalesced train.
+  Contributed by jbevemyr (#204).
+- The GRO receive path sizes its read buffer for a maximally coalesced
+  train (64 KiB). Passing 0 used the OTP default 8 KiB buffer and
+  `recvmsg' silently truncated anything larger, discarding every segment
+  past the first few. The client receiver also went through a plain
+  `recvfrom', which never split trains at all. Contributed by jbevemyr
+  (#215).
+
+### Changed
+- A mixed-size send batch on a GSO socket is split into runs of
+  equal-sized packets and each run sent with one UDP_SEGMENT call,
+  instead of falling back to one `sendmsg' per packet. A single
+  odd-sized packet between data packets (an ACK, a flow-control update)
+  previously degraded the whole batch. Contributed by jbevemyr (#217).
+- Small sends are coalesced into shared packets. Contributed by jbevemyr
+  (#203).
+- The pacing burst allowance scales with the pacing rate rather than
+  sitting at a fixed 12 packets. Pacing wakeups have roughly
+  millisecond resolution, so the fixed bucket capped throughput at 12
+  packets per wakeup whenever the sender outran the ACK clock,
+  regardless of the configured rate. Contributed by jbevemyr (#219).
+
 ## [1.8.1] - 2026-08-15
 
 ### Added
