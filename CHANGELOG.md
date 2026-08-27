@@ -131,6 +131,16 @@ All notable changes to this project will be documented in this file.
   millisecond resolution, so the fixed bucket capped throughput at 12
   packets per wakeup whenever the sender outran the ACK clock,
   regardless of the configured rate. Contributed by jbevemyr (#219).
+### Changed
+- A server with no explicit `groups` option now offers every classical
+  group the crypto layer supports (x25519, secp256r1, secp384r1) instead
+  of x25519 alone. A preference list holding only x25519 sent a
+  HelloRetryRequest to any client whose key_share led with another
+  curve, costing a full extra round trip on every such connection and
+  exercising the HRR path in flows that did not need it. picoquic shares
+  P-256 first, so this was every connection from it. An explicit
+  `groups` option still restricts the set exactly as before.
+  Contributed by jbevemyr (#246).
 
 ## [1.8.1] - 2026-08-15
 
