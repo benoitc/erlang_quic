@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- A client whose Finished is lost now recovers. The
+  Certificate(+CertificateVerify)+Finished flight goes out at the
+  Handshake level, and once the client state machine left `handshaking'
+  nothing retransmitted it: handshake-space packets are not in the 1-RTT
+  loss tracker and the handshake retransmit timer only runs in that
+  state. The client considered itself connected and sent 1-RTT data the
+  server could not act on before handshake completion, while the server
+  replayed its own flight against ACK-only answers, until the connection
+  died on the idle timer. The flight is now retained until
+  HANDSHAKE_DONE and resent from the PTO and on a duplicate
+  handshake-level CRYPTO at offset 0. A write that exceeds the peer's
+  flow-control limit also sends the part that fits rather than nothing,
+  which is what lets the recovered connection drain its queue.
+  Contributed by jbevemyr (#252, #230, #225).
+
 ## [1.8.1] - 2026-08-15
 
 ### Added
