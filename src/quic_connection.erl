@@ -685,7 +685,18 @@
     last_recv_trigger = sequential :: sequential | reordered,
 
     %% QLOG Tracing (draft-ietf-quic-qlog-quic-events)
-    qlog_ctx :: #qlog_ctx{} | undefined
+    qlog_ctx :: #qlog_ctx{} | undefined,
+
+    %% Small-send coalescing (issue #201). While `coalesce' is true -
+    %% only within one drained batch of send_data/send_data_async
+    %% requests - app packets accumulate here and are flushed as one
+    %% multi-frame packet per PMTU budget instead of one packet per
+    %% frame. Reversed accumulation lists; see send_app_packet_internal
+    %% and flush_pending_packet.
+    coalesce = false :: boolean(),
+    pend_payload = [] :: [iodata()],
+    pend_frames = [] :: [tuple()],
+    pend_size = 0 :: non_neg_integer()
 }).
 
 %%====================================================================
@@ -1957,14 +1968,7 @@ connected({call, From}, {send_datagram, Data}, State) ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
 connected({call, From}, {send_data, StreamId, Data, Fin}, State) ->
-    case do_send_data(StreamId, Data, Fin, State) of
-        {ok, NewState} ->
-            %% Event-driven flush: flush batch and timers after user API call
-            FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
-            {keep_state, FlushedState, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
-    end;
+    coalesced_sends([{From, StreamId, Data, Fin}], State);
 connected({call, From}, open_stream, State) ->
     case do_open_stream(State) of
         {ok, StreamId, NewState} ->
@@ -2254,15 +2258,7 @@ connected(cast, {close, Reason}, State) ->
     {next_state, draining, NewState};
 %% Async send data - fire-and-forget for high throughput
 connected(cast, {send_data_async, StreamId, Data, Fin}, State) ->
-    case do_send_data(StreamId, Data, Fin, State) of
-        {ok, NewState} ->
-            %% Event-driven flush: flush batch and timers after user API call
-            FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
-            {keep_state, FlushedState};
-        {error, _Reason} ->
-            %% Silently drop errors in async mode
-            {keep_state, State}
-    end;
+    coalesced_sends([{async, StreamId, Data, Fin}], State);
 connected(cast, process, #state{role = client, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
     client_rearm_active(State, N),
@@ -3551,7 +3547,78 @@ send_app_packet(Payload, State) when is_binary(Payload) ->
     send_app_packet_internal(Payload, FrameInfo, State).
 
 %% Send a 1-RTT packet with explicit frames list for retransmission tracking
+%% Coalescing front end: within a drained send batch, small app
+%% packets accumulate and are emitted as one multi-frame packet.
+%% Everything downstream (packet build, loss tracking, retransmit,
+%% counters) already handles a frames list per packet, so only the
+%% emission point changes. A payload larger than the remaining budget
+%% flushes the pending packet first; coalescing off means the old
+%% one-packet-per-call behaviour, byte for byte.
+send_app_packet_internal(Payload, Frames, #state{coalesce = true} = State) ->
+    #state{pend_payload = PP, pend_frames = PF, pend_size = PS} = State,
+    Size = erlang:iolist_size(Payload),
+    Budget = get_max_stream_data_per_packet(State),
+    case PS > 0 andalso PS + Size > Budget of
+        true ->
+            State1 = flush_pending_packet(State),
+            State1#state{
+                pend_payload = [Payload],
+                pend_frames = lists:reverse(Frames),
+                pend_size = Size
+            };
+        false ->
+            State#state{
+                pend_payload = [Payload | PP],
+                pend_frames = lists:reverse(Frames, PF),
+                pend_size = PS + Size
+            }
+    end;
 send_app_packet_internal(Payload, Frames, State) ->
+    send_app_packet_now(Payload, Frames, State).
+
+%% Drain consecutive send requests already sitting in the mailbox and
+%% process them as one batch with coalescing enabled, so frames from
+%% concurrent senders share packets (issue #201). Only send messages
+%% are drained; everything else keeps its ordinary ordering. A lone
+%% send behaves exactly as before apart from a single extra receive
+%% probe.
+coalesced_sends(Acc0, State0) ->
+    Sends = drain_send_msgs(Acc0, 63),
+    {RevReplies, State1} =
+        lists:foldl(
+            fun({Tag, Sid, Data, Fin}, {Rs, S}) ->
+                case do_send_data(Sid, Data, Fin, S) of
+                    {ok, S2} -> {[{Tag, ok} | Rs], S2};
+                    {error, Reason} -> {[{Tag, {error, Reason}} | Rs], S}
+                end
+            end,
+            {[], State0#state{coalesce = true}},
+            Sends
+        ),
+    State2 = flush_pending_packet(State1#state{coalesce = false}),
+    FlushedState = flush_dirty_timers(flush_socket_batch(State2)),
+    Replies = [{reply, F, R} || {F, R} <- lists:reverse(RevReplies), F =/= async],
+    {keep_state, FlushedState, Replies}.
+
+drain_send_msgs(Acc, 0) ->
+    lists:reverse(Acc);
+drain_send_msgs(Acc, N) ->
+    receive
+        {'$gen_call', From, {send_data, Sid, D, Fin}} ->
+            drain_send_msgs([{From, Sid, D, Fin} | Acc], N - 1);
+        {'$gen_cast', {send_data_async, Sid, D, Fin}} ->
+            drain_send_msgs([{async, Sid, D, Fin} | Acc], N - 1)
+    after 0 ->
+        lists:reverse(Acc)
+    end.
+
+flush_pending_packet(#state{pend_size = 0} = State) ->
+    State;
+flush_pending_packet(#state{pend_payload = PP, pend_frames = PF} = State) ->
+    State1 = State#state{pend_payload = [], pend_frames = [], pend_size = 0},
+    send_app_packet_now(lists:reverse(PP), lists:reverse(PF), State1).
+
+send_app_packet_now(Payload, Frames, State) ->
     #state{
         dcid = DCID,
         app_keys = {ClientKeys, ServerKeys},
