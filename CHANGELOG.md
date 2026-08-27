@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- The loss time threshold is `max(smoothed_rtt, latest_rtt)`
+  (RFC 9002 section 6.1.2) rather than the smoothed estimate alone. When
+  an RTT spike outruns the EWMA the two diverge, and the smaller
+  threshold declares in-flight packets lost while their ACKs are merely
+  late. Each spurious loss both retransmits data the peer already has
+  and collapses the congestion window, so a single latency excursion
+  (receiver queueing, bufferbloat) turned into a throughput collapse.
+  Contributed by jbevemyr (#210).
+
 ## [1.8.1] - 2026-08-15
 
 ### Added
