@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- The sent-packet tracker now survives an active path migration. It was
+  replaced wholesale, which orphaned every packet already in flight: no
+  ACK matched them, loss detection never ran, and `bytes_in_flight` read
+  zero so no PTO fired either. Their data was never retransmitted and
+  the peer kept a permanent hole in the stream. The path-derived
+  estimates (RTT, PTO count) still reset, since those belong to the old
+  path. Contributed by jbevemyr (#251).
+- The PTO backoff is capped at 5 seconds. RFC 9002 section 6.2.1 doubles
+  the PTO on each consecutive expiration and the doubling had no
+  ceiling, so on a 50 ms path it reached roughly 90 seconds after nine
+  expirations and about twelve minutes after twelve. A probe scheduled
+  that far out never happens: the idle timer and any request deadline
+  above it have long since fired. Contributed by jbevemyr (#254).
+
 ## [1.8.1] - 2026-08-15
 
 ### Added
