@@ -42,6 +42,32 @@ All notable changes to this project will be documented in this file.
   (receiver queueing, bufferbloat) turned into a throughput collapse.
   Contributed by jbevemyr (#210).
 - PMTU probes are tracked as non-ack-eliciting, so a probe lost past the path MTU no longer inflates `bytes_in_flight`, arms the PTO machinery, or feeds a congestion event (RFC 8899 §3, RFC 9000 §14.4). Combined with an in-flight-keyed liveness check, the periodic raise probe previously killed every long-lived connection on an MTU-limited path once per 600-second raise interval, both ends at once. The raise interval is configurable as `pmtu_raise_interval`. (#264)
+- The UDP_GRO control message is read as the int the kernel sends.
+  Matching exactly two bytes meant the lookup never succeeded, so a
+  GRO-coalesced buffer was passed up unsplit as one oversized datagram
+  and dropped by the QUIC layer, which cannot re-split short-header
+  packets. GRO was therefore silently losing every coalesced train.
+  Contributed by jbevemyr (#204).
+- The GRO receive path sizes its read buffer for a maximally coalesced
+  train (64 KiB). Passing 0 used the OTP default 8 KiB buffer and
+  `recvmsg' silently truncated anything larger, discarding every segment
+  past the first few. The client receiver also went through a plain
+  `recvfrom', which never split trains at all. Contributed by jbevemyr
+  (#215).
+
+### Changed
+- A mixed-size send batch on a GSO socket is split into runs of
+  equal-sized packets and each run sent with one UDP_SEGMENT call,
+  instead of falling back to one `sendmsg' per packet. A single
+  odd-sized packet between data packets (an ACK, a flow-control update)
+  previously degraded the whole batch. Contributed by jbevemyr (#217).
+- Small sends are coalesced into shared packets. Contributed by jbevemyr
+  (#203).
+- The pacing burst allowance scales with the pacing rate rather than
+  sitting at a fixed 12 packets. Pacing wakeups have roughly
+  millisecond resolution, so the fixed bucket capped throughput at 12
+  packets per wakeup whenever the sender outran the ACK clock,
+  regardless of the configured rate. Contributed by jbevemyr (#219).
 
 ## [1.8.1] - 2026-08-15
 
