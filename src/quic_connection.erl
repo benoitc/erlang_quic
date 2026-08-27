@@ -166,6 +166,8 @@
     maybe_store_initial_reset_token/2,
     check_stateless_reset/2,
     test_state_for_reset/3,
+    %% Retransmission congestion policy (RFC 9002 §7)
+    retransmit_cc_allowed/3,
     %% NEW_TOKEN frame dispatch (RFC 9000 §8.1.3)
     process_frame/3,
     test_state_for_role/1,
@@ -9388,12 +9390,7 @@ send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = 
     Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
     PacketSize = byte_size(Payload) + 50,
 
-    Allowed =
-        case Mode of
-            probe -> true;
-            normal -> quic_cc:can_send_control(CCState, PacketSize)
-        end,
-    case Allowed of
+    case retransmit_cc_allowed(Mode, CCState, PacketSize) of
         true ->
             send_app_packet_internal(Payload, Frames, State#state{retransmits = R + 1});
         false ->
@@ -9414,6 +9411,16 @@ send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = 
             ),
             defer_retransmit_frames(Frames, State)
     end.
+
+%% RFC 9002 §7: an endpoint MUST NOT exceed cwnd "unless the packet is
+%% sent on a PTO timer expiration or when entering a recovery period".
+%% A PTO probe is exempt outright; an ordinary loss retransmission
+%% stays bound by the congestion window proper, not by the more
+%% lenient control allowance.
+retransmit_cc_allowed(probe, _CCState, _PacketSize) ->
+    true;
+retransmit_cc_allowed(normal, CCState, PacketSize) ->
+    quic_cc:can_send(CCState, PacketSize).
 
 %% Split CC-deferred lost frames: stream data into FC-exempt retransmit_stream
 %% queue entries (retried by process_send_queue/1), control frames into
