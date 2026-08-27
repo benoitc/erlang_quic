@@ -106,6 +106,8 @@ All notable changes to this project will be documented in this file.
   flow-control limit also sends the part that fits rather than nothing,
   which is what lets the recovered connection drain its queue.
   Contributed by jbevemyr (#252, #230, #225).
+- Anti-amplification accounting (RFC 9000 §8.1) now also runs on the batched listener delivery path. A server whose ClientHello arrived in a GRO batch kept its amp budget at zero, deferred the handshake flight, and the handshake wedged until the connect timeout. (#263)
+- A server handshake flight lost on the wire is retransmitted on the client-Initial backoff schedule until the client's Finished arrives. Initial/Handshake packets are not loss-tracked, so a lost flight previously wedged the handshake permanently: the client's Initial retransmits only elicited ACKs once the server TLS state had advanced. (#263)
 
 ## [1.8.1] - 2026-08-15
 
