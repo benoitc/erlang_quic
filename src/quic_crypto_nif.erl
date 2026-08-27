@@ -22,14 +22,33 @@
 -on_load(load/0).
 
 load() ->
-    So = filename:join(code:priv_dir(quic), "quic_crypto_nif"),
-    case erlang:load_nif(So, 0) of
-        ok ->
+    case nif_disabled() of
+        true ->
+            %% Opt-out: stubs below stay in place; is_loaded/0 returns
+            %% false and quic_crypto uses OTP crypto.
             ok;
-        {error, _Reason} ->
-            %% Fallback path: stubs below stay in place; is_loaded/0
-            %% returns false and quic_crypto uses OTP crypto.
-            ok
+        false ->
+            So = filename:join(code:priv_dir(quic), "quic_crypto_nif"),
+            case erlang:load_nif(So, 0) of
+                ok ->
+                    ok;
+                {error, _Reason} ->
+                    %% Fallback path: same as the opt-out.
+                    ok
+            end
+    end.
+
+%% Runtime opt-out for benchmarking and fault isolation, read once at
+%% module load: QUIC_DISABLE_CRYPTO_NIF=1 disables this NIF alone,
+%% QUIC_DISABLE_NIFS=1 disables every optional NIF.
+nif_disabled() ->
+    env_true("QUIC_DISABLE_CRYPTO_NIF") orelse env_true("QUIC_DISABLE_NIFS").
+
+env_true(Var) ->
+    case os:getenv(Var) of
+        "1" -> true;
+        "true" -> true;
+        _ -> false
     end.
 
 -spec is_loaded() -> boolean().
