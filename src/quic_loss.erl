@@ -408,11 +408,20 @@ detect_lost_q(
                     true -> LostBytes + Size;
                     false -> LostBytes
                 end,
+            %% Only ack-eliciting losses drive the congestion event
+            %% (largest_lost_sent_time feeds on_congestion_event). A lost
+            %% non-ack-eliciting packet, a PMTU probe in particular, is
+            %% not a congestion signal (RFC 9000 §14.4).
             NewLL =
-                case LL of
-                    undefined -> {PN, TS};
-                    {OldPN, _} when PN > OldPN -> {PN, TS};
-                    _ -> LL
+                case AE of
+                    false ->
+                        LL;
+                    true ->
+                        case LL of
+                            undefined -> {PN, TS};
+                            {OldPN, _} when PN > OldPN -> {PN, TS};
+                            _ -> LL
+                        end
                 end,
             detect_lost_q(Rest, SRTT, LargestAcked, Now, [P | LostAcc], SurvQ, NewBytes, NewLL);
         false ->

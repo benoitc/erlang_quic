@@ -34,6 +34,7 @@ All notable changes to this project will be documented in this file.
   and collapses the congestion window, so a single latency excursion
   (receiver queueing, bufferbloat) turned into a throughput collapse.
   Contributed by jbevemyr (#210).
+- PMTU probes are tracked as non-ack-eliciting, so a probe lost past the path MTU no longer inflates `bytes_in_flight`, arms the PTO machinery, or feeds a congestion event (RFC 8899 §3, RFC 9000 §14.4). Combined with an in-flight-keyed liveness check, the periodic raise probe previously killed every long-lived connection on an MTU-limited path once per 600-second raise interval, both ends at once. The raise interval is configurable as `pmtu_raise_interval`. (#264)
 
 ## [1.8.1] - 2026-08-15
 

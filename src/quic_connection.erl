@@ -668,6 +668,7 @@
     pmtu_state :: #pmtu_state{} | undefined,
     pmtu_probe_timer :: reference() | undefined,
     pmtu_raise_timer :: reference() | undefined,
+    pmtu_raise_interval = ?PMTU_DEFAULT_RAISE_INTERVAL :: pos_integer(),
 
     %% Deferred PTO timer reset, flushed at batch boundaries via
     %% flush_dirty_timers/1. (Idle and keep-alive timers are lazy and
@@ -1191,6 +1192,7 @@ init({server, Opts}) ->
         congestion_threshold = maps:get(congestion_threshold, Opts, 2),
         pacing_enabled = maps:get(pacing_enabled, Opts, true),
         pmtu_state = init_pmtu_state(Opts),
+        pmtu_raise_interval = maps:get(pmtu_raise_interval, Opts, ?PMTU_DEFAULT_RAISE_INTERVAL),
         qlog_ctx = quic_qlog:new(Opts, InitialDCID, server)
     },
 
@@ -1573,6 +1575,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         pacing_enabled = maps:get(pacing_enabled, Opts, true),
         active_n = maps:get(active_n, Opts, 100),
         pmtu_state = init_pmtu_state(Opts),
+        pmtu_raise_interval = maps:get(pmtu_raise_interval, Opts, ?PMTU_DEFAULT_RAISE_INTERVAL),
         qlog_ctx = quic_qlog:new(Opts, DCID, client)
     },
 
@@ -3545,16 +3548,6 @@ send_frame(Frame, State) ->
 %% Send a 1-RTT (application) packet with pre-encoded binary payload
 %% Decodes the payload to extract frame info for loss tracking
 %% Note: Prefer send_frame/2 when frame tuple is available
-send_app_packet(Payload, State) when is_binary(Payload) ->
-    %% Try to decode the frame for proper loss tracking
-    FrameInfo =
-        case quic_frame:decode(Payload) of
-            {Frame, _Rest} when is_tuple(Frame); is_atom(Frame) -> [Frame];
-            % Fall back to empty if decode fails
-            _ -> []
-        end,
-    send_app_packet_internal(Payload, FrameInfo, State).
-
 %% Send a 1-RTT packet with explicit frames list for retransmission tracking
 send_app_packet_internal(Payload, Frames, State) ->
     #state{
@@ -11428,8 +11421,19 @@ send_pmtu_probe_packet(ProbeSize, Frames, #state{dcid = DCID, pn_app = PNSpace} 
     %% Add extra padding to frame payload
     PaddedFrames = <<EncodedFrames/binary, (binary:copy(<<0>>, ExtraPadding))/binary>>,
 
-    %% Use existing send_app_packet which handles all encryption/tracking
-    send_app_packet(PaddedFrames, State).
+    %% Send with an empty frames list so the probe is tracked as
+    %% non-ack-eliciting locally: it stays in sent_q, which is what the
+    %% PMTU ack/lost hooks fold over, but adds nothing to
+    %% bytes_in_flight, arms no PTO, and is never retransmitted. Losing
+    %% a probe is the expected outcome of probing past the path MTU
+    %% (RFC 8899 §3, RFC 9000 §14.4): it must be decided by quic_pmtu's
+    %% own probe timer, never surface as connection loss. Tracking it
+    %% as in-flight data let a single lost raise-probe hold
+    %% bytes_in_flight above zero with no possible progress, and the
+    %% disconnect timeout then declared the peer dead: every long-lived
+    %% connection on an MTU-limited path died on the first periodic
+    %% re-probe, both ends at once.
+    send_app_packet_internal(PaddedFrames, [], State).
 
 %% @doc Encode PMTU probe frames (PING + PADDING).
 -spec encode_pmtu_frames([term()]) -> binary().
@@ -11472,7 +11476,7 @@ set_pmtu_probe_timer(#state{pmtu_probe_timer = OldTimer, loss_state = LossState}
 -spec maybe_set_pmtu_raise_timer(#state{}) -> #state{}.
 maybe_set_pmtu_raise_timer(#state{pmtu_raise_timer = undefined} = State) ->
     Ref = make_ref(),
-    erlang:send_after(?PMTU_DEFAULT_RAISE_INTERVAL, self(), {pmtu_raise_timeout, Ref}),
+    erlang:send_after(State#state.pmtu_raise_interval, self(), {pmtu_raise_timeout, Ref}),
     State#state{pmtu_raise_timer = Ref};
 maybe_set_pmtu_raise_timer(State) ->
     State.
