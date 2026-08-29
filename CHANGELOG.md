@@ -161,6 +161,7 @@ All notable changes to this project will be documented in this file.
   P-256 first, so this was every connection from it. An explicit
   `groups` option still restricts the set exactly as before.
   Contributed by jbevemyr (#246).
+- The CONNECTION_CLOSE sent from terminate/3 (owner death, exit signals) reaches the wire: it was batched into an updated socket state that terminate discarded, flushing the stale one instead, so the peer never learned of the close and held a phantom connection until its idle timeout. Peers now see an owner-death close within milliseconds. (#265)
 
 ## [1.8.1] - 2026-08-15
 

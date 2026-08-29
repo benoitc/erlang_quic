@@ -1726,35 +1726,42 @@ terminate(
         qlog_ctx = QlogCtx
     } = State
 ) ->
-    %% If we're not already draining/closed, try to send CONNECTION_CLOSE
-    %% No owner notification here - either already notified (draining) or owner is dead
-    case StateName of
-        draining ->
-            ok;
-        closed ->
-            ok;
-        _ ->
-            try
-                %% Use close_reason from state if set, otherwise use terminate reason
-                CloseReason =
-                    case State#state.close_reason of
-                        undefined -> Reason;
-                        R -> R
-                    end,
-                send_connection_close(CloseReason, State)
-            catch
-                _:_ -> ok
-            end
-    end,
+    %% If we're not already draining/closed, try to send CONNECTION_CLOSE.
+    %% No owner notification here - either already notified (draining) or
+    %% owner is dead. The send batches the close packet into an updated
+    %% socket_state; that updated state must be the one flushed below, or
+    %% the close never reaches the wire and the peer holds a phantom
+    %% connection until its idle timeout (an owner death then looks like a
+    %% host that stays connected for up to a minute).
+    FlushSocketState =
+        case StateName of
+            draining ->
+                SocketState;
+            closed ->
+                SocketState;
+            _ ->
+                try
+                    %% Use close_reason from state if set, otherwise use terminate reason
+                    CloseReason =
+                        case State#state.close_reason of
+                            undefined -> Reason;
+                            R -> R
+                        end,
+                    CloseState = send_connection_close(CloseReason, State),
+                    CloseState#state.socket_state
+                catch
+                    _:_ -> SocketState
+                end
+        end,
     %% Flush any batched packets before closing and close owned sockets
-    case SocketState of
+    case FlushSocketState of
         undefined ->
             ok;
         _ ->
             try
-                _ = quic_socket:flush(SocketState),
+                _ = quic_socket:flush(FlushSocketState),
                 %% Close socket_state (respects owns_socket flag)
-                _ = quic_socket:close(SocketState)
+                _ = quic_socket:close(FlushSocketState)
             catch
                 _:_ -> ok
             end
@@ -9957,9 +9964,9 @@ emit_close_at_level(none, _CloseFrame, State) ->
 
 %% Send CONNECTION_CLOSE frame during terminate (best effort)
 %% This is called when the process is terminating unexpectedly
-send_connection_close(_Reason, #state{app_keys = undefined}) ->
+send_connection_close(_Reason, #state{app_keys = undefined} = State) ->
     %% No app keys yet, can't send encrypted close frame
-    ok;
+    State;
 send_connection_close(Reason, State) ->
     {ErrorCode, ReasonPhrase} =
         case Reason of
@@ -9975,13 +9982,15 @@ send_connection_close(Reason, State) ->
                 {?QUIC_APPLICATION_ERROR, <<>>}
         end,
     CloseFrame = {connection_close, application, ErrorCode, undefined, ReasonPhrase},
-    %% Best effort send - ignore errors since we're terminating anyway
+    %% Best effort send - ignore errors since we're terminating anyway.
+    %% Return the updated state: it carries the batched close packet, and
+    %% the caller must flush that socket_state for the frame to reach the
+    %% wire.
     try
         send_frame(CloseFrame, State)
     catch
-        _:_ -> ok
-    end,
-    ok.
+        _:_ -> State
+    end.
 
 %% Send TLS alert as QUIC crypto error and close connection.
 %% QUIC crypto errors are 0x100 + TLS alert code (RFC 9001 §4.8).
