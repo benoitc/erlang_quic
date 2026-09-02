@@ -159,6 +159,10 @@
     test_complete_migration/3,
     %% Spin bit (RFC 9000 §17.4)
     update_spin_from_recv/3,
+    record_app_recv/4,
+    record_received_pn/4,
+    update_last_activity/2,
+    test_app_recv_state/2,
     short_header_first_byte/3,
     test_spin_state/1,
     test_spin_state_for/2,
@@ -4912,12 +4916,7 @@ decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
                     %% recv_time and last_activity to save one BIF
                     %% call per received packet on the hot path.
                     Now = erlang:monotonic_time(millisecond),
-                    State2 = update_spin_from_recv(
-                        UnprotectedFirstByte,
-                        PN,
-                        record_received_pn(app, PN, State1, Now)
-                    ),
-                    State3 = update_last_activity(State2, Now),
+                    State3 = record_app_recv(UnprotectedFirstByte, PN, State1, Now),
                     %% Use streaming decode for efficiency
                     case decode_and_process_streaming(app, Plaintext, State3) of
                         {ok, NewState, Frames} ->
@@ -8890,10 +8889,46 @@ short_header_first_byte(KeyPhase, PNLen, #state{
 short_header_first_byte(KeyPhase, PNLen, #state{spin_bit_enabled = false}) ->
     16#40 bor (KeyPhase bsl 2) bor (PNLen - 1).
 
+%% Per-packet receive bookkeeping for the 1-RTT hot path: PN-space
+%% update, spin-bit tracking and the activity stamp in one #state{}
+%% rebuild. As three separate helpers (record_received_pn +
+%% update_spin_from_recv + update_last_activity) each rebuilt the full
+%% state record, together ~10% of receive CPU on bulk flows. Same
+%% logic as those helpers; the spin part mirrors update_spin_from_recv.
+record_app_recv(FirstByte, PN, #state{pn_app = PNSpace} = State, Now) ->
+    Trigger = classify_recv_trigger(PN, PNSpace),
+    NewPNSpace = update_pn_space_recv(PN, PNSpace, Now),
+    {SpinRecv, SpinLargest, SpinOut} =
+        case PN > State#state.spin_recv_largest_pn of
+            true ->
+                R = (FirstByte bsr 5) band 1,
+                Out =
+                    case State#state.spin_bit_enabled of
+                        false -> State#state.spin_outgoing;
+                        true when State#state.role =:= client -> R;
+                        true -> 1 - R
+                    end,
+                {R, PN, Out};
+            false ->
+                {State#state.spin_recv, State#state.spin_recv_largest_pn, State#state.spin_outgoing}
+        end,
+    State#state{
+        pn_app = NewPNSpace,
+        last_recv_trigger = Trigger,
+        spin_recv = SpinRecv,
+        spin_recv_largest_pn = SpinLargest,
+        spin_outgoing = SpinOut,
+        last_activity = Now,
+        ack_eliciting_since_recv = false
+    }.
+
 %% Update the spin-bit tracking state from a received 1-RTT packet.
 %% RFC 9000 §17.4 only updates on packets whose PN is greater than any
 %% previously received on this path so that reorderings don't flip the
 %% edge. Client mirrors the received bit; server inverts it.
+%% Kept for the spin-bit unit tests and as the reference the fused
+%% record_app_recv/4 is checked against.
+-ifdef(TEST).
 update_spin_from_recv(
     FirstByte, PN, #state{spin_recv_largest_pn = Largest, role = Role} = State
 ) when PN > Largest ->
@@ -8911,6 +8946,7 @@ update_spin_from_recv(
     };
 update_spin_from_recv(_FirstByte, _PN, State) ->
     State.
+-endif.
 
 %% Short-header packet overhead for a DATAGRAM frame on the 1-RTT level:
 %%   1 byte flags
@@ -12877,6 +12913,13 @@ test_spin_state(#state{
 -spec test_spin_state_for(client | server, boolean()) -> #state{}.
 test_spin_state_for(Role, Enabled) ->
     #state{role = Role, spin_bit_enabled = Enabled}.
+
+%% Minimal #state{} with a 1-RTT PN space, for the receive-bookkeeping
+%% tests that run record_app_recv/4 against its unfused parts.
+-spec test_app_recv_state(client | server, boolean()) -> #state{}.
+test_app_recv_state(Role, SpinEnabled) ->
+    S = test_decimate_initial_state(),
+    S#state{role = Role, spin_bit_enabled = SpinEnabled}.
 
 %% Minimal #state{} for stateless-reset tests.
 -spec test_state_with_secret(binary() | undefined) -> #state{}.
