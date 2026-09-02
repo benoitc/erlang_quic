@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- `hibernate_after` (default 5000 ms) hibernates an idle connection
+  process, running a fullsweep so the handshake's garbage stops being
+  pinned to a heap that never collects on its own. `infinity` opts out.
+  Contributed by jbevemyr (#207).
 - TLS secrets are written to the file named by `SSLKEYLOGFILE` when it is
   set, in the format Wireshark reads. Contributed by jbevemyr (#231).
 - `max_burst_packets` bounds how many packets leave per send drain, so a
@@ -15,6 +19,16 @@ All notable changes to this project will be documented in this file.
   Contributed by jbevemyr (#213).
 
 ### Fixed
+- A client switches away from a connection ID the peer has retired
+  (RFC 9000 section 5.1.2) instead of continuing to use it.
+  Contributed by jbevemyr (#218).
+- The keep-alive PING no longer spins on a connection whose peer has
+  gone quiet. Contributed by jbevemyr (#221).
+- An unresponsive peer is given up on after a disconnect timeout, checked
+  on its own timer rather than on the PTO. Contributed by jbevemyr (#224).
+- A peer address change is followed immediately and validated in the
+  background, so a NAT rebind does not stall the connection while
+  validation runs. Contributed by jbevemyr (#255).
 - The server sends a Retry when configured to, and its cipher preference
   order is configurable rather than fixed. Contributed by jbevemyr (#232).
 - The client offers the cipher suites it was configured with instead of
