@@ -167,6 +167,7 @@
     do_process_stream_data_buffered/5,
     do_process_stream_data_slow/5,
     test_recv_stream_state/4,
+    test_add_recv_stream/3,
     update_pn_space_recv/3,
     should_delay_ack/1,
     short_header_first_byte/3,
@@ -201,6 +202,8 @@
     test_state_closing/2,
     test_state_with_socket/2,
     test_state_in_recv_pass/1,
+    test_state_coalescing/2,
+    test_pending_delivery/1,
     test_finish_recv_pass/1,
     %% Regression helper for send_queue_bytes accounting during ACK coalesce
     test_coalesce_small_stream/1,
@@ -792,6 +795,19 @@
     %% packets. The max_ack_delay timer still bounds latency; the
     %% reordering immediate-ACK path bypasses this.
     recv_pass = false :: boolean(),
+    %% Opt-in (delivery_coalescing option): merge consecutive
+    %% same-stream stream_data deliveries of one receive pass into a
+    %% single owner message. QUIC gives no message-boundary guarantee,
+    %% but owners that decode each delivery as one complete
+    %% application message (rather than length-framing the byte
+    %% stream) break when deliveries merge, so the default keeps the
+    %% one-message-per-packet behaviour.
+    delivery_coalescing = false :: boolean(),
+    %% Pending run for the above: stream id, reversed chunk list, fin.
+    %% A delivery for a DIFFERENT stream flushes the pending one
+    %% first, so the owner observes stream_data messages in exact
+    %% arrival order; only adjacent chunks of one stream merge.
+    pend_deliver = none :: none | {non_neg_integer(), [binary()], boolean()},
     ack_elicited_count = 0 :: non_neg_integer(),
     %% How many ack-eliciting 1-RTT packets to accumulate before
     %% flushing an ACK. 2 is the RFC 9000 §13.2.1 recommendation;
@@ -1317,6 +1333,7 @@ init({server, Opts}) ->
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
         ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
         burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
+        delivery_coalescing = bool_opt(delivery_coalescing, Opts),
         % Server-initiated bidi: 1, 5, 9, ...
         next_stream_id_bidi = 1,
         % Server-initiated uni: 3, 7, 11, ...
@@ -1716,6 +1733,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
         ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
         burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
+        delivery_coalescing = bool_opt(delivery_coalescing, Opts),
         % Client-initiated bidi: 0, 4, 8, ...
         next_stream_id_bidi = 0,
         % Client-initiated uni: 2, 6, 10, ...
@@ -5426,8 +5444,11 @@ process_frame(
                 },
                 Streams
             ),
+            %% Data delivered earlier in this receive pass reaches the
+            %% owner before the reset notification.
+            StateFl = flush_pending_delivery(State),
             Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-            maybe_reclaim_stream(StreamId, State#state{streams = NewStreams});
+            maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams});
         error ->
             case is_reclaimed_frame(StreamId, State) of
                 true ->
@@ -5449,8 +5470,9 @@ process_frame(
                                 },
                                 Streams
                             ),
+                            StateFl = flush_pending_delivery(State),
                             Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                            State#state{streams = NewStreams}
+                            StateFl#state{streams = NewStreams}
                     end
             end
     end;
@@ -5507,8 +5529,9 @@ process_frame(
                         Streams
                     ),
                     %% Notify owner - same message as RESET_STREAM
+                    StateFl = flush_pending_delivery(State),
                     Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                    maybe_reclaim_stream(StreamId, State#state{streams = NewStreams});
+                    maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams});
                 error ->
                     case is_reclaimed_frame(StreamId, State) of
                         true ->
@@ -5535,9 +5558,10 @@ process_frame(
                                         },
                                         Streams
                                     ),
+                                    StateFl = flush_pending_delivery(State),
                                     Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
                                     maybe_reclaim_stream(
-                                        StreamId, State#state{streams = NewStreams}
+                                        StreamId, StateFl#state{streams = NewStreams}
                                     )
                             end
                     end
@@ -7092,14 +7116,15 @@ do_process_stream_data_buffered(StreamId, Offset, Data, false = Fin, State) ->
                     State#state.recv_buffer_bytes + DataSize =< ?MAX_RECV_BUFFER_BYTES
             of
                 true ->
-                    State#state.owner ! {quic, self(), {stream_data, StreamId, Data, false}},
+                    PendDeliver = deliver_stream_data(StreamId, Data, false, State),
                     State#state{
                         streams = maps:put(
                             StreamId,
                             Stream#stream_state{recv_offset = EndOffset},
                             State#state.streams
                         ),
-                        data_received = NewDataReceived
+                        data_received = NewDataReceived,
+                        pend_deliver = PendDeliver
                     };
                 false ->
                     do_process_stream_data_slow(StreamId, Offset, Data, Fin, State)
@@ -7278,16 +7303,14 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
 
                     %% Deliver contiguous data to owner
                     %% RFC 9000: Also deliver FIN-only notification when no data but FIN received
-                    case {DeliverData, DeliverFin, Fin} of
-                        {<<>>, false, _} ->
-                            %% No contiguous data to deliver yet
-                            ok;
-                        {<<>>, true, _} ->
-                            %% FIN-only delivery (all data already delivered)
-                            Owner ! {quic, self(), {stream_data, StreamId, <<>>, true}};
-                        {_, _, _} ->
-                            Owner ! {quic, self(), {stream_data, StreamId, DeliverData, DeliverFin}}
-                    end,
+                    PendDeliver1 =
+                        case {DeliverData, DeliverFin} of
+                            {<<>>, false} ->
+                                %% No contiguous data to deliver yet
+                                State#state.pend_deliver;
+                            _ ->
+                                deliver_stream_data(StreamId, DeliverData, DeliverFin, State)
+                        end,
 
                     NewStream = Stream#stream_state{
                         recv_offset = NewRecvOffset,
@@ -7323,7 +7346,8 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                     State1 = State#state{
                         streams = maps:put(StreamId, NewStream, Streams),
                         data_received = NewDataReceivedVal,
-                        recv_buffer_bytes = NewRecvBufferBytes
+                        recv_buffer_bytes = NewRecvBufferBytes,
+                        pend_deliver = PendDeliver1
                     },
                     %% The stream is reclaimed at the end of this clause (after the
                     %% MAX_STREAM_DATA / MAX_DATA updates, which re-put the stream),
@@ -7712,18 +7736,62 @@ maybe_decimate_app_ack(State) ->
             arm_ack_timer(State#state{ack_elicited_count = NewCount})
     end.
 
-%% End of a connected-state receive pass: emit the deferred ACK (one
-%% per train) if enough ack-eliciting packets accumulated, then clear
-%% the pass flag. Below-tolerance remainders keep their ack_timer.
-finish_recv_pass(
-    #state{ack_elicited_count = Count, ack_packet_tolerance = Tol, close_reason = undefined} =
-        State
-) when
-    Count >= Tol
-->
-    send_app_ack(State#state{recv_pass = false});
-finish_recv_pass(State) ->
-    State#state{recv_pass = false}.
+%% End of a connected-state receive pass: flush the accumulated stream
+%% delivery, emit the deferred ACK (one per train) if enough
+%% ack-eliciting packets accumulated, then clear the pass flag.
+%% Below-tolerance remainders keep their ack_timer. The delivery
+%% flushes even when the pass initiated a close: the data arrived
+%% before it.
+finish_recv_pass(State0) ->
+    State = flush_pending_delivery(State0),
+    case State of
+        #state{
+            ack_elicited_count = Count, ack_packet_tolerance = Tol, close_reason = undefined
+        } when
+            Count >= Tol
+        ->
+            send_app_ack(State#state{recv_pass = false});
+        _ ->
+            State#state{recv_pass = false}
+    end.
+
+%% A boolean option: true only when set to exactly `true'.
+bool_opt(Key, Opts) ->
+    case maps:get(Key, Opts, false) of
+        true -> true;
+        _ -> false
+    end.
+
+%% Hand stream data to the owner. With delivery coalescing on and a
+%% receive pass active, consecutive deliveries for the same stream
+%% merge into one pending message, flushed at the end of the pass or
+%% as soon as another stream delivers (exact arrival order is kept:
+%% only adjacent chunks of one stream merge). Otherwise one message
+%% per delivery, as before. Returns the new pend_deliver.
+deliver_stream_data(
+    StreamId, Data, Fin, #state{recv_pass = true, delivery_coalescing = true} = State
+) ->
+    case State#state.pend_deliver of
+        {StreamId, Acc, F} ->
+            {StreamId, [Data | Acc], F orelse Fin};
+        none ->
+            {StreamId, [Data], Fin};
+        {OtherId, Acc, F} ->
+            State#state.owner ! {quic, self(), {stream_data, OtherId, run_binary(Acc), F}},
+            {StreamId, [Data], Fin}
+    end;
+deliver_stream_data(StreamId, Data, Fin, State) ->
+    State#state.owner ! {quic, self(), {stream_data, StreamId, Data, Fin}},
+    State#state.pend_deliver.
+
+run_binary([Single]) -> Single;
+run_binary(RevChunks) -> iolist_to_binary(lists:reverse(RevChunks)).
+
+flush_pending_delivery(#state{pend_deliver = none} = State) ->
+    State;
+flush_pending_delivery(#state{pend_deliver = {StreamId, Acc, Fin}, owner = Owner} = State) ->
+    Owner ! {quic, self(), {stream_data, StreamId, run_binary(Acc), Fin}},
+    State#state{pend_deliver = none}.
 
 %% Arm the max_ack_delay timer if not already armed.
 arm_ack_timer(#state{ack_timer = Ref} = State) when Ref =/= undefined ->
@@ -12996,6 +13064,24 @@ test_recv_stream_state(StreamId, RecvOffset, StreamCredit, ConnCredit) ->
         recv_buffer_bytes = 0
     }.
 
+%% Add another peer-initiated stream at offset 0 to a test state.
+-spec test_add_recv_stream(#state{}, non_neg_integer(), non_neg_integer()) -> #state{}.
+test_add_recv_stream(#state{streams = Streams} = State, StreamId, StreamCredit) ->
+    Stream = #stream_state{
+        id = StreamId,
+        state = open,
+        send_offset = 0,
+        send_max_data = 0,
+        send_fin = false,
+        send_buffer = [],
+        recv_offset = 0,
+        recv_max_data = StreamCredit,
+        recv_fin = false,
+        recv_buffer = gb_trees:empty(),
+        final_size = undefined
+    },
+    State#state{streams = Streams#{StreamId => Stream}}.
+
 %% Minimal #state{} with a 1-RTT PN space, for the receive-bookkeeping
 %% tests that run record_app_recv/4 against its unfused parts.
 -spec test_app_recv_state(client | server, boolean()) -> #state{}.
@@ -13253,6 +13339,13 @@ test_decimate_step(State) ->
 -spec test_state_in_recv_pass(#state{}) -> #state{}.
 test_state_in_recv_pass(State) ->
     State#state{recv_pass = true}.
+
+-spec test_state_coalescing(#state{}, boolean()) -> #state{}.
+test_state_coalescing(State, On) ->
+    State#state{delivery_coalescing = On}.
+
+-spec test_pending_delivery(#state{}) -> none | {non_neg_integer(), [binary()], boolean()}.
+test_pending_delivery(#state{pend_deliver = P}) -> P.
 
 %% Run finish_recv_pass/1 and return the observable decimation fields.
 -spec test_finish_recv_pass(#state{}) ->

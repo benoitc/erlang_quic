@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `delivery_coalescing` (default `false`) merges consecutive
+  same-stream `stream_data` deliveries of one receive pass into a
+  single owner message, flushed at the end of the pass or as soon as
+  another stream delivers, so arrival order across streams is kept and
+  a `stream_reset` never overtakes data delivered before it. Owners
+  otherwise wake once per packet on bulk flows. QUIC gives no
+  message-boundary guarantee, but owners that decode each delivery as
+  one complete application message break when deliveries merge, so it
+  is opt-in.
+
 ### Changed
 - The interop runner declares the passive robustness cases (longrtt,
   blackhole, amplificationlimit, handshakeloss, transferloss,
