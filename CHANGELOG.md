@@ -45,6 +45,14 @@ All notable changes to this project will be documented in this file.
   bit, activity stamp) is one state update instead of three; the three
   separate helpers each rebuilt the full connection state and together
   cost about a tenth of receive CPU on bulk flows.
+- Receive-side fast paths for the dominant bulk shape: an in-order
+  stream frame on an existing stream with an empty reassembly buffer
+  and both flow-control windows comfortably open is one stream-record
+  update and one map put, falling back to the general path for every
+  other shape; a sequential packet number extends the head ACK range
+  without the range-cap scan; a packet led by a stream frame skips the
+  datagram-only delayed-ACK check. The per-frame `max_stream_data_check`
+  debug log is gone, it cost a logger allow-check per frame.
 
 ## [1.8.2] - 2026-09-05
 
