@@ -93,8 +93,10 @@
     owns_socket = true :: boolean(),
     %% GSO support detected and enabled
     gso_supported = false :: boolean(),
-    %% GSO segment size for batching
-    gso_size = ?DEFAULT_GSO_SEGMENT_SIZE :: non_neg_integer(),
+    %% Segment size of the most recent GSO flush, 0 before the first one.
+    %% Derived per run from the batch: packet sizes follow the current max
+    %% datagram size, so there is no fixed value to configure.
+    gso_size = 0 :: non_neg_integer(),
     %% GRO enabled for receive
     gro_enabled = false :: boolean(),
     %% Batching enabled
@@ -112,7 +114,9 @@
     %% the batching win. batch_flushes counts each flush that actually
     %% transmitted something.
     batch_flushes = 0 :: non_neg_integer(),
-    packets_coalesced = 0 :: non_neg_integer()
+    packets_coalesced = 0 :: non_neg_integer(),
+    %% Batches the kernel segmented, as opposed to sent packet by packet.
+    gso_flushes = 0 :: non_neg_integer()
 }).
 
 %% Packet can be:
@@ -155,7 +159,6 @@ open(Port, Opts) ->
     BatchOpts = maps:get(batching, Opts, #{}),
     BatchingEnabled = maps:get(enabled, BatchOpts, true),
     MaxBatch = maps:get(max_packets, BatchOpts, ?DEFAULT_MAX_BATCH_PACKETS),
-    GSOSize = maps:get(gso_size, BatchOpts, ?DEFAULT_GSO_SEGMENT_SIZE),
 
     case Backend of
         socket ->
@@ -163,14 +166,12 @@ open(Port, Opts) ->
                 gso_supported => GSOSupported,
                 gro_supported => GROSupported,
                 batching_enabled => BatchingEnabled,
-                max_batch => MaxBatch,
-                gso_size => GSOSize
+                max_batch => MaxBatch
             });
         gen_udp ->
             open_genudp_backend(Port, Opts, #{
                 batching_enabled => BatchingEnabled,
-                max_batch => MaxBatch,
-                gso_size => GSOSize
+                max_batch => MaxBatch
             })
     end.
 
@@ -197,21 +198,18 @@ open_for_send(RemoteIP, Opts) ->
     BatchOpts = maps:get(batching, Opts, #{}),
     BatchingEnabled = maps:get(enabled, BatchOpts, true),
     MaxBatch = maps:get(max_packets, BatchOpts, ?DEFAULT_MAX_BATCH_PACKETS),
-    GSOSize = maps:get(gso_size, BatchOpts, ?DEFAULT_GSO_SEGMENT_SIZE),
 
     case Backend of
         socket ->
             open_send_socket_backend(Family, Opts, #{
                 gso_supported => GSOSupported,
                 batching_enabled => BatchingEnabled,
-                max_batch => MaxBatch,
-                gso_size => GSOSize
+                max_batch => MaxBatch
             });
         gen_udp ->
             open_send_genudp_backend(Family, Opts, #{
                 batching_enabled => BatchingEnabled,
-                max_batch => MaxBatch,
-                gso_size => GSOSize
+                max_batch => MaxBatch
             })
     end.
 
@@ -229,13 +227,11 @@ open_server_send({LocalIP, LocalPort}, Opts) ->
     BatchOpts = maps:get(batching, Opts, #{}),
     BatchingEnabled = maps:get(enabled, BatchOpts, true),
     MaxBatch = maps:get(max_packets, BatchOpts, ?DEFAULT_MAX_BATCH_PACKETS),
-    GSOSize = maps:get(gso_size, BatchOpts, ?DEFAULT_GSO_SEGMENT_SIZE),
 
     BatchConfig = #{
         gso_supported => GSOSupported,
         batching_enabled => BatchingEnabled,
-        max_batch => MaxBatch,
-        gso_size => GSOSize
+        max_batch => MaxBatch
     },
 
     case Backend of
@@ -267,13 +263,12 @@ configure_server_send_socket(Socket, LocalIP, LocalPort, Family, Opts, BatchConf
     SockAddr = #{family => Family, addr => LocalIP, port => LocalPort},
     case socket:bind(Socket, SockAddr) of
         ok ->
-            GSOEnabled = maybe_enable_gso(Socket, BatchConfig),
+            GSOEnabled = maybe_enable_gso(BatchConfig),
             State = #socket_state{
                 socket = Socket,
                 backend = socket,
                 owns_socket = true,
                 gso_supported = GSOEnabled,
-                gso_size = maps:get(gso_size, BatchConfig),
                 gro_enabled = false,
                 batching_enabled = maps:get(batching_enabled, BatchConfig),
                 max_batch_packets = maps:get(max_batch, BatchConfig)
@@ -339,7 +334,8 @@ gso_supported(#socket_state{gso_supported = Supported}) ->
         batching_enabled := boolean(),
         max_batch_packets := pos_integer(),
         batch_flushes := non_neg_integer(),
-        packets_coalesced := non_neg_integer()
+        packets_coalesced := non_neg_integer(),
+        gso_flushes := non_neg_integer()
     }.
 info(#socket_state{
     backend = Backend,
@@ -349,7 +345,8 @@ info(#socket_state{
     batching_enabled = Batching,
     max_batch_packets = MaxBatch,
     batch_flushes = Flushes,
-    packets_coalesced = Coalesced
+    packets_coalesced = Coalesced,
+    gso_flushes = GSOFlushes
 }) ->
     #{
         backend => Backend,
@@ -359,7 +356,8 @@ info(#socket_state{
         batching_enabled => Batching,
         max_batch_packets => MaxBatch,
         batch_flushes => Flushes,
-        packets_coalesced => Coalesced
+        packets_coalesced => Coalesced,
+        gso_flushes => GSOFlushes
     }.
 
 %% @doc Build a socket_state backed by caller-supplied callbacks instead
@@ -412,14 +410,12 @@ wrap(Socket, Opts) ->
     BatchOpts = maps:get(batching, Opts, #{}),
     BatchingEnabled = maps:get(enabled, BatchOpts, true),
     MaxBatch = maps:get(max_packets, BatchOpts, ?DEFAULT_MAX_BATCH_PACKETS),
-    GSOSize = maps:get(gso_size, BatchOpts, ?DEFAULT_GSO_SEGMENT_SIZE),
 
     State = #socket_state{
         socket = Socket,
         backend = gen_udp,
         owns_socket = false,
         gso_supported = false,
-        gso_size = GSOSize,
         gro_enabled = false,
         batching_enabled = BatchingEnabled,
         max_batch_packets = MaxBatch
@@ -440,14 +436,12 @@ new_sender(Socket, Opts) ->
     BatchOpts = maps:get(batching, Opts, #{}),
     BatchingEnabled = maps:get(enabled, BatchOpts, true),
     MaxBatch = maps:get(max_packets, BatchOpts, ?DEFAULT_MAX_BATCH_PACKETS),
-    GSOSize = maps:get(gso_size, BatchOpts, ?DEFAULT_GSO_SEGMENT_SIZE),
 
     State = #socket_state{
         socket = Socket,
         backend = Backend,
         owns_socket = false,
         gso_supported = GSOSupported andalso (Backend =:= socket),
-        gso_size = GSOSize,
         gro_enabled = false,
         batching_enabled = BatchingEnabled,
         max_batch_packets = MaxBatch
@@ -533,31 +527,19 @@ flush(#socket_state{batch_count = Count, batch_addr = undefined} = State) ->
 flush(#socket_state{gso_supported = true, batch_count = 1} = State) ->
     %% Single-packet batch has no segmentation work; direct send.
     flush_individual(State);
-flush(#socket_state{gso_supported = true, batch_buffer = Buffer, gso_size = GSO} = State) ->
-    %% UDP_SEGMENT requires every segment except the last to be
-    %% exactly gso_size. Handshake flights coalesce Initial-padded-to-
-    %% 1200 with a ~400 byte Handshake packet; a naive GSO split
-    %% mis-aligns those boundaries and the client cannot decode. When
-    %% the batch is not uniform, split it into runs of equal-sized
-    %% packets and GSO each run: a single odd-sized packet (an ACK or a
-    %% flow-control update between data packets) otherwise degrades the
-    %% whole batch to one sendmsg per packet.
-    case gso_batch_uniform(Buffer, GSO) of
-        true -> flush_gso(State);
-        false -> flush_gso_runs(State)
-    end;
+flush(#socket_state{gso_supported = true} = State) ->
+    %% UDP_SEGMENT requires every segment except the last to be exactly
+    %% the segment size, so the batch goes out as runs of equal-sized
+    %% packets, one sendmsg each. The size comes from the run itself:
+    %% 1-RTT packets follow the current max datagram size, so comparing
+    %% against a configured constant never matched and the GSO path
+    %% never ran (issue #196). Handshake flights, which coalesce an
+    %% Initial padded to 1200 with a ~400 byte Handshake packet, split
+    %% into their own runs instead of being mis-segmented.
+    flush_gso_runs(State);
 flush(#socket_state{} = State) ->
     %% Fallback path - send packets individually
     flush_individual(State).
-
-%% Batch buffer is stored newest-first (head was last added). For GSO
-%% correctness we need all packets EXCEPT the last-transmitted one
-%% (which is the head of the buffer) to be exactly gso_size. The
-%% last-transmitted packet may be shorter.
-gso_batch_uniform([], _GSO) ->
-    true;
-gso_batch_uniform([_Last | Earlier], GSO) ->
-    lists:all(fun(P) -> iolist_size(P) =:= GSO end, Earlier).
 
 %% @doc Receive packets from the socket.
 %% On Linux with GRO, may return multiple coalesced packets.
@@ -786,7 +768,6 @@ build_socket_state(Socket, BatchConfig) ->
         socket = Socket,
         backend = socket,
         gso_supported = GSOEnabled,
-        gso_size = maps:get(gso_size, BatchConfig),
         gro_enabled = GROEnabled,
         batching_enabled = maps:get(batching_enabled, BatchConfig),
         max_batch_packets = maps:get(max_batch, BatchConfig)
@@ -796,12 +777,9 @@ build_socket_state(Socket, BatchConfig) ->
 %% Retained for open_server_send's separate-socket path, which still
 %% uses a dedicated socket where a socket-level UDP_SEGMENT is safe
 %% (it is a send-only socket, never used for short handshake packets).
-maybe_enable_gso(Socket, #{gso_supported := true, gso_size := Size}) ->
-    case socket:setopt_native(Socket, {udp, ?UDP_SEGMENT}, <<Size:32/native>>) of
-        ok -> true;
-        {error, _} -> false
-    end;
-maybe_enable_gso(_, _) ->
+maybe_enable_gso(#{gso_supported := true}) ->
+    true;
+maybe_enable_gso(_) ->
     false.
 
 maybe_enable_gro(Socket, #{gro_supported := true}) ->
@@ -842,7 +820,6 @@ configure_send_socket(Socket, Opts, BatchConfig) ->
         backend = socket,
         owns_socket = true,
         gso_supported = GSOEnabled,
-        gso_size = maps:get(gso_size, BatchConfig),
         gro_enabled = false,
         batching_enabled = maps:get(batching_enabled, BatchConfig),
         max_batch_packets = maps:get(max_batch, BatchConfig)
@@ -912,7 +889,6 @@ build_genudp_state(Socket, BatchConfig) ->
         socket = Socket,
         backend = gen_udp,
         gso_supported = false,
-        gso_size = maps:get(gso_size, BatchConfig),
         gro_enabled = false,
         batching_enabled = maps:get(batching_enabled, BatchConfig),
         max_batch_packets = maps:get(max_batch, BatchConfig)
@@ -940,51 +916,6 @@ add_to_batch(
             {ok, State1}
     end.
 
-flush_gso(
-    #socket_state{
-        socket = Socket,
-        batch_buffer = Buffer,
-        batch_addr = {IP, Port},
-        gso_size = SegmentSize
-    } = State
-) ->
-    %% Pass the batch as a multi-iov to socket:sendmsg/2. The kernel
-    %% treats concatenated iov buffers as a single logical payload and
-    %% segments at SegmentSize byte boundaries via the UDP_SEGMENT
-    %% cmsg, so the wire bytes are identical to the old flatten-first
-    %% shape. We save a full user-space copy per flush (up to ~76 KB
-    %% at a 64-packet batch of 1200-byte segments).
-    Packets = lists:reverse(Buffer),
-    PacketIov = [normalize_packet(P) || P <- Packets],
-    Msg = #{
-        addr => #{family => family(IP), addr => IP, port => Port},
-        iov => PacketIov,
-        ctrl => [#{level => udp, type => ?UDP_SEGMENT, data => <<SegmentSize:16/native>>}]
-    },
-
-    case socket:sendmsg(Socket, Msg) of
-        ok ->
-            {ok, record_flush(State)};
-        {ok, RestData} ->
-            flush_gso_partial(State, IP, Port, PacketIov, RestData);
-        {error, Reason} ->
-            ?LOG_WARNING(#{what => gso_send_error, reason => Reason}),
-            {error, Reason, clear_batch(State)}
-    end.
-
-%% Partial GSO send: log, disable GSO on this socket, and retry the
-%% remaining bytes segment-by-segment.
-flush_gso_partial(State, IP, Port, PacketIov, RestData) ->
-    TotalBytes = iolist_size(PacketIov),
-    Remaining = iolist_size(RestData),
-    ?LOG_WARNING(#{
-        what => gso_partial_send,
-        sent => TotalBytes - Remaining,
-        remaining => Remaining
-    }),
-    State1 = clear_batch(State#socket_state{gso_supported = false}),
-    send_remaining_individually(State1, IP, Port, RestData).
-
 flush_individual(#socket_state{backend = socket} = State) ->
     flush_individual_socket(State);
 flush_individual(#socket_state{backend = gen_udp} = State) ->
@@ -1003,9 +934,10 @@ flush_gso_runs(
 ) ->
     Packets = lists:reverse(Buffer),
     Dest = #{family => family(IP), addr => IP, port => Port},
-    case send_runs(Socket, Dest, split_uniform_runs(Packets)) of
+    Runs = split_uniform_runs(Packets),
+    case send_runs(Socket, Dest, Runs) of
         ok ->
-            {ok, record_flush(State)};
+            {ok, record_run_flush(State, Runs)};
         {error, Reason} ->
             ?LOG_WARNING(#{what => gso_run_send_error, reason => Reason}),
             {error, Reason, clear_batch(State)}
@@ -1022,7 +954,7 @@ split_uniform_runs([P | Rest]) ->
 split_uniform_runs([], _Size, [Single]) ->
     [{single, Single}];
 split_uniform_runs([], Size, RunAcc) ->
-    [{gso, Size, lists:reverse(RunAcc)}];
+    cap_run(Size, lists:reverse(RunAcc));
 split_uniform_runs([P | Rest], Size, RunAcc) ->
     case iolist_size(P) of
         Size ->
@@ -1030,15 +962,30 @@ split_uniform_runs([P | Rest], Size, RunAcc) ->
         PSize when PSize < Size ->
             %% Shorter packet closes this run as its final segment
             %% (the kernel permits a short last segment).
-            [{gso, Size, lists:reverse([P | RunAcc])} | split_uniform_runs(Rest)];
+            cap_run(Size, lists:reverse([P | RunAcc])) ++ split_uniform_runs(Rest);
         PSize ->
             Head =
                 case RunAcc of
-                    [Single] -> {single, Single};
-                    _ -> {gso, Size, lists:reverse(RunAcc)}
+                    [Single] -> [{single, Single}];
+                    _ -> cap_run(Size, lists:reverse(RunAcc))
                 end,
-            [Head | split_uniform_runs(Rest, PSize, [P])]
+            Head ++ split_uniform_runs(Rest, PSize, [P])
     end.
+
+%% One UDP_SEGMENT write carries at most UDP_MAX_SEGMENTS segments and a
+%% payload that still fits a 16-bit UDP length, so a long run is split
+%% across writes: 64 packets of 1398 bytes is 89 KB, well over the cap.
+%% Only the final packet of the batch may be short, and it stays in the
+%% final chunk, so every chunk remains a legal segmented write.
+cap_run(SegmentSize, Packets) ->
+    PerWrite = max(1, min(?MAX_GSO_SEGMENTS, ?MAX_GSO_PAYLOAD div SegmentSize)),
+    [{gso, SegmentSize, Chunk} || Chunk <- chunk_list(Packets, PerWrite)].
+
+chunk_list(Packets, Size) when length(Packets) =< Size ->
+    [Packets];
+chunk_list(Packets, Size) ->
+    {Head, Tail} = lists:split(Size, Packets),
+    [Head | chunk_list(Tail, Size)].
 
 send_runs(_Socket, _Dest, []) ->
     ok;
@@ -1142,16 +1089,6 @@ send_packets_genudp(Socket, IP, Port, [Packet | Rest], Sent) ->
             {error, Reason, Sent}
     end.
 
-%% Send remaining data after GSO partial write (RestData is iolist)
-%% Split into segment-sized packets to preserve QUIC datagram boundaries
-send_remaining_individually(
-    #socket_state{socket = Socket, gso_size = SegmentSize} = State, IP, Port, RestData
-) ->
-    Dest = #{family => family(IP), addr => IP, port => Port},
-    Data = iolist_to_binary(RestData),
-    Packets = split_into_segments(Data, SegmentSize),
-    send_segments(Socket, Dest, Packets, State).
-
 %% Split binary data into segment-sized chunks
 split_into_segments(Data, SegmentSize) ->
     split_into_segments(Data, SegmentSize, []).
@@ -1163,15 +1100,6 @@ split_into_segments(Data, SegmentSize, Acc) when byte_size(Data) =< SegmentSize 
 split_into_segments(Data, SegmentSize, Acc) ->
     <<Segment:SegmentSize/binary, Rest/binary>> = Data,
     split_into_segments(Rest, SegmentSize, [Segment | Acc]).
-
-%% Send each segment as a separate datagram
-send_segments(_Socket, _Dest, [], State) ->
-    {ok, State};
-send_segments(Socket, Dest, [Packet | Rest], State) ->
-    case socket:sendto(Socket, Packet, Dest) of
-        ok -> send_segments(Socket, Dest, Rest, State);
-        {error, Reason} -> {error, Reason, State}
-    end.
 
 do_send_immediate(
     #socket_state{backend = adapter, adapter_send_fun = Fun} = State, IP, Port, Packet
@@ -1272,6 +1200,23 @@ record_flush(
         batch_flushes = Flushes + 1,
         packets_coalesced = Coalesced + Count
     }.
+
+%% As record_flush/1, for a batch the kernel segmented. gso_flushes
+%% counts only those: batch_flushes and packets_coalesced advance on the
+%% individual path too, so a ratio over them proves batching, not
+%% offload, and stayed green while the GSO path was dead (issue #196).
+%% gso_size records the segment size that actually went on the wire.
+record_run_flush(State, Runs) ->
+    State1 = record_flush(State),
+    case [Size || {gso, Size, _} <- Runs] of
+        [] ->
+            State1;
+        [Size | _] = Sizes ->
+            State1#socket_state{
+                gso_flushes = State#socket_state.gso_flushes + length(Sizes),
+                gso_size = Size
+            }
+    end.
 
 %% Get address family
 family({_, _, _, _}) -> inet;

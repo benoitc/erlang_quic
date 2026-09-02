@@ -404,6 +404,11 @@
 -define(DEFAULT_MAX_BATCH_PACKETS, 64).
 %% Default GSO segment size (QUIC packet size for batching)
 -define(DEFAULT_GSO_SEGMENT_SIZE, 1200).
+%% Kernel limits on a single UDP_SEGMENT write: UDP_MAX_SEGMENTS segments,
+%% and a payload that still fits a 16-bit UDP length. A run larger than
+%% either is split across writes.
+-define(MAX_GSO_SEGMENTS, 64).
+-define(MAX_GSO_PAYLOAD, 65535).
 
 %%====================================================================
 %% Records
