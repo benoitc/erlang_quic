@@ -1687,7 +1687,13 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     ClientReceiver =
         case ClientSocketBackend of
             socket when SocketState =/= undefined ->
-                {ok, RPid} = quic_socket:start_client_receiver(SocketState, self()),
+                {ok, RPid} = quic_socket:start_client_receiver(
+                    SocketState,
+                    self(),
+                    quic_socket:recv_queue_max(
+                        maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA)
+                    )
+                ),
                 RPid;
             _ ->
                 undefined
@@ -11807,13 +11813,18 @@ rebind_client_socket_otp(
     #state{
         remote_addr = {RemoteIP, _},
         socket_state = OldSocketState,
-        client_receiver = OldReceiver
+        client_receiver = OldReceiver,
+        max_data_local = MaxData
     } = State
 ) ->
     OpenOpts = #{backend => socket},
     case quic_socket:open_for_send(RemoteIP, OpenOpts) of
         {ok, NewSocketState} ->
-            case quic_socket:start_client_receiver(NewSocketState, self()) of
+            case
+                quic_socket:start_client_receiver(
+                    NewSocketState, self(), quic_socket:recv_queue_max(MaxData)
+                )
+            of
                 {ok, NewReceiver} ->
                     ok = quic_socket:stop_client_receiver(OldReceiver),
                     close_socket_state_quietly(OldSocketState),

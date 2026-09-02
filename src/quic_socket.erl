@@ -57,7 +57,8 @@
     get_socket/1,
     gso_supported/1,
     info/1,
-    start_client_receiver/2,
+    recv_queue_max/1,
+    start_client_receiver/3,
     stop_client_receiver/1,
     set_socket/2,
     client_recv_drops/0
@@ -137,7 +138,7 @@
     extract_gro_segment_size/1,
     split_gro_packets/2,
     split_uniform_runs/1,
-    forward_to_owner/5
+    forward_to_owner/6
 ]).
 -endif.
 
@@ -651,18 +652,29 @@ get_fd(#socket_state{backend = adapter}) ->
 %%
 %% Returns the receiver pid, linked to the caller so it terminates
 %% when the connection process exits.
--spec start_client_receiver(socket_state(), pid()) -> {ok, pid()} | {error, term()}.
-start_client_receiver(#socket_state{backend = socket} = SocketState, Owner) when is_pid(Owner) ->
-    Pid = spawn_link(fun() -> client_recv_loop(SocketState, Owner) end),
+%% QueueMax is the owner's mailbox bound, see recv_queue_max/1.
+-spec start_client_receiver(socket_state(), pid(), pos_integer()) ->
+    {ok, pid()} | {error, term()}.
+start_client_receiver(#socket_state{backend = socket} = SocketState, Owner, QueueMax) when
+    is_pid(Owner)
+->
+    Pid = spawn_link(fun() -> client_recv_loop(SocketState, Owner, QueueMax) end),
     {ok, Pid};
-start_client_receiver(#socket_state{backend = gen_udp}, _Owner) ->
+start_client_receiver(#socket_state{backend = gen_udp}, _Owner, _QueueMax) ->
     {error, not_supported_on_gen_udp};
-start_client_receiver(#socket_state{backend = adapter}, _Owner) ->
+start_client_receiver(#socket_state{backend = adapter}, _Owner, _QueueMax) ->
     %% Adapter callers deliver `{udp, ...}' messages themselves.
     {error, not_supported_on_adapter}.
 
+%% Mailbox bound for a receiver that advertised MaxData bytes of
+%% connection flow-control window: the window in full-size packets,
+%% never below ?MAX_CONN_RECV_QUEUE_MSGS.
+-spec recv_queue_max(non_neg_integer()) -> pos_integer().
+recv_queue_max(MaxData) ->
+    max(?MAX_CONN_RECV_QUEUE_MSGS, MaxData div ?RECV_QUEUE_PACKET_BYTES).
+
 %% @doc Stop a client receiver process previously returned by
-%% `start_client_receiver/2'. Safe to call with `undefined'.
+%% `start_client_receiver/3'. Safe to call with `undefined'.
 -spec stop_client_receiver(pid() | undefined) -> ok.
 stop_client_receiver(undefined) ->
     ok;
@@ -682,7 +694,7 @@ stop_client_receiver(Pid) when is_pid(Pid) ->
 %% socket handle stored in `#state.socket'. Uses a 100ms timeout so
 %% exit signals from the linked owner are processed promptly rather
 %% than blocking forever in the NIF.
-client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
+client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner, QueueMax) ->
     %% recv_gro splits GRO-coalesced trains and sizes the read buffer
     %% for a maximal train; a plain recvfrom with the default 8 KiB
     %% buffer would silently truncate coalesced input. A multi-packet
@@ -691,10 +703,10 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
     %% receive pass.
     case recv_gro(Socket, 100) of
         {ok, {IP, Port}, Packets} ->
-            forward_to_owner(Owner, Socket, IP, Port, Packets),
-            client_recv_loop(SocketState, Owner);
+            forward_to_owner(Owner, Socket, IP, Port, Packets, QueueMax),
+            client_recv_loop(SocketState, Owner, QueueMax);
         {error, timeout} ->
-            client_recv_loop(SocketState, Owner);
+            client_recv_loop(SocketState, Owner, QueueMax);
         {error, closed} ->
             ok;
         {error, Reason} ->
@@ -703,11 +715,10 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
     end.
 
 %% Bench diagnostic: client-receiver tail-drop counter.
-%% Tail-drop over ?MAX_CONN_RECV_QUEUE_MSGS, emulating a bounded
-%% kernel rcvbuf (see the define for rationale).
-forward_to_owner(Owner, Socket, IP, Port, Packets) ->
+%% Tail-drop over QueueMax, see recv_queue_max/1.
+forward_to_owner(Owner, Socket, IP, Port, Packets, QueueMax) ->
     case erlang:process_info(Owner, message_queue_len) of
-        {message_queue_len, QLen} when QLen > ?MAX_CONN_RECV_QUEUE_MSGS ->
+        {message_queue_len, QLen} when QLen > QueueMax ->
             count_client_recv_drop(length(Packets));
         _ ->
             case Packets of

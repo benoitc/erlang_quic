@@ -410,14 +410,16 @@
 %% Default GSO segment size (QUIC packet size for batching)
 -define(DEFAULT_GSO_SEGMENT_SIZE, 1200).
 
-%% Max messages allowed in a connection process mailbox before the
-%% socket-backend receive path tail-drops incoming datagrams, emulating
-%% a bounded kernel receive buffer. Without a bound a fast sender turns
-%% receiver overload into unbounded queueing delay instead of loss;
-%% inflated RTT samples and spurious loss detection then destabilize
-%% the peer's congestion controller. Early tail drop gives it a clean
-%% loss signal at a bounded queue depth, like gen_udp + kernel rcvbuf.
--define(MAX_CONN_RECV_QUEUE_MSGS, 32).
+%% Floor on the messages a connection process mailbox may hold before
+%% the socket-backend receive path tail-drops incoming datagrams. The
+%% working bound is quic_socket:recv_queue_max/1: the connection's
+%% flow-control window in full-size packets, so a peer inside the
+%% window it was given is never dropped and the bound only catches one
+%% outside it. A bound below the window turned flow-control-permitted
+%% data into loss.
+-define(MAX_CONN_RECV_QUEUE_MSGS, 512).
+%% Nominal packet size used to turn a byte window into that bound.
+-define(RECV_QUEUE_PACKET_BYTES, 1200).
 
 %% Max packets per {quic_packets, ...} message forwarded to a
 %% connection. GRO can aggregate trains of ~44 packets; forwarded

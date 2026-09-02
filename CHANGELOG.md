@@ -19,9 +19,19 @@ All notable changes to this project will be documented in this file.
   the burst budget allow are approved up front (consuming pacing
   tokens exactly as one-at-a-time sends would), sealed and handed to
   the socket in one loop, and loss, congestion, packet-number and
-  counter bookkeeping is updated once for the run. The per-packet
-  connection-state rebuild was the largest own-time item on the
-  bulk-send profile; a 64-packet run replaces 64 copies with one.
+  counter bookkeeping is updated once for the run:
+  `quic_cc:send_check_run/4` approves the run against cwnd and pacing
+  in one step (never more permissive than the sequential checks),
+  `quic_cc:on_packets_sent/2` and `quic_loss:on_packets_sent_run/3`
+  fold it into one record update each (native for NewReno, a fold for
+  other algorithms). The per-packet connection-state rebuild was the
+  largest own-time item on the bulk-send profile; a 64-packet run
+  replaces 64 copies with one. The socket-backend receive queue bound
+  is the connection's flow-control window in full-size packets (never
+  below 512 messages): a run sender inside the window it was given is
+  never tail-dropped, and the bound only catches a peer outside it. A
+  fixed 512-message bound sat below a 16 MB window and turned
+  flow-control-permitted data into loss on loopback.
 
 ### Fixed
 - Pacing no longer freezes on sub-millisecond links. RTT samples are
@@ -46,17 +56,6 @@ All notable changes to this project will be documented in this file.
   endpoints so the blackhole case can outlast its outage, waits 60 s per
   download, and the server loads the full certificate chain from
   cert.pem.
-- The connected-state receive pass drains the datagram messages already
-  queued in the connection's mailbox (up to 64) before flushing ACKs,
-  socket batches and timers, so those flushes amortize over a train
-  instead of running once per datagram. On the socket backend the
-  listener and the client receiver now emulate a bounded kernel receive
-  buffer: trains are forwarded in chunks of at most 8 packets and
-  tail-dropped once the connection's mailbox holds more than 32
-  messages, keeping the head packet so the peer still gets a timely
-  ACK. An unbounded mailbox turned receiver overload into queueing
-  delay instead of loss, which inflated the peer's RTT samples and
-  destabilized its loss detector.
 - Count-based ACK decimation defers its flush while a receive pass is
   active, so one ACK covers the whole drained train instead of one per
   `ack_packet_tolerance` packets. A 64-packet pass previously emitted
@@ -86,6 +85,17 @@ All notable changes to this project will be documented in this file.
   without the range-cap scan; a packet led by a stream frame skips the
   datagram-only delayed-ACK check. The per-frame `max_stream_data_check`
   debug log is gone, it cost a logger allow-check per frame.
+- The connected-state receive pass drains the datagram messages already
+  queued in the connection's mailbox (up to 64) before flushing ACKs,
+  socket batches and timers, so those flushes amortize over a train
+  instead of running once per datagram. On the socket backend the
+  listener and the client receiver now emulate a bounded kernel receive
+  buffer: trains are forwarded in chunks of at most 8 packets and
+  tail-dropped once the connection's mailbox exceeds its bound (see
+  the send-side entry), keeping the head packet so the peer still
+  gets a timely ACK. An unbounded mailbox turned receiver overload into queueing
+  delay instead of loss, which inflated the peer's RTT samples and
+  destabilized its loss detector.
 
 ## [1.8.2] - 2026-09-05
 

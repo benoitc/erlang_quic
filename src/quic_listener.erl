@@ -115,7 +115,7 @@
     send_packet/6,
     compute_stateless_reset_token/2,
     build_stateless_reset/2,
-    send_packets_to_connection/3
+    send_packets_to_connection/4
 ]).
 -endif.
 
@@ -128,6 +128,7 @@
 }).
 
 -record(listener_state, {
+    recv_queue_max = ?MAX_CONN_RECV_QUEUE_MSGS :: pos_integer(),
     socket :: gen_udp:socket() | socket:socket(),
     %% Socket state for quic_socket abstraction (for GRO support on Linux)
     socket_state :: quic_socket:socket_state() | undefined,
@@ -370,6 +371,9 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
         connection_handler = ConnHandler,
         cid_config = CIDConfig,
         dcid_len = DCIDLen,
+        recv_queue_max = quic_socket:recv_queue_max(
+            maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA)
+        ),
         opts = Opts
     },
     {noreply, State}.
@@ -546,7 +550,9 @@ handle_gro_packets(Packets, RemoteAddr, State) ->
 
 %% Group packets by connection ID and dispatch in batches
 dispatch_batched_packets(
-    Packets, RemoteAddr, #listener_state{dcid_len = DCIDLen, connections = Conns} = State
+    Packets,
+    RemoteAddr,
+    #listener_state{dcid_len = DCIDLen, connections = Conns, recv_queue_max = QueueMax} = State
 ) ->
     %% Build map of ConnPid -> [Packets] (preserving order)
     Groups = group_packets_by_conn(Packets, DCIDLen, Conns, #{}),
@@ -555,7 +561,9 @@ dispatch_batched_packets(
         fun
             ({conn, ConnPid}, PacketList) ->
                 %% Reverse to restore original order (we prepended)
-                send_packets_to_connection(ConnPid, lists:reverse(PacketList), RemoteAddr);
+                send_packets_to_connection(
+                    ConnPid, lists:reverse(PacketList), RemoteAddr, QueueMax
+                );
             ({new, DCID, Version}, PacketList) ->
                 %% Initial packets that need new connections
                 [FirstPacket | _] = lists:reverse(PacketList),
@@ -608,11 +616,11 @@ group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
     end.
 
 %% Send batched packets to a connection. Tail-drops when the
-%% connection's mailbox is over ?MAX_CONN_RECV_QUEUE_MSGS - see the
-%% define for rationale.
-send_packets_to_connection(ConnPid, Packets, RemoteAddr) ->
+%% connection's mailbox is over QueueMax, see
+%% quic_socket:recv_queue_max/1.
+send_packets_to_connection(ConnPid, Packets, RemoteAddr, QueueMax) ->
     case erlang:process_info(ConnPid, message_queue_len) of
-        {message_queue_len, QLen} when QLen > ?MAX_CONN_RECV_QUEUE_MSGS ->
+        {message_queue_len, QLen} when QLen > QueueMax ->
             %% Over the bound: keep one packet of the train so the peer
             %% still gets a timely (dup-)ACK carrying the loss signal,
             %% drop the rest - per-packet-ish drops beat losing whole
