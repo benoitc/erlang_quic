@@ -157,6 +157,50 @@ jobs:
           QUIC_ENABLE_GSO_TEST: "1"
         run: rebar3 ct --suite=quic_server_batching_SUITE
 
+  dist:
+    name: Distribution Tests
+    needs: unit-tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24.0'
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: ${{ runner.os }}-dist-otp28-${{ hashFiles('rebar.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-dist-otp28-
+
+      - name: Generate certificates
+        run: |
+          chmod +x ./certs/generate_certs.sh
+          ./certs/generate_certs.sh
+
+      - name: Compile
+        run: rebar3 compile
+
+      # These boot real VMs and speak dist over QUIC, which nothing else
+      # covers: the simultaneous-connect deadlock lived here undetected.
+      #
+      # Two dist suites are deliberately absent. quic_dist_auth_SUITE's
+      # auth_ok_both_sides fails about a fifth of runs for reasons not yet
+      # understood, and a job that is red at random teaches people to
+      # ignore it. quic_dist_basic_SUITE could not be verified here: its
+      # peers fail to boot on macOS, so add it once someone confirms it
+      # runs on Linux.
+      - name: Run distribution tests
+        run: rebar3 ct --suite=quic_dist_psk_SUITE,quic_dist_simultaneous_connect_SUITE
+
   h3-e2e:
     name: HTTP/3 E2E Tests
     needs: unit-tests
