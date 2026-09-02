@@ -33,6 +33,14 @@ All notable changes to this project will be documented in this file.
   GSO batches near size 1. The max_ack_delay timer still bounds ACK
   latency for below-tolerance remainders and the reordering
   immediate-ACK path is unchanged.
+- The out-of-order reassembly buffers (stream data and CRYPTO) are
+  ordered trees instead of maps. A miss at the delivery point, which
+  happens once per received packet while a hole is outstanding, is now
+  answered with one smallest-key lookup, and the trim walk for
+  repacketized overlaps visits only chunks below the delivery point.
+  The map version rebuilt the whole buffer on every miss; with a
+  multi-megabyte hole under loss recovery that walk dominated receiver
+  CPU.
 
 ## [1.8.2] - 2026-09-05
 

@@ -14,11 +14,17 @@
 chunk(Start, Len) ->
     <<<<(B rem 256)>> || B <- lists:seq(Start, Start + Len - 1)>>.
 
+%% The buffer is an ordered tree; tests build and compare it as a map
+%% so the fixtures stay readable.
+tree(Map) ->
+    gb_trees:from_orddict(lists:sort(maps:to_list(Map))).
+
 extract(Buffer, Offset) ->
-    quic_connection:extract_contiguous_data(Buffer, Offset).
+    {Data, Off, Rest} = quic_connection:extract_contiguous_data(tree(Buffer), Offset),
+    {Data, Off, maps:from_list(gb_trees:to_list(Rest))}.
 
 trim(Buffer, Offset) ->
-    quic_connection:trim_reassembly_buffer(Buffer, Offset).
+    maps:from_list(gb_trees:to_list(quic_connection:trim_reassembly_buffer(tree(Buffer), Offset))).
 
 %%====================================================================
 %% Extraction
@@ -91,6 +97,21 @@ trim_is_idempotent_test() ->
 trim_leaves_future_chunks_untouched_test() ->
     Buffer = #{800 => chunk(800, 100), 900 => chunk(900, 100)},
     ?assertEqual(Buffer, trim(Buffer, 800)).
+
+%% The walk stops at the delivery point: with a large hole and many
+%% chunks buffered above it, a miss at the hole is answered without
+%% rebuilding the buffer (the returned tree is the input, unchanged).
+gap_below_a_large_buffer_is_answered_without_a_walk_test() ->
+    Above = tree(maps:from_list([{Off, chunk(Off, 100)} || Off <- lists:seq(1000, 100000, 100)])),
+    ?assertMatch({<<>>, 500, Above}, quic_connection:extract_contiguous_data(Above, 500)).
+
+%% With one straddling chunk below the point, only that chunk is
+%% touched; the chunks above come back as they were.
+trim_touches_only_chunks_below_the_point_test() ->
+    Above = [{Off, chunk(Off, 100)} || Off <- lists:seq(1000, 5000, 100)],
+    Buffer = maps:from_list([{300, chunk(300, 400)} | Above]),
+    Expected = maps:from_list([{500, chunk(500, 200)} | Above]),
+    ?assertEqual(Expected, trim(Buffer, 500)).
 
 %%====================================================================
 %% Randomised: any fragmentation of a known stream reassembles to it

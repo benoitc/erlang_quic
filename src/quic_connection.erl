@@ -442,7 +442,9 @@
     negotiated_scheme :: atom() | undefined,
 
     %% CRYPTO frame buffer (per level: initial, handshake, app)
-    crypto_buffer = #{initial => #{}, handshake => #{}, app => #{}} :: map(),
+    crypto_buffer = #{
+        initial => gb_trees:empty(), handshake => gb_trees:empty(), app => gb_trees:empty()
+    } :: map(),
     crypto_offset = #{initial => 0, handshake => 0, app => 0} :: map(),
     %% Incomplete TLS message buffer (data that couldn't be parsed yet)
     tls_buffer = #{initial => <<>>, handshake => <<>>, app => <<>>} :: map(),
@@ -5739,16 +5741,16 @@ buffer_crypto_data(Level, Offset, Data, State) ->
         end,
 
     %% Get current buffer
-    Buffer = maps:get(LevelAtom, State#state.crypto_buffer, #{}),
+    Buffer = maps:get(LevelAtom, State#state.crypto_buffer, gb_trees:empty()),
 
     %% Bound out-of-order CRYPTO reassembly so a peer cannot grow memory
     %% before the handshake completes (RFC 9000 §7.5). Offsets beyond the
     %% cap can never become contiguous, so reject them too.
-    BufferedBytes = maps:fold(fun(_, V, Acc) -> Acc + byte_size(V) end, 0, Buffer),
+    BufferedBytes = reassembly_buffer_bytes(Buffer),
     Overflow =
         (Offset > ?MAX_CRYPTO_BUFFER_BYTES) orelse
             ((BufferedBytes + byte_size(Data)) > ?MAX_CRYPTO_BUFFER_BYTES) orelse
-            (maps:size(Buffer) >= ?MAX_CRYPTO_BUFFER_ENTRIES),
+            (gb_trees:size(Buffer) >= ?MAX_CRYPTO_BUFFER_ENTRIES),
     case Overflow of
         true ->
             ?LOG_WARNING(
@@ -5756,7 +5758,7 @@ buffer_crypto_data(Level, Offset, Data, State) ->
                     what => crypto_buffer_exceeded,
                     level => LevelAtom,
                     buffered_bytes => BufferedBytes,
-                    entries => maps:size(Buffer)
+                    entries => gb_trees:size(Buffer)
                 },
                 ?QUIC_LOG_META
             ),
@@ -5795,17 +5797,17 @@ buffer_crypto_data(Level, Offset, Data, State) ->
 
 %% Process contiguous CRYPTO data
 process_crypto_buffer(Level, State) ->
-    Buffer = maps:get(Level, State#state.crypto_buffer, #{}),
+    Buffer = maps:get(Level, State#state.crypto_buffer, gb_trees:empty()),
     ExpectedOffset = maps:get(Level, State#state.crypto_offset, 0),
 
-    case maps:find(ExpectedOffset, Buffer) of
-        {ok, Data} ->
+    case gb_trees:lookup(ExpectedOffset, Buffer) of
+        {value, Data} ->
             %% Process this data
             State1 = process_tls_data(Level, Data, State),
 
             %% Update offset and remove from buffer
             NewOffset = ExpectedOffset + byte_size(Data),
-            NewBuffer = maps:remove(ExpectedOffset, Buffer),
+            NewBuffer = gb_trees:delete(ExpectedOffset, Buffer),
             NewCryptoBuffer = maps:put(Level, NewBuffer, State1#state.crypto_buffer),
             NewCryptoOffset = maps:put(Level, NewOffset, State1#state.crypto_offset),
 
@@ -5816,7 +5818,7 @@ process_crypto_buffer(Level, State) ->
 
             %% Try to process more
             process_crypto_buffer(Level, State2);
-        error ->
+        none ->
             %% Nothing keyed exactly at ExpectedOffset, which does not mean a
             %% gap: a peer may re-frame CRYPTO data it retransmits (RFC 9000
             %% §13.3), so the bytes we need can sit inside a chunk that starts
@@ -5828,7 +5830,7 @@ process_crypto_buffer(Level, State) ->
             State1 = State#state{
                 crypto_buffer = maps:put(Level, Trimmed, State#state.crypto_buffer)
             },
-            case maps:is_key(ExpectedOffset, Trimmed) of
+            case gb_trees:is_defined(ExpectedOffset, Trimmed) of
                 true -> process_crypto_buffer(Level, State1);
                 false -> State1
             end
@@ -7097,7 +7099,7 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                     recv_offset = 0,
                     recv_max_data = InitRecvMaxData,
                     recv_fin = false,
-                    recv_buffer = #{},
+                    recv_buffer = gb_trees:empty(),
                     final_size = undefined
                 }
         end,
@@ -7109,11 +7111,11 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
     %% Check if this would exceed our receive buffer limit (malicious peer protection)
     RecvBuffer =
         case Stream#stream_state.recv_buffer of
-            B when is_map(B) -> B;
-            _ -> #{}
+            undefined -> gb_trees:empty();
+            B -> B
         end,
     CurrentOffset = Stream#stream_state.recv_offset,
-    IsDuplicate = Offset < CurrentOffset orelse maps:is_key(Offset, RecvBuffer),
+    IsDuplicate = Offset < CurrentOffset orelse gb_trees:is_defined(Offset, RecvBuffer),
 
     %% Only check buffer limit for new (non-duplicate) data
     BufferOverflow =
@@ -7206,9 +7208,9 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                         end,
 
                     %% Fast path: in-order delivery with empty buffer
-                    %% Avoids maps:put and extract_contiguous_data for common case
+                    %% Avoids the buffer insert and extract_contiguous_data for common case
                     {DeliverData, NewRecvOffset, NewBuffer, DeliverFin} =
-                        case Offset =:= CurrentOffset andalso map_size(RecvBuffer) =:= 0 of
+                        case Offset =:= CurrentOffset andalso gb_trees:is_empty(RecvBuffer) of
                             true ->
                                 %% In-order with empty buffer: deliver directly
                                 {Data, EndOffset, RecvBuffer, Fin};
@@ -7241,7 +7243,7 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                         recv_buffer = NewBuffer,
                         final_size = FinalSize,
                         recv_done =
-                            (DeliverFin andalso map_size(NewBuffer) =:= 0) orelse
+                            (DeliverFin andalso gb_trees:is_empty(NewBuffer)) orelse
                                 recv_reset_at_met(Stream, NewRecvOffset) orelse
                                 Stream#stream_state.recv_done
                     },
@@ -7424,7 +7426,7 @@ extract_contiguous_data(Buffer, Offset) ->
     extract_contiguous_data(Buffer, Offset, <<>>).
 
 extract_contiguous_data(Buffer, Offset, Acc) ->
-    case maps:take(Offset, Buffer) of
+    case gb_trees:take_any(Offset, Buffer) of
         {Data, NewBuffer} ->
             %% Found data at this offset, continue looking for next chunk
             %% Binary append is O(1) amortized due to Erlang's pre-allocation
@@ -7435,44 +7437,58 @@ extract_contiguous_data(Buffer, Offset, Acc) ->
             %% a peer may split or coalesce retransmitted data differently
             %% (RFC 9000 §2.2, §13.3), so the bytes we want can sit inside
             %% a chunk that starts earlier. Drop what is already delivered,
-            %% re-key what straddles Offset, then retry once.
-            Trimmed = trim_reassembly_buffer(Buffer, Offset),
-            case maps:is_key(Offset, Trimmed) of
-                true -> extract_contiguous_data(Trimmed, Offset, Acc);
-                false -> {Acc, Offset, Trimmed}
+            %% re-key what straddles Offset, then retry once. When every
+            %% buffered chunk starts above Offset (the normal shape while
+            %% waiting on a hole, and this runs once per received packet
+            %% until the hole fills) the ordered tree answers that with one
+            %% smallest-key lookup and no walk.
+            case gb_trees:is_empty(Buffer) orelse element(1, gb_trees:smallest(Buffer)) > Offset of
+                true ->
+                    {Acc, Offset, Buffer};
+                false ->
+                    Trimmed = trim_reassembly_buffer(Buffer, Offset),
+                    case gb_trees:is_defined(Offset, Trimmed) of
+                        true -> extract_contiguous_data(Trimmed, Offset, Acc);
+                        false -> {Acc, Offset, Trimmed}
+                    end
             end
     end.
 
 %% Drop buffered chunks that end at or before Offset and trim those that
 %% straddle it, re-keying them to Offset. Keeps the longest chunk at each
 %% offset, so overlapping retransmissions collapse instead of accumulating.
+%% Only chunks keyed below Offset can qualify, so the ordered walk stops
+%% there; everything above is left untouched.
 trim_reassembly_buffer(Buffer, Offset) ->
-    maps:fold(
-        fun(Off, Data, Acc) ->
-            End = Off + byte_size(Data),
-            if
-                End =< Offset ->
-                    Acc;
-                Off >= Offset ->
-                    keep_longest_chunk(Off, Data, Acc);
-                true ->
-                    Kept = binary:part(Data, Offset - Off, End - Offset),
-                    keep_longest_chunk(Offset, Kept, Acc)
-            end
-        end,
-        #{},
-        Buffer
-    ).
+    trim_reassembly_buffer(gb_trees:iterator(Buffer), Buffer, Offset).
 
-keep_longest_chunk(Off, Data, Acc) ->
-    case Acc of
-        #{Off := Existing} when byte_size(Existing) >= byte_size(Data) -> Acc;
-        _ -> Acc#{Off => Data}
+trim_reassembly_buffer(Iter0, Buffer, Offset) ->
+    case gb_trees:next(Iter0) of
+        {Off, Data, Iter} when Off < Offset ->
+            End = Off + byte_size(Data),
+            Buffer1 = gb_trees:delete(Off, Buffer),
+            Buffer2 =
+                case End > Offset of
+                    true ->
+                        Kept = binary:part(Data, Offset - Off, End - Offset),
+                        keep_longest_chunk(Offset, Kept, Buffer1);
+                    false ->
+                        Buffer1
+                end,
+            trim_reassembly_buffer(Iter, Buffer2, Offset);
+        _ ->
+            Buffer
+    end.
+
+keep_longest_chunk(Off, Data, Buffer) ->
+    case gb_trees:lookup(Off, Buffer) of
+        {value, Existing} when byte_size(Existing) >= byte_size(Data) -> Buffer;
+        _ -> gb_trees:enter(Off, Data, Buffer)
     end.
 
 %% Total bytes held in a reassembly buffer.
 reassembly_buffer_bytes(Buffer) ->
-    maps:fold(fun(_, Data, Acc) -> Acc + byte_size(Data) end, 0, Buffer).
+    lists:foldl(fun(Data, Acc) -> Acc + byte_size(Data) end, 0, gb_trees:values(Buffer)).
 
 %% Get the maximum stream receive window across all streams.
 %% Used to ensure connection window >= 1.5x largest stream window.
@@ -8353,7 +8369,7 @@ do_open_stream(
                 recv_offset = 0,
                 recv_max_data = RecvMaxData,
                 recv_fin = false,
-                recv_buffer = #{},
+                recv_buffer = gb_trees:empty(),
                 final_size = undefined
             },
             NewState = State#state{
@@ -8404,7 +8420,7 @@ do_open_unidirectional_stream(
                 recv_max_data = 0,
                 % No incoming data expected
                 recv_fin = true,
-                recv_buffer = #{},
+                recv_buffer = gb_trees:empty(),
                 final_size = undefined
             },
             NewState = State#state{
