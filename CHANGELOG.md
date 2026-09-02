@@ -63,6 +63,14 @@ All notable changes to this project will be documented in this file.
   transfer in 16 writes, against 0 once ordered). Throughput on loopback
   is unchanged; the cost is the reassembly buffer, and any real path where
   reordering matters.
+- The frames a connection sends on entering `connected` (data queued
+  before the handshake finished, the server's NEW_TOKEN, the first PMTU
+  probe) leave with that transition. They went through the send batch
+  and the state-enter handler returned without flushing it, so they
+  waited for the next event on the connection: on a quiet connection the
+  peer's delayed ACK or a PTO. `get_stats` now reports
+  `send_batch_pending`, the packets built but not yet handed to the
+  socket, which is what caught this.
 - Pacing no longer freezes on sub-millisecond links. RTT samples are
   whole milliseconds, so such a link reports a smoothed RTT of 0 and
   `update_pacing_rate` treated that as "no RTT yet" and skipped the
