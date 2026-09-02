@@ -13,6 +13,26 @@ All notable changes to this project will be documented in this file.
   Contributed by jbevemyr (#213).
 
 ### Fixed
+- The connection-level MAX_DATA update triggers on remaining headroom
+  rather than cumulative bytes received. The old comparison became
+  permanently true once total received passed one window, putting an
+  ack-eliciting MAX_DATA on every packet. Contributed by jbevemyr (#209).
+- Retained ACK ranges are capped at 64 per packet-number space
+  (RFC 9000 section 13.2.4). Under burst loss the list fragmented into
+  hundreds of ranges, and every outgoing ACK encoded all of them.
+  Contributed by jbevemyr (#211).
+- Overlapping and duplicate chunks are handled when reassembling stream
+  and CRYPTO data, keeping the longer chunk at a given offset instead of
+  trusting whichever arrived first. Contributed by jbevemyr (#223).
+- A flow-control-blocked write no longer strands data behind a blocked
+  queue head: the sendable prefix goes out, the remainder requeues in
+  order, and queued data is normalised to a binary. Contributed by
+  jbevemyr (#233).
+- Streams are reclaimed when their FIN is acknowledged rather than when
+  it is sent, so a lost FIN cannot retire the stream early. Contributed
+  by jbevemyr (#236).
+- MAX_STREAM_DATA is no longer sent for a stream whose final size the
+  peer has already declared. Contributed by jbevemyr (#241).
 - The client's retained Finished flight carries its own retransmission
   timer. Once the state machine leaves the handshake nothing is
   guaranteed to be in flight to arm a PTO, so a Finished lost more than

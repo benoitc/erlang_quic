@@ -141,6 +141,7 @@
 -export([
     chunk_crypto/3,
     add_to_ack_ranges/2,
+    cap_ack_ranges/1,
     merge_ack_ranges/1,
     convert_ack_ranges_for_encode/1,
     convert_rest_ranges/2,
@@ -148,6 +149,9 @@
     test_check_flow_control/6,
     test_queue_blocked_send/5,
     close_reason_to_code/1,
+    %% Out-of-order reassembly (RFC 9000 §2.2, §13.3)
+    extract_contiguous_data/2,
+    trim_reassembly_buffer/2,
     %% Migration frame classification (RFC 9000 Section 9.1)
     is_probing_frame/1,
     contains_non_probing_frame/1,
@@ -256,6 +260,15 @@
 %% from parking the flight past the idle timeout.
 -define(HS_FLIGHT_MIN_INTERVAL, 100).
 -define(HS_FLIGHT_MAX_INTERVAL, 3000).
+
+%% Max ACK ranges retained per PN space (RFC 9000 §13.2.4 allows the
+%% receiver to limit these). Under burst loss an unbounded list
+%% fragments into hundreds of ranges, and since every outgoing ACK
+%% encodes the full list (and the peer decodes it), ACK processing
+%% cost grows O(ranges) per packet on both ends. Packets below the
+%% lowest retained range are retransmitted by the peer and dropped
+%% here as duplicates.
+-define(MAX_ACK_RANGES, 64).
 
 %% Max receive buffer size in bytes (32 MB total across all streams) - protects against malicious peers
 -define(MAX_RECV_BUFFER_BYTES, 33554432).
@@ -461,6 +474,8 @@
     %% StreamId => send reliable size, for local RESET_STREAM_AT streams whose
     %% data below the reliable size is not yet fully acked. Drained as acks arrive.
     pending_send_reset_at = #{} :: #{non_neg_integer() => non_neg_integer()},
+    %% FIN acked but earlier bytes still queued or in flight
+    pending_fin_reclaim = #{} :: #{non_neg_integer() => non_neg_integer()},
     %% Lost control-frame retransmissions deferred by congestion control, replayed
     %% through the CC-checked retransmit path when cwnd reopens.
     deferred_ctrl_retransmits = [] :: [term()],
@@ -4952,8 +4967,25 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% Retransmit lost packets
                     State4 = retransmit_lost_packets(LostPackets, State3),
 
+                    %% Close the send side of streams whose FIN the peer just
+                    %% acked (RFC 9000 §3.1 "Data Recvd"). Reclaiming here, and
+                    %% not at send time, paces MAX_STREAMS credit to what the
+                    %% peer has actually consumed; granting at send time let a
+                    %% peer run far ahead of its own completions.
+                    State4a =
+                        case
+                            lists:usort([
+                                Sid
+                             || #sent_packet{frames = Fs} <- AckedPackets,
+                                {stream, Sid, _O, _D, true} <- Fs
+                            ])
+                        of
+                            [] -> State4;
+                            FinSids -> lists:foldl(fun settle_fin_ack/2, State4, FinSids)
+                        end,
+
                     %% Reset PTO timer after ACK processing
-                    State5 = set_pto_timer(State4),
+                    State5 = set_pto_timer(State4a),
 
                     %% Try to send queued data now that cwnd may have freed up.
                     %% This also drains retransmit_stream entries deferred by CC.
@@ -4962,7 +4994,7 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% complete any local reset-at reclaim whose reliable bytes are
                     %% now acked.
                     State7 = flush_deferred_retransmits(State6),
-                    State8 = complete_send_reset_at(State7),
+                    State8 = complete_fin_reclaims(complete_send_reset_at(State7)),
                     %% Event-driven flush: flush batch and timers after ACK processing
                     flush_dirty_timers(flush_socket_batch(State8))
                 %% close inner case (on_ack_received)
@@ -5517,8 +5549,9 @@ buffer_crypto_data(Level, Offset, Data, State) ->
                     false ->
                         State
                 end,
-            %% Add data to buffer
-            NewBuffer = maps:put(Offset, Data, Buffer),
+            %% Add data to buffer, keeping the longer chunk if the peer
+            %% already sent one at this offset.
+            NewBuffer = keep_longest_chunk(Offset, Data, Buffer),
             NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State0#state.crypto_buffer),
 
             State1 = State0#state{crypto_buffer = NewCryptoBuffer},
@@ -5551,7 +5584,21 @@ process_crypto_buffer(Level, State) ->
             %% Try to process more
             process_crypto_buffer(Level, State2);
         error ->
-            State
+            %% Nothing keyed exactly at ExpectedOffset, which does not mean a
+            %% gap: a peer may re-frame CRYPTO data it retransmits (RFC 9000
+            %% §13.3), so the bytes we need can sit inside a chunk that starts
+            %% earlier. Drop what is already consumed, re-key what straddles
+            %% the offset, then retry once. Storing the trimmed buffer also
+            %% stops duplicate retransmissions from accumulating against
+            %% ?MAX_CRYPTO_BUFFER_BYTES and closing a healthy connection.
+            Trimmed = trim_reassembly_buffer(Buffer, ExpectedOffset),
+            State1 = State#state{
+                crypto_buffer = maps:put(Level, Trimmed, State#state.crypto_buffer)
+            },
+            case maps:is_key(ExpectedOffset, Trimmed) of
+                true -> process_crypto_buffer(Level, State1);
+                false -> State1
+            end
     end.
 
 %% Process TLS handshake data from CRYPTO frames
@@ -6877,7 +6924,7 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                 {Data, EndOffset, RecvBuffer, Fin};
                             false ->
                                 %% Out-of-order or buffer has data: use buffer path
-                                UpdatedBuffer = maps:put(Offset, Data, RecvBuffer),
+                                UpdatedBuffer = keep_longest_chunk(Offset, Data, RecvBuffer),
                                 {ExtractedData, ExtractedOffset, ExtractedBuffer} =
                                     extract_contiguous_data(UpdatedBuffer, CurrentOffset),
                                 ExtractedFin =
@@ -6917,11 +6964,16 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                         end,
                     NewDataReceivedVal = DataReceived + NewBytesReceived,
 
-                    %% Update receive buffer bytes tracking
-                    %% Net change: add new bytes, subtract delivered bytes
-                    DeliveredBytes = byte_size(DeliverData),
+                    %% Update receive buffer bytes tracking from the buffer
+                    %% itself. The new-minus-delivered estimate drifts upward
+                    %% once retransmissions overlap, because the overlapping
+                    %% bytes count as new but are never delivered twice, and
+                    %% that drift would eventually trip the cap on a stream
+                    %% holding nothing.
                     NewRecvBufferBytes = max(
-                        0, RecvBufferBytes + NewBytesReceived - DeliveredBytes
+                        0,
+                        RecvBufferBytes - reassembly_buffer_bytes(RecvBuffer) +
+                            reassembly_buffer_bytes(NewBuffer)
                     ),
 
                     State1 = State#state{
@@ -6941,7 +6993,13 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                     %% advancing.
                     MaxWindowForStream = State#state.fc_max_receive_window,
                     Headroom = max(0, RecvMaxData - NewRecvOffset),
-                    WillSendMaxStreamData = Headroom < (MaxWindowForStream div 2),
+                    %% A stream whose final size is known can never use more
+                    %% credit (RFC 9000 §19.10), so widening its window only
+                    %% spends bytes: one frame per completed stream adds up
+                    %% in request/response traffic.
+                    WillSendMaxStreamData =
+                        Headroom < (MaxWindowForStream div 2) andalso
+                            NewStream#stream_state.final_size =:= undefined,
                     Threshold = RecvMaxData - (MaxWindowForStream div 2),
                     ?LOG_DEBUG(
                         #{
@@ -6991,9 +7049,12 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                     recv_max_data = NewMaxStreamData
                                 },
                                 MaxStreamDataFrame = {max_stream_data, StreamId, NewMaxStreamData},
-                                %% Update cached max stream recv window
+                                %% Cache the granted window *size* (not the
+                                %% absolute limit) for the connection-window
+                                %% multiplier below.
                                 NewCachedMax = max(
-                                    NewMaxStreamData, State1#state.fc_max_stream_recv_window
+                                    NewMaxStreamData - NewRecvOffset,
+                                    State1#state.fc_max_stream_recv_window
                                 ),
                                 State1a = State1#state{
                                     streams = maps:put(StreamId, UpdatedStream, Streams),
@@ -7005,12 +7066,16 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                 State1
                         end,
 
-                    %% Check if we need to send MAX_DATA for connection-level flow control
-                    %% Send when we've consumed more than 50% of our advertised connection window
-                    %% RTT-based auto-tuning with connection/stream multiplier enforcement
+                    %% Check if we need to send MAX_DATA for connection-level flow
+                    %% control. Trigger on remaining headroom (limit - received),
+                    %% like the per-stream update above: comparing cumulative
+                    %% received bytes against the absolute limit becomes
+                    %% permanently true once total received exceeds one window,
+                    %% spraying an ack-eliciting MAX_DATA on every packet.
                     MaxDataLocalVal = State2#state.max_data_local,
+                    ConnHeadroom = max(0, MaxDataLocalVal - NewDataReceivedVal),
                     State3 =
-                        case NewDataReceivedVal > (MaxDataLocalVal div 2) of
+                        case ConnHeadroom < (State2#state.fc_max_receive_window div 2) of
                             true ->
                                 Now2 = erlang:monotonic_time(millisecond),
                                 SmoothedRTT2 = quic_loss:smoothed_rtt(State2#state.loss_state),
@@ -7034,11 +7099,15 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                     InitialConnWindow,
                                     FastConsumption2
                                 ),
-                                %% Ensure connection window >= 1.5x largest stream window
+                                %% Ensure connection window >= 1.5x largest stream
+                                %% window. MaxStreamWindow is a window size; anchor
+                                %% it at the delivered offset to compare limits.
                                 MaxStreamWindow = get_max_stream_recv_window(State2),
-                                MinConnWindow = trunc(
-                                    MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER
-                                ),
+                                MinConnWindow =
+                                    NewDataReceivedVal +
+                                        trunc(
+                                            MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER
+                                        ),
                                 NewMaxData = max(BaseNewMaxData, MinConnWindow),
                                 MaxDataFrame = {max_data, NewMaxData},
                                 State2a = send_frame(MaxDataFrame, State2),
@@ -7072,9 +7141,48 @@ extract_contiguous_data(Buffer, Offset, Acc) ->
             NextOffset = Offset + byte_size(Data),
             extract_contiguous_data(NewBuffer, NextOffset, <<Acc/binary, Data/binary>>);
         error ->
-            %% No data at this offset (gap in stream)
-            {Acc, Offset, Buffer}
+            %% Nothing keyed exactly at Offset, which does not mean a gap:
+            %% a peer may split or coalesce retransmitted data differently
+            %% (RFC 9000 §2.2, §13.3), so the bytes we want can sit inside
+            %% a chunk that starts earlier. Drop what is already delivered,
+            %% re-key what straddles Offset, then retry once.
+            Trimmed = trim_reassembly_buffer(Buffer, Offset),
+            case maps:is_key(Offset, Trimmed) of
+                true -> extract_contiguous_data(Trimmed, Offset, Acc);
+                false -> {Acc, Offset, Trimmed}
+            end
     end.
+
+%% Drop buffered chunks that end at or before Offset and trim those that
+%% straddle it, re-keying them to Offset. Keeps the longest chunk at each
+%% offset, so overlapping retransmissions collapse instead of accumulating.
+trim_reassembly_buffer(Buffer, Offset) ->
+    maps:fold(
+        fun(Off, Data, Acc) ->
+            End = Off + byte_size(Data),
+            if
+                End =< Offset ->
+                    Acc;
+                Off >= Offset ->
+                    keep_longest_chunk(Off, Data, Acc);
+                true ->
+                    Kept = binary:part(Data, Offset - Off, End - Offset),
+                    keep_longest_chunk(Offset, Kept, Acc)
+            end
+        end,
+        #{},
+        Buffer
+    ).
+
+keep_longest_chunk(Off, Data, Acc) ->
+    case Acc of
+        #{Off := Existing} when byte_size(Existing) >= byte_size(Data) -> Acc;
+        _ -> Acc#{Off => Data}
+    end.
+
+%% Total bytes held in a reassembly buffer.
+reassembly_buffer_bytes(Buffer) ->
+    maps:fold(fun(_, Data, Acc) -> Acc + byte_size(Data) end, 0, Buffer).
 
 %% Get the maximum stream receive window across all streams.
 %% Used to ensure connection window >= 1.5x largest stream window.
@@ -7631,12 +7739,21 @@ update_pn_space_recv(PN, PNSpace, Now) ->
             L -> L
         end,
     %% Add to ack_ranges maintaining descending order and merging adjacent ranges
-    NewRanges = add_to_ack_ranges(PN, Ranges),
+    NewRanges = cap_ack_ranges(add_to_ack_ranges(PN, Ranges)),
     PNSpace#pn_space{
         largest_recv = NewLargest,
         recv_time = Now,
         ack_ranges = NewRanges
     }.
+
+%% Drop the lowest ranges beyond ?MAX_ACK_RANGES (list is descending).
+cap_ack_ranges([_, _ | Tail] = Ranges) when Tail =/= [] ->
+    case length(Ranges) > ?MAX_ACK_RANGES of
+        true -> lists:sublist(Ranges, ?MAX_ACK_RANGES);
+        false -> Ranges
+    end;
+cap_ack_ranges(Ranges) ->
+    Ranges.
 
 %% Add a packet number to ACK ranges, maintaining descending order by Start
 %% and merging adjacent/overlapping ranges
@@ -8189,12 +8306,14 @@ do_send_data(
                                     case maps:find(StreamId, NewState#state.streams) of
                                         {ok, UpdatedStream} ->
                                             SendFin = (Fin andalso BytesSent =:= DataSize),
+                                            %% send_done is NOT set here: RFC 9000 §3.1
+                                            %% ends the send side at "Data Recvd", which
+                                            %% requires the peer's acks. Reclaim (and the
+                                            %% MAX_STREAMS credit it returns) happens in
+                                            %% the ack path via settle_fin_ack/2.
                                             FinalStream = UpdatedStream#stream_state{
                                                 send_offset = Offset + DataSize,
-                                                send_fin = SendFin,
-                                                send_done =
-                                                    SendFin orelse
-                                                        UpdatedStream#stream_state.send_done
+                                                send_fin = SendFin
                                             },
                                             FinalState0 = NewState#state{
                                                 streams = maps:put(
@@ -8508,14 +8627,23 @@ do_send_datagram(
 %% subsequent chunking reuses the same binary via sub-binary slices and
 %% downstream helpers can rely on the binary invariant without re-flattening.
 send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State) ->
+    send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, back).
+
+%% Where selects the queue position when a congestion/pacing block forces
+%% the unsent remainder back onto the send queue: `back' for fresh sends
+%% (their offset is highest, so appending keeps per-stream offset order),
+%% `front' when draining the queue (the popped entry's remainder must go
+%% back in front of higher-offset entries, or a later flow-control block
+%% at the head strands it behind them, leaving a permanent data hole).
+send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, Where) ->
     DataBin =
         case is_binary(Data) of
             true -> Data;
             false -> iolist_to_binary(Data)
         end,
-    send_stream_data_fragmented_tracked(StreamId, Offset, DataBin, Fin, State, 0).
+    send_stream_fragments(StreamId, Offset, DataBin, Fin, State, 0, Where).
 
-send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) when
+send_stream_fragments(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where) when
     is_binary(Data)
 ->
     %% Calculate max chunk size based on current PMTU
@@ -8524,15 +8652,17 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSen
 
     case DataSize =< MaxChunkSize of
         true ->
-            send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar);
+            send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where);
         false ->
             %% Data is already a flat binary; chunk via sub-binary slices.
-            send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize)
+            send_stream_chunked(
+                StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize, Where
+            )
     end.
 
 %% @doc Send stream data that fits in a single packet.
 %% Data is a binary (normalised by send_stream_data_fragmented_tracked/5).
-send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) when
+send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where) when
     is_binary(Data)
 ->
     #state{cc_state = CCState, pacing_enabled = PacingEnabled, streams = Streams} = State,
@@ -8564,7 +8694,7 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) wh
                 },
                 ?QUIC_LOG_META
             ),
-            case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
                 {ok, QueuedState} ->
                     PacedState = maybe_set_pacing_timer(Delay, QueuedState),
                     {PacedState, BytesSentSoFar};
@@ -8584,7 +8714,7 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar) wh
                 },
                 ?QUIC_LOG_META
             ),
-            case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
                 {ok, QueuedState} ->
                     {QueuedState, BytesSentSoFar};
                 {error, send_queue_full} ->
@@ -8624,7 +8754,7 @@ cwnd_only_check(CCState, Size, Urgency) ->
 %% send_stream_data_fragmented_tracked/6. For a 10 MB upload this cuts
 %% thousands of get_stream_urgency/2 / get_max_stream_data_per_packet/1
 %% calls and record-pattern matches out of the hot send loop.
-send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize) ->
+send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize, Where) ->
     Urgency = get_stream_urgency(StreamId, State#state.streams),
     PacketSize = MaxChunkSize + ?PACKET_OVERHEAD,
     %% Pre-compute the stream-frame header parts that stay constant
@@ -8635,7 +8765,7 @@ send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunk
     LengthVarint = quic_varint:encode(MaxChunkSize),
     HeaderPrefix =
         <<(?FRAME_STREAM bor ?STREAM_FLAG_OFF bor ?STREAM_FLAG_LEN):8, StreamIdVarint/binary>>,
-    Ctx = {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint},
+    Ctx = {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint, Where},
     send_stream_chunked_loop(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx).
 
 %% Inner chunked-send loop. Cached values in `Ctx' never change within a
@@ -8643,11 +8773,11 @@ send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunk
 %% `send_stream_single_packet/6' so a partial last chunk gets a correctly
 %% sized packet (Length != MaxChunkSize) and can also carry a FIN.
 send_stream_chunked_loop(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
-    {chunked_ctx, MaxChunkSize, _Urgency, _PacketSize, _HeaderPrefix, _LengthVarint} = Ctx,
+    {chunked_ctx, MaxChunkSize, _Urgency, _PacketSize, _HeaderPrefix, _LengthVarint, Where} = Ctx,
     DataSize = byte_size(Data),
     case DataSize =< MaxChunkSize of
         true ->
-            send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar);
+            send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where);
         false ->
             send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx)
     end.
@@ -8668,7 +8798,7 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
     end.
 
 send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
-    {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint} = Ctx,
+    {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint, Where} = Ctx,
     #state{cc_state = CCState, pacing_enabled = PacingEnabled} = State,
     Check =
         case PacingEnabled of
@@ -8701,7 +8831,7 @@ send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSen
                 },
                 ?QUIC_LOG_META
             ),
-            case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
                 {ok, QueuedState} ->
                     PacedState = maybe_set_pacing_timer(Delay, QueuedState),
                     {PacedState, BytesSentSoFar};
@@ -8723,7 +8853,7 @@ send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSen
                 },
                 ?QUIC_LOG_META
             ),
-            case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
                 {ok, QueuedState} ->
                     % Return bytes sent so far
                     {QueuedState, BytesSentSoFar};
@@ -8764,6 +8894,9 @@ queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State) ->
 %% Returns {ok, State} | {error, send_queue_full} if queue limit exceeded
 %% Entry format: {stream_data, StreamId, Offset, Data, Fin, DataSize}
 %% DataSize is cached to avoid repeated iolist_size calls
+queue_stream_data(StreamId, Offset, Data, Fin, State) ->
+    queue_stream_data(StreamId, Offset, Data, Fin, State, back).
+
 queue_stream_data(
     StreamId,
     Offset,
@@ -8775,9 +8908,18 @@ queue_stream_data(
         send_queue_bytes = QueueBytes,
         send_queue_count = QueueCount,
         send_queue_version = Version
-    } = State
+    } = State,
+    Where
 ) ->
-    DataSize = iolist_size(Data),
+    %% Normalise to a binary: consumers like
+    %% dequeue_small_stream_frame_tuple/1 hand the entry's data straight
+    %% to quic_frame:encode/1, which requires a binary.
+    DataBin =
+        case is_binary(Data) of
+            true -> Data;
+            false -> iolist_to_binary(Data)
+        end,
+    DataSize = byte_size(DataBin),
     NewQueueBytes = QueueBytes + DataSize,
     case NewQueueBytes > ?MAX_SEND_QUEUE_BYTES of
         true ->
@@ -8795,8 +8937,12 @@ queue_stream_data(
         false ->
             Urgency = get_stream_urgency(StreamId, Streams),
             %% Cache DataSize in entry to avoid repeated iolist_size calls
-            Entry = {stream_data, StreamId, Offset, Data, Fin, DataSize},
-            NewPQ = pqueue_in(Entry, Urgency, PQ),
+            Entry = {stream_data, StreamId, Offset, DataBin, Fin, DataSize},
+            NewPQ =
+                case Where of
+                    back -> pqueue_in(Entry, Urgency, PQ);
+                    front -> pqueue_in_front(Entry, Urgency, PQ)
+                end,
             NewVersion = Version + 1,
             {ok, State#state{
                 send_queue = NewPQ,
@@ -8844,8 +8990,15 @@ process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
                     %% Flow control allows - dequeue and try to send
                     process_send_queue_entry(State);
                 {blocked, _Reason} ->
-                    %% Flow control blocked - leave in queue, wait for MAX_DATA
-                    State
+                    %% An entry larger than the current window still has a
+                    %% sendable prefix. Waiting for one grant big enough for
+                    %% the whole entry stalls against a peer that extends its
+                    %% window in small steps as it reads, because it sizes the
+                    %% grant to what it consumed, never to what we have queued.
+                    case split_blocked_head(State) of
+                        {ok, SplitState} -> process_send_queue_entry(SplitState);
+                        false -> State
+                    end
             end;
         {value, {retransmit_stream, _StreamId, _Offset, _Data, _Fin, DataSize}} ->
             %% Retransmits are exempt from flow control (bytes already counted),
@@ -8889,6 +9042,45 @@ check_send_queue_flow_control(StreamId, Offset, DataSize, #state{
                     ok
             end
     end.
+
+%% Replace a flow-control-blocked head entry with the prefix that fits plus
+%% the remainder, both at the front so stream order is preserved. Returns
+%% false when nothing fits, when the whole entry fits (the caller should not
+%% have been blocked), or for a zero-length FIN-only entry.
+split_blocked_head(#state{send_queue = PQ, send_queue_count = QueueCount} = State) ->
+    case pqueue_peek(PQ) of
+        {value, {stream_data, StreamId, Offset, Data, Fin, DataSize}} ->
+            case blocked_head_allowance(StreamId, Offset, State) of
+                Allowed when Allowed > 0, Allowed < DataSize ->
+                    {{value, _}, PQ1} = pqueue_out(PQ),
+                    <<Head:Allowed/binary, Tail/binary>> = Data,
+                    Urgency = get_stream_urgency(StreamId, State#state.streams),
+                    TailEntry =
+                        {stream_data, StreamId, Offset + Allowed, Tail, Fin, DataSize - Allowed},
+                    HeadEntry = {stream_data, StreamId, Offset, Head, false, Allowed},
+                    PQ2 = pqueue_in_front(TailEntry, Urgency, PQ1),
+                    PQ3 = pqueue_in_front(HeadEntry, Urgency, PQ2),
+                    {ok, State#state{send_queue = PQ3, send_queue_count = QueueCount + 1}};
+                _ ->
+                    false
+            end;
+        _ ->
+            false
+    end.
+
+%% Bytes of the entry at Offset that both connection and stream windows admit.
+blocked_head_allowance(StreamId, Offset, #state{
+    max_data_remote = MaxDataRemote,
+    data_sent = DataSent,
+    streams = Streams
+}) ->
+    ConnectionAllowed = MaxDataRemote - DataSent,
+    StreamAllowed =
+        case maps:find(StreamId, Streams) of
+            {ok, #stream_state{send_max_data = SendMaxData}} -> SendMaxData - Offset;
+            error -> ConnectionAllowed
+        end,
+    min(ConnectionAllowed, StreamAllowed).
 
 %% Actually process the queue entry (called after flow control check passes)
 process_send_queue_entry(
@@ -8934,7 +9126,7 @@ process_send_queue_entry(
                 send_queue_bytes = DecrementedQueueBytes,
                 send_queue_count = DecrementedQueueCount
             },
-            case send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State1) of
+            case send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State1, front) of
                 {error, send_queue_full} ->
                     ?LOG_WARNING(
                         #{
@@ -8949,7 +9141,7 @@ process_send_queue_entry(
                     %% Only update data_sent for connection-level flow control accounting.
                     %% send_offset was already advanced when the data was first queued
                     %% (in do_send_data) to prevent offset overlap bugs.
-                    State3 =
+                    State3a =
                         case BytesSent > 0 of
                             true ->
                                 State2#state{
@@ -8957,6 +9149,18 @@ process_send_queue_entry(
                                 };
                             false ->
                                 State2
+                        end,
+                    %% A queued write that carried FIN closes the send side only
+                    %% here: do_send_data could not mark it (the write was still
+                    %% queued). The queue-count check rules out a zero-length FIN
+                    %% entry that was re-queued rather than sent (0 =:= 0 lies).
+                    EntrySent =
+                        BytesSent =:= DataSize andalso
+                            State3a#state.send_queue_count =:= DecrementedQueueCount,
+                    State3 =
+                        case Fin andalso EntrySent of
+                            true -> mark_fin_sent(StreamId, State3a);
+                            false -> State3a
                         end,
                     %% If data was queued again (cwnd still full), stop processing
                     case pqueue_is_empty(State3#state.send_queue) of
@@ -8984,6 +9188,16 @@ process_send_queue_entry(
 pqueue_in(Entry, Urgency, PQ) when Urgency >= 0, Urgency =< 7 ->
     Bucket = element(Urgency + 1, PQ),
     NewBucket = queue:in(Entry, Bucket),
+    setelement(Urgency + 1, PQ, NewBucket).
+
+%% Insert at the front of the urgency bucket. Used when a drain pops an
+%% entry and must put back an unsent remainder: appending it at the back
+%% would order it behind higher-offset entries of the same stream, and a
+%% later stream-flow-control block at the head then strands it forever
+%% (the peer cannot extend the window across the resulting data hole).
+pqueue_in_front(Entry, Urgency, PQ) when Urgency >= 0, Urgency =< 7 ->
+    Bucket = element(Urgency + 1, PQ),
+    NewBucket = queue:in_r(Entry, Bucket),
     setelement(Urgency + 1, PQ, NewBucket).
 
 %% Remove and return highest priority (lowest urgency) entry
@@ -9814,6 +10028,9 @@ defer_retransmit_frames(Frames, State) ->
 %% Queue a lost STREAM frame for retransmission. Exempt from flow control and
 %% data_sent (those were counted on the original send); bytes/count/version are
 %% updated like queue_stream_data/5 so the drain and reclaim-gate scans see it.
+%% Front-inserted: retransmits fill receiver-side holes, so they must not sit
+%% behind a flow-control-blocked head whose window can only grow once the hole
+%% is filled.
 enqueue_retransmit_stream(StreamId, Offset, Data, Fin, State) ->
     #state{
         send_queue = PQ,
@@ -9826,7 +10043,7 @@ enqueue_retransmit_stream(StreamId, Offset, Data, Fin, State) ->
     Urgency = get_stream_urgency(StreamId, Streams),
     Entry = {retransmit_stream, StreamId, Offset, Data, Fin, DataSize},
     State#state{
-        send_queue = pqueue_in(Entry, Urgency, PQ),
+        send_queue = pqueue_in_front(Entry, Urgency, PQ),
         send_queue_bytes = QueueBytes + DataSize,
         send_queue_count = QueueCount + 1,
         send_queue_version = Version + 1
@@ -9868,6 +10085,76 @@ complete_send_reset_at(#state{pending_send_reset_at = P} = State) ->
     ).
 
 %% Handle PTO timeout - send probe packet
+%% The drain-path counterpart of do_send_data's inline FIN bookkeeping.
+%% send_done is deliberately not set: that happens when the FIN is acked.
+mark_fin_sent(StreamId, State) ->
+    case maps:find(StreamId, State#state.streams) of
+        {ok, S} ->
+            State#state{
+                streams = maps:put(
+                    StreamId,
+                    S#stream_state{send_fin = true},
+                    State#state.streams
+                )
+            };
+        error ->
+            State
+    end.
+
+%% The peer acked a FIN-bearing STREAM frame. The send side is done once
+%% nothing below the final offset remains queued or in flight; otherwise
+%% park it for complete_fin_reclaims/1 to finish on a later ack.
+settle_fin_ack(StreamId, State) ->
+    case maps:find(StreamId, State#state.streams) of
+        {ok, #stream_state{send_done = true}} ->
+            State;
+        {ok, #stream_state{send_offset = Final}} ->
+            Pending =
+                stream_has_queued_below(StreamId, Final, State#state.send_queue) orelse
+                    quic_loss:stream_has_unacked_below(
+                        State#state.loss_state, StreamId, Final
+                    ),
+            case Pending of
+                false ->
+                    mark_send_done_and_reclaim(StreamId, State);
+                true ->
+                    State#state{
+                        pending_fin_reclaim =
+                            maps:put(StreamId, Final, State#state.pending_fin_reclaim)
+                    }
+            end;
+        error ->
+            State
+    end.
+
+%% Finish parked FIN reclaims whose remaining bytes are now acked.
+complete_fin_reclaims(#state{pending_fin_reclaim = P} = State) when map_size(P) =:= 0 ->
+    State;
+complete_fin_reclaims(#state{pending_fin_reclaim = P} = State) ->
+    maps:fold(
+        fun(StreamId, Final, Acc) ->
+            Pending =
+                stream_has_queued_below(StreamId, Final, Acc#state.send_queue) orelse
+                    quic_loss:stream_has_unacked_below(
+                        Acc#state.loss_state, StreamId, Final
+                    ),
+            case Pending of
+                true ->
+                    Acc;
+                false ->
+                    mark_send_done_and_reclaim(
+                        StreamId,
+                        Acc#state{
+                            pending_fin_reclaim =
+                                maps:remove(StreamId, Acc#state.pending_fin_reclaim)
+                        }
+                    )
+            end
+        end,
+        State,
+        P
+    ).
+
 handle_pto_timeout(#state{loss_state = LossState} = State) ->
     %% Increment PTO count
     NewLossState = quic_loss:on_pto_expired(LossState),
