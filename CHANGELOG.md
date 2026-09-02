@@ -4,7 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `max_burst_packets` bounds how many packets leave per send drain, so a
+  large queued write cannot monopolise the scheduler. Contributed by
+  jbevemyr (#214).
+- `ack_packet_tolerance` makes the 1-RTT ACK decimation threshold
+  configurable; it defaults to the RFC 9000 section 13.2.1 value of 2.
+  Contributed by jbevemyr (#213).
+
 ### Fixed
+- The GSO segment size is derived from the batch instead of a
+  configured constant. 1-RTT packets follow the current max datagram
+  size, so the uniformity check against the fixed 1200 never matched and
+  the GSO path never ran; a batch is now split into runs of equal-sized
+  packets and each run segmented on its own size. Each write is capped
+  at 64 segments and 64 KB, and GSO is requested per message rather than
+  as a socket-level `UDP_SEGMENT`, which segmented every datagram
+  including handshake packets. Reported by jbevemyr (#196).
+- The socket-backend client binds the source address from
+  `extra_socket_opts` instead of leaving it to the kernel's route
+  lookup, which picks the wrong address on a multi-address host.
+  Contributed by jbevemyr (#261).
+- A GRO train reaches the client connection as one message rather than
+  one per packet, so the whole train is processed in a single receive
+  pass. Contributed by jbevemyr (#248).
 - PTO probe packets are exempt from the congestion window and loss
   retransmissions are bound to it, per RFC 9002 section 7. A probe is
   the only thing that can restart a stalled connection, so blocking it
@@ -42,6 +65,32 @@ All notable changes to this project will be documented in this file.
   (receiver queueing, bufferbloat) turned into a throughput collapse.
   Contributed by jbevemyr (#210).
 - PMTU probes are tracked as non-ack-eliciting, so a probe lost past the path MTU no longer inflates `bytes_in_flight`, arms the PTO machinery, or feeds a congestion event (RFC 8899 §3, RFC 9000 §14.4). Combined with an in-flight-keyed liveness check, the periodic raise probe previously killed every long-lived connection on an MTU-limited path once per 600-second raise interval, both ends at once. The raise interval is configurable as `pmtu_raise_interval`. (#264)
+- The UDP_GRO control message is read as the int the kernel sends.
+  Matching exactly two bytes meant the lookup never succeeded, so a
+  GRO-coalesced buffer was passed up unsplit as one oversized datagram
+  and dropped by the QUIC layer, which cannot re-split short-header
+  packets. GRO was therefore silently losing every coalesced train.
+  Contributed by jbevemyr (#204).
+- The GRO receive path sizes its read buffer for a maximally coalesced
+  train (64 KiB). Passing 0 used the OTP default 8 KiB buffer and
+  `recvmsg' silently truncated anything larger, discarding every segment
+  past the first few. The client receiver also went through a plain
+  `recvfrom', which never split trains at all. Contributed by jbevemyr
+  (#215).
+
+### Changed
+- A mixed-size send batch on a GSO socket is split into runs of
+  equal-sized packets and each run sent with one UDP_SEGMENT call,
+  instead of falling back to one `sendmsg' per packet. A single
+  odd-sized packet between data packets (an ACK, a flow-control update)
+  previously degraded the whole batch. Contributed by jbevemyr (#217).
+- Small sends are coalesced into shared packets. Contributed by jbevemyr
+  (#203).
+- The pacing burst allowance scales with the pacing rate rather than
+  sitting at a fixed 12 packets. Pacing wakeups have roughly
+  millisecond resolution, so the fixed bucket capped throughput at 12
+  packets per wakeup whenever the sender outran the ACK clock,
+  regardless of the configured rate. Contributed by jbevemyr (#219).
 
 ## [1.8.1] - 2026-08-15
 

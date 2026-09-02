@@ -812,7 +812,7 @@ update_mtu(#cc_state{max_datagram_size = OldMDS, minimum_window = OldMinWin} = S
     NewMinimumWindow = max(2 * NewMTU, (OldMinWin * NewMTU) div OldMDS),
 
     %% Update pacing_max_burst (12 * max_datagram_size)
-    NewPacingMaxBurst = 12 * NewMTU,
+    NewPacingMaxBurst = max(12 * NewMTU, 2 * State#cc_state.pacing_rate),
 
     ?LOG_DEBUG(
         #{
@@ -904,7 +904,17 @@ update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTT) when SmoothedRTT
     %% Update HyStart++ RTT tracking
     State1 = update_hystart_rtt(State, SmoothedRTT),
 
-    State1#cc_state{pacing_rate = PacingRate};
+    %% The burst allowance must cover at least a couple of timer
+    %% granularities' worth of tokens at the paced rate: pacing wakeups
+    %% (send_after) have ~1 ms resolution, so a fixed 12-packet bucket
+    %% caps throughput at 12 packets per wakeup whenever the sender
+    %% outruns the incoming ACK clock, regardless of the configured
+    %% rate. 2 ms of rate keeps micro-bursts bounded (same idea as
+    %% Linux fq's pacing quantum) while letting a 1 ms clock sustain
+    %% the rate.
+    MaxBurst = max(12 * State1#cc_state.max_datagram_size, 2 * PacingRate),
+
+    State1#cc_state{pacing_rate = PacingRate, pacing_max_burst = MaxBurst};
 update_pacing_rate(State, _SmoothedRTT) ->
     %% No valid RTT yet, keep current state
     State.

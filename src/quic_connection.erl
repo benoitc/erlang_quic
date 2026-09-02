@@ -239,6 +239,10 @@
 %% ACK traffic for RTT-sample granularity.
 -define(ACK_PACKET_TOLERANCE, 2).
 
+%% Default per-drain send burst budget in packets (max_burst_packets
+%% option). See the burst_budget field.
+-define(DEFAULT_MAX_BURST_PACKETS, 64).
+
 %% Max receive buffer size in bytes (32 MB total across all streams) - protects against malicious peers
 -define(MAX_RECV_BUFFER_BYTES, 33554432).
 
@@ -681,7 +685,22 @@
     %% immediately; otherwise a max_ack_delay timer (ack_timer) is
     %% armed so the peer sees an ACK at worst max_ack_delay ms after
     %% the first ack-eliciting packet in the window.
+    %% Per-drain send burst budget (max_burst_packets option). Bounds
+    %% how many packets one drain emits before the remainder is queued
+    %% and a zero-delay pacing continuation is armed, yielding to the
+    %% event loop so ACK/loss feedback interleaves with bulk sending.
+    %% Without the bound a large cwnd lets a single send event emit
+    %% hundreds of packets back-to-back, which overflows slow receivers
+    %% (GSO bursts especially) before any loss signal is seen.
+    burst_budget = ?DEFAULT_MAX_BURST_PACKETS :: pos_integer(),
+    burst_sent = 0 :: non_neg_integer(),
     ack_elicited_count = 0 :: non_neg_integer(),
+    %% How many ack-eliciting 1-RTT packets to accumulate before
+    %% flushing an ACK. 2 is the RFC 9000 §13.2.1 recommendation;
+    %% higher values trade ACK traffic (and receiver CPU) for RTT
+    %% sample granularity and slower loss feedback, bounded by the
+    %% max_ack_delay timer either way.
+    ack_packet_tolerance = ?ACK_PACKET_TOLERANCE :: pos_integer(),
     ack_timer = undefined :: reference() | undefined,
     %% Transient: classification of the most recently received 1-RTT
     %% packet. Set by `record_received_pn/3' and consumed once by
@@ -691,7 +710,18 @@
     last_recv_trigger = sequential :: sequential | reordered,
 
     %% QLOG Tracing (draft-ietf-quic-qlog-quic-events)
-    qlog_ctx :: #qlog_ctx{} | undefined
+    qlog_ctx :: #qlog_ctx{} | undefined,
+
+    %% Small-send coalescing (issue #201). While `coalesce' is true -
+    %% only within one drained batch of send_data/send_data_async
+    %% requests - app packets accumulate here and are flushed as one
+    %% multi-frame packet per PMTU budget instead of one packet per
+    %% frame. Reversed accumulation lists; see send_app_packet_internal
+    %% and flush_pending_packet.
+    coalesce = false :: boolean(),
+    pend_payload = [] :: [iodata()],
+    pend_frames = [] :: [tuple()],
+    pend_size = 0 :: non_neg_integer()
 }).
 
 %%====================================================================
@@ -1160,6 +1190,8 @@ init({server, Opts}) ->
         fc_last_stream_update = undefined,
         fc_last_conn_update = undefined,
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
+        ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
+        burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
         % Server-initiated bidi: 1, 5, 9, ...
         next_stream_id_bidi = 1,
         % Server-initiated uni: 3, 7, 11, ...
@@ -1542,6 +1574,8 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         fc_last_stream_update = undefined,
         fc_last_conn_update = undefined,
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
+        ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
+        burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
         % Client-initiated bidi: 0, 4, 8, ...
         next_stream_id_bidi = 0,
         % Client-initiated uni: 2, 6, 10, ...
@@ -1740,6 +1774,10 @@ idle(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     %% Flush batched packets and timers after processing incoming data
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(idle, FlushedState);
+idle(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Socket} = State) ->
+    NewState = handle_packets_batch(Packets, State),
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    check_state_transition(idle, FlushedState);
 %% Server receives packets from listener
 idle(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
@@ -1831,6 +1869,10 @@ handshaking({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = 
 handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
     %% Flush batched packets and timers after processing incoming data
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    check_state_transition(handshaking, FlushedState);
+handshaking(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Socket} = State) ->
+    NewState = handle_packets_batch(Packets, State),
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(handshaking, FlushedState);
 %% Server receives packets from listener
@@ -1965,14 +2007,7 @@ connected({call, From}, {send_datagram, Data}, State) ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
 connected({call, From}, {send_data, StreamId, Data, Fin}, State) ->
-    case do_send_data(StreamId, Data, Fin, State) of
-        {ok, NewState} ->
-            %% Event-driven flush: flush batch and timers after user API call
-            FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
-            {keep_state, FlushedState, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
-    end;
+    coalesced_sends([{From, StreamId, Data, Fin}], State);
 connected({call, From}, open_stream, State) ->
     case do_open_stream(State) of
         {ok, StreamId, NewState} ->
@@ -2130,7 +2165,7 @@ connected(
     %% Return packet counts for liveness detection (net_kernel uses
     %% recv count to verify peer is alive) plus send-path batching
     %% counters for benchmarks and tests.
-    {Flushes, Coalesced} = send_batch_counters(SocketState),
+    {Flushes, Coalesced, GSOFlushes} = send_batch_counters(SocketState),
     Stats = #{
         packets_received => PacketsRecv,
         packets_sent => PacketsSent,
@@ -2139,7 +2174,8 @@ connected(
         ack_sent => AckSent,
         retransmits => Retransmits,
         batch_flushes => Flushes,
-        packets_coalesced => Coalesced
+        packets_coalesced => Coalesced,
+        gso_flushes => GSOFlushes
     },
     {keep_state, State, [{reply, From, {ok, Stats}}]};
 connected({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
@@ -2197,6 +2233,15 @@ connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) 
     State1 = State#state{current_packet_source = {IP, Port}},
     NewState = handle_packet(Data, State1),
     %% Clear packet source and flush
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FinalState = FlushedState#state{current_packet_source = undefined},
+    check_state_transition(connected, FinalState);
+%% Client receives a whole GRO train from the receiver process as one
+%% message; processing it in one pass amortizes the per-event flushes
+%% over the train.
+connected(info, {udp_batch, Socket, IP, Port, Packets}, #state{socket = Socket} = State) ->
+    State1 = State#state{current_packet_source = {IP, Port}},
+    NewState = handle_packets_batch(Packets, State1),
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     FinalState = FlushedState#state{current_packet_source = undefined},
     check_state_transition(connected, FinalState);
@@ -2262,15 +2307,7 @@ connected(cast, {close, Reason}, State) ->
     {next_state, draining, NewState};
 %% Async send data - fire-and-forget for high throughput
 connected(cast, {send_data_async, StreamId, Data, Fin}, State) ->
-    case do_send_data(StreamId, Data, Fin, State) of
-        {ok, NewState} ->
-            %% Event-driven flush: flush batch and timers after user API call
-            FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
-            {keep_state, FlushedState};
-        {error, _Reason} ->
-            %% Silently drop errors in async mode
-            {keep_state, State}
-    end;
+    coalesced_sends([{async, StreamId, Data, Fin}], State);
 connected(cast, process, #state{role = client, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
     client_rearm_active(State, N),
@@ -3549,7 +3586,82 @@ send_frame(Frame, State) ->
 %% Decodes the payload to extract frame info for loss tracking
 %% Note: Prefer send_frame/2 when frame tuple is available
 %% Send a 1-RTT packet with explicit frames list for retransmission tracking
+%% Coalescing front end: within a drained send batch, small app
+%% packets accumulate and are emitted as one multi-frame packet.
+%% Everything downstream (packet build, loss tracking, retransmit,
+%% counters) already handles a frames list per packet, so only the
+%% emission point changes. A payload larger than the remaining budget
+%% flushes the pending packet first; coalescing off means the old
+%% one-packet-per-call behaviour, byte for byte.
+send_app_packet_internal(Payload, Frames, #state{coalesce = true} = State) ->
+    #state{pend_payload = PP, pend_frames = PF, pend_size = PS} = State,
+    Size = erlang:iolist_size(Payload),
+    Budget = get_max_stream_data_per_packet(State),
+    case PS > 0 andalso PS + Size > Budget of
+        true ->
+            State1 = flush_pending_packet(State),
+            State1#state{
+                pend_payload = [Payload],
+                pend_frames = lists:reverse(Frames),
+                pend_size = Size
+            };
+        false ->
+            State#state{
+                pend_payload = [Payload | PP],
+                pend_frames = lists:reverse(Frames, PF),
+                pend_size = PS + Size
+            }
+    end;
 send_app_packet_internal(Payload, Frames, State) ->
+    send_app_packet_now(Payload, Frames, State).
+
+%% Drain consecutive send requests already sitting in the mailbox and
+%% process them as one batch with coalescing enabled, so frames from
+%% concurrent senders share packets (issue #201). Only send messages
+%% are drained; everything else keeps its ordinary ordering. A lone
+%% send behaves exactly as before apart from a single extra receive
+%% probe.
+coalesced_sends(Acc0, State0) ->
+    Sends = drain_send_msgs(Acc0, 63),
+    {RevReplies, State1} =
+        lists:foldl(
+            fun({Tag, Sid, Data, Fin}, {Rs, S}) ->
+                case do_send_data(Sid, Data, Fin, S) of
+                    {ok, S2} -> {[{Tag, ok} | Rs], S2};
+                    {error, Reason} -> {[{Tag, {error, Reason}} | Rs], S}
+                end
+            end,
+            {[], State0#state{coalesce = true}},
+            Sends
+        ),
+    State2 = flush_pending_packet(State1#state{coalesce = false}),
+    FlushedState = flush_dirty_timers(flush_socket_batch(State2)),
+    Replies = [{reply, F, R} || {F, R} <- lists:reverse(RevReplies), F =/= async],
+    {keep_state, FlushedState, Replies}.
+
+drain_send_msgs(Acc, 0) ->
+    lists:reverse(Acc);
+drain_send_msgs(Acc, N) ->
+    receive
+        {'$gen_call', From, {send_data, Sid, D, Fin}} ->
+            drain_send_msgs([{From, Sid, D, Fin} | Acc], N - 1);
+        {'$gen_cast', {send_data_async, Sid, D, Fin}} ->
+            drain_send_msgs([{async, Sid, D, Fin} | Acc], N - 1)
+    after 0 ->
+        lists:reverse(Acc)
+    end.
+
+flush_pending_packet(#state{pend_size = 0} = State) ->
+    State;
+flush_pending_packet(#state{pend_payload = PP, pend_frames = PF} = State) ->
+    State1 = State#state{pend_payload = [], pend_frames = [], pend_size = 0},
+    send_app_packet_now(lists:reverse(PP), lists:reverse(PF), State1).
+
+%% Counts against the per-drain burst budget here rather than in
+%% send_app_packet_internal/3: with coalescing on, several sends share
+%% one packet, and the budget bounds packets on the wire.
+send_app_packet_now(Payload, Frames, State0) ->
+    State = State0#state{burst_sent = State0#state.burst_sent + 1},
     #state{
         dcid = DCID,
         app_keys = {ClientKeys, ServerKeys},
@@ -4659,14 +4771,22 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                         LostPackets
                     ),
 
-                    %% Handle PMTU probe ACKs
-                    State2 = lists:foldl(
-                        fun(#sent_packet{pn = PN}, S) ->
-                            handle_pmtu_probe_ack(PN, S)
+                    %% Handle PMTU probe ACKs. Only walk the acked list when a
+                    %% probe is actually outstanding - the common bulk-ACK case
+                    %% has none and skips the per-packet fold.
+                    State2 =
+                        case pmtu_probe_outstanding(State1) of
+                            true ->
+                                lists:foldl(
+                                    fun(#sent_packet{pn = PN}, S) ->
+                                        handle_pmtu_probe_ack(PN, S)
+                                    end,
+                                    State1,
+                                    AckedPackets
+                                );
+                            false ->
+                                State1
                         end,
-                        State1,
-                        AckedPackets
-                    ),
 
                     %% Handle PMTU probe losses
                     %% Pass packet size directly since packets are removed from sent_packets
@@ -6950,7 +7070,7 @@ maybe_send_ack(_, _, State) ->
 %% the counter and arm a max_ack_delay timer (if not already armed).
 maybe_decimate_app_ack(State) ->
     NewCount = State#state.ack_elicited_count + 1,
-    case NewCount >= ?ACK_PACKET_TOLERANCE of
+    case NewCount >= State#state.ack_packet_tolerance of
         true ->
             send_app_ack(State);
         false ->
@@ -8334,6 +8454,21 @@ send_stream_chunked_loop(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
     end.
 
 send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
+    case burst_exhausted(State) of
+        true ->
+            case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+                {ok, QueuedState} ->
+                    {arm_burst_continuation(QueuedState), BytesSentSoFar};
+                {error, send_queue_full} ->
+                    {error, send_queue_full}
+            end;
+        false ->
+            send_stream_chunked_step_unbudgeted(
+                StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
+            )
+    end.
+
+send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
     {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint} = Ctx,
     #state{cc_state = CCState, pacing_enabled = PacingEnabled} = State,
     Check =
@@ -8463,7 +8598,13 @@ get_stream_urgency(StreamId, Streams) ->
 %% bytes at 0 while a real entry is pending.
 process_send_queue(#state{send_queue_count = 0} = State) ->
     State;
-process_send_queue(#state{send_queue = PQ} = State) ->
+process_send_queue(State) ->
+    case burst_exhausted(State) of
+        true -> arm_burst_continuation(State);
+        false -> process_send_queue_unbudgeted(State)
+    end.
+
+process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
     case pqueue_peek(PQ) of
         empty ->
             State;
@@ -9607,11 +9748,11 @@ cancel_timer(Ref) -> erlang:cancel_timer(Ref).
 %% because zero-byte FIN-only entries can sit in the queue with bytes=0.
 handle_pacing_timeout(#state{send_queue_count = 0} = State) ->
     ?LOG_DEBUG(#{what => pacing_timeout_fired, queue_empty => true}, ?QUIC_LOG_META),
-    State;
+    State#state{burst_sent = 0};
 handle_pacing_timeout(State) ->
     ?LOG_DEBUG(#{what => pacing_timeout_fired, queue_empty => false}, ?QUIC_LOG_META),
-    %% Process the send queue
-    State1 = process_send_queue(State),
+    %% Fresh drain: reset the burst budget, then process the send queue
+    State1 = process_send_queue(State#state{burst_sent = 0}),
     %% If there's still queued data and pacing is blocking, set another timer
     State2 = maybe_reschedule_pacing(State1),
     %% Event-driven flush: flush batch and timers after pacing timeout processing
@@ -9743,6 +9884,21 @@ maybe_set_pacing_timer(Delay, #state{pacing_timer = undefined} = State) ->
     erlang:send_after(Delay, self(), {pacing_timeout, Ref}),
     State#state{pacing_timer = Ref}.
 
+%% Burst budget: bounds packets emitted per drain (see burst_budget).
+burst_exhausted(#state{burst_sent = Sent, burst_budget = Budget}) ->
+    Sent >= Budget.
+
+%% Arm a zero-delay pacing continuation so the queued remainder is
+%% drained in the next event-loop pass, after any pending ACK / loss
+%% feedback in the mailbox. Reuses the pacing timer and message so the
+%% drain and stale-reference handling are shared with real pacing.
+arm_burst_continuation(#state{pacing_timer = Ref} = State) when Ref =/= undefined ->
+    State;
+arm_burst_continuation(State) ->
+    Ref = make_ref(),
+    erlang:send_after(0, self(), {pacing_timeout, Ref}),
+    State#state{pacing_timer = Ref}.
+
 %% Convert state to map for debugging
 state_to_map(#state{} = S) ->
     #{
@@ -9792,10 +9948,14 @@ send_gso_supported(SocketState) ->
     maps:get(gso_supported, quic_socket:info(SocketState)).
 
 send_batch_counters(undefined) ->
-    {0, 0};
+    {0, 0, 0};
 send_batch_counters(SocketState) ->
     Info = quic_socket:info(SocketState),
-    {maps:get(batch_flushes, Info), maps:get(packets_coalesced, Info)}.
+    {
+        maps:get(batch_flushes, Info),
+        maps:get(packets_coalesced, Info),
+        maps:get(gso_flushes, Info)
+    }.
 
 %% Normalize ALPN list - handles binary, list of binaries, list of strings
 normalize_alpn_list(undefined) ->
@@ -11480,6 +11640,13 @@ maybe_set_pmtu_raise_timer(#state{pmtu_raise_timer = undefined} = State) ->
     State#state{pmtu_raise_timer = Ref};
 maybe_set_pmtu_raise_timer(State) ->
     State.
+
+%% Whether a PMTU probe packet is in flight awaiting ACK/loss.
+-spec pmtu_probe_outstanding(#state{}) -> boolean().
+pmtu_probe_outstanding(#state{pmtu_state = undefined}) ->
+    false;
+pmtu_probe_outstanding(#state{pmtu_state = #pmtu_state{probe_pn = ProbePN}}) ->
+    ProbePN =/= undefined.
 
 %% @doc Handle ACK of a potential PMTU probe packet.
 -spec handle_pmtu_probe_ack(non_neg_integer(), #state{}) -> #state{}.
