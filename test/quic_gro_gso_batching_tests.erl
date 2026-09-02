@@ -144,3 +144,49 @@ assert_run_legal({gso, Size, Ps}) ->
     ?assert(lists:all(fun(P) -> byte_size(P) =:= Size end, AllButLast)),
     ?assert(byte_size(Last) =< Size),
     ok.
+
+%%====================================================================
+%% Per-write kernel limits (#200)
+%%====================================================================
+
+%% One UDP_SEGMENT write takes at most 64 segments and a payload that
+%% fits a 16-bit UDP length. 64 packets of 1398 bytes is 89 KB, so a
+%% full batch has to become more than one write.
+a_full_batch_of_mtu_packets_splits_across_writes_test() ->
+    Packets = [pkt(N rem 251, 1398) || N <- lists:seq(1, 64)],
+    Runs = quic_socket:split_uniform_runs(Packets),
+    ?assert(length(Runs) > 1),
+    [
+        begin
+            ?assert(length(Ps) =< 64),
+            ?assert(lists:sum([byte_size(P) || P <- Ps]) =< 65535)
+        end
+     || {gso, _Size, Ps} <- Runs
+    ],
+    ok.
+
+%% Splitting for the write limit must not drop, duplicate or reorder
+%% anything, and each piece must still be a legal segmented write.
+capped_runs_keep_every_packet_in_order_test() ->
+    Packets = [pkt(N rem 251, 1398) || N <- lists:seq(1, 100)],
+    Runs = quic_socket:split_uniform_runs(Packets),
+    Flat = lists:append([
+        case R of
+            {single, P} -> [P];
+            {gso, _, Ps} -> Ps
+        end
+     || R <- Runs
+    ]),
+    ?assertEqual(Packets, Flat),
+    [ok = assert_run_legal(R) || R <- Runs],
+    ok.
+
+%% A short final packet is the batch's last segment, so it must land in
+%% the final write rather than being carried into an earlier one.
+a_capped_run_keeps_the_short_packet_last_test() ->
+    Packets = [pkt(1, 1398) || _ <- lists:seq(1, 64)] ++ [pkt(2, 200)],
+    Runs = quic_socket:split_uniform_runs(Packets),
+    {gso, _, LastPs} = lists:last(Runs),
+    ?assertEqual(200, byte_size(lists:last(LastPs))),
+    [ok = assert_run_legal(R) || R <- Runs],
+    ok.
