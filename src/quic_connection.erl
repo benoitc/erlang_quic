@@ -166,6 +166,8 @@
     maybe_store_initial_reset_token/2,
     check_stateless_reset/2,
     test_state_for_reset/3,
+    %% Retransmission congestion policy (RFC 9002 §7)
+    retransmit_cc_allowed/3,
     %% NEW_TOKEN frame dispatch (RFC 9000 §8.1.3)
     process_frame/3,
     test_state_for_role/1,
@@ -184,7 +186,10 @@
     test_decimate_step/1,
     test_decimate_on_timer_fire/1,
     test_maybe_send_ack_app/2,
-    test_classify_recv_trigger/2
+    test_classify_recv_trigger/2,
+    %% Per-space ACK isolation (RFC 9000 Section 12.3)
+    test_state_with_loss/1,
+    test_loss_state/1
 ]).
 -endif.
 
@@ -663,6 +668,7 @@
     pmtu_state :: #pmtu_state{} | undefined,
     pmtu_probe_timer :: reference() | undefined,
     pmtu_raise_timer :: reference() | undefined,
+    pmtu_raise_interval = ?PMTU_DEFAULT_RAISE_INTERVAL :: pos_integer(),
 
     %% Deferred PTO timer reset, flushed at batch boundaries via
     %% flush_dirty_timers/1. (Idle and keep-alive timers are lazy and
@@ -1186,6 +1192,7 @@ init({server, Opts}) ->
         congestion_threshold = maps:get(congestion_threshold, Opts, 2),
         pacing_enabled = maps:get(pacing_enabled, Opts, true),
         pmtu_state = init_pmtu_state(Opts),
+        pmtu_raise_interval = maps:get(pmtu_raise_interval, Opts, ?PMTU_DEFAULT_RAISE_INTERVAL),
         qlog_ctx = quic_qlog:new(Opts, InitialDCID, server)
     },
 
@@ -1568,6 +1575,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         pacing_enabled = maps:get(pacing_enabled, Opts, true),
         active_n = maps:get(active_n, Opts, 100),
         pmtu_state = init_pmtu_state(Opts),
+        pmtu_raise_interval = maps:get(pmtu_raise_interval, Opts, ?PMTU_DEFAULT_RAISE_INTERVAL),
         qlog_ctx = quic_qlog:new(Opts, DCID, client)
     },
 
@@ -3540,16 +3548,6 @@ send_frame(Frame, State) ->
 %% Send a 1-RTT (application) packet with pre-encoded binary payload
 %% Decodes the payload to extract frame info for loss tracking
 %% Note: Prefer send_frame/2 when frame tuple is available
-send_app_packet(Payload, State) when is_binary(Payload) ->
-    %% Try to decode the frame for proper loss tracking
-    FrameInfo =
-        case quic_frame:decode(Payload) of
-            {Frame, _Rest} when is_tuple(Frame); is_atom(Frame) -> [Frame];
-            % Fall back to empty if decode fails
-            _ -> []
-        end,
-    send_app_packet_internal(Payload, FrameInfo, State).
-
 %% Send a 1-RTT packet with explicit frames list for retransmission tracking
 send_app_packet_internal(Payload, Frames, State) ->
     #state{
@@ -4554,6 +4552,15 @@ process_frame(_Level, ping, State) ->
     State;
 process_frame(Level, {crypto, Offset, Data}, State) ->
     buffer_crypto_data(Level, Offset, Data, State);
+process_frame(Level, {ack, _Ranges, _AckDelay, _ECN}, State) when Level =/= app ->
+    %% Initial/Handshake ACKs must never touch the loss tracker: only
+    %% 1-RTT packets are registered there, and packet numbers restart
+    %% per space, so a Handshake-space ACK of PN 0..N silently "acks"
+    %% the first N 1-RTT packets out of sent_q. If those carried data
+    %% the peer never received, nothing retransmits them and the peer
+    %% stalls on a permanent stream hole. Handshake flights have their
+    %% own retransmission machinery.
+    State;
 process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
     %% Process ACK - update loss detection and congestion control
     #state{loss_state = LossState, cc_state = CCState} = State,
@@ -9374,14 +9381,21 @@ filter_reset_stream_at_data(Frames, #state{streams = Streams}) ->
 %% Send frames for retransmission with congestion control check
 send_retransmit_frames_cc([], State) ->
     State;
-send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = State) ->
+send_retransmit_frames_cc(Frames, State) ->
+    send_retransmit_frames_cc(Frames, State, normal).
+
+%% Mode `probe' (PTO) is exempt from congestion control per RFC 9002
+%% §7.5. Gating probes on the control allowance deadlocks a full
+%% window: bytes_in_flight sits at or just above cwnd, every PTO probe
+%% is denied, no probe means no ACK, no ACK means loss detection never
+%% runs, and the connection stalls until idle timeout with a full
+%% sent_q. Mode `normal' (loss retransmission) stays subject to cwnd.
+send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = State, Mode) ->
     %% Encode all frames and check size
     Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
     PacketSize = byte_size(Payload) + 50,
 
-    %% Check if CC allows sending this retransmission
-    %% Use can_send_control to allow small overage for retransmissions
-    case quic_cc:can_send_control(CCState, PacketSize) of
+    case retransmit_cc_allowed(Mode, CCState, PacketSize) of
         true ->
             send_app_packet_internal(Payload, Frames, State#state{retransmits = R + 1});
         false ->
@@ -9402,6 +9416,16 @@ send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = 
             ),
             defer_retransmit_frames(Frames, State)
     end.
+
+%% RFC 9002 §7: an endpoint MUST NOT exceed cwnd "unless the packet is
+%% sent on a PTO timer expiration or when entering a recovery period".
+%% A PTO probe is exempt outright; an ordinary loss retransmission
+%% stays bound by the congestion window proper, not by the more
+%% lenient control allowance.
+retransmit_cc_allowed(probe, _CCState, _PacketSize) ->
+    true;
+retransmit_cc_allowed(normal, CCState, PacketSize) ->
+    quic_cc:can_send(CCState, PacketSize).
 
 %% Split CC-deferred lost frames: stream data into FC-exempt retransmit_stream
 %% queue entries (retried by process_send_queue/1), control frames into
@@ -9501,8 +9525,8 @@ handle_pto_timeout(#state{loss_state = LossState} = State) ->
 send_probe_packet(State) ->
     case get_oldest_unacked_frames(State) of
         {ok, Frames} ->
-            %% Retransmit oldest data as probe with CC check
-            send_retransmit_frames_cc(Frames, State);
+            %% Retransmit oldest data as the probe, cwnd-exempt
+            send_retransmit_frames_cc(Frames, State, probe);
         none ->
             %% No data to retransmit, send PING (always allowed as control)
             Payload = quic_frame:encode(ping),
@@ -10739,9 +10763,18 @@ complete_migration(
     NewPMTUState = quic_pmtu:on_path_change(PMTUState),
 
     %% RFC 9002 Section 9.4: Reset congestion controller on path change
-    %% The new path may have different RTT and bandwidth characteristics
-    NewCCState = quic_cc:new(#{}),
-    NewLossState = quic_loss:new(),
+    %% The new path may have different RTT and bandwidth characteristics.
+    %% The loss tracker's sent_q must SURVIVE the switch: replacing it
+    %% orphans every in-flight packet (no ACK match, no loss detection,
+    %% no PTO since bytes_in_flight reads 0) and their data is never
+    %% retransmitted - the peer then stalls on a permanent stream hole.
+    NewLossState = quic_loss:reset_for_new_path(State#state.loss_state),
+    NewCCState0 = quic_cc:new(#{}),
+    NewCCState =
+        case quic_loss:bytes_in_flight(NewLossState) of
+            0 -> NewCCState0;
+            Outstanding -> quic_cc:on_packet_sent(NewCCState0, Outstanding)
+        end,
 
     State#state{
         remote_addr = NewPath#path_state.remote_addr,
@@ -10752,7 +10785,8 @@ complete_migration(
         pmtu_raise_timer = undefined,
         %% Reset CC and loss detection for new path
         cc_state = NewCCState,
-        loss_state = NewLossState
+        loss_state = NewLossState,
+        pto_dirty = true
     };
 complete_migration(_, State) ->
     %% Can only migrate to validated paths
@@ -11387,8 +11421,19 @@ send_pmtu_probe_packet(ProbeSize, Frames, #state{dcid = DCID, pn_app = PNSpace} 
     %% Add extra padding to frame payload
     PaddedFrames = <<EncodedFrames/binary, (binary:copy(<<0>>, ExtraPadding))/binary>>,
 
-    %% Use existing send_app_packet which handles all encryption/tracking
-    send_app_packet(PaddedFrames, State).
+    %% Send with an empty frames list so the probe is tracked as
+    %% non-ack-eliciting locally: it stays in sent_q, which is what the
+    %% PMTU ack/lost hooks fold over, but adds nothing to
+    %% bytes_in_flight, arms no PTO, and is never retransmitted. Losing
+    %% a probe is the expected outcome of probing past the path MTU
+    %% (RFC 8899 §3, RFC 9000 §14.4): it must be decided by quic_pmtu's
+    %% own probe timer, never surface as connection loss. Tracking it
+    %% as in-flight data let a single lost raise-probe hold
+    %% bytes_in_flight above zero with no possible progress, and the
+    %% disconnect timeout then declared the peer dead: every long-lived
+    %% connection on an MTU-limited path died on the first periodic
+    %% re-probe, both ends at once.
+    send_app_packet_internal(PaddedFrames, [], State).
 
 %% @doc Encode PMTU probe frames (PING + PADDING).
 -spec encode_pmtu_frames([term()]) -> binary().
@@ -11431,7 +11476,7 @@ set_pmtu_probe_timer(#state{pmtu_probe_timer = OldTimer, loss_state = LossState}
 -spec maybe_set_pmtu_raise_timer(#state{}) -> #state{}.
 maybe_set_pmtu_raise_timer(#state{pmtu_raise_timer = undefined} = State) ->
     Ref = make_ref(),
-    erlang:send_after(?PMTU_DEFAULT_RAISE_INTERVAL, self(), {pmtu_raise_timeout, Ref}),
+    erlang:send_after(State#state.pmtu_raise_interval, self(), {pmtu_raise_timeout, Ref}),
     State#state{pmtu_raise_timer = Ref};
 maybe_set_pmtu_raise_timer(State) ->
     State.
@@ -11630,6 +11675,21 @@ test_state_for_server(RemoteAddr, Secret, ODCID) ->
 
 -spec test_close_reason(#state{}) -> term().
 test_close_reason(#state{close_reason = R}) -> R.
+
+%% Minimal #state{} carrying a caller-supplied loss tracker, for tests
+%% that need to observe what an incoming frame does to it.
+-spec test_state_with_loss(quic_loss:loss_state()) -> #state{}.
+test_state_with_loss(LossState) ->
+    #state{
+        role = client,
+        app_keys = undefined,
+        loss_state = LossState,
+        cc_state = quic_cc:new(#{})
+    }.
+
+%% Read the loss tracker back out without exposing the record.
+-spec test_loss_state(#state{}) -> quic_loss:loss_state().
+test_loss_state(#state{loss_state = L}) -> L.
 
 %% Test helper for check_send_queue_flow_control/3.
 %% Wraps the internal function to avoid exposing #state{} record.

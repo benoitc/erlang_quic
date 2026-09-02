@@ -29,6 +29,7 @@
 -include("quic.hrl").
 
 -export([
+    reset_for_new_path/1,
     %% Loss detection state
     new/0,
     new/1,
@@ -71,6 +72,7 @@
 % 9/8
 -define(TIME_THRESHOLD, 1.125).
 % 1 millisecond
+-define(MAX_PTO_MS, 5000).
 -define(GRANULARITY, 1).
 % RFC 9002 default is 333ms, but 100ms is more aggressive for faster ramp-up
 -define(DEFAULT_INITIAL_RTT, 100).
@@ -113,6 +115,25 @@
 
 -opaque loss_state() :: #loss_state{}.
 -export_type([loss_state/0]).
+
+%% RFC 9002 §9.4 path-change reset: RTT and PTO state belong to the
+%% old path, but the sent-packet tracking must survive - dropping it
+%% orphans every in-flight packet (no ACK match, no loss declaration,
+%% no PTO since bytes_in_flight reads 0) and any lost data in that set
+%% is never retransmitted.
+-spec reset_for_new_path(loss_state() | undefined) -> loss_state().
+reset_for_new_path(undefined) ->
+    new();
+reset_for_new_path(#loss_state{} = S) ->
+    S#loss_state{
+        latest_rtt = 0,
+        smoothed_rtt = ?DEFAULT_INITIAL_RTT,
+        rtt_var = ?DEFAULT_INITIAL_RTT div 2,
+        min_rtt = infinity,
+        first_rtt_sample = false,
+        pto_count = 0,
+        loss_time = undefined
+    }.
 
 %%====================================================================
 %% Loss Detection State
@@ -239,7 +260,7 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
             {LostList, SurvHeadQ, LostBytes, LargestLostSentTime} =
                 detect_lost_q(
                     KeptList,
-                    NewState1#loss_state.smoothed_rtt,
+                    max(NewState1#loss_state.smoothed_rtt, NewState1#loss_state.latest_rtt),
                     LargestAcked,
                     Now,
                     [],
@@ -329,13 +350,19 @@ maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now) ->
 -spec detect_lost_packets(loss_state(), non_neg_integer()) ->
     {loss_state(), [#sent_packet{}]}.
 detect_lost_packets(
-    #loss_state{sent_q = Q, smoothed_rtt = SRTT} = State,
+    #loss_state{sent_q = Q, smoothed_rtt = SRTT, latest_rtt = LatestRTT} = State,
     LargestAcked
 ) ->
     Now = erlang:monotonic_time(millisecond),
     SentList = queue:to_list(Q),
+    %% RFC 9002 §6.1.2: the time threshold uses max(smoothed_rtt,
+    %% latest_rtt). With the EWMA alone, an RTT spike that outruns it
+    %% (receiver queueing, bufferbloat) mass-declares in-flight packets
+    %% lost while their ACKs are merely late; each spurious loss both
+    %% retransmits data and collapses the congestion window.
+    RTT = max(SRTT, LatestRTT),
     {LostPackets, SurvQ, LostBytes, _LargestLostSentTime} =
-        detect_lost_q(SentList, SRTT, LargestAcked, Now, [], queue:new(), 0, undefined),
+        detect_lost_q(SentList, RTT, LargestAcked, Now, [], queue:new(), 0, undefined),
     NewState = State#loss_state{
         sent_q = SurvQ,
         bytes_in_flight = max(0, State#loss_state.bytes_in_flight - LostBytes)
@@ -381,11 +408,20 @@ detect_lost_q(
                     true -> LostBytes + Size;
                     false -> LostBytes
                 end,
+            %% Only ack-eliciting losses drive the congestion event
+            %% (largest_lost_sent_time feeds on_congestion_event). A lost
+            %% non-ack-eliciting packet, a PMTU probe in particular, is
+            %% not a congestion signal (RFC 9000 §14.4).
             NewLL =
-                case LL of
-                    undefined -> {PN, TS};
-                    {OldPN, _} when PN > OldPN -> {PN, TS};
-                    _ -> LL
+                case AE of
+                    false ->
+                        LL;
+                    true ->
+                        case LL of
+                            undefined -> {PN, TS};
+                            {OldPN, _} when PN > OldPN -> {PN, TS};
+                            _ -> LL
+                        end
                 end,
             detect_lost_q(Rest, SRTT, LargestAcked, Now, [P | LostAcc], SurvQ, NewBytes, NewLL);
         false ->
@@ -408,8 +444,8 @@ largest_lost_ts({_PN, TS}) -> TS.
 %% peek in the common case (head is in_flight).
 -spec get_loss_time_and_space(loss_state()) ->
     {non_neg_integer() | undefined, atom()}.
-get_loss_time_and_space(#loss_state{sent_q = Q, smoothed_rtt = SRTT}) ->
-    LossDelay = max(trunc(?TIME_THRESHOLD * SRTT), ?GRANULARITY),
+get_loss_time_and_space(#loss_state{sent_q = Q, smoothed_rtt = SRTT, latest_rtt = LatestRTT}) ->
+    LossDelay = max(trunc(?TIME_THRESHOLD * max(SRTT, LatestRTT)), ?GRANULARITY),
     case earliest_in_flight_time(queue:to_list(Q)) of
         undefined -> {undefined, initial};
         TimeSent -> {TimeSent + LossDelay, initial}
@@ -498,7 +534,12 @@ get_pto(#loss_state{
 }) ->
     PTO = SRTT + max(4 * RTTVAR, ?GRANULARITY) + MaxAckDelay,
     %% Exponential backoff
-    PTO bsl PTOCount.
+    %% Exponential backoff, capped: uncapped doubling reaches tens of
+    %% seconds after a loss streak, and a probe that arrives after the
+    %% peer's patience is a probe that never happened. Probes are tiny,
+    %% so a bounded worst-case interval costs nothing while keeping
+    %% recovery inside real-world request timeouts.
+    min(PTO bsl PTOCount, ?MAX_PTO_MS).
 
 %% @doc Handle PTO expiration.
 -spec on_pto_expired(loss_state()) -> loss_state().

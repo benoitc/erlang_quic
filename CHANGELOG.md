@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- PTO probe packets are exempt from the congestion window and loss
+  retransmissions are bound to it, per RFC 9002 section 7. A probe is
+  the only thing that can restart a stalled connection, so blocking it
+  on a window the peer's silence keeps closed deadlocks the transfer;
+  ordinary loss retransmissions, which were previously sent regardless,
+  now respect the window like any other send. Contributed by jbevemyr
+  (#249).
+- ACKs arriving at the Initial or Handshake encryption level no longer
+  reach the 1-RTT loss tracker. Packet numbers restart per space
+  (RFC 9000 §12.3), so a Handshake-space ACK of packet numbers 0..N was
+  retiring the first N 1-RTT packets from the sent queue without the peer
+  having received them: nothing retransmitted them and the peer kept a
+  permanent hole in the stream. A path that drops a full window and then
+  returns (WiFi-to-cellular handover, VPN reconnect, NAT rebind) left the
+  transfer stalled for good. Contributed by jbevemyr (#250).
+- The sent-packet tracker now survives an active path migration. It was
+  replaced wholesale, which orphaned every packet already in flight: no
+  ACK matched them, loss detection never ran, and `bytes_in_flight` read
+  zero so no PTO fired either. Their data was never retransmitted and
+  the peer kept a permanent hole in the stream. The path-derived
+  estimates (RTT, PTO count) still reset, since those belong to the old
+  path. Contributed by jbevemyr (#251).
+- The PTO backoff is capped at 5 seconds. RFC 9002 section 6.2.1 doubles
+  the PTO on each consecutive expiration and the doubling had no
+  ceiling, so on a 50 ms path it reached roughly 90 seconds after nine
+  expirations and about twelve minutes after twelve. A probe scheduled
+  that far out never happens: the idle timer and any request deadline
+  above it have long since fired. Contributed by jbevemyr (#254).
+- The loss time threshold is `max(smoothed_rtt, latest_rtt)`
+  (RFC 9002 section 6.1.2) rather than the smoothed estimate alone. When
+  an RTT spike outruns the EWMA the two diverge, and the smaller
+  threshold declares in-flight packets lost while their ACKs are merely
+  late. Each spurious loss both retransmits data the peer already has
+  and collapses the congestion window, so a single latency excursion
+  (receiver queueing, bufferbloat) turned into a throughput collapse.
+  Contributed by jbevemyr (#210).
+- PMTU probes are tracked as non-ack-eliciting, so a probe lost past the path MTU no longer inflates `bytes_in_flight`, arms the PTO machinery, or feeds a congestion event (RFC 8899 §3, RFC 9000 §14.4). Combined with an in-flight-keyed liveness check, the periodic raise probe previously killed every long-lived connection on an MTU-limited path once per 600-second raise interval, both ends at once. The raise interval is configurable as `pmtu_raise_interval`. (#264)
+
 ## [1.8.1] - 2026-08-15
 
 ### Added
