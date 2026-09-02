@@ -144,12 +144,15 @@ build_opts("keyupdate") ->
         force_key_update => true
     };
 build_opts("v2") ->
-    %% Use QUIC v2
+    %% RFC 9368 compatible version negotiation: start in v1 and offer
+    %% v2, so the server switches. Starting directly in v2 fails the
+    %% grader, which requires the client's Initial to be v1.
     #{
         verify => false,
         alpn => [<<"hq-interop">>, <<"h3">>],
-        % QUIC v2
-        version => 16#6b3343cf
+        %% Preference order: v2 first. Some servers (picoquic) honour
+        %% the client's order rather than their own.
+        versions => [16#6b3343cf, 16#00000001]
     };
 build_opts(_) ->
     %% Default options

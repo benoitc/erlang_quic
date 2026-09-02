@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- `versions` lists the QUIC versions a connection will also accept, for
+  RFC 9368 compatible version negotiation. Contributed by jbevemyr (#243).
 - `hibernate_after` (default 5000 ms) hibernates an idle connection
   process, running a fullsweep so the handshake's garbage stops being
   pinned to a heap that never collects on its own. `infinity` opts out.
@@ -19,6 +21,16 @@ All notable changes to this project will be documented in this file.
   Contributed by jbevemyr (#213).
 
 ### Fixed
+- A server answers a long-header packet carrying a version it does not
+  support with a Version Negotiation packet (RFC 9000 section 6.1)
+  instead of silence. Probing with a reserved version is how readiness
+  checks and the interop runner detect a live server. A packet that is
+  itself a Version Negotiation is never answered. Contributed by
+  jbevemyr (#229).
+- QUIC v2 (RFC 9369) uses the correct wire format: version-specific
+  packet-type bits, salts and key labels, and compatible version
+  negotiation settles on the first ClientHello. Contributed by
+  jbevemyr (#243).
 - A client switches away from a connection ID the peer has retired
   (RFC 9000 section 5.1.2) instead of continuing to use it.
   Contributed by jbevemyr (#218).

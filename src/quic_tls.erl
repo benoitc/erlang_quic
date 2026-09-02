@@ -661,6 +661,10 @@ encode_transport_params(Params) ->
 
 encode_transport_param(original_dcid, Value) ->
     encode_tp(?TP_ORIGINAL_DCID, Value);
+encode_transport_param(version_information, {Chosen, Available}) ->
+    %% RFC 9368 §3: Chosen Version followed by Available Versions.
+    Avail = <<<<V:32>> || V <- Available>>,
+    encode_tp(?TP_VERSION_INFORMATION, <<Chosen:32, Avail/binary>>);
 encode_transport_param(max_idle_timeout, Value) ->
     encode_tp(?TP_MAX_IDLE_TIMEOUT, quic_varint:encode(Value));
 encode_transport_param(max_udp_payload_size, Value) ->
@@ -797,12 +801,15 @@ tp_id_to_key(?TP_PREFERRED_ADDRESS) -> preferred_address;
 tp_id_to_key(?TP_ACTIVE_CONNECTION_ID_LIMIT) -> active_connection_id_limit;
 tp_id_to_key(?TP_INITIAL_SCID) -> initial_scid;
 tp_id_to_key(?TP_RETRY_SCID) -> retry_scid;
+tp_id_to_key(?TP_VERSION_INFORMATION) -> version_information;
 tp_id_to_key(?TP_MAX_DATAGRAM_FRAME_SIZE) -> max_datagram_frame_size;
 tp_id_to_key(?TP_RESET_STREAM_AT) -> reset_stream_at;
 tp_id_to_key(Id) -> {unknown, Id}.
 
 decode_tp_value(?TP_ORIGINAL_DCID, Value) ->
     Value;
+decode_tp_value(?TP_VERSION_INFORMATION, <<Chosen:32, Rest/binary>>) ->
+    {Chosen, [V || <<V:32>> <= Rest]};
 decode_tp_value(?TP_STATELESS_RESET_TOKEN, Value) ->
     Value;
 decode_tp_value(?TP_INITIAL_SCID, Value) ->
