@@ -141,6 +141,7 @@
 -export([
     chunk_crypto/3,
     add_to_ack_ranges/2,
+    cap_ack_ranges/1,
     merge_ack_ranges/1,
     convert_ack_ranges_for_encode/1,
     convert_rest_ranges/2,
