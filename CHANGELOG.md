@@ -21,6 +21,13 @@ All notable changes to this project will be documented in this file.
   Contributed by jbevemyr (#213).
 
 ### Fixed
+- A TLS alert raised during the handshake now reaches the peer. The
+  CONNECTION_CLOSE was batched into the state `send_tls_alert/2` returns,
+  which the six immediate-exit sites discarded before calling `exit/1`;
+  `terminate/3` could not recover it, since it runs with the pre-alert
+  state and its fallback close is skipped entirely while app keys do not
+  exist. The peer saw silence and waited out its idle timeout instead of
+  learning why the handshake failed. Reported by obi458 (#227).
 - An HTTP/3 message body ends at stream end rather than at a frame
   boundary, so a response whose last DATA frame is followed by the FIN
   in a separate packet is not truncated. Contributed by jbevemyr (#244).
