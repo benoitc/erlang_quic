@@ -311,6 +311,23 @@
 -define(AEAD_CONFIDENTIALITY_LIMIT, 16#800000).
 
 %% Connection state record
+%% Per-run constants for the bulk chunk-run sender (see
+%% send_stream_chunk_run/8): everything that would otherwise be
+%% re-extracted from #state{} on every packet of the run.
+-record(chunk_run, {
+    stream_id :: non_neg_integer(),
+    max_chunk :: pos_integer(),
+    header_prefix :: binary(),
+    length_varint :: binary(),
+    key_phase :: 0 | 1,
+    cipher :: quic_aead:cipher(),
+    key :: binary(),
+    iv :: binary(),
+    hp :: binary(),
+    dcid :: binary(),
+    now :: integer()
+}).
+
 -record(state, {
     %% Connection identity
     scid :: binary(),
@@ -9276,6 +9293,175 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Wh
             end
     end.
 
+%% Approve up to KMax-1 additional same-size sends against CC/pacing,
+%% consuming pacing tokens exactly as the one-at-a-time path would.
+approve_more_chunks(CC, _Size, _Urgency, _Pacing, KMax, K) when K >= KMax ->
+    {K, CC};
+approve_more_chunks(CC, Size, Urgency, true, KMax, K) ->
+    %% One batched CC/pacing check for the rest of the run instead of
+    %% a send_check per chunk.
+    {KExtra, CC1} = quic_cc:send_check_run(CC, Size, KMax - K, Urgency),
+    {K + KExtra, CC1};
+approve_more_chunks(CC, Size, Urgency, false, KMax, K) ->
+    %% Pacing off: count how many more chunks fit in the window,
+    %% accounting each on a scratch copy so the checks see the chunks
+    %% already approved. The real CC state is updated once for the run.
+    {cwnd_room_chunks(CC, Size, Urgency, KMax, K), CC}.
+
+cwnd_room_chunks(_CC, _Size, _Urgency, KMax, K) when K >= KMax ->
+    K;
+cwnd_room_chunks(CC, Size, Urgency, KMax, K) ->
+    case cwnd_only_check(CC, Size, Urgency) of
+        {ok, _} -> cwnd_room_chunks(quic_cc:on_packet_sent(CC, Size), Size, Urgency, KMax, K + 1);
+        _ -> K
+    end.
+
+%% Send K CC-approved full-size chunks as one run: seal and hand each
+%% wire packet to the socket, then update loss/CC/PN/counters and
+%% rebuild #state{} ONCE for the whole run instead of once per packet.
+send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, K) ->
+    {chunked_ctx, MaxChunkSize, _Urgency, _PacketSize, HeaderPrefix, LengthVarint, _Where} = Ctx,
+    %% A packet still pending from send coalescing goes out first so
+    %% the wire order matches the send order.
+    State = flush_pending_packet(State0),
+    #state{
+        dcid = DCID,
+        app_keys = {ClientKeys, ServerKeys},
+        role = Role,
+        pn_app = PNSpace,
+        loss_state = LossState,
+        cc_state = CCState,
+        socket_state = SocketState
+    } = State,
+    EncryptKeys =
+        case Role of
+            client -> ClientKeys;
+            server -> ServerKeys
+        end,
+    #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
+    Now = erlang:monotonic_time(millisecond),
+    Run = #chunk_run{
+        stream_id = StreamId,
+        max_chunk = MaxChunkSize,
+        header_prefix = HeaderPrefix,
+        length_varint = LengthVarint,
+        key_phase = get_current_key_phase(State),
+        cipher = Cipher,
+        key = Key,
+        iv = IV,
+        hp = HP,
+        dcid = DCID,
+        now = Now
+    },
+    {SS1, TrackedRev, Offset1, Rest} =
+        chunk_run_loop(K, Offset, Data, State, Run, SocketState, [], 0),
+    %% One loss-tracker and one CC update for the run's successful sends.
+    {Loss1, CC1} =
+        case TrackedRev of
+            [] ->
+                {LossState, CCState};
+            _ ->
+                Tracked = lists:reverse(TrackedRev),
+                {
+                    quic_loss:on_packets_sent_run(LossState, Tracked, Now),
+                    quic_cc:on_packets_sent(CCState, [Sz || {_, Sz, _} <- Tracked])
+                }
+        end,
+    PN0 = PNSpace#pn_space.next_pn,
+    %% RFC 9000 §10.1: the idle timer restarts on the first ack-eliciting
+    %% send since the last receive (see send_app_packet_now/3).
+    RestartIdle = not State#state.ack_eliciting_since_recv,
+    State1 = State#state{
+        pn_app = PNSpace#pn_space{next_pn = PN0 + K},
+        loss_state = Loss1,
+        cc_state = CC1,
+        socket_state = SS1,
+        packets_sent = State#state.packets_sent + K,
+        burst_sent = State#state.burst_sent + K,
+        last_activity =
+            case RestartIdle of
+                true -> Now;
+                false -> State#state.last_activity
+            end,
+        ack_eliciting_since_recv = true,
+        pto_dirty = true
+    },
+    State2 = maybe_force_key_update(State1, K),
+    send_stream_chunked_loop(
+        StreamId, Offset1, Rest, Fin, State2, BytesSentSoFar + K * MaxChunkSize, Ctx
+    ).
+
+%% Per-chunk inner loop: seal and send only; the socket state is
+%% threaded explicitly so no #state{} copy happens per packet, and the
+%% successful sends are collected as [{PN, Size, Frame}] (reversed)
+%% for one batched loss/CC update afterwards. Chunk I takes packet
+%% number next_pn + I; the caller advances next_pn by K. A failed send
+%% skips that packet's tracking exactly as send_app_packet_now/3 does
+%% (PTO owns retransmission).
+chunk_run_loop(0, Offset, Data, _State, _Run, SS, Tracked, _I) ->
+    {SS, Tracked, Offset, Data};
+chunk_run_loop(K, Offset, Data, State, Run, SS, Tracked, I) ->
+    #chunk_run{
+        stream_id = StreamId,
+        max_chunk = MaxChunkSize,
+        header_prefix = HeaderPrefix,
+        length_varint = LengthVarint,
+        key_phase = KeyPhase,
+        cipher = Cipher,
+        key = Key,
+        iv = IV,
+        hp = HP,
+        dcid = DCID
+    } = Run,
+    <<Chunk:MaxChunkSize/binary, Rest/binary>> = Data,
+    Frame = {stream, StreamId, Offset, Chunk, false},
+    Payload = build_chunk_iodata(HeaderPrefix, Offset, LengthVarint, Chunk, Frame),
+    PN = (State#state.pn_app)#pn_space.next_pn + I,
+    FirstByte = short_header_first_byte(KeyPhase, quic_packet:pn_length(PN), State),
+    Packet = quic_aead:protect_short_packet(Cipher, Key, IV, HP, PN, FirstByte, DCID, Payload),
+    PacketSize = byte_size(Packet),
+    #state{remote_addr = {IP, Port}} = State,
+    SendResult =
+        case SS of
+            undefined ->
+                case gen_udp:send(State#state.socket, IP, Port, Packet) of
+                    ok -> {ok, undefined};
+                    {error, _} = E -> E
+                end;
+            _ ->
+                quic_socket:send(SS, IP, Port, Packet)
+        end,
+    case SendResult of
+        {ok, SS1} ->
+            ?QLOG_EMIT_PACKET_SENT(State#state.qlog_ctx, #{
+                packet_type => one_rtt,
+                packet_number => PN,
+                length => PacketSize,
+                frames => [Frame]
+            }),
+            SS2 =
+                case SS1 of
+                    undefined -> SS;
+                    _ -> SS1
+                end,
+            Tracked1 = [{PN, PacketSize, Frame} | Tracked],
+            chunk_run_loop(K - 1, Offset + MaxChunkSize, Rest, State, Run, SS2, Tracked1, I + 1);
+        {error, Reason, SSCleared} ->
+            ?LOG_WARNING(
+                #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
+                ?QUIC_LOG_META
+            ),
+            chunk_run_loop(
+                K - 1, Offset + MaxChunkSize, Rest, State, Run, SSCleared, Tracked, I + 1
+            );
+        {error, Reason} ->
+            ?LOG_WARNING(
+                #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
+                ?QUIC_LOG_META
+            ),
+            chunk_run_loop(K - 1, Offset + MaxChunkSize, Rest, State, Run, SS, Tracked, I + 1)
+    end.
+
 %% Build the iodata payload `[Header, Chunk]' for a chunked stream
 %% send, reusing the pre-computed header pieces when `Offset > 0'.
 %% On the `Offset =:= 0' first-chunk path the wire format needs a
@@ -9357,7 +9543,7 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
     end.
 
 send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
-    {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint, Where} = Ctx,
+    {chunked_ctx, MaxChunkSize, Urgency, PacketSize, _HeaderPrefix, _LengthVarint, Where} = Ctx,
     #state{cc_state = CCState, pacing_enabled = PacingEnabled} = State,
     Check =
         case PacingEnabled of
@@ -9366,20 +9552,19 @@ send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSen
         end,
     case Check of
         {ok, NewCCState} ->
-            State0 = State#state{cc_state = NewCCState},
-            <<Chunk:MaxChunkSize/binary, Rest/binary>> = Data,
-            Frame = {stream, StreamId, Offset, Chunk, false},
-            Payload = build_chunk_iodata(HeaderPrefix, Offset, LengthVarint, Chunk, Frame),
-            State1 = send_app_packet_internal(Payload, [Frame], State0),
-            send_stream_chunked_loop(
-                StreamId,
-                Offset + MaxChunkSize,
-                Rest,
-                Fin,
-                State1,
-                BytesSentSoFar + MaxChunkSize,
-                Ctx
-            );
+            %% First chunk approved. Approve as many further full
+            %% chunks as CC/pacing and the burst budget allow, then
+            %% send the whole run with one bookkeeping pass: the
+            %% per-packet #state{} rebuild in send_app_packet_now is
+            %% the largest own-time item on the bulk-send profile.
+            FullChunks = byte_size(Data) div MaxChunkSize,
+            BudgetLeft = max(1, State#state.burst_budget - State#state.burst_sent),
+            KMax = min(FullChunks, BudgetLeft),
+            {K, CCStateK} = approve_more_chunks(
+                NewCCState, PacketSize, Urgency, PacingEnabled, KMax, 1
+            ),
+            State0 = State#state{cc_state = CCStateK},
+            send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, K);
         {blocked_pacing, Delay} ->
             ?LOG_DEBUG(
                 #{
@@ -11167,10 +11352,14 @@ normalize_alpn_list(_) ->
 %% and force a key update before it is reached (RFC 9001 §6.6). Only the
 %% first over-limit packet in an idle phase triggers the update; the
 %% counter resets when the new phase begins.
-maybe_force_key_update(#state{key_state = undefined} = State) ->
+maybe_force_key_update(State) ->
+    maybe_force_key_update(State, 1).
+
+%% N packets at once, for the chunk-run sender.
+maybe_force_key_update(#state{key_state = undefined} = State, _N) ->
     State;
-maybe_force_key_update(#state{key_state = KeyState} = State) ->
-    NewCount = KeyState#key_update_state.send_count + 1,
+maybe_force_key_update(#state{key_state = KeyState} = State, N) ->
+    NewCount = KeyState#key_update_state.send_count + N,
     State1 = State#state{key_state = KeyState#key_update_state{send_count = NewCount}},
     case
         NewCount >= ?AEAD_CONFIDENTIALITY_LIMIT andalso

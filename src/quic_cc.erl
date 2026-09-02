@@ -66,6 +66,8 @@
     get_pacing_tokens/2,
     pacing_delay/2,
     send_check/3,
+    send_check_run/4,
+    on_packets_sent/2,
     max_datagram_size/1,
     min_recovery_duration/1,
     ecn_ce_counter/1
@@ -332,6 +334,35 @@ send_check(#cc_wrapper{algorithm = Mod, state = State} = W, Size, Urgency) ->
         {ok, NewState} -> {ok, W#cc_wrapper{state = NewState}};
         Other -> Other
     end.
+
+%% @doc Batched send_check: approve up to MaxK packets of Size in one
+%% pass. Native for newreno; other algorithms fold send_check/3 with
+%% identical results.
+-spec send_check_run(cc_state(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
+    {non_neg_integer(), cc_state()}.
+send_check_run(
+    #cc_wrapper{algorithm = quic_cc_newreno, state = State} = W, Size, MaxK, Urgency
+) ->
+    {K, NewState} = quic_cc_newreno:send_check_run(State, Size, MaxK, Urgency),
+    {K, W#cc_wrapper{state = NewState}};
+send_check_run(W, Size, MaxK, Urgency) ->
+    send_check_run_iter(W, Size, MaxK, Urgency, 0).
+
+send_check_run_iter(W, _Size, MaxK, _Urgency, K) when K >= MaxK ->
+    {K, W};
+send_check_run_iter(W, Size, MaxK, Urgency, K) ->
+    case send_check(W, Size, Urgency) of
+        {ok, W1} -> send_check_run_iter(W1, Size, MaxK, Urgency, K + 1);
+        _ -> {K, W}
+    end.
+
+%% @doc Batched on_packet_sent for a run: one update for newreno, a
+%% fold for other algorithms.
+-spec on_packets_sent(cc_state(), [non_neg_integer()]) -> cc_state().
+on_packets_sent(#cc_wrapper{algorithm = quic_cc_newreno, state = State} = W, Sizes) ->
+    W#cc_wrapper{state = quic_cc_newreno:on_packets_sent(State, Sizes)};
+on_packets_sent(W, Sizes) ->
+    lists:foldl(fun(Size, Acc) -> on_packet_sent(Acc, Size) end, W, Sizes).
 
 %% @doc Get the current max datagram size.
 -spec max_datagram_size(cc_state()) -> pos_integer().

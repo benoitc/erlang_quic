@@ -14,6 +14,14 @@ All notable changes to this project will be documented in this file.
   message-boundary guarantee, but owners that decode each delivery as
   one complete application message break when deliveries merge, so it
   is opt-in.
+- Bulk stream sends go out as runs: once the first full-size chunk is
+  approved, as many further chunks as congestion control, pacing and
+  the burst budget allow are approved up front (consuming pacing
+  tokens exactly as one-at-a-time sends would), sealed and handed to
+  the socket in one loop, and loss, congestion, packet-number and
+  counter bookkeeping is updated once for the run. The per-packet
+  connection-state rebuild was the largest own-time item on the
+  bulk-send profile; a 64-packet run replaces 64 copies with one.
 
 ### Fixed
 - Pacing no longer freezes on sub-millisecond links. RTT samples are
