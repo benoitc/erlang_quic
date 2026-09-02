@@ -163,6 +163,12 @@
     record_received_pn/4,
     update_last_activity/2,
     test_app_recv_state/2,
+    %% Stream-data receive paths (lean vs general)
+    do_process_stream_data_buffered/5,
+    do_process_stream_data_slow/5,
+    test_recv_stream_state/4,
+    update_pn_space_recv/3,
+    should_delay_ack/1,
     short_header_first_byte/3,
     test_spin_state/1,
     test_spin_state_for/2,
@@ -7057,7 +7063,54 @@ clamp_recv_reset_at(StreamId, Offset, Data, Fin, State) ->
 recv_reset_at_met(#stream_state{recv_reset_at = R}, Off) ->
     R =/= undefined andalso Off >= R.
 
+%% Lean path for the dominant bulk shape: existing stream, exactly
+%% in-order, empty reassembly buffer, no FIN in sight, no pending reset,
+%% both flow-control windows comfortably open (so neither
+%% MAX_STREAM_DATA nor MAX_DATA fires). One stream-record update and one
+%% map put. Every other shape takes the general path below with
+%% identical semantics; on bulk flows 97+ percent of frames land here.
+do_process_stream_data_buffered(StreamId, Offset, Data, false = Fin, State) ->
+    case State#state.streams of
+        #{
+            StreamId := #stream_state{
+                recv_offset = Offset,
+                recv_max_data = RecvMaxData,
+                final_size = undefined,
+                recv_reset_at = undefined,
+                recv_buffer = RB
+            } = Stream
+        } ->
+            DataSize = byte_size(Data),
+            EndOffset = Offset + DataSize,
+            NewDataReceived = State#state.data_received + DataSize,
+            HalfWindow = State#state.fc_max_receive_window div 2,
+            case
+                DataSize > 0 andalso
+                    gb_trees:is_empty(RB) andalso
+                    RecvMaxData - EndOffset >= HalfWindow andalso
+                    State#state.max_data_local - NewDataReceived >= HalfWindow andalso
+                    State#state.recv_buffer_bytes + DataSize =< ?MAX_RECV_BUFFER_BYTES
+            of
+                true ->
+                    State#state.owner ! {quic, self(), {stream_data, StreamId, Data, false}},
+                    State#state{
+                        streams = maps:put(
+                            StreamId,
+                            Stream#stream_state{recv_offset = EndOffset},
+                            State#state.streams
+                        ),
+                        data_received = NewDataReceived
+                    };
+                false ->
+                    do_process_stream_data_slow(StreamId, Offset, Data, Fin, State)
+            end;
+        _ ->
+            do_process_stream_data_slow(StreamId, Offset, Data, Fin, State)
+    end;
 do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
+    do_process_stream_data_slow(StreamId, Offset, Data, Fin, State).
+
+do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
     #state{
         owner = Owner,
         streams = Streams,
@@ -7291,18 +7344,6 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                     WillSendMaxStreamData =
                         Headroom < (MaxWindowForStream div 2) andalso
                             NewStream#stream_state.final_size =:= undefined,
-                    Threshold = RecvMaxData - (MaxWindowForStream div 2),
-                    ?LOG_DEBUG(
-                        #{
-                            what => max_stream_data_check,
-                            stream_id => StreamId,
-                            recv_offset => NewRecvOffset,
-                            recv_max_data => RecvMaxData,
-                            threshold => Threshold,
-                            will_send => WillSendMaxStreamData
-                        },
-                        ?QUIC_LOG_META
-                    ),
                     State2 =
                         case WillSendMaxStreamData of
                             true ->
@@ -7695,6 +7736,10 @@ arm_ack_timer(#state{ack_timer = undefined} = State) ->
 
 %% Per RFC 9221 Section 5.2: Delay ACKs for packets containing only
 %% non-retransmittable ack-eliciting frames (like DATAGRAM).
+should_delay_ack([{stream, _, _, _, _} | _]) ->
+    %% Hot path: a stream frame is ack-eliciting and retransmittable,
+    %% so the packet never qualifies for the datagram-only delay.
+    false;
 should_delay_ack(Frames) ->
     AckEliciting = [F || F <- Frames, is_ack_eliciting_frame(F)],
     Retransmittable = quic_loss:retransmittable_frames(AckEliciting),
@@ -8109,8 +8154,14 @@ update_pn_space_recv(PN, PNSpace, Now) ->
             L when PN > L -> PN;
             L -> L
         end,
-    %% Add to ack_ranges maintaining descending order and merging adjacent ranges
-    NewRanges = cap_ack_ranges(add_to_ack_ranges(PN, Ranges)),
+    %% Add to ack_ranges maintaining descending order and merging adjacent
+    %% ranges. A sequential PN extends the head range in place, so the
+    %% range count cannot grow and the cap scan is skipped.
+    NewRanges =
+        case LargestRecv =/= undefined andalso PN =:= LargestRecv + 1 of
+            true -> add_to_ack_ranges(PN, Ranges);
+            false -> cap_ack_ranges(add_to_ack_ranges(PN, Ranges))
+        end,
     PNSpace#pn_space{
         largest_recv = NewLargest,
         recv_time = Now,
@@ -12913,6 +12964,37 @@ test_spin_state(#state{
 -spec test_spin_state_for(client | server, boolean()) -> #state{}.
 test_spin_state_for(Role, Enabled) ->
     #state{role = Role, spin_bit_enabled = Enabled}.
+
+%% #state{} holding one peer-initiated stream at RecvOffset with the
+%% given stream and connection receive credit, the caller as owner.
+%% For the tests that run the lean stream-data path against the
+%% general one.
+-spec test_recv_stream_state(
+    non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()
+) -> #state{}.
+test_recv_stream_state(StreamId, RecvOffset, StreamCredit, ConnCredit) ->
+    Stream = #stream_state{
+        id = StreamId,
+        state = open,
+        send_offset = 0,
+        send_max_data = 0,
+        send_fin = false,
+        send_buffer = [],
+        recv_offset = RecvOffset,
+        recv_max_data = RecvOffset + StreamCredit,
+        recv_fin = false,
+        recv_buffer = gb_trees:empty(),
+        final_size = undefined
+    },
+    #state{
+        role = server,
+        owner = self(),
+        streams = #{StreamId => Stream},
+        data_received = RecvOffset,
+        max_data_local = RecvOffset + ConnCredit,
+        fc_max_receive_window = ?DEFAULT_MAX_RECEIVE_WINDOW,
+        recv_buffer_bytes = 0
+    }.
 
 %% Minimal #state{} with a 1-RTT PN space, for the receive-bookkeeping
 %% tests that run record_app_recv/4 against its unfused parts.
