@@ -21,6 +21,9 @@ All notable changes to this project will be documented in this file.
   Contributed by jbevemyr (#213).
 
 ### Fixed
+- An HTTP/3 message body ends at stream end rather than at a frame
+  boundary, so a response whose last DATA frame is followed by the FIN
+  in a separate packet is not truncated. Contributed by jbevemyr (#244).
 - A server answers a long-header packet carrying a version it does not
   support with a Version Negotiation packet (RFC 9000 section 6.1)
   instead of silence. Probing with a reserved version is how readiness
@@ -165,6 +168,10 @@ All notable changes to this project will be documented in this file.
 - A server handshake flight lost on the wire is retransmitted on the client-Initial backoff schedule until the client's Finished arrives. Initial/Handshake packets are not loss-tracked, so a lost flight previously wedged the handshake permanently: the client's Initial retransmits only elicited ACKs once the server TLS state had advanced. (#263)
 
 ### Changed
+- The interop runner speaks real HTTP/3 in the http3 case, serves more
+  than one request per connection, issues requests concurrently within
+  the peer's stream credit, and its resumption and 0-RTT cases test what
+  they claim. Contributed by jbevemyr (#245).
 - A mixed-size send batch on a GSO socket is split into runs of
   equal-sized packets and each run sent with one UDP_SEGMENT call,
   instead of falling back to one `sendmsg' per packet. A single

@@ -20,6 +20,7 @@
 
 %% Suppress dialyzer warnings for escript functions that call halt()
 -dialyzer({no_return, [main/1, run_test/3]}).
+-dialyzer({nowarn_function, [run_http3_test/2]}).
 -dialyzer({nowarn_function, [run_resumption_test/2, run_zerortt_test/2, run_migration_test/2]}).
 
 -define(EXIT_SUCCESS, 0).
@@ -37,19 +38,25 @@
     "v2",
     "resumption",
     "zerortt",
-    "connectionmigration"
+    "connectionmigration",
+    "http3"
 ]).
 
 %% Include for session_ticket record
 -include("quic.hrl").
 
 %% Ticket file location (for resumption/0-RTT tests)
--define(TICKET_FILE, "/downloads/session_ticket.dat").
+%% NOT under /downloads: the runner diffs that directory against the
+%% requested files and fails the test on anything unexpected in it.
+-define(TICKET_FILE, "/tmp/session_ticket.dat").
 
 main(_Args) ->
-    %% Start required applications
+    %% Start required applications. The h3 path needs the quic app's
+    %% supervision (connection registry etc.); the hq path merely
+    %% tolerates its absence.
     application:ensure_all_started(crypto),
     application:ensure_all_started(ssl),
+    application:ensure_all_started(quic),
 
     %% Get environment variables
     TestCase = os:getenv("TESTCASE", "handshake"),
@@ -70,6 +77,8 @@ main(_Args) ->
             run_test(TestCase, RequestsStr, DownloadsDir)
     end.
 
+run_test("http3", RequestsStr, DownloadsDir) ->
+    run_http3_test(RequestsStr, DownloadsDir);
 run_test("resumption", RequestsStr, DownloadsDir) ->
     %% Resumption test: two connections, second uses session ticket
     run_resumption_test(RequestsStr, DownloadsDir);
@@ -88,10 +97,11 @@ run_test(TestCase, RequestsStr, DownloadsDir) ->
             io:format("No requests specified~n"),
             halt(?EXIT_FAILURE);
         _ ->
-            Results = lists:map(
-                fun(Url) -> download_file(TestCase, Url, DownloadsDir) end,
-                Requests
-            ),
+            %% The runner asks for several files and requires them on ONE
+            %% connection: the transfer test counts handshakes and fails on
+            %% more than one, and multiplexing expects concurrent streams.
+            %% Connect once per host and reuse it for every path.
+            Results = download_all(TestCase, Requests, DownloadsDir),
 
             case lists:all(fun(R) -> R =:= ok end, Results) of
                 true ->
@@ -103,29 +113,92 @@ run_test(TestCase, RequestsStr, DownloadsDir) ->
             end
     end.
 
-download_file(TestCase, Url, DownloadsDir) ->
-    io:format("Downloading: ~s~n", [Url]),
+download_all(TestCase, Requests, DownloadsDir) ->
+    ByHost = lists:foldl(
+        fun(Url, Acc) ->
+            case parse_url(Url) of
+                {ok, Host, Port, Path} ->
+                    maps:update_with(
+                        {Host, Port}, fun(Ps) -> Ps ++ [Path] end, [Path], Acc
+                    );
+                error ->
+                    io:format("Invalid URL: ~s~n", [Url]),
+                    Acc
+            end
+        end,
+        #{},
+        Requests
+    ),
+    lists:append(
+        maps:fold(
+            fun({Host, Port}, Paths, Acc) ->
+                [download_from(TestCase, Host, Port, Paths, DownloadsDir) | Acc]
+            end,
+            [],
+            ByHost
+        )
+    ).
 
-    %% Parse URL
-    case parse_url(Url) of
-        {ok, Host, Port, Path} ->
-            %% Build connection options based on test case
-            Opts = build_opts(TestCase),
-
-            %% Connect
-            case quic:connect(Host, Port, Opts, self()) of
-                {ok, Conn} ->
-                    Result = wait_for_connection_and_download(
-                        Conn, Path, DownloadsDir, TestCase
-                    ),
+download_from(TestCase, Host, Port, Paths, DownloadsDir) ->
+    Opts = build_opts(TestCase),
+    case quic:connect(Host, Port, Opts, self()) of
+        {ok, Conn} ->
+            case wait_connected(Conn, TestCase) of
+                ok ->
+                    %% Open every stream and send every request before
+                    %% collecting any of them. The multiplexing test wants the
+                    %% streams in flight at the same time; issuing them one
+                    %% after another looks like a series of single-stream
+                    %% transfers no matter how many files are requested.
+                    io:format("Requesting ~p file(s)~n", [length(Paths)]),
+                    Results = collect_streams(Conn, Paths, DownloadsDir),
                     quic:close(Conn, normal),
-                    Result;
-                {error, Reason} ->
-                    io:format("Connection failed: ~p~n", [Reason]),
-                    error
+                    Results;
+                error ->
+                    quic:close(Conn, normal),
+                    [error || _ <- Paths]
             end;
-        error ->
-            io:format("Invalid URL: ~s~n", [Url]),
+        {error, Reason} ->
+            io:format("Connection failed: ~p~n", [Reason]),
+            [error || _ <- Paths]
+    end.
+
+wait_connected(Conn, TestCase) ->
+    receive
+        {quic, Conn, {connected, _Info}} ->
+            io:format("Connected~n"),
+            case TestCase of
+                "keyupdate" -> quic_connection:key_update(Conn);
+                _ -> ok
+            end,
+            ok;
+        {quic, Conn, {closed, Reason}} ->
+            io:format("Connection closed: ~p~n", [Reason]),
+            error;
+        {quic, Conn, {transport_error, Code, Msg}} ->
+            io:format("Transport error: ~p ~p~n", [Code, Msg]),
+            error
+    after 30000 ->
+        io:format("Connection timeout~n"),
+        error
+    end.
+
+%% Kept for the resumption/zerortt paths, which connect per attempt by
+%% design: one connection, one request.
+wait_for_connection_and_download(Conn, Path, DownloadsDir, TestCase) ->
+    case wait_connected(Conn, TestCase) of
+        ok -> request_path(Conn, Path, DownloadsDir);
+        error -> error
+    end.
+
+request_path(Conn, Path, DownloadsDir) ->
+    case quic:open_stream(Conn) of
+        {ok, StreamId} ->
+            Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
+            ok = quic:send_data(Conn, StreamId, Request, true),
+            receive_and_save(Conn, StreamId, Path, DownloadsDir);
+        {error, StreamErr} ->
+            io:format("Failed to open stream: ~p~n", [StreamErr]),
             error
     end.
 
@@ -161,41 +234,122 @@ build_opts(_) ->
         alpn => [<<"hq-interop">>, <<"h3">>]
     }.
 
-wait_for_connection_and_download(Conn, Path, DownloadsDir, TestCase) ->
-    receive
-        {quic, Conn, {connected, _Info}} ->
-            io:format("Connected~n"),
+%% Keep as many streams in flight as the peer's stream credit allows and
+%% refill as they finish. The multiplexing test asks for close to 2000
+%% files while the default bidi stream limit is 100, so opening them all
+%% up front fails all but the first hundred; the peer extends credit with
+%% MAX_STREAMS only as earlier streams close.
+collect_streams(Conn, Paths, DownloadsDir) ->
+    {Open, Pending} = fill_streams(Conn, Paths, #{}, DownloadsDir),
+    Deadline = erlang:monotonic_time(millisecond) + 180000,
+    {Done, PendingLeft} = collect_loop(Conn, Open, Pending, DownloadsDir, #{}, Deadline),
+    case PendingLeft of
+        [] -> ok;
+        _ -> io:format("~p request(s) never got a stream~n", [length(PendingLeft)])
+    end,
+    [Result || {_StreamId, Result} <- maps:to_list(Done)] ++
+        [error || _ <- PendingLeft].
 
-            %% Handle key update test case
-            case TestCase of
-                "keyupdate" ->
-                    %% Initiate key update before request
-                    quic_connection:key_update(Conn);
-                _ ->
-                    ok
-            end,
-
-            %% Open stream and send request
-            case quic:open_stream(Conn) of
-                {ok, StreamId} ->
-                    %% Send HTTP/0.9 style request (for hq-interop)
-                    Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
-                    ok = quic:send_data(Conn, StreamId, Request, true),
-                    receive_and_save(Conn, StreamId, Path, DownloadsDir);
-                {error, StreamErr} ->
-                    io:format("Failed to open stream: ~p~n", [StreamErr]),
-                    error
+fill_streams(_Conn, [], Open, _DownloadsDir) ->
+    {Open, []};
+fill_streams(Conn, [Path | Rest] = Pending, Open, DownloadsDir) ->
+    case quic:open_stream(Conn) of
+        {ok, StreamId} ->
+            Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
+            case quic:send_data(Conn, StreamId, Request, true) of
+                ok ->
+                    fill_streams(
+                        Conn,
+                        Rest,
+                        Open#{StreamId => open_target(Path, DownloadsDir)},
+                        DownloadsDir
+                    );
+                _Err ->
+                    {Open, Pending}
             end;
-        {quic, Conn, {closed, Reason}} ->
-            io:format("Connection closed: ~p~n", [Reason]),
-            error;
-        {quic, Conn, {transport_error, Code, Msg}} ->
-            io:format("Transport error: ~p ~p~n", [Code, Msg]),
-            error
-    after 30000 ->
-        io:format("Connection timeout~n"),
-        error
+        {error, _} ->
+            %% Out of stream credit for now; the rest wait for MAX_STREAMS.
+            {Open, Pending}
     end.
+
+open_target(Path, DownloadsDir) ->
+    FilePath = filename:join(DownloadsDir, filename:basename(Path)),
+    case file:open(FilePath, [write, binary, raw]) of
+        {ok, Handle} -> {Handle, FilePath, 0};
+        {error, Err} -> {error, FilePath, Err}
+    end.
+
+collect_loop(_Conn, Open, [], _DownloadsDir, Done, _Deadline) when map_size(Open) =:= 0 ->
+    {Done, []};
+collect_loop(Conn, Open, Pending, DownloadsDir, Done, Deadline) ->
+    TimeLeft = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    %% With requests waiting for stream credit, poll: MAX_STREAMS
+    %% arriving at the connection process produces no message here, so
+    %% waiting only for stream events deadlocks when the last grant
+    %% lands after the last completion event has been handled.
+    Timeout =
+        case Pending of
+            [] -> TimeLeft;
+            _ -> min(200, TimeLeft)
+        end,
+    receive
+        {quic, Conn, {stream_data, Sid, Data, Fin}} ->
+            case maps:find(Sid, Open) of
+                {ok, {Handle, FilePath, Written}} ->
+                    ok = file:write(Handle, Data),
+                    NewWritten = Written + byte_size(Data),
+                    case Fin of
+                        true ->
+                            file:close(Handle),
+                            io:format("Saved: ~s (~p bytes)~n", [FilePath, NewWritten]),
+                            {Open2, Pending2} = fill_streams(
+                                Conn, Pending, maps:remove(Sid, Open), DownloadsDir
+                            ),
+                            collect_loop(
+                                Conn, Open2, Pending2, DownloadsDir, Done#{Sid => ok}, Deadline
+                            );
+                        false ->
+                            collect_loop(
+                                Conn,
+                                Open#{Sid => {Handle, FilePath, NewWritten}},
+                                Pending,
+                                DownloadsDir,
+                                Done,
+                                Deadline
+                            )
+                    end;
+                error ->
+                    collect_loop(Conn, Open, Pending, DownloadsDir, Done, Deadline)
+            end;
+        {quic, Conn, {stream_reset, Sid, _Code}} ->
+            {Open2, Pending2} = fill_streams(Conn, Pending, maps:remove(Sid, Open), DownloadsDir),
+            collect_loop(Conn, Open2, Pending2, DownloadsDir, Done#{Sid => error}, Deadline);
+        {quic, Conn, {closed, _Reason}} ->
+            {close_remaining(Open, Done), Pending}
+    after Timeout ->
+        case TimeLeft > 0 andalso Pending =/= [] of
+            true ->
+                {Open2, Pending2} = fill_streams(Conn, Pending, Open, DownloadsDir),
+                collect_loop(Conn, Open2, Pending2, DownloadsDir, Done, Deadline);
+            false ->
+                io:format("Stream timeout with ~p stream(s) outstanding~n", [map_size(Open)]),
+                {close_remaining(Open, Done), Pending}
+        end
+    end.
+
+close_remaining(Open, Done) ->
+    maps:fold(
+        fun
+            (Sid, {Handle, FilePath, _}, Acc) when is_pid(Handle) orelse is_tuple(Handle) ->
+                file:close(Handle),
+                file:delete(FilePath),
+                Acc#{Sid => error};
+            (Sid, _, Acc) ->
+                Acc#{Sid => error}
+        end,
+        Done,
+        Open
+    ).
 
 receive_and_save(Conn, StreamId, Path, DownloadsDir) ->
     %% Extract filename and open file for streaming writes
@@ -287,9 +441,18 @@ run_resumption_test(RequestsStr, DownloadsDir) ->
         [] ->
             io:format("No requests specified~n"),
             halt(?EXIT_FAILURE);
-        [Url | _Rest] ->
+        [Url | Rest] ->
             case parse_url(Url) of
                 {ok, Host, Port, Path} ->
+                    %% The runner hands us two files: the first is fetched on
+                    %% the fresh connection, the second on the resumed one.
+                    %% Fetching the same file twice leaves the second file
+                    %% missing and fails the test even when resumption works.
+                    Path2 =
+                        case [P || U <- Rest, {ok, _, _, P} <- [parse_url(U)]] of
+                            [Second | _] -> Second;
+                            [] -> Path
+                        end,
                     %% Phase 1: Initial connection to get ticket
                     io:format("~n=== Phase 1: Initial connection to get ticket ===~n"),
                     case resumption_phase1(Host, Port, Path, DownloadsDir) of
@@ -300,7 +463,7 @@ run_resumption_test(RequestsStr, DownloadsDir) ->
 
                             %% Phase 2: Resumption with ticket
                             io:format("~n=== Phase 2: Resumption with ticket ===~n"),
-                            case resumption_phase2(Host, Port, Path, DownloadsDir, Ticket) of
+                            case resumption_phase2(Host, Port, Path2, DownloadsDir, Ticket) of
                                 ok ->
                                     io:format("Resumption test successful~n"),
                                     halt(?EXIT_SUCCESS);
@@ -344,7 +507,9 @@ wait_for_ticket_and_download(Conn, Path, DownloadsDir) ->
                     Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
                     ok = quic:send_data(Conn, StreamId, Request, true),
                     %% Download and wait for ticket
-                    download_and_wait_for_ticket(Conn, StreamId, Path, DownloadsDir, undefined);
+                    download_and_wait_for_ticket(
+                        Conn, StreamId, Path, DownloadsDir, undefined, []
+                    );
                 {error, Err} ->
                     io:format("Failed to open stream: ~p~n", [Err]),
                     error
@@ -358,16 +523,18 @@ wait_for_ticket_and_download(Conn, Path, DownloadsDir) ->
     end.
 
 %% Download file and wait for session ticket
-download_and_wait_for_ticket(Conn, StreamId, Path, DownloadsDir, Ticket) ->
+download_and_wait_for_ticket(Conn, StreamId, Path, DownloadsDir, Ticket, Acc) ->
     receive
         {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
-            %% Accumulate data (could use streaming, but for resumption test this is fine)
+            %% Every chunk counts: writing only the final one truncated the
+            %% file to the last STREAM frame and failed the size check.
+            Acc1 = [Acc | Data],
             case Fin of
                 true ->
                     %% Save the file
                     Filename = filename:basename(Path),
                     FilePath = filename:join(DownloadsDir, Filename),
-                    file:write_file(FilePath, Data),
+                    file:write_file(FilePath, Acc1),
                     io:format("Phase 1: Downloaded ~s~n", [FilePath]),
                     %% Continue waiting for ticket if we don't have one yet
                     case Ticket of
@@ -375,11 +542,11 @@ download_and_wait_for_ticket(Conn, StreamId, Path, DownloadsDir, Ticket) ->
                         _ -> {ok, Ticket}
                     end;
                 false ->
-                    download_and_wait_for_ticket(Conn, StreamId, Path, DownloadsDir, Ticket)
+                    download_and_wait_for_ticket(Conn, StreamId, Path, DownloadsDir, Ticket, Acc1)
             end;
         {quic, Conn, {session_ticket, NewTicket}} ->
             io:format("Phase 1: Received session ticket~n"),
-            download_and_wait_for_ticket(Conn, StreamId, Path, DownloadsDir, NewTicket);
+            download_and_wait_for_ticket(Conn, StreamId, Path, DownloadsDir, NewTicket, Acc);
         {quic, Conn, {closed, _Reason}} ->
             case Ticket of
                 undefined -> error;
@@ -452,14 +619,28 @@ run_zerortt_test(RequestsStr, DownloadsDir) ->
         [] ->
             io:format("No requests specified~n"),
             halt(?EXIT_FAILURE);
-        [Url | _Rest] ->
+        [Url | _] ->
             case parse_url(Url) of
-                {ok, Host, Port, Path} ->
-                    %% Try to load existing ticket
-                    case load_ticket() of
+                {ok, Host, Port, _} ->
+                    %% The runner expects every requested file to be
+                    %% downloaded, with the requests sent as early data. The
+                    %% first connection only fetches a ticket; downloading
+                    %% there would also count the files against the wrong
+                    %% handshake.
+                    AllPaths = [P || U <- Requests, {ok, _, _, P} <- [parse_url(U)]],
+                    TicketResult =
+                        case load_ticket() of
+                            {ok, T} ->
+                                io:format("Using stored ticket for 0-RTT~n"),
+                                {ok, T};
+                            error ->
+                                io:format("No stored ticket, fetching one~n"),
+                                ticket_only_connection(Host, Port)
+                        end,
+                    case TicketResult of
                         {ok, Ticket} ->
-                            io:format("Using stored ticket for 0-RTT~n"),
-                            case zerortt_with_ticket(Host, Port, Path, DownloadsDir, Ticket) of
+                            save_ticket(Ticket),
+                            case zerortt_download_all(Host, Port, AllPaths, DownloadsDir, Ticket) of
                                 ok ->
                                     io:format("0-RTT test successful~n"),
                                     halt(?EXIT_SUCCESS);
@@ -468,25 +649,8 @@ run_zerortt_test(RequestsStr, DownloadsDir) ->
                                     halt(?EXIT_FAILURE)
                             end;
                         error ->
-                            %% No ticket, do resumption first
-                            io:format("No stored ticket, running resumption first~n"),
-                            case resumption_phase1(Host, Port, Path, DownloadsDir) of
-                                {ok, Ticket} ->
-                                    save_ticket(Ticket),
-                                    case
-                                        zerortt_with_ticket(Host, Port, Path, DownloadsDir, Ticket)
-                                    of
-                                        ok ->
-                                            io:format("0-RTT test successful~n"),
-                                            halt(?EXIT_SUCCESS);
-                                        error ->
-                                            io:format("0-RTT test failed~n"),
-                                            halt(?EXIT_FAILURE)
-                                    end;
-                                error ->
-                                    io:format("Failed to get ticket for 0-RTT~n"),
-                                    halt(?EXIT_FAILURE)
-                            end
+                            io:format("Failed to get ticket for 0-RTT~n"),
+                            halt(?EXIT_FAILURE)
                     end;
                 error ->
                     io:format("Invalid URL~n"),
@@ -494,156 +658,142 @@ run_zerortt_test(RequestsStr, DownloadsDir) ->
             end
     end.
 
-%% Connect with 0-RTT using stored ticket
-%% Sends request as early data before handshake completes
-zerortt_with_ticket(Host, Port, Path, DownloadsDir, Ticket) ->
+%% Fetch every file over one HTTP/3 connection (RFC 9114); the runner
+%% requires exactly one handshake, so all requests share the connection.
+run_http3_test(RequestsStr, DownloadsDir) ->
+    Requests = string:tokens(RequestsStr, " "),
+    case [{H, Po, Pa} || U <- Requests, {ok, H, Po, Pa} <- [parse_url(U)]] of
+        [] ->
+            io:format("No valid requests~n"),
+            halt(?EXIT_FAILURE);
+        [{Host, Port, _} | _] = Parsed ->
+            case quic_h3:connect(Host, Port, #{quic_opts => #{verify => false}}) of
+                {ok, Conn} ->
+                    ok = quic_h3:wait_connected(Conn, 30000),
+                    Results = [
+                        h3_fetch(Conn, Host, Path, DownloadsDir)
+                     || {_, _, Path} <- Parsed
+                    ],
+                    quic_h3:close(Conn),
+                    case lists:all(fun(R) -> R =:= ok end, Results) of
+                        true ->
+                            io:format("All H3 downloads successful~n"),
+                            halt(?EXIT_SUCCESS);
+                        false ->
+                            io:format("Some H3 downloads failed~n"),
+                            halt(?EXIT_FAILURE)
+                    end;
+                {error, Reason} ->
+                    io:format("H3 connect failed: ~p~n", [Reason]),
+                    halt(?EXIT_FAILURE)
+            end
+    end.
+
+h3_fetch(Conn, Host, Path, DownloadsDir) ->
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>,
+            case list_to_binary(Path) of
+                <<"/", _/binary>> = P -> P;
+                P -> <<"/", P/binary>>
+            end},
+        {<<":authority">>, list_to_binary(Host)}
+    ],
+    case quic_h3:request(Conn, Headers) of
+        {ok, StreamId} ->
+            h3_collect(Conn, StreamId, Path, DownloadsDir, undefined, <<>>);
+        {error, Reason} ->
+            io:format("H3 request failed: ~p~n", [Reason]),
+            error
+    end.
+
+h3_collect(Conn, StreamId, Path, DownloadsDir, Status, Acc) ->
+    receive
+        {quic_h3, Conn, {response, StreamId, RespStatus, _Headers}} ->
+            h3_collect(Conn, StreamId, Path, DownloadsDir, RespStatus, Acc);
+        {quic_h3, Conn, {data, StreamId, Data, Fin}} ->
+            Acc1 = <<Acc/binary, Data/binary>>,
+            case Fin of
+                true when Status =:= 200 ->
+                    FilePath = filename:join(DownloadsDir, filename:basename(Path)),
+                    ok = file:write_file(FilePath, Acc1),
+                    io:format("H3 saved: ~s (~p bytes)~n", [FilePath, byte_size(Acc1)]),
+                    ok;
+                true ->
+                    io:format("H3 status ~p for ~s~n", [Status, Path]),
+                    error;
+                false ->
+                    h3_collect(Conn, StreamId, Path, DownloadsDir, Status, Acc1)
+            end;
+        {quic_h3, Conn, {error, StreamId, Reason}} ->
+            io:format("H3 stream error: ~p~n", [Reason]),
+            error;
+        {quic_h3, Conn, {closed, Reason}} ->
+            io:format("H3 connection closed: ~p~n", [Reason]),
+            error
+    after 60000 ->
+        io:format("H3 timeout for ~s~n", [Path]),
+        error
+    end.
+
+%% First connection: handshake, wait for a session ticket, download nothing.
+ticket_only_connection(Host, Port) ->
+    %% pmtu_enabled: the zerortt grader counts every 1-RTT byte the client
+    %% sends across the whole capture, and padded PMTU probes alone blow
+    %% the budget.
+    Opts = #{
+        verify => false,
+        alpn => [<<"hq-interop">>, <<"h3">>],
+        pmtu_enabled => false
+    },
+    case quic:connect(Host, Port, Opts, self()) of
+        {ok, Conn} ->
+            Result =
+                receive
+                    {quic, Conn, {connected, _Info}} ->
+                        io:format("Ticket connection established~n"),
+                        wait_for_ticket_only(Conn, 10000);
+                    {quic, Conn, {closed, Reason}} ->
+                        io:format("Ticket connection closed: ~p~n", [Reason]),
+                        error
+                after 30000 ->
+                    io:format("Ticket connection timeout~n"),
+                    error
+                end,
+            quic:close(Conn, normal),
+            Result;
+        {error, Reason} ->
+            io:format("Ticket connection failed: ~p~n", [Reason]),
+            error
+    end.
+
+%% Second connection: requests go out as early data (collect_streams opens
+%% streams and sends immediately; before the handshake completes that is
+%% the client 0-RTT path), responses arrive once the handshake is done.
+zerortt_download_all(Host, Port, Paths, DownloadsDir, Ticket) ->
     Opts = #{
         verify => false,
         alpn => [<<"hq-interop">>, <<"h3">>],
         session_ticket => Ticket,
-        enable_early_data => true
+        enable_early_data => true,
+        pmtu_enabled => false
     },
     case quic:connect(Host, Port, Opts, self()) of
         {ok, Conn} ->
-            %% Open stream and send request immediately (uses 0-RTT if available)
-            case quic:open_stream(Conn) of
-                {ok, StreamId} ->
-                    Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
-                    io:format("Sending 0-RTT request~n"),
-                    ok = quic:send_data(Conn, StreamId, Request, true),
-                    Result = wait_for_zerortt_response(Conn, StreamId, Path, DownloadsDir),
-                    quic:close(Conn, normal),
-                    Result;
-                {error, not_connected} ->
-                    %% Early keys not available, fall back to waiting for connection
-                    io:format("0-RTT: Early keys not available, waiting for connection~n"),
-                    Result = wait_for_connection_then_request(Conn, Path, DownloadsDir),
-                    quic:close(Conn, normal),
-                    Result;
-                {error, Err} ->
-                    io:format("Failed to open stream: ~p~n", [Err]),
-                    quic:close(Conn, normal),
-                    error
+            io:format("Sending ~p request(s) as early data~n", [length(Paths)]),
+            Results = collect_streams(Conn, Paths, DownloadsDir),
+            quic:close(Conn, normal),
+            case
+                length(Results) =:= length(Paths) andalso
+                    lists:all(fun(R) -> R =:= ok end, Results)
+            of
+                true -> ok;
+                false -> error
             end;
         {error, Reason} ->
             io:format("0-RTT connection failed: ~p~n", [Reason]),
             error
-    end.
-
-%% Fallback: wait for connection then send request
-wait_for_connection_then_request(Conn, Path, DownloadsDir) ->
-    receive
-        {quic, Conn, {connected, _Info}} ->
-            io:format("0-RTT: Connected (fallback to 1-RTT)~n"),
-            case quic:open_stream(Conn) of
-                {ok, StreamId} ->
-                    Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
-                    ok = quic:send_data(Conn, StreamId, Request, true),
-                    wait_for_zerortt_response(Conn, StreamId, Path, DownloadsDir);
-                {error, Err} ->
-                    io:format("Failed to open stream: ~p~n", [Err]),
-                    error
-            end;
-        {quic, Conn, {closed, Reason}} ->
-            io:format("0-RTT: Connection closed: ~p~n", [Reason]),
-            error
-    after 30000 ->
-        io:format("0-RTT: Connection timeout~n"),
-        error
-    end.
-
-%% Wait for 0-RTT response (may receive before or after connected event)
-wait_for_zerortt_response(Conn, StreamId, Path, DownloadsDir) ->
-    wait_for_zerortt_response(Conn, StreamId, Path, DownloadsDir, false, false, <<>>).
-
-wait_for_zerortt_response(Conn, StreamId, Path, DownloadsDir, Connected, Retried, Acc) ->
-    %% Use shorter timeout after handshake to detect rejected 0-RTT
-    Timeout =
-        case Connected andalso Acc =:= <<>> andalso not Retried of
-            % Short wait for 0-RTT response after handshake
-            true -> 2000;
-            false -> 60000
-        end,
-    receive
-        {quic, Conn, {connected, _Info}} ->
-            io:format("0-RTT: Handshake completed~n"),
-            wait_for_zerortt_response(Conn, StreamId, Path, DownloadsDir, true, Retried, Acc);
-        {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
-            NewAcc = <<Acc/binary, Data/binary>>,
-            case Fin of
-                true ->
-                    Filename = filename:basename(Path),
-                    FilePath = filename:join(DownloadsDir, Filename),
-                    file:write_file(FilePath, NewAcc),
-                    io:format("0-RTT: Downloaded ~s (~p bytes)~n", [FilePath, byte_size(NewAcc)]),
-                    ok;
-                false ->
-                    wait_for_zerortt_response(
-                        Conn, StreamId, Path, DownloadsDir, Connected, Retried, NewAcc
-                    )
-            end;
-        {quic, Conn, {early_data_rejected, _}} ->
-            io:format("0-RTT: Early data rejected, resending as 1-RTT~n"),
-            %% Resend request on new stream
-            resend_request_1rtt(Conn, Path, DownloadsDir);
-        {quic, Conn, {closed, Reason}} ->
-            io:format("0-RTT: Connection closed: ~p~n", [Reason]),
-            case Acc of
-                <<>> ->
-                    error;
-                _ ->
-                    Filename = filename:basename(Path),
-                    FilePath = filename:join(DownloadsDir, Filename),
-                    file:write_file(FilePath, Acc),
-                    ok
-            end
-    after Timeout ->
-        case Connected andalso Acc =:= <<>> andalso not Retried of
-            true ->
-                %% 0-RTT likely rejected (server couldn't decrypt), retry as 1-RTT
-                io:format("0-RTT: No response, resending as 1-RTT~n"),
-                resend_request_1rtt(Conn, Path, DownloadsDir);
-            false ->
-                io:format("0-RTT: Timeout~n"),
-                error
-        end
-    end.
-
-%% Resend the request using 1-RTT (after 0-RTT was rejected)
-resend_request_1rtt(Conn, Path, DownloadsDir) ->
-    case quic:open_stream(Conn) of
-        {ok, NewStreamId} ->
-            Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
-            ok = quic:send_data(Conn, NewStreamId, Request, true),
-            wait_for_1rtt_response(Conn, NewStreamId, Path, DownloadsDir, <<>>);
-        {error, Err} ->
-            io:format("0-RTT: Failed to open 1-RTT stream: ~p~n", [Err]),
-            error
-    end.
-
-%% Wait for 1-RTT response
-wait_for_1rtt_response(Conn, StreamId, Path, DownloadsDir, Acc) ->
-    receive
-        {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
-            NewAcc = <<Acc/binary, Data/binary>>,
-            case Fin of
-                true ->
-                    Filename = filename:basename(Path),
-                    FilePath = filename:join(DownloadsDir, Filename),
-                    file:write_file(FilePath, NewAcc),
-                    io:format("0-RTT: Downloaded via 1-RTT ~s (~p bytes)~n", [
-                        FilePath, byte_size(NewAcc)
-                    ]),
-                    ok;
-                false ->
-                    wait_for_1rtt_response(Conn, StreamId, Path, DownloadsDir, NewAcc)
-            end;
-        {quic, Conn, {closed, Reason}} ->
-            io:format("0-RTT: Connection closed during 1-RTT: ~p~n", [Reason]),
-            error
-    after 60000 ->
-        io:format("0-RTT: 1-RTT timeout~n"),
-        error
     end.
 
 %%====================================================================
