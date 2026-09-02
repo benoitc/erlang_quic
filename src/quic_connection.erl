@@ -550,6 +550,17 @@
     keep_alive_interval :: non_neg_integer() | disabled,
     keep_alive_timer :: reference() | undefined,
 
+    %% Give up on an unresponsive peer: close the connection when
+    %% ack-eliciting data has been in flight with no ACK for this long
+    %% (RFC 9000 permits idle-timeout-only, but a stateless-reset-blind
+    %% peer then lingers for the whole idle timeout; msquic uses a 16 s
+    %% disconnect timeout for the same reason).
+    disconnect_timeout = 16000 :: pos_integer() | infinity,
+    %% Dedicated timer for the above. Checking it only when a PTO happened
+    %% to fire made the effective timeout the next PTO after the deadline,
+    %% and PTO backoff doubles, so a nominal 16 s took 24 s or more.
+    disconnect_timer :: reference() | undefined,
+
     %% Pacing (RFC 9002 Section 7.7)
     pacing_timer :: reference() | undefined,
     pacing_enabled = true :: boolean(),
@@ -798,7 +809,7 @@ start_link(Host, Port, Opts, Owner) ->
     gen_udp:socket() | undefined
 ) -> {ok, pid()} | {error, term()}.
 start_link(Host, Port, Opts, Owner, Socket) ->
-    gen_statem:start_link(?MODULE, [Host, Port, Opts, Owner, Socket], []).
+    gen_statem:start_link(?MODULE, [Host, Port, Opts, Owner, Socket], statem_opts(Opts)).
 
 %% @doc Initiate a connection to a QUIC server.
 %% This is a convenience wrapper that starts the process and initiates handshake.
@@ -821,7 +832,22 @@ connect(Host, Port, Opts, Owner) ->
 %% Called by quic_listener when a new connection is accepted.
 -spec start_server(map()) -> {ok, pid()} | {error, term()}.
 start_server(Opts) ->
-    gen_statem:start_link(?MODULE, {server, Opts}, []).
+    gen_statem:start_link(?MODULE, {server, Opts}, statem_opts(Opts)).
+
+%% An idle connection process never garbage-collects on its own, so the
+%% garbage produced by the handshake (~170 KiB measured) stays pinned to
+%% its heap indefinitely; with tens of thousands of mostly-idle
+%% connections that dominates the VM footprint. Hibernating after a
+%% quiet period runs a fullsweep GC and shrinks the process to a few
+%% KiB. Busy connections are unaffected (the timer only fires after
+%% `hibernate_after' ms without any event).
+statem_opts(Opts) ->
+    case maps:get(hibernate_after, Opts, 5000) of
+        infinity ->
+            [];
+        T when is_integer(T), T > 0 ->
+            [{hibernate_after, T}]
+    end.
 
 %% @doc Send data on a stream.
 -spec send_data(pid(), non_neg_integer(), iodata(), boolean()) ->
@@ -1266,6 +1292,7 @@ init({server, Opts}) ->
         reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeout,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
+        disconnect_timeout = disconnect_timeout_opt(Opts),
         keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
@@ -1654,6 +1681,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
         idle_timeout = IdleTimeoutClient,
         keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
+        disconnect_timeout = disconnect_timeout_opt(Opts),
         keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
@@ -1698,35 +1726,42 @@ terminate(
         qlog_ctx = QlogCtx
     } = State
 ) ->
-    %% If we're not already draining/closed, try to send CONNECTION_CLOSE
-    %% No owner notification here - either already notified (draining) or owner is dead
-    case StateName of
-        draining ->
-            ok;
-        closed ->
-            ok;
-        _ ->
-            try
-                %% Use close_reason from state if set, otherwise use terminate reason
-                CloseReason =
-                    case State#state.close_reason of
-                        undefined -> Reason;
-                        R -> R
-                    end,
-                send_connection_close(CloseReason, State)
-            catch
-                _:_ -> ok
-            end
-    end,
+    %% If we're not already draining/closed, try to send CONNECTION_CLOSE.
+    %% No owner notification here - either already notified (draining) or
+    %% owner is dead. The send batches the close packet into an updated
+    %% socket_state; that updated state must be the one flushed below, or
+    %% the close never reaches the wire and the peer holds a phantom
+    %% connection until its idle timeout (an owner death then looks like a
+    %% host that stays connected for up to a minute).
+    FlushSocketState =
+        case StateName of
+            draining ->
+                SocketState;
+            closed ->
+                SocketState;
+            _ ->
+                try
+                    %% Use close_reason from state if set, otherwise use terminate reason
+                    CloseReason =
+                        case State#state.close_reason of
+                            undefined -> Reason;
+                            R -> R
+                        end,
+                    CloseState = send_connection_close(CloseReason, State),
+                    CloseState#state.socket_state
+                catch
+                    _:_ -> SocketState
+                end
+        end,
     %% Flush any batched packets before closing and close owned sockets
-    case SocketState of
+    case FlushSocketState of
         undefined ->
             ok;
         _ ->
             try
-                _ = quic_socket:flush(SocketState),
+                _ = quic_socket:flush(FlushSocketState),
                 %% Close socket_state (respects owns_socket flag)
-                _ = quic_socket:close(SocketState)
+                _ = quic_socket:close(FlushSocketState)
             catch
                 _:_ -> ok
             end
@@ -1882,7 +1917,7 @@ idle(EventType, EventContent, State) ->
 handshaking(enter, idle, State) ->
     %% Continue handshake; (re)arm the client Initial-retransmission timer
     %% (no-op for the server).
-    {keep_state, State, hs_rtx_actions(State)};
+    {keep_state, arm_disconnect_timer(State), hs_rtx_actions(State)};
 handshaking(state_timeout, retransmit_initial, State) ->
     retransmit_initial_flight(handshaking, State);
 handshaking({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
@@ -2015,7 +2050,7 @@ connected(
         server -> ok
     end,
     %% Send any data that was queued before connection established
-    State1 = State#state{pending_data = []},
+    State1 = arm_disconnect_timer(State#state{pending_data = []}),
     State2 = send_pending_data(Pending, State1),
     %% RFC 9000 Section 9.6: Client validates server's preferred address
     State3 =
@@ -2548,9 +2583,29 @@ handle_common_event(info, {hs_flight_timeout, _Ref}, _StateName, State) ->
 handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref} = State) when
     Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
 ->
-    %% Handle PTO timeout - send probe packet
-    NewState = handle_pto_timeout(State#state{pto_timer = undefined}),
-    {keep_state, NewState};
+    case disconnect_timeout_expired(State) of
+        true ->
+            {next_state, draining, declare_peer_dead(State#state{pto_timer = undefined})};
+        false ->
+            %% Handle PTO timeout - send probe packet
+            NewState = handle_pto_timeout(State#state{pto_timer = undefined}),
+            {keep_state, NewState}
+    end;
+handle_common_event(
+    info, {disconnect_check, Ref}, StateName, #state{disconnect_timer = Ref} = State
+) when
+    Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
+->
+    State1 = State#state{disconnect_timer = undefined},
+    case disconnect_timeout_expired(State1) of
+        true ->
+            {next_state, draining, declare_peer_dead(State1)};
+        false ->
+            {keep_state, arm_disconnect_timer(State1)}
+    end;
+handle_common_event(info, {disconnect_check, _StaleRef}, _StateName, State) ->
+    %% Stale disconnect timer (ref doesn't match or wrong state)
+    {keep_state, State};
 handle_common_event(info, {pto_timeout, _StaleRef}, _StateName, State) ->
     %% Ignore stale PTO timer (ref doesn't match or wrong state)
     {keep_state, State};
@@ -2593,12 +2648,21 @@ handle_common_event(
             %% no PING needed.
             {keep_state, set_keep_alive_timer(State#state{keep_alive_timer = undefined})};
         false ->
-            %% Idle for a full interval: send a PING. Being ack-eliciting, it
-            %% refreshes last_activity if it is the first such packet since our
-            %% last receive (RFC 9000 §10.1); re-arm a full interval.
+            %% Idle for a full interval: send a PING, then wait a full
+            %% interval before the next one.
+            %%
+            %% The re-arm must count from now, not from last_activity:
+            %% last_activity only moves on the FIRST ack-eliciting packet
+            %% sent since the last receive (RFC 9000 §10.1), so on a
+            %% connection whose peer stays quiet every later PING leaves it
+            %% untouched. Deriving the delay from it then yields
+            %% max(0, past + interval - now) = 0, the timer fires straight
+            %% back, and the connection spins sending PINGs at timer-wheel
+            %% rate (measured: ~930/s per connection, 46k/s across 50 idle
+            %% connections) until the peer happens to send something.
             State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
             State2 = flush_dirty_timers(flush_socket_batch(State1)),
-            {keep_state, set_keep_alive_timer(State2)}
+            {keep_state, arm_keep_alive_timer(State2, State2#state.keep_alive_interval)}
     end;
 handle_common_event(info, {keep_alive_timeout, _StaleRef}, _StateName, State) ->
     %% Ignore stale keep-alive timer (ref doesn't match or wrong state)
@@ -4263,13 +4327,35 @@ handle_packet_loop(Data, State) ->
             maybe_reenable_socket(State),
             State;
         {error, Reason} ->
-            %% Log decryption failure for debugging
+            %% Log decryption failure for debugging. Include the packet
+            %% source, our CID expectation and the datagram head/tail so
+            %% a misrouted datagram, a foreign connection's packet or a
+            %% stateless reset can be told apart from a key/nonce bug.
             ?LOG_WARNING(
                 #{
                     what => packet_decode_decrypt_failed,
                     role => State#state.role,
                     reason => Reason,
-                    size => byte_size(Data)
+                    size => byte_size(Data),
+                    source => State#state.current_packet_source,
+                    scid => binhex(State#state.scid),
+                    dcid => binhex(State#state.dcid),
+                    known_reset_tokens => [
+                        {
+                            E#cid_entry.seq_num,
+                            binhex(E#cid_entry.cid),
+                            binhex(E#cid_entry.stateless_reset_token)
+                        }
+                     || E <- State#state.peer_cid_pool
+                    ],
+                    head => binhex(binary:part(Data, 0, min(16, byte_size(Data)))),
+                    tail => binhex(
+                        binary:part(
+                            Data,
+                            byte_size(Data) - min(16, byte_size(Data)),
+                            min(16, byte_size(Data))
+                        )
+                    )
                 },
                 ?QUIC_LOG_META
             ),
@@ -4277,6 +4363,9 @@ handle_packet_loop(Data, State) ->
             maybe_reenable_socket(State),
             State
     end.
+
+binhex(Bin) when is_binary(Bin) -> binary:encode_hex(Bin);
+binhex(Other) -> Other.
 
 %% Re-enable socket for receiving - only for client connections.
 %% Server connections use listener's socket which is managed by the listener.
@@ -9875,9 +9964,9 @@ emit_close_at_level(none, _CloseFrame, State) ->
 
 %% Send CONNECTION_CLOSE frame during terminate (best effort)
 %% This is called when the process is terminating unexpectedly
-send_connection_close(_Reason, #state{app_keys = undefined}) ->
+send_connection_close(_Reason, #state{app_keys = undefined} = State) ->
     %% No app keys yet, can't send encrypted close frame
-    ok;
+    State;
 send_connection_close(Reason, State) ->
     {ErrorCode, ReasonPhrase} =
         case Reason of
@@ -9893,13 +9982,15 @@ send_connection_close(Reason, State) ->
                 {?QUIC_APPLICATION_ERROR, <<>>}
         end,
     CloseFrame = {connection_close, application, ErrorCode, undefined, ReasonPhrase},
-    %% Best effort send - ignore errors since we're terminating anyway
+    %% Best effort send - ignore errors since we're terminating anyway.
+    %% Return the updated state: it carries the batched close packet, and
+    %% the caller must flush that socket_state for the frame to reach the
+    %% wire.
     try
         send_frame(CloseFrame, State)
     catch
-        _:_ -> ok
-    end,
-    ok.
+        _:_ -> State
+    end.
 
 %% Send TLS alert as QUIC crypto error and close connection.
 %% QUIC crypto errors are 0x100 + TLS alert code (RFC 9001 §4.8).
@@ -10470,6 +10561,69 @@ query_local_addr(Socket) ->
         {error, _} -> undefined
     end.
 
+disconnect_timeout_expired(#state{disconnect_timeout = infinity}) ->
+    false;
+disconnect_timeout_expired(#state{disconnect_timeout = DT, loss_state = LossState}) ->
+    quic_loss:bytes_in_flight(LossState) > 0 andalso
+        case quic_loss:last_progress(LossState) of
+            undefined ->
+                false;
+            T ->
+                erlang:monotonic_time(millisecond) - T >= DT
+        end.
+
+%% The disconnect timeout elapsed with ack-eliciting data in flight and
+%% no ACK: declare the peer dead instead of probing until the idle
+%% timeout. This is how a client escapes a restarted peer whose stateless
+%% resets it cannot recognise.
+declare_peer_dead(State) ->
+    ?LOG_NOTICE(
+        #{
+            what => disconnect_timeout,
+            in_flight => quic_loss:bytes_in_flight(State#state.loss_state),
+            pto_count => quic_loss:pto_count(State#state.loss_state)
+        },
+        ?QUIC_LOG_META
+    ),
+    initiate_close(disconnect_timeout, cancel_disconnect_timer(State)).
+
+cancel_disconnect_timer(#state{disconnect_timer = undefined} = State) ->
+    State;
+cancel_disconnect_timer(#state{disconnect_timer = Ref} = State) ->
+    cancel_timer(Ref),
+    State#state{disconnect_timer = undefined}.
+
+%% Arm the disconnect check at the deadline itself. Lazy, like the idle
+%% timer: a fire that finds the deadline moved re-arms the remainder.
+%% The delay is never zero, so this cannot spin the way a re-arm derived
+%% from a stale timestamp would.
+arm_disconnect_timer(#state{disconnect_timeout = infinity} = State) ->
+    cancel_disconnect_timer(State);
+arm_disconnect_timer(#state{disconnect_timeout = DT, loss_state = LossState} = State) ->
+    Delay =
+        case quic_loss:last_progress(LossState) of
+            undefined ->
+                DT;
+            T ->
+                case quic_loss:bytes_in_flight(LossState) > 0 of
+                    true -> max(1, (T + DT) - erlang:monotonic_time(millisecond));
+                    false -> DT
+                end
+        end,
+    State1 = cancel_disconnect_timer(State),
+    Ref = make_ref(),
+    erlang:send_after(Delay, self(), {disconnect_check, Ref}),
+    State1#state{disconnect_timer = Ref}.
+
+%% Disconnect-timeout option: how long ack-eliciting data may stay in
+%% flight without any ACK before the peer is declared dead.
+disconnect_timeout_opt(Opts) ->
+    case maps:get(disconnect_timeout, Opts, 16000) of
+        infinity -> infinity;
+        T when is_integer(T), T >= 1000 -> T;
+        _ -> 16000
+    end.
+
 calculate_keep_alive_interval(Opts, IdleTimeout) ->
     case maps:get(keep_alive_interval, Opts, disabled) of
         disabled -> disabled;
@@ -10487,15 +10641,19 @@ set_keep_alive_timer(#state{keep_alive_interval = disabled} = State) ->
 set_keep_alive_timer(
     #state{
         keep_alive_interval = Interval,
-        keep_alive_timer = OldTimer,
         last_activity = LastActivity
     } = State
 ) ->
-    cancel_timer(OldTimer),
     %% Lazy re-arm against last_activity (same model as the idle timer):
     %% full interval on the initial arm, the remainder on a spurious fire.
     Now = erlang:monotonic_time(millisecond),
-    Delay = max(0, (LastActivity + Interval) - Now),
+    arm_keep_alive_timer(State, max(0, (LastActivity + Interval) - Now)).
+
+%% Arm the keep-alive timer with an explicit delay.
+arm_keep_alive_timer(#state{keep_alive_interval = disabled} = State, _Delay) ->
+    State#state{keep_alive_timer = undefined};
+arm_keep_alive_timer(#state{keep_alive_timer = OldTimer} = State, Delay) ->
+    cancel_timer(OldTimer),
     Ref = make_ref(),
     erlang:send_after(Delay, self(), {keep_alive_timeout, Ref}),
     State#state{keep_alive_timer = Ref}.
@@ -11209,7 +11367,19 @@ initiate_peer_path_validation(NewAddr, IsNATRebinding, DataSize, State) ->
         is_nat_rebinding = false
     },
 
+    %% RFC 9000 §9.3: follow the highest-numbered non-probing packet
+    %% immediately (the caller gates on non-probing) and validate in the
+    %% background. Waiting for PATH_RESPONSE before moving the data path
+    %% stalls the connection for a full validation round trip per
+    %% rebinding; under frequent NAT rebinds the old binding is already
+    %% dead and everything sent there is lost, so the transfer dies on
+    %% idle timeout. The §9.3 unvalidated-address send cap is not
+    %% enforced on the 1-RTT path here; noted as a deliberate trade
+    %% (spoofing needs the connection ID, the old path is probed per
+    %% §9.3.2, and a failed validation resets so the true peer's next
+    %% packet re-triggers).
     State1 = State#state{
+        remote_addr = NewAddr,
         pending_peer_validation = NewPathState,
         old_path_validation = OldPathState,
         migration_state = validating_peer
@@ -11639,10 +11809,36 @@ add_peer_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
                 State
             );
         false ->
+            %% RFC 9000 §5.1.2: if the CID we are sending with is among
+            %% the retired ones, switch to an active CID BEFORE retiring.
+            %% Keeping a retired DCID makes the peer eventually treat our
+            %% packets as unroutable and answer with stateless resets
+            %% whose token we discarded with the pruned pool entry - the
+            %% connection goes irrecoverably deaf.
+            State0 = maybe_replace_retired_dcid(State#state{peer_cid_pool = NewPool}),
             %% Send RETIRE_CONNECTION_ID for the now-retired CIDs, then drop
             %% them from the pool so it cannot grow without bound.
-            State1 = retire_peer_cids(RetirePrior, State#state{peer_cid_pool = NewPool}),
+            State1 = retire_peer_cids(RetirePrior, State0),
             prune_retired_peer_cids(State1)
+    end.
+
+maybe_replace_retired_dcid(#state{peer_cid_pool = Pool, dcid = DCID} = State) ->
+    case lists:keyfind(DCID, #cid_entry.cid, Pool) of
+        #cid_entry{status = retired} ->
+            case find_unused_cid(Pool, DCID) of
+                {ok, NewCID} ->
+                    ?LOG_DEBUG(
+                        #{what => dcid_retired_switching, new_cid => NewCID},
+                        ?QUIC_LOG_META
+                    ),
+                    State#state{dcid = NewCID};
+                not_found ->
+                    %% Peer retired every CID we hold without providing a
+                    %% replacement; keep the old one (peer protocol error).
+                    State
+            end;
+        _ ->
+            State
     end.
 
 retire_if_below(RetirePrior, #cid_entry{seq_num = S} = Entry) when S < RetirePrior ->
