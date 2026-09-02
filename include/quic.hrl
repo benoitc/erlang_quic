@@ -591,8 +591,11 @@
     recv_offset :: non_neg_integer(),
     recv_max_data :: non_neg_integer(),
     recv_fin :: boolean(),
-    %% #{Offset => Data} for out-of-order reassembly
-    recv_buffer :: map(),
+    %% Offset => Data, ordered, for out-of-order reassembly. Ordering
+    %% keeps the per-packet gap check O(log n) and lets the trim walk
+    %% stop at the delivered point instead of visiting every buffered
+    %% chunk, which matters once loss recovery has megabytes buffered.
+    recv_buffer :: gb_trees:tree(non_neg_integer(), binary()),
     %% Our recv side is terminal: FIN read (buffer empty) or peer RESET_STREAM.
     recv_done = false :: boolean(),
 
