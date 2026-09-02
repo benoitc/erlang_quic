@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- PTO probe packets are exempt from the congestion window and loss
+  retransmissions are bound to it, per RFC 9002 section 7. A probe is
+  the only thing that can restart a stalled connection, so blocking it
+  on a window the peer's silence keeps closed deadlocks the transfer;
+  ordinary loss retransmissions, which were previously sent regardless,
+  now respect the window like any other send. Contributed by jbevemyr
+  (#249).
 - ACKs arriving at the Initial or Handshake encryption level no longer
   reach the 1-RTT loss tracker. Packet numbers restart per space
   (RFC 9000 §12.3), so a Handshake-space ACK of packet numbers 0..N was
