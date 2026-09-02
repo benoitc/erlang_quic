@@ -30,7 +30,8 @@
 -export([
     control_no_loss/1,
     survives_one_lost_finished/1,
-    survives_two_lost_finished/1
+    survives_two_lost_finished/1,
+    survives_four_lost_finished/1
 ]).
 
 -define(ECHO, <<"finished came back">>).
@@ -41,7 +42,12 @@ suite() ->
     [{timetrap, {minutes, 3}}].
 
 all() ->
-    [control_no_loss, survives_one_lost_finished, survives_two_lost_finished].
+    [
+        control_no_loss,
+        survives_one_lost_finished,
+        survives_two_lost_finished,
+        survives_four_lost_finished
+    ].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -67,6 +73,11 @@ survives_two_lost_finished(_Config) ->
     %% Two consecutive losses, so recovery cannot depend on a single
     %% retransmission happening to land.
     ?assertEqual(?ECHO, run(2)).
+
+%% Past what the server's own retransmissions can prompt: recovery here
+%% needs the client's flight timer to keep firing on its own schedule.
+survives_four_lost_finished(_Config) ->
+    ?assertEqual(?ECHO, run(4)).
 
 %%====================================================================
 %% Harness

@@ -247,6 +247,12 @@
 %% option). See the burst_budget field.
 -define(DEFAULT_MAX_BURST_PACKETS, 64).
 
+%% Bounds on the client Finished retransmission interval. The floor keeps
+%% a near-zero PTO from spinning; the ceiling keeps a long RTT estimate
+%% from parking the flight past the idle timeout.
+-define(HS_FLIGHT_MIN_INTERVAL, 100).
+-define(HS_FLIGHT_MAX_INTERVAL, 3000).
+
 %% Max receive buffer size in bytes (32 MB total across all streams) - protects against malicious peers
 -define(MAX_RECV_BUFFER_BYTES, 33554432).
 
@@ -379,6 +385,12 @@
     %% retained until HANDSHAKE_DONE so a lost Finished can be resent -
     %% nothing else retransmits it once the statem has left `handshaking'.
     client_hs_flight = undefined :: undefined | binary(),
+    %% Retransmission timer for that flight, armed while it is retained.
+    %% The flight has to carry its own timer: once the statem leaves
+    %% `handshaking' nothing else is guaranteed to be in flight to arm a
+    %% PTO, so a lost Finished had no schedule to resend it on.
+    hs_flight_timer = undefined :: reference() | undefined,
+    hs_flight_tries = 0 :: non_neg_integer(),
     tls_ch1_opts :: map() | undefined,
     %% Negotiated values surfaced in the connected event
     negotiated_group :: atom() | undefined,
@@ -2460,6 +2472,24 @@ handle_common_event(cast, handle_timeout, _StateName, State) ->
     %% Handle loss detection / idle timeout
     NewState = check_timeouts(State),
     {keep_state, NewState};
+%% The retained client Finished flight has its own schedule: resend it
+%% until the server confirms the handshake. Nothing else is guaranteed
+%% to be in flight once the statem has left `handshaking', so without
+%% this a Finished lost twice was never resent.
+handle_common_event(
+    info,
+    {hs_flight_timeout, Ref},
+    _StateName,
+    #state{hs_flight_timer = Ref, client_hs_flight = Flight, handshake_keys = HsKeys} = State
+) when Ref =/= undefined andalso Flight =/= undefined andalso HsKeys =/= undefined ->
+    State1 = send_handshake_crypto(Flight, State),
+    State2 = arm_hs_flight_timer(State1#state{
+        hs_flight_tries = State1#state.hs_flight_tries + 1
+    }),
+    {keep_state, flush_dirty_timers(flush_socket_batch(State2))};
+handle_common_event(info, {hs_flight_timeout, _Ref}, _StateName, State) ->
+    %% Stale timer, or the flight is already confirmed.
+    {keep_state, State};
 handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref} = State) when
     Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
 ->
@@ -4856,7 +4886,7 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
 %% RFC 9000 Section 19.20: Only server can send, only in 1-RTT (app level)
 process_frame(app, handshake_done, #state{role = client} = State0) ->
     %% Handshake confirmed: the retained Finished flight is done.
-    State = State0#state{client_hs_flight = undefined},
+    State = clear_hs_flight(State0),
     %% Server confirmed handshake complete (client receiving from server)
     State;
 process_frame(app, handshake_done, #state{role = server} = State) ->
@@ -5863,7 +5893,10 @@ process_tls_message(
                     %% Combine Certificate(+CertificateVerify) and Finished into one payload
                     HandshakePayload = <<CertPayload/binary, ClientFinishedMsg/binary>>,
 
-                    State1 = State#state{
+                    State0a = arm_hs_flight_timer(State#state{
+                        client_hs_flight = HandshakePayload
+                    }),
+                    State1 = State0a#state{
                         tls_state = ?TLS_HANDSHAKE_COMPLETE,
                         client_hs_flight = HandshakePayload,
                         tls_transcript = <<Transcript2/binary, ClientFinishedMsg/binary>>,
@@ -11749,6 +11782,27 @@ set_pmtu_probe_timer(#state{pmtu_probe_timer = OldTimer, loss_state = LossState}
     Ref = make_ref(),
     erlang:send_after(Timeout, self(), {pmtu_probe_timeout, Ref}),
     State#state{pmtu_probe_timer = Ref}.
+
+%% Arm the retransmission timer for the retained client Finished flight.
+%% RFC 9002 section 6.2: until the handshake is confirmed the client
+%% probes the handshake space, and the interval doubles on each attempt.
+arm_hs_flight_timer(#state{loss_state = LossState, hs_flight_tries = Tries} = State) ->
+    _ = cancel_timer(State#state.hs_flight_timer),
+    Base = max(?HS_FLIGHT_MIN_INTERVAL, quic_loss:get_pto(LossState)),
+    Timeout = min(?HS_FLIGHT_MAX_INTERVAL, Base bsl min(Tries, 4)),
+    Ref = make_ref(),
+    erlang:send_after(Timeout, self(), {hs_flight_timeout, Ref}),
+    State#state{hs_flight_timer = Ref}.
+
+%% The flight is acknowledged (HANDSHAKE_DONE, or a 1-RTT ack that only a
+%% server holding our Finished could have sent): stop resending it.
+clear_hs_flight(State) ->
+    _ = cancel_timer(State#state.hs_flight_timer),
+    State#state{
+        client_hs_flight = undefined,
+        hs_flight_timer = undefined,
+        hs_flight_tries = 0
+    }.
 
 %% @doc Set the PMTU raise timer for periodic re-probing.
 %% Uses unique reference in message to detect stale timer events
