@@ -1262,7 +1262,30 @@ wait_for_connection(Kernel, Node, Conn, MyNode, Type, Timer, Config) ->
             ?shutdown2(Node, {transport_error, Code, Reason});
         {'EXIT', Timer, setup_timer_timeout} ->
             quic:close(Conn, timeout),
-            ?shutdown2(Node, connect_timeout)
+            ?shutdown2(Node, connect_timeout);
+        {'EXIT', _From, remarked} ->
+            %% net_kernel resolved a simultaneous connect against this
+            %% setup and is now blocked in an unconditional receive
+            %% waiting for us to die (net_kernel.erl, accept_pending).
+            %% Trapping turns that signal into a message, so leaving it
+            %% unread wedges the node's entire dist machinery: no
+            %% handshake, no arbitration, both dials time out.
+            quic:close(Conn, normal),
+            exit(remarked)
+    end.
+
+%% @private
+%% net_kernel resolves a simultaneous connect by killing the losing setup
+%% process and then blocking, with no timeout, until it dies
+%% (net_kernel.erl, accept_pending). This process traps exits, so that
+%% signal arrives as a message and killing it is our job. Trapping cannot
+%% simply be turned off: unlike OTP's socket-based dist, the setup process
+%% is linked to both the QUIC connection and the controller, so an
+%% ordinary linked exit would become lethal mid-handshake.
+exit_if_remarked() ->
+    receive
+        {'EXIT', _From, remarked} -> exit(remarked)
+    after 0 -> ok
     end.
 
 %% @private
@@ -1284,6 +1307,18 @@ start_client_controller(Kernel, Node, Conn, MyNode, Type, Timer) ->
             quic_dist_controller:set_supervisor(DistCtrl, Kernel),
             quic_dist_controller:set_node(DistCtrl, Node),
             HSData = create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer),
+            %% From here the handshake belongs to dist_util, and
+            %% net_kernel resolves a simultaneous connect by killing this
+            %% process and blocking until it dies. It cannot die while it
+            %% traps exits, and it cannot stop trapping while it is linked
+            %% to the connection and the controller, whose ordinary exits
+            %% would then be lethal. The controller owns the connection by
+            %% now, so drop both links and let net_kernel kill us the way
+            %% it kills OTP's own setup processes.
+            _ = unlink(Conn),
+            _ = unlink(DistCtrl),
+            ok = exit_if_remarked(),
+            process_flag(trap_exit, false),
             dist_util:handshake_we_started(HSData);
         {error, Reason} ->
             quic:safe_close(Conn, normal),

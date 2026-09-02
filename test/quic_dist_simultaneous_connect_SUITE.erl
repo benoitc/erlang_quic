@@ -29,7 +29,8 @@
 ]).
 
 -export([
-    simultaneous_connect_test/1
+    simultaneous_connect_test/1,
+    repeated_simultaneous_connect_test/1
 ]).
 
 -define(DIAL_TIMEOUT, 10000).
@@ -44,7 +45,7 @@ all() ->
     [{group, two_node}].
 
 groups() ->
-    [{two_node, [sequence], [simultaneous_connect_test]}].
+    [{two_node, [sequence], [simultaneous_connect_test, repeated_simultaneous_connect_test]}].
 
 init_per_suite(Config) ->
     {ok, CertDir} = generate_test_certs(Config),
@@ -115,6 +116,30 @@ simultaneous_connect_test(Config) ->
     ?assertEqual({true, true}, {R1, R2}),
     ok = ensure_disconnected(Peer1, Node1, Peer2, Node2),
     ok.
+
+%% The deadlock reproduced about a quarter of the time, so a single race
+%% misses it far too often to be a regression test. Twenty leaves roughly
+%% a 0.3% chance of a false pass. This is stress coverage: the guarantee
+%% comes from the setup process no longer swallowing net_kernel's
+%% `remarked' exit, not from the count.
+repeated_simultaneous_connect_test(Config) ->
+    Node1 = ?config(node1, Config),
+    Node2 = ?config(node2, Config),
+    Peer1 = ?config(peer1, Config),
+    Peer2 = ?config(peer2, Config),
+    lists:foreach(
+        fun(N) ->
+            ok = ensure_disconnected(Peer1, Node1, Peer2, Node2),
+            case race_dial(Peer1, Node1, Peer2, Node2) of
+                {true, true} ->
+                    ok;
+                Other ->
+                    ct:fail({race_stalled_on_attempt, N, Other})
+            end
+        end,
+        lists:seq(1, 20)
+    ),
+    ok = ensure_disconnected(Peer1, Node1, Peer2, Node2).
 
 %%====================================================================
 %% Helpers
