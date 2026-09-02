@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- TLS secrets are written to the file named by `SSLKEYLOGFILE` when it is
+  set, in the format Wireshark reads. Contributed by jbevemyr (#231).
 - `max_burst_packets` bounds how many packets leave per send drain, so a
   large queued write cannot monopolise the scheduler. Contributed by
   jbevemyr (#214).
@@ -13,6 +15,24 @@ All notable changes to this project will be documented in this file.
   Contributed by jbevemyr (#213).
 
 ### Fixed
+- The server sends a Retry when configured to, and its cipher preference
+  order is configurable rather than fixed. Contributed by jbevemyr (#232).
+- The client offers the cipher suites it was configured with instead of
+  always the built-in list, and honours the `version` option.
+  Contributed by jbevemyr (#232, #235).
+- Short headers are unprotected with the negotiated cipher, so a
+  connection that negotiated ChaCha20-Poly1305 no longer fails to
+  decrypt. Contributed by jbevemyr (#234).
+- A session ticket selects the PSK it belongs to rather than only
+  feeding 0-RTT, so resumption works on its own. Contributed by
+  jbevemyr (#238).
+- The session-ticket table is owned by the server registry rather than
+  whichever connection created it: it used to vanish with that
+  connection, and a client resuming afterwards fell back to a full
+  handshake. Contributed by jbevemyr (#239).
+- Only the client sends 0-RTT, and 0-RTT data lost in flight is resent.
+  Oversized 0-RTT writes are split, and the idle-state send path is
+  gated too. Contributed by jbevemyr (#240).
 - The connection-level MAX_DATA update triggers on remaining headroom
   rather than cumulative bytes received. The old comparison became
   permanently true once total received passed one window, putting an
@@ -131,6 +151,16 @@ All notable changes to this project will be documented in this file.
   millisecond resolution, so the fixed bucket capped throughput at 12
   packets per wakeup whenever the sender outran the ACK clock,
   regardless of the configured rate. Contributed by jbevemyr (#219).
+### Changed
+- A server with no explicit `groups` option now offers every classical
+  group the crypto layer supports (x25519, secp256r1, secp384r1) instead
+  of x25519 alone. A preference list holding only x25519 sent a
+  HelloRetryRequest to any client whose key_share led with another
+  curve, costing a full extra round trip on every such connection and
+  exercising the HRR path in flows that did not need it. picoquic shares
+  P-256 first, so this was every connection from it. An explicit
+  `groups` option still restricts the set exactly as before.
+  Contributed by jbevemyr (#246).
 
 ## [1.8.1] - 2026-08-15
 

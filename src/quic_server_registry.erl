@@ -176,6 +176,21 @@ init([]) ->
         protected,
         {read_concurrency, true}
     ]),
+    %% The session-ticket table must outlive the connection that happens
+    %% to create it: with a connection process as owner it vanished when
+    %% that connection ended, so a client resuming after the issuing
+    %% connection was gone always fell back to a full handshake. The
+    %% registry is permanent, so own it here; quic_connection's
+    %% ensure_ticket_table/0 stays as a fallback for embedded use.
+    case ets:whereis(quic_server_tickets) of
+        undefined ->
+            _ = ets:new(quic_server_tickets, [
+                named_table, public, ordered_set, {read_concurrency, true}
+            ]),
+            ok;
+        _ ->
+            ok
+    end,
     {ok, #state{}}.
 
 handle_call({register, Name, Pid, Port, Opts}, _From, State = #state{monitors = Monitors}) ->

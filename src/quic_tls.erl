@@ -201,6 +201,17 @@ validate_psk_modes(Modes) ->
         Bad -> error({bad_opts, {unsupported_psk_modes, Bad}})
     end.
 
+%% The offered suites come from the `ciphers' option; the hardcoded
+%% AES-128-only offer meant the server's choice was never really a
+%% choice, and a peer that requires another suite failed the handshake.
+client_cipher_suites(Opts) ->
+    Ciphers = maps:get(ciphers, Opts, [aes_128_gcm, aes_256_gcm, chacha20_poly1305]),
+    <<<<(suite_from_cipher(C)):16>> || C <- Ciphers>>.
+
+suite_from_cipher(aes_128_gcm) -> ?TLS_AES_128_GCM_SHA256;
+suite_from_cipher(aes_256_gcm) -> ?TLS_AES_256_GCM_SHA384;
+suite_from_cipher(chacha20_poly1305) -> ?TLS_CHACHA20_POLY1305_SHA256.
+
 %% Build standard ClientHello without PSK
 build_client_hello_standard(Random, PubKey, PrivKey, Opts) ->
     %% Build extensions
@@ -210,7 +221,7 @@ build_client_hello_standard(Random, PubKey, PrivKey, Opts) ->
     SessionId = maps:get(session_id, Opts, <<>>),
 
     %% Cipher suites (TLS 1.3 only)
-    CipherSuites = <<?TLS_AES_128_GCM_SHA256:16>>,
+    CipherSuites = client_cipher_suites(Opts),
 
     %% Legacy compression methods (null only)
     CompressionMethods = <<1, 0>>,
@@ -294,7 +305,7 @@ build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer)
     ExtensionsLen = byte_size(AllExtensions),
 
     SessionId = maps:get(session_id, Opts, <<>>),
-    CipherSuites = <<?TLS_AES_128_GCM_SHA256:16>>,
+    CipherSuites = client_cipher_suites(Opts),
     CompressionMethods = <<1, 0>>,
 
     ClientHelloBody = <<

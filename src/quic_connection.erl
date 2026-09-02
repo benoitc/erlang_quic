@@ -46,7 +46,7 @@
 -dialyzer(
     {nowarn_function, [
         send_initial_ack/1,
-        select_cipher/1,
+        select_cipher/2,
         %% Reachable from the new TLS_SERVER_HELLO handler via the
         %% selected_psk_identity branch — but no eunit path currently
         %% exercises a PSK handshake end-to-end. The forthcoming
@@ -418,6 +418,7 @@
     %% PTO, so a lost Finished had no schedule to resend it on.
     hs_flight_timer = undefined :: reference() | undefined,
     hs_flight_tries = 0 :: non_neg_integer(),
+    cipher_preference = [aes_128_gcm, aes_256_gcm, chacha20_poly1305] :: [atom()],
     tls_ch1_opts :: map() | undefined,
     %% Negotiated values surfaced in the connected event
     negotiated_group :: atom() | undefined,
@@ -679,6 +680,7 @@
         undefined
         | #{
             identity => binary(),
+            identity_idx => non_neg_integer(),
             secret => binary(),
             mode => psk_dhe_ke | psk_ke
         },
@@ -1221,7 +1223,11 @@ init({server, Opts}) ->
             psk_callback => maps:get(psk_callback, Opts, undefined),
             psks => maps:get(psks, Opts, undefined)
         },
-        tls_groups = maps:get(groups, Opts, [x25519]),
+        %% Accept every group the crypto layer supports: a preference
+        %% list holding only x25519 forced a HelloRetryRequest round
+        %% trip on any client whose key_share leads with another group
+        %% (picoquic shares P-256 first).
+        tls_groups = maps:get(groups, Opts, [x25519, secp256r1, secp384r1]),
         tls_sig_algs = maps:get(signature_algs, Opts, undefined),
         alpn_list = normalize_alpn_list(ALPNList),
         pn_initial = PNSpace,
@@ -1245,6 +1251,7 @@ init({server, Opts}) ->
         next_stream_id_bidi = 1,
         % Server-initiated uni: 3, 7, 11, ...
         next_stream_id_uni = 3,
+        cipher_preference = maps:get(ciphers, Opts, default_cipher_preference()),
         max_streams_bidi_local = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
@@ -1490,8 +1497,12 @@ reown(#state{owner_mon = OldMon} = State, NewOwner) ->
 
 %% Continue client initialization after socket is ready
 init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
-    %% Generate initial keys
-    InitialKeys = derive_initial_keys(DCID),
+    %% The version decides the Initial salt, so it has to be settled before
+    %% any key is derived. This was fixed at v1, which left the `version'
+    %% option with nothing to do: both the salt and the version in our own
+    %% Initial stayed v1 however the connection was configured.
+    Version = maps:get(version, Opts, ?QUIC_VERSION_1),
+    InitialKeys = derive_initial_keys(DCID, Version),
 
     %% Initialize packet number spaces
     PNSpace = #pn_space{
@@ -1583,6 +1594,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         dcid = DCID,
         original_dcid = DCID,
         role = client,
+        version = Version,
         socket = Sock,
         socket_state = SocketState,
         client_socket_backend = ClientSocketBackend,
@@ -1629,6 +1641,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         next_stream_id_bidi = 0,
         % Client-initiated uni: 2, 6, 10, ...
         next_stream_id_uni = 2,
+        cipher_preference = maps:get(ciphers, Opts, default_cipher_preference()),
         max_streams_bidi_local = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
@@ -1795,12 +1808,25 @@ idle({call, From}, open_unidirectional_stream, #state{early_keys = _EarlyKeys} =
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
-%% 0-RTT: Allow sending data in idle state if early keys are available
+%% 0-RTT sending is client-only (RFC 9000 §17.2.3), here as in the
+%% handshaking state: a server handler answering early data delivered
+%% before the handshake completes must queue, or the response goes out
+%% as a 0-RTT packet the client can never decrypt.
+idle(
+    {call, From},
+    {send_data, StreamId, Data, Fin},
+    #state{role = client, early_keys = EarlyKeys} = State
+) when EarlyKeys =/= undefined ->
+    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
+        {ok, NewState} ->
+            {keep_state, NewState, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
 idle(
     {call, From},
     {send_data, StreamId, Data, Fin},
     #state{
-        early_keys = undefined,
         pending_data = Pending
     } = State
 ) ->
@@ -1810,13 +1836,6 @@ idle(
         false ->
             NewPending = Pending ++ [{StreamId, Data, Fin}],
             {keep_state, State#state{pending_data = NewPending}, [{reply, From, ok}]}
-    end;
-idle({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = _} = State) ->
-    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
-        {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
 idle(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
@@ -1894,26 +1913,33 @@ handshaking({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) 
 handshaking(
     {call, From},
     {send_data, StreamId, Data, Fin},
-    #state{
-        early_keys = undefined,
-        pending_data = Pending
-    } = State
+    #state{role = client, early_keys = EarlyKeys} = State
+) when EarlyKeys =/= undefined ->
+    %% Send as 0-RTT data. 0-RTT sending is a client-only affair (RFC
+    %% 9000 §17.2.3): a server also holds early keys, but only for
+    %% receiving. Answering early data before the handshake completes
+    %% must not go out in a 0-RTT packet the client can never decrypt,
+    %% so the server queues below and the data goes out 1-RTT on
+    %% connected.
+    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
+        {ok, NewState} ->
+            {keep_state, NewState, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+handshaking(
+    {call, From},
+    {send_data, StreamId, Data, Fin},
+    #state{pending_data = Pending} = State
 ) ->
-    %% No early keys, queue the data for later (with limit to prevent memory exhaustion)
+    %% No usable send keys yet, queue the data for later (with limit to
+    %% prevent memory exhaustion)
     case length(Pending) >= ?MAX_PENDING_DATA_ENTRIES of
         true ->
             {keep_state, State, [{reply, From, {error, pending_data_limit}}]};
         false ->
             NewPending = Pending ++ [{StreamId, Data, Fin}],
             {keep_state, State#state{pending_data = NewPending}, [{reply, From, ok}]}
-    end;
-handshaking({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = _} = State) ->
-    %% Send as 0-RTT data
-    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
-        {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
 handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
@@ -2722,7 +2748,8 @@ send_client_hello(State) ->
         alpn => AlpnList,
         transport_params => TransportParams,
         session_ticket => SessionTicket,
-        groups => State#state.tls_groups
+        groups => State#state.tls_groups,
+        ciphers => State#state.cipher_preference
     },
     ClientHelloOpts1 =
         case State#state.tls_sig_algs of
@@ -2789,11 +2816,15 @@ send_client_hello(State) ->
 %% Server: Select cipher suite from client's list (server preference)
 %% ClientCipherSuites is a list of TLS cipher suite codes (integers)
 %% Convert to atoms for internal use
-select_cipher(ClientCipherSuites) ->
-    %% Convert client's cipher suite codes to atoms
+%% The server's own order decides, so a deployment that must not negotiate
+%% a particular suite can say so; without this the preference was fixed in
+%% code and a `ciphers' option had nowhere to take effect.
+select_cipher(ClientCipherSuites, ServerPreference) ->
     ClientCiphers = [cipher_code_to_atom(C) || C <- ClientCipherSuites],
-    ServerPreference = [aes_128_gcm, aes_256_gcm, chacha20_poly1305],
     select_first_match(ServerPreference, ClientCiphers).
+
+default_cipher_preference() ->
+    [aes_128_gcm, aes_256_gcm, chacha20_poly1305].
 
 % Default
 select_first_match([], _) ->
@@ -3198,6 +3229,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     ServerAppSecret = quic_crypto:derive_server_app_secret(
         Cipher, MasterSecret, TranscriptHashFinal
     ),
+    keylog_application(State#state.tls_ch1_random, ClientAppSecret, ServerAppSecret),
 
     %% Derive app keys
     {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientAppSecret, Cipher),
@@ -4638,11 +4670,14 @@ decode_short_header_packet(Data, State) ->
 %% Decrypt an application (1-RTT) packet with key phase handling
 %% Uses 2-stage API: unprotect header to get key_phase, then decrypt with selected keys
 decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
-    #crypto_keys{hp = HP} = CurrentKeys,
+    %% The cipher must come from the negotiated keys: inferring it from
+    %% the HP key length mistakes ChaCha20-Poly1305 for AES-256-GCM and
+    %% drops every received 1-RTT packet on such connections.
+    #crypto_keys{hp = HP, cipher = HpCipher} = CurrentKeys,
     PNOffset = byte_size(Header),
 
     %% Stage 1: Unprotect header to get key_phase and PN info
-    case quic_aead:unprotect_short_header(HP, Header, EncryptedPayload, PNOffset) of
+    case quic_aead:unprotect_short_header(HpCipher, HP, Header, EncryptedPayload, PNOffset) of
         {error, Reason} ->
             {error, Reason};
         {ok, KeyPhase, PNLen, TruncatedPN, UnprotectedHeader} ->
@@ -5601,6 +5636,16 @@ process_crypto_buffer(Level, State) ->
             end
     end.
 
+%% Key logging is opt-in via SSLKEYLOGFILE and off otherwise; see
+%% quic_keylog for why it exists and what it exposes.
+keylog_handshake(ClientRandom, ClientSecret, ServerSecret) ->
+    quic_keylog:log(client_handshake, ClientRandom, ClientSecret),
+    quic_keylog:log(server_handshake, ClientRandom, ServerSecret).
+
+keylog_application(ClientRandom, ClientSecret, ServerSecret) ->
+    quic_keylog:log(client_application, ClientRandom, ClientSecret),
+    quic_keylog:log(server_application, ClientRandom, ServerSecret).
+
 %% Process TLS handshake data from CRYPTO frames
 process_tls_data(Level, Data, State) ->
     %% Prepend any buffered incomplete TLS data
@@ -5648,7 +5693,7 @@ process_tls_message(
                 session_id := SessionId
             } = ClientHelloInfo} ->
             %% Select cipher suite (prefer server's order)
-            Cipher = select_cipher(CipherSuites),
+            Cipher = select_cipher(CipherSuites, State#state.cipher_preference),
             %% RFC 8446 §4.1.4 group negotiation: use the client's
             %% key_share directly when possible, otherwise send a
             %% HelloRetryRequest for a mutually-supported group.
@@ -5692,6 +5737,15 @@ process_tls_message(
         {hrr, HrrInfo} ->
             handle_hello_retry_request(HrrInfo, OriginalMsg, State);
         {ok, #{cipher := Cipher} = ServerHelloMap} ->
+            %% RFC 8446 §4.1.3: the selected suite must be one we offered.
+            case lists:member(Cipher, State#state.cipher_preference) of
+                false ->
+                    notify_owner({error, {tls_alert, illegal_parameter}}, State),
+                    send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State),
+                    exit({tls_alert, illegal_parameter});
+                true ->
+                    ok
+            end,
             %% Determine handshake type: PSK (with or without DHE) vs
             %% standard cert-auth. PSK selection is signalled by the
             %% `selected_psk_identity' extension echoed in ServerHello.
@@ -5949,6 +6003,9 @@ process_tls_message(
                     ),
                     ServerAppSecret = quic_crypto:derive_server_app_secret(
                         Cipher, MasterSecret, TranscriptHashFinal
+                    ),
+                    keylog_application(
+                        State#state.tls_ch1_random, ClientAppSecret, ServerAppSecret
                     ),
 
                     %% Derive app keys
@@ -6300,6 +6357,7 @@ do_server_client_hello_cont(
     SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
 ) ->
     ClientALPN = maps:get(alpn_protocols, ClientHelloInfo, []),
+    ClientRandom = maps:get(random, ClientHelloInfo, undefined),
     TP = maps:get(transport_params, ClientHelloInfo, #{}),
     SessionId = maps:get(session_id, ClientHelloInfo, <<>>),
     %% Check for PSK (0-RTT/resumption/external)
@@ -6323,9 +6381,6 @@ do_server_client_hello_cont(
         end,
     ok,
 
-    %% For normal handshake, derive early secret from zero PSK
-    %% PSK-based resumption with full 0-RTT support requires additional changes
-    %% to skip Certificate/CertificateVerify - implementing basic 0-RTT decryption only
     HashLen0 =
         case Cipher of
             aes_256_gcm -> 48;
@@ -6333,13 +6388,14 @@ do_server_client_hello_cont(
         end,
     ZeroPSK = <<0:HashLen0/unit:8>>,
 
-    %% Derive early secret. External-PSK selection wins over both
-    %% resumption-PSK 0-RTT and the standard zero-PSK path.
+    %% Derive early secret. External-PSK selection wins over
+    %% resumption-PSK, which wins over the standard zero-PSK path.
     {EarlyKeys, EarlySecret, SelectedPsk} =
         case ExternalPskResult of
             {ok, #{secret := PSKSecret, mode := Mode} = Sel} ->
                 Selected = #{
                     identity => maps:get(identity, Sel),
+                    identity_idx => maps:get(identity_idx, Sel),
                     secret => PSKSecret,
                     mode => Mode
                 },
@@ -6350,9 +6406,7 @@ do_server_client_hello_cont(
                 };
             none ->
                 case PSKInfo of
-                    #{identities := [{Identity, _Age}], binders := [Binder]} when
-                        WantsEarlyData
-                    ->
+                    #{identities := [{Identity, _Age} | _], binders := [Binder | _]} ->
                         case validate_psk(Identity, Cipher, OriginalMsg, State) of
                             {ok, PSK, ResumptionSecret} ->
                                 PskBindersInfo = maps:get(psk_binders, ClientHelloInfo, undefined),
@@ -6367,21 +6421,42 @@ do_server_client_hello_cont(
                                         %% replayed (RFC 9001 §9.2).
                                         consume_ticket_globally(Identity),
                                         ES = quic_crypto:derive_early_secret(Cipher, PSK),
-                                        ClientHelloHash = quic_crypto:transcript_hash(
-                                            Cipher, OriginalMsg
-                                        ),
-                                        ETS = quic_crypto:derive_client_early_traffic_secret(
-                                            Cipher, ES, ClientHelloHash
-                                        ),
-                                        {Key, IV, HP} = quic_keys:derive_keys(ETS, Cipher),
-                                        EK = #crypto_keys{
-                                            key = Key, iv = IV, hp = HP, cipher = Cipher
+                                        %% The ticket's PSK carries the whole
+                                        %% handshake (psk_dhe_ke), so the cert
+                                        %% flight is skipped; before, it only
+                                        %% fed the 0-RTT keys and the
+                                        %% handshake fell back to a full
+                                        %% cert exchange on a zero PSK.
+                                        Selected = #{
+                                            identity => Identity,
+                                            identity_idx => 0,
+                                            secret => PSK,
+                                            mode => psk_dhe_ke
                                         },
-                                        {
-                                            {EK, ResumptionSecret},
-                                            quic_crypto:derive_early_secret(Cipher, ZeroPSK),
-                                            undefined
-                                        };
+                                        EK =
+                                            case WantsEarlyData of
+                                                true ->
+                                                    ClientHelloHash =
+                                                        quic_crypto:transcript_hash(
+                                                            Cipher, OriginalMsg
+                                                        ),
+                                                    ETS =
+                                                        quic_crypto:derive_client_early_traffic_secret(
+                                                            Cipher, ES, ClientHelloHash
+                                                        ),
+                                                    {Key, IV, HP} =
+                                                        quic_keys:derive_keys(ETS, Cipher),
+                                                    EKeys = #crypto_keys{
+                                                        key = Key,
+                                                        iv = IV,
+                                                        hp = HP,
+                                                        cipher = Cipher
+                                                    },
+                                                    {EKeys, ResumptionSecret};
+                                                false ->
+                                                    undefined
+                                            end,
+                                        {EK, ES, Selected};
                                     false ->
                                         ?LOG_WARNING(
                                             #{what => resumption_psk_binder_failed},
@@ -6391,6 +6466,8 @@ do_server_client_hello_cont(
                                         exit({tls_alert, decrypt_error})
                                 end;
                             error ->
+                                %% Unknown or expired ticket: fall back to a
+                                %% full handshake (RFC 8446 §4.2.11).
                                 {undefined, quic_crypto:derive_early_secret(Cipher, ZeroPSK),
                                     undefined}
                         end;
@@ -6440,10 +6517,10 @@ do_server_client_hello_cont(
         session_id => SessionId
     },
     ServerHelloOpts =
-        case {SelectedPsk, ExternalPskResult} of
-            {undefined, _} ->
+        case SelectedPsk of
+            undefined ->
                 ServerHelloOpts0;
-            {_, {ok, #{identity_idx := Idx, mode := SelMode}}} ->
+            #{identity_idx := Idx, mode := SelMode} ->
                 ServerHelloOpts0#{
                     selected_psk_identity => Idx,
                     selected_psk_mode => SelMode
@@ -6506,6 +6583,7 @@ do_server_client_hello_cont(
         negotiated_group = SelectedGroup,
         handshake_secret = HandshakeSecret,
         client_hs_secret = ClientHsSecret,
+        tls_ch1_random = ClientRandom,
         server_hs_secret = ServerHsSecret,
         handshake_keys = {ClientHsKeys, ServerHsKeys},
         alpn = ALPN,
@@ -6513,6 +6591,8 @@ do_server_client_hello_cont(
         early_data_accepted = (EarlyKeys =/= undefined andalso WantsEarlyData),
         selected_psk = SelectedPsk
     },
+    keylog_handshake(State#state.tls_ch1_random, ClientHsSecret, ServerHsSecret),
+    keylog_handshake(ClientRandom, ClientHsSecret, ServerHsSecret),
     %% Negotiate the CertificateVerify scheme up front (cert
     %% path only). No common scheme is fatal (RFC 8446 §4.4.3).
     case negotiate_cert_verify(SelectedPsk, State0) of
@@ -7489,10 +7569,6 @@ strip_brackets([$[ | Rest]) ->
 strip_brackets(Host) ->
     Host.
 
-%% Derive initial encryption keys
-derive_initial_keys(DCID) ->
-    derive_initial_keys(DCID, ?QUIC_VERSION_1).
-
 %% Derive initial encryption keys with specific QUIC version
 %% Version determines which salt to use (v1 vs v2)
 derive_initial_keys(DCID, Version) ->
@@ -8347,12 +8423,13 @@ do_send_zero_rtt_data(
             DataBin = iolist_to_binary(Data),
             Offset = StreamState#stream_state.send_offset,
 
-            %% Build STREAM frame
-            Frame = {stream, StreamId, Offset, DataBin, Fin},
-            Payload = quic_frame:encode(Frame),
-
-            %% Send as 0-RTT packet
-            NewState = send_zero_rtt_packet(Payload, EarlyKeys, State),
+            %% A write larger than one packet must be split like any
+            %% 1-RTT send; a single oversized 0-RTT packet leaves as one
+            %% IP-fragmented datagram, which QUIC forbids (RFC 9000 §14).
+            MaxChunk = get_max_stream_data_per_packet(State),
+            NewState = send_zero_rtt_chunks(
+                StreamId, Offset, DataBin, Fin, MaxChunk, EarlyKeys, State
+            ),
 
             %% Update stream state and track early data sent
             NewStreamState = StreamState#stream_state{
@@ -8377,9 +8454,21 @@ do_send_zero_rtt_data(
             {error, unknown_stream}
     end.
 
+%% Split a 0-RTT write into per-packet STREAM frames, FIN on the last.
+send_zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk, EarlyKeys, State) when
+    byte_size(Data) =< MaxChunk
+->
+    Frame = {stream, StreamId, Offset, Data, Fin},
+    send_zero_rtt_packet(quic_frame:encode(Frame), [Frame], EarlyKeys, State);
+send_zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk, EarlyKeys, State) ->
+    <<Chunk:MaxChunk/binary, Rest/binary>> = Data,
+    Frame = {stream, StreamId, Offset, Chunk, false},
+    State1 = send_zero_rtt_packet(quic_frame:encode(Frame), [Frame], EarlyKeys, State),
+    send_zero_rtt_chunks(StreamId, Offset + MaxChunk, Rest, Fin, MaxChunk, EarlyKeys, State1).
+
 %% Send a 0-RTT packet (long header, type 1)
 %% RFC 9001 Section 5.3: 0-RTT packets use early traffic keys
-send_zero_rtt_packet(Payload, EarlyKeys, State) ->
+send_zero_rtt_packet(Payload, Frames, EarlyKeys, State) ->
     #state{
         scid = SCID,
         dcid = DCID,
@@ -8415,12 +8504,25 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
     ),
     NewSocketState = send_and_take_socket_state(Packet, State),
 
+    %% 0-RTT shares the application PN space, so it must be tracked for
+    %% loss detection like any 1-RTT packet: a dropped 0-RTT request was
+    %% otherwise never retransmitted and the stream hung forever (RFC
+    %% 9001 §4.1.1 expects lost 0-RTT data to be resent).
+    Now = erlang:monotonic_time(millisecond),
+    NewLossState = quic_loss:on_packet_sent(
+        State#state.loss_state, PN, byte_size(Packet), true, Frames, Now
+    ),
+    NewCCState = quic_cc:on_packet_sent(State#state.cc_state, byte_size(Packet)),
+
     %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
     State#state{
         pn_app = NewPNSpace,
         packets_sent = State#state.packets_sent + 1,
-        socket_state = NewSocketState
+        socket_state = NewSocketState,
+        loss_state = NewLossState,
+        cc_state = NewCCState,
+        pto_dirty = true
     }.
 
 %% Reset local state for all streams that carried 0-RTT data when the
@@ -10191,6 +10293,12 @@ handle_pto_timeout(#state{loss_state = LossState} = State) ->
 
 %% Send a probe packet for PTO
 %% PTO probes are allowed to use control_allowance per RFC 9002
+%% App-space PTO can fire before 1-RTT keys exist when tracked 0-RTT
+%% packets are outstanding. Handshake-space recovery drives progress
+%% until the keys arrive; sending nothing here avoids building an app
+%% packet without keys.
+send_probe_packet(#state{app_keys = undefined} = State) ->
+    State;
 send_probe_packet(State) ->
     case get_oldest_unacked_frames(State) of
         {ok, Frames} ->
