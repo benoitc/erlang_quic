@@ -2173,7 +2173,10 @@ connected(
     State4 = set_keep_alive_timer(update_last_activity(State3b)),
     %% RFC 8899: Initialize PMTU discovery after handshake
     State5 = init_pmtu_probing(TransportParams, State4),
-    {keep_state, State5};
+    %% Everything queued above (pending data, NEW_TOKEN, the first PMTU
+    %% probe) sits in the send batch; without a flush here it would
+    %% only leave with the next event on this connection.
+    {keep_state, flush_dirty_timers(flush_socket_batch(State5))};
 connected({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 connected({call, From}, get_state, State) ->
@@ -2370,7 +2373,7 @@ connected(
     %% Return packet counts for liveness detection (net_kernel uses
     %% recv count to verify peer is alive) plus send-path batching
     %% counters for benchmarks and tests.
-    {Flushes, Coalesced, GSOFlushes} = send_batch_counters(SocketState),
+    {Flushes, Coalesced, GSOFlushes, Pending} = send_batch_counters(SocketState),
     Stats = #{
         packets_received => PacketsRecv,
         packets_sent => PacketsSent,
@@ -2380,7 +2383,10 @@ connected(
         retransmits => Retransmits,
         batch_flushes => Flushes,
         packets_coalesced => Coalesced,
-        gso_flushes => GSOFlushes
+        gso_flushes => GSOFlushes,
+        %% Packets built but not yet handed to the socket. Non-zero
+        %% between events means a handler forgot to flush.
+        send_batch_pending => Pending
     },
     {keep_state, State, [{reply, From, {ok, Stats}}]};
 connected({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
@@ -11323,13 +11329,14 @@ send_gso_supported(SocketState) ->
     maps:get(gso_supported, quic_socket:info(SocketState)).
 
 send_batch_counters(undefined) ->
-    {0, 0, 0};
+    {0, 0, 0, 0};
 send_batch_counters(SocketState) ->
     Info = quic_socket:info(SocketState),
     {
         maps:get(batch_flushes, Info),
         maps:get(packets_coalesced, Info),
-        maps:get(gso_flushes, Info)
+        maps:get(gso_flushes, Info),
+        maps:get(batch_pending, Info)
     }.
 
 %% Normalize ALPN list - handles binary, list of binaries, list of strings

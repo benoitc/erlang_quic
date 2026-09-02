@@ -339,6 +339,7 @@ gso_supported(#socket_state{gso_supported = Supported}) ->
         gro_enabled := boolean(),
         batching_enabled := boolean(),
         max_batch_packets := pos_integer(),
+        batch_pending := non_neg_integer(),
         batch_flushes := non_neg_integer(),
         packets_coalesced := non_neg_integer(),
         gso_flushes := non_neg_integer()
@@ -352,10 +353,12 @@ info(#socket_state{
     max_batch_packets = MaxBatch,
     batch_flushes = Flushes,
     packets_coalesced = Coalesced,
-    gso_flushes = GSOFlushes
+    gso_flushes = GSOFlushes,
+    batch_count = Pending
 }) ->
     #{
         backend => Backend,
+        batch_pending => Pending,
         gso_supported => GSO,
         gso_size => GSOSize,
         gro_enabled => GRO,

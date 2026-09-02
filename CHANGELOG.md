@@ -55,6 +55,14 @@ All notable changes to this project will be documented in this file.
   millisecond clock, capping bulk streams at roughly 85 MB/s regardless
   of the paced rate. Together with the previous fix, a verified
   single-stream loopback bulk transfer went from 83 to 194 MiB/s.
+- The frames a connection sends on entering `connected` (data queued
+  before the handshake finished, the server's NEW_TOKEN, the first PMTU
+  probe) leave with that transition. They went through the send batch
+  and the state-enter handler returned without flushing it, so they
+  waited for the next event on the connection: on a quiet connection the
+  peer's delayed ACK or a PTO. `get_stats` now reports
+  `send_batch_pending`, the packets built but not yet handed to the
+  socket, which is what caught this.
 
 ### Changed
 - The interop runner declares the passive robustness cases (longrtt,
