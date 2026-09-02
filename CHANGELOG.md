@@ -41,6 +41,10 @@ All notable changes to this project will be documented in this file.
   The map version rebuilt the whole buffer on every miss; with a
   multi-megabyte hole under loss recovery that walk dominated receiver
   CPU.
+- The per-packet receive bookkeeping on the 1-RTT path (PN space, spin
+  bit, activity stamp) is one state update instead of three; the three
+  separate helpers each rebuilt the full connection state and together
+  cost about a tenth of receive CPU on bulk flows.
 
 ## [1.8.2] - 2026-09-05
 
