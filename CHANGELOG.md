@@ -4,7 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `max_burst_packets` bounds how many packets leave per send drain, so a
+  large queued write cannot monopolise the scheduler. Contributed by
+  jbevemyr (#214).
+- `ack_packet_tolerance` makes the 1-RTT ACK decimation threshold
+  configurable; it defaults to the RFC 9000 section 13.2.1 value of 2.
+  Contributed by jbevemyr (#213).
+
 ### Fixed
+- The GSO segment size is derived from the batch instead of a
+  configured constant. 1-RTT packets follow the current max datagram
+  size, so the uniformity check against the fixed 1200 never matched and
+  the GSO path never ran; a batch is now split into runs of equal-sized
+  packets and each run segmented on its own size. Each write is capped
+  at 64 segments and 64 KB, and GSO is requested per message rather than
+  as a socket-level `UDP_SEGMENT`, which segmented every datagram
+  including handshake packets. Reported by jbevemyr (#196).
+- The socket-backend client binds the source address from
+  `extra_socket_opts` instead of leaving it to the kernel's route
+  lookup, which picks the wrong address on a multi-address host.
+  Contributed by jbevemyr (#261).
+- A GRO train reaches the client connection as one message rather than
+  one per packet, so the whole train is processed in a single receive
+  pass. Contributed by jbevemyr (#248).
 - PTO probe packets are exempt from the congestion window and loss
   retransmissions are bound to it, per RFC 9002 section 7. A probe is
   the only thing that can restart a stalled connection, so blocking it
