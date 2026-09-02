@@ -146,6 +146,7 @@
     convert_rest_ranges/2,
     check_send_queue_flow_control/4,
     test_check_flow_control/6,
+    test_queue_blocked_send/5,
     close_reason_to_code/1,
     %% Migration frame classification (RFC 9000 Section 9.1)
     is_probing_frame/1,
@@ -168,6 +169,10 @@
     test_state_for_reset/3,
     %% Retransmission congestion policy (RFC 9002 §7)
     retransmit_cc_allowed/3,
+    %% Anti-amplification accounting on the batched path (RFC 9000 §8.1)
+    handle_packets_batch/2,
+    test_state_amp/2,
+    test_amp_counters/1,
     %% NEW_TOKEN frame dispatch (RFC 9000 §8.1.3)
     process_frame/3,
     test_state_for_role/1,
@@ -219,9 +224,12 @@
 %% so it can flush the deferred flight. Backoff doubles from the base up
 %% to the cap. Localhost handshakes complete well under the base, so the
 %% timer is cancelled by the state change and never fires.
--define(HS_RTX_BASE_MS, 500).
--define(HS_RTX_MAX_MS, 4000).
--define(HS_RTX_MAX_ATTEMPTS, 8).
+%% 200 ms base keeps a lossy handshake moving at something closer to
+%% PTO cadence on low-RTT paths; 12 attempts bound the total effort to
+%% roughly half a minute before the connect timeout owns the outcome.
+-define(HS_RTX_BASE_MS, 200).
+-define(HS_RTX_MAX_MS, 3000).
+-define(HS_RTX_MAX_ATTEMPTS, 12).
 
 %% Max send queue size in bytes (16 MB default) - prevents memory exhaustion from queued data
 -define(MAX_SEND_QUEUE_BYTES, 16777216).
@@ -242,6 +250,12 @@
 %% Default per-drain send burst budget in packets (max_burst_packets
 %% option). See the burst_budget field.
 -define(DEFAULT_MAX_BURST_PACKETS, 64).
+
+%% Bounds on the client Finished retransmission interval. The floor keeps
+%% a near-zero PTO from spinning; the ceiling keeps a long RTT estimate
+%% from parking the flight past the idle timeout.
+-define(HS_FLIGHT_MIN_INTERVAL, 100).
+-define(HS_FLIGHT_MAX_INTERVAL, 3000).
 
 %% Max receive buffer size in bytes (32 MB total across all streams) - protects against malicious peers
 -define(MAX_RECV_BUFFER_BYTES, 33554432).
@@ -369,8 +383,28 @@
     %% one-shot flight; bumps after HRR so CH2 / ServerHello continue
     %% the stream (RFC 9001 §4.1.3).
     initial_tx_off = 0 :: non_neg_integer(),
+    %% Server handshake-flight retransmission: the ServerHello (with its
+    %% Initial CRYPTO offset) and the Handshake-level payload are kept
+    %% until the client's Finished arrives, and replayed on a backoff
+    %% timer. Initial/Handshake packets are not loss-tracked, so without
+    %% this a single lost flight wedges the handshake permanently: the
+    %% client's Initial retransmits only elicit ACKs once the server TLS
+    %% state has advanced.
+    server_flight = undefined :: undefined | {binary(), non_neg_integer(), binary()},
+    server_hs_rtx_timer = undefined :: undefined | reference(),
+    server_hs_rtx_attempts = 0 :: non_neg_integer(),
     %% Client-side: CH1 random + build opts, needed to rebuild CH2
     tls_ch1_random :: binary() | undefined,
+    %% Client-side: the Certificate(+CertificateVerify)+Finished payload,
+    %% retained until HANDSHAKE_DONE so a lost Finished can be resent -
+    %% nothing else retransmits it once the statem has left `handshaking'.
+    client_hs_flight = undefined :: undefined | binary(),
+    %% Retransmission timer for that flight, armed while it is retained.
+    %% The flight has to carry its own timer: once the statem leaves
+    %% `handshaking' nothing else is guaranteed to be in flight to arm a
+    %% PTO, so a lost Finished had no schedule to resend it on.
+    hs_flight_timer = undefined :: reference() | undefined,
+    hs_flight_tries = 0 :: non_neg_integer(),
     tls_ch1_opts :: map() | undefined,
     %% Negotiated values surfaced in the connected event
     negotiated_group :: atom() | undefined,
@@ -2452,6 +2486,24 @@ handle_common_event(cast, handle_timeout, _StateName, State) ->
     %% Handle loss detection / idle timeout
     NewState = check_timeouts(State),
     {keep_state, NewState};
+%% The retained client Finished flight has its own schedule: resend it
+%% until the server confirms the handshake. Nothing else is guaranteed
+%% to be in flight once the statem has left `handshaking', so without
+%% this a Finished lost twice was never resent.
+handle_common_event(
+    info,
+    {hs_flight_timeout, Ref},
+    _StateName,
+    #state{hs_flight_timer = Ref, client_hs_flight = Flight, handshake_keys = HsKeys} = State
+) when Ref =/= undefined andalso Flight =/= undefined andalso HsKeys =/= undefined ->
+    State1 = send_handshake_crypto(Flight, State),
+    State2 = arm_hs_flight_timer(State1#state{
+        hs_flight_tries = State1#state.hs_flight_tries + 1
+    }),
+    {keep_state, flush_dirty_timers(flush_socket_batch(State2))};
+handle_common_event(info, {hs_flight_timeout, _Ref}, _StateName, State) ->
+    %% Stale timer, or the flight is already confirmed.
+    {keep_state, State};
 handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref} = State) when
     Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
 ->
@@ -2542,10 +2594,45 @@ handle_common_event(
     #state{owner_mon = Mon} = State
 ) ->
     {stop, {shutdown, owner_down}, State};
+handle_common_event(
+    info,
+    {server_hs_rtx, Ref},
+    _StateName,
+    #state{server_hs_rtx_timer = Ref, role = server} = State
+) ->
+    {keep_state, server_hs_retransmit(State#state{server_hs_rtx_timer = undefined})};
+handle_common_event(info, {server_hs_rtx, _Stale}, _StateName, State) ->
+    {keep_state, State};
 handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     %% EXIT signals are handled in terminate/3 callback
     %% Just ignore here - the process will terminate anyway if it's from parent
     {keep_state, State};
+%% An async send can arrive before the state machine reaches `connected':
+%% the owner is told the connection is up a flight before the handshake
+%% concludes, so this is an ordinary race rather than misuse. Queue it the
+%% way the synchronous handshaking-state clause does, to be flushed by
+%% send_pending_data/2 on entering `connected'. Falling through to the
+%% catch-all below would discard it, and send_data_async cannot retry.
+handle_common_event(
+    cast,
+    {send_data_async, StreamId, Data, Fin},
+    StateName,
+    #state{pending_data = Pending} = State
+) ->
+    case length(Pending) >= ?MAX_PENDING_DATA_ENTRIES of
+        true ->
+            ?LOG_WARNING(
+                #{
+                    what => async_send_dropped_pending_limit,
+                    state => StateName,
+                    stream_id => StreamId
+                },
+                ?QUIC_LOG_META
+            ),
+            {keep_state, State};
+        false ->
+            {keep_state, State#state{pending_data = Pending ++ [{StreamId, Data, Fin}]}}
+    end;
 %% Return error for unhandled calls to prevent timeout
 handle_common_event({call, From}, _Request, StateName, State) ->
     {keep_state, State, [{reply, From, {error, {invalid_state, StateName}}}]};
@@ -2886,7 +2973,10 @@ ensure_ticket_table() ->
 %% Initial CRYPTO offset (non-zero only after a HelloRetryRequest).
 send_server_hello(ServerHelloMsg, State) ->
     Off = State#state.initial_tx_off,
-    State1 = State#state{initial_tx_off = Off + byte_size(ServerHelloMsg)},
+    State1 = State#state{
+        initial_tx_off = Off + byte_size(ServerHelloMsg),
+        server_flight = {ServerHelloMsg, Off, <<>>}
+    },
     %% Chunk across Initial packets: a hybrid ServerHello Initial is
     %% ~1225 bytes and no longer fits one datagram.
     {_Frames, NewState} = send_initial_crypto(ServerHelloMsg, Off, State1),
@@ -3137,7 +3227,15 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
 
     %% Send the flight, segmented so no datagram exceeds the peer's
     %% max_udp_payload_size (issue #134).
-    send_handshake_crypto(HandshakePayload, State1).
+    State2 = send_handshake_crypto(HandshakePayload, State1),
+    State3 =
+        case State2#state.server_flight of
+            {SH, SHOff, _} ->
+                State2#state{server_flight = {SH, SHOff, HandshakePayload}};
+            undefined ->
+                State2
+        end,
+    arm_server_hs_rtx(State3).
 
 %% @private Send a handshake CRYPTO payload as one or more packets,
 %% each sized to stay within max_udp_payload_size (RFC 9000 §14.1).
@@ -3936,6 +4034,49 @@ amp_flush_budget(#state{amp_deferred = [Packet | Rest]} = State) ->
             State
     end.
 
+%% Arm (or re-arm) the server handshake-flight retransmit timer.
+arm_server_hs_rtx(#state{role = server, server_flight = {_, _, _}} = State) ->
+    case State#state.server_hs_rtx_attempts < ?HS_RTX_MAX_ATTEMPTS of
+        true ->
+            Delay = min(
+                ?HS_RTX_BASE_MS bsl State#state.server_hs_rtx_attempts, ?HS_RTX_MAX_MS
+            ),
+            Ref = make_ref(),
+            erlang:send_after(Delay, self(), {server_hs_rtx, Ref}),
+            State#state{server_hs_rtx_timer = Ref};
+        false ->
+            State#state{server_hs_rtx_timer = undefined}
+    end;
+arm_server_hs_rtx(State) ->
+    State.
+
+%% Replay the retained server flight: ServerHello at its original
+%% Initial CRYPTO offset plus the Handshake payload (offset 0). New
+%% packet numbers, identical crypto stream bytes, so the client's
+%% reassembly is byte-exact regardless of what it already received.
+server_hs_retransmit(#state{tls_state = ?TLS_HANDSHAKE_COMPLETE} = State) ->
+    State#state{server_flight = undefined};
+server_hs_retransmit(#state{server_flight = {SH, SHOff, HsPayload}} = State) ->
+    ?LOG_WARNING(
+        #{
+            what => server_handshake_flight_retransmit,
+            attempt => State#state.server_hs_rtx_attempts + 1
+        },
+        ?QUIC_LOG_META
+    ),
+    {_Frames, State1} = send_initial_crypto(SH, SHOff, State),
+    State2 =
+        case HsPayload of
+            <<>> -> State1;
+            _ -> send_handshake_crypto(HsPayload, State1)
+        end,
+    State3 = State2#state{
+        server_hs_rtx_attempts = State2#state.server_hs_rtx_attempts + 1
+    },
+    arm_server_hs_rtx(flush_dirty_timers(flush_socket_batch(State3)));
+server_hs_retransmit(State) ->
+    State.
+
 %% State-timeout action driving client Initial retransmission while the
 %% handshake is incomplete. Empty for the server, once connected, or once
 %% the attempt budget is spent (the idle timeout then closes).
@@ -3977,13 +4118,23 @@ retransmit_initial_flight(
 retransmit_initial_flight(_StateName, State) ->
     {keep_state, State}.
 
+%% Batched variant of handle_packet/2: same anti-amplification
+%% accounting per datagram, one deferred-flight flush per batch. The
+%% batched delivery path previously skipped accounting entirely, so a
+%% server's amp budget froze at the first datagram under load and
+%% deferred flights never flushed.
+handle_packets_batch(Packets, State) ->
+    State1 = lists:foldl(fun amp_account_recv/2, State, Packets),
+    State2 = do_handle_packets_batch(Packets, State1),
+    amp_flush(State2).
+
 %% Handle batch of packets from GRO - process all without re-entering gen_statem
 %% This is more efficient than receiving multiple messages
-handle_packets_batch([], State) ->
+do_handle_packets_batch([], State) ->
     State;
-handle_packets_batch([Packet | Rest], State) ->
+do_handle_packets_batch([Packet | Rest], State) ->
     NewState = handle_packet_loop(Packet, State),
-    handle_packets_batch(Rest, NewState).
+    do_handle_packets_batch(Rest, NewState).
 
 handle_packet_loop(<<>>, #state{role = client, active_n = N} = State) ->
     %% No more data to process - re-enable socket for client connections
@@ -4820,7 +4971,9 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
     end;
 %% HANDSHAKE_DONE: Server confirms handshake complete
 %% RFC 9000 Section 19.20: Only server can send, only in 1-RTT (app level)
-process_frame(app, handshake_done, #state{role = client} = State) ->
+process_frame(app, handshake_done, #state{role = client} = State0) ->
+    %% Handshake confirmed: the retained Finished flight is done.
+    State = clear_hs_flight(State0),
     %% Server confirmed handshake complete (client receiving from server)
     State;
 process_frame(app, handshake_done, #state{role = server} = State) ->
@@ -5346,11 +5499,29 @@ buffer_crypto_data(Level, Offset, Data, State) ->
                 ?QUIC_CRYPTO_BUFFER_EXCEEDED, <<"crypto buffer exceeded">>, State
             );
         false ->
+            %% A handshake-level CRYPTO duplicate from offset 0 at a
+            %% client that has sent its Finished means the server's
+            %% retransmission timer fired: the Finished was lost, and
+            %% nothing else retransmits it once the statem has left
+            %% `handshaking'. Resend it (CRYPTO offsets are idempotent).
+            Expected = maps:get(LevelAtom, State#state.crypto_offset, 0),
+            State0 =
+                case
+                    LevelAtom =:= handshake andalso
+                        State#state.role =:= client andalso
+                        State#state.client_hs_flight =/= undefined andalso
+                        Offset =:= 0 andalso Expected > 0
+                of
+                    true ->
+                        send_handshake_crypto(State#state.client_hs_flight, State);
+                    false ->
+                        State
+                end,
             %% Add data to buffer
             NewBuffer = maps:put(Offset, Data, Buffer),
-            NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State#state.crypto_buffer),
+            NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State0#state.crypto_buffer),
 
-            State1 = State#state{crypto_buffer = NewCryptoBuffer},
+            State1 = State0#state{crypto_buffer = NewCryptoBuffer},
 
             %% Try to process contiguous data
             process_crypto_buffer(LevelAtom, State1)
@@ -5809,8 +5980,12 @@ process_tls_message(
                     %% Combine Certificate(+CertificateVerify) and Finished into one payload
                     HandshakePayload = <<CertPayload/binary, ClientFinishedMsg/binary>>,
 
-                    State1 = State#state{
+                    State0a = arm_hs_flight_timer(State#state{
+                        client_hs_flight = HandshakePayload
+                    }),
+                    State1 = State0a#state{
                         tls_state = ?TLS_HANDSHAKE_COMPLETE,
+                        client_hs_flight = HandshakePayload,
                         tls_transcript = <<Transcript2/binary, ClientFinishedMsg/binary>>,
                         master_secret = MasterSecret,
                         app_keys = {ClientAppKeys, ServerAppKeys},
@@ -5860,9 +6035,11 @@ process_tls_message(
                     ),
 
                     %% Application keys are already derived when server sent its Finished
-                    %% Mark handshake as complete
+                    %% Mark handshake as complete; the retained flight is
+                    %% no longer needed for retransmission.
                     State1 = State#state{
                         tls_state = ?TLS_HANDSHAKE_COMPLETE,
+                        server_flight = undefined,
                         tls_transcript = Transcript,
                         resumption_secret = ResumptionSecret
                     },
@@ -7936,7 +8113,30 @@ do_send_data(
                         ?QUIC_LOG_META
                     ),
 
+                    Allowed = min(ConnectionAllowed, StreamAllowed),
                     case {DataSize =< ConnectionAllowed, DataSize =< StreamAllowed} of
+                        Fits when Fits =/= {true, true}, Allowed > 0 ->
+                            %% Part of this write fits in the peer's window.
+                            %% Send that part and queue the rest: queuing the
+                            %% whole write instead deadlocks the transfer,
+                            %% because the peer only extends the window as it
+                            %% consumes data, so sending nothing means nothing
+                            %% ever arrives to open it.
+                            Bin = iolist_to_binary(Data),
+                            <<Head:Allowed/binary, Tail/binary>> = Bin,
+                            case do_send_data(StreamId, Head, false, State) of
+                                {ok, SentState} ->
+                                    queue_blocked_send(
+                                        StreamId,
+                                        Offset + Allowed,
+                                        Tail,
+                                        Fin,
+                                        byte_size(Tail),
+                                        SentState
+                                    );
+                                Other ->
+                                    Other
+                            end;
                         {false, _} ->
                             %% Connection-level flow control blocked
                             %% RFC 9000: Don't queue data beyond flow control limits.
@@ -7952,13 +8152,12 @@ do_send_data(
                             ),
                             %% RFC 9000 Section 19.12: DATA_BLOCKED reports the connection data limit
                             BlockedFrame = {data_blocked, MaxDataRemote},
-                            _FinalState = send_frame(BlockedFrame, State),
-                            {error, {flow_control_blocked, connection}};
+                            State1 = send_frame(BlockedFrame, State),
+                            queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State1);
                         {_, false} ->
-                            %% Stream-level flow control blocked
-                            %% RFC 9000: Don't queue data beyond flow control limits.
-                            %% Send STREAM_DATA_BLOCKED and return error to caller.
-                            %% Caller should retry after receiving MAX_STREAM_DATA from peer.
+                            %% Stream-level flow control blocked. Send
+                            %% STREAM_DATA_BLOCKED and queue; the send queue is
+                            %% drained when MAX_STREAM_DATA arrives.
                             ?LOG_DEBUG(
                                 #{
                                     what => stream_flow_control_blocked,
@@ -7970,8 +8169,8 @@ do_send_data(
                             ),
                             %% RFC 9000 Section 19.13: STREAM_DATA_BLOCKED reports the stream data limit
                             BlockedFrame = {stream_data_blocked, StreamId, SendMaxData},
-                            _FinalState = send_frame(BlockedFrame, State),
-                            {error, {flow_control_blocked, {stream, StreamId}}};
+                            State1 = send_frame(BlockedFrame, State),
+                            queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State1);
                         {true, true} ->
                             %% Flow control allows sending
                             %% Fragment and send data - congestion control may partially
@@ -8531,6 +8730,33 @@ send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSen
                 {error, send_queue_full} ->
                     {error, send_queue_full}
             end
+    end.
+
+%% Queue a send the peer's flow-control window has no room for, rather
+%% than returning an error. process_send_queue/1 drains it when MAX_DATA
+%% or MAX_STREAM_DATA arrives. An error here is silently lost for
+%% send_data_async callers, which are fire-and-forget and have no way to
+%% retry, and the loss is invisible to both ends: the bytes never reach
+%% the wire, so the peer cannot detect a gap, and the next send on the
+%% stream simply continues from a later offset.
+%%
+%% The send offset is advanced at queue time so later sends on the stream
+%% order behind this entry. QUIC reassembly is offset-based, so the order
+%% the queued entries actually go out in does not matter.
+queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State) ->
+    case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+        {ok, QState} ->
+            case maps:find(StreamId, QState#state.streams) of
+                {ok, Stream} ->
+                    NewStream = Stream#stream_state{send_offset = Offset + DataSize},
+                    {ok, QState#state{
+                        streams = maps:put(StreamId, NewStream, QState#state.streams)
+                    }};
+                error ->
+                    {ok, QState}
+            end;
+        {error, send_queue_full} = Error ->
+            Error
     end.
 
 %% Queue stream data when congestion window is full
@@ -9647,8 +9873,23 @@ handle_pto_timeout(#state{loss_state = LossState} = State) ->
     NewLossState = quic_loss:on_pto_expired(LossState),
     State1 = State#state{loss_state = NewLossState},
 
+    %% RFC 9002 §6.2.1: until the handshake is confirmed the PTO probes
+    %% the handshake space too. The retained Finished flight is exactly
+    %% that: a client whose Finished was lost against a server that has
+    %% stopped retransmitting its own flight would otherwise probe only
+    %% 1-RTT data the server cannot act on before handshake completion.
+    State1a =
+        case State1 of
+            #state{role = client, client_hs_flight = Flight, handshake_keys = HsKeys} when
+                Flight =/= undefined, HsKeys =/= undefined
+            ->
+                send_handshake_crypto(Flight, State1);
+            _ ->
+                State1
+        end,
+
     %% Send probe packet (retransmit oldest unacked or send PING)
-    State2 = send_probe_packet(State1),
+    State2 = send_probe_packet(State1a),
 
     %% Probes use the control allowance, so retry any CC-deferred control
     %% retransmits here too (they are not in sent_q for the probe to pick up).
@@ -11631,6 +11872,27 @@ set_pmtu_probe_timer(#state{pmtu_probe_timer = OldTimer, loss_state = LossState}
     erlang:send_after(Timeout, self(), {pmtu_probe_timeout, Ref}),
     State#state{pmtu_probe_timer = Ref}.
 
+%% Arm the retransmission timer for the retained client Finished flight.
+%% RFC 9002 section 6.2: until the handshake is confirmed the client
+%% probes the handshake space, and the interval doubles on each attempt.
+arm_hs_flight_timer(#state{loss_state = LossState, hs_flight_tries = Tries} = State) ->
+    _ = cancel_timer(State#state.hs_flight_timer),
+    Base = max(?HS_FLIGHT_MIN_INTERVAL, quic_loss:get_pto(LossState)),
+    Timeout = min(?HS_FLIGHT_MAX_INTERVAL, Base bsl min(Tries, 4)),
+    Ref = make_ref(),
+    erlang:send_after(Timeout, self(), {hs_flight_timeout, Ref}),
+    State#state{hs_flight_timer = Ref}.
+
+%% The flight is acknowledged (HANDSHAKE_DONE, or a 1-RTT ack that only a
+%% server holding our Finished could have sent): stop resending it.
+clear_hs_flight(State) ->
+    _ = cancel_timer(State#state.hs_flight_timer),
+    State#state{
+        client_hs_flight = undefined,
+        hs_flight_timer = undefined,
+        hs_flight_tries = 0
+    }.
+
 %% @doc Set the PMTU raise timer for periodic re-probing.
 %% Uses unique reference in message to detect stale timer events
 -spec maybe_set_pmtu_raise_timer(#state{}) -> #state{}.
@@ -11812,6 +12074,17 @@ test_state_for_reset(DCID, PeerCIDPool, Secret) ->
         stateless_reset_secret = Secret
     }.
 
+%% Minimal #state{} for pinning the anti-amplification accounting on the
+%% batched receive path. The datagrams fed through it are junk the parser
+%% drops, so only the accounting itself is exercised.
+-spec test_state_amp(client | server, boolean()) -> #state{}.
+test_state_amp(Role, Validated) ->
+    #state{role = Role, address_validated = Validated}.
+
+-spec test_amp_counters(#state{}) -> #{atom() => non_neg_integer()}.
+test_amp_counters(#state{amp_rx = Rx, amp_tx = Tx, amp_deferred = Deferred}) ->
+    #{amp_rx => Rx, amp_tx => Tx, deferred => length(Deferred)}.
+
 %% Minimal #state{} scoped to role for frame-dispatch tests.
 -spec test_state_for_role(client | server) -> #state{}.
 test_state_for_role(Role) ->
@@ -11875,6 +12148,21 @@ test_check_flow_control(StreamId, Offset, DataSize, MaxDataRemote, DataSent, Str
         streams = Streams
     },
     check_send_queue_flow_control(StreamId, Offset, DataSize, State).
+
+%% Test helper for queue_blocked_send/6. A send the peer's window has no
+%% room for must be queued, not dropped, and the stream offset must
+%% advance so later sends order behind it.
+%% Returns {ok, NewSendOffset, QueuedCount} | {error, Reason}.
+test_queue_blocked_send(StreamId, Offset, Data, Fin, SendOffset) ->
+    Stream = #stream_state{send_offset = SendOffset, send_max_data = 0},
+    State = #state{streams = #{StreamId => Stream}},
+    case queue_blocked_send(StreamId, Offset, Data, Fin, iolist_size(Data), State) of
+        {ok, S2} ->
+            #{StreamId := S} = S2#state.streams,
+            {ok, S#stream_state.send_offset, S2#state.send_queue_count};
+        Error ->
+            Error
+    end.
 
 %% Test helper for complete_migration/2.
 %% Tests that path_changed notification is sent to owner on active migration.

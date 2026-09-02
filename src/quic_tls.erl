@@ -586,9 +586,10 @@ parse_certificate_verify(_) ->
 %% @doc Parse Finished message.
 -spec parse_finished(binary()) -> {ok, binary()} | {error, term()}.
 parse_finished(VerifyData) when byte_size(VerifyData) >= 32 ->
-    %% SHA-256 produces 32 bytes
-    <<Data:32/binary, _/binary>> = VerifyData,
-    {ok, Data};
+    %% The verify_data length depends on the negotiated hash (32 for
+    %% SHA-256, 48 for SHA-384), so return the whole body and let
+    %% verification compare.
+    {ok, VerifyData};
 parse_finished(_) ->
     {error, invalid_finished}.
 
@@ -609,14 +610,21 @@ build_finished(VerifyData) ->
 verify_finished(ReceivedVerifyData, TrafficSecret, TranscriptHash) ->
     FinishedKey = quic_crypto:derive_finished_key(TrafficSecret),
     ExpectedVerifyData = quic_crypto:compute_finished_verify(FinishedKey, TranscriptHash),
-    crypto:hash_equals(ReceivedVerifyData, ExpectedVerifyData).
+    hash_equals(ReceivedVerifyData, ExpectedVerifyData).
 
 %% @doc Verify a Finished message with cipher-specific hash.
 -spec verify_finished(binary(), binary(), binary(), atom()) -> boolean().
 verify_finished(ReceivedVerifyData, TrafficSecret, TranscriptHash, Cipher) ->
     FinishedKey = quic_crypto:derive_finished_key(Cipher, TrafficSecret),
     ExpectedVerifyData = quic_crypto:compute_finished_verify(Cipher, FinishedKey, TranscriptHash),
-    crypto:hash_equals(ReceivedVerifyData, ExpectedVerifyData).
+    hash_equals(ReceivedVerifyData, ExpectedVerifyData).
+
+%% crypto:hash_equals/2 raises badarg on length mismatch; a wrong-length
+%% verify_data is a verification failure, not a crash.
+hash_equals(A, B) when byte_size(A) =:= byte_size(B) ->
+    crypto:hash_equals(A, B);
+hash_equals(_, _) ->
+    false.
 
 %%====================================================================
 %% Transport Parameters
@@ -919,8 +927,11 @@ decode_handshake_message(<<Type:8, Length:24, Body:Length/binary, Rest/binary>>)
     {ok, {Type, Body}, Rest};
 decode_handshake_message(<<_Type:8, Length:24, Data/binary>>) when byte_size(Data) < Length ->
     {error, incomplete};
+%% Fewer than 4 bytes: the message header itself is split across CRYPTO
+%% frames. There is no invalid framing at this layer, only insufficient
+%% data; malformed content is rejected by the per-message parsers.
 decode_handshake_message(_) ->
-    {error, invalid}.
+    {error, incomplete}.
 
 %%====================================================================
 %% Internal Functions
@@ -1571,7 +1582,7 @@ verify_psk_binder(Secret, Cipher, TruncatedHash, OfferedBinder) ->
     Expected = quic_crypto:compute_psk_binder(
         Cipher, EarlySecret, TruncatedHash, external
     ),
-    crypto:hash_equals(Expected, OfferedBinder).
+    hash_equals(Expected, OfferedBinder).
 
 %% @doc Verify a resumption PSK binder against a parsed ClientHello.
 %% `Secret' is the resumption PSK, `PskBindersInfo' is the `psk_binders'
@@ -1586,7 +1597,7 @@ verify_resumption_binder(Secret, Cipher, FullClientHello, PskBindersInfo, Offere
     Expected = quic_crypto:compute_psk_binder(
         Cipher, EarlySecret, TruncatedHash, resumption
     ),
-    crypto:hash_equals(Expected, OfferedBinder);
+    hash_equals(Expected, OfferedBinder);
 verify_resumption_binder(_Secret, _Cipher, _FullClientHello, _PskBindersInfo, _OfferedBinder) ->
     %% Missing binder offset info — cannot verify, fail closed.
     false.
