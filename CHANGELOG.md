@@ -19,9 +19,16 @@ All notable changes to this project will be documented in this file.
   the burst budget allow are approved up front (consuming pacing
   tokens exactly as one-at-a-time sends would), sealed and handed to
   the socket in one loop, and loss, congestion, packet-number and
-  counter bookkeeping is updated once for the run. The per-packet
-  connection-state rebuild was the largest own-time item on the
-  bulk-send profile; a 64-packet run replaces 64 copies with one.
+  counter bookkeeping is updated once for the run:
+  `quic_cc:send_check_run/4` approves the run against cwnd and pacing
+  in one step (never more permissive than the sequential checks),
+  `quic_cc:on_packets_sent/2` and `quic_loss:on_packets_sent_run/3`
+  fold it into one record update each (native for NewReno, a fold for
+  other algorithms). The per-packet connection-state rebuild was the
+  largest own-time item on the bulk-send profile; a 64-packet run
+  replaces 64 copies with one. The socket-backend receive queue bound
+  is 512 messages, deep enough that flow control and cwnd rather than
+  tail drop are the backpressure against a run sender.
 - `versions` lists the QUIC versions a connection will also accept, for
   RFC 9368 compatible version negotiation. Contributed by jbevemyr (#243).
 - `hibernate_after` (default 5000 ms) hibernates an idle connection

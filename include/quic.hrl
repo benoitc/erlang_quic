@@ -417,7 +417,10 @@
 %% inflated RTT samples and spurious loss detection then destabilize
 %% the peer's congestion controller. Early tail drop gives it a clean
 %% loss signal at a bounded queue depth, like gen_udp + kernel rcvbuf.
--define(MAX_CONN_RECV_QUEUE_MSGS, 32).
+%% Deep enough that flow control and cwnd, not tail drop, are the
+%% normal backpressure: a sender emitting 64-packet runs overran a
+%% 32-message bound and burned throughput in drop/retransmit cycles.
+-define(MAX_CONN_RECV_QUEUE_MSGS, 512).
 
 %% Max packets per {quic_packets, ...} message forwarded to a
 %% connection. GRO can aggregate trains of ~44 packets; forwarded
