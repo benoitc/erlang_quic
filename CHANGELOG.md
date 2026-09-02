@@ -29,6 +29,15 @@ All notable changes to this project will be documented in this file.
   replaces 64 copies with one. The socket-backend receive queue bound
   is 512 messages, deep enough that flow control and cwnd rather than
   tail drop are the backpressure against a run sender.
+- The listener drains the datagram messages already queued in its
+  mailbox into one receive sweep (up to 256 packets), groups them per
+  source address and dispatches each group as one batch. Distinct
+  flows never GRO-coalesce, so at a server with many sparse
+  connections every datagram used to be its own listener message and
+  its own connection wakeup; connections now wake once per sweep and
+  their batched receive path engages even for sparse traffic. ACK
+  processing re-arms the PTO once at the end of the receive pass
+  instead of once per ACK frame.
 - `versions` lists the QUIC versions a connection will also accept, for
   RFC 9368 compatible version negotiation. Contributed by jbevemyr (#243).
 - `hibernate_after` (default 5000 ms) hibernates an idle connection
