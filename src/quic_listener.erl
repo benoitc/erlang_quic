@@ -141,6 +141,10 @@
     socket_backend = gen_udp :: gen_udp | socket,
     %% GRO receiver process (when using socket backend)
     gro_receiver :: pid() | undefined,
+    %% Shared sender serializing server-connection sendmsg calls
+    %% (socket backend only; see quic_socket:start_shared_sender/1).
+    send_sender :: pid() | undefined,
+    send_gso_counter :: atomics:atomics_ref() | undefined,
     port :: inet:port_number(),
     %% Cert + private_key are optional; PSK-only listeners run with
     %% both `undefined' and rely on `psks' / `psk_callback'.
@@ -353,12 +357,15 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
 
     %% Start GRO receiver if using socket backend
     GROReceiver = maybe_start_gro_receiver(Backend, SocketState),
+    {SendSender, SendGSOCounter} = maybe_start_shared_sender(Backend, SocketState),
 
     State = #listener_state{
         socket = Socket,
         socket_state = SocketState,
         socket_backend = Backend,
         gro_receiver = GROReceiver,
+        send_sender = SendSender,
+        send_gso_counter = SendGSOCounter,
         port = ActualPort,
         cert = Cert,
         cert_chain = CertChain,
@@ -432,6 +439,11 @@ maybe_start_gro_receiver(socket, SocketState) when SocketState =/= undefined ->
     spawn_link(fun() -> gro_receive_loop(SocketState, Listener) end);
 maybe_start_gro_receiver(_, _) ->
     undefined.
+
+maybe_start_shared_sender(socket, SocketState) when SocketState =/= undefined ->
+    quic_socket:start_shared_sender(SocketState);
+maybe_start_shared_sender(_, _) ->
+    {undefined, undefined}.
 
 %% GRO receiver loop - runs in separate process
 %% Does blocking recvmsg calls and forwards packets to listener
@@ -527,7 +539,9 @@ handle_info(
     {noreply, State};
 %% Handle connection process exit
 handle_info(
-    {'EXIT', Pid, _Reason}, #listener_state{connections = Conns, gro_receiver = GROReceiver} = State
+    {'EXIT', Pid, _Reason},
+    #listener_state{connections = Conns, gro_receiver = GROReceiver, send_sender = SendSender} =
+        State
 ) ->
     case Pid of
         GROReceiver ->
@@ -537,6 +551,16 @@ handle_info(
                 State#listener_state.socket_state
             ),
             {noreply, State#listener_state{gro_receiver = NewReceiver}};
+        SendSender when is_pid(SendSender) ->
+            %% Shared sender died: new connections get a fresh one,
+            %% existing connections fall back to sending directly.
+            {NewSender, NewCounter} = maybe_start_shared_sender(
+                State#listener_state.socket_backend,
+                State#listener_state.socket_state
+            ),
+            {noreply, State#listener_state{
+                send_sender = NewSender, send_gso_counter = NewCounter
+            }};
         _ ->
             cleanup_connection(Conns, Pid),
             {noreply, State}
@@ -1061,6 +1085,8 @@ create_connection_unconditional(
         connection_handler = ConnHandler,
         cid_config = CIDConfig,
         reset_secret = ResetSecret,
+        send_sender = SendSender,
+        send_gso_counter = SendGSOCounter,
         opts = Opts
     }
 ) ->
@@ -1091,6 +1117,8 @@ create_connection_unconditional(
         socket => Socket,
         listener_socket_backend => Backend,
         listener_gso_supported => ListenerGSO,
+        send_sender => SendSender,
+        send_gso_counter => SendGSOCounter,
         remote_addr => RemoteAddr,
         initial_dcid => DCID,
         %% original_destination_connection_id transport param: the client's

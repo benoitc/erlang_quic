@@ -41,6 +41,18 @@ All notable changes to this project will be documented in this file.
   their batched receive path engages even for sparse traffic. ACK
   processing re-arms the PTO once at the end of the receive pass
   instead of once per ACK frame.
+  processing re-arms the PTO once at the end of the receive pass
+  instead of once per ACK frame.
+- Server connections on the socket backend hand their finished send
+  batches to one shared sender process per listener, which performs
+  the `sendmsg` calls serially. Concurrent `sendmsg` on one socket
+  handle from many connection processes burns about 20x the CPU in
+  NIF-level contention (98.6 vs 4.7 us per send with 50 concurrent
+  senders); in a 50-connection fan-out model server CPU went from 24.3
+  to 11.0 s for the same window. Connections keep their own batch
+  buffers, GSO grouping and counters; a connection whose sender has
+  died sends directly from then on, and the listener starts a new one
+  for new connections.
 
 ### Fixed
 - Pacing no longer freezes on sub-millisecond links. RTT samples are

@@ -44,6 +44,7 @@
     open_adapter/1,
     wrap/2,
     new_sender/2,
+    start_shared_sender/1,
     close/1,
     send/4,
     send_immediate/4,
@@ -65,6 +66,9 @@
 ]).
 
 -include("quic.hrl").
+
+%% Idle tick of the shared sender loop; also keeps its receive bounded.
+-define(SHARED_SENDER_IDLE_MS, 30000).
 -include_lib("kernel/include/logger.hrl").
 
 %% GSO/GRO socket option constants for Linux
@@ -118,7 +122,19 @@
     batch_flushes = 0 :: non_neg_integer(),
     packets_coalesced = 0 :: non_neg_integer(),
     %% Batches the kernel segmented, as opposed to sent packet by packet.
-    gso_flushes = 0 :: non_neg_integer()
+    gso_flushes = 0 :: non_neg_integer(),
+    %% Shared sender process: when set, flush/1 hands the batch to this
+    %% process instead of calling sendmsg from the connection process.
+    %% Concurrent sendmsg on one socket handle burns ~20x the CPU in
+    %% NIF-level contention (measured 98.6 vs 4.7 us per send with 50
+    %% concurrent senders), so server connections serialize the actual
+    %% syscalls through the listener's sender while keeping their own
+    %% batch buffers and GSO grouping.
+    sender_pid = undefined :: undefined | pid(),
+    %% GSO flushes performed by the shared sender on behalf of every
+    %% connection of the listener, so a connection's gso_flushes stays
+    %% meaningful (listener-wide) once the syscall has moved out of it.
+    gso_counter = undefined :: undefined | atomics:atomics_ref()
 }).
 
 %% Packet can be:
@@ -138,8 +154,11 @@
     extract_gro_segment_size/1,
     split_gro_packets/2,
     split_uniform_runs/1,
-    forward_to_owner/6
+    forward_to_owner/6,
+    test_socket/1
 ]).
+
+test_socket(#socket_state{socket = S}) -> S.
 -endif.
 
 %%====================================================================
@@ -353,9 +372,18 @@ info(#socket_state{
     max_batch_packets = MaxBatch,
     batch_flushes = Flushes,
     packets_coalesced = Coalesced,
-    gso_flushes = GSOFlushes,
-    batch_count = Pending
+    gso_flushes = OwnGSOFlushes,
+    batch_count = Pending,
+    sender_pid = Sender,
+    gso_counter = Counter
 }) ->
+    %% With a shared sender the segmented flushes happen there; report
+    %% the listener-wide count in that case.
+    GSOFlushes =
+        case {Sender, Counter} of
+            {P, C} when is_pid(P), C =/= undefined -> atomics:get(C, 1);
+            _ -> OwnGSOFlushes
+        end,
     #{
         backend => Backend,
         batch_pending => Pending,
@@ -453,9 +481,67 @@ new_sender(Socket, Opts) ->
         gso_supported = GSOSupported andalso (Backend =:= socket),
         gro_enabled = false,
         batching_enabled = BatchingEnabled,
-        max_batch_packets = MaxBatch
+        max_batch_packets = MaxBatch,
+        sender_pid = maps:get(sender_pid, Opts, undefined),
+        gso_counter = maps:get(gso_counter, Opts, undefined)
     },
     {ok, State}.
+
+%% @doc Spawn the shared sender for a listener socket: a process that
+%% performs the actual sendmsg calls for every server connection's
+%% batches, serially. GSO state (including the partial-send disable)
+%% lives in the sender's own socket_state copy. Linked to the caller.
+%% Returns the sender and the counter connections read gso_flushes
+%% from; both go into new_sender/2 options (`sender_pid`,
+%% `gso_counter`).
+-spec start_shared_sender(socket_state()) -> {pid(), atomics:atomics_ref()}.
+start_shared_sender(#socket_state{} = SS) ->
+    Counter = atomics:new(1, []),
+    Template = SS#socket_state{
+        sender_pid = undefined,
+        gso_counter = Counter,
+        owns_socket = false,
+        batch_buffer = [],
+        batch_count = 0,
+        batch_addr = undefined
+    },
+    {spawn_link(fun() -> shared_sender_loop(Template) end), Counter}.
+
+shared_sender_loop(SS) ->
+    receive
+        {send_batch, Addr, Buffer, Count} ->
+            Loaded = SS#socket_state{
+                batch_buffer = Buffer,
+                batch_count = Count,
+                batch_addr = Addr
+            },
+            SS2 =
+                case flush(Loaded) of
+                    {ok, S} ->
+                        S;
+                    {error, Reason, S} ->
+                        ?LOG_WARNING(#{what => shared_sender_flush_failed, reason => Reason}),
+                        S
+                end,
+            %% Carry forward only the socket-global bits (a partial GSO
+            %% send disables GSO for the socket).
+            shared_sender_loop(SS#socket_state{
+                gso_supported = SS2#socket_state.gso_supported,
+                gso_size = SS2#socket_state.gso_size
+            });
+        stop ->
+            ok
+    after ?SHARED_SENDER_IDLE_MS ->
+        %% Nothing to send for a while: shed the heap the batches left.
+        erlang:garbage_collect(),
+        shared_sender_loop(SS)
+    end.
+
+bump_batch_counters(#socket_state{} = State, Count) ->
+    State#socket_state{
+        batch_flushes = State#socket_state.batch_flushes + 1,
+        packets_coalesced = State#socket_state.packets_coalesced + Count
+    }.
 
 %% @doc Close the socket and flush any pending packets.
 %% Only closes the socket if owns_socket is true (i.e., socket was created by us).
@@ -533,6 +619,25 @@ flush(#socket_state{batch_count = Count, batch_addr = undefined} = State) ->
     %% No address set but have data - shouldn't happen, but clear buffer
     ?LOG_WARNING(#{what => flush_no_addr, buffer_size => Count}),
     {ok, clear_batch(State)};
+flush(
+    #socket_state{
+        sender_pid = Sender,
+        batch_count = Count,
+        batch_addr = Addr,
+        batch_buffer = Buffer
+    } = State
+) when is_pid(Sender) ->
+    %% Hand the whole batch to the shared sender (see the sender_pid
+    %% field). Fire-and-forget: send errors are logged by the sender
+    %% and covered by loss recovery, the same contract as the direct
+    %% path. A dead sender means a direct path from here on.
+    case is_process_alive(Sender) of
+        true ->
+            Sender ! {send_batch, Addr, Buffer, Count},
+            {ok, bump_batch_counters(clear_batch(State), Count)};
+        false ->
+            flush(State#socket_state{sender_pid = undefined})
+    end;
 flush(#socket_state{gso_supported = true, batch_count = 1} = State) ->
     %% Single-packet batch has no segmentation work; direct send.
     flush_individual(State);
@@ -1299,6 +1404,10 @@ record_run_flush(State, Runs) ->
         [] ->
             State1;
         [Size | _] = Sizes ->
+            case State#socket_state.gso_counter of
+                undefined -> ok;
+                Counter -> atomics:add(Counter, 1, length(Sizes))
+            end,
             State1#socket_state{
                 gso_flushes = State#socket_state.gso_flushes + length(Sizes),
                 gso_size = Size
