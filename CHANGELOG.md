@@ -168,6 +168,11 @@ All notable changes to this project will be documented in this file.
 - A server handshake flight lost on the wire is retransmitted on the client-Initial backoff schedule until the client's Finished arrives. Initial/Handshake packets are not loss-tracked, so a lost flight previously wedged the handshake permanently: the client's Initial retransmits only elicited ACKs once the server TLS state had advanced. (#263)
 
 ### Changed
+- Header protection reuses a cipher context instead of re-running the key
+  schedule on every packet. Measured on an 8 MB transfer, the `crypto:*`
+  share of connection-process time drops from 10.95% to 8.30%; header
+  protection itself goes from 0.77us to 0.28us per mask. Both directions'
+  keys are cached, since they alternate packet by packet.
 - The interop runner speaks real HTTP/3 in the http3 case, serves more
   than one request per connection, issues requests concurrently within
   the peer's stream credit, and its resumption and 0-RTT cases test what
