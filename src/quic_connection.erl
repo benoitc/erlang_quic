@@ -5267,8 +5267,9 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                             FinSids -> lists:foldl(fun settle_fin_ack/2, State4, FinSids)
                         end,
 
-                    %% Reset PTO timer after ACK processing
-                    State5 = set_pto_timer(State4a),
+                    %% Re-arm the PTO once at the end of the pass
+                    %% (flush_dirty_timers) instead of once per ACK frame.
+                    State5 = State4a#state{pto_dirty = true},
 
                     %% Try to send queued data now that cwnd may have freed up.
                     %% This also drains retransmit_stream entries deferred by CC.

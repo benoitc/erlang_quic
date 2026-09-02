@@ -115,7 +115,9 @@
     send_packet/6,
     compute_stateless_reset_token/2,
     build_stateless_reset/2,
-    send_packets_to_connection/4
+    send_packets_to_connection/4,
+    drain_recv_sweep/4,
+    group_recv_sweep/1
 ]).
 -endif.
 
@@ -126,6 +128,9 @@
 -define(QUIC_LOG_META, #{
     domain => [erlang_quic, listener], report_cb => fun quic_log:format_report/2
 }).
+
+%% Packets drained from the listener mailbox into one receive sweep.
+-define(RECV_SWEEP_MAX, 256).
 
 -record(listener_state, {
     recv_queue_max = ?MAX_CONN_RECV_QUEUE_MSGS :: pos_integer(),
@@ -487,7 +492,10 @@ handle_info(
         #{what => udp_received, src_ip => SrcIP, src_port => SrcPort, size => byte_size(Packet)},
         ?QUIC_LOG_META
     ),
-    handle_packet(Packet, {SrcIP, SrcPort}, State),
+    Items = drain_recv_sweep(
+        Socket, gen_udp, ?RECV_SWEEP_MAX - 1, [{{SrcIP, SrcPort}, [Packet]}]
+    ),
+    dispatch_recv_sweep(Items, State),
     {noreply, State};
 %% Handle GRO packets (socket backend with GRO)
 %% May receive multiple packets in single recv call
@@ -504,8 +512,10 @@ handle_info(
         },
         ?QUIC_LOG_META
     ),
-    RemoteAddr = {SrcIP, SrcPort},
-    handle_gro_packets(Packets, RemoteAddr, State),
+    Items = drain_recv_sweep(
+        undefined, socket, ?RECV_SWEEP_MAX - length(Packets), [{{SrcIP, SrcPort}, Packets}]
+    ),
+    dispatch_recv_sweep(Items, State),
     {noreply, State};
 %% Handle socket going passive (backpressure with {active, N}) - gen_udp only
 handle_info(
@@ -536,6 +546,49 @@ handle_info({udp, _OtherSocket, _SrcIP, _SrcPort, _Packet}, State) ->
     {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
+
+%% Drain the datagram messages already queued in the listener mailbox
+%% into one receive sweep, so packets for the same connection arriving
+%% as separate messages (distinct flows never GRO-coalesce) are
+%% dispatched as one batch: the connection wakes once per sweep instead
+%% of once per datagram, and its batched receive path engages even for
+%% sparse per-connection traffic. Bounded to keep the listener
+%% responsive under floods. Returns [{Addr, Packets}] in arrival order.
+drain_recv_sweep(_Socket, _Backend, Budget, Acc) when Budget =< 0 ->
+    lists:reverse(Acc);
+drain_recv_sweep(Socket, Backend, Budget, Acc) ->
+    receive
+        {udp, Socket, IP, Port, Packet} when Backend =:= gen_udp ->
+            drain_recv_sweep(Socket, Backend, Budget - 1, [{{IP, Port}, [Packet]} | Acc]);
+        {gro_packets, IP, Port, Packets} when Backend =:= socket ->
+            drain_recv_sweep(
+                Socket, Backend, Budget - length(Packets), [{{IP, Port}, Packets} | Acc]
+            )
+    after 0 ->
+        lists:reverse(Acc)
+    end.
+
+%% Merge the sweep per source address (per-flow packet order preserved,
+%% cross-flow order irrelevant) and route each group through the
+%% existing batched dispatch, which groups by connection and creates
+%% new connections.
+dispatch_recv_sweep([{Addr, Packets}], State) ->
+    handle_gro_packets(Packets, Addr, State);
+dispatch_recv_sweep(Items, State) ->
+    maps:foreach(
+        fun(Addr, Packets) -> handle_gro_packets(Packets, Addr, State) end,
+        group_recv_sweep(Items)
+    ).
+
+group_recv_sweep(Items) ->
+    Grouped = lists:foldl(
+        fun({Addr, Packets}, M) ->
+            maps:update_with(Addr, fun(L) -> [Packets | L] end, [Packets], M)
+        end,
+        #{},
+        Items
+    ),
+    maps:map(fun(_, Trains) -> lists:append(lists:reverse(Trains)) end, Grouped).
 
 %% Handle multiple packets received via GRO
 %% Groups packets by connection and sends batched messages

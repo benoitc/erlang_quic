@@ -32,6 +32,15 @@ All notable changes to this project will be documented in this file.
   never tail-dropped, and the bound only catches a peer outside it. A
   fixed 512-message bound sat below a 16 MB window and turned
   flow-control-permitted data into loss on loopback.
+- The listener drains the datagram messages already queued in its
+  mailbox into one receive sweep (up to 256 packets), groups them per
+  source address and dispatches each group as one batch. Distinct
+  flows never GRO-coalesce, so at a server with many sparse
+  connections every datagram used to be its own listener message and
+  its own connection wakeup; connections now wake once per sweep and
+  their batched receive path engages even for sparse traffic. ACK
+  processing re-arms the PTO once at the end of the receive pass
+  instead of once per ACK frame.
 
 ### Fixed
 - Pacing no longer freezes on sub-millisecond links. RTT samples are
