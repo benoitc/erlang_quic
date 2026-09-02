@@ -1505,7 +1505,9 @@ build_server_socket_state(Socket, Opts) ->
     SenderOpts = #{
         backend => maps:get(listener_socket_backend, Opts, gen_udp),
         gso_supported => maps:get(listener_gso_supported, Opts, false),
-        batching => BatchOpts
+        batching => BatchOpts,
+        sender_pid => maps:get(send_sender, Opts, undefined),
+        gso_counter => maps:get(send_gso_counter, Opts, undefined)
     },
     case quic_socket:new_sender(Socket, SenderOpts) of
         {ok, S} -> S;
