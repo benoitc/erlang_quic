@@ -14,6 +14,18 @@
 
 -module(quic_throughput_bench).
 
+%% What the sink server sends back once it has the whole stream: the byte
+%% count and CRC32 it actually observed.
+-define(RECEIPT(Bytes, Crc), <<(Bytes):64/big, (Crc):32/big>>).
+
+%% Bytes handed to send_data/4 at a time. The default is one write for
+%% anything the connection's 16 MB send-queue cap can hold, because
+%% splitting a stream across several writes currently collapses
+%% throughput by more than an order of magnitude: same 10 MB, one write
+%% 63 MB/s, two writes 3.3, forty writes 1.4. Set `chunk' explicitly to
+%% measure that; leave it alone to measure the send path.
+-define(CHUNK, 16777216).
+
 -export([
     run/0,
     run/1,
@@ -71,7 +83,7 @@ run_download_sink(Opts) ->
     {ok, Srv} = start_download_server(ServerExtra),
     try
         Start = erlang:monotonic_time(microsecond),
-        ClientExtra = maps:with([socket_backend], Opts),
+        ClientExtra = maps:with([socket_backend, chunk], Opts),
         {Received, ServerStats} = do_download(Srv, Size, ClientExtra),
         End = erlang:monotonic_time(microsecond),
 
@@ -282,8 +294,10 @@ run(Opts) ->
         [RecvBuf / 1048576, SndBuf / 1048576]
     ),
 
-    %% Start server
-    case start_server(Port, RecvBuf, SndBuf, Mode) of
+    %% Start server. Backend and batching are server-side knobs; applying
+    %% them to the client alone silently benchmarks the wrong half.
+    ServerExtra = maps:with([socket_backend, server_send_batching], Opts),
+    case start_server(Port, RecvBuf, SndBuf, Mode, ServerExtra) of
         {ok, ServerPid, ActualPort, ServerBufs} ->
             io:format(
                 "Server actual buffers: recv=~p, send=~p~n",
@@ -435,7 +449,7 @@ compare_cc(Opts) ->
 %% Internal Functions
 %%====================================================================
 
-start_server(Port, RecvBuf, SndBuf, Mode) ->
+start_server(Port, RecvBuf, SndBuf, Mode, Extra) ->
     %% Get test certificates
     case get_test_certs() of
         {ok, Cert, Key} ->
@@ -468,7 +482,7 @@ start_server(Port, RecvBuf, SndBuf, Mode) ->
                 max_stream_data_uni => FlowWindow,
                 connection_handler => Handler
             },
-            case quic:start_server(ServerName, Port, ServerOpts) of
+            case quic:start_server(ServerName, Port, maps:merge(ServerOpts, Extra)) of
                 {ok, Pid} ->
                     {ok, ActualPort} = quic:get_server_port(ServerName),
                     %% Get actual buffer sizes from a test socket
@@ -484,7 +498,9 @@ start_server(Port, RecvBuf, SndBuf, Mode) ->
 stop_server({ServerName, _Pid}) ->
     quic:stop_server(ServerName).
 
-run_client_benchmark(Port, DataSize, RecvBuf, SndBuf, Mode, ClientExtra) ->
+run_client_benchmark(Port, DataSize, RecvBuf, SndBuf, Mode, ClientExtra0) ->
+    Chunk = maps:get(chunk, ClientExtra0, ?CHUNK),
+    ClientExtra = maps:remove(chunk, ClientExtra0),
     %% Large flow control windows for benchmarking (16MB)
     FlowWindow = 16777216,
     ClientOpts = maps:merge(
@@ -520,42 +536,97 @@ run_client_benchmark(Port, DataSize, RecvBuf, SndBuf, Mode, ClientExtra) ->
             %% Open stream and measure transfer time
             {ok, StreamId} = quic:open_stream(Conn),
 
-            Start = erlang:monotonic_time(millisecond),
-            ok = quic:send_data(Conn, StreamId, Data, true),
+            SentCrc = erlang:crc32(Data),
+
+            Start = erlang:monotonic_time(microsecond),
+            ok = send_all(Conn, StreamId, Data, Chunk),
+            Handed = erlang:monotonic_time(microsecond),
 
             %% Wait for completion based on mode
-            case Mode of
-                echo ->
-                    %% Wait for echoed data
-                    wait_stream_close(Conn, StreamId, 30000);
-                sink ->
-                    %% Sink mode: wait for stream close (server closes after receiving FIN)
-                    wait_stream_close_sink(Conn, StreamId, 30000)
-            end,
+            Outcome =
+                case Mode of
+                    echo -> wait_stream_close(Conn, StreamId, 30000);
+                    sink -> wait_stream_close_sink(Conn, StreamId, 30000)
+                end,
 
-            End = erlang:monotonic_time(millisecond),
-            Duration = max(1, End - Start),
+            End = erlang:monotonic_time(microsecond),
+            Duration = End - Start,
 
-            MBps = (DataSize / 1048576) / (Duration / 1000),
+            %% Snapshot before closing: packet counts turn a throughput
+            %% figure into a per-packet cost, which is what any change to
+            %% the per-packet path has to be judged on.
+            Stats = connection_stats(Conn),
 
             quic:close(Conn),
 
-            io:format(
-                "Result: ~.2f MB/s (~p ms for ~.2f MB)~n",
-                [MBps, Duration, DataSize / 1048576]
-            ),
-
-            #{
-                status => ok,
-                data_size => DataSize,
-                duration_ms => Duration,
-                mb_per_sec => MBps,
-                client_buffers => ClientBufs
-            };
+            case check_delivery(Outcome, DataSize, SentCrc) of
+                ok ->
+                    MBps = (DataSize / 1048576) / (Duration / 1000000),
+                    io:format(
+                        "Result: ~.2f MB/s (~p us for ~.2f MB, verified; "
+                        "~p us to hand off, ~p us draining)~n",
+                        [MBps, Duration, DataSize / 1048576, Handed - Start, End - Handed]
+                    ),
+                    #{
+                        status => ok,
+                        data_size => DataSize,
+                        duration_us => Duration,
+                        duration_ms => Duration div 1000,
+                        handoff_us => Handed - Start,
+                        mb_per_sec => MBps,
+                        client_buffers => ClientBufs,
+                        client_stats => Stats
+                    };
+                {error, Why} ->
+                    io:format("Run FAILED after ~p us: ~p~n", [Duration, Why]),
+                    #{status => {error, Why}, data_size => DataSize, duration_us => Duration}
+            end;
         {error, Reason} ->
             io:format("Failed to connect: ~p~n", [Reason]),
             #{status => {error, Reason}}
     end.
+
+connection_stats(Conn) ->
+    Keys = [packets_sent, packets_received, retransmits, ack_sent, bytes_sent],
+    try quic:get_stats(Conn) of
+        {ok, S} -> maps:with(Keys, S);
+        _ -> #{}
+    catch
+        _:_ -> #{}
+    end.
+
+%% quic_connection caps a connection's send queue at
+%% ?MAX_SEND_QUEUE_BYTES (16 MB), so a single send_data/4 of a larger
+%% payload fails outright. Feed it the way a bulk sender would, and wait
+%% out backpressure rather than treating it as an error.
+send_all(Conn, StreamId, Data, Chunk) when byte_size(Data) =< Chunk ->
+    push(Conn, StreamId, Data, true);
+send_all(Conn, StreamId, Data, Chunk) ->
+    <<Head:Chunk/binary, Rest/binary>> = Data,
+    ok = push(Conn, StreamId, Head, false),
+    send_all(Conn, StreamId, Rest, Chunk).
+
+push(Conn, StreamId, Chunk, Fin) ->
+    case quic:send_data(Conn, StreamId, Chunk, Fin) of
+        ok ->
+            ok;
+        {error, send_queue_full} ->
+            erlang:yield(),
+            push(Conn, StreamId, Chunk, Fin);
+        {error, _} = Err ->
+            Err
+    end.
+
+%% A run counts only when the peer confirms every byte. Anything else is
+%% a failure with a reason, never a rate.
+check_delivery({error, Reason}, _Size, _Crc) ->
+    {error, Reason};
+check_delivery({ok, {Size, Crc}}, Size, Crc) ->
+    ok;
+check_delivery({ok, {Bytes, _Crc}}, Size, _Sent) when Bytes =/= Size ->
+    {error, {short_delivery, #{expected => Size, delivered => Bytes}}};
+check_delivery({ok, {_Bytes, Crc}}, _Size, Sent) ->
+    {error, {crc_mismatch, #{expected => Sent, got => Crc}}}.
 
 get_test_certs() ->
     PrivDir = code:priv_dir(quic),
@@ -597,32 +668,44 @@ get_actual_buffers(RequestedRecv, RequestedSnd) ->
             #{recbuf => 0, sndbuf => 0}
     end.
 
-%% Wait for stream to close or receive final data (echo mode)
+%% Collect the echoed stream until FIN, returning size and CRC so the
+%% caller can check the round trip rather than assume it.
 wait_stream_close(Conn, StreamId, Timeout) ->
+    wait_stream_close(Conn, StreamId, Timeout, 0, 0).
+
+wait_stream_close(Conn, StreamId, Timeout, Bytes, Crc) ->
     receive
-        {quic, Conn, {stream_data, StreamId, _Data, true}} ->
-            ok;
-        {quic, Conn, {stream_data, StreamId, _Data, false}} ->
-            wait_stream_close(Conn, StreamId, Timeout)
+        {quic, Conn, {stream_data, StreamId, Data, true}} ->
+            {ok, {Bytes + byte_size(Data), erlang:crc32(Crc, Data)}};
+        {quic, Conn, {stream_data, StreamId, Data, false}} ->
+            wait_stream_close(
+                Conn, StreamId, Timeout, Bytes + byte_size(Data), erlang:crc32(Crc, Data)
+            );
+        {quic, Conn, {closed, Reason}} ->
+            {error, {closed, Reason}}
     after Timeout ->
         {error, timeout}
     end.
 
-%% Wait for stream to close (sink mode - server closes stream after receiving FIN)
+%% Collect the sink server's receipt. A connection that closes before the
+%% receipt arrives is a failed run, not a fast one.
 wait_stream_close_sink(Conn, StreamId, Timeout) ->
+    wait_stream_close_sink(Conn, StreamId, Timeout, <<>>).
+
+wait_stream_close_sink(Conn, StreamId, Timeout, Acc) ->
     receive
-        {quic, Conn, {stream_data, StreamId, _Data, true}} ->
-            %% Server sent FIN (empty response)
-            ok;
-        {quic, Conn, {stream_data, StreamId, _Data, false}} ->
-            %% Should not happen in sink mode, but handle gracefully
-            wait_stream_close_sink(Conn, StreamId, Timeout);
-        {quic, Conn, {closed, _Reason}} ->
-            %% Connection closed
-            ok
+        {quic, Conn, {stream_data, StreamId, Data, true}} ->
+            parse_receipt(<<Acc/binary, Data/binary>>);
+        {quic, Conn, {stream_data, StreamId, Data, false}} ->
+            wait_stream_close_sink(Conn, StreamId, Timeout, <<Acc/binary, Data/binary>>);
+        {quic, Conn, {closed, Reason}} ->
+            {error, {closed, Reason}}
     after Timeout ->
         {error, timeout}
     end.
+
+parse_receipt(?RECEIPT(Bytes, Crc)) -> {ok, {Bytes, Crc}};
+parse_receipt(Other) -> {error, {bad_receipt, Other}}.
 
 %% Echo handler for benchmark server - echoes received data back
 echo_handler(Conn) ->
@@ -644,26 +727,27 @@ echo_handler(Conn) ->
 %% Sink handler for benchmark server - just counts bytes without echoing
 %% This measures raw transport throughput without owner-process message overhead
 sink_handler(Conn) ->
-    sink_handler(Conn, 0).
+    sink_handler(Conn, {0, 0}).
 
-sink_handler(Conn, BytesRecv) ->
+sink_handler(Conn, {BytesRecv, Crc} = Acc) ->
     receive
         {quic, Conn, {connected, _Info}} ->
-            sink_handler(Conn, BytesRecv);
+            sink_handler(Conn, Acc);
         {quic, Conn, {stream_opened, _StreamId}} ->
-            sink_handler(Conn, BytesRecv);
+            sink_handler(Conn, Acc);
         {quic, Conn, {stream_data, _StreamId, Data, false}} ->
-            %% Count bytes, continue receiving
-            sink_handler(Conn, BytesRecv + byte_size(Data));
+            sink_handler(Conn, {BytesRecv + byte_size(Data), erlang:crc32(Crc, Data)});
         {quic, Conn, {stream_data, StreamId, Data, true}} ->
-            %% Final data received, close the stream to signal completion
-            TotalBytes = BytesRecv + byte_size(Data),
-            %% Send empty data with FIN to signal we're done receiving
-            quic:send_data(Conn, StreamId, <<>>, true),
-            io:format("Sink received ~.2f MB~n", [TotalBytes / 1048576]),
-            sink_handler(Conn, 0);
+            %% Answer with what we actually received rather than an empty
+            %% FIN. The client checks it: a rate computed from bytes the
+            %% peer never got is the classic way a throughput harness
+            %% reports a number for a transfer that did not happen.
+            Total = BytesRecv + byte_size(Data),
+            Final = erlang:crc32(Crc, Data),
+            quic:send_data(Conn, StreamId, ?RECEIPT(Total, Final), true),
+            sink_handler(Conn, {0, 0});
         {quic, Conn, {closed, _Reason}} ->
             BytesRecv;
         _Other ->
-            sink_handler(Conn, BytesRecv)
+            sink_handler(Conn, Acc)
     end.
