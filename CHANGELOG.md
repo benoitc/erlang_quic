@@ -133,6 +133,14 @@ All notable changes to this project will be documented in this file.
   NIF-less builds seal per packet as before. Send-side crypto drops
   from about 9% of connection CPU to about 2% on bulk flows. The output
   is checked byte for byte against the per-packet path.
+- With the crypto NIF loaded, a received 1-RTT packet is opened in one
+  call: `open_packet` does header unprotection, packet-number
+  reconstruction (RFC 9000 Appendix A) and AEAD open together, replacing
+  two crypto NIF calls plus mask, packet-number and AAD glue per
+  packet. It runs only while no key update is in flight and checks the
+  key-phase bit before decrypting, handing a phase change to the
+  two-stage path so RFC 9001 §6 bookkeeping stays where it was. ChaCha
+  and NIF-less builds are unchanged.
 
 ## [1.8.2] - 2026-09-05
 

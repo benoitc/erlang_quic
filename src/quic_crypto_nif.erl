@@ -16,7 +16,8 @@
     seal/4,
     open/5,
     hp_block/2,
-    protect_run/7
+    protect_run/7,
+    open_packet/7
 ]).
 
 -nifs([
@@ -26,7 +27,8 @@
     seal/4,
     open/5,
     hp_block/2,
-    protect_run/7
+    protect_run/7,
+    open_packet/7
 ]).
 -on_load(load/0).
 
@@ -78,4 +80,6 @@ open(_Ctx, _Nonce, _AAD, _CipherText, _Tag) -> erlang:nif_error(not_loaded).
 -spec hp_block(reference(), binary()) -> binary() | {error, atom()}.
 hp_block(_Ctx, _Sample) -> erlang:nif_error(not_loaded).
 protect_run(_AeadCtx, _HpCtx, _IV, _PN0, _FirstByteBase, _DCID, _Payloads) ->
+    {error, not_loaded}.
+open_packet(_AeadCtx, _HpCtx, _IV, _LargestRecv, _ExpectedPhase, _Header, _EncPayload) ->
     {error, not_loaded}.

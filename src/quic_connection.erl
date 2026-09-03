@@ -4914,6 +4914,62 @@ decode_short_header_packet(Data, State) ->
 %% Decrypt an application (1-RTT) packet with key phase handling
 %% Uses 2-stage API: unprotect header to get key_phase, then decrypt with selected keys
 decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
+    %% Fast path: fused unprotect + PN reconstruction + AEAD open in
+    %% one NIF call, valid only when no key update is in flight (the
+    %% NIF bails to the generic path when the packet's phase bit
+    %% differs from the current phase, and the generic path owns the
+    %% RFC 9001 §6 phase-transition bookkeeping).
+    Fused =
+        case fused_decrypt_keys(CurrentKeys, State) of
+            {ok, #crypto_keys{key = FKey, iv = FIV, hp = FHP, cipher = FCipher}} ->
+                quic_aead_ctx:open_packet(
+                    FCipher,
+                    FKey,
+                    FIV,
+                    FHP,
+                    get_largest_recv(app, State),
+                    get_current_key_phase(State),
+                    Header,
+                    EncryptedPayload
+                );
+            no ->
+                fallback
+        end,
+    case Fused of
+        {ok, PN0, FirstByte0, Plaintext0} ->
+            Now0 = erlang:monotonic_time(millisecond),
+            StateF = record_app_recv(FirstByte0, PN0, State, Now0),
+            case decode_and_process_streaming(app, Plaintext0, StateF) of
+                {ok, NewState0, Frames0} ->
+                    {ok, app, Frames0, <<>>, NewState0, processed};
+                {error, Reason0} ->
+                    {error, Reason0}
+            end;
+        error ->
+            {error, decryption_failed};
+        fallback ->
+            decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State)
+    end.
+
+%% The peer-direction keys for the fused path: only when no key update
+%% is in flight, so a same-phase packet cannot carry phase-transition
+%% side effects (select_decrypt_keys/2 handles those on the slow path).
+fused_decrypt_keys(CurrentKeys, #state{key_state = undefined}) ->
+    {ok, CurrentKeys};
+fused_decrypt_keys(_CurrentKeys, #state{
+    key_state = #key_update_state{update_state = idle, current_keys = {CK, SK}},
+    role = Role
+}) ->
+    case Role of
+        server -> {ok, CK};
+        client -> {ok, SK}
+    end;
+fused_decrypt_keys(_CurrentKeys, _State) ->
+    no.
+
+%% The two-stage path: unprotect the header to learn the key phase,
+%% select keys, then decrypt.
+decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
     %% The cipher must come from the negotiated keys: inferring it from
     %% the HP key length mistakes ChaCha20-Poly1305 for AES-256-GCM and
     %% drops every received 1-RTT packet on such connections.
