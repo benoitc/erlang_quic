@@ -9104,9 +9104,14 @@ send_stream_chunked_loop(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
     end.
 
 send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
+    %% Requeue where the caller says, not always at the back: a remainder
+    %% popped off the queue has to go back in front of the higher-offset
+    %% entries it was ahead of, or the stream goes out on the wire
+    %% interleaved for the rest of the transfer.
+    {chunked_ctx, _, _, _, _, _, Where} = Ctx,
     case burst_exhausted(State) of
         true ->
-            case queue_stream_data(StreamId, Offset, Data, Fin, State) of
+            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
                 {ok, QueuedState} ->
                     {arm_burst_continuation(QueuedState), BytesSentSoFar};
                 {error, send_queue_full} ->
