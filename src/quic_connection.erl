@@ -199,6 +199,7 @@
     test_state_for_server/3,
     %% Mailbox drain of the connected-state receive pass
     drain_recv_msgs/2,
+    collect_client_udp/5,
     test_state_closing/2,
     test_state_with_socket/2,
     test_state_in_recv_pass/1,
@@ -4327,9 +4328,102 @@ handle_packets_batch(Packets, State) ->
 %% This is more efficient than receiving multiple messages
 do_handle_packets_batch([], State) ->
     State;
+do_handle_packets_batch([<<0:1, 1:1, _:6, _/binary>> | _] = Packets, State) ->
+    %% Leading run of short-header (1-RTT) datagrams: open the whole
+    %% run in one NIF call when the fused fast path applies.
+    case fused_run_keys(State) of
+        {ok, Keys} ->
+            handle_short_run(Packets, Keys, State);
+        no ->
+            [Packet | Rest] = Packets,
+            do_handle_packets_batch(Rest, handle_packet_loop(Packet, State))
+    end;
 do_handle_packets_batch([Packet | Rest], State) ->
     NewState = handle_packet_loop(Packet, State),
     do_handle_packets_batch(Rest, NewState).
+
+%% Peer-direction keys for the batched fused open, under the same
+%% no-key-update-in-flight condition as fused_decrypt_keys/2.
+fused_run_keys(#state{app_keys = undefined}) ->
+    no;
+fused_run_keys(#state{app_keys = {ClientKeys, ServerKeys}, role = Role} = State) ->
+    Current =
+        case Role of
+            client -> ServerKeys;
+            server -> ClientKeys
+        end,
+    fused_decrypt_keys(Current, State).
+
+handle_short_run(Packets, Keys, State) ->
+    {Run, Tail} = take_short_run(Packets, []),
+    #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = Keys,
+    case
+        quic_aead_ctx:open_run(
+            Cipher,
+            Key,
+            IV,
+            HP,
+            get_largest_recv(app, State),
+            get_current_key_phase(State),
+            byte_size(State#state.scid),
+            Run
+        )
+    of
+        {ok, Results} ->
+            State1 = fold_opened(Results, State),
+            case lists:nthtail(length(Results), Run) of
+                [] ->
+                    do_handle_packets_batch(Tail, State1);
+                [Unopened | RunRest] ->
+                    %% First datagram the NIF could not open takes the
+                    %% generic path (slow decrypt, key-phase transition,
+                    %% stateless-reset check), then keep batching.
+                    State2 = handle_packet_loop(Unopened, State1),
+                    do_handle_packets_batch(RunRest ++ Tail, State2)
+            end;
+        fallback ->
+            [Packet | Rest] = Packets,
+            do_handle_packets_batch(Rest, handle_packet_loop(Packet, State))
+    end.
+
+take_short_run([<<0:1, 1:1, _:6, _/binary>> = P | Rest], Acc) ->
+    take_short_run(Rest, [P | Acc]);
+take_short_run(Rest, Acc) ->
+    {lists:reverse(Acc), Rest}.
+
+%% Post-decrypt processing for a batch-opened run: the same per-packet
+%% effects as the fused branch of decrypt_app_packet/4 followed by the
+%% `processed' branch of handle_packet_loop/2.
+fold_opened([], State) ->
+    State;
+fold_opened([{PN, FirstByte, Plaintext} | Rest], State) ->
+    Now = erlang:monotonic_time(millisecond),
+    StateF = record_app_recv(FirstByte, PN, State, Now),
+    case decode_and_process_streaming(app, Plaintext, StateF) of
+        {ok, NewState, Frames} ->
+            ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
+                packet_type => app,
+                frames => Frames
+            }),
+            NewState1 = NewState#state{
+                packets_received = NewState#state.packets_received + 1
+            },
+            ?QLOG_EMIT_FRAMES_PROCESSED(NewState1#state.qlog_ctx, Frames),
+            fold_opened(Rest, maybe_send_ack(app, Frames, NewState1));
+        {error, Reason} ->
+            %% Same recovery as handle_packet_loop/2: log, drop the
+            %% datagram, continue with the pre-packet state.
+            ?LOG_WARNING(
+                #{
+                    what => packet_decode_decrypt_failed,
+                    role => State#state.role,
+                    reason => Reason,
+                    source => State#state.current_packet_source
+                },
+                ?QUIC_LOG_META
+            ),
+            fold_opened(Rest, State)
+    end.
 
 %% One server receive pass: process the packets of a listener message
 %% (source tracking, frame classification, RFC 9000 §9.1 migration
@@ -4359,8 +4453,11 @@ drain_recv_msgs(State, 0) ->
 drain_recv_msgs(#state{role = client, socket = Socket} = State, N) ->
     receive
         {udp, Socket, IP, Port, Data} ->
+            %% Collect the rest of the queued same-source datagrams so a
+            %% train is opened as one batch instead of per message.
             State1 = State#state{current_packet_source = {IP, Port}},
-            drain_recv_msgs(handle_packet(Data, State1), N - 1);
+            {Datagrams, Left} = collect_client_udp(Socket, IP, Port, N - 1, [Data]),
+            drain_recv_msgs(handle_packets_batch(Datagrams, State1), Left);
         {udp_batch, Socket, IP, Port, Packets} ->
             State1 = State#state{current_packet_source = {IP, Port}},
             drain_recv_msgs(handle_packets_batch(Packets, State1), N - 1)
@@ -4375,6 +4472,21 @@ drain_recv_msgs(#state{role = server} = State, N) ->
             drain_recv_msgs(server_recv_pass(Packets, RemoteAddr, State), N - 1)
     after 0 ->
         State
+    end.
+
+collect_client_udp(_Socket, _IP, _Port, 0, Acc) ->
+    {lists:reverse(Acc), 0};
+collect_client_udp(Socket, IP, Port, N, Acc) ->
+    %% Both message shapes in one receive: taking only the single-datagram
+    %% shape would pull those past earlier queued trains and reorder
+    %% the connection's view of the wire.
+    receive
+        {udp, Socket, IP, Port, Data} ->
+            collect_client_udp(Socket, IP, Port, N - 1, [Data | Acc]);
+        {udp_batch, Socket, IP, Port, Packets} ->
+            collect_client_udp(Socket, IP, Port, N - 1, lists:reverse(Packets, Acc))
+    after 0 ->
+        {lists:reverse(Acc), N}
     end.
 
 handle_packet_loop(<<>>, #state{role = client, active_n = N} = State) ->

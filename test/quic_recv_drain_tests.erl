@@ -75,3 +75,21 @@ leaves_the_mailbox_alone_once_closing_test() ->
     S = quic_connection:test_state_closing(S0, {application, 0, <<"bye">>}),
     ?assertEqual(S, quic_connection:drain_recv_msgs(S, 64)),
     ?assertEqual(1, length(mailbox())).
+
+%% The same-source collection must keep mailbox order across both
+%% message shapes: a single datagram queued behind a GRO train belongs
+%% after it, not in front of it. Taking one shape at a time would
+%% reorder the wire.
+client_collect_keeps_mailbox_order_test() ->
+    flush_mailbox(),
+    Sock = sock,
+    self() ! {udp_batch, Sock, {127, 0, 0, 1}, 4433, [garbage(2), garbage(3)]},
+    self() ! {udp, Sock, {127, 0, 0, 1}, 4433, garbage(4)},
+    self() ! {udp_batch, Sock, {127, 0, 0, 1}, 4433, [garbage(5)]},
+    self() ! {other, event},
+    {Datagrams, Left} = quic_connection:collect_client_udp(Sock, {127, 0, 0, 1}, 4433, 64, [
+        garbage(1)
+    ]),
+    ?assertEqual([garbage(I) || I <- lists:seq(1, 5)], Datagrams),
+    ?assertEqual(61, Left),
+    ?assertEqual([{other, event}], mailbox()).
