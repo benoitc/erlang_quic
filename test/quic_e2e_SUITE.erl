@@ -40,7 +40,8 @@
     stream_send_receive/1,
     stream_bidirectional/1,
     stream_multiple/1,
-    stream_large_data/1
+    stream_large_data/1,
+    stream_many_writes_stay_in_order/1
 ]).
 
 %% Test cases - Connection Lifecycle
@@ -76,7 +77,8 @@ groups() ->
             stream_send_receive,
             stream_bidirectional,
             stream_multiple,
-            stream_large_data
+            stream_large_data,
+            stream_many_writes_stay_in_order
         ]},
         {connection_lifecycle, [sequence], [
             connection_close_normal,
@@ -329,6 +331,81 @@ stream_large_data(Config) ->
     after 60000 ->
         quic:close(ConnRef, timeout),
         ct:fail("Connection timeout")
+    end.
+
+%% @doc A stream written in many calls must still go out in offset order.
+%%
+%% Asserts the mechanism rather than a stopwatch: on a lossless loopback
+%% path an in-order stream never buffers anything at the receiver, so the
+%% server connection's reassembly buffer stays empty for the whole
+%% transfer. When the drain requeued a remainder behind the entries it was
+%% ahead of, the stream interleaved permanently and this buffer grew to
+%% hold almost the entire transfer.
+stream_many_writes_stay_in_order(Config) ->
+    Host = ?config(host, Config),
+    Port = ?config(port, Config),
+    #{name := ServerName} = ?config(echo_server, Config),
+
+    Opts = maps:merge(quic_test_echo_server:client_opts(), #{alpn => [<<"echo">>]}),
+    {ok, ConnRef} = quic:connect(Host, Port, Opts, self()),
+
+    receive
+        {quic, ConnRef, {connected, _Info}} ->
+            {ok, StreamId} = quic:open_stream(ConnRef),
+
+            Writes = 16,
+            ChunkSize = 128 * 1024,
+            Data = crypto:strong_rand_bytes(Writes * ChunkSize),
+
+            Poller = spawn_link(fun() -> poll_recv_buffer(ServerName, self(), 0) end),
+            ok = send_in_chunks(ConnRef, StreamId, Data, ChunkSize),
+            Echoed = collect_stream_data(ConnRef, StreamId, <<>>, 60000),
+            Poller ! {stop, self()},
+            MaxBuffered =
+                receive
+                    {max_buffered, N} -> N
+                after 5000 -> ct:fail("poller did not report")
+                end,
+
+            ct:pal("~p writes, peak server reassembly buffer ~p bytes", [Writes, MaxBuffered]),
+            ?assertEqual(byte_size(Data), byte_size(Echoed)),
+            ?assertEqual(Data, Echoed),
+            %% A stray reordered packet would be a couple of kB; the bug
+            %% buffered megabytes.
+            ?assert(MaxBuffered < 128 * 1024),
+
+            quic:close(ConnRef, normal),
+            ok
+    after 60000 ->
+        quic:close(ConnRef, timeout),
+        ct:fail("Connection timeout")
+    end.
+
+send_in_chunks(Conn, StreamId, Data, ChunkSize) when byte_size(Data) =< ChunkSize ->
+    quic:send_data(Conn, StreamId, Data, true);
+send_in_chunks(Conn, StreamId, Data, ChunkSize) ->
+    <<Head:ChunkSize/binary, Rest/binary>> = Data,
+    ok = quic:send_data(Conn, StreamId, Head, false),
+    send_in_chunks(Conn, StreamId, Rest, ChunkSize).
+
+poll_recv_buffer(ServerName, Parent, Max) ->
+    receive
+        {stop, From} -> From ! {max_buffered, Max}
+    after 2 ->
+        poll_recv_buffer(ServerName, Parent, max(Max, server_recv_buffered(ServerName)))
+    end.
+
+server_recv_buffered(ServerName) ->
+    case quic:get_server_connections(ServerName) of
+        {ok, [Conn | _]} ->
+            try quic_connection:get_state(Conn) of
+                {_StateName, #{recv_buffer_bytes := Bytes}} -> Bytes;
+                _ -> 0
+            catch
+                _:_ -> 0
+            end;
+        _ ->
+            0
     end.
 
 %%====================================================================

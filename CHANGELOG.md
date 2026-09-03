@@ -21,6 +21,15 @@ All notable changes to this project will be documented in this file.
   Contributed by jbevemyr (#213).
 
 ### Fixed
+- A stream written in more than one `send_data/4` call no longer goes out
+  interleaved. When the per-drain burst budget was spent, the unsent
+  remainder was requeued at the back of its priority bucket instead of the
+  front, so the drain round-robined between the queued entries and the
+  stream stayed out of order for the rest of the transfer. The receiver
+  then buffered nearly the whole stream for reassembly. The same 10 MB
+  delivered in 40 writes went at 1.4 MB/s against 63 for a single write;
+  it is now 69.5. Single writes were never affected, which is why bulk
+  benchmarks did not show it.
 - An authenticated distribution connection no longer drops the peer's
   first handshake message about half the time. The `auth_callback` path
   put a short-lived gatekeeper process in front of the dist controller
