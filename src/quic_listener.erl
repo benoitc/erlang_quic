@@ -16,20 +16,70 @@
 %%%
 %%% == Connection Handler Callback ==
 %%%
-%%% The `connection_handler' option allows custom handling of new connections:
+%%% The `connection_handler' option decides which process owns each new
+%%% connection, and so which process receives its `{quic, Conn, _}'
+%%% events. Use it when you accept connections yourself rather than
+%%% through a higher-level server such as `quic_h3'.
+%%%
 %%% ```
 %%% Opts = #{
 %%%     cert => Cert,
 %%%     key => Key,
 %%%     connection_handler => fun(Conn) ->
-%%%         %% Conn is the connection pid
-%%%         %% Spawn your handler and return its pid
-%%%         HandlerPid = spawn(fun() -> my_handler(Conn) end),
-%%%         %% Ownership will be transferred to HandlerPid
+%%%         %% Return the process that will consume this connection's
+%%%         %% events. It becomes the owner before the connection sees
+%%%         %% its first packet.
 %%%         {ok, HandlerPid}
 %%%     end
 %%% }
 %%% '''
+%%%
+%%% Return `{ok, HandlerPid}' to take the connection, or `{error, Reason}'
+%%% to decline it, in which case the listener logs a warning and keeps
+%%% ownership. An arity-2 fun is called as `Fun(Conn, DCID)'.
+%%%
+%%% === Return the final owner ===
+%%%
+%%% The listener calls `quic:set_owner_sync/2' on the pid you return and
+%%% only then hands the connection its first packet. That is the one
+%%% moment at which ownership moves with nothing in flight.
+%%%
+%%% Do not return a short-lived broker that later transfers ownership to
+%%% a worker. Between the broker's last read and the worker's
+%%% `set_owner_sync' the connection is still delivering to the broker, and
+%%% those events die with it. Draining the broker's mailbox does not close
+%%% that window: the connection can emit into it after the drain returns.
+%%%
+%%% When the owner is an OTP process, take ownership in `init/1', or in
+%%% the handler itself before returning:
+%%%
+%%% ```
+%%% connection_handler => fun(Conn) ->
+%%%     {ok, Pid} = my_conn:start_link(Conn),
+%%%     ok = quic:set_owner_sync(Conn, Pid),
+%%%     {ok, Pid}
+%%% end
+%%% '''
+%%%
+%%% `gen_server' and `gen_statem' both answer `start_link' before running
+%%% any post-init callback, so a `set_owner_sync' in `handle_continue' or
+%%% in a `state_enter' callback runs once the starter is already back in
+%%% control, which reopens the same window.
+%%%
+%%% === Do not assume `connected' arrives first ===
+%%%
+%%% A datagram is processed before the connection changes state, so stream
+%%% events from that datagram reach the owner ahead of
+%%% `{quic, Conn, {connected, Info}}'. A client that coalesces its
+%%% Finished with a 1-RTT packet does exactly this. An owner that waits
+%%% for `connected' before entering its main loop mis-orders or swallows
+%%% whatever came first.
+%%%
+%%% === Close what you own ===
+%%%
+%%% Listener-created connections do not monitor their owner. If your
+%%% handler dies the connection stays up until its idle timeout, so close
+%%% it explicitly on the way out.
 
 -module(quic_listener).
 -behaviour(gen_server).
