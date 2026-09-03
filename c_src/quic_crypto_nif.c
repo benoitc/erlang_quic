@@ -239,6 +239,98 @@ hp_block(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     return out_term;
 }
 
+/* protect_run(AeadCtx, HpCtx, IV12, PN0, FirstByteBase, DCID, Payloads)
+ *   -> [WirePacket] | {error, badarg}
+ *
+ * Seals a run of short-header packets with consecutive packet numbers
+ * in one call. For I = 0..K-1 with PN = PN0 + I:
+ *   PNLen   = 1..4 (smallest big-endian encoding of PN)
+ *   header  = (FirstByteBase | (PNLen-1)) ++ DCID ++ PN[PNLen]
+ *   nonce   = IV with PN xored into the low 64 bits
+ *   body    = AEAD_seal(aead, nonce, header, Payload) ++ tag
+ *   mask    = ECB(hp, body[4-PNLen .. +16])
+ *   header protection: first byte ^= mask[0] & 0x1f (short header),
+ *   PN bytes ^= mask[1..PNLen]
+ * FirstByteBase must have the PN-length bits (0-1) clear. AES only -
+ * the HP context is an ECB context; ChaCha callers use the per-packet
+ * path.
+ */
+#define MAX_RUN 256
+
+static ERL_NIF_TERM
+protect_run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    qc_ctx *aead, *hp;
+    ErlNifBinary iv, dcid, plain;
+    ErlNifUInt64 pn0;
+    unsigned int fbase;
+    ERL_NIF_TERM list, head, tail;
+    ERL_NIF_TERM packets[MAX_RUN];
+    unsigned k = 0, i;
+
+    (void)argc;
+    if (enif_get_resource(env, argv[0], qc_ctx_type, (void **)&aead) == 0 || aead->enc != 1 ||
+        enif_get_resource(env, argv[1], qc_ctx_type, (void **)&hp) == 0 ||
+        enif_inspect_binary(env, argv[2], &iv) == 0 || iv.size != NONCE_LEN ||
+        enif_get_uint64(env, argv[3], &pn0) == 0 || enif_get_uint(env, argv[4], &fbase) == 0 ||
+        fbase > 255 || enif_inspect_iolist_as_binary(env, argv[5], &dcid) == 0 ||
+        dcid.size > 20)
+        return enif_make_tuple2(env, am_error, am_badarg);
+
+    list = argv[6];
+    while (enif_get_list_cell(env, list, &head, &tail)) {
+        ErlNifUInt64 pn = pn0 + k;
+        unsigned char header[1 + 20 + 4];
+        unsigned char nonce[NONCE_LEN];
+        unsigned char mask[16], sample_off;
+        unsigned pnlen, hlen;
+        unsigned char *out, *body;
+        ERL_NIF_TERM pkt;
+        int len = 0, len2 = 0, mlen = 0;
+
+        if (k >= MAX_RUN || enif_inspect_iolist_as_binary(env, head, &plain) == 0 ||
+            plain.size < 4)
+            return enif_make_tuple2(env, am_error, am_badarg);
+
+        pnlen = (pn < 0x100) ? 1 : (pn < 0x10000) ? 2 : (pn < 0x1000000) ? 3 : 4;
+        header[0] = (unsigned char)(fbase | (pnlen - 1));
+        memcpy(header + 1, dcid.data, dcid.size);
+        for (i = 0; i < pnlen; i++)
+            header[1 + dcid.size + i] = (unsigned char)(pn >> (8 * (pnlen - 1 - i)));
+        hlen = 1 + (unsigned)dcid.size + pnlen;
+
+        memcpy(nonce, iv.data, NONCE_LEN);
+        for (i = 0; i < 8; i++)
+            nonce[NONCE_LEN - 1 - i] ^= (unsigned char)(pn >> (8 * i));
+
+        out = enif_make_new_binary(env, hlen + plain.size + TAG_LEN, &pkt);
+        memcpy(out, header, hlen);
+        body = out + hlen;
+
+        if (EVP_EncryptInit_ex(aead->ctx, NULL, NULL, NULL, nonce) != 1 ||
+            EVP_EncryptUpdate(aead->ctx, NULL, &len, header, (int)hlen) != 1 ||
+            EVP_EncryptUpdate(aead->ctx, body, &len, plain.data, (int)plain.size) != 1 ||
+            EVP_EncryptFinal_ex(aead->ctx, body + len, &len2) != 1 ||
+            EVP_CIPHER_CTX_ctrl(aead->ctx, EVP_CTRL_AEAD_GET_TAG, TAG_LEN,
+                                body + plain.size) != 1)
+            return enif_make_tuple2(env, am_error, am_badarg);
+
+        sample_off = (unsigned char)(4 - pnlen);
+        if (EVP_EncryptUpdate(hp->ctx, mask, &mlen, body + sample_off, 16) != 1 || mlen != 16)
+            return enif_make_tuple2(env, am_error, am_badarg);
+        out[0] ^= mask[0] & 0x1f;
+        for (i = 0; i < pnlen; i++)
+            out[1 + dcid.size + i] ^= mask[1 + i];
+
+        packets[k++] = pkt;
+        list = tail;
+    }
+    if (!enif_is_empty_list(env, list))
+        return enif_make_tuple2(env, am_error, am_badarg);
+
+    return enif_make_list_from_array(env, packets, k);
+}
+
 static ERL_NIF_TERM
 is_loaded(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
@@ -272,6 +364,7 @@ static ErlNifFunc nif_funcs[] = {
     {"seal", 4, seal, 0},
     {"open", 5, open_, 0},
     {"hp_block", 2, hp_block, 0},
+    {"protect_run", 7, protect_run, 0},
 };
 
 ERL_NIF_INIT(quic_crypto_nif, nif_funcs, load, NULL, NULL, NULL)

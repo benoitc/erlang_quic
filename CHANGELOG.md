@@ -268,6 +268,14 @@ All notable changes to this project will be documented in this file.
 - A server handshake flight lost on the wire is retransmitted on the client-Initial backoff schedule until the client's Finished arrives. Initial/Handshake packets are not loss-tracked, so a lost flight previously wedged the handshake permanently: the client's Initial retransmits only elicited ACKs once the server TLS state had advanced. (#263)
 
 ### Changed
+- With the crypto NIF loaded, a bulk chunk run is sealed in one call:
+  `protect_run` builds each short header, derives the nonce, AEAD-seals
+  the payload and applies header protection for the whole run in C,
+  instead of two crypto NIF calls plus header, nonce and mask glue per
+  packet. AES only (the header-protection context is ECB); ChaCha and
+  NIF-less builds seal per packet as before. Send-side crypto drops
+  from about 9% of connection CPU to about 2% on bulk flows. The output
+  is checked byte for byte against the per-packet path.
 - Header protection reuses a cipher context instead of re-running the key
   schedule on every packet. Measured on an 8 MB transfer, the `crypto:*`
   share of connection-process time drops from 10.95% to 8.30%; header
