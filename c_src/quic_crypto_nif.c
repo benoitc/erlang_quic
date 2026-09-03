@@ -429,6 +429,191 @@ open_packet(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         env, enif_make_uint64(env, pn), enif_make_uint(env, fb), plain_term);
 }
 
+
+/* ---- In-NIF QUIC frame parsing for the batched receive path ----
+ * Produces term-identical output to quic_frame:decode/1 for the frame
+ * types that dominate the hot path; anything else makes the whole
+ * packet fall back to {raw, Plain} and the generic Erlang decoder,
+ * which also owns all error semantics (unknown type, truncation,
+ * empty packet). */
+
+#define PF_MAX_FRAMES 64
+
+static ERL_NIF_TERM am_padding_f, am_ping_f, am_ack_f, am_crypto_f,
+    am_stream_f, am_max_data_f, am_max_stream_data_f, am_max_streams_f,
+    am_bidi_f, am_uni_f, am_handshake_done_f, am_raw_f, am_undefined_f;
+
+static int
+rd_varint(const unsigned char *p, unsigned rem, ErlNifUInt64 *v, unsigned *used)
+{
+    unsigned len;
+    if (rem < 1)
+        return 0;
+    len = 1u << (p[0] >> 6);
+    if (rem < len)
+        return 0;
+    *v = p[0] & 0x3f;
+    for (unsigned i = 1; i < len; i++)
+        *v = (*v << 8) | p[i];
+    *used = len;
+    return 1;
+}
+
+/* Returns 1 and sets *out to the frames list (in wire order) on
+ * success; 0 to request the raw fallback. */
+static int
+parse_quic_frames(ErlNifEnv *env, ERL_NIF_TERM plain, const unsigned char *d,
+                  unsigned n, ERL_NIF_TERM *out)
+{
+    ERL_NIF_TERM frames[PF_MAX_FRAMES];
+    unsigned nf = 0, off = 0;
+
+    while (off < n) {
+        unsigned char t = d[off];
+        if (t == 0x00) { /* PADDING run: skip, no term (probing only) */
+            off++;
+            continue;
+        }
+        if (nf >= PF_MAX_FRAMES)
+            return 0;
+        if (t == 0x01) { /* PING */
+            frames[nf++] = am_ping_f;
+            off++;
+            continue;
+        }
+        if (t == 0x02 || t == 0x03) { /* ACK [+ECN] */
+            ErlNifUInt64 la, delay, cnt, fr;
+            unsigned u;
+            ERL_NIF_TERM ranges, ecn;
+            unsigned i;
+            off++;
+            if (!rd_varint(d + off, n - off, &la, &u)) return 0;
+            off += u;
+            if (!rd_varint(d + off, n - off, &delay, &u)) return 0;
+            off += u;
+            if (!rd_varint(d + off, n - off, &cnt, &u)) return 0;
+            off += u;
+            if (!rd_varint(d + off, n - off, &fr, &u)) return 0;
+            off += u;
+            if (cnt > 1024) return 0;
+            {
+                ERL_NIF_TERM pairs[64];
+                ERL_NIF_TERM tailride = enif_make_list(env, 0);
+                if (cnt > 64) return 0;
+                for (i = 0; i < cnt; i++) {
+                    ErlNifUInt64 gap, rng;
+                    if (!rd_varint(d + off, n - off, &gap, &u)) return 0;
+                    off += u;
+                    if (!rd_varint(d + off, n - off, &rng, &u)) return 0;
+                    off += u;
+                    pairs[i] = enif_make_tuple2(env,
+                        enif_make_uint64(env, gap), enif_make_uint64(env, rng));
+                }
+                for (i = cnt; i > 0; i--)
+                    tailride = enif_make_list_cell(env, pairs[i - 1], tailride);
+                ranges = enif_make_list_cell(env,
+                    enif_make_tuple2(env, enif_make_uint64(env, la),
+                        enif_make_uint64(env, fr)),
+                    tailride);
+            }
+            if (t == 0x03) {
+                ErlNifUInt64 e0, e1, ce;
+                if (!rd_varint(d + off, n - off, &e0, &u)) return 0;
+                off += u;
+                if (!rd_varint(d + off, n - off, &e1, &u)) return 0;
+                off += u;
+                if (!rd_varint(d + off, n - off, &ce, &u)) return 0;
+                off += u;
+                ecn = enif_make_tuple3(env, enif_make_uint64(env, e0),
+                    enif_make_uint64(env, e1), enif_make_uint64(env, ce));
+            } else {
+                ecn = am_undefined_f;
+            }
+            frames[nf++] = enif_make_tuple4(env, am_ack_f, ranges,
+                enif_make_uint64(env, delay), ecn);
+            continue;
+        }
+        if (t == 0x06) { /* CRYPTO */
+            ErlNifUInt64 o, len;
+            unsigned u;
+            off++;
+            if (!rd_varint(d + off, n - off, &o, &u)) return 0;
+            off += u;
+            if (!rd_varint(d + off, n - off, &len, &u)) return 0;
+            off += u;
+            if (len > n - off) return 0;
+            frames[nf++] = enif_make_tuple3(env, am_crypto_f,
+                enif_make_uint64(env, o),
+                enif_make_sub_binary(env, plain, off, (size_t)len));
+            off += (unsigned)len;
+            continue;
+        }
+        if (t >= 0x08 && t <= 0x0f) { /* STREAM */
+            ErlNifUInt64 sid, o = 0, len;
+            unsigned u;
+            ERL_NIF_TERM data, fin;
+            off++;
+            if (!rd_varint(d + off, n - off, &sid, &u)) return 0;
+            off += u;
+            if (t & 0x04) {
+                if (!rd_varint(d + off, n - off, &o, &u)) return 0;
+                off += u;
+            }
+            fin = (t & 0x01) ? am_true : am_false;
+            if (t & 0x02) {
+                if (!rd_varint(d + off, n - off, &len, &u)) return 0;
+                off += u;
+                if (len > n - off) return 0;
+                data = enif_make_sub_binary(env, plain, off, (size_t)len);
+                off += (unsigned)len;
+            } else {
+                data = enif_make_sub_binary(env, plain, off, n - off);
+                off = n;
+            }
+            frames[nf++] = enif_make_tuple5(env, am_stream_f,
+                enif_make_uint64(env, sid), enif_make_uint64(env, o), data, fin);
+            continue;
+        }
+        if (t == 0x10 || t == 0x11) { /* MAX_DATA / MAX_STREAM_DATA */
+            ErlNifUInt64 a, b;
+            unsigned u;
+            off++;
+            if (!rd_varint(d + off, n - off, &a, &u)) return 0;
+            off += u;
+            if (t == 0x10) {
+                frames[nf++] = enif_make_tuple2(env, am_max_data_f,
+                    enif_make_uint64(env, a));
+            } else {
+                if (!rd_varint(d + off, n - off, &b, &u)) return 0;
+                off += u;
+                frames[nf++] = enif_make_tuple3(env, am_max_stream_data_f,
+                    enif_make_uint64(env, a), enif_make_uint64(env, b));
+            }
+            continue;
+        }
+        if (t == 0x12 || t == 0x13) { /* MAX_STREAMS bidi/uni */
+            ErlNifUInt64 a;
+            unsigned u;
+            off++;
+            if (!rd_varint(d + off, n - off, &a, &u)) return 0;
+            off += u;
+            frames[nf++] = enif_make_tuple3(env, am_max_streams_f,
+                (t == 0x12) ? am_bidi_f : am_uni_f, enif_make_uint64(env, a));
+            continue;
+        }
+        if (t == 0x1e) { /* HANDSHAKE_DONE */
+            frames[nf++] = am_handshake_done_f;
+            off++;
+            continue;
+        }
+        return 0; /* anything else: raw fallback */
+    }
+    if (nf == 0)
+        return 0; /* padding-only packet: Erlang owns the violation */
+    *out = enif_make_list_from_array(env, frames, nf);
+    return 1;
+}
+
 /* open_run(AeadCtx, HpCtx, IV12, LargestRecv, ExpectedPhase, DcidLen,
  *          Datagrams) -> {ok, [{PN, FirstByte, Plain}]} | {error, badarg}
  *
@@ -513,8 +698,16 @@ open_run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         if (EVP_DecryptFinal_ex(aead->ctx, out + len, &len2) != 1)
             break;
 
-        results[k++] = enif_make_tuple3(
-            env, enif_make_uint64(env, pn), enif_make_uint(env, fb), plain_term);
+        {
+            ERL_NIF_TERM frames;
+            ERL_NIF_TERM third;
+            if (parse_quic_frames(env, plain_term, out, (unsigned)(len + len2), &frames))
+                third = frames;
+            else
+                third = enif_make_tuple2(env, am_raw_f, plain_term);
+            results[k++] = enif_make_tuple3(
+                env, enif_make_uint64(env, pn), enif_make_uint(env, fb), third);
+        }
         if ((ErlNifSInt64)pn > largest)
             largest = (ErlNifSInt64)pn;
         list = tail;
@@ -547,6 +740,19 @@ load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info)
     am_not_loaded = enif_make_atom(env, "not_loaded");
     am_badarg = enif_make_atom(env, "badarg");
     am_key_phase = enif_make_atom(env, "key_phase");
+    am_padding_f = enif_make_atom(env, "padding");
+    am_ping_f = enif_make_atom(env, "ping");
+    am_ack_f = enif_make_atom(env, "ack");
+    am_crypto_f = enif_make_atom(env, "crypto");
+    am_stream_f = enif_make_atom(env, "stream");
+    am_max_data_f = enif_make_atom(env, "max_data");
+    am_max_stream_data_f = enif_make_atom(env, "max_stream_data");
+    am_max_streams_f = enif_make_atom(env, "max_streams");
+    am_bidi_f = enif_make_atom(env, "bidi");
+    am_uni_f = enif_make_atom(env, "uni");
+    am_handshake_done_f = enif_make_atom(env, "handshake_done");
+    am_raw_f = enif_make_atom(env, "raw");
+    am_undefined_f = enif_make_atom(env, "undefined");
     return 0;
 }
 
