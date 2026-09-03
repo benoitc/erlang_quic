@@ -516,26 +516,37 @@ in the distribution layer.
 
 A `{Mod, Fun}` pair (or `fun/3`) invoked on both sides between TLS
 completion (the `{quic, Conn, {connected, _}}` event) and the
-`dist_util` handshake. The callback can run any application-level
-challenge / response on the freshly secured QUIC connection — open a
-user stream, send a token, validate certificates — and return `{ok, _}`
-to admit the connection or `{error, Reason}` to refuse it.
+`dist_util` handshake. It inspects the freshly secured connection and
+returns `{ok, _}` to admit it or `{error, Reason}` to refuse it.
 
-On the server side, the callback is hosted by a short-lived
-*gatekeeper* process. The listener installs the gatekeeper as the
-QUIC connection owner via the existing `connection_handler` contract,
-so it receives the `{connected, _}` event and any subsequent stream
-data. After a successful callback, the gatekeeper starts the dist
-controller (which takes ownership atomically via
-`quic:set_owner_sync/2`) and *drains its mailbox* of any QUIC events
-that arrived before the ownership swap, forwarding them to the
-controller. This guarantees the first stream-data event sent by the
-peer cannot be lost between the callback returning and the controller
-becoming the owner. On failure the gatekeeper closes the connection
-and exits; the listener is unaffected.
+On the server side the dist controller owns the connection for its
+whole life. The listener installs whatever pid the
+`connection_handler` returns as the QUIC connection owner *before* it
+hands the connection its first packet, so returning the controller
+means no event can be delivered anywhere else. With a callback
+configured the controller holds the connection in its `init_state`,
+runs the callback when the `{connected, _}` event arrives, and only
+then notifies the acceptor, which is what starts the `dist_util`
+worker, whose sends and receives are calls back into the controller.
+A refusal stops the controller normally and closes the connection.
 
-On the client side, the callback runs inline in the setup process
-that already owns the connection — no gatekeeper is needed.
+The callback must not open a stream. Stream ids are assigned in the
+order streams are opened, and both sides assume the control stream is
+stream 0 with the data streams immediately after it, so a stream
+opened during authentication shifts everything that follows.
+Connection-level checks are what the hook is for: peer certificate,
+ALPN, transport parameters, PSK identity.
+
+Nothing bounds a callback that has already started. The
+`auth_handshake_timeout` guards the wait for the QUIC handshake to
+complete, not the callback's own execution.
+
+On the client side the callback runs inline in the setup process,
+which owns the connection until the controller starts. The controller
+takes ownership in its `init/1`, before `start_link/2` returns, so the
+events the setup process buffered can be handed over with no window in
+which the connection is still delivering to a process that has stopped
+reading.
 
 ### `register_with_epmd`
 

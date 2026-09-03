@@ -957,7 +957,9 @@ set_owner(Conn, NewOwner) ->
 
 %% @doc Set new owner process (synchronous).
 %% Use this when you need to ensure ownership is transferred before continuing.
--spec set_owner_sync(pid(), pid()) -> ok.
+%% A connection that is already draining or closed refuses the swap with
+%% `{error, {invalid_state, StateName}}'.
+-spec set_owner_sync(pid(), pid()) -> ok | {error, term()}.
 set_owner_sync(Conn, NewOwner) ->
     gen_statem:call(Conn, {set_owner, NewOwner}).
 

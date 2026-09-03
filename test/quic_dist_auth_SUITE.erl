@@ -24,7 +24,8 @@
     default_no_callback/1,
     auth_ok_both_sides/1,
     auth_server_denies/1,
-    auth_timeout/1,
+    auth_callback_hang_unbounded/1,
+    auth_ok_repeated_connects/1,
     register_with_epmd_visible/1
 ]).
 
@@ -36,7 +37,8 @@ all() ->
         default_no_callback,
         auth_ok_both_sides,
         auth_server_denies,
-        auth_timeout,
+        auth_callback_hang_unbounded,
+        auth_ok_repeated_connects,
         register_with_epmd_visible
     ].
 
@@ -85,6 +87,9 @@ auth_ok_both_sides(Config) ->
     Spec = #{tag => "ok", auth_cb => Cb},
     {Target, _Port, Cookie, TargetUdp} = start_target(Config, Spec),
     Result = run_probe(Config, "ok_probe", Target, TargetUdp, Cookie, Cb, 10000),
+    %% The target is where the server-side handoff happens, so its output
+    %% is what says whether the controller ever got the dist bytes.
+    ct:log("target output:~n~s", [drain_port(TargetUdp)]),
     ?assertEqual(connected, Result).
 
 auth_server_denies(Config) ->
@@ -94,15 +99,29 @@ auth_server_denies(Config) ->
     Result = run_probe(Config, "deny_probe", Target, TargetUdp, Cookie, Cb, 10000),
     ?assertEqual(refused, Result).
 
-auth_timeout(Config) ->
-    %% Both sides hang in the callback. The configured timeout fires
-    %% on the server gatekeeper; the client setup process eventually
-    %% sees the connection close.
+auth_callback_hang_unbounded(Config) ->
+    %% Nothing bounds a callback that has already started. The configured
+    %% timeout guards only the wait for the QUIC handshake to complete, so
+    %% with a callback that never returns the server controller blocks in
+    %% it and the client setup process blocks in its own, which means
+    %% net_kernel:connect_node/1 never returns and the probe is killed
+    %% without writing a verdict at all.
     Cb = "quic_dist_auth_test_cb:hangs_forever",
     Spec = #{tag => "tmo", auth_cb => Cb, auth_timeout => 1500},
     {Target, _Port, Cookie, TargetUdp} = start_target(Config, Spec),
     Result = run_probe(Config, "tmo_probe", Target, TargetUdp, Cookie, Cb, 1500),
-    ?assertEqual(refused, Result).
+    ?assertEqual(no_result, Result).
+
+auth_ok_repeated_connects(Config) ->
+    %% One connect can pass on luck. Each reconnect is a fresh inbound
+    %% connection through the whole accept path, and the handoff race this
+    %% guards against lost about half of them.
+    Cb = "quic_dist_auth_test_cb:always_ok",
+    Spec = #{tag => "rpt", auth_cb => Cb},
+    {Target, _Port, Cookie, TargetUdp} = start_target(Config, Spec),
+    Result = run_probe(Config, "rpt_probe", Target, TargetUdp, Cookie, Cb, 10000, 10),
+    ct:log("target output:~n~s", [drain_port(TargetUdp)]),
+    ?assertEqual(connected, Result).
 
 register_with_epmd_visible(Config) ->
     %% Boot a target with register_with_epmd=true and have it write its
@@ -229,7 +248,10 @@ start_target(Config, Spec) ->
             ct:fail("target ~s not ready. output:~n~s", [Tag, Log])
     end.
 
-run_probe(Config, Tag, Target, _TargetUdp, Cookie, AuthCb, AuthTimeout) ->
+run_probe(Config, Tag, Target, TargetUdp, Cookie, AuthCb, AuthTimeout) ->
+    run_probe(Config, Tag, Target, TargetUdp, Cookie, AuthCb, AuthTimeout, 1).
+
+run_probe(Config, Tag, Target, _TargetUdp, Cookie, AuthCb, AuthTimeout, Repeat) ->
     CertDir = ?config(cert_dir, Config),
     PrivDir = ?config(priv_dir, Config),
     CertFile = filename:join(CertDir, "cert.pem"),
@@ -258,18 +280,32 @@ run_probe(Config, Tag, Target, _TargetUdp, Cookie, AuthCb, AuthTimeout) ->
     TargetStr = atom_to_list(Target),
     TargetPort = get({?MODULE, target_port_for, TargetStr}),
 
+    %% Between iterations wait for the previous connection to be gone
+    %% rather than sleeping a fixed interval, so each attempt is a clean
+    %% accept and not an overlap with the last teardown.
     Eval = lists:flatten(
         io_lib:format(
             "{ok,_}=application:ensure_all_started(quic),"
-            "Nodes=[{'~s',{\"127.0.0.1\",~b}}],"
+            "Target='~s',"
+            "Nodes=[{Target,{\"127.0.0.1\",~b}}],"
             "{ok,_}=quic_discovery_static:init([{nodes,Nodes}]),"
-            "Verdict = case net_kernel:connect_node('~s') of"
+            "Gone=fun G(0)->timeout;"
+            "G(N)->case lists:member(Target,nodes(connected)) of"
+            " false->ok;"
+            " true->timer:sleep(50),G(N-1)"
+            " end end,"
+            "Results=[begin"
+            " R=net_kernel:connect_node(Target),"
+            " _=erlang:disconnect_node(Target),"
+            " _=Gone(40),"
+            " R end||_<-lists:seq(1,~b)],"
+            "Verdict = case lists:all(fun(X)->X=:=true end,Results) of"
             " true -> connected;"
             " _ -> refused"
             " end,"
             "ok=file:write_file(\"~s\",atom_to_list(Verdict)),"
             "erlang:halt(0).",
-            [TargetStr, TargetPort, TargetStr, ResultFile]
+            [TargetStr, TargetPort, Repeat, ResultFile]
         )
     ),
     Args =
@@ -318,7 +354,7 @@ run_probe(Config, Tag, Target, _TargetUdp, Cookie, AuthCb, AuthTimeout) ->
         {ok, Bin} ->
             list_to_atom(string:trim(binary_to_list(Bin)));
         {error, _} ->
-            refused
+            no_result
     end.
 
 %%====================================================================

@@ -496,7 +496,7 @@ The input handler:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `auth_callback` | `{Mod,Fun}` \| `fun/3` | `undefined` | Optional auth handshake run after the QUIC handshake but before `dist_util` |
-| `auth_handshake_timeout` | integer | 10000 | Deadline (ms) passed to the callback; gatekeeper aborts at expiry |
+| `auth_handshake_timeout` | integer | 10000 | Deadline (ms) for the QUIC handshake to complete before the callback runs; also passed to the callback |
 | `register_with_epmd` | boolean | `false` | When `true`, register the listening port via the configured `epmd_module` so external tooling (e.g. `epmd -names`) can resolve it |
 
 #### `auth_callback`
@@ -509,16 +509,21 @@ authenticate(Conn, Side :: client | server, Timeout) ->
     {ok, Info :: term()} | {error, Reason :: term()}.
 ```
 
-`{error, Reason}` closes the QUIC connection without ever starting
-the dist controller; the peer's `net_kernel:connect_node/1` returns
-`false`. Implementations typically open a user stream
-(`quic_dist:open_stream/2`) for a challenge/response. See the
+`{error, Reason}` refuses the connection and closes it; the peer's
+`net_kernel:connect_node/1` returns `false`. Use connection-level
+checks: peer certificate, ALPN, transport parameters, PSK identity.
+Do not open a stream: stream ids are assigned in open order and both
+sides assume the control stream is stream 0, so an extra stream opened
+during authentication shifts every stream after it. See the
 `quic_dist_auth` behaviour module.
 
-On the server, the callback is hosted by a short-lived gatekeeper
-process that owns the connection until the callback resolves. Any
-QUIC events buffered in its mailbox (e.g. the first stream-data) are
-forwarded to the dist controller after a successful handoff.
+On the server the callback runs in the dist controller, which owns the
+connection from the first packet; the acceptor is notified only once
+the callback admits the peer. On the client it runs in the setup
+process, which owns the connection until the controller starts.
+
+The timeout bounds the wait for the QUIC handshake, not the callback.
+A callback that never returns blocks the process running it.
 
 Boot-arg form: `-quic_dist auth_callback Mod:Fun`.
 

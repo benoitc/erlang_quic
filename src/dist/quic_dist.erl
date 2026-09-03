@@ -102,8 +102,15 @@
 %% Internal exports
 -export([
     acceptor_loop/2,
-    do_setup/6
+    do_setup/6,
+    notify_acceptor/1
 ]).
+
+-type auth_callback() ::
+    {module(), atom()}
+    | fun((pid(), client | server, timeout()) -> {ok, term()} | {error, term()}).
+
+-export_type([auth_callback/0]).
 
 %% Per-node connect-time option overrides
 -export([
@@ -840,91 +847,29 @@ resolve_psk_callback(_) ->
 %% @private
 %% Handle a new incoming QUIC connection.
 %%
-%% Two paths:
-%% - No auth_callback configured (default): start the dist controller
-%%   immediately, hand it ownership of the QUIC connection, and notify
-%%   the acceptor.
-%% - auth_callback configured: spawn a short-lived gatekeeper process
-%%   that takes ownership, waits for `{quic, Conn, {connected, _}}',
-%%   runs the callback, and only on `{ok, _}' starts the dist
-%%   controller. Any QUIC events the gatekeeper buffered between the
-%%   `connected' event and the ownership swap are forwarded to the
-%%   controller so the first stream-data event is not lost.
+%% The listener installs whatever pid we return as the connection owner
+%% before it hands the connection its first packet, so returning the dist
+%% controller gives it the connection from packet zero. With an auth
+%% callback configured the controller holds the connection in `init_state'
+%% until the callback admits the peer, and notifies the acceptor itself;
+%% without one there is nothing to wait for and we notify here.
 handle_new_connection(Conn) ->
     Config = load_config(),
-    case Config#quic_dist_config.auth_callback of
-        undefined ->
-            handle_new_connection_direct(Conn);
-        Callback ->
-            handle_new_connection_with_auth(
-                Conn, Callback, Config#quic_dist_config.auth_handshake_timeout
-            )
-    end.
-
-%% @private
-handle_new_connection_direct(Conn) ->
-    case quic_dist_controller:start_link(Conn, server) of
+    Auth =
+        case Config#quic_dist_config.auth_callback of
+            undefined -> undefined;
+            Callback -> {Callback, Config#quic_dist_config.auth_handshake_timeout}
+        end,
+    case quic_dist_controller:start_link(Conn, server, Auth) of
         {ok, ControllerPid} ->
-            notify_acceptor(ControllerPid),
+            case Auth of
+                undefined -> notify_acceptor(ControllerPid);
+                _ -> ok
+            end,
             {ok, ControllerPid};
         Error ->
             logger:error("quic_dist: failed to start controller: ~p~n", [Error]),
             Error
-    end.
-
-%% @private
-%% Spawn the gatekeeper unlinked: a crash here must not propagate to
-%% the listener. It owns the connection, so if it dies the QUIC
-%% connection process will clean up on owner DOWN.
-handle_new_connection_with_auth(Conn, Callback, Timeout) ->
-    Gatekeeper = spawn(fun() ->
-        gatekeeper(Conn, Callback, Timeout)
-    end),
-    {ok, Gatekeeper}.
-
-%% @private
-gatekeeper(Conn, Callback, Timeout) ->
-    receive
-        {quic, Conn, {connected, _Info}} ->
-            case run_auth_callback(Callback, Conn, server, Timeout) of
-                {ok, _} ->
-                    finalize_server_handoff(Conn);
-                {error, Reason} ->
-                    quic:safe_close(Conn, normal),
-                    exit({auth_failed, Reason})
-            end;
-        {quic, Conn, {closed, Reason}} ->
-            exit({connection_closed, Reason});
-        {quic, Conn, {transport_error, Code, Reason}} ->
-            exit({transport_error, Code, Reason})
-    after Timeout ->
-        quic:safe_close(Conn, normal),
-        exit({auth_failed, handshake_timeout})
-    end.
-
-%% @private
-%% Start the dist controller (which takes ownership of the connection),
-%% drain any QUIC events that arrived in our mailbox before the
-%% ownership swap and forward them to the controller, then notify the
-%% acceptor and exit normally.
-finalize_server_handoff(Conn) ->
-    case quic_dist_controller:start_link(Conn, server) of
-        {ok, ControllerPid} ->
-            drain_quic_events(Conn, ControllerPid),
-            notify_acceptor(ControllerPid);
-        {error, Reason} ->
-            quic:safe_close(Conn, normal),
-            exit({controller_failed, Reason})
-    end.
-
-%% @private
-drain_quic_events(Conn, Target) ->
-    receive
-        {quic, Conn, _} = Msg ->
-            Target ! Msg,
-            drain_quic_events(Conn, Target)
-    after 0 ->
-        ok
     end.
 
 %% @private
@@ -950,27 +895,6 @@ notify_acceptor(ControllerPid) ->
         AcceptorPid when is_pid(AcceptorPid) ->
             AcceptorPid ! {accept, ControllerPid, undefined},
             ok
-    end.
-
-%% @private
-%% Invoke the configured auth callback. Crashes are turned into
-%% `{error, {crash, _}}' so a buggy callback cannot bring down the
-%% process running it. Callers must filter out `undefined' before
-%% calling.
-run_auth_callback({Mod, Fun}, Conn, Side, Timeout) when is_atom(Mod), is_atom(Fun) ->
-    safe_call(fun() -> Mod:Fun(Conn, Side, Timeout) end);
-run_auth_callback(F, Conn, Side, Timeout) when is_function(F, 3) ->
-    safe_call(fun() -> F(Conn, Side, Timeout) end).
-
-%% @private
-safe_call(Thunk) ->
-    try Thunk() of
-        {ok, _} = Ok -> Ok;
-        {error, _} = Err -> Err;
-        Other -> {error, {auth_callback_bad_return, Other}}
-    catch
-        Class:Reason:Stack ->
-            {error, {auth_callback_crash, Class, Reason, Stack}}
     end.
 
 %%====================================================================
@@ -1295,7 +1219,7 @@ maybe_run_client_auth(Conn, #quic_dist_config{
     auth_callback = Callback,
     auth_handshake_timeout = Timeout
 }) ->
-    case run_auth_callback(Callback, Conn, client, Timeout) of
+    case quic_dist_auth:run(Callback, Conn, client, Timeout) of
         {ok, _} -> ok;
         {error, _} = Err -> Err
     end.
@@ -1304,6 +1228,11 @@ maybe_run_client_auth(Conn, #quic_dist_config{
 start_client_controller(Kernel, Node, Conn, MyNode, Type, Timer) ->
     case quic_dist_controller:start_link(Conn, client) of
         {ok, DistCtrl} ->
+            %% The controller took ownership inside its init/1, so this
+            %% mailbox holds exactly what the connection delivered before
+            %% the swap and can receive nothing further. Hand that over
+            %% before the controller has any work to do.
+            _ = quic_dist_controller:adopt_owner_events(Conn, DistCtrl),
             quic_dist_controller:set_supervisor(DistCtrl, Kernel),
             quic_dist_controller:set_node(DistCtrl, Node),
             HSData = create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer),

@@ -21,6 +21,16 @@ All notable changes to this project will be documented in this file.
   Contributed by jbevemyr (#213).
 
 ### Fixed
+- An authenticated distribution connection no longer drops the peer's
+  first handshake message about half the time. The `auth_callback` path
+  put a short-lived gatekeeper process in front of the dist controller
+  and replayed its mailbox after the handoff, but the controller took
+  ownership from a `gen_statem` state-enter callback, which runs after
+  `start_link` has already returned; everything the connection emitted in
+  between arrived at a process that had stopped reading. The controller
+  now owns the connection from the first packet on the server and from
+  before `start_link` returns on the client, so there is no handoff to
+  race. Auth callbacks must not open streams, which never worked.
 - A TLS alert raised during the handshake now reaches the peer. The
   CONNECTION_CLOSE was batched into the state `send_tls_alert/2` returns,
   which the six immediate-exit sites discarded before calling `exit/1`;
