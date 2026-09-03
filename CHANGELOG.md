@@ -160,6 +160,17 @@ All notable changes to this project will be documented in this file.
   fuzzed with random and mutated frame sequences. In a 50-connection
   server model this cut steady-state reductions by 8%; on a verified
   bulk transfer, 190 to 222 MiB/s.
+- A batch-opened run whose packets continue the receive sequence is
+  folded with one receive-bookkeeping update (largest, ACK range, spin
+  bit, activity) and one ACK-decimation increment instead of one of
+  each per packet; and when such a run carries one stream frame per
+  packet, all for the same stream, offsets contiguous, no FIN, the
+  stream bookkeeping runs once for the train: one flow-control check
+  with the train's totals, one stream-record update, one delivery.
+  Every deviation (mixed frames, gaps, duplicates, FIN, tight windows,
+  qlog enabled) takes the per-packet path unchanged and the delivery
+  contract holds in both modes. Verified bulk with delivery coalescing
+  on: 339 to 405 MiB/s (+19%).
 
 ## [1.8.2] - 2026-09-05
 
