@@ -316,9 +316,9 @@ QUIC-based Erlang distribution protocol implementation.
 ### Extension Hooks
 - `auth_callback` (default `undefined`): `{Mod, Fun}` or `fun/3` invoked
   on both sides after the QUIC handshake but before the dist_util
-  handshake. Returning `{error, _}` closes the connection without ever
-  starting the dist controller. See `quic_dist_auth` and the
-  Configuration Reference in `docs/QUIC_DIST.md`.
+  handshake. Returning `{error, _}` closes the connection without the
+  node ever joining. See `quic_dist_auth` and the Configuration
+  Reference in `docs/QUIC_DIST.md`.
 - `register_with_epmd` (default `false`): when `true`, the listener
   registers its port via the configured `epmd_module` so external
   tooling (e.g. `epmd -names`) can resolve the node.

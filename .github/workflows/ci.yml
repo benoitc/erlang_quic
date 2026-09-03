@@ -192,14 +192,11 @@ jobs:
       # These boot real VMs and speak dist over QUIC, which nothing else
       # covers: the simultaneous-connect deadlock lived here undetected.
       #
-      # Two dist suites are deliberately absent. quic_dist_auth_SUITE's
-      # auth_ok_both_sides fails about a fifth of runs for reasons not yet
-      # understood, and a job that is red at random teaches people to
-      # ignore it. quic_dist_basic_SUITE could not be verified here: its
-      # peers fail to boot on macOS, so add it once someone confirms it
-      # runs on Linux.
+      # quic_dist_basic_SUITE is still absent: it could not be verified
+      # here because its peers fail to boot on macOS, so add it once
+      # someone confirms it runs on Linux.
       - name: Run distribution tests
-        run: rebar3 ct --suite=quic_dist_psk_SUITE,quic_dist_simultaneous_connect_SUITE
+        run: rebar3 ct --suite=quic_dist_psk_SUITE,quic_dist_simultaneous_connect_SUITE,quic_dist_auth_SUITE
 
   h3-e2e:
     name: HTTP/3 E2E Tests

@@ -53,6 +53,8 @@
 %% API
 -export([
     start_link/2,
+    start_link/3,
+    adopt_owner_events/2,
     send/2,
     recv/3,
     tick/1,
@@ -174,7 +176,11 @@
     %% Acceptor pool: list of {Pid, MonitorRef} for processes accepting incoming streams
     acceptor_pool = [] :: [{pid(), reference()}],
     %% Round-robin index for acceptor selection
-    acceptor_idx = 0 :: non_neg_integer()
+    acceptor_idx = 0 :: non_neg_integer(),
+
+    %% Pending auth handshake (server role). `undefined' means the
+    %% connection is admitted as soon as it is set up.
+    auth = undefined :: undefined | {quic_dist:auth_callback(), timeout()}
 }).
 
 %%====================================================================
@@ -184,8 +190,63 @@
 %% @doc Start a controller for a QUIC distribution connection.
 -spec start_link(Conn :: pid(), Role :: client | server) ->
     {ok, pid()} | {error, term()}.
-start_link(Conn, Role) when Role =:= client; Role =:= server ->
-    gen_statem:start_link(?MODULE, {Conn, Role}, []).
+start_link(Conn, Role) ->
+    start_link(Conn, Role, undefined).
+
+%% @doc Start a controller, optionally gating it behind an auth handshake.
+%%
+%% With an auth spec the server-role controller stays in `init_state'
+%% until the QUIC handshake completes, runs the callback, and only then
+%% admits the connection to `dist_util'.
+-spec start_link(
+    Conn :: pid(),
+    Role :: client | server,
+    Auth :: undefined | {quic_dist:auth_callback(), timeout()}
+) ->
+    {ok, pid()} | {error, term()}.
+start_link(Conn, Role, Auth) when Role =:= client; Role =:= server ->
+    gen_statem:start_link(?MODULE, {Conn, Role, Auth}, []).
+
+%% @doc Hand QUIC events buffered by a previous owner to a controller.
+%%
+%% The connecting setup process owns the connection until the controller
+%% starts, and the controller takes ownership in its `init/1', so by the
+%% time this runs the caller's mailbox holds exactly what arrived before
+%% the swap and can receive nothing further.
+%%
+%% Only events the controller understands cross over. A setup process may
+%% also have run an auth callback on a stream of its own; those bytes are
+%% not distribution traffic, and `forward_pending_data/1' would feed them
+%% to the VM's dist input. Anything not matched here stays in the caller's
+%% mailbox, which is what `{'EXIT', _, remarked}' and the setup timer
+%% depend on.
+-spec adopt_owner_events(Conn :: pid(), Controller :: pid()) -> non_neg_integer().
+adopt_owner_events(Conn, Controller) ->
+    adopt_owner_events(Conn, Controller, 0).
+
+adopt_owner_events(Conn, Controller, N) ->
+    receive
+        {quic, C, {stream_data, ?QUIC_DIST_CONTROL_STREAM, _, _}} = Msg when C =:= Conn ->
+            Controller ! Msg,
+            adopt_owner_events(Conn, Controller, N + 1);
+        {quic, C, {connected, _}} = Msg when C =:= Conn ->
+            Controller ! Msg,
+            adopt_owner_events(Conn, Controller, N + 1);
+        {quic, C, {stream_opened, _}} = Msg when C =:= Conn ->
+            Controller ! Msg,
+            adopt_owner_events(Conn, Controller, N + 1);
+        {quic, C, {session_ticket, _}} = Msg when C =:= Conn ->
+            Controller ! Msg,
+            adopt_owner_events(Conn, Controller, N + 1);
+        {quic, C, {closed, _}} = Msg when C =:= Conn ->
+            Controller ! Msg,
+            adopt_owner_events(Conn, Controller, N + 1);
+        {quic, C, {transport_error, _, _}} = Msg when C =:= Conn ->
+            Controller ! Msg,
+            adopt_owner_events(Conn, Controller, N + 1)
+    after 0 ->
+        N
+    end.
 
 %% @doc Send data on the control stream.
 -spec send(Controller :: pid(), Data :: iodata()) -> ok | {error, term()}.
@@ -330,18 +391,37 @@ list_user_streams(Controller) ->
 callback_mode() ->
     [state_functions, state_enter].
 
-%% Initialize for client role
-init({Conn, client}) ->
+%% Initialize for client role.
+%%
+%% The setup process owns the connection until this call, and it forwards
+%% whatever it buffered once we return. Take ownership here rather than in
+%% the `init_state' enter callback: gen_statem answers `start_link' before
+%% running a state-enter callback, so a swap made there leaves a window in
+%% which the connection still delivers to a process that has stopped
+%% reading. Swapping in `init/1' makes the setup process's drain final.
+init({Conn, client, _Auth}) ->
+    case quic:set_owner_sync(Conn, self()) of
+        ok ->
+            State = init_backpressure_config(#state{
+                conn = Conn,
+                role = client
+            }),
+            {ok, init_state, State};
+        {error, Reason} ->
+            %% The peer can close during a slow auth callback, and a
+            %% draining connection refuses the swap. `{error, _}' is
+            %% gen_statem's silent termination: no crash report for a
+            %% connection that simply went away.
+            {error, {set_owner_failed, Reason}}
+    end;
+%% Initialize for server role. The listener installs us as the connection
+%% owner before it hands the connection its first packet, so there is
+%% nothing to take over here.
+init({Conn, server, Auth}) ->
     State = init_backpressure_config(#state{
         conn = Conn,
-        role = client
-    }),
-    {ok, init_state, State};
-%% Initialize for server role
-init({Conn, server}) ->
-    State = init_backpressure_config(#state{
-        conn = Conn,
-        role = server
+        role = server,
+        auth = Auth
     }),
     {ok, init_state, State}.
 
@@ -400,11 +480,9 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %% State: init_state
 %%====================================================================
 
-init_state(enter, _OldState, #state{role = client, conn = Conn} = State) ->
-    %% Client: connection is already established (we received connected message)
-    %% Take over ownership synchronously to ensure we receive stream_data messages
-    ok = quic:set_owner_sync(Conn, self()),
-    %% Can proceed to open streams immediately
+init_state(enter, _OldState, #state{role = client} = State) ->
+    %% Client: ownership was taken in init/1; the connection is already
+    %% established, so we can open our streams immediately.
     case setup_streams(State) of
         {ok, State1} ->
             {keep_state, State1, [{state_timeout, 0, start_handshake}]};
@@ -412,11 +490,10 @@ init_state(enter, _OldState, #state{role = client, conn = Conn} = State) ->
             {stop, {stream_setup_failed, Reason}}
     end;
 init_state(enter, _OldState, #state{role = server, conn = Conn} = State) ->
-    %% Server: take ownership synchronously and proceed immediately
-    %% The connection_handler callback is called during QUIC handshake,
-    %% and the listener transfers ownership to us. We don't need to wait
-    %% for {connected, _} since we use stream 0 (client-initiated).
-    %% Take over as owner synchronously to ensure we receive stream_data
+    %% Server: the listener made us the owner before the connection saw
+    %% its first packet. This call is redundant, and is kept only so a
+    %% controller started any other way still ends up owning its
+    %% connection; nothing depends on its timing any more.
     ok = quic:set_owner_sync(Conn, self()),
     %% Setup streams - transition via timeout since enter can't change state
     case setup_streams(State) of
@@ -425,10 +502,46 @@ init_state(enter, _OldState, #state{role = server, conn = Conn} = State) ->
         {error, Reason} ->
             {stop, {stream_setup_failed, Reason}}
     end;
-%% Server proceeds to handshaking after setup
-init_state(state_timeout, proceed_to_handshaking, State) ->
+%% Without an auth callback the connection is admitted straight away. We
+%% do not wait for `{connected, _}': the control stream is stream 0,
+%% opened by the client.
+init_state(state_timeout, proceed_to_handshaking, #state{auth = undefined} = State) ->
     {next_state, handshaking, State};
-%% Server receives connected message - just ignore, we already transitioned
+%% With one, hold here until the QUIC handshake completes and the
+%% callback admits the peer. The deadline guards that wait, exactly as
+%% the gatekeeper process it replaces did; it does not bound a callback
+%% that has already started.
+init_state(state_timeout, proceed_to_handshaking, #state{auth = {_, Timeout}} = State) ->
+    {keep_state, State, [{state_timeout, Timeout, auth_timeout}]};
+init_state(state_timeout, auth_timeout, #state{conn = Conn} = State) ->
+    ?LOG_WARNING(
+        #{what => dist_auth_handshake_timeout, conn => Conn},
+        ?QUIC_LOG_META
+    ),
+    {stop, normal, State};
+%% Handshake complete. With auth pending this is the gate; otherwise we
+%% have already moved on and this is a late duplicate.
+init_state(
+    info,
+    {quic, Conn, {connected, _Info}},
+    #state{conn = Conn, auth = {Callback, Timeout}} = State
+) ->
+    case quic_dist_auth:run(Callback, Conn, server, Timeout) of
+        {ok, _} ->
+            %% Only now: notify_acceptor/1 starts the dist_util worker,
+            %% whose f_send/f_recv are calls into this process. Notifying
+            %% before the callback returns would deadlock them against it.
+            quic_dist:notify_acceptor(self()),
+            {next_state, handshaking, State#state{auth = undefined}};
+        {error, Reason} ->
+            ?LOG_WARNING(
+                #{what => dist_auth_refused, conn => Conn, reason => Reason},
+                ?QUIC_LOG_META
+            ),
+            %% terminate/3 closes the connection. Stop normal: a refused
+            %% peer is an outcome, not a crash.
+            {stop, normal, State}
+    end;
 init_state(info, {quic, Conn, {connected, _Info}}, #state{conn = Conn} = State) ->
     {keep_state, State};
 init_state(state_timeout, start_handshake, State) ->
