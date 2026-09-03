@@ -18,7 +18,8 @@
     aead_decrypt/6,
     hp_block/3,
     protect_run/8,
-    open_packet/8
+    open_packet/8,
+    open_run/8
 ]).
 
 -define(TAG_LEN, 16).
@@ -123,25 +124,60 @@ hp_ecb_cipher(aes_256_gcm) -> aes_256_ecb.
 open_packet(chacha20_poly1305, _Key, _IV, _HP, _Largest, _Phase, _Header, _Payload) ->
     fallback;
 open_packet(Cipher, Key, IV, HP, LargestRecv, ExpectedPhase, Header, EncPayload) ->
+    with_open_ctx(Cipher, Key, HP, LargestRecv, fun(DecCtx, HpCtx, Largest) ->
+        case
+            quic_crypto_nif:open_packet(
+                DecCtx, HpCtx, IV, Largest, ExpectedPhase, Header, EncPayload
+            )
+        of
+            {PN, FirstByte, Plain} -> {ok, PN, FirstByte, Plain};
+            error -> error;
+            key_phase -> fallback;
+            {error, _} -> fallback
+        end
+    end).
+
+%% @doc Batched open_packet over a train of short-header datagrams
+%% (FirstByte + DCID + PN + ciphertext + tag each). Returns the opened
+%% prefix; a shorter list than Datagrams means the remainder must be
+%% run through the generic per-packet path. `fallback' when the NIF is
+%% unavailable or the cipher is ChaCha.
+-spec open_run(
+    atom(),
+    binary(),
+    binary(),
+    binary(),
+    non_neg_integer() | undefined,
+    0 | 1,
+    non_neg_integer(),
+    [binary()]
+) -> {ok, [{non_neg_integer(), byte(), binary()}]} | fallback.
+open_run(chacha20_poly1305, _Key, _IV, _HP, _Largest, _Phase, _DcidLen, _Datagrams) ->
+    fallback;
+open_run(Cipher, Key, IV, HP, LargestRecv, ExpectedPhase, DcidLen, Datagrams) ->
+    with_open_ctx(Cipher, Key, HP, LargestRecv, fun(DecCtx, HpCtx, Largest) ->
+        case
+            quic_crypto_nif:open_run(
+                DecCtx, HpCtx, IV, Largest, ExpectedPhase, DcidLen, Datagrams
+            )
+        of
+            {ok, _Results} = Ok -> Ok;
+            {error, _} -> fallback
+        end
+    end).
+
+%% Run Fun with the decrypt and header-protection contexts and the
+%% largest-received PN in NIF form (-1 for none); `fallback' without
+%% the NIF.
+with_open_ctx(Cipher, Key, HP, LargestRecv, Fun) ->
     case nif_enabled() of
         true ->
-            DecCtx = ctx(qc_dec, Cipher, Key),
-            HpCtx = hp_ctx(hp_ecb_cipher(Cipher), HP),
             Largest =
                 case LargestRecv of
                     undefined -> -1;
                     _ -> LargestRecv
                 end,
-            case
-                quic_crypto_nif:open_packet(
-                    DecCtx, HpCtx, IV, Largest, ExpectedPhase, Header, EncPayload
-                )
-            of
-                {PN, FirstByte, Plain} -> {ok, PN, FirstByte, Plain};
-                error -> error;
-                key_phase -> fallback;
-                {error, _} -> fallback
-            end;
+            Fun(ctx(qc_dec, Cipher, Key), hp_ctx(hp_ecb_cipher(Cipher), HP), Largest);
         false ->
             fallback
     end.

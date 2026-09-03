@@ -141,6 +141,14 @@ All notable changes to this project will be documented in this file.
   key-phase bit before decrypting, handing a phase change to the
   two-stage path so RFC 9001 §6 bookkeeping stays where it was. ChaCha
   and NIF-less builds are unchanged.
+- A train of short-header datagrams (a GRO train at the server, the
+  drained mailbox at the client) is opened in one NIF call: `open_run`
+  carries the largest received packet number forward across the run in
+  C, matching sequential `open_packet` calls exactly, and stops at the
+  first packet that needs the generic path (key-phase transition,
+  authentication failure, undersized datagram), which the caller then
+  handles per packet. The client drain now collects queued same-source
+  datagrams into one batch before processing.
 
 ## [1.8.2] - 2026-09-05
 

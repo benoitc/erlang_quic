@@ -17,7 +17,8 @@
     open/5,
     hp_block/2,
     protect_run/7,
-    open_packet/7
+    open_packet/7,
+    open_run/7
 ]).
 
 -nifs([
@@ -28,7 +29,8 @@
     open/5,
     hp_block/2,
     protect_run/7,
-    open_packet/7
+    open_packet/7,
+    open_run/7
 ]).
 -on_load(load/0).
 
@@ -82,4 +84,6 @@ hp_block(_Ctx, _Sample) -> erlang:nif_error(not_loaded).
 protect_run(_AeadCtx, _HpCtx, _IV, _PN0, _FirstByteBase, _DCID, _Payloads) ->
     {error, not_loaded}.
 open_packet(_AeadCtx, _HpCtx, _IV, _LargestRecv, _ExpectedPhase, _Header, _EncPayload) ->
+    {error, not_loaded}.
+open_run(_AeadCtx, _HpCtx, _IV, _LargestRecv, _ExpectedPhase, _DcidLen, _Datagrams) ->
     {error, not_loaded}.
