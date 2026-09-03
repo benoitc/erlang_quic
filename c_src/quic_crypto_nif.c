@@ -36,6 +36,7 @@ static ERL_NIF_TERM am_true;
 static ERL_NIF_TERM am_false;
 static ERL_NIF_TERM am_not_loaded;
 static ERL_NIF_TERM am_badarg;
+static ERL_NIF_TERM am_key_phase;
 
 static void
 qc_ctx_dtor(ErlNifEnv *env, void *obj)
@@ -331,6 +332,103 @@ protect_run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     return enif_make_list_from_array(env, packets, k);
 }
 
+/* RFC 9000 Appendix A packet number decoding. largest < 0 means no
+ * packet received yet (use the truncated PN directly). */
+static ErlNifUInt64
+reconstruct_pn(ErlNifSInt64 largest, ErlNifUInt64 trunc_pn, unsigned pnlen)
+{
+    ErlNifUInt64 win, hwin, expected, candidate;
+
+    if (largest < 0)
+        return trunc_pn;
+    win = (ErlNifUInt64)1 << (pnlen * 8);
+    hwin = win >> 1;
+    expected = (ErlNifUInt64)largest + 1;
+    candidate = (expected & ~(win - 1)) | trunc_pn;
+    if (candidate + hwin <= expected && candidate < (((ErlNifUInt64)1 << 62) - win))
+        return candidate + win;
+    if (candidate > expected + hwin && candidate >= win)
+        return candidate - win;
+    return candidate;
+}
+
+/* open_packet(AeadCtx, HpCtx, IV12, LargestRecv, ExpectedPhase,
+ *             Header, EncPayload)
+ *   -> {PN, FirstByte, Plain} | error | key_phase | {error, badarg}
+ *
+ * Fused short-header receive path: header unprotection, packet-number
+ * reconstruction and AEAD open in one call. Header is the protected
+ * first byte + DCID; EncPayload is PN bytes + ciphertext + tag.
+ * Returns `key_phase' without decrypting when the unprotected key
+ * phase bit differs from ExpectedPhase (caller reruns the generic
+ * path with key selection); `error' on authentication failure. */
+static ERL_NIF_TERM
+open_packet(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    qc_ctx *aead, *hp;
+    ErlNifBinary iv, header, payload;
+    ErlNifSInt64 largest;
+    unsigned int expphase;
+    unsigned char mask[16], aad[1 + 20 + 4], nonce[NONCE_LEN], fb;
+    unsigned pnlen, phase, i, aadlen, ctlen;
+    ErlNifUInt64 trunc_pn = 0, pn;
+    ERL_NIF_TERM plain_term;
+    unsigned char *out;
+    int len = 0, len2 = 0, mlen = 0;
+
+    (void)argc;
+    if (enif_get_resource(env, argv[0], qc_ctx_type, (void **)&aead) == 0 || aead->enc != 0 ||
+        enif_get_resource(env, argv[1], qc_ctx_type, (void **)&hp) == 0 ||
+        enif_inspect_binary(env, argv[2], &iv) == 0 || iv.size != NONCE_LEN ||
+        enif_get_int64(env, argv[3], &largest) == 0 ||
+        enif_get_uint(env, argv[4], &expphase) == 0 || expphase > 1 ||
+        enif_inspect_binary(env, argv[5], &header) == 0 || header.size < 1 ||
+        header.size > 21 || enif_inspect_binary(env, argv[6], &payload) == 0 ||
+        payload.size < 4 + 16)
+        return enif_make_tuple2(env, am_error, am_badarg);
+
+    /* Sample sits 4 bytes past the PN start; payload begins at the PN. */
+    if (EVP_EncryptUpdate(hp->ctx, mask, &mlen, payload.data + 4, 16) != 1 || mlen != 16)
+        return enif_make_tuple2(env, am_error, am_badarg);
+    fb = header.data[0] ^ (mask[0] & 0x1f);
+    pnlen = (fb & 0x03) + 1;
+    phase = (fb >> 2) & 1;
+    if (phase != expphase)
+        return am_key_phase;
+    if (payload.size < pnlen + TAG_LEN)
+        return enif_make_tuple2(env, am_error, am_badarg);
+
+    aad[0] = fb;
+    memcpy(aad + 1, header.data + 1, header.size - 1);
+    for (i = 0; i < pnlen; i++) {
+        unsigned char b = payload.data[i] ^ mask[1 + i];
+        aad[header.size + i] = b;
+        trunc_pn = (trunc_pn << 8) | b;
+    }
+    aadlen = (unsigned)header.size + pnlen;
+    pn = reconstruct_pn(largest, trunc_pn, pnlen);
+
+    memcpy(nonce, iv.data, NONCE_LEN);
+    for (i = 0; i < 8; i++)
+        nonce[NONCE_LEN - 1 - i] ^= (unsigned char)(pn >> (8 * i));
+
+    ctlen = (unsigned)payload.size - pnlen - TAG_LEN;
+    out = enif_make_new_binary(env, ctlen, &plain_term);
+
+    if (EVP_DecryptInit_ex(aead->ctx, NULL, NULL, NULL, nonce) != 1 ||
+        EVP_DecryptUpdate(aead->ctx, NULL, &len, aad, (int)aadlen) != 1 ||
+        (ctlen > 0 &&
+         EVP_DecryptUpdate(aead->ctx, out, &len, payload.data + pnlen, (int)ctlen) != 1) ||
+        EVP_CIPHER_CTX_ctrl(aead->ctx, EVP_CTRL_AEAD_SET_TAG, TAG_LEN,
+                            (void *)(payload.data + payload.size - TAG_LEN)) != 1)
+        return enif_make_tuple2(env, am_error, am_badarg);
+    if (EVP_DecryptFinal_ex(aead->ctx, out + len, &len2) != 1)
+        return am_error;
+
+    return enif_make_tuple3(
+        env, enif_make_uint64(env, pn), enif_make_uint(env, fb), plain_term);
+}
+
 static ERL_NIF_TERM
 is_loaded(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
@@ -354,6 +452,7 @@ load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info)
     am_false = enif_make_atom(env, "false");
     am_not_loaded = enif_make_atom(env, "not_loaded");
     am_badarg = enif_make_atom(env, "badarg");
+    am_key_phase = enif_make_atom(env, "key_phase");
     return 0;
 }
 
@@ -365,6 +464,7 @@ static ErlNifFunc nif_funcs[] = {
     {"open", 5, open_, 0},
     {"hp_block", 2, hp_block, 0},
     {"protect_run", 7, protect_run, 0},
+    {"open_packet", 7, open_packet, 0},
 };
 
 ERL_NIF_INIT(quic_crypto_nif, nif_funcs, load, NULL, NULL, NULL)

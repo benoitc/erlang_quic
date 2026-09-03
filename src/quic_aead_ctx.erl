@@ -17,7 +17,8 @@
     aead_encrypt/5,
     aead_decrypt/6,
     hp_block/3,
-    protect_run/8
+    protect_run/8,
+    open_packet/8
 ]).
 
 -define(TAG_LEN, 16).
@@ -102,6 +103,48 @@ protect_run(Cipher, Key, IV, HP, PN0, FirstByteBase, DCID, Payloads) ->
 
 hp_ecb_cipher(aes_128_gcm) -> aes_128_ecb;
 hp_ecb_cipher(aes_256_gcm) -> aes_256_ecb.
+
+%% @doc Fused short-header receive: header unprotection, PN
+%% reconstruction and AEAD open in one NIF call. Returns
+%% `{ok, PN, UnprotectedFirstByte, Plaintext}', `error' on
+%% authentication failure, or `fallback' (NIF missing, ChaCha, or the
+%% packet's key phase differs from ExpectedPhase - the caller then
+%% runs the generic path with key selection).
+-spec open_packet(
+    atom(),
+    binary(),
+    binary(),
+    binary(),
+    non_neg_integer() | undefined,
+    0 | 1,
+    binary(),
+    binary()
+) -> {ok, non_neg_integer(), byte(), binary()} | error | fallback.
+open_packet(chacha20_poly1305, _Key, _IV, _HP, _Largest, _Phase, _Header, _Payload) ->
+    fallback;
+open_packet(Cipher, Key, IV, HP, LargestRecv, ExpectedPhase, Header, EncPayload) ->
+    case nif_enabled() of
+        true ->
+            DecCtx = ctx(qc_dec, Cipher, Key),
+            HpCtx = hp_ctx(hp_ecb_cipher(Cipher), HP),
+            Largest =
+                case LargestRecv of
+                    undefined -> -1;
+                    _ -> LargestRecv
+                end,
+            case
+                quic_crypto_nif:open_packet(
+                    DecCtx, HpCtx, IV, Largest, ExpectedPhase, Header, EncPayload
+                )
+            of
+                {PN, FirstByte, Plain} -> {ok, PN, FirstByte, Plain};
+                error -> error;
+                key_phase -> fallback;
+                {error, _} -> fallback
+            end;
+        false ->
+            fallback
+    end.
 
 %%====================================================================
 %% Internal
