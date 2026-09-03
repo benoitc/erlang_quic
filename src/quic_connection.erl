@@ -4462,82 +4462,59 @@ seq_run_last(_, _) ->
 fold_opened_seq([], State, N, Elicited) ->
     fold_opened_finish(State, N, Elicited);
 fold_opened_seq([{_PN, _FB, Opened} | Rest], State, N, Elicited) ->
-    case opened_frames(Opened, State) of
-        {ok, NewState, Frames} ->
-            ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
-                packet_type => app,
-                frames => Frames
-            }),
-            ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
-            {State2, Elicited2} =
-                case contains_ack_eliciting_frames(Frames) of
-                    false ->
-                        {NewState, Elicited};
-                    true ->
-                        case should_delay_ack(Frames) of
-                            true -> {schedule_delayed_ack(app, NewState), Elicited};
-                            false -> {NewState, Elicited + 1}
-                        end
-                end,
-            fold_opened_seq(Rest, State2, N + 1, Elicited2);
-        {error, Reason} ->
-            log_opened_decode_failure(Reason, State),
-            fold_opened_seq(Rest, State, N, Elicited)
-    end.
+    {ok, NewState, Frames} = opened_frames(Opened, State),
+    ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
+        packet_type => app,
+        frames => Frames
+    }),
+    ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
+    {State2, Elicited2} =
+        case contains_ack_eliciting_frames(Frames) of
+            false ->
+                {NewState, Elicited};
+            true ->
+                case should_delay_ack(Frames) of
+                    true -> {schedule_delayed_ack(app, NewState), Elicited};
+                    false -> {NewState, Elicited + 1}
+                end
+        end,
+    fold_opened_seq(Rest, State2, N + 1, Elicited2).
 
 %% Per-packet loop for a run that is not one contiguous sequence.
 fold_opened([], State, _Now, N, Elicited) ->
     fold_opened_finish(State, N, Elicited);
 fold_opened([{PN, FirstByte, Opened} | Rest], State, Now, N, Elicited) ->
     StateF = record_app_recv(FirstByte, PN, State, Now),
-    case opened_frames(Opened, StateF) of
-        {ok, NewState, Frames} ->
-            ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
-                packet_type => app,
-                frames => Frames
-            }),
-            ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
-            %% Per-packet ACK policy identical to maybe_send_ack(app, ...),
-            %% except the count-based decimation increment is accumulated
-            %% across the run and applied once at the end.
-            {State2, Elicited2} =
-                case contains_ack_eliciting_frames(Frames) of
-                    false ->
-                        {NewState, Elicited};
+    {ok, NewState, Frames} = opened_frames(Opened, StateF),
+    ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
+        packet_type => app,
+        frames => Frames
+    }),
+    ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
+    %% Per-packet ACK policy identical to maybe_send_ack(app, ...),
+    %% except the count-based decimation increment is accumulated
+    %% across the run and applied once at the end.
+    {State2, Elicited2} =
+        case contains_ack_eliciting_frames(Frames) of
+            false ->
+                {NewState, Elicited};
+            true ->
+                case should_delay_ack(Frames) of
                     true ->
-                        case should_delay_ack(Frames) of
-                            true ->
-                                {schedule_delayed_ack(app, NewState), Elicited};
-                            false ->
-                                case NewState#state.last_recv_trigger of
-                                    reordered ->
-                                        %% send_app_ack acks everything seen so
-                                        %% far and clears the count, so pending
-                                        %% increments are dropped with it.
-                                        {send_app_ack(NewState), 0};
-                                    sequential ->
-                                        {NewState, Elicited + 1}
-                                end
+                        {schedule_delayed_ack(app, NewState), Elicited};
+                    false ->
+                        case NewState#state.last_recv_trigger of
+                            reordered ->
+                                %% send_app_ack acks everything seen so
+                                %% far and clears the count, so pending
+                                %% increments are dropped with it.
+                                {send_app_ack(NewState), 0};
+                            sequential ->
+                                {NewState, Elicited + 1}
                         end
-                end,
-            fold_opened(Rest, State2, Now, N + 1, Elicited2);
-        {error, Reason} ->
-            log_opened_decode_failure(Reason, State),
-            fold_opened(Rest, State, Now, N, Elicited)
-    end.
-
-%% Same recovery as handle_packet_loop/2: log and drop the datagram,
-%% continue with the pre-packet state.
-log_opened_decode_failure(Reason, State) ->
-    ?LOG_WARNING(
-        #{
-            what => packet_decode_decrypt_failed,
-            role => State#state.role,
-            reason => Reason,
-            source => State#state.current_packet_source
-        },
-        ?QUIC_LOG_META
-    ).
+                end
+        end,
+    fold_opened(Rest, State2, Now, N + 1, Elicited2).
 
 %% Apply the run's packet count and its accumulated ack-eliciting
 %% count. Inside a receive pass decimation only counts (the pass end
