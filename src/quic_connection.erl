@@ -311,23 +311,6 @@
 -define(AEAD_CONFIDENTIALITY_LIMIT, 16#800000).
 
 %% Connection state record
-%% Per-run constants for the bulk chunk-run sender (see
-%% send_stream_chunk_run/8): everything that would otherwise be
-%% re-extracted from #state{} on every packet of the run.
--record(chunk_run, {
-    stream_id :: non_neg_integer(),
-    max_chunk :: pos_integer(),
-    header_prefix :: binary(),
-    length_varint :: binary(),
-    key_phase :: 0 | 1,
-    cipher :: quic_aead:cipher(),
-    key :: binary(),
-    iv :: binary(),
-    hp :: binary(),
-    dcid :: binary(),
-    now :: integer()
-}).
-
 -record(state, {
     %% Connection identity
     scid :: binary(),
@@ -9355,21 +9338,37 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
         end,
     #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
     Now = erlang:monotonic_time(millisecond),
-    Run = #chunk_run{
-        stream_id = StreamId,
-        max_chunk = MaxChunkSize,
-        header_prefix = HeaderPrefix,
-        length_varint = LengthVarint,
-        key_phase = get_current_key_phase(State),
-        cipher = Cipher,
-        key = Key,
-        iv = IV,
-        hp = HP,
-        dcid = DCID,
-        now = Now
-    },
-    {SS1, TrackedRev, Offset1, Rest} =
-        chunk_run_loop(K, Offset, Data, State, Run, SocketState, [], 0),
+    PN0 = PNSpace#pn_space.next_pn,
+    KeyPhase = get_current_key_phase(State),
+    %% Build the run's frames and QUIC-frame payloads, then seal all K
+    %% packets: one fused NIF call when available (header, nonce, AEAD
+    %% and header protection in C), per-packet Erlang sealing otherwise.
+    {Frames, Payloads, Offset1, Rest} =
+        build_run_payloads(K, StreamId, Offset, Data, HeaderPrefix, LengthVarint, MaxChunkSize),
+    FirstByteBase = short_header_first_byte(KeyPhase, 1, State),
+    Packets =
+        case quic_aead_ctx:protect_run(Cipher, Key, IV, HP, PN0, FirstByteBase, DCID, Payloads) of
+            {ok, Ps} ->
+                Ps;
+            fallback ->
+                {Ps, _} = lists:mapfoldl(
+                    fun(Payload, PN) ->
+                        FirstByte = short_header_first_byte(
+                            KeyPhase, quic_packet:pn_length(PN), State
+                        ),
+                        {
+                            quic_aead:protect_short_packet(
+                                Cipher, Key, IV, HP, PN, FirstByte, DCID, Payload
+                            ),
+                            PN + 1
+                        }
+                    end,
+                    PN0,
+                    Payloads
+                ),
+                Ps
+        end,
+    {SS1, TrackedRev} = send_run_packets(Packets, Frames, PN0, State, SocketState, []),
     %% One loss-tracker and one CC update for the run's successful sends.
     {Loss1, CC1} =
         case TrackedRev of
@@ -9382,7 +9381,6 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
                     quic_cc:on_packets_sent(CCState, [Sz || {_, Sz, _} <- Tracked])
                 }
         end,
-    PN0 = PNSpace#pn_space.next_pn,
     %% RFC 9000 §10.1: the idle timer restarts on the first ack-eliciting
     %% send since the last receive (see send_app_packet_now/3).
     RestartIdle = not State#state.ack_eliciting_since_recv,
@@ -9406,34 +9404,41 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
         StreamId, Offset1, Rest, Fin, State2, BytesSentSoFar + K * MaxChunkSize, Ctx
     ).
 
-%% Per-chunk inner loop: seal and send only; the socket state is
-%% threaded explicitly so no #state{} copy happens per packet, and the
-%% successful sends are collected as [{PN, Size, Frame}] (reversed)
-%% for one batched loss/CC update afterwards. Chunk I takes packet
-%% number next_pn + I; the caller advances next_pn by K. A failed send
-%% skips that packet's tracking exactly as send_app_packet_now/3 does
-%% (PTO owns retransmission).
-chunk_run_loop(0, Offset, Data, _State, _Run, SS, Tracked, _I) ->
-    {SS, Tracked, Offset, Data};
-chunk_run_loop(K, Offset, Data, State, Run, SS, Tracked, I) ->
-    #chunk_run{
-        stream_id = StreamId,
-        max_chunk = MaxChunkSize,
-        header_prefix = HeaderPrefix,
-        length_varint = LengthVarint,
-        key_phase = KeyPhase,
-        cipher = Cipher,
-        key = Key,
-        iv = IV,
-        hp = HP,
-        dcid = DCID
-    } = Run,
-    <<Chunk:MaxChunkSize/binary, Rest/binary>> = Data,
-    Frame = {stream, StreamId, Offset, Chunk, false},
+%% Split the run's data into K full chunks, building the stream frame
+%% and QUIC-frame payload for each. Returns the leftover data and its
+%% starting offset for the caller to continue with.
+build_run_payloads(K, StreamId, Offset, Data, HeaderPrefix, LengthVarint, MaxChunkSize) ->
+    build_run_payloads(
+        K, StreamId, Offset, Data, HeaderPrefix, LengthVarint, MaxChunkSize, [], []
+    ).
+
+build_run_payloads(0, _Sid, Offset, Data, _HP, _LV, _MCS, FrAcc, PlAcc) ->
+    {lists:reverse(FrAcc), lists:reverse(PlAcc), Offset, Data};
+build_run_payloads(K, Sid, Offset, Data, HeaderPrefix, LengthVarint, MCS, FrAcc, PlAcc) ->
+    <<Chunk:MCS/binary, Rest/binary>> = Data,
+    Frame = {stream, Sid, Offset, Chunk, false},
     Payload = build_chunk_iodata(HeaderPrefix, Offset, LengthVarint, Chunk, Frame),
-    PN = (State#state.pn_app)#pn_space.next_pn + I,
-    FirstByte = short_header_first_byte(KeyPhase, quic_packet:pn_length(PN), State),
-    Packet = quic_aead:protect_short_packet(Cipher, Key, IV, HP, PN, FirstByte, DCID, Payload),
+    build_run_payloads(
+        K - 1,
+        Sid,
+        Offset + MCS,
+        Rest,
+        HeaderPrefix,
+        LengthVarint,
+        MCS,
+        [Frame | FrAcc],
+        [Payload | PlAcc]
+    ).
+
+%% Hand the run's sealed packets to the socket; the socket state is
+%% threaded explicitly so no #state{} copy happens per packet, and the
+%% successful sends are collected as [{PN, Size, Frame}] (reversed) for
+%% one batched loss/CC update afterwards. Packet I carries PN0 + I. A
+%% failed send skips that packet's tracking exactly as
+%% send_app_packet_now/3 does (PTO owns retransmission).
+send_run_packets([], [], _PN, _State, SS, Tracked) ->
+    {SS, Tracked};
+send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Tracked) ->
     PacketSize = byte_size(Packet),
     #state{remote_addr = {IP, Port}} = State,
     SendResult =
@@ -9459,22 +9464,19 @@ chunk_run_loop(K, Offset, Data, State, Run, SS, Tracked, I) ->
                     undefined -> SS;
                     _ -> SS1
                 end,
-            Tracked1 = [{PN, PacketSize, Frame} | Tracked],
-            chunk_run_loop(K - 1, Offset + MaxChunkSize, Rest, State, Run, SS2, Tracked1, I + 1);
+            send_run_packets(Pkts, Frs, PN + 1, State, SS2, [{PN, PacketSize, Frame} | Tracked]);
         {error, Reason, SSCleared} ->
             ?LOG_WARNING(
                 #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
                 ?QUIC_LOG_META
             ),
-            chunk_run_loop(
-                K - 1, Offset + MaxChunkSize, Rest, State, Run, SSCleared, Tracked, I + 1
-            );
+            send_run_packets(Pkts, Frs, PN + 1, State, SSCleared, Tracked);
         {error, Reason} ->
             ?LOG_WARNING(
                 #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
                 ?QUIC_LOG_META
             ),
-            chunk_run_loop(K - 1, Offset + MaxChunkSize, Rest, State, Run, SS, Tracked, I + 1)
+            send_run_packets(Pkts, Frs, PN + 1, State, SS, Tracked)
     end.
 
 %% Build the iodata payload `[Header, Chunk]' for a chunked stream

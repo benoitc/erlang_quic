@@ -16,7 +16,8 @@
 -export([
     aead_encrypt/5,
     aead_decrypt/6,
-    hp_block/3
+    hp_block/3,
+    protect_run/8
 ]).
 
 -define(TAG_LEN, 16).
@@ -64,6 +65,43 @@ hp_block(Cipher, Key, Sample) ->
         false ->
             quic_aead:ecb_mask(Cipher, Key, Sample)
     end.
+
+%% @doc Seal a run of short-header packets with consecutive PNs in one
+%% NIF call (header build + nonce + AEAD + header protection fused).
+%% Returns `{ok, [WirePacket]}' or `fallback' when the NIF is not
+%% loaded, the cipher is ChaCha (its HP is not ECB) or the NIF rejects
+%% the input - callers then take the per-packet path.
+-spec protect_run(
+    atom(),
+    binary(),
+    binary(),
+    binary(),
+    non_neg_integer(),
+    byte(),
+    binary(),
+    [iodata()]
+) -> {ok, [binary()]} | fallback.
+protect_run(chacha20_poly1305, _Key, _IV, _HP, _PN0, _FirstByteBase, _DCID, _Payloads) ->
+    fallback;
+protect_run(Cipher, Key, IV, HP, PN0, FirstByteBase, DCID, Payloads) ->
+    case nif_enabled() of
+        true ->
+            AeadCtx = ctx(qc_enc, Cipher, Key),
+            HpCtx = hp_ctx(hp_ecb_cipher(Cipher), HP),
+            case
+                quic_crypto_nif:protect_run(
+                    AeadCtx, HpCtx, IV, PN0, FirstByteBase, DCID, Payloads
+                )
+            of
+                Packets when is_list(Packets) -> {ok, Packets};
+                {error, _} -> fallback
+            end;
+        false ->
+            fallback
+    end.
+
+hp_ecb_cipher(aes_128_gcm) -> aes_128_ecb;
+hp_ecb_cipher(aes_256_gcm) -> aes_256_ecb.
 
 %%====================================================================
 %% Internal

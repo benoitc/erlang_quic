@@ -125,6 +125,14 @@ All notable changes to this project will be documented in this file.
   gets a timely ACK. An unbounded mailbox turned receiver overload into queueing
   delay instead of loss, which inflated the peer's RTT samples and
   destabilized its loss detector.
+- With the crypto NIF loaded, a bulk chunk run is sealed in one call:
+  `protect_run` builds each short header, derives the nonce, AEAD-seals
+  the payload and applies header protection for the whole run in C,
+  instead of two crypto NIF calls plus header, nonce and mask glue per
+  packet. AES only (the header-protection context is ECB); ChaCha and
+  NIF-less builds seal per packet as before. Send-side crypto drops
+  from about 9% of connection CPU to about 2% on bulk flows. The output
+  is checked byte for byte against the per-packet path.
 
 ## [1.8.2] - 2026-09-05
 
