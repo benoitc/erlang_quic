@@ -4386,6 +4386,21 @@ handle_short_run(Packets, Keys, State) ->
             do_handle_packets_batch(Rest, handle_packet_loop(Packet, State))
     end.
 
+%% Consume an open_run result: the NIF returns either a pre-parsed
+%% frame list (term-identical to quic_frame:decode/1 output) or
+%% {raw, Plain} for packets with frame types outside the fast path,
+%% which keep the generic decoder and its error semantics. Parsed
+%% frames go through the same per-frame processing as the decoder
+%% loop.
+opened_frames({raw, Plain}, State) ->
+    decode_and_process_streaming(app, Plain, State);
+opened_frames(Frames, State) when is_list(Frames) ->
+    {ok,
+        lists:foldl(
+            fun(F, S) -> process_frame_track_probing(app, F, S) end, State, Frames
+        ),
+        Frames}.
+
 take_short_run([<<0:1, 1:1, _:6, _/binary>> = P | Rest], Acc) ->
     take_short_run(Rest, [P | Acc]);
 take_short_run(Rest, Acc) ->
@@ -4396,10 +4411,10 @@ take_short_run(Rest, Acc) ->
 %% `processed' branch of handle_packet_loop/2.
 fold_opened([], State) ->
     State;
-fold_opened([{PN, FirstByte, Plaintext} | Rest], State) ->
+fold_opened([{PN, FirstByte, Opened} | Rest], State) ->
     Now = erlang:monotonic_time(millisecond),
     StateF = record_app_recv(FirstByte, PN, State, Now),
-    case decode_and_process_streaming(app, Plaintext, StateF) of
+    case opened_frames(Opened, StateF) of
         {ok, NewState, Frames} ->
             ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
                 packet_type => app,
