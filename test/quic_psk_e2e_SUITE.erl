@@ -12,6 +12,7 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include("quic.hrl").
 
 -export([
     all/0,
@@ -179,10 +180,19 @@ bad_binder_is_fatal(_Config) ->
         with_cert => true
     }),
     try
+        %% The alert has to reach the wire, not just fail locally: assert
+        %% the exact CONNECTION_CLOSE the server owes us, promptly.
+        %% `{error, _}` alone is satisfied by an idle timeout, which is
+        %% how issue #227 shipped unnoticed.
         Result = try_connect(Server, #{
             external_psk => {?IDENTITY, ?WRONG_SECRET}
         }),
-        ?assertMatch({error, _}, Result)
+        ?assertEqual(
+            {error,
+                {peer_closed, transport, ?QUIC_CRYPTO_ERROR_BASE + ?TLS_ALERT_DECRYPT_ERROR, 0,
+                    <<"decrypt error">>}},
+            Result
+        )
     after
         stop_server(Server)
     end.
