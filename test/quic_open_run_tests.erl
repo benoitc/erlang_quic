@@ -27,8 +27,10 @@ build_run(PN0, FirstByteBase, Payloads) ->
     Packets.
 
 payloads(N) ->
+    %% 16#1f is not a QUIC frame type, so the in-NIF frame parser always
+    %% takes the {raw, Plain} fallback for these synthetic payloads.
     [
-        <<I, "payload-", (integer_to_binary(I))/binary, 0:(200 * 8)>>
+        <<16#1f, I, "payload-", (integer_to_binary(I))/binary, 0:(199 * 8)>>
      || <<I>> <= list_to_binary(lists:seq(1, N))
     ].
 
@@ -44,7 +46,9 @@ open_run_roundtrip_test() ->
             lists:seq(0, 7),
             [PN || {PN, _FB, _P} <- Results]
         ),
-        ?assertEqual(Payloads, [P || {_PN, _FB, P} <- Results])
+        %% Test payloads are not valid frame sequences, so the in-NIF
+        %% frame parser falls back to {raw, Plain} for every packet.
+        ?assertEqual(Payloads, [P || {_PN, _FB, {raw, P}} <- Results])
     end).
 
 open_run_matches_sequential_test() ->
@@ -61,7 +65,7 @@ open_run_matches_sequential_test() ->
                 {ok, PN, FB, Plain} = quic_aead_ctx:open_packet(
                     aes_128_gcm, ?KEY, ?IV, ?HP, Largest, 0, Header, Payload
                 ),
-                {{PN, FB, Plain}, max(Largest, PN)}
+                {{PN, FB, {raw, Plain}}, max(Largest, PN)}
             end,
             99,
             Packets

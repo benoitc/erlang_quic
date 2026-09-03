@@ -149,6 +149,17 @@ All notable changes to this project will be documented in this file.
   authentication failure, undersized datagram), which the caller then
   handles per packet. The client drain now collects queued same-source
   datagrams into one batch before processing.
+- After the batched decrypt, `open_run` also parses each packet's
+  frames in C and returns a frame list term-identical to what
+  `quic_frame:decode/1` produces (PING, ACK with ECN, CRYPTO, STREAM,
+  MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS, HANDSHAKE_DONE, with stream
+  and crypto payloads as zero-copy sub-binaries). A packet with any
+  other frame type comes back raw and goes through the Erlang decoder,
+  which keeps every error semantic (unknown type, truncation, empty
+  packet). The parser is differential-tested against the decoder and
+  fuzzed with random and mutated frame sequences. In a 50-connection
+  server model this cut steady-state reductions by 8%; on a verified
+  bulk transfer, 190 to 222 MiB/s.
 
 ## [1.8.2] - 2026-09-05
 

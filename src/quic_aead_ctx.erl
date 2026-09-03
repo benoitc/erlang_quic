@@ -151,7 +151,7 @@ open_packet(Cipher, Key, IV, HP, LargestRecv, ExpectedPhase, Header, EncPayload)
     0 | 1,
     non_neg_integer(),
     [binary()]
-) -> {ok, [{non_neg_integer(), byte(), binary()}]} | fallback.
+) -> {ok, [{non_neg_integer(), byte(), [term()] | {raw, binary()}}]} | fallback.
 open_run(chacha20_poly1305, _Key, _IV, _HP, _Largest, _Phase, _DcidLen, _Datagrams) ->
     fallback;
 open_run(Cipher, Key, IV, HP, LargestRecv, ExpectedPhase, DcidLen, Datagrams) ->
