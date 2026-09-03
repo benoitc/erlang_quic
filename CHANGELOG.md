@@ -28,6 +28,15 @@ All notable changes to this project will be documented in this file.
   state and its fallback close is skipped entirely while app keys do not
   exist. The peer saw silence and waited out its idle timeout instead of
   learning why the handshake failed. Reported by obi458 (#227).
+- Two nodes dialling each other at the same time no longer deadlock over
+  QUIC distribution. `net_kernel` resolves a simultaneous connect by
+  killing the losing setup process and then blocking, with no timeout,
+  until that process dies; the setup process trapped exits, so the signal
+  became an unread message, nothing died, and the node's distribution
+  machinery stayed wedged until both dials timed out. It now acts on that
+  exit while it still owns the connection, and stops trapping once the
+  controller has taken ownership, which is what OTP's own setup processes
+  do.
 - An HTTP/3 message body ends at stream end rather than at a frame
   boundary, so a response whose last DATA frame is followed by the FIN
   in a separate packet is not truncated. Contributed by jbevemyr (#244).
