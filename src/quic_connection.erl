@@ -200,6 +200,10 @@
     %% Mailbox drain of the connected-state receive pass
     drain_recv_msgs/2,
     collect_client_udp/5,
+    %% Batch-opened run processing
+    fold_opened/2,
+    test_state_with_pn_app/2,
+    test_recv_summary/2,
     test_state_closing/2,
     test_state_with_socket/2,
     test_state_in_recv_pass/1,
@@ -4386,6 +4390,175 @@ handle_short_run(Packets, Keys, State) ->
             do_handle_packets_batch(Rest, handle_packet_loop(Packet, State))
     end.
 
+take_short_run([<<0:1, 1:1, _:6, _/binary>> = P | Rest], Acc) ->
+    take_short_run(Rest, [P | Acc]);
+take_short_run(Rest, Acc) ->
+    {lists:reverse(Acc), Rest}.
+
+%% Post-decrypt processing for a batch-opened run: the same per-packet
+%% effects as the fused branch of decrypt_app_packet/4 followed by the
+%% `processed' branch of handle_packet_loop/2, with the per-packet
+%% bookkeeping collapsed where the run's shape allows it.
+%%
+%% One monotonic_time sample serves the whole run (runs are opened
+%% well under a millisecond, and nothing reads the counter mid-fold).
+fold_opened(Results, State) ->
+    Now = erlang:monotonic_time(millisecond),
+    %% Contiguous-run fast path: when the whole opened run continues the
+    %% receive sequence exactly (PNs consecutive from largest_recv + 1,
+    %% which also means the head ACK range extends in place), the
+    %% per-packet receive bookkeeping collapses into one state update:
+    %% largest/ranges/spin from the last packet, every packet classified
+    %% sequential. Any other shape takes the per-packet path unchanged.
+    case State#state.pn_app of
+        #pn_space{largest_recv = L, ack_ranges = [{RangeStart, L} | RestRanges]} = PNSpace when
+            is_integer(L)
+        ->
+            case seq_run_last(Results, L + 1) of
+                {LastPN, LastFB} ->
+                    SpinRecv = (LastFB bsr 5) band 1,
+                    SpinOut =
+                        case State#state.spin_bit_enabled of
+                            false -> State#state.spin_outgoing;
+                            true when State#state.role =:= client -> SpinRecv;
+                            true -> 1 - SpinRecv
+                        end,
+                    State1 = State#state{
+                        pn_app = PNSpace#pn_space{
+                            largest_recv = LastPN,
+                            recv_time = Now,
+                            ack_ranges = [{RangeStart, LastPN} | RestRanges]
+                        },
+                        last_recv_trigger = sequential,
+                        spin_recv = SpinRecv,
+                        spin_recv_largest_pn = LastPN,
+                        spin_outgoing = SpinOut,
+                        last_activity = Now,
+                        ack_eliciting_since_recv = false
+                    },
+                    case stream_train(Results, State1) of
+                        {ok, StreamId, FirstOff, RevChunks, Total, N} ->
+                            apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, State1);
+                        no ->
+                            fold_opened_seq(Results, State1, 0, 0)
+                    end;
+                no ->
+                    fold_opened(Results, State, Now, 0, 0)
+            end;
+        _ ->
+            fold_opened(Results, State, Now, 0, 0)
+    end.
+
+%% Last {PN, FirstByte} of a run iff PNs are consecutive from Expected.
+seq_run_last([{PN, FB, _}], PN) ->
+    {PN, FB};
+seq_run_last([{PN, _, _} | [{PN2, _, _} | _] = Rest], PN) when PN2 =:= PN + 1 ->
+    seq_run_last(Rest, PN2);
+seq_run_last(_, _) ->
+    no.
+
+%% Per-packet loop for a contiguous run: receive bookkeeping already
+%% applied for the whole train, every packet known sequential.
+fold_opened_seq([], State, N, Elicited) ->
+    fold_opened_finish(State, N, Elicited);
+fold_opened_seq([{_PN, _FB, Opened} | Rest], State, N, Elicited) ->
+    case opened_frames(Opened, State) of
+        {ok, NewState, Frames} ->
+            ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
+                packet_type => app,
+                frames => Frames
+            }),
+            ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
+            {State2, Elicited2} =
+                case contains_ack_eliciting_frames(Frames) of
+                    false ->
+                        {NewState, Elicited};
+                    true ->
+                        case should_delay_ack(Frames) of
+                            true -> {schedule_delayed_ack(app, NewState), Elicited};
+                            false -> {NewState, Elicited + 1}
+                        end
+                end,
+            fold_opened_seq(Rest, State2, N + 1, Elicited2);
+        {error, Reason} ->
+            log_opened_decode_failure(Reason, State),
+            fold_opened_seq(Rest, State, N, Elicited)
+    end.
+
+%% Per-packet loop for a run that is not one contiguous sequence.
+fold_opened([], State, _Now, N, Elicited) ->
+    fold_opened_finish(State, N, Elicited);
+fold_opened([{PN, FirstByte, Opened} | Rest], State, Now, N, Elicited) ->
+    StateF = record_app_recv(FirstByte, PN, State, Now),
+    case opened_frames(Opened, StateF) of
+        {ok, NewState, Frames} ->
+            ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
+                packet_type => app,
+                frames => Frames
+            }),
+            ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
+            %% Per-packet ACK policy identical to maybe_send_ack(app, ...),
+            %% except the count-based decimation increment is accumulated
+            %% across the run and applied once at the end.
+            {State2, Elicited2} =
+                case contains_ack_eliciting_frames(Frames) of
+                    false ->
+                        {NewState, Elicited};
+                    true ->
+                        case should_delay_ack(Frames) of
+                            true ->
+                                {schedule_delayed_ack(app, NewState), Elicited};
+                            false ->
+                                case NewState#state.last_recv_trigger of
+                                    reordered ->
+                                        %% send_app_ack acks everything seen so
+                                        %% far and clears the count, so pending
+                                        %% increments are dropped with it.
+                                        {send_app_ack(NewState), 0};
+                                    sequential ->
+                                        {NewState, Elicited + 1}
+                                end
+                        end
+                end,
+            fold_opened(Rest, State2, Now, N + 1, Elicited2);
+        {error, Reason} ->
+            log_opened_decode_failure(Reason, State),
+            fold_opened(Rest, State, Now, N, Elicited)
+    end.
+
+%% Same recovery as handle_packet_loop/2: log and drop the datagram,
+%% continue with the pre-packet state.
+log_opened_decode_failure(Reason, State) ->
+    ?LOG_WARNING(
+        #{
+            what => packet_decode_decrypt_failed,
+            role => State#state.role,
+            reason => Reason,
+            source => State#state.current_packet_source
+        },
+        ?QUIC_LOG_META
+    ).
+
+%% Apply the run's packet count and its accumulated ack-eliciting
+%% count. Inside a receive pass decimation only counts (the pass end
+%% flushes), so one increment and one arm_ack_timer serve the run;
+%% outside a pass each increment gets the threshold check it would
+%% have had per packet.
+fold_opened_finish(State, N, Elicited) ->
+    State1 = State#state{packets_received = State#state.packets_received + N},
+    case {Elicited, State1#state.recv_pass} of
+        {0, _} ->
+            State1;
+        {_, true} ->
+            arm_ack_timer(State1#state{
+                ack_elicited_count = State1#state.ack_elicited_count + Elicited
+            });
+        {_, false} ->
+            lists:foldl(
+                fun(_, S) -> maybe_decimate_app_ack(S) end, State1, lists:seq(1, Elicited)
+            )
+    end.
+
 %% Consume an open_run result: the NIF returns either a pre-parsed
 %% frame list (term-identical to quic_frame:decode/1 output) or
 %% {raw, Plain} for packets with frame types outside the fast path,
@@ -4401,44 +4574,117 @@ opened_frames(Frames, State) when is_list(Frames) ->
         ),
         Frames}.
 
-take_short_run([<<0:1, 1:1, _:6, _/binary>> = P | Rest], Acc) ->
-    take_short_run(Rest, [P | Acc]);
-take_short_run(Rest, Acc) ->
-    {lists:reverse(Acc), Rest}.
-
-%% Post-decrypt processing for a batch-opened run: the same per-packet
-%% effects as the fused branch of decrypt_app_packet/4 followed by the
-%% `processed' branch of handle_packet_loop/2.
-fold_opened([], State) ->
-    State;
-fold_opened([{PN, FirstByte, Opened} | Rest], State) ->
-    Now = erlang:monotonic_time(millisecond),
-    StateF = record_app_recv(FirstByte, PN, State, Now),
-    case opened_frames(Opened, StateF) of
-        {ok, NewState, Frames} ->
-            ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
-                packet_type => app,
-                frames => Frames
-            }),
-            NewState1 = NewState#state{
-                packets_received = NewState#state.packets_received + 1
-            },
-            ?QLOG_EMIT_FRAMES_PROCESSED(NewState1#state.qlog_ctx, Frames),
-            fold_opened(Rest, maybe_send_ack(app, Frames, NewState1));
-        {error, Reason} ->
-            %% Same recovery as handle_packet_loop/2: log, drop the
-            %% datagram, continue with the pre-packet state.
-            ?LOG_WARNING(
-                #{
-                    what => packet_decode_decrypt_failed,
-                    role => State#state.role,
-                    reason => Reason,
-                    source => State#state.current_packet_source
-                },
-                ?QUIC_LOG_META
-            ),
-            fold_opened(Rest, State)
+%% Textbook bulk train: every packet in the run carries exactly one
+%% stream frame, all for the same stream, offsets contiguous, no FIN,
+%% and qlog is off (its per-packet events would be skipped). Returns
+%% the chunks in reverse order.
+stream_train(Results, State) ->
+    case ?QLOG_ENABLED(State#state.qlog_ctx) of
+        true -> no;
+        false -> stream_train(Results, undefined, undefined, [], 0, 0)
     end.
+
+stream_train([], Sid, _NextOff, RevChunks, Total, N) when Sid =/= undefined ->
+    {Off, _} = lists:last(RevChunks),
+    {ok, Sid, Off, RevChunks, Total, N};
+stream_train(
+    [{_PN, _FB, [{stream, Sid, Off, Data, false}]} | Rest], undefined, undefined, [], 0, 0
+) ->
+    stream_train(Rest, Sid, Off + byte_size(Data), [{Off, Data}], byte_size(Data), 1);
+stream_train(
+    [{_PN, _FB, [{stream, Sid, Off, Data, false}]} | Rest], Sid, Off, RevChunks, Total, N
+) ->
+    stream_train(
+        Rest,
+        Sid,
+        Off + byte_size(Data),
+        [{Off, Data} | RevChunks],
+        Total + byte_size(Data),
+        N + 1
+    );
+stream_train(_, _, _, _, _, _) ->
+    no.
+
+%% One bookkeeping pass for a whole contiguous stream train: the same
+%% conditions as the lean clause of do_process_stream_data_buffered/5,
+%% checked once with the train's totals; any deviation replays the
+%% train through the per-packet path.
+apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, State) ->
+    case State#state.streams of
+        #{
+            StreamId := #stream_state{
+                recv_offset = FirstOff,
+                recv_max_data = RecvMaxData,
+                final_size = undefined,
+                recv_reset_at = undefined,
+                recv_buffer = RB
+            } = Stream
+        } ->
+            EndOffset = FirstOff + Total,
+            NewDataReceived = State#state.data_received + Total,
+            HalfWindow = State#state.fc_max_receive_window div 2,
+            case
+                Total > 0 andalso
+                    gb_trees:is_empty(RB) andalso
+                    RecvMaxData - EndOffset >= HalfWindow andalso
+                    State#state.max_data_local - NewDataReceived >= HalfWindow andalso
+                    State#state.recv_buffer_bytes + Total =< ?MAX_RECV_BUFFER_BYTES
+            of
+                true ->
+                    PendDeliver = deliver_stream_train(StreamId, RevChunks, State),
+                    State1 = State#state{
+                        streams = maps:put(
+                            StreamId,
+                            Stream#stream_state{recv_offset = EndOffset},
+                            State#state.streams
+                        ),
+                        data_received = NewDataReceived,
+                        pend_deliver = PendDeliver,
+                        has_non_probing_frame = true
+                    },
+                    fold_opened_finish(State1, N, N);
+                false ->
+                    stream_train_fallback(StreamId, RevChunks, State)
+            end;
+        _ ->
+            stream_train_fallback(StreamId, RevChunks, State)
+    end.
+
+%% Deviating train: replay it through the ordinary per-packet path.
+stream_train_fallback(StreamId, RevChunks, State) ->
+    {StateN, N} = lists:foldr(
+        fun({Off, Data}, {Acc, Cnt}) ->
+            {process_stream_data(StreamId, Off, Data, false, Acc), Cnt + 1}
+        end,
+        {State, 0},
+        RevChunks
+    ),
+    fold_opened_finish(StateN#state{has_non_probing_frame = true}, N, N).
+
+%% Deliver a whole train with the delivery contract of
+%% deliver_stream_data/4: merged into the pending run under coalescing
+%% (the chunks are adjacent and in order by construction), one message
+%% per chunk in stream order otherwise. Returns the new pend_deliver.
+deliver_stream_train(
+    StreamId, RevChunks, #state{recv_pass = true, delivery_coalescing = true} = State
+) ->
+    RevData = [Data || {_Off, Data} <- RevChunks],
+    case State#state.pend_deliver of
+        {StreamId, Acc, F} ->
+            {StreamId, RevData ++ Acc, F};
+        none ->
+            {StreamId, RevData, false};
+        {OtherId, Acc, F} ->
+            State#state.owner ! {quic, self(), {stream_data, OtherId, run_binary(Acc), F}},
+            {StreamId, RevData, false}
+    end;
+deliver_stream_train(StreamId, RevChunks, State) ->
+    Owner = State#state.owner,
+    lists:foreach(
+        fun({_Off, Data}) -> Owner ! {quic, self(), {stream_data, StreamId, Data, false}} end,
+        lists:reverse(RevChunks)
+    ),
+    State#state.pend_deliver.
 
 %% One server receive pass: process the packets of a listener message
 %% (source tracking, frame classification, RFC 9000 §9.1 migration
@@ -13481,6 +13727,38 @@ test_add_recv_stream(#state{streams = Streams} = State, StreamId, StreamCredit) 
         final_size = undefined
     },
     State#state{streams = Streams#{StreamId => Stream}}.
+
+%% Give a test state a 1-RTT PN space that has received 0..Largest.
+-spec test_state_with_pn_app(#state{}, non_neg_integer()) -> #state{}.
+test_state_with_pn_app(State, Largest) ->
+    State#state{
+        pn_app = #pn_space{
+            next_pn = 0,
+            largest_acked = undefined,
+            largest_recv = Largest,
+            recv_time = 0,
+            ack_ranges = [{0, Largest}],
+            ack_eliciting_in_flight = 0,
+            loss_time = undefined,
+            sent_packets = #{}
+        },
+        transport_params = #{max_ack_delay => 25}
+    }.
+
+%% The receive-side fields a batch-opened run is expected to move.
+-spec test_recv_summary(#state{}, non_neg_integer()) -> map().
+test_recv_summary(#state{pn_app = PN, streams = Streams} = State, StreamId) ->
+    #{
+        largest_recv => PN#pn_space.largest_recv,
+        ack_ranges => PN#pn_space.ack_ranges,
+        recv_offset => (maps:get(StreamId, Streams))#stream_state.recv_offset,
+        data_received => State#state.data_received,
+        packets_received => State#state.packets_received,
+        ack_elicited_count => State#state.ack_elicited_count,
+        pend_deliver => State#state.pend_deliver,
+        spin_recv_largest_pn => State#state.spin_recv_largest_pn,
+        has_non_probing_frame => State#state.has_non_probing_frame
+    }.
 
 %% Minimal #state{} with a 1-RTT PN space, for the receive-bookkeeping
 %% tests that run record_app_recv/4 against its unfused parts.
