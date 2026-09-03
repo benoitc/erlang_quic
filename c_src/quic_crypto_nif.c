@@ -429,6 +429,100 @@ open_packet(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         env, enif_make_uint64(env, pn), enif_make_uint(env, fb), plain_term);
 }
 
+/* open_run(AeadCtx, HpCtx, IV12, LargestRecv, ExpectedPhase, DcidLen,
+ *          Datagrams) -> {ok, [{PN, FirstByte, Plain}]} | {error, badarg}
+ *
+ * Batched open_packet over a train of short-header datagrams. Each
+ * datagram is FirstByte + DCID(DcidLen) + PN bytes + ciphertext + tag;
+ * the largest received PN is carried forward across the run for
+ * packet-number reconstruction, matching sequential per-packet calls.
+ * Stops at the first datagram that cannot be opened on this fast path
+ * (size, key-phase mismatch, auth failure): the result list is the
+ * consumed prefix and the caller reruns the rest generically. */
+#define OPEN_RUN_MAX 256
+static ERL_NIF_TERM
+open_run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    qc_ctx *aead, *hp;
+    ErlNifBinary iv, dgram;
+    ErlNifSInt64 largest;
+    unsigned int expphase, dcidlen;
+    ERL_NIF_TERM list, head, tail, results[OPEN_RUN_MAX];
+    unsigned k = 0;
+
+    (void)argc;
+    if (enif_get_resource(env, argv[0], qc_ctx_type, (void **)&aead) == 0 || aead->enc != 0 ||
+        enif_get_resource(env, argv[1], qc_ctx_type, (void **)&hp) == 0 ||
+        enif_inspect_binary(env, argv[2], &iv) == 0 || iv.size != NONCE_LEN ||
+        enif_get_int64(env, argv[3], &largest) == 0 ||
+        enif_get_uint(env, argv[4], &expphase) == 0 || expphase > 1 ||
+        enif_get_uint(env, argv[5], &dcidlen) == 0 || dcidlen > 20 ||
+        enif_is_list(env, argv[6]) == 0)
+        return enif_make_tuple2(env, am_error, am_badarg);
+
+    list = argv[6];
+    while (k < OPEN_RUN_MAX && enif_get_list_cell(env, list, &head, &tail)) {
+        unsigned char mask[16], aad[1 + 20 + 4], nonce[NONCE_LEN], fb;
+        unsigned pnlen, phase, i, aadlen, ctlen, hdrlen = 1 + dcidlen;
+        ErlNifUInt64 trunc_pn = 0, pn;
+        ERL_NIF_TERM plain_term;
+        unsigned char *out, *payload;
+        unsigned payload_size;
+        int len = 0, len2 = 0, mlen = 0;
+
+        if (enif_inspect_binary(env, head, &dgram) == 0 ||
+            dgram.size < hdrlen + 4 + 16)
+            break;
+        payload = dgram.data + hdrlen;
+        payload_size = (unsigned)dgram.size - hdrlen;
+
+        if (EVP_EncryptUpdate(hp->ctx, mask, &mlen, payload + 4, 16) != 1 || mlen != 16)
+            break;
+        fb = dgram.data[0] ^ (mask[0] & 0x1f);
+        pnlen = (fb & 0x03) + 1;
+        phase = (fb >> 2) & 1;
+        if (phase != expphase)
+            break;
+        if (payload_size < pnlen + TAG_LEN)
+            break;
+
+        aad[0] = fb;
+        memcpy(aad + 1, dgram.data + 1, dcidlen);
+        for (i = 0; i < pnlen; i++) {
+            unsigned char b = payload[i] ^ mask[1 + i];
+            aad[hdrlen + i] = b;
+            trunc_pn = (trunc_pn << 8) | b;
+        }
+        aadlen = hdrlen + pnlen;
+        pn = reconstruct_pn(largest, trunc_pn, pnlen);
+
+        memcpy(nonce, iv.data, NONCE_LEN);
+        for (i = 0; i < 8; i++)
+            nonce[NONCE_LEN - 1 - i] ^= (unsigned char)(pn >> (8 * i));
+
+        ctlen = payload_size - pnlen - TAG_LEN;
+        out = enif_make_new_binary(env, ctlen, &plain_term);
+
+        if (EVP_DecryptInit_ex(aead->ctx, NULL, NULL, NULL, nonce) != 1 ||
+            EVP_DecryptUpdate(aead->ctx, NULL, &len, aad, (int)aadlen) != 1 ||
+            (ctlen > 0 &&
+             EVP_DecryptUpdate(aead->ctx, out, &len, payload + pnlen, (int)ctlen) != 1) ||
+            EVP_CIPHER_CTX_ctrl(aead->ctx, EVP_CTRL_AEAD_SET_TAG, TAG_LEN,
+                                (void *)(payload + payload_size - TAG_LEN)) != 1)
+            break;
+        if (EVP_DecryptFinal_ex(aead->ctx, out + len, &len2) != 1)
+            break;
+
+        results[k++] = enif_make_tuple3(
+            env, enif_make_uint64(env, pn), enif_make_uint(env, fb), plain_term);
+        if ((ErlNifSInt64)pn > largest)
+            largest = (ErlNifSInt64)pn;
+        list = tail;
+    }
+
+    return enif_make_tuple2(env, am_ok, enif_make_list_from_array(env, results, k));
+}
+
 static ERL_NIF_TERM
 is_loaded(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
@@ -465,6 +559,7 @@ static ErlNifFunc nif_funcs[] = {
     {"hp_block", 2, hp_block, 0},
     {"protect_run", 7, protect_run, 0},
     {"open_packet", 7, open_packet, 0},
+    {"open_run", 7, open_run, 0},
 };
 
 ERL_NIF_INIT(quic_crypto_nif, nif_funcs, load, NULL, NULL, NULL)
