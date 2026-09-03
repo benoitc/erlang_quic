@@ -5904,8 +5904,7 @@ process_tls_message(
             case lists:member(Cipher, State#state.cipher_preference) of
                 false ->
                     notify_owner({error, {tls_alert, illegal_parameter}}, State),
-                    send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State),
-                    exit({tls_alert, illegal_parameter});
+                    alert_and_exit(?TLS_ALERT_ILLEGAL_PARAMETER, State, illegal_parameter);
                 true ->
                     ok
             end,
@@ -5943,12 +5942,10 @@ process_tls_message(
                     case SharedSecret of
                         {error, illegal_parameter} ->
                             notify_owner({error, {tls_alert, illegal_parameter}}, State),
-                            send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State),
-                            exit({tls_alert, illegal_parameter});
+                            alert_and_exit(?TLS_ALERT_ILLEGAL_PARAMETER, State, illegal_parameter);
                         {error, internal_error} ->
                             notify_owner({error, {tls_alert, internal_error}}, State),
-                            send_tls_alert(?TLS_ALERT_INTERNAL_ERROR, State),
-                            exit({tls_alert, internal_error});
+                            alert_and_exit(?TLS_ALERT_INTERNAL_ERROR, State, internal_error);
                         _ ->
                             ok
                     end,
@@ -6627,8 +6624,9 @@ do_server_client_hello_cont(
                                             #{what => resumption_psk_binder_failed},
                                             ?QUIC_LOG_META
                                         ),
-                                        send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State),
-                                        exit({tls_alert, decrypt_error})
+                                        alert_and_exit(
+                                            ?TLS_ALERT_DECRYPT_ERROR, State, decrypt_error
+                                        )
                                 end;
                             error ->
                                 %% Unknown or expired ticket: fall back to a
@@ -6648,8 +6646,7 @@ do_server_client_hello_cont(
                     #{what => psk_binder_verification_failed},
                     ?QUIC_LOG_META
                 ),
-                send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State),
-                exit({tls_alert, decrypt_error})
+                alert_and_exit(?TLS_ALERT_DECRYPT_ERROR, State, decrypt_error)
         end,
 
     %% Server side of the key exchange for the negotiated group: an
@@ -6663,8 +6660,7 @@ do_server_client_hello_cont(
                     #{what => bad_key_share, group => SelectedGroup},
                     ?QUIC_LOG_META
                 ),
-                send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State),
-                exit({tls_alert, illegal_parameter});
+                alert_and_exit(?TLS_ALERT_ILLEGAL_PARAMETER, State, illegal_parameter);
             Exchange ->
                 Exchange
         end,
@@ -10127,6 +10123,24 @@ send_connection_close(Reason, State) ->
 %% Send TLS alert as QUIC crypto error and close connection.
 %% QUIC crypto errors are 0x100 + TLS alert code (RFC 9001 §4.8).
 %% The /2 form defaults the close reason phrase per alert code.
+%% Emit a TLS alert and stop. The alert is batched into the state
+%% send_tls_alert/2 returns, so that state has to be flushed here:
+%% terminate/3 runs with the pre-alert state, and its fallback close is
+%% skipped outright while app_keys are undefined, which is exactly when
+%% alerts happen. Discarding the returned state left the peer with
+%% silence until its idle timeout (issue #227).
+%%
+%% terminate/3 then flushes its own copy of the socket_state, which is
+%% the pre-alert one. Anything batched before the alert therefore goes
+%% out twice: once here and once there. Those are duplicate packets with
+%% packet numbers the peer has already seen, which it discards, so the
+%% cost is a few redundant bytes on a connection that is closing.
+-spec alert_and_exit(non_neg_integer(), #state{}, atom()) -> no_return().
+alert_and_exit(AlertCode, State, Reason) ->
+    Sent = send_tls_alert(AlertCode, State),
+    _ = flush_socket_batch(Sent),
+    exit({tls_alert, Reason}).
+
 send_tls_alert(AlertCode, State) ->
     send_tls_alert(AlertCode, default_alert_phrase(AlertCode), State).
 
