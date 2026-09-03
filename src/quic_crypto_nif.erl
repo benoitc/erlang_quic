@@ -81,9 +81,18 @@ seal(_Ctx, _Nonce, _AAD, _Plain) -> erlang:nif_error(not_loaded).
 open(_Ctx, _Nonce, _AAD, _CipherText, _Tag) -> erlang:nif_error(not_loaded).
 -spec hp_block(reference(), binary()) -> binary() | {error, atom()}.
 hp_block(_Ctx, _Sample) -> erlang:nif_error(not_loaded).
+-spec protect_run(
+    reference(), reference(), binary(), non_neg_integer(), byte(), iodata(), [iodata()]
+) -> [binary()] | {error, atom()}.
 protect_run(_AeadCtx, _HpCtx, _IV, _PN0, _FirstByteBase, _DCID, _Payloads) ->
-    {error, not_loaded}.
+    erlang:nif_error(not_loaded).
+-spec open_packet(
+    reference(), reference(), binary(), integer(), 0 | 1, binary(), binary()
+) -> {non_neg_integer(), byte(), binary()} | error | key_phase | {error, atom()}.
 open_packet(_AeadCtx, _HpCtx, _IV, _LargestRecv, _ExpectedPhase, _Header, _EncPayload) ->
-    {error, not_loaded}.
+    erlang:nif_error(not_loaded).
+-spec open_run(
+    reference(), reference(), binary(), integer(), 0 | 1, non_neg_integer(), [binary()]
+) -> {ok, [{non_neg_integer(), byte(), [term()] | {raw, binary()}}]} | {error, atom()}.
 open_run(_AeadCtx, _HpCtx, _IV, _LargestRecv, _ExpectedPhase, _DcidLen, _Datagrams) ->
-    {error, not_loaded}.
+    erlang:nif_error(not_loaded).
