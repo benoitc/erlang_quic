@@ -25,11 +25,11 @@ All notable changes to this project will be documented in this file.
   interleaved. When the per-drain burst budget was spent, the unsent
   remainder was requeued at the back of its priority bucket instead of the
   front, so the drain round-robined between the queued entries and the
-  stream stayed out of order for the rest of the transfer. The receiver
-  then buffered nearly the whole stream for reassembly. The same 10 MB
-  delivered in 40 writes went at 1.4 MB/s against 63 for a single write;
-  it is now 69.5. Single writes were never affected, which is why bulk
-  benchmarks did not show it.
+  stream stayed out of order for the rest of the transfer, leaving the
+  receiver holding most of it for reassembly (1.2 MB buffered on a 2 MB
+  transfer in 16 writes, against 0 once ordered). Throughput on loopback
+  is unchanged; the cost is the reassembly buffer, and any real path where
+  reordering matters.
 - An authenticated distribution connection no longer drops the peer's
   first handshake message about half the time. The `auth_callback` path
   put a short-lived gatekeeper process in front of the dist controller

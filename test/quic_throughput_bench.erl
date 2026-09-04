@@ -296,7 +296,7 @@ run(Opts) ->
 
     %% Start server. Backend and batching are server-side knobs; applying
     %% them to the client alone silently benchmarks the wrong half.
-    ServerExtra = maps:with([socket_backend, server_send_batching], Opts),
+    ServerExtra = maps:with([socket_backend, server_send_batching, gso], Opts),
     case start_server(Port, RecvBuf, SndBuf, Mode, ServerExtra) of
         {ok, ServerPid, ActualPort, ServerBufs} ->
             io:format(
@@ -304,10 +304,12 @@ run(Opts) ->
                 [maps:get(recbuf, ServerBufs), maps:get(sndbuf, ServerBufs)]
             ),
 
-            %% Run client benchmark. Plumb client-relevant options
-            %% (currently just `socket_backend') so callers can compare
-            %% the gen_udp vs socket client paths.
-            ClientExtra = maps:with([socket_backend], Opts),
+            %% Run client benchmark. `chunk' decides how many
+            %% send_data/4 calls the payload takes, `gso' and
+            %% `socket_backend' select the send path. Dropping any of
+            %% them here silently benchmarks the default instead of what
+            %% the caller asked for.
+            ClientExtra = maps:with([socket_backend, chunk, gso], Opts),
             Result = run_client_benchmark(
                 ActualPort, DataSize, RecvBuf, SndBuf, Mode, ClientExtra
             ),

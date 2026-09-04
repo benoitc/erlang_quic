@@ -13,13 +13,17 @@ ARG OTP_VERSION=28
 
 FROM erlang:${OTP_VERSION}
 
+# rebar3 3.24.0 does not load on OTP 29; CI uses nightly there, so let the
+# caller pick. --build-arg REBAR3_URL=https://s3.amazonaws.com/rebar3-nightly/rebar3
+ARG REBAR3_URL=https://github.com/erlang/rebar3/releases/download/3.24.0/rebar3
+
 WORKDIR /build
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN wget -q https://github.com/erlang/rebar3/releases/download/3.24.0/rebar3 \
+RUN wget -q "${REBAR3_URL}" -O rebar3 \
     && chmod +x rebar3 \
     && mv rebar3 /usr/local/bin/
 
