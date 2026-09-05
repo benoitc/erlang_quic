@@ -132,6 +132,19 @@ Example: a1b2c3d4e5f6_client_1712345678901.qlog
 2. Go to Analyze > Follow > QUIC Stream
 3. Import QLOG for correlation with packet captures
 
+To let Wireshark decrypt the capture, set `SSLKEYLOGFILE` before starting the
+node. Every connection appends its TLS secrets to that file in the NSS key log
+format Wireshark reads:
+
+```bash
+export SSLKEYLOGFILE=/tmp/quic-keys.log
+erl -pa _build/default/lib/*/ebin
+```
+
+Then point Wireshark at it under Preferences > Protocols > TLS > (Pre)-Master-Secret
+log filename. The file holds the keys to every connection the node made, so treat
+it as a secret and use it on test traffic only.
+
 ### Command Line Analysis
 
 ```bash

@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.8.2] - 2026-09-05
 
 ### Added
 - `versions` lists the QUIC versions a connection will also accept, for
@@ -224,7 +224,6 @@ All notable changes to this project will be documented in this file.
   millisecond resolution, so the fixed bucket capped throughput at 12
   packets per wakeup whenever the sender outran the ACK clock,
   regardless of the configured rate. Contributed by jbevemyr (#219).
-### Changed
 - A server with no explicit `groups` option now offers every classical
   group the crypto layer supports (x25519, secp256r1, secp384r1) instead
   of x25519 alone. A preference list holding only x25519 sent a
