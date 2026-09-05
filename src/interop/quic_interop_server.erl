@@ -39,7 +39,18 @@
     "resumption",
     "zerortt",
     "connectionmigration",
-    "http3"
+    "http3",
+    %% Passive robustness cases: the simulator induces the loss,
+    %% corruption, latency or rebinding; the endpoint just transfers.
+    "longrtt",
+    "blackhole",
+    "amplificationlimit",
+    "handshakeloss",
+    "transferloss",
+    "handshakecorruption",
+    "transfercorruption",
+    "rebind-port",
+    "rebind-addr"
 ]).
 
 main(_Args) ->
@@ -79,15 +90,20 @@ run_server(TestCase, Port, CertsDir, WwwDir) ->
 
     case {file:read_file(CertFile), file:read_file(KeyFile)} of
         {{ok, CertPem}, {ok, KeyPem}} ->
-            %% Decode PEM to DER
-            [{_, CertDer, _}] = public_key:pem_decode(CertPem),
+            %% Decode PEM to DER. The amplificationlimit case hands the
+            %% server a 9-deep chain in cert.pem; leaf first, then the
+            %% intermediates in order.
+            [CertDer | CertChain] = [
+                D
+             || {'Certificate', D, not_encrypted} <- public_key:pem_decode(CertPem)
+            ],
             PrivateKey = decode_private_key(KeyPem),
 
             case TestCase of
                 "http3" ->
-                    run_h3_server(Port, CertDer, PrivateKey, WwwDir);
+                    run_h3_server(Port, {CertDer, CertChain}, PrivateKey, WwwDir);
                 _ ->
-                    run_hq_server(TestCase, Port, CertDer, PrivateKey, WwwDir)
+                    run_hq_server(TestCase, Port, {CertDer, CertChain}, PrivateKey, WwwDir)
             end;
         _ ->
             io:format("Failed to read certificates~n"),
@@ -96,13 +112,14 @@ run_server(TestCase, Port, CertsDir, WwwDir) ->
 
 %% The http3 case serves real HTTP/3 (RFC 9114) through quic_h3; every
 %% other case speaks hq-interop over a bare listener.
-run_h3_server(Port, CertDer, PrivateKey, WwwDir) ->
+run_h3_server(Port, {CertDer, CertChain}, PrivateKey, WwwDir) ->
     Handler = fun(Conn, StreamId, _Method, Path, _Headers) ->
         serve_h3_request(Conn, StreamId, Path, WwwDir)
     end,
     case
         quic_h3:start_server(interop_h3, Port, #{
             cert => CertDer,
+            cert_chain => CertChain,
             key => PrivateKey,
             handler => Handler
         })
@@ -153,11 +170,15 @@ run_hq_server(TestCase, Port, CertDer, PrivateKey, WwwDir) ->
             halt(?EXIT_FAILURE)
     end.
 
-build_server_opts(TestCase, Cert, Key, WwwDir) ->
+build_server_opts(TestCase, {Cert, CertChain}, Key, WwwDir) ->
     BaseOpts = #{
         cert => Cert,
+        cert_chain => CertChain,
         key => Key,
         alpn => [<<"hq-interop">>, <<"h3">>],
+        %% The blackhole case blacks the network out on purpose and
+        %% expects the connection to outlast it.
+        disconnect_timeout => infinity,
         connection_handler => fun(ConnPid, Conn) ->
             spawn_handler(ConnPid, Conn, WwwDir, TestCase)
         end

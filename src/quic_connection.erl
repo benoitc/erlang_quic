@@ -159,6 +159,17 @@
     test_complete_migration/3,
     %% Spin bit (RFC 9000 §17.4)
     update_spin_from_recv/3,
+    record_app_recv/4,
+    record_received_pn/4,
+    update_last_activity/2,
+    test_app_recv_state/2,
+    %% Stream-data receive paths (lean vs general)
+    do_process_stream_data_buffered/5,
+    do_process_stream_data_slow/5,
+    test_recv_stream_state/4,
+    test_add_recv_stream/3,
+    update_pn_space_recv/3,
+    should_delay_ack/1,
     short_header_first_byte/3,
     test_spin_state/1,
     test_spin_state_for/2,
@@ -186,6 +197,21 @@
     decode_and_process_streaming/3,
     maybe_validate_initial_token/2,
     test_state_for_server/3,
+    %% Mailbox drain of the connected-state receive pass
+    drain_recv_msgs/2,
+    collect_client_udp/5,
+    %% Batch-opened run processing
+    fold_opened/2,
+    test_state_with_pn_app/2,
+    test_recv_summary/2,
+    test_state_closing/2,
+    test_state_with_socket/2,
+    test_state_in_recv_pass/1,
+    test_state_coalescing/2,
+    arm_burst_continuation/1,
+    test_pacing_timer/1,
+    test_pending_delivery/1,
+    test_finish_recv_pass/1,
     %% Regression helper for send_queue_bytes accounting during ACK coalesce
     test_coalesce_small_stream/1,
     %% Regression helper for zero-byte FIN entries stranded in the send queue
@@ -260,6 +286,10 @@
 %% from parking the flight past the idle timeout.
 -define(HS_FLIGHT_MIN_INTERVAL, 100).
 -define(HS_FLIGHT_MAX_INTERVAL, 3000).
+
+%% Max additional datagram messages drained from the mailbox in one
+%% connected-state receive pass (see drain_recv_msgs/2).
+-define(RECV_DRAIN_MAX, 64).
 
 %% Max ACK ranges retained per PN space (RFC 9000 §13.2.4 allows the
 %% receiver to limit these). Under burst loss an unbounded list
@@ -432,7 +462,9 @@
     negotiated_scheme :: atom() | undefined,
 
     %% CRYPTO frame buffer (per level: initial, handshake, app)
-    crypto_buffer = #{initial => #{}, handshake => #{}, app => #{}} :: map(),
+    crypto_buffer = #{
+        initial => gb_trees:empty(), handshake => gb_trees:empty(), app => gb_trees:empty()
+    } :: map(),
     crypto_offset = #{initial => 0, handshake => 0, app => 0} :: map(),
     %% Incomplete TLS message buffer (data that couldn't be parsed yet)
     tls_buffer = #{initial => <<>>, handshake => <<>>, app => <<>>} :: map(),
@@ -763,6 +795,26 @@
     %% (GSO bursts especially) before any loss signal is seen.
     burst_budget = ?DEFAULT_MAX_BURST_PACKETS :: pos_integer(),
     burst_sent = 0 :: non_neg_integer(),
+    %% True while a connected-state receive pass (first datagram plus
+    %% drained mailbox train) is being processed. Count-based ACK
+    %% decimation defers its flush to the end of the pass, so one ACK
+    %% covers the whole train instead of one per ack_packet_tolerance
+    %% packets. The max_ack_delay timer still bounds latency; the
+    %% reordering immediate-ACK path bypasses this.
+    recv_pass = false :: boolean(),
+    %% Opt-in (delivery_coalescing option): merge consecutive
+    %% same-stream stream_data deliveries of one receive pass into a
+    %% single owner message. QUIC gives no message-boundary guarantee,
+    %% but owners that decode each delivery as one complete
+    %% application message (rather than length-framing the byte
+    %% stream) break when deliveries merge, so the default keeps the
+    %% one-message-per-packet behaviour.
+    delivery_coalescing = false :: boolean(),
+    %% Pending run for the above: stream id, reversed chunk list, fin.
+    %% A delivery for a DIFFERENT stream flushes the pending one
+    %% first, so the owner observes stream_data messages in exact
+    %% arrival order; only adjacent chunks of one stream merge.
+    pend_deliver = none :: none | {non_neg_integer(), [binary()], boolean()},
     ack_elicited_count = 0 :: non_neg_integer(),
     %% How many ack-eliciting 1-RTT packets to accumulate before
     %% flushing an ACK. 2 is the RFC 9000 §13.2.1 recommendation;
@@ -1288,6 +1340,7 @@ init({server, Opts}) ->
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
         ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
         burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
+        delivery_coalescing = bool_opt(delivery_coalescing, Opts),
         % Server-initiated bidi: 1, 5, 9, ...
         next_stream_id_bidi = 1,
         % Server-initiated uni: 3, 7, 11, ...
@@ -1440,7 +1493,9 @@ build_server_socket_state(Socket, Opts) ->
     SenderOpts = #{
         backend => maps:get(listener_socket_backend, Opts, gen_udp),
         gso_supported => maps:get(listener_gso_supported, Opts, false),
-        batching => BatchOpts
+        batching => BatchOpts,
+        sender_pid => maps:get(send_sender, Opts, undefined),
+        gso_counter => maps:get(send_gso_counter, Opts, undefined)
     },
     case quic_socket:new_sender(Socket, SenderOpts) of
         {ok, S} -> S;
@@ -1622,7 +1677,13 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     ClientReceiver =
         case ClientSocketBackend of
             socket when SocketState =/= undefined ->
-                {ok, RPid} = quic_socket:start_client_receiver(SocketState, self()),
+                {ok, RPid} = quic_socket:start_client_receiver(
+                    SocketState,
+                    self(),
+                    quic_socket:recv_queue_max(
+                        maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA)
+                    )
+                ),
                 RPid;
             _ ->
                 undefined
@@ -1687,6 +1748,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
         ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
         burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
+        delivery_coalescing = bool_opt(delivery_coalescing, Opts),
         % Client-initiated bidi: 0, 4, 8, ...
         next_stream_id_bidi = 0,
         % Client-initiated uni: 2, 6, 10, ...
@@ -2101,7 +2163,10 @@ connected(
     State4 = set_keep_alive_timer(update_last_activity(State3b)),
     %% RFC 8899: Initialize PMTU discovery after handshake
     State5 = init_pmtu_probing(TransportParams, State4),
-    {keep_state, State5};
+    %% Everything queued above (pending data, NEW_TOKEN, the first PMTU
+    %% probe) sits in the send batch; without a flush here it would
+    %% only leave with the next event on this connection.
+    {keep_state, flush_dirty_timers(flush_socket_batch(State5))};
 connected({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 connected({call, From}, get_state, State) ->
@@ -2298,7 +2363,7 @@ connected(
     %% Return packet counts for liveness detection (net_kernel uses
     %% recv count to verify peer is alive) plus send-path batching
     %% counters for benchmarks and tests.
-    {Flushes, Coalesced, GSOFlushes} = send_batch_counters(SocketState),
+    {Flushes, Coalesced, GSOFlushes, Pending} = send_batch_counters(SocketState),
     Stats = #{
         packets_received => PacketsRecv,
         packets_sent => PacketsSent,
@@ -2308,7 +2373,10 @@ connected(
         retransmits => Retransmits,
         batch_flushes => Flushes,
         packets_coalesced => Coalesced,
-        gso_flushes => GSOFlushes
+        gso_flushes => GSOFlushes,
+        %% Packets built but not yet handed to the socket. Non-zero
+        %% between events means a handler forgot to flush.
+        send_batch_pending => Pending
     },
     {keep_state, State, [{reply, From, {ok, Stats}}]};
 connected({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
@@ -2363,58 +2431,38 @@ connected({call, From}, {migrate, _Opts}, #state{remote_addr = RemoteAddr} = Sta
     end;
 connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) ->
     %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
-    State1 = State#state{current_packet_source = {IP, Port}},
+    State1 = State#state{current_packet_source = {IP, Port}, recv_pass = true},
     NewState = handle_packet(Data, State1),
-    %% Clear packet source and flush
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    %% Drain any further datagrams already in the mailbox into this
+    %% pass, then flush ACKs / batches / timers once for the lot.
+    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
+    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{current_packet_source = undefined},
     check_state_transition(connected, FinalState);
 %% Client receives a whole GRO train from the receiver process as one
 %% message; processing it in one pass amortizes the per-event flushes
 %% over the train.
 connected(info, {udp_batch, Socket, IP, Port, Packets}, #state{socket = Socket} = State) ->
-    State1 = State#state{current_packet_source = {IP, Port}},
+    State1 = State#state{current_packet_source = {IP, Port}, recv_pass = true},
     NewState = handle_packets_batch(Packets, State1),
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
+    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{current_packet_source = undefined},
     check_state_transition(connected, FinalState);
 %% Server receives packets from listener
 connected(info, {quic_packet, Data, RemoteAddr}, #state{role = server} = State) ->
-    %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
-    %% Clear has_non_probing_frame before processing - will be set by process_frame_track_probing
-    State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
-    %% Process packet FIRST to classify frames
-    NewState = handle_packet(Data, State1),
-    %% RFC 9000 Section 9.1: Only trigger migration if packet contains non-probing frames
-    NewState2 =
-        case NewState#state.has_non_probing_frame of
-            true -> maybe_handle_address_change(RemoteAddr, byte_size(Data), NewState);
-            false -> NewState
-        end,
-    %% Clear transient fields and flush
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState2)),
+    NewState = server_recv_pass([Data], RemoteAddr, State#state{recv_pass = true}),
+    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
+    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{
         current_packet_source = undefined, has_non_probing_frame = false
     },
     check_state_transition(connected, FinalState);
 %% Server receives batched packets from listener (GRO optimization)
 connected(info, {quic_packets, Packets, RemoteAddr}, #state{role = server} = State) ->
-    %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
-    %% Clear has_non_probing_frame before processing - will be set by process_frame_track_probing
-    State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
-    %% Process packets FIRST to classify frames
-    NewState = handle_packets_batch(Packets, State1),
-    %% RFC 9000 Section 9.1: Only trigger migration if any packet contains non-probing frames
-    NewState2 =
-        case NewState#state.has_non_probing_frame of
-            true ->
-                TotalSize = lists:sum([byte_size(P) || P <- Packets]),
-                maybe_handle_address_change(RemoteAddr, TotalSize, NewState);
-            false ->
-                NewState
-        end,
-    %% Clear transient fields and flush
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState2)),
+    NewState = server_recv_pass(Packets, RemoteAddr, State#state{recv_pass = true}),
+    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
+    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{
         current_packet_source = undefined, has_non_probing_frame = false
     },
@@ -4284,9 +4332,400 @@ handle_packets_batch(Packets, State) ->
 %% This is more efficient than receiving multiple messages
 do_handle_packets_batch([], State) ->
     State;
+do_handle_packets_batch([<<0:1, 1:1, _:6, _/binary>> | _] = Packets, State) ->
+    %% Leading run of short-header (1-RTT) datagrams: open the whole
+    %% run in one NIF call when the fused fast path applies.
+    case fused_run_keys(State) of
+        {ok, Keys} ->
+            handle_short_run(Packets, Keys, State);
+        no ->
+            [Packet | Rest] = Packets,
+            do_handle_packets_batch(Rest, handle_packet_loop(Packet, State))
+    end;
 do_handle_packets_batch([Packet | Rest], State) ->
     NewState = handle_packet_loop(Packet, State),
     do_handle_packets_batch(Rest, NewState).
+
+%% Peer-direction keys for the batched fused open, under the same
+%% no-key-update-in-flight condition as fused_decrypt_keys/2.
+fused_run_keys(#state{app_keys = undefined}) ->
+    no;
+fused_run_keys(#state{app_keys = {ClientKeys, ServerKeys}, role = Role} = State) ->
+    Current =
+        case Role of
+            client -> ServerKeys;
+            server -> ClientKeys
+        end,
+    fused_decrypt_keys(Current, State).
+
+handle_short_run(Packets, Keys, State) ->
+    {Run, Tail} = take_short_run(Packets, []),
+    #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = Keys,
+    case
+        quic_aead_ctx:open_run(
+            Cipher,
+            Key,
+            IV,
+            HP,
+            get_largest_recv(app, State),
+            get_current_key_phase(State),
+            byte_size(State#state.scid),
+            Run
+        )
+    of
+        {ok, Results} ->
+            State1 = fold_opened(Results, State),
+            case lists:nthtail(length(Results), Run) of
+                [] ->
+                    do_handle_packets_batch(Tail, State1);
+                [Unopened | RunRest] ->
+                    %% First datagram the NIF could not open takes the
+                    %% generic path (slow decrypt, key-phase transition,
+                    %% stateless-reset check), then keep batching.
+                    State2 = handle_packet_loop(Unopened, State1),
+                    do_handle_packets_batch(RunRest ++ Tail, State2)
+            end;
+        fallback ->
+            [Packet | Rest] = Packets,
+            do_handle_packets_batch(Rest, handle_packet_loop(Packet, State))
+    end.
+
+take_short_run([<<0:1, 1:1, _:6, _/binary>> = P | Rest], Acc) ->
+    take_short_run(Rest, [P | Acc]);
+take_short_run(Rest, Acc) ->
+    {lists:reverse(Acc), Rest}.
+
+%% Post-decrypt processing for a batch-opened run: the same per-packet
+%% effects as the fused branch of decrypt_app_packet/4 followed by the
+%% `processed' branch of handle_packet_loop/2, with the per-packet
+%% bookkeeping collapsed where the run's shape allows it.
+%%
+%% One monotonic_time sample serves the whole run (runs are opened
+%% well under a millisecond, and nothing reads the counter mid-fold).
+fold_opened(Results, State) ->
+    Now = erlang:monotonic_time(millisecond),
+    %% Contiguous-run fast path: when the whole opened run continues the
+    %% receive sequence exactly (PNs consecutive from largest_recv + 1,
+    %% which also means the head ACK range extends in place), the
+    %% per-packet receive bookkeeping collapses into one state update:
+    %% largest/ranges/spin from the last packet, every packet classified
+    %% sequential. Any other shape takes the per-packet path unchanged.
+    case State#state.pn_app of
+        #pn_space{largest_recv = L, ack_ranges = [{RangeStart, L} | RestRanges]} = PNSpace when
+            is_integer(L)
+        ->
+            case seq_run_last(Results, L + 1) of
+                {LastPN, LastFB} ->
+                    SpinRecv = (LastFB bsr 5) band 1,
+                    SpinOut =
+                        case State#state.spin_bit_enabled of
+                            false -> State#state.spin_outgoing;
+                            true when State#state.role =:= client -> SpinRecv;
+                            true -> 1 - SpinRecv
+                        end,
+                    State1 = State#state{
+                        pn_app = PNSpace#pn_space{
+                            largest_recv = LastPN,
+                            recv_time = Now,
+                            ack_ranges = [{RangeStart, LastPN} | RestRanges]
+                        },
+                        last_recv_trigger = sequential,
+                        spin_recv = SpinRecv,
+                        spin_recv_largest_pn = LastPN,
+                        spin_outgoing = SpinOut,
+                        last_activity = Now,
+                        ack_eliciting_since_recv = false
+                    },
+                    case stream_train(Results, State1) of
+                        {ok, StreamId, FirstOff, RevChunks, Total, N} ->
+                            apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, State1);
+                        no ->
+                            fold_opened_seq(Results, State1, 0, 0)
+                    end;
+                no ->
+                    fold_opened(Results, State, Now, 0, 0)
+            end;
+        _ ->
+            fold_opened(Results, State, Now, 0, 0)
+    end.
+
+%% Last {PN, FirstByte} of a run iff PNs are consecutive from Expected.
+seq_run_last([{PN, FB, _}], PN) ->
+    {PN, FB};
+seq_run_last([{PN, _, _} | [{PN2, _, _} | _] = Rest], PN) when PN2 =:= PN + 1 ->
+    seq_run_last(Rest, PN2);
+seq_run_last(_, _) ->
+    no.
+
+%% Per-packet loop for a contiguous run: receive bookkeeping already
+%% applied for the whole train, every packet known sequential.
+fold_opened_seq([], State, N, Elicited) ->
+    fold_opened_finish(State, N, Elicited);
+fold_opened_seq([{_PN, _FB, Opened} | Rest], State, N, Elicited) ->
+    {ok, NewState, Frames} = opened_frames(Opened, State),
+    ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
+        packet_type => app,
+        frames => Frames
+    }),
+    ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
+    {State2, Elicited2} =
+        case contains_ack_eliciting_frames(Frames) of
+            false ->
+                {NewState, Elicited};
+            true ->
+                case should_delay_ack(Frames) of
+                    true -> {schedule_delayed_ack(app, NewState), Elicited};
+                    false -> {NewState, Elicited + 1}
+                end
+        end,
+    fold_opened_seq(Rest, State2, N + 1, Elicited2).
+
+%% Per-packet loop for a run that is not one contiguous sequence.
+fold_opened([], State, _Now, N, Elicited) ->
+    fold_opened_finish(State, N, Elicited);
+fold_opened([{PN, FirstByte, Opened} | Rest], State, Now, N, Elicited) ->
+    StateF = record_app_recv(FirstByte, PN, State, Now),
+    {ok, NewState, Frames} = opened_frames(Opened, StateF),
+    ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
+        packet_type => app,
+        frames => Frames
+    }),
+    ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
+    %% Per-packet ACK policy identical to maybe_send_ack(app, ...),
+    %% except the count-based decimation increment is accumulated
+    %% across the run and applied once at the end.
+    {State2, Elicited2} =
+        case contains_ack_eliciting_frames(Frames) of
+            false ->
+                {NewState, Elicited};
+            true ->
+                case should_delay_ack(Frames) of
+                    true ->
+                        {schedule_delayed_ack(app, NewState), Elicited};
+                    false ->
+                        case NewState#state.last_recv_trigger of
+                            reordered ->
+                                %% send_app_ack acks everything seen so
+                                %% far and clears the count, so pending
+                                %% increments are dropped with it.
+                                {send_app_ack(NewState), 0};
+                            sequential ->
+                                {NewState, Elicited + 1}
+                        end
+                end
+        end,
+    fold_opened(Rest, State2, Now, N + 1, Elicited2).
+
+%% Apply the run's packet count and its accumulated ack-eliciting
+%% count. Inside a receive pass decimation only counts (the pass end
+%% flushes), so one increment and one arm_ack_timer serve the run;
+%% outside a pass each increment gets the threshold check it would
+%% have had per packet.
+fold_opened_finish(State, N, Elicited) ->
+    State1 = State#state{packets_received = State#state.packets_received + N},
+    case {Elicited, State1#state.recv_pass} of
+        {0, _} ->
+            State1;
+        {_, true} ->
+            arm_ack_timer(State1#state{
+                ack_elicited_count = State1#state.ack_elicited_count + Elicited
+            });
+        {_, false} ->
+            lists:foldl(
+                fun(_, S) -> maybe_decimate_app_ack(S) end, State1, lists:seq(1, Elicited)
+            )
+    end.
+
+%% Consume an open_run result: the NIF returns either a pre-parsed
+%% frame list (term-identical to quic_frame:decode/1 output) or
+%% {raw, Plain} for packets with frame types outside the fast path,
+%% which keep the generic decoder and its error semantics. Parsed
+%% frames go through the same per-frame processing as the decoder
+%% loop.
+opened_frames({raw, Plain}, State) ->
+    decode_and_process_streaming(app, Plain, State);
+opened_frames(Frames, State) when is_list(Frames) ->
+    {ok,
+        lists:foldl(
+            fun(F, S) -> process_frame_track_probing(app, F, S) end, State, Frames
+        ),
+        Frames}.
+
+%% Textbook bulk train: every packet in the run carries exactly one
+%% stream frame, all for the same stream, offsets contiguous, no FIN,
+%% and qlog is off (its per-packet events would be skipped). Returns
+%% the chunks in reverse order.
+stream_train(Results, State) ->
+    case ?QLOG_ENABLED(State#state.qlog_ctx) of
+        true -> no;
+        false -> stream_train(Results, undefined, undefined, [], 0, 0)
+    end.
+
+stream_train([], Sid, _NextOff, RevChunks, Total, N) when Sid =/= undefined ->
+    {Off, _} = lists:last(RevChunks),
+    {ok, Sid, Off, RevChunks, Total, N};
+stream_train(
+    [{_PN, _FB, [{stream, Sid, Off, Data, false}]} | Rest], undefined, undefined, [], 0, 0
+) ->
+    stream_train(Rest, Sid, Off + byte_size(Data), [{Off, Data}], byte_size(Data), 1);
+stream_train(
+    [{_PN, _FB, [{stream, Sid, Off, Data, false}]} | Rest], Sid, Off, RevChunks, Total, N
+) ->
+    stream_train(
+        Rest,
+        Sid,
+        Off + byte_size(Data),
+        [{Off, Data} | RevChunks],
+        Total + byte_size(Data),
+        N + 1
+    );
+stream_train(_, _, _, _, _, _) ->
+    no.
+
+%% One bookkeeping pass for a whole contiguous stream train: the same
+%% conditions as the lean clause of do_process_stream_data_buffered/5,
+%% checked once with the train's totals; any deviation replays the
+%% train through the per-packet path.
+apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, State) ->
+    case State#state.streams of
+        #{
+            StreamId := #stream_state{
+                recv_offset = FirstOff,
+                recv_max_data = RecvMaxData,
+                final_size = undefined,
+                recv_reset_at = undefined,
+                recv_buffer = RB
+            } = Stream
+        } ->
+            EndOffset = FirstOff + Total,
+            NewDataReceived = State#state.data_received + Total,
+            HalfWindow = State#state.fc_max_receive_window div 2,
+            case
+                Total > 0 andalso
+                    gb_trees:is_empty(RB) andalso
+                    RecvMaxData - EndOffset >= HalfWindow andalso
+                    State#state.max_data_local - NewDataReceived >= HalfWindow andalso
+                    State#state.recv_buffer_bytes + Total =< ?MAX_RECV_BUFFER_BYTES
+            of
+                true ->
+                    PendDeliver = deliver_stream_train(StreamId, RevChunks, State),
+                    State1 = State#state{
+                        streams = maps:put(
+                            StreamId,
+                            Stream#stream_state{recv_offset = EndOffset},
+                            State#state.streams
+                        ),
+                        data_received = NewDataReceived,
+                        pend_deliver = PendDeliver,
+                        has_non_probing_frame = true
+                    },
+                    fold_opened_finish(State1, N, N);
+                false ->
+                    stream_train_fallback(StreamId, RevChunks, State)
+            end;
+        _ ->
+            stream_train_fallback(StreamId, RevChunks, State)
+    end.
+
+%% Deviating train: replay it through the ordinary per-packet path.
+stream_train_fallback(StreamId, RevChunks, State) ->
+    {StateN, N} = lists:foldr(
+        fun({Off, Data}, {Acc, Cnt}) ->
+            {process_stream_data(StreamId, Off, Data, false, Acc), Cnt + 1}
+        end,
+        {State, 0},
+        RevChunks
+    ),
+    fold_opened_finish(StateN#state{has_non_probing_frame = true}, N, N).
+
+%% Deliver a whole train with the delivery contract of
+%% deliver_stream_data/4: merged into the pending run under coalescing
+%% (the chunks are adjacent and in order by construction), one message
+%% per chunk in stream order otherwise. Returns the new pend_deliver.
+deliver_stream_train(
+    StreamId, RevChunks, #state{recv_pass = true, delivery_coalescing = true} = State
+) ->
+    RevData = [Data || {_Off, Data} <- RevChunks],
+    case State#state.pend_deliver of
+        {StreamId, Acc, F} ->
+            {StreamId, RevData ++ Acc, F};
+        none ->
+            {StreamId, RevData, false};
+        {OtherId, Acc, F} ->
+            State#state.owner ! {quic, self(), {stream_data, OtherId, run_binary(Acc), F}},
+            {StreamId, RevData, false}
+    end;
+deliver_stream_train(StreamId, RevChunks, State) ->
+    Owner = State#state.owner,
+    lists:foreach(
+        fun({_Off, Data}) -> Owner ! {quic, self(), {stream_data, StreamId, Data, false}} end,
+        lists:reverse(RevChunks)
+    ),
+    State#state.pend_deliver.
+
+%% One server receive pass: process the packets of a listener message
+%% (source tracking, frame classification, RFC 9000 §9.1 migration
+%% check) without the per-message flushes - the caller flushes once
+%% per drain.
+server_recv_pass(Packets, RemoteAddr, State) ->
+    State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
+    NewState = handle_packets_batch(Packets, State1),
+    case NewState#state.has_non_probing_frame of
+        true ->
+            TotalSize = lists:sum([byte_size(P) || P <- Packets]),
+            maybe_handle_address_change(RemoteAddr, TotalSize, NewState);
+        false ->
+            NewState
+    end.
+
+%% Drain datagram messages already queued in the mailbox into the
+%% current receive pass, so ACK emission, socket-batch flushing and
+%% timer resets amortize over the whole train instead of running per
+%% datagram. Stops as soon as a close is initiated (the remaining
+%% messages are handled as ordinary events by the next state) or the
+%% cap is hit (bounds time away from the event loop).
+drain_recv_msgs(#state{close_reason = CR} = State, _N) when CR =/= undefined ->
+    State;
+drain_recv_msgs(State, 0) ->
+    State;
+drain_recv_msgs(#state{role = client, socket = Socket} = State, N) ->
+    receive
+        {udp, Socket, IP, Port, Data} ->
+            %% Collect the rest of the queued same-source datagrams so a
+            %% train is opened as one batch instead of per message.
+            State1 = State#state{current_packet_source = {IP, Port}},
+            {Datagrams, Left} = collect_client_udp(Socket, IP, Port, N - 1, [Data]),
+            drain_recv_msgs(handle_packets_batch(Datagrams, State1), Left);
+        {udp_batch, Socket, IP, Port, Packets} ->
+            State1 = State#state{current_packet_source = {IP, Port}},
+            drain_recv_msgs(handle_packets_batch(Packets, State1), N - 1)
+    after 0 ->
+        State
+    end;
+drain_recv_msgs(#state{role = server} = State, N) ->
+    receive
+        {quic_packet, Data, RemoteAddr} ->
+            drain_recv_msgs(server_recv_pass([Data], RemoteAddr, State), N - 1);
+        {quic_packets, Packets, RemoteAddr} ->
+            drain_recv_msgs(server_recv_pass(Packets, RemoteAddr, State), N - 1)
+    after 0 ->
+        State
+    end.
+
+collect_client_udp(_Socket, _IP, _Port, 0, Acc) ->
+    {lists:reverse(Acc), 0};
+collect_client_udp(Socket, IP, Port, N, Acc) ->
+    %% Both message shapes in one receive: taking only the single-datagram
+    %% shape would pull those past earlier queued trains and reorder
+    %% the connection's view of the wire.
+    receive
+        {udp, Socket, IP, Port, Data} ->
+            collect_client_udp(Socket, IP, Port, N - 1, [Data | Acc]);
+        {udp_batch, Socket, IP, Port, Packets} ->
+            collect_client_udp(Socket, IP, Port, N - 1, lists:reverse(Packets, Acc))
+    after 0 ->
+        {lists:reverse(Acc), N}
+    end.
 
 handle_packet_loop(<<>>, #state{role = client, active_n = N} = State) ->
     %% No more data to process - re-enable socket for client connections
@@ -4825,6 +5264,62 @@ decode_short_header_packet(Data, State) ->
 %% Decrypt an application (1-RTT) packet with key phase handling
 %% Uses 2-stage API: unprotect header to get key_phase, then decrypt with selected keys
 decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
+    %% Fast path: fused unprotect + PN reconstruction + AEAD open in
+    %% one NIF call, valid only when no key update is in flight (the
+    %% NIF bails to the generic path when the packet's phase bit
+    %% differs from the current phase, and the generic path owns the
+    %% RFC 9001 §6 phase-transition bookkeeping).
+    Fused =
+        case fused_decrypt_keys(CurrentKeys, State) of
+            {ok, #crypto_keys{key = FKey, iv = FIV, hp = FHP, cipher = FCipher}} ->
+                quic_aead_ctx:open_packet(
+                    FCipher,
+                    FKey,
+                    FIV,
+                    FHP,
+                    get_largest_recv(app, State),
+                    get_current_key_phase(State),
+                    Header,
+                    EncryptedPayload
+                );
+            no ->
+                fallback
+        end,
+    case Fused of
+        {ok, PN0, FirstByte0, Plaintext0} ->
+            Now0 = erlang:monotonic_time(millisecond),
+            StateF = record_app_recv(FirstByte0, PN0, State, Now0),
+            case decode_and_process_streaming(app, Plaintext0, StateF) of
+                {ok, NewState0, Frames0} ->
+                    {ok, app, Frames0, <<>>, NewState0, processed};
+                {error, Reason0} ->
+                    {error, Reason0}
+            end;
+        error ->
+            {error, decryption_failed};
+        fallback ->
+            decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State)
+    end.
+
+%% The peer-direction keys for the fused path: only when no key update
+%% is in flight, so a same-phase packet cannot carry phase-transition
+%% side effects (select_decrypt_keys/2 handles those on the slow path).
+fused_decrypt_keys(CurrentKeys, #state{key_state = undefined}) ->
+    {ok, CurrentKeys};
+fused_decrypt_keys(_CurrentKeys, #state{
+    key_state = #key_update_state{update_state = idle, current_keys = {CK, SK}},
+    role = Role
+}) ->
+    case Role of
+        server -> {ok, CK};
+        client -> {ok, SK}
+    end;
+fused_decrypt_keys(_CurrentKeys, _State) ->
+    no.
+
+%% The two-stage path: unprotect the header to learn the key phase,
+%% select keys, then decrypt.
+decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
     %% The cipher must come from the negotiated keys: inferring it from
     %% the HP key length mistakes ChaCha20-Poly1305 for AES-256-GCM and
     %% drops every received 1-RTT packet on such connections.
@@ -4867,12 +5362,7 @@ decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
                     %% recv_time and last_activity to save one BIF
                     %% call per received packet on the hot path.
                     Now = erlang:monotonic_time(millisecond),
-                    State2 = update_spin_from_recv(
-                        UnprotectedFirstByte,
-                        PN,
-                        record_received_pn(app, PN, State1, Now)
-                    ),
-                    State3 = update_last_activity(State2, Now),
+                    State3 = record_app_recv(UnprotectedFirstByte, PN, State1, Now),
                     %% Use streaming decode for efficiency
                     case decode_and_process_streaming(app, Plaintext, State3) of
                         {ok, NewState, Frames} ->
@@ -5174,8 +5664,9 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                             FinSids -> lists:foldl(fun settle_fin_ack/2, State4, FinSids)
                         end,
 
-                    %% Reset PTO timer after ACK processing
-                    State5 = set_pto_timer(State4a),
+                    %% Re-arm the PTO once at the end of the pass
+                    %% (flush_dirty_timers) instead of once per ACK frame.
+                    State5 = State4a#state{pto_dirty = true},
 
                     %% Try to send queued data now that cwnd may have freed up.
                     %% This also drains retransmit_stream entries deferred by CC.
@@ -5376,8 +5867,11 @@ process_frame(
                 },
                 Streams
             ),
+            %% Data delivered earlier in this receive pass reaches the
+            %% owner before the reset notification.
+            StateFl = flush_pending_delivery(State),
             Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-            maybe_reclaim_stream(StreamId, State#state{streams = NewStreams});
+            maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams});
         error ->
             case is_reclaimed_frame(StreamId, State) of
                 true ->
@@ -5399,8 +5893,9 @@ process_frame(
                                 },
                                 Streams
                             ),
+                            StateFl = flush_pending_delivery(State),
                             Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                            State#state{streams = NewStreams}
+                            StateFl#state{streams = NewStreams}
                     end
             end
     end;
@@ -5457,8 +5952,9 @@ process_frame(
                         Streams
                     ),
                     %% Notify owner - same message as RESET_STREAM
+                    StateFl = flush_pending_delivery(State),
                     Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                    maybe_reclaim_stream(StreamId, State#state{streams = NewStreams});
+                    maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams});
                 error ->
                     case is_reclaimed_frame(StreamId, State) of
                         true ->
@@ -5485,9 +5981,10 @@ process_frame(
                                         },
                                         Streams
                                     ),
+                                    StateFl = flush_pending_delivery(State),
                                     Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
                                     maybe_reclaim_stream(
-                                        StreamId, State#state{streams = NewStreams}
+                                        StreamId, StateFl#state{streams = NewStreams}
                                     )
                             end
                     end
@@ -5696,16 +6193,16 @@ buffer_crypto_data(Level, Offset, Data, State) ->
         end,
 
     %% Get current buffer
-    Buffer = maps:get(LevelAtom, State#state.crypto_buffer, #{}),
+    Buffer = maps:get(LevelAtom, State#state.crypto_buffer, gb_trees:empty()),
 
     %% Bound out-of-order CRYPTO reassembly so a peer cannot grow memory
     %% before the handshake completes (RFC 9000 §7.5). Offsets beyond the
     %% cap can never become contiguous, so reject them too.
-    BufferedBytes = maps:fold(fun(_, V, Acc) -> Acc + byte_size(V) end, 0, Buffer),
+    BufferedBytes = reassembly_buffer_bytes(Buffer),
     Overflow =
         (Offset > ?MAX_CRYPTO_BUFFER_BYTES) orelse
             ((BufferedBytes + byte_size(Data)) > ?MAX_CRYPTO_BUFFER_BYTES) orelse
-            (maps:size(Buffer) >= ?MAX_CRYPTO_BUFFER_ENTRIES),
+            (gb_trees:size(Buffer) >= ?MAX_CRYPTO_BUFFER_ENTRIES),
     case Overflow of
         true ->
             ?LOG_WARNING(
@@ -5713,7 +6210,7 @@ buffer_crypto_data(Level, Offset, Data, State) ->
                     what => crypto_buffer_exceeded,
                     level => LevelAtom,
                     buffered_bytes => BufferedBytes,
-                    entries => maps:size(Buffer)
+                    entries => gb_trees:size(Buffer)
                 },
                 ?QUIC_LOG_META
             ),
@@ -5752,17 +6249,17 @@ buffer_crypto_data(Level, Offset, Data, State) ->
 
 %% Process contiguous CRYPTO data
 process_crypto_buffer(Level, State) ->
-    Buffer = maps:get(Level, State#state.crypto_buffer, #{}),
+    Buffer = maps:get(Level, State#state.crypto_buffer, gb_trees:empty()),
     ExpectedOffset = maps:get(Level, State#state.crypto_offset, 0),
 
-    case maps:find(ExpectedOffset, Buffer) of
-        {ok, Data} ->
+    case gb_trees:lookup(ExpectedOffset, Buffer) of
+        {value, Data} ->
             %% Process this data
             State1 = process_tls_data(Level, Data, State),
 
             %% Update offset and remove from buffer
             NewOffset = ExpectedOffset + byte_size(Data),
-            NewBuffer = maps:remove(ExpectedOffset, Buffer),
+            NewBuffer = gb_trees:delete(ExpectedOffset, Buffer),
             NewCryptoBuffer = maps:put(Level, NewBuffer, State1#state.crypto_buffer),
             NewCryptoOffset = maps:put(Level, NewOffset, State1#state.crypto_offset),
 
@@ -5773,7 +6270,7 @@ process_crypto_buffer(Level, State) ->
 
             %% Try to process more
             process_crypto_buffer(Level, State2);
-        error ->
+        none ->
             %% Nothing keyed exactly at ExpectedOffset, which does not mean a
             %% gap: a peer may re-frame CRYPTO data it retransmits (RFC 9000
             %% §13.3), so the bytes we need can sit inside a chunk that starts
@@ -5785,7 +6282,7 @@ process_crypto_buffer(Level, State) ->
             State1 = State#state{
                 crypto_buffer = maps:put(Level, Trimmed, State#state.crypto_buffer)
             },
-            case maps:is_key(ExpectedOffset, Trimmed) of
+            case gb_trees:is_defined(ExpectedOffset, Trimmed) of
                 true -> process_crypto_buffer(Level, State1);
                 false -> State1
             end
@@ -7013,7 +7510,55 @@ clamp_recv_reset_at(StreamId, Offset, Data, Fin, State) ->
 recv_reset_at_met(#stream_state{recv_reset_at = R}, Off) ->
     R =/= undefined andalso Off >= R.
 
+%% Lean path for the dominant bulk shape: existing stream, exactly
+%% in-order, empty reassembly buffer, no FIN in sight, no pending reset,
+%% both flow-control windows comfortably open (so neither
+%% MAX_STREAM_DATA nor MAX_DATA fires). One stream-record update and one
+%% map put. Every other shape takes the general path below with
+%% identical semantics; on bulk flows 97+ percent of frames land here.
+do_process_stream_data_buffered(StreamId, Offset, Data, false = Fin, State) ->
+    case State#state.streams of
+        #{
+            StreamId := #stream_state{
+                recv_offset = Offset,
+                recv_max_data = RecvMaxData,
+                final_size = undefined,
+                recv_reset_at = undefined,
+                recv_buffer = RB
+            } = Stream
+        } ->
+            DataSize = byte_size(Data),
+            EndOffset = Offset + DataSize,
+            NewDataReceived = State#state.data_received + DataSize,
+            HalfWindow = State#state.fc_max_receive_window div 2,
+            case
+                DataSize > 0 andalso
+                    gb_trees:is_empty(RB) andalso
+                    RecvMaxData - EndOffset >= HalfWindow andalso
+                    State#state.max_data_local - NewDataReceived >= HalfWindow andalso
+                    State#state.recv_buffer_bytes + DataSize =< ?MAX_RECV_BUFFER_BYTES
+            of
+                true ->
+                    PendDeliver = deliver_stream_data(StreamId, Data, false, State),
+                    State#state{
+                        streams = maps:put(
+                            StreamId,
+                            Stream#stream_state{recv_offset = EndOffset},
+                            State#state.streams
+                        ),
+                        data_received = NewDataReceived,
+                        pend_deliver = PendDeliver
+                    };
+                false ->
+                    do_process_stream_data_slow(StreamId, Offset, Data, Fin, State)
+            end;
+        _ ->
+            do_process_stream_data_slow(StreamId, Offset, Data, Fin, State)
+    end;
 do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
+    do_process_stream_data_slow(StreamId, Offset, Data, Fin, State).
+
+do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
     #state{
         owner = Owner,
         streams = Streams,
@@ -7054,7 +7599,7 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                     recv_offset = 0,
                     recv_max_data = InitRecvMaxData,
                     recv_fin = false,
-                    recv_buffer = #{},
+                    recv_buffer = gb_trees:empty(),
                     final_size = undefined
                 }
         end,
@@ -7066,11 +7611,11 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
     %% Check if this would exceed our receive buffer limit (malicious peer protection)
     RecvBuffer =
         case Stream#stream_state.recv_buffer of
-            B when is_map(B) -> B;
-            _ -> #{}
+            undefined -> gb_trees:empty();
+            B -> B
         end,
     CurrentOffset = Stream#stream_state.recv_offset,
-    IsDuplicate = Offset < CurrentOffset orelse maps:is_key(Offset, RecvBuffer),
+    IsDuplicate = Offset < CurrentOffset orelse gb_trees:is_defined(Offset, RecvBuffer),
 
     %% Only check buffer limit for new (non-duplicate) data
     BufferOverflow =
@@ -7163,9 +7708,9 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                         end,
 
                     %% Fast path: in-order delivery with empty buffer
-                    %% Avoids maps:put and extract_contiguous_data for common case
+                    %% Avoids the buffer insert and extract_contiguous_data for common case
                     {DeliverData, NewRecvOffset, NewBuffer, DeliverFin} =
-                        case Offset =:= CurrentOffset andalso map_size(RecvBuffer) =:= 0 of
+                        case Offset =:= CurrentOffset andalso gb_trees:is_empty(RecvBuffer) of
                             true ->
                                 %% In-order with empty buffer: deliver directly
                                 {Data, EndOffset, RecvBuffer, Fin};
@@ -7181,16 +7726,14 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
 
                     %% Deliver contiguous data to owner
                     %% RFC 9000: Also deliver FIN-only notification when no data but FIN received
-                    case {DeliverData, DeliverFin, Fin} of
-                        {<<>>, false, _} ->
-                            %% No contiguous data to deliver yet
-                            ok;
-                        {<<>>, true, _} ->
-                            %% FIN-only delivery (all data already delivered)
-                            Owner ! {quic, self(), {stream_data, StreamId, <<>>, true}};
-                        {_, _, _} ->
-                            Owner ! {quic, self(), {stream_data, StreamId, DeliverData, DeliverFin}}
-                    end,
+                    PendDeliver1 =
+                        case {DeliverData, DeliverFin} of
+                            {<<>>, false} ->
+                                %% No contiguous data to deliver yet
+                                State#state.pend_deliver;
+                            _ ->
+                                deliver_stream_data(StreamId, DeliverData, DeliverFin, State)
+                        end,
 
                     NewStream = Stream#stream_state{
                         recv_offset = NewRecvOffset,
@@ -7198,7 +7741,7 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                         recv_buffer = NewBuffer,
                         final_size = FinalSize,
                         recv_done =
-                            (DeliverFin andalso map_size(NewBuffer) =:= 0) orelse
+                            (DeliverFin andalso gb_trees:is_empty(NewBuffer)) orelse
                                 recv_reset_at_met(Stream, NewRecvOffset) orelse
                                 Stream#stream_state.recv_done
                     },
@@ -7226,7 +7769,8 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                     State1 = State#state{
                         streams = maps:put(StreamId, NewStream, Streams),
                         data_received = NewDataReceivedVal,
-                        recv_buffer_bytes = NewRecvBufferBytes
+                        recv_buffer_bytes = NewRecvBufferBytes,
+                        pend_deliver = PendDeliver1
                     },
                     %% The stream is reclaimed at the end of this clause (after the
                     %% MAX_STREAM_DATA / MAX_DATA updates, which re-put the stream),
@@ -7247,18 +7791,6 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                     WillSendMaxStreamData =
                         Headroom < (MaxWindowForStream div 2) andalso
                             NewStream#stream_state.final_size =:= undefined,
-                    Threshold = RecvMaxData - (MaxWindowForStream div 2),
-                    ?LOG_DEBUG(
-                        #{
-                            what => max_stream_data_check,
-                            stream_id => StreamId,
-                            recv_offset => NewRecvOffset,
-                            recv_max_data => RecvMaxData,
-                            threshold => Threshold,
-                            will_send => WillSendMaxStreamData
-                        },
-                        ?QUIC_LOG_META
-                    ),
                     State2 =
                         case WillSendMaxStreamData of
                             true ->
@@ -7381,7 +7913,7 @@ extract_contiguous_data(Buffer, Offset) ->
     extract_contiguous_data(Buffer, Offset, <<>>).
 
 extract_contiguous_data(Buffer, Offset, Acc) ->
-    case maps:take(Offset, Buffer) of
+    case gb_trees:take_any(Offset, Buffer) of
         {Data, NewBuffer} ->
             %% Found data at this offset, continue looking for next chunk
             %% Binary append is O(1) amortized due to Erlang's pre-allocation
@@ -7392,44 +7924,58 @@ extract_contiguous_data(Buffer, Offset, Acc) ->
             %% a peer may split or coalesce retransmitted data differently
             %% (RFC 9000 §2.2, §13.3), so the bytes we want can sit inside
             %% a chunk that starts earlier. Drop what is already delivered,
-            %% re-key what straddles Offset, then retry once.
-            Trimmed = trim_reassembly_buffer(Buffer, Offset),
-            case maps:is_key(Offset, Trimmed) of
-                true -> extract_contiguous_data(Trimmed, Offset, Acc);
-                false -> {Acc, Offset, Trimmed}
+            %% re-key what straddles Offset, then retry once. When every
+            %% buffered chunk starts above Offset (the normal shape while
+            %% waiting on a hole, and this runs once per received packet
+            %% until the hole fills) the ordered tree answers that with one
+            %% smallest-key lookup and no walk.
+            case gb_trees:is_empty(Buffer) orelse element(1, gb_trees:smallest(Buffer)) > Offset of
+                true ->
+                    {Acc, Offset, Buffer};
+                false ->
+                    Trimmed = trim_reassembly_buffer(Buffer, Offset),
+                    case gb_trees:is_defined(Offset, Trimmed) of
+                        true -> extract_contiguous_data(Trimmed, Offset, Acc);
+                        false -> {Acc, Offset, Trimmed}
+                    end
             end
     end.
 
 %% Drop buffered chunks that end at or before Offset and trim those that
 %% straddle it, re-keying them to Offset. Keeps the longest chunk at each
 %% offset, so overlapping retransmissions collapse instead of accumulating.
+%% Only chunks keyed below Offset can qualify, so the ordered walk stops
+%% there; everything above is left untouched.
 trim_reassembly_buffer(Buffer, Offset) ->
-    maps:fold(
-        fun(Off, Data, Acc) ->
-            End = Off + byte_size(Data),
-            if
-                End =< Offset ->
-                    Acc;
-                Off >= Offset ->
-                    keep_longest_chunk(Off, Data, Acc);
-                true ->
-                    Kept = binary:part(Data, Offset - Off, End - Offset),
-                    keep_longest_chunk(Offset, Kept, Acc)
-            end
-        end,
-        #{},
-        Buffer
-    ).
+    trim_reassembly_buffer(gb_trees:iterator(Buffer), Buffer, Offset).
 
-keep_longest_chunk(Off, Data, Acc) ->
-    case Acc of
-        #{Off := Existing} when byte_size(Existing) >= byte_size(Data) -> Acc;
-        _ -> Acc#{Off => Data}
+trim_reassembly_buffer(Iter0, Buffer, Offset) ->
+    case gb_trees:next(Iter0) of
+        {Off, Data, Iter} when Off < Offset ->
+            End = Off + byte_size(Data),
+            Buffer1 = gb_trees:delete(Off, Buffer),
+            Buffer2 =
+                case End > Offset of
+                    true ->
+                        Kept = binary:part(Data, Offset - Off, End - Offset),
+                        keep_longest_chunk(Offset, Kept, Buffer1);
+                    false ->
+                        Buffer1
+                end,
+            trim_reassembly_buffer(Iter, Buffer2, Offset);
+        _ ->
+            Buffer
+    end.
+
+keep_longest_chunk(Off, Data, Buffer) ->
+    case gb_trees:lookup(Off, Buffer) of
+        {value, Existing} when byte_size(Existing) >= byte_size(Data) -> Buffer;
+        _ -> gb_trees:enter(Off, Data, Buffer)
     end.
 
 %% Total bytes held in a reassembly buffer.
 reassembly_buffer_bytes(Buffer) ->
-    maps:fold(fun(_, Data, Acc) -> Acc + byte_size(Data) end, 0, Buffer).
+    lists:foldl(fun(Data, Acc) -> Acc + byte_size(Data) end, 0, gb_trees:values(Buffer)).
 
 %% Get the maximum stream receive window across all streams.
 %% Used to ensure connection window >= 1.5x largest stream window.
@@ -7600,6 +8146,10 @@ maybe_send_ack(_, _, State) ->
 %% When `?ACK_PACKET_TOLERANCE' ack-eliciting packets have been seen
 %% since the last emitted ACK, flush immediately. Otherwise increment
 %% the counter and arm a max_ack_delay timer (if not already armed).
+maybe_decimate_app_ack(#state{recv_pass = true} = State) ->
+    %% Inside a receive pass: only count; finish_recv_pass/1 flushes
+    %% one ACK for the whole train.
+    arm_ack_timer(State#state{ack_elicited_count = State#state.ack_elicited_count + 1});
 maybe_decimate_app_ack(State) ->
     NewCount = State#state.ack_elicited_count + 1,
     case NewCount >= State#state.ack_packet_tolerance of
@@ -7608,6 +8158,63 @@ maybe_decimate_app_ack(State) ->
         false ->
             arm_ack_timer(State#state{ack_elicited_count = NewCount})
     end.
+
+%% End of a connected-state receive pass: flush the accumulated stream
+%% delivery, emit the deferred ACK (one per train) if enough
+%% ack-eliciting packets accumulated, then clear the pass flag.
+%% Below-tolerance remainders keep their ack_timer. The delivery
+%% flushes even when the pass initiated a close: the data arrived
+%% before it.
+finish_recv_pass(State0) ->
+    State = flush_pending_delivery(State0),
+    case State of
+        #state{
+            ack_elicited_count = Count, ack_packet_tolerance = Tol, close_reason = undefined
+        } when
+            Count >= Tol
+        ->
+            send_app_ack(State#state{recv_pass = false});
+        _ ->
+            State#state{recv_pass = false}
+    end.
+
+%% A boolean option: true only when set to exactly `true'.
+bool_opt(Key, Opts) ->
+    case maps:get(Key, Opts, false) of
+        true -> true;
+        _ -> false
+    end.
+
+%% Hand stream data to the owner. With delivery coalescing on and a
+%% receive pass active, consecutive deliveries for the same stream
+%% merge into one pending message, flushed at the end of the pass or
+%% as soon as another stream delivers (exact arrival order is kept:
+%% only adjacent chunks of one stream merge). Otherwise one message
+%% per delivery, as before. Returns the new pend_deliver.
+deliver_stream_data(
+    StreamId, Data, Fin, #state{recv_pass = true, delivery_coalescing = true} = State
+) ->
+    case State#state.pend_deliver of
+        {StreamId, Acc, F} ->
+            {StreamId, [Data | Acc], F orelse Fin};
+        none ->
+            {StreamId, [Data], Fin};
+        {OtherId, Acc, F} ->
+            State#state.owner ! {quic, self(), {stream_data, OtherId, run_binary(Acc), F}},
+            {StreamId, [Data], Fin}
+    end;
+deliver_stream_data(StreamId, Data, Fin, State) ->
+    State#state.owner ! {quic, self(), {stream_data, StreamId, Data, Fin}},
+    State#state.pend_deliver.
+
+run_binary([Single]) -> Single;
+run_binary(RevChunks) -> iolist_to_binary(lists:reverse(RevChunks)).
+
+flush_pending_delivery(#state{pend_deliver = none} = State) ->
+    State;
+flush_pending_delivery(#state{pend_deliver = {StreamId, Acc, Fin}, owner = Owner} = State) ->
+    Owner ! {quic, self(), {stream_data, StreamId, run_binary(Acc), Fin}},
+    State#state{pend_deliver = none}.
 
 %% Arm the max_ack_delay timer if not already armed.
 arm_ack_timer(#state{ack_timer = Ref} = State) when Ref =/= undefined ->
@@ -7620,6 +8227,10 @@ arm_ack_timer(#state{ack_timer = undefined} = State) ->
 
 %% Per RFC 9221 Section 5.2: Delay ACKs for packets containing only
 %% non-retransmittable ack-eliciting frames (like DATAGRAM).
+should_delay_ack([{stream, _, _, _, _} | _]) ->
+    %% Hot path: a stream frame is ack-eliciting and retransmittable,
+    %% so the packet never qualifies for the datagram-only delay.
+    false;
 should_delay_ack(Frames) ->
     AckEliciting = [F || F <- Frames, is_ack_eliciting_frame(F)],
     Retransmittable = quic_loss:retransmittable_frames(AckEliciting),
@@ -8034,8 +8645,14 @@ update_pn_space_recv(PN, PNSpace, Now) ->
             L when PN > L -> PN;
             L -> L
         end,
-    %% Add to ack_ranges maintaining descending order and merging adjacent ranges
-    NewRanges = cap_ack_ranges(add_to_ack_ranges(PN, Ranges)),
+    %% Add to ack_ranges maintaining descending order and merging adjacent
+    %% ranges. A sequential PN extends the head range in place, so the
+    %% range count cannot grow and the cap scan is skipped.
+    NewRanges =
+        case LargestRecv =/= undefined andalso PN =:= LargestRecv + 1 of
+            true -> add_to_ack_ranges(PN, Ranges);
+            false -> cap_ack_ranges(add_to_ack_ranges(PN, Ranges))
+        end,
     PNSpace#pn_space{
         largest_recv = NewLargest,
         recv_time = Now,
@@ -8293,7 +8910,7 @@ do_open_stream(
                 recv_offset = 0,
                 recv_max_data = RecvMaxData,
                 recv_fin = false,
-                recv_buffer = #{},
+                recv_buffer = gb_trees:empty(),
                 final_size = undefined
             },
             NewState = State#state{
@@ -8344,7 +8961,7 @@ do_open_unidirectional_stream(
                 recv_max_data = 0,
                 % No incoming data expected
                 recv_fin = true,
-                recv_buffer = #{},
+                recv_buffer = gb_trees:empty(),
                 final_size = undefined
             },
             NewState = State#state{
@@ -8814,10 +9431,46 @@ short_header_first_byte(KeyPhase, PNLen, #state{
 short_header_first_byte(KeyPhase, PNLen, #state{spin_bit_enabled = false}) ->
     16#40 bor (KeyPhase bsl 2) bor (PNLen - 1).
 
+%% Per-packet receive bookkeeping for the 1-RTT hot path: PN-space
+%% update, spin-bit tracking and the activity stamp in one #state{}
+%% rebuild. As three separate helpers (record_received_pn +
+%% update_spin_from_recv + update_last_activity) each rebuilt the full
+%% state record, together ~10% of receive CPU on bulk flows. Same
+%% logic as those helpers; the spin part mirrors update_spin_from_recv.
+record_app_recv(FirstByte, PN, #state{pn_app = PNSpace} = State, Now) ->
+    Trigger = classify_recv_trigger(PN, PNSpace),
+    NewPNSpace = update_pn_space_recv(PN, PNSpace, Now),
+    {SpinRecv, SpinLargest, SpinOut} =
+        case PN > State#state.spin_recv_largest_pn of
+            true ->
+                R = (FirstByte bsr 5) band 1,
+                Out =
+                    case State#state.spin_bit_enabled of
+                        false -> State#state.spin_outgoing;
+                        true when State#state.role =:= client -> R;
+                        true -> 1 - R
+                    end,
+                {R, PN, Out};
+            false ->
+                {State#state.spin_recv, State#state.spin_recv_largest_pn, State#state.spin_outgoing}
+        end,
+    State#state{
+        pn_app = NewPNSpace,
+        last_recv_trigger = Trigger,
+        spin_recv = SpinRecv,
+        spin_recv_largest_pn = SpinLargest,
+        spin_outgoing = SpinOut,
+        last_activity = Now,
+        ack_eliciting_since_recv = false
+    }.
+
 %% Update the spin-bit tracking state from a received 1-RTT packet.
 %% RFC 9000 §17.4 only updates on packets whose PN is greater than any
 %% previously received on this path so that reorderings don't flip the
 %% edge. Client mirrors the received bit; server inverts it.
+%% Kept for the spin-bit unit tests and as the reference the fused
+%% record_app_recv/4 is checked against.
+-ifdef(TEST).
 update_spin_from_recv(
     FirstByte, PN, #state{spin_recv_largest_pn = Largest, role = Role} = State
 ) when PN > Largest ->
@@ -8835,6 +9488,7 @@ update_spin_from_recv(
     };
 update_spin_from_recv(_FirstByte, _PN, State) ->
     State.
+-endif.
 
 %% Short-header packet overhead for a DATAGRAM frame on the 1-RTT level:
 %%   1 byte flags
@@ -9043,6 +9697,194 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Wh
             end
     end.
 
+%% Approve up to KMax-1 additional same-size sends against CC/pacing,
+%% consuming pacing tokens exactly as the one-at-a-time path would.
+approve_more_chunks(CC, _Size, _Urgency, _Pacing, KMax, K) when K >= KMax ->
+    {K, CC};
+approve_more_chunks(CC, Size, Urgency, true, KMax, K) ->
+    %% One batched CC/pacing check for the rest of the run instead of
+    %% a send_check per chunk.
+    {KExtra, CC1} = quic_cc:send_check_run(CC, Size, KMax - K, Urgency),
+    {K + KExtra, CC1};
+approve_more_chunks(CC, Size, Urgency, false, KMax, K) ->
+    %% Pacing off: count how many more chunks fit in the window,
+    %% accounting each on a scratch copy so the checks see the chunks
+    %% already approved. The real CC state is updated once for the run.
+    {cwnd_room_chunks(CC, Size, Urgency, KMax, K), CC}.
+
+cwnd_room_chunks(_CC, _Size, _Urgency, KMax, K) when K >= KMax ->
+    K;
+cwnd_room_chunks(CC, Size, Urgency, KMax, K) ->
+    case cwnd_only_check(CC, Size, Urgency) of
+        {ok, _} -> cwnd_room_chunks(quic_cc:on_packet_sent(CC, Size), Size, Urgency, KMax, K + 1);
+        _ -> K
+    end.
+
+%% Send K CC-approved full-size chunks as one run: seal and hand each
+%% wire packet to the socket, then update loss/CC/PN/counters and
+%% rebuild #state{} ONCE for the whole run instead of once per packet.
+send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, K) ->
+    {chunked_ctx, MaxChunkSize, _Urgency, _PacketSize, HeaderPrefix, LengthVarint, _Where} = Ctx,
+    %% A packet still pending from send coalescing goes out first so
+    %% the wire order matches the send order.
+    State = flush_pending_packet(State0),
+    #state{
+        dcid = DCID,
+        app_keys = {ClientKeys, ServerKeys},
+        role = Role,
+        pn_app = PNSpace,
+        loss_state = LossState,
+        cc_state = CCState,
+        socket_state = SocketState
+    } = State,
+    EncryptKeys =
+        case Role of
+            client -> ClientKeys;
+            server -> ServerKeys
+        end,
+    #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
+    Now = erlang:monotonic_time(millisecond),
+    PN0 = PNSpace#pn_space.next_pn,
+    KeyPhase = get_current_key_phase(State),
+    %% Build the run's frames and QUIC-frame payloads, then seal all K
+    %% packets: one fused NIF call when available (header, nonce, AEAD
+    %% and header protection in C), per-packet Erlang sealing otherwise.
+    {Frames, Payloads, Offset1, Rest} =
+        build_run_payloads(K, StreamId, Offset, Data, HeaderPrefix, LengthVarint, MaxChunkSize),
+    FirstByteBase = short_header_first_byte(KeyPhase, 1, State),
+    Packets =
+        case quic_aead_ctx:protect_run(Cipher, Key, IV, HP, PN0, FirstByteBase, DCID, Payloads) of
+            {ok, Ps} ->
+                Ps;
+            fallback ->
+                {Ps, _} = lists:mapfoldl(
+                    fun(Payload, PN) ->
+                        FirstByte = short_header_first_byte(
+                            KeyPhase, quic_packet:pn_length(PN), State
+                        ),
+                        {
+                            quic_aead:protect_short_packet(
+                                Cipher, Key, IV, HP, PN, FirstByte, DCID, Payload
+                            ),
+                            PN + 1
+                        }
+                    end,
+                    PN0,
+                    Payloads
+                ),
+                Ps
+        end,
+    {SS1, TrackedRev} = send_run_packets(Packets, Frames, PN0, State, SocketState, []),
+    %% One loss-tracker and one CC update for the run's successful sends.
+    {Loss1, CC1} =
+        case TrackedRev of
+            [] ->
+                {LossState, CCState};
+            _ ->
+                Tracked = lists:reverse(TrackedRev),
+                {
+                    quic_loss:on_packets_sent_run(LossState, Tracked, Now),
+                    quic_cc:on_packets_sent(CCState, [Sz || {_, Sz, _} <- Tracked])
+                }
+        end,
+    %% RFC 9000 §10.1: the idle timer restarts on the first ack-eliciting
+    %% send since the last receive (see send_app_packet_now/3).
+    RestartIdle = not State#state.ack_eliciting_since_recv,
+    State1 = State#state{
+        pn_app = PNSpace#pn_space{next_pn = PN0 + K},
+        loss_state = Loss1,
+        cc_state = CC1,
+        socket_state = SS1,
+        packets_sent = State#state.packets_sent + K,
+        burst_sent = State#state.burst_sent + K,
+        last_activity =
+            case RestartIdle of
+                true -> Now;
+                false -> State#state.last_activity
+            end,
+        ack_eliciting_since_recv = true,
+        pto_dirty = true
+    },
+    State2 = maybe_force_key_update(State1, K),
+    send_stream_chunked_loop(
+        StreamId, Offset1, Rest, Fin, State2, BytesSentSoFar + K * MaxChunkSize, Ctx
+    ).
+
+%% Split the run's data into K full chunks, building the stream frame
+%% and QUIC-frame payload for each. Returns the leftover data and its
+%% starting offset for the caller to continue with.
+build_run_payloads(K, StreamId, Offset, Data, HeaderPrefix, LengthVarint, MaxChunkSize) ->
+    build_run_payloads(
+        K, StreamId, Offset, Data, HeaderPrefix, LengthVarint, MaxChunkSize, [], []
+    ).
+
+build_run_payloads(0, _Sid, Offset, Data, _HP, _LV, _MCS, FrAcc, PlAcc) ->
+    {lists:reverse(FrAcc), lists:reverse(PlAcc), Offset, Data};
+build_run_payloads(K, Sid, Offset, Data, HeaderPrefix, LengthVarint, MCS, FrAcc, PlAcc) ->
+    <<Chunk:MCS/binary, Rest/binary>> = Data,
+    Frame = {stream, Sid, Offset, Chunk, false},
+    Payload = build_chunk_iodata(HeaderPrefix, Offset, LengthVarint, Chunk, Frame),
+    build_run_payloads(
+        K - 1,
+        Sid,
+        Offset + MCS,
+        Rest,
+        HeaderPrefix,
+        LengthVarint,
+        MCS,
+        [Frame | FrAcc],
+        [Payload | PlAcc]
+    ).
+
+%% Hand the run's sealed packets to the socket; the socket state is
+%% threaded explicitly so no #state{} copy happens per packet, and the
+%% successful sends are collected as [{PN, Size, Frame}] (reversed) for
+%% one batched loss/CC update afterwards. Packet I carries PN0 + I. A
+%% failed send skips that packet's tracking exactly as
+%% send_app_packet_now/3 does (PTO owns retransmission).
+send_run_packets([], [], _PN, _State, SS, Tracked) ->
+    {SS, Tracked};
+send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Tracked) ->
+    PacketSize = byte_size(Packet),
+    #state{remote_addr = {IP, Port}} = State,
+    SendResult =
+        case SS of
+            undefined ->
+                case gen_udp:send(State#state.socket, IP, Port, Packet) of
+                    ok -> {ok, undefined};
+                    {error, _} = E -> E
+                end;
+            _ ->
+                quic_socket:send(SS, IP, Port, Packet)
+        end,
+    case SendResult of
+        {ok, SS1} ->
+            ?QLOG_EMIT_PACKET_SENT(State#state.qlog_ctx, #{
+                packet_type => one_rtt,
+                packet_number => PN,
+                length => PacketSize,
+                frames => [Frame]
+            }),
+            SS2 =
+                case SS1 of
+                    undefined -> SS;
+                    _ -> SS1
+                end,
+            send_run_packets(Pkts, Frs, PN + 1, State, SS2, [{PN, PacketSize, Frame} | Tracked]);
+        {error, Reason, SSCleared} ->
+            ?LOG_WARNING(
+                #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
+                ?QUIC_LOG_META
+            ),
+            send_run_packets(Pkts, Frs, PN + 1, State, SSCleared, Tracked);
+        {error, Reason} ->
+            ?LOG_WARNING(
+                #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
+                ?QUIC_LOG_META
+            ),
+            send_run_packets(Pkts, Frs, PN + 1, State, SS, Tracked)
+    end.
+
 %% Build the iodata payload `[Header, Chunk]' for a chunked stream
 %% send, reusing the pre-computed header pieces when `Offset > 0'.
 %% On the `Offset =:= 0' first-chunk path the wire format needs a
@@ -9124,7 +9966,7 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
     end.
 
 send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
-    {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint, Where} = Ctx,
+    {chunked_ctx, MaxChunkSize, Urgency, PacketSize, _HeaderPrefix, _LengthVarint, Where} = Ctx,
     #state{cc_state = CCState, pacing_enabled = PacingEnabled} = State,
     Check =
         case PacingEnabled of
@@ -9133,20 +9975,19 @@ send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSen
         end,
     case Check of
         {ok, NewCCState} ->
-            State0 = State#state{cc_state = NewCCState},
-            <<Chunk:MaxChunkSize/binary, Rest/binary>> = Data,
-            Frame = {stream, StreamId, Offset, Chunk, false},
-            Payload = build_chunk_iodata(HeaderPrefix, Offset, LengthVarint, Chunk, Frame),
-            State1 = send_app_packet_internal(Payload, [Frame], State0),
-            send_stream_chunked_loop(
-                StreamId,
-                Offset + MaxChunkSize,
-                Rest,
-                Fin,
-                State1,
-                BytesSentSoFar + MaxChunkSize,
-                Ctx
-            );
+            %% First chunk approved. Approve as many further full
+            %% chunks as CC/pacing and the burst budget allow, then
+            %% send the whole run with one bookkeeping pass: the
+            %% per-packet #state{} rebuild in send_app_packet_now is
+            %% the largest own-time item on the bulk-send profile.
+            FullChunks = byte_size(Data) div MaxChunkSize,
+            BudgetLeft = max(1, State#state.burst_budget - State#state.burst_sent),
+            KMax = min(FullChunks, BudgetLeft),
+            {K, CCStateK} = approve_more_chunks(
+                NewCCState, PacketSize, Urgency, PacingEnabled, KMax, 1
+            ),
+            State0 = State#state{cc_state = CCStateK},
+            send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, K);
         {blocked_pacing, Delay} ->
             ?LOG_DEBUG(
                 #{
@@ -10837,13 +11678,16 @@ burst_exhausted(#state{burst_sent = Sent, burst_budget = Budget}) ->
 
 %% Arm a zero-delay pacing continuation so the queued remainder is
 %% drained in the next event-loop pass, after any pending ACK / loss
-%% feedback in the mailbox. Reuses the pacing timer and message so the
-%% drain and stale-reference handling are shared with real pacing.
+%% feedback in the mailbox. Reuses the pacing message so the drain and
+%% stale-reference handling are shared with real pacing, but sends it
+%% directly: send_after(0) goes through the timer wheel, whose ~1 ms
+%% service tick would clock every burst continuation (64 packets/ms
+%% caps bulk streams at ~85 MB/s regardless of rate).
 arm_burst_continuation(#state{pacing_timer = Ref} = State) when Ref =/= undefined ->
     State;
 arm_burst_continuation(State) ->
     Ref = make_ref(),
-    erlang:send_after(0, self(), {pacing_timeout, Ref}),
+    self() ! {pacing_timeout, Ref},
     State#state{pacing_timer = Ref}.
 
 %% Convert state to map for debugging
@@ -10895,13 +11739,14 @@ send_gso_supported(SocketState) ->
     maps:get(gso_supported, quic_socket:info(SocketState)).
 
 send_batch_counters(undefined) ->
-    {0, 0, 0};
+    {0, 0, 0, 0};
 send_batch_counters(SocketState) ->
     Info = quic_socket:info(SocketState),
     {
         maps:get(batch_flushes, Info),
         maps:get(packets_coalesced, Info),
-        maps:get(gso_flushes, Info)
+        maps:get(gso_flushes, Info),
+        maps:get(batch_pending, Info)
     }.
 
 %% Normalize ALPN list - handles binary, list of binaries, list of strings
@@ -10931,10 +11776,14 @@ normalize_alpn_list(_) ->
 %% and force a key update before it is reached (RFC 9001 §6.6). Only the
 %% first over-limit packet in an idle phase triggers the update; the
 %% counter resets when the new phase begins.
-maybe_force_key_update(#state{key_state = undefined} = State) ->
+maybe_force_key_update(State) ->
+    maybe_force_key_update(State, 1).
+
+%% N packets at once, for the chunk-run sender.
+maybe_force_key_update(#state{key_state = undefined} = State, _N) ->
     State;
-maybe_force_key_update(#state{key_state = KeyState} = State) ->
-    NewCount = KeyState#key_update_state.send_count + 1,
+maybe_force_key_update(#state{key_state = KeyState} = State, N) ->
+    NewCount = KeyState#key_update_state.send_count + N,
     State1 = State#state{key_state = KeyState#key_update_state{send_count = NewCount}},
     case
         NewCount >= ?AEAD_CONFIDENTIALITY_LIMIT andalso
@@ -11382,13 +12231,18 @@ rebind_client_socket_otp(
     #state{
         remote_addr = {RemoteIP, _},
         socket_state = OldSocketState,
-        client_receiver = OldReceiver
+        client_receiver = OldReceiver,
+        max_data_local = MaxData
     } = State
 ) ->
     OpenOpts = #{backend => socket},
     case quic_socket:open_for_send(RemoteIP, OpenOpts) of
         {ok, NewSocketState} ->
-            case quic_socket:start_client_receiver(NewSocketState, self()) of
+            case
+                quic_socket:start_client_receiver(
+                    NewSocketState, self(), quic_socket:recv_queue_max(MaxData)
+                )
+            of
                 {ok, NewReceiver} ->
                     ok = quic_socket:stop_client_receiver(OldReceiver),
                     close_socket_state_quietly(OldSocketState),
@@ -12802,6 +13656,94 @@ test_spin_state(#state{
 test_spin_state_for(Role, Enabled) ->
     #state{role = Role, spin_bit_enabled = Enabled}.
 
+%% #state{} holding one peer-initiated stream at RecvOffset with the
+%% given stream and connection receive credit, the caller as owner.
+%% For the tests that run the lean stream-data path against the
+%% general one.
+-spec test_recv_stream_state(
+    non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()
+) -> #state{}.
+test_recv_stream_state(StreamId, RecvOffset, StreamCredit, ConnCredit) ->
+    Stream = #stream_state{
+        id = StreamId,
+        state = open,
+        send_offset = 0,
+        send_max_data = 0,
+        send_fin = false,
+        send_buffer = [],
+        recv_offset = RecvOffset,
+        recv_max_data = RecvOffset + StreamCredit,
+        recv_fin = false,
+        recv_buffer = gb_trees:empty(),
+        final_size = undefined
+    },
+    #state{
+        role = server,
+        owner = self(),
+        streams = #{StreamId => Stream},
+        data_received = RecvOffset,
+        max_data_local = RecvOffset + ConnCredit,
+        fc_max_receive_window = ?DEFAULT_MAX_RECEIVE_WINDOW,
+        recv_buffer_bytes = 0
+    }.
+
+%% Add another peer-initiated stream at offset 0 to a test state.
+-spec test_add_recv_stream(#state{}, non_neg_integer(), non_neg_integer()) -> #state{}.
+test_add_recv_stream(#state{streams = Streams} = State, StreamId, StreamCredit) ->
+    Stream = #stream_state{
+        id = StreamId,
+        state = open,
+        send_offset = 0,
+        send_max_data = 0,
+        send_fin = false,
+        send_buffer = [],
+        recv_offset = 0,
+        recv_max_data = StreamCredit,
+        recv_fin = false,
+        recv_buffer = gb_trees:empty(),
+        final_size = undefined
+    },
+    State#state{streams = Streams#{StreamId => Stream}}.
+
+%% Give a test state a 1-RTT PN space that has received 0..Largest.
+-spec test_state_with_pn_app(#state{}, non_neg_integer()) -> #state{}.
+test_state_with_pn_app(State, Largest) ->
+    State#state{
+        pn_app = #pn_space{
+            next_pn = 0,
+            largest_acked = undefined,
+            largest_recv = Largest,
+            recv_time = 0,
+            ack_ranges = [{0, Largest}],
+            ack_eliciting_in_flight = 0,
+            loss_time = undefined,
+            sent_packets = #{}
+        },
+        transport_params = #{max_ack_delay => 25}
+    }.
+
+%% The receive-side fields a batch-opened run is expected to move.
+-spec test_recv_summary(#state{}, non_neg_integer()) -> map().
+test_recv_summary(#state{pn_app = PN, streams = Streams} = State, StreamId) ->
+    #{
+        largest_recv => PN#pn_space.largest_recv,
+        ack_ranges => PN#pn_space.ack_ranges,
+        recv_offset => (maps:get(StreamId, Streams))#stream_state.recv_offset,
+        data_received => State#state.data_received,
+        packets_received => State#state.packets_received,
+        ack_elicited_count => State#state.ack_elicited_count,
+        pend_deliver => State#state.pend_deliver,
+        spin_recv_largest_pn => State#state.spin_recv_largest_pn,
+        has_non_probing_frame => State#state.has_non_probing_frame
+    }.
+
+%% Minimal #state{} with a 1-RTT PN space, for the receive-bookkeeping
+%% tests that run record_app_recv/4 against its unfused parts.
+-spec test_app_recv_state(client | server, boolean()) -> #state{}.
+test_app_recv_state(Role, SpinEnabled) ->
+    S = test_decimate_initial_state(),
+    S#state{role = Role, spin_bit_enabled = SpinEnabled}.
+
 %% Minimal #state{} for stateless-reset tests.
 -spec test_state_with_secret(binary() | undefined) -> #state{}.
 test_state_with_secret(Secret) ->
@@ -12859,6 +13801,12 @@ test_state_for_server(RemoteAddr, Secret, ODCID) ->
 
 -spec test_close_reason(#state{}) -> term().
 test_close_reason(#state{close_reason = R}) -> R.
+
+-spec test_state_closing(#state{}, term()) -> #state{}.
+test_state_closing(State, Reason) -> State#state{close_reason = Reason}.
+
+-spec test_state_with_socket(#state{}, gen_udp:socket()) -> #state{}.
+test_state_with_socket(State, Socket) -> State#state{socket = Socket}.
 
 %% Minimal #state{} carrying a caller-supplied loss tracker, for tests
 %% that need to observe what an incoming frame does to it.
@@ -13039,6 +13987,37 @@ test_decimate_step(State) ->
     {NewState, #{
         ack_elicited_count => NewState#state.ack_elicited_count,
         ack_timer_armed => NewState#state.ack_timer =/= undefined
+    }}.
+
+%% Mark the state as inside a connected-state receive pass, as the
+%% datagram handlers do before processing a train.
+-spec test_state_in_recv_pass(#state{}) -> #state{}.
+test_state_in_recv_pass(State) ->
+    State#state{recv_pass = true}.
+
+-spec test_pacing_timer(#state{}) -> undefined | reference().
+test_pacing_timer(#state{pacing_timer = Ref}) -> Ref.
+
+-spec test_state_coalescing(#state{}, boolean()) -> #state{}.
+test_state_coalescing(State, On) ->
+    State#state{delivery_coalescing = On}.
+
+-spec test_pending_delivery(#state{}) -> none | {non_neg_integer(), [binary()], boolean()}.
+test_pending_delivery(#state{pend_deliver = P}) -> P.
+
+%% Run finish_recv_pass/1 and return the observable decimation fields.
+-spec test_finish_recv_pass(#state{}) ->
+    {#state{}, #{
+        ack_elicited_count := non_neg_integer(),
+        ack_timer_armed := boolean(),
+        recv_pass := boolean()
+    }}.
+test_finish_recv_pass(State) ->
+    NewState = finish_recv_pass(State),
+    {NewState, #{
+        ack_elicited_count => NewState#state.ack_elicited_count,
+        ack_timer_armed => NewState#state.ack_timer =/= undefined,
+        recv_pass => NewState#state.recv_pass
     }}.
 
 %% Simulate the delayed-ack timer firing by routing through

@@ -111,8 +111,17 @@
 ]).
 
 -ifdef(TEST).
--export([send_packet/6, compute_stateless_reset_token/2, build_stateless_reset/2]).
+-export([
+    send_packet/6,
+    compute_stateless_reset_token/2,
+    build_stateless_reset/2,
+    send_packets_to_connection/4,
+    drain_recv_sweep/4,
+    group_recv_sweep/1
+]).
 -endif.
+
+-export([recv_drops/0]).
 
 -include("quic.hrl").
 -include_lib("kernel/include/logger.hrl").
@@ -120,7 +129,11 @@
     domain => [erlang_quic, listener], report_cb => fun quic_log:format_report/2
 }).
 
+%% Packets drained from the listener mailbox into one receive sweep.
+-define(RECV_SWEEP_MAX, 256).
+
 -record(listener_state, {
+    recv_queue_max = ?MAX_CONN_RECV_QUEUE_MSGS :: pos_integer(),
     socket :: gen_udp:socket() | socket:socket(),
     %% Socket state for quic_socket abstraction (for GRO support on Linux)
     socket_state :: quic_socket:socket_state() | undefined,
@@ -128,6 +141,10 @@
     socket_backend = gen_udp :: gen_udp | socket,
     %% GRO receiver process (when using socket backend)
     gro_receiver :: pid() | undefined,
+    %% Shared sender serializing server-connection sendmsg calls
+    %% (socket backend only; see quic_socket:start_shared_sender/1).
+    send_sender :: pid() | undefined,
+    send_gso_counter :: atomics:atomics_ref() | undefined,
     port :: inet:port_number(),
     %% Cert + private_key are optional; PSK-only listeners run with
     %% both `undefined' and rely on `psks' / `psk_callback'.
@@ -340,12 +357,15 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
 
     %% Start GRO receiver if using socket backend
     GROReceiver = maybe_start_gro_receiver(Backend, SocketState),
+    {SendSender, SendGSOCounter} = maybe_start_shared_sender(Backend, SocketState),
 
     State = #listener_state{
         socket = Socket,
         socket_state = SocketState,
         socket_backend = Backend,
         gro_receiver = GROReceiver,
+        send_sender = SendSender,
+        send_gso_counter = SendGSOCounter,
         port = ActualPort,
         cert = Cert,
         cert_chain = CertChain,
@@ -363,6 +383,9 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
         connection_handler = ConnHandler,
         cid_config = CIDConfig,
         dcid_len = DCIDLen,
+        recv_queue_max = quic_socket:recv_queue_max(
+            maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA)
+        ),
         opts = Opts
     },
     {noreply, State}.
@@ -416,6 +439,11 @@ maybe_start_gro_receiver(socket, SocketState) when SocketState =/= undefined ->
     spawn_link(fun() -> gro_receive_loop(SocketState, Listener) end);
 maybe_start_gro_receiver(_, _) ->
     undefined.
+
+maybe_start_shared_sender(socket, SocketState) when SocketState =/= undefined ->
+    quic_socket:start_shared_sender(SocketState);
+maybe_start_shared_sender(_, _) ->
+    {undefined, undefined}.
 
 %% GRO receiver loop - runs in separate process
 %% Does blocking recvmsg calls and forwards packets to listener
@@ -476,7 +504,10 @@ handle_info(
         #{what => udp_received, src_ip => SrcIP, src_port => SrcPort, size => byte_size(Packet)},
         ?QUIC_LOG_META
     ),
-    handle_packet(Packet, {SrcIP, SrcPort}, State),
+    Items = drain_recv_sweep(
+        Socket, gen_udp, ?RECV_SWEEP_MAX - 1, [{{SrcIP, SrcPort}, [Packet]}]
+    ),
+    dispatch_recv_sweep(Items, State),
     {noreply, State};
 %% Handle GRO packets (socket backend with GRO)
 %% May receive multiple packets in single recv call
@@ -493,8 +524,10 @@ handle_info(
         },
         ?QUIC_LOG_META
     ),
-    RemoteAddr = {SrcIP, SrcPort},
-    handle_gro_packets(Packets, RemoteAddr, State),
+    Items = drain_recv_sweep(
+        undefined, socket, ?RECV_SWEEP_MAX - length(Packets), [{{SrcIP, SrcPort}, Packets}]
+    ),
+    dispatch_recv_sweep(Items, State),
     {noreply, State};
 %% Handle socket going passive (backpressure with {active, N}) - gen_udp only
 handle_info(
@@ -506,7 +539,9 @@ handle_info(
     {noreply, State};
 %% Handle connection process exit
 handle_info(
-    {'EXIT', Pid, _Reason}, #listener_state{connections = Conns, gro_receiver = GROReceiver} = State
+    {'EXIT', Pid, _Reason},
+    #listener_state{connections = Conns, gro_receiver = GROReceiver, send_sender = SendSender} =
+        State
 ) ->
     case Pid of
         GROReceiver ->
@@ -516,6 +551,16 @@ handle_info(
                 State#listener_state.socket_state
             ),
             {noreply, State#listener_state{gro_receiver = NewReceiver}};
+        SendSender when is_pid(SendSender) ->
+            %% Shared sender died: new connections get a fresh one,
+            %% existing connections fall back to sending directly.
+            {NewSender, NewCounter} = maybe_start_shared_sender(
+                State#listener_state.socket_backend,
+                State#listener_state.socket_state
+            ),
+            {noreply, State#listener_state{
+                send_sender = NewSender, send_gso_counter = NewCounter
+            }};
         _ ->
             cleanup_connection(Conns, Pid),
             {noreply, State}
@@ -525,6 +570,49 @@ handle_info({udp, _OtherSocket, _SrcIP, _SrcPort, _Packet}, State) ->
     {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
+
+%% Drain the datagram messages already queued in the listener mailbox
+%% into one receive sweep, so packets for the same connection arriving
+%% as separate messages (distinct flows never GRO-coalesce) are
+%% dispatched as one batch: the connection wakes once per sweep instead
+%% of once per datagram, and its batched receive path engages even for
+%% sparse per-connection traffic. Bounded to keep the listener
+%% responsive under floods. Returns [{Addr, Packets}] in arrival order.
+drain_recv_sweep(_Socket, _Backend, Budget, Acc) when Budget =< 0 ->
+    lists:reverse(Acc);
+drain_recv_sweep(Socket, Backend, Budget, Acc) ->
+    receive
+        {udp, Socket, IP, Port, Packet} when Backend =:= gen_udp ->
+            drain_recv_sweep(Socket, Backend, Budget - 1, [{{IP, Port}, [Packet]} | Acc]);
+        {gro_packets, IP, Port, Packets} when Backend =:= socket ->
+            drain_recv_sweep(
+                Socket, Backend, Budget - length(Packets), [{{IP, Port}, Packets} | Acc]
+            )
+    after 0 ->
+        lists:reverse(Acc)
+    end.
+
+%% Merge the sweep per source address (per-flow packet order preserved,
+%% cross-flow order irrelevant) and route each group through the
+%% existing batched dispatch, which groups by connection and creates
+%% new connections.
+dispatch_recv_sweep([{Addr, Packets}], State) ->
+    handle_gro_packets(Packets, Addr, State);
+dispatch_recv_sweep(Items, State) ->
+    maps:foreach(
+        fun(Addr, Packets) -> handle_gro_packets(Packets, Addr, State) end,
+        group_recv_sweep(Items)
+    ).
+
+group_recv_sweep(Items) ->
+    Grouped = lists:foldl(
+        fun({Addr, Packets}, M) ->
+            maps:update_with(Addr, fun(L) -> [Packets | L] end, [Packets], M)
+        end,
+        #{},
+        Items
+    ),
+    maps:map(fun(_, Trains) -> lists:append(lists:reverse(Trains)) end, Grouped).
 
 %% Handle multiple packets received via GRO
 %% Groups packets by connection and sends batched messages
@@ -539,7 +627,9 @@ handle_gro_packets(Packets, RemoteAddr, State) ->
 
 %% Group packets by connection ID and dispatch in batches
 dispatch_batched_packets(
-    Packets, RemoteAddr, #listener_state{dcid_len = DCIDLen, connections = Conns} = State
+    Packets,
+    RemoteAddr,
+    #listener_state{dcid_len = DCIDLen, connections = Conns, recv_queue_max = QueueMax} = State
 ) ->
     %% Build map of ConnPid -> [Packets] (preserving order)
     Groups = group_packets_by_conn(Packets, DCIDLen, Conns, #{}),
@@ -548,7 +638,9 @@ dispatch_batched_packets(
         fun
             ({conn, ConnPid}, PacketList) ->
                 %% Reverse to restore original order (we prepended)
-                send_packets_to_connection(ConnPid, lists:reverse(PacketList), RemoteAddr);
+                send_packets_to_connection(
+                    ConnPid, lists:reverse(PacketList), RemoteAddr, QueueMax
+                );
             ({new, DCID, Version}, PacketList) ->
                 %% Initial packets that need new connections
                 [FirstPacket | _] = lists:reverse(PacketList),
@@ -600,13 +692,60 @@ group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
             group_packets_by_conn(Rest, DCIDLen, Conns, Acc)
     end.
 
-%% Send batched packets to a connection
-send_packets_to_connection(ConnPid, [Packet], RemoteAddr) ->
-    %% Single packet - use existing message format
-    ConnPid ! {quic_packet, Packet, RemoteAddr};
-send_packets_to_connection(ConnPid, Packets, RemoteAddr) ->
-    %% Multiple packets - use batched message
-    ConnPid ! {quic_packets, Packets, RemoteAddr}.
+%% Send batched packets to a connection. Tail-drops when the
+%% connection's mailbox is over QueueMax, see
+%% quic_socket:recv_queue_max/1.
+send_packets_to_connection(ConnPid, Packets, RemoteAddr, QueueMax) ->
+    case erlang:process_info(ConnPid, message_queue_len) of
+        {message_queue_len, QLen} when QLen > QueueMax ->
+            %% Over the bound: keep one packet of the train so the peer
+            %% still gets a timely (dup-)ACK carrying the loss signal,
+            %% drop the rest - per-packet-ish drops beat losing whole
+            %% GRO trains, which fragments ACK ranges and provokes
+            %% retransmit storms.
+            count_recv_drop(length(Packets) - 1),
+            ConnPid ! {quic_packet, hd(Packets), RemoteAddr},
+            ok;
+        _ ->
+            forward_packet_chunks(ConnPid, Packets, RemoteAddr)
+    end.
+
+%% Forward a train in =< ?MAX_PACKETS_PER_CONN_MSG chunks so the
+%% mailbox bound above translates to a bounded packet backlog.
+forward_packet_chunks(ConnPid, [Packet], RemoteAddr) ->
+    ConnPid ! {quic_packet, Packet, RemoteAddr},
+    ok;
+forward_packet_chunks(ConnPid, Packets, RemoteAddr) ->
+    case length(Packets) =< ?MAX_PACKETS_PER_CONN_MSG of
+        true ->
+            ConnPid ! {quic_packets, Packets, RemoteAddr},
+            ok;
+        false ->
+            {Chunk, Rest} = lists:split(?MAX_PACKETS_PER_CONN_MSG, Packets),
+            ConnPid ! {quic_packets, Chunk, RemoteAddr},
+            forward_packet_chunks(ConnPid, Rest, RemoteAddr)
+    end.
+
+%% Bench diagnostic: global tail-drop counter, readable via
+%% quic_listener:recv_drops/0.
+count_recv_drop(N) ->
+    Ref =
+        case persistent_term:get({?MODULE, recv_drops}, undefined) of
+            undefined ->
+                R = atomics:new(1, []),
+                persistent_term:put({?MODULE, recv_drops}, R),
+                R;
+            R ->
+                R
+        end,
+    atomics:add(Ref, 1, N).
+
+-spec recv_drops() -> non_neg_integer().
+recv_drops() ->
+    case persistent_term:get({?MODULE, recv_drops}, undefined) of
+        undefined -> 0;
+        Ref -> atomics:get(Ref, 1)
+    end.
 
 %% @doc false
 terminate(_Reason, #listener_state{
@@ -946,6 +1085,8 @@ create_connection_unconditional(
         connection_handler = ConnHandler,
         cid_config = CIDConfig,
         reset_secret = ResetSecret,
+        send_sender = SendSender,
+        send_gso_counter = SendGSOCounter,
         opts = Opts
     }
 ) ->
@@ -976,6 +1117,8 @@ create_connection_unconditional(
         socket => Socket,
         listener_socket_backend => Backend,
         listener_gso_supported => ListenerGSO,
+        send_sender => SendSender,
+        send_gso_counter => SendGSOCounter,
         remote_addr => RemoteAddr,
         initial_dcid => DCID,
         %% original_destination_connection_id transport param: the client's

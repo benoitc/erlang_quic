@@ -57,6 +57,8 @@
     get_pacing_tokens/2,
     pacing_delay/2,
     send_check/3,
+    send_check_run/4,
+    on_packets_sent/2,
     max_datagram_size/1,
     min_recovery_duration/1,
     ecn_ce_counter/1
@@ -237,6 +239,21 @@ on_packet_sent(
     };
 on_packet_sent(#cc_state{bytes_in_flight = InFlight} = State, Size) ->
     State#cc_state{bytes_in_flight = InFlight + Size}.
+
+%% @doc Batched on_packet_sent for a run of packets: one state update
+%% for the whole list of sizes.
+-spec on_packets_sent(cc_state(), [non_neg_integer()]) -> cc_state().
+on_packets_sent(State, []) ->
+    State;
+on_packets_sent(#cc_state{bytes_in_flight = InFlight} = State, Sizes) ->
+    Total = lists:sum(Sizes),
+    case State#cc_state.first_sent_time of
+        undefined ->
+            Now = erlang:monotonic_time(millisecond),
+            State#cc_state{bytes_in_flight = InFlight + Total, first_sent_time = Now};
+        _ ->
+            State#cc_state{bytes_in_flight = InFlight + Total}
+    end.
 
 %% @doc Process acknowledged packets.
 %% AckedBytes is the total size of acknowledged packets.
@@ -885,7 +902,13 @@ on_persistent_congestion(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} 
 %% RFC 9002: pacing_rate = cwnd / smoothed_rtt
 %% Called when RTT estimate is updated.
 -spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
-update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTT) when SmoothedRTT > 0 ->
+update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTT0) ->
+    %% RTT samples are whole milliseconds, so a sub-millisecond link
+    %% reports 0. Skipping the update then freezes the rate at its
+    %% handshake-time value while cwnd keeps growing, clocking the
+    %% connection at that stale rate forever. Floor at 1 ms so the
+    %% rate keeps tracking cwnd and the congestion controller governs.
+    SmoothedRTT = max(1, SmoothedRTT0),
     %% pacing_rate stored as milli-bytes per microsecond for precision with us timestamps
     %% Formula: (cwnd * 1.25 * 1000) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
     %% Simplified: (cwnd * 5 * 250) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
@@ -914,10 +937,7 @@ update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTT) when SmoothedRTT
     %% the rate.
     MaxBurst = max(12 * State1#cc_state.max_datagram_size, 2 * PacingRate),
 
-    State1#cc_state{pacing_rate = PacingRate, pacing_max_burst = MaxBurst};
-update_pacing_rate(State, _SmoothedRTT) ->
-    %% No valid RTT yet, keep current state
-    State.
+    State1#cc_state{pacing_rate = PacingRate, pacing_max_burst = MaxBurst}.
 
 %% @doc Check if pacing allows sending Size bytes.
 %% Returns true if enough tokens are available (including burst allowance).
@@ -1041,6 +1061,59 @@ send_check(
                     Deficit = Size - Refreshed,
                     DelayMs = max(1, (Deficit + Rate - 1) div Rate),
                     {blocked_pacing, DelayMs}
+            end
+    end.
+
+%% @doc Batched send_check: approve up to MaxK packets of Size in one
+%% pass, consuming pacing tokens exactly as MaxK sequential send_check
+%% calls would, minus the sub-millisecond token refill between
+%% iterations, so the batch is never more permissive. Returns how many
+%% packets were approved and the updated state.
+-spec send_check_run(cc_state(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
+    {non_neg_integer(), cc_state()}.
+send_check_run(
+    #cc_state{
+        cwnd = Cwnd,
+        bytes_in_flight = InFlight,
+        control_allowance = Allowance,
+        pacing_rate = Rate
+    } = State,
+    Size,
+    MaxK,
+    Urgency
+) ->
+    CwndLimit =
+        case Urgency of
+            0 -> Cwnd + Allowance;
+            _ -> Cwnd
+        end,
+    Room = CwndLimit - InFlight,
+    KC =
+        case Room >= Size of
+            true -> min(MaxK, Room div Size);
+            false -> 0
+        end,
+    case {KC, Rate} of
+        {0, _} ->
+            {0, State};
+        {_, 0} ->
+            {KC, State};
+        _ ->
+            #cc_state{
+                pacing_tokens = Tokens,
+                pacing_max_burst = MaxBurst,
+                last_pacing_update = LastUpdate
+            } = State,
+            Now = erlang:monotonic_time(microsecond),
+            Refreshed = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
+            case min(KC, Refreshed div Size) of
+                KP when KP =< 0 ->
+                    {0, State};
+                KP ->
+                    {KP, State#cc_state{
+                        pacing_tokens = Refreshed - KP * Size,
+                        last_pacing_update = Now
+                    }}
             end
     end.
 

@@ -2,6 +2,176 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `delivery_coalescing` (default `false`) merges consecutive
+  same-stream `stream_data` deliveries of one receive pass into a
+  single owner message, flushed at the end of the pass or as soon as
+  another stream delivers, so arrival order across streams is kept and
+  a `stream_reset` never overtakes data delivered before it. Owners
+  otherwise wake once per packet on bulk flows. QUIC gives no
+  message-boundary guarantee, but owners that decode each delivery as
+  one complete application message break when deliveries merge, so it
+  is opt-in.
+- Bulk stream sends go out as runs: once the first full-size chunk is
+  approved, as many further chunks as congestion control, pacing and
+  the burst budget allow are approved up front (consuming pacing
+  tokens exactly as one-at-a-time sends would), sealed and handed to
+  the socket in one loop, and loss, congestion, packet-number and
+  counter bookkeeping is updated once for the run:
+  `quic_cc:send_check_run/4` approves the run against cwnd and pacing
+  in one step (never more permissive than the sequential checks),
+  `quic_cc:on_packets_sent/2` and `quic_loss:on_packets_sent_run/3`
+  fold it into one record update each (native for NewReno, a fold for
+  other algorithms). The per-packet connection-state rebuild was the
+  largest own-time item on the bulk-send profile; a 64-packet run
+  replaces 64 copies with one. The socket-backend receive queue bound
+  is the connection's flow-control window in full-size packets (never
+  below 512 messages): a run sender inside the window it was given is
+  never tail-dropped, and the bound only catches a peer outside it. A
+  fixed 512-message bound sat below a 16 MB window and turned
+  flow-control-permitted data into loss on loopback.
+- The listener drains the datagram messages already queued in its
+  mailbox into one receive sweep (up to 256 packets), groups them per
+  source address and dispatches each group as one batch. Distinct
+  flows never GRO-coalesce, so at a server with many sparse
+  connections every datagram used to be its own listener message and
+  its own connection wakeup; connections now wake once per sweep and
+  their batched receive path engages even for sparse traffic. ACK
+  processing re-arms the PTO once at the end of the receive pass
+  instead of once per ACK frame.
+  processing re-arms the PTO once at the end of the receive pass
+  instead of once per ACK frame.
+- Server connections on the socket backend hand their finished send
+  batches to one shared sender process per listener, which performs
+  the `sendmsg` calls serially. Concurrent `sendmsg` on one socket
+  handle from many connection processes burns about 20x the CPU in
+  NIF-level contention (98.6 vs 4.7 us per send with 50 concurrent
+  senders); in a 50-connection fan-out model server CPU went from 24.3
+  to 11.0 s for the same window. Connections keep their own batch
+  buffers, GSO grouping and counters; a connection whose sender has
+  died sends directly from then on, and the listener starts a new one
+  for new connections.
+
+### Fixed
+- Pacing no longer freezes on sub-millisecond links. RTT samples are
+  whole milliseconds, so such a link reports a smoothed RTT of 0 and
+  `update_pacing_rate` treated that as "no RTT yet" and skipped the
+  update: the rate stayed at its handshake-time value while cwnd kept
+  growing, clocking the connection at that stale rate forever. The RTT
+  is floored at 1 ms for the rate computation instead.
+- Burst continuations are sent to the connection directly rather than
+  through `erlang:send_after(0, ...)`. The timer wheel's ~1 ms service
+  tick turned every 64-packet burst continuation into a 64 packets per
+  millisecond clock, capping bulk streams at roughly 85 MB/s regardless
+  of the paced rate. Together with the previous fix, a verified
+  single-stream loopback bulk transfer went from 83 to 194 MiB/s.
+- The frames a connection sends on entering `connected` (data queued
+  before the handshake finished, the server's NEW_TOKEN, the first PMTU
+  probe) leave with that transition. They went through the send batch
+  and the state-enter handler returned without flushing it, so they
+  waited for the next event on the connection: on a quiet connection the
+  peer's delayed ACK or a PTO. `get_stats` now reports
+  `send_batch_pending`, the packets built but not yet handed to the
+  socket, which is what caught this.
+
+### Changed
+- The interop runner declares the passive robustness cases (longrtt,
+  blackhole, amplificationlimit, handshakeloss, transferloss,
+  handshakecorruption, transfercorruption, rebind-port, rebind-addr),
+  runs the multiconnect case as one connection per file so the runner's
+  handshake count matches, disables `disconnect_timeout` in both
+  endpoints so the blackhole case can outlast its outage, waits 60 s per
+  download, and the server loads the full certificate chain from
+  cert.pem.
+- Count-based ACK decimation defers its flush while a receive pass is
+  active, so one ACK covers the whole drained train instead of one per
+  `ack_packet_tolerance` packets. A 64-packet pass previously emitted
+  about 32 ACKs, each costing a packet build, an AEAD seal and a send
+  on the receiver and a decrypt plus ACK-frame pass on the sender; it
+  also released the sender's window in 2-3 packet quanta, which kept
+  GSO batches near size 1. The max_ack_delay timer still bounds ACK
+  latency for below-tolerance remainders and the reordering
+  immediate-ACK path is unchanged.
+- The out-of-order reassembly buffers (stream data and CRYPTO) are
+  ordered trees instead of maps. A miss at the delivery point, which
+  happens once per received packet while a hole is outstanding, is now
+  answered with one smallest-key lookup, and the trim walk for
+  repacketized overlaps visits only chunks below the delivery point.
+  The map version rebuilt the whole buffer on every miss; with a
+  multi-megabyte hole under loss recovery that walk dominated receiver
+  CPU.
+- The per-packet receive bookkeeping on the 1-RTT path (PN space, spin
+  bit, activity stamp) is one state update instead of three; the three
+  separate helpers each rebuilt the full connection state and together
+  cost about a tenth of receive CPU on bulk flows.
+- Receive-side fast paths for the dominant bulk shape: an in-order
+  stream frame on an existing stream with an empty reassembly buffer
+  and both flow-control windows comfortably open is one stream-record
+  update and one map put, falling back to the general path for every
+  other shape; a sequential packet number extends the head ACK range
+  without the range-cap scan; a packet led by a stream frame skips the
+  datagram-only delayed-ACK check. The per-frame `max_stream_data_check`
+  debug log is gone, it cost a logger allow-check per frame.
+- The connected-state receive pass drains the datagram messages already
+  queued in the connection's mailbox (up to 64) before flushing ACKs,
+  socket batches and timers, so those flushes amortize over a train
+  instead of running once per datagram. On the socket backend the
+  listener and the client receiver now emulate a bounded kernel receive
+  buffer: trains are forwarded in chunks of at most 8 packets and
+  tail-dropped once the connection's mailbox exceeds its bound (see
+  the send-side entry), keeping the head packet so the peer still
+  gets a timely ACK. An unbounded mailbox turned receiver overload into queueing
+  delay instead of loss, which inflated the peer's RTT samples and
+  destabilized its loss detector.
+- With the crypto NIF loaded, a bulk chunk run is sealed in one call:
+  `protect_run` builds each short header, derives the nonce, AEAD-seals
+  the payload and applies header protection for the whole run in C,
+  instead of two crypto NIF calls plus header, nonce and mask glue per
+  packet. AES only (the header-protection context is ECB); ChaCha and
+  NIF-less builds seal per packet as before. Send-side crypto drops
+  from about 9% of connection CPU to about 2% on bulk flows. The output
+  is checked byte for byte against the per-packet path.
+- With the crypto NIF loaded, a received 1-RTT packet is opened in one
+  call: `open_packet` does header unprotection, packet-number
+  reconstruction (RFC 9000 Appendix A) and AEAD open together, replacing
+  two crypto NIF calls plus mask, packet-number and AAD glue per
+  packet. It runs only while no key update is in flight and checks the
+  key-phase bit before decrypting, handing a phase change to the
+  two-stage path so RFC 9001 §6 bookkeeping stays where it was. ChaCha
+  and NIF-less builds are unchanged.
+- A train of short-header datagrams (a GRO train at the server, the
+  drained mailbox at the client) is opened in one NIF call: `open_run`
+  carries the largest received packet number forward across the run in
+  C, matching sequential `open_packet` calls exactly, and stops at the
+  first packet that needs the generic path (key-phase transition,
+  authentication failure, undersized datagram), which the caller then
+  handles per packet. The client drain now collects queued same-source
+  datagrams into one batch before processing.
+- After the batched decrypt, `open_run` also parses each packet's
+  frames in C and returns a frame list term-identical to what
+  `quic_frame:decode/1` produces (PING, ACK with ECN, CRYPTO, STREAM,
+  MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS, HANDSHAKE_DONE, with stream
+  and crypto payloads as zero-copy sub-binaries). A packet with any
+  other frame type comes back raw and goes through the Erlang decoder,
+  which keeps every error semantic (unknown type, truncation, empty
+  packet). The parser is differential-tested against the decoder and
+  fuzzed with random and mutated frame sequences. In a 50-connection
+  server model this cut steady-state reductions by 8%; on a verified
+  bulk transfer, 190 to 222 MiB/s.
+- A batch-opened run whose packets continue the receive sequence is
+  folded with one receive-bookkeeping update (largest, ACK range, spin
+  bit, activity) and one ACK-decimation increment instead of one of
+  each per packet; and when such a run carries one stream frame per
+  packet, all for the same stream, offsets contiguous, no FIN, the
+  stream bookkeeping runs once for the train: one flow-control check
+  with the train's totals, one stream-record update, one delivery.
+  Every deviation (mixed frames, gaps, duplicates, FIN, tight windows,
+  qlog enabled) takes the per-packet path unchanged and the delivery
+  contract holds in both modes. Verified bulk with delivery coalescing
+  on: 339 to 405 MiB/s (+19%).
+
 ## [1.8.2] - 2026-09-05
 
 ### Added

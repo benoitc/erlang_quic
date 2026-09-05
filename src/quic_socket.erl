@@ -44,6 +44,7 @@
     open_adapter/1,
     wrap/2,
     new_sender/2,
+    start_shared_sender/1,
     close/1,
     send/4,
     send_immediate/4,
@@ -57,12 +58,17 @@
     get_socket/1,
     gso_supported/1,
     info/1,
-    start_client_receiver/2,
+    recv_queue_max/1,
+    start_client_receiver/3,
     stop_client_receiver/1,
-    set_socket/2
+    set_socket/2,
+    client_recv_drops/0
 ]).
 
 -include("quic.hrl").
+
+%% Idle tick of the shared sender loop; also keeps its receive bounded.
+-define(SHARED_SENDER_IDLE_MS, 30000).
 -include_lib("kernel/include/logger.hrl").
 
 %% GSO/GRO socket option constants for Linux
@@ -116,7 +122,19 @@
     batch_flushes = 0 :: non_neg_integer(),
     packets_coalesced = 0 :: non_neg_integer(),
     %% Batches the kernel segmented, as opposed to sent packet by packet.
-    gso_flushes = 0 :: non_neg_integer()
+    gso_flushes = 0 :: non_neg_integer(),
+    %% Shared sender process: when set, flush/1 hands the batch to this
+    %% process instead of calling sendmsg from the connection process.
+    %% Concurrent sendmsg on one socket handle burns ~20x the CPU in
+    %% NIF-level contention (measured 98.6 vs 4.7 us per send with 50
+    %% concurrent senders), so server connections serialize the actual
+    %% syscalls through the listener's sender while keeping their own
+    %% batch buffers and GSO grouping.
+    sender_pid = undefined :: undefined | pid(),
+    %% GSO flushes performed by the shared sender on behalf of every
+    %% connection of the listener, so a connection's gso_flushes stays
+    %% meaningful (listener-wide) once the syscall has moved out of it.
+    gso_counter = undefined :: undefined | atomics:atomics_ref()
 }).
 
 %% Packet can be:
@@ -135,8 +153,12 @@
 -export([
     extract_gro_segment_size/1,
     split_gro_packets/2,
-    split_uniform_runs/1
+    split_uniform_runs/1,
+    forward_to_owner/6,
+    test_socket/1
 ]).
+
+test_socket(#socket_state{socket = S}) -> S.
 -endif.
 
 %%====================================================================
@@ -336,6 +358,7 @@ gso_supported(#socket_state{gso_supported = Supported}) ->
         gro_enabled := boolean(),
         batching_enabled := boolean(),
         max_batch_packets := pos_integer(),
+        batch_pending := non_neg_integer(),
         batch_flushes := non_neg_integer(),
         packets_coalesced := non_neg_integer(),
         gso_flushes := non_neg_integer()
@@ -349,10 +372,21 @@ info(#socket_state{
     max_batch_packets = MaxBatch,
     batch_flushes = Flushes,
     packets_coalesced = Coalesced,
-    gso_flushes = GSOFlushes
+    gso_flushes = OwnGSOFlushes,
+    batch_count = Pending,
+    sender_pid = Sender,
+    gso_counter = Counter
 }) ->
+    %% With a shared sender the segmented flushes happen there; report
+    %% the listener-wide count in that case.
+    GSOFlushes =
+        case {Sender, Counter} of
+            {P, C} when is_pid(P), C =/= undefined -> atomics:get(C, 1);
+            _ -> OwnGSOFlushes
+        end,
     #{
         backend => Backend,
+        batch_pending => Pending,
         gso_supported => GSO,
         gso_size => GSOSize,
         gro_enabled => GRO,
@@ -447,9 +481,67 @@ new_sender(Socket, Opts) ->
         gso_supported = GSOSupported andalso (Backend =:= socket),
         gro_enabled = false,
         batching_enabled = BatchingEnabled,
-        max_batch_packets = MaxBatch
+        max_batch_packets = MaxBatch,
+        sender_pid = maps:get(sender_pid, Opts, undefined),
+        gso_counter = maps:get(gso_counter, Opts, undefined)
     },
     {ok, State}.
+
+%% @doc Spawn the shared sender for a listener socket: a process that
+%% performs the actual sendmsg calls for every server connection's
+%% batches, serially. GSO state (including the partial-send disable)
+%% lives in the sender's own socket_state copy. Linked to the caller.
+%% Returns the sender and the counter connections read gso_flushes
+%% from; both go into new_sender/2 options (`sender_pid`,
+%% `gso_counter`).
+-spec start_shared_sender(socket_state()) -> {pid(), atomics:atomics_ref()}.
+start_shared_sender(#socket_state{} = SS) ->
+    Counter = atomics:new(1, []),
+    Template = SS#socket_state{
+        sender_pid = undefined,
+        gso_counter = Counter,
+        owns_socket = false,
+        batch_buffer = [],
+        batch_count = 0,
+        batch_addr = undefined
+    },
+    {spawn_link(fun() -> shared_sender_loop(Template) end), Counter}.
+
+shared_sender_loop(SS) ->
+    receive
+        {send_batch, Addr, Buffer, Count} ->
+            Loaded = SS#socket_state{
+                batch_buffer = Buffer,
+                batch_count = Count,
+                batch_addr = Addr
+            },
+            SS2 =
+                case flush(Loaded) of
+                    {ok, S} ->
+                        S;
+                    {error, Reason, S} ->
+                        ?LOG_WARNING(#{what => shared_sender_flush_failed, reason => Reason}),
+                        S
+                end,
+            %% Carry forward only the socket-global bits (a partial GSO
+            %% send disables GSO for the socket).
+            shared_sender_loop(SS#socket_state{
+                gso_supported = SS2#socket_state.gso_supported,
+                gso_size = SS2#socket_state.gso_size
+            });
+        stop ->
+            ok
+    after ?SHARED_SENDER_IDLE_MS ->
+        %% Nothing to send for a while: shed the heap the batches left.
+        erlang:garbage_collect(),
+        shared_sender_loop(SS)
+    end.
+
+bump_batch_counters(#socket_state{} = State, Count) ->
+    State#socket_state{
+        batch_flushes = State#socket_state.batch_flushes + 1,
+        packets_coalesced = State#socket_state.packets_coalesced + Count
+    }.
 
 %% @doc Close the socket and flush any pending packets.
 %% Only closes the socket if owns_socket is true (i.e., socket was created by us).
@@ -527,6 +619,25 @@ flush(#socket_state{batch_count = Count, batch_addr = undefined} = State) ->
     %% No address set but have data - shouldn't happen, but clear buffer
     ?LOG_WARNING(#{what => flush_no_addr, buffer_size => Count}),
     {ok, clear_batch(State)};
+flush(
+    #socket_state{
+        sender_pid = Sender,
+        batch_count = Count,
+        batch_addr = Addr,
+        batch_buffer = Buffer
+    } = State
+) when is_pid(Sender) ->
+    %% Hand the whole batch to the shared sender (see the sender_pid
+    %% field). Fire-and-forget: send errors are logged by the sender
+    %% and covered by loss recovery, the same contract as the direct
+    %% path. A dead sender means a direct path from here on.
+    case is_process_alive(Sender) of
+        true ->
+            Sender ! {send_batch, Addr, Buffer, Count},
+            {ok, bump_batch_counters(clear_batch(State), Count)};
+        false ->
+            flush(State#socket_state{sender_pid = undefined})
+    end;
 flush(#socket_state{gso_supported = true, batch_count = 1} = State) ->
     %% Single-packet batch has no segmentation work; direct send.
     flush_individual(State);
@@ -649,18 +760,29 @@ get_fd(#socket_state{backend = adapter}) ->
 %%
 %% Returns the receiver pid, linked to the caller so it terminates
 %% when the connection process exits.
--spec start_client_receiver(socket_state(), pid()) -> {ok, pid()} | {error, term()}.
-start_client_receiver(#socket_state{backend = socket} = SocketState, Owner) when is_pid(Owner) ->
-    Pid = spawn_link(fun() -> client_recv_loop(SocketState, Owner) end),
+%% QueueMax is the owner's mailbox bound, see recv_queue_max/1.
+-spec start_client_receiver(socket_state(), pid(), pos_integer()) ->
+    {ok, pid()} | {error, term()}.
+start_client_receiver(#socket_state{backend = socket} = SocketState, Owner, QueueMax) when
+    is_pid(Owner)
+->
+    Pid = spawn_link(fun() -> client_recv_loop(SocketState, Owner, QueueMax) end),
     {ok, Pid};
-start_client_receiver(#socket_state{backend = gen_udp}, _Owner) ->
+start_client_receiver(#socket_state{backend = gen_udp}, _Owner, _QueueMax) ->
     {error, not_supported_on_gen_udp};
-start_client_receiver(#socket_state{backend = adapter}, _Owner) ->
+start_client_receiver(#socket_state{backend = adapter}, _Owner, _QueueMax) ->
     %% Adapter callers deliver `{udp, ...}' messages themselves.
     {error, not_supported_on_adapter}.
 
+%% Mailbox bound for a receiver that advertised MaxData bytes of
+%% connection flow-control window: the window in full-size packets,
+%% never below ?MAX_CONN_RECV_QUEUE_MSGS.
+-spec recv_queue_max(non_neg_integer()) -> pos_integer().
+recv_queue_max(MaxData) ->
+    max(?MAX_CONN_RECV_QUEUE_MSGS, MaxData div ?RECV_QUEUE_PACKET_BYTES).
+
 %% @doc Stop a client receiver process previously returned by
-%% `start_client_receiver/2'. Safe to call with `undefined'.
+%% `start_client_receiver/3'. Safe to call with `undefined'.
 -spec stop_client_receiver(pid() | undefined) -> ok.
 stop_client_receiver(undefined) ->
     ok;
@@ -680,7 +802,7 @@ stop_client_receiver(Pid) when is_pid(Pid) ->
 %% socket handle stored in `#state.socket'. Uses a 100ms timeout so
 %% exit signals from the linked owner are processed promptly rather
 %% than blocking forever in the NIF.
-client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
+client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner, QueueMax) ->
     %% recv_gro splits GRO-coalesced trains and sizes the read buffer
     %% for a maximal train; a plain recvfrom with the default 8 KiB
     %% buffer would silently truncate coalesced input. A multi-packet
@@ -688,19 +810,49 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
     %% trains, not packets, and the whole train is processed in one
     %% receive pass.
     case recv_gro(Socket, 100) of
-        {ok, {IP, Port}, [Single]} ->
-            Owner ! {udp, Socket, IP, Port, Single},
-            client_recv_loop(SocketState, Owner);
         {ok, {IP, Port}, Packets} ->
-            Owner ! {udp_batch, Socket, IP, Port, Packets},
-            client_recv_loop(SocketState, Owner);
+            forward_to_owner(Owner, Socket, IP, Port, Packets, QueueMax),
+            client_recv_loop(SocketState, Owner, QueueMax);
         {error, timeout} ->
-            client_recv_loop(SocketState, Owner);
+            client_recv_loop(SocketState, Owner, QueueMax);
         {error, closed} ->
             ok;
         {error, Reason} ->
             ?LOG_WARNING(#{what => client_recv_loop_exit, reason => Reason}),
             ok
+    end.
+
+%% Bench diagnostic: client-receiver tail-drop counter.
+%% Tail-drop over QueueMax, see recv_queue_max/1.
+forward_to_owner(Owner, Socket, IP, Port, Packets, QueueMax) ->
+    case erlang:process_info(Owner, message_queue_len) of
+        {message_queue_len, QLen} when QLen > QueueMax ->
+            count_client_recv_drop(length(Packets));
+        _ ->
+            case Packets of
+                [Single] -> Owner ! {udp, Socket, IP, Port, Single};
+                _ -> Owner ! {udp_batch, Socket, IP, Port, Packets}
+            end,
+            ok
+    end.
+
+count_client_recv_drop(N) ->
+    Ref =
+        case persistent_term:get({?MODULE, recv_drops}, undefined) of
+            undefined ->
+                R = atomics:new(1, []),
+                persistent_term:put({?MODULE, recv_drops}, R),
+                R;
+            R ->
+                R
+        end,
+    atomics:add(Ref, 1, N).
+
+-spec client_recv_drops() -> non_neg_integer().
+client_recv_drops() ->
+    case persistent_term:get({?MODULE, recv_drops}, undefined) of
+        undefined -> 0;
+        Ref -> atomics:get(Ref, 1)
     end.
 
 %% @doc Detect platform capabilities for GSO/GRO. Context-free wrapper that
@@ -1252,6 +1404,10 @@ record_run_flush(State, Runs) ->
         [] ->
             State1;
         [Size | _] = Sizes ->
+            case State#socket_state.gso_counter of
+                undefined -> ok;
+                Counter -> atomics:add(Counter, 1, length(Sizes))
+            end,
             State1#socket_state{
                 gso_flushes = State#socket_state.gso_flushes + length(Sizes),
                 gso_size = Size

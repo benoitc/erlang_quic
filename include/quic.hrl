@@ -409,6 +409,25 @@
 -define(DEFAULT_MAX_BATCH_PACKETS, 64).
 %% Default GSO segment size (QUIC packet size for batching)
 -define(DEFAULT_GSO_SEGMENT_SIZE, 1200).
+
+%% Floor on the messages a connection process mailbox may hold before
+%% the socket-backend receive path tail-drops incoming datagrams. The
+%% working bound is quic_socket:recv_queue_max/1: the connection's
+%% flow-control window in full-size packets, so a peer inside the
+%% window it was given is never dropped and the bound only catches one
+%% outside it. A bound below the window turned flow-control-permitted
+%% data into loss.
+-define(MAX_CONN_RECV_QUEUE_MSGS, 512).
+%% Nominal packet size used to turn a byte window into that bound.
+-define(RECV_QUEUE_PACKET_BYTES, 1200).
+
+%% Max packets per {quic_packets, ...} message forwarded to a
+%% connection. GRO can aggregate trains of ~44 packets; forwarded
+%% whole, the mailbox bound above cannot cap queueing DELAY (a message
+%% may be 1 or 44 packets). Splitting trains keeps the worst-case
+%% queued backlog, and thus the RTT inflation seen by the peer's loss
+%% detector, small and predictable.
+-define(MAX_PACKETS_PER_CONN_MSG, 8).
 %% Kernel limits on a single UDP_SEGMENT write: UDP_MAX_SEGMENTS segments,
 %% and a payload that still fits a 16-bit UDP length. A run larger than
 %% either is split across writes.
@@ -574,8 +593,11 @@
     recv_offset :: non_neg_integer(),
     recv_max_data :: non_neg_integer(),
     recv_fin :: boolean(),
-    %% #{Offset => Data} for out-of-order reassembly
-    recv_buffer :: map(),
+    %% Offset => Data, ordered, for out-of-order reassembly. Ordering
+    %% keeps the per-packet gap check O(log n) and lets the trim walk
+    %% stop at the delivered point instead of visiting every buffered
+    %% chunk, which matters once loss recovery has megabytes buffered.
+    recv_buffer :: gb_trees:tree(non_neg_integer(), binary()),
     %% Our recv side is terminal: FIN read (buffer empty) or peer RESET_STREAM.
     recv_done = false :: boolean(),
 
