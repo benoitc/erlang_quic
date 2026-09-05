@@ -1,41 +1,20 @@
-# Builds the optional AEAD-context NIF. Links against the SAME
-# libcrypto that OTP's own crypto NIF uses (resolved via ldd), so
-# loading this NIF never pins an incompatible OpenSSL into the VM
-# before crypto.so loads. Falls back to plain -lcrypto when the
-# lookup fails.
+# Shim so erlang.mk, which runs c_src/Makefile unconditionally when it
+# exists, builds the NIF the same way rebar3 does. The real build is
+# CMakeLists.txt in this directory.
 #
-# Best effort by design: the NIF is a pure accelerator with a
-# pure-Erlang fallback, so a missing toolchain or missing OpenSSL
-# headers must not fail the build of a project that embeds this
-# library (erlang.mk runs this Makefile unconditionally when it
-# exists). A failed compile prints a warning and succeeds.
+# POSIX make only (no GNU extensions): FreeBSD and NetBSD run this with
+# bmake. Best effort, like every other entry point to this build: the
+# NIF is an accelerator with a pure-Erlang fallback, so a missing CMake
+# or toolchain prints a note and succeeds.
 
-ERTS_INCLUDE := $(shell erl -noshell -eval 'io:format("~ts/erts-~ts/include", [code:root_dir(), erlang:system_info(version)]), halt().')
-CRYPTO_SO := $(shell erl -noshell -eval 'io:format("~ts", [filename:join([code:lib_dir(crypto), "priv", "lib", "crypto.so"])]), halt().')
-OPENSSL_LIB := $(shell ldd "$(CRYPTO_SO)" 2>/dev/null | awk '/libcrypto/ && $$3 != "" {print $$3}')
-OPENSSL_LIBDIR := $(dir $(OPENSSL_LIB))
+BUILD = build
 
-CFLAGS ?= -O2 -Wall -Wextra
-LDLIBS := -lcrypto
-PRIV := ../priv
-
-ifneq ($(strip $(OPENSSL_LIBDIR)),)
-LDFLAGS += -L$(OPENSSL_LIBDIR) -Wl,-rpath,$(OPENSSL_LIBDIR)
-CFLAGS += -I$(OPENSSL_LIBDIR)../include
-endif
-
-all: $(PRIV)/quic_crypto_nif.so
-
-$(PRIV)/quic_crypto_nif.so: quic_crypto_nif.c
-	@mkdir -p $(PRIV)
-	@if $(CC) $(CFLAGS) -fPIC -shared -o $@ $< -I"$(ERTS_INCLUDE)" $(LDFLAGS) $(LDLIBS); then \
-	    echo "quic_crypto_nif: built $@"; \
-	else \
-	    echo "quic_crypto_nif: build failed (missing toolchain or OpenSSL headers?);" \
-	         "the pure-Erlang crypto path will be used" >&2; \
-	fi
+all:
+	@cmake -S . -B $(BUILD) >/dev/null 2>&1 && cmake --build $(BUILD) >/dev/null 2>&1 \
+	  && echo "quic_crypto_nif: built ../priv/quic_crypto_nif.so" \
+	  || echo "quic_crypto_nif: build skipped (no cmake, toolchain or OpenSSL headers?); using the pure-Erlang crypto path"
 
 clean:
-	rm -f $(PRIV)/quic_crypto_nif.so
+	@rm -rf $(BUILD) ../priv/quic_crypto_nif.so
 
 .PHONY: all clean
