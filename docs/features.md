@@ -277,6 +277,13 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `recbuf` - UDP receive buffer size in bytes (default: 7MB)
 - `sndbuf` - UDP send buffer size in bytes (default: 7MB)
 - `server_send_batching` - Per-connection send batching on the server (default: true). On Linux + `socket_backend => socket` with UDP_SEGMENT, outgoing packets are coalesced into GSO super-datagrams via `sendmsg` cmsg; neutral on macOS / gen_udp. Set to `false` to fall back to direct `gen_udp:send/4`
+- `hibernate_after` - Hibernate an idle connection process after this many milliseconds, running a fullsweep so handshake garbage is not pinned to a heap that never collects (default: 5000; `infinity` opts out)
+- `versions` - QUIC versions this connection also accepts, for RFC 9368 compatible version negotiation (default: the negotiated `version` alone)
+- `ciphers` - TLS 1.3 cipher suites to offer, in preference order (default: `[aes_128_gcm, aes_256_gcm, chacha20_poly1305]`)
+- `max_burst_packets` - Packets allowed to leave per send drain, so a large queued write cannot monopolise the scheduler (default: 64)
+- `ack_packet_tolerance` - Ack-eliciting packets received before a 1-RTT ACK is sent, the RFC 9000 section 13.2.1 decimation threshold (default: 2)
+- `disconnect_timeout` - Milliseconds without a response from the peer before the connection is given up on, checked on its own timer (default: 16000)
+- `pmtu_raise_interval` - Milliseconds between PMTU raise probes (default: 600000)
 
 ### PMTU Discovery
 - `quic:get_mtu/1` - Get current effective MTU for a connection
