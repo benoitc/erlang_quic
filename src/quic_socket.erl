@@ -41,7 +41,6 @@
     sender_down/2,
     open/2,
     open_for_send/2,
-    open_server_send/2,
     open_adapter/1,
     wrap/2,
     new_sender/2,
@@ -239,95 +238,6 @@ open_for_send(RemoteIP, Opts) ->
                 batching_enabled => BatchingEnabled,
                 max_batch => MaxBatch
             })
-    end.
-
-%% @doc Open a server send socket bound to a local address with reuseport.
-%% Uses OTP socket backend with GSO support on Linux for high throughput.
-%% This is for server connections that need to send from a specific local port.
--spec open_server_send({inet:ip_address(), inet:port_number()}, map()) ->
-    {ok, socket_state()} | {error, term()}.
-open_server_send({LocalIP, LocalPort}, Opts) ->
-    Family = family(LocalIP),
-    Capabilities = detect_capabilities(Family),
-    Backend = maps:get(backend, Capabilities, gen_udp),
-    GSOSupported = maps:get(gso, Capabilities, false),
-
-    BatchOpts = maps:get(batching, Opts, #{}),
-    BatchingEnabled = maps:get(enabled, BatchOpts, true),
-    MaxBatch = maps:get(max_packets, BatchOpts, ?DEFAULT_MAX_BATCH_PACKETS),
-
-    BatchConfig = #{
-        gso_supported => GSOSupported,
-        batching_enabled => BatchingEnabled,
-        max_batch => MaxBatch
-    },
-
-    case Backend of
-        socket ->
-            open_server_send_socket(LocalIP, LocalPort, Family, Opts, BatchConfig);
-        gen_udp ->
-            open_server_send_genudp(LocalIP, LocalPort, Opts, BatchConfig)
-    end.
-
-%% Open OTP socket for server send with reuseport binding
-open_server_send_socket(LocalIP, LocalPort, Family, Opts, BatchConfig) ->
-    case socket:open(Family, dgram, udp) of
-        {ok, Socket} ->
-            configure_server_send_socket(Socket, LocalIP, LocalPort, Family, Opts, BatchConfig);
-        {error, _} = Error ->
-            Error
-    end.
-
-configure_server_send_socket(Socket, LocalIP, LocalPort, Family, Opts, BatchConfig) ->
-    %% Set reuseaddr for binding to same port as listener.
-    %% NOTE: Do NOT use reuseport here! With reuseport, the kernel distributes
-    %% incoming packets between all sockets bound to the port. Since this socket
-    %% is only for sending (nobody reads from it), any packets directed here would
-    %% be dropped, causing the listener to miss incoming data.
-    ok = socket:setopt(Socket, {socket, reuseaddr}, true),
-    set_socket_buffer_sizes(Socket, Opts),
-
-    %% Bind to local address
-    SockAddr = #{family => Family, addr => LocalIP, port => LocalPort},
-    case socket:bind(Socket, SockAddr) of
-        ok ->
-            GSOEnabled = maybe_enable_gso(BatchConfig),
-            State = #socket_state{
-                socket = Socket,
-                backend = socket,
-                owns_socket = true,
-                gso_supported = GSOEnabled,
-                gro_enabled = false,
-                batching_enabled = maps:get(batching_enabled, BatchConfig),
-                max_batch_packets = maps:get(max_batch, BatchConfig)
-            },
-            {ok, State};
-        {error, _} = Error ->
-            socket:close(Socket),
-            Error
-    end.
-
-%% Fallback to gen_udp for server send (non-Linux platforms)
-%% NOTE: Do NOT use reuseport here! With reuseport, the kernel distributes
-%% incoming packets between all sockets bound to the port. Since this socket
-%% is only for sending, any packets directed here would be dropped.
-open_server_send_genudp(LocalIP, LocalPort, Opts, BatchConfig) ->
-    RecBuf = maps:get(recbuf, Opts, ?DEFAULT_UDP_RECBUF),
-    SndBuf = maps:get(sndbuf, Opts, ?DEFAULT_UDP_SNDBUF),
-    SocketOpts =
-        [
-            binary,
-            {ip, LocalIP},
-            {active, false},
-            {reuseaddr, true},
-            {recbuf, RecBuf},
-            {sndbuf, SndBuf}
-        ],
-    case gen_udp:open(LocalPort, SocketOpts) of
-        {ok, Socket} ->
-            {ok, build_genudp_state(Socket, BatchConfig)};
-        {error, _} = Error ->
-            Error
     end.
 
 %% @doc Get the underlying socket from a socket_state.
@@ -944,14 +854,6 @@ build_socket_state(Socket, BatchConfig) ->
         max_batch_packets = maps:get(max_batch, BatchConfig)
     },
     {ok, State}.
-
-%% Retained for open_server_send's separate-socket path, which still
-%% uses a dedicated socket where a socket-level UDP_SEGMENT is safe
-%% (it is a send-only socket, never used for short handshake packets).
-maybe_enable_gso(#{gso_supported := true}) ->
-    true;
-maybe_enable_gso(_) ->
-    false.
 
 maybe_enable_gro(Socket, #{gro_supported := true}) ->
     %% Try to enable GRO
