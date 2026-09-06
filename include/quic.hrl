@@ -598,6 +598,9 @@
     %% stop at the delivered point instead of visiting every buffered
     %% chunk, which matters once loss recovery has megabytes buffered.
     recv_buffer :: gb_trees:tree(non_neg_integer(), binary()),
+    %% Bytes held in recv_buffer, a running count so per-packet
+    %% accounting never walks the tree.
+    recv_buffered = 0 :: non_neg_integer(),
     %% Our recv side is terminal: FIN read (buffer empty) or peer RESET_STREAM.
     recv_done = false :: boolean(),
 
