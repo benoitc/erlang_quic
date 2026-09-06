@@ -139,6 +139,11 @@
 %% Test exports
 -ifdef(TEST).
 -export([
+    test_state_with_loss/1,
+    test_state_get/2,
+    test_state_set/3,
+    set_pto_timer/1,
+    pto_due/1,
     chunk_crypto/3,
     add_to_ack_ranges/2,
     cap_ack_ranges/1,
@@ -223,7 +228,6 @@
     test_maybe_send_ack_app/2,
     test_classify_recv_trigger/2,
     %% Per-space ACK isolation (RFC 9000 Section 12.3)
-    test_state_with_loss/1,
     test_loss_state/1
 ]).
 -endif.
@@ -583,6 +587,10 @@
     %% cycle when the new deadline is within ?PTO_RESET_TOLERANCE_MS of
     %% the existing one.
     pto_scheduled_at = undefined :: integer() | undefined,
+    %% Deadline the armed pto_timer will fire at. The timer is never
+    %% cancelled when the deadline moves later; the fire handler re-arms
+    %% for the remainder instead (see set_pto_timer/1).
+    pto_armed_at = undefined :: integer() | undefined,
     idle_timer :: reference() | undefined,
 
     %% Keep-alive (RFC 9000 - PING frames for liveness)
@@ -2654,13 +2662,20 @@ handle_common_event(info, {hs_flight_timeout, _Ref}, _StateName, State) ->
 handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref} = State) when
     Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
 ->
-    case disconnect_timeout_expired(State) of
-        true ->
-            {next_state, draining, declare_peer_dead(State#state{pto_timer = undefined})};
-        false ->
-            %% Handle PTO timeout - send probe packet
-            NewState = handle_pto_timeout(State#state{pto_timer = undefined}),
-            {keep_state, NewState}
+    case pto_due(State) of
+        idle ->
+            {keep_state, State#state{pto_timer = undefined, pto_armed_at = undefined}};
+        {later, Remaining} ->
+            {keep_state, arm_pto_timer(Remaining, State)};
+        due ->
+            State1 = State#state{pto_timer = undefined, pto_armed_at = undefined},
+            case disconnect_timeout_expired(State1) of
+                true ->
+                    {next_state, draining, declare_peer_dead(State1)};
+                false ->
+                    %% Handle PTO timeout - send probe packet
+                    {keep_state, handle_pto_timeout(State1)}
+            end
     end;
 handle_common_event(
     info, {disconnect_check, Ref}, StateName, #state{disconnect_timer = Ref} = State
@@ -2770,6 +2785,17 @@ handle_common_event(
     #state{owner_mon = Mon} = State
 ) ->
     {stop, {shutdown, owner_down}, State};
+%% The listener's shared sender went away: flush direct from now on.
+handle_common_event(
+    info,
+    {'DOWN', Mon, process, _Pid, _Reason},
+    _StateName,
+    #state{socket_state = SS} = State
+) ->
+    case quic_socket:sender_down(SS, Mon) of
+        {ok, SS1} -> {keep_state, State#state{socket_state = SS1}};
+        false -> {keep_state, State}
+    end;
 handle_common_event(
     info,
     {server_hs_rtx, Ref},
@@ -11428,11 +11454,17 @@ send_keep_alive_ping(State) ->
 %% and the new deadline is within ?PTO_RESET_TOLERANCE_MS of the existing
 %% one; this eliminates most per-ACK timer churn in steady-state bulk
 %% transfers where bytes_in_flight and smoothed RTT are stable.
+%% Lazy re-arm: a send or ACK moves the deadline later, and the armed
+%% timer is left alone; when it fires early the handler re-arms for the
+%% remainder. Only a deadline that moved earlier by more than the
+%% tolerance costs a cancel. Bulk transfers touched the PTO on every
+%% packet, and cancel_timer + send_after per packet was a measurable
+%% share of the server receive path on small hosts.
 set_pto_timer(
     #state{
         loss_state = LossState,
         pto_timer = OldTimer,
-        pto_scheduled_at = OldDeadline
+        pto_armed_at = ArmedAt
     } = State
 ) ->
     case quic_loss:bytes_in_flight(LossState) > 0 of
@@ -11440,22 +11472,31 @@ set_pto_timer(
             PTO = quic_loss:get_pto(LossState),
             Now = erlang:monotonic_time(millisecond),
             NewDeadline = Now + PTO,
-            Stable =
-                (OldTimer =/= undefined) andalso
-                    (OldDeadline =/= undefined) andalso
-                    (abs(NewDeadline - OldDeadline) < ?PTO_RESET_TOLERANCE_MS),
-            case Stable of
+            case OldTimer =/= undefined andalso NewDeadline + ?PTO_RESET_TOLERANCE_MS >= ArmedAt of
                 true ->
-                    State;
+                    State#state{pto_scheduled_at = NewDeadline};
                 false ->
                     cancel_timer(OldTimer),
-                    Ref = make_ref(),
-                    erlang:send_after(PTO, self(), {pto_timeout, Ref}),
-                    State#state{pto_timer = Ref, pto_scheduled_at = NewDeadline}
+                    arm_pto_timer(PTO, State#state{pto_scheduled_at = NewDeadline})
             end;
         false ->
-            cancel_timer(OldTimer),
-            State#state{pto_timer = undefined, pto_scheduled_at = undefined}
+            State#state{pto_scheduled_at = undefined}
+    end.
+
+arm_pto_timer(Delay, State) ->
+    Ref = make_ref(),
+    erlang:send_after(Delay, self(), {pto_timeout, Ref}),
+    State#state{pto_timer = Ref, pto_armed_at = erlang:monotonic_time(millisecond) + Delay}.
+
+%% What a firing PTO timer should do: nothing (flight drained since it
+%% was armed), wait the remainder (deadline moved later), or probe.
+pto_due(#state{pto_scheduled_at = undefined}) ->
+    idle;
+pto_due(#state{pto_scheduled_at = Deadline}) ->
+    Now = erlang:monotonic_time(millisecond),
+    case Deadline - Now > ?PTO_RESET_TOLERANCE_MS of
+        true -> {later, Deadline - Now};
+        false -> due
     end.
 
 %% Helper to cancel a timer reference
@@ -13810,6 +13851,12 @@ test_state_with_socket(State, Socket) -> State#state{socket = Socket}.
 
 %% Minimal #state{} carrying a caller-supplied loss tracker, for tests
 %% that need to observe what an incoming frame does to it.
+test_state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
+test_state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at.
+
+test_state_set(#state{} = S, loss_state, V) -> S#state{loss_state = V};
+test_state_set(#state{} = S, pto_scheduled_at, V) -> S#state{pto_scheduled_at = V}.
+
 -spec test_state_with_loss(quic_loss:loss_state()) -> #state{}.
 test_state_with_loss(LossState) ->
     #state{

@@ -38,6 +38,7 @@
 -module(quic_socket).
 
 -export([
+    sender_down/2,
     open/2,
     open_for_send/2,
     open_server_send/2,
@@ -131,6 +132,8 @@
     %% syscalls through the listener's sender while keeping their own
     %% batch buffers and GSO grouping.
     sender_pid = undefined :: undefined | pid(),
+    %% Monitor on sender_pid, owned by the process that built this state.
+    sender_mon = undefined :: undefined | reference(),
     %% GSO flushes performed by the shared sender on behalf of every
     %% connection of the listener, so a connection's gso_flushes stays
     %% meaningful (listener-wide) once the syscall has moved out of it.
@@ -483,9 +486,21 @@ new_sender(Socket, Opts) ->
         batching_enabled = BatchingEnabled,
         max_batch_packets = MaxBatch,
         sender_pid = maps:get(sender_pid, Opts, undefined),
+        sender_mon = monitor_sender(maps:get(sender_pid, Opts, undefined)),
         gso_counter = maps:get(gso_counter, Opts, undefined)
     },
     {ok, State}.
+
+monitor_sender(Pid) when is_pid(Pid) -> erlang:monitor(process, Pid);
+monitor_sender(_) -> undefined.
+
+%% @doc The shared sender went down (its monitor fired in the owning
+%% process): flushes go direct from here on.
+-spec sender_down(socket_state() | undefined, reference()) -> {ok, socket_state()} | false.
+sender_down(#socket_state{sender_mon = Mon} = State, Mon) when Mon =/= undefined ->
+    {ok, State#socket_state{sender_pid = undefined, sender_mon = undefined}};
+sender_down(_, _) ->
+    false.
 
 %% @doc Spawn the shared sender for a listener socket: a process that
 %% performs the actual sendmsg calls for every server connection's
@@ -630,14 +645,11 @@ flush(
     %% Hand the whole batch to the shared sender (see the sender_pid
     %% field). Fire-and-forget: send errors are logged by the sender
     %% and covered by loss recovery, the same contract as the direct
-    %% path. A dead sender means a direct path from here on.
-    case is_process_alive(Sender) of
-        true ->
-            Sender ! {send_batch, Addr, Buffer, Count},
-            {ok, bump_batch_counters(clear_batch(State), Count)};
-        false ->
-            flush(State#socket_state{sender_pid = undefined})
-    end;
+    %% path. A dead sender is noticed through its monitor (sender_down/2);
+    %% a batch sent in the window before that is covered by loss recovery
+    %% too, which is cheaper than an is_process_alive per flush.
+    Sender ! {send_batch, Addr, Buffer, Count},
+    {ok, bump_batch_counters(clear_batch(State), Count)};
 flush(#socket_state{gso_supported = true, batch_count = 1} = State) ->
     %% Single-packet batch has no segmentation work; direct send.
     flush_individual(State);
