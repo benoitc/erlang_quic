@@ -51,6 +51,16 @@ All notable changes to this project will be documented in this file.
   whose 0-RTT data the server kept. (#334)
 
 ### Changed
+- The socket-backend client receiver sweeps the datagrams the socket
+  already holds before waking the connection, up to 64 per message, the
+  client-side twin of the listener's receive sweep. A paced sender's
+  small bursts used to reach the connection one datagram per message:
+  one receive pass and one ACK each, so the peer's next burst was sized
+  to that ACK spacing, GRO never saw two packets back to back and the
+  receiver stayed at one `recvmsg` per packet. On a Raspberry Pi 4
+  receiving a 10 MB download over 1 GbE the connection saw 6330
+  single-packet messages and 17 MB/s; with the sweep it sees 64-packet
+  trains and 46 MB/s, with the same code on the sending side.
 - Loss detection and recovery keep per-space state behind one timer, the
   shape RFC 9002 Appendix A describes. Initial and Handshake packets are
   tracked and acknowledged in their own spaces instead of being dropped
