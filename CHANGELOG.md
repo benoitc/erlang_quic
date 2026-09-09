@@ -197,6 +197,12 @@ All notable changes to this project will be documented in this file.
   0.468 to 0.331, ChaCha20-Poly1305 seal 1.132 to 0.934 and open 1.067
   to 0.934. A payload too short to hold an authentication tag is now
   rejected as an authentication failure rather than raising.
+- Accepted connections now monitor their owner and stop with
+  `{shutdown, owner_down}` (CONNECTION_CLOSE to the peer) when it exits,
+  as supervised client connections already did. Before, a dead handler
+  left the connection up until its idle timeout, delivering into a dead
+  mailbox. `monitor_owner => false` in the listener options restores the
+  old behaviour.
 
 ## [1.8.2] - 2026-09-05
 
