@@ -22,7 +22,12 @@
 -include_lib("stdlib/include/assert.hrl").
 
 -export([all/0, suite/0, init_per_suite/1, end_per_suite/1]).
--export([peer_learns_of_owner_death/1, peer_learns_of_clean_close/1]).
+-export([
+    peer_learns_of_owner_death/1,
+    peer_learns_of_clean_close/1,
+    peer_learns_of_server_owner_death/1,
+    server_owner_death_ignored_when_opted_out/1
+]).
 
 %% How quickly the peer must see the close. Generous against slow rigs,
 %% far below any idle/disconnect timeout it would otherwise wait for.
@@ -32,7 +37,12 @@ suite() ->
     [{timetrap, {minutes, 1}}].
 
 all() ->
-    [peer_learns_of_clean_close, peer_learns_of_owner_death].
+    [
+        peer_learns_of_clean_close,
+        peer_learns_of_owner_death,
+        peer_learns_of_server_owner_death,
+        server_owner_death_ignored_when_opted_out
+    ].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -58,9 +68,27 @@ peer_learns_of_owner_death(_Config) ->
     exit(Owner, kill),
     assert_closed(SConn).
 
-assert_closed(SConn) ->
+%% Same on the accepting side: an accepted connection follows its
+%% handler down by default.
+peer_learns_of_server_owner_death(_Config) ->
+    {CConn, Handler, _SConn} = server_owned_pair(#{}),
+    exit(Handler, kill),
+    assert_closed(CConn).
+
+server_owner_death_ignored_when_opted_out(_Config) ->
+    {CConn, Handler, SConn} = server_owned_pair(#{monitor_owner => false}),
+    exit(Handler, kill),
     receive
-        {quic, SConn, {closed, Reason}} ->
+        {quic, CConn, {closed, Reason}} ->
+            ct:fail({closed_despite_opt_out, Reason})
+    after 500 ->
+        ok
+    end,
+    ?assert(is_process_alive(SConn)).
+
+assert_closed(Conn) ->
+    receive
+        {quic, Conn, {closed, Reason}} ->
             ct:pal("peer saw close: ~p", [Reason])
     after ?NOTICE_MS ->
         ct:fail({peer_never_saw_close, within_ms, ?NOTICE_MS})
@@ -106,3 +134,32 @@ connected_pair() ->
         after 10000 -> ct:fail("no server-side connected event")
         end,
     {SConn, Owner, CConn}.
+
+%% The client connection is owned by the test process; the accepted one
+%% by a disposable handler we can kill.
+server_owned_pair(ListenerOpts) ->
+    Test = self(),
+    {ok, Server} = quic_test_echo_server:start(ListenerOpts#{
+        connection_handler => fun(ConnPid, _ConnRef) ->
+            Handler = spawn(fun() ->
+                receive
+                after infinity -> ok
+                end
+            end),
+            ok = quic:set_owner_sync(ConnPid, Handler),
+            Test ! {server_side, ConnPid, Handler},
+            {ok, Handler}
+        end
+    }),
+    Port = maps:get(port, Server),
+    {ok, CConn} = quic:connect(
+        <<"127.0.0.1">>, Port, #{verify => false, alpn => [<<"echo">>]}, self()
+    ),
+    receive
+        {quic, CConn, {connected, _}} -> ok
+    after 10000 -> ct:fail("client connect timeout")
+    end,
+    receive
+        {server_side, SConn, Handler} -> {CConn, Handler, SConn}
+    after 10000 -> ct:fail("no server-side connection")
+    end.
