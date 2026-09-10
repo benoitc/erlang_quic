@@ -299,13 +299,54 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
         run: |
           erlc -o _build/test/lib/quic/test test/quic_nif_fuzz.erl
-          LD_PRELOAD=$(gcc -print-file-name=libasan.so) \
-            erl -noshell -pa _build/test/lib/quic/ebin -pa _build/test/lib/quic/test -eval '
-              application:ensure_all_started(quic),
-              case quic_crypto_nif:is_loaded() of
-                false -> io:format("NIF not loaded, nothing fuzzed~n"), halt(1);
-                true -> quic_nif_fuzz:run(200000), halt(0)
-              end.'
+          # One cipher per emulator so an ASan abort names the cipher.
+          # ChaCha joins this list when it reaches the fused paths; the
+          # harness answers {error, nothing_exercised} until then, so a
+          # cipher that silently stops being covered fails here.
+          for CIPHER in aes_128_gcm aes_256_gcm; do
+            LD_PRELOAD=$(gcc -print-file-name=libasan.so) \
+              erl -noshell -pa _build/test/lib/quic/ebin -pa _build/test/lib/quic/test -eval "
+                application:ensure_all_started(quic),
+                case quic_crypto_nif:is_loaded() of
+                  false -> io:format(\"NIF not loaded, nothing fuzzed~n\"), halt(1);
+                  true ->
+                    case quic_nif_fuzz:run(200000, 1, $CIPHER) of
+                      ok -> halt(0);
+                      {error, R} -> io:format(\"$CIPHER: ~p~n\", [R]), halt(1)
+                    end
+                end."
+          done
+
+  regression:
+    name: Performance Regression
+    needs: unit-tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24.0'
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev
+
+      - name: Generate certificates
+        run: |
+          chmod +x ./certs/generate_certs.sh
+          ./certs/generate_certs.sh
+
+      - name: Compile
+        run: rebar3 compile
+
+      # Asserts packet and retransmit counters, never a rate, so it does
+      # not flake on a loaded runner. The socket-backend cases need
+      # Linux, which is why this job is pinned rather than run on the
+      # macOS one.
+      - name: Run the regression gate
+        run: rebar3 ct --suite=quic_regression_SUITE
 
   dist:
     name: Distribution Tests

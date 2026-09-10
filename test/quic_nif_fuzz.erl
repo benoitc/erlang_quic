@@ -7,7 +7,7 @@
 %%%     erl -noshell -pa ebin -eval 'quic_nif_fuzz:run(200000), halt().'
 -module(quic_nif_fuzz).
 
--export([run/1, run/2]).
+-export([run/1, run/2, run/3]).
 
 -define(KEY, <<0:128>>).
 -define(IV, <<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12>>).
@@ -19,46 +19,70 @@ run(N) ->
     run(N, 1).
 
 run(N, Seed) ->
+    run(N, Seed, aes_128_gcm).
+
+%% Cipher is a parameter because the fused paths take a different route
+%% for ChaCha20-Poly1305: its header protection is a ChaCha20 keystream
+%% rather than an ECB block, so fuzzing only AES leaves that C path
+%% unexercised.
+run(N, Seed, Cipher) ->
     case quic_crypto_nif:is_loaded() of
         false ->
             io:format("NIF not loaded, nothing to fuzz~n");
         true ->
             rand:seed(exsplus, {Seed, Seed * 7 + 1, Seed * 13 + 3}),
-            {Parsed, Raw, Rejected} = loop(N, 0, 0, 0),
+            {Parsed, Raw, Rejected} = loop(N, Cipher, 0, 0, 0),
             io:format(
-                "fuzzed ~b packets: parsed=~b raw=~b rejected=~b~n",
-                [N, Parsed, Raw, Rejected]
-            )
+                "fuzzed ~b packets (~s): parsed=~b raw=~b rejected=~b~n",
+                [N, Cipher, Parsed, Raw, Rejected]
+            ),
+            %% Everything rejected means the cipher never reached the
+            %% fused path, so nothing was fuzzed. Report it rather than
+            %% let a caller read the run as coverage.
+            case Parsed + Raw of
+                0 -> {error, nothing_exercised};
+                _ -> ok
+            end
     end.
 
-loop(0, P, R, X) ->
+loop(0, _Cipher, P, R, X) ->
     {P, R, X};
-loop(N, P, R, X) ->
+loop(N, Cipher, P, R, X) ->
     Plain = payload(),
-    case protect(Plain) of
+    case protect(Cipher, Plain) of
         {ok, Packet} ->
             case
                 catch quic_aead_ctx:open_run(
-                    aes_128_gcm, ?KEY, ?IV, ?HP, 0, 0, byte_size(?DCID), [Packet]
+                    Cipher, key(Cipher), ?IV, hp(Cipher), 0, 0, byte_size(?DCID), [Packet]
                 )
             of
-                {ok, [{_PN, _FB, {raw, _}}]} -> loop(N - 1, P, R + 1, X);
-                {ok, [{_PN, _FB, L}]} when is_list(L) -> loop(N - 1, P + 1, R, X);
-                _ -> loop(N - 1, P, R, X + 1)
+                {ok, [{_PN, _FB, {raw, _}}]} -> loop(N - 1, Cipher, P, R + 1, X);
+                {ok, [{_PN, _FB, L}]} when is_list(L) -> loop(N - 1, Cipher, P + 1, R, X);
+                _ -> loop(N - 1, Cipher, P, R, X + 1)
             end;
         skip ->
-            loop(N - 1, P, R, X + 1)
+            loop(N - 1, Cipher, P, R, X + 1)
     end.
 
-protect(Plain) ->
+protect(Cipher, Plain) ->
     case
         catch quic_aead_ctx:protect_run(
-            aes_128_gcm, ?KEY, ?IV, ?HP, 7, ?FB_BASE, ?DCID, [Plain]
+            Cipher, key(Cipher), ?IV, hp(Cipher), 7, ?FB_BASE, ?DCID, [Plain]
         )
     of
         {ok, [Packet]} -> {ok, Packet};
         _ -> skip
     end.
+
+key(aes_128_gcm) -> ?KEY;
+key(aes_256_gcm) -> <<0:256>>;
+key(chacha20_poly1305) -> <<0:256>>.
+
+%% Header-protection key: 16 bytes for AES-128 ECB, 32 for AES-256 and
+%% for the ChaCha20 keystream.
+hp(aes_128_gcm) -> ?HP;
+hp(aes_256_gcm) -> <<16#aa:8, 0:248>>;
+hp(chacha20_poly1305) -> <<16#aa:8, 0:248>>.
 
 %% A mix of shapes: pure noise, valid frames with corrupted tails,
 %% truncations, and deeply nested length fields.
