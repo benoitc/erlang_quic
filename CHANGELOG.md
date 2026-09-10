@@ -92,6 +92,14 @@ All notable changes to this project will be documented in this file.
   socket, which is what caught this.
 
 ### Changed
+- ChaCha20-Poly1305 connections use the fused crypto NIF paths
+  (`protect_run`, `open_packet`, `open_run`) like the AES suites. The
+  header-protection mask is five ChaCha20 keystream bytes with the
+  16-byte sample as the cipher IV (RFC 9001 5.4.4), so the NIF keeps a
+  keyed ChaCha20 context per HP key and reloads only the IV per packet,
+  the same shape as the AES-ECB context. Where the CPU has no AES
+  instructions ChaCha is the faster cipher by a wide margin and was the
+  one suite left on the per-packet path.
 - The interop runner declares the passive robustness cases (longrtt,
   blackhole, amplificationlimit, handshakeloss, transferloss,
   handshakecorruption, transfercorruption, rebind-port, rebind-addr),

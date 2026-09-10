@@ -139,6 +139,7 @@
 %% Test exports
 -ifdef(TEST).
 -export([
+    select_cipher/2,
     chunk_crypto/3,
     add_to_ack_ranges/2,
     cap_ack_ranges/1,
@@ -2958,10 +2959,21 @@ send_client_hello(State) ->
 %% code and a `ciphers' option had nowhere to take effect.
 select_cipher(ClientCipherSuites, ServerPreference) ->
     ClientCiphers = [cipher_code_to_atom(C) || C <- ClientCipherSuites],
-    select_first_match(ServerPreference, ClientCiphers).
+    %% A client that puts ChaCha20-Poly1305 first is saying it lacks
+    %% AES hardware; honour that when the server allows the suite
+    %% (the same rule as OpenSSL's SSL_OP_PRIORITIZE_CHACHA).
+    case ClientCiphers of
+        [chacha20_poly1305 | _] ->
+            case lists:member(chacha20_poly1305, ServerPreference) of
+                true -> chacha20_poly1305;
+                false -> select_first_match(ServerPreference, ClientCiphers)
+            end;
+        _ ->
+            select_first_match(ServerPreference, ClientCiphers)
+    end.
 
 default_cipher_preference() ->
-    [aes_128_gcm, aes_256_gcm, chacha20_poly1305].
+    quic_crypto:default_cipher_preference().
 
 % Default
 select_first_match([], _) ->
