@@ -55,6 +55,18 @@ All notable changes to this project will be documented in this file.
   for new connections.
 
 ### Fixed
+- A stream receiver with a hole at the head of its reassembly buffer no
+  longer slows down with every packet buffered behind it. The
+  connection-level receive-buffer byte count was recomputed from the
+  buffer on every out-of-order stream frame, twice, by walking every
+  chunk in the tree, so with one lost packet and a congestion window's
+  worth of data queued behind it each further packet cost a walk of
+  thousands of chunks, the receiver's mailbox grew into the thousands,
+  ACKs went out seconds late and the sender sat on its window: a 50 MB
+  download over 1 GbE with a single early loss ran at 13 MB/s where
+  10 MB, or a peer that never lost a packet, ran at 90 to 108. The
+  stream now keeps a running byte count and every tree change reports
+  its delta.
 - The NIF's AEAD context cache is bounded and no longer raises. Each
   key update derives fresh keys, and the per-process cache kept a live
   EVP context for every one of them, so a long-lived bulk connection
