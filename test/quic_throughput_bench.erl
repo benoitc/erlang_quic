@@ -119,6 +119,7 @@ run_download_sink(Opts) ->
             data_size => byte_size(Received),
             duration_ms => Duration div 1000,
             mb_per_sec => MBps,
+            packets_sent => maps:get(packets_sent, ServerStats, 0),
             batch_flushes => Flushes,
             packets_coalesced => Coalesced,
             coalesce_ratio => Ratio,
