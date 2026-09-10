@@ -55,6 +55,18 @@ All notable changes to this project will be documented in this file.
   for new connections.
 
 ### Fixed
+- A stream receiver with a hole at the head of its reassembly buffer no
+  longer slows down with every packet buffered behind it. The
+  connection-level receive-buffer byte count was recomputed from the
+  buffer on every out-of-order stream frame, twice, by walking every
+  chunk in the tree, so with one lost packet and a congestion window's
+  worth of data queued behind it each further packet cost a walk of
+  thousands of chunks, the receiver's mailbox grew into the thousands,
+  ACKs went out seconds late and the sender sat on its window: a 50 MB
+  download over 1 GbE with a single early loss ran at 13 MB/s where
+  10 MB, or a peer that never lost a packet, ran at 90 to 108. The
+  stream now keeps a running byte count and every tree change reports
+  its delta.
 - The NIF's AEAD context cache is bounded and no longer raises. Each
   key update derives fresh keys, and the per-process cache kept a live
   EVP context for every one of them, so a long-lived bulk connection
@@ -92,6 +104,16 @@ All notable changes to this project will be documented in this file.
   socket, which is what caught this.
 
 ### Changed
+- The socket-backend client receiver sweeps the datagrams the socket
+  already holds before waking the connection, up to 64 per message, the
+  client-side twin of the listener's receive sweep. A paced sender's
+  small bursts used to reach the connection one datagram per message:
+  one receive pass and one ACK each, so the peer's next burst was sized
+  to that ACK spacing, GRO never saw two packets back to back and the
+  receiver stayed at one `recvmsg` per packet. On a Raspberry Pi 4
+  receiving a 10 MB download over 1 GbE the connection saw 6330
+  single-packet messages and 17 MB/s; with the sweep it sees 64-packet
+  trains and 46 MB/s, with the same code on the sending side.
 - The interop runner declares the passive robustness cases (longrtt,
   blackhole, amplificationlimit, handshakeloss, transferloss,
   handshakecorruption, transfercorruption, rebind-port, rebind-addr),

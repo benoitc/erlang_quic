@@ -151,6 +151,7 @@
     close_reason_to_code/1,
     %% Out-of-order reassembly (RFC 9000 §2.2, §13.3)
     extract_contiguous_data/2,
+    keep_longest_chunk/3,
     trim_reassembly_buffer/2,
     %% Migration frame classification (RFC 9000 Section 9.1)
     is_probing_frame/1,
@@ -6238,7 +6239,7 @@ buffer_crypto_data(Level, Offset, Data, State) ->
                 end,
             %% Add data to buffer, keeping the longer chunk if the peer
             %% already sent one at this offset.
-            NewBuffer = keep_longest_chunk(Offset, Data, Buffer),
+            {NewBuffer, _} = keep_longest_chunk(Offset, Data, Buffer),
             NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State0#state.crypto_buffer),
 
             State1 = State0#state{crypto_buffer = NewCryptoBuffer},
@@ -6278,7 +6279,7 @@ process_crypto_buffer(Level, State) ->
             %% the offset, then retry once. Storing the trimmed buffer also
             %% stops duplicate retransmissions from accumulating against
             %% ?MAX_CRYPTO_BUFFER_BYTES and closing a healthy connection.
-            Trimmed = trim_reassembly_buffer(Buffer, ExpectedOffset),
+            {Trimmed, _} = trim_reassembly_buffer(Buffer, ExpectedOffset),
             State1 = State#state{
                 crypto_buffer = maps:put(Level, Trimmed, State#state.crypto_buffer)
             },
@@ -7709,19 +7710,21 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
 
                     %% Fast path: in-order delivery with empty buffer
                     %% Avoids the buffer insert and extract_contiguous_data for common case
-                    {DeliverData, NewRecvOffset, NewBuffer, DeliverFin} =
+                    {DeliverData, NewRecvOffset, NewBuffer, DeliverFin, BufferedDelta} =
                         case Offset =:= CurrentOffset andalso gb_trees:is_empty(RecvBuffer) of
                             true ->
                                 %% In-order with empty buffer: deliver directly
-                                {Data, EndOffset, RecvBuffer, Fin};
+                                {Data, EndOffset, RecvBuffer, Fin, 0};
                             false ->
                                 %% Out-of-order or buffer has data: use buffer path
-                                UpdatedBuffer = keep_longest_chunk(Offset, Data, RecvBuffer),
-                                {ExtractedData, ExtractedOffset, ExtractedBuffer} =
+                                {UpdatedBuffer, Added} =
+                                    keep_longest_chunk(Offset, Data, RecvBuffer),
+                                {ExtractedData, ExtractedOffset, ExtractedBuffer, Removed} =
                                     extract_contiguous_data(UpdatedBuffer, CurrentOffset),
                                 ExtractedFin =
                                     FinalSize =/= undefined andalso ExtractedOffset >= FinalSize,
-                                {ExtractedData, ExtractedOffset, ExtractedBuffer, ExtractedFin}
+                                {ExtractedData, ExtractedOffset, ExtractedBuffer, ExtractedFin,
+                                    Added - Removed}
                         end,
 
                     %% Deliver contiguous data to owner
@@ -7739,6 +7742,7 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                         recv_offset = NewRecvOffset,
                         recv_fin = DeliverFin,
                         recv_buffer = NewBuffer,
+                        recv_buffered = Stream#stream_state.recv_buffered + BufferedDelta,
                         final_size = FinalSize,
                         recv_done =
                             (DeliverFin andalso gb_trees:is_empty(NewBuffer)) orelse
@@ -7760,11 +7764,7 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                     %% bytes count as new but are never delivered twice, and
                     %% that drift would eventually trip the cap on a stream
                     %% holding nothing.
-                    NewRecvBufferBytes = max(
-                        0,
-                        RecvBufferBytes - reassembly_buffer_bytes(RecvBuffer) +
-                            reassembly_buffer_bytes(NewBuffer)
-                    ),
+                    NewRecvBufferBytes = max(0, RecvBufferBytes + BufferedDelta),
 
                     State1 = State#state{
                         streams = maps:put(StreamId, NewStream, Streams),
@@ -7909,34 +7909,28 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
 %% Extract contiguous data from buffer starting at Offset
 %% Returns {Data, NewOffset, UpdatedBuffer}
 %% Uses binary append accumulator - O(1) amortized due to refc binary optimization
+%% Returns {Delivered, NewOffset, Buffer, Removed}: Removed is how many
+%% bytes left the tree, delivered or trimmed away, so the caller can keep
+%% its byte count without walking the tree.
 extract_contiguous_data(Buffer, Offset) ->
-    extract_contiguous_data(Buffer, Offset, <<>>).
+    extract_contiguous_data(Buffer, Offset, <<>>, 0).
 
-extract_contiguous_data(Buffer, Offset, Acc) ->
+extract_contiguous_data(Buffer, Offset, Acc, Removed) ->
     case gb_trees:take_any(Offset, Buffer) of
         {Data, NewBuffer} ->
-            %% Found data at this offset, continue looking for next chunk
-            %% Binary append is O(1) amortized due to Erlang's pre-allocation
             NextOffset = Offset + byte_size(Data),
-            extract_contiguous_data(NewBuffer, NextOffset, <<Acc/binary, Data/binary>>);
+            extract_contiguous_data(
+                NewBuffer, NextOffset, <<Acc/binary, Data/binary>>, Removed + byte_size(Data)
+            );
         error ->
-            %% Nothing keyed exactly at Offset, which does not mean a gap:
-            %% a peer may split or coalesce retransmitted data differently
-            %% (RFC 9000 §2.2, §13.3), so the bytes we want can sit inside
-            %% a chunk that starts earlier. Drop what is already delivered,
-            %% re-key what straddles Offset, then retry once. When every
-            %% buffered chunk starts above Offset (the normal shape while
-            %% waiting on a hole, and this runs once per received packet
-            %% until the hole fills) the ordered tree answers that with one
-            %% smallest-key lookup and no walk.
             case gb_trees:is_empty(Buffer) orelse element(1, gb_trees:smallest(Buffer)) > Offset of
                 true ->
-                    {Acc, Offset, Buffer};
+                    {Acc, Offset, Buffer, Removed};
                 false ->
-                    Trimmed = trim_reassembly_buffer(Buffer, Offset),
+                    {Trimmed, Gone} = trim_reassembly_buffer(Buffer, Offset),
                     case gb_trees:is_defined(Offset, Trimmed) of
-                        true -> extract_contiguous_data(Trimmed, Offset, Acc);
-                        false -> {Acc, Offset, Trimmed}
+                        true -> extract_contiguous_data(Trimmed, Offset, Acc, Removed + Gone);
+                        false -> {Acc, Offset, Trimmed, Removed + Gone}
                     end
             end
     end.
@@ -7945,35 +7939,43 @@ extract_contiguous_data(Buffer, Offset, Acc) ->
 %% straddle it, re-keying them to Offset. Keeps the longest chunk at each
 %% offset, so overlapping retransmissions collapse instead of accumulating.
 %% Only chunks keyed below Offset can qualify, so the ordered walk stops
-%% there; everything above is left untouched.
+%% there; everything above is left untouched. Returns {Buffer, Removed}
+%% with the bytes that left the tree.
 trim_reassembly_buffer(Buffer, Offset) ->
-    trim_reassembly_buffer(gb_trees:iterator(Buffer), Buffer, Offset).
+    trim_reassembly_buffer(gb_trees:iterator(Buffer), Buffer, Offset, 0).
 
-trim_reassembly_buffer(Iter0, Buffer, Offset) ->
+trim_reassembly_buffer(Iter0, Buffer, Offset, Removed) ->
     case gb_trees:next(Iter0) of
         {Off, Data, Iter} when Off < Offset ->
             End = Off + byte_size(Data),
             Buffer1 = gb_trees:delete(Off, Buffer),
-            Buffer2 =
+            Removed1 = Removed + byte_size(Data),
+            {Buffer2, Added} =
                 case End > Offset of
                     true ->
                         Kept = binary:part(Data, Offset - Off, End - Offset),
                         keep_longest_chunk(Offset, Kept, Buffer1);
                     false ->
-                        Buffer1
+                        {Buffer1, 0}
                 end,
-            trim_reassembly_buffer(Iter, Buffer2, Offset);
+            trim_reassembly_buffer(Iter, Buffer2, Offset, Removed1 - Added);
         _ ->
-            Buffer
+            {Buffer, Removed}
     end.
 
+%% Returns {Buffer, Delta}: the change in bytes held by the tree.
 keep_longest_chunk(Off, Data, Buffer) ->
     case gb_trees:lookup(Off, Buffer) of
-        {value, Existing} when byte_size(Existing) >= byte_size(Data) -> Buffer;
-        _ -> gb_trees:enter(Off, Data, Buffer)
+        {value, Existing} when byte_size(Existing) >= byte_size(Data) ->
+            {Buffer, 0};
+        {value, Existing} ->
+            {gb_trees:enter(Off, Data, Buffer), byte_size(Data) - byte_size(Existing)};
+        none ->
+            {gb_trees:enter(Off, Data, Buffer), byte_size(Data)}
     end.
 
-%% Total bytes held in a reassembly buffer.
+%% Total bytes held in a CRYPTO reassembly buffer (stream buffers keep a
+%% running count instead).
 reassembly_buffer_bytes(Buffer) ->
     lists:foldl(fun(Data, Acc) -> Acc + byte_size(Data) end, 0, gb_trees:values(Buffer)).
 
