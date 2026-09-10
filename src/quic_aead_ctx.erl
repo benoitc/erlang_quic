@@ -107,12 +107,10 @@ hp_block(Cipher, Key, Sample) ->
     binary(),
     [iodata()]
 ) -> {ok, [binary()]} | fallback.
-protect_run(chacha20_poly1305, _Key, _IV, _HP, _PN0, _FirstByteBase, _DCID, _Payloads) ->
-    fallback;
 protect_run(Cipher, Key, IV, HP, PN0, FirstByteBase, DCID, Payloads) ->
     case nif_enabled() of
         true ->
-            case {ctx(qc_enc, Cipher, Key), hp_ctx(hp_ecb_cipher(Cipher), HP)} of
+            case {ctx(qc_enc, Cipher, Key), hp_ctx(hp_cipher(Cipher), HP)} of
                 {{ok, AeadCtx}, {ok, HpCtx}} ->
                     case
                         quic_crypto_nif:protect_run(
@@ -129,8 +127,11 @@ protect_run(Cipher, Key, IV, HP, PN0, FirstByteBase, DCID, Payloads) ->
             fallback
     end.
 
-hp_ecb_cipher(aes_128_gcm) -> aes_128_ecb;
-hp_ecb_cipher(aes_256_gcm) -> aes_256_ecb.
+%% Header-protection cipher for an AEAD: AES-ECB for the GCM suites,
+%% ChaCha20 (sample as IV, five keystream bytes) for ChaCha20-Poly1305.
+hp_cipher(aes_128_gcm) -> aes_128_ecb;
+hp_cipher(aes_256_gcm) -> aes_256_ecb;
+hp_cipher(chacha20_poly1305) -> chacha20.
 
 %% @doc Fused short-header receive: header unprotection, PN
 %% reconstruction and AEAD open in one NIF call. Returns
@@ -148,8 +149,6 @@ hp_ecb_cipher(aes_256_gcm) -> aes_256_ecb.
     binary(),
     binary()
 ) -> {ok, non_neg_integer(), byte(), binary()} | error | fallback.
-open_packet(chacha20_poly1305, _Key, _IV, _HP, _Largest, _Phase, _Header, _Payload) ->
-    fallback;
 open_packet(Cipher, Key, IV, HP, LargestRecv, ExpectedPhase, Header, EncPayload) ->
     with_open_ctx(Cipher, Key, HP, LargestRecv, fun(DecCtx, HpCtx, Largest) ->
         case
@@ -179,8 +178,6 @@ open_packet(Cipher, Key, IV, HP, LargestRecv, ExpectedPhase, Header, EncPayload)
     non_neg_integer(),
     [binary()]
 ) -> {ok, [{non_neg_integer(), byte(), [term()] | {raw, binary()}}]} | fallback.
-open_run(chacha20_poly1305, _Key, _IV, _HP, _Largest, _Phase, _DcidLen, _Datagrams) ->
-    fallback;
 open_run(Cipher, Key, IV, HP, LargestRecv, ExpectedPhase, DcidLen, Datagrams) ->
     with_open_ctx(Cipher, Key, HP, LargestRecv, fun(DecCtx, HpCtx, Largest) ->
         case
@@ -204,7 +201,7 @@ with_open_ctx(Cipher, Key, HP, LargestRecv, Fun) ->
                     undefined -> -1;
                     _ -> LargestRecv
                 end,
-            case {ctx(qc_dec, Cipher, Key), hp_ctx(hp_ecb_cipher(Cipher), HP)} of
+            case {ctx(qc_dec, Cipher, Key), hp_ctx(hp_cipher(Cipher), HP)} of
                 {{ok, DecCtx}, {ok, HpCtx}} -> Fun(DecCtx, HpCtx, Largest);
                 _ -> fallback
             end;
