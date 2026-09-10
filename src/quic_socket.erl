@@ -69,6 +69,8 @@
 
 %% Idle tick of the shared sender loop; also keeps its receive bounded.
 -define(SHARED_SENDER_IDLE_MS, 30000).
+%% Packets per client receive sweep (matches the connection's drain cap).
+-define(CLIENT_RECV_SWEEP_MAX, 64).
 -include_lib("kernel/include/logger.hrl").
 
 %% GSO/GRO socket option constants for Linux
@@ -811,7 +813,22 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner, QueueMax) 
     %% receive pass.
     case recv_gro(Socket, 100) of
         {ok, {IP, Port}, Packets} ->
-            forward_to_owner(Owner, Socket, IP, Port, Packets, QueueMax),
+            %% Sweep what else the socket already holds before waking
+            %% the owner, so a paced sender's small bursts still reach
+            %% the connection as one train (one receive pass, one ACK).
+            %% Without it each datagram is its own message and ACK, the
+            %% peer's bursts shrink to the ACK spacing, GRO never gets
+            %% two packets back to back, and the receiver stays at one
+            %% syscall per packet: the client-side twin of the
+            %% listener's receive sweep.
+            {Train, Rest} = client_recv_sweep(
+                Socket, {IP, Port}, ?CLIENT_RECV_SWEEP_MAX - length(Packets), lists:reverse(Packets)
+            ),
+            forward_to_owner(Owner, Socket, IP, Port, Train, QueueMax),
+            [
+                forward_to_owner(Owner, Socket, IP2, Port2, Ps, QueueMax)
+             || {{IP2, Port2}, Ps} <- Rest
+            ],
             client_recv_loop(SocketState, Owner, QueueMax);
         {error, timeout} ->
             client_recv_loop(SocketState, Owner, QueueMax);
@@ -820,6 +837,22 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner, QueueMax) 
         {error, Reason} ->
             ?LOG_WARNING(#{what => client_recv_loop_exit, reason => Reason}),
             ok
+    end.
+
+%% Non-blocking reads until the socket is empty or the budget is spent.
+%% Same-source datagrams extend the train (kept reversed while
+%% collecting); a datagram from another source ends the sweep and is
+%% returned to be forwarded on its own, after the train.
+client_recv_sweep(_Socket, _Src, Budget, Acc) when Budget =< 0 ->
+    {lists:reverse(Acc), []};
+client_recv_sweep(Socket, Src, Budget, Acc) ->
+    case recv_gro(Socket, 0) of
+        {ok, Src, Packets} ->
+            client_recv_sweep(Socket, Src, Budget - length(Packets), lists:reverse(Packets, Acc));
+        {ok, Other, Packets} ->
+            {lists:reverse(Acc), [{Other, Packets}]};
+        {error, _} ->
+            {lists:reverse(Acc), []}
     end.
 
 %% Bench diagnostic: client-receiver tail-drop counter.
