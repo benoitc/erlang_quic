@@ -55,6 +55,16 @@ All notable changes to this project will be documented in this file.
   for new connections.
 
 ### Fixed
+- PMTU black-hole detection counts loss events, not lost packets, and a
+  large packet acknowledged in between clears the count. It counted every
+  large packet declared lost and, once the search had completed, nothing
+  ever reset it, so a single burst loss of six or more full-size packets
+  on a healthy path (a qdisc dropping one GSO super-packet, a small
+  receiver socket buffer) dropped the path MTU to 1200 for the rest of
+  the connection: about 15 % more packets for every byte after it. On a
+  1 GbE rig two such drops per 50 MB were enough. Now one ACK's worth of
+  losses is one strike if any of them was large, and an ACK carrying a
+  large packet proves the path still passes them.
 - The NIF's AEAD context cache is bounded and no longer raises. Each
   key update derives fresh keys, and the per-process cache kept a live
   EVP context for every one of them, so a long-lived bulk connection

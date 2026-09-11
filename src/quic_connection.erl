@@ -5634,13 +5634,17 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                                 State1
                         end,
 
-                    %% Handle PMTU probe losses
-                    %% Pass packet size directly since packets are removed from sent_packets
+                    %% Black hole detection: one strike per loss event, and
+                    %% any large packet acked in this ACK clears the strikes.
+                    State2a = handle_pmtu_ack_event(AckedPackets, State2),
+                    State2b = handle_pmtu_loss_event(LostPackets, State2a),
+
+                    %% Handle PMTU probe losses while searching
                     State3 = lists:foldl(
                         fun(#sent_packet{pn = PN, size = Size}, S) ->
                             handle_pmtu_probe_loss(PN, Size, S)
                         end,
-                        State2,
+                        State2b,
                         LostPackets
                     ),
 
@@ -13555,9 +13559,7 @@ handle_pmtu_probe_ack(PacketNumber, #state{pmtu_state = PMTUState, cc_state = CC
 -spec handle_pmtu_probe_loss(non_neg_integer(), non_neg_integer(), #state{}) -> #state{}.
 handle_pmtu_probe_loss(_PacketNumber, _PacketSize, #state{pmtu_state = undefined} = State) ->
     State;
-handle_pmtu_probe_loss(
-    PacketNumber, PacketSize, #state{pmtu_state = PMTUState, cc_state = CCState} = State
-) ->
+handle_pmtu_probe_loss(PacketNumber, _PacketSize, #state{pmtu_state = PMTUState} = State) ->
     case quic_pmtu:get_state(PMTUState) of
         searching ->
             %% Check if this loss is for our probe packet
@@ -13571,22 +13573,43 @@ handle_pmtu_probe_loss(
                     %% Loss of non-probe packet - ignore for PMTU
                     State
             end;
-        search_complete ->
-            %% Track loss for black hole detection
-            %% Only count losses of large packets (near current MTU)
-            OldMTU = quic_pmtu:current_mtu(PMTUState),
-            NewPMTUState = quic_pmtu:on_packet_lost(PacketSize, PMTUState),
-            NewMTU = quic_pmtu:current_mtu(NewPMTUState),
+        _ ->
+            %% Black hole detection is handled per event, see
+            %% handle_pmtu_loss_event/2.
+            State
+    end.
 
-            %% Update congestion control if MTU decreased (black hole)
+%% @doc Black hole detection, ack side: a large packet acknowledged in
+%% this ACK proves the path still passes them.
+-spec handle_pmtu_ack_event([#sent_packet{}], #state{}) -> #state{}.
+handle_pmtu_ack_event(_Acked, #state{pmtu_state = undefined} = State) ->
+    State;
+handle_pmtu_ack_event([], State) ->
+    State;
+handle_pmtu_ack_event(Acked, #state{pmtu_state = PMTUState} = State) ->
+    Sizes = [Size || #sent_packet{size = Size} <- Acked],
+    State#state{pmtu_state = quic_pmtu:on_ack_event(Sizes, PMTUState)}.
+
+%% @doc Black hole detection, loss side: the newly declared losses of one
+%% ACK are one strike if any of them was a large packet. Drops the MTU
+%% to base when the strikes reach the threshold.
+-spec handle_pmtu_loss_event([#sent_packet{}], #state{}) -> #state{}.
+handle_pmtu_loss_event(_Lost, #state{pmtu_state = undefined} = State) ->
+    State;
+handle_pmtu_loss_event([], State) ->
+    State;
+handle_pmtu_loss_event(Lost, #state{pmtu_state = PMTUState, cc_state = CCState} = State) ->
+    case quic_pmtu:get_state(PMTUState) of
+        search_complete ->
+            OldMTU = quic_pmtu:current_mtu(PMTUState),
+            Sizes = [Size || #sent_packet{size = Size} <- Lost],
+            NewPMTUState = quic_pmtu:on_loss_event(Sizes, PMTUState),
+            NewMTU = quic_pmtu:current_mtu(NewPMTUState),
             NewCCState =
                 case NewMTU < OldMTU of
-                    true ->
-                        quic_cc:update_mtu(CCState, NewMTU);
-                    false ->
-                        CCState
+                    true -> quic_cc:update_mtu(CCState, NewMTU);
+                    false -> CCState
                 end,
-
             State#state{
                 pmtu_state = NewPMTUState,
                 cc_state = NewCCState
