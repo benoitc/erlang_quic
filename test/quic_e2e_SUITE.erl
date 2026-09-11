@@ -41,6 +41,7 @@
     stream_bidirectional/1,
     stream_multiple/1,
     stream_large_data/1,
+    stream_large_data_chacha/1,
     stream_many_writes_stay_in_order/1
 ]).
 
@@ -78,6 +79,7 @@ groups() ->
             stream_bidirectional,
             stream_multiple,
             stream_large_data,
+            stream_large_data_chacha,
             stream_many_writes_stay_in_order
         ]},
         {connection_lifecycle, [sequence], [
@@ -326,6 +328,35 @@ stream_large_data(Config) ->
             ?assertEqual(DataSize, byte_size(ReceivedData)),
             ?assertEqual(LargeData, ReceivedData),
 
+            quic:close(ConnRef, normal),
+            ok
+    after 60000 ->
+        quic:close(ConnRef, timeout),
+        ct:fail("Connection timeout")
+    end.
+
+%% @doc The 1 MB echo again with ChaCha20-Poly1305 negotiated, so the
+%% ChaCha header-protection and AEAD paths (fused in the NIF when it is
+%% loaded, per packet otherwise) carry a real bulk transfer both ways.
+stream_large_data_chacha(Config) ->
+    Host = ?config(host, Config),
+    Port = ?config(port, Config),
+
+    Opts = maps:merge(quic_test_echo_server:client_opts(), #{
+        alpn => [<<"echo">>],
+        ciphers => [chacha20_poly1305]
+    }),
+    {ok, ConnRef} = quic:connect(Host, Port, Opts, self()),
+
+    receive
+        {quic, ConnRef, {connected, _Info}} ->
+            {ok, StreamId} = quic:open_stream(ConnRef),
+            DataSize = 1024 * 1024,
+            LargeData = crypto:strong_rand_bytes(DataSize),
+            ok = quic:send_data(ConnRef, StreamId, LargeData, true),
+            ReceivedData = collect_stream_data(ConnRef, StreamId, <<>>, 30000),
+            ?assertEqual(DataSize, byte_size(ReceivedData)),
+            ?assertEqual(LargeData, ReceivedData),
             quic:close(ConnRef, normal),
             ok
     after 60000 ->

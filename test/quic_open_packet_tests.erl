@@ -11,7 +11,12 @@
 -define(BASE, 16#40).
 
 keys() ->
-    {crypto:strong_rand_bytes(16), crypto:strong_rand_bytes(12), crypto:strong_rand_bytes(16)}.
+    keys(aes_128_gcm).
+
+keys(aes_128_gcm) ->
+    {crypto:strong_rand_bytes(16), crypto:strong_rand_bytes(12), crypto:strong_rand_bytes(16)};
+keys(chacha20_poly1305) ->
+    {crypto:strong_rand_bytes(32), crypto:strong_rand_bytes(12), crypto:strong_rand_bytes(32)}.
 
 %% Split a wire packet into the header the receiver has parsed (first
 %% byte + DCID) and the rest, as decrypt_app_packet sees it.
@@ -21,9 +26,12 @@ split(Packet) ->
     {Header, Rest}.
 
 roundtrip(PN0, K) ->
-    {Key, IV, HP} = keys(),
+    roundtrip(aes_128_gcm, PN0, K).
+
+roundtrip(Cipher, PN0, K) ->
+    {Key, IV, HP} = keys(Cipher),
     Payloads = [crypto:strong_rand_bytes(60 + I) || I <- lists:seq(1, K)],
-    case quic_aead_ctx:protect_run(aes_128_gcm, Key, IV, HP, PN0, ?BASE, ?DCID, Payloads) of
+    case quic_aead_ctx:protect_run(Cipher, Key, IV, HP, PN0, ?BASE, ?DCID, Payloads) of
         fallback ->
             ok;
         {ok, Packets} ->
@@ -32,7 +40,7 @@ roundtrip(PN0, K) ->
                     {Header, Rest} = split(Packet),
                     {ok, PN, FirstByte, Plain} =
                         quic_aead_ctx:open_packet(
-                            aes_128_gcm, Key, IV, HP, Largest, 0, Header, Rest
+                            Cipher, Key, IV, HP, Largest, 0, Header, Rest
                         ),
                     ?assertEqual(Payload, Plain),
                     %% Fixed bit set, key phase 0, PN length as encoded.
@@ -95,17 +103,39 @@ corrupted_tag_is_an_error_test() ->
             )
     end.
 
-chacha_is_fallback_test() ->
-    ?assertEqual(
-        fallback,
-        quic_aead_ctx:open_packet(
-            chacha20_poly1305,
-            crypto:strong_rand_bytes(32),
-            crypto:strong_rand_bytes(12),
-            crypto:strong_rand_bytes(32),
-            undefined,
-            0,
-            <<16#40, 1, 2, 3, 4>>,
-            <<0:(64 * 8)>>
-        )
-    ).
+%% ChaCha20-Poly1305 opens through the fused path too, with the ChaCha20
+%% header-protection mask computed in C from the sample.
+chacha_roundtrip_test_() ->
+    [
+        {lists:flatten(io_lib:format("chacha pn0=~p k=~p", [PN0, K])), fun() ->
+            roundtrip(chacha20_poly1305, PN0, K)
+        end}
+     || {PN0, K} <- [{0, 6}, {250, 10}, {65530, 10}, {16777210, 10}]
+    ].
+
+%% RFC 9001 Appendix A.5: the ChaCha20-Poly1305 short-header sample
+%% packet, opened by the fused path with a zero-length DCID. Pins the
+%% ChaCha header-protection mask in C to the published vector, which the
+%% differential tests alone cannot do.
+rfc9001_a5_chacha_test() ->
+    Key = hex(
+        "c6d98ff3441c3fe1b2182094f69caa2e"
+        "d4b716b65488960a7a984979fb23e1c8"
+    ),
+    IV = hex("e0459b3474bdd0e44a41c144"),
+    HP = hex(
+        "25a282b9e82f06f21f488917a4fc8f1b"
+        "73573685608597d0efcb076b0ab7a7a4"
+    ),
+    <<Header:1/binary, Rest/binary>> = hex("4cfe4189655e5cd55c41f69080575d7999c25a5bfb"),
+    case quic_aead_ctx:open_packet(chacha20_poly1305, Key, IV, HP, 654360563, 0, Header, Rest) of
+        fallback ->
+            ok;
+        {ok, PN, FirstByte, Plain} ->
+            ?assertEqual(654360564, PN),
+            ?assertEqual(16#42, FirstByte),
+            ?assertEqual(<<16#01>>, Plain)
+    end.
+
+hex(S) ->
+    binary:decode_hex(list_to_binary(S)).

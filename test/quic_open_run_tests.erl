@@ -145,3 +145,20 @@ open_run_reordered_test() ->
         ),
         ?assertEqual([21, 22, 20], [PN || {PN, _FB, _P} <- Results])
     end).
+
+%% Same run shape under ChaCha20-Poly1305: the batched open must agree
+%% with the per-packet open on the ChaCha header-protection mask too.
+open_run_chacha_matches_sequential_test() ->
+    with_nif(fun() ->
+        Key = crypto:strong_rand_bytes(32),
+        HP = crypto:strong_rand_bytes(32),
+        Payloads = payloads(6),
+        {ok, Packets} = quic_aead_ctx:protect_run(
+            chacha20_poly1305, Key, ?IV, HP, 100, ?FB_BASE, ?DCID, Payloads
+        ),
+        {ok, Batch} = quic_aead_ctx:open_run(
+            chacha20_poly1305, Key, ?IV, HP, 99, 0, byte_size(?DCID), Packets
+        ),
+        ?assertEqual(lists:seq(100, 105), [PN || {PN, _FB, _P} <- Batch]),
+        ?assertEqual(Payloads, [P || {_PN, _FB, {raw, P}} <- Batch])
+    end).
