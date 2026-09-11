@@ -34,6 +34,9 @@
 -export_type([group/0, kex_private/0]).
 
 -export([
+    default_cipher_preference/0,
+    aes_accelerated/0,
+    aes_accelerated/1,
     %% Key Schedule
     derive_early_secret/0,
     derive_early_secret/1,
@@ -616,3 +619,53 @@ retry_integrity_secrets(_Version) ->
 hash_len(sha256) -> 32;
 hash_len(sha384) -> 48;
 hash_len(sha512) -> 64.
+
+%% Cipher suites to offer or accept, in preference order, when the
+%% `ciphers' option is not given. AES-GCM first on a CPU with AES
+%% instructions; ChaCha20-Poly1305 first without them, where AES runs
+%% in software and ChaCha is markedly cheaper.
+-spec default_cipher_preference() -> [aes_128_gcm | aes_256_gcm | chacha20_poly1305].
+default_cipher_preference() ->
+    case aes_accelerated() of
+        true -> [aes_128_gcm, aes_256_gcm, chacha20_poly1305];
+        false -> [chacha20_poly1305, aes_128_gcm, aes_256_gcm]
+    end.
+
+%% Whether this CPU has AES instructions, from the Linux cpuinfo flags
+%% (x86 `flags', arm64 `Features'); cached. Unknown platforms count as
+%% accelerated so the historical default holds there.
+-spec aes_accelerated() -> boolean().
+aes_accelerated() ->
+    case persistent_term:get({?MODULE, aes_accelerated}, undefined) of
+        undefined ->
+            V =
+                case file:read_file("/proc/cpuinfo") of
+                    {ok, Info} -> aes_accelerated(Info);
+                    _ -> true
+                end,
+            persistent_term:put({?MODULE, aes_accelerated}, V),
+            V;
+        V ->
+            V
+    end.
+
+-spec aes_accelerated(binary()) -> boolean().
+aes_accelerated(CpuInfo) ->
+    Lines = binary:split(CpuInfo, <<"\n">>, [global]),
+    FlagLines = [
+        L
+     || L <- Lines,
+        binary:match(L, <<"flags">>) =:= {0, 5} orelse binary:match(L, <<"Features">>) =:= {0, 8}
+    ],
+    case FlagLines of
+        [] ->
+            true;
+        _ ->
+            lists:any(
+                fun(L) ->
+                    Words = binary:split(L, [<<" ">>, <<"\t">>], [global]),
+                    lists:member(<<"aes">>, Words)
+                end,
+                FlagLines
+            )
+    end.
