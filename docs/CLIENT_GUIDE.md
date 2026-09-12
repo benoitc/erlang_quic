@@ -113,7 +113,7 @@ packets automatically.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `keep_alive_interval` | integer/atom | `auto` | PING interval |
+| `keep_alive_interval` | integer/atom | `disabled` | PING interval in ms (min 5000), or `auto` for half the idle timeout |
 | `pmtu_enabled` | boolean | true | Enable Path MTU Discovery |
 | `max_udp_payload_size` | integer | 1472 (IPv4) / 1452 (IPv6) | Largest UDP payload we advertise being willing to receive |
 
