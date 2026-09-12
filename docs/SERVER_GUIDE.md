@@ -91,7 +91,7 @@ on `inet6`, `{ip, _}` or `{ifaddr, _}`.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `keep_alive_interval` | integer/atom | `auto` | PING interval (`disabled`, `auto`, or ms) |
+| `keep_alive_interval` | integer/atom | `disabled` | PING interval in ms (min 5000), or `auto` for half the idle timeout |
 | `pmtu_enabled` | boolean | true | Enable Path MTU Discovery |
 | `pmtu_max_mtu` | integer | 1500 | Maximum MTU to probe |
 | `preferred_ipv4` | tuple | - | Preferred IPv4 address for migration |
