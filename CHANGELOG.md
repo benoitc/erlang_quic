@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.9.1] - 2026-09-15
+
+### Changed
+- Interop and compliance tests exercise the external peers for real.
+  Peers are probed with a Version Negotiation request instead of a UDP
+  send, network tests fail on connect, handshake, echo and close errors,
+  the quic-go container runs its HTTP/3 server instead of an echo demo
+  that exits, and CI runs the compliance, reassembly and 0-RTT suites
+  against the peers. A Docs job builds `rebar3 ex_doc`. (#310)
+- `quic_connection`, `quic_listener` and `quic_socket` compile with
+  `export_all` under TEST instead of carrying test-only export lists.
+  The `#state{}` record moves to `src/quic_connection_state.hrl` and the
+  state builders to `test/quic_connection_test_support.erl`. The default
+  build is unchanged. (#307, #311)
+
+### Fixed
+- The owner-exit close tests no longer race the connection's exit on
+  slow runners. (#312)
+
 ## [1.9.0] - 2026-09-14
 
 ### Added
