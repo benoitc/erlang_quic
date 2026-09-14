@@ -173,46 +173,10 @@ get_server_config() ->
 check_any_server_reachable([]) ->
     false;
 check_any_server_reachable([{_Name, Host, Port, _Features} | Rest]) ->
-    case check_server_reachable(Host, Port) of
+    case quic_test_peer:reachable(Host, Port) of
         true -> true;
         false -> check_any_server_reachable(Rest)
     end.
-
-check_server_reachable(Host, Port) ->
-    %% Try to open a UDP socket and send a packet
-    case gen_udp:open(0, [binary]) of
-        {ok, Socket} ->
-            HostAddr =
-                case inet:parse_address(Host) of
-                    {ok, Addr} ->
-                        Addr;
-                    _ ->
-                        case inet:getaddr(Host, inet) of
-                            {ok, Addr} -> Addr;
-                            _ -> {127, 0, 0, 1}
-                        end
-                end,
-            %% Send a minimal QUIC initial packet to check connectivity
-            TestPacket = build_probe_packet(),
-            Result = gen_udp:send(Socket, HostAddr, Port, TestPacket),
-            gen_udp:close(Socket),
-            Result =:= ok;
-        _ ->
-            false
-    end.
-
-build_probe_packet() ->
-    %% Build a minimal QUIC initial packet for probing
-    DCID = crypto:strong_rand_bytes(8),
-    SCID = crypto:strong_rand_bytes(8),
-    %% This won't complete a handshake but tests if server is listening
-    quic_packet:encode_long(
-        initial,
-        ?QUIC_VERSION_1,
-        DCID,
-        SCID,
-        #{token => <<>>, payload => <<>>, pn => 0}
-    ).
 
 get_server(Name, Config) ->
     Servers = proplists:get_value(quic_servers, Config, []),
@@ -486,62 +450,43 @@ key_update(_Config) ->
 
 handshake_aioquic(Config) ->
     ct:comment("Test handshake with aioquic server"),
-    case get_server(aioquic, Config) of
-        {ok, Host, Port, _Features} ->
-            case check_server_reachable(Host, Port) of
-                true ->
-                    do_handshake_test(Host, Port);
-                false ->
-                    {skip, "aioquic server not reachable"}
-            end;
-        {error, not_found} ->
-            {skip, "aioquic server not configured"}
-    end.
+    with_server(aioquic, Config, fun do_handshake_test/2).
 
 handshake_quic_go(Config) ->
     ct:comment("Test handshake with quic-go server"),
-    case get_server(quic_go, Config) of
+    with_server(quic_go, Config, fun do_handshake_test/2).
+
+with_server(Name, Config, Test) ->
+    case get_server(Name, Config) of
         {ok, Host, Port, _Features} ->
-            case check_server_reachable(Host, Port) of
-                true ->
-                    do_handshake_test(Host, Port);
-                false ->
-                    {skip, "quic-go server not reachable"}
+            case quic_test_peer:reachable(Host, Port) of
+                true -> Test(Host, Port);
+                false -> {skip, io_lib:format("~p server not reachable", [Name])}
             end;
         {error, not_found} ->
-            {skip, "quic-go server not configured"}
+            {skip, io_lib:format("~p server not configured", [Name])}
     end.
 
 do_handshake_test(Host, Port) ->
-    ct:log("Attempting handshake with ~s:~p", [Host, Port]),
+    {ok, ConnRef} = connect(Host, Port, #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>]}),
+    Info = await_connected(ConnRef, Host, Port),
+    quic:close(ConnRef, normal),
+    ct:log("Handshake completed: ~p", [Info]),
+    {comment, io_lib:format("Handshake with ~s:~p successful", [Host, Port])}.
 
-    %% Connect using the QUIC API
-    Opts = #{
-        verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>]
-    },
-
+connect(Host, Port, Opts) ->
     case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
-            %% Wait for handshake completion or timeout
-            Result = wait_for_connected(ConnRef, ?HANDSHAKE_TIMEOUT),
-            %% Always clean up the connection
-            quic:close(ConnRef, normal),
-            case Result of
-                {ok, Info} ->
-                    ct:log("Handshake completed: ~p", [Info]),
-                    {comment, io_lib:format("Handshake with ~s:~p successful", [Host, Port])};
-                {error, timeout} ->
-                    %% Handshake timeout - this is expected if server doesn't respond
-                    ct:log("Handshake timeout - server may not support our ClientHello"),
-                    {comment, "Handshake initiated but timed out"};
-                {error, Reason} ->
-                    ct:log("Handshake failed: ~p", [Reason]),
-                    {comment, io_lib:format("Handshake failed: ~p", [Reason])}
-            end;
+        {ok, _} = Ok -> Ok;
+        {error, Reason} -> ct:fail({connect_failed, Host, Port, Reason})
+    end.
+
+await_connected(ConnRef, Host, Port) ->
+    case wait_for_connected(ConnRef, ?HANDSHAKE_TIMEOUT) of
+        {ok, Info} ->
+            Info;
         {error, Reason} ->
-            ct:log("Failed to initiate connection: ~p", [Reason]),
-            {comment, io_lib:format("Connection failed: ~p", [Reason])}
+            quic:close(ConnRef, normal),
+            ct:fail({handshake_failed, Host, Port, Reason})
     end.
 
 wait_for_connected(ConnRef, Timeout) ->
@@ -562,138 +507,75 @@ wait_for_connected(ConnRef, Timeout) ->
 
 version_negotiation(Config) ->
     ct:comment("Test version negotiation"),
-    case get_server(aioquic, Config) of
-        {ok, Host, Port, _Features} ->
-            case check_server_reachable(Host, Port) of
-                true ->
-                    do_version_negotiation_test(Host, Port);
-                false ->
-                    {skip, "Server not reachable"}
-            end;
-        {error, not_found} ->
-            {skip, "No server configured"}
-    end.
+    with_server(aioquic, Config, fun do_version_negotiation_test/2).
 
 do_version_negotiation_test(Host, Port) ->
-    %% Send a packet with an unknown version
-    %% Server should respond with Version Negotiation packet
+    %% An unknown version must be answered with Version Negotiation.
     DCID = crypto:strong_rand_bytes(8),
     SCID = crypto:strong_rand_bytes(8),
-    UnknownVersion = 16#FFFFFFFF,
-
-    Packet = quic_packet:encode_long(
-        initial,
-        UnknownVersion,
-        DCID,
-        SCID,
-        #{token => <<>>, payload => <<"test">>, pn => 0}
-    ),
+    Header = <<16#C0, 16#FFFFFFFF:32, 8, DCID/binary, 8, SCID/binary>>,
+    Packet = <<Header/binary, 0:((1200 - byte_size(Header)) * 8)>>,
 
     {ok, Socket} = gen_udp:open(0, [binary, {active, true}]),
-    HostAddr = parse_host(Host),
-    ok = gen_udp:send(Socket, HostAddr, Port, Packet),
-
+    ok = gen_udp:send(Socket, parse_host(Host), Port, Packet),
     Result =
         receive
-            {udp, Socket, _IP, _Port, Response} ->
-                %% Check if it's a Version Negotiation packet
-                case Response of
-                    <<1:1, _:7, 0:32, _/binary>> ->
-                        %% Version 0 indicates Version Negotiation
-                        {ok, version_negotiation_received};
-                    _ ->
-                        {ok, other_response}
-                end
+            {udp, Socket, _IP, _Port,
+                <<1:1, _:7, 0:32, DL, _:DL/binary, SL, _:SL/binary, Versions/binary>>} ->
+                {ok, [V || <<V:32>> <= Versions]};
+            {udp, Socket, _IP, _Port, Other} ->
+                {error, {other_response, Other}}
         after 2000 ->
             {error, no_response}
         end,
-
     gen_udp:close(Socket),
 
     case Result of
-        {ok, version_negotiation_received} ->
+        {ok, Offered} ->
+            ?assert(lists:member(?QUIC_VERSION_1, Offered)),
             {comment, "Version Negotiation packet received"};
-        {ok, other_response} ->
-            {comment, "Server responded (not VN packet)"};
+        {error, {other_response, _}} ->
+            ct:fail(expected_version_negotiation);
         {error, no_response} ->
-            {comment, "No response to unknown version"}
+            ct:fail(no_response_to_unknown_version)
     end.
 
 connection_close(Config) ->
     ct:comment("Test connection close"),
-    case get_server(aioquic, Config) of
-        {ok, Host, Port, _Features} ->
-            case check_server_reachable(Host, Port) of
-                true ->
-                    do_connection_close_test(Host, Port);
-                false ->
-                    {skip, "Server not reachable"}
-            end;
-        {error, not_found} ->
-            {skip, "No server configured"}
-    end.
+    with_server(aioquic, Config, fun do_connection_close_test/2).
 
 do_connection_close_test(Host, Port) ->
-    Opts = #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>]},
-
-    case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
-            %% Wait briefly for connection or just proceed
-            timer:sleep(100),
-            %% Initiate close
-            ok = quic:close(ConnRef, normal),
-            %% Wait for close confirmation
-            receive
-                {quic, ConnRef, {closed, _Reason}} ->
-                    {comment, "Connection closed successfully"}
-            after 1000 ->
-                {comment, "Close initiated"}
-            end;
-        {error, Reason} ->
-            {comment, io_lib:format("Connection failed: ~p", [Reason])}
-    end.
+    {ok, ConnRef} = connect(Host, Port, #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>]}),
+    _ = await_connected(ConnRef, Host, Port),
+    MRef = erlang:monitor(process, ConnRef),
+    ok = quic:close(ConnRef, normal),
+    receive
+        {quic, ConnRef, {closed, _Reason}} -> ok
+    after 2000 ->
+        ct:fail(no_closed_event)
+    end,
+    receive
+        {'DOWN', MRef, process, ConnRef, _} -> ok
+    after 2000 ->
+        ct:fail(connection_still_running)
+    end,
+    {comment, "Connection closed"}.
 
 idle_timeout(Config) ->
     ct:comment("Test idle timeout with short client timeout"),
-    case get_server(aioquic, Config) of
-        {ok, Host, Port, _Features} ->
-            case check_server_reachable(Host, Port) of
-                true ->
-                    do_idle_timeout_test(Host, Port);
-                false ->
-                    {skip, "Server not reachable"}
-            end;
-        {error, not_found} ->
-            {skip, "No server configured"}
-    end.
+    with_server(aioquic, Config, fun do_idle_timeout_test/2).
 
 do_idle_timeout_test(Host, Port) ->
-    %% Use a short client-side idle timeout (2 seconds)
     Opts = #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>], idle_timeout => 2000},
-
-    case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
-            case wait_for_connected(ConnRef, ?HANDSHAKE_TIMEOUT) of
-                {ok, _Info} ->
-                    ct:pal("Connected, waiting for idle timeout..."),
-                    %% Wait for idle timeout - should trigger within ~2-3 seconds
-                    receive
-                        {quic, ConnRef, {closed, idle_timeout}} ->
-                            ct:pal("Connection closed due to idle timeout"),
-                            ok;
-                        {quic, ConnRef, {closed, Reason}} ->
-                            ct:pal("Connection closed: ~p", [Reason]),
-                            ok
-                    after 10000 ->
-                        %% If no timeout occurred, close manually and pass
-                        quic:close(ConnRef, normal),
-                        {comment, "Idle timeout not triggered, closed manually"}
-                    end;
-                {error, Reason} ->
-                    {comment, io_lib:format("Connection failed: ~p", [Reason])}
-            end;
-        {error, Reason} ->
-            {comment, io_lib:format("Connect failed: ~p", [Reason])}
+    {ok, ConnRef} = connect(Host, Port, Opts),
+    _ = await_connected(ConnRef, Host, Port),
+    receive
+        {quic, ConnRef, {closed, Reason}} ->
+            ?assertEqual(idle_timeout, Reason),
+            {comment, "Connection closed on idle timeout"}
+    after 10000 ->
+        quic:close(ConnRef, normal),
+        ct:fail(idle_timeout_not_triggered)
     end.
 
 %%====================================================================
@@ -703,53 +585,25 @@ do_idle_timeout_test(Host, Port) ->
 stream_data_transfer(Config) ->
     ct:comment("Test stream data transfer"),
     case get_server(aioquic, Config) of
-        {ok, Host, Port, Features} ->
-            case {check_server_reachable(Host, Port), lists:member(streams, Features)} of
-                {true, true} ->
-                    do_stream_data_test(Host, Port);
-                {false, _} ->
-                    {skip, "Server not reachable"};
-                {_, false} ->
-                    {skip, "Server doesn't support streams feature"}
+        {ok, _Host, _Port, Features} ->
+            case lists:member(streams, Features) of
+                true -> with_server(aioquic, Config, fun do_stream_data_test/2);
+                false -> {skip, "Server doesn't support streams feature"}
             end;
         {error, not_found} ->
             {skip, "No server configured"}
     end.
 
 do_stream_data_test(Host, Port) ->
-    Opts = #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>]},
-
-    case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
-            %% Wait for connection
-            case wait_for_connected(ConnRef, ?HANDSHAKE_TIMEOUT) of
-                {ok, _Info} ->
-                    %% Open a stream and send data
-                    case quic:open_stream(ConnRef) of
-                        {ok, StreamId} ->
-                            TestData = <<"Hello, QUIC!">>,
-                            ok = quic:send_data(ConnRef, StreamId, TestData, true),
-                            %% Wait for echo response
-                            Result = wait_for_stream_data(ConnRef, StreamId, ?STREAM_TIMEOUT),
-                            quic:close(ConnRef, normal),
-                            case Result of
-                                {ok, RecvData} ->
-                                    ct:log("Sent: ~p, Received: ~p", [TestData, RecvData]),
-                                    {comment, "Stream data transferred"};
-                                {error, Reason} ->
-                                    {comment, io_lib:format("Stream read failed: ~p", [Reason])}
-                            end;
-                        {error, Reason} ->
-                            quic:close(ConnRef, normal),
-                            {comment, io_lib:format("Failed to open stream: ~p", [Reason])}
-                    end;
-                {error, Reason} ->
-                    quic:close(ConnRef, normal),
-                    {comment, io_lib:format("Handshake failed: ~p", [Reason])}
-            end;
-        {error, Reason} ->
-            {comment, io_lib:format("Connection failed: ~p", [Reason])}
-    end.
+    {ok, ConnRef} = connect(Host, Port, #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>]}),
+    _ = await_connected(ConnRef, Host, Port),
+    {ok, StreamId} = quic:open_stream(ConnRef),
+    TestData = <<"Hello, QUIC!">>,
+    ok = quic:send_data(ConnRef, StreamId, TestData, true),
+    Result = wait_for_stream_data(ConnRef, StreamId, ?STREAM_TIMEOUT),
+    quic:close(ConnRef, normal),
+    ?assertEqual({ok, TestData}, Result),
+    {comment, "Stream data echoed"}.
 
 wait_for_stream_data(ConnRef, StreamId, Timeout) ->
     receive
@@ -765,85 +619,30 @@ wait_for_stream_data(ConnRef, StreamId, Timeout) ->
 
 bidirectional_stream(Config) ->
     ct:comment("Test bidirectional stream"),
-    %% Similar to stream_data_transfer but explicitly tests bidirectional
-    case get_server(aioquic, Config) of
-        {ok, Host, Port, _Features} ->
-            case check_server_reachable(Host, Port) of
-                true ->
-                    do_bidi_stream_test(Host, Port);
-                false ->
-                    {skip, "Server not reachable"}
-            end;
-        {error, not_found} ->
-            {skip, "No server configured"}
-    end.
+    with_server(aioquic, Config, fun do_bidi_stream_test/2).
 
 do_bidi_stream_test(Host, Port) ->
-    Opts = #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>]},
-
-    case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
-            case wait_for_connected(ConnRef, ?HANDSHAKE_TIMEOUT) of
-                {ok, _Info} ->
-                    case quic:open_stream(ConnRef) of
-                        {ok, StreamId} ->
-                            %% Verify it's a bidirectional stream (client-initiated = 0, 4, 8, ...)
-                            ?assertEqual(0, StreamId rem 4),
-                            quic:close(ConnRef, normal),
-                            {comment, io_lib:format("Opened bidi stream ~p", [StreamId])};
-                        {error, Reason} ->
-                            quic:close(ConnRef, normal),
-                            {comment, io_lib:format("Failed: ~p", [Reason])}
-                    end;
-                {error, Reason} ->
-                    quic:close(ConnRef, normal),
-                    {comment, io_lib:format("Handshake failed: ~p", [Reason])}
-            end;
-        {error, Reason} ->
-            {comment, io_lib:format("Connection failed: ~p", [Reason])}
-    end.
+    {ok, ConnRef} = connect(Host, Port, #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>]}),
+    _ = await_connected(ConnRef, Host, Port),
+    {ok, StreamId} = quic:open_stream(ConnRef),
+    quic:close(ConnRef, normal),
+    %% Client-initiated bidirectional: 0, 4, 8, ...
+    ?assertEqual(0, StreamId rem 4),
+    {comment, io_lib:format("Opened bidi stream ~p", [StreamId])}.
 
 unidirectional_stream(Config) ->
     ct:comment("Test unidirectional stream"),
-    case get_server(aioquic, Config) of
-        {ok, Host, Port, _Features} ->
-            case check_server_reachable(Host, Port) of
-                true ->
-                    do_uni_stream_test(Host, Port);
-                false ->
-                    {skip, "Server not reachable"}
-            end;
-        {error, not_found} ->
-            {skip, "No server configured"}
-    end.
+    with_server(aioquic, Config, fun do_uni_stream_test/2).
 
 do_uni_stream_test(Host, Port) ->
-    Opts = #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>]},
-
-    case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
-            case wait_for_connected(ConnRef, ?HANDSHAKE_TIMEOUT) of
-                {ok, _Info} ->
-                    case quic:open_unidirectional_stream(ConnRef) of
-                        {ok, StreamId} ->
-                            %% Verify it's a unidirectional stream (client-initiated uni = 2, 6, 10, ...)
-                            ?assertEqual(2, StreamId rem 4),
-                            %% Send data (uni streams are send-only for initiator)
-                            TestData = <<"Unidirectional test">>,
-                            ok = quic:send_data(ConnRef, StreamId, TestData, true),
-                            quic:close(ConnRef, normal),
-                            {comment, io_lib:format("Sent on uni stream ~p", [StreamId])};
-                        {error, Reason} ->
-                            quic:close(ConnRef, normal),
-                            {comment, io_lib:format("Failed: ~p", [Reason])}
-                    end;
-                {error, Reason} ->
-                    quic:close(ConnRef, normal),
-                    {comment, io_lib:format("Handshake failed: ~p", [Reason])}
-            end;
-        {error, Reason} ->
-            {comment, io_lib:format("Connection failed: ~p", [Reason])}
-    end.
+    {ok, ConnRef} = connect(Host, Port, #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>]}),
+    _ = await_connected(ConnRef, Host, Port),
+    {ok, StreamId} = quic:open_unidirectional_stream(ConnRef),
+    %% Client-initiated unidirectional: 2, 6, 10, ...
+    ?assertEqual(2, StreamId rem 4),
+    ok = quic:send_data(ConnRef, StreamId, <<"Unidirectional test">>, true),
+    quic:close(ConnRef, normal),
+    {comment, io_lib:format("Sent on uni stream ~p", [StreamId])}.
 
 %%====================================================================
 %% Helper Functions

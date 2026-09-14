@@ -380,7 +380,7 @@ do_discover(HostVar, PortVar, Label) ->
             PortStr = os:getenv(PortVar, "0"),
             try list_to_integer(PortStr) of
                 Port when is_integer(Port), Port > 0 ->
-                    case probe_udp(Host, Port) of
+                    case quic_test_peer:reachable(Host, Port) of
                         true -> {Host, Port};
                         false -> {skip, Label ++ " endpoint not reachable"}
                     end;
@@ -389,29 +389,6 @@ do_discover(HostVar, PortVar, Label) ->
             catch
                 _:_ ->
                     {skip, Label ++ " port invalid: " ++ PortStr}
-            end
-    end.
-
-probe_udp(Host, Port) ->
-    case gen_udp:open(0, [binary, {active, false}]) of
-        {ok, Sock} ->
-            Addr = resolve(Host),
-            Probe = <<0:64>>,
-            Result = gen_udp:send(Sock, Addr, Port, Probe),
-            gen_udp:close(Sock),
-            Result =:= ok;
-        _ ->
-            false
-    end.
-
-resolve(Host) ->
-    case inet:parse_address(Host) of
-        {ok, A} ->
-            A;
-        _ ->
-            case inet:getaddr(Host, inet) of
-                {ok, A} -> A;
-                _ -> {127, 0, 0, 1}
             end
     end.
 

@@ -52,7 +52,7 @@ init_per_suite(Config) ->
     Port = list_to_integer(os:getenv("QUIC_SERVER_PORT", "4433")),
 
     %% Wait for server to be reachable
-    case wait_for_server(Host, Port, 10) of
+    case quic_test_peer:wait_reachable(Host, Port, 10) of
         ok ->
             ct:pal("Server reachable at ~s:~p", [Host, Port]),
             [{host, Host}, {port, Port} | Config];
@@ -186,30 +186,6 @@ streaming_still_works(Config) ->
 %%====================================================================
 %% Helper Functions
 %%====================================================================
-
-wait_for_server(_Host, _Port, 0) ->
-    {error, timeout};
-wait_for_server(Host, Port, Retries) ->
-    case gen_udp:open(0, [binary, {active, false}]) of
-        {ok, Socket} ->
-            HostAddr =
-                case inet:parse_address(Host) of
-                    {ok, Addr} -> Addr;
-                    {error, _} -> Host
-                end,
-            Result = gen_udp:send(Socket, HostAddr, Port, <<0:32>>),
-            gen_udp:close(Socket),
-            case Result of
-                ok ->
-                    ok;
-                {error, _} ->
-                    timer:sleep(1000),
-                    wait_for_server(Host, Port, Retries - 1)
-            end;
-        {error, _} ->
-            timer:sleep(1000),
-            wait_for_server(Host, Port, Retries - 1)
-    end.
 
 collect_stream_data(ConnRef, StreamId, Acc, Timeout) ->
     receive
