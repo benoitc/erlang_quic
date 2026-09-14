@@ -139,6 +139,12 @@
 %% Test exports
 -ifdef(TEST).
 -export([
+    test_state_with_loss/1,
+    test_state_get/2,
+    test_state_set/3,
+    set_pto_timer/1,
+    pto_due/1,
+    select_cipher/2,
     chunk_crypto/3,
     add_to_ack_ranges/2,
     cap_ack_ranges/1,
@@ -151,6 +157,7 @@
     close_reason_to_code/1,
     %% Out-of-order reassembly (RFC 9000 §2.2, §13.3)
     extract_contiguous_data/2,
+    keep_longest_chunk/3,
     trim_reassembly_buffer/2,
     %% Migration frame classification (RFC 9000 Section 9.1)
     is_probing_frame/1,
@@ -223,7 +230,6 @@
     test_maybe_send_ack_app/2,
     test_classify_recv_trigger/2,
     %% Per-space ACK isolation (RFC 9000 Section 12.3)
-    test_state_with_loss/1,
     test_loss_state/1
 ]).
 -endif.
@@ -583,6 +589,10 @@
     %% cycle when the new deadline is within ?PTO_RESET_TOLERANCE_MS of
     %% the existing one.
     pto_scheduled_at = undefined :: integer() | undefined,
+    %% Deadline the armed pto_timer will fire at. The timer is never
+    %% cancelled when the deadline moves later; the fire handler re-arms
+    %% for the remainder instead (see set_pto_timer/1).
+    pto_armed_at = undefined :: integer() | undefined,
     idle_timer :: reference() | undefined,
 
     %% Keep-alive (RFC 9000 - PING frames for liveness)
@@ -1303,6 +1313,7 @@ init({server, Opts}) ->
         local_addr = LocalAddr,
         % Listener is the owner for now
         owner = Listener,
+        owner_mon = maybe_monitor_owner(Opts, Listener, true),
         conn_ref = ConnRef,
         verify = maps:get(verify, Opts, false),
         cacerts = maps:get(cacerts, Opts, undefined),
@@ -1575,17 +1586,17 @@ open_client_socket_backend({IP, _Port}, Opts) ->
 address_family(IP) when tuple_size(IP) =:= 4 -> inet;
 address_family(IP) when tuple_size(IP) =:= 8 -> inet6.
 
-%% Monitor the owner only for supervised connections, which aren't linked to
-%% their caller. undefined keeps caller-linked and server connections as-is.
-maybe_monitor_owner(Opts, Owner) ->
-    case maps:get(monitor_owner, Opts, false) of
+%% `monitor_owner' defaults to false for client connections, which are
+%% linked to their caller unless supervised, and to true for accepted
+%% connections, whose handler is neither linked to nor supervised by us.
+maybe_monitor_owner(Opts, Owner, Default) ->
+    case maps:get(monitor_owner, Opts, Default) of
         true -> erlang:monitor(process, Owner);
         false -> undefined
     end.
 
-%% Swap the owner, re-pointing the owner monitor when one exists. Supervised
-%% connections monitor their owner (set in init_client_state); caller-linked
-%% and server connections do not (owner_mon =:= undefined) and keep that.
+%% Swap the owner, re-pointing the owner monitor when one exists.
+%% Connections without one (caller-linked clients) keep none.
 reown(#state{owner_mon = undefined} = State, NewOwner) ->
     State#state{owner = NewOwner};
 reown(#state{owner_mon = OldMon} = State, NewOwner) ->
@@ -1716,7 +1727,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         %% Only supervised connections (started by quic_conn_sup) monitor their
         %% owner; caller-linked connections rely on the link instead, so they do
         %% not stop a different owner's death from propagating through the link.
-        owner_mon = maybe_monitor_owner(Opts, Owner),
+        owner_mon = maybe_monitor_owner(Opts, Owner, false),
         conn_ref = ConnRef,
         server_name = ServerName,
         verify = normalize_verify(maps:get(verify, Opts, true)),
@@ -2654,13 +2665,20 @@ handle_common_event(info, {hs_flight_timeout, _Ref}, _StateName, State) ->
 handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref} = State) when
     Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
 ->
-    case disconnect_timeout_expired(State) of
-        true ->
-            {next_state, draining, declare_peer_dead(State#state{pto_timer = undefined})};
-        false ->
-            %% Handle PTO timeout - send probe packet
-            NewState = handle_pto_timeout(State#state{pto_timer = undefined}),
-            {keep_state, NewState}
+    case pto_due(State) of
+        idle ->
+            {keep_state, State#state{pto_timer = undefined, pto_armed_at = undefined}};
+        {later, Remaining} ->
+            {keep_state, arm_pto_timer(Remaining, State)};
+        due ->
+            State1 = State#state{pto_timer = undefined, pto_armed_at = undefined},
+            case disconnect_timeout_expired(State1) of
+                true ->
+                    {next_state, draining, declare_peer_dead(State1)};
+                false ->
+                    %% Handle PTO timeout - send probe packet
+                    {keep_state, handle_pto_timeout(State1)}
+            end
     end;
 handle_common_event(
     info, {disconnect_check, Ref}, StateName, #state{disconnect_timer = Ref} = State
@@ -2761,8 +2779,8 @@ handle_common_event(
 ) when Reason =/= normal andalso Reason =/= shutdown ->
     Owner ! {quic, self(), {closed, {receiver_exit, Reason}}},
     {stop, {shutdown, {receiver_exit, Reason}}, State};
-%% Owner process gone (client connections monitor their owner). Tear down
-%% so a supervised connection that is not linked to its owner doesn't leak.
+%% Owner process gone. Tear down so a connection that is not linked to its
+%% owner doesn't stay up delivering into a dead mailbox.
 handle_common_event(
     info,
     {'DOWN', Mon, process, _Pid, _Reason},
@@ -2770,6 +2788,17 @@ handle_common_event(
     #state{owner_mon = Mon} = State
 ) ->
     {stop, {shutdown, owner_down}, State};
+%% The listener's shared sender went away: flush direct from now on.
+handle_common_event(
+    info,
+    {'DOWN', Mon, process, _Pid, _Reason},
+    _StateName,
+    #state{socket_state = SS} = State
+) ->
+    case quic_socket:sender_down(SS, Mon) of
+        {ok, SS1} -> {keep_state, State#state{socket_state = SS1}};
+        false -> {keep_state, State}
+    end;
 handle_common_event(
     info,
     {server_hs_rtx, Ref},
@@ -2958,10 +2987,21 @@ send_client_hello(State) ->
 %% code and a `ciphers' option had nowhere to take effect.
 select_cipher(ClientCipherSuites, ServerPreference) ->
     ClientCiphers = [cipher_code_to_atom(C) || C <- ClientCipherSuites],
-    select_first_match(ServerPreference, ClientCiphers).
+    %% A client that puts ChaCha20-Poly1305 first is saying it lacks
+    %% AES hardware; honour that when the server allows the suite
+    %% (the same rule as OpenSSL's SSL_OP_PRIORITIZE_CHACHA).
+    case ClientCiphers of
+        [chacha20_poly1305 | _] ->
+            case lists:member(chacha20_poly1305, ServerPreference) of
+                true -> chacha20_poly1305;
+                false -> select_first_match(ServerPreference, ClientCiphers)
+            end;
+        _ ->
+            select_first_match(ServerPreference, ClientCiphers)
+    end.
 
 default_cipher_preference() ->
-    [aes_128_gcm, aes_256_gcm, chacha20_poly1305].
+    quic_crypto:default_cipher_preference().
 
 % Default
 select_first_match([], _) ->
@@ -5634,13 +5674,17 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                                 State1
                         end,
 
-                    %% Handle PMTU probe losses
-                    %% Pass packet size directly since packets are removed from sent_packets
+                    %% Black hole detection: one strike per loss event, and
+                    %% any large packet acked in this ACK clears the strikes.
+                    State2a = handle_pmtu_ack_event(AckedPackets, State2),
+                    State2b = handle_pmtu_loss_event(LostPackets, State2a),
+
+                    %% Handle PMTU probe losses while searching
                     State3 = lists:foldl(
                         fun(#sent_packet{pn = PN, size = Size}, S) ->
                             handle_pmtu_probe_loss(PN, Size, S)
                         end,
-                        State2,
+                        State2b,
                         LostPackets
                     ),
 
@@ -6238,7 +6282,7 @@ buffer_crypto_data(Level, Offset, Data, State) ->
                 end,
             %% Add data to buffer, keeping the longer chunk if the peer
             %% already sent one at this offset.
-            NewBuffer = keep_longest_chunk(Offset, Data, Buffer),
+            {NewBuffer, _} = keep_longest_chunk(Offset, Data, Buffer),
             NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State0#state.crypto_buffer),
 
             State1 = State0#state{crypto_buffer = NewCryptoBuffer},
@@ -6278,7 +6322,7 @@ process_crypto_buffer(Level, State) ->
             %% the offset, then retry once. Storing the trimmed buffer also
             %% stops duplicate retransmissions from accumulating against
             %% ?MAX_CRYPTO_BUFFER_BYTES and closing a healthy connection.
-            Trimmed = trim_reassembly_buffer(Buffer, ExpectedOffset),
+            {Trimmed, _} = trim_reassembly_buffer(Buffer, ExpectedOffset),
             State1 = State#state{
                 crypto_buffer = maps:put(Level, Trimmed, State#state.crypto_buffer)
             },
@@ -7709,19 +7753,21 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
 
                     %% Fast path: in-order delivery with empty buffer
                     %% Avoids the buffer insert and extract_contiguous_data for common case
-                    {DeliverData, NewRecvOffset, NewBuffer, DeliverFin} =
+                    {DeliverData, NewRecvOffset, NewBuffer, DeliverFin, BufferedDelta} =
                         case Offset =:= CurrentOffset andalso gb_trees:is_empty(RecvBuffer) of
                             true ->
                                 %% In-order with empty buffer: deliver directly
-                                {Data, EndOffset, RecvBuffer, Fin};
+                                {Data, EndOffset, RecvBuffer, Fin, 0};
                             false ->
                                 %% Out-of-order or buffer has data: use buffer path
-                                UpdatedBuffer = keep_longest_chunk(Offset, Data, RecvBuffer),
-                                {ExtractedData, ExtractedOffset, ExtractedBuffer} =
+                                {UpdatedBuffer, Added} =
+                                    keep_longest_chunk(Offset, Data, RecvBuffer),
+                                {ExtractedData, ExtractedOffset, ExtractedBuffer, Removed} =
                                     extract_contiguous_data(UpdatedBuffer, CurrentOffset),
                                 ExtractedFin =
                                     FinalSize =/= undefined andalso ExtractedOffset >= FinalSize,
-                                {ExtractedData, ExtractedOffset, ExtractedBuffer, ExtractedFin}
+                                {ExtractedData, ExtractedOffset, ExtractedBuffer, ExtractedFin,
+                                    Added - Removed}
                         end,
 
                     %% Deliver contiguous data to owner
@@ -7739,6 +7785,7 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                         recv_offset = NewRecvOffset,
                         recv_fin = DeliverFin,
                         recv_buffer = NewBuffer,
+                        recv_buffered = Stream#stream_state.recv_buffered + BufferedDelta,
                         final_size = FinalSize,
                         recv_done =
                             (DeliverFin andalso gb_trees:is_empty(NewBuffer)) orelse
@@ -7760,11 +7807,7 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                     %% bytes count as new but are never delivered twice, and
                     %% that drift would eventually trip the cap on a stream
                     %% holding nothing.
-                    NewRecvBufferBytes = max(
-                        0,
-                        RecvBufferBytes - reassembly_buffer_bytes(RecvBuffer) +
-                            reassembly_buffer_bytes(NewBuffer)
-                    ),
+                    NewRecvBufferBytes = max(0, RecvBufferBytes + BufferedDelta),
 
                     State1 = State#state{
                         streams = maps:put(StreamId, NewStream, Streams),
@@ -7909,34 +7952,28 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
 %% Extract contiguous data from buffer starting at Offset
 %% Returns {Data, NewOffset, UpdatedBuffer}
 %% Uses binary append accumulator - O(1) amortized due to refc binary optimization
+%% Returns {Delivered, NewOffset, Buffer, Removed}: Removed is how many
+%% bytes left the tree, delivered or trimmed away, so the caller can keep
+%% its byte count without walking the tree.
 extract_contiguous_data(Buffer, Offset) ->
-    extract_contiguous_data(Buffer, Offset, <<>>).
+    extract_contiguous_data(Buffer, Offset, <<>>, 0).
 
-extract_contiguous_data(Buffer, Offset, Acc) ->
+extract_contiguous_data(Buffer, Offset, Acc, Removed) ->
     case gb_trees:take_any(Offset, Buffer) of
         {Data, NewBuffer} ->
-            %% Found data at this offset, continue looking for next chunk
-            %% Binary append is O(1) amortized due to Erlang's pre-allocation
             NextOffset = Offset + byte_size(Data),
-            extract_contiguous_data(NewBuffer, NextOffset, <<Acc/binary, Data/binary>>);
+            extract_contiguous_data(
+                NewBuffer, NextOffset, <<Acc/binary, Data/binary>>, Removed + byte_size(Data)
+            );
         error ->
-            %% Nothing keyed exactly at Offset, which does not mean a gap:
-            %% a peer may split or coalesce retransmitted data differently
-            %% (RFC 9000 §2.2, §13.3), so the bytes we want can sit inside
-            %% a chunk that starts earlier. Drop what is already delivered,
-            %% re-key what straddles Offset, then retry once. When every
-            %% buffered chunk starts above Offset (the normal shape while
-            %% waiting on a hole, and this runs once per received packet
-            %% until the hole fills) the ordered tree answers that with one
-            %% smallest-key lookup and no walk.
             case gb_trees:is_empty(Buffer) orelse element(1, gb_trees:smallest(Buffer)) > Offset of
                 true ->
-                    {Acc, Offset, Buffer};
+                    {Acc, Offset, Buffer, Removed};
                 false ->
-                    Trimmed = trim_reassembly_buffer(Buffer, Offset),
+                    {Trimmed, Gone} = trim_reassembly_buffer(Buffer, Offset),
                     case gb_trees:is_defined(Offset, Trimmed) of
-                        true -> extract_contiguous_data(Trimmed, Offset, Acc);
-                        false -> {Acc, Offset, Trimmed}
+                        true -> extract_contiguous_data(Trimmed, Offset, Acc, Removed + Gone);
+                        false -> {Acc, Offset, Trimmed, Removed + Gone}
                     end
             end
     end.
@@ -7945,35 +7982,43 @@ extract_contiguous_data(Buffer, Offset, Acc) ->
 %% straddle it, re-keying them to Offset. Keeps the longest chunk at each
 %% offset, so overlapping retransmissions collapse instead of accumulating.
 %% Only chunks keyed below Offset can qualify, so the ordered walk stops
-%% there; everything above is left untouched.
+%% there; everything above is left untouched. Returns {Buffer, Removed}
+%% with the bytes that left the tree.
 trim_reassembly_buffer(Buffer, Offset) ->
-    trim_reassembly_buffer(gb_trees:iterator(Buffer), Buffer, Offset).
+    trim_reassembly_buffer(gb_trees:iterator(Buffer), Buffer, Offset, 0).
 
-trim_reassembly_buffer(Iter0, Buffer, Offset) ->
+trim_reassembly_buffer(Iter0, Buffer, Offset, Removed) ->
     case gb_trees:next(Iter0) of
         {Off, Data, Iter} when Off < Offset ->
             End = Off + byte_size(Data),
             Buffer1 = gb_trees:delete(Off, Buffer),
-            Buffer2 =
+            Removed1 = Removed + byte_size(Data),
+            {Buffer2, Added} =
                 case End > Offset of
                     true ->
                         Kept = binary:part(Data, Offset - Off, End - Offset),
                         keep_longest_chunk(Offset, Kept, Buffer1);
                     false ->
-                        Buffer1
+                        {Buffer1, 0}
                 end,
-            trim_reassembly_buffer(Iter, Buffer2, Offset);
+            trim_reassembly_buffer(Iter, Buffer2, Offset, Removed1 - Added);
         _ ->
-            Buffer
+            {Buffer, Removed}
     end.
 
+%% Returns {Buffer, Delta}: the change in bytes held by the tree.
 keep_longest_chunk(Off, Data, Buffer) ->
     case gb_trees:lookup(Off, Buffer) of
-        {value, Existing} when byte_size(Existing) >= byte_size(Data) -> Buffer;
-        _ -> gb_trees:enter(Off, Data, Buffer)
+        {value, Existing} when byte_size(Existing) >= byte_size(Data) ->
+            {Buffer, 0};
+        {value, Existing} ->
+            {gb_trees:enter(Off, Data, Buffer), byte_size(Data) - byte_size(Existing)};
+        none ->
+            {gb_trees:enter(Off, Data, Buffer), byte_size(Data)}
     end.
 
-%% Total bytes held in a reassembly buffer.
+%% Total bytes held in a CRYPTO reassembly buffer (stream buffers keep a
+%% running count instead).
 reassembly_buffer_bytes(Buffer) ->
     lists:foldl(fun(Data, Acc) -> Acc + byte_size(Data) end, 0, gb_trees:values(Buffer)).
 
@@ -11428,11 +11473,17 @@ send_keep_alive_ping(State) ->
 %% and the new deadline is within ?PTO_RESET_TOLERANCE_MS of the existing
 %% one; this eliminates most per-ACK timer churn in steady-state bulk
 %% transfers where bytes_in_flight and smoothed RTT are stable.
+%% Lazy re-arm: a send or ACK moves the deadline later, and the armed
+%% timer is left alone; when it fires early the handler re-arms for the
+%% remainder. Only a deadline that moved earlier by more than the
+%% tolerance costs a cancel. Bulk transfers touched the PTO on every
+%% packet, and cancel_timer + send_after per packet was a measurable
+%% share of the server receive path on small hosts.
 set_pto_timer(
     #state{
         loss_state = LossState,
         pto_timer = OldTimer,
-        pto_scheduled_at = OldDeadline
+        pto_armed_at = ArmedAt
     } = State
 ) ->
     case quic_loss:bytes_in_flight(LossState) > 0 of
@@ -11440,22 +11491,31 @@ set_pto_timer(
             PTO = quic_loss:get_pto(LossState),
             Now = erlang:monotonic_time(millisecond),
             NewDeadline = Now + PTO,
-            Stable =
-                (OldTimer =/= undefined) andalso
-                    (OldDeadline =/= undefined) andalso
-                    (abs(NewDeadline - OldDeadline) < ?PTO_RESET_TOLERANCE_MS),
-            case Stable of
+            case OldTimer =/= undefined andalso NewDeadline + ?PTO_RESET_TOLERANCE_MS >= ArmedAt of
                 true ->
-                    State;
+                    State#state{pto_scheduled_at = NewDeadline};
                 false ->
                     cancel_timer(OldTimer),
-                    Ref = make_ref(),
-                    erlang:send_after(PTO, self(), {pto_timeout, Ref}),
-                    State#state{pto_timer = Ref, pto_scheduled_at = NewDeadline}
+                    arm_pto_timer(PTO, State#state{pto_scheduled_at = NewDeadline})
             end;
         false ->
-            cancel_timer(OldTimer),
-            State#state{pto_timer = undefined, pto_scheduled_at = undefined}
+            State#state{pto_scheduled_at = undefined}
+    end.
+
+arm_pto_timer(Delay, State) ->
+    Ref = make_ref(),
+    erlang:send_after(Delay, self(), {pto_timeout, Ref}),
+    State#state{pto_timer = Ref, pto_armed_at = erlang:monotonic_time(millisecond) + Delay}.
+
+%% What a firing PTO timer should do: nothing (flight drained since it
+%% was armed), wait the remainder (deadline moved later), or probe.
+pto_due(#state{pto_scheduled_at = undefined}) ->
+    idle;
+pto_due(#state{pto_scheduled_at = Deadline}) ->
+    Now = erlang:monotonic_time(millisecond),
+    case Deadline - Now > ?PTO_RESET_TOLERANCE_MS of
+        true -> {later, Deadline - Now};
+        false -> due
     end.
 
 %% Helper to cancel a timer reference
@@ -13555,9 +13615,7 @@ handle_pmtu_probe_ack(PacketNumber, #state{pmtu_state = PMTUState, cc_state = CC
 -spec handle_pmtu_probe_loss(non_neg_integer(), non_neg_integer(), #state{}) -> #state{}.
 handle_pmtu_probe_loss(_PacketNumber, _PacketSize, #state{pmtu_state = undefined} = State) ->
     State;
-handle_pmtu_probe_loss(
-    PacketNumber, PacketSize, #state{pmtu_state = PMTUState, cc_state = CCState} = State
-) ->
+handle_pmtu_probe_loss(PacketNumber, _PacketSize, #state{pmtu_state = PMTUState} = State) ->
     case quic_pmtu:get_state(PMTUState) of
         searching ->
             %% Check if this loss is for our probe packet
@@ -13571,22 +13629,43 @@ handle_pmtu_probe_loss(
                     %% Loss of non-probe packet - ignore for PMTU
                     State
             end;
-        search_complete ->
-            %% Track loss for black hole detection
-            %% Only count losses of large packets (near current MTU)
-            OldMTU = quic_pmtu:current_mtu(PMTUState),
-            NewPMTUState = quic_pmtu:on_packet_lost(PacketSize, PMTUState),
-            NewMTU = quic_pmtu:current_mtu(NewPMTUState),
+        _ ->
+            %% Black hole detection is handled per event, see
+            %% handle_pmtu_loss_event/2.
+            State
+    end.
 
-            %% Update congestion control if MTU decreased (black hole)
+%% @doc Black hole detection, ack side: a large packet acknowledged in
+%% this ACK proves the path still passes them.
+-spec handle_pmtu_ack_event([#sent_packet{}], #state{}) -> #state{}.
+handle_pmtu_ack_event(_Acked, #state{pmtu_state = undefined} = State) ->
+    State;
+handle_pmtu_ack_event([], State) ->
+    State;
+handle_pmtu_ack_event(Acked, #state{pmtu_state = PMTUState} = State) ->
+    Sizes = [Size || #sent_packet{size = Size} <- Acked],
+    State#state{pmtu_state = quic_pmtu:on_ack_event(Sizes, PMTUState)}.
+
+%% @doc Black hole detection, loss side: the newly declared losses of one
+%% ACK are one strike if any of them was a large packet. Drops the MTU
+%% to base when the strikes reach the threshold.
+-spec handle_pmtu_loss_event([#sent_packet{}], #state{}) -> #state{}.
+handle_pmtu_loss_event(_Lost, #state{pmtu_state = undefined} = State) ->
+    State;
+handle_pmtu_loss_event([], State) ->
+    State;
+handle_pmtu_loss_event(Lost, #state{pmtu_state = PMTUState, cc_state = CCState} = State) ->
+    case quic_pmtu:get_state(PMTUState) of
+        search_complete ->
+            OldMTU = quic_pmtu:current_mtu(PMTUState),
+            Sizes = [Size || #sent_packet{size = Size} <- Lost],
+            NewPMTUState = quic_pmtu:on_loss_event(Sizes, PMTUState),
+            NewMTU = quic_pmtu:current_mtu(NewPMTUState),
             NewCCState =
                 case NewMTU < OldMTU of
-                    true ->
-                        quic_cc:update_mtu(CCState, NewMTU);
-                    false ->
-                        CCState
+                    true -> quic_cc:update_mtu(CCState, NewMTU);
+                    false -> CCState
                 end,
-
             State#state{
                 pmtu_state = NewPMTUState,
                 cc_state = NewCCState
@@ -13810,6 +13889,12 @@ test_state_with_socket(State, Socket) -> State#state{socket = Socket}.
 
 %% Minimal #state{} carrying a caller-supplied loss tracker, for tests
 %% that need to observe what an incoming frame does to it.
+test_state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
+test_state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at.
+
+test_state_set(#state{} = S, loss_state, V) -> S#state{loss_state = V};
+test_state_set(#state{} = S, pto_scheduled_at, V) -> S#state{pto_scheduled_at = V}.
+
 -spec test_state_with_loss(quic_loss:loss_state()) -> #state{}.
 test_state_with_loss(LossState) ->
     #state{

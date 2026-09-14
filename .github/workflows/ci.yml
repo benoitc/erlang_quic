@@ -52,6 +52,19 @@ jobs:
       - name: Compile
         run: rebar3 compile
 
+      # The NIF is opt-in. Runners have cmake installed, so this fails if a
+      # plain compile ever starts building it again.
+      - name: Assert the NIF is not built by default
+        run: |
+          test ! -e priv/quic_crypto_nif.so || { echo "NIF built without QUIC_BUILD_NIF=1"; exit 1; }
+          rebar3 as test compile
+          erl -noshell -pa _build/test/lib/quic/ebin -eval '
+            application:ensure_all_started(quic),
+            case quic_crypto_nif:is_loaded() of
+              false -> halt(0);
+              true -> io:format("NIF loaded without QUIC_BUILD_NIF=1~n"), halt(1)
+            end.'
+
       - name: Run unit tests
         run: rebar3 eunit
 
@@ -62,6 +75,8 @@ jobs:
     name: macOS
     needs: unit-tests
     runs-on: macos-15
+    env:
+      QUIC_BUILD_NIF: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -122,6 +137,7 @@ jobs:
             fetch -q https://github.com/erlang/rebar3/releases/download/3.25.0/rebar3 -o rebar3
             chmod +x rebar3
 
+            export QUIC_BUILD_NIF=1
             ./rebar3 compile
 
             # bmake runs c_src/Makefile, which delegates to CMake; a
@@ -221,6 +237,8 @@ jobs:
     name: Crypto NIF
     needs: unit-tests
     runs-on: ubuntu-24.04
+    env:
+      QUIC_BUILD_NIF: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -274,8 +292,8 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev
 
-      # Compile first: the rebar pre_hook builds the NIF, and the ASan
-      # build below has to be the one left in priv/.
+      # Compile without QUIC_BUILD_NIF so the ASan build below is the only
+      # NIF in priv/.
       - name: Compile
         run: rebar3 as test compile
 
@@ -300,10 +318,11 @@ jobs:
         run: |
           erlc -o _build/test/lib/quic/test test/quic_nif_fuzz.erl
           # One cipher per emulator so an ASan abort names the cipher.
-          # ChaCha joins this list when it reaches the fused paths; the
-          # harness answers {error, nothing_exercised} until then, so a
-          # cipher that silently stops being covered fails here.
-          for CIPHER in aes_128_gcm aes_256_gcm; do
+          # ChaCha reaches the fused paths now, including its own C
+          # header-protection routine; the harness answers
+          # {error, nothing_exercised} for a cipher that does not, so
+          # one that silently stops being covered fails here.
+          for CIPHER in aes_128_gcm aes_256_gcm chacha20_poly1305; do
             LD_PRELOAD=$(gcc -print-file-name=libasan.so) \
               erl -noshell -pa _build/test/lib/quic/ebin -pa _build/test/lib/quic/test -eval "
                 application:ensure_all_started(quic),
@@ -330,9 +349,6 @@ jobs:
           otp-version: '28'
           rebar3-version: '3.24.0'
 
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev
-
       - name: Generate certificates
         run: |
           chmod +x ./certs/generate_certs.sh
@@ -340,6 +356,12 @@ jobs:
 
       - name: Compile
         run: rebar3 compile
+
+      # The harness asks for a 7 MB socket buffer and the kernel clamps it
+      # to rmem_max, 212992 on a stock runner, where loopback overflows and
+      # the gate would measure the host instead of the code.
+      - name: Raise socket buffer limits
+        run: sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
 
       # Asserts packet and retransmit counters, never a rate, so it does
       # not flake on a loaded runner. The socket-backend cases need

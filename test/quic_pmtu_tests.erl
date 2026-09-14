@@ -28,6 +28,10 @@ pmtu_test_() ->
         {"Probe timeout handling", fun probe_timeout_handling/0},
         {"Black hole detection with large packets", fun black_hole_detection/0},
         {"Black hole ignores small packet losses", fun black_hole_ignores_small_packets/0},
+        {"Black hole counts a loss event once, however many packets it lost",
+            fun black_hole_counts_events_not_packets/0},
+        {"Black hole strikes clear when a large packet is acked",
+            fun black_hole_clears_on_large_ack/0},
         {"MTU bounds validation", fun mtu_bounds_validation/0},
         {"Search threshold", fun search_threshold/0},
         {"Loss array algorithm", fun loss_array_algorithm/0},
@@ -537,3 +541,48 @@ stale_ack_handling() ->
     State4 = quic_pmtu:on_probe_lost(42, 5, State0),
     ?assertEqual([1350, 1500, undefined], State4#pmtu_state.lost),
     ?assertEqual(undefined, State4#pmtu_state.probe_pn).
+
+bh_state() ->
+    #pmtu_state{
+        state = search_complete,
+        current_mtu = 1400,
+        base_mtu = 1200,
+        max_mtu = 1500,
+        black_hole_count = 0,
+        black_hole_threshold = 6
+    }.
+
+%% A burst of full-size packets declared lost by one ACK (queue or
+%% congestion loss on a healthy path) is one strike, not one per packet.
+black_hole_counts_events_not_packets() ->
+    Burst = lists:duplicate(50, 1350),
+    State1 = quic_pmtu:on_loss_event(Burst, bh_state()),
+    ?assertEqual(search_complete, quic_pmtu:get_state(State1)),
+    ?assertEqual(1, State1#pmtu_state.black_hole_count),
+    %% Small packets in the same event do not add strikes
+    State2 = quic_pmtu:on_loss_event([200, 1350, 300], State1),
+    ?assertEqual(2, State2#pmtu_state.black_hole_count),
+    %% An event with no large packet is not a strike
+    State3 = quic_pmtu:on_loss_event([200, 300], State2),
+    ?assertEqual(2, State3#pmtu_state.black_hole_count),
+    %% Six events with a large loss each are the black hole
+    State4 = lists:foldl(
+        fun(_, S) -> quic_pmtu:on_loss_event(Burst, S) end, State3, lists:seq(1, 4)
+    ),
+    ?assertEqual(error, quic_pmtu:get_state(State4)),
+    ?assertEqual(1200, quic_pmtu:current_mtu(State4)).
+
+%% Strikes only mean something while no large packet gets through: an
+%% ACK carrying one restarts the count, an ACK of small packets does not.
+black_hole_clears_on_large_ack() ->
+    State1 = lists:foldl(
+        fun(_, S) -> quic_pmtu:on_loss_event([1350], S) end, bh_state(), lists:seq(1, 5)
+    ),
+    ?assertEqual(5, State1#pmtu_state.black_hole_count),
+    State2 = quic_pmtu:on_ack_event([100, 200], State1),
+    ?assertEqual(5, State2#pmtu_state.black_hole_count),
+    State3 = quic_pmtu:on_ack_event([100, 1350], State2),
+    ?assertEqual(0, State3#pmtu_state.black_hole_count),
+    State4 = quic_pmtu:on_loss_event([1350], State3),
+    ?assertEqual(search_complete, quic_pmtu:get_state(State4)),
+    ?assertEqual(1, State4#pmtu_state.black_hole_count).

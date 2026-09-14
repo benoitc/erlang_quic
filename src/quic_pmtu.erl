@@ -55,6 +55,8 @@
 
     %% Black hole detection
     on_packet_lost/2,
+    on_loss_event/2,
+    on_ack_event/2,
     on_packet_acked/1,
 
     %% Queries
@@ -539,12 +541,22 @@ on_probe_timeout(PMTUState) ->
 %% @param PMTUState Current PMTU state
 %% @returns Updated PMTU state, possibly in error state
 -spec on_packet_lost(pos_integer(), #pmtu_state{}) -> #pmtu_state{}.
-on_packet_lost(_PacketSize, #pmtu_state{state = disabled} = State) ->
+on_packet_lost(PacketSize, State) ->
+    on_loss_event([PacketSize], State).
+
+%% @doc One loss event (one ACK's worth of newly declared losses) with
+%% the sizes of the packets it lost. Counts as one black-hole strike
+%% when any of them was large: a burst of tens of full-size packets
+%% lost together, the normal shape of congestion or queue loss, is one
+%% signal, not one per packet. Black hole detection is looking for a
+%% path that has stopped passing large packets, not a lossy one.
+-spec on_loss_event([pos_integer()], #pmtu_state{}) -> #pmtu_state{}.
+on_loss_event(_Sizes, #pmtu_state{state = disabled} = State) ->
     State;
-on_packet_lost(PacketSize, #pmtu_state{state = search_complete, current_mtu = CurrentMTU} = State) ->
-    %% Only count losses of large packets (within 100 bytes of current MTU)
-    case PacketSize >= CurrentMTU - 100 of
-        true ->
+on_loss_event(Sizes, #pmtu_state{state = search_complete, current_mtu = CurrentMTU} = State) ->
+    %% Only large packets (within 100 bytes of the current MTU) count.
+    case [S || S <- Sizes, S >= CurrentMTU - 100] of
+        [PacketSize | _] ->
             #pmtu_state{
                 black_hole_count = Count,
                 black_hole_threshold = Threshold,
@@ -579,11 +591,11 @@ on_packet_lost(PacketSize, #pmtu_state{state = search_complete, current_mtu = Cu
                 false ->
                     State#pmtu_state{black_hole_count = NewCount}
             end;
-        false ->
-            %% Small packet loss - not indicative of MTU black hole
+        [] ->
+            %% Small packet losses are not indicative of an MTU black hole
             State
     end;
-on_packet_lost(_PacketSize, State) ->
+on_loss_event(_Sizes, State) ->
     State.
 
 %% @doc Reset black hole counter on successful ACK.
@@ -592,6 +604,19 @@ on_packet_acked(#pmtu_state{black_hole_count = 0} = State) ->
     State;
 on_packet_acked(State) ->
     State#pmtu_state{black_hole_count = 0}.
+
+%% @doc One ACK event with the sizes of the packets it acknowledged. A
+%% large packet getting through proves the path still passes them, so
+%% the strike count restarts; ACKs of small packets say nothing about
+%% it and leave the count alone.
+-spec on_ack_event([pos_integer()], #pmtu_state{}) -> #pmtu_state{}.
+on_ack_event(_Sizes, #pmtu_state{black_hole_count = 0} = State) ->
+    State;
+on_ack_event(Sizes, #pmtu_state{current_mtu = CurrentMTU} = State) ->
+    case lists:any(fun(S) -> S >= CurrentMTU - 100 end, Sizes) of
+        true -> on_packet_acked(State);
+        false -> State
+    end.
 
 %%====================================================================
 %% Queries

@@ -20,11 +20,12 @@ tree(Map) ->
     gb_trees:from_orddict(lists:sort(maps:to_list(Map))).
 
 extract(Buffer, Offset) ->
-    {Data, Off, Rest} = quic_connection:extract_contiguous_data(tree(Buffer), Offset),
+    {Data, Off, Rest, _Removed} = quic_connection:extract_contiguous_data(tree(Buffer), Offset),
     {Data, Off, maps:from_list(gb_trees:to_list(Rest))}.
 
 trim(Buffer, Offset) ->
-    maps:from_list(gb_trees:to_list(quic_connection:trim_reassembly_buffer(tree(Buffer), Offset))).
+    {Rest, _Removed} = quic_connection:trim_reassembly_buffer(tree(Buffer), Offset),
+    maps:from_list(gb_trees:to_list(Rest)).
 
 %%====================================================================
 %% Extraction
@@ -103,7 +104,7 @@ trim_leaves_future_chunks_untouched_test() ->
 %% rebuilding the buffer (the returned tree is the input, unchanged).
 gap_below_a_large_buffer_is_answered_without_a_walk_test() ->
     Above = tree(maps:from_list([{Off, chunk(Off, 100)} || Off <- lists:seq(1000, 100000, 100)])),
-    ?assertMatch({<<>>, 500, Above}, quic_connection:extract_contiguous_data(Above, 500)).
+    ?assertMatch({<<>>, 500, Above, 0}, quic_connection:extract_contiguous_data(Above, 500)).
 
 %% With one straddling chunk below the point, only that chunk is
 %% touched; the chunks above come back as they were.
@@ -145,3 +146,63 @@ add_chunk(Off, Data, Buffer) ->
         #{Off := Existing} when byte_size(Existing) >= byte_size(Data) -> Buffer;
         _ -> Buffer#{Off => Data}
     end.
+
+%%====================================================================
+%% Byte accounting
+%%====================================================================
+
+bytes_in(Tree) ->
+    lists:sum([byte_size(D) || D <- gb_trees:values(Tree)]).
+
+%% Every mutation reports its byte delta; summing the deltas must track a
+%% fresh walk of the tree at every step. The sequence: a hole at 0, a
+%% run of chunks queued behind it, an overlapping retransmission, a
+%% shorter duplicate, the fill of the hole (which drains the run), and a
+%% straddling chunk that must be trimmed at the new offset.
+running_count_matches_tree_test() ->
+    Steps = [
+        {insert, 100, <<1:(100 * 8)>>},
+        {insert, 200, <<2:(100 * 8)>>},
+        {insert, 300, <<3:(100 * 8)>>},
+        %% overlapping retransmission, longer than what is there
+        {insert, 200, <<4:(150 * 8)>>},
+        %% shorter duplicate, must be ignored
+        {insert, 300, <<5:(50 * 8)>>},
+        %% the hole fills: 0..100 delivered, then the run drains
+        {extract, 0, <<0:(100 * 8)>>},
+        %% a chunk straddling the delivered edge gets trimmed
+        {insert, 380, <<6:(60 * 8)>>},
+        {extract, 400, <<>>}
+    ],
+    lists:foldl(
+        fun(Step, {Tree, Count, Offset}) ->
+            {Tree1, Count1, Offset1} =
+                case Step of
+                    {insert, Off, Data} ->
+                        {T, Delta} = quic_connection:keep_longest_chunk(Off, Data, Tree),
+                        {T, Count + Delta, Offset};
+                    {extract, Off, Head} ->
+                        {T0, Added} =
+                            case Head of
+                                <<>> -> {Tree, 0};
+                                _ -> quic_connection:keep_longest_chunk(Off, Head, Tree)
+                            end,
+                        {_Data, NewOff, T, Removed} =
+                            quic_connection:extract_contiguous_data(T0, Off),
+                        {T, Count + Added - Removed, NewOff}
+                end,
+            ?assertEqual(bytes_in(Tree1), Count1),
+            {Tree1, Count1, Offset1}
+        end,
+        {gb_trees:empty(), 0, 0},
+        Steps
+    ).
+
+trim_reports_removed_bytes_test() ->
+    T = tree(#{0 => <<0:(50 * 8)>>, 40 => <<1:(30 * 8)>>, 100 => <<2:(10 * 8)>>}),
+    {Rest, Removed} = quic_connection:trim_reassembly_buffer(T, 60),
+    %% 0..50 dropped (50), 40..70 trimmed to 60..70 (30 gone, 10 kept)
+    ?assertEqual(bytes_in(T) - bytes_in(Rest), Removed),
+    ?assertEqual(
+        #{60 => <<1:(10 * 8)>>, 100 => <<2:(10 * 8)>>}, maps:from_list(gb_trees:to_list(Rest))
+    ).

@@ -55,6 +55,28 @@ All notable changes to this project will be documented in this file.
   for new connections.
 
 ### Fixed
+- PMTU black-hole detection counts loss events, not lost packets, and a
+  large packet acknowledged in between clears the count. It counted every
+  large packet declared lost and, once the search had completed, nothing
+  ever reset it, so a single burst loss of six or more full-size packets
+  on a healthy path (a qdisc dropping one GSO super-packet, a small
+  receiver socket buffer) dropped the path MTU to 1200 for the rest of
+  the connection: about 15 % more packets for every byte after it. On a
+  1 GbE rig two such drops per 50 MB were enough. Now one ACK's worth of
+  losses is one strike if any of them was large, and an ACK carrying a
+  large packet proves the path still passes them.
+- A stream receiver with a hole at the head of its reassembly buffer no
+  longer slows down with every packet buffered behind it. The
+  connection-level receive-buffer byte count was recomputed from the
+  buffer on every out-of-order stream frame, twice, by walking every
+  chunk in the tree, so with one lost packet and a congestion window's
+  worth of data queued behind it each further packet cost a walk of
+  thousands of chunks, the receiver's mailbox grew into the thousands,
+  ACKs went out seconds late and the sender sat on its window: a 50 MB
+  download over 1 GbE with a single early loss ran at 13 MB/s where
+  10 MB, or a peer that never lost a packet, ran at 90 to 108. The
+  stream now keeps a running byte count and every tree change reports
+  its delta.
 - The NIF's AEAD context cache is bounded and no longer raises. Each
   key update derives fresh keys, and the per-process cache kept a live
   EVP context for every one of them, so a long-lived bulk connection
@@ -92,6 +114,19 @@ All notable changes to this project will be documented in this file.
   socket, which is what caught this.
 
 ### Changed
+- The optional crypto NIF is no longer built by default. Set
+  `QUIC_BUILD_NIF=1` while compiling `quic` to build it; a requested
+  build that fails now fails the compile instead of being skipped.
+  Without the variable nothing is compiled and the library runs on OTP
+  crypto.
+- ChaCha20-Poly1305 connections use the fused crypto NIF paths
+  (`protect_run`, `open_packet`, `open_run`) like the AES suites. The
+  header-protection mask is five ChaCha20 keystream bytes with the
+  16-byte sample as the cipher IV (RFC 9001 5.4.4), so the NIF keeps a
+  keyed ChaCha20 context per HP key and reloads only the IV per packet,
+  the same shape as the AES-ECB context. Where the CPU has no AES
+  instructions ChaCha is the faster cipher by a wide margin and was the
+  one suite left on the per-packet path.
 - The interop runner declares the passive robustness cases (longrtt,
   blackhole, amplificationlimit, handshakeloss, transferloss,
   handshakecorruption, transfercorruption, rebind-port, rebind-addr),
@@ -197,6 +232,12 @@ All notable changes to this project will be documented in this file.
   0.468 to 0.331, ChaCha20-Poly1305 seal 1.132 to 0.934 and open 1.067
   to 0.934. A payload too short to hold an authentication tag is now
   rejected as an authentication failure rather than raising.
+- Accepted connections now monitor their owner and stop with
+  `{shutdown, owner_down}` (CONNECTION_CLOSE to the peer) when it exits,
+  as supervised client connections already did. Before, a dead handler
+  left the connection up until its idle timeout, delivering into a dead
+  mailbox. `monitor_owner => false` in the listener options restores the
+  old behaviour.
 
 ## [1.8.2] - 2026-09-05
 

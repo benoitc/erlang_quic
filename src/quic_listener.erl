@@ -75,11 +75,14 @@
 %%% for `connected' before entering its main loop mis-orders or swallows
 %%% whatever came first.
 %%%
-%%% === Close what you own ===
+%%% === Owner death ===
 %%%
-%%% Listener-created connections do not monitor their owner. If your
-%%% handler dies the connection stays up until its idle timeout, so close
-%%% it explicitly on the way out.
+%%% Accepted connections monitor their owner and stop with
+%%% `{shutdown, owner_down}' when it exits, sending CONNECTION_CLOSE to
+%%% the peer, the way a `gen_tcp' socket follows its controlling process.
+%%% Set `monitor_owner => false' in the listener options to keep a
+%%% connection up after its handler dies; it then lives until its idle
+%%% timeout, so close it explicitly on the way out.
 
 -module(quic_listener).
 -behaviour(gen_server).

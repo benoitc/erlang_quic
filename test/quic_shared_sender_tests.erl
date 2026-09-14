@@ -39,21 +39,28 @@ empty_batch_is_not_handed_over_test() ->
         ok
     end.
 
-%% A dead sender turns the connection back into a direct sender for
-%% good; the packets still go out (here: nowhere, on a closed socket,
-%% which is what the error path covers) rather than into a dead mailbox.
+%% A dead sender is noticed through the monitor taken when the state was
+%% built: the owner gets the DOWN, hands it to sender_down/2, and the
+%% connection is a direct sender for good (here: onto a closed socket,
+%% which is what the error path covers).
 dead_sender_falls_back_to_direct_test() ->
     Dead = spawn(fun() -> ok end),
     timer:sleep(10),
     {ok, Sock} = gen_udp:open(0, [binary]),
     {ok, SS0} = quic_socket:new_sender(Sock, #{backend => gen_udp, sender_pid => Dead}),
-    {ok, SS1} = quic_socket:send(SS0, ?ADDR, 4433, <<"p1">>),
-    {ok, SS2} = quic_socket:flush(SS1),
-    ?assertMatch(#{batch_pending := 0, batch_flushes := 1}, quic_socket:info(SS2)),
-    %% The next batch goes direct without consulting the dead pid.
-    {ok, SS3} = quic_socket:send(SS2, ?ADDR, 4433, <<"p2">>),
-    {ok, SS4} = quic_socket:flush(SS3),
-    ?assertMatch(#{batch_flushes := 2}, quic_socket:info(SS4)),
+    Mon =
+        receive
+            {'DOWN', M, process, Dead, _} -> M
+        after 1000 -> error(no_down)
+        end,
+    ?assertEqual(false, quic_socket:sender_down(SS0, make_ref())),
+    {ok, SS1} = quic_socket:sender_down(SS0, Mon),
+    {ok, SS2} = quic_socket:send(SS1, ?ADDR, 4433, <<"p1">>),
+    {ok, SS3} = quic_socket:flush(SS2),
+    ?assertMatch(#{batch_pending := 0, batch_flushes := 1}, quic_socket:info(SS3)),
+    {ok, SS4} = quic_socket:send(SS3, ?ADDR, 4433, <<"p2">>),
+    {ok, SS5} = quic_socket:flush(SS4),
+    ?assertMatch(#{batch_flushes := 2}, quic_socket:info(SS5)),
     gen_udp:close(Sock).
 
 %% End to end on a real socket-backend socket: batches handed to the
