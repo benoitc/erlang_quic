@@ -300,10 +300,11 @@ jobs:
         run: |
           erlc -o _build/test/lib/quic/test test/quic_nif_fuzz.erl
           # One cipher per emulator so an ASan abort names the cipher.
-          # ChaCha joins this list when it reaches the fused paths; the
-          # harness answers {error, nothing_exercised} until then, so a
-          # cipher that silently stops being covered fails here.
-          for CIPHER in aes_128_gcm aes_256_gcm; do
+          # ChaCha reaches the fused paths now, including its own C
+          # header-protection routine; the harness answers
+          # {error, nothing_exercised} for a cipher that does not, so
+          # one that silently stops being covered fails here.
+          for CIPHER in aes_128_gcm aes_256_gcm chacha20_poly1305; do
             LD_PRELOAD=$(gcc -print-file-name=libasan.so) \
               erl -noshell -pa _build/test/lib/quic/ebin -pa _build/test/lib/quic/test -eval "
                 application:ensure_all_started(quic),

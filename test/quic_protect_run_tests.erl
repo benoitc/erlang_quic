@@ -58,14 +58,17 @@ aes_128_run_test_() ->
 aes_256_run_test() ->
     run_matches_reference(aes_256_gcm, 65530, 16).
 
-chacha_is_fallback_test() ->
-    {Key, IV, HP} = keys(chacha20_poly1305),
-    ?assertEqual(
-        fallback,
-        quic_aead_ctx:protect_run(
-            chacha20_poly1305, Key, IV, HP, 0, ?FIRST_BYTE_BASE, ?DCID, payloads(3)
-        )
-    ).
+%% ChaCha20-Poly1305 seals through the same fused path; its header
+%% protection is five ChaCha20 keystream bytes with the sample as the
+%% IV instead of an ECB block, so the differential check against the
+%% per-packet reference is what proves the C side got that right.
+chacha_run_test_() ->
+    [
+        {lists:flatten(io_lib:format("chacha pn0=~p k=~p", [PN0, K])), fun() ->
+            run_matches_reference(chacha20_poly1305, PN0, K)
+        end}
+     || {PN0, K} <- [{0, 8}, {250, 12}, {65530, 12}, {16777210, 12}, {4294967290, 12}, {7, 1}]
+    ].
 
 empty_run_test() ->
     {Key, IV, HP} = keys(aes_128_gcm),

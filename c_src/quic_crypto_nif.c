@@ -25,7 +25,8 @@
 
 typedef struct {
     EVP_CIPHER_CTX *ctx;
-    int enc; /* 1 = seal, 0 = open */
+    int enc;     /* 1 = seal, 0 = open */
+    int hp_chacha; /* header-protection context: 1 = ChaCha20, 0 = AES-ECB */
 } qc_ctx;
 
 static ErlNifResourceType *qc_ctx_type;
@@ -65,7 +66,29 @@ cipher_from_atom(ErlNifEnv *env, ERL_NIF_TERM atom)
         return EVP_aes_128_ecb();
     if (strcmp(name, "aes_256_ecb") == 0)
         return EVP_aes_256_ecb();
+    if (strcmp(name, "chacha20") == 0)
+        return EVP_chacha20();
     return NULL;
+}
+
+/* Header-protection mask for one packet (RFC 9001 5.4.3 and 5.4.4).
+ * AES: one ECB block of the 16-byte sample. ChaCha20: the sample is the
+ * cipher's 16-byte IV (4-byte little-endian counter, 12-byte nonce),
+ * and the mask is the first 5 keystream bytes; the key stays set on the
+ * context, only the IV is reloaded per packet. Only mask[0..4] are used
+ * by the callers, the rest is zeroed for ChaCha. */
+static int
+hp_mask(qc_ctx *hp, const unsigned char *sample, unsigned char mask[16])
+{
+    int mlen = 0;
+    if (hp->hp_chacha) {
+        static const unsigned char zeros[5] = {0, 0, 0, 0, 0};
+        memset(mask, 0, 16);
+        if (EVP_EncryptInit_ex(hp->ctx, NULL, NULL, NULL, sample) != 1)
+            return 0;
+        return EVP_EncryptUpdate(hp->ctx, mask, &mlen, zeros, 5) == 1 && mlen == 5;
+    }
+    return EVP_EncryptUpdate(hp->ctx, mask, &mlen, sample, 16) == 1 && mlen == 16;
 }
 
 /* new_aead_ctx(Cipher, Key, Enc) -> {ok, Ctx} | {error, Reason} */
@@ -114,7 +137,8 @@ fail:
 }
 
 /* new_hp_ctx(Cipher, Key) -> {ok, Ctx} | {error, Reason}
- * ECB context for AES header-protection mask generation. */
+ * Header-protection context: AES-ECB (aes_128_ecb, aes_256_ecb) or
+ * ChaCha20 (chacha20), keyed once; see hp_mask(). */
 static ERL_NIF_TERM
 new_hp_ctx(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
@@ -131,6 +155,7 @@ new_hp_ctx(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     c = enif_alloc_resource(qc_ctx_type, sizeof(qc_ctx));
     c->ctx = EVP_CIPHER_CTX_new();
     c->enc = 1;
+    c->hp_chacha = (cipher == EVP_chacha20());
     if (c->ctx == NULL)
         goto fail;
     if (EVP_EncryptInit_ex(c->ctx, cipher, NULL, NULL, NULL) != 1)
@@ -230,7 +255,7 @@ hp_block(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     int len = 0;
 
     (void)argc;
-    if (enif_get_resource(env, argv[0], qc_ctx_type, (void **)&c) == 0 ||
+    if (enif_get_resource(env, argv[0], qc_ctx_type, (void **)&c) == 0 || c->hp_chacha ||
         enif_inspect_binary(env, argv[1], &sample) == 0 || sample.size != 16)
         return enif_make_tuple2(env, am_error, am_badarg);
 
@@ -253,7 +278,7 @@ hp_block(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
  *   header protection: first byte ^= mask[0] & 0x1f (short header),
  *   PN bytes ^= mask[1..PNLen]
  * FirstByteBase must have the PN-length bits (0-1) clear. AES only -
- * the HP context is an ECB context; ChaCha callers use the per-packet
+ * the HP context is an ECB or ChaCha20 context, see hp_mask(); the per-packet
  * path.
  */
 #define MAX_RUN 256
@@ -287,7 +312,7 @@ protect_run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         unsigned pnlen, hlen;
         unsigned char *out, *body;
         ERL_NIF_TERM pkt;
-        int len = 0, len2 = 0, mlen = 0;
+        int len = 0, len2 = 0;
 
         if (k >= MAX_RUN || enif_inspect_iolist_as_binary(env, head, &plain) == 0 ||
             plain.size < 4)
@@ -317,7 +342,7 @@ protect_run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
             return enif_make_tuple2(env, am_error, am_badarg);
 
         sample_off = (unsigned char)(4 - pnlen);
-        if (EVP_EncryptUpdate(hp->ctx, mask, &mlen, body + sample_off, 16) != 1 || mlen != 16)
+        if (!hp_mask(hp, body + sample_off, mask))
             return enif_make_tuple2(env, am_error, am_badarg);
         out[0] ^= mask[0] & 0x1f;
         for (i = 0; i < pnlen; i++)
@@ -374,7 +399,7 @@ open_packet(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     ErlNifUInt64 trunc_pn = 0, pn;
     ERL_NIF_TERM plain_term;
     unsigned char *out;
-    int len = 0, len2 = 0, mlen = 0;
+    int len = 0, len2 = 0;
 
     (void)argc;
     if (enif_get_resource(env, argv[0], qc_ctx_type, (void **)&aead) == 0 || aead->enc != 0 ||
@@ -388,7 +413,7 @@ open_packet(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_tuple2(env, am_error, am_badarg);
 
     /* Sample sits 4 bytes past the PN start; payload begins at the PN. */
-    if (EVP_EncryptUpdate(hp->ctx, mask, &mlen, payload.data + 4, 16) != 1 || mlen != 16)
+    if (!hp_mask(hp, payload.data + 4, mask))
         return enif_make_tuple2(env, am_error, am_badarg);
     fb = header.data[0] ^ (mask[0] & 0x1f);
     pnlen = (fb & 0x03) + 1;
@@ -653,7 +678,7 @@ open_run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         ERL_NIF_TERM plain_term;
         unsigned char *out, *payload;
         unsigned payload_size;
-        int len = 0, len2 = 0, mlen = 0;
+        int len = 0, len2 = 0;
 
         if (enif_inspect_binary(env, head, &dgram) == 0 ||
             dgram.size < hdrlen + 4 + 16)
@@ -661,7 +686,7 @@ open_run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         payload = dgram.data + hdrlen;
         payload_size = (unsigned)dgram.size - hdrlen;
 
-        if (EVP_EncryptUpdate(hp->ctx, mask, &mlen, payload + 4, 16) != 1 || mlen != 16)
+        if (!hp_mask(hp, payload + 4, mask))
             break;
         fb = dgram.data[0] ^ (mask[0] & 0x1f);
         pnlen = (fb & 0x03) + 1;
