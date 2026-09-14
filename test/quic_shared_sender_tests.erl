@@ -81,7 +81,7 @@ wire_roundtrip(ListenerSS) ->
     {ok, RecvPort} = inet:port(Recv),
     {Sender, Counter} = quic_socket:start_shared_sender(ListenerSS),
     {ok, {_, _}} = quic_socket:sockname(ListenerSS),
-    {ok, Conn0} = quic_socket:new_sender(quic_socket:test_socket(ListenerSS), #{
+    {ok, Conn0} = quic_socket:new_sender(quic_socket:get_socket(ListenerSS), #{
         backend => socket, sender_pid => Sender, gso_counter => Counter
     }),
     {ok, Conn1} = quic_socket:send(Conn0, ?ADDR, RecvPort, <<"one">>),

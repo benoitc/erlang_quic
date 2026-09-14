@@ -149,18 +149,7 @@
 -export_type([socket_state/0, packet_view/0]).
 
 -ifdef(TEST).
-%% GRO/GSO batching internals. These are pure and the kernel features
-%% they serve are Linux-only, so unit tests reach them directly rather
-%% than needing a socket that supports UDP_GRO or UDP_SEGMENT.
--export([
-    extract_gro_segment_size/1,
-    split_gro_packets/2,
-    split_uniform_runs/1,
-    forward_to_owner/6,
-    test_socket/1
-]).
-
-test_socket(#socket_state{socket = S}) -> S.
+-compile([export_all, nowarn_export_all]).
 -endif.
 
 %%====================================================================

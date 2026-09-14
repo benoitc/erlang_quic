@@ -16,10 +16,10 @@ garbage(I) ->
     <<1:1, 0:1, 0:6, I:8, 0:(40 * 8)>>.
 
 server_state() ->
-    quic_connection:test_state_for_server(?ADDR, undefined, <<>>).
+    quic_connection_test_support:state_for_server(?ADDR, undefined, <<>>).
 
 client_state() ->
-    quic_connection:test_state_for_client(?ADDR).
+    quic_connection_test_support:state_for_client(?ADDR).
 
 flush_mailbox() ->
     receive
@@ -45,7 +45,7 @@ drains_queued_client_datagrams_test() ->
     %% The drain matches on the state's socket, and the client path
     %% re-arms {active, N} on it after each datagram.
     {ok, Sock} = gen_udp:open(0, [binary, {active, false}]),
-    S = quic_connection:test_state_with_socket(client_state(), Sock),
+    S = quic_connection_test_support:state_with_socket(client_state(), Sock),
     self() ! {udp, Sock, {127, 0, 0, 1}, 4433, garbage(1)},
     self() ! {udp_batch, Sock, {127, 0, 0, 1}, 4433, [garbage(2), garbage(3)]},
     self() ! {timeout, ref, idle},
@@ -72,7 +72,7 @@ leaves_the_mailbox_alone_once_closing_test() ->
     flush_mailbox(),
     self() ! {quic_packet, garbage(1), ?ADDR},
     S0 = server_state(),
-    S = quic_connection:test_state_closing(S0, {application, 0, <<"bye">>}),
+    S = quic_connection_test_support:state_closing(S0, {application, 0, <<"bye">>}),
     ?assertEqual(S, quic_connection:drain_recv_msgs(S, 64)),
     ?assertEqual(1, length(mailbox())).
 

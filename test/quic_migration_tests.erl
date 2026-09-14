@@ -533,7 +533,7 @@ challenge_data_uniqueness_test() ->
 %%====================================================================
 
 %% Test: Active migration should notify owner with path_changed
-%% Uses quic_connection:test_complete_migration/3 to verify actual behavior
+%% Uses quic_connection_test_support:complete_migration/3 to verify actual behavior
 path_changed_notification_active_migration_test() ->
     %% Active migration path (different IP = is_nat_rebinding = false)
     OldAddr = {{192, 168, 1, 100}, 4433},
@@ -552,7 +552,7 @@ path_changed_notification_active_migration_test() ->
 
     %% Call actual complete_migration via test helper
     %% Owner is self(), so we receive the notification
-    Result = quic_connection:test_complete_migration(self(), OldPath, NewPath),
+    Result = quic_connection_test_support:complete_migration(self(), OldPath, NewPath),
 
     %% Active migration SHOULD notify owner
     ?assertEqual({ok, notified}, Result).
@@ -576,7 +576,7 @@ path_changed_notification_nat_rebinding_test() ->
     },
 
     %% Call actual complete_migration via test helper
-    Result = quic_connection:test_complete_migration(self(), OldPath, NewPath),
+    Result = quic_connection_test_support:complete_migration(self(), OldPath, NewPath),
 
     %% NAT rebinding should NOT notify owner
     ?assertEqual({ok, not_notified}, Result).
@@ -593,7 +593,7 @@ path_changed_undefined_old_path_test() ->
     },
 
     %% Call with undefined old path - should still notify
-    Result = quic_connection:test_complete_migration(self(), undefined, NewPath),
+    Result = quic_connection_test_support:complete_migration(self(), undefined, NewPath),
     ?assertEqual({ok, notified}, Result).
 
 %% Test: IPv6 address migration notification
@@ -613,5 +613,5 @@ path_changed_ipv6_migration_test() ->
     },
 
     %% Should notify for IPv6 active migration
-    Result = quic_connection:test_complete_migration(self(), OldPath, NewPath),
+    Result = quic_connection_test_support:complete_migration(self(), OldPath, NewPath),
     ?assertEqual({ok, notified}, Result).

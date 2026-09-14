@@ -114,14 +114,7 @@
 ]).
 
 -ifdef(TEST).
--export([
-    send_packet/6,
-    compute_stateless_reset_token/2,
-    build_stateless_reset/2,
-    send_packets_to_connection/4,
-    drain_recv_sweep/4,
-    group_recv_sweep/1
-]).
+-compile([export_all, nowarn_export_all]).
 -endif.
 
 -export([recv_drops/0]).

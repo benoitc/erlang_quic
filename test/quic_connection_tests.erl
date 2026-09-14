@@ -403,7 +403,7 @@ flow_control_connection_within_limit_test() ->
     Streams = #{StreamId => {10000, 0}},
     ?assertEqual(
         ok,
-        quic_connection:test_check_flow_control(
+        quic_connection_test_support:check_flow_control(
             StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
@@ -419,7 +419,7 @@ flow_control_connection_exceeds_limit_test() ->
     Streams = #{StreamId => {10000, 0}},
     ?assertEqual(
         {blocked, connection},
-        quic_connection:test_check_flow_control(
+        quic_connection_test_support:check_flow_control(
             StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
@@ -434,7 +434,7 @@ flow_control_connection_at_limit_test() ->
     Streams = #{StreamId => {10000, 0}},
     ?assertEqual(
         ok,
-        quic_connection:test_check_flow_control(
+        quic_connection_test_support:check_flow_control(
             StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
@@ -450,7 +450,7 @@ flow_control_connection_already_over_limit_test() ->
     Streams = #{StreamId => {10000, 0}},
     ?assertEqual(
         {blocked, connection},
-        quic_connection:test_check_flow_control(
+        quic_connection_test_support:check_flow_control(
             StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
@@ -466,7 +466,7 @@ flow_control_stream_exceeds_limit_test() ->
     Streams = #{StreamId => {5000, 4000}},
     ?assertEqual(
         {blocked, {stream, StreamId}},
-        quic_connection:test_check_flow_control(
+        quic_connection_test_support:check_flow_control(
             StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
@@ -481,7 +481,7 @@ flow_control_stream_within_limit_test() ->
     Streams = #{StreamId => {5000, 4000}},
     ?assertEqual(
         ok,
-        quic_connection:test_check_flow_control(
+        quic_connection_test_support:check_flow_control(
             StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
@@ -496,7 +496,7 @@ flow_control_unknown_stream_allowed_test() ->
     Streams = #{0 => {5000, 0}},
     ?assertEqual(
         ok,
-        quic_connection:test_check_flow_control(
+        quic_connection_test_support:check_flow_control(
             StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
@@ -512,7 +512,7 @@ flow_control_connection_blocks_before_stream_test() ->
     Streams = #{StreamId => {10000, 0}},
     ?assertEqual(
         {blocked, connection},
-        quic_connection:test_check_flow_control(
+        quic_connection_test_support:check_flow_control(
             StreamId, Offset, DataSize, MaxDataRemote, DataSent, Streams
         )
     ).
@@ -607,7 +607,7 @@ fc_max_receive_window_default_test() ->
 %% tripped ?MAX_SEND_QUEUE_BYTES, blocking further sends on long-lived
 %% connections.
 dequeue_small_stream_frame_decrements_bytes_test() ->
-    Result = quic_connection:test_coalesce_small_stream(120),
+    Result = quic_connection_test_support:coalesce_small_stream(120),
     ?assertEqual(true, maps:get(dequeued, Result)),
     ?assertEqual(0, maps:get(send_queue_bytes, Result)),
     ?assertEqual(0, maps:get(send_queue_count, Result)),
@@ -621,7 +621,7 @@ dequeue_small_stream_frame_decrements_bytes_test() ->
 %% The benchmark itself triggers this pattern with
 %% quic:send_data(Conn, StreamId, <<>>, true).
 zero_byte_fin_not_stranded_test() ->
-    Result = quic_connection:test_zero_byte_fin_in_queue(),
+    Result = quic_connection_test_support:zero_byte_fin_in_queue(),
     %% Queue has a real entry
     ?assertEqual(false, maps:get(queue_empty, Result)),
     %% Byte-based check would incorrectly call it empty
@@ -633,17 +633,17 @@ zero_byte_fin_not_stranded_test() ->
 %% First ack-eliciting packet arms the max_ack_delay timer but does
 %% NOT emit an ACK yet.
 ack_decimation_first_packet_arms_timer_test() ->
-    S0 = quic_connection:test_decimate_initial_state(),
-    {_S1, Info} = quic_connection:test_decimate_step(S0),
+    S0 = quic_connection_test_support:decimate_initial_state(),
+    {_S1, Info} = quic_connection_test_support:decimate_step(S0),
     ?assertEqual(1, maps:get(ack_elicited_count, Info)),
     ?assertEqual(true, maps:get(ack_timer_armed, Info)).
 
 %% Second ack-eliciting packet (tolerance=2) triggers an immediate
 %% ACK, which clears the count and cancels the timer.
 ack_decimation_second_packet_flushes_test() ->
-    S0 = quic_connection:test_decimate_initial_state(),
-    {S1, _After1} = quic_connection:test_decimate_step(S0),
-    {_S2, After2} = quic_connection:test_decimate_step(S1),
+    S0 = quic_connection_test_support:decimate_initial_state(),
+    {S1, _After1} = quic_connection_test_support:decimate_step(S0),
+    {_S2, After2} = quic_connection_test_support:decimate_step(S1),
     %% send_app_ack/1 with empty ack_ranges short-circuits but still
     %% clears the decimation state via clear_ack_decimation_state/1.
     ?assertEqual(0, maps:get(ack_elicited_count, After2)),
@@ -651,10 +651,10 @@ ack_decimation_second_packet_flushes_test() ->
 
 %% Timer firing (simulated via send_app_ack/1) resets count + timer.
 ack_decimation_timer_fire_resets_test() ->
-    S0 = quic_connection:test_decimate_initial_state(),
-    {S1, _After} = quic_connection:test_decimate_step(S0),
+    S0 = quic_connection_test_support:decimate_initial_state(),
+    {S1, _After} = quic_connection_test_support:decimate_step(S0),
     %% At this point count=1 and timer armed. Simulate fire.
-    Info = quic_connection:test_decimate_on_timer_fire(S1),
+    Info = quic_connection_test_support:decimate_on_timer_fire(S1),
     ?assertEqual(0, maps:get(ack_elicited_count, Info)),
     ?assertEqual(false, maps:get(ack_timer_armed, Info)).
 
@@ -662,8 +662,8 @@ ack_decimation_timer_fire_resets_test() ->
 %% steps below tolerance don't re-arm. Observable via stable count/
 %% armed status after a single step.
 ack_decimation_timer_idempotent_test() ->
-    S0 = quic_connection:test_decimate_initial_state(),
-    {_S1, Info} = quic_connection:test_decimate_step(S0),
+    S0 = quic_connection_test_support:decimate_initial_state(),
+    {_S1, Info} = quic_connection_test_support:decimate_step(S0),
     ?assertEqual(1, maps:get(ack_elicited_count, Info)),
     ?assertEqual(true, maps:get(ack_timer_armed, Info)).
 
@@ -671,16 +671,16 @@ ack_decimation_timer_idempotent_test() ->
 %% ACK instead of being decimated. First ack-eliciting packet is still
 %% decimated when classified as sequential.
 ack_reorder_triggers_immediate_ack_test() ->
-    S0 = quic_connection:test_decimate_initial_state(),
-    Info = quic_connection:test_maybe_send_ack_app(reordered, S0),
+    S0 = quic_connection_test_support:decimate_initial_state(),
+    Info = quic_connection_test_support:maybe_send_ack_app(reordered, S0),
     %% send_app_ack/1 runs its decimation-clear branch even when
     %% ack_ranges is empty, so count stays at 0 and timer stays unarmed.
     ?assertEqual(0, maps:get(ack_elicited_count, Info)),
     ?assertEqual(false, maps:get(ack_timer_armed, Info)).
 
 ack_sequential_uses_decimation_test() ->
-    S0 = quic_connection:test_decimate_initial_state(),
-    Info = quic_connection:test_maybe_send_ack_app(sequential, S0),
+    S0 = quic_connection_test_support:decimate_initial_state(),
+    Info = quic_connection_test_support:maybe_send_ack_app(sequential, S0),
     %% Sequential first packet arms the timer, count goes to 1.
     ?assertEqual(1, maps:get(ack_elicited_count, Info)),
     ?assertEqual(true, maps:get(ack_timer_armed, Info)).
@@ -689,11 +689,11 @@ ack_sequential_uses_decimation_test() ->
 %% (largest_recv = undefined) and for PN = largest_recv + 1; every other
 %% PN (gap above, dup, below) is reordered.
 ack_classify_recv_trigger_test() ->
-    ?assertEqual(sequential, quic_connection:test_classify_recv_trigger(0, undefined)),
-    ?assertEqual(sequential, quic_connection:test_classify_recv_trigger(7, 6)),
-    ?assertEqual(reordered, quic_connection:test_classify_recv_trigger(9, 6)),
-    ?assertEqual(reordered, quic_connection:test_classify_recv_trigger(3, 6)),
-    ?assertEqual(reordered, quic_connection:test_classify_recv_trigger(6, 6)).
+    ?assertEqual(sequential, quic_connection_test_support:classify_recv_trigger(0, undefined)),
+    ?assertEqual(sequential, quic_connection_test_support:classify_recv_trigger(7, 6)),
+    ?assertEqual(reordered, quic_connection_test_support:classify_recv_trigger(9, 6)),
+    ?assertEqual(reordered, quic_connection_test_support:classify_recv_trigger(3, 6)),
+    ?assertEqual(reordered, quic_connection_test_support:classify_recv_trigger(6, 6)).
 
 %%====================================================================
 %% Lazy timer arming (idle / keep-alive)
@@ -797,7 +797,7 @@ make_test_session_ticket(ServerName) ->
 store_initial_reset_token_test() ->
     DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     Token = crypto:strong_rand_bytes(16),
-    State = quic_connection:test_state_for_reset(DCID, [], undefined),
+    State = quic_connection_test_support:state_for_reset(DCID, [], undefined),
     Pool = quic_connection:maybe_store_initial_reset_token(
         #{stateless_reset_token => Token}, State
     ),
@@ -809,7 +809,7 @@ store_initial_reset_token_test() ->
 %% No token in the transport params leaves the pool untouched.
 store_initial_reset_token_absent_test() ->
     DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
-    State = quic_connection:test_state_for_reset(DCID, [], undefined),
+    State = quic_connection_test_support:state_for_reset(DCID, [], undefined),
     ?assertEqual([], quic_connection:maybe_store_initial_reset_token(#{}, State)).
 
 %% An existing sequence-0 entry is not duplicated.
@@ -818,7 +818,7 @@ store_initial_reset_token_idempotent_test() ->
     Existing = #cid_entry{
         seq_num = 0, cid = DCID, stateless_reset_token = <<9:128>>, status = active
     },
-    State = quic_connection:test_state_for_reset(DCID, [Existing], undefined),
+    State = quic_connection_test_support:state_for_reset(DCID, [Existing], undefined),
     Pool = quic_connection:maybe_store_initial_reset_token(
         #{stateless_reset_token => crypto:strong_rand_bytes(16)}, State
     ),
@@ -830,7 +830,7 @@ reset_token_derivation_parity_test() ->
     Secret = crypto:strong_rand_bytes(32),
     CID = <<10, 11, 12, 13, 14, 15, 16, 17>>,
     Advertised = quic_connection:generate_stateless_reset_token(
-        CID, quic_connection:test_state_with_secret(Secret)
+        CID, quic_connection_test_support:state_with_secret(Secret)
     ),
     Recomputed = quic_listener:compute_stateless_reset_token(Secret, CID),
     ?assertEqual(Advertised, Recomputed).
@@ -843,13 +843,13 @@ recognize_stateless_reset_after_restart_test() ->
     DCID = <<10, 11, 12, 13, 14, 15, 16, 17>>,
     %% Server advertised this token; client stores it against the initial DCID.
     Advertised = quic_connection:generate_stateless_reset_token(
-        DCID, quic_connection:test_state_with_secret(Secret)
+        DCID, quic_connection_test_support:state_with_secret(Secret)
     ),
     Pool = quic_connection:maybe_store_initial_reset_token(
         #{stateless_reset_token => Advertised},
-        quic_connection:test_state_for_reset(DCID, [], undefined)
+        quic_connection_test_support:state_for_reset(DCID, [], undefined)
     ),
-    State = quic_connection:test_state_for_reset(DCID, Pool, undefined),
+    State = quic_connection_test_support:state_for_reset(DCID, Pool, undefined),
     %% Restarted listener derives the token and builds a real reset packet.
     ListenerToken = quic_listener:compute_stateless_reset_token(Secret, DCID),
     Reset = quic_listener:build_stateless_reset(ListenerToken, 1200),
@@ -861,13 +861,13 @@ reject_non_reset_packet_test() ->
     Secret = crypto:strong_rand_bytes(32),
     DCID = <<10, 11, 12, 13, 14, 15, 16, 17>>,
     Advertised = quic_connection:generate_stateless_reset_token(
-        DCID, quic_connection:test_state_with_secret(Secret)
+        DCID, quic_connection_test_support:state_with_secret(Secret)
     ),
     Pool = quic_connection:maybe_store_initial_reset_token(
         #{stateless_reset_token => Advertised},
-        quic_connection:test_state_for_reset(DCID, [], undefined)
+        quic_connection_test_support:state_for_reset(DCID, [], undefined)
     ),
-    State = quic_connection:test_state_for_reset(DCID, Pool, undefined),
+    State = quic_connection_test_support:state_for_reset(DCID, Pool, undefined),
     Bogus = <<64, (crypto:strong_rand_bytes(40))/binary>>,
     ?assertEqual({error, decryption_failed}, quic_connection:check_stateless_reset(Bogus, State)).
 

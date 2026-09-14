@@ -7,9 +7,9 @@
 -include_lib("eunit/include/eunit.hrl").
 
 continuation_is_in_the_mailbox_immediately_test() ->
-    S0 = quic_connection:test_decimate_initial_state(),
+    S0 = quic_connection_test_support:decimate_initial_state(),
     S1 = quic_connection:arm_burst_continuation(S0),
-    Ref = quic_connection:test_pacing_timer(S1),
+    Ref = quic_connection_test_support:pacing_timer(S1),
     ?assert(is_reference(Ref)),
     receive
         {pacing_timeout, Ref} -> ok
@@ -18,10 +18,12 @@ continuation_is_in_the_mailbox_immediately_test() ->
     end.
 
 armed_continuation_is_not_duplicated_test() ->
-    S0 = quic_connection:test_decimate_initial_state(),
+    S0 = quic_connection_test_support:decimate_initial_state(),
     S1 = quic_connection:arm_burst_continuation(S0),
     S2 = quic_connection:arm_burst_continuation(S1),
-    ?assertEqual(quic_connection:test_pacing_timer(S1), quic_connection:test_pacing_timer(S2)),
+    ?assertEqual(
+        quic_connection_test_support:pacing_timer(S1), quic_connection_test_support:pacing_timer(S2)
+    ),
     receive
         {pacing_timeout, _} -> ok
     after 0 ->
