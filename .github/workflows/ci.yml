@@ -342,6 +342,12 @@ jobs:
       - name: Compile
         run: rebar3 compile
 
+      # The harness asks for a 7 MB socket buffer and the kernel clamps it
+      # to rmem_max, 212992 on a stock runner, where loopback overflows and
+      # the gate would measure the host instead of the code.
+      - name: Raise socket buffer limits
+        run: sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+
       # Asserts packet and retransmit counters, never a rate, so it does
       # not flake on a loaded runner. The socket-backend cases need
       # Linux, which is why this job is pinned rather than run on the
