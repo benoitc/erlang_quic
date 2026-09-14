@@ -38,6 +38,10 @@ loss_with_three_inflight() ->
     S2 = quic_loss:on_packet_sent(S1, 1, ?PACKET_BYTES, true, [], Now + 1),
     quic_loss:on_packet_sent(S2, 2, ?PACKET_BYTES, true, [], Now + 2).
 
+%% Each call stamps the in-flight packets with the current clock, so a
+%% test comparing a before and an after snapshot must build the state
+%% once: two builds either side of a millisecond tick differ in
+%% time_sent and nothing else.
 state() ->
     quic_connection:test_state_with_loss(loss_with_three_inflight()).
 
@@ -76,13 +80,15 @@ three_packets_are_in_flight_test() ->
 %%====================================================================
 
 handshake_ack_leaves_the_tracker_untouched_test() ->
-    Before = snapshot(state()),
-    After = snapshot(quic_connection:process_frame(handshake, ack_all(), state())),
+    State = state(),
+    Before = snapshot(State),
+    After = snapshot(quic_connection:process_frame(handshake, ack_all(), State)),
     ?assertEqual(Before, After).
 
 initial_ack_leaves_the_tracker_untouched_test() ->
-    Before = snapshot(state()),
-    After = snapshot(quic_connection:process_frame(initial, ack_all(), state())),
+    State = state(),
+    Before = snapshot(State),
+    After = snapshot(quic_connection:process_frame(initial, ack_all(), State)),
     ?assertEqual(Before, After).
 
 handshake_ack_of_a_single_packet_leaves_it_in_flight_test() ->
@@ -118,15 +124,17 @@ app_ack_of_a_prefix_retires_only_that_prefix_test() ->
 %%====================================================================
 
 empty_ack_is_a_no_op_at_every_level_test() ->
-    Before = snapshot(state()),
+    State = state(),
+    Before = snapshot(State),
     [
-        ?assertEqual(Before, snapshot(quic_connection:process_frame(Level, ack([]), state())))
+        ?assertEqual(Before, snapshot(quic_connection:process_frame(Level, ack([]), State)))
      || Level <- [initial, handshake, app]
     ].
 
 non_ack_frame_is_unaffected_test() ->
     %% The new clause is guarded on ACK frames; a PING at handshake level
     %% must still take its own path rather than being swallowed.
-    Before = snapshot(state()),
-    After = snapshot(quic_connection:process_frame(handshake, ping, state())),
+    State = state(),
+    Before = snapshot(State),
+    After = snapshot(quic_connection:process_frame(handshake, ping, State)),
     ?assertEqual(Before, After).
