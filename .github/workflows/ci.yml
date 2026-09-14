@@ -478,17 +478,21 @@ jobs:
       - name: Build Docker images
         run: docker compose -f docker/docker-compose.yml build
 
+      # Every service must be healthy, not just the first one to come up.
       - name: Start QUIC servers
         run: |
           docker compose -f docker/docker-compose.yml up -d
-          for i in {1..30}; do
-            if docker compose -f docker/docker-compose.yml ps | grep -q "healthy"; then
-              echo "Servers are healthy"
-              break
+          for i in $(seq 1 30); do
+            waiting=$(docker compose -f docker/docker-compose.yml ps --format '{{.Service}} {{.Health}}' | grep -v ' healthy$' || true)
+            if [ -z "$waiting" ]; then
+              echo "All servers healthy"
+              exit 0
             fi
-            echo "Waiting for servers... ($i/30)"
+            echo "Waiting for: $waiting ($i/30)"
             sleep 2
           done
+          docker compose -f docker/docker-compose.yml ps
+          exit 1
 
       - name: Compile
         run: rebar3 compile
@@ -498,6 +502,18 @@ jobs:
         env:
           QUIC_AIOQUIC_HOST: 127.0.0.1
           QUIC_AIOQUIC_PORT: 4433
+          QUIC_QUICGO_HOST: 127.0.0.1
+          QUIC_QUICGO_PORT: 4434
+
+      - name: Run client compliance and stream reassembly tests
+        run: rebar3 ct --suite=quic_client_compliance_SUITE,quic_stream_reassembly_SUITE
+
+      # The h3-server on 4435 issues session tickets; 4433 does not.
+      - name: Run 0-RTT tests against external peers
+        run: rebar3 ct --suite=quic_h3_0rtt_SUITE
+        env:
+          QUIC_AIOQUIC_HOST: 127.0.0.1
+          QUIC_AIOQUIC_PORT: 4435
           QUIC_QUICGO_HOST: 127.0.0.1
           QUIC_QUICGO_PORT: 4434
 
@@ -567,6 +583,23 @@ jobs:
 
       - name: Run erlfmt check
         run: rebar3 fmt --check
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: 'nightly'
+
+      # edoc stops on a malformed doc comment and ex_doc exits non-zero,
+      # which none of the other jobs would notice.
+      - name: Build docs
+        run: rebar3 ex_doc
 
   lint:
     name: Elvis lint

@@ -27,8 +27,8 @@ include $(if $(ERLANG_MK_FILENAME),$(ERLANG_MK_FILENAME),erlang.mk)
 ## Test convenience targets layered on top of rebar3.
 ##
 ## `make test-local` runs everything that doesn't need Docker.
-## `make test-docker` runs the h3spec conformance suite, which drives
-## the kazu-yamamoto/h3spec container against our in-process server.
+## `make test-docker` starts the peer servers in docker/docker-compose.yml
+## and runs the suites that talk to them.
 ## `make test-all` runs both stages followed by static checks.
 ##
 
@@ -48,12 +48,16 @@ test-local:
 	quic_e2e_cubic_SUITE,\
 	quic_h3_e2e_SUITE,\
 	quic_datagram_e2e_SUITE,\
-	quic_lb_e2e_SUITE,\
-	quic_client_compliance_SUITE,\
-	quic_interop_SUITE,\
-	quic_h3_server_SUITE
+	quic_lb_e2e_SUITE
 
 test-docker:
-	rebar3 ct --suite=quic_h3_h3spec_SUITE
+	docker compose -f docker/docker-compose.yml up -d --wait
+	rebar3 ct --suite=quic_interop_SUITE,\
+	quic_client_compliance_SUITE,\
+	quic_stream_reassembly_SUITE,\
+	quic_h3_server_SUITE
+	QUIC_AIOQUIC_HOST=127.0.0.1 QUIC_AIOQUIC_PORT=4435 \
+	QUIC_QUICGO_HOST=127.0.0.1 QUIC_QUICGO_PORT=4434 \
+	rebar3 ct --suite=quic_h3_0rtt_SUITE
 
 test-all: test-local test-docker test-static

@@ -1,32 +1,28 @@
-# quic-go echo server for interoperability testing
+# quic-go HTTP/3 server for interoperability testing
 FROM golang:1.24-alpine AS builder
 
 RUN apk add --no-cache git
 
-# Create working directory
 WORKDIR /build
 
-# Clone quic-go at a stable release and build the echo example
-# Use v0.48.x which supports Go 1.22+ (latest may require Go 1.25+)
+# v0.48.x builds with Go 1.22+. ./example is the long-running HTTP/3
+# server; ./example/echo is a self-contained demo that exits.
 RUN git clone --depth 1 --branch v0.48.2 https://github.com/quic-go/quic-go.git && \
     cd quic-go && \
-    go build -o /build/echo ./example/echo
+    go build -o /build/h3server ./example
 
 # Runtime image
 FROM alpine:latest
 
-RUN apk add --no-cache ca-certificates netcat-openbsd
+RUN apk add --no-cache ca-certificates
 
-COPY --from=builder /build/echo /usr/local/bin/echo
+COPY --from=builder /build/h3server /usr/local/bin/h3server
 
-# Create directory for certificates
 RUN mkdir -p /certs
 
 WORKDIR /app
 
 EXPOSE 4434/udp
 
-# Run the echo server
-# The server echoes back whatever data it receives on stream 0
-ENTRYPOINT ["/usr/local/bin/echo", "-v"]
-CMD ["-listen", "0.0.0.0:4434", "-cert", "/certs/cert.pem", "-key", "/certs/priv.key"]
+ENTRYPOINT ["/usr/local/bin/h3server"]
+CMD ["-bind", "0.0.0.0:4434", "-cert", "/certs/cert.pem", "-key", "/certs/priv.key"]

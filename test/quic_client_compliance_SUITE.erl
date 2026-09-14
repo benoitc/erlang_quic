@@ -190,7 +190,7 @@ init_per_group(network_tests, Config) ->
     %% Check if server is reachable
     Host = os:getenv("QUIC_SERVER_HOST", "127.0.0.1"),
     Port = list_to_integer(os:getenv("QUIC_SERVER_PORT", "4433")),
-    case check_server_reachable(Host, Port) of
+    case quic_test_peer:reachable(Host, Port) of
         true -> [{host, Host}, {port, Port} | Config];
         false -> {skip, "No QUIC server reachable"}
     end;
@@ -858,96 +858,39 @@ network_handshake(Config) ->
     Host = ?config(host, Config),
     Port = ?config(port, Config),
     ct:comment("Network handshake test with ~s:~p", [Host, Port]),
-
-    Opts = #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>]},
-
-    case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
-            Result =
-                receive
-                    {quic, ConnRef, {connected, Info}} ->
-                        ct:pal("Handshake completed: ~p", [Info]),
-                        {ok, Info}
-                after ?HANDSHAKE_TIMEOUT ->
-                    {error, timeout}
-                end,
-            quic:close(ConnRef, normal),
-            case Result of
-                {ok, _} -> {comment, "Network handshake successful"};
-                {error, timeout} -> {comment, "Handshake timeout"}
-            end;
-        {error, Reason} ->
-            {comment, io_lib:format("Connect failed: ~p", [Reason])}
-    end.
+    ConnRef = connect_and_wait(Host, Port, [<<"hq-interop">>, <<"h3">>]),
+    quic:close(ConnRef, normal),
+    {comment, "Network handshake successful"}.
 
 %% @doc Network retry test (requires server with retry enabled)
 network_retry(Config) ->
     Host = ?config(host, Config),
     Port = ?config(port, Config),
     ct:comment("Network retry test with ~s:~p", [Host, Port]),
-
-    %% Note: Server must have retry enabled for this test
-    Opts = #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>]},
-
-    case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
-            Result =
-                receive
-                    {quic, ConnRef, {connected, _Info}} ->
-                        ok
-                after ?HANDSHAKE_TIMEOUT ->
-                    timeout
-                end,
-            quic:close(ConnRef, normal),
-            case Result of
-                ok -> {comment, "Connection established (may have used retry)"};
-                timeout -> {comment, "Timeout (server may not support retry)"}
-            end;
-        {error, Reason} ->
-            {comment, io_lib:format("Connect failed: ~p", [Reason])}
-    end.
+    ConnRef = connect_and_wait(Host, Port, [<<"hq-interop">>, <<"h3">>]),
+    quic:close(ConnRef, normal),
+    {comment, "Connection established"}.
 
 %% @doc Network transfer test
 network_transfer(Config) ->
     Host = ?config(host, Config),
     Port = ?config(port, Config),
     ct:comment("Network transfer test with ~s:~p", [Host, Port]),
-
-    Opts = #{verify => false, alpn => [<<"echo">>, <<"hq-interop">>]},
-
-    case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
-            case wait_for_connected(ConnRef, ?HANDSHAKE_TIMEOUT) of
-                {ok, _} ->
-                    case quic:open_stream(ConnRef) of
-                        {ok, StreamId} ->
-                            TestData = <<"QUIC Interop Test Data">>,
-                            ok = quic:send_data(ConnRef, StreamId, TestData, true),
-                            Result =
-                                receive
-                                    {quic, ConnRef, {stream_data, StreamId, Data, _}} ->
-                                        {ok, Data}
-                                after ?TRANSFER_TIMEOUT ->
-                                    timeout
-                                end,
-                            quic:close(ConnRef, normal),
-                            case Result of
-                                {ok, RecvData} ->
-                                    ct:pal("Sent: ~p, Received: ~p", [TestData, RecvData]),
-                                    {comment, "Transfer successful"};
-                                timeout ->
-                                    {comment, "Transfer timeout"}
-                            end;
-                        {error, StreamErr} ->
-                            quic:close(ConnRef, normal),
-                            {comment, io_lib:format("Stream error: ~p", [StreamErr])}
-                    end;
-                {error, Reason} ->
-                    quic:close(ConnRef, normal),
-                    {comment, io_lib:format("Handshake failed: ~p", [Reason])}
-            end;
-        {error, Reason} ->
-            {comment, io_lib:format("Connect failed: ~p", [Reason])}
+    ConnRef = connect_and_wait(Host, Port, [<<"echo">>, <<"hq-interop">>]),
+    StreamId = open_stream(ConnRef),
+    TestData = <<"QUIC Interop Test Data">>,
+    ok = quic:send_data(ConnRef, StreamId, TestData, true),
+    Result =
+        receive
+            {quic, ConnRef, {stream_data, StreamId, Data, _}} -> {ok, Data}
+        after ?TRANSFER_TIMEOUT ->
+            timeout
+        end,
+    quic:close(ConnRef, normal),
+    case Result of
+        {ok, TestData} -> {comment, "Transfer successful"};
+        {ok, Other} -> ct:fail({echo_mismatch, TestData, Other});
+        timeout -> ct:fail(transfer_timeout)
     end.
 
 %% @doc Network key update test
@@ -955,63 +898,40 @@ network_keyupdate(Config) ->
     Host = ?config(host, Config),
     Port = ?config(port, Config),
     ct:comment("Network key update test with ~s:~p", [Host, Port]),
-
-    Opts = #{verify => false, alpn => [<<"echo">>, <<"hq-interop">>]},
-
-    case quic:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef} ->
-            case wait_for_connected(ConnRef, ?HANDSHAKE_TIMEOUT) of
-                {ok, _} ->
-                    %% Send some data, initiate key update, send more data
-                    case quic:open_stream(ConnRef) of
-                        {ok, StreamId} ->
-                            %% Send initial data
-                            ok = quic:send_data(ConnRef, StreamId, <<"Before key update">>, false),
-
-                            %% Initiate key update
-                            %% ConnRef is already the connection PID (PR #29)
-                            Result = quic_connection:key_update(ConnRef),
-                            ct:pal("Key update result: ~p", [Result]),
-
-                            %% Send more data after key update
-                            ok = quic:send_data(ConnRef, StreamId, <<" - After key update">>, true),
-
-                            quic:close(ConnRef, normal),
-                            {comment, "Key update test completed"};
-                        {error, Err} ->
-                            quic:close(ConnRef, normal),
-                            {comment, io_lib:format("Stream error: ~p", [Err])}
-                    end;
-                {error, Reason} ->
-                    quic:close(ConnRef, normal),
-                    {comment, io_lib:format("Handshake failed: ~p", [Reason])}
-            end;
-        {error, Reason} ->
-            {comment, io_lib:format("Connect failed: ~p", [Reason])}
-    end.
+    ConnRef = connect_and_wait(Host, Port, [<<"echo">>, <<"hq-interop">>]),
+    StreamId = open_stream(ConnRef),
+    ok = quic:send_data(ConnRef, StreamId, <<"Before key update">>, false),
+    ok = quic_connection:key_update(ConnRef),
+    ok = quic:send_data(ConnRef, StreamId, <<" - After key update">>, true),
+    quic:close(ConnRef, normal),
+    {comment, "Key update test completed"}.
 
 %%====================================================================
 %% Helper Functions
 %%====================================================================
 
-check_server_reachable(Host, Port) ->
-    case gen_udp:open(0, [binary]) of
-        {ok, Socket} ->
-            HostAddr =
-                case inet:parse_address(Host) of
-                    {ok, Addr} ->
-                        Addr;
-                    _ ->
-                        case inet:getaddr(Host, inet) of
-                            {ok, Addr} -> Addr;
-                            _ -> {127, 0, 0, 1}
-                        end
-                end,
-            Result = gen_udp:send(Socket, HostAddr, Port, <<0:32>>),
-            gen_udp:close(Socket),
-            Result =:= ok;
-        _ ->
-            false
+connect_and_wait(Host, Port, Alpn) ->
+    case quic:connect(Host, Port, #{verify => false, alpn => Alpn}, self()) of
+        {ok, ConnRef} ->
+            case wait_for_connected(ConnRef, ?HANDSHAKE_TIMEOUT) of
+                {ok, Info} ->
+                    ct:pal("Handshake completed: ~p", [Info]),
+                    ConnRef;
+                {error, Reason} ->
+                    quic:close(ConnRef, normal),
+                    ct:fail({handshake_failed, Host, Port, Reason})
+            end;
+        {error, Reason} ->
+            ct:fail({connect_failed, Host, Port, Reason})
+    end.
+
+open_stream(ConnRef) ->
+    case quic:open_stream(ConnRef) of
+        {ok, StreamId} ->
+            StreamId;
+        {error, Reason} ->
+            quic:close(ConnRef, normal),
+            ct:fail({open_stream_failed, Reason})
     end.
 
 wait_for_connected(ConnRef, Timeout) ->

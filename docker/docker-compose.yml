@@ -9,7 +9,7 @@ services:
       - ../certs:/certs:ro
       - ./logs:/logs
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('127.0.0.1', 4433)); s.close()"]
+      test: ["CMD-SHELL", "grep -qsi ':1151 ' /proc/net/udp /proc/net/udp6"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -33,7 +33,7 @@ services:
       - ./www:/www:ro
       - ./logs:/logs
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('127.0.0.1', 4435)); s.close()"]
+      test: ["CMD-SHELL", "grep -qsi ':1153 ' /proc/net/udp /proc/net/udp6"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -59,7 +59,7 @@ services:
       - ./www:/www:ro
       - ./logs:/logs
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('127.0.0.1', 4436)); s.close()"]
+      test: ["CMD-SHELL", "grep -qsi ':1154 ' /proc/net/udp /proc/net/udp6"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -95,7 +95,7 @@ services:
     volumes:
       - ../certs:/certs:ro
     healthcheck:
-      test: ["CMD", "nc", "-u", "-z", "-w1", "localhost", "4434"]
+      test: ["CMD-SHELL", "grep -qsi ':1152 ' /proc/net/udp /proc/net/udp6"]
       interval: 5s
       timeout: 3s
       retries: 5
