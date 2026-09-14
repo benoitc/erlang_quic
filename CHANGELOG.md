@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.9.0] - 2026-09-14
 
 ### Added
 - `delivery_coalescing` (default `false`) merges consecutive
