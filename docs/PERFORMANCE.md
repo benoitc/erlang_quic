@@ -69,31 +69,42 @@ the 1.2.0 entry.
 
 ## The crypto NIF is optional
 
-`c_src/quic_crypto_nif.c` is an accelerator, not a dependency. QUIC
-seals every packet as its own AEAD unit and OTP's
-`crypto:crypto_one_time_aead/7` re-runs the key schedule on each call;
-the NIF keeps an `EVP_CIPHER_CTX` per key so the schedule runs once,
-and fuses header protection, nonce derivation, packet-number
-reconstruction and (on receive) frame parsing into one call per run.
+`c_src/quic_crypto_nif.c` is an accelerator for hosts where crypto is
+the bottleneck, such as small ARM boards without AES instructions. It
+keeps an `EVP_CIPHER_CTX` per key and fuses header protection, nonce
+derivation, packet-number reconstruction and, on receive, frame parsing
+into one call per run of packets. You do not need it: without it the
+library uses OTP crypto with identical semantics, and only throughput
+differs.
 
-You never have to build it. When it is missing the library uses the
-OTP crypto path with identical semantics, so the only difference is
-throughput.
-
-Build it with a C toolchain, CMake and OpenSSL headers present:
+It is off by default. To build it, set `QUIC_BUILD_NIF=1` while the
+`quic` application is compiled. You need a C compiler, CMake and
+OpenSSL headers:
 
 ```sh
-rebar3 compile          # the pre_hook builds it when it can
+QUIC_BUILD_NIF=1 rebar3 compile
 ```
 
-CMake resolves the ERTS headers and the same libcrypto OTP's own
-crypto NIF is linked against, so loading it never pins a second
-OpenSSL into the VM. Verified on Linux, macOS (arm64, OpenSSL from
-MacPorts or Homebrew) and FreeBSD 14.3 (arm64, base OpenSSL). A
-missing toolchain prints a note and the build succeeds:
+In a project that depends on `quic`, the variable has to be set for the
+build that compiles the dependency. Setting it when you start the node
+does nothing. rebar3 does not rebuild a dependency it has already
+compiled, so remove it first:
 
+```sh
+rm -rf _build/default/lib/quic
+QUIC_BUILD_NIF=1 rebar3 compile
 ```
-quic_crypto_nif: build skipped (no cmake, toolchain or OpenSSL headers?), using pure-Erlang crypto path
+
+erlang.mk projects use the same variable, through `c_src/Makefile`.
+
+If you set `QUIC_BUILD_NIF=1` and the build fails, the compile fails
+with a message saying why, rather than silently producing a build
+without the NIF.
+
+Check that it loaded:
+
+```erlang
+quic_crypto_nif:is_loaded().
 ```
 
 Turn it off at runtime without rebuilding:
@@ -103,11 +114,18 @@ QUIC_DISABLE_CRYPTO_NIF=1    # this NIF only
 QUIC_DISABLE_NIFS=1          # every optional NIF
 ```
 
-Two limits worth knowing. ChaCha20-Poly1305 connections keep only the
-per-packet acceleration, since the fused paths assume AES-ECB header
-protection. And `erlang:load_nif/2` looks under `code:priv_dir(quic)`,
-so a packaging layout where that does not resolve falls back to the
-OTP crypto path rather than failing.
+Notes:
+
+- CMake links against the same libcrypto OTP's own crypto NIF uses, so
+  loading it never pins a second OpenSSL into the VM. Verified on
+  Linux, macOS (arm64, MacPorts or Homebrew OpenSSL) and FreeBSD 14.3.
+- AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 all use the fused
+  paths.
+- A built NIF that fails to load, or a packaging layout where
+  `code:priv_dir(quic)` does not resolve, falls back to OTP crypto
+  rather than failing.
+- A shared object from an earlier opt-in build stays in `priv/` until
+  `rebar3 clean`.
 
 ## The socket backend is opt in, for now
 

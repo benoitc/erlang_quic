@@ -114,6 +114,11 @@ All notable changes to this project will be documented in this file.
   socket, which is what caught this.
 
 ### Changed
+- The optional crypto NIF is no longer built by default. Set
+  `QUIC_BUILD_NIF=1` while compiling `quic` to build it; a requested
+  build that fails now fails the compile instead of being skipped.
+  Without the variable nothing is compiled and the library runs on OTP
+  crypto.
 - ChaCha20-Poly1305 connections use the fused crypto NIF paths
   (`protect_run`, `open_packet`, `open_run`) like the AES suites. The
   header-protection mask is five ChaCha20 keystream bytes with the

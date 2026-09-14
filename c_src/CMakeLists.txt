@@ -1,10 +1,8 @@
 # Builds the optional AEAD-context NIF.
 #
-# Best effort by design: the NIF is a pure accelerator with a
-# pure-Erlang fallback (see quic_aead_ctx.erl), so a missing toolchain,
-# a missing CMake or missing OpenSSL headers must never fail the build
-# of a project that embeds this library. The callers in rebar.config
-# and in the Makefile shim swallow a failure and print a note.
+# Built only on request: rebar.config and the Makefile shim run this when
+# QUIC_BUILD_NIF=1 and fail the compile if it fails. Without the variable
+# the library runs on OTP crypto (see quic_aead_ctx.erl).
 #
 # The NIF links against the SAME libcrypto that OTP's own crypto NIF
 # uses, resolved from crypto.so with the platform's shared-library
