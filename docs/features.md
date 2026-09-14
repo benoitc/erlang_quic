@@ -269,6 +269,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `preferred_ipv6` - Server preferred IPv6 address
 - `pool_size` - Number of listener processes for server pools (default: 1)
 - `connection_handler` - Callback for handling new connections
+- `monitor_owner` - Stop the connection with `{shutdown, owner_down}` and send CONNECTION_CLOSE when its owner process exits (default: `true` for accepted connections, `false` for client connections, which are linked to their caller unless supervised). Set `false` in the listener options to keep an accepted connection alive after its handler exits
 - `lb_config` - QUIC-LB configuration map for load balancer routing
 - `keep_alive_interval` - Keep-alive PING interval (`disabled`, `auto`, or milliseconds)
 - `pmtu_enabled` - Enable Path MTU Discovery (default: true)

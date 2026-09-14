@@ -417,8 +417,8 @@ sender_down(_, _) ->
 %% batches, serially. GSO state (including the partial-send disable)
 %% lives in the sender's own socket_state copy. Linked to the caller.
 %% Returns the sender and the counter connections read gso_flushes
-%% from; both go into new_sender/2 options (`sender_pid`,
-%% `gso_counter`).
+%% from; both go into new_sender/2 options (`sender_pid',
+%% `gso_counter').
 -spec start_shared_sender(socket_state()) -> {pid(), atomics:atomics_ref()}.
 start_shared_sender(#socket_state{} = SS) ->
     Counter = atomics:new(1, []),
