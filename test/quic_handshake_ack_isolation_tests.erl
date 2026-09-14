@@ -43,7 +43,7 @@ loss_with_three_inflight() ->
 %% once: two builds either side of a millisecond tick differ in
 %% time_sent and nothing else.
 state() ->
-    quic_connection:test_state_with_loss(loss_with_three_inflight()).
+    quic_connection_test_support:state_with_loss(loss_with_three_inflight()).
 
 %% An ACK frame in the shape process_frame/3 consumes. Each range is
 %% {LargestAcked, FirstRange} where FirstRange is a *count* of further
@@ -58,7 +58,7 @@ ack_all() ->
 
 %% Everything about the tracker a stray ACK could disturb.
 snapshot(State) ->
-    L = quic_connection:test_loss_state(State),
+    L = quic_connection_test_support:loss_state(State),
     #{
         in_flight => quic_loss:bytes_in_flight(L),
         sent => quic_loss:sent_packets(L),

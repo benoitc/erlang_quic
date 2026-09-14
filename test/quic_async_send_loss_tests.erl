@@ -11,7 +11,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 queue(StreamId, Offset, Data, Fin, SendOffset) ->
-    quic_connection:test_queue_blocked_send(StreamId, Offset, Data, Fin, SendOffset).
+    quic_connection_test_support:queue_blocked_send(StreamId, Offset, Data, Fin, SendOffset).
 
 %% The regression: this used to return {error, {flow_control_blocked, _}}
 %% and drop the payload.

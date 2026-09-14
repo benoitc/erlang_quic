@@ -24,10 +24,12 @@ messages() ->
 
 state(Coalescing) ->
     flush(),
-    S0 = quic_connection:test_recv_stream_state(?SID, 1000, ?WIN, 2 * ?WIN),
-    S1 = quic_connection:test_add_recv_stream(S0, 8, ?WIN),
-    S2 = quic_connection:test_state_in_recv_pass(quic_connection:test_state_with_pn_app(S1, 9)),
-    quic_connection:test_state_coalescing(S2, Coalescing).
+    S0 = quic_connection_test_support:recv_stream_state(?SID, 1000, ?WIN, 2 * ?WIN),
+    S1 = quic_connection_test_support:add_recv_stream(S0, 8, ?WIN),
+    S2 = quic_connection_test_support:state_in_recv_pass(
+        quic_connection_test_support:state_with_pn_app(S1, 9)
+    ),
+    quic_connection_test_support:state_coalescing(S2, Coalescing).
 
 %% Packets PN0.. with one stream frame each, Sid, from Off.
 train(PN0, Sid, Off, Sizes) ->
@@ -56,7 +58,7 @@ reference(Results, S0) ->
     S1.
 
 summary(S) ->
-    M = quic_connection:test_recv_summary(S, ?SID),
+    M = quic_connection_test_support:recv_summary(S, ?SID),
     %% recv_time differs by construction; ranges/largest/offset/count matter.
     M.
 

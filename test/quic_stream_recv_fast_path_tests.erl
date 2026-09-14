@@ -34,7 +34,7 @@ both(S, Offset, Data, Fin) ->
     {{Lean, LeanMsgs}, {Slow, SlowMsgs}}.
 
 in_order_bulk_frame_test() ->
-    S = quic_connection:test_recv_stream_state(?SID, 5000, ?WIN, 2 * ?WIN),
+    S = quic_connection_test_support:recv_stream_state(?SID, 5000, ?WIN, 2 * ?WIN),
     Data = binary:copy(<<"d">>, 1200),
     {L, R} = both(S, 5000, Data, false),
     ?assertEqual(R, L),
@@ -43,7 +43,7 @@ in_order_bulk_frame_test() ->
 
 %% A run of in-order frames threads identically through both paths.
 in_order_run_test() ->
-    S0 = quic_connection:test_recv_stream_state(?SID, 0, ?WIN, 2 * ?WIN),
+    S0 = quic_connection_test_support:recv_stream_state(?SID, 0, ?WIN, 2 * ?WIN),
     Data = binary:copy(<<"r">>, 1000),
     {Lean, Slow} = lists:foldl(
         fun(I, {L, R}) ->
@@ -62,22 +62,22 @@ in_order_run_test() ->
 %% duplicate, a FIN, an empty frame, an unknown stream. All wide-window,
 %% so the general path emits no flow-control frame either way.
 out_of_order_test() ->
-    S = quic_connection:test_recv_stream_state(?SID, 5000, ?WIN, 2 * ?WIN),
+    S = quic_connection_test_support:recv_stream_state(?SID, 5000, ?WIN, 2 * ?WIN),
     {L, R} = both(S, 6200, binary:copy(<<"o">>, 1200), false),
     ?assertEqual(R, L).
 
 duplicate_test() ->
-    S = quic_connection:test_recv_stream_state(?SID, 5000, ?WIN, 2 * ?WIN),
+    S = quic_connection_test_support:recv_stream_state(?SID, 5000, ?WIN, 2 * ?WIN),
     {L, R} = both(S, 4000, binary:copy(<<"u">>, 1000), false),
     ?assertEqual(R, L).
 
 fin_test() ->
-    S = quic_connection:test_recv_stream_state(?SID, 5000, ?WIN, 2 * ?WIN),
+    S = quic_connection_test_support:recv_stream_state(?SID, 5000, ?WIN, 2 * ?WIN),
     {L, R} = both(S, 5000, binary:copy(<<"f">>, 100), true),
     ?assertEqual(R, L).
 
 empty_frame_test() ->
-    S = quic_connection:test_recv_stream_state(?SID, 5000, ?WIN, 2 * ?WIN),
+    S = quic_connection_test_support:recv_stream_state(?SID, 5000, ?WIN, 2 * ?WIN),
     {L, R} = both(S, 5000, <<>>, false),
     ?assertEqual(R, L).
 

@@ -71,6 +71,7 @@ Connections are `gen_statem` processes (`quic_connection.erl`) that progress thr
 - `test/quic_*_tests.erl` — EUnit tests (unit)
 - `test/prop_quic_*.erl` — PropEr property-based tests (encoding roundtrips, reliability)
 - `test/quic_*_SUITE.erl` — Common Test suites (E2E against aioquic/quic-go via Docker, interop runner)
+- `quic_connection`, `quic_listener` and `quic_socket` compile with `export_all` under TEST, so unit tests call internals directly. Do not add `-ifdef(TEST)` exports; put `#state{}` builders and accessors in `test/quic_connection_test_support.erl`
 - E2E tests require Docker containers (`docker/docker-compose.yml`)
 
 ## Linting Notes

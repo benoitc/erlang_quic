@@ -33,9 +33,9 @@ total() ->
     lists:sum([byte_size(D) || D <- datagrams()]).
 
 batch(Role, Validated) ->
-    State = quic_connection:test_state_amp(Role, Validated),
+    State = quic_connection_test_support:state_amp(Role, Validated),
     NewState = quic_connection:handle_packets_batch(datagrams(), State),
-    quic_connection:test_amp_counters(NewState).
+    quic_connection_test_support:amp_counters(NewState).
 
 unvalidated_server_credits_every_datagram_test() ->
     Counters = batch(server, false),
