@@ -212,6 +212,14 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - Set `h3_datagram_enabled => true` on `connect/3` / `start_server/3` to enable.
   CONNECT-UDP (RFC 9298) builds on this in a separate library.
 
+### Capsule Protocol (RFC 9297 §3.2)
+- `quic_h3_capsule:encode/2` - Encode `Type | Length | Value` as an iolist
+- `quic_h3_capsule:decode/1` - Decode one capsule, or report that more bytes are needed
+- Constants in `include/quic_h3.hrl`: `?H3_CAPSULE_DATAGRAM` (`0x00`),
+  `?H3_CAPSULE_LEGACY_DATAGRAM` (`0xff37a0`)
+- A pure codec with no callers inside this library: extension libraries
+  drive it. Same wire format as `h1_capsule` and `h2_capsule`.
+
 ### HTTP/3 Extension Streams
 - `quic_h3:open_bidi_stream/1,2` - Open a client-initiated bidi stream;
   with a non-negative `SignalType` varint the stream is pre-claimed and
@@ -236,6 +244,16 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `quic:reset_stream_at/4` - Reset stream with reliable delivery up to specified size
 - `quic:set_stream_priority/4` - Set stream priority (urgency, incremental)
 - `quic:get_stream_priority/2` - Get stream priority
+
+### Flow Control Accounting
+- `quic_flow:new/0,1` - Create accounting state
+- `quic_flow:can_send/2`, `on_data_sent/2`, `on_max_data_received/2`, `send_blocked/1` - Send side
+- `quic_flow:on_data_received/2`, `should_send_max_data/1`, `generate_max_data/1` - Receive side
+- `quic_flow:bytes_sent/1`, `bytes_received/1`, `send_limit/1`, `recv_limit/1`,
+  `send_window/1`, `recv_window/1` - Queries
+- Connection-level only, and it emits no frames. `quic_connection` does not
+  use it: the flow control that runs on the wire is inline there, auto-tuned
+  from the RTT and with per-stream limits.
 
 ### Server / Multi-Pool Server Management
 - `quic:start_server/3` - Start named server pool

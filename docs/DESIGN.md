@@ -19,7 +19,7 @@ The implementation is organized into the following module groups:
 | Module | Responsibility |
 |--------|----------------|
 | `quic_connection` | Connection state machine (gen_statem) |
-| `quic_stream` | Stream state management |
+| `quic_stream` | Stream state management, standalone. The connection keeps its own `#stream_state{}` inline |
 
 ### Protocol Layer
 
@@ -43,8 +43,8 @@ The implementation is organized into the following module groups:
 
 | Module | Responsibility |
 |--------|----------------|
-| `quic_flow` | Connection and stream flow control |
-| `quic_cc` | Congestion control (NewReno) |
+| `quic_flow` | Connection-level flow control accounting, standalone. The flow control that runs on the wire is inline in `quic_connection` |
+| `quic_cc` | Congestion control behaviour and dispatch; NewReno, CUBIC and BBR live in `quic_cc_newreno`, `quic_cc_cubic`, `quic_cc_bbr` |
 | `quic_loss` | Loss detection and recovery |
 | `quic_ack` | ACK frame processing and generation |
 

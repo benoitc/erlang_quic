@@ -567,6 +567,17 @@ Registered capsule type constants are in `include/quic_h3.hrl`:
 (`0xff37a0`). Unknown types are returned as their varint value so
 extensions can claim their own codepoints.
 
+`decode/1` returns `{more, N}` where `N` is exact only when the value is
+short. It is `1` while the type or length varint is incomplete, so keep
+feeding bytes instead of waiting for exactly `N`. A peer can announce a
+length up to 2^62-1, which gives you `{more, Huge}` rather than an
+error, so bound the buffer yourself.
+
+Nothing inside this library calls the codec; it is here for extension
+libraries. `erlang_masque` wraps it as `masque_capsule`, and the wire
+format is identical to `h1_capsule` and `h2_capsule`, so the same
+capsule stream can be framed over HTTP/1, HTTP/2 or HTTP/3.
+
 ### Building extension libraries
 
 The primitives above are designed to support both WebTransport and
