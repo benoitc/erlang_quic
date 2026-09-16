@@ -283,6 +283,10 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `max_datagram_frame_size` - Max datagram size to accept (0 = disabled, default: 0)
 - `datagram_recv_queue_len` - Bounded receive queue for inbound datagrams (default: `infinity`; drops oldest on overflow, tracked via `datagram_stats/1`)
 - `reset_stream_at` - Enable RESET_STREAM_AT extension (default: false)
+- `active_connection_id_limit` - How many of the peer's connection IDs to hold,
+  counting the handshake CID (default: 2). Advertised to the peer and enforced
+  on inbound NEW_CONNECTION_ID; exceeding it closes with
+  CONNECTION_ID_LIMIT_ERROR
 - `alpn` - ALPN protocols list
 - `verify` - Server certificate verification on the client (default: `true`; verifies the CertificateVerify signature, the chain, and the hostname). The hostname check follows the RFC 6125 HTTPS rules, so a leftmost-label wildcard SAN such as `*.example.com` matches `host.example.com`. Set `false` to accept any certificate, e.g. a self-signed test server.
 - `cacerts` - Trust anchors for client chain validation, as a list of DER-encoded certificates (default: the operating system trust store)
