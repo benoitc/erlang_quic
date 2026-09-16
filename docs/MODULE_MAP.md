@@ -63,15 +63,20 @@ Seventeen modules have no caller anywhere in `src`. None is dead, and each is re
 
 ## Reading quic_connection
 
-The file carries section banners. The ones worth knowing:
+The file carries section banners, and the module header lists them in order.
+The ones worth knowing:
 
 - API and gen_statem callbacks, then the five state functions: `idle`, `handshaking`, `connected`, `draining`, `closed`.
-- TLS handshake, which continues later inside the packet-processing region.
+- TLS handshake, then PSK validation and the session ticket store, then the handshake's server flight. Its second half, the TLS message driver, sits inside the packet-processing region because that is where CRYPTO frames arrive.
+- Packet send layer: frames and payloads become packets, at all three levels.
 - Packet processing, the largest region, covering decrypt, parse and the batched receive path.
-- Stream processing and reassembly.
-- The send path, which has no banner of its own and currently sits under the reclaimed-stream region.
+- Stream processing and reassembly; socket I/O; ACK emission and decimation; delivery to the owner.
+- Send path, then the send queue and its urgency priority queue.
 - Timers: retransmission, PTO, idle, keep-alive, pacing.
 - Key update, migration, PMTU.
+
+The two hot paths have their own walkthroughs: [SEND_PATH.md](SEND_PATH.md) and
+[RECV_PATH.md](RECV_PATH.md).
 
 `#state{}` lives in `src/quic_connection_state.hrl` and has 195 fields. When you change one, grep for the field name rather than reading the function you are in: most fields are touched in several regions.
 
