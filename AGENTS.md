@@ -8,15 +8,20 @@ Pure Erlang QUIC implementation (RFC 9000/9001) with zero external dependencies.
 
 ## Required Checks
 
-Every change must be formatted and pass all checks before committing:
+Every change must be formatted and pass all checks before committing. This list
+matches what CI gates on; see [CONTRIBUTING.md](CONTRIBUTING.md) for the rest of
+the workflow.
 
 ```bash
 rebar3 fmt                  # Auto-format (always run first)
 rebar3 compile              # Must compile cleanly
-rebar3 eunit                # Unit tests must pass
+rebar3 eunit                # Unit tests, including the docs drift check
+rebar3 proper               # Property tests must pass
+rebar3 fmt --check          # CI fails on unformatted code
 rebar3 lint                 # Elvis linter must pass
 rebar3 dialyzer             # Type checking must pass
 rebar3 xref                 # Cross-reference analysis must pass
+rebar3 ex_doc               # Docs must build
 ```
 
 ## Build & Development Commands

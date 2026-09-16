@@ -355,7 +355,7 @@ doc_files(Root) ->
     filelib:wildcard(filename:join([Root, "docs", "*.md"])) ++
         [
             filename:join(Root, F)
-         || F <- ["README.md", "AGENTS.md", "SECURITY.md"],
+         || F <- ["README.md", "AGENTS.md", "SECURITY.md", "CONTRIBUTING.md"],
             filelib:is_file(filename:join(Root, F))
         ].
 

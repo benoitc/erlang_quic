@@ -264,8 +264,12 @@ Topic guides under `docs/`:
 - [docs/QLOG_GUIDE.md](docs/QLOG_GUIDE.md): qlog tracing
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md): throughput characteristics, socket-backend rationale, roadmap
 - [docs/DESIGN.md](docs/DESIGN.md): architecture, state machine, packet flow
-- [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md): contributing
+- [docs/MODULE_MAP.md](docs/MODULE_MAP.md): where the code lives and what to read first
+- [docs/GLOSSARY.md](docs/GLOSSARY.md): abbreviations and local vocabulary
+- [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md): application developer recipes
 - [docs/features.md](docs/features.md): feature matrix and API reference
+
+Changing the library itself: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Generate API documentation with:
 
