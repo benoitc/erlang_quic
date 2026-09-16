@@ -11,6 +11,12 @@
 %%% layers (for instance a CONNECT-UDP implementation built on top of
 %%% RFC 9297) drive the codec themselves by buffering stream body bytes
 %%% and feeding them to `decode/1' until it returns `{more, N}'.
+%%%
+%%% Nothing inside this library calls it: the codec exists for
+%%% extension libraries. `erlang_masque' wraps it as `masque_capsule',
+%%% and the wire format is identical to `h1_capsule' and `h2_capsule',
+%%% so the same capsule stream can be framed over HTTP/1, HTTP/2 or
+%%% HTTP/3 without reframing.
 
 -module(quic_h3_capsule).
 
@@ -31,9 +37,17 @@ encode(Type, Value) when is_integer(Type), Type >= 0 ->
 %% @doc Decode a single capsule from the head of a binary.
 %%
 %% Returns `{ok, {Type, Value, Rest}}' when a complete capsule is
-%% available; `{more, Needed}' (a non-negative hint that may be 1 when
-%% the length is unknown) if more bytes are needed; `{error, Reason}'
-%% on a malformed varint.
+%% available, or `{more, Needed}' when more bytes are needed. `Needed'
+%% is exact only when the value itself is short: it is 1 whenever the
+%% type or length varint is still incomplete, so treat it as a hint and
+%% keep feeding bytes rather than waiting for exactly that many.
+%%
+%% A peer can announce a length of up to 2^62-1, which yields
+%% `{more, Huge}' rather than an error, so bound the buffer yourself.
+%%
+%% `{error, malformed_varint}' is defensive. Both empty-binary cases are
+%% intercepted first, so for any binary input decode/1 returns only
+%% `{ok, _}' or `{more, _}'.
 -spec decode(binary()) ->
     {ok, {capsule_type(), capsule_value(), binary()}}
     | {more, non_neg_integer()}

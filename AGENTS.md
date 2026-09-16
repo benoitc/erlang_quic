@@ -42,13 +42,13 @@ rebar3 ex_doc                                     # Generate docs
 
 **Public API:** `quic.erl` (main client/server API), `quic_listener.erl` (server listener)
 
-**Connection Management:** `quic_connection.erl` (gen_statem state machine — the central module), `quic_stream.erl` (per-stream state), `quic_server_registry.erl` (multi-server registry)
+**Connection Management:** `quic_connection.erl` (gen_statem state machine — the central module), `quic_stream.erl` (standalone per-stream state helper; the connection keeps its own `#stream_state{}` inline), `quic_server_registry.erl` (multi-server registry)
 
 **Protocol:** `quic_packet.erl` (packet encode/decode), `quic_frame.erl` (frame encode/decode), `quic_varint.erl` (RFC 9000 §16 variable-length integers)
 
 **Crypto:** `quic_crypto.erl` (key derivation, transcript hashing), `quic_tls.erl` (TLS 1.3 messages), `quic_keys.erl` (traffic keys), `quic_aead.erl` (AEAD encryption, header protection), `quic_hkdf.erl` (HKDF expansion)
 
-**Flow Control & Loss:** `quic_flow.erl` (connection/stream flow control), `quic_cc.erl` (NewReno congestion control), `quic_loss.erl` (loss detection/recovery), `quic_ack.erl` (ACK processing)
+**Flow Control & Loss:** `quic_flow.erl` (standalone connection-level accounting helper; the flow control that runs is inline in `quic_connection.erl`), `quic_cc.erl` (congestion control behaviour and dispatch; NewReno, CUBIC and BBR live in `quic_cc_newreno.erl`, `quic_cc_cubic.erl`, `quic_cc_bbr.erl`), `quic_loss.erl` (loss detection/recovery), `quic_ack.erl` (ACK processing)
 
 **Other:** `quic_ticket.erl` (session tickets/PSK), `quic_lb.erl` (QUIC-LB RFC 9312)
 

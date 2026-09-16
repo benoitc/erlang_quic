@@ -6,13 +6,24 @@
 %%% Copyright (c) 2024-2026 Benoit Chesneau
 %%% Apache License 2.0
 %%%
-%%% @doc QUIC connection-level flow control implementation.
+%%% @doc Connection-level flow control accounting.
 %%%
-%%% This module manages flow control at the connection level:
+%%% Standalone helper: `quic_connection' does not use it. The flow
+%%% control that runs on the wire is inline in `quic_connection', which
+%%% auto-tunes the window from the RTT, keeps per-stream limits, sends
+%%% the frames and closes the connection on a violation. Read that for
+%%% the library's behaviour; use this module when you want the
+%%% accounting on its own.
+%%%
+%%% What it does:
 %%% - Tracking bytes sent against peer's MAX_DATA limit
 %%% - Tracking bytes received against our MAX_DATA limit
-%%% - Generating MAX_DATA frames when needed
+%%% - Telling you when a MAX_DATA update is due, and what value to grant
 %%% - Detecting when we're blocked by flow control
+%%%
+%%% What it does not do: stream-level accounting, and sending anything.
+%%% It emits no frames, so you send MAX_DATA and DATA_BLOCKED yourself
+%%% and you decide what a violation does.
 %%%
 %%% == Flow Control Concepts ==
 %%%
@@ -164,7 +175,10 @@ on_data_received(
     end.
 
 %% @doc Check if we should send a MAX_DATA update.
-%% Returns true if we've consumed more than the threshold.
+%% True once the granted window is down to its last
+%% `?WINDOW_UPDATE_THRESHOLD' fraction. That constant is the fraction
+%% remaining, not the fraction consumed, so 0.75 fires after 25% of the
+%% window has been used.
 -spec should_send_max_data(flow_state()) -> boolean().
 should_send_max_data(#flow_state{
     bytes_received = Received,
