@@ -44,7 +44,10 @@
     maybe_send_ack_app/2,
     classify_recv_trigger/2,
     loss_state/1,
-    update_spin_from_recv/3
+    update_spin_from_recv/3,
+    state_for_cid_limit/1,
+    peer_cids/1,
+    local_cids/1
 ]).
 
 %% Update the spin-bit tracking state from a received 1-RTT packet.
@@ -251,7 +254,8 @@ state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
 state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at.
 
 state_set(#state{} = S, loss_state, V) -> S#state{loss_state = V};
-state_set(#state{} = S, pto_scheduled_at, V) -> S#state{pto_scheduled_at = V}.
+state_set(#state{} = S, pto_scheduled_at, V) -> S#state{pto_scheduled_at = V};
+state_set(#state{} = S, peer_active_cid_limit, V) -> S#state{peer_active_cid_limit = V}.
 
 -spec state_with_loss(quic_loss:loss_state()) -> #state{}.
 state_with_loss(LossState) ->
@@ -449,6 +453,39 @@ state_coalescing(State, On) ->
 
 -spec pending_delivery(#state{}) -> none | {non_neg_integer(), [binary()], boolean()}.
 pending_delivery(#state{pend_deliver = P}) -> P.
+
+%% A client state for connection-id tests, holding the peer's initial CID
+%% as sequence 0 and accepting Limit of the peer's CIDs.
+%%
+%% `coalesce' is on so RETIRE_CONNECTION_ID frames accumulate in the
+%% pending packet instead of reaching send_app_packet_now/3, which
+%% matches `app_keys' in its head and would fail on a state with no
+%% keys installed.
+-spec state_for_cid_limit(non_neg_integer()) -> #state{}.
+state_for_cid_limit(Limit) ->
+    DCID = <<"peer-cid">>,
+    SCID = <<"own-cid0">>,
+    #state{
+        role = client,
+        app_keys = undefined,
+        coalesce = true,
+        dcid = DCID,
+        scid = SCID,
+        local_active_cid_limit = Limit,
+        %% Both pools carry sequence 0 the way the init paths build them:
+        %% the peer's handshake CID and our own. Leaving our pool empty
+        %% would let issuance look one CID short of the peer's limit.
+        peer_cid_pool = [#cid_entry{seq_num = 0, cid = DCID, status = active}],
+        local_cid_pool = [#cid_entry{seq_num = 0, cid = SCID, status = active}]
+    }.
+
+%% The peer CIDs we currently hold, newest first.
+-spec peer_cids(#state{}) -> [#cid_entry{}].
+peer_cids(#state{peer_cid_pool = Pool}) -> Pool.
+
+%% The CIDs we have issued, including sequence 0.
+-spec local_cids(#state{}) -> [#cid_entry{}].
+local_cids(#state{local_cid_pool = Pool}) -> Pool.
 
 %% Run finish_recv_pass/1 and return the observable decimation fields.
 -spec finish_recv_pass(#state{}) ->

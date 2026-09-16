@@ -48,7 +48,8 @@ test-local:
 	quic_e2e_cubic_SUITE,\
 	quic_h3_e2e_SUITE,\
 	quic_datagram_e2e_SUITE,\
-	quic_lb_e2e_SUITE
+	quic_lb_e2e_SUITE,\
+	quic_cid_rotation_SUITE
 
 test-docker:
 	docker compose -f docker/docker-compose.yml up -d --wait
