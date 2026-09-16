@@ -8,7 +8,11 @@
 %%%
 %%% @doc QUIC stream state management.
 %%%
-%%% This module manages individual stream state, including:
+%%% Standalone helper: `quic_connection' does not use it. The connection
+%%% keeps its own `#stream_state{}' inline, and that is the code that
+%%% runs on the wire. This module models the same lifecycle on its own.
+%%%
+%%% It manages individual stream state, including:
 %%% - Stream lifecycle (idle -> open -> half-closed -> closed)
 %%% - Send and receive buffers
 %%% - Per-stream flow control
