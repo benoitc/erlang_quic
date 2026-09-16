@@ -855,8 +855,8 @@ H3_SERVER_HOST=127.0.0.1 H3_SERVER_PORT=4435 rebar3 ct --suite=quic_h3_e2e_SUITE
 # Server tests with aioquic clients
 rebar3 ct --suite=quic_h3_server_SUITE
 
-# h3spec conformance tests
-rebar3 ct --suite=quic_h3_h3spec_SUITE
+# h3spec conformance corpus, ported to deterministic EUnit tests
+rebar3 eunit --module=quic_h3_compliance_tests
 ```
 
 **Docker Services:**

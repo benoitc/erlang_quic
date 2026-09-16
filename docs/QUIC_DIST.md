@@ -185,7 +185,7 @@ QUIC distribution uses multiple streams for different purposes:
 | Stream | Type | Urgency | Purpose |
 |--------|------|---------|---------|
 | 0 | Bidirectional | 0 (highest) | Control: handshake, tick, link/monitor signals |
-| 4, 8, 12... | Bidirectional | 4-6 | Data: distribution messages |
+| 4, 8, 12 ... 64 | Bidirectional | 4-6 | Data: distribution messages (16 streams) |
 
 The control stream (stream 0) has the highest priority (urgency 0), ensuring that:
 - Handshake messages are delivered promptly
@@ -202,14 +202,18 @@ QUIC stream IDs encode the initiator in bit 0:
 - Even IDs (0, 4, 8...): Client-initiated bidirectional
 - Odd IDs (1, 5, 9...): Server-initiated bidirectional
 
-Distribution reserves low stream IDs:
+Distribution reserves low stream IDs. With `?QUIC_DIST_DATA_STREAMS` at 16:
 - Stream 0: Control (handshake, ticks)
-- Streams 4, 8, 12, 16: Client data (4 streams)
-- Streams 1, 5, 9, 13: Server data (4 streams)
+- Streams 4, 8, 12 ... 64: Client data (16 streams)
+- Streams 1, 5, 9 ... 61: Server data (16 streams)
 
 User streams start at:
-- Client-initiated: StreamId >= 20 (first available: 20, 24, 28...)
-- Server-initiated: StreamId >= 17 (first available: 17, 21, 25...)
+- Client-initiated: StreamId >= 68 (first available: 68, 72, 76...)
+- Server-initiated: StreamId >= 65 (first available: 65, 69, 73...)
+
+Both thresholds are derived from the stream count by
+`USER_STREAM_THRESHOLD_CLIENT` and `USER_STREAM_THRESHOLD_SERVER` in
+`include/quic_dist.hrl`, so changing `?QUIC_DIST_DATA_STREAMS` moves them.
 
 #### API Reference
 
@@ -438,7 +442,7 @@ The controller implements backpressure to prevent overwhelming the QUIC connecti
 Configuration options (in `quic_dist.hrl`):
 ```erlang
 -define(DEFAULT_MAX_PULL_PER_NOTIFICATION, 16).
--define(DEFAULT_BACKPRESSURE_RETRY_MS, 50).
+-define(DEFAULT_BACKPRESSURE_RETRY_MS, 10).
 ```
 
 ### Input Handler
@@ -488,8 +492,10 @@ The input handler:
 |--------|------|---------|-------------|
 | `keep_alive_interval` | integer/atom | `disabled` | Keep-alive PING interval (ms), or `auto` for half idle timeout |
 | `idle_timeout` | integer | 30000 | Connection idle timeout (ms) |
-| `max_data` | integer | 10485760 | Connection flow control limit (bytes) |
-| `max_stream_data` | integer | 1048576 | Stream flow control limit (bytes) |
+| `max_data` | integer | 786432 | Connection flow control limit (bytes) |
+| `max_stream_data_bidi_local` | integer | 524288 | Stream flow control limit, streams we open (bytes) |
+| `max_stream_data_bidi_remote` | integer | 524288 | Stream flow control limit, peer-opened streams (bytes) |
+| `max_stream_data_uni` | integer | 524288 | Stream flow control limit, unidirectional (bytes) |
 
 ### Extension Hooks
 
@@ -662,8 +668,8 @@ Adjust the number of data streams (default 4):
 QUIC's flow control prevents overwhelming receivers. Adjust in `quic.hrl`:
 
 ```erlang
--define(DEFAULT_INITIAL_MAX_DATA, 10485760).  % 10MB
--define(DEFAULT_INITIAL_MAX_STREAM_DATA, 1048576).  % 1MB
+-define(DEFAULT_INITIAL_MAX_DATA, 786432).  % 768KB
+-define(DEFAULT_INITIAL_MAX_STREAM_DATA, 524288).  % 512KB
 ```
 
 ### Keep-Alive

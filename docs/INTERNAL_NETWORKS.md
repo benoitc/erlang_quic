@@ -139,8 +139,9 @@ go through `quic_dist:set_connect_options/2`. See
 
 ## Cost
 
-The handshake negotiates `TLS_AES_128_GCM_SHA256`, which is the only
-suite offered, so there is no cipher choice to tune. AES-GCM runs on
+The handshake offers three suites (`TLS_AES_128_GCM_SHA256`,
+`TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`), ordered by
+whether the CPU has AES instructions. Set `ciphers` to pin the order. AES-GCM runs on
 the AES-NI / ARM crypto extensions through OpenSSL on any current
 server CPU. If throughput is the reason you wanted to drop TLS, see
 [PERFORMANCE.md](PERFORMANCE.md): the cost that shows up in profiles

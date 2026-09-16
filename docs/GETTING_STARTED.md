@@ -13,7 +13,7 @@ Add erlang_quic to your `rebar.config` dependencies:
 
 ```erlang
 {deps, [
-    {quic, {git, "https://github.com/benoitc/erlang_quic.git", {tag, "1.3.0"}}}
+    {quic, {git, "https://github.com/benoitc/erlang_quic.git", {tag, "1.9.1"}}}
 ]}.
 ```
 
@@ -89,14 +89,14 @@ start(Port) ->
         cert => Cert,
         key => Key,
         alpn => [<<"example">>],
-        connection_handler => fun handle_connection/3
+        connection_handler => fun handle_connection/2
     },
     quic:start_server(echo_server, Port, Opts).
 
 stop() ->
     quic:stop_server(echo_server).
 
-handle_connection(Conn, _Opts, _Owner) ->
+handle_connection(Conn, _DCID) ->
     spawn(fun() -> connection_loop(Conn) end).
 
 connection_loop(Conn) ->
@@ -194,8 +194,10 @@ QUIC has built-in flow control at both connection and stream levels. The library
 
 ```erlang
 Opts = #{
-    max_data => 10485760,        %% 10MB connection limit
-    max_stream_data => 1048576   %% 1MB per-stream limit
+    max_data => 10485760,                    %% 10MB connection limit
+    max_stream_data_bidi_local => 1048576,   %% 1MB per stream we open
+    max_stream_data_bidi_remote => 1048576,  %% 1MB per peer-opened stream
+    max_stream_data_uni => 1048576           %% 1MB per unidirectional stream
 }.
 ```
 
@@ -221,7 +223,7 @@ If connections fail to establish:
 For development, use `verify => verify_none`. In production:
 - Use CA-signed certificates
 - Set `verify => verify_peer`
-- Configure `cacert_file` with CA bundle
+- Configure `cacerts` with the DER-encoded CA certificates
 
 ### ALPN Mismatch
 

@@ -42,7 +42,9 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 - Per-connection owner override via `connection_handler` callback for
   multi-tenant servers
 - Per-stream handler registration to redirect body data to worker pids
-- CLI tools: `bin/quic_h3c` (client), `bin/quic_h3d` (server)
+- CLI escripts `quic_h3_client` and `quic_h3_server`, built with
+  `rebar3 as h3_client escriptize` / `rebar3 as h3_server escriptize` into
+  `_build/<profile>/bin/`
 - See [docs/HTTP3.md](docs/HTTP3.md) for the full guide
 
 ### Distributed Erlang over QUIC (`quic_dist`)

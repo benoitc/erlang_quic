@@ -758,7 +758,7 @@ init({server, Opts}) ->
 
 %% Build congestion control options from connection options.
 %% Supports:
-%%   - cc_algorithm: Congestion control algorithm (newreno | bbr, default: newreno)
+%%   - cc_algorithm: Congestion control algorithm (newreno | bbr | cubic, default: newreno)
 %%   - initial_window: Initial congestion window in bytes (default: RFC 9002 formula)
 %%                     Higher values improve bulk transfer throughput.
 %%                     Recommended for distribution: 65536 (64KB) or higher.

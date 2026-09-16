@@ -82,8 +82,10 @@ packets automatically.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `idle_timeout` | integer | 30000 | Idle timeout in ms |
-| `max_data` | integer | 10485760 | Connection-level receive limit |
-| `max_stream_data` | integer | 1048576 | Per-stream receive limit |
+| `max_data` | integer | 786432 | Connection-level receive limit |
+| `max_stream_data_bidi_local` | integer | 524288 | Receive limit for streams we open |
+| `max_stream_data_bidi_remote` | integer | 524288 | Receive limit for streams the peer opens |
+| `max_stream_data_uni` | integer | 524288 | Receive limit for unidirectional streams |
 | `max_streams_bidi` | integer | 100 | Max bidirectional streams |
 | `max_streams_uni` | integer | 100 | Max unidirectional streams |
 
@@ -390,7 +392,13 @@ StoredTicket = get_ticket(Host),
 %%     packets_sent => 150,
 %%     packets_received => 148,
 %%     data_sent => 50000,
-%%     data_received => 45000
+%%     data_received => 45000,
+%%     ack_sent => 42,
+%%     retransmits => 0,
+%%     batch_flushes => 12,
+%%     packets_coalesced => 30,
+%%     gso_flushes => 0,
+%%     send_batch_pending => 0
 %% }
 ```
 
@@ -482,7 +490,7 @@ end.
 %% Production: always verify certificates
 #{
     verify => true,
-    cacertfile => "/etc/ssl/certs/ca-certificates.crt"
+    cacerts => CACerts  %% list of DER-encoded CA certificates
 }
 
 %% Development only: disable verification
