@@ -37,7 +37,7 @@ application:ensure_all_started(quic).
 |--------|------|---------|-------------|
 | `alpn` | [binary()] | `[<<"h3">>]` | ALPN protocols to advertise |
 | `cert_chain` | [binary()] | `[]` | Additional certificate chain |
-| `groups` | [atom()] | `[x25519]` | Accepted key-exchange groups in preference order (`x25519`, `secp256r1`, `secp384r1`). A client whose `key_share` matches none of these but whose `supported_groups` does triggers a HelloRetryRequest. |
+| `groups` | [atom()] | `[x25519, secp256r1, secp384r1]` | Accepted key-exchange groups in preference order (`x25519`, `secp256r1`, `secp384r1`, `x25519mlkem768`). A client whose `key_share` matches none of these but whose `supported_groups` does triggers a HelloRetryRequest. |
 | `signature_algs` | [atom()] | historical list | Accepted/advertised signature schemes. The CertificateVerify scheme is the server's first choice the client also offered (`rsa_pkcs1_*` is never used for CertificateVerify). |
 | `psks` / `psk_callback` | map / fun | - | TLS 1.3 external PSK; see [PSK.md](PSK.md). |
 
@@ -52,8 +52,10 @@ also advertise `secp256r1`.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `idle_timeout` | integer | 30000 | Idle timeout in ms (0 = disabled) |
-| `max_data` | integer | 10485760 | Connection-level flow control limit |
-| `max_stream_data` | integer | 1048576 | Per-stream flow control limit |
+| `max_data` | integer | 786432 | Connection-level flow control limit |
+| `max_stream_data_bidi_local` | integer | 524288 | Flow control limit for streams we open |
+| `max_stream_data_bidi_remote` | integer | 524288 | Flow control limit for streams the peer opens |
+| `max_stream_data_uni` | integer | 524288 | Flow control limit for unidirectional streams |
 | `max_streams_bidi` | integer | 100 | Max bidirectional streams |
 | `max_streams_uni` | integer | 100 | Max unidirectional streams |
 | `max_datagram_frame_size` | integer | 0 | Datagram support (0 = disabled, RFC 9221) |
@@ -153,9 +155,10 @@ openssl req -x509 -newkey rsa:2048 \
 
 ```erlang
 %% Define a connection handler
-handle_connection(ConnPid, Info) ->
-    %% Info contains: peer_address, alpn_protocol, etc.
-    io:format("New connection from ~p~n", [maps:get(peer_address, Info)]),
+handle_connection(ConnPid, _DCID) ->
+    %% The second argument is the destination connection id.
+    {ok, Peer} = quic:peername(ConnPid),
+    io:format("New connection from ~p~n", [Peer]),
 
     %% Spawn a process to handle this connection
     spawn(fun() -> connection_loop(ConnPid) end).
@@ -361,8 +364,10 @@ The server tracks migration state in the connection record:
 #{
     max_streams_bidi => 100,       % Limit concurrent streams
     max_streams_uni => 100,
-    max_data => 10 * 1024 * 1024,  % 10 MB connection limit
-    max_stream_data => 1024 * 1024, % 1 MB per stream
+    max_data => 10 * 1024 * 1024,                % 10 MB connection limit
+    max_stream_data_bidi_local => 1024 * 1024,   % 1 MB per stream we open
+    max_stream_data_bidi_remote => 1024 * 1024,  % 1 MB per peer-opened stream
+    max_stream_data_uni => 1024 * 1024,          % 1 MB per uni stream
     idle_timeout => 30000           % Close idle connections
 }
 ```

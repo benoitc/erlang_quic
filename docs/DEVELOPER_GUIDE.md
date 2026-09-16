@@ -8,7 +8,7 @@ Add to your `rebar.config`:
 
 ```erlang
 {deps, [
-    {quic, {git, "https://github.com/benoitc/erlang_quic.git", {tag, "1.3.0"}}}
+    {quic, {git, "https://github.com/benoitc/erlang_quic.git", {tag, "1.9.1"}}}
 ]}.
 ```
 
@@ -138,12 +138,12 @@ handle_info({quic, Conn, {closed, Reason}}, State) ->
 ```erlang
 %% Custom handler for each connection
 -module(connection_handler).
--export([start/3]).
+-export([start/2]).
 
-start(Conn, Opts, Owner) ->
-    spawn_link(fun() -> init(Conn, Opts, Owner) end).
+start(Conn, _DCID) ->
+    spawn_link(fun() -> init(Conn) end).
 
-init(Conn, _Opts, _Owner) ->
+init(Conn) ->
     %% Take ownership of the connection
     ok = quic:set_owner(Conn, self()),
     loop(Conn, #{}).
@@ -164,7 +164,7 @@ start_server(Port, Cert, Key) ->
         cert => Cert,
         key => Key,
         alpn => [<<"myproto">>],
-        connection_handler => fun connection_handler:start/3
+        connection_handler => fun connection_handler:start/2
     }).
 ```
 
@@ -324,14 +324,16 @@ handle_quic_event({quic, Conn, Event}) ->
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `alpn` | `[binary()]` | `[]` | ALPN protocols |
-| `verify` | `verify_none \| verify_peer` | `verify_peer` | Certificate verification |
+| `alpn` | `[binary()]` | `[<<"h3">>]` | ALPN protocols |
+| `verify` | `boolean()` | `true` on the client, `false` on the server | Verify the peer certificate. `verify_peer` and `verify_none` are accepted and normalized to a boolean |
 | `idle_timeout` | `integer()` | `30000` | Idle timeout (ms), 0 to disable |
-| `max_data` | `integer()` | `10485760` | Connection flow control (bytes) |
-| `max_stream_data` | `integer()` | `1048576` | Stream flow control (bytes) |
+| `max_data` | `integer()` | `786432` | Connection flow control (bytes) |
+| `max_stream_data_bidi_local` | `integer()` | `524288` | Receive window for streams we open (bytes) |
+| `max_stream_data_bidi_remote` | `integer()` | `524288` | Receive window for streams the peer opens (bytes) |
+| `max_stream_data_uni` | `integer()` | `524288` | Receive window for unidirectional streams (bytes) |
 | `max_datagram_frame_size` | `integer()` | `0` | Max datagram size (0 = disabled) |
 | `session_ticket` | `binary()` | - | Ticket for 0-RTT resumption |
-| `congestion_control` | `newreno \| cubic \| bbr` | `newreno` | CC algorithm |
+| `cc_algorithm` | `newreno \| cubic \| bbr` | `newreno` | CC algorithm. Change it on a live connection with `quic:set_congestion_control/2` |
 | `disable_active_migration` | `boolean()` | `false` | Disable migration |
 
 ### Server Options
@@ -378,8 +380,8 @@ end.
 ### Graceful Shutdown
 
 ```erlang
-%% Close with application error code
-quic:close(Conn, app_error, <<"shutting down">>).
+%% Close with application error code (a 62-bit unsigned integer)
+quic:close(Conn, 16#100, <<"shutting down">>).
 
 %% Normal close
 quic:close(Conn).
@@ -394,7 +396,7 @@ Enable QLOG for debugging:
 ```erlang
 Opts = #{
     alpn => [<<"h3">>],
-    qlog_dir => "/tmp/qlogs"
+    qlog => #{enabled => true, dir => "/tmp/qlogs"}
 },
 {ok, Conn} = quic:connect(Host, Port, Opts, self()).
 %% View logs with qvis: https://qvis.quictools.info/

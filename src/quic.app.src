@@ -5,9 +5,11 @@
         quic_sup,
         quic_server_registry,
         quic_server_sup,
+        quic_token_cache,
+        quic_conn_sup,
+        quic_happy_sup,
         quic_dist_sup,
-        quic_dist_tickets,
-        quic_dist_nat
+        quic_dist_tickets
     ]},
     {mod, {quic_app, []}},
     {applications, [

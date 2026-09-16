@@ -54,7 +54,7 @@ rebar3 ex_doc                                     # Generate docs
 
 ### Supervision Tree
 
-`quic_app` → `quic_sup` → `quic_server_sup` → `quic_listener_sup_sup` → `quic_listener_sup` (pool). `quic_listener_manager` manages connection routing.
+`quic_app` → `quic_sup` → `quic_server_sup` → `quic_listener_sup` → `quic_listener_sup_sup` → `quic_listener` (worker pool). `quic_listener_sup` is `rest_for_one` over `quic_listener_manager` (connection routing) then the pool supervisor. `quic_sup` also starts `quic_server_registry`, `quic_token_cache`, `quic_conn_sup`, `quic_happy_sup` and `quic_dist_sup`.
 
 ### Key Files
 
@@ -64,7 +64,7 @@ rebar3 ex_doc                                     # Generate docs
 
 ### Connection Model
 
-Connections are `gen_statem` processes (`quic_connection.erl`) that progress through states: `handshaking` → `connected` → `closing` → `draining`. The owner process receives messages like `{quic, ConnRef, {connected, Info}}`, `{quic, ConnRef, {stream_data, StreamId, Data, Fin}}`.
+Connections are `gen_statem` processes (`quic_connection.erl`) that progress through states: `idle` → `handshaking` → `connected` → `draining` → `closed`. The owner process receives messages like `{quic, ConnRef, {connected, Info}}`, `{quic, ConnRef, {stream_data, StreamId, Data, Fin}}`.
 
 ### Test Organization
 

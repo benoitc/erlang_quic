@@ -105,7 +105,7 @@ All tests live under `test/`; module names in the table are bare
 | `H3_SETTINGS_ERROR` | ✓ | HTTP/2 setting id, duplicate setting id |
 | `H3_MISSING_SETTINGS` | ✓ | first control frame not SETTINGS |
 | `H3_REQUEST_REJECTED` | ✓ | handler-driven reset |
-| `H3_REQUEST_CANCELLED` | ✓ | emitted by `quic_h3:cancel_stream/2` and by the server-side CANCEL_PUSH handler (`src/h3/quic_h3_connection.erl`); code value asserted in `quic_h3_tests` |
+| `H3_REQUEST_CANCELLED` | ✓ | emitted by `quic_h3:cancel/2` and by the server-side CANCEL_PUSH handler (`src/h3/quic_h3_connection.erl`); code value asserted in `quic_h3_tests` |
 | `H3_REQUEST_INCOMPLETE` | ✓ | stream closed before FIN with a pending body |
 | `H3_MESSAGE_ERROR` | ✓ | pseudo-header ordering, missing/prohibited pseudo, forbidden fields |
 | `H3_CONNECT_ERROR` | `n/a` — CONNECT tunneling not shipped |

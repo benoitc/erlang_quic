@@ -127,15 +127,24 @@ Frames are processed in order within a packet. Key frame types:
 | PADDING (0x00) | Padding for packet size |
 | PING (0x01) | Keep-alive |
 | ACK (0x02-0x03) | Acknowledgment |
+| RESET_STREAM (0x04) | Abort the sending side of a stream |
+| STOP_SENDING (0x05) | Ask the peer to stop sending |
 | CRYPTO (0x06) | TLS handshake data |
+| NEW_TOKEN (0x07) | Token for a later connection |
 | STREAM (0x08-0x0f) | Stream data |
 | MAX_DATA (0x10) | Connection flow control |
 | MAX_STREAM_DATA (0x11) | Stream flow control |
+| MAX_STREAMS_BIDI / _UNI (0x12-0x13) | Stream count limits |
+| DATA_BLOCKED (0x14) | Blocked by the connection limit |
+| STREAM_DATA_BLOCKED (0x15) | Blocked by a stream limit |
+| STREAMS_BLOCKED_BIDI / _UNI (0x16-0x17) | Blocked by a stream count limit |
 | NEW_CONNECTION_ID (0x18) | Issue new CID |
 | RETIRE_CONNECTION_ID (0x19) | Retire old CID |
 | PATH_CHALLENGE (0x1a) | Path validation |
 | PATH_RESPONSE (0x1b) | Path validation response |
 | CONNECTION_CLOSE (0x1c-0x1d) | Close connection |
+| HANDSHAKE_DONE (0x1e) | Server signals handshake confirmed |
+| RESET_STREAM_AT (0x24) | Reset with reliable delivery up to an offset |
 | DATAGRAM (0x30-0x31) | Unreliable datagram (RFC 9221) |
 
 ## TLS Integration
@@ -232,7 +241,7 @@ Stream IDs encode initiator and directionality:
 
 - `MAX_STREAM_DATA` frame advertises per-stream receive window
 - Similar tracking at stream granularity
-- `BLOCKED` and `STREAM_BLOCKED` frames signal flow control limits
+- `DATA_BLOCKED` (0x14) and `STREAM_DATA_BLOCKED` (0x15) frames signal flow control limits
 
 ## Congestion Control
 

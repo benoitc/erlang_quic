@@ -190,7 +190,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 ## API
 
 ### Connection
-- `quic:connect/3,4` - Connect to server
+- `quic:connect/4` - Connect to server
 - `quic:close/1,2,3` - Close connection (with optional app error code)
 - `quic:peername/1` - Get peer address
 - `quic:sockname/1` - Get local address
@@ -238,8 +238,9 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 ### Streams
 - `quic:open_stream/1` - Open bidirectional stream
 - `quic:open_unidirectional_stream/1` - Open unidirectional stream
-- `quic:send/3,4` - Send data on stream
-- `quic:close_stream/2,3` - Close stream
+- `quic:send_data/4,5` - Send data on stream (`Fin = true` closes the send side)
+- `quic:send_data_async/4` - Send without waiting for the connection process
+- `quic:stop_sending/3` - Ask the peer to stop sending on a stream
 - `quic:reset_stream/3` - Reset stream with error code
 - `quic:reset_stream_at/4` - Reset stream with reliable delivery up to specified size
 - `quic:set_stream_priority/4` - Set stream priority (urgency, incremental)
@@ -276,7 +277,9 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 ### Options
 - `idle_timeout` - Connection idle timeout in milliseconds (0 to disable)
 - `max_data` - Connection-level flow control limit
-- `max_stream_data` - Stream-level flow control limit
+- `max_stream_data_bidi_local` - Stream-level limit for streams we open
+- `max_stream_data_bidi_remote` - Stream-level limit for streams the peer opens
+- `max_stream_data_uni` - Stream-level limit for unidirectional streams
 - `max_datagram_frame_size` - Max datagram size to accept (0 = disabled, default: 0)
 - `datagram_recv_queue_len` - Bounded receive queue for inbound datagrams (default: `infinity`; drops oldest on overflow, tracked via `datagram_stats/1`)
 - `reset_stream_at` - Enable RESET_STREAM_AT extension (default: false)
