@@ -64,7 +64,11 @@ init_per_testcase(TestCase, Config) ->
     [{server_name, ServerName} | Config].
 
 end_per_testcase(_TestCase, Config) ->
-    catch quic:stop_server(?config(server_name, Config)),
+    try
+        quic:stop_server(?config(server_name, Config))
+    catch
+        _:_ -> ok
+    end,
     timer:sleep(50),
     ok.
 
@@ -154,9 +158,11 @@ wait_for_peer_cids(Conn, Want, Timeout) ->
     end.
 
 peer_cid_count(Conn, _Want) ->
-    case catch quic_connection:get_state(Conn) of
+    try quic_connection:get_state(Conn) of
         {_StateName, Map} when is_map(Map) -> maps:get(peer_cid_count, Map, 0);
         _ -> 0
+    catch
+        _:_ -> 0
     end.
 
 start_server(Config, ExtraOpts) ->

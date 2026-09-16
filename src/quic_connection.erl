@@ -659,6 +659,9 @@ init({server, Opts}) ->
         %% we work out how many more to issue. Its reset token travels in
         %% our transport parameters, not in a NEW_CONNECTION_ID frame.
         local_cid_pool = [#cid_entry{seq_num = 0, cid = SCID, status = active}],
+        %% How many of the peer's CIDs we will hold. Advertised as
+        %% active_connection_id_limit and enforced in add_peer_connection_id/5.
+        local_active_cid_limit = maps:get(active_connection_id_limit, Opts, 2),
         % Will be set from ClientHello SCID
         dcid = <<>>,
         %% Defaults to the Initial's DCID; the listener overrides it with
@@ -1077,6 +1080,8 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         scid = SCID,
         %% Sequence 0 is the handshake CID; see the server init path.
         local_cid_pool = [#cid_entry{seq_num = 0, cid = SCID, status = active}],
+        %% See the server init path.
+        local_active_cid_limit = maps:get(active_connection_id_limit, Opts, 2),
         dcid = DCID,
         original_dcid = DCID,
         role = client,
@@ -2259,7 +2264,7 @@ send_client_hello(State) ->
         initial_max_streams_bidi => MaxStreamsBidi,
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => State#state.idle_timeout,
-        active_connection_id_limit => 2,
+        active_connection_id_limit => State#state.local_active_cid_limit,
         max_udp_payload_size => advertised_max_udp_payload_size(State)
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
@@ -2671,7 +2676,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         initial_max_streams_bidi => MaxStreamsBidi,
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => State#state.idle_timeout,
-        active_connection_id_limit => 2,
+        active_connection_id_limit => State#state.local_active_cid_limit,
         max_udp_payload_size => advertised_max_udp_payload_size(State),
         %% RFC 9368: the versions we would also accept; the server may
         %% switch the connection to one of them.
