@@ -38,7 +38,14 @@ drains_queued_server_datagrams_test() ->
     self() ! {other, event},
     self() ! {quic_packet, garbage(4), ?ADDR},
     _ = quic_connection:drain_recv_msgs(server_state(), 64),
-    ?assertEqual([{other, event}], mailbox()).
+    %% The drain must take the datagrams and leave anything else. Assert
+    %% that rather than the exact mailbox: this process is shared with
+    %% every other eunit module, so an unrelated late message would fail
+    %% an equality check on a slow machine.
+    Left = mailbox(),
+    ?assert(lists:member({other, event}, Left)),
+    ?assertEqual([], [M || {quic_packet, _, _} = M <- Left]),
+    ?assertEqual([], [M || {quic_packets, _, _} = M <- Left]).
 
 drains_queued_client_datagrams_test() ->
     flush_mailbox(),
@@ -51,7 +58,13 @@ drains_queued_client_datagrams_test() ->
     self() ! {timeout, ref, idle},
     _ = quic_connection:drain_recv_msgs(S, 64),
     gen_udp:close(Sock),
-    ?assertEqual([{timeout, ref, idle}], mailbox()).
+    %% Same reasoning as above, and this case also binds a real socket,
+    %% so a stray datagram can arrive while the test runs. This failed
+    %% once on FreeBSD CI and passed on a re-run of the same commit.
+    Left = mailbox(),
+    ?assert(lists:member({timeout, ref, idle}, Left)),
+    ?assertEqual([], [M || {udp, _, _, _, _} = M <- Left]),
+    ?assertEqual([], [M || {udp_batch, _, _, _, _} = M <- Left]).
 
 stops_at_the_cap_test() ->
     flush_mailbox(),
