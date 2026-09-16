@@ -376,10 +376,10 @@
     has_non_probing_frame = false :: boolean(),
 
     %% Connection ID Pool (RFC 9000 Section 5.1)
-    %% Our CIDs that we've issued to the peer (via NEW_CONNECTION_ID)
+    %% Our CIDs, starting with sequence 0 (the handshake CID) and
+    %% extended by NEW_CONNECTION_ID. The pool is the only source of
+    %% sequence numbers: see next_cid_seq/1.
     local_cid_pool = [] :: [#cid_entry{}],
-    %% Next sequence number for our CIDs
-    local_cid_seq = 1 :: non_neg_integer(),
     %% Peer's CIDs that we can use (received via NEW_CONNECTION_ID)
     peer_cid_pool = [] :: [#cid_entry{}],
     %% Local active CID limit - max peer CIDs we accept (advertised in our transport params)

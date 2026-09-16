@@ -654,6 +654,11 @@ init({server, Opts}) ->
     %% Initialize state
     State = #state{
         scid = SCID,
+        %% Sequence 0 is the handshake CID. It counts against the peer's
+        %% active_connection_id_limit, so the pool has to hold it before
+        %% we work out how many more to issue. Its reset token travels in
+        %% our transport parameters, not in a NEW_CONNECTION_ID frame.
+        local_cid_pool = [#cid_entry{seq_num = 0, cid = SCID, status = active}],
         % Will be set from ClientHello SCID
         dcid = <<>>,
         %% Defaults to the Initial's DCID; the listener overrides it with
@@ -1070,6 +1075,8 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% Initialize state
     State = #state{
         scid = SCID,
+        %% Sequence 0 is the handshake CID; see the server init path.
+        local_cid_pool = [#cid_entry{seq_num = 0, cid = SCID, status = active}],
         dcid = DCID,
         original_dcid = DCID,
         role = client,
@@ -1530,8 +1537,14 @@ connected(
     %% would risk a handshake-phase fire being dropped without a re-arm. The
     %% idle timer was already armed at init.
     State4 = set_keep_alive_timer(update_last_activity(State3b)),
+    %% RFC 9000 §5.1.1: give the peer spare CIDs to migrate onto. This is
+    %% the first point where both halves are in place: the peer's
+    %% active_connection_id_limit arrived with its transport parameters,
+    %% and NEW_CONNECTION_ID travels in a 1-RTT packet, so the app keys
+    %% the send path destructures must already exist.
+    State4b = issue_new_connection_ids(State4),
     %% RFC 8899: Initialize PMTU discovery after handshake
-    State5 = init_pmtu_probing(TransportParams, State4),
+    State5 = init_pmtu_probing(TransportParams, State4b),
     %% Everything queued above (pending data, NEW_TOKEN, the first PMTU
     %% probe) sits in the send batch; without a flush here it would
     %% only leave with the next event on this connection.
@@ -11108,7 +11121,11 @@ state_to_map(#state{} = S) ->
         fc_last_conn_update => S#state.fc_last_conn_update,
         fc_max_receive_window => S#state.fc_max_receive_window,
         idle_timer_armed => S#state.idle_timer =/= undefined,
-        keep_alive_timer_armed => S#state.keep_alive_timer =/= undefined
+        keep_alive_timer_armed => S#state.keep_alive_timer =/= undefined,
+        %% CID rotation observability: local_cid_count includes sequence 0,
+        %% peer_cid_count is what the peer has issued to us.
+        local_cid_count => length([E || #cid_entry{status = active} = E <- S#state.local_cid_pool]),
+        peer_cid_count => length([E || #cid_entry{status = active} = E <- S#state.peer_cid_pool])
     }.
 
 %% Send-path observability helpers. Each reads one field from the
@@ -12300,13 +12317,7 @@ issue_new_connection_ids(
 issue_cids(0, State) ->
     State;
 issue_cids(N, #state{local_cid_pool = Pool} = State) when N > 0 ->
-    %% Get next sequence number
-    NextSeqNum =
-        case Pool of
-            % seq 0 is the initial CID
-            [] -> 1;
-            _ -> lists:max([E#cid_entry.seq_num || E <- Pool]) + 1
-        end,
+    NextSeqNum = next_cid_seq(Pool),
 
     %% Generate new CID (8 bytes recommended by RFC 9000)
     NewCID = crypto:strong_rand_bytes(8),
@@ -12333,6 +12344,16 @@ issue_cids(N, #state{local_cid_pool = Pool} = State) when N > 0 ->
     %% Add to pool and continue
     NewPool = [NewEntry | Pool],
     issue_cids(N - 1, State1#state{local_cid_pool = NewPool}).
+
+%% The next sequence number to issue. The pool is the only place a
+%% sequence number lives, so issuance and the unissued-sequence check in
+%% handle_retire_connection_id/2 cannot drift apart. The pool always
+%% holds sequence 0 from init, so the empty clause is defensive.
+-spec next_cid_seq([#cid_entry{}]) -> non_neg_integer().
+next_cid_seq([]) ->
+    0;
+next_cid_seq(Pool) ->
+    lists:max([E#cid_entry.seq_num || E <- Pool]) + 1.
 
 %% Server connections route through the listener's shared socket, so a
 %% newly issued CID must be added to the listener's routing table. Client
@@ -12702,8 +12723,8 @@ maybe_store_initial_reset_token(TransportParams, #state{dcid = DCID, peer_cid_po
 
 %% @doc Handle RETIRE_CONNECTION_ID frame from peer.
 %% Marks the specified CID in our local pool as retired.
-handle_retire_connection_id(SeqNum, #state{local_cid_pool = Pool, local_cid_seq = NextSeq} = State) ->
-    case SeqNum >= NextSeq of
+handle_retire_connection_id(SeqNum, #state{local_cid_pool = Pool} = State) ->
+    case SeqNum >= next_cid_seq(Pool) of
         true ->
             %% RFC 9000 §19.16: retiring a sequence number we never issued.
             close_with_transport_error(

@@ -71,7 +71,8 @@ new_connection_id_retire_prior_to_exceeds_seq_test() ->
     ).
 
 %% RFC 9000 §19.16: RETIRE_CONNECTION_ID for a sequence number never issued
-%% is a PROTOCOL_VIOLATION (default local_cid_seq is 1, so 999 is unissued).
+%% is a PROTOCOL_VIOLATION. A fresh state has issued sequence 0 only, so
+%% 999 is unissued.
 retire_connection_id_unissued_test() ->
     S0 = quic_connection_test_support:state_for_role(server),
     S1 = quic_connection:process_frame(app, {retire_connection_id, 999}, S0),
