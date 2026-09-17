@@ -3,10 +3,11 @@
 %%% The connection's own ACK plumbing.
 %%%
 %%% quic_connection keeps its ACK ranges in #pn_space.ack_ranges and does
-%%% its own frame encoding; quic_ack is a separate, parallel
-%%% implementation that only quic_loss calls. These cases cover the live
-%%% path, which had no direct tests for range merging, frame building,
-%%% the frame-format boundary, or the ACK bookkeeping helpers.
+%%% its own frame encoding. Range accumulation is shared with quic_ack;
+%%% the frame building and the bookkeeping below are the connection's
+%%% own. These cases cover the live path, which had no direct tests for
+%%% range merging, frame building, the frame-format boundary, or the ACK
+%%% bookkeeping helpers.
 %%%
 %%% Internal ranges are descending and disjoint: [{Start, End}, ...] with
 %%% the newest packet numbers first. The encoder form is the wire shape,
@@ -19,36 +20,36 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %%====================================================================
-%% merge_ack_ranges/1
+%% quic_ack:merge_ranges/1
 %%
-%% Reached from add_to_ack_ranges/2 when a packet extends a range
-%% downward far enough to touch the next one. Added by the fix for an
-%% ACK-encoding crash on out-of-order packets, and never asserted
-%% directly until now.
+%% Reached from quic_ack:add_to_ranges/2 when a packet extends a range
+%% downward far enough to touch the next one. On the connection's
+%% receive path this is what keeps ACK ranges disjoint, and it was never
+%% asserted directly until now.
 %%====================================================================
 
 merge_adjacent_ranges_test() ->
     %% {4,6} extended down to 4 now touches {0,3}: 3 + 1 >= 4.
-    ?assertEqual([{0, 6}], quic_connection:merge_ack_ranges([{4, 6}, {0, 3}])).
+    ?assertEqual([{0, 6}], quic_ack:merge_ranges([{4, 6}, {0, 3}])).
 
 merge_overlapping_ranges_test() ->
-    ?assertEqual([{0, 6}], quic_connection:merge_ack_ranges([{3, 6}, {0, 4}])).
+    ?assertEqual([{0, 6}], quic_ack:merge_ranges([{3, 6}, {0, 4}])).
 
 leaves_separated_ranges_alone_test() ->
     %% A gap of one packet (4) keeps them apart: 3 + 1 < 5.
-    ?assertEqual([{5, 6}, {0, 3}], quic_connection:merge_ack_ranges([{5, 6}, {0, 3}])).
+    ?assertEqual([{5, 6}, {0, 3}], quic_ack:merge_ranges([{5, 6}, {0, 3}])).
 
 merge_keeps_the_larger_end_test() ->
     %% The head's end wins when it reaches further than the tail's.
-    ?assertEqual([{0, 9}], quic_connection:merge_ack_ranges([{4, 9}, {0, 5}])).
+    ?assertEqual([{0, 9}], quic_ack:merge_ranges([{4, 9}, {0, 5}])).
 
 merge_cascades_test() ->
     %% One merge can expose another.
-    ?assertEqual([{0, 8}], quic_connection:merge_ack_ranges([{7, 8}, {4, 6}, {0, 3}])).
+    ?assertEqual([{0, 8}], quic_ack:merge_ranges([{7, 8}, {4, 6}, {0, 3}])).
 
 merge_single_or_empty_is_identity_test() ->
-    ?assertEqual([], quic_connection:merge_ack_ranges([])),
-    ?assertEqual([{1, 2}], quic_connection:merge_ack_ranges([{1, 2}])).
+    ?assertEqual([], quic_ack:merge_ranges([])),
+    ?assertEqual([{1, 2}], quic_ack:merge_ranges([{1, 2}])).
 
 %%====================================================================
 %% build_ack_frame_tuple/1 and build_ack_frame/1

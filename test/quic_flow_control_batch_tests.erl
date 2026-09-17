@@ -18,7 +18,7 @@
 %% and the peer decodes them, on every packet.
 alternating_loss_is_capped_test() ->
     Ranges = lists:foldl(
-        fun(PN, Acc) -> cap(quic_connection:add_to_ack_ranges(PN, Acc)) end,
+        fun(PN, Acc) -> cap(quic_ack:add_to_ranges(PN, Acc)) end,
         [],
         [PN || PN <- lists:seq(1, 400), PN rem 2 =:= 0]
     ),
@@ -28,7 +28,7 @@ alternating_loss_is_capped_test() ->
 %% already retransmitted or given up on.
 the_cap_keeps_the_highest_packet_numbers_test() ->
     Ranges = lists:foldl(
-        fun(PN, Acc) -> cap(quic_connection:add_to_ack_ranges(PN, Acc)) end,
+        fun(PN, Acc) -> cap(quic_ack:add_to_ranges(PN, Acc)) end,
         [],
         [PN || PN <- lists:seq(1, 400), PN rem 2 =:= 0]
     ),
@@ -40,7 +40,7 @@ the_cap_keeps_the_highest_packet_numbers_test() ->
 %% never truncates an unfragmented ACK.
 contiguous_delivery_stays_one_range_test() ->
     Ranges = lists:foldl(
-        fun(PN, Acc) -> cap(quic_connection:add_to_ack_ranges(PN, Acc)) end,
+        fun(PN, Acc) -> cap(quic_ack:add_to_ranges(PN, Acc)) end,
         [],
         lists:seq(1, 500)
     ),
@@ -50,7 +50,7 @@ contiguous_delivery_stays_one_range_test() ->
 out_of_order_arrival_keeps_ranges_disjoint_test() ->
     PNs = [10, 1, 7, 2, 9, 3, 8, 5],
     Ranges = lists:foldl(
-        fun(PN, Acc) -> cap(quic_connection:add_to_ack_ranges(PN, Acc)) end,
+        fun(PN, Acc) -> cap(quic_ack:add_to_ranges(PN, Acc)) end,
         [],
         PNs
     ),

@@ -48,6 +48,10 @@
     ack_frame_to_pn_list/3,
     ack_frame_to_ranges/3,
 
+    %% Range accumulation (shared with quic_connection)
+    add_to_ranges/2,
+    merge_ranges/1,
+
     %% Queries
     largest_received/1,
     largest_acked/1,
@@ -273,10 +277,18 @@ ack_ranges(#ack_state{ack_ranges = R}) -> R.
 ack_eliciting_in_flight(#ack_state{ack_eliciting_in_flight = N}) -> N.
 
 %%====================================================================
-%% Internal Functions
+%% Range accumulation
+%%
+%% Shared with quic_connection, which accumulates received packet
+%% numbers into #pn_space.ack_ranges directly and holds no #ack_state{}.
 %%====================================================================
 
-%% Add a packet number to the ACK ranges
+%% @doc Add a packet number to a descending, disjoint range list.
+%%
+%% Ranges touching the new packet number are extended, and extending
+%% downward may close a gap, so the head is re-merged.
+-spec add_to_ranges(non_neg_integer(), [{non_neg_integer(), non_neg_integer()}]) ->
+    [{non_neg_integer(), non_neg_integer()}].
 add_to_ranges(PN, []) ->
     [{PN, PN}];
 add_to_ranges(PN, [{_Start, End} | _Rest] = Ranges) when PN > End + 1 ->
@@ -295,11 +307,17 @@ add_to_ranges(PN, [Range | Rest]) ->
     %% Check remaining ranges
     [Range | add_to_ranges(PN, Rest)].
 
-%% Merge adjacent ranges
+%% @doc Merge the head range with the next when they touch or overlap.
+-spec merge_ranges([{non_neg_integer(), non_neg_integer()}]) ->
+    [{non_neg_integer(), non_neg_integer()}].
 merge_ranges([{S1, E1}, {S2, E2} | Rest]) when E2 + 1 >= S1 ->
     merge_ranges([{S2, max(E1, E2)} | Rest]);
 merge_ranges(Ranges) ->
     Ranges.
+
+%%====================================================================
+%% Internal Functions
+%%====================================================================
 
 %% Convert internal ranges to ACK frame gap/range format
 ranges_to_ack_ranges(_PrevStart, []) ->

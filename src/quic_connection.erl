@@ -7887,8 +7887,8 @@ update_pn_space_recv(PN, PNSpace, Now) ->
     %% range count cannot grow and the cap scan is skipped.
     NewRanges =
         case LargestRecv =/= undefined andalso PN =:= LargestRecv + 1 of
-            true -> add_to_ack_ranges(PN, Ranges);
-            false -> cap_ack_ranges(add_to_ack_ranges(PN, Ranges))
+            true -> quic_ack:add_to_ranges(PN, Ranges);
+            false -> cap_ack_ranges(quic_ack:add_to_ranges(PN, Ranges))
         end,
     PNSpace#pn_space{
         largest_recv = NewLargest,
@@ -7903,33 +7903,6 @@ cap_ack_ranges([_, _ | Tail] = Ranges) when Tail =/= [] ->
         false -> Ranges
     end;
 cap_ack_ranges(Ranges) ->
-    Ranges.
-
-%% Add a packet number to ACK ranges, maintaining descending order by Start
-%% and merging adjacent/overlapping ranges
-add_to_ack_ranges(PN, []) ->
-    [{PN, PN}];
-add_to_ack_ranges(PN, [{Start, End} | Rest]) when PN > End + 1 ->
-    %% PN is above this range with a gap - insert new range before
-    [{PN, PN}, {Start, End} | Rest];
-add_to_ack_ranges(PN, [{Start, End} | Rest]) when PN =:= End + 1 ->
-    %% PN extends this range upward
-    [{Start, PN} | Rest];
-add_to_ack_ranges(PN, [{Start, End} | Rest]) when PN >= Start, PN =< End ->
-    %% PN already in this range (duplicate packet)
-    [{Start, End} | Rest];
-add_to_ack_ranges(PN, [{Start, End} | Rest]) when PN =:= Start - 1 ->
-    %% PN extends this range downward - may need to merge with next range
-    merge_ack_ranges([{PN, End} | Rest]);
-add_to_ack_ranges(PN, [Range | Rest]) ->
-    %% PN belongs somewhere in Rest
-    [Range | add_to_ack_ranges(PN, Rest)].
-
-%% Merge adjacent ranges after extending downward
-merge_ack_ranges([{S1, E1}, {S2, E2} | Rest]) when E2 + 1 >= S1 ->
-    %% Ranges overlap or are adjacent, merge them
-    merge_ack_ranges([{S2, max(E1, E2)} | Rest]);
-merge_ack_ranges(Ranges) ->
     Ranges.
 
 %% Record activity. The idle and keep-alive timers read last_activity at
