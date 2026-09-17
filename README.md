@@ -265,6 +265,8 @@ Topic guides under `docs/`:
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md): throughput characteristics, socket-backend rationale, roadmap
 - [docs/DESIGN.md](docs/DESIGN.md): architecture, state machine, packet flow
 - [docs/MODULE_MAP.md](docs/MODULE_MAP.md): where the code lives and what to read first
+- [docs/SEND_PATH.md](docs/SEND_PATH.md): how a write becomes bytes on a socket
+- [docs/RECV_PATH.md](docs/RECV_PATH.md): how a datagram becomes an owner message
 - [docs/GLOSSARY.md](docs/GLOSSARY.md): abbreviations and local vocabulary
 - [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md): application developer recipes
 - [docs/features.md](docs/features.md): feature matrix and API reference

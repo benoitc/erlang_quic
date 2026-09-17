@@ -26,6 +26,30 @@
 %%% {quic, Conn, {stream_opened, StreamId}}
 %%% {quic, Conn, {closed, Reason}}
 %%%
+%%% == Layout ==
+%%%
+%%% This module is large. Navigate by section banner, in this order:
+%%%
+%%% - API, gen_statem callbacks, State Functions, Common Event Handling
+%%% - TLS handshake; PSK validation and the session ticket store;
+%%%   TLS handshake continued (server flight, tickets)
+%%% - Packet send layer: frames and payloads become packets, all levels
+%%% - Frame classification; Packet Processing (decrypt, parse, batched
+%%%   receive); TLS message driver, which is the handshake's second half
+%%%   and is reached from packet processing
+%%% - Stream Processing; Socket I/O; ACK emission and decimation;
+%%%   Delivery to the owner; Frame classification for ACK policy
+%%% - Reclaimed-stream tracking; Send path; Send queue and priority queue
+%%% - Retransmission; the timer sections (PTO, idle, keep-alive, pacing)
+%%% - Key update; migration and path validation; PMTU discovery
+%%%
+%%% Two walkthroughs trace the hot paths end to end, naming functions
+%%% rather than line numbers: docs/SEND_PATH.md and docs/RECV_PATH.md.
+%%%
+%%% `#state{}' lives in quic_connection_state.hrl and has 195 fields.
+%%% When changing one, grep for the field name: most are touched in
+%%% several regions.
+%%%
 
 -module(quic_connection).
 
@@ -2454,6 +2478,13 @@ first_in([P | Rest], Avail) ->
         false -> first_in(Rest, Avail)
     end.
 
+%%====================================================================
+%% PSK validation and the session ticket store (RFC 9001 Section 4.6)
+%%
+%% The ticket store is a node-wide ETS table, so these functions are
+%% side-effecting where the negotiation helpers above are pure.
+%%====================================================================
+
 %% Validate PSK from client's pre_shared_key extension
 %% Returns {ok, PSK, ResumptionSecret} if valid, error otherwise
 validate_psk(Identity, _Cipher, _ClientHelloMsg, #state{ticket_store = TicketStore}) ->
@@ -2567,6 +2598,10 @@ ensure_ticket_table() ->
         _ ->
             ok
     end.
+
+%%====================================================================
+%% TLS handshake, continued: server flight and session tickets
+%%====================================================================
 
 %% Server: Send ServerHello in Initial packet. Uses the tracked
 %% Initial CRYPTO offset (non-zero only after a HelloRetryRequest).
@@ -2999,6 +3034,14 @@ send_new_session_ticket(
     CryptoFrame = {crypto, 0, TLSMsg},
     State1 = State#state{ticket_store = NewTicketStore},
     send_frame(CryptoFrame, State1).
+
+%%====================================================================
+%% Packet send layer
+%%
+%% Everything above builds handshake bytes; from here down the module
+%% turns frames and payloads into packets on the wire, at all three
+%% levels. `send_frame/2' is the entry point most of the module uses.
+%%====================================================================
 
 %% Send an Initial packet
 send_initial_packet(Payload, State) ->
@@ -5718,6 +5761,14 @@ keylog_application(ClientRandom, ClientSecret, ServerSecret) ->
     quic_keylog:log(client_application, ClientRandom, ClientSecret),
     quic_keylog:log(server_application, ClientRandom, ServerSecret).
 
+%%====================================================================
+%% TLS message driver
+%%
+%% The second half of the handshake, reached from packet processing
+%% rather than from the TLS section above: CRYPTO frames arrive here,
+%% are reassembled, and drive the TLS state machine.
+%%====================================================================
+
 %% Process TLS handshake data from CRYPTO frames
 process_tls_data(Level, Data, State) ->
     %% Prepend any buffered incomplete TLS data
@@ -7405,7 +7456,10 @@ get_max_stream_recv_window(#state{fc_max_stream_recv_window = CachedMax}) ->
     CachedMax.
 
 %%====================================================================
-%% Internal Functions - Helpers
+%% Socket I/O
+%%
+%% What follows this banner was one undifferentiated "Helpers" region;
+%% it is four subjects, each with its own banner below.
 %%====================================================================
 
 %% Send a packet via quic_socket (with batching) or gen_udp fallback.
@@ -7520,6 +7574,10 @@ flush_socket_batch(#state{socket_state = SocketState} = State) ->
             State#state{socket_state = ClearedSocketState}
     end.
 
+%%====================================================================
+%% ACK emission and decimation (RFC 9002 Section 6.2)
+%%====================================================================
+
 %% Send ACK if packet contained any ack-eliciting frames.
 %%
 %% For 1-RTT (`app') traffic the receiver delays ACKs per RFC 9002 §6.2
@@ -7606,6 +7664,10 @@ bool_opt(Key, Opts) ->
         _ -> false
     end.
 
+%%====================================================================
+%% Delivery to the owner process
+%%====================================================================
+
 %% Hand stream data to the owner. With delivery coalescing on and a
 %% receive pass active, consecutive deliveries for the same stream
 %% merge into one pending message, flushed at the end of the pass or
@@ -7645,6 +7707,10 @@ arm_ack_timer(#state{ack_timer = undefined} = State) ->
     NewRef = make_ref(),
     erlang:send_after(MaxAckDelay, self(), {send_delayed_ack, app, NewRef}),
     State#state{ack_timer = NewRef}.
+
+%%====================================================================
+%% Frame classification for ACK policy
+%%====================================================================
 
 %% Per RFC 9221 Section 5.2: Delay ACKs for packets containing only
 %% non-retransmittable ack-eliciting frames (like DATAGRAM).
@@ -8514,6 +8580,14 @@ can_send_on_stream(StreamId, State) ->
             %% Unidirectional - can only send if we initiated it
             is_locally_initiated(StreamId, State)
     end.
+
+%%====================================================================
+%% Send path
+%%
+%% An application write starts here and ends at the socket. This region
+%% previously sat under the reclaimed-stream banner above, which covers
+%% only the interval bookkeeping before it.
+%%====================================================================
 
 %% Send data on a stream (with fragmentation for large data)
 %% Now includes flow control checks at connection and stream level
@@ -9450,6 +9524,10 @@ queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State) ->
         {error, send_queue_full} = Error ->
             Error
     end.
+
+%%====================================================================
+%% Send queue and the urgency priority queue (RFC 9218)
+%%====================================================================
 
 %% Queue stream data when congestion window is full
 %% Uses bucket-based priority queue for O(1) insert (RFC 9218)
@@ -10941,7 +11019,8 @@ set_idle_timer(
     State#state{idle_timer = Ref}.
 
 %%====================================================================
-%% Keep-Alive Timer Management (RFC 9000 - PING frames)
+%% Keep-Alive Timer Management (RFC 9000 - PING frames), and local
+%% address lookup, which shares this region without belonging to it
 %%====================================================================
 
 %% Calculate keep-alive interval from options and idle timeout
