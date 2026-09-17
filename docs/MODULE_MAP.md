@@ -48,12 +48,11 @@ Most called, so most expensive to change:
 
 ## Modules no grep will lead you to
 
-Seventeen modules have no caller anywhere in `src`. None is dead, and each is reached a different way:
+Sixteen modules have no caller anywhere in `src`. None is dead, and each is reached a different way:
 
 | Module | How it is reached |
 |--------|-------------------|
-| `quic_cc_newreno`, `quic_cc_cubic`, `quic_cc_bbr` | `quic_cc` maps the `cc_algorithm` option to one of these modules internally and calls it through the `quic_cc` behaviour |
-| `quic_log` | Passed as a logger `report_cb` fun |
+| `quic_cc_cubic`, `quic_cc_bbr` | `quic_cc` maps the `cc_algorithm` option to one of these modules internally and calls it through the `quic_cc` behaviour. `quic_cc_newreno` is not here: `quic_cc` also calls it by name on a fast path |
 | `quic_epmd` | Named in a VM argument, `-epmd_module quic_epmd` |
 | `quic_h3_client`, `quic_h3_server`, `quic_interop_client`, `quic_interop_server` | escript entry points, built per rebar3 profile |
 | `quic_app`, `quic_dist_sup`, `quic_dist_tickets`, `quic_listener_sup_sup` | Started by a supervisor as a child spec, by name |
