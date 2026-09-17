@@ -47,7 +47,8 @@
     update_spin_from_recv/3,
     state_for_cid_limit/1,
     peer_cids/1,
-    local_cids/1
+    local_cids/1,
+    ack_counters/1
 ]).
 
 %% Update the spin-bit tracking state from a received 1-RTT packet.
@@ -486,6 +487,18 @@ peer_cids(#state{peer_cid_pool = Pool}) -> Pool.
 %% The CIDs we have issued, including sequence 0.
 -spec local_cids(#state{}) -> [#cid_entry{}].
 local_cids(#state{local_cid_pool = Pool}) -> Pool.
+
+%% ACK bookkeeping, for the functions that take and return #state{}.
+%% The timer reference comes back raw so a test can tell "still the same
+%% timer" from "armed a second one".
+-spec ack_counters(#state{}) ->
+    #{
+        ack_sent := non_neg_integer(),
+        ack_elicited_count := non_neg_integer(),
+        ack_timer := undefined | reference()
+    }.
+ack_counters(#state{ack_sent = Sent, ack_elicited_count = Count, ack_timer = Timer}) ->
+    #{ack_sent => Sent, ack_elicited_count => Count, ack_timer => Timer}.
 
 %% Run finish_recv_pass/1 and return the observable decimation fields.
 -spec finish_recv_pass(#state{}) ->
