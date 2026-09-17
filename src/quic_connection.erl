@@ -5661,7 +5661,7 @@ buffer_crypto_data(Level, Offset, Data, State) ->
     %% Bound out-of-order CRYPTO reassembly so a peer cannot grow memory
     %% before the handshake completes (RFC 9000 §7.5). Offsets beyond the
     %% cap can never become contiguous, so reject them too.
-    BufferedBytes = reassembly_buffer_bytes(Buffer),
+    BufferedBytes = quic_reassembly:reassembly_buffer_bytes(Buffer),
     Overflow =
         (Offset > ?MAX_CRYPTO_BUFFER_BYTES) orelse
             ((BufferedBytes + byte_size(Data)) > ?MAX_CRYPTO_BUFFER_BYTES) orelse
@@ -5701,7 +5701,7 @@ buffer_crypto_data(Level, Offset, Data, State) ->
                 end,
             %% Add data to buffer, keeping the longer chunk if the peer
             %% already sent one at this offset.
-            {NewBuffer, _} = keep_longest_chunk(Offset, Data, Buffer),
+            {NewBuffer, _} = quic_reassembly:keep_longest_chunk(Offset, Data, Buffer),
             NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State0#state.crypto_buffer),
 
             State1 = State0#state{crypto_buffer = NewCryptoBuffer},
@@ -5741,7 +5741,7 @@ process_crypto_buffer(Level, State) ->
             %% the offset, then retry once. Storing the trimmed buffer also
             %% stops duplicate retransmissions from accumulating against
             %% ?MAX_CRYPTO_BUFFER_BYTES and closing a healthy connection.
-            {Trimmed, _} = trim_reassembly_buffer(Buffer, ExpectedOffset),
+            {Trimmed, _} = quic_reassembly:trim_reassembly_buffer(Buffer, ExpectedOffset),
             State1 = State#state{
                 crypto_buffer = maps:put(Level, Trimmed, State#state.crypto_buffer)
             },
@@ -7188,9 +7188,11 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                             false ->
                                 %% Out-of-order or buffer has data: use buffer path
                                 {UpdatedBuffer, Added} =
-                                    keep_longest_chunk(Offset, Data, RecvBuffer),
+                                    quic_reassembly:keep_longest_chunk(Offset, Data, RecvBuffer),
                                 {ExtractedData, ExtractedOffset, ExtractedBuffer, Removed} =
-                                    extract_contiguous_data(UpdatedBuffer, CurrentOffset),
+                                    quic_reassembly:extract_contiguous_data(
+                                        UpdatedBuffer, CurrentOffset
+                                    ),
                                 ExtractedFin =
                                     FinalSize =/= undefined andalso ExtractedOffset >= FinalSize,
                                 {ExtractedData, ExtractedOffset, ExtractedBuffer, ExtractedFin,
@@ -7375,79 +7377,6 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                 % end of FinalSizeError case
             end
     end.
-
-%% Extract contiguous data from buffer starting at Offset
-%% Returns {Data, NewOffset, UpdatedBuffer}
-%% Uses binary append accumulator - O(1) amortized due to refc binary optimization
-%% Returns {Delivered, NewOffset, Buffer, Removed}: Removed is how many
-%% bytes left the tree, delivered or trimmed away, so the caller can keep
-%% its byte count without walking the tree.
-extract_contiguous_data(Buffer, Offset) ->
-    extract_contiguous_data(Buffer, Offset, <<>>, 0).
-
-extract_contiguous_data(Buffer, Offset, Acc, Removed) ->
-    case gb_trees:take_any(Offset, Buffer) of
-        {Data, NewBuffer} ->
-            NextOffset = Offset + byte_size(Data),
-            extract_contiguous_data(
-                NewBuffer, NextOffset, <<Acc/binary, Data/binary>>, Removed + byte_size(Data)
-            );
-        error ->
-            case gb_trees:is_empty(Buffer) orelse element(1, gb_trees:smallest(Buffer)) > Offset of
-                true ->
-                    {Acc, Offset, Buffer, Removed};
-                false ->
-                    {Trimmed, Gone} = trim_reassembly_buffer(Buffer, Offset),
-                    case gb_trees:is_defined(Offset, Trimmed) of
-                        true -> extract_contiguous_data(Trimmed, Offset, Acc, Removed + Gone);
-                        false -> {Acc, Offset, Trimmed, Removed + Gone}
-                    end
-            end
-    end.
-
-%% Drop buffered chunks that end at or before Offset and trim those that
-%% straddle it, re-keying them to Offset. Keeps the longest chunk at each
-%% offset, so overlapping retransmissions collapse instead of accumulating.
-%% Only chunks keyed below Offset can qualify, so the ordered walk stops
-%% there; everything above is left untouched. Returns {Buffer, Removed}
-%% with the bytes that left the tree.
-trim_reassembly_buffer(Buffer, Offset) ->
-    trim_reassembly_buffer(gb_trees:iterator(Buffer), Buffer, Offset, 0).
-
-trim_reassembly_buffer(Iter0, Buffer, Offset, Removed) ->
-    case gb_trees:next(Iter0) of
-        {Off, Data, Iter} when Off < Offset ->
-            End = Off + byte_size(Data),
-            Buffer1 = gb_trees:delete(Off, Buffer),
-            Removed1 = Removed + byte_size(Data),
-            {Buffer2, Added} =
-                case End > Offset of
-                    true ->
-                        Kept = binary:part(Data, Offset - Off, End - Offset),
-                        keep_longest_chunk(Offset, Kept, Buffer1);
-                    false ->
-                        {Buffer1, 0}
-                end,
-            trim_reassembly_buffer(Iter, Buffer2, Offset, Removed1 - Added);
-        _ ->
-            {Buffer, Removed}
-    end.
-
-%% Returns {Buffer, Delta}: the change in bytes held by the tree.
-keep_longest_chunk(Off, Data, Buffer) ->
-    case gb_trees:lookup(Off, Buffer) of
-        {value, Existing} when byte_size(Existing) >= byte_size(Data) ->
-            {Buffer, 0};
-        {value, Existing} ->
-            {gb_trees:enter(Off, Data, Buffer), byte_size(Data) - byte_size(Existing)};
-        none ->
-            {gb_trees:enter(Off, Data, Buffer), byte_size(Data)}
-    end.
-
-%% Total bytes held in a CRYPTO reassembly buffer (stream buffers keep a
-%% running count instead).
-reassembly_buffer_bytes(Buffer) ->
-    lists:foldl(fun(Data, Acc) -> Acc + byte_size(Data) end, 0, gb_trees:values(Buffer)).
 
 %% Get the maximum stream receive window across all streams.
 %% Used to ensure connection window >= 1.5x largest stream window.
@@ -8302,12 +8231,12 @@ record_reclaimed(StreamId, Role, State) ->
     {Dir, Init} = stream_class(StreamId, Role),
     Map0 = reclaimed_map(Dir, State),
     Ranges0 = maps:get(Init, Map0, []),
-    Ranges1 = interval_add(StreamId bsr 2, Ranges0),
+    Ranges1 = quic_interval:add(StreamId bsr 2, Ranges0),
     set_reclaimed_map(Dir, maps:put(Init, Ranges1, Map0), State).
 
 stream_reclaimed(StreamId, Role, State) ->
     {Dir, Init} = stream_class(StreamId, Role),
-    interval_member(StreamId bsr 2, maps:get(Init, reclaimed_map(Dir, State), [])).
+    quic_interval:member(StreamId bsr 2, maps:get(Init, reclaimed_map(Dir, State), [])).
 
 %% True when a frame's stream is not in the map but was already reclaimed: a
 %% late/retransmitted frame that must be ignored rather than recreate the stream
@@ -8320,36 +8249,6 @@ reclaimed_map(uni, State) -> State#state.reclaimed_ranges_uni.
 
 set_reclaimed_map(bidi, M, State) -> State#state{reclaimed_ranges_bidi = M};
 set_reclaimed_map(uni, M, State) -> State#state{reclaimed_ranges_uni = M}.
-
-%% Insert Idx into a sorted list of disjoint inclusive {Lo, Hi} intervals,
-%% merging adjacent (gap of 0) and overlapping ranges. Adjacency is +1 on the
-%% normalised index, which is stride-4 on the raw stream id.
-interval_add(Idx, []) ->
-    [{Idx, Idx}];
-interval_add(Idx, [{Lo, _Hi} | _] = Ranges) when Idx < Lo - 1 ->
-    [{Idx, Idx} | Ranges];
-interval_add(Idx, [{Lo, Hi} | Rest]) when Idx =:= Lo - 1 ->
-    [{Idx, Hi} | Rest];
-interval_add(Idx, [{Lo, Hi} | Rest]) when Idx >= Lo, Idx =< Hi ->
-    [{Lo, Hi} | Rest];
-interval_add(Idx, [{Lo, Hi} | Rest]) when Idx =:= Hi + 1 ->
-    interval_merge_next({Lo, Idx}, Rest);
-interval_add(Idx, [{Lo, Hi} | Rest]) ->
-    [{Lo, Hi} | interval_add(Idx, Rest)].
-
-interval_merge_next({Lo, Hi}, [{Lo2, Hi2} | Rest]) when Lo2 =< Hi + 1 ->
-    [{Lo, max(Hi, Hi2)} | Rest];
-interval_merge_next(Interval, Rest) ->
-    [Interval | Rest].
-
-interval_member(_Idx, []) ->
-    false;
-interval_member(Idx, [{Lo, Hi} | _]) when Idx >= Lo, Idx =< Hi ->
-    true;
-interval_member(Idx, [{Lo, _Hi} | _]) when Idx < Lo ->
-    false;
-interval_member(Idx, [_ | Rest]) ->
-    interval_member(Idx, Rest).
 
 %% Open a new stream
 %% Stream ID patterns: Bit 0=initiator (0=client, 1=server), Bit 1=type (0=bidi, 1=uni)
