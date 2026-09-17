@@ -44,19 +44,19 @@ default_preference_follows_hardware_test() ->
 server_prefers_own_order_by_default_test() ->
     Client = [?TLS_AES_128_GCM_SHA256, ?TLS_CHACHA20_POLY1305_SHA256],
     Server = [aes_128_gcm, aes_256_gcm, chacha20_poly1305],
-    ?assertEqual(aes_128_gcm, quic_connection:select_cipher(Client, Server)).
+    ?assertEqual(aes_128_gcm, quic_tls_negotiation:select_cipher(Client, Server)).
 
 server_honours_chacha_first_client_test() ->
     Client = [?TLS_CHACHA20_POLY1305_SHA256, ?TLS_AES_128_GCM_SHA256],
     Server = [aes_128_gcm, aes_256_gcm, chacha20_poly1305],
-    ?assertEqual(chacha20_poly1305, quic_connection:select_cipher(Client, Server)).
+    ?assertEqual(chacha20_poly1305, quic_tls_negotiation:select_cipher(Client, Server)).
 
 server_without_chacha_keeps_its_order_test() ->
     Client = [?TLS_CHACHA20_POLY1305_SHA256, ?TLS_AES_128_GCM_SHA256, ?TLS_AES_256_GCM_SHA384],
     Server = [aes_256_gcm, aes_128_gcm],
-    ?assertEqual(aes_256_gcm, quic_connection:select_cipher(Client, Server)).
+    ?assertEqual(aes_256_gcm, quic_tls_negotiation:select_cipher(Client, Server)).
 
 chacha_first_server_wins_over_aes_first_client_test() ->
     Client = [?TLS_AES_128_GCM_SHA256, ?TLS_CHACHA20_POLY1305_SHA256],
     Server = [chacha20_poly1305, aes_128_gcm, aes_256_gcm],
-    ?assertEqual(chacha20_poly1305, quic_connection:select_cipher(Client, Server)).
+    ?assertEqual(chacha20_poly1305, quic_tls_negotiation:select_cipher(Client, Server)).

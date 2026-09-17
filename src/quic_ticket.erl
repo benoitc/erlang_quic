@@ -12,16 +12,33 @@
 %%% - Storing and retrieving NewSessionTicket messages
 %%% - Deriving PSK from resumption_master_secret
 %%% - Managing ticket lifetimes and early data limits
+%%%
+%%% == Two stores ==
+%%%
+%%% `new_store/0' and friends are a plain map held in one connection's
+%%% state: pure, per-connection, gone when the connection ends.
+%%%
+%%% `store_global/2' and friends are a node-wide ETS table shared by
+%%% every connection, which is what lets a server resume a session it
+%%% issued on a different connection. Those functions touch ETS, the
+%%% clock and the random source, so they are not pure and cannot be
+%%% called from a test without the table existing.
 
 -module(quic_ticket).
 
 -export([
-    %% Ticket storage
+    %% Ticket storage (per connection, a map)
     new_store/0,
     store_ticket/3,
     lookup_ticket/2,
     clear_ticket/2,
     clear_expired/1,
+    find_by_identity/2,
+
+    %% Ticket storage (node-wide, ETS)
+    store_global/2,
+    lookup_global/1,
+    consume_global/1,
 
     %% PSK derivation
     derive_resumption_secret/4,
@@ -224,3 +241,103 @@ build_new_session_ticket(#session_ticket{
 
     <<Lifetime:32, AgeAdd:32, NonceLen, Nonce/binary, TicketLen:16, Ticket/binary, ExtLen:16,
         Extensions/binary>>.
+
+%%====================================================================
+%% Node-wide ticket store (ETS)
+%%
+%% Shared by every connection on the node, so a server can resume a
+%% session it issued on a different connection. Side-effecting: these
+%% read the clock, use the random source and mutate a public table.
+%%====================================================================
+
+%% Table name for the cross-connection store.
+-define(TICKET_TABLE, quic_server_tickets).
+%% Ticket TTL: 7 days in milliseconds (RFC 8446 recommends max 7 days)
+-define(TICKET_TTL_MS, 7 * 24 * 60 * 60 * 1000).
+%% Max tickets to store (prevents unbounded memory growth)
+-define(MAX_TICKETS, 10000).
+
+%% @doc Find a ticket by its identity in a per-connection store.
+-spec find_by_identity(binary(), ticket_store()) -> {ok, session_ticket()} | error.
+find_by_identity(Identity, Store) ->
+    find_matching_ticket(Identity, maps:values(Store)).
+
+find_matching_ticket(_Identity, []) ->
+    error;
+find_matching_ticket(Identity, [#session_ticket{ticket = Identity} = Ticket | _Rest]) ->
+    {ok, Ticket};
+find_matching_ticket(Identity, [_ | Rest]) ->
+    find_matching_ticket(Identity, Rest).
+
+%% @doc Store a ticket in the node-wide table.
+-spec store_global(binary(), session_ticket()) -> true.
+store_global(TicketIdentity, Ticket) ->
+    ensure_table(),
+    Now = erlang:monotonic_time(millisecond),
+    %% Cleanup expired tickets periodically (1 in 100 chance on insert)
+    case rand:uniform(100) of
+        1 -> cleanup_expired(Now);
+        _ -> ok
+    end,
+    %% Check table size and evict oldest if needed
+    case ets:info(?TICKET_TABLE, size) >= ?MAX_TICKETS of
+        true -> evict_oldest();
+        false -> ok
+    end,
+    ets:insert(?TICKET_TABLE, {TicketIdentity, Ticket, Now}).
+
+%% @doc Look a ticket up in the node-wide table, dropping it if expired.
+-spec lookup_global(binary()) -> {ok, session_ticket()} | error.
+lookup_global(TicketIdentity) ->
+    ensure_table(),
+    Now = erlang:monotonic_time(millisecond),
+    case ets:lookup(?TICKET_TABLE, TicketIdentity) of
+        [{_, Ticket, StoredAt}] ->
+            case Now - StoredAt > ?TICKET_TTL_MS of
+                true ->
+                    %% Ticket expired, delete it
+                    ets:delete(?TICKET_TABLE, TicketIdentity),
+                    error;
+                false ->
+                    {ok, Ticket}
+            end;
+        [{_, Ticket}] ->
+            %% Legacy entry without timestamp, treat as valid
+            {ok, Ticket};
+        [] ->
+            error
+    end.
+
+%% @doc Remove a ticket after it is used for resumption (single-use
+%% 0-RTT anti-replay). Issued tickets live in the node-wide table.
+-spec consume_global(binary()) -> true.
+consume_global(TicketIdentity) ->
+    ensure_table(),
+    ets:delete(?TICKET_TABLE, TicketIdentity).
+
+cleanup_expired(Now) ->
+    %% Delete all tickets older than TTL
+    ets:select_delete(?TICKET_TABLE, [
+        {{'_', '_', '$1'}, [{'<', '$1', {const, Now - ?TICKET_TTL_MS}}], [true]}
+    ]).
+
+evict_oldest() ->
+    %% Find and delete the oldest ticket
+    case ets:first(?TICKET_TABLE) of
+        '$end_of_table' -> ok;
+        Key -> ets:delete(?TICKET_TABLE, Key)
+    end.
+
+ensure_table() ->
+    case ets:whereis(?TICKET_TABLE) of
+        undefined ->
+            %% Create the table - public so all connections can access it
+            try
+                ets:new(?TICKET_TABLE, [named_table, public, ordered_set, {read_concurrency, true}])
+            catch
+                % Table already exists (race condition)
+                error:badarg -> ok
+            end;
+        _ ->
+            ok
+    end.

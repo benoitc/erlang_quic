@@ -70,7 +70,6 @@
 -dialyzer(
     {nowarn_function, [
         send_initial_ack/1,
-        select_cipher/2,
         %% Reachable from the new TLS_SERVER_HELLO handler via the
         %% selected_psk_identity branch — but no eunit path currently
         %% exercises a PSK handshake end-to-end. The forthcoming
@@ -2379,104 +2378,10 @@ send_client_hello(State) ->
 
     FlushedState.
 
-%% Server: Select cipher suite from client's list (server preference)
-%% ClientCipherSuites is a list of TLS cipher suite codes (integers)
-%% Convert to atoms for internal use
-%% The server's own order decides, so a deployment that must not negotiate
-%% a particular suite can say so; without this the preference was fixed in
-%% code and a `ciphers' option had nowhere to take effect.
-select_cipher(ClientCipherSuites, ServerPreference) ->
-    ClientCiphers = [cipher_code_to_atom(C) || C <- ClientCipherSuites],
-    %% A client that puts ChaCha20-Poly1305 first is saying it lacks
-    %% AES hardware; honour that when the server allows the suite
-    %% (the same rule as OpenSSL's SSL_OP_PRIORITIZE_CHACHA).
-    case ClientCiphers of
-        [chacha20_poly1305 | _] ->
-            case lists:member(chacha20_poly1305, ServerPreference) of
-                true -> chacha20_poly1305;
-                false -> select_first_match(ServerPreference, ClientCiphers)
-            end;
-        _ ->
-            select_first_match(ServerPreference, ClientCiphers)
-    end.
-
+%% The server's default preference list lives in quic_crypto, which
+%% knows whether this CPU has AES instructions.
 default_cipher_preference() ->
     quic_crypto:default_cipher_preference().
-
-% Default
-select_first_match([], _) ->
-    aes_128_gcm;
-select_first_match([Cipher | Rest], ClientSuites) ->
-    case lists:member(Cipher, ClientSuites) of
-        true -> Cipher;
-        false -> select_first_match(Rest, ClientSuites)
-    end.
-
-%% Convert TLS cipher suite code to internal atom
-cipher_code_to_atom(?TLS_AES_128_GCM_SHA256) -> aes_128_gcm;
-cipher_code_to_atom(?TLS_AES_256_GCM_SHA384) -> aes_256_gcm;
-cipher_code_to_atom(?TLS_CHACHA20_POLY1305_SHA256) -> chacha20_poly1305;
-cipher_code_to_atom(_) -> unknown.
-
-%% Convert internal cipher atom to TLS cipher suite code
-%% Used when building ServerHello to send the correct cipher suite to client
-cipher_atom_to_code(aes_128_gcm) -> ?TLS_AES_128_GCM_SHA256;
-cipher_atom_to_code(aes_256_gcm) -> ?TLS_AES_256_GCM_SHA384;
-cipher_atom_to_code(chacha20_poly1305) -> ?TLS_CHACHA20_POLY1305_SHA256;
-cipher_atom_to_code(_) -> ?TLS_AES_128_GCM_SHA256.
-
-%% Server: Negotiate ALPN
-negotiate_alpn(ClientALPN, ServerALPN) ->
-    case [A || A <- ServerALPN, lists:member(A, ClientALPN)] of
-        [First | _] -> First;
-        [] -> undefined
-    end.
-
-%% Extract the client's key_share public key for a given group atom.
-extract_group_key(_Group, undefined) ->
-    undefined;
-extract_group_key(_Group, []) ->
-    undefined;
-extract_group_key(Group, [{Code, PubKey} | Rest]) ->
-    case group_atom(Code) of
-        Group -> PubKey;
-        _ -> extract_group_key(Group, Rest)
-    end.
-
-%% Named-group wire code -> atom (unknown stays as the integer).
-group_atom(?GROUP_X25519) -> x25519;
-group_atom(?GROUP_SECP256R1) -> secp256r1;
-group_atom(?GROUP_SECP384R1) -> secp384r1;
-group_atom(?GROUP_X25519MLKEM768) -> x25519mlkem768;
-group_atom(Other) -> Other.
-
-%% Decide the key-exchange group for a ClientHello (RFC 8446 §4.1.4).
-%% Returns {direct, Group} when the client already sent a usable
-%% key_share, {hrr, Group} when a HelloRetryRequest is needed, or
-%% none when there is no group both sides support.
-select_key_share_group(ServerGroups, KeyShareEntries, SupportedGroups) ->
-    Offered = [group_atom(C) || {C, _} <- entries_or_empty(KeyShareEntries)],
-    case first_in(ServerGroups, Offered) of
-        {ok, G} ->
-            {direct, G};
-        none ->
-            case first_in(ServerGroups, SupportedGroups) of
-                {ok, G} -> {hrr, G};
-                none -> none
-            end
-    end.
-
-entries_or_empty(undefined) -> [];
-entries_or_empty(L) when is_list(L) -> L.
-
-%% First element of Prefs that also appears in Avail.
-first_in([], _Avail) ->
-    none;
-first_in([P | Rest], Avail) ->
-    case lists:member(P, Avail) of
-        true -> {ok, P};
-        false -> first_in(Rest, Avail)
-    end.
 
 %%====================================================================
 %% PSK validation and the session ticket store (RFC 9001 Section 4.6)
@@ -2489,7 +2394,7 @@ first_in([P | Rest], Avail) ->
 %% Returns {ok, PSK, ResumptionSecret} if valid, error otherwise
 validate_psk(Identity, _Cipher, _ClientHelloMsg, #state{ticket_store = TicketStore}) ->
     %% Try to find ticket by identity - first in local store, then global ETS
-    case find_ticket_by_identity(Identity, TicketStore) of
+    case quic_ticket:find_by_identity(Identity, TicketStore) of
         {ok, Ticket} ->
             %% Extract resumption secret from ticket
             ResumptionSecret = Ticket#session_ticket.resumption_secret,
@@ -2498,7 +2403,7 @@ validate_psk(Identity, _Cipher, _ClientHelloMsg, #state{ticket_store = TicketSto
             {ok, PSK, ResumptionSecret};
         error ->
             %% Try global ETS table
-            case lookup_ticket_globally(Identity) of
+            case quic_ticket:lookup_global(Identity) of
                 {ok, Ticket} ->
                     ResumptionSecret = Ticket#session_ticket.resumption_secret,
                     PSK = quic_ticket:derive_psk(ResumptionSecret, Ticket),
@@ -2510,94 +2415,6 @@ validate_psk(Identity, _Cipher, _ClientHelloMsg, #state{ticket_store = TicketSto
 validate_psk(_Identity, _Cipher, _ClientHelloMsg, _State) ->
     %% No ticket store
     error.
-
-%% Find ticket by its identity (the ticket field)
-find_ticket_by_identity(Identity, Store) ->
-    %% Search through all stored tickets
-    Tickets = maps:values(Store),
-    find_matching_ticket(Identity, Tickets).
-
-find_matching_ticket(_Identity, []) ->
-    error;
-find_matching_ticket(Identity, [#session_ticket{ticket = Identity} = Ticket | _Rest]) ->
-    {ok, Ticket};
-find_matching_ticket(Identity, [_ | Rest]) ->
-    find_matching_ticket(Identity, Rest).
-
-%% Global ticket storage using ETS (for 0-RTT across connections)
--define(TICKET_TABLE, quic_server_tickets).
-%% Ticket TTL: 7 days in milliseconds (RFC 8446 recommends max 7 days)
--define(TICKET_TTL_MS, 7 * 24 * 60 * 60 * 1000).
-%% Max tickets to store (prevents unbounded memory growth)
--define(MAX_TICKETS, 10000).
-
-store_ticket_globally(TicketIdentity, Ticket) ->
-    ensure_ticket_table(),
-    Now = erlang:monotonic_time(millisecond),
-    %% Cleanup expired tickets periodically (1 in 100 chance on insert)
-    case rand:uniform(100) of
-        1 -> cleanup_expired_tickets(Now);
-        _ -> ok
-    end,
-    %% Check table size and evict oldest if needed
-    case ets:info(?TICKET_TABLE, size) >= ?MAX_TICKETS of
-        true -> evict_oldest_ticket();
-        false -> ok
-    end,
-    ets:insert(?TICKET_TABLE, {TicketIdentity, Ticket, Now}).
-
-lookup_ticket_globally(TicketIdentity) ->
-    ensure_ticket_table(),
-    Now = erlang:monotonic_time(millisecond),
-    case ets:lookup(?TICKET_TABLE, TicketIdentity) of
-        [{_, Ticket, StoredAt}] ->
-            case Now - StoredAt > ?TICKET_TTL_MS of
-                true ->
-                    %% Ticket expired, delete it
-                    ets:delete(?TICKET_TABLE, TicketIdentity),
-                    error;
-                false ->
-                    {ok, Ticket}
-            end;
-        [{_, Ticket}] ->
-            %% Legacy entry without timestamp, treat as valid
-            {ok, Ticket};
-        [] ->
-            error
-    end.
-
-%% Remove a ticket from the global store after it is used for resumption
-%% (single-use 0-RTT anti-replay). Issued tickets live in the global ETS.
-consume_ticket_globally(TicketIdentity) ->
-    ensure_ticket_table(),
-    ets:delete(?TICKET_TABLE, TicketIdentity).
-
-cleanup_expired_tickets(Now) ->
-    %% Delete all tickets older than TTL
-    ets:select_delete(?TICKET_TABLE, [
-        {{'_', '_', '$1'}, [{'<', '$1', {const, Now - ?TICKET_TTL_MS}}], [true]}
-    ]).
-
-evict_oldest_ticket() ->
-    %% Find and delete the oldest ticket
-    case ets:first(?TICKET_TABLE) of
-        '$end_of_table' -> ok;
-        Key -> ets:delete(?TICKET_TABLE, Key)
-    end.
-
-ensure_ticket_table() ->
-    case ets:whereis(?TICKET_TABLE) of
-        undefined ->
-            %% Create the table - public so all connections can access it
-            try
-                ets:new(?TICKET_TABLE, [named_table, public, ordered_set, {read_concurrency, true}])
-            catch
-                % Table already exists (race condition)
-                error:badarg -> ok
-            end;
-        _ ->
-            ok
-    end.
 
 %%====================================================================
 %% TLS handshake, continued: server flight and session tickets
@@ -3022,7 +2839,7 @@ send_new_session_ticket(
     TicketIdentity = Ticket#session_ticket.ticket,
     NewTicketStore = maps:put(TicketIdentity, Ticket, TicketStore),
     %% Also store in global ETS table for 0-RTT across connections
-    store_ticket_globally(TicketIdentity, Ticket),
+    quic_ticket:store_global(TicketIdentity, Ticket),
 
     %% Build NewSessionTicket TLS message
     TicketMsg = quic_ticket:build_new_session_ticket(Ticket),
@@ -5826,7 +5643,9 @@ process_tls_message(
                 StateChIn
             ),
             %% Select cipher suite (prefer server's order)
-            Cipher = select_cipher(CipherSuites, State#state.cipher_preference),
+            Cipher = quic_tls_negotiation:select_cipher(
+                CipherSuites, State#state.cipher_preference
+            ),
             %% RFC 8446 §4.1.4 group negotiation: use the client's
             %% key_share directly when possible, otherwise send a
             %% HelloRetryRequest for a mutually-supported group.
@@ -5835,12 +5654,14 @@ process_tls_message(
             %% ticket consumption) once the group is settled.
             SupportedGroups = maps:get(supported_groups, ClientHelloInfo, []),
             case
-                select_key_share_group(
+                quic_tls_negotiation:select_key_share_group(
                     State#state.tls_groups, KeyShareEntries, SupportedGroups
                 )
             of
                 {direct, SelGroup} ->
-                    ClientPubKey = extract_group_key(SelGroup, KeyShareEntries),
+                    ClientPubKey = quic_tls_negotiation:extract_group_key(
+                        SelGroup, KeyShareEntries
+                    ),
                     do_server_client_hello(
                         SelGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
                     );
@@ -6549,7 +6370,7 @@ do_server_client_hello_cont(
                                         %% Single-use: consume the ticket so a
                                         %% captured 0-RTT flight cannot be
                                         %% replayed (RFC 9001 §9.2).
-                                        consume_ticket_globally(Identity),
+                                        quic_ticket:consume_global(Identity),
                                         ES = quic_crypto:derive_early_secret(Cipher, PSK),
                                         %% The ticket's PSK carries the whole
                                         %% handshake (psk_dhe_ke), so the cert
@@ -6636,13 +6457,13 @@ do_server_client_hello_cont(
         end,
 
     %% Negotiate ALPN
-    ALPN = negotiate_alpn(ClientALPN, State#state.alpn_list),
+    ALPN = quic_tls_negotiation:negotiate_alpn(ClientALPN, State#state.alpn_list),
 
     %% Build ServerHello. For PSK handshakes the ServerHello
     %% carries `selected_psk_identity'; for psk_ke it also
     %% omits key_share (RFC 8446 §4.2.9).
     ServerHelloOpts0 = #{
-        cipher_suite => cipher_atom_to_code(Cipher),
+        cipher_suite => quic_tls_negotiation:cipher_atom_to_code(Cipher),
         key_pair => {ServerPubKey, ServerPrivKey},
         key_share_group => SelectedGroup,
         session_id => SessionId
@@ -6812,7 +6633,7 @@ send_hello_retry_request(SelectedGroup, Cipher, SessionId, OriginalMsg, State) -
     CH1Hash = quic_crypto:transcript_hash(Cipher, OriginalMsg),
     Prefix = quic_crypto:hrr_transcript_prefix(Cipher, CH1Hash),
     HRR = quic_tls:build_hello_retry_request(
-        SessionId, cipher_atom_to_code(Cipher), SelectedGroup
+        SessionId, quic_tls_negotiation:cipher_atom_to_code(Cipher), SelectedGroup
     ),
     Transcript = <<Prefix/binary, HRR/binary>>,
     State1 = State#state{
