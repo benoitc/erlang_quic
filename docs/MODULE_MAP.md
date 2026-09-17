@@ -12,7 +12,7 @@ In this order, they give you the whole path of a connection without opening the 
 4. `src/quic_varint.erl` (112) is the encoding everything else is built from.
 5. `src/quic_crypto.erl` (671) is the key schedule, and `src/quic_aead.erl` packet protection.
 6. `src/quic_cc.erl` (401) is the congestion control behaviour, with `quic_loss` and `quic_ack` beside it.
-7. `src/quic_connection.erl` (12,676) is the state machine everything above meets in. Read it by section banner, not top to bottom.
+7. `src/quic_connection.erl` (12,654) is the state machine everything above meets in. Read it by section banner, not top to bottom.
 
 ## Layers
 
@@ -40,7 +40,7 @@ Most called, so most expensive to change:
 | `quic_varint` | 112 | 8 | 0 |
 | `quic_crypto` | 671 | 6 | 1 |
 | `quic_listener` | 1,411 | 5 | 8 |
-| `quic_connection` | 12,676 | 5 | 21 |
+| `quic_connection` | 12,654 | 5 | 21 |
 | `quic_cc` | 401 | 4 | 1 |
 | `quic_h3` | 836 | 4 | 2 |
 

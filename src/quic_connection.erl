@@ -7752,22 +7752,22 @@ has_app_keys(_) -> true.
 %% `last_activity' write, saving one BIF call per received packet.
 record_received_pn(initial, PN, State, Now) ->
     PNSpace = State#state.pn_initial,
-    NewPNSpace = update_pn_space_recv(PN, PNSpace, Now),
+    NewPNSpace = quic_ack:update_pn_space_recv(PN, PNSpace, Now),
     State#state{pn_initial = NewPNSpace};
 record_received_pn(handshake, PN, State, Now) ->
     PNSpace = State#state.pn_handshake,
-    NewPNSpace = update_pn_space_recv(PN, PNSpace, Now),
+    NewPNSpace = quic_ack:update_pn_space_recv(PN, PNSpace, Now),
     State#state{pn_handshake = NewPNSpace};
 record_received_pn(app, PN, State, Now) ->
     PNSpace = State#state.pn_app,
     Trigger = classify_recv_trigger(PN, PNSpace),
-    NewPNSpace = update_pn_space_recv(PN, PNSpace, Now),
+    NewPNSpace = quic_ack:update_pn_space_recv(PN, PNSpace, Now),
     State#state{pn_app = NewPNSpace, last_recv_trigger = Trigger};
 record_received_pn(zero_rtt, PN, State, Now) ->
     %% 0-RTT uses the same PN space as 1-RTT (app)
     PNSpace = State#state.pn_app,
     Trigger = classify_recv_trigger(PN, PNSpace),
-    NewPNSpace = update_pn_space_recv(PN, PNSpace, Now),
+    NewPNSpace = quic_ack:update_pn_space_recv(PN, PNSpace, Now),
     State#state{pn_app = NewPNSpace, last_recv_trigger = Trigger};
 record_received_pn(_, _PN, State, _Now) ->
     State.
@@ -7794,28 +7794,6 @@ get_largest_recv(app, State) ->
 get_largest_recv(zero_rtt, State) ->
     %% 0-RTT uses the same PN space as 1-RTT (app)
     (State#state.pn_app)#pn_space.largest_recv.
-
-update_pn_space_recv(PN, PNSpace, Now) ->
-    #pn_space{largest_recv = LargestRecv, ack_ranges = Ranges} = PNSpace,
-    NewLargest =
-        case LargestRecv of
-            undefined -> PN;
-            L when PN > L -> PN;
-            L -> L
-        end,
-    %% Add to ack_ranges maintaining descending order and merging adjacent
-    %% ranges. A sequential PN extends the head range in place, so the
-    %% range count cannot grow and the cap scan is skipped.
-    NewRanges =
-        case LargestRecv =/= undefined andalso PN =:= LargestRecv + 1 of
-            true -> quic_ack:add_to_ranges(PN, Ranges);
-            false -> quic_ack:cap_ack_ranges(quic_ack:add_to_ranges(PN, Ranges))
-        end,
-    PNSpace#pn_space{
-        largest_recv = NewLargest,
-        recv_time = Now,
-        ack_ranges = NewRanges
-    }.
 
 %% Record activity. The idle and keep-alive timers read last_activity at
 %% fire time (lazy model), so no timer op is needed per packet.
@@ -8539,7 +8517,7 @@ short_header_first_byte(KeyPhase, PNLen, #state{spin_bit_enabled = false}) ->
 %% logic as those helpers; the spin part mirrors update_spin_from_recv.
 record_app_recv(FirstByte, PN, #state{pn_app = PNSpace} = State, Now) ->
     Trigger = classify_recv_trigger(PN, PNSpace),
-    NewPNSpace = update_pn_space_recv(PN, PNSpace, Now),
+    NewPNSpace = quic_ack:update_pn_space_recv(PN, PNSpace, Now),
     {SpinRecv, SpinLargest, SpinOut} =
         case PN > State#state.spin_recv_largest_pn of
             true ->

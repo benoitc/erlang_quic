@@ -52,6 +52,7 @@
     add_to_ranges/2,
     merge_ranges/1,
     cap_ack_ranges/1,
+    update_pn_space_recv/3,
 
     %% Frame construction (shared with quic_connection)
     build_ack_frame_tuple/1,
@@ -348,6 +349,30 @@ cap_ack_ranges([_, _ | Tail] = Ranges) when Tail =/= [] ->
     end;
 cap_ack_ranges(Ranges) ->
     Ranges.
+
+%% @doc Record a received packet number in a packet-number space.
+%%
+%% A packet continuing the receive sequence extends the head range in
+%% place, so the range count cannot grow and the cap scan is skipped.
+-spec update_pn_space_recv(non_neg_integer(), #pn_space{}, non_neg_integer()) -> #pn_space{}.
+update_pn_space_recv(PN, PNSpace, Now) ->
+    #pn_space{largest_recv = LargestRecv, ack_ranges = Ranges} = PNSpace,
+    NewLargest =
+        case LargestRecv of
+            undefined -> PN;
+            L when PN > L -> PN;
+            L -> L
+        end,
+    NewRanges =
+        case LargestRecv =/= undefined andalso PN =:= LargestRecv + 1 of
+            true -> add_to_ranges(PN, Ranges);
+            false -> cap_ack_ranges(add_to_ranges(PN, Ranges))
+        end,
+    PNSpace#pn_space{
+        largest_recv = NewLargest,
+        recv_time = Now,
+        ack_ranges = NewRanges
+    }.
 
 %%====================================================================
 %% ACK frame construction
