@@ -1,17 +1,17 @@
 # Module Map
 
-Where the code lives and what to read first. The source is 62 modules and about 46,000 lines, and roughly a quarter of it is one module, so reading in file order does not work. Read this when you are new to the tree, or when you know what you want to change but not where it lives. [docs/DESIGN.md](DESIGN.md) covers how the protocol works; this page covers where it is.
+Where the code lives and what to read first. The source is 66 modules and about 46,000 lines, and roughly a quarter of it is one module, so reading in file order does not work. Read this when you are new to the tree, or when you know what you want to change but not where it lives. [docs/DESIGN.md](DESIGN.md) covers how the protocol works; this page covers where it is.
 
 ## Read these seven first
 
 In this order, they give you the whole path of a connection without opening the big module:
 
-1. `src/quic.erl` (977 lines) is the public API and the owner-message protocol. Its module header lists every message an owner receives.
-2. `src/quic_listener.erl` (1,412) accepts connections. Its header is the clearest writing in the tree on connection ownership and the handover race.
-3. `src/quic_packet.erl` (406) and `src/quic_frame.erl` (443) are the wire format, with the header diagrams in the packet module.
-4. `src/quic_varint.erl` (113) is the encoding everything else is built from.
-5. `src/quic_crypto.erl` (672) is the key schedule, and `src/quic_aead.erl` packet protection.
-6. `src/quic_cc.erl` (402) is the congestion control behaviour, with `quic_loss` and `quic_ack` beside it.
+1. `src/quic.erl` (976 lines) is the public API and the owner-message protocol. Its module header lists every message an owner receives.
+2. `src/quic_listener.erl` (1,411) accepts connections. Its header is the clearest writing in the tree on connection ownership and the handover race.
+3. `src/quic_packet.erl` (405) and `src/quic_frame.erl` (443) are the wire format, with the header diagrams in the packet module.
+4. `src/quic_varint.erl` (112) is the encoding everything else is built from.
+5. `src/quic_crypto.erl` (671) is the key schedule, and `src/quic_aead.erl` packet protection.
+6. `src/quic_cc.erl` (401) is the congestion control behaviour, with `quic_loss` and `quic_ack` beside it.
 7. `src/quic_connection.erl` (12,676) is the state machine everything above meets in. Read it by section banner, not top to bottom.
 
 ## Layers
@@ -36,13 +36,13 @@ Most called, so most expensive to change:
 
 | Module | Lines | Called by | Calls |
 |--------|------:|----------:|------:|
-| `quic` | 977 | 8 | 6 |
-| `quic_varint` | 113 | 8 | 0 |
-| `quic_crypto` | 672 | 6 | 1 |
-| `quic_listener` | 1,412 | 5 | 8 |
+| `quic` | 976 | 8 | 6 |
+| `quic_varint` | 112 | 8 | 0 |
+| `quic_crypto` | 671 | 6 | 1 |
+| `quic_listener` | 1,411 | 5 | 8 |
 | `quic_connection` | 12,676 | 5 | 21 |
-| `quic_cc` | 402 | 4 | 1 |
-| `quic_h3` | 837 | 4 | 2 |
+| `quic_cc` | 401 | 4 | 1 |
+| `quic_h3` | 836 | 4 | 2 |
 
 `quic_connection` calling 21 other modules and being called by 5 is the shape to keep in mind: it is the hub, and almost any protocol change lands in it.
 
@@ -78,7 +78,7 @@ The ones worth knowing:
 The two hot paths have their own walkthroughs: [SEND_PATH.md](SEND_PATH.md) and
 [RECV_PATH.md](RECV_PATH.md).
 
-`#state{}` lives in `src/quic_connection_state.hrl` and has 195 fields. When you change one, grep for the field name rather than reading the function you are in: most fields are touched in several regions.
+`#state{}` lives in `src/quic_connection_state.hrl` and has 194 fields. When you change one, grep for the field name rather than reading the function you are in: most fields are touched in several regions.
 
 ## Where tests live
 
