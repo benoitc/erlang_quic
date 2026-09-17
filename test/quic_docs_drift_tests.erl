@@ -6,7 +6,7 @@
 %%% suite is deleted, and the guide keeps saying otherwise until a reader
 %%% copies it and loses an afternoon. These checks catch the classes of
 %%% drift that can be settled mechanically. Defaults are deliberately not
-%%% compared wholesale, see option_defaults_are_out_of_scope/0.
+%%% compared wholesale; the comment above versions_agree_test/0 says why.
 %%%
 %%% Each check also asserts a floor on how much it inspected, so a parser
 %%% that stops matching fails loudly instead of passing vacuously.
@@ -113,7 +113,7 @@ versions_agree_test() ->
             install_tag_problems(Root, Vsn),
     ?assertEqual([], Problems).
 
-%% @doc Why defaults are not compared here.
+%% Why defaults are not compared here:
 %%
 %% `verify', `groups' and `alpn' have different client and server defaults
 %% in one file, `ciphers' is computed, `reset_secret' is random,
@@ -121,8 +121,6 @@ versions_agree_test() ->
 %% `delivery_coalescing' hides its default inside a helper. Comparing every
 %% documented default would report those as failures forever, and a check
 %% people learn to ignore is worse than no check.
-option_defaults_are_out_of_scope() ->
-    ok.
 
 %%====================================================================
 %% Documentation scanning

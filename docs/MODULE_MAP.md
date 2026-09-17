@@ -19,7 +19,7 @@ In this order, they give you the whole path of a connection without opening the 
 | Layer | Modules |
 |-------|---------|
 | Public API | `quic`, `quic_listener` |
-| Connection | `quic_connection`, `quic_connection_state.hrl` |
+| Connection | `quic_connection`, `quic_connection_state.hrl`, `quic_pqueue` (the send queue's urgency buckets, RFC 9218) |
 | Protocol | `quic_packet`, `quic_frame`, `quic_varint` |
 | Crypto | `quic_crypto`, `quic_tls`, `quic_keys`, `quic_aead`, `quic_aead_ctx`, `quic_hkdf`, `quic_crypto_nif`, `quic_cert`, `quic_keylog` |
 | Recovery | `quic_cc` with `quic_cc_newreno`, `quic_cc_cubic`, `quic_cc_bbr`; `quic_loss`, `quic_ack` |

@@ -357,7 +357,7 @@ complete_migration(Owner, OldPath, NewPath) ->
     }.
 zero_byte_fin_in_queue() ->
     Entry = {stream_data, 0, 0, <<>>, true, 0},
-    PQ = quic_connection:pqueue_in(Entry, 3, quic_connection:empty_pqueue()),
+    PQ = quic_pqueue:in(Entry, 3, quic_pqueue:new()),
     State = #state{
         send_queue = PQ,
         send_queue_bytes = 0,
@@ -367,13 +367,13 @@ zero_byte_fin_in_queue() ->
     #{
         empty_by_count => (State#state.send_queue_count =:= 0),
         empty_by_bytes => (State#state.send_queue_bytes =:= 0),
-        queue_empty => quic_connection:pqueue_is_empty(State#state.send_queue)
+        queue_empty => quic_pqueue:is_empty(State#state.send_queue)
     }.
 
 coalesce_small_stream(DataSize) ->
     Data = binary:copy(<<0>>, DataSize),
     Entry = {stream_data, 0, 0, Data, false, DataSize},
-    PQ = quic_connection:pqueue_in(Entry, 3, quic_connection:empty_pqueue()),
+    PQ = quic_pqueue:in(Entry, 3, quic_pqueue:new()),
     State0 = #state{
         send_queue = PQ,
         send_queue_bytes = DataSize,
