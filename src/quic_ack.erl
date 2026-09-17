@@ -51,6 +51,17 @@
     %% Range accumulation (shared with quic_connection)
     add_to_ranges/2,
     merge_ranges/1,
+    cap_ack_ranges/1,
+
+    %% Frame construction (shared with quic_connection)
+    build_ack_frame_tuple/1,
+    build_ack_frame/1,
+    convert_ack_ranges_for_encode/1,
+    ranges_to_ack_format/1,
+
+    %% Frame classification for ACK policy
+    contains_ack_eliciting_frames/1,
+    is_ack_eliciting_frame/1,
 
     %% Queries
     largest_received/1,
@@ -85,6 +96,14 @@
 
 %% Maximum ACK range size to prevent memory exhaustion
 -define(MAX_ACK_RANGE, 65536).
+
+%% Max ACK ranges retained per PN space (RFC 9000 §13.2.4 allows the
+%% receiver to limit these). Under burst loss an unbounded list
+%% fragments into hundreds of ranges, and since every outgoing ACK
+%% encodes the full list (and the peer decodes it), ACK processing cost
+%% grows O(ranges) per packet on both ends. Distinct from ?MAX_ACK_RANGE,
+%% which bounds the span of a single range.
+-define(MAX_ACK_RANGE_COUNT, 64).
 
 %%====================================================================
 %% ACK State Management
@@ -315,9 +334,112 @@ merge_ranges([{S1, E1}, {S2, E2} | Rest]) when E2 + 1 >= S1 ->
 merge_ranges(Ranges) ->
     Ranges.
 
+%% @doc Drop the lowest ranges beyond ?MAX_ACK_RANGE_COUNT.
+%%
+%% The list is descending, so the newest packet numbers are kept. Packets
+%% below the lowest retained range are retransmitted by the peer and
+%% dropped as duplicates.
+-spec cap_ack_ranges([{non_neg_integer(), non_neg_integer()}]) ->
+    [{non_neg_integer(), non_neg_integer()}].
+cap_ack_ranges([_, _ | Tail] = Ranges) when Tail =/= [] ->
+    case length(Ranges) > ?MAX_ACK_RANGE_COUNT of
+        true -> lists:sublist(Ranges, ?MAX_ACK_RANGE_COUNT);
+        false -> Ranges
+    end;
+cap_ack_ranges(Ranges) ->
+    Ranges.
+
+%%====================================================================
+%% ACK frame construction
+%%
+%% The connection's send path builds ACK frames straight from its
+%% #pn_space.ack_ranges, holding no #ack_state{}.
+%%====================================================================
+
+%% @doc Build an unencoded ACK frame tuple from internal ranges.
+%%
+%% The delay is zero: the frame is built at send time, so there is no
+%% accumulated delay to report.
+-spec build_ack_frame_tuple([{non_neg_integer(), non_neg_integer()}]) ->
+    {ack, [{non_neg_integer(), non_neg_integer()}], non_neg_integer(), undefined}.
+build_ack_frame_tuple(Ranges) ->
+    EncoderRanges = convert_ack_ranges_for_encode(Ranges),
+    AckDelay = 0,
+    {ack, EncoderRanges, AckDelay, undefined}.
+
+%% @doc Build an encoded ACK frame from internal ranges.
+-spec build_ack_frame([{non_neg_integer(), non_neg_integer()}]) -> binary().
+build_ack_frame(Ranges) ->
+    quic_frame:encode(build_ack_frame_tuple(Ranges)).
+
+%% @doc Convert internal ACK ranges to encoder format.
+%%
+%% Internal form is [{Start, End}, ...] descending, where Start =&lt; End.
+%% The encoder expects [{LargestAcked, FirstRange}, {Gap, Range}, ...].
+%% The first range is capped at ?MAX_ACK_RANGE so the receiver does not
+%% reject the frame.
+-spec convert_ack_ranges_for_encode([{non_neg_integer(), non_neg_integer()}]) ->
+    [{non_neg_integer(), non_neg_integer()}].
+convert_ack_ranges_for_encode([{Start, End} | Rest]) ->
+    FirstRange = min(End - Start, ?MAX_ACK_RANGE),
+    AdjustedStart = End - FirstRange,
+    RestConverted = convert_rest_ranges(AdjustedStart, Rest),
+    [{End, FirstRange} | RestConverted].
+
+%% @doc Split the codec's range list into the shape quic_loss takes.
+%%
+%% Drops the largest acked, which the caller already holds.
+-spec ranges_to_ack_format([{non_neg_integer(), non_neg_integer()}]) ->
+    {non_neg_integer(), [{non_neg_integer(), non_neg_integer()}]}.
+ranges_to_ack_format([{_LargestAcked, FirstRange} | RestRanges]) ->
+    {FirstRange, RestRanges}.
+
+%%====================================================================
+%% Frame classification for ACK policy
+%%====================================================================
+
+%% @doc Is any frame in the list ack-eliciting?
+%%
+%% The single stream frame produced by every chunked send takes a fast
+%% path rather than the list walk.
+-spec contains_ack_eliciting_frames([term()]) -> boolean().
+contains_ack_eliciting_frames([{stream, _, _, _, _}]) ->
+    true;
+contains_ack_eliciting_frames([]) ->
+    false;
+contains_ack_eliciting_frames([Frame | Rest]) ->
+    case is_ack_eliciting_frame(Frame) of
+        true -> true;
+        false -> contains_ack_eliciting_frames(Rest)
+    end.
+
+%% @doc Is a decoded frame ack-eliciting?
+%%
+%% Per RFC 9002, ACK, PADDING and CONNECTION_CLOSE are not.
+-spec is_ack_eliciting_frame(term()) -> boolean().
+is_ack_eliciting_frame(padding) -> false;
+is_ack_eliciting_frame({ack, _, _, _}) -> false;
+is_ack_eliciting_frame({connection_close, _, _, _, _}) -> false;
+is_ack_eliciting_frame(_) -> true.
+
 %%====================================================================
 %% Internal Functions
 %%====================================================================
+
+%% Convert the remaining ranges to gap/range pairs. A malformed range is
+%% skipped rather than encoded as a negative varint.
+convert_rest_ranges(_PrevStart, []) ->
+    [];
+convert_rest_ranges(PrevStart, [{Start, End} | Rest]) ->
+    Gap = PrevStart - End - 2,
+    Range = End - Start,
+    case Gap >= 0 andalso Range >= 0 andalso Range =< ?MAX_ACK_RANGE of
+        true ->
+            [{Gap, Range} | convert_rest_ranges(Start, Rest)];
+        false ->
+            %% Keep PrevStart so the next gap stays correct.
+            convert_rest_ranges(PrevStart, Rest)
+    end.
 
 %% Convert internal ranges to ACK frame gap/range format
 ranges_to_ack_ranges(_PrevStart, []) ->

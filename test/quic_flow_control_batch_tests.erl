@@ -59,7 +59,7 @@ out_of_order_arrival_keeps_ranges_disjoint_test() ->
     ?assertEqual([], [P || P <- PNs, not covered(P, Ranges)]).
 
 cap(Ranges) ->
-    quic_connection:cap_ack_ranges(Ranges).
+    quic_ack:cap_ack_ranges(Ranges).
 
 covered(PN, Ranges) ->
     lists:any(fun({S, E}) -> PN >= S andalso PN =< E end, Ranges).

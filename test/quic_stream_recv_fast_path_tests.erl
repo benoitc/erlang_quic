@@ -97,7 +97,7 @@ reference_pn_space_recv(PN, PNSpace, Now) ->
     PNSpace#pn_space{
         largest_recv = NewLargest,
         recv_time = Now,
-        ack_ranges = quic_connection:cap_ack_ranges(quic_ack:add_to_ranges(PN, Ranges))
+        ack_ranges = quic_ack:cap_ack_ranges(quic_ack:add_to_ranges(PN, Ranges))
     }.
 
 empty_pn_space() ->

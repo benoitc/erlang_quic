@@ -58,34 +58,34 @@ merge_single_or_empty_is_identity_test() ->
 frame_tuple_carries_encoder_ranges_test() ->
     Ranges = [{10, 10}, {5, 6}, {0, 1}],
     ?assertEqual(
-        {ack, quic_connection:convert_ack_ranges_for_encode(Ranges), 0, undefined},
-        quic_connection:build_ack_frame_tuple(Ranges)
+        {ack, quic_ack:convert_ack_ranges_for_encode(Ranges), 0, undefined},
+        quic_ack:build_ack_frame_tuple(Ranges)
     ).
 
 %% ACK delay is zero here: send_app_ack/1 builds the frame at send time,
 %% so there is no accumulated delay to report.
 frame_tuple_has_no_ack_delay_test() ->
-    {ack, _Ranges, AckDelay, ECN} = quic_connection:build_ack_frame_tuple([{0, 3}]),
+    {ack, _Ranges, AckDelay, ECN} = quic_ack:build_ack_frame_tuple([{0, 3}]),
     ?assertEqual(0, AckDelay),
     ?assertEqual(undefined, ECN).
 
 %% What we encode must decode back to what we built.
 frame_round_trips_test() ->
     Ranges = [{10, 10}, {5, 6}, {0, 1}],
-    Tuple = quic_connection:build_ack_frame_tuple(Ranges),
-    Encoded = quic_connection:build_ack_frame(Ranges),
+    Tuple = quic_ack:build_ack_frame_tuple(Ranges),
+    Encoded = quic_ack:build_ack_frame(Ranges),
     ?assert(is_binary(Encoded)),
     ?assertEqual({Tuple, <<>>}, quic_frame:decode(Encoded)).
 
 single_range_round_trips_test() ->
-    Tuple = quic_connection:build_ack_frame_tuple([{0, 5}]),
-    ?assertEqual({Tuple, <<>>}, quic_frame:decode(quic_connection:build_ack_frame([{0, 5}]))).
+    Tuple = quic_ack:build_ack_frame_tuple([{0, 5}]),
+    ?assertEqual({Tuple, <<>>}, quic_frame:decode(quic_ack:build_ack_frame([{0, 5}]))).
 
 %% A range wider than MAX_ACK_RANGE is clamped rather than sent whole,
 %% because a receiver may reject anything larger.
 oversized_range_is_clamped_test() ->
     {ack, [{Largest, FirstRange} | _], _, _} =
-        quic_connection:build_ack_frame_tuple([{0, 70000}]),
+        quic_ack:build_ack_frame_tuple([{0, 70000}]),
     ?assertEqual(70000, Largest),
     ?assertEqual(65536, FirstRange).
 
@@ -99,18 +99,18 @@ oversized_range_is_clamped_test() ->
 splits_first_range_from_the_rest_test() ->
     ?assertEqual(
         {1, [{2, 1}, {2, 1}]},
-        quic_connection:ranges_to_ack_format([{10, 1}, {2, 1}, {2, 1}])
+        quic_ack:ranges_to_ack_format([{10, 1}, {2, 1}, {2, 1}])
     ).
 
 single_range_leaves_an_empty_tail_test() ->
-    ?assertEqual({5, []}, quic_connection:ranges_to_ack_format([{5, 5}])).
+    ?assertEqual({5, []}, quic_ack:ranges_to_ack_format([{5, 5}])).
 
 %% Decoding our own frame and converting it is the path an incoming ACK
 %% actually takes, so pin the two together.
 decode_then_convert_test() ->
-    Encoded = quic_connection:build_ack_frame([{10, 10}, {5, 6}, {0, 1}]),
+    Encoded = quic_ack:build_ack_frame([{10, 10}, {5, 6}, {0, 1}]),
     {{ack, Ranges, _AckDelay, _ECN}, <<>>} = quic_frame:decode(Encoded),
-    {FirstRange, Rest} = quic_connection:ranges_to_ack_format(Ranges),
+    {FirstRange, Rest} = quic_ack:ranges_to_ack_format(Ranges),
     [{_Largest, ExpectedFirst} | ExpectedRest] = Ranges,
     ?assertEqual(ExpectedFirst, FirstRange),
     ?assertEqual(ExpectedRest, Rest).
@@ -120,30 +120,30 @@ decode_then_convert_test() ->
 %%====================================================================
 
 ack_eliciting_frames_test() ->
-    ?assert(quic_connection:is_ack_eliciting_frame(ping)),
-    ?assert(quic_connection:is_ack_eliciting_frame({stream, 0, 0, <<"x">>, false})),
-    ?assert(quic_connection:is_ack_eliciting_frame({crypto, 0, <<"x">>})).
+    ?assert(quic_ack:is_ack_eliciting_frame(ping)),
+    ?assert(quic_ack:is_ack_eliciting_frame({stream, 0, 0, <<"x">>, false})),
+    ?assert(quic_ack:is_ack_eliciting_frame({crypto, 0, <<"x">>})).
 
 non_ack_eliciting_frames_test() ->
-    ?assertNot(quic_connection:is_ack_eliciting_frame(padding)),
-    ?assertNot(quic_connection:is_ack_eliciting_frame({ack, [], 0, undefined})),
+    ?assertNot(quic_ack:is_ack_eliciting_frame(padding)),
+    ?assertNot(quic_ack:is_ack_eliciting_frame({ack, [], 0, undefined})),
     ?assertNot(
-        quic_connection:is_ack_eliciting_frame({connection_close, transport, 0, 0, <<>>})
+        quic_ack:is_ack_eliciting_frame({connection_close, transport, 0, 0, <<>>})
     ).
 
 contains_ack_eliciting_test() ->
-    ?assert(quic_connection:contains_ack_eliciting_frames([ping])),
-    ?assert(quic_connection:contains_ack_eliciting_frames([padding, ping])),
-    ?assertNot(quic_connection:contains_ack_eliciting_frames([])),
-    ?assertNot(quic_connection:contains_ack_eliciting_frames([padding, padding])).
+    ?assert(quic_ack:contains_ack_eliciting_frames([ping])),
+    ?assert(quic_ack:contains_ack_eliciting_frames([padding, ping])),
+    ?assertNot(quic_ack:contains_ack_eliciting_frames([])),
+    ?assertNot(quic_ack:contains_ack_eliciting_frames([padding, padding])).
 
 %% The single stream frame produced by every chunked send takes a fast
 %% path rather than the list walk; it must agree with the general case.
 contains_ack_eliciting_fast_path_agrees_test() ->
     Frames = [{stream, 0, 0, <<"x">>, false}],
     ?assertEqual(
-        lists:any(fun quic_connection:is_ack_eliciting_frame/1, Frames),
-        quic_connection:contains_ack_eliciting_frames(Frames)
+        lists:any(fun quic_ack:is_ack_eliciting_frame/1, Frames),
+        quic_ack:contains_ack_eliciting_frames(Frames)
     ).
 
 %%====================================================================

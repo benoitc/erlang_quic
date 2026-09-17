@@ -210,15 +210,6 @@
 %% connected-state receive pass (see drain_recv_msgs/2).
 -define(RECV_DRAIN_MAX, 64).
 
-%% Max ACK ranges retained per PN space (RFC 9000 §13.2.4 allows the
-%% receiver to limit these). Under burst loss an unbounded list
-%% fragments into hundreds of ranges, and since every outgoing ACK
-%% encodes the full list (and the peer decodes it), ACK processing
-%% cost grows O(ranges) per packet on both ends. Packets below the
-%% lowest retained range are retransmitted by the peer and dropped
-%% here as duplicates.
--define(MAX_ACK_RANGES, 64).
-
 %% Max receive buffer size in bytes (32 MB total across all streams) - protects against malicious peers
 -define(MAX_RECV_BUFFER_BYTES, 33554432).
 
@@ -2947,7 +2938,7 @@ send_initial_ack(State) ->
             State;
         Ranges ->
             %% Build ACK frame
-            AckFrame = build_ack_frame(Ranges),
+            AckFrame = quic_ack:build_ack_frame(Ranges),
             send_initial_packet(AckFrame, bump_ack_sent(State))
     end.
 
@@ -2958,7 +2949,7 @@ send_handshake_ack(State) ->
         [] ->
             State;
         Ranges ->
-            AckFrame = build_ack_frame(Ranges),
+            AckFrame = quic_ack:build_ack_frame(Ranges),
             send_handshake_packet(AckFrame, bump_ack_sent(State))
     end.
 
@@ -2973,7 +2964,7 @@ send_app_ack(State) ->
         [] ->
             State1;
         Ranges ->
-            AckFrameTuple = build_ack_frame_tuple(Ranges),
+            AckFrameTuple = quic_ack:build_ack_frame_tuple(Ranges),
             maybe_coalesce_ack_with_data(AckFrameTuple, bump_ack_sent(State1))
     end.
 
@@ -3046,49 +3037,6 @@ dequeue_small_stream_frame_tuple(
 send_frame_tuples(FrameTuples, State) ->
     Payload = iolist_to_binary([quic_frame:encode(F) || F <- FrameTuples]),
     send_app_packet_internal(Payload, FrameTuples, State).
-
-%% Build an ACK frame tuple (not encoded) from ranges
-%% Used by send_app_ack for coalescing without re-decode overhead
-build_ack_frame_tuple(Ranges) ->
-    EncoderRanges = convert_ack_ranges_for_encode(Ranges),
-    AckDelay = 0,
-    {ack, EncoderRanges, AckDelay, undefined}.
-
-%% Build an ACK frame from ranges (encoded)
-%% Our internal format is [{Start, End}, ...] where Start <= End
-%% quic_frame expects [{LargestAcked, FirstRange}, {Gap, Range}, ...]
-%% where FirstRange = LargestAcked - SmallestAcked (count)
-build_ack_frame(Ranges) ->
-    quic_frame:encode(build_ack_frame_tuple(Ranges)).
-
-%% Convert internal ACK ranges to encoder format
-%% Limits ranges to MAX_ACK_RANGE (65536) to prevent receiver rejection
-convert_ack_ranges_for_encode([{Start, End} | Rest]) ->
-    %% First range: LargestAcked = End, FirstRange = End - Start
-    %% Cap FirstRange at 65536 to stay within receiver's MAX_ACK_RANGE limit
-    FirstRange = min(End - Start, 65536),
-    %% Adjust Start for the capped range
-    AdjustedStart = End - FirstRange,
-    RestConverted = convert_rest_ranges(AdjustedStart, Rest),
-    [{End, FirstRange} | RestConverted].
-
-convert_rest_ranges(_PrevStart, []) ->
-    [];
-convert_rest_ranges(PrevStart, [{Start, End} | Rest]) ->
-    %% Gap = PrevStart - End - 2 (number of missing packets between ranges)
-    Gap = PrevStart - End - 2,
-    %% Range = End - Start (number of packets in this block)
-    Range = End - Start,
-    %% Validate: Gap and Range must be non-negative for valid ACK ranges
-    %% Also check that Range doesn't exceed MAX_ACK_RANGE (65536) to prevent receiver rejection
-    case Gap >= 0 andalso Range >= 0 andalso Range =< 65536 of
-        true ->
-            [{Gap, Range} | convert_rest_ranges(Start, Rest)];
-        false ->
-            %% Skip malformed range (defensive - shouldn't happen with proper range tracking)
-            %% Use PrevStart (not Start) to maintain correct gap calculation for next range
-            convert_rest_ranges(PrevStart, Rest)
-    end.
 
 %% Send a Handshake packet
 send_handshake_packet(Payload, State) ->
@@ -3292,7 +3240,7 @@ send_app_packet_now(Payload, Frames, State0) ->
             %% Track sent packet for loss detection and congestion control.
             %% Determine if ack-eliciting by checking the actual frames list
             %% so coalesced packets with multiple frames are handled.
-            AckEliciting = contains_ack_eliciting_frames(Frames),
+            AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames),
             NewLossState = quic_loss:on_packet_sent(
                 LossState, PN, PacketSize, AckEliciting, Frames, Now
             ),
@@ -3745,7 +3693,7 @@ fold_opened_seq([{_PN, _FB, Opened} | Rest], State, N, Elicited) ->
     }),
     ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
     {State2, Elicited2} =
-        case contains_ack_eliciting_frames(Frames) of
+        case quic_ack:contains_ack_eliciting_frames(Frames) of
             false ->
                 {NewState, Elicited};
             true ->
@@ -3771,7 +3719,7 @@ fold_opened([{PN, FirstByte, Opened} | Rest], State, Now, N, Elicited) ->
     %% except the count-based decimation increment is accumulated
     %% across the run and applied once at the end.
     {State2, Elicited2} =
-        case contains_ack_eliciting_frames(Frames) of
+        case quic_ack:contains_ack_eliciting_frames(Frames) of
             false ->
                 {NewState, Elicited};
             true ->
@@ -4807,7 +4755,7 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
         [{LargestAcked, _} | _] ->
             %% Convert ranges to ACK frame format for quic_loss
             %% quic_loss expects {ack, LargestAcked, AckDelay, FirstRange, AckRanges}
-            {FirstRange, RestRanges} = ranges_to_ack_format(Ranges),
+            {FirstRange, RestRanges} = quic_ack:ranges_to_ack_format(Ranges),
             AckFrame = {ack, LargestAcked, AckDelay, FirstRange, RestRanges},
 
             Now = erlang:monotonic_time(millisecond),
@@ -7340,7 +7288,7 @@ flush_socket_batch(#state{socket_state = SocketState} = State) ->
 %% Datagram-only packets (RFC 9221 §5.2) continue to take the existing
 %% delayed-ACK path, which also sits on max_ack_delay.
 maybe_send_ack(app, Frames, State) ->
-    case contains_ack_eliciting_frames(Frames) of
+    case quic_ack:contains_ack_eliciting_frames(Frames) of
         true ->
             case should_delay_ack(Frames) of
                 true ->
@@ -7359,12 +7307,12 @@ maybe_send_ack(app, Frames, State) ->
             State
     end;
 maybe_send_ack(handshake, Frames, State) ->
-    case contains_ack_eliciting_frames(Frames) of
+    case quic_ack:contains_ack_eliciting_frames(Frames) of
         true -> send_handshake_ack(State);
         false -> State
     end;
 maybe_send_ack(initial, Frames, State) ->
-    case contains_ack_eliciting_frames(Frames) of
+    case quic_ack:contains_ack_eliciting_frames(Frames) of
         true -> send_initial_ack(State);
         false -> State
     end;
@@ -7469,7 +7417,7 @@ should_delay_ack([{stream, _, _, _, _} | _]) ->
     %% so the packet never qualifies for the datagram-only delay.
     false;
 should_delay_ack(Frames) ->
-    AckEliciting = [F || F <- Frames, is_ack_eliciting_frame(F)],
+    AckEliciting = [F || F <- Frames, quic_ack:is_ack_eliciting_frame(F)],
     Retransmittable = quic_loss:retransmittable_frames(AckEliciting),
     %% If all ack-eliciting frames are non-retransmittable, delay ACK
     Retransmittable =:= [].
@@ -7479,33 +7427,6 @@ should_delay_ack(Frames) ->
 %% path so both end at the next max_ack_delay fire.
 schedule_delayed_ack(app, State) ->
     arm_ack_timer(State).
-
-%% Check if any frame in the list is ack-eliciting. Fast-path the
-%% single-stream-frame list produced by every chunked / single stream
-%% send on the hot path — skips the `is_ack_eliciting_frame/1' dispatch
-%% plus list tail-walk.
-contains_ack_eliciting_frames([{stream, _, _, _, _}]) ->
-    true;
-contains_ack_eliciting_frames([]) ->
-    false;
-contains_ack_eliciting_frames([Frame | Rest]) ->
-    case is_ack_eliciting_frame(Frame) of
-        true -> true;
-        false -> contains_ack_eliciting_frames(Rest)
-    end.
-
-%% Check if a decoded frame is ack-eliciting
-%% Per RFC 9002: ACK, PADDING, and CONNECTION_CLOSE are not ack-eliciting
-is_ack_eliciting_frame(padding) -> false;
-is_ack_eliciting_frame({ack, _, _, _}) -> false;
-is_ack_eliciting_frame({connection_close, _, _, _, _}) -> false;
-is_ack_eliciting_frame(_) -> true.
-
-%% Convert ACK ranges from quic_frame format to quic_loss format
-%% Input from quic_frame: [{LargestAcked, FirstRange} | [{Gap, Range}, ...]]
-%% Output for quic_loss: {FirstRange, [{Gap, Range}, ...]}
-ranges_to_ack_format([{_LargestAcked, FirstRange} | RestRanges]) ->
-    {FirstRange, RestRanges}.
 
 %% Process ECN counts from ACK frame (RFC 9002 Section 7.1)
 %% ECN-CE indicates network congestion experienced
@@ -7888,22 +7809,13 @@ update_pn_space_recv(PN, PNSpace, Now) ->
     NewRanges =
         case LargestRecv =/= undefined andalso PN =:= LargestRecv + 1 of
             true -> quic_ack:add_to_ranges(PN, Ranges);
-            false -> cap_ack_ranges(quic_ack:add_to_ranges(PN, Ranges))
+            false -> quic_ack:cap_ack_ranges(quic_ack:add_to_ranges(PN, Ranges))
         end,
     PNSpace#pn_space{
         largest_recv = NewLargest,
         recv_time = Now,
         ack_ranges = NewRanges
     }.
-
-%% Drop the lowest ranges beyond ?MAX_ACK_RANGES (list is descending).
-cap_ack_ranges([_, _ | Tail] = Ranges) when Tail =/= [] ->
-    case length(Ranges) > ?MAX_ACK_RANGES of
-        true -> lists:sublist(Ranges, ?MAX_ACK_RANGES);
-        false -> Ranges
-    end;
-cap_ack_ranges(Ranges) ->
-    Ranges.
 
 %% Record activity. The idle and keep-alive timers read last_activity at
 %% fire time (lazy model), so no timer op is needed per packet.

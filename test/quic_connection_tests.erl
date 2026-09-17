@@ -237,7 +237,7 @@ ack_ranges_out_of_order_no_negative_gap_test() ->
     ?assertEqual([{10, 10}, {5, 6}], R3),
 
     %% Now convert to encoder format - should work without crash
-    EncoderRanges = quic_connection:convert_ack_ranges_for_encode(R3),
+    EncoderRanges = quic_ack:convert_ack_ranges_for_encode(R3),
     %% First range: LargestAcked=10, FirstRange=0 (10-10)
     %% Second range: Gap = 10 - 6 - 2 = 2, Range = 6 - 5 = 1
     ?assertEqual([{10, 0}, {2, 1}], EncoderRanges).
@@ -260,30 +260,29 @@ ack_ranges_complex_out_of_order_test() ->
     ?assertEqual([{100, 100}, {90, 95}], R7),
 
     %% Convert to encoder format - should work
-    EncoderRanges = quic_connection:convert_ack_ranges_for_encode(R7),
+    EncoderRanges = quic_ack:convert_ack_ranges_for_encode(R7),
     %% Gap = 100 - 95 - 2 = 3, Range = 95 - 90 = 5
     ?assertEqual([{100, 0}, {3, 5}], EncoderRanges).
 
 %% Test that single range produces valid encoder format
 ack_ranges_single_range_encode_test() ->
     R = [{50, 55}],
-    EncoderRanges = quic_connection:convert_ack_ranges_for_encode(R),
+    EncoderRanges = quic_ack:convert_ack_ranges_for_encode(R),
     ?assertEqual([{55, 5}], EncoderRanges).
 
-%% Test convert_rest_ranges skips invalid gaps
+%% Test that a malformed trailing range is skipped rather than encoded
 ack_ranges_skip_invalid_gap_test() ->
-    %% If somehow we get malformed ranges, they should be skipped
-    %% This is a defensive test - malformed ranges shouldn't happen
-    %% with correct add_to_ranges, but we test the safety net
-    Result = quic_connection:convert_rest_ranges(5, [{10, 20}]),
-    %% Gap = 5 - 20 - 2 = -17 (negative), should be skipped
-    ?assertEqual([], Result).
+    %% Malformed ranges shouldn't happen with correct add_to_ranges, but
+    %% we test the safety net. The leading {5, 5} sets PrevStart to 5, so
+    %% {10, 20} gives Gap = 5 - 20 - 2 = -17 (negative) and is skipped.
+    Result = quic_ack:convert_ack_ranges_for_encode([{5, 5}, {10, 20}]),
+    ?assertEqual([{5, 0}], Result).
 
 %% Test that large ranges are capped at MAX_ACK_RANGE (65536)
 ack_ranges_large_first_range_capped_test() ->
     %% Create a range that exceeds MAX_ACK_RANGE
     LargeRange = [{0, 70000}],
-    EncoderRanges = quic_connection:convert_ack_ranges_for_encode(LargeRange),
+    EncoderRanges = quic_ack:convert_ack_ranges_for_encode(LargeRange),
     %% FirstRange should be capped at 65536, not 70000
     [{LargestAcked, FirstRange}] = EncoderRanges,
     ?assertEqual(70000, LargestAcked),
@@ -296,7 +295,7 @@ ack_ranges_large_subsequent_range_skipped_test() ->
     %% Normal case: [{100, 105}, {0, 50}]
     %% Gap = 100 - 50 - 2 = 48, Range = 50 - 0 = 50 (valid)
     NormalRanges = [{100, 105}, {0, 50}],
-    NormalResult = quic_connection:convert_ack_ranges_for_encode(NormalRanges),
+    NormalResult = quic_ack:convert_ack_ranges_for_encode(NormalRanges),
     ?assertEqual([{105, 5}, {48, 50}], NormalResult).
 
 %% Test that skipping malformed range preserves PrevStart for next calculation
@@ -308,7 +307,7 @@ ack_ranges_skip_preserves_prevstart_test() ->
     %% After fix: when we skip due to overlap, we use PrevStart=100 for next range
     %% Gap for third = 100 - 85 - 2 = 13, Range = 85 - 80 = 5
     Ranges = [{100, 105}, {80, 85}],
-    Result = quic_connection:convert_ack_ranges_for_encode(Ranges),
+    Result = quic_ack:convert_ack_ranges_for_encode(Ranges),
     %% Gap = 100 - 85 - 2 = 13, Range = 85 - 80 = 5
     ?assertEqual([{105, 5}, {13, 5}], Result).
 
@@ -318,7 +317,7 @@ ack_ranges_encode_decode_roundtrip_test() ->
     Ranges = [{90, 100}, {70, 80}, {50, 60}],
 
     %% Convert to encoder format
-    EncoderRanges = quic_connection:convert_ack_ranges_for_encode(Ranges),
+    EncoderRanges = quic_ack:convert_ack_ranges_for_encode(Ranges),
 
     %% Verify format: [{LargestAcked, FirstRange}, {Gap, Range}, ...]
     [{LargestAcked, FirstRange} | RestRanges] = EncoderRanges,
@@ -339,7 +338,7 @@ ack_ranges_encode_decode_roundtrip_test() ->
 %% Test that empty ranges returns empty
 ack_ranges_convert_empty_test() ->
     %% This should not happen in practice, but test defensive behavior
-    ?assertError(function_clause, quic_connection:convert_ack_ranges_for_encode([])).
+    ?assertError(function_clause, quic_ack:convert_ack_ranges_for_encode([])).
 
 %%====================================================================
 %% Queue Limit Tests

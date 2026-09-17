@@ -12,7 +12,7 @@ In this order, they give you the whole path of a connection without opening the 
 4. `src/quic_varint.erl` (113) is the encoding everything else is built from.
 5. `src/quic_crypto.erl` (672) is the key schedule, and `src/quic_aead.erl` packet protection.
 6. `src/quic_cc.erl` (402) is the congestion control behaviour, with `quic_loss` and `quic_ack` beside it.
-7. `src/quic_connection.erl` (13,042) is the state machine everything above meets in. Read it by section banner, not top to bottom.
+7. `src/quic_connection.erl` (12,676) is the state machine everything above meets in. Read it by section banner, not top to bottom.
 
 ## Layers
 
@@ -22,7 +22,7 @@ In this order, they give you the whole path of a connection without opening the 
 | Connection | `quic_connection`, `quic_connection_state.hrl`, `quic_pqueue` (the send queue's urgency buckets, RFC 9218), `quic_reassembly` (out-of-order buffers), `quic_interval` (disjoint interval lists, used for reclaimed stream ids) |
 | Protocol | `quic_packet`, `quic_frame`, `quic_varint` |
 | Crypto | `quic_crypto`, `quic_tls`, `quic_tls_negotiation` (cipher, ALPN and group choices), `quic_keys`, `quic_aead`, `quic_aead_ctx`, `quic_hkdf`, `quic_crypto_nif`, `quic_cert`, `quic_keylog` |
-| Recovery | `quic_cc` with `quic_cc_newreno`, `quic_cc_cubic`, `quic_cc_bbr`; `quic_loss`, `quic_ack` |
+| Recovery | `quic_cc` with `quic_cc_newreno`, `quic_cc_cubic`, `quic_cc_bbr`; `quic_loss`, `quic_ack` (the connection's ACK range and frame path, plus an `#ack_state{}` accumulator only tests drive) |
 | Transport services | `quic_socket`, `quic_pmtu`, `quic_lb`, `quic_happy`, `quic_ticket`, `quic_token_cache`, `quic_address_token`, `quic_qlog` |
 | Supervision | `quic_app`, `quic_sup`, `quic_server_sup`, `quic_server_registry`, `quic_conn_sup`, `quic_happy_sup`, `quic_listener_sup`, `quic_listener_sup_sup`, `quic_listener_manager` |
 | HTTP/3 | `src/h3/`: `quic_h3`, `quic_h3_connection`, `quic_h3_frame`, `quic_h3_capsule`, plus the client and server escripts |
@@ -40,7 +40,7 @@ Most called, so most expensive to change:
 | `quic_varint` | 113 | 8 | 0 |
 | `quic_crypto` | 672 | 6 | 1 |
 | `quic_listener` | 1,412 | 5 | 8 |
-| `quic_connection` | 13,042 | 5 | 21 |
+| `quic_connection` | 12,676 | 5 | 21 |
 | `quic_cc` | 402 | 4 | 1 |
 | `quic_h3` | 837 | 4 | 2 |
 
