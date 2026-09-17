@@ -279,7 +279,7 @@ bench_reassembly(FragmentCount) ->
         ratio => TimeBinary / max(1, TimeIOList)
     }.
 
-%% Binary append implementation (mirrors quic_connection:extract_contiguous_data)
+%% Binary append implementation (mirrors quic_reassembly:extract_contiguous_data)
 extract_contiguous_binary(Buffer, Offset) ->
     extract_contiguous_binary(Buffer, Offset, <<>>).
 

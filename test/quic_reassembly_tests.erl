@@ -20,11 +20,11 @@ tree(Map) ->
     gb_trees:from_orddict(lists:sort(maps:to_list(Map))).
 
 extract(Buffer, Offset) ->
-    {Data, Off, Rest, _Removed} = quic_connection:extract_contiguous_data(tree(Buffer), Offset),
+    {Data, Off, Rest, _Removed} = quic_reassembly:extract_contiguous_data(tree(Buffer), Offset),
     {Data, Off, maps:from_list(gb_trees:to_list(Rest))}.
 
 trim(Buffer, Offset) ->
-    {Rest, _Removed} = quic_connection:trim_reassembly_buffer(tree(Buffer), Offset),
+    {Rest, _Removed} = quic_reassembly:trim_reassembly_buffer(tree(Buffer), Offset),
     maps:from_list(gb_trees:to_list(Rest)).
 
 %%====================================================================
@@ -104,7 +104,7 @@ trim_leaves_future_chunks_untouched_test() ->
 %% rebuilding the buffer (the returned tree is the input, unchanged).
 gap_below_a_large_buffer_is_answered_without_a_walk_test() ->
     Above = tree(maps:from_list([{Off, chunk(Off, 100)} || Off <- lists:seq(1000, 100000, 100)])),
-    ?assertMatch({<<>>, 500, Above, 0}, quic_connection:extract_contiguous_data(Above, 500)).
+    ?assertMatch({<<>>, 500, Above, 0}, quic_reassembly:extract_contiguous_data(Above, 500)).
 
 %% With one straddling chunk below the point, only that chunk is
 %% touched; the chunks above come back as they were.
@@ -179,16 +179,16 @@ running_count_matches_tree_test() ->
             {Tree1, Count1, Offset1} =
                 case Step of
                     {insert, Off, Data} ->
-                        {T, Delta} = quic_connection:keep_longest_chunk(Off, Data, Tree),
+                        {T, Delta} = quic_reassembly:keep_longest_chunk(Off, Data, Tree),
                         {T, Count + Delta, Offset};
                     {extract, Off, Head} ->
                         {T0, Added} =
                             case Head of
                                 <<>> -> {Tree, 0};
-                                _ -> quic_connection:keep_longest_chunk(Off, Head, Tree)
+                                _ -> quic_reassembly:keep_longest_chunk(Off, Head, Tree)
                             end,
                         {_Data, NewOff, T, Removed} =
-                            quic_connection:extract_contiguous_data(T0, Off),
+                            quic_reassembly:extract_contiguous_data(T0, Off),
                         {T, Count + Added - Removed, NewOff}
                 end,
             ?assertEqual(bytes_in(Tree1), Count1),
@@ -200,7 +200,7 @@ running_count_matches_tree_test() ->
 
 trim_reports_removed_bytes_test() ->
     T = tree(#{0 => <<0:(50 * 8)>>, 40 => <<1:(30 * 8)>>, 100 => <<2:(10 * 8)>>}),
-    {Rest, Removed} = quic_connection:trim_reassembly_buffer(T, 60),
+    {Rest, Removed} = quic_reassembly:trim_reassembly_buffer(T, 60),
     %% 0..50 dropped (50), 40..70 trimmed to 60..70 (30 gone, 10 kept)
     ?assertEqual(bytes_in(T) - bytes_in(Rest), Removed),
     ?assertEqual(
