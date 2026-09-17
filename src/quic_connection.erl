@@ -3203,7 +3203,7 @@ dequeue_small_stream_frame_tuple(
         send_queue_version = Version
     } = State
 ) ->
-    case pqueue_peek(PQ) of
+    case quic_pqueue:peek(PQ) of
         {value, {stream_data, StreamId, Offset, Data, Fin, DataSize}} when
             DataSize < ?SMALL_FRAME_THRESHOLD
         ->
@@ -3211,7 +3211,7 @@ dequeue_small_stream_frame_tuple(
             %% send_queue_bytes must be decremented here to match the
             %% accounting done in process_send_queue_entry/1; otherwise
             %% the counter leaks until it crosses ?MAX_SEND_QUEUE_BYTES.
-            {{value, _}, NewPQ} = pqueue_out(PQ),
+            {{value, _}, NewPQ} = quic_pqueue:out(PQ),
             StreamFrameTuple = {stream, StreamId, Offset, Data, Fin},
             NewState = State#state{
                 send_queue = NewPQ,
@@ -9580,8 +9580,8 @@ queue_stream_data(
             Entry = {stream_data, StreamId, Offset, DataBin, Fin, DataSize},
             NewPQ =
                 case Where of
-                    back -> pqueue_in(Entry, Urgency, PQ);
-                    front -> pqueue_in_front(Entry, Urgency, PQ)
+                    back -> quic_pqueue:in(Entry, Urgency, PQ);
+                    front -> quic_pqueue:in_front(Entry, Urgency, PQ)
                 end,
             NewVersion = Version + 1,
             {ok, State#state{
@@ -9604,7 +9604,7 @@ get_stream_urgency(StreamId, Streams) ->
 %% Processes streams in priority order (lower urgency = higher priority)
 %% IMPORTANT: Must check BOTH congestion control AND flow control before sending
 %% Fast path: if send_queue_count is 0 the queue is empty, so skip the
-%% O(8) bucket walk in pqueue_peek/1. We cannot use send_queue_bytes for
+%% O(8) bucket walk in quic_pqueue:peek/1. We cannot use send_queue_bytes for
 %% this check because a zero-byte FIN-only stream send (iodata of <<>>
 %% with Fin=true) can be enqueued under pacing or congestion, leaving
 %% bytes at 0 while a real entry is pending.
@@ -9617,7 +9617,7 @@ process_send_queue(State) ->
     end.
 
 process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
-    case pqueue_peek(PQ) of
+    case quic_pqueue:peek(PQ) of
         empty ->
             State;
         {value, {stream_data, StreamId, Offset, _Data, _Fin, DataSize}} ->
@@ -9688,18 +9688,18 @@ check_send_queue_flow_control(StreamId, Offset, DataSize, #state{
 %% false when nothing fits, when the whole entry fits (the caller should not
 %% have been blocked), or for a zero-length FIN-only entry.
 split_blocked_head(#state{send_queue = PQ, send_queue_count = QueueCount} = State) ->
-    case pqueue_peek(PQ) of
+    case quic_pqueue:peek(PQ) of
         {value, {stream_data, StreamId, Offset, Data, Fin, DataSize}} ->
             case blocked_head_allowance(StreamId, Offset, State) of
                 Allowed when Allowed > 0, Allowed < DataSize ->
-                    {{value, _}, PQ1} = pqueue_out(PQ),
+                    {{value, _}, PQ1} = quic_pqueue:out(PQ),
                     <<Head:Allowed/binary, Tail/binary>> = Data,
                     Urgency = get_stream_urgency(StreamId, State#state.streams),
                     TailEntry =
                         {stream_data, StreamId, Offset + Allowed, Tail, Fin, DataSize - Allowed},
                     HeadEntry = {stream_data, StreamId, Offset, Head, false, Allowed},
-                    PQ2 = pqueue_in_front(TailEntry, Urgency, PQ1),
-                    PQ3 = pqueue_in_front(HeadEntry, Urgency, PQ2),
+                    PQ2 = quic_pqueue:in_front(TailEntry, Urgency, PQ1),
+                    PQ3 = quic_pqueue:in_front(HeadEntry, Urgency, PQ2),
                     {ok, State#state{send_queue = PQ3, send_queue_count = QueueCount + 1}};
                 _ ->
                     false
@@ -9730,7 +9730,7 @@ process_send_queue_entry(
         send_queue_count = QueueCount
     } = State
 ) ->
-    case pqueue_out(PQ) of
+    case quic_pqueue:out(PQ) of
         {empty, _} ->
             State;
         {{value, {retransmit_stream, StreamId, Offset, Data, Fin, DataSize}}, NewPQ} ->
@@ -9746,7 +9746,7 @@ process_send_queue_entry(
             },
             Frame = {stream, StreamId, Offset, Data, Fin},
             State2 = send_retransmit_frames_cc([Frame], State1),
-            case pqueue_is_empty(State2#state.send_queue) of
+            case quic_pqueue:is_empty(State2#state.send_queue) of
                 true ->
                     State2;
                 false ->
@@ -9803,7 +9803,7 @@ process_send_queue_entry(
                             false -> State3a
                         end,
                     %% If data was queued again (cwnd still full), stop processing
-                    case pqueue_is_empty(State3#state.send_queue) of
+                    case quic_pqueue:is_empty(State3#state.send_queue) of
                         true ->
                             State3;
                         false ->
@@ -9820,81 +9820,6 @@ process_send_queue_entry(
                     end
             end
     end.
-
-%%--------------------------------------------------------------------
-%% Priority Queue - Bucket-based implementation for urgency 0-7
-%% O(1) insert, O(1) dequeue (8 buckets = constant)
-%%--------------------------------------------------------------------
-pqueue_in(Entry, Urgency, PQ) when Urgency >= 0, Urgency =< 7 ->
-    Bucket = element(Urgency + 1, PQ),
-    NewBucket = queue:in(Entry, Bucket),
-    setelement(Urgency + 1, PQ, NewBucket).
-
-%% Insert at the front of the urgency bucket. Used when a drain pops an
-%% entry and must put back an unsent remainder: appending it at the back
-%% would order it behind higher-offset entries of the same stream, and a
-%% later stream-flow-control block at the head then strands it forever
-%% (the peer cannot extend the window across the resulting data hole).
-pqueue_in_front(Entry, Urgency, PQ) when Urgency >= 0, Urgency =< 7 ->
-    Bucket = element(Urgency + 1, PQ),
-    NewBucket = queue:in_r(Entry, Bucket),
-    setelement(Urgency + 1, PQ, NewBucket).
-
-%% Remove and return highest priority (lowest urgency) entry
-pqueue_out(PQ) ->
-    pqueue_out(PQ, 0).
-
-pqueue_out(_PQ, 8) ->
-    {empty, empty_pqueue()};
-pqueue_out(PQ, Urgency) ->
-    Bucket = element(Urgency + 1, PQ),
-    case queue:out(Bucket) of
-        {empty, _} ->
-            pqueue_out(PQ, Urgency + 1);
-        {{value, Entry}, NewBucket} ->
-            NewPQ = setelement(Urgency + 1, PQ, NewBucket),
-            {{value, Entry}, NewPQ}
-    end.
-
-%% Peek at highest priority entry without removing
-pqueue_peek(PQ) ->
-    pqueue_peek(PQ, 0).
-
-pqueue_peek(_PQ, 8) ->
-    empty;
-pqueue_peek(PQ, Urgency) ->
-    Bucket = element(Urgency + 1, PQ),
-    case queue:peek(Bucket) of
-        empty ->
-            pqueue_peek(PQ, Urgency + 1);
-        {value, Entry} ->
-            {value, Entry}
-    end.
-
-%% Check if priority queue is empty
-pqueue_is_empty(PQ) ->
-    pqueue_is_empty(PQ, 0).
-
-pqueue_is_empty(_PQ, 8) ->
-    true;
-pqueue_is_empty(PQ, Urgency) ->
-    case queue:is_empty(element(Urgency + 1, PQ)) of
-        true -> pqueue_is_empty(PQ, Urgency + 1);
-        false -> false
-    end.
-
-%% Create empty priority queue
-empty_pqueue() ->
-    {
-        queue:new(),
-        queue:new(),
-        queue:new(),
-        queue:new(),
-        queue:new(),
-        queue:new(),
-        queue:new(),
-        queue:new()
-    }.
 
 %% Send data that was queued before connection was established
 send_pending_data([], State) ->
@@ -10703,7 +10628,7 @@ enqueue_retransmit_stream(StreamId, Offset, Data, Fin, State) ->
     Urgency = get_stream_urgency(StreamId, Streams),
     Entry = {retransmit_stream, StreamId, Offset, Data, Fin, DataSize},
     State#state{
-        send_queue = pqueue_in_front(Entry, Urgency, PQ),
+        send_queue = quic_pqueue:in_front(Entry, Urgency, PQ),
         send_queue_bytes = QueueBytes + DataSize,
         send_queue_count = QueueCount + 1,
         send_queue_version = Version + 1
@@ -10953,7 +10878,7 @@ cancel_timer(Ref) -> erlang:cancel_timer(Ref).
 %% Handle pacing timeout - drain queued data
 %% Note: pacing_timer is already set to undefined by the handler before calling this
 %% Fast path: send_queue_count == 0 implies queue is empty, avoiding the
-%% O(8) bucket walk in pqueue_is_empty/1. Byte count is NOT safe here
+%% O(8) bucket walk in quic_pqueue:is_empty/1. Byte count is NOT safe here
 %% because zero-byte FIN-only entries can sit in the queue with bytes=0.
 handle_pacing_timeout(#state{send_queue_count = 0} = State) ->
     ?LOG_DEBUG(#{what => pacing_timeout_fired, queue_empty => true}, ?QUIC_LOG_META),
@@ -10969,7 +10894,7 @@ handle_pacing_timeout(State) ->
 
 %% Check if we need to reschedule pacing timer after processing queue
 maybe_reschedule_pacing(#state{send_queue = PQ, cc_state = CCState, pacing_enabled = true} = State) ->
-    case pqueue_is_empty(PQ) of
+    case quic_pqueue:is_empty(PQ) of
         true ->
             State;
         false ->
