@@ -8,16 +8,30 @@
 %%%
 %%% @doc QUIC ACK frame generation and processing.
 %%%
-%%% This module handles:
-%%% - Tracking received packet numbers
-%%% - Generating ACK frames with ranges
-%%% - Processing incoming ACK frames
-%%% - ACK delay calculation
+%%% Two independent things live here. They share the range form below and
+%%% nothing else, so read whichever one you came for and ignore the other.
+%%%
+%%% == The connection's ACK path (stateless) ==
+%%%
+%%% Plain functions over a range list, no state record. `quic_connection'
+%%% drives these: it keeps its ranges in `#pn_space.ack_ranges' and never
+%%% builds an `#ack_state{}'. Range accumulation, the retained-range cap,
+%%% ACK frame construction, and the frame classification deciding whether
+%%% a packet needs acknowledging. `quic_loss' calls `ack_frame_to_ranges/3'
+%%% from this half when an ACK arrives.
+%%%
+%%% == The #ack_state{} accumulator (stateful) ==
+%%%
+%%% A self-contained receiver: `new/0', then `record_received/2,3' per
+%%% packet, then `generate_ack/1,2', `needs_ack/1' and `process_ack/2,3'.
+%%% No production code drives it; only tests do. It is not dead weight:
+%%% it carries the ACK delay and ECN arithmetic that the stateless half
+%%% has no equivalent for, and it is the only coverage of that arithmetic.
 %%%
 %%% == ACK Ranges ==
 %%%
-%%% ACK ranges are stored as a list of {Start, End} tuples where Start =&lt; End.
-%%% The list is sorted in descending order by Start.
+%%% Both halves use the same form: a list of {Start, End} tuples where
+%%% Start =&lt; End, sorted in descending order by Start.
 %%% Example: [{100, 105}, {90, 95}, {80, 82}] acknowledges packets
 %%% 100-105, 90-95, and 80-82.
 %%%
@@ -27,34 +41,14 @@
 -include("quic.hrl").
 
 -export([
-    %% ACK state management
-    new/0,
-
-    %% Packet reception tracking
-    record_received/2,
-    record_received/3,
-
-    %% ACK frame generation
-    generate_ack/1,
-    generate_ack/2,
-    needs_ack/1,
-    mark_ack_sent/1,
-
-    %% ACK frame processing
-    process_ack/2,
-    process_ack/3,
-
-    %% ACK frame utilities (shared with quic_loss)
-    ack_frame_to_pn_list/3,
-    ack_frame_to_ranges/3,
-
-    %% Range accumulation (shared with quic_connection)
+    %% The connection's ACK path: stateless, no #ack_state{}.
+    %% Range accumulation
     add_to_ranges/2,
     merge_ranges/1,
     cap_ack_ranges/1,
     update_pn_space_recv/3,
 
-    %% Frame construction (shared with quic_connection)
+    %% Frame construction
     build_ack_frame_tuple/1,
     build_ack_frame/1,
     convert_ack_ranges_for_encode/1,
@@ -64,7 +58,23 @@
     contains_ack_eliciting_frames/1,
     is_ack_eliciting_frame/1,
 
-    %% Queries
+    %% ACK frame decoding, used by both halves. quic_loss calls
+    %% ack_frame_to_ranges/3.
+    ack_frame_to_pn_list/3,
+    ack_frame_to_ranges/3,
+
+    %% The #ack_state{} accumulator: stateful, driven by tests only.
+    new/0,
+    record_received/2,
+    record_received/3,
+    generate_ack/1,
+    generate_ack/2,
+    needs_ack/1,
+    mark_ack_sent/1,
+    process_ack/2,
+    process_ack/3,
+
+    %% Queries on #ack_state{}
     largest_received/1,
     largest_acked/1,
     ack_ranges/1,
@@ -105,6 +115,14 @@
 %% grows O(ranges) per packet on both ends. Distinct from ?MAX_ACK_RANGE,
 %% which bounds the span of a single range.
 -define(MAX_ACK_RANGE_COUNT, 64).
+
+%%%===================================================================
+%%% The #ack_state{} accumulator (stateful)
+%%%
+%%% Everything from here to "Queries on #ack_state{}" belongs to the
+%%% self-contained receiver. No production code drives it; only tests.
+%%% It holds the ACK delay and ECN arithmetic the stateless half lacks.
+%%%===================================================================
 
 %%====================================================================
 %% ACK State Management
@@ -277,7 +295,7 @@ process_ack(
     {NewState, NewlyAcked, {ecn, ECT0, ECT1, ECNCE}}.
 
 %%====================================================================
-%% Queries
+%% Queries on #ack_state{}
 %%====================================================================
 
 %% @doc Get the largest received packet number.
@@ -296,11 +314,16 @@ ack_ranges(#ack_state{ack_ranges = R}) -> R.
 -spec ack_eliciting_in_flight(ack_state()) -> non_neg_integer().
 ack_eliciting_in_flight(#ack_state{ack_eliciting_in_flight = N}) -> N.
 
+%%%===================================================================
+%%% The connection's ACK path (stateless)
+%%%
+%%% Everything from here to "ACK frame decoding" is plain functions over
+%%% a range list. quic_connection drives them, keeping its ranges in
+%%% #pn_space.ack_ranges and holding no #ack_state{}.
+%%%===================================================================
+
 %%====================================================================
 %% Range accumulation
-%%
-%% Shared with quic_connection, which accumulates received packet
-%% numbers into #pn_space.ack_ranges directly and holds no #ack_state{}.
 %%====================================================================
 
 %% @doc Add a packet number to a descending, disjoint range list.
@@ -448,36 +471,18 @@ is_ack_eliciting_frame({connection_close, _, _, _, _}) -> false;
 is_ack_eliciting_frame(_) -> true.
 
 %%====================================================================
-%% Internal Functions
+%% ACK frame decoding
+%%
+%% Reached from both halves: process_ack/3 expands a frame to packet
+%% numbers, and quic_loss calls ack_frame_to_ranges/3 to keep the ranges.
 %%====================================================================
 
-%% Convert the remaining ranges to gap/range pairs. A malformed range is
-%% skipped rather than encoded as a negative varint.
-convert_rest_ranges(_PrevStart, []) ->
-    [];
-convert_rest_ranges(PrevStart, [{Start, End} | Rest]) ->
-    Gap = PrevStart - End - 2,
-    Range = End - Start,
-    case Gap >= 0 andalso Range >= 0 andalso Range =< ?MAX_ACK_RANGE of
-        true ->
-            [{Gap, Range} | convert_rest_ranges(Start, Rest)];
-        false ->
-            %% Keep PrevStart so the next gap stays correct.
-            convert_rest_ranges(PrevStart, Rest)
-    end.
-
-%% Convert internal ranges to ACK frame gap/range format
-ranges_to_ack_ranges(_PrevStart, []) ->
-    [];
-ranges_to_ack_ranges(PrevStart, [{Start, End} | Rest]) ->
-    %% Gap is the number of missing packets between ranges - 1
-    Gap = PrevStart - End - 2,
-    %% Range is the number of packets in this range - 1
-    Range = End - Start,
-    [{Gap, Range} | ranges_to_ack_ranges(Start, Rest)].
-
-%% Convert ACK frame format back to list of packet numbers
-%% Returns list of packet numbers or {error, ack_range_too_large}
+%% @doc Convert an ACK frame to the list of packet numbers it covers.
+%%
+%% Prefer ack_frame_to_ranges/3 for wide ranges: this expands every
+%% packet number into the list.
+-spec ack_frame_to_pn_list(non_neg_integer(), non_neg_integer(), list()) ->
+    [non_neg_integer()] | {error, ack_range_too_large}.
 ack_frame_to_pn_list(LargestAcked, FirstRange, AckRanges) ->
     %% First range: LargestAcked - FirstRange to LargestAcked
     FirstEnd = LargestAcked,
@@ -549,7 +554,38 @@ ack_ranges_to_range_list(PrevStart, [{Gap, Range} | Rest]) ->
             end
     end.
 
-%% Check if a sent packet info indicates ACK-eliciting
+%%====================================================================
+%% Internal Functions
+%%====================================================================
+
+%% Convert the remaining ranges to gap/range pairs. A malformed range is
+%% skipped rather than encoded as a negative varint. Stateless half.
+convert_rest_ranges(_PrevStart, []) ->
+    [];
+convert_rest_ranges(PrevStart, [{Start, End} | Rest]) ->
+    Gap = PrevStart - End - 2,
+    Range = End - Start,
+    case Gap >= 0 andalso Range >= 0 andalso Range =< ?MAX_ACK_RANGE of
+        true ->
+            [{Gap, Range} | convert_rest_ranges(Start, Rest)];
+        false ->
+            %% Keep PrevStart so the next gap stays correct.
+            convert_rest_ranges(PrevStart, Rest)
+    end.
+
+%% Convert internal ranges to ACK frame gap/range format. #ack_state{}
+%% half; the stateless one uses convert_rest_ranges/2, which also clamps.
+ranges_to_ack_ranges(_PrevStart, []) ->
+    [];
+ranges_to_ack_ranges(PrevStart, [{Start, End} | Rest]) ->
+    %% Gap is the number of missing packets between ranges - 1
+    Gap = PrevStart - End - 2,
+    %% Range is the number of packets in this range - 1
+    Range = End - Start,
+    [{Gap, Range} | ranges_to_ack_ranges(Start, Rest)].
+
+%% Does a sent packet record count as ACK-eliciting? Takes #sent_packet{},
+%% unlike is_ack_eliciting_frame/1, which classifies a decoded frame.
 is_ack_eliciting(#sent_packet{ack_eliciting = AE}) ->
     AE;
 is_ack_eliciting(Info) when is_map(Info) ->
