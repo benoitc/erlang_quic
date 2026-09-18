@@ -165,79 +165,79 @@ binary_hostname_test() ->
 %% Test that ACK ranges are maintained in descending order
 ack_ranges_descending_order_test() ->
     %% Start with empty, add packets out of order
-    R1 = quic_connection:add_to_ack_ranges(10, []),
+    R1 = quic_ack:add_to_ranges(10, []),
     ?assertEqual([{10, 10}], R1),
 
     %% Add lower packet - should go after
-    R2 = quic_connection:add_to_ack_ranges(5, R1),
+    R2 = quic_ack:add_to_ranges(5, R1),
     ?assertEqual([{10, 10}, {5, 5}], R2),
 
     %% Add packet in between (not adjacent) - should be inserted
-    R3 = quic_connection:add_to_ack_ranges(7, R2),
+    R3 = quic_ack:add_to_ranges(7, R2),
     ?assertEqual([{10, 10}, {7, 7}, {5, 5}], R3).
 
 %% Test that adjacent packets extend ranges
 ack_ranges_extend_upward_test() ->
-    R1 = quic_connection:add_to_ack_ranges(5, []),
+    R1 = quic_ack:add_to_ranges(5, []),
     ?assertEqual([{5, 5}], R1),
 
-    R2 = quic_connection:add_to_ack_ranges(6, R1),
+    R2 = quic_ack:add_to_ranges(6, R1),
     ?assertEqual([{5, 6}], R2),
 
-    R3 = quic_connection:add_to_ack_ranges(7, R2),
+    R3 = quic_ack:add_to_ranges(7, R2),
     ?assertEqual([{5, 7}], R3).
 
 %% Test that adjacent packets extend ranges downward
 ack_ranges_extend_downward_test() ->
-    R1 = quic_connection:add_to_ack_ranges(10, []),
+    R1 = quic_ack:add_to_ranges(10, []),
     ?assertEqual([{10, 10}], R1),
 
-    R2 = quic_connection:add_to_ack_ranges(9, R1),
+    R2 = quic_ack:add_to_ranges(9, R1),
     ?assertEqual([{9, 10}], R2),
 
-    R3 = quic_connection:add_to_ack_ranges(8, R2),
+    R3 = quic_ack:add_to_ranges(8, R2),
     ?assertEqual([{8, 10}], R3).
 
 %% Test duplicate packet numbers are handled
 ack_ranges_duplicate_test() ->
-    R1 = quic_connection:add_to_ack_ranges(5, []),
-    R2 = quic_connection:add_to_ack_ranges(6, R1),
+    R1 = quic_ack:add_to_ranges(5, []),
+    R2 = quic_ack:add_to_ranges(6, R1),
     ?assertEqual([{5, 6}], R2),
 
     %% Add duplicate - should not change
-    R3 = quic_connection:add_to_ack_ranges(5, R2),
+    R3 = quic_ack:add_to_ranges(5, R2),
     ?assertEqual([{5, 6}], R3),
 
-    R4 = quic_connection:add_to_ack_ranges(6, R3),
+    R4 = quic_ack:add_to_ranges(6, R3),
     ?assertEqual([{5, 6}], R4).
 
 %% Test that ranges merge when extending downward creates adjacency
 ack_ranges_merge_test() ->
     %% Create two separate ranges
-    R1 = quic_connection:add_to_ack_ranges(10, []),
-    R2 = quic_connection:add_to_ack_ranges(8, R1),
+    R1 = quic_ack:add_to_ranges(10, []),
+    R2 = quic_ack:add_to_ranges(8, R1),
     ?assertEqual([{10, 10}, {8, 8}], R2),
 
     %% Add packet 9 which should merge the two ranges
-    R3 = quic_connection:add_to_ack_ranges(9, R2),
+    R3 = quic_ack:add_to_ranges(9, R2),
     ?assertEqual([{8, 10}], R3).
 
 %% Test out-of-order packet arrival that previously caused negative gaps
 ack_ranges_out_of_order_no_negative_gap_test() ->
     %% This sequence caused badarg in quic_varint:encode due to negative Gap
     %% Receive packets: 10, 5, 6
-    R1 = quic_connection:add_to_ack_ranges(10, []),
+    R1 = quic_ack:add_to_ranges(10, []),
     ?assertEqual([{10, 10}], R1),
 
-    R2 = quic_connection:add_to_ack_ranges(5, R1),
+    R2 = quic_ack:add_to_ranges(5, R1),
     ?assertEqual([{10, 10}, {5, 5}], R2),
 
-    R3 = quic_connection:add_to_ack_ranges(6, R2),
+    R3 = quic_ack:add_to_ranges(6, R2),
     %% {5, 5} should extend to {5, 6}
     ?assertEqual([{10, 10}, {5, 6}], R3),
 
     %% Now convert to encoder format - should work without crash
-    EncoderRanges = quic_connection:convert_ack_ranges_for_encode(R3),
+    EncoderRanges = quic_ack:convert_ack_ranges_for_encode(R3),
     %% First range: LargestAcked=10, FirstRange=0 (10-10)
     %% Second range: Gap = 10 - 6 - 2 = 2, Range = 6 - 5 = 1
     ?assertEqual([{10, 0}, {2, 1}], EncoderRanges).
@@ -245,45 +245,44 @@ ack_ranges_out_of_order_no_negative_gap_test() ->
 %% Test complex out-of-order scenario
 ack_ranges_complex_out_of_order_test() ->
     %% Receive: 100, 90, 95, 92, 93, 94, 91
-    R1 = quic_connection:add_to_ack_ranges(100, []),
-    R2 = quic_connection:add_to_ack_ranges(90, R1),
-    R3 = quic_connection:add_to_ack_ranges(95, R2),
-    R4 = quic_connection:add_to_ack_ranges(92, R3),
-    R5 = quic_connection:add_to_ack_ranges(93, R4),
-    R6 = quic_connection:add_to_ack_ranges(94, R5),
+    R1 = quic_ack:add_to_ranges(100, []),
+    R2 = quic_ack:add_to_ranges(90, R1),
+    R3 = quic_ack:add_to_ranges(95, R2),
+    R4 = quic_ack:add_to_ranges(92, R3),
+    R5 = quic_ack:add_to_ranges(93, R4),
+    R6 = quic_ack:add_to_ranges(94, R5),
 
     %% Without 91: should have {92-95} and {90} separate since 91 is missing
     ?assertEqual([{100, 100}, {92, 95}, {90, 90}], R6),
 
     %% Now add 91 to fill the gap - should merge to {90-95}
-    R7 = quic_connection:add_to_ack_ranges(91, R6),
+    R7 = quic_ack:add_to_ranges(91, R6),
     ?assertEqual([{100, 100}, {90, 95}], R7),
 
     %% Convert to encoder format - should work
-    EncoderRanges = quic_connection:convert_ack_ranges_for_encode(R7),
+    EncoderRanges = quic_ack:convert_ack_ranges_for_encode(R7),
     %% Gap = 100 - 95 - 2 = 3, Range = 95 - 90 = 5
     ?assertEqual([{100, 0}, {3, 5}], EncoderRanges).
 
 %% Test that single range produces valid encoder format
 ack_ranges_single_range_encode_test() ->
     R = [{50, 55}],
-    EncoderRanges = quic_connection:convert_ack_ranges_for_encode(R),
+    EncoderRanges = quic_ack:convert_ack_ranges_for_encode(R),
     ?assertEqual([{55, 5}], EncoderRanges).
 
-%% Test convert_rest_ranges skips invalid gaps
+%% Test that a malformed trailing range is skipped rather than encoded
 ack_ranges_skip_invalid_gap_test() ->
-    %% If somehow we get malformed ranges, they should be skipped
-    %% This is a defensive test - malformed ranges shouldn't happen
-    %% with correct add_to_ack_ranges, but we test the safety net
-    Result = quic_connection:convert_rest_ranges(5, [{10, 20}]),
-    %% Gap = 5 - 20 - 2 = -17 (negative), should be skipped
-    ?assertEqual([], Result).
+    %% Malformed ranges shouldn't happen with correct add_to_ranges, but
+    %% we test the safety net. The leading {5, 5} sets PrevStart to 5, so
+    %% {10, 20} gives Gap = 5 - 20 - 2 = -17 (negative) and is skipped.
+    Result = quic_ack:convert_ack_ranges_for_encode([{5, 5}, {10, 20}]),
+    ?assertEqual([{5, 0}], Result).
 
 %% Test that large ranges are capped at MAX_ACK_RANGE (65536)
 ack_ranges_large_first_range_capped_test() ->
     %% Create a range that exceeds MAX_ACK_RANGE
     LargeRange = [{0, 70000}],
-    EncoderRanges = quic_connection:convert_ack_ranges_for_encode(LargeRange),
+    EncoderRanges = quic_ack:convert_ack_ranges_for_encode(LargeRange),
     %% FirstRange should be capped at 65536, not 70000
     [{LargestAcked, FirstRange}] = EncoderRanges,
     ?assertEqual(70000, LargestAcked),
@@ -296,7 +295,7 @@ ack_ranges_large_subsequent_range_skipped_test() ->
     %% Normal case: [{100, 105}, {0, 50}]
     %% Gap = 100 - 50 - 2 = 48, Range = 50 - 0 = 50 (valid)
     NormalRanges = [{100, 105}, {0, 50}],
-    NormalResult = quic_connection:convert_ack_ranges_for_encode(NormalRanges),
+    NormalResult = quic_ack:convert_ack_ranges_for_encode(NormalRanges),
     ?assertEqual([{105, 5}, {48, 50}], NormalResult).
 
 %% Test that skipping malformed range preserves PrevStart for next calculation
@@ -308,7 +307,7 @@ ack_ranges_skip_preserves_prevstart_test() ->
     %% After fix: when we skip due to overlap, we use PrevStart=100 for next range
     %% Gap for third = 100 - 85 - 2 = 13, Range = 85 - 80 = 5
     Ranges = [{100, 105}, {80, 85}],
-    Result = quic_connection:convert_ack_ranges_for_encode(Ranges),
+    Result = quic_ack:convert_ack_ranges_for_encode(Ranges),
     %% Gap = 100 - 85 - 2 = 13, Range = 85 - 80 = 5
     ?assertEqual([{105, 5}, {13, 5}], Result).
 
@@ -318,7 +317,7 @@ ack_ranges_encode_decode_roundtrip_test() ->
     Ranges = [{90, 100}, {70, 80}, {50, 60}],
 
     %% Convert to encoder format
-    EncoderRanges = quic_connection:convert_ack_ranges_for_encode(Ranges),
+    EncoderRanges = quic_ack:convert_ack_ranges_for_encode(Ranges),
 
     %% Verify format: [{LargestAcked, FirstRange}, {Gap, Range}, ...]
     [{LargestAcked, FirstRange} | RestRanges] = EncoderRanges,
@@ -339,7 +338,7 @@ ack_ranges_encode_decode_roundtrip_test() ->
 %% Test that empty ranges returns empty
 ack_ranges_convert_empty_test() ->
     %% This should not happen in practice, but test defensive behavior
-    ?assertError(function_clause, quic_connection:convert_ack_ranges_for_encode([])).
+    ?assertError(function_clause, quic_ack:convert_ack_ranges_for_encode([])).
 
 %%====================================================================
 %% Queue Limit Tests

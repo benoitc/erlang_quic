@@ -97,7 +97,7 @@ reference_pn_space_recv(PN, PNSpace, Now) ->
     PNSpace#pn_space{
         largest_recv = NewLargest,
         recv_time = Now,
-        ack_ranges = quic_connection:cap_ack_ranges(quic_connection:add_to_ack_ranges(PN, Ranges))
+        ack_ranges = quic_ack:cap_ack_ranges(quic_ack:add_to_ranges(PN, Ranges))
     }.
 
 empty_pn_space() ->
@@ -129,7 +129,7 @@ pn_space_run(Seed) ->
                     1 -> I * 2;
                     _ -> I * 2 + 1
                 end,
-            New1 = quic_connection:update_pn_space_recv(PN, New, I),
+            New1 = quic_ack:update_pn_space_recv(PN, New, I),
             Ref1 = reference_pn_space_recv(PN, Ref, I),
             ?assertEqual(Ref1, New1),
             {New1, Ref1}
