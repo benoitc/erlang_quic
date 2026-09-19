@@ -2782,6 +2782,11 @@ initial_crypto_budget(#state{dcid = DCID, scid = SCID, retry_token = Token} = St
     max(1, Ceiling - Overhead).
 
 %% Server: Send HANDSHAKE_DONE frame after receiving client Finished
+confirm_handshake(#state{loss_state = undefined} = State) ->
+    State;
+confirm_handshake(#state{loss_state = LossState} = State) ->
+    State#state{loss_state = quic_loss:on_handshake_confirmed(LossState)}.
+
 send_handshake_done(State) ->
     %% HANDSHAKE_DONE is frame type 0x1e with no payload
     send_frame(handshake_done, State).
@@ -4916,10 +4921,9 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
 %% HANDSHAKE_DONE: Server confirms handshake complete
 %% RFC 9000 Section 19.20: Only server can send, only in 1-RTT (app level)
 process_frame(app, handshake_done, #state{role = client} = State0) ->
-    %% Handshake confirmed: the retained Finished flight is done.
-    State = clear_hs_flight(State0),
-    %% Server confirmed handshake complete (client receiving from server)
-    State;
+    %% Handshake confirmed (RFC 9001 §4.1.2): the retained Finished flight
+    %% is done.
+    confirm_handshake(clear_hs_flight(State0));
 process_frame(app, handshake_done, #state{role = server} = State) ->
     %% RFC 9000 §19.20: clients MUST NOT send HANDSHAKE_DONE.
     ?LOG_WARNING(
@@ -6050,8 +6054,9 @@ process_tls_message(
                         resumption_secret = ResumptionSecret
                     },
 
-                    %% Send HANDSHAKE_DONE frame to client
-                    State2 = send_handshake_done(State1),
+                    %% The server's handshake is confirmed once complete
+                    %% (RFC 9001 §4.1.2); tell the client.
+                    State2 = send_handshake_done(confirm_handshake(State1)),
 
                     %% Send NewSessionTicket to enable session resumption
                     send_new_session_ticket(State2);
@@ -7447,7 +7452,7 @@ check_persistent_congestion([], _LossState, CCState) ->
 check_persistent_congestion(LostPackets, LossState, CCState) ->
     %% Extract packet number and time sent from lost packets
     LostInfo = [{P#sent_packet.pn, P#sent_packet.time_sent} || P <- LostPackets],
-    PTO = quic_loss:get_pto(LossState),
+    PTO = quic_loss:persistent_congestion_pto(LossState),
     case quic_cc:detect_persistent_congestion(LostInfo, PTO, CCState) of
         true ->
             quic_cc:on_persistent_congestion(CCState);
@@ -12250,9 +12255,8 @@ apply_peer_transport_params_internal(TransportParams, State) ->
     %% If true, peer has indicated they don't want to receive traffic from different addresses
     PeerDisableMigration = maps:get(disable_active_migration, TransportParams, false),
 
-    %% RFC 9000 §10.3: the peer's stateless_reset_token applies to the CID it
-    %% chose as its initial source CID — i.e. our current DCID. Record it so a
-    %% later stateless reset for this connection is recognised by
+    %% RFC 9000 §10.3: the peer's stateless_reset_token applies to its
+    %% sequence-0 CID. Record it so a later stateless reset is recognised by
     %% check_stateless_reset/2 (only servers send this, so only clients store it).
     PeerCIDPool = maybe_store_initial_reset_token(TransportParams, State),
 
@@ -12267,6 +12271,7 @@ apply_peer_transport_params_internal(TransportParams, State) ->
         }),
         peer_cid_pool = PeerCIDPool,
         peer_active_cid_limit = PeerCIDLimit,
+        loss_state = peer_ack_params(TransportParams, State#state.loss_state),
         %% Connection-level send limit
         max_data_remote = MaxDataRemote,
         %% Stream limits (how many streams we can open)
@@ -12277,6 +12282,17 @@ apply_peer_transport_params_internal(TransportParams, State) ->
         %% Migration disabled by peer (RFC 9000 Section 18.2)
         peer_disable_migration = PeerDisableMigration
     }.
+
+%% The peer's ACK timing, which loss detection needs to read its ACK Delay
+%% field and to size the PTO (RFC 9002 Sections 5.3 and 6.2.1).
+peer_ack_params(_TransportParams, undefined) ->
+    undefined;
+peer_ack_params(TransportParams, LossState) ->
+    quic_loss:set_peer_ack_params(
+        LossState,
+        maps:get(ack_delay_exponent, TransportParams, ?DEFAULT_ACK_DELAY_EXPONENT),
+        maps:get(max_ack_delay, TransportParams, ?DEFAULT_MAX_ACK_DELAY)
+    ).
 
 %% Record the peer's transport-parameter stateless_reset_token (RFC 9000 §10.3)
 %% against our current DCID (the peer's initial source CID), as a sequence-0
