@@ -103,6 +103,70 @@ minimum_limit_test() ->
     ).
 
 %%====================================================================
+%% The peer's handshake CID (RFC 9000 Section 18.2)
+%%
+%% active_connection_id_limit includes the CID the peer used during the
+%% handshake. These start from an empty peer pool, as the init paths
+%% leave it, so sequence 0 has to come from adopting the peer's Initial.
+%%====================================================================
+
+%% Server: a limit of 2 is the client's handshake CID plus one more.
+server_counts_peer_handshake_cid_test() ->
+    S0 = quic_connection_test_support:state_before_initial(server, 2),
+    S1 = quic_connection:adopt_peer_scid(<<"client-scid">>, S0),
+    S2 = new_cid(1, 0, <<1:64>>, S1),
+    ?assertEqual(undefined, quic_connection_test_support:close_reason(S2)),
+    S3 = new_cid(2, 0, <<2:64>>, S2),
+    ?assertMatch(
+        {transport, ?QUIC_CONNECTION_ID_LIMIT_ERROR, _},
+        quic_connection_test_support:close_reason(S3)
+    ).
+
+%% Client: the same, with the server's handshake CID.
+client_counts_peer_handshake_cid_test() ->
+    S0 = quic_connection_test_support:state_before_initial(client, 2),
+    S1 = quic_connection:adopt_peer_scid(<<"server-scid">>, S0),
+    S2 = new_cid(1, 0, <<1:64>>, S1),
+    ?assertEqual(undefined, quic_connection_test_support:close_reason(S2)),
+    S3 = new_cid(2, 0, <<2:64>>, S2),
+    ?assertMatch(
+        {transport, ?QUIC_CONNECTION_ID_LIMIT_ERROR, _},
+        quic_connection_test_support:close_reason(S3)
+    ).
+
+%% Adopting the peer's Initial records it as sequence 0 and switches to it.
+adopting_initial_installs_sequence_zero_test() ->
+    S0 = quic_connection_test_support:state_before_initial(client, 2),
+    S1 = quic_connection:adopt_peer_scid(<<"server-scid">>, S0),
+    ?assertEqual(<<"server-scid">>, quic_connection_test_support:state_get(S1, dcid)),
+    ?assertMatch(
+        [#cid_entry{seq_num = 0, cid = <<"server-scid">>, status = active}],
+        quic_connection_test_support:peer_cids(S1)
+    ).
+
+%% After a Retry the DCID is the Retry SCID, which has no sequence number.
+%% Sequence 0 is the SCID of the server Initial that follows, and it is
+%% the only entry.
+retry_scid_is_not_sequence_zero_test() ->
+    S0 = quic_connection_test_support:state_before_initial(client, 2),
+    S1 = quic_connection_test_support:state_set(S0, dcid, <<"retry-scid">>),
+    AfterRetry = quic_connection_test_support:state_set(S1, retry_scid, <<"retry-scid">>),
+    ?assertEqual([], quic_connection_test_support:peer_cids(AfterRetry)),
+    S2 = quic_connection:adopt_peer_scid(<<"server-scid">>, AfterRetry),
+    ?assertMatch(
+        [#cid_entry{seq_num = 0, cid = <<"server-scid">>}],
+        quic_connection_test_support:peer_cids(S2)
+    ).
+
+%% Later Initials do not re-adopt or duplicate sequence 0.
+adoption_happens_once_test() ->
+    S0 = quic_connection_test_support:state_before_initial(client, 2),
+    S1 = quic_connection:adopt_peer_scid(<<"server-scid">>, S0),
+    S2 = quic_connection:adopt_peer_scid(<<"other-scid">>, S1),
+    ?assertEqual(<<"server-scid">>, quic_connection_test_support:state_get(S2, dcid)),
+    ?assertEqual(1, length(quic_connection_test_support:peer_cids(S2))).
+
+%%====================================================================
 %% Retiring peer CIDs (RFC 9000 Section 19.16)
 %%====================================================================
 

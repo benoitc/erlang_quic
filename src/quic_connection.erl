@@ -4194,6 +4194,28 @@ handle_version_negotiation(_DCID, VersionsBin, #state{version = Ours}) ->
             {error, {version_negotiation, Versions}}
     end.
 
+%% Adopt the SCID of a peer Initial as our DCID, and record it as the peer's
+%% sequence-0 CID: it counts against the active_connection_id_limit we
+%% advertised (RFC 9000 §18.2). Only an Initial reaches here; a Retry SCID
+%% carries no sequence number and is handled in handle_valid_retry/3.
+adopt_peer_scid(PeerSCID, #state{dcid = <<>>} = State) ->
+    %% Server, first client Initial.
+    install_initial_peer_cid(PeerSCID, State);
+adopt_peer_scid(PeerSCID, #state{dcid = DCID} = State) when
+    DCID =:= State#state.original_dcid; DCID =:= State#state.retry_scid
+->
+    %% Client, first server Initial, after a Retry or not.
+    install_initial_peer_cid(PeerSCID, State);
+adopt_peer_scid(_PeerSCID, State) ->
+    State.
+
+install_initial_peer_cid(PeerSCID, #state{peer_cid_pool = Pool} = State) ->
+    Entry = #cid_entry{seq_num = 0, cid = PeerSCID, status = active},
+    State#state{
+        dcid = PeerSCID,
+        peer_cid_pool = lists:keystore(0, #cid_entry.seq_num, Pool, Entry)
+    }.
+
 %% Version list of a Version Negotiation packet. A trailing partial entry
 %% (a truncated or padded packet) is ignored.
 decode_versions(<<Version:32, Rest/binary>>) -> [Version | decode_versions(Rest)];
@@ -4227,26 +4249,7 @@ decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
     HeaderLen = byte_size(FullPacket) - byte_size(Rest4),
     <<Header:HeaderLen/binary, Payload/binary>> = FullPacket,
 
-    %% Update DCID from peer's SCID (their SCID becomes our DCID)
-    %% - Client: update dcid to server's SCID
-    %% - Server: update dcid to client's SCID
-    State1 =
-        case State#state.dcid of
-            <<>> ->
-                % First packet, set DCID
-                State#state{dcid = PeerSCID};
-            _ when
-                State#state.dcid =:= State#state.original_dcid orelse
-                    State#state.dcid =:= State#state.retry_scid
-            ->
-                % Client adopts the server's SCID after the first server
-                % packet. After a Retry the DCID is the Retry's SCID rather
-                % than the original, so accept that case too.
-                State#state{dcid = PeerSCID};
-            _ ->
-                % Already updated
-                State
-        end,
+    State1 = adopt_peer_scid(PeerSCID, State),
 
     %% Ensure we have enough data
     case byte_size(Payload) >= PayloadLen of
@@ -12280,21 +12283,17 @@ apply_peer_transport_params_internal(TransportParams, State) ->
 %% entry in the peer CID pool. This is what lets check_stateless_reset/2 match a
 %% reset for the initial connection ID — a steady connection never receives a
 %% NEW_CONNECTION_ID frame, so without this the token is never stored.
-maybe_store_initial_reset_token(TransportParams, #state{dcid = DCID, peer_cid_pool = Pool}) ->
-    case maps:get(stateless_reset_token, TransportParams, undefined) of
-        Token when is_binary(Token), byte_size(Token) =:= 16, is_binary(DCID) ->
-            case lists:keyfind(0, #cid_entry.seq_num, Pool) of
-                false ->
-                    Entry = #cid_entry{
-                        seq_num = 0,
-                        cid = DCID,
-                        stateless_reset_token = Token,
-                        status = active
-                    },
-                    [Entry | Pool];
-                _ ->
-                    Pool
-            end;
+maybe_store_initial_reset_token(TransportParams, #state{peer_cid_pool = Pool}) ->
+    %% Sequence 0 already exists, installed when the peer's Initial was
+    %% adopted; the token only fills it in.
+    Token = maps:get(stateless_reset_token, TransportParams, undefined),
+    case lists:keyfind(0, #cid_entry.seq_num, Pool) of
+        #cid_entry{stateless_reset_token = undefined} = Entry when
+            is_binary(Token), byte_size(Token) =:= 16
+        ->
+            lists:keystore(
+                0, #cid_entry.seq_num, Pool, Entry#cid_entry{stateless_reset_token = Token}
+            );
         _ ->
             Pool
     end.

@@ -29,6 +29,7 @@
 
 -export([
     peer_receives_issued_cids/1,
+    both_sides_hold_the_handshake_cid/1,
     issuance_respects_peer_limit/1,
     retire_replenishes_and_stays_issuable/1
 ]).
@@ -39,6 +40,7 @@ suite() ->
 all() ->
     [
         peer_receives_issued_cids,
+        both_sides_hold_the_handshake_cid,
         issuance_respects_peer_limit,
         retire_replenishes_and_stays_issuable
     ].
@@ -76,24 +78,38 @@ end_per_testcase(_TestCase, Config) ->
 %% Cases
 %%====================================================================
 
-%% The peer must end up holding connection IDs we issued. This is the
-%% case that fails when rotation is unreachable.
+%% The peer must end up holding connection IDs we issued, beyond the
+%% handshake CID it holds as sequence 0. This is the case that fails when
+%% rotation is unreachable.
 peer_receives_issued_cids(Config) ->
     {ok, _Name, Port} = start_server(Config, #{}),
     {ok, Conn} = connect_client(Port, #{}),
-    PeerCIDs = wait_for_peer_cids(Conn, 1, 2000),
+    PeerCIDs = wait_for_peer_cids(Conn, 2, 2000),
     quic:close(Conn, normal),
     ?assert(
-        PeerCIDs >= 1,
+        PeerCIDs >= 2,
         lists:flatten(
             io_lib:format(
-                "client holds ~p peer CIDs; the server issued none, so "
-                "NEW_CONNECTION_ID never reached it",
+                "client holds ~p peer CIDs; beyond the handshake CID the "
+                "server issued none, so NEW_CONNECTION_ID never reached it",
                 [PeerCIDs]
             )
         )
     ),
     {comment, io_lib:format("client holds ~p peer CIDs", [PeerCIDs])}.
+
+%% Each side holds the other's handshake CID as sequence 0 plus the one
+%% CID issued up to the default limit of 2. Without sequence 0 in the
+%% pool, the limit is enforced one CID too loosely on both roles.
+both_sides_hold_the_handshake_cid(Config) ->
+    {ok, Name, Port} = start_server(Config, #{}),
+    {ok, Conn} = connect_client(Port, #{}),
+    ClientHolds = wait_for_peer_cids(Conn, 2, 2000),
+    {ok, [ServerConn | _]} = quic:get_server_connections(Name),
+    ServerHolds = wait_for_peer_cids(ServerConn, 2, 2000),
+    quic:close(Conn, normal),
+    ?assertEqual({2, 2}, {ClientHolds, ServerHolds}),
+    {comment, io_lib:format("client ~p, server ~p", [ClientHolds, ServerHolds])}.
 
 %% active_connection_id_limit counts sequence 0, the handshake CID, so a
 %% limit of N means N active CIDs in total and not N plus the original.

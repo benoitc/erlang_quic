@@ -791,12 +791,12 @@ make_test_session_ticket(ServerName) ->
 %% stateless reset that the client then recognises.
 %%====================================================================
 
-%% The peer's transport-parameter reset token is stored against our DCID as a
-%% sequence-0 peer CID pool entry.
+%% The peer's transport-parameter reset token fills in the sequence-0 entry
+%% installed when its Initial was adopted.
 store_initial_reset_token_test() ->
     DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     Token = crypto:strong_rand_bytes(16),
-    State = quic_connection_test_support:state_for_reset(DCID, [], undefined),
+    State = adopted(DCID),
     Pool = quic_connection:maybe_store_initial_reset_token(
         #{stateless_reset_token => Token}, State
     ),
@@ -807,9 +807,23 @@ store_initial_reset_token_test() ->
 
 %% No token in the transport params leaves the pool untouched.
 store_initial_reset_token_absent_test() ->
+    State = adopted(<<1, 2, 3, 4, 5, 6, 7, 8>>),
+    ?assertEqual(
+        quic_connection_test_support:peer_cids(State),
+        quic_connection:maybe_store_initial_reset_token(#{}, State)
+    ).
+
+%% A token alone does not create sequence 0: that entry comes from the
+%% peer's Initial, so the limit accounting never depends on a token.
+store_initial_reset_token_needs_sequence_zero_test() ->
     DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     State = quic_connection_test_support:state_for_reset(DCID, [], undefined),
-    ?assertEqual([], quic_connection:maybe_store_initial_reset_token(#{}, State)).
+    ?assertEqual(
+        [],
+        quic_connection:maybe_store_initial_reset_token(
+            #{stateless_reset_token => crypto:strong_rand_bytes(16)}, State
+        )
+    ).
 
 %% An existing sequence-0 entry is not duplicated.
 store_initial_reset_token_idempotent_test() ->
@@ -845,14 +859,19 @@ recognize_stateless_reset_after_restart_test() ->
         DCID, quic_connection_test_support:state_with_secret(Secret)
     ),
     Pool = quic_connection:maybe_store_initial_reset_token(
-        #{stateless_reset_token => Advertised},
-        quic_connection_test_support:state_for_reset(DCID, [], undefined)
+        #{stateless_reset_token => Advertised}, adopted(DCID)
     ),
     State = quic_connection_test_support:state_for_reset(DCID, Pool, undefined),
     %% Restarted listener derives the token and builds a real reset packet.
     ListenerToken = quic_listener:compute_stateless_reset_token(Secret, DCID),
     Reset = quic_listener:build_stateless_reset(ListenerToken, 1200),
     ?assertEqual({error, stateless_reset}, quic_connection:check_stateless_reset(Reset, State)).
+
+%% A client that has adopted the server Initial carrying SCID as its DCID.
+adopted(SCID) ->
+    quic_connection:adopt_peer_scid(
+        SCID, quic_connection_test_support:state_before_initial(client, 2)
+    ).
 
 %% A short-header packet whose trailing bytes are not a known token is a plain
 %% decryption failure, not a stateless reset.
@@ -863,8 +882,7 @@ reject_non_reset_packet_test() ->
         DCID, quic_connection_test_support:state_with_secret(Secret)
     ),
     Pool = quic_connection:maybe_store_initial_reset_token(
-        #{stateless_reset_token => Advertised},
-        quic_connection_test_support:state_for_reset(DCID, [], undefined)
+        #{stateless_reset_token => Advertised}, adopted(DCID)
     ),
     State = quic_connection_test_support:state_for_reset(DCID, Pool, undefined),
     Bogus = <<64, (crypto:strong_rand_bytes(40))/binary>>,
