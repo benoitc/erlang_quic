@@ -68,6 +68,20 @@ covered(PN, Ranges) ->
 %% Blocked writes and window growth (#209, #233, #236)
 %%====================================================================
 
+%% When the burst budget runs out mid-chunk, the remainder goes back in
+%% front of the later chunk already queued. Appended instead, the drain
+%% round-robins between them and the stream goes out interleaved for the
+%% rest of the transfer, leaving the receiver reassembling nearly all of
+%% it. This is the ordering the e2e reassembly-buffer check guards, pinned
+%% here without depending on a lossless path.
+burst_remainder_requeued_in_front_test() ->
+    ?assertEqual([0, 1000], quic_connection_test_support:requeued_offsets(front)).
+
+%% A fresh send carries the highest offset and is appended. Also shows the
+%% helper can tell the two positions apart.
+fresh_send_requeued_at_back_test() ->
+    ?assertEqual([1000, 0], quic_connection_test_support:requeued_offsets(back)).
+
 large_write_test_() ->
     {timeout, 60, fun a_write_past_the_window_arrives_whole_and_in_order/0}.
 

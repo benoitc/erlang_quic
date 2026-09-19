@@ -46,6 +46,7 @@
     loss_state/1,
     update_spin_from_recv/3,
     state_for_cid_limit/1,
+    requeued_offsets/1,
     peer_cids/1,
     local_cids/1,
     ack_counters/1
@@ -479,6 +480,36 @@ state_for_cid_limit(Limit) ->
         peer_cid_pool = [#cid_entry{seq_num = 0, cid = DCID, status = active}],
         local_cid_pool = [#cid_entry{seq_num = 0, cid = SCID, status = active}]
     }.
+
+%% With the burst budget spent, hand a remainder at offset 0 to the
+%% chunked send step while a later chunk (offset 1000) is already queued
+%% on the same stream. Returns the offsets in the order the queue will
+%% send them. Where is the requeue position the caller computed: front
+%% for a remainder coming off the queue, back for a fresh send.
+-spec requeued_offsets(front | back) -> [non_neg_integer()].
+requeued_offsets(Where) ->
+    S0 = #state{
+        streams = #{0 => #stream_state{}},
+        burst_budget = 1,
+        burst_sent = 1
+    },
+    {ok, S1} = quic_connection:queue_stream_data(0, 1000, <<0:8000>>, false, S0, back),
+    Ctx = {chunked_ctx, 1200, 3, 1200, <<>>, <<>>, Where},
+    {S2, 0} = quic_connection:send_stream_chunked_step(0, 0, <<0:8000>>, false, S1, 0, Ctx),
+    %% The step arms a zero-delay continuation by messaging this process.
+    receive
+        {pacing_timeout, _} -> ok
+    after 0 -> ok
+    end,
+    queued_offsets(S2#state.send_queue).
+
+queued_offsets(PQ) ->
+    case quic_pqueue:out(PQ) of
+        {{value, {stream_data, _Sid, Offset, _Data, _Fin, _Size}}, Rest} ->
+            [Offset | queued_offsets(Rest)];
+        {empty, _} ->
+            []
+    end.
 
 %% The peer CIDs we currently hold, newest first.
 -spec peer_cids(#state{}) -> [#cid_entry{}].
