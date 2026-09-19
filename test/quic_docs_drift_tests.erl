@@ -18,6 +18,9 @@
 %% goal; an entry here needs a comment saying why it cannot be checked.
 -define(OPTION_ALLOWLIST, []).
 
+%% Headings whose bullet lists document option keys.
+-define(OPTION_HEADINGS, ["Options", "Extension Hooks"]).
+
 %%====================================================================
 %% Checks
 %%====================================================================
@@ -45,7 +48,7 @@ option_names_exist_test() ->
         documented_options(Root)
     ),
     ?debugFmt("option names: checked ~p", [Checked]),
-    ?assert(Checked > 50),
+    ?assert(Checked > 130),
     ?assertEqual([], lists:reverse(Problems)).
 
 %% Every `mod:fun/arity' in the docs must be exported by that module.
@@ -126,23 +129,50 @@ versions_agree_test() ->
 %% Documentation scanning
 %%====================================================================
 
-%% Option name from the first cell of a `| Option | Type | Default | ... |'
-%% row. Rows whose first cell is not a plain `name' (prose, separators,
-%% headers) are skipped.
+%% Options documented either as table rows or as bullets. Rows come from
+%% the first cell of a `| Option | Type | Default | ... |' table; rows whose
+%% first cell is not a plain `name' (prose, separators, headers) are
+%% skipped. Bullets come from `- `name` - ...' lines under an options
+%% heading.
 documented_options(Root) ->
     lists:flatmap(
         fun(File) ->
-            {_, Found} = lists:foldl(
+            Rel = rel(Root, File),
+            Lines = lines(File),
+            {_, Rows} = lists:foldl(
                 fun({Line, Text}, {InTable, Acc}) ->
-                    scan_option_row(rel(Root, File), Line, Text, InTable, Acc)
+                    scan_option_row(Rel, Line, Text, InTable, Acc)
                 end,
                 {false, []},
-                lines(File)
+                Lines
             ),
-            lists:reverse(Found)
+            {_, Bullets} = lists:foldl(
+                fun({Line, Text}, {InSection, Acc}) ->
+                    scan_option_bullet(Rel, Line, Text, InSection, Acc)
+                end,
+                {false, []},
+                Lines
+            ),
+            lists:reverse(Rows) ++ lists:reverse(Bullets)
         end,
         doc_files(Root)
     ).
+
+%% Bullets are options only under a heading that says so. The same
+%% `- `name` - ...' shape lists modules under other headings, and those
+%% are not option keys.
+scan_option_bullet(File, Line, Text, InSection, Acc) ->
+    case re:run(Text, "^#+\\s+(.*?)\\s*$", [{capture, [1], list}]) of
+        {match, [Heading]} ->
+            {lists:member(Heading, ?OPTION_HEADINGS), Acc};
+        nomatch when InSection ->
+            case re:run(Text, "^\\s*-\\s+`([a-z][a-z_0-9]*)`\\s*[-(]", [{capture, [1], list}]) of
+                {match, [Name]} -> {true, [{File, Line, Name} | Acc]};
+                nomatch -> {true, Acc}
+            end;
+        nomatch ->
+            {false, Acc}
+    end.
 
 %% Only rows of a table whose first column is "Option" are options. The
 %% same pipe-table shape carries qlog event names, module lists and state
