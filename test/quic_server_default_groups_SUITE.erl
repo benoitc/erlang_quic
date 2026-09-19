@@ -148,7 +148,11 @@ handshake(ServerOpts, ClientGroups) ->
                 {quic, Conn, {connected, I}} -> I
             after 10000 -> ct:fail("connect timeout")
             end,
-        Count = count_initials(0),
+        %% Put a 1-RTT datagram on the wire behind every Initial: the
+        %% bridge reports it after all of them, which closes the count.
+        {ok, StreamId} = quic:open_stream(Conn),
+        ok = quic:send_data(Conn, StreamId, <<"sync">>, true),
+        Count = count_initials(SocketRef, 0),
         ct:pal("server ~p / client ~p: negotiated ~p over ~p client Initial datagram(s)", [
             maps:get(groups, ServerOpts, default),
             ClientGroups,
@@ -180,11 +184,19 @@ connect_plain(Port, Opts) ->
             Err
     end.
 
-count_initials(N) ->
+%% Counts until the client's first 1-RTT datagram. The connection process
+%% calls the adapter for every datagram, so the bridge sees them in send
+%% order, and a client has dropped its Initial keys before it sends 1-RTT.
+%% Every Initial report therefore arrives before the 1-RTT one: the count
+%% is complete when the marker arrives, however slow the bridge is.
+%% Reports carry this handshake's ref: a case runs more than one
+%% handshake, and a bridge keeps reporting until it is stopped.
+count_initials(Ref, N) ->
     receive
-        {client_initial, Size} when Size >= ?PADDED_INITIAL -> count_initials(N + 1);
-        {client_initial, _Small} -> count_initials(N)
-    after 300 -> N
+        {client_initial, Ref, Size} when Size >= ?PADDED_INITIAL -> count_initials(Ref, N + 1);
+        {client_initial, Ref, _Small} -> count_initials(Ref, N);
+        {client_1rtt, Ref} -> N
+    after 10000 -> ct:fail("no 1-RTT datagram from the client")
     end.
 
 %%====================================================================
@@ -192,7 +204,8 @@ count_initials(N) ->
 %%====================================================================
 
 %% Relays between the client's socket adapter and a real UDP socket,
-%% reporting the size of every client Initial. The long-header form bit
+%% reporting the size of every client Initial and marking each 1-RTT
+%% datagram. The long-header form bit
 %% and packet-type bits are outside the header-protection mask, so the
 %% type is readable without keys.
 bridge_init(ServerIP, ServerPort, SocketRef, Reporter) ->
@@ -214,8 +227,10 @@ bridge_loop(#{sock := Sock, server := {ServerIP, ServerPort}} = Bridge) ->
         {send, _IP, _Port, Pkt} ->
             case header_type(Pkt) of
                 initial ->
-                    maps:get(reporter, Bridge) ! {client_initial, iolist_size(Pkt)};
-                _ ->
+                    report(Bridge, {client_initial, ref(Bridge), iolist_size(Pkt)});
+                short ->
+                    report(Bridge, {client_1rtt, ref(Bridge)});
+                other_long ->
                     ok
             end,
             ok = gen_udp:send(Sock, ServerIP, ServerPort, Pkt),
@@ -233,6 +248,10 @@ bridge_loop(#{sock := Sock, server := {ServerIP, ServerPort}} = Bridge) ->
         _ ->
             bridge_loop(Bridge)
     end.
+
+report(#{reporter := Reporter}, Msg) -> Reporter ! Msg.
+
+ref(#{socket_ref := SocketRef}) -> SocketRef.
 
 deliver(#{server := {ServerIP, ServerPort}, socket_ref := SocketRef}, Conn, Data) ->
     Conn ! {udp, SocketRef, ServerIP, ServerPort, Data}.
