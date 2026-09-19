@@ -78,7 +78,7 @@ end_per_testcase(_TestCase, _Config) ->
 server_download_coalesces_by_default(Config) ->
     {ok, Srv} = start_download_server(#{}),
     try
-        {Received, Delta} = run_download(Srv, ?DOWNLOAD_SIZE),
+        {Received, Delta, _ServerInfo} = run_download(Srv, ?DOWNLOAD_SIZE),
 
         ?assertEqual(?DOWNLOAD_SIZE, byte_size(Received)),
 
@@ -111,7 +111,7 @@ server_download_coalesces_by_default(Config) ->
 server_download_no_batching_when_disabled(Config) ->
     {ok, Srv} = start_download_server(#{server_send_batching => false}),
     try
-        {Received, Delta} = run_download(Srv, ?DOWNLOAD_SIZE),
+        {Received, Delta, _ServerInfo} = run_download(Srv, ?DOWNLOAD_SIZE),
 
         ?assertEqual(?DOWNLOAD_SIZE, byte_size(Received)),
 
@@ -133,7 +133,7 @@ opt_out_still_completes_transfer(Config) ->
     {ok, Srv} = start_download_server(#{server_send_batching => false}),
     try
         Size = ?DOWNLOAD_SIZE,
-        {Received, Delta} = run_download(Srv, Size),
+        {Received, Delta, _ServerInfo} = run_download(Srv, Size),
         ?assertEqual(Size, byte_size(Received)),
         %% Spot-check payload integrity: every byte should be 0x42 per
         %% send_download/3. Verify a sample of bytes rather than the
@@ -167,11 +167,8 @@ server_download_uses_gso_on_linux(Config) ->
             ?assertEqual(true, maps:get(gso, Caps, false)),
             {ok, Srv} = start_download_server(#{socket_backend => socket}),
             try
-                {Received, Delta} = run_download(Srv, ?DOWNLOAD_SIZE),
+                {Received, Delta, Info} = run_download(Srv, ?DOWNLOAD_SIZE),
                 ?assertEqual(?DOWNLOAD_SIZE, byte_size(Received)),
-
-                ServerPid = server_connection_pid(maps:get(name, Srv)),
-                {_State, Info} = quic_connection:get_state(ServerPid),
                 ?assertEqual(true, maps:get(send_gso_supported, Info)),
 
                 Flushes = maps:get(batch_flushes, Delta),
@@ -288,7 +285,10 @@ run_download(#{name := Name, port := Port}, Size) ->
         Received = collect_stream_data(Conn, StreamId, <<>>),
 
         {ok, After} = poll_stats(ServerPid),
-        {Received, stats_delta(After, Before)}
+        %% Read while the client is still connected: after the close
+        %% below the server connection may already have exited.
+        {_State, Info} = quic_connection:get_state(ServerPid),
+        {Received, stats_delta(After, Before), Info}
     after
         quic:close(Conn)
     end.
