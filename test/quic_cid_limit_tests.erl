@@ -103,6 +103,49 @@ minimum_limit_test() ->
     ).
 
 %%====================================================================
+%% Retiring peer CIDs (RFC 9000 Section 19.16)
+%%====================================================================
+
+%% retire_prior_to must be answered with RETIRE_CONNECTION_ID for every
+%% sequence it retires, or the peer keeps counting them against the
+%% limit it advertised.
+retire_prior_to_sends_retire_frames_test() ->
+    S0 = quic_connection_test_support:state_for_cid_limit(3),
+    S1 = new_cid(1, 0, <<1:64>>, S0),
+    S2 = new_cid(2, 2, <<2:64>>, S1),
+    ?assertEqual(undefined, quic_connection_test_support:close_reason(S2)),
+    ?assertEqual([0, 1], retired_seqs(S2)).
+
+%% Only sequences below retire_prior_to go; the frame's own CID stays.
+retire_frames_only_for_retired_seqs_test() ->
+    S0 = quic_connection_test_support:state_for_cid_limit(4),
+    S1 = new_cid(1, 0, <<1:64>>, S0),
+    S2 = new_cid(2, 0, <<2:64>>, S1),
+    S3 = new_cid(3, 2, <<3:64>>, S2),
+    ?assertEqual([0, 1], retired_seqs(S3)),
+    ?assertEqual(
+        [2, 3],
+        lists:sort([S || #cid_entry{seq_num = S} <- quic_connection_test_support:peer_cids(S3)])
+    ).
+
+%% A frame retiring nothing sends nothing.
+no_retirement_sends_nothing_test() ->
+    S0 = quic_connection_test_support:state_for_cid_limit(3),
+    S1 = new_cid(1, 0, <<1:64>>, S0),
+    ?assertEqual([], retired_seqs(S1)).
+
+%% When the CID we send with is retired, we switch to a live one before
+%% announcing the retirement: a packet still carrying the retired DCID
+%% would be unroutable at the peer.
+retiring_current_dcid_switches_it_test() ->
+    S0 = quic_connection_test_support:state_for_cid_limit(3),
+    ?assertEqual(<<"peer-cid">>, quic_connection_test_support:state_get(S0, dcid)),
+    S1 = new_cid(1, 0, <<1:64>>, S0),
+    S2 = new_cid(2, 2, <<2:64>>, S1),
+    ?assertEqual(<<2:64>>, quic_connection_test_support:state_get(S2, dcid)),
+    ?assertEqual([0, 1], retired_seqs(S2)).
+
+%%====================================================================
 %% Issuing our own CIDs
 %%====================================================================
 
@@ -132,6 +175,13 @@ new_cid(SeqNum, RetirePrior, CID, State) ->
     quic_connection:process_frame(
         app, {new_connection_id, SeqNum, RetirePrior, CID, Token}, State
     ).
+
+%% Sequence numbers of the RETIRE_CONNECTION_ID frames queued to send.
+retired_seqs(State) ->
+    [
+        Seq
+     || {retire_connection_id, Seq} <- quic_connection_test_support:pending_frames(State)
+    ].
 
 active_count(State) ->
     length([

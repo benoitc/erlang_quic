@@ -11799,7 +11799,9 @@ handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
 
 add_peer_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
     #state{peer_cid_pool = Pool, local_active_cid_limit = Limit} = State,
-    %% Mark CIDs below RetirePrior for retirement.
+    %% Capture what this frame retires before marking it: once marked, the
+    %% entries no longer read as active and nothing would announce them.
+    ToRetire = [S || #cid_entry{seq_num = S, status = active} <- Pool, S < RetirePrior],
     RetiredPool = [retire_if_below(RetirePrior, E) || E <- Pool],
     NewEntry = #cid_entry{
         seq_num = SeqNum,
@@ -11824,9 +11826,9 @@ add_peer_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
             %% whose token we discarded with the pruned pool entry - the
             %% connection goes irrecoverably deaf.
             State0 = maybe_replace_retired_dcid(State#state{peer_cid_pool = NewPool}),
-            %% Send RETIRE_CONNECTION_ID for the now-retired CIDs, then drop
-            %% them from the pool so it cannot grow without bound.
-            State1 = retire_peer_cids(RetirePrior, State0),
+            %% Announce the retirements, then drop the entries so the pool
+            %% cannot grow without bound.
+            State1 = send_retire_connection_ids(ToRetire, State0),
             prune_retired_peer_cids(State1)
     end.
 
@@ -11859,29 +11861,13 @@ retire_if_below(_RetirePrior, Entry) ->
 prune_retired_peer_cids(#state{peer_cid_pool = Pool} = State) ->
     State#state{peer_cid_pool = [E || #cid_entry{status = St} = E <- Pool, St =/= retired]}.
 
-%% Send RETIRE_CONNECTION_ID frames for CIDs that need to be retired
-%% RFC 9000 Section 19.16: Retires CIDs with sequence numbers less than RetirePrior
-retire_peer_cids(RetirePrior, #state{peer_cid_pool = Pool} = State) ->
-    %% Find CIDs to retire and send RETIRE_CONNECTION_ID for each
-    {NewPool, State1} = lists:foldl(
-        fun
-            (#cid_entry{seq_num = SeqNum, status = active} = Entry, {AccPool, AccState}) when
-                SeqNum < RetirePrior
-            ->
-                %% Send RETIRE_CONNECTION_ID frame
-                Frame = {retire_connection_id, SeqNum},
-                AccState1 = send_frame(Frame, AccState),
-                %% Mark as retired in pool
-                RetiredEntry = Entry#cid_entry{status = retired},
-                {[RetiredEntry | AccPool], AccState1};
-            (Entry, {AccPool, AccState}) ->
-                %% Keep as-is
-                {[Entry | AccPool], AccState}
-        end,
-        {[], State},
-        Pool
-    ),
-    State1#state{peer_cid_pool = lists:reverse(NewPool)}.
+%% RFC 9000 Section 19.16: one RETIRE_CONNECTION_ID per retired sequence.
+send_retire_connection_ids(SeqNums, State) ->
+    lists:foldl(
+        fun(SeqNum, Acc) -> send_frame({retire_connection_id, SeqNum}, Acc) end,
+        State,
+        lists:sort(SeqNums)
+    ).
 
 %% @doc Issue new connection IDs to the peer.
 %% RFC 9000 Section 5.1.1: Generates new CIDs with stateless reset tokens.

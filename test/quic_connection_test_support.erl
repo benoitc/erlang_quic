@@ -48,6 +48,7 @@
     state_for_cid_limit/1,
     peer_cids/1,
     local_cids/1,
+    pending_frames/1,
     ack_counters/1
 ]).
 
@@ -252,7 +253,8 @@ state_with_socket(State, Socket) -> State#state{socket = Socket}.
 %% Minimal #state{} carrying a caller-supplied loss tracker, for tests
 %% that need to observe what an incoming frame does to it.
 state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
-state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at.
+state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at;
+state_get(#state{} = S, dcid) -> S#state.dcid.
 
 state_set(#state{} = S, loss_state, V) -> S#state{loss_state = V};
 state_set(#state{} = S, pto_scheduled_at, V) -> S#state{pto_scheduled_at = V};
@@ -483,6 +485,10 @@ state_for_cid_limit(Limit) ->
 %% The peer CIDs we currently hold, newest first.
 -spec peer_cids(#state{}) -> [#cid_entry{}].
 peer_cids(#state{peer_cid_pool = Pool}) -> Pool.
+
+%% Frames queued in the pending coalesced packet, in send order.
+-spec pending_frames(#state{}) -> [term()].
+pending_frames(#state{pend_frames = Frames}) -> lists:reverse(Frames).
 
 %% The CIDs we have issued, including sequence 0.
 -spec local_cids(#state{}) -> [#cid_entry{}].
