@@ -46,7 +46,7 @@
 %%% Two walkthroughs trace the hot paths end to end, naming functions
 %%% rather than line numbers: docs/SEND_PATH.md and docs/RECV_PATH.md.
 %%%
-%%% `#state{}' lives in quic_connection_state.hrl and has 195 fields.
+%%% `#state{}' lives in quic_connection_state.hrl and has 194 fields.
 %%% When changing one, grep for the field name: most are touched in
 %%% several regions.
 %%%
@@ -2782,6 +2782,11 @@ initial_crypto_budget(#state{dcid = DCID, scid = SCID, retry_token = Token} = St
     max(1, Ceiling - Overhead).
 
 %% Server: Send HANDSHAKE_DONE frame after receiving client Finished
+confirm_handshake(#state{loss_state = undefined} = State) ->
+    State;
+confirm_handshake(#state{loss_state = LossState} = State) ->
+    State#state{loss_state = quic_loss:on_handshake_confirmed(LossState)}.
+
 send_handshake_done(State) ->
     %% HANDSHAKE_DONE is frame type 0x1e with no payload
     send_frame(handshake_done, State).
@@ -4194,6 +4199,28 @@ handle_version_negotiation(_DCID, VersionsBin, #state{version = Ours}) ->
             {error, {version_negotiation, Versions}}
     end.
 
+%% Adopt the SCID of a peer Initial as our DCID, and record it as the peer's
+%% sequence-0 CID: it counts against the active_connection_id_limit we
+%% advertised (RFC 9000 §18.2). Only an Initial reaches here; a Retry SCID
+%% carries no sequence number and is handled in handle_valid_retry/3.
+adopt_peer_scid(PeerSCID, #state{dcid = <<>>} = State) ->
+    %% Server, first client Initial.
+    install_initial_peer_cid(PeerSCID, State);
+adopt_peer_scid(PeerSCID, #state{dcid = DCID} = State) when
+    DCID =:= State#state.original_dcid; DCID =:= State#state.retry_scid
+->
+    %% Client, first server Initial, after a Retry or not.
+    install_initial_peer_cid(PeerSCID, State);
+adopt_peer_scid(_PeerSCID, State) ->
+    State.
+
+install_initial_peer_cid(PeerSCID, #state{peer_cid_pool = Pool} = State) ->
+    Entry = #cid_entry{seq_num = 0, cid = PeerSCID, status = active},
+    State#state{
+        dcid = PeerSCID,
+        peer_cid_pool = lists:keystore(0, #cid_entry.seq_num, Pool, Entry)
+    }.
+
 %% Version list of a Version Negotiation packet. A trailing partial entry
 %% (a truncated or padded packet) is ignored.
 decode_versions(<<Version:32, Rest/binary>>) -> [Version | decode_versions(Rest)];
@@ -4227,26 +4254,7 @@ decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
     HeaderLen = byte_size(FullPacket) - byte_size(Rest4),
     <<Header:HeaderLen/binary, Payload/binary>> = FullPacket,
 
-    %% Update DCID from peer's SCID (their SCID becomes our DCID)
-    %% - Client: update dcid to server's SCID
-    %% - Server: update dcid to client's SCID
-    State1 =
-        case State#state.dcid of
-            <<>> ->
-                % First packet, set DCID
-                State#state{dcid = PeerSCID};
-            _ when
-                State#state.dcid =:= State#state.original_dcid orelse
-                    State#state.dcid =:= State#state.retry_scid
-            ->
-                % Client adopts the server's SCID after the first server
-                % packet. After a Retry the DCID is the Retry's SCID rather
-                % than the original, so accept that case too.
-                State#state{dcid = PeerSCID};
-            _ ->
-                % Already updated
-                State
-        end,
+    State1 = adopt_peer_scid(PeerSCID, State),
 
     %% Ensure we have enough data
     case byte_size(Payload) >= PayloadLen of
@@ -4913,10 +4921,9 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
 %% HANDSHAKE_DONE: Server confirms handshake complete
 %% RFC 9000 Section 19.20: Only server can send, only in 1-RTT (app level)
 process_frame(app, handshake_done, #state{role = client} = State0) ->
-    %% Handshake confirmed: the retained Finished flight is done.
-    State = clear_hs_flight(State0),
-    %% Server confirmed handshake complete (client receiving from server)
-    State;
+    %% Handshake confirmed (RFC 9001 §4.1.2): the retained Finished flight
+    %% is done.
+    confirm_handshake(clear_hs_flight(State0));
 process_frame(app, handshake_done, #state{role = server} = State) ->
     %% RFC 9000 §19.20: clients MUST NOT send HANDSHAKE_DONE.
     ?LOG_WARNING(
@@ -6047,8 +6054,9 @@ process_tls_message(
                         resumption_secret = ResumptionSecret
                     },
 
-                    %% Send HANDSHAKE_DONE frame to client
-                    State2 = send_handshake_done(State1),
+                    %% The server's handshake is confirmed once complete
+                    %% (RFC 9001 §4.1.2); tell the client.
+                    State2 = send_handshake_done(confirm_handshake(State1)),
 
                     %% Send NewSessionTicket to enable session resumption
                     send_new_session_ticket(State2);
@@ -7444,7 +7452,7 @@ check_persistent_congestion([], _LossState, CCState) ->
 check_persistent_congestion(LostPackets, LossState, CCState) ->
     %% Extract packet number and time sent from lost packets
     LostInfo = [{P#sent_packet.pn, P#sent_packet.time_sent} || P <- LostPackets],
-    PTO = quic_loss:get_pto(LossState),
+    PTO = quic_loss:persistent_congestion_pto(LossState),
     case quic_cc:detect_persistent_congestion(LostInfo, PTO, CCState) of
         true ->
             quic_cc:on_persistent_congestion(CCState);
@@ -11799,7 +11807,9 @@ handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
 
 add_peer_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
     #state{peer_cid_pool = Pool, local_active_cid_limit = Limit} = State,
-    %% Mark CIDs below RetirePrior for retirement.
+    %% Capture what this frame retires before marking it: once marked, the
+    %% entries no longer read as active and nothing would announce them.
+    ToRetire = [S || #cid_entry{seq_num = S, status = active} <- Pool, S < RetirePrior],
     RetiredPool = [retire_if_below(RetirePrior, E) || E <- Pool],
     NewEntry = #cid_entry{
         seq_num = SeqNum,
@@ -11824,9 +11834,9 @@ add_peer_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
             %% whose token we discarded with the pruned pool entry - the
             %% connection goes irrecoverably deaf.
             State0 = maybe_replace_retired_dcid(State#state{peer_cid_pool = NewPool}),
-            %% Send RETIRE_CONNECTION_ID for the now-retired CIDs, then drop
-            %% them from the pool so it cannot grow without bound.
-            State1 = retire_peer_cids(RetirePrior, State0),
+            %% Announce the retirements, then drop the entries so the pool
+            %% cannot grow without bound.
+            State1 = send_retire_connection_ids(ToRetire, State0),
             prune_retired_peer_cids(State1)
     end.
 
@@ -11859,29 +11869,13 @@ retire_if_below(_RetirePrior, Entry) ->
 prune_retired_peer_cids(#state{peer_cid_pool = Pool} = State) ->
     State#state{peer_cid_pool = [E || #cid_entry{status = St} = E <- Pool, St =/= retired]}.
 
-%% Send RETIRE_CONNECTION_ID frames for CIDs that need to be retired
-%% RFC 9000 Section 19.16: Retires CIDs with sequence numbers less than RetirePrior
-retire_peer_cids(RetirePrior, #state{peer_cid_pool = Pool} = State) ->
-    %% Find CIDs to retire and send RETIRE_CONNECTION_ID for each
-    {NewPool, State1} = lists:foldl(
-        fun
-            (#cid_entry{seq_num = SeqNum, status = active} = Entry, {AccPool, AccState}) when
-                SeqNum < RetirePrior
-            ->
-                %% Send RETIRE_CONNECTION_ID frame
-                Frame = {retire_connection_id, SeqNum},
-                AccState1 = send_frame(Frame, AccState),
-                %% Mark as retired in pool
-                RetiredEntry = Entry#cid_entry{status = retired},
-                {[RetiredEntry | AccPool], AccState1};
-            (Entry, {AccPool, AccState}) ->
-                %% Keep as-is
-                {[Entry | AccPool], AccState}
-        end,
-        {[], State},
-        Pool
-    ),
-    State1#state{peer_cid_pool = lists:reverse(NewPool)}.
+%% RFC 9000 Section 19.16: one RETIRE_CONNECTION_ID per retired sequence.
+send_retire_connection_ids(SeqNums, State) ->
+    lists:foldl(
+        fun(SeqNum, Acc) -> send_frame({retire_connection_id, SeqNum}, Acc) end,
+        State,
+        lists:sort(SeqNums)
+    ).
 
 %% @doc Issue new connection IDs to the peer.
 %% RFC 9000 Section 5.1.1: Generates new CIDs with stateless reset tokens.
@@ -12261,9 +12255,8 @@ apply_peer_transport_params_internal(TransportParams, State) ->
     %% If true, peer has indicated they don't want to receive traffic from different addresses
     PeerDisableMigration = maps:get(disable_active_migration, TransportParams, false),
 
-    %% RFC 9000 §10.3: the peer's stateless_reset_token applies to the CID it
-    %% chose as its initial source CID — i.e. our current DCID. Record it so a
-    %% later stateless reset for this connection is recognised by
+    %% RFC 9000 §10.3: the peer's stateless_reset_token applies to its
+    %% sequence-0 CID. Record it so a later stateless reset is recognised by
     %% check_stateless_reset/2 (only servers send this, so only clients store it).
     PeerCIDPool = maybe_store_initial_reset_token(TransportParams, State),
 
@@ -12278,6 +12271,7 @@ apply_peer_transport_params_internal(TransportParams, State) ->
         }),
         peer_cid_pool = PeerCIDPool,
         peer_active_cid_limit = PeerCIDLimit,
+        loss_state = peer_ack_params(TransportParams, State#state.loss_state),
         %% Connection-level send limit
         max_data_remote = MaxDataRemote,
         %% Stream limits (how many streams we can open)
@@ -12289,26 +12283,33 @@ apply_peer_transport_params_internal(TransportParams, State) ->
         peer_disable_migration = PeerDisableMigration
     }.
 
+%% The peer's ACK timing, which loss detection needs to read its ACK Delay
+%% field and to size the PTO (RFC 9002 Sections 5.3 and 6.2.1).
+peer_ack_params(_TransportParams, undefined) ->
+    undefined;
+peer_ack_params(TransportParams, LossState) ->
+    quic_loss:set_peer_ack_params(
+        LossState,
+        maps:get(ack_delay_exponent, TransportParams, ?DEFAULT_ACK_DELAY_EXPONENT),
+        maps:get(max_ack_delay, TransportParams, ?DEFAULT_MAX_ACK_DELAY)
+    ).
+
 %% Record the peer's transport-parameter stateless_reset_token (RFC 9000 §10.3)
 %% against our current DCID (the peer's initial source CID), as a sequence-0
 %% entry in the peer CID pool. This is what lets check_stateless_reset/2 match a
 %% reset for the initial connection ID — a steady connection never receives a
 %% NEW_CONNECTION_ID frame, so without this the token is never stored.
-maybe_store_initial_reset_token(TransportParams, #state{dcid = DCID, peer_cid_pool = Pool}) ->
-    case maps:get(stateless_reset_token, TransportParams, undefined) of
-        Token when is_binary(Token), byte_size(Token) =:= 16, is_binary(DCID) ->
-            case lists:keyfind(0, #cid_entry.seq_num, Pool) of
-                false ->
-                    Entry = #cid_entry{
-                        seq_num = 0,
-                        cid = DCID,
-                        stateless_reset_token = Token,
-                        status = active
-                    },
-                    [Entry | Pool];
-                _ ->
-                    Pool
-            end;
+maybe_store_initial_reset_token(TransportParams, #state{peer_cid_pool = Pool}) ->
+    %% Sequence 0 already exists, installed when the peer's Initial was
+    %% adopted; the token only fills it in.
+    Token = maps:get(stateless_reset_token, TransportParams, undefined),
+    case lists:keyfind(0, #cid_entry.seq_num, Pool) of
+        #cid_entry{stateless_reset_token = undefined} = Entry when
+            is_binary(Token), byte_size(Token) =:= 16
+        ->
+            lists:keystore(
+                0, #cid_entry.seq_num, Pool, Entry#cid_entry{stateless_reset_token = Token}
+            );
         _ ->
             Pool
     end.

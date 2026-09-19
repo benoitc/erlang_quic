@@ -58,7 +58,12 @@
 
     %% PTO
     get_pto/1,
+    persistent_congestion_pto/1,
     on_pto_expired/1,
+
+    %% Peer transport parameters and handshake confirmation
+    set_peer_ack_params/3,
+    on_handshake_confirmed/1,
 
     %% Queries
     sent_packets/1,
@@ -117,8 +122,14 @@
     %% Bytes in flight
     bytes_in_flight = 0 :: non_neg_integer(),
 
-    %% Configuration
-    max_ack_delay = ?DEFAULT_MAX_ACK_DELAY :: non_neg_integer()
+    %% Configuration. The peer's values arrive with its transport
+    %% parameters (set_peer_ack_params/3).
+    max_ack_delay = ?DEFAULT_MAX_ACK_DELAY :: non_neg_integer(),
+    ack_delay_exponent = ?DEFAULT_ACK_DELAY_EXPONENT :: non_neg_integer(),
+
+    %% max_ack_delay only caps RTT samples and joins the PTO once the
+    %% handshake is confirmed (RFC 9002 Sections 5.3 and 6.2.1).
+    handshake_confirmed = false :: boolean()
 }).
 
 -opaque loss_state() :: #loss_state{}.
@@ -522,18 +533,25 @@ update_rtt(
         smoothed_rtt = SRTT,
         rtt_var = RTTVAR,
         min_rtt = MinRTT,
-        max_ack_delay = MaxAckDelay
+        max_ack_delay = MaxAckDelay,
+        handshake_confirmed = Confirmed
     } = State,
     LatestRTT,
-    AckDelay
+    AckDelay0
 ) ->
     %% Update min RTT
     NewMinRTT = min(MinRTT, LatestRTT),
 
-    %% Adjust for ACK delay
+    %% RFC 9002 Section 5.3: cap the peer's delay at its max_ack_delay only
+    %% once the handshake is confirmed, then adjust by that same value.
+    AckDelay =
+        case Confirmed of
+            true -> min(AckDelay0, MaxAckDelay);
+            false -> AckDelay0
+        end,
     AdjustedRTT =
-        case LatestRTT > NewMinRTT + AckDelay of
-            true -> LatestRTT - min(AckDelay, MaxAckDelay);
+        case LatestRTT >= NewMinRTT + AckDelay of
+            true -> LatestRTT - AckDelay;
             false -> LatestRTT
         end,
 
@@ -573,12 +591,21 @@ min_rtt(#loss_state{min_rtt = M}) -> M.
 %% @doc Calculate the Probe Timeout.
 %% PTO = smoothed_rtt + max(4 * rttvar, kGranularity) + max_ack_delay
 -spec get_pto(loss_state()) -> non_neg_integer().
-get_pto(#loss_state{
-    smoothed_rtt = SRTT,
-    rtt_var = RTTVAR,
-    max_ack_delay = MaxAckDelay,
-    pto_count = PTOCount
-}) ->
+get_pto(#loss_state{handshake_confirmed = true, max_ack_delay = MaxAckDelay} = State) ->
+    pto(State, MaxAckDelay);
+get_pto(#loss_state{} = State) ->
+    %% RFC 9002 Section 6.2.1: Initial and Handshake PTO use 0 for
+    %% max_ack_delay, and the application-data PTO is not armed until
+    %% the handshake is confirmed.
+    pto(State, 0).
+
+%% @doc The PTO the persistent congestion window is built from. It keeps
+%% max_ack_delay whatever the packet number space (RFC 9002 Section 7.6.1).
+-spec persistent_congestion_pto(loss_state()) -> non_neg_integer().
+persistent_congestion_pto(#loss_state{max_ack_delay = MaxAckDelay} = State) ->
+    pto(State, MaxAckDelay).
+
+pto(#loss_state{smoothed_rtt = SRTT, rtt_var = RTTVAR, pto_count = PTOCount}, MaxAckDelay) ->
     PTO = SRTT + max(4 * RTTVAR, ?GRANULARITY) + MaxAckDelay,
     %% Exponential backoff
     %% Exponential backoff, capped: uncapped doubling reaches tens of
@@ -587,6 +614,18 @@ get_pto(#loss_state{
     %% so a bounded worst-case interval costs nothing while keeping
     %% recovery inside real-world request timeouts.
     min(PTO bsl PTOCount, ?MAX_PTO_MS).
+
+%% @doc Adopt the peer's ack_delay_exponent and max_ack_delay (ms), from
+%% its transport parameters.
+-spec set_peer_ack_params(loss_state(), non_neg_integer(), non_neg_integer()) -> loss_state().
+set_peer_ack_params(#loss_state{} = State, Exponent, MaxAckDelay) ->
+    State#loss_state{ack_delay_exponent = Exponent, max_ack_delay = MaxAckDelay}.
+
+%% @doc Mark the handshake confirmed (RFC 9001 Section 4.1.2), from which
+%% point max_ack_delay caps RTT samples and joins the PTO.
+-spec on_handshake_confirmed(loss_state()) -> loss_state().
+on_handshake_confirmed(#loss_state{} = State) ->
+    State#loss_state{handshake_confirmed = true}.
 
 %% @doc Handle PTO expiration.
 -spec on_pto_expired(loss_state()) -> loss_state().
@@ -667,10 +706,10 @@ pn_in_ranges(PN, [_Range | Rest]) ->
     pn_in_ranges(PN, Rest).
 
 %% Convert encoded ACK delay to milliseconds
-ack_delay_to_ms(AckDelay, #loss_state{}) ->
-    %% AckDelay is in microseconds after shifting by ack_delay_exponent
-    %% Using default exponent of 3
-    (AckDelay bsl ?DEFAULT_ACK_DELAY_EXPONENT) div 1000.
+ack_delay_to_ms(AckDelay, #loss_state{ack_delay_exponent = Exp}) ->
+    %% The field counts units of 2^Exp microseconds, Exp being the
+    %% peer's ack_delay_exponent (RFC 9000 Section 19.3).
+    (AckDelay bsl Exp) div 1000.
 
 %%====================================================================
 %% Retransmission Helpers

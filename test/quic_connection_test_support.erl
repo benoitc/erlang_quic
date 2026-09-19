@@ -47,8 +47,10 @@
     update_spin_from_recv/3,
     state_for_cid_limit/1,
     requeued_offsets/1,
+    state_before_initial/2,
     peer_cids/1,
     local_cids/1,
+    pending_frames/1,
     ack_counters/1
 ]).
 
@@ -253,11 +255,14 @@ state_with_socket(State, Socket) -> State#state{socket = Socket}.
 %% Minimal #state{} carrying a caller-supplied loss tracker, for tests
 %% that need to observe what an incoming frame does to it.
 state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
-state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at.
+state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at;
+state_get(#state{} = S, dcid) -> S#state.dcid.
 
 state_set(#state{} = S, loss_state, V) -> S#state{loss_state = V};
 state_set(#state{} = S, pto_scheduled_at, V) -> S#state{pto_scheduled_at = V};
-state_set(#state{} = S, peer_active_cid_limit, V) -> S#state{peer_active_cid_limit = V}.
+state_set(#state{} = S, peer_active_cid_limit, V) -> S#state{peer_active_cid_limit = V};
+state_set(#state{} = S, dcid, V) -> S#state{dcid = V};
+state_set(#state{} = S, retry_scid, V) -> S#state{retry_scid = V}.
 
 -spec state_with_loss(quic_loss:loss_state()) -> #state{}.
 state_with_loss(LossState) ->
@@ -511,9 +516,35 @@ queued_offsets(PQ) ->
             []
     end.
 
+%% A state that has not yet seen the peer's Initial: the peer pool is
+%% empty, as both init paths leave it. Sequence 0 must come from
+%% quic_connection:adopt_peer_scid/2, never from the fixture.
+-spec state_before_initial(client | server, non_neg_integer()) -> #state{}.
+state_before_initial(Role, Limit) ->
+    DCID =
+        case Role of
+            server -> <<>>;
+            client -> <<"orig-dcid">>
+        end,
+    #state{
+        role = Role,
+        app_keys = undefined,
+        coalesce = true,
+        dcid = DCID,
+        original_dcid = DCID,
+        scid = <<"own-cid0">>,
+        local_active_cid_limit = Limit,
+        peer_cid_pool = [],
+        local_cid_pool = [#cid_entry{seq_num = 0, cid = <<"own-cid0">>, status = active}]
+    }.
+
 %% The peer CIDs we currently hold, newest first.
 -spec peer_cids(#state{}) -> [#cid_entry{}].
 peer_cids(#state{peer_cid_pool = Pool}) -> Pool.
+
+%% Frames queued in the pending coalesced packet, in send order.
+-spec pending_frames(#state{}) -> [term()].
+pending_frames(#state{pend_frames = Frames}) -> lists:reverse(Frames).
 
 %% The CIDs we have issued, including sequence 0.
 -spec local_cids(#state{}) -> [#cid_entry{}].

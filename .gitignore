@@ -35,3 +35,6 @@ doc/
 rebar3.crashdump
 /priv/quic_crypto_nif.so
 /c_src/build/
+
+# Downloaded by the Makefile
+/erlang.mk
