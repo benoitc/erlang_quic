@@ -46,7 +46,7 @@
 %%% Two walkthroughs trace the hot paths end to end, naming functions
 %%% rather than line numbers: docs/SEND_PATH.md and docs/RECV_PATH.md.
 %%%
-%%% `#state{}' lives in quic_connection_state.hrl and has 195 fields.
+%%% `#state{}' lives in quic_connection_state.hrl and has 194 fields.
 %%% When changing one, grep for the field name: most are touched in
 %%% several regions.
 %%%
