@@ -95,18 +95,21 @@ min_rtt_updates_test() ->
 
 initial_pto_test() ->
     State = quic_loss:new(),
-    PTO = quic_loss:get_pto(State),
-    %% Initial: smoothed_rtt=100, rtt_var=50, max_ack_delay=25
-    %% PTO = 100 + max(4*50, 1) + 25 = 100 + 200 + 25 = 325
-    ?assertEqual(325, PTO).
+    %% Initial: smoothed_rtt=100, rtt_var=50, max_ack_delay=25.
+    %% Before confirmation max_ack_delay is left out:
+    %% PTO = 100 + max(4*50, 1) = 300
+    ?assertEqual(300, quic_loss:get_pto(State)),
+    %% After it: PTO = 100 + 200 + 25 = 325
+    ?assertEqual(325, quic_loss:get_pto(quic_loss:on_handshake_confirmed(State))).
 
 pto_after_rtt_sample_test() ->
     State = quic_loss:new(),
     S1 = quic_loss:update_rtt(State, 50, 0),
-    PTO = quic_loss:get_pto(S1),
-    %% smoothed_rtt=50, rtt_var=25, max_ack_delay=25
-    %% PTO = 50 + max(4*25, 1) + 25 = 50 + 100 + 25 = 175
-    ?assertEqual(175, PTO).
+    %% smoothed_rtt=50, rtt_var=25, max_ack_delay=25.
+    %% Before confirmation: PTO = 50 + max(4*25, 1) = 150
+    ?assertEqual(150, quic_loss:get_pto(S1)),
+    %% After it: PTO = 50 + 100 + 25 = 175
+    ?assertEqual(175, quic_loss:get_pto(quic_loss:on_handshake_confirmed(S1))).
 
 pto_exponential_backoff_test() ->
     State = quic_loss:new(),
