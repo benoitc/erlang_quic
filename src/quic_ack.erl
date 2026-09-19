@@ -213,8 +213,9 @@ generate_ack(
     [{FirstStart, FirstEnd} | RestRanges] = Ranges,
     FirstAckRange = FirstEnd - FirstStart,
 
-    %% Convert remaining ranges to gap/range pairs
-    AckRanges = ranges_to_ack_ranges(FirstStart, RestRanges),
+    %% Convert remaining ranges to gap/range pairs, with the same guard the
+    %% connection's path applies to a malformed or oversized range.
+    AckRanges = convert_rest_ranges(FirstStart, RestRanges),
 
     AckFrame = {ack, Largest, AckDelayEncoded, FirstAckRange, AckRanges},
     {ok, AckFrame}.
@@ -559,7 +560,7 @@ ack_ranges_to_range_list(PrevStart, [{Gap, Range} | Rest]) ->
 %%====================================================================
 
 %% Convert the remaining ranges to gap/range pairs. A malformed range is
-%% skipped rather than encoded as a negative varint. Stateless half.
+%% skipped rather than encoded as a negative varint. Used by both halves.
 convert_rest_ranges(_PrevStart, []) ->
     [];
 convert_rest_ranges(PrevStart, [{Start, End} | Rest]) ->
@@ -572,17 +573,6 @@ convert_rest_ranges(PrevStart, [{Start, End} | Rest]) ->
             %% Keep PrevStart so the next gap stays correct.
             convert_rest_ranges(PrevStart, Rest)
     end.
-
-%% Convert internal ranges to ACK frame gap/range format. #ack_state{}
-%% half; the stateless one uses convert_rest_ranges/2, which also clamps.
-ranges_to_ack_ranges(_PrevStart, []) ->
-    [];
-ranges_to_ack_ranges(PrevStart, [{Start, End} | Rest]) ->
-    %% Gap is the number of missing packets between ranges - 1
-    Gap = PrevStart - End - 2,
-    %% Range is the number of packets in this range - 1
-    Range = End - Start,
-    [{Gap, Range} | ranges_to_ack_ranges(Start, Rest)].
 
 %% Does a sent packet record count as ACK-eliciting? Takes #sent_packet{},
 %% unlike is_ack_eliciting_frame/1, which classifies a decoded frame.
