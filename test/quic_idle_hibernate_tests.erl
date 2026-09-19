@@ -12,32 +12,34 @@
 hibernate_test_() ->
     {timeout, 30, fun an_idle_connection_shrinks/0}.
 
-stays_awake_test_() ->
-    {timeout, 30, fun hibernation_can_be_turned_off/0}.
-
-%% After the quiet period the process has run a fullsweep and parked:
-%% a hibernated process reports no current function and a small heap.
-%% Hibernation runs a fullsweep, so the handshake and transfer garbage
-%% stops being pinned to a heap that never collects on its own. The
-%% assertion is that collapse, not the internal function the process
-%% parks in, which differs across OTP releases.
+%% After the quiet period the process hibernates, which runs a fullsweep,
+%% so the handshake and transfer garbage stops being pinned to a heap that
+%% never collects on its own. The assertion is that collapse, not the
+%% function the process parks in, which varies by release: erlang:hibernate/3
+%% where gen_statem calls it, while on OTP 29 gen_statem calls
+%% erlang:hibernate/0 and the process reports a gen_statem internal. Polled
+%% rather than slept, so a slow runner that hibernates late still passes.
 an_idle_connection_shrinks() ->
     with_connection(#{hibernate_after => 200}, fun(Conn) ->
         Busy = heap_after_work(Conn),
-        timer:sleep(1500),
-        Idle = heap_words(Conn),
-        ?assert(Idle * 4 =< Busy)
+        ?assert(quic_test_wait:until(fun() -> heap_words(Conn) * 4 =< Busy end, 10000))
     end).
 
 %% `infinity' opts out, for a deployment that would rather keep the heap
-%% than pay a fullsweep on every quiet stretch.
-hibernation_can_be_turned_off() ->
-    with_connection(#{hibernate_after => infinity}, fun(Conn) ->
-        Busy = heap_after_work(Conn),
-        timer:sleep(1500),
-        Idle = heap_words(Conn),
-        ?assert(Idle * 4 > Busy)
-    end).
+%% than pay a fullsweep on every quiet stretch. The connection then gives
+%% gen_statem no hibernate_after at all. Checked at the option rather than
+%% on a live heap: a live check can only show the heap did not shrink,
+%% which any ordinary garbage collection can make false.
+infinity_passes_no_hibernate_after_test() ->
+    ?assertEqual([], quic_connection:statem_opts(#{hibernate_after => infinity})).
+
+explicit_hibernate_after_is_passed_through_test() ->
+    ?assertEqual(
+        [{hibernate_after, 200}], quic_connection:statem_opts(#{hibernate_after => 200})
+    ).
+
+default_hibernate_after_test() ->
+    ?assertEqual([{hibernate_after, 5000}], quic_connection:statem_opts(#{})).
 
 %% Echo enough data to leave real garbage on the heap, then report it.
 heap_after_work(Conn) ->
