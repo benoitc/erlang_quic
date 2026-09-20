@@ -81,8 +81,11 @@ Connections are `gen_statem` processes (`quic_connection.erl`) that progress thr
 
 ## Linting Notes
 
-Elvis rules are configured in `rebar.config`. Notable exceptions:
+Elvis rules are configured in `elvis.config`, the only lint configuration.
+`rebar3 lint` reads that file and ignores any `{elvis, ...}` entry in
+`rebar.config` while it exists, so an exemption added to `rebar.config` has
+no effect. Notable exceptions:
 - `quic_connection` is excluded from `dont_repeat_yourself`
 - Several modules (`quic_ack`, `quic_connection`, `quic_frame`, etc.) are excluded from `max_function_length`
-- `quic`, `quic_connection`, `quic_crypto`, `quic_stream` are excluded from `no_god_modules`
+- `quic`, `quic_connection`, `quic_crypto`, `quic_stream` and others are excluded from `no_god_modules`
 - Atom naming regex: `^[a-z](_?[a-zA-Z0-9]+)*(_SUITE)?$`
