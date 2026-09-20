@@ -51,6 +51,7 @@
     update_pacing_rate/2,
     update_mtu/2,
     cwnd/1,
+    initial_window/1,
     ssthresh/1,
     bytes_in_flight/1,
     can_send/2,
@@ -189,6 +190,10 @@
     ecn_ce_counter = 0 :: non_neg_integer(),
 
     %% Configuration
+    %% The window this controller started with. cwnd evolves away from
+    %% it, so without keeping it a reset cannot restore the configured
+    %% value.
+    initial_window = 0 :: non_neg_integer(),
     max_datagram_size = ?MAX_DATAGRAM_SIZE :: pos_integer(),
     minimum_window = 2400 :: non_neg_integer(),
     min_recovery_duration = 100 :: non_neg_integer(),
@@ -265,6 +270,7 @@ new(Opts) ->
         pacing_gain = ?STARTUP_PACING_GAIN,
         cwnd_gain = ?DEFAULT_CWND_GAIN,
         cwnd = InitialCwnd,
+        initial_window = InitialCwnd,
         initial_rtt = InitialRtt,
         max_bw = InitialMaxBw,
         pacing_rate = InitialPacingRate,
@@ -710,6 +716,10 @@ update_mtu(#bbr_state{max_datagram_size = OldMDS, minimum_window = OldMinWin} = 
 %% @doc Get the current congestion window.
 -spec cwnd(cc_state()) -> non_neg_integer().
 cwnd(#bbr_state{cwnd = Cwnd}) -> Cwnd.
+
+%% @doc The window this controller was configured with.
+-spec initial_window(cc_state()) -> non_neg_integer().
+initial_window(#bbr_state{initial_window = IW}) -> IW.
 
 %% @doc Get the slow start threshold.
 %% BBR doesn't use ssthresh; returns infinity.

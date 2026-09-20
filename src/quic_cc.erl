@@ -55,6 +55,7 @@
 %% API - Queries
 -export([
     cwnd/1,
+    initial_window/1,
     ssthresh/1,
     bytes_in_flight/1,
     can_send/2,
@@ -128,6 +129,7 @@
 
 %% Queries
 -callback cwnd(State :: term()) -> non_neg_integer().
+-callback initial_window(State :: term()) -> non_neg_integer().
 -callback ssthresh(State :: term()) -> non_neg_integer() | infinity.
 -callback bytes_in_flight(State :: term()) -> non_neg_integer().
 -callback can_send(State :: term(), Size :: non_neg_integer()) -> boolean().
@@ -271,6 +273,13 @@ update_mtu(#cc_wrapper{algorithm = Mod, state = State} = W, NewMTU) ->
 -spec cwnd(cc_state()) -> non_neg_integer().
 cwnd(#cc_wrapper{algorithm = Mod, state = State}) ->
     Mod:cwnd(State).
+
+%% @doc The congestion window this controller was configured with.
+%% cwnd evolves away from it, so a reset needs it to restore the
+%% configured value rather than a hardcoded default.
+-spec initial_window(cc_state()) -> non_neg_integer().
+initial_window(#cc_wrapper{algorithm = Mod, state = State}) ->
+    Mod:initial_window(State).
 
 %% @doc Get the slow start threshold.
 -spec ssthresh(cc_state()) -> non_neg_integer() | infinity.

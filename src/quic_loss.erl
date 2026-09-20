@@ -134,7 +134,13 @@
 }).
 
 -opaque loss_state() :: #loss_state{}.
--export_type([loss_state/0]).
+
+%% A packet number space (RFC 9000 Section 12.3). 0-RTT and 1-RTT share
+%% `app'. Named `space' rather than `pn_space' so specs mentioning both
+%% this and the `#pn_space{}' record stay readable.
+-type space() :: initial | handshake | app.
+
+-export_type([loss_state/0, space/0]).
 
 %% RFC 9002 §9.4 path-change reset: RTT and PTO state belong to the
 %% old path, but the sent-packet tracking must survive - dropping it

@@ -133,16 +133,20 @@ spent(Start) ->
 connect_through_bridge(Port, DropMs) ->
     ServerIP = {127, 0, 0, 1},
     SocketRef = make_ref(),
-    Bridge = spawn_link(fun() -> bridge_init(ServerIP, Port, SocketRef, DropMs) end),
+    Deadline = erlang:monotonic_time(millisecond) + DropMs,
+    Bridge = quic_test_bridge:start(#{
+        server => {ServerIP, Port},
+        socket_ref => SocketRef,
+        drop_in => fun(_Pkt, _N) ->
+            erlang:monotonic_time(millisecond) < Deadline
+        end
+    }),
     Adapter = #{
         send_fun => fun(IP, P, Pkt) ->
             Bridge ! {send, IP, P, Pkt},
             ok
         end,
-        close_fun => fun() ->
-            Bridge ! stop,
-            ok
-        end,
+        close_fun => fun() -> quic_test_bridge:stop(Bridge) end,
         local => {{127, 0, 0, 1}, 0},
         socket_ref => SocketRef
     },
@@ -153,49 +157,5 @@ connect_through_bridge(Port, DropMs) ->
         socket_adapter => Adapter
     },
     {ok, Conn} = quic:connect(<<"127.0.0.1">>, Port, Opts, self()),
-    Bridge ! {set_conn, Conn},
+    ok = quic_test_bridge:set_conn(Bridge, Conn),
     {Conn, Bridge}.
-
-bridge_init(ServerIP, ServerPort, SocketRef, DropMs) ->
-    {ok, Sock} = gen_udp:open(0, [binary, {active, true}]),
-    Deadline = erlang:monotonic_time(millisecond) + DropMs,
-    bridge_loop(#{
-        sock => Sock,
-        conn => undefined,
-        pending => [],
-        drop_until => Deadline,
-        server => {ServerIP, ServerPort},
-        socket_ref => SocketRef
-    }).
-
-bridge_loop(#{sock := Sock, server := {ServerIP, ServerPort}} = Bridge) ->
-    receive
-        {set_conn, Conn} ->
-            [deliver(Bridge, Conn, D) || D <- lists:reverse(maps:get(pending, Bridge))],
-            bridge_loop(Bridge#{conn := Conn, pending := []});
-        {send, _IP, _Port, Pkt} ->
-            ok = gen_udp:send(Sock, ServerIP, ServerPort, Pkt),
-            bridge_loop(Bridge);
-        {udp, Sock, _IP, _Port, Data} ->
-            case erlang:monotonic_time(millisecond) < maps:get(drop_until, Bridge) of
-                true ->
-                    bridge_loop(Bridge);
-                false ->
-                    case maps:get(conn, Bridge) of
-                        undefined ->
-                            bridge_loop(Bridge#{
-                                pending := [Data | maps:get(pending, Bridge)]
-                            });
-                        Conn ->
-                            deliver(Bridge, Conn, Data),
-                            bridge_loop(Bridge)
-                    end
-            end;
-        stop ->
-            gen_udp:close(Sock);
-        _ ->
-            bridge_loop(Bridge)
-    end.
-
-deliver(#{server := {ServerIP, ServerPort}, socket_ref := SocketRef}, Conn, Data) ->
-    Conn ! {udp, SocketRef, ServerIP, ServerPort, Data}.

@@ -617,13 +617,10 @@ init({server, Opts}) ->
     %% Initialize packet number spaces
     PNSpace = #pn_space{
         next_pn = 0,
-        largest_acked = undefined,
         largest_recv = undefined,
         recv_time = undefined,
         ack_ranges = [],
-        ack_eliciting_in_flight = 0,
-        loss_time = undefined,
-        sent_packets = #{}
+        ack_eliciting_in_flight = 0
     },
 
     %% Create connection reference (for internal use only)
@@ -999,13 +996,10 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% Initialize packet number spaces
     PNSpace = #pn_space{
         next_pn = 0,
-        largest_acked = undefined,
         largest_recv = undefined,
         recv_time = undefined,
         ack_ranges = [],
-        ack_eliciting_in_flight = 0,
-        loss_time = undefined,
-        sent_packets = #{}
+        ack_eliciting_in_flight = 0
     },
 
     %% Create connection reference (for internal use only)
@@ -4414,13 +4408,10 @@ handle_valid_retry(RetryToken, ServerSCID, State) ->
 reset_initial_pn_space(#state{pn_initial = #pn_space{next_pn = NextPN}} = State) ->
     PNSpace = #pn_space{
         next_pn = NextPN,
-        largest_acked = undefined,
         largest_recv = undefined,
         recv_time = undefined,
         ack_ranges = [],
-        ack_eliciting_in_flight = 0,
-        loss_time = undefined,
-        sent_packets = #{}
+        ack_eliciting_in_flight = 0
     },
     %% RFC 9002 §6.2.1: the Initials sent before the Retry can be treated as
     %% lost. Only Initials can have been sent at this point, so dropping the

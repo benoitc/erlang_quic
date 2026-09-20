@@ -156,13 +156,10 @@ state_with_pn_app(State, Largest) ->
     State#state{
         pn_app = #pn_space{
             next_pn = 0,
-            largest_acked = undefined,
             largest_recv = Largest,
             recv_time = 0,
             ack_ranges = [{0, Largest}],
-            ack_eliciting_in_flight = 0,
-            loss_time = undefined,
-            sent_packets = #{}
+            ack_eliciting_in_flight = 0
         },
         transport_params = #{max_ack_delay => 25}
     }.
@@ -424,13 +421,10 @@ coalesce_small_stream(DataSize) ->
 decimate_initial_state() ->
     PN = #pn_space{
         next_pn = 0,
-        largest_acked = undefined,
         largest_recv = undefined,
         recv_time = undefined,
         ack_ranges = [],
-        ack_eliciting_in_flight = 0,
-        loss_time = undefined,
-        sent_packets = #{}
+        ack_eliciting_in_flight = 0
     },
     #state{
         pn_app = PN,

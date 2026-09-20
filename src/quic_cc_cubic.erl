@@ -45,6 +45,7 @@
     update_pacing_rate/2,
     update_mtu/2,
     cwnd/1,
+    initial_window/1,
     ssthresh/1,
     bytes_in_flight/1,
     can_send/2,
@@ -158,6 +159,10 @@
     app_limited_start = 0 :: non_neg_integer(),
 
     %% Configuration
+    %% The window this controller started with. cwnd evolves away from
+    %% it, so without keeping it a reset cannot restore the configured
+    %% value.
+    initial_window :: non_neg_integer(),
     minimum_window :: non_neg_integer(),
     max_datagram_size :: pos_integer(),
     min_recovery_duration = 100 :: non_neg_integer(),
@@ -182,7 +187,7 @@
 -spec new(quic_cc:cc_opts()) -> cc_state().
 new(Opts) ->
     MaxDatagramSize = maps:get(max_datagram_size, Opts, ?MAX_DATAGRAM_SIZE),
-    DefaultWindow = initial_window(MaxDatagramSize),
+    DefaultWindow = default_initial_window(MaxDatagramSize),
     DefaultMinimumWindow = minimum_window(MaxDatagramSize),
     ConfiguredMinimumWindow =
         case maps:find(minimum_window, Opts) of
@@ -210,6 +215,7 @@ new(Opts) ->
     ),
     #cubic_state{
         cwnd = InitialWindow,
+        initial_window = InitialWindow,
         ssthresh = infinity,
         minimum_window = ConfiguredMinimumWindow,
         max_datagram_size = MaxDatagramSize,
@@ -983,6 +989,10 @@ update_mtu(#cubic_state{max_datagram_size = OldMDS, minimum_window = OldMinWin} 
 -spec cwnd(cc_state()) -> non_neg_integer().
 cwnd(#cubic_state{cwnd = Cwnd}) -> Cwnd.
 
+%% @doc The window this controller was configured with.
+-spec initial_window(cc_state()) -> non_neg_integer().
+initial_window(#cubic_state{initial_window = IW}) -> IW.
+
 %% @doc Get the slow start threshold.
 -spec ssthresh(cc_state()) -> non_neg_integer() | infinity.
 ssthresh(#cubic_state{ssthresh = SST}) -> SST.
@@ -1037,7 +1047,7 @@ refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now) ->
     min(MaxBurst, Tokens + Added).
 
 %% Calculate initial window (32 packets like quic-go)
-initial_window(MaxDatagramSize) ->
+default_initial_window(MaxDatagramSize) ->
     32 * MaxDatagramSize.
 
 %% Calculate minimum window (2 * max_datagram_size per RFC 9002)

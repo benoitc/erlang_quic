@@ -671,21 +671,28 @@
     frames :: [term()]
 }).
 
-%% Packet number space
+%% What the loss-detection timer needs that the loss state cannot hold:
+%% both facts depend on the role and on key availability (RFC 9002
+%% Appendix A.8). PeerCompletedAddressValidation is always true for a
+%% server; a client learns it from a Handshake ACK or from confirmation.
+-record(handshake_status, {
+    has_handshake_keys = false :: boolean(),
+    peer_completed_address_validation = false :: boolean()
+}).
+
+%% Packet number space.
+%%
+%% Send and receive bookkeeping only. Loss detection state lives in
+%% quic_loss, keyed by space there, so it has one owner.
 -record(pn_space, {
     %% Send state
     next_pn :: non_neg_integer(),
-    largest_acked :: non_neg_integer() | undefined,
 
     %% Receive state
     largest_recv :: non_neg_integer() | undefined,
     recv_time :: non_neg_integer() | undefined,
     ack_ranges :: [{non_neg_integer(), non_neg_integer()}],
-    ack_eliciting_in_flight :: non_neg_integer(),
-
-    %% Loss detection
-    loss_time :: non_neg_integer() | undefined,
-    sent_packets :: #{non_neg_integer() => #sent_packet{}}
+    ack_eliciting_in_flight :: non_neg_integer()
 }).
 
 %% QUIC packet
