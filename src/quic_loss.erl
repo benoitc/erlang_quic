@@ -71,7 +71,8 @@
     last_progress/1,
     pto_count/1,
     oldest_unacked/1,
-    has_rtt_sample/1
+    has_rtt_sample/1,
+    handshake_confirmed/1
 ]).
 
 %% Constants from RFC 9002
@@ -599,11 +600,15 @@ get_pto(#loss_state{} = State) ->
     %% the handshake is confirmed.
     pto(State, 0).
 
-%% @doc The PTO the persistent congestion window is built from. It keeps
-%% max_ack_delay whatever the packet number space (RFC 9002 Section 7.6.1).
+%% @doc The PTO the persistent congestion window is built from
+%% (RFC 9002 Section 7.6.1): max_ack_delay whatever the packet number space,
+%% and no backoff, so the window does not widen during the blackout it is
+%% meant to detect.
 -spec persistent_congestion_pto(loss_state()) -> non_neg_integer().
-persistent_congestion_pto(#loss_state{max_ack_delay = MaxAckDelay} = State) ->
-    pto(State, MaxAckDelay).
+persistent_congestion_pto(#loss_state{
+    smoothed_rtt = SRTT, rtt_var = RTTVAR, max_ack_delay = MaxAckDelay
+}) ->
+    SRTT + max(4 * RTTVAR, ?GRANULARITY) + MaxAckDelay.
 
 pto(#loss_state{smoothed_rtt = SRTT, rtt_var = RTTVAR, pto_count = PTOCount}, MaxAckDelay) ->
     PTO = SRTT + max(4 * RTTVAR, ?GRANULARITY) + MaxAckDelay,
@@ -673,6 +678,10 @@ oldest_unacked(#loss_state{sent_q = Q}) ->
 %% Returns false until the first ACK provides a real RTT measurement.
 -spec has_rtt_sample(loss_state()) -> boolean().
 has_rtt_sample(#loss_state{first_rtt_sample = HasSample}) -> HasSample.
+
+%% @doc Whether the handshake has been confirmed (RFC 9001 Section 4.1.2).
+-spec handshake_confirmed(loss_state()) -> boolean().
+handshake_confirmed(#loss_state{handshake_confirmed = Confirmed}) -> Confirmed.
 
 %%====================================================================
 %% Internal Functions
