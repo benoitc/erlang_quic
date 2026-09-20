@@ -48,6 +48,7 @@
     cwnd/1,
     initial_window/1,
     on_packets_discarded/2,
+    reset_for_retry/1,
     ssthresh/1,
     bytes_in_flight/1,
     can_send/2,
@@ -773,6 +774,21 @@ cwnd(#cc_state{cwnd = Cwnd}) -> Cwnd.
 -spec on_packets_discarded(cc_state(), non_neg_integer()) -> cc_state().
 on_packets_discarded(#cc_state{bytes_in_flight = B} = State, Bytes) ->
     State#cc_state{bytes_in_flight = max(0, B - Bytes)}.
+
+%% @doc Start over after a Retry, keeping every configured value.
+-spec reset_for_retry(cc_state()) -> cc_state().
+reset_for_retry(#cc_state{initial_window = IW} = State) ->
+    State#cc_state{
+        cwnd = IW,
+        bytes_in_flight = 0,
+        ssthresh = infinity,
+        in_recovery = false,
+        recovery_start_time = undefined,
+        first_sent_time = undefined,
+        ecn_ce_counter = 0,
+        pacing_tokens = State#cc_state.pacing_max_burst,
+        pacing_rate = 0
+    }.
 
 %% @doc The window this controller was configured with.
 -spec initial_window(cc_state()) -> non_neg_integer().

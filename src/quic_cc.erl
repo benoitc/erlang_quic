@@ -57,6 +57,7 @@
     cwnd/1,
     initial_window/1,
     on_packets_discarded/2,
+    reset_for_retry/1,
     ssthresh/1,
     bytes_in_flight/1,
     can_send/2,
@@ -132,6 +133,7 @@
 -callback cwnd(State :: term()) -> non_neg_integer().
 -callback initial_window(State :: term()) -> non_neg_integer().
 -callback on_packets_discarded(State :: term(), Bytes :: non_neg_integer()) -> State :: term().
+-callback reset_for_retry(State :: term()) -> State :: term().
 -callback ssthresh(State :: term()) -> non_neg_integer() | infinity.
 -callback bytes_in_flight(State :: term()) -> non_neg_integer().
 -callback can_send(State :: term(), Size :: non_neg_integer()) -> boolean().
@@ -283,6 +285,13 @@ cwnd(#cc_wrapper{algorithm = Mod, state = State}) ->
 -spec on_packets_discarded(cc_state(), non_neg_integer()) -> cc_state().
 on_packets_discarded(#cc_wrapper{algorithm = Mod, state = State} = W, Bytes) ->
     W#cc_wrapper{state = Mod:on_packets_discarded(State, Bytes)}.
+
+%% @doc Start the window over after a Retry (RFC 9002 Section 6.3),
+%% keeping the algorithm, MTU and configured windows. Rebuilding the
+%% controller instead would silently drop those.
+-spec reset_for_retry(cc_state()) -> cc_state().
+reset_for_retry(#cc_wrapper{algorithm = Mod, state = State} = W) ->
+    W#cc_wrapper{state = Mod:reset_for_retry(State)}.
 
 %% @doc The congestion window this controller was configured with.
 %% cwnd evolves away from it, so a reset needs it to restore the

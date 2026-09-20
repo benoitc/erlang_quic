@@ -19,8 +19,8 @@
 fresh_cwnd_is_the_initial_window_test() ->
     [
         ?assertEqual(
-            quic_cc:cwnd(quic_cc:new(#{cc_algorithm => Alg})),
-            quic_cc:initial_window(quic_cc:new(#{cc_algorithm => Alg})),
+            quic_cc:cwnd(quic_cc:new(#{algorithm => Alg})),
+            quic_cc:initial_window(quic_cc:new(#{algorithm => Alg})),
             atom_to_list(Alg)
         )
      || Alg <- [newreno, cubic, bbr]
@@ -33,7 +33,7 @@ configured_window_is_retained_test() ->
         ?assertEqual(
             65536,
             quic_cc:initial_window(
-                quic_cc:new(#{cc_algorithm => Alg, initial_window => 65536})
+                quic_cc:new(#{algorithm => Alg, initial_window => 65536})
             ),
             atom_to_list(Alg)
         )
@@ -43,7 +43,7 @@ configured_window_is_retained_test() ->
 %% The retained value survives cwnd moving away from it, which is the
 %% whole point: it is read after the connection has been running.
 retained_window_survives_cwnd_growth_test() ->
-    S0 = quic_cc:new(#{cc_algorithm => newreno, initial_window => 65536}),
+    S0 = quic_cc:new(#{algorithm => newreno, initial_window => 65536}),
     S1 = quic_cc:on_packet_sent(S0, 1200),
     S2 = quic_cc:on_packets_acked(S1, 1200),
     ?assertNotEqual(quic_cc:cwnd(S2), 0),

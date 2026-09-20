@@ -59,6 +59,7 @@
     %% PTO
     get_pto/2,
     discard_space/2,
+    reset_for_retry/2,
     get_pto_time_and_space/3,
     persistent_congestion_pto/1,
     on_pto_expired/1,
@@ -712,6 +713,42 @@ discard_space(Space, #loss_state{bytes_in_flight = InFlight} = State) ->
         State#loss_state{bytes_in_flight = max(0, InFlight - Bytes), pto_count = 0}
     ),
     {Cleared, Bytes}.
+
+%% @doc Reset recovery state after a Retry (RFC 9002 Section 6.3), and
+%% hand back the packets that were in flight so the caller can decide
+%% what to resend.
+%%
+%% They come back keyed by space: #sent_packet{} carries no space and
+%% packet numbers restart in each one, so a flat list could not tell an
+%% Initial packet from a 0-RTT one. Only the application entry is worth
+%% replaying; the Initial flight is rebuilt from the retained TLS state
+%% with the Retry token in it, so replaying it from here too would send
+%% the ClientHello twice.
+%%
+%% The RTT estimate goes back to its default rather than adopting the
+%% Initial-to-Retry sample, which RFC 9002 permits but does not require.
+-spec reset_for_retry(loss_state(), integer()) ->
+    {loss_state(), #{space() => [#sent_packet{}]}}.
+reset_for_retry(#loss_state{} = State, _Now) ->
+    Discarded = maps:from_list([
+        {Space, queue:to_list((pn(Space, State))#pn_loss.sent_q)}
+     || Space <- [initial, handshake, app]
+    ]),
+    Reset = State#loss_state{
+        initial = #pn_loss{},
+        handshake = #pn_loss{},
+        app = #pn_loss{},
+        latest_rtt = 0,
+        smoothed_rtt = ?DEFAULT_INITIAL_RTT,
+        rtt_var = ?DEFAULT_INITIAL_RTT div 2,
+        min_rtt = infinity,
+        first_rtt_sample = false,
+        pto_count = 0,
+        bytes_in_flight = 0,
+        outstanding_since = undefined,
+        time_of_last_ack = undefined
+    },
+    {Reset, Discarded}.
 
 %% @doc The PTO for one packet number space. max_ack_delay applies only
 %% to Application Data: the peer is expected not to delay Initial or

@@ -4507,11 +4507,38 @@ reset_initial_pn_space(#state{pn_initial = #pn_space{next_pn = NextPN}} = State)
         ack_ranges = [],
         ack_eliciting_in_flight = 0
     },
-    %% RFC 9002 §6.2.1: the Initials sent before the Retry can be treated as
-    %% lost. Only Initials can have been sent at this point, so dropping the
-    %% loss state clears them all rather than leaving bytes charged in flight
-    %% for packets that can never be acknowledged.
-    State#state{pn_initial = PNSpace, loss_state = quic_loss:new()}.
+    %% RFC 9002 Section 6.3: a Retry resets recovery and congestion state,
+    %% including the timers. RFC 9000 Section 17.2.5.3: the data that
+    %% carried is resent, under packet numbers that keep climbing. The
+    %% Initial flight is rebuilt from the retained TLS state with the
+    %% Retry token in it, so only 0-RTT is replayed from here.
+    cancel_timer(State#state.pto_timer),
+    {NewLossState, Discarded} = quic_loss:reset_for_retry(
+        State#state.loss_state, erlang:monotonic_time(millisecond)
+    ),
+    State1 = State#state{
+        pn_initial = PNSpace,
+        loss_state = NewLossState,
+        cc_state = quic_cc:reset_for_retry(State#state.cc_state),
+        pto_timer = undefined,
+        pto_scheduled_at = undefined,
+        pto_armed_at = undefined
+    },
+    requeue_early_data(maps:get(app, Discarded, []), State1).
+
+%% Replay 0-RTT a Retry discarded. It goes back through the
+%% retransmission path, not the fresh-send path: this data already
+%% consumed its flow-control credit when it first went out.
+requeue_early_data([], State) ->
+    State;
+requeue_early_data(Packets, State) ->
+    lists:foldl(
+        fun(#sent_packet{frames = Frames}, Acc) ->
+            send_retransmit_frames_cc(quic_loss:retransmittable_frames(Frames), Acc)
+        end,
+        State,
+        Packets
+    ).
 
 %% Check if a packet is a stateless reset (RFC 9000 Section 10.3)
 check_stateless_reset(Data, _State) when byte_size(Data) < 21 ->
