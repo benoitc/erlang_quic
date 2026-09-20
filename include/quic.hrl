@@ -575,6 +575,24 @@
     status = active :: active | retired
 }).
 
+%% Both connection ID pools, held in one #state{} field and owned by
+%% quic_cid. The limits cross over: the limit we advertise bounds how many
+%% of the peer's CIDs we retain, and the peer's bounds how many of ours we
+%% issue (RFC 9000 Section 5.1.1).
+-record(cid_pool_state, {
+    %% CIDs we issued to the peer, newest first, including our sequence 0
+    local = [] :: [#cid_entry{}],
+
+    %% CIDs the peer issued to us, newest first, including its sequence 0
+    peer = [] :: [#cid_entry{}],
+
+    %% Ours, advertised as active_connection_id_limit; bounds `peer'
+    local_active_limit = 2 :: non_neg_integer(),
+
+    %% The peer's, from its transport parameters; bounds `local'
+    peer_active_limit = 2 :: non_neg_integer()
+}).
+
 %% Stream state
 -record(stream_state, {
     id :: non_neg_integer(),

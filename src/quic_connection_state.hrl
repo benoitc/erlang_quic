@@ -375,17 +375,9 @@
     %% RFC 9000 Section 9.1: Only non-probing frames trigger migration
     has_non_probing_frame = false :: boolean(),
 
-    %% Connection ID Pool (RFC 9000 Section 5.1)
-    %% Our CIDs, starting with sequence 0 (the handshake CID) and
-    %% extended by NEW_CONNECTION_ID. The pool is the only source of
-    %% sequence numbers: see next_cid_seq/1.
-    local_cid_pool = [] :: [#cid_entry{}],
-    %% Peer's CIDs that we can use (received via NEW_CONNECTION_ID)
-    peer_cid_pool = [] :: [#cid_entry{}],
-    %% Local active CID limit - max peer CIDs we accept (advertised in our transport params)
-    local_active_cid_limit = 2 :: non_neg_integer(),
-    %% Peer's active CID limit - max CIDs we can issue to them (from their transport params)
-    peer_active_cid_limit = 2 :: non_neg_integer(),
+    %% Both connection ID pools and both active_connection_id_limits
+    %% (RFC 9000 Section 5.1), owned by quic_cid.
+    cid_pool_state = #cid_pool_state{} :: quic_cid:pool(),
 
     %% Peer certificate (received during TLS handshake)
     peer_cert :: binary() | undefined,

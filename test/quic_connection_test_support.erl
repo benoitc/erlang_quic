@@ -195,12 +195,12 @@ state_with_secret(Secret) ->
 
 %% Minimal client #state{} for stateless-reset recognition tests: a current DCID
 %% and an explicit peer CID pool.
--spec state_for_reset(binary(), [#cid_entry{}], binary() | undefined) -> #state{}.
+-spec state_for_reset(binary(), quic_cid:pool(), binary() | undefined) -> #state{}.
 state_for_reset(DCID, PeerCIDPool, Secret) ->
     #state{
         role = client,
         dcid = DCID,
-        peer_cid_pool = PeerCIDPool,
+        cid_pool_state = PeerCIDPool,
         stateless_reset_secret = Secret
     }.
 
@@ -258,11 +258,16 @@ state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
 state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at;
 state_get(#state{} = S, dcid) -> S#state.dcid.
 
-state_set(#state{} = S, loss_state, V) -> S#state{loss_state = V};
-state_set(#state{} = S, pto_scheduled_at, V) -> S#state{pto_scheduled_at = V};
-state_set(#state{} = S, peer_active_cid_limit, V) -> S#state{peer_active_cid_limit = V};
-state_set(#state{} = S, dcid, V) -> S#state{dcid = V};
-state_set(#state{} = S, retry_scid, V) -> S#state{retry_scid = V}.
+state_set(#state{} = S, loss_state, V) ->
+    S#state{loss_state = V};
+state_set(#state{} = S, pto_scheduled_at, V) ->
+    S#state{pto_scheduled_at = V};
+state_set(#state{} = S, peer_active_cid_limit, V) ->
+    S#state{cid_pool_state = quic_cid:set_peer_active_limit(S#state.cid_pool_state, V)};
+state_set(#state{} = S, dcid, V) ->
+    S#state{dcid = V};
+state_set(#state{} = S, retry_scid, V) ->
+    S#state{retry_scid = V}.
 
 -spec state_with_loss(quic_loss:loss_state()) -> #state{}.
 state_with_loss(LossState) ->
@@ -478,12 +483,10 @@ state_for_cid_limit(Limit) ->
         coalesce = true,
         dcid = DCID,
         scid = SCID,
-        local_active_cid_limit = Limit,
         %% Both pools carry sequence 0 the way the init paths build them:
         %% the peer's handshake CID and our own. Leaving our pool empty
         %% would let issuance look one CID short of the peer's limit.
-        peer_cid_pool = [#cid_entry{seq_num = 0, cid = DCID, status = active}],
-        local_cid_pool = [#cid_entry{seq_num = 0, cid = SCID, status = active}]
+        cid_pool_state = quic_cid:set_initial_peer_cid(quic_cid:new(SCID, Limit), DCID, undefined)
     }.
 
 %% With the burst budget spent, hand a remainder at offset 0 to the
@@ -533,14 +536,12 @@ state_before_initial(Role, Limit) ->
         dcid = DCID,
         original_dcid = DCID,
         scid = <<"own-cid0">>,
-        local_active_cid_limit = Limit,
-        peer_cid_pool = [],
-        local_cid_pool = [#cid_entry{seq_num = 0, cid = <<"own-cid0">>, status = active}]
+        cid_pool_state = quic_cid:new(<<"own-cid0">>, Limit)
     }.
 
 %% The peer CIDs we currently hold, newest first.
 -spec peer_cids(#state{}) -> [#cid_entry{}].
-peer_cids(#state{peer_cid_pool = Pool}) -> Pool.
+peer_cids(#state{cid_pool_state = Pool}) -> quic_cid:peer_entries(Pool).
 
 %% Frames queued in the pending coalesced packet, in send order.
 -spec pending_frames(#state{}) -> [term()].
@@ -548,7 +549,7 @@ pending_frames(#state{pend_frames = Frames}) -> lists:reverse(Frames).
 
 %% The CIDs we have issued, including sequence 0.
 -spec local_cids(#state{}) -> [#cid_entry{}].
-local_cids(#state{local_cid_pool = Pool}) -> Pool.
+local_cids(#state{cid_pool_state = Pool}) -> quic_cid:local_entries(Pool).
 
 %% ACK bookkeeping, for the functions that take and return #state{}.
 %% The timer reference comes back raw so a test can tell "still the same
