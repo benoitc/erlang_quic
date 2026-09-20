@@ -137,16 +137,6 @@
     %% one-shot flight; bumps after HRR so CH2 / ServerHello continue
     %% the stream (RFC 9001 §4.1.3).
     initial_tx_off = 0 :: non_neg_integer(),
-    %% Server handshake-flight retransmission: the ServerHello (with its
-    %% Initial CRYPTO offset) and the Handshake-level payload are kept
-    %% until the client's Finished arrives, and replayed on a backoff
-    %% timer. Initial/Handshake packets are not loss-tracked, so without
-    %% this a single lost flight wedges the handshake permanently: the
-    %% client's Initial retransmits only elicit ACKs once the server TLS
-    %% state has advanced.
-    server_flight = undefined :: undefined | {binary(), non_neg_integer(), binary()},
-    server_hs_rtx_timer = undefined :: undefined | reference(),
-    server_hs_rtx_attempts = 0 :: non_neg_integer(),
     %% Client-side: CH1 random + build opts, needed to rebuild CH2
     tls_ch1_random :: binary() | undefined,
     %% Client-side: the Certificate(+CertificateVerify)+Finished payload,

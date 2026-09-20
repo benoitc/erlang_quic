@@ -2031,8 +2031,12 @@ handle_common_event(cast, handle_timeout, _StateName, State) ->
 %% until the server confirms the handshake. Nothing else is guaranteed
 %% to be in flight once the statem has left `handshaking', so without
 %% this a Finished lost twice was never resent.
+%% `idle' is included because the early handshake runs there: a probe
+%% for the Initial or Handshake space fires before the state machine has
+%% reached `handshaking', and dropping it wedges the handshake.
 handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref} = State) when
-    Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
+    Ref =/= undefined andalso
+        (StateName =:= connected orelse StateName =:= handshaking orelse StateName =:= idle)
 ->
     case pto_due(State) of
         idle ->
@@ -2168,15 +2172,6 @@ handle_common_event(
         {ok, SS1} -> {keep_state, State#state{socket_state = SS1}};
         false -> {keep_state, State}
     end;
-handle_common_event(
-    info,
-    {server_hs_rtx, Ref},
-    _StateName,
-    #state{server_hs_rtx_timer = Ref, role = server} = State
-) ->
-    {keep_state, server_hs_retransmit(State#state{server_hs_rtx_timer = undefined})};
-handle_common_event(info, {server_hs_rtx, _Stale}, _StateName, State) ->
-    {keep_state, State};
 handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     %% EXIT signals are handled in terminate/3 callback
     %% Just ignore here - the process will terminate anyway if it's from parent
@@ -2394,10 +2389,7 @@ validate_psk(_Identity, _Cipher, _ClientHelloMsg, _State) ->
 %% Initial CRYPTO offset (non-zero only after a HelloRetryRequest).
 send_server_hello(ServerHelloMsg, State) ->
     Off = State#state.initial_tx_off,
-    State1 = State#state{
-        initial_tx_off = Off + byte_size(ServerHelloMsg),
-        server_flight = {ServerHelloMsg, Off, <<>>}
-    },
+    State1 = State#state{initial_tx_off = Off + byte_size(ServerHelloMsg)},
     %% Chunk across Initial packets: a hybrid ServerHello Initial is
     %% ~1225 bytes and no longer fits one datagram.
     {_Frames, NewState} = send_initial_crypto(ServerHelloMsg, Off, State1),
@@ -2662,15 +2654,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
 
     %% Send the flight, segmented so no datagram exceeds the peer's
     %% max_udp_payload_size (issue #134).
-    State2 = send_handshake_crypto(HandshakePayload, State1),
-    State3 =
-        case State2#state.server_flight of
-            {SH, SHOff, _} ->
-                State2#state{server_flight = {SH, SHOff, HandshakePayload}};
-            undefined ->
-                State2
-        end,
-    arm_server_hs_rtx(State3).
+    send_handshake_crypto(HandshakePayload, State1).
 
 %% @private Send a handshake CRYPTO payload as one or more packets,
 %% each sized to stay within max_udp_payload_size (RFC 9000 §14.1).
@@ -2924,7 +2908,7 @@ send_initial_packet(Payload, Frames, State) ->
         TokenLenEnc/binary,
         RetryToken/binary,
         % +16 for AEAD tag
-        (quic_varint:encode(byte_size(PaddedPayload) + PNLen + 16))/binary
+        (quic_varint:encode(iolist_size(PaddedPayload) + PNLen + 16))/binary
     >>,
 
     %% First byte: long header form/fixed bits, version-specific Initial
@@ -3106,7 +3090,7 @@ send_handshake_packet(Payload, Frames, State) ->
         DCID/binary,
         (byte_size(SCID)):8,
         SCID/binary,
-        (quic_varint:encode(byte_size(PaddedPayload) + PNLen + 16))/binary
+        (quic_varint:encode(iolist_size(PaddedPayload) + PNLen + 16))/binary
     >>,
     HeaderPrefix = <<FirstByte, HeaderBody/binary>>,
 
@@ -3531,49 +3515,6 @@ amp_flush_budget(#state{amp_deferred = [{Packet, Meta} | Rest]} = State) ->
         false ->
             State
     end.
-
-%% Arm (or re-arm) the server handshake-flight retransmit timer.
-arm_server_hs_rtx(#state{role = server, server_flight = {_, _, _}} = State) ->
-    case State#state.server_hs_rtx_attempts < ?HS_RTX_MAX_ATTEMPTS of
-        true ->
-            Delay = min(
-                ?HS_RTX_BASE_MS bsl State#state.server_hs_rtx_attempts, ?HS_RTX_MAX_MS
-            ),
-            Ref = make_ref(),
-            erlang:send_after(Delay, self(), {server_hs_rtx, Ref}),
-            State#state{server_hs_rtx_timer = Ref};
-        false ->
-            State#state{server_hs_rtx_timer = undefined}
-    end;
-arm_server_hs_rtx(State) ->
-    State.
-
-%% Replay the retained server flight: ServerHello at its original
-%% Initial CRYPTO offset plus the Handshake payload (offset 0). New
-%% packet numbers, identical crypto stream bytes, so the client's
-%% reassembly is byte-exact regardless of what it already received.
-server_hs_retransmit(#state{tls_state = ?TLS_HANDSHAKE_COMPLETE} = State) ->
-    State#state{server_flight = undefined};
-server_hs_retransmit(#state{server_flight = {SH, SHOff, HsPayload}} = State) ->
-    ?LOG_WARNING(
-        #{
-            what => server_handshake_flight_retransmit,
-            attempt => State#state.server_hs_rtx_attempts + 1
-        },
-        ?QUIC_LOG_META
-    ),
-    {_Frames, State1} = send_initial_crypto(SH, SHOff, State),
-    State2 =
-        case HsPayload of
-            <<>> -> State1;
-            _ -> send_handshake_crypto(HsPayload, State1)
-        end,
-    State3 = State2#state{
-        server_hs_rtx_attempts = State2#state.server_hs_rtx_attempts + 1
-    },
-    arm_server_hs_rtx(flush_dirty_timers(flush_socket_batch(State3)));
-server_hs_retransmit(State) ->
-    State.
 
 %% State-timeout action driving client Initial retransmission while the
 %% handshake is incomplete. Empty for the server, once connected, or once
@@ -6154,11 +6095,8 @@ process_tls_message(
                     ),
 
                     %% Application keys are already derived when server sent its Finished
-                    %% Mark handshake as complete; the retained flight is
-                    %% no longer needed for retransmission.
                     State1 = State#state{
                         tls_state = ?TLS_HANDSHAKE_COMPLETE,
-                        server_flight = undefined,
                         tls_transcript = Transcript,
                         resumption_secret = ResumptionSecret
                     },
@@ -8563,7 +8501,7 @@ send_zero_rtt_packet(Payload, Frames, EarlyKeys, State) ->
     DCIDLen = byte_size(DCID),
     SCIDLen = byte_size(SCID),
     % +16 for AEAD tag
-    PayloadLen = byte_size(PaddedPayload) + 16,
+    PayloadLen = iolist_size(PaddedPayload) + 16,
     LengthEncoded = quic_varint:encode(PNLen + PayloadLen),
     HeaderPrefix =
         <<FirstByte, Version:32, DCIDLen, DCID/binary, SCIDLen, SCID/binary, LengthEncoded/binary>>,
