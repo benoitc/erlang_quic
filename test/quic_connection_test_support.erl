@@ -267,7 +267,9 @@ state_set(#state{} = S, peer_active_cid_limit, V) ->
 state_set(#state{} = S, dcid, V) ->
     S#state{dcid = V};
 state_set(#state{} = S, retry_scid, V) ->
-    S#state{retry_scid = V}.
+    S#state{retry_scid = V};
+state_set(#state{} = S, transport_params, V) ->
+    S#state{transport_params = V}.
 
 -spec state_with_loss(quic_loss:loss_state()) -> #state{}.
 state_with_loss(LossState) ->

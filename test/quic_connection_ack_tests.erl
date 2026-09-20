@@ -171,6 +171,25 @@ arm_ack_timer_sets_a_timer_test() ->
         ct_fail_no_timer()
     end.
 
+%% The timer runs on the delay we advertise, not the one the peer
+%% advertises. max_ack_delay is an endpoint's own maximum (RFC 9000
+%% Section 18.2), so a peer asking for 2000 must not stretch our timer:
+%% it would hold ACKs for two seconds while that peer sizes its PTO on
+%% the 25 ms it has to assume for us.
+arm_ack_timer_ignores_the_peer_max_ack_delay_test() ->
+    S0 = quic_connection_test_support:state_set(
+        quic_connection_test_support:decimate_initial_state(),
+        transport_params,
+        #{max_ack_delay => 2000}
+    ),
+    S1 = quic_connection:arm_ack_timer(S0),
+    #{ack_timer := Ref} = quic_connection_test_support:ack_counters(S1),
+    receive
+        {send_delayed_ack, app, Ref} -> ok
+    after 500 ->
+        ct_fail_no_timer()
+    end.
+
 %% Arming twice must not start a second timer: the first reference stays,
 %% otherwise a stale fire would be indistinguishable from a live one.
 arm_ack_timer_is_idempotent_test() ->

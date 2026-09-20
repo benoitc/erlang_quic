@@ -7415,12 +7415,13 @@ flush_pending_delivery(#state{pend_deliver = {StreamId, Acc, Fin}, owner = Owner
     State#state{pend_deliver = none}.
 
 %% Arm the max_ack_delay timer if not already armed.
+%% The delay is our own advertised maximum, not the peer's: `transport_params'
+%% holds what the peer sent (RFC 9000 Section 18.2).
 arm_ack_timer(#state{ack_timer = Ref} = State) when Ref =/= undefined ->
     State;
 arm_ack_timer(#state{ack_timer = undefined} = State) ->
-    MaxAckDelay = maps:get(max_ack_delay, State#state.transport_params, 25),
     NewRef = make_ref(),
-    erlang:send_after(MaxAckDelay, self(), {send_delayed_ack, app, NewRef}),
+    erlang:send_after(?DEFAULT_MAX_ACK_DELAY, self(), {send_delayed_ack, app, NewRef}),
     State#state{ack_timer = NewRef}.
 
 %%====================================================================
