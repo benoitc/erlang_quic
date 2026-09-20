@@ -6661,6 +6661,35 @@ handle_hello_retry_request(
     end.
 
 %%====================================================================
+%% Handshake flight retransmission
+%%
+%% The client retains its Certificate(+CertificateVerify)+Finished flight
+%% and resends it until the handshake is confirmed. Nothing here is PMTU,
+%% where these two used to sit.
+%%====================================================================
+
+%% Arm the retransmission timer for the retained client Finished flight.
+%% RFC 9002 section 6.2: until the handshake is confirmed the client
+%% probes the handshake space, and the interval doubles on each attempt.
+arm_hs_flight_timer(#state{loss_state = LossState, hs_flight_tries = Tries} = State) ->
+    _ = cancel_timer(State#state.hs_flight_timer),
+    Base = max(?HS_FLIGHT_MIN_INTERVAL, quic_loss:get_pto(LossState)),
+    Timeout = min(?HS_FLIGHT_MAX_INTERVAL, Base bsl min(Tries, 4)),
+    Ref = make_ref(),
+    erlang:send_after(Timeout, self(), {hs_flight_timeout, Ref}),
+    State#state{hs_flight_timer = Ref}.
+
+%% The flight is acknowledged (HANDSHAKE_DONE, or a 1-RTT ack that only a
+%% server holding our Finished could have sent): stop resending it.
+clear_hs_flight(State) ->
+    _ = cancel_timer(State#state.hs_flight_timer),
+    State#state{
+        client_hs_flight = undefined,
+        hs_flight_timer = undefined,
+        hs_flight_tries = 0
+    }.
+
+%%====================================================================
 %% Internal Functions - Stream Processing
 %%====================================================================
 
@@ -12475,27 +12504,6 @@ set_pmtu_probe_timer(#state{pmtu_probe_timer = OldTimer, loss_state = LossState}
     Ref = make_ref(),
     erlang:send_after(Timeout, self(), {pmtu_probe_timeout, Ref}),
     State#state{pmtu_probe_timer = Ref}.
-
-%% Arm the retransmission timer for the retained client Finished flight.
-%% RFC 9002 section 6.2: until the handshake is confirmed the client
-%% probes the handshake space, and the interval doubles on each attempt.
-arm_hs_flight_timer(#state{loss_state = LossState, hs_flight_tries = Tries} = State) ->
-    _ = cancel_timer(State#state.hs_flight_timer),
-    Base = max(?HS_FLIGHT_MIN_INTERVAL, quic_loss:get_pto(LossState)),
-    Timeout = min(?HS_FLIGHT_MAX_INTERVAL, Base bsl min(Tries, 4)),
-    Ref = make_ref(),
-    erlang:send_after(Timeout, self(), {hs_flight_timeout, Ref}),
-    State#state{hs_flight_timer = Ref}.
-
-%% The flight is acknowledged (HANDSHAKE_DONE, or a 1-RTT ack that only a
-%% server holding our Finished could have sent): stop resending it.
-clear_hs_flight(State) ->
-    _ = cancel_timer(State#state.hs_flight_timer),
-    State#state{
-        client_hs_flight = undefined,
-        hs_flight_timer = undefined,
-        hs_flight_tries = 0
-    }.
 
 %% @doc Set the PMTU raise timer for periodic re-probing.
 %% Uses unique reference in message to detect stale timer events
