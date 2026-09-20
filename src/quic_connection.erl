@@ -12145,7 +12145,7 @@ validate_peer_transport_params(TransportParams, State) ->
     case validate_connection_id_params(TransportParams, State) of
         ok ->
             case validate_role_specific_params(TransportParams, State) of
-                ok -> validate_tp_ranges(TransportParams);
+                ok -> quic_tls:validate_transport_param_constraints(TransportParams);
                 Error -> Error
             end;
         Error ->
@@ -12166,29 +12166,6 @@ validate_role_specific_params(TransportParams, #state{role = server}) ->
     end;
 validate_role_specific_params(_TransportParams, #state{role = client}) ->
     ok.
-
-%% RFC 9000 Section 18.2: numeric transport parameters carry range
-%% constraints that an endpoint MUST treat as TRANSPORT_PARAMETER_ERROR.
-validate_tp_ranges(TP) ->
-    Checks = [
-        {max_udp_payload_size, fun(V) -> V >= 1200 end, max_udp_payload_size_too_small},
-        {ack_delay_exponent, fun(V) -> V =< 20 end, ack_delay_exponent_too_large},
-        {max_ack_delay, fun(V) -> V < 16384 end, max_ack_delay_too_large}
-    ],
-    run_tp_checks(Checks, TP).
-
-run_tp_checks([], _TP) ->
-    ok;
-run_tp_checks([{Key, Pred, ErrTag} | Rest], TP) ->
-    case maps:find(Key, TP) of
-        {ok, Value} ->
-            case Pred(Value) of
-                true -> run_tp_checks(Rest, TP);
-                false -> {error, {ErrTag, Value}}
-            end;
-        error ->
-            run_tp_checks(Rest, TP)
-    end.
 
 tp_reason_to_binary(Reason) ->
     list_to_binary(io_lib:format("~p", [Reason])).

@@ -51,6 +51,7 @@
     %% Transport parameters
     encode_transport_params/1,
     decode_transport_params/1,
+    validate_transport_param_constraints/1,
 
     %% Preferred address (RFC 9000 Section 9.6)
     encode_preferred_address/1,
@@ -743,12 +744,17 @@ decode_transport_params_loop(Data, Acc) ->
 %% RFC 9000 Section 18.2
 -spec validate_transport_params(map()) -> {ok, map()} | {error, term()}.
 validate_transport_params(Params) ->
-    case validate_tp_constraints(Params) of
+    case validate_transport_param_constraints(Params) of
         ok -> {ok, Params};
         {error, _} = Error -> Error
     end.
 
-validate_tp_constraints(Params) ->
+%% @doc Check the peer's transport parameters against the RFC 9000 §18.2
+%% bounds. Returns `ok' or the offending parameter; the caller decides what
+%% to do about it, since a connection defers its close until its own
+%% handshake flight has been sent.
+-spec validate_transport_param_constraints(map()) -> ok | {error, term()}.
+validate_transport_param_constraints(Params) ->
     %% RFC 9000 Section 18.2: active_connection_id_limit MUST be >= 2
     case maps:get(active_connection_id_limit, Params, 2) of
         N when N < 2 ->
