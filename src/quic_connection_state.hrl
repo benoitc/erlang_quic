@@ -41,14 +41,14 @@
     %% flushed when more is received or the address becomes validated.
     amp_rx = 0 :: non_neg_integer(),
     amp_tx = 0 :: non_neg_integer(),
-    amp_deferred = [] :: [iodata()],
-    %% Client-side: the Initial CRYPTO frame (ClientHello) buffered so a
-    %% stalled handshake can re-send it, and the retransmission attempt
-    %% count for backoff. See ?HS_RTX_* and retransmit_initial_flight/1.
-    %% Every CRYPTO chunk of the current Initial flight, in send order,
-    %% so the whole flight is replayed on retransmit -- a hybrid
-    %% (ML-KEM) ClientHello spans more than one Initial packet.
-    initial_crypto_frames = [] :: [binary()],
+    amp_deferred = [] :: [{iodata(), tuple()}],
+    %% Client-side: every CRYPTO chunk of the current Initial flight, in
+    %% send order, so a stalled handshake replays the whole flight -- a
+    %% hybrid (ML-KEM) ClientHello spans more than one Initial packet.
+    %% Each chunk is {Encoded, Decoded}: the wire bytes to replay and the
+    %% frame the loss tracker records. See ?HS_RTX_* and
+    %% retransmit_initial_flight/2.
+    initial_crypto_frames = [] :: [{binary(), term()}],
     hs_rtx_attempts = 0 :: non_neg_integer(),
     %% Server-side only. The Retry SCID to echo back as
     %% retry_source_connection_id (RFC 9000 §7.3) when this connection

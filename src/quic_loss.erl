@@ -58,6 +58,7 @@
 
     %% PTO
     get_pto/2,
+    discard_space/2,
     get_pto_time_and_space/3,
     persistent_congestion_pto/1,
     on_pto_expired/1,
@@ -690,6 +691,27 @@ min_rtt(#loss_state{min_rtt = M}) -> M.
 %%====================================================================
 %% Probe Timeout (RFC 9002 Section 6.2)
 %%====================================================================
+
+%% @doc Drop a packet number space whose keys are gone (RFC 9002
+%% Appendix A.11). Returns the bytes removed so the caller can subtract
+%% the same amount from congestion control, which keeps its own count.
+%%
+%% Without this the space keeps its packets in flight forever: nothing
+%% can acknowledge them, so they hold the connection's in-flight byte
+%% count above zero and keep winning the probe selector.
+-spec discard_space(space(), loss_state()) -> {loss_state(), non_neg_integer()}.
+discard_space(Space, #loss_state{bytes_in_flight = InFlight} = State) ->
+    P = pn(Space, State),
+    Bytes = lists:sum([
+        Sz
+     || #sent_packet{size = Sz, in_flight = true} <- queue:to_list(P#pn_loss.sent_q)
+    ]),
+    Cleared = set_pn(
+        Space,
+        #pn_loss{},
+        State#loss_state{bytes_in_flight = max(0, InFlight - Bytes), pto_count = 0}
+    ),
+    {Cleared, Bytes}.
 
 %% @doc The PTO for one packet number space. max_ack_delay applies only
 %% to Application Data: the peer is expected not to delay Initial or

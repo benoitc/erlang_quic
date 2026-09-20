@@ -47,6 +47,7 @@
     update_mtu/2,
     cwnd/1,
     initial_window/1,
+    on_packets_discarded/2,
     ssthresh/1,
     bytes_in_flight/1,
     can_send/2,
@@ -766,6 +767,12 @@ ecn_ce_counter(#cc_state{ecn_ce_counter = C}) -> C.
 %% @doc Get the current congestion window.
 -spec cwnd(cc_state()) -> non_neg_integer().
 cwnd(#cc_state{cwnd = Cwnd}) -> Cwnd.
+
+%% @doc Drop bytes for a discarded packet number space. Not a
+%% congestion event: no window or recovery change.
+-spec on_packets_discarded(cc_state(), non_neg_integer()) -> cc_state().
+on_packets_discarded(#cc_state{bytes_in_flight = B} = State, Bytes) ->
+    State#cc_state{bytes_in_flight = max(0, B - Bytes)}.
 
 %% @doc The window this controller was configured with.
 -spec initial_window(cc_state()) -> non_neg_integer().
