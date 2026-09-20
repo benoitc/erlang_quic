@@ -203,8 +203,6 @@
 %% Bounds on the client Finished retransmission interval. The floor keeps
 %% a near-zero PTO from spinning; the ceiling keeps a long RTT estimate
 %% from parking the flight past the idle timeout.
--define(HS_FLIGHT_MIN_INTERVAL, 100).
--define(HS_FLIGHT_MAX_INTERVAL, 3000).
 
 %% Max additional datagram messages drained from the mailbox in one
 %% connected-state receive pass (see drain_recv_msgs/2).
@@ -2033,20 +2031,6 @@ handle_common_event(cast, handle_timeout, _StateName, State) ->
 %% until the server confirms the handshake. Nothing else is guaranteed
 %% to be in flight once the statem has left `handshaking', so without
 %% this a Finished lost twice was never resent.
-handle_common_event(
-    info,
-    {hs_flight_timeout, Ref},
-    _StateName,
-    #state{hs_flight_timer = Ref, client_hs_flight = Flight, handshake_keys = HsKeys} = State
-) when Ref =/= undefined andalso Flight =/= undefined andalso HsKeys =/= undefined ->
-    State1 = send_handshake_crypto(Flight, State),
-    State2 = arm_hs_flight_timer(State1#state{
-        hs_flight_tries = State1#state.hs_flight_tries + 1
-    }),
-    {keep_state, flush_dirty_timers(flush_socket_batch(State2))};
-handle_common_event(info, {hs_flight_timeout, _Ref}, _StateName, State) ->
-    %% Stale timer, or the flight is already confirmed.
-    {keep_state, State};
 handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref} = State) when
     Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
 ->
@@ -5462,7 +5446,15 @@ app_ack_tail(AckedPackets, LostPackets, State1) ->
 
 handshake_ack_tail(Level, LostPackets, State1) ->
     State2 = retransmit_lost_handshake(Level, LostPackets, State1),
-    flush_dirty_timers(flush_socket_batch(State2#state{pto_dirty = true})).
+    State3 = note_handshake_ack(Level, State2),
+    flush_dirty_timers(flush_socket_batch(State3#state{pto_dirty = true})).
+
+%% A Handshake acknowledgement tells a client the server has processed a
+%% protected packet from it, so its address is validated.
+note_handshake_ack(handshake, #state{role = client} = State) ->
+    State#state{handshake_ack_received = true};
+note_handshake_ack(_Level, State) ->
+    State.
 
 %% A lost CRYPTO frame goes back out at the level it was sent from.
 %% Routing it through the application send path would encrypt it with
@@ -6110,10 +6102,7 @@ process_tls_message(
                     %% Combine Certificate(+CertificateVerify) and Finished into one payload
                     HandshakePayload = <<CertPayload/binary, ClientFinishedMsg/binary>>,
 
-                    State0a = arm_hs_flight_timer(State#state{
-                        client_hs_flight = HandshakePayload
-                    }),
-                    State1 = State0a#state{
+                    State1 = State#state{
                         tls_state = ?TLS_HANDSHAKE_COMPLETE,
                         client_hs_flight = HandshakePayload,
                         tls_transcript = <<Transcript2/binary, ClientFinishedMsg/binary>>,
@@ -6788,26 +6777,11 @@ handle_hello_retry_request(
 %% where these two used to sit.
 %%====================================================================
 
-%% Arm the retransmission timer for the retained client Finished flight.
-%% RFC 9002 section 6.2: until the handshake is confirmed the client
-%% probes the handshake space, and the interval doubles on each attempt.
-arm_hs_flight_timer(#state{loss_state = LossState, hs_flight_tries = Tries} = State) ->
-    _ = cancel_timer(State#state.hs_flight_timer),
-    Base = max(?HS_FLIGHT_MIN_INTERVAL, quic_loss:get_pto(LossState, handshake)),
-    Timeout = min(?HS_FLIGHT_MAX_INTERVAL, Base bsl min(Tries, 4)),
-    Ref = make_ref(),
-    erlang:send_after(Timeout, self(), {hs_flight_timeout, Ref}),
-    State#state{hs_flight_timer = Ref}.
-
 %% The flight is acknowledged (HANDSHAKE_DONE, or a 1-RTT ack that only a
-%% server holding our Finished could have sent): stop resending it.
+%% server holding our Finished could have sent): stop holding it for the
+%% handshake-space probe to pick up.
 clear_hs_flight(State) ->
-    _ = cancel_timer(State#state.hs_flight_timer),
-    State#state{
-        client_hs_flight = undefined,
-        hs_flight_timer = undefined,
-        hs_flight_tries = 0
-    }.
+    State#state{client_hs_flight = undefined}.
 
 %%====================================================================
 %% Internal Functions - Stream Processing
@@ -10506,28 +10480,15 @@ complete_fin_reclaims(#state{pending_fin_reclaim = P} = State) ->
         P
     ).
 
-handle_pto_timeout(#state{loss_state = LossState} = State) ->
+handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
     %% Increment PTO count
     NewLossState = quic_loss:on_pto_expired(LossState),
     State1 = State#state{loss_state = NewLossState},
 
-    %% RFC 9002 §6.2.1: until the handshake is confirmed the PTO probes
-    %% the handshake space too. The retained Finished flight is exactly
-    %% that: a client whose Finished was lost against a server that has
-    %% stopped retransmitting its own flight would otherwise probe only
-    %% 1-RTT data the server cannot act on before handshake completion.
-    State1a =
-        case State1 of
-            #state{role = client, client_hs_flight = Flight, handshake_keys = HsKeys} when
-                Flight =/= undefined, HsKeys =/= undefined
-            ->
-                send_handshake_crypto(Flight, State1);
-            _ ->
-                State1
-        end,
-
-    %% Send probe packet (retransmit oldest unacked or send PING)
-    State2 = send_probe_packet(State1a),
+    %% The probe goes out in the space the timer was armed for: at any
+    %% other encryption level the peer cannot act on it, and before
+    %% confirmation it could not even decrypt it.
+    State2 = send_probe_packet(Space, State1),
 
     %% Probes use the control allowance, so retry any CC-deferred control
     %% retransmits here too (they are not in sent_q for the probe to pick up).
@@ -10546,10 +10507,10 @@ handle_pto_timeout(#state{loss_state = LossState} = State) ->
 %% packets are outstanding. Handshake-space recovery drives progress
 %% until the keys arrive; sending nothing here avoids building an app
 %% packet without keys.
-send_probe_packet(#state{app_keys = undefined} = State) ->
+send_probe_packet(app, #state{app_keys = undefined} = State) ->
     State;
-send_probe_packet(State) ->
-    case get_oldest_unacked_frames(State) of
+send_probe_packet(app, State) ->
+    case get_oldest_unacked_frames(app, State) of
         {ok, Frames} ->
             %% Retransmit oldest data as the probe, cwnd-exempt
             send_retransmit_frames_cc(Frames, State, probe);
@@ -10557,12 +10518,22 @@ send_probe_packet(State) ->
             %% No data to retransmit, send PING (always allowed as control)
             Payload = quic_frame:encode(ping),
             send_app_packet_internal(Payload, [ping], State)
+    end;
+send_probe_packet(Space, State) ->
+    %% A handshake probe replays that space's oldest CRYPTO, or a PING at
+    %% the same level when there is nothing outstanding, which is what
+    %% the anti-deadlock timer arms for.
+    case get_oldest_unacked_frames(Space, State) of
+        {ok, Frames} ->
+            lists:foldl(fun(F, Acc) -> send_at_level(Space, F, Acc) end, State, Frames);
+        none ->
+            send_at_level(Space, ping, State)
     end.
 
 %% Get frames from the oldest unacked packet for probe retransmission
 %% Uses cached oldest_unacked from loss_state for O(1) lookup
-get_oldest_unacked_frames(#state{loss_state = LossState}) ->
-    case quic_loss:oldest_unacked(app, LossState) of
+get_oldest_unacked_frames(Space, #state{loss_state = LossState}) ->
+    case quic_loss:oldest_unacked(Space, LossState) of
         none ->
             none;
         {ok, #sent_packet{frames = Frames}} ->
@@ -10605,31 +10576,58 @@ set_pto_timer(
         pto_armed_at = ArmedAt
     } = State
 ) ->
-    case quic_loss:bytes_in_flight(LossState) > 0 of
-        true ->
-            %% The armed timer is for application data, but before
-            %% confirmation it is sized with max_ack_delay 0, which is
-            %% Initial and Handshake timing. That inversion is the
-            %% defect; it is preserved here and removed once Initial and
-            %% Handshake sends are registered and this call becomes
-            %% quic_loss:get_pto_time_and_space/3.
-            PTO =
-                case quic_loss:handshake_confirmed(LossState) of
-                    true -> quic_loss:get_pto(LossState, app);
-                    false -> quic_loss:get_pto(LossState, handshake)
-                end,
-            Now = erlang:monotonic_time(millisecond),
-            NewDeadline = Now + PTO,
-            case OldTimer =/= undefined andalso NewDeadline + ?PTO_RESET_TOLERANCE_MS >= ArmedAt of
+    Now = erlang:monotonic_time(millisecond),
+    %% RFC 9002 Appendix A.8. A server over its anti-amplification budget
+    %% cannot send anything, so it arms nothing; the client is the one
+    %% that has to keep probing to unblock it.
+    Selected =
+        case amplification_blocked(State) of
+            true -> none;
+            false -> quic_loss:get_pto_time_and_space(LossState, Now, handshake_status(State))
+        end,
+    case Selected of
+        {Deadline, Space} ->
+            PTO = max(0, Deadline - Now),
+            SameSpace = (Space =:= State#state.pto_space),
+            case
+                OldTimer =/= undefined andalso SameSpace andalso
+                    Deadline + ?PTO_RESET_TOLERANCE_MS >= ArmedAt
+            of
                 true ->
-                    State#state{pto_scheduled_at = NewDeadline};
+                    State#state{pto_scheduled_at = Deadline};
                 false ->
                     cancel_timer(OldTimer),
-                    arm_pto_timer(PTO, State#state{pto_scheduled_at = NewDeadline})
+                    arm_pto_timer(
+                        PTO, State#state{pto_scheduled_at = Deadline, pto_space = Space}
+                    )
             end;
-        false ->
+        none ->
+            cancel_timer(OldTimer),
+            State#state{pto_timer = undefined, pto_scheduled_at = undefined};
+        _ ->
             State#state{pto_scheduled_at = undefined}
     end.
+
+%% A server has to stop at three times what it has received from an
+%% unvalidated address (RFC 9000 Section 8.1).
+amplification_blocked(#state{role = server, address_validated = false} = State) ->
+    State#state.amp_tx >= 3 * State#state.amp_rx;
+amplification_blocked(_State) ->
+    false.
+
+%% What Appendix A.8 needs that the loss state cannot hold. A server's
+%% peer validates its address implicitly, so the predicate is constant
+%% there; a client learns it from a Handshake acknowledgement or from
+%% confirmation.
+handshake_status(#state{role = server}) ->
+    #handshake_status{has_handshake_keys = true, peer_completed_address_validation = true};
+handshake_status(#state{handshake_keys = HSKeys, loss_state = LossState} = State) ->
+    #handshake_status{
+        has_handshake_keys = HSKeys =/= undefined,
+        peer_completed_address_validation =
+            State#state.handshake_ack_received orelse
+                quic_loss:handshake_confirmed(LossState)
+    }.
 
 arm_pto_timer(Delay, State) ->
     Ref = make_ref(),

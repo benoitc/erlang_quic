@@ -157,8 +157,6 @@
     %% The flight has to carry its own timer: once the statem leaves
     %% `handshaking' nothing else is guaranteed to be in flight to arm a
     %% PTO, so a lost Finished had no schedule to resend it on.
-    hs_flight_timer = undefined :: reference() | undefined,
-    hs_flight_tries = 0 :: non_neg_integer(),
     cipher_preference = [aes_128_gcm, aes_256_gcm, chacha20_poly1305] :: [atom()],
     tls_ch1_opts :: map() | undefined,
     %% Negotiated values surfaced in the connected event
@@ -291,6 +289,16 @@
     %% cancelled when the deadline moves later; the fire handler re-arms
     %% for the remainder instead (see set_pto_timer/1).
     pto_armed_at = undefined :: integer() | undefined,
+    %% The packet number space the armed timer belongs to. A probe has to
+    %% go out at that level, and a change of space forces a re-arm: the
+    %% lazy "a later deadline never cancels" rule would otherwise leave
+    %% the wrong space armed.
+    pto_space = app :: quic_loss:space(),
+    %% Client-side: a Handshake acknowledgement has arrived, so the
+    %% server has validated this address (RFC 9002 Appendix A.8
+    %% PeerCompletedAddressValidation). Always true for a server, which
+    %% reads the predicate directly rather than this field.
+    handshake_ack_received = false :: boolean(),
     idle_timer :: reference() | undefined,
 
     %% Keep-alive (RFC 9000 - PING frames for liveness)

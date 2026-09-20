@@ -9,6 +9,7 @@
 
 -export([
     state_with_loss/1,
+    state_with_loss/2,
     state_get/2,
     state_set/3,
     check_flow_control/6,
@@ -268,6 +269,15 @@ state_set(#state{} = S, retry_scid, V) ->
     S#state{retry_scid = V};
 state_set(#state{} = S, transport_params, V) ->
     S#state{transport_params = V}.
+
+%% A #state{} carrying a loss tracker, for the space whose timer is
+%% under test. The application space is only reachable once the handshake
+%% is confirmed (RFC 9002 Section 6.2.1), so asking for `app' confirms it.
+-spec state_with_loss(quic_loss:loss_state(), quic_loss:space()) -> #state{}.
+state_with_loss(LossState, app) ->
+    state_with_loss(quic_loss:on_handshake_confirmed(LossState));
+state_with_loss(LossState, _Space) ->
+    state_with_loss(LossState).
 
 -spec state_with_loss(quic_loss:loss_state()) -> #state{}.
 state_with_loss(LossState) ->

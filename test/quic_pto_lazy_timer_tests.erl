@@ -11,7 +11,7 @@
 state_with_flight() ->
     L0 = quic_loss:new(),
     L1 = quic_loss:on_packet_sent(app, L0, 0, 1200, true, [], erlang:monotonic_time(millisecond)),
-    quic_connection_test_support:state_with_loss(L1).
+    quic_connection_test_support:state_with_loss(L1, app).
 
 deadline_moving_later_keeps_the_timer_test() ->
     S1 = quic_connection:set_pto_timer(state_with_flight()),
@@ -26,14 +26,20 @@ deadline_moving_later_keeps_the_timer_test() ->
     ),
     erlang:cancel_timer(Ref).
 
-drained_flight_makes_the_fire_idle_test() ->
+%% Nothing left in flight and the peer has validated the address: there
+%% is nothing to probe, so RFC 9002 Appendix A.8 cancels rather than
+%% leaving an armed timer to fire and find itself idle.
+drained_flight_cancels_the_timer_test() ->
     S1 = quic_connection:set_pto_timer(state_with_flight()),
+    Ref = pto_timer(S1),
     S2 = quic_connection:set_pto_timer(
-        quic_connection_test_support:state_set(S1, loss_state, quic_loss:new())
+        quic_connection_test_support:state_set(
+            S1, loss_state, quic_loss:on_handshake_confirmed(quic_loss:new())
+        )
     ),
-    ?assertEqual(pto_timer(S1), pto_timer(S2)),
+    ?assertEqual(undefined, pto_timer(S2)),
     ?assertEqual(idle, quic_connection:pto_due(S2)),
-    erlang:cancel_timer(pto_timer(S1)).
+    erlang:cancel_timer(Ref).
 
 past_deadline_is_due_test() ->
     S1 = quic_connection:set_pto_timer(state_with_flight()),
