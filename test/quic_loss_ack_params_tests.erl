@@ -67,6 +67,20 @@ persistent_congestion_includes_max_ack_delay_test() ->
     ?assertEqual(310, quic_loss:persistent_congestion_pto(S)),
     ?assertEqual(310, quic_loss:persistent_congestion_pto(confirmed(S))).
 
+%% RFC 9002 Section 7.6.1 builds the window from the un-backed-off PTO:
+%% the formula has no 2^pto_count factor. Sharing the backoff would widen
+%% the window geometrically during the very blackout it exists to detect,
+%% so a persistent congestion period would get harder to declare the
+%% longer the connection stayed dark.
+%% Confirmed, so both sides carry max_ack_delay and the backoff is the
+%% only thing that can differ between them.
+persistent_congestion_excludes_pto_backoff_test() ->
+    S0 = confirmed(quic_loss:set_peer_ack_params(quic_loss:new(), 3, 10)),
+    ?assertEqual(310, quic_loss:get_pto(S0)),
+    S2 = quic_loss:on_pto_expired(quic_loss:on_pto_expired(S0)),
+    ?assertEqual(310 * 4, quic_loss:get_pto(S2)),
+    ?assertEqual(310, quic_loss:persistent_congestion_pto(S2)).
+
 %% A path change resets the RTT estimate, not what the peer negotiated or
 %% whether the handshake is confirmed.
 path_reset_keeps_peer_params_test() ->
@@ -146,10 +160,12 @@ confirmed_within(Pid, Budget) ->
             confirmed_within(Pid, Budget - 20)
     end.
 
+%% Ask the loss state directly. Comparing get_pto/1 against
+%% persistent_congestion_pto/1 only happened to work while the two shared
+%% an expression and pto_count was 0.
 is_confirmed(Pid) ->
     {_StateName, Data} = sys:get_state(Pid),
-    L = quic_connection_test_support:loss_state(Data),
-    quic_loss:get_pto(L) =:= quic_loss:persistent_congestion_pto(L).
+    quic_loss:handshake_confirmed(quic_connection_test_support:loss_state(Data)).
 
 %%====================================================================
 %% Helpers

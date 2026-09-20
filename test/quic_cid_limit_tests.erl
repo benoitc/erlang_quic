@@ -231,6 +231,49 @@ issue_at_peer_limit_is_noop_test() ->
     ).
 
 %%====================================================================
+%% Migrating to a new path (RFC 9000 Section 9.5)
+%%====================================================================
+
+%% Moving to a new path retires the CID the old path used, or it keeps
+%% counting against the limit we advertised and is never pruned.
+migration_retires_the_abandoned_cid_test() ->
+    S0 = quic_connection_test_support:state_for_cid_limit(3),
+    S1 = new_cid(1, 0, <<1:64>>, S0),
+    S2 = quic_connection:migrate_to({{127, 0, 0, 1}, 4433}, S1),
+    ?assertEqual([0], retired_seqs(S2)),
+    ?assertEqual(
+        [1], [S || #cid_entry{seq_num = S} <- quic_connection_test_support:peer_cids(S2)]
+    ).
+
+%% The new path's CID is in use from its first packet, not adopted later:
+%% a PATH_CHALLENGE still carrying the old CID is exactly the linkage
+%% Section 9.5 exists to prevent.
+migration_switches_the_dcid_test() ->
+    S0 = quic_connection_test_support:state_for_cid_limit(3),
+    S1 = new_cid(1, 0, <<1:64>>, S0),
+    ?assertEqual(<<"peer-cid">>, quic_connection_test_support:state_get(S1, dcid)),
+    S2 = quic_connection:migrate_to({{127, 0, 0, 1}, 4433}, S1),
+    ?assertEqual(<<1:64>>, quic_connection_test_support:state_get(S2, dcid)).
+
+%% A CID spent on one path is never offered to another, so a second
+%% migration with nothing left does not fall back to reuse.
+second_migration_finds_no_cid_test() ->
+    S0 = quic_connection_test_support:state_for_cid_limit(3),
+    S1 = new_cid(1, 0, <<1:64>>, S0),
+    S2 = quic_connection:migrate_to({{127, 0, 0, 1}, 4433}, S1),
+    ?assertEqual(false, quic_connection:has_unused_cid(S2)),
+    S3 = quic_connection:migrate_to({{127, 0, 0, 1}, 4434}, S2),
+    ?assertEqual(<<1:64>>, quic_connection_test_support:state_get(S3, dcid)).
+
+%% With only the handshake CID there is nothing to migrate onto.
+migration_without_a_spare_cid_is_refused_test() ->
+    S0 = quic_connection_test_support:state_for_cid_limit(3),
+    ?assertEqual(false, quic_connection:has_unused_cid(S0)),
+    S1 = quic_connection:migrate_to({{127, 0, 0, 1}, 4433}, S0),
+    ?assertEqual(<<"peer-cid">>, quic_connection_test_support:state_get(S1, dcid)),
+    ?assertEqual([], retired_seqs(S1)).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 

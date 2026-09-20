@@ -137,7 +137,9 @@ issuance_respects_peer_limit(Config) ->
 retire_replenishes_and_stays_issuable(Config) ->
     {ok, _Name, Port} = start_server(Config, #{}),
     {ok, Conn} = connect_client(Port, #{}),
-    _ = wait_for_peer_cids(Conn, 1, 2000),
+    %% Two, not one: the handshake CID is always there, and migrating needs
+    %% one that has not been used on the old path (RFC 9000 Section 9.5).
+    ?assertEqual(2, wait_for_peer_cids(Conn, 2, 2000)),
 
     {ok, StreamId} = quic:open_stream(Conn),
     ok = quic:send_data(Conn, StreamId, <<"before retire">>, false),

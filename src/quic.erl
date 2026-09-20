@@ -564,6 +564,13 @@ setopts(Conn, Opts) when is_pid(Conn), is_list(Opts) ->
 %% @doc Trigger connection migration to a new local address.
 %% This initiates path validation on a new network path.
 %% The connection will send PATH_CHALLENGE and wait for PATH_RESPONSE.
+%%
+%% Returns `{error, no_available_connection_id}' when the peer has not
+%% supplied a connection ID that is unused on another path. RFC 9000
+%% Section 9.5 forbids reusing one, so migrating is not possible until the
+%% peer issues another. The first spare arrives shortly after the
+%% connection is established, so a migration attempted immediately can
+%% fail and succeed on retry.
 -spec migrate(Conn) -> ok | {error, term()} when
     Conn :: pid().
 migrate(Conn) when is_pid(Conn) ->

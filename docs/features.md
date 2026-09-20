@@ -47,9 +47,16 @@
 - [x] Preferred address handling (RFC 9000 Section 9.6)
 - [x] Server-side address change detection (NAT rebinding and active migration)
 - [x] Congestion control reset on path change (RFC 9002 Section 9.4)
-- [x] CID rotation on migration for path unlinkability (RFC 9000 Section 9.5)
+- [x] Per-path connection IDs, bound before the path's first packet, with the
+  replaced one retired (RFC 9000 Section 9.5). A migration with no unused CID
+  is refused rather than reusing one: `quic:migrate/1,2` returns
+  `{error, no_available_connection_id}`
 - [x] `disable_active_migration` transport parameter support
 - [x] Path validation timeout with retry (3 * PTO, up to 3 attempts)
+
+Not yet enforced: the Section 9.3 limit on bytes sent to an unvalidated path,
+and the Section 9.4 rule that old-path packets must not be charged to the new
+path's congestion controller.
 
 ### Connection ID Management
 - [x] Multiple connection IDs
@@ -73,7 +80,9 @@
 - [x] Slow start with improved exit detection
 - [x] Congestion avoidance
 - [x] Recovery on packet loss
-- [x] Persistent congestion detection (resets cwnd after PTO * 3)
+- [x] Persistent congestion detection, over the RFC 9002 Section 7.6.1 duration:
+  the PTO without its exponential backoff, times 3. Section 7.6.2's rule about
+  packets sent before the first RTT sample is not applied
 - [x] ECN support (ECN-CE triggers congestion response)
 - [x] Packet pacing (RFC 9002 Section 7.7) to prevent bursts
 - [x] RTT-based flow control auto-tuning

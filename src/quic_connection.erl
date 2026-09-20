@@ -1801,29 +1801,35 @@ connected({call, From}, migrate, #state{peer_disable_migration = true} = State) 
     %% Peer disabled migration via transport params
     {keep_state, State, [{reply, From, {error, migration_disabled}}]};
 connected({call, From}, migrate, #state{remote_addr = RemoteAddr} = State) ->
-    %% Simulate network change by rebinding the client socket on a new
-    %% ephemeral port. Backend-agnostic: `rebind_client_socket/1' keeps
-    %% the OTP socket + receiver process together on the opt-in path.
-    case rebind_client_socket(State) of
-        {ok, State1} ->
-            %% RFC 9000 Section 9.5: Use fresh CID to prevent path linkability
-            State2 = switch_to_fresh_cid(State1),
-            State3 = initiate_path_validation(RemoteAddr, State2),
-            {keep_state, State3, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
+    %% RFC 9000 Section 9.5: an endpoint with no unused CID cannot probe a
+    %% new path, so the pool is checked before the socket is rebound. The
+    %% other order leaves the connection on a new local address still using
+    %% the old path's CID, which is the reuse the section forbids.
+    case has_unused_cid(State) of
+        false ->
+            {keep_state, State, [{reply, From, {error, no_available_connection_id}}]};
+        true ->
+            case rebind_client_socket(State) of
+                {ok, State1} ->
+                    {keep_state, migrate_to(RemoteAddr, State1), [{reply, From, ok}]};
+                {error, Reason} ->
+                    {keep_state, State, [{reply, From, {error, Reason}}]}
+            end
     end;
 %% Handle migration with options
 connected({call, From}, {migrate, _Opts}, #state{peer_disable_migration = true} = State) ->
     {keep_state, State, [{reply, From, {error, migration_disabled}}]};
 connected({call, From}, {migrate, _Opts}, #state{remote_addr = RemoteAddr} = State) ->
-    case rebind_client_socket(State) of
-        {ok, State1} ->
-            State2 = switch_to_fresh_cid(State1),
-            State3 = initiate_path_validation(RemoteAddr, State2),
-            {keep_state, State3, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
+    case has_unused_cid(State) of
+        false ->
+            {keep_state, State, [{reply, From, {error, no_available_connection_id}}]};
+        true ->
+            case rebind_client_socket(State) of
+                {ok, State1} ->
+                    {keep_state, migrate_to(RemoteAddr, State1), [{reply, From, ok}]};
+                {error, Reason} ->
+                    {keep_state, State, [{reply, From, {error, Reason}}]}
+            end
     end;
 connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) ->
     %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
@@ -7415,12 +7421,13 @@ flush_pending_delivery(#state{pend_deliver = {StreamId, Acc, Fin}, owner = Owner
     State#state{pend_deliver = none}.
 
 %% Arm the max_ack_delay timer if not already armed.
+%% The delay is our own advertised maximum, not the peer's: `transport_params'
+%% holds what the peer sent (RFC 9000 Section 18.2).
 arm_ack_timer(#state{ack_timer = Ref} = State) when Ref =/= undefined ->
     State;
 arm_ack_timer(#state{ack_timer = undefined} = State) ->
-    MaxAckDelay = maps:get(max_ack_delay, State#state.transport_params, 25),
     NewRef = make_ref(),
-    erlang:send_after(MaxAckDelay, self(), {send_delayed_ack, app, NewRef}),
+    erlang:send_after(?DEFAULT_MAX_ACK_DELAY, self(), {send_delayed_ack, app, NewRef}),
     State#state{ack_timer = NewRef}.
 
 %%====================================================================
@@ -10986,38 +10993,94 @@ get_current_key_phase(#state{key_state = KeyState}) -> KeyState#key_update_state
 %% RFC 9000 Section 8.2: PATH_CHALLENGE must be sent to the path being validated.
 %% Returns updated state with the path in validating status.
 -spec initiate_path_validation({inet:ip_address(), inet:port_number()}, #state{}) -> #state{}.
-initiate_path_validation(RemoteAddr, #state{dcid = CurrentDCID} = State) ->
-    %% Generate 8-byte random challenge data
-    ChallengeData = crypto:strong_rand_bytes(8),
+initiate_path_validation(RemoteAddr, State) ->
+    case start_path_probe(RemoteAddr, State) of
+        {ok, State1, _DCID, _Seq} -> State1;
+        none -> State
+    end.
 
-    %% Create path state for the new path
-    %% Track the CID being used on this path (RFC 9000 Section 9.5)
-    PathState = #path_state{
-        remote_addr = RemoteAddr,
-        status = validating,
-        challenge_data = ChallengeData,
-        challenge_count = 1,
-        bytes_sent = 0,
-        bytes_received = 0,
-        dcid = CurrentDCID
-    },
+%% Bind a CID to the path, record it, and send the first PATH_CHALLENGE
+%% under it. The CID is bound before the path's first packet, so the probe
+%% itself is already unlinkable from the old path (RFC 9000 Section 9.5),
+%% and `none' means the path cannot be probed at all.
+-spec start_path_probe({inet:ip_address(), inet:port_number()}, #state{}) ->
+    {ok, #state{}, binary(), non_neg_integer()} | none.
+start_path_probe(RemoteAddr, State) ->
+    case bind_path_cid(RemoteAddr, State) of
+        {ok, State0, DCID, Seq} ->
+            ChallengeData = crypto:strong_rand_bytes(8),
+            PathState = #path_state{
+                remote_addr = RemoteAddr,
+                status = validating,
+                challenge_data = ChallengeData,
+                challenge_count = 1,
+                bytes_sent = 0,
+                bytes_received = 0,
+                dcid = DCID,
+                dcid_seq = Seq
+            },
+            State1 = State0#state{alt_paths = [PathState | State0#state.alt_paths]},
+            {ok, send_path_challenge(RemoteAddr, ChallengeData, DCID, State1), DCID, Seq};
+        none ->
+            none
+    end.
 
-    %% Add to alternative paths
-    AltPaths = [PathState | State#state.alt_paths],
-    State1 = State#state{alt_paths = AltPaths},
+%% Take a peer CID for a path, keyed by its address so the same path never
+%% binds twice.
+bind_path_cid(PathRef, #state{cid_pool_state = Pool, dcid = CurrentDCID} = State) ->
+    case quic_cid:bind_peer_cid(Pool, PathRef, CurrentDCID) of
+        {ok, Pool1, DCID, Seq} -> {ok, State#state{cid_pool_state = Pool1}, DCID, Seq};
+        none -> none
+    end.
 
-    %% Send PATH_CHALLENGE to the new path address
-    send_path_challenge(RemoteAddr, ChallengeData, State1).
+%% The CID a path probes under, falling back to the connection's when the
+%% path never bound one (a NAT rebinding).
+path_dcid(#path_state{dcid = DCID}, _State) when DCID =/= undefined -> DCID;
+path_dcid(_PathState, #state{dcid = DCID}) -> DCID.
+
+%% Retire the CID an abandoned path bound, if it bound one. A path that
+%% kept the connection's CID (a NAT rebinding) leaves it alone.
+retire_abandoned_path_cid(#path_state{dcid = DCID, dcid_seq = Seq}, State) when
+    Seq =/= undefined
+->
+    retire_path_cid(DCID, State);
+retire_abandoned_path_cid(_PathState, State) ->
+    State.
+
+%% Retire the CID we moved away from, unless the path kept using it (a NAT
+%% rebinding, where no switch happened).
+retire_replaced_dcid(Same, Same, State) -> State;
+retire_replaced_dcid(OldDCID, _NewDCID, State) -> retire_path_cid(OldDCID, State).
+
+%% Retire a CID a path has stopped using, announce it and drop the entry.
+%% RFC 9000 Section 5.1.2: a CID we will not use again is retired rather
+%% than left outstanding against the peer's limit.
+retire_path_cid(undefined, State) ->
+    State;
+retire_path_cid(CID, #state{cid_pool_state = Pool} = State) ->
+    case quic_cid:retire_peer(Pool, CID) of
+        {ok, Pool1, SeqNum} ->
+            State1 = send_retire_connection_ids([SeqNum], State#state{cid_pool_state = Pool1}),
+            prune_retired_peer_cids(State1);
+        not_found ->
+            State
+    end.
 
 %% @doc Send PATH_CHALLENGE frame to a specific address.
 %% This is used for path validation where the probe must go to the new path.
 %% Uses the same packet encoding as send_frame but sends to a different address.
 -spec send_path_challenge({inet:ip_address(), inet:port_number()}, binary(), #state{}) -> #state{}.
+send_path_challenge(Addr, ChallengeData, #state{dcid = DCID} = State) ->
+    send_path_challenge(Addr, ChallengeData, DCID, State).
+
+%% A probe carries the CID bound to the path it probes: RFC 9000 Section 9.5
+%% forbids reusing a CID across paths, and the challenge is the path's first
+%% packet.
 send_path_challenge(
     {IP, Port},
     ChallengeData,
+    DCID,
     #state{
-        dcid = DCID,
         app_keys = AppKeys,
         role = Role,
         pn_app = PNSpace
@@ -11332,9 +11395,18 @@ maybe_handle_address_change(NewAddr, DataSize, State) ->
         same_path ->
             State;
         nat_rebinding ->
+            %% RFC 9000 Section 9.5 exempts an unintentional change like a
+            %% NAT rebinding from the no-reuse rule, so this path keeps the
+            %% CID it is already using.
             initiate_peer_path_validation(NewAddr, true, DataSize, State);
         new_path ->
-            initiate_peer_path_validation(NewAddr, false, DataSize, State)
+            %% A genuine migration needs a CID that has not been used on
+            %% another path. Without one we cannot probe, so nothing is
+            %% emitted and no validation state is created.
+            case has_unused_cid(State) of
+                true -> initiate_peer_path_validation(NewAddr, false, DataSize, State);
+                false -> State
+            end
     end.
 
 %% @doc Update bytes_received for pending path validation (anti-amplification).
@@ -11365,7 +11437,11 @@ update_pending_path_bytes_received(_NewAddr, _Size, State) ->
     non_neg_integer(),
     #state{}
 ) -> #state{}.
-initiate_peer_path_validation(NewAddr, IsNATRebinding, DataSize, State) ->
+initiate_peer_path_validation(NewAddr, IsNATRebinding, DataSize, State0) ->
+    %% A genuine migration takes a CID of its own; a NAT rebinding keeps the
+    %% one in use, which Section 9.5 permits for an unintentional change.
+    {State, NewDCID, NewSeq} = path_cid_for(NewAddr, IsNATRebinding, State0),
+
     %% Create path state for the new address
     NewChallengeData = crypto:strong_rand_bytes(8),
     NewPathState = #path_state{
@@ -11375,6 +11451,8 @@ initiate_peer_path_validation(NewAddr, IsNATRebinding, DataSize, State) ->
         challenge_count = 1,
         bytes_sent = 0,
         bytes_received = DataSize,
+        dcid = NewDCID,
+        dcid_seq = NewSeq,
         is_nat_rebinding = IsNATRebinding
     },
 
@@ -11389,6 +11467,7 @@ initiate_peer_path_validation(NewAddr, IsNATRebinding, DataSize, State) ->
         challenge_count = 1,
         bytes_sent = 0,
         bytes_received = 0,
+        dcid = State#state.dcid,
         is_nat_rebinding = false
     },
 
@@ -11410,10 +11489,20 @@ initiate_peer_path_validation(NewAddr, IsNATRebinding, DataSize, State) ->
         migration_state = validating_peer
     },
 
-    %% Send PATH_CHALLENGE to both addresses
-    State2 = send_path_challenge_to_addr(NewAddr, NewChallengeData, State1),
+    %% Send PATH_CHALLENGE to both addresses, each under its own path's CID
+    State2 = send_path_challenge_to_addr(NewAddr, NewChallengeData, NewDCID, State1),
     State3 = send_path_challenge_to_old_addr(OldAddr, OldChallengeData, State2),
     start_path_validation_timer(State3).
+
+%% The CID a path probes under. A NAT rebinding is the Section 9.5
+%% exception and stays on the current one; anything else binds its own.
+path_cid_for(_Addr, true, #state{dcid = DCID} = State) ->
+    {State, DCID, undefined};
+path_cid_for(Addr, false, State) ->
+    case bind_path_cid(Addr, State) of
+        {ok, State1, DCID, Seq} -> {State1, DCID, Seq};
+        none -> {State, State#state.dcid, undefined}
+    end.
 
 %% @doc Send PATH_CHALLENGE to old path address for anti-spoofing validation.
 -spec send_path_challenge_to_old_addr(
@@ -11442,11 +11531,12 @@ send_path_challenge_to_old_addr(Addr, ChallengeData, State) ->
 -spec send_path_challenge_to_addr(
     {inet:ip_address(), inet:port_number()},
     binary(),
+    binary(),
     #state{}
 ) -> #state{}.
-send_path_challenge_to_addr(Addr, ChallengeData, State) ->
+send_path_challenge_to_addr(Addr, ChallengeData, DCID, State) ->
     %% Reuse existing send_path_challenge logic
-    State1 = send_path_challenge(Addr, ChallengeData, State),
+    State1 = send_path_challenge(Addr, ChallengeData, DCID, State),
     %% Update pending path bytes_sent for anti-amplification
     case State1#state.pending_peer_validation of
         #path_state{} = PathState ->
@@ -11499,12 +11589,17 @@ handle_path_validation_timeout(#state{pending_peer_validation = PathState} = Sta
             },
             State1 = State#state{pending_peer_validation = NewPathState},
             State2 = send_path_challenge_to_addr(
-                PathState#path_state.remote_addr, ChallengeData, State1
+                PathState#path_state.remote_addr,
+                ChallengeData,
+                path_dcid(PathState, State1),
+                State1
             ),
             State3 = start_path_validation_timer(State2),
             {keep_state, State3};
         _ ->
-            %% Max retries reached, give up on this path
+            %% Max retries reached, give up on this path. A CID that has
+            %% appeared on a path is spent: it is retired rather than
+            %% returned to the pool (RFC 9000 Section 9.5).
             State1 = State#state{
                 pending_peer_validation = undefined,
                 old_path_validation = undefined,
@@ -11512,7 +11607,7 @@ handle_path_validation_timeout(#state{pending_peer_validation = PathState} = Sta
                 path_validation_timer = undefined,
                 path_validation_token = undefined
             },
-            {keep_state, State1}
+            {keep_state, retire_abandoned_path_cid(PathState, State1)}
     end.
 
 %% @doc Handle PATH_RESPONSE frame.
@@ -11609,17 +11704,19 @@ decide_migration_after_new_path_validated(ValidatedNewPath, State) ->
 handle_peer_path_validated(PendingPath, #state{path_validation_timer = Timer} = State) ->
     %% Cancel validation timer
     cancel_timer(Timer),
-    %% RFC 9000 Section 9.5: Use fresh CID on new path for unlinkability
-    State1 = switch_to_fresh_cid(State),
-    NewDCID = State1#state.dcid,
-    %% Mark path as validated with the CID used on this path
+    %% RFC 9000 Section 9.5: the path already probed under its own CID, so
+    %% that one is promoted here rather than a new one being chosen; the CID
+    %% the old path used is then retired.
+    OldDCID = State#state.dcid,
+    NewDCID = path_dcid(PendingPath, State),
     ValidatedPath = PendingPath#path_state{
         status = validated,
         challenge_data = undefined,
         dcid = NewDCID
     },
+    State1 = State#state{dcid = NewDCID},
     %% Complete migration to the new peer address
-    State2 = complete_migration(ValidatedPath, State1),
+    State2 = retire_replaced_dcid(OldDCID, NewDCID, complete_migration(ValidatedPath, State1)),
     %% Clear pending validation state including old path validation
     State2#state{
         pending_peer_validation = undefined,
@@ -11668,19 +11765,24 @@ is_preferred_address_path(_, _) ->
     false.
 
 %% Switch to using the CID from preferred_address
-switch_to_preferred_cid(#preferred_address{cid = CID}, State) ->
-    %% RFC 9000 Section 9.6: MUST use the new CID on the preferred address
-    State#state{dcid = CID}.
+switch_to_preferred_cid(#preferred_address{cid = CID}, #state{dcid = OldDCID} = State) ->
+    %% RFC 9000 Section 9.6: MUST use the new CID on the preferred address.
+    %% The one it replaces is retired, as on any other path change.
+    retire_replaced_dcid(OldDCID, CID, State#state{dcid = CID}).
 
-%% @doc Switch to a fresh CID from the peer's CID pool.
-%% RFC 9000 Section 9.5: Using a fresh CID on a new path prevents linkability.
--spec switch_to_fresh_cid(#state{}) -> #state{}.
-switch_to_fresh_cid(#state{cid_pool_state = Pool, dcid = CurrentDCID} = State) ->
-    case quic_cid:fresh_dcid(Pool, CurrentDCID) of
-        {ok, NewCID} ->
-            State#state{dcid = NewCID};
-        not_found ->
-            %% No spare CID available, continue with current
+%% @doc Whether a peer CID is free for a path we have not probed yet.
+-spec has_unused_cid(#state{}) -> boolean().
+has_unused_cid(#state{cid_pool_state = Pool, dcid = CurrentDCID}) ->
+    quic_cid:fresh_dcid(Pool, CurrentDCID) =/= not_found.
+
+%% @doc Move to a new path: take a fresh CID for it, retire the one the old
+%% path used, and validate (RFC 9000 Section 9.5).
+-spec migrate_to({inet:ip_address(), inet:port_number()}, #state{}) -> #state{}.
+migrate_to(RemoteAddr, #state{dcid = OldDCID} = State) ->
+    case start_path_probe(RemoteAddr, State) of
+        {ok, State1, NewCID, _Seq} ->
+            retire_path_cid(OldDCID, State1#state{dcid = NewCID});
+        none ->
             State
     end.
 

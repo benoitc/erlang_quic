@@ -75,6 +75,10 @@ client_socket_backend_migrate() ->
             after 5000 ->
                 ?assert(false)
             end,
+            %% A new path needs a CID not used on the old one
+            %% (RFC 9000 Section 9.5), and the peer's arrives just
+            %% after `connected'.
+            ?assert(quic_connection_test_support:await_spare_cid(Conn, 5000)),
             ?assertEqual(ok, quic:migrate(Conn)),
             %% After migration the stream should still echo.
             {ok, StreamId} = quic:open_stream(Conn),
