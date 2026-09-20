@@ -672,10 +672,7 @@ init({server, Opts}) ->
         %% active_connection_id_limit, so the pool has to hold it before
         %% we work out how many more to issue. Its reset token travels in
         %% our transport parameters, not in a NEW_CONNECTION_ID frame.
-        local_cid_pool = [#cid_entry{seq_num = 0, cid = SCID, status = active}],
-        %% How many of the peer's CIDs we will hold. Advertised as
-        %% active_connection_id_limit and enforced in add_peer_connection_id/5.
-        local_active_cid_limit = maps:get(active_connection_id_limit, Opts, 2),
+        cid_pool_state = quic_cid:new(SCID, maps:get(active_connection_id_limit, Opts, 2)),
         % Will be set from ClientHello SCID
         dcid = <<>>,
         %% Defaults to the Initial's DCID; the listener overrides it with
@@ -1093,9 +1090,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     State = #state{
         scid = SCID,
         %% Sequence 0 is the handshake CID; see the server init path.
-        local_cid_pool = [#cid_entry{seq_num = 0, cid = SCID, status = active}],
-        %% See the server init path.
-        local_active_cid_limit = maps:get(active_connection_id_limit, Opts, 2),
+        cid_pool_state = quic_cid:new(SCID, maps:get(active_connection_id_limit, Opts, 2)),
         dcid = DCID,
         original_dcid = DCID,
         role = client,
@@ -2278,7 +2273,7 @@ send_client_hello(State) ->
         initial_max_streams_bidi => MaxStreamsBidi,
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => State#state.idle_timeout,
-        active_connection_id_limit => State#state.local_active_cid_limit,
+        active_connection_id_limit => local_active_limit(State),
         max_udp_payload_size => advertised_max_udp_payload_size(State)
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
@@ -2519,7 +2514,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         initial_max_streams_bidi => MaxStreamsBidi,
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => State#state.idle_timeout,
-        active_connection_id_limit => State#state.local_active_cid_limit,
+        active_connection_id_limit => local_active_limit(State),
         max_udp_payload_size => advertised_max_udp_payload_size(State),
         %% RFC 9368: the versions we would also accept; the server may
         %% switch the connection to one of them.
@@ -4055,7 +4050,7 @@ handle_packet_loop(Data, State) ->
                             binhex(E#cid_entry.cid),
                             binhex(E#cid_entry.stateless_reset_token)
                         }
-                     || E <- State#state.peer_cid_pool
+                     || E <- quic_cid:peer_entries(State#state.cid_pool_state)
                     ],
                     head => binhex(binary:part(Data, 0, min(16, byte_size(Data)))),
                     tail => binhex(
@@ -4214,11 +4209,10 @@ adopt_peer_scid(PeerSCID, #state{dcid = DCID} = State) when
 adopt_peer_scid(_PeerSCID, State) ->
     State.
 
-install_initial_peer_cid(PeerSCID, #state{peer_cid_pool = Pool} = State) ->
-    Entry = #cid_entry{seq_num = 0, cid = PeerSCID, status = active},
+install_initial_peer_cid(PeerSCID, #state{cid_pool_state = Pool} = State) ->
     State#state{
         dcid = PeerSCID,
-        peer_cid_pool = lists:keystore(0, #cid_entry.seq_num, Pool, Entry)
+        cid_pool_state = quic_cid:set_initial_peer_cid(Pool, PeerSCID, undefined)
     }.
 
 %% Version list of a Version Negotiation packet. A trailing partial entry
@@ -4432,34 +4426,20 @@ reset_initial_pn_space(#state{pn_initial = #pn_space{next_pn = NextPN}} = State)
 check_stateless_reset(Data, _State) when byte_size(Data) < 21 ->
     %% Packet too small to be a stateless reset
     {error, decryption_failed};
-check_stateless_reset(Data, #state{peer_cid_pool = PeerCIDs} = _State) ->
+check_stateless_reset(Data, #state{cid_pool_state = Pool} = _State) ->
     %% Extract the last 16 bytes as potential reset token
     DataSize = byte_size(Data),
     TokenOffset = DataSize - 16,
     <<_:TokenOffset/binary, PotentialToken:16/binary>> = Data,
 
     %% Check against known reset tokens from peer's CIDs
-    case find_matching_reset_token(PotentialToken, PeerCIDs) of
+    case quic_cid:find_reset_token_match(Pool, PotentialToken) of
         {ok, _CID} ->
             %% This is a stateless reset - signal connection termination
             {error, stateless_reset};
         not_found ->
             %% Not a stateless reset, just decryption failure
             {error, decryption_failed}
-    end.
-
-%% Find if a token matches any known stateless reset token. Compared in
-%% constant time: reset tokens are secret (RFC 9000 §10.3.1), so avoid a
-%% byte-position timing oracle.
-find_matching_reset_token(_Token, []) ->
-    not_found;
-find_matching_reset_token(Token, [#cid_entry{stateless_reset_token = Known, cid = CID} | Rest]) ->
-    case
-        is_binary(Known) andalso byte_size(Known) =:= byte_size(Token) andalso
-            crypto:hash_equals(Token, Known)
-    of
-        true -> {ok, CID};
-        false -> find_matching_reset_token(Token, Rest)
     end.
 
 decode_short_header_packet(Data, State) ->
@@ -10753,8 +10733,8 @@ state_to_map(#state{} = S) ->
         keep_alive_timer_armed => S#state.keep_alive_timer =/= undefined,
         %% CID rotation observability: local_cid_count includes sequence 0,
         %% peer_cid_count is what the peer has issued to us.
-        local_cid_count => length([E || #cid_entry{status = active} = E <- S#state.local_cid_pool]),
-        peer_cid_count => length([E || #cid_entry{status = active} = E <- S#state.peer_cid_pool])
+        local_cid_count => quic_cid:local_active_count(S#state.cid_pool_state),
+        peer_cid_count => quic_cid:peer_active_count(S#state.cid_pool_state)
     }.
 
 %% Send-path observability helpers. Each reads one field from the
@@ -11177,19 +11157,19 @@ update_path_bytes_sent(IP, Port, Bytes, #state{alt_paths = AltPaths} = State) ->
 initiate_preferred_address_validation(
     #preferred_address{cid = CID, stateless_reset_token = Token} = PA, State
 ) ->
-    %% RFC 9000 Section 9.6: Client MUST use the new CID when communicating on preferred path
-    %% Add the new CID to peer's pool
-    CIDEntry = #cid_entry{
-        % Preferred address CID has implicit sequence number 1
-        seq_num = 1,
-        cid = CID,
-        stateless_reset_token = Token,
-        status = active
-    },
-    State1 = State#state{
-        peer_cid_pool = [CIDEntry | State#state.peer_cid_pool],
-        preferred_address = PA
-    },
+    %% RFC 9000 Section 9.6: the client must use the CID the preferred
+    %% address carries, which has an implicit sequence number of 1.
+    State1 =
+        case quic_cid:add_preferred_address_cid(State#state.cid_pool_state, CID, Token) of
+            {ok, NewPool} ->
+                State#state{cid_pool_state = NewPool, preferred_address = PA};
+            {error, Reason} ->
+                ?LOG_DEBUG(
+                    #{what => preferred_address_cid_rejected, reason => Reason},
+                    ?QUIC_LOG_META
+                ),
+                State#state{preferred_address = PA}
+        end,
     %% Choose address - prefer IPv6 over IPv4
     case select_preferred_addr(PA) of
         undefined ->
@@ -11695,25 +11675,14 @@ switch_to_preferred_cid(#preferred_address{cid = CID}, State) ->
 %% @doc Switch to a fresh CID from the peer's CID pool.
 %% RFC 9000 Section 9.5: Using a fresh CID on a new path prevents linkability.
 -spec switch_to_fresh_cid(#state{}) -> #state{}.
-switch_to_fresh_cid(#state{peer_cid_pool = Pool, dcid = CurrentDCID} = State) ->
-    case find_unused_cid(Pool, CurrentDCID) of
+switch_to_fresh_cid(#state{cid_pool_state = Pool, dcid = CurrentDCID} = State) ->
+    case quic_cid:fresh_dcid(Pool, CurrentDCID) of
         {ok, NewCID} ->
             State#state{dcid = NewCID};
         not_found ->
             %% No spare CID available, continue with current
             State
     end.
-
-%% @doc Find an unused CID from the pool (different from current DCID).
--spec find_unused_cid([#cid_entry{}], binary()) -> {ok, binary()} | not_found.
-find_unused_cid([], _CurrentCID) ->
-    not_found;
-find_unused_cid([#cid_entry{cid = CID, status = active} | _Rest], CurrentCID) when
-    CID =/= CurrentCID
-->
-    {ok, CID};
-find_unused_cid([_ | Rest], CurrentCID) ->
-    find_unused_cid(Rest, CurrentCID).
 
 %% Find a path by challenge data
 find_path_by_challenge(_Data, []) ->
@@ -11807,7 +11776,6 @@ complete_migration(_, State) ->
 %% Adds the new CID to our pool of peer CIDs.
 %% RFC 9000 Section 5.1.1: Peer must not exceed our active_connection_id_limit.
 handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
-    #state{peer_cid_pool = Pool} = State,
     case RetirePrior > SeqNum of
         true ->
             %% RFC 9000 §19.15: retire_prior_to MUST NOT exceed sequence_number.
@@ -11817,86 +11785,52 @@ handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
                 State
             );
         false ->
-            case lists:keyfind(SeqNum, #cid_entry.seq_num, Pool) of
-                #cid_entry{cid = CID, stateless_reset_token = ResetToken} ->
-                    %% Exact duplicate - ignore.
-                    State;
-                #cid_entry{} ->
-                    %% RFC 9000 §19.15: same sequence number, different CID or
-                    %% reset token.
-                    close_with_transport_error(
-                        ?QUIC_PROTOCOL_VIOLATION,
-                        <<"NEW_CONNECTION_ID sequence reuse with different CID">>,
-                        State
-                    );
-                false ->
-                    add_peer_connection_id(SeqNum, RetirePrior, CID, ResetToken, State)
-            end
+            add_peer_connection_id(SeqNum, RetirePrior, CID, ResetToken, State)
     end.
 
-add_peer_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
-    #state{peer_cid_pool = Pool, local_active_cid_limit = Limit} = State,
-    %% Capture what this frame retires before marking it: once marked, the
-    %% entries no longer read as active and nothing would announce them.
-    ToRetire = [S || #cid_entry{seq_num = S, status = active} <- Pool, S < RetirePrior],
-    RetiredPool = [retire_if_below(RetirePrior, E) || E <- Pool],
-    NewEntry = #cid_entry{
-        seq_num = SeqNum,
-        cid = CID,
-        stateless_reset_token = ResetToken,
-        status = active
-    },
-    NewPool = [NewEntry | RetiredPool],
-    ActiveCount = length([E || #cid_entry{status = active} = E <- NewPool]),
-    case ActiveCount > Limit of
-        true ->
+add_peer_connection_id(SeqNum, RetirePrior, CID, ResetToken, #state{cid_pool_state = Pool} = State) ->
+    case quic_cid:add_peer_cid(Pool, SeqNum, RetirePrior, CID, ResetToken) of
+        {duplicate, _Pool} ->
+            State;
+        {error, {reuse, _Seq}} ->
+            %% RFC 9000 §19.15: same sequence number, different CID or
+            %% reset token.
+            close_with_transport_error(
+                ?QUIC_PROTOCOL_VIOLATION,
+                <<"NEW_CONNECTION_ID sequence reuse with different CID">>,
+                State
+            );
+        {error, limit_exceeded} ->
             close_with_transport_error(
                 ?QUIC_CONNECTION_ID_LIMIT_ERROR,
                 <<"active_connection_id_limit exceeded">>,
                 State
             );
-        false ->
+        {ok, NewPool, ToRetire} ->
             %% RFC 9000 §5.1.2: if the CID we are sending with is among
             %% the retired ones, switch to an active CID BEFORE retiring.
             %% Keeping a retired DCID makes the peer eventually treat our
             %% packets as unroutable and answer with stateless resets
             %% whose token we discarded with the pruned pool entry - the
             %% connection goes irrecoverably deaf.
-            State0 = maybe_replace_retired_dcid(State#state{peer_cid_pool = NewPool}),
+            State0 = replace_retired_dcid(State#state{cid_pool_state = NewPool}),
             %% Announce the retirements, then drop the entries so the pool
             %% cannot grow without bound.
             State1 = send_retire_connection_ids(ToRetire, State0),
             prune_retired_peer_cids(State1)
     end.
 
-maybe_replace_retired_dcid(#state{peer_cid_pool = Pool, dcid = DCID} = State) ->
-    case lists:keyfind(DCID, #cid_entry.cid, Pool) of
-        #cid_entry{status = retired} ->
-            case find_unused_cid(Pool, DCID) of
-                {ok, NewCID} ->
-                    ?LOG_DEBUG(
-                        #{what => dcid_retired_switching, new_cid => NewCID},
-                        ?QUIC_LOG_META
-                    ),
-                    State#state{dcid = NewCID};
-                not_found ->
-                    %% Peer retired every CID we hold without providing a
-                    %% replacement; keep the old one (peer protocol error).
-                    State
-            end;
-        _ ->
+replace_retired_dcid(#state{cid_pool_state = Pool, dcid = DCID} = State) ->
+    case quic_cid:replacement_for_retired_dcid(Pool, DCID) of
+        {ok, NewCID} ->
+            ?LOG_DEBUG(#{what => dcid_retired_switching, new_cid => NewCID}, ?QUIC_LOG_META),
+            State#state{dcid = NewCID};
+        keep ->
             State
     end.
 
-retire_if_below(RetirePrior, #cid_entry{seq_num = S} = Entry) when S < RetirePrior ->
-    Entry#cid_entry{status = retired};
-retire_if_below(_RetirePrior, Entry) ->
-    Entry.
-
-%% Drop retired peer CIDs: RETIRE_CONNECTION_ID has been sent for them and
-%% we will not use them, so they need not be retained (RFC 9000 §5.1.2).
-prune_retired_peer_cids(#state{peer_cid_pool = Pool} = State) ->
-    State#state{peer_cid_pool = [E || #cid_entry{status = St} = E <- Pool, St =/= retired]}.
+prune_retired_peer_cids(#state{cid_pool_state = Pool} = State) ->
+    State#state{cid_pool_state = quic_cid:prune_retired_peer(Pool)}.
 
 %% RFC 9000 Section 19.16: one RETIRE_CONNECTION_ID per retired sequence.
 send_retire_connection_ids(SeqNums, State) ->
@@ -11909,66 +11843,30 @@ send_retire_connection_ids(SeqNums, State) ->
 %% @doc Issue new connection IDs to the peer.
 %% RFC 9000 Section 5.1.1: Generates new CIDs with stateless reset tokens.
 -spec issue_new_connection_ids(#state{}) -> #state{}.
-issue_new_connection_ids(
-    #state{
-        local_cid_pool = Pool,
-        peer_active_cid_limit = PeerLimit
-    } = State
-) ->
-    %% Count current active CIDs
-    ActiveCount = length([E || #cid_entry{status = active} = E <- Pool]),
+issue_new_connection_ids(#state{cid_pool_state = Pool} = State) ->
+    issue_cids(quic_cid:replenish_needed(Pool), State).
 
-    %% Issue new CIDs up to peer's limit
-    case ActiveCount < PeerLimit of
-        true ->
-            %% Need to issue more CIDs
-            NumToIssue = PeerLimit - ActiveCount,
-            issue_cids(NumToIssue, State);
-        false ->
-            State
-    end.
-
-%% Helper to issue N new connection IDs
+%% Issue N CIDs, then register each with the listener before advertising it,
+%% so the peer can use one as a Destination CID the moment the frame lands.
+%% Reversed, routing would not recognise it yet.
 issue_cids(0, State) ->
     State;
-issue_cids(N, #state{local_cid_pool = Pool} = State) when N > 0 ->
-    NextSeqNum = next_cid_seq(Pool),
+issue_cids(N, #state{cid_pool_state = Pool} = State) when N > 0 ->
+    {NewPool, Issued} = quic_cid:issue(Pool, N, State#state.stateless_reset_secret),
+    State1 = State#state{cid_pool_state = NewPool},
+    lists:foldl(
+        fun({SeqNum, CID, Token}, Acc) ->
+            maybe_register_cid(CID, Acc),
+            send_frame({new_connection_id, SeqNum, 0, CID, Token}, Acc)
+        end,
+        State1,
+        Issued
+    ).
 
-    %% Generate new CID (8 bytes recommended by RFC 9000)
-    NewCID = crypto:strong_rand_bytes(8),
-
-    %% Generate stateless reset token (16 bytes)
-    ResetToken = generate_stateless_reset_token(NewCID, State),
-
-    %% Create entry
-    NewEntry = #cid_entry{
-        seq_num = NextSeqNum,
-        cid = NewCID,
-        stateless_reset_token = ResetToken,
-        status = active
-    },
-
-    %% Make the CID routable before advertising it, so the peer can use
-    %% it as a Destination CID as soon as it receives the frame.
-    maybe_register_cid(NewCID, State),
-
-    %% Send NEW_CONNECTION_ID frame
-    Frame = {new_connection_id, NextSeqNum, 0, NewCID, ResetToken},
-    State1 = send_frame(Frame, State),
-
-    %% Add to pool and continue
-    NewPool = [NewEntry | Pool],
-    issue_cids(N - 1, State1#state{local_cid_pool = NewPool}).
-
-%% The next sequence number to issue. The pool is the only place a
-%% sequence number lives, so issuance and the unissued-sequence check in
-%% handle_retire_connection_id/2 cannot drift apart. The pool always
-%% holds sequence 0 from init, so the empty clause is defensive.
--spec next_cid_seq([#cid_entry{}]) -> non_neg_integer().
-next_cid_seq([]) ->
-    0;
-next_cid_seq(Pool) ->
-    lists:max([E#cid_entry.seq_num || E <- Pool]) + 1.
+%% How many of the peer's CIDs we will hold, advertised as our
+%% active_connection_id_limit.
+local_active_limit(#state{cid_pool_state = Pool}) ->
+    quic_cid:local_active_limit(Pool).
 
 %% Server connections route through the listener's shared socket, so a
 %% newly issued CID must be added to the listener's routing table. Client
@@ -12014,13 +11912,8 @@ next_conn_max_data(DataReceived, MaxDataLocal, MaxWindow, InitialWindow, false) 
 %% stateless reset for a CID whose per-connection state it no longer
 %% holds. Without a secret we fall back to per-CID random bytes.
 -spec generate_stateless_reset_token(binary(), #state{}) -> binary().
-generate_stateless_reset_token(_CID, #state{stateless_reset_secret = undefined}) ->
-    crypto:strong_rand_bytes(16);
-generate_stateless_reset_token(CID, #state{stateless_reset_secret = Secret}) when
-    is_binary(Secret), byte_size(Secret) >= 32
-->
-    <<Token:16/binary, _/binary>> = crypto:mac(hmac, sha256, Secret, CID),
-    Token.
+generate_stateless_reset_token(CID, #state{stateless_reset_secret = Secret}) ->
+    quic_cid:generate_reset_token(CID, Secret).
 
 %% RFC 9000 §8.1.3 server-side issuance. A NEW_TOKEN frame binds the
 %% client's current source address to an HMAC-signed envelope so the
@@ -12210,9 +12103,6 @@ maybe_emit_pending_close(State) ->
 
 %% Internal function to apply transport params after CID validation passes
 apply_peer_transport_params_internal(TransportParams, State) ->
-    %% Extract peer's active_connection_id_limit (default: 2 per RFC 9000)
-    PeerCIDLimit = maps:get(active_connection_id_limit, TransportParams, 2),
-
     %% Extract connection-level flow control: how much WE can send to THEM
     %% Peer's initial_max_data tells us the max bytes we can send on this connection
     MaxDataRemote = maps:get(initial_max_data, TransportParams, ?DEFAULT_INITIAL_MAX_DATA),
@@ -12264,7 +12154,7 @@ apply_peer_transport_params_internal(TransportParams, State) ->
     %% RFC 9000 §10.3: the peer's stateless_reset_token applies to its
     %% sequence-0 CID. Record it so a later stateless reset is recognised by
     %% check_stateless_reset/2 (only servers send this, so only clients store it).
-    PeerCIDPool = maybe_store_initial_reset_token(TransportParams, State),
+    NewCIDPool = apply_peer_cid_params(TransportParams, State),
 
     %% Store stream data limits in state for use when opening streams
     %% These tell us how much we can send on different stream types
@@ -12275,8 +12165,7 @@ apply_peer_transport_params_internal(TransportParams, State) ->
             peer_max_stream_data_bidi_local => MaxStreamDataBidiLocal,
             peer_max_stream_data_uni => MaxStreamDataUni
         }),
-        peer_cid_pool = PeerCIDPool,
-        peer_active_cid_limit = PeerCIDLimit,
+        cid_pool_state = NewCIDPool,
         loss_state = peer_ack_params(TransportParams, State#state.loss_state),
         %% Connection-level send limit
         max_data_remote = MaxDataRemote,
@@ -12305,50 +12194,36 @@ peer_ack_params(TransportParams, LossState) ->
 %% entry in the peer CID pool. This is what lets check_stateless_reset/2 match a
 %% reset for the initial connection ID — a steady connection never receives a
 %% NEW_CONNECTION_ID frame, so without this the token is never stored.
-maybe_store_initial_reset_token(TransportParams, #state{peer_cid_pool = Pool}) ->
+apply_peer_cid_params(TransportParams, #state{cid_pool_state = Pool}) ->
     %% Sequence 0 already exists, installed when the peer's Initial was
     %% adopted; the token only fills it in.
     Token = maps:get(stateless_reset_token, TransportParams, undefined),
-    case lists:keyfind(0, #cid_entry.seq_num, Pool) of
-        #cid_entry{stateless_reset_token = undefined} = Entry when
-            is_binary(Token), byte_size(Token) =:= 16
-        ->
-            lists:keystore(
-                0, #cid_entry.seq_num, Pool, Entry#cid_entry{stateless_reset_token = Token}
-            );
-        _ ->
-            Pool
-    end.
+    Limit = maps:get(active_connection_id_limit, TransportParams, 2),
+    quic_cid:set_peer_active_limit(
+        quic_cid:record_initial_reset_token(Pool, Token), Limit
+    ).
 
 %% @doc Handle RETIRE_CONNECTION_ID frame from peer.
 %% Marks the specified CID in our local pool as retired.
-handle_retire_connection_id(SeqNum, #state{local_cid_pool = Pool} = State) ->
-    case SeqNum >= next_cid_seq(Pool) of
-        true ->
+handle_retire_connection_id(SeqNum, #state{cid_pool_state = Pool} = State) ->
+    case quic_cid:retire_local(Pool, SeqNum) of
+        {error, unissued} ->
             %% RFC 9000 §19.16: retiring a sequence number we never issued.
             close_with_transport_error(
                 ?QUIC_PROTOCOL_VIOLATION,
                 <<"RETIRE_CONNECTION_ID for unissued sequence number">>,
                 State
             );
-        false ->
+        {ok, NewPool, RetiredCID} ->
             %% Drop the retired CID from the listener routing table so it
             %% no longer maps to this connection.
-            case lists:keyfind(SeqNum, #cid_entry.seq_num, Pool) of
-                #cid_entry{cid = RetiredCID} -> maybe_retire_cid(RetiredCID, State);
-                false -> ok
-            end,
-            NewPool = lists:map(
-                fun
-                    (#cid_entry{seq_num = S} = Entry) when S =:= SeqNum ->
-                        Entry#cid_entry{status = retired};
-                    (Entry) ->
-                        Entry
+            _ =
+                case RetiredCID of
+                    undefined -> ok;
+                    _ -> maybe_retire_cid(RetiredCID, State)
                 end,
-                Pool
-            ),
             %% Replenish the peer's usable CID supply after a retirement.
-            issue_new_connection_ids(State#state{local_cid_pool = NewPool})
+            issue_new_connection_ids(State#state{cid_pool_state = NewPool})
     end.
 
 %%====================================================================

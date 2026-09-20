@@ -1,6 +1,6 @@
 # Module Map
 
-Where the code lives and what to read first. The source is 66 modules and about 46,000 lines, and roughly a quarter of it is one module, so reading in file order does not work. Read this when you are new to the tree, or when you know what you want to change but not where it lives. [docs/DESIGN.md](DESIGN.md) covers how the protocol works; this page covers where it is.
+Where the code lives and what to read first. The source is 67 modules and about 46,000 lines, and roughly a quarter of it is one module, so reading in file order does not work. Read this when you are new to the tree, or when you know what you want to change but not where it lives. [docs/DESIGN.md](DESIGN.md) covers how the protocol works; this page covers where it is.
 
 ## Read these seven first
 
@@ -12,14 +12,14 @@ In this order, they give you the whole path of a connection without opening the 
 4. `src/quic_varint.erl` (112) is the encoding everything else is built from.
 5. `src/quic_crypto.erl` (671) is the key schedule, and `src/quic_aead.erl` packet protection.
 6. `src/quic_cc.erl` (401) is the congestion control behaviour, with `quic_loss` and `quic_ack` beside it.
-7. `src/quic_connection.erl` (12,654) is the state machine everything above meets in. Read it by section banner, not top to bottom.
+7. `src/quic_connection.erl` (12,515) is the state machine everything above meets in. Read it by section banner, not top to bottom.
 
 ## Layers
 
 | Layer | Modules |
 |-------|---------|
 | Public API | `quic`, `quic_listener` |
-| Connection | `quic_connection`, `quic_connection_state.hrl`, `quic_pqueue` (the send queue's urgency buckets, RFC 9218), `quic_reassembly` (out-of-order buffers), `quic_interval` (disjoint interval lists, used for reclaimed stream ids) |
+| Connection | `quic_connection`, `quic_connection_state.hrl`, `quic_cid` (both connection ID pools and the two active_connection_id_limits), `quic_pqueue` (the send queue's urgency buckets, RFC 9218), `quic_reassembly` (out-of-order buffers), `quic_interval` (disjoint interval lists, used for reclaimed stream ids) |
 | Protocol | `quic_packet`, `quic_frame`, `quic_varint` |
 | Crypto | `quic_crypto`, `quic_tls`, `quic_tls_negotiation` (cipher, ALPN and group choices), `quic_keys`, `quic_aead`, `quic_aead_ctx`, `quic_hkdf`, `quic_crypto_nif`, `quic_cert`, `quic_keylog` |
 | Recovery | `quic_cc` with `quic_cc_newreno`, `quic_cc_cubic`, `quic_cc_bbr`; `quic_loss`, `quic_ack` (the connection's ACK range and frame path, plus an `#ack_state{}` accumulator only tests drive) |
@@ -40,11 +40,11 @@ Most called, so most expensive to change:
 | `quic_varint` | 112 | 8 | 0 |
 | `quic_crypto` | 671 | 6 | 1 |
 | `quic_listener` | 1,411 | 5 | 8 |
-| `quic_connection` | 12,654 | 5 | 21 |
+| `quic_connection` | 12,515 | 5 | 22 |
 | `quic_cc` | 401 | 4 | 1 |
 | `quic_h3` | 836 | 4 | 2 |
 
-`quic_connection` calling 21 other modules and being called by 5 is the shape to keep in mind: it is the hub, and almost any protocol change lands in it.
+`quic_connection` calling 22 other modules and being called by 5 is the shape to keep in mind: it is the hub, and almost any protocol change lands in it.
 
 ## Modules no grep will lead you to
 
@@ -77,7 +77,7 @@ The ones worth knowing:
 The two hot paths have their own walkthroughs: [SEND_PATH.md](SEND_PATH.md) and
 [RECV_PATH.md](RECV_PATH.md).
 
-`#state{}` lives in `src/quic_connection_state.hrl` and has 194 fields. When you change one, grep for the field name rather than reading the function you are in: most fields are touched in several regions.
+`#state{}` lives in `src/quic_connection_state.hrl` and has 191 fields. When you change one, grep for the field name rather than reading the function you are in: most fields are touched in several regions.
 
 ## Where tests live
 
