@@ -107,6 +107,64 @@ replacement_only_for_a_retired_dcid_test() ->
     ?assertEqual({ok, <<2:64>>}, quic_cid:replacement_for_retired_dcid(Pool2, ?PEER_SCID)).
 
 %%====================================================================
+%% Binding a CID to a path and retiring it
+%%====================================================================
+
+%% A CID bound to one path is never offered to another: RFC 9000
+%% Section 9.5 forbids the same CID appearing on two paths.
+binding_takes_a_cid_out_of_circulation_test() ->
+    {ok, Pool1, []} = quic_cid:add_peer_cid(peer_pool(), 1, 0, <<1:64>>, undefined),
+    {ok, Pool2, CID, Seq} = quic_cid:bind_peer_cid(Pool1, path_a, ?PEER_SCID),
+    ?assertEqual(1, Seq),
+    ?assertEqual(<<1:64>>, CID),
+    ?assertEqual(none, quic_cid:bind_peer_cid(Pool2, path_b, ?PEER_SCID)),
+    ?assertEqual(not_found, quic_cid:fresh_dcid(Pool2, ?PEER_SCID)).
+
+%% Binding never hands back the CID already in use on the current path:
+%% with only the handshake CID in the pool there is nothing to bind.
+binding_skips_the_current_dcid_test() ->
+    ?assertEqual(none, quic_cid:bind_peer_cid(peer_pool(), path_a, ?PEER_SCID)).
+
+%% Retiring by CID reports the sequence number so the caller can send
+%% RETIRE_CONNECTION_ID for it.
+retire_peer_reports_the_sequence_test() ->
+    {ok, Pool1, []} = quic_cid:add_peer_cid(peer_pool(), 1, 0, <<1:64>>, undefined),
+    {ok, Pool2, Seq} = quic_cid:retire_peer(Pool1, <<1:64>>),
+    ?assertEqual(1, Seq),
+    ?assertEqual(1, quic_cid:peer_active_count(Pool2)),
+    ?assertEqual([0], [S || #cid_entry{seq_num = S} <- quic_cid:peer_entries(Pool2), S =/= 1]).
+
+%% An unknown CID and an already-retired one both answer not_found, so
+%% the caller never has to guard before asking.
+retire_peer_is_total_test() ->
+    ?assertEqual(not_found, quic_cid:retire_peer(peer_pool(), <<"nope">>)),
+    {ok, Pool1, _} = quic_cid:retire_peer(peer_pool(), ?PEER_SCID),
+    ?assertEqual(not_found, quic_cid:retire_peer(Pool1, ?PEER_SCID)).
+
+%% A bound CID is still retirable: a failed validation spends it.
+bound_cid_can_be_retired_test() ->
+    {ok, Pool1, []} = quic_cid:add_peer_cid(peer_pool(), 1, 0, <<1:64>>, undefined),
+    {ok, Pool2, CID, _Seq} = quic_cid:bind_peer_cid(Pool1, path_a, ?PEER_SCID),
+    ?assertEqual({ok, 1}, drop_pool(quic_cid:retire_peer(Pool2, CID))).
+
+%%====================================================================
+%% Choosing a destination CID
+%%====================================================================
+
+%% fresh_dcid/2 skips the CID in use and returns another active one.
+fresh_dcid_skips_the_current_test() ->
+    ?assertEqual(not_found, quic_cid:fresh_dcid(peer_pool(), ?PEER_SCID)),
+    {ok, Pool1, []} = quic_cid:add_peer_cid(peer_pool(), 1, 0, <<1:64>>, undefined),
+    ?assertEqual({ok, <<1:64>>}, quic_cid:fresh_dcid(Pool1, ?PEER_SCID)),
+    ?assertEqual({ok, ?PEER_SCID}, quic_cid:fresh_dcid(Pool1, <<1:64>>)).
+
+%% A retired CID is not a candidate.
+fresh_dcid_skips_retired_test() ->
+    {ok, Pool1, []} = quic_cid:add_peer_cid(peer_pool(), 1, 0, <<1:64>>, undefined),
+    {ok, Pool2, _} = quic_cid:retire_peer(Pool1, <<1:64>>),
+    ?assertEqual(not_found, quic_cid:fresh_dcid(Pool2, ?PEER_SCID)).
+
+%%====================================================================
 %% Issuing our own CIDs
 %%====================================================================
 
@@ -178,3 +236,5 @@ peer_pool() ->
 retired_pool(Pool, Seq) ->
     {ok, Retired, _CID} = quic_cid:retire_local(Pool, Seq),
     Retired.
+
+drop_pool({ok, _Pool, Seq}) -> {ok, Seq}.

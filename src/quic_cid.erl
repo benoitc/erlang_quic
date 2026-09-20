@@ -41,11 +41,13 @@
     add_preferred_address_cid/3,
     record_initial_reset_token/2,
     prune_retired_peer/1,
+    retire_peer/2,
     peer_entries/1,
     peer_active_count/1,
 
     %% Choosing a destination CID
     fresh_dcid/2,
+    bind_peer_cid/3,
     replacement_for_retired_dcid/2,
 
     %% Stateless reset
@@ -234,6 +236,21 @@ record_initial_reset_token(Pool, _Token) ->
 prune_retired_peer(#cid_pool_state{peer = Peer} = Pool) ->
     Pool#cid_pool_state{peer = [E || #cid_entry{status = St} = E <- Peer, St =/= retired]}.
 
+%% @doc Retire one peer CID by value, reporting its sequence number so the
+%% caller can announce it. Used when a path stops using a CID, which
+%% RFC 9000 Section 5.1.2 says to retire rather than leave outstanding.
+%%
+%% Total by design: an unknown CID and an already-retired one both answer
+%% not_found, so a caller abandoning a CID never has to guard first.
+-spec retire_peer(pool(), binary()) -> {ok, pool(), non_neg_integer()} | not_found.
+retire_peer(#cid_pool_state{peer = Peer} = Pool, CID) ->
+    case lists:keyfind(CID, #cid_entry.cid, Peer) of
+        #cid_entry{seq_num = SeqNum, status = active} ->
+            {ok, Pool#cid_pool_state{peer = [retire_matching(SeqNum, E) || E <- Peer]}, SeqNum};
+        _ ->
+            not_found
+    end.
+
 -spec peer_entries(pool()) -> [#cid_entry{}].
 peer_entries(#cid_pool_state{peer = Peer}) -> Peer.
 
@@ -244,11 +261,30 @@ peer_active_count(#cid_pool_state{peer = Peer}) -> active_count(Peer).
 %% Choosing a destination CID
 %%====================================================================
 
-%% @doc An active peer CID other than the one in use, for migrating to a new
-%% path.
+%% @doc An active, unbound peer CID other than the one in use.
 -spec fresh_dcid(pool(), binary()) -> {ok, binary()} | not_found.
 fresh_dcid(#cid_pool_state{peer = Peer}, CurrentDCID) ->
-    first_active_other_than(Peer, CurrentDCID).
+    case first_available(Peer, CurrentDCID) of
+        {ok, #cid_entry{cid = CID}} -> {ok, CID};
+        not_found -> not_found
+    end.
+
+%% @doc Take a CID for a new path and bind it there in one step.
+%%
+%% RFC 9000 Section 9.5 forbids the same CID appearing on two paths, so
+%% selection and reservation cannot be separate calls: two paths probing at
+%% once would otherwise pick the same entry. A bound CID is never offered
+%% again, and `none' is what stops a path being probed at all.
+-spec bind_peer_cid(pool(), term(), binary()) ->
+    {ok, pool(), binary(), non_neg_integer()} | none.
+bind_peer_cid(#cid_pool_state{peer = Peer} = Pool, PathRef, CurrentDCID) ->
+    case first_available(Peer, CurrentDCID) of
+        {ok, #cid_entry{seq_num = SeqNum, cid = CID}} ->
+            Bound = [bind_matching(SeqNum, PathRef, E) || E <- Peer],
+            {ok, Pool#cid_pool_state{peer = Bound}, CID, SeqNum};
+        not_found ->
+            none
+    end.
 
 %% @doc A replacement when the CID we send with has just been retired.
 %%
@@ -260,8 +296,8 @@ fresh_dcid(#cid_pool_state{peer = Peer}, CurrentDCID) ->
 replacement_for_retired_dcid(#cid_pool_state{peer = Peer}, CurrentDCID) ->
     case lists:keyfind(CurrentDCID, #cid_entry.cid, Peer) of
         #cid_entry{status = retired} ->
-            case first_active_other_than(Peer, CurrentDCID) of
-                {ok, CID} -> {ok, CID};
+            case first_available(Peer, CurrentDCID) of
+                {ok, #cid_entry{cid = CID}} -> {ok, CID};
                 not_found -> keep
             end;
         _ ->
@@ -326,11 +362,20 @@ retire_matching(SeqNum, #cid_entry{seq_num = SeqNum} = Entry) ->
 retire_matching(_SeqNum, Entry) ->
     Entry.
 
-first_active_other_than([], _CurrentCID) ->
+%% The first entry usable on a new path: active, not already bound to a
+%% path, and not the one we are sending with.
+first_available([], _CurrentCID) ->
     not_found;
-first_active_other_than([#cid_entry{cid = CID, status = active} | _Rest], CurrentCID) when
+first_available(
+    [#cid_entry{cid = CID, status = active, bound_to = undefined} = Entry | _Rest], CurrentCID
+) when
     CID =/= CurrentCID
 ->
-    {ok, CID};
-first_active_other_than([_ | Rest], CurrentCID) ->
-    first_active_other_than(Rest, CurrentCID).
+    {ok, Entry};
+first_available([_ | Rest], CurrentCID) ->
+    first_available(Rest, CurrentCID).
+
+bind_matching(SeqNum, PathRef, #cid_entry{seq_num = SeqNum} = Entry) ->
+    Entry#cid_entry{bound_to = PathRef};
+bind_matching(_SeqNum, _PathRef, Entry) ->
+    Entry.

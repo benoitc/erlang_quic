@@ -501,8 +501,10 @@
     %% RTT estimation for this path
     rtt :: non_neg_integer() | undefined,
 
-    %% CID used on this path (RFC 9000 Section 9.5)
+    %% CID used on this path, and its sequence number so it can be retired
+    %% when the path is abandoned (RFC 9000 Section 9.5)
     dcid :: binary() | undefined,
+    dcid_seq :: non_neg_integer() | undefined,
 
     %% NAT rebinding vs active migration (RFC 9000 Section 9.3)
     %% NAT rebinding: only port changed, same IP
@@ -572,7 +574,12 @@
     stateless_reset_token :: binary() | undefined,
 
     %% Status: active (can be used), retired (no longer valid)
-    status = active :: active | retired
+    status = active :: active | retired,
+
+    %% The path this CID has been bound to, if any. A CID that has appeared
+    %% on one path must not appear on another (RFC 9000 Section 9.5), so a
+    %% bound entry is never handed out again.
+    bound_to :: term() | undefined
 }).
 
 %% Both connection ID pools, held in one #state{} field and owned by

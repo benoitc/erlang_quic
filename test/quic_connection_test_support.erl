@@ -49,6 +49,7 @@
     requeued_offsets/1,
     state_before_initial/2,
     peer_cids/1,
+    await_spare_cid/2,
     local_cids/1,
     pending_frames/1,
     ack_counters/1
@@ -544,6 +545,21 @@ state_before_initial(Role, Limit) ->
 %% The peer CIDs we currently hold, newest first.
 -spec peer_cids(#state{}) -> [#cid_entry{}].
 peer_cids(#state{cid_pool_state = Pool}) -> quic_cid:peer_entries(Pool).
+
+%% Wait until a connection holds a peer CID it can migrate onto.
+%%
+%% RFC 9000 Section 9.5 forbids reusing a CID on a new path, so
+%% `quic:migrate/1' refuses until the peer's NEW_CONNECTION_ID arrives,
+%% which is shortly after `connected' rather than before it.
+-spec await_spare_cid(pid(), non_neg_integer()) -> boolean().
+await_spare_cid(Conn, BudgetMs) ->
+    quic_test_wait:until(
+        fun() ->
+            {_StateName, Data} = sys:get_state(Conn),
+            length([E || #cid_entry{status = active} = E <- peer_cids(Data)]) > 1
+        end,
+        BudgetMs
+    ).
 
 %% Frames queued in the pending coalesced packet, in send order.
 -spec pending_frames(#state{}) -> [term()].
