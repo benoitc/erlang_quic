@@ -254,16 +254,16 @@ pto_backoff_test() ->
     LossState = quic_loss:new(),
     S1 = quic_loss:update_rtt(LossState, 100, 0),
 
-    PTO0 = quic_loss:get_pto(S1),
+    PTO0 = quic_loss:get_pto(S1, handshake),
 
     %% First PTO expired
     S2 = quic_loss:on_pto_expired(S1),
-    PTO1 = quic_loss:get_pto(S2),
+    PTO1 = quic_loss:get_pto(S2, handshake),
     ?assertEqual(PTO0 * 2, PTO1),
 
     %% Second PTO expired
     S3 = quic_loss:on_pto_expired(S2),
-    PTO2 = quic_loss:get_pto(S3),
+    PTO2 = quic_loss:get_pto(S3, handshake),
     ?assertEqual(PTO0 * 4, PTO2),
 
     %% Send packet does NOT reset PTO count (per RFC 9002)

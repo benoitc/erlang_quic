@@ -98,32 +98,32 @@ initial_pto_test() ->
     %% Initial: smoothed_rtt=100, rtt_var=50, max_ack_delay=25.
     %% Before confirmation max_ack_delay is left out:
     %% PTO = 100 + max(4*50, 1) = 300
-    ?assertEqual(300, quic_loss:get_pto(State)),
+    ?assertEqual(300, quic_loss:get_pto(State, handshake)),
     %% After it: PTO = 100 + 200 + 25 = 325
-    ?assertEqual(325, quic_loss:get_pto(quic_loss:on_handshake_confirmed(State))).
+    ?assertEqual(325, quic_loss:get_pto(quic_loss:on_handshake_confirmed(State), app)).
 
 pto_after_rtt_sample_test() ->
     State = quic_loss:new(),
     S1 = quic_loss:update_rtt(State, 50, 0),
     %% smoothed_rtt=50, rtt_var=25, max_ack_delay=25.
     %% Before confirmation: PTO = 50 + max(4*25, 1) = 150
-    ?assertEqual(150, quic_loss:get_pto(S1)),
+    ?assertEqual(150, quic_loss:get_pto(S1, handshake)),
     %% After it: PTO = 50 + 100 + 25 = 175
-    ?assertEqual(175, quic_loss:get_pto(quic_loss:on_handshake_confirmed(S1))).
+    ?assertEqual(175, quic_loss:get_pto(quic_loss:on_handshake_confirmed(S1), app)).
 
 pto_exponential_backoff_test() ->
     State = quic_loss:new(),
     S1 = quic_loss:update_rtt(State, 100, 0),
-    PTO0 = quic_loss:get_pto(S1),
+    PTO0 = quic_loss:get_pto(S1, handshake),
 
     S2 = quic_loss:on_pto_expired(S1),
     ?assertEqual(1, quic_loss:pto_count(S2)),
-    PTO1 = quic_loss:get_pto(S2),
+    PTO1 = quic_loss:get_pto(S2, handshake),
     ?assertEqual(PTO0 * 2, PTO1),
 
     S3 = quic_loss:on_pto_expired(S2),
     ?assertEqual(2, quic_loss:pto_count(S3)),
-    PTO2 = quic_loss:get_pto(S3),
+    PTO2 = quic_loss:get_pto(S3, handshake),
     ?assertEqual(PTO0 * 4, PTO2).
 
 %% Test that PTO count is NOT reset on packet send

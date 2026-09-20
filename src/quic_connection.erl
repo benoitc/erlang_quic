@@ -1983,7 +1983,7 @@ draining(
         case LossState of
             % Fallback if loss state not initialized
             undefined -> 3000;
-            _ -> 3 * quic_loss:get_pto(LossState)
+            _ -> 3 * quic_loss:get_pto(LossState, app)
         end,
     TimerRef = erlang:send_after(DrainTimeout, self(), drain_timeout),
     {keep_state, State#state{timer_ref = TimerRef}};
@@ -4770,22 +4770,9 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                             true ->
                                 quic_cc:on_packets_acked(CCState, AckedBytes, LargestAckedSentTime)
                         end,
-                    CCState2 = quic_cc:on_packets_lost(CCState1, LostBytes),
-
-                    %% If there was loss, signal congestion event using pre-computed sent time
-                    CCState3 =
-                        case LargestLostSentTime of
-                            undefined ->
-                                CCState2;
-                            _ ->
-                                quic_cc:on_congestion_event(CCState2, LargestLostSentTime)
-                        end,
-
-                    %% Process ECN counts if present (RFC 9002 Section 7.1)
-                    CCState4 = process_ecn_counts(ECN, CCState3),
-
-                    %% Check for persistent congestion (RFC 9002 Section 7.6)
-                    CCState5 = check_persistent_congestion(LostPackets, NewLossState, CCState4),
+                    CCState5 = cc_after_loss(
+                        CCState1, LostBytes, LargestLostSentTime, ECN, LostPackets, NewLossState
+                    ),
 
                     %% Update pacing rate based on new RTT estimate (RFC 9002 Section 7.7)
                     %% Only update pacing when we have a real RTT sample to avoid
@@ -6650,7 +6637,7 @@ handle_hello_retry_request(
 %% probes the handshake space, and the interval doubles on each attempt.
 arm_hs_flight_timer(#state{loss_state = LossState, hs_flight_tries = Tries} = State) ->
     _ = cancel_timer(State#state.hs_flight_timer),
-    Base = max(?HS_FLIGHT_MIN_INTERVAL, quic_loss:get_pto(LossState)),
+    Base = max(?HS_FLIGHT_MIN_INTERVAL, quic_loss:get_pto(LossState, handshake)),
     Timeout = min(?HS_FLIGHT_MAX_INTERVAL, Base bsl min(Tries, 4)),
     Ref = make_ref(),
     erlang:send_after(Timeout, self(), {hs_flight_timeout, Ref}),
@@ -7451,6 +7438,31 @@ process_ecn_counts(undefined, CCState) ->
 process_ecn_counts({_ECT0, _ECT1, ECNCE}, CCState) ->
     %% RFC 9002: An increase in ECN-CE count triggers congestion response
     quic_cc:on_ecn_ce(CCState, ECNCE).
+
+%% @doc The congestion-control consequences of declaring packets lost,
+%% in the order both the ACK path and the loss-detection timer apply
+%% them. ECN counts ride along because on an ACK they land between the
+%% congestion event and the persistent-congestion check, and
+%% `on_congestion_event/2' is guarded on the recovery period, so the
+%% order of the two is observable. A timer-driven loss has no ACK and
+%% passes `undefined', which process_ecn_counts/2 treats as a no-op.
+-spec cc_after_loss(
+    quic_cc:cc_state(),
+    non_neg_integer(),
+    non_neg_integer() | undefined,
+    term(),
+    [#sent_packet{}],
+    quic_loss:loss_state()
+) -> quic_cc:cc_state().
+cc_after_loss(CCState, LostBytes, LargestLostSentTime, ECN, LostPackets, LossState) ->
+    CC1 = quic_cc:on_packets_lost(CCState, LostBytes),
+    CC2 =
+        case LargestLostSentTime of
+            undefined -> CC1;
+            _ -> quic_cc:on_congestion_event(CC1, LargestLostSentTime)
+        end,
+    CC3 = process_ecn_counts(ECN, CC2),
+    check_persistent_congestion(LostPackets, LossState, CC3).
 
 %% Check for persistent congestion (RFC 9002 Section 7.6)
 %% If lost packets span more than PTO * 3, reset to minimum window
@@ -10439,7 +10451,17 @@ set_pto_timer(
 ) ->
     case quic_loss:bytes_in_flight(LossState) > 0 of
         true ->
-            PTO = quic_loss:get_pto(LossState),
+            %% The armed timer is for application data, but before
+            %% confirmation it is sized with max_ack_delay 0, which is
+            %% Initial and Handshake timing. That inversion is the
+            %% defect; it is preserved here and removed once Initial and
+            %% Handshake sends are registered and this call becomes
+            %% quic_loss:get_pto_time_and_space/3.
+            PTO =
+                case quic_loss:handshake_confirmed(LossState) of
+                    true -> quic_loss:get_pto(LossState, app);
+                    false -> quic_loss:get_pto(LossState, handshake)
+                end,
             Now = erlang:monotonic_time(millisecond),
             NewDeadline = Now + PTO,
             case OldTimer =/= undefined andalso NewDeadline + ?PTO_RESET_TOLERANCE_MS >= ArmedAt of
@@ -11555,7 +11577,7 @@ start_path_validation_timer(
     Timeout =
         case LossState of
             undefined -> 3000;
-            _ -> 3 * quic_loss:get_pto(LossState)
+            _ -> 3 * quic_loss:get_pto(LossState, app)
         end,
     %% Use same token for both message and state - enables stale timeout detection
     ValidationToken = make_ref(),

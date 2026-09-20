@@ -57,7 +57,8 @@
     min_rtt/1,
 
     %% PTO
-    get_pto/1,
+    get_pto/2,
+    get_pto_time_and_space/3,
     persistent_congestion_pto/1,
     on_pto_expired/1,
 
@@ -690,16 +691,65 @@ min_rtt(#loss_state{min_rtt = M}) -> M.
 %% Probe Timeout (RFC 9002 Section 6.2)
 %%====================================================================
 
-%% @doc Calculate the Probe Timeout.
-%% PTO = smoothed_rtt + max(4 * rttvar, kGranularity) + max_ack_delay
--spec get_pto(loss_state()) -> non_neg_integer().
-get_pto(#loss_state{handshake_confirmed = true, max_ack_delay = MaxAckDelay} = State) ->
+%% @doc The PTO for one packet number space. max_ack_delay applies only
+%% to Application Data: the peer is expected not to delay Initial or
+%% Handshake acknowledgements (RFC 9002 Section 6.2.1).
+-spec get_pto(loss_state(), space()) -> non_neg_integer().
+get_pto(#loss_state{max_ack_delay = MaxAckDelay} = State, app) ->
     pto(State, MaxAckDelay);
-get_pto(#loss_state{} = State) ->
-    %% RFC 9002 Section 6.2.1: Initial and Handshake PTO use 0 for
-    %% max_ack_delay, and the application-data PTO is not armed until
-    %% the handshake is confirmed.
+get_pto(#loss_state{} = State, Space) when Space =:= initial; Space =:= handshake ->
     pto(State, 0).
+
+%% @doc RFC 9002 Appendix A.8 GetPtoTimeAndSpace: the earliest probe
+%% deadline and the space it belongs to, as an absolute monotonic
+%% millisecond time, or `none' when no probe should be armed.
+%%
+%% Two rules here carry the weight. With nothing ack-eliciting in flight
+%% anywhere the peer cannot have completed address validation, so an
+%% anti-deadlock probe is armed from now to keep the client sending;
+%% that is the client's job, and a server blocked at its amplification
+%% limit is stopped before this by the caller. And Application Data is
+%% skipped entirely until the handshake is confirmed, which Section
+%% 6.2.1 makes a MUST NOT rather than a preference.
+-spec get_pto_time_and_space(loss_state(), integer(), #handshake_status{}) ->
+    {integer(), space()} | none.
+get_pto_time_and_space(#loss_state{} = State, Now, #handshake_status{} = HS) ->
+    case total_ae_in_flight(State) of
+        0 ->
+            anti_deadlock_pto(State, Now, HS);
+        _ ->
+            earliest_pto(State, [initial, handshake, app], none)
+    end.
+
+anti_deadlock_pto(_State, _Now, #handshake_status{peer_completed_address_validation = true}) ->
+    none;
+anti_deadlock_pto(State, Now, #handshake_status{has_handshake_keys = true}) ->
+    {Now + get_pto(State, handshake), handshake};
+anti_deadlock_pto(State, Now, #handshake_status{}) ->
+    {Now + get_pto(State, initial), initial}.
+
+earliest_pto(_State, [], Best) ->
+    Best;
+earliest_pto(#loss_state{handshake_confirmed = false}, [app | _Rest], Best) ->
+    %% RFC 9002 Section 6.2.1: stop before Application Data while the
+    %% handshake is unconfirmed rather than skipping past it.
+    Best;
+earliest_pto(State, [Space | Rest], Best) ->
+    case pn(Space, State) of
+        #pn_loss{ae_in_flight = 0} ->
+            earliest_pto(State, Rest, Best);
+        #pn_loss{last_ae_sent = undefined} ->
+            earliest_pto(State, Rest, Best);
+        #pn_loss{last_ae_sent = Sent} ->
+            earliest_pto(State, Rest, earlier({Sent + get_pto(State, Space), Space}, Best))
+    end.
+
+earlier(Candidate, none) -> Candidate;
+earlier({T1, _} = C, {T2, _}) when T1 < T2 -> C;
+earlier(_C, Best) -> Best.
+
+total_ae_in_flight(#loss_state{initial = I, handshake = H, app = A}) ->
+    I#pn_loss.ae_in_flight + H#pn_loss.ae_in_flight + A#pn_loss.ae_in_flight.
 
 %% @doc The PTO the persistent congestion window is built from
 %% (RFC 9002 Section 7.6.1): max_ack_delay whatever the packet number space,

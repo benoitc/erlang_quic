@@ -278,11 +278,11 @@ prop_loss_pto_backoff() ->
         exactly(true),
         begin
             State = quic_loss:new(),
-            PTO0 = quic_loss:get_pto(State),
+            PTO0 = quic_loss:get_pto(State, handshake),
             S1 = quic_loss:on_pto_expired(State),
-            PTO1 = quic_loss:get_pto(S1),
+            PTO1 = quic_loss:get_pto(S1, handshake),
             S2 = quic_loss:on_pto_expired(S1),
-            PTO2 = quic_loss:get_pto(S2),
+            PTO2 = quic_loss:get_pto(S2, handshake),
             PTO1 =:= PTO0 * 2 andalso PTO2 =:= PTO0 * 4
         end
     ).

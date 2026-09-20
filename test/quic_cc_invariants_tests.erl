@@ -230,22 +230,22 @@ no_spurious_loss_sequential_acks_test() ->
 pto_backoff_maintained_test() ->
     State = quic_loss:new(),
     S1 = quic_loss:update_rtt(State, 100, 0),
-    BasePTO = quic_loss:get_pto(S1),
+    BasePTO = quic_loss:get_pto(S1, handshake),
 
     %% First PTO expiry
     S2 = quic_loss:on_pto_expired(S1),
     ?assertEqual(1, quic_loss:pto_count(S2)),
-    ?assertEqual(BasePTO * 2, quic_loss:get_pto(S2)),
+    ?assertEqual(BasePTO * 2, quic_loss:get_pto(S2, handshake)),
 
     %% Second PTO expiry
     S3 = quic_loss:on_pto_expired(S2),
     ?assertEqual(2, quic_loss:pto_count(S3)),
-    ?assertEqual(BasePTO * 4, quic_loss:get_pto(S3)),
+    ?assertEqual(BasePTO * 4, quic_loss:get_pto(S3, handshake)),
 
     %% Third PTO expiry
     S4 = quic_loss:on_pto_expired(S3),
     ?assertEqual(3, quic_loss:pto_count(S4)),
-    ?assertEqual(BasePTO * 8, quic_loss:get_pto(S4)).
+    ?assertEqual(BasePTO * 8, quic_loss:get_pto(S4, handshake)).
 
 %% Test PTO backoff should reset only on new ack-eliciting data, not probes
 %% NOTE: This test documents the EXPECTED behavior per RFC 9002

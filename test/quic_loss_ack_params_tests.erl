@@ -52,12 +52,12 @@ confirmed_ack_delay_is_capped_at_peer_value_test() ->
 %% 4 * rttvar 200.
 unconfirmed_pto_excludes_max_ack_delay_test() ->
     S = quic_loss:set_peer_ack_params(quic_loss:new(), 3, 10),
-    ?assertEqual(300, quic_loss:get_pto(S)).
+    ?assertEqual(300, quic_loss:get_pto(S, handshake)).
 
 %% Once confirmed, the peer's max_ack_delay is added, not the default 25.
 confirmed_pto_includes_peer_max_ack_delay_test() ->
     S = confirmed(quic_loss:set_peer_ack_params(quic_loss:new(), 3, 10)),
-    ?assertEqual(310, quic_loss:get_pto(S)).
+    ?assertEqual(310, quic_loss:get_pto(S, app)).
 
 %% The persistent congestion window includes max_ack_delay whatever the
 %% packet number space (RFC 9002 Section 7.6.1), so confirmation does
@@ -76,9 +76,9 @@ persistent_congestion_includes_max_ack_delay_test() ->
 %% only thing that can differ between them.
 persistent_congestion_excludes_pto_backoff_test() ->
     S0 = confirmed(quic_loss:set_peer_ack_params(quic_loss:new(), 3, 10)),
-    ?assertEqual(310, quic_loss:get_pto(S0)),
+    ?assertEqual(310, quic_loss:get_pto(S0, app)),
     S2 = quic_loss:on_pto_expired(quic_loss:on_pto_expired(S0)),
-    ?assertEqual(310 * 4, quic_loss:get_pto(S2)),
+    ?assertEqual(310 * 4, quic_loss:get_pto(S2, app)),
     ?assertEqual(310, quic_loss:persistent_congestion_pto(S2)).
 
 %% A path change resets the RTT estimate, not what the peer negotiated or
@@ -86,7 +86,7 @@ persistent_congestion_excludes_pto_backoff_test() ->
 path_reset_keeps_peer_params_test() ->
     S = confirmed(quic_loss:set_peer_ack_params(quic_loss:new(), 3, 10)),
     R = quic_loss:reset_for_new_path(S),
-    ?assertEqual(310, quic_loss:get_pto(R)).
+    ?assertEqual(310, quic_loss:get_pto(R, app)).
 
 %%====================================================================
 %% Through the connection
@@ -105,7 +105,7 @@ transport_params_reach_loss_state_test() ->
     ?assertEqual(undefined, quic_connection_test_support:close_reason(S3)),
     L = quic_connection_test_support:loss_state(S3),
     ?assertEqual(310, quic_loss:persistent_congestion_pto(L)),
-    ?assertEqual(300, quic_loss:get_pto(L)),
+    ?assertEqual(300, quic_loss:get_pto(L, handshake)),
     L1 = acked(sent(primed(L), 1, 1000), 1, 2000, 1200),
     ?assertEqual(104, quic_loss:smoothed_rtt(L1)).
 
@@ -116,9 +116,11 @@ handshake_done_confirms_client_test() ->
     S1 = quic_connection_test_support:state_set(
         S0, loss_state, quic_loss:set_peer_ack_params(quic_loss:new(), 3, 10)
     ),
-    ?assertEqual(300, quic_loss:get_pto(quic_connection_test_support:loss_state(S1))),
+    ?assertEqual(
+        300, quic_loss:get_pto(quic_connection_test_support:loss_state(S1), handshake)
+    ),
     S2 = quic_connection:process_frame(app, handshake_done, S1),
-    ?assertEqual(310, quic_loss:get_pto(quic_connection_test_support:loss_state(S2))).
+    ?assertEqual(310, quic_loss:get_pto(quic_connection_test_support:loss_state(S2), app)).
 
 %% Both confirmation points are reached on a real handshake: once
 %% confirmed, the PTO carries max_ack_delay just as the persistent
