@@ -69,7 +69,7 @@ high_packet_rate_ack_processing_test() ->
     %% Send 1000 packets
     {Loss1, _Sent} = lists:foldl(
         fun(PN, {L, S}) ->
-            L1 = quic_loss:on_packet_sent(L, PN, 100, true),
+            L1 = quic_loss:on_packet_sent(app, L, PN, 100, true),
             {L1, S ++ [PN]}
         end,
         {LossState, []},
@@ -79,7 +79,7 @@ high_packet_rate_ack_processing_test() ->
     %% Process ACKs for all packets
     AckFrame = {ack, 999, 0, 999, []},
     Now = erlang:monotonic_time(millisecond),
-    {_Loss2, Acked, Lost, _Meta} = quic_loss:on_ack_received(Loss1, AckFrame, Now),
+    {_Loss2, Acked, Lost, _Meta} = quic_loss:on_ack_received(app, Loss1, AckFrame, Now),
 
     ?assertEqual(1000, length(Acked)),
     ?assertEqual(0, length(Lost)).
@@ -91,7 +91,7 @@ high_packet_rate_with_loss_test() ->
     %% Send 100 packets
     Loss1 = lists:foldl(
         fun(PN, L) ->
-            quic_loss:on_packet_sent(L, PN, 100, true)
+            quic_loss:on_packet_sent(app, L, PN, 100, true)
         end,
         LossState,
         lists:seq(0, 99)
@@ -100,7 +100,7 @@ high_packet_rate_with_loss_test() ->
     %% ACK only packets 50-99 (causing loss detection for 0-46)
     AckFrame = {ack, 99, 0, 49, []},
     Now = erlang:monotonic_time(millisecond),
-    {_Loss2, Acked, Lost, _Meta} = quic_loss:on_ack_received(Loss1, AckFrame, Now),
+    {_Loss2, Acked, Lost, _Meta} = quic_loss:on_ack_received(app, Loss1, AckFrame, Now),
 
     ?assertEqual(50, length(Acked)),
     %% Loss detection by packet threshold (99 - 3 = 96, so 0-46 lost)
@@ -182,11 +182,11 @@ rtt_variation_test() ->
 
     FinalState = lists:foldl(
         fun({PN, RTT}, S) ->
-            S1 = quic_loss:on_packet_sent(S, PN, 100, true),
+            S1 = quic_loss:on_packet_sent(app, S, PN, 100, true),
             timer:sleep(1),
             Now = erlang:monotonic_time(millisecond),
             AckFrame = {ack, PN, RTT, 0, []},
-            {S2, _, _, _} = quic_loss:on_ack_received(S1, AckFrame, Now),
+            {S2, _, _, _} = quic_loss:on_ack_received(app, S1, AckFrame, Now),
             S2
         end,
         LossState,
@@ -203,13 +203,13 @@ rtt_spike_test() ->
     LossState = quic_loss:new(),
 
     %% Normal RTT, then spike, then normal
-    S1 = quic_loss:on_packet_sent(LossState, 0, 100, true),
+    S1 = quic_loss:on_packet_sent(app, LossState, 0, 100, true),
     S2 = quic_loss:update_rtt(S1, 50, 0),
 
-    S3 = quic_loss:on_packet_sent(S2, 1, 100, true),
+    S3 = quic_loss:on_packet_sent(app, S2, 1, 100, true),
     S4 = quic_loss:update_rtt(S3, 500, 0),
 
-    S5 = quic_loss:on_packet_sent(S4, 2, 100, true),
+    S5 = quic_loss:on_packet_sent(app, S4, 2, 100, true),
     S6 = quic_loss:update_rtt(S5, 60, 0),
 
     %% SRTT should smooth out the spike
@@ -267,12 +267,12 @@ pto_backoff_test() ->
     ?assertEqual(PTO0 * 4, PTO2),
 
     %% Send packet does NOT reset PTO count (per RFC 9002)
-    S4 = quic_loss:on_packet_sent(S3, 0, 100, true),
+    S4 = quic_loss:on_packet_sent(app, S3, 0, 100, true),
     ?assertEqual(2, quic_loss:pto_count(S4)),
 
     %% ACK received resets PTO count
     Now = erlang:monotonic_time(millisecond) + 50,
-    {S5, _, _, _} = quic_loss:on_ack_received(S4, {ack, 0, 0, 0, []}, Now),
+    {S5, _, _, _} = quic_loss:on_ack_received(app, S4, {ack, 0, 0, 0, []}, Now),
     ?assertEqual(0, quic_loss:pto_count(S5)).
 
 %%====================================================================
@@ -311,7 +311,7 @@ send_with_limits(FlowState, CCState, LossState, PacketSize, PN, Remaining) ->
         true ->
             {_, Flow1} = quic_flow:on_data_sent(FlowState, PacketSize),
             CC1 = quic_cc:on_packet_sent(CCState, PacketSize),
-            Loss1 = quic_loss:on_packet_sent(LossState, PN, PacketSize, true),
+            Loss1 = quic_loss:on_packet_sent(app, LossState, PN, PacketSize, true),
             send_with_limits(Flow1, CC1, Loss1, PacketSize, PN + 1, Remaining - 1);
         false ->
             {FlowState, CCState, LossState, PN}

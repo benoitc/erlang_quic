@@ -173,11 +173,14 @@ is_confirmed(Pid) ->
 
 confirmed(S) -> quic_loss:on_handshake_confirmed(S).
 
-sent(S, PN, Now) -> quic_loss:on_packet_sent(S, PN, 1200, true, [ping], Now).
+sent(S, PN, Now) -> quic_loss:on_packet_sent(app, S, PN, 1200, true, [ping], Now).
 
 acked(S, PN, EncodedDelay, Now) ->
     {S1, _Acked, _Lost, _Info} = quic_loss:on_ack_received(
-        S, {ack, PN, EncodedDelay, 0, []}, Now
+        app,
+        S,
+        {ack, PN, EncodedDelay, 0, []},
+        Now
     ),
     S1.
 

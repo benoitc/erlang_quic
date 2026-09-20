@@ -10,7 +10,7 @@
 
 state_with_flight() ->
     L0 = quic_loss:new(),
-    L1 = quic_loss:on_packet_sent(L0, 0, 1200, true, [], erlang:monotonic_time(millisecond)),
+    L1 = quic_loss:on_packet_sent(app, L0, 0, 1200, true, [], erlang:monotonic_time(millisecond)),
     quic_connection_test_support:state_with_loss(L1).
 
 deadline_moving_later_keeps_the_timer_test() ->

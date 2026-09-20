@@ -140,7 +140,7 @@ large_message_fragments_test() ->
             case quic_cc:can_send(CC, PacketSize) of
                 true ->
                     CC1 = quic_cc:on_packet_sent(CC, PacketSize),
-                    Loss1 = quic_loss:on_packet_sent(Loss, PN, PacketSize, true),
+                    Loss1 = quic_loss:on_packet_sent(app, Loss, PN, PacketSize, true),
 
                     %% 1% random loss
                     case rand:uniform(100) of
@@ -420,7 +420,7 @@ ack_processing_large_ranges_test() ->
     %% Send many packets
     S1 = lists:foldl(
         fun(PN, L) ->
-            quic_loss:on_packet_sent(L, PN, 1200, true)
+            quic_loss:on_packet_sent(app, L, PN, 1200, true)
         end,
         State,
         lists:seq(0, NumPackets - 1)
@@ -433,7 +433,7 @@ ack_processing_large_ranges_test() ->
     Now = erlang:monotonic_time(millisecond),
 
     %% This should be fast even with many packets
-    {S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(S1, AckFrame, Now),
+    {S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(app, S1, AckFrame, Now),
 
     ?assertEqual(NumPackets, length(Acked)),
     ?assertEqual(0, length(Lost)),
@@ -557,7 +557,7 @@ tick_blocked_after_loss_burst_test() ->
     {CC1, _Loss1} = lists:foldl(
         fun(PN, {CC, L}) ->
             CC_new = quic_cc:on_packet_sent(CC, PacketSize),
-            L_new = quic_loss:on_packet_sent(L, PN, PacketSize, true),
+            L_new = quic_loss:on_packet_sent(app, L, PN, PacketSize, true),
             {CC_new, L_new}
         end,
         {CCState, LossState},

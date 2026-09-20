@@ -34,7 +34,7 @@
 
 %% One in-flight packet sent at ?SENT_AT.
 with_inflight_packet(State) ->
-    quic_loss:on_packet_sent(State, 1, 1200, true, [], ?SENT_AT).
+    quic_loss:on_packet_sent(app, State, 1, 1200, true, [], ?SENT_AT).
 
 %% Feed RTT samples in order.
 samples(State, Rtts) ->
@@ -122,10 +122,10 @@ spike_scenario(SpreadMs, SampleMs) ->
     Now = erlang:monotonic_time(millisecond),
     Sent = Now - SampleMs,
     S0 = quic_loss:update_rtt(quic_loss:new(), 20, 0),
-    S1 = quic_loss:on_packet_sent(S0, 3, 1200, true, [], Sent - SpreadMs),
-    S2 = quic_loss:on_packet_sent(S1, 4, 1200, true, [], Sent - SpreadMs),
-    S3 = quic_loss:on_packet_sent(S2, 5, 1200, true, [], Sent),
-    quic_loss:on_ack_received(S3, {ack, 5, 0, 0, []}, Now).
+    S1 = quic_loss:on_packet_sent(app, S0, 3, 1200, true, [], Sent - SpreadMs),
+    S2 = quic_loss:on_packet_sent(app, S1, 4, 1200, true, [], Sent - SpreadMs),
+    S3 = quic_loss:on_packet_sent(app, S2, 5, 1200, true, [], Sent),
+    quic_loss:on_ack_received(app, S3, {ack, 5, 0, 0, []}, Now).
 
 a_spike_does_not_declare_the_earlier_flight_lost_test() ->
     %% Settled at 20 ms, then a 400 ms sample. The earlier packets are

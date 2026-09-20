@@ -77,16 +77,16 @@ loss_run_matches_fold_test() ->
         {8, 1200, {stream, 4, 1200, <<"b">>, false}}
     ],
     Fold = lists:foldl(
-        fun({PN, Sz, Fr}, Acc) -> quic_loss:on_packet_sent(Acc, PN, Sz, true, [Fr], Now) end,
+        fun({PN, Sz, Fr}, Acc) -> quic_loss:on_packet_sent(app, Acc, PN, Sz, true, [Fr], Now) end,
         L0,
         Tracked
     ),
-    ?assertEqual(Fold, quic_loss:on_packets_sent_run(L0, Tracked, Now)),
+    ?assertEqual(Fold, quic_loss:on_packets_sent_run(app, L0, Tracked, Now)),
     %% With bytes already outstanding, outstanding_since is kept.
-    L1 = quic_loss:on_packet_sent(L0, 1, 500, true, [], 100),
+    L1 = quic_loss:on_packet_sent(app, L0, 1, 500, true, [], 100),
     Fold1 = lists:foldl(
-        fun({PN, Sz, Fr}, Acc) -> quic_loss:on_packet_sent(Acc, PN, Sz, true, [Fr], Now) end,
+        fun({PN, Sz, Fr}, Acc) -> quic_loss:on_packet_sent(app, Acc, PN, Sz, true, [Fr], Now) end,
         L1,
         Tracked
     ),
-    ?assertEqual(Fold1, quic_loss:on_packets_sent_run(L1, Tracked, Now)).
+    ?assertEqual(Fold1, quic_loss:on_packets_sent_run(app, L1, Tracked, Now)).

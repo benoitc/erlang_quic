@@ -249,7 +249,7 @@ prop_loss_bytes_in_flight() ->
             State = quic_loss:new(),
             {FinalState, _} = lists:foldl(
                 fun(Size, {S, PN}) ->
-                    {quic_loss:on_packet_sent(S, PN, Size, true), PN + 1}
+                    {quic_loss:on_packet_sent(app, S, PN, Size, true), PN + 1}
                 end,
                 {State, 0},
                 Sizes

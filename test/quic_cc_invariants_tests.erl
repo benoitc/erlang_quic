@@ -154,7 +154,7 @@ time_loss_requires_larger_acked_test() ->
     State = quic_loss:new(),
 
     %% Send packet 0
-    S1 = quic_loss:on_packet_sent(State, 0, 1000, true, []),
+    S1 = quic_loss:on_packet_sent(app, State, 0, 1000, true, []),
 
     %% Wait long enough for time-based loss threshold
     timer:sleep(500),
@@ -163,7 +163,7 @@ time_loss_requires_larger_acked_test() ->
     %% This should NOT declare packet 0 lost
     AckFrame = {ack, 0, 0, 0, []},
     Now = erlang:monotonic_time(millisecond),
-    {_S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(S1, AckFrame, Now),
+    {_S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(app, S1, AckFrame, Now),
 
     %% Packet 0 should be acked, not lost
     ?assertEqual(1, length(Acked)),
@@ -176,7 +176,7 @@ packet_threshold_loss_test() ->
     %% Send packets 0, 1, 2, 3, 4
     S1 = lists:foldl(
         fun(PN, Acc) ->
-            quic_loss:on_packet_sent(Acc, PN, 1000, true, [])
+            quic_loss:on_packet_sent(app, Acc, PN, 1000, true, [])
         end,
         State,
         lists:seq(0, 4)
@@ -186,7 +186,7 @@ packet_threshold_loss_test() ->
     %% With PACKET_THRESHOLD = 3, packets 0 and 1 should be lost
     AckFrame = {ack, 4, 0, 0, []},
     Now = erlang:monotonic_time(millisecond),
-    {_S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(S1, AckFrame, Now),
+    {_S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(app, S1, AckFrame, Now),
 
     ?assertEqual(1, length(Acked)),
     %% Packets 0 and 1 should be declared lost (gap >= 3)
@@ -201,7 +201,7 @@ no_spurious_loss_sequential_acks_test() ->
     %% Send packets 0, 1, 2
     S1 = lists:foldl(
         fun(PN, Acc) ->
-            quic_loss:on_packet_sent(Acc, PN, 1000, true, [])
+            quic_loss:on_packet_sent(app, Acc, PN, 1000, true, [])
         end,
         State,
         lists:seq(0, 2)
@@ -210,15 +210,15 @@ no_spurious_loss_sequential_acks_test() ->
     %% ACK packets in order with small delay
     Now = erlang:monotonic_time(millisecond) + 10,
 
-    {S2, Acked1, Lost1, _} = quic_loss:on_ack_received(S1, {ack, 0, 0, 0, []}, Now),
+    {S2, Acked1, Lost1, _} = quic_loss:on_ack_received(app, S1, {ack, 0, 0, 0, []}, Now),
     ?assertEqual(1, length(Acked1)),
     ?assertEqual(0, length(Lost1)),
 
-    {S3, Acked2, Lost2, _} = quic_loss:on_ack_received(S2, {ack, 1, 0, 0, []}, Now + 5),
+    {S3, Acked2, Lost2, _} = quic_loss:on_ack_received(app, S2, {ack, 1, 0, 0, []}, Now + 5),
     ?assertEqual(1, length(Acked2)),
     ?assertEqual(0, length(Lost2)),
 
-    {_S4, Acked3, Lost3, _} = quic_loss:on_ack_received(S3, {ack, 2, 0, 0, []}, Now + 10),
+    {_S4, Acked3, Lost3, _} = quic_loss:on_ack_received(app, S3, {ack, 2, 0, 0, []}, Now + 10),
     ?assertEqual(1, length(Acked3)),
     ?assertEqual(0, length(Lost3)).
 
@@ -255,7 +255,7 @@ pto_backoff_reset_on_ack_only_test() ->
     S1 = quic_loss:update_rtt(State, 100, 0),
 
     %% Send initial packet
-    S2 = quic_loss:on_packet_sent(S1, 0, 1000, true, []),
+    S2 = quic_loss:on_packet_sent(app, S1, 0, 1000, true, []),
 
     %% Simulate PTO timeout
     S3 = quic_loss:on_pto_expired(S2),
@@ -263,7 +263,7 @@ pto_backoff_reset_on_ack_only_test() ->
 
     %% ACK the original packet - should reset PTO count
     Now = erlang:monotonic_time(millisecond) + 200,
-    {S4, _Acked, _Lost, _Meta} = quic_loss:on_ack_received(S3, {ack, 0, 0, 0, []}, Now),
+    {S4, _Acked, _Lost, _Meta} = quic_loss:on_ack_received(app, S3, {ack, 0, 0, 0, []}, Now),
 
     %% After ACK, PTO count should be reset
     ?assertEqual(0, quic_loss:pto_count(S4)).

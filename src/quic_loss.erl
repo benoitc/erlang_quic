@@ -35,18 +35,18 @@
     new/1,
 
     %% Packet tracking
-    on_packet_sent/4,
     on_packet_sent/5,
     on_packet_sent/6,
-    on_packets_sent_run/3,
-    on_ack_received/3,
+    on_packet_sent/7,
+    on_packets_sent_run/4,
+    on_ack_received/4,
 
     %% Retransmission
     retransmittable_frames/1,
     stream_has_unacked_below/3,
 
     %% Loss detection
-    detect_lost_packets/2,
+    detect_lost_packets/3,
     get_loss_time_and_space/1,
 
     %% RTT
@@ -66,11 +66,11 @@
     on_handshake_confirmed/1,
 
     %% Queries
-    sent_packets/1,
+    sent_packets/2,
     bytes_in_flight/1,
     last_progress/1,
     pto_count/1,
-    oldest_unacked/1,
+    oldest_unacked/2,
     has_rtt_sample/1,
     handshake_confirmed/1
 ]).
@@ -87,7 +87,7 @@
 
 %% Loss detection state.
 %%
-%% `sent_q' is an oldest-first queue of #sent_packet{}. Because sent
+%% Each space's `sent_q' is an oldest-first queue of #sent_packet{}. Because sent
 %% packet numbers are strictly monotonically increasing, the queue's
 %% insertion order is also PN order and time_sent order, so:
 %%   - on_packet_sent: queue:in/2 at the tail (amortised O(1))
@@ -97,8 +97,27 @@
 %% This replaces the previous dual map + gb_sets representation,
 %% which paid O(log n) per send/ack/loss-scan and showed up in the
 %% profile as the dominant CPU cost (gb_sets:*).
--record(loss_state, {
+%% Per-packet-number-space loss state (RFC 9002 Appendix A.3). Packet
+%% numbers restart per space, so a queue shared across spaces would let
+%% a Handshake ACK of PN 0..N acknowledge the first N application
+%% packets.
+-record(pn_loss, {
     sent_q = queue:new() :: queue:queue(#sent_packet{}),
+    loss_time = undefined :: non_neg_integer() | undefined,
+    largest_acked = undefined :: non_neg_integer() | undefined,
+
+    %% When the most recent ack-eliciting packet went out, which is what
+    %% the PTO deadline is measured from, and how many are outstanding.
+    last_ae_sent = undefined :: integer() | undefined,
+    ae_in_flight = 0 :: non_neg_integer()
+}).
+
+-record(loss_state, {
+    %% One per space. Only `app' is populated until the connection
+    %% registers Initial and Handshake sends.
+    initial = #pn_loss{} :: #pn_loss{},
+    handshake = #pn_loss{} :: #pn_loss{},
+    app = #pn_loss{} :: #pn_loss{},
 
     %% RTT estimation
     latest_rtt = 0 :: non_neg_integer(),
@@ -107,8 +126,7 @@
     min_rtt = infinity :: non_neg_integer() | infinity,
     first_rtt_sample = false :: boolean(),
 
-    %% Loss detection
-    loss_time = undefined :: non_neg_integer() | undefined,
+    %% Loss detection. loss_time is per space, in #pn_loss{}.
     time_of_last_ack = undefined :: non_neg_integer() | undefined,
 
     %% When the current outstanding burst started: set whenever an
@@ -158,8 +176,35 @@ reset_for_new_path(#loss_state{} = S) ->
         min_rtt = infinity,
         first_rtt_sample = false,
         pto_count = 0,
-        loss_time = undefined
+        initial = clear_loss_time(S#loss_state.initial),
+        handshake = clear_loss_time(S#loss_state.handshake),
+        app = clear_loss_time(S#loss_state.app)
     }.
+
+clear_loss_time(#pn_loss{} = P) -> P#pn_loss{loss_time = undefined}.
+
+%% largest_acked only ever moves forward: a reordered ACK naming a
+%% smaller largest must not pull it back (RFC 9002 Appendix A.7).
+newest(undefined, New) -> New;
+newest(Old, New) when New > Old -> New;
+newest(Old, _New) -> Old.
+
+%%====================================================================
+%% Packet number spaces
+%%====================================================================
+
+%% Read and write one space's state. Three clauses rather than a map:
+%% a maps:get/put per packet is exactly the per-send cost the queue
+%% representation was introduced to remove.
+-spec pn(space(), loss_state()) -> #pn_loss{}.
+pn(app, #loss_state{app = P}) -> P;
+pn(initial, #loss_state{initial = P}) -> P;
+pn(handshake, #loss_state{handshake = P}) -> P.
+
+-spec set_pn(space(), #pn_loss{}, loss_state()) -> loss_state().
+set_pn(app, P, S) -> S#loss_state{app = P};
+set_pn(initial, P, S) -> S#loss_state{initial = P};
+set_pn(handshake, P, S) -> S#loss_state{handshake = P}.
 
 %%====================================================================
 %% Loss Detection State
@@ -188,25 +233,28 @@ new(Opts) ->
 %%====================================================================
 
 %% @doc Record that a packet was sent (without frames).
--spec on_packet_sent(loss_state(), non_neg_integer(), non_neg_integer(), boolean()) ->
+-spec on_packet_sent(space(), loss_state(), non_neg_integer(), non_neg_integer(), boolean()) ->
     loss_state().
-on_packet_sent(State, PacketNumber, Size, AckEliciting) ->
-    on_packet_sent(State, PacketNumber, Size, AckEliciting, []).
+on_packet_sent(Space, State, PacketNumber, Size, AckEliciting) ->
+    on_packet_sent(Space, State, PacketNumber, Size, AckEliciting, []).
 
 %% @doc Record that a packet was sent with frames. Samples the send
 %% time itself. Callers that already hold a Now should use
 %% on_packet_sent/6 to avoid a duplicate monotonic_time/1 BIF call.
--spec on_packet_sent(loss_state(), non_neg_integer(), non_neg_integer(), boolean(), [term()]) ->
+-spec on_packet_sent(
+    space(), loss_state(), non_neg_integer(), non_neg_integer(), boolean(), [term()]
+) ->
     loss_state().
-on_packet_sent(State, PacketNumber, Size, AckEliciting, Frames) ->
+on_packet_sent(Space, State, PacketNumber, Size, AckEliciting, Frames) ->
     Now = erlang:monotonic_time(millisecond),
-    on_packet_sent(State, PacketNumber, Size, AckEliciting, Frames, Now).
+    on_packet_sent(Space, State, PacketNumber, Size, AckEliciting, Frames, Now).
 
 %% @doc Like on_packet_sent/5 but uses the caller-supplied monotonic
 %% millisecond timestamp. The connection send loop reuses one Now
 %% per packet for both loss tracking and last_activity, saving a
 %% BIF call.
 -spec on_packet_sent(
+    space(),
     loss_state(),
     non_neg_integer(),
     non_neg_integer(),
@@ -215,16 +263,15 @@ on_packet_sent(State, PacketNumber, Size, AckEliciting, Frames) ->
     integer()
 ) -> loss_state().
 on_packet_sent(
-    #loss_state{
-        sent_q = Q,
-        bytes_in_flight = InFlight
-    } = State,
+    Space,
+    #loss_state{bytes_in_flight = InFlight} = State,
     PacketNumber,
     Size,
     AckEliciting,
     Frames,
     Now
 ) ->
+    #pn_loss{sent_q = Q, ae_in_flight = AE} = P = pn(Space, State),
     SentPacket = #sent_packet{
         pn = PacketNumber,
         time_sent = Now,
@@ -243,24 +290,34 @@ on_packet_sent(
             true -> Now;
             false -> State#loss_state.outstanding_since
         end,
+    {LastAE, NewAE} =
+        case AckEliciting of
+            true -> {Now, AE + 1};
+            false -> {P#pn_loss.last_ae_sent, AE}
+        end,
     %% NOTE: pto_count is NOT reset here per RFC 9002.
     %% PTO count is only reset when receiving an ACK (in on_ack_received).
     %% Resetting on send would break exponential backoff for probe retransmissions.
-    State#loss_state{
-        sent_q = queue:in(SentPacket, Q),
+    State1 = State#loss_state{
         bytes_in_flight = NewInFlight,
         outstanding_since = OutstandingSince
-    }.
+    },
+    set_pn(
+        Space,
+        P#pn_loss{sent_q = queue:in(SentPacket, Q), last_ae_sent = LastAE, ae_in_flight = NewAE},
+        State1
+    ).
 
 %% @doc Batched on_packet_sent for a run of ack-eliciting packets sent
 %% at the same instant: one queue fold and one record update. Tracked
 %% is [{PN, Size, Frame}] in ascending PN order.
 -spec on_packets_sent_run(
-    loss_state(), [{non_neg_integer(), non_neg_integer(), term()}], integer()
+    space(), loss_state(), [{non_neg_integer(), non_neg_integer(), term()}], integer()
 ) -> loss_state().
-on_packets_sent_run(#loss_state{sent_q = Q, bytes_in_flight = InFlight} = State, Tracked, Now) ->
-    {Q1, Total} = lists:foldl(
-        fun({PN, Size, Frame}, {QAcc, TAcc}) ->
+on_packets_sent_run(Space, #loss_state{bytes_in_flight = InFlight} = State, Tracked, Now) ->
+    #pn_loss{sent_q = Q, ae_in_flight = AE} = P = pn(Space, State),
+    {Q1, Total, Count} = lists:foldl(
+        fun({PN, Size, Frame}, {QAcc, TAcc, N}) ->
             SentPacket = #sent_packet{
                 pn = PN,
                 time_sent = Now,
@@ -269,9 +326,9 @@ on_packets_sent_run(#loss_state{sent_q = Q, bytes_in_flight = InFlight} = State,
                 size = Size,
                 frames = [Frame]
             },
-            {queue:in(SentPacket, QAcc), TAcc + Size}
+            {queue:in(SentPacket, QAcc), TAcc + Size, N + 1}
         end,
-        {Q, 0},
+        {Q, 0, 0},
         Tracked
     ),
     OutstandingSince =
@@ -279,11 +336,20 @@ on_packets_sent_run(#loss_state{sent_q = Q, bytes_in_flight = InFlight} = State,
             true -> Now;
             false -> State#loss_state.outstanding_since
         end,
-    State#loss_state{
-        sent_q = Q1,
+    LastAE =
+        case Count > 0 of
+            true -> Now;
+            false -> P#pn_loss.last_ae_sent
+        end,
+    State1 = State#loss_state{
         bytes_in_flight = InFlight + Total,
         outstanding_since = OutstandingSince
-    }.
+    },
+    set_pn(
+        Space,
+        P#pn_loss{sent_q = Q1, last_ae_sent = LastAE, ae_in_flight = AE + Count},
+        State1
+    ).
 
 %% @doc Process an ACK frame.
 %% Returns {NewState, AckedPackets, LostPackets, AckMeta} or {error, ack_range_too_large}
@@ -299,9 +365,9 @@ on_packets_sent_run(#loss_state{sent_q = Q, bytes_in_flight = InFlight} = State,
 %%      ack-eliciting packet, if present.
 %%   3. detect_lost_q: over the kept survivors, apply packet-threshold
 %%      and time-threshold loss criteria using the freshly updated SRTT.
--spec on_ack_received(loss_state(), term(), non_neg_integer()) ->
+-spec on_ack_received(space(), loss_state(), term(), non_neg_integer()) ->
     {loss_state(), [#sent_packet{}], [#sent_packet{}], map()} | {error, ack_range_too_large}.
-on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now) ->
+on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now) ->
     case quic_ack:ack_frame_to_ranges(LargestAcked, FirstRange, AckRanges) of
         {error, _} = Error ->
             Error;
@@ -313,7 +379,13 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
             %% not to the full outstanding queue.
             {AckedList, KeptAccList, AckedBytes, MaxAckEliciting, TailQ} =
                 classify_ack_head(
-                    State#loss_state.sent_q, LargestAcked, AckedRanges, [], [], 0, undefined
+                    (pn(Space, State))#pn_loss.sent_q,
+                    LargestAcked,
+                    AckedRanges,
+                    [],
+                    [],
+                    0,
+                    undefined
                 ),
 
             NewState1 = maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now),
@@ -339,12 +411,23 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
             NewQ = queue:join(SurvHeadQ, TailQ),
 
             NewInFlight = max(0, State#loss_state.bytes_in_flight - AckedBytes - LostBytes),
-            NewState2 = NewState1#loss_state{
-                sent_q = NewQ,
-                bytes_in_flight = NewInFlight,
-                time_of_last_ack = Now,
-                pto_count = 0
-            },
+            Settled =
+                length([P || #sent_packet{ack_eliciting = true} = P <- AckedList]) +
+                    length([P || #sent_packet{ack_eliciting = true} = P <- LostList]),
+            PApp = pn(Space, NewState1),
+            NewState2 = set_pn(
+                Space,
+                PApp#pn_loss{
+                    sent_q = NewQ,
+                    largest_acked = newest(PApp#pn_loss.largest_acked, LargestAcked),
+                    ae_in_flight = max(0, PApp#pn_loss.ae_in_flight - Settled)
+                },
+                NewState1#loss_state{
+                    bytes_in_flight = NewInFlight,
+                    time_of_last_ack = Now,
+                    pto_count = 0
+                }
+            ),
 
             LargestAETime =
                 case MaxAckEliciting of
@@ -361,8 +444,10 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
 
             {NewState2, AckedList, LostList, AckMeta}
     end;
-on_ack_received(State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, _, _, _}, Now) ->
-    on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now).
+on_ack_received(
+    Space, State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, _, _, _}, Now
+) ->
+    on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now).
 
 %% Pop packets from the head of the queue while PN =< LargestAcked,
 %% classifying each as acked (in ranges) or kept-unacked.
@@ -412,14 +497,16 @@ maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now) ->
 %% @doc Detect lost packets based on time and packet thresholds.
 %% Scans the sent queue head-to-tail (oldest first) and splits into
 %% {Lost, Surviving}. Returns the new loss_state and the lost packets.
--spec detect_lost_packets(loss_state(), non_neg_integer()) ->
+-spec detect_lost_packets(space(), loss_state(), non_neg_integer()) ->
     {loss_state(), [#sent_packet{}]}.
 detect_lost_packets(
-    #loss_state{sent_q = Q, smoothed_rtt = SRTT, latest_rtt = LatestRTT} = State,
+    Space,
+    #loss_state{smoothed_rtt = SRTT, latest_rtt = LatestRTT} = State,
     LargestAcked
 ) ->
+    P = pn(Space, State),
     Now = erlang:monotonic_time(millisecond),
-    SentList = queue:to_list(Q),
+    SentList = queue:to_list(P#pn_loss.sent_q),
     %% RFC 9002 §6.1.2: the time threshold uses max(smoothed_rtt,
     %% latest_rtt). With the EWMA alone, an RTT spike that outruns it
     %% (receiver queueing, bufferbloat) mass-declares in-flight packets
@@ -428,10 +515,17 @@ detect_lost_packets(
     RTT = max(SRTT, LatestRTT),
     {LostPackets, SurvQ, LostBytes, _LargestLostSentTime} =
         detect_lost_q(SentList, RTT, LargestAcked, Now, [], queue:new(), 0, undefined),
-    NewState = State#loss_state{
-        sent_q = SurvQ,
-        bytes_in_flight = max(0, State#loss_state.bytes_in_flight - LostBytes)
-    },
+    LostAE = length([L || #sent_packet{ack_eliciting = true} = L <- LostPackets]),
+    NewState = set_pn(
+        Space,
+        P#pn_loss{
+            sent_q = SurvQ,
+            ae_in_flight = max(0, P#pn_loss.ae_in_flight - LostAE)
+        },
+        State#loss_state{
+            bytes_in_flight = max(0, State#loss_state.bytes_in_flight - LostBytes)
+        }
+    ),
     {NewState, LostPackets}.
 
 %% Core loss-detection walk over an oldest-first list of sent packets.
@@ -509,7 +603,8 @@ largest_lost_ts({_PN, TS}) -> TS.
 %% peek in the common case (head is in_flight).
 -spec get_loss_time_and_space(loss_state()) ->
     {non_neg_integer() | undefined, atom()}.
-get_loss_time_and_space(#loss_state{sent_q = Q, smoothed_rtt = SRTT, latest_rtt = LatestRTT}) ->
+get_loss_time_and_space(#loss_state{smoothed_rtt = SRTT, latest_rtt = LatestRTT} = State) ->
+    Q = (pn(app, State))#pn_loss.sent_q,
     LossDelay = max(trunc(?TIME_THRESHOLD * max(SRTT, LatestRTT)), ?GRANULARITY),
     case earliest_in_flight_time(queue:to_list(Q)) of
         undefined -> {undefined, initial};
@@ -647,11 +742,12 @@ on_pto_expired(#loss_state{pto_count = Count} = State) ->
 %% Queries
 %%====================================================================
 
-%% @doc Get all sent packets.
-%% Returned as a map for API compatibility. Built on demand from the
-%% queue; intended for tests and diagnostics, not the hot path.
--spec sent_packets(loss_state()) -> #{non_neg_integer() => #sent_packet{}}.
-sent_packets(#loss_state{sent_q = Q}) ->
+%% @doc The packets still unacked in one space, keyed by packet number.
+%% Built on demand from the queue; for tests and diagnostics, not the hot
+%% path. Keyed per space because packet numbers restart in each one.
+-spec sent_packets(space(), loss_state()) -> #{non_neg_integer() => #sent_packet{}}.
+sent_packets(Space, #loss_state{} = State) ->
+    Q = (pn(Space, State))#pn_loss.sent_q,
     maps:from_list([{P#sent_packet.pn, P} || P <- queue:to_list(Q)]).
 
 %% @doc Get bytes currently in flight.
@@ -673,8 +769,9 @@ last_progress(#loss_state{time_of_last_ack = A, outstanding_since = O}) -> max(A
 %% @doc Get the oldest unacked packet (for PTO probe selection).
 %% Returns {ok, #sent_packet{}} or none. Head of the sent queue is
 %% by construction the oldest in-flight packet.
--spec oldest_unacked(loss_state()) -> {ok, #sent_packet{}} | none.
-oldest_unacked(#loss_state{sent_q = Q}) ->
+-spec oldest_unacked(space(), loss_state()) -> {ok, #sent_packet{}} | none.
+oldest_unacked(Space, #loss_state{} = State) ->
+    Q = (pn(Space, State))#pn_loss.sent_q,
     case queue:peek(Q) of
         empty -> none;
         {value, Packet} -> {ok, Packet}
@@ -741,7 +838,8 @@ retransmittable_frames(Frames) ->
 %% for a RESET_STREAM_AT stream, so it does not gate the reliable obligation.
 -spec stream_has_unacked_below(loss_state(), non_neg_integer(), non_neg_integer()) ->
     boolean().
-stream_has_unacked_below(#loss_state{sent_q = Q}, StreamId, ReliableSize) ->
+stream_has_unacked_below(#loss_state{} = State, StreamId, ReliableSize) ->
+    Q = (pn(app, State))#pn_loss.sent_q,
     lists:any(
         fun(#sent_packet{frames = Fs}) ->
             lists:any(

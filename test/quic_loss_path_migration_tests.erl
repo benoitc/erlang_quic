@@ -30,9 +30,9 @@
 %% migration completes under load.
 in_flight_state() ->
     S0 = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(S0, 1, 1200, true, [], 1000),
-    S2 = quic_loss:on_packet_sent(S1, 2, 1200, true, [], 1010),
-    S3 = quic_loss:on_packet_sent(S2, 3, 1000, true, [], 1020),
+    S1 = quic_loss:on_packet_sent(app, S0, 1, 1200, true, [], 1000),
+    S2 = quic_loss:on_packet_sent(app, S1, 2, 1200, true, [], 1010),
+    S3 = quic_loss:on_packet_sent(app, S2, 3, 1000, true, [], 1020),
     quic_loss:update_rtt(S3, 40, 0).
 
 %%====================================================================
@@ -50,18 +50,18 @@ keeps_bytes_in_flight_test() ->
 
 keeps_sent_packets_test() ->
     State = in_flight_state(),
-    Before = quic_loss:sent_packets(State),
+    Before = quic_loss:sent_packets(app, State),
     After = quic_loss:reset_for_new_path(State),
-    ?assertEqual(Before, quic_loss:sent_packets(After)),
+    ?assertEqual(Before, quic_loss:sent_packets(app, After)),
     %% And they remain retransmittable rather than being dropped on the
     %% floor by the migration.
-    ?assertNotEqual(undefined, quic_loss:oldest_unacked(After)).
+    ?assertNotEqual(undefined, quic_loss:oldest_unacked(app, After)).
 
 keeps_oldest_unacked_test() ->
     State = in_flight_state(),
     ?assertEqual(
-        quic_loss:oldest_unacked(State),
-        quic_loss:oldest_unacked(quic_loss:reset_for_new_path(State))
+        quic_loss:oldest_unacked(app, State),
+        quic_loss:oldest_unacked(app, quic_loss:reset_for_new_path(State))
     ).
 
 %%====================================================================

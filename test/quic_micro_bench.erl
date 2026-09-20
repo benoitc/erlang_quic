@@ -131,8 +131,8 @@ bench_ack_processing(PacketCount) ->
     Now = erlang:monotonic_time(millisecond),
 
     %% Time ACK processing
-    {Time, {NewState, AckedPackets, LostPackets, _AckMeta}} = timer:tc(
-        fun() -> quic_loss:on_ack_received(LossState, AckFrame, Now) end
+    {Time, {_NewState, AckedPackets, LostPackets, _AckMeta}} = timer:tc(
+        fun() -> quic_loss:on_ack_received(app, LossState, AckFrame, Now) end
     ),
 
     #{
@@ -140,14 +140,14 @@ bench_ack_processing(PacketCount) ->
         time_us => Time,
         acked_count => length(AckedPackets),
         lost_count => length(LostPackets),
-        remaining => map_size(quic_loss:sent_packets(NewState))
+        remaining => PacketCount - length(AckedPackets) - length(LostPackets)
     }.
 
 %% Build loss state by recording sent packets
 build_loss_state(State, PN, Max) when PN >= Max ->
     State;
 build_loss_state(State, PN, Max) ->
-    NewState = quic_loss:on_packet_sent(State, PN, 1100, true, []),
+    NewState = quic_loss:on_packet_sent(app, State, PN, 1100, true, []),
     build_loss_state(NewState, PN + 1, Max).
 
 %%====================================================================
@@ -177,7 +177,7 @@ bench_incremental_acks(TotalPackets) ->
 
     %% Now process incremental ACKs and measure total time
     Now = erlang:monotonic_time(millisecond),
-    {Time, FinalState} = timer:tc(
+    {Time, _FinalState} = timer:tc(
         fun() -> process_incremental_acks(LossState1, 0, TotalPackets, AckEvery, Now) end
     ),
 
@@ -185,7 +185,8 @@ bench_incremental_acks(TotalPackets) ->
         total_packets => TotalPackets,
         num_acks => NumAcks,
         time_us => Time,
-        remaining => map_size(quic_loss:sent_packets(FinalState)),
+        %% Every packet is acked by construction.
+        remaining => 0,
         time_per_ack_us => Time / NumAcks
     }.
 
@@ -199,7 +200,7 @@ process_incremental_acks(State, Acked, TotalPackets, AckEvery, Now) ->
     AckFrame = {ack, LargestAcked, 0, FirstRange, []},
 
     {NewState, _AckedPackets, _LostPackets, _AckMeta} =
-        quic_loss:on_ack_received(State, AckFrame, Now),
+        quic_loss:on_ack_received(app, State, AckFrame, Now),
 
     process_incremental_acks(NewState, LargestAcked + 1, TotalPackets, AckEvery, Now).
 
@@ -225,15 +226,15 @@ bench_loss_detection(PacketCount) ->
     LargestAcked = PacketCount - 1,
 
     %% Time loss detection
-    {Time, {NewState, LostPackets}} = timer:tc(
-        fun() -> quic_loss:detect_lost_packets(LossState, LargestAcked) end
+    {Time, {_NewState, LostPackets}} = timer:tc(
+        fun() -> quic_loss:detect_lost_packets(app, LossState, LargestAcked) end
     ),
 
     #{
         packet_count => PacketCount,
         time_us => Time,
         lost_count => length(LostPackets),
-        remaining => map_size(quic_loss:sent_packets(NewState))
+        remaining => PacketCount - length(LostPackets)
     }.
 
 %%====================================================================

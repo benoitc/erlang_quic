@@ -3242,7 +3242,7 @@ send_app_packet_now(Payload, Frames, State0) ->
             %% so coalesced packets with multiple frames are handled.
             AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames),
             NewLossState = quic_loss:on_packet_sent(
-                LossState, PN, PacketSize, AckEliciting, Frames, Now
+                app, LossState, PN, PacketSize, AckEliciting, Frames, Now
             ),
             NewCCState =
                 case AckEliciting of
@@ -4744,7 +4744,7 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
             AckFrame = {ack, LargestAcked, AckDelay, FirstRange, RestRanges},
 
             Now = erlang:monotonic_time(millisecond),
-            case quic_loss:on_ack_received(LossState, AckFrame, Now) of
+            case quic_loss:on_ack_received(app, LossState, AckFrame, Now) of
                 {error, ack_range_too_large} ->
                     %% RFC 9000: Invalid ACK range is a protocol violation
                     ?LOG_ERROR(#{what => invalid_ack_range}, ?QUIC_LOG_META),
@@ -8439,7 +8439,7 @@ send_zero_rtt_packet(Payload, Frames, EarlyKeys, State) ->
     %% 9001 §4.1.1 expects lost 0-RTT data to be resent).
     Now = erlang:monotonic_time(millisecond),
     NewLossState = quic_loss:on_packet_sent(
-        State#state.loss_state, PN, byte_size(Packet), true, Frames, Now
+        app, State#state.loss_state, PN, byte_size(Packet), true, Frames, Now
     ),
     NewCCState = quic_cc:on_packet_sent(State#state.cc_state, byte_size(Packet)),
 
@@ -8850,7 +8850,7 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
             _ ->
                 Tracked = lists:reverse(TrackedRev),
                 {
-                    quic_loss:on_packets_sent_run(LossState, Tracked, Now),
+                    quic_loss:on_packets_sent_run(app, LossState, Tracked, Now),
                     quic_cc:on_packets_sent(CCState, [Sz || {_, Sz, _} <- Tracked])
                 }
         end,
@@ -10394,7 +10394,7 @@ send_probe_packet(State) ->
 %% Get frames from the oldest unacked packet for probe retransmission
 %% Uses cached oldest_unacked from loss_state for O(1) lookup
 get_oldest_unacked_frames(#state{loss_state = LossState}) ->
-    case quic_loss:oldest_unacked(LossState) of
+    case quic_loss:oldest_unacked(app, LossState) of
         none ->
             none;
         {ok, #sent_packet{frames = Frames}} ->
