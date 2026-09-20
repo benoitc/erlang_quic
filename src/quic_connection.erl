@@ -193,9 +193,6 @@
 %% 200 ms base keeps a lossy handshake moving at something closer to
 %% PTO cadence on low-RTT paths; 12 attempts bound the total effort to
 %% roughly half a minute before the connect timeout owns the outcome.
--define(HS_RTX_BASE_MS, 200).
--define(HS_RTX_MAX_MS, 3000).
--define(HS_RTX_MAX_ATTEMPTS, 12).
 
 %% Max send queue size in bytes (16 MB default) - prevents memory exhaustion from queued data
 -define(MAX_SEND_QUEUE_BYTES, 16777216).
@@ -1269,13 +1266,10 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 
 idle(enter, _OldState, #state{role = client} = State) ->
     %% Client: Start the handshake by sending Initial packet with ClientHello
-    NewState = send_client_hello(State),
-    {keep_state, NewState, hs_rtx_actions(NewState)};
+    {keep_state, send_client_hello(State)};
 idle(enter, _OldState, #state{role = server} = State) ->
     %% Server: Wait for Initial packet with ClientHello
     {keep_state, State};
-idle(state_timeout, retransmit_initial, State) ->
-    retransmit_initial_flight(idle, State);
 idle({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 idle({call, From}, get_state, State) ->
@@ -1382,11 +1376,7 @@ idle(EventType, EventContent, State) ->
 %% ----- HANDSHAKING STATE -----
 
 handshaking(enter, idle, State) ->
-    %% Continue handshake; (re)arm the client Initial-retransmission timer
-    %% (no-op for the server).
-    {keep_state, arm_disconnect_timer(State), hs_rtx_actions(State)};
-handshaking(state_timeout, retransmit_initial, State) ->
-    retransmit_initial_flight(handshaking, State);
+    {keep_state, arm_disconnect_timer(State)};
 handshaking({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 handshaking({call, From}, get_state, State) ->
@@ -2331,8 +2321,7 @@ send_client_hello(State) ->
                 #session_ticket{max_early_data = MaxEarly} -> MaxEarly
             end
     },
-    {Frames, NewState0} = send_initial_crypto(ClientHello, 0, State0),
-    NewState = NewState0#state{initial_crypto_frames = Frames},
+    NewState = send_initial_crypto(ClientHello, 0, State0),
 
     %% Event-driven flush: flush batch and timers after sending ClientHello
     %% Critical for handshake - must send immediately
@@ -2392,7 +2381,7 @@ send_server_hello(ServerHelloMsg, State) ->
     State1 = State#state{initial_tx_off = Off + byte_size(ServerHelloMsg)},
     %% Chunk across Initial packets: a hybrid ServerHello Initial is
     %% ~1225 bytes and no longer fits one datagram.
-    {_Frames, NewState} = send_initial_crypto(ServerHelloMsg, Off, State1),
+    NewState = send_initial_crypto(ServerHelloMsg, Off, State1),
     NewState.
 
 %% Server: Send EncryptedExtensions, Certificate, CertificateVerify, Finished
@@ -2716,15 +2705,13 @@ chunk_crypto(Payload, Offset, Max) ->
 %% packets, each sized to stay within the 1200-byte pre-PMTU limit
 %% (RFC 9000 §14.1). A hybrid ML-KEM ClientHello is ~1360 bytes and no
 %% longer fits one datagram; a single oversized Initial is dropped on
-%% paths with an MTU below ~1470 (PPPoE, WireGuard, mobile). Returns
-%% the encoded chunk frames (for the retransmit buffer) and the state.
+%% paths with an MTU below ~1470 (PPPoE, WireGuard, mobile).
 send_initial_crypto(Payload, Offset0, State) ->
     Max = initial_crypto_budget(State),
-    lists:mapfoldl(
+    lists:foldl(
         fun({Offset, Chunk}, AccState) ->
             Decoded = {crypto, Offset, Chunk},
-            Frame = quic_frame:encode(Decoded),
-            {{Frame, Decoded}, send_initial_packet(Frame, [Decoded], AccState)}
+            send_initial_packet(quic_frame:encode(Decoded), [Decoded], AccState)
         end,
         State,
         chunk_crypto(Payload, Offset0, Max)
@@ -3515,47 +3502,6 @@ amp_flush_budget(#state{amp_deferred = [{Packet, Meta} | Rest]} = State) ->
         false ->
             State
     end.
-
-%% State-timeout action driving client Initial retransmission while the
-%% handshake is incomplete. Empty for the server, once connected, or once
-%% the attempt budget is spent (the idle timeout then closes).
-hs_rtx_actions(#state{
-    role = client,
-    app_keys = undefined,
-    initial_crypto_frames = Frames,
-    hs_rtx_attempts = Attempts
-}) when Frames =/= [], Attempts < ?HS_RTX_MAX_ATTEMPTS ->
-    Delay = min(?HS_RTX_BASE_MS bsl Attempts, ?HS_RTX_MAX_MS),
-    [{state_timeout, Delay, retransmit_initial}];
-hs_rtx_actions(_State) ->
-    [].
-
-%% Re-send the buffered Initial (ClientHello) on a stalled handshake and
-%% re-arm the backoff timer. Re-sending the padded Initial also lifts a
-%% server's anti-amplification budget so it can flush a deferred flight.
-retransmit_initial_flight(
-    StateName,
-    #state{role = client, app_keys = undefined, initial_crypto_frames = Frames} = State
-) when Frames =/= [] ->
-    ?LOG_DEBUG(
-        #{
-            what => handshake_initial_retransmit,
-            state => StateName,
-            attempt => State#state.hs_rtx_attempts + 1
-        },
-        ?QUIC_LOG_META
-    ),
-    %% Replay every chunk of the flight, each in its own Initial packet.
-    State1 = lists:foldl(
-        fun({Encoded, Decoded}, Acc) -> send_initial_packet(Encoded, [Decoded], Acc) end,
-        State#state{hs_rtx_attempts = State#state.hs_rtx_attempts + 1},
-        Frames
-    ),
-    Flushed = flush_dirty_timers(flush_socket_batch(State1)),
-    client_rearm_active(Flushed, Flushed#state.active_n),
-    {keep_state, Flushed, hs_rtx_actions(Flushed)};
-retransmit_initial_flight(_StateName, State) ->
-    {keep_state, State}.
 
 %% Batched variant of handle_packet/2: same anti-amplification
 %% accounting per datagram, one deferred-flight flush per batch. The
@@ -6700,11 +6646,7 @@ handle_hello_retry_request(
                 tls_transcript = Transcript,
                 initial_tx_off = Off + byte_size(CH2)
             },
-            %% CH2 carries the hybrid key share now, so it chunks too;
-            %% replace the retransmit buffer with the CH2 chunks (the
-            %% outstanding Initial flight after HRR is CH2, not CH1).
-            {Frames, State2} = send_initial_crypto(CH2, Off, State1),
-            State2#state{initial_crypto_frames = Frames}
+            send_initial_crypto(CH2, Off, State1)
     end.
 
 %%====================================================================
