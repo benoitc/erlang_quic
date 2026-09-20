@@ -10,7 +10,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 hibernate_test_() ->
-    {timeout, 30, fun an_idle_connection_shrinks/0}.
+    {timeout, 60, fun an_idle_connection_shrinks/0}.
 
 %% After the quiet period the process hibernates, which runs a fullsweep,
 %% so the handshake and transfer garbage stops being pinned to a heap that
@@ -22,8 +22,37 @@ hibernate_test_() ->
 an_idle_connection_shrinks() ->
     with_connection(#{hibernate_after => 200}, fun(Conn) ->
         Busy = heap_after_work(Conn),
+        %% hibernate_after counts from the last event, so wait for the
+        %% connection to stop working before timing anything: under load
+        %% the echo's tail traffic can still be arriving, and a heap that
+        %% has not collapsed yet then says nothing about hibernation.
+        ?assert(wait_until_quiet(Conn, 30000), "connection never went idle"),
         ?assert(quic_test_wait:until(fun() -> heap_words(Conn) * 4 =< Busy end, 10000))
     end).
+
+%% True once the process has burned no reductions across a whole poll
+%% interval, which is what `hibernate_after' waits for as well.
+wait_until_quiet(Pid, Budget) ->
+    Deadline = erlang:monotonic_time(millisecond) + Budget,
+    quiet_loop(Pid, Deadline, reductions(Pid)).
+
+quiet_loop(Pid, Deadline, Before) ->
+    timer:sleep(250),
+    case reductions(Pid) of
+        Before ->
+            true;
+        Now ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> false;
+                false -> quiet_loop(Pid, Deadline, Now)
+            end
+    end.
+
+reductions(Pid) ->
+    case process_info(Pid, reductions) of
+        {reductions, N} -> N;
+        undefined -> error(connection_died)
+    end.
 
 %% `infinity' opts out, for a deployment that would rather keep the heap
 %% than pay a fullsweep on every quiet stretch. The connection then gives
