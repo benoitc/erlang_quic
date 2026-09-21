@@ -254,28 +254,19 @@ aioquic_client_multiple_requests(Config) ->
 %%====================================================================
 
 %% @doc Find the certs directory
+%%
+%% From this file's own path rather than the build directory or the
+%% working directory, neither of which is the project root under Common
+%% Test: the lookup used to fall through to a path on one machine.
 find_certs_dir() ->
-    Candidates = [
-        filename:join([code:lib_dir(quic), "..", "certs"]),
-        "certs",
-        "/Users/benoitc/Projects/erlang_quic/certs"
-    ],
-    find_existing_dir(Candidates).
-
-find_existing_dir([]) ->
-    ct:fail(certs_dir_not_found);
-find_existing_dir([Dir | Rest]) ->
-    AbsDir = filename:absname(Dir),
-    case filelib:is_dir(AbsDir) of
-        true ->
-            CertFile = filename:join(AbsDir, "cert.pem"),
-            case filelib:is_file(CertFile) of
-                true -> AbsDir;
-                false -> find_existing_dir(Rest)
-            end;
-        false ->
-            find_existing_dir(Rest)
+    Dir = filename:join(project_root(), "certs"),
+    case filelib:is_file(filename:join(Dir, "cert.pem")) of
+        true -> Dir;
+        false -> ct:fail({certs_dir_not_found, Dir})
     end.
+
+project_root() ->
+    filename:dirname(filename:dirname(filename:absname(?FILE))).
 
 %% @doc Create a temporary directory
 create_tmp_dir() ->
@@ -309,21 +300,10 @@ build_aioquic_cmd(Port, TmpDir, UrlPattern, ExtraArgs) ->
 
 %% @doc Find the docker directory containing docker-compose.yml
 find_docker_dir() ->
-    Candidates = [
-        filename:join([code:lib_dir(quic), "..", "docker"]),
-        "docker",
-        "/Users/benoitc/Projects/erlang_quic/docker"
-    ],
-    find_docker_dir(Candidates).
-
-find_docker_dir([]) ->
-    ct:fail(docker_dir_not_found);
-find_docker_dir([Dir | Rest]) ->
-    AbsDir = filename:absname(Dir),
-    ComposeFile = filename:join(AbsDir, "docker-compose.yml"),
-    case filelib:is_file(ComposeFile) of
-        true -> AbsDir;
-        false -> find_docker_dir(Rest)
+    Dir = filename:join(project_root(), "docker"),
+    case filelib:is_file(filename:join(Dir, "docker-compose.yml")) of
+        true -> Dir;
+        false -> ct:fail({docker_dir_not_found, Dir})
     end.
 
 %% @doc Count format placeholders (~p, ~s, etc.) in a string
