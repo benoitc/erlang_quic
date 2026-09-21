@@ -7119,28 +7119,29 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
         _ ->
             %% Flow control OK - check final size consistency before buffering
 
-            %% RFC 9000 Section 4.5: Validate final size when FIN received
+            %% RFC 9000 Section 4.5: once a FIN has fixed the final size it
+            %% cannot move, and nothing may lie beyond it.
             ExistingFinalSize = Stream#stream_state.final_size,
             FinalSizeError =
-                Fin andalso
-                    ExistingFinalSize =/= undefined andalso
-                    ExistingFinalSize =/= EndOffset,
+                ExistingFinalSize =/= undefined andalso
+                    ((Fin andalso ExistingFinalSize =/= EndOffset) orelse
+                        EndOffset > ExistingFinalSize),
 
             case FinalSizeError of
                 true ->
-                    %% FINAL_SIZE_ERROR: FIN indicates different final size
                     ?LOG_WARNING(
                         #{
                             what => final_size_error,
                             stream_id => StreamId,
                             existing => ExistingFinalSize,
-                            fin_offset => EndOffset
+                            end_offset => EndOffset,
+                            fin => Fin
                         },
                         ?QUIC_LOG_META
                     ),
                     CloseFrame =
                         {connection_close, transport, ?QUIC_FINAL_SIZE_ERROR, 0,
-                            <<"FIN final size mismatch">>},
+                            <<"stream data past its final size">>},
                     send_frame(CloseFrame, State#state{close_reason = final_size_error});
                 false ->
                     %% Track FIN position if received
@@ -8418,6 +8419,10 @@ do_send_data(
     } = State
 ) ->
     case maps:find(StreamId, Streams) of
+        {ok, #stream_state{send_fin = true}} ->
+            %% Our FIN fixed the final size (RFC 9000 Section 4.5), so
+            %% anything written now would lie past it.
+            {error, stream_closed};
         {ok, StreamState} ->
             %% Check stream direction (can't send on peer's uni streams)
             case can_send_on_stream(StreamId, State) of
