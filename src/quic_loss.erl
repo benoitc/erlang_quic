@@ -593,9 +593,6 @@ largest_lost_ts(undefined) -> undefined;
 largest_lost_ts({_PN, TS}) -> TS.
 
 %% @doc Get the loss time for setting timers.
-%% The queue is oldest-first, so the earliest in_flight packet is at
-%% the head; this turns the previous O(n) map fold into an O(1) head
-%% peek in the common case (head is in_flight).
 -spec get_loss_time_and_space(loss_state()) -> {non_neg_integer(), space()} | none.
 get_loss_time_and_space(#loss_state{} = State) ->
     LossDelay = max(trunc(?TIME_THRESHOLD * loss_delay_rtt(State)), ?GRANULARITY),
@@ -614,20 +611,15 @@ space_loss_time(Space, State, LossDelay) ->
         #pn_loss{largest_acked = undefined} ->
             none;
         #pn_loss{largest_acked = LargestAcked, sent_q = Q} ->
-            case earliest_overtaken(queue:to_list(Q), LargestAcked) of
-                undefined -> none;
-                TimeSent -> {TimeSent + LossDelay, Space}
+            %% Oldest first, packet numbers rising with the queue, and
+            %% every entry in flight: the head is the only candidate.
+            case queue:peek(Q) of
+                {value, #sent_packet{pn = PN, time_sent = TS}} when PN < LargestAcked ->
+                    {TS + LossDelay, Space};
+                _ ->
+                    none
             end
     end.
-
-earliest_overtaken([], _LargestAcked) ->
-    undefined;
-earliest_overtaken([#sent_packet{pn = PN, time_sent = TS, in_flight = true} | _], LargestAcked) when
-    PN < LargestAcked
-->
-    TS;
-earliest_overtaken([_ | Rest], LargestAcked) ->
-    earliest_overtaken(Rest, LargestAcked).
 
 earlier_loss(none, Best) -> Best;
 earlier_loss(Candidate, none) -> Candidate;
