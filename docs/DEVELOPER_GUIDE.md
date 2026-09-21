@@ -341,7 +341,7 @@ handle_quic_event({quic, Conn, Event}) ->
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `cert` | `binary()` | - | DER-encoded certificate |
-| `key` | `term()` | - | Private key |
+| `key` | `term()` | - | Decoded private key for `cert`; one that cannot sign for it returns `{error, {invalid_server_key, _}}` |
 | `pool_size` | `integer()` | `1` | Listener pool size |
 | `connection_handler` | `fun/3` | - | Custom connection handler |
 | `lb_config` | `map()` | - | QUIC-LB configuration |

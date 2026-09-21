@@ -10,7 +10,7 @@
 
 -module(quic_test_echo_server).
 
--export([start/0, start/1, stop/1, client_opts/0]).
+-export([start/0, start/1, stop/1, client_opts/0, cert_and_key/0]).
 
 -type handle() :: #{name := atom(), port := inet:port_number()}.
 
@@ -105,6 +105,13 @@ echo_loop(Conn) ->
         _Unexpected ->
             echo_loop(Conn)
     end.
+
+%% @doc A server certificate (DER) and the decoded key that signs for it,
+%% for tests that start a server without this echo handler.
+-spec cert_and_key() -> {binary(), term()}.
+cert_and_key() ->
+    {ok, Cert, Key} = load_or_generate_certs(),
+    {Cert, Key}.
 
 %% Prefer the committed certs so tests match what the Python echo
 %% server uses; fall back to an on-the-fly self-signed cert.

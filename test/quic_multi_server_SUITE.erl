@@ -99,11 +99,10 @@ end_per_testcase(_TestCase, _Config) ->
 %% Helper Functions
 %%====================================================================
 
-%% Generate test certificate and key
+%% A certificate and the key that signs for it: start_server/3 refuses a
+%% pair that could not complete a handshake.
 generate_test_cert() ->
-    Cert = <<"test_certificate_data">>,
-    PrivKey = crypto:strong_rand_bytes(32),
-    {Cert, PrivKey}.
+    quic_test_echo_server:cert_and_key().
 
 %% Create base server options
 base_opts() ->

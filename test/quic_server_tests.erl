@@ -13,11 +13,11 @@
 %% Test Helpers
 %%====================================================================
 
-%% Generate dummy test certificate and key (same as listener tests)
+%% A certificate and the key that signs for it. start_server/3 refuses a
+%% pair that could not complete a handshake, so placeholder bytes will
+%% not do even though these cases never connect.
 generate_test_cert() ->
-    Cert = <<"test_certificate_data">>,
-    PrivKey = crypto:strong_rand_bytes(32),
-    {Cert, PrivKey}.
+    quic_test_echo_server:cert_and_key().
 
 %% Create base server options with required cert/key
 base_opts() ->

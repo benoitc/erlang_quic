@@ -221,6 +221,9 @@ get_fd(Socket) ->
 %%       validation (e.g. self-signed test servers).</li>
 %%   <li>`cacerts' - Trust anchors as a list of DER-encoded CA
 %%       certificates. Defaults to the OS trust store.</li>
+%%   <li>`cert' - DER-encoded client certificate, for mutual TLS</li>
+%%   <li>`key' - Decoded private key for `cert'. One that cannot sign for
+%%       the certificate is refused with `{error, {invalid_client_key, _}}'.</li>
 %%   <li>`alpn' - ALPN protocols (default: [&lt;&lt;"h3"&gt;&gt;])</li>
 %%   <li>`server_name' - Server Name Indication, also the hostname
 %%       checked against the certificate (default: Host)</li>
@@ -281,7 +284,7 @@ connect(_Host, _Port, _Opts, _Owner) ->
 %% to the caller instead of crashing mid-handshake.
 validate_client_opts(Socket, Opts) ->
     case validate_groups(Opts) of
-        ok -> validate_connect_opts(Socket, Opts);
+        ok -> first_error([credentials(client, Opts), validate_connect_opts(Socket, Opts)]);
         {error, _} = Error -> Error
     end.
 
@@ -792,7 +795,9 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %% Options:
 %% <ul>
 %%   <li>`cert' - DER-encoded certificate</li>
-%%   <li>`key' - Private key term</li>
+%%   <li>`key' - Decoded private key for `cert', as
+%%       `public_key:pem_entry_decode/1' returns it. One that cannot sign for
+%%       the certificate is refused with `{error, {invalid_server_key, _}}'.</li>
 %%   <li>`verify' - Request a client certificate (mutual TLS) and validate any
 %%       presented chain against `cacerts' (RFC 8446 §4.4.2.4). Optional by
 %%       default: a client that sends no certificate still connects.</li>
@@ -864,8 +869,19 @@ start_server(_Name, _Port, _Opts) ->
 %% caller instead of taking the pool down after it has been created.
 validate_server_opts(Opts) ->
     case validate_groups(Opts) of
-        ok -> quic_listener:has_auth_method(Opts);
+        ok -> first_error([quic_listener:has_auth_method(Opts), credentials(server, Opts)]);
         {error, _} = Error -> Error
+    end.
+
+%% @private A key that cannot sign for its certificate fails every
+%% handshake, so it is refused up front rather than on each connection.
+credentials(Role, Opts) ->
+    quic_connection:check_credentials(Role, Opts).
+
+first_error(Results) ->
+    case [E || {error, _} = E <- Results] of
+        [] -> ok;
+        [Error | _] -> Error
     end.
 
 %% @private Reject a `groups' option naming a key-exchange group this
