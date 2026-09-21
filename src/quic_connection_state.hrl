@@ -276,6 +276,16 @@
     %% lazy "a later deadline never cancels" rule would otherwise leave
     %% the wrong space armed.
     pto_space = app :: quic_loss:space(),
+    %% Handshake payloads the congestion window or pacer refused, held as
+    %% frames rather than encoded packets so no packet number is spent
+    %% until one actually goes out. Drained when an acknowledgement
+    %% reopens the window.
+    pending_hs = #{initial => [], handshake => []} :: #{
+        quic_loss:space() => [{iodata(), [term()]}]
+    },
+    %% Set while a probe is being sent, which RFC 9002 Section 7 exempts
+    %% from the congestion window.
+    hs_probe = false :: boolean(),
     %% Client-side: a Handshake acknowledgement has arrived, so the
     %% server has validated this address (RFC 9002 Appendix A.8
     %% PeerCompletedAddressValidation). Always true for a server, which

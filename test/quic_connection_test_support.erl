@@ -233,6 +233,16 @@ state_with_keys(Role) ->
     Keys = quic_connection:derive_initial_keys(<<"discard-cid">>, ?QUIC_VERSION_1),
     #state{
         role = Role,
+        scid = <<"own-cid0">>,
+        dcid = <<"peer-cid">>,
+        pn_handshake = #pn_space{
+            next_pn = 0,
+            largest_recv = undefined,
+            recv_time = undefined,
+            ack_ranges = [],
+            ack_eliciting_in_flight = 0
+        },
+        coalesce = true,
         initial_keys = Keys,
         handshake_keys = Keys,
         app_keys = Keys,
@@ -273,7 +283,9 @@ state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
 state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at;
 state_get(#state{} = S, dcid) -> S#state.dcid;
 state_get(#state{} = S, initial_keys) -> S#state.initial_keys;
-state_get(#state{} = S, handshake_keys) -> S#state.handshake_keys.
+state_get(#state{} = S, handshake_keys) -> S#state.handshake_keys;
+state_get(#state{} = S, pending_hs) -> S#state.pending_hs;
+state_get(#state{} = S, handshake_next_pn) -> (S#state.pn_handshake)#pn_space.next_pn.
 
 state_set(#state{} = S, loss_state, V) ->
     S#state{loss_state = V};
@@ -286,7 +298,11 @@ state_set(#state{} = S, dcid, V) ->
 state_set(#state{} = S, retry_scid, V) ->
     S#state{retry_scid = V};
 state_set(#state{} = S, transport_params, V) ->
-    S#state{transport_params = V}.
+    S#state{transport_params = V};
+state_set(#state{} = S, cc_state, V) ->
+    S#state{cc_state = V};
+state_set(#state{} = S, hs_probe, V) ->
+    S#state{hs_probe = V}.
 
 %% A #state{} carrying a loss tracker, for the space whose timer is
 %% under test. The application space is only reachable once the handshake

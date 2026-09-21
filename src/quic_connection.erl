@@ -2860,6 +2860,56 @@ packet_flags(Frames, Padded) ->
     AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames),
     {AckEliciting, AckEliciting orelse Padded orelse lists:member(padding, Frames)}.
 
+%% RFC 9002 Section 7: a handshake packet counts against the congestion
+%% window like any other. A refusal holds the frames rather than the
+%% encoded packet, so the packet number is not spent and the packet is
+%% rebuilt when the window reopens.
+%%
+%% Probes are exempt (Section 7, "an endpoint MAY send a probe packet
+%% when it is blocked"), which is what keeps a blocked connection from
+%% deadlocking on its own window.
+-spec admit(quic_loss:space(), non_neg_integer(), iodata(), [term()], #state{}) ->
+    {ok, #state{}} | {deferred, #state{}}.
+admit(_Space, _Size, _Payload, _Frames, #state{hs_probe = true} = State) ->
+    {ok, State};
+admit(_Space, _Size, _Payload, _Frames, #state{cc_state = undefined} = State) ->
+    {ok, State};
+admit(Space, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
+    %% Urgency 0 buys the control allowance: a handshake flight is small
+    %% and stalling it behind a full window stalls the connection.
+    case quic_cc:send_check(CCState, Size, 0) of
+        {ok, NewCC} ->
+            {ok, State#state{cc_state = NewCC}};
+        {blocked_cwnd, _Avail} ->
+            {deferred, enqueue_hs(Space, Payload, Frames, State)};
+        {blocked_pacing, _Delay} ->
+            {deferred, enqueue_hs(Space, Payload, Frames, State)}
+    end.
+
+enqueue_hs(Space, Payload, Frames, #state{pending_hs = Pending} = State) ->
+    Queued = maps:get(Space, Pending, []),
+    State#state{pending_hs = Pending#{Space => Queued ++ [{Payload, Frames}]}}.
+
+%% Rebuild and resend what the window refused. Re-runs admission, so a
+%% window that reopened only part way stops at the first refusal and
+%% leaves the rest queued in order.
+-spec drain_pending_hs(#state{}) -> #state{}.
+drain_pending_hs(#state{} = State) ->
+    lists:foldl(fun drain_space/2, State, [initial, handshake]).
+
+drain_space(Space, #state{pending_hs = Pending} = State) ->
+    case maps:get(Space, Pending, []) of
+        [] ->
+            State;
+        Queued ->
+            Cleared = State#state{pending_hs = Pending#{Space => []}},
+            lists:foldl(
+                fun({Payload, Frames}, Acc) -> send_at_level(Space, Payload, Frames, Acc) end,
+                Cleared,
+                Queued
+            )
+    end.
+
 %% Send an Initial packet.
 %%
 %% Once the keys for a level are discarded nothing may be sent at it
@@ -2928,25 +2978,32 @@ send_initial_packet(Payload, Frames, State) ->
     %% Pad Initial packets to at least 1200 bytes
     PaddedPacket = pad_initial_packet(Packet),
 
-    %% Send (subject to the anti-amplification budget on the server).
+    %% Congestion control counts the protected packet; the amplification
+    %% budget counts the datagram, which for a short Initial is larger
+    %% because it is brought to 1200 bytes outside the packet.
     Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
-    Meta = {initial, PN, byte_size(PaddedPacket), Frames, Padded},
-    {Outcome, State1} = amp_send(PaddedPacket, Meta, State),
-    State2 = register_sent(Outcome, Meta, State1),
+    Meta = {initial, PN, byte_size(Packet), Frames, Padded},
+    case admit(initial, byte_size(Packet), Payload, Frames, State) of
+        {deferred, Deferred} ->
+            Deferred;
+        {ok, Admitted} ->
+            {Outcome, State1} = amp_send(PaddedPacket, Meta, Admitted),
+            State2 = register_sent(Outcome, Meta, State1),
 
-    %% Emit qlog packet_sent event
-    quic_qlog:packet_sent(State#state.qlog_ctx, #{
-        packet_type => initial,
-        packet_number => PN,
-        length => byte_size(PaddedPacket)
-    }),
+            %% Emit qlog packet_sent event
+            quic_qlog:packet_sent(State#state.qlog_ctx, #{
+                packet_type => initial,
+                packet_number => PN,
+                length => byte_size(PaddedPacket)
+            }),
 
-    %% Update packet number space and packet counter
-    NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State2#state{
-        pn_initial = NewPNSpace,
-        packets_sent = State2#state.packets_sent + 1
-    }.
+            %% Update packet number space and packet counter
+            NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
+            State2#state{
+                pn_initial = NewPNSpace,
+                packets_sent = State2#state.packets_sent + 1
+            }
+    end.
 
 %% Send an Initial ACK packet
 send_initial_ack(State) ->
@@ -3105,22 +3162,27 @@ send_handshake_packet(Payload, Frames, State) ->
     ),
     Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
     Meta = {handshake, PN, byte_size(Packet), Frames, Padded},
-    {Outcome, State1} = amp_send(Packet, Meta, State),
-    State2 = register_sent(Outcome, Meta, State1),
+    case admit(handshake, byte_size(Packet), Payload, Frames, State) of
+        {deferred, Deferred} ->
+            Deferred;
+        {ok, Admitted} ->
+            {Outcome, State1} = amp_send(Packet, Meta, Admitted),
+            State2 = register_sent(Outcome, Meta, State1),
 
-    %% Emit qlog packet_sent event
-    quic_qlog:packet_sent(State#state.qlog_ctx, #{
-        packet_type => handshake,
-        packet_number => PN,
-        length => byte_size(Packet)
-    }),
+            %% Emit qlog packet_sent event
+            quic_qlog:packet_sent(State#state.qlog_ctx, #{
+                packet_type => handshake,
+                packet_number => PN,
+                length => byte_size(Packet)
+            }),
 
-    %% Update PN space and packet counter
-    NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State2#state{
-        pn_handshake = NewPNSpace,
-        packets_sent = State2#state.packets_sent + 1
-    }.
+            %% Update PN space and packet counter
+            NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
+            State2#state{
+                pn_handshake = NewPNSpace,
+                packets_sent = State2#state.packets_sent + 1
+            }
+    end.
 
 %% Send a 1-RTT (application) packet with a single frame (avoid encode/decode roundtrip)
 %% This is the preferred send function - encodes once and passes frame for loss tracking
@@ -5350,14 +5412,14 @@ app_ack_tail(AckedPackets, LostPackets, State1) ->
     %% cwnd reopened: replay CC-deferred control retransmits, then
     %% complete any local reset-at reclaim whose reliable bytes are
     %% now acked.
-    State7 = flush_deferred_retransmits(State6),
+    State7 = flush_deferred_retransmits(drain_pending_hs(State6)),
     State8 = complete_fin_reclaims(complete_send_reset_at(State7)),
     %% Event-driven flush: flush batch and timers after ACK processing
     flush_dirty_timers(flush_socket_batch(State8)).
 
 handshake_ack_tail(Level, LostPackets, State1) ->
     State2 = retransmit_lost_handshake(Level, LostPackets, State1),
-    State3 = note_handshake_ack(Level, State2),
+    State3 = drain_pending_hs(note_handshake_ack(Level, State2)),
     flush_dirty_timers(flush_socket_batch(State3#state{pto_dirty = true})).
 
 %% A Handshake acknowledgement tells a client the server has processed a
@@ -5390,10 +5452,13 @@ retransmit_lost_handshake(Level, LostPackets, State) ->
         LostPackets
     ).
 
-send_at_level(initial, Frame, State) ->
-    send_initial_packet(quic_frame:encode(Frame), [Frame], State);
-send_at_level(handshake, Frame, State) ->
-    send_handshake_packet(quic_frame:encode(Frame), [Frame], State).
+send_at_level(Space, Frame, State) ->
+    send_at_level(Space, quic_frame:encode(Frame), [Frame], State).
+
+send_at_level(initial, Payload, Frames, State) ->
+    send_initial_packet(Payload, Frames, State);
+send_at_level(handshake, Payload, Frames, State) ->
+    send_handshake_packet(Payload, Frames, State).
 
 %% Helper to remove a stream from the send queue (tuple of 8 queues)
 %% Returns {NewPQ, RemovedBytes, RemovedCount} to allow adjusting the
@@ -10398,8 +10463,11 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
 
     %% The probe goes out in the space the timer was armed for: at any
     %% other encryption level the peer cannot act on it, and before
-    %% confirmation it could not even decrypt it.
-    State2 = send_probe_packet(Space, State1),
+    %% confirmation it could not even decrypt it. RFC 9002 Section 7
+    %% exempts it from the congestion window, which is what stops a
+    %% blocked connection deadlocking on its own.
+    Probing = send_probe_packet(Space, State1#state{hs_probe = true}),
+    State2 = Probing#state{hs_probe = false},
 
     %% Probes use the control allowance, so retry any CC-deferred control
     %% retransmits here too (they are not in sent_q for the probe to pick up).
