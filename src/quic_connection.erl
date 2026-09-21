@@ -2781,9 +2781,8 @@ discard_space(Space, #state{loss_state = LossState, cc_state = CCState} = State)
 %% Nothing may be sent at a discarded level (RFC 9001 Section 4.9), which
 %% includes packets that never left: one held back by the amplification
 %% budget, or by the congestion window.
-purge_unsent(Space, #state{amp_deferred = Deferred, pending_hs = Pending} = State) ->
+purge_unsent(Space, #state{pending_hs = Pending} = State) ->
     State#state{
-        amp_deferred = [E || {_Packet, Meta} = E <- Deferred, element(1, Meta) =/= Space],
         pending_hs = Pending#{Space => []},
         pending_hs_bytes = (State#state.pending_hs_bytes)#{Space => 0}
     }.
@@ -3038,12 +3037,11 @@ send_initial_packet(Payload, Frames, State) ->
     Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
     Meta = {initial, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
-    case admit(initial, InFlight, byte_size(Packet), Payload, Frames, State) of
+    case gate(initial, InFlight, byte_size(Packet), PaddedPacket, Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
-            {Outcome, State1} = amp_send(PaddedPacket, Meta, Admitted),
-            State2 = register_sent(Outcome, Meta, State1),
+            State1 = emit(PaddedPacket, Meta, Admitted),
 
             %% Emit qlog packet_sent event
             quic_qlog:packet_sent(State#state.qlog_ctx, #{
@@ -3054,9 +3052,9 @@ send_initial_packet(Payload, Frames, State) ->
 
             %% Update packet number space and packet counter
             NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-            State2#state{
+            State1#state{
                 pn_initial = NewPNSpace,
-                packets_sent = State2#state.packets_sent + 1
+                packets_sent = State1#state.packets_sent + 1
             }
     end.
 
@@ -3218,12 +3216,11 @@ send_handshake_packet(Payload, Frames, State) ->
     Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
     Meta = {handshake, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
-    case admit(handshake, InFlight, byte_size(Packet), Payload, Frames, State) of
+    case gate(handshake, InFlight, byte_size(Packet), Packet, Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
-            {Outcome, State1} = amp_send(Packet, Meta, Admitted),
-            State2 = register_sent(Outcome, Meta, State1),
+            State1 = emit(Packet, Meta, Admitted),
 
             %% Emit qlog packet_sent event
             quic_qlog:packet_sent(State#state.qlog_ctx, #{
@@ -3234,9 +3231,9 @@ send_handshake_packet(Payload, Frames, State) ->
 
             %% Update PN space and packet counter
             NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-            State2#state{
+            State1#state{
                 pn_handshake = NewPNSpace,
-                packets_sent = State2#state.packets_sent + 1
+                packets_sent = State1#state.packets_sent + 1
             }
     end.
 
@@ -3530,11 +3527,11 @@ contains_non_probing_frame([Frame | Rest]) ->
 %% Handle incoming packet (may be coalesced with multiple QUIC packets)
 handle_packet(Data, State) ->
     %% RFC 9000 §8.1: count every received byte toward the
-    %% anti-amplification budget, then flush any flight we had to defer
-    %% once the budget (or address validation) allows.
+    %% anti-amplification budget, then retry any flight a gate held back,
+    %% which the fresh budget (or address validation) may now let out.
     State1 = amp_account_recv(Data, State),
     State2 = handle_packet_loop(Data, State1),
-    amp_flush(State2).
+    drain_pending_hs(State2).
 
 %% Server-side anti-amplification accounting/gating (RFC 9000 §8.1).
 amp_account_recv(Data, #state{role = server, address_validated = false} = State) ->
@@ -3542,32 +3539,52 @@ amp_account_recv(Data, #state{role = server, address_validated = false} = State)
 amp_account_recv(_Data, State) ->
     State.
 
-%% Send a pre-handshake datagram subject to the 3x budget. Over-budget
-%% datagrams are deferred verbatim and flushed later. Returns the updated
-%% state (socket_state / amp counters / deferred queue threaded in).
-amp_send(Packet, Meta, #state{role = server, address_validated = false} = State) ->
-    Size = erlang:iolist_size(Packet),
-    case (State#state.amp_tx + Size) =< (3 * State#state.amp_rx) of
-        true ->
-            SocketState = send_and_take_socket_state(Packet, State),
-            {sent, State#state{socket_state = SocketState, amp_tx = State#state.amp_tx + Size}};
-        false ->
-            {deferred, State#state{amp_deferred = State#state.amp_deferred ++ [{Packet, Meta}]}}
-    end;
-amp_send(Packet, _Meta, State) ->
-    {sent, State#state{socket_state = send_and_take_socket_state(Packet, State)}}.
-
-%% Record a handshake-level packet with loss detection and congestion
-%% control, at the moment it actually reaches the socket.
+%% Both gates a pre-handshake packet has to clear, in the only order
+%% that lets a refusal cost nothing.
 %%
-%% A packet the amplification budget defers has not left the host, so
-%% charging it now would put bytes in flight for something unsent and
-%% arm a probe whose own transmission is deferred too. It is registered
-%% from the deferred queue instead, with the send time it really got.
-register_sent(deferred, _Meta, State) ->
-    State;
-register_sent(sent, Meta, State) ->
-    register_now(Meta, erlang:monotonic_time(millisecond), State).
+%% Amplification first and congestion second, because only the second
+%% has state to spend: a packet refused here has not taken a packet
+%% number, has not been counted as sent and has not drawn on the pacer,
+%% so its later attempt is a first attempt rather than a retry. Both
+%% refusals put the frames in the same per-space queue, which is what
+%% keeps a flight in order across the two.
+%%
+%% The two measure different things: the congestion window counts the
+%% protected packet, the amplification budget counts the datagram, which
+%% for a short Initial is larger because it is brought to 1200 bytes
+%% outside the packet.
+-spec gate(
+    quic_loss:space(), boolean(), non_neg_integer(), iodata(), iodata(), [term()], #state{}
+) ->
+    {ok, #state{}} | {deferred, #state{}}.
+gate(Space, InFlight, Size, Datagram, Payload, Frames, State) ->
+    case amp_allows(Datagram, State) of
+        false ->
+            {deferred, enqueue_hs(Space, Payload, Frames, State)};
+        true ->
+            admit(Space, InFlight, Size, Payload, Frames, State)
+    end.
+
+%% RFC 9000 Section 8.1: until it has validated the peer address a
+%% server may send at most three times what it has received. The limit
+%% is absolute, so unlike the congestion window it has no probe
+%% exemption.
+amp_allows(Datagram, #state{role = server, address_validated = false} = State) ->
+    (State#state.amp_tx + erlang:iolist_size(Datagram)) =< (3 * State#state.amp_rx);
+amp_allows(_Datagram, _State) ->
+    true.
+
+%% Put the datagram on the wire and charge it, in that order: nothing is
+%% spent until both gates have passed.
+emit(Datagram, Meta, #state{role = server, address_validated = false} = State) ->
+    State1 = State#state{
+        socket_state = send_and_take_socket_state(Datagram, State),
+        amp_tx = State#state.amp_tx + erlang:iolist_size(Datagram)
+    },
+    register_now(Meta, erlang:monotonic_time(millisecond), State1);
+emit(Datagram, Meta, State) ->
+    State1 = State#state{socket_state = send_and_take_socket_state(Datagram, State)},
+    register_now(Meta, erlang:monotonic_time(millisecond), State1).
 
 %% Only a packet in flight is tracked or charged (RFC 9002 Section 2).
 register_now({_Space, _PN, _Size, _Frames, _AckEliciting, false}, _Now, State) ->
@@ -3598,53 +3615,15 @@ server_discard_initial(handshake, #state{role = server} = State) ->
 server_discard_initial(_Type, State) ->
     State.
 
-%% Flush deferred datagrams. Once validated, send all; otherwise send
-%% only what the current budget covers (in order).
-amp_flush(#state{amp_deferred = []} = State) ->
-    State;
-amp_flush(#state{address_validated = true, amp_deferred = Pending} = State) ->
-    Flushed = lists:foldl(
-        fun({Packet, Meta}, S) ->
-            S1 = S#state{
-                socket_state = send_and_take_socket_state(Packet, S),
-                amp_tx = S#state.amp_tx + erlang:iolist_size(Packet)
-            },
-            register_now(Meta, erlang:monotonic_time(millisecond), S1)
-        end,
-        State,
-        Pending
-    ),
-    Flushed#state{amp_deferred = []};
-amp_flush(#state{role = server} = State) ->
-    amp_flush_budget(State);
-amp_flush(State) ->
-    State.
-
-amp_flush_budget(#state{amp_deferred = []} = State) ->
-    State;
-amp_flush_budget(#state{amp_deferred = [{Packet, Meta} | Rest]} = State) ->
-    Size = erlang:iolist_size(Packet),
-    case (State#state.amp_tx + Size) =< (3 * State#state.amp_rx) of
-        true ->
-            State1 = State#state{
-                socket_state = send_and_take_socket_state(Packet, State),
-                amp_tx = State#state.amp_tx + Size,
-                amp_deferred = Rest
-            },
-            amp_flush_budget(register_now(Meta, erlang:monotonic_time(millisecond), State1));
-        false ->
-            State
-    end.
-
 %% Batched variant of handle_packet/2: same anti-amplification
-%% accounting per datagram, one deferred-flight flush per batch. The
-%% batched delivery path previously skipped accounting entirely, so a
-%% server's amp budget froze at the first datagram under load and
-%% deferred flights never flushed.
+%% accounting per datagram, one drain per batch. The batched delivery
+%% path previously skipped accounting entirely, so a server's amp budget
+%% froze at the first datagram under load and held flights never went
+%% out.
 handle_packets_batch(Packets, State) ->
     State1 = lists:foldl(fun amp_account_recv/2, State, Packets),
     State2 = do_handle_packets_batch(Packets, State1),
-    amp_flush(State2).
+    drain_pending_hs(State2).
 
 %% Handle batch of packets from GRO - process all without re-entering gen_statem
 %% This is more efficient than receiving multiple messages

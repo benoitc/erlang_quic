@@ -43,11 +43,10 @@
     address_validated = false :: boolean(),
     %% RFC 9000 §8.1 anti-amplification (server, pre-validation). Cap
     %% bytes sent to <= 3x bytes received until the peer's address is
-    %% validated; datagrams over budget are deferred (held verbatim) and
-    %% flushed when more is received or the address becomes validated.
+    %% validated; a datagram over budget is held in pending_hs and tried
+    %% again when more is received or the address becomes validated.
     amp_rx = 0 :: non_neg_integer(),
     amp_tx = 0 :: non_neg_integer(),
-    amp_deferred = [] :: [{iodata(), tuple()}],
     %% Server-side only. The Retry SCID to echo back as
     %% retry_source_connection_id (RFC 9000 §7.3) when this connection
     %% was spawned from a retried Initial.

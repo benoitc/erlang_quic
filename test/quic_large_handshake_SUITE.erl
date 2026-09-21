@@ -11,10 +11,9 @@
 %%% the handshake never completes.
 %%%
 %%% This reproduces that on a live connection rather than on the queue
-%%% alone. `address_validation => always' puts a Retry in front of the
-%%% flight, which also settles the address, so the congestion window is
-%%% the only thing holding packets back and the queue is what has to
-%%% carry them.
+%%% alone, with and without a Retry in front of the flight: the Retry
+%%% settles the peer address, so without one the anti-amplification
+%%% budget holds packets back as well as the window.
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
 %%% Apache License 2.0
@@ -24,7 +23,7 @@
 -include_lib("stdlib/include/assert.hrl").
 
 -export([all/0, suite/0, init_per_suite/1, end_per_suite/1]).
--export([large_chain_handshake_after_retry/1]).
+-export([large_chain_handshake/1, large_chain_handshake_after_retry/1]).
 
 %% Filler certificates in the chain. Each is about 1.2 KB of DER, so
 %% this puts the Certificate message well past 30 KB: more than twenty
@@ -44,7 +43,7 @@ suite() ->
     [{timetrap, {minutes, 5}}].
 
 all() ->
-    [large_chain_handshake_after_retry].
+    [large_chain_handshake, large_chain_handshake_after_retry].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -66,8 +65,16 @@ end_per_suite(_Config) ->
 %% Cases
 %%====================================================================
 
+%% Without a Retry the server also starts out unvalidated, so the
+%% amplification budget holds the flight back as well as the window.
+%% Both gates feed one queue, so the flight still comes out whole and in
+%% order.
+large_chain_handshake(Config) ->
+    ?assertEqual(?ECHO, run(?config(chain, Config), never)).
+
 %% The shape this was first reported in: a certificate flight past the
-%% window, behind a Retry.
+%% window, behind a Retry. The Retry settles the address, so the window
+%% is the only gate.
 large_chain_handshake_after_retry(Config) ->
     ?assertEqual(?ECHO, run(?config(chain, Config), always)).
 

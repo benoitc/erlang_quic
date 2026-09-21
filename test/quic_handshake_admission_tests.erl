@@ -174,12 +174,18 @@ payload() -> <<"handshake-crypto-payload">>.
 frames() -> [{crypto, 0, <<"handshake-crypto-payload">>}].
 
 %% A connection whose congestion window is entirely spoken for, so
-%% admission refuses anything above the control allowance.
+%% admission refuses anything above the control allowance. The peer
+%% address is validated, which takes the amplification budget out of it:
+%% these cases are about the window.
 blocked_state() ->
-    S = quic_connection_test_support:state_with_keys(server),
+    S = quic_connection_test_support:state_sending(
+        quic_connection_test_support:state_with_keys(server)
+    ),
     CC = quic_cc:new(#{algorithm => newreno, initial_window => 1200}),
     quic_connection_test_support:state_set(
-        S, cc_state, quic_cc:on_packet_sent(CC, 100000)
+        quic_connection_test_support:state_set(S, address_validated, true),
+        cc_state,
+        quic_cc:on_packet_sent(CC, 100000)
     ).
 
 next_pn(State) ->

@@ -24,6 +24,7 @@
     state_for_reset/3,
     state_amp/2,
     amp_counters/1,
+    state_sending/1,
     state_for_role/1,
     state_for_client/1,
     state_with_keys/1,
@@ -212,8 +213,9 @@ state_amp(Role, Validated) ->
     #state{role = Role, address_validated = Validated}.
 
 -spec amp_counters(#state{}) -> #{atom() => non_neg_integer()}.
-amp_counters(#state{amp_rx = Rx, amp_tx = Tx, amp_deferred = Deferred}) ->
-    #{amp_rx => Rx, amp_tx => Tx, deferred => length(Deferred)}.
+amp_counters(#state{amp_rx = Rx, amp_tx = Tx, pending_hs = Pending}) ->
+    Deferred = length(maps:get(initial, Pending, [])) + length(maps:get(handshake, Pending, [])),
+    #{amp_rx => Rx, amp_tx => Tx, deferred => Deferred}.
 
 %% Minimal #state{} scoped to role for frame-dispatch tests.
 -spec state_for_role(client | server) -> #state{}.
@@ -277,6 +279,15 @@ state_closing(State, Reason) -> State#state{close_reason = Reason}.
 -spec state_with_socket(#state{}, gen_udp:socket()) -> #state{}.
 state_with_socket(State, Socket) -> State#state{socket = Socket}.
 
+%% A state whose sends reach a real socket, aimed at the discard port.
+%% Tests that assert a packet went out need the send to succeed rather
+%% than fall over a missing socket; the socket is owned by the calling
+%% test process and goes with it.
+-spec state_sending(#state{}) -> #state{}.
+state_sending(State) ->
+    {ok, Socket} = gen_udp:open(0, [binary, {active, false}]),
+    State#state{socket = Socket, remote_addr = {{127, 0, 0, 1}, 9}}.
+
 %% Minimal #state{} carrying a caller-supplied loss tracker, for tests
 %% that need to observe what an incoming frame does to it.
 state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
@@ -285,7 +296,9 @@ state_get(#state{} = S, dcid) -> S#state.dcid;
 state_get(#state{} = S, initial_keys) -> S#state.initial_keys;
 state_get(#state{} = S, handshake_keys) -> S#state.handshake_keys;
 state_get(#state{} = S, pending_hs) -> S#state.pending_hs;
-state_get(#state{} = S, handshake_next_pn) -> (S#state.pn_handshake)#pn_space.next_pn.
+state_get(#state{} = S, handshake_next_pn) -> (S#state.pn_handshake)#pn_space.next_pn;
+state_get(#state{} = S, packets_sent) -> S#state.packets_sent;
+state_get(#state{} = S, amp_tx) -> S#state.amp_tx.
 
 state_set(#state{} = S, loss_state, V) ->
     S#state{loss_state = V};
@@ -302,7 +315,11 @@ state_set(#state{} = S, transport_params, V) ->
 state_set(#state{} = S, cc_state, V) ->
     S#state{cc_state = V};
 state_set(#state{} = S, hs_probe, V) ->
-    S#state{hs_probe = V}.
+    S#state{hs_probe = V};
+state_set(#state{} = S, address_validated, V) ->
+    S#state{address_validated = V};
+state_set(#state{} = S, amp_rx, V) ->
+    S#state{amp_rx = V}.
 
 %% A #state{} carrying a loss tracker, for the space whose timer is
 %% under test. The application space is only reachable once the handshake
