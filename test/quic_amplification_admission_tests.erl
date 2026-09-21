@@ -61,6 +61,38 @@ a_released_packet_is_still_window_checked_test() ->
     ?assertEqual(next_pn(S1), next_pn(S2)),
     ?assertEqual([], in_flight(S2)).
 
+%% RFC 9000 Section 8.1 gives the budget no exceptions. The congestion
+%% window has one for probes, so that a blocked sender can free itself,
+%% and an ACK or a close is not congestion controlled at all; none of
+%% that carries over, or an unvalidated server could be used to amplify
+%% traffic at a spoofed address.
+probe_does_not_bypass_the_budget_test() ->
+    S0 = quic_connection_test_support:state_set(amp_limited(), hs_probe, true),
+    S1 = quic_connection:send_handshake_packet(payload(), frames(), S0),
+    ?assertEqual(1, queued(handshake, S1)),
+    ?assertEqual(0, amp_tx(S1)).
+
+ack_only_does_not_bypass_the_budget_test() ->
+    S1 = quic_connection:send_handshake_packet(
+        <<2, 0, 0, 0, 0, 0>>, [{ack, [{0, 0}], 0, undefined}], amp_limited()
+    ),
+    ?assertEqual(1, queued(handshake, S1)),
+    ?assertEqual(0, amp_tx(S1)).
+
+connection_close_does_not_bypass_the_budget_test() ->
+    Frame = {connection_close, transport, 0, 0, <<>>},
+    S1 = quic_connection:send_handshake_packet(<<28, 0, 0, 0, 0, 0>>, [Frame], amp_limited()),
+    ?assertEqual(1, queued(handshake, S1)),
+    ?assertEqual(0, amp_tx(S1)).
+
+%% What the budget does allow goes out, so the cases above are showing a
+%% budget that is out of room rather than one that never sends.
+what_the_budget_covers_is_sent_test() ->
+    S0 = quic_connection_test_support:state_set(amp_limited(), amp_rx, 1200),
+    S1 = quic_connection:send_handshake_packet(payload(), frames(), S0),
+    ?assertEqual(0, queued(handshake, S1)),
+    ?assert(amp_tx(S1) > 0).
+
 %%====================================================================
 %% Order
 %%====================================================================
