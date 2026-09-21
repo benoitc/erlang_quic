@@ -303,7 +303,8 @@ state_get(#state{} = S, initial_keys) -> S#state.initial_keys;
 state_get(#state{} = S, handshake_keys) -> S#state.handshake_keys;
 state_get(#state{} = S, handshake_next_pn) -> (S#state.pn_handshake)#pn_space.next_pn;
 state_get(#state{} = S, packets_sent) -> S#state.packets_sent;
-state_get(#state{} = S, amp_tx) -> S#state.amp_tx.
+state_get(#state{} = S, amp_tx) -> S#state.amp_tx;
+state_get(#state{} = S, pacing_timer) -> S#state.pacing_timer.
 
 state_set(#state{} = S, loss_state, V) ->
     S#state{loss_state = V};

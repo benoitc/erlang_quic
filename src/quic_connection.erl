@@ -1735,7 +1735,6 @@ connected(
         data_sent = DataSent,
         ack_sent = AckSent,
         retransmits = Retransmits,
-        zero_rtt_stream_ids = ZeroRttStreams,
         socket_state = SocketState
     } = State
 ) ->
@@ -1750,10 +1749,6 @@ connected(
         data_sent => DataSent,
         ack_sent => AckSent,
         retransmits => Retransmits,
-        %% Streams that carried 0-RTT-encrypted data and kept it. A
-        %% rejection clears them (RFC 9001 Section 4.6.2), so a non-zero
-        %% value here means early data was sent and the server took it.
-        zero_rtt_streams => sets:size(ZeroRttStreams),
         batch_flushes => Flushes,
         packets_coalesced => Coalesced,
         gso_flushes => GSOFlushes,
@@ -2068,8 +2063,9 @@ handle_common_event(info, {disconnect_check, _StaleRef}, _StateName, State) ->
 handle_common_event(info, {pto_timeout, _StaleRef}, _StateName, State) ->
     %% Ignore stale PTO timer (ref doesn't match or wrong state)
     {keep_state, State};
-handle_common_event(info, {pacing_timeout, Ref}, connected, #state{pacing_timer = Ref} = State) when
-    Ref =/= undefined
+handle_common_event(info, {pacing_timeout, Ref}, StateName, #state{pacing_timer = Ref} = State) when
+    Ref =/= undefined andalso
+        (StateName =:= connected orelse StateName =:= handshaking orelse StateName =:= idle)
 ->
     %% Handle pacing timeout - process send queue
     NewState = handle_pacing_timeout(State#state{pacing_timer = undefined}),
@@ -2904,9 +2900,15 @@ admit(Space, true, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
         {ok, NewCC} ->
             {ok, State#state{cc_state = NewCC}};
         {blocked_cwnd, _Avail} ->
+            %% The window reopens on acknowledgement, and something is
+            %% in flight while it is shut, so the retry is already
+            %% coming.
             {deferred, enqueue_hs(Space, Payload, Frames, State)};
-        {blocked_pacing, _Delay} ->
-            {deferred, enqueue_hs(Space, Payload, Frames, State)}
+        {blocked_pacing, Delay} ->
+            %% Pacing can refuse with nothing in flight, so no
+            %% acknowledgement is on its way to drain this: it has to
+            %% schedule its own retry.
+            {deferred, maybe_set_pacing_timer(Delay, enqueue_hs(Space, Payload, Frames, State))}
     end.
 
 %% A queue, so both ends are cheap: a sustained refusal appends and the
@@ -10746,17 +10748,21 @@ cancel_timer(Ref) -> erlang:cancel_timer(Ref).
 %% Fast path: send_queue_count == 0 implies queue is empty, avoiding the
 %% O(8) bucket walk in quic_pqueue:is_empty/1. Byte count is NOT safe here
 %% because zero-byte FIN-only entries can sit in the queue with bytes=0.
-handle_pacing_timeout(#state{send_queue_count = 0} = State) ->
-    ?LOG_DEBUG(#{what => pacing_timeout_fired, queue_empty => true}, ?QUIC_LOG_META),
-    State#state{burst_sent = 0};
-handle_pacing_timeout(State) ->
-    ?LOG_DEBUG(#{what => pacing_timeout_fired, queue_empty => false}, ?QUIC_LOG_META),
-    %% Fresh drain: reset the burst budget, then process the send queue
-    State1 = process_send_queue(State#state{burst_sent = 0}),
-    %% If there's still queued data and pacing is blocking, set another timer
-    State2 = maybe_reschedule_pacing(State1),
-    %% Event-driven flush: flush batch and timers after pacing timeout processing
-    flush_dirty_timers(flush_socket_batch(State2)).
+handle_pacing_timeout(State0) ->
+    %% Handshake packets the pacer refused are not in the application
+    %% send queue, so they are drained before the fast path that looks
+    %% only at that queue.
+    State = drain_pending_hs(State0#state{burst_sent = 0}),
+    ?LOG_DEBUG(
+        #{what => pacing_timeout_fired, queue_empty => (State#state.send_queue_count =:= 0)},
+        ?QUIC_LOG_META
+    ),
+    Processed =
+        case State#state.send_queue_count of
+            0 -> State;
+            _ -> maybe_reschedule_pacing(process_send_queue(State))
+        end,
+    flush_dirty_timers(flush_socket_batch(Processed)).
 
 %% Check if we need to reschedule pacing timer after processing queue
 maybe_reschedule_pacing(#state{send_queue = PQ, cc_state = CCState, pacing_enabled = true} = State) ->

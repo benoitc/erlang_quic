@@ -18,6 +18,11 @@
 %% Must match quic_connection_state.hrl.
 -define(MAX_PENDING_HS_BYTES, 1048576).
 
+%% Payload for the pacing cases, and how long its tokens take to come
+%% back. See paced_out_state/0.
+-define(PACED_PAYLOAD, 4096).
+-define(REFILL_MS, 20).
+
 %% A window with no room refuses, and the refusal costs nothing: the
 %% packet number is still there to be used when the window reopens.
 refusal_does_not_spend_a_packet_number_test() ->
@@ -176,6 +181,53 @@ drain_cost(Count) ->
     end.
 
 %%====================================================================
+%% A pacing refusal has to schedule its own retry
+%%====================================================================
+
+%% The congestion window reopens on acknowledgement, and something is
+%% always in flight while it is shut, so a window refusal already has a
+%% retry coming. Pacing has neither: it refuses with nothing in flight,
+%% and then no acknowledgement is on its way. Without a timer the flight
+%% sits there until the handshake times out.
+pacing_refusal_arms_a_timer_test() ->
+    S0 = paced_out_state(),
+    ?assertEqual(undefined, pacing_timer(S0)),
+    S1 = quic_connection:send_handshake_packet(paced_payload(), paced_frames(), S0),
+    ?assertEqual(1, queued(handshake, S1)),
+    ?assertNotEqual(undefined, pacing_timer(S1)).
+
+%% The handshake queue is not the application send queue, so a handler
+%% that looks only at the latter has nothing to do and the flight stays
+%% put.
+pacing_timeout_drains_the_handshake_queue_test() ->
+    S1 = quic_connection:send_handshake_packet(paced_payload(), paced_frames(), paced_out_state()),
+    ?assertEqual(1, queued(handshake, S1)),
+    %% Tokens refill with the clock.
+    timer:sleep(?REFILL_MS),
+    S2 = quic_connection:handle_pacing_timeout(S1),
+    ?assertEqual(0, queued(handshake, S2)),
+    ?assertEqual(next_pn(S1) + 1, next_pn(S2)).
+
+%% The early handshake runs in `idle' and `handshaking', not
+%% `connected', so a guard that accepts the timeout only there drops
+%% every retry the handshake schedules.
+pacing_timeout_is_handled_before_connected_test() ->
+    Drained = fun(StateName) ->
+        S1 = quic_connection:send_handshake_packet(
+            paced_payload(), paced_frames(), paced_out_state()
+        ),
+        1 = queued(handshake, S1),
+        timer:sleep(?REFILL_MS),
+        {keep_state, S2} = quic_connection:handle_common_event(
+            info, {pacing_timeout, pacing_timer(S1)}, StateName, S1
+        ),
+        queued(handshake, S2)
+    end,
+    ?assertEqual(0, Drained(idle)),
+    ?assertEqual(0, Drained(handshaking)),
+    ?assertEqual(0, Drained(connected)).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -235,6 +287,47 @@ blocked_state() ->
         cc_state,
         quic_cc:on_packet_sent(CC, 100000)
     ).
+
+%% A connection whose window is wide open but whose pacing tokens are
+%% spent, so the pacer is the only thing refusing.
+%%
+%% Tokens refill with the clock, so the packet has to be big enough that
+%% the microseconds between draining them and the send cannot cover it:
+%% at this rate ?PACED_PAYLOAD takes about ten milliseconds to afford,
+%% and the ?REFILL_MS the drain cases wait is twice that.
+paced_out_state() ->
+    S = quic_connection_test_support:state_sending(
+        quic_connection_test_support:state_with_keys(server)
+    ),
+    CC = spend_pacing_tokens(
+        quic_cc:update_pacing_rate(
+            quic_cc:new(#{
+                algorithm => newreno, initial_window => 1000000, max_datagram_size => 1500
+            }),
+            3000
+        ),
+        100
+    ),
+    quic_connection_test_support:state_set(
+        quic_connection_test_support:state_set(S, address_validated, true),
+        cc_state,
+        CC
+    ).
+
+spend_pacing_tokens(CC, 0) ->
+    CC;
+spend_pacing_tokens(CC, Budget) ->
+    case quic_cc:send_check(CC, 2000, 0) of
+        {ok, Next} -> spend_pacing_tokens(Next, Budget - 1);
+        _Blocked -> CC
+    end.
+
+paced_payload() -> binary:copy(<<"c">>, ?PACED_PAYLOAD).
+
+paced_frames() -> [{crypto, 0, paced_payload()}].
+
+pacing_timer(State) ->
+    quic_connection_test_support:state_get(State, pacing_timer).
 
 next_pn(State) ->
     quic_connection_test_support:state_get(State, handshake_next_pn).
