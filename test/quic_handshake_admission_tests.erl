@@ -58,6 +58,41 @@ spaces_queue_separately_test() ->
     ?assertEqual(0, queued(initial, S1)),
     ?assertEqual(1, queued(handshake, S1)).
 
+%% An acknowledgement is not in flight (RFC 9002 Section 2), so it is
+%% not congestion controlled. Holding one back would be worse than
+%% pointless: an acknowledgement is what reopens the peer's window, so a
+%% deferred one can stall the handshake that would unblock the sender,
+%% and nothing would drain it because the drain runs on acknowledgement.
+ack_only_is_never_held_back_test() ->
+    S0 = blocked_state(),
+    Before = next_pn(S0),
+    %% A real ACK frame is well over the four bytes below which a
+    %% payload gets PADDING for header-protection sampling, which would
+    %% put it in flight after all.
+    S1 = quic_connection:send_handshake_packet(
+        <<2, 0, 0, 0, 0, 0>>, [{ack, [{0, 0}], 0, undefined}], S0
+    ),
+    ?assertEqual(0, queued(handshake, S1)),
+    ?assertEqual(Before + 1, next_pn(S1)).
+
+%% A close is not in flight either, and must go out while the window is
+%% shut or the peer is left waiting for a timeout instead.
+connection_close_is_never_held_back_test() ->
+    S0 = blocked_state(),
+    Frame = {connection_close, transport, 0, 0, <<>>},
+    S1 = quic_connection:send_handshake_packet(<<28, 0, 0, 0, 0, 0>>, [Frame], S0),
+    ?assertEqual(0, queued(handshake, S1)).
+
+%% Nothing may be sent at a discarded level, which includes what the
+%% window is still holding: draining it afterwards would put an obsolete
+%% packet on the wire.
+discard_purges_what_the_window_holds_test() ->
+    S1 = quic_connection:send_handshake_packet(payload(), frames(), blocked_state()),
+    ?assertEqual(1, queued(handshake, S1)),
+    S2 = quic_connection:confirm_handshake(S1),
+    ?assertEqual(0, queued(handshake, S2)),
+    ?assertEqual(S2, quic_connection:drain_pending_hs(S2)).
+
 %%====================================================================
 %% Helpers
 %%====================================================================
@@ -78,8 +113,10 @@ blocked_state() ->
 next_pn(State) ->
     quic_connection_test_support:state_get(State, handshake_next_pn).
 
+%% In the order they would be sent. The queue itself is newest-first, so
+%% that a sustained refusal does not append to a growing tail.
 pending(Space, State) ->
-    maps:get(Space, quic_connection_test_support:state_get(State, pending_hs), []).
+    lists:reverse(maps:get(Space, quic_connection_test_support:state_get(State, pending_hs), [])).
 
 queued(Space, State) ->
     length(pending(Space, State)).

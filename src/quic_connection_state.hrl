@@ -9,6 +9,11 @@
 %% retransmission semantics.
 -define(PTO_RESET_TOLERANCE_MS, 2).
 
+%% Most handshake packets the congestion window may hold back at once.
+%% A flight is a handful of packets, so a queue past this is a peer that
+%% never opens the window rather than a slow one.
+-define(MAX_PENDING_HS, 16).
+
 %% ACK packet tolerance for 1-RTT (RFC 9002 §6.2).
 %% The receiver SHOULD send an ACK frame in response to at least every
 %% second ack-eliciting packet. 2 is the RFC floor; higher values trade
@@ -276,6 +281,10 @@
     %% lazy "a later deadline never cancels" rule would otherwise leave
     %% the wrong space armed.
     pto_space = app :: quic_loss:space(),
+    %% Whether the armed timer is a time-threshold loss deadline or a
+    %% probe. They are handled differently when it fires, and a change of
+    %% either forces a re-arm.
+    pto_kind = pto :: loss | pto,
     %% Handshake payloads the congestion window or pacer refused, held as
     %% frames rather than encoded packets so no packet number is spent
     %% until one actually goes out. Drained when an acknowledgement

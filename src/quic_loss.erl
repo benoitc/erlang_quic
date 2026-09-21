@@ -48,6 +48,7 @@
     %% Loss detection
     detect_lost_packets/3,
     get_loss_time_and_space/1,
+    largest_acked/2,
 
     %% RTT
     update_rtt/3,
@@ -231,7 +232,7 @@ on_packet_sent(Space, State, PacketNumber, Size, AckEliciting) ->
 
 %% @doc Record that a packet was sent with frames. Samples the send
 %% time itself. Callers that already hold a Now should use
-%% on_packet_sent/6 to avoid a duplicate monotonic_time/1 BIF call.
+%% on_packet_sent/7 to avoid a duplicate monotonic_time/1 BIF call.
 -spec on_packet_sent(
     space(), loss_state(), non_neg_integer(), non_neg_integer(), boolean(), [term()]
 ) ->
@@ -592,19 +593,43 @@ largest_lost_ts({_PN, TS}) -> TS.
 %% The queue is oldest-first, so the earliest in_flight packet is at
 %% the head; this turns the previous O(n) map fold into an O(1) head
 %% peek in the common case (head is in_flight).
--spec get_loss_time_and_space(loss_state()) ->
-    {non_neg_integer() | undefined, atom()}.
+-spec get_loss_time_and_space(loss_state()) -> {non_neg_integer(), space()} | none.
 get_loss_time_and_space(#loss_state{} = State) ->
-    Q = (pn(app, State))#pn_loss.sent_q,
     LossDelay = max(trunc(?TIME_THRESHOLD * loss_delay_rtt(State)), ?GRANULARITY),
-    case earliest_in_flight_time(queue:to_list(Q)) of
-        undefined -> {undefined, initial};
-        TimeSent -> {TimeSent + LossDelay, initial}
+    lists:foldl(
+        fun(Space, Best) -> earlier_loss(space_loss_time(Space, State, LossDelay), Best) end,
+        none,
+        [initial, handshake, app]
+    ).
+
+%% RFC 9002 Appendix A.10: only a packet an acknowledgement has already
+%% overtaken can be declared lost on time. Until one has, nothing in the
+%% space has a deadline, and it is the probe timer's job rather than
+%% this one's.
+space_loss_time(Space, State, LossDelay) ->
+    case pn(Space, State) of
+        #pn_loss{largest_acked = undefined} ->
+            none;
+        #pn_loss{largest_acked = LargestAcked, sent_q = Q} ->
+            case earliest_overtaken(queue:to_list(Q), LargestAcked) of
+                undefined -> none;
+                TimeSent -> {TimeSent + LossDelay, Space}
+            end
     end.
 
-earliest_in_flight_time([]) -> undefined;
-earliest_in_flight_time([#sent_packet{time_sent = TS, in_flight = true} | _]) -> TS;
-earliest_in_flight_time([_ | Rest]) -> earliest_in_flight_time(Rest).
+earliest_overtaken([], _LargestAcked) ->
+    undefined;
+earliest_overtaken([#sent_packet{pn = PN, time_sent = TS, in_flight = true} | _], LargestAcked) when
+    PN < LargestAcked
+->
+    TS;
+earliest_overtaken([_ | Rest], LargestAcked) ->
+    earliest_overtaken(Rest, LargestAcked).
+
+earlier_loss(none, Best) -> Best;
+earlier_loss(Candidate, none) -> Candidate;
+earlier_loss({T1, _} = C, {T2, _}) when T1 < T2 -> C;
+earlier_loss(_C, Best) -> Best.
 
 %%====================================================================
 %% RTT Estimation (RFC 9002 Section 5)
@@ -634,6 +659,15 @@ update_rtt(
 %% congestion window.
 loss_delay_rtt(#loss_state{rtt = RTT}) ->
     max(quic_rtt:smoothed(RTT), quic_rtt:latest(RTT)).
+
+%% @doc The highest packet number acknowledged in a space, or 0 before
+%% anything has been.
+-spec largest_acked(loss_state(), space()) -> non_neg_integer().
+largest_acked(#loss_state{} = State, Space) ->
+    case (pn(Space, State))#pn_loss.largest_acked of
+        undefined -> 0;
+        LargestAcked -> LargestAcked
+    end.
 
 %% @doc The path's RTT estimate, read through quic_rtt.
 -spec rtt(loss_state()) -> quic_rtt:state().

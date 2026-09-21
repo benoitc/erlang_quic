@@ -208,15 +208,22 @@ loss_by_packet_threshold_test() ->
 %%====================================================================
 
 get_loss_time_no_packets_test() ->
-    State = quic_loss:new(),
-    {LossTime, _Space} = quic_loss:get_loss_time_and_space(State),
-    ?assertEqual(undefined, LossTime).
+    ?assertEqual(none, quic_loss:get_loss_time_and_space(quic_loss:new())).
+
+%% A packet nothing has overtaken has no time-threshold deadline: until
+%% an acknowledgement names a higher packet number there is no evidence
+%% it was lost, and the probe timer covers it instead.
+get_loss_time_needs_an_acknowledgement_test() ->
+    S1 = quic_loss:on_packet_sent(app, quic_loss:new(), 0, 100, true),
+    ?assertEqual(none, quic_loss:get_loss_time_and_space(S1)).
 
 get_loss_time_with_packets_test() ->
-    State = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(app, State, 0, 100, true),
-    {LossTime, _Space} = quic_loss:get_loss_time_and_space(S1),
-    ?assertNotEqual(undefined, LossTime).
+    S1 = quic_loss:on_packet_sent(app, quic_loss:new(), 0, 100, true),
+    S2 = quic_loss:on_packet_sent(app, S1, 1, 100, true),
+    {S3, _Acked, _Lost, _Meta} = quic_loss:on_ack_received(
+        app, S2, {ack, 1, 0, 0, []}, erlang:monotonic_time(millisecond)
+    ),
+    ?assertMatch({_LossTime, app}, quic_loss:get_loss_time_and_space(S3)).
 
 %%====================================================================
 %% Integration Tests

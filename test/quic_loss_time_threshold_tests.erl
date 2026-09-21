@@ -32,9 +32,18 @@
 %% Helpers
 %%====================================================================
 
-%% One in-flight packet sent at ?SENT_AT.
+%% One in-flight packet sent at ?SENT_AT, with a later one acknowledged
+%% so it has been overtaken: a packet nothing has overtaken has no
+%% time-threshold deadline (RFC 9002 Appendix A.10).
 with_inflight_packet(State) ->
-    quic_loss:on_packet_sent(app, State, 1, 1200, true, [], ?SENT_AT).
+    S1 = quic_loss:on_packet_sent(app, State, 1, 1200, true, [], ?SENT_AT),
+    %% Not ack-eliciting, so acknowledging it takes no RTT sample and
+    %% leaves the estimate each case sets up untouched.
+    S2 = quic_loss:on_packet_sent(app, S1, 2, 1200, false, [], ?SENT_AT),
+    {S3, _Acked, _Lost, _Meta} = quic_loss:on_ack_received(
+        app, S2, {ack, 2, 0, 0, []}, ?SENT_AT
+    ),
+    S3.
 
 %% Feed RTT samples in order.
 samples(State, Rtts) ->
@@ -43,7 +52,6 @@ samples(State, Rtts) ->
 %% The delay actually applied, recovered from the returned loss time.
 applied_delay(State) ->
     {LossTime, _Space} = quic_loss:get_loss_time_and_space(State),
-    ?assertNotEqual(undefined, LossTime),
     LossTime - ?SENT_AT.
 
 expected_delay(Rtt) ->
@@ -101,7 +109,7 @@ delay_floors_at_granularity_test() ->
 
 no_in_flight_packet_has_no_loss_time_test() ->
     State = samples(quic_loss:new(), [50]),
-    ?assertEqual({undefined, initial}, quic_loss:get_loss_time_and_space(State)).
+    ?assertEqual(none, quic_loss:get_loss_time_and_space(State)).
 
 %%====================================================================
 %% What the threshold is for: not declaring loss on an RTT spike

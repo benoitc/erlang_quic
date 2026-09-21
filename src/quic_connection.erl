@@ -2038,6 +2038,8 @@ handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref}
             case disconnect_timeout_expired(State1) of
                 true ->
                     {next_state, draining, declare_peer_dead(State1)};
+                false when State1#state.pto_kind =:= loss ->
+                    {keep_state, handle_loss_timeout(State1)};
                 false ->
                     %% Handle PTO timeout - send probe packet
                     {keep_state, handle_pto_timeout(State1)}
@@ -2765,17 +2767,25 @@ discard_initial(State) ->
 discard_space(_Space, #state{loss_state = undefined} = State) ->
     State;
 discard_space(Space, #state{loss_state = LossState, cc_state = CCState} = State) ->
-    case quic_loss:sent_packets(Space, LossState) of
-        Empty when map_size(Empty) =:= 0 ->
-            State;
-        _ ->
-            {NewLossState, Bytes} = quic_loss:discard_space(Space, LossState),
-            State#state{
-                loss_state = NewLossState,
-                cc_state = discard_cc_bytes(CCState, Bytes),
-                pto_dirty = true
-            }
-    end.
+    %% Unconditional, even when the space tracked nothing: RFC 9002
+    %% Appendix A.11 resets the probe backoff and re-arms the timer
+    %% whenever a space is dropped, and a space with no packets can still
+    %% have earned a backoff.
+    {NewLossState, Bytes} = quic_loss:discard_space(Space, LossState),
+    purge_unsent(Space, State#state{
+        loss_state = NewLossState,
+        cc_state = discard_cc_bytes(CCState, Bytes),
+        pto_dirty = true
+    }).
+
+%% Nothing may be sent at a discarded level (RFC 9001 Section 4.9), which
+%% includes packets that never left: one held back by the amplification
+%% budget, or by the congestion window.
+purge_unsent(Space, #state{amp_deferred = Deferred, pending_hs = Pending} = State) ->
+    State#state{
+        amp_deferred = [E || {_Packet, Meta} = E <- Deferred, element(1, Meta) =/= Space],
+        pending_hs = Pending#{Space => []}
+    }.
 
 discard_cc_bytes(undefined, _Bytes) -> undefined;
 discard_cc_bytes(CCState, Bytes) -> quic_cc:on_packets_discarded(CCState, Bytes).
@@ -2868,13 +2878,21 @@ packet_flags(Frames, Padded) ->
 %% Probes are exempt (Section 7, "an endpoint MAY send a probe packet
 %% when it is blocked"), which is what keeps a blocked connection from
 %% deadlocking on its own window.
--spec admit(quic_loss:space(), non_neg_integer(), iodata(), [term()], #state{}) ->
+-spec admit(
+    quic_loss:space(), boolean(), non_neg_integer(), iodata(), [term()], #state{}
+) ->
     {ok, #state{}} | {deferred, #state{}}.
-admit(_Space, _Size, _Payload, _Frames, #state{hs_probe = true} = State) ->
+%% A packet that is not in flight is not congestion controlled
+%% (RFC 9002 Section 2), and holding one back is worse than pointless:
+%% an acknowledgement is what frees the window, so deferring it can stall
+%% the very handshake that would unblock the sender.
+admit(_Space, false, _Size, _Payload, _Frames, State) ->
     {ok, State};
-admit(_Space, _Size, _Payload, _Frames, #state{cc_state = undefined} = State) ->
+admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{hs_probe = true} = State) ->
     {ok, State};
-admit(Space, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
+admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{cc_state = undefined} = State) ->
+    {ok, State};
+admit(Space, true, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
     %% Urgency 0 buys the control allowance: a handshake flight is small
     %% and stalling it behind a full window stalls the connection.
     case quic_cc:send_check(CCState, Size, 0) of
@@ -2886,9 +2904,16 @@ admit(Space, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
             {deferred, enqueue_hs(Space, Payload, Frames, State)}
     end.
 
+%% Newest first, reversed on drain: appending to the tail would make a
+%% sustained refusal quadratic. Bounded, because a peer that never opens
+%% the window must not be able to grow this without limit; the flight is
+%% a handful of packets, so anything past the bound is a fault and the
+%% oldest is dropped rather than the newest, which the peer is waiting
+%% on.
 enqueue_hs(Space, Payload, Frames, #state{pending_hs = Pending} = State) ->
-    Queued = maps:get(Space, Pending, []),
-    State#state{pending_hs = Pending#{Space => Queued ++ [{Payload, Frames}]}}.
+    Queued = [{Payload, Frames} | maps:get(Space, Pending, [])],
+    Bounded = lists:sublist(Queued, ?MAX_PENDING_HS),
+    State#state{pending_hs = Pending#{Space => Bounded}}.
 
 %% Rebuild and resend what the window refused. Re-runs admission, so a
 %% window that reopened only part way stops at the first refusal and
@@ -2906,7 +2931,7 @@ drain_space(Space, #state{pending_hs = Pending} = State) ->
             lists:foldl(
                 fun({Payload, Frames}, Acc) -> send_at_level(Space, Payload, Frames, Acc) end,
                 Cleared,
-                Queued
+                lists:reverse(Queued)
             )
     end.
 
@@ -2982,8 +3007,9 @@ send_initial_packet(Payload, Frames, State) ->
     %% budget counts the datagram, which for a short Initial is larger
     %% because it is brought to 1200 bytes outside the packet.
     Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
-    Meta = {initial, PN, byte_size(Packet), Frames, Padded},
-    case admit(initial, byte_size(Packet), Payload, Frames, State) of
+    {AckEliciting, InFlight} = packet_flags(Frames, Padded),
+    Meta = {initial, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
+    case admit(initial, InFlight, byte_size(Packet), Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
@@ -3161,8 +3187,9 @@ send_handshake_packet(Payload, Frames, State) ->
         Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
     Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
-    Meta = {handshake, PN, byte_size(Packet), Frames, Padded},
-    case admit(handshake, byte_size(Packet), Payload, Frames, State) of
+    {AckEliciting, InFlight} = packet_flags(Frames, Padded),
+    Meta = {handshake, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
+    case admit(handshake, InFlight, byte_size(Packet), Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
@@ -3513,20 +3540,18 @@ register_sent(deferred, _Meta, State) ->
 register_sent(sent, Meta, State) ->
     register_now(Meta, erlang:monotonic_time(millisecond), State).
 
-register_now({Space, PN, Size, Frames, Padded}, Now, State) ->
-    case packet_flags(Frames, Padded) of
-        {_AckEliciting, false} ->
-            State;
-        {AckEliciting, true} ->
-            LossState = quic_loss:on_packet_sent(
-                Space, State#state.loss_state, PN, Size, AckEliciting, Frames, Now
-            ),
-            State#state{
-                loss_state = LossState,
-                cc_state = quic_cc:on_packet_sent(State#state.cc_state, Size),
-                pto_dirty = true
-            }
-    end.
+%% Only a packet in flight is tracked or charged (RFC 9002 Section 2).
+register_now({_Space, _PN, _Size, _Frames, _AckEliciting, false}, _Now, State) ->
+    State;
+register_now({Space, PN, Size, Frames, AckEliciting, true}, Now, State) ->
+    LossState = quic_loss:on_packet_sent(
+        Space, State#state.loss_state, PN, Size, AckEliciting, Frames, Now
+    ),
+    State#state{
+        loss_state = LossState,
+        cc_state = quic_cc:on_packet_sent(State#state.cc_state, Size),
+        pto_dirty = true
+    }.
 
 %% Mark the peer address validated once a server decrypts a Handshake
 %% packet from it (RFC 9000 §8.1) — lifts the amplification limit.
@@ -10456,6 +10481,38 @@ complete_fin_reclaims(#state{pending_fin_reclaim = P} = State) ->
         P
     ).
 
+%% The deadline was a time threshold, not a probe: those packets are
+%% presumed lost, so declare them and let the same consequences follow as
+%% when an acknowledgement declares one. The probe backoff is untouched,
+%% because nothing was probed.
+handle_loss_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
+    LargestAcked = quic_loss:largest_acked(LossState, Space),
+    {NewLossState, Lost} = quic_loss:detect_lost_packets(Space, LossState, LargestAcked),
+    State1 = State#state{loss_state = NewLossState},
+    State2 = apply_lost_packets(Space, Lost, State1),
+    flush_dirty_timers(flush_socket_batch(State2#state{pto_dirty = true})).
+
+%% The congestion response, the retransmission and the qlog record that
+%% follow a loss, wherever it was declared.
+apply_lost_packets(_Space, [], State) ->
+    State;
+apply_lost_packets(Space, Lost, #state{cc_state = CCState, loss_state = LossState} = State) ->
+    LostBytes = lists:sum([Sz || #sent_packet{size = Sz} <- Lost]),
+    LargestLostSentTime = lists:max([TS || #sent_packet{time_sent = TS} <- Lost]),
+    NewCC = cc_after_loss(CCState, LostBytes, LargestLostSentTime, undefined, Lost, LossState),
+    lists:foreach(
+        fun(#sent_packet{pn = LostPN}) ->
+            ?QLOG_EMIT_PACKET_LOST(State#state.qlog_ctx, #{
+                packet_number => LostPN, reason => timeout
+            })
+        end,
+        Lost
+    ),
+    retransmit_for_space(Space, Lost, State#state{cc_state = NewCC}).
+
+retransmit_for_space(app, Lost, State) -> retransmit_lost_packets(Lost, State);
+retransmit_for_space(Space, Lost, State) -> retransmit_lost_handshake(Space, Lost, State).
+
 handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
     %% Increment PTO count
     NewLossState = quic_loss:on_pto_expired(LossState),
@@ -10559,17 +10616,22 @@ set_pto_timer(
     %% RFC 9002 Appendix A.8. A server over its anti-amplification budget
     %% cannot send anything, so it arms nothing; the client is the one
     %% that has to keep probing to unblock it.
+    %% RFC 9002 Appendix A.8 in order: a time-threshold loss deadline
+    %% takes precedence over a probe, because those packets are already
+    %% presumed lost and there is nothing to probe for.
     Selected =
-        case amplification_blocked(State) of
-            true -> none;
-            false -> quic_loss:get_pto_time_and_space(LossState, Now, handshake_status(State))
+        case {quic_loss:get_loss_time_and_space(LossState), amplification_blocked(State)} of
+            {{LossAt, LossSpace}, _} -> {loss, LossAt, LossSpace};
+            {none, true} -> none;
+            {none, false} -> pto_selection(LossState, Now, State)
         end,
     case Selected of
-        {Deadline, Space} ->
+        {Kind, Deadline, Space} ->
             PTO = max(0, Deadline - Now),
             SameSpace = (Space =:= State#state.pto_space),
+            Same = SameSpace andalso Kind =:= State#state.pto_kind,
             case
-                OldTimer =/= undefined andalso SameSpace andalso
+                OldTimer =/= undefined andalso Same andalso
                     Deadline + ?PTO_RESET_TOLERANCE_MS >= ArmedAt
             of
                 true ->
@@ -10577,7 +10639,10 @@ set_pto_timer(
                 false ->
                     cancel_timer(OldTimer),
                     arm_pto_timer(
-                        PTO, State#state{pto_scheduled_at = Deadline, pto_space = Space}
+                        PTO,
+                        State#state{
+                            pto_scheduled_at = Deadline, pto_space = Space, pto_kind = Kind
+                        }
                     )
             end;
         none ->
@@ -10585,6 +10650,12 @@ set_pto_timer(
             State#state{pto_timer = undefined, pto_scheduled_at = undefined};
         _ ->
             State#state{pto_scheduled_at = undefined}
+    end.
+
+pto_selection(LossState, Now, State) ->
+    case quic_loss:get_pto_time_and_space(LossState, Now, handshake_status(State)) of
+        {Deadline, Space} -> {pto, Deadline, Space};
+        none -> none
     end.
 
 %% A server has to stop at three times what it has received from an
