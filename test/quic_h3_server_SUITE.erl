@@ -74,10 +74,25 @@ init_per_suite(Config) ->
             CertsDir = find_certs_dir(),
             ct:pal("Using certificates from: ~s", [CertsDir]),
 
+            %% Build the client image here, under its own budget. Left to
+            %% the first case, a fresh machine spends that case's timeout
+            %% building it and fails before any request is made.
+            build_client_image(),
+
             %% Create temp directory for downloads
             TmpDir = create_tmp_dir(),
 
             [{certs_dir, CertsDir}, {tmp_dir, TmpDir} | Config]
+    end.
+
+build_client_image() ->
+    Cmd = io_lib:format(
+        "cd ~s && docker compose --profile tools build aioquic-h3-client 2>&1",
+        [find_docker_dir()]
+    ),
+    case exec_cmd(Cmd, 600000) of
+        {0, _} -> ok;
+        {Status, Output} -> ct:fail({client_image_build_failed, Status, Output})
     end.
 
 end_per_suite(Config) ->
@@ -101,14 +116,11 @@ init_per_group(aioquic_client, Config) ->
     %% Parse certificate
     [{'Certificate', CertDer, not_encrypted}] = public_key:pem_decode(CertPem),
 
-    %% Parse private key
+    %% Decode the private key: the server signs with it, and a PEM entry
+    %% is not a key. Handing it over as one left every handshake unable
+    %% to sign its CertificateVerify.
     [KeyEntry] = public_key:pem_decode(KeyPem),
-    Key =
-        case KeyEntry of
-            {'PrivateKeyInfo', _, _} -> KeyEntry;
-            {'RSAPrivateKey', KeyDer, not_encrypted} -> {'RSAPrivateKey', KeyDer};
-            {'ECPrivateKey', KeyDer, not_encrypted} -> {'ECPrivateKey', KeyDer}
-        end,
+    Key = public_key:pem_entry_decode(KeyEntry),
 
     %% Handler that tracks requests
     Self = self(),
@@ -161,14 +173,15 @@ aioquic_client_get(Config) ->
     TmpDir = ?config(tmp_dir, Config),
 
     %% Use aioquic's http3_client to make a GET request
+    clear(TmpDir, ["test"]),
     Cmd = build_aioquic_cmd(Port, TmpDir, "https://127.0.0.1:~p/test", []),
     ct:pal("Running: ~s", [Cmd]),
 
     {ExitCode, Output} = exec_cmd(Cmd, 30000),
     ct:pal("Exit code: ~p, Output: ~s", [ExitCode, Output]),
 
-    %% Check exit code
     ?assertEqual(0, ExitCode),
+    ?assertEqual({ok, <<"test response">>}, fetched(TmpDir, "test")),
     ok.
 
 %% @doc Test POST request using aioquic client
@@ -179,13 +192,16 @@ aioquic_client_post(Config) ->
     %% Create a test file to POST
     TestFile = filename:join(TmpDir, "post_data.txt"),
     ok = file:write_file(TestFile, <<"Hello from aioquic!">>),
+    clear(TmpDir, ["echo"]),
 
     %% POST the file
     Cmd = build_aioquic_cmd(
         Port,
         TmpDir,
         "https://127.0.0.1:~p/echo",
-        ["--data", TestFile]
+        %% The client runs in a container with TmpDir mounted at
+        %% /tmp/output, so it needs the file's path in there.
+        ["--data", "/tmp/output/post_data.txt"]
     ),
     ct:pal("Running: ~s", [Cmd]),
 
@@ -193,6 +209,7 @@ aioquic_client_post(Config) ->
     ct:pal("Exit code: ~p, Output: ~s", [ExitCode, Output]),
 
     ?assertEqual(0, ExitCode),
+    ?assertEqual({ok, <<"echo">>}, fetched(TmpDir, "echo")),
     ok.
 
 %% @doc Test HEAD request using aioquic client
@@ -202,6 +219,7 @@ aioquic_client_head(Config) ->
 
     %% aioquic http3_client doesn't support HEAD directly,
     %% but we can check server handles GET properly and infer HEAD works
+    clear(TmpDir, ["test"]),
     Cmd = build_aioquic_cmd(Port, TmpDir, "https://127.0.0.1:~p/test", ["-v"]),
     ct:pal("Running: ~s", [Cmd]),
 
@@ -209,6 +227,7 @@ aioquic_client_head(Config) ->
     ct:pal("Exit code: ~p, Output: ~s", [ExitCode, Output]),
 
     ?assertEqual(0, ExitCode),
+    ?assertEqual({ok, <<"test response">>}, fetched(TmpDir, "test")),
     ok.
 
 %% @doc Test large download using aioquic client
@@ -217,6 +236,7 @@ aioquic_client_large_download(Config) ->
     TmpDir = ?config(tmp_dir, Config),
 
     %% Request a large file (server will generate random data)
+    clear(TmpDir, ["large"]),
     Cmd = build_aioquic_cmd(Port, TmpDir, "https://127.0.0.1:~p/large", []),
     ct:pal("Running: ~s", [Cmd]),
 
@@ -227,6 +247,8 @@ aioquic_client_large_download(Config) ->
     ),
 
     ?assertEqual(0, ExitCode),
+    {ok, Body} = fetched(TmpDir, "large"),
+    ?assertEqual(1024 * 1024, byte_size(Body)),
     ok.
 
 %% @doc Test multiple sequential requests using aioquic client
@@ -234,11 +256,13 @@ aioquic_client_multiple_requests(Config) ->
     Port = ?config(h3_port, Config),
     TmpDir = ?config(tmp_dir, Config),
 
-    %% Make multiple requests - aioquic supports this
+    %% Make multiple requests - aioquic supports this. Only paths the
+    %% handler serves to a GET: /echo is POST only and answers 404.
+    clear(TmpDir, ["test", "index"]),
     Cmd = build_aioquic_cmd(
         Port,
         TmpDir,
-        "https://127.0.0.1:~p/test https://127.0.0.1:~p/echo https://127.0.0.1:~p/index",
+        "https://127.0.0.1:~p/test https://127.0.0.1:~p/index",
         []
     ),
     ct:pal("Running: ~s", [Cmd]),
@@ -247,6 +271,8 @@ aioquic_client_multiple_requests(Config) ->
     ct:pal("Exit code: ~p, Output: ~s", [ExitCode, Output]),
 
     ?assertEqual(0, ExitCode),
+    ?assertEqual({ok, <<"test response">>}, fetched(TmpDir, "test")),
+    ?assertEqual({ok, <<"<html><body>OK</body></html>">>}, fetched(TmpDir, "index")),
     ok.
 
 %%====================================================================
@@ -267,6 +293,15 @@ find_certs_dir() ->
 
 project_root() ->
     filename:dirname(filename:dirname(filename:absname(?FILE))).
+
+%% The client saves each body under its last path segment, in a directory
+%% every case shares. A case removes what it expects first, so a check
+%% that passes is reading this request's response and not an earlier one.
+clear(TmpDir, Names) ->
+    lists:foreach(fun(N) -> file:delete(filename:join(TmpDir, N)) end, Names).
+
+fetched(TmpDir, Name) ->
+    file:read_file(filename:join(TmpDir, Name)).
 
 %% @doc Create a temporary directory
 create_tmp_dir() ->
@@ -321,10 +356,20 @@ count_format_placeholders([_ | Rest], Count) ->
     count_format_placeholders(Rest, Count).
 
 %% @doc Execute command with timeout
+%%
+%% Through sh -c rather than {spawn, Cmd}, which prefixes the command with
+%% `exec': the commands start with cd, a shell builtin, and dash (Ubuntu's
+%% /bin/sh) will not exec one.
 exec_cmd(Cmd, Timeout) ->
     Port = open_port(
-        {spawn, lists:flatten(Cmd)},
-        [exit_status, binary, stderr_to_stdout, {line, 1024}]
+        {spawn_executable, "/bin/sh"},
+        [
+            {args, ["-c", lists:flatten(Cmd)]},
+            exit_status,
+            binary,
+            stderr_to_stdout,
+            {line, 1024}
+        ]
     ),
     exec_cmd_loop(Port, [], Timeout).
 
