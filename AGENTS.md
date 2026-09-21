@@ -33,6 +33,7 @@ rebar3 eunit --module=quic_varint_tests           # Run specific test module
 rebar3 eunit --module=quic_varint_tests --test=encode_0_test  # Run single test
 rebar3 proper                                     # Run PropEr property-based tests
 rebar3 ct --suite=quic_e2e_SUITE                  # Run specific Common Test suite
+docker/run-ct.sh quic_bulk_run_send_SUITE         # Run a Linux-only suite from macOS
 rebar3 lint                                       # Elvis linter
 rebar3 fmt --check                                # Check formatting (erlfmt)
 rebar3 fmt                                        # Auto-format code
