@@ -275,6 +275,53 @@ jobs:
       - name: Run the bulk send suite
         run: rebar3 ct --suite=quic_bulk_run_send_SUITE
 
+  common-test:
+    name: Common Test (all suites)
+    needs: unit-tests
+    # Every suite, so a new one is covered without being added to a list:
+    # most were in none, and three distribution suites had never run at
+    # all. The other jobs keep what needs its own environment, such as the
+    # external peers and forced GSO; here those cases skip.
+    runs-on: ubuntu-24.04
+    steps:
+      # The QPACK interop suite reads the qifs submodule, and skips
+      # without it.
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24.0'
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: ${{ runner.os }}-ct-otp28-${{ hashFiles('rebar.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-ct-otp28-
+
+      - name: Generate certificates
+        run: |
+          chmod +x ./certs/generate_certs.sh
+          ./certs/generate_certs.sh
+
+      - name: Compile
+        run: rebar3 compile
+
+      # The regression and socket-backend suites ask for buffers the stock
+      # runner clamps, which would measure the host rather than the code.
+      - name: Raise socket buffer limits
+        run: sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+
+      - name: Run every suite
+        run: rebar3 ct
+
   crypto-nif:
     name: Crypto NIF
     needs: unit-tests
@@ -446,10 +493,7 @@ jobs:
 
       # These boot real VMs and speak dist over QUIC, which nothing else
       # covers: the simultaneous-connect deadlock lived here undetected.
-      #
-      # quic_dist_basic_SUITE is still absent: it could not be verified
-      # here because its peers fail to boot on macOS, so add it once
-      # someone confirms it runs on Linux.
+      # The Common Test job runs the other distribution suites.
       - name: Run distribution tests
         run: rebar3 ct --suite=quic_dist_psk_SUITE,quic_dist_simultaneous_connect_SUITE,quic_dist_auth_SUITE
 
