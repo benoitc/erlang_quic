@@ -2,6 +2,56 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.10.0] - 2026-09-21
+
+### Added
+- `active_connection_id_limit` sets how many connection IDs the peer may
+  hold at once. (#317)
+- `quic:get_stats/1` reports `zero_rtt_streams`, the number of streams
+  whose 0-RTT data the server kept. (#334)
+
+### Changed
+- Loss detection and recovery keep per-space state behind one timer, the
+  shape RFC 9002 Appendix A describes. Initial and Handshake packets are
+  tracked and acknowledged in their own spaces instead of being dropped
+  by a guard, the application-data probe is armed only once the handshake
+  is confirmed, and the three ad-hoc handshake retransmission timers are
+  replaced by the probe for whichever space lost something. Handshake
+  packets are admitted against the congestion window and the
+  anti-amplification budget before a packet number, the send counter or
+  the pacing allowance is spent; either refusal holds the frames in one
+  per-space queue and a later attempt is a first attempt. Keys are
+  discarded with the spaces they protect, on the role-specific triggers
+  RFC 9001 §4.9.1 gives, and a Retry resets recovery and congestion state
+  while keeping the data to resend. (#333, #334)
+- `quic_connection` sheds the pieces that stand on their own. New
+  internal modules: `quic_pqueue` for the send queue's priority buckets,
+  `quic_reassembly` and `quic_interval` for stream reassembly,
+  `quic_tls_negotiation` for TLS negotiation and the node-wide ticket
+  store, `quic_cid` for the connection ID pools, and `quic_rtt` for the
+  RTT estimate, which belongs to the path rather than to any packet
+  number space. The connection's ACK frame path, its receive-side packet
+  number bookkeeping and its range accumulation move into `quic_ack`,
+  which now separates its two topics, and both halves of a range encode
+  through one guarded gap encoder. Peer transport parameters are
+  validated in one place, and the module is laid out by section with the
+  handshake-flight timers out of the PMTU code. No public API changes.
+  (#319, #320, #321, #322, #323, #327, #329, #330, #332, #334)
+- Elvis rules live in `elvis.config` alone, the build fails if a second
+  lint configuration appears, and `rebar3_lint` is pinned to the version
+  CI resolves. (#328)
+
+### Fixed
+- A connection ID is bound to the path that first used it and retired
+  when a new path replaces it (RFC 9000 §9.5), and `RETIRE_CONNECTION_ID`
+  is sent for the IDs a `retire_prior_to` covers. The peer's handshake
+  connection ID counts against `active_connection_id_limit`. (#317, #324,
+  #333)
+- The delayed-ACK timer runs on our own `max_ack_delay` rather than the
+  peer's, and the persistent-congestion window is built from the PTO
+  without its exponential backoff (RFC 9002 §7.6.1). (#333)
+- The peer's ACK timing parameters reach loss detection. (#324)
+
 ## [1.9.1] - 2026-09-15
 
 ### Changed
