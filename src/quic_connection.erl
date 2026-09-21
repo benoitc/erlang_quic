@@ -958,14 +958,40 @@ address_family(IP) when tuple_size(IP) =:= 8 -> inet6.
 %% `monitor_owner' defaults to false for client connections, which are
 %% linked to their caller unless supervised, and to true for accepted
 %% connections, whose handler is neither linked to nor supervised by us.
+%% An explicit false is kept apart from the client default, because only
+%% the default stops holding once the connection changes hands.
 maybe_monitor_owner(Opts, Owner, Default) ->
-    case maps:get(monitor_owner, Opts, Default) of
-        true -> erlang:monitor(process, Owner);
-        false -> undefined
+    case maps:find(monitor_owner, Opts) of
+        {ok, true} -> erlang:monitor(process, Owner);
+        {ok, false} -> opted_out;
+        error when Default -> erlang:monitor(process, Owner);
+        error -> linked_parent()
+    end.
+
+%% The caller that started a client connection is linked to it, which is
+%% how the connection follows it down. Remember which process that is, so
+%% a handoff to another owner knows which link to drop. proc_lib puts the
+%% parent at the head of '$ancestors' before init runs.
+linked_parent() ->
+    case get('$ancestors') of
+        [Parent | _] when is_pid(Parent) -> {linked, Parent};
+        _ -> undefined
     end.
 
 %% Swap the owner, re-pointing the owner monitor when one exists.
-%% Connections without one (caller-linked clients) keep none.
+reown(#state{owner_mon = opted_out} = State, NewOwner) ->
+    State#state{owner = NewOwner};
+reown(#state{owner_mon = {linked, Parent}} = State, Parent) ->
+    %% Back with the caller it is linked to, which still covers it.
+    State#state{owner = Parent};
+reown(#state{owner_mon = {linked, Parent}} = State, NewOwner) ->
+    %% The caller handed it on. From here the connection follows the new
+    %% owner, which has no link to it, so it is monitored: otherwise its
+    %% death leaves the connection up and answering the peer with nobody
+    %% behind it. And the caller's link goes, or the connection's exit
+    %% when the new owner dies would take the caller down with it.
+    true = unlink(Parent),
+    State#state{owner = NewOwner, owner_mon = erlang:monitor(process, NewOwner)};
 reown(#state{owner_mon = undefined} = State, NewOwner) ->
     State#state{owner = NewOwner};
 reown(#state{owner_mon = OldMon} = State, NewOwner) ->
