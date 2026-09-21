@@ -194,7 +194,7 @@ rtt_variation_test() ->
     ),
 
     %% SRTT should be reasonable
-    SRTT = quic_loss:smoothed_rtt(FinalState),
+    SRTT = quic_rtt:smoothed(quic_loss:rtt(FinalState)),
     ?assert(SRTT > 0),
     ?assert(SRTT < 1000).
 
@@ -213,7 +213,7 @@ rtt_spike_test() ->
     S6 = quic_loss:update_rtt(S5, 60, 0),
 
     %% SRTT should smooth out the spike
-    SRTT = quic_loss:smoothed_rtt(S6),
+    SRTT = quic_rtt:smoothed(quic_loss:rtt(S6)),
     ?assert(SRTT < 500),
     ?assert(SRTT > 50).
 

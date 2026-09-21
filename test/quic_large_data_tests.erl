@@ -301,7 +301,7 @@ loss_rtt_calculation_under_load_test() ->
     ),
 
     %% RTT should be reasonable
-    SRTT = quic_loss:smoothed_rtt(FinalState),
+    SRTT = quic_rtt:smoothed(quic_loss:rtt(FinalState)),
     ?assert(SRTT >= 1),
     ?assert(SRTT < 1000).
 

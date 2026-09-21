@@ -267,7 +267,7 @@ prop_loss_rtt_update() ->
             State = quic_loss:new(),
             S1 = quic_loss:update_rtt(State, RTT, 0),
             %% First sample sets smoothed_rtt directly
-            quic_loss:smoothed_rtt(S1) =:= RTT
+            quic_rtt:smoothed(quic_loss:rtt(S1)) =:= RTT
         end
     ).
 

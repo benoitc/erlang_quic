@@ -1,6 +1,6 @@
 # Module Map
 
-Where the code lives and what to read first. The source is 67 modules and about 47,000 lines, and roughly a quarter of it is one module, so reading in file order does not work. Read this when you are new to the tree, or when you know what you want to change but not where it lives. [docs/DESIGN.md](DESIGN.md) covers how the protocol works; this page covers where it is.
+Where the code lives and what to read first. The source is 68 modules and about 47,000 lines, and roughly a quarter of it is one module, so reading in file order does not work. Read this when you are new to the tree, or when you know what you want to change but not where it lives. [docs/DESIGN.md](DESIGN.md) covers how the protocol works; this page covers where it is.
 
 ## Read these seven first
 
@@ -22,7 +22,7 @@ In this order, they give you the whole path of a connection without opening the 
 | Connection | `quic_connection`, `quic_connection_state.hrl`, `quic_cid` (both connection ID pools and the two active_connection_id_limits), `quic_pqueue` (the send queue's urgency buckets, RFC 9218), `quic_reassembly` (out-of-order buffers), `quic_interval` (disjoint interval lists, used for reclaimed stream ids) |
 | Protocol | `quic_packet`, `quic_frame`, `quic_varint` |
 | Crypto | `quic_crypto`, `quic_tls`, `quic_tls_negotiation` (cipher, ALPN and group choices), `quic_keys`, `quic_aead`, `quic_aead_ctx`, `quic_hkdf`, `quic_crypto_nif`, `quic_cert`, `quic_keylog` |
-| Recovery | `quic_cc` with `quic_cc_newreno`, `quic_cc_cubic`, `quic_cc_bbr`; `quic_loss` (per-packet-number-space sent packets and loss state, with RTT, probe backoff and bytes in flight connection-wide), `quic_ack` (the connection's ACK range and frame path, plus an `#ack_state{}` accumulator only tests drive) |
+| Recovery | `quic_cc` with `quic_cc_newreno`, `quic_cc_cubic`, `quic_cc_bbr`; `quic_loss` (per-packet-number-space sent packets and loss state, with the probe backoff and bytes in flight connection-wide), `quic_rtt` (the path's RTT estimate, which every space shares), `quic_ack` (the connection's ACK range and frame path, plus an `#ack_state{}` accumulator only tests drive) |
 | Transport services | `quic_socket`, `quic_pmtu`, `quic_lb`, `quic_happy`, `quic_ticket`, `quic_token_cache`, `quic_address_token`, `quic_qlog` |
 | Supervision | `quic_app`, `quic_sup`, `quic_server_sup`, `quic_server_registry`, `quic_conn_sup`, `quic_happy_sup`, `quic_listener_sup`, `quic_listener_sup_sup`, `quic_listener_manager` |
 | HTTP/3 | `src/h3/`: `quic_h3`, `quic_h3_connection`, `quic_h3_frame`, `quic_h3_capsule`, plus the client and server escripts |

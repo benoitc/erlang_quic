@@ -1710,15 +1710,15 @@ connected(
     %% stays untouched. min_rtt is `infinity' before the first sample
     %% lands; surface it as 0 so callers can rely on non_neg_integer.
     MinRttMs =
-        case quic_loss:min_rtt(LossState) of
+        case quic_rtt:min(quic_loss:rtt(LossState)) of
             infinity -> 0;
             M -> M
         end,
     Stats = #{
-        srtt => quic_loss:smoothed_rtt(LossState) * 1000,
-        latest_rtt => quic_loss:latest_rtt(LossState) * 1000,
+        srtt => quic_rtt:smoothed(quic_loss:rtt(LossState)) * 1000,
+        latest_rtt => quic_rtt:latest(quic_loss:rtt(LossState)) * 1000,
         min_rtt => MinRttMs * 1000,
-        rtt_var => quic_loss:rtt_var(LossState) * 1000,
+        rtt_var => quic_rtt:var(quic_loss:rtt(LossState)) * 1000,
         cwnd => Cwnd,
         bytes_in_flight => InFlight,
         in_recovery => InRecovery,
@@ -4785,9 +4785,9 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% Only update pacing when we have a real RTT sample to avoid
                     %% using the default 100ms RTT which causes excessive pacing delays
                     CCState6 =
-                        case quic_loss:has_rtt_sample(NewLossState) of
+                        case quic_rtt:has_sample(quic_loss:rtt(NewLossState)) of
                             true ->
-                                SmoothedRTT = quic_loss:smoothed_rtt(NewLossState),
+                                SmoothedRTT = quic_rtt:smoothed(quic_loss:rtt(NewLossState)),
                                 quic_cc:update_pacing_rate(CCState5, SmoothedRTT);
                             false ->
                                 CCState5
@@ -7074,7 +7074,9 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                         case WillSendMaxStreamData of
                             true ->
                                 Now = erlang:monotonic_time(millisecond),
-                                SmoothedRTT = quic_loss:smoothed_rtt(State1#state.loss_state),
+                                SmoothedRTT = quic_rtt:smoothed(
+                                    quic_loss:rtt(State1#state.loss_state)
+                                ),
                                 MaxWindow = State1#state.fc_max_receive_window,
                                 LastStreamUpdate = State1#state.fc_last_stream_update,
                                 InitialStreamWindow = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
@@ -7136,7 +7138,9 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                         case ConnHeadroom < (State2#state.fc_max_receive_window div 2) of
                             true ->
                                 Now2 = erlang:monotonic_time(millisecond),
-                                SmoothedRTT2 = quic_loss:smoothed_rtt(State2#state.loss_state),
+                                SmoothedRTT2 = quic_rtt:smoothed(
+                                    quic_loss:rtt(State2#state.loss_state)
+                                ),
                                 MaxWindow2 = State2#state.fc_max_receive_window,
                                 LastConnUpdate = State2#state.fc_last_conn_update,
                                 InitialConnWindow = ?DEFAULT_INITIAL_MAX_DATA,
@@ -12526,7 +12530,7 @@ set_pmtu_probe_timer(#state{pmtu_probe_timer = OldTimer, loss_state = LossState}
             undefined ->
                 ?PMTU_DEFAULT_PROBE_TIMEOUT;
             _ ->
-                SRTT = quic_loss:smoothed_rtt(LossState),
+                SRTT = quic_rtt:smoothed(quic_loss:rtt(LossState)),
                 max(1000, 5 * SRTT)
         end,
     Ref = make_ref(),

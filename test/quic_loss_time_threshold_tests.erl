@@ -55,15 +55,15 @@ expected_delay(Rtt) ->
 
 spike_leaves_latest_above_smoothed_test() ->
     State = samples(quic_loss:new(), [20, 400]),
-    ?assertEqual(400, quic_loss:latest_rtt(State)),
+    ?assertEqual(400, quic_rtt:latest(quic_loss:rtt(State))),
     %% The EWMA lags the spike, otherwise the assertions below would not
     %% distinguish the two thresholds.
-    ?assert(quic_loss:smoothed_rtt(State) < 400).
+    ?assert(quic_rtt:smoothed(quic_loss:rtt(State)) < 400).
 
 decay_leaves_smoothed_above_latest_test() ->
     State = samples(quic_loss:new(), [400, 20]),
-    ?assertEqual(20, quic_loss:latest_rtt(State)),
-    ?assert(quic_loss:smoothed_rtt(State) > 20).
+    ?assertEqual(20, quic_rtt:latest(quic_loss:rtt(State))),
+    ?assert(quic_rtt:smoothed(quic_loss:rtt(State)) > 20).
 
 %%====================================================================
 %% Loss time threshold
@@ -71,8 +71,8 @@ decay_leaves_smoothed_above_latest_test() ->
 
 delay_follows_latest_rtt_when_it_exceeds_smoothed_test() ->
     State = with_inflight_packet(samples(quic_loss:new(), [20, 400])),
-    SRTT = quic_loss:smoothed_rtt(State),
-    Latest = quic_loss:latest_rtt(State),
+    SRTT = quic_rtt:smoothed(quic_loss:rtt(State)),
+    Latest = quic_rtt:latest(quic_loss:rtt(State)),
     ?assertEqual(expected_delay(Latest), applied_delay(State)),
     %% Explicitly not the smoothed-only value, which is what an
     %% EWMA-only threshold would produce.
@@ -80,8 +80,8 @@ delay_follows_latest_rtt_when_it_exceeds_smoothed_test() ->
 
 delay_follows_smoothed_rtt_when_it_exceeds_latest_test() ->
     State = with_inflight_packet(samples(quic_loss:new(), [400, 20])),
-    SRTT = quic_loss:smoothed_rtt(State),
-    Latest = quic_loss:latest_rtt(State),
+    SRTT = quic_rtt:smoothed(quic_loss:rtt(State)),
+    Latest = quic_rtt:latest(quic_loss:rtt(State)),
     ?assertEqual(expected_delay(SRTT), applied_delay(State)),
     ?assertNotEqual(expected_delay(Latest), applied_delay(State)).
 
@@ -89,8 +89,8 @@ delay_equals_both_when_rtt_is_stable_test() ->
     %% With a flat RTT the two estimates coincide and the max() is a
     %% no-op; the threshold must not drift.
     State = with_inflight_packet(samples(quic_loss:new(), [50, 50, 50])),
-    ?assertEqual(50, quic_loss:latest_rtt(State)),
-    ?assertEqual(50, quic_loss:smoothed_rtt(State)),
+    ?assertEqual(50, quic_rtt:latest(quic_loss:rtt(State))),
+    ?assertEqual(50, quic_rtt:smoothed(quic_loss:rtt(State))),
     ?assertEqual(expected_delay(50), applied_delay(State)).
 
 delay_floors_at_granularity_test() ->

@@ -51,10 +51,7 @@
 
     %% RTT
     update_rtt/3,
-    smoothed_rtt/1,
-    rtt_var/1,
-    latest_rtt/1,
-    min_rtt/1,
+    rtt/1,
 
     %% PTO
     get_pto/2,
@@ -74,7 +71,6 @@
     last_progress/1,
     pto_count/1,
     oldest_unacked/2,
-    has_rtt_sample/1,
     handshake_confirmed/1
 ]).
 
@@ -122,12 +118,9 @@
     handshake = #pn_loss{} :: #pn_loss{},
     app = #pn_loss{} :: #pn_loss{},
 
-    %% RTT estimation
-    latest_rtt = 0 :: non_neg_integer(),
-    smoothed_rtt = ?DEFAULT_INITIAL_RTT :: non_neg_integer(),
-    rtt_var = ?DEFAULT_INITIAL_RTT div 2 :: non_neg_integer(),
-    min_rtt = infinity :: non_neg_integer() | infinity,
-    first_rtt_sample = false :: boolean(),
+    %% RTT estimation, which belongs to the path rather than to any one
+    %% space (RFC 9002 Section 5).
+    rtt = quic_rtt:new() :: quic_rtt:state(),
 
     %% Loss detection. loss_time is per space, in #pn_loss{}.
     time_of_last_ack = undefined :: non_neg_integer() | undefined,
@@ -173,11 +166,7 @@ reset_for_new_path(undefined) ->
     new();
 reset_for_new_path(#loss_state{} = S) ->
     S#loss_state{
-        latest_rtt = 0,
-        smoothed_rtt = ?DEFAULT_INITIAL_RTT,
-        rtt_var = ?DEFAULT_INITIAL_RTT div 2,
-        min_rtt = infinity,
-        first_rtt_sample = false,
+        rtt = quic_rtt:reset(S#loss_state.rtt),
         pto_count = 0,
         initial = clear_loss_time(S#loss_state.initial),
         handshake = clear_loss_time(S#loss_state.handshake),
@@ -226,8 +215,7 @@ new() ->
 new(Opts) ->
     InitialRTT = maps:get(initial_rtt, Opts, ?DEFAULT_INITIAL_RTT),
     #loss_state{
-        smoothed_rtt = InitialRTT,
-        rtt_var = InitialRTT div 2,
+        rtt = quic_rtt:new(InitialRTT),
         max_ack_delay = maps:get(max_ack_delay, Opts, ?DEFAULT_MAX_ACK_DELAY)
     }.
 
@@ -400,7 +388,7 @@ on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRange
             {LostList, SurvHeadQ, LostBytes, LargestLostSentTime} =
                 detect_lost_q(
                     KeptList,
-                    max(NewState1#loss_state.smoothed_rtt, NewState1#loss_state.latest_rtt),
+                    loss_delay_rtt(NewState1),
                     LargestAcked,
                     Now,
                     [],
@@ -504,7 +492,7 @@ maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now) ->
     {loss_state(), [#sent_packet{}]}.
 detect_lost_packets(
     Space,
-    #loss_state{smoothed_rtt = SRTT, latest_rtt = LatestRTT} = State,
+    #loss_state{} = State,
     LargestAcked
 ) ->
     P = pn(Space, State),
@@ -515,7 +503,7 @@ detect_lost_packets(
     %% (receiver queueing, bufferbloat) mass-declares in-flight packets
     %% lost while their ACKs are merely late; each spurious loss both
     %% retransmits data and collapses the congestion window.
-    RTT = max(SRTT, LatestRTT),
+    RTT = loss_delay_rtt(State),
     {LostPackets, SurvQ, LostBytes, _LargestLostSentTime} =
         detect_lost_q(SentList, RTT, LargestAcked, Now, [], queue:new(), 0, undefined),
     LostAE = length([L || #sent_packet{ack_eliciting = true} = L <- LostPackets]),
@@ -606,9 +594,9 @@ largest_lost_ts({_PN, TS}) -> TS.
 %% peek in the common case (head is in_flight).
 -spec get_loss_time_and_space(loss_state()) ->
     {non_neg_integer() | undefined, atom()}.
-get_loss_time_and_space(#loss_state{smoothed_rtt = SRTT, latest_rtt = LatestRTT} = State) ->
+get_loss_time_and_space(#loss_state{} = State) ->
     Q = (pn(app, State))#pn_loss.sent_q,
-    LossDelay = max(trunc(?TIME_THRESHOLD * max(SRTT, LatestRTT)), ?GRANULARITY),
+    LossDelay = max(trunc(?TIME_THRESHOLD * loss_delay_rtt(State)), ?GRANULARITY),
     case earliest_in_flight_time(queue:to_list(Q)) of
         undefined -> {undefined, initial};
         TimeSent -> {TimeSent + LossDelay, initial}
@@ -624,70 +612,32 @@ earliest_in_flight_time([_ | Rest]) -> earliest_in_flight_time(Rest).
 
 %% @doc Update RTT estimates with a new sample.
 -spec update_rtt(loss_state(), non_neg_integer(), non_neg_integer()) -> loss_state().
-update_rtt(#loss_state{first_rtt_sample = false} = State, LatestRTT, _AckDelay) ->
-    %% First RTT sample
-    State#loss_state{
-        latest_rtt = LatestRTT,
-        smoothed_rtt = LatestRTT,
-        rtt_var = LatestRTT div 2,
-        min_rtt = LatestRTT,
-        first_rtt_sample = true
-    };
 update_rtt(
-    #loss_state{
-        smoothed_rtt = SRTT,
-        rtt_var = RTTVAR,
-        min_rtt = MinRTT,
-        max_ack_delay = MaxAckDelay,
-        handshake_confirmed = Confirmed
-    } = State,
+    #loss_state{rtt = RTT, max_ack_delay = MaxAckDelay, handshake_confirmed = Confirmed} = State,
     LatestRTT,
     AckDelay0
 ) ->
-    %% Update min RTT
-    NewMinRTT = min(MinRTT, LatestRTT),
-
-    %% RFC 9002 Section 5.3: cap the peer's delay at its max_ack_delay only
-    %% once the handshake is confirmed, then adjust by that same value.
+    %% RFC 9002 Section 5.3: cap the peer's reported delay at its
+    %% max_ack_delay only once the handshake is confirmed. How much to
+    %% subtract is decided here; the estimator is told the result.
     AckDelay =
         case Confirmed of
             true -> min(AckDelay0, MaxAckDelay);
             false -> AckDelay0
         end,
-    AdjustedRTT =
-        case LatestRTT >= NewMinRTT + AckDelay of
-            true -> LatestRTT - AckDelay;
-            false -> LatestRTT
-        end,
+    State#loss_state{rtt = quic_rtt:update(RTT, LatestRTT, AckDelay)}.
 
-    %% Update smoothed RTT and variance (RFC 9002 Section 5.3)
-    %% rttvar = 3/4 * rttvar + 1/4 * |smoothed_rtt - adjusted_rtt|
-    %% smoothed_rtt = 7/8 * smoothed_rtt + 1/8 * adjusted_rtt
-    NewRTTVAR = (3 * RTTVAR + abs(SRTT - AdjustedRTT)) div 4,
-    NewSRTT = (7 * SRTT + AdjustedRTT) div 8,
+%% RFC 9002 Section 6.1.2: the time threshold uses max(smoothed_rtt,
+%% latest_rtt). With the EWMA alone, an RTT spike that outruns it
+%% mass-declares in-flight packets lost while their acknowledgements are
+%% merely late, and each spurious loss both retransmits and collapses the
+%% congestion window.
+loss_delay_rtt(#loss_state{rtt = RTT}) ->
+    max(quic_rtt:smoothed(RTT), quic_rtt:latest(RTT)).
 
-    State#loss_state{
-        latest_rtt = LatestRTT,
-        smoothed_rtt = NewSRTT,
-        rtt_var = NewRTTVAR,
-        min_rtt = NewMinRTT
-    }.
-
-%% @doc Get the smoothed RTT.
--spec smoothed_rtt(loss_state()) -> non_neg_integer().
-smoothed_rtt(#loss_state{smoothed_rtt = SRTT}) -> SRTT.
-
-%% @doc Get the RTT variance.
--spec rtt_var(loss_state()) -> non_neg_integer().
-rtt_var(#loss_state{rtt_var = RTTVAR}) -> RTTVAR.
-
-%% @doc Get the latest RTT sample.
--spec latest_rtt(loss_state()) -> non_neg_integer().
-latest_rtt(#loss_state{latest_rtt = L}) -> L.
-
-%% @doc Get the minimum RTT.
--spec min_rtt(loss_state()) -> non_neg_integer() | infinity.
-min_rtt(#loss_state{min_rtt = M}) -> M.
+%% @doc The path's RTT estimate, read through quic_rtt.
+-spec rtt(loss_state()) -> quic_rtt:state().
+rtt(#loss_state{rtt = RTT}) -> RTT.
 
 %%====================================================================
 %% Probe Timeout (RFC 9002 Section 6.2)
@@ -738,11 +688,7 @@ reset_for_retry(#loss_state{} = State, _Now) ->
         initial = #pn_loss{},
         handshake = #pn_loss{},
         app = #pn_loss{},
-        latest_rtt = 0,
-        smoothed_rtt = ?DEFAULT_INITIAL_RTT,
-        rtt_var = ?DEFAULT_INITIAL_RTT div 2,
-        min_rtt = infinity,
-        first_rtt_sample = false,
+        rtt = quic_rtt:reset(State#loss_state.rtt),
         pto_count = 0,
         bytes_in_flight = 0,
         outstanding_since = undefined,
@@ -816,12 +762,12 @@ total_ae_in_flight(#loss_state{initial = I, handshake = H, app = A}) ->
 %% meant to detect.
 -spec persistent_congestion_pto(loss_state()) -> non_neg_integer().
 persistent_congestion_pto(#loss_state{
-    smoothed_rtt = SRTT, rtt_var = RTTVAR, max_ack_delay = MaxAckDelay
+    rtt = RTT, max_ack_delay = MaxAckDelay
 }) ->
-    SRTT + max(4 * RTTVAR, ?GRANULARITY) + MaxAckDelay.
+    quic_rtt:smoothed(RTT) + max(4 * quic_rtt:var(RTT), ?GRANULARITY) + MaxAckDelay.
 
-pto(#loss_state{smoothed_rtt = SRTT, rtt_var = RTTVAR, pto_count = PTOCount}, MaxAckDelay) ->
-    PTO = SRTT + max(4 * RTTVAR, ?GRANULARITY) + MaxAckDelay,
+pto(#loss_state{rtt = RTT, pto_count = PTOCount}, MaxAckDelay) ->
+    PTO = quic_rtt:smoothed(RTT) + max(4 * quic_rtt:var(RTT), ?GRANULARITY) + MaxAckDelay,
     %% Exponential backoff
     %% Exponential backoff, capped: uncapped doubling reaches tens of
     %% seconds after a loss streak, and a probe that arrives after the
@@ -885,11 +831,6 @@ oldest_unacked(Space, #loss_state{} = State) ->
         empty -> none;
         {value, Packet} -> {ok, Packet}
     end.
-
-%% @doc Check if we have received a real RTT sample.
-%% Returns false until the first ACK provides a real RTT measurement.
--spec has_rtt_sample(loss_state()) -> boolean().
-has_rtt_sample(#loss_state{first_rtt_sample = HasSample}) -> HasSample.
 
 %% @doc Whether the handshake has been confirmed (RFC 9001 Section 4.1.2).
 -spec handshake_confirmed(loss_state()) -> boolean().

@@ -27,7 +27,7 @@ peer_exponent_decodes_ack_delay_test() ->
     S0 = primed(quic_loss:set_peer_ack_params(quic_loss:new(), 5, 100)),
     S1 = acked(sent(S0, 1, 1000), 1, 2000, 1200),
     %% latest 200, delay 64: adjusted 136, smoothed (7*100 + 136) div 8
-    ?assertEqual(104, quic_loss:smoothed_rtt(S1)).
+    ?assertEqual(104, quic_rtt:smoothed(quic_loss:rtt(S1))).
 
 %% Before confirmation the delay is subtracted in full, even beyond the
 %% peer's max_ack_delay.
@@ -35,14 +35,14 @@ unconfirmed_ack_delay_is_not_capped_test() ->
     S0 = primed(quic_loss:set_peer_ack_params(quic_loss:new(), 3, 10)),
     S1 = acked(sent(S0, 1, 1000), 1, delay(50, 3), 1200),
     %% latest 200, delay 50: adjusted 150, smoothed (700 + 150) div 8
-    ?assertEqual(106, quic_loss:smoothed_rtt(S1)).
+    ?assertEqual(106, quic_rtt:smoothed(quic_loss:rtt(S1))).
 
 %% After confirmation the delay is capped at the peer's max_ack_delay.
 confirmed_ack_delay_is_capped_at_peer_value_test() ->
     S0 = primed(confirmed(quic_loss:set_peer_ack_params(quic_loss:new(), 3, 10))),
     S1 = acked(sent(S0, 1, 1000), 1, delay(50, 3), 1200),
     %% latest 200, delay capped to 10: adjusted 190, smoothed (700 + 190) div 8
-    ?assertEqual(111, quic_loss:smoothed_rtt(S1)).
+    ?assertEqual(111, quic_rtt:smoothed(quic_loss:rtt(S1))).
 
 %%====================================================================
 %% PTO
@@ -107,7 +107,7 @@ transport_params_reach_loss_state_test() ->
     ?assertEqual(310, quic_loss:persistent_congestion_pto(L)),
     ?assertEqual(300, quic_loss:get_pto(L, handshake)),
     L1 = acked(sent(primed(L), 1, 1000), 1, 2000, 1200),
-    ?assertEqual(104, quic_loss:smoothed_rtt(L1)).
+    ?assertEqual(104, quic_rtt:smoothed(quic_loss:rtt(L1))).
 
 %% A client's handshake is confirmed by HANDSHAKE_DONE (RFC 9001 Section
 %% 4.1.2).
@@ -190,7 +190,7 @@ acked(S, PN, EncodedDelay, Now) ->
 %% delay assertion needs a second one.
 primed(S) ->
     S1 = acked(sent(S, 0, 0), 0, 0, 100),
-    100 = quic_loss:smoothed_rtt(S1),
+    100 = quic_rtt:smoothed(quic_loss:rtt(S1)),
     S1.
 
 %% Encode Ms milliseconds of ACK delay for exponent Exp.

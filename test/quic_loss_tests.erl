@@ -53,24 +53,24 @@ non_ack_eliciting_no_bytes_test() ->
 initial_rtt_test() ->
     State = quic_loss:new(),
     %% Default initial RTT is 100ms (more aggressive than RFC 9002's 333ms)
-    ?assertEqual(100, quic_loss:smoothed_rtt(State)).
+    ?assertEqual(100, quic_rtt:smoothed(quic_loss:rtt(State))).
 
 first_rtt_sample_test() ->
     State = quic_loss:new(),
     S1 = quic_loss:update_rtt(State, 100, 0),
-    ?assertEqual(100, quic_loss:smoothed_rtt(S1)),
-    ?assertEqual(50, quic_loss:rtt_var(S1)),
-    ?assertEqual(100, quic_loss:min_rtt(S1)),
-    ?assertEqual(100, quic_loss:latest_rtt(S1)).
+    ?assertEqual(100, quic_rtt:smoothed(quic_loss:rtt(S1))),
+    ?assertEqual(50, quic_rtt:var(quic_loss:rtt(S1))),
+    ?assertEqual(100, quic_rtt:min(quic_loss:rtt(S1))),
+    ?assertEqual(100, quic_rtt:latest(quic_loss:rtt(S1))).
 
 rtt_update_test() ->
     State = quic_loss:new(),
     S1 = quic_loss:update_rtt(State, 100, 0),
     S2 = quic_loss:update_rtt(S1, 120, 0),
     %% smoothed_rtt = 7/8 * 100 + 1/8 * 120 = 102.5 -> 102
-    ?assertEqual(102, quic_loss:smoothed_rtt(S2)),
-    ?assertEqual(100, quic_loss:min_rtt(S2)),
-    ?assertEqual(120, quic_loss:latest_rtt(S2)).
+    ?assertEqual(102, quic_rtt:smoothed(quic_loss:rtt(S2))),
+    ?assertEqual(100, quic_rtt:min(quic_loss:rtt(S2))),
+    ?assertEqual(120, quic_rtt:latest(quic_loss:rtt(S2))).
 
 rtt_with_ack_delay_test() ->
     State = quic_loss:new(),
@@ -79,15 +79,15 @@ rtt_with_ack_delay_test() ->
     S2 = quic_loss:update_rtt(S1, 150, 30),
     %% adjusted_rtt = 150 - 30 = 120 (since 150 > 100 + 30)
     %% But ACK delay is capped at max_ack_delay (25ms default)
-    ?assert(quic_loss:smoothed_rtt(S2) > 100).
+    ?assert(quic_rtt:smoothed(quic_loss:rtt(S2)) > 100).
 
 min_rtt_updates_test() ->
     State = quic_loss:new(),
     S1 = quic_loss:update_rtt(State, 100, 0),
     S2 = quic_loss:update_rtt(S1, 80, 0),
-    ?assertEqual(80, quic_loss:min_rtt(S2)),
+    ?assertEqual(80, quic_rtt:min(quic_loss:rtt(S2))),
     S3 = quic_loss:update_rtt(S2, 120, 0),
-    ?assertEqual(80, quic_loss:min_rtt(S3)).
+    ?assertEqual(80, quic_rtt:min(quic_loss:rtt(S3))).
 
 %%====================================================================
 %% PTO Tests
@@ -174,7 +174,7 @@ ack_updates_rtt_test() ->
     AckFrame = {ack, 0, 0, 0, []},
     {S2, _Acked, _Lost, _Meta} = quic_loss:on_ack_received(app, S1, AckFrame, Now),
     %% RTT should be updated from the sample
-    ?assert(quic_loss:latest_rtt(S2) >= 10).
+    ?assert(quic_rtt:latest(quic_loss:rtt(S2)) >= 10).
 
 %%====================================================================
 %% Loss Detection Tests
