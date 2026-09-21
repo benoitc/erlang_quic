@@ -23,10 +23,6 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# The mounted tree carries the host's _build, which holds beam files
-# compiled for a different OS. Keep the container's artefacts separate
-# so the two never overwrite each other.
-ENV REBAR_BASE_DIR=/tmp/ct_build
 
 COPY docker/ct-entrypoint.sh /usr/local/bin/ct-entrypoint.sh
 RUN chmod +x /usr/local/bin/ct-entrypoint.sh

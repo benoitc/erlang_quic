@@ -23,5 +23,10 @@ docker build -q -f "$ROOT/docker/Dockerfile.ct" \
 
 # --network host so loopback behaves as the suites expect, and the
 # sysctl knobs the entrypoint sets need the capability.
+#
+# The mounted tree carries the host's _build, built for another OS. A
+# fresh volume over /app/_build keeps the two apart while leaving _build
+# where it always is: suites find certs/ and test/qifs by walking up from
+# it, and moving it elsewhere sends them looking in the wrong place.
 exec docker run --rm --network host --privileged \
-    -v "$ROOT":/app -w /app "$IMAGE" "$@"
+    -v "$ROOT":/app -v /app/_build -w /app "$IMAGE" "$@"
