@@ -79,10 +79,12 @@
 
     %% Owner process (receives {quic, Conn, Event} messages where Conn is pid())
     owner :: pid(),
-    %% Monitor of the owner for client connections that are not linked to
-    %% their owner (e.g. Happy Eyeballs winners supervised by quic_conn_sup);
-    %% undefined for server connections.
-    owner_mon :: reference() | undefined,
+    %% How the connection follows its owner down: a monitor on the owner;
+    %% `{linked, Parent}' for a client that follows the caller that started
+    %% it through their link, until it is handed to another owner;
+    %% `opted_out' when `monitor_owner => false' asked for the connection to
+    %% outlive it; `undefined' when there is nothing to follow.
+    owner_mon :: reference() | {linked, pid()} | opted_out | undefined,
     conn_ref :: reference(),
 
     %% Options

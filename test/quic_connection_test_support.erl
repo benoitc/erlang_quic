@@ -29,6 +29,8 @@
     state_for_role/1,
     state_for_client/1,
     state_with_keys/1,
+    with_keys_and_socket/1,
+    state_with_send_stream/3,
     close_reason/1,
     state_for_server/3,
     state_with_pn_app/2,
@@ -256,6 +258,57 @@ state_with_keys(Role) ->
         app_keys = Keys,
         loss_state = quic_loss:new(),
         cc_state = quic_cc:new(#{})
+    }.
+
+%% Keys, packet-number spaces and a real socket on top of State, so a
+%% path that ends in a CONNECTION_CLOSE can actually send it.
+-spec with_keys_and_socket(#state{}) -> #state{}.
+with_keys_and_socket(State) ->
+    #state{
+        scid = SCID,
+        dcid = DCID,
+        initial_keys = IK,
+        handshake_keys = HK,
+        app_keys = AK,
+        pn_handshake = PNH,
+        loss_state = LS,
+        cc_state = CC
+    } = state_with_keys(State#state.role),
+    state_sending(State#state{
+        scid = SCID,
+        dcid = DCID,
+        initial_keys = IK,
+        handshake_keys = HK,
+        app_keys = AK,
+        pn_handshake = PNH,
+        pn_app = PNH,
+        loss_state = LS,
+        cc_state = CC
+    }).
+
+%% A connection with one local stream whose send side is at SendOffset,
+%% with its FIN already sent or not, and room in both windows.
+-spec state_with_send_stream(non_neg_integer(), non_neg_integer(), boolean()) -> #state{}.
+state_with_send_stream(StreamId, SendOffset, SendFin) ->
+    Stream = #stream_state{
+        id = StreamId,
+        state = open,
+        send_offset = SendOffset,
+        send_max_data = 1000000,
+        send_fin = SendFin,
+        send_buffer = [],
+        recv_offset = 0,
+        recv_max_data = 1000000,
+        recv_fin = false,
+        recv_buffer = gb_trees:empty(),
+        final_size = undefined
+    },
+    S = state_sending(state_with_keys(client)),
+    S#state{
+        pn_app = S#state.pn_handshake,
+        streams = #{StreamId => Stream},
+        max_data_remote = 1000000,
+        data_sent = SendOffset
     }.
 
 -spec state_for_client({inet:ip_address(), inet:port_number()}) -> #state{}.

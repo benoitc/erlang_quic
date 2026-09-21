@@ -3,6 +3,16 @@
 %%% QUIC Distribution Cluster Common Test Suite
 %%% Tests multi-node mesh formation and communication
 %%%
+%%% Five peers that speak QUIC distribution to each other. The test node
+%%% is not one of them, so each case drives the peers with peer:call/4,5
+%%% and collects what it needs on a peer; see quic_dist_peer for why.
+%%%
+%%% The cases run in sequence and share the cluster. node_failure_test
+%%% brings a node down and node_rejoin_test brings it back under the same
+%%% name and port, so every later case sees all five again. The current
+%%% peers live in a persistent_term, since a restarted node is a new peer
+%%% and Common Test hands each case the group's config unchanged.
+%%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
 %%% Apache License 2.0
 %%%
@@ -37,6 +47,23 @@
     partition_heal_test/1
 ]).
 
+%% Run on the peers.
+-export([broadcast/2, broadcast_receiver/2, ring/1, ring_process/2]).
+
+-define(SIZE, 5).
+-define(PEERS, {?MODULE, peers}).
+
+%% global keeps the nodes fully meshed and, since OTP 25, disconnects
+%% nodes to undo a partition that overlaps, so the bridged partition
+%% below would be rearranged before it could be looked at. The cases
+%% build the topology they assert on with explicit pings instead.
+-define(NO_MESH, ["-connect_all", "false"]).
+
+%% An abrupt crash sends nothing, so the survivors only learn of it when
+%% the connection goes quiet: measured at about 16 s here. Room for a
+%% loaded runner, while a node that is never dropped still fails.
+-define(FAILURE_NOTICE_MS, 45000).
+
 %%====================================================================
 %% CT Callbacks
 %%====================================================================
@@ -62,38 +89,27 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    %% Generate test certificates
-    PrivDir = proplists:get_value(priv_dir, Config),
-    CertDir = filename:join(PrivDir, "certs"),
-    ok = filelib:ensure_dir(filename:join(CertDir, "dummy")),
+    CertDir = filename:join(?config(priv_dir, Config), "certs"),
+    {ok, Certs} = quic_dist_peer:generate_certs(CertDir),
+    [{certs, Certs} | Config].
 
-    %% Generate certificates (simplified for tests)
-    generate_certs(CertDir),
-
-    [{cert_dir, CertDir} | Config].
-
-end_per_suite(Config) ->
-    CertDir = proplists:get_value(cert_dir, Config),
-    os:cmd("rm -rf " ++ CertDir),
+end_per_suite(_Config) ->
     ok.
 
 init_per_group(five_node, Config) ->
-    %% This would start 5 nodes with QUIC distribution
-    %% For now, we skip if nodes can't be started
-    CertDir = proplists:get_value(cert_dir, Config),
-
-    case start_cluster(5, CertDir) of
-        {ok, Nodes} ->
-            [{nodes, Nodes} | Config];
+    case quic_dist_peer:start("quic_ct_cluster", ?SIZE, ?config(certs, Config), ?NO_MESH) of
+        {ok, Peers} ->
+            persistent_term:put(?PEERS, Peers),
+            Config;
         {error, Reason} ->
-            {skip, {cluster_start_failed, Reason}}
+            ct:fail({cluster_start_failed, Reason})
     end;
 init_per_group(_Group, Config) ->
     Config.
 
-end_per_group(five_node, Config) ->
-    Nodes = proplists:get_value(nodes, Config, []),
-    stop_cluster(Nodes),
+end_per_group(five_node, _Config) ->
+    quic_dist_peer:stop(persistent_term:get(?PEERS, [])),
+    _ = persistent_term:erase(?PEERS),
     ok;
 end_per_group(_Group, _Config) ->
     ok.
@@ -109,297 +125,186 @@ end_per_testcase(_TestCase, _Config) ->
 %%====================================================================
 
 %% Test that all 5 nodes form a full mesh
-mesh_formation_test(Config) ->
-    Nodes = proplists:get_value(nodes, Config),
-
-    %% Connect all nodes
-    connect_mesh(Nodes),
-
-    %% Each node should see exactly N-1 peers
-    ExpectedPeerCount = length(Nodes) - 1,
-
-    lists:foreach(
-        fun(Node) ->
-            Peers = rpc:call(Node, erlang, nodes, []),
-            ?assertEqual(
-                ExpectedPeerCount,
-                length(Peers),
-                {Node, expected, ExpectedPeerCount, got, length(Peers)}
-            )
-        end,
-        Nodes
-    ),
-
-    ok.
+mesh_formation_test(_Config) ->
+    Peers = peers(),
+    connect_mesh(Peers),
+    assert_full_mesh(Peers).
 
 %% Test that all pairs can communicate
-mesh_all_pairs_test(Config) ->
-    Nodes = proplists:get_value(nodes, Config),
-
-    %% Test all pairs
-    Pairs = [{N1, N2} || N1 <- Nodes, N2 <- Nodes, N1 < N2],
-
+mesh_all_pairs_test(_Config) ->
+    Peers = peers(),
     lists:foreach(
-        fun({Node1, Node2}) ->
-            %% RPC from Node1 to Node2
-            Result = rpc:call(Node1, rpc, call, [Node2, erlang, node, []]),
-            ?assertEqual(Node2, Result, {pair, Node1, Node2})
+        fun({#{peer := From, node := A}, #{node := B}}) ->
+            ?assertEqual(B, peer:call(From, rpc, call, [B, erlang, node, []]), {pair, A, B})
         end,
-        Pairs
-    ),
-
-    ok.
-
-%% Test behavior when a node fails
-node_failure_test(Config) ->
-    Nodes = proplists:get_value(nodes, Config),
-    [Node1, Node2, Node3, Node4, Node5] = Nodes,
-
-    %% Ensure mesh
-    connect_mesh(Nodes),
-
-    %% Kill Node3
-    rpc:call(Node3, erlang, halt, [0]),
-    timer:sleep(2000),
-
-    %% Remaining nodes should have 3 peers each
-    RemainingNodes = [Node1, Node2, Node4, Node5],
-    lists:foreach(
-        fun(Node) ->
-            Peers = rpc:call(Node, erlang, nodes, []),
-            ?assertEqual(3, length(Peers), {Node, peers, Peers})
-        end,
-        RemainingNodes
-    ),
-
-    %% Communication should still work
-    Node5 = rpc:call(Node1, rpc, call, [Node5, erlang, node, []]),
-
-    ok.
-
-%% Test node rejoin after failure
-node_rejoin_test(_Config) ->
-    %% This test would restart Node3 and verify it rejoins
-    %% For now, we skip as it requires node restart capability
-    {skip, requires_node_restart}.
-
-%% Test broadcast to all nodes
-broadcast_test(Config) ->
-    Nodes = proplists:get_value(nodes, Config),
-
-    %% Ensure mesh
-    connect_mesh(Nodes),
-
-    %% Start receivers on all nodes except first
-    [_Sender | Receivers] = Nodes,
-    Self = self(),
-
-    ReceiverPids = lists:map(
-        fun(Node) ->
-            rpc:call(Node, erlang, spawn, [
-                fun() ->
-                    receive
-                        {broadcast, Data} ->
-                            Self ! {received, Node, Data}
-                    after 10000 ->
-                        Self ! {timeout, Node}
-                    end
-                end
-            ])
-        end,
-        Receivers
-    ),
-
-    %% Broadcast from sender
-    TestData = {test, erlang:system_time()},
-    lists:foreach(
-        fun(Pid) ->
-            Pid ! {broadcast, TestData}
-        end,
-        ReceiverPids
-    ),
-
-    %% Verify all received
-    ReceivedFrom = receive_all(length(Receivers), []),
-    ?assertEqual(lists:sort(Receivers), lists:sort(ReceivedFrom)),
-
-    ok.
-
-%% Test ring message passing
-ring_message_test(Config) ->
-    Nodes = proplists:get_value(nodes, Config),
-
-    %% Ensure mesh
-    connect_mesh(Nodes),
-
-    %% Start ring processes
-    Self = self(),
-    % Close the ring
-    RingNodes = Nodes ++ [hd(Nodes)],
-
-    %% Create ring
-    Pids = lists:foldl(
-        fun(Node, Acc) ->
-            NextPid =
-                case Acc of
-                    % Last node points to test process
-                    [] -> self;
-                    [Prev | _] -> Prev
-                end,
-            Pid = rpc:call(Node, erlang, spawn, [
-                fun() ->
-                    ring_process(NextPid, Self)
-                end
-            ]),
-            [Pid | Acc]
-        end,
-        [],
-        lists:reverse(RingNodes)
-    ),
-
-    %% Send message through ring
-    [FirstPid | _] = Pids,
-    FirstPid ! {ring, 0, length(Nodes)},
-
-    %% Wait for message to complete ring
-    receive
-        {ring_complete, Hops} ->
-            ?assertEqual(length(Nodes), Hops)
-    after 30000 ->
-        ct:fail(ring_timeout)
-    end.
-
-%% Test network partition
-partition_test(Config) ->
-    Nodes = proplists:get_value(nodes, Config),
-    [Node1, Node2, Node3, Node4, Node5] = Nodes,
-
-    %% Ensure mesh
-    connect_mesh(Nodes),
-
-    %% Partition: disconnect Node1 and Node2 from Node4 and Node5
-    %% Node3 stays connected to all (bridge)
-
-    %% For QUIC, we'd need to simulate this at network level
-    %% For now, we use disconnect_node
-
-    rpc:call(Node1, erlang, disconnect_node, [Node4]),
-    rpc:call(Node1, erlang, disconnect_node, [Node5]),
-    rpc:call(Node2, erlang, disconnect_node, [Node4]),
-    rpc:call(Node2, erlang, disconnect_node, [Node5]),
-
-    timer:sleep(500),
-
-    %% Verify partition
-    %% Node1 should see Node2, Node3
-    Peers1 = rpc:call(Node1, erlang, nodes, []),
-    ?assert(lists:member(Node2, Peers1)),
-    ?assert(lists:member(Node3, Peers1)),
-    ?assert(not lists:member(Node4, Peers1)),
-    ?assert(not lists:member(Node5, Peers1)),
-
-    ok.
-
-%% Test partition healing
-partition_heal_test(Config) ->
-    Nodes = proplists:get_value(nodes, Config),
-    [Node1, _Node2, _Node3, Node4, _Node5] = Nodes,
-
-    %% Reconnect partitioned nodes
-    pong = rpc:call(Node1, net_adm, ping, [Node4]),
-
-    %% Wait for full mesh to reform
-    timer:sleep(1000),
-    connect_mesh(Nodes),
-
-    %% Verify full connectivity
-    ExpectedPeerCount = length(Nodes) - 1,
-    lists:foreach(
-        fun(Node) ->
-            Peers = rpc:call(Node, erlang, nodes, []),
-            ?assertEqual(ExpectedPeerCount, length(Peers))
-        end,
-        Nodes
-    ),
-
-    ok.
-
-%%====================================================================
-%% Helper Functions
-%%====================================================================
-
-generate_certs(CertDir) ->
-    Cmd = io_lib:format(
-        "openssl req -x509 -newkey rsa:2048 -keyout ~s/key.pem -out ~s/cert.pem "
-        "-days 1 -nodes -subj '/CN=localhost' 2>/dev/null",
-        [CertDir, CertDir]
-    ),
-    os:cmd(lists:flatten(Cmd)),
-    ok.
-
-start_cluster(N, _CertDir) ->
-    %% Start N nodes with QUIC distribution
-    %% This is simplified - actual implementation would use peer module or docker
-    BasePort = 14430,
-
-    _Nodes = lists:map(
-        fun(I) ->
-            Name = list_to_atom("cluster_node" ++ integer_to_list(I)),
-            Port = BasePort + I,
-            {Name, Port}
-        end,
-        lists:seq(1, N)
-    ),
-
-    %% For now, return skip as we can't actually start nodes in CT
-    {error, not_implemented}.
-
-stop_cluster(Nodes) ->
-    lists:foreach(
-        fun(Node) ->
-            try
-                rpc:call(Node, erlang, halt, [0])
-            catch
-                _:_ -> ok
-            end
-        end,
-        Nodes
+        [{P, Q} || P <- Peers, Q <- Peers, P =/= Q]
     ).
 
-connect_mesh([]) ->
-    ok;
-connect_mesh([_]) ->
-    ok;
-connect_mesh([Node | Rest]) ->
+%% Test behavior when a node fails: the others drop it, and keep working.
+node_failure_test(_Config) ->
+    Peers = peers(),
+    [P1, P2, #{peer := Peer3, node := Node3}, P4, #{node := Node5}] = Peers,
+    connect_mesh(Peers),
+    ok = peer:cast(Peer3, erlang, halt, [0]),
+    Survivors = [P1, P2, P4, lists:last(Peers)],
     lists:foreach(
-        fun(OtherNode) ->
-            rpc:call(Node, net_adm, ping, [OtherNode])
+        fun(#{peer := Peer, node := Node}) ->
+            ?assert(
+                wait_until(
+                    fun() -> not lists:member(Node3, peer:call(Peer, erlang, nodes, [])) end,
+                    ?FAILURE_NOTICE_MS
+                ),
+                {Node, still_sees, Node3}
+            ),
+            ?assertEqual(3, length(peer:call(Peer, erlang, nodes, [])), Node)
         end,
-        Rest
+        Survivors
     ),
-    connect_mesh(Rest).
+    #{peer := Peer1} = P1,
+    ?assertEqual(Node5, peer:call(Peer1, rpc, call, [Node5, erlang, node, []])).
 
-receive_all(0, Acc) ->
+%% Test node rejoin after failure: the node comes back under its old name
+%% and port, and the mesh closes over it again.
+node_rejoin_test(Config) ->
+    Peers = peers(),
+    Dead = lists:nth(3, Peers),
+    quic_dist_peer:stop_one(Dead),
+    {ok, Back} = quic_dist_peer:restart(Dead, Peers, ?config(certs, Config)),
+    Rejoined = [
+        case P of
+            Dead -> Back;
+            _ -> P
+        end
+     || P <- Peers
+    ],
+    persistent_term:put(?PEERS, Rejoined),
+    connect_mesh(Rejoined),
+    assert_full_mesh(Rejoined).
+
+%% Test broadcast to all nodes
+broadcast_test(_Config) ->
+    [#{peer := Sender} | Receivers] = peers(),
+    ReceiverNodes = [N || #{node := N} <- Receivers],
+    Heard = peer:call(Sender, ?MODULE, broadcast, [ReceiverNodes, {test, 42}], 30000),
+    ?assertEqual(lists:sort(ReceiverNodes), lists:sort(Heard)).
+
+%% Test ring message passing
+ring_message_test(_Config) ->
+    [#{peer := Start} | _] = Peers = peers(),
+    Nodes = [N || #{node := N} <- Peers],
+    ?assertEqual({ring_complete, ?SIZE}, peer:call(Start, ?MODULE, ring, [Nodes], 30000)).
+
+%% Test network partition: node1 and node2 drop node4 and node5, node3
+%% stays in touch with all of them. Both sides of each cut have to see it.
+partition_test(_Config) ->
+    Peers = peers(),
+    [#{peer := Peer1, node := Node1}, #{peer := Peer2, node := Node2}, #{node := Node3}, P4, P5] =
+        Peers,
+    #{peer := Peer4, node := Node4} = P4,
+    #{node := Node5} = P5,
+    connect_mesh(Peers),
+    lists:foreach(
+        fun({Peer, Far}) -> true = peer:call(Peer, erlang, disconnect_node, [Far]) end,
+        [{Peer1, Node4}, {Peer1, Node5}, {Peer2, Node4}, {Peer2, Node5}]
+    ),
+    ?assert(wait_until(fun() -> sees(Peer1, [Node2, Node3], [Node4, Node5]) end, 5000)),
+    ?assert(wait_until(fun() -> sees(Peer4, [Node3, Node5], [Node1, Node2]) end, 5000)).
+
+%% Test partition healing
+partition_heal_test(_Config) ->
+    Peers = peers(),
+    connect_mesh(Peers),
+    assert_full_mesh(Peers).
+
+%%====================================================================
+%% Run on node1
+%%====================================================================
+
+broadcast(Nodes, Data) ->
+    Self = self(),
+    Pids = [spawn(N, ?MODULE, broadcast_receiver, [Self, N]) || N <- Nodes],
+    lists:foreach(fun(Pid) -> Pid ! {broadcast, Data} end, Pids),
+    collect(length(Nodes), []).
+
+collect(0, Acc) ->
     Acc;
-receive_all(N, Acc) ->
+collect(N, Acc) ->
     receive
-        {received, Node, _Data} ->
-            receive_all(N - 1, [Node | Acc]);
-        {timeout, Node} ->
-            ct:fail({timeout, Node})
-    after 10000 ->
-        ct:fail({receive_all_timeout, got, Acc})
+        {received, Node} -> collect(N - 1, [Node | Acc])
+    after 10000 -> Acc
     end.
 
-ring_process(self, Parent) ->
+%% The token visits every node once and comes back here.
+ring(Nodes) ->
+    Self = self(),
+    First = lists:foldl(
+        fun(Node, Next) -> spawn(Node, ?MODULE, ring_process, [Next, Self]) end,
+        Self,
+        lists:reverse(Nodes)
+    ),
+    First ! {ring, 0},
     receive
-        {ring, Hops, _Max} ->
-            Parent ! {ring_complete, Hops + 1}
-    end;
-ring_process(NextPid, Parent) ->
+        {ring, Hops} -> {ring_complete, Hops}
+    after 20000 -> ring_timeout
+    end.
+
+%%====================================================================
+%% Run on the other nodes
+%%====================================================================
+
+broadcast_receiver(Parent, Node) ->
     receive
-        {ring, Hops, Max} when Hops < Max ->
-            NextPid ! {ring, Hops + 1, Max};
-        {ring, Hops, _Max} ->
-            Parent ! {ring_complete, Hops}
+        {broadcast, _Data} -> Parent ! {received, Node}
+    after 10000 -> ok
+    end.
+
+ring_process(Next, _Parent) ->
+    receive
+        {ring, Hops} -> Next ! {ring, Hops + 1}
+    after 20000 -> ok
+    end.
+
+%%====================================================================
+%% Helpers
+%%====================================================================
+
+peers() ->
+    persistent_term:get(?PEERS).
+
+connect_mesh(Peers) ->
+    lists:foreach(
+        fun({#{peer := From}, #{node := To}}) ->
+            pong = peer:call(From, net_adm, ping, [To])
+        end,
+        [{P, Q} || P <- Peers, Q <- Peers, P < Q]
+    ).
+
+assert_full_mesh(Peers) ->
+    Expected = length(Peers) - 1,
+    lists:foreach(
+        fun(#{peer := Peer, node := Node}) ->
+            ?assert(
+                wait_until(
+                    fun() -> length(peer:call(Peer, erlang, nodes, [])) =:= Expected end, 5000
+                ),
+                {Node, sees, peer:call(Peer, erlang, nodes, [])}
+            )
+        end,
+        Peers
+    ).
+
+sees(Peer, Present, Absent) ->
+    Nodes = peer:call(Peer, erlang, nodes, []),
+    lists:all(fun(N) -> lists:member(N, Nodes) end, Present) andalso
+        not lists:any(fun(N) -> lists:member(N, Nodes) end, Absent).
+
+wait_until(Fun, BudgetMs) when BudgetMs =< 0 ->
+    Fun();
+wait_until(Fun, BudgetMs) ->
+    case Fun() of
+        true ->
+            true;
+        false ->
+            timer:sleep(250),
+            wait_until(Fun, BudgetMs - 250)
     end.

@@ -3,6 +3,17 @@
 %%% QUIC Distribution User Stream Integration Tests
 %%% Tests user stream functionality over QUIC distribution
 %%%
+%%% Both nodes are peers that speak QUIC distribution to each other; the
+%%% test node is not one of them, so everything runs on the peers through
+%%% peer:call/5 (see quic_dist_peer).
+%%%
+%%% Two things shape the cases. A stream belongs to the process that
+%%% opened it and goes when that process does, while peer:call runs each
+%%% call in a process of its own, so a node1 sequence that opens a stream
+%%% and uses it runs inside one call. And incoming streams go round-robin
+%%% to every registered acceptor, so each case's receiver leaves the pool
+%%% before it reports, and the next case cannot hand its stream to it.
+%%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
 %%% Apache License 2.0
 %%%
@@ -38,6 +49,24 @@
     fin_flag_test/1
 ]).
 
+%% Run on the peers.
+-export([
+    start_receiver/2,
+    receiver/2,
+    first_data/0,
+    echo/0,
+    collect_hash/0,
+    first_stream_id/0,
+    collect_fin/0,
+    exchange/4,
+    open_and_close/1,
+    open_many/2,
+    send_after_close/1,
+    owner_dies/1
+]).
+
+-define(CALL_MS, 90000).
+
 %%====================================================================
 %% CT Callbacks
 %%====================================================================
@@ -64,68 +93,33 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    %% Generate test certificates
-    {ok, CertDir} = generate_test_certs(Config),
+    CertDir = filename:join(?config(priv_dir, Config), "certs"),
+    {ok, Certs} = quic_dist_peer:generate_certs(CertDir),
+    [{certs, Certs} | Config].
 
-    %% Configure QUIC distribution
-    DistConfig = [
-        {cert_file, filename:join(CertDir, "cert.pem")},
-        {key_file, filename:join(CertDir, "key.pem")},
-        {verify, verify_none},
-        {discovery_module, quic_discovery_static}
-    ],
-
-    application:set_env(quic, dist, DistConfig),
-
-    [{cert_dir, CertDir}, {dist_config, DistConfig} | Config].
-
-end_per_suite(Config) ->
-    %% Clean up test certificates
-    CertDir = proplists:get_value(cert_dir, Config),
-    os:cmd("rm -rf " ++ CertDir),
+end_per_suite(_Config) ->
     ok.
 
 init_per_group(two_node, Config) ->
-    %% Check if we can start peer nodes
-    case code:which(peer) of
-        non_existing ->
-            {skip, peer_module_not_available};
-        _ ->
-            CertDir = proplists:get_value(cert_dir, Config),
-            case start_peer_nodes(CertDir, Config) of
-                {ok, Node1, Peer1, Node2, Peer2} ->
-                    %% Connect nodes
-                    pong = rpc:call(Node1, net_adm, ping, [Node2]),
-                    [
-                        {node1, Node1},
-                        {peer1, Peer1},
-                        {node2, Node2},
-                        {peer2, Peer2}
-                        | Config
-                    ];
-                {error, Reason} ->
-                    {skip, {peer_start_failed, Reason}}
-            end
+    case quic_dist_peer:start("quic_ct_us", 2, ?config(certs, Config)) of
+        {ok, [#{peer := Peer1, node := Node1} = P1, #{peer := Peer2, node := Node2} = P2]} ->
+            pong = peer:call(Peer1, net_adm, ping, [Node2]),
+            [
+                {peers, [P1, P2]},
+                {node1, Node1},
+                {peer1, Peer1},
+                {node2, Node2},
+                {peer2, Peer2}
+                | Config
+            ];
+        {error, Reason} ->
+            ct:fail({peer_start_failed, Reason})
     end;
 init_per_group(_Group, Config) ->
     Config.
 
 end_per_group(two_node, Config) ->
-    %% Stop peer nodes
-    Peer1 = proplists:get_value(peer1, Config),
-    Peer2 = proplists:get_value(peer2, Config),
-
-    try
-        peer:stop(Peer1)
-    catch
-        _:_ -> ok
-    end,
-    try
-        peer:stop(Peer2)
-    catch
-        _:_ -> ok
-    end,
-    ok;
+    quic_dist_peer:stop(?config(peers, Config));
 end_per_group(_Group, _Config) ->
     ok.
 
@@ -141,446 +135,228 @@ end_per_testcase(_TestCase, _Config) ->
 
 %% Test opening a user stream
 open_stream_test(Config) ->
-    Node1 = proplists:get_value(node1, Config),
-    Node2 = proplists:get_value(node2, Config),
-
-    %% Open stream from Node1 to Node2
-    Result = rpc:call(Node1, quic_dist, open_stream, [Node2]),
-    ?assertMatch({ok, {quic_dist_stream, Node2, _}}, Result),
-
-    {ok, StreamRef} = Result,
-    {quic_dist_stream, _, StreamId} = StreamRef,
-    % Above threshold
+    {Peer1, _Node1, _Peer2, Node2} = pair(Config),
+    {{ok, Stream}, Closed} = peer:call(Peer1, ?MODULE, open_and_close, [Node2], ?CALL_MS),
+    ?assertMatch({quic_dist_stream, Node2, _}, Stream),
+    {quic_dist_stream, _, StreamId} = Stream,
+    %% User streams start above the ones distribution reserves.
     ?assert(StreamId >= 20),
-
-    %% Clean up
-    ok = rpc:call(Node1, quic_dist, close_stream, [StreamRef]),
-    ok.
+    ?assertEqual(ok, Closed).
 
 %% Test sending and receiving data
 send_receive_test(Config) ->
-    Node1 = proplists:get_value(node1, Config),
-    Node2 = proplists:get_value(node2, Config),
-    Self = self(),
-
-    %% Set up receiver on Node2
-    ok = rpc:call(Node2, quic_dist, accept_streams, [Node1]),
-
-    %% Spawn receiver process on Node2. The controller auto-assigns
-    %% ownership of incoming streams to the registered acceptor and
-    %% delivers `{data, _, _}' directly — no prior `{incoming, _}'
-    %% handshake.
-    ReceiverPid = rpc:call(Node2, erlang, spawn, [
-        fun() ->
-            receive
-                {quic_dist_stream, _StreamRef, {data, Data, _Fin}} ->
-                    Self ! {received, Data}
-            after 5000 ->
-                Self ! timeout
-            end
-        end
-    ]),
-
-    %% Re-register receiver as acceptor
-    ok = rpc:call(Node2, quic_dist, accept_streams, [Node1]),
-    %% Need to update acceptor to our spawned process
-    {ok, Ctrl} = rpc:call(Node2, quic_dist, get_controller, [Node1]),
-    ok = rpc:call(Node2, quic_dist_controller, accept_user_streams, [Ctrl, ReceiverPid]),
-
-    %% Open stream from Node1 and send data
-    {ok, Stream} = rpc:call(Node1, quic_dist, open_stream, [Node2]),
     TestData = <<"Hello from user stream!">>,
-    ok = rpc:call(Node1, quic_dist, send, [Stream, TestData]),
+    {_Stream, none, Result} = run(Config, first_data, [{TestData, false}], none),
+    ?assertEqual({received, TestData}, Result).
 
-    %% Wait for data
-    receive
-        {received, TestData} -> ok;
-        {received, Other} -> ct:fail({wrong_data, Other});
-        timeout -> ct:fail(receive_timeout);
-        no_incoming -> ct:fail(no_incoming_stream)
-    after 10000 ->
-        ct:fail(test_timeout)
-    end,
-
-    %% Clean up
-    ok = rpc:call(Node1, quic_dist, close_stream, [Stream]),
-    ok = rpc:call(Node2, quic_dist, stop_accepting, [Node1]),
-    ok.
-
-%% Test bidirectional communication
+%% Test bidirectional communication: node2 answers on the same stream,
+%% and node1 has to get the answer.
 bidirectional_test(Config) ->
-    Node1 = proplists:get_value(node1, Config),
-    Node2 = proplists:get_value(node2, Config),
-    Self = self(),
+    {_Stream, Echo, Result} = run(Config, echo, [{<<"Test">>, false}], echo),
+    ?assertEqual(echoed, Result),
+    ?assertEqual({echo, <<"Echo: Test">>}, Echo).
 
-    %% Set up acceptor on Node2
-    {ok, Ctrl2} = rpc:call(Node2, quic_dist, get_controller, [Node1]),
-
-    ReceiverPid = rpc:call(Node2, erlang, spawn, [
-        fun() ->
-            receive
-                {quic_dist_stream, StreamRef, {data, Data, _}} ->
-                    Response = <<"Echo: ", Data/binary>>,
-                    ok = quic_dist:send(StreamRef, Response),
-                    Self ! echoed
-            after 5000 ->
-                Self ! timeout
-            end
-        end
-    ]),
-
-    ok = rpc:call(Node2, quic_dist_controller, accept_user_streams, [Ctrl2, ReceiverPid]),
-
-    %% Open stream from Node1 and send data
-    {ok, Stream} = rpc:call(Node1, quic_dist, open_stream, [Node2]),
-    ok = rpc:call(Node1, quic_dist, send, [Stream, <<"Test">>]),
-
-    %% Wait for echo confirmation
-    receive
-        echoed -> ok;
-        timeout -> ct:fail(echo_timeout)
-    after 10000 ->
-        ct:fail(bidirectional_timeout)
-    end,
-
-    %% Clean up
-    ok = rpc:call(Node1, quic_dist, close_stream, [Stream]),
-    ok.
-
-%% Test large data transfer
+%% Test large data transfer: node2 hashes what arrived up to the FIN.
 large_data_test(Config) ->
-    Node1 = proplists:get_value(node1, Config),
-    Node2 = proplists:get_value(node2, Config),
-    Self = self(),
-
-    %% Create 1MB of data
     LargeData = crypto:strong_rand_bytes(1024 * 1024),
     Hash = crypto:hash(sha256, LargeData),
-
-    %% Set up receiver
-    {ok, Ctrl2} = rpc:call(Node2, quic_dist, get_controller, [Node1]),
-
-    ReceiverPid = rpc:call(Node2, erlang, spawn, [
-        fun() ->
-            receive
-                {quic_dist_stream, _StreamRef, {data, Data, true}} ->
-                    Hash = crypto:hash(sha256, Data),
-                    Self ! {collected, Hash};
-                {quic_dist_stream, StreamRef, {data, Data, false}} ->
-                    collect_data(StreamRef, [Data], Self)
-            after 10000 ->
-                Self ! no_incoming
-            end
-        end
-    ]),
-
-    ok = rpc:call(Node2, quic_dist_controller, accept_user_streams, [Ctrl2, ReceiverPid]),
-
-    %% Send large data
-    {ok, Stream} = rpc:call(Node1, quic_dist, open_stream, [Node2]),
-    ok = rpc:call(Node1, quic_dist, send, [Stream, LargeData, true]),
-
-    %% Wait for hash verification
-    receive
-        {hash_match, true} -> ok;
-        {hash_match, false} -> ct:fail(hash_mismatch);
-        {collected, RecvHash} -> ?assertEqual(Hash, RecvHash);
-        no_incoming -> ct:fail(no_incoming)
-    after 60000 ->
-        ct:fail(large_data_timeout)
-    end,
-
-    ok.
+    {_Stream, none, Result} = run(Config, collect_hash, [{LargeData, true}], none),
+    ?assertEqual({collected, Hash}, Result).
 
 %% Test multiple concurrent streams
 multiple_streams_test(Config) ->
-    Node1 = proplists:get_value(node1, Config),
-    Node2 = proplists:get_value(node2, Config),
-
-    %% Open 10 streams
+    {Peer1, _Node1, _Peer2, Node2} = pair(Config),
     NumStreams = 10,
-    Streams = lists:map(
-        fun(_) ->
-            {ok, Stream} = rpc:call(Node1, quic_dist, open_stream, [Node2]),
-            Stream
-        end,
-        lists:seq(1, NumStreams)
-    ),
-
+    Streams = peer:call(Peer1, ?MODULE, open_many, [Node2, NumStreams], ?CALL_MS),
     ?assertEqual(NumStreams, length(Streams)),
-
-    %% Verify all stream IDs are unique
     StreamIds = [Id || {quic_dist_stream, _, Id} <- Streams],
-    ?assertEqual(NumStreams, length(lists:usort(StreamIds))),
+    ?assertEqual(NumStreams, length(lists:usort(StreamIds))).
 
-    %% Clean up
-    lists:foreach(
-        fun(Stream) ->
-            ok = rpc:call(Node1, quic_dist, close_stream, [Stream])
-        end,
-        Streams
-    ),
-    ok.
-
-%% Test stream close
+%% Test stream close: sending on a closed stream fails.
 close_stream_test(Config) ->
-    Node1 = proplists:get_value(node1, Config),
-    Node2 = proplists:get_value(node2, Config),
+    {Peer1, _Node1, _Peer2, Node2} = pair(Config),
+    ?assertMatch({error, _}, peer:call(Peer1, ?MODULE, send_after_close, [Node2], ?CALL_MS)).
 
-    %% Open and close stream
-    {ok, Stream} = rpc:call(Node1, quic_dist, open_stream, [Node2]),
-    ok = rpc:call(Node1, quic_dist, close_stream, [Stream]),
-
-    %% Sending on closed stream should fail
-    Result = rpc:call(Node1, quic_dist, send, [Stream, <<"test">>]),
-    ?assertMatch({error, _}, Result),
-
-    ok.
-
-%% Test owner death cleanup
+%% Test owner death: the owner goes, and the connection is still usable
+%% for the next stream.
 owner_death_test(Config) ->
-    Node1 = proplists:get_value(node1, Config),
-    Node2 = proplists:get_value(node2, Config),
+    {Peer1, _Node1, _Peer2, Node2} = pair(Config),
+    ?assertMatch(
+        {dead, {ok, {quic_dist_stream, Node2, _}}},
+        peer:call(Peer1, ?MODULE, owner_dies, [Node2], ?CALL_MS)
+    ).
 
-    %% Spawn a process that opens a stream and dies
-    OwnerPid = rpc:call(Node1, erlang, spawn, [
-        fun() ->
-            {ok, _Stream} = quic_dist:open_stream(Node2),
-            %% Exit immediately, stream should be cleaned up
-            ok
-        end
-    ]),
-
-    %% Wait for process to die
-    timer:sleep(100),
-    ?assertEqual(false, rpc:call(Node1, erlang, is_process_alive, [OwnerPid])),
-
-    %% Stream should be cleaned up (no way to verify directly, but no crash)
-    ok.
-
-%% Test accept_streams functionality
+%% Test accept_streams: the acceptor is given the stream node1 opened.
 accept_streams_test(Config) ->
-    Node1 = proplists:get_value(node1, Config),
-    Node2 = proplists:get_value(node2, Config),
-    Self = self(),
+    {{quic_dist_stream, _, ExpectedId}, none, Result} =
+        run(Config, first_stream_id, [{<<"trigger">>, false}], none),
+    ?assertEqual({got_incoming, ExpectedId}, Result).
 
-    %% Set up acceptor on Node2
-    {ok, Ctrl2} = rpc:call(Node2, quic_dist, get_controller, [Node1]),
-
-    AcceptorPid = rpc:call(Node2, erlang, spawn, [
-        fun() ->
-            receive
-                {quic_dist_stream, {quic_dist_stream, _, StreamId}, {data, _, _}} ->
-                    Self ! {got_incoming, StreamId}
-            after 5000 ->
-                Self ! timeout
-            end
-        end
-    ]),
-
-    ok = rpc:call(Node2, quic_dist_controller, accept_user_streams, [Ctrl2, AcceptorPid]),
-
-    %% Open stream from Node1
-    {ok, Stream} = rpc:call(Node1, quic_dist, open_stream, [Node2]),
-
-    %% Send some data; the controller auto-assigns ownership to the
-    %% registered acceptor and delivers the first `{data, _, _}' event.
-    ok = rpc:call(Node1, quic_dist, send, [Stream, <<"trigger">>]),
-
-    receive
-        {got_incoming, StreamId} ->
-            {quic_dist_stream, _, ExpectedId} = Stream,
-            ?assertEqual(ExpectedId, StreamId);
-        timeout ->
-            ct:fail(no_incoming_notification)
-    after 5000 ->
-        ct:fail(accept_streams_timeout)
-    end,
-
-    %% Clean up
-    ok = rpc:call(Node1, quic_dist, close_stream, [Stream]),
-    ok = rpc:call(Node2, quic_dist, stop_accepting, [Node1]),
-    ok.
-
-%% Test FIN flag semantics
+%% Test FIN flag semantics: data without FIN, then data with it.
 fin_flag_test(Config) ->
-    Node1 = proplists:get_value(node1, Config),
-    Node2 = proplists:get_value(node2, Config),
-    Self = self(),
+    {_Stream, none, Result} = run(
+        Config,
+        collect_fin,
+        [{<<"part1">>, false}, {<<"part2">>, false}, {<<"final">>, true}],
+        none
+    ),
+    ?assertMatch({fin_received, [_ | _]}, Result),
+    {fin_received, Chunks} = Result,
+    ?assertEqual(<<"part1part2final">>, iolist_to_binary([D || {D, _} <- Chunks])),
+    {_, LastFin} = lists:last(Chunks),
+    ?assertEqual(true, LastFin).
 
-    %% Set up receiver
-    {ok, Ctrl2} = rpc:call(Node2, quic_dist, get_controller, [Node1]),
+%%====================================================================
+%% Driving a case
+%%====================================================================
 
-    ReceiverPid = rpc:call(Node2, erlang, spawn, [
-        fun() ->
-            receive
-                {quic_dist_stream, StreamRef, {data, Data, Fin}} ->
-                    fin_receiver_loop(StreamRef, Self, [{Data, Fin}])
-            after 5000 ->
-                Self ! no_incoming
-            end
+%% Start a Kind receiver on node2, have node1 write Chunks to a new
+%% stream, and return what node1 saw with what the receiver reports.
+run(Config, Kind, Chunks, Wait) ->
+    {Peer1, Node1, Peer2, Node2} = pair(Config),
+    Receiver = peer:call(Peer2, ?MODULE, start_receiver, [Node1, Kind], ?CALL_MS),
+    peer:call(Peer1, ?MODULE, exchange, [Node2, Receiver, Chunks, Wait], ?CALL_MS).
+
+%%====================================================================
+%% Run on node1
+%%====================================================================
+
+%% The stream stays open, owned by this process, until the receiver on
+%% node2 has answered, and the answer comes back over distribution.
+exchange(Node2, Receiver, Chunks, Wait) ->
+    {ok, Stream} = quic_dist:open_stream(Node2),
+    lists:foreach(fun({Data, Fin}) -> ok = quic_dist:send(Stream, Data, Fin) end, Chunks),
+    Echo =
+        case Wait of
+            echo ->
+                receive
+                    {quic_dist_stream, Stream, {data, Data, _}} -> {echo, Data}
+                after 10000 -> no_echo
+                end;
+            none ->
+                none
+        end,
+    Receiver ! {get, self()},
+    Result =
+        receive
+            {result, Receiver, R} -> R
+        after 60000 -> result_timeout
+        end,
+    _ = quic_dist:close_stream(Stream),
+    {Stream, Echo, Result}.
+
+open_and_close(Node2) ->
+    {ok, Stream} = quic_dist:open_stream(Node2),
+    {{ok, Stream}, quic_dist:close_stream(Stream)}.
+
+open_many(Node2, Count) ->
+    Streams = [
+        begin
+            {ok, S} = quic_dist:open_stream(Node2),
+            S
         end
-    ]),
+     || _ <- lists:seq(1, Count)
+    ],
+    lists:foreach(fun(S) -> ok = quic_dist:close_stream(S) end, Streams),
+    Streams.
 
-    ok = rpc:call(Node2, quic_dist_controller, accept_user_streams, [Ctrl2, ReceiverPid]),
+send_after_close(Node2) ->
+    {ok, Stream} = quic_dist:open_stream(Node2),
+    ok = quic_dist:close_stream(Stream),
+    quic_dist:send(Stream, <<"test">>).
 
-    %% Open stream and send data without FIN
-    {ok, Stream} = rpc:call(Node1, quic_dist, open_stream, [Node2]),
-    ok = rpc:call(Node1, quic_dist, send, [Stream, <<"part1">>]),
-    ok = rpc:call(Node1, quic_dist, send, [Stream, <<"part2">>]),
-    %% Send final data with FIN
-    ok = rpc:call(Node1, quic_dist, send, [Stream, <<"final">>, true]),
-
-    %% Wait for receiver to get all data and FIN
+owner_dies(Node2) ->
+    Owner = spawn(fun() -> {ok, _} = quic_dist:open_stream(Node2) end),
+    Ref = erlang:monitor(process, Owner),
     receive
-        {fin_received, Chunks} ->
-            %% Verify we got data and final FIN flag was true
-            ?assert(length(Chunks) >= 1),
-            {_, LastFin} = lists:last(Chunks),
-            ?assertEqual(true, LastFin);
-        no_incoming ->
-            ct:fail(no_incoming)
-    after 10000 ->
-        ct:fail(fin_flag_timeout)
+        {'DOWN', Ref, process, Owner, _} -> ok
+    after 5000 -> ok
     end,
-
-    ok.
+    Dead =
+        case is_process_alive(Owner) of
+            false -> dead;
+            true -> alive
+        end,
+    {Dead, quic_dist:open_stream(Node2)}.
 
 %%====================================================================
-%% Helper Functions
+%% Run on node2
 %%====================================================================
 
-generate_test_certs(Config) ->
-    PrivDir = proplists:get_value(priv_dir, Config),
-    CertDir = filename:join(PrivDir, "certs"),
-    ok = filelib:ensure_dir(filename:join(CertDir, "dummy")),
+start_receiver(Node1, Kind) ->
+    {ok, Ctrl} = quic_dist:get_controller(Node1),
+    Pid = spawn(?MODULE, receiver, [Ctrl, Kind]),
+    ok = quic_dist_controller:accept_user_streams(Ctrl, Pid),
+    Pid.
 
-    %% Generate self-signed certificate using openssl
-    Cmd = io_lib:format(
-        "openssl req -x509 -newkey rsa:2048 -keyout ~s/key.pem -out ~s/cert.pem "
-        "-days 1 -nodes -subj '/CN=localhost' 2>/dev/null",
-        [CertDir, CertDir]
-    ),
-
-    os:cmd(lists:flatten(Cmd)),
-
-    %% Verify files were created
-    case
-        {
-            filelib:is_file(filename:join(CertDir, "cert.pem")),
-            filelib:is_file(filename:join(CertDir, "key.pem"))
-        }
-    of
-        {true, true} ->
-            {ok, CertDir};
-        _ ->
-            {error, cert_generation_failed}
-    end.
-
-start_peer_nodes(CertDir, Config) ->
-    _PrivDir = proplists:get_value(priv_dir, Config),
-
-    Node1Name = list_to_atom(
-        "quic_us_node1_" ++ integer_to_list(erlang:unique_integer([positive]))
-    ),
-    Node2Name = list_to_atom(
-        "quic_us_node2_" ++ integer_to_list(erlang:unique_integer([positive]))
-    ),
-
-    %% Build code path
-    CodePath = code:get_path(),
-
-    %% Common peer options
-    PeerOpts = fun(Name, Port) ->
-        #{
-            name => Name,
-            host => "127.0.0.1",
-            args => [
-                "-proto_dist",
-                "quic",
-                "-epmd_module",
-                "quic_epmd",
-                "-start_epmd",
-                "false",
-                "-quic_dist_port",
-                integer_to_list(Port),
-                "-setcookie",
-                atom_to_list(erlang:get_cookie()),
-                "-pa"
-                | lists:flatmap(fun(P) -> [P] end, CodePath)
-            ],
-            connection => standard_io
-        }
-    end,
-
-    %% Start peer nodes with unique ports
-    try
-        {ok, Peer1, Node1} = peer:start_link(PeerOpts(Node1Name, 15433)),
-        {ok, Peer2, Node2} = peer:start_link(PeerOpts(Node2Name, 15434)),
-
-        %% Configure QUIC distribution on nodes
-        Nodes = [
-            {Node1, {"127.0.0.1", 15433}},
-            {Node2, {"127.0.0.1", 15434}}
-        ],
-
-        DistConfig = [
-            {cert_file, filename:join(CertDir, "cert.pem")},
-            {key_file, filename:join(CertDir, "key.pem")},
-            {verify, verify_none},
-            {discovery_module, quic_discovery_static},
-            {nodes, Nodes}
-        ],
-
-        %% Apply configuration
-        ok = rpc:call(Node1, application, set_env, [quic, dist, DistConfig]),
-        ok = rpc:call(Node2, application, set_env, [quic, dist, DistConfig]),
-
-        %% Start quic application
-        {ok, _} = rpc:call(Node1, application, ensure_all_started, [quic]),
-        {ok, _} = rpc:call(Node2, application, ensure_all_started, [quic]),
-
-        %% Initialize discovery
-        {ok, _} = rpc:call(Node1, quic_discovery_static, init, [[{nodes, Nodes}]]),
-        {ok, _} = rpc:call(Node2, quic_discovery_static, init, [[{nodes, Nodes}]]),
-
-        {ok, Node1, Peer1, Node2, Peer2}
-    catch
-        _:Reason ->
-            {error, Reason}
-    end.
-
-%% Helper to collect data chunks until FIN
-collect_data(StreamRef, Acc, Parent) ->
+%% Do the work, leave the acceptor pool, then hold the outcome for
+%% whoever asks for it.
+receiver(Ctrl, Kind) ->
+    Result = ?MODULE:Kind(),
+    ok = quic_dist_controller:stop_accepting_streams(Ctrl),
     receive
-        {quic_dist_stream, StreamRef, {data, Data, true}} ->
-            %% Final chunk
-            AllData = iolist_to_binary(lists:reverse([Data | Acc])),
-            Hash = crypto:hash(sha256, AllData),
-            Parent ! {collected, Hash};
-        {quic_dist_stream, StreamRef, {data, Data, false}} ->
-            collect_data(StreamRef, [Data | Acc], Parent);
-        {quic_dist_stream, StreamRef, closed} ->
-            AllData = iolist_to_binary(lists:reverse(Acc)),
-            Hash = crypto:hash(sha256, AllData),
-            Parent ! {collected, Hash}
-    after 30000 ->
-        Parent ! collect_timeout
+        {get, From} -> From ! {result, self(), Result}
+    after 60000 -> ok
     end.
 
-%% Helper to receive data and track FIN flags
-fin_receiver_loop(StreamRef, Parent, Acc) ->
+first_data() ->
     receive
-        {quic_dist_stream, StreamRef, {data, Data, Fin}} ->
-            NewAcc = [{Data, Fin} | Acc],
-            case Fin of
-                true ->
-                    Parent ! {fin_received, lists:reverse(NewAcc)};
-                false ->
-                    fin_receiver_loop(StreamRef, Parent, NewAcc)
-            end;
-        {quic_dist_stream, StreamRef, closed} ->
-            Parent ! {fin_received, lists:reverse(Acc)}
-    after 10000 ->
-        Parent ! fin_timeout
+        {quic_dist_stream, _Ref, {data, Data, _Fin}} -> {received, Data}
+    after 10000 -> timeout
     end.
+
+echo() ->
+    receive
+        {quic_dist_stream, Ref, {data, Data, _}} ->
+            ok = quic_dist:send(Ref, <<"Echo: ", Data/binary>>),
+            echoed
+    after 10000 -> timeout
+    end.
+
+collect_hash() ->
+    receive
+        {quic_dist_stream, Ref, {data, Data, Fin}} -> collect_hash(Ref, [Data], Fin)
+    after 30000 -> no_incoming
+    end.
+
+collect_hash(_Ref, Acc, true) ->
+    {collected, crypto:hash(sha256, lists:reverse(Acc))};
+collect_hash(Ref, Acc, false) ->
+    receive
+        {quic_dist_stream, Ref, {data, Data, Fin}} -> collect_hash(Ref, [Data | Acc], Fin);
+        {quic_dist_stream, Ref, closed} -> {collected, crypto:hash(sha256, lists:reverse(Acc))}
+    after 30000 -> {partial, iolist_size(Acc)}
+    end.
+
+first_stream_id() ->
+    receive
+        {quic_dist_stream, {quic_dist_stream, _, StreamId}, {data, _, _}} ->
+            {got_incoming, StreamId}
+    after 10000 -> timeout
+    end.
+
+collect_fin() ->
+    receive
+        {quic_dist_stream, Ref, {data, Data, Fin}} -> collect_fin(Ref, [{Data, Fin}], Fin)
+    after 10000 -> no_incoming
+    end.
+
+collect_fin(_Ref, Acc, true) ->
+    {fin_received, lists:reverse(Acc)};
+collect_fin(Ref, Acc, false) ->
+    receive
+        {quic_dist_stream, Ref, {data, Data, Fin}} -> collect_fin(Ref, [{Data, Fin} | Acc], Fin)
+    after 10000 -> {no_fin, lists:reverse(Acc)}
+    end.
+
+%%====================================================================
+%% Helpers
+%%====================================================================
+
+pair(Config) ->
+    {
+        ?config(peer1, Config),
+        ?config(node1, Config),
+        ?config(peer2, Config),
+        ?config(node2, Config)
+    }.

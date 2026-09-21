@@ -26,6 +26,7 @@
     peer_learns_of_owner_death/1,
     peer_learns_of_clean_close/1,
     peer_learns_of_server_owner_death/1,
+    peer_learns_of_handed_off_owner_death/1,
     server_owner_death_ignored_when_opted_out/1
 ]).
 
@@ -41,6 +42,7 @@ all() ->
         peer_learns_of_clean_close,
         peer_learns_of_owner_death,
         peer_learns_of_server_owner_death,
+        peer_learns_of_handed_off_owner_death,
         server_owner_death_ignored_when_opted_out
     ].
 
@@ -74,6 +76,33 @@ peer_learns_of_server_owner_death(_Config) ->
     {CConn, Handler, _SConn} = server_owned_pair(#{}),
     exit(Handler, kill),
     assert_closed(CConn).
+
+%% A client connection follows the caller that started it through that
+%% caller's link. Handed to another owner with set_owner, it has to follow
+%% the new owner instead, which has no link to it: distribution does this
+%% for every outgoing connection, and a dead controller used to leave its
+%% connection up and answering the peer, which then believed the node was
+%% still there.
+peer_learns_of_handed_off_owner_death(_Config) ->
+    {SConn, Caller, CConn} = connected_pair(),
+    NewOwner = spawn(fun() ->
+        receive
+        after infinity -> ok
+        end
+    end),
+    ok = quic:set_owner_sync(CConn, NewOwner),
+    %% The fence: the handoff alone closes nothing, so the close below is
+    %% the new owner's death and not something set_owner did.
+    receive
+        {quic, SConn, {closed, Reason}} -> ct:fail({closed_on_handoff, Reason})
+    after 500 -> ok
+    end,
+    exit(NewOwner, kill),
+    assert_closed(SConn),
+    %% The caller handed the connection on, so the new owner's death is
+    %% not the caller's: it has to survive the connection going.
+    timer:sleep(200),
+    ?assert(is_process_alive(Caller)).
 
 server_owner_death_ignored_when_opted_out(_Config) ->
     {CConn, Handler, SConn} = server_owned_pair(#{monitor_owner => false}),
