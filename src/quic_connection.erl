@@ -2784,7 +2784,8 @@ discard_space(Space, #state{loss_state = LossState, cc_state = CCState} = State)
 purge_unsent(Space, #state{amp_deferred = Deferred, pending_hs = Pending} = State) ->
     State#state{
         amp_deferred = [E || {_Packet, Meta} = E <- Deferred, element(1, Meta) =/= Space],
-        pending_hs = Pending#{Space => []}
+        pending_hs = Pending#{Space => []},
+        pending_hs_bytes = (State#state.pending_hs_bytes)#{Space => 0}
     }.
 
 discard_cc_bytes(undefined, _Bytes) -> undefined;
@@ -2905,15 +2906,40 @@ admit(Space, true, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
     end.
 
 %% Newest first, reversed on drain: appending to the tail would make a
-%% sustained refusal quadratic. Bounded, because a peer that never opens
-%% the window must not be able to grow this without limit; the flight is
-%% a handful of packets, so anything past the bound is a fault and the
-%% oldest is dropped rather than the newest, which the peer is waiting
-%% on.
-enqueue_hs(Space, Payload, Frames, #state{pending_hs = Pending} = State) ->
-    Queued = [{Payload, Frames} | maps:get(Space, Pending, [])],
-    Bounded = lists:sublist(Queued, ?MAX_PENDING_HS),
-    State#state{pending_hs = Pending#{Space => Bounded}}.
+%% sustained refusal quadratic.
+%%
+%% Nothing queued is ever evicted. CRYPTO is a reliable ordered stream,
+%% so dropping a fragment leaves the peer a gap it can never fill and
+%% deadlocks the handshake. What we queue is our own flight, bounded by
+%% the handshake rather than by anything the peer controls, so the
+%% ceiling only catches a local fault and closing is the honest answer
+%% to reaching it.
+enqueue_hs(Space, Payload, Frames, State) ->
+    #state{pending_hs = Pending, pending_hs_bytes = Bytes} = State,
+    Held = maps:get(Space, Bytes, 0) + iolist_size(Payload),
+    case Held > ?MAX_PENDING_HS_BYTES of
+        true ->
+            ?LOG_ERROR(
+                #{what => pending_handshake_overflow, space => Space, bytes => Held},
+                ?QUIC_LOG_META
+            ),
+            close_with_error(
+                level_for_close(Space),
+                transport,
+                ?QUIC_INTERNAL_ERROR,
+                0,
+                <<"pending handshake queue overflow">>,
+                State#state{
+                    pending_hs = #{initial => [], handshake => []},
+                    pending_hs_bytes = #{initial => 0, handshake => 0}
+                }
+            );
+        false ->
+            State#state{
+                pending_hs = Pending#{Space => [{Payload, Frames} | maps:get(Space, Pending, [])]},
+                pending_hs_bytes = Bytes#{Space => Held}
+            }
+    end.
 
 %% Rebuild and resend what the window refused. Re-runs admission, so a
 %% window that reopened only part way stops at the first refusal and
@@ -2927,7 +2953,10 @@ drain_space(Space, #state{pending_hs = Pending} = State) ->
         [] ->
             State;
         Queued ->
-            Cleared = State#state{pending_hs = Pending#{Space => []}},
+            Cleared = State#state{
+                pending_hs = Pending#{Space => []},
+                pending_hs_bytes = (State#state.pending_hs_bytes)#{Space => 0}
+            },
             lists:foldl(
                 fun({Payload, Frames}, Acc) -> send_at_level(Space, Payload, Frames, Acc) end,
                 Cleared,

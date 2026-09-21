@@ -15,6 +15,9 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% Must match quic_connection_state.hrl.
+-define(MAX_PENDING_HS_BYTES, 1048576).
+
 %% A window with no room refuses, and the refusal costs nothing: the
 %% packet number is still there to be used when the window reopens.
 refusal_does_not_spend_a_packet_number_test() ->
@@ -94,8 +97,77 @@ discard_purges_what_the_window_holds_test() ->
     ?assertEqual(S2, quic_connection:drain_pending_hs(S2)).
 
 %%====================================================================
+%% Nothing queued is ever dropped
+%%====================================================================
+
+%% CRYPTO is a reliable ordered stream: dropping any fragment leaves a
+%% gap the peer can never fill, and the oldest is the prefix everything
+%% behind it waits on. A large certificate chain legitimately runs to
+%% far more packets than a typical flight, so the queue has to hold all
+%% of it, in order.
+a_large_flight_is_never_truncated_test() ->
+    Flight = flight(64),
+    S = enqueue_flight(blocked_state(), Flight),
+    ?assertEqual(Flight, pending(handshake, S)).
+
+%% The ceiling exists only against a local fault, so it sits far above
+%% any real flight and is stated in bytes: what matters is the memory a
+%% stuck queue holds, not how many packets it took to get there.
+a_large_flight_stays_far_below_the_ceiling_test() ->
+    Bytes = lists:sum([iolist_size(P) || {P, _F} <- flight(64)]),
+    ?assert(Bytes * 8 < ?MAX_PENDING_HS_BYTES).
+
+%% Past the ceiling this endpoint is malfunctioning, so it closes rather
+%% than growing without bound. Closing is checked by the reason, not by
+%% the queue being empty, which a silent drop would also produce.
+overflowing_the_ceiling_closes_the_connection_test() ->
+    S = enqueue_until_closed(blocked_state(), (?MAX_PENDING_HS_BYTES div 1200) + 2),
+    %% INTERNAL_ERROR, not an empty queue: a silent drop would leave the
+    %% queue empty too, and that is the bug this replaced.
+    ?assertMatch({transport, 16#01, _}, quic_connection_test_support:close_reason(S)),
+    ?assertEqual(0, queued(handshake, S)).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
+
+%% Distinct CRYPTO offsets, so a gap in the drained order is visible
+%% rather than hidden by identical payloads.
+flight(Count) ->
+    [
+        begin
+            Payload = <<"crypto-", (integer_to_binary(I))/binary>>,
+            {Payload, [{crypto, I * 1000, Payload}]}
+        end
+     || I <- lists:seq(0, Count - 1)
+    ].
+
+%% Stops at the close, so a run that never closes leaves close_reason
+%% undefined rather than looking like a pass.
+enqueue_until_closed(State, 0) ->
+    State;
+enqueue_until_closed(State, Budget) ->
+    case quic_connection_test_support:close_reason(State) of
+        undefined ->
+            Payload = binary:copy(<<"c">>, 1200),
+            enqueue_until_closed(
+                quic_connection:send_handshake_packet(
+                    Payload, [{crypto, 0, Payload}], State
+                ),
+                Budget - 1
+            );
+        _Closed ->
+            State
+    end.
+
+enqueue_flight(State, Flight) ->
+    lists:foldl(
+        fun({Payload, Frames}, Acc) ->
+            quic_connection:send_handshake_packet(Payload, Frames, Acc)
+        end,
+        State,
+        Flight
+    ).
 
 payload() -> <<"handshake-crypto-payload">>.
 

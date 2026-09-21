@@ -9,10 +9,11 @@
 %% retransmission semantics.
 -define(PTO_RESET_TOLERANCE_MS, 2).
 
-%% Most handshake packets the congestion window may hold back at once.
-%% A flight is a handful of packets, so a queue past this is a peer that
-%% never opens the window rather than a slow one.
--define(MAX_PENDING_HS, 16).
+%% Most handshake bytes per space the congestion window may hold back at
+%% once. A large certificate chain runs to tens of kilobytes and a
+%% post-quantum key exchange to more, so this sits far above any real
+%% flight: reaching it means this endpoint is malfunctioning.
+-define(MAX_PENDING_HS_BYTES, 1048576).
 
 %% ACK packet tolerance for 1-RTT (RFC 9002 §6.2).
 %% The receiver SHOULD send an ACK frame in response to at least every
@@ -291,6 +292,11 @@
     %% reopens the window.
     pending_hs = #{initial => [], handshake => []} :: #{
         quic_loss:space() => [{iodata(), [term()]}]
+    },
+    %% Payload bytes held in pending_hs, per space, against
+    %% ?MAX_PENDING_HS_BYTES.
+    pending_hs_bytes = #{initial => 0, handshake => 0} :: #{
+        quic_loss:space() => non_neg_integer()
     },
     %% Set while a probe is being sent, which RFC 9002 Section 7 exempts
     %% from the congestion window.
