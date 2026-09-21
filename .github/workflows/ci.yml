@@ -233,6 +233,48 @@ jobs:
           QUIC_ENABLE_GSO_TEST: "1"
         run: rebar3 ct --suite=quic_server_batching_SUITE
 
+  bulk-send:
+    name: Bulk Send + Socket Backend
+    needs: unit-tests
+    # The socket-backend cases need GRO and per-message GSO, so they run
+    # here rather than on the macOS job. docker/run-ct.sh gives the same
+    # coverage from a non-Linux host.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24.0'
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: ${{ runner.os }}-bulk-otp28-${{ hashFiles('rebar.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bulk-otp28-
+
+      - name: Generate certificates
+        run: |
+          chmod +x ./certs/generate_certs.sh
+          ./certs/generate_certs.sh
+
+      - name: Compile
+        run: rebar3 compile
+
+      # The harness asks for buffers the stock runner clamps, which would
+      # measure the host rather than the code.
+      - name: Raise socket buffer limits
+        run: sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+
+      - name: Run the bulk send suite
+        run: rebar3 ct --suite=quic_bulk_run_send_SUITE
+
   crypto-nif:
     name: Crypto NIF
     needs: unit-tests

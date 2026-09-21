@@ -43,6 +43,9 @@ rebar3 ex_doc
 - `test/quic_*_tests.erl` are EUnit tests, run by `rebar3 eunit`.
 - `test/prop_quic_*.erl` are PropEr properties, run by `rebar3 proper`.
 - `test/quic_*_SUITE.erl` are Common Test suites, run one at a time with `rebar3 ct --suite=quic_e2e_SUITE`.
+- Suites that exercise the OTP `socket` backend need GRO and per-message GSO,
+  so they only run on Linux. From macOS or FreeBSD run them in a container
+  instead: `docker/run-ct.sh quic_bulk_run_send_SUITE`. CI runs them natively.
 
 Most end-to-end suites run in process against `test/quic_test_echo_server.erl`, so they need no containers. The suites that talk to other implementations do:
 

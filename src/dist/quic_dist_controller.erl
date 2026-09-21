@@ -555,7 +555,7 @@ init_state({call, _From}, {recv, _Length}, State) ->
     {keep_state, State, [postpone]};
 %% Handle QUIC errors during init
 init_state(info, {quic, Conn, {closed, Reason}}, #state{conn = Conn}) ->
-    {stop, {connection_closed, Reason}};
+    {stop, close_reason(Reason)};
 init_state(info, {quic, Conn, {transport_error, Code, Reason}}, #state{conn = Conn}) ->
     {stop, {transport_error, Code, Reason}};
 init_state(EventType, Event, State) ->
@@ -1000,7 +1000,7 @@ handle_common_event(
     #state{conn = Conn} = State
 ) ->
     %% Connection closed
-    {stop, {connection_closed, Reason}, State};
+    {stop, close_reason(Reason), State};
 handle_common_event(
     info,
     {quic, Conn, {transport_error, Code, Reason}},
@@ -1035,6 +1035,17 @@ handle_common_event(info, pending_tick_retry, _StateName, State) ->
     {keep_state, State2};
 handle_common_event(_EventType, _Event, _StateName, State) ->
     {keep_state, State}.
+
+%% A node leaving is not a fault. A peer that closed the connection
+%% cleanly, which for distribution means an application close with error
+%% code 0, stops as a shutdown so no crash report is logged; anything
+%% else keeps a reason that is reported, because it is a real failure.
+close_reason({peer_closed, application, 0, _Phrase} = Reason) ->
+    {shutdown, {connection_closed, Reason}};
+close_reason(normal = Reason) ->
+    {shutdown, {connection_closed, Reason}};
+close_reason(Reason) ->
+    {connection_closed, Reason}.
 
 %%====================================================================
 %% Internal Functions - Streams

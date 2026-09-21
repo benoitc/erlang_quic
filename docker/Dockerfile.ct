@@ -1,0 +1,34 @@
+# Run Common Test suites on Linux from any host.
+#
+# Some suites exercise the OTP `socket' backend, which needs GRO and
+# per-message GSO. Those are Linux kernel features, so the cases cannot
+# run on macOS or FreeBSD at all. Rather than skip them there and lose
+# the coverage, run them in here.
+#
+# Build context is the repository root:
+#   docker build -f docker/Dockerfile.ct -t quic-ct .
+#
+# Then, with the sources mounted so a rebuild is not needed per run:
+#   docker run --rm -v "$PWD":/app quic-ct quic_bulk_run_send_SUITE
+#
+# docker/run-ct.sh wraps both steps.
+ARG OTP_VERSION=28
+FROM erlang:${OTP_VERSION}
+
+# The suites open real sockets on loopback and ask for large buffers.
+# procps is for the process checks some suites make.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends procps \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# The mounted tree carries the host's _build, which holds beam files
+# compiled for a different OS. Keep the container's artefacts separate
+# so the two never overwrite each other.
+ENV REBAR_BASE_DIR=/tmp/ct_build
+
+COPY docker/ct-entrypoint.sh /usr/local/bin/ct-entrypoint.sh
+RUN chmod +x /usr/local/bin/ct-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/ct-entrypoint.sh"]
