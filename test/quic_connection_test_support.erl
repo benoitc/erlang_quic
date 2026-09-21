@@ -26,6 +26,7 @@
     amp_counters/1,
     state_for_role/1,
     state_for_client/1,
+    state_with_keys/1,
     close_reason/1,
     state_for_server/3,
     state_with_pn_app/2,
@@ -224,6 +225,21 @@ state_for_role(Role) ->
         max_streams_uni_local = ?DEFAULT_MAX_STREAMS_UNI
     }.
 
+%% A #state{} holding real Initial and Handshake keys, for the
+%% key-discard hooks. The two key pairs are derived the same way; these
+%% cases only care whether they are present.
+-spec state_with_keys(client | server) -> #state{}.
+state_with_keys(Role) ->
+    Keys = quic_connection:derive_initial_keys(<<"discard-cid">>, ?QUIC_VERSION_1),
+    #state{
+        role = Role,
+        initial_keys = Keys,
+        handshake_keys = Keys,
+        app_keys = Keys,
+        loss_state = quic_loss:new(),
+        cc_state = quic_cc:new(#{})
+    }.
+
 -spec state_for_client({inet:ip_address(), inet:port_number()}) -> #state{}.
 state_for_client(RemoteAddr) ->
     #state{role = client, app_keys = undefined, remote_addr = RemoteAddr}.
@@ -255,7 +271,9 @@ state_with_socket(State, Socket) -> State#state{socket = Socket}.
 %% that need to observe what an incoming frame does to it.
 state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
 state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at;
-state_get(#state{} = S, dcid) -> S#state.dcid.
+state_get(#state{} = S, dcid) -> S#state.dcid;
+state_get(#state{} = S, initial_keys) -> S#state.initial_keys;
+state_get(#state{} = S, handshake_keys) -> S#state.handshake_keys.
 
 state_set(#state{} = S, loss_state, V) ->
     S#state{loss_state = V};

@@ -2656,7 +2656,7 @@ send_handshake_crypto(Payload, State0) ->
     %% ServerHello to retransmit at the Initial level.
     State =
         case State0#state.role of
-            client -> discard_space(initial, State0);
+            client -> discard_initial(State0);
             server -> State0
         end,
     Max = handshake_crypto_budget(State),
@@ -2748,9 +2748,16 @@ confirm_handshake(#state{loss_state = LossState} = State) ->
     %% RFC 9001 Section 4.9.2: neither endpoint sends at the Handshake
     %% level once the handshake is confirmed, so anything still tracked
     %% there can never be acknowledged.
-    discard_space(handshake, State#state{
+    Confirmed = discard_space(handshake, State#state{
         loss_state = quic_loss:on_handshake_confirmed(LossState)
-    }).
+    }),
+    Confirmed#state{handshake_keys = undefined}.
+
+%% RFC 9001 Section 4.9.1: the keys go with the packets. Discarding the
+%% space alone would leave the connection able to send at a level it must
+%% not, and able to decrypt packets it must drop.
+discard_initial(State) ->
+    (discard_space(initial, State))#state{initial_keys = undefined, initial_keys_alt = undefined}.
 
 %% Drop a packet number space from both byte counters at once. They are
 %% tracked separately, so subtracting from one and not the other leaves
@@ -2796,12 +2803,13 @@ send_new_session_ticket(
         server_name = ServerName,
         max_early_data = MaxEarlyData,
         alpn = ALPN,
-        handshake_keys = {ClientHsKeys, _},
+        app_keys = {ClientAppKeys, _},
         ticket_store = TicketStore
     } = State
 ) ->
-    %% Get cipher from the connection
-    Cipher = ClientHsKeys#crypto_keys.cipher,
+    %% The cipher is the same at every level; the 1-RTT keys are the ones
+    %% still held once the handshake is confirmed.
+    Cipher = ClientAppKeys#crypto_keys.cipher,
 
     %% Create a session ticket
     Ticket = quic_ticket:create_ticket(
@@ -2852,7 +2860,14 @@ packet_flags(Frames, Padded) ->
     AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames),
     {AckEliciting, AckEliciting orelse Padded orelse lists:member(padding, Frames)}.
 
-%% Send an Initial packet
+%% Send an Initial packet.
+%%
+%% Once the keys for a level are discarded nothing may be sent at it
+%% (RFC 9001 Section 4.9.1), so a send that races the discard is dropped
+%% rather than crashing. The peer has discarded that space too, so there
+%% is nothing left for it to acknowledge.
+send_initial_packet(_Payload, _Frames, #state{initial_keys = undefined} = State) ->
+    State;
 send_initial_packet(Payload, Frames, State) ->
     #state{
         scid = SCID,
@@ -3043,6 +3058,8 @@ send_frame_tuples(FrameTuples, State) ->
     send_app_packet_internal(Payload, FrameTuples, State).
 
 %% Send a Handshake packet
+send_handshake_packet(_Payload, _Frames, #state{handshake_keys = undefined} = State) ->
+    State;
 send_handshake_packet(Payload, Frames, State) ->
     #state{
         scid = SCID,
@@ -3461,7 +3478,7 @@ amp_mark_validated(_Type, State) ->
 %% receiving one, not lifting the amplification limit, which may already
 %% have been lifted by a validated token.
 server_discard_initial(handshake, #state{role = server} = State) ->
-    discard_space(initial, State);
+    discard_initial(State);
 server_discard_initial(_Type, State) ->
     State.
 
@@ -4187,7 +4204,14 @@ decode_versions(_) -> [].
 
 decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
     <<_:8, PacketVersion:32, _/binary>> = FullPacket,
-    {ClientKeys, ServerKeys} = initial_keys_for_version(PacketVersion, State),
+    case initial_keys_for_version(PacketVersion, State) of
+        undefined ->
+            {error, no_initial_keys};
+        Keys ->
+            decode_initial_with_keys(FullPacket, FirstByte, PeerSCID, Rest, Keys, State)
+    end.
+
+decode_initial_with_keys(FullPacket, FirstByte, PeerSCID, Rest, {ClientKeys, ServerKeys}, State) ->
     #state{role = Role} = State,
 
     %% Select correct keys based on role:
@@ -6073,7 +6097,7 @@ process_tls_message(
         alpn = ALPN,
         master_secret = MasterSecret,
         tls_transcript = Transcript,
-        handshake_keys = {ClientHsKeys, _}
+        app_keys = {ClientAppKeys, _}
     } = State
 ) ->
     case quic_ticket:parse_new_session_ticket(Body) of
@@ -6084,7 +6108,10 @@ process_tls_message(
             ticket := TicketData,
             max_early_data := MaxEarlyData
         }} ->
-            Cipher = ClientHsKeys#crypto_keys.cipher,
+            %% The cipher is the same across levels; read it from the
+            %% 1-RTT keys, which a ticket arriving after confirmation is
+            %% protected with anyway.
+            Cipher = ClientAppKeys#crypto_keys.cipher,
 
             %% Derive resumption_master_secret from master secret
             %% The transcript should include client Finished
