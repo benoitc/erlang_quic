@@ -552,7 +552,10 @@ detect_lost_q(
 ) ->
     LossDelay = max(trunc(?TIME_THRESHOLD * SRTT), ?GRANULARITY),
     LossThreshold = LargestAcked - ?PACKET_THRESHOLD + 1,
-    case (PN < LossThreshold) orelse ((Now - TS) > LossDelay) of
+    %% >=, not >: get_loss_time_and_space/1 arms the timer for exactly
+    %% TS + LossDelay, so detection has to declare at that instant or
+    %% the timer re-arms at zero and spins until the clock moves.
+    case (PN < LossThreshold) orelse ((Now - TS) >= LossDelay) of
         true ->
             NewBytes =
                 case AE of

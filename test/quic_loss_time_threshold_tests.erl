@@ -19,6 +19,7 @@
 -module(quic_loss_time_threshold_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("quic.hrl").
 
 %% Must match quic_loss.
 -define(TIME_THRESHOLD, 1.125).
@@ -110,6 +111,33 @@ delay_floors_at_granularity_test() ->
 no_in_flight_packet_has_no_loss_time_test() ->
     State = samples(quic_loss:new(), [50]),
     ?assertEqual(none, quic_loss:get_loss_time_and_space(State)).
+
+%%====================================================================
+%% The deadline the timer is armed for
+%%====================================================================
+
+%% get_loss_time_and_space/1 arms the timer for TimeSent + LossDelay.
+%% Detection has to agree with it at that exact instant: if it only
+%% fires strictly after, the timer expires, declares nothing, recomputes
+%% the same deadline and re-arms at zero, spinning until the clock moves.
+loss_is_declared_at_the_deadline_test() ->
+    State = with_inflight_packet(samples(quic_loss:new(), [100])),
+    {Deadline, app} = quic_loss:get_loss_time_and_space(State),
+    {_S, _Acked, Lost, _Meta} = quic_loss:on_ack_received(
+        app, State, {ack, 2, 0, 0, []}, Deadline
+    ),
+    ?assertEqual([1], [PN || #sent_packet{pn = PN} <- Lost]).
+
+%% The fence: one millisecond earlier the deadline has not arrived and
+%% nothing may be declared, otherwise the comparison has merely moved
+%% the spurious-loss problem a tick earlier.
+loss_is_not_declared_before_the_deadline_test() ->
+    State = with_inflight_packet(samples(quic_loss:new(), [100])),
+    {Deadline, app} = quic_loss:get_loss_time_and_space(State),
+    {_S, _Acked, Lost, _Meta} = quic_loss:on_ack_received(
+        app, State, {ack, 2, 0, 0, []}, Deadline - 1
+    ),
+    ?assertEqual([], Lost).
 
 %%====================================================================
 %% What the threshold is for: not declaring loss on an RTT spike
