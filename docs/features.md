@@ -425,6 +425,6 @@ checks here, so the table is not taken on trust:
 | chacha20 | Pass | yes |
 | multiconnect | Pass | yes |
 | v2 | Pass | yes |
-| resumption | Pass | yes, skipped when the peer issues no ticket |
-| zerortt | Pass | yes, skipped when the peer issues no ticket |
-| connectionmigration | Pass | yes |
+| resumption | Pass | yes |
+| zerortt | Pass | yes, early data sent, accepted and answered |
+| connectionmigration | Pass | yes, data echoed over the new path |

@@ -1735,6 +1735,7 @@ connected(
         data_sent = DataSent,
         ack_sent = AckSent,
         retransmits = Retransmits,
+        zero_rtt_stream_ids = ZeroRttStreams,
         socket_state = SocketState
     } = State
 ) ->
@@ -1749,6 +1750,10 @@ connected(
         data_sent => DataSent,
         ack_sent => AckSent,
         retransmits => Retransmits,
+        %% Streams that carried 0-RTT-encrypted data and kept it. A
+        %% rejection clears them (RFC 9001 Section 4.6.2), so a non-zero
+        %% value here means early data was sent and the server took it.
+        zero_rtt_streams => sets:size(ZeroRttStreams),
         batch_flushes => Flushes,
         packets_coalesced => Coalesced,
         gso_flushes => GSOFlushes,

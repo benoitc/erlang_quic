@@ -74,6 +74,9 @@
 -define(HANDSHAKE_TIMEOUT, 5000).
 -define(STREAM_TIMEOUT, 10000).
 
+-define(MIGRATION_BEFORE, <<"before the migration">>).
+-define(MIGRATION_AFTER, <<"after the migration">>).
+
 %%====================================================================
 %% CT Callbacks
 %%====================================================================
@@ -707,32 +710,59 @@ do_zero_rtt(Host, Port) ->
     quic:close(First, normal),
     case Ticket of
         undefined ->
-            {skip, "peer issued no session ticket"};
+            throw({skip, "peer issued no session ticket"});
         _ ->
-            {ok, Conn} = connect(Host, Port, (interop_opts())#{session_ticket => Ticket}),
-            _ = await_connected(Conn, Host, Port),
-            Accepted = quic:early_data_accepted(Conn),
-            quic:close(Conn, normal),
-            ?assert(is_boolean(Accepted)),
-            {comment, io_lib:format("early data accepted: ~p", [Accepted])}
-    end.
+            ok
+    end,
+    {ok, Conn} = connect(Host, Port, (interop_opts())#{session_ticket => Ticket}),
+    %% Written before the handshake completes, so it goes out in 0-RTT
+    %% packets: waiting for `connected' first would send it at 1-RTT and
+    %% prove nothing about early data.
+    {ok, StreamId} = quic:open_stream(Conn),
+    Early = <<"zero rtt payload">>,
+    ok = quic:send_data(Conn, StreamId, Early, true),
+    _ = await_connected(Conn, Host, Port),
+    Accepted = quic:early_data_accepted(Conn),
+    {ok, Stats} = quic_connection:get_stats(Conn),
+    Echo = wait_for_stream_data(Conn, StreamId, ?STREAM_TIMEOUT),
+    quic:close(Conn, normal),
+    %% The peer echoed the empty early_data extension, so acceptance is
+    %% known rather than `unknown'.
+    ?assertEqual(true, Accepted),
+    %% The stream really carried 0-RTT-encrypted bytes and kept them: a
+    %% rejection clears this.
+    ?assert(maps:get(zero_rtt_streams, Stats) >= 1),
+    %% And the peer acted on them.
+    ?assertEqual({ok, Early}, Echo),
+    {comment, "early data sent, accepted and answered"}.
 
 %% RFC 9000 Section 9: the connection survives a local address change
 %% and keeps carrying data on the new path.
 connection_migration(Config) ->
     ct:comment("Connection migration against an external peer"),
-    with_server(aioquic, Config, fun do_connection_migration/2).
+    skippable(fun() -> with_server(aioquic, Config, fun do_connection_migration/2) end).
 
 do_connection_migration(Host, Port) ->
     {ok, Conn} = connect(Host, Port, interop_opts()),
     _ = await_connected(Conn, Host, Port),
+    %% A fence on the old path, so a migration that carries nothing is
+    %% told apart from a peer that was never answering.
+    ?assertEqual({ok, ?MIGRATION_BEFORE}, echo(Conn, ?MIGRATION_BEFORE)),
     %% Migrating needs a connection ID the old path has not used
     %% (Section 9.5), and the peer's arrives just after the handshake.
     ?assert(quic_connection_test_support:await_spare_cid(Conn, 5000)),
     ?assertEqual(ok, quic:migrate(Conn)),
-    ?assertMatch({ok, _}, quic:open_stream(Conn)),
+    %% The point of Section 9 is that the connection keeps carrying
+    %% data, which opening a stream locally does not show.
+    ?assertEqual({ok, ?MIGRATION_AFTER}, echo(Conn, ?MIGRATION_AFTER)),
     quic:close(Conn, normal),
-    {comment, "migrated and still usable"}.
+    {comment, "data echoed over the new path"}.
+
+%% One request/response on a fresh stream.
+echo(Conn, Payload) ->
+    {ok, StreamId} = quic:open_stream(Conn),
+    ok = quic:send_data(Conn, StreamId, Payload, true),
+    wait_for_stream_data(Conn, StreamId, ?STREAM_TIMEOUT).
 
 interop_opts() ->
     #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>]}.
