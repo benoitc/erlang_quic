@@ -105,9 +105,24 @@ end_per_group(script, Config) ->
         undefined -> ok;
         Port -> stop_port(Port)
     end,
+    kill_target_node(?config(target_node, Config)),
     ok;
 end_per_group(_Group, _Config) ->
     ok.
+
+%% `erl' is a shell script that execs beam.smp, so the port's os_pid is
+%% the wrapper and killing it orphans the node, which keeps holding the
+%% fixed target port and makes every later run of this suite skip with
+%% target_not_ready. The node name carries a per-run counter, so it
+%% identifies exactly this target and nothing else.
+kill_target_node(undefined) ->
+    ok;
+kill_target_node(Node) ->
+    _ = os:cmd("pkill -f " ++ escape(atom_to_list(Node)) ++ " 2>/dev/null"),
+    ok.
+
+escape(Str) ->
+    "'" ++ lists:flatten(string:replace(Str, "'", "'\\''", all)) ++ "'".
 
 stop_port(Port) ->
     case erlang:port_info(Port, os_pid) of
@@ -354,6 +369,7 @@ start_target(Config) ->
         timeout ->
             Log = drain_port(Port, []),
             stop_port(Port),
+            kill_target_node(Node),
             ct:log("target failed to become ready. output:~n~s", [Log]),
             {error, target_not_ready}
     end.
