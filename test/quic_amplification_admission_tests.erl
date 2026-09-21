@@ -137,7 +137,7 @@ in_flight(State) ->
     ).
 
 pending(Space, State) ->
-    lists:reverse(maps:get(Space, quic_connection_test_support:state_get(State, pending_hs), [])).
+    quic_connection_test_support:pending_hs(State, Space).
 
 queued(Space, State) ->
     length(pending(Space, State)).

@@ -1735,6 +1735,7 @@ connected(
         data_sent = DataSent,
         ack_sent = AckSent,
         retransmits = Retransmits,
+        zero_rtt_stream_ids = ZeroRttStreams,
         socket_state = SocketState
     } = State
 ) ->
@@ -1749,6 +1750,10 @@ connected(
         data_sent => DataSent,
         ack_sent => AckSent,
         retransmits => Retransmits,
+        %% Streams that carried 0-RTT-encrypted data and kept it. A
+        %% rejection clears them (RFC 9001 Section 4.6.2), so a non-zero
+        %% value here means early data was sent and the server took it.
+        zero_rtt_streams => sets:size(ZeroRttStreams),
         batch_flushes => Flushes,
         packets_coalesced => Coalesced,
         gso_flushes => GSOFlushes,
@@ -2783,7 +2788,7 @@ discard_space(Space, #state{loss_state = LossState, cc_state = CCState} = State)
 %% budget, or by the congestion window.
 purge_unsent(Space, #state{pending_hs = Pending} = State) ->
     State#state{
-        pending_hs = Pending#{Space => []},
+        pending_hs = Pending#{Space => queue:new()},
         pending_hs_bytes = (State#state.pending_hs_bytes)#{Space => 0}
     }.
 
@@ -2904,8 +2909,8 @@ admit(Space, true, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
             {deferred, enqueue_hs(Space, Payload, Frames, State)}
     end.
 
-%% Newest first, reversed on drain: appending to the tail would make a
-%% sustained refusal quadratic.
+%% A queue, so both ends are cheap: a sustained refusal appends and the
+%% drain takes from the head.
 %%
 %% Nothing queued is ever evicted. CRYPTO is a reliable ordered stream,
 %% so dropping a fragment leaves the peer a gap it can never fill and
@@ -2929,38 +2934,67 @@ enqueue_hs(Space, Payload, Frames, State) ->
                 0,
                 <<"pending handshake queue overflow">>,
                 State#state{
-                    pending_hs = #{initial => [], handshake => []},
+                    pending_hs = #{initial => queue:new(), handshake => queue:new()},
                     pending_hs_bytes = #{initial => 0, handshake => 0}
                 }
             );
         false ->
+            Queued = maps:get(Space, Pending, queue:new()),
             State#state{
-                pending_hs = Pending#{Space => [{Payload, Frames} | maps:get(Space, Pending, [])]},
+                pending_hs = Pending#{Space => queue:in({Payload, Frames}, Queued)},
                 pending_hs_bytes = Bytes#{Space => Held}
             }
     end.
 
-%% Rebuild and resend what the window refused. Re-runs admission, so a
-%% window that reopened only part way stops at the first refusal and
-%% leaves the rest queued in order.
+%% Rebuild and resend what a gate refused, in order.
 -spec drain_pending_hs(#state{}) -> #state{}.
 drain_pending_hs(#state{} = State) ->
     lists:foldl(fun drain_space/2, State, [initial, handshake]).
 
 drain_space(Space, #state{pending_hs = Pending} = State) ->
-    case maps:get(Space, Pending, []) of
-        [] ->
+    Queued = maps:get(Space, Pending, queue:new()),
+    case queue:is_empty(Queued) of
+        true ->
             State;
-        Queued ->
-            Cleared = State#state{
-                pending_hs = Pending#{Space => []},
-                pending_hs_bytes = (State#state.pending_hs_bytes)#{Space => 0}
-            },
-            lists:foldl(
-                fun({Payload, Frames}, Acc) -> send_at_level(Space, Payload, Frames, Acc) end,
-                Cleared,
-                lists:reverse(Queued)
-            )
+        false ->
+            %% The queue is held outside the state for the walk, so a
+            %% refusal re-enqueues into an empty one and is easy to see.
+            %% The byte counter stays as it is and is adjusted per
+            %% packet.
+            drain_one_by_one(Space, Queued, State#state{
+                pending_hs = Pending#{Space => queue:new()}
+            })
+    end.
+
+%% Stop at the first refusal. The gates do not depend on what is being
+%% sent, so a refusal settles everything behind it, and every received
+%% datagram runs a drain: pushing the whole queue through the send path
+%% would rebuild and protect each packet only to have it refused again,
+%% which is CPU a peer could spend for us. Putting the untouched tail
+%% back costs the same whatever its length.
+drain_one_by_one(Space, Queue, State) ->
+    case queue:out(Queue) of
+        {empty, _} ->
+            State;
+        {{value, {Payload, Frames}}, Rest} ->
+            %% Uncount it before the attempt: a refusal goes back
+            %% through enqueue_hs, which counts it again.
+            Bytes = State#state.pending_hs_bytes,
+            Held = max(0, maps:get(Space, Bytes, 0) - iolist_size(Payload)),
+            Sent = send_at_level(
+                Space, Payload, Frames, State#state{pending_hs_bytes = Bytes#{Space => Held}}
+            ),
+            Requeued = maps:get(Space, Sent#state.pending_hs, queue:new()),
+            case queue:is_empty(Requeued) of
+                true ->
+                    drain_one_by_one(Space, Rest, Sent);
+                false ->
+                    Sent#state{
+                        pending_hs = (Sent#state.pending_hs)#{
+                            Space => queue:join(Requeued, Rest)
+                        }
+                    }
+            end
     end.
 
 %% Send an Initial packet.

@@ -24,6 +24,7 @@
     state_for_reset/3,
     state_amp/2,
     amp_counters/1,
+    pending_hs/2,
     state_sending/1,
     state_for_role/1,
     state_for_client/1,
@@ -213,9 +214,14 @@ state_amp(Role, Validated) ->
     #state{role = Role, address_validated = Validated}.
 
 -spec amp_counters(#state{}) -> #{atom() => non_neg_integer()}.
-amp_counters(#state{amp_rx = Rx, amp_tx = Tx, pending_hs = Pending}) ->
-    Deferred = length(maps:get(initial, Pending, [])) + length(maps:get(handshake, Pending, [])),
+amp_counters(#state{amp_rx = Rx, amp_tx = Tx} = State) ->
+    Deferred = length(pending_hs(State, initial)) + length(pending_hs(State, handshake)),
     #{amp_rx => Rx, amp_tx => Tx, deferred => Deferred}.
+
+%% What a space still holds back, in the order it would be sent.
+-spec pending_hs(#state{}, quic_loss:space()) -> [{iodata(), [term()]}].
+pending_hs(#state{pending_hs = Pending}, Space) ->
+    queue:to_list(maps:get(Space, Pending, queue:new())).
 
 %% Minimal #state{} scoped to role for frame-dispatch tests.
 -spec state_for_role(client | server) -> #state{}.
@@ -295,7 +301,6 @@ state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at;
 state_get(#state{} = S, dcid) -> S#state.dcid;
 state_get(#state{} = S, initial_keys) -> S#state.initial_keys;
 state_get(#state{} = S, handshake_keys) -> S#state.handshake_keys;
-state_get(#state{} = S, pending_hs) -> S#state.pending_hs;
 state_get(#state{} = S, handshake_next_pn) -> (S#state.pn_handshake)#pn_space.next_pn;
 state_get(#state{} = S, packets_sent) -> S#state.packets_sent;
 state_get(#state{} = S, amp_tx) -> S#state.amp_tx.

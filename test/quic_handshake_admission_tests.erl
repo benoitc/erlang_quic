@@ -127,6 +127,54 @@ overflowing_the_ceiling_closes_the_connection_test() ->
     ?assertMatch({transport, 16#01, _}, quic_connection_test_support:close_reason(S)),
     ?assertEqual(0, queued(handshake, S)).
 
+%% Every received datagram runs a drain, so a drain that pushes the whole
+%% queue back through the send path lets a peer spend our CPU in
+%% proportion to the flight: each attempt rebuilds and protects a packet
+%% before the gate refuses it again. The first refusal settles the rest,
+%% so that is where the drain stops, and putting the untouched tail back
+%% costs the same whatever its length.
+%%
+%% Reductions over ?DRAINS drains, for a deterministic assertion. Before
+%% the early stop, 64 queued packets cost 536k and 800 cost 6.60M, a
+%% ratio of twelve; after, they cost 13.9k and 12.9k, a ratio of one.
+drain_cost_does_not_follow_the_queue_test_() ->
+    {timeout, 60, fun() ->
+        Shallow = drain_cost(64),
+        Deep = drain_cost(800),
+        ?assert(Deep < Shallow * 2)
+    end}.
+
+%% Enough drains that the queue's one-off internal rebalance, paid once
+%% on the first one, does not stand in for the per-datagram cost.
+-define(DRAINS, 100).
+
+drain_cost(Count) ->
+    Parent = self(),
+    Ref = make_ref(),
+    {_Pid, MRef} = spawn_monitor(fun() ->
+        State = enqueue_flight(blocked_state(), flight(Count)),
+        {reductions, Before} = erlang:process_info(self(), reductions),
+        Drained = lists:foldl(
+            fun(_, Acc) -> quic_connection:drain_pending_hs(Acc) end,
+            State,
+            lists:seq(1, ?DRAINS)
+        ),
+        {reductions, After} = erlang:process_info(self(), reductions),
+        %% The window is shut throughout, so nothing may have left and
+        %% nothing may have been dropped.
+        Count = queued(handshake, Drained),
+        Parent ! {Ref, After - Before}
+    end),
+    receive
+        {Ref, Reductions} ->
+            erlang:demonitor(MRef, [flush]),
+            Reductions;
+        {'DOWN', MRef, process, _, Reason} ->
+            exit({drain_cost_failed, Count, Reason})
+    after 60000 ->
+        exit({drain_cost_timeout, Count})
+    end.
+
 %%====================================================================
 %% Helpers
 %%====================================================================
@@ -191,10 +239,9 @@ blocked_state() ->
 next_pn(State) ->
     quic_connection_test_support:state_get(State, handshake_next_pn).
 
-%% In the order they would be sent. The queue itself is newest-first, so
-%% that a sustained refusal does not append to a growing tail.
+%% In the order they would be sent.
 pending(Space, State) ->
-    lists:reverse(maps:get(Space, quic_connection_test_support:state_get(State, pending_hs), [])).
+    quic_connection_test_support:pending_hs(State, Space).
 
 queued(Space, State) ->
     length(pending(Space, State)).

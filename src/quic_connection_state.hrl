@@ -289,8 +289,8 @@
     %% frames rather than encoded packets so no packet number is spent
     %% until one actually goes out. Drained when an acknowledgement
     %% reopens the window.
-    pending_hs = #{initial => [], handshake => []} :: #{
-        quic_loss:space() => [{iodata(), [term()]}]
+    pending_hs = #{initial => queue:new(), handshake => queue:new()} :: #{
+        quic_loss:space() => queue:queue({iodata(), [term()]})
     },
     %% Payload bytes held in pending_hs, per space, against
     %% ?MAX_PENDING_HS_BYTES.
