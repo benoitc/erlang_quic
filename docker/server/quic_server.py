@@ -83,6 +83,23 @@ class EchoServerProtocol(QuicConnectionProtocol):
             )
 
 
+# In-memory session-ticket store enabling TLS 1.3 resumption and 0-RTT.
+# aioquic issues a NewSessionTicket (advertising max_early_data) only
+# when a session_ticket_handler is configured, and accepts 0-RTT on
+# resumption when the matching ticket comes back from the fetcher.
+# Without it the resumption and 0-RTT interop cases have no peer to run
+# against and skip themselves.
+_SESSION_TICKETS: Dict[bytes, object] = {}
+
+
+def _store_session_ticket(ticket) -> None:
+    _SESSION_TICKETS[ticket.ticket] = ticket
+
+
+def _fetch_session_ticket(label: bytes):
+    return _SESSION_TICKETS.pop(label, None)
+
+
 async def main(
     host: str,
     port: int,
@@ -121,6 +138,8 @@ async def main(
         port,
         configuration=configuration,
         create_protocol=EchoServerProtocol,
+        session_ticket_fetcher=_fetch_session_ticket,
+        session_ticket_handler=_store_session_ticket,
         retry=False,  # Disabled for testing
     )
 

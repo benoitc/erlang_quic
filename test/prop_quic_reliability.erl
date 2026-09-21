@@ -249,7 +249,7 @@ prop_loss_bytes_in_flight() ->
             State = quic_loss:new(),
             {FinalState, _} = lists:foldl(
                 fun(Size, {S, PN}) ->
-                    {quic_loss:on_packet_sent(S, PN, Size, true), PN + 1}
+                    {quic_loss:on_packet_sent(app, S, PN, Size, true), PN + 1}
                 end,
                 {State, 0},
                 Sizes
@@ -267,7 +267,7 @@ prop_loss_rtt_update() ->
             State = quic_loss:new(),
             S1 = quic_loss:update_rtt(State, RTT, 0),
             %% First sample sets smoothed_rtt directly
-            quic_loss:smoothed_rtt(S1) =:= RTT
+            quic_rtt:smoothed(quic_loss:rtt(S1)) =:= RTT
         end
     ).
 
@@ -278,11 +278,11 @@ prop_loss_pto_backoff() ->
         exactly(true),
         begin
             State = quic_loss:new(),
-            PTO0 = quic_loss:get_pto(State),
+            PTO0 = quic_loss:get_pto(State, handshake),
             S1 = quic_loss:on_pto_expired(State),
-            PTO1 = quic_loss:get_pto(S1),
+            PTO1 = quic_loss:get_pto(S1, handshake),
             S2 = quic_loss:on_pto_expired(S1),
-            PTO2 = quic_loss:get_pto(S2),
+            PTO2 = quic_loss:get_pto(S2, handshake),
             PTO1 =:= PTO0 * 2 andalso PTO2 =:= PTO0 * 4
         end
     ).

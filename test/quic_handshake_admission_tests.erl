@@ -1,0 +1,340 @@
+%%% -*- erlang -*-
+%%%
+%%% Handshake packets against the congestion window (RFC 9002 Section 7).
+%%%
+%%% Once Initial and Handshake packets are tracked they count against the
+%%% window like any other, so they have to be admitted like any other.
+%%% What makes that safe is the two exceptions: a refusal holds the
+%%% frames rather than the encoded packet, so no packet number is spent
+%%% and nothing is lost; and a probe is exempt, which is what stops a
+%%% blocked connection deadlocking on its own window.
+%%%
+%%% Copyright (c) 2024-2026 Benoit Chesneau
+%%% Apache License 2.0
+-module(quic_handshake_admission_tests).
+
+-include_lib("eunit/include/eunit.hrl").
+
+%% Must match quic_connection_state.hrl.
+-define(MAX_PENDING_HS_BYTES, 1048576).
+
+%% Payload for the pacing cases, and how long its tokens take to come
+%% back. See paced_out_state/0.
+-define(PACED_PAYLOAD, 4096).
+-define(REFILL_MS, 20).
+
+%% A window with no room refuses, and the refusal costs nothing: the
+%% packet number is still there to be used when the window reopens.
+refusal_does_not_spend_a_packet_number_test() ->
+    S0 = blocked_state(),
+    Before = next_pn(S0),
+    S1 = quic_connection:send_handshake_packet(payload(), frames(), S0),
+    ?assertEqual(Before, next_pn(S1)),
+    ?assertEqual(1, queued(handshake, S1)).
+
+%% The frames are kept, not the encoded packet, so the packet is rebuilt
+%% against whatever the window and packet number are by then.
+refusal_queues_the_frames_test() ->
+    S1 = quic_connection:send_handshake_packet(payload(), frames(), blocked_state()),
+    ?assertEqual([{payload(), frames()}], pending(handshake, S1)).
+
+%% Draining with the window still shut leaves the queue as it was, in
+%% order, rather than dropping what it cannot send.
+drain_into_a_shut_window_keeps_the_queue_test() ->
+    S1 = quic_connection:send_handshake_packet(payload(), frames(), blocked_state()),
+    S2 = quic_connection:send_handshake_packet(<<"second">>, [ping], S1),
+    ?assertEqual(2, queued(handshake, S2)),
+    S3 = quic_connection:drain_pending_hs(S2),
+    ?assertEqual(
+        [{payload(), frames()}, {<<"second">>, [ping]}],
+        pending(handshake, S3)
+    ).
+
+%% A probe ignores the window entirely. Without this a connection whose
+%% window is full of the very packets it needs to probe for could never
+%% send the probe that would free it.
+probe_bypasses_a_shut_window_test() ->
+    S0 = quic_connection_test_support:state_set(blocked_state(), hs_probe, true),
+    S1 = quic_connection:send_handshake_packet(payload(), frames(), S0),
+    ?assertEqual(0, queued(handshake, S1)),
+    ?assertEqual(next_pn(S0) + 1, next_pn(S1)).
+
+%% Each space queues separately: an Initial refusal does not hold up
+%% Handshake, and the drain visits both.
+spaces_queue_separately_test() ->
+    S1 = quic_connection:send_handshake_packet(payload(), frames(), blocked_state()),
+    ?assertEqual(0, queued(initial, S1)),
+    ?assertEqual(1, queued(handshake, S1)).
+
+%% An acknowledgement is not in flight (RFC 9002 Section 2), so it is
+%% not congestion controlled. Holding one back would be worse than
+%% pointless: an acknowledgement is what reopens the peer's window, so a
+%% deferred one can stall the handshake that would unblock the sender,
+%% and nothing would drain it because the drain runs on acknowledgement.
+ack_only_is_never_held_back_test() ->
+    S0 = blocked_state(),
+    Before = next_pn(S0),
+    %% A real ACK frame is well over the four bytes below which a
+    %% payload gets PADDING for header-protection sampling, which would
+    %% put it in flight after all.
+    S1 = quic_connection:send_handshake_packet(
+        <<2, 0, 0, 0, 0, 0>>, [{ack, [{0, 0}], 0, undefined}], S0
+    ),
+    ?assertEqual(0, queued(handshake, S1)),
+    ?assertEqual(Before + 1, next_pn(S1)).
+
+%% A close is not in flight either, and must go out while the window is
+%% shut or the peer is left waiting for a timeout instead.
+connection_close_is_never_held_back_test() ->
+    S0 = blocked_state(),
+    Frame = {connection_close, transport, 0, 0, <<>>},
+    S1 = quic_connection:send_handshake_packet(<<28, 0, 0, 0, 0, 0>>, [Frame], S0),
+    ?assertEqual(0, queued(handshake, S1)).
+
+%% Nothing may be sent at a discarded level, which includes what the
+%% window is still holding: draining it afterwards would put an obsolete
+%% packet on the wire.
+discard_purges_what_the_window_holds_test() ->
+    S1 = quic_connection:send_handshake_packet(payload(), frames(), blocked_state()),
+    ?assertEqual(1, queued(handshake, S1)),
+    S2 = quic_connection:confirm_handshake(S1),
+    ?assertEqual(0, queued(handshake, S2)),
+    ?assertEqual(S2, quic_connection:drain_pending_hs(S2)).
+
+%%====================================================================
+%% Nothing queued is ever dropped
+%%====================================================================
+
+%% CRYPTO is a reliable ordered stream: dropping any fragment leaves a
+%% gap the peer can never fill, and the oldest is the prefix everything
+%% behind it waits on. A large certificate chain legitimately runs to
+%% far more packets than a typical flight, so the queue has to hold all
+%% of it, in order.
+a_large_flight_is_never_truncated_test() ->
+    Flight = flight(64),
+    S = enqueue_flight(blocked_state(), Flight),
+    ?assertEqual(Flight, pending(handshake, S)).
+
+%% The ceiling exists only against a local fault, so it sits far above
+%% any real flight and is stated in bytes: what matters is the memory a
+%% stuck queue holds, not how many packets it took to get there.
+a_large_flight_stays_far_below_the_ceiling_test() ->
+    Bytes = lists:sum([iolist_size(P) || {P, _F} <- flight(64)]),
+    ?assert(Bytes * 8 < ?MAX_PENDING_HS_BYTES).
+
+%% Past the ceiling this endpoint is malfunctioning, so it closes rather
+%% than growing without bound. Closing is checked by the reason, not by
+%% the queue being empty, which a silent drop would also produce.
+overflowing_the_ceiling_closes_the_connection_test() ->
+    S = enqueue_until_closed(blocked_state(), (?MAX_PENDING_HS_BYTES div 1200) + 2),
+    %% INTERNAL_ERROR, not an empty queue: a silent drop would leave the
+    %% queue empty too, and that is the bug this replaced.
+    ?assertMatch({transport, 16#01, _}, quic_connection_test_support:close_reason(S)),
+    ?assertEqual(0, queued(handshake, S)).
+
+%% Every received datagram runs a drain, so a drain that pushes the whole
+%% queue back through the send path lets a peer spend our CPU in
+%% proportion to the flight: each attempt rebuilds and protects a packet
+%% before the gate refuses it again. The first refusal settles the rest,
+%% so that is where the drain stops, and putting the untouched tail back
+%% costs the same whatever its length.
+%%
+%% Reductions over ?DRAINS drains, for a deterministic assertion. Before
+%% the early stop, 64 queued packets cost 536k and 800 cost 6.60M, a
+%% ratio of twelve; after, they cost 13.9k and 12.9k, a ratio of one.
+drain_cost_does_not_follow_the_queue_test_() ->
+    {timeout, 60, fun() ->
+        Shallow = drain_cost(64),
+        Deep = drain_cost(800),
+        ?assert(Deep < Shallow * 2)
+    end}.
+
+%% Enough drains that the queue's one-off internal rebalance, paid once
+%% on the first one, does not stand in for the per-datagram cost.
+-define(DRAINS, 100).
+
+drain_cost(Count) ->
+    Parent = self(),
+    Ref = make_ref(),
+    {_Pid, MRef} = spawn_monitor(fun() ->
+        State = enqueue_flight(blocked_state(), flight(Count)),
+        {reductions, Before} = erlang:process_info(self(), reductions),
+        Drained = lists:foldl(
+            fun(_, Acc) -> quic_connection:drain_pending_hs(Acc) end,
+            State,
+            lists:seq(1, ?DRAINS)
+        ),
+        {reductions, After} = erlang:process_info(self(), reductions),
+        %% The window is shut throughout, so nothing may have left and
+        %% nothing may have been dropped.
+        Count = queued(handshake, Drained),
+        Parent ! {Ref, After - Before}
+    end),
+    receive
+        {Ref, Reductions} ->
+            erlang:demonitor(MRef, [flush]),
+            Reductions;
+        {'DOWN', MRef, process, _, Reason} ->
+            exit({drain_cost_failed, Count, Reason})
+    after 60000 ->
+        exit({drain_cost_timeout, Count})
+    end.
+
+%%====================================================================
+%% A pacing refusal has to schedule its own retry
+%%====================================================================
+
+%% The congestion window reopens on acknowledgement, and something is
+%% always in flight while it is shut, so a window refusal already has a
+%% retry coming. Pacing has neither: it refuses with nothing in flight,
+%% and then no acknowledgement is on its way. Without a timer the flight
+%% sits there until the handshake times out.
+pacing_refusal_arms_a_timer_test() ->
+    S0 = paced_out_state(),
+    ?assertEqual(undefined, pacing_timer(S0)),
+    S1 = quic_connection:send_handshake_packet(paced_payload(), paced_frames(), S0),
+    ?assertEqual(1, queued(handshake, S1)),
+    ?assertNotEqual(undefined, pacing_timer(S1)).
+
+%% The handshake queue is not the application send queue, so a handler
+%% that looks only at the latter has nothing to do and the flight stays
+%% put.
+pacing_timeout_drains_the_handshake_queue_test() ->
+    S1 = quic_connection:send_handshake_packet(paced_payload(), paced_frames(), paced_out_state()),
+    ?assertEqual(1, queued(handshake, S1)),
+    %% Tokens refill with the clock.
+    timer:sleep(?REFILL_MS),
+    S2 = quic_connection:handle_pacing_timeout(S1),
+    ?assertEqual(0, queued(handshake, S2)),
+    ?assertEqual(next_pn(S1) + 1, next_pn(S2)).
+
+%% The early handshake runs in `idle' and `handshaking', not
+%% `connected', so a guard that accepts the timeout only there drops
+%% every retry the handshake schedules.
+pacing_timeout_is_handled_before_connected_test() ->
+    Drained = fun(StateName) ->
+        S1 = quic_connection:send_handshake_packet(
+            paced_payload(), paced_frames(), paced_out_state()
+        ),
+        1 = queued(handshake, S1),
+        timer:sleep(?REFILL_MS),
+        {keep_state, S2} = quic_connection:handle_common_event(
+            info, {pacing_timeout, pacing_timer(S1)}, StateName, S1
+        ),
+        queued(handshake, S2)
+    end,
+    ?assertEqual(0, Drained(idle)),
+    ?assertEqual(0, Drained(handshaking)),
+    ?assertEqual(0, Drained(connected)).
+
+%%====================================================================
+%% Helpers
+%%====================================================================
+
+%% Distinct CRYPTO offsets, so a gap in the drained order is visible
+%% rather than hidden by identical payloads.
+flight(Count) ->
+    [
+        begin
+            Payload = <<"crypto-", (integer_to_binary(I))/binary>>,
+            {Payload, [{crypto, I * 1000, Payload}]}
+        end
+     || I <- lists:seq(0, Count - 1)
+    ].
+
+%% Stops at the close, so a run that never closes leaves close_reason
+%% undefined rather than looking like a pass.
+enqueue_until_closed(State, 0) ->
+    State;
+enqueue_until_closed(State, Budget) ->
+    case quic_connection_test_support:close_reason(State) of
+        undefined ->
+            Payload = binary:copy(<<"c">>, 1200),
+            enqueue_until_closed(
+                quic_connection:send_handshake_packet(
+                    Payload, [{crypto, 0, Payload}], State
+                ),
+                Budget - 1
+            );
+        _Closed ->
+            State
+    end.
+
+enqueue_flight(State, Flight) ->
+    lists:foldl(
+        fun({Payload, Frames}, Acc) ->
+            quic_connection:send_handshake_packet(Payload, Frames, Acc)
+        end,
+        State,
+        Flight
+    ).
+
+payload() -> <<"handshake-crypto-payload">>.
+
+frames() -> [{crypto, 0, <<"handshake-crypto-payload">>}].
+
+%% A connection whose congestion window is entirely spoken for, so
+%% admission refuses anything above the control allowance. The peer
+%% address is validated, which takes the amplification budget out of it:
+%% these cases are about the window.
+blocked_state() ->
+    S = quic_connection_test_support:state_sending(
+        quic_connection_test_support:state_with_keys(server)
+    ),
+    CC = quic_cc:new(#{algorithm => newreno, initial_window => 1200}),
+    quic_connection_test_support:state_set(
+        quic_connection_test_support:state_set(S, address_validated, true),
+        cc_state,
+        quic_cc:on_packet_sent(CC, 100000)
+    ).
+
+%% A connection whose window is wide open but whose pacing tokens are
+%% spent, so the pacer is the only thing refusing.
+%%
+%% Tokens refill with the clock, so the packet has to be big enough that
+%% the microseconds between draining them and the send cannot cover it:
+%% at this rate ?PACED_PAYLOAD takes about ten milliseconds to afford,
+%% and the ?REFILL_MS the drain cases wait is twice that.
+paced_out_state() ->
+    S = quic_connection_test_support:state_sending(
+        quic_connection_test_support:state_with_keys(server)
+    ),
+    CC = spend_pacing_tokens(
+        quic_cc:update_pacing_rate(
+            quic_cc:new(#{
+                algorithm => newreno, initial_window => 1000000, max_datagram_size => 1500
+            }),
+            3000
+        ),
+        100
+    ),
+    quic_connection_test_support:state_set(
+        quic_connection_test_support:state_set(S, address_validated, true),
+        cc_state,
+        CC
+    ).
+
+spend_pacing_tokens(CC, 0) ->
+    CC;
+spend_pacing_tokens(CC, Budget) ->
+    case quic_cc:send_check(CC, 2000, 0) of
+        {ok, Next} -> spend_pacing_tokens(Next, Budget - 1);
+        _Blocked -> CC
+    end.
+
+paced_payload() -> binary:copy(<<"c">>, ?PACED_PAYLOAD).
+
+paced_frames() -> [{crypto, 0, paced_payload()}].
+
+pacing_timer(State) ->
+    quic_connection_test_support:state_get(State, pacing_timer).
+
+next_pn(State) ->
+    quic_connection_test_support:state_get(State, handshake_next_pn).
+
+%% In the order they would be sent.
+pending(Space, State) ->
+    quic_connection_test_support:pending_hs(State, Space).
+
+queued(Space, State) ->
+    length(pending(Space, State)).

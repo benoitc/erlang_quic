@@ -38,7 +38,7 @@ pto_after(State, N) ->
         State,
         lists:seq(1, N)
     ),
-    quic_loss:get_pto(Expired).
+    quic_loss:get_pto(Expired, handshake).
 
 series(State, Upto) ->
     [pto_after(State, N) || N <- lists:seq(1, Upto)].
@@ -69,7 +69,7 @@ a_long_loss_streak_stays_at_the_cap_test() ->
 
 backoff_still_doubles_below_the_cap_test() ->
     State = settled(50),
-    Base = quic_loss:get_pto(State),
+    Base = quic_loss:get_pto(State, handshake),
     ?assert(Base * 2 < ?MAX_PTO_MS),
     %% Each step is exactly twice the last for as long as there is room.
     ?assertEqual(Base * 2, pto_after(State, 1)),
@@ -87,7 +87,7 @@ first_expiration_is_not_clamped_on_a_fast_path_test() ->
 
 unexpired_pto_is_untouched_test() ->
     State = settled(50),
-    ?assert(quic_loss:get_pto(State) < ?MAX_PTO_MS),
+    ?assert(quic_loss:get_pto(State, handshake) < ?MAX_PTO_MS),
     ?assertEqual(0, quic_loss:pto_count(State)).
 
 %%====================================================================

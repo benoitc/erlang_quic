@@ -46,6 +46,9 @@
     update_pacing_rate/2,
     update_mtu/2,
     cwnd/1,
+    initial_window/1,
+    on_packets_discarded/2,
+    reset_for_retry/1,
     ssthresh/1,
     bytes_in_flight/1,
     can_send/2,
@@ -112,6 +115,9 @@
     ecn_ce_counter = 0 :: non_neg_integer(),
 
     %% Configuration
+    %% The window this controller started with. cwnd evolves away from it,
+    %% so without keeping it a reset cannot restore the configured value.
+    initial_window :: non_neg_integer(),
     minimum_window :: non_neg_integer(),
     max_datagram_size :: non_neg_integer(),
 
@@ -174,7 +180,7 @@
 -spec new(quic_cc:cc_opts()) -> cc_state().
 new(Opts) ->
     MaxDatagramSize = maps:get(max_datagram_size, Opts, ?MAX_DATAGRAM_SIZE),
-    DefaultWindow = initial_window(MaxDatagramSize),
+    DefaultWindow = default_initial_window(MaxDatagramSize),
     DefaultMinimumWindow = minimum_window(MaxDatagramSize),
     ConfiguredMinimumWindow =
         case maps:find(minimum_window, Opts) of
@@ -207,6 +213,7 @@ new(Opts) ->
     ),
     #cc_state{
         cwnd = InitialWindow,
+        initial_window = InitialWindow,
         ssthresh = infinity,
         minimum_window = ConfiguredMinimumWindow,
         max_datagram_size = MaxDatagramSize,
@@ -762,6 +769,31 @@ ecn_ce_counter(#cc_state{ecn_ce_counter = C}) -> C.
 -spec cwnd(cc_state()) -> non_neg_integer().
 cwnd(#cc_state{cwnd = Cwnd}) -> Cwnd.
 
+%% @doc Drop bytes for a discarded packet number space. Not a
+%% congestion event: no window or recovery change.
+-spec on_packets_discarded(cc_state(), non_neg_integer()) -> cc_state().
+on_packets_discarded(#cc_state{bytes_in_flight = B} = State, Bytes) ->
+    State#cc_state{bytes_in_flight = max(0, B - Bytes)}.
+
+%% @doc Start over after a Retry, keeping every configured value.
+-spec reset_for_retry(cc_state()) -> cc_state().
+reset_for_retry(#cc_state{initial_window = IW} = State) ->
+    State#cc_state{
+        cwnd = IW,
+        bytes_in_flight = 0,
+        ssthresh = infinity,
+        in_recovery = false,
+        recovery_start_time = undefined,
+        first_sent_time = undefined,
+        ecn_ce_counter = 0,
+        pacing_tokens = State#cc_state.pacing_max_burst,
+        pacing_rate = 0
+    }.
+
+%% @doc The window this controller was configured with.
+-spec initial_window(cc_state()) -> non_neg_integer().
+initial_window(#cc_state{initial_window = IW}) -> IW.
+
 %% @doc Get the slow start threshold.
 -spec ssthresh(cc_state()) -> non_neg_integer() | infinity.
 ssthresh(#cc_state{ssthresh = SST}) -> SST.
@@ -1131,7 +1163,7 @@ refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now) ->
 %% Calculate initial window
 %% Use 32 packets like quic-go for better initial throughput
 %% RFC 9002 suggests min(10*mds, max(14720, 2*mds)) but larger is common in practice
-initial_window(MaxDatagramSize) ->
+default_initial_window(MaxDatagramSize) ->
     32 * MaxDatagramSize.
 
 %% Calculate minimum window

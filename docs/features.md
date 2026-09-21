@@ -68,8 +68,27 @@ path's congestion controller.
 
 ### Loss Detection
 - [x] Packet loss detection
-- [x] Probe timeout (PTO)
+- [x] Per-packet-number-space recovery (RFC 9002 Appendix A): each space keeps
+  its own sent packets and loss state, while the RTT estimate, the probe
+  backoff and bytes in flight stay connection-wide
+- [x] Probe timeout (PTO), armed for one space at a time and probing at that
+  encryption level. The application space is not armed until the handshake is
+  confirmed (Section 6.2.1), an endpoint over its anti-amplification limit arms
+  nothing, and a client with nothing in flight and an unvalidated address arms
+  the anti-deadlock probe
+- [x] Packet number space discard on key discard (Section 6.4), removing those
+  packets from both the loss tracker and the congestion controller
+- [x] Handshake packets are admitted against the congestion window like any
+  other (Section 7). A refusal holds the frames rather than the encoded packet,
+  so no packet number is spent, and probes are exempt
+- [x] Recovery and congestion state reset on Retry (Section 6.3), preserving the
+  data to resend and the controller's configuration
 - [x] RTT measurement (smoothed RTT, RTT variance)
+
+The probe interval is capped at 5 seconds, which RFC 9002's unbounded
+exponential backoff does not require; this is a deliberate bound on how late a
+probe may arrive. Time-threshold loss detection runs on acknowledgement rather
+than from its own timer.
 
 ### Congestion Control
 - [x] Pluggable congestion control behavior
@@ -393,17 +412,19 @@ mark known gaps that may land in a later release.
 
 ## Interop Runner Compliance
 
-All 10 QUIC Interop Runner test cases pass:
+All 10 QUIC Interop Runner test cases pass against the external runner.
+The `Covered by` column says which of them `quic_interop_SUITE` also
+checks here, so the table is not taken on trust:
 
-| Test Case | Status |
-|-----------|--------|
-| handshake | Pass |
-| transfer | Pass |
-| retry | Pass |
-| keyupdate | Pass |
-| chacha20 | Pass |
-| multiconnect | Pass |
-| v2 | Pass |
-| resumption | Pass |
-| zerortt | Pass |
-| connectionmigration | Pass |
+| Test Case | Status | Covered by quic_interop_SUITE |
+|-----------|--------|-------------------------------|
+| handshake | Pass | yes |
+| transfer | Pass | yes |
+| retry | Pass | no |
+| keyupdate | Pass | no, nothing exposes the key phase to assert on |
+| chacha20 | Pass | yes |
+| multiconnect | Pass | yes |
+| v2 | Pass | yes |
+| resumption | Pass | yes |
+| zerortt | Pass | yes, early data sent, accepted and answered |
+| connectionmigration | Pass | yes, data echoed over the new path |

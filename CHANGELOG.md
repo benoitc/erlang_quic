@@ -41,7 +41,7 @@ All notable changes to this project will be documented in this file.
   counter bookkeeping is updated once for the run:
   `quic_cc:send_check_run/4` approves the run against cwnd and pacing
   in one step (never more permissive than the sequential checks),
-  `quic_cc:on_packets_sent/2` and `quic_loss:on_packets_sent_run/3`
+  `quic_cc:on_packets_sent/2` and `quic_loss:on_packets_sent_run/4`
   fold it into one record update each (native for NewReno, a fold for
   other algorithms). The per-packet connection-state rebuild was the
   largest own-time item on the bulk-send profile; a 64-packet run

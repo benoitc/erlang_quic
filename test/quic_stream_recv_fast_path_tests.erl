@@ -103,13 +103,10 @@ reference_pn_space_recv(PN, PNSpace, Now) ->
 empty_pn_space() ->
     #pn_space{
         next_pn = 0,
-        largest_acked = undefined,
         largest_recv = undefined,
         recv_time = undefined,
         ack_ranges = [],
-        ack_eliciting_in_flight = 0,
-        loss_time = undefined,
-        sent_packets = #{}
+        ack_eliciting_in_flight = 0
     }.
 
 pn_space_matches_reference_test_() ->

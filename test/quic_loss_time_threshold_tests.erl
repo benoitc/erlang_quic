@@ -19,6 +19,7 @@
 -module(quic_loss_time_threshold_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("quic.hrl").
 
 %% Must match quic_loss.
 -define(TIME_THRESHOLD, 1.125).
@@ -32,9 +33,18 @@
 %% Helpers
 %%====================================================================
 
-%% One in-flight packet sent at ?SENT_AT.
+%% One in-flight packet sent at ?SENT_AT, with a later one acknowledged
+%% so it has been overtaken: a packet nothing has overtaken has no
+%% time-threshold deadline (RFC 9002 Appendix A.10).
 with_inflight_packet(State) ->
-    quic_loss:on_packet_sent(State, 1, 1200, true, [], ?SENT_AT).
+    S1 = quic_loss:on_packet_sent(app, State, 1, 1200, true, [], ?SENT_AT),
+    %% Not ack-eliciting, so acknowledging it takes no RTT sample and
+    %% leaves the estimate each case sets up untouched.
+    S2 = quic_loss:on_packet_sent(app, S1, 2, 1200, false, [], ?SENT_AT),
+    {S3, _Acked, _Lost, _Meta} = quic_loss:on_ack_received(
+        app, S2, {ack, 2, 0, 0, []}, ?SENT_AT
+    ),
+    S3.
 
 %% Feed RTT samples in order.
 samples(State, Rtts) ->
@@ -43,7 +53,6 @@ samples(State, Rtts) ->
 %% The delay actually applied, recovered from the returned loss time.
 applied_delay(State) ->
     {LossTime, _Space} = quic_loss:get_loss_time_and_space(State),
-    ?assertNotEqual(undefined, LossTime),
     LossTime - ?SENT_AT.
 
 expected_delay(Rtt) ->
@@ -55,15 +64,15 @@ expected_delay(Rtt) ->
 
 spike_leaves_latest_above_smoothed_test() ->
     State = samples(quic_loss:new(), [20, 400]),
-    ?assertEqual(400, quic_loss:latest_rtt(State)),
+    ?assertEqual(400, quic_rtt:latest(quic_loss:rtt(State))),
     %% The EWMA lags the spike, otherwise the assertions below would not
     %% distinguish the two thresholds.
-    ?assert(quic_loss:smoothed_rtt(State) < 400).
+    ?assert(quic_rtt:smoothed(quic_loss:rtt(State)) < 400).
 
 decay_leaves_smoothed_above_latest_test() ->
     State = samples(quic_loss:new(), [400, 20]),
-    ?assertEqual(20, quic_loss:latest_rtt(State)),
-    ?assert(quic_loss:smoothed_rtt(State) > 20).
+    ?assertEqual(20, quic_rtt:latest(quic_loss:rtt(State))),
+    ?assert(quic_rtt:smoothed(quic_loss:rtt(State)) > 20).
 
 %%====================================================================
 %% Loss time threshold
@@ -71,8 +80,8 @@ decay_leaves_smoothed_above_latest_test() ->
 
 delay_follows_latest_rtt_when_it_exceeds_smoothed_test() ->
     State = with_inflight_packet(samples(quic_loss:new(), [20, 400])),
-    SRTT = quic_loss:smoothed_rtt(State),
-    Latest = quic_loss:latest_rtt(State),
+    SRTT = quic_rtt:smoothed(quic_loss:rtt(State)),
+    Latest = quic_rtt:latest(quic_loss:rtt(State)),
     ?assertEqual(expected_delay(Latest), applied_delay(State)),
     %% Explicitly not the smoothed-only value, which is what an
     %% EWMA-only threshold would produce.
@@ -80,8 +89,8 @@ delay_follows_latest_rtt_when_it_exceeds_smoothed_test() ->
 
 delay_follows_smoothed_rtt_when_it_exceeds_latest_test() ->
     State = with_inflight_packet(samples(quic_loss:new(), [400, 20])),
-    SRTT = quic_loss:smoothed_rtt(State),
-    Latest = quic_loss:latest_rtt(State),
+    SRTT = quic_rtt:smoothed(quic_loss:rtt(State)),
+    Latest = quic_rtt:latest(quic_loss:rtt(State)),
     ?assertEqual(expected_delay(SRTT), applied_delay(State)),
     ?assertNotEqual(expected_delay(Latest), applied_delay(State)).
 
@@ -89,8 +98,8 @@ delay_equals_both_when_rtt_is_stable_test() ->
     %% With a flat RTT the two estimates coincide and the max() is a
     %% no-op; the threshold must not drift.
     State = with_inflight_packet(samples(quic_loss:new(), [50, 50, 50])),
-    ?assertEqual(50, quic_loss:latest_rtt(State)),
-    ?assertEqual(50, quic_loss:smoothed_rtt(State)),
+    ?assertEqual(50, quic_rtt:latest(quic_loss:rtt(State))),
+    ?assertEqual(50, quic_rtt:smoothed(quic_loss:rtt(State))),
     ?assertEqual(expected_delay(50), applied_delay(State)).
 
 delay_floors_at_granularity_test() ->
@@ -101,7 +110,34 @@ delay_floors_at_granularity_test() ->
 
 no_in_flight_packet_has_no_loss_time_test() ->
     State = samples(quic_loss:new(), [50]),
-    ?assertEqual({undefined, initial}, quic_loss:get_loss_time_and_space(State)).
+    ?assertEqual(none, quic_loss:get_loss_time_and_space(State)).
+
+%%====================================================================
+%% The deadline the timer is armed for
+%%====================================================================
+
+%% get_loss_time_and_space/1 arms the timer for TimeSent + LossDelay.
+%% Detection has to agree with it at that exact instant: if it only
+%% fires strictly after, the timer expires, declares nothing, recomputes
+%% the same deadline and re-arms at zero, spinning until the clock moves.
+loss_is_declared_at_the_deadline_test() ->
+    State = with_inflight_packet(samples(quic_loss:new(), [100])),
+    {Deadline, app} = quic_loss:get_loss_time_and_space(State),
+    {_S, _Acked, Lost, _Meta} = quic_loss:on_ack_received(
+        app, State, {ack, 2, 0, 0, []}, Deadline
+    ),
+    ?assertEqual([1], [PN || #sent_packet{pn = PN} <- Lost]).
+
+%% The fence: one millisecond earlier the deadline has not arrived and
+%% nothing may be declared, otherwise the comparison has merely moved
+%% the spurious-loss problem a tick earlier.
+loss_is_not_declared_before_the_deadline_test() ->
+    State = with_inflight_packet(samples(quic_loss:new(), [100])),
+    {Deadline, app} = quic_loss:get_loss_time_and_space(State),
+    {_S, _Acked, Lost, _Meta} = quic_loss:on_ack_received(
+        app, State, {ack, 2, 0, 0, []}, Deadline - 1
+    ),
+    ?assertEqual([], Lost).
 
 %%====================================================================
 %% What the threshold is for: not declaring loss on an RTT spike
@@ -122,10 +158,10 @@ spike_scenario(SpreadMs, SampleMs) ->
     Now = erlang:monotonic_time(millisecond),
     Sent = Now - SampleMs,
     S0 = quic_loss:update_rtt(quic_loss:new(), 20, 0),
-    S1 = quic_loss:on_packet_sent(S0, 3, 1200, true, [], Sent - SpreadMs),
-    S2 = quic_loss:on_packet_sent(S1, 4, 1200, true, [], Sent - SpreadMs),
-    S3 = quic_loss:on_packet_sent(S2, 5, 1200, true, [], Sent),
-    quic_loss:on_ack_received(S3, {ack, 5, 0, 0, []}, Now).
+    S1 = quic_loss:on_packet_sent(app, S0, 3, 1200, true, [], Sent - SpreadMs),
+    S2 = quic_loss:on_packet_sent(app, S1, 4, 1200, true, [], Sent - SpreadMs),
+    S3 = quic_loss:on_packet_sent(app, S2, 5, 1200, true, [], Sent),
+    quic_loss:on_ack_received(app, S3, {ack, 5, 0, 0, []}, Now).
 
 a_spike_does_not_declare_the_earlier_flight_lost_test() ->
     %% Settled at 20 ms, then a 400 ms sample. The earlier packets are

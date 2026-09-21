@@ -14,7 +14,7 @@
 
 new_state_test() ->
     State = quic_loss:new(),
-    ?assertEqual(#{}, quic_loss:sent_packets(State)),
+    ?assertEqual(#{}, quic_loss:sent_packets(app, State)),
     ?assertEqual(0, quic_loss:bytes_in_flight(State)),
     ?assertEqual(0, quic_loss:pto_count(State)).
 
@@ -28,22 +28,22 @@ new_state_with_opts_test() ->
 
 on_packet_sent_test() ->
     State = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(State, 0, 1200, true),
+    S1 = quic_loss:on_packet_sent(app, State, 0, 1200, true),
     ?assertEqual(1200, quic_loss:bytes_in_flight(S1)),
-    Sent = quic_loss:sent_packets(S1),
+    Sent = quic_loss:sent_packets(app, S1),
     ?assert(maps:is_key(0, Sent)).
 
 on_packet_sent_multiple_test() ->
     State = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(State, 0, 1000, true),
-    S2 = quic_loss:on_packet_sent(S1, 1, 500, true),
-    S3 = quic_loss:on_packet_sent(S2, 2, 300, true),
+    S1 = quic_loss:on_packet_sent(app, State, 0, 1000, true),
+    S2 = quic_loss:on_packet_sent(app, S1, 1, 500, true),
+    S3 = quic_loss:on_packet_sent(app, S2, 2, 300, true),
     ?assertEqual(1800, quic_loss:bytes_in_flight(S3)),
-    ?assertEqual(3, maps:size(quic_loss:sent_packets(S3))).
+    ?assertEqual(3, maps:size(quic_loss:sent_packets(app, S3))).
 
 non_ack_eliciting_no_bytes_test() ->
     State = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(State, 0, 100, false),
+    S1 = quic_loss:on_packet_sent(app, State, 0, 100, false),
     ?assertEqual(0, quic_loss:bytes_in_flight(S1)).
 
 %%====================================================================
@@ -53,24 +53,24 @@ non_ack_eliciting_no_bytes_test() ->
 initial_rtt_test() ->
     State = quic_loss:new(),
     %% Default initial RTT is 100ms (more aggressive than RFC 9002's 333ms)
-    ?assertEqual(100, quic_loss:smoothed_rtt(State)).
+    ?assertEqual(100, quic_rtt:smoothed(quic_loss:rtt(State))).
 
 first_rtt_sample_test() ->
     State = quic_loss:new(),
     S1 = quic_loss:update_rtt(State, 100, 0),
-    ?assertEqual(100, quic_loss:smoothed_rtt(S1)),
-    ?assertEqual(50, quic_loss:rtt_var(S1)),
-    ?assertEqual(100, quic_loss:min_rtt(S1)),
-    ?assertEqual(100, quic_loss:latest_rtt(S1)).
+    ?assertEqual(100, quic_rtt:smoothed(quic_loss:rtt(S1))),
+    ?assertEqual(50, quic_rtt:var(quic_loss:rtt(S1))),
+    ?assertEqual(100, quic_rtt:min(quic_loss:rtt(S1))),
+    ?assertEqual(100, quic_rtt:latest(quic_loss:rtt(S1))).
 
 rtt_update_test() ->
     State = quic_loss:new(),
     S1 = quic_loss:update_rtt(State, 100, 0),
     S2 = quic_loss:update_rtt(S1, 120, 0),
     %% smoothed_rtt = 7/8 * 100 + 1/8 * 120 = 102.5 -> 102
-    ?assertEqual(102, quic_loss:smoothed_rtt(S2)),
-    ?assertEqual(100, quic_loss:min_rtt(S2)),
-    ?assertEqual(120, quic_loss:latest_rtt(S2)).
+    ?assertEqual(102, quic_rtt:smoothed(quic_loss:rtt(S2))),
+    ?assertEqual(100, quic_rtt:min(quic_loss:rtt(S2))),
+    ?assertEqual(120, quic_rtt:latest(quic_loss:rtt(S2))).
 
 rtt_with_ack_delay_test() ->
     State = quic_loss:new(),
@@ -79,15 +79,15 @@ rtt_with_ack_delay_test() ->
     S2 = quic_loss:update_rtt(S1, 150, 30),
     %% adjusted_rtt = 150 - 30 = 120 (since 150 > 100 + 30)
     %% But ACK delay is capped at max_ack_delay (25ms default)
-    ?assert(quic_loss:smoothed_rtt(S2) > 100).
+    ?assert(quic_rtt:smoothed(quic_loss:rtt(S2)) > 100).
 
 min_rtt_updates_test() ->
     State = quic_loss:new(),
     S1 = quic_loss:update_rtt(State, 100, 0),
     S2 = quic_loss:update_rtt(S1, 80, 0),
-    ?assertEqual(80, quic_loss:min_rtt(S2)),
+    ?assertEqual(80, quic_rtt:min(quic_loss:rtt(S2))),
     S3 = quic_loss:update_rtt(S2, 120, 0),
-    ?assertEqual(80, quic_loss:min_rtt(S3)).
+    ?assertEqual(80, quic_rtt:min(quic_loss:rtt(S3))).
 
 %%====================================================================
 %% PTO Tests
@@ -98,32 +98,32 @@ initial_pto_test() ->
     %% Initial: smoothed_rtt=100, rtt_var=50, max_ack_delay=25.
     %% Before confirmation max_ack_delay is left out:
     %% PTO = 100 + max(4*50, 1) = 300
-    ?assertEqual(300, quic_loss:get_pto(State)),
+    ?assertEqual(300, quic_loss:get_pto(State, handshake)),
     %% After it: PTO = 100 + 200 + 25 = 325
-    ?assertEqual(325, quic_loss:get_pto(quic_loss:on_handshake_confirmed(State))).
+    ?assertEqual(325, quic_loss:get_pto(quic_loss:on_handshake_confirmed(State), app)).
 
 pto_after_rtt_sample_test() ->
     State = quic_loss:new(),
     S1 = quic_loss:update_rtt(State, 50, 0),
     %% smoothed_rtt=50, rtt_var=25, max_ack_delay=25.
     %% Before confirmation: PTO = 50 + max(4*25, 1) = 150
-    ?assertEqual(150, quic_loss:get_pto(S1)),
+    ?assertEqual(150, quic_loss:get_pto(S1, handshake)),
     %% After it: PTO = 50 + 100 + 25 = 175
-    ?assertEqual(175, quic_loss:get_pto(quic_loss:on_handshake_confirmed(S1))).
+    ?assertEqual(175, quic_loss:get_pto(quic_loss:on_handshake_confirmed(S1), app)).
 
 pto_exponential_backoff_test() ->
     State = quic_loss:new(),
     S1 = quic_loss:update_rtt(State, 100, 0),
-    PTO0 = quic_loss:get_pto(S1),
+    PTO0 = quic_loss:get_pto(S1, handshake),
 
     S2 = quic_loss:on_pto_expired(S1),
     ?assertEqual(1, quic_loss:pto_count(S2)),
-    PTO1 = quic_loss:get_pto(S2),
+    PTO1 = quic_loss:get_pto(S2, handshake),
     ?assertEqual(PTO0 * 2, PTO1),
 
     S3 = quic_loss:on_pto_expired(S2),
     ?assertEqual(2, quic_loss:pto_count(S3)),
-    PTO2 = quic_loss:get_pto(S3),
+    PTO2 = quic_loss:get_pto(S3, handshake),
     ?assertEqual(PTO0 * 4, PTO2).
 
 %% Test that PTO count is NOT reset on packet send
@@ -133,11 +133,11 @@ pto_not_reset_on_packet_sent_test() ->
     S1 = quic_loss:on_pto_expired(State),
     ?assertEqual(1, quic_loss:pto_count(S1)),
     %% Sending a packet should NOT reset PTO count
-    S2 = quic_loss:on_packet_sent(S1, 0, 100, true, []),
+    S2 = quic_loss:on_packet_sent(app, S1, 0, 100, true, []),
     ?assertEqual(1, quic_loss:pto_count(S2)),
     %% PTO count should only reset on ACK
     Now = erlang:monotonic_time(millisecond) + 50,
-    {S3, _, _, _} = quic_loss:on_ack_received(S2, {ack, 0, 0, 0, []}, Now),
+    {S3, _, _, _} = quic_loss:on_ack_received(app, S2, {ack, 0, 0, 0, []}, Now),
     ?assertEqual(0, quic_loss:pto_count(S3)).
 
 %%====================================================================
@@ -146,35 +146,35 @@ pto_not_reset_on_packet_sent_test() ->
 
 ack_single_packet_test() ->
     State = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(State, 0, 1000, true),
+    S1 = quic_loss:on_packet_sent(app, State, 0, 1000, true),
     AckFrame = {ack, 0, 0, 0, []},
     Now = erlang:monotonic_time(millisecond) + 50,
-    {S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(S1, AckFrame, Now),
+    {S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(app, S1, AckFrame, Now),
     ?assertEqual(1, length(Acked)),
     ?assertEqual(0, length(Lost)),
     ?assertEqual(0, quic_loss:bytes_in_flight(S2)).
 
 ack_multiple_packets_test() ->
     State = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(State, 0, 500, true),
-    S2 = quic_loss:on_packet_sent(S1, 1, 500, true),
-    S3 = quic_loss:on_packet_sent(S2, 2, 500, true),
+    S1 = quic_loss:on_packet_sent(app, State, 0, 500, true),
+    S2 = quic_loss:on_packet_sent(app, S1, 1, 500, true),
+    S3 = quic_loss:on_packet_sent(app, S2, 2, 500, true),
     % Acks 0, 1, 2
     AckFrame = {ack, 2, 0, 2, []},
     Now = erlang:monotonic_time(millisecond) + 50,
-    {S4, Acked, _Lost, _Meta} = quic_loss:on_ack_received(S3, AckFrame, Now),
+    {S4, Acked, _Lost, _Meta} = quic_loss:on_ack_received(app, S3, AckFrame, Now),
     ?assertEqual(3, length(Acked)),
     ?assertEqual(0, quic_loss:bytes_in_flight(S4)).
 
 ack_updates_rtt_test() ->
     State = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(State, 0, 500, true),
+    S1 = quic_loss:on_packet_sent(app, State, 0, 500, true),
     timer:sleep(10),
     Now = erlang:monotonic_time(millisecond),
     AckFrame = {ack, 0, 0, 0, []},
-    {S2, _Acked, _Lost, _Meta} = quic_loss:on_ack_received(S1, AckFrame, Now),
+    {S2, _Acked, _Lost, _Meta} = quic_loss:on_ack_received(app, S1, AckFrame, Now),
     %% RTT should be updated from the sample
-    ?assert(quic_loss:latest_rtt(S2) >= 10).
+    ?assert(quic_rtt:latest(quic_loss:rtt(S2)) >= 10).
 
 %%====================================================================
 %% Loss Detection Tests
@@ -185,7 +185,7 @@ loss_by_packet_threshold_test() ->
     %% Send packets 0-5
     S1 = lists:foldl(
         fun(PN, Acc) ->
-            quic_loss:on_packet_sent(Acc, PN, 100, true)
+            quic_loss:on_packet_sent(app, Acc, PN, 100, true)
         end,
         State,
         lists:seq(0, 5)
@@ -195,7 +195,7 @@ loss_by_packet_threshold_test() ->
     %% With packet threshold of 3, packets 0, 1, 2 should be lost
     AckFrame = {ack, 5, 0, 0, []},
     Now = erlang:monotonic_time(millisecond) + 1000,
-    {_S2, _Acked, Lost, _Meta} = quic_loss:on_ack_received(S1, AckFrame, Now),
+    {_S2, _Acked, Lost, _Meta} = quic_loss:on_ack_received(app, S1, AckFrame, Now),
 
     %% Packets 0, 1, 2 should be lost (5 - 3 = 2)
     LostPNs = [P#sent_packet.pn || P <- Lost],
@@ -208,15 +208,22 @@ loss_by_packet_threshold_test() ->
 %%====================================================================
 
 get_loss_time_no_packets_test() ->
-    State = quic_loss:new(),
-    {LossTime, _Space} = quic_loss:get_loss_time_and_space(State),
-    ?assertEqual(undefined, LossTime).
+    ?assertEqual(none, quic_loss:get_loss_time_and_space(quic_loss:new())).
+
+%% A packet nothing has overtaken has no time-threshold deadline: until
+%% an acknowledgement names a higher packet number there is no evidence
+%% it was lost, and the probe timer covers it instead.
+get_loss_time_needs_an_acknowledgement_test() ->
+    S1 = quic_loss:on_packet_sent(app, quic_loss:new(), 0, 100, true),
+    ?assertEqual(none, quic_loss:get_loss_time_and_space(S1)).
 
 get_loss_time_with_packets_test() ->
-    State = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(State, 0, 100, true),
-    {LossTime, _Space} = quic_loss:get_loss_time_and_space(S1),
-    ?assertNotEqual(undefined, LossTime).
+    S1 = quic_loss:on_packet_sent(app, quic_loss:new(), 0, 100, true),
+    S2 = quic_loss:on_packet_sent(app, S1, 1, 100, true),
+    {S3, _Acked, _Lost, _Meta} = quic_loss:on_ack_received(
+        app, S2, {ack, 1, 0, 0, []}, erlang:monotonic_time(millisecond)
+    ),
+    ?assertMatch({_LossTime, app}, quic_loss:get_loss_time_and_space(S3)).
 
 %%====================================================================
 %% Integration Tests
@@ -226,15 +233,15 @@ full_cycle_test() ->
     State = quic_loss:new(),
 
     %% Send some packets
-    S1 = quic_loss:on_packet_sent(State, 0, 1000, true),
-    S2 = quic_loss:on_packet_sent(S1, 1, 1000, true),
+    S1 = quic_loss:on_packet_sent(app, State, 0, 1000, true),
+    S2 = quic_loss:on_packet_sent(app, S1, 1, 1000, true),
     ?assertEqual(2000, quic_loss:bytes_in_flight(S2)),
 
     %% Wait and receive ACK
     timer:sleep(10),
     Now = erlang:monotonic_time(millisecond),
     AckFrame = {ack, 1, 0, 1, []},
-    {S3, Acked, _Lost, _Meta} = quic_loss:on_ack_received(S2, AckFrame, Now),
+    {S3, Acked, _Lost, _Meta} = quic_loss:on_ack_received(app, S2, AckFrame, Now),
 
     ?assertEqual(2, length(Acked)),
     ?assertEqual(0, quic_loss:bytes_in_flight(S3)),
@@ -246,10 +253,10 @@ full_cycle_test() ->
 
 ack_ecn_test() ->
     State = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(State, 0, 500, true),
+    S1 = quic_loss:on_packet_sent(app, State, 0, 500, true),
     AckFrame = {ack_ecn, 0, 0, 0, [], 10, 20, 5},
     Now = erlang:monotonic_time(millisecond) + 50,
-    {S2, Acked, _Lost, _Meta} = quic_loss:on_ack_received(S1, AckFrame, Now),
+    {S2, Acked, _Lost, _Meta} = quic_loss:on_ack_received(app, S1, AckFrame, Now),
     ?assertEqual(1, length(Acked)),
     ?assertEqual(0, quic_loss:bytes_in_flight(S2)).
 
@@ -260,24 +267,24 @@ ack_ecn_test() ->
 on_packet_sent_with_frames_test() ->
     State = quic_loss:new(),
     Frames = [{stream, 0, 0, <<"hello">>, false}, ping],
-    S1 = quic_loss:on_packet_sent(State, 0, 100, true, Frames),
-    Sent = quic_loss:sent_packets(S1),
+    S1 = quic_loss:on_packet_sent(app, State, 0, 100, true, Frames),
+    Sent = quic_loss:sent_packets(app, S1),
     ?assert(maps:is_key(0, Sent)),
     Packet = maps:get(0, Sent),
     ?assertEqual(Frames, Packet#sent_packet.frames).
 
 on_packet_sent_empty_frames_test() ->
     State = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(State, 0, 100, true, []),
-    Sent = quic_loss:sent_packets(S1),
+    S1 = quic_loss:on_packet_sent(app, State, 0, 100, true, []),
+    Sent = quic_loss:sent_packets(app, S1),
     Packet = maps:get(0, Sent),
     ?assertEqual([], Packet#sent_packet.frames).
 
 on_packet_sent_backward_compatible_test() ->
     %% Test that on_packet_sent/4 still works (calls /5 with empty frames)
     State = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(State, 0, 100, true),
-    Sent = quic_loss:sent_packets(S1),
+    S1 = quic_loss:on_packet_sent(app, State, 0, 100, true),
+    Sent = quic_loss:sent_packets(app, S1),
     Packet = maps:get(0, Sent),
     ?assertEqual([], Packet#sent_packet.frames).
 
@@ -393,7 +400,7 @@ stream_has_unacked_below_empty_test() ->
 stream_has_unacked_below_test() ->
     S0 = quic_loss:new(),
     %% In-flight STREAM data for stream 4 starting at offset 50.
-    S1 = quic_loss:on_packet_sent(S0, 0, 100, true, [{stream, 4, 50, <<"a">>, false}]),
+    S1 = quic_loss:on_packet_sent(app, S0, 0, 100, true, [{stream, 4, 50, <<"a">>, false}]),
     ?assert(quic_loss:stream_has_unacked_below(S1, 4, 100)),
     ?assert(quic_loss:stream_has_unacked_below(S1, 4, 51)),
     %% Boundary at/below the frame's start offset is not "below".
@@ -404,5 +411,5 @@ stream_has_unacked_below_test() ->
 
 stream_has_unacked_below_ignores_non_stream_test() ->
     S0 = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(S0, 0, 50, true, [ping, {max_data, 1000}]),
+    S1 = quic_loss:on_packet_sent(app, S0, 0, 50, true, [ping, {max_data, 1000}]),
     ?assertNot(quic_loss:stream_has_unacked_below(S1, 12, 100)).

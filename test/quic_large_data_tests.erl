@@ -238,7 +238,7 @@ loss_many_packets_in_flight_test() ->
     %% Send many packets
     S1 = lists:foldl(
         fun(PN, Acc) ->
-            quic_loss:on_packet_sent(Acc, PN, 1200, true)
+            quic_loss:on_packet_sent(app, Acc, PN, 1200, true)
         end,
         State,
         lists:seq(0, NumPackets - 1)
@@ -250,7 +250,7 @@ loss_many_packets_in_flight_test() ->
     %% ACK all packets
     AckFrame = {ack, NumPackets - 1, 0, NumPackets - 1, []},
     Now = erlang:monotonic_time(millisecond),
-    {S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(S1, AckFrame, Now),
+    {S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(app, S1, AckFrame, Now),
 
     ?assertEqual(NumPackets, length(Acked)),
     ?assertEqual(0, length(Lost)),
@@ -263,7 +263,7 @@ loss_detection_with_gaps_test() ->
     %% Send packets 0-9
     S1 = lists:foldl(
         fun(PN, Acc) ->
-            quic_loss:on_packet_sent(Acc, PN, 1200, true)
+            quic_loss:on_packet_sent(app, Acc, PN, 1200, true)
         end,
         State,
         lists:seq(0, 9)
@@ -273,7 +273,7 @@ loss_detection_with_gaps_test() ->
     %% With packet threshold of 3, packets 0,1,2 should be marked lost
     AckFrame = {ack, 9, 0, 4, []},
     Now = erlang:monotonic_time(millisecond) + 100,
-    {_S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(S1, AckFrame, Now),
+    {_S2, Acked, Lost, _Meta} = quic_loss:on_ack_received(app, S1, AckFrame, Now),
 
     ?assertEqual(5, length(Acked)),
     %% Packets 0, 1, 2 should be lost (9 - 3 = 6, so 0-2 are lost)
@@ -289,11 +289,11 @@ loss_rtt_calculation_under_load_test() ->
     %% Send packet and get ACK multiple times
     FinalState = lists:foldl(
         fun(N, Acc) ->
-            S1 = quic_loss:on_packet_sent(Acc, N, 100, true),
+            S1 = quic_loss:on_packet_sent(app, Acc, N, 100, true),
             timer:sleep(1),
             Now = erlang:monotonic_time(millisecond),
             AckFrame = {ack, N, 0, 0, []},
-            {S2, _, _, _} = quic_loss:on_ack_received(S1, AckFrame, Now),
+            {S2, _, _, _} = quic_loss:on_ack_received(app, S1, AckFrame, Now),
             S2
         end,
         State,
@@ -301,7 +301,7 @@ loss_rtt_calculation_under_load_test() ->
     ),
 
     %% RTT should be reasonable
-    SRTT = quic_loss:smoothed_rtt(FinalState),
+    SRTT = quic_rtt:smoothed(quic_loss:rtt(FinalState)),
     ?assert(SRTT >= 1),
     ?assert(SRTT < 1000).
 
@@ -399,7 +399,7 @@ simulated_large_transfer_test() ->
             case quic_cc:can_send(CC, PacketSize) of
                 true ->
                     CC1 = quic_cc:on_packet_sent(CC, PacketSize),
-                    Loss1 = quic_loss:on_packet_sent(Loss, PN, PacketSize, true),
+                    Loss1 = quic_loss:on_packet_sent(app, Loss, PN, PacketSize, true),
 
                     %% Simulate ACK for most packets, loss for some
                     case PN rem 100 of

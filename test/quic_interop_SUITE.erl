@@ -44,7 +44,7 @@
 
     %% Crypto tests
     initial_keys_derivation/1,
-    key_update/1,
+    local_key_schedule/1,
 
     %% Connection tests
     connection_close/1,
@@ -54,6 +54,14 @@
     stream_data_transfer/1,
     bidirectional_stream/1,
     unidirectional_stream/1,
+
+    %% Interop Runner cases the matrix in docs/features.md claims
+    chacha20/1,
+    multiconnect/1,
+    version_2/1,
+    resumption/1,
+    zero_rtt/1,
+    connection_migration/1,
 
     %% Local tests (no network)
     local_packet_roundtrip/1,
@@ -65,6 +73,9 @@
 %% Timeout for handshake (ms)
 -define(HANDSHAKE_TIMEOUT, 5000).
 -define(STREAM_TIMEOUT, 10000).
+
+-define(MIGRATION_BEFORE, <<"before the migration">>).
+-define(MIGRATION_AFTER, <<"after the migration">>).
 
 %%====================================================================
 %% CT Callbacks
@@ -80,7 +91,8 @@ all() ->
         {group, crypto_tests},
         {group, handshake_tests},
         {group, connection_tests},
-        {group, stream_tests}
+        {group, stream_tests},
+        {group, runner_tests}
     ].
 
 groups() ->
@@ -89,6 +101,7 @@ groups() ->
             local_packet_roundtrip,
             local_frame_roundtrip,
             local_key_derivation,
+            local_key_schedule,
             local_connection_state
         ]},
         {packet_tests, [sequence], [
@@ -111,6 +124,14 @@ groups() ->
             stream_data_transfer,
             bidirectional_stream,
             unidirectional_stream
+        ]},
+        {runner_tests, [sequence], [
+            chacha20,
+            multiconnect,
+            version_2,
+            resumption,
+            zero_rtt,
+            connection_migration
         ]}
     ].
 
@@ -126,6 +147,12 @@ end_per_suite(_Config) ->
 
 init_per_group(handshake_tests, Config) ->
     %% Check if at least one server is reachable
+    Servers = proplists:get_value(quic_servers, Config, []),
+    case check_any_server_reachable(Servers) of
+        true -> Config;
+        false -> {skip, "No QUIC servers reachable"}
+    end;
+init_per_group(runner_tests, Config) ->
     Servers = proplists:get_value(quic_servers, Config, []),
     case check_any_server_reachable(Servers) of
         true -> Config;
@@ -415,7 +442,7 @@ initial_keys_derivation(_Config) ->
 
     {comment, "Initial keys derivation and encryption works"}.
 
-key_update(_Config) ->
+local_key_schedule(_Config) ->
     ct:comment("Test TLS 1.3 key schedule"),
 
     %% Generate ECDHE shared secret
@@ -576,6 +603,178 @@ do_idle_timeout_test(Host, Port) ->
     after 10000 ->
         quic:close(ConnRef, normal),
         ct:fail(idle_timeout_not_triggered)
+    end.
+
+%%====================================================================
+%% Interop Runner cases
+%%
+%% docs/features.md claims these pass against external peers. They were
+%% asserted there without a test in this suite, so each row now has one
+%% and each asserts the mechanism it names rather than that a connection
+%% happened: a case that stops exercising its feature has to fail.
+%%====================================================================
+
+%% The peer negotiates ChaCha20-Poly1305 when it is the only cipher
+%% offered, which exercises a different AEAD and header protection than
+%% the AES default every other case uses.
+chacha20(Config) ->
+    ct:comment("ChaCha20-Poly1305 against an external peer"),
+    with_server(aioquic, Config, fun do_chacha20/2).
+
+do_chacha20(Host, Port) ->
+    %% Offering only ChaCha20 is the assertion: a handshake that
+    %% completes cannot have used anything else.
+    Opts = (interop_opts())#{ciphers => [chacha20_poly1305]},
+    {ok, Conn} = connect(Host, Port, Opts),
+    _ = await_connected(Conn, Host, Port),
+    quic:close(Conn, normal),
+    {comment, "handshake completed with chacha20_poly1305 as the only offer"}.
+
+%% Several sequential connections to the same peer. Catches state that
+%% leaks between connections in one VM, which a single-connection case
+%% cannot see.
+multiconnect(Config) ->
+    ct:comment("Sequential connections against an external peer"),
+    with_server(aioquic, Config, fun do_multiconnect/2).
+
+do_multiconnect(Host, Port) ->
+    Conns = [
+        begin
+            {ok, C} = connect(Host, Port, interop_opts()),
+            _ = await_connected(C, Host, Port),
+            quic:close(C, normal),
+            ok
+        end
+     || _ <- lists:seq(1, 4)
+    ],
+    ?assertEqual([ok, ok, ok, ok], Conns),
+    {comment, "4 sequential connections"}.
+
+%% RFC 9369: the peer answers version 2 rather than negotiating back to
+%% version 1.
+version_2(Config) ->
+    ct:comment("QUIC version 2 against an external peer"),
+    with_server(aioquic, Config, fun do_version_2/2).
+
+do_version_2(Host, Port) ->
+    Opts = (interop_opts())#{version => ?QUIC_VERSION_2},
+    {ok, Conn} = connect(Host, Port, Opts),
+    _ = await_connected(Conn, Host, Port),
+    {_StateName, Map} = quic_connection:get_state(Conn),
+    quic:close(Conn, normal),
+    ?assertEqual(?QUIC_VERSION_2, maps:get(version, Map)),
+    {comment, "handshake completed on version 2"}.
+
+%% RFC 9001 Section 4.6: a ticket from the first connection resumes the
+%% second, which has to be a PSK handshake rather than a fresh one.
+resumption(Config) ->
+    ct:comment("Session resumption against an external peer"),
+    skippable(fun() -> with_server(aioquic, Config, fun do_resumption/2) end).
+
+do_resumption(Host, Port) ->
+    {ok, First} = connect(Host, Port, interop_opts()),
+    _ = await_connected(First, Host, Port),
+    Ticket = await_ticket(First),
+    quic:close(First, normal),
+    case Ticket of
+        undefined -> throw({skip, "peer issued no session ticket"});
+        _ -> ok
+    end,
+    {ok, Second} = connect(Host, Port, (interop_opts())#{session_ticket => Ticket}),
+    _ = await_connected(Second, Host, Port),
+    %% Early keys exist only where a pre-shared key was used, so their
+    %% presence is what distinguishes a resumed handshake from a fresh
+    %% one that merely succeeded.
+    Resumed = quic:has_early_keys(Second),
+    quic:close(Second, normal),
+    ?assert(Resumed),
+    {comment, "second handshake resumed"}.
+
+%% The ticket is delivered to the owner rather than polled for.
+await_ticket(Conn) ->
+    receive
+        {quic, Conn, {session_ticket, Ticket}} -> Ticket
+    after 5000 -> undefined
+    end.
+
+%% RFC 9001 Section 4.6.1: early data reaches the peer on the resumed
+%% connection, before its handshake completes.
+zero_rtt(Config) ->
+    ct:comment("0-RTT against an external peer"),
+    skippable(fun() -> with_server(aioquic, Config, fun do_zero_rtt/2) end).
+
+do_zero_rtt(Host, Port) ->
+    {ok, First} = connect(Host, Port, interop_opts()),
+    _ = await_connected(First, Host, Port),
+    Ticket = await_ticket(First),
+    quic:close(First, normal),
+    case Ticket of
+        undefined ->
+            throw({skip, "peer issued no session ticket"});
+        _ ->
+            ok
+    end,
+    {ok, Conn} = connect(Host, Port, (interop_opts())#{session_ticket => Ticket}),
+    %% Written before the handshake completes, so it goes out in 0-RTT
+    %% packets: waiting for `connected' first would send it at 1-RTT and
+    %% prove nothing about early data.
+    {ok, StreamId} = quic:open_stream(Conn),
+    Early = <<"zero rtt payload">>,
+    ok = quic:send_data(Conn, StreamId, Early, true),
+    _ = await_connected(Conn, Host, Port),
+    Accepted = quic:early_data_accepted(Conn),
+    {ok, Stats} = quic_connection:get_stats(Conn),
+    Echo = wait_for_stream_data(Conn, StreamId, ?STREAM_TIMEOUT),
+    quic:close(Conn, normal),
+    %% The peer echoed the empty early_data extension, so acceptance is
+    %% known rather than `unknown'.
+    ?assertEqual(true, Accepted),
+    %% The stream really carried 0-RTT-encrypted bytes and kept them: a
+    %% rejection clears this.
+    ?assert(maps:get(zero_rtt_streams, Stats) >= 1),
+    %% And the peer acted on them.
+    ?assertEqual({ok, Early}, Echo),
+    {comment, "early data sent, accepted and answered"}.
+
+%% RFC 9000 Section 9: the connection survives a local address change
+%% and keeps carrying data on the new path.
+connection_migration(Config) ->
+    ct:comment("Connection migration against an external peer"),
+    skippable(fun() -> with_server(aioquic, Config, fun do_connection_migration/2) end).
+
+do_connection_migration(Host, Port) ->
+    {ok, Conn} = connect(Host, Port, interop_opts()),
+    _ = await_connected(Conn, Host, Port),
+    %% A fence on the old path, so a migration that carries nothing is
+    %% told apart from a peer that was never answering.
+    ?assertEqual({ok, ?MIGRATION_BEFORE}, echo(Conn, ?MIGRATION_BEFORE)),
+    %% Migrating needs a connection ID the old path has not used
+    %% (Section 9.5), and the peer's arrives just after the handshake.
+    ?assert(quic_connection_test_support:await_spare_cid(Conn, 5000)),
+    ?assertEqual(ok, quic:migrate(Conn)),
+    %% The point of Section 9 is that the connection keeps carrying
+    %% data, which opening a stream locally does not show.
+    ?assertEqual({ok, ?MIGRATION_AFTER}, echo(Conn, ?MIGRATION_AFTER)),
+    quic:close(Conn, normal),
+    {comment, "data echoed over the new path"}.
+
+%% One request/response on a fresh stream.
+echo(Conn, Payload) ->
+    {ok, StreamId} = quic:open_stream(Conn),
+    ok = quic:send_data(Conn, StreamId, Payload, true),
+    wait_for_stream_data(Conn, StreamId, ?STREAM_TIMEOUT).
+
+interop_opts() ->
+    #{verify => false, alpn => [<<"hq-interop">>, <<"h3">>]}.
+
+%% A case that depends on the peer offering something optional says so
+%% rather than failing: not every peer configuration issues tickets, and
+%% a red run there would say nothing about this code.
+skippable(Fun) ->
+    try
+        Fun()
+    catch
+        throw:{skip, _} = Skip -> Skip
     end.
 
 %%====================================================================

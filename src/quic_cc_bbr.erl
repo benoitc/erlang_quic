@@ -51,6 +51,9 @@
     update_pacing_rate/2,
     update_mtu/2,
     cwnd/1,
+    initial_window/1,
+    on_packets_discarded/2,
+    reset_for_retry/1,
     ssthresh/1,
     bytes_in_flight/1,
     can_send/2,
@@ -189,6 +192,10 @@
     ecn_ce_counter = 0 :: non_neg_integer(),
 
     %% Configuration
+    %% The window this controller started with. cwnd evolves away from
+    %% it, so without keeping it a reset cannot restore the configured
+    %% value.
+    initial_window = 0 :: non_neg_integer(),
     max_datagram_size = ?MAX_DATAGRAM_SIZE :: pos_integer(),
     minimum_window = 2400 :: non_neg_integer(),
     min_recovery_duration = 100 :: non_neg_integer(),
@@ -265,6 +272,7 @@ new(Opts) ->
         pacing_gain = ?STARTUP_PACING_GAIN,
         cwnd_gain = ?DEFAULT_CWND_GAIN,
         cwnd = InitialCwnd,
+        initial_window = InitialCwnd,
         initial_rtt = InitialRtt,
         max_bw = InitialMaxBw,
         pacing_rate = InitialPacingRate,
@@ -710,6 +718,30 @@ update_mtu(#bbr_state{max_datagram_size = OldMDS, minimum_window = OldMinWin} = 
 %% @doc Get the current congestion window.
 -spec cwnd(cc_state()) -> non_neg_integer().
 cwnd(#bbr_state{cwnd = Cwnd}) -> Cwnd.
+
+%% @doc Drop bytes for a discarded packet number space. Not a
+%% congestion event: no window or recovery change.
+-spec on_packets_discarded(cc_state(), non_neg_integer()) -> cc_state().
+on_packets_discarded(#bbr_state{bytes_in_flight = B} = State, Bytes) ->
+    State#bbr_state{bytes_in_flight = max(0, B - Bytes)}.
+
+%% @doc Start over after a Retry, keeping every configured value.
+-spec reset_for_retry(cc_state()) -> cc_state().
+reset_for_retry(#bbr_state{initial_window = IW} = State) ->
+    State#bbr_state{
+        cwnd = IW,
+        bytes_in_flight = 0,
+        in_recovery = false,
+        recovery_start_time = 0,
+        ecn_ce_counter = 0,
+        prior_cwnd = 0,
+        pacing_tokens = State#bbr_state.pacing_max_burst,
+        pacing_rate = 0
+    }.
+
+%% @doc The window this controller was configured with.
+-spec initial_window(cc_state()) -> non_neg_integer().
+initial_window(#bbr_state{initial_window = IW}) -> IW.
 
 %% @doc Get the slow start threshold.
 %% BBR doesn't use ssthresh; returns infinity.

@@ -9,6 +9,7 @@
 
 -export([
     state_with_loss/1,
+    state_with_loss/2,
     state_get/2,
     state_set/3,
     check_flow_control/6,
@@ -23,8 +24,11 @@
     state_for_reset/3,
     state_amp/2,
     amp_counters/1,
+    pending_hs/2,
+    state_sending/1,
     state_for_role/1,
     state_for_client/1,
+    state_with_keys/1,
     close_reason/1,
     state_for_server/3,
     state_with_pn_app/2,
@@ -156,13 +160,10 @@ state_with_pn_app(State, Largest) ->
     State#state{
         pn_app = #pn_space{
             next_pn = 0,
-            largest_acked = undefined,
             largest_recv = Largest,
             recv_time = 0,
             ack_ranges = [{0, Largest}],
-            ack_eliciting_in_flight = 0,
-            loss_time = undefined,
-            sent_packets = #{}
+            ack_eliciting_in_flight = 0
         },
         transport_params = #{max_ack_delay => 25}
     }.
@@ -213,8 +214,14 @@ state_amp(Role, Validated) ->
     #state{role = Role, address_validated = Validated}.
 
 -spec amp_counters(#state{}) -> #{atom() => non_neg_integer()}.
-amp_counters(#state{amp_rx = Rx, amp_tx = Tx, amp_deferred = Deferred}) ->
-    #{amp_rx => Rx, amp_tx => Tx, deferred => length(Deferred)}.
+amp_counters(#state{amp_rx = Rx, amp_tx = Tx} = State) ->
+    Deferred = length(pending_hs(State, initial)) + length(pending_hs(State, handshake)),
+    #{amp_rx => Rx, amp_tx => Tx, deferred => Deferred}.
+
+%% What a space still holds back, in the order it would be sent.
+-spec pending_hs(#state{}, quic_loss:space()) -> [{iodata(), [term()]}].
+pending_hs(#state{pending_hs = Pending}, Space) ->
+    queue:to_list(maps:get(Space, Pending, queue:new())).
 
 %% Minimal #state{} scoped to role for frame-dispatch tests.
 -spec state_for_role(client | server) -> #state{}.
@@ -224,6 +231,31 @@ state_for_role(Role) ->
         app_keys = undefined,
         max_streams_bidi_local = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = ?DEFAULT_MAX_STREAMS_UNI
+    }.
+
+%% A #state{} holding real Initial and Handshake keys, for the
+%% key-discard hooks. The two key pairs are derived the same way; these
+%% cases only care whether they are present.
+-spec state_with_keys(client | server) -> #state{}.
+state_with_keys(Role) ->
+    Keys = quic_connection:derive_initial_keys(<<"discard-cid">>, ?QUIC_VERSION_1),
+    #state{
+        role = Role,
+        scid = <<"own-cid0">>,
+        dcid = <<"peer-cid">>,
+        pn_handshake = #pn_space{
+            next_pn = 0,
+            largest_recv = undefined,
+            recv_time = undefined,
+            ack_ranges = [],
+            ack_eliciting_in_flight = 0
+        },
+        coalesce = true,
+        initial_keys = Keys,
+        handshake_keys = Keys,
+        app_keys = Keys,
+        loss_state = quic_loss:new(),
+        cc_state = quic_cc:new(#{})
     }.
 
 -spec state_for_client({inet:ip_address(), inet:port_number()}) -> #state{}.
@@ -253,11 +285,26 @@ state_closing(State, Reason) -> State#state{close_reason = Reason}.
 -spec state_with_socket(#state{}, gen_udp:socket()) -> #state{}.
 state_with_socket(State, Socket) -> State#state{socket = Socket}.
 
+%% A state whose sends reach a real socket, aimed at the discard port.
+%% Tests that assert a packet went out need the send to succeed rather
+%% than fall over a missing socket; the socket is owned by the calling
+%% test process and goes with it.
+-spec state_sending(#state{}) -> #state{}.
+state_sending(State) ->
+    {ok, Socket} = gen_udp:open(0, [binary, {active, false}]),
+    State#state{socket = Socket, remote_addr = {{127, 0, 0, 1}, 9}}.
+
 %% Minimal #state{} carrying a caller-supplied loss tracker, for tests
 %% that need to observe what an incoming frame does to it.
 state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
 state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at;
-state_get(#state{} = S, dcid) -> S#state.dcid.
+state_get(#state{} = S, dcid) -> S#state.dcid;
+state_get(#state{} = S, initial_keys) -> S#state.initial_keys;
+state_get(#state{} = S, handshake_keys) -> S#state.handshake_keys;
+state_get(#state{} = S, handshake_next_pn) -> (S#state.pn_handshake)#pn_space.next_pn;
+state_get(#state{} = S, packets_sent) -> S#state.packets_sent;
+state_get(#state{} = S, amp_tx) -> S#state.amp_tx;
+state_get(#state{} = S, pacing_timer) -> S#state.pacing_timer.
 
 state_set(#state{} = S, loss_state, V) ->
     S#state{loss_state = V};
@@ -270,7 +317,24 @@ state_set(#state{} = S, dcid, V) ->
 state_set(#state{} = S, retry_scid, V) ->
     S#state{retry_scid = V};
 state_set(#state{} = S, transport_params, V) ->
-    S#state{transport_params = V}.
+    S#state{transport_params = V};
+state_set(#state{} = S, cc_state, V) ->
+    S#state{cc_state = V};
+state_set(#state{} = S, hs_probe, V) ->
+    S#state{hs_probe = V};
+state_set(#state{} = S, address_validated, V) ->
+    S#state{address_validated = V};
+state_set(#state{} = S, amp_rx, V) ->
+    S#state{amp_rx = V}.
+
+%% A #state{} carrying a loss tracker, for the space whose timer is
+%% under test. The application space is only reachable once the handshake
+%% is confirmed (RFC 9002 Section 6.2.1), so asking for `app' confirms it.
+-spec state_with_loss(quic_loss:loss_state(), quic_loss:space()) -> #state{}.
+state_with_loss(LossState, app) ->
+    state_with_loss(quic_loss:on_handshake_confirmed(LossState));
+state_with_loss(LossState, _Space) ->
+    state_with_loss(LossState).
 
 -spec state_with_loss(quic_loss:loss_state()) -> #state{}.
 state_with_loss(LossState) ->
@@ -424,13 +488,10 @@ coalesce_small_stream(DataSize) ->
 decimate_initial_state() ->
     PN = #pn_space{
         next_pn = 0,
-        largest_acked = undefined,
         largest_recv = undefined,
         recv_time = undefined,
         ack_ranges = [],
-        ack_eliciting_in_flight = 0,
-        loss_time = undefined,
-        sent_packets = #{}
+        ack_eliciting_in_flight = 0
     },
     #state{
         pn_app = PN,

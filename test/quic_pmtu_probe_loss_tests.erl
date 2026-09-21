@@ -36,10 +36,10 @@ now_ms() ->
 %% A probe is registered with an empty frames list, exactly as
 %% send_pmtu_probe_packet does, which makes it non-ack-eliciting.
 send_probe(State, PN, Now) ->
-    quic_loss:on_packet_sent(State, PN, ?PROBE_SIZE, false, [], Now).
+    quic_loss:on_packet_sent(app, State, PN, ?PROBE_SIZE, false, [], Now).
 
 send_data(State, PN, Now) ->
-    quic_loss:on_packet_sent(State, PN, ?DATA_SIZE, true, [{ping}], Now).
+    quic_loss:on_packet_sent(app, State, PN, ?DATA_SIZE, true, [{ping}], Now).
 
 probe_adds_no_bytes_in_flight_test() ->
     S0 = quic_loss:new(),
@@ -49,7 +49,7 @@ probe_adds_no_bytes_in_flight_test() ->
 acked_probe_is_seen_but_counts_nothing_test() ->
     Now = now_ms(),
     S0 = send_probe(quic_loss:new(), 0, Now),
-    {S1, Acked, Lost, Meta} = quic_loss:on_ack_received(S0, ack(0, 0), Now + 20),
+    {S1, Acked, Lost, Meta} = quic_loss:on_ack_received(app, S0, ack(0, 0), Now + 20),
     %% The PMTU ack hook folds over the acked list, so the probe must
     %% appear there even though it elicits nothing locally.
     ?assertEqual([0], [P#sent_packet.pn || P <- Acked]),
@@ -66,7 +66,7 @@ lost_probe_is_seen_but_is_not_a_congestion_signal_test() ->
     S1 = send_data(S0, 1, Now + 1),
     S2 = send_data(S1, 2, Now + 2),
     S3 = send_data(S2, 3, Now + 3),
-    {S4, Acked, Lost, Meta} = quic_loss:on_ack_received(S3, ack(3, 2), Now + 30),
+    {S4, Acked, Lost, Meta} = quic_loss:on_ack_received(app, S3, ack(3, 2), Now + 30),
     ?assertEqual([1, 2, 3], lists:sort([P#sent_packet.pn || P <- Acked])),
     %% The PMTU lost hook folds over the lost list, so the probe must
     %% appear there...
@@ -84,7 +84,7 @@ lost_data_still_signals_congestion_test() ->
     S1 = send_data(S0, 1, Now + 1),
     S2 = send_data(S1, 2, Now + 2),
     S3 = send_data(S2, 3, Now + 3),
-    {_S4, _Acked, Lost, Meta} = quic_loss:on_ack_received(S3, ack(3, 2), Now + 30),
+    {_S4, _Acked, Lost, Meta} = quic_loss:on_ack_received(app, S3, ack(3, 2), Now + 30),
     ?assertEqual([0], [P#sent_packet.pn || P <- Lost]),
     ?assertEqual(?DATA_SIZE, maps:get(lost_bytes, Meta)),
     ?assertNotEqual(undefined, maps:get(largest_lost_sent_time, Meta)).

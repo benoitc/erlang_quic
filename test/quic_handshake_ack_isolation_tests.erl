@@ -34,9 +34,9 @@
 loss_with_three_inflight() ->
     Now = erlang:monotonic_time(millisecond),
     S0 = quic_loss:new(),
-    S1 = quic_loss:on_packet_sent(S0, 0, ?PACKET_BYTES, true, [], Now),
-    S2 = quic_loss:on_packet_sent(S1, 1, ?PACKET_BYTES, true, [], Now + 1),
-    quic_loss:on_packet_sent(S2, 2, ?PACKET_BYTES, true, [], Now + 2).
+    S1 = quic_loss:on_packet_sent(app, S0, 0, ?PACKET_BYTES, true, [], Now),
+    S2 = quic_loss:on_packet_sent(app, S1, 1, ?PACKET_BYTES, true, [], Now + 1),
+    quic_loss:on_packet_sent(app, S2, 2, ?PACKET_BYTES, true, [], Now + 2).
 
 %% Each call stamps the in-flight packets with the current clock, so a
 %% test comparing a before and an after snapshot must build the state
@@ -61,8 +61,8 @@ snapshot(State) ->
     L = quic_connection_test_support:loss_state(State),
     #{
         in_flight => quic_loss:bytes_in_flight(L),
-        sent => quic_loss:sent_packets(L),
-        oldest => quic_loss:oldest_unacked(L),
+        sent => quic_loss:sent_packets(app, L),
+        oldest => quic_loss:oldest_unacked(app, L),
         pto_count => quic_loss:pto_count(L)
     }.
 

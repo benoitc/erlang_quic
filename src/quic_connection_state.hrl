@@ -9,6 +9,12 @@
 %% retransmission semantics.
 -define(PTO_RESET_TOLERANCE_MS, 2).
 
+%% Most handshake bytes per space the congestion window may hold back at
+%% once. A large certificate chain runs to tens of kilobytes and a
+%% post-quantum key exchange to more, so this sits far above any real
+%% flight: reaching it means this endpoint is malfunctioning.
+-define(MAX_PENDING_HS_BYTES, 1048576).
+
 %% ACK packet tolerance for 1-RTT (RFC 9002 §6.2).
 %% The receiver SHOULD send an ACK frame in response to at least every
 %% second ack-eliciting packet. 2 is the RFC floor; higher values trade
@@ -37,19 +43,10 @@
     address_validated = false :: boolean(),
     %% RFC 9000 §8.1 anti-amplification (server, pre-validation). Cap
     %% bytes sent to <= 3x bytes received until the peer's address is
-    %% validated; datagrams over budget are deferred (held verbatim) and
-    %% flushed when more is received or the address becomes validated.
+    %% validated; a datagram over budget is held in pending_hs and tried
+    %% again when more is received or the address becomes validated.
     amp_rx = 0 :: non_neg_integer(),
     amp_tx = 0 :: non_neg_integer(),
-    amp_deferred = [] :: [iodata()],
-    %% Client-side: the Initial CRYPTO frame (ClientHello) buffered so a
-    %% stalled handshake can re-send it, and the retransmission attempt
-    %% count for backoff. See ?HS_RTX_* and retransmit_initial_flight/1.
-    %% Every CRYPTO chunk of the current Initial flight, in send order,
-    %% so the whole flight is replayed on retransmit -- a hybrid
-    %% (ML-KEM) ClientHello spans more than one Initial packet.
-    initial_crypto_frames = [] :: [binary()],
-    hs_rtx_attempts = 0 :: non_neg_integer(),
     %% Server-side only. The Retry SCID to echo back as
     %% retry_source_connection_id (RFC 9000 §7.3) when this connection
     %% was spawned from a retried Initial.
@@ -137,16 +134,6 @@
     %% one-shot flight; bumps after HRR so CH2 / ServerHello continue
     %% the stream (RFC 9001 §4.1.3).
     initial_tx_off = 0 :: non_neg_integer(),
-    %% Server handshake-flight retransmission: the ServerHello (with its
-    %% Initial CRYPTO offset) and the Handshake-level payload are kept
-    %% until the client's Finished arrives, and replayed on a backoff
-    %% timer. Initial/Handshake packets are not loss-tracked, so without
-    %% this a single lost flight wedges the handshake permanently: the
-    %% client's Initial retransmits only elicit ACKs once the server TLS
-    %% state has advanced.
-    server_flight = undefined :: undefined | {binary(), non_neg_integer(), binary()},
-    server_hs_rtx_timer = undefined :: undefined | reference(),
-    server_hs_rtx_attempts = 0 :: non_neg_integer(),
     %% Client-side: CH1 random + build opts, needed to rebuild CH2
     tls_ch1_random :: binary() | undefined,
     %% Client-side: the Certificate(+CertificateVerify)+Finished payload,
@@ -157,8 +144,6 @@
     %% The flight has to carry its own timer: once the statem leaves
     %% `handshaking' nothing else is guaranteed to be in flight to arm a
     %% PTO, so a lost Finished had no schedule to resend it on.
-    hs_flight_timer = undefined :: reference() | undefined,
-    hs_flight_tries = 0 :: non_neg_integer(),
     cipher_preference = [aes_128_gcm, aes_256_gcm, chacha20_poly1305] :: [atom()],
     tls_ch1_opts :: map() | undefined,
     %% Negotiated values surfaced in the connected event
@@ -291,6 +276,35 @@
     %% cancelled when the deadline moves later; the fire handler re-arms
     %% for the remainder instead (see set_pto_timer/1).
     pto_armed_at = undefined :: integer() | undefined,
+    %% The packet number space the armed timer belongs to. A probe has to
+    %% go out at that level, and a change of space forces a re-arm: the
+    %% lazy "a later deadline never cancels" rule would otherwise leave
+    %% the wrong space armed.
+    pto_space = app :: quic_loss:space(),
+    %% Whether the armed timer is a time-threshold loss deadline or a
+    %% probe. They are handled differently when it fires, and a change of
+    %% either forces a re-arm.
+    pto_kind = pto :: loss | pto,
+    %% Handshake payloads the congestion window or pacer refused, held as
+    %% frames rather than encoded packets so no packet number is spent
+    %% until one actually goes out. Drained when an acknowledgement
+    %% reopens the window.
+    pending_hs = #{initial => queue:new(), handshake => queue:new()} :: #{
+        quic_loss:space() => queue:queue({iodata(), [term()]})
+    },
+    %% Payload bytes held in pending_hs, per space, against
+    %% ?MAX_PENDING_HS_BYTES.
+    pending_hs_bytes = #{initial => 0, handshake => 0} :: #{
+        quic_loss:space() => non_neg_integer()
+    },
+    %% Set while a probe is being sent, which RFC 9002 Section 7 exempts
+    %% from the congestion window.
+    hs_probe = false :: boolean(),
+    %% Client-side: a Handshake acknowledgement has arrived, so the
+    %% server has validated this address (RFC 9002 Appendix A.8
+    %% PeerCompletedAddressValidation). Always true for a server, which
+    %% reads the predicate directly rather than this field.
+    handshake_ack_received = false :: boolean(),
     idle_timer :: reference() | undefined,
 
     %% Keep-alive (RFC 9000 - PING frames for liveness)
