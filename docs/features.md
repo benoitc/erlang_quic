@@ -412,17 +412,19 @@ mark known gaps that may land in a later release.
 
 ## Interop Runner Compliance
 
-All 10 QUIC Interop Runner test cases pass:
+All 10 QUIC Interop Runner test cases pass against the external runner.
+The `Covered by` column says which of them `quic_interop_SUITE` also
+checks here, so the table is not taken on trust:
 
-| Test Case | Status |
-|-----------|--------|
-| handshake | Pass |
-| transfer | Pass |
-| retry | Pass |
-| keyupdate | Pass |
-| chacha20 | Pass |
-| multiconnect | Pass |
-| v2 | Pass |
-| resumption | Pass |
-| zerortt | Pass |
-| connectionmigration | Pass |
+| Test Case | Status | Covered by quic_interop_SUITE |
+|-----------|--------|-------------------------------|
+| handshake | Pass | yes |
+| transfer | Pass | yes |
+| retry | Pass | no |
+| keyupdate | Pass | no, nothing exposes the key phase to assert on |
+| chacha20 | Pass | yes |
+| multiconnect | Pass | yes |
+| v2 | Pass | yes |
+| resumption | Pass | yes, skipped when the peer issues no ticket |
+| zerortt | Pass | yes, skipped when the peer issues no ticket |
+| connectionmigration | Pass | yes |
