@@ -38,6 +38,9 @@ All notable changes to this project will be documented in this file.
   streams after the first server packets arrived no longer fails the
   connect. The QUIC connection refused to open unidirectional streams in
   the handshaking state, which one scheduler made common.
+- A stopping server closes its connections before its socket, so each
+  sends CONNECTION_CLOSE and its clients are told at once. They heard
+  nothing until their own idle timeout.
 
 ## [1.10.0] - 2026-09-21
 

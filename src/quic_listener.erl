@@ -121,6 +121,10 @@
 
 -include("quic.hrl").
 -include_lib("kernel/include/logger.hrl").
+
+%% How long a stopping listener waits for its connections to close.
+-define(CLOSE_CONNECTIONS_MS, 1000).
+
 -define(QUIC_LOG_META, #{
     domain => [erlang_quic, listener], report_cb => fun quic_log:format_report/2
 }).
@@ -765,6 +769,7 @@ terminate(_Reason, #listener_state{
     socket_backend = Backend,
     socket = Socket
 }) ->
+    close_connections(ConnTab),
     %% Close socket based on backend
     case Backend of
         socket when SocketState =/= undefined ->
@@ -792,6 +797,38 @@ code_change(_OldVsn, State, _Extra) ->
 %%====================================================================
 %% Internal Functions
 %%====================================================================
+
+%% Stop the connections this listener started, and wait for them, while
+%% the socket is still open: each sends CONNECTION_CLOSE as it terminates.
+%% With the socket closed first, their clients heard nothing until their
+%% own idle timeout.
+close_connections(ConnTab) ->
+    {links, Links} = process_info(self(), links),
+    Linked = sets:from_list(Links, [{version, 2}]),
+    Conns = lists:usort([P || {_CID, P} <- safe_tab_list(ConnTab), sets:is_element(P, Linked)]),
+    Refs = [stop_connection(P) || P <- Conns],
+    await_down(Refs, erlang:monotonic_time(millisecond) + ?CLOSE_CONNECTIONS_MS).
+
+stop_connection(Pid) ->
+    Ref = erlang:monitor(process, Pid),
+    exit(Pid, shutdown),
+    Ref.
+
+await_down([], _Deadline) ->
+    ok;
+await_down([Ref | Rest], Deadline) ->
+    Left = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {'DOWN', Ref, process, _, _} -> await_down(Rest, Deadline)
+    after Left -> ok
+    end.
+
+safe_tab_list(Tab) ->
+    try
+        ets:tab2list(Tab)
+    catch
+        error:badarg -> []
+    end.
 
 safe_close_socket(Socket) ->
     try
