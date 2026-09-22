@@ -690,15 +690,16 @@ early_data(
     end;
 early_data(
     info,
-    {quic, QuicConn, {stream_closed, StreamId, ErrorCode}},
+    {quic, QuicConn, {stream_reset, StreamId, ErrorCode}},
     #state{quic_conn = QuicConn} = State
 ) ->
-    case handle_stream_closed(StreamId, ErrorCode, State) of
-        {ok, State1} ->
-            {keep_state, State1};
-        {error, Reason} ->
-            handle_connection_error(Reason, State)
-    end;
+    handle_peer_reset(StreamId, ErrorCode, State);
+early_data(
+    info,
+    {quic, QuicConn, {stop_sending, StreamId, ErrorCode}},
+    #state{quic_conn = QuicConn} = State
+) ->
+    {keep_state, handle_peer_stop_sending(StreamId, ErrorCode, State)};
 early_data(info, {quic, QuicConn, {connected, _Info}}, #state{quic_conn = QuicConn} = State) ->
     maybe_transition_from_early_data(State#state{quic_connected = true});
 early_data({call, From}, get_settings, #state{local_settings = Settings}) ->
@@ -860,15 +861,16 @@ h3_connecting(
     end;
 h3_connecting(
     info,
-    {quic, QuicConn, {stream_closed, StreamId, ErrorCode}},
+    {quic, QuicConn, {stream_reset, StreamId, ErrorCode}},
     #state{quic_conn = QuicConn} = State
 ) ->
-    case handle_stream_closed(StreamId, ErrorCode, State) of
-        {ok, State1} ->
-            {keep_state, State1};
-        {error, Reason} ->
-            handle_connection_error(Reason, State)
-    end;
+    handle_peer_reset(StreamId, ErrorCode, State);
+h3_connecting(
+    info,
+    {quic, QuicConn, {stop_sending, StreamId, ErrorCode}},
+    #state{quic_conn = QuicConn} = State
+) ->
+    {keep_state, handle_peer_stop_sending(StreamId, ErrorCode, State)};
 h3_connecting({call, From}, {request, _Headers, _Opts}, _State) ->
     %% Can't send requests until connected
     {keep_state_and_data, [{reply, From, {error, not_connected}}]};
@@ -944,35 +946,16 @@ connected(
     end;
 connected(
     info,
-    {quic, QuicConn, {stream_closed, StreamId, ErrorCode}},
+    {quic, QuicConn, {stream_reset, StreamId, ErrorCode}},
     #state{quic_conn = QuicConn} = State
 ) ->
-    case handle_stream_closed(StreamId, ErrorCode, State) of
-        {ok, State1} ->
-            %% For non-claimed streams keep today's generic event;
-            %% claimed streams already got stream_type_reset/closed
-            %% inside handle_stream_closed/3.
-            case claimed_stream_direction(StreamId, State) of
-                {ok, _Dir} -> ok;
-                error -> notify_stream_reset(StreamId, ErrorCode, State1)
-            end,
-            {keep_state, State1};
-        {error, Reason} ->
-            handle_connection_error(Reason, State)
-    end;
+    handle_peer_reset(StreamId, ErrorCode, State);
 connected(
     info,
     {quic, QuicConn, {stop_sending, StreamId, ErrorCode}},
-    #state{quic_conn = QuicConn, owner = Owner} = State
+    #state{quic_conn = QuicConn} = State
 ) ->
-    case claimed_stream_direction(StreamId, State) of
-        {ok, Direction} ->
-            Owner !
-                {quic_h3, self(), {stream_type_stop_sending, Direction, StreamId, ErrorCode}};
-        error ->
-            ok
-    end,
-    {keep_state, State};
+    {keep_state, handle_peer_stop_sending(StreamId, ErrorCode, State)};
 connected(
     info,
     {quic, QuicConn, {datagram, Data}},
@@ -4567,8 +4550,46 @@ reason_phrase(Reason) ->
         _:_ -> iolist_to_binary(io_lib:format("~0p", [Reason]))
     end.
 
-notify_stream_reset(StreamId, ErrorCode, #state{owner = Owner}) ->
-    Owner ! {quic_h3, self(), {stream_reset, StreamId, ErrorCode}}.
+%% RESET_STREAM or RESET_STREAM_AT from the peer: clean up, then tell
+%% whoever waits on a request stream. Claimed streams were told already.
+handle_peer_reset(StreamId, ErrorCode, State) ->
+    case handle_stream_closed(StreamId, ErrorCode, State) of
+        {ok, State1} ->
+            case is_request_stream(StreamId, State) of
+                true ->
+                    notify_stream(StreamId, {stream_reset, StreamId, ErrorCode}, State1),
+                    {keep_state, do_unset_stream_handler(StreamId, State1)};
+                false ->
+                    {keep_state, State1}
+            end;
+        {error, Reason} ->
+            handle_connection_error(Reason, State)
+    end.
+
+%% The QUIC layer has answered with RESET_STREAM; the writer is told to stop.
+handle_peer_stop_sending(StreamId, ErrorCode, #state{owner = Owner} = State) ->
+    case claimed_stream_direction(StreamId, State) of
+        {ok, Direction} ->
+            Owner !
+                {quic_h3, self(), {stream_type_stop_sending, Direction, StreamId, ErrorCode}};
+        error when (StreamId band 2) =:= 0 ->
+            notify_stream(StreamId, {stop_sending, StreamId, ErrorCode}, State);
+        error ->
+            ok
+    end,
+    State.
+
+is_request_stream(StreamId, State) ->
+    ((StreamId band 2) =:= 0) andalso (claimed_stream_direction(StreamId, State) =:= error).
+
+%% To the stream's registered handler if it has one, else the owner.
+notify_stream(StreamId, Event, #state{stream_handlers = Handlers, owner = Owner}) ->
+    Target =
+        case maps:find(StreamId, Handlers) of
+            {ok, {HandlerPid, _MonRef}} -> HandlerPid;
+            error -> Owner
+        end,
+    Target ! {quic_h3, self(), Event}.
 
 %% Forward a session ticket from the QUIC layer to the H3 owner.
 %% RFC 8446 Section 4.6.1: tickets may be issued at any time post-handshake;

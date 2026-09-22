@@ -485,10 +485,11 @@ These solve different problems and compose rather than overlap.
   chosen pid, returning any bytes buffered before registration. It
   only works on streams already present in the connection's request
   map; extension-claimed streams (WT uni `0x54`, WT bidi `0x41`)
-  aren't request streams and can't be registered this way. Other
-  events on the same request stream (`{request, ...}`,
-  `{trailers, ...}`, `{stream_reset, ...}`) still reach the
-  connection owner.
+  aren't request streams and can't be registered this way. The
+  peer abandoning the stream (`{stream_reset, ...}`,
+  `{stop_sending, ...}`) also goes to that pid. Other events on the
+  same request stream (`{request, ...}`, `{trailers, ...}`) still
+  reach the connection owner.
 - `connection_handler` picks the *connection's* owner pid at
   construction, before any stream exists. Every connection-level
   event — `{connected, ...}`, `{request, ...}`,
@@ -676,8 +677,14 @@ sides — see [HTTP Datagrams (RFC 9297)](#http-datagrams-rfc-9297) above.
 
 | Event | Description |
 |-------|-------------|
-| `{stream_reset, StreamId, ErrorCode}` | Stream was reset |
+| `{stream_reset, StreamId, ErrorCode}` | Peer reset the stream (RESET_STREAM) |
+| `{stop_sending, StreamId, ErrorCode}` | Peer sent STOP_SENDING; stop writing to the stream |
 | `{error, Reason}` | Connection error |
+
+Both go to the stream handler registered with `set_stream_handler/3,4`
+if there is one, otherwise to the connection owner. The transport
+answers a STOP_SENDING with a RESET_STREAM carrying the same code, so
+the peer hears `{stream_reset, ...}` in turn.
 
 ## Module Internals
 
