@@ -118,9 +118,10 @@ A server configured with both certs and PSK selects per-handshake:
 - No 0-RTT / `early_data` on external PSK. A client offering
   `external_psk` with `early_data` will have the `early_data`
   extension ignored by the server.
-- `NewSessionTicket` is not emitted on PSK-authenticated
-  handshakes. External PSK clients already hold a long-lived
-  credential.
+- `NewSessionTicket` is not emitted on external-PSK handshakes.
+  External PSK clients already hold a long-lived credential. A
+  handshake resumed from a session ticket does get a new ticket, since
+  tickets are single-use.
 
 Both items are tracked as follow-ups in `docs/features.md`.
 

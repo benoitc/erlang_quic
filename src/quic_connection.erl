@@ -2888,12 +2888,13 @@ send_handshake_done(State) ->
 %% Server: Send NewSessionTicket after handshake completes
 %% RFC 8446 Section 4.6.1: Server sends NewSessionTicket in post-handshake message
 %% In QUIC, this is sent as a TLS handshake message in a CRYPTO frame
-send_new_session_ticket(#state{selected_psk = Sel} = State) when Sel =/= undefined ->
-    %% Suppress NewSessionTicket on PSK-authenticated handshakes (v1
+send_new_session_ticket(#state{selected_psk = #{source := external}} = State) ->
+    %% Suppress NewSessionTicket on external-PSK handshakes (v1
     %% — see docs/PSK.md "v1 limitations"). External-PSK clients
     %% already have a long-lived credential and don't need a
     %% resumption ticket; mixing the two raises a binding question
-    %% we don't want to answer right now.
+    %% we don't want to answer right now. A handshake resumed from a
+    %% ticket gets a new one: tickets are single-use.
     State;
 send_new_session_ticket(#state{resumption_secret = undefined} = State) ->
     %% No resumption secret available - skip sending ticket
@@ -6548,7 +6549,8 @@ do_server_client_hello_cont(
                     identity => maps:get(identity, Sel),
                     identity_idx => maps:get(identity_idx, Sel),
                     secret => PSKSecret,
-                    mode => Mode
+                    mode => Mode,
+                    source => external
                 },
                 {
                     undefined,
@@ -6582,7 +6584,8 @@ do_server_client_hello_cont(
                                             identity => Identity,
                                             identity_idx => 0,
                                             secret => PSK,
-                                            mode => psk_dhe_ke
+                                            mode => psk_dhe_ke,
+                                            source => ticket
                                         },
                                         EK =
                                             case WantsEarlyData of

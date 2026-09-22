@@ -29,6 +29,9 @@ All notable changes to this project will be documented in this file.
   16 MiB; the cap now applies only to the request body a server buffers.
 - A request or push stream ending inside a frame closes the connection
   with H3_FRAME_ERROR instead of crashing the HTTP/3 connection process.
+- A server issues a new session ticket on a handshake resumed from a
+  ticket. Tickets are single-use, so a client could resume only once and
+  then fell back to a full handshake without 0-RTT.
 
 ## [1.10.0] - 2026-09-21
 
