@@ -113,6 +113,9 @@
     get_path_stats/1,
     %% Connection statistics (for liveness detection)
     get_stats/1,
+    %% Whether a certificate's key can sign for it
+    check_signing_key/2,
+    check_credentials/2,
     %% 0-RTT accessors (RFC 9001 §4.6)
     has_early_keys/1,
     early_data_accepted/1,
@@ -2479,6 +2482,62 @@ notify_owner(Msg, #state{owner = Owner}) when is_pid(Owner) ->
         _:_ -> ok
     end;
 notify_owner(_Msg, _State) ->
+    ok.
+
+%% Building our own flight is local work, so a failure in it is ours,
+%% such as a key from an sni_callback that cannot sign. Left to the packet
+%% loop it would be taken for a malformed datagram from the peer and
+%% dropped, and the client would wait out its timeout without an answer.
+%% Fail the handshake with internal_error (RFC 8446 Section 6.2) instead.
+%% exit is left alone, as in the packet loop: it is how the handshake
+%% aborts on purpose.
+server_handshake_flight(Cipher, TranscriptHash, State) ->
+    try
+        send_server_handshake_flight(Cipher, TranscriptHash, State)
+    catch
+        Class:Reason:Stack when Class =:= error; Class =:= throw ->
+            ?LOG_ERROR(
+                #{
+                    what => server_handshake_flight_failed,
+                    class => Class,
+                    reason => Reason,
+                    stacktrace => Stack
+                },
+                ?QUIC_LOG_META
+            ),
+            send_tls_alert(?TLS_ALERT_INTERNAL_ERROR, <<"internal error">>, State)
+    end.
+
+%% @doc Whether Key can authenticate as Cert: sign a CertificateVerify as a
+%% handshake does and check the certificate's public key accepts the
+%% signature. This catches a key in a form the signer does not take and a
+%% key that belongs to another certificate, both of which would otherwise
+%% fail every handshake that presents the certificate.
+-spec check_signing_key(binary(), term()) -> ok | {error, term()}.
+check_signing_key(Cert, Key) ->
+    Hash = crypto:hash(sha256, <<"quic server key check">>),
+    Code = hd(compatible_sig_schemes_codes(Key)),
+    try quic_tls:build_certificate_verify(Code, Key, Hash) of
+        <<_Type, _Len:24, Body/binary>> ->
+            case quic_tls:verify_certificate_verify(Body, Cert, Hash, server) of
+                true -> ok;
+                false -> {error, signature_not_accepted_by_certificate}
+            end
+    catch
+        _:Reason -> {error, {cannot_sign, Reason}}
+    end.
+
+%% @doc Whether the `cert' and `key' in Opts can authenticate as Role, the
+%% error naming the side whose key is at fault. Opts without both have
+%% nothing to check here.
+-spec check_credentials(server | client, map()) -> ok | {error, term()}.
+check_credentials(Role, #{cert := Cert, key := Key}) when Cert =/= undefined, Key =/= undefined ->
+    case check_signing_key(Cert, Key) of
+        ok -> ok;
+        {error, Reason} when Role =:= server -> {error, {invalid_server_key, Reason}};
+        {error, Reason} -> {error, {invalid_client_key, Reason}}
+    end;
+check_credentials(_Role, _Opts) ->
     ok.
 
 send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
@@ -6706,7 +6765,7 @@ do_server_client_hello_cont(
             },
             State1 = apply_peer_transport_params(TP, State0b),
             State2 = send_server_hello(ServerHello, State1),
-            State3 = send_server_handshake_flight(Cipher, TranscriptHash, State2),
+            State3 = server_handshake_flight(Cipher, TranscriptHash, State2),
             maybe_emit_pending_close(State3)
     end.
 

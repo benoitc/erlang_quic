@@ -82,11 +82,18 @@ fi
 # The probe boots with -proto_dist quic, and quic_dist:listen/1 runs before
 # the kernel finishes loading sys.config-defined app envs, so the credentials
 # must come through -quic_dist_cert / -quic_dist_key init args.
+#
+# Take the string that follows each key, not the first string on its
+# line: a config written on one line has both paths there, and the key
+# used to come back as the certificate's path.
+config_path() {
+    sed -n "s/.*{$1, *\"\([^\"]*\)\".*/\1/p" "$CONFIG" 2>/dev/null | head -n 1
+}
 if [[ -n "$CONFIG" && -z "$CERT" ]]; then
-    CERT="$(awk -F'"' '/cert_file/{print $2; exit}' "$CONFIG" 2>/dev/null || true)"
+    CERT="$(config_path cert_file)"
 fi
 if [[ -n "$CONFIG" && -z "$KEY" ]]; then
-    KEY="$(awk -F'"' '/key_file/{print $2; exit}' "$CONFIG" 2>/dev/null || true)"
+    KEY="$(config_path key_file)"
 fi
 
 if [[ -z "$CERT" || -z "$KEY" ]]; then
