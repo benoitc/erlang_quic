@@ -1430,6 +1430,17 @@ handshaking({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) 
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
+%% 0-RTT: HTTP/3 opens its control and QPACK streams as early data, and
+%% the connection can be past `idle' by the time it does (mirrors idle).
+handshaking({call, From}, open_unidirectional_stream, #state{early_keys = undefined} = State) ->
+    {keep_state, State, [{reply, From, {error, not_connected}}]};
+handshaking({call, From}, open_unidirectional_stream, State) ->
+    case do_open_unidirectional_stream(State) of
+        {ok, StreamId, NewState} ->
+            {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
 %% 0-RTT: Allow sending data during handshake if early keys are available
 handshaking(
     {call, From},

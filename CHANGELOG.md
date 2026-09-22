@@ -34,6 +34,10 @@ All notable changes to this project will be documented in this file.
   then fell back to a full handshake without 0-RTT.
 - A client offers 0-RTT only on a ticket that allows early data
   (RFC 8446 Section 4.2.10), and derives early keys only then.
+- A resuming client whose HTTP/3 layer opens its control and QPACK
+  streams after the first server packets arrived no longer fails the
+  connect. The QUIC connection refused to open unidirectional streams in
+  the handshaking state, which one scheduler made common.
 
 ## [1.10.0] - 2026-09-21
 
