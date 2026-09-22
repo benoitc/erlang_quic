@@ -297,7 +297,7 @@ init_genudp_backend(Port, Opts) ->
             binary,
             Family,
             {active, ActiveN},
-            {reuseaddr, true},
+            {reuseaddr, quic_socket:reuseaddr_for_port(Port)},
             {recbuf, RecBuf},
             {sndbuf, SndBuf}
         ] ++
