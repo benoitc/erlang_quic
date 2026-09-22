@@ -8,6 +8,7 @@
 -include_lib("quic/src/quic_connection_state.hrl").
 
 -export([
+    datagrams_sent/1,
     state_with_loss/1,
     state_with_loss/2,
     state_get/2,
@@ -748,3 +749,17 @@ maybe_send_ack_app(Trigger, State) ->
     sequential | reordered.
 classify_recv_trigger(PN, LargestRecv) ->
     quic_connection:classify_recv_trigger(PN, #pn_space{largest_recv = LargestRecv}).
+
+%% Datagrams a live connection's socket has written, as the OS counts
+%% them. A frame counts once its packet has left the send batch.
+-spec datagrams_sent(pid()) -> non_neg_integer().
+datagrams_sent(Conn) ->
+    {_StateName, #state{socket = Socket}} = sys:get_state(Conn),
+    case Socket of
+        {'$socket', _} ->
+            #{counters := #{write_pkg := N}} = socket:info(Socket),
+            N;
+        Port ->
+            {ok, [{send_cnt, N}]} = inet:getstat(Port, [send_cnt]),
+            N
+    end.
