@@ -584,10 +584,11 @@ jobs:
         run: rebar3 compile
 
       - name: Run Interop tests
-        run: rebar3 ct --suite=quic_interop_SUITE
+        run: rebar3 ct --suite=quic_interop_SUITE,quic_interop_stream_reset_SUITE
         env:
           QUIC_AIOQUIC_HOST: 127.0.0.1
           QUIC_AIOQUIC_PORT: 4433
+          QUIC_AIOQUIC_H3_PORT: 4435
           QUIC_QUICGO_HOST: 127.0.0.1
           QUIC_QUICGO_PORT: 4434
 
@@ -608,6 +609,8 @@ jobs:
         run: |
           echo "=== QUIC Server Logs (aioquic) ==="
           docker compose -f docker/docker-compose.yml logs quic-server
+          echo "=== HTTP/3 Server Logs (aioquic) ==="
+          docker compose -f docker/docker-compose.yml logs h3-server
           echo "=== QUIC Server Logs (quic-go) ==="
           docker compose -f docker/docker-compose.yml logs quic-go-server || true
 

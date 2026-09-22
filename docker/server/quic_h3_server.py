@@ -8,6 +8,8 @@ A full HTTP/3 server using aioquic that:
 - Echoes POST body for /echo endpoint
 - Supports trailers
 - Supports Server Push (RFC 9114 Section 4.6)
+- Resets or stops streams on request (/reset, /stop) and lists the resets
+  it received (/resets)
 - Logs all events for debugging
 """
 
@@ -35,6 +37,7 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import (
     ProtocolNegotiated,
     StreamDataReceived,
+    StreamReset,
     QuicEvent,
 )
 from aioquic.quic.logger import QuicFileLogger
@@ -50,6 +53,16 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def _query_code(path: str) -> int:
+    """The code=N query parameter, 0x10c (H3_REQUEST_CANCELLED) if absent."""
+    _, _, query = path.partition("?")
+    for param in query.split("&"):
+        name, _, value = param.partition("=")
+        if name == "code":
+            return int(value, 0)
+    return 0x10C
 
 
 class RequestState:
@@ -77,6 +90,7 @@ class HttpServerProtocol(QuicConnectionProtocol):
         self._document_root = Path(document_root)
         self._enable_push = enable_push
         self._next_push_id = 0
+        self._resets: List[Tuple[int, int]] = []
 
     def quic_event_received(self, event: QuicEvent) -> None:
         """Handle QUIC events."""
@@ -84,6 +98,10 @@ class HttpServerProtocol(QuicConnectionProtocol):
             if event.alpn_protocol in H3_ALPN:
                 self._http = H3Connection(self._quic, enable_webtransport=False)
                 logger.info(f"H3 connection established, ALPN: {event.alpn_protocol}")
+
+        if isinstance(event, StreamReset):
+            logger.info(f"Stream {event.stream_id} reset with error code {event.error_code}")
+            self._resets.append((event.stream_id, event.error_code))
 
         if self._http is not None:
             for h3_event in self._http.handle_event(event):
@@ -119,6 +137,13 @@ class HttpServerProtocol(QuicConnectionProtocol):
             f"Stream {stream_id}: {request.method} {request.path} "
             f"(end_stream={end_stream})"
         )
+
+        # POST /stop?code=N: ask the client to stop sending its body.
+        if request.method == "POST" and request.path.startswith("/stop"):
+            code = _query_code(request.path)
+            logger.info(f"Stream {stream_id}: sending STOP_SENDING {code}")
+            self._quic.stop_stream(stream_id, code)
+            return
 
         # For GET/HEAD without body, respond immediately
         if end_stream and request.method in ("GET", "HEAD"):
@@ -170,7 +195,20 @@ class HttpServerProtocol(QuicConnectionProtocol):
             self._send_push_promises(stream_id, path, request)
 
         # Route request
-        if path == "/echo" and method == "POST":
+        if path.startswith("/reset?") and method == "GET":
+            # Part of a body, then RESET_STREAM with the requested code.
+            self._http.send_headers(stream_id, [(b":status", b"200")])
+            self._http.send_data(stream_id, b"partial", end_stream=False)
+            self.transmit()
+            asyncio.get_event_loop().call_later(
+                0.1, self._reset_stream, stream_id, _query_code(path)
+            )
+            return
+        if path == "/resets" and method == "GET":
+            body = "".join(f"{sid} {code}\n" for sid, code in self._resets).encode()
+            status = 200
+            content_type = b"text/plain"
+        elif path == "/echo" and method == "POST":
             # Echo POST body
             body = request.body
             status = 200
@@ -204,6 +242,11 @@ class HttpServerProtocol(QuicConnectionProtocol):
             content_type = b"text/plain"
 
         self._send_simple_response(stream_id, status, content_type, body)
+
+    def _reset_stream(self, stream_id: int, code: int) -> None:
+        logger.info(f"Stream {stream_id}: sending RESET_STREAM {code}")
+        self._quic.reset_stream(stream_id, code)
+        self.transmit()
 
     def _read_file(self, path: str) -> Tuple[bytes, int, bytes]:
         """Read file from document root."""

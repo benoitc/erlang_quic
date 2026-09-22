@@ -58,6 +58,14 @@ class EchoServerProtocol(QuicConnectionProtocol):
                 f"end_stream={end_stream}"
             )
 
+            # "stop_sending <code>" asks this server to send STOP_SENDING
+            # on the stream instead of echoing.
+            if data.startswith(b"stop_sending "):
+                code = int(data.split(b" ", 1)[1])
+                logger.info(f"Stream {stream_id}: sending STOP_SENDING {code}")
+                self._quic.stop_stream(stream_id, code)
+                return
+
             # Accumulate data for this stream
             if stream_id not in self._stream_buffers:
                 self._stream_buffers[stream_id] = b""
@@ -75,6 +83,13 @@ class EchoServerProtocol(QuicConnectionProtocol):
             logger.info(f"Stream {event.stream_id} reset with error code {event.error_code}")
             # Clean up buffer for this stream
             self._stream_buffers.pop(event.stream_id, None)
+            # Tell the client what arrived, on a stream of its own.
+            report = self._quic.get_next_available_stream_id(is_unidirectional=True)
+            self._quic.send_stream_data(
+                report,
+                b"reset %d %d" % (event.stream_id, event.error_code),
+                end_stream=True,
+            )
 
         elif isinstance(event, ConnectionTerminated):
             logger.info(
