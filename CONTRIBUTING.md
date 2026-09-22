@@ -58,6 +58,10 @@ That brings up aioquic on 4433, quic-go on 4434, and HTTP/3 servers on 4435 and 
 
 To reach `quic_connection` internals from a test, note that `quic_connection`, `quic_listener` and `quic_socket` compile with `export_all` under TEST. Do not add `-ifdef(TEST)` exports. State builders and accessors belong in `test/quic_connection_test_support.erl`.
 
+macOS defers loopback UDP. On an otherwise idle pair of sockets, plain `gen_udp` had 10 of 120 datagrams arrive 106 to 600 ms after the send, while the same probe in the Linux container arrives within a millisecond every time. Inside a connection this reads as loss: the peer's socket counter stays flat, a probe goes out, and a retransmission repairs it.
+
+So a test that has to pass on macOS must not assert how quickly a peer receives something. Assert what the sender did instead: `test/quic_api_frame_send_tests.erl` counts the datagrams a call writes to the socket, and `test/quic_socket_reuseaddr_tests.erl` reads socket options back. Where a test does have to wait for delivery, give it seconds, not hundreds of milliseconds.
+
 A test must fail for one reason. A denial test that also passes when the call crashes, or a test that asserts a value it computed itself, is worse than no test because it reads as coverage.
 
 ## What CI enforces
