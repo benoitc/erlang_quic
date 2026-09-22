@@ -1630,7 +1630,7 @@ connected({call, From}, open_unidirectional_stream, State) ->
 connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
     case do_close_stream(StreamId, ErrorCode, State) of
         {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
+            {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1639,7 +1639,7 @@ connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
 connected({call, From}, {reset_stream_at, StreamId, ErrorCode, ReliableSize}, State) ->
     case do_reset_stream_at(StreamId, ErrorCode, ReliableSize, State) of
         {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
+            {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1647,7 +1647,7 @@ connected({call, From}, {reset_stream_at, StreamId, ErrorCode, ReliableSize}, St
 connected({call, From}, {stop_sending, StreamId, ErrorCode}, State) ->
     case do_stop_sending(StreamId, ErrorCode, State) of
         {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
+            {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1796,7 +1796,7 @@ connected({call, From}, get_peer_transport_params, #state{transport_params = TP}
 connected({call, From}, send_ping, State) ->
     %% Send PING frame - bypasses congestion control
     NewState = send_keep_alive_ping(State),
-    {keep_state, NewState, [{reply, From, ok}]};
+    {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
 connected({call, From}, get_mtu, State) ->
     MTU = get_current_mtu(State),
     {keep_state, State, [{reply, From, {ok, MTU}}]};
