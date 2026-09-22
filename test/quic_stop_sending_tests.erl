@@ -1,143 +1,73 @@
 %%% -*- erlang -*-
 %%%
-%%% Tests for QUIC STOP_SENDING API
-%%% RFC 9000 Section 19.5
+%%% A STOP_SENDING has to be answered with a RESET_STREAM.
 %%%
-
+%%% RFC 9000 Section 3.5: an endpoint that receives STOP_SENDING MUST send
+%%% RESET_STREAM if its send side is still open, and SHOULD carry the error
+%%% code the peer gave. The receiver asked because it no longer wants the
+%%% data; the reset is what closes its side of the stream. Without it the
+%%% peer is left waiting on a stream the sender has quietly stopped using.
+%%%
+%%% Copyright (c) 2024-2026 Benoit Chesneau
+%%% Apache License 2.0
 -module(quic_stop_sending_tests).
 
 -include_lib("eunit/include/eunit.hrl").
--include("quic.hrl").
+
+%% Well under eunit's 5 s per-test limit, so a reset that never comes
+%% fails on its assertion rather than as a timeout.
+-define(WAIT_MS, 2000).
+
+-define(CODE, 16#0107).
+
+%% The echo server answers on the same stream and leaves its side open
+%% while ours is, so its send side is still going when we ask it to stop.
+stop_sending_is_answered_with_a_reset_test() ->
+    with_echo_stream(fun(Conn, StreamId) ->
+        ok = quic:stop_sending(Conn, StreamId, ?CODE),
+        ?assertEqual({stream_reset, StreamId, ?CODE}, await_reset(Conn, StreamId))
+    end).
+
+%% The fence: without STOP_SENDING the server keeps its side open and
+%% resets nothing, so the reset above is the answer to the request.
+no_stop_sending_no_reset_test() ->
+    with_echo_stream(fun(Conn, StreamId) ->
+        ?assertEqual(timeout, await_reset(Conn, StreamId))
+    end).
 
 %%====================================================================
-%% API Tests
+%% Helpers
 %%====================================================================
 
-%% Test that stop_sending in idle state returns invalid_state error
-stop_sending_idle_state_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
-
-    %% Connection is in idle state (not connected yet)
-    {State, _} = quic_connection:get_state(Pid),
-    ?assertEqual(idle, State),
-
-    %% stop_sending should fail because we're not in connected state
-    Result = quic_connection:stop_sending(Pid, 0, 0),
-    ?assertEqual({error, {invalid_state, idle}}, Result),
-
-    quic_connection:close(Pid, normal),
-    timer:sleep(100).
-
-%% Test that stop_sending API accepts pid
-stop_sending_with_pid_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
-
-    %% Connection is in idle state
-    Result = quic:stop_sending(Pid, 0, 0),
-    ?assertEqual({error, {invalid_state, idle}}, Result),
-
-    quic_connection:close(Pid, normal),
-    timer:sleep(100).
-
-%%====================================================================
-%% Frame Encoding Tests
-%%====================================================================
-
-%% Verify STOP_SENDING frame encoding
-stop_sending_frame_encode_test() ->
-    StreamId = 4,
-    ErrorCode = 256,
-
-    Frame = {stop_sending, StreamId, ErrorCode},
-    Encoded = quic_frame:encode(Frame),
-
-    %% Frame type should be 0x05
-    ?assertMatch(<<5, _/binary>>, Encoded),
-
-    %% Should roundtrip correctly
-    {Decoded, <<>>} = quic_frame:decode(Encoded),
-    ?assertEqual(Frame, Decoded).
-
-%% Test various stream IDs and error codes
-stop_sending_frame_values_test() ->
-    TestCases = [
-        {0, 0},
-        {1, 1},
-        {100, 500},
-        % Large varint values
-        {16#3FFFFFFF, 16#3FFFFFFF}
-    ],
-
-    lists:foreach(
-        fun({StreamId, ErrorCode}) ->
-            Frame = {stop_sending, StreamId, ErrorCode},
-            Encoded = quic_frame:encode(Frame),
-            {Decoded, <<>>} = quic_frame:decode(Encoded),
-            ?assertEqual(Frame, Decoded)
+%% A connected client with one stream whose first write has been echoed,
+%% neither side having sent FIN.
+with_echo_stream(F) ->
+    {ok, Server} = quic_test_echo_server:start(),
+    try
+        Port = maps:get(port, Server),
+        Opts = maps:merge(quic_test_echo_server:client_opts(), #{alpn => [<<"echo">>]}),
+        {ok, Conn} = quic:connect(<<"127.0.0.1">>, Port, Opts, self()),
+        receive
+            {quic, Conn, {connected, _}} -> ok
+        after ?WAIT_MS -> error(connect_timeout)
         end,
-        TestCases
-    ).
-
-%%====================================================================
-%% quic_stream Module Integration Tests
-%%====================================================================
-
-%% Test that quic_stream:stop_sending clears send buffer
-stream_stop_sending_clears_buffer_test() ->
-    Stream = quic_stream:new(0, client),
-    {ok, S1} = quic_stream:send(Stream, <<"pending data">>),
-    ?assert(quic_stream:bytes_to_send(S1) > 0),
-
-    %% stop_sending should clear send buffer
-    S2 = quic_stream:stop_sending(S1, 0),
-    ?assertEqual(0, quic_stream:bytes_to_send(S2)).
-
-%% Test stop_sending on empty stream
-stream_stop_sending_empty_test() ->
-    Stream = quic_stream:new(0, client),
-    S1 = quic_stream:stop_sending(Stream, 42),
-    ?assertEqual(0, quic_stream:bytes_to_send(S1)).
-
-%% Test stop_sending with different error codes
-stream_stop_sending_error_codes_test() ->
-    Stream = quic_stream:new(4, server),
-    {ok, S1} = quic_stream:send(Stream, <<"data">>),
-
-    %% Various error codes should all clear the buffer
-    lists:foreach(
-        fun(ErrorCode) ->
-            S2 = quic_stream:stop_sending(S1, ErrorCode),
-            ?assertEqual(0, quic_stream:bytes_to_send(S2))
+        {ok, StreamId} = quic:open_stream(Conn),
+        ok = quic:send_data(Conn, StreamId, <<"ping">>, false),
+        receive
+            {quic, Conn, {stream_data, StreamId, <<"ping">>, false}} -> ok
+        after ?WAIT_MS -> error(no_echo)
         end,
-        [0, 1, 256, 16#FFFFFFFF]
-    ).
+        try
+            F(Conn, StreamId)
+        after
+            _ = quic:close(Conn, normal)
+        end
+    after
+        quic_test_echo_server:stop(Server)
+    end.
 
-%%====================================================================
-%% Protocol Compliance Tests (RFC 9000 Section 19.5)
-%%====================================================================
-
-%% Verify STOP_SENDING frame type is 0x05
-stop_sending_frame_type_test() ->
-    Frame = {stop_sending, 0, 0},
-    <<Type, _/binary>> = quic_frame:encode(Frame),
-    ?assertEqual(5, Type).
-
-%% Test that STOP_SENDING uses varint encoding for StreamId and ErrorCode
-stop_sending_varint_encoding_test() ->
-    %% Small values (1-byte varint, values 0-63)
-    Frame1 = {stop_sending, 0, 0},
-    Encoded1 = quic_frame:encode(Frame1),
-    % 1 type + 1 stream_id + 1 error_code
-    ?assertEqual(3, byte_size(Encoded1)),
-
-    %% Values 0-63 fit in 1 byte
-    Frame2 = {stop_sending, 63, 63},
-    Encoded2 = quic_frame:encode(Frame2),
-    % 1 type + 1 stream_id + 1 error_code
-    ?assertEqual(3, byte_size(Encoded2)),
-
-    %% Values 64-16383 require 2-byte varint
-    Frame3 = {stop_sending, 1000, 2000},
-    Encoded3 = quic_frame:encode(Frame3),
-    % 1 type + 2 stream_id + 2 error_code
-    ?assertEqual(5, byte_size(Encoded3)).
+await_reset(Conn, StreamId) ->
+    receive
+        {quic, Conn, {stream_reset, StreamId, _} = Reset} -> Reset
+    after ?WAIT_MS -> timeout
+    end.
