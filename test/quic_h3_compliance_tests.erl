@@ -1527,6 +1527,24 @@ oversized_frame_rejected_test() ->
     Encoded = <<Type/binary, Len/binary>>,
     ?assertMatch({error, {frame_error, oversized, _}}, quic_h3_frame:decode(Encoded)).
 
+%% The stream ending inside a DATA frame truncates it (RFC 9114 §7.1).
+fin_inside_data_frame_is_a_frame_error_test() ->
+    <<Part:5/binary, _/binary>> = quic_h3_frame:encode_data(<<"0123456789">>),
+    State0 = request_stream_state(client, #h3_stream{}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_ERROR, <<"stream ended mid-frame">>}, _},
+        quic_h3_connection:handle_stream_data(0, Part, true, State0)
+    ).
+
+%% State with request stream 0 past its HEADERS. Stream 0 is the client's
+%% own request on a client and a peer request on a server.
+request_stream_state(Role, Stream) ->
+    request_stream_state(Role, Stream, #{}).
+
+request_stream_state(Role, Stream, Overrides) ->
+    Stream1 = Stream#h3_stream{id = 0, type = request, state = open, frame_state = expecting_data},
+    make_test_state(Overrides#{role => Role, streams => #{0 => Stream1}}).
+
 %%====================================================================
 %% Theme C: Header / trailer / path / status symmetry
 %%====================================================================

@@ -2527,7 +2527,7 @@ handle_request_stream_data(
     case process_request_frames(StreamId, Combined, Fin, Stream, State) of
         {ok, Rest, _Stream1, _State1} when Fin, Rest =/= <<>> ->
             %% Stream ended inside an H3 frame: truncated (RFC 9114 §7.1).
-            {error, {connection_error, ?H3_FRAME_ERROR, <<"stream ended mid-frame">>}};
+            {error, {connection_error, ?H3_FRAME_ERROR, <<"stream ended mid-frame">>}, State};
         {ok, Rest, Stream1, State1} ->
             %% RFC 9114 §4.1: the message ends when the stream ends, not at
             %% a frame boundary. A peer that sends its FIN in a bare final
