@@ -21,7 +21,7 @@ hibernate_test_() ->
 %% rather than slept, so a slow runner that hibernates late still passes.
 an_idle_connection_shrinks() ->
     with_connection(#{hibernate_after => 200}, fun(Conn) ->
-        Busy = heap_after_work(Conn),
+        Busy = busiest_heap(Conn),
         %% hibernate_after counts from the last event, so wait for the
         %% connection to stop working before timing anything: under load
         %% the echo's tail traffic can still be arriving, and a heap that
@@ -70,22 +70,26 @@ explicit_hibernate_after_is_passed_through_test() ->
 default_hibernate_after_test() ->
     ?assertEqual([{hibernate_after, 5000}], quic_connection:statem_opts(#{})).
 
-%% Echo enough data to leave real garbage on the heap, then report it.
-heap_after_work(Conn) ->
+%% Echo enough data to leave real garbage on the heap, and report the
+%% largest heap seen while it was in flight. A single sample taken once
+%% the echo has arrived can be a heap that already collapsed: the transfer
+%% only has to pause for `hibernate_after', and the connection hibernates
+%% mid-echo. Measured that way the heap looked four times smaller than its
+%% peak before the test even started waiting.
+busiest_heap(Conn) ->
     {ok, StreamId} = quic:open_stream(Conn),
     Payload = binary:copy(<<"x">>, 256 * 1024),
     ok = quic:send_data(Conn, StreamId, Payload, true),
-    _ = collect(Conn, StreamId, <<>>),
-    heap_words(Conn).
+    collect(Conn, StreamId, heap_words(Conn)).
 
-collect(Conn, StreamId, Acc) ->
+collect(Conn, StreamId, Peak) ->
     receive
-        {quic, Conn, {stream_data, StreamId, Data, true}} ->
-            <<Acc/binary, Data/binary>>;
-        {quic, Conn, {stream_data, StreamId, Data, false}} ->
-            collect(Conn, StreamId, <<Acc/binary, Data/binary>>)
+        {quic, Conn, {stream_data, StreamId, _Data, true}} ->
+            max(Peak, heap_words(Conn));
+        {quic, Conn, {stream_data, StreamId, _Data, false}} ->
+            collect(Conn, StreamId, max(Peak, heap_words(Conn)))
     after 20000 ->
-        Acc
+        Peak
     end.
 
 %%====================================================================
