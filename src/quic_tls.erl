@@ -168,7 +168,8 @@ psk_offer_from_ticket(#session_ticket{} = Ticket) ->
         age = Age,
         secret = Secret,
         cipher = Ticket#session_ticket.cipher,
-        modes = [psk_dhe_ke]
+        modes = [psk_dhe_ke],
+        early_data = Ticket#session_ticket.max_early_data > 0
     }.
 
 psk_offer_from_external({Identity, Secret}) ->
@@ -265,7 +266,8 @@ build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer)
         secret = Secret,
         cipher = Cipher,
         modes = Modes,
-        type = OfferType
+        type = OfferType,
+        early_data = OfferEarlyData
     } = Offer,
 
     %% Base extensions advertise the configured PSK modes (drives the
@@ -274,13 +276,12 @@ build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer)
     BaseExtensions0 = build_client_hello_extensions(PubKey, OptsWithModes),
     %% RFC 8446 §4.2.10 / RFC 9001 §4.6.1: offer 0-RTT by carrying an empty
     %% early_data extension in the ClientHello (before pre_shared_key, which
-    %% must remain the last extension). A resumption offer always derives
-    %% early keys here, so it always offers 0-RTT.
+    %% must remain the last extension), and only on a ticket that allows it.
     BaseExtensions =
-        case OfferType of
-            resumption ->
+        case OfferEarlyData of
+            true ->
                 <<BaseExtensions0/binary, (encode_extension(?EXT_EARLY_DATA, <<>>))/binary>>;
-            _ ->
+            false ->
                 BaseExtensions0
         end,
 

@@ -251,7 +251,9 @@
     %% cipher whose hash determines binder length & key schedule
     cipher :: atom(),
     %% offered modes in client preference order
-    modes = [psk_dhe_ke] :: [psk_dhe_ke | psk_ke]
+    modes = [psk_dhe_ke] :: [psk_dhe_ke | psk_ke],
+    %% whether to offer 0-RTT: only on a ticket that allows early data
+    early_data = false :: boolean()
 }).
 
 %% HelloRetryRequest sentinel random (RFC 8446 §4.1.3): SHA-256 of

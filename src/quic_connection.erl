@@ -2321,12 +2321,12 @@ send_client_hello(State) ->
     %% Update transcript
     Transcript = ClientHello,
 
-    %% Derive early keys if we have a session ticket for 0-RTT
+    %% Derive early keys if we have a session ticket that allows 0-RTT
     EarlyKeys =
         case SessionTicket of
-            undefined ->
-                undefined;
-            #session_ticket{cipher = Cipher, resumption_secret = ResSecret} ->
+            #session_ticket{
+                max_early_data = TicketMaxEarly, cipher = Cipher, resumption_secret = ResSecret
+            } when TicketMaxEarly > 0 ->
                 %% Derive PSK and early secret
                 PSK = quic_ticket:derive_psk(ResSecret, SessionTicket),
                 EarlySecret = quic_crypto:derive_early_secret(Cipher, PSK),
@@ -2340,7 +2340,9 @@ send_client_hello(State) ->
                     EarlyTrafficSecret, Cipher, State#state.version
                 ),
                 Keys = #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher},
-                {Keys, EarlySecret}
+                {Keys, EarlySecret};
+            _ ->
+                undefined
         end,
 
     %% Encrypt and send the ClientHello, chunked across Initial packets

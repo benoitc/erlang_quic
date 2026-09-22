@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
 - A server issues a new session ticket on a handshake resumed from a
   ticket. Tickets are single-use, so a client could resume only once and
   then fell back to a full handshake without 0-RTT.
+- A client offers 0-RTT only on a ticket that allows early data
+  (RFC 8446 Section 4.2.10), and derives early keys only then.
 
 ## [1.10.0] - 2026-09-21
 
