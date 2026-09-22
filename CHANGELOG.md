@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- An HTTP/3 peer resetting a request stream, or sending STOP_SENDING
+  on it, is reported as `{stream_reset, StreamId, ErrorCode}` or
+  `{stop_sending, StreamId, ErrorCode}`, to the stream handler if one
+  is set and to the connection owner otherwise. Both were dropped, so a
+  client waiting on a response the server had reset waited out its own
+  timeout.
+- A STOP_SENDING is answered with a RESET_STREAM carrying the peer's
+  code (RFC 9000 Section 3.5).
+- `quic:reset_stream/3`, `quic:reset_stream_at/4`, `quic:stop_sending/3`
+  and `quic:send_ping/1` send their frame before returning, instead of
+  leaving it for the next packet the connection happened to send.
+
 ## [1.10.0] - 2026-09-21
 
 ### Added

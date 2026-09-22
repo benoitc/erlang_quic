@@ -1630,7 +1630,7 @@ connected({call, From}, open_unidirectional_stream, State) ->
 connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
     case do_close_stream(StreamId, ErrorCode, State) of
         {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
+            {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1639,7 +1639,7 @@ connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
 connected({call, From}, {reset_stream_at, StreamId, ErrorCode, ReliableSize}, State) ->
     case do_reset_stream_at(StreamId, ErrorCode, ReliableSize, State) of
         {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
+            {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1647,7 +1647,7 @@ connected({call, From}, {reset_stream_at, StreamId, ErrorCode, ReliableSize}, St
 connected({call, From}, {stop_sending, StreamId, ErrorCode}, State) ->
     case do_stop_sending(StreamId, ErrorCode, State) of
         {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
+            {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1796,7 +1796,7 @@ connected({call, From}, get_peer_transport_params, #state{transport_params = TP}
 connected({call, From}, send_ping, State) ->
     %% Send PING frame - bypasses congestion control
     NewState = send_keep_alive_ping(State),
-    {keep_state, NewState, [{reply, From, ok}]};
+    {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
 connected({call, From}, get_mtu, State) ->
     MTU = get_current_mtu(State),
     {keep_state, State, [{reply, From, {ok, MTU}}]};
@@ -5408,12 +5408,12 @@ process_frame(
                         remove_stream_from_queue(StreamId, State#state.send_queue),
                     NewQueueBytes = max(0, State#state.send_queue_bytes - RemovedBytes),
                     NewQueueCount = max(0, State#state.send_queue_count - RemovedCount),
-                    State#state{
+                    answer_stop_sending(StreamId, ErrorCode, Streams, State#state{
                         streams = NewStreams,
                         send_queue = NewSendQueue,
                         send_queue_bytes = NewQueueBytes,
                         send_queue_count = NewQueueCount
-                    }
+                    })
             end
     end;
 %% STREAM_DATA_BLOCKED: Peer is blocked by stream-level flow control
@@ -9711,6 +9711,25 @@ send_pending_data([{StreamId, Data, Fin} | Rest], State) ->
         {error, _Reason} ->
             %% Skip failed sends
             send_pending_data(Rest, State)
+    end.
+
+%% RFC 9000 Section 3.5: STOP_SENDING MUST be answered with RESET_STREAM
+%% while our send side is open, and carries the peer's code over. The
+%% reset is what closes the peer's side of the stream; without it the peer
+%% waits on a stream we have stopped writing to. Only a stream that already
+%% existed, and one we can send on, has a send side to reset.
+answer_stop_sending(StreamId, ErrorCode, StreamsBefore, State) ->
+    case maps:find(StreamId, StreamsBefore) of
+        {ok, #stream_state{send_done = false}} ->
+            case can_send_on_stream(StreamId, State) of
+                true ->
+                    {ok, Reset} = do_close_stream(StreamId, ErrorCode, State),
+                    Reset;
+                false ->
+                    State
+            end;
+        _ ->
+            State
     end.
 
 %% Send RESET_STREAM (RFC 9000 §3.2): closes the SEND direction only.
