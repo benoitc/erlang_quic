@@ -527,7 +527,9 @@ escape_json_string(<<C, Rest/binary>>, Acc) ->
 start_writer(Filename, Header) ->
     Parent = self(),
     Pid = spawn_link(fun() ->
-        case file:open(Filename, [write, raw, delayed_write]) of
+        %% No delayed_write: the loop already batches, and the driver's
+        %% own buffer would hold events back until 64 KB or close.
+        case file:open(Filename, [write, raw]) of
             {ok, Fd} ->
                 %% Write header as first line
                 ok = file:write(Fd, [Header, "\n"]),

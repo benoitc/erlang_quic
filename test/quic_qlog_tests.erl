@@ -325,3 +325,26 @@ frames_processed_all_types_test_() ->
             ?_assertEqual(ok, quic_qlog:close(Ctx))
         ]
     end}.
+
+%% Events reach the file while the connection is still open, within a
+%% few flush intervals, not only when the qlog is closed.
+events_reach_disk_before_close_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun(TmpDir) ->
+        Ctx = quic_qlog:new(#{qlog => #{enabled => true, dir => TmpDir}}, <<9, 9, 9, 9>>, client),
+        quic_qlog:packet_sent(Ctx, #{packet_number => 0, packet_type => initial}),
+        timer:sleep(3 * ?QLOG_FLUSH_INTERVAL_MS),
+        Written = events(TmpDir, <<"quic:packet_sent">>),
+        ok = quic_qlog:close(Ctx),
+        ?_assertMatch([_], Written)
+    end}.
+
+%% Event lines with the given name, from every qlog file in Dir.
+events(Dir, Name) ->
+    Needle = <<"\"", Name/binary, "\"">>,
+    [
+        L
+     || F <- filelib:wildcard(filename:join(Dir, "*.qlog")),
+        {ok, Bin} <- [file:read_file(F)],
+        L <- binary:split(Bin, <<"\n">>, [global, trim_all]),
+        binary:match(L, Needle) =/= nomatch
+    ].
