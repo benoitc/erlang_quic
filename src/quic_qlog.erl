@@ -391,13 +391,17 @@ encode_packet_info(Info) ->
         Frames -> Base3#{frames => encode_frames(Frames)}
     end.
 
-%% @private Encode a list of frames for qlog.
-encode_frames(Frames) ->
-    [encode_frame(F) || F <- Frames].
+%% @private Encode a list of frames for qlog. The decoder yields one
+%% padding atom per byte; a run of them is one padding frame.
+encode_frames([padding | Rest]) ->
+    {Run, Rest1} = lists:splitwith(fun(F) -> F =:= padding end, Rest),
+    [#{frame_type => <<"padding">>, length => length(Run) + 1} | encode_frames(Rest1)];
+encode_frames([Frame | Rest]) ->
+    [encode_frame(Frame) | encode_frames(Rest)];
+encode_frames([]) ->
+    [].
 
 %% @private Encode a single frame for qlog.
-encode_frame(padding) ->
-    #{frame_type => <<"padding">>};
 encode_frame(ping) ->
     #{frame_type => <<"ping">>};
 encode_frame({crypto, Offset, Data}) ->
@@ -527,7 +531,9 @@ escape_json_string(<<C, Rest/binary>>, Acc) ->
 start_writer(Filename, Header) ->
     Parent = self(),
     Pid = spawn_link(fun() ->
-        case file:open(Filename, [write, raw, delayed_write]) of
+        %% No delayed_write: the loop already batches, and the driver's
+        %% own buffer would hold events back until 64 KB or close.
+        case file:open(Filename, [write, raw]) of
             {ok, Fd} ->
                 %% Write header as first line
                 ok = file:write(Fd, [Header, "\n"]),
