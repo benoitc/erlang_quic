@@ -21,21 +21,23 @@ retry_keeps_initial_pn() ->
             qlog => #{enabled => true, dir => QlogDir}
         }),
         {ok, Conn} = quic:connect({127, 0, 0, 1}, Port, Opts, self()),
-        try
-            receive
-                {quic, Conn, {connected, _}} -> ok
-            after 5000 -> error(not_connected)
-            end,
-            %% Let the qlog writer flush the handshake events.
-            timer:sleep(300),
-            PNs = initial_packet_numbers(QlogDir),
-            %% Retry (address_validation => always) means at least two
-            %% Initials: the ClientHello and the retried one.
-            ?assert(length(PNs) >= 2),
-            ?assertEqual(lists:usort(PNs), PNs)
-        after
-            quic:safe_close(Conn)
-        end
+        receive
+            {quic, Conn, {connected, _}} -> ok
+        after 5000 -> error(not_connected)
+        end,
+        %% The connection closes its qlog as it terminates, so once it is
+        %% down the file holds every event.
+        MRef = erlang:monitor(process, Conn),
+        quic:safe_close(Conn),
+        receive
+            {'DOWN', MRef, process, Conn, _} -> ok
+        after 5000 -> error(not_closed)
+        end,
+        PNs = initial_packet_numbers(QlogDir),
+        %% Retry (address_validation => always) means at least two
+        %% Initials: the ClientHello and the retried one.
+        length(PNs) >= 2 orelse error({too_few_initials, PNs, qlog_files(QlogDir)}),
+        ?assertEqual(lists:usort(PNs), PNs)
     after
         quic_test_echo_server:stop(Srv),
         del_dir(QlogDir)
@@ -48,6 +50,10 @@ qlog_dir() ->
     ),
     ok = filelib:ensure_dir(filename:join(Dir, "x")),
     Dir.
+
+%% What was on disk, for a failure to explain itself.
+qlog_files(Dir) ->
+    [{F, filelib:file_size(F)} || F <- filelib:wildcard(filename:join(Dir, "*"))].
 
 %% Packet numbers of the Initial packets the client sent, in send order.
 %% Read off the qlog rather than the connection state: `packet_sent' is the
