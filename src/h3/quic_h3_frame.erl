@@ -25,6 +25,7 @@
     encode_push_promise/2,
     %% Frame decoding
     decode/1,
+    decode_streaming/2,
     decode_all/1,
     decode_stream_type/1,
     %% Settings helpers
@@ -149,6 +150,33 @@ decode(Data) ->
         Other ->
             Other
     end.
+
+%% @doc Decode the next frame on a request or push stream, handing out
+%% DATA payload as it arrives instead of waiting for the whole frame.
+%% `Remaining' is what the previous call left of a DATA frame, 0 between
+%% frames. A DATA piece comes back as `{data, Piece, Remaining, Rest}';
+%% other frames decode as in decode/1, capped at ?H3_MAX_FRAME_SIZE.
+-spec decode_streaming(binary(), non_neg_integer()) ->
+    {data, binary(), non_neg_integer(), binary()}
+    | {ok, frame(), binary()}
+    | {error, term()}
+    | {more, non_neg_integer()}.
+decode_streaming(Data, Remaining) when Remaining > 0 ->
+    take_data(Remaining, Data);
+decode_streaming(Data, 0) ->
+    case decode_type_and_length(Data) of
+        {ok, ?H3_FRAME_DATA, Length, Rest} ->
+            take_data(Length, Rest);
+        {ok, Type, Length, Rest} ->
+            decode_with_payload(Type, Length, Rest);
+        Other ->
+            Other
+    end.
+
+take_data(Length, Data) ->
+    Size = min(Length, byte_size(Data)),
+    <<Piece:Size/binary, Rest/binary>> = Data,
+    {data, Piece, Length - Size, Rest}.
 
 %% Internal: decode frame type and length varints
 -spec decode_type_and_length(binary()) ->

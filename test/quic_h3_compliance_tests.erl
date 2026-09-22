@@ -1527,6 +1527,135 @@ oversized_frame_rejected_test() ->
     Encoded = <<Type/binary, Len/binary>>,
     ?assertMatch({error, {frame_error, oversized, _}}, quic_h3_frame:decode(Encoded)).
 
+%% A DATA frame's payload reaches the owner as it arrives, one event per
+%% piece, with the fin on the piece that ends the stream.
+data_frame_is_delivered_in_pieces_test() ->
+    flush_mailbox(),
+    Frame = quic_h3_frame:encode_data(<<"0123456789">>),
+    <<Head:5/binary, Middle:4/binary, Tail/binary>> = Frame,
+    State0 = request_stream_state(client, #h3_stream{}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, Head, false, State0),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, Middle, false, State1),
+    {ok, _} = quic_h3_connection:handle_stream_data(0, Tail, true, State2),
+    ?assertEqual(
+        [{data, 0, <<"012">>, false}, {data, 0, <<"3456">>, false}, {data, 0, <<"789">>, true}],
+        owner_events()
+    ).
+
+%% A DATA frame past the size a buffered frame may have is fine.
+data_frame_over_the_frame_cap_is_accepted_test() ->
+    flush_mailbox(),
+    Header = <<
+        (quic_varint:encode(0))/binary, (quic_varint:encode(?H3_MAX_FRAME_SIZE + 1))/binary
+    >>,
+    State0 = request_stream_state(client, #h3_stream{}),
+    ?assertMatch({ok, _}, quic_h3_connection:handle_stream_data(0, Header, false, State0)).
+
+%% Frames other than DATA are still buffered whole, so still capped.
+headers_frame_over_the_frame_cap_is_rejected_test() ->
+    Header = <<
+        (quic_varint:encode(1))/binary, (quic_varint:encode(?H3_MAX_FRAME_SIZE + 1))/binary
+    >>,
+    State0 = request_stream_state(client, #h3_stream{}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_ERROR, _}, _},
+        quic_h3_connection:handle_stream_data(0, Header, false, State0)
+    ).
+
+%% The stream ending inside a DATA frame truncates it (RFC 9114 §7.1).
+fin_inside_data_frame_is_a_frame_error_test() ->
+    <<Part:5/binary, _/binary>> = quic_h3_frame:encode_data(<<"0123456789">>),
+    State0 = request_stream_state(client, #h3_stream{}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_ERROR, <<"stream ended mid-frame">>}, _},
+        quic_h3_connection:handle_stream_data(0, Part, true, State0)
+    ).
+
+%% A stream error on the first piece of a DATA frame resets the stream,
+%% and the rest of that frame is dropped rather than read as frames.
+rest_of_data_frame_after_stream_error_is_dropped_test() ->
+    flush_mailbox(),
+    <<Head:5/binary, Tail/binary>> = quic_h3_frame:encode_data(<<"0123456789">>),
+    Quic = fake_quic_conn(),
+    State0 = request_stream_state(client, #h3_stream{content_length = 2}, #{quic_conn => Quic}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, Head, false, State0),
+    ?assertEqual([{close_stream, 0, ?H3_MESSAGE_ERROR}], fake_quic_calls(Quic)),
+    ?assertMatch({ok, _}, quic_h3_connection:handle_stream_data(0, Tail, true, State1)),
+    ?assertEqual([], owner_events()).
+
+%% With no Content-Length, a client passes any amount through; the server,
+%% which buffers the body until a handler registers, still caps it.
+body_cap_without_content_length_is_server_only_test() ->
+    Frame = quic_h3_frame:encode_data(<<"0123456789">>),
+    NearCap = #h3_stream{body_received = ?H3_MAX_BUFFERED_BODY - 5},
+    flush_mailbox(),
+    {ok, _} = quic_h3_connection:handle_stream_data(
+        0, Frame, false, request_stream_state(client, NearCap)
+    ),
+    ?assertEqual([{data, 0, <<"0123456789">>, false}], owner_events()),
+    Quic = fake_quic_conn(),
+    {ok, _} = quic_h3_connection:handle_stream_data(
+        0, Frame, false, request_stream_state(server, NearCap, #{quic_conn => Quic})
+    ),
+    ?assertEqual([{close_stream, 0, ?H3_EXCESSIVE_LOAD}], fake_quic_calls(Quic)).
+
+%% The same piece-by-piece delivery on a push stream.
+push_data_frame_is_delivered_in_pieces_test() ->
+    flush_mailbox(),
+    <<Head:5/binary, Tail/binary>> = quic_h3_frame:encode_data(<<"0123456789">>),
+    Push = #h3_stream{id = 15, type = push, state = open, frame_state = expecting_data},
+    State0 = make_test_state(#{role => client, received_pushes => #{7 => Push}}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(15, Head, false, State0),
+    {ok, _} = quic_h3_connection:handle_stream_data(15, Tail, true, State1),
+    ?assertEqual(
+        [{push_data, 7, <<"012">>, false}, {push_data, 7, <<"3456789">>, true}, {push_complete, 7}],
+        owner_events()
+    ).
+
+push_stream_ending_inside_data_frame_is_a_frame_error_test() ->
+    <<Part:5/binary, _/binary>> = quic_h3_frame:encode_data(<<"0123456789">>),
+    Push = #h3_stream{id = 15, type = push, state = open, frame_state = expecting_data},
+    State0 = make_test_state(#{role => client, received_pushes => #{7 => Push}}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_ERROR, <<"push stream ended mid-frame">>}, _},
+        quic_h3_connection:handle_stream_data(15, Part, true, State0)
+    ).
+
+%% State with request stream 0 past its HEADERS. Stream 0 is the client's
+%% own request on a client and a peer request on a server.
+request_stream_state(Role, Stream) ->
+    request_stream_state(Role, Stream, #{}).
+
+request_stream_state(Role, Stream, Overrides) ->
+    Stream1 = Stream#h3_stream{id = 0, type = request, state = open, frame_state = expecting_data},
+    make_test_state(Overrides#{role => Role, streams => #{0 => Stream1}}).
+
+%% The quic_h3 events the owner (this process) has received, in order.
+owner_events() ->
+    Self = self(),
+    receive
+        {quic_h3, Self, Event} -> [Event | owner_events()]
+    after 0 -> []
+    end.
+
+%% Stands in for the QUIC connection, answering every call with ok and
+%% recording it.
+fake_quic_conn() ->
+    spawn_link(fun() -> fake_quic_loop([]) end).
+
+fake_quic_loop(Calls) ->
+    receive
+        {'$gen_call', From, {calls, Pid}} when is_pid(Pid) ->
+            gen:reply(From, lists:reverse(Calls)),
+            fake_quic_loop(Calls);
+        {'$gen_call', From, Call} ->
+            gen:reply(From, ok),
+            fake_quic_loop([Call | Calls])
+    end.
+
+fake_quic_calls(Quic) ->
+    gen_statem:call(Quic, {calls, self()}).
+
 %%====================================================================
 %% Theme C: Header / trailer / path / status symmetry
 %%====================================================================

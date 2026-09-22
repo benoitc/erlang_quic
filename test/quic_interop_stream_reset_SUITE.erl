@@ -3,18 +3,21 @@
 %%% Stream resets and STOP_SENDING against other QUIC stacks.
 %%%
 %%% quic_h3_stream_reset_SUITE runs both ends in this VM, so it cannot
-%%% catch a misreading both ends share. These cases put aioquic on the
-%%% other side, started by docker/docker-compose.yml:
+%%% catch a misreading both ends share. These cases put aioquic and
+%%% quic-go on the other side, started by docker/docker-compose.yml:
 %%%
 %%%   - the aioquic echo server (4433) reports every RESET_STREAM it
 %%%     receives on a stream of its own, and sends STOP_SENDING when a
 %%%     stream starts with "stop_sending <code>";
 %%%   - the aioquic HTTP/3 server (4435) resets GET /reset?code=N after
 %%%     part of the body, sends STOP_SENDING on POST /stop?code=N, and
-%%%     lists the resets it received on GET /resets.
+%%%     lists the resets it received on GET /resets;
+%%%   - the quic-go HTTP/3 example (4434) serves GET /N as N bytes, written
+%%%     as one DATA frame.
 %%%
 %%% Each group skips when its server is not reachable. Hosts and ports
-%%% come from QUIC_AIOQUIC_HOST, QUIC_AIOQUIC_PORT and QUIC_AIOQUIC_H3_PORT.
+%%% come from QUIC_AIOQUIC_HOST, QUIC_AIOQUIC_PORT, QUIC_AIOQUIC_H3_PORT,
+%%% QUIC_QUICGO_HOST and QUIC_QUICGO_PORT.
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
 %%% Apache License 2.0
@@ -30,7 +33,9 @@
     aioquic_answers_stop_sending/1,
     stop_sending_from_aioquic_is_answered/1,
     h3_reset_from_aioquic_after_partial_body/1,
-    h3_stop_sending_from_aioquic_is_answered/1
+    h3_stop_sending_from_aioquic_is_answered/1,
+    h3_large_response_from_quic_go/1,
+    h3_quic_go_answers_stop_sending/1
 ]).
 
 %% H3_REQUEST_CANCELLED (RFC 9114 Section 8.1).
@@ -42,7 +47,7 @@ suite() ->
     [{timetrap, {seconds, 60}}].
 
 all() ->
-    [{group, aioquic}, {group, aioquic_h3}].
+    [{group, aioquic}, {group, aioquic_h3}, {group, quic_go_h3}].
 
 groups() ->
     [
@@ -54,6 +59,10 @@ groups() ->
         {aioquic_h3, [sequence], [
             h3_reset_from_aioquic_after_partial_body,
             h3_stop_sending_from_aioquic_is_answered
+        ]},
+        {quic_go_h3, [sequence], [
+            h3_large_response_from_quic_go,
+            h3_quic_go_answers_stop_sending
         ]}
     ].
 
@@ -67,7 +76,9 @@ end_per_suite(_Config) ->
 init_per_group(aioquic, Config) ->
     peer(Config, "QUIC_AIOQUIC_HOST", "QUIC_AIOQUIC_PORT", 4433);
 init_per_group(aioquic_h3, Config) ->
-    peer(Config, "QUIC_AIOQUIC_HOST", "QUIC_AIOQUIC_H3_PORT", 4435).
+    peer(Config, "QUIC_AIOQUIC_HOST", "QUIC_AIOQUIC_H3_PORT", 4435);
+init_per_group(quic_go_h3, Config) ->
+    peer(Config, "QUIC_QUICGO_HOST", "QUIC_QUICGO_PORT", 4434).
 
 end_per_group(_Group, _Config) ->
     ok.
@@ -155,6 +166,36 @@ h3_stop_sending_from_aioquic_is_answered(Config) ->
     end.
 
 %%====================================================================
+%% quic-go, HTTP/3
+%%====================================================================
+
+%% quic-go writes the whole body as one DATA frame, far past the 1 MiB a
+%% buffered frame may have.
+h3_large_response_from_quic_go(Config) ->
+    Conn = connect_h3(Config),
+    try
+        ?assertMatch({200, <<_:20000000/binary>>}, http_get(Conn, <<"/20000000">>))
+    after
+        quic_h3:close(Conn)
+    end.
+
+%% STOP_SENDING part way through a large download: quic-go answers with
+%% RESET_STREAM, which reaches the owner, and the connection stays usable.
+h3_quic_go_answers_stop_sending(Config) ->
+    Conn = connect_h3(Config),
+    try
+        {ok, StreamId} = quic_h3:request(Conn, headers(<<"GET">>, <<"/100000000">>)),
+        ?assertMatch({response, StreamId, 200, _}, next_h3(Conn)),
+        ?assertMatch({data, StreamId, _, false}, next_h3(Conn)),
+        ok = quic:stop_sending(quic_h3:get_quic_conn(Conn), StreamId, ?REQUEST_CANCELLED),
+        {stream_reset, StreamId, Code} = await_h3_reset(Conn, StreamId),
+        ?assertMatch({200, <<_:10/binary>>}, http_get(Conn, <<"/10">>)),
+        {comment, io_lib:format("quic-go reset with code ~p", [Code])}
+    after
+        quic_h3:close(Conn)
+    end.
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -214,6 +255,13 @@ next_h3(Conn) ->
         {quic_h3, Conn, {session_ticket, _}} -> next_h3(Conn);
         {quic_h3, Conn, Event} -> Event
     after ?WAIT_MS -> timeout
+    end.
+
+%% Skips the body still in flight when the reset arrives.
+await_h3_reset(Conn, StreamId) ->
+    case next_h3(Conn) of
+        {data, StreamId, _, _} -> await_h3_reset(Conn, StreamId);
+        Event -> Event
     end.
 
 %% A complete GET, as {Status, Body}.
