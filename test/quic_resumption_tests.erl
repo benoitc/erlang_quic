@@ -427,3 +427,54 @@ clienthello_with_psk_test() ->
 
     %% Decode and verify it's a ClientHello (type 1)
     <<1:8, _Len:24, _Body/binary>> = Msg.
+
+%% RFC 8446 §4.2.10: a client offers early data only on a ticket that
+%% allows it, one whose NewSessionTicket carried a max_early_data.
+clienthello_offers_early_data_only_when_the_ticket_allows_test() ->
+    ?assert(offers_early_data(16384)),
+    ?assertNot(offers_early_data(0)).
+
+%% And only then derives the keys to send it with.
+client_derives_early_keys_only_when_the_ticket_allows_test() ->
+    {ok, _} = application:ensure_all_started(quic),
+    ?assert(has_early_keys(16384)),
+    ?assertNot(has_early_keys(0)).
+
+offers_early_data(MaxEarlyData) ->
+    Opts = #{
+        server_name => <<"example.com">>,
+        alpn => [<<"h3">>],
+        transport_params => #{},
+        session_ticket => ticket(MaxEarlyData)
+    },
+    {<<1:8, _Len:24, Body/binary>>, _PrivKey, _Random} = quic_tls:build_client_hello(Opts),
+    {ok, #{early_data := EarlyData}} = quic_tls:parse_client_hello(Body),
+    EarlyData.
+
+%% A client connection to a port nothing answers on, so it stays in the
+%% state it built its ClientHello in.
+has_early_keys(MaxEarlyData) ->
+    {ok, Silent} = gen_udp:open(0, [binary, {active, false}]),
+    {ok, Port} = inet:port(Silent),
+    Opts = #{verify => false, alpn => [<<"h3">>], session_ticket => ticket(MaxEarlyData)},
+    {ok, Conn} = quic:connect(<<"127.0.0.1">>, Port, Opts, self()),
+    try
+        quic:has_early_keys(Conn)
+    after
+        quic:close(Conn, normal),
+        gen_udp:close(Silent)
+    end.
+
+ticket(MaxEarlyData) ->
+    #session_ticket{
+        server_name = <<"example.com">>,
+        ticket = crypto:strong_rand_bytes(32),
+        lifetime = 86400,
+        age_add = 12345,
+        nonce = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+        resumption_secret = crypto:strong_rand_bytes(32),
+        max_early_data = MaxEarlyData,
+        received_at = erlang:system_time(second) - 10,
+        cipher = aes_128_gcm,
+        alpn = <<"h3">>
+    }.

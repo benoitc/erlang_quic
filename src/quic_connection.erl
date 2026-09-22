@@ -1430,6 +1430,17 @@ handshaking({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) 
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
+%% 0-RTT: HTTP/3 opens its control and QPACK streams as early data, and
+%% the connection can be past `idle' by the time it does (mirrors idle).
+handshaking({call, From}, open_unidirectional_stream, #state{early_keys = undefined} = State) ->
+    {keep_state, State, [{reply, From, {error, not_connected}}]};
+handshaking({call, From}, open_unidirectional_stream, State) ->
+    case do_open_unidirectional_stream(State) of
+        {ok, StreamId, NewState} ->
+            {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
 %% 0-RTT: Allow sending data during handshake if early keys are available
 handshaking(
     {call, From},
@@ -2321,12 +2332,12 @@ send_client_hello(State) ->
     %% Update transcript
     Transcript = ClientHello,
 
-    %% Derive early keys if we have a session ticket for 0-RTT
+    %% Derive early keys if we have a session ticket that allows 0-RTT
     EarlyKeys =
         case SessionTicket of
-            undefined ->
-                undefined;
-            #session_ticket{cipher = Cipher, resumption_secret = ResSecret} ->
+            #session_ticket{
+                max_early_data = TicketMaxEarly, cipher = Cipher, resumption_secret = ResSecret
+            } when TicketMaxEarly > 0 ->
                 %% Derive PSK and early secret
                 PSK = quic_ticket:derive_psk(ResSecret, SessionTicket),
                 EarlySecret = quic_crypto:derive_early_secret(Cipher, PSK),
@@ -2340,7 +2351,9 @@ send_client_hello(State) ->
                     EarlyTrafficSecret, Cipher, State#state.version
                 ),
                 Keys = #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher},
-                {Keys, EarlySecret}
+                {Keys, EarlySecret};
+            _ ->
+                undefined
         end,
 
     %% Encrypt and send the ClientHello, chunked across Initial packets
@@ -2888,12 +2901,13 @@ send_handshake_done(State) ->
 %% Server: Send NewSessionTicket after handshake completes
 %% RFC 8446 Section 4.6.1: Server sends NewSessionTicket in post-handshake message
 %% In QUIC, this is sent as a TLS handshake message in a CRYPTO frame
-send_new_session_ticket(#state{selected_psk = Sel} = State) when Sel =/= undefined ->
-    %% Suppress NewSessionTicket on PSK-authenticated handshakes (v1
+send_new_session_ticket(#state{selected_psk = #{source := external}} = State) ->
+    %% Suppress NewSessionTicket on external-PSK handshakes (v1
     %% — see docs/PSK.md "v1 limitations"). External-PSK clients
     %% already have a long-lived credential and don't need a
     %% resumption ticket; mixing the two raises a binding question
-    %% we don't want to answer right now.
+    %% we don't want to answer right now. A handshake resumed from a
+    %% ticket gets a new one: tickets are single-use.
     State;
 send_new_session_ticket(#state{resumption_secret = undefined} = State) ->
     %% No resumption secret available - skip sending ticket
@@ -6548,7 +6562,8 @@ do_server_client_hello_cont(
                     identity => maps:get(identity, Sel),
                     identity_idx => maps:get(identity_idx, Sel),
                     secret => PSKSecret,
-                    mode => Mode
+                    mode => Mode,
+                    source => external
                 },
                 {
                     undefined,
@@ -6582,7 +6597,8 @@ do_server_client_hello_cont(
                                             identity => Identity,
                                             identity_idx => 0,
                                             secret => PSK,
-                                            mode => psk_dhe_ke
+                                            mode => psk_dhe_ke,
+                                            source => ticket
                                         },
                                         EK =
                                             case WantsEarlyData of

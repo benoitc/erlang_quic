@@ -448,7 +448,8 @@
             identity => binary(),
             identity_idx => non_neg_integer(),
             secret => binary(),
-            mode => psk_dhe_ke | psk_ke
+            mode => psk_dhe_ke | psk_ke,
+            source => external | ticket
         },
 
     %% 0-RTT / Early Data (RFC 9001 Section 4.6)
