@@ -326,6 +326,26 @@ frames_processed_all_types_test_() ->
         ]
     end}.
 
+%% A padding run is one frame with its length, not one entry per byte:
+%% a 1200-byte PMTU probe used to add about 36 KB to the qlog.
+padding_run_is_one_frame_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun(TmpDir) ->
+        Ctx = quic_qlog:new(#{qlog => #{enabled => true, dir => TmpDir}}, <<5, 6, 7, 8>>, client),
+        ok = quic_qlog:frames_processed(
+            Ctx, [ping] ++ lists:duplicate(1200, padding) ++ [ping, padding]
+        ),
+        ok = quic_qlog:close(Ctx),
+        [Event] = events(TmpDir, <<"quic:frames_processed">>),
+        Frames = frame_types(Event),
+        [
+            ?_assertEqual(
+                [<<"ping">>, <<"padding">>, <<"ping">>, <<"padding">>],
+                [T || {T, _} <- Frames]
+            ),
+            ?_assertEqual([1200, 1], [L || {<<"padding">>, L} <- Frames])
+        ]
+    end}.
+
 %% Events reach the file while the connection is still open, within a
 %% few flush intervals, not only when the qlog is closed.
 events_reach_disk_before_close_test_() ->
@@ -348,3 +368,23 @@ events(Dir, Name) ->
         L <- binary:split(Bin, <<"\n">>, [global, trim_all]),
         binary:match(L, Needle) =/= nomatch
     ].
+
+%% {frame_type, length} for each frame in an event line, in order. Frame
+%% objects are flat, so each one is a brace pair with no brace inside.
+frame_types(Event) ->
+    {match, Objects} = re:run(
+        Event, <<"\\{[^{}]*\"frame_type\"[^{}]*\\}">>, [global, {capture, first, binary}]
+    ),
+    [{field(<<"frame_type\":\"([a-z_]+)">>, O), frame_length(O)} || [O] <- Objects].
+
+frame_length(Object) ->
+    case field(<<"\"length\":([0-9]+)">>, Object) of
+        undefined -> undefined;
+        Digits -> binary_to_integer(Digits)
+    end.
+
+field(Pattern, Object) ->
+    case re:run(Object, Pattern, [{capture, all_but_first, binary}]) of
+        {match, [Value]} -> Value;
+        nomatch -> undefined
+    end.

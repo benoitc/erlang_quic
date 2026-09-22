@@ -19,6 +19,8 @@ All notable changes to this project will be documented in this file.
 - qlog events reach the file while the connection is open, within the
   writer's 100 ms flush interval. The file driver's write buffer held
   them back until 64 KB had built up or the connection closed.
+- qlog logs a run of padding as one `padding` frame with its `length`,
+  instead of one entry per byte.
 
 ## [1.10.0] - 2026-09-21
 
