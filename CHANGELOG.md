@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Client sockets no longer set `SO_REUSEADDR`. With it set the kernel can
+  hand two client sockets the same ephemeral port and then deliver every
+  datagram to only one of them, so the other connection sends its
+  ClientHello and its probes and never sees a reply. Under 150
+  simultaneous connects on one host this stalled about one connection
+  per round. Listeners keep `SO_REUSEADDR` for their fixed port.
+
+### Fixed
 - An HTTP/3 peer resetting a request stream, or sending STOP_SENDING
   on it, is reported as `{stream_reset, StreamId, ErrorCode}` or
   `{stop_sending, StreamId, ErrorCode}`, to the stream handler if one

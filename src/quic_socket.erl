@@ -795,7 +795,9 @@ open_socket_backend(Port, Family, Opts, BatchConfig) ->
     end.
 
 configure_and_bind_socket(Socket, Port, Family, Opts, BatchConfig) ->
-    ok = socket:setopt(Socket, {socket, reuseaddr}, true),
+    %% SO_REUSEADDR lets a restarted listener rebind its port; an
+    %% ephemeral port must be unique, so it stays off for Port 0.
+    Port =/= 0 andalso (ok = socket:setopt(Socket, {socket, reuseaddr}, true)),
     set_socket_buffer_sizes(Socket, Opts),
     maybe_set_reuseport(Socket, Opts),
     %% Honor a specific bind address from extra_socket_opts {ip, Addr};
@@ -867,8 +869,10 @@ open_send_socket_backend(Family, Opts, BatchConfig) ->
             Error
     end.
 
+%% No SO_REUSEADDR on a client socket: with it set, the kernel may hand
+%% two sockets the same ephemeral port and then deliver every datagram to
+%% only one of them, leaving the other connection deaf.
 configure_send_socket(Socket, Opts, BatchConfig) ->
-    ok = socket:setopt(Socket, {socket, reuseaddr}, true),
     set_socket_buffer_sizes(Socket, Opts),
     maybe_bind_source(Socket, Opts),
     %% GSO is applied per-message via the UDP_SEGMENT cmsg in
@@ -940,7 +944,6 @@ build_send_genudp_opts(Family, Opts) ->
         binary,
         Family,
         {active, ActiveN},
-        {reuseaddr, true},
         {recbuf, RecBuf},
         {sndbuf, SndBuf}
     ] ++ ExtraFlags.
@@ -950,7 +953,7 @@ build_send_genudp_opts(Family, Opts) ->
 %%====================================================================
 
 open_genudp_backend(Port, Opts, BatchConfig) ->
-    SocketOpts = build_genudp_opts(Opts),
+    SocketOpts = build_genudp_opts(Port, Opts),
     case gen_udp:open(Port, SocketOpts) of
         {ok, Socket} ->
             {ok, build_genudp_state(Socket, BatchConfig)};
@@ -958,7 +961,7 @@ open_genudp_backend(Port, Opts, BatchConfig) ->
             Error
     end.
 
-build_genudp_opts(Opts) ->
+build_genudp_opts(Port, Opts) ->
     ActiveN = maps:get(active_n, Opts, 100),
     ReusePort = maps:get(reuseport, Opts, false),
     ExtraFlags = maps:get(extra_socket_opts, Opts, []),
@@ -968,7 +971,7 @@ build_genudp_opts(Opts) ->
         binary,
         extra_socket_family(ExtraFlags),
         {active, ActiveN},
-        {reuseaddr, true},
+        {reuseaddr, Port =/= 0},
         {recbuf, RecBuf},
         {sndbuf, SndBuf}
     ],
