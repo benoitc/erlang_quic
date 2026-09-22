@@ -56,6 +56,7 @@
     detect_capabilities/0,
     get_fd/1,
     get_socket/1,
+    reuseaddr_for_port/1,
     gso_supported/1,
     info/1,
     recv_queue_max/1,
@@ -795,7 +796,7 @@ open_socket_backend(Port, Family, Opts, BatchConfig) ->
     end.
 
 configure_and_bind_socket(Socket, Port, Family, Opts, BatchConfig) ->
-    ok = socket:setopt(Socket, {socket, reuseaddr}, true),
+    maybe_set_reuseaddr(Socket, Port),
     set_socket_buffer_sizes(Socket, Opts),
     maybe_set_reuseport(Socket, Opts),
     %% Honor a specific bind address from extra_socket_opts {ip, Addr};
@@ -809,6 +810,23 @@ set_socket_buffer_sizes(Socket, Opts) ->
     _ = socket:setopt(Socket, {socket, rcvbuf}, RecBuf),
     _ = socket:setopt(Socket, {socket, sndbuf}, SndBuf),
     ok.
+
+%% @doc Whether a UDP socket bound to `Port' should set SO_REUSEADDR.
+%% Only a listener on a fixed port needs it, to rebind after a restart.
+%% On an ephemeral port it buys nothing, and it makes the kernel treat a
+%% port held by another SO_REUSEADDR socket as free when it autobinds, so
+%% two sockets land on one port and only one of them sees its datagrams.
+%% A gen_udp caller that wants it anyway can pass it in `extra_socket_opts',
+%% which is appended last; the socket backend reads only `{ip, _}' there.
+-spec reuseaddr_for_port(inet:port_number()) -> boolean().
+reuseaddr_for_port(0) -> false;
+reuseaddr_for_port(_Port) -> true.
+
+maybe_set_reuseaddr(Socket, Port) ->
+    case reuseaddr_for_port(Port) of
+        true -> ok = socket:setopt(Socket, {socket, reuseaddr}, true);
+        false -> ok
+    end.
 
 maybe_set_reuseport(Socket, Opts) ->
     case maps:get(reuseport, Opts, false) of
@@ -868,7 +886,6 @@ open_send_socket_backend(Family, Opts, BatchConfig) ->
     end.
 
 configure_send_socket(Socket, Opts, BatchConfig) ->
-    ok = socket:setopt(Socket, {socket, reuseaddr}, true),
     set_socket_buffer_sizes(Socket, Opts),
     maybe_bind_source(Socket, Opts),
     %% GSO is applied per-message via the UDP_SEGMENT cmsg in
@@ -940,7 +957,6 @@ build_send_genudp_opts(Family, Opts) ->
         binary,
         Family,
         {active, ActiveN},
-        {reuseaddr, true},
         {recbuf, RecBuf},
         {sndbuf, SndBuf}
     ] ++ ExtraFlags.
@@ -950,7 +966,7 @@ build_send_genudp_opts(Family, Opts) ->
 %%====================================================================
 
 open_genudp_backend(Port, Opts, BatchConfig) ->
-    SocketOpts = build_genudp_opts(Opts),
+    SocketOpts = build_genudp_opts(Port, Opts),
     case gen_udp:open(Port, SocketOpts) of
         {ok, Socket} ->
             {ok, build_genudp_state(Socket, BatchConfig)};
@@ -958,7 +974,7 @@ open_genudp_backend(Port, Opts, BatchConfig) ->
             Error
     end.
 
-build_genudp_opts(Opts) ->
+build_genudp_opts(Port, Opts) ->
     ActiveN = maps:get(active_n, Opts, 100),
     ReusePort = maps:get(reuseport, Opts, false),
     ExtraFlags = maps:get(extra_socket_opts, Opts, []),
@@ -968,7 +984,7 @@ build_genudp_opts(Opts) ->
         binary,
         extra_socket_family(ExtraFlags),
         {active, ActiveN},
-        {reuseaddr, true},
+        {reuseaddr, reuseaddr_for_port(Port)},
         {recbuf, RecBuf},
         {sndbuf, SndBuf}
     ],
