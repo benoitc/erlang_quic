@@ -136,6 +136,9 @@
     frame_state = expecting_headers ::
         expecting_headers | expecting_data | expecting_trailers | complete,
 
+    %% Bytes of the current DATA frame still to arrive; 0 between frames.
+    data_remaining = 0 :: non_neg_integer(),
+
     %% Priority (RFC 9218 Extensible Priorities)
     %% urgency: 0-7 (lower = more urgent, default 3)
     %% incremental: whether data can be processed incrementally

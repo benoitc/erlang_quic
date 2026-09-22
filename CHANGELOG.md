@@ -21,6 +21,14 @@ All notable changes to this project will be documented in this file.
   them back until 64 KB had built up or the connection closed.
 - qlog logs a run of padding as one `padding` frame with its `length`,
   instead of one entry per byte.
+- HTTP/3 DATA frames of any size are accepted, and their payload reaches
+  the owner or stream handler as it arrives. A DATA frame over 1 MiB,
+  which `quic_h3:send_data/4` and the Go http3 server produce for a large
+  body written in one call, closed the connection with H3_FRAME_ERROR.
+- An HTTP/3 client receives a response without Content-Length past
+  16 MiB; the cap now applies only to the request body a server buffers.
+- A request or push stream ending inside a frame closes the connection
+  with H3_FRAME_ERROR instead of crashing the HTTP/3 connection process.
 
 ## [1.10.0] - 2026-09-21
 

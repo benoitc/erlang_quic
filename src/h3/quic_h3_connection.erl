@@ -2136,26 +2136,37 @@ handle_push_stream_data(
     Combined = <<Buffer/binary, Data/binary>>,
     case process_push_frames(StreamId, PushId, Combined, Fin, State) of
         {ok, Rest, State1} ->
-            Buffers1 =
-                case Rest of
-                    <<>> -> maps:remove(StreamId, Buffers);
-                    _ -> Buffers#{StreamId => Rest}
-                end,
-            {ok, State1#state{stream_buffers = Buffers1}};
+            Truncated = Fin andalso (Rest =/= <<>> orelse push_data_remaining(PushId, State1) > 0),
+            case Truncated of
+                true ->
+                    %% Stream ended inside an H3 frame (RFC 9114 §7.1).
+                    {error, {connection_error, ?H3_FRAME_ERROR, <<"push stream ended mid-frame">>},
+                        State};
+                false ->
+                    Buffers1 =
+                        case Rest of
+                            <<>> -> maps:remove(StreamId, Buffers);
+                            _ -> Buffers#{StreamId => Rest}
+                        end,
+                    {ok, State1#state{stream_buffers = Buffers1}}
+            end;
         {error, Reason} ->
             {error, Reason, State}
     end.
 
 %% Process frames on push stream
 process_push_frames(StreamId, PushId, Data, Fin, State) ->
-    case quic_h3_frame:decode(Data) of
+    case quic_h3_frame:decode_streaming(Data, push_data_remaining(PushId, State)) of
+        {data, <<>>, Remaining, Rest} when Remaining > 0 ->
+            {ok, Rest, set_push_data_remaining(PushId, Remaining, State)};
+        {data, Piece, Remaining, Rest} ->
+            State0 = set_push_data_remaining(PushId, Remaining, State),
+            PieceFin = Fin andalso Remaining =:= 0 andalso Rest =:= <<>>,
+            process_push_frame(StreamId, PushId, {data, Piece}, PieceFin, Rest, Fin, State0);
         {ok, Frame, Rest} ->
-            case handle_push_frame(StreamId, PushId, Frame, Fin andalso Rest =:= <<>>, State) of
-                {ok, State1} ->
-                    process_push_frames(StreamId, PushId, Rest, Fin, State1);
-                {error, Reason} ->
-                    {error, Reason}
-            end;
+            process_push_frame(
+                StreamId, PushId, Frame, Fin andalso Rest =:= <<>>, Rest, Fin, State
+            );
         {error, {h2_reserved_frame, Type}} ->
             {error,
                 {connection_error, ?H3_FRAME_UNEXPECTED,
@@ -2168,6 +2179,28 @@ process_push_frames(StreamId, PushId, Data, Fin, State) ->
                     )}};
         {more, _} ->
             {ok, Data, State}
+    end.
+
+process_push_frame(StreamId, PushId, Frame, FrameFin, Rest, Fin, State) ->
+    case handle_push_frame(StreamId, PushId, Frame, FrameFin, State) of
+        {ok, State1} -> process_push_frames(StreamId, PushId, Rest, Fin, State1);
+        {error, Reason} -> {error, Reason}
+    end.
+
+%% Bytes of the push stream's current DATA frame still to arrive.
+push_data_remaining(PushId, #state{received_pushes = Received}) ->
+    case maps:get(PushId, Received, undefined) of
+        #h3_stream{data_remaining = Remaining} -> Remaining;
+        undefined -> 0
+    end.
+
+set_push_data_remaining(PushId, Remaining, #state{received_pushes = Received} = State) ->
+    case maps:find(PushId, Received) of
+        {ok, Stream} ->
+            Stream1 = Stream#h3_stream{data_remaining = Remaining},
+            State#state{received_pushes = Received#{PushId => Stream1}};
+        error ->
+            State
     end.
 
 %% Handle individual frames on push stream
@@ -2523,11 +2556,19 @@ handle_request_stream_data(
     Stream = maps:get(StreamId, Streams, #h3_stream{id = StreamId, type = request, state = open}),
     Buffer = maps:get(StreamId, Buffers, <<>>),
     Combined = <<Buffer/binary, Data/binary>>,
+    handle_request_stream_data(StreamId, Combined, Fin, Stream, State).
 
+handle_request_stream_data(_StreamId, _Data, _Fin, #h3_stream{state = closed}, State) ->
+    {ok, State};
+handle_request_stream_data(
+    StreamId, Combined, Fin, Stream, #state{streams = Streams, stream_buffers = Buffers} = State
+) ->
     case process_request_frames(StreamId, Combined, Fin, Stream, State) of
-        {ok, Rest, _Stream1, _State1} when Fin, Rest =/= <<>> ->
+        {ok, Rest, #h3_stream{data_remaining = Owed}, _State1} when
+            Fin andalso (Rest =/= <<>> orelse Owed > 0)
+        ->
             %% Stream ended inside an H3 frame: truncated (RFC 9114 §7.1).
-            {error, {connection_error, ?H3_FRAME_ERROR, <<"stream ended mid-frame">>}};
+            {error, {connection_error, ?H3_FRAME_ERROR, <<"stream ended mid-frame">>}, State};
         {ok, Rest, Stream1, State1} ->
             %% RFC 9114 §4.1: the message ends when the stream ends, not at
             %% a frame boundary. A peer that sends its FIN in a bare final
@@ -2552,6 +2593,8 @@ handle_request_stream_data(
 %% The stream's FIN arrived after the last complete frame. If the body
 %% was already closed by a fin-marked frame delivery this is a no-op;
 %% an open body gets its final empty fin-marked delivery here.
+finish_request_stream(_StreamId, #h3_stream{state = closed} = Stream, State) ->
+    {Stream, State};
 finish_request_stream(
     StreamId, #h3_stream{frame_state = expecting_data} = Stream, State
 ) ->
@@ -2560,19 +2603,21 @@ finish_request_stream(
 finish_request_stream(_StreamId, Stream, State) ->
     {Stream, State}.
 
-process_request_frames(StreamId, Data, Fin, Stream, #state{quic_conn = QuicConn} = State) ->
-    case quic_h3_frame:decode(Data) of
+process_request_frames(StreamId, Data, Fin, Stream, State) ->
+    case quic_h3_frame:decode_streaming(Data, Stream#h3_stream.data_remaining) of
+        {data, <<>>, Remaining, Rest} when Remaining > 0 ->
+            %% A DATA frame header with none of its payload yet.
+            {ok, Rest, Stream#h3_stream{data_remaining = Remaining}, State};
+        {data, Piece, Remaining, Rest} ->
+            Stream0 = Stream#h3_stream{data_remaining = Remaining},
+            PieceFin = Fin andalso Remaining =:= 0 andalso Rest =:= <<>>,
+            process_request_frame(
+                StreamId, {data, Piece}, PieceFin, Rest, Fin, Stream0, State
+            );
         {ok, Frame, Rest} ->
-            case handle_request_frame(StreamId, Frame, Fin andalso Rest =:= <<>>, Stream, State) of
-                {ok, Stream1, State1} ->
-                    process_request_frames(StreamId, Rest, Fin, Stream1, State1);
-                {error, {stream_reset, SId, Code}} ->
-                    %% Stream-level error - reset the stream and remove from tracking
-                    quic:reset_stream(QuicConn, SId, Code),
-                    {ok, <<>>, Stream, State#state{streams = maps:remove(SId, State#state.streams)}};
-                {error, Reason} ->
-                    {error, Reason}
-            end;
+            process_request_frame(
+                StreamId, Frame, Fin andalso Rest =:= <<>>, Rest, Fin, Stream, State
+            );
         %% RFC 9114 Section 7.2.4: duplicate settings use H3_SETTINGS_ERROR
         {error, {frame_error, settings, {duplicate_setting, _Key}}} ->
             {error, {connection_error, ?H3_SETTINGS_ERROR, <<"duplicate setting identifier">>}};
@@ -2593,6 +2638,21 @@ process_request_frames(StreamId, Data, Fin, Stream, #state{quic_conn = QuicConn}
                     iolist_to_binary(io_lib:format("malformed ~p: ~p", [FrameType, Reason]))}};
         {more, _} ->
             {ok, Data, Stream, State}
+    end.
+
+process_request_frame(
+    StreamId, Frame, FrameFin, Rest, Fin, Stream, #state{quic_conn = QuicConn} = State
+) ->
+    case handle_request_frame(StreamId, Frame, FrameFin, Stream, State) of
+        {ok, Stream1, State1} ->
+            process_request_frames(StreamId, Rest, Fin, Stream1, State1);
+        {error, {stream_reset, SId, Code}} ->
+            %% Stream-level error: reset it, and drop what else arrives on
+            %% it, the rest of a DATA frame included.
+            quic:reset_stream(QuicConn, SId, Code),
+            {ok, <<>>, Stream#h3_stream{state = closed, data_remaining = 0}, State};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 handle_request_frame(
@@ -2646,16 +2706,16 @@ handle_request_frame(
                 end,
             {ok, Stream2, State1}
     end;
-%% DATA frame - no content-length
+%% DATA frame - no content-length. The server buffers a request body until
+%% a handler registers, so it caps the total; a client hands each piece to
+%% its owner and holds nothing.
 handle_request_frame(
     StreamId,
     {data, Payload},
     _Fin,
     #h3_stream{frame_state = expecting_data} = Stream,
-    _State
+    #state{role = server}
 ) when (Stream#h3_stream.body_received + byte_size(Payload)) > ?H3_MAX_BUFFERED_BODY ->
-    %% Without Content-Length, cap the total received body bytes so a peer
-    %% cannot keep an unbounded application stream open indefinitely.
     {error, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}};
 handle_request_frame(
     StreamId,
