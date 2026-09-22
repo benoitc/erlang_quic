@@ -2646,16 +2646,16 @@ handle_request_frame(
                 end,
             {ok, Stream2, State1}
     end;
-%% DATA frame - no content-length
+%% DATA frame - no content-length. The server buffers a request body until
+%% a handler registers, so it caps the total; a client hands each piece to
+%% its owner and holds nothing.
 handle_request_frame(
     StreamId,
     {data, Payload},
     _Fin,
     #h3_stream{frame_state = expecting_data} = Stream,
-    _State
+    #state{role = server}
 ) when (Stream#h3_stream.body_received + byte_size(Payload)) > ?H3_MAX_BUFFERED_BODY ->
-    %% Without Content-Length, cap the total received body bytes so a peer
-    %% cannot keep an unbounded application stream open indefinitely.
     {error, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}};
 handle_request_frame(
     StreamId,

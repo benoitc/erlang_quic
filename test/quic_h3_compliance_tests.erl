@@ -1536,6 +1536,22 @@ fin_inside_data_frame_is_a_frame_error_test() ->
         quic_h3_connection:handle_stream_data(0, Part, true, State0)
     ).
 
+%% With no Content-Length, a client passes any amount through; the server,
+%% which buffers the body until a handler registers, still caps it.
+body_cap_without_content_length_is_server_only_test() ->
+    Frame = quic_h3_frame:encode_data(<<"0123456789">>),
+    NearCap = #h3_stream{body_received = ?H3_MAX_BUFFERED_BODY - 5},
+    flush_mailbox(),
+    {ok, _} = quic_h3_connection:handle_stream_data(
+        0, Frame, false, request_stream_state(client, NearCap)
+    ),
+    ?assertEqual([{data, 0, <<"0123456789">>, false}], owner_events()),
+    Quic = fake_quic_conn(),
+    {ok, _} = quic_h3_connection:handle_stream_data(
+        0, Frame, false, request_stream_state(server, NearCap, #{quic_conn => Quic})
+    ),
+    ?assertEqual([{close_stream, 0, ?H3_EXCESSIVE_LOAD}], fake_quic_calls(Quic)).
+
 %% State with request stream 0 past its HEADERS. Stream 0 is the client's
 %% own request on a client and a peer request on a server.
 request_stream_state(Role, Stream) ->
@@ -1544,6 +1560,32 @@ request_stream_state(Role, Stream) ->
 request_stream_state(Role, Stream, Overrides) ->
     Stream1 = Stream#h3_stream{id = 0, type = request, state = open, frame_state = expecting_data},
     make_test_state(Overrides#{role => Role, streams => #{0 => Stream1}}).
+
+%% The quic_h3 events the owner (this process) has received, in order.
+owner_events() ->
+    Self = self(),
+    receive
+        {quic_h3, Self, Event} -> [Event | owner_events()]
+    after 0 -> []
+    end.
+
+%% Stands in for the QUIC connection, answering every call with ok and
+%% recording it.
+fake_quic_conn() ->
+    spawn_link(fun() -> fake_quic_loop([]) end).
+
+fake_quic_loop(Calls) ->
+    receive
+        {'$gen_call', From, {calls, Pid}} when is_pid(Pid) ->
+            gen:reply(From, lists:reverse(Calls)),
+            fake_quic_loop(Calls);
+        {'$gen_call', From, Call} ->
+            gen:reply(From, ok),
+            fake_quic_loop([Call | Calls])
+    end.
+
+fake_quic_calls(Quic) ->
+    gen_statem:call(Quic, {calls, self()}).
 
 %%====================================================================
 %% Theme C: Header / trailer / path / status symmetry

@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
 - `quic:reset_stream/3`, `quic:reset_stream_at/4`, `quic:stop_sending/3`
   and `quic:send_ping/1` send their frame before returning, instead of
   leaving it for the next packet the connection happened to send.
+- An HTTP/3 client receives a response without Content-Length past
+  16 MiB; the cap now applies only to the request body a server buffers.
 - A request stream ending inside a frame closes the connection
   with H3_FRAME_ERROR instead of crashing the HTTP/3 connection process.
 
