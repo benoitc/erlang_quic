@@ -508,9 +508,11 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
         %% peer's SETTINGS are applied (apply_peer_settings/2), never from our
         %% local settings, so 0-RTT early-data requests stay static-only until
         %% the server's remembered capacity is known (RFC 9114 §7.2.4.2). The
-        %% decoder is sized by the capacity we advertise, which we must honour.
+        %% decoder carries what we advertised as its ceiling: RFC 9204 §3.2.2
+        %% starts the table at zero capacity, and only the peer's Set Dynamic
+        %% Table Capacity opens it, up to that ceiling.
         qpack_encoder = quic_qpack:new(#{max_allowed_capacity => MaxTableCapacity}),
-        qpack_decoder = quic_qpack:new(#{max_dynamic_size => MaxTableCapacity}),
+        qpack_decoder = quic_qpack:new(#{max_allowed_capacity => MaxTableCapacity}),
         % Client uses even stream IDs (0, 4, 8, ...)
         next_stream_id = 0,
         local_max_field_section_size = LocalMaxFieldSize,
@@ -553,9 +555,11 @@ init({server, QuicConn, Opts, Owner}) ->
         %% peer's SETTINGS are applied (apply_peer_settings/2), never from our
         %% local settings, so 0-RTT early-data requests stay static-only until
         %% the server's remembered capacity is known (RFC 9114 §7.2.4.2). The
-        %% decoder is sized by the capacity we advertise, which we must honour.
+        %% decoder carries what we advertised as its ceiling: RFC 9204 §3.2.2
+        %% starts the table at zero capacity, and only the peer's Set Dynamic
+        %% Table Capacity opens it, up to that ceiling.
         qpack_encoder = quic_qpack:new(#{max_allowed_capacity => MaxTableCapacity}),
-        qpack_decoder = quic_qpack:new(#{max_dynamic_size => MaxTableCapacity}),
+        qpack_decoder = quic_qpack:new(#{max_allowed_capacity => MaxTableCapacity}),
         % Server uses odd stream IDs (1, 5, 9, ...)
         next_stream_id = 1,
         local_max_field_section_size = LocalMaxFieldSize,

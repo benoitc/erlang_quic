@@ -808,6 +808,19 @@ data_buffered_when_no_handler_test() ->
         #{0 => {[{<<"hello">>, false}], 5 + ?H3_BUFFER_CHUNK_OVERHEAD, false}}, StreamDataBuffers
     ).
 
+%% An encoder-stream instruction that announces more than any insertable
+%% entry could need closes the connection, rather than being buffered
+%% until it never completes.
+oversized_encoder_instruction_closes_the_connection_test() ->
+    State = make_test_state(#{role => server, peer_encoder_stream => 6}),
+    %% Insert With Literal Name announcing a 64 KiB name, with no capacity
+    %% negotiated, so no entry could be inserted at all.
+    Instruction = <<2#01011111, 16#E1, 16#FF, 16#03>>,
+    ?assertMatch(
+        {error, {connection_error, ?H3_QPACK_ENCODER_STREAM_ERROR, _}, _},
+        quic_h3_connection:handle_stream_data(6, Instruction, false, State)
+    ).
+
 %%====================================================================
 %% Buffered request bodies (max_buffered_body)
 %%====================================================================
