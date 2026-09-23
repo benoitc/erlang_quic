@@ -62,6 +62,15 @@ macOS defers loopback UDP. On an otherwise idle pair of sockets, plain `gen_udp`
 
 So a test that has to pass on macOS must not assert how quickly a peer receives something. Assert what the sender did instead: `test/quic_api_frame_send_tests.erl` counts the datagrams a call writes to the socket, and `test/quic_socket_reuseaddr_tests.erl` reads socket options back. Where a test does have to wait for delivery, give it seconds, not hundreds of milliseconds.
 
+To reproduce a race that only shows up under load, give the container one CPU:
+
+```bash
+docker run --rm --network host --privileged --cpus=1 \
+  -v "$PWD":/app -v /app/_build -w /app quic-ct quic_dist_simultaneous_connect_SUITE
+```
+
+Handshake steps that normally finish in a millisecond then take tens of them, and orderings the scheduler usually hides become common. The QUIC distribution simultaneous-connect race failed about a third of these runs and never failed otherwise.
+
 A test must fail for one reason. A denial test that also passes when the call crashes, or a test that asserts a value it computed itself, is worse than no test because it reads as coverage.
 
 ## What CI enforces
