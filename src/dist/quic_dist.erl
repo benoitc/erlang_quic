@@ -279,6 +279,10 @@ accept_connection(_AcceptPid, DistCtrl, MyNode, Allowed, SetupTime) ->
             %% Do NOT trap exits: dist_util:start_timer/1 spawns a linked
             %% timer whose exit must kill this process on timeout.
             ok = quic_dist_controller:set_supervisor(DistCtrl, Kernel),
+            %% net_kernel resolves a simultaneous connect by killing a
+            %% handshake process; the connection has to go with it, or
+            %% the peer waits on a read that will never be answered.
+            ok = quic_dist_controller:set_handshake_owner(DistCtrl, self()),
             Timer = dist_util:start_timer(SetupTime),
             HSData = create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel),
             dist_util:handshake_other_started(HSData)
@@ -1235,6 +1239,7 @@ start_client_controller(Kernel, Node, Conn, MyNode, Type, Timer) ->
             _ = quic_dist_controller:adopt_owner_events(Conn, DistCtrl),
             quic_dist_controller:set_supervisor(DistCtrl, Kernel),
             quic_dist_controller:set_node(DistCtrl, Node),
+            ok = quic_dist_controller:set_handshake_owner(DistCtrl, self()),
             HSData = create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer),
             %% From here the handshake belongs to dist_util, and
             %% net_kernel resolves a simultaneous connect by killing this

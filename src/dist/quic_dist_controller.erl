@@ -61,6 +61,7 @@
     getstat/1,
     get_address/2,
     set_supervisor/2,
+    set_handshake_owner/2,
     set_node/2,
     get_node/1,
     getll/1,
@@ -136,6 +137,10 @@
     %% Supervision
     supervisor :: pid() | undefined,
     kernel :: pid() | undefined,
+
+    %% The dist_util process this controller serves. dist_util expects
+    %% the transport to go with it, so its exit closes the connection.
+    handshake_owner_mon :: reference() | undefined,
 
     %% Remote node info
     node :: node() | undefined,
@@ -284,6 +289,19 @@ get_address(Controller, Node) ->
 -spec set_supervisor(Controller :: pid(), Supervisor :: pid()) -> ok.
 set_supervisor(Controller, Supervisor) ->
     gen_statem:cast(Controller, {set_supervisor, Supervisor}).
+
+%% @doc Name the dist_util process this controller serves.
+%%
+%% `dist_util' owns the transport in stock distribution, so net_kernel
+%% resolves a simultaneous connect by killing the losing handshake
+%% process and lets the peer discover the dropped socket. Here the
+%% connection belongs to the controller, so it has to follow that
+%% process down itself. Synchronous: the caller hands control to
+%% dist_util straight after, and by then the connection must already be
+%% tied to it.
+-spec set_handshake_owner(Controller :: pid(), Owner :: pid()) -> ok.
+set_handshake_owner(Controller, Owner) when is_pid(Owner) ->
+    gen_statem:call(Controller, {set_handshake_owner, Owner}).
 
 %% @doc Set the other node name.
 -spec set_node(Controller :: pid(), Node :: node()) -> ok.
@@ -840,6 +858,12 @@ connected({call, From}, {controlling_process, StreamId, NewOwner}, State) ->
     handle_controlling_process(From, StreamId, NewOwner, State);
 connected({call, From}, list_user_streams, State) ->
     handle_list_user_streams(From, State);
+connected(
+    info,
+    {'DOWN', MonRef, process, _Pid, _Reason},
+    #state{handshake_owner_mon = MonRef} = State
+) when MonRef =/= undefined ->
+    stop_and_fail_reads({shutdown, handshake_owner_down}, State);
 %% Handle user stream owner DOWN
 connected(info, {'DOWN', MonRef, process, Pid, _Reason}, State) ->
     handle_user_stream_owner_down(MonRef, Pid, State);
@@ -890,6 +914,26 @@ handle_common_event(
     {keep_state, State, [{reply, From, {ok, Address}}]};
 handle_common_event(cast, {set_supervisor, Pid}, _StateName, State) ->
     {keep_state, State#state{supervisor = Pid, kernel = Pid}};
+handle_common_event(
+    {call, From},
+    {set_handshake_owner, Owner},
+    _StateName,
+    #state{handshake_owner_mon = Old} = State
+) ->
+    _ =
+        case Old of
+            undefined -> ok;
+            _ -> erlang:demonitor(Old, [flush])
+        end,
+    MonRef = erlang:monitor(process, Owner),
+    {keep_state, State#state{handshake_owner_mon = MonRef}, [{reply, From, ok}]};
+handle_common_event(
+    info,
+    {'DOWN', MonRef, process, _Pid, _Reason},
+    _StateName,
+    #state{handshake_owner_mon = MonRef} = State
+) when MonRef =/= undefined ->
+    stop_and_fail_reads({shutdown, handshake_owner_down}, State);
 handle_common_event(cast, {set_node, Node}, _StateName, State) ->
     {keep_state, State#state{node = Node}};
 handle_common_event({call, From}, get_node, _StateName, #state{node = Node} = State) ->
@@ -1000,14 +1044,14 @@ handle_common_event(
     #state{conn = Conn} = State
 ) ->
     %% Connection closed
-    {stop, close_reason(Reason), State};
+    stop_and_fail_reads(close_reason(Reason), State);
 handle_common_event(
     info,
     {quic, Conn, {transport_error, Code, Reason}},
     _StateName,
     #state{conn = Conn} = State
 ) ->
-    {stop, {transport_error, Code, Reason}, State};
+    stop_and_fail_reads({transport_error, Code, Reason}, State);
 handle_common_event(
     info,
     {quic, _OtherRef, {stream_data, StreamId, Data, _Fin}},
@@ -1035,6 +1079,13 @@ handle_common_event(info, pending_tick_retry, _StateName, State) ->
     {keep_state, State2};
 handle_common_event(_EventType, _Event, _StateName, State) ->
     {keep_state, State}.
+
+%% A read blocked on a connection that has gone answers like a closed
+%% socket, which dist_util reports as a failed handshake step. Left
+%% unanswered the caller dies out of the gen_statem call instead.
+stop_and_fail_reads(Reason, #state{recv_waiters = Waiters} = State) ->
+    Replies = [{reply, From, {error, closed}} || {From, _Ref, _Len} <- Waiters],
+    {stop_and_reply, Reason, Replies, State#state{recv_waiters = []}}.
 
 %% A node leaving is not a fault. A peer that closed the connection
 %% cleanly, which for distribution means an application close with error

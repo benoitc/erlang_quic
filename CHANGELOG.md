@@ -61,6 +61,16 @@ All notable changes to this project will be documented in this file.
   held, so it also reset large uploads a handler was reading. Buffered bytes
   are now released when a stream is reset or cancelled, and empty or
   fin-only pieces are charged so they cannot accumulate for free.
+- A QUIC distribution connection is closed when the `dist_util` process
+  handshaking over it dies, which is what stock distribution gets from
+  socket ownership. net_kernel resolves a simultaneous connect by killing
+  the losing handshake process, and the peer, seeing no drop, blocked in
+  `recv_status` until its setup timer fired seconds later while
+  net_kernel held a pending entry for that node, so the next
+  `connect_node/1` on either side returned false.
+- A distribution handshake read waiting on a connection that closes gets
+  `{error, closed}`, which `dist_util` reports as a failed handshake,
+  instead of the caller dying out of the gen_statem call.
 - `SO_REUSEADDR` is set only on a listener bound to a fixed port. On a
   client socket, or a listener on port 0, it let the kernel autobind two
   sockets to one port and deliver every datagram for it to one of them,
