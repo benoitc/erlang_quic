@@ -14,7 +14,7 @@
 
 start_connection_test() ->
     %% Start a connection process
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     ?assert(is_pid(Pid)),
     ?assert(is_process_alive(Pid)),
 
@@ -27,7 +27,9 @@ start_connection_test() ->
     timer:sleep(100).
 
 connect_returns_ref_test() ->
-    {ok, Ref, Pid} = quic_connection:connect("127.0.0.1", 4433, #{}, self()),
+    {ok, Ref, Pid} = quic_connection:connect(
+        "127.0.0.1", quic_test_silent_peer:port(), #{}, self()
+    ),
     ?assert(is_reference(Ref)),
     ?assert(is_pid(Pid)),
 
@@ -35,7 +37,7 @@ connect_returns_ref_test() ->
     timer:sleep(100).
 
 state_info_contains_required_fields_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     {_State, Info} = quic_connection:get_state(Pid),
 
     ?assert(maps:is_key(scid, Info)),
@@ -59,28 +61,28 @@ state_info_contains_required_fields_test() ->
 
 custom_max_data_test() ->
     Opts = #{max_data => 2000000},
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), Opts, self()),
     ?assert(is_pid(Pid)),
     quic_connection:close(Pid, normal),
     timer:sleep(100).
 
 custom_max_streams_test() ->
     Opts = #{max_streams_bidi => 50, max_streams_uni => 25},
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), Opts, self()),
     ?assert(is_pid(Pid)),
     quic_connection:close(Pid, normal),
     timer:sleep(100).
 
 custom_idle_timeout_test() ->
     Opts = #{idle_timeout => 60000},
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), Opts, self()),
     ?assert(is_pid(Pid)),
     quic_connection:close(Pid, normal),
     timer:sleep(100).
 
 alpn_option_test() ->
     Opts = #{alpn => <<"h3">>},
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), Opts, self()),
     ?assert(is_pid(Pid)),
     quic_connection:close(Pid, normal),
     timer:sleep(100).
@@ -90,7 +92,7 @@ alpn_option_test() ->
 %%====================================================================
 
 close_normal_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     quic_connection:close(Pid, normal),
     timer:sleep(200),
 
@@ -103,14 +105,14 @@ close_normal_test() ->
 %%====================================================================
 
 process_cast_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     %% Should not crash
     ok = quic_connection:process(Pid),
     quic_connection:close(Pid, normal),
     timer:sleep(100).
 
 handle_timeout_cast_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     %% Should not crash
     ok = quic_connection:handle_timeout(Pid),
     quic_connection:close(Pid, normal),
@@ -121,8 +123,10 @@ handle_timeout_cast_test() ->
 %%====================================================================
 
 multiple_connections_test() ->
-    {ok, Pid1} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
-    {ok, Pid2} = quic_connection:start_link("127.0.0.1", 4434, #{}, self()),
+    {ok, Pid1} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
+    {ok, Pid2} = quic_connection:start_link(
+        "127.0.0.1", quic_test_silent_peer:port(2), #{}, self()
+    ),
 
     ?assertNotEqual(Pid1, Pid2),
 
@@ -141,19 +145,23 @@ multiple_connections_test() ->
 %%====================================================================
 
 ipv4_tuple_address_test() ->
-    {ok, Pid} = quic_connection:start_link({127, 0, 0, 1}, 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link(
+        {127, 0, 0, 1}, quic_test_silent_peer:port(), #{}, self()
+    ),
     ?assert(is_pid(Pid)),
     quic_connection:close(Pid, normal),
     timer:sleep(100).
 
 string_hostname_test() ->
-    {ok, Pid} = quic_connection:start_link("localhost", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("localhost", quic_test_silent_peer:port(), #{}, self()),
     ?assert(is_pid(Pid)),
     quic_connection:close(Pid, normal),
     timer:sleep(100).
 
 binary_hostname_test() ->
-    {ok, Pid} = quic_connection:start_link(<<"localhost">>, 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link(
+        <<"localhost">>, quic_test_silent_peer:port(), #{}, self()
+    ),
     ?assert(is_pid(Pid)),
     quic_connection:close(Pid, normal),
     timer:sleep(100).
@@ -346,7 +354,7 @@ ack_ranges_convert_empty_test() ->
 
 %% Test that send_queue_bytes is tracked in connection state
 send_queue_bytes_in_state_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     {_State, Info} = quic_connection:get_state(Pid),
 
     %% Should have send_queue_bytes field in state info
@@ -358,7 +366,7 @@ send_queue_bytes_in_state_test() ->
 
 %% Test that recv_buffer_bytes is tracked in connection state
 recv_buffer_bytes_in_state_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     {_State, Info} = quic_connection:get_state(Pid),
 
     %% Should have recv_buffer_bytes field in state info
@@ -370,7 +378,7 @@ recv_buffer_bytes_in_state_test() ->
 
 %% Test that state info contains both queue counters
 state_info_contains_queue_counters_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     {_State, Info} = quic_connection:get_state(Pid),
 
     %% Verify both counters are present
@@ -539,7 +547,7 @@ default_connection_stream_ratio_test() ->
 custom_max_receive_window_test() ->
     CustomMaxWindow = 4194304,
     Opts = #{max_receive_window => CustomMaxWindow},
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), Opts, self()),
     {_State, Info} = quic_connection:get_state(Pid),
 
     ?assertEqual(CustomMaxWindow, maps:get(fc_max_receive_window, Info)),
@@ -549,7 +557,7 @@ custom_max_receive_window_test() ->
 
 %% Test that state contains flow control auto-tuning fields
 state_contains_fc_auto_tune_fields_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     {_State, Info} = quic_connection:get_state(Pid),
 
     %% Should have auto-tuning fields
@@ -567,7 +575,7 @@ state_contains_fc_auto_tune_fields_test() ->
 
 %% Test that max_data_local uses new default (1.5x stream window)
 max_data_local_default_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     {_State, Info} = quic_connection:get_state(Pid),
 
     %% max_data_local should be 768KB (1.5 * 512KB)
@@ -581,7 +589,7 @@ max_data_local_default_test() ->
 custom_max_data_overrides_default_test() ->
     CustomMaxData = 2097152,
     Opts = #{max_data => CustomMaxData},
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), Opts, self()),
     {_State, Info} = quic_connection:get_state(Pid),
 
     ?assertEqual(CustomMaxData, maps:get(max_data_local, Info)),
@@ -591,7 +599,7 @@ custom_max_data_overrides_default_test() ->
 
 %% Test that fc_max_receive_window defaults to 8MB
 fc_max_receive_window_default_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     {_State, Info} = quic_connection:get_state(Pid),
 
     %% 8MB = 8388608 bytes
@@ -702,7 +710,7 @@ ack_classify_recv_trigger_test() ->
 %% lazily from last_activity), so it must be present even in the idle
 %% state before any handshake.
 idle_timer_armed_at_init_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     {idle, Info} = quic_connection:get_state(Pid),
     ?assert(maps:get(idle_timer_armed, Info)),
     quic_connection:close(Pid, normal),
@@ -711,7 +719,7 @@ idle_timer_armed_at_init_test() ->
 %% idle_timeout = 0 disables the idle timer entirely.
 idle_timer_not_armed_when_zero_test() ->
     Opts = #{idle_timeout => 0},
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), Opts, self()),
     {idle, Info} = quic_connection:get_state(Pid),
     ?assertNot(maps:get(idle_timer_armed, Info)),
     quic_connection:close(Pid, normal),
@@ -726,7 +734,7 @@ idle_timer_not_armed_when_zero_test() ->
 %% keep-alive timer still unarmed.
 keep_alive_not_armed_before_connected_test() ->
     Opts = #{keep_alive_interval => 5000, idle_timeout => 30000},
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), Opts, self()),
     {idle, Info} = quic_connection:get_state(Pid),
     ?assert(maps:get(idle_timer_armed, Info)),
     ?assertNot(maps:get(keep_alive_timer_armed, Info)),
@@ -739,7 +747,7 @@ keep_alive_not_armed_before_connected_test() ->
 
 %% Without a session ticket the client never derives early keys.
 has_early_keys_initially_false_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     ?assertEqual(false, quic_connection:has_early_keys(Pid)),
     quic_connection:close(Pid, normal),
     timer:sleep(100).
@@ -749,7 +757,7 @@ has_early_keys_initially_false_test() ->
 has_early_keys_true_with_ticket_test() ->
     Ticket = make_test_session_ticket(<<"127.0.0.1">>),
     Opts = #{session_ticket => Ticket, server_name => <<"127.0.0.1">>},
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), Opts, self()),
     ?assertEqual(true, quic_connection:has_early_keys(Pid)),
     quic_connection:close(Pid, normal),
     timer:sleep(100).
@@ -757,7 +765,7 @@ has_early_keys_true_with_ticket_test() ->
 %% Before the handshake completes the connection can't know whether the
 %% server accepted early data; the accessor returns `unknown`.
 early_data_accepted_unknown_pre_handshake_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     ?assertEqual(unknown, quic_connection:early_data_accepted(Pid)),
     quic_connection:close(Pid, normal),
     timer:sleep(100).

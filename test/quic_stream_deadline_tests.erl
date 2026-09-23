@@ -125,7 +125,7 @@ api_test_() ->
     ]}.
 
 setup() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", quic_test_silent_peer:port(), #{}, self()),
     Pid.
 
 cleanup(Pid) ->
