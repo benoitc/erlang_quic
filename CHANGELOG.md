@@ -41,6 +41,19 @@ All notable changes to this project will be documented in this file.
 - A stopping server closes its connections before its socket, so each
   sends CONNECTION_CLOSE and its clients are told at once. They heard
   nothing until their own idle timeout.
+- A QPACK encoder-stream instruction that announces more than any
+  insertable entry could need is refused before its bytes are buffered,
+  and an entry larger than the capacity in force is an encoder stream
+  error rather than being dropped while our insert count drifts from the
+  peer's (RFC 9204 Section 3.2.2). A peer could pin memory for the life of
+  the connection by announcing a huge name and stopping.
+- The QPACK dynamic table starts at zero capacity and opens only on the
+  peer's Set Dynamic Table Capacity, within what we advertised, while the
+  Required Insert Count of a field section is decoded against the
+  advertised capacity as RFC 9204 Section 4.5.1.1 requires.
+- A malformed Huffman literal or an over-long integer on the encoder
+  stream closes the connection with QPACK_ENCODER_STREAM_ERROR instead of
+  crashing the HTTP/3 connection process.
 - An HTTP/3 server bounds what it holds for request bodies whose handler
   has not registered yet: `max_buffered_body`, 16 MiB by default, counted
   across the whole connection. A body with a Content-Length was not bounded

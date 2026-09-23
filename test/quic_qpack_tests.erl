@@ -562,6 +562,118 @@ encoder_set_capacity_over_max_rejected_test() ->
         quic_qpack:process_encoder_instructions(Instruction, State)
     ).
 
+%%====================================================================
+%% Encoder stream: what a peer can make us hold
+%%====================================================================
+
+%% An instruction announces a length before its bytes arrive, so a peer
+%% that announces a huge one and stops pins that memory until the
+%% connection ends. Nothing an insertable entry could need is refused:
+%% the entry has to fit the capacity in force, so a literal name beyond
+%% it cannot be one.
+literal_name_beyond_the_capacity_is_refused_test() ->
+    State = with_capacity(256),
+    ?assertMatch(
+        {error, _},
+        quic_qpack:process_encoder_instructions(insert_literal_header(1024), State)
+    ).
+
+%% Huffman encoding can expand as well as shrink, up to 30 bits for one
+%% byte, so a Huffman length merely above the capacity may still decode
+%% to an entry that fits and has to be allowed to wait for its bytes.
+huffman_name_a_little_over_the_capacity_still_waits_test() ->
+    State = with_capacity(256),
+    ?assertMatch(
+        {incomplete, _, _},
+        quic_qpack:process_encoder_instructions(huffman_literal_header(300), State)
+    ).
+
+huffman_name_far_beyond_the_capacity_is_refused_test() ->
+    State = with_capacity(256),
+    ?assertMatch(
+        {error, _},
+        quic_qpack:process_encoder_instructions(huffman_literal_header(4 * 256 + 1), State)
+    ).
+
+%% With no capacity negotiated there is no table, so no insert can fit.
+insert_before_set_capacity_is_refused_test() ->
+    State = quic_qpack:new(#{max_allowed_capacity => 4096}),
+    ?assertMatch(
+        {error, _},
+        quic_qpack:process_encoder_instructions(insert_literal(<<"name">>, <<"value">>), State)
+    ).
+
+%% RFC 9204 §3.2.2: an entry larger than the capacity is an error, not
+%% something to drop while our insert count drifts from the peer's.
+entry_larger_than_the_capacity_is_refused_test() ->
+    State = with_capacity(64),
+    Insert = insert_literal(binary:copy(<<"n">>, 40), binary:copy(<<"v">>, 40)),
+    ?assertMatch({error, _}, quic_qpack:process_encoder_instructions(Insert, State)).
+
+%% A malformed Huffman literal is an error the caller can act on, not an
+%% exception that takes the connection process down with it.
+malformed_huffman_on_the_encoder_stream_is_an_error_test() ->
+    State = with_capacity(4096),
+    %% All ones is the EOS padding pattern, which RFC 7541 §5.2 rejects.
+    Insert = <<2#01100100, 16#FF, 16#FF, 16#FF, 16#FF, 0>>,
+    ?assertMatch({error, _}, quic_qpack:process_encoder_instructions(Insert, State)).
+
+%% A field section is decoded against the advertised ceiling, so one that
+%% arrives before the encoder has set a capacity still decodes.
+field_section_before_set_capacity_decodes_test() ->
+    State = quic_qpack:new(#{max_allowed_capacity => 4096}),
+    Encoder = quic_qpack:new(#{max_dynamic_size => 4096}),
+    {Encoded, _} = quic_qpack:encode([{<<":method">>, <<"GET">>}], Encoder),
+    ?assertMatch({{ok, [{<<":method">>, <<"GET">>}]}, _}, quic_qpack:decode(Encoded, State)).
+
+%% Under 32 bytes the formula allows no entries at all, so a field section
+%% that claims a dynamic reference cannot be decoded against one.
+required_insert_count_without_room_for_an_entry_is_refused_test() ->
+    State = quic_qpack:new(#{max_allowed_capacity => 16}),
+    %% Prefix only: encoded Required Insert Count 1, Base delta 0.
+    ?assertMatch({{error, _}, _}, quic_qpack:decode(<<1, 0>>, State)),
+    ?assertMatch({{ok, []}, _}, quic_qpack:decode(<<0, 0>>, State)).
+
+%% A decoder whose peer has set a capacity still takes inserts.
+insert_within_the_capacity_is_accepted_test() ->
+    State = with_capacity(4096),
+    ?assertMatch(
+        {ok, _},
+        quic_qpack:process_encoder_instructions(insert_literal(<<"name">>, <<"value">>), State)
+    ).
+
+%% A decoder state whose peer has set Capacity to what we advertised.
+with_capacity(Capacity) ->
+    State = quic_qpack:new(#{max_allowed_capacity => Capacity}),
+    {ok, State1} = quic_qpack:process_encoder_instructions(set_capacity(Capacity), State),
+    State1.
+
+set_capacity(Capacity) when Capacity < 31 ->
+    <<2#001:3, Capacity:5>>;
+set_capacity(Capacity) ->
+    <<2#00111111, (encode_varint_tail(Capacity - 31))/binary>>.
+
+%% Insert With Literal Name: 01Hxxxxx, name length in a 5-bit prefix.
+insert_literal_header(NameLen) ->
+    literal_header(0, NameLen).
+
+huffman_literal_header(NameLen) ->
+    literal_header(1, NameLen).
+
+literal_header(H, NameLen) when NameLen < 31 ->
+    <<2#01:2, H:1, NameLen:5>>;
+literal_header(H, NameLen) ->
+    <<2#01:2, H:1, 2#11111:5, (encode_varint_tail(NameLen - 31))/binary>>.
+
+insert_literal(Name, Value) ->
+    Header = literal_header(0, byte_size(Name)),
+    <<Header/binary, Name/binary, (byte_size(Value)):8, Value/binary>>.
+
+encode_varint_tail(Value) when Value < 128 ->
+    <<Value:8>>;
+encode_varint_tail(Value) ->
+    <<1:1, (Value band 127):7, (encode_varint_tail(Value bsr 7))/binary>>.
+
 %% RFC 9204 §3.1: static-table references MUST use a valid index
 %% (0..98 in the v1 table). A reference to 99+ is undefined; the
 %% decoder throws and the error surfaces as a decode error.

@@ -188,7 +188,7 @@ encode(Headers, State) ->
     %% silently corrupts the section once a value reaches the prefix maximum
     %% (e.g. an encoded insert count of 255 on a long-lived dynamic table),
     %% because the decoder then reads a continuation byte that was never sent.
-    RICEncoded = encode_prefixed_int(encode_ric(RIC, State#qpack.dyn_max_size), 8, 0),
+    RICEncoded = encode_prefixed_int(encode_ric(RIC, State#qpack.max_allowed_capacity), 8, 0),
     BaseEncoded = encode_prefixed_int(BaseIC - RIC, 7, 0),
     Prefix = <<RICEncoded/binary, BaseEncoded/binary>>,
 
@@ -313,7 +313,7 @@ encode_stream_cancel(StreamId) ->
 process_encoder_instructions(<<>>, State) ->
     {ok, State};
 process_encoder_instructions(Data, State) ->
-    try decode_encoder_instruction(Data) of
+    try decode_encoder_instruction(Data, State#qpack.dyn_max_size) of
         {ok, Instruction, Rest} ->
             case apply_encoder_instruction(Instruction, State) of
                 {ok, State1} ->
@@ -328,31 +328,40 @@ process_encoder_instructions(Data, State) ->
     catch
         throw:incomplete ->
             %% Return remaining data AND current state (progress preserved)
-            {incomplete, Data, State}
+            {incomplete, Data, State};
+        throw:{qpack_encoder_stream_error, Reason} ->
+            %% An announced length no insertable entry could need. Refusing
+            %% before the bytes arrive is the point: buffering them is what
+            %% a peer would otherwise get for free.
+            {error, Reason};
+        throw:{qpack_decompression_failed, Reason} ->
+            %% Thrown from the shared string and integer decoders. Without
+            %% this clause it escapes and takes the caller down with it.
+            {error, {qpack_decompression_failed, Reason}}
     end.
 
--spec decode_encoder_instruction(binary()) ->
+-spec decode_encoder_instruction(binary(), non_neg_integer()) ->
     {ok, term(), binary()} | incomplete | {error, term()}.
-decode_encoder_instruction(<<2#1:1, S:1, _:6, _/binary>> = Data) ->
+decode_encoder_instruction(<<2#1:1, S:1, _:6, _/binary>> = Data, Capacity) ->
     %% Insert With Name Reference: 1Sxxxxxx
-    decode_insert_with_name_ref(Data, S);
-decode_encoder_instruction(<<2#01:2, H:1, _:5, _/binary>> = Data) ->
+    decode_insert_with_name_ref(Data, S, Capacity);
+decode_encoder_instruction(<<2#01:2, H:1, _:5, _/binary>> = Data, Capacity) ->
     %% Insert With Literal Name: 01Hxxxxx
-    decode_insert_literal_name(Data, H);
-decode_encoder_instruction(<<2#000:3, _:5, _/binary>> = Data) ->
+    decode_insert_literal_name(Data, H, Capacity);
+decode_encoder_instruction(<<2#000:3, _:5, _/binary>> = Data, _Capacity) ->
     %% Duplicate: 000xxxxx
     decode_duplicate(Data);
-decode_encoder_instruction(<<2#001:3, _:5, _/binary>> = Data) ->
+decode_encoder_instruction(<<2#001:3, _:5, _/binary>> = Data, _Capacity) ->
     %% Set Dynamic Table Capacity: 001xxxxx
     decode_set_capacity(Data);
-decode_encoder_instruction(<<>>) ->
+decode_encoder_instruction(<<>>, _Capacity) ->
     incomplete;
-decode_encoder_instruction(_) ->
+decode_encoder_instruction(_, _Capacity) ->
     {error, invalid_encoder_instruction}.
 
--spec decode_insert_with_name_ref(binary(), 0 | 1) ->
+-spec decode_insert_with_name_ref(binary(), 0 | 1, non_neg_integer()) ->
     {ok, term(), binary()} | incomplete.
-decode_insert_with_name_ref(Data, Static) ->
+decode_insert_with_name_ref(Data, Static, Capacity) ->
     <<FirstByte, Rest0/binary>> = Data,
     IndexBits = FirstByte band 16#3F,
     {Index, Rest1} =
@@ -360,26 +369,56 @@ decode_insert_with_name_ref(Data, Static) ->
             true -> {IndexBits, Rest0};
             false -> decode_multi_byte_int(Rest0, IndexBits, 0)
         end,
-    {Value, Rest2} = decode_string(Rest1),
+    {Value, Rest2} = decode_insert_string(Rest1, Capacity),
     {ok, {insert_name_ref, Static, Index, Value}, Rest2}.
 
--spec decode_insert_literal_name(binary(), 0 | 1) ->
+-spec decode_insert_literal_name(binary(), 0 | 1, non_neg_integer()) ->
     {ok, term(), binary()} | incomplete.
-decode_insert_literal_name(Data, H) ->
+decode_insert_literal_name(Data, H, Capacity) ->
     <<_:3, NameLenBits:5, Rest0/binary>> = Data,
     {NameLen, Rest1} =
         case NameLenBits < 31 of
             true -> {NameLenBits, Rest0};
             false -> decode_multi_byte_int(Rest0, NameLenBits, 0)
         end,
+    ok = check_insert_length(H, NameLen, Capacity),
     case byte_size(Rest1) >= NameLen of
         true ->
             {Name, Rest2} = decode_string_with_huffman(H, NameLen, Rest1),
-            {Value, Rest3} = decode_string(Rest2),
+            {Value, Rest3} = decode_insert_string(Rest2, Capacity),
             {ok, {insert_literal, Name, Value}, Rest3};
         false ->
             incomplete
     end.
+
+%% A string on the encoder stream belongs to an entry the peer wants in
+%% the table, so its length is bounded by the capacity in force. The same
+%% decoder serves field sections, whose bound is the field section size,
+%% so only the insert path comes through here.
+decode_insert_string(<<H:1, 127:7, _/binary>> = Data, Capacity) ->
+    {Len, _} = decode_multi_byte_int(binary:part(Data, 1, byte_size(Data) - 1), 127, 0),
+    ok = check_insert_length(H, Len, Capacity),
+    decode_string(Data);
+decode_insert_string(<<H:1, Len:7, _/binary>> = Data, Capacity) ->
+    ok = check_insert_length(H, Len, Capacity),
+    decode_string(Data);
+decode_insert_string(Data, _Capacity) ->
+    decode_string(Data).
+
+%% What no insertable entry could need. An entry has to fit the capacity
+%% (RFC 9204 §3.2.2), so with no capacity negotiated nothing can be
+%% inserted at all. A literal string is its own decoded length. Huffman
+%% can expand as well as shrink, up to 30 bits for a byte against the
+%% 8-bit minimum, so it is allowed four times the capacity before the
+%% decoded entry could not possibly fit.
+check_insert_length(_H, _Len, 0) ->
+    throw({qpack_encoder_stream_error, insert_without_capacity});
+check_insert_length(0, Len, Capacity) when Len > Capacity ->
+    throw({qpack_encoder_stream_error, {literal_beyond_capacity, Len, Capacity}});
+check_insert_length(1, Len, Capacity) when Len > 4 * Capacity ->
+    throw({qpack_encoder_stream_error, {huffman_beyond_capacity, Len, Capacity}});
+check_insert_length(_H, _Len, _Capacity) ->
+    ok.
 
 -spec decode_duplicate(binary()) -> {ok, term(), binary()}.
 decode_duplicate(Data) ->
@@ -527,13 +566,24 @@ apply_decoder_instruction({insert_count_increment, Increment}, _State) ->
 %%====================================================================
 
 %% Encode Required Insert Count per Section 4.5.1.1
+%% No entry fits in what we advertised, so a field section cannot be
+%% referring to one.
+decode_required_insert_count(0, _MaxEntries, _InsertCount) ->
+    0;
+decode_required_insert_count(_ERIC, 0, _InsertCount) ->
+    throw({qpack_decompression_failed, required_insert_count_without_capacity});
+decode_required_insert_count(ERIC, MaxEntries, InsertCount) ->
+    quic_qpack_prefix:decode_ric(ERIC, MaxEntries, InsertCount).
+
 %% ERIC = (RIC mod (2 * MaxEntries)) + 1
 -spec encode_ric(non_neg_integer(), non_neg_integer()) -> non_neg_integer().
 encode_ric(0, _MaxSize) ->
     0;
 encode_ric(RIC, MaxSize) ->
-    MaxEntries = max(1, MaxSize div ?ENTRY_OVERHEAD),
-    (RIC rem (2 * MaxEntries)) + 1.
+    case MaxSize div ?ENTRY_OVERHEAD of
+        0 -> 0;
+        MaxEntries -> (RIC rem (2 * MaxEntries)) + 1
+    end.
 
 %% Encode headers while tracking the maximum dynamic table index referenced.
 %% `BaseIC` is the fixed Base (insert count at section start) that every
@@ -787,8 +837,11 @@ decode_prefix(Data, State) ->
                     false -> decode_multi_byte_int(Rest1, DeltaBits, 0)
                 end,
             %% Reconstruct RIC using modulo arithmetic
-            MaxEntries = max(1, State#qpack.dyn_max_size div ?ENTRY_OVERHEAD),
-            RIC = quic_qpack_prefix:decode_ric(ERIC, MaxEntries, State#qpack.insert_count),
+            %% RFC 9204 §4.5.1.1: the count is encoded against the
+            %% capacity we advertised, not the one in force, so a field
+            %% section that arrives before Set Capacity still decodes.
+            MaxEntries = State#qpack.max_allowed_capacity div ?ENTRY_OVERHEAD,
+            RIC = decode_required_insert_count(ERIC, MaxEntries, State#qpack.insert_count),
             %% Reconstruct Base per RFC 9204 Section 4.5.1.2.
             Base = quic_qpack_prefix:decode_base(SBit, RIC, DeltaBase),
             {{RIC, Base}, Rest2}
@@ -1026,18 +1079,16 @@ get_static_entry(Index) ->
 
 %% @doc Insert an entry into the dynamic table.
 %% Evicts old entries if necessary to make room.
--spec insert_entry(binary(), binary(), state()) -> {ok, state()}.
+-spec insert_entry(binary(), binary(), state()) -> {ok, state()} | {error, term()}.
 insert_entry(Name, Value, State) ->
     EntrySize = entry_size(Name, Value),
     case EntrySize > State#qpack.dyn_max_size of
         true ->
-            %% Entry too large - evict everything but don't insert
-            {ok, State#qpack{
-                dyn_entries = [],
-                dyn_field_index = #{},
-                dyn_name_index = #{},
-                dyn_size = 0
-            }};
+            %% RFC 9204 §3.2.2: an entry larger than the capacity is an
+            %% encoder stream error. Dropping it silently also skipped the
+            %% insert count, so our view of the table drifted from the
+            %% peer's and every later reference was off by one.
+            {error, {entry_larger_than_capacity, EntrySize, State#qpack.dyn_max_size}};
         false ->
             %% Evict entries to make room
             State1 = evict_to_fit(EntrySize, State),
