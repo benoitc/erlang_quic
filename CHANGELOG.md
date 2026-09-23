@@ -61,6 +61,13 @@ All notable changes to this project will be documented in this file.
   held, so it also reset large uploads a handler was reading. Buffered bytes
   are now released when a stream is reset or cancelled, and empty or
   fin-only pieces are charged so they cannot accumulate for free.
+- An HTTP/3 connection reports every close as `{quic_h3, Conn, {closed, Reason}}`.
+  Two of the three close paths sent a bare `closed`, which
+  `quic_h3:wait_connected/2` does not match, so a connection that died while
+  connecting reported a timeout it never waited out. The reason is `normal` for a
+  local close or a drained GOAWAY, `owner_down` when the owning process exits,
+  `{h3_error, Code, Phrase}` for a protocol error, and otherwise whatever the
+  QUIC connection reported.
 - A QUIC distribution connection is closed when the `dist_util` process
   handshaking over it dies, which is what stock distribution gets from
   socket ownership. net_kernel resolves a simultaneous connect by killing

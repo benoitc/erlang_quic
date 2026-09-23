@@ -2768,6 +2768,16 @@ request_missing_method_rejected_test() ->
 %%====================================================================
 
 %% Build a test state tuple matching quic_h3_connection's internal state record
+%% The builder below writes the state tuple out by hand, because the
+%% record lives inside quic_h3_connection and no test can see it. A field
+%% added to the record and not to the builder shifts every later field
+%% and turns these tests into nonsense that still passes, so compare the
+%% shape against a state a real connection built.
+make_test_state_matches_the_record_test() ->
+    ?assertEqual(
+        quic_h3_connection:state_record_size(), tuple_size(make_test_state(#{}))
+    ).
+
 make_test_state(Overrides) ->
     Default = #{
         quic_conn => undefined,
@@ -2829,7 +2839,8 @@ make_test_state(Overrides) ->
         bidi_type_buffers => #{},
         claimed_bidi_streams => #{},
         has_early_keys => false,
-        quic_connected => false
+        quic_connected => false,
+        close_reason => normal
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -2862,4 +2873,5 @@ make_test_state(Overrides) ->
         maps:get(peer_h3_datagram_enabled, Merged), maps:get(bidi_type_buffers, Merged),
         maps:get(claimed_bidi_streams, Merged), maps:get(pending_response_headers, Merged),
         %% 0-RTT bootstrap fields
-        maps:get(has_early_keys, Merged), maps:get(quic_connected, Merged)}.
+        maps:get(has_early_keys, Merged), maps:get(quic_connected, Merged),
+        maps:get(close_reason, Merged)}.

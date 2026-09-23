@@ -288,8 +288,8 @@ receive_loop(Conn, StreamId, Opts, Timeout, Status, Body) ->
         {quic_h3, Conn, {goaway, _LastId}} ->
             verbose(Opts, "Server sent GOAWAY~n", []),
             output_response(Opts, Status, Body);
-        {quic_h3, Conn, closed} ->
-            verbose(Opts, "Connection closed~n", []),
+        {quic_h3, Conn, {closed, CloseReason}} ->
+            verbose(Opts, "Connection closed: ~p~n", [CloseReason]),
             case Status of
                 undefined ->
                     io:format(standard_error, "Connection closed before response~n", []),

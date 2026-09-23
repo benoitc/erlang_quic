@@ -79,6 +79,7 @@
 %% Test exports - only available when compiled with TEST defined
 -ifdef(TEST).
 -export([
+    state_record_size/0,
     handle_stream_data/4,
     handle_stream_closed/2,
     handle_stream_closed/3,
@@ -281,7 +282,12 @@
 
     %% Set when {quic, _, {connected, _}} arrives. Used by early_data
     %% convergence logic to detect when 1-RTT is up.
-    quic_connected = false :: boolean()
+    quic_connected = false :: boolean(),
+
+    %% Why this connection is closing. Read by the `closing' enter clause,
+    %% which is the only place the owner is told, so every transition into
+    %% `closing' goes through close_with/2 to set it.
+    close_reason = normal :: term()
 }).
 
 %%====================================================================
@@ -612,9 +618,9 @@ bootstrapping({call, From}, get_peer_settings, #state{peer_settings = Settings})
 bootstrapping({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 bootstrapping(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 bootstrapping(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 bootstrapping(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 bootstrapping(
@@ -726,9 +732,9 @@ early_data({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
 early_data({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 early_data(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 early_data(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 early_data(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 early_data(
@@ -795,9 +801,9 @@ awaiting_quic({call, From}, get_peer_settings, #state{peer_settings = Settings})
 awaiting_quic({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 awaiting_quic(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 awaiting_quic(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 awaiting_quic(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 awaiting_quic(
@@ -898,9 +904,9 @@ h3_connecting({call, From}, get_peer_settings, #state{peer_settings = Settings})
 h3_connecting({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 h3_connecting(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 h3_connecting(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 h3_connecting(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 h3_connecting(
@@ -1116,13 +1122,13 @@ connected(cast, goaway, State) ->
     case send_goaway(State) of
         {ok, State1} ->
             {next_state, goaway_sent, State1};
-        {error, _Reason} ->
-            {next_state, closing, State}
+        {error, Reason} ->
+            close_with({goaway_failed, Reason}, State)
     end;
 connected(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 connected(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 connected(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 connected(info, {'DOWN', Ref, process, _Pid, _Reason}, #state{stream_handlers = Handlers} = State) ->
@@ -1198,9 +1204,9 @@ goaway_sent({call, From}, {send_data, StreamId, Data, Fin}, State) ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
 goaway_sent(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 goaway_sent(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 goaway_sent(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 goaway_sent(
@@ -1262,9 +1268,9 @@ goaway_received({call, From}, {send_data, StreamId, Data, Fin}, State) ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
 goaway_received(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 goaway_received(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 goaway_received(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 goaway_received(
@@ -1293,9 +1299,9 @@ goaway_received(_EventType, _Event, _State) ->
 %% State: closing
 %%====================================================================
 
-closing(enter, _OldState, #state{quic_conn = QuicConn, owner = Owner}) ->
+closing(enter, _OldState, #state{quic_conn = QuicConn, owner = Owner, close_reason = Reason}) ->
     quic:safe_close(QuicConn),
-    Owner ! {quic_h3, self(), closed},
+    Owner ! {quic_h3, self(), {closed, Reason}},
     {stop, normal};
 closing(
     info,
@@ -1333,7 +1339,7 @@ handle_quic_failed(Reason, #state{owner = Owner} = State) ->
 %% A cleanly closed QUIC connection must not crash the H3 process:
 %% only an abnormal QUIC exit is propagated as {quic_closed, Reason}.
 handle_quic_down(Reason, #state{owner = Owner} = State) ->
-    Owner ! {quic_h3, self(), closed},
+    Owner ! {quic_h3, self(), {closed, Reason}},
     case Reason of
         normal -> {stop, normal, State};
         shutdown -> {stop, normal, State};
@@ -4633,8 +4639,22 @@ maybe_transition_connected(#state{settings_received = true} = State) ->
 maybe_transition_connected(State) ->
     {keep_state, State}.
 
+%% Two test modules build a #state{} by writing the tuple out by hand,
+%% because the record is private to this module. This lets them check the
+%% shape still matches, instead of silently shifting every field after a
+%% new one.
+-ifdef(TEST).
+state_record_size() ->
+    record_info(size, state).
+-endif.
+
+%% Every way into `closing' records why, because the enter clause is the
+%% only place the owner is told and it has nothing else to go on.
+close_with(Reason, State) ->
+    {next_state, closing, State#state{close_reason = Reason}}.
+
 maybe_close_if_drained(#state{streams = Streams} = State) when map_size(Streams) =:= 0 ->
-    {next_state, closing, State};
+    close_with(normal, State);
 maybe_close_if_drained(State) ->
     {keep_state, State}.
 
@@ -4646,7 +4666,7 @@ handle_connection_error(
     Phrase = reason_phrase(Reason),
     Owner ! {quic_h3, self(), {error, ErrorCode, Phrase}},
     quic:safe_close(QuicConn, ErrorCode, Phrase),
-    {next_state, closing, State}.
+    close_with({h3_error, ErrorCode, Phrase}, State).
 
 reason_phrase(Reason) when is_binary(Reason) ->
     Reason;

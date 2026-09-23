@@ -129,10 +129,9 @@ with_h3_server(Config, F) ->
         _ = quic_h3:stop_server(Name)
     end.
 
-%% Whatever form the close takes, it is not a response.
+%% A close, whatever its reason, is not a response.
 await_h3_closed(Conn) ->
     receive
-        {quic_h3, Conn, closed} -> closed;
         {quic_h3, Conn, {closed, _}} -> closed;
         {quic_h3, Conn, {goaway, _}} -> await_h3_closed(Conn);
         {quic_h3, Conn, {settings, _}} -> await_h3_closed(Conn);

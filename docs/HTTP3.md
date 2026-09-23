@@ -651,7 +651,10 @@ The connection owner process receives messages in the form `{quic_h3, Conn, Even
 | `connected` | H3 connection established, SETTINGS exchanged |
 | `goaway_sent` | GOAWAY sent, no new streams accepted |
 | `{goaway, StreamId}` | GOAWAY received from peer |
-| `{closed, Reason}` | Connection closed |
+| `{closed, Reason}` | Connection closed, carrying why: `normal` for a local close or a drained GOAWAY, `owner_down` when the owning process went away, `{h3_error, ErrorCode, Phrase}` for a protocol error, otherwise the reason the QUIC connection reported |
+| `{error, ErrorCode, Phrase}` | Protocol error, sent just before the `closed` that follows it |
+| `{session_ticket, Ticket}` | Resumption ticket from the server |
+| `{early_data_rejected, StreamIds}` | Server refused 0-RTT; these streams must be retried |
 
 #### Request/Response Events
 
@@ -698,7 +701,6 @@ sides — see [HTTP Datagrams (RFC 9297)](#http-datagrams-rfc-9297) above.
 |-------|-------------|
 | `{stream_reset, StreamId, ErrorCode}` | Peer reset the stream (RESET_STREAM) |
 | `{stop_sending, StreamId, ErrorCode}` | Peer sent STOP_SENDING; stop writing to the stream |
-| `{error, Reason}` | Connection error |
 
 Both go to the stream handler registered with `set_stream_handler/3,4`
 if there is one, otherwise to the connection owner. The transport
