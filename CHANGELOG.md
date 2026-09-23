@@ -4,7 +4,50 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- An HTTP/3 connection reports every close as `{quic_h3, Conn, {closed, Reason}}`.
+  Two of the three close paths sent a bare `closed`, which
+  `quic_h3:wait_connected/2` does not match, so a connection that died while
+  connecting reported a timeout it never waited out. The reason is `normal` for a
+  local close or a drained GOAWAY, `owner_down` when the owning process exits,
+  `{h3_error, Code, Phrase}` for a protocol error, and otherwise whatever the
+  QUIC connection reported.
+- An HTTP/3 stream that this library resets is reported to its stream handler,
+  or to the connection owner if none is registered, as
+  `{stream_reset, StreamId, ErrorCode}`, the same event a peer reset produces.
+  A body refused past `max_buffered_body`, a frame error on a stream, and
+  `quic_h3:cancel/2,3` told the peer and left the local caller waiting out its
+  own timeout. The stream's handler registration is dropped with it, so a
+  cancelled stream no longer leaves a monitor behind.
+- An HTTP/3 request that finished in both directions is dropped from the
+  connection's stream map. One consequence to be aware of:
+  `quic_h3:send_datagram/3` for such a stream now returns
+  `{error, unknown_stream}`, where the leaked entry used to let it through. A
+  datagram session holds its request stream open (`end_stream => false`), as
+  extended CONNECT and MASQUE do, so it is unaffected. Nothing removed it on a clean FIN, so a connection
+  grew by the retained header list of every request it had served, and, because
+  the GOAWAY drain waits for that map to empty, a connection that had served
+  anything never closed gracefully. The half-close state is now combined rather
+  than overwritten, so a stream that finished both directions reaches `closed`.
+
+### Added
+- `quic:connect/4`, `quic:start_server/3` and `quic:server_spec/3` accept
+  `cacertfile`, a PEM file holding the trust anchors, read once where the
+  connection or server starts. The key was accepted nowhere and silently
+  ignored, so verification fell back to the OS trust store without saying so.
+  A file that cannot be read, or that holds no certificate, fails the call.
+  `cacerts` still wins when both are given.
+
 ### Fixed
+- A response that announces a Content-Length and carries no body is read as the
+  protocol defines it rather than as a short body. A HEAD response states the
+  size a GET would have returned (RFC 9110 Section 8.6), and 204 and 304 never
+  carry content (Section 6.4.1); all three were reset with H3_MESSAGE_ERROR. A
+  body that really is shorter than its Content-Length is still refused.
+- `quic_h3:send_response/4` and the push equivalent take the status as an
+  argument, so a `:status` in the header list as well is dropped rather than
+  sent beside it. Two of one pseudo-header is a malformed response
+  (RFC 9114 Section 4.3.1).
 - An HTTP/3 peer resetting a request stream, or sending STOP_SENDING
   on it, is reported as `{stream_reset, StreamId, ErrorCode}` or
   `{stop_sending, StreamId, ErrorCode}`, to the stream handler if one
@@ -61,40 +104,10 @@ All notable changes to this project will be documented in this file.
   held, so it also reset large uploads a handler was reading. Buffered bytes
   are now released when a stream is reset or cancelled, and empty or
   fin-only pieces are charged so they cannot accumulate for free.
-- `quic:connect/4`, `quic:start_server/3` and `quic:server_spec/3` accept
-  `cacertfile`, a PEM file holding the trust anchors, read once where the
-  connection or server starts. The key was accepted nowhere and silently
-  ignored, so verification fell back to the OS trust store without saying so.
-  A file that cannot be read, or that holds no certificate, fails the call.
-  `cacerts` still wins when both are given.
 - `{error, send_queue_full}` is named in the `quic:send_data/4,5` and
   `quic_h3:send_data/3,4` specs and documented as the backpressure signal it is:
   nothing was written, and the same piece should be sent again once the
   connection drains. It appeared in no spec and no page.
-- An HTTP/3 request that finished in both directions is dropped from the
-  connection's stream map. One consequence to be aware of:
-  `quic_h3:send_datagram/3` for such a stream now returns
-  `{error, unknown_stream}`, where the leaked entry used to let it through. A
-  datagram session holds its request stream open (`end_stream => false`), as
-  extended CONNECT and MASQUE do, so it is unaffected. Nothing removed it on a clean FIN, so a connection
-  grew by the retained header list of every request it had served, and, because
-  the GOAWAY drain waits for that map to empty, a connection that had served
-  anything never closed gracefully. The half-close state is now combined rather
-  than overwritten, so a stream that finished both directions reaches `closed`.
-- An HTTP/3 stream that this library resets is reported to its stream handler,
-  or to the connection owner if none is registered, as
-  `{stream_reset, StreamId, ErrorCode}`, the same event a peer reset produces.
-  A body refused past `max_buffered_body`, a frame error on a stream, and
-  `quic_h3:cancel/2,3` told the peer and left the local caller waiting out its
-  own timeout. The stream's handler registration is dropped with it, so a
-  cancelled stream no longer leaves a monitor behind.
-- An HTTP/3 connection reports every close as `{quic_h3, Conn, {closed, Reason}}`.
-  Two of the three close paths sent a bare `closed`, which
-  `quic_h3:wait_connected/2` does not match, so a connection that died while
-  connecting reported a timeout it never waited out. The reason is `normal` for a
-  local close or a drained GOAWAY, `owner_down` when the owning process exits,
-  `{h3_error, Code, Phrase}` for a protocol error, and otherwise whatever the
-  QUIC connection reported.
 - A QUIC distribution connection is closed when the `dist_util` process
   handshaking over it dies, which is what stock distribution gets from
   socket ownership. net_kernel resolves a simultaneous connect by killing

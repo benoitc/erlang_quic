@@ -128,6 +128,63 @@ content_length_underflow_returns_reset_test() ->
     ),
     ?assertMatch({error, {stream_reset, 0, ?H3_MESSAGE_ERROR}}, Result).
 
+%% RFC 9110 Section 8.6: a Content-Length on a response to HEAD states the
+%% size the body would have had for a GET. The response carries no body,
+%% and that is not a mismatch.
+head_response_with_content_length_is_not_a_mismatch_test() ->
+    Stream = #h3_stream{
+        id = 0,
+        frame_state = expecting_data,
+        method = <<"HEAD">>,
+        status = 200,
+        content_length = 48,
+        body_received = 0,
+        body = <<>>
+    },
+    State = make_test_state(#{owner => self()}),
+    ?assertMatch(
+        {ok, _, _},
+        quic_h3_connection:handle_request_frame(0, {data, <<>>}, true, Stream, State)
+    ).
+
+%% RFC 9110 Section 6.4.1: 204 and 304 never carry content either.
+no_content_response_with_content_length_is_not_a_mismatch_test() ->
+    lists:foreach(
+        fun(Status) ->
+            Stream = #h3_stream{
+                id = 0,
+                frame_state = expecting_data,
+                status = Status,
+                content_length = 48,
+                body_received = 0,
+                body = <<>>
+            },
+            State = make_test_state(#{owner => self()}),
+            ?assertMatch(
+                {ok, _, _},
+                quic_h3_connection:handle_request_frame(0, {data, <<>>}, true, Stream, State)
+            )
+        end,
+        [204, 304]
+    ).
+
+%% A body that really is short is still a mismatch.
+a_short_body_is_still_a_mismatch_test() ->
+    Stream = #h3_stream{
+        id = 0,
+        frame_state = expecting_data,
+        method = <<"GET">>,
+        status = 200,
+        content_length = 48,
+        body_received = 0,
+        body = <<>>
+    },
+    State = make_test_state(#{owner => self()}),
+    ?assertMatch(
+        {error, {stream_reset, 0, ?H3_MESSAGE_ERROR}},
+        quic_h3_connection:handle_request_frame(0, {data, <<>>}, true, Stream, State)
+    ).
+
 content_length_exact_succeeds_test() ->
     Stream = #h3_stream{
         id = 0,
