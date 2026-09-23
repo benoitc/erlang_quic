@@ -375,7 +375,8 @@ make_test_state(Overrides) ->
         %% Per-stream handler registration
         stream_handlers => #{},
         stream_data_buffers => #{},
-        stream_buffer_limit => 65536,
+        buffered_bytes => 0,
+        max_buffered_body => ?H3_MAX_BUFFERED_BODY,
         stream_type_handler => undefined,
         claimed_uni_streams => #{},
         h3_datagram_enabled => false,
@@ -407,9 +408,10 @@ make_test_state(Overrides) ->
         maps:get(local_max_push_id, Merged), maps:get(promised_pushes, Merged),
         maps:get(received_pushes, Merged), maps:get(local_cancelled_pushes, Merged),
         maps:get(last_accepted_push_id, Merged), maps:get(stream_handlers, Merged),
-        maps:get(stream_data_buffers, Merged), maps:get(stream_buffer_limit, Merged),
-        maps:get(local_connect_enabled, Merged), maps:get(stream_type_handler, Merged),
-        maps:get(claimed_uni_streams, Merged), maps:get(h3_datagram_enabled, Merged),
-        maps:get(peer_h3_datagram_enabled, Merged), maps:get(bidi_type_buffers, Merged),
-        maps:get(claimed_bidi_streams, Merged), maps:get(pending_response_headers, Merged),
-        maps:get(has_early_keys, Merged), maps:get(quic_connected, Merged)}.
+        maps:get(stream_data_buffers, Merged), maps:get(buffered_bytes, Merged),
+        maps:get(max_buffered_body, Merged), maps:get(local_connect_enabled, Merged),
+        maps:get(stream_type_handler, Merged), maps:get(claimed_uni_streams, Merged),
+        maps:get(h3_datagram_enabled, Merged), maps:get(peer_h3_datagram_enabled, Merged),
+        maps:get(bidi_type_buffers, Merged), maps:get(claimed_bidi_streams, Merged),
+        maps:get(pending_response_headers, Merged), maps:get(has_early_keys, Merged),
+        maps:get(quic_connected, Merged)}.

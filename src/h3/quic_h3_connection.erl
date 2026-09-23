@@ -103,6 +103,7 @@
     handle_push_frame/5,
     handle_priority_update_frame/2,
     handle_priority_update_push_frame/2,
+    do_cancel_stream/3,
     do_send_trailers/3,
     do_respond/5,
     pre_claim_bidi_stream/3,
@@ -112,7 +113,12 @@
 -endif.
 
 %% Exposed for tests and introspection; not part of the public H3 API.
--export([test_discarded_uni_streams/1, test_stream/2, test_push_stream/2]).
+-export([
+    test_discarded_uni_streams/1,
+    test_stream/2,
+    test_push_stream/2,
+    test_stream_data_buffers/1
+]).
 
 %%====================================================================
 %% Types
@@ -222,10 +228,15 @@
     %% Per-stream handler registration (Option A for body data routing)
     %% Maps StreamId -> {Pid, MonitorRef} for streams with registered handlers
     stream_handlers = #{} :: #{stream_id() => {pid(), reference()}},
-    %% Buffers data received before handler registers (with size limit)
+    %% Buffers data received before a handler registers. Sizes are charged
+    %% sizes: payload plus ?H3_BUFFER_CHUNK_OVERHEAD per retained chunk.
     stream_data_buffers = #{} :: #{stream_id() => {[binary()], non_neg_integer(), boolean()}},
-    %% Maximum bytes to buffer per stream before handler registers (64KB default)
-    stream_buffer_limit = 65536 :: non_neg_integer(),
+    %% What those buffers hold in total, kept as a counter so the admission
+    %% check does not walk the map for every piece that arrives.
+    buffered_bytes = 0 :: non_neg_integer(),
+    %% What this connection will hold on the application's behalf, across
+    %% all of its streams, before a handler registers to read a body.
+    max_buffered_body = ?H3_MAX_BUFFERED_BODY :: non_neg_integer(),
 
     %% RFC 9220: extended CONNECT enabled locally (advertised in our SETTINGS).
     %% Used on the server side to validate inbound :protocol pseudo-headers.
@@ -529,6 +540,7 @@ init({server, QuicConn, Opts, Owner}) ->
     Handler = maps:get(handler, Opts, undefined),
     StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
     H3DatagramEnabled = maps:get(h3_datagram_enabled, Opts, false),
+    MaxBufferedBody = maps:get(max_buffered_body, Opts, ?H3_MAX_BUFFERED_BODY),
 
     State = #state{
         quic_conn = QuicConn,
@@ -550,7 +562,8 @@ init({server, QuicConn, Opts, Owner}) ->
         local_max_blocked_streams = LocalMaxBlocked,
         local_connect_enabled = LocalConnectEnabled,
         stream_type_handler = StreamTypeHandler,
-        h3_datagram_enabled = H3DatagramEnabled
+        h3_datagram_enabled = H3DatagramEnabled,
+        max_buffered_body = MaxBufferedBody
     },
 
     %% Store handler in process dictionary for server
@@ -2598,8 +2611,18 @@ finish_request_stream(_StreamId, #h3_stream{state = closed} = Stream, State) ->
 finish_request_stream(
     StreamId, #h3_stream{frame_state = expecting_data} = Stream, State
 ) ->
-    State1 = notify_stream_data(StreamId, <<>>, true, State),
-    {Stream#h3_stream{frame_state = complete, state = half_closed_remote}, State1};
+    %% A bare fin still leaves an entry a handler may come for, so it goes
+    %% through the same admission check as a piece with a payload.
+    case deliver_body(StreamId, <<>>, true, Stream, State) of
+        {ok, Stream1, State1} ->
+            {Stream1, State1};
+        {error, {stream_reset, _StreamId, Code}} ->
+            quic:reset_stream(State#state.quic_conn, StreamId, Code),
+            {
+                Stream#h3_stream{frame_state = complete, state = closed},
+                release_buffered(StreamId, State)
+            }
+    end;
 finish_request_stream(_StreamId, Stream, State) ->
     {Stream, State}.
 
@@ -2650,7 +2673,8 @@ process_request_frame(
             %% Stream-level error: reset it, and drop what else arrives on
             %% it, the rest of a DATA frame included.
             quic:reset_stream(QuicConn, SId, Code),
-            {ok, <<>>, Stream#h3_stream{state = closed, data_remaining = 0}, State};
+            {ok, <<>>, Stream#h3_stream{state = closed, data_remaining = 0},
+                release_buffered(SId, State)};
         {error, Reason} ->
             {error, Reason}
     end.
@@ -2695,28 +2719,11 @@ handle_request_frame(
             %% Body shorter than content-length - stream error
             {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}};
         false ->
-            Stream1 = Stream#h3_stream{
-                body_received = NewReceived
-            },
-            State1 = notify_stream_data(StreamId, Payload, Fin, State),
-            Stream2 =
-                case Fin of
-                    true -> Stream1#h3_stream{frame_state = complete, state = half_closed_remote};
-                    false -> Stream1
-                end,
-            {ok, Stream2, State1}
+            deliver_body(
+                StreamId, Payload, Fin, Stream#h3_stream{body_received = NewReceived}, State
+            )
     end;
-%% DATA frame - no content-length. The server buffers a request body until
-%% a handler registers, so it caps the total; a client hands each piece to
-%% its owner and holds nothing.
-handle_request_frame(
-    StreamId,
-    {data, Payload},
-    _Fin,
-    #h3_stream{frame_state = expecting_data} = Stream,
-    #state{role = server}
-) when (Stream#h3_stream.body_received + byte_size(Payload)) > ?H3_MAX_BUFFERED_BODY ->
-    {error, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}};
+%% DATA frame - no content-length.
 handle_request_frame(
     StreamId,
     {data, Payload},
@@ -2727,13 +2734,7 @@ handle_request_frame(
     Stream1 = Stream#h3_stream{
         body_received = Stream#h3_stream.body_received + byte_size(Payload)
     },
-    State1 = notify_stream_data(StreamId, Payload, Fin, State),
-    Stream2 =
-        case Fin of
-            true -> Stream1#h3_stream{frame_state = complete, state = half_closed_remote};
-            false -> Stream1
-        end,
-    {ok, Stream2, State1};
+    deliver_body(StreamId, Payload, Fin, Stream1, State);
 %% RFC 9114 §4.4: once a CONNECT tunnel is established, only DATA frames are
 %% allowed on the stream. Reject any HEADERS (including trailers) or
 %% PUSH_PROMISE frames.
@@ -3582,7 +3583,7 @@ handle_stream_closed(
             %% H3_REQUEST_INCOMPLETE.
             maybe_reset_incomplete_request(StreamId, State),
             State1 = maybe_send_stream_cancel(StreamId, State),
-            {ok, State1#state{
+            {ok, (release_buffered(StreamId, State1))#state{
                 streams = maps:remove(StreamId, Streams),
                 stream_buffers = maps:remove(StreamId, Buffers),
                 uni_stream_buffers = maps:remove(StreamId, UniBuffers),
@@ -3610,6 +3611,9 @@ maybe_reset_incomplete_request(_StreamId, _State) ->
 
 test_discarded_uni_streams(#state{discarded_uni_streams = D}) ->
     D.
+
+test_stream_data_buffers(#state{stream_data_buffers = Buffers}) ->
+    Buffers.
 
 test_stream(StreamId, #state{streams = Streams}) ->
     maps:get(StreamId, Streams).
@@ -3896,10 +3900,13 @@ do_cancel_stream(
     quic:reset_stream(QuicConn, StreamId, ErrorCode),
     %% RFC 9204 Section 4.4.2: Send Stream Cancellation if stream was blocked
     State1 = maybe_send_stream_cancel(StreamId, State),
-    %% Drop any buffered (unsent) HEADERS for the cancelled stream.
-    State1#state{
+    %% Drop what the cancelled stream was holding: unsent HEADERS, the
+    %% partial frame buffer, and any body no handler claimed.
+    State2 = release_buffered(StreamId, State1),
+    State2#state{
         streams = maps:remove(StreamId, Streams),
-        pending_response_headers = maps:remove(StreamId, Pending)
+        pending_response_headers = maps:remove(StreamId, Pending),
+        stream_buffers = maps:remove(StreamId, State2#state.stream_buffers)
     }.
 
 %%====================================================================
@@ -3927,8 +3934,8 @@ register_stream_handler(
     MonRef = erlang:monitor(process, HandlerPid),
     NewHandlers = Handlers#{StreamId => {HandlerPid, MonRef}},
     case maps:take(StreamId, Buffers) of
-        {{Chunks, _Size, _HadFin}, NewBuffers} ->
-            State1 = State#state{stream_handlers = NewHandlers, stream_data_buffers = NewBuffers},
+        {{Chunks, _Size, _HadFin}, _NewBuffers} ->
+            State1 = release_buffered(StreamId, State#state{stream_handlers = NewHandlers}),
             drain_buffered_data(StreamId, HandlerPid, Chunks, Opts, State1);
         error ->
             {ok, State#state{stream_handlers = NewHandlers}}
@@ -3972,6 +3979,43 @@ find_handler_by_ref_iter(Ref, Iter) ->
             error
     end.
 
+%% Hand a piece of body to whoever is reading it, or refuse it.
+%%
+%% A server holds a body only until the application registers a handler, so
+%% what is bounded is what the connection holds across all of its streams,
+%% not what a stream carries: with a handler registered a body of any size
+%% streams through. A piece that would take the connection past its budget
+%% resets that stream with H3_EXCESSIVE_LOAD; the connection carries on.
+deliver_body(StreamId, Payload, Fin, Stream, State) ->
+    case body_fits(StreamId, Payload, State) of
+        true ->
+            State1 = notify_stream_data(StreamId, Payload, Fin, State),
+            {ok, finish_on_fin(Stream, Fin), State1};
+        false ->
+            {error, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}}
+    end.
+
+finish_on_fin(Stream, true) ->
+    Stream#h3_stream{frame_state = complete, state = half_closed_remote};
+finish_on_fin(Stream, false) ->
+    Stream.
+
+%% Only what gets buffered is charged: a client hands each piece to its
+%% owner, and so does a server once the stream has a handler.
+body_fits(StreamId, Payload, #state{role = server} = State) ->
+    case maps:is_key(StreamId, State#state.stream_handlers) of
+        true ->
+            true;
+        false ->
+            State#state.buffered_bytes + charge(Payload) =< State#state.max_buffered_body
+    end;
+body_fits(_StreamId, _Payload, _State) ->
+    true.
+
+%% What one retained chunk costs the budget.
+charge(Payload) ->
+    byte_size(Payload) + ?H3_BUFFER_CHUNK_OVERHEAD.
+
 %% Notify stream data to appropriate recipient
 %% If a handler is registered, send directly to handler.
 %% If no handler registered and role is client, send to owner (default client behavior).
@@ -3993,30 +4037,29 @@ notify_stream_data(
             buffer_stream_data(StreamId, Data, Fin, State)
     end.
 
-%% Buffer data for a stream (before handler registers)
+%% Buffer data for a stream (before handler registers). An empty piece is
+%% not stored unless it carries the fin, which a handler registering later
+%% still has to learn about; without that a peer could add entries for free.
+buffer_stream_data(_StreamId, <<>>, false, State) ->
+    State;
 buffer_stream_data(
     StreamId,
     Data,
     Fin,
-    #state{
-        stream_data_buffers = Buffers,
-        stream_buffer_limit = Limit
-    } = State
+    #state{stream_data_buffers = Buffers, buffered_bytes = Held} = State
 ) ->
     {Chunks, Size, HadFin} = maps:get(StreamId, Buffers, {[], 0, false}),
-    NewSize = Size + byte_size(Data),
-    case NewSize > Limit of
-        true ->
-            %% Buffer overflow - keep buffering but truncate
-            %% Add the chunk anyway but mark as overflow for debugging
-            NewChunks = [{Data, Fin} | Chunks],
-            NewBuffers = Buffers#{StreamId => {NewChunks, NewSize, HadFin orelse Fin}},
-            State#state{stream_data_buffers = NewBuffers};
-        false ->
-            NewChunks = [{Data, Fin} | Chunks],
-            NewHadFin = HadFin orelse Fin,
-            NewBuffers = Buffers#{StreamId => {NewChunks, NewSize, NewHadFin}},
-            State#state{stream_data_buffers = NewBuffers}
+    Charge = charge(Data),
+    NewBuffers = Buffers#{StreamId => {[{Data, Fin} | Chunks], Size + Charge, HadFin orelse Fin}},
+    State#state{stream_data_buffers = NewBuffers, buffered_bytes = Held + Charge}.
+
+%% Release what a stream was holding, when it is torn down or handed over.
+release_buffered(StreamId, #state{stream_data_buffers = Buffers, buffered_bytes = Held} = State) ->
+    case maps:take(StreamId, Buffers) of
+        {{_Chunks, Size, _HadFin}, NewBuffers} ->
+            State#state{stream_data_buffers = NewBuffers, buffered_bytes = max(0, Held - Size)};
+        error ->
+            State
     end.
 
 %%====================================================================

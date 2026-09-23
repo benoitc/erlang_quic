@@ -185,6 +185,23 @@ handle_request(Conn, StreamId, <<"POST">>, _Path, _Headers) ->
     end.
 ```
 
+Register promptly. Until you do, the connection holds that stream's body
+for you, and what it holds counts against `max_buffered_body`: the total
+one connection will hold across all of its streams, 16 MiB by default. A
+stream whose body would cross the budget is reset with `H3_EXCESSIVE_LOAD`
+and the connection carries on. Once you have registered, pieces are
+forwarded as they arrive and nothing is held, so a body of any size
+streams through.
+
+```erlang
+quic_h3:start_server(my_server, 4433, #{
+    cert => Cert,
+    key => Key,
+    handler => fun handle_request/5,
+    max_buffered_body => 4 * 1024 * 1024
+}).
+```
+
 #### unset_stream_handler/2
 
 Unregister a stream handler.
@@ -473,8 +490,10 @@ pid per H3 connection via the `connection_handler` option:
 ```
 
 The returned map's `owner`, `handler`, `stream_type_handler`,
-`h3_datagram_enabled`, and `settings` keys replace the listener
-defaults for that single connection; absent keys inherit.
+`h3_datagram_enabled`, `max_buffered_body`, and `settings` keys replace
+the listener defaults for that single connection; absent keys inherit. A
+`max_buffered_body` that is not a byte count fails the listener at start,
+or that one connection when it comes from this hook.
 
 #### `connection_handler` vs `set_stream_handler/3`
 

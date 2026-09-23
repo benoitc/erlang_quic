@@ -209,7 +209,8 @@
     handler => fun((conn(), stream_id(), binary(), binary(), headers()) -> any()) | module(),
     settings => map(),
     stream_type_handler => stream_type_handler(),
-    h3_datagram_enabled => boolean()
+    h3_datagram_enabled => boolean(),
+    max_buffered_body => non_neg_integer()
 }.
 
 -type server_opts() :: #{
@@ -224,10 +225,15 @@
     quic_opts => map(),
     %% Extension hook for unknown uni-stream types (e.g. WebTransport).
     stream_type_handler => stream_type_handler(),
+    %% What one connection will hold on the application's behalf, across all
+    %% of its streams, while a request body waits for `set_stream_handler/3'.
+    %% Default 16 MiB. A stream whose body would cross it is reset with
+    %% H3_EXCESSIVE_LOAD.
+    max_buffered_body => non_neg_integer(),
     %% Per-connection configuration override; the returned map's
     %% `owner', `handler', `stream_type_handler', `h3_datagram_enabled',
-    %% and `settings' keys replace the listener-wide defaults for that
-    %% single connection. Useful for spawning a dedicated router pid
+    %% `max_buffered_body' and `settings' keys replace the listener-wide
+    %% defaults for that single connection. Useful for spawning a dedicated router pid
     %% per H3 connection rather than sharing one global owner.
     connection_handler => connection_handler_fun()
 }.
@@ -531,13 +537,17 @@ start_server(Name, Port, Opts) ->
     H3Settings = maps:get(settings, Opts, #{}),
     StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
     H3DatagramEnabled = maps:get(h3_datagram_enabled, Opts, false),
+    MaxBufferedBody = valid_max_buffered_body(
+        maps:get(max_buffered_body, Opts, ?H3_MAX_BUFFERED_BODY)
+    ),
     PerConn = maps:get(connection_handler, Opts, undefined),
     QuicOpts0 = build_server_quic_opts(Opts),
     ListenerDefaults = #{
         handler => Handler,
         settings => H3Settings,
         stream_type_handler => StreamTypeHandler,
-        h3_datagram_enabled => H3DatagramEnabled
+        h3_datagram_enabled => H3DatagramEnabled,
+        max_buffered_body => MaxBufferedBody
     },
     QuicOpts = QuicOpts0#{
         connection_handler => fun(ConnPid, _ConnRef) ->
@@ -802,10 +812,18 @@ maybe_enable_quic_datagrams(Opts, QuicOpts) ->
 %% `connection_handler' callback may supply `owner => Pid' to route
 %% extension events (datagrams, stream-type) to a durable receiver.
 h3_connection_handler(QuicConnPid, #{handler := Handler, settings := Settings} = Opts) ->
-    StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
-    H3DatagramEnabled = maps:get(h3_datagram_enabled, Opts, false),
-    Owner = maps:get(owner, Opts, self()),
-    H3Opts = build_h3_opts(Settings, Handler, StreamTypeHandler, H3DatagramEnabled),
+    try build_h3_opts(Opts#{handler => Handler, settings => Settings}) of
+        H3Opts -> start_h3_connection(QuicConnPid, H3Opts, maps:get(owner, Opts, self()))
+    catch
+        error:Reason ->
+            %% A listener only logs a failing connection handler and still
+            %% feeds the Initial to the QUIC connection, so close it here or
+            %% the peer keeps a connection with no HTTP/3 process behind it.
+            _ = quic:safe_close(QuicConnPid, normal),
+            {error, Reason}
+    end.
+
+start_h3_connection(QuicConnPid, H3Opts, Owner) ->
     case
         gen_statem:start_link(
             quic_h3_connection, {server, QuicConnPid, H3Opts, Owner}, []
@@ -820,16 +838,24 @@ h3_connection_handler(QuicConnPid, #{handler := Handler, settings := Settings} =
             {error, Reason}
     end.
 
-build_h3_opts(Settings, Handler, undefined, false) ->
-    #{settings => Settings, handler => Handler};
-build_h3_opts(Settings, Handler, StreamTypeHandler, H3DatagramEnabled) ->
-    Base = #{settings => Settings, handler => Handler},
-    Base1 =
-        case StreamTypeHandler of
-            undefined -> Base;
-            _ -> Base#{stream_type_handler => StreamTypeHandler}
-        end,
-    Base1#{h3_datagram_enabled => H3DatagramEnabled}.
+%% The per-connection map, validated, with the keys the connection reads.
+build_h3_opts(Opts) ->
+    Base = maps:with(
+        [settings, handler, stream_type_handler, h3_datagram_enabled, max_buffered_body], Opts
+    ),
+    Base#{
+        h3_datagram_enabled => maps:get(h3_datagram_enabled, Opts, false),
+        max_buffered_body => valid_max_buffered_body(
+            maps:get(max_buffered_body, Opts, ?H3_MAX_BUFFERED_BODY)
+        )
+    }.
+
+%% A comparison never fails across types in Erlang, so an unvalidated limit
+%% would quietly hold everything instead of bounding anything.
+valid_max_buffered_body(Bytes) when is_integer(Bytes), Bytes >= 0 ->
+    Bytes;
+valid_max_buffered_body(Other) ->
+    error({bad_opts, {max_buffered_body, Other}}).
 
 default_handler(Conn, StreamId, _Method, _Path, _Headers) ->
     send_response(Conn, StreamId, 404, [{<<"content-type">>, <<"text/plain">>}]),

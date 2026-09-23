@@ -16,9 +16,14 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("quic/include/quic.hrl").
 
 -export([all/0, suite/0, init_per_suite/1, end_per_suite/1]).
 -export([
+    an_unread_body_is_refused_past_the_budget/1,
+    the_budget_is_shared_across_streams/1,
+    a_read_body_is_not_limited/1,
+    an_invalid_budget_is_refused/1,
     memory_does_not_grow_with_the_frame/1,
     response_in_one_large_data_frame/1,
     request_body_in_one_large_data_frame/1,
@@ -37,12 +42,19 @@
 -define(CHUNK, (1024 * 1024)).
 
 -define(WAIT_MS, 10000).
+%% Small enough that a case crosses it quickly, far above a request's own
+%% overhead so nothing crosses it by accident.
+-define(BUDGET, (256 * 1024)).
 
 suite() ->
     [{timetrap, {seconds, 120}}].
 
 all() ->
     [
+        an_unread_body_is_refused_past_the_budget,
+        the_budget_is_shared_across_streams,
+        a_read_body_is_not_limited,
+        an_invalid_budget_is_refused,
         memory_does_not_grow_with_the_frame,
         response_in_one_large_data_frame,
         request_body_in_one_large_data_frame,
@@ -60,6 +72,55 @@ end_per_suite(_Config) ->
 %%====================================================================
 %% Cases
 %%====================================================================
+
+%% A handler that never registers leaves its body in the connection, so a
+%% body past the budget is refused rather than held.
+an_unread_body_is_refused_past_the_budget(Config) ->
+    with_server(Config, #{max_buffered_body => ?BUDGET}, fun(Port) ->
+        Conn = connect(Port),
+        {ok, StreamId} = post(Conn, <<"/ignored">>, 4 * ?BUDGET),
+        ?assertEqual({stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}, next(Conn)),
+        quic_h3:close(Conn)
+    end).
+
+%% The budget belongs to the connection, so bodies on several streams are
+%% refused once together they cross it, and the connection holds no more.
+the_budget_is_shared_across_streams(Config) ->
+    with_server(Config, #{max_buffered_body => ?BUDGET}, fun(Port) ->
+        Conn = connect(Port),
+        Streams = [element(2, post(Conn, <<"/ignored">>, ?BUDGET div 2)) || _ <- lists:seq(1, 8)],
+        Resets = [Id || Id <- Streams, reset_arrived(Conn, Id)],
+        ?assert(length(Resets) >= 1),
+        ct:pal("~p of 8 streams reset once the connection budget was spent", [length(Resets)]),
+        quic_h3:close(Conn)
+    end).
+
+%% A handler that reads the body holds nothing, so no limit applies: this
+%% body is far past the cap the old received-bytes guard imposed, and it
+%% carries no Content-Length, which is where that guard applied.
+a_read_body_is_not_limited(Config) ->
+    with_server(Config, #{max_buffered_body => ?BUDGET}, fun(Port) ->
+        Conn = connect(Port),
+        {ok, StreamId} = quic_h3:request(
+            Conn, headers(<<"POST">>, <<"/count">>), #{end_stream => false}
+        ),
+        ok = send_chunks(Conn, StreamId, ?UNBOUNDED),
+        ?assertEqual({200, integer_to_binary(?UNBOUNDED)}, response(Conn, StreamId)),
+        quic_h3:close(Conn)
+    end).
+
+%% A budget that is not a size is refused when the server starts, rather
+%% than accepted and never enforced.
+an_invalid_budget_is_refused(Config) ->
+    Name = list_to_atom("h3_bad_budget_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    ?assertError(
+        {bad_opts, {max_buffered_body, <<"16mb">>}},
+        quic_h3:start_server(Name, 0, #{
+            cert => ?config(cert, Config),
+            key => ?config(key, Config),
+            max_buffered_body => <<"16mb">>
+        })
+    ).
 
 %% A DATA frame's payload passes through the connection rather than
 %% collecting in it, so what the connection holds does not grow with the
@@ -118,12 +179,19 @@ response_over_16_mib_without_content_length(Config) ->
 %%====================================================================
 
 with_server(Config, F) ->
+    with_server(Config, #{}, F).
+
+with_server(Config, Extra, F) ->
     Name = list_to_atom("h3_large_" ++ integer_to_list(erlang:unique_integer([positive]))),
-    {ok, _} = quic_h3:start_server(Name, 0, #{
-        cert => ?config(cert, Config),
-        key => ?config(key, Config),
-        handler => fun handle/5
-    }),
+    {ok, _} = quic_h3:start_server(
+        Name,
+        0,
+        maps:merge(Extra, #{
+            cert => ?config(cert, Config),
+            key => ?config(key, Config),
+            handler => fun handle/5
+        })
+    ),
     {ok, Port} = quic:get_server_port(Name),
     try
         F(Port)
@@ -137,6 +205,18 @@ handle(Conn, StreamId, <<"GET">>, <<"/large">>, _Headers) ->
 handle(Conn, StreamId, <<"GET">>, <<"/huge">>, _Headers) ->
     ok = quic_h3:send_response(Conn, StreamId, 200, []),
     quic_h3:send_data(Conn, StreamId, body(?HUGE), true);
+handle(_Conn, _StreamId, <<"POST">>, <<"/ignored">>, _Headers) ->
+    %% Never registers a stream handler: the body stays with the connection.
+    timer:sleep(?WAIT_MS);
+handle(Conn, StreamId, <<"POST">>, <<"/count">>, _Headers) ->
+    Buffered =
+        case quic_h3:set_stream_handler(Conn, StreamId, self()) of
+            ok -> [];
+            {ok, Chunks} -> Chunks
+        end,
+    Size = count_upload(Conn, StreamId, iolist_size([D || {D, _} <- Buffered]), Buffered),
+    ok = quic_h3:send_response(Conn, StreamId, 200, []),
+    quic_h3:send_data(Conn, StreamId, integer_to_binary(Size), true);
 handle(Conn, StreamId, <<"GET">>, <<"/small">>, _Headers) ->
     ok = quic_h3:send_response(Conn, StreamId, 200, []),
     quic_h3:send_data(Conn, StreamId, <<"small">>, true);
@@ -168,6 +248,45 @@ send(Conn, StreamId, Data, Fin) ->
             send(Conn, StreamId, Data, Fin);
         Result ->
             Result
+    end.
+
+%% Bytes of an upload, counting what was buffered before registration.
+count_upload(Conn, StreamId, Size, Buffered) ->
+    case lists:any(fun({_, Fin}) -> Fin end, Buffered) of
+        true -> Size;
+        false -> count_rest(Conn, StreamId, Size)
+    end.
+
+count_rest(Conn, StreamId, Size) ->
+    receive
+        {quic_h3, Conn, {data, StreamId, Data, true}} ->
+            Size + byte_size(Data);
+        {quic_h3, Conn, {data, StreamId, Data, false}} ->
+            count_rest(Conn, StreamId, Size + byte_size(Data))
+    after ?WAIT_MS -> Size
+    end.
+
+%% A POST whose body goes out in chunks, without waiting for a response.
+post(Conn, Path, Size) ->
+    {ok, StreamId} = quic_h3:request(Conn, headers(<<"POST">>, Path), #{end_stream => false}),
+    ok = send_chunks(Conn, StreamId, Size),
+    {ok, StreamId}.
+
+%% Whether this stream was reset before the case's budget of patience.
+reset_arrived(Conn, StreamId) ->
+    receive
+        {quic_h3, Conn, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}} -> true
+    after 2000 -> false
+    end.
+
+%% The next event on the connection, skipping the connection-level ones.
+next(Conn) ->
+    receive
+        {quic_h3, Conn, {settings, _}} -> next(Conn);
+        {quic_h3, Conn, {goaway, _}} -> next(Conn);
+        {quic_h3, Conn, {session_ticket, _}} -> next(Conn);
+        {quic_h3, Conn, Event} -> Event
+    after ?WAIT_MS -> timeout
     end.
 
 %% The body as buffered before registration, then as it streams in.
