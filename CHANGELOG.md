@@ -72,7 +72,11 @@ All notable changes to this project will be documented in this file.
   nothing was written, and the same piece should be sent again once the
   connection drains. It appeared in no spec and no page.
 - An HTTP/3 request that finished in both directions is dropped from the
-  connection's stream map. Nothing removed it on a clean FIN, so a connection
+  connection's stream map. One consequence to be aware of:
+  `quic_h3:send_datagram/3` for such a stream now returns
+  `{error, unknown_stream}`, where the leaked entry used to let it through. A
+  datagram session holds its request stream open (`end_stream => false`), as
+  extended CONNECT and MASQUE do, so it is unaffected. Nothing removed it on a clean FIN, so a connection
   grew by the retained header list of every request it had served, and, because
   the GOAWAY drain waits for that map to empty, a connection that had served
   anything never closed gracefully. The half-close state is now combined rather
