@@ -664,7 +664,7 @@ The connection owner process receives messages in the form `{quic_h3, Conn, Even
 | Event | Description |
 |-------|-------------|
 | `{request, StreamId, Method, Path, Headers}` | Request received (server) |
-| `{response, StreamId, Status, Headers}` | Response headers received (client) |
+| `{response, StreamId, Status, Headers}` | Response headers received (client). `Status` is the parsed status, and `Headers` is the field section as it arrived, `:status` included. Do not prepend `Status` to `Headers`: the pseudo-header is already there, and two of one is a malformed response |
 | `{data, StreamId, Data, Fin}` | Body data received |
 | `{trailers, StreamId, Trailers}` | Trailers received |
 
