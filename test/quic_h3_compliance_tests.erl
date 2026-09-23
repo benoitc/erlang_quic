@@ -803,7 +803,145 @@ data_buffered_when_no_handler_test() ->
     ),
     %% Check that data was buffered (tuple position 44 for stream_data_buffers)
     StreamDataBuffers = element(44, State2),
-    ?assertMatch(#{0 := {[{<<"hello">>, false}], 5, false}}, StreamDataBuffers).
+    ?assertMatch(#{0 := {[{<<"hello">>, false}], _, false}}, StreamDataBuffers),
+    ?assertEqual(
+        #{0 => {[{<<"hello">>, false}], 5 + ?H3_BUFFER_CHUNK_OVERHEAD, false}}, StreamDataBuffers
+    ).
+
+%%====================================================================
+%% Buffered request bodies (max_buffered_body)
+%%====================================================================
+
+%% A server holds a body only until the application registers a handler,
+%% so the budget counts what it holds, across every stream, and refuses
+%% the stream that would cross it.
+body_past_the_budget_is_refused_test() ->
+    State = buffering_state(#{max_buffered_body => 100}),
+    ?assertEqual(
+        {error, {stream_reset, 0, ?H3_EXCESSIVE_LOAD}},
+        deliver(0, binary:copy(<<"x">>, 200), false, State)
+    ).
+
+%% With a handler registered nothing is held, so no limit applies.
+body_past_the_budget_reaches_a_registered_handler_test() ->
+    Handler = self(),
+    State = buffering_state(#{
+        max_buffered_body => 100, stream_handlers => #{0 => {Handler, make_ref()}}
+    }),
+    Payload = binary:copy(<<"x">>, 200),
+    ?assertMatch({ok, _, _}, deliver(0, Payload, false, State)),
+    receive
+        {quic_h3, _, {data, 0, Payload, false}} -> ok
+    after 100 -> ?assert(false)
+    end.
+
+%% A declared Content-Length is not a licence to buffer: the same budget
+%% applies, which is the path that had no ceiling at all.
+body_with_content_length_is_charged_to_the_budget_test() ->
+    Stream = #h3_stream{id = 0, frame_state = expecting_data, content_length = 4294967296},
+    State = buffering_state(#{max_buffered_body => 100, streams => #{0 => Stream}}),
+    ?assertEqual(
+        {error, {stream_reset, 0, ?H3_EXCESSIVE_LOAD}},
+        quic_h3_connection:handle_request_frame(
+            0, {data, binary:copy(<<"x">>, 200)}, false, Stream, State
+        )
+    ).
+
+%% Empty pieces are not free: they are not buffered at all unless they
+%% carry the fin, which still has to be recorded for a late handler.
+empty_pieces_are_not_buffered_test() ->
+    State0 = buffering_state(#{}),
+    State1 = lists:foldl(
+        fun(_, S) ->
+            {ok, _, S1} = deliver(0, <<>>, false, S),
+            S1
+        end,
+        State0,
+        lists:seq(1, 100)
+    ),
+    ?assertEqual(#{}, quic_h3_connection:test_stream_data_buffers(State1)),
+    {ok, _, State2} = deliver(0, <<>>, true, State1),
+    ?assertMatch(#{0 := {_, _, true}}, quic_h3_connection:test_stream_data_buffers(State2)).
+
+%% Every retained chunk costs its payload plus a fixed overhead, so a run
+%% of requests that complete unclaimed cannot accumulate for free.
+fin_only_entries_spend_the_budget_test() ->
+    State = buffering_state(#{max_buffered_body => 4 * ?H3_BUFFER_CHUNK_OVERHEAD}),
+    ?assertMatch(
+        {error, {stream_reset, _, ?H3_EXCESSIVE_LOAD}},
+        deliver_until_refused([0, 4, 8, 12, 16, 20, 24, 28], State)
+    ).
+
+%% What the connection holds is released when the stream is torn down.
+buffer_is_released_on_peer_reset_test() ->
+    State0 = buffering_state(#{quic_conn => fake_quic_conn()}),
+    {ok, _, State1} = deliver(0, <<"hello">>, false, State0),
+    ?assertMatch(#{0 := _}, quic_h3_connection:test_stream_data_buffers(State1)),
+    {ok, State2} = quic_h3_connection:handle_stream_closed(0, 16#010c, State1),
+    ?assertEqual(#{}, quic_h3_connection:test_stream_data_buffers(State2)).
+
+buffer_is_released_on_cancel_test() ->
+    Quic = fake_quic_conn(),
+    State0 = buffering_state(#{quic_conn => Quic}),
+    {ok, _, State1} = deliver(0, <<"hello">>, false, State0),
+    State2 = quic_h3_connection:do_cancel_stream(0, 16#010c, State1),
+    ?assertEqual(#{}, quic_h3_connection:test_stream_data_buffers(State2)).
+
+%% Not released on a plain fin: a handler may still register and drain it.
+buffer_survives_a_plain_fin_test() ->
+    {ok, _, State1} = deliver(0, <<"hello">>, true, buffering_state(#{})),
+    ?assertMatch(#{0 := _}, quic_h3_connection:test_stream_data_buffers(State1)).
+
+%% A server holding one stream's body at the limit still refuses another
+%% stream's, because the budget belongs to the connection.
+budget_is_shared_across_streams_test() ->
+    Streams = #{
+        0 => #h3_stream{id = 0, frame_state = expecting_data},
+        4 => #h3_stream{id = 4, frame_state = expecting_data}
+    },
+    State0 = buffering_state(#{max_buffered_body => 300, streams => Streams}),
+    {ok, _, State1} = deliver(0, binary:copy(<<"x">>, 150), false, State0),
+    ?assertEqual(
+        {error, {stream_reset, 4, ?H3_EXCESSIVE_LOAD}},
+        deliver(4, binary:copy(<<"x">>, 150), false, State1)
+    ).
+
+%% A server that holds nothing keeps going, whatever the stream carried.
+%% This replaces the old cap on bytes received.
+a_streamed_body_is_not_capped_by_its_size_test() ->
+    Handler = self(),
+    Stream = #h3_stream{
+        id = 0, frame_state = expecting_data, body_received = ?H3_MAX_BUFFERED_BODY
+    },
+    State = buffering_state(#{
+        streams => #{0 => Stream}, stream_handlers => #{0 => {Handler, make_ref()}}
+    }),
+    ?assertMatch(
+        {ok, _, _},
+        quic_h3_connection:handle_request_frame(0, {data, <<"more">>}, false, Stream, State)
+    ).
+
+%% A server whose state says it is buffering for a stream.
+buffering_state(Overrides) ->
+    Defaults = #{
+        role => server,
+        streams => #{0 => #h3_stream{id = 0, frame_state = expecting_data}},
+        stream_handlers => #{}
+    },
+    make_test_state(maps:merge(Defaults, Overrides)).
+
+deliver(StreamId, Payload, Fin, State) ->
+    Stream = #h3_stream{id = StreamId, frame_state = expecting_data},
+    quic_h3_connection:handle_request_frame(StreamId, {data, Payload}, Fin, Stream, State).
+
+%% Deliver a fin-only piece per stream until one is refused.
+deliver_until_refused([], State) ->
+    {ok, State};
+deliver_until_refused([StreamId | Rest], State) ->
+    case deliver(StreamId, <<>>, true, State) of
+        {ok, _Stream, State1} -> deliver_until_refused(Rest, State1);
+        {error, _} = Error -> Error
+    end.
 
 %% Test that data is sent to handler when registered
 data_sent_to_handler_when_registered_test() ->
@@ -858,7 +996,8 @@ multiple_chunks_buffered_in_order_test() ->
     StreamDataBuffers = element(44, State2),
     {Chunks, Size, HadFin} = maps:get(0, StreamDataBuffers),
     ?assertEqual([{<<"chunk2">>, true}, {<<"chunk1">>, false}], Chunks),
-    ?assertEqual(12, Size),
+    %% Charged size: both payloads plus the per-chunk overhead each one costs.
+    ?assertEqual(12 + 2 * ?H3_BUFFER_CHUNK_OVERHEAD, Size),
     ?assertEqual(true, HadFin).
 
 %%====================================================================
@@ -1585,19 +1724,29 @@ rest_of_data_frame_after_stream_error_is_dropped_test() ->
 
 %% With no Content-Length, a client passes any amount through; the server,
 %% which buffers the body until a handler registers, still caps it.
-body_cap_without_content_length_is_server_only_test() ->
+%% Bytes that have passed through cost nothing: what counts is what the
+%% connection still holds. A server that has streamed a body far past the
+%% old cap keeps going, on either role.
+a_body_already_delivered_does_not_cap_the_stream_test() ->
     Frame = quic_h3_frame:encode_data(<<"0123456789">>),
-    NearCap = #h3_stream{body_received = ?H3_MAX_BUFFERED_BODY - 5},
+    PastOldCap = #h3_stream{body_received = ?H3_MAX_BUFFERED_BODY},
     flush_mailbox(),
     {ok, _} = quic_h3_connection:handle_stream_data(
-        0, Frame, false, request_stream_state(client, NearCap)
+        0, Frame, false, request_stream_state(client, PastOldCap)
     ),
     ?assertEqual([{data, 0, <<"0123456789">>, false}], owner_events()),
     Quic = fake_quic_conn(),
+    Handler = self(),
     {ok, _} = quic_h3_connection:handle_stream_data(
-        0, Frame, false, request_stream_state(server, NearCap, #{quic_conn => Quic})
+        0,
+        Frame,
+        false,
+        request_stream_state(server, PastOldCap, #{
+            quic_conn => Quic, stream_handlers => #{0 => {Handler, make_ref()}}
+        })
     ),
-    ?assertEqual([{close_stream, 0, ?H3_EXCESSIVE_LOAD}], fake_quic_calls(Quic)).
+    ?assertEqual([], fake_quic_calls(Quic)),
+    ?assertEqual([{data, 0, <<"0123456789">>, false}], owner_events()).
 
 %% The same piece-by-piece delivery on a push stream.
 push_data_frame_is_delivered_in_pieces_test() ->
@@ -2658,7 +2807,8 @@ make_test_state(Overrides) ->
         %% Per-stream handler registration
         stream_handlers => #{},
         stream_data_buffers => #{},
-        stream_buffer_limit => 65536,
+        buffered_bytes => 0,
+        max_buffered_body => ?H3_MAX_BUFFERED_BODY,
         stream_type_handler => undefined,
         claimed_uni_streams => #{},
         h3_datagram_enabled => false,
@@ -2693,10 +2843,10 @@ make_test_state(Overrides) ->
         maps:get(last_accepted_push_id, Merged),
         %% Per-stream handler registration
         maps:get(stream_handlers, Merged), maps:get(stream_data_buffers, Merged),
-        maps:get(stream_buffer_limit, Merged), maps:get(local_connect_enabled, Merged),
-        maps:get(stream_type_handler, Merged), maps:get(claimed_uni_streams, Merged),
-        maps:get(h3_datagram_enabled, Merged), maps:get(peer_h3_datagram_enabled, Merged),
-        maps:get(bidi_type_buffers, Merged), maps:get(claimed_bidi_streams, Merged),
-        maps:get(pending_response_headers, Merged),
+        maps:get(buffered_bytes, Merged), maps:get(max_buffered_body, Merged),
+        maps:get(local_connect_enabled, Merged), maps:get(stream_type_handler, Merged),
+        maps:get(claimed_uni_streams, Merged), maps:get(h3_datagram_enabled, Merged),
+        maps:get(peer_h3_datagram_enabled, Merged), maps:get(bidi_type_buffers, Merged),
+        maps:get(claimed_bidi_streams, Merged), maps:get(pending_response_headers, Merged),
         %% 0-RTT bootstrap fields
         maps:get(has_early_keys, Merged), maps:get(quic_connected, Merged)}.

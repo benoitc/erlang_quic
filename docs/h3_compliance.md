@@ -100,7 +100,7 @@ All tests live under `test/`; module names in the table are bare
 | `H3_CLOSED_CRITICAL_STREAM` | ✓ | control / encoder / decoder stream closed |
 | `H3_FRAME_UNEXPECTED` | ✓ | DATA/HEADERS on control, CANCEL_PUSH on request, second SETTINGS, PUSH_PROMISE on server |
 | `H3_FRAME_ERROR` | ✓ | malformed frame payloads |
-| `H3_EXCESSIVE_LOAD` | ✓ | frame size > 1 MiB |
+| `H3_EXCESSIVE_LOAD` | ✓ | frame size > 1 MiB, field section over the advertised limit, request body held past `max_buffered_body` |
 | `H3_ID_ERROR` | ✓ | GOAWAY id increase, MAX_PUSH_ID decrease |
 | `H3_SETTINGS_ERROR` | ✓ | HTTP/2 setting id, duplicate setting id |
 | `H3_MISSING_SETTINGS` | ✓ | first control frame not SETTINGS |

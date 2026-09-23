@@ -85,6 +85,12 @@
 %% data is consumed could otherwise grow this buffer without bound.
 -define(H3_MAX_BUFFERED_BODY, 16#1000000).
 
+%% What one retained chunk costs against `max_buffered_body' on top of its
+%% payload. Without it an empty chunk, or a fin-only entry left by a request
+%% no handler claimed, would be free and a peer could accumulate entries
+%% without spending the budget.
+-define(H3_BUFFER_CHUNK_OVERHEAD, 64).
+
 %%====================================================================
 %% QPACK Error Codes (RFC 9204 Section 8.2)
 %%====================================================================

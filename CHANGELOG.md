@@ -41,6 +41,13 @@ All notable changes to this project will be documented in this file.
 - A stopping server closes its connections before its socket, so each
   sends CONNECTION_CLOSE and its clients are told at once. They heard
   nothing until their own idle timeout.
+- An HTTP/3 server bounds what it holds for request bodies whose handler
+  has not registered yet: `max_buffered_body`, 16 MiB by default, counted
+  across the whole connection. A body with a Content-Length was not bounded
+  at all, and the guard that did fire counted bytes received rather than
+  held, so it also reset large uploads a handler was reading. Buffered bytes
+  are now released when a stream is reset or cancelled, and empty or
+  fin-only pieces are charged so they cannot accumulate for free.
 - `SO_REUSEADDR` is set only on a listener bound to a fixed port. On a
   client socket, or a listener on port 0, it let the kernel autobind two
   sockets to one port and deliver every datagram for it to one of them,
