@@ -61,6 +61,12 @@ All notable changes to this project will be documented in this file.
   held, so it also reset large uploads a handler was reading. Buffered bytes
   are now released when a stream is reset or cancelled, and empty or
   fin-only pieces are charged so they cannot accumulate for free.
+- `quic:connect/4`, `quic:start_server/3` and `quic:server_spec/3` accept
+  `cacertfile`, a PEM file holding the trust anchors, read once where the
+  connection or server starts. The key was accepted nowhere and silently
+  ignored, so verification fell back to the OS trust store without saying so.
+  A file that cannot be read, or that holds no certificate, fails the call.
+  `cacerts` still wins when both are given.
 - `{error, send_queue_full}` is named in the `quic:send_data/4,5` and
   `quic_h3:send_data/3,4` specs and documented as the backpressure signal it is:
   nothing was written, and the same piece should be sent again once the

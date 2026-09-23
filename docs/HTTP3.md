@@ -41,6 +41,7 @@ Establish an HTTP/3 connection to a server.
 | `cert` | binary | - | Client certificate (DER) |
 | `key` | term | - | Client private key |
 | `cacerts` | [binary()] | - | CA certificates for verification |
+| `cacertfile` | file path | - | PEM file holding those CA certificates, read once at connect |
 | `verify` | atom | - | `verify_none` or `verify_peer` |
 | `settings` | map | - | HTTP/3 settings |
 | `quic_opts` | map | - | Additional QUIC options |

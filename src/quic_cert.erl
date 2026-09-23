@@ -13,7 +13,7 @@
 
 -include_lib("public_key/include/public_key.hrl").
 
--export([validate_server/4, validate_client/3]).
+-export([validate_server/4, validate_client/3, cacerts_from_file/1, resolve_cacerts/1]).
 
 -define(MAX_PATH_LENGTH, 10).
 
@@ -54,6 +54,52 @@ validate_client(undefined, _Intermediates, _CaCerts) ->
     {error, no_certificate};
 validate_client(Leaf, Intermediates, CaCerts) when is_binary(Leaf) ->
     verify_chain(Leaf, Intermediates, trust_anchors(CaCerts)).
+
+%% @doc Turn a `cacertfile' option into the DER `cacerts' the rest of the
+%% library takes.
+%%
+%% Called once where a connection or server starts, so the file is read
+%% once and a bad path fails the call that named it. An explicit
+%% `cacerts' is what the caller already resolved, so it wins.
+-spec resolve_cacerts(map()) -> {ok, map()} | {error, term()}.
+resolve_cacerts(Opts) ->
+    case {maps:is_key(cacerts, Opts), maps:get(cacertfile, Opts, undefined)} of
+        {true, _} ->
+            {ok, Opts};
+        {false, undefined} ->
+            {ok, Opts};
+        {false, File} ->
+            case cacerts_from_file(File) of
+                {ok, Ders} -> {ok, Opts#{cacerts => Ders}};
+                {error, _} = Error -> Error
+            end
+    end.
+
+%% @doc Read trust anchors from a PEM file as DER.
+%%
+%% A bundle yields every certificate in it. A file that cannot be read,
+%% or that holds no certificate, is an error rather than an empty list:
+%% empty anchors mean trust nothing, which fails every later handshake
+%% with a reason that says nothing about the file.
+-spec cacerts_from_file(file:name_all()) ->
+    {ok, [public_key:der_encoded()]} | {error, {cacertfile, file:name_all(), term()}}.
+cacerts_from_file(File) ->
+    case file:read_file(File) of
+        {ok, Pem} ->
+            case certificates(Pem) of
+                [] -> {error, {cacertfile, File, no_certificates}};
+                Ders -> {ok, Ders}
+            end;
+        {error, Reason} ->
+            {error, {cacertfile, File, Reason}}
+    end.
+
+certificates(Pem) ->
+    try
+        [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(Pem)]
+    catch
+        _:_ -> []
+    end.
 
 %%====================================================================
 %% Chain validation

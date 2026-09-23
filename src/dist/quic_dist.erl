@@ -790,9 +790,9 @@ load_credentials(#quic_dist_config{
                 undefined ->
                     undefined;
                 _ ->
-                    {ok, CACertPem} = file:read_file(CACertFile),
-                    [{'Certificate', CADer, _}] = public_key:pem_decode(CACertPem),
-                    CADer
+                    %% A bundle is as valid as a single certificate here.
+                    {ok, CADers} = quic_cert:cacerts_from_file(CACertFile),
+                    CADers
             end,
 
         {ok, CertDer, KeyDer, CACertDer}

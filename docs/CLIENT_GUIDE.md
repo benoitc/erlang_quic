@@ -500,6 +500,14 @@ end.
     cacerts => CACerts  %% list of DER-encoded CA certificates
 }
 
+%% Or name the PEM file and let the library read it. It is read once,
+%% and a path that cannot be read fails the connect rather than quietly
+%% verifying against the OS trust store instead.
+#{
+    verify => true,
+    cacertfile => "/etc/ssl/certs/our-ca.pem"
+}
+
 %% Development only: disable verification
 #{verify => false}
 ```

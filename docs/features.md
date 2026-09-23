@@ -318,6 +318,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `alpn` - ALPN protocols list
 - `verify` - Server certificate verification on the client (default: `true`; verifies the CertificateVerify signature, the chain, and the hostname). The hostname check follows the RFC 6125 HTTPS rules, so a leftmost-label wildcard SAN such as `*.example.com` matches `host.example.com`. Set `false` to accept any certificate, e.g. a self-signed test server.
 - `cacerts` - Trust anchors for client chain validation, as a list of DER-encoded certificates (default: the operating system trust store)
+- `cacertfile` - Path to a PEM file holding those anchors, read once when the connection or server starts. Ignored when `cacerts` is given; an unreadable file, or one with no certificate in it, fails the call
 - `preferred_ipv4` - Server preferred IPv4 address
 - `preferred_ipv6` - Server preferred IPv6 address
 - `pool_size` - Number of listener processes for server pools (default: 1)

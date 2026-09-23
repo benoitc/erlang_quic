@@ -185,11 +185,16 @@
 -type stream_type_handler() ::
     fun((uni | bidi, stream_id(), non_neg_integer()) -> claim | ignore).
 
+-ifdef(TEST).
+-export([test_client_quic_opts/1]).
+-endif.
+
 -type connect_opts() :: #{
     %% TLS options
     cert => binary(),
     key => term(),
     cacerts => [binary()],
+    cacertfile => file:name_all(),
     verify => verify_none | verify_peer,
     %% HTTP/3 settings
     settings => map(),
@@ -776,18 +781,23 @@ build_client_quic_opts(Host, Opts) ->
         server_name => Host
     },
     %% Add TLS options
-    TlsOpts = maps:with([cert, key, cacerts, verify], Opts),
+    TlsOpts = maps:with([cert, key, cacerts, cacertfile, verify], Opts),
     %% Add any custom QUIC options
     QuicOpts = maps:get(quic_opts, Opts, #{}),
     Merged = maps:merge(maps:merge(BaseOpts, TlsOpts), QuicOpts),
     maybe_enable_quic_datagrams(Opts, Merged).
+
+-ifdef(TEST).
+test_client_quic_opts(Opts) ->
+    build_client_quic_opts(<<"example.com">>, Opts).
+-endif.
 
 build_server_quic_opts(Opts) ->
     BaseOpts = #{
         alpn => [<<"h3">>]
     },
     %% TLS options (required for server)
-    TlsOpts = maps:with([cert, key, cacerts], Opts),
+    TlsOpts = maps:with([cert, key, cacerts, cacertfile], Opts),
     %% Custom QUIC options
     QuicOpts = maps:get(quic_opts, Opts, #{}),
     Merged = maps:merge(maps:merge(BaseOpts, TlsOpts), QuicOpts),

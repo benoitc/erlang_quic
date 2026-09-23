@@ -241,8 +241,8 @@ decode_key_entry({'PrivateKeyInfo', Der, not_encrypted}) ->
     public_key:der_decode('PrivateKeyInfo', Der).
 
 read_cacerts(File) ->
-    {ok, Pem} = file:read_file(File),
-    [Der || {_, Der, _} <- public_key:pem_decode(Pem)].
+    {ok, Ders} = quic_cert:cacerts_from_file(File),
+    Ders.
 
 build_request_headers(Opts, Host, Path) ->
     Method = Opts#opts.method,
