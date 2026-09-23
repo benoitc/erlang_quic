@@ -396,15 +396,20 @@ open_bidi_stream(Conn, SignalType) ->
 %% For clients, this sends request body data.
 %% For servers, this sends response body data.
 %% @end
--spec send_data(conn(), stream_id(), binary()) -> ok | {error, term()}.
+-spec send_data(conn(), stream_id(), binary()) -> ok | {error, send_queue_full | term()}.
 send_data(Conn, StreamId, Data) ->
     quic_h3_connection:send_data(Conn, StreamId, Data).
 
 %% @doc Send body data with fin flag.
 %%
 %% Set `Fin' to `true' to indicate the end of the body.
+%%
+%% Returns `{error, send_queue_full}' when the stream's send queue is
+%% full. Nothing was written; wait for the connection to drain and send
+%% the same piece again.
 %% @end
--spec send_data(conn(), stream_id(), binary(), boolean()) -> ok | {error, term()}.
+-spec send_data(conn(), stream_id(), binary(), boolean()) ->
+    ok | {error, send_queue_full | term()}.
 send_data(Conn, StreamId, Data, Fin) ->
     quic_h3_connection:send_data(Conn, StreamId, Data, Fin).
 

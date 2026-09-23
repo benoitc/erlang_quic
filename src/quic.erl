@@ -406,7 +406,14 @@ open_unidirectional_stream(Conn) when is_pid(Conn) ->
 
 %% @doc Send data on a stream.
 %% Fin indicates if this is the final frame on the stream.
--spec send_data(Conn, StreamId, Data, Fin) -> ok | {error, term()} when
+%%
+%% Returns `{error, send_queue_full}' when the stream's send queue is
+%% already at its ceiling, which is the backpressure signal: the write
+%% did not happen, and the caller should let the connection drain and
+%% retry rather than treat it as a failure.
+-spec send_data(Conn, StreamId, Data, Fin) ->
+    ok | {error, send_queue_full | term()}
+when
     Conn :: pid(),
     StreamId :: non_neg_integer(),
     Data :: iodata(),
@@ -417,7 +424,9 @@ send_data(Conn, StreamId, Data, Fin) when is_pid(Conn) ->
 %% @doc Send data on a stream with a timeout.
 %% Fin indicates if this is the final frame on the stream.
 %% Timeout is in milliseconds; if the operation takes longer, returns {error, timeout}.
--spec send_data(Conn, StreamId, Data, Fin, Timeout) -> ok | {error, term()} when
+-spec send_data(Conn, StreamId, Data, Fin, Timeout) ->
+    ok | {error, send_queue_full | timeout | term()}
+when
     Conn :: pid(),
     StreamId :: non_neg_integer(),
     Data :: iodata(),

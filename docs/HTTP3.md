@@ -969,6 +969,28 @@ quic_h3:send_data(Conn, StreamId, <<"{\"key\":\"value\"}">>, true),
 %% Handle response...
 ```
 
+### Backpressure on a large body
+
+`send_data/4` returns `{error, send_queue_full}` when the stream's send
+queue is already at its ceiling. Nothing was written, so send the same
+piece again once the connection has drained rather than treating it as a
+failure:
+
+```erlang
+send_body(Conn, StreamId, <<>>) ->
+    quic_h3:send_data(Conn, StreamId, <<>>, true);
+send_body(Conn, StreamId, Body) ->
+    Size = min(byte_size(Body), 65536),
+    <<Chunk:Size/binary, Rest/binary>> = Body,
+    case quic_h3:send_data(Conn, StreamId, Chunk, Rest =:= <<>>) of
+        ok ->
+            send_body(Conn, StreamId, Rest);
+        {error, send_queue_full} ->
+            timer:sleep(10),
+            send_body(Conn, StreamId, Body)
+    end.
+```
+
 ### Simple Server
 
 ```erlang

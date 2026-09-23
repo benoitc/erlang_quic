@@ -61,6 +61,10 @@ All notable changes to this project will be documented in this file.
   held, so it also reset large uploads a handler was reading. Buffered bytes
   are now released when a stream is reset or cancelled, and empty or
   fin-only pieces are charged so they cannot accumulate for free.
+- `{error, send_queue_full}` is named in the `quic:send_data/4,5` and
+  `quic_h3:send_data/3,4` specs and documented as the backpressure signal it is:
+  nothing was written, and the same piece should be sent again once the
+  connection drains. It appeared in no spec and no page.
 - An HTTP/3 request that finished in both directions is dropped from the
   connection's stream map. Nothing removed it on a clean FIN, so a connection
   grew by the retained header list of every request it had served, and, because
