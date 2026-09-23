@@ -2639,6 +2639,28 @@ finish_request_stream(
 finish_request_stream(_StreamId, Stream, State) ->
     {Stream, State}.
 
+%% The Status argument is what the response says. A `:status' the caller
+%% also put in the header list would otherwise be sent alongside it, and
+%% two of one pseudo-header is a malformed response
+%% (RFC 9114 Section 4.3.1).
+with_status(Status, Headers) ->
+    [
+        {<<":status">>, integer_to_binary(Status)}
+        | [KV || {Name, _} = KV <- Headers, Name =/= <<":status">>]
+    ].
+
+%% A response that never carries content, so a Content-Length on it
+%% describes what a GET would have returned rather than what is on the
+%% wire (RFC 9110 Section 8.6 for HEAD, Section 6.4.1 for 204 and 304).
+carries_no_content(#h3_stream{method = <<"HEAD">>}) ->
+    true;
+carries_no_content(#h3_stream{status = 204}) ->
+    true;
+carries_no_content(#h3_stream{status = 304}) ->
+    true;
+carries_no_content(_) ->
+    false.
+
 process_request_frames(StreamId, Data, Fin, Stream, State) ->
     case quic_h3_frame:decode_streaming(Data, Stream#h3_stream.data_remaining) of
         {data, <<>>, Remaining, Rest} when Remaining > 0 ->
@@ -2727,8 +2749,23 @@ handle_request_frame(
             %% Body exceeds content-length - stream error
             {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}};
         false when Fin, NewReceived < CL ->
-            %% Body shorter than content-length - stream error
-            {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}};
+            case carries_no_content(Stream) of
+                true ->
+                    %% RFC 9110 Section 8.6: on a response to HEAD the
+                    %% Content-Length states what a GET would have
+                    %% returned, and 204 and 304 never carry content, so
+                    %% an absent body is not a mismatch.
+                    deliver_body(
+                        StreamId,
+                        Payload,
+                        Fin,
+                        Stream#h3_stream{body_received = NewReceived},
+                        State
+                    );
+                false ->
+                    %% Body shorter than content-length - stream error
+                    {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}}
+            end;
         false ->
             deliver_body(
                 StreamId, Payload, Fin, Stream#h3_stream{body_received = NewReceived}, State
@@ -3711,15 +3748,21 @@ send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, Streams, State)
                             true -> half_closed_local;
                             false -> open
                         end,
-                    IsConnect =
-                        (lists:keyfind(<<":method">>, 1, Headers) =:=
-                            {<<":method">>, <<"CONNECT">>}),
+                    Method =
+                        case lists:keyfind(<<":method">>, 1, Headers) of
+                            {<<":method">>, M} -> M;
+                            false -> undefined
+                        end,
                     Stream = #h3_stream{
                         id = StreamId,
                         type = request,
+                        %% Kept so the response can be read against the
+                        %% request: a HEAD response carries a
+                        %% Content-Length but no body.
+                        method = Method,
                         state = StreamState,
                         frame_state = expecting_headers,
-                        is_connect = IsConnect
+                        is_connect = (Method =:= <<"CONNECT">>)
                     },
                     State3 = State2#state{
                         next_stream_id = NextId + 4,
@@ -3776,8 +3819,7 @@ do_send_response(
         streams = Streams
     } = State
 ) ->
-    StatusHeader = {<<":status">>, integer_to_binary(Status)},
-    AllHeaders = [StatusHeader | Headers],
+    AllHeaders = with_status(Status, Headers),
     %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
     case validate_outbound_headers(AllHeaders, State) of
         {error, Reason} ->
@@ -4238,8 +4280,7 @@ do_send_push_response(
         qpack_encoder = Encoder
     } = State
 ) ->
-    StatusHeader = {<<":status">>, integer_to_binary(Status)},
-    AllHeaders = [StatusHeader | Headers],
+    AllHeaders = with_status(Status, Headers),
     %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
     case validate_outbound_headers(AllHeaders, State) of
         {error, Reason} ->
