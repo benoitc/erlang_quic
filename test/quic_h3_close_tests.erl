@@ -5,7 +5,10 @@
 %%% shutdown, {shutdown, _}) must stop the H3 process with `normal'
 %%% (no crash report, no abnormal link-EXIT to the owner), while an
 %%% abnormal QUIC exit stops it with {quic_closed, Reason}. In both
-%%% cases the owner receives {quic_h3, Conn, closed}.
+%%% cases the owner receives {quic_h3, Conn, {closed, Reason}} carrying
+%%% the reason the connection went away, which is what
+%%% quic_h3:wait_connected/2 reads and what the QUIC layer underneath
+%%% already sends as {quic, Conn, {closed, Reason}}.
 
 -module(quic_h3_close_tests).
 
@@ -31,7 +34,7 @@ quic_down_normal_is_graceful_test_() ->
         Capture = install_capture(),
         {FakeQuicConn, H3Conn, Mon} = start_client(),
         FakeQuicConn ! {exit_with, normal},
-        expect_closed(H3Conn),
+        expect_closed(H3Conn, normal),
         expect_down(Mon, normal),
         assert_no_error_log(H3Conn),
         remove_capture(Capture)
@@ -42,7 +45,7 @@ quic_down_shutdown_is_graceful_test_() ->
         Capture = install_capture(),
         {FakeQuicConn, H3Conn, Mon} = start_client(),
         FakeQuicConn ! {exit_with, {shutdown, drained}},
-        expect_closed(H3Conn),
+        expect_closed(H3Conn, {shutdown, drained}),
         expect_down(Mon, normal),
         assert_no_error_log(H3Conn),
         remove_capture(Capture)
@@ -53,7 +56,7 @@ quic_down_abnormal_propagates_test_() ->
         Capture = install_capture(),
         {FakeQuicConn, H3Conn, Mon} = start_client(),
         FakeQuicConn ! {exit_with, boom},
-        expect_closed(H3Conn),
+        expect_closed(H3Conn, boom),
         expect_down(Mon, {quic_closed, boom}),
         expect_error_log(H3Conn),
         remove_capture(Capture)
@@ -70,10 +73,30 @@ server_quic_down_normal_is_graceful_test_() ->
         Mon = monitor(process, H3Conn),
         ?assertEqual(awaiting_quic, current_state(H3Conn)),
         FakeQuicConn ! {exit_with, normal},
-        expect_closed(H3Conn),
+        expect_closed(H3Conn, normal),
         expect_down(Mon, normal),
         assert_no_error_log(H3Conn),
         remove_capture(Capture)
+    end}.
+
+%% An application close is a close like any other, and `normal' is the
+%% reason it reports.
+close_reports_normal_test_() ->
+    {setup, fun setup/0, fun teardown/1, fun() ->
+        {_FakeQuicConn, H3Conn, Mon} = start_client(),
+        quic_h3_connection:close(H3Conn),
+        expect_closed(H3Conn, normal),
+        expect_down(Mon, normal)
+    end}.
+
+%% `wait_connected/2' reads the reason off the close event. While two of
+%% the three close paths sent a bare atom it matched none of them, so a
+%% connection that died waiting reported a timeout it never waited out.
+wait_connected_reports_the_reason_test_() ->
+    {setup, fun setup/0, fun teardown/1, fun() ->
+        {FakeQuicConn, H3Conn, _Mon} = start_client(),
+        FakeQuicConn ! {exit_with, boom},
+        ?assertEqual({error, boom}, quic_h3:wait_connected(H3Conn, 2000))
     end}.
 
 %%====================================================================
@@ -98,9 +121,10 @@ current_state(Pid) ->
     {StateName, _StateData} = sys:get_state(Pid, 1000),
     StateName.
 
-expect_closed(H3Conn) ->
+expect_closed(H3Conn, ExpectedReason) ->
     receive
-        {quic_h3, H3Conn, closed} -> ok
+        {quic_h3, H3Conn, {closed, Reason}} ->
+            ?assertEqual(ExpectedReason, Reason)
     after 1000 ->
         error(no_closed_message)
     end.

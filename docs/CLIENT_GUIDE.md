@@ -140,6 +140,13 @@ case quic:send_data(Conn, StreamId, Data, true, 5000) of
     {error, timeout} -> handle_timeout()
 end.
 
+%% Backpressure: the queue for this stream is full, nothing was written.
+%% Let the connection drain and send the same piece again.
+case quic:send_data(Conn, StreamId, Data, false) of
+    ok -> sent;
+    {error, send_queue_full} -> retry_later(Data)
+end.
+
 %% Reset a stream with error code
 ok = quic:reset_stream(Conn, StreamId, 0).
 
@@ -491,6 +498,14 @@ end.
 #{
     verify => true,
     cacerts => CACerts  %% list of DER-encoded CA certificates
+}
+
+%% Or name the PEM file and let the library read it. It is read once,
+%% and a path that cannot be read fails the connect rather than quietly
+%% verifying against the OS trust store instead.
+#{
+    verify => true,
+    cacertfile => "/etc/ssl/certs/our-ca.pem"
 }
 
 %% Development only: disable verification

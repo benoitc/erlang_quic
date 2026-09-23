@@ -214,17 +214,12 @@ throughput(Port, DataSize) ->
             %% Generate random body
             Body = crypto:strong_rand_bytes(DataSize),
 
-            %% Upload benchmark (POST)
-            Start1 = erlang:monotonic_time(millisecond),
-            case do_request(Conn, <<"/echo">>, Body) of
-                {ok, _Status, _Headers, ResponseBody} ->
-                    End1 = erlang:monotonic_time(millisecond),
-                    Duration1 = max(1, End1 - Start1),
-
-                    UploadMBps = (DataSize / 1048576) / (Duration1 / 1000),
-                    DownloadMBps = (byte_size(ResponseBody) / 1048576) / (Duration1 / 1000),
-                    TotalMBps =
-                        ((DataSize + byte_size(ResponseBody)) / 1048576) / (Duration1 / 1000),
+            case do_timed_request(Conn, <<"/echo">>, Body) of
+                {ok, _Status, _Headers, ResponseBody, Timing} ->
+                    #{upload_us := UpUs, download_us := DownUs} = Timing,
+                    UploadMBps = mbps(DataSize, UpUs),
+                    DownloadMBps = mbps(byte_size(ResponseBody), DownUs),
+                    TotalMBps = mbps(DataSize + byte_size(ResponseBody), UpUs + DownUs),
 
                     quic_h3:close(Conn),
 
@@ -237,7 +232,9 @@ throughput(Port, DataSize) ->
                         status => ok,
                         data_size => DataSize,
                         response_size => byte_size(ResponseBody),
-                        duration_ms => Duration1,
+                        duration_ms => (UpUs + DownUs) div 1000,
+                        upload_ms => UpUs div 1000,
+                        download_ms => DownUs div 1000,
                         upload_mbps => UploadMBps,
                         download_mbps => DownloadMBps,
                         total_mbps => TotalMBps
@@ -589,6 +586,9 @@ send_echo_response(Conn, StreamId, Body) ->
     %% past the initial outbound stream window.
     send_chunked(Conn, StreamId, Body).
 
+mbps(Bytes, Microseconds) ->
+    (Bytes / 1048576) / (Microseconds / 1000000).
+
 do_request(Conn, Path, Body) ->
     Headers = [
         {<<":method">>,
@@ -611,6 +611,43 @@ do_request(Conn, Path, Body) ->
                         ok -> wait_response(Conn, StreamId, <<>>, 30000);
                         {error, Reason} -> {error, {send_body, Reason}}
                     end
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Same request, reporting when the body was handed over and when the
+%% response finished, so the two directions can be timed apart.
+%%
+%% The upload mark is when the connection accepted the last write, not
+%% when the peer acknowledged it, so it bounds the upload time from
+%% below. The echo server answers only once it holds the whole body, so
+%% the two windows do not overlap.
+do_timed_request(Conn, Path, Body) ->
+    Headers = [
+        {<<":method">>, <<"POST">>},
+        {<<":path">>, Path},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"127.0.0.1">>}
+    ],
+    Start = erlang:monotonic_time(microsecond),
+    case quic_h3:request(Conn, Headers, #{end_stream => false}) of
+        {ok, StreamId} ->
+            case send_chunked(Conn, StreamId, Body) of
+                ok ->
+                    Sent = erlang:monotonic_time(microsecond),
+                    case wait_response(Conn, StreamId, <<>>, 30000) of
+                        {ok, Status, RespHeaders, RespBody} ->
+                            Done = erlang:monotonic_time(microsecond),
+                            {ok, Status, RespHeaders, RespBody, #{
+                                upload_us => max(1, Sent - Start),
+                                download_us => max(1, Done - Sent)
+                            }};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
+                {error, Reason} ->
+                    {error, {send_body, Reason}}
             end;
         {error, Reason} ->
             {error, Reason}

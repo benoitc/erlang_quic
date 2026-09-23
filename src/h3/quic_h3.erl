@@ -185,11 +185,16 @@
 -type stream_type_handler() ::
     fun((uni | bidi, stream_id(), non_neg_integer()) -> claim | ignore).
 
+-ifdef(TEST).
+-export([test_client_quic_opts/1]).
+-endif.
+
 -type connect_opts() :: #{
     %% TLS options
     cert => binary(),
     key => term(),
     cacerts => [binary()],
+    cacertfile => file:name_all(),
     verify => verify_none | verify_peer,
     %% HTTP/3 settings
     settings => map(),
@@ -396,15 +401,20 @@ open_bidi_stream(Conn, SignalType) ->
 %% For clients, this sends request body data.
 %% For servers, this sends response body data.
 %% @end
--spec send_data(conn(), stream_id(), binary()) -> ok | {error, term()}.
+-spec send_data(conn(), stream_id(), binary()) -> ok | {error, send_queue_full | term()}.
 send_data(Conn, StreamId, Data) ->
     quic_h3_connection:send_data(Conn, StreamId, Data).
 
 %% @doc Send body data with fin flag.
 %%
 %% Set `Fin' to `true' to indicate the end of the body.
+%%
+%% Returns `{error, send_queue_full}' when the stream's send queue is
+%% full. Nothing was written; wait for the connection to drain and send
+%% the same piece again.
 %% @end
--spec send_data(conn(), stream_id(), binary(), boolean()) -> ok | {error, term()}.
+-spec send_data(conn(), stream_id(), binary(), boolean()) ->
+    ok | {error, send_queue_full | term()}.
 send_data(Conn, StreamId, Data, Fin) ->
     quic_h3_connection:send_data(Conn, StreamId, Data, Fin).
 
@@ -771,18 +781,23 @@ build_client_quic_opts(Host, Opts) ->
         server_name => Host
     },
     %% Add TLS options
-    TlsOpts = maps:with([cert, key, cacerts, verify], Opts),
+    TlsOpts = maps:with([cert, key, cacerts, cacertfile, verify], Opts),
     %% Add any custom QUIC options
     QuicOpts = maps:get(quic_opts, Opts, #{}),
     Merged = maps:merge(maps:merge(BaseOpts, TlsOpts), QuicOpts),
     maybe_enable_quic_datagrams(Opts, Merged).
+
+-ifdef(TEST).
+test_client_quic_opts(Opts) ->
+    build_client_quic_opts(<<"example.com">>, Opts).
+-endif.
 
 build_server_quic_opts(Opts) ->
     BaseOpts = #{
         alpn => [<<"h3">>]
     },
     %% TLS options (required for server)
-    TlsOpts = maps:with([cert, key, cacerts], Opts),
+    TlsOpts = maps:with([cert, key, cacerts, cacertfile], Opts),
     %% Custom QUIC options
     QuicOpts = maps:get(quic_opts, Opts, #{}),
     Merged = maps:merge(maps:merge(BaseOpts, TlsOpts), QuicOpts),

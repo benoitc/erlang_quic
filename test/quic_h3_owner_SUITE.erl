@@ -124,7 +124,12 @@ custom_owner_receives_datagram(Config) ->
             {<<":path">>, <<"/">>},
             {<<":authority">>, <<"localhost">>}
         ],
-        {ok, StreamId} = quic_h3:request(Conn, Headers),
+        %% Datagrams belong to a request stream that is still open, which
+        %% is how a real session (extended CONNECT, MASQUE) holds it: the
+        %% request half is never finished. A stream closed in both
+        %% directions is gone, and a datagram for it has no stream to
+        %% name.
+        {ok, StreamId} = quic_h3:request(Conn, Headers, #{end_stream => false}),
         {200, <<"hello">>} = recv_response(Conn, StreamId, 5000),
 
         Payload = <<"ping-payload">>,

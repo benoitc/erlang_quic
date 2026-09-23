@@ -158,7 +158,12 @@
     %% RFC 9220 extended CONNECT: :protocol pseudo-header (e.g. websocket).
     %% Set when SETTINGS_ENABLE_CONNECT_PROTOCOL is negotiated and the
     %% client sends method=CONNECT with :protocol.
-    protocol :: binary() | undefined
+    protocol :: binary() | undefined,
+
+    %% This stream was reset rather than finished. Both end up `closed',
+    %% but a reset one stays in the map so whatever else arrives on it is
+    %% swallowed, while a finished one is dropped.
+    reset = false :: boolean()
 }).
 
 %%====================================================================

@@ -79,6 +79,7 @@
 %% Test exports - only available when compiled with TEST defined
 -ifdef(TEST).
 -export([
+    state_record_size/0,
     handle_stream_data/4,
     handle_stream_closed/2,
     handle_stream_closed/3,
@@ -108,7 +109,9 @@
     do_respond/5,
     pre_claim_bidi_stream/3,
     assign_uni_stream/3,
-    validate_peer_h3_datagram_with/1
+    validate_peer_h3_datagram_with/1,
+    handle_peer_reset/3,
+    maybe_close_if_drained/1
 ]).
 -endif.
 
@@ -117,7 +120,9 @@
     test_discarded_uni_streams/1,
     test_stream/2,
     test_push_stream/2,
-    test_stream_data_buffers/1
+    test_stream_data_buffers/1,
+    test_stream_handlers/1,
+    test_streams/1
 ]).
 
 %%====================================================================
@@ -281,7 +286,12 @@
 
     %% Set when {quic, _, {connected, _}} arrives. Used by early_data
     %% convergence logic to detect when 1-RTT is up.
-    quic_connected = false :: boolean()
+    quic_connected = false :: boolean(),
+
+    %% Why this connection is closing. Read by the `closing' enter clause,
+    %% which is the only place the owner is told, so every transition into
+    %% `closing' goes through close_with/2 to set it.
+    close_reason = normal :: term()
 }).
 
 %%====================================================================
@@ -612,9 +622,9 @@ bootstrapping({call, From}, get_peer_settings, #state{peer_settings = Settings})
 bootstrapping({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 bootstrapping(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 bootstrapping(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 bootstrapping(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 bootstrapping(
@@ -726,9 +736,9 @@ early_data({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
 early_data({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 early_data(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 early_data(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 early_data(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 early_data(
@@ -795,9 +805,9 @@ awaiting_quic({call, From}, get_peer_settings, #state{peer_settings = Settings})
 awaiting_quic({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 awaiting_quic(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 awaiting_quic(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 awaiting_quic(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 awaiting_quic(
@@ -898,9 +908,9 @@ h3_connecting({call, From}, get_peer_settings, #state{peer_settings = Settings})
 h3_connecting({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 h3_connecting(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 h3_connecting(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 h3_connecting(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 h3_connecting(
@@ -1116,13 +1126,13 @@ connected(cast, goaway, State) ->
     case send_goaway(State) of
         {ok, State1} ->
             {next_state, goaway_sent, State1};
-        {error, _Reason} ->
-            {next_state, closing, State}
+        {error, Reason} ->
+            close_with({goaway_failed, Reason}, State)
     end;
 connected(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 connected(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 connected(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 connected(info, {'DOWN', Ref, process, _Pid, _Reason}, #state{stream_handlers = Handlers} = State) ->
@@ -1198,9 +1208,9 @@ goaway_sent({call, From}, {send_data, StreamId, Data, Fin}, State) ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
 goaway_sent(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 goaway_sent(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 goaway_sent(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 goaway_sent(
@@ -1262,9 +1272,9 @@ goaway_received({call, From}, {send_data, StreamId, Data, Fin}, State) ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
 goaway_received(cast, close, State) ->
-    {next_state, closing, State};
+    close_with(normal, State);
 goaway_received(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    {next_state, closing, State};
+    close_with(owner_down, State);
 goaway_received(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
 goaway_received(
@@ -1293,9 +1303,9 @@ goaway_received(_EventType, _Event, _State) ->
 %% State: closing
 %%====================================================================
 
-closing(enter, _OldState, #state{quic_conn = QuicConn, owner = Owner}) ->
+closing(enter, _OldState, #state{quic_conn = QuicConn, owner = Owner, close_reason = Reason}) ->
     quic:safe_close(QuicConn),
-    Owner ! {quic_h3, self(), closed},
+    Owner ! {quic_h3, self(), {closed, Reason}},
     {stop, normal};
 closing(
     info,
@@ -1333,7 +1343,7 @@ handle_quic_failed(Reason, #state{owner = Owner} = State) ->
 %% A cleanly closed QUIC connection must not crash the H3 process:
 %% only an abnormal QUIC exit is propagated as {quic_closed, Reason}.
 handle_quic_down(Reason, #state{owner = Owner} = State) ->
-    Owner ! {quic_h3, self(), closed},
+    Owner ! {quic_h3, self(), {closed, Reason}},
     case Reason of
         normal -> {stop, normal, State};
         shutdown -> {stop, normal, State};
@@ -1958,8 +1968,7 @@ retry_blocked_streams(#state{blocked_streams = Blocked} = State) when map_size(B
 retry_blocked_streams(
     #state{
         blocked_streams = Blocked,
-        qpack_decoder = Decoder,
-        quic_conn = QuicConn
+        qpack_decoder = Decoder
     } = State
 ) ->
     InsertCount = quic_qpack:get_insert_count(Decoder),
@@ -1971,8 +1980,8 @@ retry_blocked_streams(
         {ok, State2} ->
             {ok, State2};
         {error, {stream_reset, SId, Code}} ->
-            quic:reset_stream(QuicConn, SId, Code),
-            {ok, State1#state{streams = maps:remove(SId, State1#state.streams)}};
+            State3 = reset_request_stream(SId, Code, State1),
+            {ok, State3#state{streams = maps:remove(SId, State3#state.streams)}};
         {error, Reason} ->
             {error, Reason, State1}
     end.
@@ -2601,7 +2610,7 @@ handle_request_stream_data(
                     <<>> -> maps:remove(StreamId, Buffers);
                     _ -> Buffers#{StreamId => Rest}
                 end,
-            Streams1 = Streams#{StreamId => Stream2},
+            Streams1 = store_stream(StreamId, Stream2, Streams),
             {ok, State2#state{streams = Streams1, stream_buffers = Buffers1}};
         {error, Reason} ->
             {error, Reason, State}
@@ -2621,10 +2630,10 @@ finish_request_stream(
         {ok, Stream1, State1} ->
             {Stream1, State1};
         {error, {stream_reset, _StreamId, Code}} ->
-            quic:reset_stream(State#state.quic_conn, StreamId, Code),
+            State1 = reset_request_stream(StreamId, Code, State),
             {
-                Stream#h3_stream{frame_state = complete, state = closed},
-                release_buffered(StreamId, State)
+                Stream#h3_stream{frame_state = complete, state = closed, reset = true},
+                release_buffered(StreamId, State1)
             }
     end;
 finish_request_stream(_StreamId, Stream, State) ->
@@ -2667,18 +2676,16 @@ process_request_frames(StreamId, Data, Fin, Stream, State) ->
             {ok, Data, Stream, State}
     end.
 
-process_request_frame(
-    StreamId, Frame, FrameFin, Rest, Fin, Stream, #state{quic_conn = QuicConn} = State
-) ->
+process_request_frame(StreamId, Frame, FrameFin, Rest, Fin, Stream, State) ->
     case handle_request_frame(StreamId, Frame, FrameFin, Stream, State) of
         {ok, Stream1, State1} ->
             process_request_frames(StreamId, Rest, Fin, Stream1, State1);
         {error, {stream_reset, SId, Code}} ->
             %% Stream-level error: reset it, and drop what else arrives on
             %% it, the rest of a DATA frame included.
-            quic:reset_stream(QuicConn, SId, Code),
-            {ok, <<>>, Stream#h3_stream{state = closed, data_remaining = 0},
-                release_buffered(SId, State)};
+            State1 = reset_request_stream(SId, Code, State),
+            {ok, <<>>, Stream#h3_stream{state = closed, reset = true, data_remaining = 0},
+                release_buffered(SId, State1)};
         {error, Reason} ->
             {error, Reason}
     end.
@@ -3042,7 +3049,7 @@ process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State) ->
 %% expecting_headers so subsequent HEADERS frames are accepted as either
 %% another interim or the final response.
 finalize_stream_state(Stream, true, _Role) ->
-    Stream#h3_stream{frame_state = complete, state = half_closed_remote};
+    close_half(remote, Stream#h3_stream{frame_state = complete});
 finalize_stream_state(#h3_stream{status = Status} = Stream, false, client) when
     is_integer(Status), Status >= 100, Status < 200
 ->
@@ -3585,8 +3592,8 @@ handle_stream_closed(
             %% RFC 9114 Section 4.1.1: server-side request stream that ends
             %% before a complete request is received MUST be reset with
             %% H3_REQUEST_INCOMPLETE.
-            maybe_reset_incomplete_request(StreamId, State),
-            State1 = maybe_send_stream_cancel(StreamId, State),
+            State0 = maybe_reset_incomplete_request(StreamId, State),
+            State1 = maybe_send_stream_cancel(StreamId, State0),
             {ok, (release_buffered(StreamId, State1))#state{
                 streams = maps:remove(StreamId, Streams),
                 stream_buffers = maps:remove(StreamId, Buffers),
@@ -3598,26 +3605,36 @@ handle_stream_closed(
             }}
     end.
 
+%% Only reached from handle_peer_reset/3, which reports the stream with
+%% the peer's code once this returns, so this tells the peer and nobody
+%% else. Reporting here as well would give the application two events for
+%% one dead stream.
 maybe_reset_incomplete_request(StreamId, #state{role = server, quic_conn = QuicConn} = State) when
     StreamId rem 4 =:= 0
 ->
     case maps:find(StreamId, State#state.streams) of
         {ok, #h3_stream{frame_state = complete}} ->
-            ok;
+            State;
         {ok, _Incomplete} ->
             quic:reset_stream(QuicConn, StreamId, ?H3_REQUEST_INCOMPLETE),
-            ok;
+            State;
         error ->
-            ok
+            State
     end;
-maybe_reset_incomplete_request(_StreamId, _State) ->
-    ok.
+maybe_reset_incomplete_request(_StreamId, State) ->
+    State.
 
 test_discarded_uni_streams(#state{discarded_uni_streams = D}) ->
     D.
 
 test_stream_data_buffers(#state{stream_data_buffers = Buffers}) ->
     Buffers.
+
+test_stream_handlers(#state{stream_handlers = Handlers}) ->
+    Handlers.
+
+test_streams(#state{streams = Streams}) ->
+    Streams.
 
 test_stream(StreamId, #state{streams = Streams}) ->
     maps:get(StreamId, Streams).
@@ -3829,11 +3846,11 @@ do_send_data(
                 ok ->
                     Stream1 =
                         case Fin of
-                            true -> Stream#h3_stream{state = half_closed_local};
+                            true -> close_half(local, Stream);
                             false -> Stream
                         end,
                     {ok, State#state{
-                        streams = Streams#{StreamId => Stream1},
+                        streams = store_stream(StreamId, Stream1, Streams),
                         pending_response_headers = Pending1
                     }};
                 {error, Reason} ->
@@ -3879,12 +3896,9 @@ do_send_trailers(
                         end,
                     case quic:send_data(QuicConn, StreamId, Payload, true) of
                         ok ->
-                            Stream1 = Stream#h3_stream{
-                                trailers = Trailers,
-                                state = half_closed_local
-                            },
+                            Stream1 = close_half(local, Stream#h3_stream{trailers = Trailers}),
                             State3 = State2#state{
-                                streams = Streams#{StreamId => Stream1},
+                                streams = store_stream(StreamId, Stream1, Streams),
                                 pending_response_headers = Pending1
                             },
                             {ok, State3};
@@ -3899,11 +3913,11 @@ do_send_trailers(
 do_cancel_stream(
     StreamId,
     ErrorCode,
-    #state{quic_conn = QuicConn, streams = Streams, pending_response_headers = Pending} = State
+    #state{streams = Streams, pending_response_headers = Pending} = State
 ) ->
-    quic:reset_stream(QuicConn, StreamId, ErrorCode),
+    State0 = reset_request_stream(StreamId, ErrorCode, State),
     %% RFC 9204 Section 4.4.2: Send Stream Cancellation if stream was blocked
-    State1 = maybe_send_stream_cancel(StreamId, State),
+    State1 = maybe_send_stream_cancel(StreamId, State0),
     %% Drop what the cancelled stream was holding: unsent HEADERS, the
     %% partial frame buffer, and any body no handler claimed.
     State2 = release_buffered(StreamId, State1),
@@ -4000,9 +4014,30 @@ deliver_body(StreamId, Payload, Fin, Stream, State) ->
     end.
 
 finish_on_fin(Stream, true) ->
-    Stream#h3_stream{frame_state = complete, state = half_closed_remote};
+    close_half(remote, Stream#h3_stream{frame_state = complete});
 finish_on_fin(Stream, false) ->
     Stream.
+
+%% A FIN closes one direction. A stream whose other direction was already
+%% closed is finished, and `closed' is what store_stream/3 drops on. The
+%% field used to be assigned rather than combined, so whichever FIN came
+%% last decided the state and no stream ever reached `closed'.
+close_half(remote, #h3_stream{state = half_closed_local} = Stream) ->
+    Stream#h3_stream{state = closed};
+close_half(remote, Stream) ->
+    Stream#h3_stream{state = half_closed_remote};
+close_half(local, #h3_stream{state = half_closed_remote} = Stream) ->
+    Stream#h3_stream{state = closed};
+close_half(local, Stream) ->
+    Stream#h3_stream{state = half_closed_local}.
+
+%% A finished stream is not kept: its entry holds the header list for the
+%% life of the connection, and an unfinished-looking map also stops a
+%% GOAWAY-ed connection from ever draining.
+store_stream(StreamId, #h3_stream{state = closed, reset = false}, Streams) ->
+    maps:remove(StreamId, Streams);
+store_stream(StreamId, Stream, Streams) ->
+    Streams#{StreamId => Stream}.
 
 %% Only what gets buffered is charged: a client hands each piece to its
 %% owner, and so does a server once the stream has a handler.
@@ -4633,8 +4668,22 @@ maybe_transition_connected(#state{settings_received = true} = State) ->
 maybe_transition_connected(State) ->
     {keep_state, State}.
 
+%% Two test modules build a #state{} by writing the tuple out by hand,
+%% because the record is private to this module. This lets them check the
+%% shape still matches, instead of silently shifting every field after a
+%% new one.
+-ifdef(TEST).
+state_record_size() ->
+    record_info(size, state).
+-endif.
+
+%% Every way into `closing' records why, because the enter clause is the
+%% only place the owner is told and it has nothing else to go on.
+close_with(Reason, State) ->
+    {next_state, closing, State#state{close_reason = Reason}}.
+
 maybe_close_if_drained(#state{streams = Streams} = State) when map_size(Streams) =:= 0 ->
-    {next_state, closing, State};
+    close_with(normal, State);
 maybe_close_if_drained(State) ->
     {keep_state, State}.
 
@@ -4646,7 +4695,7 @@ handle_connection_error(
     Phrase = reason_phrase(Reason),
     Owner ! {quic_h3, self(), {error, ErrorCode, Phrase}},
     quic:safe_close(QuicConn, ErrorCode, Phrase),
-    {next_state, closing, State}.
+    close_with({h3_error, ErrorCode, Phrase}, State).
 
 reason_phrase(Reason) when is_binary(Reason) ->
     Reason;
@@ -4655,6 +4704,23 @@ reason_phrase(Reason) ->
         iolist_to_binary(Reason)
     catch
         _:_ -> iolist_to_binary(io_lib:format("~0p", [Reason]))
+    end.
+
+%% A stream this side resets is as dead to the application as one the peer
+%% reset, so it is reported the same way and the handler goes with it. The
+%% peer hears the RESET_STREAM; without this the local caller heard nothing
+%% and waited out its own timeout.
+reset_request_stream(StreamId, ErrorCode, #state{quic_conn = QuicConn} = State) ->
+    quic:reset_stream(QuicConn, StreamId, ErrorCode),
+    report_local_reset(StreamId, ErrorCode, State).
+
+report_local_reset(StreamId, ErrorCode, State) ->
+    case is_request_stream(StreamId, State) of
+        true ->
+            notify_stream(StreamId, {stream_reset, StreamId, ErrorCode}, State),
+            do_unset_stream_handler(StreamId, State);
+        false ->
+            State
     end.
 
 %% RESET_STREAM or RESET_STREAM_AT from the peer: clean up, then tell

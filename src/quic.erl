@@ -221,6 +221,10 @@ get_fd(Socket) ->
 %%       validation (e.g. self-signed test servers).</li>
 %%   <li>`cacerts' - Trust anchors as a list of DER-encoded CA
 %%       certificates. Defaults to the OS trust store.</li>
+%%   <li>`cacertfile' - Path to a PEM file holding those anchors, read
+%%       once here. A file that cannot be read, or that holds no
+%%       certificate, fails the call rather than falling back to the OS
+%%       store. Ignored when `cacerts' is given.</li>
 %%   <li>`cert' - DER-encoded client certificate, for mutual TLS</li>
 %%   <li>`key' - Decoded private key for `cert'. One that cannot sign for
 %%       the certificate is refused with `{error, {invalid_client_key, _}}'.</li>
@@ -268,16 +272,20 @@ connect(Host, Port, Opts, Owner) when
     %% Extract socket option for pre-opened socket support
     Socket = maps:get(socket, Opts, undefined),
     case validate_client_opts(Socket, Opts) of
-        ok ->
-            %% Resolution (and RFC 8305 Happy Eyeballs for hostnames) runs in
-            %% the caller process so a resolution failure returns {error, _}
-            %% instead of crashing the caller via the start_link.
-            quic_happy:connect(Host, Port, Opts, Owner, Socket);
-        {error, _} = Error ->
-            Error
+        ok -> dial(Host, Port, Opts, Owner, Socket);
+        {error, _} = Error -> Error
     end;
 connect(_Host, _Port, _Opts, _Owner) ->
     {error, badarg}.
+
+%% Resolution (and RFC 8305 Happy Eyeballs for hostnames) runs in the
+%% caller process so a resolution failure returns {error, _} instead of
+%% crashing the caller via the start_link.
+dial(Host, Port, Opts, Owner, Socket) ->
+    case quic_cert:resolve_cacerts(Opts) of
+        {ok, Opts1} -> quic_happy:connect(Host, Port, Opts1, Owner, Socket);
+        {error, _} = Error -> Error
+    end.
 
 %% @private All client-side option checks that must run before the
 %% connection process is started, so a bad option returns {error, _}
@@ -406,7 +414,12 @@ open_unidirectional_stream(Conn) when is_pid(Conn) ->
 
 %% @doc Send data on a stream.
 %% Fin indicates if this is the final frame on the stream.
--spec send_data(Conn, StreamId, Data, Fin) -> ok | {error, term()} when
+%%
+%% Returns `{error, send_queue_full}' when the stream's send queue is
+%% already at its ceiling, which is the backpressure signal: the write
+%% did not happen, and the caller should let the connection drain and
+%% retry rather than treat it as a failure.
+-spec send_data(Conn, StreamId, Data, Fin) -> ok | {error, send_queue_full | term()} when
     Conn :: pid(),
     StreamId :: non_neg_integer(),
     Data :: iodata(),
@@ -417,7 +430,9 @@ send_data(Conn, StreamId, Data, Fin) when is_pid(Conn) ->
 %% @doc Send data on a stream with a timeout.
 %% Fin indicates if this is the final frame on the stream.
 %% Timeout is in milliseconds; if the operation takes longer, returns {error, timeout}.
--spec send_data(Conn, StreamId, Data, Fin, Timeout) -> ok | {error, term()} when
+-spec send_data(Conn, StreamId, Data, Fin, Timeout) ->
+    ok | {error, send_queue_full | timeout | term()}
+when
     Conn :: pid(),
     StreamId :: non_neg_integer(),
     Data :: iodata(),
@@ -803,6 +818,9 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %%       default: a client that sends no certificate still connects.</li>
 %%   <li>`cacerts' - Trust anchors (list of DER CA certs) for validating a
 %%       client certificate; `undefined' uses the OS trust store.</li>
+%%   <li>`cacertfile' - Path to a PEM file holding those anchors, read once
+%%       at start. A file that cannot be read, or that holds no certificate,
+%%       fails the start. Ignored when `cacerts' is given.</li>
 %%   <li>`require_client_cert' - With `verify', reject a client that presents
 %%       no certificate (`certificate_required') instead of accepting it,
 %%       making mutual TLS mandatory (default `false').</li>
@@ -858,8 +876,13 @@ start_server(Name, Port, Opts) when
     is_map(Opts)
 ->
     case validate_server_opts(Opts) of
-        ok -> quic_server_sup:start_server(Name, Port, Opts);
-        {error, _} = Error -> Error
+        ok ->
+            case quic_cert:resolve_cacerts(Opts) of
+                {ok, Opts1} -> quic_server_sup:start_server(Name, Port, Opts1);
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error ->
+            Error
     end;
 start_server(_Name, _Port, _Opts) ->
     {error, badarg}.
@@ -941,7 +964,10 @@ server_spec(Name, Port, Opts) when
     Port =< 65535,
     is_map(Opts)
 ->
-    quic_server_sup:server_spec(Name, Port, Opts);
+    case quic_cert:resolve_cacerts(Opts) of
+        {ok, Opts1} -> quic_server_sup:server_spec(Name, Port, Opts1);
+        {error, Reason} -> error(Reason)
+    end;
 server_spec(_Name, _Port, _Opts) ->
     error(badarg).
 

@@ -835,6 +835,114 @@ body_past_the_budget_is_refused_test() ->
         deliver(0, binary:copy(<<"x">>, 200), false, State)
     ).
 
+%% A stream this side resets is as dead to the application as one the
+%% peer reset, so it is reported the same way. Without it the caller
+%% waits on a stream that is already gone until its own timeout.
+a_refused_body_is_reported_locally_test() ->
+    flush_owner_events(),
+    Conn = quiet_conn(),
+    try
+        State = buffering_state(#{max_buffered_body => 100, quic_conn => Conn}),
+        Frame = quic_h3_frame:encode_data(binary:copy(<<"x">>, 200)),
+        {ok, _} = quic_h3_connection:handle_stream_data(0, Frame, false, State),
+        ?assertEqual({stream_reset, 0, ?H3_EXCESSIVE_LOAD}, next_owner_event())
+    after
+        stop_conn(Conn)
+    end.
+
+%% The pid that cancels a stream is often not the pid reading it, so the
+%% registered handler is the one that has to hear about it.
+a_cancelled_stream_is_reported_to_its_handler_test() ->
+    flush_owner_events(),
+    Conn = quiet_conn(),
+    Handler = collector(),
+    try
+        State = buffering_state(#{
+            quic_conn => Conn, stream_handlers => #{0 => {Handler, make_ref()}}
+        }),
+        _ = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, State),
+        ?assertEqual(
+            {stream_reset, 0, ?H3_REQUEST_CANCELLED}, collected(Handler)
+        ),
+        %% and not to the canceller
+        ?assertEqual(nothing, next_owner_event())
+    after
+        stop_conn(Conn),
+        Handler ! stop
+    end.
+
+%% A handler whose stream we reset keeps no monitor on it.
+a_local_reset_drops_the_handler_test() ->
+    Conn = quiet_conn(),
+    Handler = collector(),
+    try
+        State = buffering_state(#{
+            quic_conn => Conn, stream_handlers => #{0 => {Handler, make_ref()}}
+        }),
+        State1 = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, State),
+        ?assertEqual(#{}, quic_h3_connection:test_stream_handlers(State1))
+    after
+        stop_conn(Conn),
+        Handler ! stop
+    end.
+
+%% A peer reset of a request the server never finished reading resets it
+%% back (RFC 9114 Section 4.1.1) but is still one dead stream, so the
+%% application hears about it once.
+a_peer_reset_of_an_incomplete_request_is_reported_once_test() ->
+    flush_owner_events(),
+    Conn = quiet_conn(),
+    try
+        State = buffering_state(#{quic_conn => Conn}),
+        {keep_state, _} = quic_h3_connection:handle_peer_reset(
+            0, ?H3_REQUEST_CANCELLED, State
+        ),
+        ?assertEqual({stream_reset, 0, ?H3_REQUEST_CANCELLED}, next_owner_event()),
+        ?assertEqual(nothing, next_owner_event())
+    after
+        stop_conn(Conn)
+    end.
+
+%% A request that finished in both directions is done with, so it leaves
+%% the stream map. It used to stay for the life of the connection, which
+%% also meant a GOAWAY-ed connection never drained.
+a_finished_exchange_leaves_no_stream_test() ->
+    Conn = quiet_conn(),
+    try
+        State = buffering_state(#{
+            quic_conn => Conn, stream_handlers => #{0 => {self(), make_ref()}}
+        }),
+        Body = quic_h3_frame:encode_data(<<"hi">>),
+        {ok, State1} = quic_h3_connection:handle_stream_data(0, Body, true, State),
+        ?assert(maps:is_key(0, quic_h3_connection:test_streams(State1))),
+        {ok, State2} = quic_h3_connection:do_respond(0, 200, [], <<"ok">>, State1),
+        ?assertEqual(#{}, quic_h3_connection:test_streams(State2))
+    after
+        stop_conn(Conn)
+    end.
+
+%% GOAWAY drains when the last stream finishes. The drain checks that the
+%% stream map is empty, so while finished streams stayed in it a
+%% connection that had served anything never reached closing.
+a_goaway_drains_once_the_last_stream_finishes_test() ->
+    Conn = quiet_conn(),
+    try
+        State = buffering_state(#{
+            quic_conn => Conn,
+            stream_handlers => #{0 => {self(), make_ref()}},
+            goaway_id => 0
+        }),
+        Body = quic_h3_frame:encode_data(<<"hi">>),
+        {ok, State1} = quic_h3_connection:handle_stream_data(0, Body, true, State),
+        {ok, State2} = quic_h3_connection:do_respond(0, 200, [], <<"ok">>, State1),
+        ?assertMatch(
+            {next_state, closing, _},
+            quic_h3_connection:maybe_close_if_drained(State2)
+        )
+    after
+        stop_conn(Conn)
+    end.
+
 %% With a handler registered nothing is held, so no limit applies.
 body_past_the_budget_reaches_a_registered_handler_test() ->
     Handler = self(),
@@ -935,6 +1043,61 @@ a_streamed_body_is_not_capped_by_its_size_test() ->
     ).
 
 %% A server whose state says it is buffering for a stream.
+%% Answers the one call a reset makes and stays silent otherwise.
+quiet_conn() ->
+    spawn(fun QuietLoop() ->
+        receive
+            {'$gen_call', From, _} ->
+                gen_statem:reply(From, ok),
+                QuietLoop();
+            stop ->
+                ok;
+            _ ->
+                QuietLoop()
+        end
+    end).
+
+stop_conn(Conn) ->
+    Conn ! stop,
+    ok.
+
+%% Stands in for a registered stream handler and reports what it was told.
+collector() ->
+    spawn(fun CollectLoop() ->
+        receive
+            {quic_h3, _Conn, Event} ->
+                put(last, Event),
+                CollectLoop();
+            {what, From} ->
+                From ! {collected, get(last)},
+                CollectLoop();
+            stop ->
+                ok
+        end
+    end).
+
+collected(Pid) ->
+    Pid ! {what, self()},
+    receive
+        {collected, undefined} -> nothing;
+        {collected, Event} -> Event
+    after 1000 -> error(collector_silent)
+    end.
+
+%% These tests share one process, so an event another test left behind
+%% would be read as this one's.
+flush_owner_events() ->
+    receive
+        {quic_h3, _, _} -> flush_owner_events()
+    after 0 -> ok
+    end.
+
+next_owner_event() ->
+    receive
+        {quic_h3, _Conn, Event} -> Event
+    after 500 -> nothing
+    end.
+
 buffering_state(Overrides) ->
     Defaults = #{
         role => server,
@@ -1732,6 +1895,8 @@ rest_of_data_frame_after_stream_error_is_dropped_test() ->
     State0 = request_stream_state(client, #h3_stream{content_length = 2}, #{quic_conn => Quic}),
     {ok, State1} = quic_h3_connection:handle_stream_data(0, Head, false, State0),
     ?assertEqual([{close_stream, 0, ?H3_MESSAGE_ERROR}], fake_quic_calls(Quic)),
+    %% The reset is reported once, and the dropped remainder adds nothing.
+    ?assertEqual([{stream_reset, 0, ?H3_MESSAGE_ERROR}], owner_events()),
     ?assertMatch({ok, _}, quic_h3_connection:handle_stream_data(0, Tail, true, State1)),
     ?assertEqual([], owner_events()).
 
@@ -2768,6 +2933,16 @@ request_missing_method_rejected_test() ->
 %%====================================================================
 
 %% Build a test state tuple matching quic_h3_connection's internal state record
+%% The builder below writes the state tuple out by hand, because the
+%% record lives inside quic_h3_connection and no test can see it. A field
+%% added to the record and not to the builder shifts every later field
+%% and turns these tests into nonsense that still passes, so compare the
+%% shape against a state a real connection built.
+make_test_state_matches_the_record_test() ->
+    ?assertEqual(
+        quic_h3_connection:state_record_size(), tuple_size(make_test_state(#{}))
+    ).
+
 make_test_state(Overrides) ->
     Default = #{
         quic_conn => undefined,
@@ -2829,7 +3004,8 @@ make_test_state(Overrides) ->
         bidi_type_buffers => #{},
         claimed_bidi_streams => #{},
         has_early_keys => false,
-        quic_connected => false
+        quic_connected => false,
+        close_reason => normal
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -2862,4 +3038,5 @@ make_test_state(Overrides) ->
         maps:get(peer_h3_datagram_enabled, Merged), maps:get(bidi_type_buffers, Merged),
         maps:get(claimed_bidi_streams, Merged), maps:get(pending_response_headers, Merged),
         %% 0-RTT bootstrap fields
-        maps:get(has_early_keys, Merged), maps:get(quic_connected, Merged)}.
+        maps:get(has_early_keys, Merged), maps:get(quic_connected, Merged),
+        maps:get(close_reason, Merged)}.
