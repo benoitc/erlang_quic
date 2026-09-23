@@ -61,6 +61,13 @@ All notable changes to this project will be documented in this file.
   held, so it also reset large uploads a handler was reading. Buffered bytes
   are now released when a stream is reset or cancelled, and empty or
   fin-only pieces are charged so they cannot accumulate for free.
+- An HTTP/3 stream that this library resets is reported to its stream handler,
+  or to the connection owner if none is registered, as
+  `{stream_reset, StreamId, ErrorCode}`, the same event a peer reset produces.
+  A body refused past `max_buffered_body`, a frame error on a stream, and
+  `quic_h3:cancel/2,3` told the peer and left the local caller waiting out its
+  own timeout. The stream's handler registration is dropped with it, so a
+  cancelled stream no longer leaves a monitor behind.
 - An HTTP/3 connection reports every close as `{quic_h3, Conn, {closed, Reason}}`.
   Two of the three close paths sent a bare `closed`, which
   `quic_h3:wait_connected/2` does not match, so a connection that died while

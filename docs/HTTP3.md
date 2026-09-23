@@ -189,7 +189,9 @@ Register promptly. Until you do, the connection holds that stream's body
 for you, and what it holds counts against `max_buffered_body`: the total
 one connection will hold across all of its streams, 16 MiB by default. A
 stream whose body would cross the budget is reset with `H3_EXCESSIVE_LOAD`
-and the connection carries on. Once you have registered, pieces are
+and the connection carries on; you are told with
+`{stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}`, so nothing is left waiting
+on it. Once you have registered, pieces are
 forwarded as they arrive and nothing is held, so a body of any size
 streams through.
 
@@ -699,11 +701,12 @@ sides — see [HTTP Datagrams (RFC 9297)](#http-datagrams-rfc-9297) above.
 
 | Event | Description |
 |-------|-------------|
-| `{stream_reset, StreamId, ErrorCode}` | Peer reset the stream (RESET_STREAM) |
+| `{stream_reset, StreamId, ErrorCode}` | The stream was reset, by the peer or by this library. `H3_EXCESSIVE_LOAD` (0x0107) means a request body crossed `max_buffered_body`; `H3_REQUEST_CANCELLED` (0x010c) follows `quic_h3:cancel/2,3`; other codes come from a protocol error on the stream |
 | `{stop_sending, StreamId, ErrorCode}` | Peer sent STOP_SENDING; stop writing to the stream |
 
 Both go to the stream handler registered with `set_stream_handler/3,4`
-if there is one, otherwise to the connection owner. The transport
+if there is one, otherwise to the connection owner. A stream is reported
+once, whoever reset it, and its handler registration is dropped with it. The transport
 answers a STOP_SENDING with a RESET_STREAM carrying the same code, so
 the peer hears `{stream_reset, ...}` in turn.
 

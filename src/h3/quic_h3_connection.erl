@@ -109,7 +109,8 @@
     do_respond/5,
     pre_claim_bidi_stream/3,
     assign_uni_stream/3,
-    validate_peer_h3_datagram_with/1
+    validate_peer_h3_datagram_with/1,
+    handle_peer_reset/3
 ]).
 -endif.
 
@@ -118,7 +119,8 @@
     test_discarded_uni_streams/1,
     test_stream/2,
     test_push_stream/2,
-    test_stream_data_buffers/1
+    test_stream_data_buffers/1,
+    test_stream_handlers/1
 ]).
 
 %%====================================================================
@@ -1964,8 +1966,7 @@ retry_blocked_streams(#state{blocked_streams = Blocked} = State) when map_size(B
 retry_blocked_streams(
     #state{
         blocked_streams = Blocked,
-        qpack_decoder = Decoder,
-        quic_conn = QuicConn
+        qpack_decoder = Decoder
     } = State
 ) ->
     InsertCount = quic_qpack:get_insert_count(Decoder),
@@ -1977,8 +1978,8 @@ retry_blocked_streams(
         {ok, State2} ->
             {ok, State2};
         {error, {stream_reset, SId, Code}} ->
-            quic:reset_stream(QuicConn, SId, Code),
-            {ok, State1#state{streams = maps:remove(SId, State1#state.streams)}};
+            State3 = reset_request_stream(SId, Code, State1),
+            {ok, State3#state{streams = maps:remove(SId, State3#state.streams)}};
         {error, Reason} ->
             {error, Reason, State1}
     end.
@@ -2627,10 +2628,10 @@ finish_request_stream(
         {ok, Stream1, State1} ->
             {Stream1, State1};
         {error, {stream_reset, _StreamId, Code}} ->
-            quic:reset_stream(State#state.quic_conn, StreamId, Code),
+            State1 = reset_request_stream(StreamId, Code, State),
             {
                 Stream#h3_stream{frame_state = complete, state = closed},
-                release_buffered(StreamId, State)
+                release_buffered(StreamId, State1)
             }
     end;
 finish_request_stream(_StreamId, Stream, State) ->
@@ -2673,18 +2674,16 @@ process_request_frames(StreamId, Data, Fin, Stream, State) ->
             {ok, Data, Stream, State}
     end.
 
-process_request_frame(
-    StreamId, Frame, FrameFin, Rest, Fin, Stream, #state{quic_conn = QuicConn} = State
-) ->
+process_request_frame(StreamId, Frame, FrameFin, Rest, Fin, Stream, State) ->
     case handle_request_frame(StreamId, Frame, FrameFin, Stream, State) of
         {ok, Stream1, State1} ->
             process_request_frames(StreamId, Rest, Fin, Stream1, State1);
         {error, {stream_reset, SId, Code}} ->
             %% Stream-level error: reset it, and drop what else arrives on
             %% it, the rest of a DATA frame included.
-            quic:reset_stream(QuicConn, SId, Code),
+            State1 = reset_request_stream(SId, Code, State),
             {ok, <<>>, Stream#h3_stream{state = closed, data_remaining = 0},
-                release_buffered(SId, State)};
+                release_buffered(SId, State1)};
         {error, Reason} ->
             {error, Reason}
     end.
@@ -3591,8 +3590,8 @@ handle_stream_closed(
             %% RFC 9114 Section 4.1.1: server-side request stream that ends
             %% before a complete request is received MUST be reset with
             %% H3_REQUEST_INCOMPLETE.
-            maybe_reset_incomplete_request(StreamId, State),
-            State1 = maybe_send_stream_cancel(StreamId, State),
+            State0 = maybe_reset_incomplete_request(StreamId, State),
+            State1 = maybe_send_stream_cancel(StreamId, State0),
             {ok, (release_buffered(StreamId, State1))#state{
                 streams = maps:remove(StreamId, Streams),
                 stream_buffers = maps:remove(StreamId, Buffers),
@@ -3604,26 +3603,33 @@ handle_stream_closed(
             }}
     end.
 
+%% Only reached from handle_peer_reset/3, which reports the stream with
+%% the peer's code once this returns, so this tells the peer and nobody
+%% else. Reporting here as well would give the application two events for
+%% one dead stream.
 maybe_reset_incomplete_request(StreamId, #state{role = server, quic_conn = QuicConn} = State) when
     StreamId rem 4 =:= 0
 ->
     case maps:find(StreamId, State#state.streams) of
         {ok, #h3_stream{frame_state = complete}} ->
-            ok;
+            State;
         {ok, _Incomplete} ->
             quic:reset_stream(QuicConn, StreamId, ?H3_REQUEST_INCOMPLETE),
-            ok;
+            State;
         error ->
-            ok
+            State
     end;
-maybe_reset_incomplete_request(_StreamId, _State) ->
-    ok.
+maybe_reset_incomplete_request(_StreamId, State) ->
+    State.
 
 test_discarded_uni_streams(#state{discarded_uni_streams = D}) ->
     D.
 
 test_stream_data_buffers(#state{stream_data_buffers = Buffers}) ->
     Buffers.
+
+test_stream_handlers(#state{stream_handlers = Handlers}) ->
+    Handlers.
 
 test_stream(StreamId, #state{streams = Streams}) ->
     maps:get(StreamId, Streams).
@@ -3905,11 +3911,11 @@ do_send_trailers(
 do_cancel_stream(
     StreamId,
     ErrorCode,
-    #state{quic_conn = QuicConn, streams = Streams, pending_response_headers = Pending} = State
+    #state{streams = Streams, pending_response_headers = Pending} = State
 ) ->
-    quic:reset_stream(QuicConn, StreamId, ErrorCode),
+    State0 = reset_request_stream(StreamId, ErrorCode, State),
     %% RFC 9204 Section 4.4.2: Send Stream Cancellation if stream was blocked
-    State1 = maybe_send_stream_cancel(StreamId, State),
+    State1 = maybe_send_stream_cancel(StreamId, State0),
     %% Drop what the cancelled stream was holding: unsent HEADERS, the
     %% partial frame buffer, and any body no handler claimed.
     State2 = release_buffered(StreamId, State1),
@@ -4675,6 +4681,23 @@ reason_phrase(Reason) ->
         iolist_to_binary(Reason)
     catch
         _:_ -> iolist_to_binary(io_lib:format("~0p", [Reason]))
+    end.
+
+%% A stream this side resets is as dead to the application as one the peer
+%% reset, so it is reported the same way and the handler goes with it. The
+%% peer hears the RESET_STREAM; without this the local caller heard nothing
+%% and waited out its own timeout.
+reset_request_stream(StreamId, ErrorCode, #state{quic_conn = QuicConn} = State) ->
+    quic:reset_stream(QuicConn, StreamId, ErrorCode),
+    report_local_reset(StreamId, ErrorCode, State).
+
+report_local_reset(StreamId, ErrorCode, State) ->
+    case is_request_stream(StreamId, State) of
+        true ->
+            notify_stream(StreamId, {stream_reset, StreamId, ErrorCode}, State),
+            do_unset_stream_handler(StreamId, State);
+        false ->
+            State
     end.
 
 %% RESET_STREAM or RESET_STREAM_AT from the peer: clean up, then tell
