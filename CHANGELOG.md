@@ -2,7 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.0.0] - 2026-09-24
+
+Upgrading from 1.x: the HTTP/3 connection close is now always
+`{quic_h3, Conn, {closed, Reason}}`. Two of the three close paths used to send
+the bare atom `closed`, so code matching that atom stops matching and, where the
+match sits in a `handle_info/2` with a catch-all or in a selective receive, the
+close is dropped silently and the caller waits out its own timeout instead.
+Match the reason-carrying shape. Code that already matches a peer
+`{stream_reset, StreamId, ErrorCode}` needs no change and will simply start
+seeing the streams this library resets as well.
 
 ### Changed
 - An HTTP/3 connection reports every close as `{quic_h3, Conn, {closed, Reason}}`.
