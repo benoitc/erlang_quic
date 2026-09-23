@@ -57,7 +57,7 @@ draining_handles_owner_exit_test() ->
 with_owner(Fun) ->
     TestPid = self(),
     Owner = spawn(fun() ->
-        {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+        {ok, Pid} = quic_connection:start_link("127.0.0.1", silent_port(), #{}, self()),
         TestPid ! {conn_pid, self(), Pid},
         receive
             go -> Fun(Pid)
@@ -73,6 +73,38 @@ with_owner(Fun) ->
     Owner ! go,
     {Owner, Conn, Mon}.
 
+%% A port nothing answers on: a socket this VM holds open for the whole
+%% run, so no other test and nothing on the host can bind it, no server
+%% can reply, and the kernel sends no unreachable back. These tests are
+%% about close and owner exit, so the peer only has to stay silent; a
+%% shared fixed port let a reply kill the connection before a test could
+%% monitor it.
+silent_port() ->
+    case persistent_term:get({?MODULE, silent_port}, undefined) of
+        undefined -> open_silent_port();
+        Port -> Port
+    end.
+
+open_silent_port() ->
+    Test = self(),
+    %% Owned by a process of its own, so it outlives the test that first
+    %% asked for it.
+    spawn(fun() ->
+        {ok, Socket} = gen_udp:open(0, [binary, {active, false}]),
+        {ok, Port} = inet:port(Socket),
+        Test ! {silent_port, Port},
+        receive
+            stop -> gen_udp:close(Socket)
+        end
+    end),
+    receive
+        {silent_port, Port} ->
+            persistent_term:put({?MODULE, silent_port}, Port),
+            Port
+    after 1000 ->
+        error(no_silent_port)
+    end.
+
 await_down(Conn, Mon) ->
     receive
         {'DOWN', Mon, process, Conn, Reason} -> Reason
@@ -86,7 +118,7 @@ await_down(Conn, Mon) ->
 
 %% Test that close triggers draining state and sends closed message
 close_sends_closed_message_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", silent_port(), #{}, self()),
 
     %% Close the connection (doesn't need to be connected to test close behavior)
     quic_connection:close(Pid, normal),
@@ -107,7 +139,7 @@ close_sends_closed_message_test() ->
 
 %% Test close/3 with custom error code and reason phrase
 close_with_app_error_code_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", silent_port(), #{}, self()),
 
     %% Close with custom application error code
     ErrorCode = 16#0100,
@@ -125,7 +157,7 @@ close_with_app_error_code_test() ->
 
 %% Test close/3 API with zero error code (QUIC_NO_ERROR equivalent)
 close_with_zero_error_code_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", silent_port(), #{}, self()),
 
     %% Close with error code 0 (no error)
     quic_connection:close(Pid, {app_error, 0, <<>>}),
@@ -140,7 +172,7 @@ close_with_zero_error_code_test() ->
 
 %% Test close/3 API with maximum valid 62-bit error code
 close_with_max_error_code_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", silent_port(), #{}, self()),
 
     %% Close with maximum 62-bit error code
     MaxErrorCode = (1 bsl 62) - 1,
@@ -156,7 +188,7 @@ close_with_max_error_code_test() ->
 
 %% Test quic:close/3 public API
 quic_close_3_api_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", silent_port(), #{}, self()),
 
     %% Use the public API
     ErrorCode = 42,
@@ -167,7 +199,7 @@ quic_close_3_api_test() ->
 
 %% Test that close/2 with legacy {error, application_error} still works
 close_legacy_application_error_test() ->
-    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", silent_port(), #{}, self()),
 
     %% Close with legacy pattern (used in E2E tests)
     quic_connection:close(Pid, {error, application_error}),
