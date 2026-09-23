@@ -61,6 +61,12 @@ All notable changes to this project will be documented in this file.
   held, so it also reset large uploads a handler was reading. Buffered bytes
   are now released when a stream is reset or cancelled, and empty or
   fin-only pieces are charged so they cannot accumulate for free.
+- An HTTP/3 request that finished in both directions is dropped from the
+  connection's stream map. Nothing removed it on a clean FIN, so a connection
+  grew by the retained header list of every request it had served, and, because
+  the GOAWAY drain waits for that map to empty, a connection that had served
+  anything never closed gracefully. The half-close state is now combined rather
+  than overwritten, so a stream that finished both directions reaches `closed`.
 - An HTTP/3 stream that this library resets is reported to its stream handler,
   or to the connection owner if none is registered, as
   `{stream_reset, StreamId, ErrorCode}`, the same event a peer reset produces.

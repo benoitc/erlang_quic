@@ -110,7 +110,8 @@
     pre_claim_bidi_stream/3,
     assign_uni_stream/3,
     validate_peer_h3_datagram_with/1,
-    handle_peer_reset/3
+    handle_peer_reset/3,
+    maybe_close_if_drained/1
 ]).
 -endif.
 
@@ -120,7 +121,8 @@
     test_stream/2,
     test_push_stream/2,
     test_stream_data_buffers/1,
-    test_stream_handlers/1
+    test_stream_handlers/1,
+    test_streams/1
 ]).
 
 %%====================================================================
@@ -2608,7 +2610,7 @@ handle_request_stream_data(
                     <<>> -> maps:remove(StreamId, Buffers);
                     _ -> Buffers#{StreamId => Rest}
                 end,
-            Streams1 = Streams#{StreamId => Stream2},
+            Streams1 = store_stream(StreamId, Stream2, Streams),
             {ok, State2#state{streams = Streams1, stream_buffers = Buffers1}};
         {error, Reason} ->
             {error, Reason, State}
@@ -2630,7 +2632,7 @@ finish_request_stream(
         {error, {stream_reset, _StreamId, Code}} ->
             State1 = reset_request_stream(StreamId, Code, State),
             {
-                Stream#h3_stream{frame_state = complete, state = closed},
+                Stream#h3_stream{frame_state = complete, state = closed, reset = true},
                 release_buffered(StreamId, State1)
             }
     end;
@@ -2682,7 +2684,7 @@ process_request_frame(StreamId, Frame, FrameFin, Rest, Fin, Stream, State) ->
             %% Stream-level error: reset it, and drop what else arrives on
             %% it, the rest of a DATA frame included.
             State1 = reset_request_stream(SId, Code, State),
-            {ok, <<>>, Stream#h3_stream{state = closed, data_remaining = 0},
+            {ok, <<>>, Stream#h3_stream{state = closed, reset = true, data_remaining = 0},
                 release_buffered(SId, State1)};
         {error, Reason} ->
             {error, Reason}
@@ -3047,7 +3049,7 @@ process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State) ->
 %% expecting_headers so subsequent HEADERS frames are accepted as either
 %% another interim or the final response.
 finalize_stream_state(Stream, true, _Role) ->
-    Stream#h3_stream{frame_state = complete, state = half_closed_remote};
+    close_half(remote, Stream#h3_stream{frame_state = complete});
 finalize_stream_state(#h3_stream{status = Status} = Stream, false, client) when
     is_integer(Status), Status >= 100, Status < 200
 ->
@@ -3631,6 +3633,9 @@ test_stream_data_buffers(#state{stream_data_buffers = Buffers}) ->
 test_stream_handlers(#state{stream_handlers = Handlers}) ->
     Handlers.
 
+test_streams(#state{streams = Streams}) ->
+    Streams.
+
 test_stream(StreamId, #state{streams = Streams}) ->
     maps:get(StreamId, Streams).
 
@@ -3841,11 +3846,11 @@ do_send_data(
                 ok ->
                     Stream1 =
                         case Fin of
-                            true -> Stream#h3_stream{state = half_closed_local};
+                            true -> close_half(local, Stream);
                             false -> Stream
                         end,
                     {ok, State#state{
-                        streams = Streams#{StreamId => Stream1},
+                        streams = store_stream(StreamId, Stream1, Streams),
                         pending_response_headers = Pending1
                     }};
                 {error, Reason} ->
@@ -3891,12 +3896,9 @@ do_send_trailers(
                         end,
                     case quic:send_data(QuicConn, StreamId, Payload, true) of
                         ok ->
-                            Stream1 = Stream#h3_stream{
-                                trailers = Trailers,
-                                state = half_closed_local
-                            },
+                            Stream1 = close_half(local, Stream#h3_stream{trailers = Trailers}),
                             State3 = State2#state{
-                                streams = Streams#{StreamId => Stream1},
+                                streams = store_stream(StreamId, Stream1, Streams),
                                 pending_response_headers = Pending1
                             },
                             {ok, State3};
@@ -4012,9 +4014,30 @@ deliver_body(StreamId, Payload, Fin, Stream, State) ->
     end.
 
 finish_on_fin(Stream, true) ->
-    Stream#h3_stream{frame_state = complete, state = half_closed_remote};
+    close_half(remote, Stream#h3_stream{frame_state = complete});
 finish_on_fin(Stream, false) ->
     Stream.
+
+%% A FIN closes one direction. A stream whose other direction was already
+%% closed is finished, and `closed' is what store_stream/3 drops on. The
+%% field used to be assigned rather than combined, so whichever FIN came
+%% last decided the state and no stream ever reached `closed'.
+close_half(remote, #h3_stream{state = half_closed_local} = Stream) ->
+    Stream#h3_stream{state = closed};
+close_half(remote, Stream) ->
+    Stream#h3_stream{state = half_closed_remote};
+close_half(local, #h3_stream{state = half_closed_remote} = Stream) ->
+    Stream#h3_stream{state = closed};
+close_half(local, Stream) ->
+    Stream#h3_stream{state = half_closed_local}.
+
+%% A finished stream is not kept: its entry holds the header list for the
+%% life of the connection, and an unfinished-looking map also stops a
+%% GOAWAY-ed connection from ever draining.
+store_stream(StreamId, #h3_stream{state = closed, reset = false}, Streams) ->
+    maps:remove(StreamId, Streams);
+store_stream(StreamId, Stream, Streams) ->
+    Streams#{StreamId => Stream}.
 
 %% Only what gets buffered is charged: a client hands each piece to its
 %% owner, and so does a server once the stream has a handler.

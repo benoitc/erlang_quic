@@ -903,6 +903,46 @@ a_peer_reset_of_an_incomplete_request_is_reported_once_test() ->
         stop_conn(Conn)
     end.
 
+%% A request that finished in both directions is done with, so it leaves
+%% the stream map. It used to stay for the life of the connection, which
+%% also meant a GOAWAY-ed connection never drained.
+a_finished_exchange_leaves_no_stream_test() ->
+    Conn = quiet_conn(),
+    try
+        State = buffering_state(#{
+            quic_conn => Conn, stream_handlers => #{0 => {self(), make_ref()}}
+        }),
+        Body = quic_h3_frame:encode_data(<<"hi">>),
+        {ok, State1} = quic_h3_connection:handle_stream_data(0, Body, true, State),
+        ?assert(maps:is_key(0, quic_h3_connection:test_streams(State1))),
+        {ok, State2} = quic_h3_connection:do_respond(0, 200, [], <<"ok">>, State1),
+        ?assertEqual(#{}, quic_h3_connection:test_streams(State2))
+    after
+        stop_conn(Conn)
+    end.
+
+%% GOAWAY drains when the last stream finishes. The drain checks that the
+%% stream map is empty, so while finished streams stayed in it a
+%% connection that had served anything never reached closing.
+a_goaway_drains_once_the_last_stream_finishes_test() ->
+    Conn = quiet_conn(),
+    try
+        State = buffering_state(#{
+            quic_conn => Conn,
+            stream_handlers => #{0 => {self(), make_ref()}},
+            goaway_id => 0
+        }),
+        Body = quic_h3_frame:encode_data(<<"hi">>),
+        {ok, State1} = quic_h3_connection:handle_stream_data(0, Body, true, State),
+        {ok, State2} = quic_h3_connection:do_respond(0, 200, [], <<"ok">>, State1),
+        ?assertMatch(
+            {next_state, closing, _},
+            quic_h3_connection:maybe_close_if_drained(State2)
+        )
+    after
+        stop_conn(Conn)
+    end.
+
 %% With a handler registered nothing is held, so no limit applies.
 body_past_the_budget_reaches_a_registered_handler_test() ->
     Handler = self(),
