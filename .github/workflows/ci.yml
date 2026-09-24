@@ -178,8 +178,8 @@ jobs:
             export QUIC_BUILD_NIF=1
             ./rebar3 compile
 
-            # bmake runs c_src/Makefile, which delegates to CMake; a
-            # skipped build would silently drop the NIF coverage.
+            # The FreeBSD compile hook runs c_src/build_nif.sh; a skipped
+            # build would silently drop the NIF coverage.
             test -f priv/quic_crypto_nif.so || { echo "NIF was not built"; exit 1; }
             ./rebar3 as test compile
             erl -noshell -pa _build/test/lib/quic/ebin -eval '

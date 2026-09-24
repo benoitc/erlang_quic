@@ -5,10 +5,11 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
-- `quic` compiles on Windows again. The NIF build and clean hooks run
+- `quic` compiles on Windows again. The NIF build and clean hooks ran
   through `sh`, which Windows lacks, so every compile failed there,
-  including projects that only reach `quic` through hackney. Windows now
-  skips the hooks and runs on OTP crypto (#358).
+  including projects that only reach `quic` through hackney. The hooks now
+  run `c_src/build_nif.sh` only on Unix platforms, and Windows runs on OTP
+  crypto (#358).
 
 ## [2.0.0] - 2026-09-24
 
