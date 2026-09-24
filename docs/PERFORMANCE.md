@@ -97,6 +97,9 @@ QUIC_BUILD_NIF=1 rebar3 compile
 
 erlang.mk projects use the same variable, through `c_src/Makefile`.
 
+On Windows the NIF is not built and `QUIC_BUILD_NIF` is ignored: the
+library compiles without a shell and runs on OTP crypto.
+
 If you set `QUIC_BUILD_NIF=1` and the build fails, the compile fails
 with a message saying why, rather than silently producing a build
 without the NIF.
