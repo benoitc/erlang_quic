@@ -115,6 +115,7 @@ jobs:
     name: Windows
     needs: unit-tests
     runs-on: windows-2022
+    timeout-minutes: 20
     # Set so a hook that ran would try, and fail, to build the NIF.
     env:
       QUIC_BUILD_NIF: "1"
@@ -122,13 +123,15 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
-
+      # Before checkout: setup-beam runs `rebar3 version`, which hangs
+      # fetching the project plugins when it finds our rebar.config.
       - name: Set up Erlang
         uses: erlef/setup-beam@v1
         with:
           otp-version: '28'
           rebar3-version: '3.24.0'
+
+      - uses: actions/checkout@v4
 
       # Git for Windows puts sh on the runner's PATH; users do not have it.
       - name: Remove sh from PATH
@@ -139,6 +142,7 @@ jobs:
       - name: Compile
         run: |
           if (Get-Command sh -ErrorAction SilentlyContinue) { throw "sh is still on PATH" }
+          $env:DEBUG = "1"
           rebar3 compile
 
       - name: Assert the app starts on OTP crypto
