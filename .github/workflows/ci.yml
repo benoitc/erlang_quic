@@ -111,6 +111,44 @@ jobs:
           QUIC_DISABLE_CRYPTO_NIF: "1"
         run: rebar3 eunit
 
+  windows:
+    name: Windows
+    needs: unit-tests
+    runs-on: windows-2022
+    # Set so a hook that ran would try, and fail, to build the NIF.
+    env:
+      QUIC_BUILD_NIF: "1"
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24.0'
+
+      # Git for Windows puts sh on the runner's PATH; users do not have it.
+      - name: Remove sh from PATH
+        run: |
+          $path = ($env:PATH -split ';' | Where-Object { $_ -notmatch '\\Git\\' }) -join ';'
+          "PATH=$path" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Compile
+        run: |
+          if (Get-Command sh -ErrorAction SilentlyContinue) { throw "sh is still on PATH" }
+          rebar3 compile
+
+      - name: Assert the app starts on OTP crypto
+        run: |
+          if (Test-Path priv/quic_crypto_nif.*) { throw "NIF was built" }
+          erl -noshell -pa _build/default/lib/quic/ebin -eval "{ok, _} = application:ensure_all_started(quic), false = quic_crypto_nif:is_loaded(), halt(0)."
+
+      - name: Clean
+        run: rebar3 clean
+
   freebsd:
     name: FreeBSD
     needs: unit-tests
@@ -140,8 +178,8 @@ jobs:
             export QUIC_BUILD_NIF=1
             ./rebar3 compile
 
-            # bmake runs c_src/Makefile, which delegates to CMake; a
-            # skipped build would silently drop the NIF coverage.
+            # The FreeBSD compile hook runs c_src/build_nif.sh; a skipped
+            # build would silently drop the NIF coverage.
             test -f priv/quic_crypto_nif.so || { echo "NIF was not built"; exit 1; }
             ./rebar3 as test compile
             erl -noshell -pa _build/test/lib/quic/ebin -eval '
