@@ -115,6 +115,7 @@ jobs:
     name: Windows
     needs: unit-tests
     runs-on: windows-2022
+    timeout-minutes: 20
     # Set so a hook that ran would try, and fail, to build the NIF.
     env:
       QUIC_BUILD_NIF: "1"
@@ -122,13 +123,21 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
-
       - name: Set up Erlang
         uses: erlef/setup-beam@v1
         with:
           otp-version: '28'
-          rebar3-version: '3.24.0'
+          rebar3-version: '3.25.0'
+
+      # Built as an app of a bare project, the way a dependent builds it:
+      # its hooks run, but not our project plugins, whose fetch hangs
+      # rebar3 on this runner.
+      - uses: actions/checkout@v4
+        with:
+          path: apps/quic
+
+      - name: Create the enclosing project
+        run: Set-Content -Path rebar.config -Value "{deps, []}."
 
       # Git for Windows puts sh on the runner's PATH; users do not have it.
       - name: Remove sh from PATH
@@ -143,7 +152,7 @@ jobs:
 
       - name: Assert the app starts on OTP crypto
         run: |
-          if (Test-Path priv/quic_crypto_nif.*) { throw "NIF was built" }
+          if (Test-Path apps/quic/priv/quic_crypto_nif.*) { throw "NIF was built" }
           erl -noshell -pa _build/default/lib/quic/ebin -eval "{ok, _} = application:ensure_all_started(quic), false = quic_crypto_nif:is_loaded(), halt(0)."
 
       - name: Clean
