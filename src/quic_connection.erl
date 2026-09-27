@@ -3427,7 +3427,7 @@ coalesced_sends(Acc0, State0) ->
     {RevReplies, State1} =
         lists:foldl(
             fun({Tag, Sid, Data, Fin}, {Rs, S}) ->
-                case do_send_data(Sid, Data, Fin, S) of
+                case do_send_data(Sid, Data, Fin, S, send_admission(Tag)) of
                     {ok, S2} -> {[{Tag, ok} | Rs], S2};
                     {error, Reason} -> {[{Tag, {error, Reason}} | Rs], S}
                 end
@@ -3439,6 +3439,10 @@ coalesced_sends(Acc0, State0) ->
     FlushedState = flush_dirty_timers(flush_socket_batch(State2)),
     Replies = [{reply, F, R} || {F, R} <- lists:reverse(RevReplies), F =/= async],
     {keep_state, FlushedState, Replies}.
+
+%% An async send has no caller to hand send_queue_full back to.
+send_admission(async) -> force;
+send_admission(_From) -> check.
 
 drain_send_msgs(Acc, 0) ->
     lists:reverse(Acc);
@@ -8483,16 +8487,11 @@ can_send_on_stream(StreamId, State) ->
 
 %% Send data on a stream (with fragmentation for large data)
 %% Now includes flow control checks at connection and stream level
-do_send_data(
-    StreamId,
-    Data,
-    Fin,
-    #state{
-        streams = Streams,
-        max_data_remote = MaxDataRemote,
-        data_sent = DataSent
-    } = State
-) ->
+%%
+%% `check' refuses a write that would take the send queue past its ceiling,
+%% before any of it is sent, so the caller can retry the same piece.
+%% `force' admits it: async writes have no caller to retry.
+do_send_data(StreamId, Data, Fin, #state{streams = Streams} = State, Admission) ->
     case maps:find(StreamId, Streams) of
         {ok, #stream_state{send_fin = true}} ->
             %% Our FIN fixed the final size (RFC 9000 Section 4.5), so
@@ -8510,135 +8509,162 @@ do_send_data(
                     %% Use iolist_size to avoid premature flattening
                     %% Data is only flattened when needed for chunking or frame encoding
                     DataSize = iolist_size(Data),
-                    Offset = StreamState#stream_state.send_offset,
-                    SendMaxData = StreamState#stream_state.send_max_data,
-
-                    %% Check connection-level flow control
-                    ConnectionAllowed = MaxDataRemote - DataSent,
-                    %% Check stream-level flow control
-                    StreamAllowed = SendMaxData - Offset,
-
-                    %% Log flow control status for debugging
-                    ?LOG_DEBUG(
-                        #{
-                            what => send_data_flow_check,
-                            stream_id => StreamId,
-                            data_size => DataSize,
-                            offset => Offset,
-                            send_max_data => SendMaxData,
-                            stream_allowed => StreamAllowed,
-                            max_data_remote => MaxDataRemote,
-                            data_sent => DataSent,
-                            connection_allowed => ConnectionAllowed
-                        },
-                        ?QUIC_LOG_META
-                    ),
-
-                    Allowed = min(ConnectionAllowed, StreamAllowed),
-                    case {DataSize =< ConnectionAllowed, DataSize =< StreamAllowed} of
-                        Fits when Fits =/= {true, true}, Allowed > 0 ->
-                            %% Part of this write fits in the peer's window.
-                            %% Send that part and queue the rest: queuing the
-                            %% whole write instead deadlocks the transfer,
-                            %% because the peer only extends the window as it
-                            %% consumes data, so sending nothing means nothing
-                            %% ever arrives to open it.
-                            Bin = iolist_to_binary(Data),
-                            <<Head:Allowed/binary, Tail/binary>> = Bin,
-                            case do_send_data(StreamId, Head, false, State) of
-                                {ok, SentState} ->
-                                    queue_blocked_send(
-                                        StreamId,
-                                        Offset + Allowed,
-                                        Tail,
-                                        Fin,
-                                        byte_size(Tail),
-                                        SentState
-                                    );
-                                Other ->
-                                    Other
-                            end;
-                        {false, _} ->
-                            %% Connection-level flow control blocked
-                            %% RFC 9000: Don't queue data beyond flow control limits.
-                            %% Send DATA_BLOCKED and return error to caller.
-                            %% Caller should retry after receiving MAX_DATA from peer.
-                            ?LOG_DEBUG(
-                                #{
-                                    what => connection_flow_control_blocked,
-                                    need => DataSize,
-                                    allowed => ConnectionAllowed
-                                },
-                                ?QUIC_LOG_META
-                            ),
-                            %% RFC 9000 Section 19.12: DATA_BLOCKED reports the connection data limit
-                            BlockedFrame = {data_blocked, MaxDataRemote},
-                            State1 = send_frame(BlockedFrame, State),
-                            queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State1);
-                        {_, false} ->
-                            %% Stream-level flow control blocked. Send
-                            %% STREAM_DATA_BLOCKED and queue; the send queue is
-                            %% drained when MAX_STREAM_DATA arrives.
-                            ?LOG_DEBUG(
-                                #{
-                                    what => stream_flow_control_blocked,
-                                    stream_id => StreamId,
-                                    need => DataSize,
-                                    allowed => StreamAllowed
-                                },
-                                ?QUIC_LOG_META
-                            ),
-                            %% RFC 9000 Section 19.13: STREAM_DATA_BLOCKED reports the stream data limit
-                            BlockedFrame = {stream_data_blocked, StreamId, SendMaxData},
-                            State1 = send_frame(BlockedFrame, State),
-                            queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State1);
-                        {true, true} ->
-                            %% Flow control allows sending
-                            %% Fragment and send data - congestion control may partially
-                            %% send and queue the remainder
-                            case
-                                send_stream_data_fragmented_tracked(
-                                    StreamId, Offset, Data, Fin, State
-                                )
-                            of
-                                {error, send_queue_full} ->
-                                    {error, send_queue_full};
-                                {NewState, BytesSent} ->
-                                    %% Advance send_offset by full DataSize (not just BytesSent),
-                                    %% because any unsent remainder was queued with correct offsets
-                                    %% and subsequent sends must not overlap.
-                                    case maps:find(StreamId, NewState#state.streams) of
-                                        {ok, UpdatedStream} ->
-                                            SendFin = (Fin andalso BytesSent =:= DataSize),
-                                            %% send_done is NOT set here: RFC 9000 §3.1
-                                            %% ends the send side at "Data Recvd", which
-                                            %% requires the peer's acks. Reclaim (and the
-                                            %% MAX_STREAMS credit it returns) happens in
-                                            %% the ack path via settle_fin_ack/2.
-                                            FinalStream = UpdatedStream#stream_state{
-                                                send_offset = Offset + DataSize,
-                                                send_fin = SendFin
-                                            },
-                                            FinalState0 = NewState#state{
-                                                streams = maps:put(
-                                                    StreamId, FinalStream, NewState#state.streams
-                                                ),
-                                                data_sent = NewState#state.data_sent + BytesSent
-                                            },
-                                            %% RFC 9000 §4.6: extend MAX_STREAMS when this
-                                            %% peer-initiated stream is now fully closed.
-                                            FinalState = maybe_reclaim_stream(
-                                                StreamId, FinalState0
-                                            ),
-                                            {ok, FinalState};
-                                        error ->
-                                            {ok, NewState}
-                                    end
-                            end
+                    case admit_send(Admission, DataSize, State) of
+                        true ->
+                            send_admitted_data(StreamId, StreamState, Data, DataSize, Fin, State);
+                        false ->
+                            {error, send_queue_full}
                     end
             end;
         error ->
             {error, unknown_stream}
+    end.
+
+admit_send(force, _DataSize, _State) ->
+    true;
+admit_send(check, DataSize, #state{send_queue_bytes = QueueBytes}) when
+    QueueBytes + DataSize =< ?MAX_SEND_QUEUE_BYTES
+->
+    true;
+admit_send(check, DataSize, #state{send_queue_bytes = QueueBytes}) ->
+    ?LOG_WARNING(
+        #{
+            what => send_queue_full,
+            queue_bytes => QueueBytes,
+            data_size => DataSize,
+            max_bytes => ?MAX_SEND_QUEUE_BYTES
+        },
+        ?QUIC_LOG_META
+    ),
+    false.
+
+send_admitted_data(
+    StreamId,
+    StreamState,
+    Data,
+    DataSize,
+    Fin,
+    #state{max_data_remote = MaxDataRemote, data_sent = DataSent} = State
+) ->
+    Offset = StreamState#stream_state.send_offset,
+    SendMaxData = StreamState#stream_state.send_max_data,
+
+    %% Check connection-level flow control
+    ConnectionAllowed = MaxDataRemote - DataSent,
+    %% Check stream-level flow control
+    StreamAllowed = SendMaxData - Offset,
+
+    %% Log flow control status for debugging
+    ?LOG_DEBUG(
+        #{
+            what => send_data_flow_check,
+            stream_id => StreamId,
+            data_size => DataSize,
+            offset => Offset,
+            send_max_data => SendMaxData,
+            stream_allowed => StreamAllowed,
+            max_data_remote => MaxDataRemote,
+            data_sent => DataSent,
+            connection_allowed => ConnectionAllowed
+        },
+        ?QUIC_LOG_META
+    ),
+
+    Allowed = min(ConnectionAllowed, StreamAllowed),
+    case {DataSize =< ConnectionAllowed, DataSize =< StreamAllowed} of
+        Fits when Fits =/= {true, true}, Allowed > 0 ->
+            %% Part of this write fits in the peer's window.
+            %% Send that part and queue the rest: queuing the
+            %% whole write instead deadlocks the transfer,
+            %% because the peer only extends the window as it
+            %% consumes data, so sending nothing means nothing
+            %% ever arrives to open it.
+            Bin = iolist_to_binary(Data),
+            <<Head:Allowed/binary, Tail/binary>> = Bin,
+            case do_send_data(StreamId, Head, false, State, force) of
+                {ok, SentState} ->
+                    queue_blocked_send(
+                        StreamId,
+                        Offset + Allowed,
+                        Tail,
+                        Fin,
+                        byte_size(Tail),
+                        SentState
+                    );
+                Other ->
+                    Other
+            end;
+        {false, _} ->
+            %% Connection-level flow control blocked
+            %% RFC 9000: Don't queue data beyond flow control limits.
+            %% Send DATA_BLOCKED and return error to caller.
+            %% Caller should retry after receiving MAX_DATA from peer.
+            ?LOG_DEBUG(
+                #{
+                    what => connection_flow_control_blocked,
+                    need => DataSize,
+                    allowed => ConnectionAllowed
+                },
+                ?QUIC_LOG_META
+            ),
+            %% RFC 9000 Section 19.12: DATA_BLOCKED reports the connection data limit
+            BlockedFrame = {data_blocked, MaxDataRemote},
+            State1 = send_frame(BlockedFrame, State),
+            queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State1);
+        {_, false} ->
+            %% Stream-level flow control blocked. Send
+            %% STREAM_DATA_BLOCKED and queue; the send queue is
+            %% drained when MAX_STREAM_DATA arrives.
+            ?LOG_DEBUG(
+                #{
+                    what => stream_flow_control_blocked,
+                    stream_id => StreamId,
+                    need => DataSize,
+                    allowed => StreamAllowed
+                },
+                ?QUIC_LOG_META
+            ),
+            %% RFC 9000 Section 19.13: STREAM_DATA_BLOCKED reports the stream data limit
+            BlockedFrame = {stream_data_blocked, StreamId, SendMaxData},
+            State1 = send_frame(BlockedFrame, State),
+            queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State1);
+        {true, true} ->
+            %% Flow control allows sending
+            %% Fragment and send data - congestion control may partially
+            %% send and queue the remainder
+            {NewState, BytesSent} = send_stream_data_fragmented_tracked(
+                StreamId, Offset, Data, Fin, State
+            ),
+            %% Advance send_offset by full DataSize (not just BytesSent),
+            %% because any unsent remainder was queued with correct offsets
+            %% and subsequent sends must not overlap.
+            case maps:find(StreamId, NewState#state.streams) of
+                {ok, UpdatedStream} ->
+                    SendFin = (Fin andalso BytesSent =:= DataSize),
+                    %% send_done is NOT set here: RFC 9000 §3.1
+                    %% ends the send side at "Data Recvd", which
+                    %% requires the peer's acks. Reclaim (and the
+                    %% MAX_STREAMS credit it returns) happens in
+                    %% the ack path via settle_fin_ack/2.
+                    FinalStream = UpdatedStream#stream_state{
+                        send_offset = Offset + DataSize,
+                        send_fin = SendFin
+                    },
+                    FinalState0 = NewState#state{
+                        streams = maps:put(
+                            StreamId, FinalStream, NewState#state.streams
+                        ),
+                        data_sent = NewState#state.data_sent + BytesSent
+                    },
+                    %% RFC 9000 §4.6: extend MAX_STREAMS when this
+                    %% peer-initiated stream is now fully closed.
+                    FinalState = maybe_reclaim_stream(
+                        StreamId, FinalState0
+                    ),
+                    {ok, FinalState};
+                error ->
+                    {ok, NewState}
+            end
     end.
 
 %% Send 0-RTT (early) data on a stream
@@ -9034,13 +9060,8 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Wh
                 },
                 ?QUIC_LOG_META
             ),
-            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
-                {ok, QueuedState} ->
-                    PacedState = maybe_set_pacing_timer(Delay, QueuedState),
-                    {PacedState, BytesSentSoFar};
-                {error, send_queue_full} ->
-                    {error, send_queue_full}
-            end;
+            QueuedState = queue_stream_data(StreamId, Offset, Data, Fin, State, Where),
+            {maybe_set_pacing_timer(Delay, QueuedState), BytesSentSoFar};
         {blocked_cwnd, _Available} ->
             ?LOG_DEBUG(
                 #{
@@ -9054,12 +9075,7 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Wh
                 },
                 ?QUIC_LOG_META
             ),
-            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
-                {ok, QueuedState} ->
-                    {QueuedState, BytesSentSoFar};
-                {error, send_queue_full} ->
-                    {error, send_queue_full}
-            end
+            {queue_stream_data(StreamId, Offset, Data, Fin, State, Where), BytesSentSoFar}
     end.
 
 %% Approve up to KMax-1 additional same-size sends against CC/pacing,
@@ -9318,12 +9334,8 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
     {chunked_ctx, _, _, _, _, _, Where} = Ctx,
     case burst_exhausted(State) of
         true ->
-            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
-                {ok, QueuedState} ->
-                    {arm_burst_continuation(QueuedState), BytesSentSoFar};
-                {error, send_queue_full} ->
-                    {error, send_queue_full}
-            end;
+            QueuedState = queue_stream_data(StreamId, Offset, Data, Fin, State, Where),
+            {arm_burst_continuation(QueuedState), BytesSentSoFar};
         false ->
             send_stream_chunked_step_unbudgeted(
                 StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
@@ -9363,13 +9375,8 @@ send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSen
                 },
                 ?QUIC_LOG_META
             ),
-            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
-                {ok, QueuedState} ->
-                    PacedState = maybe_set_pacing_timer(Delay, QueuedState),
-                    {PacedState, BytesSentSoFar};
-                {error, send_queue_full} ->
-                    {error, send_queue_full}
-            end;
+            QueuedState = queue_stream_data(StreamId, Offset, Data, Fin, State, Where),
+            {maybe_set_pacing_timer(Delay, QueuedState), BytesSentSoFar};
         {blocked_cwnd, Available} ->
             %% Queue remaining data for later
             ?LOG_DEBUG(
@@ -9385,13 +9392,7 @@ send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSen
                 },
                 ?QUIC_LOG_META
             ),
-            case queue_stream_data(StreamId, Offset, Data, Fin, State, Where) of
-                {ok, QueuedState} ->
-                    % Return bytes sent so far
-                    {QueuedState, BytesSentSoFar};
-                {error, send_queue_full} ->
-                    {error, send_queue_full}
-            end
+            {queue_stream_data(StreamId, Offset, Data, Fin, State, Where), BytesSentSoFar}
     end.
 
 %% Queue a send the peer's flow-control window has no room for, rather
@@ -9406,19 +9407,15 @@ send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSen
 %% order behind this entry. QUIC reassembly is offset-based, so the order
 %% the queued entries actually go out in does not matter.
 queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State) ->
-    case queue_stream_data(StreamId, Offset, Data, Fin, State) of
-        {ok, QState} ->
-            case maps:find(StreamId, QState#state.streams) of
-                {ok, Stream} ->
-                    NewStream = Stream#stream_state{send_offset = Offset + DataSize},
-                    {ok, QState#state{
-                        streams = maps:put(StreamId, NewStream, QState#state.streams)
-                    }};
-                error ->
-                    {ok, QState}
-            end;
-        {error, send_queue_full} = Error ->
-            Error
+    QState = queue_stream_data(StreamId, Offset, Data, Fin, State),
+    case maps:find(StreamId, QState#state.streams) of
+        {ok, Stream} ->
+            NewStream = Stream#stream_state{send_offset = Offset + DataSize},
+            {ok, QState#state{
+                streams = maps:put(StreamId, NewStream, QState#state.streams)
+            }};
+        error ->
+            {ok, QState}
     end.
 
 %%====================================================================
@@ -9427,7 +9424,8 @@ queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State) ->
 
 %% Queue stream data when congestion window is full
 %% Uses bucket-based priority queue for O(1) insert (RFC 9218)
-%% Returns {ok, State} | {error, send_queue_full} if queue limit exceeded
+%% Never refuses: the ceiling is checked once, when do_send_data/5 admits
+%% the write, because part of it may already be on the wire by now.
 %% Entry format: {stream_data, StreamId, Offset, Data, Fin, DataSize}
 %% DataSize is cached to avoid repeated iolist_size calls
 queue_stream_data(StreamId, Offset, Data, Fin, State) ->
@@ -9456,37 +9454,20 @@ queue_stream_data(
             false -> iolist_to_binary(Data)
         end,
     DataSize = byte_size(DataBin),
-    NewQueueBytes = QueueBytes + DataSize,
-    case NewQueueBytes > ?MAX_SEND_QUEUE_BYTES of
-        true ->
-            ?LOG_WARNING(
-                #{
-                    what => send_queue_full,
-                    stream_id => StreamId,
-                    queue_bytes => QueueBytes,
-                    data_size => DataSize,
-                    max_bytes => ?MAX_SEND_QUEUE_BYTES
-                },
-                ?QUIC_LOG_META
-            ),
-            {error, send_queue_full};
-        false ->
-            Urgency = get_stream_urgency(StreamId, Streams),
-            %% Cache DataSize in entry to avoid repeated iolist_size calls
-            Entry = {stream_data, StreamId, Offset, DataBin, Fin, DataSize},
-            NewPQ =
-                case Where of
-                    back -> quic_pqueue:in(Entry, Urgency, PQ);
-                    front -> quic_pqueue:in_front(Entry, Urgency, PQ)
-                end,
-            NewVersion = Version + 1,
-            {ok, State#state{
-                send_queue = NewPQ,
-                send_queue_bytes = NewQueueBytes,
-                send_queue_count = QueueCount + 1,
-                send_queue_version = NewVersion
-            }}
-    end.
+    Urgency = get_stream_urgency(StreamId, Streams),
+    %% Cache DataSize in entry to avoid repeated iolist_size calls
+    Entry = {stream_data, StreamId, Offset, DataBin, Fin, DataSize},
+    NewPQ =
+        case Where of
+            back -> quic_pqueue:in(Entry, Urgency, PQ);
+            front -> quic_pqueue:in_front(Entry, Urgency, PQ)
+        end,
+    State#state{
+        send_queue = NewPQ,
+        send_queue_bytes = QueueBytes + DataSize,
+        send_queue_count = QueueCount + 1,
+        send_queue_version = Version + 1
+    }.
 
 %% Get stream urgency (default 3 if stream not found)
 get_stream_urgency(StreamId, Streams) ->
@@ -9662,57 +9643,45 @@ process_send_queue_entry(
                 send_queue_bytes = DecrementedQueueBytes,
                 send_queue_count = DecrementedQueueCount
             },
-            case send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State1, front) of
-                {error, send_queue_full} ->
-                    ?LOG_WARNING(
-                        #{
-                            what => send_queue_overflow_on_requeue,
-                            stream_id => StreamId,
-                            data_size => DataSize
-                        },
-                        ?QUIC_LOG_META
-                    ),
-                    State1;
-                {State2, BytesSent} ->
-                    %% Only update data_sent for connection-level flow control accounting.
-                    %% send_offset was already advanced when the data was first queued
-                    %% (in do_send_data) to prevent offset overlap bugs.
-                    State3a =
-                        case BytesSent > 0 of
-                            true ->
-                                State2#state{
-                                    data_sent = State2#state.data_sent + BytesSent
-                                };
-                            false ->
-                                State2
-                        end,
-                    %% A queued write that carried FIN closes the send side only
-                    %% here: do_send_data could not mark it (the write was still
-                    %% queued). The queue-count check rules out a zero-length FIN
-                    %% entry that was re-queued rather than sent (0 =:= 0 lies).
-                    EntrySent =
-                        BytesSent =:= DataSize andalso
-                            State3a#state.send_queue_count =:= DecrementedQueueCount,
-                    State3 =
-                        case Fin andalso EntrySent of
-                            true -> mark_fin_sent(StreamId, State3a);
-                            false -> State3a
-                        end,
-                    %% If data was queued again (cwnd still full), stop processing
-                    case quic_pqueue:is_empty(State3#state.send_queue) of
-                        true ->
-                            State3;
-                        false ->
-                            %% Check if we just queued more data (cwnd full)
-                            %% Use version counter for fast comparison (avoids structural equality on 8-tuple)
-                            case
-                                State3#state.send_queue_version =:= State1#state.send_queue_version
-                            of
-                                % Keep processing (check flow control again)
-                                true -> process_send_queue(State3);
-                                % New data queued, cwnd full
-                                false -> State3
-                            end
+            {State2, BytesSent} = send_stream_data_fragmented_tracked(
+                StreamId, Offset, Data, Fin, State1, front
+            ),
+            %% Only update data_sent for connection-level flow control accounting.
+            %% send_offset was already advanced when the data was first queued
+            %% (in do_send_data) to prevent offset overlap bugs.
+            State3a =
+                case BytesSent > 0 of
+                    true ->
+                        State2#state{
+                            data_sent = State2#state.data_sent + BytesSent
+                        };
+                    false ->
+                        State2
+                end,
+            %% A queued write that carried FIN closes the send side only
+            %% here: do_send_data could not mark it (the write was still
+            %% queued). The queue-count check rules out a zero-length FIN
+            %% entry that was re-queued rather than sent (0 =:= 0 lies).
+            EntrySent =
+                BytesSent =:= DataSize andalso
+                    State3a#state.send_queue_count =:= DecrementedQueueCount,
+            State3 =
+                case Fin andalso EntrySent of
+                    true -> mark_fin_sent(StreamId, State3a);
+                    false -> State3a
+                end,
+            %% If data was queued again (cwnd still full), stop processing
+            case quic_pqueue:is_empty(State3#state.send_queue) of
+                true ->
+                    State3;
+                false ->
+                    %% Check if we just queued more data (cwnd full)
+                    %% Use version counter for fast comparison (avoids structural equality on 8-tuple)
+                    case State3#state.send_queue_version =:= State1#state.send_queue_version of
+                        % Keep processing (check flow control again)
+                        true -> process_send_queue(State3);
+                        % New data queued, cwnd full
+                        false -> State3
                     end
             end
     end.
@@ -9721,7 +9690,8 @@ process_send_queue_entry(
 send_pending_data([], State) ->
     State;
 send_pending_data([{StreamId, Data, Fin} | Rest], State) ->
-    case do_send_data(StreamId, Data, Fin, State) of
+    %% Accepted before the handshake finished; refusing it now would drop it.
+    case do_send_data(StreamId, Data, Fin, State, force) of
         {ok, NewState} ->
             send_pending_data(Rest, NewState);
         {error, _Reason} ->
