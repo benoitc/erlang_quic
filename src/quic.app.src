@@ -32,6 +32,8 @@
     ]},
     {modules, []},
     {licenses, ["Apache-2.0"]},
+    %% The CMake build directory is git-ignored but rebar3_hex packs it.
+    {exclude_paths, ["c_src/build"]},
     {links, [
         {"GitHub", "https://github.com/benoitc/erlang_quic"}
     ]}

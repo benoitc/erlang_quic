@@ -537,8 +537,8 @@ Boot-arg form: `-quic_dist auth_callback Mod:Fun`.
 
 By default, `quic_dist` skips `epmd` registration entirely and uses
 its own discovery. With `register_with_epmd = true`, the listener
-calls `EpmdMod:register_node/3` (where `EpmdMod` is whatever
-`net_kernel:epmd_module/0` returns) so the node appears in the
+calls `EpmdMod:register_node/3` (where `EpmdMod` is the kernel
+`epmd_module` parameter, `erl_epmd` by default) so the node appears in the
 configured registry. Useful in mixed-protocol clusters and for
 tools that scrape `epmd` directly.
 

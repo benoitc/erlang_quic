@@ -897,7 +897,7 @@ receive paths, and a migration fix for the default gen_udp client.
   backend. Rebind closes the old OTP socket, stops its dedicated
   receiver process, opens a fresh one, and threads the new handle
   through the connection state. (#90)
-- `quic_socket:start_client_receiver/2` / `stop_client_receiver/1`:
+- `quic_socket` `start_client_receiver` / `stop_client_receiver`:
   dedicated receiver process for the socket-backend client path
   (the OTP socket NIF has no `{active, N}` mode). (#88)
 - `quic_socket:set_socket/2` swaps the underlying socket handle
