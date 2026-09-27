@@ -3286,22 +3286,34 @@ dequeue_small_stream_frame_tuple(
         {value, {stream_data, StreamId, Offset, Data, Fin, DataSize}} when
             DataSize < ?SMALL_FRAME_THRESHOLD
         ->
-            %% Remove from queue and return frame tuple (not encoded).
-            %% send_queue_bytes must be decremented here to match the
-            %% accounting done in process_send_queue_entry/1; otherwise
-            %% the counter leaks until it crosses ?MAX_SEND_QUEUE_BYTES.
-            {{value, _}, NewPQ} = quic_pqueue:out(PQ),
-            StreamFrameTuple = {stream, StreamId, Offset, Data, Fin},
-            NewState = State#state{
-                send_queue = NewPQ,
-                send_queue_bytes = max(0, QueueBytes - DataSize),
-                send_queue_count = max(0, QueueCount - 1),
-                send_queue_version = Version + 1
-            },
-            {ok, StreamFrameTuple, NewState};
+            %% A queued entry is often one the peer's window has no room
+            %% for yet: it rides along only once both windows admit it.
+            case check_send_queue_flow_control(StreamId, Offset, DataSize, State) of
+                ok ->
+                    %% Remove from queue and return frame tuple (not encoded).
+                    %% send_queue_bytes must be decremented here to match the
+                    %% accounting done in process_send_queue_entry/1; otherwise
+                    %% the counter leaks until it crosses ?MAX_SEND_QUEUE_BYTES.
+                    %% data_sent and the FIN are settled as that path does.
+                    {{value, _}, NewPQ} = quic_pqueue:out(PQ),
+                    StreamFrameTuple = {stream, StreamId, Offset, Data, Fin},
+                    NewState = State#state{
+                        send_queue = NewPQ,
+                        send_queue_bytes = max(0, QueueBytes - DataSize),
+                        send_queue_count = max(0, QueueCount - 1),
+                        send_queue_version = Version + 1,
+                        data_sent = State#state.data_sent + DataSize
+                    },
+                    {ok, StreamFrameTuple, fin_sent_if(Fin, StreamId, NewState)};
+                {blocked, _} ->
+                    none
+            end;
         _ ->
             none
     end.
+
+fin_sent_if(true, StreamId, State) -> mark_fin_sent(StreamId, State);
+fin_sent_if(false, _StreamId, State) -> State.
 
 %% Send multiple frame tuples in a single packet
 %% Takes frame tuples, encodes them, and passes directly to loss tracking

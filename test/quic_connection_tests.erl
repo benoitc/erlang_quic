@@ -618,7 +618,18 @@ dequeue_small_stream_frame_decrements_bytes_test() ->
     ?assertEqual(true, maps:get(dequeued, Result)),
     ?assertEqual(0, maps:get(send_queue_bytes, Result)),
     ?assertEqual(0, maps:get(send_queue_count, Result)),
-    ?assertEqual(2, maps:get(send_queue_version, Result)).
+    ?assertEqual(2, maps:get(send_queue_version, Result)),
+    ?assertEqual(120, maps:get(data_sent, Result)).
+
+%% A small queued entry the peer's window has no room for stays queued
+%% rather than riding along with an ACK past the peer's limit.
+dequeue_small_stream_frame_respects_stream_window_test() ->
+    Result = quic_connection_test_support:coalesce_small_stream(120, 100, 1000000),
+    ?assertEqual(false, maps:get(dequeued, Result)).
+
+dequeue_small_stream_frame_respects_connection_window_test() ->
+    Result = quic_connection_test_support:coalesce_small_stream(120, 1000000, 100),
+    ?assertEqual(false, maps:get(dequeued, Result)).
 
 %% Regression: an empty FIN-only stream send (iodata <<>>, Fin=true) can
 %% be enqueued under pacing or cwnd blocking. The O(1) emptiness check

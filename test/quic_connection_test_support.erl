@@ -44,6 +44,7 @@
     pending_delivery/1,
     finish_recv_pass/1,
     coalesce_small_stream/1,
+    coalesce_small_stream/3,
     zero_byte_fin_in_queue/0,
     decimate_initial_state/0,
     decimate_step/1,
@@ -514,6 +515,11 @@ zero_byte_fin_in_queue() ->
     }.
 
 coalesce_small_stream(DataSize) ->
+    coalesce_small_stream(DataSize, 1000000, 1000000).
+
+%% As coalesce_small_stream/1, with the peer's stream and connection
+%% windows set to StreamWindow and ConnWindow bytes past what was sent.
+coalesce_small_stream(DataSize, StreamWindow, ConnWindow) ->
     Data = binary:copy(<<0>>, DataSize),
     Entry = {stream_data, 0, 0, Data, false, DataSize},
     PQ = quic_pqueue:in(Entry, 3, quic_pqueue:new()),
@@ -521,26 +527,32 @@ coalesce_small_stream(DataSize) ->
         send_queue = PQ,
         send_queue_bytes = DataSize,
         send_queue_count = 1,
-        send_queue_version = 1
+        send_queue_version = 1,
+        streams = #{0 => #stream_state{id = 0, send_max_data = StreamWindow}},
+        max_data_remote = ConnWindow,
+        data_sent = 0
     },
     case quic_connection:dequeue_small_stream_frame_tuple(State0) of
         {ok, _FrameTuple, #state{
             send_queue_bytes = NewBytes,
             send_queue_count = NewCount,
-            send_queue_version = NewVersion
+            send_queue_version = NewVersion,
+            data_sent = Sent
         }} ->
             #{
                 dequeued => true,
                 send_queue_bytes => NewBytes,
                 send_queue_count => NewCount,
-                send_queue_version => NewVersion
+                send_queue_version => NewVersion,
+                data_sent => Sent
             };
         none ->
             #{
                 dequeued => false,
                 send_queue_bytes => DataSize,
                 send_queue_count => 1,
-                send_queue_version => 1
+                send_queue_version => 1,
+                data_sent => 0
             }
     end.
 
