@@ -68,7 +68,10 @@
     queue_stream/4,
     state_with_stream_limits/3,
     recv_max_data/2,
-    send_queue_full_refusals/1
+    send_queue_full_refusals/1,
+    state_for_manual_recv/2,
+    stream_recv/2,
+    max_data_local/1
 ]).
 
 %% Update the spin-bit tracking state from a received 1-RTT packet.
@@ -871,3 +874,31 @@ recv_max_data(#state{streams = Streams}, StreamId) ->
 
 -spec send_queue_full_refusals(#state{}) -> non_neg_integer().
 send_queue_full_refusals(#state{send_queue_full_refusals = N}) -> N.
+
+%% A connected client that has opened stream 0 and can send frames: its
+%% stream and connection limits start at Window, and grow to MaxWindow.
+-spec state_for_manual_recv(pos_integer(), pos_integer()) -> #state{}.
+state_for_manual_recv(Window, MaxWindow) ->
+    S0 = state_with_stream_limits(client, Window, Window),
+    S1 = state_sending(S0#state{
+        pn_app = S0#state.pn_handshake,
+        max_data_local = Window,
+        fc_max_receive_window = MaxWindow,
+        coalesce = false
+    }),
+    {ok, 0, S2} = quic_connection:do_open_stream(S1),
+    S2.
+
+%% A stream's receive fields.
+-spec stream_recv(#state{}, non_neg_integer()) -> map().
+stream_recv(#state{streams = Streams}, StreamId) ->
+    #{StreamId := S} = Streams,
+    #{
+        flow => S#stream_state.recv_flow,
+        offset => S#stream_state.recv_offset,
+        max => S#stream_state.recv_max_data,
+        consumed => S#stream_state.recv_consumed
+    }.
+
+-spec max_data_local(#state{}) -> non_neg_integer().
+max_data_local(#state{max_data_local = M}) -> M.

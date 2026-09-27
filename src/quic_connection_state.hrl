@@ -347,6 +347,8 @@
     send_queue_bytes = 0 :: non_neg_integer(),
     %% Writes refused with send_queue_full, reported by get_stats.
     send_queue_full_refusals = 0 :: non_neg_integer(),
+    %% Streams whose receive credit waits for the reader (recv_flow).
+    manual_recv_streams = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
     %% Send queue entry count. Used as an O(1) emptiness check because
     %% send_queue_bytes can legitimately be 0 while an entry is queued
     %% (e.g. an empty FIN-only stream send enqueued under pacing).
