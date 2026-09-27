@@ -32,7 +32,10 @@
     ]},
     {modules, []},
     {licenses, ["Apache-2.0"]},
-    %% The CMake build directory is git-ignored but rebar3_hex packs it.
+    %% rebar3_hex reads package paths from here, not from rebar.config.
+    %% README's image ships so the Hex.pm page does not show it broken;
+    %% the CMake build directory is git-ignored but would be packed.
+    {include_paths, ["docs/images/enki-multimedia.svg"]},
     {exclude_paths, ["c_src/build"]},
     {links, [
         {"GitHub", "https://github.com/benoitc/erlang_quic"}
