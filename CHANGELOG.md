@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.0] - 2026-09-28
+
+### Added
+- Receive backpressure for HTTP/3. `quic_h3:set_stream_handler/4` and
+  `quic_h3:request/3` take `flow_control => manual`, and
+  `quic_h3:consume/3` returns credit for body the reader has processed.
+  The peer can then send at most one stream window past what was consumed,
+  so a handler that stops reading stops the peer instead of filling its
+  mailbox. HTTP/3 framing is credited as it is parsed. `auto`, the
+  default, is unchanged.
+- A write refused with `send_queue_full` is followed by
+  `{quic_h3, Conn, {send_ready, StreamId}}` to the refused caller once the
+  send queue drains below half its ceiling, so writers need not poll.
+
+### Fixed
+- A small queued stream frame could ride along with an ACK past the peer's
+  flow-control limit, closing the connection with FLOW_CONTROL_ERROR. It now
+  waits for both windows, and its bytes count against the connection limit.
+- `quic_h3:set_stream_handler/3,4` and `unset_stream_handler/2` no longer
+  leave the caller waiting forever while the connection is still connecting
+  or after a GOAWAY: every state answers them.
+
 ## [2.0.3] - 2026-09-27
 
 ### Fixed
