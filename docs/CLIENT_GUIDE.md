@@ -140,7 +140,7 @@ case quic:send_data(Conn, StreamId, Data, true, 5000) of
     {error, timeout} -> handle_timeout()
 end.
 
-%% Backpressure: the queue for this stream is full, nothing was written.
+%% Backpressure: the connection's send queue is full, nothing was written.
 %% Let the connection drain and send the same piece again.
 case quic:send_data(Conn, StreamId, Data, false) of
     ok -> sent;
