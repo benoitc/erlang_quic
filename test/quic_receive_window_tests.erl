@@ -1,6 +1,7 @@
 %%% -*- erlang -*-
 %%%
-%%% Which receive limit a stream gets.
+%%% Which receive limit a stream gets, and the smallest receive window
+%%% the options accept.
 %%%
 %%% RFC 9000 Section 18.2: initial_max_stream_data_bidi_local covers the
 %%% bidirectional streams opened by the endpoint that sends it, and
@@ -13,6 +14,7 @@
 -module(quic_receive_window_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("quic.hrl").
 
 -define(S, quic_connection_test_support).
 -define(LOCAL, 65536).
@@ -25,6 +27,40 @@ locally_opened_stream_uses_bidi_local_test_() ->
 %% A stream the peer opens receives within our bidi_remote limit.
 peer_opened_stream_uses_bidi_remote_test_() ->
     [?_assertEqual(?REMOTE, opened_by_peer(Role)) || Role <- [client, server]].
+
+%% A window too small to hold a few packets is refused up front.
+small_receive_window_is_refused_by_connect_test() ->
+    ?assertEqual(
+        {error, {invalid_max_receive_window, ?MIN_RECEIVE_WINDOW - 1}},
+        quic:connect(
+            <<"127.0.0.1">>, 4433, #{max_receive_window => ?MIN_RECEIVE_WINDOW - 1}, self()
+        )
+    ).
+
+%% The fence: the smallest accepted window starts a connection.
+smallest_receive_window_is_accepted_by_connect_test() ->
+    {ok, _} = application:ensure_all_started(quic),
+    {ok, Conn} = quic:connect(
+        <<"127.0.0.1">>, 4433, #{max_receive_window => ?MIN_RECEIVE_WINDOW}, self()
+    ),
+    ?assert(is_pid(Conn)),
+    quic:close(Conn).
+
+small_receive_window_is_refused_by_start_server_test() ->
+    {Cert, Key} = quic_test_echo_server:cert_and_key(),
+    ?assertEqual(
+        {error, {invalid_max_receive_window, 0}},
+        quic:start_server(
+            window_too_small, 0, #{cert => Cert, key => Key, max_receive_window => 0}
+        )
+    ).
+
+smallest_receive_window_is_accepted_by_start_server_test() ->
+    {ok, _} = application:ensure_all_started(quic),
+    {Cert, Key} = quic_test_echo_server:cert_and_key(),
+    Opts = #{cert => Cert, key => Key, max_receive_window => ?MIN_RECEIVE_WINDOW},
+    ?assertMatch({ok, _}, quic:start_server(smallest_window, 0, Opts)),
+    ok = quic:stop_server(smallest_window).
 
 %%====================================================================
 %% Helpers

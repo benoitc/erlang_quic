@@ -308,6 +308,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `max_stream_data_bidi_local` - Stream-level limit for streams we open
 - `max_stream_data_bidi_remote` - Stream-level limit for streams the peer opens
 - `max_stream_data_uni` - Stream-level limit for unidirectional streams
+- `max_receive_window` - Largest window the receive limits grow to (default: 8 MiB, minimum: 16 KiB)
 - `max_datagram_frame_size` - Max datagram size to accept (0 = disabled, default: 0)
 - `datagram_recv_queue_len` - Bounded receive queue for inbound datagrams (default: `infinity`; drops oldest on overflow, tracked via `datagram_stats/1`)
 - `reset_stream_at` - Enable RESET_STREAM_AT extension (default: false)

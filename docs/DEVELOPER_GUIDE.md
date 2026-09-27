@@ -331,6 +331,7 @@ handle_quic_event({quic, Conn, Event}) ->
 | `max_stream_data_bidi_local` | `integer()` | `524288` | Receive window for streams we open (bytes) |
 | `max_stream_data_bidi_remote` | `integer()` | `524288` | Receive window for streams the peer opens (bytes) |
 | `max_stream_data_uni` | `integer()` | `524288` | Receive window for unidirectional streams (bytes) |
+| `max_receive_window` | `integer()` | `8388608` | Largest window the receive limits grow to (bytes); smaller than `16384` is refused |
 | `max_datagram_frame_size` | `integer()` | `0` | Max datagram size (0 = disabled) |
 | `session_ticket` | `binary()` | - | Ticket for 0-RTT resumption |
 | `cc_algorithm` | `newreno \| cubic \| bbr` | `newreno` | CC algorithm. Change it on a live connection with `quic:set_congestion_control/2` |
