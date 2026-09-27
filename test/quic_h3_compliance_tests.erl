@@ -1826,6 +1826,114 @@ writes(StreamId) ->
     end.
 
 %%====================================================================
+%% Manual receive credit (flow_control => manual)
+%%====================================================================
+
+%% Consuming the payload credits the whole frame: the DATA header was
+%% parsed by the connection, never seen by the reader.
+consume_credits_the_frame_header_too_test() ->
+    Conn = cast_capture_conn(self()),
+    try
+        State0 = manual_stream_state(Conn),
+        Frame = quic_h3_frame:encode_data(<<"hello">>),
+        {ok, State1} = quic_h3_connection:handle_stream_data(0, Frame, false, State0),
+        From = {self(), make_ref()},
+        {keep_state, _, [{reply, From, ok}]} =
+            quic_h3_connection:connected({call, From}, {consume, 0, 5}, State1),
+        ?assertEqual([byte_size(Frame)], consumed_offsets())
+    after
+        stop_conn(Conn)
+    end.
+
+%% Nothing is credited while the payload is unconsumed; consuming part
+%% of it credits the header and that part.
+credit_follows_the_consumed_payload_test() ->
+    Conn = cast_capture_conn(self()),
+    try
+        State0 = manual_stream_state(Conn),
+        Frame = quic_h3_frame:encode_data(<<"hello">>),
+        {ok, State1} = quic_h3_connection:handle_stream_data(0, Frame, false, State0),
+        ?assertEqual([], consumed_offsets()),
+        From = {self(), make_ref()},
+        {keep_state, _, [{reply, From, ok}]} =
+            quic_h3_connection:connected({call, From}, {consume, 0, 4}, State1),
+        ?assertEqual([byte_size(Frame) - 1], consumed_offsets())
+    after
+        stop_conn(Conn)
+    end.
+
+%% Every state answers the per-stream calls; none leaves the caller
+%% waiting on a call it has no clause for.
+stream_calls_are_answered_in_every_state_test_() ->
+    States = [
+        bootstrapping,
+        early_data,
+        awaiting_quic,
+        h3_connecting,
+        connected,
+        goaway_sent,
+        goaway_received,
+        closing
+    ],
+    Calls = [
+        {{consume, 0, 10}, {error, unknown_stream}},
+        {{set_stream_handler, 0, self(), #{}}, {error, unknown_stream}},
+        {{unset_stream_handler, 0}, ok}
+    ],
+    [
+        ?_assertEqual(
+            Expected,
+            reply_of(
+                quic_h3_connection:StateName(
+                    {call, {self(), make_ref()}}, Call, make_test_state(#{})
+                )
+            )
+        )
+     || StateName <- States, {Call, Expected} <- Calls
+    ].
+
+reply_of({keep_state, _, [{reply, _, Reply}]}) -> Reply;
+reply_of({keep_state_and_data, [{reply, _, Reply}]}) -> Reply;
+reply_of(Other) -> {no_reply, Other}.
+
+%% A server request stream in manual mode with this process as handler.
+manual_stream_state(Conn) ->
+    make_test_state(#{
+        role => server,
+        quic_conn => Conn,
+        streams => #{
+            0 => #h3_stream{
+                id = 0,
+                type = request,
+                state = open,
+                frame_state = expecting_data,
+                flow = manual
+            }
+        },
+        stream_handlers => #{0 => {self(), make_ref()}}
+    }).
+
+%% Forwards the stream_consumed casts it receives.
+cast_capture_conn(Reporter) ->
+    spawn(fun Loop() ->
+        receive
+            {'$gen_cast', {stream_consumed, _Id, Offset}} ->
+                Reporter ! {consumed_offset, Offset},
+                Loop();
+            stop ->
+                ok;
+            _ ->
+                Loop()
+        end
+    end).
+
+consumed_offsets() ->
+    receive
+        {consumed_offset, Offset} -> [Offset | consumed_offsets()]
+    after 100 -> []
+    end.
+
+%%====================================================================
 %% Authority / Host validation (RFC 9114 §4.3.1)
 %%====================================================================
 

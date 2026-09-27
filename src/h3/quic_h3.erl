@@ -116,6 +116,7 @@
     set_stream_handler/3,
     set_stream_handler/4,
     unset_stream_handler/2,
+    consume/3,
     %% HTTP Datagrams (RFC 9297)
     send_datagram/3,
     h3_datagrams_enabled/1,
@@ -355,6 +356,16 @@ request(Conn, Headers) ->
     quic_h3_connection:request(Conn, Headers).
 
 %% @doc Send an HTTP request with options.
+%%
+%% Options:
+%% <ul>
+%%   <li>`end_stream' - Close the request side after the headers
+%%       (default `true').</li>
+%%   <li>`flow_control' - `auto' (default) or `manual'. With `manual' the
+%%       response body waits for {@link consume/3}: the server can send at
+%%       most one stream window past what the caller consumed.</li>
+%% </ul>
+%% @end
 -spec request(conn(), headers(), map()) -> {ok, stream_id()} | {error, term()}.
 request(Conn, Headers, Opts) ->
     quic_h3_connection:request(Conn, Headers, Opts).
@@ -488,6 +499,12 @@ set_stream_handler(Conn, StreamId, HandlerPid) ->
 %% <ul>
 %%   <li>`drain_buffer' - If true (default), returns buffered data.
 %%       If false, sends buffered data as messages.</li>
+%%   <li>`flow_control' - `auto' (default) grants the peer receive credit
+%%       as data arrives. `manual' grants it only for the bytes the
+%%       handler returns with {@link consume/3}, so a handler that stops
+%%       reading stops the peer after one stream window. Data buffered
+%%       before registration counts as received and is consumed like any
+%%       other. Without the option the stream keeps its current mode.</li>
 %% </ul>
 %% @end
 -spec set_stream_handler(conn(), stream_id(), pid(), map()) ->
@@ -502,6 +519,24 @@ set_stream_handler(Conn, StreamId, HandlerPid, Opts) ->
 -spec unset_stream_handler(conn(), stream_id()) -> ok.
 unset_stream_handler(Conn, StreamId) ->
     quic_h3_connection:unset_stream_handler(Conn, StreamId).
+
+%% @doc Return receive credit on a `flow_control => manual' stream.
+%%
+%% Call it after processing `Bytes' of body received on `StreamId'; the
+%% peer may then send up to one stream window past what was consumed.
+%% HTTP/3 framing is credited without it, so count payload bytes only.
+%% A no-op returning `ok' on an `auto' stream. Returns
+%% `{error, unknown_stream}' once the stream is finished or reset.
+%%
+%% ```
+%% ok = quic_h3:set_stream_handler(Conn, StreamId, self(), #{flow_control => manual}),
+%% %% after handling Data:
+%% ok = quic_h3:consume(Conn, StreamId, byte_size(Data)).
+%% '''
+%% @end
+-spec consume(conn(), stream_id(), non_neg_integer()) -> ok | {error, term()}.
+consume(Conn, StreamId, Bytes) ->
+    quic_h3_connection:consume(Conn, StreamId, Bytes).
 
 %%====================================================================
 %% Server API
