@@ -718,6 +718,7 @@ The connection owner process receives messages in the form `{quic_h3, Conn, Even
 | `{response, StreamId, Status, Headers}` | Response headers received (client). `Status` is the parsed status, and `Headers` is the field section as it arrived, `:status` included. Do not prepend `Status` to `Headers`: the pseudo-header is already there, and two of one is a malformed response |
 | `{data, StreamId, Data, Fin}` | Body data received |
 | `{trailers, StreamId, Trailers}` | Trailers received |
+| `{send_ready, StreamId}` | The send queue has drained after a write on `StreamId` was refused with `send_queue_full`; sent to the refused caller, not the owner |
 
 #### Push Events
 
@@ -1030,6 +1031,10 @@ failure. The ceiling is per connection, not per stream: a slow stream can
 make writes on another stream of the same connection return
 `send_queue_full`.
 
+After a refusal, the process that made the call receives
+`{quic_h3, Conn, {send_ready, StreamId}}` once the queue has drained below
+half its ceiling, so you can wait for it instead of polling:
+
 ```erlang
 send_body(Conn, StreamId, <<>>) ->
     quic_h3:send_data(Conn, StreamId, <<>>, true);
@@ -1040,10 +1045,15 @@ send_body(Conn, StreamId, Body) ->
         ok ->
             send_body(Conn, StreamId, Rest);
         {error, send_queue_full} ->
-            timer:sleep(10),
-            send_body(Conn, StreamId, Body)
+            receive
+                {quic_h3, Conn, {send_ready, StreamId}} -> send_body(Conn, StreamId, Body)
+            after 30000 -> {error, timeout}
+            end
     end.
 ```
+
+`send_ready` is sent once per refusal episode, only to a process that was
+refused, and also follows a refused `respond/5` or `send_trailers/3`.
 
 ### Simple Server
 

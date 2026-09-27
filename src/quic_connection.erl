@@ -91,6 +91,7 @@
     send_data_async/4,
     set_stream_flow_control/3,
     stream_consumed/3,
+    notify_send_ready/1,
     send_datagram/2,
     datagram_max_size/1,
     datagram_stats/1,
@@ -313,6 +314,13 @@ send_data_async(Conn, StreamId, Data, Fin) ->
     ok.
 set_stream_flow_control(Conn, StreamId, Mode) ->
     gen_statem:cast(Conn, {set_stream_flow_control, StreamId, Mode}).
+
+%% @private After a send_queue_full refusal: send the owner
+%% `{quic, Conn, send_ready}' once, when the send queue is below half its
+%% ceiling (at once if it already is). Used by quic_h3.
+-spec notify_send_ready(pid()) -> ok.
+notify_send_ready(Conn) ->
+    gen_statem:cast(Conn, notify_send_ready).
 
 %% @private The reader of a manual stream has consumed up to Offset
 %% (absolute, in stream bytes); credit may advance up to one window past it.
@@ -2074,6 +2082,8 @@ closed(_EventType, _EventContent, State) ->
 %% Common Event Handling
 %%====================================================================
 
+handle_common_event(cast, notify_send_ready, _StateName, State) ->
+    {keep_state, maybe_send_ready(State#state{send_ready_wanted = true})};
 handle_common_event(cast, {set_stream_flow_control, StreamId, Mode}, StateName, State) ->
     {keep_state, flush_after_grant(StateName, set_recv_flow(StreamId, Mode, StateName, State))};
 handle_common_event(cast, {stream_consumed, StreamId, Offset}, StateName, State) ->
@@ -8298,10 +8308,20 @@ update_last_activity(State, Now) ->
 %% Flush the deferred PTO timer reset at batch boundaries. The idle and
 %% keep-alive timers are lazy (armed once, re-armed only on fire), so the
 %% only deferred timer left is the PTO.
+%% The end of every event that may have drained the send queue, so it is
+%% also where a wanted send_ready goes out.
 flush_dirty_timers(#state{pto_dirty = false} = State) ->
-    State;
+    maybe_send_ready(State);
 flush_dirty_timers(#state{pto_dirty = true} = State) ->
-    set_pto_timer(State#state{pto_dirty = false}).
+    maybe_send_ready(set_pto_timer(State#state{pto_dirty = false})).
+
+maybe_send_ready(#state{send_ready_wanted = true, send_queue_bytes = Bytes} = State) when
+    Bytes < ?MAX_SEND_QUEUE_BYTES div 2
+->
+    State#state.owner ! {quic, self(), send_ready},
+    State#state{send_ready_wanted = false};
+maybe_send_ready(State) ->
+    State.
 
 %% Reclaim a stream once every direction that applies to it is terminal.
 %% Removes the #stream_state{} from the connection map, records the id in the

@@ -422,7 +422,8 @@ send_data(Conn, StreamId, Data) ->
 %%
 %% Returns `{error, send_queue_full}' when the connection's send queue is
 %% full. Nothing was written; wait for the connection to drain and send
-%% the same piece again.
+%% the same piece again. Once the queue is below half its ceiling, the
+%% caller receives `{quic_h3, Conn, {send_ready, StreamId}}', once.
 %% @end
 -spec send_data(conn(), stream_id(), binary(), boolean()) ->
     ok | {error, send_queue_full | term()}.

@@ -27,7 +27,8 @@
     auto_streams_are_unchanged/1,
     consume_on_a_finished_stream_is_an_error/1,
     consume_on_a_reset_stream_is_an_error/1,
-    consume_on_an_auto_stream_is_a_no_op/1
+    consume_on_an_auto_stream_is_a_no_op/1,
+    a_refused_writer_is_told_when_to_send_again/1
 ]).
 
 -define(KIB, 1024).
@@ -55,7 +56,8 @@ all() ->
         auto_streams_are_unchanged,
         consume_on_a_finished_stream_is_an_error,
         consume_on_a_reset_stream_is_an_error,
-        consume_on_an_auto_stream_is_a_no_op
+        consume_on_an_auto_stream_is_a_no_op,
+        a_refused_writer_is_told_when_to_send_again
     ].
 
 init_per_suite(Config) ->
@@ -208,6 +210,39 @@ consume_on_an_auto_stream_is_a_no_op(Config) ->
         ok = quic_h3:close(Conn)
     end).
 
+%% The client holds a large response in manual mode, so the server's
+%% writes queue until one is refused. The writer waits for `send_ready'
+%% instead of polling, and resumes once the client reads and the queue
+%% drains; every byte arrives.
+a_refused_writer_is_told_when_to_send_again(Config) ->
+    with_server(Config, #{}, fun(Port) ->
+        Conn = connect(Port, small_window()),
+        Size = 32 * ?MIB,
+        {ok, StreamId} = quic_h3:request(
+            Conn,
+            headers(<<"GET">>, <<"/waiting/", (integer_to_binary(Size))/binary>>),
+            #{flow_control => manual}
+        ),
+        {200, Held} = held_response(Conn, StreamId),
+        Refused =
+            receive
+                {refused, N} -> N
+            after ?WAIT_MS -> ct:fail(no_refusal)
+            end,
+        ?assert(Refused > 0),
+        ok = quic_h3:consume(Conn, StreamId, byte_size(Held)),
+        Rest = consuming_body(Conn, StreamId, []),
+        ?assert(<<Held/binary, Rest/binary>> =:= body(Size)),
+        ?assertEqual(
+            ok,
+            receive
+                {done, Result} -> Result
+            after ?WAIT_MS -> timeout
+            end
+        ),
+        ok = quic_h3:close(Conn)
+    end).
+
 %%====================================================================
 %% Server
 %%====================================================================
@@ -239,6 +274,9 @@ with_server(Config, QuicOpts, F) ->
 handle(Conn, StreamId, <<"GET">>, <<"/bytes/", Size/binary>>, _Headers) ->
     ok = quic_h3:send_response(Conn, StreamId, 200, []),
     send_body(Conn, StreamId, body(binary_to_integer(Size)));
+handle(Conn, StreamId, <<"GET">>, <<"/waiting/", Size/binary>>, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 200, []),
+    ?PROBE ! {done, write_waiting(Conn, StreamId, body(binary_to_integer(Size)), false)};
 handle(Conn, StreamId, <<"POST">>, <<"/upload/auto">>, _Headers) ->
     Buffered = claim(Conn, StreamId, #{}),
     upload_loop(Conn, StreamId, auto, Buffered);
@@ -346,6 +384,25 @@ send_body(Conn, StreamId, Body) ->
     <<Piece:?PIECE/binary, Rest/binary>> = Body,
     ok = send(Conn, StreamId, Piece, false),
     send_body(Conn, StreamId, Rest).
+
+%% Write in 1 MiB pieces; on a refusal, report it once and wait to be told
+%% the queue has drained rather than retrying on a timer.
+write_waiting(Conn, StreamId, Body, Reported) ->
+    Size = min(?MIB, byte_size(Body)),
+    <<Piece:Size/binary, Rest/binary>> = Body,
+    case quic_h3:send_data(Conn, StreamId, Piece, Rest =:= <<>>) of
+        ok when Rest =:= <<>> ->
+            ok;
+        ok ->
+            write_waiting(Conn, StreamId, Rest, Reported);
+        {error, send_queue_full} ->
+            Reported orelse (?PROBE ! {refused, 1}),
+            receive
+                {quic_h3, Conn, {send_ready, StreamId}} ->
+                    write_waiting(Conn, StreamId, Body, true)
+            after ?WAIT_MS * 3 -> no_send_ready
+            end
+    end.
 
 send(Conn, StreamId, Data, Fin) ->
     case quic_h3:send_data(Conn, StreamId, Data, Fin) of

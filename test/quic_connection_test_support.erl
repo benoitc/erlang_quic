@@ -71,7 +71,9 @@
     send_queue_full_refusals/1,
     state_for_manual_recv/2,
     stream_recv/2,
-    max_data_local/1
+    max_data_local/1,
+    state_wanting_send_ready/2,
+    send_ready_wanted/1
 ]).
 
 %% Update the spin-bit tracking state from a received 1-RTT packet.
@@ -902,3 +904,12 @@ stream_recv(#state{streams = Streams}, StreamId) ->
 
 -spec max_data_local(#state{}) -> non_neg_integer().
 max_data_local(#state{max_data_local = M}) -> M.
+
+%% A state owned by the caller, with QueueBytes queued and a send_ready
+%% requested or not.
+-spec state_wanting_send_ready(non_neg_integer(), boolean()) -> #state{}.
+state_wanting_send_ready(QueueBytes, Wanted) ->
+    #state{owner = self(), send_queue_bytes = QueueBytes, send_ready_wanted = Wanted}.
+
+-spec send_ready_wanted(#state{}) -> boolean().
+send_ready_wanted(#state{send_ready_wanted = W}) -> W.

@@ -124,6 +124,35 @@ logged_levels() ->
     end.
 
 %%====================================================================
+%% send_ready
+%%====================================================================
+
+%% Asked for, it goes out once the queue is below half the ceiling.
+send_ready_waits_for_half_the_ceiling_test() ->
+    S0 = ?S:state_wanting_send_ready(?MAX div 2, true),
+    S1 = quic_connection:flush_dirty_timers(S0),
+    ?assertEqual([], send_ready_msgs()),
+    S2 = quic_connection:flush_dirty_timers(
+        quic_connection_test_support:state_set(S1, send_queue_bytes, ?MAX div 2 - 1)
+    ),
+    ?assertEqual([send_ready], send_ready_msgs()),
+    ?assertNot(?S:send_ready_wanted(S2)),
+    %% Once only: a later drain says nothing.
+    _ = quic_connection:flush_dirty_timers(S2),
+    ?assertEqual([], send_ready_msgs()).
+
+%% Never asked for, it never goes out, however empty the queue.
+send_ready_is_opt_in_test() ->
+    _ = quic_connection:flush_dirty_timers(?S:state_wanting_send_ready(0, false)),
+    ?assertEqual([], send_ready_msgs()).
+
+send_ready_msgs() ->
+    receive
+        {quic, _, send_ready} -> [send_ready | send_ready_msgs()]
+    after 50 -> []
+    end.
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 

@@ -301,7 +301,12 @@
     %% Why this connection is closing. Read by the `closing' enter clause,
     %% which is the only place the owner is told, so every transition into
     %% `closing' goes through close_with/2 to set it.
-    close_reason = normal :: term()
+    close_reason = normal :: term(),
+
+    %% Streams whose last write was refused with send_queue_full, with the
+    %% process that made it: told `send_ready' once the QUIC send queue
+    %% has drained.
+    send_blocked = #{} :: #{stream_id() => pid()}
 }).
 
 %%====================================================================
@@ -756,6 +761,8 @@ early_data({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 early_data(cast, close, State) ->
     close_with(normal, State);
+early_data(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
+    {keep_state, tell_send_ready(State)};
 early_data(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 early_data(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
@@ -934,6 +941,8 @@ h3_connecting({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 h3_connecting(cast, close, State) ->
     close_with(normal, State);
+h3_connecting(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
+    {keep_state, tell_send_ready(State)};
 h3_connecting(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 h3_connecting(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
@@ -1067,30 +1076,11 @@ connected({call, From}, {send_response, StreamId, Status, Headers}, State) ->
             {keep_state, State1, [{reply, From, {error, Reason}}]}
     end;
 connected({call, From}, {send_data, StreamId, Data, Fin}, State) ->
-    case do_send_data(StreamId, Data, Fin, State) of
-        {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
-    end;
+    write_reply(From, StreamId, do_send_data(StreamId, Data, Fin, State), State);
 connected({call, From}, {respond, StreamId, Status, Headers, Body}, State) ->
-    case do_respond(StreamId, Status, Headers, Body, State) of
-        {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]};
-        {error, Reason, State1} ->
-            {keep_state, State1, [{reply, From, {error, Reason}}]}
-    end;
+    write_reply(From, StreamId, do_respond(StreamId, Status, Headers, Body, State), State);
 connected({call, From}, {send_trailers, StreamId, Trailers}, State) ->
-    case do_send_trailers(StreamId, Trailers, State) of
-        {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]};
-        {error, Reason, State1} ->
-            {keep_state, State1, [{reply, From, {error, Reason}}]}
-    end;
+    write_reply(From, StreamId, do_send_trailers(StreamId, Trailers, State), State);
 connected({call, From}, get_settings, #state{local_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
 connected({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
@@ -1162,6 +1152,8 @@ connected(cast, goaway, State) ->
     end;
 connected(cast, close, State) ->
     close_with(normal, State);
+connected(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
+    {keep_state, tell_send_ready(State)};
 connected(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 connected(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
@@ -1223,15 +1215,11 @@ goaway_sent(
 goaway_sent({call, From}, {request, _Headers, _Opts}, _State) ->
     {keep_state_and_data, [{reply, From, {error, goaway_sent}}]};
 goaway_sent({call, From}, {send_data, StreamId, Data, Fin}, State) ->
-    %% Allow completing existing streams
-    case do_send_data(StreamId, Data, Fin, State) of
-        {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
-    end;
+    write_reply(From, StreamId, do_send_data(StreamId, Data, Fin, State), State);
 goaway_sent(cast, close, State) ->
     close_with(normal, State);
+goaway_sent(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
+    {keep_state, tell_send_ready(State)};
 goaway_sent(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 goaway_sent(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
@@ -1292,14 +1280,11 @@ goaway_received(
 goaway_received({call, From}, {request, _Headers, _Opts}, _State) ->
     {keep_state_and_data, [{reply, From, {error, goaway_received}}]};
 goaway_received({call, From}, {send_data, StreamId, Data, Fin}, State) ->
-    case do_send_data(StreamId, Data, Fin, State) of
-        {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
-    end;
+    write_reply(From, StreamId, do_send_data(StreamId, Data, Fin, State), State);
 goaway_received(cast, close, State) ->
     close_with(normal, State);
+goaway_received(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
+    {keep_state, tell_send_ready(State)};
 goaway_received(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 goaway_received(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
@@ -4053,6 +4038,31 @@ do_cancel_stream(
 %%====================================================================
 %% Internal: Per-stream Handler Registration
 %%====================================================================
+
+%% Reply to a write on StreamId. A send_queue_full refusal is remembered
+%% so the stream is told `send_ready' once the queue drains.
+write_reply(From, _StreamId, {ok, State1}, _State) ->
+    {keep_state, State1, [{reply, From, ok}]};
+write_reply(From, StreamId, {error, Reason}, State) ->
+    {keep_state, note_refusal(StreamId, Reason, From, State), [{reply, From, {error, Reason}}]};
+write_reply(From, StreamId, {error, Reason, State1}, _State) ->
+    {keep_state, note_refusal(StreamId, Reason, From, State1), [{reply, From, {error, Reason}}]}.
+
+note_refusal(StreamId, send_queue_full, {Caller, _Tag}, #state{send_blocked = Blocked} = State) ->
+    %% One request covers every stream refused until QUIC answers it.
+    map_size(Blocked) =:= 0 andalso quic_connection:notify_send_ready(State#state.quic_conn),
+    State#state{send_blocked = Blocked#{StreamId => Caller}};
+note_refusal(_StreamId, _Reason, _From, State) ->
+    State.
+
+%% The QUIC send queue has drained: whoever was refused on each stream may
+%% write again.
+tell_send_ready(#state{send_blocked = Blocked} = State) ->
+    Conn = self(),
+    maps:foreach(
+        fun(StreamId, Caller) -> Caller ! {quic_h3, Conn, {send_ready, StreamId}} end, Blocked
+    ),
+    State#state{send_blocked = #{}}.
 
 stream_call(From, {set_stream_handler, StreamId, HandlerPid, Opts}, State) ->
     case do_set_stream_handler(StreamId, HandlerPid, Opts, State) of
