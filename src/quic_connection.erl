@@ -8412,9 +8412,12 @@ get_peer_stream_limit(StreamType, #state{transport_params = TP}) ->
     ),
     Result.
 
-%% Get our local receive limit for a stream (what we advertised to peer)
-%% - bidi_local_initiated: Bidi stream we opened, use our max_stream_data_bidi_remote
-%% - bidi_peer_initiated: Bidi stream peer opened, use our max_stream_data_bidi_local
+%% Get our local receive limit for a stream (what we advertised to peer).
+%% RFC 9000 Section 18.2: initial_max_stream_data_bidi_local covers the
+%% streams opened by the endpoint that sends it, bidi_remote those its
+%% peer opens.
+%% - bidi_local_initiated: Bidi stream we opened, use our max_stream_data_bidi_local
+%% - bidi_peer_initiated: Bidi stream peer opened, use our max_stream_data_bidi_remote
 %% - uni_peer_initiated: Uni stream peer opened, use our max_stream_data_uni
 get_local_recv_limit(StreamType, #state{
     max_stream_data_bidi_local = BidiLocal,
@@ -8422,8 +8425,8 @@ get_local_recv_limit(StreamType, #state{
     max_stream_data_uni = Uni
 }) ->
     case StreamType of
-        bidi_local_initiated -> BidiRemote;
-        bidi_peer_initiated -> BidiLocal;
+        bidi_local_initiated -> BidiLocal;
+        bidi_peer_initiated -> BidiRemote;
         uni_peer_initiated -> Uni
     end.
 
