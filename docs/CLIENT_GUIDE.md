@@ -86,6 +86,7 @@ packets automatically.
 | `max_stream_data_bidi_local` | integer | 524288 | Receive limit for streams we open |
 | `max_stream_data_bidi_remote` | integer | 524288 | Receive limit for streams the peer opens |
 | `max_stream_data_uni` | integer | 524288 | Receive limit for unidirectional streams |
+| `max_receive_window` | integer | 8388608 | Largest window the receive limits grow to; at least 16384 |
 | `max_streams_bidi` | integer | 100 | Max bidirectional streams |
 | `max_streams_uni` | integer | 100 | Max unidirectional streams |
 

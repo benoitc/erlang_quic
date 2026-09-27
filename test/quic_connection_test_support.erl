@@ -64,7 +64,10 @@
     send_snapshot/2,
     datagrams_out/1,
     queue_head/1,
-    queue_stream/4
+    queue_stream/4,
+    state_with_stream_limits/3,
+    recv_max_data/2,
+    send_queue_full_refusals/1
 ]).
 
 %% Update the spin-bit tracking state from a received 1-RTT packet.
@@ -822,3 +825,37 @@ queue_stream(State, StreamId, Offset, Data) ->
     S1#state{
         streams = #{StreamId => Stream#stream_state{send_offset = Offset + byte_size(Data)}}
     }.
+
+%% A connected state whose receive limits differ by stream kind, to see
+%% which one a new stream is given.
+-spec state_with_stream_limits(client | server, non_neg_integer(), non_neg_integer()) ->
+    #state{}.
+state_with_stream_limits(Role, BidiLocal, BidiRemote) ->
+    S = state_with_keys(Role),
+    S#state{
+        next_stream_id_bidi =
+            case Role of
+                client -> 0;
+                server -> 1
+            end,
+        max_streams_bidi_local = 10,
+        max_streams_bidi_remote = 10,
+        max_stream_data_bidi_local = BidiLocal,
+        max_stream_data_bidi_remote = BidiRemote,
+        max_data_local = 16777216,
+        data_received = 0,
+        recv_buffer_bytes = 0,
+        %% Small enough that the test's one byte triggers no window update.
+        fc_max_receive_window = 16384,
+        streams = #{},
+        transport_params = #{},
+        owner = self()
+    }.
+
+-spec recv_max_data(#state{}, non_neg_integer()) -> non_neg_integer().
+recv_max_data(#state{streams = Streams}, StreamId) ->
+    #{StreamId := #stream_state{recv_max_data = Max}} = Streams,
+    Max.
+
+-spec send_queue_full_refusals(#state{}) -> non_neg_integer().
+send_queue_full_refusals(#state{send_queue_full_refusals = N}) -> N.

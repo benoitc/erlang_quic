@@ -358,6 +358,8 @@
 -define(CONNECTION_FLOW_CONTROL_MULTIPLIER, 1.5).
 % 8MB cap on receive window
 -define(DEFAULT_MAX_RECEIVE_WINDOW, 8388608).
+%% Below a few full-size packets per window the transfer crawls or stops.
+-define(MIN_RECEIVE_WINDOW, 16384).
 % Double window if consumed in < 4*RTT (aggressive), else linear growth
 -define(AUTO_TUNE_RTT_FACTOR, 4).
 

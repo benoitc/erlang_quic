@@ -292,8 +292,14 @@ dial(Host, Port, Opts, Owner, Socket) ->
 %% to the caller instead of crashing mid-handshake.
 validate_client_opts(Socket, Opts) ->
     case validate_groups(Opts) of
-        ok -> first_error([credentials(client, Opts), validate_connect_opts(Socket, Opts)]);
-        {error, _} = Error -> Error
+        ok ->
+            first_error([
+                credentials(client, Opts),
+                validate_connect_opts(Socket, Opts),
+                validate_receive_window(Opts)
+            ]);
+        {error, _} = Error ->
+            Error
     end.
 
 %% A pre-opened `socket' is always a gen_udp handle; requesting the
@@ -732,6 +738,7 @@ get_path_stats(Conn) when is_pid(Conn) ->
 %% - `packets_sent': Total QUIC packets sent
 %% - `data_received': Total bytes of application data received
 %% - `data_sent': Total bytes of application data sent
+%% - `send_queue_full_refusals': Writes refused with `send_queue_full'
 %%
 %% See `quic_dist_controller' for usage in distribution tick checking.
 -spec get_stats(Conn) -> {ok, map()} | {error, term()} when
@@ -895,8 +902,14 @@ start_server(_Name, _Port, _Opts) ->
 %% caller instead of taking the pool down after it has been created.
 validate_server_opts(Opts) ->
     case validate_groups(Opts) of
-        ok -> first_error([quic_listener:has_auth_method(Opts), credentials(server, Opts)]);
-        {error, _} = Error -> Error
+        ok ->
+            first_error([
+                quic_listener:has_auth_method(Opts),
+                credentials(server, Opts),
+                validate_receive_window(Opts)
+            ]);
+        {error, _} = Error ->
+            Error
     end.
 
 %% @private A key that cannot sign for its certificate fails every
@@ -908,6 +921,15 @@ first_error(Results) ->
     case [E || {error, _} = E <- Results] of
         [] -> ok;
         [Error | _] -> Error
+    end.
+
+%% @private The receive window grows up to `max_receive_window'; one too
+%% small to hold a few packets leaves the peer unable to make progress.
+validate_receive_window(Opts) ->
+    case maps:find(max_receive_window, Opts) of
+        error -> ok;
+        {ok, W} when is_integer(W), W >= ?MIN_RECEIVE_WINDOW -> ok;
+        {ok, W} -> {error, {invalid_max_receive_window, W}}
     end.
 
 %% @private Reject a `groups' option naming a key-exchange group this

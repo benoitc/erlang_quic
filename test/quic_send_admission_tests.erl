@@ -14,6 +14,9 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% logger handler callback for the log test below.
+-export([log/2]).
+
 -define(SID, 0).
 -define(MAX, 16777216).
 %% Many packets, more than the initial congestion window lets out.
@@ -79,6 +82,46 @@ drain_keeps_the_remainder_test() ->
     ?assertEqual(?PIECE, Offset + Size),
     ?assertEqual(Size, byte_size(Data)),
     ?assertEqual(binary:part(piece(), Offset, Size), Data).
+
+%%====================================================================
+%% Refusals are backpressure, not faults
+%%====================================================================
+
+%% A caller retries the same piece until the queue drains: each refusal
+%% is logged at debug and counted, never as a warning.
+repeated_refusals_do_not_warn_test() ->
+    Handler = send_queue_full_capture,
+    #{level := Level} = logger:get_primary_config(),
+    ok = logger:set_primary_config(level, debug),
+    ok = logger:add_handler(Handler, ?MODULE, #{config => #{pid => self()}}),
+    try
+        S0 = ?S:state_for_admission(?SID, ?MAX - ?PIECE div 2, ?WIN, ?WIN),
+        S5 = lists:foldl(fun(_, S) -> refuse(S) end, S0, lists:seq(1, 5)),
+        ?assertEqual(5, ?S:send_queue_full_refusals(S5)),
+        Levels = logged_levels(),
+        ?assertEqual(5, length([L || L <- Levels, L =:= debug])),
+        ?assertEqual([], [L || L <- Levels, L =/= debug])
+    after
+        _ = logger:remove_handler(Handler),
+        logger:set_primary_config(level, Level)
+    end.
+
+log(#{level := Level, msg := {report, #{what := send_queue_full}}}, #{config := #{pid := Pid}}) ->
+    Pid ! {send_queue_full_logged, Level};
+log(_Event, _Config) ->
+    ok.
+
+refuse(S) ->
+    From = {self(), make_ref()},
+    {keep_state, S1, [{reply, From, {error, send_queue_full}}]} =
+        quic_connection:coalesced_sends([{From, ?SID, piece(), false}], S),
+    S1.
+
+logged_levels() ->
+    receive
+        {send_queue_full_logged, Level} -> [Level | logged_levels()]
+    after 100 -> []
+    end.
 
 %%====================================================================
 %% Helpers

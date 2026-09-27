@@ -39,6 +39,8 @@
 
 -define(HOST, "127.0.0.1").
 -define(HOST_IP, {127, 0, 0, 1}).
+%% First boots of a node before giving up; see boot_fresh/5.
+-define(BOOT_TRIES, 3).
 
 %% @doc A self-signed certificate and key under Dir.
 -spec generate_certs(file:filename()) -> {ok, certs()} | {error, term()}.
@@ -89,7 +91,7 @@ start_specs([], Certs, _Args, Acc) ->
             {error, {Class, Reason}}
     end;
 start_specs([{Name, Port} | Rest], Certs, Args, Acc) ->
-    case boot(Name, Port, Certs, Args) of
+    case boot_fresh(Name, Port, Certs, Args, ?BOOT_TRIES) of
         {ok, Peer} ->
             start_specs(Rest, Certs, Args, [Peer | Acc]);
         {error, _} = Error ->
@@ -170,6 +172,17 @@ boot(Name, Port, #{cert := Cert, key := Key}, Extra) ->
         Class:Reason -> {error, {Class, Reason}}
     end.
 
+%% free_port/0 can lose its port to another process before the node
+%% binds it, and the node then exits (the cause is not reported). No other
+%% node knows the port until configure/3, so a fresh one is safe to try.
+boot_fresh(Name, Port, Certs, Args, Tries) ->
+    case boot(Name, Port, Certs, Args) of
+        {error, _} when Tries > 1 ->
+            boot_fresh(Name, free_port(), Certs, Args, Tries - 1);
+        Result ->
+            Result
+    end.
+
 configure(#{peer := Pid}, Peers, #{cert := Cert, key := Key}) ->
     Table = [{N, {?HOST, Port}} || #{node := N, port := Port} <- Peers],
     DistConfig = [
@@ -185,8 +198,8 @@ configure(#{peer := Pid}, Peers, #{cert := Cert, key := Key}) ->
     ok.
 
 %% A port nothing holds right now. Something else could take it before
-%% the peer binds, but on loopback in a test run that is rare, and far
-%% better than fixed ports that collide across suites.
+%% the peer binds, which boot_fresh/5 recovers from; still far better
+%% than fixed ports that collide across suites.
 free_port() ->
     {ok, Socket} = gen_udp:open(0, [{ip, ?HOST_IP}]),
     {ok, Port} = inet:port(Socket),
