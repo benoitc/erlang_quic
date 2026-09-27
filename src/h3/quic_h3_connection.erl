@@ -687,7 +687,9 @@ early_data({call, From}, {request, Headers, Opts}, #state{role = client} = State
         {ok, StreamId, State1} ->
             {keep_state, State1, [{reply, From, {ok, StreamId}}]};
         {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+            {keep_state_and_data, [{reply, From, {error, Reason}}]};
+        {error, Reason, State1} ->
+            {keep_state, State1, [{reply, From, {error, Reason}}]}
     end;
 early_data({call, From}, {request, _Headers, _Opts}, #state{role = server}) ->
     {keep_state_and_data, [{reply, From, {error, server_cannot_request}}]};
@@ -1015,7 +1017,9 @@ connected({call, From}, {request, Headers, Opts}, #state{role = client} = State)
         {ok, StreamId, State1} ->
             {keep_state, State1, [{reply, From, {ok, StreamId}}]};
         {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+            {keep_state_and_data, [{reply, From, {error, Reason}}]};
+        {error, Reason, State1} ->
+            {keep_state, State1, [{reply, From, {error, Reason}}]}
     end;
 connected({call, From}, {request, _Headers, _Opts}, #state{role = server}) ->
     {keep_state_and_data, [{reply, From, {error, server_cannot_request}}]};
@@ -1031,7 +1035,9 @@ connected({call, From}, {send_response, StreamId, Status, Headers}, State) ->
         {ok, State1} ->
             {keep_state, State1, [{reply, From, ok}]};
         {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+            {keep_state_and_data, [{reply, From, {error, Reason}}]};
+        {error, Reason, State1} ->
+            {keep_state, State1, [{reply, From, {error, Reason}}]}
     end;
 connected({call, From}, {send_data, StreamId, Data, Fin}, State) ->
     case do_send_data(StreamId, Data, Fin, State) of
@@ -1045,14 +1051,18 @@ connected({call, From}, {respond, StreamId, Status, Headers, Body}, State) ->
         {ok, State1} ->
             {keep_state, State1, [{reply, From, ok}]};
         {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+            {keep_state_and_data, [{reply, From, {error, Reason}}]};
+        {error, Reason, State1} ->
+            {keep_state, State1, [{reply, From, {error, Reason}}]}
     end;
 connected({call, From}, {send_trailers, StreamId, Trailers}, State) ->
     case do_send_trailers(StreamId, Trailers, State) of
         {ok, State1} ->
             {keep_state, State1, [{reply, From, ok}]};
         {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+            {keep_state_and_data, [{reply, From, {error, Reason}}]};
+        {error, Reason, State1} ->
+            {keep_state, State1, [{reply, From, {error, Reason}}]}
     end;
 connected({call, From}, get_settings, #state{local_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
@@ -1066,7 +1076,9 @@ connected({call, From}, {push, RequestStreamId, Headers}, #state{role = server} 
         {ok, PushId, State1} ->
             {keep_state, State1, [{reply, From, {ok, PushId}}]};
         {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+            {keep_state_and_data, [{reply, From, {error, Reason}}]};
+        {error, Reason, State1} ->
+            {keep_state, State1, [{reply, From, {error, Reason}}]}
     end;
 connected({call, From}, {push, _RequestStreamId, _Headers}, #state{role = client}) ->
     {keep_state_and_data, [{reply, From, {error, client_cannot_push}}]};
@@ -1077,7 +1089,9 @@ connected(
         {ok, State1} ->
             {keep_state, State1, [{reply, From, ok}]};
         {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+            {keep_state_and_data, [{reply, From, {error, Reason}}]};
+        {error, Reason, State1} ->
+            {keep_state, State1, [{reply, From, {error, Reason}}]}
     end;
 connected({call, From}, {send_push_response, _PushId, _Status, _Headers}, #state{role = client}) ->
     {keep_state_and_data, [{reply, From, {error, client_cannot_push}}]};
@@ -3695,8 +3709,7 @@ send_request(
     #state{
         quic_conn = QuicConn,
         qpack_encoder = Encoder,
-        next_stream_id = NextId,
-        streams = Streams
+        next_stream_id = NextId
     } = State
 ) ->
     %% RFC 9114 §4.2.2: enforce peer's max field section size.
@@ -3711,9 +3724,7 @@ send_request(
                 {error, Reason} ->
                     {error, Reason};
                 ok ->
-                    send_request_validated(
-                        Headers, Opts, QuicConn, Encoder, NextId, Streams, State
-                    )
+                    send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, State)
             end
     end.
 
@@ -3729,7 +3740,7 @@ validate_outbound_request_headers(Headers, State) ->
         throw:{header_error, Reason} -> {error, Reason}
     end.
 
-send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, Streams, State) ->
+send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, State) ->
     %% end_stream defaults to true for requests without body (GET, HEAD, etc.)
     EndStream = maps:get(end_stream, Opts, true),
     case quic:open_stream(QuicConn) of
@@ -3739,41 +3750,56 @@ send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, Streams, State)
             %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
             %% so peer has dynamic table entries before receiving references
             State1 = State#state{qpack_encoder = Encoder1},
-            State2 = send_encoder_instructions(State1),
-            HeadersFrame = quic_h3_frame:encode_headers(Encoded),
-            case quic:send_data(QuicConn, StreamId, HeadersFrame, EndStream) of
-                ok ->
-                    StreamState =
-                        case EndStream of
-                            true -> half_closed_local;
-                            false -> open
-                        end,
-                    Method =
-                        case lists:keyfind(<<":method">>, 1, Headers) of
-                            {<<":method">>, M} -> M;
-                            false -> undefined
-                        end,
-                    Stream = #h3_stream{
-                        id = StreamId,
-                        type = request,
-                        %% Kept so the response can be read against the
-                        %% request: a HEAD response carries a
-                        %% Content-Length but no body.
-                        method = Method,
-                        state = StreamState,
-                        frame_state = expecting_headers,
-                        is_connect = (Method =:= <<"CONNECT">>)
-                    },
-                    State3 = State2#state{
-                        next_stream_id = NextId + 4,
-                        streams = Streams#{StreamId => Stream}
-                    },
-                    {ok, StreamId, State3};
-                {error, Reason} ->
-                    {error, Reason}
-            end;
+            send_request_headers(
+                send_encoder_instructions(State1), StreamId, Headers, Encoded, EndStream, NextId
+            );
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% Encoder instructions that went out commit the encoder: a failed
+%% HEADERS write after them returns the state that holds it.
+send_request_headers({error, _} = Error, _StreamId, _Headers, _Encoded, _EndStream, _NextId) ->
+    Error;
+send_request_headers(
+    {ok, #state{quic_conn = QuicConn, streams = Streams} = State2},
+    StreamId,
+    Headers,
+    Encoded,
+    EndStream,
+    NextId
+) ->
+    HeadersFrame = quic_h3_frame:encode_headers(Encoded),
+    case quic:send_data(QuicConn, StreamId, HeadersFrame, EndStream) of
+        ok ->
+            StreamState =
+                case EndStream of
+                    true -> half_closed_local;
+                    false -> open
+                end,
+            Method =
+                case lists:keyfind(<<":method">>, 1, Headers) of
+                    {<<":method">>, M} -> M;
+                    false -> undefined
+                end,
+            Stream = #h3_stream{
+                id = StreamId,
+                type = request,
+                %% Kept so the response can be read against the
+                %% request: a HEAD response carries a
+                %% Content-Length but no body.
+                method = Method,
+                state = StreamState,
+                frame_state = expecting_headers,
+                is_connect = (Method =:= <<"CONNECT">>)
+            },
+            State3 = State2#state{
+                next_stream_id = NextId + 4,
+                streams = Streams#{StreamId => Stream}
+            },
+            {ok, StreamId, State3};
+        {error, Reason} ->
+            {error, Reason, State2}
     end.
 
 %% Coalesce a full response: send_response then a final send_data with end-stream
@@ -3788,8 +3814,11 @@ do_respond(StreamId, Status, Headers, Body, State) ->
                     true -> Body;
                     false -> <<>>
                 end,
-            do_send_data(StreamId, Data, true, State1);
-        {error, _} = Err ->
+            case do_send_data(StreamId, Data, true, State1) of
+                {ok, _} = Ok -> Ok;
+                {error, Reason} -> {error, Reason, State1}
+            end;
+        Err ->
             Err
     end.
 
@@ -3831,10 +3860,14 @@ do_send_response(
                     {Encoded, Encoder1} = quic_qpack:encode(AllHeaders, StreamId, Encoder),
                     %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
                     State1 = State#state{qpack_encoder = Encoder1},
-                    State2 = send_encoder_instructions(State1),
-                    HeadersFrame = quic_h3_frame:encode_headers(Encoded),
-                    Stream1 = Stream#h3_stream{status = Status, headers = AllHeaders},
-                    finish_send_response(StreamId, Status, HeadersFrame, Stream1, State2);
+                    case send_encoder_instructions(State1) of
+                        {ok, State2} ->
+                            HeadersFrame = quic_h3_frame:encode_headers(Encoded),
+                            Stream1 = Stream#h3_stream{status = Status, headers = AllHeaders},
+                            finish_send_response(StreamId, Status, HeadersFrame, Stream1, State2);
+                        {error, _} = Error ->
+                            Error
+                    end;
                 error ->
                     {error, unknown_stream}
             end
@@ -3865,7 +3898,7 @@ send_response_headers_now(StreamId, HeadersFrame, Stream1, State) ->
         ok ->
             {ok, State#state{streams = (State#state.streams)#{StreamId => Stream1}}};
         {error, Reason} ->
-            {error, Reason}
+            {error, Reason, State}
     end.
 
 do_send_data(
@@ -3906,7 +3939,6 @@ do_send_trailers(
     StreamId,
     Trailers,
     #state{
-        quic_conn = QuicConn,
         qpack_encoder = Encoder,
         streams = Streams
     } = State
@@ -3925,31 +3957,41 @@ do_send_trailers(
                     {Encoded, Encoder1} = quic_qpack:encode(Trailers, StreamId, Encoder),
                     %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
                     State1 = State#state{qpack_encoder = Encoder1},
-                    State2 = send_encoder_instructions(State1),
-                    TrailersFrame = quic_h3_frame:encode_headers(Encoded),
-                    %% Flush any still-buffered response HEADERS ahead of the
-                    %% trailers (a response with HEADERS + trailers but no body).
-                    {Payload, Pending1} =
-                        case maps:take(StreamId, State2#state.pending_response_headers) of
-                            {HeadersFrame, P1} ->
-                                {<<HeadersFrame/binary, TrailersFrame/binary>>, P1};
-                            error ->
-                                {TrailersFrame, State2#state.pending_response_headers}
-                        end,
-                    case quic:send_data(QuicConn, StreamId, Payload, true) of
-                        ok ->
-                            Stream1 = close_half(local, Stream#h3_stream{trailers = Trailers}),
-                            State3 = State2#state{
-                                streams = store_stream(StreamId, Stream1, Streams),
-                                pending_response_headers = Pending1
-                            },
-                            {ok, State3};
-                        {error, Reason} ->
-                            {error, Reason}
-                    end;
-                error ->
-                    {error, unknown_stream}
+                    send_trailers_frame(
+                        send_encoder_instructions(State1), StreamId, Trailers, Encoded, Stream
+                    )
             end
+    end.
+
+send_trailers_frame({error, _} = Error, _StreamId, _Trailers, _Encoded, _Stream) ->
+    Error;
+send_trailers_frame(
+    {ok, #state{quic_conn = QuicConn, streams = Streams} = State2},
+    StreamId,
+    Trailers,
+    Encoded,
+    Stream
+) ->
+    TrailersFrame = quic_h3_frame:encode_headers(Encoded),
+    %% Flush any still-buffered response HEADERS ahead of the
+    %% trailers (a response with HEADERS + trailers but no body).
+    {Payload, Pending1} =
+        case maps:take(StreamId, State2#state.pending_response_headers) of
+            {HeadersFrame, P1} ->
+                {<<HeadersFrame/binary, TrailersFrame/binary>>, P1};
+            error ->
+                {TrailersFrame, State2#state.pending_response_headers}
+        end,
+    case quic:send_data(QuicConn, StreamId, Payload, true) of
+        ok ->
+            Stream1 = close_half(local, Stream#h3_stream{trailers = Trailers}),
+            State3 = State2#state{
+                streams = store_stream(StreamId, Stream1, Streams),
+                pending_response_headers = Pending1
+            },
+            {ok, State3};
+        {error, Reason} ->
+            {error, Reason, State2}
     end.
 
 do_cancel_stream(
@@ -4226,13 +4268,16 @@ do_push_internal(
             %% Encode headers for PUSH_PROMISE
             {Encoded, Encoder1} = quic_qpack:encode(Headers, RequestStreamId, Encoder),
             State1 = State#state{qpack_encoder = Encoder1},
-            State2 = send_encoder_instructions(State1),
-
-            %% Send PUSH_PROMISE on request stream
-            PushPromiseFrame = quic_h3_frame:encode_push_promise(PushId, Encoded),
-            do_push_send(
-                QuicConn, RequestStreamId, PushPromiseFrame, PushId, PushStreams, State2
-            )
+            case send_encoder_instructions(State1) of
+                {ok, State2} ->
+                    %% Send PUSH_PROMISE on request stream
+                    PushPromiseFrame = quic_h3_frame:encode_push_promise(PushId, Encoded),
+                    do_push_send(
+                        QuicConn, RequestStreamId, PushPromiseFrame, PushId, PushStreams, State2
+                    );
+                {error, _} = Error ->
+                    Error
+            end
     end.
 
 do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, PushId, PushStreams, State) ->
@@ -4260,13 +4305,13 @@ do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, PushId, PushStreams, S
                             },
                             {ok, PushId, State3};
                         {error, Reason} ->
-                            {error, Reason}
+                            {error, Reason, State}
                     end;
                 {error, Reason} ->
-                    {error, Reason}
+                    {error, Reason, State}
             end;
         {error, Reason} ->
-            {error, Reason}
+            {error, Reason, State}
     end.
 
 %% Send response headers on a push stream
@@ -4290,25 +4335,32 @@ do_send_push_response(
                 {ok, {StreamId, Stream}} ->
                     {Encoded, Encoder1} = quic_qpack:encode(AllHeaders, StreamId, Encoder),
                     State1 = State#state{qpack_encoder = Encoder1},
-                    State2 = send_encoder_instructions(State1),
-                    HeadersFrame = quic_h3_frame:encode_headers(Encoded),
-                    case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
-                        ok ->
+                    case send_encoder_instructions(State1) of
+                        {ok, State2} ->
+                            HeadersFrame = quic_h3_frame:encode_headers(Encoded),
                             Stream1 = Stream#h3_stream{
                                 status = Status,
                                 headers = AllHeaders,
                                 frame_state = expecting_data
                             },
-                            State3 = State2#state{
-                                push_streams = maps:put(PushId, {StreamId, Stream1}, PushStreams)
-                            },
-                            {ok, State3};
-                        {error, Reason} ->
-                            {error, Reason}
+                            send_push_headers(
+                                QuicConn, StreamId, HeadersFrame, PushId, Stream1, State2
+                            );
+                        {error, _} = Error ->
+                            Error
                     end;
                 error ->
                     {error, unknown_push_id}
             end
+    end.
+
+send_push_headers(QuicConn, StreamId, HeadersFrame, PushId, Stream1, State) ->
+    case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
+        ok ->
+            PushStreams = maps:put(PushId, {StreamId, Stream1}, State#state.push_streams),
+            {ok, State#state{push_streams = PushStreams}};
+        {error, Reason} ->
+            {error, Reason, State}
     end.
 
 %% Send data on a push stream
@@ -4488,11 +4540,15 @@ send_encoder_instructions(
     Instructions = quic_qpack:get_encoder_instructions(Encoder),
     case Instructions of
         <<>> ->
-            State;
+            {ok, State};
         _ ->
-            quic:send_data(QuicConn, EncoderStream, Instructions, false),
-            Encoder1 = quic_qpack:clear_encoder_instructions(Encoder),
-            State#state{qpack_encoder = Encoder1}
+            case quic:send_data(QuicConn, EncoderStream, Instructions, false) of
+                ok ->
+                    Encoder1 = quic_qpack:clear_encoder_instructions(Encoder),
+                    {ok, State#state{qpack_encoder = Encoder1}};
+                {error, _} = Error ->
+                    Error
+            end
     end.
 
 %%====================================================================
@@ -4574,7 +4630,11 @@ apply_peer_settings(Settings, #state{qpack_encoder = Encoder} = State) ->
         peer_connect_enabled = ConnectEnabled,
         peer_h3_datagram_enabled = H3DatagramEnabled
     },
-    send_encoder_instructions(State1).
+    %% Refused instructions stay buffered and go out with the next flush.
+    case send_encoder_instructions(State1) of
+        {ok, State2} -> State2;
+        {error, _} -> State1
+    end.
 
 %% RFC 9297 §2.1: peer SETTINGS_H3_DATAGRAM = 1 requires non-zero
 %% max_datagram_frame_size on the QUIC connection. Return `true' when

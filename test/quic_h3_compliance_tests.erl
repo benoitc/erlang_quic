@@ -1732,6 +1732,100 @@ connect_tunnel_send_trailers_rejected_test() ->
     ?assertMatch({error, connect_tunnel}, Result).
 
 %%====================================================================
+%% QPACK encoder state across a refused HEADERS write
+%%====================================================================
+
+-define(ENC_STREAM, 7).
+
+%% Encoder instructions went out, the trailers were refused: the state
+%% returned keeps the encoder that the peer's decoder now matches.
+refused_trailers_keep_the_sent_encoder_test() ->
+    Conn = refusing_conn(self(), [0]),
+    try
+        State = encoder_state(Conn),
+        Result = quic_h3_connection:do_send_trailers(0, [{<<"x-custom">>, <<"v">>}], State),
+        ?assertMatch({error, send_queue_full, _}, Result),
+        {error, send_queue_full, State1} = Result,
+        ?assertNotEqual(qpack_encoder(State), qpack_encoder(State1)),
+        ?assertEqual(<<>>, quic_qpack:get_encoder_instructions(qpack_encoder(State1))),
+        ?assertMatch([_], writes(?ENC_STREAM))
+    after
+        stop_conn(Conn)
+    end.
+
+%% The instructions were refused: nothing went out, so the plain error
+%% leaves the caller's state, encoder included, as it was.
+refused_instructions_leave_nothing_behind_test() ->
+    Conn = refusing_conn(self(), [0, ?ENC_STREAM]),
+    try
+        State = encoder_state(Conn),
+        Result = quic_h3_connection:do_send_trailers(0, [{<<"x-custom">>, <<"v">>}], State),
+        ?assertEqual({error, send_queue_full}, Result),
+        ?assertEqual([], writes(0))
+    after
+        stop_conn(Conn)
+    end.
+
+%% A coalesced response whose write is refused keeps the encoder too.
+refused_respond_keeps_the_sent_encoder_test() ->
+    Conn = refusing_conn(self(), [0]),
+    try
+        State = encoder_state(Conn),
+        Result = quic_h3_connection:do_respond(
+            0, 200, [{<<"x-custom">>, <<"v">>}], <<"body">>, State
+        ),
+        ?assertMatch({error, send_queue_full, _}, Result),
+        {error, send_queue_full, State1} = Result,
+        ?assertEqual(<<>>, quic_qpack:get_encoder_instructions(qpack_encoder(State1))),
+        ?assertMatch([_], writes(?ENC_STREAM))
+    after
+        stop_conn(Conn)
+    end.
+
+%% A server state whose encoder inserts into the dynamic table, so the
+%% next field section produces encoder instructions.
+encoder_state(Conn) ->
+    E0 = quic_qpack:set_dynamic_capacity(4096, quic_qpack:new(#{max_allowed_capacity => 4096})),
+    make_test_state(#{
+        role => server,
+        quic_conn => Conn,
+        local_encoder_stream => ?ENC_STREAM,
+        qpack_encoder => quic_qpack:clear_encoder_instructions(E0),
+        streams => #{0 => #h3_stream{id = 0, type = request, state = open}}
+    }).
+
+%% qpack_encoder's position in the tuple make_test_state/1 builds.
+qpack_encoder(State) ->
+    element(13, State).
+
+%% Accepts every write except those on Refused, which get send_queue_full.
+refusing_conn(Reporter, Refused) ->
+    spawn(fun Loop() ->
+        receive
+            {'$gen_call', From, {send_data, StreamId, Data, _Fin}} ->
+                case lists:member(StreamId, Refused) of
+                    true ->
+                        gen_statem:reply(From, {error, send_queue_full});
+                    false ->
+                        Reporter ! {sent, StreamId, Data},
+                        gen_statem:reply(From, ok)
+                end,
+                Loop();
+            stop ->
+                ok;
+            _ ->
+                Loop()
+        end
+    end).
+
+writes(StreamId) ->
+    receive
+        {sent, StreamId, Data} -> [Data | writes(StreamId)]
+    after 100 ->
+        []
+    end.
+
+%%====================================================================
 %% Authority / Host validation (RFC 9114 §4.3.1)
 %%====================================================================
 
