@@ -84,6 +84,13 @@ Headers = [
 {ok, StreamId} = quic_h3:request(Conn, Headers).
 ```
 
+**Options:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `end_stream` | boolean | `true` | Close the request side after the headers |
+| `flow_control` | `auto \| manual` | `auto` | `manual` holds the response body until you call `consume/3`; see [Receive backpressure](#receive-backpressure) |
+
 #### wait_connected/2
 
 Block until the connection is established.
@@ -172,6 +179,7 @@ If data arrived before registration, it is returned as a list of `{Data, Fin}` t
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `drain_buffer` | boolean | `true` | Return buffered data instead of sending as messages |
+| `flow_control` | `auto \| manual` | unchanged | `manual` grants the peer credit only for what you return with `consume/3`; see [Receive backpressure](#receive-backpressure) |
 
 **Example:**
 
@@ -213,7 +221,50 @@ Unregister a stream handler.
 -spec unset_stream_handler(conn(), stream_id()) -> ok.
 ```
 
-Future data will be sent to the connection owner.
+Future data will be sent to the connection owner. A `manual` stream goes
+back to `auto`, since nothing is left to consume its data.
+
+#### consume/3
+
+Return receive credit on a `flow_control => manual` stream.
+
+```erlang
+-spec consume(conn(), stream_id(), non_neg_integer()) -> ok | {error, term()}.
+```
+
+Returns `ok`, and does nothing, on an `auto` stream. Returns
+`{error, unknown_stream}` once the stream is finished or reset.
+
+#### Receive backpressure
+
+By default a stream grants the peer credit as data arrives, so a handler
+that stops reading lets its mailbox grow without bound. Use
+`flow_control => manual` when you forward the body somewhere that can
+push back, such as a TCP socket, and call `consume/3` after processing
+each piece:
+
+```erlang
+ok = quic_h3:set_stream_handler(Conn, StreamId, self(), #{flow_control => manual}),
+receive
+    {quic_h3, Conn, {data, StreamId, Data, _Fin}} ->
+        ok = gen_tcp:send(Socket, Data),
+        ok = quic_h3:consume(Conn, StreamId, byte_size(Data))
+end.
+```
+
+On a client, pass the option to `request/3` instead. Notes:
+
+- Count payload bytes only. The HTTP/3 framing around them is credited
+  for you.
+- The peer can send at most one stream window past what you consumed:
+  `max_stream_data_bidi_remote` for a request the peer opened,
+  `max_stream_data_bidi_local` for one you opened, capped at
+  `max_receive_window`. Unconsumed bytes earn no connection credit
+  either.
+- Data buffered before you registered is handed to you like any other
+  and has to be consumed too.
+- If the handler exits or calls `unset_stream_handler/2`, the stream goes
+  back to `auto`.
 
 #### get_settings/1
 
