@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.3] - 2026-09-27
+
+### Fixed
+- A transfer through a small receive window no longer stops after the
+  first window. Each bidirectional stream tracked the other limit than the
+  one it advertised (RFC 9000 Section 18.2), so with a small
+  `max_receive_window` the receiver never sent MAX_STREAM_DATA and the
+  sender's writes sat queued. A receiver now keeps granting credit as it
+  receives, whatever the window.
+- The hex package ships the README image and leaves out a local
+  `c_src/build` directory.
+
+### Changed
+- `max_receive_window` below 16384 bytes is refused by `quic:connect/4` and
+  `quic:start_server/3` with `{error, {invalid_max_receive_window, W}}`;
+  such a window cannot keep the peer moving.
+- A write refused with `send_queue_full` is logged at debug rather than as a
+  warning, since callers retry it until the queue drains.
+  `quic:get_stats/1` reports the count as `send_queue_full_refusals`.
+
 ## [2.0.2] - 2026-09-27
 
 ### Fixed
