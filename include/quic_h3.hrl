@@ -163,7 +163,16 @@
     %% This stream was reset rather than finished. Both end up `closed',
     %% but a reset one stays in the map so whatever else arrives on it is
     %% swallowed, while a finished one is dropped.
-    reset = false :: boolean()
+    reset = false :: boolean(),
+
+    %% Receive credit. `manual': QUIC grants it only for what the reader
+    %% returns with quic_h3:consume/3. `received' counts QUIC stream bytes
+    %% handed to the parser, `unconsumed' payload delivered but not yet
+    %% consumed, `consumed_sent' the offset last reported to QUIC.
+    flow = auto :: auto | manual,
+    received = 0 :: non_neg_integer(),
+    unconsumed = 0 :: non_neg_integer(),
+    consumed_sent = 0 :: non_neg_integer()
 }).
 
 %%====================================================================

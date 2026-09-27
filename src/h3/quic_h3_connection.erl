@@ -47,6 +47,7 @@
     set_stream_handler/3,
     set_stream_handler/4,
     unset_stream_handler/2,
+    consume/3,
     %% HTTP Datagrams (RFC 9297)
     send_datagram/3,
     h3_datagrams_enabled/1,
@@ -75,6 +76,15 @@
 
 -include("quic.hrl").
 -include("quic_h3.hrl").
+
+%% Per-stream calls every state answers, so a caller never waits on a
+%% state that has no clause for them.
+-define(STREAM_CALL(C),
+    (is_tuple(C) andalso
+        (element(1, C) =:= set_stream_handler orelse
+            element(1, C) =:= unset_stream_handler orelse
+            element(1, C) =:= consume))
+).
 
 %% Test exports - only available when compiled with TEST defined
 -ifdef(TEST).
@@ -291,7 +301,12 @@
     %% Why this connection is closing. Read by the `closing' enter clause,
     %% which is the only place the owner is told, so every transition into
     %% `closing' goes through close_with/2 to set it.
-    close_reason = normal :: term()
+    close_reason = normal :: term(),
+
+    %% Streams whose last write was refused with send_queue_full, with the
+    %% process that made it: told `send_ready' once the QUIC send queue
+    %% has drained.
+    send_blocked = #{} :: #{stream_id() => pid()}
 }).
 
 %%====================================================================
@@ -485,6 +500,11 @@ set_stream_handler(Conn, StreamId, HandlerPid, Opts) ->
 unset_stream_handler(Conn, StreamId) ->
     gen_statem:call(Conn, {unset_stream_handler, StreamId}).
 
+%% @doc Return Bytes of receive credit on a manual stream.
+-spec consume(pid(), stream_id(), non_neg_integer()) -> ok | {error, term()}.
+consume(Conn, StreamId, Bytes) when is_integer(Bytes), Bytes >= 0 ->
+    gen_statem:call(Conn, {consume, StreamId, Bytes}).
+
 %%====================================================================
 %% gen_statem callbacks
 %%====================================================================
@@ -661,6 +681,8 @@ bootstrapping(info, {quic, QC, {error, Reason}}, #state{quic_conn = QC} = State)
     handle_quic_failed(Reason, State);
 bootstrapping(info, {quic, QC, {closed, Reason}}, #state{quic_conn = QC} = State) ->
     handle_quic_failed(Reason, State);
+bootstrapping({call, From}, Call, State) when ?STREAM_CALL(Call) ->
+    stream_call(From, Call, State);
 bootstrapping(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -739,10 +761,14 @@ early_data({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 early_data(cast, close, State) ->
     close_with(normal, State);
+early_data(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
+    {keep_state, tell_send_ready(State)};
 early_data(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 early_data(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
+early_data(info, {'DOWN', Ref, process, _Pid, _Reason}, State) ->
+    handler_down(Ref, State);
 early_data(
     info,
     {quic, QC, {session_ticket, T}},
@@ -766,6 +792,8 @@ early_data(info, {quic, QC, {error, Reason}}, #state{quic_conn = QC} = State) ->
     handle_quic_failed(Reason, State);
 early_data(info, {quic, QC, {closed, Reason}}, #state{quic_conn = QC} = State) ->
     handle_quic_failed(Reason, State);
+early_data({call, From}, Call, State) when ?STREAM_CALL(Call) ->
+    stream_call(From, Call, State);
 early_data(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -835,6 +863,8 @@ awaiting_quic(info, {quic, QC, {error, Reason}}, #state{quic_conn = QC} = State)
     handle_quic_failed(Reason, State);
 awaiting_quic(info, {quic, QC, {closed, Reason}}, #state{quic_conn = QC} = State) ->
     handle_quic_failed(Reason, State);
+awaiting_quic({call, From}, Call, State) when ?STREAM_CALL(Call) ->
+    stream_call(From, Call, State);
 awaiting_quic(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -911,10 +941,14 @@ h3_connecting({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 h3_connecting(cast, close, State) ->
     close_with(normal, State);
+h3_connecting(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
+    {keep_state, tell_send_ready(State)};
 h3_connecting(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 h3_connecting(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
+h3_connecting(info, {'DOWN', Ref, process, _Pid, _Reason}, State) ->
+    handler_down(Ref, State);
 h3_connecting(
     info,
     {quic, QC, {session_ticket, T}},
@@ -938,6 +972,8 @@ h3_connecting(info, {quic, QC, {error, Reason}}, #state{quic_conn = QC} = State)
     handle_quic_failed(Reason, State);
 h3_connecting(info, {quic, QC, {closed, Reason}}, #state{quic_conn = QC} = State) ->
     handle_quic_failed(Reason, State);
+h3_connecting({call, From}, Call, State) when ?STREAM_CALL(Call) ->
+    stream_call(From, Call, State);
 h3_connecting(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -1040,30 +1076,11 @@ connected({call, From}, {send_response, StreamId, Status, Headers}, State) ->
             {keep_state, State1, [{reply, From, {error, Reason}}]}
     end;
 connected({call, From}, {send_data, StreamId, Data, Fin}, State) ->
-    case do_send_data(StreamId, Data, Fin, State) of
-        {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
-    end;
+    write_reply(From, StreamId, do_send_data(StreamId, Data, Fin, State), State);
 connected({call, From}, {respond, StreamId, Status, Headers, Body}, State) ->
-    case do_respond(StreamId, Status, Headers, Body, State) of
-        {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]};
-        {error, Reason, State1} ->
-            {keep_state, State1, [{reply, From, {error, Reason}}]}
-    end;
+    write_reply(From, StreamId, do_respond(StreamId, Status, Headers, Body, State), State);
 connected({call, From}, {send_trailers, StreamId, Trailers}, State) ->
-    case do_send_trailers(StreamId, Trailers, State) of
-        {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]};
-        {error, Reason, State1} ->
-            {keep_state, State1, [{reply, From, {error, Reason}}]}
-    end;
+    write_reply(From, StreamId, do_send_trailers(StreamId, Trailers, State), State);
 connected({call, From}, get_settings, #state{local_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
 connected({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
@@ -1114,19 +1131,9 @@ connected({call, From}, {set_max_push_id, MaxPushId}, #state{role = client} = St
     end;
 connected({call, From}, {set_max_push_id, _MaxPushId}, #state{role = server}) ->
     {keep_state_and_data, [{reply, From, {error, server_cannot_set_max_push_id}}]};
-%% Per-stream handler registration
-connected({call, From}, {set_stream_handler, StreamId, HandlerPid, Opts}, State) ->
-    case do_set_stream_handler(StreamId, HandlerPid, Opts, State) of
-        {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
-        {ok, BufferedChunks, State1} ->
-            {keep_state, State1, [{reply, From, {ok, BufferedChunks}}]};
-        {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
-    end;
-connected({call, From}, {unset_stream_handler, StreamId}, State) ->
-    State1 = do_unset_stream_handler(StreamId, State),
-    {keep_state, State1, [{reply, From, ok}]};
+%% Per-stream handler registration and receive credit
+connected({call, From}, Call, State) when ?STREAM_CALL(Call) ->
+    stream_call(From, Call, State);
 connected(cast, {cancel_push, PushId}, #state{role = client} = State) ->
     State1 = do_cancel_push(PushId, State),
     {keep_state, State1};
@@ -1145,20 +1152,14 @@ connected(cast, goaway, State) ->
     end;
 connected(cast, close, State) ->
     close_with(normal, State);
+connected(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
+    {keep_state, tell_send_ready(State)};
 connected(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 connected(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
-connected(info, {'DOWN', Ref, process, _Pid, _Reason}, #state{stream_handlers = Handlers} = State) ->
-    %% Check if this is a stream handler going down
-    case find_handler_by_ref(Ref, Handlers) of
-        {ok, StreamId} ->
-            State1 = do_unset_stream_handler(StreamId, State),
-            {keep_state, State1};
-        error ->
-            %% Unknown monitor, ignore
-            keep_state_and_data
-    end;
+connected(info, {'DOWN', Ref, process, _Pid, _Reason}, State) ->
+    handler_down(Ref, State);
 connected(
     info,
     {quic, QC, {session_ticket, T}},
@@ -1214,19 +1215,17 @@ goaway_sent(
 goaway_sent({call, From}, {request, _Headers, _Opts}, _State) ->
     {keep_state_and_data, [{reply, From, {error, goaway_sent}}]};
 goaway_sent({call, From}, {send_data, StreamId, Data, Fin}, State) ->
-    %% Allow completing existing streams
-    case do_send_data(StreamId, Data, Fin, State) of
-        {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
-    end;
+    write_reply(From, StreamId, do_send_data(StreamId, Data, Fin, State), State);
 goaway_sent(cast, close, State) ->
     close_with(normal, State);
+goaway_sent(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
+    {keep_state, tell_send_ready(State)};
 goaway_sent(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 goaway_sent(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
+goaway_sent(info, {'DOWN', Ref, process, _Pid, _Reason}, State) ->
+    handler_down(Ref, State);
 goaway_sent(
     info,
     {quic, QC, {session_ticket, T}},
@@ -1246,6 +1245,8 @@ goaway_sent(
     #state{quic_conn = QC} = _State
 ) ->
     {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
+goaway_sent({call, From}, Call, State) when ?STREAM_CALL(Call) ->
+    stream_call(From, Call, State);
 goaway_sent(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -1279,18 +1280,17 @@ goaway_received(
 goaway_received({call, From}, {request, _Headers, _Opts}, _State) ->
     {keep_state_and_data, [{reply, From, {error, goaway_received}}]};
 goaway_received({call, From}, {send_data, StreamId, Data, Fin}, State) ->
-    case do_send_data(StreamId, Data, Fin, State) of
-        {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
-    end;
+    write_reply(From, StreamId, do_send_data(StreamId, Data, Fin, State), State);
 goaway_received(cast, close, State) ->
     close_with(normal, State);
+goaway_received(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
+    {keep_state, tell_send_ready(State)};
 goaway_received(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 goaway_received(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
+goaway_received(info, {'DOWN', Ref, process, _Pid, _Reason}, State) ->
+    handler_down(Ref, State);
 goaway_received(
     info,
     {quic, QC, {session_ticket, T}},
@@ -1310,6 +1310,8 @@ goaway_received(
     #state{quic_conn = QC} = _State
 ) ->
     {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
+goaway_received({call, From}, Call, State) when ?STREAM_CALL(Call) ->
+    stream_call(From, Call, State);
 goaway_received(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -1340,6 +1342,8 @@ closing(
     #state{quic_conn = QC} = _State
 ) ->
     {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
+closing({call, From}, Call, State) when ?STREAM_CALL(Call) ->
+    stream_call(From, Call, State);
 closing(_EventType, _Event, _State) ->
     keep_state_and_data.
 
@@ -2593,7 +2597,8 @@ handle_request_stream_data(
     Fin,
     #state{streams = Streams, stream_buffers = Buffers} = State
 ) ->
-    Stream = maps:get(StreamId, Streams, #h3_stream{id = StreamId, type = request, state = open}),
+    Stream0 = maps:get(StreamId, Streams, #h3_stream{id = StreamId, type = request, state = open}),
+    Stream = Stream0#h3_stream{received = Stream0#h3_stream.received + byte_size(Data)},
     Buffer = maps:get(StreamId, Buffers, <<>>),
     Combined = <<Buffer/binary, Data/binary>>,
     handle_request_stream_data(StreamId, Combined, Fin, Stream, State).
@@ -2624,8 +2629,10 @@ handle_request_stream_data(
                     <<>> -> maps:remove(StreamId, Buffers);
                     _ -> Buffers#{StreamId => Rest}
                 end,
-            Streams1 = store_stream(StreamId, Stream2, Streams),
-            {ok, State2#state{streams = Streams1, stream_buffers = Buffers1}};
+            State3 = State2#state{stream_buffers = Buffers1},
+            Stream3 = report_overhead(StreamId, Stream2, State3),
+            Streams1 = store_stream(StreamId, Stream3, Streams),
+            {ok, State3#state{streams = Streams1}};
         {error, Reason} ->
             {error, Reason, State}
     end.
@@ -3743,15 +3750,31 @@ validate_outbound_request_headers(Headers, State) ->
 send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, State) ->
     %% end_stream defaults to true for requests without body (GET, HEAD, etc.)
     EndStream = maps:get(end_stream, Opts, true),
+    Flow = maps:get(flow_control, Opts, auto),
     case quic:open_stream(QuicConn) of
         {ok, StreamId} ->
+            %% Before HEADERS, so no response byte is credited by delivery.
+            ok =
+                case Flow of
+                    manual ->
+                        quic_connection:set_stream_flow_control(
+                            QuicConn, StreamId, {manual, 0}
+                        );
+                    _ ->
+                        ok
+                end,
             %% Use encode/3 with StreamId for section ack tracking
             {Encoded, Encoder1} = quic_qpack:encode(Headers, StreamId, Encoder),
             %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
             %% so peer has dynamic table entries before receiving references
             State1 = State#state{qpack_encoder = Encoder1},
             send_request_headers(
-                send_encoder_instructions(State1), StreamId, Headers, Encoded, EndStream, NextId
+                send_encoder_instructions(State1),
+                StreamId,
+                Headers,
+                Encoded,
+                {EndStream, Flow},
+                NextId
             );
         {error, Reason} ->
             {error, Reason}
@@ -3759,14 +3782,14 @@ send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, State) ->
 
 %% Encoder instructions that went out commit the encoder: a failed
 %% HEADERS write after them returns the state that holds it.
-send_request_headers({error, _} = Error, _StreamId, _Headers, _Encoded, _EndStream, _NextId) ->
+send_request_headers({error, _} = Error, _StreamId, _Headers, _Encoded, _Mode, _NextId) ->
     Error;
 send_request_headers(
     {ok, #state{quic_conn = QuicConn, streams = Streams} = State2},
     StreamId,
     Headers,
     Encoded,
-    EndStream,
+    {EndStream, Flow},
     NextId
 ) ->
     HeadersFrame = quic_h3_frame:encode_headers(Encoded),
@@ -3791,7 +3814,8 @@ send_request_headers(
                 method = Method,
                 state = StreamState,
                 frame_state = expecting_headers,
-                is_connect = (Method =:= <<"CONNECT">>)
+                is_connect = (Method =:= <<"CONNECT">>),
+                flow = Flow
             },
             State3 = State2#state{
                 next_stream_id = NextId + 4,
@@ -4015,6 +4039,106 @@ do_cancel_stream(
 %% Internal: Per-stream Handler Registration
 %%====================================================================
 
+%% Reply to a write on StreamId. A send_queue_full refusal is remembered
+%% so the stream is told `send_ready' once the queue drains.
+write_reply(From, _StreamId, {ok, State1}, _State) ->
+    {keep_state, State1, [{reply, From, ok}]};
+write_reply(From, StreamId, {error, Reason}, State) ->
+    {keep_state, note_refusal(StreamId, Reason, From, State), [{reply, From, {error, Reason}}]};
+write_reply(From, StreamId, {error, Reason, State1}, _State) ->
+    {keep_state, note_refusal(StreamId, Reason, From, State1), [{reply, From, {error, Reason}}]}.
+
+note_refusal(StreamId, send_queue_full, {Caller, _Tag}, #state{send_blocked = Blocked} = State) ->
+    %% One request covers every stream refused until QUIC answers it.
+    map_size(Blocked) =:= 0 andalso quic_connection:notify_send_ready(State#state.quic_conn),
+    State#state{send_blocked = Blocked#{StreamId => Caller}};
+note_refusal(_StreamId, _Reason, _From, State) ->
+    State.
+
+%% The QUIC send queue has drained: whoever was refused on each stream may
+%% write again.
+tell_send_ready(#state{send_blocked = Blocked} = State) ->
+    Conn = self(),
+    maps:foreach(
+        fun(StreamId, Caller) -> Caller ! {quic_h3, Conn, {send_ready, StreamId}} end, Blocked
+    ),
+    State#state{send_blocked = #{}}.
+
+stream_call(From, {set_stream_handler, StreamId, HandlerPid, Opts}, State) ->
+    case do_set_stream_handler(StreamId, HandlerPid, Opts, State) of
+        {ok, State1} ->
+            {keep_state, State1, [{reply, From, ok}]};
+        {ok, BufferedChunks, State1} ->
+            {keep_state, State1, [{reply, From, {ok, BufferedChunks}}]};
+        {error, Reason} ->
+            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+    end;
+stream_call(From, {unset_stream_handler, StreamId}, State) ->
+    State1 = do_unset_stream_handler(StreamId, State),
+    {keep_state, State1, [{reply, From, ok}]};
+stream_call(From, {consume, StreamId, Bytes}, State) ->
+    {Reply, State1} = do_consume(StreamId, Bytes, State),
+    {keep_state, State1, [{reply, From, Reply}]}.
+
+%% Credit for Bytes of payload the reader has processed. Framing around it
+%% is credited as it is parsed, so the reader counts payload only.
+do_consume(StreamId, Bytes, #state{streams = Streams} = State) ->
+    case Streams of
+        #{StreamId := #h3_stream{reset = true}} ->
+            {{error, unknown_stream}, State};
+        #{StreamId := #h3_stream{flow = manual, unconsumed = Owed} = Stream} ->
+            Stream1 = report_consumed(
+                StreamId, Stream#h3_stream{unconsumed = max(0, Owed - Bytes)}, State
+            ),
+            {ok, State#state{streams = Streams#{StreamId => Stream1}}};
+        #{StreamId := #h3_stream{}} ->
+            {ok, State};
+        _ ->
+            {{error, unknown_stream}, State}
+    end.
+
+%% The stream offset the reader has accounted for: everything parsed,
+%% less payload it has not consumed yet.
+consumed_offset(StreamId, #h3_stream{received = Received, unconsumed = Owed}, State) ->
+    Tail = byte_size(maps:get(StreamId, State#state.stream_buffers, <<>>)),
+    Received - Tail - Owed.
+
+report_consumed(StreamId, #h3_stream{consumed_sent = Sent} = Stream, State) ->
+    case consumed_offset(StreamId, Stream, State) of
+        Offset when Offset > Sent ->
+            quic_connection:stream_consumed(State#state.quic_conn, StreamId, Offset),
+            Stream#h3_stream{consumed_sent = Offset};
+        _ ->
+            Stream
+    end.
+
+%% After a parse pass: when everything delivered has been consumed, the
+%% framing just parsed is credited here, since no consume/3 will follow it.
+report_overhead(StreamId, #h3_stream{flow = manual, unconsumed = 0} = Stream, State) ->
+    report_consumed(StreamId, Stream, State);
+report_overhead(_StreamId, Stream, _State) ->
+    Stream.
+
+%% Payload handed to the reader of a manual stream is owed until consumed.
+owe(#h3_stream{flow = manual, unconsumed = Owed} = Stream, Payload) ->
+    Stream#h3_stream{unconsumed = Owed + byte_size(Payload)};
+owe(Stream, _Payload) ->
+    Stream.
+
+%% Switch a stream to manual credit. Payload the reader is about to be
+%% given (Pending) counts as not yet consumed.
+make_manual(StreamId, Stream, Pending, State) ->
+    Stream1 = Stream#h3_stream{flow = manual, unconsumed = Pending},
+    Offset = consumed_offset(StreamId, Stream1, State),
+    quic_connection:set_stream_flow_control(State#state.quic_conn, StreamId, {manual, Offset}),
+    Stream1#h3_stream{consumed_sent = Offset}.
+
+make_auto(StreamId, #h3_stream{flow = manual} = Stream, State) ->
+    quic_connection:set_stream_flow_control(State#state.quic_conn, StreamId, auto),
+    Stream#h3_stream{flow = auto, unconsumed = 0};
+make_auto(_StreamId, Stream, _State) ->
+    Stream.
+
 %% Register a handler process to receive stream data
 do_set_stream_handler(StreamId, HandlerPid, Opts, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
@@ -4035,13 +4159,30 @@ register_stream_handler(
 ) ->
     MonRef = erlang:monitor(process, HandlerPid),
     NewHandlers = Handlers#{StreamId => {HandlerPid, MonRef}},
-    case maps:take(StreamId, Buffers) of
-        {{Chunks, _Size, _HadFin}, _NewBuffers} ->
-            State1 = release_buffered(StreamId, State#state{stream_handlers = NewHandlers}),
-            drain_buffered_data(StreamId, HandlerPid, Chunks, Opts, State1);
-        error ->
-            {ok, State#state{stream_handlers = NewHandlers}}
+    Chunks =
+        case maps:find(StreamId, Buffers) of
+            {ok, {Buffered, _Size, _HadFin}} -> Buffered;
+            error -> []
+        end,
+    State1 = set_flow(StreamId, Opts, iolist_size([D || {D, _} <- Chunks]), State),
+    case Chunks of
+        [] ->
+            {ok, State1#state{stream_handlers = NewHandlers}};
+        _ ->
+            State2 = release_buffered(StreamId, State1#state{stream_handlers = NewHandlers}),
+            drain_buffered_data(StreamId, HandlerPid, Chunks, Opts, State2)
     end.
+
+%% Apply a `flow_control' option; without one the stream keeps its mode.
+set_flow(StreamId, Opts, Pending, #state{streams = Streams} = State) ->
+    #{StreamId := Stream} = Streams,
+    Stream1 =
+        case {maps:get(flow_control, Opts, Stream#h3_stream.flow), Stream#h3_stream.flow} of
+            {manual, auto} -> make_manual(StreamId, Stream, Pending, State);
+            {auto, manual} -> make_auto(StreamId, Stream, State);
+            _ -> Stream
+        end,
+    State#state{streams = Streams#{StreamId => Stream1}}.
 
 drain_buffered_data(StreamId, HandlerPid, Chunks, Opts, State) ->
     OrderedChunks = lists:reverse(Chunks),
@@ -4057,13 +4198,32 @@ drain_buffered_data(StreamId, HandlerPid, Chunks, Opts, State) ->
             {ok, State}
     end.
 
+%% A stream handler went down: its stream stops waiting on it.
+handler_down(Ref, #state{stream_handlers = Handlers} = State) ->
+    case find_handler_by_ref(Ref, Handlers) of
+        {ok, StreamId} ->
+            {keep_state, do_unset_stream_handler(StreamId, State)};
+        error ->
+            %% Unknown monitor, ignore
+            keep_state_and_data
+    end.
+
 %% Unregister a stream handler
 do_unset_stream_handler(StreamId, #state{stream_handlers = Handlers} = State) ->
     case maps:take(StreamId, Handlers) of
         {{_Pid, MonRef}, NewHandlers} ->
             erlang:demonitor(MonRef, [flush]),
-            State#state{stream_handlers = NewHandlers};
+            %% Nobody is left to consume: credit follows delivery again.
+            release_manual(StreamId, State#state{stream_handlers = NewHandlers});
         error ->
+            State
+    end.
+
+release_manual(StreamId, #state{streams = Streams} = State) ->
+    case Streams of
+        #{StreamId := #h3_stream{flow = manual} = Stream} ->
+            State#state{streams = Streams#{StreamId => make_auto(StreamId, Stream, State)}};
+        _ ->
             State
     end.
 
@@ -4092,7 +4252,7 @@ deliver_body(StreamId, Payload, Fin, Stream, State) ->
     case body_fits(StreamId, Payload, State) of
         true ->
             State1 = notify_stream_data(StreamId, Payload, Fin, State),
-            {ok, finish_on_fin(Stream, Fin), State1};
+            {ok, finish_on_fin(owe(Stream, Payload), Fin), State1};
         false ->
             {error, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}}
     end.

@@ -29,6 +29,7 @@
 - [x] Connection-level flow control (MAX_DATA)
 - [x] Stream-level flow control (MAX_STREAM_DATA)
 - [x] MAX_STREAMS limits (bidirectional and unidirectional)
+- [x] HTTP/3 receive backpressure: `flow_control => manual` on `quic_h3:set_stream_handler/4` or `quic_h3:request/3`, credit returned with `quic_h3:consume/3`
 
 ### Packet Handling
 - [x] Initial, Handshake, and 1-RTT packet types

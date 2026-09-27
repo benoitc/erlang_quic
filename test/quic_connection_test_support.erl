@@ -44,6 +44,7 @@
     pending_delivery/1,
     finish_recv_pass/1,
     coalesce_small_stream/1,
+    coalesce_small_stream/3,
     zero_byte_fin_in_queue/0,
     decimate_initial_state/0,
     decimate_step/1,
@@ -67,7 +68,12 @@
     queue_stream/4,
     state_with_stream_limits/3,
     recv_max_data/2,
-    send_queue_full_refusals/1
+    send_queue_full_refusals/1,
+    state_for_manual_recv/2,
+    stream_recv/2,
+    max_data_local/1,
+    state_wanting_send_ready/2,
+    send_ready_wanted/1
 ]).
 
 %% Update the spin-bit tracking state from a received 1-RTT packet.
@@ -514,6 +520,11 @@ zero_byte_fin_in_queue() ->
     }.
 
 coalesce_small_stream(DataSize) ->
+    coalesce_small_stream(DataSize, 1000000, 1000000).
+
+%% As coalesce_small_stream/1, with the peer's stream and connection
+%% windows set to StreamWindow and ConnWindow bytes past what was sent.
+coalesce_small_stream(DataSize, StreamWindow, ConnWindow) ->
     Data = binary:copy(<<0>>, DataSize),
     Entry = {stream_data, 0, 0, Data, false, DataSize},
     PQ = quic_pqueue:in(Entry, 3, quic_pqueue:new()),
@@ -521,26 +532,32 @@ coalesce_small_stream(DataSize) ->
         send_queue = PQ,
         send_queue_bytes = DataSize,
         send_queue_count = 1,
-        send_queue_version = 1
+        send_queue_version = 1,
+        streams = #{0 => #stream_state{id = 0, send_max_data = StreamWindow}},
+        max_data_remote = ConnWindow,
+        data_sent = 0
     },
     case quic_connection:dequeue_small_stream_frame_tuple(State0) of
         {ok, _FrameTuple, #state{
             send_queue_bytes = NewBytes,
             send_queue_count = NewCount,
-            send_queue_version = NewVersion
+            send_queue_version = NewVersion,
+            data_sent = Sent
         }} ->
             #{
                 dequeued => true,
                 send_queue_bytes => NewBytes,
                 send_queue_count => NewCount,
-                send_queue_version => NewVersion
+                send_queue_version => NewVersion,
+                data_sent => Sent
             };
         none ->
             #{
                 dequeued => false,
                 send_queue_bytes => DataSize,
                 send_queue_count => 1,
-                send_queue_version => 1
+                send_queue_version => 1,
+                data_sent => 0
             }
     end.
 
@@ -859,3 +876,40 @@ recv_max_data(#state{streams = Streams}, StreamId) ->
 
 -spec send_queue_full_refusals(#state{}) -> non_neg_integer().
 send_queue_full_refusals(#state{send_queue_full_refusals = N}) -> N.
+
+%% A connected client that has opened stream 0 and can send frames: its
+%% stream and connection limits start at Window, and grow to MaxWindow.
+-spec state_for_manual_recv(pos_integer(), pos_integer()) -> #state{}.
+state_for_manual_recv(Window, MaxWindow) ->
+    S0 = state_with_stream_limits(client, Window, Window),
+    S1 = state_sending(S0#state{
+        pn_app = S0#state.pn_handshake,
+        max_data_local = Window,
+        fc_max_receive_window = MaxWindow,
+        coalesce = false
+    }),
+    {ok, 0, S2} = quic_connection:do_open_stream(S1),
+    S2.
+
+%% A stream's receive fields.
+-spec stream_recv(#state{}, non_neg_integer()) -> map().
+stream_recv(#state{streams = Streams}, StreamId) ->
+    #{StreamId := S} = Streams,
+    #{
+        flow => S#stream_state.recv_flow,
+        offset => S#stream_state.recv_offset,
+        max => S#stream_state.recv_max_data,
+        consumed => S#stream_state.recv_consumed
+    }.
+
+-spec max_data_local(#state{}) -> non_neg_integer().
+max_data_local(#state{max_data_local = M}) -> M.
+
+%% A state owned by the caller, with QueueBytes queued and a send_ready
+%% requested or not.
+-spec state_wanting_send_ready(non_neg_integer(), boolean()) -> #state{}.
+state_wanting_send_ready(QueueBytes, Wanted) ->
+    #state{owner = self(), send_queue_bytes = QueueBytes, send_ready_wanted = Wanted}.
+
+-spec send_ready_wanted(#state{}) -> boolean().
+send_ready_wanted(#state{send_ready_wanted = W}) -> W.

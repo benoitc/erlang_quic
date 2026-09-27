@@ -630,6 +630,10 @@
     %% Bytes held in recv_buffer, a running count so per-packet
     %% accounting never walks the tree.
     recv_buffered = 0 :: non_neg_integer(),
+    %% `manual': credit follows recv_consumed, the offset the reader has
+    %% returned, instead of what has been delivered.
+    recv_flow = auto :: auto | manual,
+    recv_consumed = 0 :: non_neg_integer(),
     %% Our recv side is terminal: FIN read (buffer empty) or peer RESET_STREAM.
     recv_done = false :: boolean(),
 
