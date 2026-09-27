@@ -170,10 +170,9 @@ end_per_testcase(TestCase, _Config) ->
 %% @doc Test GET request using aioquic client
 aioquic_client_get(Config) ->
     Port = ?config(h3_port, Config),
-    TmpDir = ?config(tmp_dir, Config),
+    TmpDir = output_dir(Config),
 
     %% Use aioquic's http3_client to make a GET request
-    clear(TmpDir, ["test"]),
     Cmd = build_aioquic_cmd(Port, TmpDir, "https://127.0.0.1:~p/test", []),
     ct:pal("Running: ~s", [Cmd]),
 
@@ -187,12 +186,11 @@ aioquic_client_get(Config) ->
 %% @doc Test POST request using aioquic client
 aioquic_client_post(Config) ->
     Port = ?config(h3_port, Config),
-    TmpDir = ?config(tmp_dir, Config),
+    TmpDir = output_dir(Config),
 
     %% Create a test file to POST
     TestFile = filename:join(TmpDir, "post_data.txt"),
     ok = file:write_file(TestFile, <<"Hello from aioquic!">>),
-    clear(TmpDir, ["echo"]),
 
     %% POST the file
     Cmd = build_aioquic_cmd(
@@ -215,11 +213,10 @@ aioquic_client_post(Config) ->
 %% @doc Test HEAD request using aioquic client
 aioquic_client_head(Config) ->
     Port = ?config(h3_port, Config),
-    TmpDir = ?config(tmp_dir, Config),
+    TmpDir = output_dir(Config),
 
     %% aioquic http3_client doesn't support HEAD directly,
     %% but we can check server handles GET properly and infer HEAD works
-    clear(TmpDir, ["test"]),
     Cmd = build_aioquic_cmd(Port, TmpDir, "https://127.0.0.1:~p/test", ["-v"]),
     ct:pal("Running: ~s", [Cmd]),
 
@@ -233,10 +230,9 @@ aioquic_client_head(Config) ->
 %% @doc Test large download using aioquic client
 aioquic_client_large_download(Config) ->
     Port = ?config(h3_port, Config),
-    TmpDir = ?config(tmp_dir, Config),
+    TmpDir = output_dir(Config),
 
     %% Request a large file (server will generate random data)
-    clear(TmpDir, ["large"]),
     Cmd = build_aioquic_cmd(Port, TmpDir, "https://127.0.0.1:~p/large", []),
     ct:pal("Running: ~s", [Cmd]),
 
@@ -254,11 +250,10 @@ aioquic_client_large_download(Config) ->
 %% @doc Test multiple sequential requests using aioquic client
 aioquic_client_multiple_requests(Config) ->
     Port = ?config(h3_port, Config),
-    TmpDir = ?config(tmp_dir, Config),
+    TmpDir = output_dir(Config),
 
     %% Make multiple requests - aioquic supports this. Only paths the
     %% handler serves to a GET: /echo is POST only and answers 404.
-    clear(TmpDir, ["test", "index"]),
     Cmd = build_aioquic_cmd(
         Port,
         TmpDir,
@@ -294,11 +289,16 @@ find_certs_dir() ->
 project_root() ->
     filename:dirname(filename:dirname(filename:absname(?FILE))).
 
-%% The client saves each body under its last path segment, in a directory
-%% every case shares. A case removes what it expects first, so a check
-%% that passes is reading this request's response and not an earlier one.
-clear(TmpDir, Names) ->
-    lists:foreach(fun(N) -> file:delete(filename:join(TmpDir, N)) end, Names).
+%% A new, empty directory for one client run, so a check that passes is
+%% reading this run's response. Files are never deleted and recreated in
+%% place: on Docker Desktop for macOS a container cannot create a file at
+%% a path the host just deleted from the bind mount (ENOENT).
+output_dir(Config) ->
+    Dir = filename:join(
+        ?config(tmp_dir, Config), integer_to_list(erlang:unique_integer([positive]))
+    ),
+    ok = file:make_dir(Dir),
+    Dir.
 
 fetched(TmpDir, Name) ->
     file:read_file(filename:join(TmpDir, Name)).
