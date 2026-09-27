@@ -738,6 +738,7 @@ get_path_stats(Conn) when is_pid(Conn) ->
 %% - `packets_sent': Total QUIC packets sent
 %% - `data_received': Total bytes of application data received
 %% - `data_sent': Total bytes of application data sent
+%% - `send_queue_full_refusals': Writes refused with `send_queue_full'
 %%
 %% See `quic_dist_controller' for usage in distribution tick checking.
 -spec get_stats(Conn) -> {ok, map()} | {error, term()} when

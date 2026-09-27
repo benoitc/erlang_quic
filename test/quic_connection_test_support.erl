@@ -66,7 +66,8 @@
     queue_head/1,
     queue_stream/4,
     state_with_stream_limits/3,
-    recv_max_data/2
+    recv_max_data/2,
+    send_queue_full_refusals/1
 ]).
 
 %% Update the spin-bit tracking state from a received 1-RTT packet.
@@ -855,3 +856,6 @@ state_with_stream_limits(Role, BidiLocal, BidiRemote) ->
 recv_max_data(#state{streams = Streams}, StreamId) ->
     #{StreamId := #stream_state{recv_max_data = Max}} = Streams,
     Max.
+
+-spec send_queue_full_refusals(#state{}) -> non_neg_integer().
+send_queue_full_refusals(#state{send_queue_full_refusals = N}) -> N.

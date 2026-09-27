@@ -1794,6 +1794,8 @@ connected(
         %% rejection clears them (RFC 9001 Section 4.6.2), so a non-zero
         %% value here means early data was sent and the server took it.
         zero_rtt_streams => sets:size(ZeroRttStreams),
+        %% Writes refused as backpressure; each is logged at debug only.
+        send_queue_full_refusals => State#state.send_queue_full_refusals,
         batch_flushes => Flushes,
         packets_coalesced => Coalesced,
         gso_flushes => GSOFlushes,
@@ -3428,8 +3430,15 @@ coalesced_sends(Acc0, State0) ->
         lists:foldl(
             fun({Tag, Sid, Data, Fin}, {Rs, S}) ->
                 case do_send_data(Sid, Data, Fin, S, send_admission(Tag)) of
-                    {ok, S2} -> {[{Tag, ok} | Rs], S2};
-                    {error, Reason} -> {[{Tag, {error, Reason}} | Rs], S}
+                    {ok, S2} ->
+                        {[{Tag, ok} | Rs], S2};
+                    {error, send_queue_full} ->
+                        Refusals = S#state.send_queue_full_refusals + 1,
+                        {[{Tag, {error, send_queue_full}} | Rs], S#state{
+                            send_queue_full_refusals = Refusals
+                        }};
+                    {error, Reason} ->
+                        {[{Tag, {error, Reason}} | Rs], S}
                 end
             end,
             {[], State0#state{coalesce = true}},
@@ -8530,7 +8539,7 @@ admit_send(check, DataSize, #state{send_queue_bytes = QueueBytes}) when
 ->
     true;
 admit_send(check, DataSize, #state{send_queue_bytes = QueueBytes}) ->
-    ?LOG_WARNING(
+    ?LOG_DEBUG(
         #{
             what => send_queue_full,
             queue_bytes => QueueBytes,
