@@ -58,12 +58,12 @@ the_lean_path_defers_once_the_final_size_is_known_test() ->
 %% nothing is queued or sent.
 a_write_after_our_fin_is_refused_test() ->
     S0 = quic_connection_test_support:state_with_send_stream(?SID, 5, true),
-    ?assertMatch({error, _}, quic_connection:do_send_data(?SID, <<"after fin">>, false, S0)).
+    ?assertMatch({error, _}, quic_connection:do_send_data(?SID, <<"after fin">>, false, S0, check)).
 
 %% The fence: before the FIN the same write goes through.
 a_write_before_our_fin_is_accepted_test() ->
     S0 = quic_connection_test_support:state_with_send_stream(?SID, 5, false),
-    ?assertMatch({ok, _}, quic_connection:do_send_data(?SID, <<"more">>, false, S0)).
+    ?assertMatch({ok, _}, quic_connection:do_send_data(?SID, <<"more">>, false, S0, check)).
 
 %%====================================================================
 %% Helpers

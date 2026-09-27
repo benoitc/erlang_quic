@@ -27,7 +27,8 @@
     memory_does_not_grow_with_the_frame/1,
     response_in_one_large_data_frame/1,
     request_body_in_one_large_data_frame/1,
-    response_over_16_mib_without_content_length/1
+    response_over_16_mib_without_content_length/1,
+    a_refused_piece_is_sent_once_on_retry/1
 ]).
 
 %% Five times the 1 MiB a frame used to be allowed.
@@ -40,6 +41,10 @@
 %% Past the 16 MiB a body without Content-Length used to be allowed.
 -define(UNBOUNDED, (20 * 1024 * 1024)).
 -define(CHUNK, (1024 * 1024)).
+%% Four times the send-queue ceiling, so the server has to retry.
+-define(RETRIED, (64 * 1024 * 1024)).
+%% Registered by the retry case to hear how often the server was refused.
+-define(PROBE, quic_h3_large_body_probe).
 
 -define(WAIT_MS, 10000).
 %% Small enough that a case crosses it quickly, far above a request's own
@@ -58,7 +63,8 @@ all() ->
         memory_does_not_grow_with_the_frame,
         response_in_one_large_data_frame,
         request_body_in_one_large_data_frame,
-        response_over_16_mib_without_content_length
+        response_over_16_mib_without_content_length,
+        a_refused_piece_is_sent_once_on_retry
     ].
 
 init_per_suite(Config) ->
@@ -174,6 +180,31 @@ response_over_16_mib_without_content_length(Config) ->
         quic_h3:close(Conn)
     end).
 
+%% A body four times the send-queue ceiling, written in 1 MiB pieces to a
+%% client whose windows are small: the server is refused and sends each
+%% refused piece again, and the client receives every byte exactly once.
+a_refused_piece_is_sent_once_on_retry(Config) ->
+    true = register(?PROBE, self()),
+    with_server(Config, fun(Port) ->
+        {ok, Conn} = quic_h3:connect("127.0.0.1", Port, #{
+            verify => false,
+            sync => true,
+            quic_opts => #{max_stream_data_bidi_local => 65536, max_data => 262144}
+        }),
+        {ok, StreamId} = quic_h3:request(Conn, headers(<<"GET">>, <<"/retried">>)),
+        {200, Body} = response(Conn, StreamId),
+        ?assertEqual(?RETRIED, byte_size(Body)),
+        ?assert(Body =:= body(?RETRIED)),
+        Refusals =
+            receive
+                {refusals, N} -> N
+            after ?WAIT_MS -> none
+            end,
+        ?assert(is_integer(Refusals) andalso Refusals > 0),
+        ok = quic_h3:close(Conn),
+        ?assertEqual({closed, normal}, next(Conn))
+    end).
+
 %%====================================================================
 %% Server
 %%====================================================================
@@ -223,6 +254,11 @@ handle(Conn, StreamId, <<"GET">>, <<"/small">>, _Headers) ->
 handle(Conn, StreamId, <<"GET">>, <<"/unbounded">>, _Headers) ->
     ok = quic_h3:send_response(Conn, StreamId, 200, []),
     send_chunks(Conn, StreamId, ?UNBOUNDED);
+handle(Conn, StreamId, <<"GET">>, <<"/retried">>, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 200, []),
+    Refusals = send_pieces(Conn, StreamId, body(?RETRIED), 0),
+    ?PROBE ! {refusals, Refusals},
+    ok;
 handle(Conn, StreamId, <<"POST">>, <<"/upload">>, _Headers) ->
     Buffered =
         case quic_h3:set_stream_handler(Conn, StreamId, self()) of
@@ -238,6 +274,23 @@ send_chunks(Conn, StreamId, Left) when Left =< ?CHUNK ->
 send_chunks(Conn, StreamId, Left) ->
     ok = send(Conn, StreamId, binary:copy(<<"u">>, ?CHUNK), false),
     send_chunks(Conn, StreamId, Left - ?CHUNK).
+
+%% Send Body in ?CHUNK pieces, retrying a refused piece as the HTTP/3
+%% guide shows. Returns how many times a piece was refused.
+send_pieces(Conn, StreamId, Body, Refusals) when byte_size(Body) =< ?CHUNK ->
+    retry(Conn, StreamId, Body, true, Refusals);
+send_pieces(Conn, StreamId, Body, Refusals) ->
+    <<Piece:?CHUNK/binary, Rest/binary>> = Body,
+    send_pieces(Conn, StreamId, Rest, retry(Conn, StreamId, Piece, false, Refusals)).
+
+retry(Conn, StreamId, Piece, Fin, Refusals) ->
+    case quic_h3:send_data(Conn, StreamId, Piece, Fin) of
+        ok ->
+            Refusals;
+        {error, send_queue_full} ->
+            timer:sleep(10),
+            retry(Conn, StreamId, Piece, Fin, Refusals + 1)
+    end.
 
 %% The connection refuses more once its send queue is full; wait for it
 %% to drain and try again.

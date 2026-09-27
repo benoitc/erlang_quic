@@ -415,10 +415,11 @@ open_unidirectional_stream(Conn) when is_pid(Conn) ->
 %% @doc Send data on a stream.
 %% Fin indicates if this is the final frame on the stream.
 %%
-%% Returns `{error, send_queue_full}' when the stream's send queue is
+%% Returns `{error, send_queue_full}' when the connection's send queue is
 %% already at its ceiling, which is the backpressure signal: the write
 %% did not happen, and the caller should let the connection drain and
-%% retry rather than treat it as a failure.
+%% retry rather than treat it as a failure. The ceiling is shared by
+%% every stream of the connection.
 -spec send_data(Conn, StreamId, Data, Fin) -> ok | {error, send_queue_full | term()} when
     Conn :: pid(),
     StreamId :: non_neg_integer(),
@@ -448,6 +449,8 @@ send_data(Conn, StreamId, Data, Fin, Timeout) when is_pid(Conn) ->
 %% @doc Send data on a stream asynchronously (fire-and-forget).
 %% This is faster than send_data/4 because it uses cast instead of call,
 %% avoiding the round-trip latency. However, errors are silently dropped.
+%% The send-queue ceiling does not apply: an async write is always queued,
+%% so a caller that writes faster than the peer reads grows the queue.
 %% Use this for high-throughput scenarios where occasional dropped data is acceptable.
 -spec send_data_async(Conn, StreamId, Data, Fin) -> ok when
     Conn :: pid(),

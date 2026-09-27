@@ -13,7 +13,7 @@ Add erlang_quic to your `rebar.config` dependencies:
 
 ```erlang
 {deps, [
-    {quic, {git, "https://github.com/benoitc/erlang_quic.git", {tag, "2.0.1"}}}
+    {quic, {git, "https://github.com/benoitc/erlang_quic.git", {tag, "2.0.2"}}}
 ]}.
 ```
 

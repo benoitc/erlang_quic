@@ -11,7 +11,7 @@ located by line, so this survives the file changing underneath it.
 
 ```
 quic:send_data/4
-  -> quic_connection:do_send_data/4        flow control, fragmentation
+  -> quic_connection:do_send_data/5        admission, flow control, fragmentation
      -> queue_stream_data/5                when blocked: park it, priority queue
      -> send_stream_chunk_run/8            bulk: many chunks, one bookkeeping pass
      -> send_app_packet_internal/3         one frame, maybe coalesced
@@ -21,12 +21,16 @@ quic:send_data/4
 
 ## Stage by stage
 
-**`do_send_data/4`** is the entry point for a stream write. It checks connection
-and stream flow control, and fragments data larger than one packet can carry.
-Three outcomes: send now, queue because the congestion window or the peer's
-window has no room, or reject when the send queue is full.
+**`do_send_data/5`** is the entry point for a stream write. It first admits the
+write against the connection's 16 MiB send-queue ceiling, before anything is
+sent: a write that would cross it is refused whole with `send_queue_full`, and
+the connection state is left untouched. Async writes are always admitted. An
+admitted write then goes through connection and stream flow control, and is
+fragmented when larger than one packet can carry. It is sent now, or queued
+because the congestion window or the peer's window has no room.
 
-**`queue_stream_data/5`** parks a write that cannot go now. Entries live in a
+**`queue_stream_data/5`** parks a write that cannot go now. It never refuses:
+part of the write may already be on the wire by then. Entries live in a
 bucket-per-urgency priority queue (RFC 9218, urgency 0 to 7), so insertion is
 constant time and the drain order matches stream priority. `send_queue_bytes`,
 `send_queue_count` and `send_queue_version` track it; the count, not the byte

@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.2] - 2026-09-27
+
+### Fixed
+- `{error, send_queue_full}` from `quic:send_data/4,5` and
+  `quic_h3:send_data/3,4` now means nothing was written. A write larger
+  than one packet could already have sent part of itself before being
+  refused, and the connection then forgot those packets, so the retry
+  reused their packet numbers and loss recovery never covered them. The
+  ceiling is now checked once, before anything is sent, and it is per
+  connection. `quic:send_data_async/4` is never refused, and a queued
+  remainder is no longer dropped when the queue is over the ceiling.
+- A refused HTTP/3 HEADERS, trailers or PUSH_PROMISE write keeps the QPACK
+  encoder state once its encoder instructions were sent, so the peer's
+  decoder stays in step.
+
 ## [2.0.1] - 2026-09-25
 
 ### Fixed

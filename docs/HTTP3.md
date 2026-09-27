@@ -972,10 +972,12 @@ quic_h3:send_data(Conn, StreamId, <<"{\"key\":\"value\"}">>, true),
 
 ### Backpressure on a large body
 
-`send_data/4` returns `{error, send_queue_full}` when the stream's send
+`send_data/4` returns `{error, send_queue_full}` when the connection's send
 queue is already at its ceiling. Nothing was written, so send the same
 piece again once the connection has drained rather than treating it as a
-failure:
+failure. The ceiling is per connection, not per stream: a slow stream can
+make writes on another stream of the same connection return
+`send_queue_full`.
 
 ```erlang
 send_body(Conn, StreamId, <<>>) ->

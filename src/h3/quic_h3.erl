@@ -409,7 +409,7 @@ send_data(Conn, StreamId, Data) ->
 %%
 %% Set `Fin' to `true' to indicate the end of the body.
 %%
-%% Returns `{error, send_queue_full}' when the stream's send queue is
+%% Returns `{error, send_queue_full}' when the connection's send queue is
 %% full. Nothing was written; wait for the connection to drain and send
 %% the same piece again.
 %% @end

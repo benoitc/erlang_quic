@@ -59,7 +59,12 @@
     await_spare_cid/2,
     local_cids/1,
     pending_frames/1,
-    ack_counters/1
+    ack_counters/1,
+    state_for_admission/4,
+    send_snapshot/2,
+    datagrams_out/1,
+    queue_head/1,
+    queue_stream/4
 ]).
 
 %% Update the spin-bit tracking state from a received 1-RTT packet.
@@ -362,6 +367,8 @@ state_get(#state{} = S, pacing_timer) -> S#state.pacing_timer.
 
 state_set(#state{} = S, loss_state, V) ->
     S#state{loss_state = V};
+state_set(#state{} = S, send_queue_bytes, V) ->
+    S#state{send_queue_bytes = V};
 state_set(#state{} = S, pto_scheduled_at, V) ->
     S#state{pto_scheduled_at = V};
 state_set(#state{} = S, peer_active_cid_limit, V) ->
@@ -619,7 +626,7 @@ requeued_offsets(Where) ->
         burst_budget = 1,
         burst_sent = 1
     },
-    {ok, S1} = quic_connection:queue_stream_data(0, 1000, <<0:8000>>, false, S0, back),
+    S1 = quic_connection:queue_stream_data(0, 1000, <<0:8000>>, false, S0, back),
     Ctx = {chunked_ctx, 1200, 3, 1200, <<>>, <<>>, Where},
     {S2, 0} = quic_connection:send_stream_chunked_step(0, 0, <<0:8000>>, false, S1, 0, Ctx),
     %% The step arms a zero-delay continuation by messaging this process.
@@ -763,3 +770,55 @@ datagrams_sent(Conn) ->
             {ok, [{send_cnt, N}]} = inet:getstat(Port, [send_cnt]),
             N
     end.
+
+%% A connected state with one open stream, the send queue already holding
+%% QueueBytes and the peer's windows set to StreamWindow / ConnWindow.
+%% Pacing and coalescing are off, so a sealed packet reaches the socket
+%% at once and the congestion window alone limits a burst.
+-spec state_for_admission(
+    non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()
+) -> #state{}.
+state_for_admission(StreamId, QueueBytes, StreamWindow, ConnWindow) ->
+    S = state_with_send_stream(StreamId, 0, false),
+    #{StreamId := Stream} = S#state.streams,
+    S#state{
+        streams = #{StreamId => Stream#stream_state{send_max_data = StreamWindow}},
+        max_data_remote = ConnWindow,
+        send_queue_bytes = QueueBytes,
+        pacing_enabled = false,
+        coalesce = false
+    }.
+
+%% The parts of the state a refused write must leave alone.
+-spec send_snapshot(#state{}, non_neg_integer()) -> map().
+send_snapshot(#state{pn_app = PN, streams = Streams} = S, StreamId) ->
+    #{StreamId := #stream_state{send_offset = SendOffset}} = Streams,
+    #{
+        next_pn => PN#pn_space.next_pn,
+        loss_state => S#state.loss_state,
+        cc_state => S#state.cc_state,
+        send_queue_bytes => S#state.send_queue_bytes,
+        send_queue_count => S#state.send_queue_count,
+        send_offset => SendOffset,
+        data_sent => S#state.data_sent
+    }.
+
+%% Datagrams handed to the state's socket so far.
+-spec datagrams_out(#state{}) -> non_neg_integer().
+datagrams_out(#state{socket = Socket}) ->
+    {ok, [{send_cnt, N}]} = inet:getstat(Socket, [send_cnt]),
+    N.
+
+-spec queue_head(#state{}) -> term().
+queue_head(#state{send_queue = PQ}) ->
+    quic_pqueue:peek(PQ).
+
+%% Queue Data at Offset and advance the stream's send offset past it, as
+%% a congestion-blocked write leaves it.
+-spec queue_stream(#state{}, non_neg_integer(), non_neg_integer(), binary()) -> #state{}.
+queue_stream(State, StreamId, Offset, Data) ->
+    S1 = quic_connection:queue_stream_data(StreamId, Offset, Data, false, State),
+    #{StreamId := Stream} = S1#state.streams,
+    S1#state{
+        streams = #{StreamId => Stream#stream_state{send_offset = Offset + byte_size(Data)}}
+    }.
