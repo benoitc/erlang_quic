@@ -35,6 +35,9 @@
 -define(PAYLOAD_BYTES, 256 * 1024).
 %% Long enough for the window to fill and for loss detection to run.
 -define(BLACKHOLE_MS, 1500).
+%% Largest datagram the connection sends; a window with less room than
+%% this left is full.
+-define(MAX_DATAGRAM, 1500).
 %% Budget for the whole transfer once the path is back. Recovery takes
 %% well under a second when it works at all; this is deliberately loose
 %% so the case fails on a stall rather than on a slow machine.
@@ -82,10 +85,10 @@ recovers_after_the_window_is_stranded(_Config) ->
 
         Stranded = path_stats(Conn),
         ct:pal("at the end of the outage: ~p", [Stranded]),
-        %% The premise: the window really is full. Without it the
-        %% assertion below would pass on a connection that simply had
-        %% nothing outstanding.
-        ?assert(maps:get(bytes_in_flight, Stranded) >= maps:get(cwnd, Stranded)),
+        %% The premise: the window really is full, with no room for one
+        %% more datagram. Without it the assertion below would pass on a
+        %% connection that simply had nothing outstanding.
+        ?assert(maps:get(cwnd, Stranded) - maps:get(bytes_in_flight, Stranded) < ?MAX_DATAGRAM),
 
         Restored = erlang:monotonic_time(millisecond),
         Bridge ! heal,

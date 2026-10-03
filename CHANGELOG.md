@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.1] - 2026-10-04
+
+### Fixed
+- HTTP/3 streams already open keep working after a GOAWAY, sent or
+  received (RFC 9114 Section 5.2). `quic_h3:cancel/2,3` sent nothing, the
+  peer's RESET_STREAM and STOP_SENDING were never reported, and calls such
+  as `send_trailers/3`, `send_response/4` or `get_quic_conn/1` waited out
+  their timeout. Only new requests are refused. A call the connection
+  does not know is answered with `{error, unknown_call}` in every live
+  state instead of being dropped.
+- GOAWAY from both endpoints. A server that had sent GOAWAY closed with
+  H3_ID_ERROR when the client answered with its own, or rejected every
+  new stream. The identifier the peer sent is now kept apart from the one
+  we sent, either side can answer the other's GOAWAY with
+  `quic_h3:goaway/1`, and a server refuses new pushes once the client's
+  GOAWAY arrives.
+
 ## [2.1.0] - 2026-09-28
 
 ### Added
