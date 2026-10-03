@@ -639,6 +639,11 @@ jobs:
           QUIC_QUICGO_HOST: 127.0.0.1
           QUIC_QUICGO_PORT: 4434
 
+      # GOAWAY from both endpoints against aioquic, quic-go and quiche, in
+      # both roles. The client images are built by the suite itself.
+      - name: Run GOAWAY interop tests
+        run: rebar3 ct --suite=quic_h3_goaway_interop_SUITE
+
       - name: Run client compliance and stream reassembly tests
         run: rebar3 ct --suite=quic_client_compliance_SUITE,quic_stream_reassembly_SUITE
 

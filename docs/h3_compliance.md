@@ -59,6 +59,7 @@ All tests live under `test/`; module names in the table are bare
 | §5.2 | GOAWAY client-sent ID is a push ID | `quic_h3_compliance_tests:goaway_server_receives_any_push_id_accepted_test` ✓ |
 | §5.2 | GOAWAY blocks new requests above threshold | `quic_h3_compliance_tests:goaway_blocks_new_request_stream_test` ✓ |
 | §5.2 | Streams below the GOAWAY ID keep running: cancel, reset, trailers, response, calls | `quic_h3_goaway_SUITE` ✓ |
+| §5.2 | GOAWAY from both endpoints: the peer's ID is tracked apart from ours, each side may answer the other's | `quic_h3_compliance_tests:goaway_received_after_sent_*_test`, `quic_h3_event_forwarding_tests`, `quic_h3_goaway_SUITE:goaway_from_both_sides`, `quic_h3_goaway_interop_SUITE` (aioquic, quic-go, quiche) ✓ |
 | §7.2.3 | CANCEL_PUSH with push id > MAX_PUSH_ID → `H3_ID_ERROR` | `quic_h3_compliance_tests:cancel_push_above_max_push_id_is_id_error_test` ✓ |
 
 ### §6 Stream Handling
