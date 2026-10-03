@@ -577,7 +577,7 @@ jobs:
         run: rebar3 compile
 
       - name: Run H3 E2E tests
-        run: rebar3 ct --suite=quic_h3_e2e_SUITE
+        run: rebar3 ct --suite=quic_h3_e2e_SUITE,quic_h3_goaway_SUITE
 
   interop:
     name: Interop Tests

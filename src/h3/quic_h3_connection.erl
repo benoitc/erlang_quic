@@ -998,41 +998,122 @@ connected(
         {error, Reason, State1} ->
             handle_connection_error(Reason, State1)
     end;
-connected(
+connected({call, From}, {request, Headers, Opts}, #state{role = client} = State) ->
+    case send_request(Headers, Opts, State) of
+        {ok, StreamId, State1} ->
+            {keep_state, State1, [{reply, From, {ok, StreamId}}]};
+        {error, Reason} ->
+            {keep_state_and_data, [{reply, From, {error, Reason}}]};
+        {error, Reason, State1} ->
+            {keep_state, State1, [{reply, From, {error, Reason}}]}
+    end;
+connected({call, From}, {request, _Headers, _Opts}, #state{role = server}) ->
+    {keep_state_and_data, [{reply, From, {error, server_cannot_request}}]};
+connected(cast, goaway, State) ->
+    case send_goaway(State) of
+        {ok, State1} ->
+            {next_state, goaway_sent, State1};
+        {error, Reason} ->
+            close_with({goaway_failed, Reason}, State)
+    end;
+connected(EventType, Event, State) ->
+    live_event(EventType, Event, State).
+
+%%====================================================================
+%% State: goaway_sent
+%%====================================================================
+
+goaway_sent(enter, _OldState, #state{owner = Owner, goaway_id = GoawayId}) ->
+    Owner ! {quic_h3, self(), {goaway_sent, GoawayId}},
+    keep_state_and_data;
+goaway_sent(
+    info,
+    {quic, QuicConn, {stream_data, StreamId, Data, Fin}},
+    #state{quic_conn = QuicConn} = State
+) ->
+    %% Continue processing existing streams
+    case handle_stream_data(StreamId, Data, Fin, State) of
+        {ok, State1} ->
+            maybe_close_if_drained(State1);
+        {error, Reason, State1} ->
+            handle_connection_error(Reason, State1)
+    end;
+goaway_sent({call, From}, {request, _Headers, _Opts}, _State) ->
+    {keep_state_and_data, [{reply, From, {error, goaway_sent}}]};
+goaway_sent(EventType, Event, State) ->
+    live_event(EventType, Event, State).
+
+%%====================================================================
+%% State: goaway_received
+%%====================================================================
+
+goaway_received(enter, _OldState, #state{owner = Owner, goaway_id = GoawayId}) ->
+    Owner ! {quic_h3, self(), {goaway, GoawayId}},
+    keep_state_and_data;
+goaway_received(
+    info,
+    {quic, QuicConn, {stream_data, StreamId, Data, Fin}},
+    #state{quic_conn = QuicConn} = State
+) ->
+    case handle_stream_data(StreamId, Data, Fin, State) of
+        {ok, State1} ->
+            maybe_close_if_drained(State1);
+        {error, Reason, State1} ->
+            handle_connection_error(Reason, State1)
+    end;
+goaway_received({call, From}, {request, _Headers, _Opts}, _State) ->
+    {keep_state_and_data, [{reply, From, {error, goaway_received}}]};
+goaway_received({call, From}, {push, _RequestStreamId, _Headers}, #state{role = server}) ->
+    %% RFC 9114 Section 5.2: a client's GOAWAY names the first push ID it
+    %% will not accept, and every push allocated from here on is at or
+    %% beyond it.
+    {keep_state_and_data, [{reply, From, {error, goaway_received}}]};
+goaway_received(EventType, Event, State) ->
+    live_event(EventType, Event, State).
+
+%%====================================================================
+%% Events shared by connected, goaway_sent and goaway_received
+%%====================================================================
+
+%% RFC 9114 Section 5.2: streams below the GOAWAY identifier keep running
+%% after a GOAWAY, so everything that acts on an existing stream is handled
+%% the same way in all three states. Only new requests differ.
+live_event(
     info,
     {quic, QuicConn, {new_stream, StreamId, Type}},
     #state{quic_conn = QuicConn} = State
 ) ->
+    %% handle_new_stream/3 rejects streams at or beyond the GOAWAY ID.
     case handle_new_stream(StreamId, Type, State) of
         {ok, State1} ->
             {keep_state, State1};
         {error, Reason} ->
             handle_connection_error(Reason, State)
     end;
-connected(
+live_event(
     info,
     {quic, QuicConn, {stream_reset, StreamId, ErrorCode}},
     #state{quic_conn = QuicConn} = State
 ) ->
     handle_peer_reset(StreamId, ErrorCode, State);
-connected(
+live_event(
     info,
     {quic, QuicConn, {stop_sending, StreamId, ErrorCode}},
     #state{quic_conn = QuicConn} = State
 ) ->
     {keep_state, handle_peer_stop_sending(StreamId, ErrorCode, State)};
-connected(
+live_event(
     info,
     {quic, QuicConn, {datagram, Data}},
     #state{quic_conn = QuicConn} = State
 ) ->
     deliver_h3_datagram(Data, State),
     {keep_state, State};
-connected({call, From}, {send_h3_datagram, StreamId, Data}, State) ->
+live_event({call, From}, {send_h3_datagram, StreamId, Data}, State) ->
     {keep_state, State, [{reply, From, h3_send_datagram(StreamId, Data, State)}]};
-connected({call, From}, h3_datagrams_enabled, State) ->
+live_event({call, From}, h3_datagrams_enabled, State) ->
     {keep_state, State, [{reply, From, h3_datagrams_live(State)}]};
-connected(
+live_event(
     {call, From},
     {h3_max_datagram_size, StreamId},
     #state{quic_conn = QuicConn} = State
@@ -1048,25 +1129,14 @@ connected(
                 end
         end,
     {keep_state, State, [{reply, From, Reply}]};
-connected({call, From}, {request, Headers, Opts}, #state{role = client} = State) ->
-    case send_request(Headers, Opts, State) of
-        {ok, StreamId, State1} ->
-            {keep_state, State1, [{reply, From, {ok, StreamId}}]};
-        {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]};
-        {error, Reason, State1} ->
-            {keep_state, State1, [{reply, From, {error, Reason}}]}
-    end;
-connected({call, From}, {request, _Headers, _Opts}, #state{role = server}) ->
-    {keep_state_and_data, [{reply, From, {error, server_cannot_request}}]};
-connected({call, From}, {open_bidi_stream, SignalType}, State) ->
+live_event({call, From}, {open_bidi_stream, SignalType}, State) ->
     case do_open_bidi_stream(SignalType, State) of
         {ok, StreamId, State1} ->
             {keep_state, State1, [{reply, From, {ok, StreamId}}]};
         {error, Reason} ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
-connected({call, From}, {send_response, StreamId, Status, Headers}, State) ->
+live_event({call, From}, {send_response, StreamId, Status, Headers}, State) ->
     case do_send_response(StreamId, Status, Headers, State) of
         {ok, State1} ->
             {keep_state, State1, [{reply, From, ok}]};
@@ -1075,20 +1145,20 @@ connected({call, From}, {send_response, StreamId, Status, Headers}, State) ->
         {error, Reason, State1} ->
             {keep_state, State1, [{reply, From, {error, Reason}}]}
     end;
-connected({call, From}, {send_data, StreamId, Data, Fin}, State) ->
+live_event({call, From}, {send_data, StreamId, Data, Fin}, State) ->
     write_reply(From, StreamId, do_send_data(StreamId, Data, Fin, State), State);
-connected({call, From}, {respond, StreamId, Status, Headers, Body}, State) ->
+live_event({call, From}, {respond, StreamId, Status, Headers, Body}, State) ->
     write_reply(From, StreamId, do_respond(StreamId, Status, Headers, Body, State), State);
-connected({call, From}, {send_trailers, StreamId, Trailers}, State) ->
+live_event({call, From}, {send_trailers, StreamId, Trailers}, State) ->
     write_reply(From, StreamId, do_send_trailers(StreamId, Trailers, State), State);
-connected({call, From}, get_settings, #state{local_settings = Settings}) ->
+live_event({call, From}, get_settings, #state{local_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
-connected({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
+live_event({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
     {keep_state_and_data, [{reply, From, Settings}]};
-connected({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
+live_event({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 %% Server Push API
-connected({call, From}, {push, RequestStreamId, Headers}, #state{role = server} = State) ->
+live_event({call, From}, {push, RequestStreamId, Headers}, #state{role = server} = State) ->
     case do_push(RequestStreamId, Headers, State) of
         {ok, PushId, State1} ->
             {keep_state, State1, [{reply, From, {ok, PushId}}]};
@@ -1097,9 +1167,9 @@ connected({call, From}, {push, RequestStreamId, Headers}, #state{role = server} 
         {error, Reason, State1} ->
             {keep_state, State1, [{reply, From, {error, Reason}}]}
     end;
-connected({call, From}, {push, _RequestStreamId, _Headers}, #state{role = client}) ->
+live_event({call, From}, {push, _RequestStreamId, _Headers}, #state{role = client}) ->
     {keep_state_and_data, [{reply, From, {error, client_cannot_push}}]};
-connected(
+live_event(
     {call, From}, {send_push_response, PushId, Status, Headers}, #state{role = server} = State
 ) ->
     case do_send_push_response(PushId, Status, Headers, State) of
@@ -1110,209 +1180,72 @@ connected(
         {error, Reason, State1} ->
             {keep_state, State1, [{reply, From, {error, Reason}}]}
     end;
-connected({call, From}, {send_push_response, _PushId, _Status, _Headers}, #state{role = client}) ->
+live_event({call, From}, {send_push_response, _PushId, _Status, _Headers}, #state{role = client}) ->
     {keep_state_and_data, [{reply, From, {error, client_cannot_push}}]};
-connected({call, From}, {send_push_data, PushId, Data, Fin}, #state{role = server} = State) ->
+live_event({call, From}, {send_push_data, PushId, Data, Fin}, #state{role = server} = State) ->
     case do_send_push_data(PushId, Data, Fin, State) of
         {ok, State1} ->
             {keep_state, State1, [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
-connected({call, From}, {send_push_data, _PushId, _Data, _Fin}, #state{role = client}) ->
+live_event({call, From}, {send_push_data, _PushId, _Data, _Fin}, #state{role = client}) ->
     {keep_state_and_data, [{reply, From, {error, client_cannot_push}}]};
 %% Client Push API
-connected({call, From}, {set_max_push_id, MaxPushId}, #state{role = client} = State) ->
+live_event({call, From}, {set_max_push_id, MaxPushId}, #state{role = client} = State) ->
     case do_set_max_push_id(MaxPushId, State) of
         {ok, State1} ->
             {keep_state, State1, [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
-connected({call, From}, {set_max_push_id, _MaxPushId}, #state{role = server}) ->
+live_event({call, From}, {set_max_push_id, _MaxPushId}, #state{role = server}) ->
     {keep_state_and_data, [{reply, From, {error, server_cannot_set_max_push_id}}]};
 %% Per-stream handler registration and receive credit
-connected({call, From}, Call, State) when ?STREAM_CALL(Call) ->
+live_event({call, From}, Call, State) when ?STREAM_CALL(Call) ->
     stream_call(From, Call, State);
-connected(cast, {cancel_push, PushId}, #state{role = client} = State) ->
+live_event(
+    {call, From},
+    early_data_accepted,
+    #state{quic_conn = QC} = _State
+) ->
+    {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
+live_event({call, From}, _Call, _State) ->
+    %% A caller must never wait out gen_statem:call/2 on a dropped request.
+    {keep_state_and_data, [{reply, From, {error, unknown_call}}]};
+live_event(cast, {cancel_push, PushId}, #state{role = client} = State) ->
     State1 = do_cancel_push(PushId, State),
     {keep_state, State1};
-connected(cast, {cancel_push, _PushId}, #state{role = server}) ->
+live_event(cast, {cancel_push, _PushId}, #state{role = server}) ->
     %% Server can't cancel push as client would
     keep_state_and_data;
-connected(cast, {cancel_stream, StreamId, ErrorCode}, State) ->
+live_event(cast, {cancel_stream, StreamId, ErrorCode}, State) ->
     State1 = do_cancel_stream(StreamId, ErrorCode, State),
     {keep_state, State1};
-connected(cast, goaway, State) ->
-    case send_goaway(State) of
-        {ok, State1} ->
-            {next_state, goaway_sent, State1};
-        {error, Reason} ->
-            close_with({goaway_failed, Reason}, State)
-    end;
-connected(cast, close, State) ->
+live_event(cast, close, State) ->
     close_with(normal, State);
-connected(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
+live_event(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
     {keep_state, tell_send_ready(State)};
-connected(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
+live_event(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
-connected(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
+live_event(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
     handle_quic_down(Reason, State);
-connected(info, {'DOWN', Ref, process, _Pid, _Reason}, State) ->
+live_event(info, {'DOWN', Ref, process, _Pid, _Reason}, State) ->
     handler_down(Ref, State);
-connected(
+live_event(
     info,
     {quic, QC, {session_ticket, T}},
     #state{quic_conn = QC} = State
 ) ->
     ok = forward_session_ticket(T, State),
     keep_state_and_data;
-connected(
+live_event(
     info,
     {quic, QC, {early_data_rejected, StreamIds}},
     #state{quic_conn = QC} = State
 ) ->
     {keep_state, forward_early_data_rejected(StreamIds, State)};
-connected(
-    {call, From},
-    early_data_accepted,
-    #state{quic_conn = QC} = _State
-) ->
-    {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
-connected(_EventType, _Event, _State) ->
-    keep_state_and_data.
-
-%%====================================================================
-%% State: goaway_sent
-%%====================================================================
-
-goaway_sent(enter, _OldState, #state{owner = Owner, goaway_id = GoawayId}) ->
-    Owner ! {quic_h3, self(), {goaway_sent, GoawayId}},
-    keep_state_and_data;
-goaway_sent(
-    info,
-    {quic, QuicConn, {new_stream, StreamId, Type}},
-    #state{quic_conn = QuicConn} = State
-) ->
-    %% Route through handle_new_stream so the GOAWAY rejection in
-    %% stream_blocked_by_goaway/3 fires for in-progress drain.
-    case handle_new_stream(StreamId, Type, State) of
-        {ok, State1} -> {keep_state, State1};
-        {error, Reason} -> handle_connection_error(Reason, State)
-    end;
-goaway_sent(
-    info,
-    {quic, QuicConn, {stream_data, StreamId, Data, Fin}},
-    #state{quic_conn = QuicConn} = State
-) ->
-    %% Continue processing existing streams
-    case handle_stream_data(StreamId, Data, Fin, State) of
-        {ok, State1} ->
-            maybe_close_if_drained(State1);
-        {error, Reason, State1} ->
-            handle_connection_error(Reason, State1)
-    end;
-goaway_sent({call, From}, {request, _Headers, _Opts}, _State) ->
-    {keep_state_and_data, [{reply, From, {error, goaway_sent}}]};
-goaway_sent({call, From}, {send_data, StreamId, Data, Fin}, State) ->
-    write_reply(From, StreamId, do_send_data(StreamId, Data, Fin, State), State);
-goaway_sent(cast, close, State) ->
-    close_with(normal, State);
-goaway_sent(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
-    {keep_state, tell_send_ready(State)};
-goaway_sent(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    close_with(owner_down, State);
-goaway_sent(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
-    handle_quic_down(Reason, State);
-goaway_sent(info, {'DOWN', Ref, process, _Pid, _Reason}, State) ->
-    handler_down(Ref, State);
-goaway_sent(
-    info,
-    {quic, QC, {session_ticket, T}},
-    #state{quic_conn = QC} = State
-) ->
-    ok = forward_session_ticket(T, State),
-    keep_state_and_data;
-goaway_sent(
-    info,
-    {quic, QC, {early_data_rejected, StreamIds}},
-    #state{quic_conn = QC} = State
-) ->
-    {keep_state, forward_early_data_rejected(StreamIds, State)};
-goaway_sent(
-    {call, From},
-    early_data_accepted,
-    #state{quic_conn = QC} = _State
-) ->
-    {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
-goaway_sent({call, From}, Call, State) when ?STREAM_CALL(Call) ->
-    stream_call(From, Call, State);
-goaway_sent(_EventType, _Event, _State) ->
-    keep_state_and_data.
-
-%%====================================================================
-%% State: goaway_received
-%%====================================================================
-
-goaway_received(enter, _OldState, #state{owner = Owner, goaway_id = GoawayId}) ->
-    Owner ! {quic_h3, self(), {goaway, GoawayId}},
-    keep_state_and_data;
-goaway_received(
-    info,
-    {quic, QuicConn, {new_stream, StreamId, Type}},
-    #state{quic_conn = QuicConn} = State
-) ->
-    case handle_new_stream(StreamId, Type, State) of
-        {ok, State1} -> {keep_state, State1};
-        {error, Reason} -> handle_connection_error(Reason, State)
-    end;
-goaway_received(
-    info,
-    {quic, QuicConn, {stream_data, StreamId, Data, Fin}},
-    #state{quic_conn = QuicConn} = State
-) ->
-    case handle_stream_data(StreamId, Data, Fin, State) of
-        {ok, State1} ->
-            maybe_close_if_drained(State1);
-        {error, Reason, State1} ->
-            handle_connection_error(Reason, State1)
-    end;
-goaway_received({call, From}, {request, _Headers, _Opts}, _State) ->
-    {keep_state_and_data, [{reply, From, {error, goaway_received}}]};
-goaway_received({call, From}, {send_data, StreamId, Data, Fin}, State) ->
-    write_reply(From, StreamId, do_send_data(StreamId, Data, Fin, State), State);
-goaway_received(cast, close, State) ->
-    close_with(normal, State);
-goaway_received(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
-    {keep_state, tell_send_ready(State)};
-goaway_received(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
-    close_with(owner_down, State);
-goaway_received(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
-    handle_quic_down(Reason, State);
-goaway_received(info, {'DOWN', Ref, process, _Pid, _Reason}, State) ->
-    handler_down(Ref, State);
-goaway_received(
-    info,
-    {quic, QC, {session_ticket, T}},
-    #state{quic_conn = QC} = State
-) ->
-    ok = forward_session_ticket(T, State),
-    keep_state_and_data;
-goaway_received(
-    info,
-    {quic, QC, {early_data_rejected, StreamIds}},
-    #state{quic_conn = QC} = State
-) ->
-    {keep_state, forward_early_data_rejected(StreamIds, State)};
-goaway_received(
-    {call, From},
-    early_data_accepted,
-    #state{quic_conn = QC} = _State
-) ->
-    {keep_state_and_data, [{reply, From, quic:early_data_accepted(QC)}]};
-goaway_received({call, From}, Call, State) when ?STREAM_CALL(Call) ->
-    stream_call(From, Call, State);
-goaway_received(_EventType, _Event, _State) ->
+live_event(_EventType, _Event, _State) ->
     keep_state_and_data.
 
 %%====================================================================
