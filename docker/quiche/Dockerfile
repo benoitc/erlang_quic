@@ -1,7 +1,10 @@
 # Quiche benchmark server for QUIC comparison
-FROM rust:1.86-alpine AS builder
+# Debian rather than Alpine: quiche's BoringSSL bindings run bindgen, which
+# dlopens libclang, and musl build scripts are statically linked.
+FROM rust:1.97-slim-bookworm AS builder
 
-RUN apk add --no-cache musl-dev cmake make perl g++ linux-headers
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake make perl g++ git clang libclang-dev pkg-config
 
 WORKDIR /build
 
@@ -11,9 +14,9 @@ COPY src ./src
 RUN cargo build --release
 
 # Runtime image
-FROM alpine:latest
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache ca-certificates netcat-openbsd
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates netcat-openbsd
 
 COPY --from=builder /build/target/release/quiche-bench-server /usr/local/bin/
 
