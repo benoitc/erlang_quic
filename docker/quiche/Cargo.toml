@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 
 [dependencies]
-quiche = "0.23"
+quiche = "0.30"
 ring = "0.17"
 log = "0.4"
 env_logger = "0.11"

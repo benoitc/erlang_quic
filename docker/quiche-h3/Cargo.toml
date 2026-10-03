@@ -12,7 +12,7 @@ name = "quiche-h3-client"
 path = "src/bin/client.rs"
 
 [dependencies]
-quiche = "0.23"
+quiche = "0.30"
 ring = "0.17"
 log = "0.4"
 env_logger = "0.11"
