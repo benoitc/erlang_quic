@@ -217,13 +217,17 @@ get_loss_time_needs_an_acknowledgement_test() ->
     S1 = quic_loss:on_packet_sent(app, quic_loss:new(), 0, 100, true),
     ?assertEqual(none, quic_loss:get_loss_time_and_space(S1)).
 
+%% Packet 0 is overtaken by the acknowledgement of packet 1, so it gets a
+%% time-threshold deadline: its send time plus 9/8 of the RTT. Times are
+%% pinned rather than sampled from the clock, so a stalled runner cannot
+%% let the deadline pass before the assertion looks for it.
 get_loss_time_with_packets_test() ->
-    S1 = quic_loss:on_packet_sent(app, quic_loss:new(), 0, 100, true),
-    S2 = quic_loss:on_packet_sent(app, S1, 1, 100, true),
-    {S3, _Acked, _Lost, _Meta} = quic_loss:on_ack_received(
-        app, S2, {ack, 1, 0, 0, []}, erlang:monotonic_time(millisecond)
-    ),
-    ?assertMatch({_LossTime, app}, quic_loss:get_loss_time_and_space(S3)).
+    T0 = 1000,
+    S1 = quic_loss:on_packet_sent(app, quic_loss:new(), 0, 100, true, [], T0),
+    S2 = quic_loss:on_packet_sent(app, S1, 1, 100, true, [], T0),
+    {S3, _Acked, [], _Meta} = quic_loss:on_ack_received(app, S2, {ack, 1, 0, 0, []}, T0 + 10),
+    %% First RTT sample: 10ms, so the loss delay is trunc(1.125 * 10).
+    ?assertEqual({T0 + 11, app}, quic_loss:get_loss_time_and_space(S3)).
 
 %%====================================================================
 %% Integration Tests
