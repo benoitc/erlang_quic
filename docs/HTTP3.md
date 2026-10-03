@@ -146,6 +146,8 @@ Initiate graceful shutdown.
 
 Sends a GOAWAY frame to the peer. No new requests will be accepted, but existing streams will complete.
 
+After a GOAWAY, sent or received, `request/2,3` returns `{error, goaway_sent}` or `{error, goaway_received}`. Everything else keeps working on the streams already open: `send_data/4`, `send_trailers/3`, `send_response/4`, `cancel/2,3`, `set_stream_handler/3,4`, the query functions, and the `stream_reset` and `stop_sending` events the peer sends.
+
 #### close/1
 
 Close the connection.
