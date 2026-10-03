@@ -114,6 +114,43 @@ session_ticket_forwarded_from_goaway_received_test_() ->
         stop_h3(H3Conn, FakeQuicConn)
     end}.
 
+%% The peer's GOAWAY arriving after ours is reported and the drain goes
+%% on: with nothing open the connection closes normally rather than with
+%% an ID error from comparing the peer's ID with the one we sent.
+peer_goaway_after_local_goaway_test_() ->
+    {setup, fun setup/0, fun teardown/1, fun() ->
+        FakeQuicConn = spawn_link(fun fake_quic_loop/0),
+        {ok, H3Conn} = start_client_h3(FakeQuicConn),
+        drive_to_connected(H3Conn, FakeQuicConn),
+        ok = quic_h3_connection:goaway(H3Conn),
+        wait_state(H3Conn, goaway_sent, 500),
+        assert_owner_message({goaway_sent, 0}, H3Conn, 500),
+        send_peer_goaway(H3Conn, FakeQuicConn, 8),
+        assert_owner_message({goaway, 8}, H3Conn, 500),
+        assert_owner_message({closed, normal}, H3Conn, 500),
+        stop_h3(H3Conn, FakeQuicConn)
+    end}.
+
+%% Our GOAWAY after the peer's goes out on the control stream and is
+%% reported, while the connection keeps draining.
+local_goaway_after_peer_goaway_test_() ->
+    {setup, fun setup/0, fun teardown/1, fun() ->
+        FakeQuicConn = spawn_link(fun fake_quic_loop/0),
+        {ok, H3Conn} = start_client_h3(FakeQuicConn),
+        drive_to_connected(H3Conn, FakeQuicConn),
+        send_peer_goaway(H3Conn, FakeQuicConn, 8),
+        wait_state(H3Conn, goaway_received, 500),
+        assert_owner_message({goaway, 8}, H3Conn, 500),
+        ok = quic_h3_connection:goaway(H3Conn),
+        assert_owner_message({goaway_sent, 0}, H3Conn, 500),
+        %% The control stream is the first unidirectional stream opened.
+        ?assert(
+            meck:called(quic, send_data, ['_', 2, quic_h3_frame:encode_goaway(0), false])
+        ),
+        ?assertEqual(goaway_received, current_state(H3Conn)),
+        stop_h3(H3Conn, FakeQuicConn)
+    end}.
+
 session_ticket_forwarded_from_goaway_sent_test_() ->
     {setup, fun setup/0, fun teardown/1, fun() ->
         FakeQuicConn = spawn_link(fun fake_quic_loop/0),

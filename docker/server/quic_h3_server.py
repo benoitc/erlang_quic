@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 
 from aioquic.asyncio import QuicConnectionProtocol, serve
-from aioquic.h3.connection import H3_ALPN, H3Connection
+from aioquic.buffer import encode_uint_var
+from aioquic.h3.connection import H3_ALPN, FrameType, H3Connection, encode_frame
 from aioquic.h3.events import (
     HeadersReceived,
     DataReceived,
@@ -218,12 +219,21 @@ class HttpServerProtocol(QuicConnectionProtocol):
             self._send_with_trailers(stream_id, request)
             return
         elif path == "/goaway":
-            # Test GOAWAY
-            self._http.send_goaway(0)
+            # aioquic has no API to send GOAWAY: write the frame on the
+            # control stream, naming the next client request stream. The
+            # body ends only after a hold, so the client has the GOAWAY
+            # while its request is still in flight.
+            self._quic.send_stream_data(
+                self._http._local_control_stream_id,
+                encode_frame(FrameType.GOAWAY, encode_uint_var(stream_id + 4)),
+            )
+            self._http.send_headers(
+                stream_id, [(b":status", b"200"), (b"content-type", b"text/plain")]
+            )
+            self._http.send_data(stream_id, b"partial", end_stream=False)
             self.transmit()
-            body = b"GOAWAY sent"
-            status = 200
-            content_type = b"text/plain"
+            asyncio.get_event_loop().call_later(0.5, self._finish_body, stream_id)
+            return
         elif method == "HEAD":
             # HEAD request - read file for content-length but don't send body
             body, status, content_type = self._read_file(path)
@@ -242,6 +252,10 @@ class HttpServerProtocol(QuicConnectionProtocol):
             content_type = b"text/plain"
 
         self._send_simple_response(stream_id, status, content_type, body)
+
+    def _finish_body(self, stream_id: int) -> None:
+        self._http.send_data(stream_id, b" and done", end_stream=True)
+        self.transmit()
 
     def _reset_stream(self, stream_id: int, code: int) -> None:
         logger.info(f"Stream {stream_id}: sending RESET_STREAM {code}")

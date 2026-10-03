@@ -25,7 +25,8 @@
     peer_reset_after_goaway_reaches_owner/1,
     trailers_after_goaway_reach_the_server/1,
     response_after_goaway_sent_reaches_client/1,
-    calls_after_goaway_are_answered/1
+    calls_after_goaway_are_answered/1,
+    goaway_from_both_sides/1
 ]).
 
 %% H3_REQUEST_CANCELLED (RFC 9114 Section 8.1).
@@ -44,7 +45,8 @@ all() ->
         peer_reset_after_goaway_reaches_owner,
         trailers_after_goaway_reach_the_server,
         response_after_goaway_sent_reaches_client,
-        calls_after_goaway_are_answered
+        calls_after_goaway_are_answered,
+        goaway_from_both_sides
     ].
 
 init_per_suite(Config) ->
@@ -138,6 +140,25 @@ calls_after_goaway_are_answered(Config) ->
         ?assert(is_map(quic_h3:get_peer_settings(Conn))),
         ?assertEqual(ok, quic_h3:set_stream_handler(Conn, StreamId, self())),
         ?assertEqual({error, unknown_call}, gen_statem:call(Conn, no_such_call, 1000)),
+        quic_h3:close(Conn)
+    end).
+
+%% The client answers the server's GOAWAY with its own. The server owner
+%% hears it, the connection keeps draining, and the held request can
+%% still be cancelled.
+goaway_from_both_sides(Config) ->
+    with_server(Config, fun(Port) ->
+        Conn = connect(Port),
+        {ok, StreamId} = quic_h3:request(
+            Conn, headers(<<"POST">>, <<"/hold">>), #{end_stream => false}
+        ),
+        ?assertMatch({handler, {goaway_sent, _}}, await(handler)),
+        ?assertMatch({goaway, _}, next(Conn)),
+        ok = quic_h3:goaway(Conn),
+        ?assertEqual({goaway_sent, 0}, next(Conn)),
+        ?assertEqual({server_owner, {goaway, 0}}, await(server_owner)),
+        ok = quic_h3:cancel(Conn, StreamId, ?REQUEST_CANCELLED),
+        ?assertEqual({handler, {stream_reset, StreamId, ?REQUEST_CANCELLED}}, await(handler)),
         quic_h3:close(Conn)
     end).
 
@@ -246,6 +267,7 @@ await(handler) ->
     end;
 await(server_owner) ->
     receive
-        {server_owner, {trailers, _, _}} = T -> T
+        {server_owner, {trailers, _, _}} = T -> T;
+        {server_owner, {goaway, _}} = G -> G
     after ?WAIT_MS -> {server_owner, timeout}
     end.

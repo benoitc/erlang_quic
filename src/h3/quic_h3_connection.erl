@@ -175,7 +175,7 @@
     settings_sent = false :: boolean(),
     settings_received = false :: boolean(),
 
-    %% GOAWAY state
+    %% GOAWAY identifier we sent; the peer's is peer_goaway_id below.
     goaway_id :: stream_id() | undefined,
     last_stream_id = 0 :: stream_id(),
 
@@ -306,7 +306,11 @@
     %% Streams whose last write was refused with send_queue_full, with the
     %% process that made it: told `send_ready' once the QUIC send queue
     %% has drained.
-    send_blocked = #{} :: #{stream_id() => pid()}
+    send_blocked = #{} :: #{stream_id() => pid()},
+
+    %% GOAWAY identifier the peer sent. A different kind of number from
+    %% goaway_id: a server names a stream, a client a push.
+    peer_goaway_id :: non_neg_integer() | undefined
 }).
 
 %%====================================================================
@@ -1035,6 +1039,10 @@ goaway_sent(
     case handle_stream_data(StreamId, Data, Fin, State) of
         {ok, State1} ->
             maybe_close_if_drained(State1);
+        {transition, goaway_received, State1} ->
+            %% Both sides are now draining; the rules are the same here.
+            tell_peer_goaway(State1),
+            maybe_close_if_drained(State1);
         {error, Reason, State1} ->
             handle_connection_error(Reason, State1)
     end;
@@ -1047,8 +1055,8 @@ goaway_sent(EventType, Event, State) ->
 %% State: goaway_received
 %%====================================================================
 
-goaway_received(enter, _OldState, #state{owner = Owner, goaway_id = GoawayId}) ->
-    Owner ! {quic_h3, self(), {goaway, GoawayId}},
+goaway_received(enter, _OldState, State) ->
+    tell_peer_goaway(State),
     keep_state_and_data;
 goaway_received(
     info,
@@ -1063,11 +1071,15 @@ goaway_received(
     end;
 goaway_received({call, From}, {request, _Headers, _Opts}, _State) ->
     {keep_state_and_data, [{reply, From, {error, goaway_received}}]};
-goaway_received({call, From}, {push, _RequestStreamId, _Headers}, #state{role = server}) ->
-    %% RFC 9114 Section 5.2: a client's GOAWAY names the first push ID it
-    %% will not accept, and every push allocated from here on is at or
-    %% beyond it.
-    {keep_state_and_data, [{reply, From, {error, goaway_received}}]};
+goaway_received(cast, goaway, #state{goaway_id = undefined, owner = Owner} = State) ->
+    %% RFC 9114 Section 5.2: an endpoint may answer a GOAWAY with its own.
+    case send_goaway(State) of
+        {ok, #state{goaway_id = Id} = State1} ->
+            Owner ! {quic_h3, self(), {goaway_sent, Id}},
+            {keep_state, State1};
+        {error, Reason} ->
+            close_with({goaway_failed, Reason}, State)
+    end;
 goaway_received(EventType, Event, State) ->
     live_event(EventType, Event, State).
 
@@ -1158,6 +1170,13 @@ live_event({call, From}, get_peer_settings, #state{peer_settings = Settings}) ->
 live_event({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 %% Server Push API
+live_event(
+    {call, From}, {push, _RequestStreamId, _Headers}, #state{role = server, peer_goaway_id = Id}
+) when Id =/= undefined ->
+    %% RFC 9114 Section 5.2: a client's GOAWAY names the first push ID it
+    %% will not accept, and every push allocated from here on is at or
+    %% beyond it.
+    {keep_state_and_data, [{reply, From, {error, goaway_received}}]};
 live_event({call, From}, {push, RequestStreamId, Headers}, #state{role = server} = State) ->
     case do_push(RequestStreamId, Headers, State) of
         {ok, PushId, State1} ->
@@ -1838,15 +1857,15 @@ handle_control_frame({goaway, Id}, #state{role = Role} = State) ->
     %%   client-to-server: push ID (no modular constraint)
     case validate_goaway_id(Role, Id) of
         ok ->
-            case State#state.goaway_id of
+            case State#state.peer_goaway_id of
                 undefined ->
                     State1 = cleanup_blocked_streams_on_goaway(State),
-                    {transition, goaway_received, State1#state{goaway_id = Id}};
+                    {transition, goaway_received, State1#state{peer_goaway_id = Id}};
                 Old when Id > Old ->
                     %% RFC 9114 Section 5.2: GOAWAY ID MUST NOT increase
                     {error, {connection_error, ?H3_ID_ERROR, <<"GOAWAY ID increased">>}};
                 _ ->
-                    {ok, State#state{goaway_id = Id}}
+                    {ok, State#state{peer_goaway_id = Id}}
             end;
         {error, Reason} ->
             {error, {connection_error, ?H3_ID_ERROR, Reason}}
@@ -4875,6 +4894,9 @@ state_record_size() ->
 %% only place the owner is told and it has nothing else to go on.
 close_with(Reason, State) ->
     {next_state, closing, State#state{close_reason = Reason}}.
+
+tell_peer_goaway(#state{owner = Owner, peer_goaway_id = Id}) ->
+    Owner ! {quic_h3, self(), {goaway, Id}}.
 
 maybe_close_if_drained(#state{streams = Streams} = State) when map_size(Streams) =:= 0 ->
     close_with(normal, State);

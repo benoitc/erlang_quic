@@ -394,7 +394,8 @@ make_test_state(Overrides) ->
         has_early_keys => false,
         quic_connected => false,
         close_reason => normal,
-        send_blocked => #{}
+        send_blocked => #{},
+        peer_goaway_id => undefined
     },
     Merged = maps:merge(Default, Overrides),
     {state, maps:get(quic_conn, Merged), maps:get(quic_ref, Merged), maps:get(role, Merged),
@@ -424,4 +425,4 @@ make_test_state(Overrides) ->
         maps:get(bidi_type_buffers, Merged), maps:get(claimed_bidi_streams, Merged),
         maps:get(pending_response_headers, Merged), maps:get(has_early_keys, Merged),
         maps:get(quic_connected, Merged), maps:get(close_reason, Merged),
-        maps:get(send_blocked, Merged)}.
+        maps:get(send_blocked, Merged), maps:get(peer_goaway_id, Merged)}.

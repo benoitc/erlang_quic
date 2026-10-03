@@ -10,6 +10,8 @@ Options:
     --insecure          Skip certificate verification
     --output-dir DIR    Directory to save responses
     --data FILE         File to POST
+    --goaway            Send GOAWAY on the control stream once the response
+                        headers arrive, then finish reading the response
     -v                  Verbose output
 """
 
@@ -22,7 +24,8 @@ from urllib.parse import urlparse
 
 from aioquic.asyncio.client import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
-from aioquic.h3.connection import H3_ALPN, H3Connection
+from aioquic.buffer import encode_uint_var
+from aioquic.h3.connection import H3_ALPN, FrameType, H3Connection, encode_frame
 from aioquic.h3.events import (
     DataReceived,
     HeadersReceived,
@@ -32,14 +35,31 @@ from aioquic.h3.events import (
 from aioquic.quic.configuration import QuicConfiguration
 
 
+# aioquic has no API to send GOAWAY and ignores the ones it receives, so
+# the frame is written on the control stream by hand (RFC 9114 Section 7.2.6).
+SEND_GOAWAY = False
+
+
 class HttpClient(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._http = None
         self._request_events = {}
         self._request_waiter = {}
+        self._goaway_sent = False
+
+    def send_goaway(self, push_id: int) -> None:
+        self._quic.send_stream_data(
+            self._http._local_control_stream_id,
+            encode_frame(FrameType.GOAWAY, encode_uint_var(push_id)),
+        )
+        self._goaway_sent = True
+        print("GOAWAY sent")
 
     def http_event_received(self, event: H3Event):
+        if isinstance(event, HeadersReceived) and SEND_GOAWAY and not self._goaway_sent:
+            self.send_goaway(0)
+            self.transmit()
         if isinstance(event, (HeadersReceived, DataReceived)):
             stream_id = event.stream_id
             if stream_id in self._request_events:
@@ -137,8 +157,14 @@ async def main():
     parser.add_argument("--insecure", action="store_true", help="Skip certificate verification")
     parser.add_argument("--output-dir", help="Directory to save responses")
     parser.add_argument("--data", help="File to POST")
+    parser.add_argument(
+        "--goaway", action="store_true", help="Send GOAWAY once response headers arrive"
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     args = parser.parse_args()
+
+    global SEND_GOAWAY
+    SEND_GOAWAY = args.goaway
 
     # Configure QUIC
     configuration = QuicConfiguration(
