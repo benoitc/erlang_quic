@@ -63,19 +63,48 @@ goaway_first_transitions_state_test() ->
     ?assertMatch({transition, goaway_received, _}, Result).
 
 goaway_id_decrease_ok_test() ->
-    State = make_test_state(#{goaway_id => 8, settings_received => true}),
+    State = make_test_state(#{peer_goaway_id => 8, settings_received => true}),
     Result = quic_h3_connection:handle_control_frame({goaway, 4}, State),
     ?assertMatch({ok, _}, Result).
 
 goaway_id_same_ok_test() ->
-    State = make_test_state(#{goaway_id => 4, settings_received => true}),
+    State = make_test_state(#{peer_goaway_id => 4, settings_received => true}),
     Result = quic_h3_connection:handle_control_frame({goaway, 4}, State),
     ?assertMatch({ok, _}, Result).
 
 goaway_id_increase_error_test() ->
-    State = make_test_state(#{goaway_id => 4, settings_received => true}),
+    State = make_test_state(#{peer_goaway_id => 4, settings_received => true}),
     Result = quic_h3_connection:handle_control_frame({goaway, 8}, State),
     ?assertMatch({error, {connection_error, ?H3_ID_ERROR, _}}, Result).
+
+%% A server that sent GOAWAY with stream ID 8 then receives the client's
+%% GOAWAY with push ID 10. The push ID is not an increase of the stream
+%% ID: it is accepted, and only a later, larger push ID is an error.
+goaway_received_after_sent_is_not_an_increase_test() ->
+    State = make_test_state(#{role => server, goaway_id => 8, settings_received => true}),
+    Result = quic_h3_connection:handle_control_frame({goaway, 10}, State),
+    ?assertMatch({transition, goaway_received, _}, Result),
+    {transition, goaway_received, State1} = Result,
+    ?assertMatch(
+        {error, {connection_error, ?H3_ID_ERROR, _}},
+        quic_h3_connection:handle_control_frame({goaway, 12}, State1)
+    ),
+    ?assertMatch({ok, _}, quic_h3_connection:handle_control_frame({goaway, 10}, State1)).
+
+%% The peer's GOAWAY leaves the ID we sent alone: streams below it are
+%% still accepted, streams at or beyond it still rejected.
+goaway_received_after_sent_keeps_our_id_test() ->
+    Stub = spawn_quic_stub(),
+    State = make_test_state(#{
+        role => server, goaway_id => 8, settings_received => true, quic_conn => Stub
+    }),
+    {transition, goaway_received, State1} =
+        quic_h3_connection:handle_control_frame({goaway, 0}, State),
+    {ok, State2} = quic_h3_connection:handle_new_stream(4, bidirectional, State1),
+    ?assert(maps:is_key(4, element(21, State2))),
+    {ok, State3} = quic_h3_connection:handle_new_stream(8, bidirectional, State2),
+    ?assertNot(maps:is_key(8, element(21, State3))),
+    exit(Stub, normal).
 
 %%====================================================================
 %% Request Validation Tests (RFC 9114 Section 4.1)
@@ -3319,7 +3348,8 @@ make_test_state(Overrides) ->
         has_early_keys => false,
         quic_connected => false,
         close_reason => normal,
-        send_blocked => #{}
+        send_blocked => #{},
+        peer_goaway_id => undefined
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -3353,4 +3383,5 @@ make_test_state(Overrides) ->
         maps:get(claimed_bidi_streams, Merged), maps:get(pending_response_headers, Merged),
         %% 0-RTT bootstrap fields
         maps:get(has_early_keys, Merged), maps:get(quic_connected, Merged),
-        maps:get(close_reason, Merged), maps:get(send_blocked, Merged)}.
+        maps:get(close_reason, Merged), maps:get(send_blocked, Merged),
+        maps:get(peer_goaway_id, Merged)}.

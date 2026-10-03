@@ -86,6 +86,60 @@ services:
     profiles:
       - tools
 
+  # quic-go HTTP/3 server whose /goaway path drains the connection
+  quic-go-h3-goaway:
+    build:
+      context: ./go-h3
+      dockerfile: Dockerfile
+    ports:
+      - "4440:4440/udp"
+    volumes:
+      - ../certs:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "grep -qsi ':1158 ' /proc/net/udp /proc/net/udp6"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # quic-go HTTP/3 client for testing our server
+  quic-go-h3-client:
+    build:
+      context: ./go-h3
+      dockerfile: Dockerfile
+    entrypoint: ["/usr/local/bin/goaway-h3", "client"]
+    network_mode: host
+    profiles:
+      - tools
+
+  # quiche HTTP/3 server that sends GOAWAY on the first request
+  quiche-h3-goaway:
+    build:
+      context: ./quiche-h3
+      dockerfile: Dockerfile
+    ports:
+      - "4441:4441/udp"
+    volumes:
+      - ../certs:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "grep -qsi ':1159 ' /proc/net/udp /proc/net/udp6"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # quiche HTTP/3 client that answers a GOAWAY with its own
+  quiche-h3-client:
+    build:
+      context: ./quiche-h3
+      dockerfile: Dockerfile
+    entrypoint: ["/usr/local/bin/quiche-h3-client"]
+    network_mode: host
+    profiles:
+      - tools
+
   quic-go-server:
     build:
       context: .
