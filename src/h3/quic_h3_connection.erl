@@ -2799,13 +2799,12 @@ handle_request_frame(
                 ok ->
                     %% Send Section Acknowledgment for trailers
                     State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
-                    Stream1 = Stream#h3_stream{
+                    Stream1 = close_half(remote, Stream#h3_stream{
                         trailers = Trailers,
-                        frame_state = complete,
-                        state = half_closed_remote
-                    },
+                        frame_state = complete
+                    }),
                     Owner ! {quic_h3, self(), {trailers, StreamId, Trailers}},
-                    {ok, Stream1, State1};
+                    end_body_after_trailers(StreamId, Stream1, State1);
                 {error, _Reason} ->
                     {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}}
             end;
@@ -3045,7 +3044,7 @@ process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State) ->
             apply_stream_priority(StreamId, Stream1, State1),
             Stream2 = finalize_stream_state(Stream1, Fin, Role),
             notify_headers_received(StreamId, Headers, Stream2, Owner, Role),
-            {ok, Stream2, State1};
+            end_body_with_headers(StreamId, Fin, Stream2, State1);
         {error, {invalid_field, _Field, _Value}} ->
             %% Malformed header field - stream reset (RFC 9114 Section 4.1.2)
             {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}};
@@ -3075,16 +3074,22 @@ notify_headers_received(StreamId, Headers, Stream, Owner, server) ->
     invoke_handler(self(), StreamId, Method, Path, Headers);
 notify_headers_received(StreamId, Headers, Stream, Owner, client) ->
     Status = Stream#h3_stream.status,
-    Owner ! {quic_h3, self(), {response, StreamId, Status, Headers}},
-    %% RFC 9114: if the peer half-closed the stream with the HEADERS frame
-    %% (HEAD, 204, 304, or any response without a body) deliver an empty
-    %% final DATA event so callers see end-of-stream.
-    case Stream#h3_stream.frame_state of
-        complete ->
-            Owner ! {quic_h3, self(), {data, StreamId, <<>>, true}};
-        _ ->
-            ok
-    end.
+    Owner ! {quic_h3, self(), {response, StreamId, Status, Headers}}.
+
+%% HEADERS carrying the FIN end the body as well (a GET, HEAD, 204 or
+%% 304), so the reader gets the same empty fin-marked delivery a bare FIN
+%% brings.
+end_body_with_headers(StreamId, true, Stream, State) ->
+    deliver_body(StreamId, <<>>, true, Stream, State);
+end_body_with_headers(_StreamId, false, Stream, State) ->
+    {ok, Stream, State}.
+
+%% The owner hears the trailers; a server handler reading the body does
+%% not, so it is told the body ended.
+end_body_after_trailers(StreamId, Stream, #state{role = server} = State) ->
+    deliver_body(StreamId, <<>>, true, Stream, State);
+end_body_after_trailers(_StreamId, Stream, State) ->
+    {ok, Stream, State}.
 
 %% Update stream with headers, validating pseudo-headers and parsing values safely
 %% Returns {ok, Stream} | {error, Reason}
@@ -3624,6 +3629,10 @@ maybe_reset_incomplete_request(StreamId, #state{role = server, quic_conn = QuicC
 ->
     case maps:find(StreamId, State#state.streams) of
         {ok, #h3_stream{frame_state = complete}} ->
+            State;
+        {ok, #h3_stream{state = half_closed_local}} ->
+            %% RFC 9114 Section 4.1.1: a complete response may precede the
+            %% end of the request; a reset would abandon its unacked bytes.
             State;
         {ok, _Incomplete} ->
             quic:reset_stream(QuicConn, StreamId, ?H3_REQUEST_INCOMPLETE),
@@ -4218,6 +4227,8 @@ finish_on_fin(Stream, false) ->
 %% closed is finished, and `closed' is what store_stream/3 drops on. The
 %% field used to be assigned rather than combined, so whichever FIN came
 %% last decided the state and no stream ever reached `closed'.
+close_half(_Side, #h3_stream{state = closed} = Stream) ->
+    Stream;
 close_half(remote, #h3_stream{state = half_closed_local} = Stream) ->
     Stream#h3_stream{state = closed};
 close_half(remote, Stream) ->

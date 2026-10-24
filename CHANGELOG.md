@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- An HTTP/3 server handler reading a request body now always learns
+  where the body ends. A request without a body (curl sends every GET
+  this way) or one ending with trailers never signalled its end to the
+  handler, so a handler waiting for the body hung.
+- A server that answers a request before it is fully received, then
+  stops reading it (RFC 9114 Section 4.1.1), no longer resets its own
+  response when the client resets the request. On a lossy link the
+  reset could throw away the end of the response.
+
 ## [2.1.1] - 2026-10-04
 
 ### Fixed
