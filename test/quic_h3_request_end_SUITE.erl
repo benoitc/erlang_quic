@@ -96,7 +96,8 @@ bare_fin_ends_the_body(Config) ->
         quic_h3:close(Conn)
     end).
 
-%% The server answers a request still being sent, then stops reading it.
+%% The server answers a request whose body is still being sent, the way
+%% a server refuses an upload past its size limit, then stops reading it.
 %% The client gets the whole response, and the server does not reset the
 %% stream when the client's RESET_STREAM comes back. Loopback delivers
 %% the response before any reset could catch it, so what is checked is
@@ -108,6 +109,7 @@ early_response_survives_stop_sending(Config) ->
         {ok, StreamId} = quic_h3:request(
             Conn, headers(<<"POST">>, <<"/early">>), #{end_stream => false}
         ),
+        ok = quic_h3:send_data(Conn, StreamId, <<"part of a body">>, false),
         Events = lists:sort([next(Conn), next(Conn), next(Conn)]),
         ?assertMatch(
             [
@@ -150,7 +152,14 @@ handle(Test, Conn, StreamId, _Method, <<"/read">>, _Headers) ->
     Test ! {handler, Result},
     ok = quic_h3:send_response(Conn, StreamId, 200, []),
     quic_h3:send_data(Conn, StreamId, <<>>, true);
+%% Answers once part of the body is in, so the client's send cannot race
+%% the response.
 handle(_Test, Conn, StreamId, <<"POST">>, <<"/early">>, _Headers) ->
+    ok = quic_h3:set_stream_handler(Conn, StreamId, self(), #{drain_buffer => false}),
+    receive
+        {quic_h3, Conn, {data, StreamId, <<_, _/binary>>, false}} -> ok
+    after ?WAIT_MS -> ok
+    end,
     ok = quic_h3:send_response(Conn, StreamId, 413, []),
     ok = quic_h3:send_data(Conn, StreamId, <<"too large">>, true),
     quic:stop_sending(quic_h3:get_quic_conn(Conn), StreamId, ?NO_ERROR).
