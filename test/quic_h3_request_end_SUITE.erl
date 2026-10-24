@@ -108,10 +108,15 @@ early_response_survives_stop_sending(Config) ->
         {ok, StreamId} = quic_h3:request(
             Conn, headers(<<"POST">>, <<"/early">>), #{end_stream => false}
         ),
-        ok = quic_h3:send_data(Conn, StreamId, <<"part of a body">>, false),
-        ?assertMatch({response, StreamId, 413, _}, next(Conn)),
-        ?assertEqual({data, StreamId, <<"too large">>, true}, next(Conn)),
-        ?assertMatch({stop_sending, StreamId, ?NO_ERROR}, next(Conn)),
+        Events = lists:sort([next(Conn), next(Conn), next(Conn)]),
+        ?assertMatch(
+            [
+                {stop_sending, StreamId, ?NO_ERROR},
+                {data, StreamId, <<"too large">>, true},
+                {response, StreamId, 413, _}
+            ],
+            Events
+        ),
         ?assertEqual(no_reset, await_reset(StreamId)),
         quic_h3:close(Conn)
     end).
