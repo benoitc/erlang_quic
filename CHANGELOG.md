@@ -10,7 +10,7 @@ All notable changes to this project will be documented in this file.
   table for the whole VM and accepted by any listener, so a client given
   a ticket by one listener could log in to any other listener in the
   same VM, including one that only admits clients holding its pre-shared
-  key. (GHSA-cv3h-phw9-vfjm, CWE-287). Reported by humdrum00001010.
+  key. (GHSA-cv3h-phw9-vfjm, CWE-287). Found by GPT Cyber.
 - A listener no longer stalls when many connections close at once.
   Each closing connection made the listener scan its whole routing
   table, so a burst of short-lived connections, which anyone can open,
