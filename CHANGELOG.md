@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.1.2] - 2026-10-25
 
 ### Security
 - A session ticket now resumes only on the listener that issued it, for
