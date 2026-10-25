@@ -231,7 +231,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 ### Datagrams (RFC 9221)
 - `quic:send_datagram/2` - Send unreliable datagram
 - `quic:datagram_max_size/1` - Get max datagram size (0 if unsupported)
-- `quic:datagram_stats/1` - Delivered / dropped / sent counters (backpressure)
+- `quic:datagram_stats/1` - Delivered / dropped / sent counters (backpressure); DATAGRAMs that arrive while the owner is behind are dropped
 
 ### HTTP Datagrams (RFC 9297)
 - `quic_h3:send_datagram/3` - Send an HTTP datagram bound to a request stream
@@ -312,7 +312,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `max_stream_data_bidi_remote` - Stream-level limit for streams the peer opens
 - `max_stream_data_uni` - Stream-level limit for unidirectional streams
 - `max_receive_window` - Largest window the receive limits grow to (default: 8 MiB, minimum: 16 KiB)
-- `max_owner_queue` - Receive credit waits while the owner's mailbox holds more messages than this (default: 1000, or `infinity`)
+- `max_owner_queue` - Receive credit waits, and DATAGRAMs are dropped, while the owner's mailbox holds more messages than this (default: 1000, or `infinity`)
 - `max_datagram_frame_size` - Max datagram size to accept (0 = disabled, default: 0)
 - `datagram_recv_queue_len` - Bounded receive queue for inbound datagrams (default: `infinity`; drops oldest on overflow, tracked via `datagram_stats/1`)
 - `reset_stream_at` - Enable RESET_STREAM_AT extension (default: false)

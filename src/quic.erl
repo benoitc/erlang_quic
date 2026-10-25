@@ -614,9 +614,10 @@ datagram_max_size(Conn) when is_pid(Conn) ->
     quic_connection:datagram_max_size(Conn).
 
 %% @doc Get datagram accounting counters.
-%% Returns delivered / dropped_recv / sent / dropped_send counters so
-%% callers can detect back-pressure when `datagram_recv_queue_len'
-%% has been set to a finite value.
+%% Returns delivered / dropped_recv / sent / dropped_send counters.
+%% `dropped_recv' counts DATAGRAMs dropped because the owner's mailbox
+%% held more than `max_owner_queue' messages, or because a finite
+%% `datagram_recv_queue_len' was full.
 -spec datagram_stats(Conn) ->
     #{
         delivered := non_neg_integer(),

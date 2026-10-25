@@ -11,7 +11,8 @@
 %%%
 %%% Each case sends far more than the bound to an owner that is not
 %%% reading, checks what reached its mailbox, then lets it read and
-%%% checks the whole transfer still arrives.
+%%% checks the whole transfer still arrives. DATAGRAMs have no credit,
+%%% so the ones that arrive while the owner is behind are dropped.
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
 %%% Apache License 2.0
@@ -24,6 +25,7 @@
 -export([
     auto_credit_follows_the_owner/1,
     manual_credit_follows_consume/1,
+    datagrams_wait_for_the_owner/1,
     max_owner_queue_is_validated/1
 ]).
 
@@ -33,6 +35,8 @@
 %% plus the windows granted before the limit was reached.
 -define(BOUND, 3 * 1024 * 1024).
 -define(WINDOW, 262144).
+-define(OWNER_QUEUE, 1000).
+-define(DATAGRAMS, 20000).
 
 suite() ->
     [{timetrap, {minutes, 3}}].
@@ -41,6 +45,7 @@ all() ->
     [
         auto_credit_follows_the_owner,
         manual_credit_follows_consume,
+        datagrams_wait_for_the_owner,
         max_owner_queue_is_validated
     ].
 
@@ -61,6 +66,46 @@ auto_credit_follows_the_owner(_Config) ->
 manual_credit_follows_consume(_Config) ->
     %% Only the stream's own credit holds the peer back here.
     transfer(manual, #{max_owner_queue => infinity}).
+
+datagrams_wait_for_the_owner(_Config) ->
+    Test = self(),
+    {ok, Server} = quic_test_echo_server:start(#{
+        max_datagram_frame_size => 1200,
+        connection_handler => fun(_ConnPid, _ConnRef) ->
+            {ok,
+                spawn(fun() ->
+                    Test ! {owner, self()},
+                    receive
+                        stop -> ok
+                    end
+                end)}
+        end
+    }),
+    {ok, Conn} = quic:connect(
+        <<"127.0.0.1">>,
+        maps:get(port, Server),
+        #{verify => false, alpn => [<<"echo">>], max_datagram_frame_size => 1200},
+        self()
+    ),
+    try
+        receive
+            {quic, Conn, {connected, _}} -> ok
+        after 5000 -> ct:fail(not_connected)
+        end,
+        Owner =
+            receive
+                {owner, P} -> P
+            after 5000 -> ct:fail(no_owner)
+            end,
+        Sent = send_datagrams(Conn, ?DATAGRAMS, 0),
+        ?assert(Sent > 2 * ?OWNER_QUEUE),
+        Held = settle_len(Owner, 0, 0),
+        ct:pal("datagrams: sent ~p, owner held ~p", [Sent, Held]),
+        ?assert(Held =< ?OWNER_QUEUE + 1)
+    after
+        quic:close(Conn, normal),
+        quic_test_echo_server:stop(Server)
+    end.
 
 max_owner_queue_is_validated(_Config) ->
     ?assertEqual(
@@ -142,6 +187,29 @@ read(Conn, StreamId, Mode, Acc) ->
                 false -> read(Conn, StreamId, Mode, Acc + byte_size(Data))
             end
     after 10000 -> Acc
+    end.
+
+%% DATAGRAMs the connection accepted for sending, pacing on refusals.
+send_datagrams(_Conn, 0, Sent) ->
+    Sent;
+send_datagrams(Conn, N, Sent) ->
+    case quic:send_datagram(Conn, <<N:32, 0:800>>) of
+        ok ->
+            send_datagrams(Conn, N - 1, Sent + 1);
+        {error, _} ->
+            timer:sleep(1),
+            send_datagrams(Conn, N - 1, Sent)
+    end.
+
+%% The owner's mailbox length once it stops growing for a second.
+settle_len(Owner, Last, Stable) when Stable >= 5 ->
+    _ = Owner,
+    Last;
+settle_len(Owner, Last, Stable) ->
+    timer:sleep(200),
+    case process_info(Owner, message_queue_len) of
+        {message_queue_len, Last} -> settle_len(Owner, Last, Stable + 1);
+        {message_queue_len, Len} -> settle_len(Owner, Len, 0)
     end.
 
 %% Bytes in the owner's mailbox once they stop growing for a second.
