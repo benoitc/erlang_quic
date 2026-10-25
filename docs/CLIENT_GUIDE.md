@@ -87,6 +87,7 @@ packets automatically.
 | `max_stream_data_bidi_remote` | integer | 524288 | Receive limit for streams the peer opens |
 | `max_stream_data_uni` | integer | 524288 | Receive limit for unidirectional streams |
 | `max_receive_window` | integer | 8388608 | Largest window the receive limits grow to; at least 16384 |
+| `max_owner_queue` | integer \| `infinity` | 1000 | Receive credit waits while the owner's mailbox holds more messages than this |
 | `max_streams_bidi` | integer | 100 | Max bidirectional streams |
 | `max_streams_uni` | integer | 100 | Max unidirectional streams |
 
@@ -428,6 +429,28 @@ case maps:get(congested, Info) of
     false -> continue_sending()
 end.
 ```
+
+### Receive Backpressure
+
+The peer can only send as fast as the owner reads. By default a stream
+earns the peer new credit as its data is delivered, and that credit
+waits while the owner's mailbox holds more than `max_owner_queue`
+messages (1000 by default).
+
+When the owner hands data to another process, or processes it later,
+switch the stream to `manual` and return credit for what was processed.
+The peer then sends at most one stream window past what was consumed.
+
+```erlang
+{quic, Conn, {stream_opened, StreamId}} ->
+    ok = quic:set_stream_flow_control(Conn, StreamId, manual);
+{quic, Conn, {stream_data, StreamId, Data, _Fin}} ->
+    handle(Data),
+    ok = quic:consume(Conn, StreamId, byte_size(Data))
+```
+
+Bytes delivered before the switch count as received and are consumed
+like any other.
 
 ## Message Reference
 

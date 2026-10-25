@@ -88,6 +88,9 @@
     send_data/4,
     send_data/5,
     send_data_async/4,
+    %% Receive credit
+    set_stream_flow_control/3,
+    consume/3,
     reset_stream/3,
     reset_stream_at/4,
     stop_sending/3,
@@ -296,7 +299,8 @@ validate_client_opts(Socket, Opts) ->
             first_error([
                 credentials(client, Opts),
                 validate_connect_opts(Socket, Opts),
-                validate_receive_window(Opts)
+                validate_receive_window(Opts),
+                validate_owner_queue(Opts)
             ]);
         {error, _} = Error ->
             Error
@@ -465,6 +469,50 @@ send_data(Conn, StreamId, Data, Fin, Timeout) when is_pid(Conn) ->
     Fin :: boolean().
 send_data_async(Conn, StreamId, Data, Fin) when is_pid(Conn) ->
     quic_connection:send_data_async(Conn, StreamId, Data, Fin).
+
+%% @doc Choose how a stream earns the peer receive credit.
+%%
+%% `auto' (default) grants credit as data is delivered to the owner,
+%% while the owner's mailbox holds no more than `max_owner_queue'
+%% messages. `manual' grants it only for the bytes the owner returns
+%% with {@link consume/3}, so an owner that stops reading stops the peer
+%% after one stream window. Bytes delivered before the switch count as
+%% received and are consumed like any other.
+%% Returns `{error, unknown_stream}' once the stream is finished or reset.
+%%
+%% ```
+%% {quic, Conn, {stream_opened, StreamId}} ->
+%%     ok = quic:set_stream_flow_control(Conn, StreamId, manual)
+%% '''
+%% @end
+-spec set_stream_flow_control(Conn, StreamId, Mode) -> ok | {error, unknown_stream} when
+    Conn :: pid(),
+    StreamId :: non_neg_integer(),
+    Mode :: auto | manual.
+set_stream_flow_control(Conn, StreamId, Mode) when
+    is_pid(Conn), Mode =:= auto; is_pid(Conn), Mode =:= manual
+->
+    quic_connection:stream_flow_control(Conn, StreamId, Mode).
+
+%% @doc Return receive credit on a `manual' stream.
+%%
+%% Call it after processing `Bytes' received on `StreamId'; the peer may
+%% then send up to one stream window past what was consumed. A no-op
+%% returning `ok' on an `auto' stream. Returns `{error, unknown_stream}'
+%% once the stream is finished or reset.
+%%
+%% ```
+%% {quic, Conn, {stream_data, StreamId, Data, _Fin}} ->
+%%     handle(Data),
+%%     ok = quic:consume(Conn, StreamId, byte_size(Data))
+%% '''
+%% @end
+-spec consume(Conn, StreamId, Bytes) -> ok | {error, unknown_stream} when
+    Conn :: pid(),
+    StreamId :: non_neg_integer(),
+    Bytes :: non_neg_integer().
+consume(Conn, StreamId, Bytes) when is_pid(Conn), is_integer(Bytes), Bytes >= 0 ->
+    quic_connection:consume(Conn, StreamId, Bytes).
 
 %% @doc Reset a stream with an error code.
 -spec reset_stream(Conn, StreamId, ErrorCode) -> ok | {error, term()} when
@@ -906,7 +954,8 @@ validate_server_opts(Opts) ->
             first_error([
                 quic_listener:has_auth_method(Opts),
                 credentials(server, Opts),
-                validate_receive_window(Opts)
+                validate_receive_window(Opts),
+                validate_owner_queue(Opts)
             ]);
         {error, _} = Error ->
             Error
@@ -930,6 +979,15 @@ validate_receive_window(Opts) ->
         error -> ok;
         {ok, W} when is_integer(W), W >= ?MIN_RECEIVE_WINDOW -> ok;
         {ok, W} -> {error, {invalid_max_receive_window, W}}
+    end.
+
+%% @private `max_owner_queue' is a message count or `infinity'.
+validate_owner_queue(Opts) ->
+    case maps:find(max_owner_queue, Opts) of
+        error -> ok;
+        {ok, infinity} -> ok;
+        {ok, N} when is_integer(N), N > 0 -> ok;
+        {ok, N} -> {error, {invalid_max_owner_queue, N}}
     end.
 
 %% @private Reject a `groups' option naming a key-exchange group this

@@ -182,6 +182,12 @@
     fc_last_stream_update :: integer() | undefined,
     fc_last_conn_update :: integer() | undefined,
     fc_max_receive_window :: non_neg_integer(),
+    %% Credit for `auto' streams and the connection is withheld while the
+    %% owner's mailbox holds more than this, and re-checked on credit_timer
+    max_owner_queue = ?DEFAULT_MAX_OWNER_QUEUE :: pos_integer() | infinity,
+    credit_timer :: reference() | undefined,
+    %% `auto' streams whose MAX_STREAM_DATA is waiting on credit_timer
+    credit_withheld = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
     %% Cached max stream recv window (avoids O(n) scan for connection flow control)
     fc_max_stream_recv_window = ?DEFAULT_INITIAL_MAX_STREAM_DATA :: non_neg_integer(),
 

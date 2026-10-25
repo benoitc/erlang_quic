@@ -269,6 +269,8 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `quic:open_unidirectional_stream/1` - Open unidirectional stream
 - `quic:send_data/4,5` - Send data on stream (`Fin = true` closes the send side)
 - `quic:send_data_async/4` - Send without waiting for the connection process
+- `quic:set_stream_flow_control/3` - `auto` or `manual` receive credit for a stream
+- `quic:consume/3` - Return receive credit on a `manual` stream
 - `quic:stop_sending/3` - Ask the peer to stop sending on a stream
 - `quic:reset_stream/3` - Reset stream with error code
 - `quic:reset_stream_at/4` - Reset stream with reliable delivery up to specified size
@@ -310,6 +312,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `max_stream_data_bidi_remote` - Stream-level limit for streams the peer opens
 - `max_stream_data_uni` - Stream-level limit for unidirectional streams
 - `max_receive_window` - Largest window the receive limits grow to (default: 8 MiB, minimum: 16 KiB)
+- `max_owner_queue` - Receive credit waits while the owner's mailbox holds more messages than this (default: 1000, or `infinity`)
 - `max_datagram_frame_size` - Max datagram size to accept (0 = disabled, default: 0)
 - `datagram_recv_queue_len` - Bounded receive queue for inbound datagrams (default: `infinity`; drops oldest on overflow, tracked via `datagram_stats/1`)
 - `reset_stream_at` - Enable RESET_STREAM_AT extension (default: false)

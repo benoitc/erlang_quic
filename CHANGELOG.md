@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- A peer can no longer fill a slow connection owner's mailbox until the
+  VM runs out of memory. Stream data earned the peer new credit as soon
+  as it reached the owner's mailbox, read or not. Credit now waits while
+  the owner's mailbox holds more than `max_owner_queue` messages (1000
+  by default). (GHSA-6fr7-vvrm-wf2w, CWE-770). Reported by wallace0409.
+
+### Added
+- `quic:set_stream_flow_control/3` and `quic:consume/3`: a stream in
+  `manual` mode earns the peer credit only for the bytes the owner
+  reports as processed, so the peer sends at most one stream window
+  ahead of the reader.
+
 ### Fixed
 - An HTTP/3 server handler reading a request body now always learns
   where the body ends. A request without a body (curl sends every GET
