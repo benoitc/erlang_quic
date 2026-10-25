@@ -362,6 +362,10 @@
 -define(MIN_RECEIVE_WINDOW, 16384).
 % Double window if consumed in < 4*RTT (aggressive), else linear growth
 -define(AUTO_TUNE_RTT_FACTOR, 4).
+%% Owner mailbox length past which receive credit and DATAGRAMs wait
+-define(DEFAULT_MAX_OWNER_QUEUE, 1000).
+%% How often withheld credit is re-checked against the owner's mailbox
+-define(CREDIT_RETRY_MS, 10).
 
 %% Congestion Control - Initial Window
 %% RFC 9002 default: min(10 * max_datagram_size, max(14720, 2 * max_datagram_size))

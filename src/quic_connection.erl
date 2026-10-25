@@ -91,6 +91,8 @@
     send_data_async/4,
     set_stream_flow_control/3,
     stream_consumed/3,
+    stream_flow_control/3,
+    consume/3,
     notify_send_ready/1,
     send_datagram/2,
     datagram_max_size/1,
@@ -327,6 +329,17 @@ notify_send_ready(Conn) ->
 -spec stream_consumed(pid(), non_neg_integer(), non_neg_integer()) -> ok.
 stream_consumed(Conn, StreamId, Offset) ->
     gen_statem:cast(Conn, {stream_consumed, StreamId, Offset}).
+
+%% @private Public form of set_stream_flow_control/3, see quic.
+-spec stream_flow_control(pid(), non_neg_integer(), auto | manual) ->
+    ok | {error, unknown_stream}.
+stream_flow_control(Conn, StreamId, Mode) ->
+    gen_statem:call(Conn, {stream_flow_control, StreamId, Mode}).
+
+%% @private Return credit for Bytes the reader has processed, see quic.
+-spec consume(pid(), non_neg_integer(), non_neg_integer()) -> ok | {error, unknown_stream}.
+consume(Conn, StreamId, Bytes) ->
+    gen_statem:call(Conn, {consume, StreamId, Bytes}).
 
 %% @doc Open a new bidirectional stream.
 -spec open_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
@@ -747,6 +760,7 @@ init({server, Opts}) ->
         fc_last_stream_update = undefined,
         fc_last_conn_update = undefined,
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
+        max_owner_queue = maps:get(max_owner_queue, Opts, ?DEFAULT_MAX_OWNER_QUEUE),
         ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
         burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
         delivery_coalescing = bool_opt(delivery_coalescing, Opts),
@@ -1181,6 +1195,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         fc_last_stream_update = undefined,
         fc_last_conn_update = undefined,
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
+        max_owner_queue = maps:get(max_owner_queue, Opts, ?DEFAULT_MAX_OWNER_QUEUE),
         ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
         burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
         delivery_coalescing = bool_opt(delivery_coalescing, Opts),
@@ -2089,6 +2104,32 @@ handle_common_event(cast, {set_stream_flow_control, StreamId, Mode}, StateName, 
     {keep_state, flush_after_grant(StateName, set_recv_flow(StreamId, Mode, StateName, State))};
 handle_common_event(cast, {stream_consumed, StreamId, Offset}, StateName, State) ->
     {keep_state, flush_after_grant(StateName, recv_consumed(StreamId, Offset, StateName, State))};
+handle_common_event({call, From}, {stream_flow_control, StreamId, Mode}, StateName, State) ->
+    case State#state.streams of
+        #{StreamId := #stream_state{recv_flow = Mode}} ->
+            {keep_state, State, [{reply, From, ok}]};
+        #{StreamId := _} ->
+            %% Everything delivered so far is still to be consumed.
+            Flow =
+                case Mode of
+                    manual -> {manual, 0};
+                    auto -> auto
+                end,
+            State1 = flush_after_grant(StateName, set_recv_flow(StreamId, Flow, StateName, State)),
+            {keep_state, State1, [{reply, From, ok}]};
+        _ ->
+            {keep_state, State, [{reply, From, {error, unknown_stream}}]}
+    end;
+handle_common_event({call, From}, {consume, StreamId, Bytes}, StateName, State) ->
+    case State#state.streams of
+        #{StreamId := #stream_state{recv_flow = manual, recv_consumed = Consumed}} ->
+            State1 = recv_consumed(StreamId, Consumed + Bytes, StateName, State),
+            {keep_state, flush_after_grant(StateName, State1), [{reply, From, ok}]};
+        #{StreamId := _} ->
+            {keep_state, State, [{reply, From, ok}]};
+        _ ->
+            {keep_state, State, [{reply, From, {error, unknown_stream}}]}
+    end;
 handle_common_event({call, From}, get_ref, _StateName, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 handle_common_event({call, From}, get_path_stats, _StateName, State) ->
@@ -2137,6 +2178,14 @@ handle_common_event(
         false ->
             {keep_state, arm_disconnect_timer(State1)}
     end;
+handle_common_event(info, {credit_retry, Ref}, StateName, #state{credit_timer = Ref} = State) ->
+    State1 = State#state{credit_timer = undefined},
+    case StateName of
+        connected -> {keep_state, flush_after_grant(connected, release_withheld_credit(State1))};
+        _ -> {keep_state, State1}
+    end;
+handle_common_event(info, {credit_retry, _StaleRef}, _StateName, State) ->
+    {keep_state, State};
 handle_common_event(info, {disconnect_check, _StaleRef}, _StateName, State) ->
     %% Stale disconnect timer (ref doesn't match or wrong state)
     {keep_state, State};
@@ -7358,78 +7407,10 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                     %% MAX_STREAM_DATA / MAX_DATA updates, which re-put the stream),
                     %% so a terminal stream is not re-inserted after removal.
 
-                    %% Check if we need to send MAX_STREAM_DATA to allow more data.
-                    %% Trigger when remaining sender headroom (max - delivered) drops
-                    %% below half the configured per-stream window. Using the absolute
-                    %% recv_max_data alone deadlocks once it reaches MaxWindow because
-                    %% NewRecvOffset will eventually catch up but the threshold stops
-                    %% advancing.
-                    MaxWindowForStream = State#state.fc_max_receive_window,
-                    Headroom = max(0, RecvMaxData - NewRecvOffset),
-                    %% A stream whose final size is known can never use more
-                    %% credit (RFC 9000 §19.10), so widening its window only
-                    %% spends bytes: one frame per completed stream adds up
-                    %% in request/response traffic.
-                    WillSendMaxStreamData =
-                        Headroom < (MaxWindowForStream div 2) andalso
-                            NewStream#stream_state.final_size =:= undefined andalso
-                            NewStream#stream_state.recv_flow =:= auto,
                     State2 =
-                        case WillSendMaxStreamData of
-                            true ->
-                                Now = erlang:monotonic_time(millisecond),
-                                SmoothedRTT = quic_rtt:smoothed(
-                                    quic_loss:rtt(State1#state.loss_state)
-                                ),
-                                MaxWindow = State1#state.fc_max_receive_window,
-                                LastStreamUpdate = State1#state.fc_last_stream_update,
-                                InitialStreamWindow = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
-                                %% Check if consumption is fast (< 4*RTT since last update)
-                                FastConsumption =
-                                    case LastStreamUpdate of
-                                        undefined ->
-                                            true;
-                                        _ ->
-                                            (Now - LastStreamUpdate) <
-                                                (SmoothedRTT * ?AUTO_TUNE_RTT_FACTOR)
-                                    end,
-                                %% Slide the window forward relative to the
-                                %% delivered offset, capped at MaxWindow. Without
-                                %% the offset relativization we'd hit MaxWindow
-                                %% once and never advance again — sender stalls.
-                                NewMaxStreamData =
-                                    case FastConsumption of
-                                        true ->
-                                            %% Double the live window (aggressive)
-                                            NewRecvOffset + min(RecvMaxData * 2, MaxWindow);
-                                        false ->
-                                            %% Add one initial window (conservative)
-                                            NewRecvOffset +
-                                                min(
-                                                    RecvMaxData + InitialStreamWindow, MaxWindow
-                                                )
-                                    end,
-                                UpdatedStream = NewStream#stream_state{
-                                    recv_max_data = NewMaxStreamData
-                                },
-                                MaxStreamDataFrame = {max_stream_data, StreamId, NewMaxStreamData},
-                                %% Cache the granted window *size* (not the
-                                %% absolute limit) for the connection-window
-                                %% multiplier below.
-                                NewCachedMax = max(
-                                    NewMaxStreamData - NewRecvOffset,
-                                    State1#state.fc_max_stream_recv_window
-                                ),
-                                State1a = State1#state{
-                                    streams = maps:put(StreamId, UpdatedStream, Streams),
-                                    fc_last_stream_update = Now,
-                                    fc_max_stream_recv_window = NewCachedMax
-                                },
-                                send_frame(MaxStreamDataFrame, State1a);
-                            false when NewStream#stream_state.recv_flow =:= manual ->
-                                manual_stream_grant(StreamId, State1);
-                            false ->
-                                State1
+                        case NewStream#stream_state.recv_flow of
+                            auto -> auto_stream_grant(StreamId, State1);
+                            manual -> manual_stream_grant(StreamId, State1)
                         end,
 
                     %% Check if we need to send MAX_DATA for connection-level flow
@@ -7448,6 +7429,98 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
             end
     end.
 
+%% MAX_STREAM_DATA for an `auto' stream once the sender's headroom (limit
+%% - delivered) drops below half the window. Comparing the absolute limit
+%% instead deadlocks once it reaches the window. A stream whose final size
+%% is known can never use more credit (RFC 9000 Section 19.10), so it gets
+%% none.
+auto_stream_grant(StreamId, #state{streams = Streams} = State) ->
+    case Streams of
+        #{
+            StreamId := #stream_state{
+                recv_flow = auto,
+                final_size = undefined,
+                recv_offset = Offset,
+                recv_max_data = RecvMaxData
+            } = Stream
+        } when RecvMaxData - Offset < State#state.fc_max_receive_window div 2 ->
+            case credit_allowed(State) of
+                {true, State1} ->
+                    send_auto_stream_credit(StreamId, Stream, State1);
+                {false, #state{credit_withheld = Withheld} = State1} ->
+                    State1#state{credit_withheld = sets:add_element(StreamId, Withheld)}
+            end;
+        _ ->
+            State
+    end.
+
+send_auto_stream_credit(
+    StreamId,
+    #stream_state{recv_offset = Offset, recv_max_data = RecvMaxData} = Stream,
+    #state{streams = Streams} = State
+) ->
+    Now = erlang:monotonic_time(millisecond),
+    SmoothedRTT = quic_rtt:smoothed(quic_loss:rtt(State#state.loss_state)),
+    MaxWindow = State#state.fc_max_receive_window,
+    %% Check if consumption is fast (< 4*RTT since last update)
+    FastConsumption =
+        case State#state.fc_last_stream_update of
+            undefined -> true;
+            Last -> (Now - Last) < (SmoothedRTT * ?AUTO_TUNE_RTT_FACTOR)
+        end,
+    %% Slide the window forward relative to the delivered offset, capped
+    %% at MaxWindow, so the sender never stalls at a fixed limit.
+    NewMaxStreamData =
+        case FastConsumption of
+            true -> Offset + min(RecvMaxData * 2, MaxWindow);
+            false -> Offset + min(RecvMaxData + ?DEFAULT_INITIAL_MAX_STREAM_DATA, MaxWindow)
+        end,
+    %% Cache the granted window size (not the absolute limit) for the
+    %% connection-window multiplier in conn_grant/1.
+    NewCachedMax = max(NewMaxStreamData - Offset, State#state.fc_max_stream_recv_window),
+    State1 = State#state{
+        streams = Streams#{StreamId => Stream#stream_state{recv_max_data = NewMaxStreamData}},
+        fc_last_stream_update = Now,
+        fc_max_stream_recv_window = NewCachedMax
+    },
+    send_frame({max_stream_data, StreamId, NewMaxStreamData}, State1).
+
+%% Credit waits while the owner is behind on its mailbox: what the peer
+%% sends next would only pile up there. A timer re-checks.
+credit_allowed(#state{credit_timer = Ref} = State) when Ref =/= undefined ->
+    {false, State};
+credit_allowed(State) ->
+    case owner_behind(State) of
+        true ->
+            Ref = make_ref(),
+            erlang:send_after(?CREDIT_RETRY_MS, self(), {credit_retry, Ref}),
+            {false, State#state{credit_timer = Ref}};
+        false ->
+            {true, State}
+    end.
+
+%% The owner is behind when its mailbox holds more than max_owner_queue
+%% messages.
+owner_behind(#state{max_owner_queue = infinity}) ->
+    false;
+owner_behind(#state{owner = Owner, max_owner_queue = Max}) when node(Owner) =:= node() ->
+    case erlang:process_info(Owner, message_queue_len) of
+        {message_queue_len, Len} -> Len > Max;
+        undefined -> false
+    end;
+owner_behind(_State) ->
+    false.
+
+%% Grant what was withheld, or wait another round if the owner is still
+%% behind.
+release_withheld_credit(#state{credit_withheld = Withheld} = State) ->
+    State1 = sets:fold(
+        fun auto_stream_grant/2,
+        State#state{credit_withheld = sets:new([{version, 2}])},
+        Withheld
+    ),
+    conn_grant(State1).
+
 %% MAX_DATA when the connection's headroom (limit - received) falls under
 %% half the window. The new limit is anchored on what readers have taken:
 %% bytes a manual stream has delivered but not had consumed do not earn
@@ -7456,34 +7529,41 @@ conn_grant(#state{max_data_local = MaxDataLocal, data_received = Received} = Sta
     MaxWindow = State#state.fc_max_receive_window,
     case max(0, MaxDataLocal - Received) < MaxWindow div 2 of
         true ->
-            {Unconsumed, State1} = manual_unconsumed(State),
-            Anchor = Received - Unconsumed,
-            Now = erlang:monotonic_time(millisecond),
-            SmoothedRTT = quic_rtt:smoothed(quic_loss:rtt(State1#state.loss_state)),
-            %% Check if consumption is fast (< 4*RTT since last update)
-            FastConsumption =
-                case State1#state.fc_last_conn_update of
-                    undefined -> true;
-                    Last -> (Now - Last) < (SmoothedRTT * ?AUTO_TUNE_RTT_FACTOR)
-                end,
-            %% Calculate new window based on RTT-aware growth.
-            BaseNewMaxData = next_conn_max_data(
-                Anchor, MaxDataLocal, MaxWindow, ?DEFAULT_INITIAL_MAX_DATA, FastConsumption
-            ),
-            %% Ensure connection window >= 1.5x largest stream window.
-            %% MaxStreamWindow is a window size; anchor it to compare limits.
-            MaxStreamWindow = get_max_stream_recv_window(State1),
-            MinConnWindow =
-                Anchor + trunc(MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER),
-            case max(BaseNewMaxData, MinConnWindow) of
-                NewMaxData when NewMaxData > MaxDataLocal ->
-                    State2 = send_frame({max_data, NewMaxData}, State1),
-                    State2#state{max_data_local = NewMaxData, fc_last_conn_update = Now};
-                _ ->
-                    State1
+            case credit_allowed(State) of
+                {true, State0} -> send_conn_credit(State0);
+                {false, State0} -> State0
             end;
         false ->
             State
+    end.
+
+send_conn_credit(#state{max_data_local = MaxDataLocal, data_received = Received} = State) ->
+    MaxWindow = State#state.fc_max_receive_window,
+    {Unconsumed, State1} = manual_unconsumed(State),
+    Anchor = Received - Unconsumed,
+    Now = erlang:monotonic_time(millisecond),
+    SmoothedRTT = quic_rtt:smoothed(quic_loss:rtt(State1#state.loss_state)),
+    %% Check if consumption is fast (< 4*RTT since last update)
+    FastConsumption =
+        case State1#state.fc_last_conn_update of
+            undefined -> true;
+            Last -> (Now - Last) < (SmoothedRTT * ?AUTO_TUNE_RTT_FACTOR)
+        end,
+    %% Calculate new window based on RTT-aware growth.
+    BaseNewMaxData = next_conn_max_data(
+        Anchor, MaxDataLocal, MaxWindow, ?DEFAULT_INITIAL_MAX_DATA, FastConsumption
+    ),
+    %% Ensure connection window >= 1.5x largest stream window.
+    %% MaxStreamWindow is a window size; anchor it to compare limits.
+    MaxStreamWindow = get_max_stream_recv_window(State1),
+    MinConnWindow =
+        Anchor + trunc(MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER),
+    case max(BaseNewMaxData, MinConnWindow) of
+        NewMaxData when NewMaxData > MaxDataLocal ->
+            State2 = send_frame({max_data, NewMaxData}, State1),
+            State2#state{max_data_local = NewMaxData, fc_last_conn_update = Now};
+        _ ->
+            State1
     end.
 
 %% Bytes manual streams have delivered but not had consumed, dropping ids
