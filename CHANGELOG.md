@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- A listener no longer stalls when many connections close at once.
+  Each closing connection made the listener scan its whole routing
+  table, so a burst of short-lived connections, which anyone can open,
+  kept it from accepting or routing other clients for tens of seconds.
+  (GHSA-fqq7-rg4w-x69m, CWE-407). Reported by wallace0409.
+
 ### Fixed
 - An HTTP/3 server handler reading a request body now always learns
   where the body ends. A request without a body (curl sends every GET
