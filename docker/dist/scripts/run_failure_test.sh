@@ -51,7 +51,7 @@ fi
 
 for i in $REMAINING_NODES; do
     NODE="node$i"
-    NODEDOWN=$(docker compose logs "$NODE" 2>&1 | grep -c "\[DIST_TEST\].*nodedown.*node3" || echo 0)
+    NODEDOWN=$(docker compose logs "$NODE" 2>&1 | grep -c "\[DIST_TEST\].*nodedown.*node3" || true)
 
     if [ "$NODEDOWN" -ge 1 ]; then
         echo "  OK: $NODE detected node3 failure"
@@ -72,7 +72,7 @@ echo ""
 # Step 6: Check node3 reconnected
 echo "Step 6: Checking reconnection..."
 # Look for new nodeup events after restart
-RECOVERY_NODEUPS=$(docker compose logs node3 --since 1m 2>&1 | grep -c "\[DIST_TEST\].*nodeup" || echo 0)
+RECOVERY_NODEUPS=$(docker compose logs node3 --since 1m 2>&1 | grep -c "\[DIST_TEST\].*nodeup" || true)
 EXPECTED_RECONNECT=$((CLUSTER_SIZE - 1))
 
 if [ "$RECOVERY_NODEUPS" -ge "$EXPECTED_RECONNECT" ]; then
@@ -85,7 +85,7 @@ fi
 # Check other nodes saw node3 come back
 for i in $REMAINING_NODES; do
     NODE="node$i"
-    NODEUP=$(docker compose logs "$NODE" --since 1m 2>&1 | grep -c "\[DIST_TEST\].*nodeup.*node3" || echo 0)
+    NODEUP=$(docker compose logs "$NODE" --since 1m 2>&1 | grep -c "\[DIST_TEST\].*nodeup.*node3" || true)
 
     if [ "$NODEUP" -ge 1 ]; then
         echo "  OK: $NODE detected node3 recovery"

@@ -101,7 +101,7 @@ count_mesh_complete() {
 get_connections() {
     local total=0
     for i in $(seq 1 $CLUSTER_SIZE); do
-        local conns=$(docker compose logs "node$i" 2>&1 | grep -c "\[DIST_TEST\].*nodeup" || echo 0)
+        local conns=$(docker compose logs "node$i" 2>&1 | grep -c "\[DIST_TEST\].*nodeup" || true)
         total=$((total + conns))
     done
     # Total expected connections: each node connects to (n-1) peers

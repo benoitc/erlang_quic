@@ -126,7 +126,21 @@ handle_info({nodeup, Node}, State) ->
 handle_info({nodedown, Node}, State) ->
     log_event(nodedown, Node),
     NewNodes = lists:delete(Node, State#state.connected_nodes),
+    %% Only the lower-named side dials a pair, so it is also the side
+    %% that has to dial again when the peer comes back.
+    case Node > node() of
+        true -> erlang:send_after(?CONNECT_RETRY_INTERVAL, self(), {reconnect, Node});
+        false -> ok
+    end,
     {noreply, State#state{connected_nodes = NewNodes}};
+
+handle_info({reconnect, Node}, State) ->
+    ensure_connected(Node),
+    case lists:member(Node, nodes()) of
+        true -> ok;
+        false -> erlang:send_after(?CONNECT_RETRY_INTERVAL, self(), {reconnect, Node})
+    end,
+    {noreply, State};
 
 handle_info(try_connect, State) ->
     connect_to_cluster(),
