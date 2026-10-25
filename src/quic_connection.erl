@@ -9172,12 +9172,19 @@ record_app_recv(FirstByte, PN, #state{pn_app = PNSpace} = State, Now) ->
 datagram_overhead(#state{dcid = Dcid}) ->
     1 + byte_size(Dcid) + 4 + 16 + 1 + 2.
 
-%% Deliver an inbound DATAGRAM to the owner and account for it in the
-%% bounded recv queue. When the queue has no cap (`infinity') we keep
-%% today's zero-overhead push-to-mailbox behaviour. With a finite cap
-%% the oldest entry is dropped so a slow owner can detect back-pressure
-%% via datagram_stats/1 without the mailbox growing unbounded.
-deliver_datagram(
+%% Deliver an inbound DATAGRAM to the owner, or drop it while the owner's
+%% mailbox holds more than max_owner_queue messages: DATAGRAMs are
+%% unreliable (RFC 9221 Section 5), and nothing else stops a peer from
+%% filling that mailbox. Drops show in datagram_stats/1.
+deliver_datagram(Data, #state{datagram_recv_dropped = Dropped} = State) ->
+    case owner_behind(State) of
+        true -> State#state{datagram_recv_dropped = Dropped + 1};
+        false -> push_datagram(Data, State)
+    end.
+
+%% Also account for it in the recv queue. With no cap (`infinity') this
+%% is a plain push; with a finite cap the queue drops its oldest entry.
+push_datagram(
     Data,
     #state{
         owner = Owner,

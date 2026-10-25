@@ -10,6 +10,13 @@ All notable changes to this project will be documented in this file.
   as it reached the owner's mailbox, read or not. Credit now waits while
   the owner's mailbox holds more than `max_owner_queue` messages (1000
   by default). (GHSA-6fr7-vvrm-wf2w, CWE-770). Reported by wallace0409.
+- A peer can no longer fill a slow owner's mailbox with DATAGRAMs.
+  Every DATAGRAM received was sent to the owner whatever its backlog;
+  the `datagram_recv_queue_len` cap did not limit the mailbox. DATAGRAMs
+  that arrive while the owner's mailbox holds more than
+  `max_owner_queue` messages are now dropped and counted in
+  `datagram_stats/1`. (GHSA-gq4m-5qh3-q47h, CWE-770). Reported by
+  wallace0409.
 
 ### Added
 - `quic:set_stream_flow_control/3` and `quic:consume/3`: a stream in

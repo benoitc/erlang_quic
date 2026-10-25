@@ -87,7 +87,7 @@ packets automatically.
 | `max_stream_data_bidi_remote` | integer | 524288 | Receive limit for streams the peer opens |
 | `max_stream_data_uni` | integer | 524288 | Receive limit for unidirectional streams |
 | `max_receive_window` | integer | 8388608 | Largest window the receive limits grow to; at least 16384 |
-| `max_owner_queue` | integer \| `infinity` | 1000 | Receive credit waits while the owner's mailbox holds more messages than this |
+| `max_owner_queue` | integer \| `infinity` | 1000 | Receive credit waits, and DATAGRAMs are dropped, while the owner's mailbox holds more messages than this |
 | `max_streams_bidi` | integer | 100 | Max bidirectional streams |
 | `max_streams_uni` | integer | 100 | Max unidirectional streams |
 
@@ -222,6 +222,10 @@ receive
         handle_datagram(Data)
 end.
 ```
+
+Datagrams that arrive while the owner's mailbox holds more than
+`max_owner_queue` messages are dropped; `quic:datagram_stats/1` counts
+them in `dropped_recv`.
 
 ### Connection Migration (RFC 9000 Section 9)
 
