@@ -162,6 +162,9 @@
     alpn_list :: [binary()],
     %% Connection ID -> Pid mapping
     connections :: ets:tid(),
+    %% Pid -> Connection ID, for the connections this listener started,
+    %% so an exit deletes by key instead of scanning `connections'
+    cid_index :: ets:tid(),
     tickets_table :: ets:tid(),
     %% Whether this listener owns the ETS tables (false in pool mode)
     owns_tables = true :: boolean(),
@@ -375,6 +378,7 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
         sni_callback = SniCallback,
         alpn_list = ALPNList,
         connections = ConnTab,
+        cid_index = ets:new(quic_cid_index, [bag, private]),
         tickets_table = TicketTab,
         owns_tables = OwnsTables,
         reset_secret = ResetSecret,
@@ -485,11 +489,14 @@ handle_call(_Request, _From, State) ->
 
 %% @doc false
 -spec handle_cast(term(), state()) -> {noreply, state()}.
-handle_cast({register_cid, CID, ConnPid}, #listener_state{connections = Conns} = State) ->
-    ets:insert(Conns, {CID, ConnPid}),
+handle_cast({register_cid, CID, ConnPid}, State) ->
+    add_cid(CID, ConnPid, State),
     {noreply, State};
-handle_cast({retire_cid, CID}, #listener_state{connections = Conns} = State) ->
-    ets:delete(Conns, CID),
+handle_cast({retire_cid, CID}, #listener_state{connections = Conns, cid_index = Index} = State) ->
+    case ets:take(Conns, CID) of
+        [{CID, ConnPid}] -> ets:delete_object(Index, {ConnPid, CID});
+        [] -> ok
+    end,
     {noreply, State};
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -540,8 +547,7 @@ handle_info(
 %% Handle connection process exit
 handle_info(
     {'EXIT', Pid, _Reason},
-    #listener_state{connections = Conns, gro_receiver = GROReceiver, send_sender = SendSender} =
-        State
+    #listener_state{gro_receiver = GROReceiver, send_sender = SendSender} = State
 ) ->
     case Pid of
         GROReceiver ->
@@ -562,7 +568,7 @@ handle_info(
                 send_sender = NewSender, send_gso_counter = NewCounter
             }};
         _ ->
-            cleanup_connection(Conns, Pid),
+            cleanup_connection(Pid, State),
             {noreply, State}
     end;
 %% Handle UDP from different socket (shouldn't happen)
@@ -901,11 +907,13 @@ init_cid_config(Opts, ResetSecret) ->
             end
     end.
 
+add_cid(CID, ConnPid, #listener_state{connections = Conns, cid_index = Index}) ->
+    ets:insert(Conns, {CID, ConnPid}),
+    ets:insert(Index, {ConnPid, CID}).
+
 %% Remove all CIDs associated with this connection
-cleanup_connection(Conns, Pid) ->
-    %% Use '$1' match spec variable, not literal atom '_'
-    Pattern = {{'$1', Pid}, [], [true]},
-    _ = ets:select_delete(Conns, [Pattern]).
+cleanup_connection(Pid, #listener_state{connections = Conns, cid_index = Index}) ->
+    lists:foreach(fun({_, CID}) -> ets:delete_object(Conns, {CID, Pid}) end, ets:take(Index, Pid)).
 
 %% Use provided ETS table or create new one for connection tracking
 %% When using pool mode, the supervisor is in the options, query it for the
@@ -1128,7 +1136,6 @@ create_connection_unconditional(
         psk_callback = PskCallback,
         sni_callback = SniCallback,
         alpn_list = ALPNList,
-        connections = Conns,
         tickets_table = TicketTab,
         connection_handler = ConnHandler,
         cid_config = CIDConfig,
@@ -1136,7 +1143,7 @@ create_connection_unconditional(
         send_sender = SendSender,
         send_gso_counter = SendGSOCounter,
         opts = Opts
-    }
+    } = State
 ) ->
     %% Generate server connection ID (LB-aware if configured)
     ServerCID =
@@ -1200,8 +1207,8 @@ create_connection_unconditional(
             ?LOG_INFO(#{what => connection_created, conn_pid => ConnPid}, ?QUIC_LOG_META),
 
             %% Register connection ID
-            ets:insert(Conns, {DCID, ConnPid}),
-            ets:insert(Conns, {ServerCID, ConnPid}),
+            add_cid(DCID, ConnPid, State),
+            add_cid(ServerCID, ConnPid, State),
 
             %% Invoke connection handler callback BEFORE sending packet
             %% This ensures ownership is transferred before handshake can complete

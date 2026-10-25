@@ -11,6 +11,11 @@ All notable changes to this project will be documented in this file.
   a ticket by one listener could log in to any other listener in the
   same VM, including one that only admits clients holding its pre-shared
   key. (GHSA-cv3h-phw9-vfjm, CWE-287). Reported by humdrum00001010.
+- A listener no longer stalls when many connections close at once.
+  Each closing connection made the listener scan its whole routing
+  table, so a burst of short-lived connections, which anyone can open,
+  kept it from accepting or routing other clients for tens of seconds.
+  (GHSA-fqq7-rg4w-x69m, CWE-407). Reported by wallace0409.
 
 ### Fixed
 - An HTTP/3 server handler reading a request body now always learns
