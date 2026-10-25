@@ -920,7 +920,8 @@ get_tables(#{supervisor := SupPid}) ->
     {ConnTab, TicketTab, false};
 get_tables(_) ->
     ConnTab = ets:new(quic_connections, [set, protected]),
-    TicketTab = ets:new(quic_tickets, [set, protected]),
+    %% Public: the connections store the tickets they issue here.
+    TicketTab = ets:new(quic_tickets, [set, public]),
     % Standalone mode - own tables
     {ConnTab, TicketTab, true}.
 
@@ -1128,6 +1129,7 @@ create_connection_unconditional(
         sni_callback = SniCallback,
         alpn_list = ALPNList,
         connections = Conns,
+        tickets_table = TicketTab,
         connection_handler = ConnHandler,
         cid_config = CIDConfig,
         reset_secret = ResetSecret,
@@ -1179,6 +1181,7 @@ create_connection_unconditional(
         sni_callback => SniCallback,
         alpn => ALPNList,
         listener => self(),
+        ticket_table => TicketTab,
         cid_config => CIDConfig,
         reset_secret => ResetSecret,
         %% The listener already validated the client's token (if any);

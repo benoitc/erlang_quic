@@ -432,6 +432,9 @@
 
     %% Client-side ticket storage for session resumption
     ticket_store = #{} :: quic_ticket:ticket_store(),
+    %% Server-side: the issuing listener's table, the only place a
+    %% ticket presented to this connection is looked up
+    ticket_table :: ets:table() | undefined,
 
     %% TLS 1.3 External PSK (RFC 8446 §4.2.11)
     %% Client-side: offered to the peer. Two-tuple form defaults to

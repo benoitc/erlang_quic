@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- A session ticket now resumes only on the listener that issued it, for
+  the server name and ALPN it was issued under. Tickets were kept in one
+  table for the whole VM and accepted by any listener, so a client given
+  a ticket by one listener could log in to any other listener in the
+  same VM, including one that only admits clients holding its pre-shared
+  key. (GHSA-cv3h-phw9-vfjm, CWE-287). Reported by humdrum00001010.
+
 ### Fixed
 - An HTTP/3 server handler reading a request body now always learns
   where the body ends. A request without a body (curl sends every GET

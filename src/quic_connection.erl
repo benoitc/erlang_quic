@@ -775,6 +775,7 @@ init({server, Opts}) ->
         cc_state = CCState,
         loss_state = LossState,
         listener = Listener,
+        ticket_table = maps:get(ticket_table, Opts, undefined),
         server_cert = Cert,
         server_cert_chain = CertChain,
         server_private_key = PrivateKey,
@@ -2424,35 +2425,51 @@ default_cipher_preference() ->
 %%====================================================================
 %% PSK validation and the session ticket store (RFC 9001 Section 4.6)
 %%
-%% The ticket store is a node-wide ETS table, so these functions are
+%% The ticket store is the listener's ETS table, so these functions are
 %% side-effecting where the negotiation helpers above are pure.
 %%====================================================================
 
-%% Validate PSK from client's pre_shared_key extension
-%% Returns {ok, PSK, ResumptionSecret} if valid, error otherwise
-validate_psk(Identity, _Cipher, _ClientHelloMsg, #state{ticket_store = TicketStore}) ->
-    %% Try to find ticket by identity - first in local store, then global ETS
-    case quic_ticket:find_by_identity(Identity, TicketStore) of
+%% A ticket resumes only on the listener that issued it, for the server
+%% name, ALPN and hash it was issued under (RFC 8446 Sections 4.2.11 and
+%% 4.6.1). It is taken once its binder checks out, so of two handshakes
+%% presenting it only one resumes (RFC 9001 Section 9.2).
+resume_ticket(_Identity, _Binder, _Cipher, _Msg, _Info, #state{ticket_table = undefined}) ->
+    error;
+resume_ticket(Identity, Binder, Cipher, Msg, Info, #state{ticket_table = Tab} = State) ->
+    case quic_ticket:lookup_issued(Tab, Identity) of
         {ok, Ticket} ->
-            %% Extract resumption secret from ticket
-            ResumptionSecret = Ticket#session_ticket.resumption_secret,
-            %% Derive PSK from resumption secret
-            PSK = quic_ticket:derive_psk(ResumptionSecret, Ticket),
-            {ok, PSK, ResumptionSecret};
+            case ticket_matches(Ticket, Cipher, Info, State) of
+                true -> check_resumption_binder(Identity, Ticket, Binder, Cipher, Msg, Info, Tab);
+                false -> error
+            end;
         error ->
-            %% Try global ETS table
-            case quic_ticket:lookup_global(Identity) of
-                {ok, Ticket} ->
-                    ResumptionSecret = Ticket#session_ticket.resumption_secret,
-                    PSK = quic_ticket:derive_psk(ResumptionSecret, Ticket),
-                    {ok, PSK, ResumptionSecret};
-                error ->
-                    error
-            end
-    end;
-validate_psk(_Identity, _Cipher, _ClientHelloMsg, _State) ->
-    %% No ticket store
-    error.
+            error
+    end.
+
+ticket_matches(
+    #session_ticket{server_name = SNI, alpn = ALPN, cipher = Issued}, Cipher, Info, State
+) ->
+    ClientALPN = maps:get(alpn_protocols, Info, []),
+    (SNI =:= sni_or_empty(maps:get(server_name, Info, undefined))) andalso
+        (ALPN =:= quic_tls_negotiation:negotiate_alpn(ClientALPN, State#state.alpn_list)) andalso
+        (quic_crypto:cipher_to_hash(Issued) =:= quic_crypto:cipher_to_hash(Cipher)).
+
+check_resumption_binder(Identity, Ticket, Binder, Cipher, Msg, Info, Tab) ->
+    ResumptionSecret = Ticket#session_ticket.resumption_secret,
+    PSK = quic_ticket:derive_psk(ResumptionSecret, Ticket),
+    Binders = maps:get(psk_binders, Info, undefined),
+    case quic_tls:verify_resumption_binder(PSK, Cipher, Msg, Binders, Binder) of
+        true ->
+            case quic_ticket:take_issued(Tab, Identity) of
+                {ok, _} -> {ok, PSK, ResumptionSecret};
+                error -> error
+            end;
+        false ->
+            bad_binder
+    end.
+
+sni_or_empty(undefined) -> <<>>;
+sni_or_empty(Name) -> Name.
 
 %%====================================================================
 %% TLS handshake, continued: server flight and session tickets
@@ -2946,6 +2963,9 @@ send_new_session_ticket(#state{selected_psk = #{source := external}} = State) ->
 send_new_session_ticket(#state{resumption_secret = undefined} = State) ->
     %% No resumption secret available - skip sending ticket
     State;
+send_new_session_ticket(#state{ticket_table = undefined} = State) ->
+    %% Not started by a listener: nowhere to resume the ticket from.
+    State;
 send_new_session_ticket(
     #state{
         resumption_secret = ResumptionSecret,
@@ -2953,7 +2973,7 @@ send_new_session_ticket(
         max_early_data = MaxEarlyData,
         alpn = ALPN,
         app_keys = {ClientAppKeys, _},
-        ticket_store = TicketStore
+        ticket_table = TicketTable
     } = State
 ) ->
     %% The cipher is the same at every level; the 1-RTT keys are the ones
@@ -2972,13 +2992,7 @@ send_new_session_ticket(
         ALPN
     ),
 
-    %% Store ticket on server side for later PSK validation (0-RTT support)
-    %% Use the ticket identity (the ticket field) as the key
-    %% Store in both local map and global ETS table for cross-connection access
-    TicketIdentity = Ticket#session_ticket.ticket,
-    NewTicketStore = maps:put(TicketIdentity, Ticket, TicketStore),
-    %% Also store in global ETS table for 0-RTT across connections
-    quic_ticket:store_global(TicketIdentity, Ticket),
+    quic_ticket:store_issued(TicketTable, Ticket),
 
     %% Build NewSessionTicket TLS message
     TicketMsg = quic_ticket:build_new_session_ticket(Ticket),
@@ -2988,8 +3002,7 @@ send_new_session_ticket(
 
     %% Send in CRYPTO frame (at application level)
     CryptoFrame = {crypto, 0, TLSMsg},
-    State1 = State#state{ticket_store = NewTicketStore},
-    send_frame(CryptoFrame, State1).
+    send_frame(CryptoFrame, State).
 
 %%====================================================================
 %% Packet send layer
@@ -6563,7 +6576,9 @@ do_server_client_hello(SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, Ori
     %% CertificateVerify negotiation, then resolve the server cert (static
     %% or via the per-SNI callback) before any cert-path work runs.
     StateSig = State0In#state{
-        peer_sig_algs = maps:get(signature_algorithms, ClientHelloInfo, [])
+        peer_sig_algs = maps:get(signature_algorithms, ClientHelloInfo, []),
+        %% The tickets this connection issues are bound to it.
+        server_name = maps:get(server_name, ClientHelloInfo, undefined)
     },
     case resolve_server_cert(ClientHelloInfo, StateSig) of
         {error, Phrase} ->
@@ -6630,68 +6645,58 @@ do_server_client_hello_cont(
             none ->
                 case PSKInfo of
                     #{identities := [{Identity, _Age} | _], binders := [Binder | _]} ->
-                        case validate_psk(Identity, Cipher, OriginalMsg, State) of
+                        case
+                            resume_ticket(
+                                Identity, Binder, Cipher, OriginalMsg, ClientHelloInfo, State
+                            )
+                        of
                             {ok, PSK, ResumptionSecret} ->
-                                PskBindersInfo = maps:get(psk_binders, ClientHelloInfo, undefined),
-                                case
-                                    quic_tls:verify_resumption_binder(
-                                        PSK, Cipher, OriginalMsg, PskBindersInfo, Binder
-                                    )
-                                of
-                                    true ->
-                                        %% Single-use: consume the ticket so a
-                                        %% captured 0-RTT flight cannot be
-                                        %% replayed (RFC 9001 §9.2).
-                                        quic_ticket:consume_global(Identity),
-                                        ES = quic_crypto:derive_early_secret(Cipher, PSK),
-                                        %% The ticket's PSK carries the whole
-                                        %% handshake (psk_dhe_ke), so the cert
-                                        %% flight is skipped; before, it only
-                                        %% fed the 0-RTT keys and the
-                                        %% handshake fell back to a full
-                                        %% cert exchange on a zero PSK.
-                                        Selected = #{
-                                            identity => Identity,
-                                            identity_idx => 0,
-                                            secret => PSK,
-                                            mode => psk_dhe_ke,
-                                            source => ticket
-                                        },
-                                        EK =
-                                            case WantsEarlyData of
-                                                true ->
-                                                    ClientHelloHash =
-                                                        quic_crypto:transcript_hash(
-                                                            Cipher, OriginalMsg
-                                                        ),
-                                                    ETS =
-                                                        quic_crypto:derive_client_early_traffic_secret(
-                                                            Cipher, ES, ClientHelloHash
-                                                        ),
-                                                    {Key, IV, HP} =
-                                                        quic_keys:derive_keys(
-                                                            ETS, Cipher, State#state.version
-                                                        ),
-                                                    EKeys = #crypto_keys{
-                                                        key = Key,
-                                                        iv = IV,
-                                                        hp = HP,
-                                                        cipher = Cipher
-                                                    },
-                                                    {EKeys, ResumptionSecret};
-                                                false ->
-                                                    undefined
-                                            end,
-                                        {EK, ES, Selected};
-                                    false ->
-                                        ?LOG_WARNING(
-                                            #{what => resumption_psk_binder_failed},
-                                            ?QUIC_LOG_META
-                                        ),
-                                        alert_and_exit(
-                                            ?TLS_ALERT_DECRYPT_ERROR, State, decrypt_error
-                                        )
-                                end;
+                                ES = quic_crypto:derive_early_secret(Cipher, PSK),
+                                %% The ticket's PSK carries the whole
+                                %% handshake (psk_dhe_ke), so the cert
+                                %% flight is skipped; before, it only
+                                %% fed the 0-RTT keys and the
+                                %% handshake fell back to a full
+                                %% cert exchange on a zero PSK.
+                                Selected = #{
+                                    identity => Identity,
+                                    identity_idx => 0,
+                                    secret => PSK,
+                                    mode => psk_dhe_ke,
+                                    source => ticket
+                                },
+                                EK =
+                                    case WantsEarlyData of
+                                        true ->
+                                            ClientHelloHash =
+                                                quic_crypto:transcript_hash(
+                                                    Cipher, OriginalMsg
+                                                ),
+                                            ETS =
+                                                quic_crypto:derive_client_early_traffic_secret(
+                                                    Cipher, ES, ClientHelloHash
+                                                ),
+                                            {Key, IV, HP} =
+                                                quic_keys:derive_keys(
+                                                    ETS, Cipher, State#state.version
+                                                ),
+                                            EKeys = #crypto_keys{
+                                                key = Key,
+                                                iv = IV,
+                                                hp = HP,
+                                                cipher = Cipher
+                                            },
+                                            {EKeys, ResumptionSecret};
+                                        false ->
+                                            undefined
+                                    end,
+                                {EK, ES, Selected};
+                            bad_binder ->
+                                ?LOG_WARNING(
+                                    #{what => resumption_psk_binder_failed},
+                                    ?QUIC_LOG_META
+                                ),
+                                alert_and_exit(?TLS_ALERT_DECRYPT_ERROR, State, decrypt_error);
                             error ->
                                 %% Unknown or expired ticket: fall back to a
                                 %% full handshake (RFC 8446 §4.2.11).
