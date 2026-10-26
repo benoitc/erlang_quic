@@ -132,6 +132,25 @@
 %% Packets drained from the listener mailbox into one receive sweep.
 -define(RECV_SWEEP_MAX, 256).
 
+%% TLS credentials and ALPN handed to every connection this listener
+%% starts.
+-record(listener_tls, {
+    %% Cert + private_key are optional; PSK-only listeners run with
+    %% both `undefined' and rely on `psks' / `psk_callback'.
+    cert :: binary() | undefined,
+    cert_chain :: [binary()],
+    private_key :: term() | undefined,
+    %% TLS 1.3 external PSK (RFC 8446 §4.2.11). Either may be set
+    %% independently; per-handshake selection happens in quic_connection.
+    psks :: #{binary() => binary()} | undefined,
+    psk_callback :: fun((binary()) -> {ok, binary()} | not_found) | undefined,
+    %% Per-SNI cert selection (RFC 6066 §3). Invoked with the ClientHello
+    %% server_name; its returned cert/key override the static ones above.
+    sni_callback ::
+        fun((binary() | undefined) -> {ok, map()} | {error, term()}) | undefined,
+    alpn_list :: [binary()]
+}).
+
 -record(listener_state, {
     recv_queue_max = ?MAX_CONN_RECV_QUEUE_MSGS :: pos_integer(),
     socket :: gen_udp:socket() | socket:socket(),
@@ -146,20 +165,7 @@
     send_sender :: pid() | undefined,
     send_gso_counter :: atomics:atomics_ref() | undefined,
     port :: inet:port_number(),
-    %% Cert + private_key are optional; PSK-only listeners run with
-    %% both `undefined' and rely on `psks' / `psk_callback'.
-    cert :: binary() | undefined,
-    cert_chain :: [binary()],
-    private_key :: term() | undefined,
-    %% TLS 1.3 external PSK (RFC 8446 §4.2.11). Either may be set
-    %% independently; per-handshake selection happens in quic_connection.
-    psks :: #{binary() => binary()} | undefined,
-    psk_callback :: fun((binary()) -> {ok, binary()} | not_found) | undefined,
-    %% Per-SNI cert selection (RFC 6066 §3). Invoked with the ClientHello
-    %% server_name; its returned cert/key override the static ones above.
-    sni_callback ::
-        fun((binary() | undefined) -> {ok, map()} | {error, term()}) | undefined,
-    alpn_list :: [binary()],
+    tls :: #listener_tls{},
     %% Connection ID -> Pid mapping
     connections :: ets:tid(),
     %% Pid -> Connection ID, for the connections this listener started,
@@ -370,13 +376,15 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
         send_sender = SendSender,
         send_gso_counter = SendGSOCounter,
         port = ActualPort,
-        cert = Cert,
-        cert_chain = CertChain,
-        private_key = PrivateKey,
-        psks = Psks,
-        psk_callback = PskCallback,
-        sni_callback = SniCallback,
-        alpn_list = ALPNList,
+        tls = #listener_tls{
+            cert = Cert,
+            cert_chain = CertChain,
+            private_key = PrivateKey,
+            psks = Psks,
+            psk_callback = PskCallback,
+            sni_callback = SniCallback,
+            alpn_list = ALPNList
+        },
         connections = ConnTab,
         cid_index = ets:new(quic_cid_index, [bag, private]),
         tickets_table = TicketTab,
@@ -1129,13 +1137,15 @@ create_connection_unconditional(
         socket = Socket,
         socket_state = SocketState,
         socket_backend = Backend,
-        cert = Cert,
-        cert_chain = CertChain,
-        private_key = PrivateKey,
-        psks = Psks,
-        psk_callback = PskCallback,
-        sni_callback = SniCallback,
-        alpn_list = ALPNList,
+        tls = #listener_tls{
+            cert = Cert,
+            cert_chain = CertChain,
+            private_key = PrivateKey,
+            psks = Psks,
+            psk_callback = PskCallback,
+            sni_callback = SniCallback,
+            alpn_list = ALPNList
+        },
         tickets_table = TicketTab,
         connection_handler = ConnHandler,
         cid_config = CIDConfig,
