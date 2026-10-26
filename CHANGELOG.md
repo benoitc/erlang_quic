@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- Connections produce much less garbage and use less CPU per packet. A
+  small request/response exchange creates about 70% less garbage per
+  round trip, decoding the common frames is about twice as fast, and
+  bulk transfers run faster as well.
+- A pending acknowledgement now travels on the next data packet instead
+  of in a packet of its own, so a request/response exchange sends two
+  packets per round trip instead of three. `ack_sent` in `get_stats/1`
+  counts these acknowledgements too.
+- Sending an acknowledgement now cancels its delay timer, so the
+  connection no longer wakes up later for a timer with nothing left to
+  do.
+
 ## [2.1.2] - 2026-10-25
 
 ### Security
