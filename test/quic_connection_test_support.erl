@@ -235,16 +235,16 @@ state_for_reset(DCID, PeerCIDPool, Secret) ->
 %% drops, so only the accounting itself is exercised.
 -spec state_amp(client | server, boolean()) -> #state{}.
 state_amp(Role, Validated) ->
-    #state{address_validated = Validated, cfg = #conn_cfg{role = Role}}.
+    #state{cfg = #conn_cfg{role = Role}, hs = #hs{address_validated = Validated}}.
 
 -spec amp_counters(#state{}) -> #{atom() => non_neg_integer()}.
-amp_counters(#state{amp_rx = Rx, amp_tx = Tx} = State) ->
+amp_counters(#state{hs = #hs{amp_rx = Rx, amp_tx = Tx}} = State) ->
     Deferred = length(pending_hs(State, initial)) + length(pending_hs(State, handshake)),
     #{amp_rx => Rx, amp_tx => Tx, deferred => Deferred}.
 
 %% What a space still holds back, in the order it would be sent.
 -spec pending_hs(#state{}, quic_loss:space()) -> [{iodata(), [term()]}].
-pending_hs(#state{pending_hs = Pending}, Space) ->
+pending_hs(#state{hs = #hs{pending_hs = Pending}}, Space) ->
     queue:to_list(maps:get(Space, Pending, queue:new())).
 
 %% Minimal #state{} scoped to role for frame-dispatch tests.
@@ -267,22 +267,24 @@ state_with_keys(Role) ->
     Keys = quic_connection:derive_initial_keys(<<"discard-cid">>, ?QUIC_VERSION_1),
     #state{
         dcid = <<"peer-cid">>,
-        pn_handshake = #pn_space{
-            next_pn = 0,
-            largest_recv = undefined,
-            recv_time = undefined,
-            ack_ranges = [],
-            ack_eliciting_in_flight = 0
-        },
         coalesce = true,
-        initial_keys = Keys,
-        handshake_keys = Keys,
         app_keys = Keys,
         loss_state = quic_loss:new(),
         cc_state = quic_cc:new(#{}),
         cfg = #conn_cfg{
             role = Role,
             scid = <<"own-cid0">>
+        },
+        hs = #hs{
+            pn_handshake = #pn_space{
+                next_pn = 0,
+                largest_recv = undefined,
+                recv_time = undefined,
+                ack_ranges = [],
+                ack_eliciting_in_flight = 0
+            },
+            initial_keys = Keys,
+            handshake_keys = Keys
         }
     }.
 
@@ -292,27 +294,31 @@ state_with_keys(Role) ->
 with_keys_and_socket(State) ->
     #state{
         dcid = DCID,
-        initial_keys = IK,
-        handshake_keys = HK,
         app_keys = AK,
-        pn_handshake = PNH,
         loss_state = LS,
         cc_state = CC,
         cfg = #conn_cfg{
             scid = SCID
+        },
+        hs = #hs{
+            initial_keys = IK,
+            handshake_keys = HK,
+            pn_handshake = PNH
         }
     } = state_with_keys((State#state.cfg)#conn_cfg.role),
     state_sending(State#state{
         dcid = DCID,
-        initial_keys = IK,
-        handshake_keys = HK,
         app_keys = AK,
-        pn_handshake = PNH,
         pn_app = PNH,
         loss_state = LS,
         cc_state = CC,
         cfg = (State#state.cfg)#conn_cfg{
             scid = SCID
+        },
+        hs = (State#state.hs)#hs{
+            initial_keys = IK,
+            handshake_keys = HK,
+            pn_handshake = PNH
         }
     }).
 
@@ -321,7 +327,7 @@ with_keys_and_socket(State) ->
 -spec state_owing_ack(non_neg_integer(), boolean()) -> #state{}.
 state_owing_ack(Count, TimerArmed) ->
     S = state_sending(state_with_keys(client)),
-    PN = S#state.pn_handshake,
+    PN = (S#state.hs)#hs.pn_handshake,
     S#state{
         coalesce = false,
         pn_app = PN#pn_space{largest_recv = 4, ack_ranges = [{0, 4}]},
@@ -352,7 +358,7 @@ state_with_send_stream(StreamId, SendOffset, SendFin) ->
     },
     S = state_sending(state_with_keys(client)),
     S#state{
-        pn_app = S#state.pn_handshake,
+        pn_app = (S#state.hs)#hs.pn_handshake,
         streams = #{StreamId => Stream},
         max_data_remote = 1000000,
         data_sent = SendOffset
@@ -401,11 +407,11 @@ state_sending(State) ->
 state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
 state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at;
 state_get(#state{} = S, dcid) -> S#state.dcid;
-state_get(#state{} = S, initial_keys) -> S#state.initial_keys;
-state_get(#state{} = S, handshake_keys) -> S#state.handshake_keys;
-state_get(#state{} = S, handshake_next_pn) -> (S#state.pn_handshake)#pn_space.next_pn;
+state_get(#state{} = S, initial_keys) -> (S#state.hs)#hs.initial_keys;
+state_get(#state{} = S, handshake_keys) -> (S#state.hs)#hs.handshake_keys;
+state_get(#state{} = S, handshake_next_pn) -> ((S#state.hs)#hs.pn_handshake)#pn_space.next_pn;
 state_get(#state{} = S, packets_sent) -> quic_connection:count(?C_PACKETS_SENT, S);
-state_get(#state{} = S, amp_tx) -> S#state.amp_tx;
+state_get(#state{} = S, amp_tx) -> (S#state.hs)#hs.amp_tx;
 state_get(#state{} = S, pacing_timer) -> S#state.pacing_timer.
 
 state_set(#state{} = S, loss_state, V) ->
@@ -419,17 +425,17 @@ state_set(#state{} = S, peer_active_cid_limit, V) ->
 state_set(#state{} = S, dcid, V) ->
     S#state{dcid = V};
 state_set(#state{} = S, retry_scid, V) ->
-    S#state{retry_scid = V};
+    S#state{hs = (S#state.hs)#hs{retry_scid = V}};
 state_set(#state{} = S, transport_params, V) ->
     S#state{transport_params = V};
 state_set(#state{} = S, cc_state, V) ->
     S#state{cc_state = V};
 state_set(#state{} = S, hs_probe, V) ->
-    S#state{hs_probe = V};
+    S#state{hs = (S#state.hs)#hs{hs_probe = V}};
 state_set(#state{} = S, address_validated, V) ->
-    S#state{address_validated = V};
+    S#state{hs = (S#state.hs)#hs{address_validated = V}};
 state_set(#state{} = S, amp_rx, V) ->
-    S#state{amp_rx = V}.
+    S#state{hs = (S#state.hs)#hs{amp_rx = V}}.
 
 %% A #state{} carrying a loss tracker, for the space whose timer is
 %% under test. The application space is only reachable once the handshake
@@ -507,7 +513,9 @@ complete_migration(Owner, OldPath, NewPath) ->
         pmtu_state = quic_pmtu:new(),
         pmtu_probe_timer = undefined,
         pmtu_raise_timer = undefined,
-        alt_paths = []
+        mig = #mig{
+            alt_paths = []
+        }
     },
     %% Call complete_migration - it will send message to Owner if active migration
     _ = quic_connection:complete_migration(NewPath, State),
@@ -934,7 +942,7 @@ send_queue_full_refusals(S) -> quic_connection:count(?C_SEND_QUEUE_FULL_REFUSALS
 state_for_manual_recv(Window, MaxWindow) ->
     S0 = state_with_stream_limits(client, Window, Window),
     S1 = state_sending(S0#state{
-        pn_app = S0#state.pn_handshake,
+        pn_app = (S0#state.hs)#hs.pn_handshake,
         max_data_local = Window,
         coalesce = false,
         cfg = (S0#state.cfg)#conn_cfg{

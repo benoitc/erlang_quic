@@ -205,9 +205,10 @@
     qlog_ctx :: #qlog_ctx{} | undefined
 }).
 
--record(state, {
-    %% Connection identity (the rest is in #conn_cfg{})
-    dcid :: binary(),
+%% Handshake, TLS and peer identity state. Read on the hot path but
+%% written only around the handshake, so it is kept out of #state{}:
+%% a #state update copies one pointer for all of it.
+-record(hs, {
     %% Retry handling (RFC 9000 Section 8.1)
 
     % Token from Retry packet for Initial resend
@@ -226,25 +227,6 @@
     amp_tx = 0 :: non_neg_integer(),
     % SCID from Retry packet (for transport param validation)
     retry_scid :: binary() | undefined,
-    version = ?QUIC_VERSION_1 :: non_neg_integer(),
-
-    %% Socket
-    socket :: gen_udp:socket() | socket:socket() | undefined,
-    %% Socket state for batching (quic_socket abstraction)
-    socket_state :: quic_socket:socket_state() | undefined,
-    %% Pid of the client-side receiver process when
-    %% client_socket_backend = socket; undefined otherwise.
-    client_receiver :: pid() | undefined,
-    remote_addr :: {inet:ip_address(), inet:port_number()},
-
-    %% Owner process (receives {quic, Conn, Event} messages where Conn is pid())
-    owner :: pid(),
-    %% How the connection follows its owner down: a monitor on the owner;
-    %% `{linked, Parent}' for a client that follows the caller that started
-    %% it through their link, until it is handed to another owner;
-    %% `opted_out' when `monitor_owner => false' asked for the connection to
-    %% outlive it; `undefined' when there is nothing to follow.
-    owner_mon :: reference() | {linked, pid()} | opted_out | undefined,
 
     %% Options
     server_name :: binary() | undefined,
@@ -256,11 +238,6 @@
     %% still decrypt (RFC 9368 §2.2).
     initial_keys_alt :: {non_neg_integer(), {#crypto_keys{}, #crypto_keys{}}} | undefined,
     handshake_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
-    % Convenience accessor (= key_state.current_keys)
-    app_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
-
-    %% Key update state (RFC 9001 Section 6)
-    key_state :: #key_update_state{} | undefined,
 
     %% TLS state
     tls_state :: atom(),
@@ -303,12 +280,128 @@
     %% Incomplete TLS message buffer (data that couldn't be parsed yet)
     tls_buffer = #{initial => <<>>, handshake => <<>>, app => <<>>} :: map(),
 
-    %% Negotiated ALPN
-    alpn :: binary() | undefined,
-
     %% Packet number spaces
     pn_initial :: #pn_space{},
     pn_handshake :: #pn_space{},
+    %% Handshake payloads the congestion window or pacer refused, held as
+    %% frames rather than encoded packets so no packet number is spent
+    %% until one actually goes out. Drained when an acknowledgement
+    %% reopens the window.
+    pending_hs = #{initial => queue:new(), handshake => queue:new()} :: #{
+        quic_loss:space() => queue:queue({iodata(), [term()]})
+    },
+    %% Payload bytes held in pending_hs, per space, against
+    %% ?MAX_PENDING_HS_BYTES.
+    pending_hs_bytes = #{initial => 0, handshake => 0} :: #{
+        quic_loss:space() => non_neg_integer()
+    },
+    %% Set while a probe is being sent, which RFC 9002 Section 7 exempts
+    %% from the congestion window.
+    hs_probe = false :: boolean(),
+    %% Client-side: a Handshake acknowledgement has arrived, so the
+    %% server has validated this address (RFC 9002 Appendix A.8
+    %% PeerCompletedAddressValidation). Always true for a server, which
+    %% reads the predicate directly rather than this field.
+    handshake_ack_received = false :: boolean(),
+
+    %% Peer certificate (received during TLS handshake)
+    peer_cert :: binary() | undefined,
+    peer_cert_chain = [] :: [binary()],
+    server_cert :: binary() | undefined,
+    server_cert_chain = [] :: [binary()],
+    server_private_key :: term() | undefined,
+    %% True if server sent CertificateRequest
+    cert_request_received = false :: boolean(),
+
+    %% Session resumption (RFC 8446 Section 4.6)
+    resumption_secret :: binary() | undefined,
+    % Default max 0-RTT data size
+    max_early_data = 16384 :: non_neg_integer(),
+
+    %% Client-side ticket storage for session resumption
+    ticket_store = #{} :: quic_ticket:ticket_store(),
+    %% Per-handshake: identity/secret/mode the server selected, or undefined.
+    selected_psk ::
+        undefined
+        | #{
+            identity => binary(),
+            identity_idx => non_neg_integer(),
+            secret => binary(),
+            mode => psk_dhe_ke | psk_ke,
+            source => external | ticket
+        },
+
+    %% 0-RTT / Early Data (RFC 9001 Section 4.6)
+
+    % {Keys, EarlySecret}
+    early_keys :: {#crypto_keys{}, binary()} | undefined,
+    % Bytes of early data sent
+    early_data_sent = 0 :: non_neg_integer(),
+    % Server accepted early data
+    early_data_accepted = false :: boolean(),
+    %% Streams that have carried 0-RTT-encrypted data. Used at handshake
+    %% completion to either retain (acceptance) or reset (rejection per
+    %% RFC 9001 §4.6.2) stream state.
+    zero_rtt_stream_ids = sets:new([{version, 2}]) :: sets:set(non_neg_integer())
+}).
+
+%% Connection migration and path validation (RFC 9000 Section 9).
+%% Written only when a path changes, so it is kept out of #state{}.
+-record(mig, {
+    %% Alternative paths being validated
+    alt_paths = [] :: [#path_state{}],
+    %% Preferred address being validated (RFC 9000 Section 9.6)
+    %% Set when client is validating server's preferred address
+    preferred_address :: #preferred_address{} | undefined,
+
+    %% Migration state machine (RFC 9000 Section 9)
+    %% idle: no migration in progress
+    %% validating_peer: server validating client's new address
+    migration_state = idle :: idle | validating_peer,
+    %% Path being validated when client sends from new address
+    pending_peer_validation :: #path_state{} | undefined,
+    %% Old path validation for anti-spoofing defense (RFC 9000 Section 9.3.2)
+    %% When detecting apparent migration, probe both old and new paths
+    old_path_validation :: #path_state{} | undefined,
+    %% Timer reference for path validation timeout
+    path_validation_timer :: reference() | undefined,
+    %% Token for correlating path validation timeout messages
+    %% Used to ignore stale timeouts from canceled validations
+    path_validation_token :: reference() | undefined,
+    %% Peer's disable_active_migration transport param (RFC 9000 Section 18.2)
+    peer_disable_migration = false :: boolean()
+}).
+
+-record(state, {
+    %% Connection identity (the rest is in #conn_cfg{})
+    dcid :: binary(),
+    version = ?QUIC_VERSION_1 :: non_neg_integer(),
+
+    %% Socket
+    socket :: gen_udp:socket() | socket:socket() | undefined,
+    %% Socket state for batching (quic_socket abstraction)
+    socket_state :: quic_socket:socket_state() | undefined,
+    %% Pid of the client-side receiver process when
+    %% client_socket_backend = socket; undefined otherwise.
+    client_receiver :: pid() | undefined,
+    remote_addr :: {inet:ip_address(), inet:port_number()},
+
+    %% Owner process (receives {quic, Conn, Event} messages where Conn is pid())
+    owner :: pid(),
+    %% How the connection follows its owner down: a monitor on the owner;
+    %% `{linked, Parent}' for a client that follows the caller that started
+    %% it through their link, until it is handed to another owner;
+    %% `opted_out' when `monitor_owner => false' asked for the connection to
+    %% outlive it; `undefined' when there is nothing to follow.
+    owner_mon :: reference() | {linked, pid()} | opted_out | undefined,
+    % Convenience accessor (= key_state.current_keys)
+    app_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
+
+    %% Key update state (RFC 9001 Section 6)
+    key_state :: #key_update_state{} | undefined,
+
+    %% Negotiated ALPN
+    alpn :: binary() | undefined,
     pn_app :: #pn_space{},
 
     %% Flow control
@@ -394,26 +487,6 @@
     %% probe. They are handled differently when it fires, and a change of
     %% either forces a re-arm.
     pto_kind = pto :: loss | pto,
-    %% Handshake payloads the congestion window or pacer refused, held as
-    %% frames rather than encoded packets so no packet number is spent
-    %% until one actually goes out. Drained when an acknowledgement
-    %% reopens the window.
-    pending_hs = #{initial => queue:new(), handshake => queue:new()} :: #{
-        quic_loss:space() => queue:queue({iodata(), [term()]})
-    },
-    %% Payload bytes held in pending_hs, per space, against
-    %% ?MAX_PENDING_HS_BYTES.
-    pending_hs_bytes = #{initial => 0, handshake => 0} :: #{
-        quic_loss:space() => non_neg_integer()
-    },
-    %% Set while a probe is being sent, which RFC 9002 Section 7 exempts
-    %% from the congestion window.
-    hs_probe = false :: boolean(),
-    %% Client-side: a Handshake acknowledgement has arrived, so the
-    %% server has validated this address (RFC 9002 Appendix A.8
-    %% PeerCompletedAddressValidation). Always true for a server, which
-    %% reads the predicate directly rather than this field.
-    handshake_ack_received = false :: boolean(),
     idle_timer :: reference() | undefined,
     keep_alive_timer :: reference() | undefined,
     %% Dedicated timer for the above. Checking it only when a PTO happened
@@ -461,28 +534,6 @@
     %% Connection Migration (RFC 9000 Section 9)
     %% Current path (active remote address)
     current_path :: #path_state{} | undefined,
-    %% Alternative paths being validated
-    alt_paths = [] :: [#path_state{}],
-    %% Preferred address being validated (RFC 9000 Section 9.6)
-    %% Set when client is validating server's preferred address
-    preferred_address :: #preferred_address{} | undefined,
-
-    %% Migration state machine (RFC 9000 Section 9)
-    %% idle: no migration in progress
-    %% validating_peer: server validating client's new address
-    migration_state = idle :: idle | validating_peer,
-    %% Path being validated when client sends from new address
-    pending_peer_validation :: #path_state{} | undefined,
-    %% Old path validation for anti-spoofing defense (RFC 9000 Section 9.3.2)
-    %% When detecting apparent migration, probe both old and new paths
-    old_path_validation :: #path_state{} | undefined,
-    %% Timer reference for path validation timeout
-    path_validation_timer :: reference() | undefined,
-    %% Token for correlating path validation timeout messages
-    %% Used to ignore stale timeouts from canceled validations
-    path_validation_token :: reference() | undefined,
-    %% Peer's disable_active_migration transport param (RFC 9000 Section 18.2)
-    peer_disable_migration = false :: boolean(),
     %% Transient field: source address of the current packet being processed
     %% Set during packet processing, cleared after. Used to route PATH_RESPONSE
     %% to the address that sent the PATH_CHALLENGE (RFC 9000 Section 8.2.2).
@@ -494,46 +545,6 @@
     %% Both connection ID pools and both active_connection_id_limits
     %% (RFC 9000 Section 5.1), owned by quic_cid.
     cid_pool_state = #cid_pool_state{} :: quic_cid:pool(),
-
-    %% Peer certificate (received during TLS handshake)
-    peer_cert :: binary() | undefined,
-    peer_cert_chain = [] :: [binary()],
-    server_cert :: binary() | undefined,
-    server_cert_chain = [] :: [binary()],
-    server_private_key :: term() | undefined,
-    %% True if server sent CertificateRequest
-    cert_request_received = false :: boolean(),
-
-    %% Session resumption (RFC 8446 Section 4.6)
-    resumption_secret :: binary() | undefined,
-    % Default max 0-RTT data size
-    max_early_data = 16384 :: non_neg_integer(),
-
-    %% Client-side ticket storage for session resumption
-    ticket_store = #{} :: quic_ticket:ticket_store(),
-    %% Per-handshake: identity/secret/mode the server selected, or undefined.
-    selected_psk ::
-        undefined
-        | #{
-            identity => binary(),
-            identity_idx => non_neg_integer(),
-            secret => binary(),
-            mode => psk_dhe_ke | psk_ke,
-            source => external | ticket
-        },
-
-    %% 0-RTT / Early Data (RFC 9001 Section 4.6)
-
-    % {Keys, EarlySecret}
-    early_keys :: {#crypto_keys{}, binary()} | undefined,
-    % Bytes of early data sent
-    early_data_sent = 0 :: non_neg_integer(),
-    % Server accepted early data
-    early_data_accepted = false :: boolean(),
-    %% Streams that have carried 0-RTT-encrypted data. Used at handshake
-    %% completion to either retain (acceptance) or reset (rejection per
-    %% RFC 9001 §4.6.2) stream state.
-    zero_rtt_stream_ids = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
 
     %% PMTU Discovery (RFC 8899)
     pmtu_state :: #pmtu_state{} | undefined,
@@ -583,8 +594,10 @@
     pend_frames = [] :: [tuple()],
     pend_size = 0 :: non_neg_integer(),
 
-    %% Write-once configuration, see #conn_cfg{}.
-    cfg = #conn_cfg{} :: #conn_cfg{}
+    %% Rarely written groups, each copied as one pointer by a state update.
+    cfg = #conn_cfg{} :: #conn_cfg{},
+    hs = #hs{} :: #hs{},
+    mig = #mig{} :: #mig{}
 }).
 
 -endif.
