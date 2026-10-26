@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.1.3] - 2026-10-26
 
 ### Changed
 - Connections produce much less garbage and use less CPU per packet. A
