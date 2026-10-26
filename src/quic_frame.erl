@@ -215,9 +215,16 @@ decode(<<0, Rest/binary>>) ->
 decode(<<1, Rest/binary>>) ->
     {ping, Rest};
 decode(<<2, Rest/binary>>) ->
-    decode_ack(Rest, false);
+    ack(Rest, 2);
 decode(<<3, Rest/binary>>) ->
-    decode_ack(Rest, true);
+    ack(Rest, 3);
+decode(<<?FRAME_MAX_DATA, P1:2, MaxData:((8 bsl P1) - 2), Rest/binary>>) ->
+    {{max_data, MaxData}, Rest};
+decode(
+    <<?FRAME_MAX_STREAM_DATA, P1:2, StreamId:((8 bsl P1) - 2), P2:2, MaxData:((8 bsl P2) - 2),
+        Rest/binary>>
+) ->
+    {{max_stream_data, StreamId, MaxData}, Rest};
 decode(<<?FRAME_RESET_STREAM, Rest/binary>>) ->
     {StreamId, Rest1} = quic_varint:decode(Rest),
     {ErrorCode, Rest2} = quic_varint:decode(Rest1),
@@ -253,29 +260,7 @@ decode(<<?FRAME_NEW_TOKEN, Rest/binary>>) ->
             {{new_token, Token}, Rest2}
     end;
 decode(<<Type, Rest/binary>>) when Type >= ?FRAME_STREAM, Type =< 16#0f ->
-    HasOff = (Type band ?STREAM_FLAG_OFF) =/= 0,
-    HasLen = (Type band ?STREAM_FLAG_LEN) =/= 0,
-    Fin = (Type band ?STREAM_FLAG_FIN) =/= 0,
-    {StreamId, Rest1} = quic_varint:decode(Rest),
-    {Offset, Rest2} =
-        case HasOff of
-            true -> quic_varint:decode(Rest1);
-            false -> {0, Rest1}
-        end,
-    case HasLen of
-        true ->
-            {Length, R} = quic_varint:decode(Rest2),
-            case Length > ?MAX_FRAME_DATA_LEN of
-                true ->
-                    {error, frame_too_large};
-                false ->
-                    <<D:Length/binary, R2/binary>> = R,
-                    {{stream, StreamId, Offset, D, Fin}, R2}
-            end;
-        false ->
-            %% Data extends to end of packet
-            {{stream, StreamId, Offset, Rest2, Fin}, <<>>}
-    end;
+    stream(Type, Rest);
 decode(<<?FRAME_MAX_DATA, Rest/binary>>) ->
     {MaxData, Rest1} = quic_varint:decode(Rest),
     {{max_data, MaxData}, Rest1};
@@ -433,6 +418,93 @@ decode_ack(Bin, WithECN) ->
             {ECNCE, Rest8} = quic_varint:decode(Rest7),
             {{ack, Ranges, AckDelay, {ECT0, ECT1, ECNCE}}, Rest8}
     end.
+
+%% Hot frames: each varint is matched in the head (RFC 9000 §16: a 2-bit
+%% prefix P gives 6, 14, 30 or 62 value bits), which keeps the match
+%% context where quic_varint:decode/1 builds a tuple and a sub-binary
+%% per field. Input the fast clauses do not match (truncated, oversized)
+%% goes to the field-by-field decoder, which keeps its error behaviour.
+stream(
+    Type,
+    <<P1:2, StreamId:((8 bsl P1) - 2), P2:2, Offset:((8 bsl P2) - 2), P3:2, Len:((8 bsl P3) - 2),
+        Data:Len/binary, Rest/binary>>
+) when (Type band 16#fe) =:= 16#0e, Len =< ?MAX_FRAME_DATA_LEN ->
+    stream_frame(Type, StreamId, Offset, Data, Rest);
+stream(
+    Type,
+    <<P1:2, StreamId:((8 bsl P1) - 2), P2:2, Len:((8 bsl P2) - 2), Data:Len/binary, Rest/binary>>
+) when
+    (Type band 16#fe) =:= 16#0a, Len =< ?MAX_FRAME_DATA_LEN
+->
+    stream_frame(Type, StreamId, 0, Data, Rest);
+stream(Type, <<P1:2, StreamId:((8 bsl P1) - 2), P2:2, Offset:((8 bsl P2) - 2), Data/binary>>) when
+    (Type band 16#fe) =:= 16#0c
+->
+    stream_frame(Type, StreamId, Offset, Data, <<>>);
+stream(Type, <<P1:2, StreamId:((8 bsl P1) - 2), Data/binary>>) when (Type band 16#fe) =:= 16#08 ->
+    stream_frame(Type, StreamId, 0, Data, <<>>);
+stream(Type, <<Rest/binary>>) ->
+    stream_generic(Type, Rest).
+
+stream_frame(Type, StreamId, Offset, Data, Rest) ->
+    {{stream, StreamId, Offset, Data, (Type band 1) =:= 1}, Rest}.
+
+stream_generic(Type, Rest) ->
+    HasOff = (Type band ?STREAM_FLAG_OFF) =/= 0,
+    HasLen = (Type band ?STREAM_FLAG_LEN) =/= 0,
+    Fin = (Type band ?STREAM_FLAG_FIN) =/= 0,
+    {StreamId, Rest1} = quic_varint:decode(Rest),
+    {Offset, Rest2} =
+        case HasOff of
+            true -> quic_varint:decode(Rest1);
+            false -> {0, Rest1}
+        end,
+    case HasLen of
+        true ->
+            {Length, R} = quic_varint:decode(Rest2),
+            case Length > ?MAX_FRAME_DATA_LEN of
+                true ->
+                    {error, frame_too_large};
+                false ->
+                    <<D:Length/binary, R2/binary>> = R,
+                    {{stream, StreamId, Offset, D, Fin}, R2}
+            end;
+        false ->
+            %% Data extends to end of packet
+            {{stream, StreamId, Offset, Rest2, Fin}, <<>>}
+    end.
+
+ack(
+    <<P1:2, Largest:((8 bsl P1) - 2), P2:2, Delay:((8 bsl P2) - 2), P3:2, Count:((8 bsl P3) - 2),
+        P4:2, First:((8 bsl P4) - 2), Rest/binary>>,
+    Type
+) ->
+    ack_ranges(Rest, Count, [{Largest, First}], Delay, Type);
+ack(<<Rest/binary>>, Type) ->
+    decode_ack(Rest, Type =:= 3).
+
+%% ACK ranges, then the ECN counts for type 0x03, all in one match context.
+ack_ranges(
+    <<P1:2, Gap:((8 bsl P1) - 2), P2:2, Range:((8 bsl P2) - 2), Rest/binary>>, N, Acc, Delay, Type
+) when N > 0 ->
+    ack_ranges(Rest, N - 1, [{Gap, Range} | Acc], Delay, Type);
+ack_ranges(<<Rest/binary>>, 0, Acc, Delay, 2) ->
+    {{ack, lists:reverse(Acc), Delay, undefined}, Rest};
+ack_ranges(
+    <<P1:2, ECT0:((8 bsl P1) - 2), P2:2, ECT1:((8 bsl P2) - 2), P3:2, ECNCE:((8 bsl P3) - 2),
+        Rest/binary>>,
+    0,
+    Acc,
+    Delay,
+    3
+) ->
+    {{ack, lists:reverse(Acc), Delay, {ECT0, ECT1, ECNCE}}, Rest};
+ack_ranges(<<Bin/binary>>, N, _Acc, _Delay, _Type) ->
+    %% Truncated: raise what the field-by-field decoder raises.
+    {_, Rest1} = quic_varint:decode(Bin),
+    {_, Rest2} = quic_varint:decode(Rest1),
+    _ = N > 0 orelse quic_varint:decode(Rest2),
+    error(badarg).
 
 decode_ack_ranges(0, Bin) ->
     {[], Bin};
