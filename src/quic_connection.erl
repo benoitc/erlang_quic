@@ -1959,12 +1959,12 @@ connected(cast, process, #state{role = server} = State) ->
     {keep_state, State};
 %% Handle delayed ACK timer (RFC 9000 §13.2.1 / RFC 9221 §5.2).
 %% Validates reference to ignore stale timer events.
-connected(info, {send_delayed_ack, app, Ref}, #state{ack_timer = Ref} = State) ->
+connected(info, {timeout, Ref, send_delayed_ack}, #state{ack_timer = Ref} = State) ->
     %% send_app_ack/1 clears ack_timer + ack_elicited_count.
     State1 = send_app_ack(State),
     NewState = flush_event(State1, event),
     {keep_state, NewState};
-connected(info, {send_delayed_ack, app, _StaleRef}, State) ->
+connected(info, {timeout, _StaleRef, send_delayed_ack}, State) ->
     %% Stale timer — ignore.
     {keep_state, State};
 %% Handle PMTU probe timeout (RFC 8899)
@@ -3588,7 +3588,9 @@ end_coalescing(true, #state{pend_payload = PP, pend_frames = PF} = State) ->
 %% one packet, and the budget bounds packets on the wire. `clear' empties
 %% the coalescing buffer the payload came from, in the same update;
 %% `close' also turns coalescing off.
-send_app_packet_now(Payload, Frames, State, Pend, CCState) ->
+send_app_packet_now(Payload0, Frames0, State, Pend, CCState) ->
+    AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames0),
+    {Payload, Frames, AckFields} = piggyback_ack(AckEliciting, Payload0, Frames0, State),
     #state{
         dcid = DCID,
         app_keys = {ClientKeys, ServerKeys},
@@ -3642,9 +3644,6 @@ send_app_packet_now(Payload, Frames, State, Pend, CCState) ->
             Now = erlang:monotonic_time(millisecond),
 
             %% Track sent packet for loss detection and congestion control.
-            %% Determine if ack-eliciting by checking the actual frames list
-            %% so coalesced packets with multiple frames are handled.
-            AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames),
             NewLossState = quic_loss:on_packet_sent(
                 app, LossState, PN, PacketSize, AckEliciting, Frames, Now
             ),
@@ -3677,6 +3676,7 @@ send_app_packet_now(Payload, Frames, State, Pend, CCState) ->
                     false -> State#state.last_activity
                 end,
             {NewKeyState, KeyLimit} = count_sealed(State#state.key_state, 1),
+            {AckTimer, AckCount, AckSent} = sent_ack_fields(AckFields, State),
             {PendPayload, PendFrames, PendSize, Coalesce} =
                 case Pend of
                     keep ->
@@ -3704,7 +3704,10 @@ send_app_packet_now(Payload, Frames, State, Pend, CCState) ->
                 pend_payload = PendPayload,
                 pend_frames = PendFrames,
                 pend_size = PendSize,
-                coalesce = Coalesce
+                coalesce = Coalesce,
+                ack_timer = AckTimer,
+                ack_elicited_count = AckCount,
+                ack_sent = AckSent
             },
             after_sealed(KeyLimit, State1);
         {error, Reason, ClearedSocketState} ->
@@ -3733,6 +3736,39 @@ clear_pend(clear, State) ->
     State#state{pend_payload = [], pend_frames = [], pend_size = 0};
 clear_pend(close, State) ->
     State#state{pend_payload = [], pend_frames = [], pend_size = 0, coalesce = false}.
+
+%% An ack-eliciting packet carries the pending ACK when it fits the data
+%% budget (RFC 9000 §13.2.1 lets an ACK ride on any 1-RTT packet), so an
+%% interactive exchange sends no ACK-only packet and needs no ACK timer.
+%% `acked' tells the packet update to clear the decimation state.
+piggyback_ack(
+    true,
+    Payload,
+    Frames,
+    #state{
+        ack_elicited_count = Count,
+        ack_timer = Timer,
+        pn_app = #pn_space{ack_ranges = [_ | _] = Ranges}
+    } = State
+) when Count > 0; Timer =/= undefined ->
+    AckFrame = quic_ack:build_ack_frame_tuple(Ranges),
+    AckBin = quic_frame:encode(AckFrame),
+    case
+        erlang:iolist_size(Payload) + byte_size(AckBin) =<
+            get_max_stream_data_per_packet(State)
+    of
+        true -> {[AckBin | Payload], [AckFrame | Frames], acked};
+        false -> {Payload, Frames, none}
+    end;
+piggyback_ack(_AckEliciting, Payload, Frames, _State) ->
+    {Payload, Frames, none}.
+
+%% ACK timer, decimation count and ACK counter after the packet went out.
+sent_ack_fields(none, #state{ack_timer = T, ack_elicited_count = C, ack_sent = N}) ->
+    {T, C, N};
+sent_ack_fields(acked, #state{ack_timer = T, ack_sent = N}) ->
+    cancel_timer(T),
+    {undefined, 0, N + 1}.
 
 %% Common error handling for send_app_packet_internal: bump PN without
 %% tracking the packet (PTO owns retransmission) and, on the 3-tuple
@@ -4138,9 +4174,7 @@ fold_opened_finish(State, N, Elicited) ->
         {0, _} ->
             State1;
         {_, true} ->
-            arm_ack_timer(State1#state{
-                ack_elicited_count = State1#state.ack_elicited_count + Elicited
-            });
+            State1#state{ack_elicited_count = State1#state.ack_elicited_count + Elicited};
         {_, false} ->
             lists:foldl(
                 fun(_, S) -> maybe_decimate_app_ack(S) end, State1, lists:seq(1, Elicited)
@@ -4243,8 +4277,7 @@ apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, Recv, State) ->
                                 pend_deliver = PendDeliver,
                                 has_non_probing_frame = true,
                                 packets_received = State#state.packets_received + N,
-                                ack_elicited_count = State#state.ack_elicited_count + N,
-                                ack_timer = ensure_ack_timer(State#state.ack_timer)
+                                ack_elicited_count = State#state.ack_elicited_count + N
                             };
                         false ->
                             State1 = with_recv(Recv, State),
@@ -7914,6 +7947,11 @@ flush_socket_batch(#state{socket_state = SocketState} = State) ->
         NewSocketState -> State#state{socket_state = NewSocketState}
     end.
 
+%% A receive pass only counts ack-eliciting packets; an ACK still owed at
+%% its end gets the max_ack_delay timer here.
+pass_ack_timer(#state{ack_elicited_count = 0, ack_timer = Timer}) -> Timer;
+pass_ack_timer(#state{ack_timer = Timer}) -> ensure_ack_timer(Timer).
+
 flushed_socket_state(undefined) ->
     undefined;
 flushed_socket_state(SocketState) ->
@@ -7925,7 +7963,8 @@ flushed_socket_state(SocketState) ->
 %% End of an event, in one record update: flush the socket batch and the
 %% deferred PTO reset (the idle and keep-alive timers are lazy, so the PTO
 %% is the only deferred timer); `rearm' forces the PTO reset. After a
-%% receive pass (`pass') the per-pass fields are cleared too. Every event that may have drained the send
+%% receive pass (`pass') the per-pass fields are cleared and an ACK still
+%% owed gets its timer. Every event that may have drained the send
 %% queue ends here, so it is also where a wanted send_ready goes out.
 flush_event(#state{socket_state = SocketState0, pto_dirty = Dirty0} = State, Scope) ->
     SocketState = flushed_socket_state(SocketState0),
@@ -7949,10 +7988,16 @@ flush_event(#state{socket_state = SocketState0, pto_dirty = Dirty0} = State, Sco
                             } = State,
                             {T, A, D, Sp, K}
                     end,
-                {Source, RecvPass} =
+                {Source, RecvPass, AckTimer} =
                     case Scope of
-                        pass -> {undefined, false};
-                        _ -> {State#state.current_packet_source, State#state.recv_pass}
+                        pass ->
+                            {undefined, false, pass_ack_timer(State)};
+                        _ ->
+                            {
+                                State#state.current_packet_source,
+                                State#state.recv_pass,
+                                State#state.ack_timer
+                            }
                     end,
                 State#state{
                     socket_state = SocketState,
@@ -7963,7 +8008,8 @@ flush_event(#state{socket_state = SocketState0, pto_dirty = Dirty0} = State, Sco
                     pto_kind = Kind,
                     pto_dirty = false,
                     current_packet_source = Source,
-                    recv_pass = RecvPass
+                    recv_pass = RecvPass,
+                    ack_timer = AckTimer
                 }
         end,
     maybe_send_ready(State1).
@@ -8021,8 +8067,9 @@ maybe_send_ack(_, _, State) ->
 %% the counter and arm a max_ack_delay timer (if not already armed).
 maybe_decimate_app_ack(#state{recv_pass = true} = State) ->
     %% Inside a receive pass: only count; flush_recv_pass/1 flushes
-    %% one ACK for the whole train.
-    arm_ack_timer(State#state{ack_elicited_count = State#state.ack_elicited_count + 1});
+    %% one ACK for the whole train and flush_event/2 arms the timer for a
+    %% remainder.
+    State#state{ack_elicited_count = State#state.ack_elicited_count + 1};
 maybe_decimate_app_ack(State) ->
     NewCount = State#state.ack_elicited_count + 1,
     case NewCount >= State#state.ack_packet_tolerance of
@@ -8101,11 +8148,11 @@ arm_ack_timer(#state{ack_timer = Ref} = State) when Ref =/= undefined ->
 arm_ack_timer(#state{ack_timer = undefined} = State) ->
     State#state{ack_timer = ensure_ack_timer(undefined)}.
 
-%% The armed ACK timer reference, arming one if there is none.
+%% The armed ACK timer, arming one if there is none. A start_timer
+%% reference is also the timer handle, so cancel_timer/1 stops it and a
+%% piggybacked ACK leaves no stale timeout behind.
 ensure_ack_timer(undefined) ->
-    NewRef = make_ref(),
-    erlang:send_after(?DEFAULT_MAX_ACK_DELAY, self(), {send_delayed_ack, app, NewRef}),
-    NewRef;
+    erlang:start_timer(?DEFAULT_MAX_ACK_DELAY, self(), send_delayed_ack);
 ensure_ack_timer(Ref) ->
     Ref.
 

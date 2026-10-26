@@ -491,7 +491,8 @@
     %% These count actual QUIC packets (not bytes), used by net_kernel getstat
     packets_received = 0 :: non_neg_integer(),
     packets_sent = 0 :: non_neg_integer(),
-    %% ACK packets actually emitted on the wire (Initial + Handshake + 1-RTT).
+    %% ACK frames emitted on the wire (Initial + Handshake + 1-RTT), alone
+    %% or riding on a data packet.
     %% Used by benches/tests to reason about ACK-to-data ratios.
     ack_sent = 0 :: non_neg_integer(),
     %% Retransmission packets emitted (CC-permitted branch of loss recovery).

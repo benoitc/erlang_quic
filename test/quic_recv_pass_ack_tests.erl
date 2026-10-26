@@ -17,9 +17,10 @@ steps(S, N) ->
 
 no_flush_inside_a_pass_test() ->
     S0 = in_pass(quic_connection_test_support:decimate_initial_state()),
-    %% Well past the tolerance (2): still counting, timer armed.
+    %% Well past the tolerance (2): still counting. The timer waits for
+    %% the end of the pass, which may not owe an ACK any more.
     {_S, Info} = quic_connection_test_support:decimate_step(steps(S0, 7)),
-    ?assertMatch(#{ack_elicited_count := 8, ack_timer_armed := true}, Info).
+    ?assertMatch(#{ack_elicited_count := 8, ack_timer_armed := false}, Info).
 
 one_ack_at_pass_end_test() ->
     S0 = in_pass(quic_connection_test_support:decimate_initial_state()),

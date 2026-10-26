@@ -8,6 +8,7 @@
 -include_lib("quic/src/quic_connection_state.hrl").
 
 -export([
+    state_owing_ack/2,
     datagrams_sent/1,
     state_with_loss/1,
     state_with_loss/2,
@@ -300,6 +301,23 @@ with_keys_and_socket(State) ->
         loss_state = LS,
         cc_state = CC
     }).
+
+%% A connected sender that has received packets 0..4 and owes their ACK:
+%% Count ack-eliciting packets since the last ACK, timer armed or not.
+-spec state_owing_ack(non_neg_integer(), boolean()) -> #state{}.
+state_owing_ack(Count, TimerArmed) ->
+    S = state_sending(state_with_keys(client)),
+    PN = S#state.pn_handshake,
+    S#state{
+        coalesce = false,
+        pn_app = PN#pn_space{largest_recv = 4, ack_ranges = [{0, 4}]},
+        ack_elicited_count = Count,
+        ack_timer =
+            case TimerArmed of
+                true -> make_ref();
+                false -> undefined
+            end
+    }.
 
 %% A connection with one local stream whose send side is at SendOffset,
 %% with its FIN already sent or not, and room in both windows.
