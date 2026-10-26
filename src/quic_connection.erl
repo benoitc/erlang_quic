@@ -701,7 +701,6 @@ init({server, Opts}) ->
 
     %% Initialize state
     State = #state{
-        scid = SCID,
         %% Sequence 0 is the handshake CID. It counts against the peer's
         %% active_connection_id_limit, so the pool has to hold it before
         %% we work out how many more to issue. Its reset token travels in
@@ -709,102 +708,109 @@ init({server, Opts}) ->
         cid_pool_state = quic_cid:new(SCID, maps:get(active_connection_id_limit, Opts, 2)),
         % Will be set from ClientHello SCID
         dcid = <<>>,
-        %% Defaults to the Initial's DCID; the listener overrides it with
-        %% the pre-Retry DCID (from the token) for a retried connection.
-        original_dcid = maps:get(original_dcid, Opts, InitialDCID),
-        role = server,
         % Use client's QUIC version
         version = Version,
-        supported_versions = SupportedVersions,
         socket = Socket,
-        %% send_socket is undefined - socket is in socket_state
-        send_socket = undefined,
         socket_state = SocketState,
         remote_addr = RemoteAddr,
-        local_addr = LocalAddr,
         % Listener is the owner for now
         owner = Listener,
         owner_mon = maybe_monitor_owner(Opts, Listener, true),
-        conn_ref = ConnRef,
-        verify = maps:get(verify, Opts, false),
-        cacerts = maps:get(cacerts, Opts, undefined),
-        require_client_cert = maps:get(require_client_cert, Opts, false),
-        initial_keys = InitialKeys,
-        tls_state = ?TLS_AWAITING_CLIENT_HELLO,
-        %% TLS 1.3 external PSK config (RFC 8446 §4.2.11). Either or
-        %% both may be `undefined'; if both are undefined the server
-        %% only accepts cert-authenticated handshakes.
-        psk_config = #{
-            psk_callback => maps:get(psk_callback, Opts, undefined),
-            psks => maps:get(psks, Opts, undefined)
-        },
-        %% Accept every group the crypto layer supports: a preference
-        %% list holding only x25519 forced a HelloRetryRequest round
-        %% trip on any client whose key_share leads with another group
-        %% (picoquic shares P-256 first).
-        tls_groups = maps:get(groups, Opts, [x25519, secp256r1, secp384r1]),
-        tls_sig_algs = maps:get(signature_algs, Opts, undefined),
-        alpn_list = normalize_alpn_list(ALPNList),
-        pn_initial = PNSpace,
-        pn_handshake = PNSpace,
         pn_app = PNSpace,
         max_data_local = maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA),
         max_data_remote = ?DEFAULT_INITIAL_MAX_DATA,
-        max_stream_data_bidi_local = maps:get(
-            max_stream_data_bidi_local, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
-        ),
-        max_stream_data_bidi_remote = maps:get(
-            max_stream_data_bidi_remote, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
-        ),
-        max_stream_data_uni = maps:get(max_stream_data_uni, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA),
         fc_last_stream_update = undefined,
         fc_last_conn_update = undefined,
-        fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
-        max_owner_queue = maps:get(max_owner_queue, Opts, ?DEFAULT_MAX_OWNER_QUEUE),
-        ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
-        burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
-        delivery_coalescing = bool_opt(delivery_coalescing, Opts),
         % Server-initiated bidi: 1, 5, 9, ...
         next_stream_id_bidi = 1,
         % Server-initiated uni: 3, 7, 11, ...
         next_stream_id_uni = 3,
-        cipher_preference = maps:get(ciphers, Opts, default_cipher_preference()),
         max_streams_bidi_local = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
-        max_udp_payload_size_local = maps:get(max_udp_payload_size, Opts, undefined),
-        max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
-        datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
-        spin_bit_enabled = maps:get(spin_bit, Opts, true),
-        stateless_reset_secret = maps:get(reset_secret, Opts, undefined),
-        address_validated = maps:get(address_validated, Opts, false),
-        retry_scid_for_tp = maps:get(retry_scid, Opts, undefined),
-        reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
-        idle_timeout = IdleTimeout,
-        keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
-        disconnect_timeout = disconnect_timeout_opt(Opts),
         keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
         loss_state = LossState,
-        listener = Listener,
-        ticket_table = maps:get(ticket_table, Opts, undefined),
-        server_cert = Cert,
-        server_cert_chain = CertChain,
-        server_private_key = PrivateKey,
-        sni_callback = SniCallback,
-        server_preferred_address = build_server_preferred_address(Opts),
-        cid_config = maps:get(cid_config, Opts, undefined),
-        congestion_threshold = maps:get(congestion_threshold, Opts, 2),
-        pacing_enabled = maps:get(pacing_enabled, Opts, true),
         pmtu_state = init_pmtu_state(Opts),
-        pmtu_raise_interval = maps:get(pmtu_raise_interval, Opts, ?PMTU_DEFAULT_RAISE_INTERVAL),
-        qlog_ctx = quic_qlog:new(Opts, InitialDCID, server)
+        cfg = #conn_cfg{
+            scid = SCID,
+            %% Defaults to the Initial's DCID; the listener overrides it with
+            %% the pre-Retry DCID (from the token) for a retried connection.
+            original_dcid = maps:get(original_dcid, Opts, InitialDCID),
+            role = server,
+            supported_versions = SupportedVersions,
+            %% send_socket is undefined - socket is in socket_state
+            send_socket = undefined,
+            local_addr = LocalAddr,
+            conn_ref = ConnRef,
+            verify = maps:get(verify, Opts, false),
+            cacerts = maps:get(cacerts, Opts, undefined),
+            require_client_cert = maps:get(require_client_cert, Opts, false),
+            %% TLS 1.3 external PSK config (RFC 8446 §4.2.11). Either or
+            %% both may be `undefined'; if both are undefined the server
+            %% only accepts cert-authenticated handshakes.
+            psk_config = #{
+                psk_callback => maps:get(psk_callback, Opts, undefined),
+                psks => maps:get(psks, Opts, undefined)
+            },
+            %% Accept every group the crypto layer supports: a preference
+            %% list holding only x25519 forced a HelloRetryRequest round
+            %% trip on any client whose key_share leads with another group
+            %% (picoquic shares P-256 first).
+            tls_groups = maps:get(groups, Opts, [x25519, secp256r1, secp384r1]),
+            tls_sig_algs = maps:get(signature_algs, Opts, undefined),
+            alpn_list = normalize_alpn_list(ALPNList),
+            max_stream_data_bidi_local = maps:get(
+                max_stream_data_bidi_local, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+            ),
+            max_stream_data_bidi_remote = maps:get(
+                max_stream_data_bidi_remote, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+            ),
+            max_stream_data_uni = maps:get(
+                max_stream_data_uni, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+            ),
+            fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
+            max_owner_queue = maps:get(max_owner_queue, Opts, ?DEFAULT_MAX_OWNER_QUEUE),
+            ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
+            burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
+            delivery_coalescing = bool_opt(delivery_coalescing, Opts),
+            cipher_preference = maps:get(ciphers, Opts, default_cipher_preference()),
+            max_udp_payload_size_local = maps:get(max_udp_payload_size, Opts, undefined),
+            max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
+            datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
+            spin_bit_enabled = maps:get(spin_bit, Opts, true),
+            stateless_reset_secret = maps:get(reset_secret, Opts, undefined),
+            retry_scid_for_tp = maps:get(retry_scid, Opts, undefined),
+            reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
+            idle_timeout = IdleTimeout,
+            keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
+            disconnect_timeout = disconnect_timeout_opt(Opts),
+            listener = Listener,
+            ticket_table = maps:get(ticket_table, Opts, undefined),
+            sni_callback = SniCallback,
+            server_preferred_address = build_server_preferred_address(Opts),
+            cid_config = maps:get(cid_config, Opts, undefined),
+            congestion_threshold = maps:get(congestion_threshold, Opts, 2),
+            pacing_enabled = maps:get(pacing_enabled, Opts, true),
+            pmtu_raise_interval = maps:get(pmtu_raise_interval, Opts, ?PMTU_DEFAULT_RAISE_INTERVAL),
+            qlog_ctx = quic_qlog:new(Opts, InitialDCID, server)
+        },
+        hs = #hs{
+            initial_keys = InitialKeys,
+            tls_state = ?TLS_AWAITING_CLIENT_HELLO,
+            pn_initial = PNSpace,
+            pn_handshake = PNSpace,
+            address_validated = maps:get(address_validated, Opts, false),
+            server_cert = Cert,
+            server_cert_chain = CertChain,
+            server_private_key = PrivateKey
+        }
     },
 
     %% Emit qlog connection_started event
-    quic_qlog:connection_started(State#state.qlog_ctx),
+    quic_qlog:connection_started((State#state.cfg)#conn_cfg.qlog_ctx),
 
     %% RFC 9000 §10.1: arm the idle timer once; it re-arms itself lazily
     %% from last_activity (the keep-alive timer is armed on entering the
@@ -1147,99 +1153,105 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
 
     %% Initialize state
     State = #state{
-        scid = SCID,
         %% Sequence 0 is the handshake CID; see the server init path.
         cid_pool_state = quic_cid:new(SCID, maps:get(active_connection_id_limit, Opts, 2)),
         dcid = DCID,
-        original_dcid = DCID,
-        role = client,
         version = Version,
-        supported_versions = SupportedVersions,
         socket = Sock,
         socket_state = SocketState,
-        client_socket_backend = ClientSocketBackend,
         client_receiver = ClientReceiver,
         remote_addr = RemoteAddr,
-        local_addr = LocalAddr,
         owner = Owner,
         %% Only supervised connections (started by quic_conn_sup) monitor their
         %% owner; caller-linked connections rely on the link instead, so they do
         %% not stop a different owner's death from propagating through the link.
         owner_mon = maybe_monitor_owner(Opts, Owner, false),
-        conn_ref = ConnRef,
-        server_name = ServerName,
-        verify = normalize_verify(maps:get(verify, Opts, true)),
-        cacerts = maps:get(cacerts, Opts, undefined),
-        client_cert = maps:get(cert, Opts, undefined),
-        client_cert_chain = maps:get(cert_chain, Opts, []),
-        client_private_key = maps:get(key, Opts, undefined),
-        initial_keys = InitialKeys,
-        retry_token = InitialRetryToken,
-        tls_state = ?TLS_AWAITING_SERVER_HELLO,
-        tls_groups = maps:get(groups, Opts, [x25519]),
-        tls_sig_algs = maps:get(signature_algs, Opts, undefined),
-        tls_group = hd(maps:get(groups, Opts, [x25519])),
-        alpn_list = AlpnList,
-        pn_initial = PNSpace,
-        pn_handshake = PNSpace,
         pn_app = PNSpace,
         max_data_local = maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA),
         max_data_remote = ?DEFAULT_INITIAL_MAX_DATA,
-        max_stream_data_bidi_local = maps:get(
-            max_stream_data_bidi_local, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
-        ),
-        max_stream_data_bidi_remote = maps:get(
-            max_stream_data_bidi_remote, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
-        ),
-        max_stream_data_uni = maps:get(max_stream_data_uni, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA),
         fc_last_stream_update = undefined,
         fc_last_conn_update = undefined,
-        fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
-        max_owner_queue = maps:get(max_owner_queue, Opts, ?DEFAULT_MAX_OWNER_QUEUE),
-        ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
-        burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
-        delivery_coalescing = bool_opt(delivery_coalescing, Opts),
         % Client-initiated bidi: 0, 4, 8, ...
         next_stream_id_bidi = 0,
         % Client-initiated uni: 2, 6, 10, ...
         next_stream_id_uni = 2,
-        cipher_preference = maps:get(ciphers, Opts, default_cipher_preference()),
         max_streams_bidi_local = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
-        max_udp_payload_size_local = maps:get(max_udp_payload_size, Opts, undefined),
-        max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
-        datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
-        spin_bit_enabled = maps:get(spin_bit, Opts, true),
-        stateless_reset_secret = maps:get(reset_secret, Opts, undefined),
-        reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
-        idle_timeout = IdleTimeoutClient,
-        keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
-        disconnect_timeout = disconnect_timeout_opt(Opts),
         keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
         loss_state = LossState,
-        %% Store session ticket for resumption
-        ticket_store =
-            case SessionTicket of
-                undefined -> quic_ticket:new_store();
-                Ticket -> quic_ticket:store_ticket(ServerName, Ticket, quic_ticket:new_store())
-            end,
-        %% TLS 1.3 external PSK (RFC 8446 §4.2.11) — mutually exclusive
-        %% with session_ticket; conflict raised by build_client_hello/1.
-        external_psk = ExternalPsk,
-        congestion_threshold = maps:get(congestion_threshold, Opts, 2),
-        pacing_enabled = maps:get(pacing_enabled, Opts, true),
-        active_n = maps:get(active_n, Opts, 100),
         pmtu_state = init_pmtu_state(Opts),
-        pmtu_raise_interval = maps:get(pmtu_raise_interval, Opts, ?PMTU_DEFAULT_RAISE_INTERVAL),
-        qlog_ctx = quic_qlog:new(Opts, DCID, client)
+        cfg = #conn_cfg{
+            scid = SCID,
+            original_dcid = DCID,
+            role = client,
+            supported_versions = SupportedVersions,
+            client_socket_backend = ClientSocketBackend,
+            local_addr = LocalAddr,
+            conn_ref = ConnRef,
+            verify = normalize_verify(maps:get(verify, Opts, true)),
+            cacerts = maps:get(cacerts, Opts, undefined),
+            client_cert = maps:get(cert, Opts, undefined),
+            client_cert_chain = maps:get(cert_chain, Opts, []),
+            client_private_key = maps:get(key, Opts, undefined),
+            tls_groups = maps:get(groups, Opts, [x25519]),
+            tls_sig_algs = maps:get(signature_algs, Opts, undefined),
+            alpn_list = AlpnList,
+            max_stream_data_bidi_local = maps:get(
+                max_stream_data_bidi_local, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+            ),
+            max_stream_data_bidi_remote = maps:get(
+                max_stream_data_bidi_remote, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+            ),
+            max_stream_data_uni = maps:get(
+                max_stream_data_uni, Opts, ?DEFAULT_INITIAL_MAX_STREAM_DATA
+            ),
+            fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
+            max_owner_queue = maps:get(max_owner_queue, Opts, ?DEFAULT_MAX_OWNER_QUEUE),
+            ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
+            burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
+            delivery_coalescing = bool_opt(delivery_coalescing, Opts),
+            cipher_preference = maps:get(ciphers, Opts, default_cipher_preference()),
+            max_udp_payload_size_local = maps:get(max_udp_payload_size, Opts, undefined),
+            max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
+            datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
+            spin_bit_enabled = maps:get(spin_bit, Opts, true),
+            stateless_reset_secret = maps:get(reset_secret, Opts, undefined),
+            reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
+            idle_timeout = IdleTimeoutClient,
+            keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
+            disconnect_timeout = disconnect_timeout_opt(Opts),
+            %% TLS 1.3 external PSK (RFC 8446 §4.2.11) — mutually exclusive
+            %% with session_ticket; conflict raised by build_client_hello/1.
+            external_psk = ExternalPsk,
+            congestion_threshold = maps:get(congestion_threshold, Opts, 2),
+            pacing_enabled = maps:get(pacing_enabled, Opts, true),
+            active_n = maps:get(active_n, Opts, 100),
+            pmtu_raise_interval = maps:get(pmtu_raise_interval, Opts, ?PMTU_DEFAULT_RAISE_INTERVAL),
+            qlog_ctx = quic_qlog:new(Opts, DCID, client)
+        },
+        hs = #hs{
+            server_name = ServerName,
+            initial_keys = InitialKeys,
+            retry_token = InitialRetryToken,
+            tls_state = ?TLS_AWAITING_SERVER_HELLO,
+            tls_group = hd(maps:get(groups, Opts, [x25519])),
+            pn_initial = PNSpace,
+            pn_handshake = PNSpace,
+            %% Store session ticket for resumption
+            ticket_store =
+                case SessionTicket of
+                    undefined -> quic_ticket:new_store();
+                    Ticket -> quic_ticket:store_ticket(ServerName, Ticket, quic_ticket:new_store())
+                end
+        }
     },
 
     %% Emit qlog connection_started event
-    quic_qlog:connection_started(State#state.qlog_ctx),
+    quic_qlog:connection_started((State#state.cfg)#conn_cfg.qlog_ctx),
 
     %% RFC 9000 §10.1: arm the idle timer once; it re-arms itself lazily
     %% from last_activity (the keep-alive timer is armed on entering the
@@ -1250,15 +1262,17 @@ terminate(
     Reason,
     StateName,
     #state{
-        send_socket = SendSocket,
         socket_state = SocketState,
         pto_timer = PtoTimer,
         idle_timer = IdleTimer,
         keep_alive_timer = KeepAliveTimer,
         pacing_timer = PacingTimer,
         ack_timer = AckTimer,
-        role = Role,
-        qlog_ctx = QlogCtx
+        cfg = #conn_cfg{
+            send_socket = SendSocket,
+            role = Role,
+            qlog_ctx = QlogCtx
+        }
     } = State
 ) ->
     %% If we're not already draining/closed, try to send CONNECTION_CLOSE.
@@ -1335,28 +1349,28 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 
 %% ----- IDLE STATE -----
 
-idle(enter, _OldState, #state{role = client} = State) ->
+idle(enter, _OldState, #state{cfg = #conn_cfg{role = client}} = State) ->
     %% Client: Start the handshake by sending Initial packet with ClientHello
     {keep_state, send_client_hello(State)};
-idle(enter, _OldState, #state{role = server} = State) ->
+idle(enter, _OldState, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% Server: Wait for Initial packet with ClientHello
     {keep_state, State};
-idle({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
+idle({call, From}, get_ref, #state{cfg = #conn_cfg{conn_ref = Ref}} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 idle({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {idle, state_to_map(State)}}]};
 idle({call, From}, peername, #state{remote_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
-idle({call, From}, sockname, #state{local_addr = Addr} = State) ->
+idle({call, From}, sockname, #state{cfg = #conn_cfg{local_addr = Addr}} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
 idle({call, From}, {set_owner, NewOwner}, State) ->
     {keep_state, reown(State, NewOwner), [{reply, From, ok}]};
 idle(cast, {set_owner, NewOwner}, State) ->
     {keep_state, reown(State, NewOwner)};
 %% 0-RTT: Allow opening streams in idle state if early keys are available
-idle({call, From}, open_stream, #state{early_keys = undefined} = State) ->
+idle({call, From}, open_stream, #state{hs = #hs{early_keys = undefined}} = State) ->
     {keep_state, State, [{reply, From, {error, not_connected}}]};
-idle({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) ->
+idle({call, From}, open_stream, #state{hs = #hs{early_keys = _EarlyKeys}} = State) ->
     case do_open_stream(State) of
         {ok, StreamId, NewState} ->
             {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
@@ -1366,9 +1380,9 @@ idle({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) ->
 %% 0-RTT: HTTP/3 opens its control and QPACK unidirectional streams as early
 %% data, so the idle state must allow opening uni streams once early keys are
 %% present (mirrors open_stream above).
-idle({call, From}, open_unidirectional_stream, #state{early_keys = undefined} = State) ->
+idle({call, From}, open_unidirectional_stream, #state{hs = #hs{early_keys = undefined}} = State) ->
     {keep_state, State, [{reply, From, {error, not_connected}}]};
-idle({call, From}, open_unidirectional_stream, #state{early_keys = _EarlyKeys} = State) ->
+idle({call, From}, open_unidirectional_stream, #state{hs = #hs{early_keys = _EarlyKeys}} = State) ->
     case do_open_unidirectional_stream(State) of
         {ok, StreamId, NewState} ->
             {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
@@ -1382,7 +1396,7 @@ idle({call, From}, open_unidirectional_stream, #state{early_keys = _EarlyKeys} =
 idle(
     {call, From},
     {send_data, StreamId, Data, Fin},
-    #state{role = client, early_keys = EarlyKeys} = State
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{early_keys = EarlyKeys}} = State
 ) when EarlyKeys =/= undefined ->
     case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
         {ok, NewState} ->
@@ -1407,37 +1421,37 @@ idle(
 idle(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
     %% Flush batched packets and timers after processing incoming data
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 idle(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Socket} = State) ->
     NewState = handle_packets_batch(Packets, State),
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 %% Server receives packets from listener
-idle(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
+idle(info, {quic_packet, Data, _RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
     NewState = handle_packet(Data, State),
     %% Flush batched packets and timers after processing incoming data
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 %% Server receives batched packets from listener (GRO optimization)
-idle(info, {quic_packets, Packets, _RemoteAddr}, #state{role = server} = State) ->
+idle(info, {quic_packets, Packets, _RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
     NewState = handle_packets_batch(Packets, State),
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
-idle(cast, process, #state{role = client, active_n = N} = State) ->
+idle(cast, process, #state{cfg = #conn_cfg{role = client, active_n = N}} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
     client_rearm_active(State, N),
     {keep_state, State};
-idle(cast, process, #state{role = server} = State) ->
+idle(cast, process, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% Server connections receive via listener, don't touch socket options
     {keep_state, State};
 idle(cast, {close, Reason}, State) ->
     %% Close in idle state - no keys yet, just transition to draining
     emit_qlog_state_change(idle, draining, State),
     State1 = initiate_close(Reason, State),
-    NewState = flush_dirty_timers(flush_socket_batch(State1)),
+    NewState = flush_event(State1, event),
     {next_state, draining, NewState};
-idle({call, From}, has_early_keys, #state{early_keys = EK} = State) ->
+idle({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
 idle({call, From}, early_data_accepted, State) ->
     {keep_state, State, [{reply, From, unknown}]};
@@ -1448,23 +1462,23 @@ idle(EventType, EventContent, State) ->
 
 handshaking(enter, idle, State) ->
     {keep_state, arm_disconnect_timer(State)};
-handshaking({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
+handshaking({call, From}, get_ref, #state{cfg = #conn_cfg{conn_ref = Ref}} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 handshaking({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {handshaking, state_to_map(State)}}]};
 handshaking({call, From}, peername, #state{remote_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
-handshaking({call, From}, sockname, #state{local_addr = Addr} = State) ->
+handshaking({call, From}, sockname, #state{cfg = #conn_cfg{local_addr = Addr}} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
 handshaking({call, From}, {set_owner, NewOwner}, State) ->
     {keep_state, reown(State, NewOwner), [{reply, From, ok}]};
 handshaking(cast, {set_owner, NewOwner}, State) ->
     {keep_state, reown(State, NewOwner)};
 %% 0-RTT: Allow opening streams during handshake if early keys are available
-handshaking({call, From}, open_stream, #state{early_keys = undefined} = State) ->
+handshaking({call, From}, open_stream, #state{hs = #hs{early_keys = undefined}} = State) ->
     %% No early keys, must wait for handshake to complete
     {keep_state, State, [{reply, From, {error, not_connected}}]};
-handshaking({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) ->
+handshaking({call, From}, open_stream, #state{hs = #hs{early_keys = _EarlyKeys}} = State) ->
     %% Early keys available, can open stream for 0-RTT
     case do_open_stream(State) of
         {ok, StreamId, NewState} ->
@@ -1474,7 +1488,9 @@ handshaking({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) 
     end;
 %% 0-RTT: HTTP/3 opens its control and QPACK streams as early data, and
 %% the connection can be past `idle' by the time it does (mirrors idle).
-handshaking({call, From}, open_unidirectional_stream, #state{early_keys = undefined} = State) ->
+handshaking(
+    {call, From}, open_unidirectional_stream, #state{hs = #hs{early_keys = undefined}} = State
+) ->
     {keep_state, State, [{reply, From, {error, not_connected}}]};
 handshaking({call, From}, open_unidirectional_stream, State) ->
     case do_open_unidirectional_stream(State) of
@@ -1487,7 +1503,7 @@ handshaking({call, From}, open_unidirectional_stream, State) ->
 handshaking(
     {call, From},
     {send_data, StreamId, Data, Fin},
-    #state{role = client, early_keys = EarlyKeys} = State
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{early_keys = EarlyKeys}} = State
 ) when EarlyKeys =/= undefined ->
     %% Send as 0-RTT data. 0-RTT sending is a client-only affair (RFC
     %% 9000 §17.2.3): a server also holds early keys, but only for
@@ -1518,37 +1534,39 @@ handshaking(
 handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
     %% Flush batched packets and timers after processing incoming data
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 handshaking(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Socket} = State) ->
     NewState = handle_packets_batch(Packets, State),
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 %% Server receives packets from listener
-handshaking(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
+handshaking(info, {quic_packet, Data, _RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
     NewState = handle_packet(Data, State),
     %% Flush batched packets and timers after processing incoming data
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 %% Server receives batched packets from listener (GRO optimization)
-handshaking(info, {quic_packets, Packets, _RemoteAddr}, #state{role = server} = State) ->
+handshaking(
+    info, {quic_packets, Packets, _RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State
+) ->
     NewState = handle_packets_batch(Packets, State),
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
-handshaking(cast, process, #state{role = client, active_n = N} = State) ->
+handshaking(cast, process, #state{cfg = #conn_cfg{role = client, active_n = N}} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
     client_rearm_active(State, N),
     {keep_state, State};
-handshaking(cast, process, #state{role = server} = State) ->
+handshaking(cast, process, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% Server connections receive via listener, don't touch socket options
     {keep_state, State};
 handshaking(cast, {close, Reason}, State) ->
     %% Close during handshake - may not have app keys yet
     emit_qlog_state_change(handshaking, draining, State),
     State1 = initiate_close(Reason, State),
-    NewState = flush_dirty_timers(flush_socket_batch(State1)),
+    NewState = flush_event(State1, event),
     {next_state, draining, NewState};
-handshaking({call, From}, has_early_keys, #state{early_keys = EK} = State) ->
+handshaking({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
 handshaking({call, From}, early_data_accepted, State) ->
     {keep_state, State, [{reply, From, unknown}]};
@@ -1563,12 +1581,16 @@ connected(
     #state{
         owner = Owner,
         alpn = Alpn,
-        role = Role,
         pending_data = Pending,
         transport_params = TransportParams,
-        negotiated_group = NegGroup,
-        negotiated_scheme = NegScheme,
-        active_n = ActiveN
+        cfg = #conn_cfg{
+            role = Role,
+            active_n = ActiveN
+        },
+        hs = #hs{
+            negotiated_group = NegGroup,
+            negotiated_scheme = NegScheme
+        }
     } = State
 ) when
     OldState =:= handshaking; OldState =:= idle
@@ -1626,18 +1648,18 @@ connected(
     %% Everything queued above (pending data, NEW_TOKEN, the first PMTU
     %% probe) sits in the send batch; without a flush here it would
     %% only leave with the next event on this connection.
-    {keep_state, flush_dirty_timers(flush_socket_batch(State5))};
-connected({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
+    {keep_state, flush_event(State5, event)};
+connected({call, From}, get_ref, #state{cfg = #conn_cfg{conn_ref = Ref}} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 connected({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {connected, state_to_map(State)}}]};
 connected({call, From}, peername, #state{remote_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
-connected({call, From}, sockname, #state{local_addr = Addr} = State) ->
+connected({call, From}, sockname, #state{cfg = #conn_cfg{local_addr = Addr}} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
-connected({call, From}, peercert, #state{peer_cert = undefined} = State) ->
+connected({call, From}, peercert, #state{hs = #hs{peer_cert = undefined}} = State) ->
     {keep_state, State, [{reply, From, {error, no_peercert}}]};
-connected({call, From}, peercert, #state{peer_cert = Cert} = State) ->
+connected({call, From}, peercert, #state{hs = #hs{peer_cert = Cert}} = State) ->
     {keep_state, State, [{reply, From, {ok, Cert}}]};
 connected({call, From}, datagram_max_size, #state{max_datagram_frame_size_remote = Size} = State) ->
     {keep_state, State, [{reply, From, Size}]};
@@ -1657,7 +1679,7 @@ connected({call, From}, {send_datagram, Data}, State) ->
     case do_send_datagram(Data, State) of
         {ok, NewState} ->
             %% Event-driven flush: flush batch and timers after user API call
-            FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+            FlushedState = flush_event(NewState, event),
             {keep_state, FlushedState, [{reply, From, ok}]};
         {error, Reason, NewState} ->
             {keep_state, NewState, [{reply, From, {error, Reason}}]};
@@ -1683,7 +1705,7 @@ connected({call, From}, open_unidirectional_stream, State) ->
 connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
     case do_close_stream(StreamId, ErrorCode, State) of
         {ok, NewState} ->
-            {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
+            {keep_state, flush_event(NewState, event), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1692,7 +1714,7 @@ connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
 connected({call, From}, {reset_stream_at, StreamId, ErrorCode, ReliableSize}, State) ->
     case do_reset_stream_at(StreamId, ErrorCode, ReliableSize, State) of
         {ok, NewState} ->
-            {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
+            {keep_state, flush_event(NewState, event), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1700,7 +1722,7 @@ connected({call, From}, {reset_stream_at, StreamId, ErrorCode, ReliableSize}, St
 connected({call, From}, {stop_sending, StreamId, ErrorCode}, State) ->
     case do_stop_sending(StreamId, ErrorCode, State) of
         {ok, NewState} ->
-            {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
+            {keep_state, flush_event(NewState, event), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1757,7 +1779,9 @@ connected(
     #state{
         send_queue_bytes = Bytes,
         cc_state = CCState,
-        congestion_threshold = Threshold
+        cfg = #conn_cfg{
+            congestion_threshold = Threshold
+        }
     } = State
 ) ->
     Cwnd = quic_cc:cwnd(CCState),
@@ -1780,7 +1804,9 @@ connected(
         send_queue_bytes = Bytes,
         cc_state = CCState,
         loss_state = LossState,
-        congestion_threshold = Threshold
+        cfg = #conn_cfg{
+            congestion_threshold = Threshold
+        }
     } = State
 ) ->
     Cwnd = quic_cc:cwnd(CCState),
@@ -1811,14 +1837,12 @@ connected(
     {call, From},
     get_stats,
     #state{
-        packets_received = PacketsRecv,
-        packets_sent = PacketsSent,
         data_received = DataRecv,
         data_sent = DataSent,
-        ack_sent = AckSent,
-        retransmits = Retransmits,
-        zero_rtt_stream_ids = ZeroRttStreams,
-        socket_state = SocketState
+        socket_state = SocketState,
+        hs = #hs{
+            zero_rtt_stream_ids = ZeroRttStreams
+        }
     } = State
 ) ->
     %% Return packet counts for liveness detection (net_kernel uses
@@ -1826,18 +1850,18 @@ connected(
     %% counters for benchmarks and tests.
     {Flushes, Coalesced, GSOFlushes, Pending} = send_batch_counters(SocketState),
     Stats = #{
-        packets_received => PacketsRecv,
-        packets_sent => PacketsSent,
+        packets_received => count(?C_PACKETS_RECEIVED, State),
+        packets_sent => count(?C_PACKETS_SENT, State),
         data_received => DataRecv,
         data_sent => DataSent,
-        ack_sent => AckSent,
-        retransmits => Retransmits,
+        ack_sent => count(?C_ACK_SENT, State),
+        retransmits => count(?C_RETRANSMITS, State),
         %% Streams that carried 0-RTT-encrypted data and kept it. A
         %% rejection clears them (RFC 9001 Section 4.6.2), so a non-zero
         %% value here means early data was sent and the server took it.
         zero_rtt_streams => sets:size(ZeroRttStreams),
         %% Writes refused as backpressure; each is logged at debug only.
-        send_queue_full_refusals => State#state.send_queue_full_refusals,
+        send_queue_full_refusals => count(?C_SEND_QUEUE_FULL_REFUSALS, State),
         batch_flushes => Flushes,
         packets_coalesced => Coalesced,
         gso_flushes => GSOFlushes,
@@ -1851,7 +1875,7 @@ connected({call, From}, get_peer_transport_params, #state{transport_params = TP}
 connected({call, From}, send_ping, State) ->
     %% Send PING frame - bypasses congestion control
     NewState = send_keep_alive_ping(State),
-    {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
+    {keep_state, flush_event(NewState, event), [{reply, From, ok}]};
 connected({call, From}, get_mtu, State) ->
     MTU = get_current_mtu(State),
     {keep_state, State, [{reply, From, {ok, MTU}}]};
@@ -1868,7 +1892,7 @@ connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
             {keep_state, State, [{reply, From, {error, key_update_in_progress}}]}
     end;
 %% Handle connection migration request (RFC 9000 Section 9)
-connected({call, From}, migrate, #state{peer_disable_migration = true} = State) ->
+connected({call, From}, migrate, #state{mig = #mig{peer_disable_migration = true}} = State) ->
     %% Peer disabled migration via transport params
     {keep_state, State, [{reply, From, {error, migration_disabled}}]};
 connected({call, From}, migrate, #state{remote_addr = RemoteAddr} = State) ->
@@ -1888,7 +1912,9 @@ connected({call, From}, migrate, #state{remote_addr = RemoteAddr} = State) ->
             end
     end;
 %% Handle migration with options
-connected({call, From}, {migrate, _Opts}, #state{peer_disable_migration = true} = State) ->
+connected(
+    {call, From}, {migrate, _Opts}, #state{mig = #mig{peer_disable_migration = true}} = State
+) ->
     {keep_state, State, [{reply, From, {error, migration_disabled}}]};
 connected({call, From}, {migrate, _Opts}, #state{remote_addr = RemoteAddr} = State) ->
     case has_unused_cid(State) of
@@ -1908,9 +1934,7 @@ connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) 
     NewState = handle_packet(Data, State1),
     %% Drain any further datagrams already in the mailbox into this
     %% pass, then flush ACKs / batches / timers once for the lot.
-    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
-    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
-    FinalState = FlushedState#state{current_packet_source = undefined},
+    FinalState = flush_event(flush_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)), pass),
     check_state_transition(connected, FinalState);
 %% Client receives a whole GRO train from the receiver process as one
 %% message; processing it in one pass amortizes the per-event flushes
@@ -1918,38 +1942,34 @@ connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) 
 connected(info, {udp_batch, Socket, IP, Port, Packets}, #state{socket = Socket} = State) ->
     State1 = State#state{current_packet_source = {IP, Port}, recv_pass = true},
     NewState = handle_packets_batch(Packets, State1),
-    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
-    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
-    FinalState = FlushedState#state{current_packet_source = undefined},
+    FinalState = flush_event(flush_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)), pass),
     check_state_transition(connected, FinalState);
 %% Server receives packets from listener
-connected(info, {quic_packet, Data, RemoteAddr}, #state{role = server} = State) ->
-    NewState = server_recv_pass([Data], RemoteAddr, State#state{recv_pass = true}),
-    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
-    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
-    FinalState = FlushedState#state{
-        current_packet_source = undefined, has_non_probing_frame = false
-    },
+connected(info, {quic_packet, Data, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
+    NewState = server_recv_pass([Data], RemoteAddr, State),
+    FinalState = flush_event(flush_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)), pass),
     check_state_transition(connected, FinalState);
 %% Server receives batched packets from listener (GRO optimization)
-connected(info, {quic_packets, Packets, RemoteAddr}, #state{role = server} = State) ->
-    NewState = server_recv_pass(Packets, RemoteAddr, State#state{recv_pass = true}),
-    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
-    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
-    FinalState = FlushedState#state{
-        current_packet_source = undefined, has_non_probing_frame = false
-    },
+connected(
+    info, {quic_packets, Packets, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State
+) ->
+    NewState = server_recv_pass(Packets, RemoteAddr, State),
+    FinalState = flush_event(flush_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)), pass),
     check_state_transition(connected, FinalState);
 %% Path validation timeout - stay on current path if validation fails
 %% Match on token (not timer ref) to correlate with specific validation attempt
 connected(
     info,
     {path_validation_timeout, Token},
-    #state{path_validation_token = Token} = State
+    #state{mig = #mig{path_validation_token = Token}} = State
 ) when Token =/= undefined ->
     %% Token matches - this is the current validation attempt
-    _ = cancel_timer(State#state.path_validation_timer),
-    State1 = State#state{path_validation_timer = undefined, path_validation_token = undefined},
+    _ = cancel_timer((State#state.mig)#mig.path_validation_timer),
+    State1 = State#state{
+        mig = (State#state.mig)#mig{
+            path_validation_timer = undefined, path_validation_token = undefined
+        }
+    },
     handle_path_validation_timeout(State1);
 connected(info, {path_validation_timeout, _StaleToken}, State) ->
     %% Stale token from canceled validation - ignore
@@ -1957,26 +1977,26 @@ connected(info, {path_validation_timeout, _StaleToken}, State) ->
 connected(cast, {close, Reason}, State) ->
     emit_qlog_state_change(connected, draining, State),
     State1 = initiate_close(Reason, State),
-    NewState = flush_dirty_timers(flush_socket_batch(State1)),
+    NewState = flush_event(State1, event),
     {next_state, draining, NewState};
 %% Async send data - fire-and-forget for high throughput
 connected(cast, {send_data_async, StreamId, Data, Fin}, State) ->
     coalesced_sends([{async, StreamId, Data, Fin}], State);
-connected(cast, process, #state{role = client, active_n = N} = State) ->
+connected(cast, process, #state{cfg = #conn_cfg{role = client, active_n = N}} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
     client_rearm_active(State, N),
     {keep_state, State};
-connected(cast, process, #state{role = server} = State) ->
+connected(cast, process, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% Server connections receive via listener, don't touch socket options
     {keep_state, State};
 %% Handle delayed ACK timer (RFC 9000 §13.2.1 / RFC 9221 §5.2).
 %% Validates reference to ignore stale timer events.
-connected(info, {send_delayed_ack, app, Ref}, #state{ack_timer = Ref} = State) ->
+connected(info, {timeout, Ref, send_delayed_ack}, #state{ack_timer = Ref} = State) ->
     %% send_app_ack/1 clears ack_timer + ack_elicited_count.
     State1 = send_app_ack(State),
-    NewState = flush_dirty_timers(flush_socket_batch(State1)),
+    NewState = flush_event(State1, event),
     {keep_state, NewState};
-connected(info, {send_delayed_ack, app, _StaleRef}, State) ->
+connected(info, {timeout, _StaleRef, send_delayed_ack}, State) ->
     %% Stale timer — ignore.
     {keep_state, State};
 %% Handle PMTU probe timeout (RFC 8899)
@@ -2024,9 +2044,9 @@ connected(info, {stream_deadline, StreamId}, State) ->
             %% Stream already closed or doesn't exist
             {keep_state, State}
     end;
-connected({call, From}, has_early_keys, #state{early_keys = EK} = State) ->
+connected({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
-connected({call, From}, early_data_accepted, #state{early_data_accepted = EDA} = State) ->
+connected({call, From}, early_data_accepted, #state{hs = #hs{early_data_accepted = EDA}} = State) ->
     {keep_state, State, [{reply, From, EDA}]};
 connected(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, connected, State).
@@ -2040,7 +2060,9 @@ draining(
         owner = Owner,
         close_reason = Reason,
         loss_state = LossState,
-        qlog_ctx = QlogCtx
+        cfg = #conn_cfg{
+            qlog_ctx = QlogCtx
+        }
     } = State
 ) ->
     %% Extract reason phrase for qlog
@@ -2074,9 +2096,9 @@ draining(info, {udp, _Socket, _IP, _Port, _Data}, State) ->
 draining(cast, {close, _Reason}, State) ->
     %% Ignore duplicate close requests - already draining
     {keep_state, State};
-draining({call, From}, has_early_keys, #state{early_keys = EK} = State) ->
+draining({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
-draining({call, From}, early_data_accepted, #state{early_data_accepted = EDA} = State) ->
+draining({call, From}, early_data_accepted, #state{hs = #hs{early_data_accepted = EDA}} = State) ->
     {keep_state, State, [{reply, From, EDA}]};
 draining(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, draining, State).
@@ -2087,9 +2109,9 @@ closed(enter, _OldState, State) ->
     {stop, normal, State};
 closed({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {closed, state_to_map(State)}}]};
-closed({call, From}, has_early_keys, #state{early_keys = EK} = State) ->
+closed({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
-closed({call, From}, early_data_accepted, #state{early_data_accepted = EDA} = State) ->
+closed({call, From}, early_data_accepted, #state{hs = #hs{early_data_accepted = EDA}} = State) ->
     {keep_state, State, [{reply, From, EDA}]};
 closed(_EventType, _EventContent, State) ->
     {keep_state, State}.
@@ -2130,7 +2152,9 @@ handle_common_event({call, From}, {consume, StreamId, Bytes}, StateName, State) 
         _ ->
             {keep_state, State, [{reply, From, {error, unknown_stream}}]}
     end;
-handle_common_event({call, From}, get_ref, _StateName, #state{conn_ref = Ref} = State) ->
+handle_common_event(
+    {call, From}, get_ref, _StateName, #state{cfg = #conn_cfg{conn_ref = Ref}} = State
+) ->
     {keep_state, State, [{reply, From, Ref}]};
 handle_common_event({call, From}, get_path_stats, _StateName, State) ->
     {keep_state, State, [{reply, From, {error, not_connected}}]};
@@ -2208,7 +2232,7 @@ handle_common_event(info, {idle_timeout, Ref}, StateName, #state{idle_timer = Re
     %% Handle idle timeout - check if we've truly been idle
     Now = erlang:monotonic_time(millisecond),
     TimeSinceActivity = Now - State#state.last_activity,
-    case TimeSinceActivity >= State#state.idle_timeout of
+    case TimeSinceActivity >= (State#state.cfg)#conn_cfg.idle_timeout of
         true ->
             %% Genuine idle timeout - initiate close
             NewState = initiate_close(idle_timeout, State#state{idle_timer = undefined}),
@@ -2226,7 +2250,7 @@ handle_common_event(
     Ref =/= undefined
 ->
     Now = erlang:monotonic_time(millisecond),
-    case (Now - State#state.last_activity) < State#state.keep_alive_interval of
+    case (Now - State#state.last_activity) < (State#state.cfg)#conn_cfg.keep_alive_interval of
         true ->
             %% Activity since the timer was armed: re-arm for the remainder,
             %% no PING needed.
@@ -2245,8 +2269,9 @@ handle_common_event(
             %% rate (measured: ~930/s per connection, 46k/s across 50 idle
             %% connections) until the peer happens to send something.
             State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
-            State2 = flush_dirty_timers(flush_socket_batch(State1)),
-            {keep_state, arm_keep_alive_timer(State2, State2#state.keep_alive_interval)}
+            State2 = flush_event(State1, event),
+            {keep_state,
+                arm_keep_alive_timer(State2, (State2#state.cfg)#conn_cfg.keep_alive_interval)}
     end;
 handle_common_event(info, {keep_alive_timeout, _StaleRef}, _StateName, State) ->
     %% Ignore stale keep-alive timer (ref doesn't match or wrong state)
@@ -2257,7 +2282,7 @@ handle_common_event(
     info,
     {udp_passive, Socket},
     _StateName,
-    #state{role = client, socket = Socket, active_n = N} = State
+    #state{socket = Socket, cfg = #conn_cfg{role = client, active_n = N}} = State
 ) ->
     client_rearm_active(State, N),
     {keep_state, State};
@@ -2270,7 +2295,7 @@ handle_common_event(
     info,
     {'EXIT', Pid, Reason},
     _StateName,
-    #state{role = client, client_receiver = Pid, owner = Owner} = State
+    #state{client_receiver = Pid, owner = Owner, cfg = #conn_cfg{role = client}} = State
 ) when Reason =/= normal andalso Reason =/= shutdown ->
     Owner ! {quic, self(), {closed, {receiver_exit, Reason}}},
     {stop, {shutdown, {receiver_exit, Reason}}, State};
@@ -2337,24 +2362,28 @@ handle_common_event(_EventType, _EventContent, _StateName, State) ->
 %% Send ClientHello in an Initial packet
 send_client_hello(State) ->
     #state{
-        scid = SCID,
-        server_name = ServerName,
-        alpn_list = AlpnList,
         max_data_local = MaxData,
-        max_stream_data_bidi_local = MaxStreamDataBidiLocal,
-        max_stream_data_bidi_remote = MaxStreamDataBidiRemote,
-        max_stream_data_uni = MaxStreamDataUni,
         max_streams_bidi_local = MaxStreamsBidi,
         max_streams_uni_local = MaxStreamsUni,
-        max_datagram_frame_size_local = MaxDatagramSize,
-        ticket_store = TicketStore
+        cfg = #conn_cfg{
+            scid = SCID,
+            alpn_list = AlpnList,
+            max_stream_data_bidi_local = MaxStreamDataBidiLocal,
+            max_stream_data_bidi_remote = MaxStreamDataBidiRemote,
+            max_stream_data_uni = MaxStreamDataUni,
+            max_datagram_frame_size_local = MaxDatagramSize
+        },
+        hs = #hs{
+            server_name = ServerName,
+            ticket_store = TicketStore
+        }
     } = State,
 
     %% Look up session ticket for resumption — but skip if the caller
     %% supplied an external PSK; build_client_hello/1 will raise
     %% {bad_opts, psk_conflict} if both end up in Opts.
     SessionTicket =
-        case State#state.external_psk of
+        case (State#state.cfg)#conn_cfg.external_psk of
             undefined ->
                 case quic_ticket:lookup_ticket(ServerName, TicketStore) of
                     {ok, Ticket} -> Ticket;
@@ -2373,7 +2402,7 @@ send_client_hello(State) ->
         initial_max_stream_data_uni => MaxStreamDataUni,
         initial_max_streams_bidi => MaxStreamsBidi,
         initial_max_streams_uni => MaxStreamsUni,
-        max_idle_timeout => State#state.idle_timeout,
+        max_idle_timeout => (State#state.cfg)#conn_cfg.idle_timeout,
         active_connection_id_limit => local_active_limit(State),
         max_udp_payload_size => advertised_max_udp_payload_size(State)
     },
@@ -2385,7 +2414,7 @@ send_client_hello(State) ->
         end,
     %% Add reset_stream_at if enabled (draft-ietf-quic-reliable-stream-reset-07)
     TransportParams =
-        case State#state.reset_stream_at_enabled of
+        case (State#state.cfg)#conn_cfg.reset_stream_at_enabled of
             false -> TransportParams1;
             true -> TransportParams1#{reset_stream_at => true}
         end,
@@ -2398,16 +2427,16 @@ send_client_hello(State) ->
         alpn => AlpnList,
         transport_params => TransportParams,
         session_ticket => SessionTicket,
-        groups => State#state.tls_groups,
-        ciphers => State#state.cipher_preference
+        groups => (State#state.cfg)#conn_cfg.tls_groups,
+        ciphers => (State#state.cfg)#conn_cfg.cipher_preference
     },
     ClientHelloOpts1 =
-        case State#state.tls_sig_algs of
+        case (State#state.cfg)#conn_cfg.tls_sig_algs of
             undefined -> ClientHelloOpts0;
             SigAlgs -> ClientHelloOpts0#{signature_algs => SigAlgs}
         end,
     ClientHelloOpts =
-        case State#state.external_psk of
+        case (State#state.cfg)#conn_cfg.external_psk of
             undefined -> ClientHelloOpts1;
             Ext -> ClientHelloOpts1#{external_psk => Ext}
         end,
@@ -2443,26 +2472,28 @@ send_client_hello(State) ->
     %% Encrypt and send the ClientHello, chunked across Initial packets
     %% when it exceeds one datagram (hybrid ML-KEM key share).
     State0 = State#state{
-        tls_private_key = PrivKey,
-        tls_transcript = Transcript,
-        tls_ch1_random = ClientRandom,
-        tls_ch1_opts = ClientHelloOpts,
-        initial_tx_off = byte_size(ClientHello),
-        early_keys = EarlyKeys,
-        max_early_data =
-            case SessionTicket of
-                undefined -> 0;
-                #session_ticket{max_early_data = MaxEarly} -> MaxEarly
-            end
+        hs = (State#state.hs)#hs{
+            tls_private_key = PrivKey,
+            tls_transcript = Transcript,
+            tls_ch1_random = ClientRandom,
+            tls_ch1_opts = ClientHelloOpts,
+            initial_tx_off = byte_size(ClientHello),
+            early_keys = EarlyKeys,
+            max_early_data =
+                case SessionTicket of
+                    undefined -> 0;
+                    #session_ticket{max_early_data = MaxEarly} -> MaxEarly
+                end
+        }
     },
     NewState = send_initial_crypto(ClientHello, 0, State0),
 
     %% Event-driven flush: flush batch and timers after sending ClientHello
     %% Critical for handshake - must send immediately
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
 
     %% Enable socket for receiving (use {active, N} for better throughput)
-    client_rearm_active(FlushedState, FlushedState#state.active_n),
+    client_rearm_active(FlushedState, (FlushedState#state.cfg)#conn_cfg.active_n),
 
     FlushedState.
 
@@ -2482,9 +2513,13 @@ default_cipher_preference() ->
 %% name, ALPN and hash it was issued under (RFC 8446 Sections 4.2.11 and
 %% 4.6.1). It is taken once its binder checks out, so of two handshakes
 %% presenting it only one resumes (RFC 9001 Section 9.2).
-resume_ticket(_Identity, _Binder, _Cipher, _Msg, _Info, #state{ticket_table = undefined}) ->
+resume_ticket(_Identity, _Binder, _Cipher, _Msg, _Info, #state{
+    cfg = #conn_cfg{ticket_table = undefined}
+}) ->
     error;
-resume_ticket(Identity, Binder, Cipher, Msg, Info, #state{ticket_table = Tab} = State) ->
+resume_ticket(
+    Identity, Binder, Cipher, Msg, Info, #state{cfg = #conn_cfg{ticket_table = Tab}} = State
+) ->
     case quic_ticket:lookup_issued(Tab, Identity) of
         {ok, Ticket} ->
             case ticket_matches(Ticket, Cipher, Info, State) of
@@ -2500,7 +2535,8 @@ ticket_matches(
 ) ->
     ClientALPN = maps:get(alpn_protocols, Info, []),
     (SNI =:= sni_or_empty(maps:get(server_name, Info, undefined))) andalso
-        (ALPN =:= quic_tls_negotiation:negotiate_alpn(ClientALPN, State#state.alpn_list)) andalso
+        (ALPN =:=
+            quic_tls_negotiation:negotiate_alpn(ClientALPN, (State#state.cfg)#conn_cfg.alpn_list)) andalso
         (quic_crypto:cipher_to_hash(Issued) =:= quic_crypto:cipher_to_hash(Cipher)).
 
 check_resumption_binder(Identity, Ticket, Binder, Cipher, Msg, Info, Tab) ->
@@ -2527,8 +2563,10 @@ sni_or_empty(Name) -> Name.
 %% Server: Send ServerHello in Initial packet. Uses the tracked
 %% Initial CRYPTO offset (non-zero only after a HelloRetryRequest).
 send_server_hello(ServerHelloMsg, State) ->
-    Off = State#state.initial_tx_off,
-    State1 = State#state{initial_tx_off = Off + byte_size(ServerHelloMsg)},
+    Off = (State#state.hs)#hs.initial_tx_off,
+    State1 = State#state{
+        hs = (State#state.hs)#hs{initial_tx_off = Off + byte_size(ServerHelloMsg)}
+    },
     %% Chunk across Initial packets: a hybrid ServerHello Initial is
     %% ~1225 bytes and no longer fits one datagram.
     NewState = send_initial_crypto(ServerHelloMsg, Off, State1),
@@ -2543,15 +2581,21 @@ send_server_hello(ServerHelloMsg, State) ->
 %% check a server with `verify => false` could silently fall back to
 %% an unauthenticated cert path while the client believed it was on
 %% the PSK path.
-validate_client_psk_selection(undefined, #state{external_psk = undefined}) ->
+validate_client_psk_selection(undefined, #state{cfg = #conn_cfg{external_psk = undefined}}) ->
     %% Neither side wants PSK — standard handshake.
     {ok, undefined};
-validate_client_psk_selection(undefined, #state{external_psk = _Offered}) ->
+validate_client_psk_selection(undefined, #state{cfg = #conn_cfg{external_psk = _Offered}}) ->
     %% Client offered, server didn't select.
     {error, server_did_not_select_psk};
 validate_client_psk_selection(
     Idx,
-    #state{external_psk = undefined, server_name = ServerName, ticket_store = TicketStore}
+    #state{
+        cfg = #conn_cfg{external_psk = undefined},
+        hs = #hs{
+            server_name = ServerName,
+            ticket_store = TicketStore
+        }
+    }
 ) ->
     %% No external PSK was offered, so the server must have selected the
     %% resumption ticket we offered. Re-derive that PSK from the stored
@@ -2569,9 +2613,9 @@ validate_client_psk_selection(
             %% Server selected a PSK we never offered (or it expired).
             {error, unexpected_psk_selection}
     end;
-validate_client_psk_selection(Idx, #state{external_psk = {Identity, Secret}}) ->
+validate_client_psk_selection(Idx, #state{cfg = #conn_cfg{external_psk = {Identity, Secret}}}) ->
     validate_client_psk_selection(Idx, Identity, Secret, [psk_dhe_ke]);
-validate_client_psk_selection(Idx, #state{external_psk = {Identity, Secret, Modes}}) ->
+validate_client_psk_selection(Idx, #state{cfg = #conn_cfg{external_psk = {Identity, Secret, Modes}}}) ->
     validate_client_psk_selection(Idx, Identity, Secret, Modes).
 
 validate_client_psk_selection(0, Identity, Secret, Modes) ->
@@ -2655,28 +2699,32 @@ check_credentials(_Role, _Opts) ->
 
 send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     #state{
-        scid = SCID,
         alpn = ALPN,
-        verify = Verify,
         max_data_local = MaxData,
-        max_stream_data_bidi_local = MaxStreamDataBidiLocal,
-        max_stream_data_bidi_remote = MaxStreamDataBidiRemote,
-        max_stream_data_uni = MaxStreamDataUni,
         max_streams_bidi_local = MaxStreamsBidi,
         max_streams_uni_local = MaxStreamsUni,
-        max_datagram_frame_size_local = MaxDatagramSize,
-        server_cert = Cert,
-        server_cert_chain = CertChain,
-        server_private_key = PrivateKey,
-        tls_transcript = Transcript,
-        server_hs_secret = ServerHsSecret,
-        handshake_secret = HandshakeSecret
+        cfg = #conn_cfg{
+            scid = SCID,
+            verify = Verify,
+            max_stream_data_bidi_local = MaxStreamDataBidiLocal,
+            max_stream_data_bidi_remote = MaxStreamDataBidiRemote,
+            max_stream_data_uni = MaxStreamDataUni,
+            max_datagram_frame_size_local = MaxDatagramSize
+        },
+        hs = #hs{
+            server_cert = Cert,
+            server_cert_chain = CertChain,
+            server_private_key = PrivateKey,
+            tls_transcript = Transcript,
+            server_hs_secret = ServerHsSecret,
+            handshake_secret = HandshakeSecret
+        }
     } = State,
 
     %% Build transport parameters
     TransportParams0 = #{
         %% RFC 9000 §7.3: server MUST send this
-        original_dcid => State#state.original_dcid,
+        original_dcid => (State#state.cfg)#conn_cfg.original_dcid,
         initial_scid => SCID,
         initial_max_data => MaxData,
         initial_max_stream_data_bidi_local => MaxStreamDataBidiLocal,
@@ -2684,13 +2732,13 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         initial_max_stream_data_uni => MaxStreamDataUni,
         initial_max_streams_bidi => MaxStreamsBidi,
         initial_max_streams_uni => MaxStreamsUni,
-        max_idle_timeout => State#state.idle_timeout,
+        max_idle_timeout => (State#state.cfg)#conn_cfg.idle_timeout,
         active_connection_id_limit => local_active_limit(State),
         max_udp_payload_size => advertised_max_udp_payload_size(State),
         %% RFC 9368: the versions we would also accept; the server may
         %% switch the connection to one of them.
         version_information =>
-            {State#state.version, State#state.supported_versions}
+            {State#state.version, (State#state.cfg)#conn_cfg.supported_versions}
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
     TransportParams1 =
@@ -2700,14 +2748,14 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         end,
     %% Add reset_stream_at if enabled (draft-ietf-quic-reliable-stream-reset-07)
     TransportParams2 =
-        case State#state.reset_stream_at_enabled of
+        case (State#state.cfg)#conn_cfg.reset_stream_at_enabled of
             false -> TransportParams1;
             true -> TransportParams1#{reset_stream_at => true}
         end,
     %% Add preferred_address if configured (RFC 9000 Section 9.6)
     %% Server MUST NOT send preferred_address if disable_active_migration is set
     TransportParams3 =
-        case State#state.server_preferred_address of
+        case (State#state.cfg)#conn_cfg.server_preferred_address of
             #preferred_address{} = PA ->
                 TransportParams2#{preferred_address => PA};
             _ ->
@@ -2718,14 +2766,14 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     %% echo the Retry's SCID in retry_source_connection_id so the
     %% client can verify the full handshake against the Retry it saw.
     TransportParams3b =
-        case State#state.retry_scid_for_tp of
+        case (State#state.cfg)#conn_cfg.retry_scid_for_tp of
             undefined -> TransportParams3;
             RetrySCIDTP -> TransportParams3#{retry_scid => RetrySCIDTP}
         end,
     %% RFC 9368: echo the negotiated version and our acceptable set.
     TransportParams4 = TransportParams3b#{
         version_information =>
-            {State#state.version, State#state.supported_versions}
+            {State#state.version, (State#state.cfg)#conn_cfg.supported_versions}
     },
 
     %% RFC 9000 §10.3: advertise a stateless_reset_token bound to our initial
@@ -2734,7 +2782,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     %% derived from the same server-wide secret + CID. Only sent when a secret
     %% is configured.
     TransportParams =
-        case State#state.stateless_reset_secret of
+        case (State#state.cfg)#conn_cfg.stateless_reset_secret of
             undefined ->
                 TransportParams4;
             _ ->
@@ -2747,14 +2795,14 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     EncExtMsg = quic_tls:build_encrypted_extensions(#{
         alpn => ALPN,
         transport_params => TransportParams,
-        early_data => State#state.early_data_accepted
+        early_data => (State#state.hs)#hs.early_data_accepted
     }),
 
     %% PSK handshakes (RFC 8446 §4.6) skip CertificateRequest / Certificate /
     %% CertificateVerify entirely. Cert path runs only when no PSK was
     %% selected for this handshake.
     {CertReqMsg, CertMsg, CertVerifyMsg, Transcript2, TranscriptHashForFinished} =
-        case State#state.selected_psk of
+        case (State#state.hs)#hs.selected_psk of
             undefined ->
                 %% Cert path
                 CertReq =
@@ -2767,7 +2815,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
                 T1 = <<Transcript/binary, EncExtMsg/binary, CertReq/binary, Cert0/binary>>,
                 HashForCV = quic_crypto:transcript_hash(Cipher, T1),
                 %% Scheme negotiated in do_server_client_hello.
-                SigAlg = State#state.cert_verify_code,
+                SigAlg = (State#state.hs)#hs.cert_verify_code,
                 CV = quic_tls:build_certificate_verify(SigAlg, PrivateKey, HashForCV),
                 T2 = <<T1/binary, CV/binary>>,
                 HashForFin = quic_crypto:transcript_hash(Cipher, T2),
@@ -2800,7 +2848,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     ServerAppSecret = quic_crypto:derive_server_app_secret(
         Cipher, MasterSecret, TranscriptHashFinal
     ),
-    keylog_application(State#state.tls_ch1_random, ClientAppSecret, ServerAppSecret),
+    keylog_application((State#state.hs)#hs.tls_ch1_random, ClientAppSecret, ServerAppSecret),
 
     %% Derive app keys
     {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(
@@ -2840,11 +2888,13 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
 
     %% Update state with transcript and app keys
     State1 = State#state{
-        tls_state = NextTlsState,
-        tls_transcript = Transcript3,
-        master_secret = MasterSecret,
         app_keys = {ClientAppKeys, ServerAppKeys},
-        key_state = KeyState
+        key_state = KeyState,
+        hs = (State#state.hs)#hs{
+            tls_state = NextTlsState,
+            tls_transcript = Transcript3,
+            master_secret = MasterSecret
+        }
     },
 
     %% Send the flight, segmented so no datagram exceeds the peer's
@@ -2861,7 +2911,7 @@ send_handshake_crypto(Payload, State0) ->
     %% one, not sending one, so it must not discard here: it still has a
     %% ServerHello to retransmit at the Initial level.
     State =
-        case State0#state.role of
+        case (State0#state.cfg)#conn_cfg.role of
             client -> discard_initial(State0);
             server -> State0
         end,
@@ -2880,7 +2930,7 @@ send_handshake_crypto(Payload, State0) ->
 %% mid-handshake and every peer's max_udp_payload_size is >= 1200, so
 %% 1200 is universally safe. Overhead covers the long header, packet
 %% number, AEAD tag and CRYPTO frame header (generous varints).
-handshake_crypto_budget(#state{dcid = DCID, scid = SCID} = State) ->
+handshake_crypto_budget(#state{dcid = DCID, cfg = #conn_cfg{scid = SCID}} = State) ->
     PeerMax = maps:get(
         max_udp_payload_size,
         State#state.transport_params,
@@ -2929,7 +2979,9 @@ send_initial_crypto(Payload, Offset0, State) ->
 %% Initial packet is separately padded to 1200 bytes downstream, so
 %% the budget bounds the pre-padding size and keeps every datagram
 %% within the universally safe 1200-byte ceiling.
-initial_crypto_budget(#state{dcid = DCID, scid = SCID, retry_token = Token} = State) ->
+initial_crypto_budget(
+    #state{dcid = DCID, cfg = #conn_cfg{scid = SCID}, hs = #hs{retry_token = Token}} = State
+) ->
     PeerMax = maps:get(
         max_udp_payload_size,
         State#state.transport_params,
@@ -2957,13 +3009,14 @@ confirm_handshake(#state{loss_state = LossState} = State) ->
     Confirmed = discard_space(handshake, State#state{
         loss_state = quic_loss:on_handshake_confirmed(LossState)
     }),
-    Confirmed#state{handshake_keys = undefined}.
+    Confirmed#state{hs = (Confirmed#state.hs)#hs{handshake_keys = undefined}}.
 
 %% RFC 9001 Section 4.9.1: the keys go with the packets. Discarding the
 %% space alone would leave the connection able to send at a level it must
 %% not, and able to decrypt packets it must drop.
 discard_initial(State) ->
-    (discard_space(initial, State))#state{initial_keys = undefined, initial_keys_alt = undefined}.
+    State1 = discard_space(initial, State),
+    State1#state{hs = (State1#state.hs)#hs{initial_keys = undefined, initial_keys_alt = undefined}}.
 
 %% Drop a packet number space from both byte counters at once. They are
 %% tracked separately, so subtracting from one and not the other leaves
@@ -2985,10 +3038,12 @@ discard_space(Space, #state{loss_state = LossState, cc_state = CCState} = State)
 %% Nothing may be sent at a discarded level (RFC 9001 Section 4.9), which
 %% includes packets that never left: one held back by the amplification
 %% budget, or by the congestion window.
-purge_unsent(Space, #state{pending_hs = Pending} = State) ->
+purge_unsent(Space, #state{hs = #hs{pending_hs = Pending}} = State) ->
     State#state{
-        pending_hs = Pending#{Space => queue:new()},
-        pending_hs_bytes = (State#state.pending_hs_bytes)#{Space => 0}
+        hs = (State#state.hs)#hs{
+            pending_hs = Pending#{Space => queue:new()},
+            pending_hs_bytes = ((State#state.hs)#hs.pending_hs_bytes)#{Space => 0}
+        }
     }.
 
 discard_cc_bytes(undefined, _Bytes) -> undefined;
@@ -3001,7 +3056,7 @@ send_handshake_done(State) ->
 %% Server: Send NewSessionTicket after handshake completes
 %% RFC 8446 Section 4.6.1: Server sends NewSessionTicket in post-handshake message
 %% In QUIC, this is sent as a TLS handshake message in a CRYPTO frame
-send_new_session_ticket(#state{selected_psk = #{source := external}} = State) ->
+send_new_session_ticket(#state{hs = #hs{selected_psk = #{source := external}}} = State) ->
     %% Suppress NewSessionTicket on external-PSK handshakes (v1
     %% — see docs/PSK.md "v1 limitations"). External-PSK clients
     %% already have a long-lived credential and don't need a
@@ -3009,20 +3064,24 @@ send_new_session_ticket(#state{selected_psk = #{source := external}} = State) ->
     %% we don't want to answer right now. A handshake resumed from a
     %% ticket gets a new one: tickets are single-use.
     State;
-send_new_session_ticket(#state{resumption_secret = undefined} = State) ->
+send_new_session_ticket(#state{hs = #hs{resumption_secret = undefined}} = State) ->
     %% No resumption secret available - skip sending ticket
     State;
-send_new_session_ticket(#state{ticket_table = undefined} = State) ->
+send_new_session_ticket(#state{cfg = #conn_cfg{ticket_table = undefined}} = State) ->
     %% Not started by a listener: nowhere to resume the ticket from.
     State;
 send_new_session_ticket(
     #state{
-        resumption_secret = ResumptionSecret,
-        server_name = ServerName,
-        max_early_data = MaxEarlyData,
         alpn = ALPN,
         app_keys = {ClientAppKeys, _},
-        ticket_table = TicketTable
+        cfg = #conn_cfg{
+            ticket_table = TicketTable
+        },
+        hs = #hs{
+            resumption_secret = ResumptionSecret,
+            server_name = ServerName,
+            max_early_data = MaxEarlyData
+        }
     } = State
 ) ->
     %% The cipher is the same at every level; the 1-RTT keys are the ones
@@ -3089,7 +3148,7 @@ packet_flags(Frames, Padded) ->
 %% the very handshake that would unblock the sender.
 admit(_Space, false, _Size, _Payload, _Frames, State) ->
     {ok, State};
-admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{hs_probe = true} = State) ->
+admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{hs = #hs{hs_probe = true}} = State) ->
     {ok, State};
 admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{cc_state = undefined} = State) ->
     {ok, State};
@@ -3121,7 +3180,7 @@ admit(Space, true, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
 %% ceiling only catches a local fault and closing is the honest answer
 %% to reaching it.
 enqueue_hs(Space, Payload, Frames, State) ->
-    #state{pending_hs = Pending, pending_hs_bytes = Bytes} = State,
+    #state{hs = #hs{pending_hs = Pending, pending_hs_bytes = Bytes}} = State,
     Held = maps:get(Space, Bytes, 0) + iolist_size(Payload),
     case Held > ?MAX_PENDING_HS_BYTES of
         true ->
@@ -3136,15 +3195,19 @@ enqueue_hs(Space, Payload, Frames, State) ->
                 0,
                 <<"pending handshake queue overflow">>,
                 State#state{
-                    pending_hs = #{initial => queue:new(), handshake => queue:new()},
-                    pending_hs_bytes = #{initial => 0, handshake => 0}
+                    hs = (State#state.hs)#hs{
+                        pending_hs = #{initial => queue:new(), handshake => queue:new()},
+                        pending_hs_bytes = #{initial => 0, handshake => 0}
+                    }
                 }
             );
         false ->
             Queued = maps:get(Space, Pending, queue:new()),
             State#state{
-                pending_hs = Pending#{Space => queue:in({Payload, Frames}, Queued)},
-                pending_hs_bytes = Bytes#{Space => Held}
+                hs = (State#state.hs)#hs{
+                    pending_hs = Pending#{Space => queue:in({Payload, Frames}, Queued)},
+                    pending_hs_bytes = Bytes#{Space => Held}
+                }
             }
     end.
 
@@ -3153,7 +3216,7 @@ enqueue_hs(Space, Payload, Frames, State) ->
 drain_pending_hs(#state{} = State) ->
     lists:foldl(fun drain_space/2, State, [initial, handshake]).
 
-drain_space(Space, #state{pending_hs = Pending} = State) ->
+drain_space(Space, #state{hs = #hs{pending_hs = Pending}} = State) ->
     Queued = maps:get(Space, Pending, queue:new()),
     case queue:is_empty(Queued) of
         true ->
@@ -3164,7 +3227,9 @@ drain_space(Space, #state{pending_hs = Pending} = State) ->
             %% The byte counter stays as it is and is adjusted per
             %% packet.
             drain_one_by_one(Space, Queued, State#state{
-                pending_hs = Pending#{Space => queue:new()}
+                hs = (State#state.hs)#hs{
+                    pending_hs = Pending#{Space => queue:new()}
+                }
             })
     end.
 
@@ -3181,19 +3246,23 @@ drain_one_by_one(Space, Queue, State) ->
         {{value, {Payload, Frames}}, Rest} ->
             %% Uncount it before the attempt: a refusal goes back
             %% through enqueue_hs, which counts it again.
-            Bytes = State#state.pending_hs_bytes,
+            Bytes = (State#state.hs)#hs.pending_hs_bytes,
             Held = max(0, maps:get(Space, Bytes, 0) - iolist_size(Payload)),
             Sent = send_at_level(
-                Space, Payload, Frames, State#state{pending_hs_bytes = Bytes#{Space => Held}}
+                Space, Payload, Frames, State#state{
+                    hs = (State#state.hs)#hs{pending_hs_bytes = Bytes#{Space => Held}}
+                }
             ),
-            Requeued = maps:get(Space, Sent#state.pending_hs, queue:new()),
+            Requeued = maps:get(Space, (Sent#state.hs)#hs.pending_hs, queue:new()),
             case queue:is_empty(Requeued) of
                 true ->
                     drain_one_by_one(Space, Rest, Sent);
                 false ->
                     Sent#state{
-                        pending_hs = (Sent#state.pending_hs)#{
-                            Space => queue:join(Requeued, Rest)
+                        hs = (Sent#state.hs)#hs{
+                            pending_hs = ((Sent#state.hs)#hs.pending_hs)#{
+                                Space => queue:join(Requeued, Rest)
+                            }
                         }
                     }
             end
@@ -3205,17 +3274,21 @@ drain_one_by_one(Space, Queue, State) ->
 %% (RFC 9001 Section 4.9.1), so a send that races the discard is dropped
 %% rather than crashing. The peer has discarded that space too, so there
 %% is nothing left for it to acknowledge.
-send_initial_packet(_Payload, _Frames, #state{initial_keys = undefined} = State) ->
+send_initial_packet(_Payload, _Frames, #state{hs = #hs{initial_keys = undefined}} = State) ->
     State;
 send_initial_packet(Payload, Frames, State) ->
     #state{
-        scid = SCID,
         dcid = DCID,
         version = Version,
-        initial_keys = {ClientKeys, ServerKeys},
-        role = Role,
-        pn_initial = PNSpace,
-        retry_token = RetryToken
+        cfg = #conn_cfg{
+            scid = SCID,
+            role = Role
+        },
+        hs = #hs{
+            initial_keys = {ClientKeys, ServerKeys},
+            pn_initial = PNSpace,
+            retry_token = RetryToken
+        }
     } = State,
 
     %% Select correct keys based on role:
@@ -3280,7 +3353,7 @@ send_initial_packet(Payload, Frames, State) ->
             State1 = emit(PaddedPacket, Meta, Admitted),
 
             %% Emit qlog packet_sent event
-            quic_qlog:packet_sent(State#state.qlog_ctx, #{
+            quic_qlog:packet_sent((State#state.cfg)#conn_cfg.qlog_ctx, #{
                 packet_type => initial,
                 packet_number => PN,
                 length => byte_size(PaddedPacket)
@@ -3288,15 +3361,13 @@ send_initial_packet(Payload, Frames, State) ->
 
             %% Update packet number space and packet counter
             NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-            State1#state{
-                pn_initial = NewPNSpace,
-                packets_sent = State1#state.packets_sent + 1
-            }
+            bump(?C_PACKETS_SENT, 1, State1),
+            State1#state{hs = (State1#state.hs)#hs{pn_initial = NewPNSpace}}
     end.
 
 %% Send an Initial ACK packet
 send_initial_ack(State) ->
-    #state{pn_initial = PNSpace} = State,
+    #state{hs = #hs{pn_initial = PNSpace}} = State,
     case PNSpace#pn_space.ack_ranges of
         [] ->
             % Nothing to ACK
@@ -3309,7 +3380,7 @@ send_initial_ack(State) ->
 
 %% Send a Handshake ACK packet
 send_handshake_ack(State) ->
-    #state{pn_handshake = PNSpace} = State,
+    #state{hs = #hs{pn_handshake = PNSpace}} = State,
     case PNSpace#pn_space.ack_ranges of
         [] ->
             State;
@@ -3323,28 +3394,38 @@ send_handshake_ack(State) ->
 %% Always resets the decimation counter + cancels any armed ack_timer
 %% so the next ack-eliciting batch starts a fresh window.
 send_app_ack(State) ->
-    State1 = clear_ack_decimation_state(State),
-    #state{pn_app = PNSpace} = State1,
+    send_app_ack(State, State#state.recv_pass).
+
+%% Cancel the ACK timer, zero the decimation count, count the ACK and
+%% set the receive-pass flag in one record update.
+send_app_ack(#state{ack_timer = Ref, pn_app = PNSpace} = State, RecvPass) ->
+    cancel_timer(Ref),
     case PNSpace#pn_space.ack_ranges of
         [] ->
-            State1;
+            State#state{ack_timer = undefined, ack_elicited_count = 0, recv_pass = RecvPass};
         Ranges ->
             AckFrameTuple = quic_ack:build_ack_frame_tuple(Ranges),
-            maybe_coalesce_ack_with_data(AckFrameTuple, bump_ack_sent(State1))
+            bump(?C_ACK_SENT, 1, State),
+            maybe_coalesce_ack_with_data(AckFrameTuple, State#state{
+                ack_timer = undefined,
+                ack_elicited_count = 0,
+                recv_pass = RecvPass
+            })
     end.
 
 %% Bump the ack_sent counter. Called once per ACK packet that is about
 %% to hit the wire (after the ack_ranges non-empty check).
-bump_ack_sent(#state{ack_sent = N} = State) ->
-    State#state{ack_sent = N + 1}.
+bump_ack_sent(State) ->
+    bump(?C_ACK_SENT, 1, State),
+    State.
 
-%% Cancel any armed ACK timer and zero the decimation counter. Called
-%% from every 1-RTT ACK emission path.
-clear_ack_decimation_state(#state{ack_timer = undefined} = State) ->
-    State#state{ack_elicited_count = 0};
-clear_ack_decimation_state(#state{ack_timer = Ref} = State) ->
-    cancel_timer(Ref),
-    State#state{ack_timer = undefined, ack_elicited_count = 0}.
+%% Per-connection counters live in a counters array, so bumping one
+%% copies nothing.
+bump(Ix, N, #state{cfg = #conn_cfg{counters = C}}) ->
+    counters:add(C, Ix, N).
+
+count(Ix, #state{cfg = #conn_cfg{counters = C}}) ->
+    counters:get(C, Ix).
 
 %% Try to coalesce ACK frame with small pending stream data
 %% Takes frame tuples (not encoded) to avoid re-decode overhead
@@ -3416,16 +3497,20 @@ send_frame_tuples(FrameTuples, State) ->
     send_app_packet_internal(Payload, FrameTuples, State).
 
 %% Send a Handshake packet
-send_handshake_packet(_Payload, _Frames, #state{handshake_keys = undefined} = State) ->
+send_handshake_packet(_Payload, _Frames, #state{hs = #hs{handshake_keys = undefined}} = State) ->
     State;
 send_handshake_packet(Payload, Frames, State) ->
     #state{
-        scid = SCID,
         dcid = DCID,
         version = Version,
-        handshake_keys = {ClientKeys, ServerKeys},
-        role = Role,
-        pn_handshake = PNSpace
+        cfg = #conn_cfg{
+            scid = SCID,
+            role = Role
+        },
+        hs = #hs{
+            handshake_keys = {ClientKeys, ServerKeys},
+            pn_handshake = PNSpace
+        }
     } = State,
 
     %% Select correct keys based on role
@@ -3471,7 +3556,7 @@ send_handshake_packet(Payload, Frames, State) ->
             State1 = emit(Packet, Meta, Admitted),
 
             %% Emit qlog packet_sent event
-            quic_qlog:packet_sent(State#state.qlog_ctx, #{
+            quic_qlog:packet_sent((State#state.cfg)#conn_cfg.qlog_ctx, #{
                 packet_type => handshake,
                 packet_number => PN,
                 length => byte_size(Packet)
@@ -3479,10 +3564,8 @@ send_handshake_packet(Payload, Frames, State) ->
 
             %% Update PN space and packet counter
             NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-            State1#state{
-                pn_handshake = NewPNSpace,
-                packets_sent = State1#state.packets_sent + 1
-            }
+            bump(?C_PACKETS_SENT, 1, State1),
+            State1#state{hs = (State1#state.hs)#hs{pn_handshake = NewPNSpace}}
     end.
 
 %% Send a 1-RTT (application) packet with a single frame (avoid encode/decode roundtrip)
@@ -3502,13 +3585,18 @@ send_frame(Frame, State) ->
 %% emission point changes. A payload larger than the remaining budget
 %% flushes the pending packet first; coalescing off means the old
 %% one-packet-per-call behaviour, byte for byte.
-send_app_packet_internal(Payload, Frames, #state{coalesce = true} = State) ->
+send_app_packet_internal(Payload, Frames, State) ->
+    send_app_packet_internal(Payload, Frames, State, State#state.cc_state).
+
+%% CCState is the congestion state the caller already charged for this
+%% packet, stored with the rest of the update instead of a copy of its own.
+send_app_packet_internal(Payload, Frames, #state{coalesce = true} = State, CCState) ->
     #state{pend_payload = PP, pend_frames = PF, pend_size = PS} = State,
     Size = erlang:iolist_size(Payload),
     Budget = get_max_stream_data_per_packet(State),
     case PS > 0 andalso PS + Size > Budget of
         true ->
-            State1 = flush_pending_packet(State),
+            State1 = flush_pending_packet(State#state{cc_state = CCState}),
             State1#state{
                 pend_payload = [Payload],
                 pend_frames = lists:reverse(Frames),
@@ -3518,20 +3606,21 @@ send_app_packet_internal(Payload, Frames, #state{coalesce = true} = State) ->
             State#state{
                 pend_payload = [Payload | PP],
                 pend_frames = lists:reverse(Frames, PF),
-                pend_size = PS + Size
+                pend_size = PS + Size,
+                cc_state = CCState
             }
     end;
-send_app_packet_internal(Payload, Frames, State) ->
-    send_app_packet_now(Payload, Frames, State).
+send_app_packet_internal(Payload, Frames, State, CCState) ->
+    send_app_packet_now(Payload, Frames, State, keep, CCState).
 
 %% Drain consecutive send requests already sitting in the mailbox and
 %% process them as one batch with coalescing enabled, so frames from
 %% concurrent senders share packets (issue #201). Only send messages
 %% are drained; everything else keeps its ordinary ordering. A lone
-%% send behaves exactly as before apart from a single extra receive
-%% probe.
+%% send has nothing to share a packet with and skips coalescing.
 coalesced_sends(Acc0, State0) ->
     Sends = drain_send_msgs(Acc0, 63),
+    Coalesce = (tl(Sends) =/= []),
     {RevReplies, State1} =
         lists:foldl(
             fun({Tag, Sid, Data, Fin}, {Rs, S}) ->
@@ -3539,19 +3628,17 @@ coalesced_sends(Acc0, State0) ->
                     {ok, S2} ->
                         {[{Tag, ok} | Rs], S2};
                     {error, send_queue_full} ->
-                        Refusals = S#state.send_queue_full_refusals + 1,
-                        {[{Tag, {error, send_queue_full}} | Rs], S#state{
-                            send_queue_full_refusals = Refusals
-                        }};
+                        bump(?C_SEND_QUEUE_FULL_REFUSALS, 1, S),
+                        {[{Tag, {error, send_queue_full}} | Rs], S};
                     {error, Reason} ->
                         {[{Tag, {error, Reason}} | Rs], S}
                 end
             end,
-            {[], State0#state{coalesce = true}},
+            {[], start_coalescing(Coalesce, State0)},
             Sends
         ),
-    State2 = flush_pending_packet(State1#state{coalesce = false}),
-    FlushedState = flush_dirty_timers(flush_socket_batch(State2)),
+    State2 = end_coalescing(Coalesce, State1),
+    FlushedState = flush_event(State2, event),
     Replies = [{reply, F, R} || {F, R} <- lists:reverse(RevReplies), F =/= async],
     {keep_state, FlushedState, Replies}.
 
@@ -3574,21 +3661,36 @@ drain_send_msgs(Acc, N) ->
 flush_pending_packet(#state{pend_size = 0} = State) ->
     State;
 flush_pending_packet(#state{pend_payload = PP, pend_frames = PF} = State) ->
-    State1 = State#state{pend_payload = [], pend_frames = [], pend_size = 0},
-    send_app_packet_now(lists:reverse(PP), lists:reverse(PF), State1).
+    send_app_packet_now(lists:reverse(PP), lists:reverse(PF), State, clear, State#state.cc_state).
+
+%% Leave a coalescing batch: flush what it accumulated and turn
+%% coalescing off in the same update.
+start_coalescing(false, State) -> State;
+start_coalescing(true, State) -> State#state{coalesce = true}.
+
+end_coalescing(false, State) ->
+    State;
+end_coalescing(true, #state{pend_size = 0} = State) ->
+    State#state{coalesce = false};
+end_coalescing(true, #state{pend_payload = PP, pend_frames = PF} = State) ->
+    send_app_packet_now(lists:reverse(PP), lists:reverse(PF), State, close, State#state.cc_state).
 
 %% Counts against the per-drain burst budget here rather than in
 %% send_app_packet_internal/3: with coalescing on, several sends share
-%% one packet, and the budget bounds packets on the wire.
-send_app_packet_now(Payload, Frames, State0) ->
-    State = State0#state{burst_sent = State0#state.burst_sent + 1},
+%% one packet, and the budget bounds packets on the wire. `clear' empties
+%% the coalescing buffer the payload came from, in the same update;
+%% `close' also turns coalescing off.
+send_app_packet_now(Payload0, Frames0, State, Pend, CCState) ->
+    AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames0),
+    {Payload, Frames, AckFields} = piggyback_ack(AckEliciting, Payload0, Frames0, State),
     #state{
         dcid = DCID,
         app_keys = {ClientKeys, ServerKeys},
-        role = Role,
         pn_app = PNSpace,
-        cc_state = CCState,
-        loss_state = LossState
+        loss_state = LossState,
+        cfg = #conn_cfg{
+            role = Role
+        }
     } = State,
 
     %% Select correct keys based on role
@@ -3623,7 +3725,7 @@ send_app_packet_now(Payload, Frames, State0) ->
     case SendResult of
         {ok, NewSocketState} ->
             %% Emit qlog packet_sent event (no-op when qlog disabled)
-            ?QLOG_EMIT_PACKET_SENT(State#state.qlog_ctx, #{
+            ?QLOG_EMIT_PACKET_SENT((State#state.cfg)#conn_cfg.qlog_ctx, #{
                 packet_type => one_rtt,
                 packet_number => PN,
                 length => PacketSize,
@@ -3636,9 +3738,6 @@ send_app_packet_now(Payload, Frames, State0) ->
             Now = erlang:monotonic_time(millisecond),
 
             %% Track sent packet for loss detection and congestion control.
-            %% Determine if ack-eliciting by checking the actual frames list
-            %% so coalesced packets with multiple frames are handled.
-            AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames),
             NewLossState = quic_loss:on_packet_sent(
                 app, LossState, PN, PacketSize, AckEliciting, Frames, Now
             ),
@@ -3670,24 +3769,100 @@ send_app_packet_now(Payload, Frames, State0) ->
                     true -> Now;
                     false -> State#state.last_activity
                 end,
-            maybe_force_key_update(State#state{
+            {NewKeyState, KeyLimit} = count_sealed(State#state.key_state, 1),
+            {AckTimer, AckCount} = sent_ack_fields(AckFields, State),
+            bump(?C_PACKETS_SENT, 1, State),
+            {PendPayload, PendFrames, PendSize, Coalesce} =
+                case Pend of
+                    keep ->
+                        #state{
+                            pend_payload = PP, pend_frames = PF, pend_size = PS, coalesce = C
+                        } = State,
+                        {PP, PF, PS, C};
+                    clear ->
+                        {[], [], 0, State#state.coalesce};
+                    close ->
+                        {[], [], 0, false}
+                end,
+            State1 = State#state{
                 pn_app = NewPNSpace,
                 cc_state = NewCCState,
                 loss_state = NewLossState,
-                packets_sent = State#state.packets_sent + 1,
                 socket_state = EffectiveSocketState,
                 last_activity = NewLastActivity,
                 ack_eliciting_since_recv =
                     AckEliciting orelse State#state.ack_eliciting_since_recv,
-                pto_dirty = true
-            });
+                pto_dirty = true,
+                burst_sent = State#state.burst_sent + 1,
+                key_state = NewKeyState,
+                pend_payload = PendPayload,
+                pend_frames = PendFrames,
+                pend_size = PendSize,
+                coalesce = Coalesce,
+                ack_timer = AckTimer,
+                ack_elicited_count = AckCount
+            },
+            after_sealed(KeyLimit, State1);
         {error, Reason, ClearedSocketState} ->
             send_app_packet_internal_error(
-                Reason, PN, PacketSize, PNSpace, State, ClearedSocketState
+                Reason,
+                PN,
+                PacketSize,
+                PNSpace,
+                clear_pend(Pend, State#state{cc_state = CCState}),
+                ClearedSocketState
             );
         {error, Reason} ->
-            send_app_packet_internal_error(Reason, PN, PacketSize, PNSpace, State, undefined)
+            send_app_packet_internal_error(
+                Reason,
+                PN,
+                PacketSize,
+                PNSpace,
+                clear_pend(Pend, State#state{cc_state = CCState}),
+                undefined
+            )
     end.
+
+clear_pend(keep, State) ->
+    State;
+clear_pend(clear, State) ->
+    State#state{pend_payload = [], pend_frames = [], pend_size = 0};
+clear_pend(close, State) ->
+    State#state{pend_payload = [], pend_frames = [], pend_size = 0, coalesce = false}.
+
+%% An ack-eliciting packet carries the pending ACK when it fits the data
+%% budget (RFC 9000 §13.2.1 lets an ACK ride on any 1-RTT packet), so an
+%% interactive exchange sends no ACK-only packet and needs no ACK timer.
+%% `acked' tells the packet update to clear the decimation state.
+piggyback_ack(
+    true,
+    Payload,
+    Frames,
+    #state{
+        ack_elicited_count = Count,
+        ack_timer = Timer,
+        pn_app = #pn_space{ack_ranges = [_ | _] = Ranges}
+    } = State
+) when Count > 0; Timer =/= undefined ->
+    AckFrame = quic_ack:build_ack_frame_tuple(Ranges),
+    AckBin = quic_frame:encode(AckFrame),
+    case
+        erlang:iolist_size(Payload) + byte_size(AckBin) =<
+            get_max_stream_data_per_packet(State)
+    of
+        true -> {[AckBin | Payload], [AckFrame | Frames], acked};
+        false -> {Payload, Frames, none}
+    end;
+piggyback_ack(_AckEliciting, Payload, Frames, _State) ->
+    {Payload, Frames, none}.
+
+%% ACK timer and decimation count after the packet went out.
+sent_ack_fields(none, #state{ack_timer = T, ack_elicited_count = C}) ->
+    {T, C};
+sent_ack_fields(acked, #state{ack_timer = T} = State) ->
+    cancel_timer(T),
+    bump(?C_ACK_SENT, 1, State),
+    {undefined, 0}.
 
 %% Common error handling for send_app_packet_internal: bump PN without
 %% tracking the packet (PTO owns retransmission) and, on the 3-tuple
@@ -3699,11 +3874,14 @@ send_app_packet_internal_error(Reason, PN, PacketSize, PNSpace, State, ClearedSo
         ?QUIC_LOG_META
     ),
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
+    Burst = State#state.burst_sent + 1,
     case ClearedSocketState of
         undefined ->
-            State#state{pn_app = NewPNSpace};
+            State#state{pn_app = NewPNSpace, burst_sent = Burst};
         _ ->
-            State#state{pn_app = NewPNSpace, socket_state = ClearedSocketState}
+            State#state{
+                pn_app = NewPNSpace, socket_state = ClearedSocketState, burst_sent = Burst
+            }
     end.
 
 %% Pad Initial packet to minimum 1200 bytes
@@ -3793,8 +3971,10 @@ handle_packet(Data, State) ->
     drain_pending_hs(State2).
 
 %% Server-side anti-amplification accounting/gating (RFC 9000 §8.1).
-amp_account_recv(Data, #state{role = server, address_validated = false} = State) ->
-    State#state{amp_rx = State#state.amp_rx + byte_size(Data)};
+amp_account_recv(
+    Data, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
+) ->
+    State#state{hs = (State#state.hs)#hs{amp_rx = (State#state.hs)#hs.amp_rx + byte_size(Data)}};
 amp_account_recv(_Data, State) ->
     State.
 
@@ -3828,17 +4008,25 @@ gate(Space, InFlight, Size, Datagram, Payload, Frames, State) ->
 %% server may send at most three times what it has received. The limit
 %% is absolute, so unlike the congestion window it has no probe
 %% exemption.
-amp_allows(Datagram, #state{role = server, address_validated = false} = State) ->
-    (State#state.amp_tx + erlang:iolist_size(Datagram)) =< (3 * State#state.amp_rx);
+amp_allows(
+    Datagram, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
+) ->
+    ((State#state.hs)#hs.amp_tx + erlang:iolist_size(Datagram)) =< (3 * (State#state.hs)#hs.amp_rx);
 amp_allows(_Datagram, _State) ->
     true.
 
 %% Put the datagram on the wire and charge it, in that order: nothing is
 %% spent until both gates have passed.
-emit(Datagram, Meta, #state{role = server, address_validated = false} = State) ->
+emit(
+    Datagram,
+    Meta,
+    #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
+) ->
     State1 = State#state{
         socket_state = send_and_take_socket_state(Datagram, State),
-        amp_tx = State#state.amp_tx + erlang:iolist_size(Datagram)
+        hs = (State#state.hs)#hs{
+            amp_tx = (State#state.hs)#hs.amp_tx + erlang:iolist_size(Datagram)
+        }
     },
     register_now(Meta, erlang:monotonic_time(millisecond), State1);
 emit(Datagram, Meta, State) ->
@@ -3860,8 +4048,10 @@ register_now({Space, PN, Size, Frames, AckEliciting, true}, Now, State) ->
 
 %% Mark the peer address validated once a server decrypts a Handshake
 %% packet from it (RFC 9000 §8.1) — lifts the amplification limit.
-amp_mark_validated(handshake, #state{role = server, address_validated = false} = State) ->
-    State#state{address_validated = true};
+amp_mark_validated(
+    handshake, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
+) ->
+    State#state{hs = (State#state.hs)#hs{address_validated = true}};
 amp_mark_validated(_Type, State) ->
     State.
 
@@ -3869,7 +4059,7 @@ amp_mark_validated(_Type, State) ->
 %% first successfully processes a Handshake packet. The trigger is
 %% receiving one, not lifting the amplification limit, which may already
 %% have been lifted by a validated token.
-server_discard_initial(handshake, #state{role = server} = State) ->
+server_discard_initial(handshake, #state{cfg = #conn_cfg{role = server}} = State) ->
     discard_initial(State);
 server_discard_initial(_Type, State) ->
     State.
@@ -3906,7 +4096,7 @@ do_handle_packets_batch([Packet | Rest], State) ->
 %% no-key-update-in-flight condition as fused_decrypt_keys/2.
 fused_run_keys(#state{app_keys = undefined}) ->
     no;
-fused_run_keys(#state{app_keys = {ClientKeys, ServerKeys}, role = Role} = State) ->
+fused_run_keys(#state{app_keys = {ClientKeys, ServerKeys}, cfg = #conn_cfg{role = Role}} = State) ->
     Current =
         case Role of
             client -> ServerKeys;
@@ -3925,7 +4115,7 @@ handle_short_run(Packets, Keys, State) ->
             HP,
             get_largest_recv(app, State),
             get_current_key_phase(State),
-            byte_size(State#state.scid),
+            byte_size((State#state.cfg)#conn_cfg.scid),
             Run
         )
     of
@@ -3974,29 +4164,24 @@ fold_opened(Results, State) ->
                 {LastPN, LastFB} ->
                     SpinRecv = (LastFB bsr 5) band 1,
                     SpinOut =
-                        case State#state.spin_bit_enabled of
+                        case (State#state.cfg)#conn_cfg.spin_bit_enabled of
                             false -> State#state.spin_outgoing;
-                            true when State#state.role =:= client -> SpinRecv;
+                            true when (State#state.cfg)#conn_cfg.role =:= client -> SpinRecv;
                             true -> 1 - SpinRecv
                         end,
-                    State1 = State#state{
-                        pn_app = PNSpace#pn_space{
-                            largest_recv = LastPN,
-                            recv_time = Now,
-                            ack_ranges = [{RangeStart, LastPN} | RestRanges]
-                        },
-                        last_recv_trigger = sequential,
-                        spin_recv = SpinRecv,
-                        spin_recv_largest_pn = LastPN,
-                        spin_outgoing = SpinOut,
-                        last_activity = Now,
-                        ack_eliciting_since_recv = false
+                    NewPNSpace = PNSpace#pn_space{
+                        largest_recv = LastPN,
+                        recv_time = Now,
+                        ack_ranges = [{RangeStart, LastPN} | RestRanges]
                     },
-                    case stream_train(Results, State1) of
+                    Recv = {NewPNSpace, SpinRecv, LastPN, SpinOut, Now},
+                    case stream_train(Results, State) of
                         {ok, StreamId, FirstOff, RevChunks, Total, N} ->
-                            apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, State1);
+                            apply_stream_train(
+                                StreamId, FirstOff, RevChunks, Total, N, Recv, State
+                            );
                         no ->
-                            fold_opened_seq(Results, State1, 0, 0)
+                            fold_opened_seq(Results, with_recv(Recv, State), 0, 0)
                     end;
                 no ->
                     fold_opened(Results, State, Now, 0, 0)
@@ -4004,6 +4189,18 @@ fold_opened(Results, State) ->
         _ ->
             fold_opened(Results, State, Now, 0, 0)
     end.
+
+%% Receive bookkeeping of a contiguous run, every packet sequential.
+with_recv({PNSpace, SpinRecv, LastPN, SpinOut, Now}, State) ->
+    State#state{
+        pn_app = PNSpace,
+        last_recv_trigger = sequential,
+        spin_recv = SpinRecv,
+        spin_recv_largest_pn = LastPN,
+        spin_outgoing = SpinOut,
+        last_activity = Now,
+        ack_eliciting_since_recv = false
+    }.
 
 %% Last {PN, FirstByte} of a run iff PNs are consecutive from Expected.
 seq_run_last([{PN, FB, _}], PN) ->
@@ -4019,11 +4216,11 @@ fold_opened_seq([], State, N, Elicited) ->
     fold_opened_finish(State, N, Elicited);
 fold_opened_seq([{_PN, _FB, Opened} | Rest], State, N, Elicited) ->
     {ok, NewState, Frames} = opened_frames(Opened, State),
-    ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
+    ?QLOG_EMIT_PACKET_RECEIVED((NewState#state.cfg)#conn_cfg.qlog_ctx, #{
         packet_type => app,
         frames => Frames
     }),
-    ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
+    ?QLOG_EMIT_FRAMES_PROCESSED((NewState#state.cfg)#conn_cfg.qlog_ctx, Frames),
     {State2, Elicited2} =
         case quic_ack:contains_ack_eliciting_frames(Frames) of
             false ->
@@ -4042,11 +4239,11 @@ fold_opened([], State, _Now, N, Elicited) ->
 fold_opened([{PN, FirstByte, Opened} | Rest], State, Now, N, Elicited) ->
     StateF = record_app_recv(FirstByte, PN, State, Now),
     {ok, NewState, Frames} = opened_frames(Opened, StateF),
-    ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
+    ?QLOG_EMIT_PACKET_RECEIVED((NewState#state.cfg)#conn_cfg.qlog_ctx, #{
         packet_type => app,
         frames => Frames
     }),
-    ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
+    ?QLOG_EMIT_FRAMES_PROCESSED((NewState#state.cfg)#conn_cfg.qlog_ctx, Frames),
     %% Per-packet ACK policy identical to maybe_send_ack(app, ...),
     %% except the count-based decimation increment is accumulated
     %% across the run and applied once at the end.
@@ -4077,15 +4274,13 @@ fold_opened([{PN, FirstByte, Opened} | Rest], State, Now, N, Elicited) ->
 %% flushes), so one increment and one arm_ack_timer serve the run;
 %% outside a pass each increment gets the threshold check it would
 %% have had per packet.
-fold_opened_finish(State, N, Elicited) ->
-    State1 = State#state{packets_received = State#state.packets_received + N},
+fold_opened_finish(State1, N, Elicited) ->
+    bump(?C_PACKETS_RECEIVED, N, State1),
     case {Elicited, State1#state.recv_pass} of
         {0, _} ->
             State1;
         {_, true} ->
-            arm_ack_timer(State1#state{
-                ack_elicited_count = State1#state.ack_elicited_count + Elicited
-            });
+            State1#state{ack_elicited_count = State1#state.ack_elicited_count + Elicited};
         {_, false} ->
             lists:foldl(
                 fun(_, S) -> maybe_decimate_app_ack(S) end, State1, lists:seq(1, Elicited)
@@ -4112,7 +4307,7 @@ opened_frames(Frames, State) when is_list(Frames) ->
 %% and qlog is off (its per-packet events would be skipped). Returns
 %% the chunks in reverse order.
 stream_train(Results, State) ->
-    case ?QLOG_ENABLED(State#state.qlog_ctx) of
+    case ?QLOG_ENABLED((State#state.cfg)#conn_cfg.qlog_ctx) of
         true -> no;
         false -> stream_train(Results, undefined, undefined, [], 0, 0)
     end.
@@ -4142,7 +4337,9 @@ stream_train(_, _, _, _, _, _) ->
 %% conditions as the lean clause of do_process_stream_data_buffered/5,
 %% checked once with the train's totals; any deviation replays the
 %% train through the per-packet path.
-apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, State) ->
+%% Inside a receive pass the run's bookkeeping (Recv), the stream update
+%% and fold_opened_finish/3 are written in one record update.
+apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, Recv, State) ->
     case State#state.streams of
         #{
             StreamId := #stream_state{
@@ -4155,7 +4352,7 @@ apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, State) ->
         } ->
             EndOffset = FirstOff + Total,
             NewDataReceived = State#state.data_received + Total,
-            HalfWindow = State#state.fc_max_receive_window div 2,
+            HalfWindow = (State#state.cfg)#conn_cfg.fc_max_receive_window div 2,
             case
                 Total > 0 andalso
                     gb_trees:is_empty(RB) andalso
@@ -4165,22 +4362,47 @@ apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, State) ->
             of
                 true ->
                     PendDeliver = deliver_stream_train(StreamId, RevChunks, State),
-                    State1 = State#state{
-                        streams = maps:put(
-                            StreamId,
-                            Stream#stream_state{recv_offset = EndOffset},
-                            State#state.streams
-                        ),
-                        data_received = NewDataReceived,
-                        pend_deliver = PendDeliver,
-                        has_non_probing_frame = true
-                    },
-                    fold_opened_finish(State1, N, N);
+                    Streams = maps:put(
+                        StreamId,
+                        Stream#stream_state{recv_offset = EndOffset},
+                        State#state.streams
+                    ),
+                    case State#state.recv_pass of
+                        true ->
+                            bump(?C_PACKETS_RECEIVED, N, State),
+                            {PNSpace, SpinRecv, LastPN, SpinOut, Now} = Recv,
+                            State#state{
+                                pn_app = PNSpace,
+                                last_recv_trigger = sequential,
+                                spin_recv = SpinRecv,
+                                spin_recv_largest_pn = LastPN,
+                                spin_outgoing = SpinOut,
+                                last_activity = Now,
+                                ack_eliciting_since_recv = false,
+                                streams = Streams,
+                                data_received = NewDataReceived,
+                                pend_deliver = PendDeliver,
+                                has_non_probing_frame = true,
+                                ack_elicited_count = State#state.ack_elicited_count + N
+                            };
+                        false ->
+                            State1 = with_recv(Recv, State),
+                            fold_opened_finish(
+                                State1#state{
+                                    streams = Streams,
+                                    data_received = NewDataReceived,
+                                    pend_deliver = PendDeliver,
+                                    has_non_probing_frame = true
+                                },
+                                N,
+                                N
+                            )
+                    end;
                 false ->
-                    stream_train_fallback(StreamId, RevChunks, State)
+                    stream_train_fallback(StreamId, RevChunks, with_recv(Recv, State))
             end;
         _ ->
-            stream_train_fallback(StreamId, RevChunks, State)
+            stream_train_fallback(StreamId, RevChunks, with_recv(Recv, State))
     end.
 
 %% Deviating train: replay it through the ordinary per-packet path.
@@ -4199,7 +4421,9 @@ stream_train_fallback(StreamId, RevChunks, State) ->
 %% (the chunks are adjacent and in order by construction), one message
 %% per chunk in stream order otherwise. Returns the new pend_deliver.
 deliver_stream_train(
-    StreamId, RevChunks, #state{recv_pass = true, delivery_coalescing = true} = State
+    StreamId,
+    RevChunks,
+    #state{recv_pass = true, cfg = #conn_cfg{delivery_coalescing = true}} = State
 ) ->
     RevData = [Data || {_Off, Data} <- RevChunks],
     case State#state.pend_deliver of
@@ -4222,9 +4446,11 @@ deliver_stream_train(StreamId, RevChunks, State) ->
 %% One server receive pass: process the packets of a listener message
 %% (source tracking, frame classification, RFC 9000 §9.1 migration
 %% check) without the per-message flushes - the caller flushes once
-%% per drain.
+%% per drain. Opens the receive pass when it is the first message.
 server_recv_pass(Packets, RemoteAddr, State) ->
-    State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
+    State1 = State#state{
+        current_packet_source = RemoteAddr, has_non_probing_frame = false, recv_pass = true
+    },
     NewState = handle_packets_batch(Packets, State1),
     case NewState#state.has_non_probing_frame of
         true ->
@@ -4244,7 +4470,7 @@ drain_recv_msgs(#state{close_reason = CR} = State, _N) when CR =/= undefined ->
     State;
 drain_recv_msgs(State, 0) ->
     State;
-drain_recv_msgs(#state{role = client, socket = Socket} = State, N) ->
+drain_recv_msgs(#state{socket = Socket, cfg = #conn_cfg{role = client}} = State, N) ->
     receive
         {udp, Socket, IP, Port, Data} ->
             %% Collect the rest of the queued same-source datagrams so a
@@ -4258,7 +4484,7 @@ drain_recv_msgs(#state{role = client, socket = Socket} = State, N) ->
     after 0 ->
         State
     end;
-drain_recv_msgs(#state{role = server} = State, N) ->
+drain_recv_msgs(#state{cfg = #conn_cfg{role = server}} = State, N) ->
     receive
         {quic_packet, Data, RemoteAddr} ->
             drain_recv_msgs(server_recv_pass([Data], RemoteAddr, State), N - 1);
@@ -4283,13 +4509,13 @@ collect_client_udp(Socket, IP, Port, N, Acc) ->
         {lists:reverse(Acc), N}
     end.
 
-handle_packet_loop(<<>>, #state{role = client, active_n = N} = State) ->
+handle_packet_loop(<<>>, #state{cfg = #conn_cfg{role = client, active_n = N}} = State) ->
     %% No more data to process - re-enable socket for client connections
     %% Note: With {active, N}, calling setopts resets the counter, so this is optional
     %% but provides safety in case socket went passive during processing
     client_rearm_active(State, N),
     State;
-handle_packet_loop(<<>>, #state{role = server} = State) ->
+handle_packet_loop(<<>>, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% No more data to process - server socket managed by listener
     State;
 handle_packet_loop(Data, State) ->
@@ -4313,36 +4539,32 @@ handle_packet_loop(Data, State) ->
     case Decoded of
         {ok, Type, Frames, RemainingData, NewState, processed} ->
             %% Frames already processed by streaming decode
-            ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
+            ?QLOG_EMIT_PACKET_RECEIVED((NewState#state.cfg)#conn_cfg.qlog_ctx, #{
                 packet_type => Type,
                 frames => Frames
             }),
 
             %% Increment packet counter for liveness detection
-            NewState1 = NewState#state{
-                packets_received = NewState#state.packets_received + 1
-            },
+            bump(?C_PACKETS_RECEIVED, 1, NewState),
 
-            ?QLOG_EMIT_FRAMES_PROCESSED(NewState1#state.qlog_ctx, Frames),
+            ?QLOG_EMIT_FRAMES_PROCESSED((NewState#state.cfg)#conn_cfg.qlog_ctx, Frames),
 
             %% Send ACK if packet contained ack-eliciting frames
             State2 = server_discard_initial(
-                Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, NewState1))
+                Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, NewState))
             ),
             %% Continue with remaining coalesced packets
             handle_packet_loop(RemainingData, State2);
         {ok, Type, Frames, RemainingData, NewState} ->
             %% Legacy path - frames need to be processed
-            ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
+            ?QLOG_EMIT_PACKET_RECEIVED((NewState#state.cfg)#conn_cfg.qlog_ctx, #{
                 packet_type => Type,
                 frames => Frames
             }),
 
-            NewState1 = NewState#state{
-                packets_received = NewState#state.packets_received + 1
-            },
-            State1 = process_frames_noreenbl(Type, Frames, NewState1),
-            ?QLOG_EMIT_FRAMES_PROCESSED(State1#state.qlog_ctx, Frames),
+            bump(?C_PACKETS_RECEIVED, 1, NewState),
+            State1 = process_frames_noreenbl(Type, Frames, NewState),
+            ?QLOG_EMIT_FRAMES_PROCESSED((State1#state.cfg)#conn_cfg.qlog_ctx, Frames),
             State2 = server_discard_initial(
                 Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, State1))
             ),
@@ -4374,11 +4596,11 @@ handle_packet_loop(Data, State) ->
             ?LOG_WARNING(
                 #{
                     what => packet_decode_decrypt_failed,
-                    role => State#state.role,
+                    role => (State#state.cfg)#conn_cfg.role,
                     reason => Reason,
                     size => byte_size(Data),
                     source => State#state.current_packet_source,
-                    scid => binhex(State#state.scid),
+                    scid => binhex((State#state.cfg)#conn_cfg.scid),
                     dcid => binhex(State#state.dcid),
                     known_reset_tokens => [
                         {
@@ -4410,9 +4632,9 @@ binhex(Other) -> Other.
 %% Re-enable socket for receiving - only for client connections.
 %% Server connections use listener's socket which is managed by the listener.
 %% With {active, N}, this resets the counter (provides safety margin).
-maybe_reenable_socket(#state{role = client, active_n = N} = State) ->
+maybe_reenable_socket(#state{cfg = #conn_cfg{role = client, active_n = N}} = State) ->
     client_rearm_active(State, N);
-maybe_reenable_socket(#state{role = server}) ->
+maybe_reenable_socket(#state{cfg = #conn_cfg{role = server}}) ->
     ok.
 
 %% Decode and decrypt a packet
@@ -4475,12 +4697,16 @@ decode_long_header_packet(Data, State) ->
 maybe_adopt_peer_version(
     Version,
     #state{
-        role = client,
         version = Current,
-        tls_state = ?TLS_AWAITING_SERVER_HELLO
+        cfg = #conn_cfg{
+            role = client
+        },
+        hs = #hs{
+            tls_state = ?TLS_AWAITING_SERVER_HELLO
+        }
     } = State
 ) when Version =/= Current ->
-    case lists:member(Version, State#state.supported_versions) of
+    case lists:member(Version, (State#state.cfg)#conn_cfg.supported_versions) of
         true -> switch_version(Version, State);
         false -> State
     end;
@@ -4506,13 +4732,19 @@ decode_long_header_type(Type, Data, FirstByte, Version, DCID, SCID, Rest3, State
 %% server does not speak the version we sent and lists what it does speak.
 %% A server never receives one, and a client only acts on it before it has
 %% processed any packet from this server; later ones are attacks or stale.
-handle_version_negotiation(_DCID, _Versions, #state{role = server}) ->
+handle_version_negotiation(_DCID, _Versions, #state{cfg = #conn_cfg{role = server}}) ->
     {error, unexpected_version_negotiation};
-handle_version_negotiation(_DCID, _Versions, #state{packets_received = N}) when N > 0 ->
-    {error, late_version_negotiation};
-handle_version_negotiation(DCID, _Versions, #state{scid = SCID}) when DCID =/= SCID ->
+handle_version_negotiation(DCID, VersionsBin, State) ->
+    case count(?C_PACKETS_RECEIVED, State) of
+        0 -> handle_first_version_negotiation(DCID, VersionsBin, State);
+        _ -> {error, late_version_negotiation}
+    end.
+
+handle_first_version_negotiation(DCID, _Versions, #state{cfg = #conn_cfg{scid = SCID}}) when
+    DCID =/= SCID
+->
     {error, version_negotiation_cid_mismatch};
-handle_version_negotiation(_DCID, VersionsBin, #state{version = Ours}) ->
+handle_first_version_negotiation(_DCID, VersionsBin, #state{version = Ours}) ->
     Versions = decode_versions(VersionsBin),
     case lists:member(Ours, Versions) of
         true ->
@@ -4538,7 +4770,7 @@ adopt_peer_scid(PeerSCID, #state{dcid = <<>>} = State) ->
     %% Server, first client Initial.
     install_initial_peer_cid(PeerSCID, State);
 adopt_peer_scid(PeerSCID, #state{dcid = DCID} = State) when
-    DCID =:= State#state.original_dcid; DCID =:= State#state.retry_scid
+    DCID =:= (State#state.cfg)#conn_cfg.original_dcid; DCID =:= (State#state.hs)#hs.retry_scid
 ->
     %% Client, first server Initial, after a Retry or not.
     install_initial_peer_cid(PeerSCID, State);
@@ -4566,7 +4798,7 @@ decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
     end.
 
 decode_initial_with_keys(FullPacket, FirstByte, PeerSCID, Rest, {ClientKeys, ServerKeys}, State) ->
-    #state{role = Role} = State,
+    #state{cfg = #conn_cfg{role = Role}} = State,
 
     %% Select correct keys based on role:
     %% - Client receives from server -> use ServerKeys
@@ -4605,13 +4837,13 @@ decode_initial_with_keys(FullPacket, FirstByte, PeerSCID, Rest, {ClientKeys, Ser
     end.
 
 decode_handshake_packet(FullPacket, FirstByte, _DCID, _SCID, Rest, State) ->
-    case State#state.handshake_keys of
+    case (State#state.hs)#hs.handshake_keys of
         undefined ->
             {error, no_handshake_keys};
         {ClientKeys, ServerKeys} ->
             %% Select correct keys based on role
             DecryptKeys =
-                case State#state.role of
+                case (State#state.cfg)#conn_cfg.role of
                     client -> ServerKeys;
                     server -> ClientKeys
                 end,
@@ -4639,14 +4871,18 @@ decode_handshake_packet(FullPacket, FirstByte, _DCID, _SCID, Rest, State) ->
 
 %% Decode 0-RTT packet (RFC 9001 Section 5.3)
 %% Server uses early keys derived from client's PSK
-decode_zero_rtt_packet(_FullPacket, _FirstByte, _DCID, _SCID, _Rest, #state{role = client}) ->
+decode_zero_rtt_packet(_FullPacket, _FirstByte, _DCID, _SCID, _Rest, #state{
+    cfg = #conn_cfg{role = client}
+}) ->
     %% Clients don't receive 0-RTT packets
     {error, unexpected_zero_rtt};
-decode_zero_rtt_packet(_FullPacket, _FirstByte, _DCID, _SCID, _Rest, #state{early_keys = undefined}) ->
+decode_zero_rtt_packet(_FullPacket, _FirstByte, _DCID, _SCID, _Rest, #state{
+    hs = #hs{early_keys = undefined}
+}) ->
     %% No early keys - can't decrypt 0-RTT
     {error, no_early_keys};
 decode_zero_rtt_packet(
-    FullPacket, FirstByte, _DCID, _SCID, Rest, #state{early_keys = {EarlyKeys, _}} = State
+    FullPacket, FirstByte, _DCID, _SCID, Rest, #state{hs = #hs{early_keys = {EarlyKeys, _}}} = State
 ) ->
     %% Parse length
     {PayloadLen, Rest2} = quic_varint:decode(Rest),
@@ -4670,7 +4906,7 @@ handle_retry_packet(
     _Version,
     _ServerSCID,
     _Rest,
-    #state{role = server}
+    #state{cfg = #conn_cfg{role = server}}
 ) ->
     %% Servers don't receive Retry packets
     {error, unexpected_retry};
@@ -4679,7 +4915,7 @@ handle_retry_packet(
     _Version,
     _ServerSCID,
     _Rest,
-    #state{retry_received = true}
+    #state{hs = #hs{retry_received = true}}
 ) ->
     %% RFC 9000 Section 17.2.5.2: MUST discard subsequent Retry packets
     {error, duplicate_retry};
@@ -4688,7 +4924,7 @@ handle_retry_packet(
     Version,
     ServerSCID,
     Rest,
-    #state{role = client, original_dcid = OriginalDCID} = State
+    #state{cfg = #conn_cfg{role = client, original_dcid = OriginalDCID}} = State
 ) ->
     %% Rest contains: Retry Token + Retry Integrity Tag (16 bytes at end)
     %% There's no length field, the entire remaining data is the token + tag
@@ -4718,19 +4954,23 @@ handle_valid_retry(RetryToken, ServerSCID, State) ->
     %% Store retry_scid for later validation of transport params (RFC 9000 Section 7.3)
     State1 = State#state{
         dcid = ServerSCID,
-        retry_token = RetryToken,
-        retry_received = true,
-        retry_scid = ServerSCID
+        hs = (State#state.hs)#hs{
+            retry_token = RetryToken,
+            retry_received = true,
+            retry_scid = ServerSCID
+        }
     },
 
     %% Regenerate initial keys with the NEW DCID (ServerSCID) and current version
     {ClientKeys, ServerKeys} = derive_initial_keys(ServerSCID, State1#state.version),
-    State2 = State1#state{initial_keys = {ClientKeys, ServerKeys}},
+    State2 = State1#state{hs = (State1#state.hs)#hs{initial_keys = {ClientKeys, ServerKeys}}},
 
     %% Reset crypto state for a fresh Initial
     State3 = State2#state{
-        crypto_offset = #{initial => 0, handshake => 0, app => 0},
-        tls_transcript = <<>>
+        hs = (State2#state.hs)#hs{
+            crypto_offset = #{initial => 0, handshake => 0, app => 0},
+            tls_transcript = <<>>
+        }
     },
 
     %% Reset packet number space for Initial
@@ -4748,7 +4988,7 @@ handle_valid_retry(RetryToken, ServerSCID, State) ->
 %% packet to the server rather than a replay of the one it answered with the
 %% Retry. Everything else in the space describes packets protected by the
 %% keys we just replaced.
-reset_initial_pn_space(#state{pn_initial = #pn_space{next_pn = NextPN}} = State) ->
+reset_initial_pn_space(#state{hs = #hs{pn_initial = #pn_space{next_pn = NextPN}}} = State) ->
     PNSpace = #pn_space{
         next_pn = NextPN,
         largest_recv = undefined,
@@ -4766,12 +5006,14 @@ reset_initial_pn_space(#state{pn_initial = #pn_space{next_pn = NextPN}} = State)
         State#state.loss_state, erlang:monotonic_time(millisecond)
     ),
     State1 = State#state{
-        pn_initial = PNSpace,
         loss_state = NewLossState,
         cc_state = quic_cc:reset_for_retry(State#state.cc_state),
         pto_timer = undefined,
         pto_scheduled_at = undefined,
-        pto_armed_at = undefined
+        pto_armed_at = undefined,
+        hs = (State#state.hs)#hs{
+            pn_initial = PNSpace
+        }
     },
     requeue_early_data(maps:get(app, Discarded, []), State1).
 
@@ -4818,13 +5060,13 @@ decode_short_header_packet(Data, State) ->
         {ClientKeys, ServerKeys} ->
             %% Select correct keys based on role
             DecryptKeys =
-                case State#state.role of
+                case (State#state.cfg)#conn_cfg.role of
                     client -> ServerKeys;
                     server -> ClientKeys
                 end,
             %% Short header: first byte + DCID (our SCID that peer uses as their DCID)
             %% Short header packets don't have length field, so they consume all remaining data
-            DCIDLen = byte_size(State#state.scid),
+            DCIDLen = byte_size((State#state.cfg)#conn_cfg.scid),
             <<FirstByte, DCID:DCIDLen/binary, EncryptedPayload/binary>> = Data,
             Header = <<FirstByte, DCID/binary>>,
             %% No remaining data after short header packet
@@ -4887,7 +5129,9 @@ fused_decrypt_keys(CurrentKeys, #state{key_state = undefined}) ->
     {ok, CurrentKeys};
 fused_decrypt_keys(_CurrentKeys, #state{
     key_state = #key_update_state{update_state = idle, current_keys = {CK, SK}},
-    role = Role
+    cfg = #conn_cfg{
+        role = Role
+    }
 }) ->
     case Role of
         server -> {ok, CK};
@@ -4913,7 +5157,7 @@ decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
             %% Select keys based on key_phase
             {DecryptKeys, State1} = select_decrypt_keys(KeyPhase, State),
             PeerDecryptKeys =
-                case State1#state.role of
+                case (State1#state.cfg)#conn_cfg.role of
                     % ClientKeys
                     server -> element(1, DecryptKeys);
                     % ServerKeys
@@ -5149,7 +5393,8 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
 
                     State1 = State#state{
                         loss_state = NewLossState,
-                        cc_state = CCState6
+                        cc_state = CCState6,
+                        pto_dirty = true
                     },
 
                     %% Emit qlog packets_acked event
@@ -5159,14 +5404,14 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
                             [] -> undefined;
                             _ -> Now - LargestAckedSentTime
                         end,
-                    ?QLOG_EMIT_PACKETS_ACKED(State1#state.qlog_ctx, AckedPNs, #{
+                    ?QLOG_EMIT_PACKETS_ACKED((State1#state.cfg)#conn_cfg.qlog_ctx, AckedPNs, #{
                         rtt_sample => RTTSample
                     }),
 
                     %% Emit qlog packet_lost events
                     lists:foreach(
                         fun(#sent_packet{pn = LostPN}) ->
-                            ?QLOG_EMIT_PACKET_LOST(State1#state.qlog_ctx, #{
+                            ?QLOG_EMIT_PACKET_LOST((State1#state.cfg)#conn_cfg.qlog_ctx, #{
                                 packet_number => LostPN,
                                 reason => timeout
                             })
@@ -5186,11 +5431,11 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
     end;
 %% HANDSHAKE_DONE: Server confirms handshake complete
 %% RFC 9000 Section 19.20: Only server can send, only in 1-RTT (app level)
-process_frame(app, handshake_done, #state{role = client} = State0) ->
+process_frame(app, handshake_done, #state{cfg = #conn_cfg{role = client}} = State0) ->
     %% Handshake confirmed (RFC 9001 §4.1.2): the retained Finished flight
     %% is done.
     confirm_handshake(clear_hs_flight(State0));
-process_frame(app, handshake_done, #state{role = server} = State) ->
+process_frame(app, handshake_done, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% RFC 9000 §19.20: clients MUST NOT send HANDSHAKE_DONE.
     ?LOG_WARNING(
         #{what => invalid_handshake_done_frame, reason => server_received}, ?QUIC_LOG_META
@@ -5225,7 +5470,7 @@ process_frame(app, {max_data, MaxData}, #state{max_data_remote = Current} = Stat
             State1 = State#state{max_data_remote = MaxData},
             State2 = process_send_queue(State1),
             %% Event-driven flush: flush batch and timers after flow control opens
-            flush_dirty_timers(flush_socket_batch(State2));
+            flush_event(State2, event);
         false ->
             %% Monotonic: ignore if not increasing (per RFC 9000)
             State
@@ -5256,7 +5501,7 @@ process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Stream
                     %% Limit increased - try to drain queued data
                     State2 = process_send_queue(State1),
                     %% Event-driven flush: flush batch and timers after stream flow control opens
-                    flush_dirty_timers(flush_socket_batch(State2));
+                    flush_event(State2, event);
                 false ->
                     %% Monotonic: ignore if not increasing
                     State
@@ -5598,19 +5843,27 @@ process_frame(Level, {data_blocked, _}, State) when Level =/= app ->
 %% DATAGRAM frames (RFC 9221)
 %% RFC 9221: MUST terminate with PROTOCOL_VIOLATION if receiving DATAGRAM
 %% without having advertised support (max_datagram_frame_size = 0)
-process_frame(app, {datagram, _Data}, #state{max_datagram_frame_size_local = 0} = State) ->
+process_frame(
+    app, {datagram, _Data}, #state{cfg = #conn_cfg{max_datagram_frame_size_local = 0}} = State
+) ->
     send_protocol_violation(<<"unexpected DATAGRAM frame">>, State);
 process_frame(
-    app, {datagram_with_length, _Data}, #state{max_datagram_frame_size_local = 0} = State
+    app,
+    {datagram_with_length, _Data},
+    #state{cfg = #conn_cfg{max_datagram_frame_size_local = 0}} = State
 ) ->
     send_protocol_violation(<<"unexpected DATAGRAM frame">>, State);
 %% RFC 9221: MUST terminate with PROTOCOL_VIOLATION if receiving oversized DATAGRAM
-process_frame(app, {datagram, Data}, #state{max_datagram_frame_size_local = Max} = State) when
+process_frame(
+    app, {datagram, Data}, #state{cfg = #conn_cfg{max_datagram_frame_size_local = Max}} = State
+) when
     byte_size(Data) > Max
 ->
     send_protocol_violation(<<"DATAGRAM frame too large">>, State);
 process_frame(
-    app, {datagram_with_length, Data}, #state{max_datagram_frame_size_local = Max} = State
+    app,
+    {datagram_with_length, Data},
+    #state{cfg = #conn_cfg{max_datagram_frame_size_local = Max}} = State
 ) when byte_size(Data) > Max ->
     send_protocol_violation(<<"DATAGRAM frame too large">>, State);
 process_frame(app, {datagram, Data}, State) ->
@@ -5622,7 +5875,7 @@ process_frame(app, {datagram_with_length, Data}, State) ->
 %% the token for reconnect-without-retry reuse depends on server-side
 %% token issuance + validation, which aren't implemented yet and are
 %% tracked as a follow-up.
-process_frame(app, {new_token, _}, #state{role = server} = State) ->
+process_frame(app, {new_token, _}, #state{cfg = #conn_cfg{role = server}} = State) ->
     close_with_error(
         app,
         transport,
@@ -5631,7 +5884,9 @@ process_frame(app, {new_token, _}, #state{role = server} = State) ->
         <<"NEW_TOKEN received by server">>,
         State
     );
-process_frame(app, {new_token, Token}, #state{role = client, remote_addr = Addr} = State) ->
+process_frame(
+    app, {new_token, Token}, #state{remote_addr = Addr, cfg = #conn_cfg{role = client}} = State
+) ->
     ok = quic_token_cache:put(Addr, Token),
     State;
 process_frame(_Level, _Frame, State) ->
@@ -5694,30 +5949,31 @@ app_ack_tail(AckedPackets, LostPackets, State1) ->
             FinSids -> lists:foldl(fun settle_fin_ack/2, State4, FinSids)
         end,
 
-    %% Re-arm the PTO once at the end of the pass
-    %% (flush_dirty_timers) instead of once per ACK frame.
-    State5 = State4a#state{pto_dirty = true},
-
     %% Try to send queued data now that cwnd may have freed up.
     %% This also drains retransmit_stream entries deferred by CC.
-    State6 = process_send_queue(State5),
+    State6 = process_send_queue(State4a),
     %% cwnd reopened: replay CC-deferred control retransmits, then
     %% complete any local reset-at reclaim whose reliable bytes are
     %% now acked.
     State7 = flush_deferred_retransmits(drain_pending_hs(State6)),
     State8 = complete_fin_reclaims(complete_send_reset_at(State7)),
-    %% Event-driven flush: flush batch and timers after ACK processing
-    flush_dirty_timers(flush_socket_batch(State8)).
+    %% The PTO is re-armed once per receive pass, not once per ACK frame:
+    %% inside a pass flush_event/2 runs at its end.
+    case State8 of
+        #state{recv_pass = true, pto_dirty = true} -> State8;
+        #state{recv_pass = true} -> State8#state{pto_dirty = true};
+        _ -> flush_event(State8, rearm)
+    end.
 
 handshake_ack_tail(Level, LostPackets, State1) ->
     State2 = retransmit_lost_handshake(Level, LostPackets, State1),
     State3 = drain_pending_hs(note_handshake_ack(Level, State2)),
-    flush_dirty_timers(flush_socket_batch(State3#state{pto_dirty = true})).
+    flush_event(State3#state{pto_dirty = true}, event).
 
 %% A Handshake acknowledgement tells a client the server has processed a
 %% protected packet from it, so its address is validated.
-note_handshake_ack(handshake, #state{role = client} = State) ->
-    State#state{handshake_ack_received = true};
+note_handshake_ack(handshake, #state{cfg = #conn_cfg{role = client}} = State) ->
+    State#state{hs = (State#state.hs)#hs{handshake_ack_received = true}};
 note_handshake_ack(_Level, State) ->
     State.
 
@@ -5808,7 +6064,7 @@ buffer_crypto_data(Level, Offset, Data, State) ->
         end,
 
     %% Get current buffer
-    Buffer = maps:get(LevelAtom, State#state.crypto_buffer, gb_trees:empty()),
+    Buffer = maps:get(LevelAtom, (State#state.hs)#hs.crypto_buffer, gb_trees:empty()),
 
     %% Bound out-of-order CRYPTO reassembly so a peer cannot grow memory
     %% before the handshake completes (RFC 9000 §7.5). Offsets beyond the
@@ -5838,25 +6094,25 @@ buffer_crypto_data(Level, Offset, Data, State) ->
             %% retransmission timer fired: the Finished was lost, and
             %% nothing else retransmits it once the statem has left
             %% `handshaking'. Resend it (CRYPTO offsets are idempotent).
-            Expected = maps:get(LevelAtom, State#state.crypto_offset, 0),
+            Expected = maps:get(LevelAtom, (State#state.hs)#hs.crypto_offset, 0),
             State0 =
                 case
                     LevelAtom =:= handshake andalso
-                        State#state.role =:= client andalso
-                        State#state.client_hs_flight =/= undefined andalso
+                        (State#state.cfg)#conn_cfg.role =:= client andalso
+                        (State#state.hs)#hs.client_hs_flight =/= undefined andalso
                         Offset =:= 0 andalso Expected > 0
                 of
                     true ->
-                        send_handshake_crypto(State#state.client_hs_flight, State);
+                        send_handshake_crypto((State#state.hs)#hs.client_hs_flight, State);
                     false ->
                         State
                 end,
             %% Add data to buffer, keeping the longer chunk if the peer
             %% already sent one at this offset.
             {NewBuffer, _} = quic_reassembly:keep_longest_chunk(Offset, Data, Buffer),
-            NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State0#state.crypto_buffer),
+            NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, (State0#state.hs)#hs.crypto_buffer),
 
-            State1 = State0#state{crypto_buffer = NewCryptoBuffer},
+            State1 = State0#state{hs = (State0#state.hs)#hs{crypto_buffer = NewCryptoBuffer}},
 
             %% Try to process contiguous data
             process_crypto_buffer(LevelAtom, State1)
@@ -5864,8 +6120,8 @@ buffer_crypto_data(Level, Offset, Data, State) ->
 
 %% Process contiguous CRYPTO data
 process_crypto_buffer(Level, State) ->
-    Buffer = maps:get(Level, State#state.crypto_buffer, gb_trees:empty()),
-    ExpectedOffset = maps:get(Level, State#state.crypto_offset, 0),
+    Buffer = maps:get(Level, (State#state.hs)#hs.crypto_buffer, gb_trees:empty()),
+    ExpectedOffset = maps:get(Level, (State#state.hs)#hs.crypto_offset, 0),
 
     case gb_trees:lookup(ExpectedOffset, Buffer) of
         {value, Data} ->
@@ -5875,12 +6131,14 @@ process_crypto_buffer(Level, State) ->
             %% Update offset and remove from buffer
             NewOffset = ExpectedOffset + byte_size(Data),
             NewBuffer = gb_trees:delete(ExpectedOffset, Buffer),
-            NewCryptoBuffer = maps:put(Level, NewBuffer, State1#state.crypto_buffer),
-            NewCryptoOffset = maps:put(Level, NewOffset, State1#state.crypto_offset),
+            NewCryptoBuffer = maps:put(Level, NewBuffer, (State1#state.hs)#hs.crypto_buffer),
+            NewCryptoOffset = maps:put(Level, NewOffset, (State1#state.hs)#hs.crypto_offset),
 
             State2 = State1#state{
-                crypto_buffer = NewCryptoBuffer,
-                crypto_offset = NewCryptoOffset
+                hs = (State1#state.hs)#hs{
+                    crypto_buffer = NewCryptoBuffer,
+                    crypto_offset = NewCryptoOffset
+                }
             },
 
             %% Try to process more
@@ -5895,7 +6153,9 @@ process_crypto_buffer(Level, State) ->
             %% ?MAX_CRYPTO_BUFFER_BYTES and closing a healthy connection.
             {Trimmed, _} = quic_reassembly:trim_reassembly_buffer(Buffer, ExpectedOffset),
             State1 = State#state{
-                crypto_buffer = maps:put(Level, Trimmed, State#state.crypto_buffer)
+                hs = (State#state.hs)#hs{
+                    crypto_buffer = maps:put(Level, Trimmed, (State#state.hs)#hs.crypto_buffer)
+                }
             },
             case gb_trees:is_defined(ExpectedOffset, Trimmed) of
                 true -> process_crypto_buffer(Level, State1);
@@ -5924,10 +6184,12 @@ keylog_application(ClientRandom, ClientSecret, ServerSecret) ->
 %% Process TLS handshake data from CRYPTO frames
 process_tls_data(Level, Data, State) ->
     %% Prepend any buffered incomplete TLS data
-    BufferedData = maps:get(Level, State#state.tls_buffer, <<>>),
+    BufferedData = maps:get(Level, (State#state.hs)#hs.tls_buffer, <<>>),
     FullData = <<BufferedData/binary, Data/binary>>,
     %% Clear the buffer before processing
-    State1 = State#state{tls_buffer = maps:put(Level, <<>>, State#state.tls_buffer)},
+    State1 = State#state{
+        hs = (State#state.hs)#hs{tls_buffer = maps:put(Level, <<>>, (State#state.hs)#hs.tls_buffer)}
+    },
     process_tls_messages(Level, FullData, State1).
 
 %% Process TLS messages
@@ -5943,7 +6205,11 @@ process_tls_messages(Level, Data, State) ->
             process_tls_messages(Level, Rest, State1);
         {error, incomplete} ->
             %% Buffer the incomplete data for next CRYPTO frame
-            State#state{tls_buffer = maps:put(Level, Data, State#state.tls_buffer)};
+            State#state{
+                hs = (State#state.hs)#hs{
+                    tls_buffer = maps:put(Level, Data, (State#state.hs)#hs.tls_buffer)
+                }
+            };
         {error, _Err} ->
             State
     end.
@@ -5957,7 +6223,8 @@ process_tls_message(
     ?TLS_CLIENT_HELLO,
     Body,
     OriginalMsg,
-    #state{role = server, tls_state = ?TLS_AWAITING_CLIENT_HELLO} = StateChIn
+    #state{cfg = #conn_cfg{role = server}, hs = #hs{tls_state = ?TLS_AWAITING_CLIENT_HELLO}} =
+        StateChIn
 ) ->
     case quic_tls:parse_client_hello(Body) of
         {ok,
@@ -5979,7 +6246,7 @@ process_tls_message(
             ),
             %% Select cipher suite (prefer server's order)
             Cipher = quic_tls_negotiation:select_cipher(
-                CipherSuites, State#state.cipher_preference
+                CipherSuites, (State#state.cfg)#conn_cfg.cipher_preference
             ),
             %% RFC 8446 §4.1.4 group negotiation: use the client's
             %% key_share directly when possible, otherwise send a
@@ -5990,7 +6257,7 @@ process_tls_message(
             SupportedGroups = maps:get(supported_groups, ClientHelloInfo, []),
             case
                 quic_tls_negotiation:select_key_share_group(
-                    State#state.tls_groups, KeyShareEntries, SupportedGroups
+                    (State#state.cfg)#conn_cfg.tls_groups, KeyShareEntries, SupportedGroups
                 )
             of
                 {direct, SelGroup} ->
@@ -6000,7 +6267,7 @@ process_tls_message(
                     do_server_client_hello(
                         SelGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
                     );
-                {hrr, HrrGroup} when not State#state.hrr_sent ->
+                {hrr, HrrGroup} when not (State#state.hs)#hs.hrr_sent ->
                     send_hello_retry_request(HrrGroup, Cipher, SessionId, OriginalMsg, State);
                 {hrr, _} ->
                     %% Client ignored our HRR group selection.
@@ -6020,14 +6287,14 @@ process_tls_message(
     ?TLS_SERVER_HELLO,
     Body,
     OriginalMsg,
-    #state{role = client, tls_state = ?TLS_AWAITING_SERVER_HELLO} = State
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{tls_state = ?TLS_AWAITING_SERVER_HELLO}} = State
 ) ->
     case quic_tls:parse_server_hello(Body) of
         {hrr, HrrInfo} ->
             handle_hello_retry_request(HrrInfo, OriginalMsg, State);
         {ok, #{cipher := Cipher} = ServerHelloMap} ->
             %% RFC 8446 §4.1.3: the selected suite must be one we offered.
-            case lists:member(Cipher, State#state.cipher_preference) of
+            case lists:member(Cipher, (State#state.cfg)#conn_cfg.cipher_preference) of
                 false ->
                     notify_owner({error, {tls_alert, illegal_parameter}}, State),
                     alert_and_exit(?TLS_ALERT_ILLEGAL_PARAMETER, State, illegal_parameter);
@@ -6054,10 +6321,10 @@ process_tls_message(
                         case {ServerPubKey, ServerGroup} of
                             {undefined, undefined} ->
                                 <<>>;
-                            {_, Group} when Group =:= State#state.tls_group ->
+                            {_, Group} when Group =:= (State#state.hs)#hs.tls_group ->
                                 quic_crypto:compute_shared_secret(
-                                    State#state.tls_group,
-                                    State#state.tls_private_key,
+                                    (State#state.hs)#hs.tls_group,
+                                    (State#state.hs)#hs.tls_private_key,
                                     ServerPubKey
                                 );
                             _ ->
@@ -6076,7 +6343,9 @@ process_tls_message(
                             ok
                     end,
 
-                    Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+                    Transcript = <<
+                        ((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary
+                    >>,
                     TranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
 
                     %% Cipher-aware hash length for the zero-PSK case.
@@ -6122,14 +6391,16 @@ process_tls_message(
                     },
 
                     State1 = State#state{
-                        tls_state = ?TLS_AWAITING_ENCRYPTED_EXT,
-                        tls_transcript = Transcript,
-                        handshake_secret = HandshakeSecret,
-                        client_hs_secret = ClientHsSecret,
-                        server_hs_secret = ServerHsSecret,
-                        handshake_keys = {ClientHsKeys, ServerHsKeys},
-                        negotiated_group = State#state.tls_group,
-                        selected_psk = ClientSelectedPsk
+                        hs = (State#state.hs)#hs{
+                            tls_state = ?TLS_AWAITING_ENCRYPTED_EXT,
+                            tls_transcript = Transcript,
+                            handshake_secret = HandshakeSecret,
+                            client_hs_secret = ClientHsSecret,
+                            server_hs_secret = ServerHsSecret,
+                            handshake_keys = {ClientHsKeys, ServerHsKeys},
+                            negotiated_group = (State#state.hs)#hs.tls_group,
+                            selected_psk = ClientSelectedPsk
+                        }
                     },
                     send_initial_ack(State1)
             end;
@@ -6144,16 +6415,17 @@ process_tls_message(
     ?TLS_ENCRYPTED_EXTENSIONS,
     Body,
     OriginalMsg,
-    #state{role = client, tls_state = ?TLS_AWAITING_ENCRYPTED_EXT} = State
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{tls_state = ?TLS_AWAITING_ENCRYPTED_EXT}} =
+        State
 ) ->
     %% Update transcript - USE ORIGINAL BYTES
-    Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+    Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
 
     %% Next state depends on auth path: PSK-authenticated handshakes
     %% skip Certificate/CertificateVerify (RFC 8446 §4.6.1) and go
     %% straight to Finished.
     NextState =
-        case State#state.selected_psk of
+        case (State#state.hs)#hs.selected_psk of
             undefined -> ?TLS_AWAITING_CERT;
             _ -> ?TLS_AWAITING_FINISHED
         end,
@@ -6165,13 +6437,15 @@ process_tls_message(
             %% acceptance by the presence of the empty `early_data'
             %% extension in EncryptedExtensions. Absence is rejection.
             %% Clients that did not offer 0-RTT keep the default `false'.
-            OfferedZeroRtt = State#state.early_keys =/= undefined,
+            OfferedZeroRtt = (State#state.hs)#hs.early_keys =/= undefined,
             EarlyDataAccepted = OfferedZeroRtt andalso EarlyDataInEE,
             State0 = State#state{
-                tls_state = NextState,
-                tls_transcript = Transcript,
                 alpn = Alpn,
-                early_data_accepted = EarlyDataAccepted
+                hs = (State#state.hs)#hs{
+                    tls_state = NextState,
+                    tls_transcript = Transcript,
+                    early_data_accepted = EarlyDataAccepted
+                }
             },
             %% Apply peer transport params (extracts active_connection_id_limit).
             %% Client already has handshake keys at this point, so the CLOSE
@@ -6184,8 +6458,10 @@ process_tls_message(
             finalize_zero_rtt_state(State1);
         _ ->
             State#state{
-                tls_state = NextState,
-                tls_transcript = Transcript
+                hs = (State#state.hs)#hs{
+                    tls_state = NextState,
+                    tls_transcript = Transcript
+                }
             }
     end;
 %% Client receives server Certificate
@@ -6194,9 +6470,9 @@ process_tls_message(
     ?TLS_CERTIFICATE,
     Body,
     OriginalMsg,
-    #state{role = client, tls_state = ?TLS_AWAITING_CERT} = State
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{tls_state = ?TLS_AWAITING_CERT}} = State
 ) ->
-    Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+    Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
     %% Parse and store peer certificate. The chain and identity are
     %% validated at CertificateVerify, where the signature also proves
     %% the server holds the leaf's private key.
@@ -6210,12 +6486,14 @@ process_tls_message(
                 {undefined, []}
         end,
     State1 = State#state{
-        tls_state = ?TLS_AWAITING_CERT_VERIFY,
-        tls_transcript = Transcript,
-        peer_cert = PeerCert,
-        peer_cert_chain = PeerCertChain
+        hs = (State#state.hs)#hs{
+            tls_state = ?TLS_AWAITING_CERT_VERIFY,
+            tls_transcript = Transcript,
+            peer_cert = PeerCert,
+            peer_cert_chain = PeerCertChain
+        }
     },
-    case State#state.verify andalso (PeerCert =:= undefined) of
+    case (State#state.cfg)#conn_cfg.verify andalso (PeerCert =:= undefined) of
         true ->
             %% verify enabled but server sent no certificate.
             ?LOG_ERROR(#{what => server_sent_no_certificate}, ?QUIC_LOG_META),
@@ -6230,25 +6508,27 @@ process_tls_message(
     ?TLS_CERTIFICATE_VERIFY,
     Body,
     OriginalMsg,
-    #state{role = client, tls_state = ?TLS_AWAITING_CERT_VERIFY} = State
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{tls_state = ?TLS_AWAITING_CERT_VERIFY}} = State
 ) ->
     %% The signature is over the transcript up to and including
     %% Certificate, i.e. before this message is appended.
-    {ClientHsKeys, _} = State#state.handshake_keys,
+    {ClientHsKeys, _} = (State#state.hs)#hs.handshake_keys,
     Cipher = ClientHsKeys#crypto_keys.cipher,
-    TranscriptHash = quic_crypto:transcript_hash(Cipher, State#state.tls_transcript),
+    TranscriptHash = quic_crypto:transcript_hash(Cipher, (State#state.hs)#hs.tls_transcript),
     Scheme =
         case quic_tls:parse_certificate_verify(Body) of
             {ok, #{algorithm := Alg}} -> code_to_sig_alg(Alg);
             _ -> undefined
         end,
-    Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+    Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
     Advance = State#state{
-        tls_state = ?TLS_AWAITING_FINISHED,
-        tls_transcript = Transcript,
-        negotiated_scheme = Scheme
+        hs = (State#state.hs)#hs{
+            tls_state = ?TLS_AWAITING_FINISHED,
+            tls_transcript = Transcript,
+            negotiated_scheme = Scheme
+        }
     },
-    case State#state.verify of
+    case (State#state.cfg)#conn_cfg.verify of
         false ->
             Advance;
         true ->
@@ -6260,29 +6540,33 @@ process_tls_message(
     ?TLS_FINISHED,
     Body,
     OriginalMsg,
-    #state{role = client, tls_state = ?TLS_AWAITING_FINISHED} = State
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{tls_state = ?TLS_AWAITING_FINISHED}} = State
 ) ->
     %% Get cipher from handshake keys for cipher-aware operations
-    {ClientHsKeys, _} = State#state.handshake_keys,
+    {ClientHsKeys, _} = (State#state.hs)#hs.handshake_keys,
     Cipher = ClientHsKeys#crypto_keys.cipher,
 
     %% Verify server Finished
     case quic_tls:parse_finished(Body) of
         {ok, VerifyData} ->
-            TranscriptHash = quic_crypto:transcript_hash(Cipher, State#state.tls_transcript),
+            TranscriptHash = quic_crypto:transcript_hash(
+                Cipher, (State#state.hs)#hs.tls_transcript
+            ),
             case
                 quic_tls:verify_finished(
-                    VerifyData, State#state.server_hs_secret, TranscriptHash, Cipher
+                    VerifyData, (State#state.hs)#hs.server_hs_secret, TranscriptHash, Cipher
                 )
             of
                 true ->
                     %% Update transcript with server Finished - USE ORIGINAL BYTES
-                    Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+                    Transcript = <<
+                        ((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary
+                    >>,
                     TranscriptHashFinal = quic_crypto:transcript_hash(Cipher, Transcript),
 
                     %% Derive master secret and application keys (cipher-aware)
                     MasterSecret = quic_crypto:derive_master_secret(
-                        Cipher, State#state.handshake_secret
+                        Cipher, (State#state.hs)#hs.handshake_secret
                     ),
                     ClientAppSecret = quic_crypto:derive_client_app_secret(
                         Cipher, MasterSecret, TranscriptHashFinal
@@ -6291,7 +6575,7 @@ process_tls_message(
                         Cipher, MasterSecret, TranscriptHashFinal
                     ),
                     keylog_application(
-                        State#state.tls_ch1_random, ClientAppSecret, ServerAppSecret
+                        (State#state.hs)#hs.tls_ch1_random, ClientAppSecret, ServerAppSecret
                     ),
 
                     %% Derive app keys
@@ -6323,9 +6607,9 @@ process_tls_message(
                     %% send Certificate and optionally CertificateVerify before Finished
                     %% RFC 8446 Section 4.4.2: client MUST send Certificate if server sent CertificateRequest
                     {CertPayload, Transcript2} =
-                        case State#state.cert_request_received of
+                        case (State#state.hs)#hs.cert_request_received of
                             true ->
-                                case State#state.client_cert of
+                                case (State#state.cfg)#conn_cfg.client_cert of
                                     undefined ->
                                         %% No client cert - send empty Certificate, no CertificateVerify
                                         EmptyCertMsg = quic_tls:build_certificate(<<>>, []),
@@ -6333,7 +6617,8 @@ process_tls_message(
                                     ClientCert ->
                                         %% Have client cert - send Certificate + CertificateVerify
                                         AllClientCerts = [
-                                            ClientCert | State#state.client_cert_chain
+                                            ClientCert
+                                            | (State#state.cfg)#conn_cfg.client_cert_chain
                                         ],
                                         ClientCertMsg = quic_tls:build_certificate(
                                             <<>>, AllClientCerts
@@ -6345,7 +6630,9 @@ process_tls_message(
                                         %% natural scheme if the offer is empty.
                                         SigAlg = client_cert_verify_code(State),
                                         ClientCertVerifyMsg = quic_tls:build_certificate_verify_client(
-                                            SigAlg, State#state.client_private_key, TranscriptHashCV
+                                            SigAlg,
+                                            (State#state.cfg)#conn_cfg.client_private_key,
+                                            TranscriptHashCV
                                         ),
                                         {
                                             <<ClientCertMsg/binary, ClientCertVerifyMsg/binary>>,
@@ -6360,7 +6647,7 @@ process_tls_message(
                     %% Compute client Finished using updated transcript
                     TranscriptHash2 = quic_crypto:transcript_hash(Cipher, Transcript2),
                     ClientFinishedKey = quic_crypto:derive_finished_key(
-                        Cipher, State#state.client_hs_secret
+                        Cipher, (State#state.hs)#hs.client_hs_secret
                     ),
                     ClientVerifyData = quic_crypto:compute_finished_verify(
                         Cipher, ClientFinishedKey, TranscriptHash2
@@ -6371,12 +6658,14 @@ process_tls_message(
                     HandshakePayload = <<CertPayload/binary, ClientFinishedMsg/binary>>,
 
                     State1 = State#state{
-                        tls_state = ?TLS_HANDSHAKE_COMPLETE,
-                        client_hs_flight = HandshakePayload,
-                        tls_transcript = <<Transcript2/binary, ClientFinishedMsg/binary>>,
-                        master_secret = MasterSecret,
                         app_keys = {ClientAppKeys, ServerAppKeys},
-                        key_state = KeyState
+                        key_state = KeyState,
+                        hs = (State#state.hs)#hs{
+                            tls_state = ?TLS_HANDSHAKE_COMPLETE,
+                            client_hs_flight = HandshakePayload,
+                            tls_transcript = <<Transcript2/binary, ClientFinishedMsg/binary>>,
+                            master_secret = MasterSecret
+                        }
                     },
 
                     %% Send client Certificate(+CertificateVerify)+Finished,
@@ -6395,37 +6684,44 @@ process_tls_message(
     ?TLS_FINISHED,
     Body,
     OriginalMsg,
-    #state{role = server, tls_state = ?TLS_AWAITING_CLIENT_FINISHED} = State
+    #state{cfg = #conn_cfg{role = server}, hs = #hs{tls_state = ?TLS_AWAITING_CLIENT_FINISHED}} =
+        State
 ) ->
-    {ClientHsKeys, _} = State#state.handshake_keys,
+    {ClientHsKeys, _} = (State#state.hs)#hs.handshake_keys,
     Cipher = ClientHsKeys#crypto_keys.cipher,
 
     case quic_tls:parse_finished(Body) of
         {ok, VerifyData} ->
             %% Verify client's Finished using client handshake secret
-            TranscriptHash = quic_crypto:transcript_hash(Cipher, State#state.tls_transcript),
+            TranscriptHash = quic_crypto:transcript_hash(
+                Cipher, (State#state.hs)#hs.tls_transcript
+            ),
             case
                 quic_tls:verify_finished(
-                    VerifyData, State#state.client_hs_secret, TranscriptHash, Cipher
+                    VerifyData, (State#state.hs)#hs.client_hs_secret, TranscriptHash, Cipher
                 )
             of
                 true ->
                     %% Update transcript with client Finished
-                    Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+                    Transcript = <<
+                        ((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary
+                    >>,
 
                     %% Derive resumption_master_secret (RFC 8446 Section 7.1)
                     %% resumption_master_secret = Derive-Secret(master_secret, "res master",
                     %%                                          ClientHello..client Finished)
                     FinalTranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
                     ResumptionSecret = quic_ticket:derive_resumption_secret(
-                        Cipher, State#state.master_secret, FinalTranscriptHash, <<>>
+                        Cipher, (State#state.hs)#hs.master_secret, FinalTranscriptHash, <<>>
                     ),
 
                     %% Application keys are already derived when server sent its Finished
                     State1 = State#state{
-                        tls_state = ?TLS_HANDSHAKE_COMPLETE,
-                        tls_transcript = Transcript,
-                        resumption_secret = ResumptionSecret
+                        hs = (State#state.hs)#hs{
+                            tls_state = ?TLS_HANDSHAKE_COMPLETE,
+                            tls_transcript = Transcript,
+                            resumption_secret = ResumptionSecret
+                        }
                     },
 
                     %% The server's handshake is confirmed once complete
@@ -6448,13 +6744,17 @@ process_tls_message(
     Body,
     _OriginalMsg,
     #state{
-        role = client,
-        tls_state = ?TLS_HANDSHAKE_COMPLETE,
-        server_name = ServerName,
         alpn = ALPN,
-        master_secret = MasterSecret,
-        tls_transcript = Transcript,
-        app_keys = {ClientAppKeys, _}
+        app_keys = {ClientAppKeys, _},
+        cfg = #conn_cfg{
+            role = client
+        },
+        hs = #hs{
+            tls_state = ?TLS_HANDSHAKE_COMPLETE,
+            server_name = ServerName,
+            master_secret = MasterSecret,
+            tls_transcript = Transcript
+        }
     } = State
 ) ->
     case quic_ticket:parse_new_session_ticket(Body) of
@@ -6502,7 +6802,7 @@ process_tls_message(
                     SN -> SN
                 end,
             TicketStore = quic_ticket:store_ticket(
-                TicketKey, Ticket, State#state.ticket_store
+                TicketKey, Ticket, (State#state.hs)#hs.ticket_store
             ),
 
             %% Notify owner about the new ticket
@@ -6510,8 +6810,10 @@ process_tls_message(
             Owner ! {quic, self(), {session_ticket, Ticket}},
 
             State#state{
-                ticket_store = TicketStore,
-                resumption_secret = ResumptionSecret
+                hs = (State#state.hs)#hs{
+                    ticket_store = TicketStore,
+                    resumption_secret = ResumptionSecret
+                }
             };
         {error, _Reason} ->
             State
@@ -6522,21 +6824,23 @@ process_tls_message(
     ?TLS_CERTIFICATE_REQUEST,
     Body,
     OriginalMsg,
-    #state{role = client, tls_state = ?TLS_AWAITING_CERT} = State
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{tls_state = ?TLS_AWAITING_CERT}} = State
 ) ->
     %% Update transcript and mark that server wants client certificate.
     %% Capture the advertised signature_algorithms so the client can
     %% pick a compatible CertificateVerify scheme.
-    Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+    Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
     PeerSigAlgs =
         case quic_tls:parse_certificate_request(Body) of
             {ok, #{signature_algorithms := SA}} -> SA;
             _ -> []
         end,
     State#state{
-        tls_transcript = Transcript,
-        cert_request_received = true,
-        peer_sig_algs = PeerSigAlgs
+        hs = (State#state.hs)#hs{
+            tls_transcript = Transcript,
+            cert_request_received = true,
+            peer_sig_algs = PeerSigAlgs
+        }
     };
 %% Server receives client Certificate (when verify=true)
 process_tls_message(
@@ -6544,22 +6848,24 @@ process_tls_message(
     ?TLS_CERTIFICATE,
     Body,
     OriginalMsg,
-    #state{role = server, tls_state = ?TLS_AWAITING_CLIENT_CERT} = State
+    #state{cfg = #conn_cfg{role = server}, hs = #hs{tls_state = ?TLS_AWAITING_CLIENT_CERT}} = State
 ) ->
-    Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+    Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
     case quic_tls:parse_certificate(Body) of
         {ok, #{certificates := [First | Rest]}} ->
             %% RFC 8446 §4.4.2.4: validate the client's certificate chain against
             %% our trust anchors before accepting it. Possession of the leaf's
             %% private key is checked next, on CertificateVerify; the signature
             %% check alone does not establish that the certificate is trusted.
-            case quic_cert:validate_client(First, Rest, State#state.cacerts) of
+            case quic_cert:validate_client(First, Rest, (State#state.cfg)#conn_cfg.cacerts) of
                 ok ->
                     State#state{
-                        tls_state = ?TLS_AWAITING_CLIENT_CERT_VERIFY,
-                        tls_transcript = Transcript,
-                        peer_cert = First,
-                        peer_cert_chain = Rest
+                        hs = (State#state.hs)#hs{
+                            tls_state = ?TLS_AWAITING_CLIENT_CERT_VERIFY,
+                            tls_transcript = Transcript,
+                            peer_cert = First,
+                            peer_cert_chain = Rest
+                        }
                     };
                 {error, Reason} ->
                     reject_client_cert(Reason, State)
@@ -6569,15 +6875,17 @@ process_tls_message(
             %% none. The server MAY continue without client auth or abort with
             %% certificate_required. Default to optional mTLS; only
             %% require_client_cert makes a client certificate mandatory.
-            case State#state.require_client_cert of
+            case (State#state.cfg)#conn_cfg.require_client_cert of
                 true ->
                     reject_client_cert(no_certificate, State);
                 false ->
                     State#state{
-                        tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
-                        tls_transcript = Transcript,
-                        peer_cert = undefined,
-                        peer_cert_chain = []
+                        hs = (State#state.hs)#hs{
+                            tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
+                            tls_transcript = Transcript,
+                            peer_cert = undefined,
+                            peer_cert_chain = []
+                        }
                     }
             end;
         {error, _} ->
@@ -6590,23 +6898,29 @@ process_tls_message(
     Body,
     OriginalMsg,
     #state{
-        role = server,
-        tls_state = ?TLS_AWAITING_CLIENT_CERT_VERIFY,
-        peer_cert = PeerCert
+        cfg = #conn_cfg{
+            role = server
+        },
+        hs = #hs{
+            tls_state = ?TLS_AWAITING_CLIENT_CERT_VERIFY,
+            peer_cert = PeerCert
+        }
     } = State
 ) when PeerCert =/= undefined ->
     %% Get cipher for transcript hash
-    {ClientHsKeys, _} = State#state.handshake_keys,
+    {ClientHsKeys, _} = (State#state.hs)#hs.handshake_keys,
     Cipher = ClientHsKeys#crypto_keys.cipher,
 
     %% Verify signature (transcript is BEFORE CertificateVerify)
-    TranscriptHash = quic_crypto:transcript_hash(Cipher, State#state.tls_transcript),
+    TranscriptHash = quic_crypto:transcript_hash(Cipher, (State#state.hs)#hs.tls_transcript),
     case quic_tls:verify_certificate_verify(Body, PeerCert, TranscriptHash, client) of
         true ->
-            Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+            Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
             State#state{
-                tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
-                tls_transcript = Transcript
+                hs = (State#state.hs)#hs{
+                    tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
+                    tls_transcript = Transcript
+                }
             };
         false ->
             %% Signature verification failed - send TLS decrypt_error alert
@@ -6625,9 +6939,11 @@ do_server_client_hello(SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, Ori
     %% CertificateVerify negotiation, then resolve the server cert (static
     %% or via the per-SNI callback) before any cert-path work runs.
     StateSig = State0In#state{
-        peer_sig_algs = maps:get(signature_algorithms, ClientHelloInfo, []),
-        %% The tickets this connection issues are bound to it.
-        server_name = maps:get(server_name, ClientHelloInfo, undefined)
+        hs = (State0In#state.hs)#hs{
+            peer_sig_algs = maps:get(signature_algorithms, ClientHelloInfo, []),
+            %% The tickets this connection issues are bound to it.
+            server_name = maps:get(server_name, ClientHelloInfo, undefined)
+        }
     },
     case resolve_server_cert(ClientHelloInfo, StateSig) of
         {error, Phrase} ->
@@ -6654,7 +6970,7 @@ do_server_client_hello_cont(
     %% Validate pre_shared_key placement, lookup identity, verify
     %% binder. On match the server skips the cert path and uses
     %% the PSK secret in the early_secret derivation below.
-    PskConfig = State#state.psk_config,
+    PskConfig = (State#state.cfg)#conn_cfg.psk_config,
     ServerPskModes = [psk_dhe_ke, psk_ke],
     ExternalPskResult =
         case PskConfig of
@@ -6784,7 +7100,7 @@ do_server_client_hello_cont(
         end,
 
     %% Negotiate ALPN
-    ALPN = quic_tls_negotiation:negotiate_alpn(ClientALPN, State#state.alpn_list),
+    ALPN = quic_tls_negotiation:negotiate_alpn(ClientALPN, (State#state.cfg)#conn_cfg.alpn_list),
 
     %% Build ServerHello. For PSK handshakes the ServerHello
     %% carries `selected_psk_identity'; for psk_ke it also
@@ -6811,8 +7127,8 @@ do_server_client_hello_cont(
     %% synthetic-message_hash + HRR prefix on a post-HRR retry
     %% (already stored in tls_transcript when the HRR was sent).
     Transcript0 =
-        case State#state.hrr_sent of
-            true -> State#state.tls_transcript;
+        case (State#state.hs)#hs.hrr_sent of
+            true -> (State#state.hs)#hs.tls_transcript;
             false -> <<>>
         end,
     Transcript = <<Transcript0/binary, OriginalMsg/binary, ServerHello/binary>>,
@@ -6859,22 +7175,24 @@ do_server_client_hello_cont(
 
     State0 = State#state{
         dcid = ClientSCID,
-        tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
-        tls_transcript = Transcript,
-        tls_private_key = ServerPrivKey,
-        tls_group = SelectedGroup,
-        negotiated_group = SelectedGroup,
-        handshake_secret = HandshakeSecret,
-        client_hs_secret = ClientHsSecret,
-        tls_ch1_random = ClientRandom,
-        server_hs_secret = ServerHsSecret,
-        handshake_keys = {ClientHsKeys, ServerHsKeys},
         alpn = ALPN,
-        early_keys = EarlyKeys,
-        early_data_accepted = (EarlyKeys =/= undefined andalso WantsEarlyData),
-        selected_psk = SelectedPsk
+        hs = (State#state.hs)#hs{
+            tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
+            tls_transcript = Transcript,
+            tls_private_key = ServerPrivKey,
+            tls_group = SelectedGroup,
+            negotiated_group = SelectedGroup,
+            handshake_secret = HandshakeSecret,
+            client_hs_secret = ClientHsSecret,
+            tls_ch1_random = ClientRandom,
+            server_hs_secret = ServerHsSecret,
+            handshake_keys = {ClientHsKeys, ServerHsKeys},
+            early_keys = EarlyKeys,
+            early_data_accepted = (EarlyKeys =/= undefined andalso WantsEarlyData),
+            selected_psk = SelectedPsk
+        }
     },
-    keylog_handshake(State#state.tls_ch1_random, ClientHsSecret, ServerHsSecret),
+    keylog_handshake((State#state.hs)#hs.tls_ch1_random, ClientHsSecret, ServerHsSecret),
     keylog_handshake(ClientRandom, ClientHsSecret, ServerHsSecret),
     %% Negotiate the CertificateVerify scheme up front (cert
     %% path only). No common scheme is fatal (RFC 8446 §4.4.3).
@@ -6887,8 +7205,10 @@ do_server_client_hello_cont(
             );
         {ok, CVCode, CVScheme} ->
             State0b = State0#state{
-                cert_verify_code = CVCode,
-                negotiated_scheme = CVScheme
+                hs = (State0#state.hs)#hs{
+                    cert_verify_code = CVCode,
+                    negotiated_scheme = CVScheme
+                }
             },
             State1 = apply_peer_transport_params(TP, State0b),
             State2 = send_server_hello(ServerHello, State1),
@@ -6901,16 +7221,18 @@ do_server_client_hello_cont(
 %% Otherwise the callback is invoked with the ClientHello server_name
 %% (RFC 6066 §3); its cert/key/chain override the static ones. A
 %% rejection, malformed result, or raised exception fails the handshake.
-resolve_server_cert(_ClientHelloInfo, #state{sni_callback = undefined} = State) ->
+resolve_server_cert(_ClientHelloInfo, #state{cfg = #conn_cfg{sni_callback = undefined}} = State) ->
     {ok, State};
-resolve_server_cert(ClientHelloInfo, #state{sni_callback = Fn} = State) ->
+resolve_server_cert(ClientHelloInfo, #state{cfg = #conn_cfg{sni_callback = Fn}} = State) ->
     ServerName = maps:get(server_name, ClientHelloInfo, undefined),
     try Fn(ServerName) of
         {ok, #{cert := Cert, key := Key} = CertMap} when is_binary(Cert) ->
             {ok, State#state{
-                server_cert = Cert,
-                server_private_key = Key,
-                server_cert_chain = maps:get(cert_chain, CertMap, [])
+                hs = (State#state.hs)#hs{
+                    server_cert = Cert,
+                    server_private_key = Key,
+                    server_cert_chain = maps:get(cert_chain, CertMap, [])
+                }
             }};
         Other ->
             ?LOG_WARNING(
@@ -6938,14 +7260,14 @@ resolve_server_cert(ClientHelloInfo, #state{sni_callback = Fn} = State) ->
 %% with the client's offer; no overlap is fatal.
 negotiate_cert_verify(SelectedPsk, _State) when SelectedPsk =/= undefined ->
     {ok, undefined, undefined};
-negotiate_cert_verify(_None, #state{server_private_key = undefined}) ->
+negotiate_cert_verify(_None, #state{hs = #hs{server_private_key = undefined}}) ->
     {ok, undefined, undefined};
 negotiate_cert_verify(_None, State) ->
     case
         select_signature_algorithm(
-            State#state.server_private_key,
-            State#state.tls_sig_algs,
-            State#state.peer_sig_algs
+            (State#state.hs)#hs.server_private_key,
+            (State#state.cfg)#conn_cfg.tls_sig_algs,
+            (State#state.hs)#hs.peer_sig_algs
         )
     of
         error -> {error, no_common_sig_alg};
@@ -6964,10 +7286,12 @@ send_hello_retry_request(SelectedGroup, Cipher, SessionId, OriginalMsg, State) -
     ),
     Transcript = <<Prefix/binary, HRR/binary>>,
     State1 = State#state{
-        hrr_sent = true,
-        hrr_group = SelectedGroup,
-        tls_transcript = Transcript,
-        initial_tx_off = byte_size(HRR)
+        hs = (State#state.hs)#hs{
+            hrr_sent = true,
+            hrr_group = SelectedGroup,
+            tls_transcript = Transcript,
+            initial_tx_off = byte_size(HRR)
+        }
     },
     send_initial_packet(quic_frame:encode({crypto, 0, HRR}), [{crypto, 0, HRR}], State1).
 
@@ -6978,13 +7302,13 @@ send_hello_retry_request(SelectedGroup, Cipher, SessionId, OriginalMsg, State) -
 handle_hello_retry_request(
     #{cipher := Cipher, selected_group := SelGroup}, HrrMsg, State
 ) ->
-    Ch1Opts = State#state.tls_ch1_opts,
+    Ch1Opts = (State#state.hs)#hs.tls_ch1_opts,
     PskOffered =
         Ch1Opts =/= undefined andalso
             (maps:get(external_psk, Ch1Opts, undefined) =/= undefined orelse
                 maps:get(session_ticket, Ch1Opts, undefined) =/= undefined),
-    GroupOffered = lists:member(SelGroup, State#state.tls_groups),
-    case {State#state.hrr_sent, PskOffered, GroupOffered} of
+    GroupOffered = lists:member(SelGroup, (State#state.cfg)#conn_cfg.tls_groups),
+    case {(State#state.hs)#hs.hrr_sent, PskOffered, GroupOffered} of
         {true, _, _} ->
             %% A second HRR is illegal (RFC 8446 §4.1.4).
             notify_owner({error, {tls_alert, unexpected_message}}, State),
@@ -7001,7 +7325,7 @@ handle_hello_retry_request(
         {false, false, true} ->
             %% Synthetic transcript: message_hash(CH1) || HRR. The
             %% current transcript holds exactly CH1.
-            CH1Hash = quic_crypto:transcript_hash(Cipher, State#state.tls_transcript),
+            CH1Hash = quic_crypto:transcript_hash(Cipher, (State#state.hs)#hs.tls_transcript),
             Prefix = quic_crypto:hrr_transcript_prefix(Cipher, CH1Hash),
             BaseTranscript = <<Prefix/binary, HrrMsg/binary>>,
 
@@ -7009,20 +7333,22 @@ handle_hello_retry_request(
             %% to the server-selected group. supported_groups stays.
             Ch2Opts = Ch1Opts#{
                 key_share_group => SelGroup,
-                retry_random => State#state.tls_ch1_random,
+                retry_random => (State#state.hs)#hs.tls_ch1_random,
                 retry_session_id => <<>>
             },
             {CH2, PrivKey, _Random} = quic_tls:build_client_hello(Ch2Opts),
             Transcript = <<BaseTranscript/binary, CH2/binary>>,
 
-            Off = State#state.initial_tx_off,
+            Off = (State#state.hs)#hs.initial_tx_off,
             State1 = State#state{
-                hrr_sent = true,
-                hrr_group = SelGroup,
-                tls_group = SelGroup,
-                tls_private_key = PrivKey,
-                tls_transcript = Transcript,
-                initial_tx_off = Off + byte_size(CH2)
+                hs = (State#state.hs)#hs{
+                    hrr_sent = true,
+                    hrr_group = SelGroup,
+                    tls_group = SelGroup,
+                    tls_private_key = PrivKey,
+                    tls_transcript = Transcript,
+                    initial_tx_off = Off + byte_size(CH2)
+                }
             },
             send_initial_crypto(CH2, Off, State1)
     end.
@@ -7039,14 +7365,14 @@ handle_hello_retry_request(
 %% server holding our Finished could have sent): stop holding it for the
 %% handshake-space probe to pick up.
 clear_hs_flight(State) ->
-    State#state{client_hs_flight = undefined}.
+    State#state{hs = (State#state.hs)#hs{client_hs_flight = undefined}}.
 
 %%====================================================================
 %% Internal Functions - Stream Processing
 %%====================================================================
 
 process_stream_data(StreamId, Offset, Data, Fin, State) ->
-    #state{role = Role} = State,
+    #state{cfg = #conn_cfg{role = Role}} = State,
 
     %% RFC 9000 Section 2.1: Validate stream direction
     %% Cannot receive on locally-initiated unidirectional streams
@@ -7083,14 +7409,16 @@ validate_receive_stream(StreamId, Role) ->
 
 process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
     NotInMap = not is_map_key(StreamId, State#state.streams),
-    case NotInMap andalso stream_reclaimed(StreamId, State#state.role, State) of
+    case NotInMap andalso stream_reclaimed(StreamId, (State#state.cfg)#conn_cfg.role, State) of
         true ->
             %% Late/retransmitted frame for an already-reclaimed stream. Stream
             %% ids are never reused (RFC 9000 §2.1), so this is never a new
             %% stream; ignore it rather than resurrecting the record.
             State;
         false ->
-            case NotInMap andalso stream_locally_initiated(StreamId, State#state.role) of
+            case
+                NotInMap andalso stream_locally_initiated(StreamId, (State#state.cfg)#conn_cfg.role)
+            of
                 true ->
                     %% The peer sent STREAM data for one of our locally-initiated
                     %% stream ids that we never opened (RFC 9000 §3.2). The peer
@@ -7159,7 +7487,7 @@ do_process_stream_data_buffered(StreamId, Offset, Data, false = Fin, State) ->
             DataSize = byte_size(Data),
             EndOffset = Offset + DataSize,
             NewDataReceived = State#state.data_received + DataSize,
-            HalfWindow = State#state.fc_max_receive_window div 2,
+            HalfWindow = (State#state.cfg)#conn_cfg.fc_max_receive_window div 2,
             case
                 DataSize > 0 andalso
                     gb_trees:is_empty(RB) andalso
@@ -7443,7 +7771,7 @@ auto_stream_grant(StreamId, #state{streams = Streams} = State) ->
                 recv_offset = Offset,
                 recv_max_data = RecvMaxData
             } = Stream
-        } when RecvMaxData - Offset < State#state.fc_max_receive_window div 2 ->
+        } when RecvMaxData - Offset < (State#state.cfg)#conn_cfg.fc_max_receive_window div 2 ->
             case credit_allowed(State) of
                 {true, State1} ->
                     send_auto_stream_credit(StreamId, Stream, State1);
@@ -7461,7 +7789,7 @@ send_auto_stream_credit(
 ) ->
     Now = erlang:monotonic_time(millisecond),
     SmoothedRTT = quic_rtt:smoothed(quic_loss:rtt(State#state.loss_state)),
-    MaxWindow = State#state.fc_max_receive_window,
+    MaxWindow = (State#state.cfg)#conn_cfg.fc_max_receive_window,
     %% Check if consumption is fast (< 4*RTT since last update)
     FastConsumption =
         case State#state.fc_last_stream_update of
@@ -7501,9 +7829,11 @@ credit_allowed(State) ->
 
 %% The owner is behind when its mailbox holds more than max_owner_queue
 %% messages.
-owner_behind(#state{max_owner_queue = infinity}) ->
+owner_behind(#state{cfg = #conn_cfg{max_owner_queue = infinity}}) ->
     false;
-owner_behind(#state{owner = Owner, max_owner_queue = Max}) when node(Owner) =:= node() ->
+owner_behind(#state{owner = Owner, cfg = #conn_cfg{max_owner_queue = Max}}) when
+    node(Owner) =:= node()
+->
     case erlang:process_info(Owner, message_queue_len) of
         {message_queue_len, Len} -> Len > Max;
         undefined -> false
@@ -7526,7 +7856,7 @@ release_withheld_credit(#state{credit_withheld = Withheld} = State) ->
 %% bytes a manual stream has delivered but not had consumed do not earn
 %% connection credit. Never sent unless it raises the limit.
 conn_grant(#state{max_data_local = MaxDataLocal, data_received = Received} = State) ->
-    MaxWindow = State#state.fc_max_receive_window,
+    MaxWindow = (State#state.cfg)#conn_cfg.fc_max_receive_window,
     case max(0, MaxDataLocal - Received) < MaxWindow div 2 of
         true ->
             case credit_allowed(State) of
@@ -7538,7 +7868,7 @@ conn_grant(#state{max_data_local = MaxDataLocal, data_received = Received} = Sta
     end.
 
 send_conn_credit(#state{max_data_local = MaxDataLocal, data_received = Received} = State) ->
-    MaxWindow = State#state.fc_max_receive_window,
+    MaxWindow = (State#state.cfg)#conn_cfg.fc_max_receive_window,
     {Unconsumed, State1} = manual_unconsumed(State),
     Anchor = Received - Unconsumed,
     Now = erlang:monotonic_time(millisecond),
@@ -7591,13 +7921,13 @@ manual_unconsumed(#state{manual_recv_streams = Manual, streams = Streams} = Stat
 
 %% A manual stream's window: its configured initial limit, capped at the
 %% largest window this connection grants. Not auto-tuned.
-manual_window(StreamId, #state{role = Role} = State) ->
+manual_window(StreamId, #state{cfg = #conn_cfg{role = Role}} = State) ->
     Kind =
         case stream_locally_initiated(StreamId, Role) of
             true -> bidi_local_initiated;
             false -> peer_stream_kind(StreamId)
         end,
-    min(get_local_recv_limit(Kind, State), State#state.fc_max_receive_window).
+    min(get_local_recv_limit(Kind, State), (State#state.cfg)#conn_cfg.fc_max_receive_window).
 
 %% MAX_STREAM_DATA for a manual stream: one window past what the reader
 %% consumed, sent once that is at least half a window beyond the current
@@ -7701,7 +8031,7 @@ auto_stream_release(StreamId, #state{streams = Streams} = State) ->
     end.
 
 flush_after_grant(connected, State) ->
-    flush_dirty_timers(flush_socket_batch(State));
+    flush_event(State, event);
 flush_after_grant(_StateName, State) ->
     State.
 
@@ -7768,9 +8098,9 @@ send_packet_to_addr(IP, Port, Packet, #state{socket = Socket}) ->
 %% Re-arm active-N on the client socket. No-op on the `socket' backend
 %% which delivers messages via the dedicated receiver process — see
 %% `quic_socket:start_client_receiver/2'.
-client_rearm_active(#state{client_socket_backend = socket}, _N) ->
+client_rearm_active(#state{cfg = #conn_cfg{client_socket_backend = socket}}, _N) ->
     ok;
-client_rearm_active(#state{client_socket_backend = adapter}, _N) ->
+client_rearm_active(#state{cfg = #conn_cfg{client_socket_backend = adapter}}, _N) ->
     %% Adapter callers manage their own delivery; there is no UDP
     %% socket whose active counter we could rearm.
     ok;
@@ -7782,9 +8112,13 @@ client_rearm_active(#state{socket = Socket}, N) ->
 %% OTP socket on the socket-backend path; here we only stop the
 %% dedicated receiver. For gen_udp we still need to close the raw
 %% `gen_udp:socket()' — nothing else owns it.
-close_client_socket(#state{client_socket_backend = socket, client_receiver = Receiver}) ->
+close_client_socket(#state{
+    client_receiver = Receiver, cfg = #conn_cfg{client_socket_backend = socket}
+}) ->
     quic_socket:stop_client_receiver(Receiver);
-close_client_socket(#state{client_socket_backend = adapter, socket_state = SocketState}) ->
+close_client_socket(#state{
+    socket_state = SocketState, cfg = #conn_cfg{client_socket_backend = adapter}
+}) ->
     case SocketState of
         undefined -> ok;
         _ -> quic_socket:close(SocketState)
@@ -7820,15 +8154,79 @@ close_raw_client_socket(Opts, Socket) ->
     end.
 
 %% Flush any batched packets (call before timers or idle periods)
-flush_socket_batch(#state{socket_state = undefined} = State) ->
-    State;
 flush_socket_batch(#state{socket_state = SocketState} = State) ->
-    case quic_socket:flush(SocketState) of
-        {ok, NewSocketState} ->
-            State#state{socket_state = NewSocketState};
-        {error, _, ClearedSocketState} ->
-            State#state{socket_state = ClearedSocketState}
+    case flushed_socket_state(SocketState) of
+        %% Empty batch: the socket state is returned as is.
+        SocketState -> State;
+        NewSocketState -> State#state{socket_state = NewSocketState}
     end.
+
+%% A receive pass only counts ack-eliciting packets; an ACK still owed at
+%% its end gets the max_ack_delay timer here.
+pass_ack_timer(#state{ack_elicited_count = 0, ack_timer = Timer}) -> Timer;
+pass_ack_timer(#state{ack_timer = Timer}) -> ensure_ack_timer(Timer).
+
+flushed_socket_state(undefined) ->
+    undefined;
+flushed_socket_state(SocketState) ->
+    case quic_socket:flush(SocketState) of
+        {ok, NewSocketState} -> NewSocketState;
+        {error, _, ClearedSocketState} -> ClearedSocketState
+    end.
+
+%% End of an event, in one record update: flush the socket batch and the
+%% deferred PTO reset (the idle and keep-alive timers are lazy, so the PTO
+%% is the only deferred timer); `rearm' forces the PTO reset. After a
+%% receive pass (`pass') the per-pass fields are cleared and an ACK still
+%% owed gets its timer. Every event that may have drained the send
+%% queue ends here, so it is also where a wanted send_ready goes out.
+flush_event(#state{socket_state = SocketState0, pto_dirty = Dirty0} = State, Scope) ->
+    SocketState = flushed_socket_state(SocketState0),
+    Dirty = Dirty0 orelse Scope =:= rearm,
+    State1 =
+        case Dirty orelse Scope =:= pass orelse SocketState =/= SocketState0 of
+            false ->
+                State;
+            true ->
+                {Timer, ArmedAt, ScheduledAt, Space, Kind} =
+                    case Dirty of
+                        true ->
+                            pto_plan(State);
+                        false ->
+                            #state{
+                                pto_timer = T,
+                                pto_armed_at = A,
+                                pto_scheduled_at = D,
+                                pto_space = Sp,
+                                pto_kind = K
+                            } = State,
+                            {T, A, D, Sp, K}
+                    end,
+                {Source, RecvPass, AckTimer} =
+                    case Scope of
+                        pass ->
+                            {undefined, false, pass_ack_timer(State)};
+                        _ ->
+                            {
+                                State#state.current_packet_source,
+                                State#state.recv_pass,
+                                State#state.ack_timer
+                            }
+                    end,
+                State#state{
+                    socket_state = SocketState,
+                    pto_timer = Timer,
+                    pto_armed_at = ArmedAt,
+                    pto_scheduled_at = ScheduledAt,
+                    pto_space = Space,
+                    pto_kind = Kind,
+                    pto_dirty = false,
+                    current_packet_source = Source,
+                    recv_pass = RecvPass,
+                    ack_timer = AckTimer
+                }
+        end,
+    maybe_send_ready(State1).
 
 %%====================================================================
 %% ACK emission and decimation (RFC 9002 Section 6.2)
@@ -7882,12 +8280,13 @@ maybe_send_ack(_, _, State) ->
 %% since the last emitted ACK, flush immediately. Otherwise increment
 %% the counter and arm a max_ack_delay timer (if not already armed).
 maybe_decimate_app_ack(#state{recv_pass = true} = State) ->
-    %% Inside a receive pass: only count; finish_recv_pass/1 flushes
-    %% one ACK for the whole train.
-    arm_ack_timer(State#state{ack_elicited_count = State#state.ack_elicited_count + 1});
+    %% Inside a receive pass: only count; flush_recv_pass/1 flushes
+    %% one ACK for the whole train and flush_event/2 arms the timer for a
+    %% remainder.
+    State#state{ack_elicited_count = State#state.ack_elicited_count + 1};
 maybe_decimate_app_ack(State) ->
     NewCount = State#state.ack_elicited_count + 1,
-    case NewCount >= State#state.ack_packet_tolerance of
+    case NewCount >= (State#state.cfg)#conn_cfg.ack_packet_tolerance of
         true ->
             send_app_ack(State);
         false ->
@@ -7896,21 +8295,23 @@ maybe_decimate_app_ack(State) ->
 
 %% End of a connected-state receive pass: flush the accumulated stream
 %% delivery, emit the deferred ACK (one per train) if enough
-%% ack-eliciting packets accumulated, then clear the pass flag.
-%% Below-tolerance remainders keep their ack_timer. The delivery
+%% ack-eliciting packets accumulated. flush_event/2 then clears the pass
+%% flag. Below-tolerance remainders keep their ack_timer. The delivery
 %% flushes even when the pass initiated a close: the data arrived
 %% before it.
-finish_recv_pass(State0) ->
+flush_recv_pass(State0) ->
     State = flush_pending_delivery(State0),
     case State of
         #state{
-            ack_elicited_count = Count, ack_packet_tolerance = Tol, close_reason = undefined
+            ack_elicited_count = Count,
+            close_reason = undefined,
+            cfg = #conn_cfg{ack_packet_tolerance = Tol}
         } when
             Count >= Tol
         ->
-            send_app_ack(State#state{recv_pass = false});
+            send_app_ack(State, false);
         _ ->
-            State#state{recv_pass = false}
+            State
     end.
 
 %% A boolean option: true only when set to exactly `true'.
@@ -7931,7 +8332,10 @@ bool_opt(Key, Opts) ->
 %% only adjacent chunks of one stream merge). Otherwise one message
 %% per delivery, as before. Returns the new pend_deliver.
 deliver_stream_data(
-    StreamId, Data, Fin, #state{recv_pass = true, delivery_coalescing = true} = State
+    StreamId,
+    Data,
+    Fin,
+    #state{recv_pass = true, cfg = #conn_cfg{delivery_coalescing = true}} = State
 ) ->
     case State#state.pend_deliver of
         {StreamId, Acc, F} ->
@@ -7961,9 +8365,15 @@ flush_pending_delivery(#state{pend_deliver = {StreamId, Acc, Fin}, owner = Owner
 arm_ack_timer(#state{ack_timer = Ref} = State) when Ref =/= undefined ->
     State;
 arm_ack_timer(#state{ack_timer = undefined} = State) ->
-    NewRef = make_ref(),
-    erlang:send_after(?DEFAULT_MAX_ACK_DELAY, self(), {send_delayed_ack, app, NewRef}),
-    State#state{ack_timer = NewRef}.
+    State#state{ack_timer = ensure_ack_timer(undefined)}.
+
+%% The armed ACK timer, arming one if there is none. A start_timer
+%% reference is also the timer handle, so cancel_timer/1 stops it and a
+%% piggybacked ACK leaves no stale timeout behind.
+ensure_ack_timer(undefined) ->
+    erlang:start_timer(?DEFAULT_MAX_ACK_DELAY, self(), send_delayed_ack);
+ensure_ack_timer(Ref) ->
+    Ref.
 
 %%====================================================================
 %% Frame classification for ACK policy
@@ -8100,7 +8510,7 @@ maybe_negotiate_compatible_version(TP, false, State) ->
         {_Chosen, Available} when is_list(Available) ->
             Mutual = [
                 V
-             || V <- State#state.supported_versions,
+             || V <- (State#state.cfg)#conn_cfg.supported_versions,
                 lists:member(V, Available)
             ],
             case Mutual of
@@ -8127,21 +8537,23 @@ switch_version(NewVersion, State) ->
         ?QUIC_LOG_META
     ),
     OldVersion = State#state.version,
-    NewKeys = derive_initial_keys(State#state.original_dcid, NewVersion),
+    NewKeys = derive_initial_keys((State#state.cfg)#conn_cfg.original_dcid, NewVersion),
     State#state{
         version = NewVersion,
-        initial_keys = NewKeys,
-        initial_keys_alt = {OldVersion, State#state.initial_keys}
+        hs = (State#state.hs)#hs{
+            initial_keys = NewKeys,
+            initial_keys_alt = {OldVersion, (State#state.hs)#hs.initial_keys}
+        }
     }.
 
 %% Initial keys matching a received packet's version: through a
 %% compatible version switch the peer's first flight is still protected
 %% with the pre-switch version's keys.
-initial_keys_for_version(V, #state{version = V, initial_keys = Keys}) ->
+initial_keys_for_version(V, #state{version = V, hs = #hs{initial_keys = Keys}}) ->
     Keys;
-initial_keys_for_version(V, #state{initial_keys_alt = {V, Keys}}) ->
+initial_keys_for_version(V, #state{hs = #hs{initial_keys_alt = {V, Keys}}}) ->
     Keys;
-initial_keys_for_version(_, #state{initial_keys = Keys}) ->
+initial_keys_for_version(_, #state{hs = #hs{initial_keys = Keys}}) ->
     Keys.
 
 derive_initial_keys(DCID, Version) ->
@@ -8164,7 +8576,9 @@ derive_initial_keys(DCID, Version) ->
 %% Pick the client's CertificateVerify scheme for mTLS: intersect the
 %% server's advertised schemes with the client key's schemes, falling
 %% back to the key's natural scheme when the server offered none.
-client_cert_verify_code(#state{client_private_key = Key, peer_sig_algs = Offered}) ->
+client_cert_verify_code(#state{
+    cfg = #conn_cfg{client_private_key = Key}, hs = #hs{peer_sig_algs = Offered}
+}) ->
     case Offered of
         [] ->
             select_signature_algorithm(Key);
@@ -8177,9 +8591,9 @@ client_cert_verify_code(#state{client_private_key = Key, peer_sig_algs = Offered
 
 %% Build a CertificateRequest advertising the server's configured
 %% signature schemes (defaults when none set).
-build_cert_request(#state{tls_sig_algs = undefined}) ->
+build_cert_request(#state{cfg = #conn_cfg{tls_sig_algs = undefined}}) ->
     quic_tls:build_certificate_request(<<>>);
-build_cert_request(#state{tls_sig_algs = SigAlgs}) ->
+build_cert_request(#state{cfg = #conn_cfg{tls_sig_algs = SigAlgs}}) ->
     quic_tls:build_certificate_request(<<>>, SigAlgs).
 
 %% Select signature algorithm based on private key type (mTLS client
@@ -8277,7 +8691,7 @@ check_state_transition(CurrentState, State) ->
             {next_state, draining, State};
         _ ->
             %% Check for TLS handshake state transitions
-            case {CurrentState, State#state.tls_state, has_app_keys(State)} of
+            case {CurrentState, (State#state.hs)#hs.tls_state, has_app_keys(State)} of
                 {idle, ?TLS_AWAITING_ENCRYPTED_EXT, _} ->
                     %% Got ServerHello, have handshake keys
                     emit_qlog_state_change(idle, handshaking, State),
@@ -8303,7 +8717,7 @@ check_state_transition(CurrentState, State) ->
     end.
 
 %% Helper to emit qlog connection_state_updated event
-emit_qlog_state_change(OldState, NewState, #state{qlog_ctx = Ctx}) ->
+emit_qlog_state_change(OldState, NewState, #state{cfg = #conn_cfg{qlog_ctx = Ctx}}) ->
     quic_qlog:connection_state_updated(Ctx, OldState, NewState).
 
 %% Convert close reason to error code for qlog
@@ -8335,13 +8749,13 @@ has_app_keys(_) -> true.
 %% both `recv_time' (below) and the immediately-following
 %% `last_activity' write, saving one BIF call per received packet.
 record_received_pn(initial, PN, State, Now) ->
-    PNSpace = State#state.pn_initial,
+    PNSpace = (State#state.hs)#hs.pn_initial,
     NewPNSpace = quic_ack:update_pn_space_recv(PN, PNSpace, Now),
-    State#state{pn_initial = NewPNSpace};
+    State#state{hs = (State#state.hs)#hs{pn_initial = NewPNSpace}};
 record_received_pn(handshake, PN, State, Now) ->
-    PNSpace = State#state.pn_handshake,
+    PNSpace = (State#state.hs)#hs.pn_handshake,
     NewPNSpace = quic_ack:update_pn_space_recv(PN, PNSpace, Now),
-    State#state{pn_handshake = NewPNSpace};
+    State#state{hs = (State#state.hs)#hs{pn_handshake = NewPNSpace}};
 record_received_pn(app, PN, State, Now) ->
     PNSpace = State#state.pn_app,
     Trigger = classify_recv_trigger(PN, PNSpace),
@@ -8370,9 +8784,9 @@ classify_recv_trigger(_PN, _PNSpace) ->
 
 %% Get largest received PN for a given encryption level
 get_largest_recv(initial, State) ->
-    (State#state.pn_initial)#pn_space.largest_recv;
+    ((State#state.hs)#hs.pn_initial)#pn_space.largest_recv;
 get_largest_recv(handshake, State) ->
-    (State#state.pn_handshake)#pn_space.largest_recv;
+    ((State#state.hs)#hs.pn_handshake)#pn_space.largest_recv;
 get_largest_recv(app, State) ->
     (State#state.pn_app)#pn_space.largest_recv;
 get_largest_recv(zero_rtt, State) ->
@@ -8390,16 +8804,6 @@ update_last_activity(State) ->
 update_last_activity(State, Now) ->
     State#state{last_activity = Now, ack_eliciting_since_recv = false}.
 
-%% Flush the deferred PTO timer reset at batch boundaries. The idle and
-%% keep-alive timers are lazy (armed once, re-armed only on fire), so the
-%% only deferred timer left is the PTO.
-%% The end of every event that may have drained the send queue, so it is
-%% also where a wanted send_ready goes out.
-flush_dirty_timers(#state{pto_dirty = false} = State) ->
-    maybe_send_ready(State);
-flush_dirty_timers(#state{pto_dirty = true} = State) ->
-    maybe_send_ready(set_pto_timer(State#state{pto_dirty = false})).
-
 maybe_send_ready(#state{send_ready_wanted = true, send_queue_bytes = Bytes} = State) when
     Bytes < ?MAX_SEND_QUEUE_BYTES div 2
 ->
@@ -8414,7 +8818,7 @@ maybe_send_ready(State) ->
 %% new stream, RFC 9000 §2.1), and for a peer-initiated stream extends the
 %% MAX_STREAMS credit by one (RFC 9000 §4.6). Runs at most once per stream:
 %% later calls miss the map and no-op, so crediting is exactly-once.
-maybe_reclaim_stream(StreamId, #state{streams = Streams, role = Role} = State) ->
+maybe_reclaim_stream(StreamId, #state{streams = Streams, cfg = #conn_cfg{role = Role}} = State) ->
     case maps:find(StreamId, Streams) of
         error ->
             State;
@@ -8519,7 +8923,7 @@ stream_reclaimed(StreamId, Role, State) ->
 %% True when a frame's stream is not in the map but was already reclaimed: a
 %% late/retransmitted frame that must be ignored rather than recreate the stream
 %% (RFC 9000 §2.1: ids are never reused). Used by every open-on-miss handler.
-is_reclaimed_frame(StreamId, #state{streams = Streams, role = Role} = State) ->
+is_reclaimed_frame(StreamId, #state{streams = Streams, cfg = #conn_cfg{role = Role}} = State) ->
     (not is_map_key(StreamId, Streams)) andalso stream_reclaimed(StreamId, Role, State).
 
 reclaimed_map(bidi, State) -> State#state.reclaimed_ranges_bidi;
@@ -8533,10 +8937,12 @@ set_reclaimed_map(uni, M, State) -> State#state{reclaimed_ranges_uni = M}.
 %% Client bidi=0x00, Server bidi=0x01, Client uni=0x02, Server uni=0x03
 do_open_stream(
     #state{
-        role = Role,
         next_stream_id_bidi = NextId,
         max_streams_bidi_remote = Max,
-        streams = Streams
+        streams = Streams,
+        cfg = #conn_cfg{
+            role = Role
+        }
     } = State
 ) ->
     %% RFC 9000 §4.6: Check cumulative stream count against peer's limit.
@@ -8587,10 +8993,12 @@ do_open_stream(
 %% Open a new unidirectional stream
 do_open_unidirectional_stream(
     #state{
-        role = Role,
         next_stream_id_uni = NextId,
         max_streams_uni_remote = Max,
-        streams = Streams
+        streams = Streams,
+        cfg = #conn_cfg{
+            role = Role
+        }
     } = State
 ) ->
     %% RFC 9000 §4.6: MAX_STREAMS value of N permits opening streams with IDs
@@ -8701,9 +9109,11 @@ get_peer_stream_limit(StreamType, #state{transport_params = TP}) ->
 %% - bidi_peer_initiated: Bidi stream peer opened, use our max_stream_data_bidi_remote
 %% - uni_peer_initiated: Uni stream peer opened, use our max_stream_data_uni
 get_local_recv_limit(StreamType, #state{
-    max_stream_data_bidi_local = BidiLocal,
-    max_stream_data_bidi_remote = BidiRemote,
-    max_stream_data_uni = Uni
+    cfg = #conn_cfg{
+        max_stream_data_bidi_local = BidiLocal,
+        max_stream_data_bidi_remote = BidiRemote,
+        max_stream_data_uni = Uni
+    }
 }) ->
     case StreamType of
         bidi_local_initiated -> BidiLocal;
@@ -8715,7 +9125,7 @@ get_local_recv_limit(StreamType, #state{
 %% RFC 9000 Section 2.1: Stream ID format determines initiator and type.
 %% Bit 0: 0=client-initiated, 1=server-initiated
 %% Bit 1: 0=bidirectional, 1=unidirectional
-is_locally_initiated(StreamId, #state{role = Role}) ->
+is_locally_initiated(StreamId, #state{cfg = #conn_cfg{role = Role}}) ->
     ClientInitiated = (StreamId band 1) =:= 0,
     case Role of
         client -> ClientInitiated;
@@ -8954,7 +9364,7 @@ send_admitted_data(
 %% Send 0-RTT (early) data on a stream
 %% RFC 9001 Section 4.6: 0-RTT data uses the early traffic secret
 do_send_zero_rtt_data(
-    StreamId, Data, Fin, #state{streams = Streams, early_keys = {EarlyKeys, _}} = State
+    StreamId, Data, Fin, #state{streams = Streams, hs = #hs{early_keys = {EarlyKeys, _}}} = State
 ) ->
     case maps:find(StreamId, Streams) of
         {ok, StreamState} ->
@@ -8975,15 +9385,17 @@ do_send_zero_rtt_data(
                 send_fin = Fin,
                 send_done = Fin orelse StreamState#stream_state.send_done
             },
-            EarlyDataSent = State#state.early_data_sent + byte_size(DataBin),
+            EarlyDataSent = (State#state.hs)#hs.early_data_sent + byte_size(DataBin),
             NewZeroRttIds = sets:add_element(
-                StreamId, State#state.zero_rtt_stream_ids
+                StreamId, (State#state.hs)#hs.zero_rtt_stream_ids
             ),
 
             FinalState0 = NewState#state{
                 streams = maps:put(StreamId, NewStreamState, Streams),
-                early_data_sent = EarlyDataSent,
-                zero_rtt_stream_ids = NewZeroRttIds
+                hs = (NewState#state.hs)#hs{
+                    early_data_sent = EarlyDataSent,
+                    zero_rtt_stream_ids = NewZeroRttIds
+                }
             },
             %% RFC 9000 §4.6: extend MAX_STREAMS once this stream is fully
             %% closed (covers the rare 0-RTT FIN-from-server case).
@@ -9008,11 +9420,13 @@ send_zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk, EarlyKeys, State) ->
 %% RFC 9001 Section 5.3: 0-RTT packets use early traffic keys
 send_zero_rtt_packet(Payload, Frames, EarlyKeys, State) ->
     #state{
-        scid = SCID,
         dcid = DCID,
         version = Version,
         % 0-RTT uses app PN space
-        pn_app = PNSpace
+        pn_app = PNSpace,
+        cfg = #conn_cfg{
+            scid = SCID
+        }
     } = State,
 
     PN = PNSpace#pn_space.next_pn,
@@ -9053,9 +9467,9 @@ send_zero_rtt_packet(Payload, Frames, EarlyKeys, State) ->
 
     %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
+    bump(?C_PACKETS_SENT, 1, State),
     State#state{
         pn_app = NewPNSpace,
-        packets_sent = State#state.packets_sent + 1,
         socket_state = NewSocketState,
         loss_state = NewLossState,
         cc_state = NewCCState,
@@ -9090,8 +9504,10 @@ reset_zero_rtt_streams(RejectedIds, #state{streams = Streams, owner = Owner} = S
     Owner ! {quic, self(), {early_data_rejected, RejectedIds}},
     State#state{
         streams = NewStreams,
-        zero_rtt_stream_ids = sets:new([{version, 2}]),
-        early_data_sent = 0
+        hs = (State#state.hs)#hs{
+            zero_rtt_stream_ids = sets:new([{version, 2}]),
+            early_data_sent = 0
+        }
     }.
 
 %% Branch on early_data_accepted at handshake completion. When 0-RTT was
@@ -9103,11 +9519,13 @@ reset_zero_rtt_streams(RejectedIds, #state{streams = Streams, owner = Owner} = S
 %% touches `data_sent', so without this fold the connection counter would
 %% under-count accepted early data and could later overshoot max_data.
 -spec finalize_zero_rtt_state(#state{}) -> #state{}.
-finalize_zero_rtt_state(#state{early_data_accepted = true} = State) ->
-    #state{data_sent = DataSent, early_data_sent = EarlyDataSent} = State,
-    State#state{data_sent = DataSent + EarlyDataSent, early_data_sent = 0};
-finalize_zero_rtt_state(#state{early_data_accepted = false} = State) ->
-    case sets:to_list(State#state.zero_rtt_stream_ids) of
+finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = true}} = State) ->
+    #state{data_sent = DataSent, hs = #hs{early_data_sent = EarlyDataSent}} = State,
+    State#state{
+        data_sent = DataSent + EarlyDataSent, hs = (State#state.hs)#hs{early_data_sent = 0}
+    };
+finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = false}} = State) ->
+    case sets:to_list((State#state.hs)#hs.zero_rtt_stream_ids) of
         [] -> State;
         RejectedIds -> reset_zero_rtt_streams(RejectedIds, State)
     end.
@@ -9126,10 +9544,10 @@ finalize_zero_rtt_state(#state{early_data_accepted = false} = State) ->
 %%   bit 2   = key phase
 %%   bits 1-0 = PN length - 1
 short_header_first_byte(KeyPhase, PNLen, #state{
-    spin_outgoing = Spin, spin_bit_enabled = true
+    spin_outgoing = Spin, cfg = #conn_cfg{spin_bit_enabled = true}
 }) ->
     16#40 bor (Spin bsl 5) bor (KeyPhase bsl 2) bor (PNLen - 1);
-short_header_first_byte(KeyPhase, PNLen, #state{spin_bit_enabled = false}) ->
+short_header_first_byte(KeyPhase, PNLen, #state{cfg = #conn_cfg{spin_bit_enabled = false}}) ->
     16#40 bor (KeyPhase bsl 2) bor (PNLen - 1).
 
 %% Per-packet receive bookkeeping for the 1-RTT hot path: PN-space
@@ -9146,9 +9564,9 @@ record_app_recv(FirstByte, PN, #state{pn_app = PNSpace} = State, Now) ->
             true ->
                 R = (FirstByte bsr 5) band 1,
                 Out =
-                    case State#state.spin_bit_enabled of
+                    case (State#state.cfg)#conn_cfg.spin_bit_enabled of
                         false -> State#state.spin_outgoing;
-                        true when State#state.role =:= client -> R;
+                        true when (State#state.cfg)#conn_cfg.role =:= client -> R;
                         true -> 1 - R
                     end,
                 {R, PN, Out};
@@ -9181,10 +9599,13 @@ datagram_overhead(#state{dcid = Dcid}) ->
 %% mailbox holds more than max_owner_queue messages: DATAGRAMs are
 %% unreliable (RFC 9221 Section 5), and nothing else stops a peer from
 %% filling that mailbox. Drops show in datagram_stats/1.
-deliver_datagram(Data, #state{datagram_recv_dropped = Dropped} = State) ->
+deliver_datagram(Data, State) ->
     case owner_behind(State) of
-        true -> State#state{datagram_recv_dropped = Dropped + 1};
-        false -> push_datagram(Data, State)
+        true ->
+            bump(?C_DATAGRAM_RECV_DROPPED, 1, State),
+            State;
+        false ->
+            push_datagram(Data, State)
     end.
 
 %% Also account for it in the recv queue. With no cap (`infinity') this
@@ -9194,29 +9615,26 @@ push_datagram(
     #state{
         owner = Owner,
         datagram_recv_queue = Queue,
-        datagram_recv_queue_len = Cap,
-        datagram_recv_delivered = Delivered,
-        datagram_recv_dropped = Dropped
+        cfg = #conn_cfg{
+            datagram_recv_queue_len = Cap
+        }
     } = State
 ) ->
     Owner ! {quic, self(), {datagram, Data}},
+    bump(?C_DATAGRAM_RECV_DELIVERED, 1, State),
     case Cap of
         infinity ->
-            State#state{datagram_recv_delivered = Delivered + 1};
+            State;
         Max when is_integer(Max), Max >= 0 ->
-            {Queue1, Dropped1} =
+            Queue1 =
                 case queue:len(Queue) >= Max of
                     true ->
-                        Trimmed = queue_drop_oldest(Queue),
-                        {queue:in(Data, Trimmed), Dropped + 1};
+                        bump(?C_DATAGRAM_RECV_DROPPED, 1, State),
+                        queue:in(Data, queue_drop_oldest(Queue));
                     false ->
-                        {queue:in(Data, Queue), Dropped}
+                        queue:in(Data, Queue)
                 end,
-            State#state{
-                datagram_recv_queue = Queue1,
-                datagram_recv_delivered = Delivered + 1,
-                datagram_recv_dropped = Dropped1
-            }
+            State#state{datagram_recv_queue = Queue1}
     end.
 
 queue_drop_oldest(Q) ->
@@ -9226,17 +9644,12 @@ queue_drop_oldest(Q) ->
     end.
 
 %% Stats snapshot used by quic:datagram_stats/1.
-datagram_stats_snapshot(#state{
-    datagram_recv_delivered = Delivered,
-    datagram_recv_dropped = RDropped,
-    datagram_sent = Sent,
-    datagram_send_dropped = SDropped
-}) ->
+datagram_stats_snapshot(State) ->
     #{
-        delivered => Delivered,
-        dropped_recv => RDropped,
-        sent => Sent,
-        dropped_send => SDropped
+        delivered => count(?C_DATAGRAM_RECV_DELIVERED, State),
+        dropped_recv => count(?C_DATAGRAM_RECV_DROPPED, State),
+        sent => count(?C_DATAGRAM_SENT, State),
+        dropped_send => count(?C_DATAGRAM_SEND_DROPPED, State)
     }.
 
 %% Send a datagram (RFC 9221)
@@ -9264,13 +9677,12 @@ do_send_datagram(
                     %% Use datagram_with_length for better framing
                     Frame = {datagram_with_length, DataBin},
                     Payload = quic_frame:encode(Frame),
-                    State1 = send_app_packet_internal(Payload, [Frame], State),
-                    {ok, State1#state{datagram_sent = State#state.datagram_sent + 1}};
+                    bump(?C_DATAGRAM_SENT, 1, State),
+                    {ok, send_app_packet_internal(Payload, [Frame], State)};
                 false ->
                     %% Datagrams are unreliable - just drop if cwnd is full
-                    {error, congestion_limited, State#state{
-                        datagram_send_dropped = State#state.datagram_send_dropped + 1
-                    }}
+                    bump(?C_DATAGRAM_SEND_DROPPED, 1, State),
+                    {error, congestion_limited, State}
             end
     end.
 
@@ -9322,7 +9734,8 @@ send_stream_fragments(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where)
 send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where) when
     is_binary(Data)
 ->
-    #state{cc_state = CCState, pacing_enabled = PacingEnabled, streams = Streams} = State,
+    #state{cc_state = CCState, streams = Streams, cfg = #conn_cfg{pacing_enabled = PacingEnabled}} =
+        State,
     DataSize = byte_size(Data),
     PacketSize = DataSize + ?PACKET_OVERHEAD,
     %% Control streams (urgency 0) can exceed cwnd to prevent tick blocking
@@ -9336,10 +9749,9 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Wh
         end,
     case Check of
         {ok, NewCCState} ->
-            State1 = State#state{cc_state = NewCCState},
             Frame = {stream, StreamId, Offset, Data, Fin},
             Payload = quic_frame:encode_iodata(Frame),
-            NewState = send_app_packet_internal(Payload, [Frame], State1),
+            NewState = send_app_packet_internal(Payload, [Frame], State, NewCCState),
             {NewState, BytesSentSoFar + DataSize};
         {blocked_pacing, Delay} ->
             ?LOG_DEBUG(
@@ -9403,11 +9815,13 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
     #state{
         dcid = DCID,
         app_keys = {ClientKeys, ServerKeys},
-        role = Role,
         pn_app = PNSpace,
         loss_state = LossState,
         cc_state = CCState,
-        socket_state = SocketState
+        socket_state = SocketState,
+        cfg = #conn_cfg{
+            role = Role
+        }
     } = State,
     EncryptKeys =
         case Role of
@@ -9462,12 +9876,12 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
     %% RFC 9000 §10.1: the idle timer restarts on the first ack-eliciting
     %% send since the last receive (see send_app_packet_now/3).
     RestartIdle = not State#state.ack_eliciting_since_recv,
+    bump(?C_PACKETS_SENT, K, State),
     State1 = State#state{
         pn_app = PNSpace#pn_space{next_pn = PN0 + K},
         loss_state = Loss1,
         cc_state = CC1,
         socket_state = SS1,
-        packets_sent = State#state.packets_sent + K,
         burst_sent = State#state.burst_sent + K,
         last_activity =
             case RestartIdle of
@@ -9531,7 +9945,7 @@ send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Tracked) ->
         end,
     case SendResult of
         {ok, SS1} ->
-            ?QLOG_EMIT_PACKET_SENT(State#state.qlog_ctx, #{
+            ?QLOG_EMIT_PACKET_SENT((State#state.cfg)#conn_cfg.qlog_ctx, #{
                 packet_type => one_rtt,
                 packet_number => PN,
                 length => PacketSize,
@@ -9635,7 +10049,7 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
 
 send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
     {chunked_ctx, MaxChunkSize, Urgency, PacketSize, _HeaderPrefix, _LengthVarint, Where} = Ctx,
-    #state{cc_state = CCState, pacing_enabled = PacingEnabled} = State,
+    #state{cc_state = CCState, cfg = #conn_cfg{pacing_enabled = PacingEnabled}} = State,
     Check =
         case PacingEnabled of
             true -> quic_cc:send_check(CCState, PacketSize, Urgency);
@@ -9649,7 +10063,7 @@ send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSen
             %% per-packet #state{} rebuild in send_app_packet_now is
             %% the largest own-time item on the bulk-send profile.
             FullChunks = byte_size(Data) div MaxChunkSize,
-            BudgetLeft = max(1, State#state.burst_budget - State#state.burst_sent),
+            BudgetLeft = max(1, (State#state.cfg)#conn_cfg.burst_budget - State#state.burst_sent),
             KMax = min(FullChunks, BudgetLeft),
             {K, CCStateK} = approve_more_chunks(
                 NewCCState, PacketSize, Urgency, PacingEnabled, KMax, 1
@@ -10445,10 +10859,14 @@ do_close_stream_deadline(StreamId, ErrorCode, #state{streams = Streams} = State)
     end.
 
 %% Initiate connection close
-initiate_close(Reason, #state{path_validation_timer = PathTimer} = State) ->
+initiate_close(Reason, #state{mig = #mig{path_validation_timer = PathTimer}} = State) ->
     %% Cancel path validation timer if active
     cancel_timer(PathTimer),
-    State1 = State#state{path_validation_timer = undefined, path_validation_token = undefined},
+    State1 = State#state{
+        mig = (State#state.mig)#mig{
+            path_validation_timer = undefined, path_validation_token = undefined
+        }
+    },
     %% Send CONNECTION_CLOSE frame
     {ErrorCode, ReasonPhrase} =
         case Reason of
@@ -10494,11 +10912,15 @@ select_close_level(app, #state{app_keys = AppKeys}) when AppKeys =/= undefined -
     app;
 select_close_level(app, State) ->
     select_close_level(handshake, State);
-select_close_level(handshake, #state{handshake_keys = HSKeys}) when HSKeys =/= undefined ->
+select_close_level(handshake, #state{hs = #hs{handshake_keys = HSKeys}}) when
+    HSKeys =/= undefined
+->
     handshake;
 select_close_level(handshake, State) ->
     select_close_level(initial, State);
-select_close_level(initial, #state{initial_keys = InitKeys}) when InitKeys =/= undefined ->
+select_close_level(initial, #state{hs = #hs{initial_keys = InitKeys}}) when
+    InitKeys =/= undefined
+->
     initial;
 select_close_level(_, _) ->
     none.
@@ -10611,15 +11033,15 @@ normalize_verify(_) -> true.
 %% authentication succeeds; on failure we close from `State' so the
 %% catch-all ignores the trailing Finished.
 verify_server_authentication(Body, TranscriptHash, Advance, State) ->
-    PeerCert = State#state.peer_cert,
+    PeerCert = (State#state.hs)#hs.peer_cert,
     case quic_tls:verify_certificate_verify(Body, PeerCert, TranscriptHash, server) of
         true ->
             case
                 quic_cert:validate_server(
                     PeerCert,
-                    State#state.peer_cert_chain,
-                    State#state.cacerts,
-                    State#state.server_name
+                    (State#state.hs)#hs.peer_cert_chain,
+                    (State#state.cfg)#conn_cfg.cacerts,
+                    (State#state.hs)#hs.server_name
                 )
             of
                 ok ->
@@ -10662,7 +11084,7 @@ check_timeouts(State) ->
     Now = erlang:monotonic_time(millisecond),
     TimeSinceActivity = Now - State#state.last_activity,
     if
-        TimeSinceActivity > State#state.idle_timeout ->
+        TimeSinceActivity > (State#state.cfg)#conn_cfg.idle_timeout ->
             initiate_close(idle_timeout, State);
         true ->
             State
@@ -10732,14 +11154,15 @@ send_retransmit_frames_cc(Frames, State) ->
 %% is denied, no probe means no ACK, no ACK means loss detection never
 %% runs, and the connection stalls until idle timeout with a full
 %% sent_q. Mode `normal' (loss retransmission) stays subject to cwnd.
-send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = State, Mode) ->
+send_retransmit_frames_cc(Frames, #state{cc_state = CCState} = State, Mode) ->
     %% Encode all frames and check size
     Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
     PacketSize = byte_size(Payload) + 50,
 
     case retransmit_cc_allowed(Mode, CCState, PacketSize) of
         true ->
-            send_app_packet_internal(Payload, Frames, State#state{retransmits = R + 1});
+            bump(?C_RETRANSMITS, 1, State),
+            send_app_packet_internal(Payload, Frames, State);
         false ->
             %% CC doesn't allow yet. detect_lost_packets/2 already pulled these
             %% frames out of sent_q, so PTO would not retry them. Track them so
@@ -10925,7 +11348,7 @@ handle_loss_timeout(#state{loss_state = LossState, pto_space = Space} = State) -
     {NewLossState, Lost} = quic_loss:detect_lost_packets(Space, LossState, LargestAcked),
     State1 = State#state{loss_state = NewLossState},
     State2 = apply_lost_packets(Space, Lost, State1),
-    flush_dirty_timers(flush_socket_batch(State2#state{pto_dirty = true})).
+    flush_event(State2#state{pto_dirty = true}, event).
 
 %% The congestion response, the retransmission and the qlog record that
 %% follow a loss, wherever it was declared.
@@ -10937,7 +11360,7 @@ apply_lost_packets(Space, Lost, #state{cc_state = CCState, loss_state = LossStat
     NewCC = cc_after_loss(CCState, LostBytes, LargestLostSentTime, undefined, Lost, LossState),
     lists:foreach(
         fun(#sent_packet{pn = LostPN}) ->
-            ?QLOG_EMIT_PACKET_LOST(State#state.qlog_ctx, #{
+            ?QLOG_EMIT_PACKET_LOST((State#state.cfg)#conn_cfg.qlog_ctx, #{
                 packet_number => LostPN, reason => timeout
             })
         end,
@@ -10958,8 +11381,8 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
     %% confirmation it could not even decrypt it. RFC 9002 Section 7
     %% exempts it from the congestion window, which is what stops a
     %% blocked connection deadlocking on its own.
-    Probing = send_probe_packet(Space, State1#state{hs_probe = true}),
-    State2 = Probing#state{hs_probe = false},
+    Probing = send_probe_packet(Space, State1#state{hs = (State1#state.hs)#hs{hs_probe = true}}),
+    State2 = Probing#state{hs = (Probing#state.hs)#hs{hs_probe = false}},
 
     %% Probes use the control allowance, so retry any CC-deferred control
     %% retransmits here too (they are not in sent_q for the probe to pick up).
@@ -10967,7 +11390,7 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
     State2b = complete_send_reset_at(State2a),
 
     %% Flush immediately - probe packets and timers must not be batched
-    State3 = flush_dirty_timers(flush_socket_batch(State2b)),
+    State3 = flush_event(State2b, event),
 
     %% Set new PTO timer
     set_pto_timer(State3).
@@ -11040,11 +11463,26 @@ send_keep_alive_ping(State) ->
 %% tolerance costs a cancel. Bulk transfers touched the PTO on every
 %% packet, and cancel_timer + send_after per packet was a measurable
 %% share of the server receive path on small hosts.
-set_pto_timer(
+set_pto_timer(State) ->
+    {Timer, ArmedAt, ScheduledAt, Space, Kind} = pto_plan(State),
+    State#state{
+        pto_timer = Timer,
+        pto_armed_at = ArmedAt,
+        pto_scheduled_at = ScheduledAt,
+        pto_space = Space,
+        pto_kind = Kind,
+        pto_dirty = false
+    }.
+
+%% The PTO fields set_pto_timer/1 stores, cancelling or arming the timer
+%% as needed: {Timer, ArmedAt, ScheduledAt, Space, Kind}.
+pto_plan(
     #state{
         loss_state = LossState,
         pto_timer = OldTimer,
-        pto_armed_at = ArmedAt
+        pto_armed_at = ArmedAt,
+        pto_space = OldSpace,
+        pto_kind = OldKind
     } = State
 ) ->
     Now = erlang:monotonic_time(millisecond),
@@ -11063,28 +11501,23 @@ set_pto_timer(
     case Selected of
         {Kind, Deadline, Space} ->
             PTO = max(0, Deadline - Now),
-            SameSpace = (Space =:= State#state.pto_space),
-            Same = SameSpace andalso Kind =:= State#state.pto_kind,
+            Same = (Space =:= OldSpace) andalso (Kind =:= OldKind),
             case
                 OldTimer =/= undefined andalso Same andalso
                     Deadline + ?PTO_RESET_TOLERANCE_MS >= ArmedAt
             of
                 true ->
-                    State#state{pto_scheduled_at = Deadline};
+                    {OldTimer, ArmedAt, Deadline, OldSpace, OldKind};
                 false ->
                     cancel_timer(OldTimer),
-                    arm_pto_timer(
-                        PTO,
-                        State#state{
-                            pto_scheduled_at = Deadline, pto_space = Space, pto_kind = Kind
-                        }
-                    )
+                    {Ref, NewArmedAt} = start_pto_timer(PTO),
+                    {Ref, NewArmedAt, Deadline, Space, Kind}
             end;
         none ->
             cancel_timer(OldTimer),
-            State#state{pto_timer = undefined, pto_scheduled_at = undefined};
+            {undefined, ArmedAt, undefined, OldSpace, OldKind};
         _ ->
-            State#state{pto_scheduled_at = undefined}
+            {OldTimer, ArmedAt, undefined, OldSpace, OldKind}
     end.
 
 pto_selection(LossState, Now, State) ->
@@ -11095,8 +11528,10 @@ pto_selection(LossState, Now, State) ->
 
 %% A server has to stop at three times what it has received from an
 %% unvalidated address (RFC 9000 Section 8.1).
-amplification_blocked(#state{role = server, address_validated = false} = State) ->
-    State#state.amp_tx >= 3 * State#state.amp_rx;
+amplification_blocked(
+    #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
+) ->
+    (State#state.hs)#hs.amp_tx >= 3 * (State#state.hs)#hs.amp_rx;
 amplification_blocked(_State) ->
     false.
 
@@ -11104,20 +11539,24 @@ amplification_blocked(_State) ->
 %% peer validates its address implicitly, so the predicate is constant
 %% there; a client learns it from a Handshake acknowledgement or from
 %% confirmation.
-handshake_status(#state{role = server}) ->
+handshake_status(#state{cfg = #conn_cfg{role = server}}) ->
     #handshake_status{has_handshake_keys = true, peer_completed_address_validation = true};
-handshake_status(#state{handshake_keys = HSKeys, loss_state = LossState} = State) ->
+handshake_status(#state{loss_state = LossState, hs = #hs{handshake_keys = HSKeys}} = State) ->
     #handshake_status{
         has_handshake_keys = HSKeys =/= undefined,
         peer_completed_address_validation =
-            State#state.handshake_ack_received orelse
+            (State#state.hs)#hs.handshake_ack_received orelse
                 quic_loss:handshake_confirmed(LossState)
     }.
 
 arm_pto_timer(Delay, State) ->
+    {Ref, ArmedAt} = start_pto_timer(Delay),
+    State#state{pto_timer = Ref, pto_armed_at = ArmedAt}.
+
+start_pto_timer(Delay) ->
     Ref = make_ref(),
     erlang:send_after(Delay, self(), {pto_timeout, Ref}),
-    State#state{pto_timer = Ref, pto_armed_at = erlang:monotonic_time(millisecond) + Delay}.
+    {Ref, erlang:monotonic_time(millisecond) + Delay}.
 
 %% What a firing PTO timer should do: nothing (flight drained since it
 %% was armed), wait the remainder (deadline moved later), or probe.
@@ -11153,10 +11592,12 @@ handle_pacing_timeout(State0) ->
             0 -> State;
             _ -> maybe_reschedule_pacing(process_send_queue(State))
         end,
-    flush_dirty_timers(flush_socket_batch(Processed)).
+    flush_event(Processed, event).
 
 %% Check if we need to reschedule pacing timer after processing queue
-maybe_reschedule_pacing(#state{send_queue = PQ, cc_state = CCState, pacing_enabled = true} = State) ->
+maybe_reschedule_pacing(
+    #state{send_queue = PQ, cc_state = CCState, cfg = #conn_cfg{pacing_enabled = true}} = State
+) ->
     case quic_pqueue:is_empty(PQ) of
         true ->
             State;
@@ -11190,10 +11631,12 @@ maybe_reschedule_pacing(State) ->
 
 %% Set idle timer based on idle_timeout configuration
 %% Uses unique reference in message to detect stale timer events
-set_idle_timer(#state{idle_timeout = 0} = State) ->
+set_idle_timer(#state{cfg = #conn_cfg{idle_timeout = 0}} = State) ->
     State#state{idle_timer = undefined};
 set_idle_timer(
-    #state{idle_timeout = Timeout, idle_timer = OldTimer, last_activity = LastActivity} = State
+    #state{
+        idle_timer = OldTimer, last_activity = LastActivity, cfg = #conn_cfg{idle_timeout = Timeout}
+    } = State
 ) ->
     cancel_timer(OldTimer),
     %% Lazy re-arm: fire when the connection would actually be idle for
@@ -11232,9 +11675,9 @@ query_local_addr(Socket) ->
         {error, _} -> undefined
     end.
 
-disconnect_timeout_expired(#state{disconnect_timeout = infinity}) ->
+disconnect_timeout_expired(#state{cfg = #conn_cfg{disconnect_timeout = infinity}}) ->
     false;
-disconnect_timeout_expired(#state{disconnect_timeout = DT, loss_state = LossState}) ->
+disconnect_timeout_expired(#state{loss_state = LossState, cfg = #conn_cfg{disconnect_timeout = DT}}) ->
     quic_loss:bytes_in_flight(LossState) > 0 andalso
         case quic_loss:last_progress(LossState) of
             undefined ->
@@ -11268,9 +11711,11 @@ cancel_disconnect_timer(#state{disconnect_timer = Ref} = State) ->
 %% timer: a fire that finds the deadline moved re-arms the remainder.
 %% The delay is never zero, so this cannot spin the way a re-arm derived
 %% from a stale timestamp would.
-arm_disconnect_timer(#state{disconnect_timeout = infinity} = State) ->
+arm_disconnect_timer(#state{cfg = #conn_cfg{disconnect_timeout = infinity}} = State) ->
     cancel_disconnect_timer(State);
-arm_disconnect_timer(#state{disconnect_timeout = DT, loss_state = LossState} = State) ->
+arm_disconnect_timer(
+    #state{loss_state = LossState, cfg = #conn_cfg{disconnect_timeout = DT}} = State
+) ->
     Delay =
         case quic_loss:last_progress(LossState) of
             undefined ->
@@ -11307,12 +11752,14 @@ calculate_keep_alive_interval(Opts, IdleTimeout) ->
 
 %% Set keep-alive timer
 %% Uses unique reference in message to detect stale timer events
-set_keep_alive_timer(#state{keep_alive_interval = disabled} = State) ->
+set_keep_alive_timer(#state{cfg = #conn_cfg{keep_alive_interval = disabled}} = State) ->
     State#state{keep_alive_timer = undefined};
 set_keep_alive_timer(
     #state{
-        keep_alive_interval = Interval,
-        last_activity = LastActivity
+        last_activity = LastActivity,
+        cfg = #conn_cfg{
+            keep_alive_interval = Interval
+        }
     } = State
 ) ->
     %% Lazy re-arm against last_activity (same model as the idle timer):
@@ -11321,7 +11768,7 @@ set_keep_alive_timer(
     arm_keep_alive_timer(State, max(0, (LastActivity + Interval) - Now)).
 
 %% Arm the keep-alive timer with an explicit delay.
-arm_keep_alive_timer(#state{keep_alive_interval = disabled} = State, _Delay) ->
+arm_keep_alive_timer(#state{cfg = #conn_cfg{keep_alive_interval = disabled}} = State, _Delay) ->
     State#state{keep_alive_timer = undefined};
 arm_keep_alive_timer(#state{keep_alive_timer = OldTimer} = State, Delay) ->
     cancel_timer(OldTimer),
@@ -11350,7 +11797,7 @@ maybe_set_pacing_timer(Delay, #state{pacing_timer = undefined} = State) ->
     State#state{pacing_timer = Ref}.
 
 %% Burst budget: bounds packets emitted per drain (see burst_budget).
-burst_exhausted(#state{burst_sent = Sent, burst_budget = Budget}) ->
+burst_exhausted(#state{burst_sent = Sent, cfg = #conn_cfg{burst_budget = Budget}}) ->
     Sent >= Budget.
 
 %% Arm a zero-delay pacing continuation so the queued remainder is
@@ -11370,11 +11817,11 @@ arm_burst_continuation(State) ->
 %% Convert state to map for debugging
 state_to_map(#state{} = S) ->
     #{
-        scid => S#state.scid,
+        scid => (S#state.cfg)#conn_cfg.scid,
         dcid => S#state.dcid,
-        role => S#state.role,
+        role => (S#state.cfg)#conn_cfg.role,
         version => S#state.version,
-        tls_state => S#state.tls_state,
+        tls_state => (S#state.hs)#hs.tls_state,
         alpn => S#state.alpn,
         streams => maps:size(S#state.streams),
         data_sent => S#state.data_sent,
@@ -11391,7 +11838,7 @@ state_to_map(#state{} = S) ->
         max_data_local => S#state.max_data_local,
         fc_last_stream_update => S#state.fc_last_stream_update,
         fc_last_conn_update => S#state.fc_last_conn_update,
-        fc_max_receive_window => S#state.fc_max_receive_window,
+        fc_max_receive_window => (S#state.cfg)#conn_cfg.fc_max_receive_window,
         idle_timer_armed => S#state.idle_timer =/= undefined,
         keep_alive_timer_armed => S#state.keep_alive_timer =/= undefined,
         %% CID rotation observability: local_cid_count includes sequence 0,
@@ -11457,22 +11904,27 @@ normalize_alpn_list(_) ->
 %% and force a key update before it is reached (RFC 9001 §6.6). Only the
 %% first over-limit packet in an idle phase triggers the update; the
 %% counter resets when the new phase begins.
-maybe_force_key_update(State) ->
-    maybe_force_key_update(State, 1).
-
 %% N packets at once, for the chunk-run sender.
 maybe_force_key_update(#state{key_state = undefined} = State, _N) ->
     State;
 maybe_force_key_update(#state{key_state = KeyState} = State, N) ->
+    {NewKeyState, KeyLimit} = count_sealed(KeyState, N),
+    after_sealed(KeyLimit, State#state{key_state = NewKeyState}).
+
+%% The key state with N more packets sealed, and whether that reached the
+%% confidentiality limit with no update in progress.
+count_sealed(undefined, _N) ->
+    {undefined, false};
+count_sealed(KeyState, N) ->
     NewCount = KeyState#key_update_state.send_count + N,
-    State1 = State#state{key_state = KeyState#key_update_state{send_count = NewCount}},
-    case
+    {
+        KeyState#key_update_state{send_count = NewCount},
         NewCount >= ?AEAD_CONFIDENTIALITY_LIMIT andalso
             KeyState#key_update_state.update_state =:= idle
-    of
-        true -> initiate_key_update(State1);
-        false -> State1
-    end.
+    }.
+
+after_sealed(true, State) -> initiate_key_update(State);
+after_sealed(false, State) -> State.
 
 initiate_key_update(#state{key_state = KeyState} = State) ->
     #key_update_state{
@@ -11675,7 +12127,11 @@ start_path_probe(RemoteAddr, State) ->
                 dcid = DCID,
                 dcid_seq = Seq
             },
-            State1 = State0#state{alt_paths = [PathState | State0#state.alt_paths]},
+            State1 = State0#state{
+                mig = (State0#state.mig)#mig{
+                    alt_paths = [PathState | (State0#state.mig)#mig.alt_paths]
+                }
+            },
             {ok, send_path_challenge(RemoteAddr, ChallengeData, DCID, State1), DCID, Seq};
         none ->
             none
@@ -11738,8 +12194,10 @@ send_path_challenge(
     DCID,
     #state{
         app_keys = AppKeys,
-        role = Role,
-        pn_app = PNSpace
+        pn_app = PNSpace,
+        cfg = #conn_cfg{
+            role = Role
+        }
     } = State
 ) ->
     %% Check we have app keys for encryption
@@ -11805,8 +12263,10 @@ send_path_response_to_addr(
     #state{
         dcid = DCID,
         app_keys = AppKeys,
-        role = Role,
-        pn_app = PNSpace
+        pn_app = PNSpace,
+        cfg = #conn_cfg{
+            role = Role
+        }
     } = State
 ) ->
     case AppKeys of
@@ -11855,7 +12315,7 @@ send_path_response_to_addr(
 %% @doc Update bytes_sent for anti-amplification tracking on a path.
 -spec update_path_bytes_sent(inet:ip_address(), inet:port_number(), non_neg_integer(), #state{}) ->
     #state{}.
-update_path_bytes_sent(IP, Port, Bytes, #state{alt_paths = AltPaths} = State) ->
+update_path_bytes_sent(IP, Port, Bytes, #state{mig = #mig{alt_paths = AltPaths}} = State) ->
     NewAltPaths = lists:map(
         fun
             (#path_state{remote_addr = {PathIP, PathPort}} = PS) when
@@ -11867,7 +12327,7 @@ update_path_bytes_sent(IP, Port, Bytes, #state{alt_paths = AltPaths} = State) ->
         end,
         AltPaths
     ),
-    State#state{alt_paths = NewAltPaths}.
+    State#state{mig = (State#state.mig)#mig{alt_paths = NewAltPaths}}.
 
 %% @doc Initiate path validation for server's preferred address (RFC 9000 Section 9.6).
 %% Client validates the preferred address before migrating to it.
@@ -11881,13 +12341,15 @@ initiate_preferred_address_validation(
     State1 =
         case quic_cid:add_preferred_address_cid(State#state.cid_pool_state, CID, Token) of
             {ok, NewPool} ->
-                State#state{cid_pool_state = NewPool, preferred_address = PA};
+                State#state{
+                    cid_pool_state = NewPool, mig = (State#state.mig)#mig{preferred_address = PA}
+                };
             {error, Reason} ->
                 ?LOG_DEBUG(
                     #{what => preferred_address_cid_rejected, reason => Reason},
                     ?QUIC_LOG_META
                 ),
-                State#state{preferred_address = PA}
+                State#state{mig = (State#state.mig)#mig{preferred_address = PA}}
         end,
     %% Choose address - prefer IPv6 over IPv4
     case select_preferred_addr(PA) of
@@ -11929,9 +12391,9 @@ rebind_socket(OldSocket, Family) ->
 %% socket paths pick up a fresh local port without the other path's
 %% primitives crashing on the wrong handle.
 -spec rebind_client_socket(#state{}) -> {ok, #state{}} | {error, term()}.
-rebind_client_socket(#state{client_socket_backend = socket} = State) ->
+rebind_client_socket(#state{cfg = #conn_cfg{client_socket_backend = socket}} = State) ->
     rebind_client_socket_otp(State);
-rebind_client_socket(#state{client_socket_backend = adapter}) ->
+rebind_client_socket(#state{cfg = #conn_cfg{client_socket_backend = adapter}}) ->
     %% Connection migration via fresh local UDP port has no analogue
     %% when the transport is a caller-supplied adapter.
     {error, not_supported_on_adapter};
@@ -12042,7 +12504,9 @@ maybe_handle_address_change(RemoteAddr, _Data, #state{remote_addr = RemoteAddr} 
 %% RFC 9000 Section 18.2: disable_active_migration only means the RECEIVER should
 %% not migrate to a new local address. It does NOT mean ignore peer address changes.
 %% The check for peer_disable_migration is correctly placed in migrate/1 API only.
-maybe_handle_address_change(NewAddr, DataSize, #state{migration_state = validating_peer} = State) ->
+maybe_handle_address_change(
+    NewAddr, DataSize, #state{mig = #mig{migration_state = validating_peer}} = State
+) ->
     %% Already validating a path - update bytes received for anti-amplification
     update_pending_path_bytes_received(NewAddr, DataSize, State);
 maybe_handle_address_change(NewAddr, DataSize, State) ->
@@ -12074,12 +12538,13 @@ maybe_handle_address_change(NewAddr, DataSize, State) ->
 update_pending_path_bytes_received(
     NewAddr,
     Size,
-    #state{pending_peer_validation = #path_state{remote_addr = NewAddr} = PathState} = State
+    #state{mig = #mig{pending_peer_validation = #path_state{remote_addr = NewAddr} = PathState}} =
+        State
 ) ->
     NewPath = PathState#path_state{
         bytes_received = PathState#path_state.bytes_received + Size
     },
-    State#state{pending_peer_validation = NewPath};
+    State#state{mig = (State#state.mig)#mig{pending_peer_validation = NewPath}};
 update_pending_path_bytes_received(_NewAddr, _Size, State) ->
     %% Address doesn't match pending validation
     State.
@@ -12140,9 +12605,11 @@ initiate_peer_path_validation(NewAddr, IsNATRebinding, DataSize, State0) ->
     %% packet re-triggers).
     State1 = State#state{
         remote_addr = NewAddr,
-        pending_peer_validation = NewPathState,
-        old_path_validation = OldPathState,
-        migration_state = validating_peer
+        mig = (State#state.mig)#mig{
+            pending_peer_validation = NewPathState,
+            old_path_validation = OldPathState,
+            migration_state = validating_peer
+        }
     },
 
     %% Send PATH_CHALLENGE to both addresses, each under its own path's CID
@@ -12170,14 +12637,14 @@ send_path_challenge_to_old_addr(Addr, ChallengeData, State) ->
     %% Reuse existing send_path_challenge logic
     State1 = send_path_challenge(Addr, ChallengeData, State),
     %% Update old path bytes_sent for tracking
-    case State1#state.old_path_validation of
+    case (State1#state.mig)#mig.old_path_validation of
         #path_state{} = PathState ->
             % Padded probe packet
             PacketSize = 1200,
             NewPath = PathState#path_state{
                 bytes_sent = PathState#path_state.bytes_sent + PacketSize
             },
-            State1#state{old_path_validation = NewPath};
+            State1#state{mig = (State1#state.mig)#mig{old_path_validation = NewPath}};
         undefined ->
             State1
     end.
@@ -12194,14 +12661,14 @@ send_path_challenge_to_addr(Addr, ChallengeData, DCID, State) ->
     %% Reuse existing send_path_challenge logic
     State1 = send_path_challenge(Addr, ChallengeData, DCID, State),
     %% Update pending path bytes_sent for anti-amplification
-    case State1#state.pending_peer_validation of
+    case (State1#state.mig)#mig.pending_peer_validation of
         #path_state{} = PathState ->
             %% Estimate packet size (short header + PATH_CHALLENGE frame)
             PacketSize = 50,
             NewPath = PathState#path_state{
                 bytes_sent = PathState#path_state.bytes_sent + PacketSize
             },
-            State1#state{pending_peer_validation = NewPath};
+            State1#state{mig = (State1#state.mig)#mig{pending_peer_validation = NewPath}};
         undefined ->
             State1
     end.
@@ -12212,7 +12679,7 @@ send_path_challenge_to_addr(Addr, ChallengeData, DCID, State) ->
 %% allowing stale timeouts from canceled validations to be ignored.
 -spec start_path_validation_timer(#state{}) -> #state{}.
 start_path_validation_timer(
-    #state{loss_state = LossState, path_validation_timer = OldTimer} = State
+    #state{loss_state = LossState, mig = #mig{path_validation_timer = OldTimer}} = State
 ) ->
     %% Cancel any existing timer
     cancel_timer(OldTimer),
@@ -12226,14 +12693,16 @@ start_path_validation_timer(
     ValidationToken = make_ref(),
     TimerRef = erlang:send_after(Timeout, self(), {path_validation_timeout, ValidationToken}),
     State#state{
-        path_validation_timer = TimerRef,
-        path_validation_token = ValidationToken
+        mig = (State#state.mig)#mig{
+            path_validation_timer = TimerRef,
+            path_validation_token = ValidationToken
+        }
     }.
 
 %% @doc Handle path validation timeout.
 %% RFC 9000 Section 8.2.4: Validation fails after timeout, stay on current path.
 -spec handle_path_validation_timeout(#state{}) -> {keep_state, #state{}}.
-handle_path_validation_timeout(#state{pending_peer_validation = PathState} = State) ->
+handle_path_validation_timeout(#state{mig = #mig{pending_peer_validation = PathState}} = State) ->
     %% Mark path as failed, stay on current path
     case PathState of
         #path_state{challenge_count = Count} when Count < 3 ->
@@ -12243,7 +12712,9 @@ handle_path_validation_timeout(#state{pending_peer_validation = PathState} = Sta
                 challenge_data = ChallengeData,
                 challenge_count = Count + 1
             },
-            State1 = State#state{pending_peer_validation = NewPathState},
+            State1 = State#state{
+                mig = (State#state.mig)#mig{pending_peer_validation = NewPathState}
+            },
             State2 = send_path_challenge_to_addr(
                 PathState#path_state.remote_addr,
                 ChallengeData,
@@ -12257,11 +12728,13 @@ handle_path_validation_timeout(#state{pending_peer_validation = PathState} = Sta
             %% appeared on a path is spent: it is retired rather than
             %% returned to the pool (RFC 9000 Section 9.5).
             State1 = State#state{
-                pending_peer_validation = undefined,
-                old_path_validation = undefined,
-                migration_state = idle,
-                path_validation_timer = undefined,
-                path_validation_token = undefined
+                mig = (State#state.mig)#mig{
+                    pending_peer_validation = undefined,
+                    old_path_validation = undefined,
+                    migration_state = idle,
+                    path_validation_timer = undefined,
+                    path_validation_token = undefined
+                }
             },
             {keep_state, retire_abandoned_path_cid(PathState, State1)}
     end.
@@ -12289,14 +12762,16 @@ handle_path_response(ResponseData, State) ->
             State1;
         no_match ->
             %% Check alt_paths (client validating paths)
-            case find_path_by_challenge(ResponseData, State#state.alt_paths) of
+            case find_path_by_challenge(ResponseData, (State#state.mig)#mig.alt_paths) of
                 {ok, PathState, OtherPaths} ->
                     %% Mark path as validated
                     ValidatedPath = PathState#path_state{
                         status = validated,
                         challenge_data = undefined
                     },
-                    State1 = State#state{alt_paths = [ValidatedPath | OtherPaths]},
+                    State1 = State#state{
+                        mig = (State#state.mig)#mig{alt_paths = [ValidatedPath | OtherPaths]}
+                    },
                     %% Check if this is a preferred address validation - auto-migrate
                     maybe_migrate_to_preferred_address(ValidatedPath, State1);
                 not_found ->
@@ -12323,21 +12798,25 @@ handle_path_response(ResponseData, State) ->
     | no_match.
 check_peer_validation_response(ResponseData, State) ->
     %% Check new path (pending_peer_validation)
-    case State#state.pending_peer_validation of
+    case (State#state.mig)#mig.pending_peer_validation of
         #path_state{challenge_data = ResponseData} = PendingPath ->
             %% New path validated
             ValidatedPath = PendingPath#path_state{status = validated, challenge_data = undefined},
-            State1 = State#state{pending_peer_validation = ValidatedPath},
+            State1 = State#state{
+                mig = (State#state.mig)#mig{pending_peer_validation = ValidatedPath}
+            },
             {new_path_validated, ValidatedPath, State1};
         _ ->
             %% Check old path
-            case State#state.old_path_validation of
+            case (State#state.mig)#mig.old_path_validation of
                 #path_state{challenge_data = ResponseData} = OldPath ->
                     %% Old path validated - confirms peer is real (anti-spoofing signal)
                     ValidatedOldPath = OldPath#path_state{
                         status = validated, challenge_data = undefined
                     },
-                    State1 = State#state{old_path_validation = ValidatedOldPath},
+                    State1 = State#state{
+                        mig = (State#state.mig)#mig{old_path_validation = ValidatedOldPath}
+                    },
                     {old_path_validated, State1};
                 _ ->
                     no_match
@@ -12357,7 +12836,7 @@ decide_migration_after_new_path_validated(ValidatedNewPath, State) ->
 %% @doc Handle successful peer path validation (server accepting client's new address).
 %% RFC 9000 Section 9: Complete migration to the validated peer address.
 -spec handle_peer_path_validated(#path_state{}, #state{}) -> #state{}.
-handle_peer_path_validated(PendingPath, #state{path_validation_timer = Timer} = State) ->
+handle_peer_path_validated(PendingPath, #state{mig = #mig{path_validation_timer = Timer}} = State) ->
     %% Cancel validation timer
     cancel_timer(Timer),
     %% RFC 9000 Section 9.5: the path already probed under its own CID, so
@@ -12375,22 +12854,28 @@ handle_peer_path_validated(PendingPath, #state{path_validation_timer = Timer} = 
     State2 = retire_replaced_dcid(OldDCID, NewDCID, complete_migration(ValidatedPath, State1)),
     %% Clear pending validation state including old path validation
     State2#state{
-        pending_peer_validation = undefined,
-        old_path_validation = undefined,
-        migration_state = idle,
-        path_validation_timer = undefined,
-        path_validation_token = undefined
+        mig = (State2#state.mig)#mig{
+            pending_peer_validation = undefined,
+            old_path_validation = undefined,
+            migration_state = idle,
+            path_validation_timer = undefined,
+            path_validation_token = undefined
+        }
     }.
 
 %% @doc Auto-migrate to preferred address if the validated path matches.
 %% RFC 9000 Section 9.6: Client SHOULD migrate to validated preferred address.
 -spec maybe_migrate_to_preferred_address(#path_state{}, #state{}) -> #state{}.
-maybe_migrate_to_preferred_address(ValidatedPath, #state{preferred_address = undefined} = State) ->
+maybe_migrate_to_preferred_address(
+    ValidatedPath, #state{mig = #mig{preferred_address = undefined}} = State
+) ->
     %% No preferred address, just return
-    State#state{alt_paths = [ValidatedPath | State#state.alt_paths]};
+    State#state{
+        mig = (State#state.mig)#mig{alt_paths = [ValidatedPath | (State#state.mig)#mig.alt_paths]}
+    };
 maybe_migrate_to_preferred_address(
     #path_state{remote_addr = RemoteAddr} = ValidatedPath,
-    #state{preferred_address = PA} = State
+    #state{mig = #mig{preferred_address = PA}} = State
 ) ->
     %% Check if validated path matches the preferred address
     case is_preferred_address_path(RemoteAddr, PA) of
@@ -12401,7 +12886,7 @@ maybe_migrate_to_preferred_address(
             %% Switch CID BEFORE sending any packets (including PMTU probes)
             State2 = switch_to_preferred_cid(PA, State1),
             %% Clear the preferred_address field since migration is complete
-            State3 = State2#state{preferred_address = undefined},
+            State3 = State2#state{mig = (State2#state.mig)#mig{preferred_address = undefined}},
             %% Now start PMTU probing on the new path with correct CID
             maybe_send_pmtu_probe(State3);
         false ->
@@ -12470,9 +12955,11 @@ complete_migration(
     State#state{
         remote_addr = NewPath#path_state.remote_addr,
         current_path = NewPath,
-        alt_paths = lists:delete(NewPath, State#state.alt_paths),
-        migration_state = idle,
-        pending_peer_validation = undefined
+        mig = (State#state.mig)#mig{
+            alt_paths = lists:delete(NewPath, (State#state.mig)#mig.alt_paths),
+            migration_state = idle,
+            pending_peer_validation = undefined
+        }
     };
 %% Active migration: reset CC, loss, and PMTU (different network path)
 %% RFC 9002 Section 9.4: Reset congestion state on path change
@@ -12517,14 +13004,16 @@ complete_migration(
     State#state{
         remote_addr = NewPath#path_state.remote_addr,
         current_path = NewPath,
-        alt_paths = lists:delete(NewPath, State#state.alt_paths),
         pmtu_state = NewPMTUState,
         pmtu_probe_timer = undefined,
         pmtu_raise_timer = undefined,
         %% Reset CC and loss detection for new path
         cc_state = NewCCState,
         loss_state = NewLossState,
-        pto_dirty = true
+        pto_dirty = true,
+        mig = (State#state.mig)#mig{
+            alt_paths = lists:delete(NewPath, (State#state.mig)#mig.alt_paths)
+        }
     };
 complete_migration(_, State) ->
     %% Can only migrate to validated paths
@@ -12610,7 +13099,7 @@ issue_new_connection_ids(#state{cid_pool_state = Pool} = State) ->
 issue_cids(0, State) ->
     State;
 issue_cids(N, #state{cid_pool_state = Pool} = State) when N > 0 ->
-    {NewPool, Issued} = quic_cid:issue(Pool, N, State#state.stateless_reset_secret),
+    {NewPool, Issued} = quic_cid:issue(Pool, N, (State#state.cfg)#conn_cfg.stateless_reset_secret),
     State1 = State#state{cid_pool_state = NewPool},
     lists:foldl(
         fun({SeqNum, CID, Token}, Acc) ->
@@ -12629,12 +13118,16 @@ local_active_limit(#state{cid_pool_state = Pool}) ->
 %% Server connections route through the listener's shared socket, so a
 %% newly issued CID must be added to the listener's routing table. Client
 %% connections own their socket and route locally, so this is a no-op.
-maybe_register_cid(CID, #state{role = server, listener = Listener}) when is_pid(Listener) ->
+maybe_register_cid(CID, #state{cfg = #conn_cfg{role = server, listener = Listener}}) when
+    is_pid(Listener)
+->
     quic_listener:register_cid(Listener, CID, self());
 maybe_register_cid(_CID, _State) ->
     ok.
 
-maybe_retire_cid(CID, #state{role = server, listener = Listener}) when is_pid(Listener) ->
+maybe_retire_cid(CID, #state{cfg = #conn_cfg{role = server, listener = Listener}}) when
+    is_pid(Listener)
+->
     quic_listener:retire_cid(Listener, CID);
 maybe_retire_cid(_CID, _State) ->
     ok.
@@ -12670,7 +13163,7 @@ next_conn_max_data(DataReceived, MaxDataLocal, MaxWindow, InitialWindow, false) 
 %% stateless reset for a CID whose per-connection state it no longer
 %% holds. Without a secret we fall back to per-CID random bytes.
 -spec generate_stateless_reset_token(binary(), #state{}) -> binary().
-generate_stateless_reset_token(CID, #state{stateless_reset_secret = Secret}) ->
+generate_stateless_reset_token(CID, #state{cfg = #conn_cfg{stateless_reset_secret = Secret}}) ->
     quic_cid:generate_reset_token(CID, Secret).
 
 %% RFC 9000 §8.1.3 server-side issuance. A NEW_TOKEN frame binds the
@@ -12679,15 +13172,17 @@ generate_stateless_reset_token(CID, #state{stateless_reset_secret = Secret}) ->
 %% Requires a token secret; reuses the same listener-wide secret as
 %% stateless reset to avoid spawning a second knob. Only emitted on
 %% server-role connections that reached the connected state.
-maybe_send_new_token(#state{role = client} = State) ->
+maybe_send_new_token(#state{cfg = #conn_cfg{role = client}} = State) ->
     State;
-maybe_send_new_token(#state{stateless_reset_secret = undefined} = State) ->
+maybe_send_new_token(#state{cfg = #conn_cfg{stateless_reset_secret = undefined}} = State) ->
     State;
 maybe_send_new_token(
     #state{
-        role = server,
-        stateless_reset_secret = Secret,
-        remote_addr = Addr
+        remote_addr = Addr,
+        cfg = #conn_cfg{
+            role = server,
+            stateless_reset_secret = Secret
+        }
     } = State
 ) ->
     Token = quic_address_token:encode_new_token(
@@ -12703,17 +13198,19 @@ maybe_send_new_token(
 %% doesn't yet retry, so validation outcomes only surface in logs.
 maybe_validate_initial_token(<<>>, _State) ->
     no_token;
-maybe_validate_initial_token(_Token, #state{role = client}) ->
+maybe_validate_initial_token(_Token, #state{cfg = #conn_cfg{role = client}}) ->
     no_token;
-maybe_validate_initial_token(_Token, #state{address_validated = true}) ->
+maybe_validate_initial_token(_Token, #state{hs = #hs{address_validated = true}}) ->
     %% Listener already ran the full token check. Skipping here avoids
     %% duplicating the HMAC verify on the hot path.
     validated;
-maybe_validate_initial_token(_Token, #state{stateless_reset_secret = undefined}) ->
+maybe_validate_initial_token(_Token, #state{cfg = #conn_cfg{stateless_reset_secret = undefined}}) ->
     no_token;
 maybe_validate_initial_token(Token, #state{
-    stateless_reset_secret = Secret,
-    remote_addr = Addr
+    remote_addr = Addr,
+    cfg = #conn_cfg{
+        stateless_reset_secret = Secret
+    }
 }) ->
     case quic_address_token:decode(Secret, Token) of
         {ok, #{addr := TokAddr} = Decoded} when TokAddr =/= Addr ->
@@ -12733,13 +13230,17 @@ maybe_validate_initial_token(Token, #state{
 %% - original_destination_connection_id (server only) must match original DCID
 %% - retry_source_connection_id (if Retry used) must match Retry packet SCID
 -spec validate_connection_id_params(map(), #state{}) -> ok | {error, term()}.
-validate_connection_id_params(TransportParams, #state{role = client} = State) ->
+validate_connection_id_params(TransportParams, #state{cfg = #conn_cfg{role = client}} = State) ->
     %% Client validates server's transport params
     #state{
-        original_dcid = OriginalDCID,
         dcid = CurrentDCID,
-        retry_received = RetryReceived,
-        retry_scid = RetrySCID
+        cfg = #conn_cfg{
+            original_dcid = OriginalDCID
+        },
+        hs = #hs{
+            retry_received = RetryReceived,
+            retry_scid = RetrySCID
+        }
     } = State,
 
     %% Server must include original_destination_connection_id matching our original DCID
@@ -12752,7 +13253,7 @@ validate_connection_id_params(TransportParams, #state{role = client} = State) ->
         Other ->
             {error, {original_dcid_mismatch, expected, OriginalDCID, got, Other}}
     end;
-validate_connection_id_params(TransportParams, #state{role = server} = State) ->
+validate_connection_id_params(TransportParams, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% Server validates client's transport params
     #state{dcid = ClientSCID} = State,
 
@@ -12832,7 +13333,7 @@ validate_peer_transport_params(TransportParams, State) ->
             Error
     end.
 
-validate_role_specific_params(TransportParams, #state{role = server}) ->
+validate_role_specific_params(TransportParams, #state{cfg = #conn_cfg{role = server}}) ->
     %% Per RFC 9000 Section 18.2, these parameters MUST NOT be sent by a client.
     ServerOnly = [
         original_dcid,
@@ -12844,7 +13345,7 @@ validate_role_specific_params(TransportParams, #state{role = server}) ->
         [] -> ok;
         [Forbidden | _] -> {error, {forbidden_client_param, Forbidden}}
     end;
-validate_role_specific_params(_TransportParams, #state{role = client}) ->
+validate_role_specific_params(_TransportParams, #state{cfg = #conn_cfg{role = client}}) ->
     ok.
 
 tp_reason_to_binary(Reason) ->
@@ -12932,8 +13433,10 @@ apply_peer_transport_params_internal(TransportParams, State) ->
         max_streams_uni_remote = MaxStreamsUni,
         %% Datagram size limit (RFC 9221)
         max_datagram_frame_size_remote = MaxDatagramFrameSize,
-        %% Migration disabled by peer (RFC 9000 Section 18.2)
-        peer_disable_migration = PeerDisableMigration
+        mig = (State#state.mig)#mig{
+            %% Migration disabled by peer (RFC 9000 Section 18.2)
+            peer_disable_migration = PeerDisableMigration
+        }
     }.
 
 %% The peer's ACK timing, which loss detection needs to read its ACK Delay
@@ -13120,7 +13623,9 @@ set_pmtu_probe_timer(#state{pmtu_probe_timer = OldTimer, loss_state = LossState}
 -spec maybe_set_pmtu_raise_timer(#state{}) -> #state{}.
 maybe_set_pmtu_raise_timer(#state{pmtu_raise_timer = undefined} = State) ->
     Ref = make_ref(),
-    erlang:send_after(State#state.pmtu_raise_interval, self(), {pmtu_raise_timeout, Ref}),
+    erlang:send_after(
+        (State#state.cfg)#conn_cfg.pmtu_raise_interval, self(), {pmtu_raise_timeout, Ref}
+    ),
     State#state{pmtu_raise_timer = Ref};
 maybe_set_pmtu_raise_timer(State) ->
     State.
@@ -13259,7 +13764,7 @@ get_local_max_udp_payload_size(#state{pmtu_state = PMTUState}) ->
 %% delivers for the local address family, since a peer that takes the
 %% parameter at face value and sends more would have it dropped.
 -spec advertised_max_udp_payload_size(#state{}) -> pos_integer().
-advertised_max_udp_payload_size(#state{max_udp_payload_size_local = Size}) when
+advertised_max_udp_payload_size(#state{cfg = #conn_cfg{max_udp_payload_size_local = Size}}) when
     is_integer(Size)
 ->
     Size;

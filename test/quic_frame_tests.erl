@@ -452,3 +452,110 @@ decode_with_trailing_test() ->
     Frame = ping,
     Encoded = <<(quic_frame:encode(Frame))/binary, "trailing data">>,
     ?assertEqual({Frame, <<"trailing data">>}, quic_frame:decode(Encoded)).
+
+%%====================================================================
+%% Hot frames decoded in place: every varint width, every truncation
+%%====================================================================
+
+-define(VARINT_EDGES, [0, 63, 64, 16383, 16384, 1073741823, 1073741824, 4611686018427387903]).
+
+hot_frames_every_varint_width_test() ->
+    [
+        ?assertEqual(ref_decode(Bin), outcome(Bin))
+     || V <- ?VARINT_EDGES, Bin <- hot_encodings(V)
+    ].
+
+hot_frames_every_truncation_test() ->
+    [
+        ?assertEqual(ref_decode(Prefix), outcome(Prefix))
+     || V <- ?VARINT_EDGES,
+        Bin <- hot_encodings(V),
+        N <- lists:seq(1, byte_size(Bin) - 1),
+        Prefix <- [binary:part(Bin, 0, N)]
+    ].
+
+hot_frames_oversized_stream_test() ->
+    Len = 65536,
+    Bin = <<16#0a, 4, (quic_varint:encode(Len))/binary, 0:(Len * 8)>>,
+    ?assertEqual({error, frame_too_large}, quic_frame:decode(Bin)).
+
+hot_encodings(V) ->
+    E = fun quic_varint:encode/1,
+    Data = <<"abc">>,
+    [
+        %% STREAM with offset and length, with length only, offset only, neither
+        <<16#0f, (E(V))/binary, (E(V))/binary, (E(3))/binary, Data/binary, "rest">>,
+        <<16#0a, (E(V))/binary, (E(3))/binary, Data/binary, "rest">>,
+        <<16#0d, (E(V))/binary, (E(V))/binary, Data/binary>>,
+        <<16#08, (E(V))/binary, Data/binary>>,
+        <<16#10, (E(V))/binary, "rest">>,
+        <<16#11, (E(V))/binary, (E(V))/binary, "rest">>,
+        %% ACK with two extra ranges, and ACK_ECN
+        <<2, (E(V))/binary, (E(V))/binary, 2, (E(V))/binary, (E(V))/binary, (E(1))/binary,
+            (E(2))/binary, (E(V))/binary, "rest">>,
+        <<3, (E(V))/binary, (E(V))/binary, 1, (E(V))/binary, (E(V))/binary, (E(V))/binary,
+            (E(1))/binary, (E(2))/binary, (E(V))/binary, "rest">>
+    ].
+
+%% Decode outcome, with a raise reduced to its class: the connection
+%% drops a datagram on any raise, whatever the reason.
+outcome(Bin) ->
+    try quic_frame:decode(Bin) of
+        Result -> Result
+    catch
+        Class:_ -> {raised, Class}
+    end.
+
+%% Field-by-field reference decoder for the hot frames.
+ref_decode(Bin) ->
+    try ref(Bin) of
+        Result -> Result
+    catch
+        Class:_ -> {raised, Class}
+    end.
+
+ref(<<Type, Rest/binary>>) when Type >= 16#08, Type =< 16#0f ->
+    {Sid, R1} = quic_varint:decode(Rest),
+    {Off, R2} =
+        case Type band 4 of
+            0 -> {0, R1};
+            _ -> quic_varint:decode(R1)
+        end,
+    Fin = (Type band 1) =:= 1,
+    case Type band 2 of
+        0 ->
+            {{stream, Sid, Off, R2, Fin}, <<>>};
+        _ ->
+            {Len, R3} = quic_varint:decode(R2),
+            <<D:Len/binary, R4/binary>> = R3,
+            {{stream, Sid, Off, D, Fin}, R4}
+    end;
+ref(<<16#10, Rest/binary>>) ->
+    {M, R} = quic_varint:decode(Rest),
+    {{max_data, M}, R};
+ref(<<16#11, Rest/binary>>) ->
+    {S, R1} = quic_varint:decode(Rest),
+    {M, R2} = quic_varint:decode(R1),
+    {{max_stream_data, S, M}, R2};
+ref(<<Type, Rest/binary>>) when Type =:= 2; Type =:= 3 ->
+    {Largest, R1} = quic_varint:decode(Rest),
+    {Delay, R2} = quic_varint:decode(R1),
+    {Count, R3} = quic_varint:decode(R2),
+    {First, R4} = quic_varint:decode(R3),
+    {Ranges, R5} = ref_ranges(Count, R4, []),
+    case Type of
+        2 ->
+            {{ack, [{Largest, First} | Ranges], Delay, undefined}, R5};
+        3 ->
+            {E0, R6} = quic_varint:decode(R5),
+            {E1, R7} = quic_varint:decode(R6),
+            {CE, R8} = quic_varint:decode(R7),
+            {{ack, [{Largest, First} | Ranges], Delay, {E0, E1, CE}}, R8}
+    end.
+
+ref_ranges(0, Bin, Acc) ->
+    {lists:reverse(Acc), Bin};
+ref_ranges(N, Bin, Acc) ->
+    {Gap, R1} = quic_varint:decode(Bin),
+    {Range, R2} = quic_varint:decode(R1),
+    ref_ranges(N - 1, R2, [{Gap, Range} | Acc]).

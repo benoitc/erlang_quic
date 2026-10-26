@@ -166,7 +166,7 @@ arm_ack_timer_sets_a_timer_test() ->
     ?assert(is_reference(Ref)),
     %% max_ack_delay is 25ms in this state, so the message lands quickly.
     receive
-        {send_delayed_ack, app, Ref} -> ok
+        {timeout, Ref, send_delayed_ack} -> ok
     after 2000 ->
         ct_fail_no_timer()
     end.
@@ -185,7 +185,7 @@ arm_ack_timer_ignores_the_peer_max_ack_delay_test() ->
     S1 = quic_connection:arm_ack_timer(S0),
     #{ack_timer := Ref} = quic_connection_test_support:ack_counters(S1),
     receive
-        {send_delayed_ack, app, Ref} -> ok
+        {timeout, Ref, send_delayed_ack} -> ok
     after 500 ->
         ct_fail_no_timer()
     end.
@@ -198,35 +198,34 @@ arm_ack_timer_is_idempotent_test() ->
     S1 = quic_connection:arm_ack_timer(S0),
     #{ack_timer := Second} = quic_connection_test_support:ack_counters(S1),
     ?assertEqual(First, Second),
-    flush({send_delayed_ack, app, First}).
+    flush({timeout, First, send_delayed_ack}).
 
 clear_decimation_without_a_timer_test() ->
     S0 = quic_connection_test_support:decimate_initial_state(),
     {S1, _} = quic_connection_test_support:decimate_step(S0),
     #{ack_elicited_count := Counted} = quic_connection_test_support:ack_counters(S1),
     ?assert(Counted > 0),
-    S2 = quic_connection:clear_ack_decimation_state(S1),
+    S2 = quic_connection:send_app_ack(S1),
     #{ack_elicited_count := Cleared, ack_timer := Timer} =
         quic_connection_test_support:ack_counters(S2),
     ?assertEqual(0, Cleared),
     ?assertEqual(undefined, Timer).
 
-%% With a timer armed, clearing drops the reference as well as zeroing
-%% the count. The stored reference is not the send_after reference, so a
-%% pending message still arrives; what makes it harmless is that the
-%% state no longer matches it, and the connected/3 clause for a
-%% non-matching reference discards it.
-clear_decimation_drops_the_timer_reference_test() ->
+%% With a timer armed, sending the ACK cancels it as well as zeroing the
+%% count: no stale timeout is left to wake the connection up.
+clear_decimation_cancels_the_timer_test() ->
     S0 = quic_connection:arm_ack_timer(quic_connection_test_support:decimate_initial_state()),
     #{ack_timer := Ref} = quic_connection_test_support:ack_counters(S0),
     ?assert(is_reference(Ref)),
-    S1 = quic_connection:clear_ack_decimation_state(S0),
+    S1 = quic_connection:send_app_ack(S0),
     #{ack_elicited_count := Count, ack_timer := Timer} =
         quic_connection_test_support:ack_counters(S1),
     ?assertEqual(0, Count),
     ?assertEqual(undefined, Timer),
-    ?assertNotEqual(Ref, Timer),
-    flush({send_delayed_ack, app, Ref}).
+    receive
+        {timeout, Ref, send_delayed_ack} -> ?assert(false)
+    after 100 -> ok
+    end.
 
 %%====================================================================
 %% Helpers
