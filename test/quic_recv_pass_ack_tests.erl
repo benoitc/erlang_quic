@@ -1,5 +1,5 @@
 %% Inside a connected-state receive pass, count-based ACK decimation
-%% only counts; finish_recv_pass/1 then emits one ACK for the whole
+%% only counts; flush_recv_pass/1 then emits one ACK for the whole
 %% train. Without this a 64-packet drain pass emitted an ACK every
 %% ack_packet_tolerance packets, and the ACK machinery on both ends
 %% ate a large share of the CPU on bulk flows.

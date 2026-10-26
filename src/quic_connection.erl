@@ -1407,22 +1407,22 @@ idle(
 idle(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
     %% Flush batched packets and timers after processing incoming data
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 idle(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Socket} = State) ->
     NewState = handle_packets_batch(Packets, State),
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 %% Server receives packets from listener
 idle(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
     %% Flush batched packets and timers after processing incoming data
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 %% Server receives batched packets from listener (GRO optimization)
 idle(info, {quic_packets, Packets, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packets_batch(Packets, State),
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 idle(cast, process, #state{role = client, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
@@ -1435,7 +1435,7 @@ idle(cast, {close, Reason}, State) ->
     %% Close in idle state - no keys yet, just transition to draining
     emit_qlog_state_change(idle, draining, State),
     State1 = initiate_close(Reason, State),
-    NewState = flush_dirty_timers(flush_socket_batch(State1)),
+    NewState = flush_event(State1, event),
     {next_state, draining, NewState};
 idle({call, From}, has_early_keys, #state{early_keys = EK} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
@@ -1518,22 +1518,22 @@ handshaking(
 handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
     %% Flush batched packets and timers after processing incoming data
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 handshaking(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Socket} = State) ->
     NewState = handle_packets_batch(Packets, State),
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 %% Server receives packets from listener
 handshaking(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
     %% Flush batched packets and timers after processing incoming data
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 %% Server receives batched packets from listener (GRO optimization)
 handshaking(info, {quic_packets, Packets, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packets_batch(Packets, State),
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 handshaking(cast, process, #state{role = client, active_n = N} = State) ->
     %% Re-enable socket for receiving (client only - server uses listener's socket)
@@ -1546,7 +1546,7 @@ handshaking(cast, {close, Reason}, State) ->
     %% Close during handshake - may not have app keys yet
     emit_qlog_state_change(handshaking, draining, State),
     State1 = initiate_close(Reason, State),
-    NewState = flush_dirty_timers(flush_socket_batch(State1)),
+    NewState = flush_event(State1, event),
     {next_state, draining, NewState};
 handshaking({call, From}, has_early_keys, #state{early_keys = EK} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
@@ -1626,7 +1626,7 @@ connected(
     %% Everything queued above (pending data, NEW_TOKEN, the first PMTU
     %% probe) sits in the send batch; without a flush here it would
     %% only leave with the next event on this connection.
-    {keep_state, flush_dirty_timers(flush_socket_batch(State5))};
+    {keep_state, flush_event(State5, event)};
 connected({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 connected({call, From}, get_state, State) ->
@@ -1657,7 +1657,7 @@ connected({call, From}, {send_datagram, Data}, State) ->
     case do_send_datagram(Data, State) of
         {ok, NewState} ->
             %% Event-driven flush: flush batch and timers after user API call
-            FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+            FlushedState = flush_event(NewState, event),
             {keep_state, FlushedState, [{reply, From, ok}]};
         {error, Reason, NewState} ->
             {keep_state, NewState, [{reply, From, {error, Reason}}]};
@@ -1683,7 +1683,7 @@ connected({call, From}, open_unidirectional_stream, State) ->
 connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
     case do_close_stream(StreamId, ErrorCode, State) of
         {ok, NewState} ->
-            {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
+            {keep_state, flush_event(NewState, event), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1692,7 +1692,7 @@ connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
 connected({call, From}, {reset_stream_at, StreamId, ErrorCode, ReliableSize}, State) ->
     case do_reset_stream_at(StreamId, ErrorCode, ReliableSize, State) of
         {ok, NewState} ->
-            {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
+            {keep_state, flush_event(NewState, event), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1700,7 +1700,7 @@ connected({call, From}, {reset_stream_at, StreamId, ErrorCode, ReliableSize}, St
 connected({call, From}, {stop_sending, StreamId, ErrorCode}, State) ->
     case do_stop_sending(StreamId, ErrorCode, State) of
         {ok, NewState} ->
-            {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
+            {keep_state, flush_event(NewState, event), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1851,7 +1851,7 @@ connected({call, From}, get_peer_transport_params, #state{transport_params = TP}
 connected({call, From}, send_ping, State) ->
     %% Send PING frame - bypasses congestion control
     NewState = send_keep_alive_ping(State),
-    {keep_state, flush_dirty_timers(flush_socket_batch(NewState)), [{reply, From, ok}]};
+    {keep_state, flush_event(NewState, event), [{reply, From, ok}]};
 connected({call, From}, get_mtu, State) ->
     MTU = get_current_mtu(State),
     {keep_state, State, [{reply, From, {ok, MTU}}]};
@@ -1908,9 +1908,7 @@ connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) 
     NewState = handle_packet(Data, State1),
     %% Drain any further datagrams already in the mailbox into this
     %% pass, then flush ACKs / batches / timers once for the lot.
-    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
-    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
-    FinalState = FlushedState#state{current_packet_source = undefined},
+    FinalState = flush_event(flush_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)), pass),
     check_state_transition(connected, FinalState);
 %% Client receives a whole GRO train from the receiver process as one
 %% message; processing it in one pass amortizes the per-event flushes
@@ -1918,27 +1916,17 @@ connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) 
 connected(info, {udp_batch, Socket, IP, Port, Packets}, #state{socket = Socket} = State) ->
     State1 = State#state{current_packet_source = {IP, Port}, recv_pass = true},
     NewState = handle_packets_batch(Packets, State1),
-    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
-    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
-    FinalState = FlushedState#state{current_packet_source = undefined},
+    FinalState = flush_event(flush_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)), pass),
     check_state_transition(connected, FinalState);
 %% Server receives packets from listener
 connected(info, {quic_packet, Data, RemoteAddr}, #state{role = server} = State) ->
-    NewState = server_recv_pass([Data], RemoteAddr, State#state{recv_pass = true}),
-    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
-    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
-    FinalState = FlushedState#state{
-        current_packet_source = undefined, has_non_probing_frame = false
-    },
+    NewState = server_recv_pass([Data], RemoteAddr, State),
+    FinalState = flush_event(flush_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)), pass),
     check_state_transition(connected, FinalState);
 %% Server receives batched packets from listener (GRO optimization)
 connected(info, {quic_packets, Packets, RemoteAddr}, #state{role = server} = State) ->
-    NewState = server_recv_pass(Packets, RemoteAddr, State#state{recv_pass = true}),
-    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
-    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
-    FinalState = FlushedState#state{
-        current_packet_source = undefined, has_non_probing_frame = false
-    },
+    NewState = server_recv_pass(Packets, RemoteAddr, State),
+    FinalState = flush_event(flush_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)), pass),
     check_state_transition(connected, FinalState);
 %% Path validation timeout - stay on current path if validation fails
 %% Match on token (not timer ref) to correlate with specific validation attempt
@@ -1957,7 +1945,7 @@ connected(info, {path_validation_timeout, _StaleToken}, State) ->
 connected(cast, {close, Reason}, State) ->
     emit_qlog_state_change(connected, draining, State),
     State1 = initiate_close(Reason, State),
-    NewState = flush_dirty_timers(flush_socket_batch(State1)),
+    NewState = flush_event(State1, event),
     {next_state, draining, NewState};
 %% Async send data - fire-and-forget for high throughput
 connected(cast, {send_data_async, StreamId, Data, Fin}, State) ->
@@ -1974,7 +1962,7 @@ connected(cast, process, #state{role = server} = State) ->
 connected(info, {send_delayed_ack, app, Ref}, #state{ack_timer = Ref} = State) ->
     %% send_app_ack/1 clears ack_timer + ack_elicited_count.
     State1 = send_app_ack(State),
-    NewState = flush_dirty_timers(flush_socket_batch(State1)),
+    NewState = flush_event(State1, event),
     {keep_state, NewState};
 connected(info, {send_delayed_ack, app, _StaleRef}, State) ->
     %% Stale timer — ignore.
@@ -2245,7 +2233,7 @@ handle_common_event(
             %% rate (measured: ~930/s per connection, 46k/s across 50 idle
             %% connections) until the peer happens to send something.
             State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
-            State2 = flush_dirty_timers(flush_socket_batch(State1)),
+            State2 = flush_event(State1, event),
             {keep_state, arm_keep_alive_timer(State2, State2#state.keep_alive_interval)}
     end;
 handle_common_event(info, {keep_alive_timeout, _StaleRef}, _StateName, State) ->
@@ -2459,7 +2447,7 @@ send_client_hello(State) ->
 
     %% Event-driven flush: flush batch and timers after sending ClientHello
     %% Critical for handshake - must send immediately
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    FlushedState = flush_event(NewState, event),
 
     %% Enable socket for receiving (use {active, N} for better throughput)
     client_rearm_active(FlushedState, FlushedState#state.active_n),
@@ -3323,28 +3311,29 @@ send_handshake_ack(State) ->
 %% Always resets the decimation counter + cancels any armed ack_timer
 %% so the next ack-eliciting batch starts a fresh window.
 send_app_ack(State) ->
-    State1 = clear_ack_decimation_state(State),
-    #state{pn_app = PNSpace} = State1,
+    send_app_ack(State, State#state.recv_pass).
+
+%% Cancel the ACK timer, zero the decimation count, count the ACK and
+%% set the receive-pass flag in one record update.
+send_app_ack(#state{ack_timer = Ref, pn_app = PNSpace} = State, RecvPass) ->
+    cancel_timer(Ref),
     case PNSpace#pn_space.ack_ranges of
         [] ->
-            State1;
+            State#state{ack_timer = undefined, ack_elicited_count = 0, recv_pass = RecvPass};
         Ranges ->
             AckFrameTuple = quic_ack:build_ack_frame_tuple(Ranges),
-            maybe_coalesce_ack_with_data(AckFrameTuple, bump_ack_sent(State1))
+            maybe_coalesce_ack_with_data(AckFrameTuple, State#state{
+                ack_timer = undefined,
+                ack_elicited_count = 0,
+                ack_sent = State#state.ack_sent + 1,
+                recv_pass = RecvPass
+            })
     end.
 
 %% Bump the ack_sent counter. Called once per ACK packet that is about
 %% to hit the wire (after the ack_ranges non-empty check).
 bump_ack_sent(#state{ack_sent = N} = State) ->
     State#state{ack_sent = N + 1}.
-
-%% Cancel any armed ACK timer and zero the decimation counter. Called
-%% from every 1-RTT ACK emission path.
-clear_ack_decimation_state(#state{ack_timer = undefined} = State) ->
-    State#state{ack_elicited_count = 0};
-clear_ack_decimation_state(#state{ack_timer = Ref} = State) ->
-    cancel_timer(Ref),
-    State#state{ack_timer = undefined, ack_elicited_count = 0}.
 
 %% Try to coalesce ACK frame with small pending stream data
 %% Takes frame tuples (not encoded) to avoid re-decode overhead
@@ -3502,13 +3491,18 @@ send_frame(Frame, State) ->
 %% emission point changes. A payload larger than the remaining budget
 %% flushes the pending packet first; coalescing off means the old
 %% one-packet-per-call behaviour, byte for byte.
-send_app_packet_internal(Payload, Frames, #state{coalesce = true} = State) ->
+send_app_packet_internal(Payload, Frames, State) ->
+    send_app_packet_internal(Payload, Frames, State, State#state.cc_state).
+
+%% CCState is the congestion state the caller already charged for this
+%% packet, stored with the rest of the update instead of a copy of its own.
+send_app_packet_internal(Payload, Frames, #state{coalesce = true} = State, CCState) ->
     #state{pend_payload = PP, pend_frames = PF, pend_size = PS} = State,
     Size = erlang:iolist_size(Payload),
     Budget = get_max_stream_data_per_packet(State),
     case PS > 0 andalso PS + Size > Budget of
         true ->
-            State1 = flush_pending_packet(State),
+            State1 = flush_pending_packet(State#state{cc_state = CCState}),
             State1#state{
                 pend_payload = [Payload],
                 pend_frames = lists:reverse(Frames),
@@ -3518,20 +3512,21 @@ send_app_packet_internal(Payload, Frames, #state{coalesce = true} = State) ->
             State#state{
                 pend_payload = [Payload | PP],
                 pend_frames = lists:reverse(Frames, PF),
-                pend_size = PS + Size
+                pend_size = PS + Size,
+                cc_state = CCState
             }
     end;
-send_app_packet_internal(Payload, Frames, State) ->
-    send_app_packet_now(Payload, Frames, State).
+send_app_packet_internal(Payload, Frames, State, CCState) ->
+    send_app_packet_now(Payload, Frames, State, keep, CCState).
 
 %% Drain consecutive send requests already sitting in the mailbox and
 %% process them as one batch with coalescing enabled, so frames from
 %% concurrent senders share packets (issue #201). Only send messages
 %% are drained; everything else keeps its ordinary ordering. A lone
-%% send behaves exactly as before apart from a single extra receive
-%% probe.
+%% send has nothing to share a packet with and skips coalescing.
 coalesced_sends(Acc0, State0) ->
     Sends = drain_send_msgs(Acc0, 63),
+    Coalesce = (tl(Sends) =/= []),
     {RevReplies, State1} =
         lists:foldl(
             fun({Tag, Sid, Data, Fin}, {Rs, S}) ->
@@ -3547,11 +3542,11 @@ coalesced_sends(Acc0, State0) ->
                         {[{Tag, {error, Reason}} | Rs], S}
                 end
             end,
-            {[], State0#state{coalesce = true}},
+            {[], start_coalescing(Coalesce, State0)},
             Sends
         ),
-    State2 = flush_pending_packet(State1#state{coalesce = false}),
-    FlushedState = flush_dirty_timers(flush_socket_batch(State2)),
+    State2 = end_coalescing(Coalesce, State1),
+    FlushedState = flush_event(State2, event),
     Replies = [{reply, F, R} || {F, R} <- lists:reverse(RevReplies), F =/= async],
     {keep_state, FlushedState, Replies}.
 
@@ -3574,20 +3569,31 @@ drain_send_msgs(Acc, N) ->
 flush_pending_packet(#state{pend_size = 0} = State) ->
     State;
 flush_pending_packet(#state{pend_payload = PP, pend_frames = PF} = State) ->
-    State1 = State#state{pend_payload = [], pend_frames = [], pend_size = 0},
-    send_app_packet_now(lists:reverse(PP), lists:reverse(PF), State1).
+    send_app_packet_now(lists:reverse(PP), lists:reverse(PF), State, clear, State#state.cc_state).
+
+%% Leave a coalescing batch: flush what it accumulated and turn
+%% coalescing off in the same update.
+start_coalescing(false, State) -> State;
+start_coalescing(true, State) -> State#state{coalesce = true}.
+
+end_coalescing(false, State) ->
+    State;
+end_coalescing(true, #state{pend_size = 0} = State) ->
+    State#state{coalesce = false};
+end_coalescing(true, #state{pend_payload = PP, pend_frames = PF} = State) ->
+    send_app_packet_now(lists:reverse(PP), lists:reverse(PF), State, close, State#state.cc_state).
 
 %% Counts against the per-drain burst budget here rather than in
 %% send_app_packet_internal/3: with coalescing on, several sends share
-%% one packet, and the budget bounds packets on the wire.
-send_app_packet_now(Payload, Frames, State0) ->
-    State = State0#state{burst_sent = State0#state.burst_sent + 1},
+%% one packet, and the budget bounds packets on the wire. `clear' empties
+%% the coalescing buffer the payload came from, in the same update;
+%% `close' also turns coalescing off.
+send_app_packet_now(Payload, Frames, State, Pend, CCState) ->
     #state{
         dcid = DCID,
         app_keys = {ClientKeys, ServerKeys},
         role = Role,
         pn_app = PNSpace,
-        cc_state = CCState,
         loss_state = LossState
     } = State,
 
@@ -3670,7 +3676,20 @@ send_app_packet_now(Payload, Frames, State0) ->
                     true -> Now;
                     false -> State#state.last_activity
                 end,
-            maybe_force_key_update(State#state{
+            {NewKeyState, KeyLimit} = count_sealed(State#state.key_state, 1),
+            {PendPayload, PendFrames, PendSize, Coalesce} =
+                case Pend of
+                    keep ->
+                        #state{
+                            pend_payload = PP, pend_frames = PF, pend_size = PS, coalesce = C
+                        } = State,
+                        {PP, PF, PS, C};
+                    clear ->
+                        {[], [], 0, State#state.coalesce};
+                    close ->
+                        {[], [], 0, false}
+                end,
+            State1 = State#state{
                 pn_app = NewPNSpace,
                 cc_state = NewCCState,
                 loss_state = NewLossState,
@@ -3679,15 +3698,41 @@ send_app_packet_now(Payload, Frames, State0) ->
                 last_activity = NewLastActivity,
                 ack_eliciting_since_recv =
                     AckEliciting orelse State#state.ack_eliciting_since_recv,
-                pto_dirty = true
-            });
+                pto_dirty = true,
+                burst_sent = State#state.burst_sent + 1,
+                key_state = NewKeyState,
+                pend_payload = PendPayload,
+                pend_frames = PendFrames,
+                pend_size = PendSize,
+                coalesce = Coalesce
+            },
+            after_sealed(KeyLimit, State1);
         {error, Reason, ClearedSocketState} ->
             send_app_packet_internal_error(
-                Reason, PN, PacketSize, PNSpace, State, ClearedSocketState
+                Reason,
+                PN,
+                PacketSize,
+                PNSpace,
+                clear_pend(Pend, State#state{cc_state = CCState}),
+                ClearedSocketState
             );
         {error, Reason} ->
-            send_app_packet_internal_error(Reason, PN, PacketSize, PNSpace, State, undefined)
+            send_app_packet_internal_error(
+                Reason,
+                PN,
+                PacketSize,
+                PNSpace,
+                clear_pend(Pend, State#state{cc_state = CCState}),
+                undefined
+            )
     end.
+
+clear_pend(keep, State) ->
+    State;
+clear_pend(clear, State) ->
+    State#state{pend_payload = [], pend_frames = [], pend_size = 0};
+clear_pend(close, State) ->
+    State#state{pend_payload = [], pend_frames = [], pend_size = 0, coalesce = false}.
 
 %% Common error handling for send_app_packet_internal: bump PN without
 %% tracking the packet (PTO owns retransmission) and, on the 3-tuple
@@ -3699,11 +3744,14 @@ send_app_packet_internal_error(Reason, PN, PacketSize, PNSpace, State, ClearedSo
         ?QUIC_LOG_META
     ),
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
+    Burst = State#state.burst_sent + 1,
     case ClearedSocketState of
         undefined ->
-            State#state{pn_app = NewPNSpace};
+            State#state{pn_app = NewPNSpace, burst_sent = Burst};
         _ ->
-            State#state{pn_app = NewPNSpace, socket_state = ClearedSocketState}
+            State#state{
+                pn_app = NewPNSpace, socket_state = ClearedSocketState, burst_sent = Burst
+            }
     end.
 
 %% Pad Initial packet to minimum 1200 bytes
@@ -3979,24 +4027,19 @@ fold_opened(Results, State) ->
                             true when State#state.role =:= client -> SpinRecv;
                             true -> 1 - SpinRecv
                         end,
-                    State1 = State#state{
-                        pn_app = PNSpace#pn_space{
-                            largest_recv = LastPN,
-                            recv_time = Now,
-                            ack_ranges = [{RangeStart, LastPN} | RestRanges]
-                        },
-                        last_recv_trigger = sequential,
-                        spin_recv = SpinRecv,
-                        spin_recv_largest_pn = LastPN,
-                        spin_outgoing = SpinOut,
-                        last_activity = Now,
-                        ack_eliciting_since_recv = false
+                    NewPNSpace = PNSpace#pn_space{
+                        largest_recv = LastPN,
+                        recv_time = Now,
+                        ack_ranges = [{RangeStart, LastPN} | RestRanges]
                     },
-                    case stream_train(Results, State1) of
+                    Recv = {NewPNSpace, SpinRecv, LastPN, SpinOut, Now},
+                    case stream_train(Results, State) of
                         {ok, StreamId, FirstOff, RevChunks, Total, N} ->
-                            apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, State1);
+                            apply_stream_train(
+                                StreamId, FirstOff, RevChunks, Total, N, Recv, State
+                            );
                         no ->
-                            fold_opened_seq(Results, State1, 0, 0)
+                            fold_opened_seq(Results, with_recv(Recv, State), 0, 0)
                     end;
                 no ->
                     fold_opened(Results, State, Now, 0, 0)
@@ -4004,6 +4047,18 @@ fold_opened(Results, State) ->
         _ ->
             fold_opened(Results, State, Now, 0, 0)
     end.
+
+%% Receive bookkeeping of a contiguous run, every packet sequential.
+with_recv({PNSpace, SpinRecv, LastPN, SpinOut, Now}, State) ->
+    State#state{
+        pn_app = PNSpace,
+        last_recv_trigger = sequential,
+        spin_recv = SpinRecv,
+        spin_recv_largest_pn = LastPN,
+        spin_outgoing = SpinOut,
+        last_activity = Now,
+        ack_eliciting_since_recv = false
+    }.
 
 %% Last {PN, FirstByte} of a run iff PNs are consecutive from Expected.
 seq_run_last([{PN, FB, _}], PN) ->
@@ -4142,7 +4197,9 @@ stream_train(_, _, _, _, _, _) ->
 %% conditions as the lean clause of do_process_stream_data_buffered/5,
 %% checked once with the train's totals; any deviation replays the
 %% train through the per-packet path.
-apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, State) ->
+%% Inside a receive pass the run's bookkeeping (Recv), the stream update
+%% and fold_opened_finish/3 are written in one record update.
+apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, Recv, State) ->
     case State#state.streams of
         #{
             StreamId := #stream_state{
@@ -4165,22 +4222,48 @@ apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, State) ->
             of
                 true ->
                     PendDeliver = deliver_stream_train(StreamId, RevChunks, State),
-                    State1 = State#state{
-                        streams = maps:put(
-                            StreamId,
-                            Stream#stream_state{recv_offset = EndOffset},
-                            State#state.streams
-                        ),
-                        data_received = NewDataReceived,
-                        pend_deliver = PendDeliver,
-                        has_non_probing_frame = true
-                    },
-                    fold_opened_finish(State1, N, N);
+                    Streams = maps:put(
+                        StreamId,
+                        Stream#stream_state{recv_offset = EndOffset},
+                        State#state.streams
+                    ),
+                    case State#state.recv_pass of
+                        true ->
+                            {PNSpace, SpinRecv, LastPN, SpinOut, Now} = Recv,
+                            State#state{
+                                pn_app = PNSpace,
+                                last_recv_trigger = sequential,
+                                spin_recv = SpinRecv,
+                                spin_recv_largest_pn = LastPN,
+                                spin_outgoing = SpinOut,
+                                last_activity = Now,
+                                ack_eliciting_since_recv = false,
+                                streams = Streams,
+                                data_received = NewDataReceived,
+                                pend_deliver = PendDeliver,
+                                has_non_probing_frame = true,
+                                packets_received = State#state.packets_received + N,
+                                ack_elicited_count = State#state.ack_elicited_count + N,
+                                ack_timer = ensure_ack_timer(State#state.ack_timer)
+                            };
+                        false ->
+                            State1 = with_recv(Recv, State),
+                            fold_opened_finish(
+                                State1#state{
+                                    streams = Streams,
+                                    data_received = NewDataReceived,
+                                    pend_deliver = PendDeliver,
+                                    has_non_probing_frame = true
+                                },
+                                N,
+                                N
+                            )
+                    end;
                 false ->
-                    stream_train_fallback(StreamId, RevChunks, State)
+                    stream_train_fallback(StreamId, RevChunks, with_recv(Recv, State))
             end;
         _ ->
-            stream_train_fallback(StreamId, RevChunks, State)
+            stream_train_fallback(StreamId, RevChunks, with_recv(Recv, State))
     end.
 
 %% Deviating train: replay it through the ordinary per-packet path.
@@ -4222,9 +4305,11 @@ deliver_stream_train(StreamId, RevChunks, State) ->
 %% One server receive pass: process the packets of a listener message
 %% (source tracking, frame classification, RFC 9000 §9.1 migration
 %% check) without the per-message flushes - the caller flushes once
-%% per drain.
+%% per drain. Opens the receive pass when it is the first message.
 server_recv_pass(Packets, RemoteAddr, State) ->
-    State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
+    State1 = State#state{
+        current_packet_source = RemoteAddr, has_non_probing_frame = false, recv_pass = true
+    },
     NewState = handle_packets_batch(Packets, State1),
     case NewState#state.has_non_probing_frame of
         true ->
@@ -5149,7 +5234,8 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
 
                     State1 = State#state{
                         loss_state = NewLossState,
-                        cc_state = CCState6
+                        cc_state = CCState6,
+                        pto_dirty = true
                     },
 
                     %% Emit qlog packets_acked event
@@ -5225,7 +5311,7 @@ process_frame(app, {max_data, MaxData}, #state{max_data_remote = Current} = Stat
             State1 = State#state{max_data_remote = MaxData},
             State2 = process_send_queue(State1),
             %% Event-driven flush: flush batch and timers after flow control opens
-            flush_dirty_timers(flush_socket_batch(State2));
+            flush_event(State2, event);
         false ->
             %% Monotonic: ignore if not increasing (per RFC 9000)
             State
@@ -5256,7 +5342,7 @@ process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Stream
                     %% Limit increased - try to drain queued data
                     State2 = process_send_queue(State1),
                     %% Event-driven flush: flush batch and timers after stream flow control opens
-                    flush_dirty_timers(flush_socket_batch(State2));
+                    flush_event(State2, event);
                 false ->
                     %% Monotonic: ignore if not increasing
                     State
@@ -5694,25 +5780,26 @@ app_ack_tail(AckedPackets, LostPackets, State1) ->
             FinSids -> lists:foldl(fun settle_fin_ack/2, State4, FinSids)
         end,
 
-    %% Re-arm the PTO once at the end of the pass
-    %% (flush_dirty_timers) instead of once per ACK frame.
-    State5 = State4a#state{pto_dirty = true},
-
     %% Try to send queued data now that cwnd may have freed up.
     %% This also drains retransmit_stream entries deferred by CC.
-    State6 = process_send_queue(State5),
+    State6 = process_send_queue(State4a),
     %% cwnd reopened: replay CC-deferred control retransmits, then
     %% complete any local reset-at reclaim whose reliable bytes are
     %% now acked.
     State7 = flush_deferred_retransmits(drain_pending_hs(State6)),
     State8 = complete_fin_reclaims(complete_send_reset_at(State7)),
-    %% Event-driven flush: flush batch and timers after ACK processing
-    flush_dirty_timers(flush_socket_batch(State8)).
+    %% The PTO is re-armed once per receive pass, not once per ACK frame:
+    %% inside a pass flush_event/2 runs at its end.
+    case State8 of
+        #state{recv_pass = true, pto_dirty = true} -> State8;
+        #state{recv_pass = true} -> State8#state{pto_dirty = true};
+        _ -> flush_event(State8, rearm)
+    end.
 
 handshake_ack_tail(Level, LostPackets, State1) ->
     State2 = retransmit_lost_handshake(Level, LostPackets, State1),
     State3 = drain_pending_hs(note_handshake_ack(Level, State2)),
-    flush_dirty_timers(flush_socket_batch(State3#state{pto_dirty = true})).
+    flush_event(State3#state{pto_dirty = true}, event).
 
 %% A Handshake acknowledgement tells a client the server has processed a
 %% protected packet from it, so its address is validated.
@@ -7701,7 +7788,7 @@ auto_stream_release(StreamId, #state{streams = Streams} = State) ->
     end.
 
 flush_after_grant(connected, State) ->
-    flush_dirty_timers(flush_socket_batch(State));
+    flush_event(State, event);
 flush_after_grant(_StateName, State) ->
     State.
 
@@ -7820,15 +7907,66 @@ close_raw_client_socket(Opts, Socket) ->
     end.
 
 %% Flush any batched packets (call before timers or idle periods)
-flush_socket_batch(#state{socket_state = undefined} = State) ->
-    State;
 flush_socket_batch(#state{socket_state = SocketState} = State) ->
-    case quic_socket:flush(SocketState) of
-        {ok, NewSocketState} ->
-            State#state{socket_state = NewSocketState};
-        {error, _, ClearedSocketState} ->
-            State#state{socket_state = ClearedSocketState}
+    case flushed_socket_state(SocketState) of
+        %% Empty batch: the socket state is returned as is.
+        SocketState -> State;
+        NewSocketState -> State#state{socket_state = NewSocketState}
     end.
+
+flushed_socket_state(undefined) ->
+    undefined;
+flushed_socket_state(SocketState) ->
+    case quic_socket:flush(SocketState) of
+        {ok, NewSocketState} -> NewSocketState;
+        {error, _, ClearedSocketState} -> ClearedSocketState
+    end.
+
+%% End of an event, in one record update: flush the socket batch and the
+%% deferred PTO reset (the idle and keep-alive timers are lazy, so the PTO
+%% is the only deferred timer); `rearm' forces the PTO reset. After a
+%% receive pass (`pass') the per-pass fields are cleared too. Every event that may have drained the send
+%% queue ends here, so it is also where a wanted send_ready goes out.
+flush_event(#state{socket_state = SocketState0, pto_dirty = Dirty0} = State, Scope) ->
+    SocketState = flushed_socket_state(SocketState0),
+    Dirty = Dirty0 orelse Scope =:= rearm,
+    State1 =
+        case Dirty orelse Scope =:= pass orelse SocketState =/= SocketState0 of
+            false ->
+                State;
+            true ->
+                {Timer, ArmedAt, ScheduledAt, Space, Kind} =
+                    case Dirty of
+                        true ->
+                            pto_plan(State);
+                        false ->
+                            #state{
+                                pto_timer = T,
+                                pto_armed_at = A,
+                                pto_scheduled_at = D,
+                                pto_space = Sp,
+                                pto_kind = K
+                            } = State,
+                            {T, A, D, Sp, K}
+                    end,
+                {Source, RecvPass} =
+                    case Scope of
+                        pass -> {undefined, false};
+                        _ -> {State#state.current_packet_source, State#state.recv_pass}
+                    end,
+                State#state{
+                    socket_state = SocketState,
+                    pto_timer = Timer,
+                    pto_armed_at = ArmedAt,
+                    pto_scheduled_at = ScheduledAt,
+                    pto_space = Space,
+                    pto_kind = Kind,
+                    pto_dirty = false,
+                    current_packet_source = Source,
+                    recv_pass = RecvPass
+                }
+        end,
+    maybe_send_ready(State1).
 
 %%====================================================================
 %% ACK emission and decimation (RFC 9002 Section 6.2)
@@ -7882,7 +8020,7 @@ maybe_send_ack(_, _, State) ->
 %% since the last emitted ACK, flush immediately. Otherwise increment
 %% the counter and arm a max_ack_delay timer (if not already armed).
 maybe_decimate_app_ack(#state{recv_pass = true} = State) ->
-    %% Inside a receive pass: only count; finish_recv_pass/1 flushes
+    %% Inside a receive pass: only count; flush_recv_pass/1 flushes
     %% one ACK for the whole train.
     arm_ack_timer(State#state{ack_elicited_count = State#state.ack_elicited_count + 1});
 maybe_decimate_app_ack(State) ->
@@ -7896,11 +8034,11 @@ maybe_decimate_app_ack(State) ->
 
 %% End of a connected-state receive pass: flush the accumulated stream
 %% delivery, emit the deferred ACK (one per train) if enough
-%% ack-eliciting packets accumulated, then clear the pass flag.
-%% Below-tolerance remainders keep their ack_timer. The delivery
+%% ack-eliciting packets accumulated. flush_event/2 then clears the pass
+%% flag. Below-tolerance remainders keep their ack_timer. The delivery
 %% flushes even when the pass initiated a close: the data arrived
 %% before it.
-finish_recv_pass(State0) ->
+flush_recv_pass(State0) ->
     State = flush_pending_delivery(State0),
     case State of
         #state{
@@ -7908,9 +8046,9 @@ finish_recv_pass(State0) ->
         } when
             Count >= Tol
         ->
-            send_app_ack(State#state{recv_pass = false});
+            send_app_ack(State, false);
         _ ->
-            State#state{recv_pass = false}
+            State
     end.
 
 %% A boolean option: true only when set to exactly `true'.
@@ -7961,9 +8099,15 @@ flush_pending_delivery(#state{pend_deliver = {StreamId, Acc, Fin}, owner = Owner
 arm_ack_timer(#state{ack_timer = Ref} = State) when Ref =/= undefined ->
     State;
 arm_ack_timer(#state{ack_timer = undefined} = State) ->
+    State#state{ack_timer = ensure_ack_timer(undefined)}.
+
+%% The armed ACK timer reference, arming one if there is none.
+ensure_ack_timer(undefined) ->
     NewRef = make_ref(),
     erlang:send_after(?DEFAULT_MAX_ACK_DELAY, self(), {send_delayed_ack, app, NewRef}),
-    State#state{ack_timer = NewRef}.
+    NewRef;
+ensure_ack_timer(Ref) ->
+    Ref.
 
 %%====================================================================
 %% Frame classification for ACK policy
@@ -8389,16 +8533,6 @@ update_last_activity(State) ->
 %% timer (RFC 9000 §10.1).
 update_last_activity(State, Now) ->
     State#state{last_activity = Now, ack_eliciting_since_recv = false}.
-
-%% Flush the deferred PTO timer reset at batch boundaries. The idle and
-%% keep-alive timers are lazy (armed once, re-armed only on fire), so the
-%% only deferred timer left is the PTO.
-%% The end of every event that may have drained the send queue, so it is
-%% also where a wanted send_ready goes out.
-flush_dirty_timers(#state{pto_dirty = false} = State) ->
-    maybe_send_ready(State);
-flush_dirty_timers(#state{pto_dirty = true} = State) ->
-    maybe_send_ready(set_pto_timer(State#state{pto_dirty = false})).
 
 maybe_send_ready(#state{send_ready_wanted = true, send_queue_bytes = Bytes} = State) when
     Bytes < ?MAX_SEND_QUEUE_BYTES div 2
@@ -9336,10 +9470,9 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Wh
         end,
     case Check of
         {ok, NewCCState} ->
-            State1 = State#state{cc_state = NewCCState},
             Frame = {stream, StreamId, Offset, Data, Fin},
             Payload = quic_frame:encode_iodata(Frame),
-            NewState = send_app_packet_internal(Payload, [Frame], State1),
+            NewState = send_app_packet_internal(Payload, [Frame], State, NewCCState),
             {NewState, BytesSentSoFar + DataSize};
         {blocked_pacing, Delay} ->
             ?LOG_DEBUG(
@@ -10925,7 +11058,7 @@ handle_loss_timeout(#state{loss_state = LossState, pto_space = Space} = State) -
     {NewLossState, Lost} = quic_loss:detect_lost_packets(Space, LossState, LargestAcked),
     State1 = State#state{loss_state = NewLossState},
     State2 = apply_lost_packets(Space, Lost, State1),
-    flush_dirty_timers(flush_socket_batch(State2#state{pto_dirty = true})).
+    flush_event(State2#state{pto_dirty = true}, event).
 
 %% The congestion response, the retransmission and the qlog record that
 %% follow a loss, wherever it was declared.
@@ -10967,7 +11100,7 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
     State2b = complete_send_reset_at(State2a),
 
     %% Flush immediately - probe packets and timers must not be batched
-    State3 = flush_dirty_timers(flush_socket_batch(State2b)),
+    State3 = flush_event(State2b, event),
 
     %% Set new PTO timer
     set_pto_timer(State3).
@@ -11040,11 +11173,26 @@ send_keep_alive_ping(State) ->
 %% tolerance costs a cancel. Bulk transfers touched the PTO on every
 %% packet, and cancel_timer + send_after per packet was a measurable
 %% share of the server receive path on small hosts.
-set_pto_timer(
+set_pto_timer(State) ->
+    {Timer, ArmedAt, ScheduledAt, Space, Kind} = pto_plan(State),
+    State#state{
+        pto_timer = Timer,
+        pto_armed_at = ArmedAt,
+        pto_scheduled_at = ScheduledAt,
+        pto_space = Space,
+        pto_kind = Kind,
+        pto_dirty = false
+    }.
+
+%% The PTO fields set_pto_timer/1 stores, cancelling or arming the timer
+%% as needed: {Timer, ArmedAt, ScheduledAt, Space, Kind}.
+pto_plan(
     #state{
         loss_state = LossState,
         pto_timer = OldTimer,
-        pto_armed_at = ArmedAt
+        pto_armed_at = ArmedAt,
+        pto_space = OldSpace,
+        pto_kind = OldKind
     } = State
 ) ->
     Now = erlang:monotonic_time(millisecond),
@@ -11063,28 +11211,23 @@ set_pto_timer(
     case Selected of
         {Kind, Deadline, Space} ->
             PTO = max(0, Deadline - Now),
-            SameSpace = (Space =:= State#state.pto_space),
-            Same = SameSpace andalso Kind =:= State#state.pto_kind,
+            Same = (Space =:= OldSpace) andalso (Kind =:= OldKind),
             case
                 OldTimer =/= undefined andalso Same andalso
                     Deadline + ?PTO_RESET_TOLERANCE_MS >= ArmedAt
             of
                 true ->
-                    State#state{pto_scheduled_at = Deadline};
+                    {OldTimer, ArmedAt, Deadline, OldSpace, OldKind};
                 false ->
                     cancel_timer(OldTimer),
-                    arm_pto_timer(
-                        PTO,
-                        State#state{
-                            pto_scheduled_at = Deadline, pto_space = Space, pto_kind = Kind
-                        }
-                    )
+                    {Ref, NewArmedAt} = start_pto_timer(PTO),
+                    {Ref, NewArmedAt, Deadline, Space, Kind}
             end;
         none ->
             cancel_timer(OldTimer),
-            State#state{pto_timer = undefined, pto_scheduled_at = undefined};
+            {undefined, ArmedAt, undefined, OldSpace, OldKind};
         _ ->
-            State#state{pto_scheduled_at = undefined}
+            {OldTimer, ArmedAt, undefined, OldSpace, OldKind}
     end.
 
 pto_selection(LossState, Now, State) ->
@@ -11115,9 +11258,13 @@ handshake_status(#state{handshake_keys = HSKeys, loss_state = LossState} = State
     }.
 
 arm_pto_timer(Delay, State) ->
+    {Ref, ArmedAt} = start_pto_timer(Delay),
+    State#state{pto_timer = Ref, pto_armed_at = ArmedAt}.
+
+start_pto_timer(Delay) ->
     Ref = make_ref(),
     erlang:send_after(Delay, self(), {pto_timeout, Ref}),
-    State#state{pto_timer = Ref, pto_armed_at = erlang:monotonic_time(millisecond) + Delay}.
+    {Ref, erlang:monotonic_time(millisecond) + Delay}.
 
 %% What a firing PTO timer should do: nothing (flight drained since it
 %% was armed), wait the remainder (deadline moved later), or probe.
@@ -11153,7 +11300,7 @@ handle_pacing_timeout(State0) ->
             0 -> State;
             _ -> maybe_reschedule_pacing(process_send_queue(State))
         end,
-    flush_dirty_timers(flush_socket_batch(Processed)).
+    flush_event(Processed, event).
 
 %% Check if we need to reschedule pacing timer after processing queue
 maybe_reschedule_pacing(#state{send_queue = PQ, cc_state = CCState, pacing_enabled = true} = State) ->
@@ -11457,22 +11604,27 @@ normalize_alpn_list(_) ->
 %% and force a key update before it is reached (RFC 9001 §6.6). Only the
 %% first over-limit packet in an idle phase triggers the update; the
 %% counter resets when the new phase begins.
-maybe_force_key_update(State) ->
-    maybe_force_key_update(State, 1).
-
 %% N packets at once, for the chunk-run sender.
 maybe_force_key_update(#state{key_state = undefined} = State, _N) ->
     State;
 maybe_force_key_update(#state{key_state = KeyState} = State, N) ->
+    {NewKeyState, KeyLimit} = count_sealed(KeyState, N),
+    after_sealed(KeyLimit, State#state{key_state = NewKeyState}).
+
+%% The key state with N more packets sealed, and whether that reached the
+%% confidentiality limit with no update in progress.
+count_sealed(undefined, _N) ->
+    {undefined, false};
+count_sealed(KeyState, N) ->
     NewCount = KeyState#key_update_state.send_count + N,
-    State1 = State#state{key_state = KeyState#key_update_state{send_count = NewCount}},
-    case
+    {
+        KeyState#key_update_state{send_count = NewCount},
         NewCount >= ?AEAD_CONFIDENTIALITY_LIMIT andalso
             KeyState#key_update_state.update_state =:= idle
-    of
-        true -> initiate_key_update(State1);
-        false -> State1
-    end.
+    }.
+
+after_sealed(true, State) -> initiate_key_update(State);
+after_sealed(false, State) -> State.
 
 initiate_key_update(#state{key_state = KeyState} = State) ->
     #key_update_state{

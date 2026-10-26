@@ -723,7 +723,8 @@ local_cids(#state{cid_pool_state = Pool}) -> quic_cid:local_entries(Pool).
 ack_counters(#state{ack_sent = Sent, ack_elicited_count = Count, ack_timer = Timer}) ->
     #{ack_sent => Sent, ack_elicited_count => Count, ack_timer => Timer}.
 
-%% Run finish_recv_pass/1 and return the observable decimation fields.
+%% End a receive pass as the datagram handlers do and return the
+%% observable decimation fields.
 -spec finish_recv_pass(#state{}) ->
     {#state{}, #{
         ack_elicited_count := non_neg_integer(),
@@ -731,7 +732,7 @@ ack_counters(#state{ack_sent = Sent, ack_elicited_count = Count, ack_timer = Tim
         recv_pass := boolean()
     }}.
 finish_recv_pass(State) ->
-    NewState = quic_connection:finish_recv_pass(State),
+    NewState = quic_connection:flush_event(quic_connection:flush_recv_pass(State), pass),
     {NewState, #{
         ack_elicited_count => NewState#state.ack_elicited_count,
         ack_timer_armed => NewState#state.ack_timer =/= undefined,

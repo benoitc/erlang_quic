@@ -205,7 +205,7 @@ clear_decimation_without_a_timer_test() ->
     {S1, _} = quic_connection_test_support:decimate_step(S0),
     #{ack_elicited_count := Counted} = quic_connection_test_support:ack_counters(S1),
     ?assert(Counted > 0),
-    S2 = quic_connection:clear_ack_decimation_state(S1),
+    S2 = quic_connection:send_app_ack(S1),
     #{ack_elicited_count := Cleared, ack_timer := Timer} =
         quic_connection_test_support:ack_counters(S2),
     ?assertEqual(0, Cleared),
@@ -220,7 +220,7 @@ clear_decimation_drops_the_timer_reference_test() ->
     S0 = quic_connection:arm_ack_timer(quic_connection_test_support:decimate_initial_state()),
     #{ack_timer := Ref} = quic_connection_test_support:ack_counters(S0),
     ?assert(is_reference(Ref)),
-    S1 = quic_connection:clear_ack_decimation_state(S0),
+    S1 = quic_connection:send_app_ack(S0),
     #{ack_elicited_count := Count, ack_timer := Timer} =
         quic_connection_test_support:ack_counters(S1),
     ?assertEqual(0, Count),

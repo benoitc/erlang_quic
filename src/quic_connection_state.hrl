@@ -508,7 +508,7 @@
     pmtu_raise_interval = ?PMTU_DEFAULT_RAISE_INTERVAL :: pos_integer(),
 
     %% Deferred PTO timer reset, flushed at batch boundaries via
-    %% flush_dirty_timers/1. (Idle and keep-alive timers are lazy and
+    %% flush_event/2. (Idle and keep-alive timers are lazy and
     %% re-arm only on fire, so they need no dirty flag.)
     pto_dirty = false :: boolean(),
 
