@@ -1811,12 +1811,8 @@ connected(
     {call, From},
     get_stats,
     #state{
-        packets_received = PacketsRecv,
-        packets_sent = PacketsSent,
         data_received = DataRecv,
         data_sent = DataSent,
-        ack_sent = AckSent,
-        retransmits = Retransmits,
         zero_rtt_stream_ids = ZeroRttStreams,
         socket_state = SocketState
     } = State
@@ -1826,18 +1822,18 @@ connected(
     %% counters for benchmarks and tests.
     {Flushes, Coalesced, GSOFlushes, Pending} = send_batch_counters(SocketState),
     Stats = #{
-        packets_received => PacketsRecv,
-        packets_sent => PacketsSent,
+        packets_received => count(?C_PACKETS_RECEIVED, State),
+        packets_sent => count(?C_PACKETS_SENT, State),
         data_received => DataRecv,
         data_sent => DataSent,
-        ack_sent => AckSent,
-        retransmits => Retransmits,
+        ack_sent => count(?C_ACK_SENT, State),
+        retransmits => count(?C_RETRANSMITS, State),
         %% Streams that carried 0-RTT-encrypted data and kept it. A
         %% rejection clears them (RFC 9001 Section 4.6.2), so a non-zero
         %% value here means early data was sent and the server took it.
         zero_rtt_streams => sets:size(ZeroRttStreams),
         %% Writes refused as backpressure; each is logged at debug only.
-        send_queue_full_refusals => State#state.send_queue_full_refusals,
+        send_queue_full_refusals => count(?C_SEND_QUEUE_FULL_REFUSALS, State),
         batch_flushes => Flushes,
         packets_coalesced => Coalesced,
         gso_flushes => GSOFlushes,
@@ -3276,10 +3272,8 @@ send_initial_packet(Payload, Frames, State) ->
 
             %% Update packet number space and packet counter
             NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-            State1#state{
-                pn_initial = NewPNSpace,
-                packets_sent = State1#state.packets_sent + 1
-            }
+            bump(?C_PACKETS_SENT, 1, State1),
+            State1#state{pn_initial = NewPNSpace}
     end.
 
 %% Send an Initial ACK packet
@@ -3322,18 +3316,27 @@ send_app_ack(#state{ack_timer = Ref, pn_app = PNSpace} = State, RecvPass) ->
             State#state{ack_timer = undefined, ack_elicited_count = 0, recv_pass = RecvPass};
         Ranges ->
             AckFrameTuple = quic_ack:build_ack_frame_tuple(Ranges),
+            bump(?C_ACK_SENT, 1, State),
             maybe_coalesce_ack_with_data(AckFrameTuple, State#state{
                 ack_timer = undefined,
                 ack_elicited_count = 0,
-                ack_sent = State#state.ack_sent + 1,
                 recv_pass = RecvPass
             })
     end.
 
 %% Bump the ack_sent counter. Called once per ACK packet that is about
 %% to hit the wire (after the ack_ranges non-empty check).
-bump_ack_sent(#state{ack_sent = N} = State) ->
-    State#state{ack_sent = N + 1}.
+bump_ack_sent(State) ->
+    bump(?C_ACK_SENT, 1, State),
+    State.
+
+%% Per-connection counters live in a counters array, so bumping one
+%% copies nothing.
+bump(Ix, N, #state{counters = C}) ->
+    counters:add(C, Ix, N).
+
+count(Ix, #state{counters = C}) ->
+    counters:get(C, Ix).
 
 %% Try to coalesce ACK frame with small pending stream data
 %% Takes frame tuples (not encoded) to avoid re-decode overhead
@@ -3468,10 +3471,8 @@ send_handshake_packet(Payload, Frames, State) ->
 
             %% Update PN space and packet counter
             NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-            State1#state{
-                pn_handshake = NewPNSpace,
-                packets_sent = State1#state.packets_sent + 1
-            }
+            bump(?C_PACKETS_SENT, 1, State1),
+            State1#state{pn_handshake = NewPNSpace}
     end.
 
 %% Send a 1-RTT (application) packet with a single frame (avoid encode/decode roundtrip)
@@ -3534,10 +3535,8 @@ coalesced_sends(Acc0, State0) ->
                     {ok, S2} ->
                         {[{Tag, ok} | Rs], S2};
                     {error, send_queue_full} ->
-                        Refusals = S#state.send_queue_full_refusals + 1,
-                        {[{Tag, {error, send_queue_full}} | Rs], S#state{
-                            send_queue_full_refusals = Refusals
-                        }};
+                        bump(?C_SEND_QUEUE_FULL_REFUSALS, 1, S),
+                        {[{Tag, {error, send_queue_full}} | Rs], S};
                     {error, Reason} ->
                         {[{Tag, {error, Reason}} | Rs], S}
                 end
@@ -3676,7 +3675,8 @@ send_app_packet_now(Payload0, Frames0, State, Pend, CCState) ->
                     false -> State#state.last_activity
                 end,
             {NewKeyState, KeyLimit} = count_sealed(State#state.key_state, 1),
-            {AckTimer, AckCount, AckSent} = sent_ack_fields(AckFields, State),
+            {AckTimer, AckCount} = sent_ack_fields(AckFields, State),
+            bump(?C_PACKETS_SENT, 1, State),
             {PendPayload, PendFrames, PendSize, Coalesce} =
                 case Pend of
                     keep ->
@@ -3693,7 +3693,6 @@ send_app_packet_now(Payload0, Frames0, State, Pend, CCState) ->
                 pn_app = NewPNSpace,
                 cc_state = NewCCState,
                 loss_state = NewLossState,
-                packets_sent = State#state.packets_sent + 1,
                 socket_state = EffectiveSocketState,
                 last_activity = NewLastActivity,
                 ack_eliciting_since_recv =
@@ -3706,8 +3705,7 @@ send_app_packet_now(Payload0, Frames0, State, Pend, CCState) ->
                 pend_size = PendSize,
                 coalesce = Coalesce,
                 ack_timer = AckTimer,
-                ack_elicited_count = AckCount,
-                ack_sent = AckSent
+                ack_elicited_count = AckCount
             },
             after_sealed(KeyLimit, State1);
         {error, Reason, ClearedSocketState} ->
@@ -3763,12 +3761,13 @@ piggyback_ack(
 piggyback_ack(_AckEliciting, Payload, Frames, _State) ->
     {Payload, Frames, none}.
 
-%% ACK timer, decimation count and ACK counter after the packet went out.
-sent_ack_fields(none, #state{ack_timer = T, ack_elicited_count = C, ack_sent = N}) ->
-    {T, C, N};
-sent_ack_fields(acked, #state{ack_timer = T, ack_sent = N}) ->
+%% ACK timer and decimation count after the packet went out.
+sent_ack_fields(none, #state{ack_timer = T, ack_elicited_count = C}) ->
+    {T, C};
+sent_ack_fields(acked, #state{ack_timer = T} = State) ->
     cancel_timer(T),
-    {undefined, 0, N + 1}.
+    bump(?C_ACK_SENT, 1, State),
+    {undefined, 0}.
 
 %% Common error handling for send_app_packet_internal: bump PN without
 %% tracking the packet (PTO owns retransmission) and, on the 3-tuple
@@ -4168,8 +4167,8 @@ fold_opened([{PN, FirstByte, Opened} | Rest], State, Now, N, Elicited) ->
 %% flushes), so one increment and one arm_ack_timer serve the run;
 %% outside a pass each increment gets the threshold check it would
 %% have had per packet.
-fold_opened_finish(State, N, Elicited) ->
-    State1 = State#state{packets_received = State#state.packets_received + N},
+fold_opened_finish(State1, N, Elicited) ->
+    bump(?C_PACKETS_RECEIVED, N, State1),
     case {Elicited, State1#state.recv_pass} of
         {0, _} ->
             State1;
@@ -4263,6 +4262,7 @@ apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, Recv, State) ->
                     ),
                     case State#state.recv_pass of
                         true ->
+                            bump(?C_PACKETS_RECEIVED, N, State),
                             {PNSpace, SpinRecv, LastPN, SpinOut, Now} = Recv,
                             State#state{
                                 pn_app = PNSpace,
@@ -4276,7 +4276,6 @@ apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, Recv, State) ->
                                 data_received = NewDataReceived,
                                 pend_deliver = PendDeliver,
                                 has_non_probing_frame = true,
-                                packets_received = State#state.packets_received + N,
                                 ack_elicited_count = State#state.ack_elicited_count + N
                             };
                         false ->
@@ -4437,15 +4436,13 @@ handle_packet_loop(Data, State) ->
             }),
 
             %% Increment packet counter for liveness detection
-            NewState1 = NewState#state{
-                packets_received = NewState#state.packets_received + 1
-            },
+            bump(?C_PACKETS_RECEIVED, 1, NewState),
 
-            ?QLOG_EMIT_FRAMES_PROCESSED(NewState1#state.qlog_ctx, Frames),
+            ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
 
             %% Send ACK if packet contained ack-eliciting frames
             State2 = server_discard_initial(
-                Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, NewState1))
+                Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, NewState))
             ),
             %% Continue with remaining coalesced packets
             handle_packet_loop(RemainingData, State2);
@@ -4456,10 +4453,8 @@ handle_packet_loop(Data, State) ->
                 frames => Frames
             }),
 
-            NewState1 = NewState#state{
-                packets_received = NewState#state.packets_received + 1
-            },
-            State1 = process_frames_noreenbl(Type, Frames, NewState1),
+            bump(?C_PACKETS_RECEIVED, 1, NewState),
+            State1 = process_frames_noreenbl(Type, Frames, NewState),
             ?QLOG_EMIT_FRAMES_PROCESSED(State1#state.qlog_ctx, Frames),
             State2 = server_discard_initial(
                 Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, State1))
@@ -4626,11 +4621,15 @@ decode_long_header_type(Type, Data, FirstByte, Version, DCID, SCID, Rest3, State
 %% processed any packet from this server; later ones are attacks or stale.
 handle_version_negotiation(_DCID, _Versions, #state{role = server}) ->
     {error, unexpected_version_negotiation};
-handle_version_negotiation(_DCID, _Versions, #state{packets_received = N}) when N > 0 ->
-    {error, late_version_negotiation};
-handle_version_negotiation(DCID, _Versions, #state{scid = SCID}) when DCID =/= SCID ->
+handle_version_negotiation(DCID, VersionsBin, State) ->
+    case count(?C_PACKETS_RECEIVED, State) of
+        0 -> handle_first_version_negotiation(DCID, VersionsBin, State);
+        _ -> {error, late_version_negotiation}
+    end.
+
+handle_first_version_negotiation(DCID, _Versions, #state{scid = SCID}) when DCID =/= SCID ->
     {error, version_negotiation_cid_mismatch};
-handle_version_negotiation(_DCID, VersionsBin, #state{version = Ours}) ->
+handle_first_version_negotiation(_DCID, VersionsBin, #state{version = Ours}) ->
     Versions = decode_versions(VersionsBin),
     case lists:member(Ours, Versions) of
         true ->
@@ -9234,9 +9233,9 @@ send_zero_rtt_packet(Payload, Frames, EarlyKeys, State) ->
 
     %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
+    bump(?C_PACKETS_SENT, 1, State),
     State#state{
         pn_app = NewPNSpace,
-        packets_sent = State#state.packets_sent + 1,
         socket_state = NewSocketState,
         loss_state = NewLossState,
         cc_state = NewCCState,
@@ -9362,10 +9361,13 @@ datagram_overhead(#state{dcid = Dcid}) ->
 %% mailbox holds more than max_owner_queue messages: DATAGRAMs are
 %% unreliable (RFC 9221 Section 5), and nothing else stops a peer from
 %% filling that mailbox. Drops show in datagram_stats/1.
-deliver_datagram(Data, #state{datagram_recv_dropped = Dropped} = State) ->
+deliver_datagram(Data, State) ->
     case owner_behind(State) of
-        true -> State#state{datagram_recv_dropped = Dropped + 1};
-        false -> push_datagram(Data, State)
+        true ->
+            bump(?C_DATAGRAM_RECV_DROPPED, 1, State),
+            State;
+        false ->
+            push_datagram(Data, State)
     end.
 
 %% Also account for it in the recv queue. With no cap (`infinity') this
@@ -9375,29 +9377,24 @@ push_datagram(
     #state{
         owner = Owner,
         datagram_recv_queue = Queue,
-        datagram_recv_queue_len = Cap,
-        datagram_recv_delivered = Delivered,
-        datagram_recv_dropped = Dropped
+        datagram_recv_queue_len = Cap
     } = State
 ) ->
     Owner ! {quic, self(), {datagram, Data}},
+    bump(?C_DATAGRAM_RECV_DELIVERED, 1, State),
     case Cap of
         infinity ->
-            State#state{datagram_recv_delivered = Delivered + 1};
+            State;
         Max when is_integer(Max), Max >= 0 ->
-            {Queue1, Dropped1} =
+            Queue1 =
                 case queue:len(Queue) >= Max of
                     true ->
-                        Trimmed = queue_drop_oldest(Queue),
-                        {queue:in(Data, Trimmed), Dropped + 1};
+                        bump(?C_DATAGRAM_RECV_DROPPED, 1, State),
+                        queue:in(Data, queue_drop_oldest(Queue));
                     false ->
-                        {queue:in(Data, Queue), Dropped}
+                        queue:in(Data, Queue)
                 end,
-            State#state{
-                datagram_recv_queue = Queue1,
-                datagram_recv_delivered = Delivered + 1,
-                datagram_recv_dropped = Dropped1
-            }
+            State#state{datagram_recv_queue = Queue1}
     end.
 
 queue_drop_oldest(Q) ->
@@ -9407,17 +9404,12 @@ queue_drop_oldest(Q) ->
     end.
 
 %% Stats snapshot used by quic:datagram_stats/1.
-datagram_stats_snapshot(#state{
-    datagram_recv_delivered = Delivered,
-    datagram_recv_dropped = RDropped,
-    datagram_sent = Sent,
-    datagram_send_dropped = SDropped
-}) ->
+datagram_stats_snapshot(State) ->
     #{
-        delivered => Delivered,
-        dropped_recv => RDropped,
-        sent => Sent,
-        dropped_send => SDropped
+        delivered => count(?C_DATAGRAM_RECV_DELIVERED, State),
+        dropped_recv => count(?C_DATAGRAM_RECV_DROPPED, State),
+        sent => count(?C_DATAGRAM_SENT, State),
+        dropped_send => count(?C_DATAGRAM_SEND_DROPPED, State)
     }.
 
 %% Send a datagram (RFC 9221)
@@ -9445,13 +9437,12 @@ do_send_datagram(
                     %% Use datagram_with_length for better framing
                     Frame = {datagram_with_length, DataBin},
                     Payload = quic_frame:encode(Frame),
-                    State1 = send_app_packet_internal(Payload, [Frame], State),
-                    {ok, State1#state{datagram_sent = State#state.datagram_sent + 1}};
+                    bump(?C_DATAGRAM_SENT, 1, State),
+                    {ok, send_app_packet_internal(Payload, [Frame], State)};
                 false ->
                     %% Datagrams are unreliable - just drop if cwnd is full
-                    {error, congestion_limited, State#state{
-                        datagram_send_dropped = State#state.datagram_send_dropped + 1
-                    }}
+                    bump(?C_DATAGRAM_SEND_DROPPED, 1, State),
+                    {error, congestion_limited, State}
             end
     end.
 
@@ -9642,12 +9633,12 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
     %% RFC 9000 §10.1: the idle timer restarts on the first ack-eliciting
     %% send since the last receive (see send_app_packet_now/3).
     RestartIdle = not State#state.ack_eliciting_since_recv,
+    bump(?C_PACKETS_SENT, K, State),
     State1 = State#state{
         pn_app = PNSpace#pn_space{next_pn = PN0 + K},
         loss_state = Loss1,
         cc_state = CC1,
         socket_state = SS1,
-        packets_sent = State#state.packets_sent + K,
         burst_sent = State#state.burst_sent + K,
         last_activity =
             case RestartIdle of
@@ -10912,14 +10903,15 @@ send_retransmit_frames_cc(Frames, State) ->
 %% is denied, no probe means no ACK, no ACK means loss detection never
 %% runs, and the connection stalls until idle timeout with a full
 %% sent_q. Mode `normal' (loss retransmission) stays subject to cwnd.
-send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = State, Mode) ->
+send_retransmit_frames_cc(Frames, #state{cc_state = CCState} = State, Mode) ->
     %% Encode all frames and check size
     Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
     PacketSize = byte_size(Payload) + 50,
 
     case retransmit_cc_allowed(Mode, CCState, PacketSize) of
         true ->
-            send_app_packet_internal(Payload, Frames, State#state{retransmits = R + 1});
+            bump(?C_RETRANSMITS, 1, State),
+            send_app_packet_internal(Payload, Frames, State);
         false ->
             %% CC doesn't allow yet. detect_lost_packets/2 already pulled these
             %% frames out of sent_q, so PTO would not retry them. Track them so

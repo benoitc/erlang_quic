@@ -25,6 +25,18 @@
 %% option). See the burst_budget field.
 -define(DEFAULT_MAX_BURST_PACKETS, 64).
 
+%% Indexes into the per-connection counters array (#state.counters).
+-define(C_PACKETS_SENT, 1).
+-define(C_PACKETS_RECEIVED, 2).
+-define(C_ACK_SENT, 3).
+-define(C_RETRANSMITS, 4).
+-define(C_DATAGRAM_SENT, 5).
+-define(C_DATAGRAM_SEND_DROPPED, 6).
+-define(C_DATAGRAM_RECV_DELIVERED, 7).
+-define(C_DATAGRAM_RECV_DROPPED, 8).
+-define(C_SEND_QUEUE_FULL_REFUSALS, 9).
+-define(N_COUNTERS, 9).
+
 %% Connection state record
 -record(state, {
     %% Connection identity
@@ -234,10 +246,6 @@
     %% surfaces dropped counts for backpressure decisions.
     datagram_recv_queue_len = infinity :: non_neg_integer() | infinity,
     datagram_recv_queue = queue:new() :: queue:queue(binary()),
-    datagram_recv_delivered = 0 :: non_neg_integer(),
-    datagram_recv_dropped = 0 :: non_neg_integer(),
-    datagram_sent = 0 :: non_neg_integer(),
-    datagram_send_dropped = 0 :: non_neg_integer(),
 
     %% Latency spin bit (RFC 9000 §17.4). `spin_outgoing' is the bit
     %% we set on outbound 1-RTT packets; updated from `spin_recv' on
@@ -351,8 +359,6 @@
 
     %% Send queue byte tracking (prevents memory exhaustion)
     send_queue_bytes = 0 :: non_neg_integer(),
-    %% Writes refused with send_queue_full, reported by get_stats.
-    send_queue_full_refusals = 0 :: non_neg_integer(),
     %% Streams whose receive credit waits for the reader (recv_flow).
     manual_recv_streams = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
     %% The owner asked to hear `send_ready' once the send queue drains.
@@ -487,16 +493,13 @@
     %% Connection is congested when queue > cwnd * congestion_threshold
     congestion_threshold = 2 :: pos_integer(),
 
-    %% Statistics - packet counts for liveness detection
-    %% These count actual QUIC packets (not bytes), used by net_kernel getstat
-    packets_received = 0 :: non_neg_integer(),
-    packets_sent = 0 :: non_neg_integer(),
-    %% ACK frames emitted on the wire (Initial + Handshake + 1-RTT), alone
-    %% or riding on a data packet.
-    %% Used by benches/tests to reason about ACK-to-data ratios.
-    ack_sent = 0 :: non_neg_integer(),
-    %% Retransmission packets emitted (CC-permitted branch of loss recovery).
-    retransmits = 0 :: non_neg_integer(),
+    %% Statistics, indexed by the ?C_* macros: QUIC packets sent and
+    %% received (net_kernel getstat liveness), ACK frames emitted alone or
+    %% on a data packet, CC-permitted retransmissions, DATAGRAM frames sent,
+    %% dropped on send, delivered and dropped on receive, and writes
+    %% refused with send_queue_full. Mutable, so bumping one copies
+    %% nothing.
+    counters = counters:new(?N_COUNTERS, [atomics]) :: counters:counters_ref(),
 
     %% Socket active mode - number of packets before socket goes passive
     %% Using {active, N} instead of {active, once} reduces inet:setopts overhead

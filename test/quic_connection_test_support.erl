@@ -194,7 +194,7 @@ recv_summary(#state{pn_app = PN, streams = Streams} = State, StreamId) ->
         ack_ranges => PN#pn_space.ack_ranges,
         recv_offset => (maps:get(StreamId, Streams))#stream_state.recv_offset,
         data_received => State#state.data_received,
-        packets_received => State#state.packets_received,
+        packets_received => quic_connection:count(?C_PACKETS_RECEIVED, State),
         ack_elicited_count => State#state.ack_elicited_count,
         pend_deliver => State#state.pend_deliver,
         spin_recv_largest_pn => State#state.spin_recv_largest_pn,
@@ -388,7 +388,7 @@ state_get(#state{} = S, dcid) -> S#state.dcid;
 state_get(#state{} = S, initial_keys) -> S#state.initial_keys;
 state_get(#state{} = S, handshake_keys) -> S#state.handshake_keys;
 state_get(#state{} = S, handshake_next_pn) -> (S#state.pn_handshake)#pn_space.next_pn;
-state_get(#state{} = S, packets_sent) -> S#state.packets_sent;
+state_get(#state{} = S, packets_sent) -> quic_connection:count(?C_PACKETS_SENT, S);
 state_get(#state{} = S, amp_tx) -> S#state.amp_tx;
 state_get(#state{} = S, pacing_timer) -> S#state.pacing_timer.
 
@@ -738,8 +738,12 @@ local_cids(#state{cid_pool_state = Pool}) -> quic_cid:local_entries(Pool).
         ack_elicited_count := non_neg_integer(),
         ack_timer := undefined | reference()
     }.
-ack_counters(#state{ack_sent = Sent, ack_elicited_count = Count, ack_timer = Timer}) ->
-    #{ack_sent => Sent, ack_elicited_count => Count, ack_timer => Timer}.
+ack_counters(#state{ack_elicited_count = Count, ack_timer = Timer} = S) ->
+    #{
+        ack_sent => quic_connection:count(?C_ACK_SENT, S),
+        ack_elicited_count => Count,
+        ack_timer => Timer
+    }.
 
 %% End a receive pass as the datagram handlers do and return the
 %% observable decimation fields.
@@ -894,7 +898,7 @@ recv_max_data(#state{streams = Streams}, StreamId) ->
     Max.
 
 -spec send_queue_full_refusals(#state{}) -> non_neg_integer().
-send_queue_full_refusals(#state{send_queue_full_refusals = N}) -> N.
+send_queue_full_refusals(S) -> quic_connection:count(?C_SEND_QUEUE_FULL_REFUSALS, S).
 
 %% A connected client that has opened stream 0 and can send frames: its
 %% stream and connection limits start at Window, and grow to MaxWindow.
