@@ -38,11 +38,176 @@
 -define(N_COUNTERS, 9).
 
 %% Connection state record
--record(state, {
+%% Write-once connection configuration, set in init/1 and never
+%% updated. Kept apart from #state{} so a state update copies one
+%% pointer for all of it.
+-record(conn_cfg, {
     %% Connection identity
     scid :: binary(),
-    dcid :: binary(),
     original_dcid :: binary(),
+    %% Server-side only. The Retry SCID to echo back as
+    %% retry_source_connection_id (RFC 9000 §7.3) when this connection
+    %% was spawned from a retried Initial.
+    retry_scid_for_tp = undefined :: binary() | undefined,
+    role :: client | server,
+    %% Acceptable versions in preference order (RFC 9368); the head of
+    %% the list is what we advertise as most preferred.
+    supported_versions = [?QUIC_VERSION_1] :: [non_neg_integer()],
+    %% Dedicated send socket for server connections (SO_REUSEPORT)
+    %% Allows each server connection to have its own batching state
+    send_socket :: gen_udp:socket() | undefined,
+    %% Client socket backend selector (gen_udp | socket). When `socket'
+    %% the client uses the OTP socket NIF via open_for_send/2 and a
+    %% dedicated receiver process forwards {udp, ...} messages to this
+    %% connection. Ignored for server connections (the listener picks).
+    client_socket_backend = gen_udp :: gen_udp | socket | adapter,
+    local_addr :: {inet:ip_address(), inet:port_number()} | undefined,
+    conn_ref :: reference(),
+    verify :: boolean(),
+    %% Trust anchors (DER): a client validates the server cert against these, a
+    %% server validates a presented client cert; undefined = OS store
+    cacerts :: [binary()] | undefined,
+    %% Server-side mutual TLS: require a valid client certificate. When false, an
+    %% empty client Certificate is accepted (optional mTLS, RFC 8446 §4.4.2.4).
+    require_client_cert = false :: boolean(),
+
+    %% Key-exchange + signature negotiation (RFC 8446 §4.1.4 / §4.2.3)
+    tls_groups = [x25519] :: [atom()],
+    tls_sig_algs :: [atom()] | undefined,
+    cipher_preference = [aes_128_gcm, aes_256_gcm, chacha20_poly1305] :: [atom()],
+    alpn_list :: [binary()],
+    %% Per-stream flow control limits (advertised in transport params)
+    max_stream_data_bidi_local :: non_neg_integer(),
+    max_stream_data_bidi_remote :: non_neg_integer(),
+    max_stream_data_uni :: non_neg_integer(),
+    fc_max_receive_window :: non_neg_integer(),
+    %% Credit for `auto' streams and the connection is withheld while the
+    %% owner's mailbox holds more than this, and re-checked on credit_timer
+    max_owner_queue = ?DEFAULT_MAX_OWNER_QUEUE :: pos_integer() | infinity,
+
+    %% Largest UDP payload we advertise being willing to receive
+    %% (RFC 9000 §18.2). `undefined' means "derive it from the local
+    %% address family" rather than the PMTU probing ceiling.
+    max_udp_payload_size_local = undefined :: pos_integer() | undefined,
+
+    %% Datagram support (RFC 9221)
+    %% Local: our advertised max size (0 = disabled)
+    max_datagram_frame_size_local = 0 :: non_neg_integer(),
+    %% Bounded receive queue for DATAGRAM frames. `infinity' disables
+    %% the cap entirely (default). When finite, we still push each
+    %% datagram to the owner process, but we also drop the oldest entry
+    %% in this queue when the limit is hit so that `datagram_stats/1'
+    %% surfaces dropped counts for backpressure decisions.
+    datagram_recv_queue_len = infinity :: non_neg_integer() | infinity,
+    spin_bit_enabled = true :: boolean(),
+
+    %% Server-wide secret used to HMAC stateless-reset tokens over a
+    %% connection id (RFC 9000 §10.3.2). `undefined' preserves today's
+    %% per-CID random-token fallback — acceptable for clients and for
+    %% single-instance servers that don't need post-restart recovery.
+    stateless_reset_secret = undefined :: binary() | undefined,
+
+    %% RESET_STREAM_AT support (draft-ietf-quic-reliable-stream-reset-07)
+    %% Local: whether we advertise support for RESET_STREAM_AT
+    reset_stream_at_enabled = false :: boolean(),
+
+    %% Timers
+    idle_timeout :: non_neg_integer(),
+
+    %% Keep-alive (RFC 9000 - PING frames for liveness)
+    keep_alive_interval :: non_neg_integer() | disabled,
+
+    %% Give up on an unresponsive peer: close the connection when
+    %% ack-eliciting data has been in flight with no ACK for this long
+    %% (RFC 9000 permits idle-timeout-only, but a stateless-reset-blind
+    %% peer then lingers for the whole idle timeout; msquic uses a 16 s
+    %% disconnect timeout for the same reason).
+    disconnect_timeout = 16000 :: pos_integer() | infinity,
+    pacing_enabled = true :: boolean(),
+
+    %% Server-specific fields
+    listener :: pid() | undefined,
+    %% Per-SNI cert selection (RFC 6066 §3). When set, invoked on the
+    %% ClientHello server_name to override the cert fields above.
+    sni_callback ::
+        fun((binary() | undefined) -> {ok, map()} | {error, term()}) | undefined,
+    %% Server preferred address config (RFC 9000 Section 9.6)
+    %% Set from listener options: {IPv4, IPv6} where each is {Addr, Port} | undefined
+    server_preferred_address :: #preferred_address{} | undefined,
+
+    %% Client certificate (for mutual TLS)
+    client_cert :: binary() | undefined,
+    client_cert_chain = [] :: [binary()],
+    client_private_key :: term() | undefined,
+    %% Server-side: the issuing listener's table, the only place a
+    %% ticket presented to this connection is looked up
+    ticket_table :: ets:table() | undefined,
+
+    %% TLS 1.3 External PSK (RFC 8446 §4.2.11)
+    %% Client-side: offered to the peer. Two-tuple form defaults to
+    %% modes [psk_dhe_ke]; three-tuple form takes an explicit list.
+    external_psk ::
+        {binary(), binary()}
+        | {binary(), binary(), [psk_dhe_ke | psk_ke]}
+        | undefined,
+    %% Server-side: configured PSK lookup (callback wins, map as fallback).
+    psk_config ::
+        #{
+            psk_callback => fun((binary()) -> {ok, binary()} | not_found) | undefined,
+            psks => #{binary() => binary()} | undefined
+        }
+        | undefined,
+
+    %% QUIC-LB CID configuration (RFC 9312)
+    cid_config :: #cid_config{} | undefined,
+
+    %% Backpressure configuration (for distribution connections)
+    %% Connection is congested when queue > cwnd * congestion_threshold
+    congestion_threshold = 2 :: pos_integer(),
+
+    %% Statistics, indexed by the ?C_* macros: QUIC packets sent and
+    %% received (net_kernel getstat liveness), ACK frames emitted alone or
+    %% on a data packet, CC-permitted retransmissions, DATAGRAM frames sent,
+    %% dropped on send, delivered and dropped on receive, and writes
+    %% refused with send_queue_full. Mutable, so bumping one copies
+    %% nothing.
+    counters = counters:new(?N_COUNTERS, [atomics]) :: counters:counters_ref(),
+
+    %% Socket active mode - number of packets before socket goes passive
+    %% Using {active, N} instead of {active, once} reduces inet:setopts overhead
+    active_n = 100 :: pos_integer(),
+    pmtu_raise_interval = ?PMTU_DEFAULT_RAISE_INTERVAL :: pos_integer(),
+
+    %% Per-drain send burst budget (max_burst_packets option). Bounds
+    %% how many packets one drain emits before the remainder is queued
+    %% and a zero-delay pacing continuation is armed, yielding to the
+    %% event loop so ACK/loss feedback interleaves with bulk sending.
+    %% Without the bound a large cwnd lets a single send event emit
+    %% hundreds of packets back-to-back, which overflows slow receivers
+    %% (GSO bursts especially) before any loss signal is seen.
+    burst_budget = ?DEFAULT_MAX_BURST_PACKETS :: pos_integer(),
+    %% Opt-in (delivery_coalescing option): merge consecutive
+    %% same-stream stream_data deliveries of one receive pass into a
+    %% single owner message. QUIC gives no message-boundary guarantee,
+    %% but owners that decode each delivery as one complete
+    %% application message (rather than length-framing the byte
+    %% stream) break when deliveries merge, so the default keeps the
+    %% one-message-per-packet behaviour.
+    delivery_coalescing = false :: boolean(),
+    %% How many ack-eliciting 1-RTT packets to accumulate before
+    %% flushing an ACK. 2 is the RFC 9000 §13.2.1 recommendation;
+    %% higher values trade ACK traffic (and receiver CPU) for RTT
+    %% sample granularity and slower loss feedback, bounded by the
+    %% max_ack_delay timer either way.
+    ack_packet_tolerance = ?ACK_PACKET_TOLERANCE :: pos_integer(),
+
+    %% QLOG Tracing (draft-ietf-quic-qlog-quic-events)
+    qlog_ctx :: #qlog_ctx{} | undefined
+}).
+
+-record(state, {
+    %% Connection identity (the rest is in #conn_cfg{})
+    dcid :: binary(),
     %% Retry handling (RFC 9000 Section 8.1)
 
     % Token from Retry packet for Initial resend
@@ -59,35 +224,18 @@
     %% again when more is received or the address becomes validated.
     amp_rx = 0 :: non_neg_integer(),
     amp_tx = 0 :: non_neg_integer(),
-    %% Server-side only. The Retry SCID to echo back as
-    %% retry_source_connection_id (RFC 9000 §7.3) when this connection
-    %% was spawned from a retried Initial.
-    retry_scid_for_tp = undefined :: binary() | undefined,
     % SCID from Retry packet (for transport param validation)
     retry_scid :: binary() | undefined,
-    role :: client | server,
     version = ?QUIC_VERSION_1 :: non_neg_integer(),
-    %% Acceptable versions in preference order (RFC 9368); the head of
-    %% the list is what we advertise as most preferred.
-    supported_versions = [?QUIC_VERSION_1] :: [non_neg_integer()],
 
     %% Socket
     socket :: gen_udp:socket() | socket:socket() | undefined,
-    %% Dedicated send socket for server connections (SO_REUSEPORT)
-    %% Allows each server connection to have its own batching state
-    send_socket :: gen_udp:socket() | undefined,
     %% Socket state for batching (quic_socket abstraction)
     socket_state :: quic_socket:socket_state() | undefined,
-    %% Client socket backend selector (gen_udp | socket). When `socket'
-    %% the client uses the OTP socket NIF via open_for_send/2 and a
-    %% dedicated receiver process forwards {udp, ...} messages to this
-    %% connection. Ignored for server connections (the listener picks).
-    client_socket_backend = gen_udp :: gen_udp | socket | adapter,
     %% Pid of the client-side receiver process when
     %% client_socket_backend = socket; undefined otherwise.
     client_receiver :: pid() | undefined,
     remote_addr :: {inet:ip_address(), inet:port_number()},
-    local_addr :: {inet:ip_address(), inet:port_number()} | undefined,
 
     %% Owner process (receives {quic, Conn, Event} messages where Conn is pid())
     owner :: pid(),
@@ -97,17 +245,9 @@
     %% `opted_out' when `monitor_owner => false' asked for the connection to
     %% outlive it; `undefined' when there is nothing to follow.
     owner_mon :: reference() | {linked, pid()} | opted_out | undefined,
-    conn_ref :: reference(),
 
     %% Options
     server_name :: binary() | undefined,
-    verify :: boolean(),
-    %% Trust anchors (DER): a client validates the server cert against these, a
-    %% server validates a presented client cert; undefined = OS store
-    cacerts :: [binary()] | undefined,
-    %% Server-side mutual TLS: require a valid client certificate. When false, an
-    %% empty client Certificate is accepted (optional mTLS, RFC 8446 §4.4.2.4).
-    require_client_cert = false :: boolean(),
 
     %% Encryption keys per level
     initial_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
@@ -130,10 +270,6 @@
     master_secret :: binary() | undefined,
     server_hs_secret :: binary() | undefined,
     client_hs_secret :: binary() | undefined,
-
-    %% Key-exchange + signature negotiation (RFC 8446 §4.1.4 / §4.2.3)
-    tls_groups = [x25519] :: [atom()],
-    tls_sig_algs :: [atom()] | undefined,
     %% Peer's offered signature_algorithms (wire codes), set on the
     %% server when the ClientHello is parsed.
     peer_sig_algs = [] :: [non_neg_integer()],
@@ -154,11 +290,6 @@
     %% retained until HANDSHAKE_DONE so a lost Finished can be resent -
     %% nothing else retransmits it once the statem has left `handshaking'.
     client_hs_flight = undefined :: undefined | binary(),
-    %% Retransmission timer for that flight, armed while it is retained.
-    %% The flight has to carry its own timer: once the statem leaves
-    %% `handshaking' nothing else is guaranteed to be in flight to arm a
-    %% PTO, so a lost Finished had no schedule to resend it on.
-    cipher_preference = [aes_128_gcm, aes_256_gcm, chacha20_poly1305] :: [atom()],
     tls_ch1_opts :: map() | undefined,
     %% Negotiated values surfaced in the connected event
     negotiated_group :: atom() | undefined,
@@ -174,7 +305,6 @@
 
     %% Negotiated ALPN
     alpn :: binary() | undefined,
-    alpn_list :: [binary()],
 
     %% Packet number spaces
     pn_initial :: #pn_space{},
@@ -186,17 +316,9 @@
     max_data_remote :: non_neg_integer(),
     data_sent = 0 :: non_neg_integer(),
     data_received = 0 :: non_neg_integer(),
-    %% Per-stream flow control limits (advertised in transport params)
-    max_stream_data_bidi_local :: non_neg_integer(),
-    max_stream_data_bidi_remote :: non_neg_integer(),
-    max_stream_data_uni :: non_neg_integer(),
     %% Flow control auto-tuning state
     fc_last_stream_update :: integer() | undefined,
     fc_last_conn_update :: integer() | undefined,
-    fc_max_receive_window :: non_neg_integer(),
-    %% Credit for `auto' streams and the connection is withheld while the
-    %% owner's mailbox holds more than this, and re-checked on credit_timer
-    max_owner_queue = ?DEFAULT_MAX_OWNER_QUEUE :: pos_integer() | infinity,
     credit_timer :: reference() | undefined,
     %% `auto' streams whose MAX_STREAM_DATA is waiting on credit_timer
     credit_withheld = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
@@ -228,23 +350,8 @@
     %% Lost control-frame retransmissions deferred by congestion control, replayed
     %% through the CC-checked retransmit path when cwnd reopens.
     deferred_ctrl_retransmits = [] :: [term()],
-
-    %% Largest UDP payload we advertise being willing to receive
-    %% (RFC 9000 §18.2). `undefined' means "derive it from the local
-    %% address family" rather than the PMTU probing ceiling.
-    max_udp_payload_size_local = undefined :: pos_integer() | undefined,
-
-    %% Datagram support (RFC 9221)
-    %% Local: our advertised max size (0 = disabled)
-    max_datagram_frame_size_local = 0 :: non_neg_integer(),
     %% Remote: peer's advertised max size (0 = not supported)
     max_datagram_frame_size_remote = 0 :: non_neg_integer(),
-    %% Bounded receive queue for DATAGRAM frames. `infinity' disables
-    %% the cap entirely (default). When finite, we still push each
-    %% datagram to the owner process, but we also drop the oldest entry
-    %% in this queue when the limit is hit so that `datagram_stats/1'
-    %% surfaces dropped counts for backpressure decisions.
-    datagram_recv_queue_len = infinity :: non_neg_integer() | infinity,
     datagram_recv_queue = queue:new() :: queue:queue(binary()),
 
     %% Latency spin bit (RFC 9000 §17.4). `spin_outgoing' is the bit
@@ -255,23 +362,9 @@
     spin_outgoing = 0 :: 0 | 1,
     spin_recv = 0 :: 0 | 1,
     spin_recv_largest_pn = -1 :: integer(),
-    spin_bit_enabled = true :: boolean(),
-
-    %% Server-wide secret used to HMAC stateless-reset tokens over a
-    %% connection id (RFC 9000 §10.3.2). `undefined' preserves today's
-    %% per-CID random-token fallback — acceptable for clients and for
-    %% single-instance servers that don't need post-restart recovery.
-    stateless_reset_secret = undefined :: binary() | undefined,
-
-    %% RESET_STREAM_AT support (draft-ietf-quic-reliable-stream-reset-07)
-    %% Local: whether we advertise support for RESET_STREAM_AT
-    reset_stream_at_enabled = false :: boolean(),
 
     %% Transport parameters (received from peer)
     transport_params = #{} :: map(),
-
-    %% Timers
-    idle_timeout :: non_neg_integer(),
     last_activity :: non_neg_integer(),
     %% RFC 9000 §10.1: true once an ack-eliciting packet has been sent since the
     %% last received packet. Gates the send-side idle-timer restart so it fires
@@ -322,17 +415,7 @@
     %% reads the predicate directly rather than this field.
     handshake_ack_received = false :: boolean(),
     idle_timer :: reference() | undefined,
-
-    %% Keep-alive (RFC 9000 - PING frames for liveness)
-    keep_alive_interval :: non_neg_integer() | disabled,
     keep_alive_timer :: reference() | undefined,
-
-    %% Give up on an unresponsive peer: close the connection when
-    %% ack-eliciting data has been in flight with no ACK for this long
-    %% (RFC 9000 permits idle-timeout-only, but a stateless-reset-blind
-    %% peer then lingers for the whole idle timeout; msquic uses a 16 s
-    %% disconnect timeout for the same reason).
-    disconnect_timeout = 16000 :: pos_integer() | infinity,
     %% Dedicated timer for the above. Checking it only when a PTO happened
     %% to fire made the effective timeout the next PTO after the deadline,
     %% and PTO backoff doubles, so a nominal 16 s took 24 s or more.
@@ -340,7 +423,6 @@
 
     %% Pacing (RFC 9002 Section 7.7)
     pacing_timer :: reference() | undefined,
-    pacing_enabled = true :: boolean(),
 
     %% Pending data - priority queue with 8 buckets (one per urgency 0-7)
     %% Each bucket is a queue:queue() for FIFO within same priority
@@ -416,24 +498,9 @@
     %% Peer certificate (received during TLS handshake)
     peer_cert :: binary() | undefined,
     peer_cert_chain = [] :: [binary()],
-
-    %% Server-specific fields
-    listener :: pid() | undefined,
     server_cert :: binary() | undefined,
     server_cert_chain = [] :: [binary()],
     server_private_key :: term() | undefined,
-    %% Per-SNI cert selection (RFC 6066 §3). When set, invoked on the
-    %% ClientHello server_name to override the cert fields above.
-    sni_callback ::
-        fun((binary() | undefined) -> {ok, map()} | {error, term()}) | undefined,
-    %% Server preferred address config (RFC 9000 Section 9.6)
-    %% Set from listener options: {IPv4, IPv6} where each is {Addr, Port} | undefined
-    server_preferred_address :: #preferred_address{} | undefined,
-
-    %% Client certificate (for mutual TLS)
-    client_cert :: binary() | undefined,
-    client_cert_chain = [] :: [binary()],
-    client_private_key :: term() | undefined,
     %% True if server sent CertificateRequest
     cert_request_received = false :: boolean(),
 
@@ -444,24 +511,6 @@
 
     %% Client-side ticket storage for session resumption
     ticket_store = #{} :: quic_ticket:ticket_store(),
-    %% Server-side: the issuing listener's table, the only place a
-    %% ticket presented to this connection is looked up
-    ticket_table :: ets:table() | undefined,
-
-    %% TLS 1.3 External PSK (RFC 8446 §4.2.11)
-    %% Client-side: offered to the peer. Two-tuple form defaults to
-    %% modes [psk_dhe_ke]; three-tuple form takes an explicit list.
-    external_psk ::
-        {binary(), binary()}
-        | {binary(), binary(), [psk_dhe_ke | psk_ke]}
-        | undefined,
-    %% Server-side: configured PSK lookup (callback wins, map as fallback).
-    psk_config ::
-        #{
-            psk_callback => fun((binary()) -> {ok, binary()} | not_found) | undefined,
-            psks => #{binary() => binary()} | undefined
-        }
-        | undefined,
     %% Per-handshake: identity/secret/mode the server selected, or undefined.
     selected_psk ::
         undefined
@@ -486,50 +535,15 @@
     %% RFC 9001 §4.6.2) stream state.
     zero_rtt_stream_ids = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
 
-    %% QUIC-LB CID configuration (RFC 9312)
-    cid_config :: #cid_config{} | undefined,
-
-    %% Backpressure configuration (for distribution connections)
-    %% Connection is congested when queue > cwnd * congestion_threshold
-    congestion_threshold = 2 :: pos_integer(),
-
-    %% Statistics, indexed by the ?C_* macros: QUIC packets sent and
-    %% received (net_kernel getstat liveness), ACK frames emitted alone or
-    %% on a data packet, CC-permitted retransmissions, DATAGRAM frames sent,
-    %% dropped on send, delivered and dropped on receive, and writes
-    %% refused with send_queue_full. Mutable, so bumping one copies
-    %% nothing.
-    counters = counters:new(?N_COUNTERS, [atomics]) :: counters:counters_ref(),
-
-    %% Socket active mode - number of packets before socket goes passive
-    %% Using {active, N} instead of {active, once} reduces inet:setopts overhead
-    active_n = 100 :: pos_integer(),
-
     %% PMTU Discovery (RFC 8899)
     pmtu_state :: #pmtu_state{} | undefined,
     pmtu_probe_timer :: reference() | undefined,
     pmtu_raise_timer :: reference() | undefined,
-    pmtu_raise_interval = ?PMTU_DEFAULT_RAISE_INTERVAL :: pos_integer(),
 
     %% Deferred PTO timer reset, flushed at batch boundaries via
     %% flush_event/2. (Idle and keep-alive timers are lazy and
     %% re-arm only on fire, so they need no dirty flag.)
     pto_dirty = false :: boolean(),
-
-    %% 1-RTT ACK decimation (RFC 9002 §6.2). Count of ack-eliciting
-    %% 1-RTT packets received since the last emitted ACK. When it
-    %% reaches ?ACK_PACKET_TOLERANCE (default 2) the ACK is sent
-    %% immediately; otherwise a max_ack_delay timer (ack_timer) is
-    %% armed so the peer sees an ACK at worst max_ack_delay ms after
-    %% the first ack-eliciting packet in the window.
-    %% Per-drain send burst budget (max_burst_packets option). Bounds
-    %% how many packets one drain emits before the remainder is queued
-    %% and a zero-delay pacing continuation is armed, yielding to the
-    %% event loop so ACK/loss feedback interleaves with bulk sending.
-    %% Without the bound a large cwnd lets a single send event emit
-    %% hundreds of packets back-to-back, which overflows slow receivers
-    %% (GSO bursts especially) before any loss signal is seen.
-    burst_budget = ?DEFAULT_MAX_BURST_PACKETS :: pos_integer(),
     burst_sent = 0 :: non_neg_integer(),
     %% True while a connected-state receive pass (first datagram plus
     %% drained mailbox train) is being processed. Count-based ACK
@@ -538,26 +552,18 @@
     %% packets. The max_ack_delay timer still bounds latency; the
     %% reordering immediate-ACK path bypasses this.
     recv_pass = false :: boolean(),
-    %% Opt-in (delivery_coalescing option): merge consecutive
-    %% same-stream stream_data deliveries of one receive pass into a
-    %% single owner message. QUIC gives no message-boundary guarantee,
-    %% but owners that decode each delivery as one complete
-    %% application message (rather than length-framing the byte
-    %% stream) break when deliveries merge, so the default keeps the
-    %% one-message-per-packet behaviour.
-    delivery_coalescing = false :: boolean(),
     %% Pending run for the above: stream id, reversed chunk list, fin.
     %% A delivery for a DIFFERENT stream flushes the pending one
     %% first, so the owner observes stream_data messages in exact
     %% arrival order; only adjacent chunks of one stream merge.
     pend_deliver = none :: none | {non_neg_integer(), [binary()], boolean()},
+    %% 1-RTT ACK decimation (RFC 9002 §6.2). Count of ack-eliciting
+    %% 1-RTT packets received since the last emitted ACK. When it
+    %% reaches ?ACK_PACKET_TOLERANCE (default 2) the ACK is sent
+    %% immediately; otherwise a max_ack_delay timer (ack_timer) is
+    %% armed so the peer sees an ACK at worst max_ack_delay ms after
+    %% the first ack-eliciting packet in the window.
     ack_elicited_count = 0 :: non_neg_integer(),
-    %% How many ack-eliciting 1-RTT packets to accumulate before
-    %% flushing an ACK. 2 is the RFC 9000 §13.2.1 recommendation;
-    %% higher values trade ACK traffic (and receiver CPU) for RTT
-    %% sample granularity and slower loss feedback, bounded by the
-    %% max_ack_delay timer either way.
-    ack_packet_tolerance = ?ACK_PACKET_TOLERANCE :: pos_integer(),
     ack_timer = undefined :: reference() | undefined,
     %% Transient: classification of the most recently received 1-RTT
     %% packet. Set by `record_received_pn/3' and consumed once by
@@ -565,9 +571,6 @@
     %% (RFC 9002 §6.2 reordering recommendation) and count-based
     %% decimation.
     last_recv_trigger = sequential :: sequential | reordered,
-
-    %% QLOG Tracing (draft-ietf-quic-qlog-quic-events)
-    qlog_ctx :: #qlog_ctx{} | undefined,
 
     %% Small-send coalescing (issue #201). While `coalesce' is true -
     %% only within one drained batch of send_data/send_data_async
@@ -578,7 +581,10 @@
     coalesce = false :: boolean(),
     pend_payload = [] :: [iodata()],
     pend_frames = [] :: [tuple()],
-    pend_size = 0 :: non_neg_integer()
+    pend_size = 0 :: non_neg_integer(),
+
+    %% Write-once configuration, see #conn_cfg{}.
+    cfg = #conn_cfg{} :: #conn_cfg{}
 }).
 
 -endif.
