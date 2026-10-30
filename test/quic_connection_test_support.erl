@@ -276,16 +276,20 @@ state_with_keys(Role) ->
             scid = <<"own-cid0">>
         },
         hs = #hs{
-            pn_handshake = #pn_space{
-                next_pn = 0,
-                largest_recv = undefined,
-                recv_time = undefined,
-                ack_ranges = [],
-                ack_eliciting_in_flight = 0
-            },
+            pn_initial = empty_pn_space(),
+            pn_handshake = empty_pn_space(),
             initial_keys = Keys,
             handshake_keys = Keys
         }
+    }.
+
+empty_pn_space() ->
+    #pn_space{
+        next_pn = 0,
+        largest_recv = undefined,
+        recv_time = undefined,
+        ack_ranges = [],
+        ack_eliciting_in_flight = 0
     }.
 
 %% Keys, packet-number spaces and a real socket on top of State, so a
@@ -409,6 +413,7 @@ state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at;
 state_get(#state{} = S, dcid) -> S#state.dcid;
 state_get(#state{} = S, initial_keys) -> (S#state.hs)#hs.initial_keys;
 state_get(#state{} = S, handshake_keys) -> (S#state.hs)#hs.handshake_keys;
+state_get(#state{} = S, initial_next_pn) -> ((S#state.hs)#hs.pn_initial)#pn_space.next_pn;
 state_get(#state{} = S, handshake_next_pn) -> ((S#state.hs)#hs.pn_handshake)#pn_space.next_pn;
 state_get(#state{} = S, packets_sent) -> quic_connection:count(?C_PACKETS_SENT, S);
 state_get(#state{} = S, amp_tx) -> (S#state.hs)#hs.amp_tx;
@@ -435,7 +440,15 @@ state_set(#state{} = S, hs_probe, V) ->
 state_set(#state{} = S, address_validated, V) ->
     S#state{hs = (S#state.hs)#hs{address_validated = V}};
 state_set(#state{} = S, amp_rx, V) ->
-    S#state{hs = (S#state.hs)#hs{amp_rx = V}}.
+    S#state{hs = (S#state.hs)#hs{amp_rx = V}};
+state_set(#state{} = S, pto_space, V) ->
+    S#state{pto_space = V};
+state_set(#state{} = S, socket, V) ->
+    S#state{socket = V};
+state_set(#state{} = S, remote_addr, V) ->
+    S#state{remote_addr = V};
+state_set(#state{hs = #hs{pn_initial = PN} = HS} = S, initial_ack_ranges, V) ->
+    S#state{hs = HS#hs{pn_initial = PN#pn_space{ack_ranges = V}}}.
 
 %% A #state{} carrying a loss tracker, for the space whose timer is
 %% under test. The application space is only reachable once the handshake

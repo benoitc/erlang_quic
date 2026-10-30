@@ -11376,12 +11376,17 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
     NewLossState = quic_loss:on_pto_expired(LossState),
     State1 = State#state{loss_state = NewLossState},
 
-    %% The probe goes out in the space the timer was armed for: at any
-    %% other encryption level the peer cannot act on it, and before
-    %% confirmation it could not even decrypt it. RFC 9002 Section 7
+    %% The probe goes out in the space the timer was armed for, with its
+    %% Initial or Handshake counterpart (probe_spaces/2). Application data
+    %% is never added to a handshake probe or the other way round: before
+    %% confirmation the peer could not decrypt it. RFC 9002 Section 7
     %% exempts it from the congestion window, which is what stops a
     %% blocked connection deadlocking on its own.
-    Probing = send_probe_packet(Space, State1#state{hs = (State1#state.hs)#hs{hs_probe = true}}),
+    Probing = lists:foldl(
+        fun send_probe_packet/2,
+        State1#state{hs = (State1#state.hs)#hs{hs_probe = true}},
+        probe_spaces(Space, State1)
+    ),
     State2 = Probing#state{hs = (Probing#state.hs)#hs{hs_probe = false}},
 
     %% Probes use the control allowance, so retry any CC-deferred control
@@ -11394,6 +11399,23 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
 
     %% Set new PTO timer
     set_pto_timer(State3).
+
+%% RFC 9002 Section 6.2.4: Initial and Handshake probes are coalesced.
+%% Both spaces share one backoff, so probing only the space whose
+%% deadline came first would leave each probed at every other expiry.
+%% Initial goes first, as a coalesced datagram requires.
+probe_spaces(initial, State) ->
+    [initial | outstanding_space(handshake, State)];
+probe_spaces(handshake, State) ->
+    outstanding_space(initial, State) ++ [handshake];
+probe_spaces(Space, _State) ->
+    [Space].
+
+outstanding_space(Space, State) ->
+    case get_oldest_unacked_frames(Space, State) of
+        {ok, _} -> [Space];
+        none -> []
+    end.
 
 %% Send a probe packet for PTO
 %% PTO probes are allowed to use control_allowance per RFC 9002
