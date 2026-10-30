@@ -301,6 +301,9 @@
     %% Datagrams that arrived before the keys to read them, oldest first,
     %% as {Level, Datagram, Source} (RFC 9001 Section 5.7).
     early_packets = [] :: [{handshake | app, binary(), term()}],
+    %% A probe was refused for want of anti-amplification budget; no probe
+    %% is armed again until the peer sends more.
+    amp_probe_blocked = false :: boolean(),
     %% Client-side: a Handshake acknowledgement has arrived, so the
     %% server has validated this address (RFC 9002 Appendix A.8
     %% PeerCompletedAddressValidation). Always true for a server, which
