@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A client keeps backing off its handshake probes when the server
+  acknowledges its Initial but has not yet validated its address. The
+  backoff used to reset on every such acknowledgement, so with a lost
+  ServerHello the client probed at the initial PTO, every 70 to 100 ms,
+  and a server answering each probe could keep postponing its own
+  retransmission.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed

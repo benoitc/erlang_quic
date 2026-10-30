@@ -61,6 +61,7 @@
     get_pto_time_and_space/3,
     persistent_congestion_pto/1,
     on_pto_expired/1,
+    keep_pto_backoff/2,
 
     %% Peer transport parameters and handshake confirmation
     set_peer_ack_params/3,
@@ -821,6 +822,12 @@ on_handshake_confirmed(#loss_state{} = State) ->
 -spec on_pto_expired(loss_state()) -> loss_state().
 on_pto_expired(#loss_state{pto_count = Count} = State) ->
     State#loss_state{pto_count = Count + 1}.
+
+%% @doc Carry the PTO backoff of one loss state over to a later one, for
+%% an acknowledgement that must not reset it.
+-spec keep_pto_backoff(loss_state(), loss_state()) -> loss_state().
+keep_pto_backoff(#loss_state{pto_count = Count}, #loss_state{} = State) ->
+    State#loss_state{pto_count = Count}.
 
 %%====================================================================
 %% Queries
