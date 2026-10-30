@@ -32,6 +32,8 @@
     state_for_client/1,
     state_with_keys/1,
     with_keys_and_socket/1,
+    zero_rtt_client/1,
+    next_app_pn/1,
     state_with_send_stream/3,
     close_reason/1,
     state_for_server/3,
@@ -363,6 +365,22 @@ state_with_send_stream(StreamId, SendOffset, SendFin) ->
         max_data_remote = 1000000,
         data_sent = SendOffset
     }.
+
+%% A client holding 0-RTT keys with the given streams open.
+-spec zero_rtt_client([non_neg_integer()]) -> #state{}.
+zero_rtt_client([First | _] = StreamIds) ->
+    S = state_with_send_stream(First, 0, false),
+    #{First := Stream} = S#state.streams,
+    Keys = quic_connection:derive_initial_keys(<<"early-cid">>, ?QUIC_VERSION_1),
+    S#state{
+        loss_state = quic_loss:new(),
+        cc_state = quic_cc:new(#{}),
+        streams = maps:from_list([{Id, Stream#stream_state{id = Id}} || Id <- StreamIds]),
+        hs = (S#state.hs)#hs{early_keys = Keys}
+    }.
+
+-spec next_app_pn(#state{}) -> non_neg_integer().
+next_app_pn(#state{pn_app = #pn_space{next_pn = PN}}) -> PN.
 
 -spec state_for_client({inet:ip_address(), inet:port_number()}) -> #state{}.
 state_for_client(RemoteAddr) ->

@@ -1394,16 +1394,17 @@ idle({call, From}, open_unidirectional_stream, #state{hs = #hs{early_keys = _Ear
 %% before the handshake completes must queue, or the response goes out
 %% as a 0-RTT packet the client can never decrypt.
 idle(
+    cast,
+    {send_data_async, StreamId, Data, Fin},
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{early_keys = EarlyKeys}} = State
+) when EarlyKeys =/= undefined ->
+    zero_rtt_sends([{async, StreamId, Data, Fin}], State);
+idle(
     {call, From},
     {send_data, StreamId, Data, Fin},
     #state{cfg = #conn_cfg{role = client}, hs = #hs{early_keys = EarlyKeys}} = State
 ) when EarlyKeys =/= undefined ->
-    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
-        {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
-    end;
+    zero_rtt_sends([{From, StreamId, Data, Fin}], State);
 idle(
     {call, From},
     {send_data, StreamId, Data, Fin},
@@ -1501,6 +1502,12 @@ handshaking({call, From}, open_unidirectional_stream, State) ->
     end;
 %% 0-RTT: Allow sending data during handshake if early keys are available
 handshaking(
+    cast,
+    {send_data_async, StreamId, Data, Fin},
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{early_keys = EarlyKeys}} = State
+) when EarlyKeys =/= undefined ->
+    zero_rtt_sends([{async, StreamId, Data, Fin}], State);
+handshaking(
     {call, From},
     {send_data, StreamId, Data, Fin},
     #state{cfg = #conn_cfg{role = client}, hs = #hs{early_keys = EarlyKeys}} = State
@@ -1511,12 +1518,7 @@ handshaking(
     %% must not go out in a 0-RTT packet the client can never decrypt,
     %% so the server queues below and the data goes out 1-RTT on
     %% connected.
-    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
-        {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
-    end;
+    zero_rtt_sends([{From, StreamId, Data, Fin}], State);
 handshaking(
     {call, From},
     {send_data, StreamId, Data, Fin},
@@ -9363,9 +9365,33 @@ send_admitted_data(
 
 %% Send 0-RTT (early) data on a stream
 %% RFC 9001 Section 4.6: 0-RTT data uses the early traffic secret
-do_send_zero_rtt_data(
-    StreamId, Data, Fin, #state{streams = Streams, hs = #hs{early_keys = {EarlyKeys, _}}} = State
-) ->
+%%
+%% The send calls already queued are taken as one batch and their frames
+%% share packets: a client that opens a stream per request would
+%% otherwise send each request in a datagram of its own.
+zero_rtt_sends(Acc, #state{hs = #hs{early_keys = {EarlyKeys, _}}} = State0) ->
+    {RevReplies, RevFrames, State1} =
+        lists:foldl(
+            fun({From, StreamId, Data, Fin}, {Rs, Fs, S}) ->
+                case zero_rtt_frames(StreamId, Data, Fin, S) of
+                    {ok, Frames, S1} -> {[{From, ok} | Rs], lists:reverse(Frames, Fs), S1};
+                    {error, Reason} -> {[{From, {error, Reason}} | Rs], Fs, S}
+                end
+            end,
+            {[], [], State0},
+            drain_send_msgs(Acc, 63)
+        ),
+    MaxPayload = get_max_stream_data_per_packet(State1),
+    State = lists:foldl(
+        fun(Frames, S) ->
+            send_zero_rtt_packet([quic_frame:encode(F) || F <- Frames], Frames, EarlyKeys, S)
+        end,
+        State1,
+        pack_frames(lists:reverse(RevFrames), MaxPayload)
+    ),
+    {keep_state, State, [{reply, F, R} || {F, R} <- lists:reverse(RevReplies), F =/= async]}.
+
+zero_rtt_frames(StreamId, Data, Fin, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, StreamState} ->
             DataBin = iolist_to_binary(Data),
@@ -9375,9 +9401,7 @@ do_send_zero_rtt_data(
             %% 1-RTT send; a single oversized 0-RTT packet leaves as one
             %% IP-fragmented datagram, which QUIC forbids (RFC 9000 §14).
             MaxChunk = get_max_stream_data_per_packet(State),
-            NewState = send_zero_rtt_chunks(
-                StreamId, Offset, DataBin, Fin, MaxChunk, EarlyKeys, State
-            ),
+            Frames = zero_rtt_chunks(StreamId, Offset, DataBin, Fin, MaxChunk),
 
             %% Update stream state and track early data sent
             NewStreamState = StreamState#stream_state{
@@ -9390,31 +9414,45 @@ do_send_zero_rtt_data(
                 StreamId, (State#state.hs)#hs.zero_rtt_stream_ids
             ),
 
-            FinalState0 = NewState#state{
+            State1 = State#state{
                 streams = maps:put(StreamId, NewStreamState, Streams),
-                hs = (NewState#state.hs)#hs{
+                hs = (State#state.hs)#hs{
                     early_data_sent = EarlyDataSent,
                     zero_rtt_stream_ids = NewZeroRttIds
                 }
             },
             %% RFC 9000 §4.6: extend MAX_STREAMS once this stream is fully
             %% closed (covers the rare 0-RTT FIN-from-server case).
-            {ok, maybe_reclaim_stream(StreamId, FinalState0)};
+            {ok, Frames, maybe_reclaim_stream(StreamId, State1)};
         error ->
             {error, unknown_stream}
     end.
 
 %% Split a 0-RTT write into per-packet STREAM frames, FIN on the last.
-send_zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk, EarlyKeys, State) when
-    byte_size(Data) =< MaxChunk
-->
-    Frame = {stream, StreamId, Offset, Data, Fin},
-    send_zero_rtt_packet(quic_frame:encode(Frame), [Frame], EarlyKeys, State);
-send_zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk, EarlyKeys, State) ->
+zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk) when byte_size(Data) =< MaxChunk ->
+    [{stream, StreamId, Offset, Data, Fin}];
+zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk) ->
     <<Chunk:MaxChunk/binary, Rest/binary>> = Data,
-    Frame = {stream, StreamId, Offset, Chunk, false},
-    State1 = send_zero_rtt_packet(quic_frame:encode(Frame), [Frame], EarlyKeys, State),
-    send_zero_rtt_chunks(StreamId, Offset + MaxChunk, Rest, Fin, MaxChunk, EarlyKeys, State1).
+    [
+        {stream, StreamId, Offset, Chunk, false}
+        | zero_rtt_chunks(StreamId, Offset + MaxChunk, Rest, Fin, MaxChunk)
+    ].
+
+%% Group frames into packets of at most MaxPayload encoded bytes, in
+%% order. A frame larger than that gets a packet of its own.
+pack_frames(Frames, MaxPayload) ->
+    pack_frames(Frames, MaxPayload, 0, [], []).
+
+pack_frames([], _Max, _Size, [], Packets) ->
+    lists:reverse(Packets);
+pack_frames([], _Max, _Size, Cur, Packets) ->
+    lists:reverse([lists:reverse(Cur) | Packets]);
+pack_frames([F | Rest] = Frames, Max, Size, Cur, Packets) ->
+    FSize = iolist_size(quic_frame:encode(F)),
+    case Cur =/= [] andalso Size + FSize > Max of
+        true -> pack_frames(Frames, Max, 0, [], [lists:reverse(Cur) | Packets]);
+        false -> pack_frames(Rest, Max, Size + FSize, [F | Cur], Packets)
+    end.
 
 %% Send a 0-RTT packet (long header, type 1)
 %% RFC 9001 Section 5.3: 0-RTT packets use early traffic keys
