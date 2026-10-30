@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A client now migrates to the server's preferred address. It probed
+  the address before the handshake was confirmed (RFC 9000 §9.6.1),
+  which servers ignore, never resent an unanswered PATH_CHALLENGE, and
+  always picked the IPv6 address, even on an IPv4 socket. It now probes
+  once the handshake is confirmed, in the family of the current path,
+  and resends the challenge up to three times.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed
