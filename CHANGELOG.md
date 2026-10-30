@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A server now acknowledges 0-RTT packets. They were never
+  acknowledged on their own, so a client sending more early data than
+  its congestion window allows could not send its Finished, and the
+  handshake stalled until the idle timeout.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed

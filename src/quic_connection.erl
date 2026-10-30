@@ -8272,6 +8272,8 @@ maybe_send_ack(initial, Frames, State) ->
         true -> send_initial_ack(State);
         false -> State
     end;
+maybe_send_ack(zero_rtt, Frames, State) ->
+    maybe_send_ack(app, Frames, State);
 maybe_send_ack(_, _, State) ->
     State.
 
