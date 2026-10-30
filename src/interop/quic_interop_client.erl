@@ -180,16 +180,30 @@ download_from(TestCase, Host, Port, Paths, DownloadsDir) ->
                     %% transfers no matter how many files are requested.
                     io:format("Requesting ~p file(s)~n", [length(Paths)]),
                     Results = collect_streams(Conn, Paths, DownloadsDir),
-                    quic:close(Conn, normal),
+                    close_and_wait(Conn),
                     Results;
                 error ->
-                    quic:close(Conn, normal),
+                    close_and_wait(Conn),
                     [error || _ <- Paths]
             end;
         {error, Reason} ->
             io:format("Connection failed: ~p~n", [Reason]),
             [error || _ <- Paths]
     end.
+
+%% quic:close/2 only casts; halting straight after it can kill the
+%% connection before its CONNECTION_CLOSE leaves, and the peer then keeps
+%% probing a path the client has left.
+close_and_wait(Conn) ->
+    MRef = erlang:monitor(process, Conn),
+    quic:close(Conn, normal),
+    receive
+        {quic, Conn, {closed, _}} -> ok;
+        {'DOWN', MRef, process, Conn, _} -> ok
+    after 2000 -> ok
+    end,
+    erlang:demonitor(MRef, [flush]),
+    ok.
 
 wait_connected(Conn, TestCase) ->
     receive
@@ -234,14 +248,14 @@ build_opts("chacha20") ->
     %% Force ChaCha20-Poly1305 cipher
     #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         ciphers => [chacha20_poly1305]
     };
 build_opts("keyupdate") ->
     %% Request key update after initial data
     #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         force_key_update => true
     };
 build_opts("v2") ->
@@ -250,7 +264,7 @@ build_opts("v2") ->
     %% grader, which requires the client's Initial to be v1.
     #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         %% Preference order: v2 first. Some servers (picoquic) honour
         %% the client's order rather than their own.
         versions => [16#6b3343cf, 16#00000001]
@@ -261,7 +275,7 @@ build_opts(_) ->
     %% outlast it.
     #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         disconnect_timeout => infinity
     }.
 
@@ -516,12 +530,12 @@ run_resumption_test(RequestsStr, DownloadsDir) ->
 resumption_phase1(Host, Port, Path, DownloadsDir) ->
     Opts = #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>]
+        alpn => [<<"hq-interop">>]
     },
     case quic:connect(Host, Port, Opts, self()) of
         {ok, Conn} ->
             Result = wait_for_ticket_and_download(Conn, Path, DownloadsDir),
-            quic:close(Conn, normal),
+            close_and_wait(Conn),
             Result;
         {error, Reason} ->
             io:format("Phase 1 connection failed: ~p~n", [Reason]),
@@ -609,13 +623,13 @@ wait_for_ticket_only(Conn, Timeout) ->
 resumption_phase2(Host, Port, Path, DownloadsDir, Ticket) ->
     Opts = #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         session_ticket => Ticket
     },
     case quic:connect(Host, Port, Opts, self()) of
         {ok, Conn} ->
             Result = wait_for_connection_and_download(Conn, Path, DownloadsDir, "resumption"),
-            quic:close(Conn, normal),
+            close_and_wait(Conn),
             Result;
         {error, Reason} ->
             io:format("Phase 2 connection failed: ~p~n", [Reason]),
@@ -775,7 +789,7 @@ ticket_only_connection(Host, Port) ->
     %% the budget.
     Opts = #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         pmtu_enabled => false
     },
     case quic:connect(Host, Port, Opts, self()) of
@@ -792,7 +806,7 @@ ticket_only_connection(Host, Port) ->
                     io:format("Ticket connection timeout~n"),
                     error
                 end,
-            quic:close(Conn, normal),
+            close_and_wait(Conn),
             Result;
         {error, Reason} ->
             io:format("Ticket connection failed: ~p~n", [Reason]),
@@ -805,7 +819,7 @@ ticket_only_connection(Host, Port) ->
 zerortt_download_all(Host, Port, Paths, DownloadsDir, Ticket) ->
     Opts = #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         session_ticket => Ticket,
         enable_early_data => true,
         pmtu_enabled => false
@@ -814,7 +828,7 @@ zerortt_download_all(Host, Port, Paths, DownloadsDir, Ticket) ->
         {ok, Conn} ->
             io:format("Sending ~p request(s) as early data~n", [length(Paths)]),
             Results = collect_streams(Conn, Paths, DownloadsDir),
-            quic:close(Conn, normal),
+            close_and_wait(Conn),
             case
                 length(Results) =:= length(Paths) andalso
                     lists:all(fun(R) -> R =:= ok end, Results)
@@ -859,12 +873,12 @@ run_migration_test(RequestsStr, DownloadsDir) ->
 run_migration_download(Host, Port, Path, DownloadsDir) ->
     Opts = #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>]
+        alpn => [<<"hq-interop">>]
     },
     case quic:connect(Host, Port, Opts, self()) of
         {ok, Conn} ->
             Result = wait_and_migrate_download(Conn, Path, DownloadsDir),
-            quic:close(Conn, normal),
+            close_and_wait(Conn),
             Result;
         {error, Reason} ->
             io:format("Migration test connection failed: ~p~n", [Reason]),
