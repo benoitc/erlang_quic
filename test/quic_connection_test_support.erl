@@ -32,6 +32,8 @@
     state_for_client/1,
     state_with_keys/1,
     with_keys_and_socket/1,
+    server_with_peer_cid/1,
+    pending_peer_path/1,
     state_with_send_stream/3,
     close_reason/1,
     state_for_server/3,
@@ -321,6 +323,16 @@ with_keys_and_socket(State) ->
             pn_handshake = PNH
         }
     }).
+
+%% A sending server whose client uses DCID, with no spare CIDs from it.
+-spec server_with_peer_cid(binary()) -> #state{}.
+server_with_peer_cid(DCID) ->
+    S0 = with_keys_and_socket(state_for_role(server)),
+    Pool = quic_cid:set_initial_peer_cid(quic_cid:new(<<"own-cid0">>, 2), DCID, undefined),
+    S0#state{dcid = DCID, cid_pool_state = Pool}.
+
+-spec pending_peer_path(#state{}) -> #path_state{} | undefined.
+pending_peer_path(#state{mig = #mig{pending_peer_validation = Path}}) -> Path.
 
 %% A connected sender that has received packets 0..4 and owes their ACK:
 %% Count ack-eliciting packets since the last ACK, timer armed or not.

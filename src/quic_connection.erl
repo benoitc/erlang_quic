@@ -12519,6 +12519,11 @@ maybe_handle_address_change(NewAddr, DataSize, State) ->
             %% NAT rebinding from the no-reuse rule, so this path keeps the
             %% CID it is already using.
             initiate_peer_path_validation(NewAddr, true, DataSize, State);
+        new_path when State#state.dcid =:= <<>> ->
+            %% A peer with a zero-length CID has no CIDs to rotate; its
+            %% packets are linkable across paths anyway (RFC 9000
+            %% Section 9.5), so the path keeps the empty one.
+            initiate_peer_path_validation(NewAddr, true, DataSize, State);
         new_path ->
             %% A genuine migration needs a CID that has not been used on
             %% another path. Without one we cannot probe, so nothing is
