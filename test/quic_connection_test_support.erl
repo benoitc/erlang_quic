@@ -36,6 +36,8 @@
     pending_peer_path/1,
     zero_rtt_client/1,
     next_app_pn/1,
+    after_own_key_update/1,
+    key_phase/1,
     state_with_send_stream/3,
     close_reason/1,
     state_for_server/3,
@@ -335,6 +337,26 @@ server_with_peer_cid(DCID) ->
 
 -spec pending_peer_path(#state{}) -> #path_state{} | undefined.
 pending_peer_path(#state{mig = #mig{pending_peer_validation = Path}}) -> Path.
+%% A connection whose own key update to phase 1 the peer has confirmed:
+%% the previous keys are still held, and packets up to Largest arrived.
+-spec after_own_key_update(non_neg_integer()) -> #state{}.
+after_own_key_update(Largest) ->
+    S0 = state_with_pn_app(state_with_keys(server), Largest),
+    Old = S0#state.app_keys,
+    S1 = S0#state{
+        key_state = #key_update_state{
+            current_phase = 0,
+            current_keys = Old,
+            client_app_secret = binary:copy(<<1>>, 32),
+            server_app_secret = binary:copy(<<2>>, 32),
+            update_state = idle
+        }
+    },
+    S2 = quic_connection:initiate_key_update(S1),
+    S2#state{key_state = (S2#state.key_state)#key_update_state{update_state = idle}}.
+
+-spec key_phase(#state{}) -> 0 | 1.
+key_phase(#state{key_state = #key_update_state{current_phase = P}}) -> P.
 
 %% A connected sender that has received packets 0..4 and owes their ACK:
 %% Count ack-eliciting packets since the last ACK, timer armed or not.
@@ -437,6 +459,8 @@ state_sending(State) ->
 state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
 state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at;
 state_get(#state{} = S, dcid) -> S#state.dcid;
+state_get(#state{} = S, app_keys) -> S#state.app_keys;
+state_get(#state{key_state = K}, prev_app_keys) -> K#key_update_state.prev_keys;
 state_get(#state{} = S, initial_keys) -> (S#state.hs)#hs.initial_keys;
 state_get(#state{} = S, handshake_keys) -> (S#state.hs)#hs.handshake_keys;
 state_get(#state{} = S, handshake_next_pn) -> ((S#state.hs)#hs.pn_handshake)#pn_space.next_pn;
