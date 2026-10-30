@@ -1621,7 +1621,7 @@ connected(
                     undefined ->
                         State2;
                     PA when is_record(PA, preferred_address) ->
-                        initiate_preferred_address_validation(PA, State2);
+                        maybe_probe_preferred_address(record_preferred_address(PA, State2));
                     _ ->
                         State2
                 end;
@@ -1974,6 +1974,8 @@ connected(
 connected(info, {path_validation_timeout, _StaleToken}, State) ->
     %% Stale token from canceled validation - ignore
     {keep_state, State};
+connected(info, {path_probe_timeout, Addr, Data}, State) ->
+    {keep_state, handle_path_probe_timeout(Addr, Data, State)};
 connected(cast, {close, Reason}, State) ->
     emit_qlog_state_change(connected, draining, State),
     State1 = initiate_close(Reason, State),
@@ -5434,7 +5436,7 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
 process_frame(app, handshake_done, #state{cfg = #conn_cfg{role = client}} = State0) ->
     %% Handshake confirmed (RFC 9001 §4.1.2): the retained Finished flight
     %% is done.
-    confirm_handshake(clear_hs_flight(State0));
+    maybe_probe_preferred_address(confirm_handshake(clear_hs_flight(State0)));
 process_frame(app, handshake_done, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% RFC 9000 §19.20: clients MUST NOT send HANDSHAKE_DONE.
     ?LOG_WARNING(
@@ -12132,10 +12134,43 @@ start_path_probe(RemoteAddr, State) ->
                     alt_paths = [PathState | (State0#state.mig)#mig.alt_paths]
                 }
             },
+            arm_path_probe_timer(PathState, State1),
             {ok, send_path_challenge(RemoteAddr, ChallengeData, DCID, State1), DCID, Seq};
         none ->
             none
     end.
+
+%% RFC 9000 Section 8.2.1: a PATH_CHALLENGE that goes unanswered is sent
+%% again. The challenge data identifies the attempt, so a timer for one
+%% that was answered or replaced finds nothing.
+arm_path_probe_timer(#path_state{remote_addr = Addr, challenge_data = Data}, State) ->
+    erlang:send_after(path_validation_timeout(State), self(), {path_probe_timeout, Addr, Data}),
+    ok.
+
+path_validation_timeout(#state{loss_state = undefined}) ->
+    3000;
+path_validation_timeout(#state{loss_state = LossState}) ->
+    3 * quic_loss:get_pto(LossState, app).
+
+handle_path_probe_timeout(Addr, Data, #state{mig = #mig{alt_paths = Paths}} = State) ->
+    case lists:keytake(Addr, #path_state.remote_addr, Paths) of
+        {value, #path_state{status = validating, challenge_data = Data} = Path, Others} ->
+            retry_path_probe(Path, Others, State);
+        _ ->
+            State
+    end.
+
+retry_path_probe(#path_state{challenge_count = Count} = Path0, Others, State0) when Count < 3 ->
+    Path = Path0#path_state{
+        challenge_data = crypto:strong_rand_bytes(8), challenge_count = Count + 1
+    },
+    State = State0#state{mig = (State0#state.mig)#mig{alt_paths = [Path | Others]}},
+    arm_path_probe_timer(Path, State),
+    send_path_challenge_to_addr(
+        Path#path_state.remote_addr, Path#path_state.challenge_data, Path#path_state.dcid, State
+    );
+retry_path_probe(Path, Others, State) ->
+    retire_abandoned_path_cid(Path, State#state{mig = (State#state.mig)#mig{alt_paths = Others}}).
 
 %% Take a peer CID for a path, keyed by its address so the same path never
 %% binds twice.
@@ -12149,6 +12184,14 @@ bind_path_cid(PathRef, #state{cid_pool_state = Pool, dcid = CurrentDCID} = State
 %% path never bound one (a NAT rebinding).
 path_dcid(#path_state{dcid = DCID}, _State) when DCID =/= undefined -> DCID;
 path_dcid(_PathState, #state{dcid = DCID}) -> DCID.
+
+%% The CID bound to the path towards Addr: a response on a path being
+%% validated must not carry the CID of another path (RFC 9000 Section 9.5).
+addr_dcid(Addr, #state{mig = #mig{alt_paths = Paths, pending_peer_validation = Pending}} = State) ->
+    case [P || #path_state{remote_addr = A} = P <- [Pending | Paths], A =:= Addr] of
+        [Path | _] -> path_dcid(Path, State);
+        [] -> State#state.dcid
+    end.
 
 %% Retire the CID an abandoned path bound, if it bound one. A path that
 %% kept the connection's CID (a NAT rebinding) leaves it alone.
@@ -12258,10 +12301,9 @@ send_path_challenge(
     #state{}
 ) -> #state{}.
 send_path_response_to_addr(
-    {IP, Port},
+    {IP, Port} = Addr,
     ResponseData,
     #state{
-        dcid = DCID,
         app_keys = AppKeys,
         pn_app = PNSpace,
         cfg = #conn_cfg{
@@ -12277,6 +12319,7 @@ send_path_response_to_addr(
                     server -> ServerKeys
                 end,
 
+            DCID = addr_dcid(Addr, State),
             %% Build PATH_RESPONSE frame
             ResponseFrame = {path_response, ResponseData},
             Payload = quic_frame:encode(ResponseFrame),
@@ -12332,44 +12375,65 @@ update_path_bytes_sent(IP, Port, Bytes, #state{mig = #mig{alt_paths = AltPaths}}
 %% @doc Initiate path validation for server's preferred address (RFC 9000 Section 9.6).
 %% Client validates the preferred address before migrating to it.
 %% Prefers IPv6 over IPv4 when both are available.
--spec initiate_preferred_address_validation(#preferred_address{}, #state{}) -> #state{}.
-initiate_preferred_address_validation(
-    #preferred_address{cid = CID, stateless_reset_token = Token} = PA, State
-) ->
+-spec record_preferred_address(#preferred_address{}, #state{}) -> #state{}.
+record_preferred_address(#preferred_address{cid = CID, stateless_reset_token = Token} = PA, State) ->
     %% RFC 9000 Section 9.6: the client must use the CID the preferred
     %% address carries, which has an implicit sequence number of 1.
-    State1 =
-        case quic_cid:add_preferred_address_cid(State#state.cid_pool_state, CID, Token) of
-            {ok, NewPool} ->
-                State#state{
-                    cid_pool_state = NewPool, mig = (State#state.mig)#mig{preferred_address = PA}
-                };
-            {error, Reason} ->
-                ?LOG_DEBUG(
-                    #{what => preferred_address_cid_rejected, reason => Reason},
-                    ?QUIC_LOG_META
-                ),
-                State#state{mig = (State#state.mig)#mig{preferred_address = PA}}
-        end,
-    %% Choose address - prefer IPv6 over IPv4
-    case select_preferred_addr(PA) of
-        undefined ->
-            %% No valid address to validate
-            State1;
-        RemoteAddr ->
-            initiate_path_validation(RemoteAddr, State1)
+    case quic_cid:add_preferred_address_cid(State#state.cid_pool_state, CID, Token) of
+        {ok, NewPool} ->
+            State#state{
+                cid_pool_state = NewPool, mig = (State#state.mig)#mig{preferred_address = PA}
+            };
+        {error, Reason} ->
+            ?LOG_DEBUG(
+                #{what => preferred_address_cid_rejected, reason => Reason},
+                ?QUIC_LOG_META
+            ),
+            State#state{mig = (State#state.mig)#mig{preferred_address = PA}}
     end.
 
-%% Select the preferred address (IPv6 over IPv4)
-select_preferred_addr(#preferred_address{ipv6_addr = IPv6, ipv6_port = IPv6Port}) when
-    IPv6 =/= undefined, IPv6Port =/= undefined
-->
+%% RFC 9000 Section 9.6.1: a client migrates to the preferred address
+%% only once the handshake is confirmed. Either the confirmation or the
+%% preferred address can come last, so both call this.
+-spec maybe_probe_preferred_address(#state{}) -> #state{}.
+maybe_probe_preferred_address(#state{mig = #mig{preferred_address = undefined}} = State) ->
+    State;
+maybe_probe_preferred_address(
+    #state{loss_state = LossState, remote_addr = Current, mig = #mig{preferred_address = PA}} =
+        State
+) ->
+    case
+        LossState =/= undefined andalso quic_loss:handshake_confirmed(LossState) andalso
+            select_preferred_addr(PA, Current)
+    of
+        false ->
+            State;
+        undefined ->
+            State;
+        RemoteAddr ->
+            case
+                lists:keymember(
+                    RemoteAddr, #path_state.remote_addr, (State#state.mig)#mig.alt_paths
+                )
+            of
+                true -> State;
+                false -> initiate_path_validation(RemoteAddr, State)
+            end
+    end.
+
+%% Select the preferred address in the family of the current path: the
+%% client socket is bound to one family.
+select_preferred_addr(
+    #preferred_address{ipv6_addr = IPv6, ipv6_port = IPv6Port},
+    {{_, _, _, _, _, _, _, _}, _}
+) when IPv6 =/= undefined, IPv6Port =/= undefined ->
     {IPv6, IPv6Port};
-select_preferred_addr(#preferred_address{ipv4_addr = IPv4, ipv4_port = IPv4Port}) when
-    IPv4 =/= undefined, IPv4Port =/= undefined
-->
+select_preferred_addr(
+    #preferred_address{ipv4_addr = IPv4, ipv4_port = IPv4Port},
+    {{_, _, _, _}, _}
+) when IPv4 =/= undefined, IPv4Port =/= undefined ->
     {IPv4, IPv4Port};
-select_preferred_addr(_) ->
+select_preferred_addr(_, _) ->
     undefined.
 
 %% @doc Rebind socket to a new local port (simulates network change).
@@ -12679,16 +12743,11 @@ send_path_challenge_to_addr(Addr, ChallengeData, DCID, State) ->
 %% allowing stale timeouts from canceled validations to be ignored.
 -spec start_path_validation_timer(#state{}) -> #state{}.
 start_path_validation_timer(
-    #state{loss_state = LossState, mig = #mig{path_validation_timer = OldTimer}} = State
+    #state{mig = #mig{path_validation_timer = OldTimer}} = State
 ) ->
     %% Cancel any existing timer
     cancel_timer(OldTimer),
-    %% Calculate timeout as 3 * PTO
-    Timeout =
-        case LossState of
-            undefined -> 3000;
-            _ -> 3 * quic_loss:get_pto(LossState, app)
-        end,
+    Timeout = path_validation_timeout(State),
     %% Use same token for both message and state - enables stale timeout detection
     ValidationToken = make_ref(),
     TimerRef = erlang:send_after(Timeout, self(), {path_validation_timeout, ValidationToken}),
