@@ -248,14 +248,14 @@ build_opts("chacha20") ->
     %% Force ChaCha20-Poly1305 cipher
     #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         ciphers => [chacha20_poly1305]
     };
 build_opts("keyupdate") ->
     %% Request key update after initial data
     #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         force_key_update => true
     };
 build_opts("v2") ->
@@ -264,7 +264,7 @@ build_opts("v2") ->
     %% grader, which requires the client's Initial to be v1.
     #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         %% Preference order: v2 first. Some servers (picoquic) honour
         %% the client's order rather than their own.
         versions => [16#6b3343cf, 16#00000001]
@@ -275,7 +275,7 @@ build_opts(_) ->
     %% outlast it.
     #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         disconnect_timeout => infinity
     }.
 
@@ -530,7 +530,7 @@ run_resumption_test(RequestsStr, DownloadsDir) ->
 resumption_phase1(Host, Port, Path, DownloadsDir) ->
     Opts = #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>]
+        alpn => [<<"hq-interop">>]
     },
     case quic:connect(Host, Port, Opts, self()) of
         {ok, Conn} ->
@@ -623,7 +623,7 @@ wait_for_ticket_only(Conn, Timeout) ->
 resumption_phase2(Host, Port, Path, DownloadsDir, Ticket) ->
     Opts = #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         session_ticket => Ticket
     },
     case quic:connect(Host, Port, Opts, self()) of
@@ -789,7 +789,7 @@ ticket_only_connection(Host, Port) ->
     %% the budget.
     Opts = #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         pmtu_enabled => false
     },
     case quic:connect(Host, Port, Opts, self()) of
@@ -819,7 +819,7 @@ ticket_only_connection(Host, Port) ->
 zerortt_download_all(Host, Port, Paths, DownloadsDir, Ticket) ->
     Opts = #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>],
+        alpn => [<<"hq-interop">>],
         session_ticket => Ticket,
         enable_early_data => true,
         pmtu_enabled => false
@@ -873,7 +873,7 @@ run_migration_test(RequestsStr, DownloadsDir) ->
 run_migration_download(Host, Port, Path, DownloadsDir) ->
     Opts = #{
         verify => false,
-        alpn => [<<"hq-interop">>, <<"h3">>]
+        alpn => [<<"hq-interop">>]
     },
     case quic:connect(Host, Port, Opts, self()) of
         {ok, Conn} ->
