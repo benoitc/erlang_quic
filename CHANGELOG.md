@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- A handshake probe now covers both the Initial and the Handshake space
+  when both have data outstanding. The two share one backoff, so probing
+  only the space whose deadline came first left each probed at every
+  other expiry, and a lost ServerHello was repeated after 0.3, 1.2 and
+  4.8 seconds rather than 0.3, 0.6 and 1.2.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed
