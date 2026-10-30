@@ -3337,14 +3337,12 @@ send_initial_packet(Payload, Frames, State) ->
         Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
 
-    %% Pad Initial packets to at least 1200 bytes
-    PaddedPacket = pad_initial_packet(Packet),
-
     %% Congestion control counts the protected packet; the amplification
     %% budget counts the datagram, which for a short Initial is larger
     %% because it is brought to 1200 bytes outside the packet.
     Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
+    PaddedPacket = pad_initial_datagram(Role, AckEliciting, Packet),
     Meta = {initial, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
     case gate(initial, InFlight, byte_size(Packet), PaddedPacket, Payload, Frames, State) of
         {deferred, Deferred} ->
@@ -3883,6 +3881,14 @@ send_app_packet_internal_error(Reason, PN, PacketSize, PNSpace, State, ClearedSo
                 pn_app = NewPNSpace, socket_state = ClearedSocketState, burst_sent = Burst
             }
     end.
+
+%% RFC 9000 Section 14.1: a server pads only datagrams carrying an
+%% ack-eliciting Initial. An ACK-only one at full size would spend an
+%% unvalidated peer's amplification budget on nothing.
+pad_initial_datagram(server, false, Packet) ->
+    Packet;
+pad_initial_datagram(_Role, _AckEliciting, Packet) ->
+    pad_initial_packet(Packet).
 
 %% Pad Initial packet to minimum 1200 bytes
 pad_initial_packet(Packet) when byte_size(Packet) >= 1200 ->
