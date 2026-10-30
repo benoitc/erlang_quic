@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A server no longer processes 1-RTT packets before the handshake
+  completes (RFC 9001 §5.7). Acknowledging one let the client consider
+  the handshake confirmed and drop its Handshake keys while the server
+  was still waiting for the client's Finished, and the connection hung
+  until idle timeout.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed

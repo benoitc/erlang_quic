@@ -4582,7 +4582,8 @@ handle_packet_loop(Data, State) ->
         {error, Reason} when
             Reason =:= padding_only;
             Reason =:= empty_packet;
-            Reason =:= invalid_fixed_bit
+            Reason =:= invalid_fixed_bit;
+            Reason =:= handshake_incomplete
         ->
             %% End of coalesced packets (padding or invalid trailing data)
             %% This is normal, just re-enable socket and return
@@ -5051,6 +5052,15 @@ check_stateless_reset(Data, #state{cid_pool_state = Pool} = _State) ->
             {error, decryption_failed}
     end.
 
+%% RFC 9001 §5.7: a server must not process 1-RTT packets before the
+%% handshake completes. Acknowledging one would let the client consider
+%% the handshake confirmed and drop its Handshake keys while our
+%% Handshake flight is still unacknowledged.
+decode_short_header_packet(
+    _Data,
+    #state{cfg = #conn_cfg{role = server}, hs = #hs{tls_state = TlsState}}
+) when TlsState =/= ?TLS_HANDSHAKE_COMPLETE ->
+    {error, handshake_incomplete};
 decode_short_header_packet(Data, State) ->
     case State#state.app_keys of
         undefined ->
