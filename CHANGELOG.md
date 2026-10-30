@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A client now discards its Initial keys when it sends its first
+  Handshake packet of any kind, as RFC 9001 §4.9.1 requires. An
+  ACK-only Handshake packet did not count, so the client kept probing
+  in the Initial space, and a server that validated the address from
+  those Initials appeared to exceed the amplification limit.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed
