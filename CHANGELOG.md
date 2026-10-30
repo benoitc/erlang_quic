@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A NEW_CONNECTION_ID that arrives after a later one has retired its
+  sequence number is now retired at once. It used to be counted as
+  active, and a retransmission of a lost frame could close the
+  connection with CONNECTION_ID_LIMIT_ERROR.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed

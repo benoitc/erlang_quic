@@ -169,13 +169,22 @@ local_active_count(#cid_pool_state{local = Local}) -> active_count(Local).
     | {error, limit_exceeded}
     | {error, {reuse, non_neg_integer()}}.
 add_peer_cid(
-    #cid_pool_state{peer = Peer, local_active_limit = Limit} = Pool, SeqNum, RetirePrior, CID, Token
+    #cid_pool_state{peer = Peer, local_active_limit = Limit, peer_retire_prior_to = Floor} =
+        Pool,
+    SeqNum,
+    RetirePrior0,
+    CID,
+    Token
 ) ->
+    RetirePrior = max(RetirePrior0, Floor),
     case lists:keyfind(SeqNum, #cid_entry.seq_num, Peer) of
         #cid_entry{cid = CID, stateless_reset_token = Token} ->
             {duplicate, Pool};
         #cid_entry{} ->
             {error, {reuse, SeqNum}};
+        false when SeqNum < RetirePrior ->
+            %% RFC 9000 Section 19.15: retired on arrival.
+            {ok, Pool, [SeqNum]};
         false ->
             ToRetire = [S || #cid_entry{seq_num = S, status = active} <- Peer, S < RetirePrior],
             Marked = [retire_if_below(RetirePrior, E) || E <- Peer],
@@ -184,8 +193,11 @@ add_peer_cid(
             },
             NewPeer = [Entry | Marked],
             case active_count(NewPeer) > Limit of
-                true -> {error, limit_exceeded};
-                false -> {ok, Pool#cid_pool_state{peer = NewPeer}, ToRetire}
+                true ->
+                    {error, limit_exceeded};
+                false ->
+                    {ok, Pool#cid_pool_state{peer = NewPeer, peer_retire_prior_to = RetirePrior},
+                        ToRetire}
             end
     end.
 
