@@ -180,16 +180,30 @@ download_from(TestCase, Host, Port, Paths, DownloadsDir) ->
                     %% transfers no matter how many files are requested.
                     io:format("Requesting ~p file(s)~n", [length(Paths)]),
                     Results = collect_streams(Conn, Paths, DownloadsDir),
-                    quic:close(Conn, normal),
+                    close_and_wait(Conn),
                     Results;
                 error ->
-                    quic:close(Conn, normal),
+                    close_and_wait(Conn),
                     [error || _ <- Paths]
             end;
         {error, Reason} ->
             io:format("Connection failed: ~p~n", [Reason]),
             [error || _ <- Paths]
     end.
+
+%% quic:close/2 only casts; halting straight after it can kill the
+%% connection before its CONNECTION_CLOSE leaves, and the peer then keeps
+%% probing a path the client has left.
+close_and_wait(Conn) ->
+    MRef = erlang:monitor(process, Conn),
+    quic:close(Conn, normal),
+    receive
+        {quic, Conn, {closed, _}} -> ok;
+        {'DOWN', MRef, process, Conn, _} -> ok
+    after 2000 -> ok
+    end,
+    erlang:demonitor(MRef, [flush]),
+    ok.
 
 wait_connected(Conn, TestCase) ->
     receive
@@ -521,7 +535,7 @@ resumption_phase1(Host, Port, Path, DownloadsDir) ->
     case quic:connect(Host, Port, Opts, self()) of
         {ok, Conn} ->
             Result = wait_for_ticket_and_download(Conn, Path, DownloadsDir),
-            quic:close(Conn, normal),
+            close_and_wait(Conn),
             Result;
         {error, Reason} ->
             io:format("Phase 1 connection failed: ~p~n", [Reason]),
@@ -615,7 +629,7 @@ resumption_phase2(Host, Port, Path, DownloadsDir, Ticket) ->
     case quic:connect(Host, Port, Opts, self()) of
         {ok, Conn} ->
             Result = wait_for_connection_and_download(Conn, Path, DownloadsDir, "resumption"),
-            quic:close(Conn, normal),
+            close_and_wait(Conn),
             Result;
         {error, Reason} ->
             io:format("Phase 2 connection failed: ~p~n", [Reason]),
@@ -792,7 +806,7 @@ ticket_only_connection(Host, Port) ->
                     io:format("Ticket connection timeout~n"),
                     error
                 end,
-            quic:close(Conn, normal),
+            close_and_wait(Conn),
             Result;
         {error, Reason} ->
             io:format("Ticket connection failed: ~p~n", [Reason]),
@@ -814,7 +828,7 @@ zerortt_download_all(Host, Port, Paths, DownloadsDir, Ticket) ->
         {ok, Conn} ->
             io:format("Sending ~p request(s) as early data~n", [length(Paths)]),
             Results = collect_streams(Conn, Paths, DownloadsDir),
-            quic:close(Conn, normal),
+            close_and_wait(Conn),
             case
                 length(Results) =:= length(Paths) andalso
                     lists:all(fun(R) -> R =:= ok end, Results)
@@ -864,7 +878,7 @@ run_migration_download(Host, Port, Path, DownloadsDir) ->
     case quic:connect(Host, Port, Opts, self()) of
         {ok, Conn} ->
             Result = wait_and_migrate_download(Conn, Path, DownloadsDir),
-            quic:close(Conn, normal),
+            close_and_wait(Conn),
             Result;
         {error, Reason} ->
             io:format("Migration test connection failed: ~p~n", [Reason]),
