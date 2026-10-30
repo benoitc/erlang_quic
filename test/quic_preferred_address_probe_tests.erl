@@ -70,3 +70,14 @@ timeout(State) ->
         after 5000 -> no_probe_timer
         end,
     quic_connection:handle_path_probe_timeout(Addr, Data, State).
+
+response_on_probed_path_uses_its_cid_test() ->
+    S0 = quic_connection_test_support:client_with_preferred_address(true),
+    S1 = quic_connection:maybe_probe_preferred_address(S0),
+    [#path_state{dcid = PathDCID}] = quic_connection_test_support:alt_paths(S1),
+    ?assertEqual(<<"pref-cid">>, PathDCID),
+    ?assertEqual(PathDCID, quic_connection:addr_dcid(?PA_ADDR, S1)),
+    ?assertEqual(
+        quic_connection_test_support:state_get(S1, dcid),
+        quic_connection:addr_dcid({{127, 0, 0, 3}, 9}, S1)
+    ).

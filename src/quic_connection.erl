@@ -12185,6 +12185,14 @@ bind_path_cid(PathRef, #state{cid_pool_state = Pool, dcid = CurrentDCID} = State
 path_dcid(#path_state{dcid = DCID}, _State) when DCID =/= undefined -> DCID;
 path_dcid(_PathState, #state{dcid = DCID}) -> DCID.
 
+%% The CID bound to the path towards Addr: a response on a path being
+%% validated must not carry the CID of another path (RFC 9000 Section 9.5).
+addr_dcid(Addr, #state{mig = #mig{alt_paths = Paths, pending_peer_validation = Pending}} = State) ->
+    case [P || #path_state{remote_addr = A} = P <- [Pending | Paths], A =:= Addr] of
+        [Path | _] -> path_dcid(Path, State);
+        [] -> State#state.dcid
+    end.
+
 %% Retire the CID an abandoned path bound, if it bound one. A path that
 %% kept the connection's CID (a NAT rebinding) leaves it alone.
 retire_abandoned_path_cid(#path_state{dcid = DCID, dcid_seq = Seq}, State) when
@@ -12293,10 +12301,9 @@ send_path_challenge(
     #state{}
 ) -> #state{}.
 send_path_response_to_addr(
-    {IP, Port},
+    {IP, Port} = Addr,
     ResponseData,
     #state{
-        dcid = DCID,
         app_keys = AppKeys,
         pn_app = PNSpace,
         cfg = #conn_cfg{
@@ -12312,6 +12319,7 @@ send_path_response_to_addr(
                     server -> ServerKeys
                 end,
 
+            DCID = addr_dcid(Addr, State),
             %% Build PATH_RESPONSE frame
             ResponseFrame = {path_response, ResponseData},
             Payload = quic_frame:encode(ResponseFrame),
