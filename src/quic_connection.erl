@@ -3968,7 +3968,30 @@ handle_packet(Data, State) ->
     %% which the fresh budget (or address validation) may now let out.
     State1 = amp_account_recv(Data, State),
     State2 = handle_packet_loop(Data, State1),
-    drain_pending_hs(State2).
+    drain_pending_hs(replay_early_1rtt(State2)).
+
+%% RFC 9001 §5.7 lets a server buffer the 1-RTT packets it may not yet
+%% process. A short-header packet is the last in its datagram, so what is
+%% held is the whole packet.
+hold_early_1rtt(Data, #state{hs = #hs{early_1rtt = Held} = HS} = State) when
+    length(Held) < ?MAX_EARLY_1RTT
+->
+    State#state{hs = HS#hs{early_1rtt = [Data | Held]}};
+hold_early_1rtt(_Data, State) ->
+    State.
+
+%% Run outside the packet that completed the handshake, so a held packet
+%% is processed as if it had just arrived.
+replay_early_1rtt(#state{hs = #hs{early_1rtt = []}} = State) ->
+    State;
+replay_early_1rtt(
+    #state{hs = #hs{tls_state = ?TLS_HANDSHAKE_COMPLETE, early_1rtt = Held} = HS} = State
+) ->
+    lists:foldl(
+        fun handle_packet_loop/2, State#state{hs = HS#hs{early_1rtt = []}}, lists:reverse(Held)
+    );
+replay_early_1rtt(State) ->
+    State.
 
 %% Server-side anti-amplification accounting/gating (RFC 9000 §8.1).
 amp_account_recv(
@@ -4072,7 +4095,7 @@ server_discard_initial(_Type, State) ->
 handle_packets_batch(Packets, State) ->
     State1 = lists:foldl(fun amp_account_recv/2, State, Packets),
     State2 = do_handle_packets_batch(Packets, State1),
-    drain_pending_hs(State2).
+    drain_pending_hs(replay_early_1rtt(State2)).
 
 %% Handle batch of packets from GRO - process all without re-entering gen_statem
 %% This is more efficient than receiving multiple messages
@@ -4095,6 +4118,10 @@ do_handle_packets_batch([Packet | Rest], State) ->
 %% Peer-direction keys for the batched fused open, under the same
 %% no-key-update-in-flight condition as fused_decrypt_keys/2.
 fused_run_keys(#state{app_keys = undefined}) ->
+    no;
+fused_run_keys(#state{cfg = #conn_cfg{role = server}, hs = #hs{tls_state = TlsState}}) when
+    TlsState =/= ?TLS_HANDSHAKE_COMPLETE
+->
     no;
 fused_run_keys(#state{app_keys = {ClientKeys, ServerKeys}, cfg = #conn_cfg{role = Role}} = State) ->
     Current =
@@ -4579,6 +4606,8 @@ handle_packet_loop(Data, State) ->
             %% Nothing may be sent in response, so just abandon the attempt.
             maybe_reenable_socket(State),
             State#state{close_reason = Reason};
+        {error, handshake_incomplete} ->
+            hold_early_1rtt(Data, State);
         {error, Reason} when
             Reason =:= padding_only;
             Reason =:= empty_packet;
@@ -5051,6 +5080,15 @@ check_stateless_reset(Data, #state{cid_pool_state = Pool} = _State) ->
             {error, decryption_failed}
     end.
 
+%% RFC 9001 §5.7: a server must not process 1-RTT packets before the
+%% handshake completes. Acknowledging one would let the client consider
+%% the handshake confirmed and drop its Handshake keys while our
+%% Handshake flight is still unacknowledged.
+decode_short_header_packet(
+    _Data,
+    #state{cfg = #conn_cfg{role = server}, hs = #hs{tls_state = TlsState}}
+) when TlsState =/= ?TLS_HANDSHAKE_COMPLETE ->
+    {error, handshake_incomplete};
 decode_short_header_packet(Data, State) ->
     case State#state.app_keys of
         undefined ->
