@@ -467,6 +467,7 @@ state_get(#state{} = S, app_keys) -> S#state.app_keys;
 state_get(#state{key_state = K}, prev_app_keys) -> K#key_update_state.prev_keys;
 state_get(#state{} = S, initial_keys) -> (S#state.hs)#hs.initial_keys;
 state_get(#state{} = S, handshake_keys) -> (S#state.hs)#hs.handshake_keys;
+state_get(#state{} = S, initial_next_pn) -> ((S#state.hs)#hs.pn_initial)#pn_space.next_pn;
 state_get(#state{} = S, handshake_next_pn) -> ((S#state.hs)#hs.pn_handshake)#pn_space.next_pn;
 state_get(#state{} = S, packets_sent) -> quic_connection:count(?C_PACKETS_SENT, S);
 state_get(#state{} = S, amp_tx) -> (S#state.hs)#hs.amp_tx;
