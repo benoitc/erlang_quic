@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A client now writes its handshake secrets to SSLKEYLOGFILE as well.
+  Only the application secrets were written, so Wireshark could not
+  decrypt the client's Handshake packets and the QUIC Interop Runner
+  rejected the file.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed
