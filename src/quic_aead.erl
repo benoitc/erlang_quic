@@ -50,7 +50,8 @@
     %% 2-stage short header receive API (for key-phase handling)
     unprotect_short_header/4,
     unprotect_short_header/5,
-    decrypt_short_payload/8
+    decrypt_short_payload/8,
+    reconstruct_pn/3
 ]).
 
 -export_type([cipher/0]).

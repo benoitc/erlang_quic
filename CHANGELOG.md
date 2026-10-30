@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A connection now follows a key update the peer starts after one of
+  its own. It kept the previous keys after its own update and opened
+  the peer's next phase with them, so every packet from then on failed
+  to decrypt and the connection stalled until idle timeout.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed
