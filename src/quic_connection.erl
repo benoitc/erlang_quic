@@ -2096,6 +2096,11 @@ draining(info, {udp, _Socket, _IP, _Port, _Data}, State) ->
 draining(cast, {close, _Reason}, State) ->
     %% Ignore duplicate close requests - already draining
     {keep_state, State};
+%% The draining period outlives the owner (RFC 9000 §10.2): stopping now
+%% would drop the CIDs and answer the peer's retransmitted close with a
+%% stateless reset.
+draining(info, {'DOWN', Mon, process, _Pid, _Reason}, #state{owner_mon = Mon} = State) ->
+    {keep_state, State};
 draining({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
 draining({call, From}, early_data_accepted, #state{hs = #hs{early_data_accepted = EDA}} = State) ->
