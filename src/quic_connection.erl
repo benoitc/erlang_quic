@@ -6379,6 +6379,9 @@ process_tls_message(
                     ServerHsSecret = quic_crypto:derive_server_handshake_secret(
                         Cipher, HandshakeSecret, TranscriptHash
                     ),
+                    keylog_handshake(
+                        (State#state.hs)#hs.tls_ch1_random, ClientHsSecret, ServerHsSecret
+                    ),
                     {ClientKey, ClientIV, ClientHP} =
                         quic_keys:derive_keys(ClientHsSecret, Cipher, State#state.version),
                     {ServerKey, ServerIV, ServerHP} =
