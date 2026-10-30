@@ -65,11 +65,12 @@ a_released_packet_is_still_window_checked_test() ->
 %% window has one for probes, so that a blocked sender can free itself,
 %% and an ACK or a close is not congestion controlled at all; none of
 %% that carries over, or an unvalidated server could be used to amplify
-%% traffic at a spoofed address.
+%% traffic at a spoofed address. A refused probe is dropped: what it
+%% carries is still outstanding.
 probe_does_not_bypass_the_budget_test() ->
     S0 = quic_connection_test_support:state_set(amp_limited(), hs_probe, true),
     S1 = quic_connection:send_handshake_packet(payload(), frames(), S0),
-    ?assertEqual(1, queued(handshake, S1)),
+    ?assertEqual(0, queued(handshake, S1)),
     ?assertEqual(0, amp_tx(S1)).
 
 ack_only_does_not_bypass_the_budget_test() ->
