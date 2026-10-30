@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A server now follows a client with a zero-length connection ID to a
+  new address. It waited for a spare CID such a client never issues,
+  kept sending to the old address, and the connection idled out.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed
