@@ -27,7 +27,8 @@
     peer_learns_of_clean_close/1,
     peer_learns_of_server_owner_death/1,
     peer_learns_of_handed_off_owner_death/1,
-    server_owner_death_ignored_when_opted_out/1
+    server_owner_death_ignored_when_opted_out/1,
+    draining_outlives_owner_death/1
 ]).
 
 %% How quickly the peer must see the close. Generous against slow rigs,
@@ -43,7 +44,8 @@ all() ->
         peer_learns_of_owner_death,
         peer_learns_of_server_owner_death,
         peer_learns_of_handed_off_owner_death,
-        server_owner_death_ignored_when_opted_out
+        server_owner_death_ignored_when_opted_out,
+        draining_outlives_owner_death
     ].
 
 init_per_suite(Config) ->
@@ -114,6 +116,36 @@ server_owner_death_ignored_when_opted_out(_Config) ->
         ok
     end,
     ?assert(is_process_alive(SConn)).
+
+%% An owner that exits on the closed event must not cut the draining
+%% period short, or the peer's retransmitted close meets a stateless reset.
+draining_outlives_owner_death(_Config) ->
+    {CConn, Handler, SConn} = server_owned_pair(#{}),
+    ConnMon = erlang:monitor(process, SConn),
+    HandlerMon = erlang:monitor(process, Handler),
+    ok = quic:close(CConn, normal),
+    ok = wait_draining(SConn, 1000),
+    exit(Handler, kill),
+    receive
+        {'DOWN', HandlerMon, process, Handler, _} -> ok
+    end,
+    timer:sleep(5),
+    ?assertMatch({draining, _}, quic_connection:get_state(SConn)),
+    receive
+        {'DOWN', ConnMon, process, SConn, _} -> ok
+    after 10000 -> ct:fail(draining_never_ended)
+    end.
+
+wait_draining(_Conn, 0) ->
+    ct:fail(never_draining);
+wait_draining(Conn, N) ->
+    case quic_connection:get_state(Conn) of
+        {draining, _} ->
+            ok;
+        _ ->
+            timer:sleep(1),
+            wait_draining(Conn, N - 1)
+    end.
 
 assert_closed(Conn) ->
     receive

@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A connection whose owner exits on the `closed` event now completes its
+  draining period. It used to stop at once, so the peer's retransmitted
+  CONNECTION_CLOSE was answered with a stateless reset.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed
