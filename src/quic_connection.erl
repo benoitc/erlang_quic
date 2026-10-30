@@ -5354,7 +5354,10 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% RFC 9000: Invalid ACK range is a protocol violation
                     ?LOG_ERROR(#{what => invalid_ack_range}, ?QUIC_LOG_META),
                     State;
-                {NewLossState, AckedPackets, LostPackets, AckMeta} ->
+                {NewLossState0, AckedPackets, LostPackets, AckMeta} ->
+                    NewLossState = keep_unvalidated_backoff(
+                        Level, LossState, NewLossState0, State
+                    ),
                     %% Use pre-computed metadata from quic_loss (avoids redundant scanning)
                     AckedBytes = maps:get(acked_bytes, AckMeta, 0),
                     LargestAckedSentTime = maps:get(largest_ae_time, AckMeta, Now),
@@ -11548,6 +11551,17 @@ handshake_status(#state{loss_state = LossState, hs = #hs{handshake_keys = HSKeys
             (State#state.hs)#hs.handshake_ack_received orelse
                 quic_loss:handshake_confirmed(LossState)
     }.
+
+%% RFC 9002 Section 6.2.1: a client unsure the server has validated its
+%% address keeps its PTO backoff across acknowledgements. A Handshake
+%% acknowledgement is itself that assurance.
+keep_unvalidated_backoff(initial, Before, After, #state{cfg = #conn_cfg{role = client}} = State) ->
+    case (handshake_status(State))#handshake_status.peer_completed_address_validation of
+        true -> After;
+        false -> quic_loss:keep_pto_backoff(Before, After)
+    end;
+keep_unvalidated_backoff(_Level, _Before, After, _State) ->
+    After.
 
 arm_pto_timer(Delay, State) ->
     {Ref, ArmedAt} = start_pto_timer(Delay),
