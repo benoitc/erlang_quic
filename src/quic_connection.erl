@@ -2404,7 +2404,11 @@ send_client_hello(State) ->
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => (State#state.cfg)#conn_cfg.idle_timeout,
         active_connection_id_limit => local_active_limit(State),
-        max_udp_payload_size => advertised_max_udp_payload_size(State)
+        max_udp_payload_size => advertised_max_udp_payload_size(State),
+        %% RFC 9368: the versions we would also accept; the server may
+        %% switch the connection to one of them.
+        version_information =>
+            {State#state.version, (State#state.cfg)#conn_cfg.supported_versions}
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
     TransportParams1 =
@@ -2734,11 +2738,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => (State#state.cfg)#conn_cfg.idle_timeout,
         active_connection_id_limit => local_active_limit(State),
-        max_udp_payload_size => advertised_max_udp_payload_size(State),
-        %% RFC 9368: the versions we would also accept; the server may
-        %% switch the connection to one of them.
-        version_information =>
-            {State#state.version, (State#state.cfg)#conn_cfg.supported_versions}
+        max_udp_payload_size => advertised_max_udp_payload_size(State)
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
     TransportParams1 =

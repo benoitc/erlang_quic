@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A client given `versions` now offers them to the server, so compatible
+  version negotiation (RFC 9368) can move the connection to QUIC v2. The
+  `version_information` transport parameter was sent only by the server,
+  twice, and never by the client, so a client starting in v1 always stayed
+  in v1.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed
