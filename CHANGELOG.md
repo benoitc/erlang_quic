@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A server whose probe is refused by the anti-amplification limit no
+  longer queues it, and arms no probe again until the client sends more.
+  Each expiry used to queue another copy of the same handshake data, and
+  a lossy handshake could end in "pending handshake queue overflow".
+- A server no longer pads an ACK-only Initial to 1200 bytes. The padding
+  spent anti-amplification budget the server could need to repeat a lost
+  ServerHello, and a client that stopped sending Initials once its own
+  was acknowledged left the handshake stuck.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed

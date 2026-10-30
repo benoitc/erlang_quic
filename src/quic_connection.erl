@@ -3337,14 +3337,12 @@ send_initial_packet(Payload, Frames, State) ->
         Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
 
-    %% Pad Initial packets to at least 1200 bytes
-    PaddedPacket = pad_initial_packet(Packet),
-
     %% Congestion control counts the protected packet; the amplification
     %% budget counts the datagram, which for a short Initial is larger
     %% because it is brought to 1200 bytes outside the packet.
     Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
+    PaddedPacket = pad_initial_datagram(Role, AckEliciting, Packet),
     Meta = {initial, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
     case gate(initial, InFlight, byte_size(Packet), PaddedPacket, Payload, Frames, State) of
         {deferred, Deferred} ->
@@ -3884,6 +3882,14 @@ send_app_packet_internal_error(Reason, PN, PacketSize, PNSpace, State, ClearedSo
             }
     end.
 
+%% RFC 9000 Section 14.1: a server pads only datagrams carrying an
+%% ack-eliciting Initial. An ACK-only one at full size would spend an
+%% unvalidated peer's amplification budget on nothing.
+pad_initial_datagram(server, false, Packet) ->
+    Packet;
+pad_initial_datagram(_Role, _AckEliciting, Packet) ->
+    pad_initial_packet(Packet).
+
 %% Pad Initial packet to minimum 1200 bytes
 pad_initial_packet(Packet) when byte_size(Packet) >= 1200 ->
     Packet;
@@ -3971,10 +3977,16 @@ handle_packet(Data, State) ->
     drain_pending_hs(State2).
 
 %% Server-side anti-amplification accounting/gating (RFC 9000 §8.1).
+%% A blocked server arms no probe, so a receive that lifts the block has
+%% to plan one: it sends nothing in flight, and nothing else would.
 amp_account_recv(
-    Data, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
+    Data, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false} = HS} = State0
 ) ->
-    State#state{hs = (State#state.hs)#hs{amp_rx = (State#state.hs)#hs.amp_rx + byte_size(Data)}};
+    State = State0#state{
+        hs = HS#hs{amp_rx = HS#hs.amp_rx + byte_size(Data), amp_probe_blocked = false}
+    },
+    Lifted = amplification_blocked(State0) andalso not amplification_blocked(State),
+    State#state{pto_dirty = State#state.pto_dirty orelse Lifted};
 amp_account_recv(_Data, State) ->
     State.
 
@@ -3996,8 +4008,14 @@ amp_account_recv(_Data, State) ->
     quic_loss:space(), boolean(), non_neg_integer(), iodata(), iodata(), [term()], #state{}
 ) ->
     {ok, #state{}} | {deferred, #state{}}.
+%%
+%% A refused probe is not queued: what it carries is still outstanding,
+%% so the next probe carries it again, and a queued copy per expiry is
+%% what filled the queue.
 gate(Space, InFlight, Size, Datagram, Payload, Frames, State) ->
     case amp_allows(Datagram, State) of
+        false when (State#state.hs)#hs.hs_probe ->
+            {deferred, State#state{hs = (State#state.hs)#hs{amp_probe_blocked = true}}};
         false ->
             {deferred, enqueue_hs(Space, Payload, Frames, State)};
         true ->
@@ -11527,11 +11545,13 @@ pto_selection(LossState, Now, State) ->
     end.
 
 %% A server has to stop at three times what it has received from an
-%% unvalidated address (RFC 9000 Section 8.1).
+%% unvalidated address (RFC 9000 Section 8.1), and is as good as stopped
+%% once a probe has been refused for lack of room.
 amplification_blocked(
     #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
 ) ->
-    (State#state.hs)#hs.amp_tx >= 3 * (State#state.hs)#hs.amp_rx;
+    (State#state.hs)#hs.amp_probe_blocked orelse
+        (State#state.hs)#hs.amp_tx >= 3 * (State#state.hs)#hs.amp_rx;
 amplification_blocked(_State) ->
     false.
 
