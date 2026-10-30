@@ -4113,6 +4113,10 @@ do_handle_packets_batch([Packet | Rest], State) ->
 %% no-key-update-in-flight condition as fused_decrypt_keys/2.
 fused_run_keys(#state{app_keys = undefined}) ->
     no;
+fused_run_keys(#state{cfg = #conn_cfg{role = server}, hs = #hs{tls_state = TlsState}}) when
+    TlsState =/= ?TLS_HANDSHAKE_COMPLETE
+->
+    no;
 fused_run_keys(#state{app_keys = {ClientKeys, ServerKeys}, cfg = #conn_cfg{role = Role}} = State) ->
     Current =
         case Role of
@@ -4596,11 +4600,14 @@ handle_packet_loop(Data, State) ->
             %% Nothing may be sent in response, so just abandon the attempt.
             maybe_reenable_socket(State),
             State#state{close_reason = Reason};
+        {error, handshake_incomplete} ->
+            %% A server holds 1-RTT packets until the handshake completes
+            %% (RFC 9001 Section 5.7).
+            keep_early_packet(handshake_incomplete, Data, State);
         {error, Reason} when
             Reason =:= padding_only;
             Reason =:= empty_packet;
-            Reason =:= invalid_fixed_bit;
-            Reason =:= handshake_incomplete
+            Reason =:= invalid_fixed_bit
         ->
             %% End of coalesced packets (padding or invalid trailing data)
             %% This is normal, just re-enable socket and return
@@ -4672,7 +4679,8 @@ keep_early_packet(Reason, Data, #state{hs = #hs{early_packets = Early} = HS} = S
     Level =
         case Reason of
             no_handshake_keys -> handshake;
-            no_app_keys -> app
+            no_app_keys -> app;
+            handshake_incomplete -> app
         end,
     Entry = {Level, Data, State#state.current_packet_source},
     State#state{hs = HS#hs{early_packets = Early ++ [Entry]}};
@@ -4699,8 +4707,14 @@ replay_early_packets(#state{hs = #hs{early_packets = Early} = HS} = State) ->
             State1#state{current_packet_source = Source}
     end.
 
-has_keys_for(handshake, #state{hs = #hs{handshake_keys = Keys}}) -> Keys =/= undefined;
-has_keys_for(app, #state{app_keys = Keys}) -> Keys =/= undefined.
+has_keys_for(handshake, #state{hs = #hs{handshake_keys = Keys}}) ->
+    Keys =/= undefined;
+has_keys_for(app, #state{cfg = #conn_cfg{role = server}, hs = #hs{tls_state = TlsState}}) when
+    TlsState =/= ?TLS_HANDSHAKE_COMPLETE
+->
+    false;
+has_keys_for(app, #state{app_keys = Keys}) ->
+    Keys =/= undefined.
 
 binhex(Bin) when is_binary(Bin) -> binary:encode_hex(Bin);
 binhex(Other) -> Other.
