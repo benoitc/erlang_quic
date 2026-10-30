@@ -605,7 +605,10 @@
     local_active_limit = 2 :: non_neg_integer(),
 
     %% The peer's, from its transport parameters; bounds `local'
-    peer_active_limit = 2 :: non_neg_integer()
+    peer_active_limit = 2 :: non_neg_integer(),
+
+    %% The largest retire_prior_to the peer has sent
+    peer_retire_prior_to = 0 :: non_neg_integer()
 }).
 
 %% Stream state

@@ -98,6 +98,38 @@ retirement_reports_sequences_then_prunes_test() ->
         ]
     ).
 
+%% RFC 9000 Section 19.15: a CID below a retire_prior_to already received
+%% is retired on arrival rather than counted against the limit. msquic
+%% sent sequences 2 and 3 retiring everything below 2, then retransmitted
+%% the lost frame carrying sequence 1.
+late_cid_below_retire_prior_to_is_retired_test() ->
+    {ok, Pool1, [0]} = quic_cid:add_peer_cid(peer_pool(), 2, 1, <<2:64>>, undefined),
+    {ok, Pool2, []} = quic_cid:add_peer_cid(
+        quic_cid:prune_retired_peer(Pool1), 3, 2, <<3:64>>, undefined
+    ),
+    {ok, Pool3, [1]} = quic_cid:add_peer_cid(
+        quic_cid:prune_retired_peer(Pool2), 1, 0, <<1:64>>, undefined
+    ),
+    ?assertEqual(2, quic_cid:peer_active_count(Pool3)),
+    ?assertEqual(
+        [2, 3],
+        lists:sort([
+            S
+         || #cid_entry{seq_num = S} <- quic_cid:peer_entries(quic_cid:prune_retired_peer(Pool3))
+        ])
+    ).
+
+%% The retire_prior_to in force is the largest one received, not the one
+%% on the frame at hand.
+earlier_retire_prior_to_does_not_lower_the_bar_test() ->
+    {ok, Pool1, []} = quic_cid:add_peer_cid(peer_pool(), 1, 0, <<1:64>>, undefined),
+    {ok, Pool2, ToRetire} = quic_cid:add_peer_cid(Pool1, 3, 3, <<3:64>>, undefined),
+    ?assertEqual([0, 1], lists:sort(ToRetire)),
+    {ok, Pool3, [2]} = quic_cid:add_peer_cid(
+        quic_cid:prune_retired_peer(Pool2), 2, 2, <<2:64>>, undefined
+    ),
+    ?assertEqual(1, quic_cid:peer_active_count(Pool3)).
+
 %% A retired current DCID is replaced by an active one; an unretired DCID is
 %% kept.
 replacement_only_for_a_retired_dcid_test() ->
