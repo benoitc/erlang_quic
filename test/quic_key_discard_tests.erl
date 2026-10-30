@@ -17,12 +17,23 @@
 %% Section 4.9.1: Initial keys, per role
 %%====================================================================
 
-%% A client discards when it first sends a Handshake packet; the hook is
-%% in send_handshake_crypto/2, which reaches discard_initial/1 here.
-client_discards_initial_test() ->
-    S0 = quic_connection_test_support:state_with_keys(client),
+%% A client discards when it first sends a Handshake packet, whatever it
+%% carries: an ACK-only one counts, or its probes stay in the Initial
+%% space after the server has moved on.
+client_discards_initial_on_handshake_send_test() ->
+    S0 = quic_connection_test_support:state_sending(
+        quic_connection_test_support:state_with_keys(client)
+    ),
     ?assertNotEqual(undefined, keys(S0, initial)),
-    ?assertEqual(undefined, keys(quic_connection:discard_initial(S0), initial)).
+    S1 = quic_connection:send_handshake_packet(quic_frame:encode(ping), [ping], S0),
+    ?assertEqual(undefined, keys(S1, initial)).
+
+server_keeps_initial_on_handshake_send_test() ->
+    S0 = quic_connection_test_support:state_sending(
+        quic_connection_test_support:state_with_keys(server)
+    ),
+    S1 = quic_connection:send_handshake_packet(quic_frame:encode(ping), [ping], S0),
+    ?assertNotEqual(undefined, keys(S1, initial)).
 
 %% A server's trigger is receiving a Handshake packet, not sending one:
 %% until then it may still owe the client an Initial-level ServerHello.
