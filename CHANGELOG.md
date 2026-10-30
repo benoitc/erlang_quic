@@ -9,7 +9,9 @@ All notable changes to this project will be documented in this file.
   completes (RFC 9001 §5.7). Acknowledging one let the client consider
   the handshake confirmed and drop its Handshake keys while the server
   was still waiting for the client's Finished, and the connection hung
-  until idle timeout.
+  until idle timeout. Up to 8 such datagrams are held and processed once
+  the handshake completes, so a request sent alongside the client's
+  Finished is not lost.
 
 ## [2.1.3] - 2026-10-26
 

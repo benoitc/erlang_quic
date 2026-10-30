@@ -15,6 +15,9 @@
 %% flight: reaching it means this endpoint is malfunctioning.
 -define(MAX_PENDING_HS_BYTES, 1048576).
 
+%% Most 1-RTT datagrams a server holds until the handshake completes.
+-define(MAX_EARLY_1RTT, 8).
+
 %% ACK packet tolerance for 1-RTT (RFC 9002 §6.2).
 %% The receiver SHOULD send an ACK frame in response to at least every
 %% second ack-eliciting packet. 2 is the RFC floor; higher values trade
@@ -298,6 +301,9 @@
     %% Set while a probe is being sent, which RFC 9002 Section 7 exempts
     %% from the congestion window.
     hs_probe = false :: boolean(),
+    %% Server-side: 1-RTT datagrams that arrived before the handshake
+    %% completed (RFC 9001 Section 5.7), newest first.
+    early_1rtt = [] :: [binary()],
     %% Client-side: a Handshake acknowledgement has arrived, so the
     %% server has validated this address (RFC 9002 Appendix A.8
     %% PeerCompletedAddressValidation). Always true for a server, which
