@@ -56,3 +56,18 @@ non_eliciting_packet_carries_no_ack_test() ->
     S1 = send(quic_frame:encode(padding), [padding], ?S:state_owing_ack(1, true)),
     ?assertEqual(1, ?S:state_get(S1, packets_sent)),
     ?assertMatch(#{ack_sent := 0, ack_elicited_count := 1}, ?S:ack_counters(S1)).
+
+%% Each ACK goes out once. When it is lost and the peer's packets stop
+%% eliciting new ones, only the probe can still tell the peer what
+%% arrived, or it never declares its own lost packets lost.
+ping_probe_carries_the_ack_test() ->
+    S1 = probe(?S:state_owing_ack(0, false)),
+    ?assertMatch([{ack, _, _, _}, ping], last_sent_frames(S1)).
+
+retransmit_probe_carries_the_ack_test() ->
+    {Payload, Frames} = small_stream(),
+    S1 = probe(send(Payload, Frames, ?S:state_owing_ack(0, false))),
+    ?assertMatch([{ack, _, _, _}, {stream, 0, 0, <<"request">>, false}], last_sent_frames(S1)).
+
+probe(State) ->
+    quic_connection:handle_pto_timeout(?S:state_set(State, pto_space, app)).

@@ -3834,16 +3834,27 @@ clear_pend(close, State) ->
 %% budget (RFC 9000 §13.2.1 lets an ACK ride on any 1-RTT packet), so an
 %% interactive exchange sends no ACK-only packet and needs no ACK timer.
 %% `acked' tells the packet update to clear the decimation state.
+%% A probe carries it even when nothing is owed: every ACK goes out once,
+%% and when that one is lost the probe is the only packet left to tell
+%% the peer which of its packets to declare lost.
 piggyback_ack(
     true,
     Payload,
     Frames,
-    #state{
-        ack_elicited_count = Count,
-        ack_timer = Timer,
-        pn_app = #pn_space{ack_ranges = [_ | _] = Ranges}
-    } = State
-) when Count > 0; Timer =/= undefined ->
+    #state{pn_app = #pn_space{ack_ranges = [_ | _] = Ranges}} = State
+) ->
+    case ack_due(State) of
+        true -> attach_ack(Ranges, Payload, Frames, State);
+        false -> {Payload, Frames, none}
+    end;
+piggyback_ack(_AckEliciting, Payload, Frames, _State) ->
+    {Payload, Frames, none}.
+
+ack_due(#state{ack_elicited_count = Count}) when Count > 0 -> true;
+ack_due(#state{ack_timer = Timer}) when Timer =/= undefined -> true;
+ack_due(#state{hs = #hs{hs_probe = Probe}}) -> Probe.
+
+attach_ack(Ranges, Payload, Frames, State) ->
     AckFrame = quic_ack:build_ack_frame_tuple(Ranges),
     AckBin = quic_frame:encode(AckFrame),
     case
@@ -3852,9 +3863,7 @@ piggyback_ack(
     of
         true -> {[AckBin | Payload], [AckFrame | Frames], acked};
         false -> {Payload, Frames, none}
-    end;
-piggyback_ack(_AckEliciting, Payload, Frames, _State) ->
-    {Payload, Frames, none}.
+    end.
 
 %% ACK timer and decimation count after the packet went out.
 sent_ack_fields(none, #state{ack_timer = T, ack_elicited_count = C}) ->

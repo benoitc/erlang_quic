@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A probe sent on a probe timeout now carries the current
+  acknowledgement. Each acknowledgement went out once, and when it was
+  lost the peer could go on waiting for its own lost packets to be
+  acknowledged until its idle timeout closed the connection.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed
