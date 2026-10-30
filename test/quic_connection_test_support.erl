@@ -435,7 +435,9 @@ state_set(#state{} = S, hs_probe, V) ->
 state_set(#state{} = S, address_validated, V) ->
     S#state{hs = (S#state.hs)#hs{address_validated = V}};
 state_set(#state{} = S, amp_rx, V) ->
-    S#state{hs = (S#state.hs)#hs{amp_rx = V}}.
+    S#state{hs = (S#state.hs)#hs{amp_rx = V}};
+state_set(#state{} = S, tls_state, V) ->
+    S#state{hs = (S#state.hs)#hs{tls_state = V}}.
 
 %% A #state{} carrying a loss tracker, for the space whose timer is
 %% under test. The application space is only reachable once the handshake
