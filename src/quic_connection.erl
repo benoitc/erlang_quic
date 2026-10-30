@@ -2905,16 +2905,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
 %% each sized to stay within max_udp_payload_size (RFC 9000 §14.1).
 %% A single oversized datagram is dropped by strict clients (Chromium),
 %% stalling the handshake.
-send_handshake_crypto(Payload, State0) ->
-    %% RFC 9001 Section 4.9.1: a client discards its Initial keys when it
-    %% first sends a Handshake packet. The server's trigger is receiving
-    %% one, not sending one, so it must not discard here: it still has a
-    %% ServerHello to retransmit at the Initial level.
-    State =
-        case (State0#state.cfg)#conn_cfg.role of
-            client -> discard_initial(State0);
-            server -> State0
-        end,
+send_handshake_crypto(Payload, State) ->
     Max = handshake_crypto_budget(State),
     lists:foldl(
         fun({Offset, Chunk}, AccState) ->
@@ -3499,6 +3490,16 @@ send_frame_tuples(FrameTuples, State) ->
 %% Send a Handshake packet
 send_handshake_packet(_Payload, _Frames, #state{hs = #hs{handshake_keys = undefined}} = State) ->
     State;
+%% RFC 9001 Section 4.9.1: a client discards its Initial keys when it
+%% first sends a Handshake packet, an ACK-only one included, so its probes
+%% move to the Handshake space. The server's trigger is receiving one: it
+%% still has a ServerHello to retransmit at the Initial level.
+send_handshake_packet(
+    Payload,
+    Frames,
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{initial_keys = InitialKeys}} = State
+) when InitialKeys =/= undefined ->
+    send_handshake_packet(Payload, Frames, discard_initial(State));
 send_handshake_packet(Payload, Frames, State) ->
     #state{
         dcid = DCID,
