@@ -38,6 +38,8 @@
     next_app_pn/1,
     after_own_key_update/1,
     key_phase/1,
+    client_with_preferred_address/1,
+    alt_paths/1,
     state_with_send_stream/3,
     state_with_send_streams/1,
     close_reason/1,
@@ -362,6 +364,33 @@ after_own_key_update(Largest) ->
 
 -spec key_phase(#state{}) -> 0 | 1.
 key_phase(#state{key_state = #key_update_state{current_phase = P}}) -> P.
+
+%% A sending client whose server offered a preferred address on IPv4,
+%% with the handshake confirmed or not.
+-spec client_with_preferred_address(boolean()) -> #state{}.
+client_with_preferred_address(Confirmed) ->
+    S0 = with_keys_and_socket(state_for_role(client)),
+    Pool0 = quic_cid:new(<<"own-cid0">>, 2),
+    Pool = quic_cid:set_initial_peer_cid(Pool0, S0#state.dcid, undefined),
+    Loss =
+        case Confirmed of
+            true -> quic_loss:on_handshake_confirmed(quic_loss:new());
+            false -> quic_loss:new()
+        end,
+    PA = #preferred_address{
+        ipv4_addr = {127, 0, 0, 1},
+        ipv4_port = 9,
+        ipv6_addr = {0, 0, 0, 0, 0, 0, 0, 1},
+        ipv6_port = 9,
+        cid = <<"pref-cid">>,
+        stateless_reset_token = binary:copy(<<7>>, 16)
+    },
+    quic_connection:record_preferred_address(
+        PA, S0#state{cid_pool_state = Pool, loss_state = Loss}
+    ).
+
+-spec alt_paths(#state{}) -> [#path_state{}].
+alt_paths(#state{mig = #mig{alt_paths = Paths}}) -> Paths.
 
 %% A connected sender that has received packets 0..4 and owes their ACK:
 %% Count ack-eliciting packets since the last ACK, timer armed or not.
