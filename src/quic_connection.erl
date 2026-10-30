@@ -5155,7 +5155,8 @@ decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
             {error, Reason};
         {ok, KeyPhase, PNLen, TruncatedPN, UnprotectedHeader} ->
             %% Select keys based on key_phase
-            {DecryptKeys, State1} = select_decrypt_keys(KeyPhase, State),
+            PN0 = quic_aead:reconstruct_pn(get_largest_recv(app, State), TruncatedPN, PNLen),
+            {DecryptKeys, State1} = select_decrypt_keys(KeyPhase, PN0, State),
             PeerDecryptKeys =
                 case (State1#state.cfg)#conn_cfg.role of
                     % ClientKeys
@@ -12049,10 +12050,10 @@ handle_peer_key_update(#state{key_state = KeyState} = State) ->
 
 %% @doc Select the appropriate keys for decryption based on the received key phase.
 %% Returns {Keys, State} where State may be updated if a key update is detected.
-select_decrypt_keys(_ReceivedKeyPhase, #state{key_state = undefined} = State) ->
+select_decrypt_keys(_ReceivedKeyPhase, _PN, #state{key_state = undefined} = State) ->
     %% No key state yet, use app_keys directly (should not happen in practice)
     {State#state.app_keys, State};
-select_decrypt_keys(ReceivedKeyPhase, #state{key_state = KeyState} = State) ->
+select_decrypt_keys(ReceivedKeyPhase, PN, #state{key_state = KeyState} = State) ->
     #key_update_state{
         current_phase = CurrentPhase,
         current_keys = CurrentKeys,
@@ -12076,15 +12077,21 @@ select_decrypt_keys(ReceivedKeyPhase, #state{key_state = KeyState} = State) ->
                 key_state = KeyState#key_update_state{update_state = idle}
             }};
         _ ->
-            %% Different phase - could be peer initiating update or using prev keys
-            case PrevKeys of
-                undefined ->
-                    %% No previous keys, peer is initiating update
-                    %% Handle the key update and decrypt with new keys
+            %% RFC 9001 §6.5: once the current phase is confirmed, a packet
+            %% in the other phase numbered above everything received so far
+            %% starts the peer's next update; one below it is a late packet
+            %% from the previous phase.
+            NewerThanAll =
+                case get_largest_recv(app, State) of
+                    undefined -> true;
+                    Largest -> PN > Largest
+                end,
+            PeerUpdate = PrevKeys =:= undefined orelse (UpdateState =:= idle andalso NewerThanAll),
+            case PeerUpdate of
+                true ->
                     State1 = handle_peer_key_update(State),
                     {State1#state.key_state#key_update_state.current_keys, State1};
-                _ ->
-                    %% Try previous keys (during transition period)
+                false ->
                     {PrevKeys, State}
             end
     end.
