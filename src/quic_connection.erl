@@ -1429,13 +1429,13 @@ idle(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Socket} = S
     check_state_transition(idle, FlushedState);
 %% Server receives packets from listener
 idle(info, {quic_packet, Data, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
-    NewState = follow_handshake_peer(RemoteAddr, State, handle_packet(Data, State)),
+    NewState = handle_packet(RemoteAddr, Data, State),
     %% Flush batched packets and timers after processing incoming data
     FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 %% Server receives batched packets from listener (GRO optimization)
 idle(info, {quic_packets, Packets, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
-    NewState = follow_handshake_peer(RemoteAddr, State, handle_packets_batch(Packets, State)),
+    NewState = handle_packets_batch(RemoteAddr, Packets, State),
     FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 idle(cast, process, #state{cfg = #conn_cfg{role = client, active_n = N}} = State) ->
@@ -1455,6 +1455,8 @@ idle({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
 idle({call, From}, early_data_accepted, State) ->
     {keep_state, State, [{reply, From, unknown}]};
+idle(info, {path_validation_timeout, _}, _State) ->
+    {keep_state_and_data, postpone};
 idle(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, idle, State).
 
@@ -1542,7 +1544,7 @@ handshaking(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Sock
     check_state_transition(handshaking, FlushedState);
 %% Server receives packets from listener
 handshaking(info, {quic_packet, Data, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
-    NewState = follow_handshake_peer(RemoteAddr, State, handle_packet(Data, State)),
+    NewState = handle_packet(RemoteAddr, Data, State),
     %% Flush batched packets and timers after processing incoming data
     FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
@@ -1550,7 +1552,7 @@ handshaking(info, {quic_packet, Data, RemoteAddr}, #state{cfg = #conn_cfg{role =
 handshaking(
     info, {quic_packets, Packets, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State
 ) ->
-    NewState = follow_handshake_peer(RemoteAddr, State, handle_packets_batch(Packets, State)),
+    NewState = handle_packets_batch(RemoteAddr, Packets, State),
     FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 handshaking(cast, process, #state{cfg = #conn_cfg{role = client, active_n = N}} = State) ->
@@ -1570,6 +1572,8 @@ handshaking({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = St
     {keep_state, State, [{reply, From, EK =/= undefined}]};
 handshaking({call, From}, early_data_accepted, State) ->
     {keep_state, State, [{reply, From, unknown}]};
+handshaking(info, {path_validation_timeout, _}, _State) ->
+    {keep_state_and_data, postpone};
 handshaking(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, handshaking, State).
 
@@ -3970,6 +3974,14 @@ handle_packet(Data, State) ->
     State2 = handle_packet_loop(Data, State1),
     drain_pending_hs(State2).
 
+%% A server still in its handshake follows the client to the address the
+%% datagram came from before the flights held back by the amplification
+%% limit go out, so they go to where the client is now.
+handle_packet(RemoteAddr, Data, State0) ->
+    State1 = amp_account_recv(Data, State0),
+    State2 = handle_packet_loop(Data, State1),
+    drain_pending_hs(follow_handshake_peer(RemoteAddr, State1, State2)).
+
 %% Server-side anti-amplification accounting/gating (RFC 9000 §8.1).
 amp_account_recv(
     Data, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
@@ -4014,6 +4026,13 @@ amp_allows(
     ((State#state.hs)#hs.amp_tx + erlang:iolist_size(Datagram)) =< (3 * (State#state.hs)#hs.amp_rx);
 amp_allows(_Datagram, _State) ->
     true.
+
+amp_charge(
+    Size, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false} = HS} = State
+) ->
+    State#state{hs = HS#hs{amp_tx = HS#hs.amp_tx + Size}};
+amp_charge(_Size, State) ->
+    State.
 
 %% Put the datagram on the wire and charge it, in that order: nothing is
 %% spent until both gates have passed.
@@ -4073,6 +4092,11 @@ handle_packets_batch(Packets, State) ->
     State1 = lists:foldl(fun amp_account_recv/2, State, Packets),
     State2 = do_handle_packets_batch(Packets, State1),
     drain_pending_hs(State2).
+
+handle_packets_batch(RemoteAddr, Packets, State0) ->
+    State1 = lists:foldl(fun amp_account_recv/2, State0, Packets),
+    State2 = do_handle_packets_batch(Packets, State1),
+    drain_pending_hs(follow_handshake_peer(RemoteAddr, State1, State2)).
 
 %% Handle batch of packets from GRO - process all without re-entering gen_statem
 %% This is more efficient than receiving multiple messages
@@ -6727,9 +6751,10 @@ process_tls_message(
                     %% The server's handshake is confirmed once complete
                     %% (RFC 9001 §4.1.2); tell the client.
                     State2 = send_handshake_done(confirm_handshake(State1)),
+                    State3 = rechallenge_pending_path(State2),
 
                     %% Send NewSessionTicket to enable session resumption
-                    send_new_session_ticket(State2);
+                    send_new_session_ticket(State3);
                 false ->
                     State
             end;
@@ -12231,15 +12256,17 @@ send_path_challenge(
             ),
 
             %% Send to the specific path address (not current remote_addr)
-            case send_packet_to_addr(IP, Port, Packet, State) of
+            case amp_allows(Packet, State) andalso send_packet_to_addr(IP, Port, Packet, State) of
                 ok ->
                     %% Update path bytes_sent for anti-amplification tracking
                     PacketSize = byte_size(Packet),
-                    State1 = update_path_bytes_sent(IP, Port, PacketSize, State),
+                    State1 = amp_charge(
+                        PacketSize, update_path_bytes_sent(IP, Port, PacketSize, State)
+                    ),
                     %% Increment packet number
                     NewPnApp = PNSpace#pn_space{next_pn = PN + 1},
                     State1#state{pn_app = NewPnApp};
-                {error, _Reason} ->
+                _ ->
                     State
             end;
         _ ->
@@ -12481,11 +12508,54 @@ follow_handshake_peer(RemoteAddr, Before, #state{remote_addr = Current} = After)
     RemoteAddr =/= Current
 ->
     case largest_received(After) =/= largest_received(Before) of
-        true -> After#state{remote_addr = RemoteAddr};
+        true -> challenge_handshake_peer(RemoteAddr, After);
         false -> After
     end;
 follow_handshake_peer(_RemoteAddr, _Before, After) ->
     After.
+
+%% RFC 9000 Section 9: a peer that moves before the handshake is
+%% confirmed is validated, which takes a 1-RTT PATH_CHALLENGE. The
+%% client has no other CID yet, so the path keeps the current one.
+challenge_handshake_peer(
+    NewAddr, #state{app_keys = {_, _}, mig = #mig{migration_state = idle} = Mig} = State
+) ->
+    ChallengeData = crypto:strong_rand_bytes(8),
+    Path = #path_state{
+        remote_addr = NewAddr,
+        status = validating,
+        challenge_data = ChallengeData,
+        challenge_count = 1,
+        bytes_sent = 0,
+        bytes_received = 0,
+        dcid = State#state.dcid,
+        is_nat_rebinding = true
+    },
+    State1 = State#state{
+        remote_addr = NewAddr,
+        mig = Mig#mig{pending_peer_validation = Path, migration_state = validating_peer}
+    },
+    State2 = send_path_challenge(NewAddr, ChallengeData, State1),
+    start_path_validation_timer(State2);
+challenge_handshake_peer(NewAddr, State) ->
+    State#state{remote_addr = NewAddr}.
+
+%% A challenge sent during the handshake may have reached a client that
+%% could not decrypt it yet. Now that it can, the same challenge goes
+%% again, so whichever copy is answered completes the validation.
+rechallenge_pending_path(
+    #state{
+        mig = #mig{
+            pending_peer_validation =
+                #path_state{
+                    status = validating, remote_addr = Addr, challenge_data = Data
+                } = Path
+        }
+    } = State
+) ->
+    send_path_challenge(Addr, Data, path_dcid(Path, State), State);
+rechallenge_pending_path(State) ->
+    State.
 
 largest_received(#state{hs = #hs{pn_initial = I, pn_handshake = H}, pn_app = A}) ->
     {I#pn_space.largest_recv, H#pn_space.largest_recv, A#pn_space.largest_recv}.
