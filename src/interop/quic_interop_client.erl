@@ -281,19 +281,6 @@ collect_streams(Conn, Paths, DownloadsDir) ->
     [Result || {_StreamId, Result} <- maps:to_list(Done)] ++
         [error || _ <- PendingLeft].
 
-%% Every stream is opened before any request is sent, and the requests
-%% are queued while the connection is suspended, so it takes them as one
-%% batch and they share 0-RTT packets.
-collect_early_streams(Conn, Paths, DownloadsDir) ->
-    {Opened, Pending} = open_streams(Conn, Paths, []),
-    ok = sys:suspend(Conn),
-    Open = maps:from_list([send_request(Conn, Sid, Path, DownloadsDir) || {Sid, Path} <- Opened]),
-    ok = sys:resume(Conn),
-    Deadline = erlang:monotonic_time(millisecond) + 180000,
-    {Done, PendingLeft} = collect_loop(Conn, Open, Pending, DownloadsDir, #{}, Deadline),
-    [Result || {_StreamId, Result} <- maps:to_list(Done)] ++
-        [error || _ <- PendingLeft].
-
 send_request(Conn, StreamId, Path, DownloadsDir) ->
     Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
     ok = quic:send_data_async(Conn, StreamId, Request, true),
@@ -307,27 +294,16 @@ open_streams(Conn, [Path | Rest] = Pending, Acc) ->
         {error, _} -> {lists:reverse(Acc), Pending}
     end.
 
-fill_streams(_Conn, [], Open, _DownloadsDir) ->
-    {Open, []};
-fill_streams(Conn, [Path | Rest] = Pending, Open, DownloadsDir) ->
-    case quic:open_stream(Conn) of
-        {ok, StreamId} ->
-            Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
-            case quic:send_data(Conn, StreamId, Request, true) of
-                ok ->
-                    fill_streams(
-                        Conn,
-                        Rest,
-                        Open#{StreamId => open_target(Path, DownloadsDir)},
-                        DownloadsDir
-                    );
-                _Err ->
-                    {Open, Pending}
-            end;
-        {error, _} ->
-            %% Out of stream credit for now; the rest wait for MAX_STREAMS.
-            {Open, Pending}
-    end.
+%% Every stream the credit allows is opened before any request is sent,
+%% and the requests are queued while the connection is suspended, so it
+%% takes them as one batch and they share packets: 0-RTT ones before the
+%% handshake completes, 1-RTT ones after. The rest wait for MAX_STREAMS.
+fill_streams(Conn, Pending, Open, DownloadsDir) ->
+    {Opened, Rest} = open_streams(Conn, Pending, []),
+    ok = sys:suspend(Conn),
+    Sent = maps:from_list([send_request(Conn, Sid, Path, DownloadsDir) || {Sid, Path} <- Opened]),
+    ok = sys:resume(Conn),
+    {maps:merge(Open, Sent), Rest}.
 
 open_target(Path, DownloadsDir) ->
     FilePath = filename:join(DownloadsDir, filename:basename(Path)),
@@ -839,7 +815,7 @@ zerortt_download_all(Host, Port, Paths, DownloadsDir, Ticket) ->
     case quic:connect(Host, Port, Opts, self()) of
         {ok, Conn} ->
             io:format("Sending ~p request(s) as early data~n", [length(Paths)]),
-            Results = collect_early_streams(Conn, Paths, DownloadsDir),
+            Results = collect_streams(Conn, Paths, DownloadsDir),
             quic:close(Conn, normal),
             case
                 length(Results) =:= length(Paths) andalso
