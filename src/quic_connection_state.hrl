@@ -261,6 +261,9 @@
     %% one-shot flight; bumps after HRR so CH2 / ServerHello continue
     %% the stream (RFC 9001 §4.1.3).
     initial_tx_off = 0 :: non_neg_integer(),
+    %% The Initial ack ranges last sent, so a ServerHello that carried
+    %% them is not followed by an ACK-only Initial.
+    initial_ack_sent = [] :: [{non_neg_integer(), non_neg_integer()}],
     %% Client-side: CH1 random + build opts, needed to rebuild CH2
     tls_ch1_random :: binary() | undefined,
     %% Client-side: the Certificate(+CertificateVerify)+Finished payload,
