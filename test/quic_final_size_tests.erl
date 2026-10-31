@@ -43,6 +43,20 @@ a_retransmission_within_the_final_size_is_fine_test() ->
     S2 = receive_frame(fin_received(<<"first">>), 0, <<"first">>, true),
     ?assertEqual(undefined, quic_connection_test_support:close_reason(S2)).
 
+%% A peer that did not see our ACK sends its request again. The data
+%% and the FIN went to the application once; an empty FIN delivered a
+%% second time reads as another request on the same stream.
+a_retransmitted_fin_is_not_delivered_again_test() ->
+    S2 = receive_frame(fin_received(<<"first">>), 0, <<"first">>, true),
+    S3 = receive_frame(S2, 0, <<"first">>, true),
+    ?assertEqual(undefined, quic_connection_test_support:close_reason(S3)),
+    ?assertEqual([], [M || {quic, _, {stream_data, ?SID, _, _}} = M <- messages()]).
+
+a_retransmission_without_fin_does_not_reopen_the_stream_test() ->
+    S2 = receive_frame(fin_received(<<"first">>), 0, <<"fir">>, false),
+    _ = receive_frame(S2, 0, <<"first">>, true),
+    ?assertEqual([], [M || {quic, _, {stream_data, ?SID, _, _}} = M <- messages()]).
+
 %% The lean path only runs while the final size is unknown, so a frame
 %% after a FIN always reaches the checks; hold it to that.
 the_lean_path_defers_once_the_final_size_is_known_test() ->

@@ -7681,7 +7681,9 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                                         UpdatedBuffer, CurrentOffset
                                     ),
                                 ExtractedFin =
-                                    FinalSize =/= undefined andalso ExtractedOffset >= FinalSize,
+                                    not Stream#stream_state.recv_fin andalso
+                                        FinalSize =/= undefined andalso
+                                        ExtractedOffset >= FinalSize,
                                 {ExtractedData, ExtractedOffset, ExtractedBuffer, ExtractedFin,
                                     Added - Removed}
                         end,
@@ -7699,7 +7701,7 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
 
                     NewStream = Stream#stream_state{
                         recv_offset = NewRecvOffset,
-                        recv_fin = DeliverFin,
+                        recv_fin = Stream#stream_state.recv_fin orelse DeliverFin,
                         recv_buffer = NewBuffer,
                         recv_buffered = Stream#stream_state.recv_buffered + BufferedDelta,
                         final_size = FinalSize,
