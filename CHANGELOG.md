@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A server follows a client whose address changes before the handshake
+  completes, as after a NAT rebinding. It kept sending its handshake
+  flight to the first address, so the handshake never completed when
+  that address was gone.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed
