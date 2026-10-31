@@ -19,6 +19,10 @@
 
 -export([main/1]).
 
+-ifdef(TEST).
+-export([spawn_handler/4]).
+-endif.
+
 %% Suppress dialyzer warnings for escript functions that call halt()
 -dialyzer({nowarn_function, [main/1, run_server/4]}).
 -dialyzer({nowarn_function, [run_h3_server/4, run_hq_server/5]}).
@@ -253,7 +257,10 @@ connection_handler(Conn, WwwDir, TestCase, Bufs) ->
             io:format("Handler got stream_opened: ~p~n", [StreamId]),
             connection_handler(Conn, WwwDir, TestCase, Bufs);
         {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
-            Bufs1 = buffer_stream_data(Conn, WwwDir, TestCase, Bufs, StreamId, Data, Fin),
+            {Bufs1, Ready} = drain_requests(
+                Conn, buffer_stream_data(Bufs, StreamId, Data, Fin, [])
+            ),
+            serve_requests(Conn, lists:reverse(Ready), WwwDir, TestCase),
             connection_handler(Conn, WwwDir, TestCase, Bufs1);
         {quic, Conn, {closed, Reason}} ->
             io:format("Handler got closed: ~p~n", [Reason]),
@@ -266,16 +273,31 @@ connection_handler(Conn, WwwDir, TestCase, Bufs) ->
         ok
     end.
 
-buffer_stream_data(Conn, WwwDir, TestCase, Bufs, StreamId, Data, Fin) ->
+buffer_stream_data(Bufs, StreamId, Data, Fin, Ready) ->
     Acc = [maps:get(StreamId, Bufs, []) | Data],
     case Fin of
-        true ->
-            Request = iolist_to_binary(Acc),
-            _ = serve_request(Conn, StreamId, Request, WwwDir, TestCase),
-            maps:remove(StreamId, Bufs);
-        false ->
-            Bufs#{StreamId => Acc}
+        true -> {maps:remove(StreamId, Bufs), [{StreamId, iolist_to_binary(Acc)} | Ready]};
+        false -> {Bufs#{StreamId => Acc}, Ready}
     end.
+
+%% Requests already queued are answered together: the responses are
+%% handed to the connection while it is suspended, so it takes them as
+%% one batch and they share packets.
+drain_requests(Conn, {Bufs, Ready}) ->
+    receive
+        {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
+            drain_requests(Conn, buffer_stream_data(Bufs, StreamId, Data, Fin, Ready))
+    after 0 ->
+        {Bufs, Ready}
+    end.
+
+serve_requests(_Conn, [], _WwwDir, _TestCase) ->
+    ok;
+serve_requests(Conn, Requests, WwwDir, TestCase) ->
+    Responses = [{Sid, serve_request(Conn, Sid, Req, WwwDir, TestCase)} || {Sid, Req} <- Requests],
+    ok = sys:suspend(Conn),
+    [quic:send_data_async(Conn, Sid, Body, true) || {Sid, Body} <- Responses],
+    ok = sys:resume(Conn).
 
 serve_request(Conn, StreamId, Data, WwwDir, TestCase) ->
     io:format("handle_request: stream=~p data=~p~n", [StreamId, Data]),
@@ -297,16 +319,14 @@ serve_request(Conn, StreamId, Data, WwwDir, TestCase) ->
             case file:read_file(FilePath) of
                 {ok, Content} ->
                     io:format("Sending ~p bytes on stream ~p~n", [byte_size(Content), StreamId]),
-                    Result = quic:send_data(Conn, StreamId, Content, true),
-                    io:format("send_data result: ~p~n", [Result]),
-                    Result;
+                    Content;
                 {error, ReadErr} ->
                     io:format("File read error: ~p, sending 404~n", [ReadErr]),
-                    quic:send_data(Conn, StreamId, <<"404 Not Found">>, true)
+                    <<"404 Not Found">>
             end;
         error ->
             io:format("Parse error, sending 400~n"),
-            quic:send_data(Conn, StreamId, <<"400 Bad Request">>, true)
+            <<"400 Bad Request">>
     end.
 
 parse_request(Data) ->
