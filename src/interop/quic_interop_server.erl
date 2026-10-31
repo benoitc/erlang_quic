@@ -157,6 +157,7 @@ run_hq_server(TestCase, Port, CertDer, PrivateKey, WwwDir) ->
     %% Start listener
     case quic_listener:start_link(Port, Opts) of
         {ok, Listener} ->
+            warm_up(Port),
             io:format("Server listening on port ~p~n", [Port]),
 
             %% Wait forever (or until killed)
@@ -168,6 +169,23 @@ run_hq_server(TestCase, Port, CertDer, PrivateKey, WwwDir) ->
         {error, Reason} ->
             io:format("Failed to start listener: ~p~n", [Reason]),
             halt(?EXIT_FAILURE)
+    end.
+
+%% The first handshake in a fresh node runs 15 to 45 ms slower than the
+%% rest, loading code and initialising crypto. Clients the runner moves
+%% to another port during the handshake miss a ServerHello that late, so
+%% one handshake over loopback goes first.
+warm_up(Port) ->
+    Opts = #{verify => false, alpn => [<<"hq-interop">>]},
+    case quic:connect(<<"127.0.0.1">>, Port, Opts, self()) of
+        {ok, Conn} ->
+            receive
+                {quic, Conn, {connected, _}} -> ok
+            after 2000 -> ok
+            end,
+            quic:close(Conn, normal);
+        {error, _} ->
+            ok
     end.
 
 build_server_opts(TestCase, {Cert, CertChain}, Key, WwwDir) ->
