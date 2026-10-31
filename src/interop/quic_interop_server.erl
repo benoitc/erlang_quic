@@ -179,6 +179,11 @@ build_server_opts(TestCase, {Cert, CertChain}, Key, WwwDir) ->
         %% The blackhole case blacks the network out on purpose and
         %% expects the connection to outlast it.
         disconnect_timeout => infinity,
+        %% xquic keeps up to 128 requests open and gives up on one that
+        %% finds the stream limit reached instead of waiting for
+        %% MAX_STREAMS. The runner fails a server that starts above 1000
+        %% in the multiplexing case, which the server sees as `transfer'.
+        max_streams_bidi => 1000,
         connection_handler => fun(ConnPid, Conn) ->
             spawn_handler(ConnPid, Conn, WwwDir, TestCase)
         end
