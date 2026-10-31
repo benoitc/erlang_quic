@@ -13,6 +13,11 @@ All notable changes to this project will be documented in this file.
   spent anti-amplification budget the server could need to repeat a lost
   ServerHello, and a client that stopped sending Initials once its own
   was acknowledged left the handshake stuck.
+- Until the client's address is validated, a server puts its Initial
+  and Handshake packets in shared datagrams, and the first Handshake
+  packet fills what the ServerHello leaves. The flight takes fewer
+  datagrams, so the anti-amplification budget covers more repeats of a
+  lost one.
 
 ## [2.1.3] - 2026-10-26
 

@@ -75,11 +75,18 @@ initial_flight_recovers(_Config) ->
 
 %% The Handshake space likewise. Dropping what the server sends at that
 %% level removes its Finished, which only the Handshake probe can bring
-%% back now that the server's retained flight is gone.
+%% back now that the server's retained flight is gone. The first datagram
+%% carrying Handshake data also carries the ServerHello, so it goes
+%% through.
 handshake_flight_recovers(_Config) ->
+    Seen = counters:new(1, []),
     {Echo, Dropped} = run(#{
         drop_in => fun(Pkt, N) ->
-            N =< 4 andalso quic_test_bridge:header_level(Pkt) =:= handshake
+            N =< 4 andalso lists:member(handshake, quic_test_bridge:levels(Pkt)) andalso
+                begin
+                    counters:add(Seen, 1, 1),
+                    counters:get(Seen, 1) > 1
+                end
         end
     }),
     ?assertEqual(?ECHO, Echo),
