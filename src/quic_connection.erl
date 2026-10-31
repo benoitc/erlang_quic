@@ -2962,16 +2962,31 @@ chunk_crypto(Payload, Offset, Max) ->
 %% (RFC 9000 §14.1). A hybrid ML-KEM ClientHello is ~1360 bytes and no
 %% longer fits one datagram; a single oversized Initial is dropped on
 %% paths with an MTU below ~1470 (PPPoE, WireGuard, mobile).
-send_initial_crypto(Payload, Offset0, State) ->
-    Max = initial_crypto_budget(State),
+send_initial_crypto(Payload, Offset0, State0) ->
+    {AckBin, Ack, State} = initial_ack(State0),
+    Max = max(1, initial_crypto_budget(State) - byte_size(AckBin)),
+    [{Offset1, Chunk1} | Chunks] = chunk_crypto(Payload, Offset0, Max),
+    First = {crypto, Offset1, Chunk1},
+    State1 = send_initial_packet(
+        <<AckBin/binary, (quic_frame:encode(First))/binary>>, Ack ++ [First], State
+    ),
     lists:foldl(
         fun({Offset, Chunk}, AccState) ->
             Decoded = {crypto, Offset, Chunk},
             send_initial_packet(quic_frame:encode(Decoded), [Decoded], AccState)
         end,
-        State,
-        chunk_crypto(Payload, Offset0, Max)
+        State1,
+        Chunks
     ).
+
+initial_ack(#state{hs = #hs{pn_initial = #pn_space{ack_ranges = []}}} = State) ->
+    {<<>>, [], State};
+initial_ack(#state{hs = #hs{pn_initial = #pn_space{ack_ranges = Ranges}} = HS} = State) ->
+    {
+        quic_ack:build_ack_frame(Ranges),
+        [{ack, Ranges, 0, undefined}],
+        bump_ack_sent(State#state{hs = HS#hs{initial_ack_sent = Ranges}})
+    }.
 
 %% @private Conservative per-chunk CRYPTO data budget for an Initial
 %% packet. Mirrors handshake_crypto_budget/1 but includes the Retry
@@ -3375,7 +3390,8 @@ send_initial_ack(State) ->
         Ranges ->
             %% Build ACK frame
             AckFrame = quic_ack:build_ack_frame(Ranges),
-            send_initial_packet(AckFrame, [{ack, Ranges, 0, undefined}], bump_ack_sent(State))
+            State1 = State#state{hs = (State#state.hs)#hs{initial_ack_sent = Ranges}},
+            send_initial_packet(AckFrame, [{ack, Ranges, 0, undefined}], bump_ack_sent(State1))
     end.
 
 %% Send a Handshake ACK packet
@@ -8267,6 +8283,12 @@ maybe_send_ack(handshake, Frames, State) ->
         true -> send_handshake_ack(State);
         false -> State
     end;
+maybe_send_ack(
+    initial,
+    _Frames,
+    #state{hs = #hs{initial_ack_sent = Ranges, pn_initial = #pn_space{ack_ranges = Ranges}}} = State
+) ->
+    State;
 maybe_send_ack(initial, Frames, State) ->
     case quic_ack:contains_ack_eliciting_frames(Frames) of
         true -> send_initial_ack(State);
