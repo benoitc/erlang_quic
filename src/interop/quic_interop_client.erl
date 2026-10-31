@@ -281,27 +281,29 @@ collect_streams(Conn, Paths, DownloadsDir) ->
     [Result || {_StreamId, Result} <- maps:to_list(Done)] ++
         [error || _ <- PendingLeft].
 
-fill_streams(_Conn, [], Open, _DownloadsDir) ->
-    {Open, []};
-fill_streams(Conn, [Path | Rest] = Pending, Open, DownloadsDir) ->
+send_request(Conn, StreamId, Path, DownloadsDir) ->
+    Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
+    ok = quic:send_data_async(Conn, StreamId, Request, true),
+    {StreamId, open_target(Path, DownloadsDir)}.
+
+open_streams(_Conn, [], Acc) ->
+    {lists:reverse(Acc), []};
+open_streams(Conn, [Path | Rest] = Pending, Acc) ->
     case quic:open_stream(Conn) of
-        {ok, StreamId} ->
-            Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
-            case quic:send_data(Conn, StreamId, Request, true) of
-                ok ->
-                    fill_streams(
-                        Conn,
-                        Rest,
-                        Open#{StreamId => open_target(Path, DownloadsDir)},
-                        DownloadsDir
-                    );
-                _Err ->
-                    {Open, Pending}
-            end;
-        {error, _} ->
-            %% Out of stream credit for now; the rest wait for MAX_STREAMS.
-            {Open, Pending}
+        {ok, StreamId} -> open_streams(Conn, Rest, [{StreamId, Path} | Acc]);
+        {error, _} -> {lists:reverse(Acc), Pending}
     end.
+
+%% Every stream the credit allows is opened before any request is sent,
+%% and the requests are queued while the connection is suspended, so it
+%% takes them as one batch and they share packets: 0-RTT ones before the
+%% handshake completes, 1-RTT ones after. The rest wait for MAX_STREAMS.
+fill_streams(Conn, Pending, Open, DownloadsDir) ->
+    {Opened, Rest} = open_streams(Conn, Pending, []),
+    ok = sys:suspend(Conn),
+    Sent = maps:from_list([send_request(Conn, Sid, Path, DownloadsDir) || {Sid, Path} <- Opened]),
+    ok = sys:resume(Conn),
+    {maps:merge(Open, Sent), Rest}.
 
 open_target(Path, DownloadsDir) ->
     FilePath = filename:join(DownloadsDir, filename:basename(Path)),
