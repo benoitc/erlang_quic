@@ -369,7 +369,11 @@
     %% Used to ignore stale timeouts from canceled validations
     path_validation_token :: reference() | undefined,
     %% Peer's disable_active_migration transport param (RFC 9000 Section 18.2)
-    peer_disable_migration = false :: boolean()
+    peer_disable_migration = false :: boolean(),
+    %% Which of our CIDs the peer sends with on the current path, and in
+    %% the receive pass being handled
+    peer_dcid :: binary() | undefined,
+    pass_dcid :: binary() | undefined
 }).
 
 -record(state, {

@@ -4455,10 +4455,30 @@ server_recv_pass(Packets, RemoteAddr, State) ->
     case NewState#state.has_non_probing_frame of
         true ->
             TotalSize = lists:sum([byte_size(P) || P <- Packets]),
-            maybe_handle_address_change(RemoteAddr, TotalSize, NewState);
+            Mig = NewState#state.mig,
+            PassDCID = pass_dcid(Packets, NewState),
+            Changed = maybe_handle_address_change(
+                RemoteAddr, TotalSize, NewState#state{mig = Mig#mig{pass_dcid = PassDCID}}
+            ),
+            note_peer_dcid(RemoteAddr, PassDCID, Changed);
         false ->
             NewState
     end.
+
+%% The destination CID of the pass's first 1-RTT packet, one of ours.
+pass_dcid(Packets, #state{cfg = #conn_cfg{scid = SCID}}) ->
+    Len = byte_size(SCID),
+    case [D || <<0:1, 1:1, _:6, D:Len/binary, _/binary>> <- Packets] of
+        [DCID | _] -> DCID;
+        [] -> undefined
+    end.
+
+note_peer_dcid(RemoteAddr, DCID, #state{remote_addr = RemoteAddr, mig = Mig} = State) when
+    DCID =/= undefined
+->
+    State#state{mig = Mig#mig{peer_dcid = DCID, pass_dcid = undefined}};
+note_peer_dcid(_RemoteAddr, _DCID, #state{mig = Mig} = State) ->
+    State#state{mig = Mig#mig{pass_dcid = undefined}}.
 
 %% Drain datagram messages already queued in the mailbox into the
 %% current receive pass, so ACK emission, socket-batch flushing and
@@ -12540,12 +12560,18 @@ maybe_handle_address_change(NewAddr, DataSize, State) ->
         new_path ->
             %% A genuine migration needs a CID that has not been used on
             %% another path. Without one we cannot probe, so nothing is
-            %% emitted and no validation state is created.
-            case has_unused_cid(State) of
-                true -> initiate_peer_path_validation(NewAddr, false, DataSize, State);
-                false -> State
+            %% emitted and no validation state is created, unless the peer
+            %% kept its CID: it did not move, the network moved it, and
+            %% the current CID may stay (RFC 9000 Section 9.5).
+            case {has_unused_cid(State), kept_its_cid(State)} of
+                {true, _} -> initiate_peer_path_validation(NewAddr, false, DataSize, State);
+                {false, true} -> initiate_peer_path_validation(NewAddr, true, DataSize, State);
+                {false, false} -> State
             end
     end.
+
+kept_its_cid(#state{mig = #mig{peer_dcid = DCID, pass_dcid = DCID}}) -> DCID =/= undefined;
+kept_its_cid(_State) -> false.
 
 %% @doc Update bytes_received for pending path validation (anti-amplification).
 -spec update_pending_path_bytes_received(
