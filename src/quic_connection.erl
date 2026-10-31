@@ -1428,14 +1428,14 @@ idle(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Socket} = S
     FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 %% Server receives packets from listener
-idle(info, {quic_packet, Data, _RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
-    NewState = handle_packet(Data, State),
+idle(info, {quic_packet, Data, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
+    NewState = follow_handshake_peer(RemoteAddr, State, handle_packet(Data, State)),
     %% Flush batched packets and timers after processing incoming data
     FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 %% Server receives batched packets from listener (GRO optimization)
-idle(info, {quic_packets, Packets, _RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
-    NewState = handle_packets_batch(Packets, State),
+idle(info, {quic_packets, Packets, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
+    NewState = follow_handshake_peer(RemoteAddr, State, handle_packets_batch(Packets, State)),
     FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 idle(cast, process, #state{cfg = #conn_cfg{role = client, active_n = N}} = State) ->
@@ -1541,16 +1541,16 @@ handshaking(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Sock
     FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 %% Server receives packets from listener
-handshaking(info, {quic_packet, Data, _RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
-    NewState = handle_packet(Data, State),
+handshaking(info, {quic_packet, Data, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
+    NewState = follow_handshake_peer(RemoteAddr, State, handle_packet(Data, State)),
     %% Flush batched packets and timers after processing incoming data
     FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 %% Server receives batched packets from listener (GRO optimization)
 handshaking(
-    info, {quic_packets, Packets, _RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State
+    info, {quic_packets, Packets, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State
 ) ->
-    NewState = handle_packets_batch(Packets, State),
+    NewState = follow_handshake_peer(RemoteAddr, State, handle_packets_batch(Packets, State)),
     FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 handshaking(cast, process, #state{cfg = #conn_cfg{role = client, active_n = N}} = State) ->
@@ -4455,10 +4455,30 @@ server_recv_pass(Packets, RemoteAddr, State) ->
     case NewState#state.has_non_probing_frame of
         true ->
             TotalSize = lists:sum([byte_size(P) || P <- Packets]),
-            maybe_handle_address_change(RemoteAddr, TotalSize, NewState);
+            Mig = NewState#state.mig,
+            PassDCID = pass_dcid(Packets, NewState),
+            Changed = maybe_handle_address_change(
+                RemoteAddr, TotalSize, NewState#state{mig = Mig#mig{pass_dcid = PassDCID}}
+            ),
+            note_peer_dcid(RemoteAddr, PassDCID, Changed);
         false ->
             NewState
     end.
+
+%% The destination CID of the pass's first 1-RTT packet, one of ours.
+pass_dcid(Packets, #state{cfg = #conn_cfg{scid = SCID}}) ->
+    Len = byte_size(SCID),
+    case [D || <<0:1, 1:1, _:6, D:Len/binary, _/binary>> <- Packets] of
+        [DCID | _] -> DCID;
+        [] -> undefined
+    end.
+
+note_peer_dcid(RemoteAddr, DCID, #state{remote_addr = RemoteAddr, mig = Mig} = State) when
+    DCID =/= undefined
+->
+    State#state{mig = Mig#mig{peer_dcid = DCID, pass_dcid = undefined}};
+note_peer_dcid(_RemoteAddr, _DCID, #state{mig = Mig} = State) ->
+    State#state{mig = Mig#mig{pass_dcid = undefined}}.
 
 %% Drain datagram messages already queued in the mailbox into the
 %% current receive pass, so ACK emission, socket-batch flushing and
@@ -12472,6 +12492,24 @@ close_socket_state_quietly(SocketState) ->
 %% Server-Side Address Change Detection (RFC 9000 Section 9)
 %%====================================================================
 
+%% Before the handshake completes there is no path validation to fall
+%% back on, and a NAT rebinding leaves the old address dead, so the
+%% server sends to wherever the newest packet came from. Until the
+%% client's first Handshake packet the anti-amplification limit covers
+%% every address alike.
+follow_handshake_peer(RemoteAddr, Before, #state{remote_addr = Current} = After) when
+    RemoteAddr =/= Current
+->
+    case largest_received(After) =/= largest_received(Before) of
+        true -> After#state{remote_addr = RemoteAddr};
+        false -> After
+    end;
+follow_handshake_peer(_RemoteAddr, _Before, After) ->
+    After.
+
+largest_received(#state{hs = #hs{pn_initial = I, pn_handshake = H}, pn_app = A}) ->
+    {I#pn_space.largest_recv, H#pn_space.largest_recv, A#pn_space.largest_recv}.
+
 %% @doc Detect type of peer address change.
 %% Returns same_path, nat_rebinding (port change only), or new_path (IP change).
 -spec detect_peer_address_change(
@@ -12522,12 +12560,18 @@ maybe_handle_address_change(NewAddr, DataSize, State) ->
         new_path ->
             %% A genuine migration needs a CID that has not been used on
             %% another path. Without one we cannot probe, so nothing is
-            %% emitted and no validation state is created.
-            case has_unused_cid(State) of
-                true -> initiate_peer_path_validation(NewAddr, false, DataSize, State);
-                false -> State
+            %% emitted and no validation state is created, unless the peer
+            %% kept its CID: it did not move, the network moved it, and
+            %% the current CID may stay (RFC 9000 Section 9.5).
+            case {has_unused_cid(State), kept_its_cid(State)} of
+                {true, _} -> initiate_peer_path_validation(NewAddr, false, DataSize, State);
+                {false, true} -> initiate_peer_path_validation(NewAddr, true, DataSize, State);
+                {false, false} -> State
             end
     end.
+
+kept_its_cid(#state{mig = #mig{peer_dcid = DCID, pass_dcid = DCID}}) -> DCID =/= undefined;
+kept_its_cid(_State) -> false.
 
 %% @doc Update bytes_received for pending path validation (anti-amplification).
 -spec update_pending_path_bytes_received(
