@@ -729,6 +729,7 @@ init({server, Opts}) ->
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
+        streams_credit_step = streams_credit_step(Opts),
         keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
@@ -1179,6 +1180,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
+        streams_credit_step = streams_credit_step(Opts),
         keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
@@ -8874,16 +8876,30 @@ peer_stream_kind(StreamId) ->
     end.
 
 credit_peer_on_reclaim(StreamId, Role, State) ->
+    #state{streams_reclaimed = {Bidi, Uni}, streams_credit_step = {BidiStep, UniStep}} = State,
     case stream_class(StreamId, Role) of
+        {bidi, peer} when Bidi + 1 >= BidiStep ->
+            N = State#state.max_streams_bidi_local + Bidi + 1,
+            send_frame({max_streams, bidi, N}, State#state{
+                max_streams_bidi_local = N, streams_reclaimed = {0, Uni}
+            });
         {bidi, peer} ->
-            N = State#state.max_streams_bidi_local + 1,
-            send_frame({max_streams, bidi, N}, State#state{max_streams_bidi_local = N});
+            State#state{streams_reclaimed = {Bidi + 1, Uni}};
+        {uni, peer} when Uni + 1 >= UniStep ->
+            N = State#state.max_streams_uni_local + Uni + 1,
+            send_frame({max_streams, uni, N}, State#state{
+                max_streams_uni_local = N, streams_reclaimed = {Bidi, 0}
+            });
         {uni, peer} ->
-            N = State#state.max_streams_uni_local + 1,
-            send_frame({max_streams, uni, N}, State#state{max_streams_uni_local = N});
+            State#state{streams_reclaimed = {Bidi, Uni + 1}};
         _ ->
             State
     end.
+
+streams_credit_step(Opts) ->
+    Bidi = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+    Uni = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+    {max(1, Bidi div 2), max(1, Uni div 2)}.
 
 cancel_stream_deadline_timer(#stream_state{deadline_timer = undefined}) ->
     ok;

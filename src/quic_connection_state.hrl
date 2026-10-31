@@ -426,6 +426,10 @@
     max_streams_bidi_remote :: non_neg_integer(),
     max_streams_uni_local :: non_neg_integer(),
     max_streams_uni_remote :: non_neg_integer(),
+    %% Peer streams reclaimed since the last MAX_STREAMS, per direction.
+    %% Credit goes back once half the initial limit has piled up.
+    streams_reclaimed = {0, 0} :: {non_neg_integer(), non_neg_integer()},
+    streams_credit_step = {1, 1} :: {pos_integer(), pos_integer()},
     %% Reclaimed-stream tracker (RFC 9000 §2.1: ids are never reused). Per
     %% initiator (local | peer), a sorted list of disjoint {Lo, Hi} intervals
     %% of normalised stream indexes (StreamId bsr 2). Lets us distinguish a
