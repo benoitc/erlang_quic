@@ -10391,17 +10391,21 @@ process_send_queue_entry(
             end
     end.
 
-%% Send data that was queued before connection was established
+%% Send data that was queued before connection was established. The
+%% writes go out as one batch, as coalesced_sends/2 does for writes
+%% queued together in `connected', so they share packets.
 send_pending_data([], State) ->
     State;
-send_pending_data([{StreamId, Data, Fin} | Rest], State) ->
+send_pending_data(Pending, State0) ->
+    Coalesce = tl(Pending) =/= [],
+    State1 = lists:foldl(fun send_pending_entry/2, start_coalescing(Coalesce, State0), Pending),
+    end_coalescing(Coalesce, State1).
+
+send_pending_entry({StreamId, Data, Fin}, State) ->
     %% Accepted before the handshake finished; refusing it now would drop it.
     case do_send_data(StreamId, Data, Fin, State, force) of
-        {ok, NewState} ->
-            send_pending_data(Rest, NewState);
-        {error, _Reason} ->
-            %% Skip failed sends
-            send_pending_data(Rest, State)
+        {ok, NewState} -> NewState;
+        {error, _Reason} -> State
     end.
 
 %% RFC 9000 Section 3.5: STOP_SENDING MUST be answered with RESET_STREAM
