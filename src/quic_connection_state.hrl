@@ -298,6 +298,15 @@
     %% Set while a probe is being sent, which RFC 9002 Section 7 exempts
     %% from the congestion window.
     hs_probe = false :: boolean(),
+    %% A probe was refused for want of anti-amplification budget; no probe
+    %% is armed again until the peer sends more.
+    amp_probe_blocked = false :: boolean(),
+    %% While a server's address is unvalidated, the Initial and Handshake
+    %% packets of one receive or probe share datagrams: {Initial packets,
+    %% Handshake packets, both reversed, bytes, padding owed}. `undefined'
+    %% outside such a pass.
+    dgram = undefined ::
+        undefined | {[binary()], [binary()], non_neg_integer(), boolean()},
     %% Client-side: a Handshake acknowledgement has arrived, so the
     %% server has validated this address (RFC 9002 Appendix A.8
     %% PeerCompletedAddressValidation). Always true for a server, which

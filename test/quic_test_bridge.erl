@@ -18,7 +18,7 @@
 -module(quic_test_bridge).
 
 -export([start/1, set_conn/2, dropped/1, stop/1]).
--export([header_level/1]).
+-export([header_level/1, levels/1]).
 
 -export_type([drop_fun/0]).
 
@@ -147,3 +147,27 @@ header_level(Pkt) ->
                 _ -> retry
             end
     end.
+
+%% @doc The levels of the long-header packets coalesced at the front of
+%% a datagram, up to the first short header or the padding.
+-spec levels(binary()) -> [initial | zero_rtt | handshake | retry].
+levels(<<1:1, 1:1, Type:2, _:4, _Version:32, DL, _:DL/binary, SL, _:SL/binary, Rest0/binary>>) ->
+    Rest1 =
+        case Type of
+            0 ->
+                {TokenLen, R} = quic_varint:decode(Rest0),
+                <<_:TokenLen/binary, R1/binary>> = R,
+                R1;
+            _ ->
+                Rest0
+        end,
+    {Len, Rest2} = quic_varint:decode(Rest1),
+    <<_:Len/binary, Rest/binary>> = Rest2,
+    [level(Type) | levels(Rest)];
+levels(_) ->
+    [].
+
+level(0) -> initial;
+level(1) -> zero_rtt;
+level(2) -> handshake;
+level(3) -> retry.

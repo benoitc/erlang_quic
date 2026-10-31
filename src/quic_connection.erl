@@ -2922,8 +2922,17 @@ send_handshake_crypto(Payload, State0) ->
             send_handshake_packet(Frame, [{crypto, Offset, Chunk}], AccState)
         end,
         State,
-        chunk_crypto(Payload, 0, Max)
+        chunk_crypto(Payload, 0, first_chunk_budget(Max, State), Max)
     ).
+
+%% The first chunk fills what the open datagram has left, so the flight
+%% starts beside the ServerHello rather than in a datagram of its own.
+first_chunk_budget(Max, #state{hs = #hs{dgram = {_, _, Size, _}}}) when
+    Size > 0, Max - Size >= 64
+->
+    Max - Size;
+first_chunk_budget(Max, _State) ->
+    Max.
 
 %% @private Conservative per-chunk CRYPTO data budget for a Handshake
 %% packet. The ceiling is the QUIC baseline (1200): PMTU is unvalidated
@@ -2949,12 +2958,15 @@ handshake_crypto_budget(#state{dcid = DCID, cfg = #conn_cfg{scid = SCID}} = Stat
 %% @private Split a handshake CRYPTO payload into {Offset, Chunk}
 %% pieces, each Chunk =< Max, with contiguous offsets from Offset.
 %% The concatenation of the chunks equals the original payload.
-chunk_crypto(<<>>, _Offset, _Max) ->
-    [];
 chunk_crypto(Payload, Offset, Max) ->
-    Take = min(byte_size(Payload), Max),
+    chunk_crypto(Payload, Offset, Max, Max).
+
+chunk_crypto(<<>>, _Offset, _First, _Max) ->
+    [];
+chunk_crypto(Payload, Offset, First, Max) ->
+    Take = min(byte_size(Payload), First),
     <<Chunk:Take/binary, Rest/binary>> = Payload,
-    [{Offset, Chunk} | chunk_crypto(Rest, Offset + Take, Max)].
+    [{Offset, Chunk} | chunk_crypto(Rest, Offset + Take, Max, Max)].
 
 %% @private Send an Initial-level CRYPTO payload (ClientHello,
 %% ServerHello, or a HelloRetryRequest CH2) as one or more Initial
@@ -3337,26 +3349,24 @@ send_initial_packet(Payload, Frames, State) ->
         Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
 
-    %% Pad Initial packets to at least 1200 bytes
-    PaddedPacket = pad_initial_packet(Packet),
-
     %% Congestion control counts the protected packet; the amplification
     %% budget counts the datagram, which for a short Initial is larger
     %% because it is brought to 1200 bytes outside the packet.
     Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
+    Datagram = initial_datagram(Role, AckEliciting, Packet, State),
     Meta = {initial, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
-    case gate(initial, InFlight, byte_size(Packet), PaddedPacket, Payload, Frames, State) of
+    case gate(initial, InFlight, byte_size(Packet), Datagram, Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
-            State1 = emit(PaddedPacket, Meta, Admitted),
+            State1 = emit(Datagram, Meta, Admitted),
 
             %% Emit qlog packet_sent event
             quic_qlog:packet_sent((State#state.cfg)#conn_cfg.qlog_ctx, #{
                 packet_type => initial,
                 packet_number => PN,
-                length => byte_size(PaddedPacket)
+                length => byte_size(Packet)
             }),
 
             %% Update packet number space and packet counter
@@ -3549,11 +3559,12 @@ send_handshake_packet(Payload, Frames, State) ->
     Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
     Meta = {handshake, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
-    case gate(handshake, InFlight, byte_size(Packet), Packet, Payload, Frames, State) of
+    Datagram = long_datagram(handshake, Packet, false, State),
+    case gate(handshake, InFlight, byte_size(Packet), Datagram, Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
-            State1 = emit(Packet, Meta, Admitted),
+            State1 = emit(Datagram, Meta, Admitted),
 
             %% Emit qlog packet_sent event
             quic_qlog:packet_sent((State#state.cfg)#conn_cfg.qlog_ctx, #{
@@ -3680,7 +3691,8 @@ end_coalescing(true, #state{pend_payload = PP, pend_frames = PF} = State) ->
 %% one packet, and the budget bounds packets on the wire. `clear' empties
 %% the coalescing buffer the payload came from, in the same update;
 %% `close' also turns coalescing off.
-send_app_packet_now(Payload0, Frames0, State, Pend, CCState) ->
+send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
+    State = flush_long_datagram(State0),
     AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames0),
     {Payload, Frames, AckFields} = piggyback_ack(AckEliciting, Payload0, Frames0, State),
     #state{
@@ -3884,6 +3896,66 @@ send_app_packet_internal_error(Reason, PN, PacketSize, PNSpace, State, ClearedSo
             }
     end.
 
+%% RFC 9000 Section 14.1: a server pads only datagrams carrying an
+%% ack-eliciting Initial. An ACK-only one at full size would spend an
+%% unvalidated peer's amplification budget on nothing.
+initial_datagram(server, AckEliciting, Packet, #state{hs = #hs{dgram = {_, _, _, _}}} = State) ->
+    long_datagram(initial, Packet, AckEliciting, State);
+initial_datagram(server, false, Packet, _State) ->
+    Packet;
+initial_datagram(_Role, _AckEliciting, Packet, _State) ->
+    pad_initial_packet(Packet).
+
+%% Inside a coalescing pass a long-header packet goes into the shared
+%% datagram instead of out on its own; Pad says it is an ack-eliciting
+%% Initial, which brings the whole datagram to 1200 bytes.
+long_datagram(Level, Packet, Pad, #state{hs = #hs{dgram = {_, _, _, _}}}) ->
+    {long, Level, Packet, Pad};
+long_datagram(_Level, Packet, _Pad, _State) ->
+    Packet.
+
+%% Run Fun as one coalescing pass when it can save the server
+%% amplification budget, then send whatever datagram it left open.
+coalescing_pass(
+    Fun,
+    #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false, dgram = undefined}} =
+        State0
+) ->
+    State1 = Fun(State0#state{hs = (State0#state.hs)#hs{dgram = {[], [], 0, false}}}),
+    State = flush_long_datagram(State1),
+    State#state{hs = (State#state.hs)#hs{dgram = undefined}};
+coalescing_pass(Fun, State) ->
+    Fun(State).
+
+%% Put the open datagram on the wire; the pass stays open.
+flush_long_datagram(#state{hs = #hs{dgram = {[], [], _, _}}} = State) ->
+    State;
+flush_long_datagram(#state{hs = #hs{dgram = {Initials, Handshakes, Size, Pad}} = HS} = State) ->
+    Datagram0 = iolist_to_binary([lists:reverse(Initials), lists:reverse(Handshakes)]),
+    Datagram =
+        case Pad andalso Size < 1200 of
+            true -> pad_initial_packet(Datagram0);
+            false -> Datagram0
+        end,
+    State1 = State#state{hs = HS#hs{dgram = {[], [], 0, false}}},
+    State1#state{socket_state = send_and_take_socket_state(Datagram, State1)};
+flush_long_datagram(State) ->
+    State.
+
+%% What adding Packet to the open datagram costs against the budget,
+%% and whether it opens a new one. Everything already in it is paid for.
+long_cost(Packet, Pad, {_, _, Size, Pad0}) ->
+    New = byte_size(Packet),
+    case Size =:= 0 orelse Size + New > 1200 of
+        true ->
+            {open, datagram_size(New, Pad)};
+        false ->
+            {append, datagram_size(Size + New, Pad orelse Pad0) - datagram_size(Size, Pad0)}
+    end.
+
+datagram_size(Size, true) -> max(Size, 1200);
+datagram_size(Size, false) -> Size.
+
 %% Pad Initial packet to minimum 1200 bytes
 pad_initial_packet(Packet) when byte_size(Packet) >= 1200 ->
     Packet;
@@ -3967,14 +4039,25 @@ handle_packet(Data, State) ->
     %% anti-amplification budget, then retry any flight a gate held back,
     %% which the fresh budget (or address validation) may now let out.
     State1 = amp_account_recv(Data, State),
-    State2 = handle_packet_loop(Data, State1),
-    drain_pending_hs(State2).
+    coalescing_pass(
+        fun(S0) ->
+            S1 = handle_packet_loop(Data, S0),
+            drain_pending_hs(S1)
+        end,
+        State1
+    ).
 
 %% Server-side anti-amplification accounting/gating (RFC 9000 §8.1).
+%% A blocked server arms no probe, so a receive that lifts the block has
+%% to plan one: it sends nothing in flight, and nothing else would.
 amp_account_recv(
-    Data, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
+    Data, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false} = HS} = State0
 ) ->
-    State#state{hs = (State#state.hs)#hs{amp_rx = (State#state.hs)#hs.amp_rx + byte_size(Data)}};
+    State = State0#state{
+        hs = HS#hs{amp_rx = HS#hs.amp_rx + byte_size(Data), amp_probe_blocked = false}
+    },
+    Lifted = amplification_blocked(State0) andalso not amplification_blocked(State),
+    State#state{pto_dirty = State#state.pto_dirty orelse Lifted};
 amp_account_recv(_Data, State) ->
     State.
 
@@ -3996,8 +4079,14 @@ amp_account_recv(_Data, State) ->
     quic_loss:space(), boolean(), non_neg_integer(), iodata(), iodata(), [term()], #state{}
 ) ->
     {ok, #state{}} | {deferred, #state{}}.
+%%
+%% A refused probe is not queued: what it carries is still outstanding,
+%% so the next probe carries it again, and a queued copy per expiry is
+%% what filled the queue.
 gate(Space, InFlight, Size, Datagram, Payload, Frames, State) ->
     case amp_allows(Datagram, State) of
+        false when (State#state.hs)#hs.hs_probe ->
+            {deferred, State#state{hs = (State#state.hs)#hs{amp_probe_blocked = true}}};
         false ->
             {deferred, enqueue_hs(Space, Payload, Frames, State)};
         true ->
@@ -4009,6 +4098,13 @@ gate(Space, InFlight, Size, Datagram, Payload, Frames, State) ->
 %% is absolute, so unlike the congestion window it has no probe
 %% exemption.
 amp_allows(
+    {long, _Level, Packet, Pad},
+    #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false, dgram = Open}} =
+        State
+) ->
+    {_, Cost} = long_cost(Packet, Pad, Open),
+    ((State#state.hs)#hs.amp_tx + Cost) =< (3 * (State#state.hs)#hs.amp_rx);
+amp_allows(
     Datagram, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
 ) ->
     ((State#state.hs)#hs.amp_tx + erlang:iolist_size(Datagram)) =< (3 * (State#state.hs)#hs.amp_rx);
@@ -4016,7 +4112,26 @@ amp_allows(_Datagram, _State) ->
     true.
 
 %% Put the datagram on the wire and charge it, in that order: nothing is
-%% spent until both gates have passed.
+%% spent until both gates have passed. A packet for the open datagram is
+%% charged now and goes out with it.
+emit({long, Level, Packet, Pad}, Meta, #state{hs = #hs{dgram = Open}} = State0) ->
+    State =
+        case long_cost(Packet, Pad, Open) of
+            {open, _} -> flush_long_datagram(State0);
+            {append, _} -> State0
+        end,
+    #hs{dgram = Open1} = HS = State#state.hs,
+    {_, Cost} = long_cost(Packet, Pad, Open1),
+    {Initials, Handshakes, Size, Pad0} = Open1,
+    Dgram =
+        case Level of
+            initial ->
+                {[Packet | Initials], Handshakes, Size + byte_size(Packet), Pad0 orelse Pad};
+            handshake ->
+                {Initials, [Packet | Handshakes], Size + byte_size(Packet), Pad0 orelse Pad}
+        end,
+    State1 = State#state{hs = HS#hs{dgram = Dgram, amp_tx = HS#hs.amp_tx + Cost}},
+    register_now(Meta, erlang:monotonic_time(millisecond), State1);
 emit(
     Datagram,
     Meta,
@@ -4071,8 +4186,13 @@ server_discard_initial(_Type, State) ->
 %% out.
 handle_packets_batch(Packets, State) ->
     State1 = lists:foldl(fun amp_account_recv/2, State, Packets),
-    State2 = do_handle_packets_batch(Packets, State1),
-    drain_pending_hs(State2).
+    coalescing_pass(
+        fun(S0) ->
+            S1 = do_handle_packets_batch(Packets, S0),
+            drain_pending_hs(S1)
+        end,
+        State1
+    ).
 
 %% Handle batch of packets from GRO - process all without re-entering gen_statem
 %% This is more efficient than receiving multiple messages
@@ -8153,8 +8273,10 @@ close_raw_client_socket(Opts, Socket) ->
             end
     end.
 
-%% Flush any batched packets (call before timers or idle periods)
-flush_socket_batch(#state{socket_state = SocketState} = State) ->
+%% Flush any batched packets (call before timers or idle periods),
+%% the open coalesced datagram first.
+flush_socket_batch(State0) ->
+    #state{socket_state = SocketState} = State = flush_long_datagram(State0),
     case flushed_socket_state(SocketState) of
         %% Empty batch: the socket state is returned as is.
         SocketState -> State;
@@ -9811,7 +9933,7 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
     {chunked_ctx, MaxChunkSize, _Urgency, _PacketSize, HeaderPrefix, LengthVarint, _Where} = Ctx,
     %% A packet still pending from send coalescing goes out first so
     %% the wire order matches the send order.
-    State = flush_pending_packet(State0),
+    State = flush_pending_packet(flush_long_datagram(State0)),
     #state{
         dcid = DCID,
         app_keys = {ClientKeys, ServerKeys},
@@ -11381,7 +11503,10 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
     %% confirmation it could not even decrypt it. RFC 9002 Section 7
     %% exempts it from the congestion window, which is what stops a
     %% blocked connection deadlocking on its own.
-    Probing = send_probe_packet(Space, State1#state{hs = (State1#state.hs)#hs{hs_probe = true}}),
+    Probing = coalescing_pass(
+        fun(S) -> send_probe_packet(Space, S) end,
+        State1#state{hs = (State1#state.hs)#hs{hs_probe = true}}
+    ),
     State2 = Probing#state{hs = (Probing#state.hs)#hs{hs_probe = false}},
 
     %% Probes use the control allowance, so retry any CC-deferred control
@@ -11527,11 +11652,13 @@ pto_selection(LossState, Now, State) ->
     end.
 
 %% A server has to stop at three times what it has received from an
-%% unvalidated address (RFC 9000 Section 8.1).
+%% unvalidated address (RFC 9000 Section 8.1), and is as good as stopped
+%% once a probe has been refused for lack of room.
 amplification_blocked(
     #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
 ) ->
-    (State#state.hs)#hs.amp_tx >= 3 * (State#state.hs)#hs.amp_rx;
+    (State#state.hs)#hs.amp_probe_blocked orelse
+        (State#state.hs)#hs.amp_tx >= 3 * (State#state.hs)#hs.amp_rx;
 amplification_blocked(_State) ->
     false.
 
