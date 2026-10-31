@@ -369,7 +369,10 @@
     %% Used to ignore stale timeouts from canceled validations
     path_validation_token :: reference() | undefined,
     %% Peer's disable_active_migration transport param (RFC 9000 Section 18.2)
-    peer_disable_migration = false :: boolean()
+    peer_disable_migration = false :: boolean(),
+    %% While the current path is on a preferred-address socket, the
+    %% listening socket and its sender, sent through again on return
+    main_sock :: {term(), term()} | undefined
 }).
 
 -record(state, {
@@ -538,6 +541,9 @@
     %% Set during packet processing, cleared after. Used to route PATH_RESPONSE
     %% to the address that sent the PATH_CHALLENGE (RFC 9000 Section 8.2.2).
     current_packet_source :: {inet:ip_address(), inet:port_number()} | undefined,
+    %% Transient: the preferred-address socket the current packet came in
+    %% on, `undefined' for the listening socket
+    current_packet_via :: term(),
     %% Transient field: set to true when a non-probing frame is processed
     %% RFC 9000 Section 9.1: Only non-probing frames trigger migration
     has_non_probing_frame = false :: boolean(),
