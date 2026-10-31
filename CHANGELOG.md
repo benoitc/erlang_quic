@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A retransmitted STREAM frame carrying a FIN that was already
+  delivered no longer delivers the FIN to the owner a second time, as
+  an empty `stream_data` with Fin set. A server reading that as a new
+  request on the stream could write past the final size it had already
+  sent.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed
