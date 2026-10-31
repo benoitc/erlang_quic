@@ -238,3 +238,16 @@ retired_pool(Pool, Seq) ->
     Retired.
 
 drop_pool({ok, _Pool, Seq}) -> {ok, Seq}.
+
+%% RFC 9000 Section 5.1.1: the preferred_address CID is sequence 1, so
+%% the first NEW_CONNECTION_ID after it is 2, and it can be retired.
+preferred_address_cid_is_sequence_one_test() ->
+    Secret = crypto:strong_rand_bytes(32),
+    Pool0 = quic_cid:set_peer_active_limit(quic_cid:new(<<0:64>>, 2), 4),
+    {Pool1, Seq, Token} = quic_cid:issue_cid(Pool0, <<1:64>>, Secret),
+    ?assertEqual(1, Seq),
+    ?assertEqual(16, byte_size(Token)),
+    ?assertEqual(2, quic_cid:replenish_needed(Pool1)),
+    {_Pool2, [{Next, _, _} | _]} = quic_cid:issue(Pool1, 2, Secret),
+    ?assertEqual(2, Next),
+    ?assertMatch({ok, _, <<1:64>>}, quic_cid:retire_local(Pool1, 1)).

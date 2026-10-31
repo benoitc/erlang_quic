@@ -11,6 +11,13 @@ All notable changes to this project will be documented in this file.
   always picked the IPv6 address, even on an IPv4 socket. It now probes
   once the handshake is confirmed, in the family of the current path,
   and resends the challenge up to three times.
+- A server with `preferred_ipv4` or `preferred_ipv6` now serves the
+  preferred address. The listener opens a socket on each preferred
+  endpoint its own socket does not cover and routes the preferred CID
+  to the connection, which answers from the socket the path is on and
+  challenges the path in the same packet. The preferred CID is sequence
+  1, so NEW_CONNECTION_ID numbering no longer collides with it. A
+  listener on the `socket` backend refuses preferred addresses.
 
 ## [2.1.3] - 2026-10-26
 

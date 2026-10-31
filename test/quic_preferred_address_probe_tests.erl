@@ -76,8 +76,8 @@ response_on_probed_path_uses_its_cid_test() ->
     S1 = quic_connection:maybe_probe_preferred_address(S0),
     [#path_state{dcid = PathDCID}] = quic_connection_test_support:alt_paths(S1),
     ?assertEqual(<<"pref-cid">>, PathDCID),
-    ?assertEqual(PathDCID, quic_connection:addr_dcid(?PA_ADDR, S1)),
+    ?assertEqual(PathDCID, quic_connection:addr_dcid(?PA_ADDR, undefined, S1)),
     ?assertEqual(
         quic_connection_test_support:state_get(S1, dcid),
-        quic_connection:addr_dcid({{127, 0, 0, 3}, 9}, S1)
+        quic_connection:addr_dcid({{127, 0, 0, 3}, 9}, undefined, S1)
     ).

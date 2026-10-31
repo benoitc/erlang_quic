@@ -517,7 +517,11 @@
     %% NAT rebinding vs active migration (RFC 9000 Section 9.3)
     %% NAT rebinding: only port changed, same IP
     %% Active migration: different IP address
-    is_nat_rebinding = false :: boolean()
+    is_nat_rebinding = false :: boolean(),
+
+    %% Server side: the listener socket bound to the preferred address
+    %% this path arrives on, `undefined' for the listening socket
+    via :: term()
 }).
 
 %% Preferred Address for Server Migration (RFC 9000 Section 9.6)
