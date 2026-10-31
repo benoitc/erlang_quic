@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- 0-RTT sends that are already queued, `send_data_async` included,
+  share packets, as 1-RTT sends do. A client that opens a stream per request sent each request in a
+  datagram of its own; a burst of 40 lost about a third of them to a
+  short router queue, and all of it then went again in 1-RTT.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed
