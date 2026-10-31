@@ -35,7 +35,11 @@
     drop_in => drop_fun(),
     %% Server to client: a datagram this returns true for is delivered
     %% after the next one, swapping the two.
-    hold_in => drop_fun()
+    hold_in => drop_fun(),
+    %% Client datagram N and those after it leave from a new port, and
+    %% nothing sent to the old one comes through: a NAT rebinding that
+    %% lands before the server's reply to the earlier datagrams.
+    rebind_at => pos_integer()
 }.
 
 -define(KEEP, fun(_Pkt, _N) -> false end).
@@ -59,6 +63,7 @@ start(#{server := Server, socket_ref := SocketRef} = Opts) ->
             drop_in => maps:get(drop_in, Opts, ?KEEP),
             hold_in => maps:get(hold_in, Opts, ?KEEP),
             held => [],
+            rebind_at => maps:get(rebind_at, Opts, undefined),
             out_seen => 0,
             in_seen => 0,
             dropped => 0
@@ -114,14 +119,20 @@ loop(#{sock := Sock, server := {ServerIP, ServerPort}} = B) ->
         {send, _IP, _Port, Pkt} ->
             Bin = iolist_to_binary(Pkt),
             N = maps:get(out_seen, B) + 1,
-            B1 = B#{out_seen := N},
-            case (maps:get(drop_out, B))(Bin, N) of
+            B1 = maybe_rebind(N, B#{out_seen := N}),
+            case (maps:get(drop_out, B1))(Bin, N) of
                 true ->
-                    loop(B1#{dropped := maps:get(dropped, B) + 1});
+                    loop(B1#{dropped := maps:get(dropped, B1) + 1});
                 false ->
-                    ok = gen_udp:send(Sock, ServerIP, ServerPort, Bin),
+                    ok = gen_udp:send(maps:get(sock, B1), ServerIP, ServerPort, Bin),
                     loop(B1)
             end;
+        {udp, Old, _IP, _Port, _Data} when Old =/= Sock ->
+            loop(B#{dropped := maps:get(dropped, B) + 1});
+        {udp, Sock, _IP, _Port, _Data} when
+            not is_map_key(old_socks, B), is_integer(map_get(rebind_at, B))
+        ->
+            loop(B#{dropped := maps:get(dropped, B) + 1});
         {udp, Sock, _IP, _Port, Data} ->
             N = maps:get(in_seen, B) + 1,
             B1 = B#{in_seen := N},
@@ -137,7 +148,8 @@ loop(#{sock := Sock, server := {ServerIP, ServerPort}} = B) ->
                     end
             end;
         stop ->
-            gen_udp:close(Sock);
+            [gen_udp:close(S) || S <- [Sock | maps:get(old_socks, B, [])]],
+            ok;
         _ ->
             loop(B)
     end.
@@ -150,6 +162,12 @@ pass_in(Data, B) ->
             deliver(B, Conn, Data),
             B
     end.
+
+maybe_rebind(N, #{rebind_at := N, sock := Old} = B) ->
+    {ok, New} = gen_udp:open(0, [binary, {active, true}]),
+    B#{sock := New, old_socks => [Old | maps:get(old_socks, B, [])]};
+maybe_rebind(_N, B) ->
+    B.
 
 deliver(#{server := {ServerIP, ServerPort}, socket_ref := SocketRef}, Conn, Data) ->
     Conn ! {udp, SocketRef, ServerIP, ServerPort, Data}.
