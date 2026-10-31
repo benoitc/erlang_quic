@@ -159,6 +159,7 @@ run_hq_server(TestCase, Port, CertDer, PrivateKey, WwwDir) ->
     V6Opts = Opts#{extra_socket_opts => [inet6, {ipv6_v6only, true}]},
     case {quic_listener:start_link(Port, Opts), quic_listener:start_link(Port, V6Opts)} of
         {{ok, Listener}, {ok, Listener6}} ->
+            warm_up(Port),
             io:format("Server listening on port ~p~n", [Port]),
 
             %% Wait forever (or until killed)
@@ -171,6 +172,23 @@ run_hq_server(TestCase, Port, CertDer, PrivateKey, WwwDir) ->
         Failed ->
             io:format("Failed to start listener: ~p~n", [Failed]),
             halt(?EXIT_FAILURE)
+    end.
+
+%% The first handshake in a fresh node runs 15 to 45 ms slower than the
+%% rest, loading code and initialising crypto. Clients the runner moves
+%% to another port during the handshake miss a ServerHello that late, so
+%% one handshake over loopback goes first.
+warm_up(Port) ->
+    Opts = #{verify => false, alpn => [<<"hq-interop">>]},
+    case quic:connect(<<"127.0.0.1">>, Port, Opts, self()) of
+        {ok, Conn} ->
+            receive
+                {quic, Conn, {connected, _}} -> ok
+            after 2000 -> ok
+            end,
+            quic:close(Conn, normal);
+        {error, _} ->
+            ok
     end.
 
 build_server_opts(TestCase, {Cert, CertChain}, Key, WwwDir) ->
