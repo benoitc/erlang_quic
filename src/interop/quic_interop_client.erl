@@ -287,21 +287,17 @@ collect_streams(Conn, Paths, DownloadsDir) ->
 collect_early_streams(Conn, Paths, DownloadsDir) ->
     {Opened, Pending} = open_streams(Conn, Paths, []),
     ok = sys:suspend(Conn),
-    Open = maps:from_list(
-        [
-            begin
-                Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
-                ok = quic:send_data_async(Conn, StreamId, Request, true),
-                {StreamId, open_target(Path, DownloadsDir)}
-            end
-         || {StreamId, Path} <- Opened
-        ]
-    ),
+    Open = maps:from_list([send_request(Conn, Sid, Path, DownloadsDir) || {Sid, Path} <- Opened]),
     ok = sys:resume(Conn),
     Deadline = erlang:monotonic_time(millisecond) + 180000,
     {Done, PendingLeft} = collect_loop(Conn, Open, Pending, DownloadsDir, #{}, Deadline),
     [Result || {_StreamId, Result} <- maps:to_list(Done)] ++
         [error || _ <- PendingLeft].
+
+send_request(Conn, StreamId, Path, DownloadsDir) ->
+    Request = <<"GET ", (list_to_binary(Path))/binary, "\r\n">>,
+    ok = quic:send_data_async(Conn, StreamId, Request, true),
+    {StreamId, open_target(Path, DownloadsDir)}.
 
 open_streams(_Conn, [], Acc) ->
     {lists:reverse(Acc), []};
