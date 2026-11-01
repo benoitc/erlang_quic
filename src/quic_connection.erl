@@ -10007,8 +10007,9 @@ send_zero_rtt_packet(Payload, Frames, EarlyKeys, State) ->
 -spec reset_zero_rtt_streams([non_neg_integer()], #state{}) -> #state{}.
 reset_zero_rtt_streams([], State) ->
     State;
-reset_zero_rtt_streams(RejectedIds, #state{streams = Streams, owner = Owner} = State) ->
+reset_zero_rtt_streams(RejectedIds, #state{streams = Streams, owner = Owner} = State0) ->
     NewStreams = lists:foldl(fun maps:remove/2, Streams, RejectedIds),
+    State = lists:foldl(fun purge_stream_send_queue/2, State0, RejectedIds),
     ?LOG_INFO(
         #{
             what => zero_rtt_rejected,
@@ -10040,11 +10041,25 @@ finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = true}} = State) ->
     State#state{
         data_sent = DataSent + EarlyDataSent, hs = (State#state.hs)#hs{early_data_sent = 0}
     };
-finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = false}} = State) ->
+finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = false}} = State0) ->
+    State = discard_zero_rtt_packets(State0),
     case sets:to_list((State#state.hs)#hs.zero_rtt_stream_ids) of
         [] -> State;
         RejectedIds -> reset_zero_rtt_streams(RejectedIds, State)
     end.
+
+%% RFC 9002 Section 6.4: the recovery state of rejected 0-RTT packets is
+%% discarded. Until the handshake completes the client sends nothing
+%% else in the application space, so that is all of it.
+discard_zero_rtt_packets(#state{loss_state = undefined} = State) ->
+    State;
+discard_zero_rtt_packets(#state{loss_state = LossState, cc_state = CCState} = State) ->
+    {NewLossState, Bytes} = quic_loss:discard_space(app, LossState),
+    State#state{
+        loss_state = NewLossState,
+        cc_state = discard_cc_bytes(CCState, Bytes),
+        pto_dirty = true
+    }.
 
 %% Estimate packet overhead (header + AEAD tag + frame header).
 %% Kept as a macro for the stream-chunking paths that sized themselves
