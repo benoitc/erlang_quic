@@ -5063,8 +5063,32 @@ decode_long_header_packet(Data, State) ->
             State1 = maybe_adopt_peer_version(Version, State),
             %% The type bits are version-specific (RFC 9369 §3.2)
             Type = quic_packet:bits_to_type(TypeBits, Version),
-            decode_long_header_type(Type, Data, FirstByte, Version, DCID, SCID, Rest3, State1)
+            case server_scid_changed(Type, SCID, State1) of
+                true ->
+                    {error, server_scid_changed};
+                false ->
+                    decode_long_header_type(
+                        Type, Data, FirstByte, Version, DCID, SCID, Rest3, State1
+                    )
+            end
     end.
+
+%% RFC 9000 Section 7.2: once a client has a valid Initial from the
+%% server, it discards packets with another Source Connection ID.
+server_scid_changed(retry, _SCID, _State) ->
+    false;
+server_scid_changed(_Type, SCID, #state{
+    cfg = #conn_cfg{role = client},
+    hs = #hs{pn_initial = #pn_space{largest_recv = Largest}},
+    cid_pool_state = Pool
+}) when Largest =/= undefined ->
+    case lists:keyfind(0, #cid_entry.seq_num, quic_cid:peer_entries(Pool)) of
+        #cid_entry{cid = SCID} -> false;
+        #cid_entry{} -> true;
+        false -> false
+    end;
+server_scid_changed(_Type, _SCID, _State) ->
+    false.
 
 %% Client side of compatible version negotiation: the first long-header
 %% packet from the server carrying a version we offered (but did not
@@ -5194,22 +5218,33 @@ decode_initial_with_keys(FullPacket, FirstByte, PeerSCID, Rest, {ClientKeys, Ser
     <<Token:TokenLen/binary, Rest3/binary>> = Rest2,
     {PayloadLen, Rest4} = quic_varint:decode(Rest3),
     _ = maybe_validate_initial_token(Token, State),
-
-    %% Header ends here, payload starts
-    HeaderLen = byte_size(FullPacket) - byte_size(Rest4),
-    <<Header:HeaderLen/binary, Payload/binary>> = FullPacket,
-
-    State1 = adopt_peer_scid(PeerSCID, State),
-
-    %% Ensure we have enough data
-    case byte_size(Payload) >= PayloadLen of
+    case Role =:= client andalso Token =/= <<>> of
         true ->
-            <<EncryptedPayload:PayloadLen/binary, RemainingData/binary>> = Payload,
-            decrypt_packet(
-                initial, Header, FirstByte, EncryptedPayload, RemainingData, DecryptKeys, State1
-            );
+            %% RFC 9000 Section 17.2.2: a server Initial carries no token
+            {error, server_initial_token};
         false ->
-            {error, incomplete_packet}
+            %% Header ends here, payload starts
+            HeaderLen = byte_size(FullPacket) - byte_size(Rest4),
+            <<Header:HeaderLen/binary, Payload/binary>> = FullPacket,
+
+            State1 = adopt_peer_scid(PeerSCID, State),
+
+            %% Ensure we have enough data
+            case byte_size(Payload) >= PayloadLen of
+                true ->
+                    <<EncryptedPayload:PayloadLen/binary, RemainingData/binary>> = Payload,
+                    decrypt_packet(
+                        initial,
+                        Header,
+                        FirstByte,
+                        EncryptedPayload,
+                        RemainingData,
+                        DecryptKeys,
+                        State1
+                    );
+                false ->
+                    {error, incomplete_packet}
+            end
     end.
 
 decode_handshake_packet(FullPacket, FirstByte, _DCID, _SCID, Rest, State) ->
