@@ -5429,6 +5429,13 @@ decode_short_header_packet(Data, State) ->
                     ?LOG_WARNING(#{what => short_header_decryption_failed}, ?QUIC_LOG_META),
                     %% Decryption failed - check if this is a stateless reset
                     check_stateless_reset(Data, State);
+                {error, _} = Error ->
+                    %% RFC 9000 Section 10.3.1: a reset too short for a
+                    %% header-protection sample fails before decryption.
+                    case check_stateless_reset(Data, State) of
+                        {error, stateless_reset} = Reset -> Reset;
+                        {error, decryption_failed} -> Error
+                    end;
                 {ok, _Type, _Frames, _Remaining, _NewState} = Result ->
                     Result;
                 Other ->
