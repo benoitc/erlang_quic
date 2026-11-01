@@ -10955,7 +10955,7 @@ do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
                 undefined -> ok;
                 Timer -> erlang:cancel_timer(Timer)
             end,
-            FinalSize = StreamState#stream_state.send_offset,
+            FinalSize = reset_final_size(StreamId, StreamState, State),
             ResetFrame = {reset_stream, StreamId, ErrorCode, FinalSize},
             NewState = send_frame(ResetFrame, State),
             UpdatedStream = StreamState#stream_state{
@@ -11172,6 +11172,28 @@ trim_entry(_Entry, _StreamId, _ReliableSize) ->
 
 %% True if the send queue holds STREAM/retransmit data for StreamId starting
 %% before ReliableSize (reliable bytes still owed).
+%% RFC 9000 Section 4.5: the final size of a stream we reset covers what
+%% we sent. New data still queued is dropped with the reset; retransmits
+%% in the queue were sent already. A stream's new data goes out in
+%% offset order, so what is queued is a tail.
+reset_final_size(StreamId, #stream_state{send_offset = Offset}, #state{send_queue = PQ}) ->
+    lists:foldl(
+        fun(I, Acc) ->
+            queue:fold(
+                fun
+                    ({stream_data, SId, QOffset, _, _, _}, A) when SId =:= StreamId ->
+                        min(QOffset, A);
+                    (_, A) ->
+                        A
+                end,
+                Acc,
+                element(I, PQ)
+            )
+        end,
+        Offset,
+        lists:seq(1, 8)
+    ).
+
 stream_has_queued_below(StreamId, ReliableSize, PQ) ->
     lists:any(
         fun(I) ->
@@ -11357,7 +11379,7 @@ do_close_stream_deadline(StreamId, ErrorCode, #state{streams = Streams} = State)
     case maps:find(StreamId, Streams) of
         {ok, StreamState} ->
             %% Send RESET_STREAM frame
-            FinalSize = StreamState#stream_state.send_offset,
+            FinalSize = reset_final_size(StreamId, StreamState, State),
             ResetFrame = {reset_stream, StreamId, ErrorCode, FinalSize},
             NewState = send_frame(ResetFrame, State),
             %% Local RESET_STREAM closes our send side; purge any queued frames
