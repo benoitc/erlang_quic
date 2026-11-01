@@ -366,7 +366,7 @@ on_packets_sent_run(Space, #loss_state{bytes_in_flight = InFlight} = State, Trac
     ).
 
 %% @doc Process an ACK frame.
-%% Returns {NewState, AckedPackets, LostPackets, AckMeta} or {error, ack_range_too_large}
+%% Returns {NewState, AckedPackets, LostPackets, AckMeta}
 %% AckMeta is a map containing:
 %%   - acked_bytes: total bytes from ack-eliciting packets that were acknowledged
 %%   - largest_ae_time: sent_time of the largest ack-eliciting packet acknowledged
@@ -380,91 +380,87 @@ on_packets_sent_run(Space, #loss_state{bytes_in_flight = InFlight} = State, Trac
 %%   3. detect_lost_q: over the kept survivors, apply packet-threshold
 %%      and time-threshold loss criteria using the freshly updated SRTT.
 -spec on_ack_received(space(), loss_state(), term(), non_neg_integer()) ->
-    {loss_state(), [#sent_packet{}], [#sent_packet{}], map()} | {error, ack_range_too_large}.
+    {loss_state(), [#sent_packet{}], [#sent_packet{}], map()}.
 on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now) ->
-    case quic_ack:ack_frame_to_ranges(LargestAcked, FirstRange, AckRanges) of
-        {error, _} = Error ->
-            Error;
-        AckedRanges ->
-            %% Phase 1: walk the sent queue ONLY through packets with
-            %% PN =< LargestAcked. Those are the ones this ACK can
-            %% decide about; anything newer stays in the tail untouched.
-            %% This keeps per-ACK work proportional to the ACK window,
-            %% not to the full outstanding queue.
-            {AckedList, KeptAccList, AckedBytes, MaxAckEliciting, TailQ} =
-                classify_ack_head(
-                    (pn(Space, State))#pn_loss.sent_q,
-                    LargestAcked,
-                    AckedRanges,
-                    [],
-                    [],
-                    0,
-                    undefined
-                ),
+    AckedRanges = quic_ack:ack_frame_to_ranges(LargestAcked, FirstRange, AckRanges),
+    %% Phase 1: walk the sent queue ONLY through packets with
+    %% PN =< LargestAcked. Those are the ones this ACK can
+    %% decide about; anything newer stays in the tail untouched.
+    %% This keeps per-ACK work proportional to the ACK window,
+    %% not to the full outstanding queue.
+    {AckedList, KeptAccList, AckedBytes, MaxAckEliciting, TailQ} =
+        classify_ack_head(
+            (pn(Space, State))#pn_loss.sent_q,
+            LargestAcked,
+            AckedRanges,
+            [],
+            [],
+            0,
+            undefined
+        ),
 
-            NewState1 = maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now),
+    NewState1 = maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now),
 
-            %% Phase 2: loss detection over the survivors from phase 1
-            %% (KeptAccList is newest-first, reverse to oldest-first so
-            %% largest-lost bookkeeping works).
-            KeptList = lists:reverse(KeptAccList),
-            %% Late acknowledgements of packets already declared lost
-            %% adapt the thresholds before this ACK's own loss pass.
-            {P0, Spurious, Undo} = spurious_losses(
-                pn(Space, NewState1), AckedRanges, LargestAcked, Now, NewState1
-            ),
-            {LostList, SurvHeadQ, LostBytes, LargestLostSentTime} =
-                detect_lost_q(
-                    KeptList,
-                    thresholds(P0, NewState1),
-                    LargestAcked,
-                    Now,
-                    [],
-                    queue:new(),
-                    0,
-                    undefined
-                ),
+    %% Phase 2: loss detection over the survivors from phase 1
+    %% (KeptAccList is newest-first, reverse to oldest-first so
+    %% largest-lost bookkeeping works).
+    KeptList = lists:reverse(KeptAccList),
+    %% Late acknowledgements of packets already declared lost
+    %% adapt the thresholds before this ACK's own loss pass.
+    {P0, Spurious, Undo} = spurious_losses(
+        pn(Space, NewState1), AckedRanges, LargestAcked, Now, NewState1
+    ),
+    {LostList, SurvHeadQ, LostBytes, LargestLostSentTime} =
+        detect_lost_q(
+            KeptList,
+            thresholds(P0, NewState1),
+            LargestAcked,
+            Now,
+            [],
+            queue:new(),
+            0,
+            undefined
+        ),
 
-            %% Phase 3: stitch survivors back together with the untouched
-            %% tail (packets with PN > LargestAcked).
-            NewQ = queue:join(SurvHeadQ, TailQ),
+    %% Phase 3: stitch survivors back together with the untouched
+    %% tail (packets with PN > LargestAcked).
+    NewQ = queue:join(SurvHeadQ, TailQ),
 
-            NewInFlight = max(0, State#loss_state.bytes_in_flight - AckedBytes - LostBytes),
-            Settled =
-                length([P || #sent_packet{ack_eliciting = true} = P <- AckedList]) +
-                    length([P || #sent_packet{ack_eliciting = true} = P <- LostList]),
-            PApp = remember_lost(LostList, LargestAcked, Now, P0),
-            NewState2 = set_pn(
-                Space,
-                PApp#pn_loss{
-                    sent_q = NewQ,
-                    largest_acked = newest(PApp#pn_loss.largest_acked, LargestAcked),
-                    ae_in_flight = max(0, PApp#pn_loss.ae_in_flight - Settled)
-                },
-                NewState1#loss_state{
-                    bytes_in_flight = NewInFlight,
-                    time_of_last_ack = Now,
-                    pto_count = 0
-                }
-            ),
+    NewInFlight = max(0, State#loss_state.bytes_in_flight - AckedBytes - LostBytes),
+    Settled =
+        length([P || #sent_packet{ack_eliciting = true} = P <- AckedList]) +
+            length([P || #sent_packet{ack_eliciting = true} = P <- LostList]),
+    PApp = remember_lost(LostList, LargestAcked, Now, P0),
+    NewState2 = set_pn(
+        Space,
+        PApp#pn_loss{
+            sent_q = NewQ,
+            largest_acked = newest(PApp#pn_loss.largest_acked, LargestAcked),
+            ae_in_flight = max(0, PApp#pn_loss.ae_in_flight - Settled)
+        },
+        NewState1#loss_state{
+            bytes_in_flight = NewInFlight,
+            time_of_last_ack = Now,
+            pto_count = 0
+        }
+    ),
 
-            LargestAETime =
-                case MaxAckEliciting of
-                    undefined -> Now;
-                    {_AckPN, AckTimeSent} -> AckTimeSent
-                end,
-            AckMeta = #{
-                acked_bytes => AckedBytes,
-                largest_ae_time => LargestAETime,
-                has_ack_eliciting => MaxAckEliciting =/= undefined,
-                lost_bytes => LostBytes,
-                largest_lost_sent_time => LargestLostSentTime,
-                spurious_losses => Spurious,
-                spurious_congestion => Undo
-            },
+    LargestAETime =
+        case MaxAckEliciting of
+            undefined -> Now;
+            {_AckPN, AckTimeSent} -> AckTimeSent
+        end,
+    AckMeta = #{
+        acked_bytes => AckedBytes,
+        largest_ae_time => LargestAETime,
+        has_ack_eliciting => MaxAckEliciting =/= undefined,
+        lost_bytes => LostBytes,
+        largest_lost_sent_time => LargestLostSentTime,
+        spurious_losses => Spurious,
+        spurious_congestion => Undo
+    },
 
-            {NewState2, AckedList, LostList, AckMeta}
-    end;
+    {NewState2, AckedList, LostList, AckMeta};
 on_ack_received(
     Space, State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, _, _, _}, Now
 ) ->

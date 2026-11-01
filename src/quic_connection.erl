@@ -5704,95 +5704,89 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
             AckFrame = {ack, LargestAcked, AckDelay, FirstRange, RestRanges},
 
             Now = erlang:monotonic_time(millisecond),
-            case quic_loss:on_ack_received(Level, LossState, AckFrame, Now) of
-                {error, ack_range_too_large} ->
-                    %% RFC 9000: Invalid ACK range is a protocol violation
-                    ?LOG_ERROR(#{what => invalid_ack_range}, ?QUIC_LOG_META),
-                    State;
-                {NewLossState0, AckedPackets, LostPackets, AckMeta} ->
-                    NewLossState = keep_unvalidated_backoff(
-                        Level, LossState, NewLossState0, State
-                    ),
-                    %% Use pre-computed metadata from quic_loss (avoids redundant scanning)
-                    AckedBytes = maps:get(acked_bytes, AckMeta, 0),
-                    LargestAckedSentTime = maps:get(largest_ae_time, AckMeta, Now),
-                    HasAckEliciting = maps:get(has_ack_eliciting, AckMeta, false),
-                    LostBytes = maps:get(lost_bytes, AckMeta, 0),
-                    LargestLostSentTime = maps:get(largest_lost_sent_time, AckMeta, undefined),
+            {NewLossState0, AckedPackets, LostPackets, AckMeta} =
+                quic_loss:on_ack_received(Level, LossState, AckFrame, Now),
+            NewLossState = keep_unvalidated_backoff(
+                Level, LossState, NewLossState0, State
+            ),
+            %% Use pre-computed metadata from quic_loss (avoids redundant scanning)
+            AckedBytes = maps:get(acked_bytes, AckMeta, 0),
+            LargestAckedSentTime = maps:get(largest_ae_time, AckMeta, Now),
+            HasAckEliciting = maps:get(has_ack_eliciting, AckMeta, false),
+            LostBytes = maps:get(lost_bytes, AckMeta, 0),
+            LargestLostSentTime = maps:get(largest_lost_sent_time, AckMeta, undefined),
 
-                    %% Only update CC ACK processing if there are ack-eliciting packets
-                    %% When only non-ack-eliciting packets are ACKed, skip on_packets_acked
-                    %% to prevent false recovery exit (LargestAckedSentTime=Now would always
-                    %% satisfy > RecoveryStart after min_duration). Loss handling is done
-                    %% separately by on_packets_lost and on_congestion_event.
-                    CCState1 =
-                        case HasAckEliciting of
-                            false ->
-                                %% No ack-eliciting acks - skip CC ACK update entirely
-                                CCState;
-                            true ->
-                                quic_cc:on_packets_acked(CCState, AckedBytes, LargestAckedSentTime)
-                        end,
-                    %% Every loss behind the last window cut was only
-                    %% reordered: undo the cut before this ACK's own losses.
-                    CCState2 =
-                        case AckMeta of
-                            #{spurious_congestion := true} ->
-                                quic_cc:on_spurious_congestion(CCState1);
-                            _ ->
-                                CCState1
-                        end,
-                    CCState5 = cc_after_loss(
-                        CCState2, LostBytes, LargestLostSentTime, ECN, LostPackets, NewLossState
-                    ),
+            %% Only update CC ACK processing if there are ack-eliciting packets
+            %% When only non-ack-eliciting packets are ACKed, skip on_packets_acked
+            %% to prevent false recovery exit (LargestAckedSentTime=Now would always
+            %% satisfy > RecoveryStart after min_duration). Loss handling is done
+            %% separately by on_packets_lost and on_congestion_event.
+            CCState1 =
+                case HasAckEliciting of
+                    false ->
+                        %% No ack-eliciting acks - skip CC ACK update entirely
+                        CCState;
+                    true ->
+                        quic_cc:on_packets_acked(CCState, AckedBytes, LargestAckedSentTime)
+                end,
+            %% Every loss behind the last window cut was only
+            %% reordered: undo the cut before this ACK's own losses.
+            CCState2 =
+                case AckMeta of
+                    #{spurious_congestion := true} ->
+                        quic_cc:on_spurious_congestion(CCState1);
+                    _ ->
+                        CCState1
+                end,
+            CCState5 = cc_after_loss(
+                CCState2, LostBytes, LargestLostSentTime, ECN, LostPackets, NewLossState
+            ),
 
-                    %% Update pacing rate based on new RTT estimate (RFC 9002 Section 7.7)
-                    %% Only update pacing when we have a real RTT sample to avoid
-                    %% using the default 100ms RTT which causes excessive pacing delays
-                    CCState6 =
-                        case quic_rtt:has_sample(quic_loss:rtt(NewLossState)) of
-                            true ->
-                                SmoothedRTT = quic_rtt:smoothed(quic_loss:rtt(NewLossState)),
-                                quic_cc:update_pacing_rate(CCState5, SmoothedRTT);
-                            false ->
-                                CCState5
-                        end,
+            %% Update pacing rate based on new RTT estimate (RFC 9002 Section 7.7)
+            %% Only update pacing when we have a real RTT sample to avoid
+            %% using the default 100ms RTT which causes excessive pacing delays
+            CCState6 =
+                case quic_rtt:has_sample(quic_loss:rtt(NewLossState)) of
+                    true ->
+                        SmoothedRTT = quic_rtt:smoothed(quic_loss:rtt(NewLossState)),
+                        quic_cc:update_pacing_rate(CCState5, SmoothedRTT);
+                    false ->
+                        CCState5
+                end,
 
-                    State1 = State#state{
-                        loss_state = NewLossState,
-                        cc_state = CCState6,
-                        pto_dirty = true
-                    },
+            State1 = State#state{
+                loss_state = NewLossState,
+                cc_state = CCState6,
+                pto_dirty = true
+            },
 
-                    %% Emit qlog packets_acked event
-                    AckedPNs = [P#sent_packet.pn || P <- AckedPackets],
-                    RTTSample =
-                        case AckedPackets of
-                            [] -> undefined;
-                            _ -> Now - LargestAckedSentTime
-                        end,
-                    ?QLOG_EMIT_PACKETS_ACKED((State1#state.cfg)#conn_cfg.qlog_ctx, AckedPNs, #{
-                        rtt_sample => RTTSample
-                    }),
+            %% Emit qlog packets_acked event
+            AckedPNs = [P#sent_packet.pn || P <- AckedPackets],
+            RTTSample =
+                case AckedPackets of
+                    [] -> undefined;
+                    _ -> Now - LargestAckedSentTime
+                end,
+            ?QLOG_EMIT_PACKETS_ACKED((State1#state.cfg)#conn_cfg.qlog_ctx, AckedPNs, #{
+                rtt_sample => RTTSample
+            }),
 
-                    %% Emit qlog packet_lost events
-                    lists:foreach(
-                        fun(#sent_packet{pn = LostPN}) ->
-                            ?QLOG_EMIT_PACKET_LOST((State1#state.cfg)#conn_cfg.qlog_ctx, #{
-                                packet_number => LostPN,
-                                reason => timeout
-                            })
-                        end,
-                        LostPackets
-                    ),
+            %% Emit qlog packet_lost events
+            lists:foreach(
+                fun(#sent_packet{pn = LostPN}) ->
+                    ?QLOG_EMIT_PACKET_LOST((State1#state.cfg)#conn_cfg.qlog_ctx, #{
+                        packet_number => LostPN,
+                        reason => timeout
+                    })
+                end,
+                LostPackets
+            ),
 
-                    case Level of
-                        app ->
-                            app_ack_tail(AckedPackets, LostPackets, State1);
-                        _ ->
-                            handshake_ack_tail(Level, LostPackets, State1)
-                    end
-                %% close inner case (on_ack_received)
+            case Level of
+                app ->
+                    app_ack_tail(AckedPackets, LostPackets, State1);
+                _ ->
+                    handshake_ack_tail(Level, LostPackets, State1)
             end
         %% close outer case (Ranges)
     end;
