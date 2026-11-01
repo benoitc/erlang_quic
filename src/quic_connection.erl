@@ -5021,6 +5021,10 @@ decode_and_decrypt_packet(Data, State) ->
             %% First byte is 0x00 - this is padding (all zeros)
             %% Skip padding by treating as end of coalesced packets
             {error, padding_only};
+        <<1:1, 0:1, _:6, Version:32, _/binary>> when Version =/= 0 ->
+            %% Long header with the fixed bit clear: not a QUIC packet
+            %% (RFC 9000 Section 17.2)
+            {error, long_header_fixed_bit};
         <<1:1, _:7, _/binary>> ->
             %% Long header (bit 7 = 1)
             decode_long_header_packet(Data, State);
