@@ -5285,6 +5285,15 @@ handle_retry_packet(
     %% RFC 9000 Section 17.2.5.2: MUST discard subsequent Retry packets
     {error, duplicate_retry};
 handle_retry_packet(
+    _FullPacket,
+    _Version,
+    _ServerSCID,
+    _Rest,
+    #state{hs = #hs{pn_initial = #pn_space{largest_recv = Largest}}}
+) when Largest =/= undefined ->
+    %% RFC 9000 Section 17.2.5.2: nor any after a server Initial
+    {error, late_retry};
+handle_retry_packet(
     FullPacket,
     Version,
     ServerSCID,
