@@ -5712,10 +5712,45 @@ level_for_close(_) -> app.
 %% RFC 9000 Section 9.1: Only packets containing non-probing frames trigger migration.
 -spec process_frame_track_probing(atom(), term(), #state{}) -> #state{}.
 process_frame_track_probing(Level, Frame, State) ->
-    case stream_frame_violation(Frame, State) of
-        none -> track_and_process_frame(Level, Frame, State);
-        {StreamId, Reason} -> stream_state_error_close(StreamId, Reason, State)
+    case frame_permitted(Level, Frame) of
+        true ->
+            case stream_frame_violation(Frame, State) of
+                none -> track_and_process_frame(Level, Frame, State);
+                {StreamId, Reason} -> stream_state_error_close(StreamId, Reason, State)
+            end;
+        false ->
+            close_with_error(
+                level_for_close(Level),
+                transport,
+                ?QUIC_PROTOCOL_VIOLATION,
+                0,
+                <<"frame not permitted in this packet type">>,
+                State
+            )
     end.
+
+%% RFC 9000 Section 12.4, Table 3: the frames each packet type may carry.
+%% Every frame may appear in 1-RTT.
+frame_permitted(Level, Frame) when Level =:= initial; Level =:= handshake ->
+    case Frame of
+        padding -> true;
+        ping -> true;
+        {ack, _, _, _} -> true;
+        {crypto, _, _} -> true;
+        {connection_close, transport, _, _, _} -> true;
+        _ -> false
+    end;
+frame_permitted(zero_rtt, Frame) ->
+    case Frame of
+        {ack, _, _, _} -> false;
+        {crypto, _, _} -> false;
+        {new_token, _} -> false;
+        {path_response, _} -> false;
+        handshake_done -> false;
+        _ -> true
+    end;
+frame_permitted(_Level, _Frame) ->
+    true.
 
 %% RFC 9000 Sections 19.4, 19.5, 19.8, 19.10 and 19.13: the stream frames a
 %% peer may not send for a stream only we send on, one only it sends on,
