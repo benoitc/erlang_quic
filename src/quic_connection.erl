@@ -5998,15 +5998,11 @@ process_frame(
                         true ->
                             stream_limit_close(State);
                         false ->
-                            %% Unknown stream - notify owner and create minimal state to track reset
                             Owner ! {quic, self(), {stream_opened, StreamId}},
+                            NewStream = new_peer_stream(StreamId, State),
                             NewStreams = maps:put(
                                 StreamId,
-                                #stream_state{
-                                    id = StreamId,
-                                    state = reset,
-                                    final_size = FinalSize
-                                },
+                                NewStream#stream_state{state = reset, final_size = FinalSize},
                                 Streams
                             ),
                             StateFl = flush_pending_delivery(State),
@@ -6085,10 +6081,10 @@ process_frame(
                                     %% A fresh stream has recv_offset 0, so the recv side is
                                     %% terminal immediately only when ReliableSize is 0.
                                     Owner ! {quic, self(), {stream_opened, StreamId}},
+                                    NewStream = new_peer_stream(StreamId, State),
                                     NewStreams = maps:put(
                                         StreamId,
-                                        #stream_state{
-                                            id = StreamId,
+                                        NewStream#stream_state{
                                             state = reset,
                                             final_size = FinalSize,
                                             recv_reset_at = ReliableSize,
@@ -6138,16 +6134,9 @@ process_frame(
                                     Streams
                                 );
                             error ->
-                                %% Unknown stream - notify owner and create minimal state
                                 Owner ! {quic, self(), {stream_opened, StreamId}},
-                                maps:put(
-                                    StreamId,
-                                    #stream_state{
-                                        id = StreamId,
-                                        state = stopped
-                                    },
-                                    Streams
-                                )
+                                NewStream = new_peer_stream(StreamId, State),
+                                maps:put(StreamId, NewStream#stream_state{state = stopped}, Streams)
                         end,
                     %% Notify owner - they should stop sending and may send RESET_STREAM
                     Owner ! {quic, self(), {stop_sending, StreamId, ErrorCode}},
@@ -6187,16 +6176,7 @@ process_frame(
                         false ->
                             %% New stream from peer - notify owner
                             Owner ! {quic, self(), {stream_opened, StreamId}},
-                            %% Create minimal stream state with limits for the stream type
-                            Kind = peer_stream_kind(StreamId),
-                            InitSendMaxData = get_peer_stream_limit(Kind, State),
-                            InitRecvMaxData = get_local_recv_limit(Kind, State),
-                            NewStream = #stream_state{
-                                id = StreamId,
-                                state = open,
-                                send_max_data = InitSendMaxData,
-                                recv_max_data = InitRecvMaxData
-                            },
+                            NewStream = new_peer_stream(StreamId, State),
                             State#state{streams = maps:put(StreamId, NewStream, Streams)}
                     end
             end
@@ -7929,31 +7909,7 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
             error ->
                 %% New stream from peer - notify owner
                 Owner ! {quic, self(), {stream_opened, StreamId}},
-                %% Use peer's limits for streams they initiate
-                InitSendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
-                InitRecvMaxData = get_local_recv_limit(bidi_peer_initiated, State),
-                ?LOG_DEBUG(
-                    #{
-                        what => stream_created_peer_initiated,
-                        stream_id => StreamId,
-                        init_send_max_data => InitSendMaxData,
-                        init_recv_max_data => InitRecvMaxData
-                    },
-                    ?QUIC_LOG_META
-                ),
-                #stream_state{
-                    id = StreamId,
-                    state = open,
-                    send_offset = 0,
-                    send_max_data = InitSendMaxData,
-                    send_fin = false,
-                    send_buffer = [],
-                    recv_offset = 0,
-                    recv_max_data = InitRecvMaxData,
-                    recv_fin = false,
-                    recv_buffer = gb_trees:empty(),
-                    final_size = undefined
-                }
+                new_peer_stream(StreamId, State)
         end,
 
     %% RFC 9000 Section 4.1: Check receive flow control limits BEFORE buffering
@@ -9291,6 +9247,27 @@ peer_stream_kind(StreamId) ->
         true -> uni_peer_initiated;
         false -> bidi_peer_initiated
     end.
+
+%% A stream the peer opened, by whichever frame opened it (RFC 9000
+%% Section 3.2).
+new_peer_stream(StreamId, State) ->
+    Kind = peer_stream_kind(StreamId),
+    #stream_state{
+        id = StreamId,
+        state = open,
+        send_offset = 0,
+        send_max_data = peer_send_limit(Kind, State),
+        send_fin = false,
+        send_buffer = [],
+        recv_offset = 0,
+        recv_max_data = get_local_recv_limit(Kind, State),
+        recv_fin = false,
+        recv_buffer = gb_trees:empty(),
+        final_size = undefined
+    }.
+
+peer_send_limit(uni_peer_initiated, _State) -> 0;
+peer_send_limit(Kind, State) -> get_peer_stream_limit(Kind, State).
 
 credit_peer_on_reclaim(StreamId, Role, State) ->
     #state{streams_reclaimed = {Bidi, Uni}, streams_credit_step = {BidiStep, UniStep}} = State,
