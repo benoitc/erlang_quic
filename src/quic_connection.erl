@@ -11680,11 +11680,28 @@ initiate_close(Reason, #state{mig = #mig{path_validation_timer = PathTimer}} = S
     CloseFrame = {connection_close, application, ErrorCode, undefined, ReasonPhrase},
     case State1#state.app_keys of
         undefined ->
-            %% No keys yet - cannot send frame, just set close_reason
-            State1#state{close_reason = Reason};
+            handshake_close(State1#state{close_reason = Reason});
         _ ->
             send_frame(CloseFrame, State1#state{close_reason = Reason})
     end.
+
+%% RFC 9000 Section 10.2.3: before 1-RTT keys the close goes out as a
+%% CONNECTION_CLOSE of type 0x1c with APPLICATION_ERROR and no reason, at
+%% the Handshake level, and at the Initial level too from a server, which
+%% cannot know whether the client has Handshake keys.
+handshake_close(#state{cfg = #conn_cfg{role = Role}, hs = HS} = State) ->
+    CloseFrame = {connection_close, transport, ?QUIC_APPLICATION_ERROR, 0, <<>>},
+    Levels = [
+        Level
+     || {Level, Keys} <- [{handshake, HS#hs.handshake_keys}, {initial, HS#hs.initial_keys}],
+        Keys =/= undefined
+    ],
+    Send =
+        case Role of
+            server -> Levels;
+            client -> lists:sublist(Levels, 1)
+        end,
+    lists:foldl(fun(Level, S) -> emit_close_at_level(Level, CloseFrame, S) end, State, Send).
 
 %% Send PROTOCOL_VIOLATION transport error (RFC 9000)
 %% Used when a peer violates the protocol (e.g., RFC 9221 datagram violations)
