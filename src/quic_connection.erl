@@ -7562,12 +7562,7 @@ do_server_client_hello_cont(
         key = ServerKey, iv = ServerIV, hp = ServerHP, cipher = Cipher
     },
 
-    %% Update DCID from ClientHello SCID
-    %% quic_tls decodes the initial_source_connection_id param as initial_scid
-    ClientSCID = maps:get(initial_scid, TP, <<>>),
-
     State0 = State#state{
-        dcid = ClientSCID,
         alpn = ALPN,
         hs = (State#state.hs)#hs{
             tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
