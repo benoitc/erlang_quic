@@ -7482,8 +7482,13 @@ process_tls_message(
             ?LOG_ERROR(#{what => client_cert_verify_failed}, ?QUIC_LOG_META),
             send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
     end;
-process_tls_message(_Level, _Type, _Body, _OriginalMsg, State) ->
-    State.
+process_tls_message(_Level, Type, _Body, _OriginalMsg, State) ->
+    %% A message the handshake is not waiting for (RFC 8446 Section 4).
+    ?LOG_WARNING(
+        #{what => unexpected_tls_message, type => Type, tls_state => (State#state.hs)#hs.tls_state},
+        ?QUIC_LOG_META
+    ),
+    send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State).
 
 %% @private Continue a server-side ClientHello once the key-exchange
 %% group is settled (direct or post-HRR). SelectedGroup is the agreed
