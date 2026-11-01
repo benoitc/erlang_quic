@@ -11657,20 +11657,24 @@ retransmit_lost_packets([], State) ->
     State;
 retransmit_lost_packets([#sent_packet{frames = Frames} | Rest], State) ->
     RetransmitFrames = quic_loss:retransmittable_frames(Frames),
-    %% Filter out stream data beyond ReliableSize (RESET_STREAM_AT spec requirement)
     FilteredFrames = filter_reset_stream_at_data(RetransmitFrames, State),
     State1 = send_retransmit_frames_cc(FilteredFrames, State),
     retransmit_lost_packets(Rest, State1).
 
-%% Filter stream data beyond ReliableSize for streams with RESET_STREAM_AT
-%% Per draft-ietf-quic-reliable-stream-reset-07: Data beyond ReliableSize
-%% SHOULD NOT be retransmitted
+%% Lost stream data is not resent once the send side is done: after a
+%% RESET_STREAM (RFC 9000 Section 3.1), or with the stream gone. Data
+%% beyond ReliableSize for streams with RESET_STREAM_AT is dropped too
+%% (draft-ietf-quic-reliable-stream-reset-07: SHOULD NOT be retransmitted).
 filter_reset_stream_at_data(Frames, #state{streams = Streams}) ->
     lists:filtermap(
         fun(Frame) ->
             case Frame of
                 {stream, StreamId, Offset, Data, _Fin} ->
                     case maps:find(StreamId, Streams) of
+                        error ->
+                            false;
+                        {ok, #stream_state{send_done = true}} ->
+                            false;
                         {ok, #stream_state{send_reset_at = RS}} when RS =/= undefined ->
                             if
                                 %% Entirely beyond the boundary - drop
@@ -12013,12 +12017,14 @@ send_probe_packet(Space, State) ->
 
 %% Get frames from the oldest unacked packet for probe retransmission
 %% Uses cached oldest_unacked from loss_state for O(1) lookup
-get_oldest_unacked_frames(Space, #state{loss_state = LossState}) ->
+get_oldest_unacked_frames(Space, #state{loss_state = LossState} = State) ->
     case quic_loss:oldest_unacked(Space, LossState) of
         none ->
             none;
         {ok, #sent_packet{frames = Frames}} ->
-            RetransmitFrames = quic_loss:retransmittable_frames(Frames),
+            RetransmitFrames = filter_reset_stream_at_data(
+                quic_loss:retransmittable_frames(Frames), State
+            ),
             case RetransmitFrames of
                 [] -> none;
                 _ -> {ok, RetransmitFrames}

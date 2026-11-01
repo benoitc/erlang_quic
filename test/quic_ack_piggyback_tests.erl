@@ -5,6 +5,8 @@
 
 -include_lib("eunit/include/eunit.hrl").
 -include("quic.hrl").
+-include_lib("quic/include/quic_qlog.hrl").
+-include_lib("quic/src/quic_connection_state.hrl").
 
 -define(S, quic_connection_test_support).
 
@@ -66,7 +68,10 @@ ping_probe_carries_the_ack_test() ->
 
 retransmit_probe_carries_the_ack_test() ->
     {Payload, Frames} = small_stream(),
-    S1 = probe(send(Payload, Frames, ?S:state_owing_ack(0, false))),
+    %% Stream 0 is open, so its lost data is resent.
+    S0 = ?S:state_owing_ack(0, false),
+    Open = S0#state{streams = #{0 => #stream_state{id = 0, send_offset = 7}}},
+    S1 = probe(send(Payload, Frames, Open)),
     ?assertMatch([{ack, _, _, _}, {stream, 0, 0, <<"request">>, false}], last_sent_frames(S1)).
 
 probe(State) ->
