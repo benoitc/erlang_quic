@@ -4403,10 +4403,22 @@ fold_opened(Results, State) ->
                             fold_opened_seq(Results, with_recv(Recv, State), 0, 0)
                     end;
                 no ->
-                    fold_opened(Results, State, Now, 0, 0)
+                    fold_opened(new_packets(Results, PNSpace), State, Now, 0, 0)
             end;
-        _ ->
-            fold_opened(Results, State, Now, 0, 0)
+        PNSpace ->
+            fold_opened(new_packets(Results, PNSpace), State, Now, 0, 0)
+    end.
+
+%% The run without packets already received, before it or within it.
+new_packets(Results, PNSpace) ->
+    new_packets(Results, PNSpace, []).
+
+new_packets([], _PNSpace, Acc) ->
+    lists:reverse(Acc);
+new_packets([{PN, _, _} = Result | Rest], PNSpace, Acc) ->
+    case received_before(PN, PNSpace) orelse lists:keymember(PN, 1, Acc) of
+        true -> new_packets(Rest, PNSpace, Acc);
+        false -> new_packets(Rest, PNSpace, [Result | Acc])
     end.
 
 %% Receive bookkeeping of a contiguous run, every packet sequential.
@@ -4815,6 +4827,8 @@ handle_packet_loop(Data, State) ->
                 Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, State1))
             ),
             handle_packet_loop(RemainingData, State2);
+        {duplicate, RemainingData} ->
+            handle_packet_loop(RemainingData, State);
         {error, stateless_reset} ->
             %% RFC 9000 Section 10.3: Stateless reset received
             %% Immediately close the connection
@@ -5438,6 +5452,8 @@ decode_short_header_packet(Data, State) ->
                     end;
                 {ok, _Type, _Frames, _Remaining, _NewState} = Result ->
                     Result;
+                duplicate ->
+                    {duplicate, <<>>};
                 Other ->
                     Other
             end
@@ -5467,7 +5483,9 @@ decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
             no ->
                 fallback
         end,
-    case Fused of
+    case drop_duplicate(Fused, State#state.pn_app) of
+        duplicate ->
+            duplicate;
         {ok, PN0, FirstByte0, Plaintext0} ->
             Now0 = erlang:monotonic_time(millisecond),
             StateF = record_app_recv(FirstByte0, PN0, State, Now0),
@@ -5529,18 +5547,19 @@ decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
             %% Stage 2: Decrypt with selected keys
             #crypto_keys{key = Key, iv = IV, cipher = Cipher} = PeerDecryptKeys,
             LargestRecv = get_largest_recv(app, State1),
-            case
-                quic_aead:decrypt_short_payload(
-                    Cipher,
-                    Key,
-                    IV,
-                    UnprotectedHeader,
-                    PNLen,
-                    TruncatedPN,
-                    EncryptedPayload,
-                    LargestRecv
-                )
-            of
+            Opened = quic_aead:decrypt_short_payload(
+                Cipher,
+                Key,
+                IV,
+                UnprotectedHeader,
+                PNLen,
+                TruncatedPN,
+                EncryptedPayload,
+                LargestRecv
+            ),
+            case drop_duplicate(Opened, State1#state.pn_app) of
+                duplicate ->
+                    duplicate;
                 {ok, PN, Plaintext} ->
                     <<UnprotectedFirstByte, _/binary>> = UnprotectedHeader,
                     %% Single monotonic_time sample shared by
@@ -5567,9 +5586,12 @@ decrypt_packet(Level, Header, _FirstByte, EncryptedPayload, RemainingData, Keys,
     LargestRecv = get_largest_recv(Level, State),
 
     %% Unprotect and decrypt in single call
-    case
-        quic_aead:unprotect_long_packet(Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRecv)
-    of
+    Opened = quic_aead:unprotect_long_packet(
+        Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRecv
+    ),
+    case drop_duplicate(Opened, pn_space(Level, State)) of
+        duplicate ->
+            {duplicate, RemainingData};
         {error, Reason} ->
             {error, Reason};
         {ok, PN, _UnprotectedHeader, Plaintext} ->
@@ -9173,6 +9195,25 @@ classify_recv_trigger(PN, #pn_space{largest_recv = L}) when PN =:= L + 1 ->
     sequential;
 classify_recv_trigger(_PN, _PNSpace) ->
     reordered.
+
+pn_space(initial, State) -> (State#state.hs)#hs.pn_initial;
+pn_space(handshake, State) -> (State#state.hs)#hs.pn_handshake;
+pn_space(_, State) -> State#state.pn_app.
+
+%% RFC 9000 Section 12.3: a packet number already received in this
+%% space is discarded once decryption has authenticated it.
+drop_duplicate(Opened, PNSpace) when element(1, Opened) =:= ok ->
+    case received_before(element(2, Opened), PNSpace) of
+        true -> duplicate;
+        false -> Opened
+    end;
+drop_duplicate(Other, _PNSpace) ->
+    Other.
+
+received_before(PN, #pn_space{largest_recv = L}) when L =:= undefined; PN > L ->
+    false;
+received_before(PN, #pn_space{ack_ranges = Ranges}) ->
+    lists:any(fun({Start, End}) -> PN >= Start andalso PN =< End end, Ranges).
 
 %% Get largest received PN for a given encryption level
 get_largest_recv(initial, State) ->
