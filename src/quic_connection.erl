@@ -7313,6 +7313,14 @@ process_tls_message(
     } = State
 ) ->
     case quic_ticket:parse_new_session_ticket(Body) of
+        {ok, #{max_early_data := MaxEarlyData}} when
+            MaxEarlyData =/= 0, MaxEarlyData =/= 16#ffffffff
+        ->
+            %% RFC 9001 Section 4.6.1: the early_data extension carries
+            %% only the 0xffffffff sentinel.
+            close_with_transport_error(
+                ?QUIC_PROTOCOL_VIOLATION, <<"max_early_data_size other than 0xffffffff">>, State
+            );
         {ok, #{
             lifetime := Lifetime,
             age_add := AgeAdd,
