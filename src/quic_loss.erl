@@ -438,11 +438,7 @@ on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRange
             largest_acked = newest(PApp#pn_loss.largest_acked, LargestAcked),
             ae_in_flight = max(0, PApp#pn_loss.ae_in_flight - Settled)
         },
-        NewState1#loss_state{
-            bytes_in_flight = NewInFlight,
-            time_of_last_ack = Now,
-            pto_count = 0
-        }
+        newly_acked(AckedList, Now, NewState1#loss_state{bytes_in_flight = NewInFlight})
     ),
 
     LargestAETime =
@@ -465,6 +461,13 @@ on_ack_received(
     Space, State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, _, _, _}, Now
 ) ->
     on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now).
+
+%% RFC 9002 Appendix A.7: an ACK that acknowledges nothing new is no
+%% sign of progress and leaves the probe backoff alone.
+newly_acked([], _Now, State) ->
+    State;
+newly_acked(_AckedList, Now, State) ->
+    State#loss_state{time_of_last_ack = Now, pto_count = 0}.
 
 %% Pop packets from the head of the queue while PN =< LargestAcked,
 %% classifying each as acked (in ranges) or kept-unacked.
