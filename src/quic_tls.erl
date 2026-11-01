@@ -788,7 +788,21 @@ validate_max_ack_delay(Params) ->
         N when N >= 16384 ->
             {error, {transport_parameter_error, max_ack_delay_too_large, N}};
         _ ->
-            ok
+            validate_max_streams(Params)
+    end.
+
+validate_max_streams(Params) ->
+    %% RFC 9000 Section 4.6: no more than 2^60 streams of either type
+    case maps:get(initial_max_streams_bidi, Params, 0) of
+        Bidi when Bidi > 1 bsl 60 ->
+            {error, {transport_parameter_error, initial_max_streams_bidi_too_large, Bidi}};
+        _ ->
+            case maps:get(initial_max_streams_uni, Params, 0) of
+                Uni when Uni > 1 bsl 60 ->
+                    {error, {transport_parameter_error, initial_max_streams_uni_too_large, Uni}};
+                _ ->
+                    ok
+            end
     end.
 
 tp_id_to_key(?TP_ORIGINAL_DCID) -> original_dcid;

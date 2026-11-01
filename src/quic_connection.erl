@@ -5695,6 +5695,11 @@ decode_frame(Data) ->
         throw:Reason -> {error, {malformed, Reason}}
     end.
 
+stream_count_close(State) ->
+    close_with_error(
+        app, transport, ?QUIC_FRAME_ENCODING_ERROR, 0, <<"stream count above 2^60">>, State
+    ).
+
 %% Map a packet-processing level atom to the level atom expected by
 %% close_with_error/6. Initial and Handshake packets emit CLOSE at their own
 %% level; 1-RTT (app) packets emit at app level.
@@ -5979,6 +5984,12 @@ process_frame(Level, {max_stream_data, _, _}, State) when Level =/= app ->
     %% Protocol violation: MAX_STREAM_DATA only allowed in 1-RTT packets
     ?LOG_WARNING(#{what => invalid_max_stream_data_level, level => Level}, ?QUIC_LOG_META),
     State#state{close_reason = {protocol_violation, max_stream_data_wrong_level}};
+%% RFC 9000 Section 4.6: a stream count above 2^60 allows stream IDs no
+%% varint can carry.
+process_frame(app, {max_streams, _Dir, Count}, State) when Count > 1 bsl 60 ->
+    stream_count_close(State);
+process_frame(app, {streams_blocked, _Dir, Count}, State) when Count > 1 bsl 60 ->
+    stream_count_close(State);
 %% MAX_STREAMS: Peer is increasing the number of streams we can open
 %% RFC 9000 Section 19.11: MAX_STREAMS is only allowed in 1-RTT packets
 process_frame(app, {max_streams, bidi, Max}, #state{max_streams_bidi_remote = Current} = State) ->
@@ -6336,6 +6347,11 @@ process_frame(app, {new_token, _}, #state{cfg = #conn_cfg{role = server}} = Stat
         0,
         <<"NEW_TOKEN received by server">>,
         State
+    );
+process_frame(app, {new_token, <<>>}, State) ->
+    %% RFC 9000 Section 19.7
+    close_with_error(
+        app, transport, ?QUIC_FRAME_ENCODING_ERROR, 0, <<"empty NEW_TOKEN">>, State
     );
 process_frame(
     app, {new_token, Token}, #state{remote_addr = Addr, cfg = #conn_cfg{role = client}} = State
