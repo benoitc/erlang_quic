@@ -1896,14 +1896,20 @@ connected({call, From}, get_mtu, State) ->
 connected({call, From}, key_update, #state{key_state = undefined} = State) ->
     {keep_state, State, [{reply, From, {error, no_keys}}]};
 connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
-    case KeyState#key_update_state.update_state of
-        idle ->
-            %% Initiate key update
-            NewState = initiate_key_update(State),
-            {keep_state, NewState, [{reply, From, ok}]};
-        _ ->
-            %% Key update already in progress
-            {keep_state, State, [{reply, From, {error, key_update_in_progress}}]}
+    case quic_loss:handshake_confirmed(State#state.loss_state) of
+        false ->
+            %% RFC 9001 Section 6.1: not before the handshake is confirmed
+            {keep_state, State, [{reply, From, {error, handshake_not_confirmed}}]};
+        true ->
+            case KeyState#key_update_state.update_state of
+                idle ->
+                    %% Initiate key update
+                    NewState = initiate_key_update(State),
+                    {keep_state, NewState, [{reply, From, ok}]};
+                _ ->
+                    %% Key update already in progress
+                    {keep_state, State, [{reply, From, {error, key_update_in_progress}}]}
+            end
     end;
 %% Handle connection migration request (RFC 9000 Section 9)
 connected({call, From}, migrate, #state{mig = #mig{peer_disable_migration = true}} = State) ->
