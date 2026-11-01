@@ -50,6 +50,7 @@
 
     %% Frame construction
     build_ack_frame_tuple/1,
+    ack_frame_for/2,
     build_ack_frame/1,
     convert_ack_ranges_for_encode/1,
     ranges_to_ack_format/1,
@@ -392,9 +393,14 @@ update_pn_space_recv(PN, PNSpace, Now) ->
             true -> add_to_ranges(PN, Ranges);
             false -> cap_ack_ranges(add_to_ranges(PN, Ranges))
         end,
+    RecvTime =
+        case NewLargest of
+            PN -> Now;
+            _ -> PNSpace#pn_space.recv_time
+        end,
     PNSpace#pn_space{
         largest_recv = NewLargest,
-        recv_time = Now,
+        recv_time = RecvTime,
         ack_ranges = NewRanges
     }.
 
@@ -405,16 +411,29 @@ update_pn_space_recv(PN, PNSpace, Now) ->
 %% #pn_space.ack_ranges, holding no #ack_state{}.
 %%====================================================================
 
-%% @doc Build an unencoded ACK frame tuple from internal ranges.
-%%
-%% The delay is zero: the frame is built at send time, so there is no
-%% accumulated delay to report.
+%% @doc Build an unencoded ACK frame tuple from internal ranges, with an
+%% ACK Delay of zero; ack_frame_for/2 reports the delay.
 -spec build_ack_frame_tuple([{non_neg_integer(), non_neg_integer()}]) ->
     {ack, [{non_neg_integer(), non_neg_integer()}], non_neg_integer(), undefined}.
 build_ack_frame_tuple(Ranges) ->
     EncoderRanges = convert_ack_ranges_for_encode(Ranges),
     AckDelay = 0,
     {ack, EncoderRanges, AckDelay, undefined}.
+
+%% @doc An ACK frame for a packet number space, reporting the time since
+%% its largest packet number arrived (RFC 9000 Section 13.2.5) in units
+%% of 2^ack_delay_exponent microseconds. eq advertises no exponent, so
+%% the default applies.
+-spec ack_frame_for(#pn_space{}, integer()) ->
+    {ack, [{non_neg_integer(), non_neg_integer()}], non_neg_integer(), undefined}.
+ack_frame_for(#pn_space{ack_ranges = Ranges, recv_time = RecvTime}, Now) ->
+    {ack, EncoderRanges, 0, ECN} = build_ack_frame_tuple(Ranges),
+    {ack, EncoderRanges, ack_delay(RecvTime, Now), ECN}.
+
+ack_delay(undefined, _Now) ->
+    0;
+ack_delay(RecvTime, Now) ->
+    (max(0, Now - RecvTime) * 1000) bsr ?DEFAULT_ACK_DELAY_EXPONENT.
 
 %% @doc Build an encoded ACK frame from internal ranges.
 -spec build_ack_frame([{non_neg_integer(), non_neg_integer()}]) -> binary().

@@ -3459,8 +3459,8 @@ send_app_ack(#state{ack_timer = Ref, pn_app = PNSpace} = State, RecvPass) ->
     case PNSpace#pn_space.ack_ranges of
         [] ->
             State#state{ack_timer = undefined, ack_elicited_count = 0, recv_pass = RecvPass};
-        Ranges ->
-            AckFrameTuple = quic_ack:build_ack_frame_tuple(Ranges),
+        [_ | _] ->
+            AckFrameTuple = quic_ack:ack_frame_for(PNSpace, erlang:monotonic_time(millisecond)),
             bump(?C_ACK_SENT, 1, State),
             maybe_coalesce_ack_with_data(AckFrameTuple, State#state{
                 ack_timer = undefined,
@@ -3909,10 +3909,10 @@ piggyback_ack(
     true,
     Payload,
     Frames,
-    #state{pn_app = #pn_space{ack_ranges = [_ | _] = Ranges}} = State
+    #state{pn_app = #pn_space{ack_ranges = [_ | _]} = PNSpace} = State
 ) ->
     case ack_due(State) of
-        true -> attach_ack(Ranges, Payload, Frames, State);
+        true -> attach_ack(PNSpace, Payload, Frames, State);
         false -> {Payload, Frames, none}
     end;
 piggyback_ack(_AckEliciting, Payload, Frames, _State) ->
@@ -3922,8 +3922,8 @@ ack_due(#state{ack_elicited_count = Count}) when Count > 0 -> true;
 ack_due(#state{ack_timer = Timer}) when Timer =/= undefined -> true;
 ack_due(#state{hs = #hs{hs_probe = Probe}}) -> Probe.
 
-attach_ack(Ranges, Payload, Frames, State) ->
-    AckFrame = quic_ack:build_ack_frame_tuple(Ranges),
+attach_ack(PNSpace, Payload, Frames, State) ->
+    AckFrame = quic_ack:ack_frame_for(PNSpace, erlang:monotonic_time(millisecond)),
     AckBin = quic_frame:encode(AckFrame),
     case
         erlang:iolist_size(Payload) + byte_size(AckBin) =<
