@@ -2271,7 +2271,7 @@ handle_common_event(info, {idle_timeout, Ref}, StateName, #state{idle_timer = Re
     %% Handle idle timeout - check if we've truly been idle
     Now = erlang:monotonic_time(millisecond),
     TimeSinceActivity = Now - State#state.last_activity,
-    case TimeSinceActivity >= (State#state.cfg)#conn_cfg.idle_timeout of
+    case TimeSinceActivity >= idle_timeout(State) of
         true ->
             %% Genuine idle timeout - initiate close
             NewState = initiate_close(idle_timeout, State#state{idle_timer = undefined}),
@@ -11550,12 +11550,9 @@ cert_alert_code(_) -> ?TLS_ALERT_BAD_CERTIFICATE.
 %% Check timeouts
 check_timeouts(State) ->
     Now = erlang:monotonic_time(millisecond),
-    TimeSinceActivity = Now - State#state.last_activity,
-    if
-        TimeSinceActivity > (State#state.cfg)#conn_cfg.idle_timeout ->
-            initiate_close(idle_timeout, State);
-        true ->
-            State
+    case Now - State#state.last_activity > idle_timeout(State) of
+        true -> initiate_close(idle_timeout, State);
+        false -> State
     end.
 
 %%====================================================================
@@ -12144,13 +12141,12 @@ maybe_reschedule_pacing(State) ->
 
 %% Set idle timer based on idle_timeout configuration
 %% Uses unique reference in message to detect stale timer events
-set_idle_timer(#state{cfg = #conn_cfg{idle_timeout = 0}} = State) ->
+set_idle_timer(State) ->
+    set_idle_timer(idle_timeout(State), State).
+
+set_idle_timer(infinity, State) ->
     State#state{idle_timer = undefined};
-set_idle_timer(
-    #state{
-        idle_timer = OldTimer, last_activity = LastActivity, cfg = #conn_cfg{idle_timeout = Timeout}
-    } = State
-) ->
+set_idle_timer(Timeout, #state{idle_timer = OldTimer, last_activity = LastActivity} = State) ->
     cancel_timer(OldTimer),
     %% Lazy re-arm: fire when the connection would actually be idle for
     %% Timeout, measured from last_activity. At the initial arm
@@ -12161,6 +12157,19 @@ set_idle_timer(
     Ref = make_ref(),
     erlang:send_after(Delay, self(), {idle_timeout, Ref}),
     State#state{idle_timer = Ref}.
+
+%% RFC 9000 Section 10.1: the smaller of the two advertised timeouts, 0
+%% meaning none, and no less than three PTOs. The PTO is taken without
+%% backoff, or probing a dead path would keep pushing the timeout out.
+idle_timeout(#state{cfg = #conn_cfg{idle_timeout = Local}, transport_params = TP} = State) ->
+    case advertised_idle_timeout(Local, maps:get(max_idle_timeout, TP, 0)) of
+        0 -> infinity;
+        Timeout -> max(Timeout, 3 * quic_loss:persistent_congestion_pto(State#state.loss_state))
+    end.
+
+advertised_idle_timeout(0, Peer) -> Peer;
+advertised_idle_timeout(Local, 0) -> Local;
+advertised_idle_timeout(Local, Peer) -> min(Local, Peer).
 
 %%====================================================================
 %% Keep-Alive Timer Management (RFC 9000 - PING frames), and local
