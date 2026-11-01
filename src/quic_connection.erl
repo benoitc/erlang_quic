@@ -174,6 +174,7 @@
 
 %% TLS handshake states (client)
 -define(TLS_AWAITING_SERVER_HELLO, awaiting_server_hello).
+-define(SHORT_RESERVED_BITS(FirstByte), ((FirstByte) band 16#18 =/= 0)).
 -define(TLS_AWAITING_ENCRYPTED_EXT, awaiting_encrypted_extensions).
 -define(TLS_AWAITING_CERT, awaiting_certificate).
 -define(TLS_AWAITING_CERT_VERIFY, awaiting_certificate_verify).
@@ -4434,9 +4435,11 @@ with_recv({PNSpace, SpinRecv, LastPN, SpinOut, Now}, State) ->
     }.
 
 %% Last {PN, FirstByte} of a run iff PNs are consecutive from Expected.
-seq_run_last([{PN, FB, _}], PN) ->
+seq_run_last([{PN, FB, _}], PN) when not ?SHORT_RESERVED_BITS(FB) ->
     {PN, FB};
-seq_run_last([{PN, _, _} | [{PN2, _, _} | _] = Rest], PN) when PN2 =:= PN + 1 ->
+seq_run_last([{PN, FB, _} | [{PN2, _, _} | _] = Rest], PN) when
+    PN2 =:= PN + 1, not ?SHORT_RESERVED_BITS(FB)
+->
     seq_run_last(Rest, PN2);
 seq_run_last(_, _) ->
     no.
@@ -4467,6 +4470,10 @@ fold_opened_seq([{_PN, _FB, Opened} | Rest], State, N, Elicited) ->
 %% Per-packet loop for a run that is not one contiguous sequence.
 fold_opened([], State, _Now, N, Elicited) ->
     fold_opened_finish(State, N, Elicited);
+fold_opened([{_PN, FirstByte, _Opened} | _], State, _Now, N, Elicited) when
+    ?SHORT_RESERVED_BITS(FirstByte)
+->
+    fold_opened_finish(reserved_bits_close(app, State), N, Elicited);
 fold_opened([{PN, FirstByte, Opened} | Rest], State, Now, N, Elicited) ->
     StateF = record_app_recv(FirstByte, PN, State, Now),
     {ok, NewState, Frames} = opened_frames(Opened, StateF),
@@ -5504,6 +5511,8 @@ decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
     case drop_duplicate(Fused, State#state.pn_app) of
         duplicate ->
             duplicate;
+        {ok, _PN0, FirstByte0, _Plaintext0} when ?SHORT_RESERVED_BITS(FirstByte0) ->
+            {ok, app, [], <<>>, reserved_bits_close(app, State), processed};
         {ok, PN0, FirstByte0, Plaintext0} ->
             Now0 = erlang:monotonic_time(millisecond),
             StateF = record_app_recv(FirstByte0, PN0, State, Now0),
@@ -5575,11 +5584,13 @@ decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
                 EncryptedPayload,
                 LargestRecv
             ),
+            <<UnprotectedFirstByte, _/binary>> = UnprotectedHeader,
             case drop_duplicate(Opened, State1#state.pn_app) of
                 duplicate ->
                     duplicate;
+                {ok, _PN, _Plaintext} when ?SHORT_RESERVED_BITS(UnprotectedFirstByte) ->
+                    {ok, app, [], <<>>, reserved_bits_close(app, State1), processed};
                 {ok, PN, Plaintext} ->
-                    <<UnprotectedFirstByte, _/binary>> = UnprotectedHeader,
                     %% Single monotonic_time sample shared by
                     %% recv_time and last_activity to save one BIF
                     %% call per received packet on the hot path.
@@ -5612,6 +5623,8 @@ decrypt_packet(Level, Header, _FirstByte, EncryptedPayload, RemainingData, Keys,
             {duplicate, RemainingData};
         {error, Reason} ->
             {error, Reason};
+        {ok, _PN, <<FirstByte, _/binary>>, _Plaintext} when FirstByte band 16#0c =/= 0 ->
+            {ok, Level, [], RemainingData, reserved_bits_close(Level, State), processed};
         {ok, PN, _UnprotectedHeader, Plaintext} ->
             %% Track received packet number for ACK generation.
             %% Single monotonic_time sample shared by recv_time and
@@ -9317,6 +9330,18 @@ classify_recv_trigger(_PN, _PNSpace) ->
 pn_space(initial, State) -> (State#state.hs)#hs.pn_initial;
 pn_space(handshake, State) -> (State#state.hs)#hs.pn_handshake;
 pn_space(_, State) -> State#state.pn_app.
+
+%% RFC 9000 Sections 17.2 and 17.3.1: the reserved bits are zero once
+%% both protections are removed.
+reserved_bits_close(Level, State) ->
+    close_with_error(
+        level_for_close(Level),
+        transport,
+        ?QUIC_PROTOCOL_VIOLATION,
+        0,
+        <<"reserved bits set">>,
+        State
+    ).
 
 %% RFC 9000 Section 12.3: a packet number already received in this
 %% space is discarded once decryption has authenticated it.
