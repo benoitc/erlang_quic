@@ -1463,15 +1463,19 @@ parse_initial_token(_) ->
 
 validate_initial_token(Secret, Token, Addr, MaxAge) ->
     case quic_address_token:decode(Secret, Token) of
-        {ok, #{addr := TokAddr} = Decoded} when TokAddr =:= Addr ->
-            case quic_address_token:validate(Decoded, #{max_age_ms => MaxAge}) of
-                ok -> {ok, Decoded};
-                {error, _} = Err -> Err
+        {ok, Decoded} ->
+            case quic_address_token:matches_addr(Decoded, Addr) of
+                true -> validate_token_age(Decoded, MaxAge);
+                false -> {error, address_mismatch}
             end;
-        {ok, _} ->
-            {error, address_mismatch};
         {error, _} = Err ->
             Err
+    end.
+
+validate_token_age(Decoded, MaxAge) ->
+    case quic_address_token:validate(Decoded, #{max_age_ms => MaxAge}) of
+        ok -> {ok, Decoded};
+        {error, _} = Err -> Err
     end.
 
 %% Send a packet using the appropriate backend.

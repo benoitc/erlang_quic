@@ -18,7 +18,8 @@
     encode_retry/4,
     encode_new_token/3,
     decode/2,
-    validate/2
+    validate/2,
+    matches_addr/2
 ]).
 
 -type addr() :: {inet:ip_address(), inet:port_number()}.
@@ -102,6 +103,14 @@ validate(#{ts := Ts}, Opts) ->
     NowMs = erlang:system_time(millisecond),
     Age = NowMs - Ts,
     check_age(Age, MaxAgeMs).
+
+%% @doc Whether a decoded token was issued to this client address. A
+%% NEW_TOKEN is for a later connection, which comes from a new ephemeral
+%% port (RFC 9000 Section 8.1.3), so only its IP address must match.
+-spec matches_addr(map(), addr()) -> boolean().
+matches_addr(#{kind := new_token, addr := {IP, _}}, {IP, _}) -> true;
+matches_addr(#{kind := retry, addr := Addr}, Addr) -> true;
+matches_addr(_Decoded, _Addr) -> false.
 
 check_age(Age, _) when Age < 0 -> {error, token_from_future};
 check_age(Age, MaxAgeMs) when Age > MaxAgeMs -> {error, token_expired};

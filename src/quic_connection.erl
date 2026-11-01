@@ -14255,15 +14255,19 @@ maybe_validate_initial_token(Token, #state{
     }
 }) ->
     case quic_address_token:decode(Secret, Token) of
-        {ok, #{addr := TokAddr} = Decoded} when TokAddr =/= Addr ->
-            {error, address_mismatch, Decoded};
         {ok, Decoded} ->
-            case quic_address_token:validate(Decoded, #{}) of
-                ok -> validated;
-                {error, Reason} -> {error, Reason}
+            case quic_address_token:matches_addr(Decoded, Addr) of
+                true -> validate_token_age(Decoded);
+                false -> {error, address_mismatch, Decoded}
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+validate_token_age(Decoded) ->
+    case quic_address_token:validate(Decoded, #{}) of
+        ok -> validated;
+        {error, Reason} -> {error, Reason}
     end.
 
 %% @doc Validate connection ID parameters from peer transport params.
