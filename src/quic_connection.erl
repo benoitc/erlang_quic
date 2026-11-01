@@ -4540,8 +4540,17 @@ opened_frames(Frames, State) when is_list(Frames) ->
 stream_train(Results, State) ->
     case ?QLOG_ENABLED((State#state.cfg)#conn_cfg.qlog_ctx) of
         true -> no;
-        false -> stream_train(Results, undefined, undefined, [], 0, 0)
+        false -> allowed_train(stream_train(Results, undefined, undefined, [], 0, 0), State)
     end.
+
+%% A train the peer may not send goes the per-packet way, which closes.
+allowed_train({ok, Sid, _, _, _, _} = Train, State) ->
+    case sending_side_violation(Sid, State) of
+        none -> Train;
+        _ -> no
+    end;
+allowed_train(no, _State) ->
+    no.
 
 stream_train([], Sid, _NextOff, RevChunks, Total, N) when Sid =/= undefined ->
     {Off, _} = lists:last(RevChunks),
@@ -5698,6 +5707,55 @@ level_for_close(_) -> app.
 %% RFC 9000 Section 9.1: Only packets containing non-probing frames trigger migration.
 -spec process_frame_track_probing(atom(), term(), #state{}) -> #state{}.
 process_frame_track_probing(Level, Frame, State) ->
+    case stream_frame_violation(Frame, State) of
+        none -> track_and_process_frame(Level, Frame, State);
+        {StreamId, Reason} -> stream_state_error_close(StreamId, Reason, State)
+    end.
+
+%% RFC 9000 Sections 19.4, 19.5, 19.8, 19.10 and 19.13: the stream frames a
+%% peer may not send for a stream only we send on, one only it sends on,
+%% or one of ours not yet opened.
+stream_frame_violation({reset_stream, StreamId, _, _}, State) ->
+    sending_side_violation(StreamId, State);
+stream_frame_violation({stream_data_blocked, StreamId, _}, State) ->
+    sending_side_violation(StreamId, State);
+stream_frame_violation({reset_stream_at, StreamId, _, _, _}, State) ->
+    sending_side_violation(StreamId, State);
+stream_frame_violation({stream, StreamId, _, _, _}, State) ->
+    sending_side_violation(StreamId, State);
+stream_frame_violation({Type, StreamId, _}, State) when
+    Type =:= stop_sending; Type =:= max_stream_data
+->
+    receiving_side_violation(StreamId, State);
+stream_frame_violation(_Frame, _State) ->
+    none.
+
+%% Frames from the sending side of a stream: the peer must be able to send on it.
+sending_side_violation(StreamId, State) ->
+    case is_unidirectional(StreamId) andalso is_locally_initiated(StreamId, State) of
+        true -> {StreamId, <<"frame for a send-only stream">>};
+        false -> unopened_local_violation(StreamId, State)
+    end.
+
+%% Frames from the receiving side of a stream: we must be able to send on it.
+receiving_side_violation(StreamId, State) ->
+    case is_unidirectional(StreamId) andalso not is_locally_initiated(StreamId, State) of
+        true -> {StreamId, <<"frame for a receive-only stream">>};
+        false -> unopened_local_violation(StreamId, State)
+    end.
+
+unopened_local_violation(StreamId, State) ->
+    Next =
+        case is_unidirectional(StreamId) of
+            true -> State#state.next_stream_id_uni;
+            false -> State#state.next_stream_id_bidi
+        end,
+    case is_locally_initiated(StreamId, State) andalso StreamId >= Next of
+        true -> {StreamId, <<"frame for an unopened local stream">>};
+        false -> none
+    end.
+
+track_and_process_frame(Level, Frame, State) ->
     %% Update has_non_probing_frame flag if this is a non-probing frame
     State1 =
         case State#state.has_non_probing_frame of
