@@ -533,7 +533,12 @@ parse_server_hello(_) ->
 %% §4.6.2). Presence is the entire signal; the extension body is empty
 %% on the EE path.
 -spec parse_encrypted_extensions(binary()) ->
-    {ok, #{alpn => binary(), transport_params => map(), early_data => boolean()}}
+    {ok, #{
+        alpn => binary(),
+        transport_params => map(),
+        transport_params_status => ok | missing | {error, term()},
+        early_data => boolean()
+    }}
     | {error, term()}.
 parse_encrypted_extensions(<<ExtensionsLen:16, Extensions:ExtensionsLen/binary, _Rest/binary>>) ->
     case parse_extensions(Extensions) of
@@ -545,20 +550,12 @@ parse_encrypted_extensions(<<ExtensionsLen:16, Extensions:ExtensionsLen/binary, 
                     _ ->
                         undefined
                 end,
-            TransportParams =
-                case maps:find(?EXT_QUIC_TRANSPORT_PARAMS, ExtMap) of
-                    {ok, TPData} ->
-                        case decode_transport_params(TPData) of
-                            {ok, TP} -> TP;
-                            _ -> #{}
-                        end;
-                    _ ->
-                        #{}
-                end,
+            {TransportParams, TPStatus} = transport_params_ext(ExtMap),
             EarlyData = maps:is_key(?EXT_EARLY_DATA, ExtMap),
             {ok, #{
                 alpn => Alpn,
                 transport_params => TransportParams,
+                transport_params_status => TPStatus,
                 early_data => EarlyData
             }};
         Error ->
@@ -566,6 +563,19 @@ parse_encrypted_extensions(<<ExtensionsLen:16, Extensions:ExtensionsLen/binary, 
     end;
 parse_encrypted_extensions(_) ->
     {error, invalid_encrypted_extensions}.
+
+%% The quic_transport_parameters extension, decoded, and whether it was
+%% there and valid (RFC 9001 Section 8.2). The map is empty unless it was.
+transport_params_ext(ExtMap) ->
+    case maps:find(?EXT_QUIC_TRANSPORT_PARAMS, ExtMap) of
+        {ok, TPData} ->
+            case decode_transport_params(TPData) of
+                {ok, TP} -> {TP, ok};
+                {error, _} = Error -> {#{}, Error}
+            end;
+        error ->
+            {#{}, missing}
+    end.
 
 %% @doc Parse Certificate message.
 -spec parse_certificate(binary()) ->
@@ -761,6 +771,15 @@ validate_transport_param_constraints(Params) ->
         N when N < 2 ->
             {error, {transport_parameter_error, active_connection_id_limit_too_small, N}};
         _ ->
+            validate_stateless_reset_token(Params)
+    end.
+
+validate_stateless_reset_token(Params) ->
+    %% RFC 9000 Section 18.2: a sequence of 16 bytes
+    case maps:get(stateless_reset_token, Params, undefined) of
+        Token when is_binary(Token), byte_size(Token) =/= 16 ->
+            {error, {transport_parameter_error, stateless_reset_token_size, byte_size(Token)}};
+        _ ->
             validate_ack_delay_exponent(Params)
     end.
 
@@ -861,8 +880,8 @@ decode_tp_value(Id, Value) when
     Id =:= ?TP_ACTIVE_CONNECTION_ID_LIMIT;
     Id =:= ?TP_MAX_DATAGRAM_FRAME_SIZE
 ->
-    %% Known integer parameters are varints
-    {Int, _} = quic_varint:decode(Value),
+    %% Known integer parameters are varints, filling the value exactly
+    {Int, <<>>} = quic_varint:decode(Value),
     Int;
 decode_tp_value(_Id, Value) ->
     %% RFC 9000 Section 18: Unknown transport parameters MUST be ignored.
@@ -896,9 +915,9 @@ decode_preferred_address(<<
     IPv6Port:16,
     CIDLen:8,
     CID:CIDLen/binary,
-    StatelessResetToken:16/binary,
-    _Rest/binary
->>) ->
+    StatelessResetToken:16/binary
+>>) when CIDLen > 0 ->
+    %% RFC 9000 Section 18.2: never a zero-length connection ID
     %% Parse IPv4 - zero address means not present
     {IPv4Addr, IPv4PortVal} =
         case {IPv4_A, IPv4_B, IPv4_C, IPv4_D, IPv4Port} of
@@ -1324,16 +1343,7 @@ finalise_client_hello(Random, SessionId, Ciphers, OrderedExts, ExtMap, ExtBlob) 
             {ok, AlpnData} -> parse_alpn_ext(AlpnData);
             error -> []
         end,
-    TransportParams =
-        case maps:find(?EXT_QUIC_TRANSPORT_PARAMS, ExtMap) of
-            {ok, TpData} ->
-                case decode_transport_params(TpData) of
-                    {ok, TP} -> TP;
-                    {error, _} -> #{}
-                end;
-            error ->
-                #{}
-        end,
+    {TransportParams, TPStatus} = transport_params_ext(ExtMap),
     PSK =
         case maps:find(?EXT_PRE_SHARED_KEY, ExtMap) of
             {ok, PskData} -> parse_pre_shared_key_ext(PskData);
@@ -1372,6 +1382,7 @@ finalise_client_hello(Random, SessionId, Ciphers, OrderedExts, ExtMap, ExtBlob) 
         server_name => ServerName,
         alpn_protocols => ALPNProtocols,
         transport_params => TransportParams,
+        transport_params_status => TPStatus,
         pre_shared_key => PSK,
         psk_key_exchange_modes => PskModes,
         psk_binders => PskBinders,

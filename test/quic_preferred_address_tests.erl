@@ -234,8 +234,8 @@ transport_params_full_with_preferred_address_test() ->
 %% CID Length Variations
 %%====================================================================
 
-%% Test with empty CID (length = 0)
-preferred_address_empty_cid_test() ->
+%% An empty CID is invalid (RFC 9000 Section 18.2)
+preferred_address_empty_cid_rejected_test() ->
     Token = crypto:strong_rand_bytes(16),
     PA = #preferred_address{
         ipv4_addr = {10, 0, 0, 1},
@@ -246,8 +246,7 @@ preferred_address_empty_cid_test() ->
         stateless_reset_token = Token
     },
     Encoded = quic_tls:encode_preferred_address(PA),
-    Decoded = quic_tls:decode_preferred_address(Encoded),
-    ?assertEqual(<<>>, Decoded#preferred_address.cid).
+    ?assertError(function_clause, quic_tls:decode_preferred_address(Encoded)).
 
 %% Test with maximum CID length (20 bytes)
 preferred_address_max_cid_test() ->
