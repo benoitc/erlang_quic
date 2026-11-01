@@ -6724,11 +6724,20 @@ process_tls_messages(_Level, <<>>, State) ->
 process_tls_messages(Level, Data, State) ->
     case quic_tls:decode_handshake_message(Data) of
         {ok, {Type, Body}, Rest} ->
-            %% Capture the ORIGINAL bytes from the wire (including TLS header)
-            OriginalMsg = binary:part(Data, 0, 4 + byte_size(Body)),
-            %% Pass the original bytes to process_tls_message for transcript
-            State1 = process_tls_message(Level, Type, Body, OriginalMsg, State),
-            process_tls_messages(Level, Rest, State1);
+            case tls_message_level(Type) of
+                Level ->
+                    %% Capture the ORIGINAL bytes from the wire (including TLS header)
+                    OriginalMsg = binary:part(Data, 0, 4 + byte_size(Body)),
+                    %% Pass the original bytes to process_tls_message for transcript
+                    State1 = process_tls_message(Level, Type, Body, OriginalMsg, State),
+                    process_tls_messages(Level, Rest, State1);
+                _ ->
+                    send_tls_alert(
+                        ?TLS_ALERT_UNEXPECTED_MESSAGE,
+                        <<"handshake message at the wrong encryption level">>,
+                        State
+                    )
+            end;
         {error, incomplete} ->
             %% Buffer the incomplete data for next CRYPTO frame
             State#state{
@@ -6739,6 +6748,20 @@ process_tls_messages(Level, Data, State) ->
         {error, _Err} ->
             State
     end.
+
+%% The encryption level each handshake message travels at (RFC 9001
+%% Section 4.1.3, Figure 5). QUIC replaces KeyUpdate (RFC 9001 Section 6)
+%% and has no EndOfEarlyData (Section 8.3), and post-handshake client
+%% authentication is not used (Section 4.4).
+tls_message_level(?TLS_CLIENT_HELLO) -> initial;
+tls_message_level(?TLS_SERVER_HELLO) -> initial;
+tls_message_level(?TLS_ENCRYPTED_EXTENSIONS) -> handshake;
+tls_message_level(?TLS_CERTIFICATE_REQUEST) -> handshake;
+tls_message_level(?TLS_CERTIFICATE) -> handshake;
+tls_message_level(?TLS_CERTIFICATE_VERIFY) -> handshake;
+tls_message_level(?TLS_FINISHED) -> handshake;
+tls_message_level(?TLS_NEW_SESSION_TICKET) -> app;
+tls_message_level(_Type) -> none.
 
 %% Process individual TLS messages
 %% OriginalMsg contains the exact bytes from the wire for transcript computation
