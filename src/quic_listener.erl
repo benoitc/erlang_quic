@@ -728,6 +728,10 @@ dispatch_batched_packets(
                 send_packets_to_connection(
                     ConnPid, lists:reverse(PacketList), RemoteAddr, QueueMax
                 );
+            (unrouted, PacketList) ->
+                lists:foreach(
+                    fun(P) -> handle_packet(P, RemoteAddr, State) end, lists:reverse(PacketList)
+                );
             ({new, DCID, Version}, PacketList) ->
                 %% Initial packets that need new connections. A client
                 %% flight larger than one datagram (a hybrid
@@ -762,8 +766,13 @@ group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
                     Acc1 = maps:update_with(Key, fun(L) -> [Packet | L] end, [Packet], Acc),
                     group_packets_by_conn(Rest, DCIDLen, Conns, Acc1);
                 [] ->
-                    %% New connection - group by DCID
-                    Key = {new, DCID, Version},
+                    %% New connection - group by DCID. An unsupported
+                    %% version is answered like a lone datagram.
+                    Key =
+                        case supported_version(Version) of
+                            true -> {new, DCID, Version};
+                            false -> unrouted
+                        end,
                     Acc1 = maps:update_with(Key, fun(L) -> [Packet | L] end, [Packet], Acc),
                     group_packets_by_conn(Rest, DCIDLen, Conns, Acc1)
             end;
@@ -774,8 +783,9 @@ group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
                     Acc1 = maps:update_with(Key, fun(L) -> [Packet | L] end, [Packet], Acc),
                     group_packets_by_conn(Rest, DCIDLen, Conns, Acc1);
                 [] ->
-                    %% Unknown - skip (will be handled as stateless reset if needed)
-                    group_packets_by_conn(Rest, DCIDLen, Conns, Acc)
+                    %% Unknown: a lone datagram's handling, stateless reset included
+                    Acc1 = maps:update_with(unrouted, fun(L) -> [Packet | L] end, [Packet], Acc),
+                    group_packets_by_conn(Rest, DCIDLen, Conns, Acc1)
             end;
         {long, DCID, _SCID, _PacketType, _Rest} ->
             case ets:lookup(Conns, DCID) of
