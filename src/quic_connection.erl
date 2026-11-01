@@ -11186,16 +11186,18 @@ send_pending_entry({StreamId, Data, Fin}, State) ->
 %% waits on a stream we have stopped writing to. Only a stream that already
 %% existed, and one we can send on, has a send side to reset.
 answer_stop_sending(StreamId, ErrorCode, StreamsBefore, State) ->
-    case maps:find(StreamId, StreamsBefore) of
-        {ok, #stream_state{send_done = false}} ->
-            case can_send_on_stream(StreamId, State) of
-                true ->
-                    {ok, Reset} = do_close_stream(StreamId, ErrorCode, State),
-                    Reset;
-                false ->
-                    State
-            end;
-        _ ->
+    %% A stream this STOP_SENDING opened has sent nothing yet: its
+    %% sending part is in "Ready" and is reset too.
+    SendDone =
+        case maps:find(StreamId, StreamsBefore) of
+            {ok, #stream_state{send_done = Done}} -> Done;
+            error -> not maps:is_key(StreamId, State#state.streams)
+        end,
+    case (not SendDone) andalso can_send_on_stream(StreamId, State) of
+        true ->
+            {ok, Reset} = do_close_stream(StreamId, ErrorCode, State),
+            Reset;
+        false ->
             State
     end.
 
