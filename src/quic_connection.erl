@@ -5611,7 +5611,7 @@ decode_and_process_streaming(Level, <<>>, State, []) ->
 decode_and_process_streaming(_Level, <<>>, State, Acc) ->
     {ok, State, lists:reverse(Acc)};
 decode_and_process_streaming(Level, Data, State, Acc) ->
-    case quic_frame:decode(Data) of
+    case decode_frame(Data) of
         {error, {unknown_frame_type, Type}} ->
             %% RFC 9000 Section 12.4: unknown frame type is FRAME_ENCODING_ERROR.
             ?LOG_WARNING(
@@ -5645,6 +5645,16 @@ decode_and_process_streaming(Level, Data, State, Acc) ->
         {Frame, Rest} ->
             NewState = process_frame_track_probing(Level, Frame, State),
             decode_and_process_streaming(Level, Rest, NewState, [Frame | Acc])
+    end.
+
+%% quic_frame:decode/1 raises on a frame cut short by the end of the
+%% packet.
+decode_frame(Data) ->
+    try
+        quic_frame:decode(Data)
+    catch
+        error:Reason -> {error, {malformed, Reason}};
+        throw:Reason -> {error, {malformed, Reason}}
     end.
 
 %% Map a packet-processing level atom to the level atom expected by
