@@ -89,7 +89,7 @@
 %% Update the spin-bit tracking state from a received 1-RTT packet.
 %% RFC 9000 §17.4 only updates on packets whose PN is greater than any
 %% previously received on this path so that reorderings don't flip the
-%% edge. Client mirrors the received bit; server inverts it.
+%% edge. The server reflects the received bit; the client inverts it.
 %% Kept for the spin-bit unit tests and as the reference the fused
 %% record_app_recv/4 is checked against.
 update_spin_from_recv(
@@ -99,8 +99,8 @@ update_spin_from_recv(
     Outgoing =
         case (State#state.cfg)#conn_cfg.spin_bit_enabled of
             false -> State#state.spin_outgoing;
-            true when Role =:= client -> RecvSpin;
-            true when Role =:= server -> 1 - RecvSpin
+            true when Role =:= client -> 1 - RecvSpin;
+            true when Role =:= server -> RecvSpin
         end,
     State#state{
         spin_recv = RecvSpin,
