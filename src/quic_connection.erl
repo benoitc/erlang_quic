@@ -7964,6 +7964,8 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
         end,
     CurrentOffset = Stream#stream_state.recv_offset,
     IsDuplicate = Offset < CurrentOffset orelse gb_trees:is_defined(Offset, RecvBuffer),
+    Highest = highest_received(Stream),
+    NewBytes = max(0, EndOffset - Highest),
 
     %% Only check buffer limit for new (non-duplicate) data
     BufferOverflow =
@@ -7972,7 +7974,7 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
             false -> RecvBufferBytes + DataSize > ?MAX_RECV_BUFFER_BYTES
         end,
 
-    case {EndOffset > RecvMaxData, DataReceived + DataSize > MaxDataLocal, BufferOverflow} of
+    case {EndOffset > RecvMaxData, DataReceived + NewBytes > MaxDataLocal, BufferOverflow} of
         {true, _, _} ->
             %% Stream-level flow control violation - RFC 9000 Section 4.1
             ?LOG_WARNING(
@@ -7994,7 +7996,7 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
             ?LOG_WARNING(
                 #{
                     what => connection_flow_control_violation,
-                    recv => DataReceived + DataSize,
+                    recv => DataReceived + NewBytes,
                     max => MaxDataLocal
                 },
                 ?QUIC_LOG_META
@@ -8097,6 +8099,9 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                         recv_fin = Stream#stream_state.recv_fin orelse DeliverFin,
                         recv_buffer = NewBuffer,
                         recv_buffered = Stream#stream_state.recv_buffered + BufferedDelta,
+                        recv_highest = ahead_of(
+                            max(Highest, EndOffset), NewRecvOffset, Stream#stream_state.recv_highest
+                        ),
                         final_size = FinalSize,
                         recv_done =
                             (DeliverFin andalso gb_trees:is_empty(NewBuffer)) orelse
@@ -8104,13 +8109,7 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                                 Stream#stream_state.recv_done
                     },
 
-                    %% Track connection-level data received - only count NEW bytes, not duplicates
-                    NewBytesReceived =
-                        case IsDuplicate of
-                            true -> 0;
-                            false -> DataSize
-                        end,
-                    NewDataReceivedVal = DataReceived + NewBytesReceived,
+                    NewDataReceivedVal = DataReceived + NewBytes,
 
                     %% Update receive buffer bytes tracking from the buffer
                     %% itself. The new-minus-delivered estimate drifts upward
@@ -9629,15 +9628,22 @@ stream_limit_close(State) ->
     ).
 
 %% RFC 9000 Section 4.5: the final size of a reset stream counts against
-%% connection flow control, received or not. data_received counts the
-%% bytes taken in, which for a stream is what it delivered and buffers.
-account_reset_stream(
-    #stream_state{recv_offset = Offset, recv_buffered = Buffered}, FinalSize, State
-) ->
+%% connection flow control, received or not.
+account_reset_stream(#stream_state{recv_buffered = Buffered} = Stream, FinalSize, State) ->
     conn_grant(State#state{
-        data_received = State#state.data_received + max(0, FinalSize - Offset - Buffered),
+        data_received =
+            State#state.data_received + max(0, FinalSize - highest_received(Stream)),
         recv_buffer_bytes = max(0, State#state.recv_buffer_bytes - Buffered)
     }).
+
+%% data_received is the sum of these over all streams.
+highest_received(#stream_state{recv_offset = Offset, recv_highest = Highest}) ->
+    max(Offset, Highest).
+
+%% Only an offset beyond the delivered data is recorded, so in-order
+%% delivery leaves recv_highest as the fast receive paths do.
+ahead_of(Highest, RecvOffset, _Old) when Highest > RecvOffset -> Highest;
+ahead_of(_Highest, _RecvOffset, Old) -> Old.
 
 %% @doc Validate stream direction for sending.
 %% RFC 9000 Section 2.1: Cannot send on peer's unidirectional streams.

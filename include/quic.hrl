@@ -642,6 +642,10 @@
     %% Bytes held in recv_buffer, a running count so per-packet
     %% accounting never walks the tree.
     recv_buffered = 0 :: non_neg_integer(),
+    %% Largest offset received beyond recv_offset, for connection flow
+    %% control (RFC 9000 Section 4.1). Behind recv_offset once the gap
+    %% below it is filled.
+    recv_highest = 0 :: non_neg_integer(),
     %% `manual': credit follows recv_consumed, the offset the reader has
     %% returned, instead of what has been delivered.
     recv_flow = auto :: auto | manual,
