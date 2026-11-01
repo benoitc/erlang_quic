@@ -6018,7 +6018,9 @@ process_frame(
                 Stream#stream_state{
                     state = reset,
                     final_size = FinalSize,
-                    recv_done = true
+                    recv_done = true,
+                    recv_buffer = gb_trees:empty(),
+                    recv_buffered = 0
                 },
                 Streams
             ),
@@ -6026,7 +6028,8 @@ process_frame(
             %% owner before the reset notification.
             StateFl = flush_pending_delivery(State),
             Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-            maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams});
+            State1 = account_reset_stream(Stream, FinalSize, StateFl#state{streams = NewStreams}),
+            maybe_reclaim_stream(StreamId, State1);
         error ->
             case is_reclaimed_frame(StreamId, State) of
                 true ->
@@ -6046,7 +6049,10 @@ process_frame(
                             ),
                             StateFl = flush_pending_delivery(State),
                             Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                            StateFl#state{streams = NewStreams}
+                            conn_grant(StateFl#state{
+                                streams = NewStreams,
+                                data_received = State#state.data_received + FinalSize
+                            })
                     end
             end
     end;
@@ -9621,6 +9627,17 @@ stream_limit_close(State) ->
     close_with_transport_error(
         ?QUIC_STREAM_LIMIT_ERROR, <<"stream limit exceeded">>, State
     ).
+
+%% RFC 9000 Section 4.5: the final size of a reset stream counts against
+%% connection flow control, received or not. data_received counts the
+%% bytes taken in, which for a stream is what it delivered and buffers.
+account_reset_stream(
+    #stream_state{recv_offset = Offset, recv_buffered = Buffered}, FinalSize, State
+) ->
+    conn_grant(State#state{
+        data_received = State#state.data_received + max(0, FinalSize - Offset - Buffered),
+        recv_buffer_bytes = max(0, State#state.recv_buffer_bytes - Buffered)
+    }).
 
 %% @doc Validate stream direction for sending.
 %% RFC 9000 Section 2.1: Cannot send on peer's unidirectional streams.
