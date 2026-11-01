@@ -500,13 +500,21 @@ classify_ack_head(Q, LargestAcked, Ranges, AckedAcc, KeptAcc, AckedBytes, MaxAE)
 
 %% Look up the largest-acked ack-eliciting packet's time_sent in the
 %% acked list, if present. Used only to drive the RTT sample update.
+%% RFC 9002 Section 5.1: a sample when the largest acknowledged is newly
+%% acknowledged and at least one newly acknowledged packet was
+%% ack-eliciting; the largest itself may be ACK-only.
 maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now) ->
     case lists:keyfind(LargestAcked, #sent_packet.pn, AckedList) of
-        #sent_packet{ack_eliciting = true, time_sent = TS} ->
-            LatestRTT = Now - TS,
-            AckDelayMs = ack_delay_to_ms(AckDelay, State),
-            update_rtt(State, LatestRTT, AckDelayMs);
-        _ ->
+        #sent_packet{time_sent = TS} ->
+            case lists:keymember(true, #sent_packet.ack_eliciting, AckedList) of
+                true ->
+                    LatestRTT = Now - TS,
+                    AckDelayMs = ack_delay_to_ms(AckDelay, State),
+                    update_rtt(State, LatestRTT, AckDelayMs);
+                false ->
+                    State
+            end;
+        false ->
             State
     end.
 
