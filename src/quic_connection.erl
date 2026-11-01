@@ -11702,11 +11702,49 @@ filter_reset_stream_at_data(Frames, #state{streams = Streams}) ->
         Frames
     ).
 
+-define(RETRANSMIT_OVERHEAD, 50).
+%% Type, stream ID, offset and length, each at its largest.
+-define(MAX_STREAM_FRAME_HEADER, 25).
+
 %% Send frames for retransmission with congestion control check
 send_retransmit_frames_cc([], State) ->
     State;
 send_retransmit_frames_cc(Frames, State) ->
     send_retransmit_frames_cc(Frames, State, normal).
+
+%% Lost frames first sent before the path MTU went down may no longer
+%% fit one packet: their stream data is split and the frames spread over
+%% as many packets as it takes.
+send_retransmit_frames_cc(Frames, State, Mode) ->
+    lists:foldl(
+        fun(Packet, S) -> send_retransmit_packet(Packet, S, Mode) end,
+        State,
+        fit_to_mtu(Frames, get_current_mtu(State) - ?RETRANSMIT_OVERHEAD)
+    ).
+
+fit_to_mtu(Frames, Budget) ->
+    case iolist_size([quic_frame:encode(F) || F <- Frames]) =< Budget of
+        true ->
+            [Frames];
+        false ->
+            Split = lists:flatmap(
+                fun(F) -> split_stream_frame(Budget - ?MAX_STREAM_FRAME_HEADER, F) end, Frames
+            ),
+            pack_frames(Split, Budget)
+    end.
+
+split_stream_frame(Max, {stream, Id, Offset, Data0, Fin} = Frame) ->
+    case iolist_to_binary(Data0) of
+        <<Part:Max/binary, Rest/binary>> when Rest =/= <<>> ->
+            [
+                {stream, Id, Offset, Part, false}
+                | split_stream_frame(Max, {stream, Id, Offset + Max, Rest, Fin})
+            ];
+        _ ->
+            [Frame]
+    end;
+split_stream_frame(_Max, Frame) ->
+    [Frame].
 
 %% Mode `probe' (PTO) is exempt from congestion control per RFC 9002
 %% §7.5. Gating probes on the control allowance deadlocks a full
@@ -11714,10 +11752,10 @@ send_retransmit_frames_cc(Frames, State) ->
 %% is denied, no probe means no ACK, no ACK means loss detection never
 %% runs, and the connection stalls until idle timeout with a full
 %% sent_q. Mode `normal' (loss retransmission) stays subject to cwnd.
-send_retransmit_frames_cc(Frames, #state{cc_state = CCState} = State, Mode) ->
+send_retransmit_packet(Frames, #state{cc_state = CCState} = State, Mode) ->
     %% Encode all frames and check size
     Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
-    PacketSize = byte_size(Payload) + 50,
+    PacketSize = byte_size(Payload) + ?RETRANSMIT_OVERHEAD,
 
     case retransmit_cc_allowed(Mode, CCState, PacketSize) of
         true ->
