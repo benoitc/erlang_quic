@@ -11771,9 +11771,10 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
     %% confirmation the peer could not decrypt it. RFC 9002 Section 7
     %% exempts it from the congestion window, which is what stops a
     %% blocked connection deadlocking on its own.
+    {ProbeSpace, State1a} = probe_space(Space, State1),
     Probing = coalescing_pass(
-        fun(S) -> lists:foldl(fun send_probe_packet/2, S, probe_spaces(Space, S)) end,
-        State1#state{hs = (State1#state.hs)#hs{hs_probe = true}}
+        fun(S) -> lists:foldl(fun send_probe_packet/2, S, probe_spaces(ProbeSpace, S)) end,
+        State1a#state{hs = (State1a#state.hs)#hs{hs_probe = true}}
     ),
     State2 = Probing#state{hs = (Probing#state.hs)#hs{hs_probe = false}},
 
@@ -11804,6 +11805,16 @@ outstanding_space(Space, State) ->
         {ok, _} -> [Space];
         none -> []
     end.
+
+%% RFC 9002 Section 6.2.2.1: a client with Handshake keys probes with a
+%% Handshake packet, and sending one discards its Initial keys (RFC 9001
+%% Section 4.9.1).
+probe_space(
+    initial, #state{cfg = #conn_cfg{role = client}, hs = #hs{handshake_keys = Keys}} = State
+) when Keys =/= undefined ->
+    {handshake, discard_initial(State)};
+probe_space(Space, State) ->
+    {Space, State}.
 
 %% Send a probe packet for PTO
 %% PTO probes are allowed to use control_allowance per RFC 9002
