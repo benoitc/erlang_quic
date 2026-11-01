@@ -92,10 +92,14 @@ set_peer_active_limit(#cid_pool_state{} = Pool, Limit) ->
 %% CIDs we issue to the peer
 %%====================================================================
 
-%% @doc How many more CIDs the peer's limit leaves room for.
+%% The peer's active_connection_id_limit has no upper bound.
+-define(MAX_ACTIVE_ISSUED, 8).
+
+%% @doc How many more CIDs the peer's limit leaves room for, up to
+%% ?MAX_ACTIVE_ISSUED.
 -spec replenish_needed(pool()) -> non_neg_integer().
 replenish_needed(#cid_pool_state{peer_active_limit = Limit} = Pool) ->
-    max(0, Limit - local_active_count(Pool)).
+    max(0, min(Limit, ?MAX_ACTIVE_ISSUED) - local_active_count(Pool)).
 
 %% @doc Issue N new CIDs, returning them in issue order for the caller to
 %% register and advertise.
