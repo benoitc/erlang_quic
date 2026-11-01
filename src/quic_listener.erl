@@ -753,11 +753,17 @@ dispatch_batched_packets(
         Groups
     ).
 
+%% RFC 9000 Section 14.1: a server discards an Initial in a smaller
+%% datagram, and Section 5.2.2 sends no Version Negotiation for one.
+-define(MIN_INITIAL_DATAGRAM, 1200).
+
 %% Group packets by their destination connection
 group_packets_by_conn([], _DCIDLen, _Conns, Acc) ->
     Acc;
 group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
     case parse_packet_header(Packet, DCIDLen) of
+        {initial, _DCID, _SCID, _Version, _Rest} when byte_size(Packet) < ?MIN_INITIAL_DATAGRAM ->
+            group_packets_by_conn(Rest, DCIDLen, Conns, Acc);
         {initial, DCID, _SCID, Version, _Rest} ->
             case ets:lookup(Conns, DCID) of
                 [{DCID, ConnPid}] ->
@@ -1026,6 +1032,8 @@ get_tables(_) ->
 
 handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) ->
     case parse_packet_header(Packet, DCIDLen) of
+        {initial, _DCID, _SCID, _Version, _Rest} when byte_size(Packet) < ?MIN_INITIAL_DATAGRAM ->
+            ok;
         {initial, DCID, SCID, Version, _Rest} ->
             %% Per-packet routing trace. Logged at debug: every received packet
             %% hits this path (a short-header packet per 1-RTT datagram), so at

@@ -17,7 +17,7 @@ unknown_short_header_test() ->
     ?assertEqual(#{unrouted => [Short, Short]}, group([Short, Short])).
 
 unsupported_version_test() ->
-    Initial = <<16#C0, 16#1A2A3A4A:32, 8, "client-d", 8, "client-s", 0, 4, 0:32>>,
+    Initial = <<16#C0, 16#1A2A3A4A:32, 8, "client-d", 8, "client-s", 0, 4, 0:(1200 - 25)/unit:8>>,
     ?assertEqual(#{unrouted => [Initial, Initial]}, group([Initial, Initial])).
 
 group(Packets) ->

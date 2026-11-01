@@ -23,8 +23,9 @@
 %% Long header, fixed bit, QUIC v1 Initial (type bits 00). Only the
 %% header is parsed for routing, so the body can be anything: the
 %% connection process is suspended before it looks at it.
+%% Padded to the 1200 bytes a client Initial datagram has.
 initial(Body) ->
-    <<
+    Packet = <<
         16#C0,
         1:32,
         (byte_size(?DCID)),
@@ -32,7 +33,8 @@ initial(Body) ->
         (byte_size(?SCID)),
         ?SCID/binary,
         Body/binary
-    >>.
+    >>,
+    <<Packet/binary, 0:((1200 - byte_size(Packet)) * 8)>>.
 
 %% Capture and freeze the connection the listener creates. Returning
 %% {error, _} keeps the listener from calling set_owner_sync, which
