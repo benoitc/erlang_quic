@@ -11104,8 +11104,26 @@ retransmit_lost_packets([#sent_packet{frames = Frames} | Rest], State) ->
     RetransmitFrames = quic_loss:retransmittable_frames(Frames),
     %% Filter out stream data beyond ReliableSize (RESET_STREAM_AT spec requirement)
     FilteredFrames = filter_reset_stream_at_data(RetransmitFrames, State),
-    State1 = send_retransmit_frames_cc(FilteredFrames, State),
+    CurrentFrames = lists:filter(fun(F) -> is_current_limit(F, State) end, FilteredFrames),
+    State1 = send_retransmit_frames_cc(CurrentFrames, State),
     retransmit_lost_packets(Rest, State1).
+
+%% RFC 9000 Section 13.3: a lost MAX_DATA, MAX_STREAM_DATA or MAX_STREAMS
+%% is resent only if no larger value has been sent since, and
+%% MAX_STREAM_DATA not once the final size is known.
+is_current_limit({max_data, N}, State) ->
+    N >= State#state.max_data_local;
+is_current_limit({max_streams, bidi, N}, State) ->
+    N >= State#state.max_streams_bidi_local;
+is_current_limit({max_streams, uni, N}, State) ->
+    N >= State#state.max_streams_uni_local;
+is_current_limit({max_stream_data, StreamId, N}, #state{streams = Streams}) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream_state{final_size = undefined, recv_max_data = Max}} -> N >= Max;
+        _ -> false
+    end;
+is_current_limit(_, _State) ->
+    true.
 
 %% Filter stream data beyond ReliableSize for streams with RESET_STREAM_AT
 %% Per draft-ietf-quic-reliable-stream-reset-07: Data beyond ReliableSize
