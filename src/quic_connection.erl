@@ -13364,7 +13364,8 @@ maybe_emit_pending_close(State) ->
 apply_peer_transport_params_internal(TransportParams, State) ->
     %% Extract connection-level flow control: how much WE can send to THEM
     %% Peer's initial_max_data tells us the max bytes we can send on this connection
-    MaxDataRemote = maps:get(initial_max_data, TransportParams, ?DEFAULT_INITIAL_MAX_DATA),
+    %% RFC 9000 Section 18.2: an absent parameter is 0
+    MaxDataRemote = maps:get(initial_max_data, TransportParams, 0),
 
     %% Extract stream-level flow control limits for streams we send on
     %% initial_max_stream_data_bidi_remote: limit for streams WE initiate (from peer's perspective, we're "remote")
@@ -13373,17 +13374,17 @@ apply_peer_transport_params_internal(TransportParams, State) ->
     MaxStreamDataBidiRemote = maps:get(
         initial_max_stream_data_bidi_remote,
         TransportParams,
-        ?DEFAULT_INITIAL_MAX_STREAM_DATA
+        0
     ),
     MaxStreamDataBidiLocal = maps:get(
         initial_max_stream_data_bidi_local,
         TransportParams,
-        ?DEFAULT_INITIAL_MAX_STREAM_DATA
+        0
     ),
     MaxStreamDataUni = maps:get(
         initial_max_stream_data_uni,
         TransportParams,
-        ?DEFAULT_INITIAL_MAX_STREAM_DATA
+        0
     ),
 
     ?LOG_DEBUG(
@@ -13399,8 +13400,8 @@ apply_peer_transport_params_internal(TransportParams, State) ->
     ),
 
     %% Extract stream limits: how many streams WE can open
-    MaxStreamsBidi = maps:get(initial_max_streams_bidi, TransportParams, ?DEFAULT_MAX_STREAMS_BIDI),
-    MaxStreamsUni = maps:get(initial_max_streams_uni, TransportParams, ?DEFAULT_MAX_STREAMS_UNI),
+    MaxStreamsBidi = maps:get(initial_max_streams_bidi, TransportParams, 0),
+    MaxStreamsUni = maps:get(initial_max_streams_uni, TransportParams, 0),
 
     %% Extract max_datagram_frame_size (RFC 9221): peer's max datagram size
     %% Default is 0 (datagrams not supported)
