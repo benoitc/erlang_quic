@@ -5062,7 +5062,7 @@ decode_long_header_packet(Data, State) ->
 
     case Version of
         0 ->
-            handle_version_negotiation(DCID, Rest3, State);
+            handle_version_negotiation(DCID, SCID, Rest3, State);
         _ ->
             %% RFC 9368: a client that offered other acceptable versions
             %% adopts the one the server switched to.
@@ -5138,19 +5138,25 @@ decode_long_header_type(Type, Data, FirstByte, Version, DCID, SCID, Rest3, State
 %% server does not speak the version we sent and lists what it does speak.
 %% A server never receives one, and a client only acts on it before it has
 %% processed any packet from this server; later ones are attacks or stale.
-handle_version_negotiation(_DCID, _Versions, #state{cfg = #conn_cfg{role = server}}) ->
+handle_version_negotiation(_DCID, _SCID, _Versions, #state{cfg = #conn_cfg{role = server}}) ->
     {error, unexpected_version_negotiation};
-handle_version_negotiation(DCID, VersionsBin, State) ->
+handle_version_negotiation(DCID, SCID, VersionsBin, State) ->
     case count(?C_PACKETS_RECEIVED, State) of
-        0 -> handle_first_version_negotiation(DCID, VersionsBin, State);
+        0 -> handle_first_version_negotiation(DCID, SCID, VersionsBin, State);
         _ -> {error, late_version_negotiation}
     end.
 
-handle_first_version_negotiation(DCID, _Versions, #state{cfg = #conn_cfg{scid = SCID}}) when
-    DCID =/= SCID
+handle_first_version_negotiation(DCID, _SCID, _Versions, #state{cfg = #conn_cfg{scid = Own}}) when
+    DCID =/= Own
 ->
     {error, version_negotiation_cid_mismatch};
-handle_first_version_negotiation(_DCID, VersionsBin, #state{version = Ours}) ->
+handle_first_version_negotiation(_DCID, SCID, _Versions, #state{
+    cfg = #conn_cfg{original_dcid = Sent}
+}) when
+    SCID =/= Sent
+->
+    {error, version_negotiation_cid_mismatch};
+handle_first_version_negotiation(_DCID, _SCID, VersionsBin, #state{version = Ours}) ->
     Versions = decode_versions(VersionsBin),
     case lists:member(Ours, Versions) of
         true ->
