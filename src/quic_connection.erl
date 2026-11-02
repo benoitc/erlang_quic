@@ -5601,6 +5601,18 @@ process_frame(
                 {connection_close, transport, ?QUIC_FINAL_SIZE_ERROR, 0,
                     <<"RESET_STREAM final size mismatch">>},
             send_frame(CloseFrame, State#state{close_reason = final_size_error});
+        {ok, #stream_state{recv_offset = Received, recv_highest = Highest}} when
+            FinalSize < Received orelse FinalSize < Highest
+        ->
+            %% RFC 9000 Section 4.5: below data already received
+            close_with_transport_error(
+                ?QUIC_FINAL_SIZE_ERROR, <<"RESET_STREAM final size below received data">>, State
+            );
+        {ok, #stream_state{recv_max_data = Limit}} when FinalSize > Limit ->
+            %% RFC 9000 Section 4.1: beyond the stream's flow control limit
+            close_with_transport_error(
+                ?QUIC_FLOW_CONTROL_ERROR, <<"RESET_STREAM final size above limit">>, State
+            );
         {ok, Stream} ->
             %% Mark stream as reset, store final size for flow control accounting.
             %% Incoming RESET_STREAM closes our receive side.
@@ -7645,9 +7657,10 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
             %% cannot move, and nothing may lie beyond it.
             ExistingFinalSize = Stream#stream_state.final_size,
             FinalSizeError =
-                ExistingFinalSize =/= undefined andalso
+                (ExistingFinalSize =/= undefined andalso
                     ((Fin andalso ExistingFinalSize =/= EndOffset) orelse
-                        EndOffset > ExistingFinalSize),
+                        EndOffset > ExistingFinalSize)) orelse
+                    (Fin andalso EndOffset < Highest),
 
             case FinalSizeError of
                 true ->
