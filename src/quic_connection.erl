@@ -13022,6 +13022,11 @@ complete_migration(_, State) ->
 %% @doc Handle NEW_CONNECTION_ID frame from peer.
 %% Adds the new CID to our pool of peer CIDs.
 %% RFC 9000 Section 5.1.1: Peer must not exceed our active_connection_id_limit.
+handle_new_connection_id(_SeqNum, _RetirePrior, _CID, _ResetToken, #state{dcid = <<>>} = State) ->
+    %% RFC 9000 Section 19.15
+    close_with_transport_error(
+        ?QUIC_PROTOCOL_VIOLATION, <<"NEW_CONNECTION_ID with zero-length DCID">>, State
+    );
 handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
     case RetirePrior > SeqNum of
         true ->
