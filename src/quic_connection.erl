@@ -5890,6 +5890,10 @@ track_and_process_frame(Level, Frame, State) ->
 frame_dispatch_level(zero_rtt) -> app;
 frame_dispatch_level(Level) -> Level.
 
+next_pn(initial, #state{hs = #hs{pn_initial = #pn_space{next_pn = PN}}}) -> PN;
+next_pn(handshake, #state{hs = #hs{pn_handshake = #pn_space{next_pn = PN}}}) -> PN;
+next_pn(app, #state{pn_app = #pn_space{next_pn = PN}}) -> PN.
+
 %% Process individual frames
 process_frame(_Level, padding, State) ->
     State;
@@ -5904,9 +5908,15 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
 
     %% Convert Ranges list to the format expected by quic_loss
     %% Ranges is a list of {Start, End} tuples from largest to smallest
+    NextPN = next_pn(Level, State),
     case Ranges of
         [] ->
             State;
+        [{LargestAcked, _} | _] when LargestAcked >= NextPN ->
+            %% RFC 9000 Section 13.1
+            close_with_transport_error(
+                ?QUIC_PROTOCOL_VIOLATION, <<"ACK for a packet not sent">>, State
+            );
         [{LargestAcked, _} | _] ->
             %% Convert ranges to ACK frame format for quic_loss
             %% quic_loss expects {ack, LargestAcked, AckDelay, FirstRange, AckRanges}
