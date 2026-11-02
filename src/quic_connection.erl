@@ -1920,10 +1920,13 @@ connected({call, From}, migrate, #state{remote_addr = RemoteAddr} = State) ->
     %% new path, so the pool is checked before the socket is rebound. The
     %% other order leaves the connection on a new local address still using
     %% the old path's CID, which is the reuse the section forbids.
-    case has_unused_cid(State) of
-        false ->
+    case {quic_loss:handshake_confirmed(State#state.loss_state), has_unused_cid(State)} of
+        {false, _} ->
+            %% RFC 9000 Section 9
+            {keep_state, State, [{reply, From, {error, handshake_not_confirmed}}]};
+        {true, false} ->
             {keep_state, State, [{reply, From, {error, no_available_connection_id}}]};
-        true ->
+        {true, true} ->
             case rebind_client_socket(State) of
                 {ok, State1} ->
                     {keep_state, migrate_to(RemoteAddr, State1), [{reply, From, ok}]};
@@ -1937,10 +1940,12 @@ connected(
 ) ->
     {keep_state, State, [{reply, From, {error, migration_disabled}}]};
 connected({call, From}, {migrate, _Opts}, #state{remote_addr = RemoteAddr} = State) ->
-    case has_unused_cid(State) of
-        false ->
+    case {quic_loss:handshake_confirmed(State#state.loss_state), has_unused_cid(State)} of
+        {false, _} ->
+            {keep_state, State, [{reply, From, {error, handshake_not_confirmed}}]};
+        {true, false} ->
             {keep_state, State, [{reply, From, {error, no_available_connection_id}}]};
-        true ->
+        {true, true} ->
             case rebind_client_socket(State) of
                 {ok, State1} ->
                     {keep_state, migrate_to(RemoteAddr, State1), [{reply, From, ok}]};
