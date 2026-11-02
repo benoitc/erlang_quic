@@ -36,6 +36,7 @@
     close_reason/1,
     state_for_server/3,
     state_with_pn_app/2,
+    state_with_sent_pns/2,
     recv_summary/2,
     state_closing/2,
     state_with_socket/2,
@@ -189,6 +190,18 @@ state_with_pn_app(State, Largest) ->
         },
         transport_params = #{max_ack_delay => 25}
     }.
+
+%% Packet numbers 0..NextPN-1 sent in every space.
+-spec state_with_sent_pns(#state{}, non_neg_integer()) -> #state{}.
+state_with_sent_pns(#state{hs = HS} = State, NextPN) ->
+    Space = #pn_space{
+        next_pn = NextPN,
+        largest_recv = undefined,
+        recv_time = undefined,
+        ack_ranges = [],
+        ack_eliciting_in_flight = 0
+    },
+    State#state{hs = HS#hs{pn_initial = Space, pn_handshake = Space}, pn_app = Space}.
 
 %% The receive-side fields a batch-opened run is expected to move.
 -spec recv_summary(#state{}, non_neg_integer()) -> map().

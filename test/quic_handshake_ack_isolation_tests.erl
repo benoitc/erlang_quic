@@ -43,7 +43,9 @@ loss_with_three_inflight() ->
 %% once: two builds either side of a millisecond tick differ in
 %% time_sent and nothing else.
 state() ->
-    quic_connection_test_support:state_with_loss(loss_with_three_inflight()).
+    quic_connection_test_support:state_with_sent_pns(
+        quic_connection_test_support:state_with_loss(loss_with_three_inflight()), 100
+    ).
 
 %% An ACK frame in the shape process_frame/3 consumes. Each range is
 %% {LargestAcked, FirstRange} where FirstRange is a *count* of further
