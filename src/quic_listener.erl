@@ -1453,9 +1453,13 @@ compute_stateless_reset_token(Secret, CID) ->
 %% RFC 9000 Section 10.3: Looks like a short header packet with random bytes
 %% followed by the 16-byte stateless reset token
 build_stateless_reset(Token, TriggerSize) ->
-    %% Reset should be smaller than trigger (RFC 9000 Section 10.3.3)
-    %% but at least 21 bytes. Use a size between 21 and TriggerSize-1.
-    ResetSize = min(TriggerSize - 1, max(21, rand:uniform(20) + 21)),
+    %% Smaller than the trigger (RFC 9000 Section 10.3.3), and exactly one
+    %% byte shorter for a trigger of 43 bytes or less (Section 10.3).
+    ResetSize =
+        case TriggerSize =< 43 of
+            true -> TriggerSize - 1;
+            false -> rand:uniform(20) + 21
+        end,
     %% Unpredictable bits with fixed bit = 1 (first bit = 0 for short header)
 
     % 1 byte header + 16 byte token

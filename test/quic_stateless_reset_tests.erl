@@ -38,3 +38,19 @@ undefined_secret_still_yields_16_random_bytes_test() ->
     S = quic_connection_test_support:state_with_secret(undefined),
     T = quic_connection:generate_stateless_reset_token(<<1, 2, 3>>, S),
     ?assertEqual(16, byte_size(T)).
+
+%% RFC 9000 Section 10.3: a reset answering a packet of 43 bytes or less
+%% is one byte shorter than it.
+small_trigger_gets_reset_one_byte_shorter_test() ->
+    Token = crypto:strong_rand_bytes(16),
+    [
+        ?assertEqual(Size - 1, byte_size(quic_listener:build_stateless_reset(Token, Size)))
+     || Size <- lists:seq(22, 43), _ <- lists:seq(1, 20)
+    ].
+
+large_trigger_gets_smaller_reset_test() ->
+    Token = crypto:strong_rand_bytes(16),
+    [
+        ?assert(byte_size(quic_listener:build_stateless_reset(Token, Size)) < Size)
+     || Size <- [44, 100, 1200], _ <- lists:seq(1, 20)
+    ].
