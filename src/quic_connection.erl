@@ -13099,7 +13099,10 @@ issue_new_connection_ids(#state{cid_pool_state = Pool} = State) ->
 issue_cids(0, State) ->
     State;
 issue_cids(N, #state{cid_pool_state = Pool} = State) when N > 0 ->
-    {NewPool, Issued} = quic_cid:issue(Pool, N, (State#state.cfg)#conn_cfg.stateless_reset_secret),
+    #conn_cfg{stateless_reset_secret = Secret, cid_config = CIDConfig} = State#state.cfg,
+    {NewPool, Issued} = quic_cid:issue(Pool, N, Secret, fun() ->
+        generate_connection_id(CIDConfig)
+    end),
     State1 = State#state{cid_pool_state = NewPool},
     lists:foldl(
         fun({SeqNum, CID, Token}, Acc) ->
