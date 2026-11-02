@@ -5645,6 +5645,21 @@ process_frame(
                     end
             end
     end;
+%% Without our reset_stream_at transport parameter the frame type is
+%% unknown on this connection (RFC 9000 Section 12.4).
+process_frame(
+    app,
+    {reset_stream_at, _, _, _, _},
+    #state{cfg = #conn_cfg{reset_stream_at_enabled = false}} = State
+) ->
+    close_with_error(
+        app,
+        transport,
+        ?QUIC_FRAME_ENCODING_ERROR,
+        ?FRAME_RESET_STREAM_AT,
+        <<"RESET_STREAM_AT not negotiated">>,
+        State
+    );
 %% RESET_STREAM_AT: Peer is aborting a stream with reliable delivery guarantee
 %% draft-ietf-quic-reliable-stream-reset-07
 process_frame(
