@@ -438,8 +438,20 @@ decode_all_complex_test() ->
 %%====================================================================
 
 decode_unknown_frame_test() ->
-    %% Frame type 0xff is not defined
-    ?assertEqual({error, {unknown_frame_type, 16#ff}}, quic_frame:decode(<<16#ff>>)).
+    ?assertEqual({error, {unknown_frame_type, 16#3f}}, quic_frame:decode(<<16#3f>>)).
+
+%% RFC 9000 Section 12.4: the frame type is a varint, so an unknown type
+%% is reported by its value, not its first byte.
+decode_unknown_multibyte_frame_type_test() ->
+    ?assertEqual({error, {unknown_frame_type, 16#ff}}, quic_frame:decode(<<16#40, 16#ff>>)),
+    ?assertEqual({error, {unknown_frame_type, 16#3fff}}, quic_frame:decode(<<16#7f, 16#ff>>)),
+    ?assertEqual(
+        {error, {unknown_frame_type, 16#ff00ff}}, quic_frame:decode(<<16#80, 16#ff, 16#00, 16#ff>>)
+    ).
+
+decode_truncated_frame_type_test() ->
+    ?assertEqual({error, truncated_frame_type}, quic_frame:decode(<<16#ff>>)),
+    ?assertEqual({error, truncated_frame_type}, quic_frame:decode(<<16#40>>)).
 
 decode_empty_test() ->
     ?assertEqual({error, empty}, quic_frame:decode(<<>>)).
