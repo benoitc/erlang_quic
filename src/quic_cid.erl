@@ -30,6 +30,7 @@
 
     %% CIDs we issue to the peer
     issue/3,
+    issue/4,
     retire_local/2,
     replenish_needed/1,
     local_active_limit/1,
@@ -110,14 +111,20 @@ replenish_needed(#cid_pool_state{peer_active_limit = Limit} = Pool) ->
 -spec issue(pool(), non_neg_integer(), binary() | undefined) ->
     {pool(), [{non_neg_integer(), binary(), binary()}]}.
 issue(Pool, N, ResetSecret) ->
-    issue(Pool, N, ResetSecret, []).
+    issue(Pool, N, ResetSecret, fun() -> crypto:strong_rand_bytes(8) end).
 
-issue(Pool, 0, _ResetSecret, Acc) ->
+%% @doc As issue/3, with each CID from `NewCID'.
+-spec issue(pool(), non_neg_integer(), binary() | undefined, fun(() -> binary())) ->
+    {pool(), [{non_neg_integer(), binary(), binary()}]}.
+issue(Pool, N, ResetSecret, NewCID) ->
+    issue(Pool, N, ResetSecret, NewCID, []).
+
+issue(Pool, 0, _ResetSecret, _NewCID, Acc) ->
     {Pool, lists:reverse(Acc)};
-issue(Pool, N, ResetSecret, Acc) when N > 0 ->
-    CID = crypto:strong_rand_bytes(8),
+issue(Pool, N, ResetSecret, NewCID, Acc) when N > 0 ->
+    CID = NewCID(),
     {Pool1, SeqNum, Token} = issue_cid(Pool, CID, ResetSecret),
-    issue(Pool1, N - 1, ResetSecret, [{SeqNum, CID, Token} | Acc]).
+    issue(Pool1, N - 1, ResetSecret, NewCID, [{SeqNum, CID, Token} | Acc]).
 
 %% @doc Issue a CID the caller chose, such as the one a preferred_address
 %% carries, as the next sequence number.
