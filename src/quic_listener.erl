@@ -803,6 +803,9 @@ group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
                     %% Unknown long header - skip
                     group_packets_by_conn(Rest, DCIDLen, Conns, Acc)
             end;
+        {unsupported_version, _DCID, _SCID, _Version} ->
+            Acc1 = maps:update_with(unrouted, fun(L) -> [Packet | L] end, [Packet], Acc),
+            group_packets_by_conn(Rest, DCIDLen, Conns, Acc1);
         {error, _Reason} ->
             %% Skip invalid packets
             group_packets_by_conn(Rest, DCIDLen, Conns, Acc)
@@ -1034,7 +1037,7 @@ handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) -
     case parse_packet_header(Packet, DCIDLen) of
         {initial, _DCID, _SCID, _Version, _Rest} when byte_size(Packet) < ?MIN_INITIAL_DATAGRAM ->
             ok;
-        {initial, DCID, SCID, Version, _Rest} ->
+        {initial, DCID, _SCID, Version, _Rest} ->
             %% Per-packet routing trace. Logged at debug: every received packet
             %% hits this path (a short-header packet per 1-RTT datagram), so at
             %% info level a busy listener floods the log and burns CPU.
@@ -1047,12 +1050,14 @@ handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) -
                 },
                 ?QUIC_LOG_META
             ),
-            case supported_version(Version) of
-                true ->
-                    handle_initial_packet(Packet, DCID, Version, RemoteAddr, State);
-                false ->
-                    send_version_negotiation(DCID, SCID, Version, RemoteAddr, State)
-            end;
+            handle_initial_packet(Packet, DCID, Version, RemoteAddr, State);
+        {unsupported_version, DCID, SCID, Version} when
+            byte_size(Packet) >= ?MIN_INITIAL_DATAGRAM
+        ->
+            send_version_negotiation(DCID, SCID, Version, RemoteAddr, State);
+        {unsupported_version, _DCID, _SCID, _Version} ->
+            %% RFC 9000 Section 5.2.2: smaller packets MUST be dropped.
+            ok;
         {short, DCID, _Rest} ->
             ?LOG_DEBUG(#{what => short_header_packet, dcid => DCID}, ?QUIC_LOG_META),
             route_to_connection(DCID, Packet, RemoteAddr, State);
@@ -1105,11 +1110,17 @@ parse_packet_header(
 ->
     %% Long header - extract packet type from bits 4-5 of first byte.
     %% The bit patterns are version-specific (RFC 9369 §3.2), so map
-    %% through the version before classifying.
+    %% through the version before classifying. Under an unsupported
+    %% version they mean nothing (RFC 8999 Section 5.1).
     PacketType = (FirstByte bsr 4) band 2#11,
-    case quic_packet:bits_to_type(PacketType, Version) of
-        initial -> {initial, DCID, SCID, Version, Rest};
-        _ -> {long, DCID, SCID, PacketType, Rest}
+    case supported_version(Version) of
+        false ->
+            {unsupported_version, DCID, SCID, Version};
+        true ->
+            case quic_packet:bits_to_type(PacketType, Version) of
+                initial -> {initial, DCID, SCID, Version, Rest};
+                _ -> {long, DCID, SCID, PacketType, Rest}
+            end
     end;
 parse_packet_header(<<0:1, _:7, Rest/binary>>, DCIDLen) ->
     %% Short header - use configured DCID length
