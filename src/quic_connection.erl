@@ -1706,6 +1706,12 @@ connected({call, From}, open_stream, State) ->
     case do_open_stream(State) of
         {ok, StreamId, NewState} ->
             {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
+        {error, stream_limit} ->
+            %% RFC 9000 Section 19.14
+            State1 = send_frame(
+                {streams_blocked, bidi, State#state.max_streams_bidi_remote}, State
+            ),
+            {keep_state, flush_event(State1, event), [{reply, From, {error, stream_limit}}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1713,6 +1719,10 @@ connected({call, From}, open_unidirectional_stream, State) ->
     case do_open_unidirectional_stream(State) of
         {ok, StreamId, NewState} ->
             {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
+        {error, stream_limit} ->
+            %% RFC 9000 Section 19.14
+            State1 = send_frame({streams_blocked, uni, State#state.max_streams_uni_remote}, State),
+            {keep_state, flush_event(State1, event), [{reply, From, {error, stream_limit}}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
