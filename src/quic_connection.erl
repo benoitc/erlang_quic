@@ -3912,12 +3912,9 @@ pad_for_header_protection(Payload) ->
 %% RFC 9000 Section 8.2.1: Path validation packets MUST be padded to at least
 %% 1200 bytes to verify PMTU and prevent amplification attacks.
 %% PADDING frames (0x00 bytes) are added to the payload BEFORE AEAD protection.
--spec pad_for_path_validation(binary(), binary()) -> binary().
-pad_for_path_validation(Payload, DCID) ->
-    %% Estimate final packet size after protection:
-    %% - Short header: 1 (flags) + DCID length + 1-4 (PN) ~= 1 + len(DCID) + 2
-    %% - Payload (with padding) + AEAD tag (16 bytes)
-    HeaderSize = 1 + byte_size(DCID) + 2,
+-spec pad_for_path_validation(binary(), binary(), 1..4) -> binary().
+pad_for_path_validation(Payload, DCID, PNLen) ->
+    HeaderSize = 1 + byte_size(DCID) + PNLen,
     AEADTagSize = 16,
     MinPacketSize = 1200,
     CurrentSize = HeaderSize + byte_size(Payload) + AEADTagSize,
@@ -12213,12 +12210,12 @@ send_path_challenge(
             %% Build PATH_CHALLENGE frame
             ChallengeFrame = {path_challenge, ChallengeData},
             Payload = quic_frame:encode(ChallengeFrame),
-            %% RFC 9000 Section 8.2.1: Pad to 1200 bytes for path validation
-            PaddedPayload = pad_for_path_validation(Payload, DCID),
 
             %% Get packet number and key phase
             PN = PNSpace#pn_space.next_pn,
             PNLen = quic_packet:pn_length(PN),
+            %% RFC 9000 Section 8.2.1: Pad to 1200 bytes for path validation
+            PaddedPayload = pad_for_path_validation(Payload, DCID, PNLen),
             KeyPhase = get_current_key_phase(State),
 
             %% Build first byte for short header
@@ -12280,12 +12277,12 @@ send_path_response_to_addr(
             %% Build PATH_RESPONSE frame
             ResponseFrame = {path_response, ResponseData},
             Payload = quic_frame:encode(ResponseFrame),
-            %% RFC 9000 Section 8.2.1: Pad to 1200 bytes for path validation
-            PaddedPayload = pad_for_path_validation(Payload, DCID),
 
             %% Get packet number and key phase
             PN = PNSpace#pn_space.next_pn,
             PNLen = quic_packet:pn_length(PN),
+            %% RFC 9000 Section 8.2.1: Pad to 1200 bytes for path validation
+            PaddedPayload = pad_for_path_validation(Payload, DCID, PNLen),
             KeyPhase = get_current_key_phase(State),
 
             %% Build first byte for short header
