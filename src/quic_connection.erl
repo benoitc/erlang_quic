@@ -3201,9 +3201,9 @@ send_new_session_ticket(
 
 %% RFC 9002 Section 2: a packet is in flight when it is ack-eliciting or
 %% carries PADDING. ACK and CONNECTION_CLOSE are neither, so an ACK-only
-%% Initial is not in flight and must not arm a probe. Initial datagrams
-%% are brought to 1200 bytes after protection, which is datagram padding
-%% and not PADDING frames, so only the in-payload padding counts.
+%% Initial is not in flight and must not arm a probe. The PADDING that
+%% brings an Initial to 1200 bytes does not count: an ACK-only packet
+%% is not acknowledged on its own, so its bytes would stay in flight.
 -spec packet_flags([term()], boolean()) -> {boolean(), boolean()}.
 packet_flags(Frames, Padded) ->
     AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames),
@@ -3387,8 +3387,16 @@ send_initial_packet(Payload, Frames, State) ->
     TokenLen = byte_size(RetryToken),
     TokenLenEnc = quic_varint:encode(TokenLen),
 
-    %% Pad payload if needed for header protection sampling
-    PaddedPayload = pad_for_header_protection(Payload),
+    %% RFC 9000 Section 14.1: PADDING frames bring the packet to 1200
+    %% bytes. Fixed is everything before the Length field, whose varint
+    %% is two bytes at this size.
+    Fixed = 7 + byte_size(DCID) + byte_size(SCID) + byte_size(TokenLenEnc) + TokenLen,
+    HPPayload = pad_for_header_protection(Payload),
+    PaddedPayload =
+        case pad_initial_in_packet(Role, quic_ack:contains_ack_eliciting_frames(Frames), State) of
+            true -> pad_initial_payload(HPPayload, 1200 - Fixed - 2 - PNLen - 16);
+            false -> HPPayload
+        end,
 
     %% Build header prefix (without packet number)
     HeaderBody = <<
@@ -3416,10 +3424,7 @@ send_initial_packet(Payload, Frames, State) ->
         Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
 
-    %% Congestion control counts the protected packet; the amplification
-    %% budget counts the datagram, which for a short Initial is larger
-    %% because it is brought to 1200 bytes outside the packet.
-    Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
+    Padded = iolist_size(HPPayload) > iolist_size(Payload),
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
     Datagram = initial_datagram(Role, AckEliciting, Packet, State),
     Meta = {initial, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
@@ -3991,7 +3996,14 @@ initial_datagram(server, AckEliciting, Packet, #state{hs = #hs{dgram = {_, _, _,
 initial_datagram(server, false, Packet, _State) ->
     Packet;
 initial_datagram(_Role, _AckEliciting, Packet, _State) ->
-    pad_initial_packet(Packet).
+    Packet.
+
+%% Whether an Initial is padded to 1200 bytes with PADDING frames: always
+%% for a client, and for a server's ack-eliciting one unless a coalescing
+%% pass pads the datagram it shares.
+pad_initial_in_packet(client, _AckEliciting, _State) -> true;
+pad_initial_in_packet(server, _AckEliciting, #state{hs = #hs{dgram = {_, _, _, _}}}) -> false;
+pad_initial_in_packet(server, AckEliciting, _State) -> AckEliciting.
 
 %% Inside a coalescing pass a long-header packet goes into the shared
 %% datagram instead of out on its own; Pad says it is an ack-eliciting
@@ -4043,7 +4055,13 @@ long_cost(Packet, Pad, {_, _, Size, Pad0}) ->
 datagram_size(Size, true) -> max(Size, 1200);
 datagram_size(Size, false) -> Size.
 
-%% Pad Initial packet to minimum 1200 bytes
+pad_initial_payload(Payload, Min) ->
+    case Min - iolist_size(Payload) of
+        PadLen when PadLen > 0 -> [Payload, <<0:PadLen/unit:8>>];
+        _ -> Payload
+    end.
+
+%% Pad a coalesced datagram to minimum 1200 bytes
 pad_initial_packet(Packet) when byte_size(Packet) >= 1200 ->
     Packet;
 pad_initial_packet(Packet) ->
@@ -4168,10 +4186,6 @@ amp_account_recv(_Data, State) ->
 %% refusals put the frames in the same per-space queue, which is what
 %% keeps a flight in order across the two.
 %%
-%% The two measure different things: the congestion window counts the
-%% protected packet, the amplification budget counts the datagram, which
-%% for a short Initial is larger because it is brought to 1200 bytes
-%% outside the packet.
 -spec gate(
     quic_loss:space(), boolean(), non_neg_integer(), iodata(), iodata(), [term()], #state{}
 ) ->
