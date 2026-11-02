@@ -213,16 +213,37 @@ derived_token_matches_the_listener_test() ->
 reset_token_lookup_test() ->
     Token = crypto:strong_rand_bytes(16),
     Pool = quic_cid:record_initial_reset_token(peer_pool(), Token),
-    ?assertEqual({ok, ?PEER_SCID}, quic_cid:find_reset_token_match(Pool, Token)),
+    ?assertEqual({ok, ?PEER_SCID}, quic_cid:find_reset_token_match(Pool, ?PEER_SCID, Token)),
     ?assertEqual(
-        not_found, quic_cid:find_reset_token_match(Pool, crypto:strong_rand_bytes(16))
+        not_found, quic_cid:find_reset_token_match(Pool, ?PEER_SCID, crypto:strong_rand_bytes(16))
     ).
 
 %% An entry without a token is skipped rather than crashing the comparison.
 tokenless_entry_is_skipped_test() ->
     ?assertEqual(
-        not_found, quic_cid:find_reset_token_match(peer_pool(), crypto:strong_rand_bytes(16))
+        not_found,
+        quic_cid:find_reset_token_match(peer_pool(), ?PEER_SCID, crypto:strong_rand_bytes(16))
     ).
+
+%% RFC 9000 Section 10.3.1: tokens of CIDs never used, or retired, are not
+%% checked.
+unused_cid_token_is_not_checked_test() ->
+    Token = crypto:strong_rand_bytes(16),
+    {ok, Pool, []} = quic_cid:add_peer_cid(peer_pool(), 1, 0, <<1:64>>, Token),
+    ?assertEqual(not_found, quic_cid:find_reset_token_match(Pool, ?PEER_SCID, Token)),
+    ?assertEqual({ok, <<1:64>>}, quic_cid:find_reset_token_match(Pool, <<1:64>>, Token)).
+
+bound_cid_token_is_checked_test() ->
+    Token = crypto:strong_rand_bytes(16),
+    {ok, Pool1, []} = quic_cid:add_peer_cid(peer_pool(), 1, 0, <<1:64>>, Token),
+    {ok, Pool2, _, _} = quic_cid:bind_peer_cid(Pool1, path_a, ?PEER_SCID),
+    ?assertEqual({ok, <<1:64>>}, quic_cid:find_reset_token_match(Pool2, ?PEER_SCID, Token)).
+
+retired_cid_token_is_not_checked_test() ->
+    Token = crypto:strong_rand_bytes(16),
+    {ok, Pool1, []} = quic_cid:add_peer_cid(peer_pool(), 1, 0, <<1:64>>, Token),
+    {ok, Pool2, _} = quic_cid:add_peer_cid(Pool1, 2, 2, <<2:64>>, undefined),
+    ?assertEqual(not_found, quic_cid:find_reset_token_match(Pool2, <<1:64>>, Token)).
 
 %%====================================================================
 %% Helpers
