@@ -11723,17 +11723,7 @@ initiate_close(Reason, #state{mig = #mig{path_validation_timer = PathTimer}} = S
             path_validation_timer = undefined, path_validation_token = undefined
         }
     },
-    %% Send CONNECTION_CLOSE frame
-    {ErrorCode, ReasonPhrase} =
-        case Reason of
-            normal ->
-                {?QUIC_NO_ERROR, <<>>};
-            {app_error, Code, Phrase} when is_integer(Code), is_binary(Phrase) ->
-                {Code, Phrase};
-            _ ->
-                {?QUIC_APPLICATION_ERROR, <<>>}
-        end,
-    CloseFrame = {connection_close, application, ErrorCode, undefined, ReasonPhrase},
+    CloseFrame = local_close_frame(Reason),
     case State1#state.app_keys of
         undefined ->
             handshake_close(State1#state{close_reason = Reason});
@@ -11758,6 +11748,15 @@ handshake_close(#state{cfg = #conn_cfg{role = Role}, hs = HS} = State) ->
             client -> lists:sublist(Levels, 1)
         end,
     lists:foldl(fun(Level, S) -> emit_close_at_level(Level, CloseFrame, S) end, State, Send).
+
+%% A close without an application error code is APPLICATION_ERROR, a
+%% transport code, so it goes in a 0x1c frame (RFC 9000 Section 20.1).
+local_close_frame(normal) ->
+    {connection_close, application, ?QUIC_NO_ERROR, undefined, <<>>};
+local_close_frame({app_error, Code, Phrase}) when is_integer(Code), is_binary(Phrase) ->
+    {connection_close, application, Code, undefined, Phrase};
+local_close_frame(_) ->
+    {connection_close, transport, ?QUIC_APPLICATION_ERROR, 0, <<>>}.
 
 %% Send PROTOCOL_VIOLATION transport error (RFC 9000)
 %% Used when a peer violates the protocol (e.g., RFC 9221 datagram violations)
@@ -11813,20 +11812,12 @@ send_connection_close(_Reason, #state{app_keys = undefined} = State) ->
     %% No app keys yet, can't send encrypted close frame
     State;
 send_connection_close(Reason, State) ->
-    {ErrorCode, ReasonPhrase} =
+    CloseFrame =
         case Reason of
-            normal ->
-                {?QUIC_NO_ERROR, <<>>};
-            shutdown ->
-                {?QUIC_NO_ERROR, <<>>};
-            {shutdown, _} ->
-                {?QUIC_NO_ERROR, <<>>};
-            {app_error, Code, Phrase} when is_integer(Code), is_binary(Phrase) ->
-                {Code, Phrase};
-            _ ->
-                {?QUIC_APPLICATION_ERROR, <<>>}
+            shutdown -> local_close_frame(normal);
+            {shutdown, _} -> local_close_frame(normal);
+            _ -> local_close_frame(Reason)
         end,
-    CloseFrame = {connection_close, application, ErrorCode, undefined, ReasonPhrase},
     %% Best effort send - ignore errors since we're terminating anyway.
     %% Return the updated state: it carries the batched close packet, and
     %% the caller must flush that socket_state for the frame to reach the
