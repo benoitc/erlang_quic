@@ -54,7 +54,7 @@
 
     %% Stateless reset
     generate_reset_token/2,
-    find_reset_token_match/2
+    find_reset_token_match/3
 ]).
 
 -export_type([pool/0]).
@@ -345,9 +345,16 @@ generate_reset_token(CID, Secret) when is_binary(Secret), byte_size(Secret) >= 3
 %% @doc Match a packet's trailing bytes against the reset tokens the peer
 %% gave us. Compared in constant time: the tokens are secret
 %% (RFC 9000 Section 10.3.1), so avoid a byte-position timing oracle.
--spec find_reset_token_match(pool(), binary()) -> {ok, binary()} | not_found.
-find_reset_token_match(#cid_pool_state{peer = Peer}, Token) ->
-    match_token(Peer, Token).
+%% Only CIDs in use count: the current one and those bound to a path, never
+%% one unused or retired (RFC 9000 Section 10.3.1).
+-spec find_reset_token_match(pool(), binary(), binary()) -> {ok, binary()} | not_found.
+find_reset_token_match(#cid_pool_state{peer = Peer}, CurrentDCID, Token) ->
+    Used = [
+        E
+     || #cid_entry{cid = CID, status = active, bound_to = Path} = E <- Peer,
+        CID =:= CurrentDCID orelse Path =/= undefined
+    ],
+    match_token(Used, Token).
 
 match_token([], _Token) ->
     not_found;

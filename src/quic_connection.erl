@@ -5479,14 +5479,14 @@ requeue_early_data(Packets, State) ->
 check_stateless_reset(Data, _State) when byte_size(Data) < 21 ->
     %% Packet too small to be a stateless reset
     {error, decryption_failed};
-check_stateless_reset(Data, #state{cid_pool_state = Pool} = _State) ->
+check_stateless_reset(Data, #state{cid_pool_state = Pool, dcid = DCID}) ->
     %% Extract the last 16 bytes as potential reset token
     DataSize = byte_size(Data),
     TokenOffset = DataSize - 16,
     <<_:TokenOffset/binary, PotentialToken:16/binary>> = Data,
 
     %% Check against known reset tokens from peer's CIDs
-    case quic_cid:find_reset_token_match(Pool, PotentialToken) of
+    case quic_cid:find_reset_token_match(Pool, DCID, PotentialToken) of
         {ok, _CID} ->
             %% This is a stateless reset - signal connection termination
             {error, stateless_reset};
