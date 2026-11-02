@@ -3122,9 +3122,9 @@ send_new_session_ticket(
 
 %% RFC 9002 Section 2: a packet is in flight when it is ack-eliciting or
 %% carries PADDING. ACK and CONNECTION_CLOSE are neither, so an ACK-only
-%% Initial is not in flight and must not arm a probe. Initial datagrams
-%% are brought to 1200 bytes after protection, which is datagram padding
-%% and not PADDING frames, so only the in-payload padding counts.
+%% Initial is not in flight and must not arm a probe. The PADDING that
+%% brings an Initial to 1200 bytes does not count: an ACK-only packet
+%% is not acknowledged on its own, so its bytes would stay in flight.
 -spec packet_flags([term()], boolean()) -> {boolean(), boolean()}.
 packet_flags(Frames, Padded) ->
     AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames),
@@ -3308,8 +3308,12 @@ send_initial_packet(Payload, Frames, State) ->
     TokenLen = byte_size(RetryToken),
     TokenLenEnc = quic_varint:encode(TokenLen),
 
-    %% Pad payload if needed for header protection sampling
-    PaddedPayload = pad_for_header_protection(Payload),
+    %% RFC 9000 Section 14.1: PADDING frames bring the packet to 1200
+    %% bytes. Fixed is everything before the Length field, whose varint
+    %% is two bytes at this size.
+    Fixed = 7 + byte_size(DCID) + byte_size(SCID) + byte_size(TokenLenEnc) + TokenLen,
+    HPPayload = pad_for_header_protection(Payload),
+    PaddedPayload = pad_initial_payload(HPPayload, 1200 - Fixed - 2 - PNLen - 16),
 
     %% Build header prefix (without packet number)
     HeaderBody = <<
@@ -3337,26 +3341,20 @@ send_initial_packet(Payload, Frames, State) ->
         Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
 
-    %% Pad Initial packets to at least 1200 bytes
-    PaddedPacket = pad_initial_packet(Packet),
-
-    %% Congestion control counts the protected packet; the amplification
-    %% budget counts the datagram, which for a short Initial is larger
-    %% because it is brought to 1200 bytes outside the packet.
-    Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
+    Padded = iolist_size(HPPayload) > iolist_size(Payload),
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
     Meta = {initial, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
-    case gate(initial, InFlight, byte_size(Packet), PaddedPacket, Payload, Frames, State) of
+    case gate(initial, InFlight, byte_size(Packet), Packet, Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
-            State1 = emit(PaddedPacket, Meta, Admitted),
+            State1 = emit(Packet, Meta, Admitted),
 
             %% Emit qlog packet_sent event
             quic_qlog:packet_sent((State#state.cfg)#conn_cfg.qlog_ctx, #{
                 packet_type => initial,
                 packet_number => PN,
-                length => byte_size(PaddedPacket)
+                length => byte_size(Packet)
             }),
 
             %% Update packet number space and packet counter
@@ -3884,12 +3882,11 @@ send_app_packet_internal_error(Reason, PN, PacketSize, PNSpace, State, ClearedSo
             }
     end.
 
-%% Pad Initial packet to minimum 1200 bytes
-pad_initial_packet(Packet) when byte_size(Packet) >= 1200 ->
-    Packet;
-pad_initial_packet(Packet) ->
-    PadLen = 1200 - byte_size(Packet),
-    <<Packet/binary, 0:PadLen/unit:8>>.
+pad_initial_payload(Payload, Min) ->
+    case Min - iolist_size(Payload) of
+        PadLen when PadLen > 0 -> [Payload, <<0:PadLen/unit:8>>];
+        _ -> Payload
+    end.
 
 %% Pad payload if needed for header protection sampling.
 %% Header protection requires a 16-byte sample from the encrypted payload.
@@ -3988,10 +3985,6 @@ amp_account_recv(_Data, State) ->
 %% refusals put the frames in the same per-space queue, which is what
 %% keeps a flight in order across the two.
 %%
-%% The two measure different things: the congestion window counts the
-%% protected packet, the amplification budget counts the datagram, which
-%% for a short Initial is larger because it is brought to 1200 bytes
-%% outside the packet.
 -spec gate(
     quic_loss:space(), boolean(), non_neg_integer(), iodata(), iodata(), [term()], #state{}
 ) ->
