@@ -595,8 +595,12 @@
 %% of the peer's CIDs we retain, and the peer's bounds how many of ours we
 %% issue (RFC 9000 Section 5.1.1).
 -record(cid_pool_state, {
-    %% CIDs we issued to the peer, newest first, including our sequence 0
+    %% CIDs we issued to the peer and it has not retired, newest first,
+    %% including our sequence 0
     local = [] :: [#cid_entry{}],
+
+    %% Sequence number of the next CID we issue
+    next_local_seq = 0 :: non_neg_integer(),
 
     %% CIDs the peer issued to us, newest first, including its sequence 0
     peer = [] :: [#cid_entry{}],

@@ -191,6 +191,24 @@ retire_local_returns_the_cid_test() ->
     ),
     ?assertEqual({ok, retired_pool(Pool1, Seq), CID}, quic_cid:retire_local(Pool1, Seq)).
 
+%% A peer that keeps retiring keeps us issuing; the retired entries are
+%% dropped, so the pool stays at the peer's limit.
+retired_local_cids_are_dropped_test() ->
+    Pool0 = quic_cid:set_peer_active_limit(quic_cid:new(?OUR_SCID, 2), 2),
+    {Pool1, _} = quic_cid:issue(Pool0, 1, undefined),
+    Pool = lists:foldl(fun retire_and_replenish/2, Pool1, lists:seq(0, 99)),
+    ?assertEqual(
+        [101, 100], [S || #cid_entry{seq_num = S} <- quic_cid:local_entries(Pool)]
+    ).
+
+%% Retiring the newest CID does not hand its sequence number out again.
+sequence_numbers_are_not_reused_test() ->
+    Pool0 = quic_cid:set_peer_active_limit(quic_cid:new(?OUR_SCID, 2), 3),
+    {Pool1, _} = quic_cid:issue(Pool0, 1, undefined),
+    Pool2 = retired_pool(Pool1, 1),
+    {_Pool3, Issued} = quic_cid:issue(Pool2, 1, undefined),
+    ?assertMatch([{2, _, _}], Issued).
+
 %%====================================================================
 %% Reset tokens
 %%====================================================================
@@ -238,3 +256,8 @@ retired_pool(Pool, Seq) ->
     Retired.
 
 drop_pool({ok, _Pool, Seq}) -> {ok, Seq}.
+
+retire_and_replenish(Seq, Pool0) ->
+    Pool1 = retired_pool(Pool0, Seq),
+    {Pool, _} = quic_cid:issue(Pool1, quic_cid:replenish_needed(Pool1), undefined),
+    Pool.
