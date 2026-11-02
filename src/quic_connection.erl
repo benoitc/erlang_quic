@@ -9380,10 +9380,11 @@ do_send_zero_rtt_data(
             ),
 
             %% Update stream state and track early data sent
+            %% send_done waits for the FIN's ACK (settle_fin_ack/2), as on
+            %% the 1-RTT path: lost 0-RTT data is retransmitted until then.
             NewStreamState = StreamState#stream_state{
                 send_offset = Offset + byte_size(DataBin),
-                send_fin = Fin,
-                send_done = Fin orelse StreamState#stream_state.send_done
+                send_fin = Fin
             },
             EarlyDataSent = (State#state.hs)#hs.early_data_sent + byte_size(DataBin),
             NewZeroRttIds = sets:add_element(
