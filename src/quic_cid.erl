@@ -70,6 +70,7 @@
 new(SCID, LocalActiveLimit) ->
     #cid_pool_state{
         local = [#cid_entry{seq_num = 0, cid = SCID, status = active}],
+        next_local_seq = 1,
         peer = [],
         local_active_limit = LocalActiveLimit
     }.
@@ -122,31 +123,24 @@ issue(Pool, N, ResetSecret, Acc) when N > 0 ->
 %% carries, as the next sequence number.
 -spec issue_cid(pool(), binary(), binary() | undefined) ->
     {pool(), non_neg_integer(), binary()}.
-issue_cid(#cid_pool_state{local = Local} = Pool, CID, ResetSecret) ->
-    SeqNum = next_seq(Local),
+issue_cid(#cid_pool_state{local = Local, next_local_seq = SeqNum} = Pool, CID, ResetSecret) ->
     Token = generate_reset_token(CID, ResetSecret),
     Entry = #cid_entry{
         seq_num = SeqNum, cid = CID, stateless_reset_token = Token, status = active
     },
-    {Pool#cid_pool_state{local = [Entry | Local]}, SeqNum, Token}.
+    {Pool#cid_pool_state{local = [Entry | Local], next_local_seq = SeqNum + 1}, SeqNum, Token}.
 
 %% @doc Retire a CID we issued, returning it so the caller can drop it from
 %% the listener's routing table. A sequence we never issued is a protocol
 %% violation the caller reports (RFC 9000 Section 19.16).
 -spec retire_local(pool(), non_neg_integer()) ->
     {ok, pool(), binary()} | {ok, pool(), undefined} | {error, unissued}.
+retire_local(#cid_pool_state{next_local_seq = Next}, SeqNum) when SeqNum >= Next ->
+    {error, unissued};
 retire_local(#cid_pool_state{local = Local} = Pool, SeqNum) ->
-    case SeqNum >= next_seq(Local) of
-        true ->
-            {error, unissued};
-        false ->
-            Retired = [retire_matching(SeqNum, E) || E <- Local],
-            CID =
-                case lists:keyfind(SeqNum, #cid_entry.seq_num, Local) of
-                    #cid_entry{cid = C} -> C;
-                    false -> undefined
-                end,
-            {ok, Pool#cid_pool_state{local = Retired}, CID}
+    case lists:keytake(SeqNum, #cid_entry.seq_num, Local) of
+        {value, #cid_entry{cid = CID}, Rest} -> {ok, Pool#cid_pool_state{local = Rest}, CID};
+        false -> {ok, Pool, undefined}
     end.
 
 %% @doc The limit we advertise, which bounds how many of the peer's CIDs
@@ -366,9 +360,6 @@ match_token([#cid_entry{stateless_reset_token = Known, cid = CID} | Rest], Token
 %% The pool is the only place a sequence number lives, so issuance and the
 %% unissued check cannot drift apart. The pool always holds sequence 0 from
 %% init, so the empty clause is defensive.
-next_seq([]) -> 0;
-next_seq(Entries) -> lists:max([E#cid_entry.seq_num || E <- Entries]) + 1.
-
 active_count(Entries) ->
     length([E || #cid_entry{status = active} = E <- Entries]).
 
