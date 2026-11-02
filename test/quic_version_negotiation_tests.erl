@@ -68,6 +68,23 @@ foreign_cid_is_discarded() ->
         gen_udp:close(Sock)
     end.
 
+%% The Source Connection ID echoes the Destination Connection ID of the
+%% Initial (RFC 9000 Section 17.2.1); one that does not was not sent in
+%% response to it.
+foreign_scid_is_discarded_test_() ->
+    {timeout, 30, fun foreign_scid_is_discarded/0}.
+
+foreign_scid_is_discarded() ->
+    {ok, Sock, Port} = fake_server(),
+    try
+        {ok, Conn} = connect(Port),
+        {Peer, _DCID, SCID} = recv_initial(Sock),
+        send_vn(Sock, Peer, SCID, crypto:strong_rand_bytes(8), ?OTHER_VERSIONS),
+        ?assertEqual(no_close, wait_close(Conn, 1000))
+    after
+        gen_udp:close(Sock)
+    end.
+
 %%====================================================================
 %% Helpers
 %%====================================================================
