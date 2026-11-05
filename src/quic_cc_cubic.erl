@@ -848,7 +848,9 @@ on_persistent_congestion(#cubic_state{cwnd = Cwnd, minimum_window = MinimumWindo
 
 %% @doc Update pacing rate based on smoothed RTT.
 -spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
-update_pacing_rate(#cubic_state{cwnd = Cwnd} = State, SmoothedRTT) when SmoothedRTT > 0 ->
+update_pacing_rate(#cubic_state{cwnd = Cwnd} = State, SmoothedRTT0) ->
+    %% RTT samples are whole milliseconds; a sub-millisecond link reads 0.
+    SmoothedRTT = max(1, SmoothedRTT0),
     %% pacing_rate stored as milli-bytes per microsecond for precision with us timestamps
     %% Formula: (cwnd * 1.25 * 1000) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
     PacingRate = max(1, (Cwnd * 1250) div (SmoothedRTT * 1000)),
@@ -858,10 +860,15 @@ update_pacing_rate(#cubic_state{cwnd = Cwnd} = State, SmoothedRTT) when Smoothed
 
     State1#cubic_state{
         pacing_rate = PacingRate,
+        pacing_max_burst = pacing_max_burst(State1#cubic_state.max_datagram_size, PacingRate),
         smoothed_rtt = SmoothedRTT
-    };
-update_pacing_rate(State, _SmoothedRTT) ->
-    State.
+    }.
+
+%% Two milliseconds at the paced rate, floored at 12 packets: pacing
+%% wakeups have about 1 ms resolution, so a fixed 12-packet bucket caps
+%% throughput whenever the pacing timer is the only wakeup.
+pacing_max_burst(MDS, PacingRate) ->
+    max(12 * MDS, 2 * PacingRate).
 
 %% @private Update HyStart++ RTT samples
 update_hystart_rtt(
@@ -1002,7 +1009,7 @@ update_mtu(#cubic_state{max_datagram_size = OldMDS} = State, NewMTU) when NewMTU
     State;
 update_mtu(#cubic_state{max_datagram_size = OldMDS, minimum_window = OldMinWin} = State, NewMTU) ->
     NewMinimumWindow = max(2 * NewMTU, (OldMinWin * NewMTU) div OldMDS),
-    NewPacingMaxBurst = 12 * NewMTU,
+    NewPacingMaxBurst = pacing_max_burst(NewMTU, State#cubic_state.pacing_rate),
 
     ?LOG_DEBUG(
         #{
