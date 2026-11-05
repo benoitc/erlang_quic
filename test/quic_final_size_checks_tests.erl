@@ -27,7 +27,9 @@ reset_above_limit_test() ->
     ).
 
 fin_below_received_test() ->
-    ?assertEqual(final_size_error, close({stream, ?STREAM, 40, <<"x">>, true})).
+    ?assertMatch(
+        {transport, ?QUIC_FINAL_SIZE_ERROR, _}, close({stream, ?STREAM, 40, <<"x">>, true})
+    ).
 
 reset_at_received_test() ->
     ?assertEqual(undefined, close({reset_stream, ?STREAM, 0, 100})).

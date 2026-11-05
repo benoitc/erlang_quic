@@ -6071,7 +6071,14 @@ process_frame(app, {max_data, MaxData}, #state{max_data_remote = Current} = Stat
 process_frame(Level, {max_data, _}, State) when Level =/= app ->
     %% Protocol violation: MAX_DATA only allowed in 1-RTT packets
     ?LOG_WARNING(#{what => invalid_max_data_level, level => Level}, ?QUIC_LOG_META),
-    State#state{close_reason = {protocol_violation, max_data_wrong_level}};
+    close_with_error(
+        Level,
+        transport,
+        ?QUIC_PROTOCOL_VIOLATION,
+        ?FRAME_MAX_DATA,
+        <<"MAX_DATA outside 1-RTT">>,
+        State
+    );
 %% MAX_STREAM_DATA: Peer is increasing stream-level flow control limit
 %% RFC 9000 Section 19.10: MAX_STREAM_DATA is only allowed in 1-RTT packets
 process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Streams} = State) ->
@@ -6113,7 +6120,14 @@ process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Stream
 process_frame(Level, {max_stream_data, _, _}, State) when Level =/= app ->
     %% Protocol violation: MAX_STREAM_DATA only allowed in 1-RTT packets
     ?LOG_WARNING(#{what => invalid_max_stream_data_level, level => Level}, ?QUIC_LOG_META),
-    State#state{close_reason = {protocol_violation, max_stream_data_wrong_level}};
+    close_with_error(
+        Level,
+        transport,
+        ?QUIC_PROTOCOL_VIOLATION,
+        ?FRAME_MAX_STREAM_DATA,
+        <<"MAX_STREAM_DATA outside 1-RTT">>,
+        State
+    );
 %% RFC 9000 Section 4.6: a stream count above 2^60 allows stream IDs no
 %% varint can carry.
 process_frame(app, {max_streams, _Dir, Count}, State) when Count > 1 bsl 60 ->
@@ -6136,10 +6150,22 @@ process_frame(app, {max_streams, uni, Max}, #state{max_streams_uni_remote = Curr
         false ->
             State
     end;
-process_frame(Level, {max_streams, _, _}, State) when Level =/= app ->
+process_frame(Level, {max_streams, Dir, _}, State) when Level =/= app ->
     %% Protocol violation: MAX_STREAMS only allowed in 1-RTT packets
     ?LOG_WARNING(#{what => invalid_max_streams_level, level => Level}, ?QUIC_LOG_META),
-    State#state{close_reason = {protocol_violation, max_streams_wrong_level}};
+    FrameType =
+        case Dir of
+            bidi -> ?FRAME_MAX_STREAMS_BIDI;
+            uni -> ?FRAME_MAX_STREAMS_UNI
+        end,
+    close_with_error(
+        Level,
+        transport,
+        ?QUIC_PROTOCOL_VIOLATION,
+        FrameType,
+        <<"MAX_STREAMS outside 1-RTT">>,
+        State
+    );
 %% PATH_CHALLENGE: Peer is probing the path, respond with PATH_RESPONSE
 %% RFC 9000 Section 8.2.2: PATH_RESPONSE MUST be sent on the path where the
 %% PATH_CHALLENGE was received (to the source address of that packet).
@@ -6205,10 +6231,9 @@ process_frame(
                 },
                 ?QUIC_LOG_META
             ),
-            CloseFrame =
-                {connection_close, transport, ?QUIC_FINAL_SIZE_ERROR, 0,
-                    <<"RESET_STREAM final size mismatch">>},
-            send_frame(CloseFrame, State#state{close_reason = final_size_error});
+            close_with_transport_error(
+                ?QUIC_FINAL_SIZE_ERROR, <<"RESET_STREAM final size mismatch">>, State
+            );
         {ok, #stream_state{recv_offset = Received, recv_highest = Highest}} when
             FinalSize < Received orelse FinalSize < Highest
         ->
@@ -6297,28 +6322,25 @@ process_frame(
     %% Validate: ReliableSize <= FinalSize (FRAME_ENCODING_ERROR per spec)
     case ReliableSize > FinalSize of
         true ->
-            CloseFrame =
-                {connection_close, transport, ?QUIC_FRAME_ENCODING_ERROR, 0,
-                    <<"RESET_STREAM_AT reliable_size > final_size">>},
-            send_frame(CloseFrame, State#state{close_reason = frame_encoding_error});
+            close_with_transport_error(
+                ?QUIC_FRAME_ENCODING_ERROR, <<"RESET_STREAM_AT reliable_size > final_size">>, State
+            );
         false ->
             case maps:find(StreamId, Streams) of
                 {ok, #stream_state{final_size = ExistingFinalSize}} when
                     ExistingFinalSize =/= undefined andalso ExistingFinalSize =/= FinalSize
                 ->
                     %% STREAM_STATE_ERROR: FinalSize changed
-                    CloseFrame =
-                        {connection_close, transport, ?QUIC_STREAM_STATE_ERROR, 0,
-                            <<"RESET_STREAM_AT final_size changed">>},
-                    send_frame(CloseFrame, State#state{close_reason = stream_state_error});
+                    close_with_transport_error(
+                        ?QUIC_STREAM_STATE_ERROR, <<"RESET_STREAM_AT final_size changed">>, State
+                    );
                 {ok, #stream_state{recv_reset_error = ExistingError}} when
                     ExistingError =/= undefined andalso ExistingError =/= ErrorCode
                 ->
                     %% STREAM_STATE_ERROR: ErrorCode changed
-                    CloseFrame =
-                        {connection_close, transport, ?QUIC_STREAM_STATE_ERROR, 0,
-                            <<"RESET_STREAM_AT error_code changed">>},
-                    send_frame(CloseFrame, State#state{close_reason = stream_state_error});
+                    close_with_transport_error(
+                        ?QUIC_STREAM_STATE_ERROR, <<"RESET_STREAM_AT error_code changed">>, State
+                    );
                 {ok, #stream_state{recv_reset_at = ExistingReliable}} when
                     ExistingReliable =/= undefined andalso ReliableSize > ExistingReliable
                 ->
@@ -6465,7 +6487,14 @@ process_frame(app, {data_blocked, _Limit}, State) ->
 process_frame(Level, {data_blocked, _}, State) when Level =/= app ->
     %% Protocol violation: DATA_BLOCKED only allowed in 1-RTT packets
     ?LOG_WARNING(#{what => invalid_data_blocked_level, level => Level}, ?QUIC_LOG_META),
-    State#state{close_reason = {protocol_violation, data_blocked_wrong_level}};
+    close_with_error(
+        Level,
+        transport,
+        ?QUIC_PROTOCOL_VIOLATION,
+        ?FRAME_DATA_BLOCKED,
+        <<"DATA_BLOCKED outside 1-RTT">>,
+        State
+    );
 %% DATAGRAM frames (RFC 9221)
 %% RFC 9221: MUST terminate with PROTOCOL_VIOLATION if receiving DATAGRAM
 %% without having advertised support (max_datagram_frame_size = 0)
@@ -8259,10 +8288,9 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                 ?QUIC_LOG_META
             ),
             %% Send FLOW_CONTROL_ERROR and close connection
-            CloseFrame =
-                {connection_close, transport, ?QUIC_FLOW_CONTROL_ERROR, 0,
-                    <<"stream flow control violation">>},
-            send_frame(CloseFrame, State#state{close_reason = stream_flow_control_error});
+            close_with_transport_error(
+                ?QUIC_FLOW_CONTROL_ERROR, <<"stream flow control violation">>, State
+            );
         {_, true, _} ->
             %% Connection-level flow control violation - RFC 9000 Section 4.1
             ?LOG_WARNING(
@@ -8274,10 +8302,9 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                 ?QUIC_LOG_META
             ),
             %% Send FLOW_CONTROL_ERROR and close connection
-            CloseFrame =
-                {connection_close, transport, ?QUIC_FLOW_CONTROL_ERROR, 0,
-                    <<"connection flow control violation">>},
-            send_frame(CloseFrame, State#state{close_reason = connection_flow_control_error});
+            close_with_transport_error(
+                ?QUIC_FLOW_CONTROL_ERROR, <<"connection flow control violation">>, State
+            );
         {_, _, true} ->
             %% Receive buffer overflow - malicious peer sending too much out-of-order data
             ?LOG_WARNING(
@@ -8291,10 +8318,7 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                 ?QUIC_LOG_META
             ),
             %% Send FLOW_CONTROL_ERROR and close connection
-            CloseFrame =
-                {connection_close, transport, ?QUIC_FLOW_CONTROL_ERROR, 0,
-                    <<"recv buffer overflow">>},
-            send_frame(CloseFrame, State#state{close_reason = recv_buffer_overflow});
+            close_with_transport_error(?QUIC_FLOW_CONTROL_ERROR, <<"recv buffer overflow">>, State);
         _ ->
             %% Flow control OK - check final size consistency before buffering
 
@@ -8319,10 +8343,9 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                         },
                         ?QUIC_LOG_META
                     ),
-                    CloseFrame =
-                        {connection_close, transport, ?QUIC_FINAL_SIZE_ERROR, 0,
-                            <<"stream data past its final size">>},
-                    send_frame(CloseFrame, State#state{close_reason = final_size_error});
+                    close_with_transport_error(
+                        ?QUIC_FINAL_SIZE_ERROR, <<"stream data past its final size">>, State
+                    );
                 false ->
                     %% Track FIN position if received
                     FinalSize =
@@ -9374,6 +9397,9 @@ check_state_transition(CurrentState, State) ->
             {next_state, draining, State};
         {application, _Code, _Reason} ->
             %% We sent an application-level CONNECTION_CLOSE; enter draining.
+            emit_qlog_state_change(CurrentState, draining, State),
+            {next_state, draining, State};
+        {tls_alert, _} ->
             emit_qlog_state_change(CurrentState, draining, State),
             {next_state, draining, State};
         _ ->
@@ -11761,13 +11787,7 @@ local_close_frame(_) ->
 %% Send PROTOCOL_VIOLATION transport error (RFC 9000)
 %% Used when a peer violates the protocol (e.g., RFC 9221 datagram violations)
 send_protocol_violation(Reason, State) ->
-    CloseFrame = {connection_close, transport, ?QUIC_PROTOCOL_VIOLATION, 0, Reason},
-    case State#state.app_keys of
-        undefined ->
-            State#state{close_reason = {protocol_violation, Reason}};
-        _ ->
-            send_frame(CloseFrame, State#state{close_reason = {protocol_violation, Reason}})
-    end.
+    close_with_transport_error(?QUIC_PROTOCOL_VIOLATION, Reason, State).
 
 %% Emit CONNECTION_CLOSE at the requested encryption level.
 %% Picks the right keys (initial/handshake/app) and encodes the frame in a
