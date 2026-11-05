@@ -1899,25 +1899,23 @@ convert_public_key_for_verify(
         subjectPublicKey = #'ECPoint'{point = ECPoint}
     },
     Algorithm
-) when
-    Algorithm =:= ?SIG_ECDSA_SECP256R1_SHA256;
-    Algorithm =:= ?SIG_ECDSA_SECP384R1_SHA384
-->
-    %% ECDSA: [ECPoint, NamedCurve]
-    Curve =
-        case Params of
-            {namedCurve, ?'secp256r1'} -> secp256r1;
-            {namedCurve, ?'secp384r1'} -> secp384r1;
-            _ -> secp256r1
-        end,
-    {ok, [ECPoint, Curve]};
+) ->
+    case {Params, Algorithm} of
+        {{namedCurve, ?'secp256r1'}, ?SIG_ECDSA_SECP256R1_SHA256} -> {ok, [ECPoint, secp256r1]};
+        {{namedCurve, ?'secp384r1'}, ?SIG_ECDSA_SECP384R1_SHA384} -> {ok, [ECPoint, secp384r1]};
+        _ -> {error, unsupported_key_type}
+    end;
 convert_public_key_for_verify(
     #'OTPSubjectPublicKeyInfo'{
         algorithm = #'PublicKeyAlgorithm'{algorithm = ?'rsaEncryption'},
         subjectPublicKey = #'RSAPublicKey'{modulus = N, publicExponent = E}
     },
-    _Algorithm
-) ->
+    Algorithm
+) when
+    Algorithm =:= ?SIG_RSA_PSS_RSAE_SHA256;
+    Algorithm =:= ?SIG_RSA_PSS_RSAE_SHA384;
+    Algorithm =:= ?SIG_RSA_PSS_RSAE_SHA512
+->
     %% RSA: [E, N]
     {ok, [E, N]};
 convert_public_key_for_verify(
