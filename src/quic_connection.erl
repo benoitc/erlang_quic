@@ -1361,8 +1361,8 @@ idle({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {idle, state_to_map(State)}}]};
 idle({call, From}, peername, #state{remote_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
-idle({call, From}, sockname, #state{cfg = #conn_cfg{local_addr = Addr}} = State) ->
-    {keep_state, State, [{reply, From, {ok, Addr}}]};
+idle({call, From}, sockname, State) ->
+    {keep_state, State, [{reply, From, {ok, current_sockname(State)}}]};
 idle({call, From}, {set_owner, NewOwner}, State) ->
     {keep_state, reown(State, NewOwner), [{reply, From, ok}]};
 idle(cast, {set_owner, NewOwner}, State) ->
@@ -1468,8 +1468,8 @@ handshaking({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {handshaking, state_to_map(State)}}]};
 handshaking({call, From}, peername, #state{remote_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
-handshaking({call, From}, sockname, #state{cfg = #conn_cfg{local_addr = Addr}} = State) ->
-    {keep_state, State, [{reply, From, {ok, Addr}}]};
+handshaking({call, From}, sockname, State) ->
+    {keep_state, State, [{reply, From, {ok, current_sockname(State)}}]};
 handshaking({call, From}, {set_owner, NewOwner}, State) ->
     {keep_state, reown(State, NewOwner), [{reply, From, ok}]};
 handshaking(cast, {set_owner, NewOwner}, State) ->
@@ -1655,8 +1655,8 @@ connected({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {connected, state_to_map(State)}}]};
 connected({call, From}, peername, #state{remote_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
-connected({call, From}, sockname, #state{cfg = #conn_cfg{local_addr = Addr}} = State) ->
-    {keep_state, State, [{reply, From, {ok, Addr}}]};
+connected({call, From}, sockname, State) ->
+    {keep_state, State, [{reply, From, {ok, current_sockname(State)}}]};
 connected({call, From}, peercert, #state{hs = #hs{peer_cert = undefined}} = State) ->
     {keep_state, State, [{reply, From, {error, no_peercert}}]};
 connected({call, From}, peercert, #state{hs = #hs{peer_cert = Cert}} = State) ->
@@ -11661,6 +11661,15 @@ set_idle_timer(
 %% socket handle ({'$socket', Ref}). inet:sockname/1 only accepts
 %% the gen_udp port shape, socket:sockname/1 the other. Returns
 %% undefined if neither succeeds.
+%% The address the connection sends from now. Read from the socket, since
+%% a migration rebinds it and an OTP socket binds on its first send; the
+%% address seen at connect time answers when the socket cannot.
+current_sockname(#state{socket = Socket, cfg = #conn_cfg{local_addr = Initial}}) ->
+    case query_local_addr(Socket) of
+        {_, Port} = Addr when Port =/= 0 -> Addr;
+        _ -> Initial
+    end.
+
 query_local_addr(Ref) when is_reference(Ref) ->
     %% Adapter backend: no real socket, no kernel-known sockname.
     undefined;

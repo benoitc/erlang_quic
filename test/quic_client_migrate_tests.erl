@@ -58,7 +58,11 @@ do_migrate(ServerExtra, Host) ->
             %% (RFC 9000 Section 9.5), and the peer's arrives just
             %% after `connected'.
             ?assert(quic_connection_test_support:await_spare_cid(Conn, 5000)),
+            {ok, {_, OldPort}} = quic:sockname(Conn),
             ?assertEqual(ok, quic:migrate(Conn)),
+            %% sockname follows the rebound socket.
+            {ok, {_, NewPort}} = quic:sockname(Conn),
+            ?assertNotEqual(OldPort, NewPort),
             {ok, StreamId} = quic:open_stream(Conn),
             Payload = crypto:strong_rand_bytes(4096),
             ok = quic:send_data(Conn, StreamId, Payload, true),
