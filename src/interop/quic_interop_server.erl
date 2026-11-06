@@ -159,18 +159,25 @@ run_hq_server(TestCase, Port, CertDer, PrivateKey, WwwDir) ->
     Opts = build_server_opts(TestCase, CertDer, PrivateKey, WwwDir),
 
     %% The runner gives the ipv6 case TESTCASE=transfer, so every case
-    %% listens on both families.
+    %% also listens on IPv6 when the host has it.
     V6Opts = Opts#{extra_socket_opts => [inet6, {ipv6_v6only, true}]},
-    case {quic_listener:start_link(Port, Opts), quic_listener:start_link(Port, V6Opts)} of
-        {{ok, Listener}, {ok, Listener6}} ->
+    case quic_listener:start_link(Port, Opts) of
+        {ok, Listener} ->
+            Listener6 =
+                case quic_listener:start_link(Port, V6Opts) of
+                    {ok, L6} ->
+                        [L6];
+                    {error, V6Reason} ->
+                        io:format("No IPv6 listener: ~p~n", [V6Reason]),
+                        []
+                end,
             warm_up(Port),
             io:format("Server listening on port ~p~n", [Port]),
 
             %% Wait forever (or until killed)
             receive
                 stop ->
-                    quic_listener:stop(Listener),
-                    quic_listener:stop(Listener6),
+                    lists:foreach(fun quic_listener:stop/1, [Listener | Listener6]),
                     halt(?EXIT_SUCCESS)
             end;
         Failed ->
