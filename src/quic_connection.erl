@@ -12841,8 +12841,16 @@ answer_probe_on_new_path(Addr, ResponseData, #state{current_packet_via = Via} = 
             ]
         of
             [#path_state{dcid = D, dcid_seq = Q} | _] -> {State0, D, Q};
-            [] -> path_cid_for(Addr, false, State0)
+            [] -> probe_cid_for(Addr, Via, State0)
         end,
+    answer_probe_on_new_path(Addr, Via, ResponseData, State, DCID, Seq).
+
+%% RFC 9000 Section 9.5: a CID is never used from two local addresses, so
+%% a probe on another of our sockets needs an unused CID or goes
+%% unanswered.
+answer_probe_on_new_path(_Addr, _Via, _ResponseData, State, none, _Seq) ->
+    State;
+answer_probe_on_new_path(Addr, Via, ResponseData, State, DCID, Seq) ->
     ChallengeData = crypto:strong_rand_bytes(8),
     Path = #path_state{
         remote_addr = Addr,
@@ -12865,6 +12873,17 @@ answer_probe_on_new_path(Addr, ResponseData, #state{current_packet_via = Via} = 
         [{path_response, ResponseData}, {path_challenge, ChallengeData}],
         State1
     ).
+
+probe_cid_for(Addr, Via, State) ->
+    case Via =:= current_via(State) of
+        true ->
+            path_cid_for(Addr, false, State);
+        false ->
+            case bind_path_cid(Addr, State) of
+                {ok, State1, DCID, Seq} -> {State1, DCID, Seq};
+                none -> {State, none, undefined}
+            end
+    end.
 
 alt_paths(#state{mig = #mig{alt_paths = Paths}}) -> Paths.
 
@@ -13227,7 +13246,8 @@ maybe_handle_address_change(NewAddr, DataSize, State) ->
 %% new path too.
 maybe_handle_path_change(Via, NewAddr, DataSize, State) ->
     Probed = lists:any(fun(P) -> is_path(NewAddr, Via, P) end, alt_paths(State)),
-    case Probed orelse has_unused_cid(State) orelse kept_its_cid(State) of
+    KeptCID = Via =:= current_via(State) andalso kept_its_cid(State),
+    case Probed orelse has_unused_cid(State) orelse KeptCID of
         true -> initiate_peer_path_validation(NewAddr, Via, false, DataSize, State);
         false -> State
     end.
@@ -13303,14 +13323,23 @@ initiate_peer_path_validation(NewAddr, Via, IsNATRebinding, DataSize, State0) ->
     %% A genuine migration takes a CID of its own; a NAT rebinding keeps the
     %% one in use, which Section 9.5 permits for an unintentional change.
     %% A path the peer probed first already has one.
-    {State, NewDCID, NewSeq} =
-        case lists:partition(fun(P) -> is_path(NewAddr, Via, P) end, alt_paths(State0)) of
-            {[#path_state{dcid = D, dcid_seq = Q} | _], Others} when D =/= undefined ->
-                {State0#state{mig = (State0#state.mig)#mig{alt_paths = Others}}, D, Q};
-            _ ->
-                path_cid_for(NewAddr, IsNATRebinding, State0)
-        end,
+    CurrentVia = current_via(State0),
+    case lists:partition(fun(P) -> is_path(NewAddr, Via, P) end, alt_paths(State0)) of
+        {[#path_state{status = validated, dcid = D} = Probed | _], Others} when
+            D =/= undefined, Via =/= CurrentVia
+        ->
+            %% The peer already answered our challenge on this path.
+            State1 = State0#state{mig = (State0#state.mig)#mig{alt_paths = Others}},
+            handle_peer_path_validated(Probed#path_state{via = Via}, State1);
+        {[#path_state{dcid = D, dcid_seq = Q} | _], Others} when D =/= undefined ->
+            State1 = State0#state{mig = (State0#state.mig)#mig{alt_paths = Others}},
+            start_peer_path_validation(NewAddr, Via, IsNATRebinding, DataSize, D, Q, State1);
+        _ ->
+            {State1, D, Q} = path_cid_for(NewAddr, IsNATRebinding, State0),
+            start_peer_path_validation(NewAddr, Via, IsNATRebinding, DataSize, D, Q, State1)
+    end.
 
+start_peer_path_validation(NewAddr, Via, IsNATRebinding, DataSize, NewDCID, NewSeq, State) ->
     %% Create path state for the new address
     NewChallengeData = crypto:strong_rand_bytes(8),
     NewPathState = #path_state{
@@ -13353,20 +13382,33 @@ initiate_peer_path_validation(NewAddr, Via, IsNATRebinding, DataSize, State0) ->
     %% (spoofing needs the connection ID, the old path is probed per
     %% §9.3.2, and a failed validation resets so the true peer's next
     %% packet re-triggers).
-    Moved = use_via(Via, State),
-    State1 = Moved#state{
-        remote_addr = NewAddr,
-        mig = (Moved#state.mig)#mig{
-            pending_peer_validation = NewPathState,
-            old_path_validation = OldPathState,
-            migration_state = validating_peer
-        }
-    },
-
-    %% Send PATH_CHALLENGE to both addresses, each under its own path's CID
-    State2 = send_path_challenge_to_addr(NewAddr, NewChallengeData, NewDCID, State1),
-    State3 = send_path_challenge_to_old_addr(OldAddr, OldChallengeData, State2),
-    start_path_validation_timer(State3).
+    case Via =:= current_via(State) of
+        true ->
+            State1 = State#state{
+                remote_addr = NewAddr,
+                mig = (State#state.mig)#mig{
+                    pending_peer_validation = NewPathState,
+                    old_path_validation = OldPathState,
+                    migration_state = validating_peer
+                }
+            },
+            %% Send PATH_CHALLENGE to both addresses, each under its own path's CID
+            State2 = send_path_challenge_to_addr(NewAddr, NewChallengeData, NewDCID, State1),
+            State3 = send_path_challenge_to_old_addr(OldAddr, OldChallengeData, State2),
+            start_path_validation_timer(State3);
+        false ->
+            %% RFC 9000 Section 9.6.2: a client moving to the preferred
+            %% address is answered from the original one until the new
+            %% path is validated; the current path needs no new check.
+            State1 = State#state{
+                mig = (State#state.mig)#mig{
+                    pending_peer_validation = NewPathState,
+                    migration_state = validating_peer
+                }
+            },
+            State2 = send_path_challenge_to_addr(NewAddr, NewChallengeData, NewDCID, State1),
+            start_path_validation_timer(State2)
+    end.
 
 %% The CID a path probes under. A NAT rebinding is the Section 9.5
 %% exception and stays on the current one; anything else binds its own.
@@ -13413,8 +13455,13 @@ send_path_challenge_to_old_addr(Addr, ChallengeData, State) ->
     #state{}
 ) -> #state{}.
 send_path_challenge_to_addr(Addr, ChallengeData, DCID, State) ->
-    %% Reuse existing send_path_challenge logic
-    State1 = send_path_challenge(Addr, ChallengeData, DCID, State),
+    %% The challenge leaves from the socket of the path it probes.
+    Via =
+        case (State#state.mig)#mig.pending_peer_validation of
+            #path_state{via = V} -> V;
+            undefined -> current_via(State)
+        end,
+    State1 = send_path_challenge(Addr, ChallengeData, DCID, Via, State),
     %% Update pending path bytes_sent for anti-amplification
     case (State1#state.mig)#mig.pending_peer_validation of
         #path_state{} = PathState ->
@@ -13599,7 +13646,7 @@ handle_peer_path_validated(PendingPath, #state{mig = #mig{path_validation_timer 
         challenge_data = undefined,
         dcid = NewDCID
     },
-    State1 = State#state{dcid = NewDCID},
+    State1 = (use_via(PendingPath#path_state.via, State))#state{dcid = NewDCID},
     %% Complete migration to the new peer address
     State2 = retire_replaced_dcid(OldDCID, NewDCID, complete_migration(ValidatedPath, State1)),
     %% Clear pending validation state including old path validation
