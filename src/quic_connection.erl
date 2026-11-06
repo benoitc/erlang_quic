@@ -8253,7 +8253,20 @@ do_process_stream_data_buffered(StreamId, Offset, Data, false = Fin, State) ->
 do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
     do_process_stream_data_slow(StreamId, Offset, Data, Fin, State).
 
+%% RFC 9000 Section 3.2: once the peer has reset a stream its data is not
+%% delivered, and its final size is already counted against connection
+%% flow control. A late STREAM frame within that size is dropped.
 do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
+    case maps:find(StreamId, State#state.streams) of
+        {ok, #stream_state{state = reset, recv_done = true, recv_reset_at = undefined, final_size = FS}} when
+            is_integer(FS), Offset + byte_size(Data) =< FS
+        ->
+            State;
+        _ ->
+            process_stream_data_slow(StreamId, Offset, Data, Fin, State)
+    end.
+
+process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
     #state{
         owner = Owner,
         streams = Streams,

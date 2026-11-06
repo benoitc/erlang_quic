@@ -31,6 +31,15 @@ releases_buffered_data_test() ->
     ?assertEqual(0, S#state.recv_buffer_bytes),
     ?assertEqual(1000, S#state.data_received).
 
+%% Data that arrives after the reset is not counted, or delivered, again.
+late_data_is_not_counted_again_test() ->
+    S0 = reset(1000, server(100)),
+    S = quic_connection:process_frame(
+        app, {stream, ?STREAM, 100, binary:copy(<<0>>, 900), false}, S0
+    ),
+    ?assertEqual(1000, S#state.data_received),
+    ?assertEqual(0, S#state.recv_buffer_bytes).
+
 reset(FinalSize, S) ->
     quic_connection:process_frame(app, {reset_stream, ?STREAM, 0, FinalSize}, S).
 
