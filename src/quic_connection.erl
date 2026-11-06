@@ -7152,7 +7152,10 @@ process_tls_message(
             %% Apply peer transport params (extracts active_connection_id_limit).
             %% Client already has handshake keys at this point, so the CLOSE
             %% (if any) can be emitted immediately.
-            State1 = maybe_emit_pending_close(apply_peer_transport_params(TP, State0)),
+            %% The idle timeout now depends on the peer's max_idle_timeout.
+            State1 = maybe_emit_pending_close(
+                set_idle_timer(apply_peer_transport_params(TP, State0))
+            ),
             %% Finalise 0-RTT bookkeeping: if the client offered 0-RTT and
             %% the server did NOT accept, reset every stream that carried
             %% 0-RTT data and notify the owner so the application protocol
@@ -7919,7 +7922,10 @@ do_server_client_hello_cont(
                     negotiated_scheme = CVScheme
                 }
             },
-            State1 = apply_peer_transport_params(peer_transport_params(ClientHelloInfo), State0b),
+            %% The idle timeout now depends on the peer's max_idle_timeout.
+            State1 = set_idle_timer(
+                apply_peer_transport_params(peer_transport_params(ClientHelloInfo), State0b)
+            ),
             State2 = send_server_hello(ServerHello, State1),
             State3 = server_handshake_flight(Cipher, TranscriptHash, State2),
             maybe_emit_pending_close(State3)

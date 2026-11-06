@@ -23,6 +23,21 @@ arms_the_peers_timeout_when_ours_is_off_test() ->
     S = quic_connection:set_idle_timer(state(0, #{max_idle_timeout => 10000}, 0)),
     ?assertNotEqual(undefined, S#state.idle_timer).
 
+%% The timer is armed again once the peer's parameters are known, so a
+%% connection with ours off still times out on the peer's.
+arms_the_peers_timeout_once_its_parameters_arrive_test() ->
+    #state{cfg = Cfg} = S0 = quic_connection_test_support:state_for_role(server),
+    S1 = S0#state{
+        dcid = <<"peer-cid">>,
+        loss_state = quic_loss:new(),
+        last_activity = erlang:monotonic_time(millisecond),
+        cfg = Cfg#conn_cfg{idle_timeout = 0}
+    },
+    ?assertEqual(undefined, (quic_connection:set_idle_timer(S1))#state.idle_timer),
+    TP = #{initial_scid => S1#state.dcid, max_idle_timeout => 10000},
+    S2 = quic_connection:set_idle_timer(quic_connection:apply_peer_transport_params(TP, S1)),
+    ?assertNotEqual(undefined, S2#state.idle_timer).
+
 fire(Local, PeerTP, Idle) ->
     Ref = make_ref(),
     quic_connection:handle_common_event(
