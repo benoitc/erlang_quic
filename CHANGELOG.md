@@ -69,6 +69,10 @@ All notable changes to this project will be documented in this file.
   no protocol agreed. With the default `alpn => [<<"h3">>]` a listener
   now turns away clients that do not offer h3.
 
+- A connection made with the `happy_eyeballs` option no longer crashes when the
+  winning connection closes before it is handed to the caller. The race
+  goes on with the other attempts.
+
 ### Changed
 - Sends queued before the connection is up share packets, for 0-RTT and
   for writes held until the handshake completes, instead of one packet

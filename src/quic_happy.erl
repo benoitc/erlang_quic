@@ -241,7 +241,8 @@ buffer_owner_msg(#{attempts := Attempts, backlog := Backlog} = St, Pid, Msg) ->
 %% coordinator and self-close on owner-DOWN when we exit below.
 on_connected(#{owner := Owner, caller := Caller, backlog := Backlog} = St, Pid, _Info) ->
     %% set_owner_sync is a gen_statem:call; a winner that died between
-    %% {connected} and here raises, and we continue the race.
+    %% {connected} and here raises, one that started closing returns an
+    %% error, and either way we continue the race.
     try quic_connection:set_owner_sync(Pid, Owner) of
         ok ->
             %% The connection handshaked while we owned it, so any peer data
@@ -253,7 +254,9 @@ on_connected(#{owner := Owner, caller := Caller, backlog := Backlog} = St, Pid, 
             [Owner ! M || M <- lists:reverse(maps:get(Pid, Backlog, []))],
             forward_quic_backlog(Pid, Owner),
             Caller ! {quic_happy_result, self(), {ok, Pid}},
-            ok
+            ok;
+        {error, Reason} ->
+            loop(drop_attempt(note_error(St, Pid, Reason), Pid))
     catch
         _:_ ->
             loop(drop_attempt(St, Pid))
