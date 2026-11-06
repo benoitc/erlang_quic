@@ -18,6 +18,15 @@ zero_length_cid_peer_is_validated_on_new_address_test() ->
         quic_connection_test_support:pending_peer_path(S1)
     ).
 
+%% Only a port change keeps the congestion state (RFC 9000 Section 9.4).
+zero_length_cid_move_is_a_migration_test() ->
+    S0 = quic_connection_test_support:server_with_peer_cid(<<>>),
+    S1 = quic_connection:maybe_handle_address_change(?NEW_ADDR, 1200, S0),
+    ?assertMatch(
+        #path_state{is_nat_rebinding = false},
+        quic_connection_test_support:pending_peer_path(S1)
+    ).
+
 peer_without_spare_cid_is_not_followed_test() ->
     S0 = quic_connection_test_support:server_with_peer_cid(<<"peer-cid">>),
     S1 = quic_connection:maybe_handle_address_change(?NEW_ADDR, 1200, S0),

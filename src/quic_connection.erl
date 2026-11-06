@@ -13046,10 +13046,10 @@ maybe_handle_address_change(NewAddr, DataSize, State) ->
             %% CID it is already using.
             initiate_peer_path_validation(NewAddr, true, DataSize, State);
         new_path when State#state.dcid =:= <<>> ->
-            %% A peer with a zero-length CID has no CIDs to rotate; its
-            %% packets are linkable across paths anyway (RFC 9000
-            %% Section 9.5), so the path keeps the empty one.
-            initiate_peer_path_validation(NewAddr, true, DataSize, State);
+            %% A peer with a zero-length CID is sent that CID on every
+            %% path (RFC 9000 Section 5.1.1). Its IP changed, so this is
+            %% a migration and not a rebinding (Section 9.4).
+            initiate_peer_path_validation(NewAddr, false, DataSize, State);
         new_path ->
             %% A genuine migration needs a CID that has not been used on
             %% another path. Without one we cannot probe, so nothing is
@@ -13058,7 +13058,7 @@ maybe_handle_address_change(NewAddr, DataSize, State) ->
             %% the current CID may stay (RFC 9000 Section 9.5).
             case {has_unused_cid(State), kept_its_cid(State)} of
                 {true, _} -> initiate_peer_path_validation(NewAddr, false, DataSize, State);
-                {false, true} -> initiate_peer_path_validation(NewAddr, true, DataSize, State);
+                {false, true} -> initiate_peer_path_validation(NewAddr, false, DataSize, State);
                 {false, false} -> State
             end
     end.

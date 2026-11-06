@@ -21,6 +21,15 @@ follows_a_peer_that_kept_its_cid_test() ->
     ?assertEqual(?NEW, S#state.remote_addr),
     ?assertEqual(<<"peer-cid">>, S#state.dcid).
 
+%% The IP changed, so congestion state is reset on validation (RFC 9000
+%% Section 9.4) even though the CID stays.
+kept_cid_move_is_a_migration_test() ->
+    S = quic_connection:maybe_handle_address_change(?NEW, 100, state(<<"own-cid0">>)),
+    ?assertMatch(
+        #path_state{is_nat_rebinding = false},
+        quic_connection_test_support:pending_peer_path(S)
+    ).
+
 stays_for_a_migration_it_cannot_probe_test() ->
     S = quic_connection:maybe_handle_address_change(?NEW, 100, state(<<"own-cid1">>)),
     ?assertEqual(?OLD, S#state.remote_addr).
