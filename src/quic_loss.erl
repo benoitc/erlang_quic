@@ -56,6 +56,7 @@
 
     %% PTO
     get_pto/2,
+    base_pto/1,
     discard_space/2,
     reset_for_retry/2,
     get_pto_time_and_space/3,
@@ -78,7 +79,14 @@
 %% Constants from RFC 9002
 -define(PACKET_THRESHOLD, 3).
 % 9/8
--define(TIME_THRESHOLD, 1.125).
+%% Time threshold as a shift: RTT + RTT bsr Shift, 3 being 9/8. A
+%% spurious time-based loss moves it to 2, 5/4 (as Chromium does).
+-define(TIME_SHIFT, 3).
+-define(MIN_TIME_SHIFT, 2).
+%% Ceiling for the packet threshold raised by observed reordering.
+-define(MAX_REORDER_THRESHOLD, 32).
+%% Lost packets remembered to recognise a late acknowledgement.
+-define(MAX_RECENT_LOST, 64).
 % 1 millisecond
 -define(MAX_PTO_MS, 5000).
 -define(GRANULARITY, 1).
@@ -109,7 +117,20 @@
     %% When the most recent ack-eliciting packet went out, which is what
     %% the PTO deadline is measured from, and how many are outstanding.
     last_ae_sent = undefined :: integer() | undefined,
-    ae_in_flight = 0 :: non_neg_integer()
+    ae_in_flight = 0 :: non_neg_integer(),
+
+    %% Reordering (RFC 9002 Section 6.1: both thresholds may adapt). A
+    %% packet declared lost and acknowledged later was only reordered: the
+    %% packet threshold rises to the distance seen, the time threshold to
+    %% 5/4 RTT if time declared it.
+    reorder_threshold = ?PACKET_THRESHOLD :: pos_integer(),
+    time_shift = ?TIME_SHIFT :: pos_integer(),
+    %% Ack-eliciting packets declared lost, newest first, as
+    %% {PN, DeclaredAt, packet | time}, kept about two RTTs.
+    recent_lost = [] :: [{non_neg_integer(), integer(), packet | time}],
+    %% Set when one of the current losses aged out unacknowledged: that
+    %% episode was a real loss and its window cut stays.
+    loss_confirmed = false :: boolean()
 }).
 
 -record(loss_state, {
@@ -386,10 +407,15 @@ on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRange
             %% (KeptAccList is newest-first, reverse to oldest-first so
             %% largest-lost bookkeeping works).
             KeptList = lists:reverse(KeptAccList),
+            %% Late acknowledgements of packets already declared lost
+            %% adapt the thresholds before this ACK's own loss pass.
+            {P0, Spurious, Undo} = spurious_losses(
+                pn(Space, NewState1), AckedRanges, LargestAcked, Now, NewState1
+            ),
             {LostList, SurvHeadQ, LostBytes, LargestLostSentTime} =
                 detect_lost_q(
                     KeptList,
-                    loss_delay_rtt(NewState1),
+                    thresholds(P0, NewState1),
                     LargestAcked,
                     Now,
                     [],
@@ -406,7 +432,7 @@ on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRange
             Settled =
                 length([P || #sent_packet{ack_eliciting = true} = P <- AckedList]) +
                     length([P || #sent_packet{ack_eliciting = true} = P <- LostList]),
-            PApp = pn(Space, NewState1),
+            PApp = remember_lost(LostList, LargestAcked, Now, P0),
             NewState2 = set_pn(
                 Space,
                 PApp#pn_loss{
@@ -431,7 +457,9 @@ on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRange
                 largest_ae_time => LargestAETime,
                 has_ack_eliciting => MaxAckEliciting =/= undefined,
                 lost_bytes => LostBytes,
-                largest_lost_sent_time => LargestLostSentTime
+                largest_lost_sent_time => LargestLostSentTime,
+                spurious_losses => Spurious,
+                spurious_congestion => Undo
             },
 
             {NewState2, AckedList, LostList, AckMeta}
@@ -504,13 +532,13 @@ detect_lost_packets(
     %% (receiver queueing, bufferbloat) mass-declares in-flight packets
     %% lost while their ACKs are merely late; each spurious loss both
     %% retransmits data and collapses the congestion window.
-    RTT = loss_delay_rtt(State),
+    Thresholds = thresholds(P, State),
     {LostPackets, SurvQ, LostBytes, _LargestLostSentTime} =
-        detect_lost_q(SentList, RTT, LargestAcked, Now, [], queue:new(), 0, undefined),
+        detect_lost_q(SentList, Thresholds, LargestAcked, Now, [], queue:new(), 0, undefined),
     LostAE = length([L || #sent_packet{ack_eliciting = true} = L <- LostPackets]),
     NewState = set_pn(
         Space,
-        P#pn_loss{
+        (remember_lost(LostPackets, LargestAcked, Now, P))#pn_loss{
             sent_q = SurvQ,
             ae_in_flight = max(0, P#pn_loss.ae_in_flight - LostAE)
         },
@@ -524,10 +552,17 @@ detect_lost_packets(
 %% Returns {LostList, SurvivingQ, LostBytes, LargestLostSentTime} where
 %% LargestLostSentTime is the time_sent of the highest-PN lost packet
 %% (used by the CC congestion-event reporter).
-detect_lost_q([], _SRTT, _LargestAcked, _Now, LostAcc, SurvQ, LostBytes, LargestLost) ->
+detect_lost_q([], _Thresholds, _LargestAcked, _Now, LostAcc, SurvQ, LostBytes, LargestLost) ->
     {LostAcc, SurvQ, LostBytes, largest_lost_ts(LargestLost)};
 detect_lost_q(
-    [#sent_packet{pn = PN} = P | Rest], _SRTT, LargestAcked, _Now, LostAcc, SurvQ, LostBytes, LL
+    [#sent_packet{pn = PN} = P | Rest],
+    _Thresholds,
+    LargestAcked,
+    _Now,
+    LostAcc,
+    SurvQ,
+    LostBytes,
+    LL
 ) when
     PN >= LargestAcked
 ->
@@ -542,7 +577,7 @@ detect_lost_q(
         } = P
         | Rest
     ],
-    SRTT,
+    {LossDelay, PacketThreshold} = Thresholds,
     LargestAcked,
     Now,
     LostAcc,
@@ -550,8 +585,7 @@ detect_lost_q(
     LostBytes,
     LL
 ) ->
-    LossDelay = max(trunc(?TIME_THRESHOLD * SRTT), ?GRANULARITY),
-    LossThreshold = LargestAcked - ?PACKET_THRESHOLD + 1,
+    LossThreshold = LargestAcked - PacketThreshold + 1,
     %% >=, not >: get_loss_time_and_space/1 arms the timer for exactly
     %% TS + LossDelay, so detection has to declare at that instant or
     %% the timer re-arms at zero and spins until the clock moves.
@@ -577,17 +611,84 @@ detect_lost_q(
                             _ -> LL
                         end
                 end,
-            detect_lost_q(Rest, SRTT, LargestAcked, Now, [P | LostAcc], SurvQ, NewBytes, NewLL);
+            detect_lost_q(
+                Rest, Thresholds, LargestAcked, Now, [P | LostAcc], SurvQ, NewBytes, NewLL
+            );
         false ->
             detect_lost_q(
-                Rest, SRTT, LargestAcked, Now, LostAcc, queue:in(P, SurvQ), LostBytes, LL
+                Rest, Thresholds, LargestAcked, Now, LostAcc, queue:in(P, SurvQ), LostBytes, LL
             )
     end;
 detect_lost_q(
-    [#sent_packet{} = P | Rest], SRTT, LargestAcked, Now, LostAcc, SurvQ, LostBytes, LL
+    [#sent_packet{} = P | Rest], Thresholds, LargestAcked, Now, LostAcc, SurvQ, LostBytes, LL
 ) ->
     %% Not in_flight (defensive, shouldn't happen for queue-managed packets).
-    detect_lost_q(Rest, SRTT, LargestAcked, Now, LostAcc, queue:in(P, SurvQ), LostBytes, LL).
+    detect_lost_q(Rest, Thresholds, LargestAcked, Now, LostAcc, queue:in(P, SurvQ), LostBytes, LL).
+
+%% {LossDelay, PacketThreshold} for a space: RFC 9002 Section 6.1 with
+%% both thresholds as reordering has adapted them.
+thresholds(#pn_loss{reorder_threshold = PT, time_shift = Shift}, State) ->
+    RTT = loss_delay_rtt(State),
+    {max(RTT + (RTT bsr Shift), ?GRANULARITY), PT}.
+
+%% Remember the ack-eliciting packets just declared lost, so a late
+%% acknowledgement can show the loss was spurious. A loss after the
+%% previous ones all settled starts a new episode.
+remember_lost(Lost, LargestAcked, Now, #pn_loss{recent_lost = Recent} = P) ->
+    New = [
+        {PN, Now, loss_kind(PN, LargestAcked, P)}
+     || #sent_packet{pn = PN, ack_eliciting = true} <- lists:reverse(Lost)
+    ],
+    case New of
+        [] ->
+            P;
+        _ ->
+            All = New ++ Recent,
+            Confirmed = (Recent =/= [] andalso P#pn_loss.loss_confirmed),
+            case length(All) > ?MAX_RECENT_LOST of
+                true ->
+                    %% Forgetting a loss means it can no longer prove
+                    %% spurious, so the episode keeps its cut.
+                    P#pn_loss{
+                        recent_lost = lists:sublist(All, ?MAX_RECENT_LOST), loss_confirmed = true
+                    };
+                false ->
+                    P#pn_loss{recent_lost = All, loss_confirmed = Confirmed}
+            end
+    end.
+
+loss_kind(PN, LargestAcked, #pn_loss{reorder_threshold = PT}) when PN =< LargestAcked - PT ->
+    packet;
+loss_kind(_PN, _LargestAcked, _P) ->
+    time.
+
+%% Split the remembered losses into those this ACK covers (spurious) and
+%% the rest, raise the thresholds for the spurious ones, and age out
+%% losses older than two RTTs as real. Returns the updated space, the
+%% number of spurious losses, and whether the whole episode proved
+%% spurious, in which case the window cut it caused can be undone.
+spurious_losses(#pn_loss{recent_lost = []} = P, _Ranges, _LargestAcked, _Now, _State) ->
+    {P, 0, false};
+spurious_losses(#pn_loss{recent_lost = Recent} = P, Ranges, LargestAcked, Now, State) ->
+    {Spurious, Rest} = lists:partition(fun({PN, _, _}) -> pn_in_ranges(PN, Ranges) end, Recent),
+    Window = 2 * loss_delay_rtt(State) + State#loss_state.max_ack_delay,
+    {Kept, Aged} = lists:partition(fun({_, At, _}) -> Now - At =< Window end, Rest),
+    Confirmed = P#pn_loss.loss_confirmed orelse Aged =/= [],
+    P1 = lists:foldl(fun(L, Acc) -> adapt(L, LargestAcked, Acc) end, P, Spurious),
+    Undo = Spurious =/= [] andalso Kept =:= [] andalso not Confirmed,
+    P2 = P1#pn_loss{recent_lost = Kept, loss_confirmed = Kept =/= [] andalso Confirmed},
+    {P2, length(Spurious), Undo}.
+
+adapt({PN, _, Kind}, LargestAcked, #pn_loss{reorder_threshold = PT, time_shift = Shift} = P) ->
+    Seen = min(LargestAcked - PN + 1, ?MAX_REORDER_THRESHOLD),
+    P#pn_loss{
+        reorder_threshold = max(PT, Seen),
+        time_shift =
+            case Kind of
+                time -> max(?MIN_TIME_SHIFT, Shift - 1);
+                packet -> Shift
+            end
+    }.
 
 largest_lost_ts(undefined) -> undefined;
 largest_lost_ts({_PN, TS}) -> TS.
@@ -595,9 +696,11 @@ largest_lost_ts({_PN, TS}) -> TS.
 %% @doc Get the loss time for setting timers.
 -spec get_loss_time_and_space(loss_state()) -> {non_neg_integer(), space()} | none.
 get_loss_time_and_space(#loss_state{} = State) ->
-    LossDelay = max(trunc(?TIME_THRESHOLD * loss_delay_rtt(State)), ?GRANULARITY),
     lists:foldl(
-        fun(Space, Best) -> earlier_loss(space_loss_time(Space, State, LossDelay), Best) end,
+        fun(Space, Best) ->
+            {LossDelay, _} = thresholds(pn(Space, State), State),
+            earlier_loss(space_loss_time(Space, State, LossDelay), Best)
+        end,
         none,
         [initial, handshake, app]
     ).
@@ -804,6 +907,12 @@ pto(#loss_state{rtt = RTT, pto_count = PTOCount}, MaxAckDelay) ->
     %% so a bounded worst-case interval costs nothing while keeping
     %% recovery inside real-world request timeouts.
     min(PTO bsl PTOCount, ?MAX_PTO_MS).
+
+%% @doc The application-space PTO without backoff: how long an ACK for a
+%% packet sent now should take on this path.
+-spec base_pto(loss_state()) -> non_neg_integer().
+base_pto(#loss_state{} = State) ->
+    pto(State#loss_state{pto_count = 0}, State#loss_state.max_ack_delay).
 
 %% @doc Adopt the peer's ack_delay_exponent and max_ack_delay (ms), from
 %% its transport parameters.

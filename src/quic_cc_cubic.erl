@@ -32,6 +32,7 @@
 -define(QUIC_LOG_META, #{domain => [erlang_quic, congestion_control]}).
 
 -export([
+    on_spurious_congestion/1,
     %% Behavior callbacks
     new/1,
     on_packet_sent/2,
@@ -133,6 +134,11 @@
     bytes_in_flight = 0 :: non_neg_integer(),
     recovery_start_time :: non_neg_integer() | undefined,
     in_recovery = false :: boolean(),
+    %% {cwnd, ssthresh, w_max, w_last_max} before the last loss cut,
+    %% restored if every loss behind it proves spurious.
+    undo = undefined ::
+        {non_neg_integer(), non_neg_integer() | infinity, non_neg_integer(), non_neg_integer()}
+        | undefined,
     ecn_ce_counter = 0 :: non_neg_integer(),
     first_sent_time :: non_neg_integer() | undefined,
 
@@ -633,7 +639,11 @@ on_congestion_event(State, SentTime) ->
 do_congestion_event(
     #cubic_state{
         cwnd = Cwnd,
+        ssthresh = SSThresh,
+        w_max = WMax,
         w_last_max = WLastMax,
+        in_recovery = InRecovery,
+        undo = Undo,
         minimum_window = MinimumWindow
     } = State,
     SentTime
@@ -680,6 +690,8 @@ do_congestion_event(
         w_last_max = NewWLastMax,
         recovery_start_time = Now,
         in_recovery = true,
+        %% A cut inside recovery keeps the window from before the first one.
+        undo = undo_point(InRecovery, Undo, {Cwnd, SSThresh, WMax, WLastMax}),
         first_sent_time = SentTime,
         %% Reset epoch for next congestion avoidance phase
         epoch_start = 0,
@@ -692,6 +704,29 @@ do_congestion_event(
         hystart_rtt_sample_count = 0,
         hystart_css_baseline_rtt = infinity,
         hystart_round_start_time = 0
+    }.
+
+undo_point(true, {_, _, _, _} = Undo, _Now) -> Undo;
+undo_point(_InRecovery, _Undo, Now) -> Now.
+
+%% @doc Restore the window from before the last loss cut and leave
+%% recovery: the packets it was for were delivered, only reordered. The
+%% cubic curve restarts from the restored window.
+-spec on_spurious_congestion(cc_state()) -> cc_state().
+on_spurious_congestion(#cubic_state{undo = undefined} = State) ->
+    State;
+on_spurious_congestion(#cubic_state{undo = {Cwnd, SSThresh, WMax, WLastMax}, cwnd = Now} = State) ->
+    State#cubic_state{
+        cwnd = max(Cwnd, Now),
+        ssthresh = SSThresh,
+        w_max = WMax,
+        w_last_max = WLastMax,
+        epoch_start = 0,
+        origin_point = 0,
+        k = 0.0,
+        tcp_cwnd = 0,
+        in_recovery = false,
+        undo = undefined
     }.
 
 %%====================================================================
@@ -740,6 +775,7 @@ on_ecn_ce(
         w_last_max = NewWLastMax,
         recovery_start_time = Now,
         in_recovery = true,
+        undo = undefined,
         ecn_ce_counter = NewCECount,
         epoch_start = 0,
         origin_point = 0,
@@ -786,6 +822,7 @@ on_persistent_congestion(#cubic_state{cwnd = Cwnd, minimum_window = MinimumWindo
         cwnd = MinimumWindow,
         ssthresh = NewSSThresh,
         in_recovery = false,
+        undo = undefined,
         recovery_start_time = undefined,
         first_sent_time = undefined,
         %% Reset CUBIC state

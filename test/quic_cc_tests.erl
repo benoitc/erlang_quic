@@ -543,3 +543,53 @@ send_until_full(State, Sent) ->
         false ->
             {State, Sent}
     end.
+
+%%====================================================================
+%% Spurious congestion undo
+%%====================================================================
+
+%% A cut whose losses all prove to be reordering is undone: the window
+%% and slow-start threshold come back and recovery ends.
+spurious_congestion_restores_window_test_() ->
+    [{atom_to_list(A), fun() -> spurious_restores(A) end} || A <- [newreno, cubic]].
+
+spurious_restores(Algo) ->
+    CC0 = quic_cc:new(Algo, #{}),
+    Cwnd = quic_cc:cwnd(CC0),
+    SSThresh = quic_cc:ssthresh(CC0),
+    Cut = quic_cc:on_congestion_event(CC0, erlang:monotonic_time(millisecond)),
+    ?assert(quic_cc:cwnd(Cut) < Cwnd),
+    ?assert(quic_cc:in_recovery(Cut)),
+    Undone = quic_cc:on_spurious_congestion(Cut),
+    ?assertEqual(Cwnd, quic_cc:cwnd(Undone)),
+    ?assertEqual(SSThresh, quic_cc:ssthresh(Undone)),
+    ?assertNot(quic_cc:in_recovery(Undone)),
+    %% Only once: a second undo has nothing left to restore.
+    ?assertEqual(Undone, quic_cc:on_spurious_congestion(Undone)).
+
+%% Persistent congestion and ECN marks are real: nothing to undo after them.
+spurious_congestion_after_real_signal_test_() ->
+    [
+        {atom_to_list(A) ++ " " ++ atom_to_list(Signal), fun() -> no_undo_after(A, Signal) end}
+     || A <- [newreno, cubic], Signal <- [persistent, ecn]
+    ].
+
+no_undo_after(Algo, Signal) ->
+    CC0 = quic_cc:new(Algo, #{}),
+    Cut = quic_cc:on_congestion_event(CC0, erlang:monotonic_time(millisecond)),
+    Real =
+        case Signal of
+            persistent -> quic_cc:on_persistent_congestion(Cut);
+            ecn -> quic_cc:on_ecn_ce(quic_cc:on_spurious_congestion(Cut), 1)
+        end,
+    ?assertEqual(quic_cc:cwnd(Real), quic_cc:cwnd(quic_cc:on_spurious_congestion(Real))).
+
+%% Nothing was cut: undo changes nothing.
+spurious_congestion_without_cut_test() ->
+    CC0 = quic_cc:new(newreno, #{}),
+    ?assertEqual(CC0, quic_cc:on_spurious_congestion(CC0)).
+
+%% BBR does not cut on loss and keeps its state.
+spurious_congestion_bbr_test() ->
+    CC0 = quic_cc:new(bbr, #{}),
+    ?assertEqual(CC0, quic_cc:on_spurious_congestion(CC0)).

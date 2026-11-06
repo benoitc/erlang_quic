@@ -33,6 +33,7 @@
 -define(QUIC_LOG_META, #{domain => [erlang_quic, congestion_control]}).
 
 -export([
+    on_spurious_congestion/1,
     %% Behavior callbacks
     new/1,
     on_packet_sent/2,
@@ -106,6 +107,9 @@
     %% Recovery state
     recovery_start_time :: non_neg_integer() | undefined,
     in_recovery = false :: boolean(),
+    %% {cwnd, ssthresh} before the last loss cut, restored if every loss
+    %% behind it proves spurious.
+    undo = undefined :: {non_neg_integer(), non_neg_integer() | infinity} | undefined,
 
     %% Persistent congestion detection
     first_sent_time :: non_neg_integer() | undefined,
@@ -672,6 +676,8 @@ on_congestion_event(State, SentTime) ->
 do_congestion_event(
     #cc_state{
         cwnd = Cwnd,
+        ssthresh = SSThresh,
+        undo = Undo,
         bytes_in_flight = InFlight,
         minimum_window = MinimumWindow,
         in_recovery = InRecovery,
@@ -707,6 +713,8 @@ do_congestion_event(
         ssthresh = NewSSThresh,
         recovery_start_time = Now,
         in_recovery = true,
+        %% A cut inside recovery keeps the window from before the first one.
+        undo = undo_point(InRecovery, Undo, {Cwnd, SSThresh}),
         % Track for persistent congestion
         first_sent_time = SentTime,
         %% Reset HyStart++ state
@@ -715,6 +723,22 @@ do_congestion_event(
         hystart_rtt_sample_count = 0,
         hystart_css_baseline_rtt = infinity,
         hystart_round_start_time = 0
+    }.
+
+undo_point(true, {_, _} = Undo, _Now) -> Undo;
+undo_point(_InRecovery, _Undo, Now) -> Now.
+
+%% @doc Restore the window from before the last loss cut and leave
+%% recovery: the packets it was for were delivered, only reordered.
+-spec on_spurious_congestion(cc_state()) -> cc_state().
+on_spurious_congestion(#cc_state{undo = undefined} = State) ->
+    State;
+on_spurious_congestion(#cc_state{undo = {Cwnd, SSThresh}, cwnd = Now} = State) ->
+    State#cc_state{
+        cwnd = max(Cwnd, Now),
+        ssthresh = SSThresh,
+        in_recovery = false,
+        undo = undefined
     }.
 
 %%====================================================================
@@ -748,6 +772,7 @@ on_ecn_ce(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} = State, NewCEC
         ssthresh = NewSSThresh,
         recovery_start_time = Now,
         in_recovery = true,
+        undo = undefined,
         ecn_ce_counter = NewCECount,
         %% Reset HyStart++ state
         hystart_in_css = false,
@@ -914,6 +939,7 @@ on_persistent_congestion(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} 
         cwnd = MinimumWindow,
         ssthresh = NewSSThresh,
         in_recovery = false,
+        undo = undefined,
         recovery_start_time = undefined,
         first_sent_time = undefined,
         %% Reset HyStart++ state

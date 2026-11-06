@@ -1361,8 +1361,8 @@ idle({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {idle, state_to_map(State)}}]};
 idle({call, From}, peername, #state{remote_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
-idle({call, From}, sockname, #state{cfg = #conn_cfg{local_addr = Addr}} = State) ->
-    {keep_state, State, [{reply, From, {ok, Addr}}]};
+idle({call, From}, sockname, State) ->
+    {keep_state, State, [{reply, From, {ok, current_sockname(State)}}]};
 idle({call, From}, {set_owner, NewOwner}, State) ->
     {keep_state, reown(State, NewOwner), [{reply, From, ok}]};
 idle(cast, {set_owner, NewOwner}, State) ->
@@ -1468,8 +1468,8 @@ handshaking({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {handshaking, state_to_map(State)}}]};
 handshaking({call, From}, peername, #state{remote_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
-handshaking({call, From}, sockname, #state{cfg = #conn_cfg{local_addr = Addr}} = State) ->
-    {keep_state, State, [{reply, From, {ok, Addr}}]};
+handshaking({call, From}, sockname, State) ->
+    {keep_state, State, [{reply, From, {ok, current_sockname(State)}}]};
 handshaking({call, From}, {set_owner, NewOwner}, State) ->
     {keep_state, reown(State, NewOwner), [{reply, From, ok}]};
 handshaking(cast, {set_owner, NewOwner}, State) ->
@@ -1655,8 +1655,8 @@ connected({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {connected, state_to_map(State)}}]};
 connected({call, From}, peername, #state{remote_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
-connected({call, From}, sockname, #state{cfg = #conn_cfg{local_addr = Addr}} = State) ->
-    {keep_state, State, [{reply, From, {ok, Addr}}]};
+connected({call, From}, sockname, State) ->
+    {keep_state, State, [{reply, From, {ok, current_sockname(State)}}]};
 connected({call, From}, peercert, #state{hs = #hs{peer_cert = undefined}} = State) ->
     {keep_state, State, [{reply, From, {error, no_peercert}}]};
 connected({call, From}, peercert, #state{hs = #hs{peer_cert = Cert}} = State) ->
@@ -2181,11 +2181,11 @@ handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref}
         due ->
             State1 = State#state{pto_timer = undefined, pto_armed_at = undefined},
             case disconnect_timeout_expired(State1) of
-                true ->
-                    {next_state, draining, declare_peer_dead(State1)};
-                false when State1#state.pto_kind =:= loss ->
+                true when not is_tuple(State1#state.disconnect_timer) ->
+                    disconnect_deadline(State1);
+                _ when State1#state.pto_kind =:= loss ->
                     {keep_state, handle_loss_timeout(State1)};
-                false ->
+                _ ->
                     %% Handle PTO timeout - send probe packet
                     {keep_state, handle_pto_timeout(State1)}
             end
@@ -2198,10 +2198,22 @@ handle_common_event(
     State1 = State#state{disconnect_timer = undefined},
     case disconnect_timeout_expired(State1) of
         true ->
-            {next_state, draining, declare_peer_dead(State1)};
+            disconnect_deadline(State1);
         false ->
             {keep_state, arm_disconnect_timer(State1)}
     end;
+handle_common_event(
+    info, {disconnect_final, Ref}, StateName, #state{disconnect_timer = {final, Ref}} = State
+) when
+    StateName =:= connected orelse StateName =:= handshaking
+->
+    State1 = State#state{disconnect_timer = undefined},
+    case disconnect_timeout_expired(State1) of
+        true -> {next_state, draining, declare_peer_dead(State1)};
+        false -> {keep_state, arm_disconnect_timer(State1)}
+    end;
+handle_common_event(info, {disconnect_final, _StaleRef}, _StateName, State) ->
+    {keep_state, State};
 handle_common_event(info, {credit_retry, Ref}, StateName, #state{credit_timer = Ref} = State) ->
     State1 = State#state{credit_timer = undefined},
     case StateName of
@@ -4514,10 +4526,10 @@ handle_packet_loop(<<>>, #state{cfg = #conn_cfg{role = client, active_n = N}} = 
     %% Note: With {active, N}, calling setopts resets the counter, so this is optional
     %% but provides safety in case socket went passive during processing
     client_rearm_active(State, N),
-    State;
+    replay_early_packets(State);
 handle_packet_loop(<<>>, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% No more data to process - server socket managed by listener
-    State;
+    replay_early_packets(State);
 handle_packet_loop(Data, State) ->
     %% Header/frame parsing runs on attacker-controlled bytes before (and
     %% during) AEAD checks and can raise on truncated/oversized input
@@ -4587,6 +4599,21 @@ handle_packet_loop(Data, State) ->
             %% End of coalesced packets (padding or invalid trailing data)
             %% This is normal, just re-enable socket and return
             maybe_reenable_socket(State),
+            replay_early_packets(State);
+        {error, no_app_keys} ->
+            %% Overtook the handshake that brings its keys; kept for when
+            %% they arrive.
+            maybe_reenable_socket(State),
+            keep_early_packet(no_app_keys, Data, State);
+        {error, no_handshake_keys} when State#state.app_keys =:= undefined ->
+            %% Overtook the Initial that brings its keys. With no 1-RTT
+            %% keys yet, the level cannot have been discarded.
+            maybe_reenable_socket(State),
+            keep_early_packet(no_handshake_keys, Data, State);
+        {error, no_handshake_keys} ->
+            %% A late Handshake packet after those keys were discarded,
+            %% which RFC 9001 Section 4.9.2 says to drop.
+            maybe_reenable_socket(State),
             State;
         {error, Reason} ->
             %% Log decryption failure for debugging. Include the packet
@@ -4625,6 +4652,49 @@ handle_packet_loop(Data, State) ->
             maybe_reenable_socket(State),
             State
     end.
+
+%% Least time the last probe before a disconnect gets to be acknowledged.
+-define(DISCONNECT_GRACE_MS, 1000).
+
+%% RFC 9001 Section 5.7: a few datagrams that arrive before their keys
+%% may be kept. Beyond the cap they are dropped, as before.
+-define(MAX_EARLY_PACKETS, 8).
+
+keep_early_packet(Reason, Data, #state{hs = #hs{early_packets = Early} = HS} = State) when
+    length(Early) < ?MAX_EARLY_PACKETS
+->
+    Level =
+        case Reason of
+            no_handshake_keys -> handshake;
+            no_app_keys -> app
+        end,
+    Entry = {Level, Data, State#state.current_packet_source},
+    State#state{hs = HS#hs{early_packets = Early ++ [Entry]}};
+keep_early_packet(_Reason, _Data, State) ->
+    State.
+
+%% Feed back the kept datagrams whose keys are now installed, oldest
+%% first, from the address each came from.
+replay_early_packets(#state{hs = #hs{early_packets = []}} = State) ->
+    State;
+replay_early_packets(#state{hs = #hs{early_packets = Early} = HS} = State) ->
+    case lists:partition(fun({Level, _, _}) -> has_keys_for(Level, State) end, Early) of
+        {[], _} ->
+            State;
+        {Ready, Waiting} ->
+            Source = State#state.current_packet_source,
+            State1 = lists:foldl(
+                fun({_, Data, From}, Acc) ->
+                    handle_packet_loop(Data, Acc#state{current_packet_source = From})
+                end,
+                State#state{hs = HS#hs{early_packets = Waiting}},
+                Ready
+            ),
+            State1#state{current_packet_source = Source}
+    end.
+
+has_keys_for(handshake, #state{hs = #hs{handshake_keys = Keys}}) -> Keys =/= undefined;
+has_keys_for(app, #state{app_keys = Keys}) -> Keys =/= undefined.
 
 binhex(Bin) when is_binary(Bin) -> binary:encode_hex(Bin);
 binhex(Other) -> Other.
@@ -5054,9 +5124,12 @@ check_stateless_reset(Data, #state{cid_pool_state = Pool} = _State) ->
 decode_short_header_packet(Data, State) ->
     case State#state.app_keys of
         undefined ->
-            ?LOG_WARNING(#{what => no_app_keys_short_header}, ?QUIC_LOG_META),
-            %% No app keys yet - check if this might be a stateless reset
-            check_stateless_reset(Data, State);
+            %% No app keys yet: a stateless reset, or a 1-RTT packet that
+            %% overtook the handshake.
+            case check_stateless_reset(Data, State) of
+                {error, decryption_failed} -> {error, no_app_keys};
+                Other -> Other
+            end;
         {ClientKeys, ServerKeys} ->
             %% Select correct keys based on role
             DecryptKeys =
@@ -5375,8 +5448,17 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
                             true ->
                                 quic_cc:on_packets_acked(CCState, AckedBytes, LargestAckedSentTime)
                         end,
+                    %% Every loss behind the last window cut was only
+                    %% reordered: undo the cut before this ACK's own losses.
+                    CCState2 =
+                        case AckMeta of
+                            #{spurious_congestion := true} ->
+                                quic_cc:on_spurious_congestion(CCState1);
+                            _ ->
+                                CCState1
+                        end,
                     CCState5 = cc_after_loss(
-                        CCState1, LostBytes, LargestLostSentTime, ECN, LostPackets, NewLossState
+                        CCState2, LostBytes, LargestLostSentTime, ECN, LostPackets, NewLossState
                     ),
 
                     %% Update pacing rate based on new RTT estimate (RFC 9002 Section 7.7)
@@ -11661,6 +11743,15 @@ set_idle_timer(
 %% socket handle ({'$socket', Ref}). inet:sockname/1 only accepts
 %% the gen_udp port shape, socket:sockname/1 the other. Returns
 %% undefined if neither succeeds.
+%% The address the connection sends from now. Read from the socket, since
+%% a migration rebinds it and an OTP socket binds on its first send; the
+%% address seen at connect time answers when the socket cannot.
+current_sockname(#state{socket = Socket, cfg = #conn_cfg{local_addr = Initial}}) ->
+    case query_local_addr(Socket) of
+        {_, Port} = Addr when Port =/= 0 -> Addr;
+        _ -> Initial
+    end.
+
 query_local_addr(Ref) when is_reference(Ref) ->
     %% Adapter backend: no real socket, no kernel-known sockname.
     undefined;
@@ -11686,6 +11777,18 @@ disconnect_timeout_expired(#state{loss_state = LossState, cfg = #conn_cfg{discon
                 erlang:monotonic_time(millisecond) - T >= DT
         end.
 
+%% The deadline passed with no ACK. The last probe may predate a network
+%% that has just come back, and backoff can put the next one seconds away,
+%% so send one now and give it one un-backed-off PTO to be acknowledged,
+%% and never less than ?DISCONNECT_GRACE_MS: a path that has just come back
+%% (a new NAT mapping, a link rejoining) is often slower than the RTT says.
+disconnect_deadline(#state{loss_state = LossState} = State) ->
+    State1 = flush_event(send_probe_packet(app, State), event),
+    Ref = make_ref(),
+    Grace = max(quic_loss:base_pto(LossState), ?DISCONNECT_GRACE_MS),
+    erlang:send_after(Grace, self(), {disconnect_final, Ref}),
+    {keep_state, State1#state{disconnect_timer = {final, Ref}}}.
+
 %% The disconnect timeout elapsed with ack-eliciting data in flight and
 %% no ACK: declare the peer dead instead of probing until the idle
 %% timeout. This is how a client escapes a restarted peer whose stateless
@@ -11703,6 +11806,8 @@ declare_peer_dead(State) ->
 
 cancel_disconnect_timer(#state{disconnect_timer = undefined} = State) ->
     State;
+cancel_disconnect_timer(#state{disconnect_timer = {final, _}} = State) ->
+    State#state{disconnect_timer = undefined};
 cancel_disconnect_timer(#state{disconnect_timer = Ref} = State) ->
     cancel_timer(Ref),
     State#state{disconnect_timer = undefined}.

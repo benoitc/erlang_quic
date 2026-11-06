@@ -24,6 +24,12 @@ rebar3 xref                 # Cross-reference analysis must pass
 rebar3 ex_doc               # Docs must build
 ```
 
+## Pull Requests
+
+Work on one issue goes in one pull request. Give each change a reviewer has to
+look at its own commit, with its tests, rather than opening a pull request per
+change. Docs and CHANGELOG entries go in the same pull request.
+
 ## Build & Development Commands
 
 ```bash

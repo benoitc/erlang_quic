@@ -79,7 +79,11 @@ client_socket_backend_migrate() ->
             %% (RFC 9000 Section 9.5), and the peer's arrives just
             %% after `connected'.
             ?assert(quic_connection_test_support:await_spare_cid(Conn, 5000)),
+            {ok, {_, OldPort}} = quic:sockname(Conn),
             ?assertEqual(ok, quic:migrate(Conn)),
+            %% sockname follows the rebound socket.
+            {ok, {_, NewPort}} = quic:sockname(Conn),
+            ?assertNotEqual(OldPort, NewPort),
             %% After migration the stream should still echo.
             {ok, StreamId} = quic:open_stream(Conn),
             Payload = crypto:strong_rand_bytes(4096),
