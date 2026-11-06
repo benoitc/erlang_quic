@@ -25,6 +25,22 @@ handshake_after_initial_failing_decryption_test() ->
     ),
     ?assertEqual(0, handshake_largest_recv(S)).
 
+%% Once Handshake keys are discarded a late Handshake packet is dropped,
+%% and the 1-RTT packet after it is still read.
+app_after_handshake_with_discarded_keys_test() ->
+    #state{hs = HS} = S0 = quic_connection_test_support:state_with_pn_app(client(), 0),
+    Datagram = <<(handshake_packet(S0))/binary, (app_packet(S0, 3))/binary>>,
+    S = quic_connection:handle_packet_loop(Datagram, S0#state{
+        hs = HS#hs{handshake_keys = undefined}
+    }),
+    ?assertEqual(3, quic_connection:get_largest_recv(app, S)).
+
+app_packet(#state{app_keys = {_, ServerKeys}}, PN) ->
+    #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = ServerKeys,
+    quic_aead:protect_short_packet(
+        Cipher, Key, IV, HP, PN, 16#40, <<"own-cid0">>, <<1, 0:(8 * 20)>>
+    ).
+
 client() ->
     quic_connection_test_support:state_sending(
         quic_connection_test_support:state_with_keys(client)

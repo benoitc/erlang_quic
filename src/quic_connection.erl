@@ -4912,9 +4912,9 @@ handle_packet_loop(Data, State) ->
             keep_early_packet(no_handshake_keys, Data, State);
         {error, no_handshake_keys} ->
             %% A late Handshake packet after those keys were discarded,
-            %% which RFC 9001 Section 4.9.2 says to drop.
-            maybe_reenable_socket(State),
-            State;
+            %% which RFC 9001 Section 4.9.2 says to drop. The packets
+            %% coalesced after it are still read (RFC 9000 Section 12.2).
+            handle_packet_loop(next_coalesced_packet(Data), State);
         {error, Reason} ->
             %% Log decryption failure for debugging. Include the packet
             %% source, our CID expectation and the datagram head/tail so
@@ -8258,7 +8258,9 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
 %% flow control. A late STREAM frame within that size is dropped.
 do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
     case maps:find(StreamId, State#state.streams) of
-        {ok, #stream_state{state = reset, recv_done = true, recv_reset_at = undefined, final_size = FS}} when
+        {ok, #stream_state{
+            state = reset, recv_done = true, recv_reset_at = undefined, final_size = FS
+        }} when
             is_integer(FS), Offset + byte_size(Data) =< FS
         ->
             State;
