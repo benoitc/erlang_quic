@@ -39,6 +39,7 @@
     after_own_key_update/1,
     key_phase/1,
     state_with_send_stream/3,
+    state_with_send_streams/1,
     close_reason/1,
     state_for_server/3,
     state_with_pn_app/2,
@@ -377,6 +378,17 @@ state_owing_ack(Count, TimerArmed) ->
                 true -> make_ref();
                 false -> undefined
             end
+    }.
+
+%% Like state_with_send_stream/3 with one open send stream per id, and
+%% coalescing off, as before entering `connected'.
+-spec state_with_send_streams([non_neg_integer()]) -> #state{}.
+state_with_send_streams(Sids) ->
+    S0 = state_with_send_stream(0, 0, false),
+    #stream_state{} = Template = maps:get(0, S0#state.streams),
+    S0#state{
+        coalesce = false,
+        streams = maps:from_list([{Sid, Template#stream_state{id = Sid}} || Sid <- Sids])
     }.
 
 %% A connection with one local stream whose send side is at SendOffset,

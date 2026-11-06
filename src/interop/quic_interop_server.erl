@@ -19,9 +19,8 @@
 
 -export([main/1]).
 
--ifdef(TEST).
+%% Used by quic_interop_server_batch_SUITE.
 -export([spawn_handler/4]).
--endif.
 
 %% Suppress dialyzer warnings for escript functions that call halt()
 -dialyzer({nowarn_function, [main/1, run_server/4]}).
