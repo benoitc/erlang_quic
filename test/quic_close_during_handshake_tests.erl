@@ -18,7 +18,14 @@ client_sends_a_close_test() ->
 server_sends_it_at_both_levels_test() ->
     ?assertEqual([handshake, initial], lists:sort(close_packet_types(server))).
 
+%% RFC 9000 Section 10.1: an idle timeout closes silently.
+idle_timeout_sends_nothing_test() ->
+    ?assertEqual([], close_packet_types(server, idle_timeout)).
+
 close_packet_types(Role) ->
+    close_packet_types(Role, normal).
+
+close_packet_types(Role, Reason) ->
     {ok, Peer} = gen_udp:open(0, [binary, {active, false}]),
     try
         {ok, Port} = inet:port(Peer),
@@ -32,9 +39,9 @@ close_packet_types(Role) ->
             remote_addr = {{127, 0, 0, 1}, Port},
             hs = HS#hs{pn_initial = HS#hs.pn_handshake, address_validated = true}
         },
-        S = quic_connection:initiate_close(normal, S1),
+        S = quic_connection:initiate_close(Reason, S1),
         _ = quic_connection:flush_socket_batch(S),
-        ?assertEqual(normal, S#state.close_reason),
+        ?assertEqual(Reason, S#state.close_reason),
         packet_types(Peer)
     after
         gen_udp:close(Peer)

@@ -11846,6 +11846,9 @@ initiate_close(Reason, #state{mig = #mig{path_validation_timer = PathTimer}} = S
     },
     CloseFrame = local_close_frame(Reason),
     case State1#state.app_keys of
+        undefined when Reason =:= idle_timeout ->
+            %% RFC 9000 Section 10.1: an idle connection closes silently.
+            State1#state{close_reason = Reason};
         undefined ->
             handshake_close(State1#state{close_reason = Reason});
         _ ->
