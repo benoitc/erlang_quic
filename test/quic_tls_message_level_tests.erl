@@ -29,6 +29,13 @@ rejected_test_() ->
         ]
     ].
 
+%% RFC 9001 Section 4.4: a client receiving a post-handshake
+%% CertificateRequest closes with PROTOCOL_VIOLATION.
+client_post_handshake_certificate_request_test() ->
+    ?assertMatch(
+        {transport, ?QUIC_PROTOCOL_VIOLATION, _}, close(client, app, ?TLS_CERTIFICATE_REQUEST)
+    ).
+
 close(Role, Level, Type) ->
     S0 = quic_connection_test_support:with_keys_and_socket(
         quic_connection_test_support:state_for_role(Role)

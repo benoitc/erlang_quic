@@ -6881,6 +6881,18 @@ process_tls_messages(Level, Data, State) ->
                     %% Pass the original bytes to process_tls_message for transcript
                     State1 = process_tls_message(Level, Type, Body, OriginalMsg, State),
                     process_tls_messages(Level, Rest, State1);
+                _ when
+                    Type =:= ?TLS_CERTIFICATE_REQUEST,
+                    Level =:= app,
+                    (State#state.cfg)#conn_cfg.role =:= client
+                ->
+                    %% RFC 9001 Section 4.4: a client treats a post-handshake
+                    %% CertificateRequest as a PROTOCOL_VIOLATION.
+                    close_with_transport_error(
+                        ?QUIC_PROTOCOL_VIOLATION,
+                        <<"post-handshake CertificateRequest">>,
+                        State
+                    );
                 _ ->
                     send_tls_alert(
                         ?TLS_ALERT_UNEXPECTED_MESSAGE,
