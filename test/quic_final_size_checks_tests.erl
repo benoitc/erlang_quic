@@ -34,6 +34,31 @@ fin_below_received_test() ->
 reset_at_received_test() ->
     ?assertEqual(undefined, close({reset_stream, ?STREAM, 0, 100})).
 
+%% A stream with more credit than the connection has left.
+reset_above_connection_limit_test() ->
+    ?assertMatch(
+        {transport, ?QUIC_FLOW_CONTROL_ERROR, _},
+        (frame({reset_stream, ?STREAM, 0, 50000}, narrow()))#state.close_reason
+    ).
+
+unseen_reset_above_connection_limit_test() ->
+    ?assertMatch(
+        {transport, ?QUIC_FLOW_CONTROL_ERROR, _},
+        (frame({reset_stream, 4, 0, 5000}, narrow()))#state.close_reason
+    ).
+
+reset_at_below_received_test() ->
+    ?assertMatch(
+        {transport, ?QUIC_FINAL_SIZE_ERROR, _},
+        (frame({reset_stream_at, ?STREAM, 0, 50, 10}, reset_at(server())))#state.close_reason
+    ).
+
+reset_at_above_connection_limit_test() ->
+    ?assertMatch(
+        {transport, ?QUIC_FLOW_CONTROL_ERROR, _},
+        (frame({reset_stream_at, ?STREAM, 0, 50000, 10}, reset_at(narrow())))#state.close_reason
+    ).
+
 close(Frame) ->
     S = frame(Frame, server()),
     S#state.close_reason.
@@ -49,3 +74,15 @@ server() ->
         max_streams_uni_local = 100,
         transport_params = #{}
     }).
+
+%% 100 bytes received; the stream may take 200000 more, the connection 1000.
+narrow() ->
+    S = quic_connection_test_support:recv_stream_state(?STREAM, 100, 200000, 1000),
+    quic_connection_test_support:with_keys_and_socket(S#state{
+        max_streams_bidi_local = 100,
+        max_streams_uni_local = 100,
+        transport_params = #{}
+    }).
+
+reset_at(#state{cfg = Cfg} = S) ->
+    S#state{cfg = Cfg#conn_cfg{reset_stream_at_enabled = true}}.

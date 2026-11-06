@@ -6228,7 +6228,7 @@ process_frame(_Level, {connection_close, Type, Code, FrameType, ReasonPhrase}, S
 process_frame(
     app,
     {reset_stream, StreamId, ErrorCode, FinalSize},
-    #state{owner = Owner, streams = Streams} = State
+    #state{streams = Streams} = State
 ) ->
     %% RFC 9000 Section 4.5: Validate final size against any previously known value
     case maps:find(StreamId, Streams) of
@@ -6261,55 +6261,12 @@ process_frame(
                 ?QUIC_FLOW_CONTROL_ERROR, <<"RESET_STREAM final size above limit">>, State
             );
         {ok, Stream} ->
-            %% Mark stream as reset, store final size for flow control accounting.
-            %% Incoming RESET_STREAM closes our receive side.
-            NewStreams = maps:put(
-                StreamId,
-                Stream#stream_state{
-                    state = reset,
-                    final_size = FinalSize,
-                    recv_done = true,
-                    recv_buffer = gb_trees:empty(),
-                    recv_buffered = 0
-                },
-                Streams
-            ),
-            %% Data delivered earlier in this receive pass reaches the
-            %% owner before the reset notification.
-            StateFl = flush_pending_delivery(State),
-            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-            State1 = account_reset_stream(Stream, FinalSize, StateFl#state{streams = NewStreams}),
-            maybe_reclaim_stream(StreamId, State1);
+            case reset_size_error(Stream, FinalSize, State) of
+                ok -> accept_reset_stream(Stream, StreamId, ErrorCode, FinalSize, State);
+                {Code, Reason} -> close_with_transport_error(Code, Reason, State)
+            end;
         error ->
-            case is_reclaimed_frame(StreamId, State) of
-                true ->
-                    %% Late RESET_STREAM for an already-reclaimed stream; ignore.
-                    State;
-                false ->
-                    case exceeds_stream_limit(StreamId, State) of
-                        true ->
-                            stream_limit_close(State);
-                        false ->
-                            Owner ! {quic, self(), {stream_opened, StreamId}},
-                            NewStream = new_peer_stream(StreamId, State),
-                            NewStreams = maps:put(
-                                StreamId,
-                                NewStream#stream_state{
-                                    state = reset, final_size = FinalSize, recv_done = true
-                                },
-                                Streams
-                            ),
-                            StateFl = flush_pending_delivery(State),
-                            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                            maybe_reclaim_stream(
-                                StreamId,
-                                conn_grant(StateFl#state{
-                                    streams = NewStreams,
-                                    data_received = State#state.data_received + FinalSize
-                                })
-                            )
-                    end
-            end
+            reset_unseen_stream(StreamId, ErrorCode, FinalSize, State)
     end;
 %% Without our reset_stream_at transport parameter the frame type is
 %% unknown on this connection (RFC 9000 Section 12.4).
@@ -6361,24 +6318,29 @@ process_frame(
                     %% Spec: Ignore if ReliableSize increased (not an error, just ignore)
                     State;
                 {ok, Stream} ->
-                    %% Valid RESET_STREAM_AT - update stream state. The recv side
-                    %% is terminal once the reliable bytes are already delivered.
-                    Delivered = Stream#stream_state.recv_offset >= ReliableSize,
-                    NewStreams = maps:put(
-                        StreamId,
-                        Stream#stream_state{
-                            state = reset,
-                            final_size = FinalSize,
-                            recv_reset_at = ReliableSize,
-                            recv_reset_error = ErrorCode,
-                            recv_done = Delivered orelse Stream#stream_state.recv_done
-                        },
-                        Streams
-                    ),
-                    %% Notify owner - same message as RESET_STREAM
-                    StateFl = flush_pending_delivery(State),
-                    Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                    maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams});
+                    case reset_size_error(Stream, FinalSize, State) of
+                        {Code, Reason} ->
+                            close_with_transport_error(Code, Reason, State);
+                        ok ->
+                            %% Valid RESET_STREAM_AT - update stream state. The recv side
+                            %% is terminal once the reliable bytes are already delivered.
+                            Delivered = Stream#stream_state.recv_offset >= ReliableSize,
+                            NewStreams = maps:put(
+                                StreamId,
+                                Stream#stream_state{
+                                    state = reset,
+                                    final_size = FinalSize,
+                                    recv_reset_at = ReliableSize,
+                                    recv_reset_error = ErrorCode,
+                                    recv_done = Delivered orelse Stream#stream_state.recv_done
+                                },
+                                Streams
+                            ),
+                            %% Notify owner - same message as RESET_STREAM
+                            StateFl = flush_pending_delivery(State),
+                            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                            maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams})
+                    end;
                 error ->
                     case is_reclaimed_frame(StreamId, State) of
                         true ->
@@ -6392,24 +6354,30 @@ process_frame(
                                     %% Unknown stream - notify owner and create minimal state.
                                     %% A fresh stream has recv_offset 0, so the recv side is
                                     %% terminal immediately only when ReliableSize is 0.
-                                    Owner ! {quic, self(), {stream_opened, StreamId}},
                                     NewStream = new_peer_stream(StreamId, State),
-                                    NewStreams = maps:put(
-                                        StreamId,
-                                        NewStream#stream_state{
-                                            state = reset,
-                                            final_size = FinalSize,
-                                            recv_reset_at = ReliableSize,
-                                            recv_reset_error = ErrorCode,
-                                            recv_done = (ReliableSize =:= 0)
-                                        },
-                                        Streams
-                                    ),
-                                    StateFl = flush_pending_delivery(State),
-                                    Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                                    maybe_reclaim_stream(
-                                        StreamId, StateFl#state{streams = NewStreams}
-                                    )
+                                    case reset_size_error(NewStream, FinalSize, State) of
+                                        {Code, Reason} ->
+                                            close_with_transport_error(Code, Reason, State);
+                                        ok ->
+                                            Owner ! {quic, self(), {stream_opened, StreamId}},
+                                            NewStreams = maps:put(
+                                                StreamId,
+                                                NewStream#stream_state{
+                                                    state = reset,
+                                                    final_size = FinalSize,
+                                                    recv_reset_at = ReliableSize,
+                                                    recv_reset_error = ErrorCode,
+                                                    recv_done = (ReliableSize =:= 0)
+                                                },
+                                                Streams
+                                            ),
+                                            StateFl = flush_pending_delivery(State),
+                                            Owner !
+                                                {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                                            maybe_reclaim_stream(
+                                                StreamId, StateFl#state{streams = NewStreams}
+                                            )
+                                    end
                             end
                     end
             end
@@ -9989,6 +9957,84 @@ stream_limit_close(State) ->
 
 %% RFC 9000 Section 4.5: the final size of a reset stream counts against
 %% connection flow control, received or not.
+%% A RESET_STREAM the size checks let through: the receive side is done.
+accept_reset_stream(
+    Stream, StreamId, ErrorCode, FinalSize, #state{owner = Owner, streams = Streams} = State
+) ->
+    %% Mark stream as reset, store final size for flow control accounting.
+    %% Incoming RESET_STREAM closes our receive side.
+    NewStreams = maps:put(
+        StreamId,
+        Stream#stream_state{
+            state = reset,
+            final_size = FinalSize,
+            recv_done = true,
+            recv_buffer = gb_trees:empty(),
+            recv_buffered = 0
+        },
+        Streams
+    ),
+    %% Data delivered earlier in this receive pass reaches the
+    %% owner before the reset notification.
+    StateFl = flush_pending_delivery(State),
+    Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+    State1 = account_reset_stream(Stream, FinalSize, StateFl#state{streams = NewStreams}),
+    maybe_reclaim_stream(StreamId, State1).
+
+%% A RESET_STREAM for a stream not seen yet opens it already reset.
+reset_unseen_stream(
+    StreamId, ErrorCode, FinalSize, #state{owner = Owner, streams = Streams} = State
+) ->
+    case is_reclaimed_frame(StreamId, State) of
+        true ->
+            %% Late RESET_STREAM for an already-reclaimed stream; ignore.
+            State;
+        false ->
+            case exceeds_stream_limit(StreamId, State) of
+                true ->
+                    stream_limit_close(State);
+                false ->
+                    NewStream = new_peer_stream(StreamId, State),
+                    case reset_size_error(NewStream, FinalSize, State) of
+                        ok ->
+                            Owner ! {quic, self(), {stream_opened, StreamId}},
+                            NewStreams = maps:put(
+                                StreamId,
+                                NewStream#stream_state{
+                                    state = reset, final_size = FinalSize, recv_done = true
+                                },
+                                Streams
+                            ),
+                            StateFl = flush_pending_delivery(State),
+                            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                            maybe_reclaim_stream(
+                                StreamId,
+                                conn_grant(StateFl#state{
+                                    streams = NewStreams,
+                                    data_received = State#state.data_received + FinalSize
+                                })
+                            );
+                        {Code, Reason} ->
+                            close_with_transport_error(Code, Reason, State)
+                    end
+            end
+    end.
+
+%% RFC 9000 Sections 4.1 and 4.5: a final size below the data received is
+%% a FINAL_SIZE_ERROR, and one beyond the stream's or the connection's
+%% flow control limit a FLOW_CONTROL_ERROR.
+reset_size_error(Stream, FinalSize, State) ->
+    Highest = highest_received(Stream),
+    Below = FinalSize < Highest,
+    AboveStream = FinalSize > Stream#stream_state.recv_max_data,
+    AboveConn = State#state.data_received + (FinalSize - Highest) > State#state.max_data_local,
+    case {Below, AboveStream, AboveConn} of
+        {true, _, _} -> {?QUIC_FINAL_SIZE_ERROR, <<"final size below received data">>};
+        {_, true, _} -> {?QUIC_FLOW_CONTROL_ERROR, <<"final size above stream limit">>};
+        {_, _, true} -> {?QUIC_FLOW_CONTROL_ERROR, <<"final size above connection limit">>};
+        _ -> ok
+    end.
+
 account_reset_stream(#stream_state{recv_buffered = Buffered} = Stream, FinalSize, State) ->
     conn_grant(State#state{
         data_received =
