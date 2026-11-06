@@ -64,6 +64,11 @@ All notable changes to this project will be documented in this file.
   a long outage. With the repeated checks it gave up on the path it was
   using and could no longer send.
 
+- A server refuses a client that offers none of its application
+  protocols (ALPN), as RFC 9001 requires. It completed the handshake with
+  no protocol agreed. With the default `alpn => [<<"h3">>]` a listener
+  now turns away clients that do not offer h3.
+
 ### Changed
 - Sends queued before the connection is up share packets, for 0-RTT and
   for writes held until the handshake completes, instead of one packet
