@@ -32,7 +32,14 @@
     state_for_client/1,
     state_with_keys/1,
     with_keys_and_socket/1,
+    server_with_peer_cid/1,
+    pending_peer_path/1,
+    zero_rtt_client/1,
+    next_app_pn/1,
+    after_own_key_update/1,
+    key_phase/1,
     state_with_send_stream/3,
+    state_with_send_streams/1,
     close_reason/1,
     state_for_server/3,
     state_with_pn_app/2,
@@ -276,16 +283,20 @@ state_with_keys(Role) ->
             scid = <<"own-cid0">>
         },
         hs = #hs{
-            pn_handshake = #pn_space{
-                next_pn = 0,
-                largest_recv = undefined,
-                recv_time = undefined,
-                ack_ranges = [],
-                ack_eliciting_in_flight = 0
-            },
+            pn_initial = empty_pn_space(),
+            pn_handshake = empty_pn_space(),
             initial_keys = Keys,
             handshake_keys = Keys
         }
+    }.
+
+empty_pn_space() ->
+    #pn_space{
+        next_pn = 0,
+        largest_recv = undefined,
+        recv_time = undefined,
+        ack_ranges = [],
+        ack_eliciting_in_flight = 0
     }.
 
 %% Keys, packet-number spaces and a real socket on top of State, so a
@@ -322,6 +333,36 @@ with_keys_and_socket(State) ->
         }
     }).
 
+%% A sending server whose client uses DCID, with no spare CIDs from it.
+-spec server_with_peer_cid(binary()) -> #state{}.
+server_with_peer_cid(DCID) ->
+    S0 = with_keys_and_socket(state_for_role(server)),
+    Pool = quic_cid:set_initial_peer_cid(quic_cid:new(<<"own-cid0">>, 2), DCID, undefined),
+    S0#state{dcid = DCID, cid_pool_state = Pool}.
+
+-spec pending_peer_path(#state{}) -> #path_state{} | undefined.
+pending_peer_path(#state{mig = #mig{pending_peer_validation = Path}}) -> Path.
+%% A connection whose own key update to phase 1 the peer has confirmed:
+%% the previous keys are still held, and packets up to Largest arrived.
+-spec after_own_key_update(non_neg_integer()) -> #state{}.
+after_own_key_update(Largest) ->
+    S0 = state_with_pn_app(state_with_keys(server), Largest),
+    Old = S0#state.app_keys,
+    S1 = S0#state{
+        key_state = #key_update_state{
+            current_phase = 0,
+            current_keys = Old,
+            client_app_secret = binary:copy(<<1>>, 32),
+            server_app_secret = binary:copy(<<2>>, 32),
+            update_state = idle
+        }
+    },
+    S2 = quic_connection:initiate_key_update(S1),
+    S2#state{key_state = (S2#state.key_state)#key_update_state{update_state = idle}}.
+
+-spec key_phase(#state{}) -> 0 | 1.
+key_phase(#state{key_state = #key_update_state{current_phase = P}}) -> P.
+
 %% A connected sender that has received packets 0..4 and owes their ACK:
 %% Count ack-eliciting packets since the last ACK, timer armed or not.
 -spec state_owing_ack(non_neg_integer(), boolean()) -> #state{}.
@@ -337,6 +378,17 @@ state_owing_ack(Count, TimerArmed) ->
                 true -> make_ref();
                 false -> undefined
             end
+    }.
+
+%% Like state_with_send_stream/3 with one open send stream per id, and
+%% coalescing off, as before entering `connected'.
+-spec state_with_send_streams([non_neg_integer()]) -> #state{}.
+state_with_send_streams(Sids) ->
+    S0 = state_with_send_stream(0, 0, false),
+    #stream_state{} = Template = maps:get(0, S0#state.streams),
+    S0#state{
+        coalesce = false,
+        streams = maps:from_list([{Sid, Template#stream_state{id = Sid}} || Sid <- Sids])
     }.
 
 %% A connection with one local stream whose send side is at SendOffset,
@@ -363,6 +415,22 @@ state_with_send_stream(StreamId, SendOffset, SendFin) ->
         max_data_remote = 1000000,
         data_sent = SendOffset
     }.
+
+%% A client holding 0-RTT keys with the given streams open.
+-spec zero_rtt_client([non_neg_integer()]) -> #state{}.
+zero_rtt_client([First | _] = StreamIds) ->
+    S = state_with_send_stream(First, 0, false),
+    #{First := Stream} = S#state.streams,
+    Keys = quic_connection:derive_initial_keys(<<"early-cid">>, ?QUIC_VERSION_1),
+    S#state{
+        loss_state = quic_loss:new(),
+        cc_state = quic_cc:new(#{}),
+        streams = maps:from_list([{Id, Stream#stream_state{id = Id}} || Id <- StreamIds]),
+        hs = (S#state.hs)#hs{early_keys = Keys}
+    }.
+
+-spec next_app_pn(#state{}) -> non_neg_integer().
+next_app_pn(#state{pn_app = #pn_space{next_pn = PN}}) -> PN.
 
 -spec state_for_client({inet:ip_address(), inet:port_number()}) -> #state{}.
 state_for_client(RemoteAddr) ->
@@ -407,8 +475,11 @@ state_sending(State) ->
 state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
 state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at;
 state_get(#state{} = S, dcid) -> S#state.dcid;
+state_get(#state{} = S, app_keys) -> S#state.app_keys;
+state_get(#state{key_state = K}, prev_app_keys) -> K#key_update_state.prev_keys;
 state_get(#state{} = S, initial_keys) -> (S#state.hs)#hs.initial_keys;
 state_get(#state{} = S, handshake_keys) -> (S#state.hs)#hs.handshake_keys;
+state_get(#state{} = S, initial_next_pn) -> ((S#state.hs)#hs.pn_initial)#pn_space.next_pn;
 state_get(#state{} = S, handshake_next_pn) -> ((S#state.hs)#hs.pn_handshake)#pn_space.next_pn;
 state_get(#state{} = S, packets_sent) -> quic_connection:count(?C_PACKETS_SENT, S);
 state_get(#state{} = S, amp_tx) -> (S#state.hs)#hs.amp_tx;
@@ -435,7 +506,17 @@ state_set(#state{} = S, hs_probe, V) ->
 state_set(#state{} = S, address_validated, V) ->
     S#state{hs = (S#state.hs)#hs{address_validated = V}};
 state_set(#state{} = S, amp_rx, V) ->
-    S#state{hs = (S#state.hs)#hs{amp_rx = V}}.
+    S#state{hs = (S#state.hs)#hs{amp_rx = V}};
+state_set(#state{} = S, tls_state, V) ->
+    S#state{hs = (S#state.hs)#hs{tls_state = V}};
+state_set(#state{} = S, pto_space, V) ->
+    S#state{pto_space = V};
+state_set(#state{} = S, socket, V) ->
+    S#state{socket = V};
+state_set(#state{} = S, remote_addr, V) ->
+    S#state{remote_addr = V};
+state_set(#state{hs = #hs{pn_initial = PN} = HS} = S, initial_ack_ranges, V) ->
+    S#state{hs = HS#hs{pn_initial = PN#pn_space{ack_ranges = V}}}.
 
 %% A #state{} carrying a loss tracker, for the space whose timer is
 %% under test. The application space is only reachable once the handshake

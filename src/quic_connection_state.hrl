@@ -261,6 +261,9 @@
     %% one-shot flight; bumps after HRR so CH2 / ServerHello continue
     %% the stream (RFC 9001 §4.1.3).
     initial_tx_off = 0 :: non_neg_integer(),
+    %% The Initial ack ranges last sent, so a ServerHello that carried
+    %% them is not followed by an ACK-only Initial.
+    initial_ack_sent = [] :: [{non_neg_integer(), non_neg_integer()}],
     %% Client-side: CH1 random + build opts, needed to rebuild CH2
     tls_ch1_random :: binary() | undefined,
     %% Client-side: the Certificate(+CertificateVerify)+Finished payload,
@@ -301,6 +304,15 @@
     %% Datagrams that arrived before the keys to read them, oldest first,
     %% as {Level, Datagram, Source} (RFC 9001 Section 5.7).
     early_packets = [] :: [{handshake | app, binary(), term()}],
+    %% A probe was refused for want of anti-amplification budget; no probe
+    %% is armed again until the peer sends more.
+    amp_probe_blocked = false :: boolean(),
+    %% While a server's address is unvalidated, the Initial and Handshake
+    %% packets of one receive or probe share datagrams: {Initial packets,
+    %% Handshake packets, both reversed, bytes, padding owed}. `undefined'
+    %% outside such a pass.
+    dgram = undefined ::
+        undefined | {[binary()], [binary()], non_neg_integer(), boolean()},
     %% Client-side: a Handshake acknowledgement has arrived, so the
     %% server has validated this address (RFC 9002 Appendix A.8
     %% PeerCompletedAddressValidation). Always true for a server, which
@@ -372,7 +384,11 @@
     %% Used to ignore stale timeouts from canceled validations
     path_validation_token :: reference() | undefined,
     %% Peer's disable_active_migration transport param (RFC 9000 Section 18.2)
-    peer_disable_migration = false :: boolean()
+    peer_disable_migration = false :: boolean(),
+    %% Which of our CIDs the peer sends with on the current path, and in
+    %% the receive pass being handled
+    peer_dcid :: binary() | undefined,
+    pass_dcid :: binary() | undefined
 }).
 
 -record(state, {
@@ -429,6 +445,10 @@
     max_streams_bidi_remote :: non_neg_integer(),
     max_streams_uni_local :: non_neg_integer(),
     max_streams_uni_remote :: non_neg_integer(),
+    %% Peer streams reclaimed since the last MAX_STREAMS, per direction.
+    %% Credit goes back once half the initial limit has piled up.
+    streams_reclaimed = {0, 0} :: {non_neg_integer(), non_neg_integer()},
+    streams_credit_step = {1, 1} :: {pos_integer(), pos_integer()},
     %% Reclaimed-stream tracker (RFC 9000 §2.1: ids are never reused). Per
     %% initiator (local | peer), a sorted list of disjoint {Lo, Hi} intervals
     %% of normalised stream indexes (StreamId bsr 2). Lets us distinguish a

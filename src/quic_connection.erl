@@ -729,6 +729,7 @@ init({server, Opts}) ->
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
+        streams_credit_step = streams_credit_step(Opts),
         keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
@@ -1179,6 +1180,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
         max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
+        streams_credit_step = streams_credit_step(Opts),
         keep_alive_timer = undefined,
         last_activity = erlang:monotonic_time(millisecond),
         cc_state = CCState,
@@ -1394,16 +1396,17 @@ idle({call, From}, open_unidirectional_stream, #state{hs = #hs{early_keys = _Ear
 %% before the handshake completes must queue, or the response goes out
 %% as a 0-RTT packet the client can never decrypt.
 idle(
+    cast,
+    {send_data_async, StreamId, Data, Fin},
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{early_keys = EarlyKeys}} = State
+) when EarlyKeys =/= undefined ->
+    zero_rtt_sends([{async, StreamId, Data, Fin}], State);
+idle(
     {call, From},
     {send_data, StreamId, Data, Fin},
     #state{cfg = #conn_cfg{role = client}, hs = #hs{early_keys = EarlyKeys}} = State
 ) when EarlyKeys =/= undefined ->
-    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
-        {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
-    end;
+    zero_rtt_sends([{From, StreamId, Data, Fin}], State);
 idle(
     {call, From},
     {send_data, StreamId, Data, Fin},
@@ -1428,14 +1431,14 @@ idle(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Socket} = S
     FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 %% Server receives packets from listener
-idle(info, {quic_packet, Data, _RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
-    NewState = handle_packet(Data, State),
+idle(info, {quic_packet, Data, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
+    NewState = handle_packet(RemoteAddr, Data, State),
     %% Flush batched packets and timers after processing incoming data
     FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 %% Server receives batched packets from listener (GRO optimization)
-idle(info, {quic_packets, Packets, _RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
-    NewState = handle_packets_batch(Packets, State),
+idle(info, {quic_packets, Packets, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
+    NewState = handle_packets_batch(RemoteAddr, Packets, State),
     FlushedState = flush_event(NewState, event),
     check_state_transition(idle, FlushedState);
 idle(cast, process, #state{cfg = #conn_cfg{role = client, active_n = N}} = State) ->
@@ -1455,6 +1458,8 @@ idle({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
 idle({call, From}, early_data_accepted, State) ->
     {keep_state, State, [{reply, From, unknown}]};
+idle(info, {path_validation_timeout, _}, _State) ->
+    {keep_state_and_data, postpone};
 idle(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, idle, State).
 
@@ -1501,6 +1506,12 @@ handshaking({call, From}, open_unidirectional_stream, State) ->
     end;
 %% 0-RTT: Allow sending data during handshake if early keys are available
 handshaking(
+    cast,
+    {send_data_async, StreamId, Data, Fin},
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{early_keys = EarlyKeys}} = State
+) when EarlyKeys =/= undefined ->
+    zero_rtt_sends([{async, StreamId, Data, Fin}], State);
+handshaking(
     {call, From},
     {send_data, StreamId, Data, Fin},
     #state{cfg = #conn_cfg{role = client}, hs = #hs{early_keys = EarlyKeys}} = State
@@ -1511,12 +1522,7 @@ handshaking(
     %% must not go out in a 0-RTT packet the client can never decrypt,
     %% so the server queues below and the data goes out 1-RTT on
     %% connected.
-    case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
-        {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
-    end;
+    zero_rtt_sends([{From, StreamId, Data, Fin}], State);
 handshaking(
     {call, From},
     {send_data, StreamId, Data, Fin},
@@ -1541,16 +1547,16 @@ handshaking(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Sock
     FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 %% Server receives packets from listener
-handshaking(info, {quic_packet, Data, _RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
-    NewState = handle_packet(Data, State),
+handshaking(info, {quic_packet, Data, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State) ->
+    NewState = handle_packet(RemoteAddr, Data, State),
     %% Flush batched packets and timers after processing incoming data
     FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 %% Server receives batched packets from listener (GRO optimization)
 handshaking(
-    info, {quic_packets, Packets, _RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State
+    info, {quic_packets, Packets, RemoteAddr}, #state{cfg = #conn_cfg{role = server}} = State
 ) ->
-    NewState = handle_packets_batch(Packets, State),
+    NewState = handle_packets_batch(RemoteAddr, Packets, State),
     FlushedState = flush_event(NewState, event),
     check_state_transition(handshaking, FlushedState);
 handshaking(cast, process, #state{cfg = #conn_cfg{role = client, active_n = N}} = State) ->
@@ -1570,6 +1576,8 @@ handshaking({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = St
     {keep_state, State, [{reply, From, EK =/= undefined}]};
 handshaking({call, From}, early_data_accepted, State) ->
     {keep_state, State, [{reply, From, unknown}]};
+handshaking(info, {path_validation_timeout, _}, _State) ->
+    {keep_state_and_data, postpone};
 handshaking(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, handshaking, State).
 
@@ -2096,6 +2104,11 @@ draining(info, {udp, _Socket, _IP, _Port, _Data}, State) ->
 draining(cast, {close, _Reason}, State) ->
     %% Ignore duplicate close requests - already draining
     {keep_state, State};
+%% The draining period outlives the owner (RFC 9000 §10.2): stopping now
+%% would drop the CIDs and answer the peer's retransmitted close with a
+%% stateless reset.
+draining(info, {'DOWN', Mon, process, _Pid, _Reason}, #state{owner_mon = Mon} = State) ->
+    {keep_state, State};
 draining({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
 draining({call, From}, early_data_accepted, #state{hs = #hs{early_data_accepted = EDA}} = State) ->
@@ -2416,7 +2429,11 @@ send_client_hello(State) ->
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => (State#state.cfg)#conn_cfg.idle_timeout,
         active_connection_id_limit => local_active_limit(State),
-        max_udp_payload_size => advertised_max_udp_payload_size(State)
+        max_udp_payload_size => advertised_max_udp_payload_size(State),
+        %% RFC 9368: the versions we would also accept; the server may
+        %% switch the connection to one of them.
+        version_information =>
+            {State#state.version, (State#state.cfg)#conn_cfg.supported_versions}
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
     TransportParams1 =
@@ -2746,11 +2763,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         initial_max_streams_uni => MaxStreamsUni,
         max_idle_timeout => (State#state.cfg)#conn_cfg.idle_timeout,
         active_connection_id_limit => local_active_limit(State),
-        max_udp_payload_size => advertised_max_udp_payload_size(State),
-        %% RFC 9368: the versions we would also accept; the server may
-        %% switch the connection to one of them.
-        version_information =>
-            {State#state.version, (State#state.cfg)#conn_cfg.supported_versions}
+        max_udp_payload_size => advertised_max_udp_payload_size(State)
     },
     %% Add max_datagram_frame_size if datagrams are enabled (RFC 9221)
     TransportParams1 =
@@ -2917,16 +2930,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
 %% each sized to stay within max_udp_payload_size (RFC 9000 §14.1).
 %% A single oversized datagram is dropped by strict clients (Chromium),
 %% stalling the handshake.
-send_handshake_crypto(Payload, State0) ->
-    %% RFC 9001 Section 4.9.1: a client discards its Initial keys when it
-    %% first sends a Handshake packet. The server's trigger is receiving
-    %% one, not sending one, so it must not discard here: it still has a
-    %% ServerHello to retransmit at the Initial level.
-    State =
-        case (State0#state.cfg)#conn_cfg.role of
-            client -> discard_initial(State0);
-            server -> State0
-        end,
+send_handshake_crypto(Payload, State) ->
     Max = handshake_crypto_budget(State),
     lists:foldl(
         fun({Offset, Chunk}, AccState) ->
@@ -2934,8 +2938,17 @@ send_handshake_crypto(Payload, State0) ->
             send_handshake_packet(Frame, [{crypto, Offset, Chunk}], AccState)
         end,
         State,
-        chunk_crypto(Payload, 0, Max)
+        chunk_crypto(Payload, 0, first_chunk_budget(Max, State), Max)
     ).
+
+%% The first chunk fills what the open datagram has left, so the flight
+%% starts beside the ServerHello rather than in a datagram of its own.
+first_chunk_budget(Max, #state{hs = #hs{dgram = {_, _, Size, _}}}) when
+    Size > 0, Max - Size >= 64
+->
+    Max - Size;
+first_chunk_budget(Max, _State) ->
+    Max.
 
 %% @private Conservative per-chunk CRYPTO data budget for a Handshake
 %% packet. The ceiling is the QUIC baseline (1200): PMTU is unvalidated
@@ -2961,12 +2974,15 @@ handshake_crypto_budget(#state{dcid = DCID, cfg = #conn_cfg{scid = SCID}} = Stat
 %% @private Split a handshake CRYPTO payload into {Offset, Chunk}
 %% pieces, each Chunk =< Max, with contiguous offsets from Offset.
 %% The concatenation of the chunks equals the original payload.
-chunk_crypto(<<>>, _Offset, _Max) ->
-    [];
 chunk_crypto(Payload, Offset, Max) ->
-    Take = min(byte_size(Payload), Max),
+    chunk_crypto(Payload, Offset, Max, Max).
+
+chunk_crypto(<<>>, _Offset, _First, _Max) ->
+    [];
+chunk_crypto(Payload, Offset, First, Max) ->
+    Take = min(byte_size(Payload), First),
     <<Chunk:Take/binary, Rest/binary>> = Payload,
-    [{Offset, Chunk} | chunk_crypto(Rest, Offset + Take, Max)].
+    [{Offset, Chunk} | chunk_crypto(Rest, Offset + Take, Max, Max)].
 
 %% @private Send an Initial-level CRYPTO payload (ClientHello,
 %% ServerHello, or a HelloRetryRequest CH2) as one or more Initial
@@ -2974,16 +2990,31 @@ chunk_crypto(Payload, Offset, Max) ->
 %% (RFC 9000 §14.1). A hybrid ML-KEM ClientHello is ~1360 bytes and no
 %% longer fits one datagram; a single oversized Initial is dropped on
 %% paths with an MTU below ~1470 (PPPoE, WireGuard, mobile).
-send_initial_crypto(Payload, Offset0, State) ->
-    Max = initial_crypto_budget(State),
+send_initial_crypto(Payload, Offset0, State0) ->
+    {AckBin, Ack, State} = initial_ack(State0),
+    Max = max(1, initial_crypto_budget(State) - byte_size(AckBin)),
+    [{Offset1, Chunk1} | Chunks] = chunk_crypto(Payload, Offset0, Max),
+    First = {crypto, Offset1, Chunk1},
+    State1 = send_initial_packet(
+        <<AckBin/binary, (quic_frame:encode(First))/binary>>, Ack ++ [First], State
+    ),
     lists:foldl(
         fun({Offset, Chunk}, AccState) ->
             Decoded = {crypto, Offset, Chunk},
             send_initial_packet(quic_frame:encode(Decoded), [Decoded], AccState)
         end,
-        State,
-        chunk_crypto(Payload, Offset0, Max)
+        State1,
+        Chunks
     ).
+
+initial_ack(#state{hs = #hs{pn_initial = #pn_space{ack_ranges = []}}} = State) ->
+    {<<>>, [], State};
+initial_ack(#state{hs = #hs{pn_initial = #pn_space{ack_ranges = Ranges}} = HS} = State) ->
+    {
+        quic_ack:build_ack_frame(Ranges),
+        [{ack, Ranges, 0, undefined}],
+        bump_ack_sent(State#state{hs = HS#hs{initial_ack_sent = Ranges}})
+    }.
 
 %% @private Conservative per-chunk CRYPTO data budget for an Initial
 %% packet. Mirrors handshake_crypto_budget/1 but includes the Retry
@@ -3349,26 +3380,24 @@ send_initial_packet(Payload, Frames, State) ->
         Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
 
-    %% Pad Initial packets to at least 1200 bytes
-    PaddedPacket = pad_initial_packet(Packet),
-
     %% Congestion control counts the protected packet; the amplification
     %% budget counts the datagram, which for a short Initial is larger
     %% because it is brought to 1200 bytes outside the packet.
     Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
+    Datagram = initial_datagram(Role, AckEliciting, Packet, State),
     Meta = {initial, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
-    case gate(initial, InFlight, byte_size(Packet), PaddedPacket, Payload, Frames, State) of
+    case gate(initial, InFlight, byte_size(Packet), Datagram, Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
-            State1 = emit(PaddedPacket, Meta, Admitted),
+            State1 = emit(Datagram, Meta, Admitted),
 
             %% Emit qlog packet_sent event
             quic_qlog:packet_sent((State#state.cfg)#conn_cfg.qlog_ctx, #{
                 packet_type => initial,
                 packet_number => PN,
-                length => byte_size(PaddedPacket)
+                length => byte_size(Packet)
             }),
 
             %% Update packet number space and packet counter
@@ -3387,7 +3416,8 @@ send_initial_ack(State) ->
         Ranges ->
             %% Build ACK frame
             AckFrame = quic_ack:build_ack_frame(Ranges),
-            send_initial_packet(AckFrame, [{ack, Ranges, 0, undefined}], bump_ack_sent(State))
+            State1 = State#state{hs = (State#state.hs)#hs{initial_ack_sent = Ranges}},
+            send_initial_packet(AckFrame, [{ack, Ranges, 0, undefined}], bump_ack_sent(State1))
     end.
 
 %% Send a Handshake ACK packet
@@ -3511,6 +3541,16 @@ send_frame_tuples(FrameTuples, State) ->
 %% Send a Handshake packet
 send_handshake_packet(_Payload, _Frames, #state{hs = #hs{handshake_keys = undefined}} = State) ->
     State;
+%% RFC 9001 Section 4.9.1: a client discards its Initial keys when it
+%% first sends a Handshake packet, an ACK-only one included, so its probes
+%% move to the Handshake space. The server's trigger is receiving one: it
+%% still has a ServerHello to retransmit at the Initial level.
+send_handshake_packet(
+    Payload,
+    Frames,
+    #state{cfg = #conn_cfg{role = client}, hs = #hs{initial_keys = InitialKeys}} = State
+) when InitialKeys =/= undefined ->
+    send_handshake_packet(Payload, Frames, discard_initial(State));
 send_handshake_packet(Payload, Frames, State) ->
     #state{
         dcid = DCID,
@@ -3561,11 +3601,12 @@ send_handshake_packet(Payload, Frames, State) ->
     Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
     Meta = {handshake, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
-    case gate(handshake, InFlight, byte_size(Packet), Packet, Payload, Frames, State) of
+    Datagram = long_datagram(handshake, Packet, false, State),
+    case gate(handshake, InFlight, byte_size(Packet), Datagram, Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
-            State1 = emit(Packet, Meta, Admitted),
+            State1 = emit(Datagram, Meta, Admitted),
 
             %% Emit qlog packet_sent event
             quic_qlog:packet_sent((State#state.cfg)#conn_cfg.qlog_ctx, #{
@@ -3692,7 +3733,8 @@ end_coalescing(true, #state{pend_payload = PP, pend_frames = PF} = State) ->
 %% one packet, and the budget bounds packets on the wire. `clear' empties
 %% the coalescing buffer the payload came from, in the same update;
 %% `close' also turns coalescing off.
-send_app_packet_now(Payload0, Frames0, State, Pend, CCState) ->
+send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
+    State = flush_long_datagram(State0),
     AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames0),
     {Payload, Frames, AckFields} = piggyback_ack(AckEliciting, Payload0, Frames0, State),
     #state{
@@ -3846,16 +3888,27 @@ clear_pend(close, State) ->
 %% budget (RFC 9000 §13.2.1 lets an ACK ride on any 1-RTT packet), so an
 %% interactive exchange sends no ACK-only packet and needs no ACK timer.
 %% `acked' tells the packet update to clear the decimation state.
+%% A probe carries it even when nothing is owed: every ACK goes out once,
+%% and when that one is lost the probe is the only packet left to tell
+%% the peer which of its packets to declare lost.
 piggyback_ack(
     true,
     Payload,
     Frames,
-    #state{
-        ack_elicited_count = Count,
-        ack_timer = Timer,
-        pn_app = #pn_space{ack_ranges = [_ | _] = Ranges}
-    } = State
-) when Count > 0; Timer =/= undefined ->
+    #state{pn_app = #pn_space{ack_ranges = [_ | _] = Ranges}} = State
+) ->
+    case ack_due(State) of
+        true -> attach_ack(Ranges, Payload, Frames, State);
+        false -> {Payload, Frames, none}
+    end;
+piggyback_ack(_AckEliciting, Payload, Frames, _State) ->
+    {Payload, Frames, none}.
+
+ack_due(#state{ack_elicited_count = Count}) when Count > 0 -> true;
+ack_due(#state{ack_timer = Timer}) when Timer =/= undefined -> true;
+ack_due(#state{hs = #hs{hs_probe = Probe}}) -> Probe.
+
+attach_ack(Ranges, Payload, Frames, State) ->
     AckFrame = quic_ack:build_ack_frame_tuple(Ranges),
     AckBin = quic_frame:encode(AckFrame),
     case
@@ -3864,9 +3917,7 @@ piggyback_ack(
     of
         true -> {[AckBin | Payload], [AckFrame | Frames], acked};
         false -> {Payload, Frames, none}
-    end;
-piggyback_ack(_AckEliciting, Payload, Frames, _State) ->
-    {Payload, Frames, none}.
+    end.
 
 %% ACK timer and decimation count after the packet went out.
 sent_ack_fields(none, #state{ack_timer = T, ack_elicited_count = C}) ->
@@ -3895,6 +3946,66 @@ send_app_packet_internal_error(Reason, PN, PacketSize, PNSpace, State, ClearedSo
                 pn_app = NewPNSpace, socket_state = ClearedSocketState, burst_sent = Burst
             }
     end.
+
+%% RFC 9000 Section 14.1: a server pads only datagrams carrying an
+%% ack-eliciting Initial. An ACK-only one at full size would spend an
+%% unvalidated peer's amplification budget on nothing.
+initial_datagram(server, AckEliciting, Packet, #state{hs = #hs{dgram = {_, _, _, _}}} = State) ->
+    long_datagram(initial, Packet, AckEliciting, State);
+initial_datagram(server, false, Packet, _State) ->
+    Packet;
+initial_datagram(_Role, _AckEliciting, Packet, _State) ->
+    pad_initial_packet(Packet).
+
+%% Inside a coalescing pass a long-header packet goes into the shared
+%% datagram instead of out on its own; Pad says it is an ack-eliciting
+%% Initial, which brings the whole datagram to 1200 bytes.
+long_datagram(Level, Packet, Pad, #state{hs = #hs{dgram = {_, _, _, _}}}) ->
+    {long, Level, Packet, Pad};
+long_datagram(_Level, Packet, _Pad, _State) ->
+    Packet.
+
+%% Run Fun as one coalescing pass when it can save the server
+%% amplification budget, then send whatever datagram it left open.
+coalescing_pass(
+    Fun,
+    #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false, dgram = undefined}} =
+        State0
+) ->
+    State1 = Fun(State0#state{hs = (State0#state.hs)#hs{dgram = {[], [], 0, false}}}),
+    State = flush_long_datagram(State1),
+    State#state{hs = (State#state.hs)#hs{dgram = undefined}};
+coalescing_pass(Fun, State) ->
+    Fun(State).
+
+%% Put the open datagram on the wire; the pass stays open.
+flush_long_datagram(#state{hs = #hs{dgram = {[], [], _, _}}} = State) ->
+    State;
+flush_long_datagram(#state{hs = #hs{dgram = {Initials, Handshakes, Size, Pad}} = HS} = State) ->
+    Datagram0 = iolist_to_binary([lists:reverse(Initials), lists:reverse(Handshakes)]),
+    Datagram =
+        case Pad andalso Size < 1200 of
+            true -> pad_initial_packet(Datagram0);
+            false -> Datagram0
+        end,
+    State1 = State#state{hs = HS#hs{dgram = {[], [], 0, false}}},
+    State1#state{socket_state = send_and_take_socket_state(Datagram, State1)};
+flush_long_datagram(State) ->
+    State.
+
+%% What adding Packet to the open datagram costs against the budget,
+%% and whether it opens a new one. Everything already in it is paid for.
+long_cost(Packet, Pad, {_, _, Size, Pad0}) ->
+    New = byte_size(Packet),
+    case Size =:= 0 orelse Size + New > 1200 of
+        true ->
+            {open, datagram_size(New, Pad)};
+        false ->
+            {append, datagram_size(Size + New, Pad orelse Pad0) - datagram_size(Size, Pad0)}
+    end.
+
+datagram_size(Size, true) -> max(Size, 1200);
+datagram_size(Size, false) -> Size.
 
 %% Pad Initial packet to minimum 1200 bytes
 pad_initial_packet(Packet) when byte_size(Packet) >= 1200 ->
@@ -3979,14 +4090,38 @@ handle_packet(Data, State) ->
     %% anti-amplification budget, then retry any flight a gate held back,
     %% which the fresh budget (or address validation) may now let out.
     State1 = amp_account_recv(Data, State),
-    State2 = handle_packet_loop(Data, State1),
-    drain_pending_hs(State2).
+    coalescing_pass(
+        fun(S0) ->
+            S1 = handle_packet_loop(Data, S0),
+            drain_pending_hs(S1)
+        end,
+        State1
+    ).
+
+%% A server still in its handshake follows the client to the address the
+%% datagram came from before the flights held back by the amplification
+%% limit go out, so they go to where the client is now.
+handle_packet(RemoteAddr, Data, State0) ->
+    State1 = amp_account_recv(Data, State0),
+    coalescing_pass(
+        fun(S0) ->
+            S1 = handle_packet_loop(Data, S0),
+            drain_pending_hs(follow_handshake_peer(RemoteAddr, S0, S1))
+        end,
+        State1
+    ).
 
 %% Server-side anti-amplification accounting/gating (RFC 9000 §8.1).
+%% A blocked server arms no probe, so a receive that lifts the block has
+%% to plan one: it sends nothing in flight, and nothing else would.
 amp_account_recv(
-    Data, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
+    Data, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false} = HS} = State0
 ) ->
-    State#state{hs = (State#state.hs)#hs{amp_rx = (State#state.hs)#hs.amp_rx + byte_size(Data)}};
+    State = State0#state{
+        hs = HS#hs{amp_rx = HS#hs.amp_rx + byte_size(Data), amp_probe_blocked = false}
+    },
+    Lifted = amplification_blocked(State0) andalso not amplification_blocked(State),
+    State#state{pto_dirty = State#state.pto_dirty orelse Lifted};
 amp_account_recv(_Data, State) ->
     State.
 
@@ -4008,8 +4143,14 @@ amp_account_recv(_Data, State) ->
     quic_loss:space(), boolean(), non_neg_integer(), iodata(), iodata(), [term()], #state{}
 ) ->
     {ok, #state{}} | {deferred, #state{}}.
+%%
+%% A refused probe is not queued: what it carries is still outstanding,
+%% so the next probe carries it again, and a queued copy per expiry is
+%% what filled the queue.
 gate(Space, InFlight, Size, Datagram, Payload, Frames, State) ->
     case amp_allows(Datagram, State) of
+        false when (State#state.hs)#hs.hs_probe ->
+            {deferred, State#state{hs = (State#state.hs)#hs{amp_probe_blocked = true}}};
         false ->
             {deferred, enqueue_hs(Space, Payload, Frames, State)};
         true ->
@@ -4021,14 +4162,47 @@ gate(Space, InFlight, Size, Datagram, Payload, Frames, State) ->
 %% is absolute, so unlike the congestion window it has no probe
 %% exemption.
 amp_allows(
+    {long, _Level, Packet, Pad},
+    #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false, dgram = Open}} =
+        State
+) ->
+    {_, Cost} = long_cost(Packet, Pad, Open),
+    ((State#state.hs)#hs.amp_tx + Cost) =< (3 * (State#state.hs)#hs.amp_rx);
+amp_allows(
     Datagram, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
 ) ->
     ((State#state.hs)#hs.amp_tx + erlang:iolist_size(Datagram)) =< (3 * (State#state.hs)#hs.amp_rx);
 amp_allows(_Datagram, _State) ->
     true.
 
+amp_charge(
+    Size, #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false} = HS} = State
+) ->
+    State#state{hs = HS#hs{amp_tx = HS#hs.amp_tx + Size}};
+amp_charge(_Size, State) ->
+    State.
+
 %% Put the datagram on the wire and charge it, in that order: nothing is
-%% spent until both gates have passed.
+%% spent until both gates have passed. A packet for the open datagram is
+%% charged now and goes out with it.
+emit({long, Level, Packet, Pad}, Meta, #state{hs = #hs{dgram = Open}} = State0) ->
+    State =
+        case long_cost(Packet, Pad, Open) of
+            {open, _} -> flush_long_datagram(State0);
+            {append, _} -> State0
+        end,
+    #hs{dgram = Open1} = HS = State#state.hs,
+    {_, Cost} = long_cost(Packet, Pad, Open1),
+    {Initials, Handshakes, Size, Pad0} = Open1,
+    Dgram =
+        case Level of
+            initial ->
+                {[Packet | Initials], Handshakes, Size + byte_size(Packet), Pad0 orelse Pad};
+            handshake ->
+                {Initials, [Packet | Handshakes], Size + byte_size(Packet), Pad0 orelse Pad}
+        end,
+    State1 = State#state{hs = HS#hs{dgram = Dgram, amp_tx = HS#hs.amp_tx + Cost}},
+    register_now(Meta, erlang:monotonic_time(millisecond), State1);
 emit(
     Datagram,
     Meta,
@@ -4083,8 +4257,23 @@ server_discard_initial(_Type, State) ->
 %% out.
 handle_packets_batch(Packets, State) ->
     State1 = lists:foldl(fun amp_account_recv/2, State, Packets),
-    State2 = do_handle_packets_batch(Packets, State1),
-    drain_pending_hs(State2).
+    coalescing_pass(
+        fun(S0) ->
+            S1 = do_handle_packets_batch(Packets, S0),
+            drain_pending_hs(S1)
+        end,
+        State1
+    ).
+
+handle_packets_batch(RemoteAddr, Packets, State0) ->
+    State1 = lists:foldl(fun amp_account_recv/2, State0, Packets),
+    coalescing_pass(
+        fun(S0) ->
+            S1 = do_handle_packets_batch(Packets, S0),
+            drain_pending_hs(follow_handshake_peer(RemoteAddr, S0, S1))
+        end,
+        State1
+    ).
 
 %% Handle batch of packets from GRO - process all without re-entering gen_statem
 %% This is more efficient than receiving multiple messages
@@ -4107,6 +4296,10 @@ do_handle_packets_batch([Packet | Rest], State) ->
 %% Peer-direction keys for the batched fused open, under the same
 %% no-key-update-in-flight condition as fused_decrypt_keys/2.
 fused_run_keys(#state{app_keys = undefined}) ->
+    no;
+fused_run_keys(#state{cfg = #conn_cfg{role = server}, hs = #hs{tls_state = TlsState}}) when
+    TlsState =/= ?TLS_HANDSHAKE_COMPLETE
+->
     no;
 fused_run_keys(#state{app_keys = {ClientKeys, ServerKeys}, cfg = #conn_cfg{role = Role}} = State) ->
     Current =
@@ -4467,10 +4660,30 @@ server_recv_pass(Packets, RemoteAddr, State) ->
     case NewState#state.has_non_probing_frame of
         true ->
             TotalSize = lists:sum([byte_size(P) || P <- Packets]),
-            maybe_handle_address_change(RemoteAddr, TotalSize, NewState);
+            Mig = NewState#state.mig,
+            PassDCID = pass_dcid(Packets, NewState),
+            Changed = maybe_handle_address_change(
+                RemoteAddr, TotalSize, NewState#state{mig = Mig#mig{pass_dcid = PassDCID}}
+            ),
+            note_peer_dcid(RemoteAddr, PassDCID, Changed);
         false ->
             NewState
     end.
+
+%% The destination CID of the pass's first 1-RTT packet, one of ours.
+pass_dcid(Packets, #state{cfg = #conn_cfg{scid = SCID}}) ->
+    Len = byte_size(SCID),
+    case [D || <<0:1, 1:1, _:6, D:Len/binary, _/binary>> <- Packets] of
+        [DCID | _] -> DCID;
+        [] -> undefined
+    end.
+
+note_peer_dcid(RemoteAddr, DCID, #state{remote_addr = RemoteAddr, mig = Mig} = State) when
+    DCID =/= undefined
+->
+    State#state{mig = Mig#mig{peer_dcid = DCID, pass_dcid = undefined}};
+note_peer_dcid(_RemoteAddr, _DCID, #state{mig = Mig} = State) ->
+    State#state{mig = Mig#mig{pass_dcid = undefined}}.
 
 %% Drain datagram messages already queued in the mailbox into the
 %% current receive pass, so ACK emission, socket-batch flushing and
@@ -4591,6 +4804,10 @@ handle_packet_loop(Data, State) ->
             %% Nothing may be sent in response, so just abandon the attempt.
             maybe_reenable_socket(State),
             State#state{close_reason = Reason};
+        {error, handshake_incomplete} ->
+            %% A server holds 1-RTT packets until the handshake completes
+            %% (RFC 9001 Section 5.7).
+            keep_early_packet(handshake_incomplete, Data, State);
         {error, Reason} when
             Reason =:= padding_only;
             Reason =:= empty_packet;
@@ -4666,7 +4883,8 @@ keep_early_packet(Reason, Data, #state{hs = #hs{early_packets = Early} = HS} = S
     Level =
         case Reason of
             no_handshake_keys -> handshake;
-            no_app_keys -> app
+            no_app_keys -> app;
+            handshake_incomplete -> app
         end,
     Entry = {Level, Data, State#state.current_packet_source},
     State#state{hs = HS#hs{early_packets = Early ++ [Entry]}};
@@ -4693,8 +4911,14 @@ replay_early_packets(#state{hs = #hs{early_packets = Early} = HS} = State) ->
             State1#state{current_packet_source = Source}
     end.
 
-has_keys_for(handshake, #state{hs = #hs{handshake_keys = Keys}}) -> Keys =/= undefined;
-has_keys_for(app, #state{app_keys = Keys}) -> Keys =/= undefined.
+has_keys_for(handshake, #state{hs = #hs{handshake_keys = Keys}}) ->
+    Keys =/= undefined;
+has_keys_for(app, #state{cfg = #conn_cfg{role = server}, hs = #hs{tls_state = TlsState}}) when
+    TlsState =/= ?TLS_HANDSHAKE_COMPLETE
+->
+    false;
+has_keys_for(app, #state{app_keys = Keys}) ->
+    Keys =/= undefined.
 
 binhex(Bin) when is_binary(Bin) -> binary:encode_hex(Bin);
 binhex(Other) -> Other.
@@ -5121,6 +5345,15 @@ check_stateless_reset(Data, #state{cid_pool_state = Pool} = _State) ->
             {error, decryption_failed}
     end.
 
+%% RFC 9001 §5.7: a server must not process 1-RTT packets before the
+%% handshake completes. Acknowledging one would let the client consider
+%% the handshake confirmed and drop its Handshake keys while our
+%% Handshake flight is still unacknowledged.
+decode_short_header_packet(
+    _Data,
+    #state{cfg = #conn_cfg{role = server}, hs = #hs{tls_state = TlsState}}
+) when TlsState =/= ?TLS_HANDSHAKE_COMPLETE ->
+    {error, handshake_incomplete};
 decode_short_header_packet(Data, State) ->
     case State#state.app_keys of
         undefined ->
@@ -5228,7 +5461,8 @@ decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
             {error, Reason};
         {ok, KeyPhase, PNLen, TruncatedPN, UnprotectedHeader} ->
             %% Select keys based on key_phase
-            {DecryptKeys, State1} = select_decrypt_keys(KeyPhase, State),
+            PN0 = quic_aead:reconstruct_pn(get_largest_recv(app, State), TruncatedPN, PNLen),
+            {DecryptKeys, State1} = select_decrypt_keys(KeyPhase, PN0, State),
             PeerDecryptKeys =
                 case (State1#state.cfg)#conn_cfg.role of
                     % ClientKeys
@@ -5427,7 +5661,10 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% RFC 9000: Invalid ACK range is a protocol violation
                     ?LOG_ERROR(#{what => invalid_ack_range}, ?QUIC_LOG_META),
                     State;
-                {NewLossState, AckedPackets, LostPackets, AckMeta} ->
+                {NewLossState0, AckedPackets, LostPackets, AckMeta} ->
+                    NewLossState = keep_unvalidated_backoff(
+                        Level, LossState, NewLossState0, State
+                    ),
                     %% Use pre-computed metadata from quic_loss (avoids redundant scanning)
                     AckedBytes = maps:get(acked_bytes, AckMeta, 0),
                     LargestAckedSentTime = maps:get(largest_ae_time, AckMeta, Now),
@@ -6461,6 +6698,9 @@ process_tls_message(
                     ServerHsSecret = quic_crypto:derive_server_handshake_secret(
                         Cipher, HandshakeSecret, TranscriptHash
                     ),
+                    keylog_handshake(
+                        (State#state.hs)#hs.tls_ch1_random, ClientHsSecret, ServerHsSecret
+                    ),
                     {ClientKey, ClientIV, ClientHP} =
                         quic_keys:derive_keys(ClientHsSecret, Cipher, State#state.version),
                     {ServerKey, ServerIV, ServerHP} =
@@ -6809,9 +7049,10 @@ process_tls_message(
                     %% The server's handshake is confirmed once complete
                     %% (RFC 9001 §4.1.2); tell the client.
                     State2 = send_handshake_done(confirm_handshake(State1)),
+                    State3 = rechallenge_pending_path(State2),
 
                     %% Send NewSessionTicket to enable session resumption
-                    send_new_session_ticket(State2);
+                    send_new_session_ticket(State3);
                 false ->
                     State
             end;
@@ -7752,8 +7993,10 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                     {DeliverData, NewRecvOffset, NewBuffer, DeliverFin, BufferedDelta} =
                         case Offset =:= CurrentOffset andalso gb_trees:is_empty(RecvBuffer) of
                             true ->
-                                %% In-order with empty buffer: deliver directly
-                                {Data, EndOffset, RecvBuffer, Fin, 0};
+                                %% In-order with empty buffer: deliver directly.
+                                %% A FIN already delivered is not delivered again.
+                                {Data, EndOffset, RecvBuffer,
+                                    Fin andalso not Stream#stream_state.recv_fin, 0};
                             false ->
                                 %% Out-of-order or buffer has data: use buffer path
                                 {UpdatedBuffer, Added} =
@@ -7763,7 +8006,9 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                                         UpdatedBuffer, CurrentOffset
                                     ),
                                 ExtractedFin =
-                                    FinalSize =/= undefined andalso ExtractedOffset >= FinalSize,
+                                    not Stream#stream_state.recv_fin andalso
+                                        FinalSize =/= undefined andalso
+                                        ExtractedOffset >= FinalSize,
                                 {ExtractedData, ExtractedOffset, ExtractedBuffer, ExtractedFin,
                                     Added - Removed}
                         end,
@@ -7781,7 +8026,7 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
 
                     NewStream = Stream#stream_state{
                         recv_offset = NewRecvOffset,
-                        recv_fin = DeliverFin,
+                        recv_fin = Stream#stream_state.recv_fin orelse DeliverFin,
                         recv_buffer = NewBuffer,
                         recv_buffered = Stream#stream_state.recv_buffered + BufferedDelta,
                         final_size = FinalSize,
@@ -8235,8 +8480,10 @@ close_raw_client_socket(Opts, Socket) ->
             end
     end.
 
-%% Flush any batched packets (call before timers or idle periods)
-flush_socket_batch(#state{socket_state = SocketState} = State) ->
+%% Flush any batched packets (call before timers or idle periods),
+%% the open coalesced datagram first.
+flush_socket_batch(State0) ->
+    #state{socket_state = SocketState} = State = flush_long_datagram(State0),
     case flushed_socket_state(SocketState) of
         %% Empty batch: the socket state is returned as is.
         SocketState -> State;
@@ -8349,11 +8596,19 @@ maybe_send_ack(handshake, Frames, State) ->
         true -> send_handshake_ack(State);
         false -> State
     end;
+maybe_send_ack(
+    initial,
+    _Frames,
+    #state{hs = #hs{initial_ack_sent = Ranges, pn_initial = #pn_space{ack_ranges = Ranges}}} = State
+) ->
+    State;
 maybe_send_ack(initial, Frames, State) ->
     case quic_ack:contains_ack_eliciting_frames(Frames) of
         true -> send_initial_ack(State);
         false -> State
     end;
+maybe_send_ack(zero_rtt, Frames, State) ->
+    maybe_send_ack(app, Frames, State);
 maybe_send_ack(_, _, State) ->
     State.
 
@@ -8956,16 +9211,30 @@ peer_stream_kind(StreamId) ->
     end.
 
 credit_peer_on_reclaim(StreamId, Role, State) ->
+    #state{streams_reclaimed = {Bidi, Uni}, streams_credit_step = {BidiStep, UniStep}} = State,
     case stream_class(StreamId, Role) of
+        {bidi, peer} when Bidi + 1 >= BidiStep ->
+            N = State#state.max_streams_bidi_local + Bidi + 1,
+            send_frame({max_streams, bidi, N}, State#state{
+                max_streams_bidi_local = N, streams_reclaimed = {0, Uni}
+            });
         {bidi, peer} ->
-            N = State#state.max_streams_bidi_local + 1,
-            send_frame({max_streams, bidi, N}, State#state{max_streams_bidi_local = N});
+            State#state{streams_reclaimed = {Bidi + 1, Uni}};
+        {uni, peer} when Uni + 1 >= UniStep ->
+            N = State#state.max_streams_uni_local + Uni + 1,
+            send_frame({max_streams, uni, N}, State#state{
+                max_streams_uni_local = N, streams_reclaimed = {Bidi, 0}
+            });
         {uni, peer} ->
-            N = State#state.max_streams_uni_local + 1,
-            send_frame({max_streams, uni, N}, State#state{max_streams_uni_local = N});
+            State#state{streams_reclaimed = {Bidi, Uni + 1}};
         _ ->
             State
     end.
+
+streams_credit_step(Opts) ->
+    Bidi = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+    Uni = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+    {max(1, Bidi div 2), max(1, Uni div 2)}.
 
 cancel_stream_deadline_timer(#stream_state{deadline_timer = undefined}) ->
     ok;
@@ -9445,9 +9714,33 @@ send_admitted_data(
 
 %% Send 0-RTT (early) data on a stream
 %% RFC 9001 Section 4.6: 0-RTT data uses the early traffic secret
-do_send_zero_rtt_data(
-    StreamId, Data, Fin, #state{streams = Streams, hs = #hs{early_keys = {EarlyKeys, _}}} = State
-) ->
+%%
+%% The send calls already queued are taken as one batch and their frames
+%% share packets: a client that opens a stream per request would
+%% otherwise send each request in a datagram of its own.
+zero_rtt_sends(Acc, #state{hs = #hs{early_keys = {EarlyKeys, _}}} = State0) ->
+    {RevReplies, RevFrames, State1} =
+        lists:foldl(
+            fun({From, StreamId, Data, Fin}, {Rs, Fs, S}) ->
+                case zero_rtt_frames(StreamId, Data, Fin, S) of
+                    {ok, Frames, S1} -> {[{From, ok} | Rs], lists:reverse(Frames, Fs), S1};
+                    {error, Reason} -> {[{From, {error, Reason}} | Rs], Fs, S}
+                end
+            end,
+            {[], [], State0},
+            drain_send_msgs(Acc, 63)
+        ),
+    MaxPayload = get_max_stream_data_per_packet(State1),
+    State = lists:foldl(
+        fun(Frames, S) ->
+            send_zero_rtt_packet([quic_frame:encode(F) || F <- Frames], Frames, EarlyKeys, S)
+        end,
+        State1,
+        pack_frames(lists:reverse(RevFrames), MaxPayload)
+    ),
+    {keep_state, State, [{reply, F, R} || {F, R} <- lists:reverse(RevReplies), F =/= async]}.
+
+zero_rtt_frames(StreamId, Data, Fin, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, StreamState} ->
             DataBin = iolist_to_binary(Data),
@@ -9457,9 +9750,7 @@ do_send_zero_rtt_data(
             %% 1-RTT send; a single oversized 0-RTT packet leaves as one
             %% IP-fragmented datagram, which QUIC forbids (RFC 9000 §14).
             MaxChunk = get_max_stream_data_per_packet(State),
-            NewState = send_zero_rtt_chunks(
-                StreamId, Offset, DataBin, Fin, MaxChunk, EarlyKeys, State
-            ),
+            Frames = zero_rtt_chunks(StreamId, Offset, DataBin, Fin, MaxChunk),
 
             %% Update stream state and track early data sent
             NewStreamState = StreamState#stream_state{
@@ -9472,31 +9763,45 @@ do_send_zero_rtt_data(
                 StreamId, (State#state.hs)#hs.zero_rtt_stream_ids
             ),
 
-            FinalState0 = NewState#state{
+            State1 = State#state{
                 streams = maps:put(StreamId, NewStreamState, Streams),
-                hs = (NewState#state.hs)#hs{
+                hs = (State#state.hs)#hs{
                     early_data_sent = EarlyDataSent,
                     zero_rtt_stream_ids = NewZeroRttIds
                 }
             },
             %% RFC 9000 §4.6: extend MAX_STREAMS once this stream is fully
             %% closed (covers the rare 0-RTT FIN-from-server case).
-            {ok, maybe_reclaim_stream(StreamId, FinalState0)};
+            {ok, Frames, maybe_reclaim_stream(StreamId, State1)};
         error ->
             {error, unknown_stream}
     end.
 
 %% Split a 0-RTT write into per-packet STREAM frames, FIN on the last.
-send_zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk, EarlyKeys, State) when
-    byte_size(Data) =< MaxChunk
-->
-    Frame = {stream, StreamId, Offset, Data, Fin},
-    send_zero_rtt_packet(quic_frame:encode(Frame), [Frame], EarlyKeys, State);
-send_zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk, EarlyKeys, State) ->
+zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk) when byte_size(Data) =< MaxChunk ->
+    [{stream, StreamId, Offset, Data, Fin}];
+zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk) ->
     <<Chunk:MaxChunk/binary, Rest/binary>> = Data,
-    Frame = {stream, StreamId, Offset, Chunk, false},
-    State1 = send_zero_rtt_packet(quic_frame:encode(Frame), [Frame], EarlyKeys, State),
-    send_zero_rtt_chunks(StreamId, Offset + MaxChunk, Rest, Fin, MaxChunk, EarlyKeys, State1).
+    [
+        {stream, StreamId, Offset, Chunk, false}
+        | zero_rtt_chunks(StreamId, Offset + MaxChunk, Rest, Fin, MaxChunk)
+    ].
+
+%% Group frames into packets of at most MaxPayload encoded bytes, in
+%% order. A frame larger than that gets a packet of its own.
+pack_frames(Frames, MaxPayload) ->
+    pack_frames(Frames, MaxPayload, 0, [], []).
+
+pack_frames([], _Max, _Size, [], Packets) ->
+    lists:reverse(Packets);
+pack_frames([], _Max, _Size, Cur, Packets) ->
+    lists:reverse([lists:reverse(Cur) | Packets]);
+pack_frames([F | Rest] = Frames, Max, Size, Cur, Packets) ->
+    FSize = iolist_size(quic_frame:encode(F)),
+    case Cur =/= [] andalso Size + FSize > Max of
+        true -> pack_frames(Frames, Max, 0, [], [lists:reverse(Cur) | Packets]);
+        false -> pack_frames(Rest, Max, Size + FSize, [F | Cur], Packets)
+    end.
 
 %% Send a 0-RTT packet (long header, type 1)
 %% RFC 9001 Section 5.3: 0-RTT packets use early traffic keys
@@ -9893,7 +10198,7 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
     {chunked_ctx, MaxChunkSize, _Urgency, _PacketSize, HeaderPrefix, LengthVarint, _Where} = Ctx,
     %% A packet still pending from send coalescing goes out first so
     %% the wire order matches the send order.
-    State = flush_pending_packet(State0),
+    State = flush_pending_packet(flush_long_datagram(State0)),
     #state{
         dcid = DCID,
         app_keys = {ClientKeys, ServerKeys},
@@ -10473,17 +10778,21 @@ process_send_queue_entry(
             end
     end.
 
-%% Send data that was queued before connection was established
+%% Send data that was queued before connection was established. The
+%% writes go out as one batch, as coalesced_sends/2 does for writes
+%% queued together in `connected', so they share packets.
 send_pending_data([], State) ->
     State;
-send_pending_data([{StreamId, Data, Fin} | Rest], State) ->
+send_pending_data(Pending, State0) ->
+    Coalesce = tl(Pending) =/= [],
+    State1 = lists:foldl(fun send_pending_entry/2, start_coalescing(Coalesce, State0), Pending),
+    end_coalescing(Coalesce, State1).
+
+send_pending_entry({StreamId, Data, Fin}, State) ->
     %% Accepted before the handshake finished; refusing it now would drop it.
     case do_send_data(StreamId, Data, Fin, State, force) of
-        {ok, NewState} ->
-            send_pending_data(Rest, NewState);
-        {error, _Reason} ->
-            %% Skip failed sends
-            send_pending_data(Rest, State)
+        {ok, NewState} -> NewState;
+        {error, _Reason} -> State
     end.
 
 %% RFC 9000 Section 3.5: STOP_SENDING MUST be answered with RESET_STREAM
@@ -11458,12 +11767,17 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
     NewLossState = quic_loss:on_pto_expired(LossState),
     State1 = State#state{loss_state = NewLossState},
 
-    %% The probe goes out in the space the timer was armed for: at any
-    %% other encryption level the peer cannot act on it, and before
-    %% confirmation it could not even decrypt it. RFC 9002 Section 7
+    %% The probe goes out in the space the timer was armed for, with its
+    %% Initial or Handshake counterpart (probe_spaces/2). Application data
+    %% is never added to a handshake probe or the other way round: before
+    %% confirmation the peer could not decrypt it. RFC 9002 Section 7
     %% exempts it from the congestion window, which is what stops a
     %% blocked connection deadlocking on its own.
-    Probing = send_probe_packet(Space, State1#state{hs = (State1#state.hs)#hs{hs_probe = true}}),
+    {ProbeSpace, State1a} = probe_space(Space, State1),
+    Probing = coalescing_pass(
+        fun(S) -> lists:foldl(fun send_probe_packet/2, S, probe_spaces(ProbeSpace, S)) end,
+        State1a#state{hs = (State1a#state.hs)#hs{hs_probe = true}}
+    ),
     State2 = Probing#state{hs = (Probing#state.hs)#hs{hs_probe = false}},
 
     %% Probes use the control allowance, so retry any CC-deferred control
@@ -11476,6 +11790,33 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
 
     %% Set new PTO timer
     set_pto_timer(State3).
+
+%% RFC 9002 Section 6.2.4: Initial and Handshake probes are coalesced.
+%% Both spaces share one backoff, so probing only the space whose
+%% deadline came first would leave each probed at every other expiry.
+%% Initial goes first, as a coalesced datagram requires.
+probe_spaces(initial, State) ->
+    [initial | outstanding_space(handshake, State)];
+probe_spaces(handshake, State) ->
+    outstanding_space(initial, State) ++ [handshake];
+probe_spaces(Space, _State) ->
+    [Space].
+
+outstanding_space(Space, State) ->
+    case get_oldest_unacked_frames(Space, State) of
+        {ok, _} -> [Space];
+        none -> []
+    end.
+
+%% RFC 9002 Section 6.2.2.1: a client with Handshake keys probes with a
+%% Handshake packet, and sending one discards its Initial keys (RFC 9001
+%% Section 4.9.1).
+probe_space(
+    initial, #state{cfg = #conn_cfg{role = client}, hs = #hs{handshake_keys = Keys}} = State
+) when Keys =/= undefined ->
+    {handshake, discard_initial(State)};
+probe_space(Space, State) ->
+    {Space, State}.
 
 %% Send a probe packet for PTO
 %% PTO probes are allowed to use control_allowance per RFC 9002
@@ -11609,11 +11950,13 @@ pto_selection(LossState, Now, State) ->
     end.
 
 %% A server has to stop at three times what it has received from an
-%% unvalidated address (RFC 9000 Section 8.1).
+%% unvalidated address (RFC 9000 Section 8.1), and is as good as stopped
+%% once a probe has been refused for lack of room.
 amplification_blocked(
     #state{cfg = #conn_cfg{role = server}, hs = #hs{address_validated = false}} = State
 ) ->
-    (State#state.hs)#hs.amp_tx >= 3 * (State#state.hs)#hs.amp_rx;
+    (State#state.hs)#hs.amp_probe_blocked orelse
+        (State#state.hs)#hs.amp_tx >= 3 * (State#state.hs)#hs.amp_rx;
 amplification_blocked(_State) ->
     false.
 
@@ -11630,6 +11973,17 @@ handshake_status(#state{loss_state = LossState, hs = #hs{handshake_keys = HSKeys
             (State#state.hs)#hs.handshake_ack_received orelse
                 quic_loss:handshake_confirmed(LossState)
     }.
+
+%% RFC 9002 Section 6.2.1: a client unsure the server has validated its
+%% address keeps its PTO backoff across acknowledgements. A Handshake
+%% acknowledgement is itself that assurance.
+keep_unvalidated_backoff(initial, Before, After, #state{cfg = #conn_cfg{role = client}} = State) ->
+    case (handshake_status(State))#handshake_status.peer_completed_address_validation of
+        true -> After;
+        false -> quic_loss:keep_pto_backoff(Before, After)
+    end;
+keep_unvalidated_backoff(_Level, _Before, After, _State) ->
+    After.
 
 arm_pto_timer(Delay, State) ->
     {Ref, ArmedAt} = start_pto_timer(Delay),
@@ -12154,10 +12508,10 @@ handle_peer_key_update(#state{key_state = KeyState} = State) ->
 
 %% @doc Select the appropriate keys for decryption based on the received key phase.
 %% Returns {Keys, State} where State may be updated if a key update is detected.
-select_decrypt_keys(_ReceivedKeyPhase, #state{key_state = undefined} = State) ->
+select_decrypt_keys(_ReceivedKeyPhase, _PN, #state{key_state = undefined} = State) ->
     %% No key state yet, use app_keys directly (should not happen in practice)
     {State#state.app_keys, State};
-select_decrypt_keys(ReceivedKeyPhase, #state{key_state = KeyState} = State) ->
+select_decrypt_keys(ReceivedKeyPhase, PN, #state{key_state = KeyState} = State) ->
     #key_update_state{
         current_phase = CurrentPhase,
         current_keys = CurrentKeys,
@@ -12181,15 +12535,21 @@ select_decrypt_keys(ReceivedKeyPhase, #state{key_state = KeyState} = State) ->
                 key_state = KeyState#key_update_state{update_state = idle}
             }};
         _ ->
-            %% Different phase - could be peer initiating update or using prev keys
-            case PrevKeys of
-                undefined ->
-                    %% No previous keys, peer is initiating update
-                    %% Handle the key update and decrypt with new keys
+            %% RFC 9001 §6.5: once the current phase is confirmed, a packet
+            %% in the other phase numbered above everything received so far
+            %% starts the peer's next update; one below it is a late packet
+            %% from the previous phase.
+            NewerThanAll =
+                case get_largest_recv(app, State) of
+                    undefined -> true;
+                    Largest -> PN > Largest
+                end,
+            PeerUpdate = PrevKeys =:= undefined orelse (UpdateState =:= idle andalso NewerThanAll),
+            case PeerUpdate of
+                true ->
                     State1 = handle_peer_key_update(State),
                     {State1#state.key_state#key_update_state.current_keys, State1};
-                _ ->
-                    %% Try previous keys (during transition period)
+                false ->
                     {PrevKeys, State}
             end
     end.
@@ -12336,15 +12696,17 @@ send_path_challenge(
             ),
 
             %% Send to the specific path address (not current remote_addr)
-            case send_packet_to_addr(IP, Port, Packet, State) of
+            case amp_allows(Packet, State) andalso send_packet_to_addr(IP, Port, Packet, State) of
                 ok ->
                     %% Update path bytes_sent for anti-amplification tracking
                     PacketSize = byte_size(Packet),
-                    State1 = update_path_bytes_sent(IP, Port, PacketSize, State),
+                    State1 = amp_charge(
+                        PacketSize, update_path_bytes_sent(IP, Port, PacketSize, State)
+                    ),
                     %% Increment packet number
                     NewPnApp = PNSpace#pn_space{next_pn = PN + 1},
                     State1#state{pn_app = NewPnApp};
-                {error, _Reason} ->
+                _ ->
                     State
             end;
         _ ->
@@ -12577,6 +12939,67 @@ close_socket_state_quietly(SocketState) ->
 %% Server-Side Address Change Detection (RFC 9000 Section 9)
 %%====================================================================
 
+%% Before the handshake completes there is no path validation to fall
+%% back on, and a NAT rebinding leaves the old address dead, so the
+%% server sends to wherever the newest packet came from. Until the
+%% client's first Handshake packet the anti-amplification limit covers
+%% every address alike.
+follow_handshake_peer(RemoteAddr, Before, #state{remote_addr = Current} = After) when
+    RemoteAddr =/= Current
+->
+    case largest_received(After) =/= largest_received(Before) of
+        true -> challenge_handshake_peer(RemoteAddr, After);
+        false -> After
+    end;
+follow_handshake_peer(_RemoteAddr, _Before, After) ->
+    After.
+
+%% RFC 9000 Section 9: a peer that moves before the handshake is
+%% confirmed is validated, which takes a 1-RTT PATH_CHALLENGE. The
+%% client has no other CID yet, so the path keeps the current one.
+challenge_handshake_peer(
+    NewAddr, #state{app_keys = {_, _}, mig = #mig{migration_state = idle} = Mig} = State
+) ->
+    ChallengeData = crypto:strong_rand_bytes(8),
+    Path = #path_state{
+        remote_addr = NewAddr,
+        status = validating,
+        challenge_data = ChallengeData,
+        challenge_count = 1,
+        bytes_sent = 0,
+        bytes_received = 0,
+        dcid = State#state.dcid,
+        is_nat_rebinding = true
+    },
+    State1 = State#state{
+        remote_addr = NewAddr,
+        mig = Mig#mig{pending_peer_validation = Path, migration_state = validating_peer}
+    },
+    State2 = send_path_challenge(NewAddr, ChallengeData, State1),
+    start_path_validation_timer(State2);
+challenge_handshake_peer(NewAddr, State) ->
+    State#state{remote_addr = NewAddr}.
+
+%% A challenge sent during the handshake may have reached a client that
+%% could not decrypt it yet. Now that it can, the same challenge goes
+%% again, so whichever copy is answered completes the validation.
+rechallenge_pending_path(
+    #state{
+        mig = #mig{
+            pending_peer_validation =
+                #path_state{
+                    status = validating, remote_addr = Addr, challenge_data = Data
+                } = Path
+        }
+    } = State
+) ->
+    send_path_challenge(Addr, Data, path_dcid(Path, State), State);
+rechallenge_pending_path(State) ->
+    State.
+
+largest_received(#state{hs = #hs{pn_initial = I, pn_handshake = H}, pn_app = A}) ->
+    {I#pn_space.largest_recv, H#pn_space.largest_recv, A#pn_space.largest_recv}.
+
 %% @doc Detect type of peer address change.
 %% Returns same_path, nat_rebinding (port change only), or new_path (IP change).
 -spec detect_peer_address_change(
@@ -12624,15 +13047,26 @@ maybe_handle_address_change(NewAddr, DataSize, State) ->
             %% NAT rebinding from the no-reuse rule, so this path keeps the
             %% CID it is already using.
             initiate_peer_path_validation(NewAddr, true, DataSize, State);
+        new_path when State#state.dcid =:= <<>> ->
+            %% A peer with a zero-length CID is sent that CID on every
+            %% path (RFC 9000 Section 5.1.1). Its IP changed, so this is
+            %% a migration and not a rebinding (Section 9.4).
+            initiate_peer_path_validation(NewAddr, false, DataSize, State);
         new_path ->
             %% A genuine migration needs a CID that has not been used on
             %% another path. Without one we cannot probe, so nothing is
-            %% emitted and no validation state is created.
-            case has_unused_cid(State) of
-                true -> initiate_peer_path_validation(NewAddr, false, DataSize, State);
-                false -> State
+            %% emitted and no validation state is created, unless the peer
+            %% kept its CID: it did not move, the network moved it, and
+            %% the current CID may stay (RFC 9000 Section 9.5).
+            case {has_unused_cid(State), kept_its_cid(State)} of
+                {true, _} -> initiate_peer_path_validation(NewAddr, false, DataSize, State);
+                {false, true} -> initiate_peer_path_validation(NewAddr, false, DataSize, State);
+                {false, false} -> State
             end
     end.
+
+kept_its_cid(#state{mig = #mig{peer_dcid = DCID, pass_dcid = DCID}}) -> DCID =/= undefined;
+kept_its_cid(_State) -> false.
 
 %% @doc Update bytes_received for pending path validation (anti-amplification).
 -spec update_pending_path_bytes_received(

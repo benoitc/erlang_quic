@@ -19,6 +19,9 @@
 
 -export([main/1]).
 
+%% Used by quic_interop_server_batch_SUITE.
+-export([spawn_handler/4]).
+
 %% Suppress dialyzer warnings for escript functions that call halt()
 -dialyzer({nowarn_function, [main/1, run_server/4]}).
 -dialyzer({nowarn_function, [run_h3_server/4, run_hq_server/5]}).
@@ -154,20 +157,48 @@ run_hq_server(TestCase, Port, CertDer, PrivateKey, WwwDir) ->
     %% Build server options
     Opts = build_server_opts(TestCase, CertDer, PrivateKey, WwwDir),
 
-    %% Start listener
+    %% The runner gives the ipv6 case TESTCASE=transfer, so every case
+    %% also listens on IPv6 when the host has it.
+    V6Opts = Opts#{extra_socket_opts => [inet6, {ipv6_v6only, true}]},
     case quic_listener:start_link(Port, Opts) of
         {ok, Listener} ->
+            Listener6 =
+                case quic_listener:start_link(Port, V6Opts) of
+                    {ok, L6} ->
+                        [L6];
+                    {error, V6Reason} ->
+                        io:format("No IPv6 listener: ~p~n", [V6Reason]),
+                        []
+                end,
+            warm_up(Port),
             io:format("Server listening on port ~p~n", [Port]),
 
             %% Wait forever (or until killed)
             receive
                 stop ->
-                    quic_listener:stop(Listener),
+                    lists:foreach(fun quic_listener:stop/1, [Listener | Listener6]),
                     halt(?EXIT_SUCCESS)
             end;
-        {error, Reason} ->
-            io:format("Failed to start listener: ~p~n", [Reason]),
+        Failed ->
+            io:format("Failed to start listener: ~p~n", [Failed]),
             halt(?EXIT_FAILURE)
+    end.
+
+%% The first handshake in a fresh node runs 15 to 45 ms slower than the
+%% rest, loading code and initialising crypto. Clients the runner moves
+%% to another port during the handshake miss a ServerHello that late, so
+%% one handshake over loopback goes first.
+warm_up(Port) ->
+    Opts = #{verify => false, alpn => [<<"hq-interop">>]},
+    case quic:connect(<<"127.0.0.1">>, Port, Opts, self()) of
+        {ok, Conn} ->
+            receive
+                {quic, Conn, {connected, _}} -> ok
+            after 2000 -> ok
+            end,
+            quic:close(Conn, normal);
+        {error, _} ->
+            ok
     end.
 
 build_server_opts(TestCase, {Cert, CertChain}, Key, WwwDir) ->
@@ -179,6 +210,11 @@ build_server_opts(TestCase, {Cert, CertChain}, Key, WwwDir) ->
         %% The blackhole case blacks the network out on purpose and
         %% expects the connection to outlast it.
         disconnect_timeout => infinity,
+        %% xquic keeps up to 128 requests open and gives up on one that
+        %% finds the stream limit reached instead of waiting for
+        %% MAX_STREAMS. The runner fails a server that starts above 1000
+        %% in the multiplexing case, which the server sees as `transfer'.
+        max_streams_bidi => 1000,
         connection_handler => fun(ConnPid, Conn) ->
             spawn_handler(ConnPid, Conn, WwwDir, TestCase)
         end
@@ -253,7 +289,10 @@ connection_handler(Conn, WwwDir, TestCase, Bufs) ->
             io:format("Handler got stream_opened: ~p~n", [StreamId]),
             connection_handler(Conn, WwwDir, TestCase, Bufs);
         {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
-            Bufs1 = buffer_stream_data(Conn, WwwDir, TestCase, Bufs, StreamId, Data, Fin),
+            {Bufs1, Ready} = drain_requests(
+                Conn, buffer_stream_data(Bufs, StreamId, Data, Fin, [])
+            ),
+            serve_requests(Conn, lists:reverse(Ready), WwwDir, TestCase),
             connection_handler(Conn, WwwDir, TestCase, Bufs1);
         {quic, Conn, {closed, Reason}} ->
             io:format("Handler got closed: ~p~n", [Reason]),
@@ -266,16 +305,31 @@ connection_handler(Conn, WwwDir, TestCase, Bufs) ->
         ok
     end.
 
-buffer_stream_data(Conn, WwwDir, TestCase, Bufs, StreamId, Data, Fin) ->
+buffer_stream_data(Bufs, StreamId, Data, Fin, Ready) ->
     Acc = [maps:get(StreamId, Bufs, []) | Data],
     case Fin of
-        true ->
-            Request = iolist_to_binary(Acc),
-            _ = serve_request(Conn, StreamId, Request, WwwDir, TestCase),
-            maps:remove(StreamId, Bufs);
-        false ->
-            Bufs#{StreamId => Acc}
+        true -> {maps:remove(StreamId, Bufs), [{StreamId, iolist_to_binary(Acc)} | Ready]};
+        false -> {Bufs#{StreamId => Acc}, Ready}
     end.
+
+%% Requests already queued are answered together: the responses are
+%% handed to the connection while it is suspended, so it takes them as
+%% one batch and they share packets.
+drain_requests(Conn, {Bufs, Ready}) ->
+    receive
+        {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
+            drain_requests(Conn, buffer_stream_data(Bufs, StreamId, Data, Fin, Ready))
+    after 0 ->
+        {Bufs, Ready}
+    end.
+
+serve_requests(_Conn, [], _WwwDir, _TestCase) ->
+    ok;
+serve_requests(Conn, Requests, WwwDir, TestCase) ->
+    Responses = [{Sid, serve_request(Conn, Sid, Req, WwwDir, TestCase)} || {Sid, Req} <- Requests],
+    ok = sys:suspend(Conn),
+    [quic:send_data_async(Conn, Sid, Body, true) || {Sid, Body} <- Responses],
+    ok = sys:resume(Conn).
 
 serve_request(Conn, StreamId, Data, WwwDir, TestCase) ->
     io:format("handle_request: stream=~p data=~p~n", [StreamId, Data]),
@@ -297,16 +351,14 @@ serve_request(Conn, StreamId, Data, WwwDir, TestCase) ->
             case file:read_file(FilePath) of
                 {ok, Content} ->
                     io:format("Sending ~p bytes on stream ~p~n", [byte_size(Content), StreamId]),
-                    Result = quic:send_data(Conn, StreamId, Content, true),
-                    io:format("send_data result: ~p~n", [Result]),
-                    Result;
+                    Content;
                 {error, ReadErr} ->
                     io:format("File read error: ~p, sending 404~n", [ReadErr]),
-                    quic:send_data(Conn, StreamId, <<"404 Not Found">>, true)
+                    <<"404 Not Found">>
             end;
         error ->
             io:format("Parse error, sending 400~n"),
-            quic:send_data(Conn, StreamId, <<"400 Bad Request">>, true)
+            <<"400 Bad Request">>
     end.
 
 parse_request(Data) ->
