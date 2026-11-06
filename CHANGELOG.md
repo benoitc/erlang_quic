@@ -2,6 +2,64 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A client given `versions` now offers them, so the server can move the
+  connection to QUIC v2. Only the server announced its versions, so a
+  client that started in v1 always stayed in v1.
+- A connection whose owner exits on `closed` now finishes its draining
+  period. It stopped at once, and the peer's repeated close got a
+  stateless reset back.
+- A server no longer reads 1-RTT packets before the handshake completes.
+  The client could take the handshake as done too early and the
+  connection hung. Such packets are kept and read once the handshake is
+  done, so a request sent with the client's last handshake message is
+  not lost.
+- A client drops its Initial keys as soon as it sends a Handshake packet
+  of any kind. It went on probing with Initial packets, and a server
+  could appear to send more than its amplification limit allows.
+- A server follows a client to a new address when the client uses
+  zero-length connection IDs or keeps its connection ID. It stayed on the
+  old address and the transfer stopped. After such a move the congestion
+  state starts again, since the path is a different one.
+- A server follows a client that moves before the handshake completes,
+  and checks the new address before using it. The handshake used to
+  hang when the first address was gone.
+- A client writes its handshake secrets to SSLKEYLOGFILE too, so
+  Wireshark and the QUIC Interop Runner can decrypt its handshake.
+- A connection follows a key update the peer starts right after one of
+  its own. Every packet after it failed to decrypt and the connection
+  stalled.
+- Lossy handshakes recover faster and no longer stall:
+  - a server no longer queues a probe its amplification limit refuses,
+    which could end in "pending handshake queue overflow";
+  - a server no longer pads an Initial that only acknowledges, and puts
+    its handshake packets in fewer datagrams while the client's address
+    is not yet validated, so it can repeat a lost flight more often;
+  - a server acknowledges the client's Initial in the same packet as its
+    reply, so the client gets an RTT sample early;
+  - a client keeps backing off its probes until the server has validated
+    its address, and probes with a Handshake packet once it can;
+  - a probe covers both handshake packet spaces and carries the current
+    acknowledgement.
+- A late NEW_CONNECTION_ID whose sequence number was already retired is
+  retired at once instead of closing the connection with
+  CONNECTION_ID_LIMIT_ERROR.
+- A server acknowledges 0-RTT packets. A client sending more early data
+  than its window allows could not finish the handshake.
+- A STREAM FIN that was already delivered is not delivered again when
+  the peer repeats it. A server could take it as a new request.
+
+### Changed
+- Sends queued before the connection is up share packets, for 0-RTT and
+  for writes held until the handshake completes, instead of one packet
+  each. A burst of small requests no longer fills a router queue.
+- A connection returns stream credit to the peer in steps of half the
+  initial limit, rather than one MAX_STREAMS frame per closed stream.
+- The interop endpoints serve over IPv6 as well, send a batch of
+  requests or responses together, and warm up before the first test.
+
 ## [2.1.4] - 2026-11-06
 
 ### Fixed
