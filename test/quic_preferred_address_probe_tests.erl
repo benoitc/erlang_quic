@@ -81,3 +81,16 @@ response_on_probed_path_uses_its_cid_test() ->
         quic_connection_test_support:state_get(S1, dcid),
         quic_connection:addr_dcid({{127, 0, 0, 3}, 9}, undefined, S1)
     ).
+
+%% After quic:migrate/1 the probed path is the one in use; giving it up
+%% would leave the connection nothing to send on.
+path_in_use_is_not_abandoned_test() ->
+    S0 = quic_connection_test_support:client_with_preferred_address(true),
+    S1 = quic_connection:maybe_probe_preferred_address(S0),
+    [#path_state{dcid = PathDCID}] = quic_connection_test_support:alt_paths(S1),
+    S2 = quic_connection_test_support:state_set(S1, dcid, PathDCID),
+    S3 = timeout(timeout(timeout(S2))),
+    ?assertMatch(
+        [#path_state{status = validating, challenge_count = 4}],
+        quic_connection_test_support:alt_paths(S3)
+    ).

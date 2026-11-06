@@ -12663,7 +12663,12 @@ handle_path_probe_timeout(Addr, Data, #state{mig = #mig{alt_paths = Paths}} = St
             State
     end.
 
-retry_path_probe(#path_state{challenge_count = Count} = Path0, Others, State0) when Count < 3 ->
+%% A path the connection already sends on (after quic:migrate/1) is never
+%% abandoned: its CID is the one in use, and giving up would leave nothing
+%% to send on. It is probed until it answers or the connection times out.
+retry_path_probe(#path_state{challenge_count = Count, dcid = DCID} = Path0, Others, State0) when
+    Count < 3; DCID =:= State0#state.dcid
+->
     Path = Path0#path_state{
         challenge_data = crypto:strong_rand_bytes(8), challenge_count = Count + 1
     },
