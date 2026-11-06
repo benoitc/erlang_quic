@@ -39,6 +39,7 @@
     %% CIDs the peer issues to us
     add_peer_cid/5,
     add_preferred_address_cid/3,
+    issue_cid/3,
     record_initial_reset_token/2,
     prune_retired_peer/1,
     retire_peer/2,
@@ -108,19 +109,22 @@ issue(Pool, N, ResetSecret) ->
 
 issue(Pool, 0, _ResetSecret, Acc) ->
     {Pool, lists:reverse(Acc)};
-issue(#cid_pool_state{local = Local} = Pool, N, ResetSecret, Acc) when N > 0 ->
-    SeqNum = next_seq(Local),
+issue(Pool, N, ResetSecret, Acc) when N > 0 ->
     CID = crypto:strong_rand_bytes(8),
+    {Pool1, SeqNum, Token} = issue_cid(Pool, CID, ResetSecret),
+    issue(Pool1, N - 1, ResetSecret, [{SeqNum, CID, Token} | Acc]).
+
+%% @doc Issue a CID the caller chose, such as the one a preferred_address
+%% carries, as the next sequence number.
+-spec issue_cid(pool(), binary(), binary() | undefined) ->
+    {pool(), non_neg_integer(), binary()}.
+issue_cid(#cid_pool_state{local = Local} = Pool, CID, ResetSecret) ->
+    SeqNum = next_seq(Local),
     Token = generate_reset_token(CID, ResetSecret),
     Entry = #cid_entry{
         seq_num = SeqNum, cid = CID, stateless_reset_token = Token, status = active
     },
-    issue(
-        Pool#cid_pool_state{local = [Entry | Local]},
-        N - 1,
-        ResetSecret,
-        [{SeqNum, CID, Token} | Acc]
-    ).
+    {Pool#cid_pool_state{local = [Entry | Local]}, SeqNum, Token}.
 
 %% @doc Retire a CID we issued, returning it so the caller can drop it from
 %% the listener's routing table. A sequence we never issued is a protocol

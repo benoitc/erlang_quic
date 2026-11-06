@@ -193,6 +193,9 @@
     cid_config :: #cid_config{} | undefined,
     %% Expected DCID length for short header packets
     dcid_len = 8 :: pos_integer(),
+    %% Sockets bound to the preferred_address endpoints the listening
+    %% socket does not already cover (RFC 9000 Section 9.6)
+    preferred_sockets = [] :: [gen_udp:socket()],
     %% Options
     opts :: map()
 }).
@@ -281,11 +284,14 @@ init({Port, Opts}) ->
 
 %% Initialize with OTP socket backend (GRO support on Linux)
 init_socket_backend(Port, Opts) ->
-    case quic_socket:open(Port, Opts) of
-        {ok, SocketState} ->
+    case {preferred_endpoints(Opts), quic_socket:open(Port, Opts)} of
+        {[_ | _], {ok, SocketState}} ->
+            quic_socket:close(SocketState),
+            {stop, preferred_address_requires_gen_udp};
+        {[], {ok, SocketState}} ->
             Socket = quic_socket:get_socket(SocketState),
-            {ok, {Socket, SocketState, socket, Opts}, {continue, discover_manager}};
-        {error, Reason} ->
+            {ok, {Socket, SocketState, socket, Opts, []}, {continue, discover_manager}};
+        {_, {error, Reason}} ->
             {stop, Reason}
     end.
 
@@ -316,10 +322,61 @@ init_genudp_backend(Port, Opts) ->
             end ++ ExtraFlags,
     case gen_udp:open(Port, SocketOpts) of
         {ok, Socket} ->
-            {ok, {Socket, undefined, gen_udp, Opts}, {continue, discover_manager}};
+            case open_preferred_sockets(Socket, Opts) of
+                {ok, Preferred} ->
+                    {ok, {Socket, undefined, gen_udp, Opts, Preferred},
+                        {continue, discover_manager}};
+                {error, Reason} ->
+                    gen_udp:close(Socket),
+                    {stop, Reason}
+            end;
         {error, Reason} ->
             {stop, Reason}
     end.
+
+preferred_endpoints(Opts) ->
+    [E || Key <- [preferred_ipv4, preferred_ipv6], {_, _} = E <- [maps:get(Key, Opts, undefined)]].
+
+%% A client that moves to the preferred address sends there, so something
+%% has to receive it: the listening socket when it is bound to that
+%% endpoint or to the wildcard of its family on the same port, a socket of
+%% its own otherwise.
+open_preferred_sockets(Socket, Opts) ->
+    {ok, Bound} = inet:sockname(Socket),
+    open_preferred_sockets(
+        [E || E <- preferred_endpoints(Opts), not covers(Bound, E)], Opts, []
+    ).
+
+open_preferred_sockets([], _Opts, Acc) ->
+    {ok, lists:reverse(Acc)};
+open_preferred_sockets([{IP, Port} = Endpoint | Rest], Opts, Acc) ->
+    SocketOpts = [
+        binary,
+        address_family(IP),
+        {ip, IP},
+        {active, maps:get(active_n, Opts, 100)},
+        {recbuf, maps:get(recbuf, Opts, ?DEFAULT_UDP_RECBUF)},
+        {sndbuf, maps:get(sndbuf, Opts, ?DEFAULT_UDP_SNDBUF)}
+        | case maps:get(reuseport, Opts, false) of
+            true -> [{reuseport, true}, {reuseport_lb, true}];
+            false -> []
+        end
+    ],
+    case gen_udp:open(Port, SocketOpts) of
+        {ok, S} ->
+            open_preferred_sockets(Rest, Opts, [S | Acc]);
+        {error, Reason} ->
+            lists:foreach(fun gen_udp:close/1, Acc),
+            {error, {preferred_address, Endpoint, Reason}}
+    end.
+
+covers({IP, Port}, {IP, Port}) -> true;
+covers({{0, 0, 0, 0}, Port}, {{_, _, _, _}, Port}) -> true;
+covers({{0, 0, 0, 0, 0, 0, 0, 0}, Port}, {{_, _, _, _, _, _, _, _}, Port}) -> true;
+covers(_Bound, _Endpoint) -> false.
+
+address_family({_, _, _, _}) -> inet;
+address_family({_, _, _, _, _, _, _, _}) -> inet6.
 
 %% Infer the UDP address family from caller socket options: inet6 when an
 %% `inet6' atom or an 8-tuple `{ip, _}' is present, inet otherwise.
@@ -335,7 +392,7 @@ extra_socket_family(Extra) ->
     end.
 
 %% @doc false
-handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
+handle_continue(discover_manager, {Socket, SocketState, Backend, Opts, Preferred}) ->
     %% Auth-method options: cert+key for X.509 auth, or PSK config
     %% (psks / psk_callback) for TLS 1.3 external PSK (RFC 8446 §4.2.11).
     %% At least one must be provided; both may coexist (per-handshake
@@ -398,6 +455,7 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts}) ->
         recv_queue_max = quic_socket:recv_queue_max(
             maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA)
         ),
+        preferred_sockets = Preferred,
         opts = Opts
     },
     {noreply, State}.
@@ -552,6 +610,12 @@ handle_info(
     N = maps:get(active_n, Opts, 100),
     inet:setopts(Socket, [{active, N}]),
     {noreply, State};
+handle_info({udp_passive, Socket}, #listener_state{opts = Opts} = State) ->
+    case lists:member(Socket, State#listener_state.preferred_sockets) of
+        true -> inet:setopts(Socket, [{active, maps:get(active_n, Opts, 100)}]);
+        false -> ok
+    end,
+    {noreply, State};
 %% Handle connection process exit
 handle_info(
     {'EXIT', Pid, _Reason},
@@ -579,6 +643,15 @@ handle_info(
             cleanup_connection(Pid, State),
             {noreply, State}
     end;
+%% A packet to the preferred address. A client only moves there once the
+%% handshake is confirmed, so only short headers are routed, and they go
+%% out tagged with the socket so the connection answers from it.
+handle_info({udp, Socket, SrcIP, SrcPort, Packet}, #listener_state{} = State) ->
+    case lists:member(Socket, State#listener_state.preferred_sockets) of
+        true -> route_preferred(Socket, {SrcIP, SrcPort}, Packet, State);
+        false -> ok
+    end,
+    {noreply, State};
 %% Handle UDP from different socket (shouldn't happen)
 handle_info({udp, _OtherSocket, _SrcIP, _SrcPort, _Packet}, State) ->
     {noreply, State};
@@ -1061,6 +1134,17 @@ route_to_connection(
         [] ->
             %% Unknown connection - potentially send stateless reset
             handle_unknown_packet(DCID, Packet, RemoteAddr, State)
+    end.
+
+route_preferred(Socket, RemoteAddr, Packet, #listener_state{dcid_len = DCIDLen} = State) ->
+    case parse_packet_header(Packet, DCIDLen) of
+        {short, DCID, _Rest} ->
+            case ets:lookup(State#listener_state.connections, DCID) of
+                [{DCID, ConnPid}] -> ConnPid ! {quic_packet, Packet, RemoteAddr, Socket};
+                [] -> ok
+            end;
+        _ ->
+            ok
     end.
 
 %% Create a new server-side connection

@@ -29,6 +29,7 @@
 -define(EXIT_SUCCESS, 0).
 -define(EXIT_FAILURE, 1).
 -define(EXIT_UNSUPPORTED, 127).
+-define(PREFERRED_PORT, 4433).
 
 %% Supported test cases
 -define(SUPPORTED_TESTS, [
@@ -230,9 +231,35 @@ build_server_opts(TestCase, {Cert, CertChain}, Key, WwwDir) ->
             BaseOpts#{ciphers => [chacha20_poly1305]};
         "v2" ->
             BaseOpts#{versions => [16#6b3343cf, 16#00000001]};
+        "connectionmigration" ->
+            %% The client reaches server46 on either family and moves to
+            %% the preferred address, on another port as the other
+            %% implementations do it.
+            Preferred = [
+                {Family, {IP, ?PREFERRED_PORT}}
+             || {Family, IP} <- host_addresses()
+            ],
+            maps:merge(
+                BaseOpts#{extra_socket_opts => [inet6, {ipv6_v6only, false}]},
+                maps:from_list(Preferred)
+            );
         _ ->
             BaseOpts
     end.
+
+%% The host's first global address of each family it has.
+host_addresses() ->
+    {ok, Ifs} = inet:getifaddrs(),
+    Addrs = [A || {_, Props} <- Ifs, {addr, A} <- Props],
+    V4 = [A || {X, _, _, _} = A <- Addrs, X =/= 127],
+    V6 = [
+        A
+     || {X, _, _, _, _, _, _, _} = A <- Addrs,
+        X band 16#ffc0 =/= 16#fe80,
+        A =/= {0, 0, 0, 0, 0, 0, 0, 1}
+    ],
+    [{preferred_ipv4, A} || A <- lists:sublist(V4, 1)] ++
+        [{preferred_ipv6, A} || A <- lists:sublist(V6, 1)].
 
 %% Decode PEM-encoded private key to internal format
 decode_private_key(PemData) ->

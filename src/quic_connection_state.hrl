@@ -388,7 +388,10 @@
     %% Which of our CIDs the peer sends with on the current path, and in
     %% the receive pass being handled
     peer_dcid :: binary() | undefined,
-    pass_dcid :: binary() | undefined
+    pass_dcid :: binary() | undefined,
+    %% While the current path is on a preferred-address socket, the
+    %% listening socket and its sender, sent through again on return
+    main_sock :: {term(), term()} | undefined
 }).
 
 -record(state, {
@@ -563,6 +566,9 @@
     %% Set during packet processing, cleared after. Used to route PATH_RESPONSE
     %% to the address that sent the PATH_CHALLENGE (RFC 9000 Section 8.2.2).
     current_packet_source :: {inet:ip_address(), inet:port_number()} | undefined,
+    %% Transient: the preferred-address socket the current packet came in
+    %% on, `undefined' for the listening socket
+    current_packet_via :: term(),
     %% Transient field: set to true when a non-probing frame is processed
     %% RFC 9000 Section 9.1: Only non-probing frames trigger migration
     has_non_probing_frame = false :: boolean(),
