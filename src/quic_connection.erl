@@ -5387,8 +5387,17 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
                             true ->
                                 quic_cc:on_packets_acked(CCState, AckedBytes, LargestAckedSentTime)
                         end,
+                    %% Every loss behind the last window cut was only
+                    %% reordered: undo the cut before this ACK's own losses.
+                    CCState2 =
+                        case AckMeta of
+                            #{spurious_congestion := true} ->
+                                quic_cc:on_spurious_congestion(CCState1);
+                            _ ->
+                                CCState1
+                        end,
                     CCState5 = cc_after_loss(
-                        CCState1, LostBytes, LargestLostSentTime, ECN, LostPackets, NewLossState
+                        CCState2, LostBytes, LargestLostSentTime, ECN, LostPackets, NewLossState
                     ),
 
                     %% Update pacing rate based on new RTT estimate (RFC 9002 Section 7.7)

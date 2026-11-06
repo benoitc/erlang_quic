@@ -417,3 +417,76 @@ stream_has_unacked_below_ignores_non_stream_test() ->
     S0 = quic_loss:new(),
     S1 = quic_loss:on_packet_sent(app, S0, 0, 50, true, [ping, {max_data, 1000}]),
     ?assertNot(quic_loss:stream_has_unacked_below(S1, 12, 100)).
+
+%%====================================================================
+%% Reordering: spurious losses and adaptive thresholds
+%%====================================================================
+
+sent(State, PNs) ->
+    lists:foldl(fun(PN, Acc) -> quic_loss:on_packet_sent(app, Acc, PN, 1000, true) end, State, PNs).
+
+pns(Packets) -> lists:sort([P#sent_packet.pn || P <- Packets]).
+
+%% 0..2 are declared lost by the packet threshold when 5 is acked alone,
+%% then acknowledged: the episode was reordering, the window cut can be
+%% undone, and the packet threshold grows to the distance seen.
+reordered_losses_are_spurious_test() ->
+    S1 = sent(quic_loss:new(), lists:seq(0, 10)),
+    Now = erlang:monotonic_time(millisecond),
+    {S2, _, Lost, M1} = quic_loss:on_ack_received(app, S1, {ack, 5, 0, 0, []}, Now),
+    ?assertEqual([0, 1, 2], pns(Lost)),
+    ?assertMatch(#{spurious_losses := 0, spurious_congestion := false}, M1),
+    {S3, _, [], M2} = quic_loss:on_ack_received(app, S2, {ack, 10, 0, 10, []}, Now),
+    ?assertMatch(#{spurious_losses := 3, spurious_congestion := true}, M2),
+    %% Reordering of up to 11 packets was seen: a gap of 9 is not a loss.
+    S4 = sent(S3, lists:seq(11, 20)),
+    {_, _, Lost2, _} = quic_loss:on_ack_received(app, S4, {ack, 20, 0, 0, []}, Now),
+    ?assertEqual([], Lost2).
+
+%% Without reordering seen, the same gap is a loss.
+packet_threshold_default_test() ->
+    S1 = sent(quic_loss:new(), lists:seq(11, 20)),
+    Now = erlang:monotonic_time(millisecond),
+    {_, _, Lost, _} = quic_loss:on_ack_received(app, S1, {ack, 20, 0, 0, []}, Now),
+    ?assertEqual(lists:seq(11, 17), pns(Lost)).
+
+%% One loss of the episode is never acknowledged: it ages out as a real
+%% loss and the cut stays, even though the others were reordered.
+real_loss_keeps_cut_test() ->
+    S1 = sent(quic_loss:new(), lists:seq(0, 10)),
+    Now = erlang:monotonic_time(millisecond),
+    {S2, _, Lost, _} = quic_loss:on_ack_received(app, S1, {ack, 5, 0, 0, []}, Now),
+    ?assertEqual([0, 1, 2], pns(Lost)),
+    %% 1..10 acknowledged, 0 still missing.
+    {S3, _, _, M1} = quic_loss:on_ack_received(app, S2, {ack, 10, 0, 9, []}, Now),
+    ?assertMatch(#{spurious_losses := 2, spurious_congestion := false}, M1),
+    %% Long after: 0 has aged out, so nothing is left to prove spurious.
+    S4 = sent(S3, [11]),
+    Later = Now + 10000,
+    {_, _, _, M2} = quic_loss:on_ack_received(app, S4, {ack, 11, 0, 0, []}, Later),
+    ?assertMatch(#{spurious_losses := 0, spurious_congestion := false}, M2).
+
+%% A loss the time threshold declared, then acknowledged, moves the time
+%% threshold from 9/8 to 5/4 of the RTT.
+spurious_time_loss_widens_time_threshold_test() ->
+    %% A 10 ms RTT sample first.
+    S0 = sent(quic_loss:new(), [0]),
+    #{0 := #sent_packet{time_sent = T0}} = quic_loss:sent_packets(app, S0),
+    {S1, _, _, _} = quic_loss:on_ack_received(app, S0, {ack, 0, 0, 0, []}, T0 + 10),
+    %% 1 goes out 60 ms before 2; 2 acked alone declares 1 lost by time,
+    %% since it is only one packet behind.
+    S2 = sent(S1, [1]),
+    timer:sleep(60),
+    S3 = sent(S2, [2]),
+    #{2 := #sent_packet{time_sent = T2}} = quic_loss:sent_packets(app, S3),
+    {S4, _, Lost, _} = quic_loss:on_ack_received(app, S3, {ack, 2, 0, 0, []}, T2 + 10),
+    ?assertEqual([1], pns(Lost)),
+    {S5, _, _, M} = quic_loss:on_ack_received(app, S4, {ack, 2, 0, 2, []}, T2 + 11),
+    ?assertMatch(#{spurious_losses := 1}, M),
+    S6 = sent(S5, [3, 4]),
+    #{3 := #sent_packet{time_sent = T3}} = quic_loss:sent_packets(app, S6),
+    {S7, _, [], _} = quic_loss:on_ack_received(app, S6, {ack, 4, 0, 0, []}, T3),
+    RTT = quic_loss:rtt(S7),
+    R = max(quic_rtt:smoothed(RTT), quic_rtt:latest(RTT)),
+    {Deadline, app} = quic_loss:get_loss_time_and_space(S7),
+    ?assertEqual(R + R div 4, Deadline - T3).

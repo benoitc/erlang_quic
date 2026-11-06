@@ -45,6 +45,7 @@
     on_packets_acked/3,
     on_packets_lost/2,
     on_congestion_event/2,
+    on_spurious_congestion/1,
     on_ecn_ce/2,
     on_persistent_congestion/1,
     detect_persistent_congestion/3,
@@ -98,6 +99,7 @@
 -callback on_congestion_event(State :: term(), SentTime :: non_neg_integer()) -> State :: term().
 -callback on_ecn_ce(State :: term(), ECNCE :: non_neg_integer()) -> State :: term().
 -callback on_persistent_congestion(State :: term()) -> State :: term().
+-callback on_spurious_congestion(State :: term()) -> State :: term().
 -callback detect_persistent_congestion(
     LostInfo :: [{non_neg_integer(), non_neg_integer()}],
     PTO :: non_neg_integer(),
@@ -244,6 +246,12 @@ on_congestion_event(#cc_wrapper{algorithm = Mod, state = State} = W, SentTime) -
 -spec on_ecn_ce(cc_state(), non_neg_integer()) -> cc_state().
 on_ecn_ce(#cc_wrapper{algorithm = Mod, state = State} = W, ECNCE) ->
     W#cc_wrapper{state = Mod:on_ecn_ce(State, ECNCE)}.
+
+%% @doc Undo the last window reduction: every packet it was for turned
+%% out to be delivered, only late.
+-spec on_spurious_congestion(cc_state()) -> cc_state().
+on_spurious_congestion(#cc_wrapper{algorithm = Mod, state = State} = W) ->
+    W#cc_wrapper{state = Mod:on_spurious_congestion(State)}.
 
 %% @doc Handle persistent congestion.
 -spec on_persistent_congestion(cc_state()) -> cc_state().

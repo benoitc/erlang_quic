@@ -38,6 +38,7 @@
 -define(QUIC_LOG_META, #{domain => [erlang_quic, congestion_control]}).
 
 -export([
+    on_spurious_congestion/1,
     %% Behavior callbacks
     new/1,
     on_packet_sent/2,
@@ -504,6 +505,11 @@ on_ecn_ce(#bbr_state{max_bw = MaxBw} = State, NewCECount) ->
         in_recovery = true,
         recovery_start_time = Now
     }.
+
+%% @doc BBR does not cut its model on loss, so there is nothing to undo.
+-spec on_spurious_congestion(cc_state()) -> cc_state().
+on_spurious_congestion(State) ->
+    State.
 
 %% @doc Handle persistent congestion.
 -spec on_persistent_congestion(cc_state()) -> cc_state().
