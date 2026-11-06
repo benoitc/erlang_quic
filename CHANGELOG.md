@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.1.4] - 2026-11-06
 
 ### Fixed
 - Downloads on paths that reorder packets are several times faster.
