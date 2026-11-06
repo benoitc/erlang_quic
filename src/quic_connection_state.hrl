@@ -492,7 +492,9 @@
     %% Dedicated timer for the above. Checking it only when a PTO happened
     %% to fire made the effective timeout the next PTO after the deadline,
     %% and PTO backoff doubles, so a nominal 16 s took 24 s or more.
-    disconnect_timer :: reference() | undefined,
+    %% `{final, Ref}' while the last probe before declaring the peer dead
+    %% waits for its ACK.
+    disconnect_timer :: reference() | {final, reference()} | undefined,
 
     %% Pacing (RFC 9002 Section 7.7)
     pacing_timer :: reference() | undefined,

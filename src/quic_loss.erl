@@ -56,6 +56,7 @@
 
     %% PTO
     get_pto/2,
+    base_pto/1,
     discard_space/2,
     reset_for_retry/2,
     get_pto_time_and_space/3,
@@ -804,6 +805,12 @@ pto(#loss_state{rtt = RTT, pto_count = PTOCount}, MaxAckDelay) ->
     %% so a bounded worst-case interval costs nothing while keeping
     %% recovery inside real-world request timeouts.
     min(PTO bsl PTOCount, ?MAX_PTO_MS).
+
+%% @doc The application-space PTO without backoff: how long an ACK for a
+%% packet sent now should take on this path.
+-spec base_pto(loss_state()) -> non_neg_integer().
+base_pto(#loss_state{} = State) ->
+    pto(State#loss_state{pto_count = 0}, State#loss_state.max_ack_delay).
 
 %% @doc Adopt the peer's ack_delay_exponent and max_ack_delay (ms), from
 %% its transport parameters.

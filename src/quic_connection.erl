@@ -2181,11 +2181,11 @@ handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref}
         due ->
             State1 = State#state{pto_timer = undefined, pto_armed_at = undefined},
             case disconnect_timeout_expired(State1) of
-                true ->
-                    {next_state, draining, declare_peer_dead(State1)};
-                false when State1#state.pto_kind =:= loss ->
+                true when not is_tuple(State1#state.disconnect_timer) ->
+                    disconnect_deadline(State1);
+                _ when State1#state.pto_kind =:= loss ->
                     {keep_state, handle_loss_timeout(State1)};
-                false ->
+                _ ->
                     %% Handle PTO timeout - send probe packet
                     {keep_state, handle_pto_timeout(State1)}
             end
@@ -2198,10 +2198,22 @@ handle_common_event(
     State1 = State#state{disconnect_timer = undefined},
     case disconnect_timeout_expired(State1) of
         true ->
-            {next_state, draining, declare_peer_dead(State1)};
+            disconnect_deadline(State1);
         false ->
             {keep_state, arm_disconnect_timer(State1)}
     end;
+handle_common_event(
+    info, {disconnect_final, Ref}, StateName, #state{disconnect_timer = {final, Ref}} = State
+) when
+    StateName =:= connected orelse StateName =:= handshaking
+->
+    State1 = State#state{disconnect_timer = undefined},
+    case disconnect_timeout_expired(State1) of
+        true -> {next_state, draining, declare_peer_dead(State1)};
+        false -> {keep_state, arm_disconnect_timer(State1)}
+    end;
+handle_common_event(info, {disconnect_final, _StaleRef}, _StateName, State) ->
+    {keep_state, State};
 handle_common_event(info, {credit_retry, Ref}, StateName, #state{credit_timer = Ref} = State) ->
     State1 = State#state{credit_timer = undefined},
     case StateName of
@@ -11695,6 +11707,15 @@ disconnect_timeout_expired(#state{loss_state = LossState, cfg = #conn_cfg{discon
                 erlang:monotonic_time(millisecond) - T >= DT
         end.
 
+%% The deadline passed with no ACK. The last probe may predate a network
+%% that has just come back, and backoff can put the next one seconds away,
+%% so send one now and give it one un-backed-off PTO to be acknowledged.
+disconnect_deadline(#state{loss_state = LossState} = State) ->
+    State1 = flush_event(send_probe_packet(app, State), event),
+    Ref = make_ref(),
+    erlang:send_after(quic_loss:base_pto(LossState), self(), {disconnect_final, Ref}),
+    {keep_state, State1#state{disconnect_timer = {final, Ref}}}.
+
 %% The disconnect timeout elapsed with ack-eliciting data in flight and
 %% no ACK: declare the peer dead instead of probing until the idle
 %% timeout. This is how a client escapes a restarted peer whose stateless
@@ -11712,6 +11733,8 @@ declare_peer_dead(State) ->
 
 cancel_disconnect_timer(#state{disconnect_timer = undefined} = State) ->
     State;
+cancel_disconnect_timer(#state{disconnect_timer = {final, _}} = State) ->
+    State#state{disconnect_timer = undefined};
 cancel_disconnect_timer(#state{disconnect_timer = Ref} = State) ->
     cancel_timer(Ref),
     State#state{disconnect_timer = undefined}.
