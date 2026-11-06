@@ -7993,8 +7993,10 @@ do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                     {DeliverData, NewRecvOffset, NewBuffer, DeliverFin, BufferedDelta} =
                         case Offset =:= CurrentOffset andalso gb_trees:is_empty(RecvBuffer) of
                             true ->
-                                %% In-order with empty buffer: deliver directly
-                                {Data, EndOffset, RecvBuffer, Fin, 0};
+                                %% In-order with empty buffer: deliver directly.
+                                %% A FIN already delivered is not delivered again.
+                                {Data, EndOffset, RecvBuffer,
+                                    Fin andalso not Stream#stream_state.recv_fin, 0};
                             false ->
                                 %% Out-of-order or buffer has data: use buffer path
                                 {UpdatedBuffer, Added} =

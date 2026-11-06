@@ -52,6 +52,12 @@ a_retransmitted_fin_is_not_delivered_again_test() ->
     ?assertEqual(undefined, quic_connection_test_support:close_reason(S3)),
     ?assertEqual([], [M || {quic, _, {stream_data, ?SID, _, _}} = M <- messages()]).
 
+%% An empty FIN at the final offset takes the in-order path.
+a_retransmitted_empty_fin_is_not_delivered_again_test() ->
+    S2 = receive_frame(fin_received(<<"first">>), 5, <<>>, true),
+    ?assertEqual(undefined, quic_connection_test_support:close_reason(S2)),
+    ?assertEqual([], [M || {quic, _, {stream_data, ?SID, _, _}} = M <- messages()]).
+
 a_retransmission_without_fin_does_not_reopen_the_stream_test() ->
     S2 = receive_frame(fin_received(<<"first">>), 0, <<"fir">>, false),
     _ = receive_frame(S2, 0, <<"first">>, true),
