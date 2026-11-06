@@ -11,6 +11,9 @@
 -module(quic_client_pto_backoff_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("quic/include/quic.hrl").
+-include_lib("quic/include/quic_qlog.hrl").
+-include_lib("quic/src/quic_connection_state.hrl").
 
 initial_ack_keeps_unvalidated_client_backoff_test() ->
     S = quic_connection:process_frame(initial, ack(), backed_off(client)),
@@ -39,7 +42,13 @@ backed_off(Role) ->
     L1 = quic_loss:on_packet_sent(initial, L0, 0, 1200, true, [ping], Now),
     L2 = quic_loss:on_packet_sent(handshake, L1, 0, 1200, true, [ping], Now),
     L3 = lists:foldl(fun(_, L) -> quic_loss:on_pto_expired(L) end, L2, [1, 2, 3]),
-    quic_connection_test_support:state_set(S0, loss_state, L3).
+    %% Packet 0 went out in both spaces, so an ACK for it is not one for
+    %% a packet never sent.
+    #state{hs = #hs{pn_initial = PNI, pn_handshake = PNH} = HS} = S0,
+    S1 = S0#state{
+        hs = HS#hs{pn_initial = PNI#pn_space{next_pn = 1}, pn_handshake = PNH#pn_space{next_pn = 1}}
+    },
+    quic_connection_test_support:state_set(S1, loss_state, L3).
 
 pto_count(State) ->
     quic_loss:pto_count(quic_connection_test_support:loss_state(State)).

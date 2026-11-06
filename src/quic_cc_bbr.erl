@@ -237,7 +237,6 @@ new(Opts) ->
     MinRecoveryDuration = MinRecoveryDurationMs * 1000,
     InitialRtt = maps:get(initial_rtt, Opts, ?INITIAL_RTT),
     HystartEnabled = maps:get(hystart_enabled, Opts, true),
-    PacingMaxBurst = 12 * MaxDatagramSize,
     Now = erlang:monotonic_time(microsecond),
 
     %% Initial cwnd: 10 packets or BDP estimate
@@ -252,6 +251,7 @@ new(Opts) ->
 
     %% Initial pacing rate (bytes/sec): startup_gain * max_bw.
     InitialPacingRate = trunc(?STARTUP_PACING_GAIN * InitialMaxBw),
+    PacingMaxBurst = pacing_max_burst(MaxDatagramSize, InitialPacingRate),
 
     ?LOG_DEBUG(
         #{
@@ -701,7 +701,7 @@ update_mtu(#bbr_state{max_datagram_size = OldMDS} = State, NewMTU) when NewMTU =
     State;
 update_mtu(#bbr_state{max_datagram_size = OldMDS, minimum_window = OldMinWin} = State, NewMTU) ->
     NewMinimumWindow = max(2 * NewMTU, (OldMinWin * NewMTU) div OldMDS),
-    NewPacingMaxBurst = 12 * NewMTU,
+    NewPacingMaxBurst = pacing_max_burst(NewMTU, State#bbr_state.pacing_rate),
     ?LOG_DEBUG(
         #{
             what => bbr_mtu_updated,
@@ -1291,8 +1291,18 @@ update_bbr_pacing_rate(
         pacing_gain = PacingGain
     } = State
 ) ->
-    PacingRate = trunc(PacingGain * MaxBw * ?PACING_MARGIN),
-    State#bbr_state{pacing_rate = max(1, PacingRate)}.
+    PacingRate = max(1, trunc(PacingGain * MaxBw * ?PACING_MARGIN)),
+    State#bbr_state{
+        pacing_rate = PacingRate,
+        pacing_max_burst = pacing_max_burst(State#bbr_state.max_datagram_size, PacingRate)
+    }.
+
+%% Two milliseconds at the paced rate (bytes/sec), floored at 12
+%% packets: pacing wakeups have about 1 ms resolution, so a fixed
+%% 12-packet bucket caps throughput whenever the pacing timer is the
+%% only wakeup.
+pacing_max_burst(MDS, PacingRate) ->
+    max(12 * MDS, PacingRate div 500).
 
 %%====================================================================
 %% Internal Functions - Pacing Token Bucket

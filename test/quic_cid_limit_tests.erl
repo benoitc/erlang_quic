@@ -209,6 +209,17 @@ retiring_current_dcid_switches_it_test() ->
     ?assertEqual(<<2:64>>, quic_connection_test_support:state_get(S2, dcid)),
     ?assertEqual([0, 1], retired_seqs(S2)).
 
+%% A peer that chose a zero-length CID has no CIDs to rotate to
+%% (RFC 9000 Section 19.15).
+new_cid_with_zero_length_dcid_test() ->
+    S0 = quic_connection_test_support:state_for_cid_limit(3),
+    S1 = quic_connection_test_support:state_set(S0, dcid, <<>>),
+    S2 = new_cid(1, 0, <<1:64>>, S1),
+    ?assertMatch(
+        {transport, ?QUIC_PROTOCOL_VIOLATION, _},
+        quic_connection_test_support:close_reason(S2)
+    ).
+
 %%====================================================================
 %% Issuing our own CIDs
 %%====================================================================

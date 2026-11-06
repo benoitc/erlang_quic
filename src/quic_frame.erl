@@ -341,8 +341,17 @@ decode(<<?FRAME_DATAGRAM_WITH_LEN, Rest/binary>>) ->
             <<Data:Length/binary, Rest2/binary>> = Rest1,
             {{datagram_with_length, Data}, Rest2}
     end;
-decode(<<Type, _/binary>>) ->
+%% The frame type is a varint (RFC 9000 Section 12.4).
+decode(<<0:2, Type:6, _/binary>>) ->
     {error, {unknown_frame_type, Type}};
+decode(<<1:2, Type:14, _/binary>>) ->
+    {error, {unknown_frame_type, Type}};
+decode(<<2:2, Type:30, _/binary>>) ->
+    {error, {unknown_frame_type, Type}};
+decode(<<3:2, Type:62, _/binary>>) ->
+    {error, {unknown_frame_type, Type}};
+decode(<<_, _/binary>>) ->
+    {error, truncated_frame_type};
 decode(<<>>) ->
     {error, empty}.
 

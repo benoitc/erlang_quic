@@ -99,7 +99,8 @@
     get_connections/1,
     register_cid/3,
     retire_cid/2,
-    has_auth_method/1
+    has_auth_method/1,
+    validate_reset_secret/1
 ]).
 
 %% gen_server callbacks
@@ -275,10 +276,12 @@ init({Port, Opts}) ->
     %% Default: gen_udp for backwards compatibility
     Backend = maps:get(socket_backend, Opts, gen_udp),
 
-    case Backend of
-        socket ->
+    case {validate_reset_secret(Opts), Backend} of
+        {{error, Reason}, _} ->
+            {stop, Reason};
+        {ok, socket} ->
             init_socket_backend(Port, Opts);
-        gen_udp ->
+        {ok, gen_udp} ->
             init_genudp_backend(Port, Opts)
     end.
 
@@ -464,6 +467,17 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts, Preferred
 %% Validate that listener options carry at least one viable auth
 %% method. Callers check this before starting a listener so the
 %% failure surfaces as an error return rather than a supervisor crash.
+%% @doc Reset tokens are an HMAC-SHA256 keyed with `reset_secret', which
+%% takes 32 bytes or more.
+-spec validate_reset_secret(map()) -> ok | {error, {invalid_reset_secret, term()}}.
+validate_reset_secret(Opts) ->
+    case maps:find(reset_secret, Opts) of
+        error -> ok;
+        {ok, S} when is_binary(S), byte_size(S) >= 32 -> ok;
+        {ok, S} when is_binary(S) -> {error, {invalid_reset_secret, byte_size(S)}};
+        {ok, S} -> {error, {invalid_reset_secret, S}}
+    end.
+
 -spec has_auth_method(map()) -> ok | {error, no_auth_method}.
 has_auth_method(Opts) when is_map(Opts) ->
     has_auth_method(
@@ -728,6 +742,10 @@ dispatch_batched_packets(
                 send_packets_to_connection(
                     ConnPid, lists:reverse(PacketList), RemoteAddr, QueueMax
                 );
+            (unrouted, PacketList) ->
+                lists:foreach(
+                    fun(P) -> handle_packet(P, RemoteAddr, State) end, lists:reverse(PacketList)
+                );
             ({new, DCID, Version}, PacketList) ->
                 %% Initial packets that need new connections. A client
                 %% flight larger than one datagram (a hybrid
@@ -749,11 +767,17 @@ dispatch_batched_packets(
         Groups
     ).
 
+%% RFC 9000 Section 14.1: a server discards an Initial in a smaller
+%% datagram, and Section 5.2.2 sends no Version Negotiation for one.
+-define(MIN_INITIAL_DATAGRAM, 1200).
+
 %% Group packets by their destination connection
 group_packets_by_conn([], _DCIDLen, _Conns, Acc) ->
     Acc;
 group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
     case parse_packet_header(Packet, DCIDLen) of
+        {initial, _DCID, _SCID, _Version, _Rest} when byte_size(Packet) < ?MIN_INITIAL_DATAGRAM ->
+            group_packets_by_conn(Rest, DCIDLen, Conns, Acc);
         {initial, DCID, _SCID, Version, _Rest} ->
             case ets:lookup(Conns, DCID) of
                 [{DCID, ConnPid}] ->
@@ -762,8 +786,13 @@ group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
                     Acc1 = maps:update_with(Key, fun(L) -> [Packet | L] end, [Packet], Acc),
                     group_packets_by_conn(Rest, DCIDLen, Conns, Acc1);
                 [] ->
-                    %% New connection - group by DCID
-                    Key = {new, DCID, Version},
+                    %% New connection - group by DCID. An unsupported
+                    %% version is answered like a lone datagram.
+                    Key =
+                        case supported_version(Version) of
+                            true -> {new, DCID, Version};
+                            false -> unrouted
+                        end,
                     Acc1 = maps:update_with(Key, fun(L) -> [Packet | L] end, [Packet], Acc),
                     group_packets_by_conn(Rest, DCIDLen, Conns, Acc1)
             end;
@@ -774,8 +803,9 @@ group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
                     Acc1 = maps:update_with(Key, fun(L) -> [Packet | L] end, [Packet], Acc),
                     group_packets_by_conn(Rest, DCIDLen, Conns, Acc1);
                 [] ->
-                    %% Unknown - skip (will be handled as stateless reset if needed)
-                    group_packets_by_conn(Rest, DCIDLen, Conns, Acc)
+                    %% Unknown: a lone datagram's handling, stateless reset included
+                    Acc1 = maps:update_with(unrouted, fun(L) -> [Packet | L] end, [Packet], Acc),
+                    group_packets_by_conn(Rest, DCIDLen, Conns, Acc1)
             end;
         {long, DCID, _SCID, _PacketType, _Rest} ->
             case ets:lookup(Conns, DCID) of
@@ -787,6 +817,9 @@ group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
                     %% Unknown long header - skip
                     group_packets_by_conn(Rest, DCIDLen, Conns, Acc)
             end;
+        {unsupported_version, _DCID, _SCID, _Version} ->
+            Acc1 = maps:update_with(unrouted, fun(L) -> [Packet | L] end, [Packet], Acc),
+            group_packets_by_conn(Rest, DCIDLen, Conns, Acc1);
         {error, _Reason} ->
             %% Skip invalid packets
             group_packets_by_conn(Rest, DCIDLen, Conns, Acc)
@@ -1016,7 +1049,9 @@ get_tables(_) ->
 
 handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) ->
     case parse_packet_header(Packet, DCIDLen) of
-        {initial, DCID, SCID, Version, _Rest} ->
+        {initial, _DCID, _SCID, _Version, _Rest} when byte_size(Packet) < ?MIN_INITIAL_DATAGRAM ->
+            ok;
+        {initial, DCID, _SCID, Version, _Rest} ->
             %% Per-packet routing trace. Logged at debug: every received packet
             %% hits this path (a short-header packet per 1-RTT datagram), so at
             %% info level a busy listener floods the log and burns CPU.
@@ -1029,12 +1064,14 @@ handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) -
                 },
                 ?QUIC_LOG_META
             ),
-            case supported_version(Version) of
-                true ->
-                    handle_initial_packet(Packet, DCID, Version, RemoteAddr, State);
-                false ->
-                    send_version_negotiation(DCID, SCID, Version, RemoteAddr, State)
-            end;
+            handle_initial_packet(Packet, DCID, Version, RemoteAddr, State);
+        {unsupported_version, DCID, SCID, Version} when
+            byte_size(Packet) >= ?MIN_INITIAL_DATAGRAM
+        ->
+            send_version_negotiation(DCID, SCID, Version, RemoteAddr, State);
+        {unsupported_version, _DCID, _SCID, _Version} ->
+            %% RFC 9000 Section 5.2.2: smaller packets MUST be dropped.
+            ok;
         {short, DCID, _Rest} ->
             ?LOG_DEBUG(#{what => short_header_packet, dcid => DCID}, ?QUIC_LOG_META),
             route_to_connection(DCID, Packet, RemoteAddr, State);
@@ -1087,11 +1124,17 @@ parse_packet_header(
 ->
     %% Long header - extract packet type from bits 4-5 of first byte.
     %% The bit patterns are version-specific (RFC 9369 §3.2), so map
-    %% through the version before classifying.
+    %% through the version before classifying. Under an unsupported
+    %% version they mean nothing (RFC 8999 Section 5.1).
     PacketType = (FirstByte bsr 4) band 2#11,
-    case quic_packet:bits_to_type(PacketType, Version) of
-        initial -> {initial, DCID, SCID, Version, Rest};
-        _ -> {long, DCID, SCID, PacketType, Rest}
+    case supported_version(Version) of
+        false ->
+            {unsupported_version, DCID, SCID, Version};
+        true ->
+            case quic_packet:bits_to_type(PacketType, Version) of
+                initial -> {initial, DCID, SCID, Version, Rest};
+                _ -> {long, DCID, SCID, PacketType, Rest}
+            end
     end;
 parse_packet_header(<<0:1, _:7, Rest/binary>>, DCIDLen) ->
     %% Short header - use configured DCID length
@@ -1463,15 +1506,19 @@ parse_initial_token(_) ->
 
 validate_initial_token(Secret, Token, Addr, MaxAge) ->
     case quic_address_token:decode(Secret, Token) of
-        {ok, #{addr := TokAddr} = Decoded} when TokAddr =:= Addr ->
-            case quic_address_token:validate(Decoded, #{max_age_ms => MaxAge}) of
-                ok -> {ok, Decoded};
-                {error, _} = Err -> Err
+        {ok, Decoded} ->
+            case quic_address_token:matches_addr(Decoded, Addr) of
+                true -> validate_token_age(Decoded, MaxAge);
+                false -> {error, address_mismatch}
             end;
-        {ok, _} ->
-            {error, address_mismatch};
         {error, _} = Err ->
             Err
+    end.
+
+validate_token_age(Decoded, MaxAge) ->
+    case quic_address_token:validate(Decoded, #{max_age_ms => MaxAge}) of
+        ok -> {ok, Decoded};
+        {error, _} = Err -> Err
     end.
 
 %% Send a packet using the appropriate backend.
@@ -1537,9 +1584,13 @@ compute_stateless_reset_token(Secret, CID) ->
 %% RFC 9000 Section 10.3: Looks like a short header packet with random bytes
 %% followed by the 16-byte stateless reset token
 build_stateless_reset(Token, TriggerSize) ->
-    %% Reset should be smaller than trigger (RFC 9000 Section 10.3.3)
-    %% but at least 21 bytes. Use a size between 21 and TriggerSize-1.
-    ResetSize = min(TriggerSize - 1, max(21, rand:uniform(20) + 21)),
+    %% Smaller than the trigger (RFC 9000 Section 10.3.3), and exactly one
+    %% byte shorter for a trigger of 43 bytes or less (Section 10.3).
+    ResetSize =
+        case TriggerSize =< 43 of
+            true -> TriggerSize - 1;
+            false -> rand:uniform(20) + 21
+        end,
     %% Unpredictable bits with fixed bit = 1 (first bit = 0 for short header)
 
     % 1 byte header + 16 byte token

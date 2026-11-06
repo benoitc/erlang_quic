@@ -30,6 +30,7 @@
 
     %% CIDs we issue to the peer
     issue/3,
+    issue/4,
     retire_local/2,
     replenish_needed/1,
     local_active_limit/1,
@@ -53,7 +54,7 @@
 
     %% Stateless reset
     generate_reset_token/2,
-    find_reset_token_match/2
+    find_reset_token_match/3
 ]).
 
 -export_type([pool/0]).
@@ -70,6 +71,7 @@
 new(SCID, LocalActiveLimit) ->
     #cid_pool_state{
         local = [#cid_entry{seq_num = 0, cid = SCID, status = active}],
+        next_local_seq = 1,
         peer = [],
         local_active_limit = LocalActiveLimit
     }.
@@ -92,10 +94,14 @@ set_peer_active_limit(#cid_pool_state{} = Pool, Limit) ->
 %% CIDs we issue to the peer
 %%====================================================================
 
-%% @doc How many more CIDs the peer's limit leaves room for.
+%% The peer's active_connection_id_limit has no upper bound.
+-define(MAX_ACTIVE_ISSUED, 8).
+
+%% @doc How many more CIDs the peer's limit leaves room for, up to
+%% ?MAX_ACTIVE_ISSUED.
 -spec replenish_needed(pool()) -> non_neg_integer().
 replenish_needed(#cid_pool_state{peer_active_limit = Limit} = Pool) ->
-    max(0, Limit - local_active_count(Pool)).
+    max(0, min(Limit, ?MAX_ACTIVE_ISSUED) - local_active_count(Pool)).
 
 %% @doc Issue N new CIDs, returning them in issue order for the caller to
 %% register and advertise.
@@ -105,44 +111,43 @@ replenish_needed(#cid_pool_state{peer_active_limit = Limit} = Pool) ->
 -spec issue(pool(), non_neg_integer(), binary() | undefined) ->
     {pool(), [{non_neg_integer(), binary(), binary()}]}.
 issue(Pool, N, ResetSecret) ->
-    issue(Pool, N, ResetSecret, []).
+    issue(Pool, N, ResetSecret, fun() -> crypto:strong_rand_bytes(8) end).
 
-issue(Pool, 0, _ResetSecret, Acc) ->
+%% @doc As issue/3, with each CID from `NewCID'.
+-spec issue(pool(), non_neg_integer(), binary() | undefined, fun(() -> binary())) ->
+    {pool(), [{non_neg_integer(), binary(), binary()}]}.
+issue(Pool, N, ResetSecret, NewCID) ->
+    issue(Pool, N, ResetSecret, NewCID, []).
+
+issue(Pool, 0, _ResetSecret, _NewCID, Acc) ->
     {Pool, lists:reverse(Acc)};
-issue(Pool, N, ResetSecret, Acc) when N > 0 ->
-    CID = crypto:strong_rand_bytes(8),
+issue(Pool, N, ResetSecret, NewCID, Acc) when N > 0 ->
+    CID = NewCID(),
     {Pool1, SeqNum, Token} = issue_cid(Pool, CID, ResetSecret),
-    issue(Pool1, N - 1, ResetSecret, [{SeqNum, CID, Token} | Acc]).
+    issue(Pool1, N - 1, ResetSecret, NewCID, [{SeqNum, CID, Token} | Acc]).
 
 %% @doc Issue a CID the caller chose, such as the one a preferred_address
 %% carries, as the next sequence number.
 -spec issue_cid(pool(), binary(), binary() | undefined) ->
     {pool(), non_neg_integer(), binary()}.
-issue_cid(#cid_pool_state{local = Local} = Pool, CID, ResetSecret) ->
-    SeqNum = next_seq(Local),
+issue_cid(#cid_pool_state{local = Local, next_local_seq = SeqNum} = Pool, CID, ResetSecret) ->
     Token = generate_reset_token(CID, ResetSecret),
     Entry = #cid_entry{
         seq_num = SeqNum, cid = CID, stateless_reset_token = Token, status = active
     },
-    {Pool#cid_pool_state{local = [Entry | Local]}, SeqNum, Token}.
+    {Pool#cid_pool_state{local = [Entry | Local], next_local_seq = SeqNum + 1}, SeqNum, Token}.
 
 %% @doc Retire a CID we issued, returning it so the caller can drop it from
 %% the listener's routing table. A sequence we never issued is a protocol
 %% violation the caller reports (RFC 9000 Section 19.16).
 -spec retire_local(pool(), non_neg_integer()) ->
     {ok, pool(), binary()} | {ok, pool(), undefined} | {error, unissued}.
+retire_local(#cid_pool_state{next_local_seq = Next}, SeqNum) when SeqNum >= Next ->
+    {error, unissued};
 retire_local(#cid_pool_state{local = Local} = Pool, SeqNum) ->
-    case SeqNum >= next_seq(Local) of
-        true ->
-            {error, unissued};
-        false ->
-            Retired = [retire_matching(SeqNum, E) || E <- Local],
-            CID =
-                case lists:keyfind(SeqNum, #cid_entry.seq_num, Local) of
-                    #cid_entry{cid = C} -> C;
-                    false -> undefined
-                end,
-            {ok, Pool#cid_pool_state{local = Retired}, CID}
+    case lists:keytake(SeqNum, #cid_entry.seq_num, Local) of
+        {value, #cid_entry{cid = CID}, Rest} -> {ok, Pool#cid_pool_state{local = Rest}, CID};
+        false -> {ok, Pool, undefined}
     end.
 
 %% @doc The limit we advertise, which bounds how many of the peer's CIDs
@@ -340,9 +345,16 @@ generate_reset_token(CID, Secret) when is_binary(Secret), byte_size(Secret) >= 3
 %% @doc Match a packet's trailing bytes against the reset tokens the peer
 %% gave us. Compared in constant time: the tokens are secret
 %% (RFC 9000 Section 10.3.1), so avoid a byte-position timing oracle.
--spec find_reset_token_match(pool(), binary()) -> {ok, binary()} | not_found.
-find_reset_token_match(#cid_pool_state{peer = Peer}, Token) ->
-    match_token(Peer, Token).
+%% Only CIDs in use count: the current one and those bound to a path, never
+%% one unused or retired (RFC 9000 Section 10.3.1).
+-spec find_reset_token_match(pool(), binary(), binary()) -> {ok, binary()} | not_found.
+find_reset_token_match(#cid_pool_state{peer = Peer}, CurrentDCID, Token) ->
+    Used = [
+        E
+     || #cid_entry{cid = CID, status = active, bound_to = Path} = E <- Peer,
+        CID =:= CurrentDCID orelse Path =/= undefined
+    ],
+    match_token(Used, Token).
 
 match_token([], _Token) ->
     not_found;
@@ -362,9 +374,6 @@ match_token([#cid_entry{stateless_reset_token = Known, cid = CID} | Rest], Token
 %% The pool is the only place a sequence number lives, so issuance and the
 %% unissued check cannot drift apart. The pool always holds sequence 0 from
 %% init, so the empty clause is defensive.
-next_seq([]) -> 0;
-next_seq(Entries) -> lists:max([E#cid_entry.seq_num || E <- Entries]) + 1.
-
 active_count(Entries) ->
     length([E || #cid_entry{status = active} = E <- Entries]).
 

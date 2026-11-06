@@ -842,6 +842,16 @@ recognize_stateless_reset_after_restart_test() ->
 peer_pool(PeerSCID) ->
     quic_cid:set_initial_peer_cid(quic_cid:new(<<"own-cid0">>, 2), PeerSCID, undefined).
 
+%% RFC 9000 Section 10.3.1: the token of a CID the client has not used is
+%% not checked, so a packet ending in it is no stateless reset.
+unused_cid_token_is_no_reset_test() ->
+    DCID = <<10, 11, 12, 13, 14, 15, 16, 17>>,
+    Token = crypto:strong_rand_bytes(16),
+    {ok, Pool, []} = quic_cid:add_peer_cid(peer_pool(DCID), 1, 0, <<1:64>>, Token),
+    State = quic_connection_test_support:state_for_reset(DCID, Pool, undefined),
+    Reset = quic_listener:build_stateless_reset(Token, 1200),
+    ?assertEqual({error, decryption_failed}, quic_connection:check_stateless_reset(Reset, State)).
+
 %% A short-header packet whose trailing bytes are not a known token is a plain
 %% decryption failure, not a stateless reset.
 reject_non_reset_packet_test() ->

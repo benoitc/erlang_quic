@@ -162,6 +162,15 @@ stream_frame_does_not_trigger_no_frames_test() ->
 %% RFC 9000 §12.4: unknown frame type is FRAME_ENCODING_ERROR.
 %% 0xff is not assigned (valid QUIC frame types occupy low codes and a few
 %% draft extensions); the streaming decoder must close with 0x07.
+%% A multi-byte frame type is closed with its full varint value.
+multibyte_unknown_frame_type_is_named_in_full_test() ->
+    S0 = server_state(),
+    {ok, S1, []} = quic_connection:decode_and_process_streaming(app, <<16#40, 16#ff>>, S0),
+    ?assertEqual(
+        {transport, ?QUIC_FRAME_ENCODING_ERROR, <<"unknown frame type 0xff">>},
+        quic_connection_test_support:close_reason(S1)
+    ).
+
 unknown_frame_type_is_frame_encoding_error_test() ->
     S0 = server_state(),
     {ok, S1, []} = quic_connection:decode_and_process_streaming(app, <<16#ff>>, S0),

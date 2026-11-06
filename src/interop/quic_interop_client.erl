@@ -210,7 +210,7 @@ wait_connected(Conn, TestCase) ->
         {quic, Conn, {connected, _Info}} ->
             io:format("Connected~n"),
             case TestCase of
-                "keyupdate" -> quic_connection:key_update(Conn);
+                "keyupdate" -> key_update_once_confirmed(Conn, 40);
                 _ -> ok
             end,
             ok;
@@ -223,6 +223,19 @@ wait_connected(Conn, TestCase) ->
     after 60000 ->
         io:format("Connection timeout~n"),
         error
+    end.
+
+%% A key update may only start once HANDSHAKE_DONE has confirmed the
+%% handshake (RFC 9001 Section 6.1), which can trail {connected}.
+key_update_once_confirmed(_Conn, 0) ->
+    {error, handshake_not_confirmed};
+key_update_once_confirmed(Conn, Tries) ->
+    case quic_connection:key_update(Conn) of
+        {error, handshake_not_confirmed} ->
+            timer:sleep(25),
+            key_update_once_confirmed(Conn, Tries - 1);
+        Result ->
+            Result
     end.
 
 %% Kept for the resumption/zerortt paths, which connect per attempt by

@@ -956,7 +956,8 @@ validate_server_opts(Opts) ->
                 quic_listener:has_auth_method(Opts),
                 credentials(server, Opts),
                 validate_receive_window(Opts),
-                validate_owner_queue(Opts)
+                validate_owner_queue(Opts),
+                quic_listener:validate_reset_secret(Opts)
             ]);
         {error, _} = Error ->
             Error

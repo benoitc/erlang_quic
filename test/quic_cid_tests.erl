@@ -223,6 +223,24 @@ retire_local_returns_the_cid_test() ->
     ),
     ?assertEqual({ok, retired_pool(Pool1, Seq), CID}, quic_cid:retire_local(Pool1, Seq)).
 
+%% A peer that keeps retiring keeps us issuing; the retired entries are
+%% dropped, so the pool stays at the peer's limit.
+retired_local_cids_are_dropped_test() ->
+    Pool0 = quic_cid:set_peer_active_limit(quic_cid:new(?OUR_SCID, 2), 2),
+    {Pool1, _} = quic_cid:issue(Pool0, 1, undefined),
+    Pool = lists:foldl(fun retire_and_replenish/2, Pool1, lists:seq(0, 99)),
+    ?assertEqual(
+        [101, 100], [S || #cid_entry{seq_num = S} <- quic_cid:local_entries(Pool)]
+    ).
+
+%% Retiring the newest CID does not hand its sequence number out again.
+sequence_numbers_are_not_reused_test() ->
+    Pool0 = quic_cid:set_peer_active_limit(quic_cid:new(?OUR_SCID, 2), 3),
+    {Pool1, _} = quic_cid:issue(Pool0, 1, undefined),
+    Pool2 = retired_pool(Pool1, 1),
+    {_Pool3, Issued} = quic_cid:issue(Pool2, 1, undefined),
+    ?assertMatch([{2, _, _}], Issued).
+
 %%====================================================================
 %% Reset tokens
 %%====================================================================
@@ -245,16 +263,37 @@ derived_token_matches_the_listener_test() ->
 reset_token_lookup_test() ->
     Token = crypto:strong_rand_bytes(16),
     Pool = quic_cid:record_initial_reset_token(peer_pool(), Token),
-    ?assertEqual({ok, ?PEER_SCID}, quic_cid:find_reset_token_match(Pool, Token)),
+    ?assertEqual({ok, ?PEER_SCID}, quic_cid:find_reset_token_match(Pool, ?PEER_SCID, Token)),
     ?assertEqual(
-        not_found, quic_cid:find_reset_token_match(Pool, crypto:strong_rand_bytes(16))
+        not_found, quic_cid:find_reset_token_match(Pool, ?PEER_SCID, crypto:strong_rand_bytes(16))
     ).
 
 %% An entry without a token is skipped rather than crashing the comparison.
 tokenless_entry_is_skipped_test() ->
     ?assertEqual(
-        not_found, quic_cid:find_reset_token_match(peer_pool(), crypto:strong_rand_bytes(16))
+        not_found,
+        quic_cid:find_reset_token_match(peer_pool(), ?PEER_SCID, crypto:strong_rand_bytes(16))
     ).
+
+%% RFC 9000 Section 10.3.1: tokens of CIDs never used, or retired, are not
+%% checked.
+unused_cid_token_is_not_checked_test() ->
+    Token = crypto:strong_rand_bytes(16),
+    {ok, Pool, []} = quic_cid:add_peer_cid(peer_pool(), 1, 0, <<1:64>>, Token),
+    ?assertEqual(not_found, quic_cid:find_reset_token_match(Pool, ?PEER_SCID, Token)),
+    ?assertEqual({ok, <<1:64>>}, quic_cid:find_reset_token_match(Pool, <<1:64>>, Token)).
+
+bound_cid_token_is_checked_test() ->
+    Token = crypto:strong_rand_bytes(16),
+    {ok, Pool1, []} = quic_cid:add_peer_cid(peer_pool(), 1, 0, <<1:64>>, Token),
+    {ok, Pool2, _, _} = quic_cid:bind_peer_cid(Pool1, path_a, ?PEER_SCID),
+    ?assertEqual({ok, <<1:64>>}, quic_cid:find_reset_token_match(Pool2, ?PEER_SCID, Token)).
+
+retired_cid_token_is_not_checked_test() ->
+    Token = crypto:strong_rand_bytes(16),
+    {ok, Pool1, []} = quic_cid:add_peer_cid(peer_pool(), 1, 0, <<1:64>>, Token),
+    {ok, Pool2, _} = quic_cid:add_peer_cid(Pool1, 2, 2, <<2:64>>, undefined),
+    ?assertEqual(not_found, quic_cid:find_reset_token_match(Pool2, <<1:64>>, Token)).
 
 %%====================================================================
 %% Helpers
@@ -283,3 +322,8 @@ preferred_address_cid_is_sequence_one_test() ->
     {_Pool2, [{Next, _, _} | _]} = quic_cid:issue(Pool1, 2, Secret),
     ?assertEqual(2, Next),
     ?assertMatch({ok, _, <<1:64>>}, quic_cid:retire_local(Pool1, 1)).
+
+retire_and_replenish(Seq, Pool0) ->
+    Pool1 = retired_pool(Pool0, Seq),
+    {Pool, _} = quic_cid:issue(Pool1, quic_cid:replenish_needed(Pool1), undefined),
+    Pool.

@@ -27,14 +27,18 @@
 data_beyond_the_final_size_is_rejected_test() ->
     S1 = fin_received(<<"first">>),
     S2 = receive_frame(S1, 5, <<"after fin">>, false),
-    ?assertEqual(final_size_error, quic_connection_test_support:close_reason(S2)),
+    ?assertMatch(
+        {transport, ?QUIC_FINAL_SIZE_ERROR, _}, quic_connection_test_support:close_reason(S2)
+    ),
     %% And it never reaches the application.
     ?assertEqual([], [D || {quic, _, {stream_data, ?SID, D, _}} <- messages()]).
 
 %% The existing rule, kept: a second FIN may not move the final size.
 a_second_fin_that_moves_the_final_size_is_rejected_test() ->
     S2 = receive_frame(fin_received(<<"first">>), 0, <<"first and more">>, true),
-    ?assertEqual(final_size_error, quic_connection_test_support:close_reason(S2)).
+    ?assertMatch(
+        {transport, ?QUIC_FINAL_SIZE_ERROR, _}, quic_connection_test_support:close_reason(S2)
+    ).
 
 %% The fence: a retransmission that stays within the final size is
 %% ordinary, so the cases above are about the boundary and not about
@@ -68,7 +72,9 @@ a_retransmission_without_fin_does_not_reopen_the_stream_test() ->
 the_lean_path_defers_once_the_final_size_is_known_test() ->
     S1 = fin_received(<<"first">>),
     S2 = quic_connection:do_process_stream_data_buffered(?SID, 5, <<"after fin">>, false, S1),
-    ?assertEqual(final_size_error, quic_connection_test_support:close_reason(S2)).
+    ?assertMatch(
+        {transport, ?QUIC_FINAL_SIZE_ERROR, _}, quic_connection_test_support:close_reason(S2)
+    ).
 
 %%====================================================================
 %% Sending

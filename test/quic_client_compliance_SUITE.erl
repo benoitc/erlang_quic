@@ -901,7 +901,7 @@ network_keyupdate(Config) ->
     ConnRef = connect_and_wait(Host, Port, [<<"echo">>, <<"hq-interop">>]),
     StreamId = open_stream(ConnRef),
     ok = quic:send_data(ConnRef, StreamId, <<"Before key update">>, false),
-    ok = quic_connection:key_update(ConnRef),
+    ok = key_update_once_confirmed(ConnRef, 40),
     ok = quic:send_data(ConnRef, StreamId, <<" - After key update">>, true),
     quic:close(ConnRef, normal),
     {comment, "Key update test completed"}.
@@ -909,6 +909,19 @@ network_keyupdate(Config) ->
 %%====================================================================
 %% Helper Functions
 %%====================================================================
+
+%% A key update may only start once HANDSHAKE_DONE has confirmed the
+%% handshake (RFC 9001 Section 6.1), which can trail {connected}.
+key_update_once_confirmed(_ConnRef, 0) ->
+    ct:fail(handshake_never_confirmed);
+key_update_once_confirmed(ConnRef, Tries) ->
+    case quic_connection:key_update(ConnRef) of
+        {error, handshake_not_confirmed} ->
+            timer:sleep(50),
+            key_update_once_confirmed(ConnRef, Tries - 1);
+        Result ->
+            Result
+    end.
 
 connect_and_wait(Host, Port, Alpn) ->
     case quic:connect(Host, Port, #{verify => false, alpn => Alpn}, self()) of

@@ -236,6 +236,8 @@
 -define(TLS_ALERT_UNKNOWN_PSK_IDENTITY, 115).
 -define(TLS_ALERT_NO_APPLICATION_PROTOCOL, 120).
 
+-define(TLS_ALERT_MISSING_EXTENSION, 109).
+
 %%====================================================================
 %% PSK offer record (client-side, fed into ClientHello PSK builder)
 %%====================================================================
@@ -600,8 +602,12 @@
 %% of the peer's CIDs we retain, and the peer's bounds how many of ours we
 %% issue (RFC 9000 Section 5.1.1).
 -record(cid_pool_state, {
-    %% CIDs we issued to the peer, newest first, including our sequence 0
+    %% CIDs we issued to the peer and it has not retired, newest first,
+    %% including our sequence 0
     local = [] :: [#cid_entry{}],
+
+    %% Sequence number of the next CID we issue
+    next_local_seq = 0 :: non_neg_integer(),
 
     %% CIDs the peer issued to us, newest first, including its sequence 0
     peer = [] :: [#cid_entry{}],
@@ -642,6 +648,10 @@
     %% Bytes held in recv_buffer, a running count so per-packet
     %% accounting never walks the tree.
     recv_buffered = 0 :: non_neg_integer(),
+    %% Largest offset received beyond recv_offset, for connection flow
+    %% control (RFC 9000 Section 4.1). Behind recv_offset once the gap
+    %% below it is filled.
+    recv_highest = 0 :: non_neg_integer(),
     %% `manual': credit follows recv_consumed, the offset the reader has
     %% returned, instead of what has been delivered.
     recv_flow = auto :: auto | manual,

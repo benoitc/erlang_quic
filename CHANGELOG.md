@@ -73,7 +73,60 @@ All notable changes to this project will be documented in this file.
   winning connection closes before it is handed to the caller. The race
   goes on with the other attempts.
 
+- Many protocol rules from RFC 9000, 9001 and 9002 that were not checked
+  now are. A peer that breaks them gets the error the RFCs name instead of
+  being accepted, and well-behaved peers see no difference. Among them:
+  invalid or missing transport parameters, frames a packet type may not
+  carry, frames on a stream the peer may not use, reserved header bits,
+  truncated frames, unknown frame types, TLS messages at the wrong level
+  or out of order, a TLS signature scheme that does not fit the key, an
+  ACK for a packet never sent, stream counts above the maximum, and final
+  sizes that contradict the data received or exceed a flow control limit.
+- Packets the RFCs say to drop are dropped: duplicates, Initials in
+  datagrams under 1200 bytes, a late Retry, a Version Negotiation that does
+  not echo our connection ID, server packets with a changed source
+  connection ID or an Initial token, and long-header packets with the fixed
+  bit clear. The rest of a datagram is still read after a packet that
+  cannot be decrypted.
+- Flow control matches the peer's view. A reset stream counts its final
+  size once, data arriving after the reset is dropped, a stream we reset
+  sends the size we really sent, and data on several out-of-order frames is
+  counted once per stream. An absent flow control or stream limit
+  parameter means 0, as the RFC says.
+- Recovery is closer to RFC 9002: ACK ranges wider than 65536 packets are
+  accepted (a long lossless transfer used to stall after about 90 MB), an
+  ACK that acknowledges nothing new no longer resets the probe backoff, an
+  RTT sample is taken when the largest acknowledged packet only carried
+  ACKs, the ACK delay is reported, rejected 0-RTT packets leave the
+  recovery state, retransmissions fit the current path MTU, and stale flow
+  control limits and data of a reset stream are not resent.
+- Connections use the smaller of the two idle timeouts, at least three
+  probe timeouts, and close silently when it expires during the handshake.
+  An application close during the handshake now reaches the peer.
+- Connection IDs: those issued at the peer's request are capped, retired
+  ones are dropped, QUIC-LB configurations apply to every issued ID, reset
+  tokens are checked only for IDs in use, and short stateless resets are
+  recognised. Stateless resets and Version Negotiation are sent the way the
+  RFC asks.
+- A server pads Initial packets with PADDING frames inside the packet.
+  Path validation packets reach 1200 bytes whatever the packet number
+  length. The spin bit follows the RFC roles. A peer stream is opened the
+  same way whichever frame opens it, and is reclaimed when the peer resets
+  it first.
+- CUBIC and BBR pace in bursts sized to the sending rate, as NewReno does.
+
 ### Changed
+- `quic_connection:key_update/1` and `quic:migrate/1` return
+  `{error, handshake_not_confirmed}` until the handshake is confirmed, as
+  RFC 9000 and 9001 require.
+- A local close with no application error code is sent as a transport
+  CONNECTION_CLOSE with APPLICATION_ERROR. Peers used to read it as
+  application error 12.
+- A `reset_secret` shorter than 32 bytes is refused when a listener starts
+  instead of failing every handshake.
+- The client drops server Initial packets that carry a token, which the RFC
+  forbids. xquic sends them after a Retry or on resumption, so those
+  connections fail until xquic is fixed.
 - Sends queued before the connection is up share packets, for 0-RTT and
   for writes held until the handshake completes, instead of one packet
   each. A burst of small requests no longer fills a router queue.

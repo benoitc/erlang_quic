@@ -18,7 +18,9 @@ vn_test_() ->
     {foreach, fun setup/0, fun cleanup/1, [
         fun an_unknown_version_gets_a_version_list/1,
         fun the_reply_swaps_the_connection_ids/1,
-        fun a_version_negotiation_packet_is_not_answered/1
+        fun a_version_negotiation_packet_is_not_answered/1,
+        fun a_small_probe_is_dropped/1,
+        fun the_type_bits_do_not_matter/1
     ]}.
 
 setup() ->
@@ -44,7 +46,8 @@ the_reply_swaps_the_connection_ids({Srv, Sock}) ->
     fun() ->
         DCID = <<1, 2, 3, 4, 5, 6, 7, 8>>,
         SCID = <<9, 10, 11, 12>>,
-        {ok, {0, ReplyDCID, ReplySCID, _}} = probe(Srv, Sock, ?GREASE_VERSION, DCID, SCID),
+        {ok, {0, ReplyDCID, ReplySCID, _}} =
+            probe(Srv, Sock, long_header(16#c0, ?GREASE_VERSION, DCID, SCID, 1200)),
         ?assertEqual(SCID, ReplyDCID),
         ?assertEqual(DCID, ReplySCID)
     end.
@@ -56,34 +59,54 @@ a_version_negotiation_packet_is_not_answered({Srv, Sock}) ->
         ?assertEqual({error, timeout}, probe(Srv, Sock, 0))
     end.
 
+%% RFC 9000 Section 5.2.2: a packet too small to start a connection is
+%% dropped, not answered.
+a_small_probe_is_dropped({Srv, Sock}) ->
+    fun() ->
+        ?assertEqual({error, timeout}, probe(Srv, Sock, long_header(16#c0, ?GREASE_VERSION, 1199)))
+    end.
+
+%% Under an unknown version the long header type bits mean nothing
+%% (RFC 8999 Section 5.1); a 0-RTT- or Handshake-looking probe is answered.
+the_type_bits_do_not_matter({Srv, Sock}) ->
+    fun() ->
+        [
+            ?assertMatch(
+                {ok, {0, _, _, [_ | _]}},
+                probe(Srv, Sock, long_header(First, ?GREASE_VERSION, 1200))
+            )
+         || First <- [16#d0, 16#e0, 16#f0]
+        ]
+    end.
+
 %%====================================================================
 %% Helpers
 %%====================================================================
 
-probe(Srv, Sock, Version) ->
-    probe(Srv, Sock, Version, <<1, 2, 3, 4, 5, 6, 7, 8>>, <<9, 9, 9, 9>>).
-
-probe(Srv, Sock, Version, DCID, SCID) ->
+probe(Srv, Sock, Version) when is_integer(Version) ->
+    probe(Srv, Sock, long_header(16#c0, Version, 1200));
+probe(Srv, Sock, Pkt) ->
     #{port := Port} = Srv,
-    Pkt = long_header(Version, DCID, SCID),
     ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, Pkt),
     case gen_udp:recv(Sock, 0, 1000) of
         {ok, {_, _, Data}} -> {ok, parse_vn(Data)};
         {error, _} = E -> E
     end.
 
-%% Minimal long header carrying the probe version, padded to the 1200
-%% bytes a server may require before it will answer an Initial.
-long_header(Version, DCID, SCID) ->
+%% Minimal long header carrying the probe version, padded to Size.
+long_header(First, Version, Size) ->
+    long_header(First, Version, <<1, 2, 3, 4, 5, 6, 7, 8>>, <<9, 9, 9, 9>>, Size).
+
+long_header(First, Version, DCID, SCID, Size) ->
     Head = <<
-        16#c0,
+        First,
         Version:32,
         (byte_size(DCID)),
         DCID/binary,
         (byte_size(SCID)),
         SCID/binary
     >>,
-    Pad = binary:copy(<<0>>, max(0, 1200 - byte_size(Head))),
+    Pad = binary:copy(<<0>>, max(0, Size - byte_size(Head))),
     <<Head/binary, Pad/binary>>.
 
 parse_vn(<<First, 0:32, DLen, DCID:DLen/binary, SLen, SCID:SLen/binary, Rest/binary>>) when
