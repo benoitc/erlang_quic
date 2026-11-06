@@ -30,6 +30,15 @@ Work on one issue goes in one pull request. Give each change a reviewer has to
 look at its own commit, with its tests, rather than opening a pull request per
 change. Docs and CHANGELOG entries go in the same pull request.
 
+## Skills
+
+Task guides for agents live in `.agents/skills/<name>/SKILL.md`; read the one
+that matches the task before starting. `.claude/skills` links to the same
+directories, so there is one copy.
+
+- [rfc-compliance](.agents/skills/rfc-compliance/SKILL.md): check a change or
+  pull request against RFC 9000, 9001, 9002 and the related specs.
+
 ## Build & Development Commands
 
 ```bash
