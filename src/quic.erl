@@ -957,7 +957,7 @@ validate_server_opts(Opts) ->
                 credentials(server, Opts),
                 validate_receive_window(Opts),
                 validate_owner_queue(Opts),
-                validate_reset_secret(Opts)
+                quic_listener:validate_reset_secret(Opts)
             ]);
         {error, _} = Error ->
             Error
@@ -990,16 +990,6 @@ validate_owner_queue(Opts) ->
         {ok, infinity} -> ok;
         {ok, N} when is_integer(N), N > 0 -> ok;
         {ok, N} -> {error, {invalid_max_owner_queue, N}}
-    end.
-
-%% @private Reset tokens are an HMAC-SHA256 keyed with `reset_secret';
-%% quic_cid:generate_reset_token/2 takes 32 bytes or more.
-validate_reset_secret(Opts) ->
-    case maps:find(reset_secret, Opts) of
-        error -> ok;
-        {ok, S} when is_binary(S), byte_size(S) >= 32 -> ok;
-        {ok, S} when is_binary(S) -> {error, {invalid_reset_secret, byte_size(S)}};
-        {ok, S} -> {error, {invalid_reset_secret, S}}
     end.
 
 %% @private Reject a `groups' option naming a key-exchange group this

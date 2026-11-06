@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% Reset tokens are derived with HMAC-SHA256 over a secret of at least
-%%% 32 bytes; a shorter `reset_secret' is refused by start_server/3.
+%%% 32 bytes; a shorter `reset_secret' is refused when a listener starts.
 
 -module(quic_reset_secret_tests).
 
@@ -12,6 +12,17 @@ short_secret_refused_test() ->
 
 non_binary_secret_refused_test() ->
     ?assertEqual({error, {invalid_reset_secret, secret}}, start(secret)).
+
+%% A listener started on its own refuses it too, as quic_dist and the
+%% interop server start it.
+listener_refuses_short_secret_test() ->
+    {Cert, Key} = quic_test_echo_server:cert_and_key(),
+    ?assertEqual(
+        {error, {invalid_reset_secret, 16}},
+        quic_listener:start(0, #{
+            cert => Cert, key => Key, alpn => [<<"h3">>], reset_secret => binary:copy(<<1>>, 16)
+        })
+    ).
 
 start(Secret) ->
     {ok, _} = application:ensure_all_started(quic),

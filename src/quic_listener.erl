@@ -99,7 +99,8 @@
     get_connections/1,
     register_cid/3,
     retire_cid/2,
-    has_auth_method/1
+    has_auth_method/1,
+    validate_reset_secret/1
 ]).
 
 %% gen_server callbacks
@@ -275,10 +276,12 @@ init({Port, Opts}) ->
     %% Default: gen_udp for backwards compatibility
     Backend = maps:get(socket_backend, Opts, gen_udp),
 
-    case Backend of
-        socket ->
+    case {validate_reset_secret(Opts), Backend} of
+        {{error, Reason}, _} ->
+            {stop, Reason};
+        {ok, socket} ->
             init_socket_backend(Port, Opts);
-        gen_udp ->
+        {ok, gen_udp} ->
             init_genudp_backend(Port, Opts)
     end.
 
@@ -464,6 +467,17 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts, Preferred
 %% Validate that listener options carry at least one viable auth
 %% method. Callers check this before starting a listener so the
 %% failure surfaces as an error return rather than a supervisor crash.
+%% @doc Reset tokens are an HMAC-SHA256 keyed with `reset_secret', which
+%% takes 32 bytes or more.
+-spec validate_reset_secret(map()) -> ok | {error, {invalid_reset_secret, term()}}.
+validate_reset_secret(Opts) ->
+    case maps:find(reset_secret, Opts) of
+        error -> ok;
+        {ok, S} when is_binary(S), byte_size(S) >= 32 -> ok;
+        {ok, S} when is_binary(S) -> {error, {invalid_reset_secret, byte_size(S)}};
+        {ok, S} -> {error, {invalid_reset_secret, S}}
+    end.
+
 -spec has_auth_method(map()) -> ok | {error, no_auth_method}.
 has_auth_method(Opts) when is_map(Opts) ->
     has_auth_method(
