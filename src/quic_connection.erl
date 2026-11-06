@@ -6452,17 +6452,19 @@ process_frame(
                         end,
                     %% Notify owner - they should stop sending and may send RESET_STREAM
                     Owner ! {quic, self(), {stop_sending, StreamId, ErrorCode}},
-                    %% Also remove from send queue and adjust byte / entry count
+                    %% Answer while the queue still shows what was sent, so
+                    %% the RESET_STREAM carries that as the final size, then
+                    %% remove the stream from the send queue.
+                    State1 = answer_stop_sending(StreamId, ErrorCode, Streams, State#state{
+                        streams = NewStreams
+                    }),
                     {NewSendQueue, RemovedBytes, RemovedCount} =
-                        remove_stream_from_queue(StreamId, State#state.send_queue),
-                    NewQueueBytes = max(0, State#state.send_queue_bytes - RemovedBytes),
-                    NewQueueCount = max(0, State#state.send_queue_count - RemovedCount),
-                    answer_stop_sending(StreamId, ErrorCode, Streams, State#state{
-                        streams = NewStreams,
+                        remove_stream_from_queue(StreamId, State1#state.send_queue),
+                    State1#state{
                         send_queue = NewSendQueue,
-                        send_queue_bytes = NewQueueBytes,
-                        send_queue_count = NewQueueCount
-                    })
+                        send_queue_bytes = max(0, State1#state.send_queue_bytes - RemovedBytes),
+                        send_queue_count = max(0, State1#state.send_queue_count - RemovedCount)
+                    }
             end
     end;
 %% STREAM_DATA_BLOCKED: Peer is blocked by stream-level flow control
@@ -11530,8 +11532,6 @@ trim_entry({Tag, SId, Offset, Data, _Fin, DataSize}, StreamId, ReliableSize) whe
 trim_entry(_Entry, _StreamId, _ReliableSize) ->
     keep.
 
-%% True if the send queue holds STREAM/retransmit data for StreamId starting
-%% before ReliableSize (reliable bytes still owed).
 %% RFC 9000 Section 4.5: the final size of a stream we reset covers what
 %% we sent. New data still queued is dropped with the reset; retransmits
 %% in the queue were sent already. A stream's new data goes out in
@@ -11554,6 +11554,8 @@ reset_final_size(StreamId, #stream_state{send_offset = Offset}, #state{send_queu
         lists:seq(1, 8)
     ).
 
+%% True if the send queue holds STREAM/retransmit data for StreamId starting
+%% before ReliableSize (reliable bytes still owed).
 stream_has_queued_below(StreamId, ReliableSize, PQ) ->
     lists:any(
         fun(I) ->

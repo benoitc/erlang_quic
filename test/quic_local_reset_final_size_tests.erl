@@ -20,6 +20,14 @@ deadline_test() ->
         [400], final_sizes(quic_connection:do_close_stream_deadline(?STREAM, 0, queued()))
     ).
 
+%% The peer's STOP_SENDING is answered with the size sent, before the
+%% queued data is dropped.
+stop_sending_test() ->
+    S0 = (queued())#state{owner = self()},
+    ?assertEqual(
+        [400], final_sizes(quic_connection:process_frame(app, {stop_sending, ?STREAM, 0}, S0))
+    ).
+
 nothing_queued_test() ->
     S0 = quic_connection_test_support:state_with_send_stream(?STREAM, 1000, false),
     ?assertEqual([1000], final_sizes(quic_connection:do_close_stream(?STREAM, 0, S0))).
