@@ -50,6 +50,19 @@ All notable changes to this project will be documented in this file.
   than its window allows could not finish the handshake.
 - A STREAM FIN that was already delivered is not delivered again when
   the peer repeats it. A server could take it as a new request.
+- A listener's `preferred_ipv4` / `preferred_ipv6` addresses now work.
+  The server advertised them but nothing answered there, so a client that
+  moved lost the connection. The server now receives on them, and moves
+  there once it has checked the client can be reached that way. The
+  `socket` backend refuses preferred addresses for now instead of
+  advertising ones it cannot serve.
+- A client moves to the server's preferred address once the handshake is
+  confirmed, in the address family it already uses, and repeats an
+  unanswered check. It used to send one check before the handshake was
+  confirmed and give up.
+- A client that moved with `quic:migrate/1` keeps its connection through
+  a long outage. With the repeated checks it gave up on the path it was
+  using and could no longer send.
 
 ### Changed
 - Sends queued before the connection is up share packets, for 0-RTT and
