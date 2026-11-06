@@ -4653,6 +4653,9 @@ handle_packet_loop(Data, State) ->
             State
     end.
 
+%% Least time the last probe before a disconnect gets to be acknowledged.
+-define(DISCONNECT_GRACE_MS, 1000).
+
 %% RFC 9001 Section 5.7: a few datagrams that arrive before their keys
 %% may be kept. Beyond the cap they are dropped, as before.
 -define(MAX_EARLY_PACKETS, 8).
@@ -11776,11 +11779,14 @@ disconnect_timeout_expired(#state{loss_state = LossState, cfg = #conn_cfg{discon
 
 %% The deadline passed with no ACK. The last probe may predate a network
 %% that has just come back, and backoff can put the next one seconds away,
-%% so send one now and give it one un-backed-off PTO to be acknowledged.
+%% so send one now and give it one un-backed-off PTO to be acknowledged,
+%% and never less than ?DISCONNECT_GRACE_MS: a path that has just come back
+%% (a new NAT mapping, a link rejoining) is often slower than the RTT says.
 disconnect_deadline(#state{loss_state = LossState} = State) ->
     State1 = flush_event(send_probe_packet(app, State), event),
     Ref = make_ref(),
-    erlang:send_after(quic_loss:base_pto(LossState), self(), {disconnect_final, Ref}),
+    Grace = max(quic_loss:base_pto(LossState), ?DISCONNECT_GRACE_MS),
+    erlang:send_after(Grace, self(), {disconnect_final, Ref}),
     {keep_state, State1#state{disconnect_timer = {final, Ref}}}.
 
 %% The disconnect timeout elapsed with ack-eliciting data in flight and
