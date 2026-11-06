@@ -298,6 +298,9 @@
     %% Set while a probe is being sent, which RFC 9002 Section 7 exempts
     %% from the congestion window.
     hs_probe = false :: boolean(),
+    %% Datagrams that arrived before the keys to read them, oldest first,
+    %% as {Level, Datagram, Source} (RFC 9001 Section 5.7).
+    early_packets = [] :: [{handshake | app, binary(), term()}],
     %% Client-side: a Handshake acknowledgement has arrived, so the
     %% server has validated this address (RFC 9002 Appendix A.8
     %% PeerCompletedAddressValidation). Always true for a server, which

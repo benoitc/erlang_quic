@@ -4526,10 +4526,10 @@ handle_packet_loop(<<>>, #state{cfg = #conn_cfg{role = client, active_n = N}} = 
     %% Note: With {active, N}, calling setopts resets the counter, so this is optional
     %% but provides safety in case socket went passive during processing
     client_rearm_active(State, N),
-    State;
+    replay_early_packets(State);
 handle_packet_loop(<<>>, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% No more data to process - server socket managed by listener
-    State;
+    replay_early_packets(State);
 handle_packet_loop(Data, State) ->
     %% Header/frame parsing runs on attacker-controlled bytes before (and
     %% during) AEAD checks and can raise on truncated/oversized input
@@ -4599,6 +4599,21 @@ handle_packet_loop(Data, State) ->
             %% End of coalesced packets (padding or invalid trailing data)
             %% This is normal, just re-enable socket and return
             maybe_reenable_socket(State),
+            replay_early_packets(State);
+        {error, no_app_keys} ->
+            %% Overtook the handshake that brings its keys; kept for when
+            %% they arrive.
+            maybe_reenable_socket(State),
+            keep_early_packet(no_app_keys, Data, State);
+        {error, no_handshake_keys} when State#state.app_keys =:= undefined ->
+            %% Overtook the Initial that brings its keys. With no 1-RTT
+            %% keys yet, the level cannot have been discarded.
+            maybe_reenable_socket(State),
+            keep_early_packet(no_handshake_keys, Data, State);
+        {error, no_handshake_keys} ->
+            %% A late Handshake packet after those keys were discarded,
+            %% which RFC 9001 Section 4.9.2 says to drop.
+            maybe_reenable_socket(State),
             State;
         {error, Reason} ->
             %% Log decryption failure for debugging. Include the packet
@@ -4637,6 +4652,46 @@ handle_packet_loop(Data, State) ->
             maybe_reenable_socket(State),
             State
     end.
+
+%% RFC 9001 Section 5.7: a few datagrams that arrive before their keys
+%% may be kept. Beyond the cap they are dropped, as before.
+-define(MAX_EARLY_PACKETS, 8).
+
+keep_early_packet(Reason, Data, #state{hs = #hs{early_packets = Early} = HS} = State) when
+    length(Early) < ?MAX_EARLY_PACKETS
+->
+    Level =
+        case Reason of
+            no_handshake_keys -> handshake;
+            no_app_keys -> app
+        end,
+    Entry = {Level, Data, State#state.current_packet_source},
+    State#state{hs = HS#hs{early_packets = Early ++ [Entry]}};
+keep_early_packet(_Reason, _Data, State) ->
+    State.
+
+%% Feed back the kept datagrams whose keys are now installed, oldest
+%% first, from the address each came from.
+replay_early_packets(#state{hs = #hs{early_packets = []}} = State) ->
+    State;
+replay_early_packets(#state{hs = #hs{early_packets = Early} = HS} = State) ->
+    case lists:partition(fun({Level, _, _}) -> has_keys_for(Level, State) end, Early) of
+        {[], _} ->
+            State;
+        {Ready, Waiting} ->
+            Source = State#state.current_packet_source,
+            State1 = lists:foldl(
+                fun({_, Data, From}, Acc) ->
+                    handle_packet_loop(Data, Acc#state{current_packet_source = From})
+                end,
+                State#state{hs = HS#hs{early_packets = Waiting}},
+                Ready
+            ),
+            State1#state{current_packet_source = Source}
+    end.
+
+has_keys_for(handshake, #state{hs = #hs{handshake_keys = Keys}}) -> Keys =/= undefined;
+has_keys_for(app, #state{app_keys = Keys}) -> Keys =/= undefined.
 
 binhex(Bin) when is_binary(Bin) -> binary:encode_hex(Bin);
 binhex(Other) -> Other.
@@ -5066,9 +5121,12 @@ check_stateless_reset(Data, #state{cid_pool_state = Pool} = _State) ->
 decode_short_header_packet(Data, State) ->
     case State#state.app_keys of
         undefined ->
-            ?LOG_WARNING(#{what => no_app_keys_short_header}, ?QUIC_LOG_META),
-            %% No app keys yet - check if this might be a stateless reset
-            check_stateless_reset(Data, State);
+            %% No app keys yet: a stateless reset, or a 1-RTT packet that
+            %% overtook the handshake.
+            case check_stateless_reset(Data, State) of
+                {error, decryption_failed} -> {error, no_app_keys};
+                Other -> Other
+            end;
         {ClientKeys, ServerKeys} ->
             %% Select correct keys based on role
             DecryptKeys =

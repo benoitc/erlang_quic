@@ -17,7 +17,7 @@
 %%% Apache License 2.0
 -module(quic_test_bridge).
 
--export([start/1, set_conn/2, dropped/1, stop/1]).
+-export([start/1, set_conn/2, dropped/1, delivered_in/1, stop/1]).
 -export([header_level/1]).
 
 -export_type([drop_fun/0]).
@@ -32,7 +32,10 @@
     %% Client to server
     drop_out => drop_fun(),
     %% Server to client
-    drop_in => drop_fun()
+    drop_in => drop_fun(),
+    %% Server to client: a datagram this returns true for is delivered
+    %% after the next one, swapping the two.
+    hold_in => drop_fun()
 }.
 
 -define(KEEP, fun(_Pkt, _N) -> false end).
@@ -54,6 +57,8 @@ start(#{server := Server, socket_ref := SocketRef} = Opts) ->
             socket_ref => SocketRef,
             drop_out => maps:get(drop_out, Opts, ?KEEP),
             drop_in => maps:get(drop_in, Opts, ?KEEP),
+            hold_in => maps:get(hold_in, Opts, ?KEEP),
+            held => [],
             out_seen => 0,
             in_seen => 0,
             dropped => 0
@@ -76,6 +81,15 @@ dropped(Bridge) ->
     after 1000 -> error(bridge_report_timeout)
     end.
 
+%% @doc How many server datagrams the relay has seen, dropped or not.
+-spec delivered_in(pid()) -> non_neg_integer().
+delivered_in(Bridge) ->
+    Bridge ! {report_in, self()},
+    receive
+        {in_seen, N} -> N
+    after 1000 -> error(bridge_report_timeout)
+    end.
+
 -spec stop(pid()) -> ok.
 stop(Bridge) ->
     Bridge ! stop,
@@ -92,6 +106,9 @@ loop(#{sock := Sock, server := {ServerIP, ServerPort}} = B) ->
             loop(B#{conn := Conn, pending := []});
         {report, To} ->
             To ! {dropped, maps:get(dropped, B)},
+            loop(B);
+        {report_in, To} ->
+            To ! {in_seen, maps:get(in_seen, B)},
             loop(B);
         %% The connection sends here as if this were its socket.
         {send, _IP, _Port, Pkt} ->
@@ -112,18 +129,26 @@ loop(#{sock := Sock, server := {ServerIP, ServerPort}} = B) ->
                 true ->
                     loop(B1#{dropped := maps:get(dropped, B) + 1});
                 false ->
-                    case maps:get(conn, B1) of
-                        undefined ->
-                            loop(B1#{pending := [Data | maps:get(pending, B1)]});
-                        Conn ->
-                            deliver(B1, Conn, Data),
-                            loop(B1)
+                    case {maps:get(held, B1), (maps:get(hold_in, B1))(Data, N)} of
+                        {[], true} ->
+                            loop(B1#{held := [Data]});
+                        {Held, _} ->
+                            loop(lists:foldl(fun pass_in/2, B1#{held := []}, [Data | Held]))
                     end
             end;
         stop ->
             gen_udp:close(Sock);
         _ ->
             loop(B)
+    end.
+
+pass_in(Data, B) ->
+    case maps:get(conn, B) of
+        undefined ->
+            B#{pending := [Data | maps:get(pending, B)]};
+        Conn ->
+            deliver(B, Conn, Data),
+            B
     end.
 
 deliver(#{server := {ServerIP, ServerPort}, socket_ref := SocketRef}, Conn, Data) ->
