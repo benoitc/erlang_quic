@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- Downloads on paths that reorder packets are several times faster.
+  Packets that arrived out of order were taken as lost, so they were
+  sent again and the sending rate was cut each time. Late packets are now
+  recognised: the connection waits longer before it calls a packet lost,
+  and gives back the rate it cut when the loss turns out not to be real.
+  On a simulated mobile path (80 ms round trip, 10 ms jitter, 0.5% loss)
+  a download went from 68 to 430 KB/s with NewReno, and from 52 to over
+  300 KB/s with CUBIC.
+- Connecting over such a path takes about one round trip again. A
+  server packet that arrived before the one it depends on was dropped and
+  had to be sent again; the client now keeps it until it can be read.
+- A connection whose network comes back late in a long outage is no
+  longer closed by the disconnect timeout just before it would have
+  recovered. When the timeout is reached, the connection now sends one
+  more probe and waits for its answer before giving up. This also covers
+  a `quic:migrate/1` made while there is no network at all.
+- `quic:sockname/1` now returns the address the connection sends from
+  now. It kept the one from connect time after `quic:migrate/1`, and
+  with the `socket` backend it reported port 0.
+
 ## [2.1.3] - 2026-10-26
 
 ### Changed
