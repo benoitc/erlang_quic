@@ -3443,3 +3443,66 @@ wt_stream_first_bytes_of_peer_stream_allowed_test() ->
     ?assertMatch(
         {ok, _}, quic_h3_connection:handle_stream_data(0, <<16#40, 16#41, 0>>, false, State)
     ).
+
+%%====================================================================
+%% Field section limit while decoding (RFC 9114 §4.2.2)
+%%====================================================================
+
+%% 100 static ":path /" fields: 3800 bytes by the RFC's count.
+big_field_section() ->
+    Lines = binary:copy(<<16#C1>>, 100),
+    <<0, 0, Lines/binary>>.
+
+oversized_request_headers_close_the_connection_test() ->
+    State = make_test_state(#{role => server, local_max_field_section_size => 1024}),
+    Frame = quic_h3_frame:encode({headers, big_field_section()}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_EXCESSIVE_LOAD, _}, _},
+        quic_h3_connection:handle_stream_data(0, Frame, false, State)
+    ).
+
+oversized_trailers_reset_only_the_stream_test() ->
+    Stream = #h3_stream{id = 0, type = request, state = open, frame_state = expecting_data},
+    State = make_test_state(#{
+        role => server, local_max_field_section_size => 1024, streams => #{0 => Stream}
+    }),
+    ?assertEqual(
+        {error, {stream_reset, 0, ?H3_EXCESSIVE_LOAD}},
+        quic_h3_connection:handle_request_frame(
+            0, {headers, big_field_section()}, true, Stream, State
+        )
+    ).
+
+oversized_push_trailers_cancel_only_the_push_test_() ->
+    {setup,
+        fun() ->
+            meck:new(quic, [passthrough]),
+            meck:expect(quic, stop_sending, fun(_, _, _) -> ok end),
+            meck:expect(quic, send_data, fun(_, _, _, _) -> ok end)
+        end,
+        fun(_) -> meck:unload(quic) end, fun() ->
+            Push = #h3_stream{id = 3, type = push, state = open, frame_state = expecting_data},
+            State = make_test_state(#{
+                role => client,
+                quic_conn => self(),
+                local_control_stream => 2,
+                local_max_push_id => 10,
+                local_max_field_section_size => 1024,
+                received_pushes => #{0 => Push}
+            }),
+            flush_mailbox(),
+            {ok, State1} = quic_h3_connection:handle_push_frame(
+                3, 0, {headers, big_field_section()}, true, State
+            ),
+            ?assert(meck:called(quic, stop_sending, ['_', 3, ?H3_EXCESSIVE_LOAD])),
+            Self = self(),
+            receive
+                {quic_h3, Self, {push_cancelled, 0}} -> ok
+            after 100 -> ?assert(false)
+            end,
+            %% CANCEL_PUSH went out on the control stream.
+            ?assert(
+                meck:called(quic, send_data, ['_', 2, quic_h3_frame:encode_cancel_push(0), false])
+            ),
+            _ = State1
+        end}.

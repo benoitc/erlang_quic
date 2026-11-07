@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- An HTTP/3 peer could make the other side spend minutes of CPU on one
+  request. Decoding a header block took time that grew with the square of
+  its size, so a 1 MiB block of small header fields kept a scheduler busy
+  for over ten minutes, and the header size limit was only checked once
+  everything was decoded. Header blocks now decode in linear time, the
+  limit we advertise stops decoding as soon as it is crossed, and it now
+  applies to trailers too: trailers over it reset only their own request.
+  (GHSA-224p-pchv-5r3r, CWE-407).
+
 ### Added
 - HTTP/3 server option `defer_requests_until_settings`. When set, a
   request or WebTransport stream that arrives before the client's
@@ -37,6 +47,12 @@ All notable changes to this project will be documented in this file.
   address sends a small path check there. The answer did not fit in what
   the server may send to an address it has not yet confirmed, and the
   connection went down instead of waiting for more data from the client.
+- HTTP/3 header fields a peer sent by reference to a static table entry
+  with no value, such as an empty `cookie`, came out with no value at all
+  and brought the connection down. They now decode as empty fields.
+- The QPACK static table had entry 2 as `:age` instead of `age`, so an
+  `age: 0` header sent by reference was taken for an unknown pseudo-header
+  and the message refused.
 
 ## [2.2.1] - 2026-11-07
 

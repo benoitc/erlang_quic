@@ -2337,20 +2337,16 @@ handle_push_frame(_StreamId, _PushId, {unknown, _Type, _Payload}, _Fin, State) -
 handle_push_headers(
     StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, #state{received_pushes = Received} = State
 ) ->
-    case quic_qpack:decode(HeaderBlock, Decoder) of
+    case decode_field_section(HeaderBlock, Decoder, State) of
         {{ok, Headers}, Decoder1} ->
-            MaxSize = State#state.local_max_field_section_size,
-            case calculate_field_section_size(Headers) > MaxSize of
-                true ->
-                    {error,
-                        {connection_error, ?H3_EXCESSIVE_LOAD,
-                            <<"push field section exceeds SETTINGS_MAX_FIELD_SECTION_SIZE">>}};
-                false ->
-                    State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
-                    validate_and_deliver_push_response(
-                        StreamId, PushId, Headers, Fin, Owner, Received, State1
-                    )
-            end;
+            State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
+            validate_and_deliver_push_response(
+                StreamId, PushId, Headers, Fin, Owner, Received, State1
+            );
+        {{error, field_section_too_large}, _Decoder1} ->
+            {error,
+                {connection_error, ?H3_EXCESSIVE_LOAD,
+                    <<"push field section exceeds SETTINGS_MAX_FIELD_SECTION_SIZE">>}};
         {{blocked, _RIC}, _Decoder1} ->
             {error,
                 {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED,
@@ -2450,7 +2446,12 @@ cl_data_check(_, _, _) ->
 %% specific fields, Content-Length matches response headers, body size
 %% agrees with advertised content-length.
 handle_push_trailers(StreamId, PushId, HeaderBlock, Decoder, Owner, Stream, State) ->
-    case quic_qpack:decode(HeaderBlock, Decoder) of
+    case decode_field_section(HeaderBlock, Decoder, State) of
+        {{error, field_section_too_large}, _Decoder1} ->
+            %% Trailers over our limit cost only this push.
+            _ = quic:stop_sending(State#state.quic_conn, StreamId, ?H3_EXCESSIVE_LOAD),
+            Owner ! {quic_h3, self(), {push_cancelled, PushId}},
+            cleanup_push_stream(PushId, StreamId, do_cancel_push(PushId, State));
         {{ok, Trailers}, Decoder1} ->
             State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
             try
@@ -2866,7 +2867,10 @@ handle_request_frame(
     #h3_stream{frame_state = expecting_data} = Stream,
     #state{qpack_decoder = Decoder, owner = Owner} = State
 ) ->
-    case quic_qpack:decode(HeaderBlock, Decoder) of
+    case decode_field_section(HeaderBlock, Decoder, State) of
+        {{error, field_section_too_large}, _Decoder1} ->
+            %% Trailers over our limit cost only this request.
+            {error, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}};
         {{ok, Trailers}, Decoder1} ->
             %% RFC 9114 Section 4.1.2: validate trailers
             case validate_trailer_headers(Trailers, Stream) of
@@ -2954,20 +2958,16 @@ handle_push_promise(
 decode_push_promise_headers(
     StreamId, PushId, HeaderBlock, Stream, Cancelled, Decoder, Owner, Promised, State
 ) ->
-    case quic_qpack:decode(HeaderBlock, Decoder) of
+    case decode_field_section(HeaderBlock, Decoder, State) of
         {{ok, Headers}, Decoder1} ->
-            MaxSize = State#state.local_max_field_section_size,
-            case calculate_field_section_size(Headers) > MaxSize of
-                true ->
-                    {error,
-                        {connection_error, ?H3_EXCESSIVE_LOAD,
-                            <<"PUSH_PROMISE field section exceeds limit">>}};
-                false ->
-                    State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
-                    validate_and_apply_push_promise(
-                        StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised, State1
-                    )
-            end;
+            State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
+            validate_and_apply_push_promise(
+                StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised, State1
+            );
+        {{error, field_section_too_large}, _Decoder1} ->
+            {error,
+                {connection_error, ?H3_EXCESSIVE_LOAD,
+                    <<"PUSH_PROMISE field section exceeds limit">>}};
         {{blocked, _RIC}, _Decoder1} ->
             {error,
                 {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED,
@@ -3067,23 +3067,21 @@ validate_push_promise_duplicate(PushId, Headers, Promised) ->
                     <<"PUSH_PROMISE headers mismatch for repeated push ID">>}}
     end.
 
+%% RFC 9114 §4.2.2: what we advertised as SETTINGS_MAX_FIELD_SECTION_SIZE
+%% bounds every field section we decode, enforced while decoding.
+decode_field_section(HeaderBlock, Decoder, #state{local_max_field_section_size = Max}) ->
+    quic_qpack:decode(HeaderBlock, Decoder, Max).
+
 %% Decode and process headers
 handle_headers_decode(StreamId, HeaderBlock, Fin, Stream, Decoder, Owner, Role, State) ->
-    case quic_qpack:decode(HeaderBlock, Decoder) of
+    case decode_field_section(HeaderBlock, Decoder, State) of
         {{ok, Headers}, Decoder1} ->
-            %% RFC 9114 Section 4.2.2: Check decoded field section size
-            %% Use LOCAL setting - we enforce our own limit on inbound headers
-            DecodedSize = calculate_field_section_size(Headers),
-            MaxSize = State#state.local_max_field_section_size,
-            case DecodedSize > MaxSize of
-                true ->
-                    {error,
-                        {connection_error, ?H3_EXCESSIVE_LOAD,
-                            <<"field section exceeds SETTINGS_MAX_FIELD_SECTION_SIZE">>}};
-                false ->
-                    State1 = State#state{qpack_decoder = Decoder1},
-                    process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State1)
-            end;
+            State1 = State#state{qpack_decoder = Decoder1},
+            process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State1);
+        {{error, field_section_too_large}, _Decoder1} ->
+            {error,
+                {connection_error, ?H3_EXCESSIVE_LOAD,
+                    <<"field section exceeds SETTINGS_MAX_FIELD_SECTION_SIZE">>}};
         {{blocked, RIC}, Decoder1} ->
             %% Stream blocked waiting for encoder instructions (RFC 9204 Section 2.2.2)
             %% Check blocked streams limit (RFC 9204 Section 2.1.2)

@@ -698,3 +698,45 @@ short_huffman_invalid_rejected_test() ->
     %% prefix(0,0) + literal-name "x" + Huffman value (len 4) of 0xFFFFFFFF.
     Bad = <<0, 0, 16#21, "x", 16#84, 16#FF, 16#FF, 16#FF, 16#FF>>,
     ?assertMatch({error, _}, quic_qpack:decode(Bad)).
+
+%% Field lines decode in linear time: reading a line's first byte used to
+%% copy the rest of the block, so this took seconds.
+many_literal_field_lines_decode_in_linear_time_test() ->
+    Lines = binary:copy(<<16#51, 0>>, 64000),
+    {Us, {ok, Headers}} = timer:tc(fun() -> quic_qpack:decode(<<0, 0, Lines/binary>>) end),
+    ?assertEqual(64000, length(Headers)),
+    ?assert(Us < 500000).
+
+%% decode/3 enforces the field section size limit (name + value + 32 per
+%% field) while decoding.
+field_section_limit_test() ->
+    Lines = binary:copy(<<16#C1>>, 100),
+    Block = <<0, 0, Lines/binary>>,
+    %% Each static ":path /" field counts 5 + 1 + 32 = 38 bytes.
+    State = quic_qpack:new(),
+    ?assertMatch({{ok, [_ | _]}, _}, quic_qpack:decode(Block, State, 3800)),
+    ?assertEqual(
+        {{error, field_section_too_large}, State}, quic_qpack:decode(Block, State, 3799)
+    ).
+
+%% Decoding stops at the field that crosses the limit: an invalid line
+%% after it is never reached.
+field_section_limit_stops_decoding_test() ->
+    Lines = binary:copy(<<16#C1>>, 100),
+    Block = <<0, 0, Lines/binary, 16#80>>,
+    ?assertMatch(
+        {{error, {invalid_dynamic_index, _}}, _}, quic_qpack:decode(Block, quic_qpack:new())
+    ),
+    ?assertMatch(
+        {{error, field_section_too_large}, _}, quic_qpack:decode(Block, quic_qpack:new(), 1000)
+    ).
+
+%% A static entry listed without a value decodes with an empty one.
+indexed_static_entry_without_value_test() ->
+    ?assertEqual({ok, [{<<"cookie">>, <<>>}]}, quic_qpack:decode(<<0, 0, 16#C5>>)),
+    ?assertEqual({ok, [{<<":authority">>, <<>>}]}, quic_qpack:decode(<<0, 0, 16#C0>>)).
+
+%% RFC 9204 Appendix A: static entry 2 is "age: 0".
+static_entry_two_is_age_test() ->
+    ?assertEqual({ok, [{<<"age">>, <<"0">>}]}, quic_qpack:decode(<<0, 0, 16#C2>>)),
+    ?assertEqual(<<0, 0, 16#C2>>, quic_qpack:encode([{<<"age">>, <<"0">>}])).
