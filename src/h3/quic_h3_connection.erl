@@ -33,6 +33,7 @@
     cancel_stream/3,
     goaway/1,
     close/1,
+    close/2,
     get_settings/1,
     get_peer_settings/1,
     get_quic_conn/1,
@@ -85,6 +86,14 @@
             element(1, C) =:= unset_stream_handler orelse
             element(1, C) =:= consume))
 ).
+
+%% defer_requests_until_settings is on and the peer's SETTINGS are not in.
+-define(HOLDING_STREAMS(S),
+    (S#state.defer_requests andalso not S#state.settings_received)
+).
+
+%% The peer opened this stream: client-initiated ids are even.
+-define(IS_PEER_STREAM(Id, S), ((S#state.role =:= server) =:= ((Id) band 1 =:= 0))).
 
 %% Test exports - only available when compiled with TEST defined
 -ifdef(TEST).
@@ -310,7 +319,20 @@
 
     %% GOAWAY identifier the peer sent. A different kind of number from
     %% goaway_id: a server names a stream, a client a push.
-    peer_goaway_id :: non_neg_integer() | undefined
+    peer_goaway_id :: non_neg_integer() | undefined,
+
+    %% Server option defer_requests_until_settings: requests whose HEADERS
+    %% complete before the peer's SETTINGS wait in deferred_requests,
+    %% newest first, and are dispatched once SETTINGS are applied.
+    defer_requests = false :: boolean(),
+    deferred_requests = [] :: [{stream_id(), binary(), binary(), [{binary(), binary()}]}],
+    %% Same option: bytes of streams a stream_type_handler would see,
+    %% held until SETTINGS and replayed in arrival order. held_streams
+    %% names them, held_data is newest first, held_bytes bounds it by
+    %% max_buffered_body.
+    held_streams = #{} :: #{stream_id() => true},
+    held_data = [] :: [{stream_id(), binary(), boolean()}],
+    held_bytes = 0 :: non_neg_integer()
 }).
 
 %%====================================================================
@@ -406,6 +428,11 @@ goaway(Conn) ->
 -spec close(pid()) -> ok.
 close(Conn) ->
     gen_statem:cast(Conn, close).
+
+%% @doc Close the connection, sending ErrorCode in CONNECTION_CLOSE.
+-spec close(pid(), error_code()) -> ok.
+close(Conn, ErrorCode) ->
+    gen_statem:cast(Conn, {close, ErrorCode}).
 
 %% @doc Get local settings.
 -spec get_settings(pid()) -> map().
@@ -577,6 +604,7 @@ init({server, QuicConn, Opts, Owner}) ->
     StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
     H3DatagramEnabled = maps:get(h3_datagram_enabled, Opts, false),
     MaxBufferedBody = maps:get(max_buffered_body, Opts, ?H3_MAX_BUFFERED_BODY),
+    DeferRequests = maps:get(defer_requests_until_settings, Opts, false),
 
     State = #state{
         quic_conn = QuicConn,
@@ -601,7 +629,8 @@ init({server, QuicConn, Opts, Owner}) ->
         local_connect_enabled = LocalConnectEnabled,
         stream_type_handler = StreamTypeHandler,
         h3_datagram_enabled = H3DatagramEnabled,
-        max_buffered_body = MaxBufferedBody
+        max_buffered_body = MaxBufferedBody,
+        defer_requests = DeferRequests
     },
 
     %% Store handler in process dictionary for server
@@ -647,6 +676,8 @@ bootstrapping({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 bootstrapping(cast, close, State) ->
     close_with(normal, State);
+bootstrapping(cast, {close, ErrorCode}, State) ->
+    close_with_code(ErrorCode, State);
 bootstrapping(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 bootstrapping(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
@@ -765,6 +796,8 @@ early_data({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 early_data(cast, close, State) ->
     close_with(normal, State);
+early_data(cast, {close, ErrorCode}, State) ->
+    close_with_code(ErrorCode, State);
 early_data(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
     {keep_state, tell_send_ready(State)};
 early_data(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
@@ -840,6 +873,8 @@ awaiting_quic({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 awaiting_quic(cast, close, State) ->
     close_with(normal, State);
+awaiting_quic(cast, {close, ErrorCode}, State) ->
+    close_with_code(ErrorCode, State);
 awaiting_quic(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 awaiting_quic(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
@@ -945,6 +980,8 @@ h3_connecting({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 h3_connecting(cast, close, State) ->
     close_with(normal, State);
+h3_connecting(cast, {close, ErrorCode}, State) ->
+    close_with_code(ErrorCode, State);
 h3_connecting(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
     {keep_state, tell_send_ready(State)};
 h3_connecting(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
@@ -1243,8 +1280,14 @@ live_event(cast, {cancel_stream, StreamId, ErrorCode}, State) ->
     {keep_state, State1};
 live_event(cast, close, State) ->
     close_with(normal, State);
+live_event(cast, {close, ErrorCode}, State) ->
+    close_with_code(ErrorCode, State);
 live_event(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
     {keep_state, tell_send_ready(State)};
+live_event(info, {quic, QC, {closed, Reason}}, #state{quic_conn = QC} = State) ->
+    %% The owner hears a peer's error code, not the `normal' the QUIC
+    %% process exits with after draining. A clean close stays `normal'.
+    handle_quic_failed(live_close_reason(Reason), State);
 live_event(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 live_event(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
@@ -1303,12 +1346,21 @@ closing(_EventType, _Event, _State) ->
 %% Internal: QUIC connection DOWN
 %%====================================================================
 
-%% The QUIC connection reported a failure (bad certificate, TLS alert, peer
-%% close) before HTTP/3 came up. Pass the reason to the owner so a caller in
-%% `quic_h3:wait_connected/2' fails with it instead of timing out.
+%% The QUIC connection closed (bad certificate, TLS alert, peer close, idle
+%% timeout). Pass the reason to the owner: before HTTP/3 is up a caller in
+%% `quic_h3:wait_connected/2' fails with it instead of timing out, and
+%% after it the owner learns the peer's error code.
 handle_quic_failed(Reason, #state{owner = Owner} = State) ->
     Owner ! {quic_h3, self(), {closed, Reason}},
     {stop, normal, State}.
+
+%% A peer closing with no error is a normal close.
+live_close_reason({peer_closed, application, Code, _}) when
+    Code =:= ?H3_NO_ERROR; Code =:= 0
+->
+    normal;
+live_close_reason(Reason) ->
+    Reason.
 
 %% A cleanly closed QUIC connection must not crash the H3 process:
 %% only an abnormal QUIC exit is propagated as {quic_closed, Reason}.
@@ -1466,6 +1518,10 @@ stream_blocked_by_goaway(_StreamId, client, _State) ->
     %% client-initiated and not constrained by the goaway_id value.
     false.
 
+handle_stream_data(StreamId, Data, Fin, #state{held_streams = Held} = State) when
+    is_map_key(StreamId, Held)
+->
+    hold_stream_data(StreamId, Data, Fin, State);
 handle_stream_data(StreamId, Data, Fin, State) ->
     case classify_stream(StreamId, State) of
         {uni, discarded} ->
@@ -1491,6 +1547,8 @@ handle_stream_data(StreamId, Data, Fin, State) ->
             handle_encoder_stream_data(Data, State);
         {uni, qpack_decoder} ->
             handle_decoder_stream_data(Data, State);
+        {bidi, pending_type} when ?HOLDING_STREAMS(State) ->
+            hold_stream_data(StreamId, Data, Fin, State);
         {bidi, pending_type} ->
             handle_bidi_stream_type(StreamId, Data, Fin, State);
         {bidi, {claimed, _Type}} ->
@@ -1589,6 +1647,11 @@ handle_uni_stream_type(StreamId, Data, Fin, #state{uni_stream_buffers = Buffers}
     Buffer = maps:get(StreamId, Buffers, <<>>),
     Combined = <<Buffer/binary, Data/binary>>,
     case quic_h3_frame:decode_stream_type(Combined) of
+        {ok, {unknown, _}, _Rest} when
+            ?HOLDING_STREAMS(State), State#state.stream_type_handler =/= undefined
+        ->
+            State1 = State#state{uni_stream_buffers = maps:remove(StreamId, Buffers)},
+            hold_stream_data(StreamId, Combined, Fin, State1);
         {ok, Type, Rest} ->
             State1 = State#state{uni_stream_buffers = maps:remove(StreamId, Buffers)},
             case assign_uni_stream(StreamId, Type, State1) of
@@ -1837,10 +1900,12 @@ handle_control_frame({settings, Settings}, #state{settings_received = false} = S
     %% error that flows through handle_connection_error/2 for a clean close.
     try apply_peer_settings(Settings, State) of
         State1 ->
-            {ok, State1#state{
-                peer_settings = Settings,
-                settings_received = true
-            }}
+            replay_held_streams(
+                dispatch_deferred_requests(State1#state{
+                    peer_settings = Settings,
+                    settings_received = true
+                })
+            )
     catch
         throw:{connection_error, _Code, _Reason} = Err ->
             {error, Err}
@@ -1896,6 +1961,8 @@ handle_control_frame({headers, _}, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"HEADERS on control stream">>}};
 handle_control_frame({push_promise, _, _}, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"PUSH_PROMISE on control stream">>}};
+handle_control_frame({unknown, ?H3_FRAME_WT_STREAM, _}, _State) ->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"WT_STREAM on control stream">>}};
 handle_control_frame({unknown, Type, Payload}, State) ->
     %% Check for PRIORITY_UPDATE frames (RFC 9218)
     case Type of
@@ -2257,6 +2324,8 @@ handle_push_frame(_StreamId, _PushId, {max_push_id, _}, _Fin, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"MAX_PUSH_ID on push stream">>}};
 handle_push_frame(_StreamId, _PushId, {cancel_push, _}, _Fin, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"CANCEL_PUSH on push stream">>}};
+handle_push_frame(_StreamId, _PushId, {unknown, ?H3_FRAME_WT_STREAM, _}, _Fin, _State) ->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"WT_STREAM on push stream">>}};
 handle_push_frame(_StreamId, _PushId, {unknown, _Type, _Payload}, _Fin, State) ->
     %% Unknown frame types are ignored per RFC 9114
     {ok, State}.
@@ -2645,6 +2714,11 @@ process_request_frames(StreamId, Data, Fin, Stream, State) ->
             process_request_frame(
                 StreamId, {data, Piece}, PieceFin, Rest, Fin, Stream0, State
             );
+        {ok, {unknown, ?H3_FRAME_WT_STREAM, _}, _Rest} when
+            not (Stream#h3_stream.received =:= byte_size(Data) andalso
+                ?IS_PEER_STREAM(StreamId, State))
+        ->
+            {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"WT_STREAM after stream start">>}};
         {ok, Frame, Rest} ->
             process_request_frame(
                 StreamId, Frame, Fin andalso Rest =:= <<>>, Rest, Fin, Stream, State
@@ -3043,8 +3117,8 @@ process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State) ->
             %% Apply RFC 9218 priority to underlying QUIC stream
             apply_stream_priority(StreamId, Stream1, State1),
             Stream2 = finalize_stream_state(Stream1, Fin, Role),
-            notify_headers_received(StreamId, Headers, Stream2, Owner, Role),
-            end_body_with_headers(StreamId, Fin, Stream2, State1);
+            State2 = notify_headers_received(StreamId, Headers, Stream2, Owner, Role, State1),
+            end_body_with_headers(StreamId, Fin, Stream2, State2);
         {error, {invalid_field, _Field, _Value}} ->
             %% Malformed header field - stream reset (RFC 9114 Section 4.1.2)
             {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}};
@@ -3067,14 +3141,83 @@ finalize_stream_state(Stream, false, _Role) ->
     Stream#h3_stream{frame_state = expecting_data}.
 
 %% Notify owner and invoke handler for received headers
-notify_headers_received(StreamId, Headers, Stream, Owner, server) ->
-    Method = Stream#h3_stream.method,
-    Path = Stream#h3_stream.path,
-    Owner ! {quic_h3, self(), {request, StreamId, Method, Path, Headers}},
-    invoke_handler(self(), StreamId, Method, Path, Headers);
-notify_headers_received(StreamId, Headers, Stream, Owner, client) ->
+notify_headers_received(
+    StreamId,
+    Headers,
+    Stream,
+    _Owner,
+    server,
+    #state{defer_requests = true, settings_received = false, deferred_requests = Q} = State
+) ->
+    Req = {StreamId, Stream#h3_stream.method, Stream#h3_stream.path, Headers},
+    State#state{deferred_requests = [Req | Q]};
+notify_headers_received(StreamId, Headers, Stream, Owner, server, State) ->
+    dispatch_request(Owner, {StreamId, Stream#h3_stream.method, Stream#h3_stream.path, Headers}),
+    State;
+notify_headers_received(StreamId, Headers, Stream, Owner, client, State) ->
     Status = Stream#h3_stream.status,
-    Owner ! {quic_h3, self(), {response, StreamId, Status, Headers}}.
+    Owner ! {quic_h3, self(), {response, StreamId, Status, Headers}},
+    State.
+
+dispatch_request(Owner, {StreamId, Method, Path, Headers}) ->
+    Owner ! {quic_h3, self(), {request, StreamId, Method, Path, Headers}},
+    invoke_handler(self(), StreamId, Method, Path, Headers).
+
+%% In arrival order, skipping streams the peer has reset meanwhile.
+dispatch_deferred_requests(#state{deferred_requests = []} = State) ->
+    State;
+dispatch_deferred_requests(#state{deferred_requests = Q, owner = Owner, streams = Streams} = State) ->
+    lists:foreach(
+        fun({StreamId, _, _, _} = Req) ->
+            case Streams of
+                #{StreamId := #h3_stream{reset = true}} -> ok;
+                _ -> dispatch_request(Owner, Req)
+            end
+        end,
+        lists:reverse(Q)
+    ),
+    State#state{deferred_requests = []}.
+
+%% WebTransport draft-17 §7.1: stream headers depend on the draft the
+%% client's SETTINGS select, so the streams wait for them.
+hold_stream_data(StreamId, Data, Fin, #state{held_bytes = Bytes} = State) ->
+    case Bytes + byte_size(Data) > State#state.max_buffered_body of
+        true ->
+            {error, {connection_error, ?H3_EXCESSIVE_LOAD, <<"streams held before SETTINGS">>},
+                State};
+        false ->
+            {ok, State#state{
+                held_streams = (State#state.held_streams)#{StreamId => true},
+                held_data = [{StreamId, Data, Fin} | State#state.held_data],
+                held_bytes = Bytes + byte_size(Data)
+            }}
+    end.
+
+replay_held_streams(#state{held_data = []} = State) ->
+    {ok, State};
+replay_held_streams(#state{held_data = Held} = State) ->
+    replay_held(lists:reverse(Held), State#state{
+        held_streams = #{}, held_data = [], held_bytes = 0
+    }).
+
+replay_held([], State) ->
+    {ok, State};
+replay_held([{StreamId, Data, Fin} | Rest], State) ->
+    case handle_stream_data(StreamId, Data, Fin, State) of
+        {ok, State1} -> replay_held(Rest, State1);
+        {error, Reason, _State1} -> {error, Reason}
+    end.
+
+%% A held stream the peer resets is dropped before anyone saw it.
+drop_held_stream(StreamId, #state{held_streams = Held} = State) when is_map_key(StreamId, Held) ->
+    Kept = [E || {Id, _, _} = E <- State#state.held_data, Id =/= StreamId],
+    State#state{
+        held_streams = maps:remove(StreamId, Held),
+        held_data = Kept,
+        held_bytes = lists:sum([byte_size(D) || {_, D, _} <- Kept])
+    };
+drop_held_stream(_StreamId, State) ->
+    State.
 
 %% HEADERS carrying the FIN end the body as well (a GET, HEAD, 204 or
 %% 304), so the reader gets the same empty fin-marked delivery a bare FIN
@@ -4903,8 +5046,19 @@ state_record_size() ->
 
 %% Every way into `closing' records why, because the enter clause is the
 %% only place the owner is told and it has nothing else to go on.
+%% close/2: the peer sees ErrorCode, the owner a normal close.
+close_with_code(ErrorCode, #state{quic_conn = QuicConn} = State) ->
+    quic:safe_close(QuicConn, ErrorCode, <<>>),
+    close_with(normal, State).
+
 close_with(Reason, State) ->
-    {next_state, closing, State#state{close_reason = Reason}}.
+    {next_state, closing, State#state{
+        close_reason = Reason,
+        deferred_requests = [],
+        held_streams = #{},
+        held_data = [],
+        held_bytes = 0
+    }}.
 
 tell_peer_goaway(#state{owner = Owner, peer_goaway_id = Id}) ->
     Owner ! {quic_h3, self(), {goaway, Id}}.
@@ -4952,7 +5106,8 @@ report_local_reset(StreamId, ErrorCode, State) ->
 
 %% RESET_STREAM or RESET_STREAM_AT from the peer: clean up, then tell
 %% whoever waits on a request stream. Claimed streams were told already.
-handle_peer_reset(StreamId, ErrorCode, State) ->
+handle_peer_reset(StreamId, ErrorCode, State0) ->
+    State = drop_held_stream(StreamId, State0),
     case handle_stream_closed(StreamId, ErrorCode, State) of
         {ok, State1} ->
             case is_request_stream(StreamId, State) of
