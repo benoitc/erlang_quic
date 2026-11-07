@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A write to a stream whose sending side we had reset, by
+  `quic:reset_stream/3`, `quic:reset_stream_at/4`, a stream deadline or
+  the automatic answer to the peer's STOP_SENDING, was still sent, at or
+  past the final size the reset had announced. Peers that still held the
+  stream closed the connection with FINAL_SIZE_ERROR. Such a write now
+  returns `{error, stream_closed}`, as one after the FIN does.
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed
