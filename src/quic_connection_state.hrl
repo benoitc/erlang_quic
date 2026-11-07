@@ -42,6 +42,9 @@
 %% updated. Kept apart from #state{} so a state update copies one
 %% pointer for all of it.
 -record(conn_cfg, {
+    %% Congestion control options from connect/accept time, used again
+    %% whenever the controller starts over
+    cc_opts = #{} :: quic_cc:cc_opts(),
     %% Connection identity
     scid :: binary(),
     original_dcid :: binary(),

@@ -633,6 +633,7 @@ complete_migration(Owner, OldPath, NewPath) ->
         owner = Owner,
         current_path = OldPath,
         %% Minimal required fields for complete_migration
+        cc_state = quic_cc:new(#{}),
         pmtu_state = quic_pmtu:new(),
         pmtu_probe_timer = undefined,
         pmtu_raise_timer = undefined,

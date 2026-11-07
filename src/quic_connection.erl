@@ -742,6 +742,7 @@ init({server, Opts}) ->
         loss_state = LossState,
         pmtu_state = init_pmtu_state(Opts),
         cfg = #conn_cfg{
+            cc_opts = CCOpts,
             scid = SCID,
             %% Defaults to the Initial's DCID; the listener overrides it with
             %% the pre-Retry DCID (from the token) for a retried connection.
@@ -1195,6 +1196,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         loss_state = LossState,
         pmtu_state = init_pmtu_state(Opts),
         cfg = #conn_cfg{
+            cc_opts = CCOpts,
             scid = SCID,
             original_dcid = DCID,
             role = client,
@@ -11833,9 +11835,8 @@ do_get_stream_priority(StreamId, #state{streams = Streams}) ->
 do_set_congestion_control(Algorithm, #state{cc_state = OldCC} = State) when
     Algorithm =:= newreno; Algorithm =:= bbr; Algorithm =:= cubic
 ->
-    NewCC = quic_cc:new(Algorithm, #{
-        max_datagram_size => quic_cc:max_datagram_size(OldCC)
-    }),
+    #state{cfg = #conn_cfg{cc_opts = Opts}} = State,
+    NewCC = quic_cc:new(Algorithm, Opts#{max_datagram_size => quic_cc:max_datagram_size(OldCC)}),
     {ok, State#state{cc_state = NewCC}};
 do_set_congestion_control(_Algorithm, _State) ->
     {error, invalid_algorithm}.
@@ -14796,7 +14797,9 @@ reset_path_estimates(
     %% no PTO since bytes_in_flight reads 0) and their data is never
     %% retransmitted - the peer then stalls on a permanent stream hole.
     NewLossState = quic_loss:reset_for_new_path(State#state.loss_state),
-    NewCCState0 = quic_cc:new(#{}),
+    %% Same algorithm and configured options, starting over.
+    #state{cc_state = OldCC, cfg = #conn_cfg{cc_opts = CCOpts}} = State,
+    NewCCState0 = quic_cc:new(quic_cc:algorithm(OldCC), CCOpts),
     NewCCState =
         case quic_loss:bytes_in_flight(NewLossState) of
             0 -> NewCCState0;
