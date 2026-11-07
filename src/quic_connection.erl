@@ -14460,8 +14460,16 @@ handle_path_response(ResponseData, State) ->
                     State1 = State#state{
                         mig = (State#state.mig)#mig{alt_paths = [ValidatedPath | OtherPaths]}
                     },
-                    %% Check if this is a preferred address validation - auto-migrate
-                    maybe_migrate_to_preferred_address(ValidatedPath, State1);
+                    case
+                        ValidatedPath#path_state.dcid =:= State#state.dcid andalso
+                            (State#state.cfg)#conn_cfg.role =:= client
+                    of
+                        true ->
+                            %% The path quic:migrate/1 moved to.
+                            maybe_send_pmtu_probe(reset_path_estimates(State1));
+                        false ->
+                            maybe_migrate_to_preferred_address(ValidatedPath, State1)
+                    end;
                 not_found ->
                     %% Check current path (if we sent challenge on current path)
                     case State#state.current_path of
@@ -14580,12 +14588,9 @@ handle_peer_path_validated(PendingPath, #state{mig = #mig{path_validation_timer 
 %% RFC 9000 Section 9.6: Client SHOULD migrate to validated preferred address.
 -spec maybe_migrate_to_preferred_address(#path_state{}, #state{}) -> #state{}.
 maybe_migrate_to_preferred_address(
-    ValidatedPath, #state{mig = #mig{preferred_address = undefined}} = State
+    _ValidatedPath, #state{mig = #mig{preferred_address = undefined}} = State
 ) ->
-    %% No preferred address, just return
-    State#state{
-        mig = (State#state.mig)#mig{alt_paths = [ValidatedPath | (State#state.mig)#mig.alt_paths]}
-    };
+    State;
 maybe_migrate_to_preferred_address(
     #path_state{remote_addr = RemoteAddr} = ValidatedPath,
     #state{mig = #mig{preferred_address = PA}} = State
@@ -14678,13 +14683,7 @@ complete_migration(
 %% RFC 9002 Section 9.4: Reset congestion state on path change
 complete_migration(
     #path_state{status = validated, is_nat_rebinding = false} = NewPath,
-    #state{
-        owner = Owner,
-        current_path = OldPath,
-        pmtu_state = PMTUState,
-        pmtu_probe_timer = ProbeTimer,
-        pmtu_raise_timer = RaiseTimer
-    } = State
+    #state{owner = Owner, current_path = OldPath} = State
 ) ->
     %% Notify owner of path change (for logging/monitoring)
     OldAddr =
@@ -14693,7 +14692,23 @@ complete_migration(
             undefined -> undefined
         end,
     Owner ! {quic, self(), {path_changed, OldAddr, NewPath#path_state.remote_addr}},
+    State1 = reset_path_estimates(State),
+    State1#state{
+        remote_addr = NewPath#path_state.remote_addr,
+        current_path = NewPath,
+        mig = (State1#state.mig)#mig{
+            alt_paths = lists:delete(NewPath, (State1#state.mig)#mig.alt_paths)
+        }
+    };
+complete_migration(_, State) ->
+    %% Can only migrate to validated paths
+    State.
 
+%% A new path starts with fresh PMTU, congestion and RTT state.
+reset_path_estimates(
+    #state{pmtu_state = PMTUState, pmtu_probe_timer = ProbeTimer, pmtu_raise_timer = RaiseTimer} =
+        State
+) ->
     %% RFC 8899: Reset PMTU on path change
     %% Cancel PMTU timers before resetting state
     cancel_timer(ProbeTimer),
@@ -14715,22 +14730,14 @@ complete_migration(
         end,
 
     State#state{
-        remote_addr = NewPath#path_state.remote_addr,
-        current_path = NewPath,
         pmtu_state = NewPMTUState,
         pmtu_probe_timer = undefined,
         pmtu_raise_timer = undefined,
         %% Reset CC and loss detection for new path
         cc_state = NewCCState,
         loss_state = NewLossState,
-        pto_dirty = true,
-        mig = (State#state.mig)#mig{
-            alt_paths = lists:delete(NewPath, (State#state.mig)#mig.alt_paths)
-        }
-    };
-complete_migration(_, State) ->
-    %% Can only migrate to validated paths
-    State.
+        pto_dirty = true
+    }.
 
 %% @doc Handle NEW_CONNECTION_ID frame from peer.
 %% Adds the new CID to our pool of peer CIDs.
