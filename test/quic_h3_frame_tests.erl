@@ -85,7 +85,7 @@ settings_payload_test() ->
     {ok, DecodedSettings} = quic_h3_frame:decode_settings_payload(Payload),
     ?assertEqual(1024, maps:get(qpack_max_table_capacity, DecodedSettings)).
 
-%% WebTransport setting IDs (draft-ietf-webtrans-http3-15 §9.2) round-trip
+%% WebTransport setting IDs (draft-ietf-webtrans-http3-17 §9.2) round-trip
 %% through the SETTINGS frame as dedicated atoms.
 settings_wt_atoms_roundtrip_test() ->
     Settings = #{
@@ -100,6 +100,22 @@ settings_wt_atoms_roundtrip_test() ->
     ?assertEqual(1048576, maps:get(wt_initial_max_data, Decoded)),
     ?assertEqual(100, maps:get(wt_initial_max_streams_uni, Decoded)),
     ?assertEqual(50, maps:get(wt_initial_max_streams_bidi, Decoded)).
+
+%% Both WT_ENABLED codepoints can be advertised together (draft-17 §7.1).
+settings_wt_enabled_codepoints_test() ->
+    Settings = #{wt_enabled => 1, wt_enabled_draft15 => 1},
+    {ok, {settings, Decoded}, <<>>} =
+        quic_h3_frame:decode(quic_h3_frame:encode_settings(Settings)),
+    ?assertEqual(Settings, Decoded),
+    ?assertEqual(16#20b8933b, quic_h3_frame:setting_to_id(wt_enabled)),
+    ?assertEqual(16#2c7cf000, quic_h3_frame:setting_to_id(wt_enabled_draft15)),
+    ?assertEqual(16#4abc, quic_h3_frame:setting_to_id(16#4abc)).
+
+%% A peer sending the draft-17 id is seen as `wt_enabled'.
+settings_wt_enabled_from_id_test() ->
+    Payload = quic_h3_frame:encode_settings_payload(#{16#20b8933b => 1}),
+    {ok, Decoded} = quic_h3_frame:decode_settings_payload(Payload),
+    ?assertEqual(#{wt_enabled => 1}, Decoded).
 
 %% Unknown (non-forbidden) setting IDs are preserved in the decoded map
 %% under their integer key so upper layers can observe future IETF

@@ -4,7 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- HTTP/3 server option `defer_requests_until_settings`. When set, a
+  request or WebTransport stream that arrives before the client's
+  SETTINGS waits for them, so the application always sees the peer's
+  settings. WebTransport draft-17 requires this, as the client's settings
+  select the draft version.
+- `quic_h3:close/2` closes the connection with an HTTP/3 error code, such
+  as H3_SETTINGS_ERROR or H3_ID_ERROR, which the peer receives.
+
+### Changed
+- `wt_enabled` in HTTP/3 settings now means the WebTransport draft-17
+  codepoint. The draft-15 codepoint is still available as
+  `wt_enabled_draft15`, so a server can advertise both.
+  `quic_h3_frame:setting_to_id/1` is exported to turn a setting name into
+  its id.
+
 ### Fixed
+- A WebTransport stream signal (0x41) found anywhere other than the start
+  of a bidirectional stream opened by the peer was skipped. It now closes
+  the connection with H3_FRAME_UNEXPECTED, as WebTransport draft-17
+  requires.
+- An HTTP/3 connection closed by its peer with an error code told its
+  owner `{closed, normal}`, so the code was lost. The owner now receives
+  `{closed, {peer_closed, application, ErrorCode, Phrase}}`; a peer that
+  closes with no error still reads as `normal`.
 - A server no longer crashes when a client that has just moved to a new
   address sends a small path check there. The answer did not fit in what
   the server may send to an address it has not yet confirmed, and the

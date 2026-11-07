@@ -89,6 +89,28 @@ close_reports_normal_test_() ->
         expect_down(Mon, normal)
     end}.
 
+%% close/2 sends its code to the peer and still exits `normal'.
+close_with_error_code_test_() ->
+    {setup, fun setup/0, fun teardown/1, fun() ->
+        Self = self(),
+        meck:expect(quic, safe_close, fun(_, Code, Phrase) ->
+            Self ! {quic_close, Code, Phrase},
+            ok
+        end),
+        {FakeQuicConn, H3Conn, Mon} = start_client(),
+        ok = quic_h3:close(H3Conn, 16#109),
+        receive
+            {quic_close, Code, _} -> ?assertEqual(16#109, Code)
+        after 1000 -> error(no_quic_close)
+        end,
+        ?assertEqual(FakeQuicConn, meck:capture(first, quic, safe_close, '_', 1)),
+        expect_closed(H3Conn, normal),
+        expect_down(Mon, normal)
+    end}.
+
+close_rejects_bad_error_code_test() ->
+    ?assertError(function_clause, quic_h3:close(self(), -1)).
+
 %% `wait_connected/2' reads the reason off the close event. While two of
 %% the three close paths sent a bare atom it matched none of them, so a
 %% connection that died waiting reported a timeout it never waited out.
