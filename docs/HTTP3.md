@@ -725,7 +725,7 @@ The connection owner process receives messages in the form `{quic_h3, Conn, Even
 | `connected` | H3 connection established, SETTINGS exchanged |
 | `goaway_sent` | GOAWAY sent, no new streams accepted |
 | `{goaway, StreamId}` | GOAWAY received from peer |
-| `{closed, Reason}` | Connection closed, carrying why: `normal` for a local close or a drained GOAWAY, `owner_down` when the owning process went away, `{h3_error, ErrorCode, Phrase}` for a protocol error, otherwise the reason the QUIC connection reported |
+| `{closed, Reason}` | Connection closed, carrying why: `normal` for a local close or a drained GOAWAY, `owner_down` when the owning process went away, `{h3_error, ErrorCode, Phrase}` for a protocol error, `{peer_closed, application, ErrorCode, Phrase}` when the peer closed with an error code (a peer closing with H3_NO_ERROR reads as `normal`), otherwise the reason the QUIC connection reported |
 | `{error, ErrorCode, Phrase}` | Protocol error, sent just before the `closed` that follows it |
 | `{session_ticket, Ticket}` | Resumption ticket from the server |
 | `{early_data_rejected, StreamIds}` | Server refused 0-RTT; these streams must be retried |

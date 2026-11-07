@@ -24,6 +24,10 @@ All notable changes to this project will be documented in this file.
   of a bidirectional stream opened by the peer was skipped. It now closes
   the connection with H3_FRAME_UNEXPECTED, as WebTransport draft-17
   requires.
+- An HTTP/3 connection closed by its peer with an error code told its
+  owner `{closed, normal}`, so the code was lost. The owner now receives
+  `{closed, {peer_closed, application, ErrorCode, Phrase}}`; a peer that
+  closes with no error still reads as `normal`.
 
 ## [2.2.1] - 2026-11-07
 

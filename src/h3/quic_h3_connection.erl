@@ -1272,6 +1272,10 @@ live_event(cast, {close, ErrorCode}, State) ->
     close_with_code(ErrorCode, State);
 live_event(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
     {keep_state, tell_send_ready(State)};
+live_event(info, {quic, QC, {closed, Reason}}, #state{quic_conn = QC} = State) ->
+    %% The owner hears a peer's error code, not the `normal' the QUIC
+    %% process exits with after draining. A clean close stays `normal'.
+    handle_quic_failed(live_close_reason(Reason), State);
 live_event(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 live_event(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
@@ -1330,12 +1334,21 @@ closing(_EventType, _Event, _State) ->
 %% Internal: QUIC connection DOWN
 %%====================================================================
 
-%% The QUIC connection reported a failure (bad certificate, TLS alert, peer
-%% close) before HTTP/3 came up. Pass the reason to the owner so a caller in
-%% `quic_h3:wait_connected/2' fails with it instead of timing out.
+%% The QUIC connection closed (bad certificate, TLS alert, peer close, idle
+%% timeout). Pass the reason to the owner: before HTTP/3 is up a caller in
+%% `quic_h3:wait_connected/2' fails with it instead of timing out, and
+%% after it the owner learns the peer's error code.
 handle_quic_failed(Reason, #state{owner = Owner} = State) ->
     Owner ! {quic_h3, self(), {closed, Reason}},
     {stop, normal, State}.
+
+%% A peer closing with no error is a normal close.
+live_close_reason({peer_closed, application, Code, _}) when
+    Code =:= ?H3_NO_ERROR; Code =:= 0
+->
+    normal;
+live_close_reason(Reason) ->
+    Reason.
 
 %% A cleanly closed QUIC connection must not crash the H3 process:
 %% only an abnormal QUIC exit is propagated as {quic_closed, Reason}.
