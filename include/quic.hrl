@@ -483,7 +483,10 @@
 
     %% Packets encrypted under the current key phase; forces a key update
     %% at the AEAD confidentiality limit (RFC 9001 §6.6).
-    send_count = 0 :: non_neg_integer()
+    send_count = 0 :: non_neg_integer(),
+
+    %% Lowest packet number opened with the current keys
+    recv_first_pn :: non_neg_integer() | undefined
 }).
 
 %% Path State for Connection Migration (RFC 9000 Section 9)

@@ -5798,22 +5798,54 @@ decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
                 {ok, _PN, _Plaintext} when ?SHORT_RESERVED_BITS(UnprotectedFirstByte) ->
                     {ok, app, [], <<>>, reserved_bits_close(app, State1), processed};
                 {ok, PN, Plaintext} ->
-                    %% Single monotonic_time sample shared by
-                    %% recv_time and last_activity to save one BIF
-                    %% call per received packet on the hot path.
-                    Now = erlang:monotonic_time(millisecond),
-                    State3 = record_app_recv(UnprotectedFirstByte, PN, State1, Now),
-                    %% Use streaming decode for efficiency
-                    case decode_and_process_streaming(app, Plaintext, State3) of
-                        {ok, NewState, Frames} ->
-                            {ok, app, Frames, <<>>, NewState, processed};
-                        {error, Reason} ->
-                            {error, Reason}
+                    case opened_with(DecryptKeys, PN, State1) of
+                        out_of_order ->
+                            {ok, app, [], <<>>, key_update_close(State1), processed};
+                        {ok, State2} ->
+                            %% Single monotonic_time sample shared by
+                            %% recv_time and last_activity to save one BIF
+                            %% call per received packet on the hot path.
+                            Now = erlang:monotonic_time(millisecond),
+                            State3 = record_app_recv(UnprotectedFirstByte, PN, State2, Now),
+                            %% Use streaming decode for efficiency
+                            case decode_and_process_streaming(app, Plaintext, State3) of
+                                {ok, NewState, Frames} ->
+                                    {ok, app, Frames, <<>>, NewState, processed};
+                                {error, Reason} ->
+                                    {error, Reason}
+                            end
                     end;
                 {error, decryption_failed} ->
                     {error, decryption_failed}
             end
     end.
+
+%% RFC 9001 Section 6.4: a packet numbered above one opened with newer
+%% keys must not open with older ones.
+opened_with(
+    Keys,
+    PN,
+    #state{key_state = #key_update_state{current_keys = Keys, recv_first_pn = First} = KS} = State
+) when First =:= undefined; PN < First ->
+    {ok, State#state{key_state = KS#key_update_state{recv_first_pn = PN}}};
+opened_with(Keys, PN, #state{
+    key_state = #key_update_state{current_keys = Current, recv_first_pn = First}
+}) when
+    is_integer(First), PN > First, Keys =/= Current
+->
+    out_of_order;
+opened_with(_Keys, _PN, State) ->
+    {ok, State}.
+
+key_update_close(State) ->
+    close_with_error(
+        level_for_close(app),
+        transport,
+        ?QUIC_KEY_UPDATE_ERROR,
+        0,
+        <<"packet opened with old keys after newer ones">>,
+        State
+    ).
 
 %% Decrypt a long header packet (Initial/Handshake)
 %% RemainingData is the data after this packet (for coalesced packets)
@@ -13460,7 +13492,8 @@ initiate_key_update(#state{key_state = KeyState} = State) ->
         server_app_secret = NewServerSecret,
         update_state = initiated,
         % New phase: reset the AEAD send counter.
-        send_count = 0
+        send_count = 0,
+        recv_first_pn = undefined
     },
 
     State#state{
@@ -13523,7 +13556,8 @@ handle_peer_key_update(#state{key_state = KeyState} = State) ->
                 client_app_secret = NewClientSecret,
                 server_app_secret = NewServerSecret,
                 update_state = responding,
-                send_count = 0
+                send_count = 0,
+                recv_first_pn = undefined
             },
             State#state{
                 app_keys = {NewClientKeys, NewServerKeys},
