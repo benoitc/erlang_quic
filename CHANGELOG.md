@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A client that migrated several times in a row could be left unable to
+  migrate again, with `quic:migrate/1` returning
+  `{error, no_available_connection_id}` for good. When the client moved,
+  the server sent the replacement connection id answering the client's
+  retirement to the address the client had just left; if that network
+  was gone the id never arrived. Replies to the packet that moves a
+  client now go to its new address.
+
 ## [2.3.0] - 2026-11-07
 
 ### Security

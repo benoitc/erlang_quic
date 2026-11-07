@@ -606,6 +606,14 @@
     %% packets. The max_ack_delay timer still bounds latency; the
     %% reordering immediate-ACK path bypasses this.
     recv_pass = false :: boolean(),
+    %% Server receive pass from an address or socket other than the one
+    %% we send to: frames it sends wait in pass_frames (newest first)
+    %% until the pass has decided whether the peer moved (RFC 9000 §9.3),
+    %% so a reply such as the NEW_CONNECTION_ID answering a
+    %% RETIRE_CONNECTION_ID follows the peer instead of going down the
+    %% path it just left.
+    hold_pass_frames = false :: boolean(),
+    pass_frames = [] :: [term()],
     %% Pending run for the above: stream id, reversed chunk list, fin.
     %% A delivery for a DIFFERENT stream flushes the pending one
     %% first, so the owner observes stream_data messages in exact
