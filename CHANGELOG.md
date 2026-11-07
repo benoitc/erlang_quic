@@ -16,6 +16,9 @@ All notable changes to this project will be documented in this file.
   message, closed the connection with unexpected_message. Data after the
   message that moves the handshake on, or data buffered out of order
   beyond it, is now a PROTOCOL_VIOLATION (RFC 9001 Section 4.1.3).
+- A Finished message that failed verification was ignored, leaving the
+  handshake to time out. It now closes the connection with decrypt_error
+  (RFC 8446 Section 4.4.4).
 
 ## [2.6.1] - 2026-11-08
 

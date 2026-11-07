@@ -7525,8 +7525,7 @@ process_tls_message(
                     %% segmented so no datagram exceeds max_udp_payload_size.
                     send_handshake_crypto(HandshakePayload, State1);
                 false ->
-                    %% Verification failed
-                    State
+                    send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
             end;
         {error, _} ->
             State
@@ -7585,7 +7584,7 @@ process_tls_message(
                     %% Send NewSessionTicket to enable session resumption
                     send_new_session_ticket(State3);
                 false ->
-                    State
+                    send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
             end;
         {error, _} ->
             State
