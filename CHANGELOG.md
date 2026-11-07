@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- A large download could be closed with a flow-control error, seen as a
+  transfer that stopped part way. The sender counted its connection credit
+  in bytes sent while the receiver counts the highest offset on each
+  stream, as the RFC says, so a write that went out ahead of data still
+  queued made the two disagree. The sender now counts the same way.
 - A connection that moves to a new path keeps the congestion control it was
   configured with. Each path change started over with NewReno and the default
   windows, whatever `cc_algorithm`, `initial_window` and `minimum_window`
