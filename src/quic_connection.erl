@@ -11665,6 +11665,8 @@ reset_own_stream(
 %% both directions are terminated.
 do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
+        {ok, #stream_state{send_done = true}} ->
+            {ok, State};
         {ok, StreamState} ->
             case StreamState#stream_state.deadline_timer of
                 undefined -> ok;
