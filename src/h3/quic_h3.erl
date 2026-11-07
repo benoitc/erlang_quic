@@ -112,6 +112,7 @@
     cancel/3,
     goaway/1,
     close/1,
+    close/2,
     %% Per-stream handler registration
     set_stream_handler/3,
     set_stream_handler/4,
@@ -216,7 +217,8 @@
     settings => map(),
     stream_type_handler => stream_type_handler(),
     h3_datagram_enabled => boolean(),
-    max_buffered_body => non_neg_integer()
+    max_buffered_body => non_neg_integer(),
+    defer_requests_until_settings => boolean()
 }.
 
 -type server_opts() :: #{
@@ -236,11 +238,16 @@
     %% Default 16 MiB. A stream whose body would cross it is reset with
     %% H3_EXCESSIVE_LOAD.
     max_buffered_body => non_neg_integer(),
+    %% Hold each request, and each stream a stream_type_handler would see,
+    %% until the client's SETTINGS have arrived, so the handler can read
+    %% them (WebTransport draft-17 §7.1). Default false.
+    defer_requests_until_settings => boolean(),
     %% Per-connection configuration override; the returned map's
     %% `owner', `handler', `stream_type_handler', `h3_datagram_enabled',
-    %% `max_buffered_body' and `settings' keys replace the listener-wide
-    %% defaults for that single connection. Useful for spawning a dedicated router pid
-    %% per H3 connection rather than sharing one global owner.
+    %% `max_buffered_body', `defer_requests_until_settings' and `settings'
+    %% keys replace the listener-wide defaults for that single connection.
+    %% Useful for spawning a dedicated router pid per H3 connection rather
+    %% than sharing one global owner.
     connection_handler => connection_handler_fun()
 }.
 
@@ -465,6 +472,15 @@ goaway(Conn) ->
 close(Conn) ->
     quic_h3_connection:close(Conn).
 
+%% @doc Close the connection with an HTTP/3 error code.
+%%
+%% Same as `close/1', but the peer receives `ErrorCode' in CONNECTION_CLOSE,
+%% for example `H3_SETTINGS_ERROR' (0x109) or `H3_ID_ERROR' (0x108).
+%% @end
+-spec close(conn(), error_code()) -> ok.
+close(Conn, ErrorCode) when is_integer(ErrorCode), ErrorCode >= 0, ErrorCode < (1 bsl 62) ->
+    quic_h3_connection:close(Conn, ErrorCode).
+
 %% @doc Register a handler to receive stream body data.
 %%
 %% By default, body data messages are sent to the connection owner.
@@ -586,6 +602,7 @@ start_server(Name, Port, Opts) ->
     MaxBufferedBody = valid_max_buffered_body(
         maps:get(max_buffered_body, Opts, ?H3_MAX_BUFFERED_BODY)
     ),
+    DeferRequests = valid_defer_requests(maps:get(defer_requests_until_settings, Opts, false)),
     PerConn = maps:get(connection_handler, Opts, undefined),
     QuicOpts0 = build_server_quic_opts(Opts),
     ListenerDefaults = #{
@@ -593,7 +610,8 @@ start_server(Name, Port, Opts) ->
         settings => H3Settings,
         stream_type_handler => StreamTypeHandler,
         h3_datagram_enabled => H3DatagramEnabled,
-        max_buffered_body => MaxBufferedBody
+        max_buffered_body => MaxBufferedBody,
+        defer_requests_until_settings => DeferRequests
     },
     QuicOpts = QuicOpts0#{
         connection_handler => fun(ConnPid, _ConnRef) ->
@@ -896,6 +914,9 @@ build_h3_opts(Opts) ->
     ),
     Base#{
         h3_datagram_enabled => maps:get(h3_datagram_enabled, Opts, false),
+        defer_requests_until_settings => valid_defer_requests(
+            maps:get(defer_requests_until_settings, Opts, false)
+        ),
         max_buffered_body => valid_max_buffered_body(
             maps:get(max_buffered_body, Opts, ?H3_MAX_BUFFERED_BODY)
         )
@@ -907,6 +928,11 @@ valid_max_buffered_body(Bytes) when is_integer(Bytes), Bytes >= 0 ->
     Bytes;
 valid_max_buffered_body(Other) ->
     error({bad_opts, {max_buffered_body, Other}}).
+
+valid_defer_requests(Flag) when is_boolean(Flag) ->
+    Flag;
+valid_defer_requests(Other) ->
+    error({bad_opts, {defer_requests_until_settings, Other}}).
 
 default_handler(Conn, StreamId, _Method, _Path, _Headers) ->
     send_response(Conn, StreamId, 404, [{<<"content-type">>, <<"text/plain">>}]),

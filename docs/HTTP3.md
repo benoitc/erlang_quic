@@ -158,6 +158,22 @@ Close the connection.
 
 Immediately closes the HTTP/3 connection and underlying QUIC connection.
 
+#### close/2
+
+Close the connection with an HTTP/3 error code.
+
+```erlang
+-spec close(conn(), error_code()) -> ok.
+```
+
+Same as `close/1`, but the peer receives `ErrorCode` in CONNECTION_CLOSE.
+Use it for connection errors the application detects, such as
+`H3_SETTINGS_ERROR` (0x109) or `H3_ID_ERROR` (0x108) in WebTransport.
+
+```erlang
+ok = quic_h3:close(Conn, 16#109).
+```
+
 #### set_stream_handler/3, set_stream_handler/4
 
 Register a handler to receive stream body data.
@@ -310,6 +326,7 @@ Start an HTTP/3 server.
 | `handler` | fun/5 or module | No | Request handler |
 | `settings` | map | No | HTTP/3 settings |
 | `quic_opts` | map | No | Additional QUIC options |
+| `defer_requests_until_settings` | boolean | No | Hold each request, and each stream a `stream_type_handler` would see, until the client's SETTINGS arrive, so `get_peer_settings/1` is a map in the handler. What is held counts against `max_buffered_body`. WebTransport draft-17 requires it. Default `false` |
 
 The handler can be:
 - A function: `fun(Conn, StreamId, Method, Path, Headers) -> ok`
@@ -546,7 +563,8 @@ pid per H3 connection via the `connection_handler` option:
 ```
 
 The returned map's `owner`, `handler`, `stream_type_handler`,
-`h3_datagram_enabled`, `max_buffered_body`, and `settings` keys replace
+`h3_datagram_enabled`, `max_buffered_body`,
+`defer_requests_until_settings`, and `settings` keys replace
 the listener defaults for that single connection; absent keys inherit. A
 `max_buffered_body` that is not a byte count fails the listener at start,
 or that one connection when it comes from this hook.
@@ -707,7 +725,7 @@ The connection owner process receives messages in the form `{quic_h3, Conn, Even
 | `connected` | H3 connection established, SETTINGS exchanged |
 | `goaway_sent` | GOAWAY sent, no new streams accepted |
 | `{goaway, StreamId}` | GOAWAY received from peer |
-| `{closed, Reason}` | Connection closed, carrying why: `normal` for a local close or a drained GOAWAY, `owner_down` when the owning process went away, `{h3_error, ErrorCode, Phrase}` for a protocol error, otherwise the reason the QUIC connection reported |
+| `{closed, Reason}` | Connection closed, carrying why: `normal` for a local close or a drained GOAWAY, `owner_down` when the owning process went away, `{h3_error, ErrorCode, Phrase}` for a protocol error, `{peer_closed, application, ErrorCode, Phrase}` when the peer closed with an error code (a peer closing with H3_NO_ERROR reads as `normal`), otherwise the reason the QUIC connection reported |
 | `{error, ErrorCode, Phrase}` | Protocol error, sent just before the `closed` that follows it |
 | `{session_ticket, Ticket}` | Resumption ticket from the server |
 | `{early_data_rejected, StreamIds}` | Server refused 0-RTT; these streams must be retried |
@@ -843,6 +861,7 @@ Frame encoding and decoding (RFC 9114 Section 7.2).
 | `decode_all/1` | Decode all frames from buffer |
 | `decode_stream_type/1` | Decode unidirectional stream type |
 | `default_settings/0` | Get default HTTP/3 settings |
+| `setting_to_id/1` | Numeric id of a setting atom (`wt_enabled` is the draft-17 codepoint, `wt_enabled_draft15` the draft-15 one) |
 
 **Frame Types:**
 

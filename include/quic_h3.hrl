@@ -20,6 +20,10 @@
 -define(H3_FRAME_GOAWAY, 16#07).
 -define(H3_FRAME_MAX_PUSH_ID, 16#0D).
 
+%% WT_STREAM signal (draft-ietf-webtrans-http3-17 §4.3): only valid as the
+%% first bytes of a bidirectional stream, sent by its initiator.
+-define(H3_FRAME_WT_STREAM, 16#41).
+
 %% Reserved frame types (RFC 9114 Section 7.2.8)
 %% 0x1f * N + 0x21 for any non-negative integer N
 
@@ -50,8 +54,10 @@
 %% RFC 9297 §2.1
 -define(H3_SETTINGS_H3_DATAGRAM, 16#33).
 
-%% WebTransport over HTTP/3 (draft-ietf-webtrans-http3-15 §9.2)
--define(H3_SETTINGS_WT_ENABLED, 16#2c7cf000).
+%% WebTransport over HTTP/3 (draft-ietf-webtrans-http3-17 §9.2)
+-define(H3_SETTINGS_WT_ENABLED, 16#20b8933b).
+%% draft-15 codepoint, still advertised alongside the current one (§7.1)
+-define(H3_SETTINGS_WT_ENABLED_DRAFT15, 16#2c7cf000).
 -define(H3_SETTINGS_WT_INITIAL_MAX_DATA, 16#2b61).
 -define(H3_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI, 16#2b64).
 -define(H3_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, 16#2b65).
