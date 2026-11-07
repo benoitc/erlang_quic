@@ -378,6 +378,8 @@
     %% Old path validation for anti-spoofing defense (RFC 9000 Section 9.3.2)
     %% When detecting apparent migration, probe both old and new paths
     old_path_validation :: #path_state{} | undefined,
+    %% The last validated peer address, while sending to an unvalidated one
+    validated_addr :: {inet:ip_address(), inet:port_number()} | undefined,
     %% Timer reference for path validation timeout
     path_validation_timer :: reference() | undefined,
     %% Token for correlating path validation timeout messages

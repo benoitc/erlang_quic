@@ -14012,12 +14012,14 @@ start_peer_path_validation(NewAddr, Via, IsNATRebinding, DataSize, NewDCID, NewS
     %% packet re-triggers).
     case Via =:= current_via(State) of
         true ->
+            Mig = State#state.mig,
             State1 = State#state{
                 remote_addr = NewAddr,
-                mig = (State#state.mig)#mig{
+                mig = Mig#mig{
                     pending_peer_validation = NewPathState,
                     old_path_validation = OldPathState,
-                    migration_state = validating_peer
+                    migration_state = validating_peer,
+                    validated_addr = validated_addr(Mig, OldAddr)
                 }
             },
             %% Send PATH_CHALLENGE to both addresses, each under its own path's CID
@@ -14037,6 +14039,9 @@ start_peer_path_validation(NewAddr, Via, IsNATRebinding, DataSize, NewDCID, NewS
             State2 = send_path_challenge_to_addr(NewAddr, NewChallengeData, NewDCID, State1),
             start_path_validation_timer(State2)
     end.
+
+validated_addr(#mig{validated_addr = undefined}, Addr) -> Addr;
+validated_addr(#mig{validated_addr = Addr}, _) -> Addr.
 
 %% The CID a path probes under. A NAT rebinding is the Section 9.5
 %% exception and stays on the current one; anything else binds its own.
@@ -14149,13 +14154,22 @@ handle_path_validation_timeout(#state{mig = #mig{pending_peer_validation = PathS
             State3 = start_path_validation_timer(State2),
             {keep_state, State3};
         _ ->
-            %% Max retries reached, give up on this path. A CID that has
-            %% appeared on a path is spent: it is retired rather than
-            %% returned to the pool (RFC 9000 Section 9.5).
+            %% Max retries reached, give up on this path and go back to
+            %% the last validated address (RFC 9000 Section 9.3.2). A CID
+            %% that has appeared on a path is spent: it is retired rather
+            %% than returned to the pool (Section 9.5).
+            Mig = State#state.mig,
+            RemoteAddr =
+                case Mig#mig.validated_addr of
+                    undefined -> State#state.remote_addr;
+                    Validated -> Validated
+                end,
             State1 = State#state{
-                mig = (State#state.mig)#mig{
+                remote_addr = RemoteAddr,
+                mig = Mig#mig{
                     pending_peer_validation = undefined,
                     old_path_validation = undefined,
+                    validated_addr = undefined,
                     migration_state = idle,
                     path_validation_timer = undefined,
                     path_validation_token = undefined
@@ -14282,6 +14296,7 @@ handle_peer_path_validated(PendingPath, #state{mig = #mig{path_validation_timer 
         mig = (State2#state.mig)#mig{
             pending_peer_validation = undefined,
             old_path_validation = undefined,
+            validated_addr = undefined,
             migration_state = idle,
             path_validation_timer = undefined,
             path_validation_token = undefined
