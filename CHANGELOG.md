@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
   packet was processed twice (a DATAGRAM delivered again, a PATH_CHALLENGE
   answered again). Packet numbers below the lowest range kept are now
   discarded as duplicates.
+- An ACK frame whose ranges reached below packet number 0 was processed
+  instead of closing the connection with FRAME_ENCODING_ERROR.
 
 ## [2.6.1] - 2026-11-08
 
