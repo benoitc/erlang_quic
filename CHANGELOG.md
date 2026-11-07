@@ -9,6 +9,13 @@ All notable changes to this project will be documented in this file.
   took the rest of its send batch with it: the packets queued behind it
   were already counted as sent and came back as losses. Only the
   oversized datagram is dropped now.
+- QUIC datagrams could leave the host IP-fragmented, against RFC 9000
+  §14: Linux sets DF only up to its cached path MTU and fragments larger
+  datagrams locally, so a PMTU probe above the link MTU went out in
+  fragments, was acknowledged, and raised the datagram size past what the
+  path carries unfragmented. Every UDP socket now sets
+  IP_PMTUDISC_PROBE (and IPV6_PMTUDISC_PROBE on IPv6 sockets) on Linux, so
+  DF is always set and an oversized probe is lost instead.
 
 ## [2.6.1] - 2026-11-08
 
