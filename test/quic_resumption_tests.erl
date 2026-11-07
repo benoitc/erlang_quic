@@ -476,5 +476,6 @@ ticket(MaxEarlyData) ->
         max_early_data = MaxEarlyData,
         received_at = erlang:system_time(second) - 10,
         cipher = aes_128_gcm,
-        alpn = <<"h3">>
+        alpn = <<"h3">>,
+        transport_params = #{initial_max_data => 65536, initial_max_streams_bidi => 4}
     }.

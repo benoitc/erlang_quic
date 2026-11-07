@@ -352,6 +352,9 @@
     early_keys :: {#crypto_keys{}, binary()} | undefined,
     % Bytes of early data sent
     early_data_sent = 0 :: non_neg_integer(),
+    %% A 0-RTT write exceeded the server's remembered limits; the rest
+    %% waits for 1-RTT so the stream stays in order
+    early_deferred = false :: boolean(),
     % Server accepted early data
     early_data_accepted = false :: boolean(),
     %% Streams that have carried 0-RTT-encrypted data. Used at handshake
@@ -378,6 +381,12 @@
     %% Old path validation for anti-spoofing defense (RFC 9000 Section 9.3.2)
     %% When detecting apparent migration, probe both old and new paths
     old_path_validation :: #path_state{} | undefined,
+    %% The last validated peer address, while sending to an unvalidated one
+    validated_addr :: {inet:ip_address(), inet:port_number()} | undefined,
+    %% and the CID sent to it
+    validated_dcid :: binary() | undefined,
+    %% 1-RTT datagrams held back by the amplification limit, newest first
+    held = [] :: [binary()],
     %% Timer reference for path validation timeout
     path_validation_timer :: reference() | undefined,
     %% Token for correlating path validation timeout messages

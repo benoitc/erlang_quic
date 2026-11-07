@@ -524,7 +524,17 @@
 
     %% Server side: the listener socket bound to the preferred address
     %% this path arrives on, `undefined' for the listening socket
-    via :: term()
+    via :: term(),
+
+    %% Challenges sent earlier on this path, still answerable
+    old_challenges = [] :: [binary()],
+    %% Monotonic time (ms) at which validation of this path is abandoned
+    deadline :: integer() | undefined,
+
+    %% Challenges sent in datagrams under 1200 bytes; an answer to one
+    %% validates the address but not the path MTU (RFC 9000 Section 8.2.1)
+    short_challenges = [] :: [binary()],
+    address_validated = false :: boolean()
 }).
 
 %% Preferred Address for Server Migration (RFC 9000 Section 9.6)
@@ -573,7 +583,11 @@
     cipher :: atom(),
 
     %% ALPN used for the original connection
-    alpn :: binary() | undefined
+    alpn :: binary() | undefined,
+
+    %% The server's transport parameters that 0-RTT data must respect
+    %% (RFC 9000 Section 7.4.1); without them no 0-RTT is attempted
+    transport_params :: map() | undefined
 }).
 
 %% Connection ID Entry for CID Pool (RFC 9000 Section 5.1)
