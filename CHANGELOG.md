@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.3.0] - 2026-11-07
 
 ### Security
 - An HTTP/3 peer could make the other side spend minutes of CPU on one
