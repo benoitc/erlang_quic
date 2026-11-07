@@ -6046,7 +6046,19 @@ process_frame(_Level, ping, State) ->
     %% Should trigger ACK
     State;
 process_frame(Level, {crypto, Offset, Data}, State) ->
-    buffer_crypto_data(Level, Offset, Data, State);
+    case
+        crypto_level_closed(Level, State) andalso
+            Offset + byte_size(Data) > maps:get(Level, (State#state.hs)#hs.crypto_offset, 0)
+    of
+        true ->
+            close_with_transport_error(
+                ?QUIC_PROTOCOL_VIOLATION,
+                <<"CRYPTO data past the end of a previous encryption level">>,
+                State
+            );
+        false ->
+            buffer_crypto_data(Level, Offset, Data, State)
+    end;
 process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
     %% Process ACK - update loss detection and congestion control
     #state{loss_state = LossState, cc_state = CCState} = State,
@@ -6927,6 +6939,15 @@ process_crypto_buffer(Level, State) ->
                 false -> State1
             end
     end.
+
+%% TLS has moved past this level for receiving (RFC 9001 Section 4.1.3).
+crypto_level_closed(initial, #state{hs = #hs{tls_state = T}}) ->
+    T =/= undefined andalso T =/= ?TLS_AWAITING_CLIENT_HELLO andalso
+        T =/= ?TLS_AWAITING_SERVER_HELLO;
+crypto_level_closed(handshake, #state{hs = #hs{tls_state = T}}) ->
+    T =:= ?TLS_HANDSHAKE_COMPLETE;
+crypto_level_closed(_Level, _State) ->
+    false.
 
 %% Key logging is opt-in via SSLKEYLOGFILE and off otherwise; see
 %% quic_keylog for why it exists and what it exposes.

@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- CRYPTO data at an encryption level the handshake had left, extending
+  past what had been received there, was handed to TLS: a fragment was
+  buffered for good, a whole message closed the connection with
+  unexpected_message. It is now a PROTOCOL_VIOLATION (RFC 9001
+  Section 4.1.3); retransmissions of data already received are still
+  ignored.
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed
