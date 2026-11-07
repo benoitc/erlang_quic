@@ -323,7 +323,7 @@ init_genudp_backend(Port, Opts) ->
             case ReusePort of
                 true -> [{reuseport, true}, {reuseport_lb, true}];
                 false -> []
-            end ++ ExtraFlags,
+            end ++ quic_socket:dont_fragment_opts(Family) ++ ExtraFlags,
     case gen_udp:open(Port, SocketOpts) of
         {ok, Socket} ->
             case open_preferred_sockets(Socket, Opts) of
@@ -364,7 +364,7 @@ open_preferred_sockets([{IP, Port} = Endpoint | Rest], Opts, Acc) ->
         | case maps:get(reuseport, Opts, false) of
             true -> [{reuseport, true}, {reuseport_lb, true}];
             false -> []
-        end
+        end ++ quic_socket:dont_fragment_opts(address_family(IP))
     ],
     case gen_udp:open(Port, SocketOpts) of
         {ok, S} ->

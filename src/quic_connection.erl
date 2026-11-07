@@ -963,6 +963,7 @@ open_client_socket_genudp(IP, Opts, ExtraOpts) ->
         {active, false},
         {recbuf, RecBuf},
         {sndbuf, SndBuf}
+        | quic_socket:dont_fragment_opts(AddrFamily)
     ],
     case gen_udp:open(0, BaseOpts ++ ExtraOpts) of
         {ok, S} ->
@@ -14111,7 +14112,9 @@ select_preferred_addr(_, _) ->
 -spec rebind_socket(gen_udp:socket(), inet | inet6) -> {ok, gen_udp:socket()} | {error, term()}.
 rebind_socket(OldSocket, Family) ->
     {ok, [{active, Active}]} = inet:getopts(OldSocket, [active]),
-    case gen_udp:open(0, [binary, Family, {active, Active}]) of
+    case
+        gen_udp:open(0, [binary, Family, {active, Active} | quic_socket:dont_fragment_opts(Family)])
+    of
         {ok, NewSocket} ->
             gen_udp:close(OldSocket),
             {ok, NewSocket};

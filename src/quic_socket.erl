@@ -63,7 +63,8 @@
     start_client_receiver/3,
     stop_client_receiver/1,
     set_socket/2,
-    client_recv_drops/0
+    client_recv_drops/0,
+    dont_fragment_opts/1
 ]).
 
 -include("quic.hrl").
@@ -77,6 +78,12 @@
 %% UDP_GRO = 104 (for GRO)
 -define(UDP_SEGMENT, 103).
 -define(UDP_GRO, 104).
+
+-define(SOL_IP, 0).
+-define(SOL_IPV6, 41).
+-define(IP_MTU_DISCOVER, 10).
+-define(IPV6_MTU_DISCOVER, 23).
+-define(PMTUDISC_PROBE, 3).
 
 -record(socket_state, {
     %% The underlying socket. For the `adapter' backend this is an
@@ -774,6 +781,29 @@ client_recv_drops() ->
 detect_capabilities() ->
     detect_capabilities(inet).
 
+%% @doc Raw options that set DF on a socket of `Family' (RFC 9000 §14).
+%% IP_PMTUDISC_PROBE sets DF without letting the kernel's path MTU cache
+%% cap the datagram size, which DPLPMTUD needs (RFC 8899). An IPv6 socket
+%% takes the IPv4 option too, for IPv4-mapped peers.
+-spec dont_fragment_opts(inet | inet6) -> [{raw, integer(), integer(), binary()}].
+dont_fragment_opts(Family) ->
+    case os:type() of
+        {unix, linux} -> linux_dont_fragment_opts(Family);
+        _ -> []
+    end.
+
+linux_dont_fragment_opts(inet) ->
+    [{raw, ?SOL_IP, ?IP_MTU_DISCOVER, <<?PMTUDISC_PROBE:32/native>>}];
+linux_dont_fragment_opts(inet6) ->
+    linux_dont_fragment_opts(inet) ++
+        [{raw, ?SOL_IPV6, ?IPV6_MTU_DISCOVER, <<?PMTUDISC_PROBE:32/native>>}].
+
+set_dont_fragment(Socket, Family) ->
+    lists:foreach(
+        fun({raw, Level, Opt, Value}) -> _ = socket:setopt_native(Socket, {Level, Opt}, Value) end,
+        dont_fragment_opts(Family)
+    ).
+
 -spec detect_capabilities(inet | inet6) -> map().
 detect_capabilities(Family) ->
     case os:type() of
@@ -798,6 +828,7 @@ open_socket_backend(Port, Family, Opts, BatchConfig) ->
 configure_and_bind_socket(Socket, Port, Family, Opts, BatchConfig) ->
     maybe_set_reuseaddr(Socket, Port),
     set_socket_buffer_sizes(Socket, Opts),
+    set_dont_fragment(Socket, Family),
     maybe_set_reuseport(Socket, Opts),
     %% Honor a specific bind address from extra_socket_opts {ip, Addr};
     %% fall back to the family wildcard.
@@ -880,13 +911,14 @@ maybe_enable_gro(_, _) ->
 open_send_socket_backend(Family, Opts, BatchConfig) ->
     case socket:open(Family, dgram, udp) of
         {ok, Socket} ->
-            configure_send_socket(Socket, Opts, BatchConfig);
+            configure_send_socket(Socket, Family, Opts, BatchConfig);
         {error, _} = Error ->
             Error
     end.
 
-configure_send_socket(Socket, Opts, BatchConfig) ->
+configure_send_socket(Socket, Family, Opts, BatchConfig) ->
     set_socket_buffer_sizes(Socket, Opts),
+    set_dont_fragment(Socket, Family),
     maybe_bind_source(Socket, Opts),
     %% GSO is applied per-message via the UDP_SEGMENT cmsg in
     %% flush_gso/1, never as a socket-level setsockopt. A socket-level
@@ -959,7 +991,7 @@ build_send_genudp_opts(Family, Opts) ->
         {active, ActiveN},
         {recbuf, RecBuf},
         {sndbuf, SndBuf}
-    ] ++ ExtraFlags.
+    ] ++ dont_fragment_opts(Family) ++ ExtraFlags.
 
 %%====================================================================
 %% Internal Functions - gen_udp Backend
@@ -980,9 +1012,10 @@ build_genudp_opts(Port, Opts) ->
     ExtraFlags = maps:get(extra_socket_opts, Opts, []),
     RecBuf = maps:get(recbuf, Opts, ?DEFAULT_UDP_RECBUF),
     SndBuf = maps:get(sndbuf, Opts, ?DEFAULT_UDP_SNDBUF),
+    Family = extra_socket_family(ExtraFlags),
     BaseOpts = [
         binary,
-        extra_socket_family(ExtraFlags),
+        Family,
         {active, ActiveN},
         {reuseaddr, reuseaddr_for_port(Port)},
         {recbuf, RecBuf},
@@ -993,7 +1026,7 @@ build_genudp_opts(Port, Opts) ->
             true -> [{reuseport, true}, {reuseport_lb, true}];
             false -> []
         end,
-    BaseOpts ++ ReuseOpts ++ ExtraFlags.
+    BaseOpts ++ ReuseOpts ++ dont_fragment_opts(Family) ++ ExtraFlags.
 
 build_genudp_state(Socket, BatchConfig) ->
     #socket_state{
