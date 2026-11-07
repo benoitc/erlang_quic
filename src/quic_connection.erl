@@ -3714,6 +3714,8 @@ send_handshake_packet(Payload, Frames, State) ->
 
 %% Send a 1-RTT (application) packet with a single frame (avoid encode/decode roundtrip)
 %% This is the preferred send function - encodes once and passes frame for loss tracking
+send_frame(Frame, #state{hold_pass_frames = true, pass_frames = Held} = State) ->
+    State#state{pass_frames = [Frame | Held]};
 send_frame(Frame, State) ->
     Payload = quic_frame:encode(Frame),
     send_app_packet_internal(Payload, [Frame], State).
@@ -4791,26 +4793,40 @@ server_recv_pass(Packets, RemoteAddr, Via, State) ->
         current_packet_source = RemoteAddr,
         current_packet_via = Via,
         has_non_probing_frame = false,
-        recv_pass = true
+        recv_pass = true,
+        hold_pass_frames = {RemoteAddr, Via} =/= {State#state.remote_addr, current_via(State)}
     },
     TotalSize = lists:sum([byte_size(P) || P <- Packets]),
     NewState = handle_packets_batch(Packets, account_path_recv(RemoteAddr, Via, TotalSize, State1)),
     %% RFC 9000 Section 9.3: only the highest-numbered non-probing packet
     %% moves the peer's address, so a pass that raised nothing is a late one.
     Newest = pass_largest(NewState) =/= pass_largest(State),
-    case NewState#state.has_non_probing_frame andalso Newest of
-        true ->
-            Mig = NewState#state.mig,
-            PassDCID = pass_dcid(Packets, NewState),
-            Changed = maybe_handle_address_change(
-                {path, Via, RemoteAddr},
-                TotalSize,
-                NewState#state{mig = Mig#mig{pass_dcid = PassDCID}}
-            ),
-            note_peer_dcid(RemoteAddr, PassDCID, Changed);
-        false ->
-            NewState
-    end.
+    Decided =
+        case NewState#state.has_non_probing_frame andalso Newest of
+            true ->
+                Mig = NewState#state.mig,
+                PassDCID = pass_dcid(Packets, NewState),
+                Changed = maybe_handle_address_change(
+                    {path, Via, RemoteAddr},
+                    TotalSize,
+                    NewState#state{mig = Mig#mig{pass_dcid = PassDCID}}
+                ),
+                note_peer_dcid(RemoteAddr, PassDCID, Changed);
+            false ->
+                NewState
+        end,
+    send_pass_frames(Decided).
+
+%% The frames held while the pass decided where the peer is, sent to
+%% wherever that is now; dropped when the pass closed the connection.
+send_pass_frames(#state{close_reason = CR} = State) when CR =/= undefined ->
+    State#state{hold_pass_frames = false, pass_frames = []};
+send_pass_frames(#state{pass_frames = Held} = State) ->
+    lists:foldl(
+        fun send_frame/2,
+        State#state{hold_pass_frames = false, pass_frames = []},
+        lists:reverse(Held)
+    ).
 
 pass_largest(#state{hs = #hs{pn_initial = I, pn_handshake = H}, pn_app = A}) ->
     {space_largest(I), space_largest(H), space_largest(A)}.
