@@ -2177,9 +2177,14 @@ draining({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {draining, state_to_map(State)}}]};
 draining(info, drain_timeout, State) ->
     {next_state, closed, State};
-draining(info, {udp, _Socket, _IP, _Port, _Data}, State) ->
-    %% Ignore packets in draining state
-    {keep_state, State};
+draining(info, {udp, _Socket, IP, Port, _Data}, State) ->
+    {keep_state, closing_reply({IP, Port}, State)};
+draining(info, {udp_batch, _Socket, IP, Port, Packets}, State) ->
+    {keep_state, closing_reply({IP, Port}, length(Packets), State)};
+draining(info, {quic_packet, _Data, RemoteAddr}, State) ->
+    {keep_state, closing_reply(RemoteAddr, State)};
+draining(info, {quic_packets, Packets, RemoteAddr}, State) ->
+    {keep_state, closing_reply(RemoteAddr, length(Packets), State)};
 draining(cast, {close, _Reason}, State) ->
     %% Ignore duplicate close requests - already draining
     {keep_state, State};
@@ -2194,6 +2199,32 @@ draining({call, From}, early_data_accepted, #state{hs = #hs{early_data_accepted 
     {keep_state, State, [{reply, From, EDA}]};
 draining(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, draining, State).
+
+%% RFC 9000 Section 10.2.1: after a close of our own, packets from the
+%% peer's address are answered with the CONNECTION_CLOSE again, on the
+%% 1st, 2nd, 4th, 8th... packet. After the peer's close, or an idle
+%% timeout, nothing is sent.
+closing_reply(Addr, State) ->
+    closing_reply(Addr, 1, State).
+
+closing_reply(
+    Addr,
+    N,
+    #state{remote_addr = Addr, closing_frame = {Level, Frame}, closing_recv = Recv} = State
+) when Level =/= none ->
+    Recv1 = Recv + N,
+    State1 = State#state{closing_recv = Recv1},
+    case 1 bsl floor_log2(Recv1) > Recv of
+        true -> flush_event(emit_close_at_level(Level, Frame, State1), event);
+        false -> State1
+    end;
+closing_reply(_Addr, _N, State) ->
+    State.
+
+floor_log2(N) -> floor_log2(N, 0).
+
+floor_log2(1, Acc) -> Acc;
+floor_log2(N, Acc) -> floor_log2(N bsr 1, Acc + 1).
 
 %% ----- CLOSED STATE -----
 
@@ -12126,7 +12157,9 @@ initiate_close(Reason, #state{mig = #mig{path_validation_timer = PathTimer}} = S
         undefined ->
             handshake_close(State1#state{close_reason = Reason});
         _ ->
-            send_frame(CloseFrame, State1#state{close_reason = Reason})
+            send_frame(CloseFrame, State1#state{
+                close_reason = Reason, closing_frame = {app, CloseFrame}
+            })
     end.
 
 %% RFC 9000 Section 10.2.3: before 1-RTT keys the close goes out as a
@@ -12169,8 +12202,11 @@ send_protocol_violation(Reason, State) ->
 %% the CLOSE frame because only the 1-RTT send path was wired.
 close_with_error(Level, Class, Code, FrameType, Reason, State) ->
     CloseFrame = {connection_close, Class, Code, FrameType, Reason},
-    CloseState = State#state{close_reason = {Class, Code, Reason}},
-    emit_close_at_level(select_close_level(Level, State), CloseFrame, CloseState).
+    CloseLevel = select_close_level(Level, State),
+    CloseState = State#state{
+        close_reason = {Class, Code, Reason}, closing_frame = {CloseLevel, CloseFrame}
+    },
+    emit_close_at_level(CloseLevel, CloseFrame, CloseState).
 
 select_close_level(app, #state{app_keys = AppKeys}) when AppKeys =/= undefined ->
     app;
