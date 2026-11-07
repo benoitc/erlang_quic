@@ -60,6 +60,15 @@ answer_to_a_full_size_challenge_validates_test() ->
         ?assertEqual(undefined, quic_connection_test_support:pending_peer_path(S2))
     end).
 
+a_response_the_limit_leaves_no_room_for_is_not_sent_test() ->
+    with_peer(fun(Peer, Sock) ->
+        S1 = recv(1, 100, Peer, state()),
+        _ = recv_all(Sock),
+        S = quic_connection:send_path_response_to_addr(Peer, <<"response">>, S1),
+        ?assertEqual([], recv_all(Sock)),
+        ?assertEqual(Peer, S#state.remote_addr)
+    end).
+
 recv(PN, Size, From, State) ->
     quic_connection:server_recv_pass([packet(PN, Size, State)], From, undefined, State).
 

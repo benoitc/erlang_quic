@@ -13739,6 +13739,10 @@ send_path_frames(
                         PacketSize,
                         State#state{pn_app = PNSpace#pn_space{next_pn = PN + 1}}
                     );
+                %% Over the unvalidated-address limit: not sent, like a
+                %% failed send; the peer's next probe is answered.
+                false ->
+                    State;
                 {error, _Reason} ->
                     State
             end;
