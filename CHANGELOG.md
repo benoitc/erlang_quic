@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A server no longer crashes when a client that has just moved to a new
+  address sends a small path check there. The answer did not fit in what
+  the server may send to an address it has not yet confirmed, and the
+  connection went down instead of waiting for more data from the client.
+
 ## [2.2.1] - 2026-11-07
 
 ### Changed
