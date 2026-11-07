@@ -21,6 +21,15 @@ reverts_to_the_validated_address_test() ->
     ?assertEqual(?OLD, S2#state.remote_addr),
     ?assertEqual(idle, (S2#state.mig)#mig.migration_state).
 
+reverts_after_a_move_during_the_handshake_test() ->
+    S1 = quic_connection:challenge_handshake_peer(?SPOOFED, 100, state()),
+    ?assertEqual(?SPOOFED, S1#state.remote_addr),
+    ?assertNotEqual(
+        undefined, (quic_connection_test_support:pending_peer_path(S1))#path_state.deadline
+    ),
+    S2 = give_up(S1),
+    ?assertEqual(?OLD, S2#state.remote_addr).
+
 give_up(#state{mig = Mig} = S) ->
     Pending = Mig#mig.pending_peer_validation,
     Expired = Pending#path_state{deadline = erlang:monotonic_time(millisecond) - 1},

@@ -13943,11 +13943,16 @@ challenge_handshake_peer(
         bytes_sent = 0,
         bytes_received = Size,
         dcid = State#state.dcid,
-        is_nat_rebinding = true
+        is_nat_rebinding = true,
+        deadline = erlang:monotonic_time(millisecond) + path_validation_deadline(State)
     },
     State1 = State#state{
         remote_addr = NewAddr,
-        mig = Mig#mig{pending_peer_validation = Path, migration_state = validating_peer}
+        mig = Mig#mig{
+            pending_peer_validation = Path,
+            migration_state = validating_peer,
+            validated_addr = validated_addr(Mig, State#state.remote_addr)
+        }
     },
     State2 = send_path_challenge(NewAddr, ChallengeData, State1#state.dcid, State1),
     start_path_validation_timer(State2);
