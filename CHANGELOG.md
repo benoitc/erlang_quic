@@ -19,6 +19,10 @@ All notable changes to this project will be documented in this file.
 - A Finished message that failed verification was ignored, leaving the
   handshake to time out. It now closes the connection with decrypt_error
   (RFC 8446 Section 4.4.4).
+- A client took a ServerHello or HelloRetryRequest naming a cipher suite
+  it does not know for TLS_AES_128_GCM_SHA256 and carried on with the
+  wrong keys. It now aborts with illegal_parameter (RFC 8446
+  Section 4.1.3).
 
 ## [2.6.1] - 2026-11-08
 

@@ -456,6 +456,14 @@ encode_alpn_list(Protocols) ->
     }}
     | {hrr, #{cipher := atom(), selected_group := atom() | unknown, extensions := map()}}
     | {error, term()}.
+parse_server_hello(
+    <<_:16, _:32/binary, SessionIdLen:8, _:SessionIdLen/binary, CipherSuite:16, _/binary>>
+) when
+    CipherSuite =/= ?TLS_AES_128_GCM_SHA256,
+    CipherSuite =/= ?TLS_AES_256_GCM_SHA384,
+    CipherSuite =/= ?TLS_CHACHA20_POLY1305_SHA256
+->
+    {error, illegal_parameter};
 parse_server_hello(<<
     % legacy_version
     ?TLS_VERSION_1_2:16,
@@ -1052,8 +1060,7 @@ parse_server_key_share(_) ->
 
 cipher_from_suite(?TLS_AES_128_GCM_SHA256) -> aes_128_gcm;
 cipher_from_suite(?TLS_AES_256_GCM_SHA384) -> aes_256_gcm;
-cipher_from_suite(?TLS_CHACHA20_POLY1305_SHA256) -> chacha20_poly1305;
-cipher_from_suite(_) -> aes_128_gcm.
+cipher_from_suite(?TLS_CHACHA20_POLY1305_SHA256) -> chacha20_poly1305.
 
 %% @private Encode a single psk_key_exchange_mode byte (RFC 8446 §4.2.9).
 encode_psk_mode(psk_ke) -> <<?PSK_KE_MODE_KE:8>>;
