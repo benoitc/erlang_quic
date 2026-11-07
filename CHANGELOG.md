@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- HTTP/3 server option `defer_requests_until_settings`. When set, a
+  request that arrives before the client's SETTINGS waits for them, so
+  the handler always sees the peer's settings. WebTransport draft-17
+  requires this, as the client's settings select the draft version.
+
 ### Changed
 - `wt_enabled` in HTTP/3 settings now means the WebTransport draft-17
   codepoint. The draft-15 codepoint is still available as

@@ -310,6 +310,7 @@ Start an HTTP/3 server.
 | `handler` | fun/5 or module | No | Request handler |
 | `settings` | map | No | HTTP/3 settings |
 | `quic_opts` | map | No | Additional QUIC options |
+| `defer_requests_until_settings` | boolean | No | Hold each request until the client's SETTINGS arrive, so `get_peer_settings/1` is a map in the handler. WebTransport draft-17 requires it. Default `false` |
 
 The handler can be:
 - A function: `fun(Conn, StreamId, Method, Path, Headers) -> ok`
@@ -546,7 +547,8 @@ pid per H3 connection via the `connection_handler` option:
 ```
 
 The returned map's `owner`, `handler`, `stream_type_handler`,
-`h3_datagram_enabled`, `max_buffered_body`, and `settings` keys replace
+`h3_datagram_enabled`, `max_buffered_body`,
+`defer_requests_until_settings`, and `settings` keys replace
 the listener defaults for that single connection; absent keys inherit. A
 `max_buffered_body` that is not a byte count fails the listener at start,
 or that one connection when it comes from this hook.

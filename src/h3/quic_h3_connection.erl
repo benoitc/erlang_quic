@@ -313,7 +313,13 @@
 
     %% GOAWAY identifier the peer sent. A different kind of number from
     %% goaway_id: a server names a stream, a client a push.
-    peer_goaway_id :: non_neg_integer() | undefined
+    peer_goaway_id :: non_neg_integer() | undefined,
+
+    %% Server option defer_requests_until_settings: requests whose HEADERS
+    %% complete before the peer's SETTINGS wait in deferred_requests,
+    %% newest first, and are dispatched once SETTINGS are applied.
+    defer_requests = false :: boolean(),
+    deferred_requests = [] :: [{stream_id(), binary(), binary(), [{binary(), binary()}]}]
 }).
 
 %%====================================================================
@@ -580,6 +586,7 @@ init({server, QuicConn, Opts, Owner}) ->
     StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
     H3DatagramEnabled = maps:get(h3_datagram_enabled, Opts, false),
     MaxBufferedBody = maps:get(max_buffered_body, Opts, ?H3_MAX_BUFFERED_BODY),
+    DeferRequests = maps:get(defer_requests_until_settings, Opts, false),
 
     State = #state{
         quic_conn = QuicConn,
@@ -604,7 +611,8 @@ init({server, QuicConn, Opts, Owner}) ->
         local_connect_enabled = LocalConnectEnabled,
         stream_type_handler = StreamTypeHandler,
         h3_datagram_enabled = H3DatagramEnabled,
-        max_buffered_body = MaxBufferedBody
+        max_buffered_body = MaxBufferedBody,
+        defer_requests = DeferRequests
     },
 
     %% Store handler in process dictionary for server
@@ -1840,10 +1848,11 @@ handle_control_frame({settings, Settings}, #state{settings_received = false} = S
     %% error that flows through handle_connection_error/2 for a clean close.
     try apply_peer_settings(Settings, State) of
         State1 ->
-            {ok, State1#state{
-                peer_settings = Settings,
-                settings_received = true
-            }}
+            {ok,
+                dispatch_deferred_requests(State1#state{
+                    peer_settings = Settings,
+                    settings_received = true
+                })}
     catch
         throw:{connection_error, _Code, _Reason} = Err ->
             {error, Err}
@@ -3055,8 +3064,8 @@ process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State) ->
             %% Apply RFC 9218 priority to underlying QUIC stream
             apply_stream_priority(StreamId, Stream1, State1),
             Stream2 = finalize_stream_state(Stream1, Fin, Role),
-            notify_headers_received(StreamId, Headers, Stream2, Owner, Role),
-            end_body_with_headers(StreamId, Fin, Stream2, State1);
+            State2 = notify_headers_received(StreamId, Headers, Stream2, Owner, Role, State1),
+            end_body_with_headers(StreamId, Fin, Stream2, State2);
         {error, {invalid_field, _Field, _Value}} ->
             %% Malformed header field - stream reset (RFC 9114 Section 4.1.2)
             {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}};
@@ -3079,14 +3088,42 @@ finalize_stream_state(Stream, false, _Role) ->
     Stream#h3_stream{frame_state = expecting_data}.
 
 %% Notify owner and invoke handler for received headers
-notify_headers_received(StreamId, Headers, Stream, Owner, server) ->
-    Method = Stream#h3_stream.method,
-    Path = Stream#h3_stream.path,
-    Owner ! {quic_h3, self(), {request, StreamId, Method, Path, Headers}},
-    invoke_handler(self(), StreamId, Method, Path, Headers);
-notify_headers_received(StreamId, Headers, Stream, Owner, client) ->
+notify_headers_received(
+    StreamId,
+    Headers,
+    Stream,
+    _Owner,
+    server,
+    #state{defer_requests = true, settings_received = false, deferred_requests = Q} = State
+) ->
+    Req = {StreamId, Stream#h3_stream.method, Stream#h3_stream.path, Headers},
+    State#state{deferred_requests = [Req | Q]};
+notify_headers_received(StreamId, Headers, Stream, Owner, server, State) ->
+    dispatch_request(Owner, {StreamId, Stream#h3_stream.method, Stream#h3_stream.path, Headers}),
+    State;
+notify_headers_received(StreamId, Headers, Stream, Owner, client, State) ->
     Status = Stream#h3_stream.status,
-    Owner ! {quic_h3, self(), {response, StreamId, Status, Headers}}.
+    Owner ! {quic_h3, self(), {response, StreamId, Status, Headers}},
+    State.
+
+dispatch_request(Owner, {StreamId, Method, Path, Headers}) ->
+    Owner ! {quic_h3, self(), {request, StreamId, Method, Path, Headers}},
+    invoke_handler(self(), StreamId, Method, Path, Headers).
+
+%% In arrival order, skipping streams the peer has reset meanwhile.
+dispatch_deferred_requests(#state{deferred_requests = []} = State) ->
+    State;
+dispatch_deferred_requests(#state{deferred_requests = Q, owner = Owner, streams = Streams} = State) ->
+    lists:foreach(
+        fun({StreamId, _, _, _} = Req) ->
+            case Streams of
+                #{StreamId := #h3_stream{reset = true}} -> ok;
+                _ -> dispatch_request(Owner, Req)
+            end
+        end,
+        lists:reverse(Q)
+    ),
+    State#state{deferred_requests = []}.
 
 %% HEADERS carrying the FIN end the body as well (a GET, HEAD, 204 or
 %% 304), so the reader gets the same empty fin-marked delivery a bare FIN
@@ -4916,7 +4953,7 @@ state_record_size() ->
 %% Every way into `closing' records why, because the enter clause is the
 %% only place the owner is told and it has nothing else to go on.
 close_with(Reason, State) ->
-    {next_state, closing, State#state{close_reason = Reason}}.
+    {next_state, closing, State#state{close_reason = Reason, deferred_requests = []}}.
 
 tell_peer_goaway(#state{owner = Owner, peer_goaway_id = Id}) ->
     Owner ! {quic_h3, self(), {goaway, Id}}.

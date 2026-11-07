@@ -3349,7 +3349,9 @@ make_test_state(Overrides) ->
         quic_connected => false,
         close_reason => normal,
         send_blocked => #{},
-        peer_goaway_id => undefined
+        peer_goaway_id => undefined,
+        defer_requests => false,
+        deferred_requests => []
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -3384,7 +3386,8 @@ make_test_state(Overrides) ->
         %% 0-RTT bootstrap fields
         maps:get(has_early_keys, Merged), maps:get(quic_connected, Merged),
         maps:get(close_reason, Merged), maps:get(send_blocked, Merged),
-        maps:get(peer_goaway_id, Merged)}.
+        maps:get(peer_goaway_id, Merged), maps:get(defer_requests, Merged),
+        maps:get(deferred_requests, Merged)}.
 
 %%====================================================================
 %% WT_STREAM placement (draft-ietf-webtrans-http3-17 §4.3)
