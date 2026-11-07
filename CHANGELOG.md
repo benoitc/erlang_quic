@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A connection that moves to a new path keeps the congestion control it was
+  configured with. Each path change started over with NewReno and the default
+  windows, whatever `cc_algorithm`, `initial_window` and `minimum_window`
+  said, and `quic:set_congestion_control/2` also dropped those windows.
+
 ## [2.2.0] - 2026-11-07
 
 ### Security
