@@ -13747,10 +13747,8 @@ send_path_response_to_addr(Addr, ResponseData, #state{current_packet_via = Via} 
         Addr, Via, addr_dcid(Addr, Via, State), [{path_response, ResponseData}], State
     ).
 
-on_current_path(Addr, #state{remote_addr = Addr, current_packet_via = Via} = State) ->
-    Via =:= current_via(State);
-on_current_path(_Addr, _State) ->
-    false.
+on_current_path(Addr, #state{current_packet_via = Via} = State) ->
+    on_path(Addr, Via, State).
 
 %% A probe on a path we are not on, such as a client checking the
 %% preferred address: answer it and challenge the path back in the same
@@ -13775,29 +13773,33 @@ answer_probe_on_new_path(Addr, ResponseData, #state{current_packet_via = Via} = 
 %% unanswered.
 answer_probe_on_new_path(_Addr, _Via, _ResponseData, State, none, _Seq) ->
     State;
-answer_probe_on_new_path(Addr, Via, ResponseData, State, DCID, Seq) ->
-    ChallengeData = crypto:strong_rand_bytes(8),
-    Path = #path_state{
-        remote_addr = Addr,
-        status = validating,
-        challenge_data = ChallengeData,
-        challenge_count = 1,
-        dcid = DCID,
-        dcid_seq = Seq,
-        via = Via
-    },
-    Others = [
-        P
-     || #path_state{remote_addr = A, via = V} = P <- alt_paths(State), {A, V} =/= {Addr, Via}
-    ],
-    State1 = State#state{mig = (State#state.mig)#mig{alt_paths = [Path | Others]}},
-    send_path_frames(
-        Addr,
-        Via,
-        path_dcid(Path, State1),
-        [{path_response, ResponseData}, {path_challenge, ChallengeData}],
-        State1
-    ).
+answer_probe_on_new_path(Addr, Via, ResponseData, #state{mig = Mig} = State, DCID, Seq) ->
+    {Path0, Others} =
+        case lists:partition(fun(P) -> is_path(Addr, Via, P) end, alt_paths(State)) of
+            {[P | _], Rest} ->
+                {P, Rest};
+            {[], Rest} ->
+                {#path_state{remote_addr = Addr, bytes_received = Mig#mig.pass_rx}, Rest}
+        end,
+    Path1 = Path0#path_state{dcid = DCID, dcid_seq = Seq, via = Via},
+    {Path, Frames} =
+        case path_room(Addr, Via, with_alt_path(Path1, Others, State)) >= 1200 of
+            true ->
+                ChallengeData = crypto:strong_rand_bytes(8),
+                {
+                    Path1#path_state{
+                        status = validating, challenge_data = ChallengeData, challenge_count = 1
+                    },
+                    [{path_response, ResponseData}, {path_challenge, ChallengeData}]
+                };
+            false ->
+                {Path1, [{path_response, ResponseData}]}
+        end,
+    State1 = with_alt_path(Path, Others, State),
+    send_path_frames(Addr, Via, path_dcid(Path, State1), Frames, State1).
+
+with_alt_path(Path, Others, #state{mig = Mig} = State) ->
+    State#state{mig = Mig#mig{alt_paths = [Path | Others]}}.
 
 probe_cid_for(Addr, Via, State) ->
     case Via =:= current_via(State) of
@@ -13855,7 +13857,12 @@ send_path_frames(
                         {IP, Port},
                         Via,
                         PacketSize,
-                        State#state{pn_app = PNSpace#pn_space{next_pn = PN + 1}}
+                        update_path_bytes_sent(
+                            IP,
+                            Port,
+                            PacketSize,
+                            State#state{pn_app = PNSpace#pn_space{next_pn = PN + 1}}
+                        )
                     );
                 %% Over the unvalidated-address limit: not sent, like a
                 %% failed send; the peer's next probe is answered.
@@ -14262,8 +14269,24 @@ account_path_recv(
     release_held(State#state{
         mig = Mig#mig{pending_peer_validation = Path#path_state{bytes_received = Rx + Size}}
     });
+account_path_recv(Addr, Via, Size, #state{cfg = #conn_cfg{role = server}, mig = Mig} = State) ->
+    case on_path(Addr, Via, State) of
+        true ->
+            State;
+        false ->
+            case lists:partition(fun(P) -> is_path(Addr, Via, P) end, Mig#mig.alt_paths) of
+                {[#path_state{bytes_received = Rx} = Path | Rest], Others} ->
+                    Paths = [Path#path_state{bytes_received = Rx + Size} | Rest ++ Others],
+                    State#state{mig = Mig#mig{alt_paths = Paths}};
+                {[], _} ->
+                    State#state{mig = Mig#mig{pass_rx = Size}}
+            end
+    end;
 account_path_recv(_Addr, _Via, _Size, State) ->
     State.
+
+on_path(Addr, Via, #state{remote_addr = Addr} = State) -> Via =:= current_via(State);
+on_path(_Addr, _Via, _State) -> false.
 
 %% RFC 9000 Sections 8 and 9.3.1: until a peer address is validated, a
 %% server sends it at most three times what it received from it.
@@ -14281,6 +14304,11 @@ path_room(Addr, Via, #state{
     }
 }) ->
     max(0, 3 * Rx - Tx);
+path_room(Addr, Via, #state{cfg = #conn_cfg{role = server}, mig = #mig{alt_paths = Paths}}) ->
+    case [P || #path_state{status = St} = P <- Paths, St =/= validated, is_path(Addr, Via, P)] of
+        [#path_state{bytes_sent = Tx, bytes_received = Rx} | _] -> max(0, 3 * Rx - Tx);
+        [] -> infinity
+    end;
 path_room(_Addr, _Via, _State) ->
     infinity.
 

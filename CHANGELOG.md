@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A server answered a PATH_CHALLENGE from an address the client was not
+  using with a 1200-byte datagram whatever the size of the probe, so a
+  client that knew the connection keys could send small probes with a
+  spoofed source address and have the server send about twenty times as
+  much to a third party. What the server sends to such an address is now
+  held to three times what it received from it, as RFC 9000 requires; a
+  response the full-size datagram does not fit in goes out alone and
+  smaller, and the path is challenged once a full-size datagram fits.
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed

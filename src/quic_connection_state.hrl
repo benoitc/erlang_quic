@@ -408,6 +408,8 @@
     %% the receive pass being handled
     peer_dcid :: binary() | undefined,
     pass_dcid :: binary() | undefined,
+    %% Bytes of the receive pass from a peer address on no path yet
+    pass_rx = 0 :: non_neg_integer(),
     %% While the current path is on a preferred-address socket, the
     %% listening socket and its sender, sent through again on return
     main_sock :: {term(), term()} | undefined
