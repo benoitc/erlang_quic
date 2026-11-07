@@ -5208,6 +5208,8 @@ decode_long_header_packet(Data, State) ->
     case Version of
         0 ->
             handle_version_negotiation(DCID, SCID, Rest3, State);
+        _ when DCIDLen > 20; SCIDLen > 20 ->
+            {error, cid_too_long};
         _ ->
             %% RFC 9368: a client that offered other acceptable versions
             %% adopts the one the server switched to.

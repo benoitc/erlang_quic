@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A version 1 or 2 long-header packet with a connection id longer than
+  20 bytes is now dropped, as RFC 9000 Section 17.2 requires. Before, a
+  listener started a connection for an Initial with such a Destination
+  Connection ID, and either side took such a Source Connection ID as the
+  peer's. Version Negotiation still accepts the longer ids RFC 8999
+  allows.
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed
