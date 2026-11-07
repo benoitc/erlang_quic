@@ -14118,9 +14118,7 @@ follow_handshake_peer(_RemoteAddr, _Size, _Before, After) ->
 %% RFC 9000 Section 9: a peer that moves before the handshake is
 %% confirmed is validated, which takes a 1-RTT PATH_CHALLENGE. The
 %% client has no other CID yet, so the path keeps the current one.
-challenge_handshake_peer(
-    NewAddr, Size, #state{app_keys = {_, _}, mig = #mig{migration_state = idle} = Mig} = State
-) ->
+challenge_handshake_peer(NewAddr, Size, #state{app_keys = {_, _}, mig = Mig} = State) ->
     ChallengeData = crypto:strong_rand_bytes(8),
     Path = #path_state{
         remote_addr = NewAddr,
