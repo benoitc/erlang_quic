@@ -2446,7 +2446,12 @@ cl_data_check(_, _, _) ->
 %% specific fields, Content-Length matches response headers, body size
 %% agrees with advertised content-length.
 handle_push_trailers(StreamId, PushId, HeaderBlock, Decoder, Owner, Stream, State) ->
-    case quic_qpack:decode(HeaderBlock, Decoder) of
+    case decode_field_section(HeaderBlock, Decoder, State) of
+        {{error, field_section_too_large}, _Decoder1} ->
+            %% Trailers over our limit cost only this push.
+            _ = quic:stop_sending(State#state.quic_conn, StreamId, ?H3_EXCESSIVE_LOAD),
+            Owner ! {quic_h3, self(), {push_cancelled, PushId}},
+            cleanup_push_stream(PushId, StreamId, do_cancel_push(PushId, State));
         {{ok, Trailers}, Decoder1} ->
             State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
             try
@@ -2862,7 +2867,10 @@ handle_request_frame(
     #h3_stream{frame_state = expecting_data} = Stream,
     #state{qpack_decoder = Decoder, owner = Owner} = State
 ) ->
-    case quic_qpack:decode(HeaderBlock, Decoder) of
+    case decode_field_section(HeaderBlock, Decoder, State) of
+        {{error, field_section_too_large}, _Decoder1} ->
+            %% Trailers over our limit cost only this request.
+            {error, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}};
         {{ok, Trailers}, Decoder1} ->
             %% RFC 9114 Section 4.1.2: validate trailers
             case validate_trailer_headers(Trailers, Stream) of
