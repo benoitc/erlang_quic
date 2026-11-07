@@ -1099,7 +1099,11 @@ find_static_match(Name, Value) ->
 %% Get static table entry by index - O(1)
 -spec get_static_entry(non_neg_integer()) -> header().
 get_static_entry(Index) when Index >= 0, Index =< 98 ->
-    element(Index + 1, ?STATIC_TABLE);
+    %% An entry the table lists without a value carries an empty one.
+    case element(Index + 1, ?STATIC_TABLE) of
+        {Name, undefined} -> {Name, <<>>};
+        Entry -> Entry
+    end;
 get_static_entry(Index) ->
     throw({invalid_static_index, Index}).
 

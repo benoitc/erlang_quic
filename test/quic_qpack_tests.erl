@@ -730,3 +730,8 @@ field_section_limit_stops_decoding_test() ->
     ?assertMatch(
         {{error, field_section_too_large}, _}, quic_qpack:decode(Block, quic_qpack:new(), 1000)
     ).
+
+%% A static entry listed without a value decodes with an empty one.
+indexed_static_entry_without_value_test() ->
+    ?assertEqual({ok, [{<<"cookie">>, <<>>}]}, quic_qpack:decode(<<0, 0, 16#C5>>)),
+    ?assertEqual({ok, [{<<":authority">>, <<>>}]}, quic_qpack:decode(<<0, 0, 16#C0>>)).
