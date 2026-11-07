@@ -3606,13 +3606,12 @@ dequeue_small_stream_frame_tuple(
                     %% data_sent and the FIN are settled as that path does.
                     {{value, _}, NewPQ} = quic_pqueue:out(PQ),
                     StreamFrameTuple = {stream, StreamId, Offset, Data, Fin},
-                    NewState = State#state{
+                    NewState = count_sent(StreamId, Offset + DataSize, State#state{
                         send_queue = NewPQ,
                         send_queue_bytes = max(0, QueueBytes - DataSize),
                         send_queue_count = max(0, QueueCount - 1),
-                        send_queue_version = Version + 1,
-                        data_sent = State#state.data_sent + DataSize
-                    },
+                        send_queue_version = Version + 1
+                    }),
                     {ok, StreamFrameTuple, fin_sent_if(Fin, StreamId, NewState)};
                 {blocked, _} ->
                     none
@@ -10229,7 +10228,7 @@ send_admitted_data(
     SendMaxData = StreamState#stream_state.send_max_data,
 
     %% Check connection-level flow control
-    ConnectionAllowed = MaxDataRemote - DataSent,
+    ConnectionAllowed = conn_allowance(StreamState, Offset, MaxDataRemote, DataSent),
     %% Check stream-level flow control
     StreamAllowed = SendMaxData - Offset,
 
@@ -10329,12 +10328,11 @@ send_admitted_data(
                         send_offset = Offset + DataSize,
                         send_fin = SendFin
                     },
-                    FinalState0 = NewState#state{
+                    FinalState0 = count_sent(StreamId, Offset + BytesSent, NewState#state{
                         streams = maps:put(
                             StreamId, FinalStream, NewState#state.streams
-                        ),
-                        data_sent = NewState#state.data_sent + BytesSent
-                    },
+                        )
+                    }),
                     %% RFC 9000 §4.6: extend MAX_STREAMS when this
                     %% peer-initiated stream is now fully closed.
                     FinalState = maybe_reclaim_stream(
@@ -10419,6 +10417,7 @@ zero_rtt_frames(StreamId, StreamState, DataBin, Fin, #state{streams = Streams} =
     %% the 1-RTT path: lost 0-RTT data is retransmitted until then.
     NewStreamState = StreamState#stream_state{
         send_offset = Offset + byte_size(DataBin),
+        send_highest = max(StreamState#stream_state.send_highest, Offset + byte_size(DataBin)),
         send_fin = Fin
     },
     EarlyDataSent = (State#state.hs)#hs.early_data_sent + byte_size(DataBin),
@@ -11336,7 +11335,11 @@ check_send_queue_flow_control(StreamId, Offset, DataSize, #state{
     streams = Streams
 }) ->
     %% Check connection-level flow control
-    ConnectionAllowed = MaxDataRemote - DataSent,
+    ConnectionAllowed =
+        case maps:find(StreamId, Streams) of
+            {ok, Stream} -> conn_allowance(Stream, Offset, MaxDataRemote, DataSent);
+            error -> MaxDataRemote - DataSent
+        end,
     case DataSize =< ConnectionAllowed of
         false ->
             {blocked, connection};
@@ -11388,13 +11391,32 @@ blocked_head_allowance(StreamId, Offset, #state{
     data_sent = DataSent,
     streams = Streams
 }) ->
-    ConnectionAllowed = MaxDataRemote - DataSent,
-    StreamAllowed =
-        case maps:find(StreamId, Streams) of
-            {ok, #stream_state{send_max_data = SendMaxData}} -> SendMaxData - Offset;
-            error -> ConnectionAllowed
-        end,
-    min(ConnectionAllowed, StreamAllowed).
+    case maps:find(StreamId, Streams) of
+        {ok, #stream_state{send_max_data = SendMaxData} = Stream} ->
+            min(conn_allowance(Stream, Offset, MaxDataRemote, DataSent), SendMaxData - Offset);
+        error ->
+            MaxDataRemote - DataSent
+    end.
+
+%% How many bytes from Offset on this stream connection flow control
+%% admits: the bytes up to the stream's highest offset sent are already
+%% counted, so only what goes beyond it uses connection credit.
+conn_allowance(#stream_state{send_highest = Highest}, Offset, MaxDataRemote, DataSent) ->
+    Highest + (MaxDataRemote - DataSent) - Offset.
+
+%% Count the bytes up to End on StreamId against connection flow
+%% control, once each: only what lies beyond the highest offset sent so
+%% far is new to the peer's count (RFC 9000 Section 4.1).
+count_sent(StreamId, End, #state{streams = Streams, data_sent = DataSent} = State) ->
+    case Streams of
+        #{StreamId := #stream_state{send_highest = Highest} = Stream} when End > Highest ->
+            State#state{
+                streams = Streams#{StreamId := Stream#stream_state{send_highest = End}},
+                data_sent = DataSent + (End - Highest)
+            };
+        _ ->
+            State
+    end.
 
 %% Actually process the queue entry (called after flow control check passes)
 process_send_queue_entry(
@@ -11446,15 +11468,7 @@ process_send_queue_entry(
             %% Only update data_sent for connection-level flow control accounting.
             %% send_offset was already advanced when the data was first queued
             %% (in do_send_data) to prevent offset overlap bugs.
-            State3a =
-                case BytesSent > 0 of
-                    true ->
-                        State2#state{
-                            data_sent = State2#state.data_sent + BytesSent
-                        };
-                    false ->
-                        State2
-                end,
+            State3a = count_sent(StreamId, Offset + BytesSent, State2),
             %% A queued write that carried FIN closes the send side only
             %% here: do_send_data could not mark it (the write was still
             %% queued). The queue-count check rules out a zero-length FIN

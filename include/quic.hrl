@@ -649,6 +649,10 @@
     %% Our send side is terminal: FIN emitted or we sent RESET_STREAM. Used
     %% (with recv_done) to reclaim the stream from the connection map.
     send_done = false :: boolean(),
+    %% Highest offset sent on this stream so far. Connection flow control
+    %% counts the sum of these over all streams, as the peer does (RFC
+    %% 9000 Section 4.1), whatever order the bytes went out in.
+    send_highest = 0 :: non_neg_integer(),
 
     %% Receive state
     recv_offset :: non_neg_integer(),

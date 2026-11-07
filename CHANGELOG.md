@@ -9,6 +9,11 @@ All notable changes to this project will be documented in this file.
   can no longer be replayed later.
 
 ### Fixed
+- A large download could be closed with a flow-control error, seen as a
+  transfer that stopped part way. The sender counted its connection credit
+  in bytes sent while the receiver counts the highest offset on each
+  stream, as the RFC says, so a write that went out ahead of data still
+  queued made the two disagree. The sender now counts the same way.
 - `quic:migrate/1` on a server connection closed the listener's socket,
   breaking every connection on it. It now returns
   `{error, not_supported_on_server}`.
