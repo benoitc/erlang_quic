@@ -10271,7 +10271,12 @@ do_send_data(StreamId, Data, Fin, #state{streams = Streams} = State, Admission) 
     case maps:find(StreamId, Streams) of
         {ok, #stream_state{send_fin = true}} ->
             %% Our FIN fixed the final size (RFC 9000 Section 4.5), so
-            %% anything written now would lie past it.
+            %% anything written now would lie past it. So did our
+            %% RESET_STREAM or RESET_STREAM_AT.
+            {error, stream_closed};
+        {ok, #stream_state{send_done = true}} ->
+            {error, stream_closed};
+        {ok, #stream_state{send_reset_at = RS}} when RS =/= undefined ->
             {error, stream_closed};
         {ok, StreamState} ->
             %% Check stream direction (can't send on peer's uni streams)
