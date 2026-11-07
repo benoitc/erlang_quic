@@ -938,6 +938,17 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %%       handshake. `cert'/`key' may be omitted when this is set. An
 %%       `{error, _}', a malformed result, or a raised exception fails the
 %%       handshake with a `handshake_failure' alert.</li>
+%%   <li>`alpn_handler' -
+%%       `fun((Conn :: pid(), Alpn :: binary()) -> {ok, Owner :: pid()} | {error, term()})'.
+%%       Invoked in the connection process once the ClientHello has
+%%       negotiated `Alpn', before any stream data can be decoded;
+%%       `Owner' becomes the connection's owner from there, after any
+%%       owner `connection_handler' chose. It runs like `sni_callback':
+%%       it must return quickly and must not call the connection
+%%       synchronously. An `{error, _}', a malformed result, or a raised
+%%       exception fails the handshake with a `handshake_failure' alert,
+%%       and the handshake can still fail after it returns. Not called
+%%       when `alpn' is empty.</li>
 %% </ul>
 %%
 %% Example:
