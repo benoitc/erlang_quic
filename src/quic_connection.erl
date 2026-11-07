@@ -13739,7 +13739,7 @@ send_path_frames(
                         PacketSize,
                         State#state{pn_app = PNSpace#pn_space{next_pn = PN + 1}}
                     );
-                {error, _Reason} ->
+                _NoRoomOrError ->
                     State
             end;
         _ ->
