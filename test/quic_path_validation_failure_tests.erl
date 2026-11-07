@@ -23,7 +23,8 @@ reverts_to_the_validated_address_test() ->
 
 give_up(#state{mig = Mig} = S) ->
     Pending = Mig#mig.pending_peer_validation,
-    S1 = S#state{mig = Mig#mig{pending_peer_validation = Pending#path_state{challenge_count = 3}}},
+    Expired = Pending#path_state{deadline = erlang:monotonic_time(millisecond) - 1},
+    S1 = S#state{mig = Mig#mig{pending_peer_validation = Expired}},
     {keep_state, S2} = quic_connection:handle_path_validation_timeout(S1),
     S2.
 

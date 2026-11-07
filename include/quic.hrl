@@ -524,7 +524,12 @@
 
     %% Server side: the listener socket bound to the preferred address
     %% this path arrives on, `undefined' for the listening socket
-    via :: term()
+    via :: term(),
+
+    %% Challenges sent earlier on this path, still answerable
+    old_challenges = [] :: [binary()],
+    %% Monotonic time (ms) at which validation of this path is abandoned
+    deadline :: integer() | undefined
 }).
 
 %% Preferred Address for Server Migration (RFC 9000 Section 9.6)

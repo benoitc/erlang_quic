@@ -180,6 +180,8 @@
 -define(TLS_AWAITING_CERT_VERIFY, awaiting_certificate_verify).
 -define(TLS_AWAITING_FINISHED, awaiting_finished).
 -define(TLS_HANDSHAKE_COMPLETE, handshake_complete).
+-define(K_INITIAL_RTT, 333).
+-define(PATH_VALIDATION_INITIAL_PTO, 1000).
 
 %% TLS handshake states (server)
 -define(TLS_AWAITING_CLIENT_HELLO, awaiting_client_hello).
@@ -14002,7 +14004,8 @@ start_peer_path_validation(NewAddr, Via, IsNATRebinding, DataSize, NewDCID, NewS
         dcid = NewDCID,
         dcid_seq = NewSeq,
         is_nat_rebinding = IsNATRebinding,
-        via = Via
+        via = Via,
+        deadline = erlang:monotonic_time(millisecond) + path_validation_deadline(State)
     },
 
     %% RFC 9000 Section 9.3.2: Also probe the old path to defend against spoofing
@@ -14130,7 +14133,18 @@ send_path_challenge_to_addr(Addr, ChallengeData, DCID, State) ->
             State1
     end.
 
-%% @doc Start path validation timer (3 * PTO).
+%% RFC 9000 Section 8.2.4: three times the larger of the current PTO and
+%% that of the new path, computed from kInitialRtt.
+path_validation_deadline(#state{loss_state = undefined}) ->
+    3 * ?PATH_VALIDATION_INITIAL_PTO;
+path_validation_deadline(#state{loss_state = LossState}) ->
+    3 *
+        max(
+            quic_loss:get_pto(LossState, app),
+            quic_loss:initial_path_pto(LossState, ?K_INITIAL_RTT)
+        ).
+
+%% @doc Start the timer for the next PATH_CHALLENGE retry.
 %% RFC 9000 Section 8.2.4: Use PTO-based timeout for path validation.
 %% Uses a token to correlate timeout messages with specific validation attempts,
 %% allowing stale timeouts from canceled validations to be ignored.
@@ -14140,7 +14154,7 @@ start_path_validation_timer(
 ) ->
     %% Cancel any existing timer
     cancel_timer(OldTimer),
-    Timeout = path_validation_timeout(State),
+    Timeout = path_retry_interval(State),
     %% Use same token for both message and state - enables stale timeout detection
     ValidationToken = make_ref(),
     TimerRef = erlang:send_after(Timeout, self(), {path_validation_timeout, ValidationToken}),
@@ -14151,18 +14165,30 @@ start_path_validation_timer(
         }
     }.
 
+%% Challenges are resent with backoff until the deadline.
+path_retry_interval(
+    #state{mig = #mig{pending_peer_validation = #path_state{challenge_count = N, deadline = D}}} =
+        State
+) when D =/= undefined ->
+    Left = D - erlang:monotonic_time(millisecond),
+    max(1, min(path_validation_timeout(State) bsl (N - 1), Left));
+path_retry_interval(State) ->
+    path_validation_timeout(State).
+
 %% @doc Handle path validation timeout.
 %% RFC 9000 Section 8.2.4: Validation fails after timeout, stay on current path.
 -spec handle_path_validation_timeout(#state{}) -> {keep_state, #state{}}.
 handle_path_validation_timeout(#state{mig = #mig{pending_peer_validation = PathState}} = State) ->
     %% Mark path as failed, stay on current path
-    case PathState of
-        #path_state{challenge_count = Count} when Count < 3 ->
-            %% Retry PATH_CHALLENGE
+    case keep_validating(PathState) of
+        true ->
+            #path_state{challenge_count = Count, challenge_data = Sent, old_challenges = Old} =
+                PathState,
             ChallengeData = crypto:strong_rand_bytes(8),
             NewPathState = PathState#path_state{
                 challenge_data = ChallengeData,
-                challenge_count = Count + 1
+                challenge_count = Count + 1,
+                old_challenges = [Sent | Old]
             },
             State1 = State#state{
                 mig = (State#state.mig)#mig{pending_peer_validation = NewPathState}
@@ -14175,9 +14201,16 @@ handle_path_validation_timeout(#state{mig = #mig{pending_peer_validation = PathS
             ),
             State3 = start_path_validation_timer(State2),
             {keep_state, State3};
-        _ ->
+        false ->
             {keep_state, abandon_peer_validation(State)}
     end.
+
+keep_validating(#path_state{deadline = D}) when D =/= undefined ->
+    erlang:monotonic_time(millisecond) < D;
+keep_validating(#path_state{challenge_count = Count}) ->
+    Count < 3;
+keep_validating(undefined) ->
+    false.
 
 %% Give up the path being validated and go back to the last validated
 %% address (RFC 9000 Section 9.3.2). A CID that has appeared on a path is
@@ -14259,32 +14292,28 @@ handle_path_response(ResponseData, State) ->
     {new_path_validated, #path_state{}, #state{}}
     | {old_path_validated, #state{}}
     | no_match.
-check_peer_validation_response(ResponseData, State) ->
-    %% Check new path (pending_peer_validation)
-    case (State#state.mig)#mig.pending_peer_validation of
-        #path_state{challenge_data = ResponseData} = PendingPath ->
-            %% New path validated
-            ValidatedPath = PendingPath#path_state{status = validated, challenge_data = undefined},
-            State1 = State#state{
-                mig = (State#state.mig)#mig{pending_peer_validation = ValidatedPath}
+check_peer_validation_response(ResponseData, #state{mig = Mig} = State) ->
+    Pending = Mig#mig.pending_peer_validation,
+    case {answers(ResponseData, Pending), Mig#mig.old_path_validation} of
+        {true, _} ->
+            ValidatedPath = Pending#path_state{
+                status = validated, challenge_data = undefined, old_challenges = []
             },
+            State1 = State#state{mig = Mig#mig{pending_peer_validation = ValidatedPath}},
             {new_path_validated, ValidatedPath, State1};
+        {_, #path_state{challenge_data = ResponseData} = OldPath} ->
+            %% Old path validated - confirms peer is real (anti-spoofing signal)
+            ValidatedOldPath = OldPath#path_state{status = validated, challenge_data = undefined},
+            {old_path_validated, State#state{mig = Mig#mig{old_path_validation = ValidatedOldPath}}};
         _ ->
-            %% Check old path
-            case (State#state.mig)#mig.old_path_validation of
-                #path_state{challenge_data = ResponseData} = OldPath ->
-                    %% Old path validated - confirms peer is real (anti-spoofing signal)
-                    ValidatedOldPath = OldPath#path_state{
-                        status = validated, challenge_data = undefined
-                    },
-                    State1 = State#state{
-                        mig = (State#state.mig)#mig{old_path_validation = ValidatedOldPath}
-                    },
-                    {old_path_validated, State1};
-                _ ->
-                    no_match
-            end
+            no_match
     end.
+
+%% RFC 9000 Section 8.2.3: a response to any challenge sent on the path.
+answers(Data, #path_state{challenge_data = Sent, old_challenges = Old}) ->
+    Data =:= Sent orelse lists:member(Data, Old);
+answers(_Data, undefined) ->
+    false.
 
 %% @doc Decide migration after new path is validated.
 %% RFC 9000 Section 9.3.2: Old path validation is an anti-spoofing signal.

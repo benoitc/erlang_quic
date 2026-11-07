@@ -57,6 +57,7 @@
     %% PTO
     get_pto/2,
     base_pto/1,
+    initial_path_pto/2,
     discard_space/2,
     reset_for_retry/2,
     get_pto_time_and_space/3,
@@ -921,6 +922,11 @@ pto(#loss_state{rtt = RTT, pto_count = PTOCount}, MaxAckDelay) ->
 -spec base_pto(loss_state()) -> non_neg_integer().
 base_pto(#loss_state{} = State) ->
     pto(State#loss_state{pto_count = 0}, State#loss_state.max_ack_delay).
+
+%% @doc The PTO of a new path whose RTT is not known yet, from InitialRTT.
+-spec initial_path_pto(loss_state(), non_neg_integer()) -> non_neg_integer().
+initial_path_pto(#loss_state{max_ack_delay = MaxAckDelay} = State, InitialRTT) ->
+    pto(State#loss_state{rtt = quic_rtt:new(InitialRTT), pto_count = 0}, MaxAckDelay).
 
 %% @doc Adopt the peer's ack_delay_exponent and max_ack_delay (ms), from
 %% its transport parameters.
