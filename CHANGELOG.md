@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.2.1] - 2026-11-07
 
 ### Changed
 - Retry tokens are accepted for at most 10 seconds, so a captured token
