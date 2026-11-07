@@ -4,7 +4,7 @@ This guide walks you through setting up and using erlang_quic in your applicatio
 
 ## Requirements
 
-- Erlang/OTP 26.0 or later
+- Erlang/OTP 27 or later
 - rebar3
 
 ## Installation

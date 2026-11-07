@@ -17,7 +17,7 @@ This document describes `quic_dist`, the Erlang distribution protocol implementa
 
 ### Prerequisites
 
-1. Erlang/OTP 26 or later
+1. Erlang/OTP 27 or later
 2. TLS certificates (self-signed for testing, CA-signed for production)
 
 ### Generate Test Certificates

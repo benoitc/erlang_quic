@@ -1408,24 +1408,7 @@ split_gro_packets(Data, SegmentSize, Acc) ->
 %%====================================================================
 
 detect_linux_capabilities(Family) ->
-    %% Check OTP version - need 27+ for socket module features
-    case otp_version_check() of
-        false ->
-            #{gso => false, gro => false, backend => gen_udp};
-        true ->
-            %% Try to create a test socket and check GSO/GRO
-            test_linux_socket_capabilities(Family)
-    end.
-
-otp_version_check() ->
-    %% Check if OTP version is 27 or higher
-    try
-        OtpRelease = erlang:system_info(otp_release),
-        Version = list_to_integer(OtpRelease),
-        Version >= 27
-    catch
-        _:_ -> false
-    end.
+    test_linux_socket_capabilities(Family).
 
 test_linux_socket_capabilities(Family) ->
     case socket:open(Family, dgram, udp) of
