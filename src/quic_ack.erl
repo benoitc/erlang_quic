@@ -54,6 +54,7 @@
     build_ack_frame/1,
     convert_ack_ranges_for_encode/1,
     ranges_to_ack_format/1,
+    acks_negative_pn/1,
 
     %% Frame classification for ACK policy
     contains_ack_eliciting_frames/1,
@@ -466,6 +467,18 @@ convert_ack_ranges_for_encode([{Start, End} | Rest]) ->
     {non_neg_integer(), [{non_neg_integer(), non_neg_integer()}]}.
 ranges_to_ack_format([{_LargestAcked, FirstRange} | RestRanges]) ->
     {FirstRange, RestRanges}.
+
+%% @doc Do the codec's ranges reach below packet number 0?
+-spec acks_negative_pn([{non_neg_integer(), non_neg_integer()}]) -> boolean().
+acks_negative_pn([]) ->
+    false;
+acks_negative_pn([{LargestAcked, FirstRange} | RestRanges]) ->
+    lowest_acked(LargestAcked - FirstRange, RestRanges) < 0.
+
+lowest_acked(Start, []) ->
+    Start;
+lowest_acked(Start, [{Gap, Range} | Rest]) ->
+    lowest_acked(Start - Gap - 2 - Range, Rest).
 
 %%====================================================================
 %% Frame classification for ACK policy

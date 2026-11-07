@@ -6054,9 +6054,15 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
     %% Convert Ranges list to the format expected by quic_loss
     %% Ranges is a list of {Start, End} tuples from largest to smallest
     NextPN = next_pn(Level, State),
+    NegativePN = quic_ack:acks_negative_pn(Ranges),
     case Ranges of
         [] ->
             State;
+        _ when NegativePN ->
+            %% RFC 9000 Section 19.3.1
+            close_with_transport_error(
+                ?QUIC_FRAME_ENCODING_ERROR, <<"ACK below packet number 0">>, State
+            );
         [{LargestAcked, _} | _] when LargestAcked >= NextPN ->
             %% RFC 9000 Section 13.1
             close_with_transport_error(
