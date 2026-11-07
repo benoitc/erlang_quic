@@ -875,17 +875,20 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %%   <li>`key' - Decoded private key for `cert', as
 %%       `public_key:pem_entry_decode/1' returns it. One that cannot sign for
 %%       the certificate is refused with `{error, {invalid_server_key, _}}'.</li>
-%%   <li>`verify' - Request a client certificate (mutual TLS) and validate any
-%%       presented chain against `cacerts' (RFC 8446 §4.4.2.4). Optional by
-%%       default: a client that sends no certificate still connects.</li>
+%%   <li>`verify' - `true' or `verify_peer': request a client certificate
+%%       (mutual TLS) and validate any presented chain against `cacerts'
+%%       (RFC 8446 §4.4.2.4). A client that sends no certificate still
+%%       connects. `false' or `verify_none' (the default) requests none.</li>
 %%   <li>`cacerts' - Trust anchors (list of DER CA certs) for validating a
-%%       client certificate; `undefined' uses the OS trust store.</li>
+%%       client certificate. Required, or `cacertfile', when `verify' or
+%%       `require_client_cert' is set: the start fails with
+%%       `{error, client_auth_needs_cacerts}' otherwise.</li>
 %%   <li>`cacertfile' - Path to a PEM file holding those anchors, read once
 %%       at start. A file that cannot be read, or that holds no certificate,
 %%       fails the start. Ignored when `cacerts' is given.</li>
-%%   <li>`require_client_cert' - With `verify', reject a client that presents
-%%       no certificate (`certificate_required') instead of accepting it,
-%%       making mutual TLS mandatory (default `false').</li>
+%%   <li>`require_client_cert' - Request a client certificate and refuse
+%%       a client that presents none (`certificate_required'), making mutual
+%%       TLS mandatory whatever `verify' says (default `false').</li>
 %%   <li>`psks' - `#{Identity :: binary() => Secret :: binary()}'
 %%       static PSK table</li>
 %%   <li>`psk_callback' - `fun((Identity :: binary()) -> {ok, Secret} | not_found)';
@@ -957,6 +960,7 @@ validate_server_opts(Opts) ->
         ok ->
             first_error([
                 quic_listener:has_auth_method(Opts),
+                quic_cert:check_client_auth(Opts),
                 credentials(server, Opts),
                 validate_receive_window(Opts),
                 validate_owner_queue(Opts),
@@ -1052,9 +1056,10 @@ server_spec(Name, Port, Opts) when
     Port =< 65535,
     is_map(Opts)
 ->
-    case quic_cert:resolve_cacerts(Opts) of
-        {ok, Opts1} -> quic_server_sup:server_spec(Name, Port, Opts1);
-        {error, Reason} -> error(Reason)
+    case {quic_cert:check_client_auth(Opts), quic_cert:resolve_cacerts(Opts)} of
+        {ok, {ok, Opts1}} -> quic_server_sup:server_spec(Name, Port, Opts1);
+        {{error, Reason}, _} -> error(Reason);
+        {ok, {error, Reason}} -> error(Reason)
     end;
 server_spec(_Name, _Port, _Opts) ->
     error(badarg).

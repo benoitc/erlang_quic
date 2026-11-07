@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Security
+- A listener started with `require_client_cert => true` never asked
+  clients for a certificate unless `verify => true` was set as well, so
+  it accepted every client while appearing to enforce mutual TLS, and
+  `quic:peercert/1` found nothing. `require_client_cert` now asks for a
+  certificate and refuses a client without one, whatever `verify` says.
+  `verify => verify_peer` on a listener now asks for one too, as
+  `verify => true` does. A listener that asks for client certificates
+  now needs `cacerts` or `cacertfile` and fails to start without them,
+  instead of checking client certificates against the system trust
+  store, which any publicly issued certificate would pass. For QUIC
+  distribution this means `verify_peer` needs `cacert_file`.
+  (GHSA-wc8g-r527-q23h, CWE-287).
+
+### Fixed
+- A resumed connection to a listener that asks for client certificates
+  failed with an unexpected-message alert: the server waited for a
+  client certificate it had not asked for.
+
 ## [2.4.0] - 2026-11-07
 
 ### Changed

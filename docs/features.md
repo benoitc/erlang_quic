@@ -322,7 +322,8 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
   CONNECTION_ID_LIMIT_ERROR
 - `alpn` - ALPN protocols list
 - `verify` - Server certificate verification on the client (default: `true`; verifies the CertificateVerify signature, the chain, and the hostname). The hostname check follows the RFC 6125 HTTPS rules, so a leftmost-label wildcard SAN such as `*.example.com` matches `host.example.com`. Set `false` to accept any certificate, e.g. a self-signed test server.
-- `cacerts` - Trust anchors for client chain validation, as a list of DER-encoded certificates (default: the operating system trust store)
+- `cacerts` - Trust anchors for chain validation, as a list of DER-encoded certificates. On a client, for the server's chain (default: the operating system trust store). On a server that asks for client certificates, for the client's chain: required there, with `cacertfile` as the alternative, and the start fails with `{error, client_auth_needs_cacerts}` without either
+- `require_client_cert` - On a server: ask the client for a certificate and refuse one that sends none (`certificate_required`), whatever `verify` says (default: `false`). A server with `verify => true` (or `verify_peer`) alone asks for a certificate, validates one if sent, and still accepts a client without one. `quic:peercert/1` returns the client's DER leaf once validated
 - `cacertfile` - Path to a PEM file holding those anchors, read once when the connection or server starts. Ignored when `cacerts` is given; an unreadable file, or one with no certificate in it, fails the call
 - `preferred_ipv4` - Server preferred IPv4 address
 - `preferred_ipv6` - Server preferred IPv6 address

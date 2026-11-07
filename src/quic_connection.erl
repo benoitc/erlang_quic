@@ -753,7 +753,9 @@ init({server, Opts}) ->
             send_socket = undefined,
             local_addr = LocalAddr,
             conn_ref = ConnRef,
-            verify = maps:get(verify, Opts, false),
+            %% Set when a CertificateRequest is sent: on `verify' or
+            %% `require_client_cert' (quic_cert:requests_client_cert/1).
+            verify = quic_cert:requests_client_cert(Opts),
             cacerts = maps:get(cacerts, Opts, undefined),
             require_client_cert = maps:get(require_client_cert, Opts, false),
             %% TLS 1.3 external PSK config (RFC 8446 §4.2.11). Either or
@@ -2989,13 +2991,12 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         <<EncExtMsg/binary, CertReqMsg/binary, CertMsg/binary, CertVerifyMsg/binary,
             FinishedMsg/binary>>,
 
-    %% Determine next TLS state based on verify option
-    %% If verify=true, we expect Certificate from client next
-    %% If verify=false, we expect Finished from client next
+    %% The client sends a Certificate next only if we asked for one; a
+    %% resumed (PSK) handshake asks for none (RFC 8446 Section 4.6).
     NextTlsState =
-        case Verify of
-            true -> ?TLS_AWAITING_CLIENT_CERT;
-            false -> ?TLS_AWAITING_CLIENT_FINISHED
+        case CertReqMsg of
+            <<>> -> ?TLS_AWAITING_CLIENT_FINISHED;
+            _ -> ?TLS_AWAITING_CLIENT_CERT
         end,
 
     %% Update state with transcript and app keys

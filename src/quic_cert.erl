@@ -14,6 +14,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -export([validate_server/4, validate_client/3, cacerts_from_file/1, resolve_cacerts/1]).
+-export([requests_client_cert/1, check_client_auth/1]).
 
 -define(MAX_PATH_LENGTH, 10).
 
@@ -54,6 +55,34 @@ validate_client(undefined, _Intermediates, _CaCerts) ->
     {error, no_certificate};
 validate_client(Leaf, Intermediates, CaCerts) when is_binary(Leaf) ->
     verify_chain(Leaf, Intermediates, trust_anchors(CaCerts)).
+
+%% @doc Whether a server with these options asks the client for a
+%% certificate: `verify' (`true' or `verify_peer') asks and accepts a
+%% client without one; `require_client_cert' asks and refuses one
+%% without.
+-spec requests_client_cert(map()) -> boolean().
+requests_client_cert(Opts) ->
+    case {maps:get(verify, Opts, false), maps:get(require_client_cert, Opts, false)} of
+        {_, true} -> true;
+        {Verify, _} -> lists:member(Verify, [true, verify_peer])
+    end.
+
+%% @doc Check, where a server starts, that a listener asking for client
+%% certificates has trust anchors to check them against. Without
+%% `cacerts' or `cacertfile' every client certificate would be checked
+%% against the OS store, so any publicly issued one would authenticate.
+-spec check_client_auth(map()) -> ok | {error, term()}.
+check_client_auth(Opts) ->
+    Anchors =
+        case maps:get(cacerts, Opts, undefined) of
+            [_ | _] -> true;
+            _ -> maps:get(cacertfile, Opts, undefined) =/= undefined
+        end,
+    case {maps:get(require_client_cert, Opts, false), requests_client_cert(Opts), Anchors} of
+        {Require, _, _} when not is_boolean(Require) -> {error, {bad_option, require_client_cert}};
+        {_, true, false} -> {error, client_auth_needs_cacerts};
+        _ -> ok
+    end.
 
 %% @doc Turn a `cacertfile' option into the DER `cacerts' the rest of the
 %% library takes.

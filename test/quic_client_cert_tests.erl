@@ -237,7 +237,7 @@ verify_certificate_verify_wrong_role_test() ->
 server_verify_client_no_cert_test() ->
     ensure_started(),
     case generate_certs() of
-        {ok, TmpDir, ServerCert, ServerKey, _ClientCert, _ClientKey} ->
+        {ok, TmpDir, ServerCert, ServerKey, ClientCert, _ClientKey} ->
             ServerName = list_to_atom(
                 "verify_nocert_" ++ integer_to_list(erlang:unique_integer([positive]))
             ),
@@ -246,7 +246,8 @@ server_verify_client_no_cert_test() ->
                     cert => ServerCert,
                     key => ServerKey,
                     alpn => [<<"h3">>],
-                    verify => true
+                    verify => true,
+                    cacerts => [ClientCert]
                 }),
                 {ok, Port} = quic:get_server_port(ServerName),
                 {ok, Conn} = quic:connect(
@@ -269,7 +270,7 @@ server_verify_client_no_cert_test() ->
 server_require_client_cert_no_cert_test() ->
     ensure_started(),
     case generate_certs() of
-        {ok, TmpDir, ServerCert, ServerKey, _ClientCert, _ClientKey} ->
+        {ok, TmpDir, ServerCert, ServerKey, ClientCert, _ClientKey} ->
             ServerName = list_to_atom(
                 "require_nocert_" ++ integer_to_list(erlang:unique_integer([positive]))
             ),
@@ -279,7 +280,8 @@ server_require_client_cert_no_cert_test() ->
                     key => ServerKey,
                     alpn => [<<"h3">>],
                     verify => true,
-                    require_client_cert => true
+                    require_client_cert => true,
+                    cacerts => [ClientCert]
                 }),
                 {ok, Port} = quic:get_server_port(ServerName),
                 {ok, Conn} = quic:connect(
@@ -514,7 +516,8 @@ mutual_tls_data_exchange_test() ->
                     cert => ServerCert,
                     key => ServerKey,
                     alpn => [<<"h3">>],
-                    verify => true
+                    verify => true,
+                    cacerts => [ClientCert]
                 }),
                 {ok, Port} = quic:get_server_port(ServerName),
 
@@ -548,4 +551,137 @@ mutual_tls_data_exchange_test() ->
             end;
         {error, cert_generation_failed} ->
             {skip, "OpenSSL not available"}
+    end.
+
+%%====================================================================
+%% require_client_cert without verify
+%%====================================================================
+
+%% `require_client_cert' asks for a certificate on its own; it used to
+%% be read only when one arrived, which it never did without `verify'.
+require_client_cert_alone_takes_a_trusted_cert_test() ->
+    with_require_server(#{}, fun(Port, Certs) ->
+        #{client_cert := ClientCert, client_key := ClientKey} = Certs,
+        {ok, Conn} = client(Port, #{cert => ClientCert, key => ClientKey}),
+        expect_connected_and_stable(Conn),
+        ?assertEqual({ok, ClientCert}, quic:peercert(server_conn())),
+        quic:close(Conn, normal)
+    end).
+
+require_client_cert_alone_refuses_no_cert_test() ->
+    with_require_server(#{}, fun(Port, _Certs) ->
+        {ok, Conn} = client(Port, #{}),
+        ?assertMatch({peer_closed, transport, _, _, _}, wait_for_rejection(Conn))
+    end).
+
+require_client_cert_alone_refuses_another_ca_test() ->
+    with_require_server(#{}, fun(Port, Certs) ->
+        %% The server's own self-signed certificate is not a trust anchor.
+        #{server_cert := Other, server_key := OtherKey} = Certs,
+        {ok, Conn} = client(Port, #{cert => Other, key => OtherKey}),
+        ?assertMatch({peer_closed, transport, _, _, _}, wait_for_rejection(Conn))
+    end).
+
+%% `verify => verify_peer' on a listener asks for a certificate, as
+%% `verify => true' does.
+verify_peer_on_a_listener_asks_for_a_cert_test() ->
+    with_server(#{verify => verify_peer}, fun(Port, Certs) ->
+        #{client_cert := ClientCert, client_key := ClientKey} = Certs,
+        {ok, Conn} = client(Port, #{cert => ClientCert, key => ClientKey}),
+        expect_connected_and_stable(Conn),
+        ?assertEqual({ok, ClientCert}, quic:peercert(server_conn())),
+        quic:close(Conn, normal)
+    end).
+
+%% A listener that asks for client certificates needs anchors to check
+%% them against, or it fails to start.
+client_auth_without_cacerts_fails_at_start_test() ->
+    ensure_started(),
+    {Cert, Key} = quic_test_echo_server:cert_and_key(),
+    Base = #{cert => Cert, key => Key, alpn => [<<"h3">>]},
+    [
+        ?assertEqual(
+            {error, client_auth_needs_cacerts},
+            quic:start_server(no_cacerts_server, 0, maps:merge(Base, Extra))
+        )
+     || Extra <- [#{require_client_cert => true}, #{verify => true}, #{verify => verify_peer}]
+    ],
+    ?assertEqual(
+        {error, {bad_option, require_client_cert}},
+        quic:start_server(no_cacerts_server, 0, Base#{require_client_cert => yes, cacerts => [Cert]})
+    ).
+
+%% A resumed connection skips the certificate exchange: with a ticket
+%% from an authenticated connection, a client without a certificate
+%% comes up, where a full handshake without one is refused.
+resumption_skips_the_cert_exchange_test() ->
+    with_require_server(#{}, fun(Port, Certs) ->
+        #{client_cert := ClientCert, client_key := ClientKey} = Certs,
+        {ok, First} = client(Port, #{cert => ClientCert, key => ClientKey}),
+        Ticket =
+            receive
+                {quic, First, {session_ticket, T}} -> T
+            after 5000 -> ct:fail(no_session_ticket)
+            end,
+        quic:close(First, normal),
+        {ok, Resumed} = client(Port, #{session_ticket => Ticket}),
+        expect_connected_and_stable(Resumed),
+        quic:close(Resumed, normal)
+    end).
+
+with_require_server(Extra, Fun) ->
+    with_server(Extra#{require_client_cert => true}, Fun).
+
+%% A listener trusting the client certificate, handing each accepted
+%% connection to the test process.
+with_server(Extra, Fun) ->
+    ensure_started(),
+    flush_server_conns(),
+    case generate_certs() of
+        {ok, TmpDir, ServerCert, ServerKey, ClientCert, ClientKey} ->
+            Name = list_to_atom("mtls_" ++ integer_to_list(erlang:unique_integer([positive]))),
+            Test = self(),
+            try
+                {ok, _} = quic:start_server(Name, 0, Extra#{
+                    cert => ServerCert,
+                    key => ServerKey,
+                    alpn => [<<"h3">>],
+                    cacerts => [ClientCert],
+                    connection_handler => fun(Conn) ->
+                        Test ! {server_conn, Conn},
+                        {ok, Test}
+                    end
+                }),
+                {ok, Port} = quic:get_server_port(Name),
+                Fun(Port, #{
+                    server_cert => ServerCert,
+                    server_key => ServerKey,
+                    client_cert => ClientCert,
+                    client_key => ClientKey
+                })
+            after
+                cleanup_server_only(TmpDir, Name)
+            end;
+        {error, cert_generation_failed} ->
+            {skip, "OpenSSL not available"}
+    end.
+
+client(Port, Extra) ->
+    quic:connect(
+        "127.0.0.1",
+        Port,
+        Extra#{alpn => [<<"h3">>], verify => false, server_name => <<"server">>},
+        self()
+    ).
+
+flush_server_conns() ->
+    receive
+        {server_conn, _} -> flush_server_conns()
+    after 0 -> ok
+    end.
+
+server_conn() ->
+    receive
+        {server_conn, Conn} -> Conn
+    after 5000 -> ct:fail(no_server_conn)
     end.
