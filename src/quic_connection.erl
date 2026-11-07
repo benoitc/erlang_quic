@@ -5067,8 +5067,35 @@ handle_packet_loop(Data, State) ->
                 },
                 ?QUIC_LOG_META
             ),
-            handle_packet_loop(next_coalesced_packet(Data), State)
+            case count_auth_failure(Reason, State) of
+                {limit_reached, State1} ->
+                    maybe_reenable_socket(State1),
+                    State1;
+                {ok, State1} ->
+                    handle_packet_loop(next_coalesced_packet(Data), State1)
+            end
     end.
+
+%% RFC 9001 Section 6.6: past the AEAD's integrity limit the connection
+%% closes with AEAD_LIMIT_REACHED and processes no more packets.
+count_auth_failure(decryption_failed, #state{auth_failures = N} = State) ->
+    State1 = State#state{auth_failures = N + 1},
+    case N + 1 > integrity_limit(State) of
+        true ->
+            {limit_reached,
+                close_with_error(
+                    app, transport, ?QUIC_AEAD_LIMIT_REACHED, 0, <<"integrity limit">>, State1
+                )};
+        false ->
+            {ok, State1}
+    end;
+count_auth_failure(_Reason, State) ->
+    {ok, State}.
+
+integrity_limit(#state{app_keys = {#crypto_keys{cipher = chacha20_poly1305}, _}}) ->
+    1 bsl 36;
+integrity_limit(_State) ->
+    1 bsl 52.
 
 %% Least time the last probe before a disconnect gets to be acknowledged.
 -define(DISCONNECT_GRACE_MS, 1000).
