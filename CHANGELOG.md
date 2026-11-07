@@ -19,6 +19,13 @@ All notable changes to this project will be documented in this file.
   to an address that had sent only a packet. The second address is now
   validated like the first, and until it is the server sends it at most
   three times what it received from it.
+- Out-of-order stream data was bounded in bytes only (RFC 9000 §21.7). A
+  peer sending one byte in every other position held a reassembly entry
+  of about 64 bytes per byte sent, so a connection could pin hundreds of
+  megabytes while its 32 MiB receive buffer cap counted a few, and a
+  small fragment kept the whole packet it arrived in. Each buffered
+  fragment now counts its entry against the cap, and a fragment much
+  smaller than its packet is copied out of it.
 
 ## [2.6.1] - 2026-11-08
 

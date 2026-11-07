@@ -96,9 +96,17 @@ keep_longest_chunk(Off, Data, Buffer) ->
         {value, Existing} when byte_size(Existing) >= byte_size(Data) ->
             {Buffer, 0};
         {value, Existing} ->
-            {gb_trees:enter(Off, Data, Buffer), byte_size(Data) - byte_size(Existing)};
+            {gb_trees:enter(Off, unshare(Data), Buffer), byte_size(Data) - byte_size(Existing)};
         none ->
-            {gb_trees:enter(Off, Data, Buffer), byte_size(Data)}
+            {gb_trees:enter(Off, unshare(Data), Buffer), byte_size(Data)}
+    end.
+
+%% A chunk much smaller than the packet it was decoded from would keep
+%% the whole packet alive while it waits.
+unshare(Data) ->
+    case binary:referenced_byte_size(Data) > 2 * byte_size(Data) of
+        true -> binary:copy(Data);
+        false -> Data
     end.
 
 %% @doc Total bytes held in a CRYPTO reassembly buffer.

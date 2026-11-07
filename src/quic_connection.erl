@@ -219,6 +219,9 @@
 
 %% Max receive buffer size in bytes (32 MB total across all streams) - protects against malicious peers
 -define(MAX_RECV_BUFFER_BYTES, 33554432).
+%% What a reassembly entry costs on top of its data, charged against the
+%% cap (RFC 9000 §21.7): a gb_trees node and its binary.
+-define(REASSEMBLY_ENTRY_BYTES, 64).
 
 %% Per-level cap on out-of-order CRYPTO reassembly (RFC 9000 §7.5). A
 %% legitimate handshake flight is a few KB; bound buffered bytes and the
@@ -8411,7 +8414,7 @@ process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
     BufferOverflow =
         case IsDuplicate of
             true -> false;
-            false -> RecvBufferBytes + DataSize > ?MAX_RECV_BUFFER_BYTES
+            false -> RecvBufferBytes + DataSize + ?REASSEMBLY_ENTRY_BYTES > ?MAX_RECV_BUFFER_BYTES
         end,
 
     case {EndOffset > RecvMaxData, DataReceived + NewBytes > MaxDataLocal, BufferOverflow} of
@@ -8514,8 +8517,10 @@ process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                                     not Stream#stream_state.recv_fin andalso
                                         FinalSize =/= undefined andalso
                                         ExtractedOffset >= FinalSize,
+                                EntryDelta =
+                                    gb_trees:size(ExtractedBuffer) - gb_trees:size(RecvBuffer),
                                 {ExtractedData, ExtractedOffset, ExtractedBuffer, ExtractedFin,
-                                    Added - Removed}
+                                    Added - Removed + EntryDelta * ?REASSEMBLY_ENTRY_BYTES}
                         end,
 
                     %% Deliver contiguous data to owner
