@@ -9697,6 +9697,8 @@ drop_duplicate(Other, _PNSpace) ->
 
 received_before(PN, #pn_space{largest_recv = L}) when L =:= undefined; PN > L ->
     false;
+received_before(PN, #pn_space{recv_floor = Floor}) when PN < Floor ->
+    true;
 received_before(PN, #pn_space{ack_ranges = Ranges}) ->
     lists:any(fun({Start, End}) -> PN >= Start andalso PN =< End end, Ranges).
 

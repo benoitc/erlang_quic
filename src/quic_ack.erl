@@ -45,7 +45,7 @@
     %% Range accumulation
     add_to_ranges/2,
     merge_ranges/1,
-    cap_ack_ranges/1,
+    cap_ack_ranges/2,
     update_pn_space_recv/3,
 
     %% Frame construction
@@ -362,18 +362,22 @@ merge_ranges(Ranges) ->
 
 %% @doc Drop the lowest ranges beyond ?MAX_ACK_RANGE_COUNT.
 %%
-%% The list is descending, so the newest packet numbers are kept. Packets
-%% below the lowest retained range are retransmitted by the peer and
-%% dropped as duplicates.
--spec cap_ack_ranges([{non_neg_integer(), non_neg_integer()}]) ->
-    [{non_neg_integer(), non_neg_integer()}].
-cap_ack_ranges([_, _ | Tail] = Ranges) when Tail =/= [] ->
+%% The list is descending, so the newest packet numbers are kept. The
+%% returned floor is the start of the lowest retained range: packets
+%% below it are dropped as duplicates (RFC 9000 Section 13.2.3).
+-spec cap_ack_ranges([{non_neg_integer(), non_neg_integer()}], non_neg_integer()) ->
+    {[{non_neg_integer(), non_neg_integer()}], non_neg_integer()}.
+cap_ack_ranges([_, _ | Tail] = Ranges, Floor) when Tail =/= [] ->
     case length(Ranges) > ?MAX_ACK_RANGE_COUNT of
-        true -> lists:sublist(Ranges, ?MAX_ACK_RANGE_COUNT);
-        false -> Ranges
+        true ->
+            Kept = lists:sublist(Ranges, ?MAX_ACK_RANGE_COUNT),
+            {Lowest, _} = lists:last(Kept),
+            {Kept, Lowest};
+        false ->
+            {Ranges, Floor}
     end;
-cap_ack_ranges(Ranges) ->
-    Ranges.
+cap_ack_ranges(Ranges, Floor) ->
+    {Ranges, Floor}.
 
 %% @doc Record a received packet number in a packet-number space.
 %%
@@ -381,17 +385,17 @@ cap_ack_ranges(Ranges) ->
 %% place, so the range count cannot grow and the cap scan is skipped.
 -spec update_pn_space_recv(non_neg_integer(), #pn_space{}, non_neg_integer()) -> #pn_space{}.
 update_pn_space_recv(PN, PNSpace, Now) ->
-    #pn_space{largest_recv = LargestRecv, ack_ranges = Ranges} = PNSpace,
+    #pn_space{largest_recv = LargestRecv, ack_ranges = Ranges, recv_floor = Floor} = PNSpace,
     NewLargest =
         case LargestRecv of
             undefined -> PN;
             L when PN > L -> PN;
             L -> L
         end,
-    NewRanges =
+    {NewRanges, NewFloor} =
         case LargestRecv =/= undefined andalso PN =:= LargestRecv + 1 of
-            true -> add_to_ranges(PN, Ranges);
-            false -> cap_ack_ranges(add_to_ranges(PN, Ranges))
+            true -> {add_to_ranges(PN, Ranges), Floor};
+            false -> cap_ack_ranges(add_to_ranges(PN, Ranges), Floor)
         end,
     RecvTime =
         case NewLargest of
@@ -401,7 +405,8 @@ update_pn_space_recv(PN, PNSpace, Now) ->
     PNSpace#pn_space{
         largest_recv = NewLargest,
         recv_time = RecvTime,
-        ack_ranges = NewRanges
+        ack_ranges = NewRanges,
+        recv_floor = NewFloor
     }.
 
 %%====================================================================
