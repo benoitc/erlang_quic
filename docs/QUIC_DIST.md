@@ -475,7 +475,7 @@ The input handler:
 | `cacert_file` | string | - | Path to CA certificate (for verify_peer) |
 | `cert` | binary | - | DER-encoded certificate (alternative to file) |
 | `key` | term | - | Private key term (alternative to file) |
-| `verify` | atom | `verify_none` | `verify_none` or `verify_peer` |
+| `verify` | atom | `verify_none` | `verify_peer`: each node presents its certificate and checks the other's against `cacert_file` and the host part of its node name. `verify_none`: no certificate check |
 
 ### Discovery Settings
 
@@ -647,7 +647,7 @@ logger:set_module_level(quic_dist_controller, debug).
 
 ## Security Considerations
 
-1. **Use verify_peer in production**: Always verify peer certificates in production
+1. **Use verify_peer in production**: With `verify_none` only the distribution cookie authenticates a node, and the cookie exchange is not bound to the QUIC connection, so anyone on the path can relay it. Each node's certificate must name the host in its node name (an IP address in its subjectAltName for `name@10.0.0.1`).
 2. **Certificate management**: Use short-lived certificates with auto-renewal
 3. **Distribution cookie**: The Erlang distribution cookie is still used for application-level authentication
 4. **ALPN**: Connections use `erlang-dist` ALPN to prevent protocol confusion

@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [2.2.0] - 2026-11-07
 
+### Security
+- QUIC distribution now checks certificates when configured with
+  `{verify, verify_peer}`. The `verify` and `cacert_file` options were
+  read and never used: a node did not check the certificate of the node it
+  dialed, and the listener asked for none. Anyone on the network path
+  could stand between two nodes, relay the cookie exchange and then read
+  and inject distribution traffic, including remote calls. With
+  `verify_peer`, both nodes now present a certificate and check the
+  other's against `cacert_file` and the host in its node name. The
+  `-quic_dist_verify` command line flag is read as well.
+  (GHSA-h2qx-fxx7-7r6j, CWE-295). Reported by Johan Bevemyr.
+
 ### Fixed
 - A client given `versions` now offers them, so the server can move the
   connection to QUIC v2. Only the server announced its versions, so a
