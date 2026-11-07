@@ -11,6 +11,11 @@ All notable changes to this project will be documented in this file.
   past the final size the reset had announced. Peers that still held the
   stream closed the connection with FINAL_SIZE_ERROR. Such a write now
   returns `{error, stream_closed}`, as one after the FIN does.
+- Resetting a stream a second time sent a second RESET_STREAM with the
+  new error code and a larger final size, counting data the first reset
+  had dropped unsent, and the peer closed the connection with
+  FINAL_SIZE_ERROR. A reset of a stream whose sending side is already
+  done is now a no-op.
 
 ## [2.6.1] - 2026-11-08
 
