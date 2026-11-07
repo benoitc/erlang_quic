@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.4.1] - 2026-11-08
 
 ### Security
 - A listener started with `require_client_cert => true` never asked
