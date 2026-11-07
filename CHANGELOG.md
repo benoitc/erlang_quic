@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- An idle timeout after the handshake sent a CONNECTION_CLOSE to a peer
+  that had most likely discarded the connection already. The connection
+  now closes silently, as it already did during the handshake.
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed
