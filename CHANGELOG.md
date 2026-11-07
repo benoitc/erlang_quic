@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A connection whose handshake lost a few packets could start with its
+  congestion window collapsed to two packets. Losses of the first flight
+  and of its probes, all sent before any RTT sample, were taken for
+  persistent congestion. Only packets sent after the first RTT sample
+  now count towards it (RFC 9002 Section 7.6.2).
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed

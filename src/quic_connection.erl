@@ -9307,7 +9307,10 @@ check_persistent_congestion([], _LossState, CCState) ->
     CCState;
 check_persistent_congestion(LostPackets, LossState, CCState) ->
     %% Extract packet number and time sent from lost packets
-    LostInfo = [{P#sent_packet.pn, P#sent_packet.time_sent} || P <- LostPackets],
+    LostInfo = [
+        {P#sent_packet.pn, P#sent_packet.time_sent}
+     || P <- LostPackets, quic_loss:after_first_rtt_sample(LossState, P)
+    ],
     PTO = quic_loss:persistent_congestion_pto(LossState),
     case quic_cc:detect_persistent_congestion(LostInfo, PTO, CCState) of
         true ->

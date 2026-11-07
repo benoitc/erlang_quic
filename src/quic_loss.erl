@@ -64,6 +64,7 @@
     reset_for_retry/2,
     get_pto_time_and_space/3,
     persistent_congestion_pto/1,
+    after_first_rtt_sample/2,
     on_pto_expired/1,
     keep_pto_backoff/2,
 
@@ -147,6 +148,7 @@
     %% RTT estimation, which belongs to the path rather than to any one
     %% space (RFC 9002 Section 5).
     rtt = quic_rtt:new() :: quic_rtt:state(),
+    first_rtt_sample = undefined :: non_neg_integer() | undefined,
 
     %% Loss detection. loss_time is per space, in #pn_loss{}.
     time_of_last_ack = undefined :: non_neg_integer() | undefined,
@@ -202,6 +204,7 @@ reset_for_new_path(#loss_state{} = S) ->
         end,
     S#loss_state{
         rtt = quic_rtt:reset(S#loss_state.rtt),
+        first_rtt_sample = undefined,
         pto_count = 0,
         initial = clear_loss_time(S#loss_state.initial),
         handshake = clear_loss_time(S#loss_state.handshake),
@@ -541,7 +544,8 @@ maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now) ->
                 true ->
                     LatestRTT = Now - TS,
                     AckDelayMs = ack_delay_to_ms(AckDelay, State),
-                    update_rtt(State, LatestRTT, AckDelayMs);
+                    State1 = update_rtt(State, LatestRTT, AckDelayMs),
+                    first_rtt_sample(State1, Now);
                 false ->
                     State
             end;
@@ -789,6 +793,11 @@ update_rtt(
         end,
     State#loss_state{rtt = quic_rtt:update(RTT, LatestRTT, AckDelay)}.
 
+first_rtt_sample(#loss_state{first_rtt_sample = undefined} = State, Now) ->
+    State#loss_state{first_rtt_sample = Now};
+first_rtt_sample(State, _Now) ->
+    State.
+
 %% RFC 9002 Section 6.1.2: the time threshold uses max(smoothed_rtt,
 %% latest_rtt). With the EWMA alone, an RTT spike that outruns it
 %% mass-declares in-flight packets lost while their acknowledgements are
@@ -860,6 +869,7 @@ reset_for_retry(#loss_state{} = State, _Now) ->
         handshake = #pn_loss{},
         app = #pn_loss{},
         rtt = quic_rtt:reset(State#loss_state.rtt),
+        first_rtt_sample = undefined,
         pto_count = 0,
         bytes_in_flight = 0,
         outstanding_since = undefined,
@@ -936,6 +946,14 @@ persistent_congestion_pto(#loss_state{
     rtt = RTT, max_ack_delay = MaxAckDelay
 }) ->
     quic_rtt:smoothed(RTT) + max(4 * quic_rtt:var(RTT), ?GRANULARITY) + MaxAckDelay.
+
+%% @doc Whether a packet was sent after the first RTT sample, so its loss
+%% can count towards persistent congestion (RFC 9002 Section 7.6.2).
+-spec after_first_rtt_sample(loss_state(), #sent_packet{}) -> boolean().
+after_first_rtt_sample(#loss_state{first_rtt_sample = undefined}, _Packet) ->
+    false;
+after_first_rtt_sample(#loss_state{first_rtt_sample = T}, #sent_packet{time_sent = Sent}) ->
+    Sent > T.
 
 pto(#loss_state{rtt = RTT, pto_count = PTOCount}, MaxAckDelay) ->
     PTO = quic_rtt:smoothed(RTT) + max(4 * quic_rtt:var(RTT), ?GRANULARITY) + MaxAckDelay,
