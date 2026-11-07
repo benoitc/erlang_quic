@@ -12,6 +12,10 @@ All notable changes to this project will be documented in this file.
   select the draft version.
 - `quic_h3:close/2` closes the connection with an HTTP/3 error code, such
   as H3_SETTINGS_ERROR or H3_ID_ERROR, which the peer receives.
+- erlang_quic runs in the QUIC Interop Runner, which tests it against
+  the other QUIC implementations: `make interop`, see interop/README.md.
+  Each release publishes the image the runner needs, so the project can
+  be listed on interop.seemann.io.
 
 ### Changed
 - `wt_enabled` in HTTP/3 settings now means the WebTransport draft-17

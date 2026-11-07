@@ -27,3 +27,7 @@ test/e2e/results/
 # Ignore docs and local config
 doc/
 .claude/
+
+# Built NIF, rebuilt in the image
+c_src/build/
+priv/*.so

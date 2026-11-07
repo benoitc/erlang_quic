@@ -62,3 +62,17 @@ test-docker:
 	rebar3 ct --suite=quic_h3_0rtt_SUITE
 
 test-all: test-local test-docker test-static
+
+##
+## QUIC Interop Runner, see interop/README.md.
+## `make interop` runs erlang_quic against itself; pass the runner's
+## options in INTEROP, e.g. INTEROP="-c quic-go -t extended".
+##
+
+.PHONY: interop-image interop
+
+interop-image:
+	docker build -t erlang-quic-interop -f interop/Dockerfile .
+
+interop: interop-image
+	interop/run.sh $(INTEROP)
