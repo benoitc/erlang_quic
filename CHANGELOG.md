@@ -47,6 +47,12 @@ All notable changes to this project will be documented in this file.
   address sends a small path check there. The answer did not fit in what
   the server may send to an address it has not yet confirmed, and the
   connection went down instead of waiting for more data from the client.
+- HTTP/3 header fields a peer sent by reference to a static table entry
+  with no value, such as an empty `cookie`, came out with no value at all
+  and brought the connection down. They now decode as empty fields.
+- The QPACK static table had entry 2 as `:age` instead of `age`, so an
+  `age: 0` header sent by reference was taken for an unknown pseudo-header
+  and the message refused.
 
 ## [2.2.1] - 2026-11-07
 

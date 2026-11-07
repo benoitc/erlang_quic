@@ -735,3 +735,8 @@ field_section_limit_stops_decoding_test() ->
 indexed_static_entry_without_value_test() ->
     ?assertEqual({ok, [{<<"cookie">>, <<>>}]}, quic_qpack:decode(<<0, 0, 16#C5>>)),
     ?assertEqual({ok, [{<<":authority">>, <<>>}]}, quic_qpack:decode(<<0, 0, 16#C0>>)).
+
+%% RFC 9204 Appendix A: static entry 2 is "age: 0".
+static_entry_two_is_age_test() ->
+    ?assertEqual({ok, [{<<"age">>, <<"0">>}]}, quic_qpack:decode(<<0, 0, 16#C2>>)),
+    ?assertEqual(<<0, 0, 16#C2>>, quic_qpack:encode([{<<"age">>, <<"0">>}])).

@@ -22,7 +22,7 @@
     %% 0-14
     {<<":authority">>, undefined},
     {<<":path">>, <<"/">>},
-    {<<":age">>, <<"0">>},
+    {<<"age">>, <<"0">>},
     {<<"content-disposition">>, undefined},
     {<<"content-length">>, <<"0">>},
     {<<"cookie">>, undefined},
@@ -131,7 +131,7 @@
 %% Maps {Name, Value} -> Index
 -define(STATIC_FIELD_MAP, #{
     {<<":path">>, <<"/">>} => 1,
-    {<<":age">>, <<"0">>} => 2,
+    {<<"age">>, <<"0">>} => 2,
     {<<"content-length">>, <<"0">>} => 4,
     {<<":method">>, <<"CONNECT">>} => 15,
     {<<":method">>, <<"DELETE">>} => 16,
@@ -216,7 +216,7 @@
 -define(STATIC_NAME_MAP, #{
     <<":authority">> => 0,
     <<":path">> => 1,
-    <<":age">> => 2,
+    <<"age">> => 2,
     <<"content-disposition">> => 3,
     <<"content-length">> => 4,
     <<"cookie">> => 5,
