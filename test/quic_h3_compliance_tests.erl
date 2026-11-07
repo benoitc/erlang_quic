@@ -3443,3 +3443,20 @@ wt_stream_first_bytes_of_peer_stream_allowed_test() ->
     ?assertMatch(
         {ok, _}, quic_h3_connection:handle_stream_data(0, <<16#40, 16#41, 0>>, false, State)
     ).
+
+%%====================================================================
+%% Field section limit while decoding (RFC 9114 §4.2.2)
+%%====================================================================
+
+%% 100 static ":path /" fields: 3800 bytes by the RFC's count.
+big_field_section() ->
+    Lines = binary:copy(<<16#C1>>, 100),
+    <<0, 0, Lines/binary>>.
+
+oversized_request_headers_close_the_connection_test() ->
+    State = make_test_state(#{role => server, local_max_field_section_size => 1024}),
+    Frame = quic_h3_frame:encode({headers, big_field_section()}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_EXCESSIVE_LOAD, _}, _},
+        quic_h3_connection:handle_stream_data(0, Frame, false, State)
+    ).

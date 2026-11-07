@@ -706,3 +706,27 @@ many_literal_field_lines_decode_in_linear_time_test() ->
     {Us, {ok, Headers}} = timer:tc(fun() -> quic_qpack:decode(<<0, 0, Lines/binary>>) end),
     ?assertEqual(64000, length(Headers)),
     ?assert(Us < 500000).
+
+%% decode/3 enforces the field section size limit (name + value + 32 per
+%% field) while decoding.
+field_section_limit_test() ->
+    Lines = binary:copy(<<16#C1>>, 100),
+    Block = <<0, 0, Lines/binary>>,
+    %% Each static ":path /" field counts 5 + 1 + 32 = 38 bytes.
+    State = quic_qpack:new(),
+    ?assertMatch({{ok, [_ | _]}, _}, quic_qpack:decode(Block, State, 3800)),
+    ?assertEqual(
+        {{error, field_section_too_large}, State}, quic_qpack:decode(Block, State, 3799)
+    ).
+
+%% Decoding stops at the field that crosses the limit: an invalid line
+%% after it is never reached.
+field_section_limit_stops_decoding_test() ->
+    Lines = binary:copy(<<16#C1>>, 100),
+    Block = <<0, 0, Lines/binary, 16#80>>,
+    ?assertMatch(
+        {{error, {invalid_dynamic_index, _}}, _}, quic_qpack:decode(Block, quic_qpack:new())
+    ),
+    ?assertMatch(
+        {{error, field_section_too_large}, _}, quic_qpack:decode(Block, quic_qpack:new(), 1000)
+    ).

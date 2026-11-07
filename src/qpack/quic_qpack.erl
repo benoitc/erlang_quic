@@ -40,7 +40,8 @@
     new/1,
     encode/2,
     encode/3,
-    decode/2
+    decode/2,
+    decode/3
 ]).
 
 %% Dynamic table management
@@ -210,6 +211,14 @@ encode(Headers, StreamId, State) ->
 -spec decode(binary(), state()) ->
     {{ok, headers()} | {blocked, non_neg_integer()} | {error, term()}, state()}.
 decode(Data, State) ->
+    decode(Data, State, infinity).
+
+%% @doc Decode with a field section size limit (RFC 9114 §4.2.2: name,
+%% value and 32 bytes per field). Decoding stops at the first field that
+%% crosses it, with `{error, field_section_too_large}'.
+-spec decode(binary(), state(), non_neg_integer() | infinity) ->
+    {{ok, headers()} | {blocked, non_neg_integer()} | {error, term()}, state()}.
+decode(Data, State, MaxSize) ->
     try
         {{RIC, Base}, Rest} = decode_prefix(Data, State),
         %% Check if we have all required dynamic table entries
@@ -218,7 +227,7 @@ decode(Data, State) ->
                 %% Blocked: need more encoder stream instructions
                 {{blocked, RIC}, State};
             false ->
-                {Headers, NewState} = decode_headers(Rest, RIC, Base, State, []),
+                {Headers, NewState} = decode_headers(Rest, RIC, Base, State, [], budget(MaxSize)),
                 {{ok, Headers}, NewState}
         end
     catch
@@ -847,28 +856,44 @@ decode_prefix(Data, State) ->
             {{RIC, Base}, Rest2}
     end.
 
+%% What is left of the field section size limit, as an integer so the
+%% decoding loop carries no extra allocation.
+budget(infinity) -> (1 bsl 59) - 1;
+budget(Max) -> Max.
+
+%% The budget left once Field is counted: name, value and 32 bytes.
+left({Name, Value}, Left) ->
+    case Left - byte_size(Name) - byte_size(Value) - 32 of
+        Left1 when Left1 >= 0 -> Left1;
+        _ -> throw(field_section_too_large)
+    end.
+
 %% Decode headers with Required Insert Count (RIC) and Base from prefix
--spec decode_headers(binary(), non_neg_integer(), non_neg_integer(), state(), headers()) ->
+-spec decode_headers(
+    binary(), non_neg_integer(), non_neg_integer(), state(), headers(), integer()
+) ->
     {headers(), state()}.
-decode_headers(<<>>, _RIC, _Base, State, Acc) ->
+decode_headers(<<>>, _RIC, _Base, State, Acc, _Left) ->
     {lists:reverse(Acc), State};
-decode_headers(<<2#11:2, _:6, _/binary>> = Data, RIC, Base, State, Acc) ->
+decode_headers(<<2#11:2, _:6, _/binary>> = Data, RIC, Base, State, Acc, Left) ->
     %% Indexed Field Line (static) - 11xxxxxx
     {Index, Rest} = decode_prefixed_int(Data, 6),
     Header = get_static_entry(Index),
-    decode_headers(Rest, RIC, Base, State, [Header | Acc]);
-decode_headers(<<2#10:2, _:6, _/binary>> = Data, RIC, Base, State, Acc) ->
+    decode_headers(Rest, RIC, Base, State, [Header | Acc], left(Header, Left));
+decode_headers(<<2#10:2, _:6, _/binary>> = Data, RIC, Base, State, Acc, Left) ->
     %% Indexed Field Line (dynamic, pre-base) - 10xxxxxx
     {RelIndex, Rest} = decode_prefixed_int(Data, 6),
     %% Convert relative index to absolute using Base
     AbsIndex = Base - RelIndex - 1,
     case get_dynamic_entry_by_absolute(AbsIndex, State) of
         {Name, Value} ->
-            decode_headers(Rest, RIC, Base, State, [{Name, Value} | Acc]);
+            decode_headers(
+                Rest, RIC, Base, State, [{Name, Value} | Acc], left({Name, Value}, Left)
+            );
         undefined ->
             throw({invalid_dynamic_index, AbsIndex})
     end;
-decode_headers(<<2#01:2, _N:1, T:1, _:4, _/binary>> = Data, RIC, Base, State, Acc) ->
+decode_headers(<<2#01:2, _N:1, T:1, _:4, _/binary>> = Data, RIC, Base, State, Acc, Left) ->
     %% Literal Field Line with Name Reference - 01NTxxxx
     <<FirstByte, Rest0/binary>> = Data,
     IndexBits = FirstByte band 16#0F,
@@ -882,18 +907,22 @@ decode_headers(<<2#01:2, _N:1, T:1, _:4, _/binary>> = Data, RIC, Base, State, Ac
         1 ->
             %% Static table reference
             {Name, _} = get_static_entry(Index),
-            decode_headers(Rest2, RIC, Base, State, [{Name, Value} | Acc]);
+            decode_headers(
+                Rest2, RIC, Base, State, [{Name, Value} | Acc], left({Name, Value}, Left)
+            );
         0 ->
             %% Dynamic table reference (pre-base)
             AbsIndex = Base - Index - 1,
             case get_dynamic_entry_by_absolute(AbsIndex, State) of
                 {Name, _} ->
-                    decode_headers(Rest2, RIC, Base, State, [{Name, Value} | Acc]);
+                    decode_headers(
+                        Rest2, RIC, Base, State, [{Name, Value} | Acc], left({Name, Value}, Left)
+                    );
                 undefined ->
                     throw({invalid_dynamic_index, AbsIndex})
             end
     end;
-decode_headers(<<2#0010:4, H:1, NameLenPrefix:3, Rest0/binary>>, RIC, Base, State, Acc) ->
+decode_headers(<<2#0010:4, H:1, NameLenPrefix:3, Rest0/binary>>, RIC, Base, State, Acc, Left) ->
     %% Literal with literal name - 0010Hxxx
     {NameLen, Rest1} =
         case NameLenPrefix < 7 of
@@ -902,8 +931,8 @@ decode_headers(<<2#0010:4, H:1, NameLenPrefix:3, Rest0/binary>>, RIC, Base, Stat
         end,
     {Name, Rest2} = decode_string_with_huffman(H, NameLen, Rest1),
     {Value, Rest3} = decode_string(Rest2),
-    decode_headers(Rest3, RIC, Base, State, [{Name, Value} | Acc]);
-decode_headers(<<2#0011:4, H:1, NameLenPrefix:3, Rest0/binary>>, RIC, Base, State, Acc) ->
+    decode_headers(Rest3, RIC, Base, State, [{Name, Value} | Acc], left({Name, Value}, Left));
+decode_headers(<<2#0011:4, H:1, NameLenPrefix:3, Rest0/binary>>, RIC, Base, State, Acc, Left) ->
     %% Literal with literal name, N=1 (never indexed) - 0011Hxxx.
     %% RFC 9204 §4.5.6: this representation MUST NOT be added to the
     %% dynamic table by any party. Our decoder never auto-inserts literals,
@@ -916,8 +945,8 @@ decode_headers(<<2#0011:4, H:1, NameLenPrefix:3, Rest0/binary>>, RIC, Base, Stat
         end,
     {Name, Rest2} = decode_string_with_huffman(H, NameLen, Rest1),
     {Value, Rest3} = decode_string(Rest2),
-    decode_headers(Rest3, RIC, Base, State, [{Name, Value} | Acc]);
-decode_headers(<<2#0001:4, _:4, _/binary>> = Data, RIC, Base, State, Acc) ->
+    decode_headers(Rest3, RIC, Base, State, [{Name, Value} | Acc], left({Name, Value}, Left));
+decode_headers(<<2#0001:4, _:4, _/binary>> = Data, RIC, Base, State, Acc, Left) ->
     %% Indexed Header Field with Post-Base Index - 0001xxxx
     <<FirstByte, Rest0/binary>> = Data,
     IndexBits = FirstByte band 16#0F,
@@ -930,11 +959,13 @@ decode_headers(<<2#0001:4, _:4, _/binary>> = Data, RIC, Base, State, Acc) ->
     AbsIndex = Base + PostBaseIndex,
     case get_dynamic_entry_by_absolute(AbsIndex, State) of
         {Name, Value} ->
-            decode_headers(Rest1, RIC, Base, State, [{Name, Value} | Acc]);
+            decode_headers(
+                Rest1, RIC, Base, State, [{Name, Value} | Acc], left({Name, Value}, Left)
+            );
         undefined ->
             throw({invalid_dynamic_index, AbsIndex})
     end;
-decode_headers(<<2#0000:4, _N:1, _:3, _/binary>> = Data, RIC, Base, State, Acc) ->
+decode_headers(<<2#0000:4, _N:1, _:3, _/binary>> = Data, RIC, Base, State, Acc, Left) ->
     %% Literal with post-base name reference - 0000Nxxx
     <<FirstByte, Rest0/binary>> = Data,
     IndexBits = FirstByte band 16#07,
@@ -948,11 +979,13 @@ decode_headers(<<2#0000:4, _N:1, _:3, _/binary>> = Data, RIC, Base, State, Acc) 
     AbsIndex = Base + PostBaseIndex,
     case get_dynamic_entry_by_absolute(AbsIndex, State) of
         {Name, _} ->
-            decode_headers(Rest2, RIC, Base, State, [{Name, Value} | Acc]);
+            decode_headers(
+                Rest2, RIC, Base, State, [{Name, Value} | Acc], left({Name, Value}, Left)
+            );
         undefined ->
             throw({invalid_dynamic_index, AbsIndex})
     end;
-decode_headers(<<Byte, _/binary>>, _RIC, _Base, _State, _Acc) ->
+decode_headers(<<Byte, _/binary>>, _RIC, _Base, _State, _Acc, _Left) ->
     throw({unknown_instruction, Byte}).
 
 -spec decode_prefixed_int(binary(), 1..8) -> {non_neg_integer(), binary()}.
