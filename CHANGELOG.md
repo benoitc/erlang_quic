@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
   Connection ID, and either side took such a Source Connection ID as the
   peer's. Version Negotiation still accepts the longer ids RFC 8999
   allows.
+- A client now discards a Retry whose Source Connection ID is the
+  Destination Connection ID of its own Initial (RFC 9000 Section
+  17.2.5.1). Before, it took the Retry and restarted the handshake.
 
 ## [2.6.1] - 2026-11-08
 
