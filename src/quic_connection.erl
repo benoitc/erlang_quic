@@ -4738,7 +4738,10 @@ server_recv_pass(Packets, RemoteAddr, Via, State) ->
         recv_pass = true
     },
     NewState = handle_packets_batch(Packets, State1),
-    case NewState#state.has_non_probing_frame of
+    %% RFC 9000 Section 9.3: only the highest-numbered non-probing packet
+    %% moves the peer's address, so a pass that raised nothing is a late one.
+    Newest = pass_largest(NewState) =/= pass_largest(State),
+    case NewState#state.has_non_probing_frame andalso Newest of
         true ->
             TotalSize = lists:sum([byte_size(P) || P <- Packets]),
             Mig = NewState#state.mig,
@@ -4752,6 +4755,12 @@ server_recv_pass(Packets, RemoteAddr, Via, State) ->
         false ->
             NewState
     end.
+
+pass_largest(#state{hs = #hs{pn_initial = I, pn_handshake = H}, pn_app = A}) ->
+    {space_largest(I), space_largest(H), space_largest(A)}.
+
+space_largest(#pn_space{largest_recv = Largest}) -> Largest;
+space_largest(_) -> undefined.
 
 %% The destination CID of the pass's first 1-RTT packet, one of ours.
 pass_dcid(Packets, #state{cfg = #conn_cfg{scid = SCID}}) ->
@@ -13842,10 +13851,23 @@ maybe_handle_address_change(RemoteAddr, _Data, #state{remote_addr = RemoteAddr} 
 %% not migrate to a new local address. It does NOT mean ignore peer address changes.
 %% The check for peer_disable_migration is correctly placed in migrate/1 API only.
 maybe_handle_address_change(
+    NewAddr,
+    DataSize,
+    #state{
+        mig = #mig{
+            migration_state = validating_peer,
+            pending_peer_validation = #path_state{remote_addr = NewAddr}
+        }
+    } = State
+) ->
+    update_pending_path_bytes_received(NewAddr, DataSize, State);
+maybe_handle_address_change(
     NewAddr, DataSize, #state{mig = #mig{migration_state = validating_peer}} = State
 ) ->
-    %% Already validating a path - update bytes received for anti-amplification
-    update_pending_path_bytes_received(NewAddr, DataSize, State);
+    %% RFC 9000 Section 9.3.2: a newer packet from another address ends
+    %% the validation under way; from the validated address it was a
+    %% spurious migration, otherwise the peer moved again.
+    maybe_handle_address_change(NewAddr, DataSize, abandon_peer_validation(State));
 maybe_handle_address_change(NewAddr, DataSize, State) ->
     %% New address detected - initiate path validation
     case detect_peer_address_change(NewAddr, State) of
@@ -14154,29 +14176,31 @@ handle_path_validation_timeout(#state{mig = #mig{pending_peer_validation = PathS
             State3 = start_path_validation_timer(State2),
             {keep_state, State3};
         _ ->
-            %% Max retries reached, give up on this path and go back to
-            %% the last validated address (RFC 9000 Section 9.3.2). A CID
-            %% that has appeared on a path is spent: it is retired rather
-            %% than returned to the pool (Section 9.5).
-            Mig = State#state.mig,
-            RemoteAddr =
-                case Mig#mig.validated_addr of
-                    undefined -> State#state.remote_addr;
-                    Validated -> Validated
-                end,
-            State1 = State#state{
-                remote_addr = RemoteAddr,
-                mig = Mig#mig{
-                    pending_peer_validation = undefined,
-                    old_path_validation = undefined,
-                    validated_addr = undefined,
-                    migration_state = idle,
-                    path_validation_timer = undefined,
-                    path_validation_token = undefined
-                }
-            },
-            {keep_state, retire_abandoned_path_cid(PathState, State1)}
+            {keep_state, abandon_peer_validation(State)}
     end.
+
+%% Give up the path being validated and go back to the last validated
+%% address (RFC 9000 Section 9.3.2). A CID that has appeared on a path is
+%% spent: it is retired rather than returned to the pool (Section 9.5).
+abandon_peer_validation(#state{mig = Mig} = State) ->
+    cancel_timer(Mig#mig.path_validation_timer),
+    RemoteAddr =
+        case Mig#mig.validated_addr of
+            undefined -> State#state.remote_addr;
+            Validated -> Validated
+        end,
+    State1 = State#state{
+        remote_addr = RemoteAddr,
+        mig = Mig#mig{
+            pending_peer_validation = undefined,
+            old_path_validation = undefined,
+            validated_addr = undefined,
+            migration_state = idle,
+            path_validation_timer = undefined,
+            path_validation_token = undefined
+        }
+    },
+    retire_abandoned_path_cid(Mig#mig.pending_peer_validation, State1).
 
 %% @doc Handle PATH_RESPONSE frame.
 %% Validates the response against pending challenges.
