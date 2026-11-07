@@ -26,5 +26,9 @@ state(Enabled) ->
     S0 = ?S:with_keys_and_socket(?S:state_for_role(client)),
     S0#state{
         owner = self(),
-        cfg = (S0#state.cfg)#conn_cfg{reset_stream_at_enabled = Enabled}
+        max_data_local = 1000000,
+        cfg = (S0#state.cfg)#conn_cfg{
+            reset_stream_at_enabled = Enabled,
+            fc_max_receive_window = ?DEFAULT_MAX_RECEIVE_WINDOW
+        }
     }.

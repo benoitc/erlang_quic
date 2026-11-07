@@ -20,6 +20,10 @@ All notable changes to this project will be documented in this file.
   we still had open, counted the stream's unreceived bytes against
   connection flow control a second time and reported the reset to the
   owner again. A repeated RESET_STREAM is now ignored.
+- A RESET_STREAM_AT from the peer did not count the stream's final size
+  against connection flow control, so the bytes it abandoned were never
+  accounted for and connection credit fell behind what the peer had
+  used, until the peer could stall waiting for MAX_DATA.
 
 ## [2.6.1] - 2026-11-08
 

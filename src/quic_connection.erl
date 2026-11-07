@@ -6454,14 +6454,20 @@ process_frame(
                                     final_size = FinalSize,
                                     recv_reset_at = ReliableSize,
                                     recv_reset_error = ErrorCode,
-                                    recv_done = Delivered orelse Stream#stream_state.recv_done
+                                    recv_done = Delivered orelse Stream#stream_state.recv_done,
+                                    recv_highest = FinalSize
                                 },
                                 Streams
                             ),
                             %% Notify owner - same message as RESET_STREAM
                             StateFl = flush_pending_delivery(State),
                             notify_stream_reset(StreamId, ErrorCode, FinalSize, State),
-                            maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams})
+                            maybe_reclaim_stream(
+                                StreamId,
+                                account_reset_stream_at(
+                                    Stream, FinalSize, StateFl#state{streams = NewStreams}
+                                )
+                            )
                     end;
                 error ->
                     case is_reclaimed_frame(StreamId, State) of
@@ -6489,7 +6495,8 @@ process_frame(
                                                     final_size = FinalSize,
                                                     recv_reset_at = ReliableSize,
                                                     recv_reset_error = ErrorCode,
-                                                    recv_done = (ReliableSize =:= 0)
+                                                    recv_done = (ReliableSize =:= 0),
+                                                    recv_highest = FinalSize
                                                 },
                                                 Streams
                                             ),
@@ -6498,7 +6505,12 @@ process_frame(
                                                 StreamId, ErrorCode, FinalSize, State
                                             ),
                                             maybe_reclaim_stream(
-                                                StreamId, StateFl#state{streams = NewStreams}
+                                                StreamId,
+                                                account_reset_stream_at(
+                                                    NewStream,
+                                                    FinalSize,
+                                                    StateFl#state{streams = NewStreams}
+                                                )
                                             )
                                     end
                             end
@@ -10232,6 +10244,13 @@ account_reset_stream(#stream_state{recv_buffered = Buffered} = Stream, FinalSize
         data_received =
             State#state.data_received + max(0, FinalSize - highest_received(Stream)),
         recv_buffer_bytes = max(0, State#state.recv_buffer_bytes - Buffered)
+    }).
+
+%% Callers move the stream's recv_highest to FinalSize, so the reliable
+%% bytes still to come are not counted again.
+account_reset_stream_at(Stream, FinalSize, State) ->
+    conn_grant(State#state{
+        data_received = State#state.data_received + FinalSize - highest_received(Stream)
     }).
 
 %% data_received is the sum of these over all streams.
