@@ -380,6 +380,8 @@
     old_path_validation :: #path_state{} | undefined,
     %% The last validated peer address, while sending to an unvalidated one
     validated_addr :: {inet:ip_address(), inet:port_number()} | undefined,
+    %% 1-RTT datagrams held back by the amplification limit, newest first
+    held = [] :: [binary()],
     %% Timer reference for path validation timeout
     path_validation_timer :: reference() | undefined,
     %% Token for correlating path validation timeout messages

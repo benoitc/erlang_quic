@@ -3820,7 +3820,13 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
         Cipher, Key, IV, HP, PN, FirstByte, DCID, PaddedPayload
     ),
     PacketSize = byte_size(Packet),
-    SendResult = do_socket_send(Packet, State),
+    AmpRoom = amp_room(State),
+    Hold = must_hold(PacketSize, AmpRoom, State),
+    SendResult =
+        case Hold of
+            true -> {ok, undefined};
+            false -> do_socket_send(Packet, State)
+        end,
 
     %% Handle send result - only track packet and update state if send succeeded
     case SendResult of
@@ -3903,7 +3909,7 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
                 ack_timer = AckTimer,
                 ack_elicited_count = AckCount
             },
-            after_sealed(KeyLimit, State1);
+            after_sealed(KeyLimit, note_amp_send(Packet, PacketSize, AmpRoom, Hold, State1));
         {error, Reason, ClearedSocketState} ->
             send_app_packet_internal_error(
                 Reason,
@@ -4093,13 +4099,13 @@ pad_for_header_protection(Payload) ->
 
 %% @doc Pad payload for path validation to reach 1200 bytes.
 %% RFC 9000 Section 8.2.1: Path validation packets MUST be padded to at least
-%% 1200 bytes to verify PMTU and prevent amplification attacks.
+%% 1200 bytes, unless the path's amplification limit leaves less room.
 %% PADDING frames (0x00 bytes) are added to the payload BEFORE AEAD protection.
--spec pad_for_path_validation(binary(), binary(), 1..4) -> binary().
-pad_for_path_validation(Payload, DCID, PNLen) ->
+-spec pad_for_path_validation(binary(), binary(), 1..4, non_neg_integer() | infinity) -> binary().
+pad_for_path_validation(Payload, DCID, PNLen, Room) ->
     HeaderSize = 1 + byte_size(DCID) + PNLen,
     AEADTagSize = 16,
-    MinPacketSize = 1200,
+    MinPacketSize = min(1200, Room),
     CurrentSize = HeaderSize + byte_size(Payload) + AEADTagSize,
     case CurrentSize >= MinPacketSize of
         true ->
@@ -4159,11 +4165,12 @@ handle_packet(Data, State) ->
 %% datagram came from before the flights held back by the amplification
 %% limit go out, so they go to where the client is now.
 handle_packet(RemoteAddr, Data, State0) ->
-    State1 = amp_account_recv(Data, State0),
+    Size = byte_size(Data),
+    State1 = account_path_recv(RemoteAddr, undefined, Size, amp_account_recv(Data, State0)),
     coalescing_pass(
         fun(S0) ->
             S1 = handle_packet_loop(Data, S0),
-            drain_pending_hs(follow_handshake_peer(RemoteAddr, S0, S1))
+            drain_pending_hs(follow_handshake_peer(RemoteAddr, Size, S0, S1))
         end,
         State1
     ).
@@ -4319,11 +4326,14 @@ handle_packets_batch(Packets, State) ->
     ).
 
 handle_packets_batch(RemoteAddr, Packets, State0) ->
-    State1 = lists:foldl(fun amp_account_recv/2, State0, Packets),
+    Size = lists:sum([byte_size(P) || P <- Packets]),
+    State1 = account_path_recv(
+        RemoteAddr, undefined, Size, lists:foldl(fun amp_account_recv/2, State0, Packets)
+    ),
     coalescing_pass(
         fun(S0) ->
             S1 = do_handle_packets_batch(Packets, S0),
-            drain_pending_hs(follow_handshake_peer(RemoteAddr, S0, S1))
+            drain_pending_hs(follow_handshake_peer(RemoteAddr, Size, S0, S1))
         end,
         State1
     ).
@@ -4739,13 +4749,13 @@ server_recv_pass(Packets, RemoteAddr, Via, State) ->
         has_non_probing_frame = false,
         recv_pass = true
     },
-    NewState = handle_packets_batch(Packets, State1),
+    TotalSize = lists:sum([byte_size(P) || P <- Packets]),
+    NewState = handle_packets_batch(Packets, account_path_recv(RemoteAddr, Via, TotalSize, State1)),
     %% RFC 9000 Section 9.3: only the highest-numbered non-probing packet
     %% moves the peer's address, so a pass that raised nothing is a late one.
     Newest = pass_largest(NewState) =/= pass_largest(State),
     case NewState#state.has_non_probing_frame andalso Newest of
         true ->
-            TotalSize = lists:sum([byte_size(P) || P <- Packets]),
             Mig = NewState#state.mig,
             PassDCID = pass_dcid(Packets, NewState),
             Changed = maybe_handle_address_change(
@@ -10824,7 +10834,7 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
                 ),
                 Ps
         end,
-    {SS1, TrackedRev} = send_run_packets(Packets, Frames, PN0, State, SocketState, []),
+    {SS1, TrackedRev, AmpState} = send_run(Packets, Frames, PN0, State, SocketState),
     %% One loss-tracker and one CC update for the run's successful sends.
     {Loss1, CC1} =
         case TrackedRev of
@@ -10855,7 +10865,7 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
         ack_eliciting_since_recv = true,
         pto_dirty = true
     },
-    State2 = maybe_force_key_update(State1, K),
+    State2 = maybe_force_key_update(State1#state{mig = AmpState#state.mig}, K),
     send_stream_chunked_loop(
         StreamId, Offset1, Rest, Fin, State2, BytesSentSoFar + K * MaxChunkSize, Ctx
     ).
@@ -10885,6 +10895,31 @@ build_run_payloads(K, Sid, Offset, Data, HeaderPrefix, LengthVarint, MCS, FrAcc,
         [Frame | FrAcc],
         [Payload | PlAcc]
     ).
+
+%% A run to an unvalidated address goes through the amplification limit
+%% one datagram at a time; a held one is tracked as sent.
+send_run(Packets, Frames, PN0, State, SocketState) ->
+    case amp_room(State) of
+        infinity ->
+            {SS, Tracked} = send_run_packets(Packets, Frames, PN0, State, SocketState, []),
+            {SS, Tracked, State};
+        _ ->
+            send_run_limited(Packets, Frames, PN0, State#state{socket_state = SocketState}, [])
+    end.
+
+send_run_limited([], [], _PN, State, Tracked) ->
+    {State#state.socket_state, Tracked, State};
+send_run_limited([Packet | Pkts], [Frame | Frs], PN, State0, Tracked) ->
+    Size = byte_size(Packet),
+    Room = amp_room(State0),
+    Hold = must_hold(Size, Room, State0),
+    State1 =
+        case Hold of
+            true -> State0;
+            false -> send_held(Packet, State0)
+        end,
+    State = note_amp_send(Packet, Size, Room, Hold, State1),
+    send_run_limited(Pkts, Frs, PN + 1, State, [{PN, Size, Frame} | Tracked]).
 
 %% Hand the run's sealed packets to the socket; the socket state is
 %% threaded explicitly so no #state{} copy happens per packet, and the
@@ -13413,8 +13448,8 @@ send_path_challenge(
             %% Get packet number and key phase
             PN = PNSpace#pn_space.next_pn,
             PNLen = quic_packet:pn_length(PN),
-            %% RFC 9000 Section 8.2.1: Pad to 1200 bytes for path validation
-            PaddedPayload = pad_for_path_validation(Payload, DCID, PNLen),
+            Room = path_room({IP, Port}, Via, State),
+            PaddedPayload = pad_for_path_validation(Payload, DCID, PNLen, Room),
             KeyPhase = get_current_key_phase(State),
 
             %% Build first byte for short header
@@ -13427,16 +13462,26 @@ send_path_challenge(
             ),
 
             %% Send to the specific path address (not current remote_addr)
-            case amp_allows(Packet, State) andalso send_packet_via(Via, IP, Port, Packet, State) of
+            PacketSize = byte_size(Packet),
+            case
+                amp_allows(Packet, State) andalso PacketSize =< Room andalso
+                    send_packet_via(Via, IP, Port, Packet, State)
+            of
                 ok ->
                     %% Update path bytes_sent for anti-amplification tracking
-                    PacketSize = byte_size(Packet),
                     State1 = amp_charge(
-                        PacketSize, update_path_bytes_sent(IP, Port, PacketSize, State)
+                        PacketSize,
+                        charge_pending_path(
+                            {IP, Port},
+                            Via,
+                            PacketSize,
+                            update_path_bytes_sent(IP, Port, PacketSize, State)
+                        )
                     ),
+                    State2 = note_short_challenge(ChallengeData, PacketSize, State1),
                     %% Increment packet number
                     NewPnApp = PNSpace#pn_space{next_pn = PN + 1},
-                    State1#state{pn_app = NewPnApp};
+                    State2#state{pn_app = NewPnApp};
                 _ ->
                     State
             end;
@@ -13445,6 +13490,24 @@ send_path_challenge(
             ?LOG_DEBUG(#{what => path_challenge_no_keys}, ?QUIC_LOG_META),
             State
     end.
+
+note_short_challenge(
+    Data,
+    Size,
+    #state{
+        mig =
+            #mig{
+                pending_peer_validation =
+                    #path_state{challenge_data = Data, short_challenges = Short} =
+                        Path
+            } = Mig
+    } = State
+) when Size < 1200 ->
+    State#state{
+        mig = Mig#mig{pending_peer_validation = Path#path_state{short_challenges = [Data | Short]}}
+    };
+note_short_challenge(_Data, _Size, State) ->
+    State.
 
 %% @doc Send PATH_RESPONSE to a specific address with proper 1200-byte padding.
 %% RFC 9000 Section 8.2.1: PATH_RESPONSE MUST be padded to at least 1200 bytes.
@@ -13553,17 +13616,23 @@ send_path_frames(
             Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
             PN = PNSpace#pn_space.next_pn,
             PNLen = quic_packet:pn_length(PN),
-            %% RFC 9000 Section 8.2.1: Pad to 1200 bytes for path validation
-            PaddedPayload = pad_for_path_validation(Payload, DCID, PNLen),
+            Room = path_room({IP, Port}, Via, State),
+            PaddedPayload = pad_for_path_validation(Payload, DCID, PNLen, Room),
             KeyPhase = get_current_key_phase(State),
             FirstByte = short_header_first_byte(KeyPhase, PNLen, State),
             #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
             Packet = quic_aead:protect_short_packet(
                 Cipher, Key, IV, HP, PN, FirstByte, DCID, PaddedPayload
             ),
-            case send_packet_via(Via, IP, Port, Packet, State) of
+            PacketSize = byte_size(Packet),
+            case PacketSize =< Room andalso send_packet_via(Via, IP, Port, Packet, State) of
                 ok ->
-                    State#state{pn_app = PNSpace#pn_space{next_pn = PN + 1}};
+                    charge_pending_path(
+                        {IP, Port},
+                        Via,
+                        PacketSize,
+                        State#state{pn_app = PNSpace#pn_space{next_pn = PN + 1}}
+                    );
                 {error, _Reason} ->
                     State
             end;
@@ -13758,21 +13827,21 @@ close_socket_state_quietly(SocketState) ->
 %% server sends to wherever the newest packet came from. Until the
 %% client's first Handshake packet the anti-amplification limit covers
 %% every address alike.
-follow_handshake_peer(RemoteAddr, Before, #state{remote_addr = Current} = After) when
+follow_handshake_peer(RemoteAddr, Size, Before, #state{remote_addr = Current} = After) when
     RemoteAddr =/= Current
 ->
     case largest_received(After) =/= largest_received(Before) of
-        true -> challenge_handshake_peer(RemoteAddr, After);
+        true -> challenge_handshake_peer(RemoteAddr, Size, After);
         false -> After
     end;
-follow_handshake_peer(_RemoteAddr, _Before, After) ->
+follow_handshake_peer(_RemoteAddr, _Size, _Before, After) ->
     After.
 
 %% RFC 9000 Section 9: a peer that moves before the handshake is
 %% confirmed is validated, which takes a 1-RTT PATH_CHALLENGE. The
 %% client has no other CID yet, so the path keeps the current one.
 challenge_handshake_peer(
-    NewAddr, #state{app_keys = {_, _}, mig = #mig{migration_state = idle} = Mig} = State
+    NewAddr, Size, #state{app_keys = {_, _}, mig = #mig{migration_state = idle} = Mig} = State
 ) ->
     ChallengeData = crypto:strong_rand_bytes(8),
     Path = #path_state{
@@ -13781,7 +13850,7 @@ challenge_handshake_peer(
         challenge_data = ChallengeData,
         challenge_count = 1,
         bytes_sent = 0,
-        bytes_received = 0,
+        bytes_received = Size,
         dcid = State#state.dcid,
         is_nat_rebinding = true
     },
@@ -13791,7 +13860,7 @@ challenge_handshake_peer(
     },
     State2 = send_path_challenge(NewAddr, ChallengeData, State1#state.dcid, State1),
     start_path_validation_timer(State2);
-challenge_handshake_peer(NewAddr, State) ->
+challenge_handshake_peer(NewAddr, _Size, State) ->
     State#state{remote_addr = NewAddr}.
 
 %% A challenge sent during the handshake may have reached a client that
@@ -13854,7 +13923,7 @@ maybe_handle_address_change(RemoteAddr, _Data, #state{remote_addr = RemoteAddr} 
 %% The check for peer_disable_migration is correctly placed in migrate/1 API only.
 maybe_handle_address_change(
     NewAddr,
-    DataSize,
+    _DataSize,
     #state{
         mig = #mig{
             migration_state = validating_peer,
@@ -13862,7 +13931,7 @@ maybe_handle_address_change(
         }
     } = State
 ) ->
-    update_pending_path_bytes_received(NewAddr, DataSize, State);
+    State;
 maybe_handle_address_change(
     NewAddr, DataSize, #state{mig = #mig{migration_state = validating_peer}} = State
 ) ->
@@ -13939,25 +14008,106 @@ use_via(Via, State0) ->
 kept_its_cid(#state{mig = #mig{peer_dcid = DCID, pass_dcid = DCID}}) -> DCID =/= undefined;
 kept_its_cid(_State) -> false.
 
-%% @doc Update bytes_received for pending path validation (anti-amplification).
--spec update_pending_path_bytes_received(
-    {inet:ip_address(), inet:port_number()},
-    non_neg_integer(),
-    #state{}
-) -> #state{}.
-update_pending_path_bytes_received(
-    NewAddr,
+%% Count what arrives from the address being validated, which raises
+%% what may be sent to it.
+account_path_recv(
+    Addr,
+    Via,
     Size,
-    #state{mig = #mig{pending_peer_validation = #path_state{remote_addr = NewAddr} = PathState}} =
-        State
+    #state{
+        mig =
+            #mig{
+                pending_peer_validation =
+                    #path_state{remote_addr = Addr, via = Via, bytes_received = Rx} =
+                        Path
+            } = Mig
+    } = State
 ) ->
-    NewPath = PathState#path_state{
-        bytes_received = PathState#path_state.bytes_received + Size
-    },
-    State#state{mig = (State#state.mig)#mig{pending_peer_validation = NewPath}};
-update_pending_path_bytes_received(_NewAddr, _Size, State) ->
-    %% Address doesn't match pending validation
+    release_held(State#state{
+        mig = Mig#mig{pending_peer_validation = Path#path_state{bytes_received = Rx + Size}}
+    });
+account_path_recv(_Addr, _Via, _Size, State) ->
     State.
+
+%% RFC 9000 Sections 8 and 9.3.1: until a peer address is validated, a
+%% server sends it at most three times what it received from it.
+path_room(Addr, Via, #state{
+    cfg = #conn_cfg{role = server},
+    mig = #mig{
+        pending_peer_validation = #path_state{
+            remote_addr = Addr,
+            via = Via,
+            status = validating,
+            address_validated = false,
+            bytes_sent = Tx,
+            bytes_received = Rx
+        }
+    }
+}) ->
+    max(0, 3 * Rx - Tx);
+path_room(_Addr, _Via, _State) ->
+    infinity.
+
+amp_room(#state{mig = #mig{migration_state = idle}}) ->
+    infinity;
+amp_room(#state{remote_addr = Addr} = State) ->
+    path_room(Addr, current_via(State), State).
+
+charge_pending_path(Addr, Via, Size, #state{mig = Mig} = State) ->
+    case Mig#mig.pending_peer_validation of
+        #path_state{remote_addr = Addr, via = Via, bytes_sent = Tx} = Path ->
+            State#state{
+                mig = Mig#mig{pending_peer_validation = Path#path_state{bytes_sent = Tx + Size}}
+            };
+        _ ->
+            State
+    end.
+
+%% Whether a 1-RTT datagram of Size goes out now or is held. Once one
+%% is held the rest queue behind it, keeping the send order.
+must_hold(_Size, infinity, _State) -> false;
+must_hold(Size, Room, #state{mig = #mig{held = Held}}) -> Held =/= [] orelse Size > Room.
+
+%% Account for a 1-RTT datagram the send path sealed while the current
+%% address is unvalidated: charged when sent, kept when held.
+note_amp_send(_Packet, _Size, infinity, _Held, State) ->
+    State;
+note_amp_send(Packet, _Size, _Room, true, #state{mig = Mig} = State) ->
+    State#state{mig = Mig#mig{held = [Packet | Mig#mig.held]}};
+note_amp_send(_Packet, Size, _Room, false, #state{remote_addr = Addr} = State) ->
+    charge_pending_path(Addr, current_via(State), Size, State).
+
+%% Send held datagrams, oldest first, as far as the limit allows; all of
+%% them once the address is validated or given up.
+release_held(#state{mig = #mig{held = []}} = State) ->
+    State;
+release_held(#state{mig = Mig} = State) ->
+    release_held(lists:reverse(Mig#mig.held), amp_room(State), State#state{mig = Mig#mig{held = []}}).
+
+release_held([], _Room, State) ->
+    State;
+release_held([Packet | Rest] = Held, Room, State0) ->
+    Size = byte_size(Packet),
+    case Room =:= infinity orelse Size =< Room of
+        true ->
+            State1 = send_held(Packet, State0),
+            State = note_amp_send(Packet, Size, Room, false, State1),
+            release_held(Rest, sub_room(Room, Size), State);
+        false ->
+            Mig = State0#state.mig,
+            State0#state{mig = Mig#mig{held = lists:reverse(Held)}}
+    end.
+
+sub_room(infinity, _Size) -> infinity;
+sub_room(Room, Size) -> Room - Size.
+
+send_held(Packet, State) ->
+    case do_socket_send(Packet, State) of
+        {ok, undefined} -> State;
+        {ok, SocketState} -> State#state{socket_state = SocketState};
+        {error, _, SocketState} -> State#state{socket_state = SocketState};
+        {error, _} -> State
+    end.
 
 %% @doc Initiate path validation for peer's new address.
 %% RFC 9000 Section 8.2: Send PATH_CHALLENGE to validate the new path.
@@ -14119,19 +14269,7 @@ send_path_challenge_to_addr(Addr, ChallengeData, DCID, State) ->
             #path_state{via = V} -> V;
             undefined -> current_via(State)
         end,
-    State1 = send_path_challenge(Addr, ChallengeData, DCID, Via, State),
-    %% Update pending path bytes_sent for anti-amplification
-    case (State1#state.mig)#mig.pending_peer_validation of
-        #path_state{} = PathState ->
-            %% Estimate packet size (short header + PATH_CHALLENGE frame)
-            PacketSize = 50,
-            NewPath = PathState#path_state{
-                bytes_sent = PathState#path_state.bytes_sent + PacketSize
-            },
-            State1#state{mig = (State1#state.mig)#mig{pending_peer_validation = NewPath}};
-        undefined ->
-            State1
-    end.
+    send_path_challenge(Addr, ChallengeData, DCID, Via, State).
 
 %% RFC 9000 Section 8.2.4: three times the larger of the current PTO and
 %% that of the new path, computed from kInitialRtt.
@@ -14233,7 +14371,7 @@ abandon_peer_validation(#state{mig = Mig} = State) ->
             path_validation_token = undefined
         }
     },
-    retire_abandoned_path_cid(Mig#mig.pending_peer_validation, State1).
+    release_held(retire_abandoned_path_cid(Mig#mig.pending_peer_validation, State1)).
 
 %% @doc Handle PATH_RESPONSE frame.
 %% Validates the response against pending challenges.
@@ -14256,6 +14394,8 @@ handle_path_response(ResponseData, State) ->
             %% Old path validated - confirms peer is real (anti-spoofing)
             %% Wait for new path validation or timeout
             State1;
+        {address_validated, State1} ->
+            release_held(State1);
         no_match ->
             %% Check alt_paths (client validating paths)
             case find_path_by_challenge(ResponseData, (State#state.mig)#mig.alt_paths) of
@@ -14291,16 +14431,22 @@ handle_path_response(ResponseData, State) ->
 -spec check_peer_validation_response(binary(), #state{}) ->
     {new_path_validated, #path_state{}, #state{}}
     | {old_path_validated, #state{}}
+    | {address_validated, #state{}}
     | no_match.
 check_peer_validation_response(ResponseData, #state{mig = Mig} = State) ->
     Pending = Mig#mig.pending_peer_validation,
     case {answers(ResponseData, Pending), Mig#mig.old_path_validation} of
         {true, _} ->
-            ValidatedPath = Pending#path_state{
-                status = validated, challenge_data = undefined, old_challenges = []
-            },
-            State1 = State#state{mig = Mig#mig{pending_peer_validation = ValidatedPath}},
-            {new_path_validated, ValidatedPath, State1};
+            case lists:member(ResponseData, Pending#path_state.short_challenges) of
+                true ->
+                    {address_validated, check_path_mtu(Pending, State)};
+                false ->
+                    ValidatedPath = Pending#path_state{
+                        status = validated, challenge_data = undefined, old_challenges = []
+                    },
+                    State1 = State#state{mig = Mig#mig{pending_peer_validation = ValidatedPath}},
+                    {new_path_validated, ValidatedPath, State1}
+            end;
         {_, #path_state{challenge_data = ResponseData} = OldPath} ->
             %% Old path validated - confirms peer is real (anti-spoofing signal)
             ValidatedOldPath = OldPath#path_state{status = validated, challenge_data = undefined},
@@ -14308,6 +14454,25 @@ check_peer_validation_response(ResponseData, #state{mig = Mig} = State) ->
         _ ->
             no_match
     end.
+
+%% The address answered, but in a datagram too small to show the path
+%% carries 1200 bytes; a full-size challenge must be answered before the
+%% path is validated (RFC 9000 Sections 8.2.1 and 8.2.3).
+check_path_mtu(Pending, #state{mig = Mig} = State) ->
+    Data = crypto:strong_rand_bytes(8),
+    Path = Pending#path_state{
+        address_validated = true,
+        challenge_data = Data,
+        challenge_count = 1,
+        old_challenges = [],
+        short_challenges = [],
+        deadline = erlang:monotonic_time(millisecond) + path_validation_deadline(State)
+    },
+    State1 = State#state{mig = Mig#mig{pending_peer_validation = Path}},
+    State2 = send_path_challenge_to_addr(
+        Path#path_state.remote_addr, Data, path_dcid(Path, State1), State1
+    ),
+    start_path_validation_timer(State2).
 
 %% RFC 9000 Section 8.2.3: a response to any challenge sent on the path.
 answers(Data, #path_state{challenge_data = Sent, old_challenges = Old}) ->
@@ -14345,7 +14510,7 @@ handle_peer_path_validated(PendingPath, #state{mig = #mig{path_validation_timer 
     %% Complete migration to the new peer address
     State2 = retire_replaced_dcid(OldDCID, NewDCID, complete_migration(ValidatedPath, State1)),
     %% Clear pending validation state including old path validation
-    State2#state{
+    release_held(State2#state{
         mig = (State2#state.mig)#mig{
             pending_peer_validation = undefined,
             old_path_validation = undefined,
@@ -14354,7 +14519,7 @@ handle_peer_path_validated(PendingPath, #state{mig = #mig{path_validation_timer 
             path_validation_timer = undefined,
             path_validation_token = undefined
         }
-    }.
+    }).
 
 %% @doc Auto-migrate to preferred address if the validated path matches.
 %% RFC 9000 Section 9.6: Client SHOULD migrate to validated preferred address.

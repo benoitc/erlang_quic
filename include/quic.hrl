@@ -529,7 +529,12 @@
     %% Challenges sent earlier on this path, still answerable
     old_challenges = [] :: [binary()],
     %% Monotonic time (ms) at which validation of this path is abandoned
-    deadline :: integer() | undefined
+    deadline :: integer() | undefined,
+
+    %% Challenges sent in datagrams under 1200 bytes; an answer to one
+    %% validates the address but not the path MTU (RFC 9000 Section 8.2.1)
+    short_challenges = [] :: [binary()],
+    address_validated = false :: boolean()
 }).
 
 %% Preferred Address for Server Migration (RFC 9000 Section 9.6)
