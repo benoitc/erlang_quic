@@ -5499,6 +5499,15 @@ handle_retry_packet(
     %% RFC 9000 Section 17.2.5.2: nor any after a server Initial
     {error, late_retry};
 handle_retry_packet(
+    _FullPacket,
+    _Version,
+    ServerSCID,
+    _Rest,
+    #state{cfg = #conn_cfg{original_dcid = ServerSCID}}
+) ->
+    %% RFC 9000 Section 17.2.5.1
+    {error, retry_scid_is_our_dcid};
+handle_retry_packet(
     FullPacket,
     Version,
     ServerSCID,
