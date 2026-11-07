@@ -26,8 +26,9 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/erlang_quic-interop
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
             type=ref,event=tag
+            type=sha,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - uses: docker/build-push-action@v6
         with:
