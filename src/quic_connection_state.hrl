@@ -141,6 +141,9 @@
     %% ClientHello server_name to override the cert fields above.
     sni_callback ::
         fun((binary() | undefined) -> {ok, map()} | {error, term()}) | undefined,
+    %% Picks the owner by the negotiated ALPN, during ClientHello.
+    alpn_handler ::
+        fun((pid(), binary()) -> {ok, pid()} | {error, term()}) | undefined,
     %% Server preferred address config (RFC 9000 Section 9.6)
     %% Set from listener options: {IPv4, IPv6} where each is {Addr, Port} | undefined
     server_preferred_address :: #preferred_address{} | undefined,

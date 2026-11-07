@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Listener option `alpn_handler`, called with the connection and the
+  negotiated ALPN during the handshake, returns the connection's owner.
+  One listener can then hand each protocol to its own process, before
+  any stream data arrives.
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed
