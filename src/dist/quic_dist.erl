@@ -421,7 +421,7 @@ load_config() ->
         cert = get_opt(cert, DistOpts),
         key = get_opt(key, DistOpts),
         cacert = get_opt(cacert, DistOpts),
-        verify = get_verify_opt(get_opt(verify, DistOpts, verify_none)),
+        verify = get_verify_opt(get_init_arg(verify, get_opt(verify, DistOpts, verify_none))),
         discovery_module = get_opt(discovery_module, DistOpts, quic_discovery_static),
         nodes = get_opt(nodes, DistOpts, []),
         dns_domain = get_opt(dns_domain, DistOpts),
@@ -639,7 +639,7 @@ keep_alive_interval_for(_Other) ->
 start_quic_server(Name, Port, Config, _ExtraOpts) ->
     %% Load certificate and key (or fall through to PSK-only auth)
     case load_credentials(Config) of
-        {ok, Cert, Key, _CACert} ->
+        {ok, Cert, Key, CACert} ->
             CongestionThreshold = Config#quic_dist_config.congestion_threshold,
             BaseOpts0 = #{
                 alpn => [?QUIC_DIST_ALPN],
@@ -676,8 +676,10 @@ start_quic_server(Name, Port, Config, _ExtraOpts) ->
             %% Add cert/key when present (PSK-only listeners omit them).
             BaseOpts1 =
                 case {Cert, Key} of
-                    {undefined, undefined} -> BaseOpts0;
-                    {_, _} -> BaseOpts0#{cert => Cert, key => Key}
+                    {undefined, undefined} ->
+                        BaseOpts0;
+                    {_, _} ->
+                        server_verify_opts(Config, CACert, BaseOpts0#{cert => Cert, key => Key})
                 end,
             %% Add PSK auth when configured.
             Opts = add_psk_listener_opts(BaseOpts1, Config),
@@ -751,6 +753,26 @@ get_creation(Name) ->
 
 %% @private
 %% Load TLS credentials from files or config.
+%% With verify_peer the listener asks every node for a certificate and
+%% checks it against the configured CA; without, it asks for none.
+server_verify_opts(#quic_dist_config{verify = verify_peer}, CACert, Opts) ->
+    with_cacerts(CACert, Opts#{verify => true, require_client_cert => true});
+server_verify_opts(_Config, _CACert, Opts) ->
+    Opts.
+
+%% With verify_peer a node checks the certificate of the node it dials
+%% against the configured CA, and its name against the host part of the
+%% node name, as inet_tls_dist does.
+client_verify_opts(#quic_dist_config{verify = verify_peer}, CACert, Node, Opts) ->
+    {node, _Name, Host} = dist_util:split_node(Node),
+    with_cacerts(CACert, Opts#{verify => true, server_name => list_to_binary(Host)});
+client_verify_opts(_Config, _CACert, _Node, Opts) ->
+    Opts#{verify => false}.
+
+with_cacerts(undefined, Opts) -> Opts;
+with_cacerts(CACerts, Opts) when is_list(CACerts) -> Opts#{cacerts => CACerts};
+with_cacerts(CACert, Opts) when is_binary(CACert) -> Opts#{cacerts => [CACert]}.
+
 load_credentials(#quic_dist_config{cert = Cert, key = Key, cacert = CACert}) when
     Cert =/= undefined, Key =/= undefined
 ->
@@ -1108,7 +1130,7 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
 
     %% Prepare QUIC connection options
     case load_credentials(Config) of
-        {ok, Cert, Key, _CACert} ->
+        {ok, Cert, Key, CACert} ->
             CongestionThreshold = Config#quic_dist_config.congestion_threshold,
             BaseOpts0 = #{
                 alpn => [?QUIC_DIST_ALPN],
@@ -1137,9 +1159,7 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                 %% Use known-safe MTU for LAN (1452 bytes, IPv4/IPv6 compatible)
                 %% instead of PMTU probing which adds overhead
                 max_udp_payload_size => ?DIST_MAX_UDP_PAYLOAD_SIZE,
-                pmtu_enabled => false,
-                % TODO: Enable proper verification
-                verify => false
+                pmtu_enabled => false
             },
             %% Add cert/key when present (PSK-only clients omit them).
             BaseOpts1 =
@@ -1148,7 +1168,9 @@ connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
                     {_, _} -> BaseOpts0#{cert => Cert, key => Key}
                 end,
             %% Add external_psk when configured.
-            BaseOpts = add_psk_client_opts(BaseOpts1, Config),
+            BaseOpts = add_psk_client_opts(
+                client_verify_opts(Config, CACert, Node, BaseOpts1), Config
+            ),
 
             %% Per-node overrides registered via set_connect_options/2.
             %% Merged on top of the defaults so callers can swap the
