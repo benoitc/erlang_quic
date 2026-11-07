@@ -647,6 +647,9 @@ setopts(Conn, Opts) when is_pid(Conn), is_list(Opts) ->
 %% peer issues another. The first spare arrives shortly after the
 %% connection is established, so a migration attempted immediately can
 %% fail and succeed on retry.
+%%
+%% Only a client migrates (RFC 9000 Section 9); on a server connection
+%% this returns `{error, not_supported_on_server}'.
 -spec migrate(Conn) -> ok | {error, term()} when
     Conn :: pid().
 migrate(Conn) when is_pid(Conn) ->

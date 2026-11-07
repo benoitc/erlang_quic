@@ -1922,6 +1922,10 @@ connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
             end
     end;
 %% Handle connection migration request (RFC 9000 Section 9)
+connected({call, From}, Migrate, #state{cfg = #conn_cfg{role = server}} = State) when
+    Migrate =:= migrate; element(1, Migrate) =:= migrate
+->
+    {keep_state, State, [{reply, From, {error, not_supported_on_server}}]};
 connected({call, From}, migrate, #state{mig = #mig{peer_disable_migration = true}} = State) ->
     %% Peer disabled migration via transport params
     {keep_state, State, [{reply, From, {error, migration_disabled}}]};
