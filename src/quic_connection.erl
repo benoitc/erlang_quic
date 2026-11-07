@@ -14008,6 +14008,9 @@ use_via(Via, State0) ->
 kept_its_cid(#state{mig = #mig{peer_dcid = DCID, pass_dcid = DCID}}) -> DCID =/= undefined;
 kept_its_cid(_State) -> false.
 
+changed_its_cid(#state{mig = #mig{peer_dcid = Peer, pass_dcid = Pass}}) ->
+    Peer =/= undefined andalso Pass =/= undefined andalso Peer =/= Pass.
+
 %% Count what arrives from the address being validated, which raises
 %% what may be sent to it.
 account_path_recv(
@@ -14187,14 +14190,18 @@ start_peer_path_validation(NewAddr, Via, IsNATRebinding, DataSize, NewDCID, NewS
     %% packet re-triggers).
     case Via =:= current_via(State) of
         true ->
+            %% Data follows under the new path's CID at once: the old one
+            %% must not go to a second address (RFC 9000 Section 9.5).
             Mig = State#state.mig,
             State1 = State#state{
                 remote_addr = NewAddr,
+                dcid = NewDCID,
                 mig = Mig#mig{
                     pending_peer_validation = NewPathState,
                     old_path_validation = OldPathState,
                     migration_state = validating_peer,
-                    validated_addr = validated_addr(Mig, OldAddr)
+                    validated_addr = validated_addr(Mig, OldAddr),
+                    validated_dcid = validated_dcid(Mig, State#state.dcid)
                 }
             },
             %% Send PATH_CHALLENGE to both addresses, each under its own path's CID
@@ -14218,10 +14225,17 @@ start_peer_path_validation(NewAddr, Via, IsNATRebinding, DataSize, NewDCID, NewS
 validated_addr(#mig{validated_addr = undefined}, Addr) -> Addr;
 validated_addr(#mig{validated_addr = Addr}, _) -> Addr.
 
+validated_dcid(#mig{validated_dcid = undefined}, DCID) -> DCID;
+validated_dcid(#mig{validated_dcid = DCID}, _) -> DCID.
+
 %% The CID a path probes under. A NAT rebinding is the Section 9.5
-%% exception and stays on the current one; anything else binds its own.
-path_cid_for(_Addr, true, #state{dcid = DCID} = State) ->
-    {State, DCID, undefined};
+%% exception and stays on the current one, as long as the peer kept its
+%% CID too; anything else binds its own.
+path_cid_for(Addr, true, #state{dcid = DCID} = State) ->
+    case changed_its_cid(State) of
+        false -> {State, DCID, undefined};
+        true -> path_cid_for(Addr, false, State)
+    end;
 path_cid_for(Addr, false, State) ->
     case bind_path_cid(Addr, State) of
         {ok, State1, DCID, Seq} -> {State1, DCID, Seq};
@@ -14240,7 +14254,12 @@ send_path_challenge_to_old_addr(Addr, ChallengeData, State) ->
             #path_state{via = V} -> V;
             undefined -> current_via(State)
         end,
-    State1 = send_path_challenge(Addr, ChallengeData, State#state.dcid, Via, State),
+    DCID =
+        case (State#state.mig)#mig.old_path_validation of
+            #path_state{dcid = D} when D =/= undefined -> D;
+            _ -> State#state.dcid
+        end,
+    State1 = send_path_challenge(Addr, ChallengeData, DCID, Via, State),
     %% Update old path bytes_sent for tracking
     case (State1#state.mig)#mig.old_path_validation of
         #path_state{} = PathState ->
@@ -14360,12 +14379,23 @@ abandon_peer_validation(#state{mig = Mig} = State) ->
             undefined -> State#state.remote_addr;
             Validated -> Validated
         end,
+    DCID = validated_dcid(Mig, State#state.dcid),
+    %% Datagrams held under the abandoned path's CID are not sent to the
+    %% old address; loss recovery repeats what they carried.
+    Held =
+        case DCID =:= State#state.dcid of
+            true -> Mig#mig.held;
+            false -> []
+        end,
     State1 = State#state{
         remote_addr = RemoteAddr,
+        dcid = DCID,
         mig = Mig#mig{
+            held = Held,
             pending_peer_validation = undefined,
             old_path_validation = undefined,
             validated_addr = undefined,
+            validated_dcid = undefined,
             migration_state = idle,
             path_validation_timer = undefined,
             path_validation_token = undefined
@@ -14499,7 +14529,7 @@ handle_peer_path_validated(PendingPath, #state{mig = #mig{path_validation_timer 
     %% RFC 9000 Section 9.5: the path already probed under its own CID, so
     %% that one is promoted here rather than a new one being chosen; the CID
     %% the old path used is then retired.
-    OldDCID = State#state.dcid,
+    OldDCID = validated_dcid(State#state.mig, State#state.dcid),
     NewDCID = path_dcid(PendingPath, State),
     ValidatedPath = PendingPath#path_state{
         status = validated,
@@ -14515,6 +14545,7 @@ handle_peer_path_validated(PendingPath, #state{mig = #mig{path_validation_timer 
             pending_peer_validation = undefined,
             old_path_validation = undefined,
             validated_addr = undefined,
+            validated_dcid = undefined,
             migration_state = idle,
             path_validation_timer = undefined,
             path_validation_token = undefined
