@@ -3,7 +3,7 @@
 # Build context should be the root of the erlang_quic project:
 #   docker build -f docker/dist/Dockerfile -t quic-dist-test .
 #
-# Supports Erlang/OTP 28 or later. Use build arg to select:
+# Supports Erlang/OTP 27 or later. Use build arg to select:
 #   docker build --build-arg OTP_VERSION=28 ...
 #
 ARG OTP_VERSION=28

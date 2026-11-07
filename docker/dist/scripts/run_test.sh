@@ -44,7 +44,7 @@ usage() {
     echo "  --background  Start containers and exit immediately (non-blocking)"
     echo ""
     echo "Environment Variables:"
-    echo "  OTP_VERSION   Erlang/OTP version (28 or later). Default: 28"
+    echo "  OTP_VERSION   Erlang/OTP version (27 or later). Default: 28"
     echo ""
     echo "Examples:"
     echo "  $0 2                        # Run 2-node test with OTP 28"

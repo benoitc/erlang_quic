@@ -15,8 +15,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-            otp: '28'
-            rebar3: 'nightly'
+            otp: '27'
+            rebar3: '3.24.0'
+          - os: ubuntu-24.04
+            otp: '27'
+            rebar3: '3.24.0'
           - os: ubuntu-24.04
             otp: '28'
             rebar3: 'nightly'
