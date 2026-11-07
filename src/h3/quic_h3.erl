@@ -88,6 +88,18 @@
 %%% end.
 %%% '''
 %%%
+%%%
+%%% == Reset streams and their final size ==
+%%%
+%%% A stream claimed by a `stream_type_handler' that the peer resets is
+%%% reported as `{stream_type_reset, Dir, StreamId, ErrorCode}'. With the
+%%% `stream_reset_final_size => true' option it is reported as
+%%% `{stream_type_reset, Dir, StreamId, ErrorCode, FinalSize}' instead,
+%%% `FinalSize' being the final size from the peer's RESET_STREAM or
+%%% RESET_STREAM_AT (RFC 9000 Section 4.5). A WebTransport session needs it
+%%% to count the stream's bytes against WT_MAX_DATA (draft-ietf-webtrans-
+%%% http3-17 Section 5.4), since the bytes it never received count on the
+%%% peer's side.
 %%% @end
 
 -module(quic_h3).
@@ -203,7 +215,10 @@
     %% QUIC options
     quic_opts => map(),
     %% Extension hook for unknown uni-stream types (e.g. WebTransport).
-    stream_type_handler => stream_type_handler()
+    stream_type_handler => stream_type_handler(),
+    %% Report a claimed stream's reset with its final size (see the module
+    %% doc). Default false.
+    stream_reset_final_size => boolean()
 }.
 
 %% Override function invoked once per newly accepted QUIC connection.
@@ -218,7 +233,8 @@
     stream_type_handler => stream_type_handler(),
     h3_datagram_enabled => boolean(),
     max_buffered_body => non_neg_integer(),
-    defer_requests_until_settings => boolean()
+    defer_requests_until_settings => boolean(),
+    stream_reset_final_size => boolean()
 }.
 
 -type server_opts() :: #{
@@ -242,10 +258,13 @@
     %% until the client's SETTINGS have arrived, so the handler can read
     %% them (WebTransport draft-17 §7.1). Default false.
     defer_requests_until_settings => boolean(),
+    %% Report a claimed stream's reset with its final size (see the module
+    %% doc). Default false.
+    stream_reset_final_size => boolean(),
     %% Per-connection configuration override; the returned map's
     %% `owner', `handler', `stream_type_handler', `h3_datagram_enabled',
-    %% `max_buffered_body', `defer_requests_until_settings' and `settings'
-    %% keys replace the listener-wide defaults for that single connection.
+    %% `max_buffered_body', `defer_requests_until_settings',
+    %% `stream_reset_final_size' and `settings' keys replace the listener-wide defaults for that single connection.
     %% Useful for spawning a dedicated router pid per H3 connection rather
     %% than sharing one global owner.
     connection_handler => connection_handler_fun()
@@ -293,7 +312,9 @@ connect(Host, Port, Opts) ->
     end.
 
 start_h3_connection(QuicConn, HostBin, Port, Opts) ->
-    H3Opts = maps:with([settings, stream_type_handler, h3_datagram_enabled], Opts),
+    H3Opts = maps:with(
+        [settings, stream_type_handler, h3_datagram_enabled, stream_reset_final_size], Opts
+    ),
     case quic_h3_connection:start_link(QuicConn, HostBin, Port, H3Opts) of
         {ok, H3Conn} ->
             %% Transfer ownership to H3 process so it receives QUIC events
@@ -611,7 +632,10 @@ start_server(Name, Port, Opts) ->
         stream_type_handler => StreamTypeHandler,
         h3_datagram_enabled => H3DatagramEnabled,
         max_buffered_body => MaxBufferedBody,
-        defer_requests_until_settings => DeferRequests
+        defer_requests_until_settings => DeferRequests,
+        stream_reset_final_size => valid_flag(
+            stream_reset_final_size, maps:get(stream_reset_final_size, Opts, false)
+        )
     },
     QuicOpts = QuicOpts0#{
         connection_handler => fun(ConnPid, _ConnRef) ->
@@ -832,7 +856,9 @@ to_binary({A, B, C, D, E, F, G, H}) when
 build_client_quic_opts(Host, Opts) ->
     BaseOpts = #{
         alpn => [<<"h3">>],
-        server_name => Host
+        server_name => Host,
+        %% Read by quic_h3_connection, the owner, never by the application.
+        stream_reset_final_size => true
     },
     %% Add TLS options
     TlsOpts = maps:with([cert, key, cacerts, cacertfile, verify], Opts),
@@ -848,7 +874,9 @@ test_client_quic_opts(Opts) ->
 
 build_server_quic_opts(Opts) ->
     BaseOpts = #{
-        alpn => [<<"h3">>]
+        alpn => [<<"h3">>],
+        %% Read by quic_h3_connection, the owner, never by the application.
+        stream_reset_final_size => true
     },
     %% TLS options (required for server)
     TlsOpts = maps:with([cert, key, cacerts, cacertfile], Opts),
@@ -914,6 +942,9 @@ build_h3_opts(Opts) ->
     ),
     Base#{
         h3_datagram_enabled => maps:get(h3_datagram_enabled, Opts, false),
+        stream_reset_final_size => valid_flag(
+            stream_reset_final_size, maps:get(stream_reset_final_size, Opts, false)
+        ),
         defer_requests_until_settings => valid_defer_requests(
             maps:get(defer_requests_until_settings, Opts, false)
         ),
@@ -928,6 +959,11 @@ valid_max_buffered_body(Bytes) when is_integer(Bytes), Bytes >= 0 ->
     Bytes;
 valid_max_buffered_body(Other) ->
     error({bad_opts, {max_buffered_body, Other}}).
+
+valid_flag(_Name, Flag) when is_boolean(Flag) ->
+    Flag;
+valid_flag(Name, Other) ->
+    error({bad_opts, {Name, Other}}).
 
 valid_defer_requests(Flag) when is_boolean(Flag) ->
     Flag;

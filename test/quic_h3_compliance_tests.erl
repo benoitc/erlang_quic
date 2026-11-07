@@ -981,7 +981,7 @@ a_peer_reset_of_an_incomplete_request_is_reported_once_test() ->
     try
         State = buffering_state(#{quic_conn => Conn}),
         {keep_state, _} = quic_h3_connection:handle_peer_reset(
-            0, ?H3_REQUEST_CANCELLED, State
+            0, ?H3_REQUEST_CANCELLED, undefined, State
         ),
         ?assertEqual({stream_reset, 0, ?H3_REQUEST_CANCELLED}, next_owner_event()),
         ?assertEqual(nothing, next_owner_event())
@@ -3354,7 +3354,8 @@ make_test_state(Overrides) ->
         deferred_requests => [],
         held_streams => #{},
         held_data => [],
-        held_bytes => 0
+        held_bytes => 0,
+        reset_final_size => false
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -3391,7 +3392,8 @@ make_test_state(Overrides) ->
         maps:get(close_reason, Merged), maps:get(send_blocked, Merged),
         maps:get(peer_goaway_id, Merged), maps:get(defer_requests, Merged),
         maps:get(deferred_requests, Merged), maps:get(held_streams, Merged),
-        maps:get(held_data, Merged), maps:get(held_bytes, Merged)}.
+        maps:get(held_data, Merged), maps:get(held_bytes, Merged),
+        maps:get(reset_final_size, Merged)}.
 
 %%====================================================================
 %% WT_STREAM placement (draft-ietf-webtrans-http3-17 §4.3)
@@ -3556,3 +3558,42 @@ data_on_known_peer_request_stream_with_handler_test() ->
         #h3_stream{method = <<"POST">>, frame_state = expecting_data},
         quic_h3_connection:test_stream(0, S1)
     ).
+
+%%====================================================================
+%% Final size of a reset claimed stream (WebTransport draft-17 §5.4)
+%%====================================================================
+
+claimed_reset_carries_final_size_test() ->
+    Claim = fun(_Dir, _StreamId, _Type) -> claim end,
+    %% A uni stream with 600 of its bytes delivered, then reset at 1000.
+    S0 = make_test_state(#{role => server, stream_type_handler => Claim, reset_final_size => true}),
+    {ok, S1} = quic_h3_connection:handle_stream_data(
+        3, <<16#40, 16#54, (binary:copy(<<1>>, 598))/binary>>, false, mark_uni_stream_open(3, S0)
+    ),
+    flush_mailbox(),
+    {keep_state, _} = quic_h3_connection:handle_peer_reset(3, 7, 1000, S1),
+    ?assertEqual({stream_type_reset, uni, 3, 7, 1000}, next_reset_event()),
+    %% A bidi one, reset with code 0: still a reset with its final size.
+    {ok, S2} = quic_h3_connection:handle_stream_data(0, <<16#40, 16#41, 0>>, false, S0),
+    flush_mailbox(),
+    {keep_state, _} = quic_h3_connection:handle_peer_reset(0, 0, 3, S2),
+    ?assertEqual({stream_type_reset, bidi, 0, 0, 3}, next_reset_event()).
+
+claimed_reset_unchanged_without_the_option_test() ->
+    Claim = fun(_Dir, _StreamId, _Type) -> claim end,
+    S0 = make_test_state(#{role => server, stream_type_handler => Claim}),
+    {ok, S1} = quic_h3_connection:handle_stream_data(
+        3, <<16#40, 16#54, 0>>, false, mark_uni_stream_open(3, S0)
+    ),
+    flush_mailbox(),
+    {keep_state, _} = quic_h3_connection:handle_peer_reset(3, 7, 1000, S1),
+    ?assertEqual({stream_type_reset, uni, 3, 7}, next_reset_event()).
+
+next_reset_event() ->
+    Self = self(),
+    receive
+        {quic_h3, Self, {stream_type_reset, _, _, _} = E} -> E;
+        {quic_h3, Self, {stream_type_reset, _, _, _, _} = E} -> E;
+        {quic_h3, Self, {stream_type_closed, _, _} = E} -> E
+    after 100 -> no_reset_event
+    end.

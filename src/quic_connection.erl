@@ -758,6 +758,7 @@ init({server, Opts}) ->
             verify = quic_cert:requests_client_cert(Opts),
             cacerts = maps:get(cacerts, Opts, undefined),
             require_client_cert = maps:get(require_client_cert, Opts, false),
+            stream_reset_final_size = maps:get(stream_reset_final_size, Opts, false),
             %% TLS 1.3 external PSK config (RFC 8446 §4.2.11). Either or
             %% both may be `undefined'; if both are undefined the server
             %% only accepts cert-authenticated handshakes.
@@ -1208,6 +1209,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             conn_ref = ConnRef,
             verify = normalize_verify(maps:get(verify, Opts, true)),
             cacerts = maps:get(cacerts, Opts, undefined),
+            stream_reset_final_size = maps:get(stream_reset_final_size, Opts, false),
             client_cert = maps:get(cert, Opts, undefined),
             client_cert_chain = maps:get(cert_chain, Opts, []),
             client_private_key = maps:get(key, Opts, undefined),
@@ -6425,7 +6427,7 @@ process_frame(
                             ),
                             %% Notify owner - same message as RESET_STREAM
                             StateFl = flush_pending_delivery(State),
-                            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                            notify_stream_reset(StreamId, ErrorCode, FinalSize, State),
                             maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams})
                     end;
                 error ->
@@ -6459,8 +6461,9 @@ process_frame(
                                                 Streams
                                             ),
                                             StateFl = flush_pending_delivery(State),
-                                            Owner !
-                                                {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                                            notify_stream_reset(
+                                                StreamId, ErrorCode, FinalSize, State
+                                            ),
                                             maybe_reclaim_stream(
                                                 StreamId, StateFl#state{streams = NewStreams}
                                             )
@@ -10068,7 +10071,7 @@ stream_limit_close(State) ->
 %% connection flow control, received or not.
 %% A RESET_STREAM the size checks let through: the receive side is done.
 accept_reset_stream(
-    Stream, StreamId, ErrorCode, FinalSize, #state{owner = Owner, streams = Streams} = State
+    Stream, StreamId, ErrorCode, FinalSize, #state{streams = Streams} = State
 ) ->
     %% Mark stream as reset, store final size for flow control accounting.
     %% Incoming RESET_STREAM closes our receive side.
@@ -10086,9 +10089,21 @@ accept_reset_stream(
     %% Data delivered earlier in this receive pass reaches the
     %% owner before the reset notification.
     StateFl = flush_pending_delivery(State),
-    Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+    notify_stream_reset(StreamId, ErrorCode, FinalSize, State),
     State1 = account_reset_stream(Stream, FinalSize, StateFl#state{streams = NewStreams}),
     maybe_reclaim_stream(StreamId, State1).
+
+%% The owner hears of a peer's reset; with stream_reset_final_size it is
+%% also told the stream's final size, the bytes the peer counts against
+%% flow control whether or not they arrived.
+notify_stream_reset(StreamId, ErrorCode, FinalSize, #state{owner = Owner, cfg = Cfg}) ->
+    Event =
+        case Cfg#conn_cfg.stream_reset_final_size of
+            true -> {stream_reset, StreamId, ErrorCode, FinalSize};
+            false -> {stream_reset, StreamId, ErrorCode}
+        end,
+    Owner ! {quic, self(), Event},
+    ok.
 
 %% A RESET_STREAM for a stream not seen yet opens it already reset.
 reset_unseen_stream(
@@ -10115,7 +10130,7 @@ reset_unseen_stream(
                                 Streams
                             ),
                             StateFl = flush_pending_delivery(State),
-                            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                            notify_stream_reset(StreamId, ErrorCode, FinalSize, State),
                             maybe_reclaim_stream(
                                 StreamId,
                                 conn_grant(StateFl#state{

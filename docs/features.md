@@ -316,6 +316,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `max_datagram_frame_size` - Max datagram size to accept (0 = disabled, default: 0)
 - `datagram_recv_queue_len` - Bounded receive queue for inbound datagrams (default: `infinity`; drops oldest on overflow, tracked via `datagram_stats/1`)
 - `reset_stream_at` - Enable RESET_STREAM_AT extension (default: false)
+- `stream_reset_final_size` - The owner's notice of a peer's reset is `{stream_reset, StreamId, ErrorCode, FinalSize}` instead of `{stream_reset, StreamId, ErrorCode}`, `FinalSize` being the RESET_STREAM or RESET_STREAM_AT final size (default: false). `quic_h3` sets it on the connections it owns
 - `active_connection_id_limit` - How many of the peer's connection IDs to hold,
   counting the handshake CID (default: 2). Advertised to the peer and enforced
   on inbound NEW_CONNECTION_ID; exceeding it closes with

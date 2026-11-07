@@ -18,7 +18,9 @@
     server_data_after_200_reaches_the_client/1,
     client_data_after_the_response_reaches_the_server/1,
     chunked_response_body_arrives_whole/1,
-    peer_stream_with_a_signal_is_still_claimed/1
+    peer_stream_with_a_signal_is_still_claimed/1,
+    reset_of_a_claimed_stream_reports_final_size/1,
+    reset_stream_at_reports_final_size_not_reliable_size/1
 ]).
 
 -define(WT_STREAM, 16#41).
@@ -32,7 +34,9 @@ all() ->
         server_data_after_200_reaches_the_client,
         client_data_after_the_response_reaches_the_server,
         chunked_response_body_arrives_whole,
-        peer_stream_with_a_signal_is_still_claimed
+        peer_stream_with_a_signal_is_still_claimed,
+        reset_of_a_claimed_stream_reports_final_size,
+        reset_stream_at_reports_final_size_not_reliable_size
     ].
 
 init_per_suite(Config) ->
@@ -98,15 +102,54 @@ peer_stream_with_a_signal_is_still_claimed(Config) ->
         )
     end).
 
+%% The client resets a claimed stream after sending 1000 bytes on it; the
+%% server's owner, which asked for final sizes, is told 1000.
+reset_of_a_claimed_stream_reports_final_size(Config) ->
+    with_server(Config, #{stream_reset_final_size => true}, #{}, fun(Conn) ->
+        QC = quic_h3:get_quic_conn(Conn),
+        StreamId = send_on_claimed_stream(Conn, QC, 1000),
+        ok = quic:reset_stream(QC, StreamId, 7),
+        ?assertEqual({stream_type_reset, bidi, StreamId, 7, 1000}, await_reset(StreamId))
+    end).
+
+reset_stream_at_reports_final_size_not_reliable_size(Config) ->
+    ResetAt = #{quic_opts => #{reset_stream_at => true}},
+    with_server(Config, ResetAt#{stream_reset_final_size => true}, ResetAt, fun(Conn) ->
+        QC = quic_h3:get_quic_conn(Conn),
+        StreamId = send_on_claimed_stream(Conn, QC, 1000),
+        ok = quic:reset_stream_at(QC, StreamId, 7, 200),
+        ?assertEqual({stream_type_reset, bidi, StreamId, 7, 1000}, await_reset(StreamId))
+    end).
+
+%% A claimed bidi stream with Size bytes written on it, signal included,
+%% once the server has claimed it.
+send_on_claimed_stream(Conn, QC, Size) ->
+    {ok, StreamId} = quic_h3:open_bidi_stream(Conn, ?WT_STREAM),
+    Payload = binary:copy(<<1>>, Size - 3),
+    ok = quic:send_data(QC, StreamId, <<16#40, ?WT_STREAM, 0, Payload/binary>>, false),
+    ?assertMatch({stream_type_open, bidi, StreamId, ?WT_STREAM}, await({server_owner, '_'})),
+    StreamId.
+
+await_reset(StreamId) ->
+    receive
+        {server_owner, {stream_type_reset, bidi, StreamId, _, _} = E} -> E;
+        {server_owner, {stream_type_reset, bidi, StreamId, _} = E} -> E;
+        {server_owner, _} -> await_reset(StreamId)
+    after ?WAIT_MS -> no_reset
+    end.
+
 %%====================================================================
 %% Server
 %%====================================================================
 
 with_server(Config, F) ->
+    with_server(Config, #{}, #{}, F).
+
+with_server(Config, ServerExtra, ClientExtra, F) ->
     Test = self(),
     Relay = spawn_link(fun() -> relay(Test) end),
     Name = list_to_atom("h3_sth_" ++ integer_to_list(erlang:unique_integer([positive]))),
-    {ok, _} = quic_h3:start_server(Name, 0, #{
+    {ok, _} = quic_h3:start_server(Name, 0, ServerExtra#{
         cert => ?config(cert, Config),
         key => ?config(key, Config),
         settings => #{enable_connect_protocol => 1},
@@ -115,7 +158,7 @@ with_server(Config, F) ->
         connection_handler => fun(_Conn) -> #{owner => Relay} end
     }),
     {ok, Port} = quic:get_server_port(Name),
-    {ok, Conn} = quic_h3:connect("127.0.0.1", Port, #{
+    {ok, Conn} = quic_h3:connect("127.0.0.1", Port, ClientExtra#{
         verify => false,
         sync => true,
         settings => #{enable_connect_protocol => 1},
@@ -176,6 +219,8 @@ relay(Test) ->
     receive
         {quic_h3, _Conn, {stream_type_open, _, _, _} = E} -> Test ! {server_owner, E};
         {quic_h3, _Conn, {stream_type_data, _, _, _, _} = E} -> Test ! {server_owner, E};
+        {quic_h3, _Conn, {stream_type_reset, _, _, _} = E} -> Test ! {server_owner, E};
+        {quic_h3, _Conn, {stream_type_reset, _, _, _, _} = E} -> Test ! {server_owner, E};
         _ -> ok
     end,
     relay(Test).

@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `stream_reset_final_size` option for `quic_h3`. When set, a peer's
+  reset of a stream claimed by a `stream_type_handler` is reported with
+  the stream's final size, as `{stream_type_reset, Dir, StreamId,
+  ErrorCode, FinalSize}`. A WebTransport session needs it to count the
+  stream's bytes against WT_MAX_DATA: without it, every reset with data
+  in flight made the receiver count less than the sender, until the
+  sender stalled. The same option on a QUIC connection makes the owner's
+  `stream_reset` notice carry the final size. Off by default, so existing
+  owners see the same events.
+
 ## [2.4.1] - 2026-11-08
 
 ### Security
