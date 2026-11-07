@@ -870,9 +870,8 @@ decode_headers(<<2#10:2, _:6, _/binary>> = Data, RIC, Base, State, Acc) ->
     end;
 decode_headers(<<2#01:2, _N:1, T:1, _:4, _/binary>> = Data, RIC, Base, State, Acc) ->
     %% Literal Field Line with Name Reference - 01NTxxxx
-    FirstByte = hd(binary_to_list(Data)),
+    <<FirstByte, Rest0/binary>> = Data,
     IndexBits = FirstByte band 16#0F,
-    <<_, Rest0/binary>> = Data,
     {Index, Rest1} =
         case IndexBits < 15 of
             true -> {IndexBits, Rest0};
@@ -920,9 +919,8 @@ decode_headers(<<2#0011:4, H:1, NameLenPrefix:3, Rest0/binary>>, RIC, Base, Stat
     decode_headers(Rest3, RIC, Base, State, [{Name, Value} | Acc]);
 decode_headers(<<2#0001:4, _:4, _/binary>> = Data, RIC, Base, State, Acc) ->
     %% Indexed Header Field with Post-Base Index - 0001xxxx
-    FirstByte = hd(binary_to_list(Data)),
+    <<FirstByte, Rest0/binary>> = Data,
     IndexBits = FirstByte band 16#0F,
-    <<_, Rest0/binary>> = Data,
     {PostBaseIndex, Rest1} =
         case IndexBits < 15 of
             true -> {IndexBits, Rest0};
@@ -938,9 +936,8 @@ decode_headers(<<2#0001:4, _:4, _/binary>> = Data, RIC, Base, State, Acc) ->
     end;
 decode_headers(<<2#0000:4, _N:1, _:3, _/binary>> = Data, RIC, Base, State, Acc) ->
     %% Literal with post-base name reference - 0000Nxxx
-    FirstByte = hd(binary_to_list(Data)),
+    <<FirstByte, Rest0/binary>> = Data,
     IndexBits = FirstByte band 16#07,
-    <<_, Rest0/binary>> = Data,
     {PostBaseIndex, Rest1} =
         case IndexBits < 7 of
             true -> {IndexBits, Rest0};

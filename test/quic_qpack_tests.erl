@@ -698,3 +698,11 @@ short_huffman_invalid_rejected_test() ->
     %% prefix(0,0) + literal-name "x" + Huffman value (len 4) of 0xFFFFFFFF.
     Bad = <<0, 0, 16#21, "x", 16#84, 16#FF, 16#FF, 16#FF, 16#FF>>,
     ?assertMatch({error, _}, quic_qpack:decode(Bad)).
+
+%% Field lines decode in linear time: reading a line's first byte used to
+%% copy the rest of the block, so this took seconds.
+many_literal_field_lines_decode_in_linear_time_test() ->
+    Lines = binary:copy(<<16#51, 0>>, 64000),
+    {Us, {ok, Headers}} = timer:tc(fun() -> quic_qpack:decode(<<0, 0, Lines/binary>>) end),
+    ?assertEqual(64000, length(Headers)),
+    ?assert(Us < 500000).
