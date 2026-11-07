@@ -1,112 +1,57 @@
-# QUIC Interop Runner Integration
+# QUIC Interop Runner
 
-This directory contains the integration for the [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner).
+erlang_quic can be run in the [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner),
+which tests QUIC implementations against each other over a simulated
+network: handshakes, transfers, retry, resumption, 0-RTT, HTTP/3, QUIC v2,
+key updates, and in the extended cases loss, corruption, ECN, IPv6,
+rebinding and migration.
 
-## Quick Start
+## The endpoint image
 
-### Build Docker Images
-
-```bash
-# Build client image
-docker build -t erlang-quic-client -f interop/Dockerfile.client .
-
-# Build server image
-docker build -t erlang-quic-server -f interop/Dockerfile.server .
-```
-
-### Run Locally
+`interop/Dockerfile` builds one image for both roles, on the runner's
+`martenseemann/quic-network-simulator-endpoint`. `run_endpoint.sh` starts
+the interop client (`src/interop/quic_interop_client.erl`) or server
+(`src/interop/quic_interop_server.erl`) depending on `ROLE`.
 
 ```bash
-# Run server
-docker run -p 443:443/udp \
-  -v $(pwd)/certs:/certs \
-  -v $(pwd)/www:/www \
-  -e TESTCASE=handshake \
-  erlang-quic-server
-
-# Run client
-docker run \
-  -e REQUESTS="https://host.docker.internal:443/test.txt" \
-  -e TESTCASE=handshake \
-  -e DOWNLOADS=/downloads \
-  -v $(pwd)/downloads:/downloads \
-  erlang-quic-client
+docker build -t erlang-quic-interop -f interop/Dockerfile .
 ```
 
-## Supported Test Cases
+A released image is published as `ghcr.io/benoitc/erlang_quic-interop`
+by the `Interop image` workflow.
 
-All core test cases pass:
-
-| Test Case | Client | Server | Notes |
-|-----------|--------|--------|-------|
-| `handshake` | ✓ | ✓ | Basic QUIC handshake |
-| `transfer` | ✓ | ✓ | File download with flow control |
-| `retry` | ✓ | ✓ | Retry packet handling |
-| `keyupdate` | ✓ | ✓ | Key rotation during transfer |
-| `chacha20` | ✓ | ✓ | ChaCha20-Poly1305 only |
-| `multiconnect` | ✓ | ✓ | Multiple connections |
-| `v2` | ✓ | ✓ | QUIC v2 support |
-| `resumption` | ✓ | ✓ | Session resumption with PSK |
-| `zerortt` | ✓ | ✓ | 0-RTT early data |
-| `connectionmigration` | ✓ | ✓ | Active path migration |
-
-## Integration with Official Runner
-
-To add erlang-quic to the official interop runner:
-
-1. Fork https://github.com/quic-interop/quic-interop-runner
-2. Add entry to `implementations.json`:
-
-```json
-{
-  "erlang-quic": {
-    "name": "erlang-quic",
-    "url": "https://github.com/benoitc/erlang_quic",
-    "image": "erlang-quic"
-  }
-}
-```
-
-3. Push Docker images to a registry (e.g., Docker Hub, GitHub Container Registry)
-4. Submit PR to the interop runner repository
-
-## Environment Variables
-
-### Client
-
-- `REQUESTS` - Space-separated list of URLs to download
-- `TESTCASE` - Test case name
-- `DOWNLOADS` - Directory for downloaded files
-- `SSLKEYLOGFILE` - Optional: Path for TLS key log
-
-### Server
-
-- `TESTCASE` - Test case name
-- `PORT` - Listen port (default: 443)
-- `CERTS` - Certificate directory (expects cert.pem, priv.key)
-- `WWW` - Directory to serve files from
-- `SSLKEYLOGFILE` - Optional: Path for TLS key log
-
-## Exit Codes
-
-- `0` - Success
-- `1` - Failure
-- `127` - Test case not supported
-
-## Local Testing
-
-Run the local compliance tests:
+## Running the runner
 
 ```bash
-rebar3 ct --suite=quic_client_compliance_SUITE
+make interop                                    # erlang_quic against itself, core cases
+make interop INTEROP="-c quic-go,ngtcp2 -t extended"
+interop/run.sh -s picoquic -c erlang-quic -t zerortt,resumption
 ```
 
-Run interop tests against aioquic:
+`make interop` builds the image first; `interop/run.sh` uses the one
+already built.
+
+`-s` and `-c` take comma-separated names from the runner's
+`implementations_quic.json`; `-t` takes test names, `core` or
+`extended`; `-i` picks another image. The runner is cloned under
+`_build/interop` at a pinned revision and runs in its own container, so
+the host needs only Docker. Results go to `_build/interop/results/<time>`:
+`result.json` and, per cell, the endpoints' logs, the simulator's pcaps
+and the TLS key logs.
+
+A failing cell is easiest to read from the pcap with the key log:
 
 ```bash
-# Start aioquic server
-docker compose -f docker/docker-compose.yml up -d
-
-# Run tests
-rebar3 ct --suite=quic_interop_SUITE
+tshark -r sim/trace_node_left.pcap -o tls.keylog_file:server/keys.log -Y quic
 ```
+
+The runner's own checks are in its `testcases_quic.py`; a red cell is
+often a requirement there rather than in the RFC, such as a
+PATH_CHALLENGE in the first packet on a new path.
+
+## Listing on interop.seemann.io
+
+[interop.seemann.io](https://interop.seemann.io) runs every listed
+implementation against every other one daily. Joining takes a PR to the
+runner adding `implementations.json`'s entry to its
+`implementations_quic.json`, once the image is published.
