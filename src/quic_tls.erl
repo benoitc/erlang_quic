@@ -858,6 +858,8 @@ decode_tp_value(?TP_RETRY_SCID, Value) ->
     Value;
 decode_tp_value(?TP_DISABLE_ACTIVE_MIGRATION, <<>>) ->
     true;
+decode_tp_value(?TP_DISABLE_ACTIVE_MIGRATION, _) ->
+    error({transport_parameter_error, disable_active_migration_non_empty});
 decode_tp_value(?TP_RESET_STREAM_AT, <<>>) ->
     true;
 decode_tp_value(?TP_RESET_STREAM_AT, _) ->
@@ -916,7 +918,7 @@ decode_preferred_address(<<
     CIDLen:8,
     CID:CIDLen/binary,
     StatelessResetToken:16/binary
->>) when CIDLen > 0 ->
+>>) when CIDLen > 0, CIDLen =< 20 ->
     %% RFC 9000 Section 18.2: never a zero-length connection ID
     %% Parse IPv4 - zero address means not present
     {IPv4Addr, IPv4PortVal} =

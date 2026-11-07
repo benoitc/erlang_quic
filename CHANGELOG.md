@@ -14,6 +14,11 @@ All notable changes to this project will be documented in this file.
 - A client now discards a Retry whose Source Connection ID is the
   Destination Connection ID of its own Initial (RFC 9000 Section
   17.2.5.1). Before, it took the Retry and restarted the handshake.
+- A `disable_active_migration` transport parameter with a value, or a
+  `preferred_address` with a connection id longer than 20 bytes, now
+  closes the connection with TRANSPORT_PARAMETER_ERROR (RFC 9000
+  Sections 7.4 and 18.2). Before, both were accepted, and the
+  malformed `disable_active_migration` was read as allowing migration.
 
 ## [2.6.1] - 2026-11-08
 
