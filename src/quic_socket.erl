@@ -1105,6 +1105,7 @@ send_runs(Socket, Dest, [{single, Packet} | Rest]) ->
     case socket:sendmsg(Socket, Msg) of
         ok -> send_runs(Socket, Dest, Rest);
         {ok, _RestData} -> send_runs(Socket, Dest, Rest);
+        {error, emsgsize} -> send_runs(Socket, Dest, Rest);
         {error, _} = Error -> Error
     end;
 send_runs(Socket, Dest, [{gso, SegmentSize, Packets} | Rest]) ->
@@ -1122,12 +1123,17 @@ send_runs(Socket, Dest, [{gso, SegmentSize, Packets} | Rest]) ->
             %% remainder segment-by-segment, then continue with the
             %% remaining runs (mirrors flush_gso_partial).
             Data = iolist_to_binary(RestData),
-            case send_run_segments(Socket, Dest, split_into_segments(Data, SegmentSize)) of
-                ok -> send_runs(Socket, Dest, Rest);
-                {error, _} = Error -> Error
-            end;
+            send_segments_then_runs(Socket, Dest, split_into_segments(Data, SegmentSize), Rest);
+        {error, emsgsize} ->
+            send_segments_then_runs(Socket, Dest, PacketIov, Rest);
         {error, _} = Error ->
             Error
+    end.
+
+send_segments_then_runs(Socket, Dest, Segments, Runs) ->
+    case send_run_segments(Socket, Dest, Segments) of
+        ok -> send_runs(Socket, Dest, Runs);
+        {error, _} = Error -> Error
     end.
 
 send_run_segments(_Socket, _Dest, []) ->
@@ -1135,6 +1141,7 @@ send_run_segments(_Socket, _Dest, []) ->
 send_run_segments(Socket, Dest, [Packet | Rest]) ->
     case socket:sendto(Socket, Packet, Dest) of
         ok -> send_run_segments(Socket, Dest, Rest);
+        {error, emsgsize} -> send_run_segments(Socket, Dest, Rest);
         {error, _} = Error -> Error
     end.
 
@@ -1171,7 +1178,9 @@ flush_individual_genudp(
             {error, Reason, clear_batch(State)}
     end.
 
-%% Send packets using socket:sendmsg with iov (no flattening for socket backend)
+%% Send packets using socket:sendmsg with iov (no flattening for socket backend).
+%% A datagram too large for the interface is lost alone, like a PMTU probe
+%% past the path MTU, not with the rest of the batch.
 send_packets_socket(_Socket, _Dest, [], Sent) ->
     {ok, Sent};
 send_packets_socket(Socket, Dest, [Packet | Rest], Sent) ->
@@ -1184,6 +1193,8 @@ send_packets_socket(Socket, Dest, [Packet | Rest], Sent) ->
             send_packets_socket(Socket, Dest, Rest, Sent + 1);
         {ok, _Remaining} ->
             {error, partial_send, Sent};
+        {error, emsgsize} ->
+            send_packets_socket(Socket, Dest, Rest, Sent);
         {error, Reason} ->
             {error, Reason, Sent}
     end.
@@ -1196,6 +1207,8 @@ send_packets_genudp(Socket, IP, Port, [Packet | Rest], Sent) ->
     case gen_udp:send(Socket, IP, Port, Bin) of
         ok ->
             send_packets_genudp(Socket, IP, Port, Rest, Sent + 1);
+        {error, emsgsize} ->
+            send_packets_genudp(Socket, IP, Port, Rest, Sent);
         {error, Reason} ->
             {error, Reason, Sent}
     end.

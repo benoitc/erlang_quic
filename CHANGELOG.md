@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A datagram the kernel refused as too large for the interface (EMSGSIZE)
+  took the rest of its send batch with it: the packets queued behind it
+  were already counted as sent and came back as losses. Only the
+  oversized datagram is dropped now.
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed
