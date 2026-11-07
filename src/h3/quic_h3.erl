@@ -156,6 +156,7 @@
 %% Server API
 -export([
     start_server/3,
+    accept/2,
     stop_server/1,
     send_response/4,
     respond/5
@@ -704,6 +705,37 @@ resolve_per_conn_opts(Defaults, Fun, ConnPid) when is_function(Fun, 1) ->
     true = is_map(Overrides),
     maps:merge(Defaults, Overrides).
 
+%% @doc Start the server side of HTTP/3 on a QUIC connection the caller
+%% already holds, and return the HTTP/3 process.
+%%
+%% `Opts' takes the per-connection options of `start_server/3':
+%% `handler', `settings', `stream_type_handler', `h3_datagram_enabled',
+%% `max_buffered_body', `defer_requests_until_settings' and `owner'
+%% (default: the caller). The HTTP/3 process must become the QUIC
+%% connection's owner before the connection delivers stream events:
+%% return it from the listener's `alpn_handler', which makes it the
+%% owner during the handshake.
+%%
+%% ```
+%% alpn_handler => fun
+%%     (Conn, <<"h3">>) -> quic_h3:accept(Conn, #{handler => fun my_http:handle/5});
+%%     (Conn, <<"myproto">>) -> {ok, spawn(fun() -> myproto:loop(Conn) end)}
+%% end
+%% '''
+%% @end
+-spec accept(pid(), map()) -> {ok, pid()} | {error, term()}.
+accept(QuicConnPid, Opts) ->
+    try
+        build_h3_opts(Opts#{
+            handler => maps:get(handler, Opts, fun default_handler/5),
+            settings => maps:get(settings, Opts, #{})
+        })
+    of
+        H3Opts -> start_h3_process(QuicConnPid, H3Opts, maps:get(owner, Opts, self()))
+    catch
+        error:Reason -> {error, Reason}
+    end.
+
 %% @doc Stop an HTTP/3 server.
 -spec stop_server(atom()) -> ok | {error, term()}.
 stop_server(Name) ->
@@ -969,11 +1001,7 @@ h3_connection_handler(QuicConnPid, #{handler := Handler, settings := Settings} =
     end.
 
 start_h3_connection(QuicConnPid, H3Opts, Owner) ->
-    case
-        gen_statem:start_link(
-            quic_h3_connection, {server, QuicConnPid, H3Opts, Owner}, []
-        )
-    of
+    case start_h3_process(QuicConnPid, H3Opts, Owner) of
         {ok, H3Conn} ->
             %% Transfer ownership to H3 process so it receives QUIC events
             %% including the {connected, Info} notification after handshake completes
@@ -982,6 +1010,9 @@ start_h3_connection(QuicConnPid, H3Opts, Owner) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+start_h3_process(QuicConnPid, H3Opts, Owner) ->
+    gen_statem:start_link(quic_h3_connection, {server, QuicConnPid, H3Opts, Owner}, []).
 
 %% The per-connection map, validated, with the keys the connection reads.
 build_h3_opts(Opts) ->
