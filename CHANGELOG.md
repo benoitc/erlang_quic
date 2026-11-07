@@ -9,6 +9,9 @@ All notable changes to this project will be documented in this file.
   negotiated ALPN during the handshake, returns the connection's owner.
   One listener can then hand each protocol to its own process, before
   any stream data arrives.
+- `quic_h3:accept/2` starts the server side of HTTP/3 on a connection
+  the application already holds, such as one an `alpn_handler` picked
+  for `h3`.
 
 ## [2.6.1] - 2026-11-08
 
