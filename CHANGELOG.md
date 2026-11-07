@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A packet that opened with the previous 1-RTT keys was accepted even
+  when a lower-numbered packet had already used the new ones. It now
+  closes the connection with KEY_UPDATE_ERROR (RFC 9001 §6.4).
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed
