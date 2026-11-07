@@ -164,12 +164,17 @@ run_hq_server(TestCase, Port, CertDer, PrivateKey, WwwDir) ->
     case quic_listener:start_link(Port, Opts) of
         {ok, Listener} ->
             Listener6 =
-                case quic_listener:start_link(Port, V6Opts) of
-                    {ok, L6} ->
-                        [L6];
-                    {error, V6Reason} ->
-                        io:format("No IPv6 listener: ~p~n", [V6Reason]),
-                        []
+                case dual_stack(Opts) of
+                    true ->
+                        [];
+                    false ->
+                        case quic_listener:start_link(Port, V6Opts) of
+                            {ok, L6} ->
+                                [L6];
+                            {error, V6Reason} ->
+                                io:format("No IPv6 listener: ~p~n", [V6Reason]),
+                                []
+                        end
                 end,
             warm_up(Port),
             io:format("Server listening on port ~p~n", [Port]),
@@ -184,6 +189,9 @@ run_hq_server(TestCase, Port, CertDer, PrivateKey, WwwDir) ->
             io:format("Failed to start listener: ~p~n", [Failed]),
             halt(?EXIT_FAILURE)
     end.
+
+dual_stack(Opts) ->
+    lists:member({ipv6_v6only, false}, maps:get(extra_socket_opts, Opts, [])).
 
 %% The first handshake in a fresh node runs 15 to 45 ms slower than the
 %% rest, loading code and initialising crypto. Clients the runner moves
