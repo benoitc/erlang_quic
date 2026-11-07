@@ -78,7 +78,7 @@ client_data_after_the_response_reaches_the_server(Config) ->
 
 chunked_response_body_arrives_whole(Config) ->
     with_server(Config, fun(Conn) ->
-        {ok, StreamId} = quic_h3:request(Conn, get(<<"/body">>)),
+        {ok, StreamId} = quic_h3:request(Conn, get_request(<<"/body">>)),
         ?assertEqual({response, StreamId, 200}, next(Conn)),
         ?assertEqual(<<"part1part2part3">>, body(Conn, StreamId, <<>>))
     end).
@@ -193,7 +193,7 @@ connect(Path) ->
         {<<":path">>, Path}
     ].
 
-get(Path) ->
+get_request(Path) ->
     [
         {<<":method">>, <<"GET">>},
         {<<":scheme">>, <<"https">>},
