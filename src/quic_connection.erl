@@ -14540,7 +14540,7 @@ handle_peer_path_validated(PendingPath, #state{mig = #mig{path_validation_timer 
     %% Complete migration to the new peer address
     State2 = retire_replaced_dcid(OldDCID, NewDCID, complete_migration(ValidatedPath, State1)),
     %% Clear pending validation state including old path validation
-    release_held(State2#state{
+    State3 = release_held(State2#state{
         mig = (State2#state.mig)#mig{
             pending_peer_validation = undefined,
             old_path_validation = undefined,
@@ -14550,7 +14550,9 @@ handle_peer_path_validated(PendingPath, #state{mig = #mig{path_validation_timer 
             path_validation_timer = undefined,
             path_validation_token = undefined
         }
-    }).
+    }),
+    %% An active migration reset PMTU to the base size; search again.
+    maybe_send_pmtu_probe(State3).
 
 %% @doc Auto-migrate to preferred address if the validated path matches.
 %% RFC 9000 Section 9.6: Client SHOULD migrate to validated preferred address.
