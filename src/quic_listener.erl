@@ -125,6 +125,7 @@
 
 %% How long a stopping listener waits for its connections to close.
 -define(CLOSE_CONNECTIONS_MS, 1000).
+-define(RETRY_TOKEN_MAX_AGE_MS, 10000).
 
 -define(QUIC_LOG_META, #{
     domain => [erlang_quic, listener], report_cb => fun quic_log:format_report/2
@@ -1515,7 +1516,14 @@ validate_initial_token(Secret, Token, Addr, MaxAge) ->
             Err
     end.
 
-validate_token_age(Decoded, MaxAge) ->
+%% RFC 9000 Section 8.1.3: a Retry token comes straight back, so it is
+%% accepted only briefly; a NEW_TOKEN token lasts `MaxAge'.
+validate_token_age(#{kind := Kind} = Decoded, MaxAge0) ->
+    MaxAge =
+        case Kind of
+            retry -> min(MaxAge0, ?RETRY_TOKEN_MAX_AGE_MS);
+            new_token -> MaxAge0
+        end,
     case quic_address_token:validate(Decoded, #{max_age_ms => MaxAge}) of
         ok -> {ok, Decoded};
         {error, _} = Err -> Err
