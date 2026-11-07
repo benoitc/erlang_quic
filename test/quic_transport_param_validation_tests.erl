@@ -23,6 +23,15 @@ preferred_address_with_empty_cid_test() ->
         {error, _}, quic_tls:decode_transport_params(<<16#0d, (byte_size(PA)), PA/binary>>)
     ).
 
+preferred_address_with_long_cid_test() ->
+    PA = <<0:32, 0:16, 0:128, 0:16, 21, 0:168, 0:128>>,
+    ?assertMatch(
+        {error, _}, quic_tls:decode_transport_params(<<16#0d, (byte_size(PA)), PA/binary>>)
+    ).
+
+disable_active_migration_with_value_test() ->
+    ?assertMatch({error, _}, quic_tls:decode_transport_params(<<16#0c, 1, 1>>)).
+
 retry_scid_without_retry_test() ->
     ?assertMatch(
         {pending_close, transport, ?QUIC_TRANSPORT_PARAMETER_ERROR, _},
