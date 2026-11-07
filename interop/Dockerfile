@@ -22,7 +22,7 @@ RUN rebar3 compile \
 # runtime and its OpenSSL come from the builder.
 FROM martenseemann/quic-network-simulator-endpoint:latest
 COPY --from=builder /usr/local/lib/erlang /usr/local/lib/erlang
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /usr/lib/x86_64-linux-gnu/libssl.so.3 /opt/ossl/
+COPY --from=builder /usr/lib/*-linux-gnu/libcrypto.so.3 /usr/lib/*-linux-gnu/libssl.so.3 /opt/ossl/
 RUN ln -sf /usr/local/lib/erlang/bin/erl /usr/local/bin/erl \
     && ln -sf /usr/local/lib/erlang/bin/escript /usr/local/bin/escript
 WORKDIR /app
