@@ -1131,6 +1131,8 @@ parse_packet_header(
     case supported_version(Version) of
         false ->
             {unsupported_version, DCID, SCID, Version};
+        true when DCIDLenField > 20; SCIDLen > 20 ->
+            {error, cid_too_long};
         true ->
             case quic_packet:bits_to_type(PacketType, Version) of
                 initial -> {initial, DCID, SCID, Version, Rest};
