@@ -33,6 +33,7 @@
     cancel_stream/3,
     goaway/1,
     close/1,
+    close/2,
     get_settings/1,
     get_peer_settings/1,
     get_quic_conn/1,
@@ -416,6 +417,11 @@ goaway(Conn) ->
 close(Conn) ->
     gen_statem:cast(Conn, close).
 
+%% @doc Close the connection, sending ErrorCode in CONNECTION_CLOSE.
+-spec close(pid(), error_code()) -> ok.
+close(Conn, ErrorCode) ->
+    gen_statem:cast(Conn, {close, ErrorCode}).
+
 %% @doc Get local settings.
 -spec get_settings(pid()) -> map().
 get_settings(Conn) ->
@@ -658,6 +664,8 @@ bootstrapping({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 bootstrapping(cast, close, State) ->
     close_with(normal, State);
+bootstrapping(cast, {close, ErrorCode}, State) ->
+    close_with_code(ErrorCode, State);
 bootstrapping(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 bootstrapping(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
@@ -776,6 +784,8 @@ early_data({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 early_data(cast, close, State) ->
     close_with(normal, State);
+early_data(cast, {close, ErrorCode}, State) ->
+    close_with_code(ErrorCode, State);
 early_data(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
     {keep_state, tell_send_ready(State)};
 early_data(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
@@ -851,6 +861,8 @@ awaiting_quic({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 awaiting_quic(cast, close, State) ->
     close_with(normal, State);
+awaiting_quic(cast, {close, ErrorCode}, State) ->
+    close_with_code(ErrorCode, State);
 awaiting_quic(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
     close_with(owner_down, State);
 awaiting_quic(info, {'DOWN', Ref, process, _, Reason}, #state{quic_ref = Ref} = State) ->
@@ -956,6 +968,8 @@ h3_connecting({call, From}, get_quic_conn, #state{quic_conn = QuicConn}) ->
     {keep_state_and_data, [{reply, From, QuicConn}]};
 h3_connecting(cast, close, State) ->
     close_with(normal, State);
+h3_connecting(cast, {close, ErrorCode}, State) ->
+    close_with_code(ErrorCode, State);
 h3_connecting(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
     {keep_state, tell_send_ready(State)};
 h3_connecting(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
@@ -1254,6 +1268,8 @@ live_event(cast, {cancel_stream, StreamId, ErrorCode}, State) ->
     {keep_state, State1};
 live_event(cast, close, State) ->
     close_with(normal, State);
+live_event(cast, {close, ErrorCode}, State) ->
+    close_with_code(ErrorCode, State);
 live_event(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
     {keep_state, tell_send_ready(State)};
 live_event(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
@@ -4952,6 +4968,11 @@ state_record_size() ->
 
 %% Every way into `closing' records why, because the enter clause is the
 %% only place the owner is told and it has nothing else to go on.
+%% close/2: the peer sees ErrorCode, the owner a normal close.
+close_with_code(ErrorCode, #state{quic_conn = QuicConn} = State) ->
+    quic:safe_close(QuicConn, ErrorCode, <<>>),
+    close_with(normal, State).
+
 close_with(Reason, State) ->
     {next_state, closing, State#state{close_reason = Reason, deferred_requests = []}}.
 

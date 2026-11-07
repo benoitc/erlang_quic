@@ -9,6 +9,8 @@ All notable changes to this project will be documented in this file.
   request that arrives before the client's SETTINGS waits for them, so
   the handler always sees the peer's settings. WebTransport draft-17
   requires this, as the client's settings select the draft version.
+- `quic_h3:close/2` closes the connection with an HTTP/3 error code, such
+  as H3_SETTINGS_ERROR or H3_ID_ERROR, which the peer receives.
 
 ### Changed
 - `wt_enabled` in HTTP/3 settings now means the WebTransport draft-17

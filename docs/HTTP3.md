@@ -158,6 +158,22 @@ Close the connection.
 
 Immediately closes the HTTP/3 connection and underlying QUIC connection.
 
+#### close/2
+
+Close the connection with an HTTP/3 error code.
+
+```erlang
+-spec close(conn(), error_code()) -> ok.
+```
+
+Same as `close/1`, but the peer receives `ErrorCode` in CONNECTION_CLOSE.
+Use it for connection errors the application detects, such as
+`H3_SETTINGS_ERROR` (0x109) or `H3_ID_ERROR` (0x108) in WebTransport.
+
+```erlang
+ok = quic_h3:close(Conn, 16#109).
+```
+
 #### set_stream_handler/3, set_stream_handler/4
 
 Register a handler to receive stream body data.

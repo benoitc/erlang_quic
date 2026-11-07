@@ -112,6 +112,7 @@
     cancel/3,
     goaway/1,
     close/1,
+    close/2,
     %% Per-stream handler registration
     set_stream_handler/3,
     set_stream_handler/4,
@@ -469,6 +470,15 @@ goaway(Conn) ->
 -spec close(conn()) -> ok.
 close(Conn) ->
     quic_h3_connection:close(Conn).
+
+%% @doc Close the connection with an HTTP/3 error code.
+%%
+%% Same as `close/1', but the peer receives `ErrorCode' in CONNECTION_CLOSE,
+%% for example `H3_SETTINGS_ERROR' (0x109) or `H3_ID_ERROR' (0x108).
+%% @end
+-spec close(conn(), error_code()) -> ok.
+close(Conn, ErrorCode) when is_integer(ErrorCode), ErrorCode >= 0, ErrorCode < (1 bsl 62) ->
+    quic_h3_connection:close(Conn, ErrorCode).
 
 %% @doc Register a handler to receive stream body data.
 %%
