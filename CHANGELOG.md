@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 - An idle timeout after the handshake sent a CONNECTION_CLOSE to a peer
   that had most likely discarded the connection already. The connection
   now closes silently, as it already did during the handshake.
+- After sending CONNECTION_CLOSE a connection ignored the peer's
+  packets, so when the close was lost the peer kept retransmitting until
+  its idle timeout. Packets from the peer's address are now answered with
+  the close again, at an exponentially decreasing rate.
 
 ## [2.6.1] - 2026-11-08
 
