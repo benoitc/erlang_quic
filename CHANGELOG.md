@@ -13,6 +13,12 @@ All notable changes to this project will be documented in this file.
   held to three times what it received from it, as RFC 9000 requires; a
   response the full-size datagram does not fit in goes out alone and
   smaller, and the path is challenged once a full-size datagram fits.
+- A client that moved twice before the handshake was confirmed was
+  followed to its second address without that address being validated
+  or the amount sent to it being limited, so its data went out in full
+  to an address that had sent only a packet. The second address is now
+  validated like the first, and until it is the server sends it at most
+  three times what it received from it.
 
 ## [2.6.1] - 2026-11-08
 

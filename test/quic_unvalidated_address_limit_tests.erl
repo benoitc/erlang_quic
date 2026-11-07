@@ -14,6 +14,7 @@
 -include_lib("quic/src/quic_connection_state.hrl").
 
 -define(OLD, {{127, 0, 0, 1}, 40000}).
+-define(SPOOFED, {{127, 0, 0, 1}, 40001}).
 
 holds_data_beyond_three_times_received_test() ->
     with_peer(fun(Peer, Sock) ->
@@ -91,6 +92,19 @@ probe_answer_is_padded_when_the_limit_allows_test() ->
         )
     end).
 
+holds_data_to_a_second_address_during_the_handshake_test() ->
+    with_peer(fun(Peer, Sock) ->
+        S1 = hs_recv(1, 100, ?SPOOFED, handshaking()),
+        S2 = hs_recv(2, 100, Peer, S1),
+        ?assertEqual(Peer, S2#state.remote_addr),
+        ?assertMatch([C] when byte_size(C) =< 300, recv_all(Sock)),
+        _ = quic_connection:send_frame({stream, 0, 0, binary:copy(<<"x">>, 1000), false}, S2),
+        ?assertEqual([], recv_all(Sock))
+    end).
+
+hs_recv(PN, Size, From, State) ->
+    quic_connection:handle_packet(From, packet(PN, ping, Size, State), State).
+
 recv(PN, Size, From, State) ->
     quic_connection:server_recv_pass([packet(PN, ping, Size, State)], From, undefined, State).
 
@@ -135,6 +149,10 @@ with_spare_cid(S) ->
     quic_connection:process_frame(
         app, {new_connection_id, 1, 0, <<1:64>>, crypto:strong_rand_bytes(16)}, S
     ).
+
+handshaking() ->
+    #state{hs = Hs} = S = state(),
+    S#state{hs = Hs#hs{pn_initial = #pn_space{}, pn_handshake = #pn_space{}}}.
 
 %% Takes the path_changed notices, which would otherwise reach later tests.
 owner() ->
