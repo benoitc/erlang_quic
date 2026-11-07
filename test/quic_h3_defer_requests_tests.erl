@@ -2,7 +2,8 @@
 %%%
 %%% Server option defer_requests_until_settings: a request whose HEADERS
 %%% arrive before the client's SETTINGS is dispatched only once SETTINGS
-%%% are applied (WebTransport draft-17 §7.1).
+%%% are applied, and so are the streams a stream_type_handler would see
+%%% (WebTransport draft-17 §7.1).
 
 -module(quic_h3_defer_requests_tests).
 
@@ -66,6 +67,67 @@ request_not_deferred_by_default_test_() ->
         stop(Conn, Fake)
     end}.
 
+%% A WebTransport uni stream and bidi stream that arrive before SETTINGS
+%% reach the owner after them, in arrival order.
+streams_held_until_settings_test_() ->
+    {setup, fun setup/0, fun teardown/1, fun() ->
+        {Fake, Conn} = start_server(wt_opts(#{defer_requests_until_settings => true})),
+        Conn ! {quic, Fake, {stream_data, 6, <<16#40, 16#54, 0, "u1">>, false}},
+        Conn ! {quic, Fake, {stream_data, 6, <<"u2">>, false}},
+        Conn ! {quic, Fake, {stream_data, 4, <<16#40, 16#41, 0, "b1">>, false}},
+        refute_stream_event(Conn),
+        send_settings(Conn, Fake),
+        ?assertEqual(
+            [
+                {stream_type_open, uni, 6, 16#54},
+                {stream_type_data, uni, 6, <<0, "u1">>, false},
+                {stream_type_data, uni, 6, <<"u2">>, false},
+                {stream_type_open, bidi, 4, 16#41},
+                {stream_type_data, bidi, 4, <<0, "b1">>, false}
+            ],
+            [next_stream_event(Conn) || _ <- lists:seq(1, 5)]
+        ),
+        stop(Conn, Fake)
+    end}.
+
+streams_not_held_by_default_test_() ->
+    {setup, fun setup/0, fun teardown/1, fun() ->
+        {Fake, Conn} = start_server(wt_opts(#{})),
+        Conn ! {quic, Fake, {stream_data, 4, <<16#40, 16#41, 0>>, false}},
+        ?assertEqual({stream_type_open, bidi, 4, 16#41}, next_stream_event(Conn)),
+        stop(Conn, Fake)
+    end}.
+
+%% A held stream the peer resets never reaches the owner.
+reset_held_stream_is_dropped_test_() ->
+    {setup, fun setup/0, fun teardown/1, fun() ->
+        {Fake, Conn} = start_server(wt_opts(#{defer_requests_until_settings => true})),
+        Conn ! {quic, Fake, {stream_data, 6, <<16#40, 16#54, 0>>, false}},
+        Conn ! {quic, Fake, {stream_reset, 6, 16#10c}},
+        send_settings(Conn, Fake),
+        refute_stream_event(Conn),
+        stop(Conn, Fake)
+    end}.
+
+%% What is held before SETTINGS is bounded by max_buffered_body.
+held_streams_are_bounded_test_() ->
+    {setup, fun setup/0, fun teardown/1, fun() ->
+        Self = self(),
+        meck:expect(quic, safe_close, fun(_, Code, _) ->
+            Self ! {quic_close, Code},
+            ok
+        end),
+        {Fake, Conn} = start_server(
+            wt_opts(#{defer_requests_until_settings => true, max_buffered_body => 8})
+        ),
+        Conn ! {quic, Fake, {stream_data, 6, <<16#40, 16#54, 0:64>>, false}},
+        receive
+            {quic_close, Code} -> ?assertEqual(16#0107, Code)
+        after 500 -> error(no_close)
+        end,
+        stop(Conn, Fake)
+    end}.
+
 bad_option_value_is_rejected_test() ->
     ?assertError(
         {bad_opts, {defer_requests_until_settings, yes}},
@@ -88,6 +150,23 @@ start_server(Opts) ->
     Conn ! {quic, Fake, {connected, #{}}},
     wait_state(Conn, h3_connecting, 500),
     {Fake, Conn}.
+
+wt_opts(Opts) ->
+    Opts#{stream_type_handler => fun(_Dir, _StreamId, _Type) -> claim end}.
+
+next_stream_event(Conn) ->
+    receive
+        {quic_h3, Conn, {stream_type_open, _, _, _} = E} -> E;
+        {quic_h3, Conn, {stream_type_data, _, _, _, _} = E} -> E
+    after 500 -> no_stream_event
+    end.
+
+refute_stream_event(Conn) ->
+    receive
+        {quic_h3, Conn, {stream_type_open, _, _, _} = E} -> error({early, E});
+        {quic_h3, Conn, {stream_type_data, _, _, _, _} = E} -> error({early, E})
+    after 100 -> ok
+    end.
 
 send_request(Conn, Fake) ->
     send_request(Conn, Fake, 0, <<"/">>).

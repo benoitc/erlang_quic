@@ -326,7 +326,7 @@ Start an HTTP/3 server.
 | `handler` | fun/5 or module | No | Request handler |
 | `settings` | map | No | HTTP/3 settings |
 | `quic_opts` | map | No | Additional QUIC options |
-| `defer_requests_until_settings` | boolean | No | Hold each request until the client's SETTINGS arrive, so `get_peer_settings/1` is a map in the handler. WebTransport draft-17 requires it. Default `false` |
+| `defer_requests_until_settings` | boolean | No | Hold each request, and each stream a `stream_type_handler` would see, until the client's SETTINGS arrive, so `get_peer_settings/1` is a map in the handler. What is held counts against `max_buffered_body`. WebTransport draft-17 requires it. Default `false` |
 
 The handler can be:
 - A function: `fun(Conn, StreamId, Method, Path, Headers) -> ok`

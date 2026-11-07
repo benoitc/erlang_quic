@@ -3351,7 +3351,10 @@ make_test_state(Overrides) ->
         send_blocked => #{},
         peer_goaway_id => undefined,
         defer_requests => false,
-        deferred_requests => []
+        deferred_requests => [],
+        held_streams => #{},
+        held_data => [],
+        held_bytes => 0
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -3387,7 +3390,8 @@ make_test_state(Overrides) ->
         maps:get(has_early_keys, Merged), maps:get(quic_connected, Merged),
         maps:get(close_reason, Merged), maps:get(send_blocked, Merged),
         maps:get(peer_goaway_id, Merged), maps:get(defer_requests, Merged),
-        maps:get(deferred_requests, Merged)}.
+        maps:get(deferred_requests, Merged), maps:get(held_streams, Merged),
+        maps:get(held_data, Merged), maps:get(held_bytes, Merged)}.
 
 %%====================================================================
 %% WT_STREAM placement (draft-ietf-webtrans-http3-17 §4.3)

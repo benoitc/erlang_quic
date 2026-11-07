@@ -6,9 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - HTTP/3 server option `defer_requests_until_settings`. When set, a
-  request that arrives before the client's SETTINGS waits for them, so
-  the handler always sees the peer's settings. WebTransport draft-17
-  requires this, as the client's settings select the draft version.
+  request or WebTransport stream that arrives before the client's
+  SETTINGS waits for them, so the application always sees the peer's
+  settings. WebTransport draft-17 requires this, as the client's settings
+  select the draft version.
 - `quic_h3:close/2` closes the connection with an HTTP/3 error code, such
   as H3_SETTINGS_ERROR or H3_ID_ERROR, which the peer receives.
 

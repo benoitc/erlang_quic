@@ -87,6 +87,11 @@
             element(1, C) =:= consume))
 ).
 
+%% defer_requests_until_settings is on and the peer's SETTINGS are not in.
+-define(HOLDING_STREAMS(S),
+    (S#state.defer_requests andalso not S#state.settings_received)
+).
+
 %% The peer opened this stream: client-initiated ids are even.
 -define(IS_PEER_STREAM(Id, S), ((S#state.role =:= server) =:= ((Id) band 1 =:= 0))).
 
@@ -320,7 +325,14 @@
     %% complete before the peer's SETTINGS wait in deferred_requests,
     %% newest first, and are dispatched once SETTINGS are applied.
     defer_requests = false :: boolean(),
-    deferred_requests = [] :: [{stream_id(), binary(), binary(), [{binary(), binary()}]}]
+    deferred_requests = [] :: [{stream_id(), binary(), binary(), [{binary(), binary()}]}],
+    %% Same option: bytes of streams a stream_type_handler would see,
+    %% held until SETTINGS and replayed in arrival order. held_streams
+    %% names them, held_data is newest first, held_bytes bounds it by
+    %% max_buffered_body.
+    held_streams = #{} :: #{stream_id() => true},
+    held_data = [] :: [{stream_id(), binary(), boolean()}],
+    held_bytes = 0 :: non_neg_integer()
 }).
 
 %%====================================================================
@@ -1506,6 +1518,10 @@ stream_blocked_by_goaway(_StreamId, client, _State) ->
     %% client-initiated and not constrained by the goaway_id value.
     false.
 
+handle_stream_data(StreamId, Data, Fin, #state{held_streams = Held} = State) when
+    is_map_key(StreamId, Held)
+->
+    hold_stream_data(StreamId, Data, Fin, State);
 handle_stream_data(StreamId, Data, Fin, State) ->
     case classify_stream(StreamId, State) of
         {uni, discarded} ->
@@ -1531,6 +1547,8 @@ handle_stream_data(StreamId, Data, Fin, State) ->
             handle_encoder_stream_data(Data, State);
         {uni, qpack_decoder} ->
             handle_decoder_stream_data(Data, State);
+        {bidi, pending_type} when ?HOLDING_STREAMS(State) ->
+            hold_stream_data(StreamId, Data, Fin, State);
         {bidi, pending_type} ->
             handle_bidi_stream_type(StreamId, Data, Fin, State);
         {bidi, {claimed, _Type}} ->
@@ -1629,6 +1647,11 @@ handle_uni_stream_type(StreamId, Data, Fin, #state{uni_stream_buffers = Buffers}
     Buffer = maps:get(StreamId, Buffers, <<>>),
     Combined = <<Buffer/binary, Data/binary>>,
     case quic_h3_frame:decode_stream_type(Combined) of
+        {ok, {unknown, _}, _Rest} when
+            ?HOLDING_STREAMS(State), State#state.stream_type_handler =/= undefined
+        ->
+            State1 = State#state{uni_stream_buffers = maps:remove(StreamId, Buffers)},
+            hold_stream_data(StreamId, Combined, Fin, State1);
         {ok, Type, Rest} ->
             State1 = State#state{uni_stream_buffers = maps:remove(StreamId, Buffers)},
             case assign_uni_stream(StreamId, Type, State1) of
@@ -1877,11 +1900,12 @@ handle_control_frame({settings, Settings}, #state{settings_received = false} = S
     %% error that flows through handle_connection_error/2 for a clean close.
     try apply_peer_settings(Settings, State) of
         State1 ->
-            {ok,
+            replay_held_streams(
                 dispatch_deferred_requests(State1#state{
                     peer_settings = Settings,
                     settings_received = true
-                })}
+                })
+            )
     catch
         throw:{connection_error, _Code, _Reason} = Err ->
             {error, Err}
@@ -3153,6 +3177,47 @@ dispatch_deferred_requests(#state{deferred_requests = Q, owner = Owner, streams 
         lists:reverse(Q)
     ),
     State#state{deferred_requests = []}.
+
+%% WebTransport draft-17 §7.1: stream headers depend on the draft the
+%% client's SETTINGS select, so the streams wait for them.
+hold_stream_data(StreamId, Data, Fin, #state{held_bytes = Bytes} = State) ->
+    case Bytes + byte_size(Data) > State#state.max_buffered_body of
+        true ->
+            {error, {connection_error, ?H3_EXCESSIVE_LOAD, <<"streams held before SETTINGS">>},
+                State};
+        false ->
+            {ok, State#state{
+                held_streams = (State#state.held_streams)#{StreamId => true},
+                held_data = [{StreamId, Data, Fin} | State#state.held_data],
+                held_bytes = Bytes + byte_size(Data)
+            }}
+    end.
+
+replay_held_streams(#state{held_data = []} = State) ->
+    {ok, State};
+replay_held_streams(#state{held_data = Held} = State) ->
+    replay_held(lists:reverse(Held), State#state{
+        held_streams = #{}, held_data = [], held_bytes = 0
+    }).
+
+replay_held([], State) ->
+    {ok, State};
+replay_held([{StreamId, Data, Fin} | Rest], State) ->
+    case handle_stream_data(StreamId, Data, Fin, State) of
+        {ok, State1} -> replay_held(Rest, State1);
+        {error, Reason, _State1} -> {error, Reason}
+    end.
+
+%% A held stream the peer resets is dropped before anyone saw it.
+drop_held_stream(StreamId, #state{held_streams = Held} = State) when is_map_key(StreamId, Held) ->
+    Kept = [E || {Id, _, _} = E <- State#state.held_data, Id =/= StreamId],
+    State#state{
+        held_streams = maps:remove(StreamId, Held),
+        held_data = Kept,
+        held_bytes = lists:sum([byte_size(D) || {_, D, _} <- Kept])
+    };
+drop_held_stream(_StreamId, State) ->
+    State.
 
 %% HEADERS carrying the FIN end the body as well (a GET, HEAD, 204 or
 %% 304), so the reader gets the same empty fin-marked delivery a bare FIN
@@ -4987,7 +5052,13 @@ close_with_code(ErrorCode, #state{quic_conn = QuicConn} = State) ->
     close_with(normal, State).
 
 close_with(Reason, State) ->
-    {next_state, closing, State#state{close_reason = Reason, deferred_requests = []}}.
+    {next_state, closing, State#state{
+        close_reason = Reason,
+        deferred_requests = [],
+        held_streams = #{},
+        held_data = [],
+        held_bytes = 0
+    }}.
 
 tell_peer_goaway(#state{owner = Owner, peer_goaway_id = Id}) ->
     Owner ! {quic_h3, self(), {goaway, Id}}.
@@ -5035,7 +5106,8 @@ report_local_reset(StreamId, ErrorCode, State) ->
 
 %% RESET_STREAM or RESET_STREAM_AT from the peer: clean up, then tell
 %% whoever waits on a request stream. Claimed streams were told already.
-handle_peer_reset(StreamId, ErrorCode, State) ->
+handle_peer_reset(StreamId, ErrorCode, State0) ->
+    State = drop_held_stream(StreamId, State0),
     case handle_stream_closed(StreamId, ErrorCode, State) of
         {ok, State1} ->
             case is_request_stream(StreamId, State) of

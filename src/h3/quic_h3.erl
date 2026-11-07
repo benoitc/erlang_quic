@@ -238,8 +238,9 @@
     %% Default 16 MiB. A stream whose body would cross it is reset with
     %% H3_EXCESSIVE_LOAD.
     max_buffered_body => non_neg_integer(),
-    %% Hold each request until the client's SETTINGS have arrived, so the
-    %% handler can read them (WebTransport draft-17 §7.1). Default false.
+    %% Hold each request, and each stream a stream_type_handler would see,
+    %% until the client's SETTINGS have arrived, so the handler can read
+    %% them (WebTransport draft-17 §7.1). Default false.
     defer_requests_until_settings => boolean(),
     %% Per-connection configuration override; the returned map's
     %% `owner', `handler', `stream_type_handler', `h3_datagram_enabled',
