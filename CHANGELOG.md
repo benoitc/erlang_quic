@@ -12,6 +12,13 @@ All notable changes to this project will be documented in this file.
   retirement to the address the client had just left; if that network
   was gone the id never arrived. Replies to the packet that moves a
   client now go to its new address.
+- With a `stream_type_handler` set, as every WebTransport client and
+  server has, a request stream was reset with H3_FRAME_UNEXPECTED as soon
+  as its second piece of data arrived: a WebTransport session ended at the
+  first capsule after the 2xx, and a response body in several packets
+  never arrived. Each new piece was taken for the start of a new stream
+  and the stream's state was thrown away. Only a new stream the peer
+  opens is now offered to the handler.
 
 ## [2.3.0] - 2026-11-07
 

@@ -3506,3 +3506,53 @@ oversized_push_trailers_cancel_only_the_push_test_() ->
             ),
             _ = State1
         end}.
+
+%%====================================================================
+%% Known request streams with a stream_type_handler set
+%%====================================================================
+
+claim_wt_only(bidi, _StreamId, 16#41) -> claim;
+claim_wt_only(_Dir, _StreamId, _Type) -> ignore.
+
+%% DATA after the response on the client's own request stream reaches the
+%% owner; the stream keeps its state.
+data_on_own_request_stream_with_handler_test() ->
+    Stream = #h3_stream{
+        id = 0,
+        type = request,
+        state = half_closed_local,
+        status = 200,
+        frame_state = expecting_data
+    },
+    State = make_test_state(#{
+        role => client, stream_type_handler => fun claim_wt_only/3, streams => #{0 => Stream}
+    }),
+    flush_mailbox(),
+    {ok, S1} = quic_h3_connection:handle_stream_data(
+        0, quic_h3_frame:encode({data, <<"x">>}), false, State
+    ),
+    Self = self(),
+    receive
+        {quic_h3, Self, {data, 0, <<"x">>, false}} -> ok
+    after 100 -> ?assert(false)
+    end,
+    ?assertMatch(
+        #h3_stream{status = 200, frame_state = expecting_data},
+        quic_h3_connection:test_stream(0, S1)
+    ).
+
+%% The same on a peer request stream the server already knows.
+data_on_known_peer_request_stream_with_handler_test() ->
+    Stream = #h3_stream{
+        id = 0, type = request, state = open, method = <<"POST">>, frame_state = expecting_data
+    },
+    State = make_test_state(#{
+        role => server, stream_type_handler => fun claim_wt_only/3, streams => #{0 => Stream}
+    }),
+    {ok, S1} = quic_h3_connection:handle_stream_data(
+        0, quic_h3_frame:encode({data, <<"x">>}), false, State
+    ),
+    ?assertMatch(
+        #h3_stream{method = <<"POST">>, frame_state = expecting_data},
+        quic_h3_connection:test_stream(0, S1)
+    ).

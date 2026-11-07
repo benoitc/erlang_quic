@@ -1491,12 +1491,19 @@ handle_new_stream(StreamId, bidirectional, #state{role = Role} = State) ->
 open_bidi_request_stream(
     StreamId, #state{streams = Streams, role = Role} = State
 ) ->
-    Stream = #h3_stream{
-        id = StreamId,
-        type = request,
-        state = open
-    },
-    NewState = State#state{streams = Streams#{StreamId => Stream}},
+    %% A stream already known keeps its record: replacing it would lose
+    %% its headers and frame state.
+    NewState =
+        case Streams of
+            #{StreamId := _} ->
+                State;
+            _ ->
+                State#state{
+                    streams = Streams#{
+                        StreamId => #h3_stream{id = StreamId, type = request, state = open}
+                    }
+                }
+        end,
     case Role of
         server ->
             {ok, NewState#state{
@@ -1622,12 +1629,22 @@ classify_fresh_uni_stream(StreamId, Buffers, Received, State) ->
 %% {bidi, pending_type} so the dispatcher lets handle_bidi_stream_type/4
 %% peek the first varint and consult the handler (claim vs. ignore).
 %% Without a handler the stream goes straight to the HTTP/3 request path.
-classify_stream_type(StreamId, #state{stream_type_handler = Handler}) ->
-    %% Check if it's a bidirectional stream (bit 1 = 0 for bidi)
+classify_stream_type(StreamId, #state{stream_type_handler = Handler, streams = Streams} = State) ->
+    %% Check if it's a bidirectional stream (bit 1 = 0 for bidi). Only a
+    %% new stream the peer opened can start with a stream-type signal
+    %% (WebTransport draft-17 Section 4.3); a known or locally opened one
+    %% is a request stream.
     case StreamId band 2 of
-        0 when Handler =/= undefined -> {bidi, pending_type};
-        0 -> {bidi, request};
-        2 -> unknown
+        0 when
+            Handler =/= undefined,
+            not is_map_key(StreamId, Streams),
+            ?IS_PEER_STREAM(StreamId, State)
+        ->
+            {bidi, pending_type};
+        0 ->
+            {bidi, request};
+        2 ->
+            unknown
     end.
 
 %% Find push ID by stream ID in received_pushes map (values are #h3_stream{}).
