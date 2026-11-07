@@ -20,6 +20,10 @@
 -define(H3_FRAME_GOAWAY, 16#07).
 -define(H3_FRAME_MAX_PUSH_ID, 16#0D).
 
+%% WT_STREAM signal (draft-ietf-webtrans-http3-17 §4.3): only valid as the
+%% first bytes of a bidirectional stream, sent by its initiator.
+-define(H3_FRAME_WT_STREAM, 16#41).
+
 %% Reserved frame types (RFC 9114 Section 7.2.8)
 %% 0x1f * N + 0x21 for any non-negative integer N
 

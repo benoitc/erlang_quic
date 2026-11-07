@@ -3385,3 +3385,54 @@ make_test_state(Overrides) ->
         maps:get(has_early_keys, Merged), maps:get(quic_connected, Merged),
         maps:get(close_reason, Merged), maps:get(send_blocked, Merged),
         maps:get(peer_goaway_id, Merged)}.
+
+%%====================================================================
+%% WT_STREAM placement (draft-ietf-webtrans-http3-17 §4.3)
+%%====================================================================
+
+wt_stream_on_control_stream_is_connection_error_test() ->
+    State = make_test_state(#{role => server, settings_received => true}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+        quic_h3_connection:handle_control_frame({unknown, 16#41, <<>>}, State)
+    ).
+
+wt_stream_on_push_stream_is_connection_error_test() ->
+    State = make_test_state(#{role => client}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+        quic_h3_connection:handle_push_frame(3, 0, {unknown, 16#41, <<>>}, false, State)
+    ).
+
+%% A reserved frame first, then WT_STREAM: not the first bytes.
+wt_stream_mid_request_stream_is_connection_error_test() ->
+    State = make_test_state(#{role => server}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}, _},
+        quic_h3_connection:handle_stream_data(
+            0, <<16#21, 0, 16#40, 16#41, 0>>, false, State
+        )
+    ).
+
+wt_stream_mid_request_stream_split_is_connection_error_test() ->
+    State0 = make_test_state(#{role => server}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, <<16#21, 0>>, false, State0),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}, _},
+        quic_h3_connection:handle_stream_data(0, <<16#40, 16#41, 0>>, false, State1)
+    ).
+
+%% Only the initiator may send it: the server cannot on a client's stream.
+wt_stream_from_non_initiator_is_connection_error_test() ->
+    State = make_test_state(#{role => client}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}, _},
+        quic_h3_connection:handle_stream_data(0, <<16#40, 16#41, 0>>, false, State)
+    ).
+
+%% First bytes of a peer-opened stream stay allowed without a handler.
+wt_stream_first_bytes_of_peer_stream_allowed_test() ->
+    State = make_test_state(#{role => server}),
+    ?assertMatch(
+        {ok, _}, quic_h3_connection:handle_stream_data(0, <<16#40, 16#41, 0>>, false, State)
+    ).

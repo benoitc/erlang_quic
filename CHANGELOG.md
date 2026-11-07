@@ -11,6 +11,12 @@ All notable changes to this project will be documented in this file.
   `quic_h3_frame:setting_to_id/1` is exported to turn a setting name into
   its id.
 
+### Fixed
+- A WebTransport stream signal (0x41) found anywhere other than the start
+  of a bidirectional stream opened by the peer was skipped. It now closes
+  the connection with H3_FRAME_UNEXPECTED, as WebTransport draft-17
+  requires.
+
 ## [2.2.1] - 2026-11-07
 
 ### Changed

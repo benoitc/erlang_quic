@@ -86,6 +86,9 @@
             element(1, C) =:= consume))
 ).
 
+%% The peer opened this stream: client-initiated ids are even.
+-define(IS_PEER_STREAM(Id, S), ((S#state.role =:= server) =:= ((Id) band 1 =:= 0))).
+
 %% Test exports - only available when compiled with TEST defined
 -ifdef(TEST).
 -export([
@@ -1896,6 +1899,8 @@ handle_control_frame({headers, _}, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"HEADERS on control stream">>}};
 handle_control_frame({push_promise, _, _}, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"PUSH_PROMISE on control stream">>}};
+handle_control_frame({unknown, ?H3_FRAME_WT_STREAM, _}, _State) ->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"WT_STREAM on control stream">>}};
 handle_control_frame({unknown, Type, Payload}, State) ->
     %% Check for PRIORITY_UPDATE frames (RFC 9218)
     case Type of
@@ -2257,6 +2262,8 @@ handle_push_frame(_StreamId, _PushId, {max_push_id, _}, _Fin, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"MAX_PUSH_ID on push stream">>}};
 handle_push_frame(_StreamId, _PushId, {cancel_push, _}, _Fin, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"CANCEL_PUSH on push stream">>}};
+handle_push_frame(_StreamId, _PushId, {unknown, ?H3_FRAME_WT_STREAM, _}, _Fin, _State) ->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"WT_STREAM on push stream">>}};
 handle_push_frame(_StreamId, _PushId, {unknown, _Type, _Payload}, _Fin, State) ->
     %% Unknown frame types are ignored per RFC 9114
     {ok, State}.
@@ -2645,6 +2652,11 @@ process_request_frames(StreamId, Data, Fin, Stream, State) ->
             process_request_frame(
                 StreamId, {data, Piece}, PieceFin, Rest, Fin, Stream0, State
             );
+        {ok, {unknown, ?H3_FRAME_WT_STREAM, _}, _Rest} when
+            not (Stream#h3_stream.received =:= byte_size(Data) andalso
+                ?IS_PEER_STREAM(StreamId, State))
+        ->
+            {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"WT_STREAM after stream start">>}};
         {ok, Frame, Rest} ->
             process_request_frame(
                 StreamId, Frame, Fin andalso Rest =:= <<>>, Rest, Fin, Stream, State
