@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- erlang_quic runs in the QUIC Interop Runner, which tests it against
+  the other QUIC implementations: `make interop`, see interop/README.md.
+  Each release publishes the image the runner needs, so the project can
+  be listed on interop.seemann.io.
+
 ## [2.2.1] - 2026-11-07
 
 ### Changed
