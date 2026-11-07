@@ -16,6 +16,10 @@ All notable changes to this project will be documented in this file.
   had dropped unsent, and the peer closed the connection with
   FINAL_SIZE_ERROR. A reset of a stream whose sending side is already
   done is now a no-op.
+- A RESET_STREAM the peer sent again, for a stream whose sending side
+  we still had open, counted the stream's unreceived bytes against
+  connection flow control a second time and reported the reset to the
+  owner again. A repeated RESET_STREAM is now ignored.
 
 ## [2.6.1] - 2026-11-08
 

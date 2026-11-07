@@ -6380,6 +6380,8 @@ process_frame(
             close_with_transport_error(
                 ?QUIC_FLOW_CONTROL_ERROR, <<"RESET_STREAM final size above limit">>, State
             );
+        {ok, #stream_state{recv_done = true, final_size = FinalSize}} ->
+            State;
         {ok, Stream} ->
             case reset_size_error(Stream, FinalSize, State) of
                 ok -> accept_reset_stream(Stream, StreamId, ErrorCode, FinalSize, State);

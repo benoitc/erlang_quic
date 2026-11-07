@@ -40,6 +40,13 @@ late_data_is_not_counted_again_test() ->
     ?assertEqual(1000, S#state.data_received),
     ?assertEqual(0, S#state.recv_buffer_bytes).
 
+%% Our send side is still open, so the stream outlives the reset.
+repeated_reset_is_counted_once_test() ->
+    _ = resets_notified(),
+    S = reset(1000, reset(1000, server(100))),
+    ?assertEqual(1000, S#state.data_received),
+    ?assertEqual(1, length(resets_notified())).
+
 reset(FinalSize, S) ->
     quic_connection:process_frame(app, {reset_stream, ?STREAM, 0, FinalSize}, S).
 
@@ -50,3 +57,9 @@ server(Received) ->
         max_streams_uni_local = 100,
         transport_params = #{}
     }).
+
+resets_notified() ->
+    receive
+        {quic, _, {stream_reset, ?STREAM, _}} = M -> [M | resets_notified()]
+    after 0 -> []
+    end.
