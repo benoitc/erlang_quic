@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- After heavy packet loss left more than 64 ACK ranges, a packet number
+  below the ranges kept was accepted again, so a duplicated or replayed
+  packet was processed twice (a DATAGRAM delivered again, a PATH_CHALLENGE
+  answered again). Packet numbers below the lowest range kept are now
+  discarded as duplicates.
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed
