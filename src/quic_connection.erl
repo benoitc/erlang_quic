@@ -5992,14 +5992,15 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
             %% to prevent false recovery exit (LargestAckedSentTime=Now would always
             %% satisfy > RecoveryStart after min_duration). Loss handling is done
             %% separately by on_packets_lost and on_congestion_event.
-            CCState1 =
-                case HasAckEliciting of
-                    false ->
-                        %% No ack-eliciting acks - skip CC ACK update entirely
-                        CCState;
-                    true ->
-                        quic_cc:on_packets_acked(CCState, AckedBytes, LargestAckedSentTime)
-                end,
+            CCState1 = cc_after_ack(
+                CCState,
+                AckedBytes,
+                LargestAckedSentTime,
+                HasAckEliciting,
+                AckedPackets,
+                Level,
+                NewLossState
+            ),
             %% Every loss behind the last window cut was only
             %% reordered: undo the cut before this ACK's own losses.
             CCState2 =
@@ -9149,6 +9150,23 @@ should_delay_ack(Frames) ->
 schedule_delayed_ack(app, State) ->
     arm_ack_timer(State).
 
+%% Acknowledged packets from an earlier path leave the window as they
+%% are and only stop counting as in flight (RFC 9000 Section 9.4).
+cc_after_ack(CCState, _AckedBytes, _SentTime, false, _AckedPackets, _Level, _LossState) ->
+    CCState;
+cc_after_ack(CCState, AckedBytes, SentTime, true, AckedPackets, app, LossState) ->
+    case quic_loss:earlier_path_bytes(LossState, AckedPackets) of
+        0 ->
+            quic_cc:on_packets_acked(CCState, AckedBytes, SentTime);
+        AckedBytes ->
+            quic_cc:on_packets_discarded(CCState, AckedBytes);
+        Earlier ->
+            CC1 = quic_cc:on_packets_discarded(CCState, Earlier),
+            quic_cc:on_packets_acked(CC1, AckedBytes - Earlier, SentTime)
+    end;
+cc_after_ack(CCState, AckedBytes, SentTime, true, _AckedPackets, _Level, _LossState) ->
+    quic_cc:on_packets_acked(CCState, AckedBytes, SentTime).
+
 %% Process ECN counts from ACK frame (RFC 9002 Section 7.1)
 %% ECN-CE indicates network congestion experienced
 process_ecn_counts(undefined, CCState) ->
@@ -9173,11 +9191,15 @@ process_ecn_counts({_ECT0, _ECT1, ECNCE}, CCState) ->
     [#sent_packet{}],
     quic_loss:loss_state()
 ) -> quic_cc:cc_state().
-cc_after_loss(CCState, LostBytes, LargestLostSentTime, ECN, LostPackets, LossState) ->
+cc_after_loss(CCState, LostBytes, LargestLostSentTime, ECN, LostPackets0, LossState) ->
+    %% Losses on an earlier path say nothing about this one (RFC 9000
+    %% Section 9.4); they only stop counting as in flight.
+    LostPackets = [P || P <- LostPackets0, not quic_loss:on_earlier_path(LossState, P)],
     CC1 = quic_cc:on_packets_lost(CCState, LostBytes),
     CC2 =
-        case LargestLostSentTime of
-            undefined -> CC1;
+        case {LargestLostSentTime, LostPackets} of
+            {undefined, _} -> CC1;
+            {_, []} -> CC1;
             _ -> quic_cc:on_congestion_event(CC1, LargestLostSentTime)
         end,
     CC3 = process_ecn_counts(ECN, CC2),

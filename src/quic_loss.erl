@@ -30,6 +30,8 @@
 
 -export([
     reset_for_new_path/1,
+    on_earlier_path/2,
+    earlier_path_bytes/2,
     %% Loss detection state
     new/0,
     new/1,
@@ -168,7 +170,11 @@
 
     %% max_ack_delay only caps RTT samples and joins the PTO once the
     %% handshake is confirmed (RFC 9002 Sections 5.3 and 6.2.1).
-    handshake_confirmed = false :: boolean()
+    handshake_confirmed = false :: boolean(),
+
+    %% Application packets numbered below this went out on an earlier
+    %% path (RFC 9000 Section 9.4).
+    path_first_pn = 0 :: non_neg_integer()
 }).
 
 -opaque loss_state() :: #loss_state{}.
@@ -189,13 +195,33 @@
 reset_for_new_path(undefined) ->
     new();
 reset_for_new_path(#loss_state{} = S) ->
+    FirstPN =
+        case queue:peek_r((S#loss_state.app)#pn_loss.sent_q) of
+            {value, #sent_packet{pn = PN}} -> PN + 1;
+            empty -> S#loss_state.path_first_pn
+        end,
     S#loss_state{
         rtt = quic_rtt:reset(S#loss_state.rtt),
         pto_count = 0,
         initial = clear_loss_time(S#loss_state.initial),
         handshake = clear_loss_time(S#loss_state.handshake),
-        app = clear_loss_time(S#loss_state.app)
+        app = clear_loss_time(S#loss_state.app),
+        path_first_pn = FirstPN
     }.
+
+%% @doc Whether an application packet went out on an earlier path.
+-spec on_earlier_path(loss_state(), #sent_packet{}) -> boolean().
+on_earlier_path(#loss_state{path_first_pn = FirstPN}, #sent_packet{pn = PN}) ->
+    PN < FirstPN.
+
+%% @doc The ack-eliciting bytes among application Packets that went out
+%% on an earlier path.
+-spec earlier_path_bytes(loss_state(), [#sent_packet{}]) -> non_neg_integer().
+earlier_path_bytes(#loss_state{path_first_pn = FirstPN}, Packets) ->
+    lists:sum([
+        Sz
+     || #sent_packet{pn = PN, size = Sz, ack_eliciting = true} <- Packets, PN < FirstPN
+    ]).
 
 clear_loss_time(#pn_loss{} = P) -> P#pn_loss{loss_time = undefined}.
 
@@ -400,7 +426,11 @@ on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRange
             undefined
         ),
 
-    NewState1 = maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now),
+    NewState1 =
+        case Space =:= app andalso LargestAcked < State#loss_state.path_first_pn of
+            true -> State;
+            false -> maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now)
+        end,
 
     %% Phase 2: loss detection over the survivors from phase 1
     %% (KeptAccList is newest-first, reverse to oldest-first so
