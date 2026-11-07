@@ -578,6 +578,9 @@
     %% Close reason
     close_reason :: term(),
 
+    %% Received packets that failed authentication (RFC 9001 Section 6.6)
+    auth_failures = 0 :: non_neg_integer(),
+
     %% Connection Migration (RFC 9000 Section 9)
     %% Current path (active remote address)
     current_path :: #path_state{} | undefined,

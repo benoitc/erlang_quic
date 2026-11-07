@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 - A packet that opened with the previous 1-RTT keys was accepted even
   when a lower-numbered packet had already used the new ones. It now
   closes the connection with KEY_UPDATE_ERROR (RFC 9001 §6.4).
+- Packets that failed authentication were dropped without being counted,
+  so the AEAD integrity limit was never enforced. The connection now
+  closes with AEAD_LIMIT_REACHED at the limit (RFC 9001 §6.6).
 
 ## [2.6.1] - 2026-11-08
 
