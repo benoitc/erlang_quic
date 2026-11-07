@@ -2,7 +2,7 @@
 # Run from docker/dist/ with: docker compose up
 # Or from project root with: docker compose -f docker/dist/docker-compose.yml up
 #
-# Use OTP_VERSION env var to select Erlang version (26, 27, or 28):
+# Use OTP_VERSION env var to select Erlang version (28 or later):
 #   OTP_VERSION=28 docker compose --profile five up
 
 x-node-base: &node-base

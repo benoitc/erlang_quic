@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- erlang_quic now requires Erlang/OTP 28 or later. OTP 26 and 27 are no
+  longer tested or supported.
+
 ### Fixed
 - A client that migrated several times in a row could be left unable to
   migrate again, with `quic:migrate/1` returning

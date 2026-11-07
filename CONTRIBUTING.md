@@ -4,7 +4,7 @@ This page is for people changing erlang_quic itself. For using the library, star
 
 ## Set up
 
-You need Erlang/OTP 26 or later and rebar3. Nothing else is required to build: the library has no dependencies.
+You need Erlang/OTP 28 or later and rebar3. Nothing else is required to build: the library has no dependencies.
 
 ```bash
 git clone --recursive https://github.com/benoitc/erlang_quic.git
@@ -79,7 +79,7 @@ Twenty check runs per pull request:
 
 | Job | What it proves |
 |-----|----------------|
-| Unit Tests (OTP 26, 27, 28, 29) | `rebar3 eunit` and `rebar3 proper` across five OTP and Ubuntu combinations, and that the crypto NIF is not built by default |
+| Unit Tests (OTP 28, 29) | `rebar3 eunit` and `rebar3 proper` across three OTP and Ubuntu combinations, and that the crypto NIF is not built by default |
 | macOS, FreeBSD | The NIF builds and loads there, and the suite passes with it on and off |
 | E2E Tests | `quic_e2e_SUITE`, `quic_trusted_network_SUITE`, and the post-quantum suites on OTP 28.1 |
 | Server Batching + Linux GSO | `quic_server_batching_SUITE` with GSO enabled, pinned to a kernel that supports it |

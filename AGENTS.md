@@ -4,7 +4,7 @@ Instructions for AI coding agents working on this project.
 
 ## Project Overview
 
-Pure Erlang QUIC implementation (RFC 9000/9001) with zero external dependencies. Requires Erlang/OTP 26.0+ and rebar3.
+Pure Erlang QUIC implementation (RFC 9000/9001) with zero external dependencies. Requires Erlang/OTP 28 or later and rebar3.
 
 ## Required Checks
 

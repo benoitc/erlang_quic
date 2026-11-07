@@ -58,7 +58,7 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 
 ## Requirements
 
-- Erlang/OTP 26.0 or later
+- Erlang/OTP 28 or later
 - rebar3
 
 ## Installation
