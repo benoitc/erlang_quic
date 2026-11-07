@@ -102,7 +102,7 @@ All tests live under `test/`; module names in the table are bare
 | `H3_CLOSED_CRITICAL_STREAM` | ✓ | control / encoder / decoder stream closed |
 | `H3_FRAME_UNEXPECTED` | ✓ | DATA/HEADERS on control, CANCEL_PUSH on request, second SETTINGS, PUSH_PROMISE on server |
 | `H3_FRAME_ERROR` | ✓ | malformed frame payloads |
-| `H3_EXCESSIVE_LOAD` | ✓ | frame size > 1 MiB, field section over the advertised limit, request body held past `max_buffered_body` |
+| `H3_EXCESSIVE_LOAD` | ✓ | frame size > 1 MiB, field section over the advertised limit (connection error for headers, stream reset for trailers, checked while decoding), request body held past `max_buffered_body` |
 | `H3_ID_ERROR` | ✓ | GOAWAY id increase, MAX_PUSH_ID decrease |
 | `H3_SETTINGS_ERROR` | ✓ | HTTP/2 setting id, duplicate setting id |
 | `H3_MISSING_SETTINGS` | ✓ | first control frame not SETTINGS |
@@ -149,6 +149,7 @@ depends on these primitives.
 | §4.3 | Encoder-stream Set Dynamic Table Capacity > peer max → `H3_QPACK_ENCODER_STREAM_ERROR` | `quic_qpack_tests:encoder_set_capacity_over_max_rejected_test` ✓ |
 | §3.2.2 | Entry larger than the capacity in force → `H3_QPACK_ENCODER_STREAM_ERROR`, including an insert before any Set Dynamic Table Capacity | `quic_qpack_tests:entry_larger_than_the_capacity_is_refused_test`, `:insert_before_set_capacity_is_refused_test` ✓ |
 | §3.2.2 | Announced insert length beyond what an entry could need is refused before the bytes are buffered | `quic_qpack_tests:literal_name_beyond_the_capacity_is_refused_test` ✓ |
+| RFC 9114 §4.2.2 | Field section size limit enforced while decoding, 32 bytes per field included; decoding is linear in the block size | `quic_qpack_tests:field_section_limit_stops_decoding_test`, `:many_literal_field_lines_decode_in_linear_time_test`, `quic_h3_compliance_tests:oversized_trailers_reset_only_the_stream_test` ✓ |
 | §4.5.1.1 | Required Insert Count decoded against the advertised capacity, and refused when that leaves room for no entry | `quic_qpack_tests:required_insert_count_without_room_for_an_entry_is_refused_test` ✓ |
 | §4.3 | `set_dynamic_capacity` API clamps to `max_allowed_capacity` | `quic_qpack_tests:set_dynamic_capacity_clamps_to_max_test` ✓ |
 | §4.4 | Decoder-stream Section Acknowledgment encoding | `quic_qpack_tests:section_ack_encoding_test`, `section_ack_large_stream_id_test` ✓ |

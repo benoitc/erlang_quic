@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- An HTTP/3 peer could make the other side spend minutes of CPU on one
+  request. Decoding a header block took time that grew with the square of
+  its size, so a 1 MiB block of small header fields kept a scheduler busy
+  for over ten minutes, and the header size limit was only checked once
+  everything was decoded. Header blocks now decode in linear time, the
+  limit we advertise stops decoding as soon as it is crossed, and it now
+  applies to trailers too: trailers over it reset only their own request.
+  (GHSA-224p-pchv-5r3r, CWE-407).
+
 ### Added
 - HTTP/3 server option `defer_requests_until_settings`. When set, a
   request or WebTransport stream that arrives before the client's
