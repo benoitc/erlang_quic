@@ -11,6 +11,11 @@ All notable changes to this project will be documented in this file.
   unexpected_message. It is now a PROTOCOL_VIOLATION (RFC 9001
   Section 4.1.3); retransmissions of data already received are still
   ignored.
+- When the handshake moved on to a higher encryption level, CRYPTO data
+  left over at the previous one was ignored, or, if it held a whole
+  message, closed the connection with unexpected_message. Data after the
+  message that moves the handshake on, or data buffered out of order
+  beyond it, is now a PROTOCOL_VIOLATION (RFC 9001 Section 4.1.3).
 
 ## [2.6.1] - 2026-11-08
 

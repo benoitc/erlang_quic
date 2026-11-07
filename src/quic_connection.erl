@@ -6918,8 +6918,10 @@ process_crypto_buffer(Level, State) ->
                 }
             },
 
-            %% Try to process more
-            process_crypto_buffer(Level, State2);
+            case crypto_level_closed(Level, State2) of
+                true -> reject_unconsumed_crypto(Level, NewOffset, State2);
+                false -> process_crypto_buffer(Level, State2)
+            end;
         none ->
             %% Nothing keyed exactly at ExpectedOffset, which does not mean a
             %% gap: a peer may re-frame CRYPTO data it retransmits (RFC 9000
@@ -6938,6 +6940,19 @@ process_crypto_buffer(Level, State) ->
                 true -> process_crypto_buffer(Level, State1);
                 false -> State1
             end
+    end.
+
+reject_unconsumed_crypto(Level, Offset, State) ->
+    Buffer = maps:get(Level, (State#state.hs)#hs.crypto_buffer),
+    case gb_trees:is_empty(element(1, quic_reassembly:trim_reassembly_buffer(Buffer, Offset))) of
+        true ->
+            State;
+        false ->
+            close_with_transport_error(
+                ?QUIC_PROTOCOL_VIOLATION,
+                <<"unconsumed CRYPTO data at a previous encryption level">>,
+                State
+            )
     end.
 
 %% TLS has moved past this level for receiving (RFC 9001 Section 4.1.3).
@@ -6990,7 +7005,16 @@ process_tls_messages(Level, Data, State) ->
                     OriginalMsg = binary:part(Data, 0, 4 + byte_size(Body)),
                     %% Pass the original bytes to process_tls_message for transcript
                     State1 = process_tls_message(Level, Type, Body, OriginalMsg, State),
-                    process_tls_messages(Level, Rest, State1);
+                    case Rest =/= <<>> andalso crypto_level_closed(Level, State1) of
+                        true ->
+                            close_with_transport_error(
+                                ?QUIC_PROTOCOL_VIOLATION,
+                                <<"unconsumed CRYPTO data at a previous encryption level">>,
+                                State1
+                            );
+                        false ->
+                            process_tls_messages(Level, Rest, State1)
+                    end;
                 _ when
                     Type =:= ?TLS_CERTIFICATE_REQUEST,
                     Level =:= app,
