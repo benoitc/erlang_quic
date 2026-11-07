@@ -1,13 +1,7 @@
 {
   "erlang-quic": {
-    "name": "erlang-quic",
+    "image": "ghcr.io/benoitc/erlang_quic-interop:latest",
     "url": "https://github.com/benoitc/erlang_quic",
-    "image": "erlang-quic",
-    "client": {
-      "image": "erlang-quic-client"
-    },
-    "server": {
-      "image": "erlang-quic-server"
-    }
+    "role": "both"
   }
 }
