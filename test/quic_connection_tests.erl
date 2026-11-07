@@ -795,7 +795,8 @@ make_test_session_ticket(ServerName) ->
         max_early_data = 16384,
         received_at = erlang:system_time(second),
         cipher = aes_128_gcm,
-        alpn = <<"h3">>
+        alpn = <<"h3">>,
+        transport_params = #{initial_max_data => 65536, initial_max_streams_bidi => 4}
     }.
 
 %%====================================================================

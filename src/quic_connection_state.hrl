@@ -352,6 +352,9 @@
     early_keys :: {#crypto_keys{}, binary()} | undefined,
     % Bytes of early data sent
     early_data_sent = 0 :: non_neg_integer(),
+    %% A 0-RTT write exceeded the server's remembered limits; the rest
+    %% waits for 1-RTT so the stream stays in order
+    early_deferred = false :: boolean(),
     % Server accepted early data
     early_data_accepted = false :: boolean(),
     %% Streams that have carried 0-RTT-encrypted data. Used at handshake

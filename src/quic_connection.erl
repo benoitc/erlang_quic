@@ -1104,7 +1104,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     LossState = quic_loss:new(),
 
     %% Extract session ticket for resumption (if provided)
-    SessionTicket = maps:get(session_ticket, Opts, undefined),
+    SessionTicket = upgrade_ticket(maps:get(session_ticket, Opts, undefined)),
 
     %% Extract external PSK (RFC 8446 §4.2.11). Mutually exclusive
     %% with session_ticket; validated when ClientHello is built.
@@ -2520,8 +2520,11 @@ send_client_hello(State) ->
     EarlyKeys =
         case SessionTicket of
             #session_ticket{
-                max_early_data = TicketMaxEarly, cipher = Cipher, resumption_secret = ResSecret
-            } when TicketMaxEarly > 0 ->
+                max_early_data = TicketMaxEarly,
+                cipher = Cipher,
+                resumption_secret = ResSecret,
+                transport_params = Remembered
+            } when TicketMaxEarly > 0, is_map(Remembered) ->
                 %% Derive PSK and early secret
                 PSK = quic_ticket:derive_psk(ResSecret, SessionTicket),
                 EarlySecret = quic_crypto:derive_early_secret(Cipher, PSK),
@@ -2557,7 +2560,7 @@ send_client_hello(State) ->
                 end
         }
     },
-    NewState = send_initial_crypto(ClientHello, 0, State0),
+    NewState = send_initial_crypto(ClientHello, 0, with_remembered_params(SessionTicket, State0)),
 
     %% Event-driven flush: flush batch and timers after sending ClientHello
     %% Critical for handshake - must send immediately
@@ -2567,6 +2570,46 @@ send_client_hello(State) ->
     client_rearm_active(FlushedState, (FlushedState#state.cfg)#conn_cfg.active_n),
 
     FlushedState.
+
+%% RFC 9000 Section 7.4.1: 0-RTT data is bound by the transport
+%% parameters the server sent on the connection that issued the ticket.
+with_remembered_params(
+    #session_ticket{transport_params = Remembered}, #state{hs = #hs{early_keys = {_, _}}} = State
+) ->
+    apply_peer_transport_params_internal(Remembered, State);
+with_remembered_params(_Ticket, State) ->
+    State.
+
+%% A ticket stored before tickets kept transport parameters.
+upgrade_ticket(Ticket) when is_tuple(Ticket), element(1, Ticket) =:= session_ticket ->
+    case tuple_size(Ticket) =:= record_info(size, session_ticket) - 1 of
+        true -> erlang:append_element(Ticket, undefined);
+        false -> Ticket
+    end;
+upgrade_ticket(Ticket) ->
+    Ticket.
+
+%% What a ticket keeps of the server's transport parameters: all the
+%% client processes, except those Section 7.4.1 takes from the new
+%% handshake.
+-spec remembered_transport_params(map()) -> map().
+remembered_transport_params(TransportParams) ->
+    maps:with(
+        [
+            max_idle_timeout,
+            max_udp_payload_size,
+            initial_max_data,
+            initial_max_stream_data_bidi_local,
+            initial_max_stream_data_bidi_remote,
+            initial_max_stream_data_uni,
+            initial_max_streams_bidi,
+            initial_max_streams_uni,
+            disable_active_migration,
+            active_connection_id_limit,
+            reset_stream_at
+        ],
+        TransportParams
+    ).
 
 %% The server's default preference list lives in quic_crypto, which
 %% knows whether this CPU has AES instructions.
@@ -7514,7 +7557,8 @@ process_tls_message(
                 max_early_data = MaxEarlyData,
                 received_at = erlang:system_time(second),
                 cipher = Cipher,
-                alpn = ALPN
+                alpn = ALPN,
+                transport_params = remembered_transport_params(State#state.transport_params)
             },
 
             %% Store ticket
@@ -10332,39 +10376,64 @@ zero_rtt_frames(StreamId, Data, Fin, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, StreamState} ->
             DataBin = iolist_to_binary(Data),
-            Offset = StreamState#stream_state.send_offset,
-
-            %% A write larger than one packet must be split like any
-            %% 1-RTT send; a single oversized 0-RTT packet leaves as one
-            %% IP-fragmented datagram, which QUIC forbids (RFC 9000 §14).
-            MaxChunk = get_max_stream_data_per_packet(State),
-            Frames = zero_rtt_chunks(StreamId, Offset, DataBin, Fin, MaxChunk),
-
-            %% Update stream state and track early data sent
-            %% send_done waits for the FIN's ACK (settle_fin_ack/2), as on
-            %% the 1-RTT path: lost 0-RTT data is retransmitted until then.
-            NewStreamState = StreamState#stream_state{
-                send_offset = Offset + byte_size(DataBin),
-                send_fin = Fin
-            },
-            EarlyDataSent = (State#state.hs)#hs.early_data_sent + byte_size(DataBin),
-            NewZeroRttIds = sets:add_element(
-                StreamId, (State#state.hs)#hs.zero_rtt_stream_ids
-            ),
-
-            State1 = State#state{
-                streams = maps:put(StreamId, NewStreamState, Streams),
-                hs = (State#state.hs)#hs{
-                    early_data_sent = EarlyDataSent,
-                    zero_rtt_stream_ids = NewZeroRttIds
-                }
-            },
-            %% RFC 9000 §4.6: extend MAX_STREAMS once this stream is fully
-            %% closed (covers the rare 0-RTT FIN-from-server case).
-            {ok, Frames, maybe_reclaim_stream(StreamId, State1)};
+            case fits_early_limits(StreamState, byte_size(DataBin), State) of
+                true -> zero_rtt_frames(StreamId, StreamState, DataBin, Fin, State);
+                false -> defer_early_write(StreamId, DataBin, Fin, State)
+            end;
         error ->
             {error, unknown_stream}
     end.
+
+%% RFC 9000 Section 7.4.1: 0-RTT data stays within the stream and
+%% connection limits the server remembered for it.
+fits_early_limits(_StreamState, _Size, #state{hs = #hs{early_deferred = true}}) ->
+    false;
+fits_early_limits(#stream_state{send_offset = Offset, send_max_data = StreamMax}, Size, State) ->
+    Offset + Size =< StreamMax andalso
+        (State#state.hs)#hs.early_data_sent + Size =< State#state.max_data_remote.
+
+defer_early_write(StreamId, Data, Fin, #state{pending_data = Pending, hs = HS} = State) ->
+    case length(Pending) >= ?MAX_PENDING_DATA_ENTRIES of
+        true ->
+            {error, pending_data_limit};
+        false ->
+            {ok, [], State#state{
+                pending_data = Pending ++ [{StreamId, Data, Fin}],
+                hs = HS#hs{early_deferred = true}
+            }}
+    end.
+
+zero_rtt_frames(StreamId, StreamState, DataBin, Fin, #state{streams = Streams} = State) ->
+    Offset = StreamState#stream_state.send_offset,
+
+    %% A write larger than one packet must be split like any
+    %% 1-RTT send; a single oversized 0-RTT packet leaves as one
+    %% IP-fragmented datagram, which QUIC forbids (RFC 9000 §14).
+    MaxChunk = get_max_stream_data_per_packet(State),
+    Frames = zero_rtt_chunks(StreamId, Offset, DataBin, Fin, MaxChunk),
+
+    %% Update stream state and track early data sent
+    %% send_done waits for the FIN's ACK (settle_fin_ack/2), as on
+    %% the 1-RTT path: lost 0-RTT data is retransmitted until then.
+    NewStreamState = StreamState#stream_state{
+        send_offset = Offset + byte_size(DataBin),
+        send_fin = Fin
+    },
+    EarlyDataSent = (State#state.hs)#hs.early_data_sent + byte_size(DataBin),
+    NewZeroRttIds = sets:add_element(
+        StreamId, (State#state.hs)#hs.zero_rtt_stream_ids
+    ),
+
+    State1 = State#state{
+        streams = maps:put(StreamId, NewStreamState, Streams),
+        hs = (State#state.hs)#hs{
+            early_data_sent = EarlyDataSent,
+            zero_rtt_stream_ids = NewZeroRttIds
+        }
+    },
+    %% RFC 9000 §4.6: extend MAX_STREAMS once this stream is fully
+    %% closed (covers the rare 0-RTT FIN-from-server case).
+    {ok, Frames, maybe_reclaim_stream(StreamId, State1)}.
 
 %% Split a 0-RTT write into per-packet STREAM frames, FIN on the last.
 zero_rtt_chunks(StreamId, Offset, Data, Fin, MaxChunk) when byte_size(Data) =< MaxChunk ->

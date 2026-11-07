@@ -583,7 +583,11 @@
     cipher :: atom(),
 
     %% ALPN used for the original connection
-    alpn :: binary() | undefined
+    alpn :: binary() | undefined,
+
+    %% The server's transport parameters that 0-RTT data must respect
+    %% (RFC 9000 Section 7.4.1); without them no 0-RTT is attempted
+    transport_params :: map() | undefined
 }).
 
 %% Connection ID Entry for CID Pool (RFC 9000 Section 5.1)
