@@ -50,8 +50,10 @@
 %% RFC 9297 §2.1
 -define(H3_SETTINGS_H3_DATAGRAM, 16#33).
 
-%% WebTransport over HTTP/3 (draft-ietf-webtrans-http3-15 §9.2)
--define(H3_SETTINGS_WT_ENABLED, 16#2c7cf000).
+%% WebTransport over HTTP/3 (draft-ietf-webtrans-http3-17 §9.2)
+-define(H3_SETTINGS_WT_ENABLED, 16#20b8933b).
+%% draft-15 codepoint, still advertised alongside the current one (§7.1)
+-define(H3_SETTINGS_WT_ENABLED_DRAFT15, 16#2c7cf000).
 -define(H3_SETTINGS_WT_INITIAL_MAX_DATA, 16#2b61).
 -define(H3_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI, 16#2b64).
 -define(H3_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, 16#2b65).

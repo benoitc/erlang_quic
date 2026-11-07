@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- `wt_enabled` in HTTP/3 settings now means the WebTransport draft-17
+  codepoint. The draft-15 codepoint is still available as
+  `wt_enabled_draft15`, so a server can advertise both.
+  `quic_h3_frame:setting_to_id/1` is exported to turn a setting name into
+  its id.
+
 ## [2.2.1] - 2026-11-07
 
 ### Changed

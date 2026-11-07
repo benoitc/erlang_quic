@@ -843,6 +843,7 @@ Frame encoding and decoding (RFC 9114 Section 7.2).
 | `decode_all/1` | Decode all frames from buffer |
 | `decode_stream_type/1` | Decode unidirectional stream type |
 | `default_settings/0` | Get default HTTP/3 settings |
+| `setting_to_id/1` | Numeric id of a setting atom (`wt_enabled` is the draft-17 codepoint, `wt_enabled_draft15` the draft-15 one) |
 
 **Frame Types:**
 

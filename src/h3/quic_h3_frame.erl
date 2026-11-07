@@ -32,6 +32,7 @@
     default_settings/0,
     encode_settings_payload/1,
     decode_settings_payload/1,
+    setting_to_id/1,
     %% Stream type encoding
     encode_stream_type/1,
     %% Validation
@@ -369,6 +370,7 @@ is_forbidden_setting(16#04) -> true;
 is_forbidden_setting(16#05) -> true;
 is_forbidden_setting(_) -> false.
 
+%% @doc Numeric id of a setting, given its atom or its id.
 -spec setting_to_id(atom() | non_neg_integer()) -> non_neg_integer().
 setting_to_id(qpack_max_table_capacity) -> ?H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY;
 setting_to_id(max_field_section_size) -> ?H3_SETTINGS_MAX_FIELD_SECTION_SIZE;
@@ -376,6 +378,7 @@ setting_to_id(qpack_blocked_streams) -> ?H3_SETTINGS_QPACK_BLOCKED_STREAMS;
 setting_to_id(enable_connect_protocol) -> ?H3_SETTINGS_ENABLE_CONNECT_PROTOCOL;
 setting_to_id(h3_datagram) -> ?H3_SETTINGS_H3_DATAGRAM;
 setting_to_id(wt_enabled) -> ?H3_SETTINGS_WT_ENABLED;
+setting_to_id(wt_enabled_draft15) -> ?H3_SETTINGS_WT_ENABLED_DRAFT15;
 setting_to_id(wt_initial_max_data) -> ?H3_SETTINGS_WT_INITIAL_MAX_DATA;
 setting_to_id(wt_initial_max_streams_uni) -> ?H3_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI;
 setting_to_id(wt_initial_max_streams_bidi) -> ?H3_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI;
@@ -388,6 +391,7 @@ id_to_setting(?H3_SETTINGS_QPACK_BLOCKED_STREAMS) -> qpack_blocked_streams;
 id_to_setting(?H3_SETTINGS_ENABLE_CONNECT_PROTOCOL) -> enable_connect_protocol;
 id_to_setting(?H3_SETTINGS_H3_DATAGRAM) -> h3_datagram;
 id_to_setting(?H3_SETTINGS_WT_ENABLED) -> wt_enabled;
+id_to_setting(?H3_SETTINGS_WT_ENABLED_DRAFT15) -> wt_enabled_draft15;
 id_to_setting(?H3_SETTINGS_WT_INITIAL_MAX_DATA) -> wt_initial_max_data;
 id_to_setting(?H3_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI) -> wt_initial_max_streams_uni;
 id_to_setting(?H3_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI) -> wt_initial_max_streams_bidi;
