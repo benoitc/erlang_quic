@@ -4,12 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Retry tokens are accepted for at most 10 seconds, so a captured token
+  can no longer be replayed later.
+
 ### Fixed
 - A large download could be closed with a flow-control error, seen as a
   transfer that stopped part way. The sender counted its connection credit
   in bytes sent while the receiver counts the highest offset on each
   stream, as the RFC says, so a write that went out ahead of data still
   queued made the two disagree. The sender now counts the same way.
+- `quic:migrate/1` on a server connection closed the listener's socket,
+  breaking every connection on it. It now returns
+  `{error, not_supported_on_server}`.
+- A resumed connection could send more 0-RTT data than the server's
+  current limits allowed, and a server with lower limits closed the
+  connection. A ticket now keeps the server's limits and 0-RTT data stays
+  within them; what does not fit waits for the handshake to finish. A
+  ticket stored by an older version is used without 0-RTT.
+- A server whose client moves to a new address sends it at most three
+  times what it received from there until the address is validated, goes
+  back to the old address when validation fails, and follows only the
+  newest packet, so a late or spoofed packet no longer moves it. An
+  answer to any of its earlier checks of the address counts, a slow new
+  path gets time to answer, and the path must carry full-size packets
+  before it is validated. The same holds for a client that moves during
+  the handshake.
+- After a client moves, the server uses a new connection ID towards the
+  new address unless the client kept its own, from the first packet it
+  sends there.
+- Packets sent before a migration no longer feed the new path's RTT
+  estimate or congestion window, and PMTU is searched again on the new
+  path. A client's own migration resets its congestion state once the new
+  path is validated.
 - A connection that moves to a new path keeps the congestion control it was
   configured with. Each path change started over with NewReno and the default
   windows, whatever `cc_algorithm`, `initial_window` and `minimum_window`
