@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.3.1] - 2026-11-07
 
 ### Fixed
 - A client that migrated several times in a row could be left unable to
