@@ -8152,8 +8152,9 @@ handle_hello_retry_request(
         Ch1Opts =/= undefined andalso
             (maps:get(external_psk, Ch1Opts, undefined) =/= undefined orelse
                 maps:get(session_ticket, Ch1Opts, undefined) =/= undefined),
-    GroupOffered = lists:member(SelGroup, (State#state.cfg)#conn_cfg.tls_groups),
-    case {(State#state.hs)#hs.hrr_sent, PskOffered, GroupOffered} of
+    #conn_cfg{tls_groups = Groups, cipher_preference = Ciphers} = State#state.cfg,
+    Offered = lists:member(SelGroup, Groups) andalso lists:member(Cipher, Ciphers),
+    case {(State#state.hs)#hs.hrr_sent, PskOffered, Offered} of
         {true, _, _} ->
             %% A second HRR is illegal (RFC 8446 §4.1.4).
             notify_owner({error, {tls_alert, unexpected_message}}, State),
@@ -8164,7 +8165,7 @@ handle_hello_retry_request(
             notify_owner({error, {tls_alert, unexpected_message}}, State),
             send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State);
         {_, _, false} ->
-            %% Server picked a group we never offered.
+            %% Server picked a group or a cipher suite we never offered.
             notify_owner({error, {tls_alert, illegal_parameter}}, State),
             send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
         {false, false, true} ->

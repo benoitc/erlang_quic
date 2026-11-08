@@ -14,6 +14,10 @@ All notable changes to this project will be documented in this file.
 - A server whose `ciphers` shared no suite with the client's ClientHello
   went ahead with TLS_AES_128_GCM_SHA256 anyway. It now aborts with
   handshake_failure (RFC 8446 Section 4.1.1).
+- A client checked the cipher suite of a ServerHello against the ones it
+  offered, but not that of a HelloRetryRequest, and built its second
+  ClientHello on the transcript hash of a suite it never offered. It now
+  aborts with illegal_parameter (RFC 8446 Section 4.1.4).
 
 ## [2.6.1] - 2026-11-08
 
