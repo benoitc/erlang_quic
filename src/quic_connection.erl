@@ -103,6 +103,7 @@
     close_stream/3,
     reset_stream/3,
     reset_stream_at/4,
+    set_stream_reliable_size/3,
     stop_sending/3,
     handle_timeout/1,
     handle_timeout/2,
@@ -378,6 +379,12 @@ reset_stream(Conn, StreamId, ErrorCode) ->
     ok | {error, term()}.
 reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) ->
     gen_statem:call(Conn, {reset_stream_at, StreamId, ErrorCode, ReliableSize}).
+
+%% @doc See quic:set_stream_reliable_size/3.
+-spec set_stream_reliable_size(pid(), non_neg_integer(), non_neg_integer()) ->
+    ok | {error, term()}.
+set_stream_reliable_size(Conn, StreamId, Size) ->
+    gen_statem:call(Conn, {set_stream_reliable_size, StreamId, Size}).
 
 %% @doc Request peer to stop sending on a stream.
 %% Sends a STOP_SENDING frame (RFC 9000 Section 19.5).
@@ -758,6 +765,7 @@ init({server, Opts}) ->
             verify = quic_cert:requests_client_cert(Opts),
             cacerts = maps:get(cacerts, Opts, undefined),
             require_client_cert = maps:get(require_client_cert, Opts, false),
+            stream_reset_final_size = maps:get(stream_reset_final_size, Opts, false),
             %% TLS 1.3 external PSK config (RFC 8446 §4.2.11). Either or
             %% both may be `undefined'; if both are undefined the server
             %% only accepts cert-authenticated handshakes.
@@ -1208,6 +1216,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             conn_ref = ConnRef,
             verify = normalize_verify(maps:get(verify, Opts, true)),
             cacerts = maps:get(cacerts, Opts, undefined),
+            stream_reset_final_size = maps:get(stream_reset_final_size, Opts, false),
             client_cert = maps:get(cert, Opts, undefined),
             client_cert_chain = maps:get(cert_chain, Opts, []),
             client_private_key = maps:get(key, Opts, undefined),
@@ -1741,6 +1750,16 @@ connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
     end;
 %% RESET_STREAM_AT: Reset with reliable delivery up to ReliableSize
 %% (draft-ietf-quic-reliable-stream-reset-07)
+connected(
+    {call, From}, {set_stream_reliable_size, StreamId, Size}, #state{streams = Streams} = State
+) ->
+    case Streams of
+        #{StreamId := Stream} ->
+            NewStreams = Streams#{StreamId := Stream#stream_state{reliable_size = Size}},
+            {keep_state, State#state{streams = NewStreams}, [{reply, From, ok}]};
+        _ ->
+            {keep_state, State, [{reply, From, {error, unknown_stream}}]}
+    end;
 connected({call, From}, {reset_stream_at, StreamId, ErrorCode, ReliableSize}, State) ->
     case do_reset_stream_at(StreamId, ErrorCode, ReliableSize, State) of
         {ok, NewState} ->
@@ -6425,7 +6444,7 @@ process_frame(
                             ),
                             %% Notify owner - same message as RESET_STREAM
                             StateFl = flush_pending_delivery(State),
-                            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                            notify_stream_reset(StreamId, ErrorCode, FinalSize, State),
                             maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams})
                     end;
                 error ->
@@ -6459,8 +6478,9 @@ process_frame(
                                                 Streams
                                             ),
                                             StateFl = flush_pending_delivery(State),
-                                            Owner !
-                                                {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                                            notify_stream_reset(
+                                                StreamId, ErrorCode, FinalSize, State
+                                            ),
                                             maybe_reclaim_stream(
                                                 StreamId, StateFl#state{streams = NewStreams}
                                             )
@@ -10068,7 +10088,7 @@ stream_limit_close(State) ->
 %% connection flow control, received or not.
 %% A RESET_STREAM the size checks let through: the receive side is done.
 accept_reset_stream(
-    Stream, StreamId, ErrorCode, FinalSize, #state{owner = Owner, streams = Streams} = State
+    Stream, StreamId, ErrorCode, FinalSize, #state{streams = Streams} = State
 ) ->
     %% Mark stream as reset, store final size for flow control accounting.
     %% Incoming RESET_STREAM closes our receive side.
@@ -10086,9 +10106,21 @@ accept_reset_stream(
     %% Data delivered earlier in this receive pass reaches the
     %% owner before the reset notification.
     StateFl = flush_pending_delivery(State),
-    Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+    notify_stream_reset(StreamId, ErrorCode, FinalSize, State),
     State1 = account_reset_stream(Stream, FinalSize, StateFl#state{streams = NewStreams}),
     maybe_reclaim_stream(StreamId, State1).
+
+%% The owner hears of a peer's reset; with stream_reset_final_size it is
+%% also told the stream's final size, the bytes the peer counts against
+%% flow control whether or not they arrived.
+notify_stream_reset(StreamId, ErrorCode, FinalSize, #state{owner = Owner, cfg = Cfg}) ->
+    Event =
+        case Cfg#conn_cfg.stream_reset_final_size of
+            true -> {stream_reset, StreamId, ErrorCode, FinalSize};
+            false -> {stream_reset, StreamId, ErrorCode}
+        end,
+    Owner ! {quic, self(), Event},
+    ok.
 
 %% A RESET_STREAM for a stream not seen yet opens it already reset.
 reset_unseen_stream(
@@ -10115,7 +10147,7 @@ reset_unseen_stream(
                                 Streams
                             ),
                             StateFl = flush_pending_delivery(State),
-                            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                            notify_stream_reset(StreamId, ErrorCode, FinalSize, State),
                             maybe_reclaim_stream(
                                 StreamId,
                                 conn_grant(StateFl#state{
@@ -11546,10 +11578,30 @@ answer_stop_sending(StreamId, ErrorCode, StreamsBefore, State) ->
         end,
     case (not SendDone) andalso can_send_on_stream(StreamId, State) of
         true ->
-            {ok, Reset} = do_close_stream(StreamId, ErrorCode, State),
+            {ok, Reset} = reset_own_stream(StreamId, ErrorCode, fun do_close_stream/3, State),
             Reset;
         false ->
             State
+    end.
+
+%% A reset quic sends on its own: RESET_STREAM_AT keeping the stream's
+%% reliable size, capped at what was written, when the owner set one and
+%% the peer advertised reset_stream_at; otherwise Plain, a RESET_STREAM.
+reset_own_stream(
+    StreamId, ErrorCode, Plain, #state{streams = Streams, transport_params = TP} = State
+) ->
+    case {Streams, maps:get(reset_stream_at, TP, false)} of
+        {#{StreamId := #stream_state{reliable_size = Size, send_offset = Sent} = Stream}, true} when
+            is_integer(Size)
+        ->
+            case
+                do_reset_stream_at_with_stream(StreamId, ErrorCode, min(Size, Sent), Stream, State)
+            of
+                {ok, _} = Ok -> Ok;
+                {error, _} -> Plain(StreamId, ErrorCode, State)
+            end;
+        _ ->
+            Plain(StreamId, ErrorCode, State)
     end.
 
 %% Send RESET_STREAM (RFC 9000 §3.2): closes the SEND direction only.
@@ -11969,10 +12021,10 @@ handle_stream_deadline_expired(
                     Owner ! {quic, self(), {stream_deadline, StreamId}},
                     {ok, State1};
                 reset ->
-                    do_close_stream_deadline(StreamId, ErrorCode, State1);
+                    reset_own_stream(StreamId, ErrorCode, fun do_close_stream_deadline/3, State1);
                 both ->
                     Owner ! {quic, self(), {stream_deadline, StreamId}},
-                    do_close_stream_deadline(StreamId, ErrorCode, State1)
+                    reset_own_stream(StreamId, ErrorCode, fun do_close_stream_deadline/3, State1)
             end;
         {ok, _ClosedStream} ->
             %% Stream already closed

@@ -216,6 +216,14 @@ ok = quic:send_data(Conn, StreamId, Header, false),
 ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 ```
 
+When the peer stops the stream with STOP_SENDING, quic resets it by itself.
+Give the stream its reliable size up front and that reset keeps the
+header too:
+
+```erlang
+ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
+```
+
 ## API
 
 ### Connection
@@ -274,6 +282,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `quic:stop_sending/3` - Ask the peer to stop sending on a stream
 - `quic:reset_stream/3` - Reset stream with error code
 - `quic:reset_stream_at/4` - Reset stream with reliable delivery up to specified size
+- `quic:set_stream_reliable_size/3` - Make the resets quic sends on its own for a stream (answering STOP_SENDING, a send deadline) RESET_STREAM_AT with this reliable size, capped at what was written, when the peer supports it
 - `quic:set_stream_priority/4` - Set stream priority (urgency, incremental)
 - `quic:get_stream_priority/2` - Get stream priority
 
@@ -316,6 +325,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `max_datagram_frame_size` - Max datagram size to accept (0 = disabled, default: 0)
 - `datagram_recv_queue_len` - Bounded receive queue for inbound datagrams (default: `infinity`; drops oldest on overflow, tracked via `datagram_stats/1`)
 - `reset_stream_at` - Enable RESET_STREAM_AT extension (default: false)
+- `stream_reset_final_size` - The owner's notice of a peer's reset is `{stream_reset, StreamId, ErrorCode, FinalSize}` instead of `{stream_reset, StreamId, ErrorCode}`, `FinalSize` being the RESET_STREAM or RESET_STREAM_AT final size (default: false). `quic_h3` sets it on the connections it owns
 - `active_connection_id_limit` - How many of the peer's connection IDs to hold,
   counting the handshake CID (default: 2). Advertised to the peer and enforced
   on inbound NEW_CONNECTION_ID; exceeding it closes with

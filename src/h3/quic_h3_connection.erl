@@ -24,6 +24,7 @@
     request/2,
     request/3,
     open_bidi_stream/2,
+    open_uni_stream/2,
     send_response/4,
     respond/5,
     send_data/3,
@@ -129,7 +130,7 @@
     pre_claim_bidi_stream/3,
     assign_uni_stream/3,
     validate_peer_h3_datagram_with/1,
-    handle_peer_reset/3,
+    handle_peer_reset/4,
     maybe_close_if_drained/1
 ]).
 -endif.
@@ -332,7 +333,10 @@
     %% max_buffered_body.
     held_streams = #{} :: #{stream_id() => true},
     held_data = [] :: [{stream_id(), binary(), boolean()}],
-    held_bytes = 0 :: non_neg_integer()
+    held_bytes = 0 :: non_neg_integer(),
+    %% Option stream_reset_final_size: a claimed stream's reset reaches the
+    %% owner with its final size.
+    reset_final_size = false :: boolean()
 }).
 
 %%====================================================================
@@ -382,6 +386,11 @@ request(Conn, Headers, Opts) ->
     {ok, stream_id()} | {error, term()}.
 open_bidi_stream(Conn, SignalType) ->
     gen_statem:call(Conn, {open_bidi_stream, SignalType}).
+
+%% @doc See quic_h3:open_uni_stream/2.
+-spec open_uni_stream(pid(), non_neg_integer()) -> {ok, stream_id()} | {error, term()}.
+open_uni_stream(Conn, StreamType) ->
+    gen_statem:call(Conn, {open_uni_stream, StreamType}).
 
 %% @doc Send a response (server only).
 -spec send_response(pid(), stream_id(), pos_integer(), [{binary(), binary()}]) ->
@@ -580,6 +589,7 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
         local_max_blocked_streams = LocalMaxBlocked,
         local_connect_enabled = LocalConnectEnabled,
         stream_type_handler = StreamTypeHandler,
+        reset_final_size = maps:get(stream_reset_final_size, Opts, false),
         h3_datagram_enabled = H3DatagramEnabled
     },
 
@@ -628,6 +638,7 @@ init({server, QuicConn, Opts, Owner}) ->
         local_max_blocked_streams = LocalMaxBlocked,
         local_connect_enabled = LocalConnectEnabled,
         stream_type_handler = StreamTypeHandler,
+        reset_final_size = maps:get(stream_reset_final_size, Opts, false),
         h3_datagram_enabled = H3DatagramEnabled,
         max_buffered_body = MaxBufferedBody,
         defer_requests = DeferRequests
@@ -779,7 +790,13 @@ early_data(
     {quic, QuicConn, {stream_reset, StreamId, ErrorCode}},
     #state{quic_conn = QuicConn} = State
 ) ->
-    handle_peer_reset(StreamId, ErrorCode, State);
+    handle_peer_reset(StreamId, ErrorCode, undefined, State);
+early_data(
+    info,
+    {quic, QuicConn, {stream_reset, StreamId, ErrorCode, FinalSize}},
+    #state{quic_conn = QuicConn} = State
+) ->
+    handle_peer_reset(StreamId, ErrorCode, FinalSize, State);
 early_data(
     info,
     {quic, QuicConn, {stop_sending, StreamId, ErrorCode}},
@@ -962,7 +979,13 @@ h3_connecting(
     {quic, QuicConn, {stream_reset, StreamId, ErrorCode}},
     #state{quic_conn = QuicConn} = State
 ) ->
-    handle_peer_reset(StreamId, ErrorCode, State);
+    handle_peer_reset(StreamId, ErrorCode, undefined, State);
+h3_connecting(
+    info,
+    {quic, QuicConn, {stream_reset, StreamId, ErrorCode, FinalSize}},
+    #state{quic_conn = QuicConn} = State
+) ->
+    handle_peer_reset(StreamId, ErrorCode, FinalSize, State);
 h3_connecting(
     info,
     {quic, QuicConn, {stop_sending, StreamId, ErrorCode}},
@@ -1144,7 +1167,13 @@ live_event(
     {quic, QuicConn, {stream_reset, StreamId, ErrorCode}},
     #state{quic_conn = QuicConn} = State
 ) ->
-    handle_peer_reset(StreamId, ErrorCode, State);
+    handle_peer_reset(StreamId, ErrorCode, undefined, State);
+live_event(
+    info,
+    {quic, QuicConn, {stream_reset, StreamId, ErrorCode, FinalSize}},
+    #state{quic_conn = QuicConn} = State
+) ->
+    handle_peer_reset(StreamId, ErrorCode, FinalSize, State);
 live_event(
     info,
     {quic, QuicConn, {stop_sending, StreamId, ErrorCode}},
@@ -1178,6 +1207,13 @@ live_event(
                 end
         end,
     {keep_state, State, [{reply, From, Reply}]};
+live_event({call, From}, {open_uni_stream, StreamType}, State) ->
+    case do_open_uni_stream(StreamType, State) of
+        {ok, StreamId, State1} ->
+            {keep_state, State1, [{reply, From, {ok, StreamId}}]};
+        {error, Reason} ->
+            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+    end;
 live_event({call, From}, {open_bidi_stream, SignalType}, State) ->
     case do_open_bidi_stream(SignalType, State) of
         {ok, StreamId, State1} ->
@@ -1782,6 +1818,26 @@ do_open_bidi_stream(SignalType, #state{quic_conn = QuicConn} = State) ->
     case quic:open_stream(QuicConn) of
         {ok, StreamId} ->
             {ok, StreamId, pre_claim_bidi_stream(StreamId, SignalType, State)};
+        {error, _} = Err ->
+            Err
+    end.
+
+%% Open a uni stream, write its type and claim it, so the owner hears of
+%% the peer's STOP_SENDING on it as on a stream the peer opened.
+do_open_uni_stream(StreamType, #state{quic_conn = QuicConn, owner = Owner} = State) ->
+    case quic:open_unidirectional_stream(QuicConn) of
+        {ok, StreamId} ->
+            case quic:send_data(QuicConn, StreamId, quic_varint:encode(StreamType), false) of
+                ok ->
+                    Owner ! {quic_h3, self(), {stream_type_open, uni, StreamId, StreamType}},
+                    {ok, StreamId, State#state{
+                        claimed_uni_streams = maps:put(
+                            StreamId, StreamType, State#state.claimed_uni_streams
+                        )
+                    }};
+                {error, _} = Err ->
+                    Err
+            end;
         {error, _} = Err ->
             Err
     end.
@@ -3727,12 +3783,16 @@ parse_priority_params([Param | Rest], Urgency, Incremental) ->
 -ifdef(TEST).
 %% Legacy test entry point; production code always has the error code.
 handle_stream_closed(StreamId, State) ->
-    handle_stream_closed(StreamId, 0, State).
+    handle_stream_closed(StreamId, 0, undefined, State).
+
+handle_stream_closed(StreamId, ErrorCode, State) ->
+    handle_stream_closed(StreamId, ErrorCode, undefined, State).
 -endif.
 
 handle_stream_closed(
     StreamId,
     ErrorCode,
+    FinalSize,
     #state{
         streams = Streams,
         stream_buffers = Buffers,
@@ -3753,11 +3813,9 @@ handle_stream_closed(
         false ->
             case claimed_stream_direction(StreamId, State) of
                 {ok, Direction} ->
-                    Event =
-                        case ErrorCode of
-                            0 -> {stream_type_closed, Direction, StreamId};
-                            _ -> {stream_type_reset, Direction, StreamId, ErrorCode}
-                        end,
+                    Event = claimed_close_event(
+                        Direction, StreamId, ErrorCode, FinalSize, State
+                    ),
                     Owner ! {quic_h3, self(), Event};
                 error ->
                     ok
@@ -3778,7 +3836,18 @@ handle_stream_closed(
             }}
     end.
 
-%% Only reached from handle_peer_reset/3, which reports the stream with
+%% WebTransport draft-17 Section 5.4: the session counts a reset stream's
+%% final size against WT_MAX_DATA, so an owner that asked for it gets it.
+claimed_close_event(Direction, StreamId, ErrorCode, FinalSize, #state{reset_final_size = true}) when
+    is_integer(FinalSize)
+->
+    {stream_type_reset, Direction, StreamId, ErrorCode, FinalSize};
+claimed_close_event(Direction, StreamId, 0, _FinalSize, _State) ->
+    {stream_type_closed, Direction, StreamId};
+claimed_close_event(Direction, StreamId, ErrorCode, _FinalSize, _State) ->
+    {stream_type_reset, Direction, StreamId, ErrorCode}.
+
+%% Only reached from handle_peer_reset/4, which reports the stream with
 %% the peer's code once this returns, so this tells the peer and nobody
 %% else. Reporting here as well would give the application two events for
 %% one dead stream.
@@ -5121,9 +5190,9 @@ report_local_reset(StreamId, ErrorCode, State) ->
 
 %% RESET_STREAM or RESET_STREAM_AT from the peer: clean up, then tell
 %% whoever waits on a request stream. Claimed streams were told already.
-handle_peer_reset(StreamId, ErrorCode, State0) ->
+handle_peer_reset(StreamId, ErrorCode, FinalSize, State0) ->
     State = drop_held_stream(StreamId, State0),
-    case handle_stream_closed(StreamId, ErrorCode, State) of
+    case handle_stream_closed(StreamId, ErrorCode, FinalSize, State) of
         {ok, State1} ->
             case is_request_stream(StreamId, State) of
                 true ->

@@ -73,6 +73,9 @@
     %% Server-side mutual TLS: require a valid client certificate. When false, an
     %% empty client Certificate is accepted (optional mTLS, RFC 8446 §4.4.2.4).
     require_client_cert = false :: boolean(),
+    %% Option stream_reset_final_size: the owner's reset notice carries
+    %% the stream's final size (RFC 9000 Section 4.5).
+    stream_reset_final_size = false :: boolean(),
 
     %% Key-exchange + signature negotiation (RFC 8446 §4.1.4 / §4.2.3)
     tls_groups = [x25519] :: [atom()],

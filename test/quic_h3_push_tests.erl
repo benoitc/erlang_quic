@@ -400,7 +400,8 @@ make_test_state(Overrides) ->
         deferred_requests => [],
         held_streams => #{},
         held_data => [],
-        held_bytes => 0
+        held_bytes => 0,
+        reset_final_size => false
     },
     Merged = maps:merge(Default, Overrides),
     {state, maps:get(quic_conn, Merged), maps:get(quic_ref, Merged), maps:get(role, Merged),
@@ -432,4 +433,5 @@ make_test_state(Overrides) ->
         maps:get(quic_connected, Merged), maps:get(close_reason, Merged),
         maps:get(send_blocked, Merged), maps:get(peer_goaway_id, Merged),
         maps:get(defer_requests, Merged), maps:get(deferred_requests, Merged),
-        maps:get(held_streams, Merged), maps:get(held_data, Merged), maps:get(held_bytes, Merged)}.
+        maps:get(held_streams, Merged), maps:get(held_data, Merged), maps:get(held_bytes, Merged),
+        maps:get(reset_final_size, Merged)}.

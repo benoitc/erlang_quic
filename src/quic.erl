@@ -93,6 +93,7 @@
     consume/3,
     reset_stream/3,
     reset_stream_at/4,
+    set_stream_reliable_size/3,
     stop_sending/3,
     handle_timeout/2,
     process/1,
@@ -536,6 +537,22 @@ when
     ReliableSize :: non_neg_integer().
 reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) when is_pid(Conn) ->
     quic_connection:reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize).
+
+%% @doc Keep the first `Size' bytes of a stream reliable when quic resets
+%% it on its own: answering the peer's STOP_SENDING, or on a send deadline.
+%% Such a reset is then a RESET_STREAM_AT with that reliable size, capped
+%% at what was written (draft-ietf-quic-reliable-stream-reset-07), when the
+%% peer advertised `reset_stream_at'; otherwise it stays a RESET_STREAM.
+%% WebTransport needs it for its stream header (draft-ietf-webtrans-http3-17
+%% Section 4.4). Without it nothing changes.
+-spec set_stream_reliable_size(Conn, StreamId, Size) -> ok | {error, term()} when
+    Conn :: pid(),
+    StreamId :: non_neg_integer(),
+    Size :: non_neg_integer().
+set_stream_reliable_size(Conn, StreamId, Size) when
+    is_pid(Conn), is_integer(StreamId), StreamId >= 0, is_integer(Size), Size >= 0
+->
+    quic_connection:set_stream_reliable_size(Conn, StreamId, Size).
 
 %% @doc Request peer to stop sending on a stream.
 %% Sends a STOP_SENDING frame (RFC 9000 Section 19.5).

@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `stream_reset_final_size` option for `quic_h3`. When set, a peer's
+  reset of a stream claimed by a `stream_type_handler` is reported with
+  the stream's final size, as `{stream_type_reset, Dir, StreamId,
+  ErrorCode, FinalSize}`. A WebTransport session needs it to count the
+  stream's bytes against WT_MAX_DATA: without it, every reset with data
+  in flight made the receiver count less than the sender, until the
+  sender stalled. The same option on a QUIC connection makes the owner's
+  `stream_reset` notice carry the final size. Off by default, so existing
+  owners see the same events.
+- `quic:set_stream_reliable_size/3`. A stream given a reliable size is
+  reset with RESET_STREAM_AT, keeping that many bytes, when quic resets
+  it on its own: answering the peer's STOP_SENDING, or on a send
+  deadline. A WebTransport stream answered with a plain RESET_STREAM
+  could lose its header, and with it the session it belonged to;
+  WebTransport draft-17 requires RESET_STREAM_AT there. Streams without
+  the setting, and peers without `reset_stream_at`, are reset as before.
+- `quic_h3:open_uni_stream/2` opens a unidirectional stream of an
+  extension type, writes the type and claims it, as `open_bidi_stream/2`
+  does for bidirectional streams. A WebTransport endpoint opened its uni
+  streams with `quic:open_unidirectional_stream/1`, so quic_h3 did not
+  know them and dropped the peer's STOP_SENDING on them: the endpoint kept
+  writing to a stream the peer had stopped, and a draining session never
+  saw it finish. The owner now receives `{stream_type_stop_sending, uni,
+  StreamId, ErrorCode}`.
+
 ## [2.4.1] - 2026-11-08
 
 ### Security
