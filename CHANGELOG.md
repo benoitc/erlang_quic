@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `notify_streams_available` option. When a stream cannot be opened
+  because the peer allows no more (`{error, stream_limit}`), the owner is
+  now told once one can be opened again, as
+  `{quic, Conn, {streams_available, bidi | uni}}`, instead of polling.
+  `quic_h3` takes the option too and sends
+  `{quic_h3, Conn, {streams_available, bidi}}` for refused requests. Off by
+  default.
+
 ## [2.5.0] - 2026-11-08
 
 ### Added

@@ -24,6 +24,9 @@
 %%%   <li>`{quic, Conn, {stream_data, StreamId, Bin, Fin}}' - Data received</li>
 %%%   <li>`{quic, Conn, {stream_reset, StreamId, ErrorCode}}' - Stream reset</li>
 %%%   <li>`{quic, Conn, {stop_sending, StreamId, ErrorCode}}' - Stop sending</li>
+%%%   <li>`{quic, Conn, {streams_available, bidi | uni}}' - With the
+%%%       `notify_streams_available' option: an open refused with
+%%%       `stream_limit' would now succeed. Sent once per refusal.</li>
 %%%   <li>`{quic, Conn, {goaway, LastStreamId, ErrorCode, Debug}}' - GoAway received</li>
 %%%   <li>`{quic, Conn, {session_ticket, Ticket}}' - Session ticket for 0-RTT</li>
 %%%   <li>`{quic, Conn, {send_ready, StreamId}}' - Stream ready to write</li>

@@ -100,6 +100,15 @@
 %%% to count the stream's bytes against WT_MAX_DATA (draft-ietf-webtrans-
 %%% http3-17 Section 5.4), since the bytes it never received count on the
 %%% peer's side.
+%%%
+%%% == Waiting for a stream ==
+%%%
+%%% `request/2,3' returns `{error, stream_limit}' when the server allows no
+%%% more requests at once. With the `notify_streams_available => true'
+%%% option, the owner then receives
+%%% `{quic_h3, Conn, {streams_available, bidi}}' once a request would open
+%%% again, one message per refusal, instead of having to poll. Nothing is
+%%% sent once a GOAWAY was sent or received, since no new request opens.
 %%% @end
 
 -module(quic_h3).
@@ -219,7 +228,11 @@
     stream_type_handler => stream_type_handler(),
     %% Report a claimed stream's reset with its final size (see the module
     %% doc). Default false.
-    stream_reset_final_size => boolean()
+    stream_reset_final_size => boolean(),
+    %% After a request refused with stream_limit, send
+    %% {streams_available, bidi} once one can open again (see the module
+    %% doc). Default false.
+    notify_streams_available => boolean()
 }.
 
 %% Override function invoked once per newly accepted QUIC connection.
@@ -868,12 +881,12 @@ to_binary({A, B, C, D, E, F, G, H}) when
     list_to_binary(inet:ntoa({A, B, C, D, E, F, G, H})).
 
 build_client_quic_opts(Host, Opts) ->
-    BaseOpts = #{
+    BaseOpts = maybe_notify_streams_available(Opts, #{
         alpn => [<<"h3">>],
         server_name => Host,
         %% Read by quic_h3_connection, the owner, never by the application.
         stream_reset_final_size => true
-    },
+    }),
     %% Add TLS options
     TlsOpts = maps:with([cert, key, cacerts, cacertfile, verify], Opts),
     %% Add any custom QUIC options
@@ -887,11 +900,11 @@ test_client_quic_opts(Opts) ->
 -endif.
 
 build_server_quic_opts(Opts) ->
-    BaseOpts = #{
+    BaseOpts = maybe_notify_streams_available(Opts, #{
         alpn => [<<"h3">>],
         %% Read by quic_h3_connection, the owner, never by the application.
         stream_reset_final_size => true
-    },
+    }),
     %% TLS options (required for server)
     TlsOpts = maps:with([cert, key, cacerts, cacertfile], Opts),
     %% Custom QUIC options
@@ -973,6 +986,14 @@ valid_max_buffered_body(Bytes) when is_integer(Bytes), Bytes >= 0 ->
     Bytes;
 valid_max_buffered_body(Other) ->
     error({bad_opts, {max_buffered_body, Other}}).
+
+%% quic_h3's notify_streams_available turns on the QUIC option of the same
+%% name, whose messages quic_h3_connection passes on to its owner.
+maybe_notify_streams_available(Opts, QuicOpts) ->
+    case valid_flag(notify_streams_available, maps:get(notify_streams_available, Opts, false)) of
+        true -> QuicOpts#{notify_streams_available => true};
+        false -> QuicOpts
+    end.
 
 valid_flag(_Name, Flag) when is_boolean(Flag) ->
     Flag;

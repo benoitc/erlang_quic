@@ -815,6 +815,8 @@ early_data(cast, close, State) ->
     close_with(normal, State);
 early_data(cast, {close, ErrorCode}, State) ->
     close_with_code(ErrorCode, State);
+early_data(info, {quic, QC, {streams_available, Dir}}, #state{quic_conn = QC} = State) ->
+    tell_streams_available(Dir, State);
 early_data(info, {quic, QC, send_ready}, #state{quic_conn = QC} = State) ->
     {keep_state, tell_send_ready(State)};
 early_data(info, {'DOWN', Ref, process, _, _}, #state{owner_monitor = Ref} = State) ->
@@ -1080,6 +1082,8 @@ connected(cast, goaway, State) ->
         {error, Reason} ->
             close_with({goaway_failed, Reason}, State)
     end;
+connected(info, {quic, QC, {streams_available, Dir}}, #state{quic_conn = QC} = State) ->
+    tell_streams_available(Dir, State);
 connected(EventType, Event, State) ->
     live_event(EventType, Event, State).
 
@@ -1821,6 +1825,15 @@ do_open_bidi_stream(SignalType, #state{quic_conn = QuicConn} = State) ->
         {error, _} = Err ->
             Err
     end.
+
+%% Option notify_streams_available: a request refused with stream_limit
+%% can be retried. Uni streams are this module's own, so only bidi is
+%% passed on; after GOAWAY no new request opens, so nothing is.
+tell_streams_available(bidi, #state{owner = Owner}) ->
+    Owner ! {quic_h3, self(), {streams_available, bidi}},
+    keep_state_and_data;
+tell_streams_available(uni, _State) ->
+    keep_state_and_data.
 
 %% Open a uni stream, write its type and claim it, so the owner hears of
 %% the peer's STOP_SENDING on it as on a stream the peer opened.
