@@ -54,9 +54,6 @@ recovery_exit_test() ->
 
 new_loss_after_recovery_test() ->
     %% Test that the system can recover after exiting recovery
-    %% Note: After exiting recovery, recovery_start_time is set to current time,
-    %% which means congestion events with sent_time <= recovery_start_time
-    %% are skipped to prevent spurious cwnd reduction.
     State = quic_cc:new(#{
         initial_window => 65536,
         minimum_window => 2400,
@@ -85,6 +82,31 @@ new_loss_after_recovery_test() ->
     %% Verify that cwnd is maintained or grew after recovery
     Cwnd3 = quic_cc:cwnd(S3),
     ?assert(Cwnd3 >= Cwnd1).
+
+%% RFC 9002 §7.3.1: the recovery period starts when the reduction is made,
+%% so a packet sent after that and lost later cuts the window again, also
+%% once recovery has been left.
+loss_sent_during_recovery_after_exit_test_() ->
+    [
+        {atom_to_list(A), fun() -> loss_sent_during_recovery_after_exit(A) end}
+     || A <- [newreno, cubic]
+    ].
+
+loss_sent_during_recovery_after_exit(Algorithm) ->
+    State = quic_cc:new(Algorithm, #{
+        initial_window => 65536,
+        minimum_window => 2400,
+        min_recovery_duration => 0
+    }),
+    S1 = quic_cc:on_congestion_event(State, erlang:monotonic_time(millisecond)),
+    timer:sleep(5),
+    SentInRecovery = erlang:monotonic_time(millisecond),
+    timer:sleep(5),
+    S2 = quic_cc:on_packet_sent(S1, 1200),
+    S3 = quic_cc:on_packets_acked(S2, 1200, SentInRecovery),
+    ?assertNot(quic_cc:in_recovery(S3)),
+    S4 = quic_cc:on_congestion_event(S3, SentInRecovery),
+    ?assert(quic_cc:cwnd(S4) < quic_cc:cwnd(S3)).
 
 %% Test recovery with only non-ack-eliciting packets acknowledged
 %% This simulates the bidirectional deadlock where only ACK frames get through
