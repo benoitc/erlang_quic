@@ -336,7 +336,12 @@
     held_bytes = 0 :: non_neg_integer(),
     %% Option stream_reset_final_size: a claimed stream's reset reaches the
     %% owner with its final size.
-    reset_final_size = false :: boolean()
+    reset_final_size = false :: boolean(),
+    %% Option notify_streams_available: the owner opens refused with
+    %% stream_limit since its last notice (a request, open_bidi_stream/2,
+    %% open_uni_stream/2), each told once an open of its kind would succeed.
+    notify_streams = false :: boolean(),
+    streams_wanted = [] :: [request | bidi | uni]
 }).
 
 %%====================================================================
@@ -590,6 +595,7 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
         local_connect_enabled = LocalConnectEnabled,
         stream_type_handler = StreamTypeHandler,
         reset_final_size = maps:get(stream_reset_final_size, Opts, false),
+        notify_streams = maps:get(notify_streams_available, Opts, false),
         h3_datagram_enabled = H3DatagramEnabled
     },
 
@@ -639,6 +645,7 @@ init({server, QuicConn, Opts, Owner}) ->
         local_connect_enabled = LocalConnectEnabled,
         stream_type_handler = StreamTypeHandler,
         reset_final_size = maps:get(stream_reset_final_size, Opts, false),
+        notify_streams = maps:get(notify_streams_available, Opts, false),
         h3_datagram_enabled = H3DatagramEnabled,
         max_buffered_body = MaxBufferedBody,
         defer_requests = DeferRequests
@@ -754,6 +761,8 @@ early_data({call, From}, {request, Headers, Opts}, #state{role = client} = State
     case send_request(Headers, Opts, State) of
         {ok, StreamId, State1} ->
             {keep_state, State1, [{reply, From, {ok, StreamId}}]};
+        {error, stream_limit} ->
+            {keep_state, want_streams(request, State), [{reply, From, {error, stream_limit}}]};
         {error, Reason} ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]};
         {error, Reason, State1} ->
@@ -1068,6 +1077,8 @@ connected({call, From}, {request, Headers, Opts}, #state{role = client} = State)
     case send_request(Headers, Opts, State) of
         {ok, StreamId, State1} ->
             {keep_state, State1, [{reply, From, {ok, StreamId}}]};
+        {error, stream_limit} ->
+            {keep_state, want_streams(request, State), [{reply, From, {error, stream_limit}}]};
         {error, Reason} ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]};
         {error, Reason, State1} ->
@@ -1082,8 +1093,6 @@ connected(cast, goaway, State) ->
         {error, Reason} ->
             close_with({goaway_failed, Reason}, State)
     end;
-connected(info, {quic, QC, {streams_available, Dir}}, #state{quic_conn = QC} = State) ->
-    tell_streams_available(Dir, State);
 connected(EventType, Event, State) ->
     live_event(EventType, Event, State).
 
@@ -1211,10 +1220,14 @@ live_event(
                 end
         end,
     {keep_state, State, [{reply, From, Reply}]};
+live_event(info, {quic, QC, {streams_available, Dir}}, #state{quic_conn = QC} = State) ->
+    tell_streams_available(Dir, State);
 live_event({call, From}, {open_uni_stream, StreamType}, State) ->
     case do_open_uni_stream(StreamType, State) of
         {ok, StreamId, State1} ->
             {keep_state, State1, [{reply, From, {ok, StreamId}}]};
+        {error, stream_limit} ->
+            {keep_state, want_streams(uni, State), [{reply, From, {error, stream_limit}}]};
         {error, Reason} ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
@@ -1222,6 +1235,8 @@ live_event({call, From}, {open_bidi_stream, SignalType}, State) ->
     case do_open_bidi_stream(SignalType, State) of
         {ok, StreamId, State1} ->
             {keep_state, State1, [{reply, From, {ok, StreamId}}]};
+        {error, stream_limit} ->
+            {keep_state, want_streams(bidi, State), [{reply, From, {error, stream_limit}}]};
         {error, Reason} ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
@@ -1826,14 +1841,34 @@ do_open_bidi_stream(SignalType, #state{quic_conn = QuicConn} = State) ->
             Err
     end.
 
-%% Option notify_streams_available: a request refused with stream_limit
-%% can be retried. Uni streams are this module's own, so only bidi is
-%% passed on; after GOAWAY no new request opens, so nothing is.
-tell_streams_available(bidi, #state{owner = Owner}) ->
-    Owner ! {quic_h3, self(), {streams_available, bidi}},
-    keep_state_and_data;
-tell_streams_available(uni, _State) ->
-    keep_state_and_data.
+%% Option notify_streams_available: an owner open refused with stream_limit
+%% is remembered...
+want_streams(Kind, #state{notify_streams = true, streams_wanted = Wanted} = State) ->
+    State#state{streams_wanted = lists:usort([Kind | Wanted])};
+want_streams(_Kind, State) ->
+    State.
+
+%% ...and the QUIC notice for its direction is passed on, once. A request
+%% cannot open after GOAWAY, so it is only told before one; streams the
+%% owner opens itself (open_bidi_stream/2, open_uni_stream/2) still can, as
+%% a WebTransport session drains. This module's own uni streams are never
+%% owner opens, so a notice they caused is not passed on.
+tell_streams_available(bidi, #state{streams_wanted = Wanted} = State) ->
+    Told =
+        lists:member(bidi, Wanted) orelse
+            (lists:member(request, Wanted) andalso not after_goaway(State)),
+    notify_wanted(bidi, Told, Wanted -- [bidi, request], State);
+tell_streams_available(uni, #state{streams_wanted = Wanted} = State) ->
+    notify_wanted(uni, lists:member(uni, Wanted), Wanted -- [uni], State).
+
+notify_wanted(Dir, true, Left, #state{owner = Owner} = State) ->
+    Owner ! {quic_h3, self(), {streams_available, Dir}},
+    {keep_state, State#state{streams_wanted = Left}};
+notify_wanted(_Dir, false, Left, State) ->
+    {keep_state, State#state{streams_wanted = Left}}.
+
+after_goaway(#state{goaway_id = undefined, peer_goaway_id = undefined}) -> false;
+after_goaway(_State) -> true.
 
 %% Open a uni stream, write its type and claim it, so the owner hears of
 %% the peer's STOP_SENDING on it as on a stream the peer opened.
