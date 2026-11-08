@@ -69,7 +69,7 @@
     verify_certificate_verify/4,
 
     %% TLS 1.3 External PSK (RFC 8446 §4.2.11)
-    select_psk/4,
+    select_psk/5,
     verify_resumption_binder/5,
     parse_extensions_ordered/1
 ]).
@@ -1474,6 +1474,9 @@ psk_binders_offset(OrderedExts, _ExtBlob) ->
 %%                   psks => Map | undefined}`.
 %% `ServerModes' is the list of psk_key_exchange modes the server is
 %%   willing to negotiate (defaults to `[psk_dhe_ke]`).
+%% `Cipher' is the suite the server selected. An external PSK is
+%%   SHA-256 (RFC 8446 Section 4.2.11), so it is only taken with a
+%%   SHA-256 suite.
 %%
 %% Returns:
 %%   `{ok, #{identity_idx => N, secret => Secret, mode => Mode}}` on
@@ -1485,28 +1488,29 @@ psk_binders_offset(OrderedExts, _ExtBlob) ->
 %%   unknown_psk_identity);
 %%   `{error, bad_binder}` when an identity matched but the binder
 %%   didn't verify — caller MUST send decrypt_error (no cert fallback).
--spec select_psk(map(), binary(), map(), [psk_dhe_ke | psk_ke]) ->
+-spec select_psk(map(), binary(), map(), [psk_dhe_ke | psk_ke], atom()) ->
     {ok, map()} | none | {error, bad_binder}.
-select_psk(#{pre_shared_key := undefined}, _FullMsg, _PskConfig, _ServerModes) ->
+select_psk(#{pre_shared_key := undefined}, _FullMsg, _PskConfig, _ServerModes, _Cipher) ->
     none;
-select_psk(#{pre_shared_key := #{identities := []}}, _FullMsg, _PskConfig, _ServerModes) ->
+select_psk(#{pre_shared_key := #{identities := []}}, _FullMsg, _PskConfig, _ServerModes, _Cipher) ->
+    none;
+select_psk(_CH, _FullMsg, _PskConfig, _ServerModes, aes_256_gcm) ->
     none;
 select_psk(
     #{
         pre_shared_key := #{identities := Identities, binders := Binders},
         psk_key_exchange_modes := ClientModes,
-        psk_binders := PskBindersInfo,
-        cipher_suites := CipherSuites
+        psk_binders := PskBindersInfo
     },
     FullHandshakeMsg,
     PskConfig,
-    ServerModes
+    ServerModes,
+    Cipher
 ) ->
     case mode_intersection(ClientModes, ServerModes) of
         [] ->
             none;
         [SelectedMode | _] ->
-            Cipher = select_cipher(CipherSuites),
             TruncatedHash = truncated_client_hello_hash(
                 FullHandshakeMsg, PskBindersInfo, Cipher
             ),
@@ -1520,17 +1524,11 @@ select_psk(
                 TruncatedHash
             )
     end;
-select_psk(_, _, _, _) ->
+select_psk(_, _, _, _, _) ->
     none.
 
 mode_intersection(Client, Server) ->
     [M || M <- Client, lists:member(M, Server)].
-
-select_cipher(CipherSuites) ->
-    case lists:member(?TLS_AES_128_GCM_SHA256, CipherSuites) of
-        true -> aes_128_gcm;
-        false -> aes_128_gcm
-    end.
 
 %% @private
 %% Slice the full handshake bytes down to the truncated ClientHello

@@ -55,3 +55,18 @@ hello_retry_request_with_a_suite_not_offered_test() ->
         }
     }),
     ?assertEqual({tls_alert, ?TLS_ALERT_ILLEGAL_PARAMETER}, S#state.close_reason).
+
+%% An external PSK is SHA-256 (RFC 8446 Section 4.2.11), so it goes with a
+%% suite of that hash and not with the one the binder was checked by.
+external_psk_needs_a_sha256_suite_test() ->
+    {CH, _, _} = quic_tls:build_client_hello(#{
+        server_name => <<"localhost">>,
+        alpn => [<<"h3">>],
+        transport_params => #{},
+        external_psk => {<<"id">>, <<"this-is-a-32-byte-test-secret!!!">>}
+    }),
+    <<_:8, _:24, Body/binary>> = CH,
+    {ok, CHMap} = quic_tls:parse_client_hello(Body),
+    Config = #{psks => #{<<"id">> => <<"this-is-a-32-byte-test-secret!!!">>}},
+    ?assertMatch({ok, _}, quic_tls:select_psk(CHMap, CH, Config, [psk_dhe_ke], aes_128_gcm)),
+    ?assertEqual(none, quic_tls:select_psk(CHMap, CH, Config, [psk_dhe_ke], aes_256_gcm)).

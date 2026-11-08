@@ -8037,7 +8037,7 @@ do_server_client_hello_cont(
                 none;
             _ ->
                 quic_tls:select_psk(
-                    ClientHelloInfo, OriginalMsg, PskConfig, ServerPskModes
+                    ClientHelloInfo, OriginalMsg, PskConfig, ServerPskModes, Cipher
                 )
         end,
     ok,
