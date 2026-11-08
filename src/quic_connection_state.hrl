@@ -76,6 +76,10 @@
     %% Option stream_reset_final_size: the owner's reset notice carries
     %% the stream's final size (RFC 9000 Section 4.5).
     stream_reset_final_size = false :: boolean(),
+    %% Option notify_streams_available: after an open refused with
+    %% stream_limit, tell the owner once the peer's MAX_STREAMS lets it
+    %% open again.
+    notify_streams_available = false :: boolean(),
 
     %% Key-exchange + signature negotiation (RFC 8446 §4.1.4 / §4.2.3)
     tls_groups = [x25519] :: [atom()],
@@ -647,6 +651,10 @@
     pend_payload = [] :: [iodata()],
     pend_frames = [] :: [tuple()],
     pend_size = 0 :: non_neg_integer(),
+
+    %% Directions an open was refused in since the owner was last told
+    %% streams are available (notify_streams_available only).
+    streams_blocked = [] :: [bidi | uni],
 
     %% Rarely written groups, each copied as one pointer by a state update.
     cfg = #conn_cfg{} :: #conn_cfg{},

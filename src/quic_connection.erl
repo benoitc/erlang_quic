@@ -766,6 +766,7 @@ init({server, Opts}) ->
             cacerts = maps:get(cacerts, Opts, undefined),
             require_client_cert = maps:get(require_client_cert, Opts, false),
             stream_reset_final_size = maps:get(stream_reset_final_size, Opts, false),
+            notify_streams_available = maps:get(notify_streams_available, Opts, false),
             %% TLS 1.3 external PSK config (RFC 8446 §4.2.11). Either or
             %% both may be `undefined'; if both are undefined the server
             %% only accepts cert-authenticated handshakes.
@@ -1217,6 +1218,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             verify = normalize_verify(maps:get(verify, Opts, true)),
             cacerts = maps:get(cacerts, Opts, undefined),
             stream_reset_final_size = maps:get(stream_reset_final_size, Opts, false),
+            notify_streams_available = maps:get(notify_streams_available, Opts, false),
             client_cert = maps:get(cert, Opts, undefined),
             client_cert_chain = maps:get(cert_chain, Opts, []),
             client_private_key = maps:get(key, Opts, undefined),
@@ -1397,6 +1399,8 @@ idle({call, From}, open_stream, #state{hs = #hs{early_keys = _EarlyKeys}} = Stat
     case do_open_stream(State) of
         {ok, StreamId, NewState} ->
             {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
+        {error, stream_limit} ->
+            {keep_state, mark_streams_blocked(bidi, State), [{reply, From, {error, stream_limit}}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1409,6 +1413,8 @@ idle({call, From}, open_unidirectional_stream, #state{hs = #hs{early_keys = _Ear
     case do_open_unidirectional_stream(State) of
         {ok, StreamId, NewState} ->
             {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
+        {error, stream_limit} ->
+            {keep_state, mark_streams_blocked(uni, State), [{reply, From, {error, stream_limit}}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1509,6 +1515,8 @@ handshaking({call, From}, open_stream, #state{hs = #hs{early_keys = _EarlyKeys}}
     case do_open_stream(State) of
         {ok, StreamId, NewState} ->
             {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
+        {error, stream_limit} ->
+            {keep_state, mark_streams_blocked(bidi, State), [{reply, From, {error, stream_limit}}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1522,6 +1530,8 @@ handshaking({call, From}, open_unidirectional_stream, State) ->
     case do_open_unidirectional_stream(State) of
         {ok, StreamId, NewState} ->
             {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
+        {error, stream_limit} ->
+            {keep_state, mark_streams_blocked(uni, State), [{reply, From, {error, stream_limit}}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -1724,7 +1734,8 @@ connected({call, From}, open_stream, State) ->
         {error, stream_limit} ->
             %% RFC 9000 Section 19.14
             State1 = send_frame(
-                {streams_blocked, bidi, State#state.max_streams_bidi_remote}, State
+                {streams_blocked, bidi, State#state.max_streams_bidi_remote},
+                mark_streams_blocked(bidi, State)
             ),
             {keep_state, flush_event(State1, event), [{reply, From, {error, stream_limit}}]};
         {error, Reason} ->
@@ -1736,7 +1747,10 @@ connected({call, From}, open_unidirectional_stream, State) ->
             {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
         {error, stream_limit} ->
             %% RFC 9000 Section 19.14
-            State1 = send_frame({streams_blocked, uni, State#state.max_streams_uni_remote}, State),
+            State1 = send_frame(
+                {streams_blocked, uni, State#state.max_streams_uni_remote},
+                mark_streams_blocked(uni, State)
+            ),
             {keep_state, flush_event(State1, event), [{reply, From, {error, stream_limit}}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
@@ -6259,14 +6273,14 @@ process_frame(app, {streams_blocked, _Dir, Count}, State) when Count > 1 bsl 60 
 process_frame(app, {max_streams, bidi, Max}, #state{max_streams_bidi_remote = Current} = State) ->
     case Max > Current of
         true ->
-            State#state{max_streams_bidi_remote = Max};
+            maybe_notify_streams_available(bidi, State#state{max_streams_bidi_remote = Max});
         false ->
             State
     end;
 process_frame(app, {max_streams, uni, Max}, #state{max_streams_uni_remote = Current} = State) ->
     case Max > Current of
         true ->
-            State#state{max_streams_uni_remote = Max};
+            maybe_notify_streams_available(uni, State#state{max_streams_uni_remote = Max});
         false ->
             State
     end;
@@ -9860,6 +9874,41 @@ set_reclaimed_map(uni, M, State) -> State#state{reclaimed_ranges_uni = M}.
 %% Open a new stream
 %% Stream ID patterns: Bit 0=initiator (0=client, 1=server), Bit 1=type (0=bidi, 1=uni)
 %% Client bidi=0x00, Server bidi=0x01, Client uni=0x02, Server uni=0x03
+%% Option notify_streams_available: an open refused in Dir is remembered
+%% until the owner can be told an open there would succeed.
+mark_streams_blocked(Dir, #state{cfg = #conn_cfg{notify_streams_available = true}} = State) ->
+    Blocked = State#state.streams_blocked,
+    State#state{streams_blocked = lists:usort([Dir | Blocked])};
+mark_streams_blocked(_Dir, State) ->
+    State.
+
+%% Once the peer's limit lets an open in Dir succeed, the owner is told,
+%% once per refusal episode: {quic, Conn, {streams_available, Dir}}.
+maybe_notify_streams_available(Dir, #state{streams_blocked = Blocked, owner = Owner} = State) ->
+    case
+        lists:member(Dir, Blocked) andalso State#state.close_reason =:= undefined andalso
+            can_open_local_stream(Dir, State)
+    of
+        true ->
+            Owner ! {quic, self(), {streams_available, Dir}},
+            State#state{streams_blocked = lists:delete(Dir, Blocked)};
+        false ->
+            State
+    end.
+
+%% Whether the peer's stream limit lets us open one more stream in Dir
+%% (RFC 9000 Section 4.6), the check do_open_stream/1 and
+%% do_open_unidirectional_stream/1 make.
+can_open_local_stream(bidi, #state{next_stream_id_bidi = Next, max_streams_bidi_remote = Max} = S) ->
+    (Next - local_stream_pattern(bidi, S)) div 4 < Max;
+can_open_local_stream(uni, #state{next_stream_id_uni = Next, max_streams_uni_remote = Max} = S) ->
+    (Next - local_stream_pattern(uni, S)) div 4 < Max.
+
+local_stream_pattern(bidi, #state{cfg = #conn_cfg{role = client}}) -> 0;
+local_stream_pattern(bidi, #state{cfg = #conn_cfg{role = server}}) -> 1;
+local_stream_pattern(uni, #state{cfg = #conn_cfg{role = client}}) -> 2;
+local_stream_pattern(uni, #state{cfg = #conn_cfg{role = server}}) -> 3.
+
 do_open_stream(
     #state{
         next_stream_id_bidi = NextId,
@@ -15212,7 +15261,10 @@ apply_peer_transport_params({error, Reason}, State) ->
 apply_peer_transport_params(TransportParams, State) ->
     case validate_peer_transport_params(TransportParams, State) of
         ok ->
-            apply_peer_transport_params_internal(TransportParams, State);
+            %% A 0-RTT open refused under the remembered limits can succeed
+            %% under the ones the peer sends now.
+            State1 = apply_peer_transport_params_internal(TransportParams, State),
+            maybe_notify_streams_available(uni, maybe_notify_streams_available(bidi, State1));
         {error, Reason} ->
             ?LOG_ERROR(
                 #{what => transport_parameter_validation_failed, reason => Reason},

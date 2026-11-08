@@ -467,6 +467,7 @@ Messages sent to the owner process:
 | `{quic, Conn, {stream_data, StreamId, Data, Fin}}` | Data received |
 | `{quic, Conn, {stream_reset, StreamId, Code}}` | Stream reset by peer |
 | `{quic, Conn, {stop_sending, StreamId, Code}}` | Stop sending requested |
+| `{quic, Conn, {streams_available, Dir}}` | With `notify_streams_available => true`: an open refused with `stream_limit` in `Dir` (`bidi` or `uni`) would now succeed. One message per refusal |
 | `{quic, Conn, {datagram, Data}}` | Datagram received |
 | `{quic, Conn, {session_ticket, Ticket}}` | Session ticket for 0-RTT |
 | `{quic, Conn, {stream_deadline, StreamId}}` | Stream deadline expired |
