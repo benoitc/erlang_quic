@@ -706,7 +706,10 @@
     recv_reset_at = undefined :: non_neg_integer() | undefined,
     %% Error codes from RESET_STREAM_AT (must not change once set)
     send_reset_error = undefined :: non_neg_integer() | undefined,
-    recv_reset_error = undefined :: non_neg_integer() | undefined
+    recv_reset_error = undefined :: non_neg_integer() | undefined,
+    %% quic:set_stream_reliable_size/3: the bytes a reset quic sends on its
+    %% own keeps reliable, as RESET_STREAM_AT, when the peer supports it.
+    reliable_size = undefined :: non_neg_integer() | undefined
 }).
 
 %% Sent packet info for loss detection

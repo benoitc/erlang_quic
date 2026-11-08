@@ -14,6 +14,13 @@ All notable changes to this project will be documented in this file.
   sender stalled. The same option on a QUIC connection makes the owner's
   `stream_reset` notice carry the final size. Off by default, so existing
   owners see the same events.
+- `quic:set_stream_reliable_size/3`. A stream given a reliable size is
+  reset with RESET_STREAM_AT, keeping that many bytes, when quic resets
+  it on its own: answering the peer's STOP_SENDING, or on a send
+  deadline. A WebTransport stream answered with a plain RESET_STREAM
+  could lose its header, and with it the session it belonged to;
+  WebTransport draft-17 requires RESET_STREAM_AT there. Streams without
+  the setting, and peers without `reset_stream_at`, are reset as before.
 
 ## [2.4.1] - 2026-11-08
 

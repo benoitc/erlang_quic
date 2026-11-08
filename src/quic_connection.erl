@@ -103,6 +103,7 @@
     close_stream/3,
     reset_stream/3,
     reset_stream_at/4,
+    set_stream_reliable_size/3,
     stop_sending/3,
     handle_timeout/1,
     handle_timeout/2,
@@ -378,6 +379,12 @@ reset_stream(Conn, StreamId, ErrorCode) ->
     ok | {error, term()}.
 reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) ->
     gen_statem:call(Conn, {reset_stream_at, StreamId, ErrorCode, ReliableSize}).
+
+%% @doc See quic:set_stream_reliable_size/3.
+-spec set_stream_reliable_size(pid(), non_neg_integer(), non_neg_integer()) ->
+    ok | {error, term()}.
+set_stream_reliable_size(Conn, StreamId, Size) ->
+    gen_statem:call(Conn, {set_stream_reliable_size, StreamId, Size}).
 
 %% @doc Request peer to stop sending on a stream.
 %% Sends a STOP_SENDING frame (RFC 9000 Section 19.5).
@@ -1743,6 +1750,16 @@ connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
     end;
 %% RESET_STREAM_AT: Reset with reliable delivery up to ReliableSize
 %% (draft-ietf-quic-reliable-stream-reset-07)
+connected(
+    {call, From}, {set_stream_reliable_size, StreamId, Size}, #state{streams = Streams} = State
+) ->
+    case Streams of
+        #{StreamId := Stream} ->
+            NewStreams = Streams#{StreamId := Stream#stream_state{reliable_size = Size}},
+            {keep_state, State#state{streams = NewStreams}, [{reply, From, ok}]};
+        _ ->
+            {keep_state, State, [{reply, From, {error, unknown_stream}}]}
+    end;
 connected({call, From}, {reset_stream_at, StreamId, ErrorCode, ReliableSize}, State) ->
     case do_reset_stream_at(StreamId, ErrorCode, ReliableSize, State) of
         {ok, NewState} ->
@@ -11561,10 +11578,30 @@ answer_stop_sending(StreamId, ErrorCode, StreamsBefore, State) ->
         end,
     case (not SendDone) andalso can_send_on_stream(StreamId, State) of
         true ->
-            {ok, Reset} = do_close_stream(StreamId, ErrorCode, State),
+            {ok, Reset} = reset_own_stream(StreamId, ErrorCode, fun do_close_stream/3, State),
             Reset;
         false ->
             State
+    end.
+
+%% A reset quic sends on its own: RESET_STREAM_AT keeping the stream's
+%% reliable size, capped at what was written, when the owner set one and
+%% the peer advertised reset_stream_at; otherwise Plain, a RESET_STREAM.
+reset_own_stream(
+    StreamId, ErrorCode, Plain, #state{streams = Streams, transport_params = TP} = State
+) ->
+    case {Streams, maps:get(reset_stream_at, TP, false)} of
+        {#{StreamId := #stream_state{reliable_size = Size, send_offset = Sent} = Stream}, true} when
+            is_integer(Size)
+        ->
+            case
+                do_reset_stream_at_with_stream(StreamId, ErrorCode, min(Size, Sent), Stream, State)
+            of
+                {ok, _} = Ok -> Ok;
+                {error, _} -> Plain(StreamId, ErrorCode, State)
+            end;
+        _ ->
+            Plain(StreamId, ErrorCode, State)
     end.
 
 %% Send RESET_STREAM (RFC 9000 §3.2): closes the SEND direction only.
@@ -11984,10 +12021,10 @@ handle_stream_deadline_expired(
                     Owner ! {quic, self(), {stream_deadline, StreamId}},
                     {ok, State1};
                 reset ->
-                    do_close_stream_deadline(StreamId, ErrorCode, State1);
+                    reset_own_stream(StreamId, ErrorCode, fun do_close_stream_deadline/3, State1);
                 both ->
                     Owner ! {quic, self(), {stream_deadline, StreamId}},
-                    do_close_stream_deadline(StreamId, ErrorCode, State1)
+                    reset_own_stream(StreamId, ErrorCode, fun do_close_stream_deadline/3, State1)
             end;
         {ok, _ClosedStream} ->
             %% Stream already closed
