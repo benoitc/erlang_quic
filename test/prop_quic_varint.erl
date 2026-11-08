@@ -148,24 +148,29 @@ expected_length(_) -> 8.
 %%====================================================================
 
 proper_test_() ->
-    {timeout, 60, [
-        ?_assert(proper:quickcheck(prop_roundtrip(), [{numtests, 1000}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_encoded_length(), [{numtests, 1000}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_small_uses_one_byte(), [{numtests, 100}, {to_file, user}])),
-        ?_assert(
-            proper:quickcheck(prop_medium_uses_two_bytes(), [{numtests, 100}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_large_uses_four_bytes(), [{numtests, 100}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_xlarge_uses_eight_bytes(), [{numtests, 100}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_decode_preserves_rest(), [{numtests, 500}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_encode_deterministic(), [{numtests, 500}, {to_file, user}])
-        ),
-        ?_assert(proper:quickcheck(prop_length_prefix(), [{numtests, 500}, {to_file, user}]))
-    ]}.
+    [
+        {timeout, 60, T}
+     || T <- [
+            ?_assert(proper:quickcheck(prop_roundtrip(), [{numtests, 1000}, {to_file, user}])),
+            ?_assert(proper:quickcheck(prop_encoded_length(), [{numtests, 1000}, {to_file, user}])),
+            ?_assert(
+                proper:quickcheck(prop_small_uses_one_byte(), [{numtests, 100}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_medium_uses_two_bytes(), [{numtests, 100}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_large_uses_four_bytes(), [{numtests, 100}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_xlarge_uses_eight_bytes(), [{numtests, 100}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_decode_preserves_rest(), [{numtests, 500}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_encode_deterministic(), [{numtests, 500}, {to_file, user}])
+            ),
+            ?_assert(proper:quickcheck(prop_length_prefix(), [{numtests, 500}, {to_file, user}]))
+        ]
+    ].

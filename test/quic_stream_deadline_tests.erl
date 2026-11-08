@@ -374,12 +374,13 @@ timer_can_be_cancelled() ->
     end.
 
 timer_message_delivered() ->
-    %% Test that timer message is delivered after timeout
+    %% Test that timer message is delivered after timeout. macOS coalesces
+    %% the wakeups of a low-priority process, so the window is wide.
     StreamId = 8,
     _TimerRef = erlang:send_after(10, self(), {stream_deadline, StreamId}),
     receive
         {stream_deadline, RecvId} ->
             ?assertEqual(StreamId, RecvId)
-    after 100 ->
+    after 2000 ->
         ?assert(false)
     end.

@@ -16,34 +16,47 @@
 %%====================================================================
 
 qpack_prop_test_() ->
-    {timeout, 120, [
-        {"Header roundtrip", fun() ->
-            ?assert(proper:quickcheck(prop_header_roundtrip(), [{numtests, 100}, {to_file, user}]))
-        end},
-        {"Multiple headers roundtrip", fun() ->
-            ?assert(
-                proper:quickcheck(prop_multiple_headers_roundtrip(), [
-                    {numtests, 50}, {to_file, user}
-                ])
-            )
-        end},
-        {"Decode arbitrary bytes no crash", fun() ->
-            ?assert(proper:quickcheck(prop_decode_no_crash(), [{numtests, 500}, {to_file, user}]))
-        end},
-        {"Static table entries roundtrip", fun() ->
-            ?assert(
-                proper:quickcheck(prop_static_table_roundtrip(), [{numtests, 100}, {to_file, user}])
-            )
-        end},
-        {"Huffman roundtrip", fun() ->
-            ?assert(proper:quickcheck(prop_huffman_roundtrip(), [{numtests, 200}, {to_file, user}]))
-        end},
-        {"Header names preserved", fun() ->
-            ?assert(
-                proper:quickcheck(prop_header_name_preserved(), [{numtests, 100}, {to_file, user}])
-            )
-        end}
-    ]}.
+    [
+        {timeout, 120, T}
+     || T <- [
+            {"Header roundtrip", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_header_roundtrip(), [{numtests, 100}, {to_file, user}])
+                )
+            end},
+            {"Multiple headers roundtrip", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_multiple_headers_roundtrip(), [
+                        {numtests, 50}, {to_file, user}
+                    ])
+                )
+            end},
+            {"Decode arbitrary bytes no crash", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_decode_no_crash(), [{numtests, 500}, {to_file, user}])
+                )
+            end},
+            {"Static table entries roundtrip", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_static_table_roundtrip(), [
+                        {numtests, 100}, {to_file, user}
+                    ])
+                )
+            end},
+            {"Huffman roundtrip", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_huffman_roundtrip(), [{numtests, 200}, {to_file, user}])
+                )
+            end},
+            {"Header names preserved", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_header_name_preserved(), [
+                        {numtests, 100}, {to_file, user}
+                    ])
+                )
+            end}
+        ]
+    ].
 
 %%====================================================================
 %% Properties

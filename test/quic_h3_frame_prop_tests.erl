@@ -18,58 +18,67 @@
 
 %% All property tests wrapped for EUnit
 frame_prop_test_() ->
-    {timeout, 60, [
-        {"DATA frame roundtrip", fun() ->
-            ?assert(
-                proper:quickcheck(prop_data_frame_roundtrip(), [{numtests, 100}, {to_file, user}])
-            )
-        end},
-        {"HEADERS frame roundtrip", fun() ->
-            ?assert(
-                proper:quickcheck(prop_headers_frame_roundtrip(), [{numtests, 100}, {to_file, user}])
-            )
-        end},
-        {"SETTINGS frame roundtrip", fun() ->
-            ?assert(
-                proper:quickcheck(prop_settings_frame_roundtrip(), [
-                    {numtests, 100}, {to_file, user}
-                ])
-            )
-        end},
-        {"GOAWAY frame roundtrip", fun() ->
-            ?assert(
-                proper:quickcheck(prop_goaway_frame_roundtrip(), [{numtests, 100}, {to_file, user}])
-            )
-        end},
-        {"MAX_PUSH_ID frame roundtrip", fun() ->
-            ?assert(
-                proper:quickcheck(prop_max_push_id_frame_roundtrip(), [
-                    {numtests, 100}, {to_file, user}
-                ])
-            )
-        end},
-        {"CANCEL_PUSH frame roundtrip", fun() ->
-            ?assert(
-                proper:quickcheck(prop_cancel_push_frame_roundtrip(), [
-                    {numtests, 100}, {to_file, user}
-                ])
-            )
-        end},
-        {"Decode arbitrary bytes doesn't crash", fun() ->
-            ?assert(
-                proper:quickcheck(prop_decode_arbitrary_no_crash(), [
-                    {numtests, 500}, {to_file, user}
-                ])
-            )
-        end},
-        {"Partial frame needs more data", fun() ->
-            ?assert(
-                proper:quickcheck(prop_partial_frame_needs_more(), [
-                    {numtests, 100}, {to_file, user}
-                ])
-            )
-        end}
-    ]}.
+    [
+        {timeout, 60, T}
+     || T <- [
+            {"DATA frame roundtrip", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_data_frame_roundtrip(), [
+                        {numtests, 100}, {to_file, user}
+                    ])
+                )
+            end},
+            {"HEADERS frame roundtrip", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_headers_frame_roundtrip(), [
+                        {numtests, 100}, {to_file, user}
+                    ])
+                )
+            end},
+            {"SETTINGS frame roundtrip", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_settings_frame_roundtrip(), [
+                        {numtests, 100}, {to_file, user}
+                    ])
+                )
+            end},
+            {"GOAWAY frame roundtrip", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_goaway_frame_roundtrip(), [
+                        {numtests, 100}, {to_file, user}
+                    ])
+                )
+            end},
+            {"MAX_PUSH_ID frame roundtrip", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_max_push_id_frame_roundtrip(), [
+                        {numtests, 100}, {to_file, user}
+                    ])
+                )
+            end},
+            {"CANCEL_PUSH frame roundtrip", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_cancel_push_frame_roundtrip(), [
+                        {numtests, 100}, {to_file, user}
+                    ])
+                )
+            end},
+            {"Decode arbitrary bytes doesn't crash", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_decode_arbitrary_no_crash(), [
+                        {numtests, 500}, {to_file, user}
+                    ])
+                )
+            end},
+            {"Partial frame needs more data", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_partial_frame_needs_more(), [
+                        {numtests, 100}, {to_file, user}
+                    ])
+                )
+            end}
+        ]
+    ].
 
 %%====================================================================
 %% Properties

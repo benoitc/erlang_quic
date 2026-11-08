@@ -139,16 +139,21 @@ prop_dcid_length_encoded() ->
 %%====================================================================
 
 proper_test_() ->
-    {timeout, 120, [
-        ?_assert(
-            proper:quickcheck(prop_long_header_roundtrip(), [{numtests, 300}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_short_header_roundtrip(), [{numtests, 300}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_encode_deterministic(), [{numtests, 200}, {to_file, user}])
-        ),
-        ?_assert(proper:quickcheck(prop_header_form_bit(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_dcid_length_encoded(), [{numtests, 200}, {to_file, user}]))
-    ]}.
+    [
+        {timeout, 120, T}
+     || T <- [
+            ?_assert(
+                proper:quickcheck(prop_long_header_roundtrip(), [{numtests, 300}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_short_header_roundtrip(), [{numtests, 300}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_encode_deterministic(), [{numtests, 200}, {to_file, user}])
+            ),
+            ?_assert(proper:quickcheck(prop_header_form_bit(), [{numtests, 200}, {to_file, user}])),
+            ?_assert(
+                proper:quickcheck(prop_dcid_length_encoded(), [{numtests, 200}, {to_file, user}])
+            )
+        ]
+    ].
