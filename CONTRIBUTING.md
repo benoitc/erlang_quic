@@ -2,6 +2,65 @@
 
 This page is for people changing erlang_quic itself. For using the library, start with [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md). For finding your way around the source, read [docs/MODULE_MAP.md](docs/MODULE_MAP.md), and keep [docs/GLOSSARY.md](docs/GLOSSARY.md) open for the abbreviations.
 
+## Write for the person who reads it
+
+Every issue, pull request and comment is read by a person. Make it easy for
+them.
+
+- Read what you send before you send it. You are responsible for every line,
+  whether you wrote it or a tool did.
+- Use plain English and short sentences. Say what happens, what you
+  expected, and how to reproduce it. Explain any term a reader may not know.
+- Don't inflate it. No buzzwords, no severity scores, CVSS or CWE labels, no
+  "critical" for a bug, no long generated write-ups. If it takes a page to
+  explain, cut it down until it doesn't.
+- A bug report gives: the erlang_quic and OTP versions, client or server,
+  the options you set, the peer implementation, a minimal reproduction, what
+  you got and what you expected. A packet capture with a key log
+  (`SSLKEYLOGFILE`) helps most.
+- A pull request says what was wrong and why it matters, the fix in a few
+  lines, and any breaking change. Link the issue. Don't walk through the diff
+  file by file; the reviewer reads the code.
+- A fix comes with a test that fails without it.
+
+AI tools are fine to use. Before you open anything, you must have read the
+change, run the tests, and be able to answer questions about it yourself.
+
+Maintainers read every issue and pull request before acting on it. We close
+without further review:
+
+- text we cannot understand after one request to clarify;
+- descriptions that don't match the code or the reproduction;
+- reports that cannot be reproduced;
+- submissions opened by an automated agent that no person has read.
+
+## Security issues and specification bugs
+
+erlang_quic implements QUIC, TLS 1.3 for QUIC, HTTP/3, QPACK and the
+extensions listed in [AGENTS.md](https://github.com/benoitc/erlang_quic/blob/main/AGENTS.md#specifications).
+
+When the fix is to make erlang_quic do what one of these specifications says,
+it is a bug, not a security issue. That includes reports described as
+amplification, denial of service or a remote crash, when they come from:
+
+- input accepted, rejected or framed differently from the specification;
+- a wrong error code, close, reset or state transition;
+- loss detection, congestion control, path validation or migration that
+  does not follow the specification;
+- a missing bound that the specification or an option defines.
+
+Report these as a normal bug, in public. Cite the specification section. The
+fix goes in a public pull request and in the CHANGELOG under Fixed. We don't
+publish advisories or request CVEs for them, and advisories filed for them
+are closed with a link to the fix.
+
+Only problems that are not a specification deviation go through
+[SECURITY.md](https://github.com/benoitc/erlang_quic/blob/main/SECURITY.md): code execution, a peer accepted without the
+authentication the configuration asks for (certificates, hostnames, client
+certificates, PSK and session tickets, distribution node authentication),
+keys, secrets or one connection's data reaching someone else, or erlang_quic
+weakening TLS below what the configuration allows.
+
 ## Set up
 
 You need Erlang/OTP 27 or later and rebar3. Nothing else is required to build: the library has no dependencies.
@@ -102,6 +161,8 @@ Write guides in the task-oriented style the existing ones use: say what the thin
 Branch from `main` using the prefix that fits: `fix/`, `feat/`, `perf/`, `refactor/`, `docs/`, `test/` or `chore/`.
 
 Write the commit subject in the imperative, describing what the code now does rather than what it used to do. Keep the body to short bullets. Do not add generated-by or co-authored-by trailers.
+
+A change to protocol code passes the three checks in [AGENTS.md](https://github.com/benoitc/erlang_quic/blob/main/AGENTS.md#first-principle-compliance-latest-spec-safety) before it is opened: compliance with the spec section, the spec being the current one, and safety against a hostile peer.
 
 Say what the change is for and how it works. Skip the test inventory: CI reports that. If the change touches the public API, show it in a short code block.
 

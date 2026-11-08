@@ -9,6 +9,29 @@ Security fixes are applied to the latest minor release on the `main` branch.
 | 2.5.x   | yes       |
 | < 2.5   | no        |
 
+## What is a security issue
+
+Private reports are for problems that are not a deviation from a
+specification erlang_quic implements: code execution; a peer accepted without
+the authentication the configuration asks for (certificate chain, hostname
+or client-certificate checks, PSK and session-ticket binding, Erlang
+distribution node authentication); keys, secrets or one connection's data
+reaching someone else; erlang_quic weakening TLS below what the
+configuration allows.
+
+## What is a bug
+
+When the fix is to make erlang_quic follow a specification it implements
+(QUIC, TLS 1.3 for QUIC, HTTP/3, QPACK and their extensions), it is a bug,
+even when described as amplification, denial of service or a remote crash.
+Report it as a public bug and cite the specification section; see
+[Security issues and specification bugs](CONTRIBUTING.md#security-issues-and-specification-bugs).
+We don't publish advisories or request CVEs for these, and advisories filed
+for them are closed as bugs with a link to the fix.
+
+Write the report in plain English, with a minimal reproduction, as described
+in [CONTRIBUTING.md](CONTRIBUTING.md#write-for-the-person-who-reads-it).
+
 ## Reporting a Vulnerability
 
 Please report suspected vulnerabilities privately through GitHub's

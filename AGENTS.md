@@ -1,10 +1,70 @@
 # Agents
 
-Instructions for AI coding agents working on this project.
+Instructions for AI coding agents working on erlang_quic. Read this file
+before you change anything; it applies to every agent and every change.
 
 ## Project Overview
 
 Pure Erlang QUIC implementation (RFC 9000/9001) with zero external dependencies. Requires Erlang/OTP 27 or later and rebar3.
+
+## First principle: compliance, latest spec, safety
+
+erlang_quic faces untrusted peers. Every change that touches how packets,
+frames, transport parameters, TLS handshake messages, HTTP/3 frames or QPACK
+field sections are read, parsed or written, or how a connection, stream, path
+or key changes state, must pass three checks before it is called done,
+committed or opened as a pull request:
+
+1. **Compliance**: the behaviour matches the governing spec section, and a test
+   shows the accept and the reject path. The test fails on main without the
+   change.
+2. **Latest specification**: you checked that the spec you cite is the current
+   one (not obsoleted, no newer draft revision that changes the rule), and you
+   read the section itself instead of quoting from memory.
+3. **Safety**: the change does not open a known abuse class (amplification,
+   resource exhaustion, flood, connection hijack) and every per-peer resource
+   it touches stays bounded.
+
+Use the [protocol-change-review](.agents/skills/protocol-change-review/SKILL.md)
+skill to run them. When in doubt whether a change is protocol code, it is.
+
+## Specification issues are bugs, not security issues
+
+A report is a specification issue when the fix is to make erlang_quic do what
+a spec it implements says (see [Specifications](#specifications)):
+
+- input accepted, rejected or framed differently from the spec (packets,
+  frames, transport parameters, version negotiation, TLS handshake messages,
+  HTTP/3 frames and settings, QPACK, capsules, datagrams);
+- a wrong error code, close or reset, or a state transition the spec does not
+  allow (connection, stream, path, key update);
+- loss detection, congestion control, path validation or migration that does
+  not follow RFC 9002 and RFC 9000 Sections 8 and 9;
+- a missing or wrong bound that the spec or an option defines (flow-control
+  credit, stream and connection ID limits, the anti-amplification limit, ACK
+  ranges, idle and handshake timeouts, `max_field_section_size`,
+  `max_buffered_body`).
+
+This holds even when the report calls it amplification, denial of service or
+a remote crash. Treat it as a bug:
+
+- fix it in a public pull request, with a public issue if one is needed;
+- list it under **Fixed** in the CHANGELOG, in plain English, citing the spec
+  section;
+- do not open a GitHub Security Advisory, request a CVE, embargo the fix,
+  give it a severity, or describe how to attack it;
+- when it arrived as an advisory, close the advisory as not a vulnerability
+  and link the pull request that fixes it.
+
+Only a problem that is not a spec deviation goes through
+[SECURITY.md](SECURITY.md): code execution; a peer accepted without the
+authentication the configuration asks for (certificate chain, hostname or
+client-certificate checks, PSK and session-ticket binding, Erlang
+distribution node authentication); keys, secrets or one connection's data
+reaching someone else; erlang_quic weakening TLS below what the
+configuration allows. Peer authentication stays a security issue even where
+a spec describes the check. If unsure, ask the maintainer before treating
+anything as a security issue.
 
 ## Required Checks
 
@@ -30,12 +90,81 @@ Work on one issue goes in one pull request. Give each change a reviewer has to
 look at its own commit, with its tests, rather than opening a pull request per
 change. Docs and CHANGELOG entries go in the same pull request.
 
+- Every bug fix and feature has a test. Show it failing on main.
+- Never relax a limit or a check to make a peer pass; exclude the legitimate
+  case precisely.
+- Descriptions state what was wrong, the fix in a few lines, and breaking
+  changes. Reference issues with `Fixes #N`. No test plan, no file-by-file
+  walkthrough.
+- No `Co-Authored-By`, "Generated with" or similar trailers, in commits or
+  pull requests.
+- CHANGELOG: plain English, what was wrong and what it means for the user,
+  the spec section when there is one. No implementation details, no attack
+  narratives.
+- Follow "Write for the person who reads it" in
+  [CONTRIBUTING.md](CONTRIBUTING.md#write-for-the-person-who-reads-it): plain
+  English, no inflated or pseudo-technical wording, and a person has read the
+  change before it is opened.
+
+## Specifications
+
+The specs erlang_quic implements. Cite the current one in code and the
+CHANGELOG. Last checked: 2026-11-08.
+
+### QUIC
+
+| Spec | Scope in erlang_quic | Code |
+|---|---|---|
+| RFC 9000 QUIC transport | packets, frames, streams, flow control, connection IDs, migration, path validation, stateless reset, anti-amplification | `quic_connection`, `quic_packet`, `quic_frame`, `quic_listener` |
+| RFC 9001 QUIC-TLS | packet protection, header protection, key update, AEAD limits | `quic_crypto`, `quic_aead`, `quic_keys` |
+| RFC 9002 loss detection and congestion control | ACK handling, PTO, NewReno | `quic_loss`, `quic_ack`, `quic_cc_newreno` |
+| RFC 8999 version-independent properties (updated by RFC 9368) | long and short header invariants, Version Negotiation | `quic_packet` |
+| RFC 9368 compatible version negotiation, RFC 9369 QUIC v2 | `version_information`, v2 packets and keys | `quic_connection`, `quic_crypto` |
+| RFC 9221 DATAGRAM | DATAGRAM frames, `max_datagram_frame_size` | `quic_connection` |
+| RFC 8899 DPLPMTUD | PMTU probing | `quic_pmtu` |
+| RFC 9438 CUBIC, RFC 9406 HyStart++ | congestion control | `quic_cc_cubic`, `quic_cc_newreno` |
+| draft-ietf-ccwg-bbr-07 BBRv3 | congestion control | `quic_cc_bbr` |
+| draft-ietf-quic-reliable-stream-reset-11 | RESET_STREAM_AT, `reset_stream_at` transport parameter | `quic_connection` |
+| draft-ietf-quic-load-balancers-22 QUIC-LB | routable connection IDs | `quic_lb` |
+| RFC 8305 Happy Eyeballs v2 | client address racing | `quic_happy` |
+
+### TLS
+
+| Spec | Scope |
+|---|---|
+| RFC 9846 TLS 1.3 (obsoletes RFC 8446) | handshake, PSK and session tickets, 0-RTT, HelloRetryRequest |
+| RFC 5869 HKDF | key schedule |
+| RFC 6066 TLS extensions | SNI |
+| RFC 7301 ALPN | protocol negotiation |
+| RFC 9525 service identity (obsoletes RFC 6125) | hostname checks on the server certificate |
+
+### HTTP/3
+
+| Spec | Scope | Code |
+|---|---|---|
+| RFC 9114 HTTP/3 | frames, streams, SETTINGS, GOAWAY, push | `quic_h3_connection`, `quic_h3_frame` |
+| RFC 9204 QPACK | field compression, encoder and decoder streams | `quic_qpack` |
+| RFC 9110 HTTP semantics | fields, status, Content-Length, trailers | `quic_h3_connection` |
+| RFC 9297 HTTP datagrams and capsules | `h3_datagram_enabled`, capsules | `quic_h3_connection`, `quic_h3_capsule` |
+| RFC 9218 extensible priorities | PRIORITY_UPDATE, `priority` field | `quic_h3_connection` |
+| RFC 9220 extended CONNECT over HTTP/3 | `enable_connect_protocol`, `:protocol` | `quic_h3_connection` |
+| draft-ietf-webtrans-http3-17 | the primitives WebTransport needs: SETTINGS_WT_ENABLED, WT_STREAM, claimed streams | `quic_h3_connection` |
+
+Code comments still cite RFC 8446 and RFC 6125, which are obsoleted, and
+call QUIC-LB "RFC 9312", which is the QUIC manageability document. Use the
+numbers above in new code. Erlang distribution over QUIC (`quic_dist`) follows
+the OTP distribution protocol, which is documented in the OTP sources rather
+than an RFC.
+
 ## Skills
 
 Task guides for agents live in `.agents/skills/<name>/SKILL.md`; read the one
 that matches the task before starting. `.claude/skills` links to the same
 directories, so there is one copy.
 
+- [protocol-change-review](.agents/skills/protocol-change-review/SKILL.md):
+  the three checks above (compliance, latest spec, safety) for a change, a
+  commit or a pull request.
 - [rfc-compliance](.agents/skills/rfc-compliance/SKILL.md): check a change or
   pull request against RFC 9000, 9001, 9002 and the related specs.
 
