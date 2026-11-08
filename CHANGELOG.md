@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.5.0] - 2026-11-08
 
 ### Added
 - `stream_reset_final_size` option for `quic_h3`. When set, a peer's
