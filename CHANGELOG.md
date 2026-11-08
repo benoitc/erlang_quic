@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- With `notify_streams_available`, quic_h3 told its owner only about
+  refused requests. A stream the owner opens itself with
+  `quic_h3:open_uni_stream/2` or `open_bidi_stream/2` and refused with
+  `stream_limit` never got `{streams_available, uni | bidi}`, so a
+  WebTransport session could not know when to retry, and nothing was sent
+  after GOAWAY although such a session keeps opening streams while it
+  drains. Each refused open is now told for its own kind, those two also
+  after GOAWAY. `quic_h3:start_server/3` also lists the option in its type,
+  so a server passing it no longer fails dialyzer.
+
 ## [2.6.0] - 2026-11-08
 
 ### Added

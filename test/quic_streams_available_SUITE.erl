@@ -21,7 +21,10 @@
     one_message_per_refusal_episode/1,
     refused_uni_open_is_told_when_streams_return/1,
     quic_h3_owner_is_told/1,
-    quic_h3_owner_is_not_told_after_goaway/1
+    quic_h3_owner_is_not_told_after_goaway/1,
+    quic_h3_uni_open_is_told/1,
+    quic_h3_bidi_open_after_goaway_is_told/1,
+    quic_h3_nothing_without_the_option/1
 ]).
 
 -define(WAIT_MS, 3000).
@@ -38,7 +41,10 @@ all() ->
         one_message_per_refusal_episode,
         refused_uni_open_is_told_when_streams_return,
         quic_h3_owner_is_told,
-        quic_h3_owner_is_not_told_after_goaway
+        quic_h3_owner_is_not_told_after_goaway,
+        quic_h3_uni_open_is_told,
+        quic_h3_bidi_open_after_goaway_is_told,
+        quic_h3_nothing_without_the_option
     ].
 
 init_per_suite(Config) ->
@@ -144,6 +150,52 @@ quic_h3_owner_is_not_told_after_goaway(Config) ->
         ?assertEqual(none, h3_available(Conn, ?QUIET_MS))
     end).
 
+%% The client's own control and QPACK streams take 3 of the 5 uni streams
+%% the server allows, so the owner can open 2.
+quic_h3_uni_open_is_told(Config) ->
+    with_h3(Config, #{notify_streams_available => true}, fun(Conn) ->
+        QC = quic_h3:get_quic_conn(Conn),
+        {ok, U1} = quic_h3:open_uni_stream(Conn, 16#54),
+        {ok, U2} = quic_h3:open_uni_stream(Conn, 16#54),
+        ?assertEqual({error, stream_limit}, quic_h3:open_uni_stream(Conn, 16#54)),
+        ok = quic:send_data(QC, U1, <<0>>, true),
+        ok = quic:send_data(QC, U2, <<0>>, true),
+        ?assertEqual({streams_available, uni}, h3_available(Conn, ?WAIT_MS)),
+        ?assertMatch({ok, _}, quic_h3:open_uni_stream(Conn, 16#54))
+    end).
+
+%% A stream the owner opens itself can still open after GOAWAY, so its
+%% refusal is told then.
+quic_h3_bidi_open_after_goaway_is_told(Config) ->
+    with_h3(Config, #{notify_streams_available => true}, fun(Conn) ->
+        [S1, S2] = [request(Conn) || _ <- [1, 2]],
+        ServerConn = await(server_h3),
+        ok = quic_h3:goaway(ServerConn),
+        receive
+            {quic_h3, Conn, {goaway, _}} -> ok
+        after ?WAIT_MS -> ct:fail(no_goaway)
+        end,
+        ?assertEqual({error, stream_limit}, quic_h3:open_bidi_stream(Conn, 16#41)),
+        ok = h3_finish(Conn, S1),
+        ok = h3_finish(Conn, S2),
+        ?assertEqual({streams_available, bidi}, h3_available(Conn, ?WAIT_MS))
+    end).
+
+quic_h3_nothing_without_the_option(Config) ->
+    with_h3(Config, #{}, fun(Conn) ->
+        QC = quic_h3:get_quic_conn(Conn),
+        {ok, U1} = quic_h3:open_uni_stream(Conn, 16#54),
+        {ok, U2} = quic_h3:open_uni_stream(Conn, 16#54),
+        ?assertEqual({error, stream_limit}, quic_h3:open_uni_stream(Conn, 16#54)),
+        [S1, S2] = [request(Conn) || _ <- [1, 2]],
+        ?assertEqual({error, stream_limit}, quic_h3:open_bidi_stream(Conn, 16#41)),
+        ok = quic:send_data(QC, U1, <<0>>, true),
+        ok = quic:send_data(QC, U2, <<0>>, true),
+        ok = h3_finish(Conn, S1),
+        ok = h3_finish(Conn, S2),
+        ?assertEqual(none, h3_available(Conn, ?QUIET_MS))
+    end).
+
 %%====================================================================
 %% Helpers
 %%====================================================================
@@ -192,12 +244,17 @@ available(Conn, Timeout) ->
 %% A quic_h3 client with the option, to a server allowing 2 requests at
 %% once whose handler waits for the whole request and then answers.
 with_h3(Config, F) ->
+    with_h3(Config, #{notify_streams_available => true}, F).
+
+%% ClientOpts are merged into the client's connect options.
+with_h3(Config, ClientOpts, F) ->
     Test = self(),
     Name = list_to_atom("h3_sa_" ++ integer_to_list(erlang:unique_integer([positive]))),
     {ok, _} = quic_h3:start_server(Name, 0, #{
         cert => ?config(cert, Config),
         key => ?config(key, Config),
-        quic_opts => #{max_streams_bidi => 2},
+        quic_opts => #{max_streams_bidi => 2, max_streams_uni => 5},
+        notify_streams_available => true,
         handler => fun(C, S, _M, _P, _H) ->
             Test ! {server_h3, C},
             %% The body's end may already be among the buffered chunks.
@@ -214,9 +271,7 @@ with_h3(Config, F) ->
         end
     }),
     {ok, Port} = quic:get_server_port(Name),
-    {ok, Conn} = quic_h3:connect("127.0.0.1", Port, #{
-        verify => false, sync => true, notify_streams_available => true
-    }),
+    {ok, Conn} = quic_h3:connect("127.0.0.1", Port, ClientOpts#{verify => false, sync => true}),
     try
         F(Conn)
     after

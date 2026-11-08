@@ -107,8 +107,15 @@
 %%% more requests at once. With the `notify_streams_available => true'
 %%% option, the owner then receives
 %%% `{quic_h3, Conn, {streams_available, bidi}}' once a request would open
-%%% again, one message per refusal, instead of having to poll. Nothing is
-%%% sent once a GOAWAY was sent or received, since no new request opens.
+%%% again, one message per refusal, instead of having to poll. After a
+%%% GOAWAY was sent or received no new request opens, so a refused request
+%%% is not told then.
+%%%
+%%% The same holds for the streams the owner opens itself:
+%%% `open_bidi_stream/2' and `open_uni_stream/2' refused with
+%%% `stream_limit' are followed by `{streams_available, bidi}' or
+%%% `{streams_available, uni}', also after GOAWAY, since a WebTransport
+%%% session keeps opening streams while it drains.
 %%% @end
 
 -module(quic_h3).
@@ -275,6 +282,9 @@
     %% Report a claimed stream's reset with its final size (see the module
     %% doc). Default false.
     stream_reset_final_size => boolean(),
+    %% After an open refused with stream_limit, send {streams_available, Dir}
+    %% once one would succeed (see the module doc). Default false.
+    notify_streams_available => boolean(),
     %% Per-connection configuration override; the returned map's
     %% `owner', `handler', `stream_type_handler', `h3_datagram_enabled',
     %% `max_buffered_body', `defer_requests_until_settings',
@@ -327,7 +337,14 @@ connect(Host, Port, Opts) ->
 
 start_h3_connection(QuicConn, HostBin, Port, Opts) ->
     H3Opts = maps:with(
-        [settings, stream_type_handler, h3_datagram_enabled, stream_reset_final_size], Opts
+        [
+            settings,
+            stream_type_handler,
+            h3_datagram_enabled,
+            stream_reset_final_size,
+            notify_streams_available
+        ],
+        Opts
     ),
     case quic_h3_connection:start_link(QuicConn, HostBin, Port, H3Opts) of
         {ok, H3Conn} ->
@@ -643,27 +660,9 @@ consume(Conn, StreamId, Bytes) ->
     Port :: inet:port_number(),
     Opts :: server_opts().
 start_server(Name, Port, Opts) ->
-    Handler = maps:get(handler, Opts, fun default_handler/5),
-    H3Settings = maps:get(settings, Opts, #{}),
-    StreamTypeHandler = maps:get(stream_type_handler, Opts, undefined),
-    H3DatagramEnabled = maps:get(h3_datagram_enabled, Opts, false),
-    MaxBufferedBody = valid_max_buffered_body(
-        maps:get(max_buffered_body, Opts, ?H3_MAX_BUFFERED_BODY)
-    ),
-    DeferRequests = valid_defer_requests(maps:get(defer_requests_until_settings, Opts, false)),
+    ListenerDefaults = listener_defaults(Opts),
     PerConn = maps:get(connection_handler, Opts, undefined),
     QuicOpts0 = build_server_quic_opts(Opts),
-    ListenerDefaults = #{
-        handler => Handler,
-        settings => H3Settings,
-        stream_type_handler => StreamTypeHandler,
-        h3_datagram_enabled => H3DatagramEnabled,
-        max_buffered_body => MaxBufferedBody,
-        defer_requests_until_settings => DeferRequests,
-        stream_reset_final_size => valid_flag(
-            stream_reset_final_size, maps:get(stream_reset_final_size, Opts, false)
-        )
-    },
     QuicOpts = QuicOpts0#{
         connection_handler => fun(ConnPid, _ConnRef) ->
             h3_connection_handler(
@@ -672,6 +671,28 @@ start_server(Name, Port, Opts) ->
         end
     },
     quic:start_server(Name, Port, QuicOpts).
+
+%% The per-connection H3 options every connection of the listener starts
+%% from, validated once at start.
+listener_defaults(Opts) ->
+    #{
+        handler => maps:get(handler, Opts, fun default_handler/5),
+        settings => maps:get(settings, Opts, #{}),
+        stream_type_handler => maps:get(stream_type_handler, Opts, undefined),
+        h3_datagram_enabled => maps:get(h3_datagram_enabled, Opts, false),
+        max_buffered_body => valid_max_buffered_body(
+            maps:get(max_buffered_body, Opts, ?H3_MAX_BUFFERED_BODY)
+        ),
+        defer_requests_until_settings => valid_defer_requests(
+            maps:get(defer_requests_until_settings, Opts, false)
+        ),
+        stream_reset_final_size => valid_flag(
+            stream_reset_final_size, maps:get(stream_reset_final_size, Opts, false)
+        ),
+        notify_streams_available => valid_flag(
+            notify_streams_available, maps:get(notify_streams_available, Opts, false)
+        )
+    }.
 
 %% Merge per-connection overrides (returned by the caller-supplied
 %% connection_handler fun) over the listener defaults. Keeps the
@@ -971,6 +992,9 @@ build_h3_opts(Opts) ->
         h3_datagram_enabled => maps:get(h3_datagram_enabled, Opts, false),
         stream_reset_final_size => valid_flag(
             stream_reset_final_size, maps:get(stream_reset_final_size, Opts, false)
+        ),
+        notify_streams_available => valid_flag(
+            notify_streams_available, maps:get(notify_streams_available, Opts, false)
         ),
         defer_requests_until_settings => valid_defer_requests(
             maps:get(defer_requests_until_settings, Opts, false)
