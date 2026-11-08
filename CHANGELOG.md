@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.6.1] - 2026-11-08
 
 ### Fixed
 - With `notify_streams_available`, quic_h3 told its owner only about
