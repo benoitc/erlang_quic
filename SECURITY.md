@@ -6,8 +6,8 @@ Security fixes are applied to the latest minor release on the `main` branch.
 
 | Version | Supported |
 | ------- | --------- |
-| 2.4.x   | yes       |
-| < 2.4   | no        |
+| 2.5.x   | yes       |
+| < 2.5   | no        |
 
 ## Reporting a Vulnerability
 
