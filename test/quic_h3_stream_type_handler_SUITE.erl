@@ -20,10 +20,12 @@
     chunked_response_body_arrives_whole/1,
     peer_stream_with_a_signal_is_still_claimed/1,
     reset_of_a_claimed_stream_reports_final_size/1,
-    reset_stream_at_reports_final_size_not_reliable_size/1
+    reset_stream_at_reports_final_size_not_reliable_size/1,
+    own_uni_stream_hears_stop_sending/1
 ]).
 
 -define(WT_STREAM, 16#41).
+-define(WT_UNI_STREAM, 16#54).
 -define(WAIT_MS, 3000).
 
 suite() ->
@@ -36,7 +38,8 @@ all() ->
         chunked_response_body_arrives_whole,
         peer_stream_with_a_signal_is_still_claimed,
         reset_of_a_claimed_stream_reports_final_size,
-        reset_stream_at_reports_final_size_not_reliable_size
+        reset_stream_at_reports_final_size_not_reliable_size,
+        own_uni_stream_hears_stop_sending
     ].
 
 init_per_suite(Config) ->
@@ -121,6 +124,30 @@ reset_stream_at_reports_final_size_not_reliable_size(Config) ->
         ?assertEqual({stream_type_reset, bidi, StreamId, 7, 1000}, await_reset(StreamId))
     end).
 
+%% A uni stream the client opens through quic_h3 is claimed on its side
+%% too: the server's STOP_SENDING reaches the client's owner, and what the
+%% client writes after the type reaches the server unchanged.
+own_uni_stream_hears_stop_sending(Config) ->
+    with_server(Config, fun(Conn) ->
+        {ok, StreamId} = quic_h3:open_uni_stream(Conn, ?WT_UNI_STREAM),
+        ?assertEqual({stream_type_open, uni, StreamId, ?WT_UNI_STREAM}, own_event(Conn)),
+        ok = quic:send_data(quic_h3:get_quic_conn(Conn), StreamId, <<0, "hello">>, false),
+        ?assertEqual({stream_type_open, uni, StreamId, ?WT_UNI_STREAM}, await({server_owner, '_'})),
+        ?assertEqual(
+            {stream_type_data, uni, StreamId, <<0, "hello">>, false}, await({server_owner, '_'})
+        ),
+        ServerConn = await({server_h3, '_'}),
+        ok = quic:stop_sending(quic_h3:get_quic_conn(ServerConn), StreamId, 16#99),
+        ?assertEqual({stream_type_stop_sending, uni, StreamId, 16#99}, own_event(Conn))
+    end).
+
+own_event(Conn) ->
+    receive
+        {quic_h3, Conn, {stream_type_open, _, _, _} = E} -> E;
+        {quic_h3, Conn, {stream_type_stop_sending, _, _, _} = E} -> E
+    after ?WAIT_MS -> no_event
+    end.
+
 %% A claimed bidi stream with Size bytes written on it, signal included,
 %% once the server has claimed it.
 send_on_claimed_stream(Conn, QC, Size) ->
@@ -174,6 +201,7 @@ with_server(Config, ServerExtra, ClientExtra, F) ->
     end.
 
 claim_wt_streams(bidi, _StreamId, ?WT_STREAM) -> claim;
+claim_wt_streams(uni, _StreamId, ?WT_UNI_STREAM) -> claim;
 claim_wt_streams(_Dir, _StreamId, _Type) -> ignore.
 
 handle(_Test, Conn, StreamId, <<"CONNECT">>, <<"/chunks">>) ->
@@ -217,11 +245,19 @@ collect(Test, Conn, StreamId) ->
 
 relay(Test) ->
     receive
-        {quic_h3, _Conn, {stream_type_open, _, _, _} = E} -> Test ! {server_owner, E};
-        {quic_h3, _Conn, {stream_type_data, _, _, _, _} = E} -> Test ! {server_owner, E};
-        {quic_h3, _Conn, {stream_type_reset, _, _, _} = E} -> Test ! {server_owner, E};
-        {quic_h3, _Conn, {stream_type_reset, _, _, _, _} = E} -> Test ! {server_owner, E};
-        _ -> ok
+        {quic_h3, Conn, {stream_type_open, uni, _, _} = E} ->
+            Test ! {server_owner, E},
+            Test ! {server_h3, Conn};
+        {quic_h3, _Conn, {stream_type_open, _, _, _} = E} ->
+            Test ! {server_owner, E};
+        {quic_h3, _Conn, {stream_type_data, _, _, _, _} = E} ->
+            Test ! {server_owner, E};
+        {quic_h3, _Conn, {stream_type_reset, _, _, _} = E} ->
+            Test ! {server_owner, E};
+        {quic_h3, _Conn, {stream_type_reset, _, _, _, _} = E} ->
+            Test ! {server_owner, E};
+        _ ->
+            ok
     end,
     relay(Test).
 

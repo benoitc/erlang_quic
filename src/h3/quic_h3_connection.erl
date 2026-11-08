@@ -24,6 +24,7 @@
     request/2,
     request/3,
     open_bidi_stream/2,
+    open_uni_stream/2,
     send_response/4,
     respond/5,
     send_data/3,
@@ -385,6 +386,11 @@ request(Conn, Headers, Opts) ->
     {ok, stream_id()} | {error, term()}.
 open_bidi_stream(Conn, SignalType) ->
     gen_statem:call(Conn, {open_bidi_stream, SignalType}).
+
+%% @doc See quic_h3:open_uni_stream/2.
+-spec open_uni_stream(pid(), non_neg_integer()) -> {ok, stream_id()} | {error, term()}.
+open_uni_stream(Conn, StreamType) ->
+    gen_statem:call(Conn, {open_uni_stream, StreamType}).
 
 %% @doc Send a response (server only).
 -spec send_response(pid(), stream_id(), pos_integer(), [{binary(), binary()}]) ->
@@ -1201,6 +1207,13 @@ live_event(
                 end
         end,
     {keep_state, State, [{reply, From, Reply}]};
+live_event({call, From}, {open_uni_stream, StreamType}, State) ->
+    case do_open_uni_stream(StreamType, State) of
+        {ok, StreamId, State1} ->
+            {keep_state, State1, [{reply, From, {ok, StreamId}}]};
+        {error, Reason} ->
+            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+    end;
 live_event({call, From}, {open_bidi_stream, SignalType}, State) ->
     case do_open_bidi_stream(SignalType, State) of
         {ok, StreamId, State1} ->
@@ -1805,6 +1818,26 @@ do_open_bidi_stream(SignalType, #state{quic_conn = QuicConn} = State) ->
     case quic:open_stream(QuicConn) of
         {ok, StreamId} ->
             {ok, StreamId, pre_claim_bidi_stream(StreamId, SignalType, State)};
+        {error, _} = Err ->
+            Err
+    end.
+
+%% Open a uni stream, write its type and claim it, so the owner hears of
+%% the peer's STOP_SENDING on it as on a stream the peer opened.
+do_open_uni_stream(StreamType, #state{quic_conn = QuicConn, owner = Owner} = State) ->
+    case quic:open_unidirectional_stream(QuicConn) of
+        {ok, StreamId} ->
+            case quic:send_data(QuicConn, StreamId, quic_varint:encode(StreamType), false) of
+                ok ->
+                    Owner ! {quic_h3, self(), {stream_type_open, uni, StreamId, StreamType}},
+                    {ok, StreamId, State#state{
+                        claimed_uni_streams = maps:put(
+                            StreamId, StreamType, State#state.claimed_uni_streams
+                        )
+                    }};
+                {error, _} = Err ->
+                    Err
+            end;
         {error, _} = Err ->
             Err
     end.

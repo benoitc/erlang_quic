@@ -556,6 +556,24 @@ treat as a normal request.
 The caller is responsible for writing the signal-type varint and
 any session/header prefix; this API is extension-agnostic.
 
+### Locally opened claimed uni streams
+
+`quic_h3:open_uni_stream/2` opens a unidirectional stream of an extension
+type (e.g. WebTransport's `0x54`), writes the stream-type varint and
+claims it. The owner gets `{stream_type_open, uni, StreamId, StreamType}`
+at open time, and `{stream_type_stop_sending, uni, StreamId, ErrorCode}`
+if the peer stops the stream. Write the rest, such as the session id,
+with `quic:send_data/4`:
+
+```erlang
+{ok, StreamId} = quic_h3:open_uni_stream(H3Conn, 16#54),
+ok = quic:send_data(quic_h3:get_quic_conn(H3Conn), StreamId,
+                    <<SessionVarint/binary, Payload/binary>>, false).
+```
+
+A uni stream opened with `quic:open_unidirectional_stream/1` instead is
+unknown to quic_h3, and the peer's STOP_SENDING on it is not reported.
+
 ### Per-connection owner
 
 By default every H3 connection spawned by `start_server/3` delivers

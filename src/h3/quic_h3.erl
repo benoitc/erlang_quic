@@ -112,6 +112,7 @@
     request/3,
     open_bidi_stream/1,
     open_bidi_stream/2,
+    open_uni_stream/2,
     wait_connected/2
 ]).
 
@@ -430,6 +431,19 @@ open_bidi_stream(Conn) ->
     {ok, stream_id()} | {error, term()}.
 open_bidi_stream(Conn, SignalType) ->
     quic_h3_connection:open_bidi_stream(Conn, SignalType).
+
+%% @doc Open a unidirectional stream of an extension type (e.g.
+%% WebTransport's `16#54'), write the stream-type varint and claim it.
+%%
+%% The owner receives
+%% `{quic_h3, Conn, {stream_type_open, uni, StreamId, StreamType}}', and
+%% later `{stream_type_stop_sending, uni, StreamId, ErrorCode}' if the peer
+%% stops the stream, as for a stream it opened. Write the rest of the
+%% stream with `quic:send_data/4' on `get_quic_conn/1'.
+%% @end
+-spec open_uni_stream(conn(), non_neg_integer()) -> {ok, stream_id()} | {error, term()}.
+open_uni_stream(Conn, StreamType) when is_integer(StreamType), StreamType >= 0 ->
+    quic_h3_connection:open_uni_stream(Conn, StreamType).
 
 %%====================================================================
 %% Shared API (Client and Server)
