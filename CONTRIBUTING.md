@@ -61,6 +61,21 @@ certificates, PSK and session tickets, distribution node authentication),
 keys, secrets or one connection's data reaching someone else, or erlang_quic
 weakening TLS below what the configuration allows.
 
+## Keeping the specifications current
+
+The specifications erlang_quic follows, and the version of each, are listed in
+[AGENTS.md](https://github.com/benoitc/erlang_quic/blob/main/AGENTS.md#specifications),
+with the newer versions not yet followed under Pending updates. The list is
+checked before every release and when a module it names changes.
+
+Moving to a new RFC or draft revision is its own pull request: first the
+list of what changed in the sections the code uses, then one commit per
+change with its test, then the Interop Runner against peers on both
+revisions. The steps are in
+[Keeping the specifications current](https://github.com/benoitc/erlang_quic/blob/main/AGENTS.md#keeping-the-specifications-current).
+If you notice a spec has a newer version, open an issue naming it; that is
+enough to get it on the list.
+
 ## Set up
 
 You need Erlang/OTP 27 or later and rebar3. Nothing else is required to build: the library has no dependencies.
@@ -171,3 +186,5 @@ Sync a branch that has fallen behind by merging `main` into it, not by rebasing.
 ## Releases
 
 Version lives in `src/quic.app.src` and the drift test keeps the other copies honest. A release is a pull request that bumps it and adds the CHANGELOG entry, then an annotated tag on the merge commit with no `v` prefix, then a GitHub release carrying that CHANGELOG section.
+
+Before opening the release pull request, check the specification list as described in [Keeping the specifications current](#keeping-the-specifications-current), and add any newer version found to Pending updates.

@@ -108,8 +108,9 @@ change. Docs and CHANGELOG entries go in the same pull request.
 
 ## Specifications
 
-The specs erlang_quic implements. Cite the current one in code and the
-CHANGELOG. Last checked: 2026-11-08.
+The specs erlang_quic implements, at the version the code follows. Where a
+newer one exists it is listed under [Pending updates](#pending-updates).
+Last checked: 2026-11-08.
 
 ### QUIC
 
@@ -123,20 +124,20 @@ CHANGELOG. Last checked: 2026-11-08.
 | RFC 9221 DATAGRAM | DATAGRAM frames, `max_datagram_frame_size` | `quic_connection` |
 | RFC 8899 DPLPMTUD | PMTU probing | `quic_pmtu` |
 | RFC 9438 CUBIC, RFC 9406 HyStart++ | congestion control | `quic_cc_cubic`, `quic_cc_newreno` |
-| draft-ietf-ccwg-bbr-07 BBRv3 | congestion control | `quic_cc_bbr` |
-| draft-ietf-quic-reliable-stream-reset-11 | RESET_STREAM_AT, `reset_stream_at` transport parameter | `quic_connection` |
-| draft-ietf-quic-load-balancers-22 QUIC-LB | routable connection IDs | `quic_lb` |
+| draft-ietf-ccwg-bbr (revision not recorded) BBRv3 | congestion control | `quic_cc_bbr` |
+| draft-ietf-quic-reliable-stream-reset-07 | RESET_STREAM_AT, `reset_stream_at` transport parameter | `quic_connection` |
+| draft-ietf-quic-load-balancers (revision not recorded) QUIC-LB | routable connection IDs | `quic_lb` |
 | RFC 8305 Happy Eyeballs v2 | client address racing | `quic_happy` |
 
 ### TLS
 
 | Spec | Scope |
 |---|---|
-| RFC 9846 TLS 1.3 (obsoletes RFC 8446) | handshake, PSK and session tickets, 0-RTT, HelloRetryRequest |
+| RFC 8446 TLS 1.3 (obsoleted by RFC 9846) | handshake, PSK and session tickets, 0-RTT, HelloRetryRequest |
 | RFC 5869 HKDF | key schedule |
 | RFC 6066 TLS extensions | SNI |
 | RFC 7301 ALPN | protocol negotiation |
-| RFC 9525 service identity (obsoletes RFC 6125) | hostname checks on the server certificate |
+| RFC 6125 service identity (obsoleted by RFC 9525) | hostname checks on the server certificate |
 
 ### HTTP/3
 
@@ -150,11 +151,62 @@ CHANGELOG. Last checked: 2026-11-08.
 | RFC 9220 extended CONNECT over HTTP/3 | `enable_connect_protocol`, `:protocol` | `quic_h3_connection` |
 | draft-ietf-webtrans-http3-17 | the primitives WebTransport needs: SETTINGS_WT_ENABLED, WT_STREAM, claimed streams | `quic_h3_connection` |
 
-Code comments still cite RFC 8446 and RFC 6125, which are obsoleted, and
-call QUIC-LB "RFC 9312", which is the QUIC manageability document. Use the
-numbers above in new code. Erlang distribution over QUIC (`quic_dist`) follows
-the OTP distribution protocol, which is documented in the OTP sources rather
-than an RFC.
+Code comments call QUIC-LB "RFC 9312", which is the QUIC manageability
+document; it is draft-ietf-quic-load-balancers. Erlang distribution over QUIC
+(`quic_dist`) follows the OTP distribution protocol, which is documented in
+the OTP sources rather than an RFC.
+
+### Keeping the specifications current
+
+A spec changes under the code when an RFC is obsoleted or updated, or a
+draft gets a new revision. Check the list:
+
+- before every release;
+- when you change a module listed in it, for the specs that module follows;
+- when a peer implementation or erlang-webtransport moves to a newer
+  revision, since interop breaks first.
+
+Check an RFC with
+`curl -sL https://www.rfc-editor.org/rfc/rfcNNNN.json` (`obsoleted_by`,
+`updated_by`) and its errata on https://www.rfc-editor.org/errata/rfcNNNN.
+Check a draft's latest revision on
+`https://datatracker.ietf.org/doc/draft-.../`. Then set "Last checked"
+above.
+
+When a newer version exists, it is its own piece of work, not a side change:
+
+1. Add it under [Pending updates](#pending-updates) with what is known to
+   differ.
+2. Diff the sections the code relies on, old version against new, and list
+   every change: codepoints (frame types, transport parameter and setting
+   ids, error codes), MUST and SHOULD changes, removed features.
+3. Decide per change: follow it now, or keep the old behaviour and say why
+   (for example, peers still on the old draft codepoint; keep both, as
+   `wt_enabled` and `wt_enabled_draft15` do for WebTransport).
+4. Make the change in one pull request, one commit per item, each with a
+   test, run through the [protocol-change-review](.agents/skills/protocol-change-review/SKILL.md)
+   checks, and run the Interop Runner against peers on both revisions where
+   they exist.
+5. Update the citations in the code it touches, the row in the tables above
+   and the "Last checked" date, and remove it from Pending updates. Add a
+   CHANGELOG entry when behaviour or a codepoint changes, saying which
+   version is now followed.
+
+A new RFC number that only renumbers the same text still updates the
+citations and the table, with no CHANGELOG entry.
+
+### Pending updates
+
+Known newer versions, checked 2026-11-08. Each needs the diff in step 2
+before any code changes.
+
+| Spec | Code follows | Latest | To check |
+|---|---|---|---|
+| TLS 1.3 | RFC 8446 | RFC 9846 | changes since RFC 8446 in the handshake, PSK, 0-RTT and key update rules `quic_tls` and `quic_connection` rely on |
+| Service identity | RFC 6125 | RFC 9525 | wildcard and CN-ID rules in `quic_cert` hostname checks |
+| Reliable stream reset | draft-ietf-quic-reliable-stream-reset-07 | -11 | frame type (`16#24`) and transport parameter id, Reliable Size and Final Size rules |
+| QUIC-LB | revision not recorded | draft-ietf-quic-load-balancers-22 | CID formats, config rotation bits, encryption modes in `quic_lb`; fix the "RFC 9312" citation |
+| BBR | revision not recorded | draft-ietf-ccwg-bbr-07 | state machine and gains in `quic_cc_bbr`; record the revision followed |
 
 ## Skills
 

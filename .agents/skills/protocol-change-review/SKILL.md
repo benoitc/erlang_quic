@@ -53,7 +53,9 @@ touches plus handshake, transfer and http3), and for distribution changes the
 3. Check for errata on https://www.rfc-editor.org/errata/rfcNNNN.
 4. Write the version and the date checked in the PR description.
 5. If the latest text disagrees with the code, fix it in the change or say in
-   the PR that it is out of scope.
+   the PR that it is out of scope, and add it under "Pending updates" in
+   AGENTS.md. Moving to a new version follows "Keeping the specifications
+   current" there.
 
 ## 3. Safety
 
