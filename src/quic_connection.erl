@@ -7289,25 +7289,30 @@ process_tls_message(
             %% ticket consumption) once the group is settled.
             SupportedGroups = maps:get(supported_groups, ClientHelloInfo, []),
             case
-                quic_tls_negotiation:select_key_share_group(
-                    (State#state.cfg)#conn_cfg.tls_groups, KeyShareEntries, SupportedGroups
-                )
+                {Cipher,
+                    quic_tls_negotiation:select_key_share_group(
+                        (State#state.cfg)#conn_cfg.tls_groups, KeyShareEntries, SupportedGroups
+                    )}
             of
-                {direct, SelGroup} ->
+                {none, _} ->
+                    send_tls_alert(
+                        ?TLS_ALERT_HANDSHAKE_FAILURE, <<"no common cipher suite">>, State
+                    );
+                {_, {direct, SelGroup}} ->
                     ClientPubKey = quic_tls_negotiation:extract_group_key(
                         SelGroup, KeyShareEntries
                     ),
                     do_server_client_hello(
                         SelGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
                     );
-                {hrr, HrrGroup} when not (State#state.hs)#hs.hrr_sent ->
+                {_, {hrr, HrrGroup}} when not (State#state.hs)#hs.hrr_sent ->
                     send_hello_retry_request(HrrGroup, Cipher, SessionId, OriginalMsg, State);
-                {hrr, _} ->
+                {_, {hrr, _}} ->
                     %% Client ignored our HRR group selection.
                     send_tls_alert(
                         ?TLS_ALERT_ILLEGAL_PARAMETER, <<"bad retry key_share">>, State
                     );
-                none ->
+                {_, none} ->
                     send_tls_alert(?TLS_ALERT_HANDSHAKE_FAILURE, <<"no common group">>, State)
             end;
         {error, Reason} ->

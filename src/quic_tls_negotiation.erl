@@ -29,8 +29,8 @@
 %% converted to atoms for internal use. The server's own order decides,
 %% so a deployment that must not negotiate a particular suite can say so;
 %% without this the preference was fixed in code and a `ciphers' option
-%% had nowhere to take effect.
--spec select_cipher([integer()], [atom()]) -> atom().
+%% had nowhere to take effect. `none' when the two lists share no suite.
+-spec select_cipher([integer()], [atom()]) -> atom() | none.
 select_cipher(ClientCipherSuites, ServerPreference) ->
     ClientCiphers = [cipher_code_to_atom(C) || C <- ClientCipherSuites],
     %% A client that puts ChaCha20-Poly1305 first is saying it lacks
@@ -46,9 +46,8 @@ select_cipher(ClientCipherSuites, ServerPreference) ->
             select_first_match(ServerPreference, ClientCiphers)
     end.
 
-% Default
 select_first_match([], _) ->
-    aes_128_gcm;
+    none;
 select_first_match([Cipher | Rest], ClientSuites) ->
     case lists:member(Cipher, ClientSuites) of
         true -> Cipher;
