@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.6.0] - 2026-11-08
 
 ### Added
 - `notify_streams_available` option. When a stream cannot be opened
