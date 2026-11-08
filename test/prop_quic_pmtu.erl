@@ -323,35 +323,38 @@ insert_test_loss(Size, Lost) ->
 
 %% Named pmtu_prop_test_ to avoid rebar3_proper picking it up as a property
 pmtu_prop_test_() ->
-    {timeout, 60, [
-        {"Binary search converges", fun() ->
-            ?assert(proper:quickcheck(prop_binary_search_converges(), [{numtests, 100}]))
-        end},
-        {"MTU never below base", fun() ->
-            ?assert(proper:quickcheck(prop_mtu_never_below_base(), [{numtests, 100}]))
-        end},
-        {"Probe sizes in range", fun() ->
-            ?assert(proper:quickcheck(prop_probe_sizes_in_range(), [{numtests, 100}]))
-        end},
-        {"ACK never decreases MTU", fun() ->
-            ?assert(proper:quickcheck(prop_ack_never_decreases_mtu(), [{numtests, 100}]))
-        end},
-        {"Loss never increases MTU", fun() ->
-            ?assert(proper:quickcheck(prop_loss_never_increases_mtu(), [{numtests, 100}]))
-        end},
-        {"Black hole resets to base", fun() ->
-            ?assert(proper:quickcheck(prop_black_hole_resets_to_base(), [{numtests, 100}]))
-        end},
-        {"Small packet losses ignored", fun() ->
-            ?assert(proper:quickcheck(prop_small_packet_losses_ignored(), [{numtests, 100}]))
-        end},
-        {"Path change resets state", fun() ->
-            ?assert(proper:quickcheck(prop_path_change_resets_state(), [{numtests, 100}]))
-        end},
-        {"Loss array ordering", fun() ->
-            ?assert(proper:quickcheck(prop_loss_array_ordering(), [{numtests, 100}]))
-        end},
-        {"Generation increments", fun() ->
-            ?assert(proper:quickcheck(prop_generation_increments(), [{numtests, 100}]))
-        end}
-    ]}.
+    [
+        {timeout, 60, T}
+     || T <- [
+            {"Binary search converges", fun() ->
+                ?assert(proper:quickcheck(prop_binary_search_converges(), [{numtests, 100}]))
+            end},
+            {"MTU never below base", fun() ->
+                ?assert(proper:quickcheck(prop_mtu_never_below_base(), [{numtests, 100}]))
+            end},
+            {"Probe sizes in range", fun() ->
+                ?assert(proper:quickcheck(prop_probe_sizes_in_range(), [{numtests, 100}]))
+            end},
+            {"ACK never decreases MTU", fun() ->
+                ?assert(proper:quickcheck(prop_ack_never_decreases_mtu(), [{numtests, 100}]))
+            end},
+            {"Loss never increases MTU", fun() ->
+                ?assert(proper:quickcheck(prop_loss_never_increases_mtu(), [{numtests, 100}]))
+            end},
+            {"Black hole resets to base", fun() ->
+                ?assert(proper:quickcheck(prop_black_hole_resets_to_base(), [{numtests, 100}]))
+            end},
+            {"Small packet losses ignored", fun() ->
+                ?assert(proper:quickcheck(prop_small_packet_losses_ignored(), [{numtests, 100}]))
+            end},
+            {"Path change resets state", fun() ->
+                ?assert(proper:quickcheck(prop_path_change_resets_state(), [{numtests, 100}]))
+            end},
+            {"Loss array ordering", fun() ->
+                ?assert(proper:quickcheck(prop_loss_array_ordering(), [{numtests, 100}]))
+            end},
+            {"Generation increments", fun() ->
+                ?assert(proper:quickcheck(prop_generation_increments(), [{numtests, 100}]))
+            end}
+        ]
+    ].

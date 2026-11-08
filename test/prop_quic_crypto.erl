@@ -300,40 +300,67 @@ prop_ecdhe_symmetric() ->
 %%====================================================================
 
 proper_test_() ->
-    {timeout, 180, [
-        %% AEAD tests
-        ?_assert(proper:quickcheck(prop_aes128_roundtrip(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_aes256_roundtrip(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_ciphertext_has_tag(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_wrong_key_fails(), [{numtests, 100}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_wrong_aad_fails(), [{numtests, 100}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_wrong_pn_fails(), [{numtests, 100}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_nonce_deterministic(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_nonce_length(), [{numtests, 200}, {to_file, user}])),
-        %% HKDF tests
-        ?_assert(proper:quickcheck(prop_hkdf_extract_length(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_hkdf_expand_length(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_hkdf_deterministic(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_expand_label_length(), [{numtests, 200}, {to_file, user}])),
-        %% Key derivation tests
-        ?_assert(
-            proper:quickcheck(prop_initial_keys_deterministic(), [{numtests, 100}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_client_server_keys_different(), [
-                {numtests, 100}, {to_file, user}
-            ])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_different_dcid_different_keys(), [
-                {numtests, 100}, {to_file, user}
-            ])
-        ),
-        ?_assert(proper:quickcheck(prop_initial_key_sizes(), [{numtests, 100}, {to_file, user}])),
-        %% TLS key schedule tests
-        ?_assert(
-            proper:quickcheck(prop_early_secret_deterministic(), [{numtests, 100}, {to_file, user}])
-        ),
-        ?_assert(proper:quickcheck(prop_key_schedule_chain(), [{numtests, 100}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_ecdhe_symmetric(), [{numtests, 50}, {to_file, user}]))
-    ]}.
+    [
+        {timeout, 180, T}
+     || T <- [
+            %% AEAD tests
+            ?_assert(
+                proper:quickcheck(prop_aes128_roundtrip(), [{numtests, 200}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_aes256_roundtrip(), [{numtests, 200}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_ciphertext_has_tag(), [{numtests, 200}, {to_file, user}])
+            ),
+            ?_assert(proper:quickcheck(prop_wrong_key_fails(), [{numtests, 100}, {to_file, user}])),
+            ?_assert(proper:quickcheck(prop_wrong_aad_fails(), [{numtests, 100}, {to_file, user}])),
+            ?_assert(proper:quickcheck(prop_wrong_pn_fails(), [{numtests, 100}, {to_file, user}])),
+            ?_assert(
+                proper:quickcheck(prop_nonce_deterministic(), [{numtests, 200}, {to_file, user}])
+            ),
+            ?_assert(proper:quickcheck(prop_nonce_length(), [{numtests, 200}, {to_file, user}])),
+            %% HKDF tests
+            ?_assert(
+                proper:quickcheck(prop_hkdf_extract_length(), [{numtests, 200}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_hkdf_expand_length(), [{numtests, 200}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_hkdf_deterministic(), [{numtests, 200}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_expand_label_length(), [{numtests, 200}, {to_file, user}])
+            ),
+            %% Key derivation tests
+            ?_assert(
+                proper:quickcheck(prop_initial_keys_deterministic(), [
+                    {numtests, 100}, {to_file, user}
+                ])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_client_server_keys_different(), [
+                    {numtests, 100}, {to_file, user}
+                ])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_different_dcid_different_keys(), [
+                    {numtests, 100}, {to_file, user}
+                ])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_initial_key_sizes(), [{numtests, 100}, {to_file, user}])
+            ),
+            %% TLS key schedule tests
+            ?_assert(
+                proper:quickcheck(prop_early_secret_deterministic(), [
+                    {numtests, 100}, {to_file, user}
+                ])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_key_schedule_chain(), [{numtests, 100}, {to_file, user}])
+            ),
+            ?_assert(proper:quickcheck(prop_ecdhe_symmetric(), [{numtests, 50}, {to_file, user}]))
+        ]
+    ].

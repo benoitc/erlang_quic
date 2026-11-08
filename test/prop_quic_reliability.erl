@@ -421,57 +421,76 @@ prop_flow_max_data_increases() ->
 %%====================================================================
 
 proper_test_() ->
-    {timeout, 300, [
-        %% Stream tests
-        ?_assert(
-            proper:quickcheck(prop_stream_data_roundtrip(), [{numtests, 200}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_stream_receive_in_order(), [{numtests, 100}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_stream_state_transitions(), [{numtests, 200}, {to_file, user}])
-        ),
-        ?_assert(proper:quickcheck(prop_stream_id_type(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_stream_fin_closes(), [{numtests, 100}, {to_file, user}])),
-        %% ACK tests
-        ?_assert(proper:quickcheck(prop_ack_records_packets(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_ack_generation(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(
-            proper:quickcheck(prop_ack_sequential_single_range(), [{numtests, 100}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_ack_gaps_multiple_ranges(), [{numtests, 100}, {to_file, user}])
-        ),
-        %% Loss detection tests
-        ?_assert(
-            proper:quickcheck(prop_loss_bytes_in_flight(), [{numtests, 100}, {to_file, user}])
-        ),
-        ?_assert(proper:quickcheck(prop_loss_rtt_update(), [{numtests, 100}, {to_file, user}])),
-        ?_assert(proper:quickcheck(prop_loss_pto_backoff(), [{numtests, 50}, {to_file, user}])),
-        %% Congestion control tests
-        ?_assert(proper:quickcheck(prop_cc_initial_cwnd(), [{numtests, 50}, {to_file, user}])),
-        ?_assert(
-            proper:quickcheck(prop_cc_slow_start_increases(), [{numtests, 100}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_cc_congestion_reduces(), [{numtests, 50}, {to_file, user}])
-        ),
-        ?_assert(proper:quickcheck(prop_cc_bytes_tracking(), [{numtests, 100}, {to_file, user}])),
-        %% Flow control tests
-        ?_assert(
-            proper:quickcheck(prop_flow_send_within_limit(), [{numtests, 100}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_flow_send_exceeds_limit(), [{numtests, 100}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_flow_receive_within_limit(), [{numtests, 100}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_flow_receive_exceeds_limit(), [{numtests, 100}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_flow_max_data_increases(), [{numtests, 100}, {to_file, user}])
-        )
-    ]}.
+    [
+        {timeout, 300, T}
+     || T <- [
+            %% Stream tests
+            ?_assert(
+                proper:quickcheck(prop_stream_data_roundtrip(), [{numtests, 200}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_stream_receive_in_order(), [{numtests, 100}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_stream_state_transitions(), [
+                    {numtests, 200}, {to_file, user}
+                ])
+            ),
+            ?_assert(proper:quickcheck(prop_stream_id_type(), [{numtests, 200}, {to_file, user}])),
+            ?_assert(
+                proper:quickcheck(prop_stream_fin_closes(), [{numtests, 100}, {to_file, user}])
+            ),
+            %% ACK tests
+            ?_assert(
+                proper:quickcheck(prop_ack_records_packets(), [{numtests, 200}, {to_file, user}])
+            ),
+            ?_assert(proper:quickcheck(prop_ack_generation(), [{numtests, 200}, {to_file, user}])),
+            ?_assert(
+                proper:quickcheck(prop_ack_sequential_single_range(), [
+                    {numtests, 100}, {to_file, user}
+                ])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_ack_gaps_multiple_ranges(), [
+                    {numtests, 100}, {to_file, user}
+                ])
+            ),
+            %% Loss detection tests
+            ?_assert(
+                proper:quickcheck(prop_loss_bytes_in_flight(), [{numtests, 100}, {to_file, user}])
+            ),
+            ?_assert(proper:quickcheck(prop_loss_rtt_update(), [{numtests, 100}, {to_file, user}])),
+            ?_assert(proper:quickcheck(prop_loss_pto_backoff(), [{numtests, 50}, {to_file, user}])),
+            %% Congestion control tests
+            ?_assert(proper:quickcheck(prop_cc_initial_cwnd(), [{numtests, 50}, {to_file, user}])),
+            ?_assert(
+                proper:quickcheck(prop_cc_slow_start_increases(), [{numtests, 100}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_cc_congestion_reduces(), [{numtests, 50}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_cc_bytes_tracking(), [{numtests, 100}, {to_file, user}])
+            ),
+            %% Flow control tests
+            ?_assert(
+                proper:quickcheck(prop_flow_send_within_limit(), [{numtests, 100}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_flow_send_exceeds_limit(), [{numtests, 100}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_flow_receive_within_limit(), [
+                    {numtests, 100}, {to_file, user}
+                ])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_flow_receive_exceeds_limit(), [
+                    {numtests, 100}, {to_file, user}
+                ])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_flow_max_data_increases(), [{numtests, 100}, {to_file, user}])
+            )
+        ]
+    ].

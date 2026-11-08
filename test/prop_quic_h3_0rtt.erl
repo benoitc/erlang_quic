@@ -123,20 +123,23 @@ prop_postponed_requests_replayed_without_loss() ->
 %%====================================================================
 
 proper_test_() ->
-    {timeout, 180, [
-        ?_assert(
-            proper:quickcheck(
-                prop_session_ticket_forwarding_is_lossless(),
-                [{numtests, 50}, {to_file, user}]
+    [
+        {timeout, 180, T}
+     || T <- [
+            ?_assert(
+                proper:quickcheck(
+                    prop_session_ticket_forwarding_is_lossless(),
+                    [{numtests, 50}, {to_file, user}]
+                )
+            ),
+            ?_assert(
+                proper:quickcheck(
+                    prop_postponed_requests_replayed_without_loss(),
+                    [{numtests, 50}, {to_file, user}]
+                )
             )
-        ),
-        ?_assert(
-            proper:quickcheck(
-                prop_postponed_requests_replayed_without_loss(),
-                [{numtests, 50}, {to_file, user}]
-            )
-        )
-    ]}.
+        ]
+    ].
 
 %%====================================================================
 %% Helpers

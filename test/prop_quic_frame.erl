@@ -336,25 +336,30 @@ frames_equal(_, _) ->
 %%====================================================================
 
 proper_test_() ->
-    {timeout, 120, [
-        ?_assert(proper:quickcheck(prop_frame_roundtrip(), [{numtests, 500}, {to_file, user}])),
-        ?_assert(
-            proper:quickcheck(prop_stream_frame_roundtrip(), [{numtests, 200}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_crypto_frame_roundtrip(), [{numtests, 200}, {to_file, user}])
-        ),
-        ?_assert(proper:quickcheck(prop_ack_frame_roundtrip(), [{numtests, 200}, {to_file, user}])),
-        ?_assert(
-            proper:quickcheck(
-                prop_encode_iodata_equivalent_to_encode(), [{numtests, 300}, {to_file, user}]
-            )
-        ),
-        ?_assert(
-            proper:quickcheck(prop_encode_deterministic(), [{numtests, 300}, {to_file, user}])
-        ),
-        ?_assert(
-            proper:quickcheck(prop_decode_preserves_rest(), [{numtests, 300}, {to_file, user}])
-        ),
-        ?_assert(proper:quickcheck(prop_decode_multiple(), [{numtests, 100}, {to_file, user}]))
-    ]}.
+    [
+        {timeout, 120, T}
+     || T <- [
+            ?_assert(proper:quickcheck(prop_frame_roundtrip(), [{numtests, 500}, {to_file, user}])),
+            ?_assert(
+                proper:quickcheck(prop_stream_frame_roundtrip(), [{numtests, 200}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_crypto_frame_roundtrip(), [{numtests, 200}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_ack_frame_roundtrip(), [{numtests, 200}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(
+                    prop_encode_iodata_equivalent_to_encode(), [{numtests, 300}, {to_file, user}]
+                )
+            ),
+            ?_assert(
+                proper:quickcheck(prop_encode_deterministic(), [{numtests, 300}, {to_file, user}])
+            ),
+            ?_assert(
+                proper:quickcheck(prop_decode_preserves_rest(), [{numtests, 300}, {to_file, user}])
+            ),
+            ?_assert(proper:quickcheck(prop_decode_multiple(), [{numtests, 100}, {to_file, user}]))
+        ]
+    ].
