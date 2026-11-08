@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
   about one RTT late. The recovery period now keeps the time the
   reduction was made (RFC 9002 Section 7.3.1). The 100 ms minimum
   recovery period still keeps a burst loss from cutting the window twice.
+- A server whose `ciphers` shared no suite with the client's ClientHello
+  went ahead with TLS_AES_128_GCM_SHA256 anyway. It now aborts with
+  handshake_failure (RFC 8446 Section 4.1.1).
 
 ## [2.6.1] - 2026-11-08
 
