@@ -18,6 +18,11 @@ All notable changes to this project will be documented in this file.
   offered, but not that of a HelloRetryRequest, and built its second
   ClientHello on the transcript hash of a suite it never offered. It now
   aborts with illegal_parameter (RFC 8446 Section 4.1.4).
+- A server with external PSKs checked a client's binder as SHA-256 even
+  when it had selected TLS_AES_256_GCM_SHA384, and then ran the key
+  schedule on SHA-384, so the handshake failed on mismatched keys. An
+  external PSK is now only taken with a SHA-256 suite, and the server
+  falls back to the certificate path otherwise.
 
 ## [2.6.1] - 2026-11-08
 
