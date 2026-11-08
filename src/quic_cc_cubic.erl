@@ -285,8 +285,7 @@ on_packets_acked(
             %% Exit recovery
             State1 = State#cubic_state{
                 bytes_in_flight = NewInFlight,
-                in_recovery = false,
-                recovery_start_time = Now
+                in_recovery = false
             },
             %% Reset epoch and continue cubic growth
             cubic_on_ack(State1, AckedBytes, LargestAckedSentTime);
@@ -630,7 +629,7 @@ on_congestion_event(
     } = State,
     SentTime
 ) when is_integer(RecoveryStart), SentTime =< RecoveryStart ->
-    %% Packet sent before last recovery ended
+    %% Packet sent before the last recovery period started
     State;
 on_congestion_event(State, SentTime) ->
     do_congestion_event(State, SentTime).

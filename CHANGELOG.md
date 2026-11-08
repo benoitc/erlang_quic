@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- NewReno and CUBIC moved the start of the recovery period to the moment
+  they left recovery, so the loss of a packet sent during recovery was
+  ignored and, under continued overload, the next window reduction came
+  about one RTT late. The recovery period now keeps the time the
+  reduction was made (RFC 9002 Section 7.3.1). The 100 ms minimum
+  recovery period still keeps a burst loss from cutting the window twice.
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed

@@ -311,8 +311,7 @@ on_packets_acked(
             #cc_state{cwnd = Cwnd, ssthresh = SSThresh, max_datagram_size = MaxDS} = State,
             State1 = State#cc_state{
                 bytes_in_flight = NewInFlight,
-                in_recovery = false,
-                recovery_start_time = Now
+                in_recovery = false
             },
             State2 =
                 case Cwnd < SSThresh of
@@ -658,7 +657,7 @@ on_congestion_event(
     } = State,
     SentTime
 ) when is_integer(RecoveryStart), SentTime =< RecoveryStart ->
-    %% Packet was sent before the last recovery period ended.
+    %% Packet was sent before the last recovery period started.
     %% Don't re-enter recovery for old packets.
     ?LOG_DEBUG(
         #{
