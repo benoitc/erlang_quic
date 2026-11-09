@@ -461,9 +461,12 @@ decode_set_capacity(Data) ->
 
 -spec apply_encoder_instruction(term(), state()) -> {ok, state()} | {error, term()}.
 apply_encoder_instruction({insert_name_ref, 1, Index, Value}, State) ->
-    %% Static table reference (get_static_entry throws on invalid index)
-    {Name, _} = get_static_entry(Index),
-    insert_entry(Name, Value, State);
+    try get_static_entry(Index) of
+        {Name, _} -> insert_entry(Name, Value, State)
+    catch
+        %% RFC 9204 Section 3.1: an encoder stream error.
+        throw:{invalid_static_index, Index} -> {error, {invalid_static_index, Index}}
+    end;
 apply_encoder_instruction({insert_name_ref, 0, Index, Value}, State) ->
     %% Dynamic table reference
     case get_dynamic_entry_by_relative(Index, State) of
@@ -516,7 +519,10 @@ process_decoder_instructions(Data, State) ->
             Error
     catch
         throw:incomplete ->
-            {incomplete, Data, State}
+            {incomplete, Data, State};
+        throw:{qpack_decompression_failed, Reason} ->
+            %% Thrown from the shared integer decoder (RFC 7541 Section 5.1).
+            {error, Reason}
     end.
 
 -spec decode_decoder_instruction(binary()) ->

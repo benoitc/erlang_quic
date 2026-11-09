@@ -3928,3 +3928,28 @@ an_ended_claimed_uni_stream_is_forgotten_test() ->
     %% claimed_uni_streams is at position 49
     ?assertEqual(#{2 => 16#54}, element(49, State1)),
     ?assertEqual(#{}, element(49, State2)).
+
+%%====================================================================
+%% QPACK stream errors (RFC 9204 §6)
+%%====================================================================
+
+%% An integer too long to take on the decoder stream.
+overlong_integer_on_the_decoder_stream_closes_the_connection_test() ->
+    State = make_test_state(#{role => server, peer_decoder_stream => 10}),
+    Overlong = <<16#3F, (binary:copy(<<16#80>>, 9))/binary, 1>>,
+    ?assertMatch(
+        {error, {connection_error, ?H3_QPACK_DECODER_STREAM_ERROR, _}, _},
+        quic_h3_connection:handle_stream_data(10, Overlong, false, State)
+    ).
+
+%% An insertion naming static table entry 99 on the encoder stream
+%% (RFC 9204 §3.1).
+invalid_static_index_on_the_encoder_stream_closes_the_connection_test() ->
+    State = blocking_state(#{}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_QPACK_ENCODER_STREAM_ERROR, _}, _},
+        quic_h3_connection:handle_stream_data(2, <<16#FF, 36, 1, $v>>, false, State)
+    ),
+    ?assertMatch(
+        {ok, _}, quic_h3_connection:handle_stream_data(2, <<16#FF, 35, 1, $v>>, false, State)
+    ).
