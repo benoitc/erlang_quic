@@ -66,6 +66,10 @@ All notable changes to this project will be documented in this file.
   encoder stream stayed blocked, and a later insertion delivered a
   request on the reset stream. The blocked entry is dropped and Stream
   Cancellation is sent on every local reset (RFC 9204 Section 4.4.2).
+- A server remembered every push ID a client cancelled, promised or not,
+  so that set could grow without limit. A CANCEL_PUSH for a push with no
+  open stream is now ignored; one above MAX_PUSH_ID is still H3_ID_ERROR
+  (RFC 9114 Section 7.2.3).
 
 ## [2.6.1] - 2026-11-08
 

@@ -62,18 +62,43 @@ max_push_id_from_server_error_test() ->
 %% CANCEL_PUSH Handling Tests
 %%====================================================================
 
-%% Server receives CANCEL_PUSH from client
-cancel_push_server_receives_test() ->
+%% RFC 9114 Section 7.2.3: only an ID above MAX_PUSH_ID is an error. One
+%% with no push stream to stop, already sent or never promised, changes
+%% nothing, so a client cannot make the server remember IDs.
+cancel_push_without_a_stream_is_ignored_test() ->
     State = make_test_state(#{
         role => server,
         max_push_id => 10,
+        next_push_id => 3,
         settings_received => true
     }),
-    {ok, State1} = quic_h3_connection:handle_control_frame({cancel_push, 5}, State),
-    %% cancelled_pushes should contain push ID 5
-    %% cancelled_pushes is at position 37 (1-indexed, after push_streams at 36)
-    CancelledPushes = element(37, State1),
-    ?assert(sets:is_element(5, CancelledPushes)).
+    ?assertEqual({ok, State}, quic_h3_connection:handle_control_frame({cancel_push, 1}, State)),
+    ?assertEqual({ok, State}, quic_h3_connection:handle_control_frame({cancel_push, 5}, State)),
+    ?assertMatch(
+        {error, {connection_error, ?H3_ID_ERROR, _}},
+        quic_h3_connection:handle_control_frame({cancel_push, 11}, State)
+    ).
+
+%% An open push stream is reset and forgotten.
+cancel_push_resets_an_open_push_stream_test() ->
+    Quic = spawn(fun() ->
+        receive
+            {'$gen_call', From, {close_stream, 3, ?H3_REQUEST_CANCELLED}} ->
+                gen_statem:reply(From, ok)
+        end
+    end),
+    Push = #h3_stream{id = 3, type = push, state = open},
+    State = make_test_state(#{
+        role => server,
+        quic_conn => Quic,
+        max_push_id => 10,
+        next_push_id => 1,
+        push_streams => #{0 => {3, Push}},
+        settings_received => true
+    }),
+    {ok, State1} = quic_h3_connection:handle_control_frame({cancel_push, 0}, State),
+    %% push_streams is at position 36
+    ?assertEqual(#{}, element(36, State1)).
 
 %%====================================================================
 %% PUSH_PROMISE Handling Tests
