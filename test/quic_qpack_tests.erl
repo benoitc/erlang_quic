@@ -823,3 +823,45 @@ encoder_instruction_with_invalid_static_index_test() ->
     ),
     {ok, D1} = quic_qpack:process_encoder_instructions(<<16#FF, 35, 1, $v>>, D),
     ?assertEqual(1, quic_qpack:get_insert_count(D1)).
+
+%%====================================================================
+%% Required Insert Count against the decoder's maximum (RFC 9204 §4.5.1.1)
+%%====================================================================
+
+%% The encoder is willing to use more table than the decoder allows.
+%% MaxEntries is the decoder's, floor(100 / 32) = 3, so the encoded count
+%% wraps at 6: past that an encoder counting with its own 4096 sends a
+%% value the decoder cannot map back.
+ric_is_encoded_against_the_decoders_maximum_test() ->
+    ric_roundtrip(4096, 100).
+
+%% And the other way round: the decoder allows more than the encoder uses.
+ric_is_encoded_against_a_larger_decoder_maximum_test() ->
+    ric_roundtrip(64, 4096).
+
+ric_roundtrip(EncoderCeiling, DecoderMax) ->
+    E0 = quic_qpack:set_peer_max_capacity(
+        DecoderMax, quic_qpack:new(#{max_allowed_capacity => EncoderCeiling})
+    ),
+    ?assertEqual(min(EncoderCeiling, DecoderMax), quic_qpack:get_dynamic_capacity(E0)),
+    D0 = quic_qpack:new(#{max_allowed_capacity => DecoderMax}),
+    lists:foldl(
+        fun(N, {E, D}) ->
+            H = [{<<"x-", (integer_to_binary(N))/binary>>, <<"v">>}],
+            %% insert, let the decoder acknowledge, then refer to the entry
+            {_Literal, E1} = quic_qpack:encode(H, E),
+            {ok, D1} = quic_qpack:process_encoder_instructions(
+                quic_qpack:get_encoder_instructions(E1), D
+            ),
+            {ok, E2} = quic_qpack:process_decoder_instructions(
+                quic_qpack:encode_insert_count_increment(1),
+                quic_qpack:clear_encoder_instructions(E1)
+            ),
+            {Ref, E3} = quic_qpack:encode(H, E2),
+            ?assertEqual(N, quic_qpack:get_last_ric(E3)),
+            ?assertEqual({N, {ok, H}}, {N, element(1, quic_qpack:decode(Ref, D1))}),
+            {E3, D1}
+        end,
+        {E0, D0},
+        lists:seq(1, 300)
+    ).

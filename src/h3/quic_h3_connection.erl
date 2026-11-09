@@ -5064,7 +5064,7 @@ apply_peer_settings(Settings, #state{qpack_encoder = Encoder} = State) ->
     %% as literals until the peer acknowledges receipt. This avoids the cross-stream
     %% ordering issue where HEADERS might arrive before encoder instructions.
     MaxCapacity = maps:get(qpack_max_table_capacity, Settings, 0),
-    Encoder1 = quic_qpack:set_dynamic_capacity(MaxCapacity, Encoder),
+    Encoder1 = quic_qpack:set_peer_max_capacity(MaxCapacity, Encoder),
 
     %% 2. Max field section size - store for header block validation. Cap
     %% the peer-advertised value at our local frame ceiling so an attacker

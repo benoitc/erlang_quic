@@ -48,6 +48,7 @@
 %% Dynamic table management
 -export([
     set_dynamic_capacity/2,
+    set_peer_max_capacity/2,
     get_dynamic_capacity/1,
     get_insert_count/1,
     get_last_ric/1,
@@ -108,7 +109,11 @@
     %% Required insert count for last encoded block
     last_ric = 0 :: non_neg_integer(),
     %% Map of StreamId -> queue of outstanding RIC values (oldest first)
-    pending_sections = #{} :: #{non_neg_integer() => queue:queue(non_neg_integer())}
+    pending_sections = #{} :: #{non_neg_integer() => queue:queue(non_neg_integer())},
+    %% For an encoder state: the decoder's SETTINGS_QPACK_MAX_TABLE_CAPACITY,
+    %% which the Required Insert Count is encoded against. Until it is set,
+    %% max_allowed_capacity stands in for it.
+    peer_max_capacity :: non_neg_integer() | undefined
 }).
 
 -opaque state() :: #qpack{}.
@@ -190,7 +195,7 @@ encode(Headers, State) ->
     %% silently corrupts the section once a value reaches the prefix maximum
     %% (e.g. an encoded insert count of 255 on a long-lived dynamic table),
     %% because the decoder then reads a continuation byte that was never sent.
-    RICEncoded = encode_prefixed_int(encode_ric(RIC, State#qpack.max_allowed_capacity), 8, 0),
+    RICEncoded = encode_prefixed_int(encode_ric(RIC, ric_capacity(State)), 8, 0),
     BaseEncoded = encode_prefixed_int(BaseIC - RIC, 7, 0),
     Prefix = <<RICEncoded/binary, BaseEncoded/binary>>,
 
@@ -266,6 +271,14 @@ set_dynamic_capacity(Capacity, #qpack{max_allowed_capacity = Max} = State) ->
         encoder_instructions = [Instruction | State#qpack.encoder_instructions]
     },
     evict_to_fit(0, State1).
+
+%% @doc Tell an encoder the maximum table capacity its decoder advertised
+%% and set the capacity to it, or to our own ceiling if that is lower.
+%% RFC 9204 Section 4.5.1.1: the Required Insert Count is encoded modulo
+%% the decoder's maximum, not the capacity the encoder chose to use.
+-spec set_peer_max_capacity(non_neg_integer(), state()) -> state().
+set_peer_max_capacity(PeerMax, State) ->
+    set_dynamic_capacity(PeerMax, State#qpack{peer_max_capacity = PeerMax}).
 
 %% @doc Get dynamic table capacity.
 -spec get_dynamic_capacity(state()) -> non_neg_integer().
@@ -599,6 +612,9 @@ decode_required_insert_count(_ERIC, 0, _InsertCount) ->
     throw({qpack_decompression_failed, required_insert_count_without_capacity});
 decode_required_insert_count(ERIC, MaxEntries, InsertCount) ->
     quic_qpack_prefix:decode_ric(ERIC, MaxEntries, InsertCount).
+
+ric_capacity(#qpack{peer_max_capacity = undefined, max_allowed_capacity = Own}) -> Own;
+ric_capacity(#qpack{peer_max_capacity = PeerMax}) -> PeerMax.
 
 %% ERIC = (RIC mod (2 * MaxEntries)) + 1
 -spec encode_ric(non_neg_integer(), non_neg_integer()) -> non_neg_integer().

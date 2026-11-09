@@ -102,6 +102,10 @@ All notable changes to this project will be documented in this file.
 - Huffman-encoded strings with more than 7 bits of padding, or padding
   that is not all ones, were accepted. Both are decoding errors now (RFC
   7541 Section 5.2, RFC 9204 Section 4.1.2).
+- The QPACK encoder encoded the Required Insert Count using our own
+  advertised table capacity instead of the peer's. When the two
+  differed, field sections stopped decoding after a few dynamic table
+  insertions (RFC 9204 Section 4.5.1.1).
 
 ## [2.6.1] - 2026-11-08
 
