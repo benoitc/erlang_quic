@@ -4112,3 +4112,41 @@ signed_status_is_malformed_test() ->
             [{<<":status">>, <<"200">>}], Stream, client, State
         )
     ).
+
+%%====================================================================
+%% Required Insert Count and the peer's table (RFC 9204 §4.5.1.1)
+%%====================================================================
+
+%% We would use 4096 bytes of table, the peer allows 100. What the peer
+%% decodes the Required Insert Count with is its own 100, so that is what
+%% our encoder has to count with once the SETTINGS are in.
+required_insert_count_follows_the_peers_table_capacity_test() ->
+    State0 = make_test_state(#{
+        role => server,
+        quic_conn => fake_quic_conn(),
+        local_encoder_stream => 3,
+        qpack_encoder => quic_qpack:new(#{max_allowed_capacity => 4096})
+    }),
+    {ok, State1} = quic_h3_connection:handle_control_frame(
+        {settings, #{qpack_max_table_capacity => 100}}, State0
+    ),
+    Encoder = element(13, State1),
+    ?assertEqual(100, quic_qpack:get_dynamic_capacity(Encoder)),
+    lists:foldl(
+        fun(N, {E, D}) ->
+            H = [{<<"x-", (integer_to_binary(N))/binary>>, <<"v">>}],
+            {_Literal, E1} = quic_qpack:encode(H, E),
+            {ok, D1} = quic_qpack:process_encoder_instructions(
+                quic_qpack:get_encoder_instructions(E1), D
+            ),
+            {ok, E2} = quic_qpack:process_decoder_instructions(
+                quic_qpack:encode_insert_count_increment(1),
+                quic_qpack:clear_encoder_instructions(E1)
+            ),
+            {Ref, E3} = quic_qpack:encode(H, E2),
+            ?assertEqual({N, {ok, H}}, {N, element(1, quic_qpack:decode(Ref, D1))}),
+            {E3, D1}
+        end,
+        {Encoder, quic_qpack:new(#{max_dynamic_size => 100})},
+        lists:seq(1, 20)
+    ).
