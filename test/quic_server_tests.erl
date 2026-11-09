@@ -74,6 +74,9 @@ server_test_() ->
         {"Get server info", fun get_server_info_test/0},
         {"Server not found", fun server_not_found_test/0},
         {"Pool size option", fun pool_size_test/0},
+        {"One listener by default", fun default_pool_size_test/0},
+        {"A single listener does not share its port", fun single_listener_port_test/0},
+        {"Pool connections are listed once", fun pool_connections_listed_once_test/0},
         {"Which servers", fun which_servers_test/0},
         {"Get server port", fun get_server_port_test/0},
         {"Get server sockname", fun get_server_sockname_test/0},
@@ -171,7 +174,49 @@ pool_size_test() ->
     %% Get info and verify opts
     {ok, Info} = quic:get_server_info(pool_server),
     StoredOpts = maps:get(opts, Info),
-    ?assertEqual(4, maps:get(pool_size, StoredOpts)).
+    ?assertEqual(4, maps:get(pool_size, StoredOpts)),
+    ?assertEqual(4, length(quic_listener_sup:get_listeners(maps:get(pid, Info)))).
+
+default_pool_size_test() ->
+    {ok, Sup} = quic:start_server(default_pool_server, 0, base_opts()),
+    ?assertMatch([_], quic_listener_sup:get_listeners(Sup)).
+
+%% SO_REUSEPORT is for the listeners of a pool. On a lone listener it
+%% would let any other socket that sets it bind the port and take a
+%% share of the datagrams.
+single_listener_port_test() ->
+    {ok, _} = quic:start_server(single_listener_server, 0, base_opts()),
+    {ok, Port} = quic:get_server_port(single_listener_server),
+    Result = gen_udp:open(Port, [binary, {reuseport, true}]),
+    case Result of
+        {ok, Socket} -> gen_udp:close(Socket);
+        _ -> ok
+    end,
+    ?assertEqual({error, eaddrinuse}, Result).
+
+pool_connections_listed_once_test() ->
+    Test = self(),
+    Opts = maps:merge(base_opts(), #{
+        pool_size => 2,
+        connection_handler => fun(ConnPid) ->
+            Test ! {conn, ConnPid},
+            {ok, Test}
+        end
+    }),
+    {ok, Sup} = quic:start_server(listed_once_server, 0, Opts),
+    [Listener | _] = quic_listener_sup:get_listeners(Sup),
+    {ok, Sock} = gen_udp:open(0, [binary]),
+    %% Only the header is parsed to route it; padded to the 1200 bytes a
+    %% client Initial datagram has.
+    Header = <<16#C0, 1:32, 8, 1:64, 4, 2:32>>,
+    Initial = <<Header/binary, 0:((1200 - byte_size(Header)) * 8)>>,
+    ok = gen_udp:send(Sock, {127, 0, 0, 1}, quic_listener:get_port(Listener), Initial),
+    gen_udp:close(Sock),
+    receive
+        {conn, ConnPid} ->
+            ?assertEqual({ok, [ConnPid]}, quic:get_server_connections(listed_once_server))
+    after 5000 -> error(no_connection)
+    end.
 
 which_servers_test() ->
     %% Clean up any leftover servers from previous tests
