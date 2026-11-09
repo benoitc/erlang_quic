@@ -292,6 +292,13 @@ All notable changes to this project will be documented in this file.
 - TLS now follows RFC 9846, which obsoletes RFC 8446.
 - Reliable stream reset now follows draft-ietf-quic-reliable-stream-reset-11;
   both transport parameter ids are sent and accepted.
+### Changed
+- The receiver process of a client on the `socket` backend waits for a
+  datagram instead of waking ten times a second, and reads the
+  connection's mailbox length once per 16 forwarded messages rather than
+  on each. Together with the timer fix below, an idle client connection
+  uses 10 to 39 microseconds of CPU per second where it used 190 to 490
+  (loopback).
 
 ### Fixed
 - A client connecting to an internationalized host name sent it in

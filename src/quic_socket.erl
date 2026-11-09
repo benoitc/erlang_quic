@@ -84,6 +84,7 @@
 -define(IP_MTU_DISCOVER, 10).
 -define(IPV6_MTU_DISCOVER, 23).
 -define(PMTUDISC_PROBE, 3).
+-define(RECV_QUEUE_CHECK_INTERVAL, 16).
 
 -record(socket_state, {
     %% The underlying socket. For the `adapter' backend this is an
@@ -685,7 +686,7 @@ get_fd(#socket_state{backend = adapter}) ->
 start_client_receiver(#socket_state{backend = socket} = SocketState, Owner, QueueMax) when
     is_pid(Owner)
 ->
-    Pid = spawn_link(fun() -> client_recv_loop(SocketState, Owner, QueueMax) end),
+    Pid = spawn_link(fun() -> client_recv_loop(SocketState, Owner, QueueMax, 0) end),
     {ok, Pid};
 start_client_receiver(#socket_state{backend = gen_udp}, _Owner, _QueueMax) ->
     {error, not_supported_on_gen_udp};
@@ -718,22 +719,19 @@ stop_client_receiver(Pid) when is_pid(Pid) ->
 %% Blocking recvfrom loop. Forwards each datagram as a gen_udp-shaped
 %% `{udp, Socket, IP, Port, Data}' tuple so the owner's existing
 %% receive handlers work unchanged — `Socket' here matches the OTP
-%% socket handle stored in `#state.socket'. Uses a 100ms timeout so
-%% exit signals from the linked owner are processed promptly rather
-%% than blocking forever in the NIF.
-client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner, QueueMax) ->
+%% socket handle stored in `#state.socket'. The wait for a datagram is
+%% an Erlang receive, so the linked owner's exit signal ends it.
+client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner, QueueMax, Unchecked) ->
     %% recv_gro splits GRO-coalesced trains and sizes the read buffer
     %% for a maximal train; a plain recvfrom with the default 8 KiB
     %% buffer would silently truncate coalesced input. A multi-packet
     %% train goes to the owner as ONE message so the mailbox holds
     %% trains, not packets, and the whole train is processed in one
     %% receive pass.
-    case recv_gro(Socket, 100) of
+    case recv_gro(Socket, infinity) of
         {ok, {IP, Port}, Packets} ->
-            forward_to_owner(Owner, Socket, IP, Port, Packets, QueueMax),
-            client_recv_loop(SocketState, Owner, QueueMax);
-        {error, timeout} ->
-            client_recv_loop(SocketState, Owner, QueueMax);
+            Unchecked1 = forward_to_owner(Owner, Socket, IP, Port, Packets, QueueMax, Unchecked),
+            client_recv_loop(SocketState, Owner, QueueMax, Unchecked1);
         {error, closed} ->
             ok;
         {error, Reason} ->
@@ -742,18 +740,29 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner, QueueMax) 
     end.
 
 %% Bench diagnostic: client-receiver tail-drop counter.
-%% Tail-drop over QueueMax, see recv_queue_max/1.
-forward_to_owner(Owner, Socket, IP, Port, Packets, QueueMax) ->
+%% Tail-drop over QueueMax, see recv_queue_max/1. The owner's mailbox is
+%% read once per ?RECV_QUEUE_CHECK_INTERVAL forwarded messages, and on
+%% every message while it is over the bound. Returns the number of
+%% messages forwarded since the last read.
+forward_to_owner(Owner, Socket, IP, Port, Packets, _QueueMax, Unchecked) when
+    Unchecked < ?RECV_QUEUE_CHECK_INTERVAL
+->
+    forward(Owner, Socket, IP, Port, Packets),
+    Unchecked + 1;
+forward_to_owner(Owner, Socket, IP, Port, Packets, QueueMax, Unchecked) ->
     case erlang:process_info(Owner, message_queue_len) of
         {message_queue_len, QLen} when QLen > QueueMax ->
-            count_client_recv_drop(length(Packets));
+            count_client_recv_drop(length(Packets)),
+            Unchecked;
         _ ->
-            case Packets of
-                [Single] -> Owner ! {udp, Socket, IP, Port, Single};
-                _ -> Owner ! {udp_batch, Socket, IP, Port, Packets}
-            end,
-            ok
+            forward(Owner, Socket, IP, Port, Packets),
+            0
     end.
+
+forward(Owner, Socket, IP, Port, [Single]) ->
+    Owner ! {udp, Socket, IP, Port, Single};
+forward(Owner, Socket, IP, Port, Packets) ->
+    Owner ! {udp_batch, Socket, IP, Port, Packets}.
 
 count_client_recv_drop(N) ->
     Ref =
