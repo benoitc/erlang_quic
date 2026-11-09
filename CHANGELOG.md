@@ -53,6 +53,11 @@ All notable changes to this project will be documented in this file.
   with SO_REUSEPORT only when N is above 1, and
   `quic:get_server_connections/1` returns each connection once instead
   of once per listener.
+- After `cancel_stream`, the rest of the request body was read as a new
+  request, so a HEADERS frame inside a body could be delivered as a
+  second request. A cancelled stream is now ignored until the peer ends
+  it, and the peer is asked to stop sending (RFC 9114 Section 4.1.1, RFC
+  9000 Section 3.5).
 
 ## [2.6.1] - 2026-11-08
 
