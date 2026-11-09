@@ -9871,7 +9871,7 @@ flush_event(#state{socket_state = SocketState0, pto_dirty = Dirty0} = State, Sco
             false ->
                 State;
             true ->
-                {Timer, ArmedAt, ScheduledAt, Space, Kind} =
+                {Timer, ArmedAt, ScheduledAt, Space, Kind, DrainedAt} =
                     case Dirty of
                         true ->
                             pto_plan(State);
@@ -9881,9 +9881,10 @@ flush_event(#state{socket_state = SocketState0, pto_dirty = Dirty0} = State, Sco
                                 pto_armed_at = A,
                                 pto_scheduled_at = D,
                                 pto_space = Sp,
-                                pto_kind = K
+                                pto_kind = K,
+                                pto_drained_at = Dr
                             } = State,
-                            {T, A, D, Sp, K}
+                            {T, A, D, Sp, K, Dr}
                     end,
                 {Source, RecvPass, AckTimer} =
                     case Scope of
@@ -9903,6 +9904,7 @@ flush_event(#state{socket_state = SocketState0, pto_dirty = Dirty0} = State, Sco
                     pto_scheduled_at = ScheduledAt,
                     pto_space = Space,
                     pto_kind = Kind,
+                    pto_drained_at = DrainedAt,
                     pto_dirty = false,
                     current_packet_source = Source,
                     recv_pass = RecvPass,
@@ -14050,25 +14052,27 @@ send_keep_alive_ping(State) ->
 %% packet, and cancel_timer + send_after per packet was a measurable
 %% share of the server receive path on small hosts.
 set_pto_timer(State) ->
-    {Timer, ArmedAt, ScheduledAt, Space, Kind} = pto_plan(State),
+    {Timer, ArmedAt, ScheduledAt, Space, Kind, DrainedAt} = pto_plan(State),
     State#state{
         pto_timer = Timer,
         pto_armed_at = ArmedAt,
         pto_scheduled_at = ScheduledAt,
         pto_space = Space,
         pto_kind = Kind,
+        pto_drained_at = DrainedAt,
         pto_dirty = false
     }.
 
 %% The PTO fields set_pto_timer/1 stores, cancelling or arming the timer
-%% as needed: {Timer, ArmedAt, ScheduledAt, Space, Kind}.
+%% as needed: {Timer, ArmedAt, ScheduledAt, Space, Kind, DrainedAt}.
 pto_plan(
     #state{
         loss_state = LossState,
         pto_timer = OldTimer,
         pto_armed_at = ArmedAt,
         pto_space = OldSpace,
-        pto_kind = OldKind
+        pto_kind = OldKind,
+        pto_drained_at = DrainedAt
     } = State
 ) ->
     Now = erlang:monotonic_time(millisecond),
@@ -14093,17 +14097,19 @@ pto_plan(
                     Deadline + ?PTO_RESET_TOLERANCE_MS >= ArmedAt
             of
                 true ->
-                    {OldTimer, ArmedAt, Deadline, OldSpace, OldKind};
+                    {OldTimer, ArmedAt, Deadline, OldSpace, OldKind, DrainedAt};
                 false ->
                     cancel_timer(OldTimer),
                     {Ref, NewArmedAt} = start_pto_timer(PTO),
-                    {Ref, NewArmedAt, Deadline, Space, Kind}
+                    {Ref, NewArmedAt, Deadline, Space, Kind, DrainedAt}
             end;
+        none when OldTimer =:= undefined ->
+            {undefined, ArmedAt, undefined, OldSpace, OldKind, DrainedAt};
+        none when is_integer(DrainedAt), Now - DrainedAt < ?PTO_LAZY_WINDOW_MS ->
+            {OldTimer, ArmedAt, undefined, OldSpace, OldKind, Now};
         none ->
             cancel_timer(OldTimer),
-            {undefined, ArmedAt, undefined, OldSpace, OldKind};
-        _ ->
-            {OldTimer, ArmedAt, undefined, OldSpace, OldKind}
+            {undefined, ArmedAt, undefined, OldSpace, OldKind, Now}
     end.
 
 pto_selection(LossState, Now, State) ->

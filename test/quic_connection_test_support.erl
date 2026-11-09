@@ -533,6 +533,7 @@ state_sending(State) ->
 %% Minimal #state{} carrying a caller-supplied loss tracker, for tests
 %% that need to observe what an incoming frame does to it.
 state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
+state_get(#state{} = S, loss_state) -> S#state.loss_state;
 state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at;
 state_get(#state{} = S, dcid) -> S#state.dcid;
 state_get(#state{} = S, app_keys) -> S#state.app_keys;

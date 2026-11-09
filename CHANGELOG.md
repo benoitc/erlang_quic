@@ -299,6 +299,11 @@ All notable changes to this project will be documented in this file.
   on each. Together with the timer fix below, an idle client connection
   uses 10 to 39 microseconds of CPU per second where it used 190 to 490
   (loopback).
+- In a request-response exchange the PTO timer is no longer cancelled
+  and started again on every round trip: when everything in flight is
+  acknowledged twice within 100 ms the timer stays armed for the next
+  send. Probes go out at the same times as before (RFC 9002 Section
+  6.2.1).
 
 ### Fixed
 - A client connecting to an internationalized host name sent it in

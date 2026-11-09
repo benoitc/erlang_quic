@@ -8,6 +8,7 @@
 %% Stays well below the RFC 9002 minimum PTO so it does not break
 %% retransmission semantics.
 -define(PTO_RESET_TOLERANCE_MS, 2).
+-define(PTO_LAZY_WINDOW_MS, 100).
 
 %% Most handshake bytes per space the congestion window may hold back at
 %% once. A large certificate chain runs to tens of kilobytes and a
@@ -575,6 +576,11 @@
     %% cancelled when the deadline moves later; the fire handler re-arms
     %% for the remainder instead (see set_pto_timer/1).
     pto_armed_at = undefined :: integer() | undefined,
+    %% When the flight last drained with the timer armed. A flight that
+    %% drains again within ?PTO_LAZY_WINDOW_MS leaves the timer armed for
+    %% the next send; otherwise it is cancelled, so a connection going
+    %% quiet is not woken by a timer with nothing to probe.
+    pto_drained_at = undefined :: integer() | undefined,
     %% The packet number space the armed timer belongs to. A probe has to
     %% go out at that level, and a change of space forces a re-arm: the
     %% lazy "a later deadline never cancels" rule would otherwise leave
