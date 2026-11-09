@@ -97,7 +97,7 @@ stop() ->
     quic:stop_server(echo_server).
 
 handle_connection(Conn, _DCID) ->
-    spawn(fun() -> connection_loop(Conn) end).
+    {ok, spawn(fun() -> connection_loop(Conn) end)}.
 
 connection_loop(Conn) ->
     ok = quic:set_owner(Conn, self()),

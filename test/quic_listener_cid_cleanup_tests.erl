@@ -24,12 +24,10 @@ initial() ->
         <<16#C0, 1:32, (byte_size(?DCID)), ?DCID/binary, (byte_size(?SCID)), ?SCID/binary, "body">>,
     <<Packet/binary, 0:((1200 - byte_size(Packet)) * 8)>>.
 
-%% Freeze the connection so it is still alive when the test kills it.
 handler(Test) ->
     fun(ConnPid, _DCID) ->
-        sys:suspend(ConnPid),
         Test ! {conn, ConnPid},
-        {error, frozen_by_test}
+        {ok, Test}
     end.
 
 exit_cleanup_does_not_scan_the_routing_table_test_() ->
