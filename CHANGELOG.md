@@ -79,6 +79,10 @@ All notable changes to this project will be documented in this file.
   every stream. Only sections that use the dynamic table are tracked,
   and they are forgotten when their stream finishes or is reset (RFC
   9204 Section 4.4.1).
+- State kept for a peer's unidirectional stream (unknown stream types,
+  an incomplete stream type, streams claimed by a `stream_type_handler`)
+  was only released on a reset, so each stream ended with FIN left an
+  entry behind. It is released at the FIN (RFC 9114 Section 6.2.3).
 
 ## [2.6.1] - 2026-11-08
 
