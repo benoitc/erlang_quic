@@ -309,6 +309,9 @@ All notable changes to this project will be documented in this file.
   acknowledgement. It runs during the handshake as before, and from the
   first probe timeout of data in flight, so an unresponsive peer is
   still given up on at the same time.
+- With keep-alive on, the idle timer no longer fires just to find that
+  the connection was kept alive: each keep-alive expiry moves it to the
+  idle deadline (RFC 9000 Section 10.1).
 
 ### Fixed
 - A client connecting to an internationalized host name sent it in

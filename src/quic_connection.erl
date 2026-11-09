@@ -2549,7 +2549,8 @@ handle_common_event(
         true ->
             %% Activity since the timer was armed: re-arm for the remainder,
             %% no PING needed.
-            {keep_state, set_keep_alive_timer(State#state{keep_alive_timer = undefined})};
+            {keep_state,
+                set_keep_alive_timer(set_idle_timer(State#state{keep_alive_timer = undefined}))};
         false ->
             %% Idle for a full interval: send a PING, then wait a full
             %% interval before the next one.
@@ -2564,7 +2565,7 @@ handle_common_event(
             %% rate (measured: ~930/s per connection, 46k/s across 50 idle
             %% connections) until the peer happens to send something.
             State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
-            State2 = flush_event(State1, event),
+            State2 = set_idle_timer(flush_event(State1, event)),
             {keep_state,
                 arm_keep_alive_timer(State2, (State2#state.cfg)#conn_cfg.keep_alive_interval)}
     end;
