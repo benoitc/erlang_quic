@@ -2358,10 +2358,14 @@ handle_common_event(
     {keep_state, State, [{reply, From, Ref}]};
 handle_common_event({call, From}, get_path_stats, _StateName, State) ->
     {keep_state, State, [{reply, From, {error, not_connected}}]};
-handle_common_event(cast, handle_timeout, _StateName, State) ->
-    %% Handle loss detection / idle timeout
-    NewState = check_timeouts(State),
-    {keep_state, NewState};
+handle_common_event(cast, handle_timeout, StateName, State) when
+    StateName =/= draining andalso StateName =/= closed
+->
+    Now = erlang:monotonic_time(millisecond),
+    case Now - State#state.last_activity > idle_timeout(State) of
+        true -> {next_state, draining, initiate_close(idle_timeout, State)};
+        false -> {keep_state, State}
+    end;
 %% The retained client Finished flight has its own schedule: resend it
 %% until the server confirms the handshake. Nothing else is guaranteed
 %% to be in flight once the statem has left `handshaking', so without
@@ -12543,14 +12547,6 @@ cert_alert_code(no_trust_anchors) -> ?TLS_ALERT_UNKNOWN_CA;
 cert_alert_code(no_certificate) -> ?TLS_ALERT_CERTIFICATE_REQUIRED;
 cert_alert_code({hostname_mismatch, _}) -> ?TLS_ALERT_BAD_CERTIFICATE;
 cert_alert_code(_) -> ?TLS_ALERT_BAD_CERTIFICATE.
-
-%% Check timeouts
-check_timeouts(State) ->
-    Now = erlang:monotonic_time(millisecond),
-    case Now - State#state.last_activity > idle_timeout(State) of
-        true -> initiate_close(idle_timeout, State);
-        false -> State
-    end.
 
 %%====================================================================
 %% Retransmission
