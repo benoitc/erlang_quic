@@ -2545,15 +2545,19 @@ handle_common_event(
     Ref =/= undefined
 ->
     Now = erlang:monotonic_time(millisecond),
-    case (Now - State#state.last_activity) < (State#state.cfg)#conn_cfg.keep_alive_interval of
+    Interval = (State#state.cfg)#conn_cfg.keep_alive_interval,
+    %% The answer to the last PING moved last_activity a round trip past
+    %% the arm, so a comparison with the full interval fires twice for
+    %% every PING.
+    case (Now - State#state.last_activity) < Interval - Interval div 8 of
         true ->
             %% Activity since the timer was armed: re-arm for the remainder,
             %% no PING needed.
             {keep_state,
                 set_keep_alive_timer(set_idle_timer(State#state{keep_alive_timer = undefined}))};
         false ->
-            %% Idle for a full interval: send a PING, then wait a full
-            %% interval before the next one.
+            %% Idle for the interval: send a PING, then wait an interval
+            %% before the next one.
             %%
             %% The re-arm must count from now, not from last_activity:
             %% last_activity only moves on the FIRST ack-eliciting packet
@@ -2566,8 +2570,7 @@ handle_common_event(
             %% connections) until the peer happens to send something.
             State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
             State2 = set_idle_timer(flush_event(State1, event)),
-            {keep_state,
-                arm_keep_alive_timer(State2, (State2#state.cfg)#conn_cfg.keep_alive_interval)}
+            {keep_state, arm_keep_alive_timer(State2, keep_alive_period(State2))}
     end;
 handle_common_event(info, {timeout, _StaleRef, keep_alive_timeout}, _StateName, State) ->
     %% Ignore stale keep-alive timer (ref doesn't match or wrong state)
@@ -14458,6 +14461,14 @@ set_keep_alive_timer(
     %% full interval on the initial arm, the remainder on a spurious fire.
     Now = erlang:monotonic_time(millisecond),
     arm_keep_alive_timer(State, max(0, (LastActivity + Interval) - Now)).
+
+%% Time to the next PING after one was sent. With both ends on the same
+%% interval the client goes first, so each interval carries one PING, not
+%% one from each end.
+keep_alive_period(#state{cfg = #conn_cfg{role = client, keep_alive_interval = Interval}}) ->
+    Interval - Interval div 16;
+keep_alive_period(#state{cfg = #conn_cfg{keep_alive_interval = Interval}}) ->
+    Interval.
 
 %% Arm the keep-alive timer with an explicit delay.
 arm_keep_alive_timer(#state{cfg = #conn_cfg{keep_alive_interval = disabled}} = State, _Delay) ->

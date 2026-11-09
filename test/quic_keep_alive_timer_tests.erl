@@ -30,6 +30,35 @@ moves_the_idle_timer_to_its_deadline_test() ->
      || Idle <- [1000, ?INTERVAL]
     ].
 
+%% The acknowledgement of the last PING arrived a round trip into the
+%% interval. The next expiry sends the next PING; it does not wait out
+%% that round trip first.
+pings_once_idle_for_most_of_the_interval_test() ->
+    Sent = fire(state(server, ?INTERVAL - 50)),
+    ?assert(next_expiry(Sent) > ?INTERVAL - 1000),
+    cancel(Sent),
+    Waits = fire(state(server, ?INTERVAL div 2)),
+    Left = next_expiry(Waits),
+    ?assert(Left =< ?INTERVAL div 2),
+    ?assert(Left > ?INTERVAL div 2 - 1000),
+    cancel(Waits).
+
+%% Both ends on the same interval: the client's next PING comes before
+%% the server's timer, which then finds the connection active.
+client_pings_before_the_server_test() ->
+    Client = fire(state(client, ?INTERVAL)),
+    Server = fire(state(server, ?INTERVAL)),
+    ?assert(next_expiry(Client) =< ?INTERVAL - ?INTERVAL div 16),
+    ?assert(next_expiry(Server) > ?INTERVAL - ?INTERVAL div 16),
+    %% When the server's timer fires the client's PING is at most a
+    %% sixteenth of the interval old.
+    Quiet = fire(state(server, ?INTERVAL div 16)),
+    ?assert(next_expiry(Quiet) > ?INTERVAL - ?INTERVAL div 16 - 1000),
+    [cancel(S) || S <- [Client, Server, Quiet]].
+
+next_expiry(#state{keep_alive_timer = Ref}) ->
+    erlang:read_timer(Ref).
+
 fire(State) ->
     Ref = make_ref(),
     {keep_state, S} = quic_connection:handle_common_event(
