@@ -454,11 +454,7 @@ when
     Fin :: boolean(),
     Timeout :: timeout().
 send_data(Conn, StreamId, Data, Fin, Timeout) when is_pid(Conn) ->
-    try
-        gen_statem:call(Conn, {send_data, StreamId, Data, Fin}, Timeout)
-    catch
-        exit:{timeout, _} -> {error, timeout}
-    end.
+    quic_connection:send_data(Conn, StreamId, Data, Fin, Timeout).
 
 %% @doc Send data on a stream asynchronously (fire-and-forget).
 %% This is faster than send_data/4 because it uses cast instead of call,
@@ -489,7 +485,7 @@ send_data_async(Conn, StreamId, Data, Fin) when is_pid(Conn) ->
 %%     ok = quic:set_stream_flow_control(Conn, StreamId, manual)
 %% '''
 %% @end
--spec set_stream_flow_control(Conn, StreamId, Mode) -> ok | {error, unknown_stream} when
+-spec set_stream_flow_control(Conn, StreamId, Mode) -> ok | {error, unknown_stream | closed} when
     Conn :: pid(),
     StreamId :: non_neg_integer(),
     Mode :: auto | manual.
@@ -511,7 +507,7 @@ set_stream_flow_control(Conn, StreamId, Mode) when
 %%     ok = quic:consume(Conn, StreamId, byte_size(Data))
 %% '''
 %% @end
--spec consume(Conn, StreamId, Bytes) -> ok | {error, unknown_stream} when
+-spec consume(Conn, StreamId, Bytes) -> ok | {error, unknown_stream | closed} when
     Conn :: pid(),
     StreamId :: non_neg_integer(),
     Bytes :: non_neg_integer().
