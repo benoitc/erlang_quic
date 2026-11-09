@@ -2801,7 +2801,12 @@ finish_request_stream(
 ) ->
     %% A bare fin still leaves an entry a handler may come for, so it goes
     %% through the same admission check as a piece with a payload.
-    case deliver_body(StreamId, <<>>, true, Stream, State) of
+    Delivered =
+        case content_complete(Stream) of
+            true -> deliver_body(StreamId, <<>>, true, Stream, State);
+            false -> {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}}
+        end,
+    case Delivered of
         {ok, Stream1, State1} ->
             {Stream1, State1};
         {error, {stream_reset, _StreamId, Code}} ->
@@ -2835,6 +2840,15 @@ carries_no_content(#h3_stream{status = 304}) ->
     true;
 carries_no_content(_) ->
     false.
+
+%% RFC 9114 Section 4.1.2: a message that ends with less content than its
+%% Content-Length states is malformed, however it ends.
+content_complete(#h3_stream{content_length = CL, body_received = Received} = Stream) when
+    is_integer(CL), Received < CL
+->
+    carries_no_content(Stream);
+content_complete(_Stream) ->
+    true.
 
 process_request_frames(StreamId, Data, Fin, Stream, State) ->
     case quic_h3_frame:decode_streaming(Data, Stream#h3_stream.data_remaining) of
@@ -3005,7 +3019,9 @@ handle_request_frame(
             {error, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}};
         {{ok, Trailers}, Decoder1} ->
             %% RFC 9114 Section 4.1.2: validate trailers
-            case validate_trailer_headers(Trailers, Stream) of
+            case content_complete(Stream) andalso validate_trailer_headers(Trailers, Stream) of
+                false ->
+                    {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}};
                 ok ->
                     %% Send Section Acknowledgment for trailers
                     State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
@@ -3237,7 +3253,7 @@ block_stream(StreamId, Entry, Stream, #state{blocked_streams = Blocked} = State)
 process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State) ->
     %% Send Section Acknowledgment on decoder stream (RFC 9204 Section 4.4)
     State1 = send_section_ack(StreamId, State),
-    case update_stream_with_headers(Headers, Stream, Role, State1) of
+    case headers_with_content(update_stream_with_headers(Headers, Stream, Role, State1), Fin) of
         {ok, Stream1} ->
             %% Apply RFC 9218 priority to underlying QUIC stream
             apply_stream_priority(StreamId, Stream1, State1),
@@ -3251,6 +3267,16 @@ process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State) ->
             %% Other header validation error - stream reset
             {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}}
     end.
+
+%% HEADERS that end the stream leave no room for the content a
+%% Content-Length promised.
+headers_with_content({ok, Stream}, true) ->
+    case content_complete(Stream) of
+        true -> {ok, Stream};
+        false -> {error, content_length_mismatch}
+    end;
+headers_with_content(Result, _Fin) ->
+    Result.
 
 %% RFC 9114 §4.1: the client may receive zero or more interim 1xx responses
 %% before a single final response. Interim responses leave the stream in

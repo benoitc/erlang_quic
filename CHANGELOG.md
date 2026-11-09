@@ -92,6 +92,10 @@ All notable changes to this project will be documented in this file.
   SETTINGS_QPACK_BLOCKED_STREAMS. They are now, and exceeding the limit
   closes the connection with QPACK_DECOMPRESSION_FAILED, for HEADERS as
   well as trailers (RFC 9204 Section 2.1.2).
+- A request or response with less content than its Content-Length was
+  accepted when the stream ended with a bare FIN, with trailers, or with
+  the HEADERS frame itself. All are now reset with H3_MESSAGE_ERROR (RFC
+  9114 Section 4.1.2).
 
 ## [2.6.1] - 2026-11-08
 
