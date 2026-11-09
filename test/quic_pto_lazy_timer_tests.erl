@@ -41,6 +41,20 @@ drained_flight_cancels_the_timer_test() ->
     ?assertEqual(idle, quic_connection:pto_due(S2)),
     erlang:cancel_timer(Ref).
 
+%% The timer reference is the timer itself, so cancelling it stops it.
+drained_flight_stops_the_timer_test() ->
+    S1 = quic_connection:set_pto_timer(state_with_flight()),
+    Ref = pto_timer(S1),
+    ?assert(is_integer(erlang:read_timer(Ref))),
+    S2 = quic_connection:set_pto_timer(drained(S1)),
+    ?assertEqual(undefined, pto_timer(S2)),
+    ?assertEqual(false, erlang:read_timer(Ref)).
+
+drained(S) ->
+    quic_connection_test_support:state_set(
+        S, loss_state, quic_loss:on_handshake_confirmed(quic_loss:new())
+    ).
+
 past_deadline_is_due_test() ->
     S1 = quic_connection:set_pto_timer(state_with_flight()),
     ?assertEqual(

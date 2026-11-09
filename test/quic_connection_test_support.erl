@@ -846,7 +846,7 @@ requeued_offsets(Where) ->
     {S2, 0} = quic_connection:send_stream_chunked_step(0, 0, <<0:8000>>, false, S1, 0, Ctx),
     %% The step arms a zero-delay continuation by messaging this process.
     receive
-        {pacing_timeout, _} -> ok
+        {timeout, _, pacing_timeout} -> ok
     after 0 -> ok
     end,
     queued_offsets(S2#state.send_queue).

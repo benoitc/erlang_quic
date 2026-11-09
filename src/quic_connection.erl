@@ -2202,7 +2202,9 @@ connected(info, {timeout, _StaleRef, send_delayed_ack}, State) ->
 %% Handle PMTU probe timeout (RFC 8899)
 %% Validates reference to ignore stale timer events
 connected(
-    info, {pmtu_probe_timeout, Ref}, #state{pmtu_probe_timer = Ref, pmtu_state = PMTUState} = State
+    info,
+    {timeout, Ref, pmtu_probe_timeout},
+    #state{pmtu_probe_timer = Ref, pmtu_state = PMTUState} = State
 ) when
     Ref =/= undefined
 ->
@@ -2214,13 +2216,15 @@ connected(
     %% Retry probing if needed
     State2 = maybe_send_pmtu_probe(State1),
     {keep_state, State2};
-connected(info, {pmtu_probe_timeout, _StaleRef}, State) ->
+connected(info, {timeout, _StaleRef, pmtu_probe_timeout}, State) ->
     %% Stale PMTU probe timer - ignore
     {keep_state, State};
 %% Handle PMTU raise timer (periodic re-probing)
 %% Validates reference to ignore stale timer events
 connected(
-    info, {pmtu_raise_timeout, Ref}, #state{pmtu_raise_timer = Ref, pmtu_state = PMTUState} = State
+    info,
+    {timeout, Ref, pmtu_raise_timeout},
+    #state{pmtu_raise_timer = Ref, pmtu_state = PMTUState} = State
 ) when
     Ref =/= undefined
 ->
@@ -2232,7 +2236,7 @@ connected(
     },
     State2 = maybe_send_pmtu_probe(State1),
     {keep_state, State2};
-connected(info, {pmtu_raise_timeout, _StaleRef}, State) ->
+connected(info, {timeout, _StaleRef, pmtu_raise_timeout}, State) ->
     %% Stale PMTU raise timer - ignore
     {keep_state, State};
 %% Handle stream deadline expiry
@@ -2426,7 +2430,9 @@ handle_common_event(cast, handle_timeout, StateName, State) when
 %% `idle' is included because the early handshake runs there: a probe
 %% for the Initial or Handshake space fires before the state machine has
 %% reached `handshaking', and dropping it wedges the handshake.
-handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref} = State) when
+handle_common_event(
+    info, {timeout, Ref, pto_timeout}, StateName, #state{pto_timer = Ref} = State
+) when
     Ref =/= undefined andalso
         (StateName =:= connected orelse StateName =:= handshaking orelse StateName =:= idle)
 ->
@@ -2448,7 +2454,7 @@ handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref}
             end
     end;
 handle_common_event(
-    info, {disconnect_check, Ref}, StateName, #state{disconnect_timer = Ref} = State
+    info, {timeout, Ref, disconnect_check}, StateName, #state{disconnect_timer = Ref} = State
 ) when
     Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
 ->
@@ -2460,7 +2466,10 @@ handle_common_event(
             {keep_state, arm_disconnect_timer(State1)}
     end;
 handle_common_event(
-    info, {disconnect_final, Ref}, StateName, #state{disconnect_timer = {final, Ref}} = State
+    info,
+    {timeout, Ref, disconnect_final},
+    StateName,
+    #state{disconnect_timer = {final, Ref}} = State
 ) when
     StateName =:= connected orelse StateName =:= handshaking
 ->
@@ -2469,30 +2478,34 @@ handle_common_event(
         true -> {next_state, draining, declare_peer_dead(State1)};
         false -> {keep_state, arm_disconnect_timer(State1)}
     end;
-handle_common_event(info, {disconnect_final, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, disconnect_final}, _StateName, State) ->
     {keep_state, State};
-handle_common_event(info, {credit_retry, Ref}, StateName, #state{credit_timer = Ref} = State) ->
+handle_common_event(
+    info, {timeout, Ref, credit_retry}, StateName, #state{credit_timer = Ref} = State
+) ->
     State1 = State#state{credit_timer = undefined},
     case StateName of
         connected -> {keep_state, flush_after_grant(connected, release_withheld_credit(State1))};
         _ -> {keep_state, State1}
     end;
-handle_common_event(info, {credit_retry, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, credit_retry}, _StateName, State) ->
     {keep_state, State};
-handle_common_event(info, {disconnect_check, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, disconnect_check}, _StateName, State) ->
     %% Stale disconnect timer (ref doesn't match or wrong state)
     {keep_state, State};
-handle_common_event(info, {pto_timeout, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, pto_timeout}, _StateName, State) ->
     %% Ignore stale PTO timer (ref doesn't match or wrong state)
     {keep_state, State};
-handle_common_event(info, {pacing_timeout, Ref}, StateName, #state{pacing_timer = Ref} = State) when
+handle_common_event(
+    info, {timeout, Ref, pacing_timeout}, StateName, #state{pacing_timer = Ref} = State
+) when
     Ref =/= undefined andalso
         (StateName =:= connected orelse StateName =:= handshaking orelse StateName =:= idle)
 ->
     %% Handle pacing timeout - process send queue
     NewState = handle_pacing_timeout(State#state{pacing_timer = undefined}),
     {keep_state, NewState};
-handle_common_event(info, {pacing_timeout, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, pacing_timeout}, _StateName, State) ->
     %% Ignore stale pacing timer (ref doesn't match or wrong state)
     {keep_state, State};
 %% RFC 9000 Section 10.1: a handshake still running at its deadline is closed, silently if idle.
@@ -2506,7 +2519,9 @@ handle_common_event({timeout, handshake_deadline}, expired, StateName, State) wh
         end,
     emit_qlog_state_change(StateName, draining, State),
     {next_state, draining, flush_event(initiate_close(Reason, State), event)};
-handle_common_event(info, {idle_timeout, Ref}, StateName, #state{idle_timer = Ref} = State) when
+handle_common_event(
+    info, {timeout, Ref, idle_timeout}, StateName, #state{idle_timer = Ref} = State
+) when
     Ref =/= undefined andalso StateName =/= draining andalso StateName =/= closed
 ->
     case idle_expired(State) of
@@ -2518,11 +2533,11 @@ handle_common_event(info, {idle_timeout, Ref}, StateName, #state{idle_timer = Re
             %% Spurious timeout (activity occurred) - reset timer
             {keep_state, set_idle_timer(State#state{idle_timer = undefined})}
     end;
-handle_common_event(info, {idle_timeout, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, idle_timeout}, _StateName, State) ->
     %% Ignore stale idle timer (ref doesn't match or wrong state)
     {keep_state, State};
 handle_common_event(
-    info, {keep_alive_timeout, Ref}, connected, #state{keep_alive_timer = Ref} = State
+    info, {timeout, Ref, keep_alive_timeout}, connected, #state{keep_alive_timer = Ref} = State
 ) when
     Ref =/= undefined
 ->
@@ -2550,7 +2565,7 @@ handle_common_event(
             {keep_state,
                 arm_keep_alive_timer(State2, (State2#state.cfg)#conn_cfg.keep_alive_interval)}
     end;
-handle_common_event(info, {keep_alive_timeout, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, keep_alive_timeout}, _StateName, State) ->
     %% Ignore stale keep-alive timer (ref doesn't match or wrong state)
     {keep_state, State};
 %% Handle socket going passive ({active, N} exhausted)
@@ -9477,8 +9492,7 @@ credit_allowed(#state{credit_timer = Ref} = State) when Ref =/= undefined ->
 credit_allowed(State) ->
     case owner_behind(State) of
         true ->
-            Ref = make_ref(),
-            erlang:send_after(?CREDIT_RETRY_MS, self(), {credit_retry, Ref}),
+            Ref = erlang:start_timer(?CREDIT_RETRY_MS, self(), credit_retry),
             {false, State#state{credit_timer = Ref}};
         false ->
             {true, State}
@@ -14139,8 +14153,7 @@ arm_pto_timer(Delay, State) ->
     State#state{pto_timer = Ref, pto_armed_at = ArmedAt}.
 
 start_pto_timer(Delay) ->
-    Ref = make_ref(),
-    erlang:send_after(Delay, self(), {pto_timeout, Ref}),
+    Ref = erlang:start_timer(Delay, self(), pto_timeout),
     {Ref, erlang:monotonic_time(millisecond) + Delay}.
 
 %% What a firing PTO timer should do: nothing (flight drained since it
@@ -14156,7 +14169,7 @@ pto_due(#state{pto_scheduled_at = Deadline}) ->
 
 %% Helper to cancel a timer reference
 cancel_timer(undefined) -> ok;
-cancel_timer(Ref) -> erlang:cancel_timer(Ref).
+cancel_timer(Ref) -> erlang:cancel_timer(Ref, [{async, true}, {info, false}]).
 
 %% Handle pacing timeout - drain queued data
 %% Note: pacing_timer is already set to undefined by the handler before calling this
@@ -14229,8 +14242,7 @@ set_idle_timer(Timeout, #state{idle_timer = OldTimer, last_activity = LastActivi
     %% re-arm is the remaining time, not a fresh full timeout.
     Now = erlang:monotonic_time(millisecond),
     Delay = max(0, (LastActivity + Timeout) - Now),
-    Ref = make_ref(),
-    erlang:send_after(Delay, self(), {idle_timeout, Ref}),
+    Ref = erlang:start_timer(Delay, self(), idle_timeout),
     State#state{idle_timer = Ref}.
 
 %% RFC 9000 Section 10.1: the smaller of the two advertised timeouts, 0
@@ -14316,9 +14328,8 @@ disconnect_timeout_expired(#state{loss_state = LossState, cfg = #conn_cfg{discon
 %% (a new NAT mapping, a link rejoining) is often slower than the RTT says.
 disconnect_deadline(#state{loss_state = LossState} = State) ->
     State1 = flush_event(send_probe_packet(app, State), event),
-    Ref = make_ref(),
     Grace = max(quic_loss:base_pto(LossState), ?DISCONNECT_GRACE_MS),
-    erlang:send_after(Grace, self(), {disconnect_final, Ref}),
+    Ref = erlang:start_timer(Grace, self(), disconnect_final),
     {keep_state, State1#state{disconnect_timer = {final, Ref}}}.
 
 %% The disconnect timeout elapsed with ack-eliciting data in flight and
@@ -14364,8 +14375,7 @@ arm_disconnect_timer(
                 end
         end,
     State1 = cancel_disconnect_timer(State),
-    Ref = make_ref(),
-    erlang:send_after(Delay, self(), {disconnect_check, Ref}),
+    Ref = erlang:start_timer(Delay, self(), disconnect_check),
     State1#state{disconnect_timer = Ref}.
 
 %% Disconnect-timeout option: how long ack-eliciting data may stay in
@@ -14426,8 +14436,7 @@ arm_keep_alive_timer(#state{cfg = #conn_cfg{keep_alive_interval = disabled}} = S
     State#state{keep_alive_timer = undefined};
 arm_keep_alive_timer(#state{keep_alive_timer = OldTimer} = State, Delay) ->
     cancel_timer(OldTimer),
-    Ref = make_ref(),
-    erlang:send_after(Delay, self(), {keep_alive_timeout, Ref}),
+    Ref = erlang:start_timer(Delay, self(), keep_alive_timeout),
     State#state{keep_alive_timer = Ref}.
 
 %%====================================================================
@@ -14446,8 +14455,7 @@ maybe_set_pacing_timer(_Delay, #state{pacing_timer = Ref} = State) when Ref =/= 
 maybe_set_pacing_timer(Delay, #state{pacing_timer = undefined} = State) ->
     %% Set new pacing timer
     ?LOG_DEBUG(#{what => pacing_timer_set, delay_ms => Delay}, ?QUIC_LOG_META),
-    Ref = make_ref(),
-    erlang:send_after(Delay, self(), {pacing_timeout, Ref}),
+    Ref = erlang:start_timer(Delay, self(), pacing_timeout),
     State#state{pacing_timer = Ref}.
 
 %% Burst budget: bounds packets emitted per drain (see burst_budget).
@@ -14465,7 +14473,7 @@ arm_burst_continuation(#state{pacing_timer = Ref} = State) when Ref =/= undefine
     State;
 arm_burst_continuation(State) ->
     Ref = make_ref(),
-    self() ! {pacing_timeout, Ref},
+    self() ! {timeout, Ref, pacing_timeout},
     State#state{pacing_timer = Ref}.
 
 %% Convert state to map for debugging
@@ -16941,17 +16949,15 @@ set_pmtu_probe_timer(#state{pmtu_probe_timer = OldTimer, loss_state = LossState}
                 SRTT = quic_rtt:smoothed(quic_loss:rtt(LossState)),
                 max(1000, 5 * SRTT)
         end,
-    Ref = make_ref(),
-    erlang:send_after(Timeout, self(), {pmtu_probe_timeout, Ref}),
+    Ref = erlang:start_timer(Timeout, self(), pmtu_probe_timeout),
     State#state{pmtu_probe_timer = Ref}.
 
 %% @doc Set the PMTU raise timer for periodic re-probing.
 %% Uses unique reference in message to detect stale timer events
 -spec maybe_set_pmtu_raise_timer(#state{}) -> #state{}.
 maybe_set_pmtu_raise_timer(#state{pmtu_raise_timer = undefined} = State) ->
-    Ref = make_ref(),
-    erlang:send_after(
-        (State#state.cfg)#conn_cfg.pmtu_raise_interval, self(), {pmtu_raise_timeout, Ref}
+    Ref = erlang:start_timer(
+        (State#state.cfg)#conn_cfg.pmtu_raise_interval, self(), pmtu_raise_timeout
     ),
     State#state{pmtu_raise_timer = Ref};
 maybe_set_pmtu_raise_timer(State) ->

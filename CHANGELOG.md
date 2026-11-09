@@ -758,6 +758,10 @@ All notable changes to this project will be documented in this file.
   now closes the connection with STREAM_STATE_ERROR, the owner hears of
   the reset once, and no stream data is delivered after the peer's
   RESET_STREAM (draft-ietf-quic-reliable-stream-reset-11 Section 5.2).
+- No timer of a connection was ever cancelled: the PTO, idle,
+  keep-alive, pacing, disconnect and PMTU timers were "cancelled"
+  through a reference that was not the timer, so each ran to its end and
+  woke the connection for nothing. They are now stopped when cancelled.
 
 ## [2.6.1] - 2026-11-08
 
