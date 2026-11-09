@@ -417,7 +417,7 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts, Preferred
     ALPNList = maps:get(alpn, Opts, [<<"h3">>]),
     ConnHandler = maps:get(connection_handler, Opts, undefined),
 
-    {ConnTab, TicketTab, OwnsTables} = get_tables(Opts),
+    {ConnTab, TicketTab, IndexOpts, OwnsTables} = get_tables(Opts),
 
     %% Get actual port and bound address
     ActualPort = get_socket_port(Socket, SocketState, Backend),
@@ -450,7 +450,7 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts, Preferred
             alpn_list = ALPNList
         },
         connections = ConnTab,
-        cid_index = ets:new(quic_cid_index, [bag, private]),
+        cid_index = ets:new(quic_cid_index, [bag, private | IndexOpts]),
         tickets_table = TicketTab,
         owns_tables = OwnsTables,
         reset_secret = ResetSecret,
@@ -887,6 +887,7 @@ recv_drops() ->
 %% @doc false
 terminate(_Reason, #listener_state{
     connections = ConnTab,
+    cid_index = Index,
     tickets_table = TicketTab,
     owns_tables = OwnsTables,
     socket_state = SocketState,
@@ -907,7 +908,7 @@ terminate(_Reason, #listener_state{
             safe_delete_table(ConnTab),
             safe_delete_table(TicketTab);
         false ->
-            ok
+            quic_listener_manager:delete_routes(Index, ConnTab)
     end,
     ok;
 terminate(_Reason, _) ->
@@ -1036,20 +1037,22 @@ cleanup_connection(Pid, #listener_state{connections = Conns, cid_index = Index})
 %% Use provided ETS table or create new one for connection tracking
 %% When using pool mode, the supervisor is in the options, query it for the
 %% table manager and get the table from it.
-%% Returns {ConnTab, TicketTab, OwnsTable} where OwnsTable indicates if
-%% this listener should delete the tables on terminate.
+%% Returns {ConnTab, TicketTab, IndexOpts, OwnsTable} where OwnsTable
+%% indicates if this listener should delete the tables on terminate.
+%% In pool mode the manager inherits the listener's CID index, so it can
+%% remove the listener's routes when the listener is killed.
 get_tables(#{supervisor := SupPid}) ->
     Children = supervisor:which_children(SupPid),
     {quic_listener_manager, ManagerPid, _, _} = lists:keyfind(quic_listener_manager, 1, Children),
     {ok, {ConnTab, TicketTab}} = quic_listener_manager:get_tables(ManagerPid),
     % Pool mode - don't own tables
-    {ConnTab, TicketTab, false};
+    {ConnTab, TicketTab, [quic_listener_manager:cid_index_heir(ManagerPid)], false};
 get_tables(_) ->
     ConnTab = ets:new(quic_connections, [set, protected]),
     %% Public: the connections store the tickets they issue here.
     TicketTab = ets:new(quic_tickets, [set, public]),
     % Standalone mode - own tables
-    {ConnTab, TicketTab, true}.
+    {ConnTab, TicketTab, [], true}.
 
 handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) ->
     case parse_packet_header(Packet, DCIDLen) of

@@ -41,6 +41,11 @@ All notable changes to this project will be documented in this file.
   nothing served it. The connection is now stopped before it sees a
   packet, and the handler examples in the guides return `{ok, Pid}` as
   the listener requires.
+- In a server pool, a listener that stopped or crashed left its
+  connections' IDs in the shared routing table. Packets for them went to
+  dead processes instead of drawing a stateless reset (RFC 9000 Section
+  10.3), and the rows counted against `max_connections` until the server
+  restarted. They are now removed.
 
 ## [2.6.1] - 2026-11-08
 
