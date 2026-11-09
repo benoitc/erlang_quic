@@ -1786,6 +1786,21 @@ connect_tunnel_send_trailers_rejected_test() ->
     Result = quic_h3_connection:do_send_trailers(0, [{<<"foo">>, <<"bar">>}], State),
     ?assertMatch({error, connect_tunnel}, Result).
 
+%% Trailers for a stream that is gone, or that was cancelled and is only
+%% kept to drop what the peer still sends, are refused like any other
+%% write. The call used to crash the connection process.
+send_trailers_on_an_unknown_stream_is_refused_test() ->
+    State0 = make_test_state(#{role => server}),
+    ?assertEqual(
+        {error, unknown_stream},
+        quic_h3_connection:do_send_trailers(0, [{<<"foo">>, <<"bar">>}], State0)
+    ),
+    State1 = cancelled_upload(fake_quic_conn()),
+    ?assertEqual(
+        {error, unknown_stream},
+        quic_h3_connection:do_send_trailers(0, [{<<"foo">>, <<"bar">>}], State1)
+    ).
+
 %%====================================================================
 %% QPACK encoder state across a refused HEADERS write
 %%====================================================================

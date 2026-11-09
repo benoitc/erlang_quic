@@ -4251,7 +4251,7 @@ do_send_trailers(
         {error, Reason} ->
             {error, Reason};
         ok ->
-            case maps:find(StreamId, Streams) of
+            case live_stream(StreamId, Streams) of
                 {ok, #h3_stream{is_connect = true}} ->
                     %% RFC 9114 §4.4: no trailers on CONNECT tunnel streams
                     {error, connect_tunnel};
@@ -4262,7 +4262,9 @@ do_send_trailers(
                     State1 = State#state{qpack_encoder = Encoder1},
                     send_trailers_frame(
                         send_encoder_instructions(State1), StreamId, Trailers, Encoded, Stream
-                    )
+                    );
+                error ->
+                    {error, unknown_stream}
             end
     end.
 

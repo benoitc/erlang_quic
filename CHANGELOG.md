@@ -110,6 +110,8 @@ All notable changes to this project will be documented in this file.
   read as the start of a new unidirectional stream and could close the
   connection. The stream is now ignored, and a push the client cancelled
   is stopped with H3_REQUEST_CANCELLED (RFC 9114 Section 7.2.3).
+- `send_trailers/3` on a stream that had finished or been reset crashed
+  the HTTP/3 connection process. It returns `{error, unknown_stream}`.
 
 ## [2.6.1] - 2026-11-08
 
