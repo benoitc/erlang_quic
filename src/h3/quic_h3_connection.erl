@@ -1586,11 +1586,25 @@ handle_stream_data(StreamId, Data, Fin, #state{held_streams = Held} = State) whe
     hold_stream_data(StreamId, Data, Fin, State);
 handle_stream_data(StreamId, Data, true, State) when (StreamId band 2) =/= 0 ->
     case dispatch_stream_data(StreamId, Data, true, State) of
-        {ok, State1} -> {ok, forget_uni_stream(StreamId, State1)};
+        {ok, State1} -> end_uni_stream(StreamId, State1);
+        {transition, _Next, State1} -> end_uni_stream(StreamId, State1);
         Other -> Other
     end;
 handle_stream_data(StreamId, Data, Fin, State) ->
     dispatch_stream_data(StreamId, Data, Fin, State).
+
+%% RFC 9114 Section 6.2.1, RFC 9204 Section 4.2: the control and QPACK
+%% streams are never closed, by a FIN no more than by a reset.
+end_uni_stream(StreamId, State) ->
+    case is_critical_stream(StreamId, State) of
+        {true, Type} ->
+            {error,
+                {connection_error, ?H3_CLOSED_CRITICAL_STREAM,
+                    iolist_to_binary(io_lib:format("~p stream closed", [Type]))},
+                State};
+        false ->
+            {ok, forget_uni_stream(StreamId, State)}
+    end.
 
 %% A unidirectional stream the peer has ended: nothing else arrives on it,
 %% and no reset will come to clear what was kept to route its bytes.
