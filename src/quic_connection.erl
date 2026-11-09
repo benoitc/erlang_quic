@@ -235,6 +235,9 @@
 
 -include("quic_connection_state.hrl").
 
+%% What a QUIC variable-length integer can carry (RFC 9000 Section 16).
+-define(IS_VARINT(N), (is_integer(N) andalso N >= 0 andalso N =< 16#3FFFFFFFFFFFFFFF)).
+
 %%====================================================================
 %% API
 %%====================================================================
@@ -302,25 +305,46 @@ statem_opts(Opts) ->
 -spec send_data(pid(), non_neg_integer(), iodata(), boolean()) ->
     ok | {error, term()}.
 send_data(Conn, StreamId, Data, Fin) ->
-    call(Conn, {send_data, StreamId, Data, Fin}).
+    send_data(Conn, StreamId, Data, Fin, infinity).
 
 %% @doc Like send_data/4, giving up with `{error, timeout}' after Timeout.
 -spec send_data(pid(), non_neg_integer(), iodata(), boolean(), timeout()) ->
     ok | {error, term()}.
 send_data(Conn, StreamId, Data, Fin, Timeout) ->
-    try
-        call(Conn, {send_data, StreamId, Data, Fin}, Timeout)
-    catch
-        exit:{timeout, _} -> {error, timeout}
+    case is_boolean(Fin) andalso is_iodata(Data) of
+        true ->
+            try
+                call(Conn, {send_data, StreamId, Data, Fin}, Timeout)
+            catch
+                exit:{timeout, _} -> {error, timeout}
+            end;
+        false ->
+            {error, badarg}
     end.
+
+%% Bad arguments are refused here, in the caller: once in the connection
+%% process they would take it down, with every stream on it.
+is_iodata(Data) when is_binary(Data) ->
+    true;
+is_iodata(Data) when is_list(Data) ->
+    try iolist_size(Data) of
+        _ -> true
+    catch
+        error:badarg -> false
+    end;
+is_iodata(_Data) ->
+    false.
 
 %% @doc Send data on a stream asynchronously.
 %% This is faster than send_data/4 because it uses cast instead of call,
 %% avoiding the round-trip latency. However, errors are silently dropped.
 %% Use this for high-throughput scenarios where occasional dropped data is acceptable.
--spec send_data_async(pid(), non_neg_integer(), iodata(), boolean()) -> ok.
+-spec send_data_async(pid(), non_neg_integer(), iodata(), boolean()) -> ok | {error, badarg}.
 send_data_async(Conn, StreamId, Data, Fin) ->
-    gen_statem:cast(Conn, {send_data_async, StreamId, Data, Fin}).
+    case is_boolean(Fin) andalso is_iodata(Data) of
+        true -> gen_statem:cast(Conn, {send_data_async, StreamId, Data, Fin});
+        false -> {error, badarg}
+    end.
 
 %% @private Receive credit for a stream: `auto' grants it as data is
 %% delivered, `{manual, Consumed}' only as the reader returns it through
@@ -375,22 +399,28 @@ close(Conn, Reason) ->
 %% @doc Close a specific stream.
 -spec close_stream(pid(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
-close_stream(Conn, StreamId, ErrorCode) ->
-    call(Conn, {close_stream, StreamId, ErrorCode}).
+close_stream(Conn, StreamId, ErrorCode) when ?IS_VARINT(ErrorCode) ->
+    call(Conn, {close_stream, StreamId, ErrorCode});
+close_stream(_Conn, _StreamId, _ErrorCode) ->
+    {error, badarg}.
 
 %% @doc Reset a stream.
 -spec reset_stream(pid(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
 reset_stream(Conn, StreamId, ErrorCode) ->
-    call(Conn, {close_stream, StreamId, ErrorCode}).
+    close_stream(Conn, StreamId, ErrorCode).
 
 %% @doc Reset a stream with reliable delivery up to ReliableSize.
 %% Data up to ReliableSize will be delivered before the reset takes effect.
 %% Requires peer support via the reset_stream_at transport parameter.
 -spec reset_stream_at(pid(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
-reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) ->
-    call(Conn, {reset_stream_at, StreamId, ErrorCode, ReliableSize}).
+reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) when
+    ?IS_VARINT(ErrorCode), ?IS_VARINT(ReliableSize)
+->
+    call(Conn, {reset_stream_at, StreamId, ErrorCode, ReliableSize});
+reset_stream_at(_Conn, _StreamId, _ErrorCode, _ReliableSize) ->
+    {error, badarg}.
 
 %% @doc See quic:set_stream_reliable_size/3.
 -spec set_stream_reliable_size(pid(), non_neg_integer(), non_neg_integer()) ->
@@ -402,8 +432,10 @@ set_stream_reliable_size(Conn, StreamId, Size) ->
 %% Sends a STOP_SENDING frame (RFC 9000 Section 19.5).
 -spec stop_sending(pid(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
-stop_sending(Conn, StreamId, ErrorCode) ->
-    call(Conn, {stop_sending, StreamId, ErrorCode}).
+stop_sending(Conn, StreamId, ErrorCode) when ?IS_VARINT(ErrorCode) ->
+    call(Conn, {stop_sending, StreamId, ErrorCode});
+stop_sending(_Conn, _StreamId, _ErrorCode) ->
+    {error, badarg}.
 
 %% @doc Handle a timeout event.
 -spec handle_timeout(pid()) -> ok.
@@ -444,17 +476,21 @@ peercert(Conn) ->
     call(Conn, peercert).
 
 %% @doc Set new owner process (async).
--spec set_owner(pid(), pid()) -> ok.
-set_owner(Conn, NewOwner) ->
-    gen_statem:cast(Conn, {set_owner, NewOwner}).
+-spec set_owner(pid(), pid()) -> ok | {error, badarg}.
+set_owner(Conn, NewOwner) when is_pid(NewOwner) ->
+    gen_statem:cast(Conn, {set_owner, NewOwner});
+set_owner(_Conn, _NewOwner) ->
+    {error, badarg}.
 
 %% @doc Set new owner process (synchronous).
 %% Use this when you need to ensure ownership is transferred before continuing.
 %% A connection that is already draining or closed refuses the swap with
 %% `{error, {invalid_state, StateName}}'.
 -spec set_owner_sync(pid(), pid()) -> ok | {error, term()}.
-set_owner_sync(Conn, NewOwner) ->
-    call(Conn, {set_owner, NewOwner}).
+set_owner_sync(Conn, NewOwner) when is_pid(NewOwner) ->
+    call(Conn, {set_owner, NewOwner});
+set_owner_sync(_Conn, _NewOwner) ->
+    {error, badarg}.
 
 %% @doc Send a datagram.
 -spec send_datagram(pid(), iodata()) -> ok | {error, term()}.
@@ -12078,9 +12114,27 @@ do_set_congestion_control(_Algorithm, _State) ->
     {error, invalid_algorithm}.
 
 %% Set stream deadline
-do_set_stream_deadline(StreamId, TimeoutMs, Opts, #state{streams = Streams} = State) when
+do_set_stream_deadline(StreamId, TimeoutMs, Opts, State) when
+    is_integer(TimeoutMs), TimeoutMs > 0, is_map(Opts)
+->
+    Action = maps:get(action, Opts, both),
+    ErrorCode = maps:get(error_code, Opts, ?QUIC_STREAM_DEADLINE_EXCEEDED),
+    case lists:member(Action, [reset, notify, both]) of
+        true when ?IS_VARINT(ErrorCode) ->
+            arm_stream_deadline(StreamId, TimeoutMs, Action, ErrorCode, State);
+        true ->
+            {error, invalid_error_code};
+        false ->
+            {error, invalid_action}
+    end;
+do_set_stream_deadline(_StreamId, TimeoutMs, _Opts, _State) when
     is_integer(TimeoutMs), TimeoutMs > 0
 ->
+    {error, badarg};
+do_set_stream_deadline(_StreamId, _TimeoutMs, _Opts, _State) ->
+    {error, invalid_timeout}.
+
+arm_stream_deadline(StreamId, TimeoutMs, Action, ErrorCode, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, StreamState} ->
             %% Cancel existing deadline timer if any
@@ -12091,9 +12145,6 @@ do_set_stream_deadline(StreamId, TimeoutMs, Opts, #state{streams = Streams} = St
             %% Calculate absolute deadline
             Now = erlang:system_time(millisecond),
             Deadline = Now + TimeoutMs,
-            %% Parse options
-            Action = maps:get(action, Opts, both),
-            ErrorCode = maps:get(error_code, Opts, ?QUIC_STREAM_DEADLINE_EXCEEDED),
             %% Start new timer
             TimerRef = erlang:send_after(TimeoutMs, self(), {stream_deadline, StreamId}),
             NewStreamState = StreamState#stream_state{
@@ -12107,9 +12158,7 @@ do_set_stream_deadline(StreamId, TimeoutMs, Opts, #state{streams = Streams} = St
             }};
         error ->
             {error, unknown_stream}
-    end;
-do_set_stream_deadline(_StreamId, _TimeoutMs, _Opts, _State) ->
-    {error, invalid_timeout}.
+    end.
 
 %% Cancel stream deadline
 do_cancel_stream_deadline(StreamId, #state{streams = Streams} = State) ->

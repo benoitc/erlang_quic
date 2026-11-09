@@ -13,6 +13,10 @@ All notable changes to this project will be documented in this file.
   exits.
 - API calls on a connection whose process has already stopped return
   `{error, closed}` instead of exiting with `noproc`.
+- Bad arguments to `send_data`, `send_data_async`, `reset_stream`,
+  `reset_stream_at`, `stop_sending`, `set_stream_deadline` and
+  `set_owner` are refused with an error instead of crashing the
+  connection and its owner.
 
 ## [2.6.1] - 2026-11-08
 
