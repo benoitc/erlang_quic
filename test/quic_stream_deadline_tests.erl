@@ -12,6 +12,8 @@
 
 -include_lib("eunit/include/eunit.hrl").
 -include("quic.hrl").
+-include_lib("quic/include/quic_qlog.hrl").
+-include_lib("quic/src/quic_connection_state.hrl").
 
 %%====================================================================
 %% Test Generators
@@ -383,4 +385,55 @@ timer_message_delivered() ->
             ?assertEqual(StreamId, RecvId)
     after 2000 ->
         ?assert(false)
+    end.
+
+%%====================================================================
+%% A timer that fired before its deadline was cancelled or replaced
+%%====================================================================
+
+%% A stream id no other test in this module sends timer messages for.
+-define(LATE_STREAM, 28).
+
+%% The expiry is already in the mailbox when the deadline is cancelled:
+%% it must not act on the stream.
+expiry_after_cancel_is_ignored_test() ->
+    {Expiry, S1} = armed_and_fired(),
+    {ok, S2} = quic_connection:do_cancel_stream_deadline(?LATE_STREAM, S1),
+    ?assertEqual({keep_state, S2}, quic_connection:connected(info, Expiry, S2)),
+    ?assertEqual([], deadline_events()).
+
+%% Nor may it end a deadline that was set again in the meantime.
+expiry_after_rearm_is_ignored_test() ->
+    {Expiry, S1} = armed_and_fired(),
+    {ok, S2} = quic_connection:do_set_stream_deadline(?LATE_STREAM, 60000, #{action => notify}, S1),
+    ?assertEqual({keep_state, S2}, quic_connection:connected(info, Expiry, S2)),
+    ?assertEqual([], deadline_events()),
+    {ok, _} = quic_connection:do_cancel_stream_deadline(?LATE_STREAM, S2).
+
+%% Fence: the expiry of the deadline in force does act.
+expiry_of_current_deadline_notifies_test() ->
+    {Expiry, S1} = armed_and_fired(),
+    {keep_state, S2} = quic_connection:connected(info, Expiry, S1),
+    ?assertEqual([?LATE_STREAM], deadline_events()),
+    ?assertEqual({error, no_deadline}, quic_connection:do_get_stream_deadline(?LATE_STREAM, S2)).
+
+%% A stream with a 1 ms deadline, and the expiry message its timer sent.
+armed_and_fired() ->
+    _ = deadline_events(),
+    S0 = (quic_connection_test_support:state_with_send_stream(?LATE_STREAM, 0, false))#state{
+        owner = self()
+    },
+    {ok, S1} = quic_connection:do_set_stream_deadline(?LATE_STREAM, 1, #{action => notify}, S0),
+    %% With or without a timer reference, so that a message without one is
+    %% handed to the connection rather than waited for.
+    receive
+        {timeout, _, {stream_deadline, ?LATE_STREAM}} = Expiry -> {Expiry, S1};
+        {stream_deadline, ?LATE_STREAM} = Expiry -> {Expiry, S1}
+    after 5000 -> error(timer_did_not_fire)
+    end.
+
+deadline_events() ->
+    receive
+        {quic, _, {stream_deadline, StreamId}} -> [StreamId | deadline_events()]
+    after 0 -> []
     end.
