@@ -3703,12 +3703,16 @@ cancelled_upload(Quic) ->
     State2.
 
 request_frame(Method, Path) ->
+    request_frame(Method, Path, []).
+
+request_frame(Method, Path, Fields) ->
     quic_h3_frame:encode_headers(
         quic_qpack:encode([
             {<<":method">>, Method},
             {<<":scheme">>, <<"https">>},
             {<<":authority">>, <<"example.com">>},
             {<<":path">>, Path}
+            | Fields
         ])
     ).
 
@@ -3991,4 +3995,86 @@ upload_with_trailers() ->
         (request_frame(<<"POST">>, <<"/upload">>))/binary,
         (quic_h3_frame:encode_data(<<"abc">>))/binary,
         (quic_h3_frame:encode_headers(<<2, 0, 16#80>>))/binary
+    >>.
+
+%%====================================================================
+%% Content-Length when the message ends short (RFC 9114 §4.1.2)
+%%====================================================================
+
+%% Three of the ten bytes, then the stream ends with no more DATA.
+short_body_ended_by_a_bare_fin_is_malformed_test() ->
+    {Quic, State1} = short_upload(),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<>>, true, State1),
+    ?assertEqual({stream_reset, 0, ?H3_MESSAGE_ERROR}, next_owner_event()),
+    ?assert(lists:member({close_stream, 0, ?H3_MESSAGE_ERROR}, fake_quic_calls(Quic))),
+    ?assertEqual(#{}, quic_h3_connection:test_stream_data_buffers(State2)).
+
+%% The same body ended by trailers.
+short_body_ended_by_trailers_is_malformed_test() ->
+    {Quic, State1} = short_upload(),
+    Trailers = quic_h3_frame:encode_headers(quic_qpack:encode([{<<"x-sum">>, <<"1">>}])),
+    {ok, _} = quic_h3_connection:handle_stream_data(0, Trailers, true, State1),
+    ?assertEqual({stream_reset, 0, ?H3_MESSAGE_ERROR}, next_owner_event()),
+    ?assert(lists:member({close_stream, 0, ?H3_MESSAGE_ERROR}, fake_quic_calls(Quic))).
+
+%% No DATA at all: the request is not handed to the application.
+content_length_without_a_body_is_malformed_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    Request = request_frame(<<"POST">>, <<"/upload">>, [{<<"content-length">>, <<"10">>}]),
+    {ok, _} = quic_h3_connection:handle_stream_data(0, Request, true, State0),
+    ?assertEqual({stream_reset, 0, ?H3_MESSAGE_ERROR}, next_owner_event()),
+    ?assert(lists:member({close_stream, 0, ?H3_MESSAGE_ERROR}, fake_quic_calls(Quic))).
+
+%% A body of the stated length ends any of the three ways.
+full_body_is_accepted_however_it_ends_test() ->
+    Trailers = quic_h3_frame:encode_headers(quic_qpack:encode([{<<"x-sum">>, <<"1">>}])),
+    lists:foreach(
+        fun({Request, End}) ->
+            flush_owner_events(),
+            Quic = fake_quic_conn(),
+            State0 = make_test_state(#{role => server, quic_conn => Quic}),
+            {ok, State1} = quic_h3_connection:handle_stream_data(0, Request, false, State0),
+            {ok, _} = quic_h3_connection:handle_stream_data(0, End, true, State1),
+            ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic)))
+        end,
+        [
+            {upload_start(<<"3">>), <<>>},
+            {upload_start(<<"3">>), Trailers},
+            {request_frame(<<"POST">>, <<"/upload">>, [{<<"content-length">>, <<"0">>}]), <<>>}
+        ]
+    ),
+    flush_owner_events().
+
+%% A response to HEAD states the length a GET would have had (RFC 9110
+%% Section 8.6), so HEADERS that end the stream are complete.
+head_response_ending_at_headers_is_not_a_mismatch_test() ->
+    flush_owner_events(),
+    Stream = #h3_stream{
+        id = 0, type = request, state = half_closed_local, method = <<"HEAD">>
+    },
+    State0 = make_test_state(#{role => client, streams => #{0 => Stream}}),
+    Response = quic_h3_frame:encode_headers(
+        quic_qpack:encode([{<<":status">>, <<"200">>}, {<<"content-length">>, <<"10">>}])
+    ),
+    {ok, _} = quic_h3_connection:handle_stream_data(0, Response, true, State0),
+    ?assertMatch({response, 0, 200, _}, next_owner_event()),
+    flush_owner_events().
+
+%% A server that has read a POST announcing ten bytes and three of them.
+short_upload() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        0, upload_start(<<"10">>), false, State0
+    ),
+    {request, 0, <<"POST">>, <<"/upload">>, _} = next_owner_event(),
+    {Quic, State1}.
+
+upload_start(ContentLength) ->
+    <<
+        (request_frame(<<"POST">>, <<"/upload">>, [{<<"content-length">>, ContentLength}]))/binary,
+        (quic_h3_frame:encode_data(<<"abc">>))/binary
     >>.
