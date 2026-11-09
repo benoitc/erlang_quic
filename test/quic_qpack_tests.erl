@@ -740,3 +740,58 @@ indexed_static_entry_without_value_test() ->
 static_entry_two_is_age_test() ->
     ?assertEqual({ok, [{<<"age">>, <<"0">>}]}, quic_qpack:decode(<<0, 0, 16#C2>>)),
     ?assertEqual(<<0, 0, 16#C2>>, quic_qpack:encode([{<<"age">>, <<"0">>}])).
+
+%%====================================================================
+%% Outstanding field sections (RFC 9204 §4.4.1)
+%%====================================================================
+
+%% A section with Required Insert Count 0 is never acknowledged, so
+%% encoding one with a stream ID leaves nothing behind for that stream.
+static_section_is_not_tracked_test() ->
+    H = [{<<":status">>, <<"200">>}],
+    E = quic_qpack:new(#{max_dynamic_size => 4096}),
+    ?assertEqual(quic_qpack:encode(H, E), quic_qpack:encode(H, 4, E)).
+
+%% One that references the dynamic table is, until it is acknowledged.
+dynamic_section_is_tracked_until_acked_test() ->
+    H = [{<<"x-custom">>, <<"value">>}],
+    E = encoder_with_acked_entry(H),
+    {Ref, Untracked} = quic_qpack:encode(H, E),
+    {Ref, Tracked} = quic_qpack:encode(H, 4, E),
+    ?assertEqual(1, quic_qpack:get_last_ric(Tracked)),
+    ?assertNotEqual(Untracked, Tracked),
+    ?assertEqual(
+        {ok, Untracked},
+        quic_qpack:process_decoder_instructions(quic_qpack:encode_section_ack(4), Tracked)
+    ).
+
+%% The acknowledgment is for the dynamic section even when a static one
+%% went out on the stream before it.
+section_ack_skips_static_sections_test() ->
+    H = [{<<"x-custom">>, <<"value">>}],
+    E0 = encoder_with_acked_entry(H),
+    {_, E1} = quic_qpack:encode([{<<":status">>, <<"103">>}], 4, E0),
+    {_, Untracked} = quic_qpack:encode(H, E1),
+    {_, Tracked} = quic_qpack:encode(H, 4, E1),
+    ?assertEqual(
+        {ok, Untracked},
+        quic_qpack:process_decoder_instructions(quic_qpack:encode_section_ack(4), Tracked)
+    ).
+
+%% A stream that is over is forgotten without an acknowledgment.
+release_stream_forgets_outstanding_sections_test() ->
+    H = [{<<"x-custom">>, <<"value">>}],
+    E = encoder_with_acked_entry(H),
+    {_, Untracked} = quic_qpack:encode(H, E),
+    {_, Tracked} = quic_qpack:encode(H, 4, E),
+    ?assertEqual(Tracked, quic_qpack:release_stream(8, Tracked)),
+    ?assertEqual(Untracked, quic_qpack:release_stream(4, Tracked)).
+
+%% An encoder whose dynamic table holds H, acknowledged by the decoder.
+encoder_with_acked_entry(H) ->
+    E0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    {_Literal, E1} = quic_qpack:encode(H, E0),
+    {ok, E2} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(1), quic_qpack:clear_encoder_instructions(E1)
+    ),
+    E2.

@@ -3818,3 +3818,62 @@ a_blocked_request_is_dispatched_once_unblocked_test() ->
     ?assertEqual(nothing, next_owner_event()),
     {ok, _} = quic_h3_connection:handle_stream_data(2, insert_literal(<<"x-a">>), false, State1),
     ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()).
+
+%%====================================================================
+%% Unacknowledged field sections of a stream that is over (RFC 9204 §4.4.1)
+%%====================================================================
+
+%% A response that used the dynamic table waits for a Section
+%% Acknowledgment. Once its stream has finished or been reset the encoder
+%% waits no longer, so a peer that never acknowledges leaves nothing behind.
+a_finished_stream_has_no_outstanding_sections_test() ->
+    {State0, Field} = dynamic_table_server(),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        0, request_frame(<<"GET">>, <<"/">>), true, State0
+    ),
+    {ok, State2} = quic_h3_connection:do_respond(0, 200, [Field], <<"ok">>, State1),
+    ?assertEqual(1, quic_qpack:get_last_ric(element(13, State2))),
+    ?assertNot(has_outstanding_sections(0, State2)),
+    flush_owner_events().
+
+a_cancelled_stream_has_no_outstanding_sections_test() ->
+    State = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, dynamic_response()),
+    ?assertNot(has_outstanding_sections(0, State)),
+    flush_owner_events().
+
+a_peer_reset_stream_has_no_outstanding_sections_test() ->
+    {ok, State} = quic_h3_connection:handle_stream_closed(
+        0, ?H3_REQUEST_CANCELLED, dynamic_response()
+    ),
+    ?assertNot(has_outstanding_sections(0, State)).
+
+%% A server whose encoder holds Field in its dynamic table, acknowledged.
+dynamic_table_server() ->
+    Field = {<<"x-custom">>, <<"value">>},
+    Encoder0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    {_Literal, Encoder1} = quic_qpack:encode([Field], Encoder0),
+    {ok, Encoder2} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(1),
+        quic_qpack:clear_encoder_instructions(Encoder1)
+    ),
+    State = make_test_state(#{
+        role => server, quic_conn => fake_quic_conn(), qpack_encoder => Encoder2
+    }),
+    {State, Field}.
+
+%% The same server with response HEADERS referring to that entry sent on
+%% stream 0, and the body still to come.
+dynamic_response() ->
+    {State0, Field} = dynamic_table_server(),
+    {_Headers, Encoder} = quic_qpack:encode([Field], 0, element(13, State0)),
+    Stream = #h3_stream{id = 0, type = request, state = half_closed_remote, status = 200},
+    State1 = setelement(13, State0, Encoder),
+    %% streams is at position 21
+    State2 = setelement(21, State1, #{0 => Stream}),
+    ?assert(has_outstanding_sections(0, State2)),
+    State2.
+
+%% qpack_encoder is at position 13.
+has_outstanding_sections(StreamId, State) ->
+    Encoder = element(13, State),
+    quic_qpack:release_stream(StreamId, Encoder) =/= Encoder.
