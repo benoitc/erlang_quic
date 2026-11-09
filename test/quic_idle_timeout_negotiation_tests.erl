@@ -71,6 +71,22 @@ auto_keep_alive(Local, PeerTP) ->
         ),
     Interval.
 
+%% quic:handle_timeout/2 on a connection that has idled out closes it,
+%% rather than marking it closed and leaving it in its state.
+handle_timeout_closes_an_idle_connection_test() ->
+    ?assertMatch(
+        {next_state, draining, _},
+        quic_connection:handle_common_event(
+            cast, handle_timeout, connected, state(30000, #{}, 40000)
+        )
+    ).
+
+handle_timeout_leaves_an_active_connection_test() ->
+    S = state(30000, #{}, 15000),
+    ?assertEqual(
+        {keep_state, S}, quic_connection:handle_common_event(cast, handle_timeout, connected, S)
+    ).
+
 fire(Local, PeerTP, Idle) ->
     Ref = make_ref(),
     quic_connection:handle_common_event(

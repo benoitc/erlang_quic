@@ -29,6 +29,8 @@ All notable changes to this project will be documented in this file.
   connecting to an address that never answers gets `closed`.
 - A stream deadline that fires just as it is cancelled or set again no
   longer resets the stream.
+- `quic:handle_timeout/2` on a connection past its idle timeout now
+  closes it instead of leaving it marked closed in its state.
 
 ## [2.6.1] - 2026-11-08
 
