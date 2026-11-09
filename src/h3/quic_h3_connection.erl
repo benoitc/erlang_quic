@@ -2137,9 +2137,6 @@ retry_blocked_streams(
     case retry_blocked_streams_fold(maps:to_list(Ready), State1) of
         {ok, State2} ->
             {ok, State2};
-        {error, {stream_reset, SId, Code}} ->
-            State3 = reset_request_stream(SId, Code, State1),
-            {ok, State3#state{streams = maps:remove(SId, State3#state.streams)}};
         {error, Reason} ->
             {error, Reason, State1}
     end.
@@ -2170,9 +2167,14 @@ retry_blocked_streams_fold([{StreamId, {_RIC, HeaderBlock, Fin}} | Rest], State)
         {ok, Stream1, State1} ->
             State2 = State1#state{streams = maps:put(StreamId, Stream1, State1#state.streams)},
             retry_blocked_streams_fold(Rest, State2);
-        {error, {stream_reset, _, _} = Err} ->
-            %% Stream-level error - propagate to caller
-            {error, Err};
+        {error, {stream_reset, SId, Code}} ->
+            %% One stream's error leaves the others to be retried.
+            State1 = reset_request_stream(SId, Code, State),
+            Closed = Stream#h3_stream{state = closed, reset = true, data_remaining = 0},
+            State2 = release_buffered(SId, State1),
+            retry_blocked_streams_fold(
+                Rest, State2#state{streams = (State2#state.streams)#{SId => Closed}}
+            );
         {error, Reason} ->
             %% Connection error - stop processing
             {error, Reason}

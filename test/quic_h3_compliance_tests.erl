@@ -3685,3 +3685,77 @@ request_frame(Method, Path) ->
             {<<":path">>, Path}
         ])
     ).
+
+%%====================================================================
+%% Streams unblocked together (RFC 9204 §2.1.2)
+%%====================================================================
+
+%% Two requests wait for the same encoder stream data and one of them
+%% turns out malformed. Only that one is reset, whichever comes first.
+a_malformed_unblocked_request_leaves_the_next_one_test() ->
+    unblock_two(_Malformed = 0, _Good = 4).
+
+a_malformed_unblocked_request_leaves_the_previous_one_test() ->
+    unblock_two(_Malformed = 4, _Good = 0).
+
+unblock_two(Malformed, Good) ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = blocking_state(#{quic_conn => Quic, local_max_blocked_streams => 2}),
+    %% Entry 0 is a valid field, entry 1 has an uppercase name.
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        Good, blocked_request(1), true, State0
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        Malformed, blocked_request(2), true, State1
+    ),
+    ?assertEqual(nothing, next_owner_event()),
+    Inserts = <<(insert_literal(<<"x-a">>))/binary, (insert_literal(<<"X-B">>))/binary>>,
+    {ok, State3} = quic_h3_connection:handle_stream_data(2, Inserts, false, State2),
+    ?assertEqual(
+        [{request, Good, <<"GET">>}, {stream_reset, Malformed, ?H3_MESSAGE_ERROR}],
+        lists:sort([
+            case Event of
+                {request, Id, Method, _Path, _Headers} -> {request, Id, Method};
+                Other -> Other
+            end
+         || Event <- [next_owner_event(), next_owner_event()]
+        ])
+    ),
+    ?assert(lists:member({close_stream, Malformed, ?H3_MESSAGE_ERROR}, fake_quic_calls(Quic))),
+    Streams = quic_h3_connection:test_streams(State3),
+    ?assertMatch(#{Good := #h3_stream{method = <<"GET">>, reset = false}}, Streams),
+    ?assertMatch(#{Malformed := #h3_stream{state = closed, reset = true}}, Streams).
+
+%% A server whose decoder has a dynamic table, with the peer's encoder
+%% stream on stream 2.
+blocking_state(Overrides) ->
+    Defaults = #{
+        role => server,
+        peer_encoder_stream => 2,
+        qpack_decoder => quic_qpack:new(#{max_dynamic_size => 4096})
+    },
+    make_test_state(maps:merge(Defaults, Overrides)).
+
+%% A GET whose last field line is the newest of RIC dynamic table entries,
+%% so it needs that many insertions before it decodes.
+blocked_request(RIC) ->
+    quic_h3_frame:encode_headers(<<
+        %% Required Insert Count RIC (4096 / 32 = 128 entries), Base = RIC
+        (RIC + 1),
+        0,
+        %% :method GET, :scheme https, :path /
+        16#D1,
+        16#D7,
+        16#C1,
+        %% :authority a
+        16#50,
+        1,
+        $a,
+        %% dynamic entry Base - 1
+        16#80
+    >>).
+
+%% Insert With Literal Name, value "v".
+insert_literal(Name) ->
+    <<2#010:3, (byte_size(Name)):5, Name/binary, 1, $v>>.
