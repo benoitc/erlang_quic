@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
 - `quic:connect/4` returns `{error, Reason}` when the client socket
   cannot be opened, instead of killing a caller that does not trap
   exits.
+- API calls on a connection whose process has already stopped return
+  `{error, closed}` instead of exiting with `noproc`.
 
 ## [2.6.1] - 2026-11-08
 

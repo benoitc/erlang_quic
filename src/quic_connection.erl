@@ -88,6 +88,7 @@
     start_link/5,
     connect/4,
     send_data/4,
+    send_data/5,
     send_data_async/4,
     set_stream_flow_control/3,
     stream_consumed/3,
@@ -301,7 +302,17 @@ statem_opts(Opts) ->
 -spec send_data(pid(), non_neg_integer(), iodata(), boolean()) ->
     ok | {error, term()}.
 send_data(Conn, StreamId, Data, Fin) ->
-    gen_statem:call(Conn, {send_data, StreamId, Data, Fin}).
+    call(Conn, {send_data, StreamId, Data, Fin}).
+
+%% @doc Like send_data/4, giving up with `{error, timeout}' after Timeout.
+-spec send_data(pid(), non_neg_integer(), iodata(), boolean(), timeout()) ->
+    ok | {error, term()}.
+send_data(Conn, StreamId, Data, Fin, Timeout) ->
+    try
+        call(Conn, {send_data, StreamId, Data, Fin}, Timeout)
+    catch
+        exit:{timeout, _} -> {error, timeout}
+    end.
 
 %% @doc Send data on a stream asynchronously.
 %% This is faster than send_data/4 because it uses cast instead of call,
@@ -336,24 +347,25 @@ stream_consumed(Conn, StreamId, Offset) ->
 
 %% @private Public form of set_stream_flow_control/3, see quic.
 -spec stream_flow_control(pid(), non_neg_integer(), auto | manual) ->
-    ok | {error, unknown_stream}.
+    ok | {error, unknown_stream | closed}.
 stream_flow_control(Conn, StreamId, Mode) ->
-    gen_statem:call(Conn, {stream_flow_control, StreamId, Mode}).
+    call(Conn, {stream_flow_control, StreamId, Mode}).
 
 %% @private Return credit for Bytes the reader has processed, see quic.
--spec consume(pid(), non_neg_integer(), non_neg_integer()) -> ok | {error, unknown_stream}.
+-spec consume(pid(), non_neg_integer(), non_neg_integer()) ->
+    ok | {error, unknown_stream | closed}.
 consume(Conn, StreamId, Bytes) ->
-    gen_statem:call(Conn, {consume, StreamId, Bytes}).
+    call(Conn, {consume, StreamId, Bytes}).
 
 %% @doc Open a new bidirectional stream.
 -spec open_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
 open_stream(Conn) ->
-    gen_statem:call(Conn, open_stream, 10000).
+    call(Conn, open_stream, 10000).
 
 %% @doc Open a new unidirectional stream.
 -spec open_unidirectional_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
 open_unidirectional_stream(Conn) ->
-    gen_statem:call(Conn, open_unidirectional_stream).
+    call(Conn, open_unidirectional_stream).
 
 %% @doc Close the connection.
 -spec close(pid(), term()) -> ok.
@@ -364,13 +376,13 @@ close(Conn, Reason) ->
 -spec close_stream(pid(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
 close_stream(Conn, StreamId, ErrorCode) ->
-    gen_statem:call(Conn, {close_stream, StreamId, ErrorCode}).
+    call(Conn, {close_stream, StreamId, ErrorCode}).
 
 %% @doc Reset a stream.
 -spec reset_stream(pid(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
 reset_stream(Conn, StreamId, ErrorCode) ->
-    gen_statem:call(Conn, {close_stream, StreamId, ErrorCode}).
+    call(Conn, {close_stream, StreamId, ErrorCode}).
 
 %% @doc Reset a stream with reliable delivery up to ReliableSize.
 %% Data up to ReliableSize will be delivered before the reset takes effect.
@@ -378,20 +390,20 @@ reset_stream(Conn, StreamId, ErrorCode) ->
 -spec reset_stream_at(pid(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
 reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) ->
-    gen_statem:call(Conn, {reset_stream_at, StreamId, ErrorCode, ReliableSize}).
+    call(Conn, {reset_stream_at, StreamId, ErrorCode, ReliableSize}).
 
 %% @doc See quic:set_stream_reliable_size/3.
 -spec set_stream_reliable_size(pid(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
 set_stream_reliable_size(Conn, StreamId, Size) ->
-    gen_statem:call(Conn, {set_stream_reliable_size, StreamId, Size}).
+    call(Conn, {set_stream_reliable_size, StreamId, Size}).
 
 %% @doc Request peer to stop sending on a stream.
 %% Sends a STOP_SENDING frame (RFC 9000 Section 19.5).
 -spec stop_sending(pid(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
 stop_sending(Conn, StreamId, ErrorCode) ->
-    gen_statem:call(Conn, {stop_sending, StreamId, ErrorCode}).
+    call(Conn, {stop_sending, StreamId, ErrorCode}).
 
 %% @doc Handle a timeout event.
 -spec handle_timeout(pid()) -> ok.
@@ -419,17 +431,17 @@ get_state(Conn) ->
 %% @doc Get remote address.
 -spec peername(pid()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 peername(Conn) ->
-    gen_statem:call(Conn, peername).
+    call(Conn, peername).
 
 %% @doc Get local address.
 -spec sockname(pid()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 sockname(Conn) ->
-    gen_statem:call(Conn, sockname).
+    call(Conn, sockname).
 
 %% @doc Get peer certificate (DER-encoded).
 -spec peercert(pid()) -> {ok, binary()} | {error, term()}.
 peercert(Conn) ->
-    gen_statem:call(Conn, peercert).
+    call(Conn, peercert).
 
 %% @doc Set new owner process (async).
 -spec set_owner(pid(), pid()) -> ok.
@@ -442,12 +454,12 @@ set_owner(Conn, NewOwner) ->
 %% `{error, {invalid_state, StateName}}'.
 -spec set_owner_sync(pid(), pid()) -> ok | {error, term()}.
 set_owner_sync(Conn, NewOwner) ->
-    gen_statem:call(Conn, {set_owner, NewOwner}).
+    call(Conn, {set_owner, NewOwner}).
 
 %% @doc Send a datagram.
 -spec send_datagram(pid(), iodata()) -> ok | {error, term()}.
 send_datagram(Conn, Data) ->
-    gen_statem:call(Conn, {send_datagram, Data}).
+    call(Conn, {send_datagram, Data}).
 
 %% @doc Get maximum datagram payload size.
 %% Returns 0 if peer doesn't support datagrams.
@@ -468,26 +480,26 @@ datagram_stats(Conn) ->
 %% @doc Set connection options.
 -spec setopts(pid(), [{atom(), term()}]) -> ok | {error, term()}.
 setopts(Conn, Opts) ->
-    gen_statem:call(Conn, {setopts, Opts}).
+    call(Conn, {setopts, Opts}).
 
 %% @doc Get send queue status for backpressure decisions.
 %% Returns information about the current send queue state including
 %% whether the connection is congested and should apply backpressure.
 -spec get_send_queue_info(pid()) -> {ok, quic:send_queue_info()} | {error, term()}.
 get_send_queue_info(Conn) ->
-    gen_statem:call(Conn, get_send_queue_info).
+    call(Conn, get_send_queue_info).
 
 %% @doc Path metrics snapshot. See `quic:get_path_stats/1'.
 -spec get_path_stats(pid()) -> {ok, quic:path_stats()} | {error, term()}.
 get_path_stats(Conn) ->
-    gen_statem:call(Conn, get_path_stats).
+    call(Conn, get_path_stats).
 
 %% @doc Get connection statistics for liveness detection.
 %% Returns packet counts that can be used by net_kernel for tick checking.
 %% Any QUIC packet (ACK, PING, data) counts as proof of peer liveness.
 -spec get_stats(pid()) -> {ok, map()} | {error, term()}.
 get_stats(Conn) ->
-    gen_statem:call(Conn, get_stats).
+    call(Conn, get_stats).
 
 %% @doc Returns whether the connection has derived early keys (RFC 9001
 %% §4.6). True when a session ticket was supplied at connect time and
@@ -510,40 +522,40 @@ early_data_accepted(Conn) ->
 %% Useful for verifying peer capabilities (e.g., WebTransport support).
 -spec get_peer_transport_params(pid()) -> {ok, map()} | {error, term()}.
 get_peer_transport_params(Conn) ->
-    gen_statem:call(Conn, get_peer_transport_params).
+    call(Conn, get_peer_transport_params).
 
 %% @doc Send a PING frame (RFC 9000).
 %% PING frames bypass congestion control and are useful for liveness checks.
 %% The PING elicits an ACK from the peer, confirming the connection is alive.
 -spec send_ping(pid()) -> ok | {error, term()}.
 send_ping(Conn) ->
-    gen_statem:call(Conn, send_ping).
+    call(Conn, send_ping).
 
 %% @doc Get the current MTU for the connection.
 %% Returns the effective MTU discovered via DPLPMTUD (RFC 8899).
 -spec get_mtu(pid()) -> {ok, pos_integer()} | {error, term()}.
 get_mtu(Conn) ->
-    gen_statem:call(Conn, get_mtu).
+    call(Conn, get_mtu).
 
 %% @doc Initiate a key update (RFC 9001 Section 6).
 %% This triggers a key update cycle, deriving new encryption keys.
 %% Only valid when connection is in connected state.
 -spec key_update(pid()) -> ok | {error, term()}.
 key_update(Conn) ->
-    gen_statem:call(Conn, key_update).
+    call(Conn, key_update).
 
 %% @doc Initiate connection migration.
 %% This triggers path validation by sending PATH_CHALLENGE on a new path.
 %% Simulates network change by rebinding the socket.
 -spec migrate(pid()) -> ok | {error, term()}.
 migrate(Conn) ->
-    gen_statem:call(Conn, migrate).
+    call(Conn, migrate).
 
 %% @doc Trigger connection migration with timeout option.
 %% Simulates network change by rebinding the socket.
 -spec migrate(pid(), timeout()) -> ok | {error, term()}.
 migrate(Conn, Timeout) ->
-    gen_statem:call(Conn, {migrate, #{}}, Timeout).
+    call(Conn, {migrate, #{}}, Timeout).
 
 %% @doc Set stream priority (RFC 9218).
 %% Urgency: 0-7 (lower = more urgent, default 3)
@@ -551,20 +563,20 @@ migrate(Conn, Timeout) ->
 -spec set_stream_priority(pid(), non_neg_integer(), 0..7, boolean()) ->
     ok | {error, term()}.
 set_stream_priority(Conn, StreamId, Urgency, Incremental) ->
-    gen_statem:call(Conn, {set_stream_priority, StreamId, Urgency, Incremental}).
+    call(Conn, {set_stream_priority, StreamId, Urgency, Incremental}).
 
 %% @doc Get stream priority (RFC 9218).
 %% Returns {ok, {Urgency, Incremental}} or {error, not_found}.
 -spec get_stream_priority(pid(), non_neg_integer()) ->
     {ok, {0..7, boolean()}} | {error, term()}.
 get_stream_priority(Conn, StreamId) ->
-    gen_statem:call(Conn, {get_stream_priority, StreamId}).
+    call(Conn, {get_stream_priority, StreamId}).
 
 %% @doc Set the congestion control algorithm for a connection.
 %% Algorithm: newreno | bbr | cubic
 -spec set_congestion_control(pid(), quic_cc:cc_algorithm()) -> ok | {error, term()}.
 set_congestion_control(Conn, Algorithm) ->
-    gen_statem:call(Conn, {set_congestion_control, Algorithm}).
+    call(Conn, {set_congestion_control, Algorithm}).
 
 %% @doc Set a deadline for a stream.
 %% TimeoutMs is milliseconds from now until expiry.
@@ -572,18 +584,33 @@ set_congestion_control(Conn, Algorithm) ->
 -spec set_stream_deadline(pid(), non_neg_integer(), pos_integer(), map()) ->
     ok | {error, term()}.
 set_stream_deadline(Conn, StreamId, TimeoutMs, Opts) ->
-    gen_statem:call(Conn, {set_stream_deadline, StreamId, TimeoutMs, Opts}).
+    call(Conn, {set_stream_deadline, StreamId, TimeoutMs, Opts}).
 
 %% @doc Cancel a stream deadline.
 -spec cancel_stream_deadline(pid(), non_neg_integer()) -> ok | {error, term()}.
 cancel_stream_deadline(Conn, StreamId) ->
-    gen_statem:call(Conn, {cancel_stream_deadline, StreamId}).
+    call(Conn, {cancel_stream_deadline, StreamId}).
 
 %% @doc Get remaining time for a stream deadline.
 -spec get_stream_deadline(pid(), non_neg_integer()) ->
     {ok, {non_neg_integer() | infinity, reset | notify | both}} | {error, term()}.
 get_stream_deadline(Conn, StreamId) ->
-    gen_statem:call(Conn, {get_stream_deadline, StreamId}).
+    call(Conn, {get_stream_deadline, StreamId}).
+
+%% A synchronous call to the connection. Once the process is gone the
+%% caller gets `{error, closed}' instead of the exit gen_statem:call raises.
+call(Conn, Request) ->
+    call(Conn, Request, infinity).
+
+call(Conn, Request, Timeout) ->
+    try
+        gen_statem:call(Conn, Request, Timeout)
+    catch
+        exit:{noproc, _} -> {error, closed};
+        exit:{normal, _} -> {error, closed};
+        exit:{shutdown, _} -> {error, closed};
+        exit:{{shutdown, _}, _} -> {error, closed}
+    end.
 
 %%====================================================================
 %% gen_statem callbacks
