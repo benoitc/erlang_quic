@@ -125,7 +125,7 @@
     idle_timeout :: non_neg_integer(),
 
     %% Keep-alive (RFC 9000 - PING frames for liveness)
-    keep_alive_interval :: non_neg_integer() | disabled,
+    keep_alive_interval :: non_neg_integer() | disabled | auto,
 
     %% Give up on an unresponsive peer: close the connection when
     %% ack-eliciting data has been in flight with no ACK for this long

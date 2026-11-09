@@ -875,7 +875,7 @@ init({server, Opts}) ->
             retry_scid_for_tp = maps:get(retry_scid, Opts, undefined),
             reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
             idle_timeout = IdleTimeout,
-            keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
+            keep_alive_interval = calculate_keep_alive_interval(Opts),
             disconnect_timeout = disconnect_timeout_opt(Opts),
             listener = Listener,
             ticket_table = maps:get(ticket_table, Opts, undefined),
@@ -1318,7 +1318,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             stateless_reset_secret = maps:get(reset_secret, Opts, undefined),
             reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
             idle_timeout = IdleTimeoutClient,
-            keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
+            keep_alive_interval = calculate_keep_alive_interval(Opts),
             disconnect_timeout = disconnect_timeout_opt(Opts),
             %% TLS 1.3 external PSK (RFC 8446 §4.2.11) — mutually exclusive
             %% with session_ticket; conflict raised by build_client_hello/1.
@@ -1746,7 +1746,7 @@ connected(
     %% its handler runs only in the connected state, so arming it earlier
     %% would risk a handshake-phase fire being dropped without a re-arm. The
     %% idle timer was already armed at init.
-    State4 = set_keep_alive_timer(update_last_activity(State3b)),
+    State4 = set_keep_alive_timer(update_last_activity(resolve_keep_alive_interval(State3b))),
     %% RFC 9000 §5.1.1: give the peer spare CIDs to migrate onto. This is
     %% the first point where both halves are in place: the peer's
     %% active_connection_id_limit arrived with its transport parameters,
@@ -13335,15 +13335,32 @@ disconnect_timeout_opt(Opts) ->
         _ -> 16000
     end.
 
-calculate_keep_alive_interval(Opts, IdleTimeout) ->
+calculate_keep_alive_interval(Opts) ->
     case maps:get(keep_alive_interval, Opts, disabled) of
         disabled -> disabled;
         0 -> disabled;
-        auto when IdleTimeout =:= 0 -> disabled;
-        auto -> max(5000, IdleTimeout div 2);
+        auto -> auto;
         Interval when is_integer(Interval), Interval >= 5000 -> Interval;
         Interval when is_integer(Interval) -> 5000
     end.
+
+%% `auto' is half the idle timeout in force, which is the smaller of the
+%% two advertised (RFC 9000 Section 10.1) and so known only once the
+%% peer's transport parameters are.
+resolve_keep_alive_interval(
+    #state{
+        transport_params = TP,
+        cfg = #conn_cfg{keep_alive_interval = auto, idle_timeout = Local} = Cfg
+    } = State
+) ->
+    Interval =
+        case advertised_idle_timeout(Local, maps:get(max_idle_timeout, TP, 0)) of
+            0 -> disabled;
+            IdleTimeout -> max(5000, IdleTimeout div 2)
+        end,
+    State#state{cfg = Cfg#conn_cfg{keep_alive_interval = Interval}};
+resolve_keep_alive_interval(State) ->
+    State.
 
 %% Set keep-alive timer
 %% Uses unique reference in message to detect stale timer events
