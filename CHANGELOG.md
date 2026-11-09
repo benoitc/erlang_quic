@@ -46,6 +46,13 @@ All notable changes to this project will be documented in this file.
   dead processes instead of drawing a stateless reset (RFC 9000 Section
   10.3), and the rows counted against `max_connections` until the server
   restarted. They are now removed.
+- `pool_size` started one listener more than asked, so the default ran
+  two listeners on two sockets with SO_REUSEPORT always set. Another
+  process could bind a single-listener server's port, and on port 0 the
+  listeners bound different ports. `pool_size` N now starts N listeners,
+  with SO_REUSEPORT only when N is above 1, and
+  `quic:get_server_connections/1` returns each connection once instead
+  of once per listener.
 
 ## [2.6.1] - 2026-11-08
 

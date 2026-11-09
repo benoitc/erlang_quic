@@ -157,7 +157,8 @@ get_connections(Name) ->
                 end,
                 Listeners
             ),
-            {ok, Connections};
+            %% Pool listeners share one table, so each reports them all.
+            {ok, lists:usort(Connections)};
         {error, not_found} ->
             {error, not_found}
     end.
