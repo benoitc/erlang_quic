@@ -43,6 +43,32 @@ critical_stream_closure_returns_error_test() ->
     Result = quic_h3_connection:handle_stream_closed(2, State),
     ?assertMatch({error, {connection_error, ?H3_CLOSED_CRITICAL_STREAM, _}}, Result).
 
+%% A FIN closes a critical stream as much as a reset does, whether it
+%% comes with the stream's first bytes or later.
+critical_stream_fin_returns_error_test() ->
+    Settings = quic_h3_frame:encode_settings(#{}),
+    State0 = make_test_state(#{
+        role => server, quic_conn => fake_quic_conn(), local_encoder_stream => 7
+    }),
+    ?assertMatch(
+        {error, {connection_error, ?H3_CLOSED_CRITICAL_STREAM, _}, _},
+        quic_h3_connection:handle_stream_data(2, <<0, Settings/binary>>, true, State0)
+    ),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        2, <<0, Settings/binary>>, false, State0
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(6, <<2>>, false, State1),
+    {ok, State3} = quic_h3_connection:handle_stream_data(10, <<3>>, false, State2),
+    [
+        ?assertMatch(
+            {error, {connection_error, ?H3_CLOSED_CRITICAL_STREAM, _}, _},
+            quic_h3_connection:handle_stream_data(StreamId, <<>>, true, State3)
+        )
+     || StreamId <- [2, 6, 10]
+    ],
+    %% a stream of some other type may end
+    ?assertMatch({ok, _}, quic_h3_connection:handle_stream_data(14, <<16#21>>, true, State3)).
+
 normal_stream_closure_succeeds_test() ->
     State = make_test_state(#{
         peer_control_stream => 2,
