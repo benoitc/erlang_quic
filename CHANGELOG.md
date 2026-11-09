@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 - A stream that had used up its own flow-control window held back data
   queued for other streams. Only a connection-level limit stops the send
   queue now (RFC 9000 Section 4.1).
+- `quic:connect/4` returns `{error, Reason}` when the client socket
+  cannot be opened, instead of killing a caller that does not trap
+  exits.
 
 ## [2.6.1] - 2026-11-08
 

@@ -59,6 +59,9 @@ socket_opts_test_() ->
         {"Client socket option uses provided socket", fun client_socket_option_test/0},
         {"Client socket ownership", fun client_socket_ownership_test/0},
         {"Client invalid socket", fun client_socket_invalid_test/0},
+        {"Client bind failure is returned", fun client_bind_failure_is_returned/0},
+        {"Client closed socket is returned", fun client_closed_socket_is_returned/0},
+        {"Client open failure leaves no exit message", fun client_open_failure_no_exit_msg/0},
         %% UDP buffer sizing tests
         {"Server buffer options default", fun server_buffer_opts_default_test/0},
         {"Client buffer options default", fun client_buffer_opts_default_test/0},
@@ -122,6 +125,60 @@ client_socket_invalid_test() ->
     gen_udp:close(Sock),
     %% Now the socket is invalid
     ?assertEqual({error, einval}, inet:sockname(Sock)).
+
+%% 192.0.2.0/24 is TEST-NET-1 (RFC 5737): no host has an address in it,
+%% so the bind fails. The caller does not trap exits and must get the
+%% error as a return value, not as an exit signal over the link.
+client_bind_failure_is_returned() ->
+    ?assertEqual(
+        {returned, {error, eaddrnotavail}},
+        connect_in_plain_caller(#{extra_socket_opts => [{ip, {192, 0, 2, 77}}]})
+    ).
+
+client_closed_socket_is_returned() ->
+    {ok, Sock} = gen_udp:open(0, [binary, inet]),
+    ok = gen_udp:close(Sock),
+    ?assertEqual({returned, {error, einval}}, connect_in_plain_caller(#{socket => Sock})).
+
+client_open_failure_no_exit_msg() ->
+    Trap = process_flag(trap_exit, true),
+    try
+        ?assertEqual(
+            {error, eaddrnotavail},
+            quic:connect(
+                {127, 0, 0, 1},
+                4433,
+                #{verify => false, extra_socket_opts => [{ip, {192, 0, 2, 77}}]},
+                self()
+            )
+        ),
+        receive
+            {'EXIT', _, _} = Exit -> ?assertEqual(none, Exit)
+        after 100 -> ok
+        end
+    after
+        process_flag(trap_exit, Trap)
+    end.
+
+%% quic:connect/4 from a process that does not trap exits: what it
+%% returned, provided the caller outlived the failed connection process.
+connect_in_plain_caller(Opts) ->
+    Test = self(),
+    {Caller, MRef} = spawn_monitor(fun() ->
+        Result = quic:connect({127, 0, 0, 1}, 4433, Opts#{verify => false}, self()),
+        receive
+        after 200 -> Test ! {returned, Result}
+        end
+    end),
+    receive
+        {returned, _} = Returned ->
+            erlang:demonitor(MRef, [flush]),
+            Returned;
+        {'DOWN', MRef, process, Caller, Reason} ->
+            {caller_died, Reason}
+    after 5000 ->
+        timeout
+    end.
 
 %%====================================================================
 %% UDP Buffer Sizing Tests
