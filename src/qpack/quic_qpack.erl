@@ -40,6 +40,7 @@
     new/1,
     encode/2,
     encode/3,
+    release_stream/2,
     decode/2,
     decode/3
 ]).
@@ -197,15 +198,24 @@ encode(Headers, State) ->
 
 %% @doc Encode headers with stream tracking for section acknowledgment.
 %% This variant tracks the RIC per stream for proper section_ack handling.
+%% RFC 9204 Section 4.4.1: only a section with a non-zero Required Insert
+%% Count is acknowledged, so only those are tracked.
 -spec encode(headers(), non_neg_integer(), state()) -> {binary(), state()}.
 encode(Headers, StreamId, State) ->
-    {Encoded, State1} = encode(Headers, State),
-    RIC = State1#qpack.last_ric,
-    %% Append RIC to queue for this stream (FIFO: ack removes from front)
-    OldQueue = maps:get(StreamId, State1#qpack.pending_sections, queue:new()),
-    NewQueue = queue:in(RIC, OldQueue),
-    NewPending = maps:put(StreamId, NewQueue, State1#qpack.pending_sections),
-    {Encoded, State1#qpack{pending_sections = NewPending}}.
+    case encode(Headers, State) of
+        {Encoded, #qpack{last_ric = 0} = State1} ->
+            {Encoded, State1};
+        {Encoded, #qpack{last_ric = RIC, pending_sections = Pending} = State1} ->
+            %% Append RIC to queue for this stream (FIFO: ack removes from front)
+            Queue = queue:in(RIC, maps:get(StreamId, Pending, queue:new())),
+            {Encoded, State1#qpack{pending_sections = Pending#{StreamId => Queue}}}
+    end.
+
+%% @doc Forget the field sections still unacknowledged on a stream that
+%% has finished or was reset.
+-spec release_stream(non_neg_integer(), state()) -> state().
+release_stream(StreamId, #qpack{pending_sections = Pending} = State) ->
+    State#qpack{pending_sections = maps:remove(StreamId, Pending)}.
 
 %% @doc Decode QPACK-encoded headers with state.
 -spec decode(binary(), state()) ->

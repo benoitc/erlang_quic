@@ -74,6 +74,11 @@ All notable changes to this project will be documented in this file.
   kept each request's unread body buffered after the exchange finished,
   and eventually reset every new request with H3_EXCESSIVE_LOAD. The
   buffer is released when the stream finishes.
+- The QPACK encoder kept an entry for every field section it sent,
+  including those a decoder never acknowledges, so memory grew with
+  every stream. Only sections that use the dynamic table are tracked,
+  and they are forgotten when their stream finishes or is reset (RFC
+  9204 Section 4.4.1).
 
 ## [2.6.1] - 2026-11-08
 
