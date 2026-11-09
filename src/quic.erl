@@ -462,7 +462,7 @@ send_data(Conn, StreamId, Data, Fin, Timeout) when is_pid(Conn) ->
 %% The send-queue ceiling does not apply: an async write is always queued,
 %% so a caller that writes faster than the peer reads grows the queue.
 %% Use this for high-throughput scenarios where occasional dropped data is acceptable.
--spec send_data_async(Conn, StreamId, Data, Fin) -> ok when
+-spec send_data_async(Conn, StreamId, Data, Fin) -> ok | {error, badarg} when
     Conn :: pid(),
     StreamId :: non_neg_integer(),
     Data :: iodata(),
