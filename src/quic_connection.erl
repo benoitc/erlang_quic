@@ -609,7 +609,7 @@ init([Host, Port, Opts, Owner, Socket]) ->
     %% handled upstream in quic_happy; here Host is a single address or name).
     case resolve_address(Host, Port, maps:get(family, Opts, any)) of
         {error, ResolveErr} ->
-            {stop, {resolve_failed, ResolveErr}};
+            {error, {resolve_failed, ResolveErr}};
         {ok, RemoteAddr} ->
             %% Create or use provided socket with proper cleanup on failure
             %% Pass RemoteAddr to match address family (IPv4 vs IPv6)
@@ -636,7 +636,9 @@ init([Host, Port, Opts, Owner, Socket]) ->
                             erlang:raise(Class, Reason, Stack)
                     end;
                 {error, Reason} ->
-                    {stop, Reason}
+                    %% Not `stop': that exit reason would reach the linked
+                    %% caller as an exit signal instead of a return value.
+                    {error, Reason}
             end
     end;
 %% Server-side initialization
