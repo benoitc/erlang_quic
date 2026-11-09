@@ -3019,11 +3019,9 @@ handle_request_frame(
                     {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}}
             end;
         {{blocked, RIC}, Decoder1} ->
-            %% Trailers blocked - buffer them
-            BlockedStreams = maps:put(
-                StreamId, {RIC, HeaderBlock, true}, State#state.blocked_streams
-            ),
-            {ok, Stream, State#state{blocked_streams = BlockedStreams, qpack_decoder = Decoder1}};
+            block_stream(StreamId, {RIC, HeaderBlock, true}, Stream, State#state{
+                qpack_decoder = Decoder1
+            });
         {{error, Reason}, _Decoder1} ->
             {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
     end;
@@ -3215,27 +3213,24 @@ handle_headers_decode(StreamId, HeaderBlock, Fin, Stream, Decoder, Owner, Role, 
                 {connection_error, ?H3_EXCESSIVE_LOAD,
                     <<"field section exceeds SETTINGS_MAX_FIELD_SECTION_SIZE">>}};
         {{blocked, RIC}, Decoder1} ->
-            %% Stream blocked waiting for encoder instructions (RFC 9204 Section 2.2.2)
-            %% Check blocked streams limit (RFC 9204 Section 2.1.2)
-            %% Use LOCAL setting - we enforce our own decoder's blocked stream limit
-            BlockedCount = map_size(State#state.blocked_streams),
-            MaxBlocked = State#state.local_max_blocked_streams,
-            case BlockedCount >= MaxBlocked of
-                true ->
-                    %% RFC 9204 §2.1.2: if MaxBlocked is 0 the peer's encoder
-                    %% must not produce blocking references at all; any blocked
-                    %% stream here violates the advertised limit.
-                    {error, {stream_reset, StreamId, ?H3_REQUEST_REJECTED}};
-                false ->
-                    BlockedStreams = maps:put(
-                        StreamId, {RIC, HeaderBlock, Fin}, State#state.blocked_streams
-                    ),
-                    {ok, Stream, State#state{
-                        blocked_streams = BlockedStreams, qpack_decoder = Decoder1
-                    }}
-            end;
+            block_stream(StreamId, {RIC, HeaderBlock, Fin}, Stream, State#state{
+                qpack_decoder = Decoder1
+            });
         {{error, Reason}, _Decoder1} ->
             {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
+    end.
+
+%% A field section waiting for encoder stream data, HEADERS or trailers.
+%% RFC 9204 Section 2.1.2: one more blocked stream than we said we support
+%% in SETTINGS_QPACK_BLOCKED_STREAMS is a connection error.
+block_stream(StreamId, Entry, Stream, #state{blocked_streams = Blocked} = State) ->
+    case map_size(Blocked) >= State#state.local_max_blocked_streams of
+        true ->
+            {error,
+                {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED,
+                    <<"more blocked streams than SETTINGS_QPACK_BLOCKED_STREAMS">>}};
+        false ->
+            {ok, Stream, State#state{blocked_streams = Blocked#{StreamId => Entry}}}
     end.
 
 %% Process successfully decoded headers

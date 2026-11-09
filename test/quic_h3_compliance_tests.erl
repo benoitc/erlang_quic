@@ -3953,3 +3953,42 @@ invalid_static_index_on_the_encoder_stream_closes_the_connection_test() ->
     ?assertMatch(
         {ok, _}, quic_h3_connection:handle_stream_data(2, <<16#FF, 35, 1, $v>>, false, State)
     ).
+
+%%====================================================================
+%% Blocked streams limit (RFC 9204 §2.1.2)
+%%====================================================================
+
+%% Trailers that wait for the encoder stream block their stream like
+%% HEADERS do, so they count against SETTINGS_QPACK_BLOCKED_STREAMS.
+blocked_trailers_within_the_limit_wait_test() ->
+    State0 = blocking_state(#{local_max_blocked_streams => 1}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, upload_with_trailers(), true, State0),
+    %% blocked_streams is at position 28
+    ?assertMatch(#{0 := {1, _, true}}, element(28, State1)),
+    flush_owner_events().
+
+blocked_trailers_past_the_limit_close_the_connection_test() ->
+    State0 = blocking_state(#{local_max_blocked_streams => 1}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, upload_with_trailers(), true, State0),
+    ?assertMatch(
+        {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, _}, _},
+        quic_h3_connection:handle_stream_data(4, upload_with_trailers(), true, State1)
+    ),
+    flush_owner_events().
+
+%% The same for HEADERS, with the error RFC 9204 names.
+blocked_headers_past_the_limit_close_the_connection_test() ->
+    State0 = blocking_state(#{quic_conn => fake_quic_conn(), local_max_blocked_streams => 1}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, blocked_request(1), true, State0),
+    ?assertMatch(
+        {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, _}, _},
+        quic_h3_connection:handle_stream_data(4, blocked_request(1), true, State1)
+    ).
+
+%% A POST whose trailers refer to a dynamic table entry not yet inserted.
+upload_with_trailers() ->
+    <<
+        (request_frame(<<"POST">>, <<"/upload">>))/binary,
+        (quic_h3_frame:encode_data(<<"abc">>))/binary,
+        (quic_h3_frame:encode_headers(<<2, 0, 16#80>>))/binary
+    >>.
