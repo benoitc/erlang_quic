@@ -77,6 +77,8 @@
     datagrams_out/1,
     queue_head/1,
     queue_stream/4,
+    queued_entries/1,
+    state_with_send_windows/2,
     state_with_stream_limits/3,
     recv_max_data/2,
     send_queue_full_refusals/1,
@@ -1021,7 +1023,34 @@ queue_stream(State, StreamId, Offset, Data) ->
     S1 = quic_connection:queue_stream_data(StreamId, Offset, Data, false, State),
     #{StreamId := Stream} = S1#state.streams,
     S1#state{
-        streams = #{StreamId => Stream#stream_state{send_offset = Offset + byte_size(Data)}}
+        streams = (S1#state.streams)#{
+            StreamId := Stream#stream_state{send_offset = Offset + byte_size(Data)}
+        }
+    }.
+
+%% {StreamId, Offset, Size} of every queued entry, in the order the queue
+%% holds them.
+-spec queued_entries(#state{}) -> [{non_neg_integer(), non_neg_integer(), non_neg_integer()}].
+queued_entries(#state{send_queue = PQ}) ->
+    [
+        {StreamId, Offset, Size}
+     || Bucket <- tuple_to_list(PQ),
+        {_Kind, StreamId, Offset, _Data, _Fin, Size} <- queue:to_list(Bucket)
+    ].
+
+%% Like state_for_admission/4 with one stream per {StreamId, Urgency,
+%% StreamWindow} and an empty queue.
+-spec state_with_send_windows(
+    [{non_neg_integer(), 0..7, non_neg_integer()}], non_neg_integer()
+) -> #state{}.
+state_with_send_windows(Streams, ConnWindow) ->
+    S = state_for_admission(0, 0, 0, ConnWindow),
+    #{0 := Template} = S#state.streams,
+    S#state{
+        streams = maps:from_list([
+            {Id, Template#stream_state{id = Id, urgency = Urgency, send_max_data = Window}}
+         || {Id, Urgency, Window} <- Streams
+        ])
     }.
 
 %% A connected state whose receive limits differ by stream kind, to see

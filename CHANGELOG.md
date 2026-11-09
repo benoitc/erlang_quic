@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A stream that had used up its own flow-control window held back data
+  queued for other streams. Only a connection-level limit stops the send
+  queue now (RFC 9000 Section 4.1).
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed

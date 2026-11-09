@@ -11379,16 +11379,21 @@ get_stream_urgency(StreamId, Streams) ->
 %% this check because a zero-byte FIN-only stream send (iodata of <<>>
 %% with Fin=true) can be enqueued under pacing or congestion, leaving
 %% bytes at 0 while a real entry is pending.
-process_send_queue(#state{send_queue_count = 0} = State) ->
-    State;
 process_send_queue(State) ->
+    process_send_queue(0, State).
+
+%% Buckets below From hold only entries this drain found blocked by their
+%% own stream's window.
+process_send_queue(_From, #state{send_queue_count = 0} = State) ->
+    State;
+process_send_queue(From, State) ->
     case burst_exhausted(State) of
         true -> arm_burst_continuation(State);
-        false -> process_send_queue_unbudgeted(State)
+        false -> process_send_queue_unbudgeted(From, State)
     end.
 
-process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
-    case quic_pqueue:peek(PQ) of
+process_send_queue_unbudgeted(From, #state{send_queue = PQ} = State) ->
+    case quic_pqueue:peek(PQ, From) of
         empty ->
             State;
         {value, {stream_data, StreamId, Offset, _Data, _Fin, DataSize}} ->
@@ -11399,16 +11404,16 @@ process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
             case check_send_queue_flow_control(StreamId, Offset, DataSize, State) of
                 ok ->
                     %% Flow control allows - dequeue and try to send
-                    process_send_queue_entry(State);
+                    process_send_queue_entry(From, State);
                 {blocked, _Reason} ->
                     %% An entry larger than the current window still has a
                     %% sendable prefix. Waiting for one grant big enough for
                     %% the whole entry stalls against a peer that extends its
                     %% window in small steps as it reads, because it sizes the
                     %% grant to what it consumed, never to what we have queued.
-                    case split_blocked_head(State) of
-                        {ok, SplitState} -> process_send_queue_entry(SplitState);
-                        false -> State
+                    case split_blocked_head(From, State) of
+                        {ok, SplitState} -> process_send_queue_entry(From, SplitState);
+                        false -> process_past_blocked_streams(From, State)
                     end
             end;
         {value, {retransmit_stream, _StreamId, _Offset, _Data, _Fin, DataSize}} ->
@@ -11416,10 +11421,79 @@ process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
             %% but still gated by congestion control via the retransmit allowance.
             case quic_cc:can_send_control(State#state.cc_state, DataSize + ?PACKET_OVERHEAD) of
                 true ->
-                    process_send_queue_entry(State);
+                    process_send_queue_entry(From, State);
                 false ->
                     %% cwnd still blocking - leave queued, retried on next ACK
                     State
+            end
+    end.
+
+%% The head entry has no room in its own stream's window. That must not
+%% hold back the other streams: find the first entry, in urgency then
+%% queue order, of a stream that can send, move the entries of the
+%% blocked streams in its bucket behind the rest (each stream's own order
+%% is kept) and carry on from there. A connection-level block ends the
+%% drain: no stream can send past it.
+process_past_blocked_streams(8, State) ->
+    State;
+process_past_blocked_streams(Urgency, #state{send_queue = PQ} = State) ->
+    Bucket = element(Urgency + 1, PQ),
+    case skip_blocked_streams(queue:to_list(Bucket), #{}, [], State) of
+        all_blocked ->
+            process_past_blocked_streams(Urgency + 1, State);
+        connection_blocked ->
+            State;
+        {sendable, Entries} ->
+            NewPQ = setelement(Urgency + 1, PQ, queue:from_list(Entries)),
+            process_send_queue_unbudgeted(Urgency, State#state{send_queue = NewPQ})
+    end.
+
+skip_blocked_streams([], _BlockedIds, _Blocked, _State) ->
+    all_blocked;
+skip_blocked_streams([Entry | Rest], BlockedIds, Blocked, State) ->
+    StreamId = element(2, Entry),
+    case is_map_key(StreamId, BlockedIds) of
+        true ->
+            skip_blocked_streams(Rest, BlockedIds, [Entry | Blocked], State);
+        false ->
+            case queue_entry_block(Entry, State) of
+                none ->
+                    {Behind, Ahead} = lists:partition(
+                        fun(E) -> is_map_key(element(2, E), BlockedIds) end, Rest
+                    ),
+                    {sendable, [Entry | Ahead] ++ lists:reverse(Blocked, Behind)};
+                stream ->
+                    skip_blocked_streams(
+                        Rest, BlockedIds#{StreamId => true}, [Entry | Blocked], State
+                    );
+                connection ->
+                    connection_blocked
+            end
+    end.
+
+%% What keeps a queued entry from being sent, in whole or in part. `none'
+%% only when process_send_queue_unbudgeted/2 will send or split it.
+queue_entry_block({retransmit_stream, _StreamId, _Offset, _Data, _Fin, DataSize}, State) ->
+    case quic_cc:can_send_control(State#state.cc_state, DataSize + ?PACKET_OVERHEAD) of
+        true -> none;
+        false -> connection
+    end;
+queue_entry_block({stream_data, StreamId, Offset, _Data, _Fin, DataSize}, State) ->
+    #state{max_data_remote = MaxDataRemote, data_sent = DataSent, streams = Streams} = State,
+    case Streams of
+        #{StreamId := #stream_state{send_max_data = SendMaxData} = Stream} ->
+            StreamRoom = SendMaxData - Offset,
+            ConnRoom = conn_allowance(Stream, Offset, MaxDataRemote, DataSent),
+            case DataSize =< StreamRoom andalso DataSize =< ConnRoom of
+                true -> none;
+                false when StreamRoom =< 0 -> stream;
+                false when ConnRoom =< 0 -> connection;
+                false -> none
+            end;
+        _ ->
+            case DataSize > MaxDataRemote - DataSent andalso MaxDataRemote =< DataSent of
+                true -> connection;
+                false -> none
             end
     end.
 
@@ -11462,12 +11536,12 @@ check_send_queue_flow_control(StreamId, Offset, DataSize, #state{
 %% the remainder, both at the front so stream order is preserved. Returns
 %% false when nothing fits, when the whole entry fits (the caller should not
 %% have been blocked), or for a zero-length FIN-only entry.
-split_blocked_head(#state{send_queue = PQ, send_queue_count = QueueCount} = State) ->
-    case quic_pqueue:peek(PQ) of
+split_blocked_head(From, #state{send_queue = PQ, send_queue_count = QueueCount} = State) ->
+    case quic_pqueue:peek(PQ, From) of
         {value, {stream_data, StreamId, Offset, Data, Fin, DataSize}} ->
             case blocked_head_allowance(StreamId, Offset, State) of
                 Allowed when Allowed > 0, Allowed < DataSize ->
-                    {{value, _}, PQ1} = quic_pqueue:out(PQ),
+                    {{value, _}, PQ1} = quic_pqueue:out(PQ, From),
                     <<Head:Allowed/binary, Tail/binary>> = Data,
                     Urgency = get_stream_urgency(StreamId, State#state.streams),
                     TailEntry =
@@ -11518,13 +11592,14 @@ count_sent(StreamId, End, #state{streams = Streams, data_sent = DataSent} = Stat
 
 %% Actually process the queue entry (called after flow control check passes)
 process_send_queue_entry(
+    From,
     #state{
         send_queue = PQ,
         send_queue_bytes = QueueBytes,
         send_queue_count = QueueCount
     } = State
 ) ->
-    case quic_pqueue:out(PQ) of
+    case quic_pqueue:out(PQ, From) of
         {empty, _} ->
             State;
         {{value, {retransmit_stream, StreamId, Offset, Data, Fin, DataSize}}, NewPQ} ->
@@ -11545,7 +11620,7 @@ process_send_queue_entry(
                     State2;
                 false ->
                     case State2#state.send_queue_version =:= State1#state.send_queue_version of
-                        true -> process_send_queue(State2);
+                        true -> process_send_queue(From, State2);
                         false -> State2
                     end
             end;
@@ -11588,7 +11663,7 @@ process_send_queue_entry(
                     %% Use version counter for fast comparison (avoids structural equality on 8-tuple)
                     case State3#state.send_queue_version =:= State1#state.send_queue_version of
                         % Keep processing (check flow control again)
-                        true -> process_send_queue(State3);
+                        true -> process_send_queue(From, State3);
                         % New data queued, cwnd full
                         false -> State3
                     end
