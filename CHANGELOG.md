@@ -27,6 +27,8 @@ All notable changes to this project will be documented in this file.
   `disconnect_timeout` even with `idle_timeout => 0`. A server no longer
   keeps a connection for ever after one unreadable Initial, and a client
   connecting to an address that never answers gets `closed`.
+- A stream deadline that fires just as it is cancelled or set again no
+  longer resets the stream.
 
 ## [2.6.1] - 2026-11-08
 

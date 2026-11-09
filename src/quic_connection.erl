@@ -2188,12 +2188,18 @@ connected(info, {pmtu_raise_timeout, _StaleRef}, State) ->
     %% Stale PMTU raise timer - ignore
     {keep_state, State};
 %% Handle stream deadline expiry
-connected(info, {stream_deadline, StreamId}, State) ->
-    case handle_stream_deadline_expired(StreamId, State) of
-        {ok, NewState} ->
-            {keep_state, NewState};
-        {error, _Reason} ->
-            %% Stream already closed or doesn't exist
+connected(info, {timeout, TimerRef, {stream_deadline, StreamId}}, State) ->
+    case State#state.streams of
+        #{StreamId := #stream_state{deadline_timer = TimerRef}} ->
+            case handle_stream_deadline_expired(StreamId, State) of
+                {ok, NewState} ->
+                    {keep_state, NewState};
+                {error, _Reason} ->
+                    %% Stream already closed or doesn't exist
+                    {keep_state, State}
+            end;
+        _ ->
+            %% Fired just before the deadline was cancelled or set again.
             {keep_state, State}
     end;
 connected({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
@@ -12149,7 +12155,7 @@ arm_stream_deadline(StreamId, TimeoutMs, Action, ErrorCode, #state{streams = Str
             Now = erlang:system_time(millisecond),
             Deadline = Now + TimeoutMs,
             %% Start new timer
-            TimerRef = erlang:send_after(TimeoutMs, self(), {stream_deadline, StreamId}),
+            TimerRef = erlang:start_timer(TimeoutMs, self(), {stream_deadline, StreamId}),
             NewStreamState = StreamState#stream_state{
                 deadline = Deadline,
                 deadline_timer = TimerRef,
