@@ -35,8 +35,11 @@
 %%% '''
 %%%
 %%% Return `{ok, HandlerPid}' to take the connection, or `{error, Reason}'
-%%% to decline it, in which case the listener logs a warning and keeps
-%%% ownership. An arity-2 fun is called as `Fun(Conn, DCID)'.
+%%% to decline it. The listener then logs a warning and stops the
+%%% connection before it has seen a packet, so the client gets no answer
+%%% and gives up when its handshake times out. A handler that raises or
+%%% returns anything else also costs only that connection, and is logged
+%%% as an error. An arity-2 fun is called as `Fun(Conn, DCID)'.
 %%%
 %%% === Return the final owner ===
 %%%
@@ -1354,6 +1357,17 @@ create_connection_unconditional(
                 ok ->
                     send_to_connection(ConnPid, Packet, RemoteAddr),
                     {ok, ConnPid};
+                {declined, DeclineReason} ->
+                    ?LOG_WARNING(
+                        #{
+                            what => connection_declined,
+                            conn_pid => ConnPid,
+                            reason => DeclineReason
+                        },
+                        ?QUIC_LOG_META
+                    ),
+                    discard_connection(ConnPid, State),
+                    {error, connection_declined};
                 {error, HandlerError} ->
                     ?LOG_ERROR(
                         #{
@@ -1377,12 +1391,8 @@ assign_owner(Handler, ConnPid, DCID) ->
     try call_connection_handler(Handler, ConnPid, DCID) of
         {ok, HandlerPid} when is_pid(HandlerPid) ->
             set_owner(ConnPid, HandlerPid);
-        {error, HandlerError} ->
-            ?LOG_WARNING(
-                #{what => connection_handler_failed, error => HandlerError},
-                ?QUIC_LOG_META
-            ),
-            ok;
+        {error, Reason} ->
+            {declined, Reason};
         Other ->
             {error, {bad_return, Other}}
     catch

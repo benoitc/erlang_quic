@@ -36,6 +36,11 @@ All notable changes to this project will be documented in this file.
   that had already stopped, crashed the listener and took every
   connection it served down with it. Only the connection the handler was
   called for is now closed, and the failure is logged.
+- A `connection_handler` returning `{error, Reason}` did not decline the
+  connection: the handshake completed with the listener as owner and
+  nothing served it. The connection is now stopped before it sees a
+  packet, and the handler examples in the guides return `{ok, Pid}` as
+  the listener requires.
 
 ## [2.6.1] - 2026-11-08
 

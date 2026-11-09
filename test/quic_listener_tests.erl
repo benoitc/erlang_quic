@@ -218,22 +218,43 @@ connection_handler_registration_test() ->
     ?assert(is_pid(Listener)),
     ok = quic_listener:stop(Listener).
 
-connection_handler_error_handling_test() ->
-    %% Test that connection_handler errors are handled gracefully
-    {Cert, PrivKey} = generate_test_cert(),
-    %% Handler that returns an error
-    Handler = fun(_ConnPid, _ConnRef) ->
-        {error, test_error}
-    end,
-    Opts = #{
-        cert => Cert,
-        key => PrivKey,
-        alpn => [<<"h3">>],
-        connection_handler => Handler
-    },
-    {ok, Listener} = quic_listener:start_link(0, Opts),
-    ?assert(is_pid(Listener)),
-    ok = quic_listener:stop(Listener).
+%% {error, Reason} declines the connection: it is stopped before it sees
+%% the Initial and leaves the routing table.
+connection_handler_declines_test_() ->
+    {timeout, 30, fun() ->
+        Test = self(),
+        DCID = <<3, 3, 3, 3, 3, 3, 3, 3>>,
+        {ok, Listener} = quic_listener:start(0, #{
+            connection_handler => fun(ConnPid, D) ->
+                Test ! {conn, D, ConnPid},
+                receive
+                    monitored -> {error, overloaded}
+                end
+            end,
+            psks => #{<<"id">> => <<"secret">>},
+            alpn => [<<"h3">>]
+        }),
+        {ok, Sock} = gen_udp:open(0, [binary, {active, false}]),
+        try
+            Port = quic_listener:get_port(Listener),
+            ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_initial(DCID)),
+            receive
+                {conn, DCID, ConnPid} ->
+                    Ref = erlang:monitor(process, ConnPid),
+                    Listener ! monitored,
+                    receive
+                        {'DOWN', Ref, process, ConnPid, Reason} ->
+                            ?assertEqual(shutdown, Reason)
+                    after 2000 -> error(declined_connection_still_up)
+                    end
+            after 5000 -> error(handler_not_called)
+            end,
+            ?assertEqual([], quic_listener:get_connections(Listener))
+        after
+            gen_udp:close(Sock),
+            catch quic_listener:stop(Listener)
+        end
+    end}.
 
 %% A handler that misbehaves for one connection costs that connection
 %% only: the listener and the connections it already serves stay up.

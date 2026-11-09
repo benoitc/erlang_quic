@@ -920,12 +920,14 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %%       client also offered. `rsa_pkcs1_*' is never selected for
 %%       CertificateVerify (RFC 8446 §4.4.3).</li>
 %%   <li>`pool_size' - Number of listener processes (default: 1)</li>
-%%   <li>`connection_handler' - `fun((Conn) -> {ok, HandlerPid})'.
+%%   <li>`connection_handler' -
+%%       `fun((Conn) -> {ok, HandlerPid} | {error, Reason})'.
 %%       `HandlerPid' becomes the connection's owner, and so receives its
 %%       `{quic, Conn, _}' events, before the connection sees its first
 %%       packet. Return the process that will consume those events, not a
 %%       broker that hands off later; see the ownership rules in
-%%       `quic_listener'.</li>
+%%       `quic_listener'. `{error, Reason}' declines the connection: it
+%%       is stopped without an answer to the client.</li>
 %%   <li>`sni_callback' -
 %%       `fun((ServerName :: binary() | undefined) -> {ok, CertMap} | {error, term()})'
 %%       where `CertMap :: #{cert := binary(), key := term(), cert_chain => [binary()]}'.
