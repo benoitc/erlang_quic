@@ -23,6 +23,10 @@ All notable changes to this project will be documented in this file.
 - `keep_alive_interval => auto` now follows the idle timeout in force,
   the smaller of the two advertised (RFC 9000 Section 10.1), so a peer
   with a shorter timeout no longer idles the connection out.
+- A handshake that hears nothing from the peer is abandoned after
+  `disconnect_timeout` even with `idle_timeout => 0`. A server no longer
+  keeps a connection for ever after one unreadable Initial, and a client
+  connecting to an address that never answers gets `closed`.
 
 ## [2.6.1] - 2026-11-08
 

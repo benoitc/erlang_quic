@@ -1441,10 +1441,10 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 
 idle(enter, _OldState, #state{cfg = #conn_cfg{role = client}} = State) ->
     %% Client: Start the handshake by sending Initial packet with ClientHello
-    {keep_state, send_client_hello(State)};
+    {keep_state, arm_disconnect_timer(send_client_hello(State))};
 idle(enter, _OldState, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% Server: Wait for Initial packet with ClientHello
-    {keep_state, State};
+    {keep_state, arm_disconnect_timer(State)};
 idle({call, From}, get_ref, #state{cfg = #conn_cfg{conn_ref = Ref}} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 idle({call, From}, get_state, State) ->
@@ -2350,19 +2350,22 @@ handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref}
 handle_common_event(
     info, {disconnect_check, Ref}, StateName, #state{disconnect_timer = Ref} = State
 ) when
-    Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
+    Ref =/= undefined andalso
+        (StateName =:= connected orelse StateName =:= handshaking orelse StateName =:= idle)
 ->
     State1 = State#state{disconnect_timer = undefined},
     case disconnect_timeout_expired(State1) of
         true ->
             disconnect_deadline(State1);
+        false when StateName =:= connected ->
+            {keep_state, arm_disconnect_timer(State1)};
         false ->
-            {keep_state, arm_disconnect_timer(State1)}
+            handshake_stall_check(State1)
     end;
 handle_common_event(
     info, {disconnect_final, Ref}, StateName, #state{disconnect_timer = {final, Ref}} = State
 ) when
-    StateName =:= connected orelse StateName =:= handshaking
+    StateName =:= connected orelse StateName =:= handshaking orelse StateName =:= idle
 ->
     State1 = State#state{disconnect_timer = undefined},
     case disconnect_timeout_expired(State1) of
@@ -13235,6 +13238,20 @@ disconnect_deadline(#state{loss_state = LossState} = State) ->
     erlang:send_after(Grace, self(), {disconnect_final, Ref}),
     {keep_state, State1#state{disconnect_timer = {final, Ref}}}.
 
+%% A handshake that hears nothing from the peer for the disconnect timeout
+%% is abandoned, whatever the idle timeout is (it may be off) and with
+%% nothing in flight: a server that could not read the only Initial it got
+%% has sent nothing, and would otherwise wait for ever.
+handshake_stall_check(
+    #state{last_activity = LastActivity, cfg = #conn_cfg{disconnect_timeout = DT}} = State
+) ->
+    case (LastActivity + DT) - erlang:monotonic_time(millisecond) of
+        Remaining when Remaining =< 0 ->
+            {next_state, draining, declare_peer_dead(State)};
+        Remaining ->
+            {keep_state, arm_disconnect_timer(Remaining, State)}
+    end.
+
 %% The disconnect timeout elapsed with ack-eliciting data in flight and
 %% no ACK: declare the peer dead instead of probing until the idle
 %% timeout. This is how a client escapes a restarted peer whose stateless
@@ -13277,6 +13294,9 @@ arm_disconnect_timer(
                     false -> DT
                 end
         end,
+    arm_disconnect_timer(Delay, State).
+
+arm_disconnect_timer(Delay, State) ->
     State1 = cancel_disconnect_timer(State),
     Ref = make_ref(),
     erlang:send_after(Delay, self(), {disconnect_check, Ref}),
