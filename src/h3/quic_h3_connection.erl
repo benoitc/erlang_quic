@@ -2676,9 +2676,7 @@ handle_cancel_push_server(
     PushId,
     #state{
         max_push_id = MaxPushId,
-        next_push_id = NextPushId,
         push_streams = PushStreams,
-        cancelled_pushes = Cancelled,
         quic_conn = QuicConn
     } = State
 ) ->
@@ -2693,20 +2691,11 @@ handle_cancel_push_server(
                 {ok, {StreamId, _Stream}} ->
                     %% Push stream active - reset it
                     quic:reset_stream(QuicConn, StreamId, ?H3_REQUEST_CANCELLED),
-                    {ok, State#state{
-                        push_streams = maps:remove(PushId, PushStreams),
-                        cancelled_pushes = sets:add_element(PushId, Cancelled)
-                    }};
-                error when PushId < NextPushId ->
-                    %% Push ID already used but stream closed - ignore
-                    {ok, State#state{
-                        cancelled_pushes = sets:add_element(PushId, Cancelled)
-                    }};
+                    {ok, State#state{push_streams = maps:remove(PushId, PushStreams)}};
                 error ->
-                    %% Push ID not yet used - remember to skip it
-                    {ok, State#state{
-                        cancelled_pushes = sets:add_element(PushId, Cancelled)
-                    }}
+                    %% Already sent, or never promised: a push stream is
+                    %% opened with its promise, so there is none to hold back.
+                    {ok, State}
             end
     end.
 
