@@ -795,3 +795,31 @@ encoder_with_acked_entry(H) ->
         quic_qpack:encode_insert_count_increment(1), quic_qpack:clear_encoder_instructions(E1)
     ),
     E2.
+
+%%====================================================================
+%% Instructions that cannot be interpreted (RFC 9204 §6)
+%%====================================================================
+
+%% RFC 7541 §5.1: an integer longer than the implementation takes is a
+%% decoding error. On the decoder stream it is returned, not thrown.
+decoder_instruction_with_overlong_integer_test() ->
+    Overlong = <<16#3F, (binary:copy(<<16#80>>, 9))/binary, 1>>,
+    ?assertEqual(
+        {error, prefixed_int_too_long},
+        quic_qpack:process_decoder_instructions(Overlong, quic_qpack:new())
+    ),
+    %% the same instruction with a value that fits
+    E0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    {_, E1} = quic_qpack:encode([{<<"x-custom">>, <<"value">>}], E0),
+    ?assertMatch({ok, _}, quic_qpack:process_decoder_instructions(<<1>>, E1)).
+
+%% RFC 9204 §3.1: the static table has entries 0 to 98.
+encoder_instruction_with_invalid_static_index_test() ->
+    D = quic_qpack:new(#{max_dynamic_size => 4096}),
+    %% Insert With Name Reference, static, index 99 then 98, value "v"
+    ?assertEqual(
+        {error, {invalid_static_index, 99}},
+        quic_qpack:process_encoder_instructions(<<16#FF, 36, 1, $v>>, D)
+    ),
+    {ok, D1} = quic_qpack:process_encoder_instructions(<<16#FF, 35, 1, $v>>, D),
+    ?assertEqual(1, quic_qpack:get_insert_count(D1)).

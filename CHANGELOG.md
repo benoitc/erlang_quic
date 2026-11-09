@@ -83,6 +83,11 @@ All notable changes to this project will be documented in this file.
   an incomplete stream type, streams claimed by a `stream_type_handler`)
   was only released on a reset, so each stream ended with FIN left an
   entry behind. It is released at the FIN (RFC 9114 Section 6.2.3).
+- An over-long integer on the QPACK decoder stream, or an insertion
+  naming a static table entry that does not exist on the encoder stream,
+  crashed the HTTP/3 connection process. They are now
+  QPACK_DECODER_STREAM_ERROR and QPACK_ENCODER_STREAM_ERROR (RFC 9204
+  Sections 3.1 and 6).
 
 ## [2.6.1] - 2026-11-08
 
