@@ -88,6 +88,10 @@ All notable changes to this project will be documented in this file.
   crashed the HTTP/3 connection process. They are now
   QPACK_DECODER_STREAM_ERROR and QPACK_ENCODER_STREAM_ERROR (RFC 9204
   Sections 3.1 and 6).
+- Trailers waiting for the QPACK encoder stream were not counted against
+  SETTINGS_QPACK_BLOCKED_STREAMS. They are now, and exceeding the limit
+  closes the connection with QPACK_DECOMPRESSION_FAILED, for HEADERS as
+  well as trailers (RFC 9204 Section 2.1.2).
 
 ## [2.6.1] - 2026-11-08
 
