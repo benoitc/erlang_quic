@@ -133,8 +133,15 @@ push_stream_to_server_error_test() ->
 %% without crashing the connection
 cancelled_push_stream_ignored_test() ->
     %% Push ID 5 was cancelled by the client
+    Quic = spawn(fun() ->
+        receive
+            {'$gen_call', From, {stop_sending, 100, ?H3_REQUEST_CANCELLED}} ->
+                gen_statem:reply(From, ok)
+        end
+    end),
     State = make_test_state(#{
         role => client,
+        quic_conn => Quic,
         local_max_push_id => 10,
         local_cancelled_pushes => sets:from_list([5], [{version, 2}]),
         uni_stream_buffers => #{100 => {push_pending, <<>>}},

@@ -106,6 +106,10 @@ All notable changes to this project will be documented in this file.
   advertised table capacity instead of the peer's. When the two
   differed, field sections stopped decoding after a few dynamic table
   insertions (RFC 9204 Section 4.5.1.1).
+- After a push was cancelled, bytes still arriving on its stream were
+  read as the start of a new unidirectional stream and could close the
+  connection. The stream is now ignored, and a push the client cancelled
+  is stopped with H3_REQUEST_CANCELLED (RFC 9114 Section 7.2.3).
 
 ## [2.6.1] - 2026-11-08
 
