@@ -99,6 +99,9 @@ All notable changes to this project will be documented in this file.
 - `content-length: +10` and `:status: +200` were accepted. Both must be
   digits only (RFC 9110 Sections 8.6 and 15); anything else is a
   malformed message.
+- Huffman-encoded strings with more than 7 bits of padding, or padding
+  that is not all ones, were accepted. Both are decoding errors now (RFC
+  7541 Section 5.2, RFC 9204 Section 4.1.2).
 
 ## [2.6.1] - 2026-11-08
 

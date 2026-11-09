@@ -50,13 +50,16 @@ decode(Data) ->
 decode_safe(Data) ->
     try
         Decoded = decode_validated(Data, byte_size(Data), 0, <<>>),
-        %% A non-empty Huffman string must decode to at least one symbol
-        %% (padding is only the <= 7 trailing bits after the last symbol).
-        %% An empty result from non-empty input means the whole input was
-        %% padding, which exceeds the 7-bit maximum (RFC 7541 §5.2).
-        case Data =/= <<>> andalso Decoded =:= <<>> of
-            true -> {error, invalid_padding};
-            false -> {ok, Decoded}
+        %% What follows the last symbol is padding: at most 7 bits, all
+        %% ones (RFC 7541 §5.2).
+        PadBits = bit_size(Data) - encoded_bits(Decoded, 0),
+        case Data of
+            <<_:(bit_size(Data) - PadBits), Pad:PadBits>> when
+                PadBits =< 7, Pad =:= (1 bsl PadBits) - 1
+            ->
+                {ok, Decoded};
+            _ ->
+                {error, invalid_padding}
         end
     catch
         throw:{huffman_error, Reason} -> {error, Reason}

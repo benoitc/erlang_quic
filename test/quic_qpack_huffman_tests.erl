@@ -183,6 +183,28 @@ decode_safe_rejects_overlong_padding_test() ->
     ?assertMatch({error, _}, quic_qpack_huffman:decode_safe(<<16#FF>>)),
     ?assertMatch({error, _}, quic_qpack_huffman:decode_safe(<<16#FF, 16#FF>>)).
 
+%% Eight or more bits of padding after a symbol are as much an error as
+%% a string that is nothing but padding.
+decode_safe_rejects_overlong_padding_after_a_symbol_test() ->
+    %% "a" is 00011, padded with 111: one more byte of ones is 11 bits.
+    ?assertEqual({ok, <<"a">>}, quic_qpack_huffman:decode_safe(<<16#1F>>)),
+    ?assertEqual({error, invalid_padding}, quic_qpack_huffman:decode_safe(<<16#1F, 16#FF>>)),
+    ?assertEqual(
+        {error, invalid_padding}, quic_qpack_huffman:decode_safe(<<16#1F, 16#FF, 16#FF>>)
+    ),
+    Encoded = quic_qpack_huffman:encode(<<"aaaaa">>),
+    ?assertEqual(
+        {error, invalid_padding}, quic_qpack_huffman:decode_safe(<<Encoded/binary, 16#FF>>)
+    ).
+
+%% Padding has to be the start of EOS, all ones: "hc" is 100111 00100,
+%% and the 01111 after it is the start of some other code.
+decode_safe_rejects_padding_that_is_not_eos_test() ->
+    ?assertEqual({ok, <<"hc">>}, quic_qpack_huffman:decode_safe(<<2#10011100, 2#10011111>>)),
+    ?assertEqual(
+        {error, invalid_padding}, quic_qpack_huffman:decode_safe(<<2#10011100, 2#10001111>>)
+    ).
+
 decode_safe_rejects_invalid_code_without_crashing_test() ->
     %% 32 one-bits is an invalid encoding; must return {error,_}, not crash.
     ?assertMatch({error, _}, quic_qpack_huffman:decode_safe(<<16#FF, 16#FF, 16#FF, 16#FF>>)).
