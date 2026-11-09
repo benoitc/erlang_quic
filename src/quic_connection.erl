@@ -6581,15 +6581,16 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
             },
 
             %% Emit qlog packets_acked event
-            AckedPNs = [P#sent_packet.pn || P <- AckedPackets],
             RTTSample =
                 case AckedPackets of
                     [] -> undefined;
                     _ -> Now - LargestAckedSentTime
                 end,
-            ?QLOG_EMIT_PACKETS_ACKED((State1#state.cfg)#conn_cfg.qlog_ctx, AckedPNs, #{
-                rtt_sample => RTTSample
-            }),
+            ?QLOG_EMIT_PACKETS_ACKED(
+                (State1#state.cfg)#conn_cfg.qlog_ctx,
+                [P#sent_packet.pn || P <- AckedPackets],
+                #{rtt_sample => RTTSample}
+            ),
 
             %% Emit qlog packet_lost events
             lists:foreach(
@@ -17084,8 +17085,13 @@ handle_pmtu_ack_event(_Acked, #state{pmtu_state = undefined} = State) ->
 handle_pmtu_ack_event([], State) ->
     State;
 handle_pmtu_ack_event(Acked, #state{pmtu_state = PMTUState} = State) ->
-    Sizes = [Size || #sent_packet{size = Size} <- Acked],
-    State#state{pmtu_state = quic_pmtu:on_ack_event(Sizes, PMTUState)}.
+    case quic_pmtu:has_black_hole_strikes(PMTUState) of
+        true ->
+            Sizes = [Size || #sent_packet{size = Size} <- Acked],
+            State#state{pmtu_state = quic_pmtu:on_ack_event(Sizes, PMTUState)};
+        false ->
+            State
+    end.
 
 %% @doc Black hole detection, loss side: the newly declared losses of one
 %% ACK are one strike if any of them was a large packet. Drops the MTU

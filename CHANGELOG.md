@@ -321,6 +321,9 @@ All notable changes to this project will be documented in this file.
   11 on the client, where it handled 29 (loopback).
 - A listener routes a train of 1-RTT packets for one connection with a
   single routing table lookup instead of one per packet.
+- Processing an ACK no longer builds the list of acknowledged packet
+  numbers unless qlog is on, nor the list of their sizes unless PMTU
+  black hole detection has a strike to clear.
 
 ### Fixed
 - A client connecting to an internationalized host name sent it in

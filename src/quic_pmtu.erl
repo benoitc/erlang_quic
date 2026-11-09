@@ -57,6 +57,7 @@
     on_packet_lost/2,
     on_loss_event/2,
     on_ack_event/2,
+    has_black_hole_strikes/1,
     on_packet_acked/1,
 
     %% Queries
@@ -604,6 +605,11 @@ on_packet_acked(#pmtu_state{black_hole_count = 0} = State) ->
     State;
 on_packet_acked(State) ->
     State#pmtu_state{black_hole_count = 0}.
+
+%% @doc Whether on_ack_event/2 has anything to clear.
+-spec has_black_hole_strikes(#pmtu_state{}) -> boolean().
+has_black_hole_strikes(#pmtu_state{black_hole_count = Count}) ->
+    Count > 0.
 
 %% @doc One ACK event with the sizes of the packets it acknowledged. A
 %% large packet getting through proves the path still passes them, so
