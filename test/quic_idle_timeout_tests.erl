@@ -116,7 +116,7 @@ just_below_timeout_boundary_test() ->
 %%====================================================================
 
 %% keep_alive_interval is floored to 5000ms by the implementation
-%% (calculate_keep_alive_interval/2), so the idle timeout must sit above that
+%% (calculate_keep_alive_interval/1), so the idle timeout must sit above that
 %% for keep-alive to hold a live connection open. Keep it just above so the
 %% tests stay reasonably quick.
 -define(IDLE_TIMEOUT, 7000).
@@ -295,4 +295,30 @@ bridge_loop(Sock, Conn, ServerIP, ServerPort, SocketRef, Blocked) ->
             ok;
         _ ->
             Loop(Conn, Blocked)
+    end.
+
+%% `keep_alive_interval => auto' follows the idle timeout in force, the
+%% smaller of the two advertised (RFC 9000 Section 10.1): against a server
+%% with a much shorter timeout than ours the connection must stay up.
+auto_keep_alive_holds_against_shorter_peer_timeout_test_() ->
+    {timeout, 30, fun auto_keep_alive_holds_against_shorter_peer_timeout/0}.
+
+auto_keep_alive_holds_against_shorter_peer_timeout() ->
+    {ok, Echo} = quic_test_echo_server:start(#{idle_timeout => 6000}),
+    try
+        Opts = (quic_test_echo_server:client_opts())#{
+            alpn => [<<"echo">>], idle_timeout => 60000, keep_alive_interval => auto
+        },
+        {ok, Conn} = quic:connect(<<"127.0.0.1">>, maps:get(port, Echo), Opts, self()),
+        receive
+            {quic, Conn, {connected, _}} -> ok
+        after 10000 -> erlang:error(connect_timeout)
+        end,
+        receive
+            {quic, Conn, {closed, Reason}} -> ?assertEqual(still_open, Reason)
+        after 9000 -> ok
+        end,
+        quic:close(Conn)
+    after
+        quic_test_echo_server:stop(Echo)
     end.

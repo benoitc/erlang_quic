@@ -20,6 +20,9 @@ All notable changes to this project will be documented in this file.
 - The owner of a connection whose handshake fails with a TLS alert, for
   example a server rejecting the client's ALPN, now gets `{closed,
   {tls_alert, Reason}}`.
+- `keep_alive_interval => auto` now follows the idle timeout in force,
+  the smaller of the two advertised (RFC 9000 Section 10.1), so a peer
+  with a shorter timeout no longer idles the connection out.
 
 ## [2.6.1] - 2026-11-08
 
