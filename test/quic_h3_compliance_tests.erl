@@ -3600,3 +3600,88 @@ next_reset_event() ->
         {quic_h3, Self, {stream_type_closed, _, _} = E} -> E
     after 100 -> no_reset_event
     end.
+
+%%====================================================================
+%% Cancelled request streams (RFC 9114 §4.1.1)
+%%====================================================================
+
+%% The rest of a cancelled request's body is dropped, whatever it holds:
+%% here a HEADERS frame, which must not come out as a second request.
+body_after_a_cancel_is_not_a_new_request_test() ->
+    Quic = fake_quic_conn(),
+    State1 = cancelled_upload(Quic),
+    Inner = request_frame(<<"DELETE">>, <<"/admin">>),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, Inner, false, State1),
+    ?assertEqual(nothing, next_owner_event()),
+    ?assertMatch(
+        #{0 := #h3_stream{state = closed}}, quic_h3_connection:test_streams(State2)
+    ).
+
+%% Reading is aborted as well as sending.
+a_cancel_stops_the_peer_sending_test() ->
+    Quic = fake_quic_conn(),
+    _ = cancelled_upload(Quic),
+    ?assert(
+        lists:member({stop_sending, 0, ?H3_REQUEST_CANCELLED}, fake_quic_calls(Quic))
+    ).
+
+%% Another stream is still a request, and the cancelled one is forgotten
+%% once the peer ends it.
+a_cancel_leaves_other_streams_alone_test() ->
+    State1 = cancelled_upload(fake_quic_conn()),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        4, request_frame(<<"GET">>, <<"/">>), true, State1
+    ),
+    ?assertMatch({request, 4, <<"GET">>, <<"/">>, _}, next_owner_event()),
+    {ok, State3} = quic_h3_connection:handle_stream_data(0, <<"tail">>, true, State2),
+    ?assertNot(maps:is_key(0, quic_h3_connection:test_streams(State3))).
+
+%% The peer's RESET_STREAM in answer is not a second reset to report.
+the_reset_answering_a_cancel_is_not_reported_test() ->
+    State1 = cancelled_upload(fake_quic_conn()),
+    {keep_state, State2} = quic_h3_connection:handle_peer_reset(
+        0, ?H3_REQUEST_CANCELLED, undefined, State1
+    ),
+    ?assertEqual(nothing, next_owner_event()),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State2)).
+
+%% Nothing more can arrive on a request the peer has finished, so no entry
+%% is kept and no STOP_SENDING sent.
+a_cancel_after_the_request_ended_keeps_nothing_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        0, request_frame(<<"GET">>, <<"/">>), true, State0
+    ),
+    State2 = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, State1),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State2)),
+    ?assertNot(lists:keymember(stop_sending, 1, fake_quic_calls(Quic))).
+
+%% A server that has read a POST's HEADERS and part of its body, then
+%% cancelled it.
+cancelled_upload(Quic) ->
+    flush_owner_events(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    Start = <<
+        (request_frame(<<"POST">>, <<"/upload">>))/binary,
+        %% a DATA frame of 1000 bytes, 10 of them here
+        0,
+        (quic_varint:encode(1000))/binary,
+        "0123456789"
+    >>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, Start, false, State0),
+    {request, 0, <<"POST">>, <<"/upload">>, _} = next_owner_event(),
+    State2 = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, State1),
+    {stream_reset, 0, ?H3_REQUEST_CANCELLED} = next_owner_event(),
+    State2.
+
+request_frame(Method, Path) ->
+    quic_h3_frame:encode_headers(
+        quic_qpack:encode([
+            {<<":method">>, Method},
+            {<<":scheme">>, <<"https">>},
+            {<<":authority">>, <<"example.com">>},
+            {<<":path">>, Path}
+        ])
+    ).

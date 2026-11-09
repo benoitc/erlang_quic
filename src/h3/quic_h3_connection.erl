@@ -2746,7 +2746,10 @@ handle_request_stream_data(
     Combined = <<Buffer/binary, Data/binary>>,
     handle_request_stream_data(StreamId, Combined, Fin, Stream, State).
 
-handle_request_stream_data(_StreamId, _Data, _Fin, #h3_stream{state = closed}, State) ->
+handle_request_stream_data(StreamId, _Data, true, #h3_stream{state = closed}, State) ->
+    %% The peer has finished a stream this side gave up on.
+    {ok, State#state{streams = maps:remove(StreamId, State#state.streams)}};
+handle_request_stream_data(_StreamId, _Data, false, #h3_stream{state = closed}, State) ->
     {ok, State};
 handle_request_stream_data(
     StreamId, Combined, Fin, Stream, #state{streams = Streams, stream_buffers = Buffers} = State
@@ -3905,6 +3908,8 @@ maybe_reset_incomplete_request(StreamId, #state{role = server, quic_conn = QuicC
     case maps:find(StreamId, State#state.streams) of
         {ok, #h3_stream{frame_state = complete}} ->
             State;
+        {ok, #h3_stream{reset = true}} ->
+            State;
         {ok, #h3_stream{state = half_closed_local}} ->
             %% RFC 9114 Section 4.1.1: a complete response may precede the
             %% end of the request; a reset would abandon its unacked bytes.
@@ -4114,7 +4119,7 @@ do_send_response(
         {error, Reason} ->
             {error, Reason};
         ok ->
-            case maps:find(StreamId, Streams) of
+            case live_stream(StreamId, Streams) of
                 {ok, Stream} ->
                     %% Use encode/3 with StreamId for section ack tracking
                     {Encoded, Encoder1} = quic_qpack:encode(AllHeaders, StreamId, Encoder),
@@ -4167,7 +4172,7 @@ do_send_data(
     Fin,
     #state{quic_conn = QuicConn, streams = Streams, pending_response_headers = Pending} = State
 ) ->
-    case maps:find(StreamId, Streams) of
+    case live_stream(StreamId, Streams) of
         {ok, Stream} ->
             DataFrame = quic_h3_frame:encode_data(Data),
             %% Prepend any buffered response HEADERS so HEADERS + first body
@@ -4266,10 +4271,40 @@ do_cancel_stream(
     %% partial frame buffer, and any body no handler claimed.
     State2 = release_buffered(StreamId, State1),
     State2#state{
-        streams = maps:remove(StreamId, Streams),
+        streams = abort_reading(StreamId, ErrorCode, Streams, State2),
         pending_response_headers = maps:remove(StreamId, Pending),
         stream_buffers = maps:remove(StreamId, State2#state.stream_buffers)
     }.
+
+%% A stream this side reset is known only so that its bytes are dropped.
+live_stream(StreamId, Streams) ->
+    case Streams of
+        #{StreamId := #h3_stream{reset = true}} -> error;
+        #{StreamId := Stream} -> {ok, Stream};
+        _ -> error
+    end.
+
+%% RFC 9114 Section 4.1.1: a cancelled request stops being read as well.
+%% While the peer can still send on the stream its entry stays, closed, so
+%% that what arrives is dropped instead of being read as a new request.
+abort_reading(StreamId, ErrorCode, Streams, #state{quic_conn = QuicConn}) ->
+    case Streams of
+        #{StreamId := #h3_stream{state = StreamState} = Stream} when
+            StreamState =:= open; StreamState =:= half_closed_local
+        ->
+            case quic:stop_sending(QuicConn, StreamId, ErrorCode) of
+                {error, unknown_stream} ->
+                    maps:remove(StreamId, Streams);
+                _ ->
+                    Streams#{
+                        StreamId := Stream#h3_stream{
+                            state = closed, reset = true, data_remaining = 0
+                        }
+                    }
+            end;
+        _ ->
+            maps:remove(StreamId, Streams)
+    end.
 
 %%====================================================================
 %% Internal: Per-stream Handler Registration
@@ -4377,7 +4412,7 @@ make_auto(_StreamId, Stream, _State) ->
 
 %% Register a handler process to receive stream data
 do_set_stream_handler(StreamId, HandlerPid, Opts, #state{streams = Streams} = State) ->
-    case maps:find(StreamId, Streams) of
+    case live_stream(StreamId, Streams) of
         {ok, _Stream} ->
             register_stream_handler(StreamId, HandlerPid, Opts, State);
         error ->
@@ -4600,10 +4635,10 @@ do_push(RequestStreamId, Headers, #state{streams = Streams} = State) ->
         ok ->
             case allocate_push_id(State) of
                 {ok, PushId, State1} ->
-                    case maps:is_key(RequestStreamId, Streams) of
-                        false ->
+                    case live_stream(RequestStreamId, Streams) of
+                        error ->
                             {error, unknown_request_stream};
-                        true ->
+                        {ok, _} ->
                             do_push_internal(RequestStreamId, Headers, PushId, State1)
                     end;
                 {error, Reason} ->
@@ -5242,7 +5277,7 @@ handle_peer_reset(StreamId, ErrorCode, FinalSize, State0) ->
     State = drop_held_stream(StreamId, State0),
     case handle_stream_closed(StreamId, ErrorCode, FinalSize, State) of
         {ok, State1} ->
-            case is_request_stream(StreamId, State) of
+            case is_request_stream(StreamId, State) andalso not locally_reset(StreamId, State) of
                 true ->
                     notify_stream(StreamId, {stream_reset, StreamId, ErrorCode}, State1),
                     {keep_state, do_unset_stream_handler(StreamId, State1)};
@@ -5265,6 +5300,13 @@ handle_peer_stop_sending(StreamId, ErrorCode, #state{owner = Owner} = State) ->
             ok
     end,
     State.
+
+%% Reset by this side, which reported it then.
+locally_reset(StreamId, #state{streams = Streams}) ->
+    case Streams of
+        #{StreamId := #h3_stream{reset = true}} -> true;
+        _ -> false
+    end.
 
 is_request_stream(StreamId, State) ->
     ((StreamId band 2) =:= 0) andalso (claimed_stream_direction(StreamId, State) =:= error).
