@@ -1325,7 +1325,7 @@ live_event({call, From}, _Call, _State) ->
     %% A caller must never wait out gen_statem:call/2 on a dropped request.
     {keep_state_and_data, [{reply, From, {error, unknown_call}}]};
 live_event(cast, {cancel_push, PushId}, #state{role = client} = State) ->
-    State1 = do_cancel_push(PushId, State),
+    State1 = do_cancel_push(PushId, stop_push_stream(PushId, State)),
     {keep_state, State1};
 live_event(cast, {cancel_push, _PushId}, #state{role = server}) ->
     %% Server can't cancel push as client would
@@ -2257,9 +2257,13 @@ process_push_stream_id(
         ok ->
             correlate_push_stream(StreamId, PushId, _Rest, State);
         {error, cancelled} ->
-            %% RFC 9114 Section 7.2.3: Cancelled push - silently ignore stream
-            %% Just remove the buffer and continue without processing
-            {ok, State#state{uni_stream_buffers = maps:remove(StreamId, Buffers)}};
+            %% RFC 9114 Section 7.2.3: a push we cancelled arrived all the
+            %% same; reading is aborted and the rest of it ignored.
+            _ = quic:stop_sending(State#state.quic_conn, StreamId, ?H3_REQUEST_CANCELLED),
+            {ok,
+                ignore_uni_stream(StreamId, State#state{
+                    uni_stream_buffers = maps:remove(StreamId, Buffers)
+                })};
         {error, Reason} ->
             {error, Reason, State}
     end.
@@ -2735,7 +2739,7 @@ handle_cancel_push_client(
             {error, {connection_error, ?H3_ID_ERROR, <<"invalid CANCEL_PUSH ID">>}};
         false ->
             %% Remove from promised and received, notify owner
-            State1 = State#state{
+            State1 = (ignore_push_stream(PushId, State))#state{
                 promised_pushes = maps:remove(PushId, Promised),
                 received_pushes = maps:remove(PushId, Received)
             },
@@ -4924,12 +4928,38 @@ do_cancel_push(
             CancelPushFrame = quic_h3_frame:encode_cancel_push(PushId),
             quic:send_data(QuicConn, ControlStream, CancelPushFrame, false),
             %% Update state
-            State#state{
+            (ignore_push_stream(PushId, State))#state{
                 local_cancelled_pushes = sets:add_element(PushId, Cancelled),
                 promised_pushes = maps:remove(PushId, Promised),
                 received_pushes = maps:remove(PushId, Received)
             }
     end.
+
+%% RFC 9114 Section 7.2.3: the client aborts reading a push stream it has
+%% cancelled.
+stop_push_stream(PushId, #state{received_pushes = Received, quic_conn = QuicConn} = State) ->
+    case Received of
+        #{PushId := #h3_stream{id = StreamId}} ->
+            _ = quic:stop_sending(QuicConn, StreamId, ?H3_REQUEST_CANCELLED),
+            State;
+        _ ->
+            State
+    end.
+
+%% A cancelled push whose stream is already open: what still arrives on
+%% the stream is ignored rather than read as the start of a new stream.
+ignore_push_stream(PushId, #state{received_pushes = Received} = State) ->
+    case Received of
+        #{PushId := #h3_stream{id = StreamId}} ->
+            ignore_uni_stream(StreamId, State#state{
+                stream_buffers = maps:remove(StreamId, State#state.stream_buffers)
+            });
+        _ ->
+            State
+    end.
+
+ignore_uni_stream(StreamId, #state{discarded_uni_streams = Discarded} = State) ->
+    State#state{discarded_uni_streams = sets:add_element(StreamId, Discarded)}.
 
 %% Send Stream Cancellation on decoder stream if stream was blocked (RFC 9204 Section 4.4.2)
 maybe_send_stream_cancel(

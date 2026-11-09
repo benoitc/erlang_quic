@@ -4150,3 +4150,66 @@ required_insert_count_follows_the_peers_table_capacity_test() ->
         {Encoder, quic_qpack:new(#{max_dynamic_size => 100})},
         lists:seq(1, 20)
     ).
+
+%%====================================================================
+%% Cancelled pushes whose stream is open (RFC 9114 §7.2.3)
+%%====================================================================
+
+%% The server withdraws a push it has started to send. What it had already
+%% put on the push stream still arrives, and is ignored: it used to be read
+%% as the start of a new stream, here one claiming to be the control stream.
+bytes_of_a_push_the_server_cancelled_are_ignored_test() ->
+    flush_owner_events(),
+    State0 = receiving_push(fake_quic_conn()),
+    {ok, State1} = quic_h3_connection:handle_control_frame({cancel_push, 0}, State0),
+    ?assertEqual({push_cancelled, 0}, next_owner_event()),
+    ?assertEqual(
+        {ok, State1}, quic_h3_connection:handle_stream_data(3, <<0, 2, "hi">>, false, State1)
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(3, <<>>, true, State1),
+    ?assertEqual(0, sets:size(quic_h3_connection:test_discarded_uni_streams(State2))),
+    ?assertEqual(nothing, next_owner_event()).
+
+%% A push the client cancels itself is ignored the same way.
+bytes_of_a_push_the_client_cancelled_are_ignored_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = receiving_push(Quic),
+    %% handle_push_frame cancels a push whose trailers are over the limit
+    {ok, State1} = quic_h3_connection:handle_push_frame(
+        3, 0, {headers, big_field_section()}, true, State0
+    ),
+    ?assertEqual({push_cancelled, 0}, next_owner_event()),
+    ?assertEqual(
+        {ok, State1}, quic_h3_connection:handle_stream_data(3, <<0, 2, "hi">>, false, State1)
+    ),
+    ?assertEqual(nothing, next_owner_event()).
+
+%% A push cancelled before its stream arrived: reading is aborted, and the
+%% frames after the push ID are not taken for a new stream either.
+a_cancelled_push_that_arrives_is_stopped_and_ignored_test() ->
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{
+        role => client,
+        quic_conn => Quic,
+        local_max_push_id => 10,
+        local_cancelled_pushes => sets:from_list([5], [{version, 2}])
+    }),
+    {ok, State1} = quic_h3_connection:handle_stream_data(3, <<1, 5>>, false, State0),
+    ?assert(lists:member({stop_sending, 3, ?H3_REQUEST_CANCELLED}, fake_quic_calls(Quic))),
+    ?assertEqual(
+        {ok, State1}, quic_h3_connection:handle_stream_data(3, <<1, 2, 0, 0>>, false, State1)
+    ).
+
+%% A client reading the body of push 0 on stream 3.
+receiving_push(Quic) ->
+    Push = #h3_stream{id = 3, type = push, state = open, frame_state = expecting_data},
+    make_test_state(#{
+        role => client,
+        quic_conn => Quic,
+        settings_received => true,
+        local_control_stream => 2,
+        local_max_push_id => 10,
+        local_max_field_section_size => 1024,
+        received_pushes => #{0 => Push}
+    }).
