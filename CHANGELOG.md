@@ -319,6 +319,8 @@ All notable changes to this project will be documented in this file.
   client stops. With the timer changes above, an idle connection with
   keep-alive handles about 16 messages per 100 seconds on the server and
   11 on the client, where it handled 29 (loopback).
+- A listener routes a train of 1-RTT packets for one connection with a
+  single routing table lookup instead of one per packet.
 
 ### Fixed
 - A client connecting to an internationalized host name sent it in
