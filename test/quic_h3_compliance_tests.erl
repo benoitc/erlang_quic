@@ -3759,3 +3759,36 @@ blocked_request(RIC) ->
 %% Insert With Literal Name, value "v".
 insert_literal(Name) ->
     <<2#010:3, (byte_size(Name)):5, Name/binary, 1, $v>>.
+
+%%====================================================================
+%% A blocked stream that is reset (RFC 9204 §4.4.2)
+%%====================================================================
+
+%% DATA arriving while the HEADERS wait for the encoder stream resets the
+%% stream. The HEADERS are given up with it: the decoder says so, and the
+%% insertion that would have unblocked them brings no request.
+a_reset_stream_is_no_longer_blocked_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = blocking_state(#{
+        quic_conn => Quic, local_max_blocked_streams => 1, local_decoder_stream => 11
+    }),
+    Data = <<(blocked_request(1))/binary, (quic_h3_frame:encode_data(<<"x">>))/binary>>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, Data, false, State0),
+    ?assertEqual({stream_reset, 0, ?H3_FRAME_UNEXPECTED}, next_owner_event()),
+    ?assert(
+        lists:member(
+            {send_data, 11, quic_qpack:encode_stream_cancel(0), false}, fake_quic_calls(Quic)
+        )
+    ),
+    {ok, _} = quic_h3_connection:handle_stream_data(2, insert_literal(<<"x-a">>), false, State1),
+    ?assertEqual(nothing, next_owner_event()).
+
+%% Left alone, the same HEADERS become a request once the entry is there.
+a_blocked_request_is_dispatched_once_unblocked_test() ->
+    flush_owner_events(),
+    State0 = blocking_state(#{quic_conn => fake_quic_conn(), local_max_blocked_streams => 1}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, blocked_request(1), true, State0),
+    ?assertEqual(nothing, next_owner_event()),
+    {ok, _} = quic_h3_connection:handle_stream_data(2, insert_literal(<<"x-a">>), false, State1),
+    ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()).

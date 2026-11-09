@@ -62,6 +62,10 @@ All notable changes to this project will be documented in this file.
   unblocked together and one was malformed, the others lost their state
   or were never processed. Only the malformed one is reset now (RFC 9204
   Section 2.1.2).
+- A stream reset locally while its HEADERS were waiting for the QPACK
+  encoder stream stayed blocked, and a later insertion delivered a
+  request on the reset stream. The blocked entry is dropped and Stream
+  Cancellation is sent on every local reset (RFC 9204 Section 4.4.2).
 
 ## [2.6.1] - 2026-11-08
 

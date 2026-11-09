@@ -4266,9 +4266,7 @@ do_cancel_stream(
     ErrorCode,
     #state{streams = Streams, pending_response_headers = Pending} = State
 ) ->
-    State0 = reset_request_stream(StreamId, ErrorCode, State),
-    %% RFC 9204 Section 4.4.2: Send Stream Cancellation if stream was blocked
-    State1 = maybe_send_stream_cancel(StreamId, State0),
+    State1 = reset_request_stream(StreamId, ErrorCode, State),
     %% Drop what the cancelled stream was holding: unsent HEADERS, the
     %% partial frame buffer, and any body no handler claimed.
     State2 = release_buffered(StreamId, State1),
@@ -4909,7 +4907,9 @@ maybe_send_stream_cancel(
             Cancel = quic_qpack:encode_stream_cancel(StreamId),
             quic:send_data(QuicConn, DecoderStream, Cancel, false),
             State#state{blocked_streams = maps:remove(StreamId, Blocked)};
-        _ ->
+        true ->
+            State#state{blocked_streams = maps:remove(StreamId, Blocked)};
+        false ->
             State
     end.
 
@@ -5262,7 +5262,8 @@ reason_phrase(Reason) ->
 %% and waited out its own timeout.
 reset_request_stream(StreamId, ErrorCode, #state{quic_conn = QuicConn} = State) ->
     quic:reset_stream(QuicConn, StreamId, ErrorCode),
-    report_local_reset(StreamId, ErrorCode, State).
+    State1 = maybe_send_stream_cancel(StreamId, State),
+    report_local_reset(StreamId, ErrorCode, State1).
 
 report_local_reset(StreamId, ErrorCode, State) ->
     case is_request_stream(StreamId, State) of
