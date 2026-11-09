@@ -19,7 +19,9 @@
     in/3,
     in_front/3,
     out/1,
+    out/2,
     peek/1,
+    peek/2,
     is_empty/1
 ]).
 
@@ -75,8 +77,10 @@ in_front(Entry, Urgency, PQ) when Urgency >= 0, Urgency =< 7 ->
 out(PQ) ->
     out(PQ, 0).
 
-out(_PQ, 8) ->
-    {empty, new()};
+%% @doc Like out/1, looking only at the buckets from urgency From on.
+-spec out(pqueue(), 0..8) -> {{value, term()}, pqueue()} | {empty, pqueue()}.
+out(PQ, 8) ->
+    {empty, PQ};
 out(PQ, Urgency) ->
     Bucket = element(Urgency + 1, PQ),
     case queue:out(Bucket) of
@@ -92,6 +96,8 @@ out(PQ, Urgency) ->
 peek(PQ) ->
     peek(PQ, 0).
 
+%% @doc Like peek/1, looking only at the buckets from urgency From on.
+-spec peek(pqueue(), 0..8) -> {value, term()} | empty.
 peek(_PQ, 8) ->
     empty;
 peek(PQ, Urgency) ->
