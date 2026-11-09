@@ -88,7 +88,7 @@
 -behaviour(gen_server).
 
 %% Suppress pattern warnings for defensive callback handling (user-provided callbacks)
--dialyzer({no_match, create_connection/5}).
+-dialyzer({no_match, assign_owner/3}).
 
 -export([
     start_link/2,
@@ -1348,50 +1348,66 @@ create_connection_unconditional(
             add_cid(DCID, ConnPid, State),
             add_cid(ServerCID, ConnPid, State),
 
-            %% Invoke connection handler callback BEFORE sending packet
-            %% This ensures ownership is transferred before handshake can complete
-            case ConnHandler of
-                undefined ->
-                    ok;
-                Fun when is_function(Fun, 2) ->
-                    %% Handler takes (ConnPid, DCID)
-                    case Fun(ConnPid, DCID) of
-                        {ok, HandlerPid} when is_pid(HandlerPid) ->
-                            ok = quic:set_owner_sync(ConnPid, HandlerPid);
-                        {error, HandlerError} ->
-                            ?LOG_WARNING(
-                                #{
-                                    what => connection_handler_failed,
-                                    error => HandlerError
-                                },
-                                ?QUIC_LOG_META
-                            )
-                    end;
-                Fun when is_function(Fun, 1) ->
-                    case Fun(ConnPid) of
-                        {ok, HandlerPid} when is_pid(HandlerPid) ->
-                            %% Transfer ownership to handler (sync to ensure it completes
-                            %% before any packets trigger handshake completion)
-                            ok = quic:set_owner_sync(ConnPid, HandlerPid);
-                        {error, HandlerError} ->
-                            ?LOG_WARNING(
-                                #{
-                                    what => connection_handler_failed,
-                                    error => HandlerError
-                                },
-                                ?QUIC_LOG_META
-                            )
-                    end
-            end,
-
-            %% Send initial packet to new connection (after ownership transfer)
-            send_to_connection(ConnPid, Packet, RemoteAddr),
-
-            {ok, ConnPid};
+            %% The handler runs before the connection sees the packet, so
+            %% ownership has moved before the handshake can complete.
+            case assign_owner(ConnHandler, ConnPid, DCID) of
+                ok ->
+                    send_to_connection(ConnPid, Packet, RemoteAddr),
+                    {ok, ConnPid};
+                {error, HandlerError} ->
+                    ?LOG_ERROR(
+                        #{
+                            what => connection_handler_error,
+                            conn_pid => ConnPid,
+                            error => HandlerError
+                        },
+                        ?QUIC_LOG_META
+                    ),
+                    discard_connection(ConnPid, State),
+                    {error, connection_handler_error}
+            end;
         {error, Reason} ->
             ?LOG_WARNING(#{what => start_connection_failed, reason => Reason}, ?QUIC_LOG_META),
             {error, Reason}
     end.
+
+assign_owner(undefined, _ConnPid, _DCID) ->
+    ok;
+assign_owner(Handler, ConnPid, DCID) ->
+    try call_connection_handler(Handler, ConnPid, DCID) of
+        {ok, HandlerPid} when is_pid(HandlerPid) ->
+            set_owner(ConnPid, HandlerPid);
+        {error, HandlerError} ->
+            ?LOG_WARNING(
+                #{what => connection_handler_failed, error => HandlerError},
+                ?QUIC_LOG_META
+            ),
+            ok;
+        Other ->
+            {error, {bad_return, Other}}
+    catch
+        Class:Reason:Stack ->
+            {error, {Class, Reason, Stack}}
+    end.
+
+call_connection_handler(Handler, ConnPid, DCID) when is_function(Handler, 2) ->
+    Handler(ConnPid, DCID);
+call_connection_handler(Handler, ConnPid, _DCID) when is_function(Handler, 1) ->
+    Handler(ConnPid).
+
+set_owner(ConnPid, HandlerPid) ->
+    try quic:set_owner_sync(ConnPid, HandlerPid) of
+        ok -> ok;
+        {error, Reason} -> {error, {set_owner, Reason}}
+    catch
+        exit:Reason -> {error, {set_owner, Reason}}
+    end.
+
+%% The listener is the connection's parent, so the exit signal stops it.
+discard_connection(ConnPid, State) ->
+    cleanup_connection(ConnPid, State),
+    exit(ConnPid, shutdown),
+    ok.
 
 send_to_connection(ConnPid, Packet, RemoteAddr) ->
     ConnPid ! {quic_packet, Packet, RemoteAddr}.

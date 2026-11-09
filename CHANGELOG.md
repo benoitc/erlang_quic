@@ -31,6 +31,11 @@ All notable changes to this project will be documented in this file.
   longer resets the stream.
 - `quic:handle_timeout/2` on a connection past its idle timeout now
   closes it instead of leaving it marked closed in its state.
+- A `connection_handler` that raised, returned something other than
+  `{ok, Pid}` or `{error, Reason}`, or named an owner for a connection
+  that had already stopped, crashed the listener and took every
+  connection it served down with it. Only the connection the handler was
+  called for is now closed, and the failure is logged.
 
 ## [2.6.1] - 2026-11-08
 
