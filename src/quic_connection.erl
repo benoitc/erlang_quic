@@ -2447,10 +2447,10 @@ handle_common_event(
                 true when not is_tuple(State1#state.disconnect_timer) ->
                     disconnect_deadline(State1);
                 _ when State1#state.pto_kind =:= loss ->
-                    {keep_state, handle_loss_timeout(State1)};
+                    {keep_state, ensure_disconnect_timer(handle_loss_timeout(State1))};
                 _ ->
                     %% Handle PTO timeout - send probe packet
-                    {keep_state, handle_pto_timeout(State1)}
+                    {keep_state, ensure_disconnect_timer(handle_pto_timeout(State1))}
             end
     end;
 handle_common_event(
@@ -2462,6 +2462,8 @@ handle_common_event(
     case disconnect_timeout_expired(State1) of
         true ->
             disconnect_deadline(State1);
+        false when StateName =:= connected ->
+            {keep_state, rearm_disconnect_timer(State1)};
         false ->
             {keep_state, arm_disconnect_timer(State1)}
     end;
@@ -2476,6 +2478,7 @@ handle_common_event(
     State1 = State#state{disconnect_timer = undefined},
     case disconnect_timeout_expired(State1) of
         true -> {next_state, draining, declare_peer_dead(State1)};
+        false when StateName =:= connected -> {keep_state, rearm_disconnect_timer(State1)};
         false -> {keep_state, arm_disconnect_timer(State1)}
     end;
 handle_common_event(info, {timeout, _StaleRef, disconnect_final}, _StateName, State) ->
@@ -14360,6 +14363,24 @@ cancel_disconnect_timer(#state{disconnect_timer = {final, _}} = State) ->
 cancel_disconnect_timer(#state{disconnect_timer = Ref} = State) ->
     cancel_timer(Ref),
     State#state{disconnect_timer = undefined}.
+
+%% A confirmed connection with nothing in flight has no deadline to
+%% check: the first PTO or loss timeout of a later flight arms the check
+%% again. Before confirmation no PTO runs for Application Data, so the
+%% check keeps itself armed.
+rearm_disconnect_timer(#state{loss_state = LossState} = State) ->
+    case
+        quic_loss:handshake_confirmed(LossState) andalso
+            quic_loss:bytes_in_flight(LossState) =:= 0
+    of
+        true -> State;
+        false -> arm_disconnect_timer(State)
+    end.
+
+ensure_disconnect_timer(#state{disconnect_timer = undefined} = State) ->
+    arm_disconnect_timer(State);
+ensure_disconnect_timer(State) ->
+    State.
 
 %% Arm the disconnect check at the deadline itself. Lazy, like the idle
 %% timer: a fire that finds the deadline moved re-arms the remainder.

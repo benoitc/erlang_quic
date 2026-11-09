@@ -304,6 +304,11 @@ All notable changes to this project will be documented in this file.
   acknowledged twice within 100 ms the timer stays armed for the next
   send. Probes go out at the same times as before (RFC 9002 Section
   6.2.1).
+- The `disconnect_timeout` check no longer wakes an established
+  connection every `disconnect_timeout` when nothing is waiting for an
+  acknowledgement. It runs during the handshake as before, and from the
+  first probe timeout of data in flight, so an unresponsive peer is
+  still given up on at the same time.
 
 ### Fixed
 - A client connecting to an internationalized host name sent it in
