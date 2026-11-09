@@ -96,6 +96,9 @@ All notable changes to this project will be documented in this file.
   accepted when the stream ended with a bare FIN, with trailers, or with
   the HEADERS frame itself. All are now reset with H3_MESSAGE_ERROR (RFC
   9114 Section 4.1.2).
+- `content-length: +10` and `:status: +200` were accepted. Both must be
+  digits only (RFC 9110 Sections 8.6 and 15); anything else is a
+  malformed message.
 
 ## [2.6.1] - 2026-11-08
 

@@ -3760,14 +3760,18 @@ response_has_request_pseudo([{<<":protocol">>, _} | _]) ->
 response_has_request_pseudo([_ | Rest]) ->
     response_has_request_pseudo(Rest).
 
-%% Safe binary to integer conversion with proper error handling
+%% Digits only: RFC 9110 Section 8.6 has Content-Length = 1*DIGIT and
+%% Section 15 a three-digit status code, where binary_to_integer/1 would
+%% take a sign.
 safe_binary_to_integer(Bin, FieldName) ->
-    try binary_to_integer(Bin) of
-        N when N >= 0 -> N;
-        _ -> throw({header_error, {invalid_field, FieldName, Bin}})
-    catch
-        error:badarg -> throw({header_error, {invalid_field, FieldName, Bin}})
+    case Bin =/= <<>> andalso all_digits(Bin) of
+        true -> binary_to_integer(Bin);
+        false -> throw({header_error, {invalid_field, FieldName, Bin}})
     end.
+
+all_digits(<<C, Rest/binary>>) when C >= $0, C =< $9 -> all_digits(Rest);
+all_digits(<<>>) -> true;
+all_digits(_) -> false.
 
 %% Validate trailer headers (RFC 9114 Section 4.1.2)
 %% Trailers MUST NOT contain pseudo-headers or duplicate Content-Length

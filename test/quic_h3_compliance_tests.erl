@@ -4078,3 +4078,37 @@ upload_start(ContentLength) ->
         (request_frame(<<"POST">>, <<"/upload">>, [{<<"content-length">>, ContentLength}]))/binary,
         (quic_h3_frame:encode_data(<<"abc">>))/binary
     >>.
+
+%% RFC 9110 Section 8.6: Content-Length = 1*DIGIT, so no sign.
+signed_content_length_is_malformed_test() ->
+    State = make_test_state(#{role => server}),
+    Headers = fun(Value) -> valid_request_headers() ++ [{<<"content-length">>, Value}] end,
+    Stream = #h3_stream{id = 0},
+    [
+        ?assertEqual(
+            {error, {invalid_field, <<"content-length">>, Value}},
+            quic_h3_connection:update_stream_with_headers(Headers(Value), Stream, server, State)
+        )
+     || Value <- [<<"+10">>, <<"-0">>, <<>>]
+    ],
+    ?assertMatch(
+        {ok, #h3_stream{content_length = 10}},
+        quic_h3_connection:update_stream_with_headers(Headers(<<"10">>), Stream, server, State)
+    ).
+
+%% The same for :status, three digits (RFC 9110 Section 15).
+signed_status_is_malformed_test() ->
+    State = make_test_state(#{role => client}),
+    Stream = #h3_stream{id = 0},
+    ?assertEqual(
+        {error, {invalid_field, <<":status">>, <<"+200">>}},
+        quic_h3_connection:update_stream_with_headers(
+            [{<<":status">>, <<"+200">>}], Stream, client, State
+        )
+    ),
+    ?assertMatch(
+        {ok, #h3_stream{status = 200}},
+        quic_h3_connection:update_stream_with_headers(
+            [{<<":status">>, <<"200">>}], Stream, client, State
+        )
+    ).
