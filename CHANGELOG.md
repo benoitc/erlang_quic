@@ -58,6 +58,10 @@ All notable changes to this project will be documented in this file.
   second request. A cancelled stream is now ignored until the peer ends
   it, and the peer is asked to stop sending (RFC 9114 Section 4.1.1, RFC
   9000 Section 3.5).
+- When several requests waiting for QPACK encoder stream data were
+  unblocked together and one was malformed, the others lost their state
+  or were never processed. Only the malformed one is reset now (RFC 9204
+  Section 2.1.2).
 
 ## [2.6.1] - 2026-11-08
 
