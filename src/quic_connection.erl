@@ -12392,6 +12392,8 @@ send_connection_close(Reason, State) ->
 alert_and_exit(AlertCode, State, Reason) ->
     Sent = send_tls_alert(AlertCode, State),
     _ = flush_socket_batch(Sent),
+    %% The owner need not be linked to or monitoring this process.
+    notify_owner({closed, {tls_alert, Reason}}, State),
     exit({tls_alert, Reason}).
 
 send_tls_alert(AlertCode, State) ->

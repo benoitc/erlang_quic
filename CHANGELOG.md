@@ -17,6 +17,9 @@ All notable changes to this project will be documented in this file.
   `reset_stream_at`, `stop_sending`, `set_stream_deadline` and
   `set_owner` are refused with an error instead of crashing the
   connection and its owner.
+- The owner of a connection whose handshake fails with a TLS alert, for
+  example a server rejecting the client's ALPN, now gets `{closed,
+  {tls_alert, Reason}}`.
 
 ## [2.6.1] - 2026-11-08
 

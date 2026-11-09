@@ -18,6 +18,34 @@ server_rejects_unknown_alpn_test_() ->
         )
     end}.
 
+%% The handler owns the connection from the first Initial and does not
+%% monitor it: the close event is all that tells it the handshake failed.
+server_owner_is_told_of_rejected_alpn_test_() ->
+    {timeout, 20, fun() ->
+        Test = self(),
+        Handler = fun(Conn, _Ref) ->
+            {ok,
+                spawn(fun() ->
+                    receive
+                        {quic, Conn, {closed, Reason}} -> Test ! {owner_closed, Reason}
+                    end
+                end)}
+        end,
+        {ok, Server} = quic_test_echo_server:start(#{connection_handler => Handler}),
+        try
+            Opts = maps:merge(quic_test_echo_server:client_opts(), #{alpn => [<<"not-served">>]}),
+            {ok, Conn} = quic:connect(<<"127.0.0.1">>, maps:get(port, Server), Opts, self()),
+            receive
+                {owner_closed, Reason} ->
+                    ?assertEqual({tls_alert, no_application_protocol}, Reason)
+            after ?WAIT_MS -> ?assert(false)
+            end,
+            quic:safe_close(Conn)
+        after
+            quic_test_echo_server:stop(Server)
+        end
+    end}.
+
 client_rejects_missing_alpn_test_() ->
     {timeout, 20, fun() ->
         ok = meck:new(quic_tls, [passthrough]),
