@@ -1584,7 +1584,24 @@ handle_stream_data(StreamId, Data, Fin, #state{held_streams = Held} = State) whe
     is_map_key(StreamId, Held)
 ->
     hold_stream_data(StreamId, Data, Fin, State);
+handle_stream_data(StreamId, Data, true, State) when (StreamId band 2) =/= 0 ->
+    case dispatch_stream_data(StreamId, Data, true, State) of
+        {ok, State1} -> {ok, forget_uni_stream(StreamId, State1)};
+        Other -> Other
+    end;
 handle_stream_data(StreamId, Data, Fin, State) ->
+    dispatch_stream_data(StreamId, Data, Fin, State).
+
+%% A unidirectional stream the peer has ended: nothing else arrives on it,
+%% and no reset will come to clear what was kept to route its bytes.
+forget_uni_stream(StreamId, State) ->
+    State#state{
+        uni_stream_buffers = maps:remove(StreamId, State#state.uni_stream_buffers),
+        discarded_uni_streams = sets:del_element(StreamId, State#state.discarded_uni_streams),
+        claimed_uni_streams = maps:remove(StreamId, State#state.claimed_uni_streams)
+    }.
+
+dispatch_stream_data(StreamId, Data, Fin, State) ->
     case classify_stream(StreamId, State) of
         {uni, discarded} ->
             %% RFC 9114 §6.2.3: unknown uni-stream bytes are ignored.

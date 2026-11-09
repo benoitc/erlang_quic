@@ -3877,3 +3877,54 @@ dynamic_response() ->
 has_outstanding_sections(StreamId, State) ->
     Encoder = element(13, State),
     quic_qpack:release_stream(StreamId, Encoder) =/= Encoder.
+
+%%====================================================================
+%% Unidirectional streams that end with FIN
+%%====================================================================
+
+%% A stream of an unknown type is remembered so its bytes are ignored
+%% (RFC 9114 §6.2.3), and one whose type has not arrived is buffered.
+%% Both are forgotten when the stream ends, not only when it is reset.
+ended_uni_streams_are_forgotten_test() ->
+    State0 = make_test_state(#{role => server}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(2, <<16#21>>, false, State0),
+    ?assert(sets:is_element(2, quic_h3_connection:test_discarded_uni_streams(State1))),
+    {ok, State2} = quic_h3_connection:handle_stream_data(2, <<"ignored">>, true, State1),
+    %% the type and the FIN together
+    {ok, State3} = quic_h3_connection:handle_stream_data(6, <<16#21>>, true, State2),
+    %% a two-byte type cut short, then nothing
+    {ok, State4} = quic_h3_connection:handle_stream_data(10, <<16#40>>, false, State3),
+    ?assertEqual(#{10 => <<16#40>>}, element(24, State4)),
+    {ok, State5} = quic_h3_connection:handle_stream_data(10, <<>>, true, State4),
+    {ok, State6} = quic_h3_connection:handle_stream_data(14, <<>>, true, State5),
+    ?assertEqual(0, sets:size(quic_h3_connection:test_discarded_uni_streams(State6))),
+    %% uni_stream_buffers is at position 24
+    ?assertEqual(#{}, element(24, State6)).
+
+%% So is a stream the owner claimed, after its last bytes are delivered.
+an_ended_claimed_uni_stream_is_forgotten_test() ->
+    flush_mailbox(),
+    Claim = fun(_Dir, _StreamId, _Type) -> claim end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Claim}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        2, <<16#40, 16#54, "ab">>, false, State0
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(2, <<"cd">>, true, State1),
+    Self = self(),
+    ?assertEqual(
+        [
+            {stream_type_open, uni, 2, 16#54},
+            {stream_type_data, uni, 2, <<"ab">>, false},
+            {stream_type_data, uni, 2, <<"cd">>, true}
+        ],
+        [
+            receive
+                {quic_h3, Self, Event} -> Event
+            after 100 -> nothing
+            end
+         || _ <- [1, 2, 3]
+        ]
+    ),
+    %% claimed_uni_streams is at position 49
+    ?assertEqual(#{2 => 16#54}, element(49, State1)),
+    ?assertEqual(#{}, element(49, State2)).
