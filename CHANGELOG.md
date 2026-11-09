@@ -70,6 +70,10 @@ All notable changes to this project will be documented in this file.
   so that set could grow without limit. A CANCEL_PUSH for a push with no
   open stream is now ignored; one above MAX_PUSH_ID is still H3_ID_ERROR
   (RFC 9114 Section 7.2.3).
+- A server that answered requests without registering a stream handler
+  kept each request's unread body buffered after the exchange finished,
+  and eventually reset every new request with H3_EXCESSIVE_LOAD. The
+  buffer is released when the stream finishes.
 
 ## [2.6.1] - 2026-11-08
 

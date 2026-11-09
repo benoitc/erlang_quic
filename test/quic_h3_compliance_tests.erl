@@ -1099,6 +1099,32 @@ buffer_survives_a_plain_fin_test() ->
     {ok, _, State1} = deliver(0, <<"hello">>, true, buffering_state(#{})),
     ?assertMatch(#{0 := _}, quic_h3_connection:test_stream_data_buffers(State1)).
 
+%% Released once the exchange is over, though: the stream is gone, so no
+%% handler can come for it. A server that answers without registering one
+%% would otherwise spend the budget one request at a time and end up
+%% refusing every request with H3_EXCESSIVE_LOAD.
+answered_requests_do_not_spend_the_budget_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{
+        role => server, quic_conn => Quic, max_buffered_body => 4 * ?H3_BUFFER_CHUNK_OVERHEAD
+    }),
+    State1 = lists:foldl(
+        fun(StreamId, State) ->
+            {ok, StateA} = quic_h3_connection:handle_stream_data(
+                StreamId, request_frame(<<"GET">>, <<"/">>), true, State
+            ),
+            Answered = quic_h3_connection:do_respond(StreamId, 200, [], <<"ok">>, StateA),
+            ?assertMatch({ok, _}, Answered),
+            element(2, Answered)
+        end,
+        State0,
+        lists:seq(0, 36, 4)
+    ),
+    ?assertEqual(#{}, quic_h3_connection:test_stream_data_buffers(State1)),
+    ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic))),
+    flush_owner_events().
+
 %% A server holding one stream's body at the limit still refuses another
 %% stream's, because the budget belongs to the connection.
 budget_is_shared_across_streams_test() ->

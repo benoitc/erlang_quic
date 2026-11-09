@@ -2743,7 +2743,7 @@ handle_request_stream_data(StreamId, _Data, true, #h3_stream{state = closed}, St
 handle_request_stream_data(_StreamId, _Data, false, #h3_stream{state = closed}, State) ->
     {ok, State};
 handle_request_stream_data(
-    StreamId, Combined, Fin, Stream, #state{streams = Streams, stream_buffers = Buffers} = State
+    StreamId, Combined, Fin, Stream, #state{stream_buffers = Buffers} = State
 ) ->
     case process_request_frames(StreamId, Combined, Fin, Stream, State) of
         {ok, Rest, #h3_stream{data_remaining = Owed}, _State1} when
@@ -2768,8 +2768,7 @@ handle_request_stream_data(
                 end,
             State3 = State2#state{stream_buffers = Buffers1},
             Stream3 = report_overhead(StreamId, Stream2, State3),
-            Streams1 = store_stream(StreamId, Stream3, Streams),
-            {ok, State3#state{streams = Streams1}};
+            {ok, store_stream(StreamId, Stream3, State3)};
         {error, Reason} ->
             {error, Reason, State}
     end.
@@ -4180,10 +4179,10 @@ do_send_data(
                             true -> close_half(local, Stream);
                             false -> Stream
                         end,
-                    {ok, State#state{
-                        streams = store_stream(StreamId, Stream1, Streams),
-                        pending_response_headers = Pending1
-                    }};
+                    {ok,
+                        store_stream(StreamId, Stream1, State#state{
+                            pending_response_headers = Pending1
+                        })};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -4222,7 +4221,7 @@ do_send_trailers(
 send_trailers_frame({error, _} = Error, _StreamId, _Trailers, _Encoded, _Stream) ->
     Error;
 send_trailers_frame(
-    {ok, #state{quic_conn = QuicConn, streams = Streams} = State2},
+    {ok, #state{quic_conn = QuicConn} = State2},
     StreamId,
     Trailers,
     Encoded,
@@ -4241,11 +4240,8 @@ send_trailers_frame(
     case quic:send_data(QuicConn, StreamId, Payload, true) of
         ok ->
             Stream1 = close_half(local, Stream#h3_stream{trailers = Trailers}),
-            State3 = State2#state{
-                streams = store_stream(StreamId, Stream1, Streams),
-                pending_response_headers = Pending1
-            },
-            {ok, State3};
+            State3 = State2#state{pending_response_headers = Pending1},
+            {ok, store_stream(StreamId, Stream1, State3)};
         {error, Reason} ->
             {error, Reason, State2}
     end.
@@ -4539,11 +4535,13 @@ close_half(local, Stream) ->
 
 %% A finished stream is not kept: its entry holds the header list for the
 %% life of the connection, and an unfinished-looking map also stops a
-%% GOAWAY-ed connection from ever draining.
-store_stream(StreamId, #h3_stream{state = closed, reset = false}, Streams) ->
-    maps:remove(StreamId, Streams);
-store_stream(StreamId, Stream, Streams) ->
-    Streams#{StreamId => Stream}.
+%% GOAWAY-ed connection from ever draining. A body no handler came for
+%% goes with it, since none can register for the stream any more.
+store_stream(StreamId, #h3_stream{state = closed, reset = false}, State) ->
+    State1 = release_buffered(StreamId, State),
+    State1#state{streams = maps:remove(StreamId, State1#state.streams)};
+store_stream(StreamId, Stream, #state{streams = Streams} = State) ->
+    State#state{streams = Streams#{StreamId => Stream}}.
 
 %% Only what gets buffered is charged: a client hands each piece to its
 %% owner, and so does a server once the stream has a handler.
