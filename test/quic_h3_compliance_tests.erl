@@ -205,6 +205,50 @@ headers_after_trailers_reset_the_stream_test() ->
 trailers_frame() ->
     quic_h3_frame:encode_headers(quic_qpack:encode([{<<"x-sum">>, <<"1">>}])).
 
+%% A request stream that ends before any HEADERS, empty or with nothing
+%% but frames of unknown types, has no request to answer.
+request_stream_ending_without_headers_is_incomplete_test() ->
+    lists:foreach(
+        fun(Pieces) ->
+            flush_owner_events(),
+            Quic = fake_quic_conn(),
+            State0 = make_test_state(#{role => server, quic_conn => Quic}),
+            State1 = lists:foldl(
+                fun({Data, Fin}, State) ->
+                    {ok, Next} = quic_h3_connection:handle_stream_data(0, Data, Fin, State),
+                    Next
+                end,
+                State0,
+                Pieces
+            ),
+            ?assertEqual(
+                [{close_stream, 0, ?H3_REQUEST_INCOMPLETE}], fake_quic_calls(Quic)
+            ),
+            ?assertEqual(#{}, quic_h3_connection:test_streams(State1)),
+            ?assertEqual(nothing, next_owner_event())
+        end,
+        [
+            [{<<>>, true}],
+            [{<<16#21, 1, $x>>, true}],
+            [{<<16#21, 1, $x>>, false}, {<<>>, true}]
+        ]
+    ).
+
+%% One that ends after its HEADERS is a request.
+request_stream_ending_after_headers_is_complete_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        0, request_frame(<<"GET">>, <<"/">>), false, State0
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<>>, true, State1),
+    ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()),
+    ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic))),
+    ?assertMatch(
+        #{0 := #h3_stream{state = half_closed_remote}}, quic_h3_connection:test_streams(State2)
+    ).
+
 %%====================================================================
 %% Content-Length Enforcement Tests (RFC 9114 Section 4.1.2)
 %%====================================================================

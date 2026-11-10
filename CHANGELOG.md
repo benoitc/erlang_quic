@@ -130,6 +130,10 @@ All notable changes to this project will be documented in this file.
   to the FIN, never completed: the client got its headers and data but
   no `push_complete`, and kept the push for the life of the connection.
   The FIN is now seen wherever it arrives (RFC 9114 Section 4.6).
+- A server ignored a request stream that ended with no HEADERS at all,
+  empty or holding only frames of unknown types, and kept an entry for
+  it. The stream is now reset with H3_REQUEST_INCOMPLETE and forgotten
+  (RFC 9114 Section 4.1).
 
 ## [2.6.1] - 2026-11-08
 
