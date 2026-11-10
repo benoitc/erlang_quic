@@ -92,6 +92,21 @@ probe_answer_is_padded_when_the_limit_allows_test() ->
         )
     end).
 
+a_short_probe_answer_challenges_the_address_test() ->
+    with_peer(fun(Peer, Sock) ->
+        S1 = probe(1, 60, Peer, with_spare_cid(state())),
+        [Answer] = recv_all(Sock),
+        ?assert(byte_size(Answer) =< 180),
+        [#path_state{challenge_data = undefined, short_challenges = [Data]}] =
+            quic_connection_test_support:alt_paths(S1),
+        S2 = quic_connection:handle_path_response(Data, S1),
+        ?assertMatch([D] when byte_size(D) >= 1200, recv_all(Sock)),
+        ?assertMatch(
+            [#path_state{status = validating, challenge_data = <<_:64>>, short_challenges = []}],
+            quic_connection_test_support:alt_paths(S2)
+        )
+    end).
+
 holds_data_to_a_second_address_during_the_handshake_test() ->
     with_peer(fun(Peer, Sock) ->
         S1 = hs_recv(1, 100, ?SPOOFED, handshaking()),

@@ -10,9 +10,10 @@ All notable changes to this project will be documented in this file.
   client that knew the connection keys could send small probes with a
   spoofed source address and have the server send about twenty times as
   much to a third party. What the server sends to such an address is now
-  held to three times what it received from it, as RFC 9000 requires; a
-  response the full-size datagram does not fit in goes out alone and
-  smaller, and the path is challenged once a full-size datagram fits.
+  held to three times what it received from it, as RFC 9000 requires; an
+  answer the full-size datagram does not fit in goes out smaller, with a
+  PATH_CHALLENGE that only validates the address; the path is challenged
+  again at full size once the address has answered.
 - A client that moved twice before the handshake was confirmed was
   followed to its second address without that address being validated
   or the amount sent to it being limited, so its data went out in full

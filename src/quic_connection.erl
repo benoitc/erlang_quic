@@ -62,6 +62,9 @@
     domain => [erlang_quic, connection], report_cb => fun quic_log:format_report/2
 }).
 
+%% A PATH_RESPONSE and a PATH_CHALLENGE in an unpadded 1-RTT packet.
+-define(SHORT_PROBE_ANSWER_SIZE, 60).
+
 %% Suppress warnings for helper functions prepared for future use
 -compile([{nowarn_unused_function, [{send_handshake_ack, 1}, {contains_non_probing_frame, 1}]}]).
 
@@ -13787,17 +13790,21 @@ answer_probe_on_new_path(Addr, Via, ResponseData, #state{mig = Mig} = State, DCI
                 {#path_state{remote_addr = Addr, bytes_received = Mig#mig.pass_rx}, Rest}
         end,
     Path1 = Path0#path_state{dcid = DCID, dcid_seq = Seq, via = Via},
+    ChallengeData = crypto:strong_rand_bytes(8),
+    Both = [{path_response, ResponseData}, {path_challenge, ChallengeData}],
     {Path, Frames} =
-        case path_room(Addr, Via, with_alt_path(Path1, Others, State)) >= 1200 of
-            true ->
-                ChallengeData = crypto:strong_rand_bytes(8),
+        case path_room(Addr, Via, with_alt_path(Path1, Others, State)) of
+            Room when Room >= 1200 ->
                 {
                     Path1#path_state{
                         status = validating, challenge_data = ChallengeData, challenge_count = 1
                     },
-                    [{path_response, ResponseData}, {path_challenge, ChallengeData}]
+                    Both
                 };
-            false ->
+            Room when Room >= ?SHORT_PROBE_ANSWER_SIZE ->
+                Short = Path1#path_state.short_challenges,
+                {Path1#path_state{short_challenges = [ChallengeData | Short]}, Both};
+            _ ->
                 {Path1, [{path_response, ResponseData}]}
         end,
     State1 = with_alt_path(Path, Others, State),
@@ -14308,7 +14315,14 @@ path_room(Addr, Via, #state{
 }) ->
     max(0, 3 * Rx - Tx);
 path_room(Addr, Via, #state{cfg = #conn_cfg{role = server}, mig = #mig{alt_paths = Paths}}) ->
-    case [P || #path_state{status = St} = P <- Paths, St =/= validated, is_path(Addr, Via, P)] of
+    case
+        [
+            P
+         || #path_state{status = St, address_validated = false} = P <- Paths,
+            St =/= validated,
+            is_path(Addr, Via, P)
+        ]
+    of
         [#path_state{bytes_sent = Tx, bytes_received = Rx} | _] -> max(0, 3 * Rx - Tx);
         [] -> infinity
     end;
@@ -14691,6 +14705,19 @@ handle_path_response(ResponseData, State) ->
         {address_validated, State1} ->
             release_held(State1);
         no_match ->
+            handle_alt_path_response(ResponseData, State)
+    end.
+
+handle_alt_path_response(ResponseData, State) ->
+    case
+        lists:partition(
+            fun(#path_state{short_challenges = Short}) -> lists:member(ResponseData, Short) end,
+            alt_paths(State)
+        )
+    of
+        {[Path | _], Others} ->
+            check_alt_path_mtu(Path, Others, State);
+        {[], _} ->
             %% Check alt_paths (client validating paths)
             case find_path_by_challenge(ResponseData, (State#state.mig)#mig.alt_paths) of
                 {ok, PathState, OtherPaths} ->
@@ -14756,6 +14783,21 @@ check_peer_validation_response(ResponseData, #state{mig = Mig} = State) ->
         _ ->
             no_match
     end.
+
+%% A probed address answered a challenge that the limit kept under 1200
+%% bytes: the address is good, the path gets a full-size challenge
+%% (RFC 9000 Section 8.2.1).
+check_alt_path_mtu(#path_state{remote_addr = Addr, via = Via} = Path0, Others, State) ->
+    Data = crypto:strong_rand_bytes(8),
+    Path = Path0#path_state{
+        address_validated = true,
+        status = validating,
+        challenge_data = Data,
+        challenge_count = 1,
+        short_challenges = []
+    },
+    State1 = with_alt_path(Path, Others, State),
+    send_path_frames(Addr, Via, path_dcid(Path, State1), [{path_challenge, Data}], State1).
 
 %% The address answered, but in a datagram too small to show the path
 %% carries 1200 bytes; a full-size challenge must be answered before the
