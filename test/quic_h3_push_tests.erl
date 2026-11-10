@@ -150,7 +150,7 @@ cancelled_push_stream_ignored_test() ->
     }),
     %% Push stream arrives with cancelled push ID (5)
     %% This should return {ok, State} not {error, ...}
-    Result = quic_h3_connection:process_push_stream_id(100, 5, <<>>, State),
+    Result = quic_h3_connection:process_push_stream_id(100, 5, <<>>, false, State),
     ?assertMatch({ok, _}, Result),
     %% Verify the stream buffer was removed
     {ok, State1} = Result,
@@ -169,7 +169,7 @@ non_cancelled_push_works_test() ->
         received_pushes => #{}
     }),
     %% Push stream should be processed normally
-    Result = quic_h3_connection:process_push_stream_id(100, 5, <<>>, State),
+    Result = quic_h3_connection:process_push_stream_id(100, 5, <<>>, false, State),
     ?assertMatch({ok, _}, Result).
 
 %% Push ID exceeds MAX_PUSH_ID should still error
@@ -183,7 +183,7 @@ push_exceeds_max_id_error_test() ->
         received_pushes => #{}
     }),
     %% Push ID 15 exceeds max_push_id of 10
-    Result = quic_h3_connection:process_push_stream_id(100, 15, <<>>, State),
+    Result = quic_h3_connection:process_push_stream_id(100, 15, <<>>, false, State),
     ?assertMatch({error, {connection_error, ?H3_ID_ERROR, _}, _}, Result).
 
 %%====================================================================
@@ -265,12 +265,55 @@ push_stream_tracks_frame_state_test() ->
         received_pushes => #{}
     }),
     %% Correlate push stream - should set state to expecting_headers
-    {ok, State1} = quic_h3_connection:process_push_stream_id(100, 5, <<>>, State),
+    {ok, State1} = quic_h3_connection:process_push_stream_id(100, 5, <<>>, false, State),
     %% received_pushes is at position 40 and stores #h3_stream{}.
     Received = element(40, State1),
     PushStream = maps:get(5, Received),
     ?assertEqual(100, element(2, PushStream)),
     ?assertEqual(expecting_headers, element(15, PushStream)).
+
+%% A pushed response that arrives whole, stream type to FIN in one
+%% delivery, completes like one that arrives in pieces.
+push_stream_in_one_delivery_completes_test() ->
+    Push = <<
+        1,
+        5,
+        (quic_h3_frame:encode_headers(quic_qpack:encode([{<<":status">>, <<"200">>}])))/binary,
+        (quic_h3_frame:encode_data(<<"abc">>))/binary
+    >>,
+    Split = byte_size(Push) - 2,
+    <<Head:Split/binary, Tail/binary>> = Push,
+    lists:foreach(
+        fun(Pieces) ->
+            _ = push_events(),
+            State0 = make_test_state(#{
+                role => client,
+                local_max_push_id => 10,
+                promised_pushes => #{5 => {0, [{<<":method">>, <<"GET">>}]}}
+            }),
+            State1 = lists:foldl(
+                fun({Data, Fin}, State) ->
+                    {ok, Next} = quic_h3_connection:handle_stream_data(3, Data, Fin, State),
+                    Next
+                end,
+                State0,
+                Pieces
+            ),
+            Events = push_events(),
+            ?assertMatch([{push_stream, 5, 0, _}, {push_response, 5, 200, _} | _], Events),
+            ?assertEqual(<<"abc">>, <<<<Data/binary>> || {push_data, 5, Data, _Fin} <- Events>>),
+            ?assertEqual({push_complete, 5}, lists:last(Events)),
+            %% received_pushes is at position 40
+            ?assertEqual(#{}, element(40, State1))
+        end,
+        [[{Push, true}], [{Head, false}, {Tail, true}]]
+    ).
+
+push_events() ->
+    receive
+        {quic_h3, _Conn, Event} -> [Event | push_events()]
+    after 0 -> []
+    end.
 
 %%====================================================================
 %% Push Response Header Validation Tests (RFC 9114 Section 4.6)
