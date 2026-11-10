@@ -338,6 +338,10 @@ All notable changes to this project will be documented in this file.
   its session tickets need. An established connection holds 8224 bytes
   of process memory where it held 9960, and 1744 bytes less in binaries
   (loopback).
+- A run of PADDING frames is processed as one frame instead of one per
+  byte, about a thousand in a padded Initial. A server connection runs
+  27 garbage collections during its handshake where it ran 41
+  (loopback). qlog reports such a run as a single `padding` frame.
 
 ### Fixed
 - A client connecting to an internationalized host name sent it in

@@ -6379,10 +6379,18 @@ decode_and_process_streaming(Level, Data, State, Acc) ->
                 State
             ),
             {ok, NewState, lists:reverse(Acc)};
+        {padding, Rest} ->
+            NewState = process_frame_track_probing(Level, padding, State),
+            decode_and_process_streaming(Level, skip_padding(Rest), NewState, [padding | Acc]);
         {Frame, Rest} ->
             NewState = process_frame_track_probing(Level, Frame, State),
             decode_and_process_streaming(Level, Rest, NewState, [Frame | Acc])
     end.
+
+%% A padded Initial carries about a thousand PADDING frames, one byte
+%% each; a run is handled as one.
+skip_padding(<<0, Rest/binary>>) -> skip_padding(Rest);
+skip_padding(Rest) -> Rest.
 
 %% quic_frame:decode/1 raises on a frame cut short by the end of the
 %% packet.
