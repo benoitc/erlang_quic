@@ -144,6 +144,12 @@ All notable changes to this project will be documented in this file.
   the start of a new stream: a HEADERS frame among them became a second
   request, anything else could close the connection. They are dropped
   until the stream's end has been seen (RFC 9114 Section 4.1.1).
+- A request stream reset for an error of its own, a malformed message
+  for example, kept being read: only RESET_STREAM was sent, so the peer
+  went on sending a body nobody wanted. STOP_SENDING is sent as well,
+  as on `cancel_stream`, and the stream is forgotten once the peer has
+  ended it; one that failed at its FIN used to stay for the life of the
+  connection (RFC 9114 Section 8, RFC 9000 Section 3.5).
 
 ## [2.6.1] - 2026-11-08
 

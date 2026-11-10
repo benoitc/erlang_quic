@@ -2209,16 +2209,9 @@ retry_blocked_streams_fold([{StreamId, {_RIC, HeaderBlock, Fin}} | Rest], State)
             end;
         {error, {stream_reset, SId, Code}} ->
             %% One stream's error leaves the others to be retried.
-            State1 = reset_request_stream(SId, Code, State),
-            Closed = Stream#h3_stream{state = closed, reset = true, data_remaining = 0},
-            State2 = release_buffered(SId, State1),
-            retry_blocked_streams_fold(
-                Rest,
-                State2#state{
-                    streams = (State2#state.streams)#{SId => Closed},
-                    stream_buffers = maps:remove(SId, State2#state.stream_buffers)
-                }
-            );
+            {Closed, State1} = fail_request_stream(SId, Code, Fin, Stream, State),
+            State2 = State1#state{stream_buffers = maps:remove(SId, State1#state.stream_buffers)},
+            retry_blocked_streams_fold(Rest, store_stream(SId, Closed, State2));
         {error, Reason} ->
             %% Connection error - stop processing
             {error, Reason}
@@ -2844,13 +2837,12 @@ hold_behind_blocked(StreamId, Held, Fin, Stream, State) ->
     Total = State#state.buffered_bytes + Others + byte_size(Held),
     case Total > State#state.max_buffered_body of
         true ->
-            State1 = reset_request_stream(StreamId, ?H3_EXCESSIVE_LOAD, State),
-            State2 = release_buffered(StreamId, State1),
-            Closed = Stream#h3_stream{state = closed, reset = true, data_remaining = 0},
-            State2#state{
-                streams = (State2#state.streams)#{StreamId => Closed},
+            {Closed, State1} = fail_request_stream(
+                StreamId, ?H3_EXCESSIVE_LOAD, Fin, Stream, State
+            ),
+            store_stream(StreamId, Closed, State1#state{
                 stream_buffers = maps:remove(StreamId, Buffers)
-            };
+            });
         false ->
             #{StreamId := {RIC, HeaderBlock, _Fin}} = Blocked,
             Buffers1 =
@@ -2903,11 +2895,7 @@ finish_request_stream(_StreamId, Stream, State) ->
 finished_or_reset(_StreamId, {ok, Stream1, State1}, _Stream, _State) ->
     {Stream1, State1};
 finished_or_reset(StreamId, {error, {stream_reset, _StreamId, Code}}, Stream, State) ->
-    State1 = reset_request_stream(StreamId, Code, State),
-    {
-        Stream#h3_stream{frame_state = complete, state = closed, reset = true},
-        release_buffered(StreamId, State1)
-    }.
+    fail_request_stream(StreamId, Code, true, Stream#h3_stream{frame_state = complete}, State).
 
 %% The Status argument is what the response says. A `:status' the caller
 %% also put in the header list would otherwise be sent alongside it, and
@@ -2991,12 +2979,20 @@ process_request_frame(StreamId, Frame, FrameFin, Rest, Fin, Stream, State) ->
         {error, {stream_reset, SId, Code}} ->
             %% Stream-level error: reset it, and drop what else arrives on
             %% it, the rest of a DATA frame included.
-            State1 = reset_request_stream(SId, Code, State),
-            {ok, <<>>, Stream#h3_stream{state = closed, reset = true, data_remaining = 0},
-                release_buffered(SId, State1)};
+            {Closed, State1} = fail_request_stream(SId, Code, Fin, Stream, State),
+            {ok, <<>>, Closed, State1};
         {error, Reason} ->
             {error, Reason}
     end.
+
+%% A stream error: the stream is reset and, as on a cancel, reading is
+%% aborted unless the peer's FIN has been seen (RFC 9000 Section 3.5). The
+%% entry is then kept, marked reset, to swallow what arrives; after the
+%% FIN nothing does, and store_stream/3 drops it.
+fail_request_stream(StreamId, Code, Fin, Stream, State) ->
+    State1 = release_buffered(StreamId, reset_request_stream(StreamId, Code, State)),
+    Reset = not Fin andalso stop_reading(StreamId, Code, Stream, State1),
+    {Stream#h3_stream{state = closed, reset = Reset, data_remaining = 0}, State1}.
 
 handle_request_frame(
     StreamId,
@@ -4410,18 +4406,32 @@ live_stream(StreamId, Streams) ->
 %% closed, so that what arrives is dropped instead of being read as a new
 %% request. That holds when QUIC no longer knows the stream too: it has
 %% the stream's end, which is still on its way to this process.
-abort_reading(StreamId, ErrorCode, Streams, #state{quic_conn = QuicConn}) ->
+abort_reading(StreamId, ErrorCode, Streams, State) ->
     case Streams of
-        #{StreamId := #h3_stream{state = StreamState} = Stream} when
-            StreamState =:= open; StreamState =:= half_closed_local
-        ->
-            _ = quic:stop_sending(QuicConn, StreamId, ErrorCode),
-            Streams#{
-                StreamId := Stream#h3_stream{state = closed, reset = true, data_remaining = 0}
-            };
+        #{StreamId := Stream} ->
+            case stop_reading(StreamId, ErrorCode, Stream, State) of
+                true ->
+                    Streams#{
+                        StreamId := Stream#h3_stream{
+                            state = closed, reset = true, data_remaining = 0
+                        }
+                    };
+                false ->
+                    maps:remove(StreamId, Streams)
+            end;
         _ ->
-            maps:remove(StreamId, Streams)
+            Streams
     end.
+
+%% Sends STOP_SENDING unless the peer's end of the stream has been seen;
+%% true when it has not.
+stop_reading(StreamId, ErrorCode, #h3_stream{state = StreamState}, #state{quic_conn = QuicConn}) when
+    StreamState =:= open; StreamState =:= half_closed_local
+->
+    _ = quic:stop_sending(QuicConn, StreamId, ErrorCode),
+    true;
+stop_reading(_StreamId, _ErrorCode, _Stream, _State) ->
+    false.
 
 %%====================================================================
 %% Internal: Per-stream Handler Registration
