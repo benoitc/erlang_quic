@@ -3832,12 +3832,74 @@ insert_literal(Name) ->
     <<2#010:3, (byte_size(Name)):5, Name/binary, 1, $v>>.
 
 %%====================================================================
+%% Frames behind blocked HEADERS (RFC 9204 §2.1.2)
+%%====================================================================
+
+%% A request's content waits with its blocked HEADERS, whether it comes
+%% with them or later, and is read once they decode.
+content_with_blocked_headers_waits_test() ->
+    Upload = <<(blocked_request(1))/binary, (quic_h3_frame:encode_data(<<"abc">>))/binary>>,
+    content_behind_blocked_headers([{Upload, true}]).
+
+content_after_blocked_headers_waits_test() ->
+    <<Start:2/binary, End/binary>> = quic_h3_frame:encode_data(<<"abc">>),
+    content_behind_blocked_headers([
+        {<<(blocked_request(1))/binary, Start/binary>>, false}, {End, false}, {<<>>, true}
+    ]).
+
+content_behind_blocked_headers(Pieces) ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = blocking_state(#{quic_conn => Quic, local_max_blocked_streams => 1}),
+    State1 = lists:foldl(
+        fun({Data, Fin}, State) ->
+            {ok, Next} = quic_h3_connection:handle_stream_data(0, Data, Fin, State),
+            Next
+        end,
+        State0,
+        Pieces
+    ),
+    ?assertEqual(nothing, next_owner_event()),
+    ?assertEqual([], fake_quic_calls(Quic)),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        2, insert_literal(<<"x-a">>), false, State1
+    ),
+    ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()),
+    ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic))),
+    #{0 := {Chunks, _Size, true}} = quic_h3_connection:test_stream_data_buffers(State2),
+    ?assertEqual(<<"abc">>, iolist_to_binary([Piece || {Piece, _Fin} <- lists:reverse(Chunks)])),
+    ?assertMatch(
+        #{0 := #h3_stream{state = half_closed_remote, frame_state = complete}},
+        quic_h3_connection:test_streams(State2)
+    ).
+
+%% What is kept behind blocked HEADERS counts against max_buffered_body.
+content_behind_blocked_headers_is_bounded_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = blocking_state(#{
+        quic_conn => Quic, local_max_blocked_streams => 1, max_buffered_body => 8
+    }),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, blocked_request(1), false, State0),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        0, quic_h3_frame:encode_data(<<"0123456789">>), false, State1
+    ),
+    ?assertEqual({stream_reset, 0, ?H3_EXCESSIVE_LOAD}, next_owner_event()),
+    ?assert(lists:member({close_stream, 0, ?H3_EXCESSIVE_LOAD}, fake_quic_calls(Quic))),
+    ?assertMatch(
+        #{0 := #h3_stream{state = closed, reset = true}}, quic_h3_connection:test_streams(State2)
+    ),
+    %% blocked_streams is at position 28, stream_buffers at 24
+    ?assertEqual(#{}, element(28, State2)),
+    ?assertEqual(#{}, element(24, State2)).
+
+%%====================================================================
 %% A blocked stream that is reset (RFC 9204 §4.4.2)
 %%====================================================================
 
-%% DATA arriving while the HEADERS wait for the encoder stream resets the
-%% stream. The HEADERS are given up with it: the decoder says so, and the
-%% insertion that would have unblocked them brings no request.
+%% A stream cancelled while its HEADERS wait for the encoder stream gives
+%% them up: the decoder says so, and the insertion that would have
+%% unblocked them brings no request.
 a_reset_stream_is_no_longer_blocked_test() ->
     flush_owner_events(),
     Quic = fake_quic_conn(),
@@ -3845,8 +3907,9 @@ a_reset_stream_is_no_longer_blocked_test() ->
         quic_conn => Quic, local_max_blocked_streams => 1, local_decoder_stream => 11
     }),
     Data = <<(blocked_request(1))/binary, (quic_h3_frame:encode_data(<<"x">>))/binary>>,
-    {ok, State1} = quic_h3_connection:handle_stream_data(0, Data, false, State0),
-    ?assertEqual({stream_reset, 0, ?H3_FRAME_UNEXPECTED}, next_owner_event()),
+    {ok, Blocked} = quic_h3_connection:handle_stream_data(0, Data, false, State0),
+    State1 = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, Blocked),
+    ?assertEqual({stream_reset, 0, ?H3_REQUEST_CANCELLED}, next_owner_event()),
     ?assert(
         lists:member(
             {send_data, 11, quic_qpack:encode_stream_cancel(0), false}, fake_quic_calls(Quic)
