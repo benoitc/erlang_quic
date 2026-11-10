@@ -20,8 +20,11 @@
     protect_run/8,
     open_packet/8,
     open_run/8,
-    key_id/1
+    key_id/1,
+    discard/1
 ]).
+
+-include("quic.hrl").
 
 -define(TAG_LEN, 16).
 %% Current and previous key phase, encrypt and decrypt, plus the two
@@ -209,6 +212,23 @@ with_open_ctx(Cipher, Key, HP, LargestRecv, Fun) ->
         false ->
             fallback
     end.
+
+%% @doc Drop the cached contexts of keys that are being discarded, so
+%% the key schedules go with the keys (RFC 9001 Section 4.9).
+-spec discard({#crypto_keys{}, #crypto_keys{}} | undefined) -> ok.
+discard({#crypto_keys{} = K1, #crypto_keys{} = K2}) ->
+    Gone = lists:append([
+        [{qc_enc, C, key_id(Key)}, {qc_dec, C, key_id(Key)}, {qc_hp, hp_cipher(C), key_id(HP)}]
+     || #crypto_keys{cipher = C, key = Key, hp = HP} <- [K1, K2]
+    ]),
+    lists:foreach(fun erlang:erase/1, Gone),
+    case erlang:get(qc_ctx_live) of
+        undefined -> ok;
+        Live -> erlang:put(qc_ctx_live, Live -- Gone)
+    end,
+    ok;
+discard(undefined) ->
+    ok.
 
 %%====================================================================
 %% Internal

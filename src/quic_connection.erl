@@ -3406,13 +3406,58 @@ confirm_handshake(#state{loss_state = LossState} = State) ->
     Confirmed = discard_space(handshake, State#state{
         loss_state = quic_loss:on_handshake_confirmed(LossState)
     }),
-    Confirmed#state{hs = (Confirmed#state.hs)#hs{handshake_keys = undefined}}.
+    quic_aead_ctx:discard((Confirmed#state.hs)#hs.handshake_keys),
+    release_handshake_state(Confirmed#state{
+        hs = (Confirmed#state.hs)#hs{handshake_keys = undefined}
+    }).
+
+%% RFC 8446 Section 7.1: a secret is erased once everything derived from
+%% it has been. Nothing reads the transcript, the handshake secrets, the
+%% key-exchange private key or the signing key after confirmation; a
+%% client first derives the one secret its session tickets need.
+release_handshake_state(#state{hs = Hs} = State) ->
+    State#state{
+        hs = Hs#hs{
+            resumption_secret = confirmed_resumption_secret(State),
+            tls_transcript = <<>>,
+            tls_private_key = undefined,
+            handshake_secret = undefined,
+            master_secret = undefined,
+            server_hs_secret = undefined,
+            client_hs_secret = undefined,
+            tls_ch1_random = undefined,
+            tls_ch1_opts = undefined,
+            peer_sig_algs = [],
+            server_private_key = undefined
+        }
+    }.
+
+confirmed_resumption_secret(#state{
+    app_keys = {#crypto_keys{cipher = Cipher}, _},
+    cfg = #conn_cfg{role = client},
+    hs = #hs{
+        tls_state = ?TLS_HANDSHAKE_COMPLETE,
+        master_secret = MasterSecret,
+        tls_transcript = Transcript
+    }
+}) when is_binary(MasterSecret) ->
+    quic_ticket:derive_resumption_secret(
+        Cipher, MasterSecret, quic_crypto:transcript_hash(Cipher, Transcript), <<>>
+    );
+confirmed_resumption_secret(#state{hs = #hs{resumption_secret = Secret}}) ->
+    Secret.
 
 %% RFC 9001 Section 4.9.1: the keys go with the packets. Discarding the
 %% space alone would leave the connection able to send at a level it must
 %% not, and able to decrypt packets it must drop.
 discard_initial(State) ->
     State1 = discard_space(initial, State),
+    #hs{initial_keys = Keys, initial_keys_alt = Alt} = State1#state.hs,
+    quic_aead_ctx:discard(Keys),
+    case Alt of
+        {_Version, AltKeys} -> quic_aead_ctx:discard(AltKeys);
+        undefined -> ok
+    end,
     State1#state{hs = (State1#state.hs)#hs{initial_keys = undefined, initial_keys_alt = undefined}}.
 
 %% Drop a packet number space from both byte counters at once. They are
@@ -8232,7 +8277,8 @@ process_tls_message(
             tls_state = ?TLS_HANDSHAKE_COMPLETE,
             server_name = ServerName,
             master_secret = MasterSecret,
-            tls_transcript = Transcript
+            tls_transcript = Transcript,
+            resumption_secret = ConfirmedSecret
         }
     } = State
 ) ->
@@ -8257,12 +8303,21 @@ process_tls_message(
             %% protected with anyway.
             Cipher = ClientAppKeys#crypto_keys.cipher,
 
-            %% Derive resumption_master_secret from master secret
-            %% The transcript should include client Finished
-            FinalTranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
-            ResumptionSecret = quic_ticket:derive_resumption_secret(
-                Cipher, MasterSecret, FinalTranscriptHash, <<>>
-            ),
+            %% resumption_master_secret, over the transcript up to the
+            %% client Finished. Confirmation derived it and released what
+            %% it is derived from; a ticket can also arrive before that.
+            ResumptionSecret =
+                case MasterSecret of
+                    undefined ->
+                        ConfirmedSecret;
+                    _ ->
+                        quic_ticket:derive_resumption_secret(
+                            Cipher,
+                            MasterSecret,
+                            quic_crypto:transcript_hash(Cipher, Transcript),
+                            <<>>
+                        )
+                end,
 
             %% Create session ticket record
             Ticket = #session_ticket{

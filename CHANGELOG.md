@@ -324,6 +324,14 @@ All notable changes to this project will be documented in this file.
 - Processing an ACK no longer builds the list of acknowledged packet
   numbers unless qlog is on, nor the list of their sizes unless PMTU
   black hole detection has a strike to clear.
+- A connection lets go of its handshake state once the handshake is
+  confirmed: the TLS transcript, the handshake and master secrets, the
+  key-exchange private key, its copy of the signing key and the cipher
+  contexts of the discarded Initial and Handshake keys (RFC 8446 Section
+  7.1, RFC 9001 Section 4.9). A client keeps only the resumption secret
+  its session tickets need. An established connection holds 8224 bytes
+  of process memory where it held 9960, and 1744 bytes less in binaries
+  (loopback).
 
 ### Fixed
 - A client connecting to an internationalized host name sent it in
