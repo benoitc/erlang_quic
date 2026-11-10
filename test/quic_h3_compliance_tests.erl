@@ -519,6 +519,27 @@ section_ack_encoding_test() ->
     Ack = quic_qpack:encode_section_ack(4),
     ?assertEqual(<<16#84>>, Ack).
 
+%% RFC 9204 Section 4.4.1: a field section is acknowledged only when its
+%% Required Insert Count is not zero, also with a dynamic table in use.
+section_ack_only_for_sections_using_the_dynamic_table_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = blocking_state(#{quic_conn => Quic, local_decoder_stream => 11}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        2, insert_literal(<<"x-a">>), false, State0
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        0, request_frame(<<"GET">>, <<"/">>), true, State1
+    ),
+    ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()),
+    ?assertNot(lists:keymember(send_data, 1, fake_quic_calls(Quic))),
+    {ok, _} = quic_h3_connection:handle_stream_data(4, blocked_request(1), true, State2),
+    ?assertMatch({request, 4, <<"GET">>, <<"/">>, _}, next_owner_event()),
+    ?assertEqual(
+        [{send_data, 11, quic_qpack:encode_section_ack(4), false}],
+        [Call || Call <- fake_quic_calls(Quic), element(1, Call) =:= send_data]
+    ).
+
 section_ack_large_stream_id_test() ->
     %% Stream ID 200 should use multi-byte encoding
     Ack = quic_qpack:encode_section_ack(200),
