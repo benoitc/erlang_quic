@@ -292,6 +292,12 @@ All notable changes to this project will be documented in this file.
 - TLS now follows RFC 9846, which obsoletes RFC 8446.
 - Reliable stream reset now follows draft-ietf-quic-reliable-stream-reset-11;
   both transport parameter ids are sent and accepted.
+- `fullsweep_after` connection option, passed to the connection process
+  as its spawn option of the same name. Unset, the VM default applies as
+  before. `0` keeps the heap of a mostly idle connection close to its
+  live data between hibernations, and costs collector time on a busy
+  one.
+
 ### Changed
 - The receiver process of a client on the `socket` backend waits for a
   datagram instead of waking ten times a second, and reads the

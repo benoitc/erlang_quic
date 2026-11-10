@@ -310,11 +310,16 @@ start_server(Opts) ->
 %% KiB. Busy connections are unaffected (the timer only fires after
 %% `hibernate_after' ms without any event).
 statem_opts(Opts) ->
-    case maps:get(hibernate_after, Opts, 5000) of
-        infinity ->
-            [];
-        T when is_integer(T), T > 0 ->
-            [{hibernate_after, T}]
+    Hibernate =
+        case maps:get(hibernate_after, Opts, 5000) of
+            infinity ->
+                [];
+            T when is_integer(T), T > 0 ->
+                [{hibernate_after, T}]
+        end,
+    case maps:get(fullsweep_after, Opts, undefined) of
+        undefined -> Hibernate;
+        N when is_integer(N), N >= 0 -> [{spawn_opt, [{fullsweep_after, N}]} | Hibernate]
     end.
 
 %% @doc Send data on a stream.
