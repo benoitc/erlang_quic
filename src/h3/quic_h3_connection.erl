@@ -4406,23 +4406,19 @@ live_stream(StreamId, Streams) ->
     end.
 
 %% RFC 9114 Section 4.1.1: a cancelled request stops being read as well.
-%% While the peer can still send on the stream its entry stays, closed, so
-%% that what arrives is dropped instead of being read as a new request.
+%% Until the peer's FIN or reset has been seen here the entry stays,
+%% closed, so that what arrives is dropped instead of being read as a new
+%% request. That holds when QUIC no longer knows the stream too: it has
+%% the stream's end, which is still on its way to this process.
 abort_reading(StreamId, ErrorCode, Streams, #state{quic_conn = QuicConn}) ->
     case Streams of
         #{StreamId := #h3_stream{state = StreamState} = Stream} when
             StreamState =:= open; StreamState =:= half_closed_local
         ->
-            case quic:stop_sending(QuicConn, StreamId, ErrorCode) of
-                {error, unknown_stream} ->
-                    maps:remove(StreamId, Streams);
-                _ ->
-                    Streams#{
-                        StreamId := Stream#h3_stream{
-                            state = closed, reset = true, data_remaining = 0
-                        }
-                    }
-            end;
+            _ = quic:stop_sending(QuicConn, StreamId, ErrorCode),
+            Streams#{
+                StreamId := Stream#h3_stream{state = closed, reset = true, data_remaining = 0}
+            };
         _ ->
             maps:remove(StreamId, Streams)
     end.

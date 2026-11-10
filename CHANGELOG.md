@@ -139,6 +139,11 @@ All notable changes to this project will be documented in this file.
   table. A peer that checks closes the connection with
   QPACK_DECODER_STREAM_ERROR. Only sections with a non-zero Required
   Insert Count are acknowledged now (RFC 9204 Section 4.4.1).
+- After `cancel_stream` on a request whose last bytes had reached the
+  QUIC connection but not yet the HTTP/3 one, those bytes were read as
+  the start of a new stream: a HEADERS frame among them became a second
+  request, anything else could close the connection. They are dropped
+  until the stream's end has been seen (RFC 9114 Section 4.1.1).
 
 ## [2.6.1] - 2026-11-08
 
