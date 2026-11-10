@@ -2879,18 +2879,24 @@ finish_request_stream(
             true -> deliver_body(StreamId, <<>>, true, Stream, State);
             false -> {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}}
         end,
-    case Delivered of
-        {ok, Stream1, State1} ->
-            {Stream1, State1};
-        {error, {stream_reset, _StreamId, Code}} ->
-            State1 = reset_request_stream(StreamId, Code, State),
-            {
-                Stream#h3_stream{frame_state = complete, state = closed, reset = true},
-                release_buffered(StreamId, State1)
-            }
-    end;
+    finished_or_reset(StreamId, Delivered, Stream, State);
+finish_request_stream(
+    StreamId, #h3_stream{frame_state = complete, state = StreamState} = Stream, State
+) when StreamState =:= open; StreamState =:= half_closed_local ->
+    %% Trailers came ahead of the FIN.
+    Delivered = end_body_after_trailers(StreamId, close_half(remote, Stream), State),
+    finished_or_reset(StreamId, Delivered, Stream, State);
 finish_request_stream(_StreamId, Stream, State) ->
     {Stream, State}.
+
+finished_or_reset(_StreamId, {ok, Stream1, State1}, _Stream, _State) ->
+    {Stream1, State1};
+finished_or_reset(StreamId, {error, {stream_reset, _StreamId, Code}}, Stream, State) ->
+    State1 = reset_request_stream(StreamId, Code, State),
+    {
+        Stream#h3_stream{frame_state = complete, state = closed, reset = true},
+        release_buffered(StreamId, State1)
+    }.
 
 %% The Status argument is what the response says. A `:status' the caller
 %% also put in the header list would otherwise be sent alongside it, and
@@ -3071,20 +3077,12 @@ handle_request_frame(
     _State
 ) ->
     {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}};
-%% Non-trailer HEADERS after body started - stream error (RFC 9114 Section 4.1)
-handle_request_frame(
-    StreamId,
-    {headers, _HeaderBlock},
-    false,
-    #h3_stream{frame_state = expecting_data},
-    _State
-) ->
-    {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}};
-%% Trailers (HEADERS with FIN after expecting_data)
+%% RFC 9114 Section 4.1: HEADERS after the header section are the trailer
+%% section, whether or not the stream's FIN comes with them.
 handle_request_frame(
     StreamId,
     {headers, HeaderBlock},
-    true,
+    Fin,
     #h3_stream{frame_state = expecting_data} = Stream,
     #state{qpack_decoder = Decoder, owner = Owner} = State
 ) ->
@@ -3100,17 +3098,21 @@ handle_request_frame(
                 ok ->
                     %% Send Section Acknowledgment for trailers
                     State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
-                    Stream1 = close_half(remote, Stream#h3_stream{
-                        trailers = Trailers,
-                        frame_state = complete
-                    }),
+                    Stream1 = Stream#h3_stream{trailers = Trailers, frame_state = complete},
                     Owner ! {quic_h3, self(), {trailers, StreamId, Trailers}},
-                    end_body_after_trailers(StreamId, Stream1, State1);
+                    case Fin of
+                        true ->
+                            end_body_after_trailers(
+                                StreamId, close_half(remote, Stream1), State1
+                            );
+                        false ->
+                            {ok, Stream1, State1}
+                    end;
                 {error, _Reason} ->
                     {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}}
             end;
         {{blocked, RIC}, Decoder1} ->
-            block_stream(StreamId, {RIC, HeaderBlock, true}, Stream, State#state{
+            block_stream(StreamId, {RIC, HeaderBlock, Fin}, Stream, State#state{
                 qpack_decoder = Decoder1
             });
         {{error, Reason}, _Decoder1} ->

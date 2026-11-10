@@ -142,12 +142,68 @@ data_before_headers_returns_stream_reset_test() ->
     Result = quic_h3_connection:handle_request_frame(0, {data, <<"body">>}, false, Stream, State),
     ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
 
-non_trailer_headers_after_body_returns_reset_test() ->
-    Stream = #h3_stream{id = 0, frame_state = expecting_data},
-    State = make_test_state(#{}),
-    %% HEADERS without FIN after body started
-    Result = quic_h3_connection:handle_request_frame(0, {headers, <<>>}, false, Stream, State),
-    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+%% HEADERS after the content are the trailer section even when the FIN
+%% comes in a later delivery; the message ends with the FIN.
+trailers_ahead_of_the_fin_are_trailers_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    Upload = <<
+        (request_frame(<<"POST">>, <<"/upload">>))/binary,
+        (quic_h3_frame:encode_data(<<"abc">>))/binary,
+        (trailers_frame())/binary
+    >>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, Upload, false, State0),
+    ?assertMatch({request, 0, <<"POST">>, <<"/upload">>, _}, next_owner_event()),
+    ?assertEqual({trailers, 0, [{<<"x-sum">>, <<"1">>}]}, next_owner_event()),
+    ?assertMatch(
+        #{0 := #h3_stream{state = open, frame_state = complete}},
+        quic_h3_connection:test_streams(State1)
+    ),
+    ?assertMatch(
+        #{0 := {_, _, false}}, quic_h3_connection:test_stream_data_buffers(State1)
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<>>, true, State1),
+    ?assertMatch(
+        #{0 := #h3_stream{state = half_closed_remote}}, quic_h3_connection:test_streams(State2)
+    ),
+    ?assertMatch(#{0 := {_, _, true}}, quic_h3_connection:test_stream_data_buffers(State2)),
+    ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic))).
+
+%% The same on a response; the exchange is over at the FIN.
+response_trailers_ahead_of_the_fin_are_trailers_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{
+        quic_conn => Quic,
+        streams => #{0 => #h3_stream{id = 0, type = request, state = half_closed_local}}
+    }),
+    Response = <<
+        (quic_h3_frame:encode_headers(quic_qpack:encode([{<<":status">>, <<"200">>}])))/binary,
+        (quic_h3_frame:encode_data(<<"abc">>))/binary,
+        (trailers_frame())/binary
+    >>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, Response, false, State0),
+    ?assertMatch({response, 0, 200, _}, next_owner_event()),
+    ?assertEqual({data, 0, <<"abc">>, false}, next_owner_event()),
+    ?assertEqual({trailers, 0, [{<<"x-sum">>, <<"1">>}]}, next_owner_event()),
+    ?assert(maps:is_key(0, quic_h3_connection:test_streams(State1))),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<>>, true, State1),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State2)),
+    ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic))).
+
+%% Nothing but the FIN may follow the trailer section.
+headers_after_trailers_reset_the_stream_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    Upload = <<(request_frame(<<"POST">>, <<"/upload">>))/binary, (trailers_frame())/binary>>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, Upload, false, State0),
+    {ok, _} = quic_h3_connection:handle_stream_data(0, trailers_frame(), true, State1),
+    ?assert(lists:member({close_stream, 0, ?H3_FRAME_UNEXPECTED}, fake_quic_calls(Quic))).
+
+trailers_frame() ->
+    quic_h3_frame:encode_headers(quic_qpack:encode([{<<"x-sum">>, <<"1">>}])).
 
 %%====================================================================
 %% Content-Length Enforcement Tests (RFC 9114 Section 4.1.2)
