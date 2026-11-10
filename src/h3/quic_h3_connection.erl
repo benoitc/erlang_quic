@@ -113,7 +113,7 @@
     calculate_field_section_size/1,
     validate_outbound_headers/2,
     cleanup_blocked_streams_on_goaway/1,
-    process_push_stream_id/4,
+    process_push_stream_id/5,
     update_stream_with_headers/4,
     allocate_push_id/1,
     validate_push_response_headers/1,
@@ -1629,7 +1629,7 @@ dispatch_stream_data(StreamId, Data, Fin, State) ->
             handle_uni_stream_type(StreamId, Data, Fin, State);
         {uni, push_pending} ->
             %% Push stream waiting for push ID parsing
-            handle_push_stream_id(StreamId, Data, State);
+            handle_push_stream_id(StreamId, Data, Fin, State);
         {uni, {push, PushId}} ->
             %% Active push stream - process frames
             handle_push_stream_data(StreamId, PushId, Data, Fin, State);
@@ -2248,12 +2248,12 @@ handle_decoder_stream_data(
 
 %% Parse push ID from push stream header (client-side)
 %% Push stream format after type byte: Push ID (varint) + frames
-handle_push_stream_id(StreamId, Data, #state{uni_stream_buffers = Buffers} = State) ->
+handle_push_stream_id(StreamId, Data, Fin, #state{uni_stream_buffers = Buffers} = State) ->
     {push_pending, Buffer} = maps:get(StreamId, Buffers),
     Combined = <<Buffer/binary, Data/binary>>,
     try quic_varint:decode(Combined) of
         {PushId, Rest} ->
-            process_push_stream_id(StreamId, PushId, Rest, State)
+            process_push_stream_id(StreamId, PushId, Rest, Fin, State)
     catch
         error:badarg ->
             %% Need more data for push ID (empty binary)
@@ -2271,7 +2271,8 @@ handle_push_stream_id(StreamId, Data, #state{uni_stream_buffers = Buffers} = Sta
 process_push_stream_id(
     StreamId,
     PushId,
-    _Rest,
+    Rest,
+    Fin,
     #state{
         promised_pushes = Promised,
         received_pushes = Received,
@@ -2282,7 +2283,7 @@ process_push_stream_id(
 ) ->
     case validate_push_stream(PushId, MaxPushId, Promised, Received, Cancelled) of
         ok ->
-            correlate_push_stream(StreamId, PushId, _Rest, State);
+            correlate_push_stream(StreamId, PushId, Rest, Fin, State);
         {error, cancelled} ->
             %% RFC 9114 Section 7.2.3: a push we cancelled arrived all the
             %% same; reading is aborted and the rest of it ignored.
@@ -2300,6 +2301,7 @@ correlate_push_stream(
     StreamId,
     PushId,
     Rest,
+    Fin,
     #state{
         uni_stream_buffers = Buffers,
         promised_pushes = Promised,
@@ -2325,17 +2327,17 @@ correlate_push_stream(
             %% Notify owner that push stream started
             Owner ! {quic_h3, self(), {push_stream, PushId, ReqStreamId, Headers}},
             %% Process remaining data as frames
-            maybe_process_push_rest(StreamId, PushId, Rest, State1);
+            maybe_process_push_rest(StreamId, PushId, Rest, Fin, State1);
         error ->
             %% Push stream without corresponding PUSH_PROMISE
             {error, {connection_error, ?H3_ID_ERROR, <<"push stream without PUSH_PROMISE">>}, State}
     end.
 
 %% Process remaining data on push stream if any
-maybe_process_push_rest(_StreamId, _PushId, <<>>, State) ->
+maybe_process_push_rest(_StreamId, _PushId, <<>>, _Fin, State) ->
     {ok, State};
-maybe_process_push_rest(StreamId, PushId, Rest, State) ->
-    handle_push_stream_data(StreamId, PushId, Rest, false, State).
+maybe_process_push_rest(StreamId, PushId, Rest, Fin, State) ->
+    handle_push_stream_data(StreamId, PushId, Rest, Fin, State).
 
 %% Validate push stream constraints
 validate_push_stream(PushId, MaxPushId, _Promised, Received, Cancelled) ->

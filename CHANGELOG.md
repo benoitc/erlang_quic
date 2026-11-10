@@ -126,6 +126,10 @@ All notable changes to this project will be documented in this file.
   was reset with H3_FRAME_UNEXPECTED. HEADERS after the content are the
   trailer section either way, and the message ends at the FIN (RFC 9114
   Section 4.1).
+- A pushed response that arrived whole in one packet, from the push ID
+  to the FIN, never completed: the client got its headers and data but
+  no `push_complete`, and kept the push for the life of the connection.
+  The FIN is now seen wherever it arrives (RFC 9114 Section 4.6).
 
 ## [2.6.1] - 2026-11-08
 
