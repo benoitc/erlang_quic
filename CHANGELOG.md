@@ -342,6 +342,8 @@ All notable changes to this project will be documented in this file.
   byte, about a thousand in a padded Initial. A server connection runs
   27 garbage collections during its handshake where it ran 41
   (loopback). qlog reports such a run as a single `padding` frame.
+- A run of stream packets is handed to the send batch in one step
+  instead of copying the socket state once per packet.
 
 ### Fixed
 - A client connecting to an internationalized host name sent it in

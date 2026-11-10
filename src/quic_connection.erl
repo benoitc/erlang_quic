@@ -12220,6 +12220,12 @@ send_run_limited([Packet | Pkts], [Frame | Frs], PN, State0, Tracked) ->
 %% sends are collected as [{PN, Size, Frame}] (reversed) for
 %% one batched loss/CC update afterwards. Packet I carries PN0 + I. A
 %% refused packet is tracked too, so loss detection resends it.
+send_run_packets(Packets, Frames, PN, State, SS, []) when
+    SS =/= undefined, not ?QLOG_ENABLED((State#state.cfg)#conn_cfg.qlog_ctx)
+->
+    {IP, Port} = State#state.remote_addr,
+    {SS1, Failed} = quic_socket:send_run(SS, IP, Port, Packets),
+    {SS1, track_run(Packets, Frames, PN, Failed, 0, [])};
 send_run_packets([], [], _PN, _State, SS, Tracked) ->
     {SS, Tracked};
 send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Tracked) ->
@@ -12247,6 +12253,18 @@ send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Tracked) ->
             SS1 -> SS1
         end,
     send_run_packets(Pkts, Frs, PN + 1, State, SS2, [{PN, PacketSize, Frame} | Tracked]).
+
+%% Failed holds the run positions whose send failed; they are tracked like
+%% the rest, so loss detection resends them.
+track_run([], [], _PN, _Failed, _I, Tracked) ->
+    Tracked;
+track_run([Packet | Pkts], [Frame | Frs], PN, Failed, I, Tracked) ->
+    Size = byte_size(Packet),
+    case Failed =/= [] andalso lists:keyfind(I, 1, Failed) of
+        {I, Reason} -> log_send_failed(Reason, PN, Size);
+        false -> ok
+    end,
+    track_run(Pkts, Frs, PN + 1, Failed, I + 1, [{PN, Size, Frame} | Tracked]).
 
 %% Build the iodata payload `[Header, Chunk]' for a chunked stream
 %% send, reusing the pre-computed header pieces when `Offset > 0'.

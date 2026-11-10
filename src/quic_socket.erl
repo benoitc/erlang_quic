@@ -47,6 +47,7 @@
     start_shared_sender/1,
     close/1,
     send/4,
+    send_run/4,
     send_immediate/4,
     flush/1,
     recv/2,
@@ -528,6 +529,44 @@ send(#socket_state{} = State, IP, Port, Packet) ->
         {error, _, _} = Error ->
             Error
     end.
+
+%% @doc Send a run of packets to one destination, as send/4 would one
+%% at a time. Returns the positions in the run (from 0) whose send
+%% failed, with the reason.
+-spec send_run(socket_state(), inet:ip_address(), inet:port_number(), [packet_view()]) ->
+    {socket_state(), [{non_neg_integer(), term()}]}.
+send_run(State, IP, Port, Packets) ->
+    send_run(State, IP, Port, Packets, 0, []).
+
+send_run(State, _IP, _Port, [], _I, Failed) ->
+    {State, Failed};
+send_run(
+    #socket_state{batching_enabled = true, batch_addr = Addr} = State, IP, Port, Packets, I, Failed
+) when Addr =:= undefined; Addr =:= {IP, Port} ->
+    #socket_state{batch_buffer = Buffer, batch_count = Count, max_batch_packets = Max} = State,
+    {Rest, Buffer1, N} = batch_take(Packets, max(1, Max - Count), Buffer, 0),
+    State1 = State#socket_state{
+        batch_addr = {IP, Port}, batch_buffer = Buffer1, batch_count = Count + N
+    },
+    case Count + N >= Max andalso flush(State1) of
+        false ->
+            send_run(State1, IP, Port, Rest, I + N, Failed);
+        {ok, State2} ->
+            send_run(State2, IP, Port, Rest, I + N, Failed);
+        {error, Reason, State2} ->
+            send_run(State2, IP, Port, Rest, I + N, [{I + N - 1, Reason} | Failed])
+    end;
+send_run(State, IP, Port, [Packet | Rest], I, Failed) ->
+    case send(State, IP, Port, Packet) of
+        {ok, State1} -> send_run(State1, IP, Port, Rest, I + 1, Failed);
+        {error, Reason, State1} -> send_run(State1, IP, Port, Rest, I + 1, [{I, Reason} | Failed]);
+        {error, Reason} -> send_run(State, IP, Port, Rest, I + 1, [{I, Reason} | Failed])
+    end.
+
+batch_take([Packet | Rest], Room, Buffer, N) when Room > 0 ->
+    batch_take(Rest, Room - 1, [Packet | Buffer], N + 1);
+batch_take(Rest, _Room, Buffer, N) ->
+    {Rest, Buffer, N}.
 
 %% @doc Flush all buffered packets. On hard send error the batch is
 %% cleared in the returned state so callers thread a clean buffer;
