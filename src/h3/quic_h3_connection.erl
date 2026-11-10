@@ -2883,6 +2883,15 @@ finish_request_stream(
         end,
     finished_or_reset(StreamId, Delivered, Stream, State);
 finish_request_stream(
+    StreamId,
+    #h3_stream{frame_state = expecting_headers} = Stream,
+    #state{role = server, quic_conn = QuicConn} = State
+) ->
+    %% RFC 9114 Section 4.1: the request ended with no HEADERS to answer.
+    %% The application never saw it, so only the peer is told.
+    quic:reset_stream(QuicConn, StreamId, ?H3_REQUEST_INCOMPLETE),
+    {Stream#h3_stream{frame_state = complete, state = closed}, State};
+finish_request_stream(
     StreamId, #h3_stream{frame_state = complete, state = StreamState} = Stream, State
 ) when StreamState =:= open; StreamState =:= half_closed_local ->
     %% Trailers came ahead of the FIN.
