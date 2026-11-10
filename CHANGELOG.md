@@ -344,6 +344,11 @@ All notable changes to this project will be documented in this file.
   (loopback). qlog reports such a run as a single `padding` frame.
 - A run of stream packets is handed to the send batch in one step
   instead of copying the socket state once per packet.
+- A server connection receiving on an unchanged path no longer rewrites
+  its state three times per receive pass with the values already there.
+  With the listener and send batch changes above, a 50 MB transfer
+  leaves 55 MB of garbage on the receiving server where it left 81, and
+  54 on the sending server where it left 63 (loopback).
 
 ### Fixed
 - A client connecting to an internationalized host name sent it in

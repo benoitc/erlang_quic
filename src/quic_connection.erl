@@ -5250,12 +5250,25 @@ server_recv_pass(Packets, RemoteAddr, Via, State) ->
             true ->
                 Mig = NewState#state.mig,
                 PassDCID = pass_dcid(Packets, NewState),
-                Changed = maybe_handle_address_change(
-                    {path, Via, RemoteAddr},
-                    TotalSize,
-                    NewState#state{mig = Mig#mig{pass_dcid = PassDCID}}
-                ),
-                note_peer_dcid(RemoteAddr, PassDCID, Changed);
+                SamePath =
+                    RemoteAddr =:= NewState#state.remote_addr andalso
+                        Via =:= current_via(NewState),
+                case Mig of
+                    #mig{peer_dcid = PassDCID, pass_dcid = undefined} when
+                        SamePath, PassDCID =/= undefined
+                    ->
+                        %% Nothing moved: the address-change check and the
+                        %% two updates around it would write back what is
+                        %% already there.
+                        NewState;
+                    _ ->
+                        Changed = maybe_handle_address_change(
+                            {path, Via, RemoteAddr},
+                            TotalSize,
+                            NewState#state{mig = Mig#mig{pass_dcid = PassDCID}}
+                        ),
+                        note_peer_dcid(RemoteAddr, PassDCID, Changed)
+                end;
             false ->
                 NewState
         end,
@@ -5263,6 +5276,8 @@ server_recv_pass(Packets, RemoteAddr, Via, State) ->
 
 %% The frames held while the pass decided where the peer is, sent to
 %% wherever that is now; dropped when the pass closed the connection.
+send_pass_frames(#state{hold_pass_frames = false, pass_frames = []} = State) ->
+    State;
 send_pass_frames(#state{close_reason = CR} = State) when CR =/= undefined ->
     State#state{hold_pass_frames = false, pass_frames = []};
 send_pass_frames(#state{pass_frames = Held} = State) ->
@@ -5280,11 +5295,15 @@ space_largest(_) -> undefined.
 
 %% The destination CID of the pass's first 1-RTT packet, one of ours.
 pass_dcid(Packets, #state{cfg = #conn_cfg{scid = SCID}}) ->
-    Len = byte_size(SCID),
-    case [D || <<0:1, 1:1, _:6, D:Len/binary, _/binary>> <- Packets] of
-        [DCID | _] -> DCID;
-        [] -> undefined
-    end.
+    first_short_dcid(Packets, byte_size(SCID)).
+
+first_short_dcid([Packet | Rest], Len) ->
+    case Packet of
+        <<0:1, 1:1, _:6, DCID:Len/binary, _/binary>> -> DCID;
+        _ -> first_short_dcid(Rest, Len)
+    end;
+first_short_dcid([], _Len) ->
+    undefined.
 
 note_peer_dcid(RemoteAddr, DCID, #state{remote_addr = RemoteAddr, mig = Mig} = State) when
     DCID =/= undefined
