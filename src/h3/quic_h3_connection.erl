@@ -2194,17 +2194,30 @@ retry_blocked_streams_fold([{StreamId, {_RIC, HeaderBlock, Fin}} | Rest], State)
         State#state.streams,
         #h3_stream{id = StreamId, type = request, state = open}
     ),
-    case handle_request_frame(StreamId, {headers, HeaderBlock}, Fin, Stream, State) of
-        {ok, Stream1, State1} ->
+    %% Fin is the stream's; it ends the field section only when nothing
+    %% was held behind it.
+    Held = maps:get(StreamId, State#state.stream_buffers, <<>>),
+    HeadersFin = Fin andalso Held =:= <<>>,
+    case handle_request_frame(StreamId, {headers, HeaderBlock}, HeadersFin, Stream, State) of
+        {ok, Stream1, State1} when HeadersFin ->
             State2 = State1#state{streams = maps:put(StreamId, Stream1, State1#state.streams)},
             retry_blocked_streams_fold(Rest, State2);
+        {ok, Stream1, State1} ->
+            case handle_request_stream_data(StreamId, Held, Fin, Stream1, State1) of
+                {ok, State2} -> retry_blocked_streams_fold(Rest, State2);
+                {error, Reason, _State} -> {error, Reason}
+            end;
         {error, {stream_reset, SId, Code}} ->
             %% One stream's error leaves the others to be retried.
             State1 = reset_request_stream(SId, Code, State),
             Closed = Stream#h3_stream{state = closed, reset = true, data_remaining = 0},
             State2 = release_buffered(SId, State1),
             retry_blocked_streams_fold(
-                Rest, State2#state{streams = (State2#state.streams)#{SId => Closed}}
+                Rest,
+                State2#state{
+                    streams = (State2#state.streams)#{SId => Closed},
+                    stream_buffers = maps:remove(SId, State2#state.stream_buffers)
+                }
             );
         {error, Reason} ->
             %% Connection error - stop processing
@@ -2778,10 +2791,16 @@ handle_request_stream_data(StreamId, _Data, true, #h3_stream{state = closed}, St
     {ok, State#state{streams = maps:remove(StreamId, State#state.streams)}};
 handle_request_stream_data(_StreamId, _Data, false, #h3_stream{state = closed}, State) ->
     {ok, State};
+handle_request_stream_data(StreamId, Combined, Fin, Stream, State) when
+    is_map_key(StreamId, State#state.blocked_streams)
+->
+    {ok, hold_behind_blocked(StreamId, Combined, Fin, Stream, State)};
 handle_request_stream_data(
     StreamId, Combined, Fin, Stream, #state{stream_buffers = Buffers} = State
 ) ->
     case process_request_frames(StreamId, Combined, Fin, Stream, State) of
+        {blocked, Rest, Stream1, State1} ->
+            {ok, hold_behind_blocked(StreamId, Rest, Fin, Stream1, State1)};
         {ok, Rest, #h3_stream{data_remaining = Owed}, _State1} when
             Fin andalso (Rest =/= <<>> orelse Owed > 0)
         ->
@@ -2807,6 +2826,42 @@ handle_request_stream_data(
             {ok, store_stream(StreamId, Stream3, State3)};
         {error, Reason} ->
             {error, Reason, State}
+    end.
+
+%% RFC 9204 Section 2.1.2: a field section waiting for the encoder stream
+%% blocks its stream, so what follows it is kept, with the stream's FIN in
+%% the blocked entry, and read once the section decodes. The bytes kept
+%% count against max_buffered_body.
+hold_behind_blocked(StreamId, Held, Fin, Stream, State) ->
+    #state{blocked_streams = Blocked, stream_buffers = Buffers} = State,
+    Others = maps:fold(
+        fun(Id, _Entry, Sum) -> Sum + byte_size(maps:get(Id, Buffers, <<>>)) end,
+        0,
+        maps:remove(StreamId, Blocked)
+    ),
+    Total = State#state.buffered_bytes + Others + byte_size(Held),
+    case Total > State#state.max_buffered_body of
+        true ->
+            State1 = reset_request_stream(StreamId, ?H3_EXCESSIVE_LOAD, State),
+            State2 = release_buffered(StreamId, State1),
+            Closed = Stream#h3_stream{state = closed, reset = true, data_remaining = 0},
+            State2#state{
+                streams = (State2#state.streams)#{StreamId => Closed},
+                stream_buffers = maps:remove(StreamId, Buffers)
+            };
+        false ->
+            #{StreamId := {RIC, HeaderBlock, _Fin}} = Blocked,
+            Buffers1 =
+                case Held of
+                    <<>> -> maps:remove(StreamId, Buffers);
+                    _ -> Buffers#{StreamId => Held}
+                end,
+            State1 = State#state{
+                blocked_streams = Blocked#{StreamId := {RIC, HeaderBlock, Fin}},
+                stream_buffers = Buffers1
+            },
+            Stream1 = report_overhead(StreamId, Stream, State1),
+            State1#state{streams = (State1#state.streams)#{StreamId => Stream1}}
     end.
 
 %% The stream's FIN arrived after the last complete frame. If the body
@@ -2912,6 +2967,8 @@ process_request_frames(StreamId, Data, Fin, Stream, State) ->
 
 process_request_frame(StreamId, Frame, FrameFin, Rest, Fin, Stream, State) ->
     case handle_request_frame(StreamId, Frame, FrameFin, Stream, State) of
+        {ok, Stream1, State1} when is_map_key(StreamId, State1#state.blocked_streams) ->
+            {blocked, Rest, Stream1, State1};
         {ok, Stream1, State1} ->
             process_request_frames(StreamId, Rest, Fin, Stream1, State1);
         {error, {stream_reset, SId, Code}} ->

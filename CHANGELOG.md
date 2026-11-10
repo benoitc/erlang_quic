@@ -115,6 +115,12 @@ All notable changes to this project will be documented in this file.
 - A FIN on the peer's control or QPACK streams went unnoticed; only a
   reset closed the connection. Both are now H3_CLOSED_CRITICAL_STREAM
   (RFC 9114 Section 6.2.1, RFC 9204 Section 4.2).
+- DATA that followed HEADERS waiting for the QPACK encoder stream reset
+  the stream with H3_FRAME_UNEXPECTED, so a request with content failed
+  whenever its field section referred to a dynamic table entry that had
+  not arrived yet. What follows blocked HEADERS on a stream is now kept,
+  within `max_buffered_body`, and read in order once they decode (RFC
+  9204 Section 2.1.2).
 
 ## [2.6.1] - 2026-11-08
 
