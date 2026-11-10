@@ -134,6 +134,11 @@ All notable changes to this project will be documented in this file.
   empty or holding only frames of unknown types, and kept an entry for
   it. The stream is now reset with H3_REQUEST_INCOMPLETE and forgotten
   (RFC 9114 Section 4.1).
+- With a QPACK dynamic table enabled, a Section Acknowledgment was sent
+  for every field section received, including those that do not use the
+  table. A peer that checks closes the connection with
+  QPACK_DECODER_STREAM_ERROR. Only sections with a non-zero Required
+  Insert Count are acknowledged now (RFC 9204 Section 4.4.1).
 
 ## [2.6.1] - 2026-11-08
 

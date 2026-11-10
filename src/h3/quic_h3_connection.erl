@@ -2512,7 +2512,7 @@ handle_push_headers(
 ) ->
     case decode_field_section(HeaderBlock, Decoder, State) of
         {{ok, Headers}, Decoder1} ->
-            State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
+            State1 = send_section_ack(StreamId, HeaderBlock, State#state{qpack_decoder = Decoder1}),
             validate_and_deliver_push_response(
                 StreamId, PushId, Headers, Fin, Owner, Received, State1
             );
@@ -2626,7 +2626,7 @@ handle_push_trailers(StreamId, PushId, HeaderBlock, Decoder, Owner, Stream, Stat
             Owner ! {quic_h3, self(), {push_cancelled, PushId}},
             cleanup_push_stream(PushId, StreamId, do_cancel_push(PushId, State));
         {{ok, Trailers}, Decoder1} ->
-            State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
+            State1 = send_section_ack(StreamId, HeaderBlock, State#state{qpack_decoder = Decoder1}),
             try
                 validate_field_names_and_values(Trailers),
                 case validate_trailer_headers(Trailers, Stream) of
@@ -3108,7 +3108,9 @@ handle_request_frame(
                     {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}};
                 ok ->
                     %% Send Section Acknowledgment for trailers
-                    State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
+                    State1 = send_section_ack(StreamId, HeaderBlock, State#state{
+                        qpack_decoder = Decoder1
+                    }),
                     Stream1 = Stream#h3_stream{trailers = Trailers, frame_state = complete},
                     Owner ! {quic_h3, self(), {trailers, StreamId, Trailers}},
                     case Fin of
@@ -3194,7 +3196,7 @@ decode_push_promise_headers(
 ) ->
     case decode_field_section(HeaderBlock, Decoder, State) of
         {{ok, Headers}, Decoder1} ->
-            State1 = send_section_ack(StreamId, State#state{qpack_decoder = Decoder1}),
+            State1 = send_section_ack(StreamId, HeaderBlock, State#state{qpack_decoder = Decoder1}),
             validate_and_apply_push_promise(
                 StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised, State1
             );
@@ -3310,7 +3312,9 @@ decode_field_section(HeaderBlock, Decoder, #state{local_max_field_section_size =
 handle_headers_decode(StreamId, HeaderBlock, Fin, Stream, Decoder, Owner, Role, State) ->
     case decode_field_section(HeaderBlock, Decoder, State) of
         {{ok, Headers}, Decoder1} ->
-            State1 = State#state{qpack_decoder = Decoder1},
+            State1 = send_section_ack(StreamId, HeaderBlock, State#state{
+                qpack_decoder = Decoder1
+            }),
             process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State1);
         {{error, field_section_too_large}, _Decoder1} ->
             {error,
@@ -3338,9 +3342,7 @@ block_stream(StreamId, Entry, Stream, #state{blocked_streams = Blocked} = State)
     end.
 
 %% Process successfully decoded headers
-process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State) ->
-    %% Send Section Acknowledgment on decoder stream (RFC 9204 Section 4.4)
-    State1 = send_section_ack(StreamId, State),
+process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State1) ->
     case headers_with_content(update_stream_with_headers(Headers, Stream, Role, State1), Fin) of
         {ok, Stream1} ->
             %% Apply RFC 9218 priority to underlying QUIC stream
@@ -5144,11 +5146,14 @@ send_encoder_instructions(
 %% Internal: Helpers
 %%====================================================================
 
-%% Send Section Acknowledgment on decoder stream (RFC 9204 Section 4.4.1)
-%% Only send when the field section could have referenced dynamic table entries.
-%% If our max table capacity is 0, peer cannot use dynamic entries, so RIC is always 0.
+%% Send Section Acknowledgment on decoder stream (RFC 9204 Section 4.4.1),
+%% for a field section whose Required Insert Count is not zero. The count
+%% is the section's first prefixed integer, and zero is encoded as zero.
+send_section_ack(_StreamId, <<0, _/binary>>, State) ->
+    State;
 send_section_ack(
     StreamId,
+    _HeaderBlock,
     #state{
         quic_conn = QuicConn,
         local_decoder_stream = DecoderStream,
@@ -5166,7 +5171,7 @@ send_section_ack(
             %% No dynamic table, peer can't use dynamic entries, no ack needed
             State
     end;
-send_section_ack(_StreamId, State) ->
+send_section_ack(_StreamId, _HeaderBlock, State) ->
     %% Decoder stream not yet established
     State.
 
