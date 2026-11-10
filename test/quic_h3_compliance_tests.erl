@@ -2424,7 +2424,10 @@ rest_of_data_frame_after_stream_error_is_dropped_test() ->
     Quic = fake_quic_conn(),
     State0 = request_stream_state(client, #h3_stream{content_length = 2}, #{quic_conn => Quic}),
     {ok, State1} = quic_h3_connection:handle_stream_data(0, Head, false, State0),
-    ?assertEqual([{close_stream, 0, ?H3_MESSAGE_ERROR}], fake_quic_calls(Quic)),
+    ?assertEqual(
+        [{close_stream, 0, ?H3_MESSAGE_ERROR}, {stop_sending, 0, ?H3_MESSAGE_ERROR}],
+        fake_quic_calls(Quic)
+    ),
     %% The reset is reported once, and the dropped remainder adds nothing.
     ?assertEqual([{stream_reset, 0, ?H3_MESSAGE_ERROR}], owner_events()),
     ?assertMatch({ok, _}, quic_h3_connection:handle_stream_data(0, Tail, true, State1)),
@@ -3901,6 +3904,48 @@ request_frame(Method, Path, Fields) ->
     ).
 
 %%====================================================================
+%% Stream errors (RFC 9114 §8, RFC 9000 §3.5)
+%%====================================================================
+
+%% A stream reset for an error of its own is no longer read either, and
+%% its entry stays only until the peer ends it, as after a cancel.
+a_stream_error_stops_the_peer_sending_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        0, quic_h3_frame:encode_data(<<"abc">>), false, State0
+    ),
+    ?assertEqual(
+        [{close_stream, 0, ?H3_FRAME_UNEXPECTED}, {stop_sending, 0, ?H3_FRAME_UNEXPECTED}],
+        fake_quic_calls(Quic)
+    ),
+    ?assertMatch(
+        #{0 := #h3_stream{state = closed, reset = true}}, quic_h3_connection:test_streams(State1)
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<"tail">>, true, State1),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State2)).
+
+%% The peer has finished the stream: there is nothing to stop, and no
+%% entry to keep.
+a_stream_error_at_the_fin_keeps_nothing_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        0, quic_h3_frame:encode_data(<<"abc">>), true, State0
+    ),
+    ?assertEqual([{close_stream, 0, ?H3_FRAME_UNEXPECTED}], fake_quic_calls(Quic)),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State1)).
+
+a_stream_error_found_at_a_bare_fin_keeps_nothing_test() ->
+    {Quic, State1} = short_upload(),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<>>, true, State1),
+    ?assert(lists:member({close_stream, 0, ?H3_MESSAGE_ERROR}, fake_quic_calls(Quic))),
+    ?assertNot(lists:keymember(stop_sending, 1, fake_quic_calls(Quic))),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State2)).
+
+%%====================================================================
 %% Streams unblocked together (RFC 9204 §2.1.2)
 %%====================================================================
 
@@ -3939,7 +3984,8 @@ unblock_two(Malformed, Good) ->
     ?assert(lists:member({close_stream, Malformed, ?H3_MESSAGE_ERROR}, fake_quic_calls(Quic))),
     Streams = quic_h3_connection:test_streams(State3),
     ?assertMatch(#{Good := #h3_stream{method = <<"GET">>, reset = false}}, Streams),
-    ?assertMatch(#{Malformed := #h3_stream{state = closed, reset = true}}, Streams).
+    %% the peer had finished the malformed one, so nothing is kept for it
+    ?assertNot(maps:is_key(Malformed, Streams)).
 
 %% A server whose decoder has a dynamic table, with the peer's encoder
 %% stream on stream 2.
