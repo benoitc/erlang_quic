@@ -3833,6 +3833,28 @@ the_reset_answering_a_cancel_is_not_reported_test() ->
     ?assertEqual(nothing, next_owner_event()),
     ?assertEqual(#{}, quic_h3_connection:test_streams(State2)).
 
+%% QUIC may have the whole stream, and have let go of it at the reset,
+%% while its last bytes are still on their way here. They are dropped
+%% like any others, and the FIN among them ends the wait.
+a_cancel_drops_what_quic_had_already_received_test() ->
+    Quic = spawn_link(fun Loop() ->
+        receive
+            {'$gen_call', From, {stop_sending, _, _}} ->
+                gen:reply(From, {error, unknown_stream}),
+                Loop();
+            {'$gen_call', From, _Call} ->
+                gen:reply(From, ok),
+                Loop()
+        end
+    end),
+    State1 = cancelled_upload(Quic),
+    Inner = request_frame(<<"DELETE">>, <<"/admin">>),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, Inner, false, State1),
+    ?assertEqual(nothing, next_owner_event()),
+    {ok, State3} = quic_h3_connection:handle_stream_data(0, Inner, true, State2),
+    ?assertEqual(nothing, next_owner_event()),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State3)).
+
 %% Nothing more can arrive on a request the peer has finished, so no entry
 %% is kept and no STOP_SENDING sent.
 a_cancel_after_the_request_ended_keeps_nothing_test() ->
