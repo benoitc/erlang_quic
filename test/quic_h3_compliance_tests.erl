@@ -588,6 +588,65 @@ status_101_is_refused_test() ->
     ),
     ?assertEqual([], fake_quic_calls(Quic)).
 
+%% RFC 9114 Section 4.1: DATA and trailers follow the final response, so
+%% before one, with nothing or only a 1xx sent, they are refused unsent.
+no_final_response_refuses_body_and_trailers_test() ->
+    Quic = fake_quic_conn(),
+    lists:foreach(
+        fun(Status) ->
+            Stream = #h3_stream{
+                id = 0, type = request, state = open, method = <<"GET">>, status = Status
+            },
+            Push = #h3_stream{
+                id = 3, type = push, state = open, method = <<"GET">>, status = Status
+            },
+            State = make_test_state(#{
+                role => server,
+                quic_conn => Quic,
+                streams => #{0 => Stream},
+                push_streams => #{0 => {3, Push}}
+            }),
+            ?assertEqual(
+                {error, no_final_response},
+                quic_h3_connection:do_send_trailers(0, [{<<"x">>, <<"1">>}], State)
+            ),
+            lists:foreach(
+                fun(Call) ->
+                    From = {self(), make_ref()},
+                    Result = quic_h3_connection:connected({call, From}, Call, State),
+                    ?assertEqual(
+                        [{reply, From, {error, no_final_response}}],
+                        element(tuple_size(Result), Result)
+                    )
+                end,
+                [{send_data, 0, <<"x">>, false}, {send_push_data, 0, <<"x">>, true}]
+            )
+        end,
+        [undefined, 103]
+    ),
+    ?assertEqual([], fake_quic_calls(Quic)).
+
+%% A 1xx is interim, so respond/5, which ends the stream, refuses one.
+respond_refuses_an_informational_status_test() ->
+    {Result, Sends} = respond_capture(103, [], <<"hello">>, <<"GET">>),
+    ?assertEqual({error, informational_status}, Result),
+    ?assertEqual([], Sends).
+
+%% A final response waiting to go out with the body is a final response.
+send_data_after_a_held_final_response_test() ->
+    Quic = fake_quic_conn(),
+    Stream = #h3_stream{id = 0, type = request, state = open, method = <<"GET">>},
+    State0 = make_test_state(#{role => server, quic_conn => Quic, streams => #{0 => Stream}}),
+    From = {self(), make_ref()},
+    {keep_state, State1, [{reply, From, ok}]} =
+        quic_h3_connection:connected({call, From}, {send_response, 0, 200, []}, State0),
+    ?assertEqual([], fake_quic_calls(Quic)),
+    ?assertMatch(
+        {keep_state, _, [{reply, From, ok}]},
+        quic_h3_connection:connected({call, From}, {send_data, 0, <<"x">>, true}, State1)
+    ),
+    ?assertMatch([{send_data, 0, _, true}], fake_quic_calls(Quic)).
+
 respond_invalid_status_test() ->
     {Result, Sends} = respond_capture(700, [], <<"hello">>, <<"GET">>),
     ?assertEqual({error, {invalid_status, 700}}, Result),
@@ -2049,7 +2108,7 @@ connect_tunnel_rejects_push_promise_test() ->
     ?assertMatch({error, {connection_error, ?H3_FRAME_UNEXPECTED, _}}, Result).
 
 connect_tunnel_send_trailers_rejected_test() ->
-    Stream = #h3_stream{id = 0, is_connect = true},
+    Stream = #h3_stream{id = 0, is_connect = true, status = 200},
     State = make_test_state(#{
         role => server,
         streams => #{0 => Stream}
@@ -2132,7 +2191,7 @@ encoder_state(Conn) ->
         quic_conn => Conn,
         local_encoder_stream => ?ENC_STREAM,
         qpack_encoder => quic_qpack:clear_encoder_instructions(E0),
-        streams => #{0 => #h3_stream{id = 0, type = request, state = open}}
+        streams => #{0 => #h3_stream{id = 0, type = request, state = open, status = 200}}
     }).
 
 %% qpack_encoder's position in the tuple make_test_state/1 builds.
@@ -2245,7 +2304,7 @@ refused_writer_is_told_send_ready_test() ->
         State0 = make_test_state(#{
             role => server,
             quic_conn => Conn,
-            streams => #{0 => #h3_stream{id = 0, type = request, state = open}}
+            streams => #{0 => #h3_stream{id = 0, type = request, state = open, status = 200}}
         }),
         From = {self(), make_ref()},
         {keep_state, State1, [{reply, From, {error, send_queue_full}}]} =
@@ -4605,7 +4664,9 @@ peer_decoder_says(Bin, State) ->
 dynamic_push() ->
     {State0, Field} = dynamic_table_server(),
     {_Headers, Encoder} = quic_qpack:encode([Field], 3, element(13, State0)),
-    Push = #h3_stream{id = 3, type = push, state = open, frame_state = expecting_data},
+    Push = #h3_stream{
+        id = 3, type = push, state = open, status = 200, frame_state = expecting_data
+    },
     State1 = setelement(13, State0, Encoder),
     %% max_push_id, next_push_id and push_streams are at 34, 35 and 36
     State2 = setelement(36, setelement(35, setelement(34, State1, 10), 1), #{0 => {3, Push}}),

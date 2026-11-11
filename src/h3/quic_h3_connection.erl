@@ -4254,6 +4254,11 @@ send_request_headers(
 %% in one connection call. Reuses do_send_response/4 (validation, QPACK, HEADERS
 %% buffering) and do_send_data/4 (which prepends the buffered HEADERS so they ride
 %% in the same QUIC packet as the body). HEAD, 204 and 304 end on their HEADERS.
+do_respond(_StreamId, Status, _Headers, _Body, _State) when
+    is_integer(Status), Status >= 100, Status < 200, Status =/= 101
+->
+    %% RFC 9110 Section 15.2: a 1xx is interim; send it with send_response/4.
+    {error, informational_status};
 do_respond(StreamId, Status, Headers, Body, State) ->
     NoContent = ends_on_headers(StreamId, Status, State),
     case do_send_response(StreamId, Status, Headers, State) of
@@ -4375,6 +4380,7 @@ send_response_headers_now(StreamId, HeadersFrame, Stream1, State) ->
 do_send_data(StreamId, Data, Fin, State) ->
     case response_gate(StreamId, State) of
         ended -> {ok, State};
+        no_final_response -> {error, no_final_response};
         open -> send_data_frame(StreamId, Data, Fin, State)
     end.
 
@@ -4415,6 +4421,7 @@ send_data_frame(
 do_send_trailers(StreamId, Trailers, State) ->
     case response_gate(StreamId, State) of
         ended -> {ok, State};
+        no_final_response -> {error, no_final_response};
         open -> encode_and_send_trailers(StreamId, Trailers, State)
     end.
 
@@ -4453,13 +4460,21 @@ response_gate(StreamId, #state{role = server, streams = Streams} = State) ->
     case Streams of
         #{StreamId := #h3_stream{reset = true}} ->
             open;
-        #{StreamId := #h3_stream{is_connect = false, method = Method, status = Status}} ->
-            ended_or_open(no_content_status(Method, Status));
+        #{StreamId := Stream} ->
+            stream_gate(Stream);
         #{} ->
             ended_or_open(no_content_ended(StreamId, State))
     end;
 response_gate(_StreamId, _State) ->
     open.
+
+%% RFC 9114 Section 4.1: no DATA or trailers ahead of the final response.
+stream_gate(#h3_stream{status = Status}) when not is_integer(Status); Status < 200 ->
+    no_final_response;
+stream_gate(#h3_stream{is_connect = true}) ->
+    open;
+stream_gate(#h3_stream{method = Method, status = Status}) ->
+    ended_or_open(no_content_status(Method, Status)).
 
 ended_or_open(true) -> ended;
 ended_or_open(false) -> open.
@@ -5078,6 +5093,9 @@ do_send_push_data(
     } = State
 ) ->
     case maps:find(PushId, PushStreams) of
+        {ok, {_StreamId, #h3_stream{status = Status}}} when not is_integer(Status); Status < 200 ->
+            %% RFC 9114 Section 4.1: no DATA ahead of the final response.
+            {error, no_final_response};
         {ok, {StreamId, Stream}} ->
             DataFrame = quic_h3_frame:encode_data(Data),
             case quic:send_data(QuicConn, StreamId, DataFrame, Fin) of

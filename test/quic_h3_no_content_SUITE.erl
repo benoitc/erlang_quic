@@ -32,7 +32,8 @@
     no_content_push_ends_on_headers/1,
     body_and_trailers_after_no_content_are_dropped/1,
     push_body_after_no_content_is_dropped/1,
-    no_content_length_on_1xx_or_204/1
+    no_content_length_on_1xx_or_204/1,
+    no_body_before_the_final_response/1
 ]).
 
 -define(WAIT_MS, 3000).
@@ -56,7 +57,8 @@ all() ->
         no_content_push_ends_on_headers,
         body_and_trailers_after_no_content_are_dropped,
         push_body_after_no_content_is_dropped,
-        no_content_length_on_1xx_or_204
+        no_content_length_on_1xx_or_204,
+        no_body_before_the_final_response
     ].
 
 init_per_suite(Config) ->
@@ -264,6 +266,31 @@ no_content_length_on_1xx_or_204(Config) ->
         quic_h3:close(Conn)
     end).
 
+%% RFC 9114 Section 4.1: a body offered before the final response is
+%% refused, so the client still gets a well-formed response after it.
+no_body_before_the_final_response(Config) ->
+    with_server(Config, fun(Port) ->
+        Conn = connect(Port),
+        lists:foreach(
+            fun({Path, Frames}) ->
+                _ = persistent_term:erase({?MODULE, result}),
+                {Wire, Events} = traced(Conn, <<"GET">>, Path),
+                ?assertEqual({error, no_final_response}, handler_result()),
+                ?assertEqual(Frames, lists:append(Wire)),
+                ?assertMatch([{data, _, <<"ok">>, true}], [E || {data, _, _, _} = E <- Events]),
+                ?assertMatch({response, _, 200, _}, lists:keyfind(200, 3, Events))
+            end,
+            [
+                {<<"/data-first">>, [headers, data, fin]},
+                {<<"/103-then-data">>, [headers, headers, data, fin]}
+            ]
+        ),
+        %% the connection is still up
+        {ok, Next} = quic_h3:request(Conn, headers(<<"GET">>, <<"/doc">>)),
+        ?assertMatch({response, Next, 200, _}, next(Conn)),
+        quic_h3:close(Conn)
+    end).
+
 %%====================================================================
 %% Server
 %%====================================================================
@@ -314,6 +341,13 @@ handle(Conn, StreamId, _Method, <<"/push-204">>, _Headers) ->
     {ok, PushId} = quic_h3:push(Conn, StreamId, headers(<<"GET">>, <<"/pushed">>)),
     ok = quic_h3:send_push_response(Conn, PushId, 204, []),
     ok = quic_h3:respond(Conn, StreamId, 200, [], <<"page">>);
+handle(Conn, StreamId, _Method, <<"/data-first">>, _Headers) ->
+    result(quic_h3:send_data(Conn, StreamId, <<"early">>, false)),
+    ok = quic_h3:respond(Conn, StreamId, 200, [], <<"ok">>);
+handle(Conn, StreamId, _Method, <<"/103-then-data">>, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 103, []),
+    result(quic_h3:send_data(Conn, StreamId, <<"early">>, false)),
+    ok = quic_h3:respond(Conn, StreamId, 200, [], <<"ok">>);
 handle(Conn, StreamId, _Method, <<"/cl-103">>, _Headers) ->
     ok = quic_h3:send_response(Conn, StreamId, 103, doc_headers()),
     ok = quic_h3:respond(Conn, StreamId, 200, [{<<"content-length">>, <<"2">>}], <<"ok">>);
