@@ -14,6 +14,8 @@
 %% post-quantum key exchange to more, so this sits far above any real
 %% flight: reaching it means this endpoint is malfunctioning.
 -define(MAX_PENDING_HS_BYTES, 1048576).
+%% 1-RTT datagrams held for an unvalidated address (RFC 9000 Section 8.1).
+-define(MAX_HELD_DATAGRAMS, 64).
 
 %% ACK packet tolerance for 1-RTT (RFC 9002 §6.2).
 %% The receiver SHOULD send an ACK frame in response to at least every
@@ -400,7 +402,8 @@
     validated_addr :: {inet:ip_address(), inet:port_number()} | undefined,
     %% and the CID sent to it
     validated_dcid :: binary() | undefined,
-    %% 1-RTT datagrams held back by the amplification limit, newest first
+    %% 1-RTT datagrams held back by the amplification limit, newest first,
+    %% at most ?MAX_HELD_DATAGRAMS
     held = [] :: [binary()],
     %% Timer reference for path validation timeout
     path_validation_timer :: reference() | undefined,

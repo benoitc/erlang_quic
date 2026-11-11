@@ -14848,8 +14848,12 @@ must_hold(Size, Room, #state{mig = #mig{held = Held}}) -> Held =/= [] orelse Siz
 %% address is unvalidated: charged when sent, kept when held.
 note_amp_send(_Packet, _Size, infinity, _Held, State) ->
     State;
-note_amp_send(Packet, _Size, _Room, true, #state{mig = Mig} = State) ->
-    State#state{mig = Mig#mig{held = [Packet | Mig#mig.held]}};
+note_amp_send(Packet, _Size, _Room, true, #state{mig = #mig{held = Held} = Mig} = State) ->
+    case length(Held) < ?MAX_HELD_DATAGRAMS of
+        true -> State#state{mig = Mig#mig{held = [Packet | Held]}};
+        %% Already tracked as sent, so loss detection resends what it carried.
+        false -> State
+    end;
 note_amp_send(_Packet, Size, _Room, false, #state{remote_addr = Addr} = State) ->
     charge_pending_path(Addr, current_via(State), Size, State).
 
