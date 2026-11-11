@@ -2950,6 +2950,12 @@ with_status(Status, Headers) ->
         | [KV || {Name, _} = KV <- Headers, Name =/= <<":status">>]
     ].
 
+%% RFC 9110 Section 8.6: no Content-Length in a 1xx or 204; 304 and HEAD keep theirs.
+outbound_response_headers(Status, Headers) when Status < 200; Status =:= 204 ->
+    [H || {Name, _} = H <- Headers, Name =/= <<"content-length">>];
+outbound_response_headers(_Status, Headers) ->
+    Headers.
+
 %% A response that never carries content, so a Content-Length on it
 %% describes what a GET would have returned rather than what is on the
 %% wire (RFC 9110 Section 8.6 for HEAD, Section 6.4.1 for 204 and 304).
@@ -4294,7 +4300,7 @@ do_send_response(
         streams = Streams
     } = State
 ) ->
-    AllHeaders = with_status(Status, Headers),
+    AllHeaders = with_status(Status, outbound_response_headers(Status, Headers)),
     %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
     case validate_outbound_headers(AllHeaders, State) of
         {error, Reason} ->
@@ -5011,7 +5017,7 @@ do_send_push_response(
         qpack_encoder = Encoder
     } = State
 ) ->
-    AllHeaders = with_status(Status, Headers),
+    AllHeaders = with_status(Status, outbound_response_headers(Status, Headers)),
     %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
     case validate_outbound_headers(AllHeaders, State) of
         {error, Reason} ->

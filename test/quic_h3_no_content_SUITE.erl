@@ -31,7 +31,8 @@
     no_content_responses_carry_no_data_frame/1,
     no_content_push_ends_on_headers/1,
     body_and_trailers_after_no_content_are_dropped/1,
-    push_body_after_no_content_is_dropped/1
+    push_body_after_no_content_is_dropped/1,
+    no_content_length_on_1xx_or_204/1
 ]).
 
 -define(WAIT_MS, 3000).
@@ -54,7 +55,8 @@ all() ->
         no_content_responses_carry_no_data_frame,
         no_content_push_ends_on_headers,
         body_and_trailers_after_no_content_are_dropped,
-        push_body_after_no_content_is_dropped
+        push_body_after_no_content_is_dropped,
+        no_content_length_on_1xx_or_204
     ].
 
 init_per_suite(Config) ->
@@ -240,6 +242,28 @@ push_body_after_no_content_is_dropped(Config) ->
         quic_h3:close(Conn)
     end).
 
+%% RFC 9110 Section 8.6: a server MUST NOT send Content-Length in a 1xx or
+%% 204 response. A 304 keeps the one the caller set.
+no_content_length_on_1xx_or_204(Config) ->
+    with_server(Config, fun(Port) ->
+        Conn = connect(Port),
+        ok = quic_h3:set_max_push_id(Conn, 10),
+        timer:sleep(100),
+        Lengths = fun(Path) ->
+            {ok, _} = quic_h3:request(Conn, headers(<<"GET">>, Path)),
+            [
+                {Status, proplists:get_value(<<"content-length">>, H)}
+             || {Kind, _, Status, H} <- collect(Conn),
+                (Kind =:= response) orelse (Kind =:= push_response)
+            ]
+        end,
+        ?assertEqual([{103, undefined}, {200, <<"2">>}], Lengths(<<"/cl-103">>)),
+        ?assertEqual([{204, undefined}], Lengths(<<"/cl-204">>)),
+        ?assertEqual([{304, <<"40">>}], Lengths(<<"/cl-304">>)),
+        ?assertEqual([{204, undefined}, {200, undefined}], Lengths(<<"/push-cl-204">>)),
+        quic_h3:close(Conn)
+    end).
+
 %%====================================================================
 %% Server
 %%====================================================================
@@ -289,6 +313,17 @@ handle(Conn, StreamId, _Method, <<"/respond-304">>, _Headers) ->
 handle(Conn, StreamId, _Method, <<"/push-204">>, _Headers) ->
     {ok, PushId} = quic_h3:push(Conn, StreamId, headers(<<"GET">>, <<"/pushed">>)),
     ok = quic_h3:send_push_response(Conn, PushId, 204, []),
+    ok = quic_h3:respond(Conn, StreamId, 200, [], <<"page">>);
+handle(Conn, StreamId, _Method, <<"/cl-103">>, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 103, doc_headers()),
+    ok = quic_h3:respond(Conn, StreamId, 200, [{<<"content-length">>, <<"2">>}], <<"ok">>);
+handle(Conn, StreamId, _Method, <<"/cl-204">>, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 204, doc_headers());
+handle(Conn, StreamId, _Method, <<"/cl-304">>, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 304, doc_headers());
+handle(Conn, StreamId, _Method, <<"/push-cl-204">>, _Headers) ->
+    {ok, PushId} = quic_h3:push(Conn, StreamId, headers(<<"GET">>, <<"/pushed">>)),
+    ok = quic_h3:send_push_response(Conn, PushId, 204, doc_headers()),
     ok = quic_h3:respond(Conn, StreamId, 200, [], <<"page">>);
 handle(Conn, StreamId, _Method, <<"/push-204-body">>, _Headers) ->
     {ok, PushId} = quic_h3:push(Conn, StreamId, headers(<<"GET">>, <<"/pushed">>)),
