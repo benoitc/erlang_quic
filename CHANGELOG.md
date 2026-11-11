@@ -194,6 +194,31 @@ All notable changes to this project will be documented in this file.
   `quic:get_server_connections/1` returns each connection once instead
   of once per listener.
 
+||||||| parent of da88b2b (Add the cipher suite, PSK and recovery fixes to the CHANGELOG)
+- NewReno and CUBIC moved the start of the recovery period to the moment
+  they left recovery, so the loss of a packet sent during recovery was
+  ignored and, under continued overload, the next window reduction came
+  about one RTT late. The recovery period now keeps the time the
+  reduction was made (RFC 9002 Section 7.3.2 and Appendix B.6). The
+  100 ms minimum recovery period still keeps a burst loss from cutting
+  the window twice.
+- A server whose `ciphers` shared no suite with the client went ahead
+  with TLS_AES_128_GCM_SHA256 anyway. It now aborts the handshake with
+  handshake_failure (RFC 9846 Section 4.2.1).
+- A client did not check the cipher suite of a HelloRetryRequest against
+  the ones it offered, nor that the ServerHello after it named the same
+  suite. It now aborts the handshake with illegal_parameter in either
+  case (RFC 9846 Section 4.2.4).
+- A server that selected TLS_AES_256_GCM_SHA384 still took the client's
+  external PSK, which is SHA-256, so a client checking the suite against
+  the PSK could not complete the handshake. A known external PSK now
+  makes the server pick a SHA-256 suite both sides allow; when none
+  exists the PSK is skipped and the certificate path is used (RFC 9846
+  Section 4.3.11). Resumption tickets keep the server's order.
+- A client accepted a server that took its PSK, external or a resumption
+  ticket, with a cipher suite whose hash is not the PSK's. It now aborts
+  with illegal_parameter (RFC 9846 Section 4.3.11).
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed
