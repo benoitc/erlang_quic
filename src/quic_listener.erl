@@ -35,11 +35,12 @@
 %%% '''
 %%%
 %%% Return `{ok, HandlerPid}' to take the connection, or `{error, Reason}'
-%%% to decline it. The listener then logs a warning and stops the
-%%% connection before it has seen a packet, so the client gets no answer
-%%% and gives up when its handshake times out. A handler that raises or
-%%% returns anything else also costs only that connection, and is logged
-%%% as an error. An arity-2 fun is called as `Fun(Conn, DCID)'.
+%%% to decline it. The listener then logs a warning, stops the
+%%% connection before it has seen a packet, and answers the client with
+%%% CONNECTION_CLOSE carrying CONNECTION_REFUSED (RFC 9000 Section 5.2.2).
+%%% A handler that raises or returns anything else also costs only that
+%%% connection: it is logged as an error and the client gets
+%%% INTERNAL_ERROR. An arity-2 fun is called as `Fun(Conn, DCID)'.
 %%%
 %%% === Return the final owner ===
 %%%
@@ -169,6 +170,8 @@
     %% (socket backend only; see quic_socket:start_shared_sender/1).
     send_sender :: pid() | undefined,
     send_gso_counter :: atomics:atomics_ref() | undefined,
+    %% Refusal allowance: slot 1 the window (monotonic second), slot 2 the count
+    refusals :: atomics:atomics_ref(),
     port :: inet:port_number(),
     tls :: #listener_tls{},
     %% Connection ID -> Pid mapping
@@ -439,6 +442,7 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts, Preferred
         gro_receiver = GROReceiver,
         send_sender = SendSender,
         send_gso_counter = SendGSOCounter,
+        refusals = new_refusal_allowance(),
         port = ActualPort,
         tls = #listener_tls{
             cert = Cert,
@@ -774,6 +778,9 @@ dispatch_batched_packets(
 %% RFC 9000 Section 14.1: a server discards an Initial in a smaller
 %% datagram, and Section 5.2.2 sends no Version Negotiation for one.
 -define(MIN_INITIAL_DATAGRAM, 1200).
+
+%% Refusals (RFC 9000 Section 5.2.2) each listener sends per second.
+-define(MAX_REFUSALS_PER_SECOND, 100).
 
 %% Group packets by their destination connection
 group_packets_by_conn([], _DCIDLen, _Conns, Acc) ->
@@ -1240,10 +1247,8 @@ create_connection(
 spawn_with_limit(Validated, OrigDCID, RetrySCID, Packet, DCID, Version, RemoteAddr, State) ->
     case connection_limit_reached(State) of
         true ->
-            %% Silently drop (no reply) to avoid amplification; the client
-            %% retries or times out.
-            ?LOG_WARNING(#{what => connection_limit_reached}, ?QUIC_LOG_META),
-            ok;
+            ?LOG_DEBUG(#{what => connection_limit_reached}, ?QUIC_LOG_META),
+            send_refusal(?QUIC_CONNECTION_REFUSED, Packet, DCID, Version, RemoteAddr, State);
         false ->
             create_connection_unconditional(
                 Validated, OrigDCID, RetrySCID, Packet, DCID, Version, RemoteAddr, State
@@ -1372,6 +1377,9 @@ create_connection_unconditional(
                         ?QUIC_LOG_META
                     ),
                     discard_connection(ConnPid, State),
+                    send_refusal(
+                        ?QUIC_CONNECTION_REFUSED, Packet, DCID, Version, RemoteAddr, State
+                    ),
                     {error, connection_declined};
                 {error, HandlerError} ->
                     ?LOG_ERROR(
@@ -1383,10 +1391,12 @@ create_connection_unconditional(
                         ?QUIC_LOG_META
                     ),
                     discard_connection(ConnPid, State),
+                    send_refusal(?QUIC_INTERNAL_ERROR, Packet, DCID, Version, RemoteAddr, State),
                     {error, connection_handler_error}
             end;
         {error, Reason} ->
             ?LOG_WARNING(#{what => start_connection_failed, reason => Reason}, ?QUIC_LOG_META),
+            send_refusal(?QUIC_INTERNAL_ERROR, Packet, DCID, Version, RemoteAddr, State),
             {error, Reason}
     end.
 
@@ -1426,6 +1436,54 @@ discard_connection(ConnPid, State) ->
 
 send_to_connection(ConnPid, Packet, RemoteAddr) ->
     ConnPid ! {quic_packet, Packet, RemoteAddr}.
+
+%% RFC 9000 Section 5.2.2: answer a refused Initial with CONNECTION_CLOSE.
+send_refusal(Code, Packet, DCID, Version, {IP, Port}, State) ->
+    #listener_state{refusals = Refusals} = State,
+    case parse_initial_token(Packet) of
+        {ok, _Token, ClientSCID, DCID} ->
+            case refusal_allowed(Refusals, erlang:monotonic_time(second)) of
+                true ->
+                    #listener_state{
+                        socket = Socket, socket_state = SocketState, socket_backend = Backend
+                    } = State,
+                    Refusal = build_refusal(Code, ClientSCID, DCID, Version),
+                    _ = send_packet(Socket, SocketState, Backend, IP, Port, Refusal),
+                    ok;
+                false ->
+                    ok
+            end;
+        _ ->
+            ok
+    end.
+
+%% Starts with a window already over, so the first refusal opens one.
+new_refusal_allowance() ->
+    Ref = atomics:new(2, []),
+    atomics:put(Ref, 1, erlang:monotonic_time(second) - 1),
+    Ref.
+
+%% At most ?MAX_REFUSALS_PER_SECOND refusals per window; past that, drop.
+refusal_allowed(Ref, Now) ->
+    case Now =< atomics:get(Ref, 1) of
+        true ->
+            (atomics:add_get(Ref, 2, 1) =< ?MAX_REFUSALS_PER_SECOND);
+        false ->
+            atomics:put(Ref, 1, Now),
+            atomics:put(Ref, 2, 1),
+            true
+    end.
+
+%% Keyed from the Initial's DCID, the Retry SCID after a Retry.
+build_refusal(Code, ClientSCID, DCID, Version) ->
+    {Key, IV, HP} = quic_keys:derive_initial_server(DCID, Version),
+    Payload = quic_frame:encode({connection_close, transport, Code, 0, <<>>}),
+    FirstByte = 16#C0 bor (quic_packet:type_to_bits(initial, Version) bsl 4),
+    %% Empty token; Length covers the one-byte PN 0 and the 16-byte tag.
+    Prefix =
+        <<FirstByte, Version:32, (byte_size(ClientSCID)), ClientSCID/binary, (byte_size(DCID)),
+            DCID/binary, 0, (quic_varint:encode(byte_size(Payload) + 1 + 16))/binary>>,
+    quic_aead:protect_long_packet(aes_128_gcm, Key, IV, HP, 0, Prefix, Payload).
 
 %%====================================================================
 %% Stateless Reset (RFC 9000 Section 10.3)

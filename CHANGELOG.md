@@ -24,7 +24,8 @@ All notable changes to this project will be documented in this file.
 - The default `pool_size` now runs one listener, as documented. It ran
   two on Linux. Set `pool_size => 2` for the old behaviour.
 - A `connection_handler` that returns `{error, Reason}` now declines the
-  connection: it is stopped and the client gets no answer.
+  connection: it is stopped and the client is refused with
+  CONNECTION_REFUSED.
 - Calls on a connection whose process has stopped return
   `{error, closed}` instead of exiting with `noproc`.
 - `send_data`, `send_data_async`, `reset_stream`, `reset_stream_at`,
@@ -66,6 +67,11 @@ All notable changes to this project will be documented in this file.
   `{error, status_101_forbidden}` (RFC 9114 Section 4.5).
 
 ### Fixed
+- A server that refused a connection, at `max_connections` or when the
+  `connection_handler` declined it, sent nothing, so the client waited
+  for its handshake timeout. It now answers at once with
+  CONNECTION_REFUSED, or INTERNAL_ERROR when the handler fails, at a
+  bounded rate (RFC 9000 Section 5.2.2).
 - On paths with a round-trip time under 8 ms, such as a LAN or loopback,
   packets were declared lost as soon as one round trip had passed since
   they were sent, instead of 9/8 of it, so packets that were only slightly
@@ -237,8 +243,6 @@ All notable changes to this project will be documented in this file.
   now starts N listeners, with SO_REUSEPORT only when N is above 1, and
   `quic:get_server_connections/1` returns each connection once instead
   of once per listener.
-
-||||||| parent of da88b2b (Add the cipher suite, PSK and recovery fixes to the CHANGELOG)
 - NewReno and CUBIC moved the start of the recovery period to the moment
   they left recovery, so the loss of a packet sent during recovery was
   ignored and, under continued overload, the next window reduction came

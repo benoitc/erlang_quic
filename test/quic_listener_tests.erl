@@ -13,6 +13,8 @@
 -include_lib("eunit/include/eunit.hrl").
 -include("quic.hrl").
 
+-define(FAKE_SCID, <<1, 2, 3, 4>>).
+
 %%====================================================================
 %% Test Fixtures
 %%====================================================================
@@ -219,7 +221,7 @@ connection_handler_registration_test() ->
     ok = quic_listener:stop(Listener).
 
 %% {error, Reason} declines the connection: it is stopped before it sees
-%% the Initial and leaves the routing table.
+%% the Initial, leaves the routing table, and the client is refused.
 connection_handler_declines_test_() ->
     {timeout, 30, fun() ->
         Test = self(),
@@ -249,6 +251,8 @@ connection_handler_declines_test_() ->
                     end
             after 5000 -> error(handler_not_called)
             end,
+            ?assertEqual({ok, ?QUIC_CONNECTION_REFUSED}, recv_refusal(Sock, DCID)),
+            ?assertEqual(timeout, recv_any(Sock, 200)),
             ?assertEqual([], quic_listener:get_connections(Listener))
         after
             gen_udp:close(Sock),
@@ -302,6 +306,7 @@ connection_handler_failure(Misbehave) ->
             {'DOWN', Ref, process, BadConn, _} -> ok
         after 5000 -> error(connection_not_closed)
         end,
+        ?assertEqual({ok, ?QUIC_INTERNAL_ERROR}, recv_refusal(Sock, Bad)),
         ?assert(is_process_alive(Listener)),
         ?assert(is_process_alive(GoodConn)),
         ?assertEqual([GoodConn], quic_listener:get_connections(Listener))
@@ -313,9 +318,278 @@ connection_handler_failure(Misbehave) ->
 %% Only the header is parsed to route it; padded to the 1200 bytes a
 %% client Initial datagram has.
 fake_initial(DCID) ->
-    SCID = <<1, 2, 3, 4>>,
-    Packet = <<16#C0, 1:32, (byte_size(DCID)), DCID/binary, (byte_size(SCID)), SCID/binary>>,
+    fake_initial(DCID, ?QUIC_VERSION_1).
+
+fake_initial(DCID, Version) ->
+    fake_long(initial, DCID, Version).
+
+fake_long(Type, DCID, Version) ->
+    FirstByte = 16#C0 bor (quic_packet:type_to_bits(Type, Version) bsl 4),
+    SCID = ?FAKE_SCID,
+    Packet =
+        <<FirstByte, Version:32, (byte_size(DCID)), DCID/binary, (byte_size(SCID)), SCID/binary>>,
     <<Packet/binary, 0:((1200 - byte_size(Packet)) * 8)>>.
+
+%%====================================================================
+%% Refusal (RFC 9000 Section 5.2.2)
+%%====================================================================
+
+%% The refusal is an Initial carrying only CONNECTION_CLOSE, addressed to
+%% the client's SCID, keyed from the client's DCID, and not padded.
+refusal_packet_test_() ->
+    [
+        {Name ++ " " ++ CodeName, fun() -> refusal_packet(Version, Code) end}
+     || {Name, Version} <- [{"v1", ?QUIC_VERSION_1}, {"v2", ?QUIC_VERSION_2}],
+        {CodeName, Code} <- [
+            {"CONNECTION_REFUSED", ?QUIC_CONNECTION_REFUSED},
+            {"INTERNAL_ERROR", ?QUIC_INTERNAL_ERROR}
+        ]
+    ].
+
+refusal_packet(Version, Code) ->
+    DCID = <<9, 8, 7, 6, 5, 4, 3, 2>>,
+    Refusal = quic_listener:build_refusal(Code, ?FAKE_SCID, DCID, Version),
+    ?assertEqual(
+        {ok, #{
+            version => Version,
+            dcid => ?FAKE_SCID,
+            scid => DCID,
+            token => <<>>,
+            pn => 0,
+            frames => [{connection_close, transport, Code, 0, <<>>}]
+        }},
+        decode_refusal(DCID, Refusal)
+    ),
+    %% Header 1+4+1+4+1+8, token length 1, Length 1, PN 1, frame 4, tag 16.
+    ?assertEqual(42, byte_size(Refusal)),
+    ?assert(byte_size(Refusal) < byte_size(fake_initial(DCID, Version))).
+
+%% At max_connections the Initial is answered with CONNECTION_REFUSED,
+%% for each supported version.
+max_connections_refused_test_() ->
+    [
+        {Name, {timeout, 30, fun() -> max_connections_refused(Version) end}}
+     || {Name, Version} <- [{"v1", ?QUIC_VERSION_1}, {"v2", ?QUIC_VERSION_2}]
+    ].
+
+max_connections_refused(Version) ->
+    with_refusing_listener(fun(Sock, Port) ->
+        DCID = <<4, 4, 4, 4, 4, 4, 4, 4>>,
+        ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_initial(DCID, Version)),
+        ?assertEqual({ok, ?QUIC_CONNECTION_REFUSED}, recv_refusal(Sock, DCID, Version)),
+        ?assertEqual(timeout, recv_any(Sock, 200))
+    end).
+
+%% Handshake and 0-RTT packets for an unknown connection get no reply.
+non_initial_not_refused_test_() ->
+    {timeout, 30, fun() ->
+        with_refusing_listener(fun(Sock, Port) ->
+            Initial = <<5, 5, 5, 5, 5, 5, 5, 5>>,
+            [
+                ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_long(Type, Initial, V))
+             || Type <- [handshake, zero_rtt], V <- [?QUIC_VERSION_1, ?QUIC_VERSION_2]
+            ],
+            %% The listener handles datagrams in order: the first reply is
+            %% the one to this Initial.
+            ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_initial(Initial)),
+            ?assertEqual({ok, ?QUIC_CONNECTION_REFUSED}, recv_refusal(Sock, Initial)),
+            ?assertEqual(timeout, recv_any(Sock, 200))
+        end)
+    end}.
+
+%% Initials drained in one receive sweep go through the batched dispatch,
+%% which refuses each new connection once.
+batched_initials_refused_test_() ->
+    {timeout, 30, fun() ->
+        with_refusing_listener(fun(Sock, Port, Listener) ->
+            A = <<6, 6, 6, 6, 6, 6, 6, 6>>,
+            B = <<7, 7, 7, 7, 7, 7, 7, 7>>,
+            erlang:trace_pattern({quic_listener, dispatch_batched_packets, 3}, true, [local]),
+            1 = erlang:trace(Listener, true, [call]),
+            ok = sys:suspend(Listener),
+            try
+                [
+                    ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_initial(D))
+                 || D <- [A, A, B]
+                ],
+                ok = await_queue_len(Listener, 3, 5000)
+            after
+                ok = sys:resume(Listener)
+            end,
+            receive
+                {trace, Listener, call, {quic_listener, dispatch_batched_packets, [Ps, _, _]}} ->
+                    ?assertEqual(3, length(Ps))
+            after 5000 -> error(not_batched)
+            end,
+            erlang:trace(Listener, false, [call]),
+            erlang:trace_pattern({quic_listener, dispatch_batched_packets, 3}, false, [local]),
+            {ok, D1} = recv_any(Sock, 5000),
+            {ok, D2} = recv_any(Sock, 5000),
+            ?assertEqual(timeout, recv_any(Sock, 200)),
+            ?assertEqual(
+                lists:sort([{A, ?QUIC_CONNECTION_REFUSED}, {B, ?QUIC_CONNECTION_REFUSED}]),
+                lists:sort([refused_cid([A, B], D) || D <- [D1, D2]])
+            )
+        end)
+    end}.
+
+%% At most 100 refusals per one-second window, then the next window
+%% allows again.
+refusal_allowance_test() ->
+    Ref = quic_listener:new_refusal_allowance(),
+    Now = erlang:monotonic_time(second),
+    ?assertEqual(
+        lists:duplicate(100, true),
+        [quic_listener:refusal_allowed(Ref, Now) || _ <- lists:seq(1, 100)]
+    ),
+    ?assertNot(quic_listener:refusal_allowed(Ref, Now)),
+    ?assert(quic_listener:refusal_allowed(Ref, Now + 1)),
+    ?assertEqual({Now + 1, 1}, {atomics:get(Ref, 1), atomics:get(Ref, 2)}).
+
+%% The listener drops the Initial past the allowance and answers again
+%% once the window is over. The window is set by hand, not by sleeping.
+refusals_bounded_test_() ->
+    {timeout, 60, fun() ->
+        with_refusing_listener(fun(Sock, Port, Listener) ->
+            Ref = refusal_allowance(Listener),
+            Now = erlang:monotonic_time(second),
+            ok = atomics:put(Ref, 1, Now + 3600),
+            ok = atomics:put(Ref, 2, 0),
+            lists:foreach(
+                fun(N) ->
+                    D = <<N:64>>,
+                    ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_initial(D)),
+                    ?assertEqual({ok, ?QUIC_CONNECTION_REFUSED}, recv_refusal(Sock, D))
+                end,
+                lists:seq(1, 100)
+            ),
+            ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_initial(<<101:64>>)),
+            ok = await_atomic(Ref, 2, 101, 5000),
+            ok = atomics:put(Ref, 1, Now - 1),
+            Next = <<102:64>>,
+            ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_initial(Next)),
+            %% First datagram since the 100th refusal: none for the 101st.
+            ?assertEqual({ok, ?QUIC_CONNECTION_REFUSED}, recv_refusal(Sock, Next)),
+            ?assertEqual(timeout, recv_any(Sock, 200)),
+            ?assertEqual(1, atomics:get(Ref, 2))
+        end)
+    end}.
+
+%% The listener's one two-slot atomics ref.
+refusal_allowance(Listener) ->
+    [Ref] = [
+        E
+     || E <- tuple_to_list(sys:get_state(Listener)),
+        is_reference(E),
+        try atomics:info(E) of
+            #{size := 2} -> true;
+            _ -> false
+        catch
+            error:badarg -> false
+        end
+    ],
+    Ref.
+
+await_atomic(Ref, Ix, Value, Left) when Left > 0 ->
+    case atomics:get(Ref, Ix) of
+        Value ->
+            ok;
+        _ ->
+            receive
+            after 10 -> await_atomic(Ref, Ix, Value, Left - 10)
+            end
+    end;
+await_atomic(_Ref, _Ix, _Value, _Left) ->
+    error(allowance_not_reached).
+
+with_refusing_listener(Fun) when is_function(Fun, 2) ->
+    with_refusing_listener(fun(Sock, Port, _Listener) -> Fun(Sock, Port) end);
+with_refusing_listener(Fun) ->
+    {ok, Listener} = quic_listener:start(0, #{
+        max_connections => 0,
+        psks => #{<<"id">> => <<"secret">>},
+        alpn => [<<"h3">>]
+    }),
+    {ok, Sock} = gen_udp:open(0, [binary, {active, false}]),
+    try
+        Fun(Sock, quic_listener:get_port(Listener), Listener)
+    after
+        gen_udp:close(Sock),
+        quic_listener:stop(Listener)
+    end.
+
+await_queue_len(Pid, N, Left) when Left > 0 ->
+    case process_info(Pid, message_queue_len) of
+        {message_queue_len, L} when L >= N ->
+            ok;
+        _ ->
+            receive
+            after 10 -> await_queue_len(Pid, N, Left - 10)
+            end
+    end;
+await_queue_len(_Pid, _N, _Left) ->
+    error(datagrams_not_queued).
+
+%% Which of the DCIDs the refusal answers, and its error code.
+refused_cid(DCIDs, Datagram) ->
+    [Found] = [
+        {D, Code}
+     || D <- DCIDs,
+        {ok, #{frames := [{connection_close, transport, Code, 0, <<>>}]}} <-
+            [decode_refusal(D, Datagram)]
+    ],
+    Found.
+
+recv_any(Sock, Timeout) ->
+    case gen_udp:recv(Sock, 0, Timeout) of
+        {ok, {_IP, _Port, Datagram}} -> {ok, Datagram};
+        {error, timeout} -> timeout
+    end.
+
+%% The error code of the refusal to the fake Initial for DCID, checked
+%% field by field against what the client sent.
+recv_refusal(Sock, DCID) ->
+    recv_refusal(Sock, DCID, ?QUIC_VERSION_1).
+
+recv_refusal(Sock, DCID, Version) ->
+    {ok, Datagram} = recv_any(Sock, 5000),
+    ?assert(byte_size(Datagram) < 1200),
+    {ok, #{
+        version := Version,
+        dcid := ?FAKE_SCID,
+        scid := DCID,
+        token := <<>>,
+        pn := 0,
+        frames := [{connection_close, transport, Code, 0, <<>>}]
+    }} = decode_refusal(DCID, Datagram),
+    {ok, Code}.
+
+%% Decrypt a datagram holding exactly one server Initial, keyed from the
+%% client's DCID.
+decode_refusal(ClientDCID, Datagram) ->
+    <<1:1, 1:1, TypeBits:2, _:4, Version:32, DL, DCID:DL/binary, SL, SCID:SL/binary, Rest0/binary>> =
+        Datagram,
+    initial = quic_packet:bits_to_type(TypeBits, Version),
+    {TokenLen, Rest1} = quic_varint:decode(Rest0),
+    <<Token:TokenLen/binary, Rest2/binary>> = Rest1,
+    {Len, Rest3} = quic_varint:decode(Rest2),
+    Len = byte_size(Rest3),
+    Header = binary:part(Datagram, 0, byte_size(Datagram) - Len),
+    {Key, IV, HP} = quic_keys:derive_initial_server(ClientDCID, Version),
+    case quic_aead:unprotect_long_packet(aes_128_gcm, Key, IV, HP, Header, Rest3, undefined) of
+        {ok, PN, _, Plaintext} ->
+            {ok, Frames} = quic_frame:decode_all(Plaintext),
+            {ok, #{
+                version => Version,
+                dcid => DCID,
+                scid => SCID,
+                token => Token,
+                pn => PN,
+                frames => Frames
+            }};
+        {error, _} = Err ->
+            Err
+    end.
 
 await_handler_call(DCID) ->
     receive
