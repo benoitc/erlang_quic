@@ -45,6 +45,7 @@
     %% Range accumulation
     add_to_ranges/2,
     merge_ranges/1,
+    cap_ack_ranges/1,
     cap_ack_ranges/2,
     update_pn_space_recv/3,
 
@@ -362,6 +363,15 @@ merge_ranges(Ranges) ->
     Ranges.
 
 %% @doc Drop the lowest ranges beyond ?MAX_ACK_RANGE_COUNT.
+%%
+%% The list is descending, so the newest packet numbers are kept.
+-spec cap_ack_ranges([{non_neg_integer(), non_neg_integer()}]) ->
+    [{non_neg_integer(), non_neg_integer()}].
+cap_ack_ranges(Ranges) ->
+    {Kept, _Floor} = cap_ack_ranges(Ranges, 0),
+    Kept.
+
+%% @doc Drop the lowest ranges beyond ?MAX_ACK_RANGE_COUNT, tracking the floor.
 %%
 %% The list is descending, so the newest packet numbers are kept. The
 %% returned floor is the start of the lowest retained range: packets

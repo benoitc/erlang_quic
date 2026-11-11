@@ -23,6 +23,12 @@ replay_below_dropped_range_in_a_batch_test() ->
     S = quic_connection:fold_opened([{1000, 16#41, [{max_data, 2000}]}], S1),
     ?assertEqual(1000, S#state.max_data_remote).
 
+cap_ack_ranges_1_keeps_the_ranges_only_test() ->
+    Ranges = [{PN, PN} || PN <- lists:seq(200, 0, -2)],
+    Kept = quic_ack:cap_ack_ranges(Ranges),
+    ?assertEqual(lists:sublist(Ranges, 64), Kept),
+    ?assertEqual({Kept, 74}, quic_ack:cap_ack_ranges(Ranges, 0)).
+
 client() ->
     S0 = quic_connection_test_support:with_keys_and_socket(
         quic_connection_test_support:state_for_role(client)

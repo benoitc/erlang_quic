@@ -6134,8 +6134,7 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
     %% Process ACK - update loss detection and congestion control
     #state{loss_state = LossState, cc_state = CCState} = State,
 
-    %% Convert Ranges list to the format expected by quic_loss
-    %% Ranges is a list of {Start, End} tuples from largest to smallest
+    %% Ranges is the codec's [{LargestAcked, FirstRange} | [{Gap, Range}]]
     NextPN = next_pn(Level, State),
     NegativePN = quic_ack:acks_negative_pn(Ranges),
     case Ranges of
