@@ -96,6 +96,10 @@
 %% The peer opened this stream: client-initiated ids are even.
 -define(IS_PEER_STREAM(Id, S), ((S#state.role =:= server) =:= ((Id) band 1 =:= 0))).
 
+-define(IS_PRIORITY_UPDATE(T),
+    ((T) =:= ?H3_FRAME_PRIORITY_UPDATE_REQUEST orelse (T) =:= ?H3_FRAME_PRIORITY_UPDATE_PUSH)
+).
+
 %% Test exports - only available when compiled with TEST defined
 -ifdef(TEST).
 -export([
@@ -2114,6 +2118,9 @@ handle_control_frame({push_promise, _, _}, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"PUSH_PROMISE on control stream">>}};
 handle_control_frame({unknown, ?H3_FRAME_WT_STREAM, _}, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"WT_STREAM on control stream">>}};
+%% RFC 9218 Section 7.2: servers MUST NOT send PRIORITY_UPDATE.
+handle_control_frame({unknown, Type, _}, #state{role = client}) when ?IS_PRIORITY_UPDATE(Type) ->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"PRIORITY_UPDATE from server">>}};
 handle_control_frame({unknown, Type, Payload}, State) ->
     %% Check for PRIORITY_UPDATE frames (RFC 9218)
     case Type of
@@ -2491,6 +2498,10 @@ handle_push_frame(_StreamId, _PushId, {cancel_push, _}, _Fin, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"CANCEL_PUSH on push stream">>}};
 handle_push_frame(_StreamId, _PushId, {unknown, ?H3_FRAME_WT_STREAM, _}, _Fin, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"WT_STREAM on push stream">>}};
+handle_push_frame(_StreamId, _PushId, {unknown, Type, _}, _Fin, _State) when
+    ?IS_PRIORITY_UPDATE(Type)
+->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"PRIORITY_UPDATE on push stream">>}};
 handle_push_frame(_StreamId, _PushId, {unknown, _Type, _Payload}, _Fin, State) ->
     %% Unknown frame types are ignored per RFC 9114
     {ok, State}.
@@ -3138,6 +3149,11 @@ handle_request_frame(_StreamId, {max_push_id, _}, _Fin, _Stream, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"MAX_PUSH_ID on request stream">>}};
 handle_request_frame(_StreamId, {cancel_push, _}, _Fin, _Stream, _State) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"CANCEL_PUSH on request stream">>}};
+%% RFC 9218 Section 7.2: PRIORITY_UPDATE belongs on the client control stream.
+handle_request_frame(_StreamId, {unknown, Type, _}, _Fin, _Stream, _State) when
+    ?IS_PRIORITY_UPDATE(Type)
+->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"PRIORITY_UPDATE on request stream">>}};
 handle_request_frame(_StreamId, {unknown, _Type, _Payload}, _Fin, Stream, State) ->
     %% Skip unknown frame types per RFC 9114 Section 7.2.8
     {ok, Stream, State};
@@ -5335,9 +5351,8 @@ handle_priority_update_push_frame(Payload, #state{role = server, push_streams = 
         {error, Reason} ->
             {error, {connection_error, ?H3_FRAME_ERROR, Reason}}
     end;
-handle_priority_update_push_frame(_Payload, #state{role = client} = State) ->
-    %% RFC 9218: client should not receive PRIORITY_UPDATE for push; ignore.
-    {ok, State}.
+handle_priority_update_push_frame(_Payload, #state{role = client}) ->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"PRIORITY_UPDATE from server">>}}.
 
 %% Parse RFC 9218 Priority Field Value (Structured Fields format)
 %% Same format as Priority header: "u=N, i" or just parameters

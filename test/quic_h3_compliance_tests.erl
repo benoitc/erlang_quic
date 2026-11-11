@@ -2343,10 +2343,52 @@ priority_update_push_unknown_id_ignored_test() ->
     Payload = <<(quic_varint:encode(42))/binary, "u=0">>,
     ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_push_frame(Payload, State)).
 
-priority_update_push_client_ignored_test() ->
-    State = make_test_state(#{role => client}),
-    Payload = <<(quic_varint:encode(5))/binary, "u=1">>,
-    ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_push_frame(Payload, State)).
+%% RFC 9218 §7.2: servers MUST NOT send PRIORITY_UPDATE; a client that
+%% receives either kind on the control stream closes the connection.
+priority_update_received_by_a_client_is_frame_unexpected_test() ->
+    State = make_test_state(#{role => client, settings_received => true}),
+    lists:foreach(
+        fun(Type) ->
+            ?assertMatch(
+                {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+                quic_h3_connection:handle_control_frame({unknown, Type, <<0, "u=1">>}, State)
+            )
+        end,
+        [?H3_FRAME_PRIORITY_UPDATE_REQUEST, ?H3_FRAME_PRIORITY_UPDATE_PUSH]
+    ).
+
+%% RFC 9218 §7.2: on any stream but the client control stream it is a
+%% connection error H3_FRAME_UNEXPECTED, on request and push streams alike.
+priority_update_off_the_control_stream_is_frame_unexpected_test() ->
+    Update = raw_frame(?H3_FRAME_PRIORITY_UPDATE_REQUEST, <<0, "u=1">>),
+    UpdatePush = raw_frame(?H3_FRAME_PRIORITY_UPDATE_PUSH, <<0, "u=1">>),
+    lists:foreach(
+        fun({Role, Frame}) ->
+            State = make_test_state(#{role => Role, quic_conn => fake_quic_conn()}),
+            Request = <<(request_frame(<<"POST">>, <<"/">>))/binary, Frame/binary>>,
+            ?assertMatch(
+                {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}, _},
+                quic_h3_connection:handle_stream_data(0, Request, false, State)
+            )
+        end,
+        [{server, Update}, {server, UpdatePush}]
+    ),
+    flush_owner_events(),
+    Push = #h3_stream{id = 3, type = push, state = open, frame_state = expecting_data},
+    PushState = make_test_state(#{role => client, received_pushes => #{0 => Push}}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+        quic_h3_connection:handle_push_frame(
+            3, 0, {unknown, ?H3_FRAME_PRIORITY_UPDATE_REQUEST, <<0>>}, false, PushState
+        )
+    ).
+
+raw_frame(Type, Payload) ->
+    <<
+        (quic_varint:encode(Type))/binary,
+        (quic_varint:encode(byte_size(Payload)))/binary,
+        Payload/binary
+    >>.
 
 %%====================================================================
 %% Theme G: PRIORITY_UPDATE strict frame parsing (RFC 9218 §7)
