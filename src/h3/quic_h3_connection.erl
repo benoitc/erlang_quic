@@ -230,8 +230,6 @@
     next_push_id = 0 :: non_neg_integer(),
     %% push_streams: Active push streams - maps PushId to {StreamId, #h3_stream{}}
     push_streams = #{} :: #{non_neg_integer() => {non_neg_integer(), #h3_stream{}}},
-    %% cancelled_pushes: Set of push IDs cancelled by client
-    cancelled_pushes = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
 
     %% Client-side push state (RFC 9114 Section 4.6)
     %% local_max_push_id: Maximum push ID we've sent to server
@@ -2718,15 +2716,14 @@ cleanup_push_stream(
 handle_cancel_push_server(
     PushId,
     #state{
-        max_push_id = MaxPushId,
+        next_push_id = NextPushId,
         push_streams = PushStreams,
         quic_conn = QuicConn
     } = State
 ) ->
-    %% Validate push ID (RFC 9114 Section 7.2.3)
-    case PushId > MaxPushId orelse (MaxPushId =:= undefined) of
+    %% RFC 9114 Section 7.2.3: an ID no PUSH_PROMISE has mentioned is H3_ID_ERROR.
+    case PushId >= NextPushId of
         true ->
-            %% Invalid - push ID exceeds what we could use
             {error, {connection_error, ?H3_ID_ERROR, <<"invalid CANCEL_PUSH ID">>}};
         false ->
             %% Check if push stream already exists
@@ -4790,33 +4787,14 @@ cacheable_promised_method(Headers) ->
         false -> {error, missing_method}
     end.
 
-%% Allocate the next available push ID, skipping cancelled ones
+%% Allocate the next push ID
 %% Returns {ok, PushId, State} | {error, Reason}
 allocate_push_id(#state{max_push_id = undefined}) ->
     {error, push_not_enabled};
 allocate_push_id(#state{next_push_id = Next, max_push_id = Max}) when Next > Max ->
     {error, max_push_id_exceeded};
-allocate_push_id(
-    #state{next_push_id = Next, max_push_id = Max, cancelled_pushes = Cancelled} = State
-) ->
-    case sets:is_element(Next, Cancelled) of
-        true ->
-            %% Skip cancelled ID, try next
-            %% Remove from cancelled set since we're skipping it
-            State1 = State#state{
-                next_push_id = Next + 1,
-                cancelled_pushes = sets:del_element(Next, Cancelled)
-            },
-            %% Recursively find next available (but check bounds)
-            case Next + 1 > Max of
-                true ->
-                    {error, max_push_id_exceeded};
-                false ->
-                    allocate_push_id(State1)
-            end;
-        false ->
-            {ok, Next, State#state{next_push_id = Next + 1}}
-    end.
+allocate_push_id(#state{next_push_id = Next} = State) ->
+    {ok, Next, State#state{next_push_id = Next + 1}}.
 
 do_push_internal(
     RequestStreamId,
@@ -4938,7 +4916,6 @@ do_send_push_data(
     Fin,
     #state{
         push_streams = PushStreams,
-        cancelled_pushes = Cancelled,
         quic_conn = QuicConn
     } = State
 ) ->
@@ -4950,12 +4927,8 @@ do_send_push_data(
                     case Fin of
                         true ->
                             %% Push complete - remove from tracking
-                            %% Also clean cancelled_pushes to prevent unbounded set growth
                             State1 = release_sections(StreamId, State),
-                            {ok, State1#state{
-                                push_streams = maps:remove(PushId, PushStreams),
-                                cancelled_pushes = sets:del_element(PushId, Cancelled)
-                            }};
+                            {ok, State1#state{push_streams = maps:remove(PushId, PushStreams)}};
                         false ->
                             Stream1 = Stream#h3_stream{
                                 %% Sent-side accounting; push stream is dropped on FIN.

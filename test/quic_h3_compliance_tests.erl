@@ -1035,7 +1035,7 @@ data_buffered_when_no_handler_test() ->
         0, {data, <<"hello">>}, false, Stream, State
     ),
     %% Check that data was buffered (tuple position 44 for stream_data_buffers)
-    StreamDataBuffers = element(44, State2),
+    StreamDataBuffers = element(43, State2),
     ?assertMatch(#{0 := {[{<<"hello">>, false}], _, false}}, StreamDataBuffers),
     ?assertEqual(
         #{0 => {[{<<"hello">>, false}], 5 + ?H3_BUFFER_CHUNK_OVERHEAD, false}}, StreamDataBuffers
@@ -1428,7 +1428,7 @@ multiple_chunks_buffered_in_order_test() ->
         0, {data, <<"chunk2">>}, true, Stream1, State1
     ),
     %% Check buffered data (stored in reverse order internally)
-    StreamDataBuffers = element(44, State2),
+    StreamDataBuffers = element(43, State2),
     {Chunks, Size, HadFin} = maps:get(0, StreamDataBuffers),
     ?assertEqual([{<<"chunk2">>, true}, {<<"chunk1">>, false}], Chunks),
     %% Charged size: both payloads plus the per-chunk overhead each one costs.
@@ -3518,7 +3518,6 @@ make_test_state(Overrides) ->
         max_push_id => undefined,
         next_push_id => 0,
         push_streams => #{},
-        cancelled_pushes => sets:new([{version, 2}]),
         %% Client-side push state
         local_max_push_id => undefined,
         promised_pushes => #{},
@@ -3569,10 +3568,9 @@ make_test_state(Overrides) ->
         maps:get(local_max_field_section_size, Merged), maps:get(local_max_blocked_streams, Merged),
         %% Push fields
         maps:get(max_push_id, Merged), maps:get(next_push_id, Merged),
-        maps:get(push_streams, Merged), maps:get(cancelled_pushes, Merged),
-        maps:get(local_max_push_id, Merged), maps:get(promised_pushes, Merged),
-        maps:get(received_pushes, Merged), maps:get(local_cancelled_pushes, Merged),
-        maps:get(last_accepted_push_id, Merged),
+        maps:get(push_streams, Merged), maps:get(local_max_push_id, Merged),
+        maps:get(promised_pushes, Merged), maps:get(received_pushes, Merged),
+        maps:get(local_cancelled_pushes, Merged), maps:get(last_accepted_push_id, Merged),
         %% Per-stream handler registration
         maps:get(stream_handlers, Merged), maps:get(stream_data_buffers, Merged),
         maps:get(buffered_bytes, Merged), maps:get(max_buffered_body, Merged),
@@ -4223,8 +4221,8 @@ an_ended_claimed_uni_stream_is_forgotten_test() ->
         ]
     ),
     %% claimed_uni_streams is at position 49
-    ?assertEqual(#{2 => 16#54}, element(49, State1)),
-    ?assertEqual(#{}, element(49, State2)).
+    ?assertEqual(#{2 => 16#54}, element(48, State1)),
+    ?assertEqual(#{}, element(48, State2)).
 
 %%====================================================================
 %% QPACK stream errors (RFC 9204 §6)
