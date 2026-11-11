@@ -75,6 +75,26 @@ an_exception_fails_the_handshake_test() ->
         quic:stop_server(Name)
     end.
 
+%% ALPN is negotiated before the hook runs, so a ClientHello with no
+%% common protocol is refused without calling it (RFC 9001 Section 8.1).
+no_common_alpn_is_refused_before_the_handler_test() ->
+    Test = self(),
+    Name = start_server(#{
+        alpn_handler => fun(_Conn, Alpn) ->
+            Test ! {handler_called, Alpn},
+            {ok, relay(Alpn, Test)}
+        end
+    }),
+    try
+        ?assertMatch(
+            {error, {peer_closed, transport, ?NO_APPLICATION_PROTOCOL, _, _}},
+            connect(Name, <<"proto-c">>)
+        ),
+        ?assertEqual([], [M || {handler_called, _} = M <- flush()])
+    after
+        quic:stop_server(Name)
+    end.
+
 start_server(Opts) ->
     {ok, _} = application:ensure_all_started(quic),
     {Cert, Key} = quic_test_echo_server:cert_and_key(),
