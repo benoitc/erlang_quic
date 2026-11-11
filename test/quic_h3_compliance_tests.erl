@@ -2338,10 +2338,46 @@ duplicate_content_length_mismatch_rejected_test() ->
 %% PRIORITY_UPDATE on push (RFC 9218 §7.2)
 %%====================================================================
 
-priority_update_push_unknown_id_ignored_test() ->
-    State = make_test_state(#{role => server, push_streams => #{}}),
+%% A push promised and already finished is ignored.
+priority_update_push_finished_id_ignored_test() ->
+    State = make_test_state(#{
+        role => server, max_push_id => 50, next_push_id => 43, push_streams => #{}
+    }),
     Payload = <<(quic_varint:encode(42))/binary, "u=0">>,
     ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_push_frame(Payload, State)).
+
+%% RFC 9218 §7.2: a push ID not yet promised, or above MAX_PUSH_ID, is a
+%% connection error H3_ID_ERROR.
+priority_update_push_unpromised_id_is_an_id_error_test() ->
+    State = make_test_state(#{
+        role => server, max_push_id => 50, next_push_id => 43, push_streams => #{}
+    }),
+    lists:foreach(
+        fun(PushId) ->
+            ?assertMatch(
+                {error, {connection_error, ?H3_ID_ERROR, _}},
+                quic_h3_connection:handle_priority_update_push_frame(
+                    <<(quic_varint:encode(PushId))/binary, "u=0">>, State
+                )
+            )
+        end,
+        [43, 51]
+    ).
+
+%% RFC 9218 §7.2: the request variant MUST name a request stream.
+priority_update_for_a_non_request_stream_is_an_id_error_test() ->
+    State = make_test_state(#{role => server}),
+    lists:foreach(
+        fun(StreamId) ->
+            ?assertMatch(
+                {error, {connection_error, ?H3_ID_ERROR, _}},
+                quic_h3_connection:handle_priority_update_frame(
+                    <<(quic_varint:encode(StreamId))/binary, "u=0">>, State
+                )
+            )
+        end,
+        [1, 2, 3, 6]
+    ).
 
 %% RFC 9218 §7.2: servers MUST NOT send PRIORITY_UPDATE; a client that
 %% receives either kind on the control stream closes the connection.
@@ -2403,7 +2439,7 @@ priority_update_empty_payload_rejected_test() ->
 %% Well-formed PRIORITY_UPDATE for an unknown stream is silently ignored.
 priority_update_unknown_stream_ignored_test() ->
     State = make_test_state(#{role => server}),
-    Payload = <<(quic_varint:encode(99))/binary, "u=3">>,
+    Payload = <<(quic_varint:encode(100))/binary, "u=3">>,
     ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_frame(Payload, State)).
 
 %%====================================================================
@@ -3284,6 +3320,7 @@ priority_update_push_stream_updates_state_test() ->
     State = make_test_state(#{
         role => server,
         settings_received => true,
+        next_push_id => 1,
         push_streams => #{0 => {10, Stream}}
     }),
     Payload = <<0, "u=7, i">>,

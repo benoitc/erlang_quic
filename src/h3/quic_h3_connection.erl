@@ -5308,6 +5308,10 @@ apply_stream_priority(StreamId, Stream, #state{quic_conn = QuicConn}) ->
 %% Payload format: Prioritized Element ID (varint) + Priority Field Value (rest)
 handle_priority_update_frame(Payload, #state{streams = Streams} = State) ->
     case decode_priority_update_payload(Payload) of
+        {ok, StreamId, _} when (StreamId band 3) =/= 0 ->
+            %% RFC 9218 Section 7.2: it MUST name a request stream.
+            {error,
+                {connection_error, ?H3_ID_ERROR, <<"PRIORITY_UPDATE for a non-request stream">>}};
         {ok, StreamId, PriorityFieldValue} ->
             case maps:find(StreamId, Streams) of
                 {ok, Stream} ->
@@ -5337,6 +5341,9 @@ decode_priority_update_payload(Payload) ->
 %% client sends it to reprioritize a push stream.
 handle_priority_update_push_frame(Payload, #state{role = server, push_streams = Pushes} = State) ->
     case decode_priority_update_payload(Payload) of
+        {ok, PushId, _} when PushId >= State#state.next_push_id ->
+            %% RFC 9218 Section 7.2: it MUST name a promised push.
+            {error, {connection_error, ?H3_ID_ERROR, <<"PRIORITY_UPDATE for an unpromised push">>}};
         {ok, PushId, PriorityFieldValue} ->
             case maps:find(PushId, Pushes) of
                 {ok, {StreamId, Stream}} ->
