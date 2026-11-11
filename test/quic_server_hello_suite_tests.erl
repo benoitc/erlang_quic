@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% A ServerHello selecting a cipher suite the client did not offer is an
-%%% illegal_parameter (RFC 8446 Section 4.1.3), whether or not the suite
+%%% illegal_parameter (RFC 9846 Section 4.2.3), whether or not the suite
 %%% is one the client knows.
 
 -module(quic_server_hello_suite_tests).

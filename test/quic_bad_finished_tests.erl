@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% A Finished that fails verification ends the handshake with a
-%%% decrypt_error alert (RFC 8446 Section 4.4.4), QUIC error 0x0133.
+%%% decrypt_error alert (RFC 9846 Section 4.5.3), QUIC error 0x0133.
 %%% One of the wrong length ends it with decode_error, 0x0132, since
 %%% verify_data is Hash.length bytes (RFC 9846 Section 4.5.3).
 
