@@ -170,6 +170,8 @@
     %% (socket backend only; see quic_socket:start_shared_sender/1).
     send_sender :: pid() | undefined,
     send_gso_counter :: atomics:atomics_ref() | undefined,
+    %% Refusal allowance: slot 1 the window (monotonic second), slot 2 the count
+    refusals :: atomics:atomics_ref(),
     port :: inet:port_number(),
     tls :: #listener_tls{},
     %% Connection ID -> Pid mapping
@@ -440,6 +442,7 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts, Preferred
         gro_receiver = GROReceiver,
         send_sender = SendSender,
         send_gso_counter = SendGSOCounter,
+        refusals = new_refusal_allowance(),
         port = ActualPort,
         tls = #listener_tls{
             cert = Cert,
@@ -775,6 +778,9 @@ dispatch_batched_packets(
 %% RFC 9000 Section 14.1: a server discards an Initial in a smaller
 %% datagram, and Section 5.2.2 sends no Version Negotiation for one.
 -define(MIN_INITIAL_DATAGRAM, 1200).
+
+%% Refusals (RFC 9000 Section 5.2.2) each listener sends per second.
+-define(MAX_REFUSALS_PER_SECOND, 100).
 
 %% Group packets by their destination connection
 group_packets_by_conn([], _DCIDLen, _Conns, Acc) ->
@@ -1241,7 +1247,7 @@ create_connection(
 spawn_with_limit(Validated, OrigDCID, RetrySCID, Packet, DCID, Version, RemoteAddr, State) ->
     case connection_limit_reached(State) of
         true ->
-            ?LOG_WARNING(#{what => connection_limit_reached}, ?QUIC_LOG_META),
+            ?LOG_DEBUG(#{what => connection_limit_reached}, ?QUIC_LOG_META),
             send_refusal(?QUIC_CONNECTION_REFUSED, Packet, DCID, Version, RemoteAddr, State);
         false ->
             create_connection_unconditional(
@@ -1433,16 +1439,39 @@ send_to_connection(ConnPid, Packet, RemoteAddr) ->
 
 %% RFC 9000 Section 5.2.2: answer a refused Initial with CONNECTION_CLOSE.
 send_refusal(Code, Packet, DCID, Version, {IP, Port}, State) ->
+    #listener_state{refusals = Refusals} = State,
     case parse_initial_token(Packet) of
         {ok, _Token, ClientSCID, DCID} ->
-            #listener_state{
-                socket = Socket, socket_state = SocketState, socket_backend = Backend
-            } = State,
-            Refusal = build_refusal(Code, ClientSCID, DCID, Version),
-            _ = send_packet(Socket, SocketState, Backend, IP, Port, Refusal),
-            ok;
+            case refusal_allowed(Refusals, erlang:monotonic_time(second)) of
+                true ->
+                    #listener_state{
+                        socket = Socket, socket_state = SocketState, socket_backend = Backend
+                    } = State,
+                    Refusal = build_refusal(Code, ClientSCID, DCID, Version),
+                    _ = send_packet(Socket, SocketState, Backend, IP, Port, Refusal),
+                    ok;
+                false ->
+                    ok
+            end;
         _ ->
             ok
+    end.
+
+%% Starts with a window already over, so the first refusal opens one.
+new_refusal_allowance() ->
+    Ref = atomics:new(2, []),
+    atomics:put(Ref, 1, erlang:monotonic_time(second) - 1),
+    Ref.
+
+%% At most ?MAX_REFUSALS_PER_SECOND refusals per window; past that, drop.
+refusal_allowed(Ref, Now) ->
+    case Now =< atomics:get(Ref, 1) of
+        true ->
+            (atomics:add_get(Ref, 2, 1) =< ?MAX_REFUSALS_PER_SECOND);
+        false ->
+            atomics:put(Ref, 1, Now),
+            atomics:put(Ref, 2, 1),
+            true
     end.
 
 %% Keyed from the Initial's DCID, the Retry SCID after a Retry.

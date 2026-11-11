@@ -433,6 +433,75 @@ batched_initials_refused_test_() ->
         end)
     end}.
 
+%% At most 100 refusals per one-second window, then the next window
+%% allows again.
+refusal_allowance_test() ->
+    Ref = quic_listener:new_refusal_allowance(),
+    Now = erlang:monotonic_time(second),
+    ?assertEqual(
+        lists:duplicate(100, true),
+        [quic_listener:refusal_allowed(Ref, Now) || _ <- lists:seq(1, 100)]
+    ),
+    ?assertNot(quic_listener:refusal_allowed(Ref, Now)),
+    ?assert(quic_listener:refusal_allowed(Ref, Now + 1)),
+    ?assertEqual({Now + 1, 1}, {atomics:get(Ref, 1), atomics:get(Ref, 2)}).
+
+%% The listener drops the Initial past the allowance and answers again
+%% once the window is over. The window is set by hand, not by sleeping.
+refusals_bounded_test_() ->
+    {timeout, 60, fun() ->
+        with_refusing_listener(fun(Sock, Port, Listener) ->
+            Ref = refusal_allowance(Listener),
+            Now = erlang:monotonic_time(second),
+            ok = atomics:put(Ref, 1, Now + 3600),
+            ok = atomics:put(Ref, 2, 0),
+            lists:foreach(
+                fun(N) ->
+                    D = <<N:64>>,
+                    ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_initial(D)),
+                    ?assertEqual({ok, ?QUIC_CONNECTION_REFUSED}, recv_refusal(Sock, D))
+                end,
+                lists:seq(1, 100)
+            ),
+            ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_initial(<<101:64>>)),
+            ok = await_atomic(Ref, 2, 101, 5000),
+            ok = atomics:put(Ref, 1, Now - 1),
+            Next = <<102:64>>,
+            ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_initial(Next)),
+            %% First datagram since the 100th refusal: none for the 101st.
+            ?assertEqual({ok, ?QUIC_CONNECTION_REFUSED}, recv_refusal(Sock, Next)),
+            ?assertEqual(timeout, recv_any(Sock, 200)),
+            ?assertEqual(1, atomics:get(Ref, 2))
+        end)
+    end}.
+
+%% The listener's one two-slot atomics ref.
+refusal_allowance(Listener) ->
+    [Ref] = [
+        E
+     || E <- tuple_to_list(sys:get_state(Listener)),
+        is_reference(E),
+        try atomics:info(E) of
+            #{size := 2} -> true;
+            _ -> false
+        catch
+            error:badarg -> false
+        end
+    ],
+    Ref.
+
+await_atomic(Ref, Ix, Value, Left) when Left > 0 ->
+    case atomics:get(Ref, Ix) of
+        Value ->
+            ok;
+        _ ->
+            receive
+            after 10 -> await_atomic(Ref, Ix, Value, Left - 10)
+            end
+    end;
+await_atomic(_Ref, _Ix, _Value, _Left) ->
+    error(allowance_not_reached).
+
 with_refusing_listener(Fun) when is_function(Fun, 2) ->
     with_refusing_listener(fun(Sock, Port, _Listener) -> Fun(Sock, Port) end);
 with_refusing_listener(Fun) ->
