@@ -32,6 +32,15 @@ nothing_queued_test() ->
     S0 = quic_connection_test_support:state_with_send_stream(?STREAM, 1000, false),
     ?assertEqual([1000], final_sizes(quic_connection:do_close_stream(?STREAM, 0, S0))).
 
+%% RFC 9000 Section 13.3: a RESET_STREAM sent again does not change.
+second_reset_test() ->
+    {ok, S1} = quic_connection:do_close_stream(?STREAM, 0, queued()),
+    {ok, S} = quic_connection:do_close_stream(?STREAM, 1, S1),
+    ?assertEqual(
+        [{reset_stream, ?STREAM, 0, 400}],
+        [F || {reset_stream, _, _, _} = F <- S#state.pend_frames]
+    ).
+
 %% 400 bytes sent, 600 queued behind them.
 queued() ->
     S0 = quic_connection_test_support:state_with_send_stream(?STREAM, 400, false),

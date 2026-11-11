@@ -231,6 +231,7 @@
 -define(TLS_ALERT_CERTIFICATE_REQUIRED, 116).
 -define(TLS_ALERT_ILLEGAL_PARAMETER, 47).
 -define(TLS_ALERT_UNKNOWN_CA, 48).
+-define(TLS_ALERT_DECODE_ERROR, 50).
 -define(TLS_ALERT_DECRYPT_ERROR, 51).
 -define(TLS_ALERT_INTERNAL_ERROR, 80).
 -define(TLS_ALERT_UNKNOWN_PSK_IDENTITY, 115).
@@ -483,7 +484,10 @@
 
     %% Packets encrypted under the current key phase; forces a key update
     %% at the AEAD confidentiality limit (RFC 9001 §6.6).
-    send_count = 0 :: non_neg_integer()
+    send_count = 0 :: non_neg_integer(),
+
+    %% Lowest packet number opened with the current keys
+    recv_first_pn :: non_neg_integer() | undefined
 }).
 
 %% Path State for Connection Migration (RFC 9000 Section 9)
@@ -743,6 +747,8 @@
     largest_recv :: non_neg_integer() | undefined,
     recv_time :: non_neg_integer() | undefined,
     ack_ranges :: [{non_neg_integer(), non_neg_integer()}],
+    %% Packet numbers below this are no longer accepted.
+    recv_floor = 0 :: non_neg_integer(),
     ack_eliciting_in_flight :: non_neg_integer()
 }).
 

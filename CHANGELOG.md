@@ -11,6 +11,91 @@ All notable changes to this project will be documented in this file.
   authenticated to the name the peer then used in the dist handshake.
   Other return values work as before.
 
+### Fixed
+- A write to a stream whose sending side had been reset, by the
+  application, a stream deadline or the automatic answer to the peer's
+  STOP_SENDING, was still sent, at or past the final size the reset had
+  announced, and peers closed the connection with FINAL_SIZE_ERROR. Such
+  a write now fails with stream_closed, as one after the FIN does
+  (RFC 9000 Section 3.3).
+- Resetting a stream a second time sent another RESET_STREAM with a new
+  error code and a larger final size, and the peer closed the connection
+  with FINAL_SIZE_ERROR. Resetting a stream whose sending side is already
+  done now does nothing (RFC 9000 Section 4.5).
+- A RESET_STREAM the peer sent again counted the stream's unreceived
+  bytes against connection flow control a second time and told the owner
+  about the reset again. A repeated RESET_STREAM is now ignored (RFC 9000
+  Sections 4.5 and 13.3).
+- A RESET_STREAM_AT from the peer did not count the stream's final size
+  against connection flow control, so connection credit fell behind what
+  the peer had used and the peer could stall waiting for more (RFC 9000
+  Section 4.5, draft-ietf-quic-reliable-stream-reset-07).
+- After heavy packet loss left more than 64 ACK ranges, a packet number
+  below the ranges kept was accepted again, so a duplicated packet was
+  processed twice. Packet numbers below the lowest range kept are now
+  discarded as duplicates (RFC 9000 Sections 12.3 and 13.2.3).
+- An ACK frame whose ranges reached below packet number 0 was processed
+  instead of closing the connection with FRAME_ENCODING_ERROR (RFC 9000
+  Section 19.3.1).
+- A version 1 or 2 long-header packet with a connection ID longer than
+  20 bytes is now dropped (RFC 9000 Section 17.2). Before, a listener
+  started a connection for an Initial with such a Destination Connection
+  ID, and either side took such a Source Connection ID as the peer's.
+  Version Negotiation still accepts the longer IDs RFC 8999 allows.
+- A client now discards a Retry whose Source Connection ID is the
+  Destination Connection ID of its own Initial (RFC 9000 Section
+  17.2.5.1). Before, it took the Retry and restarted the handshake.
+- A disable_active_migration transport parameter with a value, or a
+  preferred_address with a connection ID longer than 20 bytes, now
+  closes the connection with TRANSPORT_PARAMETER_ERROR (RFC 9000
+  Sections 7.4 and 18.2). Before, both were accepted, and the malformed
+  disable_active_migration was read as allowing migration.
+- CRYPTO data at an encryption level the handshake had left, extending
+  past what had been received there, was handed to TLS: a fragment was
+  buffered for good, a whole message closed the connection with
+  unexpected_message. It is now a PROTOCOL_VIOLATION; retransmissions of
+  data already received are still ignored (RFC 9001 Section 4.1.3).
+- When the handshake moved on to a higher encryption level, CRYPTO data
+  left over at the previous one was ignored, or closed the connection
+  with unexpected_message if it held a whole message. It is now a
+  PROTOCOL_VIOLATION (RFC 9001 Section 4.1.3).
+- A Finished message that failed verification, or was shorter than 32
+  bytes, was ignored, leaving the handshake to time out. It now closes
+  the connection with decrypt_error, or decode_error when its length is
+  not that of the handshake hash (RFC 9846 Section 4.5.3).
+- A client took a ServerHello or HelloRetryRequest naming a cipher suite
+  it does not know for TLS_AES_128_GCM_SHA256 and carried on with the
+  wrong keys. It now aborts with illegal_parameter (RFC 9846
+  Section 4.2.3).
+- A packet that opened with the previous 1-RTT keys was accepted even
+  when a lower-numbered packet had already used the new ones. It now
+  closes the connection with KEY_UPDATE_ERROR (RFC 9001 Section 6.4).
+- Packets that failed authentication were not counted, so the AEAD
+  integrity limit was never enforced. The connection now closes with
+  AEAD_LIMIT_REACHED at the limit (RFC 9001 Section 6.6).
+- A connection whose handshake lost a few packets could start with its
+  congestion window collapsed to two packets: losses of the first flight
+  and its probes, all sent before any RTT sample, were taken for
+  persistent congestion. Only packets sent after the first RTT sample now
+  count towards it (RFC 9002 Section 7.6.2).
+- A datagram the kernel refused as too large for the interface took the
+  rest of its send batch with it, and the packets queued behind it came
+  back as losses. Only the oversized datagram is lost now (RFC 9000
+  Section 14.4).
+- On Linux, datagrams now always leave with Don't Fragment set (RFC 9000
+  Section 14). Before, Linux fragmented datagrams larger than its cached
+  path MTU, so a path MTU probe could succeed in fragments and raise the
+  datagram size past what the path carries unfragmented.
+- A 1-RTT packet the kernel refused to send outside a batch was never
+  sent again, so the stream data it carried was lost and the stream
+  stalled. It is now counted as sent, and loss detection sends its data
+  again (RFC 9002 Section 6).
+- Every datagram the listener could not parse logged a warning. It is
+  now logged at debug level.
+- The warning logged for a packet that fails to decrypt included the
+  peer's stateless reset tokens. It now lists only the peer's connection
+  IDs and their sequence numbers.
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed

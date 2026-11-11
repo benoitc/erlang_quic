@@ -963,6 +963,7 @@ open_client_socket_genudp(IP, Opts, ExtraOpts) ->
         {active, false},
         {recbuf, RecBuf},
         {sndbuf, SndBuf}
+        | quic_socket:dont_fragment_opts(AddrFamily)
     ],
     case gen_udp:open(0, BaseOpts ++ ExtraOpts) of
         {ok, S} ->
@@ -3902,120 +3903,91 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
     PacketSize = byte_size(Packet),
     AmpRoom = amp_room(State),
     Hold = must_hold(PacketSize, AmpRoom, State),
-    SendResult =
+    %% A datagram the kernel refuses is tracked as sent, so loss detection resends it.
+    NewSocketState =
         case Hold of
-            true -> {ok, undefined};
-            false -> do_socket_send(Packet, State)
+            true -> undefined;
+            false -> sent_socket_state(do_socket_send(Packet, State), PN, PacketSize)
+        end,
+    %% Emit qlog packet_sent event (no-op when qlog disabled)
+    ?QLOG_EMIT_PACKET_SENT((State#state.cfg)#conn_cfg.qlog_ctx, #{
+        packet_type => one_rtt,
+        packet_number => PN,
+        length => PacketSize,
+        frames => Frames
+    }),
+
+    %% Single monotonic_time sample shared between loss
+    %% tracking and last_activity; saves one BIF call per
+    %% packet on the bulk-send hot path.
+    Now = erlang:monotonic_time(millisecond),
+
+    %% Track sent packet for loss detection and congestion control.
+    NewLossState = quic_loss:on_packet_sent(
+        app, LossState, PN, PacketSize, AckEliciting, Frames, Now
+    ),
+    NewCCState =
+        case AckEliciting of
+            true -> quic_cc:on_packet_sent(CCState, PacketSize);
+            false -> CCState
         end,
 
-    %% Handle send result - only track packet and update state if send succeeded
-    case SendResult of
-        {ok, NewSocketState} ->
-            %% Emit qlog packet_sent event (no-op when qlog disabled)
-            ?QLOG_EMIT_PACKET_SENT((State#state.cfg)#conn_cfg.qlog_ctx, #{
-                packet_type => one_rtt,
-                packet_number => PN,
-                length => PacketSize,
-                frames => Frames
-            }),
-
-            %% Single monotonic_time sample shared between loss
-            %% tracking and last_activity; saves one BIF call per
-            %% packet on the bulk-send hot path.
-            Now = erlang:monotonic_time(millisecond),
-
-            %% Track sent packet for loss detection and congestion control.
-            NewLossState = quic_loss:on_packet_sent(
-                app, LossState, PN, PacketSize, AckEliciting, Frames, Now
-            ),
-            NewCCState =
-                case AckEliciting of
-                    true -> quic_cc:on_packet_sent(CCState, PacketSize);
-                    false -> CCState
-                end,
-
-            %% Update PN space, counters, socket state and dirty bits in
-            %% a single record update to avoid copying #state{} multiple
-            %% times per packet on the bulk-send hot path.
-            NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-            EffectiveSocketState =
-                case NewSocketState of
-                    undefined -> State#state.socket_state;
-                    _ -> NewSocketState
-                end,
-            %% RFC 9000 §10.1: restart the idle timer (by bumping last_activity)
-            %% only on the first ack-eliciting packet sent since we last received
-            %% one. Restarting on every send let a peer sending keep-alive PINGs /
-            %% PTO retransmits into a black hole hold its own idle timer open
-            %% forever; never restarting would spuriously close a reactivated idle
-            %% connection before its first ack returns. The flag is cleared on
-            %% every receive (update_last_activity/2).
-            RestartIdle = AckEliciting andalso (not State#state.ack_eliciting_since_recv),
-            NewLastActivity =
-                case RestartIdle of
-                    true -> Now;
-                    false -> State#state.last_activity
-                end,
-            {NewKeyState, KeyLimit} = count_sealed(State#state.key_state, 1),
-            {AckTimer, AckCount} = sent_ack_fields(AckFields, State),
-            bump(?C_PACKETS_SENT, 1, State),
-            {PendPayload, PendFrames, PendSize, Coalesce} =
-                case Pend of
-                    keep ->
-                        #state{
-                            pend_payload = PP, pend_frames = PF, pend_size = PS, coalesce = C
-                        } = State,
-                        {PP, PF, PS, C};
-                    clear ->
-                        {[], [], 0, State#state.coalesce};
-                    close ->
-                        {[], [], 0, false}
-                end,
-            State1 = State#state{
-                pn_app = NewPNSpace,
-                cc_state = NewCCState,
-                loss_state = NewLossState,
-                socket_state = EffectiveSocketState,
-                last_activity = NewLastActivity,
-                ack_eliciting_since_recv =
-                    AckEliciting orelse State#state.ack_eliciting_since_recv,
-                pto_dirty = true,
-                burst_sent = State#state.burst_sent + 1,
-                key_state = NewKeyState,
-                pend_payload = PendPayload,
-                pend_frames = PendFrames,
-                pend_size = PendSize,
-                coalesce = Coalesce,
-                ack_timer = AckTimer,
-                ack_elicited_count = AckCount
-            },
-            after_sealed(KeyLimit, note_amp_send(Packet, PacketSize, AmpRoom, Hold, State1));
-        {error, Reason, ClearedSocketState} ->
-            send_app_packet_internal_error(
-                Reason,
-                PN,
-                PacketSize,
-                PNSpace,
-                clear_pend(Pend, State#state{cc_state = CCState}),
-                ClearedSocketState
-            );
-        {error, Reason} ->
-            send_app_packet_internal_error(
-                Reason,
-                PN,
-                PacketSize,
-                PNSpace,
-                clear_pend(Pend, State#state{cc_state = CCState}),
-                undefined
-            )
-    end.
-
-clear_pend(keep, State) ->
-    State;
-clear_pend(clear, State) ->
-    State#state{pend_payload = [], pend_frames = [], pend_size = 0};
-clear_pend(close, State) ->
-    State#state{pend_payload = [], pend_frames = [], pend_size = 0, coalesce = false}.
+    %% Update PN space, counters, socket state and dirty bits in
+    %% a single record update to avoid copying #state{} multiple
+    %% times per packet on the bulk-send hot path.
+    NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
+    EffectiveSocketState =
+        case NewSocketState of
+            undefined -> State#state.socket_state;
+            _ -> NewSocketState
+        end,
+    %% RFC 9000 §10.1: restart the idle timer (by bumping last_activity)
+    %% only on the first ack-eliciting packet sent since we last received
+    %% one. Restarting on every send let a peer sending keep-alive PINGs /
+    %% PTO retransmits into a black hole hold its own idle timer open
+    %% forever; never restarting would spuriously close a reactivated idle
+    %% connection before its first ack returns. The flag is cleared on
+    %% every receive (update_last_activity/2).
+    RestartIdle = AckEliciting andalso (not State#state.ack_eliciting_since_recv),
+    NewLastActivity =
+        case RestartIdle of
+            true -> Now;
+            false -> State#state.last_activity
+        end,
+    {NewKeyState, KeyLimit} = count_sealed(State#state.key_state, 1),
+    {AckTimer, AckCount} = sent_ack_fields(AckFields, State),
+    bump(?C_PACKETS_SENT, 1, State),
+    {PendPayload, PendFrames, PendSize, Coalesce} =
+        case Pend of
+            keep ->
+                #state{
+                    pend_payload = PP, pend_frames = PF, pend_size = PS, coalesce = C
+                } = State,
+                {PP, PF, PS, C};
+            clear ->
+                {[], [], 0, State#state.coalesce};
+            close ->
+                {[], [], 0, false}
+        end,
+    State1 = State#state{
+        pn_app = NewPNSpace,
+        cc_state = NewCCState,
+        loss_state = NewLossState,
+        socket_state = EffectiveSocketState,
+        last_activity = NewLastActivity,
+        ack_eliciting_since_recv =
+            AckEliciting orelse State#state.ack_eliciting_since_recv,
+        pto_dirty = true,
+        burst_sent = State#state.burst_sent + 1,
+        key_state = NewKeyState,
+        pend_payload = PendPayload,
+        pend_frames = PendFrames,
+        pend_size = PendSize,
+        coalesce = Coalesce,
+        ack_timer = AckTimer,
+        ack_elicited_count = AckCount
+    },
+    after_sealed(KeyLimit, note_amp_send(Packet, PacketSize, AmpRoom, Hold, State1)).
 
 %% An ack-eliciting packet carries the pending ACK when it fits the data
 %% budget (RFC 9000 §13.2.1 lets an ACK ride on any 1-RTT packet), so an
@@ -4060,25 +4032,20 @@ sent_ack_fields(acked, #state{ack_timer = T} = State) ->
     bump(?C_ACK_SENT, 1, State),
     {undefined, 0}.
 
-%% Common error handling for send_app_packet_internal: bump PN without
-%% tracking the packet (PTO owns retransmission) and, on the 3-tuple
-%% error path, write back the cleared socket_state so the stale batch
-%% does not linger.
-send_app_packet_internal_error(Reason, PN, PacketSize, PNSpace, State, ClearedSocketState) ->
+%% The socket state to carry on after a send; a refused datagram is logged.
+sent_socket_state({ok, SocketState}, _PN, _Size) ->
+    SocketState;
+sent_socket_state({error, Reason, ClearedSocketState}, PN, Size) ->
+    log_send_failed(Reason, PN, Size),
+    ClearedSocketState;
+sent_socket_state({error, Reason}, PN, Size) ->
+    log_send_failed(Reason, PN, Size),
+    undefined.
+
+log_send_failed(Reason, PN, Size) ->
     ?LOG_WARNING(
-        #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
-        ?QUIC_LOG_META
-    ),
-    NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    Burst = State#state.burst_sent + 1,
-    case ClearedSocketState of
-        undefined ->
-            State#state{pn_app = NewPNSpace, burst_sent = Burst};
-        _ ->
-            State#state{
-                pn_app = NewPNSpace, socket_state = ClearedSocketState, burst_sent = Burst
-            }
-    end.
+        #{what => udp_send_failed, reason => Reason, pn => PN, size => Size}, ?QUIC_LOG_META
+    ).
 
 %% RFC 9000 Section 14.1: a server pads only datagrams carrying an
 %% ack-eliciting Initial. An ACK-only one at full size would spend an
@@ -5013,10 +4980,11 @@ handle_packet_loop(Data, State) ->
         {error, Reason} when
             Reason =:= padding_only;
             Reason =:= empty_packet;
-            Reason =:= invalid_fixed_bit
+            Reason =:= invalid_fixed_bit;
+            Reason =:= cid_too_long;
+            Reason =:= retry_scid_is_our_dcid
         ->
-            %% End of coalesced packets (padding or invalid trailing data)
-            %% This is normal, just re-enable socket and return
+            %% Trailing padding, or a packet the spec says to drop.
             maybe_reenable_socket(State),
             replay_early_packets(State);
         {error, no_app_keys} ->
@@ -5048,12 +5016,8 @@ handle_packet_loop(Data, State) ->
                     source => State#state.current_packet_source,
                     scid => binhex((State#state.cfg)#conn_cfg.scid),
                     dcid => binhex(State#state.dcid),
-                    known_reset_tokens => [
-                        {
-                            E#cid_entry.seq_num,
-                            binhex(E#cid_entry.cid),
-                            binhex(E#cid_entry.stateless_reset_token)
-                        }
+                    peer_cids => [
+                        {E#cid_entry.seq_num, binhex(E#cid_entry.cid)}
                      || E <- quic_cid:peer_entries(State#state.cid_pool_state)
                     ],
                     head => binhex(binary:part(Data, 0, min(16, byte_size(Data)))),
@@ -5067,8 +5031,37 @@ handle_packet_loop(Data, State) ->
                 },
                 ?QUIC_LOG_META
             ),
-            handle_packet_loop(next_coalesced_packet(Data), State)
+            case count_auth_failure(Reason, State) of
+                {limit_reached, State1} ->
+                    maybe_reenable_socket(State1),
+                    State1;
+                {ok, State1} ->
+                    handle_packet_loop(next_coalesced_packet(Data), State1)
+            end
     end.
+
+%% RFC 9001 Section 6.6: past the AEAD's integrity limit the connection
+%% closes with AEAD_LIMIT_REACHED and processes no more packets.
+count_auth_failure(decryption_failed, #state{auth_failures = N} = State) ->
+    State1 = State#state{auth_failures = N + 1},
+    case N + 1 > integrity_limit(State) of
+        true ->
+            {limit_reached,
+                close_with_error(
+                    app, transport, ?QUIC_AEAD_LIMIT_REACHED, 0, <<"integrity limit">>, State1
+                )};
+        false ->
+            {ok, State1}
+    end;
+count_auth_failure(_Reason, State) ->
+    {ok, State}.
+
+integrity_limit(#state{app_keys = {#crypto_keys{cipher = Cipher}, _}}) ->
+    aead_integrity_limit(Cipher).
+
+aead_integrity_limit(aes_128_gcm) -> 1 bsl 52;
+aead_integrity_limit(aes_256_gcm) -> 1 bsl 52;
+aead_integrity_limit(chacha20_poly1305) -> 1 bsl 36.
 
 %% Least time the last probe before a disconnect gets to be acknowledged.
 -define(DISCONNECT_GRACE_MS, 1000).
@@ -5208,6 +5201,8 @@ decode_long_header_packet(Data, State) ->
     case Version of
         0 ->
             handle_version_negotiation(DCID, SCID, Rest3, State);
+        _ when DCIDLen > 20; SCIDLen > 20 ->
+            {error, cid_too_long};
         _ ->
             %% RFC 9368: a client that offered other acceptable versions
             %% adopts the one the server switched to.
@@ -5496,6 +5491,15 @@ handle_retry_packet(
 ) when Largest =/= undefined ->
     %% RFC 9000 Section 17.2.5.2: nor any after a server Initial
     {error, late_retry};
+handle_retry_packet(
+    _FullPacket,
+    _Version,
+    ServerSCID,
+    _Rest,
+    #state{cfg = #conn_cfg{original_dcid = ServerSCID}}
+) ->
+    %% RFC 9000 Section 17.2.5.1
+    {error, retry_scid_is_our_dcid};
 handle_retry_packet(
     FullPacket,
     Version,
@@ -5787,22 +5791,54 @@ decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
                 {ok, _PN, _Plaintext} when ?SHORT_RESERVED_BITS(UnprotectedFirstByte) ->
                     {ok, app, [], <<>>, reserved_bits_close(app, State1), processed};
                 {ok, PN, Plaintext} ->
-                    %% Single monotonic_time sample shared by
-                    %% recv_time and last_activity to save one BIF
-                    %% call per received packet on the hot path.
-                    Now = erlang:monotonic_time(millisecond),
-                    State3 = record_app_recv(UnprotectedFirstByte, PN, State1, Now),
-                    %% Use streaming decode for efficiency
-                    case decode_and_process_streaming(app, Plaintext, State3) of
-                        {ok, NewState, Frames} ->
-                            {ok, app, Frames, <<>>, NewState, processed};
-                        {error, Reason} ->
-                            {error, Reason}
+                    case opened_with(DecryptKeys, PN, State1) of
+                        out_of_order ->
+                            {ok, app, [], <<>>, key_update_close(State1), processed};
+                        {ok, State2} ->
+                            %% Single monotonic_time sample shared by
+                            %% recv_time and last_activity to save one BIF
+                            %% call per received packet on the hot path.
+                            Now = erlang:monotonic_time(millisecond),
+                            State3 = record_app_recv(UnprotectedFirstByte, PN, State2, Now),
+                            %% Use streaming decode for efficiency
+                            case decode_and_process_streaming(app, Plaintext, State3) of
+                                {ok, NewState, Frames} ->
+                                    {ok, app, Frames, <<>>, NewState, processed};
+                                {error, Reason} ->
+                                    {error, Reason}
+                            end
                     end;
                 {error, decryption_failed} ->
                     {error, decryption_failed}
             end
     end.
+
+%% RFC 9001 Section 6.4: a packet numbered above one opened with newer
+%% keys must not open with older ones.
+opened_with(
+    Keys,
+    PN,
+    #state{key_state = #key_update_state{current_keys = Keys, recv_first_pn = First} = KS} = State
+) when First =:= undefined; PN < First ->
+    {ok, State#state{key_state = KS#key_update_state{recv_first_pn = PN}}};
+opened_with(Keys, PN, #state{
+    key_state = #key_update_state{current_keys = Current, recv_first_pn = First}
+}) when
+    is_integer(First), PN > First, Keys =/= Current
+->
+    out_of_order;
+opened_with(_Keys, _PN, State) ->
+    {ok, State}.
+
+key_update_close(State) ->
+    close_with_error(
+        level_for_close(app),
+        transport,
+        ?QUIC_KEY_UPDATE_ERROR,
+        0,
+        <<"packet opened with old keys after newer ones">>,
+        State
+    ).
 
 %% Decrypt a long header packet (Initial/Handshake)
 %% RemainingData is the data after this packet (for coalesced packets)
@@ -6046,17 +6082,34 @@ process_frame(_Level, ping, State) ->
     %% Should trigger ACK
     State;
 process_frame(Level, {crypto, Offset, Data}, State) ->
-    buffer_crypto_data(Level, Offset, Data, State);
+    case
+        crypto_level_closed(Level, State) andalso
+            Offset + byte_size(Data) > maps:get(Level, (State#state.hs)#hs.crypto_offset, 0)
+    of
+        true ->
+            close_with_transport_error(
+                ?QUIC_PROTOCOL_VIOLATION,
+                <<"CRYPTO data past the end of a previous encryption level">>,
+                State
+            );
+        false ->
+            buffer_crypto_data(Level, Offset, Data, State)
+    end;
 process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
     %% Process ACK - update loss detection and congestion control
     #state{loss_state = LossState, cc_state = CCState} = State,
 
-    %% Convert Ranges list to the format expected by quic_loss
-    %% Ranges is a list of {Start, End} tuples from largest to smallest
+    %% Ranges is the codec's [{LargestAcked, FirstRange} | [{Gap, Range}]]
     NextPN = next_pn(Level, State),
+    NegativePN = quic_ack:acks_negative_pn(Ranges),
     case Ranges of
         [] ->
             State;
+        _ when NegativePN ->
+            %% RFC 9000 Section 19.3.1
+            close_with_transport_error(
+                ?QUIC_FRAME_ENCODING_ERROR, <<"ACK below packet number 0">>, State
+            );
         [{LargestAcked, _} | _] when LargestAcked >= NextPN ->
             %% RFC 9000 Section 13.1
             close_with_transport_error(
@@ -6380,6 +6433,8 @@ process_frame(
             close_with_transport_error(
                 ?QUIC_FLOW_CONTROL_ERROR, <<"RESET_STREAM final size above limit">>, State
             );
+        {ok, #stream_state{recv_done = true, final_size = FinalSize}} ->
+            State;
         {ok, Stream} ->
             case reset_size_error(Stream, FinalSize, State) of
                 ok -> accept_reset_stream(Stream, StreamId, ErrorCode, FinalSize, State);
@@ -6452,14 +6507,20 @@ process_frame(
                                     final_size = FinalSize,
                                     recv_reset_at = ReliableSize,
                                     recv_reset_error = ErrorCode,
-                                    recv_done = Delivered orelse Stream#stream_state.recv_done
+                                    recv_done = Delivered orelse Stream#stream_state.recv_done,
+                                    recv_highest = FinalSize
                                 },
                                 Streams
                             ),
                             %% Notify owner - same message as RESET_STREAM
                             StateFl = flush_pending_delivery(State),
                             notify_stream_reset(StreamId, ErrorCode, FinalSize, State),
-                            maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams})
+                            maybe_reclaim_stream(
+                                StreamId,
+                                account_reset_stream_at(
+                                    Stream, FinalSize, StateFl#state{streams = NewStreams}
+                                )
+                            )
                     end;
                 error ->
                     case is_reclaimed_frame(StreamId, State) of
@@ -6487,7 +6548,8 @@ process_frame(
                                                     final_size = FinalSize,
                                                     recv_reset_at = ReliableSize,
                                                     recv_reset_error = ErrorCode,
-                                                    recv_done = (ReliableSize =:= 0)
+                                                    recv_done = (ReliableSize =:= 0),
+                                                    recv_highest = FinalSize
                                                 },
                                                 Streams
                                             ),
@@ -6496,7 +6558,12 @@ process_frame(
                                                 StreamId, ErrorCode, FinalSize, State
                                             ),
                                             maybe_reclaim_stream(
-                                                StreamId, StateFl#state{streams = NewStreams}
+                                                StreamId,
+                                                account_reset_stream_at(
+                                                    NewStream,
+                                                    FinalSize,
+                                                    StateFl#state{streams = NewStreams}
+                                                )
                                             )
                                     end
                             end
@@ -6906,8 +6973,10 @@ process_crypto_buffer(Level, State) ->
                 }
             },
 
-            %% Try to process more
-            process_crypto_buffer(Level, State2);
+            case crypto_level_closed(Level, State2) of
+                true -> reject_unconsumed_crypto(Level, NewOffset, State2);
+                false -> process_crypto_buffer(Level, State2)
+            end;
         none ->
             %% Nothing keyed exactly at ExpectedOffset, which does not mean a
             %% gap: a peer may re-frame CRYPTO data it retransmits (RFC 9000
@@ -6927,6 +6996,28 @@ process_crypto_buffer(Level, State) ->
                 false -> State1
             end
     end.
+
+reject_unconsumed_crypto(Level, Offset, State) ->
+    Buffer = maps:get(Level, (State#state.hs)#hs.crypto_buffer),
+    case gb_trees:is_empty(element(1, quic_reassembly:trim_reassembly_buffer(Buffer, Offset))) of
+        true ->
+            State;
+        false ->
+            close_with_transport_error(
+                ?QUIC_PROTOCOL_VIOLATION,
+                <<"unconsumed CRYPTO data at a previous encryption level">>,
+                State
+            )
+    end.
+
+%% TLS has moved past this level for receiving (RFC 9001 Section 4.1.3).
+crypto_level_closed(initial, #state{hs = #hs{tls_state = T}}) ->
+    T =/= undefined andalso T =/= ?TLS_AWAITING_CLIENT_HELLO andalso
+        T =/= ?TLS_AWAITING_SERVER_HELLO;
+crypto_level_closed(handshake, #state{hs = #hs{tls_state = T}}) ->
+    T =:= ?TLS_HANDSHAKE_COMPLETE;
+crypto_level_closed(_Level, _State) ->
+    false.
 
 %% Key logging is opt-in via SSLKEYLOGFILE and off otherwise; see
 %% quic_keylog for why it exists and what it exposes.
@@ -6969,7 +7060,16 @@ process_tls_messages(Level, Data, State) ->
                     OriginalMsg = binary:part(Data, 0, 4 + byte_size(Body)),
                     %% Pass the original bytes to process_tls_message for transcript
                     State1 = process_tls_message(Level, Type, Body, OriginalMsg, State),
-                    process_tls_messages(Level, Rest, State1);
+                    case Rest =/= <<>> andalso crypto_level_closed(Level, State1) of
+                        true ->
+                            close_with_transport_error(
+                                ?QUIC_PROTOCOL_VIOLATION,
+                                <<"unconsumed CRYPTO data at a previous encryption level">>,
+                                State1
+                            );
+                        false ->
+                            process_tls_messages(Level, Rest, State1)
+                    end;
                 _ when
                     Type =:= ?TLS_CERTIFICATE_REQUEST,
                     Level =:= app,
@@ -7355,7 +7455,7 @@ process_tls_message(
     Cipher = ClientHsKeys#crypto_keys.cipher,
 
     %% Verify server Finished
-    case quic_tls:parse_finished(Body) of
+    case finished_verify_data(Body, Cipher) of
         {ok, VerifyData} ->
             TranscriptHash = quic_crypto:transcript_hash(
                 Cipher, (State#state.hs)#hs.tls_transcript
@@ -7480,11 +7580,10 @@ process_tls_message(
                     %% segmented so no datagram exceeds max_udp_payload_size.
                     send_handshake_crypto(HandshakePayload, State1);
                 false ->
-                    %% Verification failed
-                    State
+                    send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
             end;
         {error, _} ->
-            State
+            send_tls_alert(?TLS_ALERT_DECODE_ERROR, State)
     end;
 %% Server receives client's Finished
 process_tls_message(
@@ -7498,7 +7597,7 @@ process_tls_message(
     {ClientHsKeys, _} = (State#state.hs)#hs.handshake_keys,
     Cipher = ClientHsKeys#crypto_keys.cipher,
 
-    case quic_tls:parse_finished(Body) of
+    case finished_verify_data(Body, Cipher) of
         {ok, VerifyData} ->
             %% Verify client's Finished using client handshake secret
             TranscriptHash = quic_crypto:transcript_hash(
@@ -7540,10 +7639,10 @@ process_tls_message(
                     %% Send NewSessionTicket to enable session resumption
                     send_new_session_ticket(State3);
                 false ->
-                    State
+                    send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
             end;
         {error, _} ->
-            State
+            send_tls_alert(?TLS_ALERT_DECODE_ERROR, State)
     end;
 %% Client receives NewSessionTicket from server (post-handshake)
 %% RFC 8446 Section 4.6.1
@@ -9307,7 +9406,10 @@ check_persistent_congestion([], _LossState, CCState) ->
     CCState;
 check_persistent_congestion(LostPackets, LossState, CCState) ->
     %% Extract packet number and time sent from lost packets
-    LostInfo = [{P#sent_packet.pn, P#sent_packet.time_sent} || P <- LostPackets],
+    LostInfo = [
+        {P#sent_packet.pn, P#sent_packet.time_sent}
+     || P <- LostPackets, quic_loss:after_first_rtt_sample(LossState, P)
+    ],
     PTO = quic_loss:persistent_congestion_pto(LossState),
     case quic_cc:detect_persistent_congestion(LostInfo, PTO, CCState) of
         true ->
@@ -9683,6 +9785,8 @@ drop_duplicate(Other, _PNSpace) ->
 
 received_before(PN, #pn_space{largest_recv = L}) when L =:= undefined; PN > L ->
     false;
+received_before(PN, #pn_space{recv_floor = Floor}) when PN < Floor ->
+    true;
 received_before(PN, #pn_space{ack_ranges = Ranges}) ->
     lists:any(fun({Start, End}) -> PN >= Start andalso PN =< End end, Ranges).
 
@@ -10232,6 +10336,13 @@ account_reset_stream(#stream_state{recv_buffered = Buffered} = Stream, FinalSize
         recv_buffer_bytes = max(0, State#state.recv_buffer_bytes - Buffered)
     }).
 
+%% Callers move the stream's recv_highest to FinalSize, so the reliable
+%% bytes still to come are not counted again.
+account_reset_stream_at(Stream, FinalSize, State) ->
+    conn_grant(State#state{
+        data_received = State#state.data_received + FinalSize - highest_received(Stream)
+    }).
+
 %% data_received is the sum of these over all streams.
 highest_received(#stream_state{recv_offset = Offset, recv_highest = Highest}) ->
     max(Offset, Highest).
@@ -10271,7 +10382,12 @@ do_send_data(StreamId, Data, Fin, #state{streams = Streams} = State, Admission) 
     case maps:find(StreamId, Streams) of
         {ok, #stream_state{send_fin = true}} ->
             %% Our FIN fixed the final size (RFC 9000 Section 4.5), so
-            %% anything written now would lie past it.
+            %% anything written now would lie past it. So did our
+            %% RESET_STREAM or RESET_STREAM_AT.
+            {error, stream_closed};
+        {ok, #stream_state{send_done = true}} ->
+            {error, stream_closed};
+        {ok, #stream_state{send_reset_at = RS}} when RS =/= undefined ->
             {error, stream_closed};
         {ok, StreamState} ->
             %% Check stream direction (can't send on peer's uni streams)
@@ -11025,7 +11141,7 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
                 Ps
         end,
     {SS1, TrackedRev, AmpState} = send_run(Packets, Frames, PN0, State, SocketState),
-    %% One loss-tracker and one CC update for the run's successful sends.
+    %% One loss-tracker and one CC update for the run.
     {Loss1, CC1} =
         case TrackedRev of
             [] ->
@@ -11113,10 +11229,9 @@ send_run_limited([Packet | Pkts], [Frame | Frs], PN, State0, Tracked) ->
 
 %% Hand the run's sealed packets to the socket; the socket state is
 %% threaded explicitly so no #state{} copy happens per packet, and the
-%% successful sends are collected as [{PN, Size, Frame}] (reversed) for
+%% sends are collected as [{PN, Size, Frame}] (reversed) for
 %% one batched loss/CC update afterwards. Packet I carries PN0 + I. A
-%% failed send skips that packet's tracking exactly as
-%% send_app_packet_now/3 does (PTO owns retransmission).
+%% refused packet is tracked too, so loss detection resends it.
 send_run_packets([], [], _PN, _State, SS, Tracked) ->
     {SS, Tracked};
 send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Tracked) ->
@@ -11132,33 +11247,18 @@ send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Tracked) ->
             _ ->
                 quic_socket:send(SS, IP, Port, Packet)
         end,
-    case SendResult of
-        {ok, SS1} ->
-            ?QLOG_EMIT_PACKET_SENT((State#state.cfg)#conn_cfg.qlog_ctx, #{
-                packet_type => one_rtt,
-                packet_number => PN,
-                length => PacketSize,
-                frames => [Frame]
-            }),
-            SS2 =
-                case SS1 of
-                    undefined -> SS;
-                    _ -> SS1
-                end,
-            send_run_packets(Pkts, Frs, PN + 1, State, SS2, [{PN, PacketSize, Frame} | Tracked]);
-        {error, Reason, SSCleared} ->
-            ?LOG_WARNING(
-                #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
-                ?QUIC_LOG_META
-            ),
-            send_run_packets(Pkts, Frs, PN + 1, State, SSCleared, Tracked);
-        {error, Reason} ->
-            ?LOG_WARNING(
-                #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
-                ?QUIC_LOG_META
-            ),
-            send_run_packets(Pkts, Frs, PN + 1, State, SS, Tracked)
-    end.
+    ?QLOG_EMIT_PACKET_SENT((State#state.cfg)#conn_cfg.qlog_ctx, #{
+        packet_type => one_rtt,
+        packet_number => PN,
+        length => PacketSize,
+        frames => [Frame]
+    }),
+    SS2 =
+        case sent_socket_state(SendResult, PN, PacketSize) of
+            undefined -> SS;
+            SS1 -> SS1
+        end,
+    send_run_packets(Pkts, Frs, PN + 1, State, SS2, [{PN, PacketSize, Frame} | Tracked]).
 
 %% Build the iodata payload `[Header, Chunk]' for a chunked stream
 %% send, reusing the pre-computed header pieces when `Offset > 0'.
@@ -11660,6 +11760,8 @@ reset_own_stream(
 %% both directions are terminated.
 do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
+        {ok, #stream_state{send_done = true}} ->
+            {ok, State};
         {ok, StreamState} ->
             case StreamState#stream_state.deadline_timer of
                 undefined -> ok;
@@ -12241,6 +12343,13 @@ alert_and_exit(AlertCode, State, Reason) ->
     _ = flush_socket_batch(Sent),
     exit({tls_alert, Reason}).
 
+%% verify_data is exactly the handshake hash length (RFC 9846 Section 4.5.3).
+finished_verify_data(Body, Cipher) ->
+    case byte_size(Body) =:= quic_crypto:hash_len(quic_crypto:cipher_to_hash(Cipher)) of
+        true -> {ok, Body};
+        false -> {error, invalid_finished}
+    end.
+
 send_tls_alert(AlertCode, State) ->
     send_tls_alert(AlertCode, default_alert_phrase(AlertCode), State).
 
@@ -12266,6 +12375,7 @@ default_alert_phrase(?TLS_ALERT_HANDSHAKE_FAILURE) -> <<"handshake failure">>;
 default_alert_phrase(?TLS_ALERT_ILLEGAL_PARAMETER) -> <<"illegal parameter">>;
 default_alert_phrase(?TLS_ALERT_UNEXPECTED_MESSAGE) -> <<"unexpected message">>;
 default_alert_phrase(?TLS_ALERT_DECRYPT_ERROR) -> <<"decrypt error">>;
+default_alert_phrase(?TLS_ALERT_DECODE_ERROR) -> <<"decode error">>;
 default_alert_phrase(?TLS_ALERT_INTERNAL_ERROR) -> <<"internal error">>;
 default_alert_phrase(?TLS_ALERT_UNKNOWN_PSK_IDENTITY) -> <<"unknown psk identity">>;
 default_alert_phrase(?TLS_ALERT_BAD_CERTIFICATE) -> <<"bad certificate">>;
@@ -13369,7 +13479,8 @@ initiate_key_update(#state{key_state = KeyState} = State) ->
         server_app_secret = NewServerSecret,
         update_state = initiated,
         % New phase: reset the AEAD send counter.
-        send_count = 0
+        send_count = 0,
+        recv_first_pn = undefined
     },
 
     State#state{
@@ -13432,7 +13543,8 @@ handle_peer_key_update(#state{key_state = KeyState} = State) ->
                 client_app_secret = NewClientSecret,
                 server_app_secret = NewServerSecret,
                 update_state = responding,
-                send_count = 0
+                send_count = 0,
+                recv_first_pn = undefined
             },
             State#state{
                 app_keys = {NewClientKeys, NewServerKeys},
@@ -13956,7 +14068,9 @@ select_preferred_addr(_, _) ->
 -spec rebind_socket(gen_udp:socket(), inet | inet6) -> {ok, gen_udp:socket()} | {error, term()}.
 rebind_socket(OldSocket, Family) ->
     {ok, [{active, Active}]} = inet:getopts(OldSocket, [active]),
-    case gen_udp:open(0, [binary, Family, {active, Active}]) of
+    case
+        gen_udp:open(0, [binary, Family, {active, Active} | quic_socket:dont_fragment_opts(Family)])
+    of
         {ok, NewSocket} ->
             gen_udp:close(OldSocket),
             {ok, NewSocket};
