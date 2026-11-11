@@ -54,6 +54,11 @@ auto_keep_alive_uses_the_peers_when_ours_is_off_test() ->
 auto_keep_alive_is_off_without_an_idle_timeout_test() ->
     ?assertEqual(disabled, auto_keep_alive(0, #{})).
 
+%% Half a short timeout still comes before it.
+auto_keep_alive_is_half_a_short_timeout_test() ->
+    ?assertEqual(2500, auto_keep_alive(60000, #{max_idle_timeout => 5000})),
+    ?assertEqual(1000, auto_keep_alive(60000, #{max_idle_timeout => 1500})).
+
 %% Fence: an interval that was given is not touched.
 explicit_keep_alive_is_kept_test() ->
     #state{cfg = Cfg} = S = state(60000, #{max_idle_timeout => 12000}, 0),

@@ -13420,7 +13420,7 @@ resolve_keep_alive_interval(
     Interval =
         case advertised_idle_timeout(Local, maps:get(max_idle_timeout, TP, 0)) of
             0 -> disabled;
-            IdleTimeout -> max(5000, IdleTimeout div 2)
+            IdleTimeout -> max(1000, IdleTimeout div 2)
         end,
     State#state{cfg = Cfg#conn_cfg{keep_alive_interval = Interval}};
 resolve_keep_alive_interval(State) ->

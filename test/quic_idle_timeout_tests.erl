@@ -304,7 +304,14 @@ auto_keep_alive_holds_against_shorter_peer_timeout_test_() ->
     {timeout, 30, fun auto_keep_alive_holds_against_shorter_peer_timeout/0}.
 
 auto_keep_alive_holds_against_shorter_peer_timeout() ->
-    {ok, Echo} = quic_test_echo_server:start(#{idle_timeout => 6000}),
+    auto_keep_alive_holds(6000).
+
+%% A peer timeout of 5 seconds or less is kept alive too.
+auto_keep_alive_holds_against_short_peer_timeout_test_() ->
+    {timeout, 30, fun() -> auto_keep_alive_holds(4000) end}.
+
+auto_keep_alive_holds(PeerTimeout) ->
+    {ok, Echo} = quic_test_echo_server:start(#{idle_timeout => PeerTimeout}),
     try
         Opts = (quic_test_echo_server:client_opts())#{
             alpn => [<<"echo">>], idle_timeout => 60000, keep_alive_interval => auto
