@@ -51,6 +51,39 @@
 %%%     quic_h3:send_data(Conn, StreamId, <<"Hello, HTTP/3!">>, true).
 %%% '''
 %%%
+%%% == Responses without content ==
+%%%
+%%% A final response to HEAD, and any 204 or 304, has no content
+%%% (RFC 9110 Section 6.4.1). `send_response/4' sends it at once with the
+%%% end of the stream, and `respond/5' sends no body. A body or trailers
+%%% offered after it are dropped: `send_data/4' and `send_trailers/3'
+%%% return `ok' and send nothing.
+%%%
+%%% ```
+%%% handle_request(Conn, StreamId, <<"HEAD">>, _Path, _Headers) ->
+%%%     ok = quic_h3:send_response(Conn, StreamId, 200, [{<<"content-length">>, <<"1024">>}]);
+%%% handle_request(Conn, StreamId, _Method, _Path, _Headers) ->
+%%%     ok = quic_h3:send_response(Conn, StreamId, 204, []).
+%%% '''
+%%%
+%%% Notes:
+%%% <ul>
+%%%   <li>A 1xx never ends the stream. Send it with `send_response/4';
+%%%       `respond/5' returns `{error, informational_status}'.</li>
+%%%   <li>`send_data/4' and `send_trailers/3' before a final response, with
+%%%       nothing or only a 1xx sent, return `{error, no_final_response}'
+%%%       (RFC 9114 Section 4.1).</li>
+%%%   <li>Status 101 returns `{error, status_101_forbidden}': HTTP/3 has no
+%%%       101 (RFC 9114 Section 4.5).</li>
+%%%   <li>Content-Length is removed from a 1xx and a 204 (RFC 9110
+%%%       Section 8.6). A 304 and a HEAD response keep it.</li>
+%%%   <li>Pushed responses follow the same rules with `send_push_response/4'
+%%%       and `send_push_data/4'.</li>
+%%%   <li>As a client, DATA with content on a response without content
+%%%       resets the stream with H3_MESSAGE_ERROR, and none of it is
+%%%       delivered. A 101 received is reset the same way.</li>
+%%% </ul>
+%%%
 %%% == Serving HTTP/3 beside other protocols ==
 %%%
 %%% Use `accept/2' when one QUIC listener serves HTTP/3 and other
@@ -527,7 +560,9 @@ open_uni_stream(Conn, StreamType) when is_integer(StreamType), StreamType >= 0 -
 %% @doc Send body data on a request stream.
 %%
 %% For clients, this sends request body data.
-%% For servers, this sends response body data.
+%% For servers, this sends response body data: after a HEAD, 204 or 304
+%% response it returns `ok' and sends nothing, and before a final response
+%% it returns `{error, no_final_response}'.
 %% @end
 -spec send_data(conn(), stream_id(), binary()) -> ok | {error, send_queue_full | term()}.
 send_data(Conn, StreamId, Data) ->
@@ -535,7 +570,9 @@ send_data(Conn, StreamId, Data) ->
 
 %% @doc Send body data with fin flag.
 %%
-%% Set `Fin' to `true' to indicate the end of the body.
+%% Set `Fin' to `true' to indicate the end of the body. A server gets `ok'
+%% with nothing sent after a HEAD, 204 or 304 response, and
+%% `{error, no_final_response}' before a final response.
 %%
 %% Returns `{error, send_queue_full}' when the connection's send queue is
 %% full. Nothing was written; wait for the connection to drain and send
@@ -549,7 +586,9 @@ send_data(Conn, StreamId, Data, Fin) ->
 
 %% @doc Send trailers on a request stream.
 %%
-%% Trailers are sent after the body and signal the end of the stream.
+%% Trailers are sent after the body and signal the end of the stream. A
+%% server gets `ok' with nothing sent after a HEAD, 204 or 304 response, and
+%% `{error, no_final_response}' before a final response.
 %% @end
 -spec send_trailers(conn(), stream_id(), headers()) -> ok | {error, term()}.
 send_trailers(Conn, StreamId, Trailers) ->
@@ -809,7 +848,10 @@ stop_server(Name) ->
 %% @doc Send an HTTP response (server only).
 %%
 %% Sends the response status and headers. The body should be
-%% sent separately using `send_data/4'.
+%% sent separately using `send_data/4'. A HEAD, 204 or 304 response is
+%% sent at once and ends the stream. A 1xx is interim and can be followed
+%% by more. Content-Length is removed from a 1xx and a 204. Status 101
+%% returns `{error, status_101_forbidden}'.
 %% @end
 -spec send_response(conn(), stream_id(), status(), headers()) ->
     ok | {error, term()}.
@@ -819,7 +861,8 @@ send_response(Conn, StreamId, Status, Headers) ->
 %% @doc Send a full HTTP response (status, headers and body) in one call.
 %%
 %% Coalesces the work of `send_response/4' plus a final `send_data/4' with
-%% end-stream. HEAD, 204 and 304 responses send no body.
+%% end-stream. HEAD, 204 and 304 responses send no body. A 1xx returns
+%% `{error, informational_status}' and 101 `{error, status_101_forbidden}'.
 %% @end
 -spec respond(conn(), stream_id(), status(), headers(), binary()) ->
     ok | {error, term()}.
@@ -845,7 +888,9 @@ push(Conn, RequestStreamId, Headers) ->
 %% @doc Send response headers on a push stream (server only).
 %%
 %% After push/3 returns a push ID, use this to send the response headers.
-%% The `:status' pseudo-header is added automatically.
+%% The `:status' pseudo-header is added automatically. A pushed response to
+%% HEAD, or a 204 or 304, ends the push stream. Status 101 returns
+%% `{error, status_101_forbidden}'.
 %% @end
 -spec send_push_response(conn(), push_id(), status(), headers()) -> ok | {error, term()}.
 send_push_response(Conn, PushId, Status, Headers) ->
@@ -853,7 +898,9 @@ send_push_response(Conn, PushId, Status, Headers) ->
 
 %% @doc Send data on a push stream (server only).
 %%
-%% Set Fin to true to indicate this is the last data.
+%% Set Fin to true to indicate this is the last data. Returns `ok' and sends
+%% nothing after a HEAD, 204 or 304 pushed response, and
+%% `{error, no_final_response}' before a final one.
 %% @end
 -spec send_push_data(conn(), push_id(), binary(), boolean()) -> ok | {error, term()}.
 send_push_data(Conn, PushId, Data, Fin) ->
