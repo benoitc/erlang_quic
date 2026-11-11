@@ -136,11 +136,20 @@ goaway_received_after_sent_keeps_our_id_test() ->
 %% Request Validation Tests (RFC 9114 Section 4.1)
 %%====================================================================
 
-data_before_headers_returns_stream_reset_test() ->
+%% RFC 9114 Section 4.1: an invalid sequence of frames is a connection
+%% error H3_FRAME_UNEXPECTED, a DATA frame before HEADERS among them.
+data_before_headers_is_a_connection_error_test() ->
     Stream = #h3_stream{id = 0, frame_state = expecting_headers},
-    State = make_test_state(#{}),
-    Result = quic_h3_connection:handle_request_frame(0, {data, <<"body">>}, false, Stream, State),
-    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+    lists:foreach(
+        fun(Role) ->
+            State = make_test_state(#{role => Role}),
+            ?assertMatch(
+                {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+                quic_h3_connection:handle_request_frame(0, {data, <<"body">>}, false, Stream, State)
+            )
+        end,
+        [client, server]
+    ).
 
 %% HEADERS after the content are the trailer section even when the FIN
 %% comes in a later delivery; the message ends with the FIN.
@@ -192,15 +201,25 @@ response_trailers_ahead_of_the_fin_are_trailers_test() ->
     ?assertEqual(#{}, quic_h3_connection:test_streams(State2)),
     ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic))).
 
-%% Nothing but the FIN may follow the trailer section.
-headers_after_trailers_reset_the_stream_test() ->
+%% Nothing but the FIN may follow the trailer section: HEADERS or DATA
+%% after it is a connection error (RFC 9114 Section 4.1).
+frames_after_trailers_are_a_connection_error_test() ->
     flush_owner_events(),
-    Quic = fake_quic_conn(),
-    State0 = make_test_state(#{role => server, quic_conn => Quic}),
-    Upload = <<(request_frame(<<"POST">>, <<"/upload">>))/binary, (trailers_frame())/binary>>,
-    {ok, State1} = quic_h3_connection:handle_stream_data(0, Upload, false, State0),
-    {ok, _} = quic_h3_connection:handle_stream_data(0, trailers_frame(), true, State1),
-    ?assert(lists:member({close_stream, 0, ?H3_FRAME_UNEXPECTED}, fake_quic_calls(Quic))).
+    lists:foreach(
+        fun(Next) ->
+            State0 = make_test_state(#{role => server, quic_conn => fake_quic_conn()}),
+            Upload = <<
+                (request_frame(<<"POST">>, <<"/upload">>))/binary, (trailers_frame())/binary
+            >>,
+            {ok, State1} = quic_h3_connection:handle_stream_data(0, Upload, false, State0),
+            ?assertMatch(
+                {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}, _},
+                quic_h3_connection:handle_stream_data(0, Next, true, State1)
+            )
+        end,
+        [trailers_frame(), quic_h3_frame:encode_data(<<"x">>)]
+    ),
+    flush_owner_events().
 
 trailers_frame() ->
     quic_h3_frame:encode_headers(quic_qpack:encode([{<<"x-sum">>, <<"1">>}])).
@@ -656,22 +675,38 @@ max_field_section_size_empty_headers_test() ->
 %% Frame After Complete State Tests (RFC 9114 Section 4.1)
 %%====================================================================
 
-frame_after_complete_returns_reset_test() ->
+frame_after_complete_is_a_connection_error_test() ->
     Stream = #h3_stream{id = 0, frame_state = complete},
     State = make_test_state(#{}),
-    %% Any frame on completed stream should be rejected (except unknown)
     Result = quic_h3_connection:handle_request_frame(
         0, {data, <<"body">>}, false, Stream, State
     ),
-    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+    ?assertMatch({error, {connection_error, ?H3_FRAME_UNEXPECTED, _}}, Result).
 
-headers_after_complete_returns_reset_test() ->
+headers_after_complete_is_a_connection_error_test() ->
     Stream = #h3_stream{id = 0, frame_state = complete},
     State = make_test_state(#{}),
     Result = quic_h3_connection:handle_request_frame(
         0, {headers, <<>>}, false, Stream, State
     ),
-    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+    ?assertMatch({error, {connection_error, ?H3_FRAME_UNEXPECTED, _}}, Result).
+
+%% PUSH_PROMISE is not part of the response and may follow it.
+push_promise_after_trailers_is_accepted_test() ->
+    flush_owner_events(),
+    Stream = #h3_stream{id = 0, frame_state = complete},
+    State = make_test_state(#{role => client, local_max_push_id => 10}),
+    Promise = quic_qpack:encode([
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/style.css">>}
+    ]),
+    ?assertMatch(
+        {ok, #h3_stream{frame_state = complete}, _},
+        quic_h3_connection:handle_request_frame(0, {push_promise, 0, Promise}, false, Stream, State)
+    ),
+    ?assertMatch({push_promise, 0, 0, _}, next_owner_event()).
 
 unknown_frame_after_complete_allowed_test() ->
     Stream = #h3_stream{id = 0, frame_state = complete},
@@ -1932,7 +1967,7 @@ connect_tunnel_rejects_trailers_test() ->
     Result = quic_h3_connection:handle_request_frame(
         0, {headers, <<>>}, true, Stream, State
     ),
-    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+    ?assertMatch({error, {connection_error, ?H3_FRAME_UNEXPECTED, _}}, Result).
 
 connect_tunnel_rejects_push_promise_test() ->
     Stream = #h3_stream{id = 0, frame_state = expecting_data, is_connect = true},
@@ -1940,7 +1975,7 @@ connect_tunnel_rejects_push_promise_test() ->
     Result = quic_h3_connection:handle_request_frame(
         0, {push_promise, 1, <<>>}, false, Stream, State
     ),
-    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+    ?assertMatch({error, {connection_error, ?H3_FRAME_UNEXPECTED, _}}, Result).
 
 connect_tunnel_send_trailers_rejected_test() ->
     Stream = #h3_stream{id = 0, is_connect = true},
@@ -3929,12 +3964,10 @@ a_stream_error_stops_the_peer_sending_test() ->
     flush_owner_events(),
     Quic = fake_quic_conn(),
     State0 = make_test_state(#{role => server, quic_conn => Quic}),
-    {ok, State1} = quic_h3_connection:handle_stream_data(
-        0, quic_h3_frame:encode_data(<<"abc">>), false, State0
-    ),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, overlong_upload(), false, State0),
     ?assertEqual(
-        [{close_stream, 0, ?H3_FRAME_UNEXPECTED}, {stop_sending, 0, ?H3_FRAME_UNEXPECTED}],
-        fake_quic_calls(Quic)
+        [{close_stream, 0, ?H3_MESSAGE_ERROR}, {stop_sending, 0, ?H3_MESSAGE_ERROR}],
+        stream_calls(Quic)
     ),
     ?assertMatch(
         #{0 := #h3_stream{state = closed, reset = true}}, quic_h3_connection:test_streams(State1)
@@ -3942,16 +3975,25 @@ a_stream_error_stops_the_peer_sending_test() ->
     {ok, State2} = quic_h3_connection:handle_stream_data(0, <<"tail">>, true, State1),
     ?assertEqual(#{}, quic_h3_connection:test_streams(State2)).
 
+%% Resets and STOP_SENDING, without the priority set at HEADERS.
+stream_calls(Quic) ->
+    [C || C <- fake_quic_calls(Quic), element(1, C) =/= set_stream_priority].
+
+%% A body longer than its Content-Length, a stream error.
+overlong_upload() ->
+    <<
+        (request_frame(<<"POST">>, <<"/">>, [{<<"content-length">>, <<"1">>}]))/binary,
+        (quic_h3_frame:encode_data(<<"abc">>))/binary
+    >>.
+
 %% The peer has finished the stream: there is nothing to stop, and no
 %% entry to keep.
 a_stream_error_at_the_fin_keeps_nothing_test() ->
     flush_owner_events(),
     Quic = fake_quic_conn(),
     State0 = make_test_state(#{role => server, quic_conn => Quic}),
-    {ok, State1} = quic_h3_connection:handle_stream_data(
-        0, quic_h3_frame:encode_data(<<"abc">>), true, State0
-    ),
-    ?assertEqual([{close_stream, 0, ?H3_FRAME_UNEXPECTED}], fake_quic_calls(Quic)),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, overlong_upload(), true, State0),
+    ?assertEqual([{close_stream, 0, ?H3_MESSAGE_ERROR}], stream_calls(Quic)),
     ?assertEqual(#{}, quic_h3_connection:test_streams(State1)).
 
 a_stream_error_found_at_a_bare_fin_keeps_nothing_test() ->

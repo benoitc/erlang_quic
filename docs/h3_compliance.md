@@ -21,8 +21,9 @@ All tests live under `test/`; module names in the table are bare
 
 | Section | Requirement | Test |
 |---|---|---|
-| §4.1 | DATA before HEADERS on request stream → stream error | `quic_h3_compliance_tests:data_before_headers_returns_stream_reset_test` ✓ |
-| §4.1 | DATA after complete → stream error | `quic_h3_compliance_tests:frame_after_complete_returns_reset_test` ✓ |
+| §4.1 | DATA before HEADERS on request stream → `H3_FRAME_UNEXPECTED` connection error | `quic_h3_compliance_tests:data_before_headers_is_a_connection_error_test` ✓ |
+| §4.1 | HEADERS or DATA after trailers → `H3_FRAME_UNEXPECTED` connection error | `quic_h3_compliance_tests:frames_after_trailers_are_a_connection_error_test`, `frame_after_complete_is_a_connection_error_test` ✓ |
+| §4.4 | HEADERS or PUSH_PROMISE on an established CONNECT tunnel → `H3_FRAME_UNEXPECTED` connection error | `quic_h3_compliance_tests:connect_tunnel_rejects_trailers_test`, `connect_tunnel_rejects_push_promise_test` ✓ |
 | §4.1.2 | Content-Length vs received body: overflow → `H3_MESSAGE_ERROR` | `quic_h3_compliance_tests:content_length_overflow_returns_reset_test` ✓ |
 | §4.1.2 | Content-Length vs received body: underflow → `H3_MESSAGE_ERROR` | `quic_h3_compliance_tests:content_length_underflow_returns_reset_test` ✓ |
 | §4.1.2 | Trailers duplicate Content-Length mismatch → reject | `quic_h3_compliance_tests:duplicate_content_length_mismatch_rejected_test` ✓ |
@@ -100,7 +101,7 @@ All tests live under `test/`; module names in the table are bare
 | `H3_INTERNAL_ERROR` | `n/a` — reserved for implementation faults |
 | `H3_STREAM_CREATION_ERROR` | ✓ | duplicate unidirectional streams, wrong stream parity |
 | `H3_CLOSED_CRITICAL_STREAM` | ✓ | control / encoder / decoder stream closed |
-| `H3_FRAME_UNEXPECTED` | ✓ | DATA/HEADERS on control, CANCEL_PUSH on request, second SETTINGS, PUSH_PROMISE on server |
+| `H3_FRAME_UNEXPECTED` | ✓ | DATA/HEADERS on control, CANCEL_PUSH on request, second SETTINGS, PUSH_PROMISE on server, DATA before HEADERS, frames after trailers |
 | `H3_FRAME_ERROR` | ✓ | malformed frame payloads |
 | `H3_EXCESSIVE_LOAD` | ✓ | frame size > 1 MiB, field section over the advertised limit (connection error for headers, stream reset for trailers, checked while decoding), request body held past `max_buffered_body` |
 | `H3_ID_ERROR` | ✓ | GOAWAY id increase, MAX_PUSH_ID decrease |

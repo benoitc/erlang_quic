@@ -3010,15 +3010,15 @@ handle_request_frame(
 ) ->
     %% Size check moved to after QPACK decode (RFC 9114 Section 4.2.2 checks decoded size)
     handle_headers_decode(StreamId, HeaderBlock, Fin, Stream, Decoder, Owner, Role, State);
-%% DATA before HEADERS - stream error (RFC 9114 Section 4.1)
+%% RFC 9114 Section 4.1: DATA before HEADERS is a connection error.
 handle_request_frame(
-    StreamId,
+    _StreamId,
     {data, _Payload},
     _Fin,
     #h3_stream{frame_state = expecting_headers},
     _State
 ) ->
-    {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}};
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"DATA before HEADERS">>}};
 %% DATA frame - validate content-length if present (RFC 9114 Section 4.1.2)
 handle_request_frame(
     StreamId,
@@ -3069,24 +3069,24 @@ handle_request_frame(
     },
     deliver_body(StreamId, Payload, Fin, Stream1, State);
 %% RFC 9114 §4.4: once a CONNECT tunnel is established, only DATA frames are
-%% allowed on the stream. Reject any HEADERS (including trailers) or
-%% PUSH_PROMISE frames.
+%% allowed on the stream; HEADERS (trailers too) or PUSH_PROMISE is a
+%% connection error.
 handle_request_frame(
-    StreamId,
+    _StreamId,
     {headers, _HeaderBlock},
     _Fin,
     #h3_stream{frame_state = expecting_data, is_connect = true},
     _State
 ) ->
-    {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}};
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"HEADERS on a CONNECT tunnel">>}};
 handle_request_frame(
-    StreamId,
+    _StreamId,
     {push_promise, _, _},
     _Fin,
     #h3_stream{is_connect = true},
     _State
 ) ->
-    {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}};
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"PUSH_PROMISE on a CONNECT tunnel">>}};
 %% RFC 9114 Section 4.1: HEADERS after the header section are the trailer
 %% section, whether or not the stream's FIN comes with them.
 handle_request_frame(
@@ -3141,14 +3141,12 @@ handle_request_frame(_StreamId, {cancel_push, _}, _Fin, _Stream, _State) ->
 handle_request_frame(_StreamId, {unknown, _Type, _Payload}, _Fin, Stream, State) ->
     %% Skip unknown frame types per RFC 9114 Section 7.2.8
     {ok, Stream, State};
-%% After complete state, no more frames allowed except unknown (handled above)
-handle_request_frame(StreamId, _Frame, _Fin, #h3_stream{frame_state = complete}, _State) ->
-    {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}};
-%% DATA after we've received everything (expecting_trailers means we already got trailers or fin)
+%% RFC 9114 Section 4.1: HEADERS or DATA after the trailers is a connection
+%% error; PUSH_PROMISE may still follow a response.
 handle_request_frame(
-    StreamId, {data, _}, _Fin, #h3_stream{frame_state = expecting_trailers}, _State
-) ->
-    {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}};
+    _StreamId, {Type, _}, _Fin, #h3_stream{frame_state = complete}, _State
+) when Type =:= headers; Type =:= data ->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"frame after trailers">>}};
 %% Client receives PUSH_PROMISE on request stream - process it (RFC 9114 Section 7.2.5)
 handle_request_frame(
     StreamId,
@@ -3161,9 +3159,9 @@ handle_request_frame(
 %% Server should NEVER receive PUSH_PROMISE on request stream - error
 handle_request_frame(_StreamId, {push_promise, _, _}, _Fin, _Stream, #state{role = server}) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"PUSH_PROMISE on request stream">>}};
-%% Any other unexpected frame/state combination
-handle_request_frame(StreamId, _Frame, _Fin, _Stream, _State) ->
-    {error, {stream_reset, StreamId, ?H3_FRAME_UNEXPECTED}}.
+%% Any other frame out of sequence (RFC 9114 Section 4.1)
+handle_request_frame(_StreamId, _Frame, _Fin, _Stream, _State) ->
+    {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"frame out of sequence">>}}.
 
 %% Handle PUSH_PROMISE on request stream (client-side, RFC 9114 Section 7.2.5)
 handle_push_promise(
