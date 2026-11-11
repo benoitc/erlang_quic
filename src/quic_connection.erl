@@ -6360,7 +6360,9 @@ process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Stream
             case MaxData > Current of
                 true ->
                     NewStream = Stream#stream_state{send_max_data = MaxData},
-                    State1 = State#state{streams = maps:put(StreamId, NewStream, Streams)},
+                    State1 = unpark_stream(StreamId, MaxData, State#state{
+                        streams = maps:put(StreamId, NewStream, Streams)
+                    }),
                     %% Limit increased - try to drain queued data
                     State2 = process_send_queue(State1),
                     %% Event-driven flush: flush batch and timers after stream flow control opens
@@ -6676,13 +6678,7 @@ process_frame(
                     State1 = answer_stop_sending(StreamId, ErrorCode, Streams, State#state{
                         streams = NewStreams
                     }),
-                    {NewSendQueue, RemovedBytes, RemovedCount} =
-                        remove_stream_from_queue(StreamId, State1#state.send_queue),
-                    State1#state{
-                        send_queue = NewSendQueue,
-                        send_queue_bytes = max(0, State1#state.send_queue_bytes - RemovedBytes),
-                        send_queue_count = max(0, State1#state.send_queue_count - RemovedCount)
-                    }
+                    purge_stream_send_queue(StreamId, State1)
             end
     end;
 %% STREAM_DATA_BLOCKED: Peer is blocked by stream-level flow control
@@ -9963,13 +9959,19 @@ cancel_stream_deadline_timer(#stream_state{deadline_timer = Timer}) ->
 
 %% Drop any queued STREAM frames for a stream and adjust the queue counters, so
 %% nothing buffered is emitted after a local RESET_STREAM.
-purge_stream_send_queue(StreamId, State) ->
+purge_stream_send_queue(StreamId, #state{send_parked = Parked} = State) ->
     {NewQueue, RemovedBytes, RemovedCount} =
         remove_stream_from_queue(StreamId, State#state.send_queue),
+    {ParkedBytes, ParkedCount, Parked1} =
+        case maps:take(StreamId, Parked) of
+            {Q, P1} -> {queue:fold(fun(E, B) -> B + element(6, E) end, 0, Q), queue:len(Q), P1};
+            error -> {0, 0, Parked}
+        end,
     State#state{
         send_queue = NewQueue,
-        send_queue_bytes = max(0, State#state.send_queue_bytes - RemovedBytes),
-        send_queue_count = max(0, State#state.send_queue_count - RemovedCount)
+        send_parked = Parked1,
+        send_queue_bytes = max(0, State#state.send_queue_bytes - RemovedBytes - ParkedBytes),
+        send_queue_count = max(0, State#state.send_queue_count - RemovedCount - ParkedCount)
     }.
 
 %%====================================================================
@@ -11510,21 +11512,16 @@ get_stream_urgency(StreamId, Streams) ->
 %% this check because a zero-byte FIN-only stream send (iodata of <<>>
 %% with Fin=true) can be enqueued under pacing or congestion, leaving
 %% bytes at 0 while a real entry is pending.
-process_send_queue(State) ->
-    process_send_queue(0, State).
-
-%% Buckets below From hold only entries this drain found blocked by their
-%% own stream's window.
-process_send_queue(_From, #state{send_queue_count = 0} = State) ->
+process_send_queue(#state{send_queue_count = 0} = State) ->
     State;
-process_send_queue(From, State) ->
+process_send_queue(State) ->
     case burst_exhausted(State) of
         true -> arm_burst_continuation(State);
-        false -> process_send_queue_unbudgeted(From, State)
+        false -> process_send_queue_unbudgeted(State)
     end.
 
-process_send_queue_unbudgeted(From, #state{send_queue = PQ} = State) ->
-    case quic_pqueue:peek(PQ, From) of
+process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
+    case quic_pqueue:peek(PQ) of
         empty ->
             State;
         {value, {stream_data, StreamId, Offset, _Data, _Fin, DataSize}} ->
@@ -11535,16 +11532,16 @@ process_send_queue_unbudgeted(From, #state{send_queue = PQ} = State) ->
             case check_send_queue_flow_control(StreamId, Offset, DataSize, State) of
                 ok ->
                     %% Flow control allows - dequeue and try to send
-                    process_send_queue_entry(From, State);
+                    process_send_queue_entry(State);
                 {blocked, _Reason} ->
                     %% An entry larger than the current window still has a
                     %% sendable prefix. Waiting for one grant big enough for
                     %% the whole entry stalls against a peer that extends its
                     %% window in small steps as it reads, because it sizes the
                     %% grant to what it consumed, never to what we have queued.
-                    case split_blocked_head(From, State) of
-                        {ok, SplitState} -> process_send_queue_entry(From, SplitState);
-                        false -> process_past_blocked_streams(From, State)
+                    case split_blocked_head(State) of
+                        {ok, SplitState} -> process_send_queue_entry(SplitState);
+                        false -> park_blocked_head(StreamId, Offset, State)
                     end
             end;
         {value, {retransmit_stream, _StreamId, _Offset, _Data, _Fin, DataSize}} ->
@@ -11552,80 +11549,60 @@ process_send_queue_unbudgeted(From, #state{send_queue = PQ} = State) ->
             %% but still gated by congestion control via the retransmit allowance.
             case quic_cc:can_send_control(State#state.cc_state, DataSize + ?PACKET_OVERHEAD) of
                 true ->
-                    process_send_queue_entry(From, State);
+                    process_send_queue_entry(State);
                 false ->
                     %% cwnd still blocking - leave queued, retried on next ACK
                     State
             end
     end.
 
-%% The head entry has no room in its own stream's window. That must not
-%% hold back the other streams: find the first entry, in urgency then
-%% queue order, of a stream that can send, move the entries of the
-%% blocked streams in its bucket behind the rest (each stream's own order
-%% is kept) and carry on from there. A connection-level block ends the
-%% drain: no stream can send past it.
-process_past_blocked_streams(8, State) ->
-    State;
-process_past_blocked_streams(Urgency, #state{send_queue = PQ} = State) ->
-    Bucket = element(Urgency + 1, PQ),
-    case skip_blocked_streams(queue:to_list(Bucket), #{}, [], State) of
-        all_blocked ->
-            process_past_blocked_streams(Urgency + 1, State);
-        connection_blocked ->
-            State;
-        {sendable, Entries} ->
-            NewPQ = setelement(Urgency + 1, PQ, queue:from_list(Entries)),
-            process_send_queue_unbudgeted(Urgency, State#state{send_queue = NewPQ})
-    end.
-
-skip_blocked_streams([], _BlockedIds, _Blocked, _State) ->
-    all_blocked;
-skip_blocked_streams([Entry | Rest], BlockedIds, Blocked, State) ->
-    StreamId = element(2, Entry),
-    case is_map_key(StreamId, BlockedIds) of
-        true ->
-            skip_blocked_streams(Rest, BlockedIds, [Entry | Blocked], State);
-        false ->
-            case queue_entry_block(Entry, State) of
-                none ->
-                    {Behind, Ahead} = lists:partition(
-                        fun(E) -> is_map_key(element(2, E), BlockedIds) end, Rest
-                    ),
-                    {sendable, [Entry | Ahead] ++ lists:reverse(Blocked, Behind)};
-                stream ->
-                    skip_blocked_streams(
-                        Rest, BlockedIds#{StreamId => true}, [Entry | Blocked], State
-                    );
-                connection ->
-                    connection_blocked
-            end
-    end.
-
-%% What keeps a queued entry from being sent, in whole or in part. `none'
-%% only when process_send_queue_unbudgeted/2 will send or split it.
-queue_entry_block({retransmit_stream, _StreamId, _Offset, _Data, _Fin, DataSize}, State) ->
-    case quic_cc:can_send_control(State#state.cc_state, DataSize + ?PACKET_OVERHEAD) of
-        true -> none;
-        false -> connection
-    end;
-queue_entry_block({stream_data, StreamId, Offset, _Data, _Fin, DataSize}, State) ->
-    #state{max_data_remote = MaxDataRemote, data_sent = DataSent, streams = Streams} = State,
+%% A stream window holds back only its stream (RFC 9000 Section 4.1).
+park_blocked_head(StreamId, Offset, #state{streams = Streams} = State) ->
     case Streams of
-        #{StreamId := #stream_state{send_max_data = SendMaxData} = Stream} ->
-            StreamRoom = SendMaxData - Offset,
-            ConnRoom = conn_allowance(Stream, Offset, MaxDataRemote, DataSent),
-            case DataSize =< StreamRoom andalso DataSize =< ConnRoom of
-                true -> none;
-                false when StreamRoom =< 0 -> stream;
-                false when ConnRoom =< 0 -> connection;
-                false -> none
-            end;
+        #{StreamId := #stream_state{send_max_data = Max}} when Offset >= Max ->
+            #state{send_queue = PQ, send_parked = Parked} = State,
+            {{value, Entry}, PQ1} = quic_pqueue:out(PQ),
+            Q = park_entry(Entry, maps:get(StreamId, Parked, queue:new())),
+            process_send_queue(State#state{send_queue = PQ1, send_parked = Parked#{StreamId => Q}});
         _ ->
-            case DataSize > MaxDataRemote - DataSent andalso MaxDataRemote =< DataSent of
-                true -> connection;
-                false -> none
-            end
+            State
+    end.
+
+%% A parked stream's entries stay in offset order.
+park_entry({_, _, Offset, _, _, _} = Entry, Q) ->
+    case queue:peek(Q) of
+        {value, {_, _, Head, _, _, _}} when Offset < Head -> queue:in_r(Entry, Q);
+        _ -> queue:in(Entry, Q)
+    end.
+
+%% Parked entries the new limit has room for go back to the bucket front.
+unpark_stream(StreamId, Max, #state{send_parked = Parked} = State) ->
+    case Parked of
+        #{StreamId := Q} ->
+            {Ready, Rest} = split_parked(Q, Max, []),
+            Urgency = get_stream_urgency(StreamId, State#state.streams),
+            PQ = lists:foldl(
+                fun(E, Acc) -> quic_pqueue:in_front(E, Urgency, Acc) end,
+                State#state.send_queue,
+                Ready
+            ),
+            Parked1 =
+                case queue:is_empty(Rest) of
+                    true -> maps:remove(StreamId, Parked);
+                    false -> Parked#{StreamId := Rest}
+                end,
+            State#state{send_queue = PQ, send_parked = Parked1};
+        _ ->
+            State
+    end.
+
+%% The entries a limit of Max admits, last first.
+split_parked(Q, Max, Acc) ->
+    case queue:peek(Q) of
+        {value, {_, _, Offset, _, _, Size}} when Offset < Max; Offset + Size =< Max ->
+            split_parked(queue:drop(Q), Max, [queue:head(Q) | Acc]);
+        _ ->
+            {Acc, Q}
     end.
 
 %% Check flow control limits for queued data
@@ -11667,12 +11644,12 @@ check_send_queue_flow_control(StreamId, Offset, DataSize, #state{
 %% the remainder, both at the front so stream order is preserved. Returns
 %% false when nothing fits, when the whole entry fits (the caller should not
 %% have been blocked), or for a zero-length FIN-only entry.
-split_blocked_head(From, #state{send_queue = PQ, send_queue_count = QueueCount} = State) ->
-    case quic_pqueue:peek(PQ, From) of
+split_blocked_head(#state{send_queue = PQ, send_queue_count = QueueCount} = State) ->
+    case quic_pqueue:peek(PQ) of
         {value, {stream_data, StreamId, Offset, Data, Fin, DataSize}} ->
             case blocked_head_allowance(StreamId, Offset, State) of
                 Allowed when Allowed > 0, Allowed < DataSize ->
-                    {{value, _}, PQ1} = quic_pqueue:out(PQ, From),
+                    {{value, _}, PQ1} = quic_pqueue:out(PQ),
                     <<Head:Allowed/binary, Tail/binary>> = Data,
                     Urgency = get_stream_urgency(StreamId, State#state.streams),
                     TailEntry =
@@ -11723,14 +11700,13 @@ count_sent(StreamId, End, #state{streams = Streams, data_sent = DataSent} = Stat
 
 %% Actually process the queue entry (called after flow control check passes)
 process_send_queue_entry(
-    From,
     #state{
         send_queue = PQ,
         send_queue_bytes = QueueBytes,
         send_queue_count = QueueCount
     } = State
 ) ->
-    case quic_pqueue:out(PQ, From) of
+    case quic_pqueue:out(PQ) of
         {empty, _} ->
             State;
         {{value, {retransmit_stream, StreamId, Offset, Data, Fin, DataSize}}, NewPQ} ->
@@ -11751,7 +11727,7 @@ process_send_queue_entry(
                     State2;
                 false ->
                     case State2#state.send_queue_version =:= State1#state.send_queue_version of
-                        true -> process_send_queue(From, State2);
+                        true -> process_send_queue(State2);
                         false -> State2
                     end
             end;
@@ -11794,7 +11770,7 @@ process_send_queue_entry(
                     %% Use version counter for fast comparison (avoids structural equality on 8-tuple)
                     case State3#state.send_queue_version =:= State1#state.send_queue_version of
                         % Keep processing (check flow control again)
-                        true -> process_send_queue(From, State3);
+                        true -> process_send_queue(State3);
                         % New data queued, cwnd full
                         false -> State3
                     end
@@ -12004,7 +11980,7 @@ execute_reset_stream_at(
 settle_send_reset_at(StreamId, State) ->
     RS = (maps:get(StreamId, State#state.streams))#stream_state.send_reset_at,
     Pending =
-        stream_has_queued_below(StreamId, RS, State#state.send_queue) orelse
+        stream_has_queued_below(StreamId, RS, State) orelse
             quic_loss:stream_has_unacked_below(State#state.loss_state, StreamId, RS),
     case Pending of
         false ->
@@ -12035,22 +12011,38 @@ mark_send_done_and_reclaim(StreamId, State) ->
 %% truncate a straddling entry to ReliableSize - Offset (clearing Fin); keep
 %% entries fully below. Mirrors remove_stream_from_queue/2 bookkeeping and bumps
 %% send_queue_version since entry payloads change.
-trim_stream_send_queue(StreamId, ReliableSize, #state{send_queue = PQ} = State) ->
+trim_stream_send_queue(
+    StreamId, ReliableSize, #state{send_queue = PQ, send_parked = Parked} = State
+) ->
+    {Parked1, ParkedBytes, ParkedCount} = trim_parked(StreamId, ReliableSize, Parked),
     {NewQueues, RemovedBytes, RemovedCount} =
         lists:foldl(
             fun(I, {Queues, Bytes, Count}) ->
                 {Kept, DBytes, DCount} = trim_bucket(element(I, PQ), StreamId, ReliableSize),
                 {[Kept | Queues], Bytes + DBytes, Count + DCount}
             end,
-            {[], 0, 0},
+            {[], ParkedBytes, ParkedCount},
             lists:seq(1, 8)
         ),
     State#state{
         send_queue = list_to_tuple(lists:reverse(NewQueues)),
+        send_parked = Parked1,
         send_queue_bytes = max(0, State#state.send_queue_bytes - RemovedBytes),
         send_queue_count = max(0, State#state.send_queue_count - RemovedCount),
         send_queue_version = State#state.send_queue_version + 1
     }.
+
+trim_parked(StreamId, ReliableSize, Parked) ->
+    case Parked of
+        #{StreamId := Q} ->
+            {Kept, DBytes, DCount} = trim_bucket(Q, StreamId, ReliableSize),
+            case queue:is_empty(Kept) of
+                true -> {maps:remove(StreamId, Parked), DBytes, DCount};
+                false -> {Parked#{StreamId := Kept}, DBytes, DCount}
+            end;
+        _ ->
+            {Parked, 0, 0}
+    end.
 
 %% Trim one priority bucket. DCount counts fully-dropped entries only (a
 %% truncated entry stays in the queue).
@@ -12090,7 +12082,12 @@ trim_entry(_Entry, _StreamId, _ReliableSize) ->
 %% we sent. New data still queued is dropped with the reset; retransmits
 %% in the queue were sent already. A stream's new data goes out in
 %% offset order, so what is queued is a tail.
-reset_final_size(StreamId, #stream_state{send_offset = Offset}, #state{send_queue = PQ}) ->
+reset_final_size(StreamId, #stream_state{send_offset = Offset}, #state{send_queue = PQ} = State) ->
+    Sent =
+        case State#state.send_parked of
+            #{StreamId := Q} -> min(Offset, element(3, queue:get(Q)));
+            _ -> Offset
+        end,
     lists:foldl(
         fun(I, Acc) ->
             queue:fold(
@@ -12104,13 +12101,26 @@ reset_final_size(StreamId, #stream_state{send_offset = Offset}, #state{send_queu
                 element(I, PQ)
             )
         end,
-        Offset,
+        Sent,
         lists:seq(1, 8)
     ).
 
 %% True if the send queue holds STREAM/retransmit data for StreamId starting
 %% before ReliableSize (reliable bytes still owed).
-stream_has_queued_below(StreamId, ReliableSize, PQ) ->
+stream_has_queued_below(StreamId, ReliableSize, #state{send_queue = PQ} = State) ->
+    parked_below(StreamId, ReliableSize, State) orelse
+        queued_below(StreamId, ReliableSize, PQ).
+
+parked_below(StreamId, ReliableSize, #state{send_parked = Parked}) ->
+    case Parked of
+        #{StreamId := Q} ->
+            {value, {_, _, Offset, _, _, _}} = queue:peek(Q),
+            Offset < ReliableSize;
+        _ ->
+            false
+    end.
+
+queued_below(StreamId, ReliableSize, PQ) ->
     lists:any(
         fun(I) ->
             lists:any(
@@ -12784,7 +12794,7 @@ complete_send_reset_at(#state{pending_send_reset_at = P} = State) ->
     maps:fold(
         fun(StreamId, RS, Acc) ->
             Pending =
-                stream_has_queued_below(StreamId, RS, Acc#state.send_queue) orelse
+                stream_has_queued_below(StreamId, RS, Acc) orelse
                     quic_loss:stream_has_unacked_below(Acc#state.loss_state, StreamId, RS),
             case Pending of
                 true ->
@@ -12829,7 +12839,7 @@ settle_fin_ack(StreamId, State) ->
             State;
         {ok, #stream_state{send_offset = Final}} ->
             Pending =
-                stream_has_queued_below(StreamId, Final, State#state.send_queue) orelse
+                stream_has_queued_below(StreamId, Final, State) orelse
                     quic_loss:stream_has_unacked_below(
                         State#state.loss_state, StreamId, Final
                     ),
@@ -12853,7 +12863,7 @@ complete_fin_reclaims(#state{pending_fin_reclaim = P} = State) ->
     maps:fold(
         fun(StreamId, Final, Acc) ->
             Pending =
-                stream_has_queued_below(StreamId, Final, Acc#state.send_queue) orelse
+                stream_has_queued_below(StreamId, Final, Acc) orelse
                     quic_loss:stream_has_unacked_below(
                         Acc#state.loss_state, StreamId, Final
                     ),

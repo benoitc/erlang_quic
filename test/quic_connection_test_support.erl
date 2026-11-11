@@ -78,6 +78,7 @@
     queue_head/1,
     queue_stream/4,
     queued_entries/1,
+    parked_entries/1,
     state_with_send_windows/2,
     state_with_stream_limits/3,
     recv_max_data/2,
@@ -1029,13 +1030,22 @@ queue_stream(State, StreamId, Offset, Data) ->
     }.
 
 %% {StreamId, Offset, Size} of every queued entry, in the order the queue
-%% holds them.
+%% holds them, then the parked ones by stream.
 -spec queued_entries(#state{}) -> [{non_neg_integer(), non_neg_integer(), non_neg_integer()}].
-queued_entries(#state{send_queue = PQ}) ->
+queued_entries(#state{send_queue = PQ} = State) ->
     [
         {StreamId, Offset, Size}
      || Bucket <- tuple_to_list(PQ),
         {_Kind, StreamId, Offset, _Data, _Fin, Size} <- queue:to_list(Bucket)
+    ] ++ parked_entries(State).
+
+%% {StreamId, Offset, Size} of every parked entry, by stream then offset.
+-spec parked_entries(#state{}) -> [{non_neg_integer(), non_neg_integer(), non_neg_integer()}].
+parked_entries(#state{send_parked = Parked}) ->
+    [
+        {StreamId, Offset, Size}
+     || {_, Q} <- lists:sort(maps:to_list(Parked)),
+        {_Kind, StreamId, Offset, _Data, _Fin, Size} <- queue:to_list(Q)
     ].
 
 %% Like state_for_admission/4 with one stream per {StreamId, Urgency,

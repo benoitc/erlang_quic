@@ -10,6 +10,9 @@
 -module(quic_send_queue_stream_block_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("quic/include/quic.hrl").
+-include_lib("quic/include/quic_qlog.hrl").
+-include_lib("quic/src/quic_connection_state.hrl").
 
 -define(S, quic_connection_test_support).
 -define(WIN, 1000000).
@@ -61,8 +64,82 @@ connection_block_stops_the_queue_test() ->
     S0 = queue([{0, 0}, {4, 0}], ?S:state_with_send_windows([{0, 3, 0}, {4, 3, ?WIN}], 0)),
     Sent0 = ?S:datagrams_out(S0),
     S1 = quic_connection:process_send_queue(S0),
-    ?assertEqual([{0, 0, ?SIZE}, {4, 0, ?SIZE}], ?S:queued_entries(S1)),
+    ?assertEqual([{0, 0, ?SIZE}, {4, 0, ?SIZE}], lists:sort(?S:queued_entries(S1))),
     ?assertEqual(Sent0, ?S:datagrams_out(S1)).
+
+%% Entries blocked by their own stream's window are visited once: a later
+%% drain costs the same however many of them wait.
+drain_work_does_not_grow_with_blocked_entries_test() ->
+    Small = drain_work(10),
+    Large = drain_work(10000),
+    ?assert(Large < Small + 1000).
+
+drain_work(Blocked) ->
+    Data = binary:copy(<<"x">>, 10),
+    S0 = lists:foldl(
+        fun(I, S) -> ?S:queue_stream(S, 0, I * 10, Data) end,
+        ?S:state_with_send_windows([{0, 3, 0}, {4, 3, ?WIN}], ?WIN),
+        lists:seq(0, Blocked - 1)
+    ),
+    S1 = quic_connection:process_send_queue(S0),
+    ?assertEqual(Blocked, length(?S:parked_entries(S1))),
+    S2 = ?S:queue_stream(S1, 4, 0, Data),
+    true = erlang:garbage_collect(),
+    {reductions, R0} = erlang:process_info(self(), reductions),
+    S3 = quic_connection:process_send_queue(S2),
+    {reductions, R1} = erlang:process_info(self(), reductions),
+    ?assertEqual([], [E || {4, _, _} = E <- ?S:queued_entries(S3)]),
+    ?assertEqual(Blocked, length(?S:parked_entries(S3))),
+    R1 - R0.
+
+%% A new limit puts back what it has room for, in offset order; the tail
+%% of a split entry waits ahead of the rest, and new data waits behind.
+parked_entries_keep_stream_order_test() ->
+    S0 = queue([{0, 0}, {0, ?SIZE}, {0, 2 * ?SIZE}], ?S:state_with_send_windows([{0, 3, 0}], ?WIN)),
+    S1 = quic_connection:process_send_queue(S0),
+    ?assertEqual([{0, 0, ?SIZE}, {0, ?SIZE, ?SIZE}, {0, 2 * ?SIZE, ?SIZE}], ?S:parked_entries(S1)),
+    S2 = quic_connection:process_frame(app, {max_stream_data, 0, 1500}, S1),
+    ?assertEqual(1500, S2#state.data_sent),
+    ?assertEqual([{0, 1500, 500}, {0, 2 * ?SIZE, ?SIZE}], ?S:queued_entries(S2)),
+    S3 = quic_connection:process_send_queue(queue([{0, 3 * ?SIZE}], S2)),
+    ?assertEqual(
+        [{0, 1500, 500}, {0, 2 * ?SIZE, ?SIZE}, {0, 3 * ?SIZE, ?SIZE}], ?S:queued_entries(S3)
+    ),
+    S4 = quic_connection:process_frame(app, {max_stream_data, 0, ?WIN}, S3),
+    ?assertEqual(4 * ?SIZE, S4#state.data_sent),
+    ?assertEqual({[], 0, 0}, {
+        ?S:queued_entries(S4), S4#state.send_queue_bytes, S4#state.send_queue_count
+    }).
+
+%% Entries put back return to their stream's urgency.
+parked_entries_keep_their_urgency_test() ->
+    S0 = queue([{4, 0}, {0, 0}], ?S:state_with_send_windows([{0, 1, 0}, {4, 5, 0}], ?WIN)),
+    S1 = quic_connection:process_send_queue(S0),
+    S2 = quic_connection:unpark_stream(0, ?WIN, quic_connection:unpark_stream(4, ?WIN, S1)),
+    ?assertMatch({value, {stream_data, 0, 0, _, _, ?SIZE}}, ?S:queue_head(S2)),
+    ?assertEqual([], ?S:parked_entries(S2)).
+
+%% A FIN-only entry at the new limit fits it.
+parked_fin_goes_out_at_the_limit_test() ->
+    S0 = queue([{0, 0}], ?S:state_with_send_windows([{0, 3, 0}], ?WIN)),
+    S1 = quic_connection:process_send_queue(
+        quic_connection:queue_stream_data(0, ?SIZE, <<>>, true, S0)
+    ),
+    ?assertEqual([{0, 0, ?SIZE}, {0, ?SIZE, 0}], ?S:parked_entries(S1)),
+    S2 = quic_connection:process_frame(app, {max_stream_data, 0, ?SIZE}, S1),
+    ?assertEqual({[], 0}, {?S:queued_entries(S2), S2#state.send_queue_count}).
+
+%% A reset drops the parked entries, and its final size covers only what
+%% was sent (RFC 9000 Section 4.5).
+reset_drops_parked_entries_test() ->
+    S0 = queue([{0, 0}, {0, ?SIZE}], ?S:state_with_send_windows([{0, 3, 0}, {4, 3, 0}], ?WIN)),
+    S1 = quic_connection:process_send_queue(queue([{4, 0}], S0)),
+    #{0 := Stream} = S1#state.streams,
+    ?assertEqual(0, quic_connection:reset_final_size(0, Stream, S1)),
+    ?assert(quic_connection:stream_has_queued_below(0, 1, S1)),
+    S2 = quic_connection:purge_stream_send_queue(0, S1),
+    ?assertEqual([{4, 0, ?SIZE}], ?S:queued_entries(S2)),
+    ?assertEqual({?SIZE, 1}, {S2#state.send_queue_bytes, S2#state.send_queue_count}).
 
 queue(Entries, State) ->
     lists:foldl(

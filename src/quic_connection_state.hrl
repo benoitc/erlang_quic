@@ -558,6 +558,8 @@
         queue:new(),
         queue:new()
     } :: tuple(),
+    %% Queued entries of streams with no room in their own window, by offset
+    send_parked = #{} :: #{non_neg_integer() => queue:queue()},
     %% Pre-connection pending sends (simple list, processed when connected)
     pending_data = [] :: [{non_neg_integer(), iodata(), boolean()}],
 
