@@ -3903,120 +3903,91 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
     PacketSize = byte_size(Packet),
     AmpRoom = amp_room(State),
     Hold = must_hold(PacketSize, AmpRoom, State),
-    SendResult =
+    %% A datagram the kernel refuses is tracked as sent, so loss detection resends it.
+    NewSocketState =
         case Hold of
-            true -> {ok, undefined};
-            false -> do_socket_send(Packet, State)
+            true -> undefined;
+            false -> sent_socket_state(do_socket_send(Packet, State), PN, PacketSize)
+        end,
+    %% Emit qlog packet_sent event (no-op when qlog disabled)
+    ?QLOG_EMIT_PACKET_SENT((State#state.cfg)#conn_cfg.qlog_ctx, #{
+        packet_type => one_rtt,
+        packet_number => PN,
+        length => PacketSize,
+        frames => Frames
+    }),
+
+    %% Single monotonic_time sample shared between loss
+    %% tracking and last_activity; saves one BIF call per
+    %% packet on the bulk-send hot path.
+    Now = erlang:monotonic_time(millisecond),
+
+    %% Track sent packet for loss detection and congestion control.
+    NewLossState = quic_loss:on_packet_sent(
+        app, LossState, PN, PacketSize, AckEliciting, Frames, Now
+    ),
+    NewCCState =
+        case AckEliciting of
+            true -> quic_cc:on_packet_sent(CCState, PacketSize);
+            false -> CCState
         end,
 
-    %% Handle send result - only track packet and update state if send succeeded
-    case SendResult of
-        {ok, NewSocketState} ->
-            %% Emit qlog packet_sent event (no-op when qlog disabled)
-            ?QLOG_EMIT_PACKET_SENT((State#state.cfg)#conn_cfg.qlog_ctx, #{
-                packet_type => one_rtt,
-                packet_number => PN,
-                length => PacketSize,
-                frames => Frames
-            }),
-
-            %% Single monotonic_time sample shared between loss
-            %% tracking and last_activity; saves one BIF call per
-            %% packet on the bulk-send hot path.
-            Now = erlang:monotonic_time(millisecond),
-
-            %% Track sent packet for loss detection and congestion control.
-            NewLossState = quic_loss:on_packet_sent(
-                app, LossState, PN, PacketSize, AckEliciting, Frames, Now
-            ),
-            NewCCState =
-                case AckEliciting of
-                    true -> quic_cc:on_packet_sent(CCState, PacketSize);
-                    false -> CCState
-                end,
-
-            %% Update PN space, counters, socket state and dirty bits in
-            %% a single record update to avoid copying #state{} multiple
-            %% times per packet on the bulk-send hot path.
-            NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-            EffectiveSocketState =
-                case NewSocketState of
-                    undefined -> State#state.socket_state;
-                    _ -> NewSocketState
-                end,
-            %% RFC 9000 §10.1: restart the idle timer (by bumping last_activity)
-            %% only on the first ack-eliciting packet sent since we last received
-            %% one. Restarting on every send let a peer sending keep-alive PINGs /
-            %% PTO retransmits into a black hole hold its own idle timer open
-            %% forever; never restarting would spuriously close a reactivated idle
-            %% connection before its first ack returns. The flag is cleared on
-            %% every receive (update_last_activity/2).
-            RestartIdle = AckEliciting andalso (not State#state.ack_eliciting_since_recv),
-            NewLastActivity =
-                case RestartIdle of
-                    true -> Now;
-                    false -> State#state.last_activity
-                end,
-            {NewKeyState, KeyLimit} = count_sealed(State#state.key_state, 1),
-            {AckTimer, AckCount} = sent_ack_fields(AckFields, State),
-            bump(?C_PACKETS_SENT, 1, State),
-            {PendPayload, PendFrames, PendSize, Coalesce} =
-                case Pend of
-                    keep ->
-                        #state{
-                            pend_payload = PP, pend_frames = PF, pend_size = PS, coalesce = C
-                        } = State,
-                        {PP, PF, PS, C};
-                    clear ->
-                        {[], [], 0, State#state.coalesce};
-                    close ->
-                        {[], [], 0, false}
-                end,
-            State1 = State#state{
-                pn_app = NewPNSpace,
-                cc_state = NewCCState,
-                loss_state = NewLossState,
-                socket_state = EffectiveSocketState,
-                last_activity = NewLastActivity,
-                ack_eliciting_since_recv =
-                    AckEliciting orelse State#state.ack_eliciting_since_recv,
-                pto_dirty = true,
-                burst_sent = State#state.burst_sent + 1,
-                key_state = NewKeyState,
-                pend_payload = PendPayload,
-                pend_frames = PendFrames,
-                pend_size = PendSize,
-                coalesce = Coalesce,
-                ack_timer = AckTimer,
-                ack_elicited_count = AckCount
-            },
-            after_sealed(KeyLimit, note_amp_send(Packet, PacketSize, AmpRoom, Hold, State1));
-        {error, Reason, ClearedSocketState} ->
-            send_app_packet_internal_error(
-                Reason,
-                PN,
-                PacketSize,
-                PNSpace,
-                clear_pend(Pend, State#state{cc_state = CCState}),
-                ClearedSocketState
-            );
-        {error, Reason} ->
-            send_app_packet_internal_error(
-                Reason,
-                PN,
-                PacketSize,
-                PNSpace,
-                clear_pend(Pend, State#state{cc_state = CCState}),
-                undefined
-            )
-    end.
-
-clear_pend(keep, State) ->
-    State;
-clear_pend(clear, State) ->
-    State#state{pend_payload = [], pend_frames = [], pend_size = 0};
-clear_pend(close, State) ->
-    State#state{pend_payload = [], pend_frames = [], pend_size = 0, coalesce = false}.
+    %% Update PN space, counters, socket state and dirty bits in
+    %% a single record update to avoid copying #state{} multiple
+    %% times per packet on the bulk-send hot path.
+    NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
+    EffectiveSocketState =
+        case NewSocketState of
+            undefined -> State#state.socket_state;
+            _ -> NewSocketState
+        end,
+    %% RFC 9000 §10.1: restart the idle timer (by bumping last_activity)
+    %% only on the first ack-eliciting packet sent since we last received
+    %% one. Restarting on every send let a peer sending keep-alive PINGs /
+    %% PTO retransmits into a black hole hold its own idle timer open
+    %% forever; never restarting would spuriously close a reactivated idle
+    %% connection before its first ack returns. The flag is cleared on
+    %% every receive (update_last_activity/2).
+    RestartIdle = AckEliciting andalso (not State#state.ack_eliciting_since_recv),
+    NewLastActivity =
+        case RestartIdle of
+            true -> Now;
+            false -> State#state.last_activity
+        end,
+    {NewKeyState, KeyLimit} = count_sealed(State#state.key_state, 1),
+    {AckTimer, AckCount} = sent_ack_fields(AckFields, State),
+    bump(?C_PACKETS_SENT, 1, State),
+    {PendPayload, PendFrames, PendSize, Coalesce} =
+        case Pend of
+            keep ->
+                #state{
+                    pend_payload = PP, pend_frames = PF, pend_size = PS, coalesce = C
+                } = State,
+                {PP, PF, PS, C};
+            clear ->
+                {[], [], 0, State#state.coalesce};
+            close ->
+                {[], [], 0, false}
+        end,
+    State1 = State#state{
+        pn_app = NewPNSpace,
+        cc_state = NewCCState,
+        loss_state = NewLossState,
+        socket_state = EffectiveSocketState,
+        last_activity = NewLastActivity,
+        ack_eliciting_since_recv =
+            AckEliciting orelse State#state.ack_eliciting_since_recv,
+        pto_dirty = true,
+        burst_sent = State#state.burst_sent + 1,
+        key_state = NewKeyState,
+        pend_payload = PendPayload,
+        pend_frames = PendFrames,
+        pend_size = PendSize,
+        coalesce = Coalesce,
+        ack_timer = AckTimer,
+        ack_elicited_count = AckCount
+    },
+    after_sealed(KeyLimit, note_amp_send(Packet, PacketSize, AmpRoom, Hold, State1)).
 
 %% An ack-eliciting packet carries the pending ACK when it fits the data
 %% budget (RFC 9000 §13.2.1 lets an ACK ride on any 1-RTT packet), so an
@@ -4061,25 +4032,20 @@ sent_ack_fields(acked, #state{ack_timer = T} = State) ->
     bump(?C_ACK_SENT, 1, State),
     {undefined, 0}.
 
-%% Common error handling for send_app_packet_internal: bump PN without
-%% tracking the packet (PTO owns retransmission) and, on the 3-tuple
-%% error path, write back the cleared socket_state so the stale batch
-%% does not linger.
-send_app_packet_internal_error(Reason, PN, PacketSize, PNSpace, State, ClearedSocketState) ->
+%% The socket state to carry on after a send; a refused datagram is logged.
+sent_socket_state({ok, SocketState}, _PN, _Size) ->
+    SocketState;
+sent_socket_state({error, Reason, ClearedSocketState}, PN, Size) ->
+    log_send_failed(Reason, PN, Size),
+    ClearedSocketState;
+sent_socket_state({error, Reason}, PN, Size) ->
+    log_send_failed(Reason, PN, Size),
+    undefined.
+
+log_send_failed(Reason, PN, Size) ->
     ?LOG_WARNING(
-        #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
-        ?QUIC_LOG_META
-    ),
-    NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    Burst = State#state.burst_sent + 1,
-    case ClearedSocketState of
-        undefined ->
-            State#state{pn_app = NewPNSpace, burst_sent = Burst};
-        _ ->
-            State#state{
-                pn_app = NewPNSpace, socket_state = ClearedSocketState, burst_sent = Burst
-            }
-    end.
+        #{what => udp_send_failed, reason => Reason, pn => PN, size => Size}, ?QUIC_LOG_META
+    ).
 
 %% RFC 9000 Section 14.1: a server pads only datagrams carrying an
 %% ack-eliciting Initial. An ACK-only one at full size would spend an
@@ -11179,7 +11145,7 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
                 Ps
         end,
     {SS1, TrackedRev, AmpState} = send_run(Packets, Frames, PN0, State, SocketState),
-    %% One loss-tracker and one CC update for the run's successful sends.
+    %% One loss-tracker and one CC update for the run.
     {Loss1, CC1} =
         case TrackedRev of
             [] ->
@@ -11267,10 +11233,9 @@ send_run_limited([Packet | Pkts], [Frame | Frs], PN, State0, Tracked) ->
 
 %% Hand the run's sealed packets to the socket; the socket state is
 %% threaded explicitly so no #state{} copy happens per packet, and the
-%% successful sends are collected as [{PN, Size, Frame}] (reversed) for
+%% sends are collected as [{PN, Size, Frame}] (reversed) for
 %% one batched loss/CC update afterwards. Packet I carries PN0 + I. A
-%% failed send skips that packet's tracking exactly as
-%% send_app_packet_now/3 does (PTO owns retransmission).
+%% refused packet is tracked too, so loss detection resends it.
 send_run_packets([], [], _PN, _State, SS, Tracked) ->
     {SS, Tracked};
 send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Tracked) ->
@@ -11286,33 +11251,18 @@ send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Tracked) ->
             _ ->
                 quic_socket:send(SS, IP, Port, Packet)
         end,
-    case SendResult of
-        {ok, SS1} ->
-            ?QLOG_EMIT_PACKET_SENT((State#state.cfg)#conn_cfg.qlog_ctx, #{
-                packet_type => one_rtt,
-                packet_number => PN,
-                length => PacketSize,
-                frames => [Frame]
-            }),
-            SS2 =
-                case SS1 of
-                    undefined -> SS;
-                    _ -> SS1
-                end,
-            send_run_packets(Pkts, Frs, PN + 1, State, SS2, [{PN, PacketSize, Frame} | Tracked]);
-        {error, Reason, SSCleared} ->
-            ?LOG_WARNING(
-                #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
-                ?QUIC_LOG_META
-            ),
-            send_run_packets(Pkts, Frs, PN + 1, State, SSCleared, Tracked);
-        {error, Reason} ->
-            ?LOG_WARNING(
-                #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
-                ?QUIC_LOG_META
-            ),
-            send_run_packets(Pkts, Frs, PN + 1, State, SS, Tracked)
-    end.
+    ?QLOG_EMIT_PACKET_SENT((State#state.cfg)#conn_cfg.qlog_ctx, #{
+        packet_type => one_rtt,
+        packet_number => PN,
+        length => PacketSize,
+        frames => [Frame]
+    }),
+    SS2 =
+        case sent_socket_state(SendResult, PN, PacketSize) of
+            undefined -> SS;
+            SS1 -> SS1
+        end,
+    send_run_packets(Pkts, Frs, PN + 1, State, SS2, [{PN, PacketSize, Frame} | Tracked]).
 
 %% Build the iodata payload `[Header, Chunk]' for a chunked stream
 %% send, reusing the pre-computed header pieces when `Offset > 0'.
