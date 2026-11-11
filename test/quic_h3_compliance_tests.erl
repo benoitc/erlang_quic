@@ -504,18 +504,11 @@ respond_304_suppresses_body_test() ->
     ?assertMatch({ok, _}, Result),
     assert_empty_body(Sends).
 
+%% RFC 9110 Section 6.4.1: one write, a HEADERS frame and the FIN, no DATA.
 assert_empty_body(Sends) ->
     ?assertMatch([{0, _Payload, true}], Sends),
     [{0, Payload, true}] = Sends,
-    EmptyData = quic_h3_frame:encode_data(<<>>),
-    ?assertEqual(
-        EmptyData,
-        binary:part(
-            Payload,
-            byte_size(Payload) - byte_size(EmptyData),
-            byte_size(EmptyData)
-        )
-    ).
+    ?assertMatch({ok, {headers, _}, <<>>}, quic_h3_frame:decode(iolist_to_binary(Payload))).
 
 respond_invalid_status_test() ->
     {Result, Sends} = respond_capture(700, [], <<"hello">>, <<"GET">>),

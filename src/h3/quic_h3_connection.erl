@@ -4240,16 +4240,14 @@ send_request_headers(
 %% Coalesce a full response: send_response then a final send_data with end-stream
 %% in one connection call. Reuses do_send_response/4 (validation, QPACK, HEADERS
 %% buffering) and do_send_data/4 (which prepends the buffered HEADERS so they ride
-%% in the same QUIC packet as the body). HEAD, 204 and 304 send no body.
+%% in the same QUIC packet as the body). HEAD, 204 and 304 end on their HEADERS.
 do_respond(StreamId, Status, Headers, Body, State) ->
+    NoContent = ends_on_headers(StreamId, Status, State),
     case do_send_response(StreamId, Status, Headers, State) of
+        {ok, State1} when NoContent ->
+            {ok, State1};
         {ok, State1} ->
-            Data =
-                case response_body_allowed(StreamId, Status, State1) of
-                    true -> Body;
-                    false -> <<>>
-                end,
-            case do_send_data(StreamId, Data, true, State1) of
+            case do_send_data(StreamId, Body, true, State1) of
                 {ok, _} = Ok -> Ok;
                 {error, Reason} -> {error, Reason, State1}
             end;
@@ -4257,14 +4255,20 @@ do_respond(StreamId, Status, Headers, Body, State) ->
             Err
     end.
 
-%% RFC 9110: HEAD requests and 204/304 responses carry no body.
-response_body_allowed(_StreamId, Status, _State) when Status =:= 204; Status =:= 304 ->
-    false;
-response_body_allowed(StreamId, _Status, #state{streams = Streams}) ->
-    case maps:find(StreamId, Streams) of
-        {ok, #h3_stream{method = <<"HEAD">>}} -> false;
-        _ -> true
+%% A no-content final response, except on a CONNECT tunnel.
+ends_on_headers(StreamId, Status, #state{streams = Streams}) ->
+    case Streams of
+        #{StreamId := #h3_stream{is_connect = false, method = Method}} ->
+            no_content_status(Method, Status);
+        _ ->
+            false
     end.
+
+%% RFC 9110 Section 6.4.1: a final response to HEAD, or a 204 or 304, has no content.
+no_content_status(Method, Status) when is_integer(Status), Status >= 200 ->
+    (Method =:= <<"HEAD">>) orelse (Status =:= 204) orelse (Status =:= 304);
+no_content_status(_Method, _Status) ->
+    false.
 
 do_send_response(
     _StreamId,
@@ -4320,13 +4324,29 @@ do_send_response(
 finish_send_response(StreamId, Status, HeadersFrame, Stream1, State) when
     Status >= 200, not Stream1#h3_stream.is_connect
 ->
-    Pending = maps:put(StreamId, HeadersFrame, State#state.pending_response_headers),
-    {ok, State#state{
-        streams = (State#state.streams)#{StreamId => Stream1},
-        pending_response_headers = Pending
-    }};
+    case no_content_status(Stream1#h3_stream.method, Status) of
+        true ->
+            end_on_headers(StreamId, HeadersFrame, Stream1, State);
+        false ->
+            Pending = maps:put(StreamId, HeadersFrame, State#state.pending_response_headers),
+            {ok, State#state{
+                streams = (State#state.streams)#{StreamId => Stream1},
+                pending_response_headers = Pending
+            }}
+    end;
 finish_send_response(StreamId, _Status, HeadersFrame, Stream1, State) ->
     send_response_headers_now(StreamId, HeadersFrame, Stream1, State).
+
+%% A HEAD, 204 or 304 response is complete on its HEADERS, sent with the FIN.
+end_on_headers(StreamId, HeadersFrame, Stream1, State) ->
+    case quic:send_data(State#state.quic_conn, StreamId, HeadersFrame, true) of
+        ok ->
+            Pending = maps:remove(StreamId, State#state.pending_response_headers),
+            State1 = State#state{pending_response_headers = Pending},
+            {ok, store_stream(StreamId, close_half(local, Stream1), State1)};
+        {error, Reason} ->
+            {error, Reason, State}
+    end.
 
 send_response_headers_now(StreamId, HeadersFrame, Stream1, State) ->
     case quic:send_data(State#state.quic_conn, StreamId, HeadersFrame, false) of
@@ -4866,15 +4886,21 @@ do_push_internal(
                 {ok, State2} ->
                     %% Send PUSH_PROMISE on request stream
                     PushPromiseFrame = quic_h3_frame:encode_push_promise(PushId, Encoded),
+                    {<<":method">>, Method} = lists:keyfind(<<":method">>, 1, Headers),
                     do_push_send(
-                        QuicConn, RequestStreamId, PushPromiseFrame, PushId, PushStreams, State2
+                        QuicConn,
+                        RequestStreamId,
+                        PushPromiseFrame,
+                        {PushId, Method},
+                        PushStreams,
+                        State2
                     );
                 {error, _} = Error ->
                     Error
             end
     end.
 
-do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, PushId, PushStreams, State) ->
+do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, {PushId, Method}, PushStreams, State) ->
     case quic:send_data(QuicConn, RequestStreamId, PushPromiseFrame, false) of
         ok ->
             %% Open push stream (unidirectional, server-initiated)
@@ -4891,6 +4917,7 @@ do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, PushId, PushStreams, S
                                 id = PushStreamId,
                                 type = push,
                                 state = open,
+                                method = Method,
                                 frame_state = expecting_headers
                             },
                             %% next_push_id already incremented by allocate_push_id
@@ -4948,8 +4975,13 @@ do_send_push_response(
             end
     end.
 
+%% A HEAD, 204 or 304 pushed response ends on its HEADERS, as on a request stream.
 send_push_headers(QuicConn, StreamId, HeadersFrame, PushId, Stream1, State) ->
-    case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
+    #h3_stream{method = Method, status = Status} = Stream1,
+    NoContent = no_content_status(Method, Status),
+    case quic:send_data(QuicConn, StreamId, HeadersFrame, NoContent) of
+        ok when NoContent ->
+            {ok, State#state{push_streams = maps:remove(PushId, State#state.push_streams)}};
         ok ->
             PushStreams = maps:put(PushId, {StreamId, Stream1}, State#state.push_streams),
             {ok, State#state{push_streams = PushStreams}};
