@@ -7493,7 +7493,7 @@ process_tls_message(
     Cipher = ClientHsKeys#crypto_keys.cipher,
 
     %% Verify server Finished
-    case quic_tls:parse_finished(Body) of
+    case finished_verify_data(Body, Cipher) of
         {ok, VerifyData} ->
             TranscriptHash = quic_crypto:transcript_hash(
                 Cipher, (State#state.hs)#hs.tls_transcript
@@ -7621,7 +7621,7 @@ process_tls_message(
                     send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
             end;
         {error, _} ->
-            State
+            send_tls_alert(?TLS_ALERT_DECODE_ERROR, State)
     end;
 %% Server receives client's Finished
 process_tls_message(
@@ -7635,7 +7635,7 @@ process_tls_message(
     {ClientHsKeys, _} = (State#state.hs)#hs.handshake_keys,
     Cipher = ClientHsKeys#crypto_keys.cipher,
 
-    case quic_tls:parse_finished(Body) of
+    case finished_verify_data(Body, Cipher) of
         {ok, VerifyData} ->
             %% Verify client's Finished using client handshake secret
             TranscriptHash = quic_crypto:transcript_hash(
@@ -7680,7 +7680,7 @@ process_tls_message(
                     send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
             end;
         {error, _} ->
-            State
+            send_tls_alert(?TLS_ALERT_DECODE_ERROR, State)
     end;
 %% Client receives NewSessionTicket from server (post-handshake)
 %% RFC 8446 Section 4.6.1
@@ -12397,6 +12397,13 @@ alert_and_exit(AlertCode, State, Reason) ->
     _ = flush_socket_batch(Sent),
     exit({tls_alert, Reason}).
 
+%% verify_data is exactly the handshake hash length (RFC 9846 Section 4.5.3).
+finished_verify_data(Body, Cipher) ->
+    case byte_size(Body) =:= quic_crypto:hash_len(quic_crypto:cipher_to_hash(Cipher)) of
+        true -> {ok, Body};
+        false -> {error, invalid_finished}
+    end.
+
 send_tls_alert(AlertCode, State) ->
     send_tls_alert(AlertCode, default_alert_phrase(AlertCode), State).
 
@@ -12422,6 +12429,7 @@ default_alert_phrase(?TLS_ALERT_HANDSHAKE_FAILURE) -> <<"handshake failure">>;
 default_alert_phrase(?TLS_ALERT_ILLEGAL_PARAMETER) -> <<"illegal parameter">>;
 default_alert_phrase(?TLS_ALERT_UNEXPECTED_MESSAGE) -> <<"unexpected message">>;
 default_alert_phrase(?TLS_ALERT_DECRYPT_ERROR) -> <<"decrypt error">>;
+default_alert_phrase(?TLS_ALERT_DECODE_ERROR) -> <<"decode error">>;
 default_alert_phrase(?TLS_ALERT_INTERNAL_ERROR) -> <<"internal error">>;
 default_alert_phrase(?TLS_ALERT_UNKNOWN_PSK_IDENTITY) -> <<"unknown psk identity">>;
 default_alert_phrase(?TLS_ALERT_BAD_CERTIFICATE) -> <<"bad certificate">>;
