@@ -454,11 +454,7 @@ when
     Fin :: boolean(),
     Timeout :: timeout().
 send_data(Conn, StreamId, Data, Fin, Timeout) when is_pid(Conn) ->
-    try
-        gen_statem:call(Conn, {send_data, StreamId, Data, Fin}, Timeout)
-    catch
-        exit:{timeout, _} -> {error, timeout}
-    end.
+    quic_connection:send_data(Conn, StreamId, Data, Fin, Timeout).
 
 %% @doc Send data on a stream asynchronously (fire-and-forget).
 %% This is faster than send_data/4 because it uses cast instead of call,
@@ -466,7 +462,7 @@ send_data(Conn, StreamId, Data, Fin, Timeout) when is_pid(Conn) ->
 %% The send-queue ceiling does not apply: an async write is always queued,
 %% so a caller that writes faster than the peer reads grows the queue.
 %% Use this for high-throughput scenarios where occasional dropped data is acceptable.
--spec send_data_async(Conn, StreamId, Data, Fin) -> ok when
+-spec send_data_async(Conn, StreamId, Data, Fin) -> ok | {error, badarg} when
     Conn :: pid(),
     StreamId :: non_neg_integer(),
     Data :: iodata(),
@@ -489,7 +485,7 @@ send_data_async(Conn, StreamId, Data, Fin) when is_pid(Conn) ->
 %%     ok = quic:set_stream_flow_control(Conn, StreamId, manual)
 %% '''
 %% @end
--spec set_stream_flow_control(Conn, StreamId, Mode) -> ok | {error, unknown_stream} when
+-spec set_stream_flow_control(Conn, StreamId, Mode) -> ok | {error, unknown_stream | closed} when
     Conn :: pid(),
     StreamId :: non_neg_integer(),
     Mode :: auto | manual.
@@ -511,7 +507,7 @@ set_stream_flow_control(Conn, StreamId, Mode) when
 %%     ok = quic:consume(Conn, StreamId, byte_size(Data))
 %% '''
 %% @end
--spec consume(Conn, StreamId, Bytes) -> ok | {error, unknown_stream} when
+-spec consume(Conn, StreamId, Bytes) -> ok | {error, unknown_stream | closed} when
     Conn :: pid(),
     StreamId :: non_neg_integer(),
     Bytes :: non_neg_integer().
@@ -924,12 +920,14 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %%       client also offered. `rsa_pkcs1_*' is never selected for
 %%       CertificateVerify (RFC 8446 §4.4.3).</li>
 %%   <li>`pool_size' - Number of listener processes (default: 1)</li>
-%%   <li>`connection_handler' - `fun((Conn) -> {ok, HandlerPid})'.
+%%   <li>`connection_handler' -
+%%       `fun((Conn) -> {ok, HandlerPid} | {error, Reason})'.
 %%       `HandlerPid' becomes the connection's owner, and so receives its
 %%       `{quic, Conn, _}' events, before the connection sees its first
 %%       packet. Return the process that will consume those events, not a
 %%       broker that hands off later; see the ownership rules in
-%%       `quic_listener'.</li>
+%%       `quic_listener'. `{error, Reason}' declines the connection: it
+%%       is stopped without an answer to the client.</li>
 %%   <li>`sni_callback' -
 %%       `fun((ServerName :: binary() | undefined) -> {ok, CertMap} | {error, term()})'
 %%       where `CertMap :: #{cert := binary(), key := term(), cert_chain => [binary()]}'.

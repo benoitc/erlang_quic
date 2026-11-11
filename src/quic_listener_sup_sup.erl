@@ -25,8 +25,8 @@ start_link(Port, Opts, Parent) ->
 %%====================================================================
 
 init({Port, Opts, Parent}) ->
-    PoolSize = 1 + maps:get(pool_size, Opts, 1),
-    Intensity = ceil(math:log2(PoolSize)),
+    PoolSize = max(1, maps:get(pool_size, Opts, 1)),
+    Intensity = max(1, ceil(math:log2(PoolSize))),
     SupFlags = #{strategy => one_for_one, intensity => Intensity, period => 5},
 
     %% Generate shared reset secret for consistent stateless resets

@@ -62,6 +62,12 @@
     domain => [erlang_quic, connection], report_cb => fun quic_log:format_report/2
 }).
 
+%% A PATH_RESPONSE and a PATH_CHALLENGE in an unpadded 1-RTT packet.
+-define(SHORT_PROBE_ANSWER_SIZE, 60).
+
+%% Paths a server keeps for addresses that probed it.
+-define(MAX_PROBED_PATHS, 4).
+
 %% Suppress warnings for helper functions prepared for future use
 -compile([{nowarn_unused_function, [{send_handshake_ack, 1}, {contains_non_probing_frame, 1}]}]).
 
@@ -88,6 +94,7 @@
     start_link/5,
     connect/4,
     send_data/4,
+    send_data/5,
     send_data_async/4,
     set_stream_flow_control/3,
     stream_consumed/3,
@@ -219,6 +226,9 @@
 
 %% Max receive buffer size in bytes (32 MB total across all streams) - protects against malicious peers
 -define(MAX_RECV_BUFFER_BYTES, 33554432).
+%% What a reassembly entry costs on top of its data, charged against the
+%% cap (RFC 9000 §21.7): a gb_trees node and its binary.
+-define(REASSEMBLY_ENTRY_BYTES, 64).
 
 %% Per-level cap on out-of-order CRYPTO reassembly (RFC 9000 §7.5). A
 %% legitimate handshake flight is a few KB; bound buffered bytes and the
@@ -233,6 +243,9 @@
 -define(AEAD_CONFIDENTIALITY_LIMIT, 16#800000).
 
 -include("quic_connection_state.hrl").
+
+%% What a QUIC variable-length integer can carry (RFC 9000 Section 16).
+-define(IS_VARINT(N), (is_integer(N) andalso N >= 0 andalso N =< 16#3FFFFFFFFFFFFFFF)).
 
 %%====================================================================
 %% API
@@ -301,15 +314,46 @@ statem_opts(Opts) ->
 -spec send_data(pid(), non_neg_integer(), iodata(), boolean()) ->
     ok | {error, term()}.
 send_data(Conn, StreamId, Data, Fin) ->
-    gen_statem:call(Conn, {send_data, StreamId, Data, Fin}).
+    send_data(Conn, StreamId, Data, Fin, infinity).
+
+%% @doc Like send_data/4, giving up with `{error, timeout}' after Timeout.
+-spec send_data(pid(), non_neg_integer(), iodata(), boolean(), timeout()) ->
+    ok | {error, term()}.
+send_data(Conn, StreamId, Data, Fin, Timeout) ->
+    case is_boolean(Fin) andalso is_iodata(Data) of
+        true ->
+            try
+                call(Conn, {send_data, StreamId, Data, Fin}, Timeout)
+            catch
+                exit:{timeout, _} -> {error, timeout}
+            end;
+        false ->
+            {error, badarg}
+    end.
+
+%% Bad arguments are refused here, in the caller: once in the connection
+%% process they would take it down, with every stream on it.
+is_iodata(Data) when is_binary(Data) ->
+    true;
+is_iodata(Data) when is_list(Data) ->
+    try iolist_size(Data) of
+        _ -> true
+    catch
+        error:badarg -> false
+    end;
+is_iodata(_Data) ->
+    false.
 
 %% @doc Send data on a stream asynchronously.
 %% This is faster than send_data/4 because it uses cast instead of call,
 %% avoiding the round-trip latency. However, errors are silently dropped.
 %% Use this for high-throughput scenarios where occasional dropped data is acceptable.
--spec send_data_async(pid(), non_neg_integer(), iodata(), boolean()) -> ok.
+-spec send_data_async(pid(), non_neg_integer(), iodata(), boolean()) -> ok | {error, badarg}.
 send_data_async(Conn, StreamId, Data, Fin) ->
-    gen_statem:cast(Conn, {send_data_async, StreamId, Data, Fin}).
+    case is_boolean(Fin) andalso is_iodata(Data) of
+        true -> gen_statem:cast(Conn, {send_data_async, StreamId, Data, Fin});
+        false -> {error, badarg}
+    end.
 
 %% @private Receive credit for a stream: `auto' grants it as data is
 %% delivered, `{manual, Consumed}' only as the reader returns it through
@@ -336,24 +380,25 @@ stream_consumed(Conn, StreamId, Offset) ->
 
 %% @private Public form of set_stream_flow_control/3, see quic.
 -spec stream_flow_control(pid(), non_neg_integer(), auto | manual) ->
-    ok | {error, unknown_stream}.
+    ok | {error, unknown_stream | closed}.
 stream_flow_control(Conn, StreamId, Mode) ->
-    gen_statem:call(Conn, {stream_flow_control, StreamId, Mode}).
+    call(Conn, {stream_flow_control, StreamId, Mode}).
 
 %% @private Return credit for Bytes the reader has processed, see quic.
--spec consume(pid(), non_neg_integer(), non_neg_integer()) -> ok | {error, unknown_stream}.
+-spec consume(pid(), non_neg_integer(), non_neg_integer()) ->
+    ok | {error, unknown_stream | closed}.
 consume(Conn, StreamId, Bytes) ->
-    gen_statem:call(Conn, {consume, StreamId, Bytes}).
+    call(Conn, {consume, StreamId, Bytes}).
 
 %% @doc Open a new bidirectional stream.
 -spec open_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
 open_stream(Conn) ->
-    gen_statem:call(Conn, open_stream, 10000).
+    call(Conn, open_stream, 10000).
 
 %% @doc Open a new unidirectional stream.
 -spec open_unidirectional_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
 open_unidirectional_stream(Conn) ->
-    gen_statem:call(Conn, open_unidirectional_stream).
+    call(Conn, open_unidirectional_stream).
 
 %% @doc Close the connection.
 -spec close(pid(), term()) -> ok.
@@ -363,35 +408,43 @@ close(Conn, Reason) ->
 %% @doc Close a specific stream.
 -spec close_stream(pid(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
-close_stream(Conn, StreamId, ErrorCode) ->
-    gen_statem:call(Conn, {close_stream, StreamId, ErrorCode}).
+close_stream(Conn, StreamId, ErrorCode) when ?IS_VARINT(ErrorCode) ->
+    call(Conn, {close_stream, StreamId, ErrorCode});
+close_stream(_Conn, _StreamId, _ErrorCode) ->
+    {error, badarg}.
 
 %% @doc Reset a stream.
 -spec reset_stream(pid(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
 reset_stream(Conn, StreamId, ErrorCode) ->
-    gen_statem:call(Conn, {close_stream, StreamId, ErrorCode}).
+    close_stream(Conn, StreamId, ErrorCode).
 
 %% @doc Reset a stream with reliable delivery up to ReliableSize.
 %% Data up to ReliableSize will be delivered before the reset takes effect.
 %% Requires peer support via the reset_stream_at transport parameter.
 -spec reset_stream_at(pid(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
-reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) ->
-    gen_statem:call(Conn, {reset_stream_at, StreamId, ErrorCode, ReliableSize}).
+reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) when
+    ?IS_VARINT(ErrorCode), ?IS_VARINT(ReliableSize)
+->
+    call(Conn, {reset_stream_at, StreamId, ErrorCode, ReliableSize});
+reset_stream_at(_Conn, _StreamId, _ErrorCode, _ReliableSize) ->
+    {error, badarg}.
 
 %% @doc See quic:set_stream_reliable_size/3.
 -spec set_stream_reliable_size(pid(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
 set_stream_reliable_size(Conn, StreamId, Size) ->
-    gen_statem:call(Conn, {set_stream_reliable_size, StreamId, Size}).
+    call(Conn, {set_stream_reliable_size, StreamId, Size}).
 
 %% @doc Request peer to stop sending on a stream.
 %% Sends a STOP_SENDING frame (RFC 9000 Section 19.5).
 -spec stop_sending(pid(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
-stop_sending(Conn, StreamId, ErrorCode) ->
-    gen_statem:call(Conn, {stop_sending, StreamId, ErrorCode}).
+stop_sending(Conn, StreamId, ErrorCode) when ?IS_VARINT(ErrorCode) ->
+    call(Conn, {stop_sending, StreamId, ErrorCode});
+stop_sending(_Conn, _StreamId, _ErrorCode) ->
+    {error, badarg}.
 
 %% @doc Handle a timeout event.
 -spec handle_timeout(pid()) -> ok.
@@ -419,35 +472,39 @@ get_state(Conn) ->
 %% @doc Get remote address.
 -spec peername(pid()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 peername(Conn) ->
-    gen_statem:call(Conn, peername).
+    call(Conn, peername).
 
 %% @doc Get local address.
 -spec sockname(pid()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 sockname(Conn) ->
-    gen_statem:call(Conn, sockname).
+    call(Conn, sockname).
 
 %% @doc Get peer certificate (DER-encoded).
 -spec peercert(pid()) -> {ok, binary()} | {error, term()}.
 peercert(Conn) ->
-    gen_statem:call(Conn, peercert).
+    call(Conn, peercert).
 
 %% @doc Set new owner process (async).
--spec set_owner(pid(), pid()) -> ok.
-set_owner(Conn, NewOwner) ->
-    gen_statem:cast(Conn, {set_owner, NewOwner}).
+-spec set_owner(pid(), pid()) -> ok | {error, badarg}.
+set_owner(Conn, NewOwner) when is_pid(NewOwner) ->
+    gen_statem:cast(Conn, {set_owner, NewOwner});
+set_owner(_Conn, _NewOwner) ->
+    {error, badarg}.
 
 %% @doc Set new owner process (synchronous).
 %% Use this when you need to ensure ownership is transferred before continuing.
 %% A connection that is already draining or closed refuses the swap with
 %% `{error, {invalid_state, StateName}}'.
 -spec set_owner_sync(pid(), pid()) -> ok | {error, term()}.
-set_owner_sync(Conn, NewOwner) ->
-    gen_statem:call(Conn, {set_owner, NewOwner}).
+set_owner_sync(Conn, NewOwner) when is_pid(NewOwner) ->
+    call(Conn, {set_owner, NewOwner});
+set_owner_sync(_Conn, _NewOwner) ->
+    {error, badarg}.
 
 %% @doc Send a datagram.
 -spec send_datagram(pid(), iodata()) -> ok | {error, term()}.
 send_datagram(Conn, Data) ->
-    gen_statem:call(Conn, {send_datagram, Data}).
+    call(Conn, {send_datagram, Data}).
 
 %% @doc Get maximum datagram payload size.
 %% Returns 0 if peer doesn't support datagrams.
@@ -468,26 +525,26 @@ datagram_stats(Conn) ->
 %% @doc Set connection options.
 -spec setopts(pid(), [{atom(), term()}]) -> ok | {error, term()}.
 setopts(Conn, Opts) ->
-    gen_statem:call(Conn, {setopts, Opts}).
+    call(Conn, {setopts, Opts}).
 
 %% @doc Get send queue status for backpressure decisions.
 %% Returns information about the current send queue state including
 %% whether the connection is congested and should apply backpressure.
 -spec get_send_queue_info(pid()) -> {ok, quic:send_queue_info()} | {error, term()}.
 get_send_queue_info(Conn) ->
-    gen_statem:call(Conn, get_send_queue_info).
+    call(Conn, get_send_queue_info).
 
 %% @doc Path metrics snapshot. See `quic:get_path_stats/1'.
 -spec get_path_stats(pid()) -> {ok, quic:path_stats()} | {error, term()}.
 get_path_stats(Conn) ->
-    gen_statem:call(Conn, get_path_stats).
+    call(Conn, get_path_stats).
 
 %% @doc Get connection statistics for liveness detection.
 %% Returns packet counts that can be used by net_kernel for tick checking.
 %% Any QUIC packet (ACK, PING, data) counts as proof of peer liveness.
 -spec get_stats(pid()) -> {ok, map()} | {error, term()}.
 get_stats(Conn) ->
-    gen_statem:call(Conn, get_stats).
+    call(Conn, get_stats).
 
 %% @doc Returns whether the connection has derived early keys (RFC 9001
 %% §4.6). True when a session ticket was supplied at connect time and
@@ -510,40 +567,40 @@ early_data_accepted(Conn) ->
 %% Useful for verifying peer capabilities (e.g., WebTransport support).
 -spec get_peer_transport_params(pid()) -> {ok, map()} | {error, term()}.
 get_peer_transport_params(Conn) ->
-    gen_statem:call(Conn, get_peer_transport_params).
+    call(Conn, get_peer_transport_params).
 
 %% @doc Send a PING frame (RFC 9000).
 %% PING frames bypass congestion control and are useful for liveness checks.
 %% The PING elicits an ACK from the peer, confirming the connection is alive.
 -spec send_ping(pid()) -> ok | {error, term()}.
 send_ping(Conn) ->
-    gen_statem:call(Conn, send_ping).
+    call(Conn, send_ping).
 
 %% @doc Get the current MTU for the connection.
 %% Returns the effective MTU discovered via DPLPMTUD (RFC 8899).
 -spec get_mtu(pid()) -> {ok, pos_integer()} | {error, term()}.
 get_mtu(Conn) ->
-    gen_statem:call(Conn, get_mtu).
+    call(Conn, get_mtu).
 
 %% @doc Initiate a key update (RFC 9001 Section 6).
 %% This triggers a key update cycle, deriving new encryption keys.
 %% Only valid when connection is in connected state.
 -spec key_update(pid()) -> ok | {error, term()}.
 key_update(Conn) ->
-    gen_statem:call(Conn, key_update).
+    call(Conn, key_update).
 
 %% @doc Initiate connection migration.
 %% This triggers path validation by sending PATH_CHALLENGE on a new path.
 %% Simulates network change by rebinding the socket.
 -spec migrate(pid()) -> ok | {error, term()}.
 migrate(Conn) ->
-    gen_statem:call(Conn, migrate).
+    call(Conn, migrate).
 
 %% @doc Trigger connection migration with timeout option.
 %% Simulates network change by rebinding the socket.
 -spec migrate(pid(), timeout()) -> ok | {error, term()}.
 migrate(Conn, Timeout) ->
-    gen_statem:call(Conn, {migrate, #{}}, Timeout).
+    call(Conn, {migrate, #{}}, Timeout).
 
 %% @doc Set stream priority (RFC 9218).
 %% Urgency: 0-7 (lower = more urgent, default 3)
@@ -551,20 +608,20 @@ migrate(Conn, Timeout) ->
 -spec set_stream_priority(pid(), non_neg_integer(), 0..7, boolean()) ->
     ok | {error, term()}.
 set_stream_priority(Conn, StreamId, Urgency, Incremental) ->
-    gen_statem:call(Conn, {set_stream_priority, StreamId, Urgency, Incremental}).
+    call(Conn, {set_stream_priority, StreamId, Urgency, Incremental}).
 
 %% @doc Get stream priority (RFC 9218).
 %% Returns {ok, {Urgency, Incremental}} or {error, not_found}.
 -spec get_stream_priority(pid(), non_neg_integer()) ->
     {ok, {0..7, boolean()}} | {error, term()}.
 get_stream_priority(Conn, StreamId) ->
-    gen_statem:call(Conn, {get_stream_priority, StreamId}).
+    call(Conn, {get_stream_priority, StreamId}).
 
 %% @doc Set the congestion control algorithm for a connection.
 %% Algorithm: newreno | bbr | cubic
 -spec set_congestion_control(pid(), quic_cc:cc_algorithm()) -> ok | {error, term()}.
 set_congestion_control(Conn, Algorithm) ->
-    gen_statem:call(Conn, {set_congestion_control, Algorithm}).
+    call(Conn, {set_congestion_control, Algorithm}).
 
 %% @doc Set a deadline for a stream.
 %% TimeoutMs is milliseconds from now until expiry.
@@ -572,18 +629,33 @@ set_congestion_control(Conn, Algorithm) ->
 -spec set_stream_deadline(pid(), non_neg_integer(), pos_integer(), map()) ->
     ok | {error, term()}.
 set_stream_deadline(Conn, StreamId, TimeoutMs, Opts) ->
-    gen_statem:call(Conn, {set_stream_deadline, StreamId, TimeoutMs, Opts}).
+    call(Conn, {set_stream_deadline, StreamId, TimeoutMs, Opts}).
 
 %% @doc Cancel a stream deadline.
 -spec cancel_stream_deadline(pid(), non_neg_integer()) -> ok | {error, term()}.
 cancel_stream_deadline(Conn, StreamId) ->
-    gen_statem:call(Conn, {cancel_stream_deadline, StreamId}).
+    call(Conn, {cancel_stream_deadline, StreamId}).
 
 %% @doc Get remaining time for a stream deadline.
 -spec get_stream_deadline(pid(), non_neg_integer()) ->
     {ok, {non_neg_integer() | infinity, reset | notify | both}} | {error, term()}.
 get_stream_deadline(Conn, StreamId) ->
-    gen_statem:call(Conn, {get_stream_deadline, StreamId}).
+    call(Conn, {get_stream_deadline, StreamId}).
+
+%% A synchronous call to the connection. Once the process is gone the
+%% caller gets `{error, closed}' instead of the exit gen_statem:call raises.
+call(Conn, Request) ->
+    call(Conn, Request, infinity).
+
+call(Conn, Request, Timeout) ->
+    try
+        gen_statem:call(Conn, Request, Timeout)
+    catch
+        exit:{noproc, _} -> {error, closed};
+        exit:{normal, _} -> {error, closed};
+        exit:{shutdown, _} -> {error, closed};
+        exit:{{shutdown, _}, _} -> {error, closed}
+    end.
 
 %%====================================================================
 %% gen_statem callbacks
@@ -603,7 +675,7 @@ init([Host, Port, Opts, Owner, Socket]) ->
     %% handled upstream in quic_happy; here Host is a single address or name).
     case resolve_address(Host, Port, maps:get(family, Opts, any)) of
         {error, ResolveErr} ->
-            {stop, {resolve_failed, ResolveErr}};
+            {error, {resolve_failed, ResolveErr}};
         {ok, RemoteAddr} ->
             %% Create or use provided socket with proper cleanup on failure
             %% Pass RemoteAddr to match address family (IPv4 vs IPv6)
@@ -630,7 +702,9 @@ init([Host, Port, Opts, Owner, Socket]) ->
                             erlang:raise(Class, Reason, Stack)
                     end;
                 {error, Reason} ->
-                    {stop, Reason}
+                    %% Not `stop': that exit reason would reach the linked
+                    %% caller as an exit signal instead of a return value.
+                    {error, Reason}
             end
     end;
 %% Server-side initialization
@@ -804,7 +878,7 @@ init({server, Opts}) ->
             retry_scid_for_tp = maps:get(retry_scid, Opts, undefined),
             reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
             idle_timeout = IdleTimeout,
-            keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeout),
+            keep_alive_interval = calculate_keep_alive_interval(Opts),
             disconnect_timeout = disconnect_timeout_opt(Opts),
             listener = Listener,
             ticket_table = maps:get(ticket_table, Opts, undefined),
@@ -1248,7 +1322,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             stateless_reset_secret = maps:get(reset_secret, Opts, undefined),
             reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
             idle_timeout = IdleTimeoutClient,
-            keep_alive_interval = calculate_keep_alive_interval(Opts, IdleTimeoutClient),
+            keep_alive_interval = calculate_keep_alive_interval(Opts),
             disconnect_timeout = disconnect_timeout_opt(Opts),
             %% TLS 1.3 external PSK (RFC 8446 §4.2.11) — mutually exclusive
             %% with session_ticket; conflict raised by build_client_hello/1.
@@ -1377,10 +1451,10 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 
 idle(enter, _OldState, #state{cfg = #conn_cfg{role = client}} = State) ->
     %% Client: Start the handshake by sending Initial packet with ClientHello
-    {keep_state, send_client_hello(State)};
+    {keep_state, arm_stall_timer(send_client_hello(State))};
 idle(enter, _OldState, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% Server: Wait for Initial packet with ClientHello
-    {keep_state, State};
+    {keep_state, arm_stall_timer(State)};
 idle({call, From}, get_ref, #state{cfg = #conn_cfg{conn_ref = Ref}} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 idle({call, From}, get_state, State) ->
@@ -1676,7 +1750,7 @@ connected(
     %% its handler runs only in the connected state, so arming it earlier
     %% would risk a handshake-phase fire being dropped without a re-arm. The
     %% idle timer was already armed at init.
-    State4 = set_keep_alive_timer(update_last_activity(State3b)),
+    State4 = set_keep_alive_timer(update_last_activity(resolve_keep_alive_interval(State3b))),
     %% RFC 9000 §5.1.1: give the peer spare CIDs to migrate onto. This is
     %% the first point where both halves are in place: the peer's
     %% active_connection_id_limit arrived with its transport parameters,
@@ -2124,12 +2198,18 @@ connected(info, {pmtu_raise_timeout, _StaleRef}, State) ->
     %% Stale PMTU raise timer - ignore
     {keep_state, State};
 %% Handle stream deadline expiry
-connected(info, {stream_deadline, StreamId}, State) ->
-    case handle_stream_deadline_expired(StreamId, State) of
-        {ok, NewState} ->
-            {keep_state, NewState};
-        {error, _Reason} ->
-            %% Stream already closed or doesn't exist
+connected(info, {timeout, TimerRef, {stream_deadline, StreamId}}, State) ->
+    case State#state.streams of
+        #{StreamId := #stream_state{deadline_timer = TimerRef}} ->
+            case handle_stream_deadline_expired(StreamId, State) of
+                {ok, NewState} ->
+                    {keep_state, NewState};
+                {error, _Reason} ->
+                    %% Stream already closed or doesn't exist
+                    {keep_state, State}
+            end;
+        _ ->
+            %% Fired just before the deadline was cancelled or set again.
             {keep_state, State}
     end;
 connected({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
@@ -2178,9 +2258,16 @@ draining({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {draining, state_to_map(State)}}]};
 draining(info, drain_timeout, State) ->
     {next_state, closed, State};
-draining(info, {udp, _Socket, _IP, _Port, _Data}, State) ->
-    %% Ignore packets in draining state
-    {keep_state, State};
+draining(info, {udp, _Socket, IP, Port, _Data}, State) ->
+    {keep_state, closing_reply({IP, Port}, State)};
+draining(info, {udp_batch, _Socket, IP, Port, Packets}, State) ->
+    {keep_state, closing_reply({IP, Port}, length(Packets), State)};
+draining(info, {quic_packet, _Data, RemoteAddr}, State) ->
+    {keep_state, closing_reply(RemoteAddr, undefined, 1, State)};
+draining(info, {quic_packet, _Data, RemoteAddr, Via}, State) ->
+    {keep_state, closing_reply(RemoteAddr, Via, 1, State)};
+draining(info, {quic_packets, Packets, RemoteAddr}, State) ->
+    {keep_state, closing_reply(RemoteAddr, undefined, length(Packets), State)};
 draining(cast, {close, _Reason}, State) ->
     %% Ignore duplicate close requests - already draining
     {keep_state, State};
@@ -2195,6 +2282,41 @@ draining({call, From}, early_data_accepted, #state{hs = #hs{early_data_accepted 
     {keep_state, State, [{reply, From, EDA}]};
 draining(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, draining, State).
+
+%% RFC 9000 Section 10.2.1: after a close of our own, packets from the
+%% peer's address on the current path's socket are answered with the
+%% CONNECTION_CLOSE again, on the 1st, 2nd, 4th, 8th... packet. After
+%% the peer's close, or an idle timeout, nothing is sent.
+closing_reply(Addr, State) ->
+    closing_reply(Addr, 1, State).
+
+closing_reply(Addr, N, State) ->
+    closing_reply(Addr, current_via(State), N, State).
+
+closing_reply(
+    Addr,
+    Via,
+    N,
+    #state{remote_addr = Addr, closing_frame = {Level, Frame}, closing_recv = Recv} = State
+) when Level =/= none ->
+    case Via =:= current_via(State) of
+        true ->
+            Recv1 = Recv + N,
+            State1 = State#state{closing_recv = Recv1},
+            case 1 bsl floor_log2(Recv1) > Recv of
+                true -> flush_event(emit_close_at_level(Level, Frame, State1), event);
+                false -> State1
+            end;
+        false ->
+            State
+    end;
+closing_reply(_Addr, _Via, _N, State) ->
+    State.
+
+floor_log2(N) -> floor_log2(N, 0).
+
+floor_log2(1, Acc) -> Acc;
+floor_log2(N, Acc) -> floor_log2(N bsr 1, Acc + 1).
 
 %% ----- CLOSED STATE -----
 
@@ -2251,10 +2373,14 @@ handle_common_event(
     {keep_state, State, [{reply, From, Ref}]};
 handle_common_event({call, From}, get_path_stats, _StateName, State) ->
     {keep_state, State, [{reply, From, {error, not_connected}}]};
-handle_common_event(cast, handle_timeout, _StateName, State) ->
-    %% Handle loss detection / idle timeout
-    NewState = check_timeouts(State),
-    {keep_state, NewState};
+handle_common_event(cast, handle_timeout, StateName, State) when
+    StateName =/= draining andalso StateName =/= closed
+->
+    Now = erlang:monotonic_time(millisecond),
+    case Now - State#state.last_activity > idle_timeout(State) of
+        true -> {next_state, draining, initiate_close(idle_timeout, State)};
+        false -> {keep_state, State}
+    end;
 %% The retained client Finished flight has its own schedule: resend it
 %% until the server confirms the handshake. Nothing else is guaranteed
 %% to be in flight once the statem has left `handshaking', so without
@@ -2286,19 +2412,30 @@ handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref}
 handle_common_event(
     info, {disconnect_check, Ref}, StateName, #state{disconnect_timer = Ref} = State
 ) when
-    Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
+    Ref =/= undefined andalso
+        (StateName =:= connected orelse StateName =:= handshaking orelse StateName =:= idle)
 ->
     State1 = State#state{disconnect_timer = undefined},
     case disconnect_timeout_expired(State1) of
         true ->
             disconnect_deadline(State1);
+        false when StateName =:= connected ->
+            {keep_state, arm_disconnect_timer(State1)};
         false ->
-            {keep_state, arm_disconnect_timer(State1)}
+            handshake_stall_check(StateName, State1)
     end;
+%% Before handshaking, the idle timer, when there is one, bounds the handshake.
+handle_common_event(
+    info,
+    {disconnect_final, Ref},
+    idle,
+    #state{disconnect_timer = {final, Ref}, idle_timer = T} = State
+) when T =/= undefined ->
+    {keep_state, State};
 handle_common_event(
     info, {disconnect_final, Ref}, StateName, #state{disconnect_timer = {final, Ref}} = State
 ) when
-    StateName =:= connected orelse StateName =:= handshaking
+    StateName =:= connected orelse StateName =:= handshaking orelse StateName =:= idle
 ->
     State1 = State#state{disconnect_timer = undefined},
     case disconnect_timeout_expired(State1) of
@@ -6284,7 +6421,9 @@ process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Stream
             case MaxData > Current of
                 true ->
                     NewStream = Stream#stream_state{send_max_data = MaxData},
-                    State1 = State#state{streams = maps:put(StreamId, NewStream, Streams)},
+                    State1 = unpark_stream(StreamId, MaxData, State#state{
+                        streams = maps:put(StreamId, NewStream, Streams)
+                    }),
                     %% Limit increased - try to drain queued data
                     State2 = process_send_queue(State1),
                     %% Event-driven flush: flush batch and timers after stream flow control opens
@@ -6614,13 +6753,7 @@ process_frame(
                     State1 = answer_stop_sending(StreamId, ErrorCode, Streams, State#state{
                         streams = NewStreams
                     }),
-                    {NewSendQueue, RemovedBytes, RemovedCount} =
-                        remove_stream_from_queue(StreamId, State1#state.send_queue),
-                    State1#state{
-                        send_queue = NewSendQueue,
-                        send_queue_bytes = max(0, State1#state.send_queue_bytes - RemovedBytes),
-                        send_queue_count = max(0, State1#state.send_queue_count - RemovedCount)
-                    }
+                    purge_stream_send_queue(StreamId, State1)
             end
     end;
 %% STREAM_DATA_BLOCKED: Peer is blocked by stream-level flow control
@@ -7144,9 +7277,11 @@ process_tls_message(
                 maps:get(early_data, ClientHelloInfo, false),
                 StateChIn
             ),
-            %% Select cipher suite (prefer server's order)
+            %% Server's order, steered to SHA-256 by a known external PSK.
+            #conn_cfg{cipher_preference = CipherPref, psk_config = PskConfig} = State#state.cfg,
+            KnownPsk = quic_tls_negotiation:known_external_psk(ClientHelloInfo, PskConfig),
             Cipher = quic_tls_negotiation:select_cipher(
-                CipherSuites, (State#state.cfg)#conn_cfg.cipher_preference
+                CipherSuites, CipherPref, external_psk_hash(KnownPsk)
             ),
             %% RFC 8446 §4.1.4 group negotiation: use the client's
             %% key_share directly when possible, otherwise send a
@@ -7156,25 +7291,36 @@ process_tls_message(
             %% ticket consumption) once the group is settled.
             SupportedGroups = maps:get(supported_groups, ClientHelloInfo, []),
             case
-                quic_tls_negotiation:select_key_share_group(
-                    (State#state.cfg)#conn_cfg.tls_groups, KeyShareEntries, SupportedGroups
-                )
+                {Cipher,
+                    quic_tls_negotiation:select_key_share_group(
+                        (State#state.cfg)#conn_cfg.tls_groups, KeyShareEntries, SupportedGroups
+                    )}
             of
-                {direct, SelGroup} ->
+                {none, _} ->
+                    send_tls_alert(
+                        ?TLS_ALERT_HANDSHAKE_FAILURE, <<"no common cipher suite">>, State
+                    );
+                {_, {direct, SelGroup}} ->
                     ClientPubKey = quic_tls_negotiation:extract_group_key(
                         SelGroup, KeyShareEntries
                     ),
                     do_server_client_hello(
-                        SelGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
+                        SelGroup,
+                        ClientPubKey,
+                        Cipher,
+                        KnownPsk,
+                        ClientHelloInfo,
+                        OriginalMsg,
+                        State
                     );
-                {hrr, HrrGroup} when not (State#state.hs)#hs.hrr_sent ->
+                {_, {hrr, HrrGroup}} when not (State#state.hs)#hs.hrr_sent ->
                     send_hello_retry_request(HrrGroup, Cipher, SessionId, OriginalMsg, State);
-                {hrr, _} ->
+                {_, {hrr, _}} ->
                     %% Client ignored our HRR group selection.
                     send_tls_alert(
                         ?TLS_ALERT_ILLEGAL_PARAMETER, <<"bad retry key_share">>, State
                     );
-                none ->
+                {_, none} ->
                     send_tls_alert(?TLS_ALERT_HANDSHAKE_FAILURE, <<"no common group">>, State)
             end;
         {error, Reason} ->
@@ -7195,6 +7341,13 @@ process_tls_message(
         {ok, #{cipher := Cipher} = ServerHelloMap} ->
             %% RFC 8446 §4.1.3: the selected suite must be one we offered.
             case lists:member(Cipher, (State#state.cfg)#conn_cfg.cipher_preference) of
+                false ->
+                    notify_owner({error, {tls_alert, illegal_parameter}}, State),
+                    alert_and_exit(?TLS_ALERT_ILLEGAL_PARAMETER, State, illegal_parameter);
+                true ->
+                    ok
+            end,
+            case server_hello_suite_fits(Cipher, ServerHelloMap, State#state.hs) of
                 false ->
                     notify_owner({error, {tls_alert, illegal_parameter}}, State),
                     alert_and_exit(?TLS_ALERT_ILLEGAL_PARAMETER, State, illegal_parameter);
@@ -7853,10 +8006,16 @@ process_tls_message(_Level, Type, _Body, _OriginalMsg, State) ->
     ),
     send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State).
 
+%% External PSKs are SHA-256 (RFC 9846 §4.3.11).
+external_psk_hash({ok, _KnownPsk}) -> sha256;
+external_psk_hash(none) -> undefined.
+
 %% @private Continue a server-side ClientHello once the key-exchange
 %% group is settled (direct or post-HRR). SelectedGroup is the agreed
 %% named group; ClientPubKey is the client's key_share for it.
-do_server_client_hello(SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State0In) ->
+do_server_client_hello(
+    SelectedGroup, ClientPubKey, Cipher, KnownPsk, ClientHelloInfo, OriginalMsg, State0In
+) ->
     %% Remember the client's offered signature schemes for the server's
     %% CertificateVerify negotiation, then resolve the server cert (static
     %% or via the per-SNI callback) before any cert-path work runs.
@@ -7872,13 +8031,13 @@ do_server_client_hello(SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, Ori
             send_tls_alert(?TLS_ALERT_HANDSHAKE_FAILURE, Phrase, StateSig);
         {ok, State} ->
             do_server_client_hello_cont(
-                SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
+                SelectedGroup, ClientPubKey, Cipher, KnownPsk, ClientHelloInfo, OriginalMsg, State
             )
     end.
 
 %% @private Continue the ClientHello once the server cert/key are settled.
 do_server_client_hello_cont(
-    SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
+    SelectedGroup, ClientPubKey, Cipher, KnownPsk, ClientHelloInfo, OriginalMsg, State
 ) ->
     ClientALPN = maps:get(alpn_protocols, ClientHelloInfo, []),
     ClientRandom = maps:get(random, ClientHelloInfo, undefined),
@@ -7891,18 +8050,9 @@ do_server_client_hello_cont(
     %% Validate pre_shared_key placement, lookup identity, verify
     %% binder. On match the server skips the cert path and uses
     %% the PSK secret in the early_secret derivation below.
-    PskConfig = (State#state.cfg)#conn_cfg.psk_config,
-    ServerPskModes = [psk_dhe_ke, psk_ke],
-    ExternalPskResult =
-        case PskConfig of
-            undefined ->
-                none;
-            _ ->
-                quic_tls:select_psk(
-                    ClientHelloInfo, OriginalMsg, PskConfig, ServerPskModes
-                )
-        end,
-    ok,
+    ExternalPskResult = quic_tls:select_psk(
+        ClientHelloInfo, OriginalMsg, KnownPsk, [psk_dhe_ke, psk_ke], Cipher
+    ),
 
     HashLen0 =
         case Cipher of
@@ -8234,6 +8384,30 @@ send_hello_retry_request(SelectedGroup, Cipher, SessionId, OriginalMsg, State) -
     },
     send_initial_packet(quic_frame:encode({crypto, 0, HRR}), [{crypto, 0, HRR}], State1).
 
+%% Client: the ServerHello repeats the HelloRetryRequest's suite (RFC 9846 §4.2.4).
+server_hello_suite_fits(Cipher, _ServerHello, #hs{hrr_cipher = HrrCipher}) when
+    HrrCipher =/= undefined, HrrCipher =/= Cipher
+->
+    false;
+%% An accepted PSK comes with a suite of its hash (RFC 9846 §4.3.11).
+server_hello_suite_fits(Cipher, #{selected_psk_identity := Idx}, #hs{tls_ch1_opts = Opts}) when
+    is_integer(Idx)
+->
+    case offered_psk_hash(Opts) of
+        undefined -> true;
+        Hash -> (quic_crypto:cipher_to_hash(Cipher) =:= Hash)
+    end;
+server_hello_suite_fits(_Cipher, _ServerHello, _HS) ->
+    true.
+
+%% External PSKs are SHA-256; a ticket has the hash it was issued under.
+offered_psk_hash(#{external_psk := _}) ->
+    sha256;
+offered_psk_hash(#{session_ticket := #session_ticket{cipher = Cipher}}) ->
+    quic_crypto:cipher_to_hash(Cipher);
+offered_psk_hash(_Opts) ->
+    undefined.
+
 %% @private Client-side HelloRetryRequest handling (RFC 8446 §4.1.4).
 %% Validates the one-HRR and group rules, rebuilds CH2 reusing CH1's
 %% random + session_id, and rewrites the transcript to the synthetic
@@ -8246,8 +8420,9 @@ handle_hello_retry_request(
         Ch1Opts =/= undefined andalso
             (maps:get(external_psk, Ch1Opts, undefined) =/= undefined orelse
                 maps:get(session_ticket, Ch1Opts, undefined) =/= undefined),
-    GroupOffered = lists:member(SelGroup, (State#state.cfg)#conn_cfg.tls_groups),
-    case {(State#state.hs)#hs.hrr_sent, PskOffered, GroupOffered} of
+    #conn_cfg{tls_groups = Groups, cipher_preference = Ciphers} = State#state.cfg,
+    Offered = lists:member(SelGroup, Groups) andalso lists:member(Cipher, Ciphers),
+    case {(State#state.hs)#hs.hrr_sent, PskOffered, Offered} of
         {true, _, _} ->
             %% A second HRR is illegal (RFC 8446 §4.1.4).
             notify_owner({error, {tls_alert, unexpected_message}}, State),
@@ -8258,7 +8433,7 @@ handle_hello_retry_request(
             notify_owner({error, {tls_alert, unexpected_message}}, State),
             send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State);
         {_, _, false} ->
-            %% Server picked a group we never offered.
+            %% Server picked a group or a cipher suite we never offered.
             notify_owner({error, {tls_alert, illegal_parameter}}, State),
             send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
         {false, false, true} ->
@@ -8283,6 +8458,7 @@ handle_hello_retry_request(
                 hs = (State#state.hs)#hs{
                     hrr_sent = true,
                     hrr_group = SelGroup,
+                    hrr_cipher = Cipher,
                     tls_group = SelGroup,
                     tls_private_key = PrivKey,
                     tls_transcript = Transcript,
@@ -8510,7 +8686,7 @@ process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
     BufferOverflow =
         case IsDuplicate of
             true -> false;
-            false -> RecvBufferBytes + DataSize > ?MAX_RECV_BUFFER_BYTES
+            false -> RecvBufferBytes + DataSize + ?REASSEMBLY_ENTRY_BYTES > ?MAX_RECV_BUFFER_BYTES
         end,
 
     case {EndOffset > RecvMaxData, DataReceived + NewBytes > MaxDataLocal, BufferOverflow} of
@@ -8613,8 +8789,10 @@ process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
                                     not Stream#stream_state.recv_fin andalso
                                         FinalSize =/= undefined andalso
                                         ExtractedOffset >= FinalSize,
+                                EntryDelta =
+                                    gb_trees:size(ExtractedBuffer) - gb_trees:size(RecvBuffer),
                                 {ExtractedData, ExtractedOffset, ExtractedBuffer, ExtractedFin,
-                                    Added - Removed}
+                                    Added - Removed + EntryDelta * ?REASSEMBLY_ENTRY_BYTES}
                         end,
 
                     %% Deliver contiguous data to owner
@@ -9936,13 +10114,19 @@ cancel_stream_deadline_timer(#stream_state{deadline_timer = Timer}) ->
 
 %% Drop any queued STREAM frames for a stream and adjust the queue counters, so
 %% nothing buffered is emitted after a local RESET_STREAM.
-purge_stream_send_queue(StreamId, State) ->
+purge_stream_send_queue(StreamId, #state{send_parked = Parked} = State) ->
     {NewQueue, RemovedBytes, RemovedCount} =
         remove_stream_from_queue(StreamId, State#state.send_queue),
+    {ParkedBytes, ParkedCount, Parked1} =
+        case maps:take(StreamId, Parked) of
+            {Q, P1} -> {queue:fold(fun(E, B) -> B + element(6, E) end, 0, Q), queue:len(Q), P1};
+            error -> {0, 0, Parked}
+        end,
     State#state{
         send_queue = NewQueue,
-        send_queue_bytes = max(0, State#state.send_queue_bytes - RemovedBytes),
-        send_queue_count = max(0, State#state.send_queue_count - RemovedCount)
+        send_parked = Parked1,
+        send_queue_bytes = max(0, State#state.send_queue_bytes - RemovedBytes - ParkedBytes),
+        send_queue_count = max(0, State#state.send_queue_count - RemovedCount - ParkedCount)
     }.
 
 %%====================================================================
@@ -11451,13 +11635,17 @@ queue_stream_data(
     Urgency = get_stream_urgency(StreamId, Streams),
     %% Cache DataSize in entry to avoid repeated iolist_size calls
     Entry = {stream_data, StreamId, Offset, DataBin, Fin, DataSize},
-    NewPQ =
-        case Where of
-            back -> quic_pqueue:in(Entry, Urgency, PQ);
-            front -> quic_pqueue:in_front(Entry, Urgency, PQ)
+    State1 =
+        case {Where, State#state.send_parked} of
+            {back, #{StreamId := Q} = Parked} ->
+                %% Behind data already parked, so it waits there too.
+                State#state{send_parked = Parked#{StreamId := queue:in(Entry, Q)}};
+            {back, _} ->
+                State#state{send_queue = quic_pqueue:in(Entry, Urgency, PQ)};
+            {front, _} ->
+                State#state{send_queue = quic_pqueue:in_front(Entry, Urgency, PQ)}
         end,
-    State#state{
-        send_queue = NewPQ,
+    State1#state{
         send_queue_bytes = QueueBytes + DataSize,
         send_queue_count = QueueCount + 1,
         send_queue_version = Version + 1
@@ -11508,7 +11696,7 @@ process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
                     %% grant to what it consumed, never to what we have queued.
                     case split_blocked_head(State) of
                         {ok, SplitState} -> process_send_queue_entry(SplitState);
-                        false -> State
+                        false -> park_blocked_head(StreamId, Offset, State)
                     end
             end;
         {value, {retransmit_stream, _StreamId, _Offset, _Data, _Fin, DataSize}} ->
@@ -11521,6 +11709,56 @@ process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
                     %% cwnd still blocking - leave queued, retried on next ACK
                     State
             end
+    end.
+
+%% A stream window holds back only its stream (RFC 9000 Section 4.1).
+park_blocked_head(StreamId, Offset, #state{streams = Streams} = State) ->
+    case Streams of
+        #{StreamId := #stream_state{send_max_data = Max}} when Offset >= Max ->
+            #state{send_queue = PQ, send_parked = Parked} = State,
+            {{value, Entry}, PQ1} = quic_pqueue:out(PQ),
+            Q = park_entry(Entry, maps:get(StreamId, Parked, queue:new())),
+            process_send_queue(State#state{send_queue = PQ1, send_parked = Parked#{StreamId => Q}});
+        _ ->
+            State
+    end.
+
+%% A parked stream's entries stay in offset order.
+park_entry({_, _, Offset, _, _, _} = Entry, Q) ->
+    case queue:peek(Q) of
+        {value, {_, _, Head, _, _, _}} when Offset < Head -> queue:in_r(Entry, Q);
+        _ -> queue:in(Entry, Q)
+    end.
+
+%% Parked entries the new limit has room for go back behind the stream's
+%% queued ones, which all have lower offsets.
+unpark_stream(StreamId, Max, #state{send_parked = Parked} = State) ->
+    case Parked of
+        #{StreamId := Q} ->
+            {Ready, Rest} = split_parked(Q, Max, []),
+            Urgency = get_stream_urgency(StreamId, State#state.streams),
+            PQ = lists:foldl(
+                fun(E, Acc) -> quic_pqueue:in(E, Urgency, Acc) end,
+                State#state.send_queue,
+                lists:reverse(Ready)
+            ),
+            Parked1 =
+                case queue:is_empty(Rest) of
+                    true -> maps:remove(StreamId, Parked);
+                    false -> Parked#{StreamId := Rest}
+                end,
+            State#state{send_queue = PQ, send_parked = Parked1};
+        _ ->
+            State
+    end.
+
+%% The entries a limit of Max admits, last first.
+split_parked(Q, Max, Acc) ->
+    case queue:peek(Q) of
+        {value, {_, _, Offset, _, _, Size}} when Offset < Max; Offset + Size =< Max ->
+            split_parked(queue:drop(Q), Max, [queue:head(Q) | Acc]);
+        _ ->
+            {Acc, Q}
     end.
 
 %% Check flow control limits for queued data
@@ -11900,7 +12138,7 @@ execute_reset_stream_at(
 settle_send_reset_at(StreamId, State) ->
     RS = (maps:get(StreamId, State#state.streams))#stream_state.send_reset_at,
     Pending =
-        stream_has_queued_below(StreamId, RS, State#state.send_queue) orelse
+        stream_has_queued_below(StreamId, RS, State) orelse
             quic_loss:stream_has_unacked_below(State#state.loss_state, StreamId, RS),
     case Pending of
         false ->
@@ -11931,22 +12169,38 @@ mark_send_done_and_reclaim(StreamId, State) ->
 %% truncate a straddling entry to ReliableSize - Offset (clearing Fin); keep
 %% entries fully below. Mirrors remove_stream_from_queue/2 bookkeeping and bumps
 %% send_queue_version since entry payloads change.
-trim_stream_send_queue(StreamId, ReliableSize, #state{send_queue = PQ} = State) ->
+trim_stream_send_queue(
+    StreamId, ReliableSize, #state{send_queue = PQ, send_parked = Parked} = State
+) ->
+    {Parked1, ParkedBytes, ParkedCount} = trim_parked(StreamId, ReliableSize, Parked),
     {NewQueues, RemovedBytes, RemovedCount} =
         lists:foldl(
             fun(I, {Queues, Bytes, Count}) ->
                 {Kept, DBytes, DCount} = trim_bucket(element(I, PQ), StreamId, ReliableSize),
                 {[Kept | Queues], Bytes + DBytes, Count + DCount}
             end,
-            {[], 0, 0},
+            {[], ParkedBytes, ParkedCount},
             lists:seq(1, 8)
         ),
     State#state{
         send_queue = list_to_tuple(lists:reverse(NewQueues)),
+        send_parked = Parked1,
         send_queue_bytes = max(0, State#state.send_queue_bytes - RemovedBytes),
         send_queue_count = max(0, State#state.send_queue_count - RemovedCount),
         send_queue_version = State#state.send_queue_version + 1
     }.
+
+trim_parked(StreamId, ReliableSize, Parked) ->
+    case Parked of
+        #{StreamId := Q} ->
+            {Kept, DBytes, DCount} = trim_bucket(Q, StreamId, ReliableSize),
+            case queue:is_empty(Kept) of
+                true -> {maps:remove(StreamId, Parked), DBytes, DCount};
+                false -> {Parked#{StreamId := Kept}, DBytes, DCount}
+            end;
+        _ ->
+            {Parked, 0, 0}
+    end.
 
 %% Trim one priority bucket. DCount counts fully-dropped entries only (a
 %% truncated entry stays in the queue).
@@ -11986,7 +12240,12 @@ trim_entry(_Entry, _StreamId, _ReliableSize) ->
 %% we sent. New data still queued is dropped with the reset; retransmits
 %% in the queue were sent already. A stream's new data goes out in
 %% offset order, so what is queued is a tail.
-reset_final_size(StreamId, #stream_state{send_offset = Offset}, #state{send_queue = PQ}) ->
+reset_final_size(StreamId, #stream_state{send_offset = Offset}, #state{send_queue = PQ} = State) ->
+    Sent =
+        case State#state.send_parked of
+            #{StreamId := Q} -> min(Offset, element(3, queue:get(Q)));
+            _ -> Offset
+        end,
     lists:foldl(
         fun(I, Acc) ->
             queue:fold(
@@ -12000,13 +12259,26 @@ reset_final_size(StreamId, #stream_state{send_offset = Offset}, #state{send_queu
                 element(I, PQ)
             )
         end,
-        Offset,
+        Sent,
         lists:seq(1, 8)
     ).
 
 %% True if the send queue holds STREAM/retransmit data for StreamId starting
 %% before ReliableSize (reliable bytes still owed).
-stream_has_queued_below(StreamId, ReliableSize, PQ) ->
+stream_has_queued_below(StreamId, ReliableSize, #state{send_queue = PQ} = State) ->
+    parked_below(StreamId, ReliableSize, State) orelse
+        queued_below(StreamId, ReliableSize, PQ).
+
+parked_below(StreamId, ReliableSize, #state{send_parked = Parked}) ->
+    case Parked of
+        #{StreamId := Q} ->
+            {value, {_, _, Offset, _, _, _}} = queue:peek(Q),
+            Offset < ReliableSize;
+        _ ->
+            false
+    end.
+
+queued_below(StreamId, ReliableSize, PQ) ->
     lists:any(
         fun(I) ->
             lists:any(
@@ -12076,9 +12348,27 @@ do_set_congestion_control(_Algorithm, _State) ->
     {error, invalid_algorithm}.
 
 %% Set stream deadline
-do_set_stream_deadline(StreamId, TimeoutMs, Opts, #state{streams = Streams} = State) when
+do_set_stream_deadline(StreamId, TimeoutMs, Opts, State) when
+    is_integer(TimeoutMs), TimeoutMs > 0, is_map(Opts)
+->
+    Action = maps:get(action, Opts, both),
+    ErrorCode = maps:get(error_code, Opts, ?QUIC_STREAM_DEADLINE_EXCEEDED),
+    case lists:member(Action, [reset, notify, both]) of
+        true when ?IS_VARINT(ErrorCode) ->
+            arm_stream_deadline(StreamId, TimeoutMs, Action, ErrorCode, State);
+        true ->
+            {error, invalid_error_code};
+        false ->
+            {error, invalid_action}
+    end;
+do_set_stream_deadline(_StreamId, TimeoutMs, _Opts, _State) when
     is_integer(TimeoutMs), TimeoutMs > 0
 ->
+    {error, badarg};
+do_set_stream_deadline(_StreamId, _TimeoutMs, _Opts, _State) ->
+    {error, invalid_timeout}.
+
+arm_stream_deadline(StreamId, TimeoutMs, Action, ErrorCode, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, StreamState} ->
             %% Cancel existing deadline timer if any
@@ -12089,11 +12379,8 @@ do_set_stream_deadline(StreamId, TimeoutMs, Opts, #state{streams = Streams} = St
             %% Calculate absolute deadline
             Now = erlang:system_time(millisecond),
             Deadline = Now + TimeoutMs,
-            %% Parse options
-            Action = maps:get(action, Opts, both),
-            ErrorCode = maps:get(error_code, Opts, ?QUIC_STREAM_DEADLINE_EXCEEDED),
             %% Start new timer
-            TimerRef = erlang:send_after(TimeoutMs, self(), {stream_deadline, StreamId}),
+            TimerRef = erlang:start_timer(TimeoutMs, self(), {stream_deadline, StreamId}),
             NewStreamState = StreamState#stream_state{
                 deadline = Deadline,
                 deadline_timer = TimerRef,
@@ -12105,9 +12392,7 @@ do_set_stream_deadline(StreamId, TimeoutMs, Opts, #state{streams = Streams} = St
             }};
         error ->
             {error, unknown_stream}
-    end;
-do_set_stream_deadline(_StreamId, _TimeoutMs, _Opts, _State) ->
-    {error, invalid_timeout}.
+    end.
 
 %% Cancel stream deadline
 do_cancel_stream_deadline(StreamId, #state{streams = Streams} = State) ->
@@ -12222,13 +12507,13 @@ initiate_close(Reason, #state{mig = #mig{path_validation_timer = PathTimer}} = S
     },
     CloseFrame = local_close_frame(Reason),
     case State1#state.app_keys of
-        undefined when Reason =:= idle_timeout ->
+        _ when Reason =:= idle_timeout ->
             %% RFC 9000 Section 10.1: an idle connection closes silently.
             State1#state{close_reason = Reason};
         undefined ->
             handshake_close(State1#state{close_reason = Reason});
         _ ->
-            send_frame(CloseFrame, State1#state{close_reason = Reason})
+            send_frame(CloseFrame, closing(Reason, app, CloseFrame, State1))
     end.
 
 %% RFC 9000 Section 10.2.3: before 1-RTT keys the close goes out as a
@@ -12271,8 +12556,19 @@ send_protocol_violation(Reason, State) ->
 %% the CLOSE frame because only the 1-RTT send path was wired.
 close_with_error(Level, Class, Code, FrameType, Reason, State) ->
     CloseFrame = {connection_close, Class, Code, FrameType, Reason},
-    CloseState = State#state{close_reason = {Class, Code, Reason}},
-    emit_close_at_level(select_close_level(Level, State), CloseFrame, CloseState).
+    emit_local_close(Level, {Class, Code, Reason}, CloseFrame, State).
+
+emit_local_close(Level, Reason, CloseFrame, State) ->
+    CloseLevel = select_close_level(Level, State),
+    emit_close_at_level(CloseLevel, CloseFrame, closing(Reason, CloseLevel, CloseFrame, State)).
+
+%% RFC 9000 Section 10.2.2: a close that follows the peer's is never resent.
+closing(Reason, Level, Frame, #state{close_reason = undefined} = State) ->
+    State#state{close_reason = Reason, closing_frame = {Level, Frame}};
+closing(Reason, Level, Frame, #state{close_reason = {pending_close, _, _, _}} = State) ->
+    State#state{close_reason = Reason, closing_frame = {Level, Frame}};
+closing(Reason, _Level, _Frame, State) ->
+    State#state{close_reason = Reason}.
 
 select_close_level(app, #state{app_keys = AppKeys}) when AppKeys =/= undefined ->
     app;
@@ -12341,6 +12637,8 @@ send_connection_close(Reason, State) ->
 alert_and_exit(AlertCode, State, Reason) ->
     Sent = send_tls_alert(AlertCode, State),
     _ = flush_socket_batch(Sent),
+    %% The owner need not be linked to or monitoring this process.
+    notify_owner({closed, {tls_alert, Reason}}, State),
     exit({tls_alert, Reason}).
 
 %% verify_data is exactly the handshake hash length (RFC 9846 Section 4.5.3).
@@ -12359,17 +12657,14 @@ send_tls_alert(AlertCode, State) ->
 %% exist, instead of being silently dropped.
 send_tls_alert(AlertCode, Phrase, State) ->
     ErrorCode = ?QUIC_CRYPTO_ERROR_BASE + AlertCode,
-    CloseState = State#state{close_reason = {tls_alert, AlertCode}},
     CloseFrame = {connection_close, transport, ErrorCode, 0, Phrase},
-    emit_close_at_level(select_close_level(app, CloseState), CloseFrame, CloseState).
+    emit_local_close(app, {tls_alert, AlertCode}, CloseFrame, State).
 
 %% Close with a transport-level error code (RFC 9000 §20.1) at the
 %% highest available encryption level. Works before app keys exist
 %% (handshake-time errors) unlike the raw stream-path close.
 close_with_transport_error(Code, Phrase, State) ->
-    CloseState = State#state{close_reason = {transport, Code, Phrase}},
-    CloseFrame = {connection_close, transport, Code, 0, Phrase},
-    emit_close_at_level(select_close_level(app, CloseState), CloseFrame, CloseState).
+    close_with_error(app, transport, Code, 0, Phrase, State).
 
 default_alert_phrase(?TLS_ALERT_HANDSHAKE_FAILURE) -> <<"handshake failure">>;
 default_alert_phrase(?TLS_ALERT_ILLEGAL_PARAMETER) -> <<"illegal parameter">>;
@@ -12445,14 +12740,6 @@ cert_alert_code(no_trust_anchors) -> ?TLS_ALERT_UNKNOWN_CA;
 cert_alert_code(no_certificate) -> ?TLS_ALERT_CERTIFICATE_REQUIRED;
 cert_alert_code({hostname_mismatch, _}) -> ?TLS_ALERT_BAD_CERTIFICATE;
 cert_alert_code(_) -> ?TLS_ALERT_BAD_CERTIFICATE.
-
-%% Check timeouts
-check_timeouts(State) ->
-    Now = erlang:monotonic_time(millisecond),
-    case Now - State#state.last_activity > idle_timeout(State) of
-        true -> initiate_close(idle_timeout, State);
-        false -> State
-    end.
 
 %%====================================================================
 %% Retransmission
@@ -12673,7 +12960,7 @@ complete_send_reset_at(#state{pending_send_reset_at = P} = State) ->
     maps:fold(
         fun(StreamId, RS, Acc) ->
             Pending =
-                stream_has_queued_below(StreamId, RS, Acc#state.send_queue) orelse
+                stream_has_queued_below(StreamId, RS, Acc) orelse
                     quic_loss:stream_has_unacked_below(Acc#state.loss_state, StreamId, RS),
             case Pending of
                 true ->
@@ -12718,7 +13005,7 @@ settle_fin_ack(StreamId, State) ->
             State;
         {ok, #stream_state{send_offset = Final}} ->
             Pending =
-                stream_has_queued_below(StreamId, Final, State#state.send_queue) orelse
+                stream_has_queued_below(StreamId, Final, State) orelse
                     quic_loss:stream_has_unacked_below(
                         State#state.loss_state, StreamId, Final
                     ),
@@ -12742,7 +13029,7 @@ complete_fin_reclaims(#state{pending_fin_reclaim = P} = State) ->
     maps:fold(
         fun(StreamId, Final, Acc) ->
             Pending =
-                stream_has_queued_below(StreamId, Final, Acc#state.send_queue) orelse
+                stream_has_queued_below(StreamId, Final, Acc) orelse
                     quic_loss:stream_has_unacked_below(
                         Acc#state.loss_state, StreamId, Final
                     ),
@@ -13190,6 +13477,27 @@ disconnect_deadline(#state{loss_state = LossState} = State) ->
     erlang:send_after(Grace, self(), {disconnect_final, Ref}),
     {keep_state, State1#state{disconnect_timer = {final, Ref}}}.
 
+%% With no idle timeout, a handshake that hears nothing from the peer for
+%% the disconnect timeout is abandoned, with or without data in flight.
+handshake_stall_check(_StateName, #state{idle_timer = undefined} = State) ->
+    #state{last_activity = LastActivity, cfg = #conn_cfg{disconnect_timeout = DT}} = State,
+    case (LastActivity + DT) - erlang:monotonic_time(millisecond) of
+        Remaining when Remaining =< 0 ->
+            {next_state, draining, declare_peer_dead(State)};
+        Remaining ->
+            {keep_state, arm_disconnect_timer(Remaining, State)}
+    end;
+handshake_stall_check(idle, State) ->
+    {keep_state, State};
+handshake_stall_check(_StateName, State) ->
+    {keep_state, arm_disconnect_timer(State)}.
+
+%% Before handshaking, the disconnect timer runs only when no idle timer does.
+arm_stall_timer(#state{idle_timer = undefined} = State) ->
+    arm_disconnect_timer(State);
+arm_stall_timer(State) ->
+    State.
+
 %% The disconnect timeout elapsed with ack-eliciting data in flight and
 %% no ACK: declare the peer dead instead of probing until the idle
 %% timeout. This is how a client escapes a restarted peer whose stateless
@@ -13232,6 +13540,9 @@ arm_disconnect_timer(
                     false -> DT
                 end
         end,
+    arm_disconnect_timer(Delay, State).
+
+arm_disconnect_timer(Delay, State) ->
     State1 = cancel_disconnect_timer(State),
     Ref = make_ref(),
     erlang:send_after(Delay, self(), {disconnect_check, Ref}),
@@ -13246,15 +13557,32 @@ disconnect_timeout_opt(Opts) ->
         _ -> 16000
     end.
 
-calculate_keep_alive_interval(Opts, IdleTimeout) ->
+calculate_keep_alive_interval(Opts) ->
     case maps:get(keep_alive_interval, Opts, disabled) of
         disabled -> disabled;
         0 -> disabled;
-        auto when IdleTimeout =:= 0 -> disabled;
-        auto -> max(5000, IdleTimeout div 2);
+        auto -> auto;
         Interval when is_integer(Interval), Interval >= 5000 -> Interval;
         Interval when is_integer(Interval) -> 5000
     end.
+
+%% `auto' is half the idle timeout in force, which is the smaller of the
+%% two advertised (RFC 9000 Section 10.1) and so known only once the
+%% peer's transport parameters are.
+resolve_keep_alive_interval(
+    #state{
+        transport_params = TP,
+        cfg = #conn_cfg{keep_alive_interval = auto, idle_timeout = Local} = Cfg
+    } = State
+) ->
+    Interval =
+        case advertised_idle_timeout(Local, maps:get(max_idle_timeout, TP, 0)) of
+            0 -> disabled;
+            IdleTimeout -> max(1000, IdleTimeout div 2)
+        end,
+    State#state{cfg = Cfg#conn_cfg{keep_alive_interval = Interval}};
+resolve_keep_alive_interval(State) ->
+    State.
 
 %% Set keep-alive timer
 %% Uses unique reference in message to detect stale timer events
@@ -13840,10 +14168,21 @@ note_short_challenge(
     } = State
 ) when Size < 1200 ->
     State#state{
-        mig = Mig#mig{pending_peer_validation = Path#path_state{short_challenges = [Data | Short]}}
+        mig = Mig#mig{
+            pending_peer_validation = Path#path_state{
+                short_challenges = add_short_challenge(Data, Short)
+            }
+        }
     };
 note_short_challenge(_Data, _Size, State) ->
     State.
+
+%% A path keeps its two latest short challenges, without repeats.
+add_short_challenge(Data, Short) ->
+    case lists:member(Data, Short) of
+        true -> Short;
+        false -> lists:sublist([Data | Short], 2)
+    end.
 
 %% @doc Send PATH_RESPONSE to a specific address with proper 1200-byte padding.
 %% RFC 9000 Section 8.2.1: PATH_RESPONSE MUST be padded to at least 1200 bytes.
@@ -13859,10 +14198,8 @@ send_path_response_to_addr(Addr, ResponseData, #state{current_packet_via = Via} 
         Addr, Via, addr_dcid(Addr, Via, State), [{path_response, ResponseData}], State
     ).
 
-on_current_path(Addr, #state{remote_addr = Addr, current_packet_via = Via} = State) ->
-    Via =:= current_via(State);
-on_current_path(_Addr, _State) ->
-    false.
+on_current_path(Addr, #state{current_packet_via = Via} = State) ->
+    on_path(Addr, Via, State).
 
 %% A probe on a path we are not on, such as a client checking the
 %% preferred address: answer it and challenge the path back in the same
@@ -13887,29 +14224,45 @@ answer_probe_on_new_path(Addr, ResponseData, #state{current_packet_via = Via} = 
 %% unanswered.
 answer_probe_on_new_path(_Addr, _Via, _ResponseData, State, none, _Seq) ->
     State;
-answer_probe_on_new_path(Addr, Via, ResponseData, State, DCID, Seq) ->
+answer_probe_on_new_path(Addr, Via, ResponseData, #state{mig = Mig} = State, DCID, Seq) ->
+    {Path0, Others} =
+        case lists:partition(fun(P) -> is_path(Addr, Via, P) end, alt_paths(State)) of
+            {[P | _], Rest} ->
+                {P, Rest};
+            {[], Rest} ->
+                {#path_state{remote_addr = Addr, bytes_received = Mig#mig.pass_rx}, Rest}
+        end,
+    Path1 = Path0#path_state{dcid = DCID, dcid_seq = Seq, via = Via},
     ChallengeData = crypto:strong_rand_bytes(8),
-    Path = #path_state{
-        remote_addr = Addr,
-        status = validating,
-        challenge_data = ChallengeData,
-        challenge_count = 1,
-        dcid = DCID,
-        dcid_seq = Seq,
-        via = Via
-    },
-    Others = [
-        P
-     || #path_state{remote_addr = A, via = V} = P <- alt_paths(State), {A, V} =/= {Addr, Via}
-    ],
-    State1 = State#state{mig = (State#state.mig)#mig{alt_paths = [Path | Others]}},
-    send_path_frames(
-        Addr,
-        Via,
-        path_dcid(Path, State1),
-        [{path_response, ResponseData}, {path_challenge, ChallengeData}],
-        State1
-    ).
+    Both = [{path_response, ResponseData}, {path_challenge, ChallengeData}],
+    {Path, Frames} =
+        case path_room(Addr, Via, with_alt_path(Path1, Others, State)) of
+            Room when Room >= 1200 ->
+                {
+                    Path1#path_state{
+                        status = validating, challenge_data = ChallengeData, challenge_count = 1
+                    },
+                    Both
+                };
+            Room when Room >= ?SHORT_PROBE_ANSWER_SIZE ->
+                Short = Path1#path_state.short_challenges,
+                {
+                    Path1#path_state{short_challenges = add_short_challenge(ChallengeData, Short)},
+                    Both
+                };
+            _ ->
+                {Path1, [{path_response, ResponseData}]}
+        end,
+    State1 = keep_probed_path(Path, Others, State),
+    send_path_frames(Addr, Via, path_dcid(Path, State1), Frames, State1).
+
+with_alt_path(Path, Others, #state{mig = Mig} = State) ->
+    State#state{mig = Mig#mig{alt_paths = [Path | Others]}}.
+
+%% The latest probed paths are kept; the least recently probed is dropped.
+keep_probed_path(Path, Others, State) ->
+    {Kept, Dropped} = lists:split(min(length(Others), ?MAX_PROBED_PATHS - 1), Others),
+    lists:foldl(fun retire_abandoned_path_cid/2, with_alt_path(Path, Kept, State), Dropped).
 
 probe_cid_for(Addr, Via, State) ->
     case Via =:= current_via(State) of
@@ -13967,7 +14320,12 @@ send_path_frames(
                         {IP, Port},
                         Via,
                         PacketSize,
-                        State#state{pn_app = PNSpace#pn_space{next_pn = PN + 1}}
+                        update_path_bytes_sent(
+                            IP,
+                            Port,
+                            PacketSize,
+                            State#state{pn_app = PNSpace#pn_space{next_pn = PN + 1}}
+                        )
                     );
                 %% Over the unvalidated-address limit: not sent, like a
                 %% failed send; the peer's next probe is answered.
@@ -14182,9 +14540,7 @@ follow_handshake_peer(_RemoteAddr, _Size, _Before, After) ->
 %% RFC 9000 Section 9: a peer that moves before the handshake is
 %% confirmed is validated, which takes a 1-RTT PATH_CHALLENGE. The
 %% client has no other CID yet, so the path keeps the current one.
-challenge_handshake_peer(
-    NewAddr, Size, #state{app_keys = {_, _}, mig = #mig{migration_state = idle} = Mig} = State
-) ->
+challenge_handshake_peer(NewAddr, Size, #state{app_keys = {_, _}, mig = Mig} = State) ->
     ChallengeData = crypto:strong_rand_bytes(8),
     Path = #path_state{
         remote_addr = NewAddr,
@@ -14376,8 +14732,24 @@ account_path_recv(
     release_held(State#state{
         mig = Mig#mig{pending_peer_validation = Path#path_state{bytes_received = Rx + Size}}
     });
+account_path_recv(Addr, Via, Size, #state{cfg = #conn_cfg{role = server}, mig = Mig} = State) ->
+    case on_path(Addr, Via, State) of
+        true ->
+            State;
+        false ->
+            case lists:partition(fun(P) -> is_path(Addr, Via, P) end, Mig#mig.alt_paths) of
+                {[#path_state{bytes_received = Rx} = Path | Rest], Others} ->
+                    Paths = [Path#path_state{bytes_received = Rx + Size} | Rest ++ Others],
+                    State#state{mig = Mig#mig{alt_paths = Paths}};
+                {[], _} ->
+                    State#state{mig = Mig#mig{pass_rx = Size}}
+            end
+    end;
 account_path_recv(_Addr, _Via, _Size, State) ->
     State.
+
+on_path(Addr, Via, #state{remote_addr = Addr} = State) -> Via =:= current_via(State);
+on_path(_Addr, _Via, _State) -> false.
 
 %% RFC 9000 Sections 8 and 9.3.1: until a peer address is validated, a
 %% server sends it at most three times what it received from it.
@@ -14395,6 +14767,18 @@ path_room(Addr, Via, #state{
     }
 }) ->
     max(0, 3 * Rx - Tx);
+path_room(Addr, Via, #state{cfg = #conn_cfg{role = server}, mig = #mig{alt_paths = Paths}}) ->
+    case
+        [
+            P
+         || #path_state{status = St, address_validated = false} = P <- Paths,
+            St =/= validated,
+            is_path(Addr, Via, P)
+        ]
+    of
+        [#path_state{bytes_sent = Tx, bytes_received = Rx} | _] -> max(0, 3 * Rx - Tx);
+        [] -> infinity
+    end;
 path_room(_Addr, _Via, _State) ->
     infinity.
 
@@ -14774,6 +15158,19 @@ handle_path_response(ResponseData, State) ->
         {address_validated, State1} ->
             release_held(State1);
         no_match ->
+            handle_alt_path_response(ResponseData, State)
+    end.
+
+handle_alt_path_response(ResponseData, State) ->
+    case
+        lists:partition(
+            fun(#path_state{short_challenges = Short}) -> lists:member(ResponseData, Short) end,
+            alt_paths(State)
+        )
+    of
+        {[Path | _], Others} ->
+            check_alt_path_mtu(Path, Others, State);
+        {[], _} ->
             %% Check alt_paths (client validating paths)
             case find_path_by_challenge(ResponseData, (State#state.mig)#mig.alt_paths) of
                 {ok, PathState, OtherPaths} ->
@@ -14839,6 +15236,21 @@ check_peer_validation_response(ResponseData, #state{mig = Mig} = State) ->
         _ ->
             no_match
     end.
+
+%% A probed address answered a challenge that the limit kept under 1200
+%% bytes: the address is good, the path gets a full-size challenge
+%% (RFC 9000 Section 8.2.1).
+check_alt_path_mtu(#path_state{remote_addr = Addr, via = Via} = Path0, Others, State) ->
+    Data = crypto:strong_rand_bytes(8),
+    Path = Path0#path_state{
+        address_validated = true,
+        status = validating,
+        challenge_data = Data,
+        challenge_count = 1,
+        short_challenges = []
+    },
+    State1 = with_alt_path(Path, Others, State),
+    send_path_frames(Addr, Via, path_dcid(Path, State1), [{path_challenge, Data}], State1).
 
 %% The address answered, but in a datagram too small to show the path
 %% carries 1200 bytes; a full-size challenge must be answered before the

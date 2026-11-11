@@ -13,6 +13,8 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 -include("quic.hrl").
+-include_lib("quic/include/quic_qlog.hrl").
+-include_lib("quic/src/quic_connection_state.hrl").
 
 -export([
     all/0,
@@ -31,7 +33,10 @@
     unknown_identity_psk_only/1,
     unknown_identity_with_cert_falls_through/1,
     bad_binder_is_fatal/1,
-    client_downgrade_protection/1
+    client_downgrade_protection/1,
+    psk_steers_the_cipher_suite/1,
+    psk_without_a_suite_of_its_hash_is_skipped/1,
+    psk_callback_runs_once/1
 ]).
 
 -define(IDENTITY, <<"alice">>).
@@ -51,7 +56,10 @@ all() ->
         unknown_identity_psk_only,
         unknown_identity_with_cert_falls_through,
         bad_binder_is_fatal,
-        client_downgrade_protection
+        client_downgrade_protection,
+        psk_steers_the_cipher_suite,
+        psk_without_a_suite_of_its_hash_is_skipped,
+        psk_callback_runs_once
     ].
 
 init_per_suite(Config) ->
@@ -211,6 +219,60 @@ client_downgrade_protection(_Config) ->
             external_psk => {?OTHER_IDENTITY, ?SECRET}
         }),
         ?assertMatch({error, _}, Result)
+    after
+        stop_server(Server)
+    end.
+
+%% RFC 9846 Section 4.3.11: a known external PSK, which is SHA-256, steers
+%% a server preferring TLS_AES_256_GCM_SHA384 to a SHA-256 suite. With no
+%% certificate the handshake only completes on the PSK.
+psk_steers_the_cipher_suite(_Config) ->
+    {ok, Server} = start_psk_server(#{
+        psks => #{?IDENTITY => ?SECRET},
+        ciphers => [aes_256_gcm, aes_128_gcm]
+    }),
+    try
+        ConnRef = connect_with_psk(Server, {?IDENTITY, ?SECRET}),
+        ok = echo_roundtrip(ConnRef, <<"steered">>),
+        {_, #state{app_keys = {#crypto_keys{cipher = Cipher}, _}}} = sys:get_state(ConnRef),
+        ?assertEqual(aes_128_gcm, Cipher),
+        quic:close(ConnRef, normal)
+    after
+        stop_server(Server)
+    end.
+
+%% A server allowing only TLS_AES_256_GCM_SHA384 skips the PSK and takes
+%% the certificate path, which the client refuses as a downgrade.
+psk_without_a_suite_of_its_hash_is_skipped(_Config) ->
+    {ok, Server} = start_psk_server(#{
+        psks => #{?IDENTITY => ?SECRET},
+        ciphers => [aes_256_gcm],
+        with_cert => true
+    }),
+    try
+        Result = try_connect(Server, #{external_psk => {?IDENTITY, ?SECRET}}),
+        ?assertEqual({error, psk_not_selected}, Result)
+    after
+        stop_server(Server)
+    end.
+
+%% The server asks `psk_callback' once per ClientHello, for both the suite
+%% choice and the binder check.
+psk_callback_runs_once(_Config) ->
+    Calls = counters:new(1, []),
+    Cb = fun(Identity) ->
+        counters:add(Calls, 1, 1),
+        case Identity of
+            ?IDENTITY -> {ok, ?SECRET};
+            _ -> not_found
+        end
+    end,
+    {ok, Server} = start_psk_server(#{psk_callback => Cb}),
+    try
+        ConnRef = connect_with_psk(Server, {?IDENTITY, ?SECRET}),
+        ok = echo_roundtrip(ConnRef, <<"once">>),
+        ?assertEqual(1, counters:get(Calls, 1)),
+        quic:close(ConnRef, normal)
     after
         stop_server(Server)
     end.

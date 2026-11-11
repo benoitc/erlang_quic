@@ -381,8 +381,19 @@ jobs:
           otp-version: '28'
           rebar3-version: '3.24.0'
 
+      # The runner image usually has both; when not, fall back from the
+      # Azure Ubuntu mirror to archive.ubuntu.com.
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev
+        run: |
+          if command -v cmake >/dev/null && dpkg -s libssl-dev >/dev/null 2>&1; then
+            cmake --version | head -1
+            exit 0
+          fi
+          if ! { sudo apt-get update && sudo apt-get install -y cmake libssl-dev; }; then
+            sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' \
+              /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list 2>/dev/null || true
+            sudo apt-get update && sudo apt-get install -y cmake libssl-dev
+          fi
 
       - name: Compile
         run: rebar3 compile
@@ -422,8 +433,19 @@ jobs:
           otp-version: '28'
           rebar3-version: '3.24.0'
 
+      # The runner image usually has both; when not, fall back from the
+      # Azure Ubuntu mirror to archive.ubuntu.com.
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev
+        run: |
+          if command -v cmake >/dev/null && dpkg -s libssl-dev >/dev/null 2>&1; then
+            cmake --version | head -1
+            exit 0
+          fi
+          if ! { sudo apt-get update && sudo apt-get install -y cmake libssl-dev; }; then
+            sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' \
+              /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list 2>/dev/null || true
+            sudo apt-get update && sudo apt-get install -y cmake libssl-dev
+          fi
 
       # Compile without QUIC_BUILD_NIF so the ASan build below is the only
       # NIF in priv/.

@@ -422,8 +422,13 @@ stream_has_unacked_below_ignores_non_stream_test() ->
 %% Reordering: spurious losses and adaptive thresholds
 %%====================================================================
 
+%% One send time for the whole burst, so a slow runner crossing a
+%% millisecond cannot make the time threshold declare part of it lost.
 sent(State, PNs) ->
-    lists:foldl(fun(PN, Acc) -> quic_loss:on_packet_sent(app, Acc, PN, 1000, true) end, State, PNs).
+    T = erlang:monotonic_time(millisecond),
+    lists:foldl(
+        fun(PN, Acc) -> quic_loss:on_packet_sent(app, Acc, PN, 1000, true, [], T) end, State, PNs
+    ).
 
 pns(Packets) -> lists:sort([P#sent_packet.pn || P <- Packets]).
 

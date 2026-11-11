@@ -38,6 +38,60 @@ arms_the_peers_timeout_once_its_parameters_arrive_test() ->
     S2 = quic_connection:set_idle_timer(quic_connection:apply_peer_transport_params(TP, S1)),
     ?assertNotEqual(undefined, S2#state.idle_timer).
 
+%% keep_alive_interval => auto is half the timeout in force.
+auto_keep_alive_follows_the_peers_shorter_timeout_test() ->
+    ?assertEqual(6000, auto_keep_alive(60000, #{max_idle_timeout => 12000})).
+
+auto_keep_alive_follows_our_shorter_timeout_test() ->
+    ?assertEqual(10000, auto_keep_alive(20000, #{max_idle_timeout => 60000})).
+
+auto_keep_alive_uses_ours_when_the_peer_has_none_test() ->
+    ?assertEqual(15000, auto_keep_alive(30000, #{})).
+
+auto_keep_alive_uses_the_peers_when_ours_is_off_test() ->
+    ?assertEqual(10000, auto_keep_alive(0, #{max_idle_timeout => 20000})).
+
+auto_keep_alive_is_off_without_an_idle_timeout_test() ->
+    ?assertEqual(disabled, auto_keep_alive(0, #{})).
+
+%% Half a short timeout still comes before it.
+auto_keep_alive_is_half_a_short_timeout_test() ->
+    ?assertEqual(2500, auto_keep_alive(60000, #{max_idle_timeout => 5000})),
+    ?assertEqual(1000, auto_keep_alive(60000, #{max_idle_timeout => 1500})).
+
+%% Fence: an interval that was given is not touched.
+explicit_keep_alive_is_kept_test() ->
+    #state{cfg = Cfg} = S = state(60000, #{max_idle_timeout => 12000}, 0),
+    Explicit = S#state{cfg = Cfg#conn_cfg{keep_alive_interval = 20000}},
+    ?assertEqual(Explicit, quic_connection:resolve_keep_alive_interval(Explicit)).
+
+auto_keep_alive(Local, PeerTP) ->
+    ?assertEqual(
+        auto, quic_connection:calculate_keep_alive_interval(#{keep_alive_interval => auto})
+    ),
+    #state{cfg = Cfg} = S = state(Local, PeerTP, 0),
+    #state{cfg = #conn_cfg{keep_alive_interval = Interval}} =
+        quic_connection:resolve_keep_alive_interval(
+            S#state{cfg = Cfg#conn_cfg{keep_alive_interval = auto}}
+        ),
+    Interval.
+
+%% quic:handle_timeout/2 on a connection that has idled out closes it,
+%% rather than marking it closed and leaving it in its state.
+handle_timeout_closes_an_idle_connection_test() ->
+    ?assertMatch(
+        {next_state, draining, _},
+        quic_connection:handle_common_event(
+            cast, handle_timeout, connected, state(30000, #{}, 40000)
+        )
+    ).
+
+handle_timeout_leaves_an_active_connection_test() ->
+    S = state(30000, #{}, 15000),
+    ?assertEqual(
+        {keep_state, S}, quic_connection:handle_common_event(cast, handle_timeout, connected, S)
+    ).
+
 fire(Local, PeerTP, Idle) ->
     Ref = make_ref(),
     quic_connection:handle_common_event(

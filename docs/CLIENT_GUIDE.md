@@ -499,7 +499,7 @@ end.
 %% Stream errors
 case quic:send_data(Conn, StreamId, Data, true) of
     ok -> ok;
-    {error, not_found} -> connection_gone();
+    {error, closed} -> connection_gone();
     {error, stream_closed} -> stream_gone();
     {error, flow_control} -> apply_backpressure()
 end.
@@ -513,6 +513,9 @@ receive
     {quic, Conn, {closed, {version_negotiation, Versions}}} ->
         %% The server speaks none of the QUIC versions we do
         log_versions(Versions);
+    {quic, Conn, {closed, {tls_alert, Alert}}} ->
+        %% The handshake failed with a TLS alert, e.g. no_application_protocol
+        log_alert(Alert);
     {quic, Conn, {transport_error, Code, Reason}} ->
         log_error(Code, Reason)
 end.

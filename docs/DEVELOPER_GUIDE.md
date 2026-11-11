@@ -141,7 +141,7 @@ handle_info({quic, Conn, {closed, Reason}}, State) ->
 -export([start/2]).
 
 start(Conn, _DCID) ->
-    spawn_link(fun() -> init(Conn) end).
+    {ok, spawn_link(fun() -> init(Conn) end)}.
 
 init(Conn) ->
     %% Take ownership of the connection
@@ -345,7 +345,7 @@ handle_quic_event({quic, Conn, Event}) ->
 | `cert` | `binary()` | - | DER-encoded certificate |
 | `key` | `term()` | - | Decoded private key for `cert`; one that cannot sign for it returns `{error, {invalid_server_key, _}}` |
 | `pool_size` | `integer()` | `1` | Listener pool size |
-| `connection_handler` | `fun/3` | - | Custom connection handler |
+| `connection_handler` | `fun/1` or `fun/2` | - | Called as `Fun(Conn)` or `Fun(Conn, DCID)`; returns `{ok, OwnerPid}`, or `{error, Reason}` to decline the connection |
 | `lb_config` | `map()` | - | QUIC-LB configuration |
 | `preferred_ipv4` | `{ip(), port()}` | - | Preferred IPv4 address |
 | `preferred_ipv6` | `{ip(), port()}` | - | Preferred IPv6 address |
