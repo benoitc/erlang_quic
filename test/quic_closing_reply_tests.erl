@@ -44,6 +44,28 @@ idle_timeout_is_not_answered_test() ->
         ?assertEqual(0, count(Sock))
     end).
 
+%% RFC 9000 Section 10.2.2: an error found after the peer's close may
+%% be sent once, and is not resent.
+an_error_after_the_peers_close_is_not_resent_test() ->
+    with_peer(fun(Peer, Sock) ->
+        Close = quic_frame:encode({connection_close, application, 0, undefined, <<>>}),
+        {ok, S0, _} = quic_connection:decode_and_process_streaming(
+            app, <<Close/binary, 16#21>>, state(Peer)
+        ),
+        ?assertMatch({transport, ?QUIC_FRAME_ENCODING_ERROR, _}, S0#state.close_reason),
+        _ = quic_connection:flush_socket_batch(S0),
+        ?assertEqual(1, count(Sock)),
+        ?assertEqual(undefined, S0#state.closing_frame),
+        _ = lists:foldl(fun(_, S) -> draining_packet(Peer, S) end, S0, [1, 2, 3, 4]),
+        ?assertEqual(0, count(Sock))
+    end).
+
+draining_packet({quic_packet, _, _} = Msg, State) ->
+    {keep_state, S} = quic_connection:draining(info, Msg, State),
+    S;
+draining_packet(Peer, State) ->
+    draining_packet({quic_packet, <<>>, Peer}, State).
+
 sent(State) ->
     quic_connection:flush_socket_batch(State).
 

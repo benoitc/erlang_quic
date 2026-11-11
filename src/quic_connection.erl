@@ -12331,9 +12331,7 @@ initiate_close(Reason, #state{mig = #mig{path_validation_timer = PathTimer}} = S
         undefined ->
             handshake_close(State1#state{close_reason = Reason});
         _ ->
-            send_frame(CloseFrame, State1#state{
-                close_reason = Reason, closing_frame = {app, CloseFrame}
-            })
+            send_frame(CloseFrame, closing(Reason, app, CloseFrame, State1))
     end.
 
 %% RFC 9000 Section 10.2.3: before 1-RTT keys the close goes out as a
@@ -12376,11 +12374,19 @@ send_protocol_violation(Reason, State) ->
 %% the CLOSE frame because only the 1-RTT send path was wired.
 close_with_error(Level, Class, Code, FrameType, Reason, State) ->
     CloseFrame = {connection_close, Class, Code, FrameType, Reason},
+    emit_local_close(Level, {Class, Code, Reason}, CloseFrame, State).
+
+emit_local_close(Level, Reason, CloseFrame, State) ->
     CloseLevel = select_close_level(Level, State),
-    CloseState = State#state{
-        close_reason = {Class, Code, Reason}, closing_frame = {CloseLevel, CloseFrame}
-    },
-    emit_close_at_level(CloseLevel, CloseFrame, CloseState).
+    emit_close_at_level(CloseLevel, CloseFrame, closing(Reason, CloseLevel, CloseFrame, State)).
+
+%% RFC 9000 Section 10.2.2: a close that follows the peer's is never resent.
+closing(Reason, Level, Frame, #state{close_reason = undefined} = State) ->
+    State#state{close_reason = Reason, closing_frame = {Level, Frame}};
+closing(Reason, Level, Frame, #state{close_reason = {pending_close, _, _, _}} = State) ->
+    State#state{close_reason = Reason, closing_frame = {Level, Frame}};
+closing(Reason, _Level, _Frame, State) ->
+    State#state{close_reason = Reason}.
 
 select_close_level(app, #state{app_keys = AppKeys}) when AppKeys =/= undefined ->
     app;
@@ -12462,17 +12468,14 @@ send_tls_alert(AlertCode, State) ->
 %% exist, instead of being silently dropped.
 send_tls_alert(AlertCode, Phrase, State) ->
     ErrorCode = ?QUIC_CRYPTO_ERROR_BASE + AlertCode,
-    CloseState = State#state{close_reason = {tls_alert, AlertCode}},
     CloseFrame = {connection_close, transport, ErrorCode, 0, Phrase},
-    emit_close_at_level(select_close_level(app, CloseState), CloseFrame, CloseState).
+    emit_local_close(app, {tls_alert, AlertCode}, CloseFrame, State).
 
 %% Close with a transport-level error code (RFC 9000 §20.1) at the
 %% highest available encryption level. Works before app keys exist
 %% (handshake-time errors) unlike the raw stream-path close.
 close_with_transport_error(Code, Phrase, State) ->
-    CloseState = State#state{close_reason = {transport, Code, Phrase}},
-    CloseFrame = {connection_close, transport, Code, 0, Phrase},
-    emit_close_at_level(select_close_level(app, CloseState), CloseFrame, CloseState).
+    close_with_error(app, transport, Code, 0, Phrase, State).
 
 default_alert_phrase(?TLS_ALERT_HANDSHAKE_FAILURE) -> <<"handshake failure">>;
 default_alert_phrase(?TLS_ALERT_ILLEGAL_PARAMETER) -> <<"illegal parameter">>;
