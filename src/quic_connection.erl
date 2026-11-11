@@ -13980,10 +13980,21 @@ note_short_challenge(
     } = State
 ) when Size < 1200 ->
     State#state{
-        mig = Mig#mig{pending_peer_validation = Path#path_state{short_challenges = [Data | Short]}}
+        mig = Mig#mig{
+            pending_peer_validation = Path#path_state{
+                short_challenges = add_short_challenge(Data, Short)
+            }
+        }
     };
 note_short_challenge(_Data, _Size, State) ->
     State.
+
+%% A path keeps its two latest short challenges, without repeats.
+add_short_challenge(Data, Short) ->
+    case lists:member(Data, Short) of
+        true -> Short;
+        false -> lists:sublist([Data | Short], 2)
+    end.
 
 %% @doc Send PATH_RESPONSE to a specific address with proper 1200-byte padding.
 %% RFC 9000 Section 8.2.1: PATH_RESPONSE MUST be padded to at least 1200 bytes.
@@ -14047,7 +14058,10 @@ answer_probe_on_new_path(Addr, Via, ResponseData, #state{mig = Mig} = State, DCI
                 };
             Room when Room >= ?SHORT_PROBE_ANSWER_SIZE ->
                 Short = Path1#path_state.short_challenges,
-                {Path1#path_state{short_challenges = [ChallengeData | Short]}, Both};
+                {
+                    Path1#path_state{short_challenges = add_short_challenge(ChallengeData, Short)},
+                    Both
+                };
             _ ->
                 {Path1, [{path_response, ResponseData}]}
         end,

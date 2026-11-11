@@ -107,6 +107,46 @@ a_short_probe_answer_challenges_the_address_test() ->
         )
     end).
 
+%% A path keeps its two latest short challenges (RFC 9000 Section 8.2.1).
+short_probe_answers_keep_two_challenges_test() ->
+    with_peer(fun(Peer, Sock) ->
+        S = lists:foldl(
+            fun(PN, S0) -> probe(PN, 60, Peer, S0) end, with_spare_cid(state()), lists:seq(1, 8)
+        ),
+        Answers = recv_all(Sock),
+        ?assertEqual(8, length(Answers)),
+        [#path_state{challenge_data = undefined, short_challenges = Short}] =
+            quic_connection_test_support:alt_paths(S),
+        ?assertEqual(2, length(Short)),
+        [Last, Previous] = Short,
+        S1 = quic_connection:handle_path_response(Previous, S),
+        ?assertMatch([D] when byte_size(D) >= 1200, recv_all(Sock)),
+        ?assertMatch(
+            [#path_state{challenge_data = <<_:64>>, short_challenges = []}],
+            quic_connection_test_support:alt_paths(S1)
+        ),
+        ?assertNotEqual(Last, Previous)
+    end).
+
+a_validating_path_keeps_two_short_challenges_test() ->
+    with_peer(fun(Peer, Sock) ->
+        S1 = recv(1, 100, Peer, state()),
+        _ = recv_all(Sock),
+        #path_state{challenge_data = First, short_challenges = [First]} =
+            quic_connection_test_support:pending_peer_path(S1),
+        S = lists:foldl(fun short_challenge/2, S1, [First, <<2:64>>, <<3:64>>, <<3:64>>]),
+        ?assertMatch(
+            #path_state{short_challenges = [<<3:64>>, <<2:64>>]},
+            quic_connection_test_support:pending_peer_path(S)
+        )
+    end).
+
+short_challenge(Data, #state{mig = #mig{pending_peer_validation = Path} = Mig} = State) ->
+    S = State#state{
+        mig = Mig#mig{pending_peer_validation = Path#path_state{challenge_data = Data}}
+    },
+    quic_connection:note_short_challenge(Data, 100, S).
+
 holds_data_to_a_second_address_during_the_handshake_test() ->
     with_peer(fun(Peer, Sock) ->
         S1 = hs_recv(1, 100, ?SPOOFED, handshaking()),
