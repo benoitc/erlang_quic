@@ -5,6 +5,9 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(TIMEOUT, 5000).
+%% CRYPTO_ERROR for the TLS alerts (RFC 9001 Section 4.8).
+-define(HANDSHAKE_FAILURE, 16#0128).
+-define(NO_APPLICATION_PROTOCOL, 16#0178).
 
 owner_chosen_by_alpn_receives_the_stream_test() ->
     Test = self(),
@@ -53,7 +56,10 @@ each_alpn_gets_its_own_owner_test() ->
 an_error_fails_the_handshake_test() ->
     Name = start_server(#{alpn_handler => fun(_Conn, _Alpn) -> {error, busy} end}),
     try
-        ?assertMatch({error, _}, connect(Name, <<"proto-a">>))
+        ?assertMatch(
+            {error, {peer_closed, transport, ?HANDSHAKE_FAILURE, _, _}},
+            connect(Name, <<"proto-a">>)
+        )
     after
         quic:stop_server(Name)
     end.
@@ -61,7 +67,10 @@ an_error_fails_the_handshake_test() ->
 an_exception_fails_the_handshake_test() ->
     Name = start_server(#{alpn_handler => fun(_Conn, _Alpn) -> error(boom) end}),
     try
-        ?assertMatch({error, _}, connect(Name, <<"proto-a">>))
+        ?assertMatch(
+            {error, {peer_closed, transport, ?HANDSHAKE_FAILURE, _, _}},
+            connect(Name, <<"proto-a">>)
+        )
     after
         quic:stop_server(Name)
     end.
