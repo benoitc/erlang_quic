@@ -87,7 +87,8 @@ empty_frame_test() ->
 
 %% The pre-optimisation update: always run the cap.
 reference_pn_space_recv(PN, PNSpace, Now) ->
-    #pn_space{largest_recv = LargestRecv, ack_ranges = Ranges} = PNSpace,
+    #pn_space{largest_recv = LargestRecv, ack_ranges = Ranges, recv_floor = Floor} = PNSpace,
+    {NewRanges, NewFloor} = quic_ack:cap_ack_ranges(quic_ack:add_to_ranges(PN, Ranges), Floor),
     NewLargest =
         case LargestRecv of
             undefined -> PN;
@@ -97,7 +98,8 @@ reference_pn_space_recv(PN, PNSpace, Now) ->
     PNSpace#pn_space{
         largest_recv = NewLargest,
         recv_time = Now,
-        ack_ranges = quic_ack:cap_ack_ranges(quic_ack:add_to_ranges(PN, Ranges))
+        ack_ranges = NewRanges,
+        recv_floor = NewFloor
     }.
 
 empty_pn_space() ->

@@ -35,8 +35,11 @@
 %%% '''
 %%%
 %%% Return `{ok, HandlerPid}' to take the connection, or `{error, Reason}'
-%%% to decline it, in which case the listener logs a warning and keeps
-%%% ownership. An arity-2 fun is called as `Fun(Conn, DCID)'.
+%%% to decline it. The listener then logs a warning and stops the
+%%% connection before it has seen a packet, so the client gets no answer
+%%% and gives up when its handshake times out. A handler that raises or
+%%% returns anything else also costs only that connection, and is logged
+%%% as an error. An arity-2 fun is called as `Fun(Conn, DCID)'.
 %%%
 %%% === Return the final owner ===
 %%%
@@ -88,7 +91,7 @@
 -behaviour(gen_server).
 
 %% Suppress pattern warnings for defensive callback handling (user-provided callbacks)
--dialyzer({no_match, create_connection/5}).
+-dialyzer({no_match, assign_owner/3}).
 
 -export([
     start_link/2,
@@ -323,7 +326,7 @@ init_genudp_backend(Port, Opts) ->
             case ReusePort of
                 true -> [{reuseport, true}, {reuseport_lb, true}];
                 false -> []
-            end ++ ExtraFlags,
+            end ++ quic_socket:dont_fragment_opts(Family) ++ ExtraFlags,
     case gen_udp:open(Port, SocketOpts) of
         {ok, Socket} ->
             case open_preferred_sockets(Socket, Opts) of
@@ -364,7 +367,7 @@ open_preferred_sockets([{IP, Port} = Endpoint | Rest], Opts, Acc) ->
         | case maps:get(reuseport, Opts, false) of
             true -> [{reuseport, true}, {reuseport_lb, true}];
             false -> []
-        end
+        end ++ quic_socket:dont_fragment_opts(address_family(IP))
     ],
     case gen_udp:open(Port, SocketOpts) of
         {ok, S} ->
@@ -414,7 +417,7 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts, Preferred
     ALPNList = maps:get(alpn, Opts, [<<"h3">>]),
     ConnHandler = maps:get(connection_handler, Opts, undefined),
 
-    {ConnTab, TicketTab, OwnsTables} = get_tables(Opts),
+    {ConnTab, TicketTab, IndexOpts, OwnsTables} = get_tables(Opts),
 
     %% Get actual port and bound address
     ActualPort = get_socket_port(Socket, SocketState, Backend),
@@ -447,7 +450,7 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts, Preferred
             alpn_list = ALPNList
         },
         connections = ConnTab,
-        cid_index = ets:new(quic_cid_index, [bag, private]),
+        cid_index = ets:new(quic_cid_index, [bag, private | IndexOpts]),
         tickets_table = TicketTab,
         owns_tables = OwnsTables,
         reset_secret = ResetSecret,
@@ -884,6 +887,7 @@ recv_drops() ->
 %% @doc false
 terminate(_Reason, #listener_state{
     connections = ConnTab,
+    cid_index = Index,
     tickets_table = TicketTab,
     owns_tables = OwnsTables,
     socket_state = SocketState,
@@ -904,7 +908,7 @@ terminate(_Reason, #listener_state{
             safe_delete_table(ConnTab),
             safe_delete_table(TicketTab);
         false ->
-            ok
+            quic_listener_manager:delete_routes(Index, ConnTab)
     end,
     ok;
 terminate(_Reason, _) ->
@@ -1033,20 +1037,22 @@ cleanup_connection(Pid, #listener_state{connections = Conns, cid_index = Index})
 %% Use provided ETS table or create new one for connection tracking
 %% When using pool mode, the supervisor is in the options, query it for the
 %% table manager and get the table from it.
-%% Returns {ConnTab, TicketTab, OwnsTable} where OwnsTable indicates if
-%% this listener should delete the tables on terminate.
+%% Returns {ConnTab, TicketTab, IndexOpts, OwnsTable} where OwnsTable
+%% indicates if this listener should delete the tables on terminate.
+%% In pool mode the manager inherits the listener's CID index, so it can
+%% remove the listener's routes when the listener is killed.
 get_tables(#{supervisor := SupPid}) ->
     Children = supervisor:which_children(SupPid),
     {quic_listener_manager, ManagerPid, _, _} = lists:keyfind(quic_listener_manager, 1, Children),
     {ok, {ConnTab, TicketTab}} = quic_listener_manager:get_tables(ManagerPid),
     % Pool mode - don't own tables
-    {ConnTab, TicketTab, false};
+    {ConnTab, TicketTab, [quic_listener_manager:cid_index_heir(ManagerPid)], false};
 get_tables(_) ->
     ConnTab = ets:new(quic_connections, [set, protected]),
     %% Public: the connections store the tickets they issue here.
     TicketTab = ets:new(quic_tickets, [set, public]),
     % Standalone mode - own tables
-    {ConnTab, TicketTab, true}.
+    {ConnTab, TicketTab, [], true}.
 
 handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) ->
     case parse_packet_header(Packet, DCIDLen) of
@@ -1083,7 +1089,7 @@ handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) -
             ),
             route_to_connection(DCID, Packet, RemoteAddr, State);
         {error, Reason} ->
-            ?LOG_WARNING(#{what => packet_parse_failed, reason => Reason}, ?QUIC_LOG_META),
+            ?LOG_DEBUG(#{what => packet_parse_failed, reason => Reason}, ?QUIC_LOG_META),
             ok
     end.
 
@@ -1131,6 +1137,8 @@ parse_packet_header(
     case supported_version(Version) of
         false ->
             {unsupported_version, DCID, SCID, Version};
+        true when DCIDLenField > 20; SCIDLen > 20 ->
+            {error, cid_too_long};
         true ->
             case quic_packet:bits_to_type(PacketType, Version) of
                 initial -> {initial, DCID, SCID, Version, Rest};
@@ -1348,50 +1356,73 @@ create_connection_unconditional(
             add_cid(DCID, ConnPid, State),
             add_cid(ServerCID, ConnPid, State),
 
-            %% Invoke connection handler callback BEFORE sending packet
-            %% This ensures ownership is transferred before handshake can complete
-            case ConnHandler of
-                undefined ->
-                    ok;
-                Fun when is_function(Fun, 2) ->
-                    %% Handler takes (ConnPid, DCID)
-                    case Fun(ConnPid, DCID) of
-                        {ok, HandlerPid} when is_pid(HandlerPid) ->
-                            ok = quic:set_owner_sync(ConnPid, HandlerPid);
-                        {error, HandlerError} ->
-                            ?LOG_WARNING(
-                                #{
-                                    what => connection_handler_failed,
-                                    error => HandlerError
-                                },
-                                ?QUIC_LOG_META
-                            )
-                    end;
-                Fun when is_function(Fun, 1) ->
-                    case Fun(ConnPid) of
-                        {ok, HandlerPid} when is_pid(HandlerPid) ->
-                            %% Transfer ownership to handler (sync to ensure it completes
-                            %% before any packets trigger handshake completion)
-                            ok = quic:set_owner_sync(ConnPid, HandlerPid);
-                        {error, HandlerError} ->
-                            ?LOG_WARNING(
-                                #{
-                                    what => connection_handler_failed,
-                                    error => HandlerError
-                                },
-                                ?QUIC_LOG_META
-                            )
-                    end
-            end,
-
-            %% Send initial packet to new connection (after ownership transfer)
-            send_to_connection(ConnPid, Packet, RemoteAddr),
-
-            {ok, ConnPid};
+            %% The handler runs before the connection sees the packet, so
+            %% ownership has moved before the handshake can complete.
+            case assign_owner(ConnHandler, ConnPid, DCID) of
+                ok ->
+                    send_to_connection(ConnPid, Packet, RemoteAddr),
+                    {ok, ConnPid};
+                {declined, DeclineReason} ->
+                    ?LOG_WARNING(
+                        #{
+                            what => connection_declined,
+                            conn_pid => ConnPid,
+                            reason => DeclineReason
+                        },
+                        ?QUIC_LOG_META
+                    ),
+                    discard_connection(ConnPid, State),
+                    {error, connection_declined};
+                {error, HandlerError} ->
+                    ?LOG_ERROR(
+                        #{
+                            what => connection_handler_error,
+                            conn_pid => ConnPid,
+                            error => HandlerError
+                        },
+                        ?QUIC_LOG_META
+                    ),
+                    discard_connection(ConnPid, State),
+                    {error, connection_handler_error}
+            end;
         {error, Reason} ->
             ?LOG_WARNING(#{what => start_connection_failed, reason => Reason}, ?QUIC_LOG_META),
             {error, Reason}
     end.
+
+assign_owner(undefined, _ConnPid, _DCID) ->
+    ok;
+assign_owner(Handler, ConnPid, DCID) ->
+    try call_connection_handler(Handler, ConnPid, DCID) of
+        {ok, HandlerPid} when is_pid(HandlerPid) ->
+            set_owner(ConnPid, HandlerPid);
+        {error, Reason} ->
+            {declined, Reason};
+        Other ->
+            {error, {bad_return, Other}}
+    catch
+        Class:Reason:Stack ->
+            {error, {Class, Reason, Stack}}
+    end.
+
+call_connection_handler(Handler, ConnPid, DCID) when is_function(Handler, 2) ->
+    Handler(ConnPid, DCID);
+call_connection_handler(Handler, ConnPid, _DCID) when is_function(Handler, 1) ->
+    Handler(ConnPid).
+
+set_owner(ConnPid, HandlerPid) ->
+    try quic:set_owner_sync(ConnPid, HandlerPid) of
+        ok -> ok;
+        {error, Reason} -> {error, {set_owner, Reason}}
+    catch
+        exit:Reason -> {error, {set_owner, Reason}}
+    end.
+
+%% The listener is the connection's parent, so the exit signal stops it.
+discard_connection(ConnPid, State) ->
+    cleanup_connection(ConnPid, State),
+    exit(ConnPid, shutdown),
+    ok.
 
 send_to_connection(ConnPid, Packet, RemoteAddr) ->
     ConnPid ! {quic_packet, Packet, RemoteAddr}.

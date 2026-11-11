@@ -1058,9 +1058,7 @@ h3_connection_handler(QuicConnPid, #{handler := Handler, settings := Settings} =
         H3Opts -> start_h3_connection(QuicConnPid, H3Opts, maps:get(owner, Opts, self()))
     catch
         error:Reason ->
-            %% A listener only logs a failing connection handler and still
-            %% feeds the Initial to the QUIC connection, so close it here or
-            %% the peer keeps a connection with no HTTP/3 process behind it.
+            %% Declined: the listener stops the connection as well.
             _ = quic:safe_close(QuicConnPid, normal),
             {error, Reason}
     end.

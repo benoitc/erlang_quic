@@ -21,6 +21,20 @@ All notable changes to this project will be documented in this file.
   `quic_h3:start_server/3`.
 
 ### Changed
+- The default `pool_size` now runs one listener, as documented. It ran
+  two on Linux. Set `pool_size => 2` for the old behaviour.
+- A `connection_handler` that returns `{error, Reason}` now declines the
+  connection: it is stopped and the client gets no answer.
+- Calls on a connection whose process has stopped return
+  `{error, closed}` instead of exiting with `noproc`.
+- `send_data`, `send_data_async`, `reset_stream`, `reset_stream_at`,
+  `stop_sending` and `set_owner` return `{error, badarg}` for bad
+  arguments, and `set_stream_deadline` returns `{error, invalid_action}`
+  or `{error, invalid_error_code}`, instead of crashing the connection.
+- A handshake that fails with a TLS alert now tells the owner
+  `{closed, {tls_alert, Reason}}`.
+- With `idle_timeout => 0`, a handshake that hears nothing from the peer
+  now ends after `disconnect_timeout` instead of never.
 - A FIN on the peer's control or QPACK streams went unnoticed; only a
   reset closed the connection. Both now close it with
   H3_CLOSED_CRITICAL_STREAM (RFC 9114 Section 6.2.1, RFC 9204 Section
@@ -43,6 +57,196 @@ All notable changes to this project will be documented in this file.
   (RFC 9218 Section 7.2).
 
 ### Fixed
+- A write to a stream whose sending side had been reset, by the
+  application, a stream deadline or the automatic answer to the peer's
+  STOP_SENDING, was still sent, at or past the final size the reset had
+  announced, and peers closed the connection with FINAL_SIZE_ERROR. Such
+  a write now fails with stream_closed, as one after the FIN does
+  (RFC 9000 Section 3.3).
+- Resetting a stream a second time sent another RESET_STREAM with a new
+  error code and a larger final size, and the peer closed the connection
+  with FINAL_SIZE_ERROR. Resetting a stream whose sending side is already
+  done now does nothing (RFC 9000 Section 4.5).
+- A RESET_STREAM the peer sent again counted the stream's unreceived
+  bytes against connection flow control a second time and told the owner
+  about the reset again. A repeated RESET_STREAM is now ignored (RFC 9000
+  Sections 4.5 and 13.3).
+- A RESET_STREAM_AT from the peer did not count the stream's final size
+  against connection flow control, so connection credit fell behind what
+  the peer had used and the peer could stall waiting for more (RFC 9000
+  Section 4.5, draft-ietf-quic-reliable-stream-reset-07).
+- After heavy packet loss left more than 64 ACK ranges, a packet number
+  below the ranges kept was accepted again, so a duplicated packet was
+  processed twice. Packet numbers below the lowest range kept are now
+  discarded as duplicates (RFC 9000 Sections 12.3 and 13.2.3).
+- An ACK frame whose ranges reached below packet number 0 was processed
+  instead of closing the connection with FRAME_ENCODING_ERROR (RFC 9000
+  Section 19.3.1).
+- A version 1 or 2 long-header packet with a connection ID longer than
+  20 bytes is now dropped (RFC 9000 Section 17.2). Before, a listener
+  started a connection for an Initial with such a Destination Connection
+  ID, and either side took such a Source Connection ID as the peer's.
+  Version Negotiation still accepts the longer IDs RFC 8999 allows.
+- A client now discards a Retry whose Source Connection ID is the
+  Destination Connection ID of its own Initial (RFC 9000 Section
+  17.2.5.1). Before, it took the Retry and restarted the handshake.
+- A disable_active_migration transport parameter with a value, or a
+  preferred_address with a connection ID longer than 20 bytes, now
+  closes the connection with TRANSPORT_PARAMETER_ERROR (RFC 9000
+  Sections 7.4 and 18.2). Before, both were accepted, and the malformed
+  disable_active_migration was read as allowing migration.
+- CRYPTO data at an encryption level the handshake had left, extending
+  past what had been received there, was handed to TLS: a fragment was
+  buffered for good, a whole message closed the connection with
+  unexpected_message. It is now a PROTOCOL_VIOLATION; retransmissions of
+  data already received are still ignored (RFC 9001 Section 4.1.3).
+- When the handshake moved on to a higher encryption level, CRYPTO data
+  left over at the previous one was ignored, or closed the connection
+  with unexpected_message if it held a whole message. It is now a
+  PROTOCOL_VIOLATION (RFC 9001 Section 4.1.3).
+- A Finished message that failed verification, or was shorter than 32
+  bytes, was ignored, leaving the handshake to time out. It now closes
+  the connection with decrypt_error, or decode_error when its length is
+  not that of the handshake hash (RFC 9846 Section 4.5.3).
+- A client took a ServerHello or HelloRetryRequest naming a cipher suite
+  it does not know for TLS_AES_128_GCM_SHA256 and carried on with the
+  wrong keys. It now aborts with illegal_parameter (RFC 9846
+  Section 4.2.3).
+- A packet that opened with the previous 1-RTT keys was accepted even
+  when a lower-numbered packet had already used the new ones. It now
+  closes the connection with KEY_UPDATE_ERROR (RFC 9001 Section 6.4).
+- Packets that failed authentication were not counted, so the AEAD
+  integrity limit was never enforced. The connection now closes with
+  AEAD_LIMIT_REACHED at the limit (RFC 9001 Section 6.6).
+- A connection whose handshake lost a few packets could start with its
+  congestion window collapsed to two packets: losses of the first flight
+  and its probes, all sent before any RTT sample, were taken for
+  persistent congestion. Only packets sent after the first RTT sample now
+  count towards it (RFC 9002 Section 7.6.2).
+- A datagram the kernel refused as too large for the interface took the
+  rest of its send batch with it, and the packets queued behind it came
+  back as losses. Only the oversized datagram is lost now (RFC 9000
+  Section 14.4).
+- On Linux, datagrams now always leave with Don't Fragment set (RFC 9000
+  Section 14). Before, Linux fragmented datagrams larger than its cached
+  path MTU, so a path MTU probe could succeed in fragments and raise the
+  datagram size past what the path carries unfragmented.
+- A 1-RTT packet the kernel refused to send outside a batch was never
+  sent again, so the stream data it carried was lost and the stream
+  stalled. It is now counted as sent, and loss detection sends its data
+  again (RFC 9002 Section 6).
+- Every datagram the listener could not parse logged a warning. It is
+  now logged at debug level.
+- The warning logged for a packet that fails to decrypt included the
+  peer's stateless reset tokens. It now lists only the peer's connection
+  IDs and their sequence numbers.
+- After closing a connection itself, erlang_quic ignored the peer's
+  packets, so when its CONNECTION_CLOSE was lost the peer kept
+  retransmitting until its own idle timeout. Packets from the peer's
+  address are now answered with the close again, at an exponentially
+  decreasing rate, on the socket the connection sends from, including a
+  server's preferred address. Nothing is sent again once the peer has
+  closed (RFC 9000 Sections 10.2.1 and 10.2.2).
+- An idle timeout after the handshake sent a CONNECTION_CLOSE to a peer
+  that had most likely discarded the connection already. The connection
+  now closes silently, as it already did during the handshake (RFC 9000
+  Section 10.1).
+- A server answered a PATH_CHALLENGE from an address the client was not
+  using with a full-size datagram, whatever the size of the probe. Until
+  that address is validated, the server now sends it at most three times
+  what it received from it (RFC 9000 Section 8). An answer too small for
+  a full-size datagram carries a PATH_CHALLENGE that validates the
+  address only, and the path is then challenged again at full size
+  (Section 8.2.1).
+- A client that moved twice before the handshake was confirmed was
+  followed to its second address without that address being validated
+  or the data sent to it being limited. The second address is now
+  validated like the first (RFC 9000 Sections 8 and 9.3).
+- A server kept state for every address that probed it, with no limit.
+  It now keeps the four most recently probed paths.
+- Out-of-order stream data was bounded in bytes only, not by the memory
+  each fragment takes, so many small fragments held far more memory than
+  the 32 MiB receive buffer cap counted, and a small fragment kept its
+  whole packet in memory. Each buffered fragment now counts against the
+  cap (RFC 9000 Section 21.7).
+- A stream that had used up its own flow-control window held back data
+  queued for other streams. Only a connection-level limit stops the send
+  queue now, and data waiting for a blocked stream no longer slows down
+  sending on the others (RFC 9000 Section 4.1).
+- `quic:connect/4` returns `{error, Reason}` when the client socket
+  cannot be opened, instead of killing a caller that does not trap
+  exits.
+- API calls on a connection whose process has already stopped exited
+  with `noproc` although their specs promise an error. They return
+  `{error, closed}`.
+- Bad arguments to `send_data`, `send_data_async`, `reset_stream`,
+  `reset_stream_at`, `stop_sending`, `set_stream_deadline` and
+  `set_owner` crashed the connection and its owner. They are refused
+  with an error.
+- The owner of a connection whose handshake failed with a TLS alert, for
+  example a server rejecting the client's ALPN, was not told it closed.
+- `keep_alive_interval => auto` was half the local idle timeout, and at
+  least 5 seconds, so a peer with a shorter timeout, or one of 5 seconds
+  or less, idled the connection out. It is now half the idle timeout in
+  force, the smaller of the two advertised, and at least one second
+  (RFC 9000 Section 10.1).
+- With `idle_timeout => 0`, nothing ended a handshake that heard nothing
+  from the peer: a server kept a connection for ever after one
+  unreadable Initial, and a client connecting to an address that never
+  answered was never told. Such a handshake is now abandoned after
+  `disconnect_timeout`, and the owner gets
+  `{closed, disconnect_timeout}`. With an idle timeout, the idle timeout
+  still bounds the handshake.
+- A stream deadline that fired just as it was cancelled or set again
+  still reset the stream. It is now ignored.
+- `quic:handle_timeout/2` on a connection past its idle timeout did not
+  close it. It now does, as the idle timer does.
+- A `connection_handler` that raised, returned something other than
+  `{ok, Pid}` or `{error, Reason}`, or named an owner for a connection
+  that had already stopped, crashed the listener and every connection it
+  served. Only the connection the handler was called for is now closed,
+  and the failure is logged.
+- A `connection_handler` returning `{error, Reason}` did not decline the
+  connection: the handshake completed with the listener as owner and
+  nothing served it. The connection is now stopped before it sees a
+  packet, and the handler examples in the guides return `{ok, Pid}` as
+  the listener requires.
+- In a server pool, a listener that stopped or crashed left its
+  connections registered. Packets for them went to a dead process
+  instead of drawing a stateless reset (RFC 9000 Section 10.3), and they
+  counted against `max_connections` until the server restarted. They are
+  now removed.
+- `pool_size` started one listener more than asked, with SO_REUSEPORT
+  always set, so another process could bind a single-listener server's
+  port, and on port 0 the listeners bound different ports. `pool_size` N
+  now starts N listeners, with SO_REUSEPORT only when N is above 1, and
+  `quic:get_server_connections/1` returns each connection once instead
+  of once per listener.
+
+||||||| parent of da88b2b (Add the cipher suite, PSK and recovery fixes to the CHANGELOG)
+- NewReno and CUBIC moved the start of the recovery period to the moment
+  they left recovery, so the loss of a packet sent during recovery was
+  ignored and, under continued overload, the next window reduction came
+  about one RTT late. The recovery period now keeps the time the
+  reduction was made (RFC 9002 Section 7.3.2 and Appendix B.6). The
+  100 ms minimum recovery period still keeps a burst loss from cutting
+  the window twice.
+- A server whose `ciphers` shared no suite with the client went ahead
+  with TLS_AES_128_GCM_SHA256 anyway. It now aborts the handshake with
+  handshake_failure (RFC 9846 Section 4.2.1).
+- A client did not check the cipher suite of a HelloRetryRequest against
+  the ones it offered, nor that the ServerHello after it named the same
+  suite. It now aborts the handshake with illegal_parameter in either
+  case (RFC 9846 Section 4.2.4).
+- A server that selected TLS_AES_256_GCM_SHA384 still took the client's
+  external PSK, which is SHA-256, so a client checking the suite against
+  the PSK could not complete the handshake. A known external PSK now
+  makes the server pick a SHA-256 suite both sides allow; when none
+  exists the PSK is skipped and the certificate path is used (RFC 9846
+  Section 4.3.11). Resumption tickets keep the server's order.
+- A client accepted a server that took its PSK, external or a resumption
+  ticket, with a cipher suite whose hash is not the PSK's. It now aborts
+  with illegal_parameter (RFC 9846 Section 4.3.11).
 - After `cancel_stream`, the rest of the request body was read as a new
   request, so a HEADERS frame inside a body could be delivered as a
   second request. A cancelled stream is now ignored until the peer ends

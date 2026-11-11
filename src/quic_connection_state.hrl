@@ -125,7 +125,7 @@
     idle_timeout :: non_neg_integer(),
 
     %% Keep-alive (RFC 9000 - PING frames for liveness)
-    keep_alive_interval :: non_neg_integer() | disabled,
+    keep_alive_interval :: non_neg_integer() | disabled | auto,
 
     %% Give up on an unresponsive peer: close the connection when
     %% ack-eliciting data has been in flight with no ACK for this long
@@ -270,6 +270,8 @@
     %% HelloRetryRequest bookkeeping
     hrr_sent = false :: boolean(),
     hrr_group :: atom() | undefined,
+    %% Client: the HelloRetryRequest's suite, which the ServerHello must repeat
+    hrr_cipher :: atom() | undefined,
     %% Outgoing Initial-level CRYPTO stream offset. Stays 0 for a
     %% one-shot flight; bumps after HRR so CH2 / ServerHello continue
     %% the stream (RFC 9001 §4.1.3).
@@ -411,6 +413,8 @@
     %% the receive pass being handled
     peer_dcid :: binary() | undefined,
     pass_dcid :: binary() | undefined,
+    %% Bytes of the receive pass from a peer address on no path yet
+    pass_rx = 0 :: non_neg_integer(),
     %% While the current path is on a preferred-address socket, the
     %% listening socket and its sender, sent through again on return
     main_sock :: {term(), term()} | undefined
@@ -559,6 +563,9 @@
         queue:new(),
         queue:new()
     } :: tuple(),
+    %% Queued entries of streams with no room in their own window, by offset,
+    %% each above every offset its stream has in send_queue
+    send_parked = #{} :: #{non_neg_integer() => queue:queue()},
     %% Pre-connection pending sends (simple list, processed when connected)
     pending_data = [] :: [{non_neg_integer(), iodata(), boolean()}],
 
@@ -580,6 +587,14 @@
 
     %% Close reason
     close_reason :: term(),
+
+    %% After a close of our own, the CONNECTION_CLOSE that answers the
+    %% peer's packets and how many have arrived (RFC 9000 Section 10.2.1)
+    closing_frame :: {app | handshake | initial | none, tuple()} | undefined,
+    closing_recv = 0 :: non_neg_integer(),
+
+    %% Received packets that failed authentication (RFC 9001 Section 6.6)
+    auth_failures = 0 :: non_neg_integer(),
 
     %% Connection Migration (RFC 9000 Section 9)
     %% Current path (active remote address)

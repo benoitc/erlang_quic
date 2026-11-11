@@ -87,7 +87,7 @@ on `inet6`, `{ip, _}` or `{ifaddr, _}`.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `pool_size` | integer | 1 | Number of listener processes |
-| `connection_handler` | function | - | Callback for new connections |
+| `connection_handler` | function | - | Callback for new connections: returns `{ok, OwnerPid}`, or `{error, Reason}` to decline |
 | `alpn_handler` | fun/2 | - | Picks each connection's owner by the negotiated ALPN; see below |
 
 ### Advanced Options
@@ -161,8 +161,10 @@ handle_connection(ConnPid, _DCID) ->
     {ok, Peer} = quic:peername(ConnPid),
     io:format("New connection from ~p~n", [Peer]),
 
-    %% Spawn a process to handle this connection
-    spawn(fun() -> connection_loop(ConnPid) end).
+    %% Spawn a process to handle this connection. It becomes the owner
+    %% of the connection. Return {error, Reason} instead to decline the
+    %% connection: the listener stops it without answering the client.
+    {ok, spawn(fun() -> connection_loop(ConnPid) end)}.
 
 %% Start server with handler
 quic:start_server(my_server, 4433, #{
@@ -478,8 +480,8 @@ start(Port) ->
 stop() ->
     quic:stop_server(echo).
 
-handle_connection(ConnPid, _Info) ->
-    spawn(fun() -> echo_loop(ConnPid) end).
+handle_connection(ConnPid, _DCID) ->
+    {ok, spawn(fun() -> echo_loop(ConnPid) end)}.
 
 echo_loop(ConnPid) ->
     receive

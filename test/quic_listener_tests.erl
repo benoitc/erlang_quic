@@ -218,39 +218,110 @@ connection_handler_registration_test() ->
     ?assert(is_pid(Listener)),
     ok = quic_listener:stop(Listener).
 
-connection_handler_error_handling_test() ->
-    %% Test that connection_handler errors are handled gracefully
-    {Cert, PrivKey} = generate_test_cert(),
-    %% Handler that returns an error
-    Handler = fun(_ConnPid, _ConnRef) ->
-        {error, test_error}
-    end,
-    Opts = #{
-        cert => Cert,
-        key => PrivKey,
-        alpn => [<<"h3">>],
-        connection_handler => Handler
-    },
-    {ok, Listener} = quic_listener:start_link(0, Opts),
-    ?assert(is_pid(Listener)),
-    ok = quic_listener:stop(Listener).
+%% {error, Reason} declines the connection: it is stopped before it sees
+%% the Initial and leaves the routing table.
+connection_handler_declines_test_() ->
+    {timeout, 30, fun() ->
+        Test = self(),
+        DCID = <<3, 3, 3, 3, 3, 3, 3, 3>>,
+        {ok, Listener} = quic_listener:start(0, #{
+            connection_handler => fun(ConnPid, D) ->
+                Test ! {conn, D, ConnPid},
+                receive
+                    monitored -> {error, overloaded}
+                end
+            end,
+            psks => #{<<"id">> => <<"secret">>},
+            alpn => [<<"h3">>]
+        }),
+        {ok, Sock} = gen_udp:open(0, [binary, {active, false}]),
+        try
+            Port = quic_listener:get_port(Listener),
+            ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_initial(DCID)),
+            receive
+                {conn, DCID, ConnPid} ->
+                    Ref = erlang:monitor(process, ConnPid),
+                    Listener ! monitored,
+                    receive
+                        {'DOWN', Ref, process, ConnPid, Reason} ->
+                            ?assertEqual(shutdown, Reason)
+                    after 2000 -> error(declined_connection_still_up)
+                    end
+            after 5000 -> error(handler_not_called)
+            end,
+            ?assertEqual([], quic_listener:get_connections(Listener))
+        after
+            gen_udp:close(Sock),
+            catch quic_listener:stop(Listener)
+        end
+    end}.
 
-connection_handler_invalid_return_test() ->
-    %% Test that invalid connection_handler return values are handled
-    {Cert, PrivKey} = generate_test_cert(),
-    %% Handler that returns unexpected value
-    Handler = fun(_ConnPid, _ConnRef) ->
-        invalid_return
+%% A handler that misbehaves for one connection costs that connection
+%% only: the listener and the connections it already serves stay up.
+connection_handler_failure_test_() ->
+    [
+        {Title, {timeout, 30, fun() -> connection_handler_failure(Misbehave) end}}
+     || {Title, Misbehave} <- [
+            {"handler raises", fun(_ConnPid) -> error(handler_bug) end},
+            {"handler returns something else", fun(_ConnPid) -> invalid_return end},
+            {"handler returns an owner for a dead connection", fun(ConnPid) ->
+                Ref = erlang:monitor(process, ConnPid),
+                exit(ConnPid, kill),
+                receive
+                    {'DOWN', Ref, process, ConnPid, _} -> {ok, self()}
+                end
+            end}
+        ]
+    ].
+
+connection_handler_failure(Misbehave) ->
+    Test = self(),
+    Good = <<1, 1, 1, 1, 1, 1, 1, 1>>,
+    Handler = fun(ConnPid, DCID) ->
+        Test ! {conn, DCID, ConnPid},
+        case DCID of
+            Good -> {ok, Test};
+            _ -> Misbehave(ConnPid)
+        end
     end,
-    Opts = #{
-        cert => Cert,
-        key => PrivKey,
-        alpn => [<<"h3">>],
-        connection_handler => Handler
-    },
-    {ok, Listener} = quic_listener:start_link(0, Opts),
-    ?assert(is_pid(Listener)),
-    ok = quic_listener:stop(Listener).
+    {ok, Listener} = quic_listener:start(0, #{
+        connection_handler => Handler,
+        psks => #{<<"id">> => <<"secret">>},
+        alpn => [<<"h3">>]
+    }),
+    Port = quic_listener:get_port(Listener),
+    {ok, Sock} = gen_udp:open(0, [binary, {active, false}]),
+    try
+        ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_initial(Good)),
+        GoodConn = await_handler_call(Good),
+        Bad = <<2, 2, 2, 2, 2, 2, 2, 2>>,
+        ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, fake_initial(Bad)),
+        BadConn = await_handler_call(Bad),
+        Ref = erlang:monitor(process, BadConn),
+        receive
+            {'DOWN', Ref, process, BadConn, _} -> ok
+        after 5000 -> error(connection_not_closed)
+        end,
+        ?assert(is_process_alive(Listener)),
+        ?assert(is_process_alive(GoodConn)),
+        ?assertEqual([GoodConn], quic_listener:get_connections(Listener))
+    after
+        gen_udp:close(Sock),
+        catch quic_listener:stop(Listener)
+    end.
+
+%% Only the header is parsed to route it; padded to the 1200 bytes a
+%% client Initial datagram has.
+fake_initial(DCID) ->
+    SCID = <<1, 2, 3, 4>>,
+    Packet = <<16#C0, 1:32, (byte_size(DCID)), DCID/binary, (byte_size(SCID)), SCID/binary>>,
+    <<Packet/binary, 0:((1200 - byte_size(Packet)) * 8)>>.
+
+await_handler_call(DCID) ->
+    receive
+        {conn, DCID, ConnPid} -> ConnPid
+    after 5000 -> error(handler_not_called)
+    end.
 
 %%====================================================================
 %% Connection Cleanup Tests

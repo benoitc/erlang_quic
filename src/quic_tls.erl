@@ -69,7 +69,7 @@
     verify_certificate_verify/4,
 
     %% TLS 1.3 External PSK (RFC 8446 §4.2.11)
-    select_psk/4,
+    select_psk/5,
     verify_resumption_binder/5,
     parse_extensions_ordered/1
 ]).
@@ -452,10 +452,20 @@ encode_alpn_list(Protocols) ->
         selected_group := atom() | undefined,
         cipher := atom(),
         random := binary(),
+        session_id := binary(),
+        extensions := map(),
         selected_psk_identity => non_neg_integer()
     }}
     | {hrr, #{cipher := atom(), selected_group := atom() | unknown, extensions := map()}}
     | {error, term()}.
+parse_server_hello(
+    <<_:16, _:32/binary, SessionIdLen:8, _:SessionIdLen/binary, CipherSuite:16, _/binary>>
+) when
+    CipherSuite =/= ?TLS_AES_128_GCM_SHA256,
+    CipherSuite =/= ?TLS_AES_256_GCM_SHA384,
+    CipherSuite =/= ?TLS_CHACHA20_POLY1305_SHA256
+->
+    {error, illegal_parameter};
 parse_server_hello(<<
     % legacy_version
     ?TLS_VERSION_1_2:16,
@@ -858,6 +868,8 @@ decode_tp_value(?TP_RETRY_SCID, Value) ->
     Value;
 decode_tp_value(?TP_DISABLE_ACTIVE_MIGRATION, <<>>) ->
     true;
+decode_tp_value(?TP_DISABLE_ACTIVE_MIGRATION, _) ->
+    error({transport_parameter_error, disable_active_migration_non_empty});
 decode_tp_value(?TP_RESET_STREAM_AT, <<>>) ->
     true;
 decode_tp_value(?TP_RESET_STREAM_AT, _) ->
@@ -916,7 +928,7 @@ decode_preferred_address(<<
     CIDLen:8,
     CID:CIDLen/binary,
     StatelessResetToken:16/binary
->>) when CIDLen > 0 ->
+>>) when CIDLen > 0, CIDLen =< 20 ->
     %% RFC 9000 Section 18.2: never a zero-length connection ID
     %% Parse IPv4 - zero address means not present
     {IPv4Addr, IPv4PortVal} =
@@ -1052,8 +1064,7 @@ parse_server_key_share(_) ->
 
 cipher_from_suite(?TLS_AES_128_GCM_SHA256) -> aes_128_gcm;
 cipher_from_suite(?TLS_AES_256_GCM_SHA384) -> aes_256_gcm;
-cipher_from_suite(?TLS_CHACHA20_POLY1305_SHA256) -> chacha20_poly1305;
-cipher_from_suite(_) -> aes_128_gcm.
+cipher_from_suite(?TLS_CHACHA20_POLY1305_SHA256) -> chacha20_poly1305.
 
 %% @private Encode a single psk_key_exchange_mode byte (RFC 8446 §4.2.9).
 encode_psk_mode(psk_ke) -> <<?PSK_KE_MODE_KE:8>>;
@@ -1461,10 +1472,12 @@ psk_binders_offset(OrderedExts, _ExtBlob) ->
 %% `FullHandshakeMsg' is the raw 4-byte-headered handshake bytes for
 %%   ClientHello (msg_type + length + body) — needed to compute the
 %%   truncated ClientHello hash for binder verification.
-%% `PskConfig' is `#{psk_callback => Fn | undefined,
-%%                   psks => Map | undefined}`.
+%% `Known' is what `quic_tls_negotiation:known_external_psk/2' found.
 %% `ServerModes' is the list of psk_key_exchange modes the server is
 %%   willing to negotiate (defaults to `[psk_dhe_ke]`).
+%% `Cipher' is the suite the server selected. An external PSK is
+%%   SHA-256 (RFC 9846 Section 4.3.11), so it is only taken with a
+%%   SHA-256 suite.
 %%
 %% Returns:
 %%   `{ok, #{identity_idx => N, secret => Secret, mode => Mode}}` on
@@ -1476,52 +1489,42 @@ psk_binders_offset(OrderedExts, _ExtBlob) ->
 %%   unknown_psk_identity);
 %%   `{error, bad_binder}` when an identity matched but the binder
 %%   didn't verify — caller MUST send decrypt_error (no cert fallback).
--spec select_psk(map(), binary(), map(), [psk_dhe_ke | psk_ke]) ->
+-spec select_psk(map(), binary(), {ok, map()} | none, [psk_dhe_ke | psk_ke], atom()) ->
     {ok, map()} | none | {error, bad_binder}.
-select_psk(#{pre_shared_key := undefined}, _FullMsg, _PskConfig, _ServerModes) ->
+select_psk(_CH, _FullMsg, none, _ServerModes, _Cipher) ->
     none;
-select_psk(#{pre_shared_key := #{identities := []}}, _FullMsg, _PskConfig, _ServerModes) ->
+select_psk(_CH, _FullMsg, _Known, _ServerModes, aes_256_gcm) ->
     none;
 select_psk(
     #{
-        pre_shared_key := #{identities := Identities, binders := Binders},
+        pre_shared_key := #{binders := Binders},
         psk_key_exchange_modes := ClientModes,
-        psk_binders := PskBindersInfo,
-        cipher_suites := CipherSuites
+        psk_binders := PskBindersInfo
     },
     FullHandshakeMsg,
-    PskConfig,
-    ServerModes
-) ->
+    {ok, #{identity_idx := Idx, secret := Secret} = Known},
+    ServerModes,
+    Cipher
+) when Idx < length(Binders) ->
     case mode_intersection(ClientModes, ServerModes) of
         [] ->
             none;
         [SelectedMode | _] ->
-            Cipher = select_cipher(CipherSuites),
             TruncatedHash = truncated_client_hello_hash(
                 FullHandshakeMsg, PskBindersInfo, Cipher
             ),
-            try_psk_identities(
-                Identities,
-                Binders,
-                0,
-                PskConfig,
-                SelectedMode,
-                Cipher,
-                TruncatedHash
-            )
+            Binder = lists:nth(Idx + 1, Binders),
+            case verify_psk_binder(Secret, Cipher, TruncatedHash, Binder) of
+                true -> {ok, Known#{mode => SelectedMode}};
+                %% A known identity with a bad binder is fatal, no cert fallback.
+                false -> {error, bad_binder}
+            end
     end;
-select_psk(_, _, _, _) ->
+select_psk(_, _, _, _, _) ->
     none.
 
 mode_intersection(Client, Server) ->
     [M || M <- Client, lists:member(M, Server)].
-
-select_cipher(CipherSuites) ->
-    case lists:member(?TLS_AES_128_GCM_SHA256, CipherSuites) of
-        true -> aes_128_gcm;
-        false -> aes_128_gcm
-    end.
 
 %% @private
 %% Slice the full handshake bytes down to the truncated ClientHello
@@ -1551,81 +1554,6 @@ extensions_offset_in_body(
         _Compression:CompressionLen/binary, _ExtLen:16, _/binary>>
 ) ->
     2 + 32 + 1 + SessionIdLen + 2 + CipherSuitesLen + 1 + CompressionLen + 2.
-
-try_psk_identities([], _Binders, _Idx, _PskConfig, _Mode, _Cipher, _TruncatedHash) ->
-    none;
-try_psk_identities(
-    [{Identity, _Age} | RestIds],
-    [Binder | RestBinders],
-    Idx,
-    PskConfig,
-    Mode,
-    Cipher,
-    TruncatedHash
-) ->
-    case lookup_psk_secret(Identity, PskConfig) of
-        {ok, Secret} ->
-            case verify_psk_binder(Secret, Cipher, TruncatedHash, Binder) of
-                true ->
-                    {ok, #{
-                        identity_idx => Idx,
-                        identity => Identity,
-                        secret => Secret,
-                        mode => Mode
-                    }};
-                false ->
-                    %% Identity matched but binder failed: per plan rule
-                    %% 3, this is fatal — no cert-path fallback.
-                    {error, bad_binder}
-            end;
-        not_found ->
-            try_psk_identities(
-                RestIds,
-                RestBinders,
-                Idx + 1,
-                PskConfig,
-                Mode,
-                Cipher,
-                TruncatedHash
-            )
-    end;
-try_psk_identities(_, _, _, _, _, _, _) ->
-    none.
-
-lookup_psk_secret(Identity, #{psk_callback := Fn} = Config) when is_function(Fn, 1) ->
-    case safe_callback(Fn, Identity) of
-        {ok, Secret} when is_binary(Secret) ->
-            {ok, Secret};
-        _ ->
-            lookup_in_psk_map(Identity, Config)
-    end;
-lookup_psk_secret(Identity, Config) ->
-    lookup_in_psk_map(Identity, Config).
-
-lookup_in_psk_map(Identity, #{psks := Map}) when is_map(Map) ->
-    case maps:find(Identity, Map) of
-        {ok, Secret} when is_binary(Secret) -> {ok, Secret};
-        _ -> not_found
-    end;
-lookup_in_psk_map(_Identity, _) ->
-    not_found.
-
-safe_callback(Fn, Identity) ->
-    try Fn(Identity) of
-        Result -> Result
-    catch
-        Class:Reason:Stack ->
-            logger:warning(
-                #{
-                    what => psk_callback_failed,
-                    class => Class,
-                    reason => Reason,
-                    stack => Stack
-                },
-                #{domain => [erlang_quic, tls]}
-            ),
-            not_found
-    end.
 
 verify_psk_binder(Secret, Cipher, TruncatedHash, OfferedBinder) ->
     EarlySecret = quic_crypto:derive_early_secret(Cipher, Secret),
