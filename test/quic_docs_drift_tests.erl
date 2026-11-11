@@ -25,6 +25,35 @@
 %% Checks
 %%====================================================================
 
+%% No merge-conflict marker survives in a doc or source file.
+no_conflict_markers_test() ->
+    Root = root(),
+    Patterns = [
+        "CHANGELOG.md",
+        "README.md",
+        "docs/**/*.md",
+        "src/**/*.erl",
+        "src/**/*.hrl",
+        "include/*.hrl",
+        "test/*.erl"
+    ],
+    Files = lists:usort(lists:append([filelib:wildcard(P, Root) || P <- Patterns])),
+    ?assert(length(Files) > 100),
+    %% Built at run time so this file does not match itself.
+    Markers = [lists:duplicate(7, C) ++ " " || C <- "<|>"],
+    Problems = [
+        fmt("~s:~p holds a merge-conflict marker", [File, N])
+     || File <- Files,
+        {N, Line} <- numbered_lines(filename:join(Root, File)),
+        lists:any(fun(M) -> lists:prefix(M, Line) end, Markers)
+    ],
+    ?assertEqual([], Problems).
+
+numbered_lines(Path) ->
+    {ok, Bin} = file:read_file(Path),
+    Lines = string:split(unicode:characters_to_list(Bin), "\n", all),
+    lists:zip(lists:seq(1, length(Lines)), Lines).
+
 %% Every option named in a docs table must be read somewhere in src/.
 option_names_exist_test() ->
     Root = root(),
