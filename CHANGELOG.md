@@ -66,6 +66,12 @@ All notable changes to this project will be documented in this file.
   `{error, status_101_forbidden}` (RFC 9114 Section 4.5).
 
 ### Fixed
+- On paths with a round-trip time under 8 ms, such as a LAN or loopback,
+  packets were declared lost as soon as one round trip had passed since
+  they were sent, instead of 9/8 of it, so packets that were only slightly
+  late were retransmitted and cut the congestion window. The time
+  threshold is now rounded up, never below 9/8 of the round-trip time
+  (RFC 9002 Section 6.1.2).
 - A write to a stream whose sending side had been reset, by the
   application, a stream deadline or the automatic answer to the peer's
   STOP_SENDING, was still sent, at or past the final size the reset had
