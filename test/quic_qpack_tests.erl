@@ -343,16 +343,19 @@ dynamic_large_insert_count_roundtrip_test() ->
             {ok, D1} = quic_qpack:process_encoder_instructions(
                 quic_qpack:get_encoder_instructions(E1), D
             ),
-            {quic_qpack:clear_encoder_instructions(E1), D1}
+            %% Acknowledged at once, so the oldest entries can be evicted.
+            {ok, E2} = quic_qpack:process_decoder_instructions(
+                quic_qpack:encode_insert_count_increment(1),
+                quic_qpack:clear_encoder_instructions(E1)
+            ),
+            {E2, D1}
         end,
         {E0, D0},
         lists:seq(0, 253)
     ),
-    {ok, Eack} = quic_qpack:process_decoder_instructions(
-        quic_qpack:encode_insert_count_increment(254), Ef
-    ),
+    ?assertEqual(254, quic_qpack:get_insert_count(Ef)),
     H = [{<<"h253">>, <<"v">>}],
-    {Ref, _E} = quic_qpack:encode(H, 999, Eack),
+    {Ref, _E} = quic_qpack:encode(H, 999, Ef),
     ?assertEqual({ok, H}, element(1, quic_qpack:decode(Ref, Df))).
 
 %%====================================================================
@@ -813,6 +816,61 @@ unacknowledged_streams_are_bounded_test() ->
     {ok, E5} = quic_qpack:process_decoder_instructions(quic_qpack:encode_section_ack(8), E1),
     {_, E6} = quic_qpack:encode(H, 400, E5),
     ?assertEqual(1, quic_qpack:get_last_ric(E6)).
+
+%%====================================================================
+%% Evictable entries (RFC 9204 §2.1.1)
+%%====================================================================
+
+%% Room for one entry: a second needs the first evicted.
+-define(ONE_ENTRY, 64).
+
+%% An entry an unacknowledged section refers to is not evicted: the new
+%% field goes as a literal and the peer can still decode that section.
+an_entry_referenced_by_a_pending_section_is_not_evicted_test() ->
+    A = {<<"x-a">>, <<"1">>},
+    B = {<<"x-b">>, <<"2">>},
+    {E1, D1} = acked_pair([A]),
+    {Ref, E2} = quic_qpack:encode([A], 4, E1),
+    ?assertEqual(1, quic_qpack:get_last_ric(E2)),
+    {_, E3} = quic_qpack:encode([B], 8, E2),
+    ?assertEqual(<<>>, quic_qpack:get_encoder_instructions(E3)),
+    {ok, D2} = quic_qpack:process_encoder_instructions(quic_qpack:get_encoder_instructions(E3), D1),
+    ?assertEqual({ok, [A]}, element(1, quic_qpack:decode(Ref, D2))),
+    %% Once the section is acknowledged the entry can go.
+    {ok, E4} = quic_qpack:process_decoder_instructions(quic_qpack:encode_section_ack(4), E3),
+    {_, E5} = quic_qpack:encode([B], 12, E4),
+    ?assertNotEqual(<<>>, quic_qpack:get_encoder_instructions(E5)).
+
+%% Nor one the section being encoded refers to.
+an_entry_the_section_refers_to_is_not_evicted_test() ->
+    A = {<<"x-a">>, <<"1">>},
+    B = {<<"x-b">>, <<"2">>},
+    {E1, D1} = acked_pair([A]),
+    {Ref, E2} = quic_qpack:encode([A, B], 4, E1),
+    {ok, D2} = quic_qpack:process_encoder_instructions(quic_qpack:get_encoder_instructions(E2), D1),
+    ?assertEqual({ok, [A, B]}, element(1, quic_qpack:decode(Ref, D2))).
+
+%% Nor one whose insertion the decoder has not acknowledged.
+an_unacknowledged_entry_is_not_evicted_test() ->
+    E0 = quic_qpack:new(#{max_dynamic_size => ?ONE_ENTRY}),
+    {_, E1} = quic_qpack:encode([{<<"x-a">>, <<"1">>}], 0, E0),
+    E2 = quic_qpack:clear_encoder_instructions(E1),
+    {_, E3} = quic_qpack:encode([{<<"x-b">>, <<"2">>}], 4, E2),
+    ?assertEqual(<<>>, quic_qpack:get_encoder_instructions(E3)),
+    ?assertEqual(1, quic_qpack:get_insert_count(E3)).
+
+%% An encoder with room for one entry holding Fields, acknowledged, and the
+%% decoder that received them.
+acked_pair(Fields) ->
+    E0 = quic_qpack:new(#{max_dynamic_size => ?ONE_ENTRY}),
+    D0 = quic_qpack:new(#{max_dynamic_size => ?ONE_ENTRY}),
+    {_, E1} = quic_qpack:encode(Fields, 0, E0),
+    {ok, D1} = quic_qpack:process_encoder_instructions(quic_qpack:get_encoder_instructions(E1), D0),
+    {ok, E2} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(length(Fields)),
+        quic_qpack:clear_encoder_instructions(E1)
+    ),
+    {E2, D1}.
 
 %% An encoder whose dynamic table holds H, acknowledged by the decoder.
 encoder_with_acked_entry(H) ->

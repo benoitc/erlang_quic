@@ -4413,8 +4413,17 @@ a_peer_reset_stream_keeps_its_sections_until_the_peer_cancels_test() ->
         0, ?H3_REQUEST_CANCELLED, dynamic_response()
     ),
     ?assert(has_outstanding_sections(0, State)),
+    ?assertNot(can_make_room(State)),
     {ok, State1} = peer_decoder_says(quic_qpack:encode_stream_cancel(0), State),
-    ?assertNot(has_outstanding_sections(0, State1)).
+    ?assertNot(has_outstanding_sections(0, State1)),
+    ?assert(can_make_room(State1)).
+
+%% Whether the encoder would evict its one entry to insert a field filling
+%% the table.
+can_make_room(State) ->
+    Big = {<<"x-big">>, binary:copy(<<"b">>, 4096 - 5 - 32)},
+    {_, Encoder} = quic_qpack:encode([Big], 100, element(13, State)),
+    quic_qpack:get_encoder_instructions(Encoder) =/= <<>>.
 
 %% The same holds for a push stream, ended by its FIN or reset after the
 %% client's CANCEL_PUSH.
