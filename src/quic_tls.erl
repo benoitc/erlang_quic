@@ -452,6 +452,8 @@ encode_alpn_list(Protocols) ->
         selected_group := atom() | undefined,
         cipher := atom(),
         random := binary(),
+        session_id := binary(),
+        extensions := map(),
         selected_psk_identity => non_neg_integer()
     }}
     | {hrr, #{cipher := atom(), selected_group := atom() | unknown, extensions := map()}}
