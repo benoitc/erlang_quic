@@ -84,7 +84,7 @@
 %% Constants from RFC 9002
 -define(PACKET_THRESHOLD, 3).
 % 9/8
-%% Time threshold as a shift: RTT + RTT bsr Shift, 3 being 9/8. A
+%% Time threshold as a shift: RTT plus RTT / 2^Shift rounded up, 3 being 9/8. A
 %% spurious time-based loss moves it to 2, 5/4 (as Chromium does).
 -define(TIME_SHIFT, 3).
 -define(MIN_TIME_SHIFT, 2).
@@ -672,7 +672,11 @@ detect_lost_q(
 %% both thresholds as reordering has adapted them.
 thresholds(#pn_loss{reorder_threshold = PT, time_shift = Shift}, State) ->
     RTT = loss_delay_rtt(State),
-    {max(RTT + (RTT bsr Shift), ?GRANULARITY), PT}.
+    {max(RTT + ceil_shift(RTT, Shift), ?GRANULARITY), PT}.
+
+%% RTT / 2^Shift rounded up, so the threshold never drops below 9/8 (or 5/4) of the RTT.
+ceil_shift(RTT, Shift) ->
+    (RTT + (1 bsl Shift) - 1) bsr Shift.
 
 %% Remember the ack-eliciting packets just declared lost, so a late
 %% acknowledgement can show the loss was spurious. A loss after the

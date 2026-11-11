@@ -226,8 +226,8 @@ get_loss_time_with_packets_test() ->
     S1 = quic_loss:on_packet_sent(app, quic_loss:new(), 0, 100, true, [], T0),
     S2 = quic_loss:on_packet_sent(app, S1, 1, 100, true, [], T0),
     {S3, _Acked, [], _Meta} = quic_loss:on_ack_received(app, S2, {ack, 1, 0, 0, []}, T0 + 10),
-    %% First RTT sample: 10ms, so the loss delay is trunc(1.125 * 10).
-    ?assertEqual({T0 + 11, app}, quic_loss:get_loss_time_and_space(S3)).
+    %% First RTT sample: 10ms, so the loss delay is 11.25 ms, reached at 12.
+    ?assertEqual({T0 + 12, app}, quic_loss:get_loss_time_and_space(S3)).
 
 %%====================================================================
 %% Integration Tests
@@ -422,8 +422,7 @@ stream_has_unacked_below_ignores_non_stream_test() ->
 %% Reordering: spurious losses and adaptive thresholds
 %%====================================================================
 
-%% One send time for the whole burst, so a slow runner crossing a
-%% millisecond cannot make the time threshold declare part of it lost.
+%% One send time for the whole burst, so its packets differ only by number.
 sent(State, PNs) ->
     T = erlang:monotonic_time(millisecond),
     lists:foldl(
@@ -431,6 +430,33 @@ sent(State, PNs) ->
     ).
 
 pns(Packets) -> lists:sort([P#sent_packet.pn || P <- Packets]).
+
+%% RFC 9002 Section 6.1.2: a packet is lost by time once 9/8 of the RTT has
+%% passed since it was sent. At an RTT under 8 ms that is still more than the
+%% RTT, so a packet sent with the one acknowledged is not lost.
+time_threshold_is_never_below_nine_eighths_test_() ->
+    [
+        {integer_to_list(R) ++ " ms", fun() -> ?assertEqual({[], [0]}, time_losses(R, 0)) end}
+     || R <- lists:seq(1, 16)
+    ].
+
+%% The same packet sent earlier, by the RTT / 8 rounded up, is lost by time.
+time_threshold_declares_past_nine_eighths_test_() ->
+    [
+        {integer_to_list(R) ++ " ms", fun() ->
+            ?assertEqual({[0], []}, time_losses(R, (R + 7) div 8))
+        end}
+     || R <- lists:seq(1, 16)
+    ].
+
+%% Send 0 at T0, 1 at T0 + Gap, acknowledge 1 an RTT later; return {lost, kept} of 0.
+time_losses(RTT, Gap) ->
+    T0 = erlang:monotonic_time(millisecond),
+    S0 = quic_loss:on_packet_sent(app, quic_loss:new(), 0, 1000, true, [], T0),
+    S1 = quic_loss:on_packet_sent(app, S0, 1, 1000, true, [], T0 + Gap),
+    {S2, _, Lost, _} = quic_loss:on_ack_received(app, S1, {ack, 1, 0, 0, []}, T0 + Gap + RTT),
+    Kept = [PN || PN <- maps:keys(quic_loss:sent_packets(app, S2)), PN =:= 0],
+    {pns(Lost), Kept}.
 
 %% 0..2 are declared lost by the packet threshold when 5 is acked alone,
 %% then acknowledged: the episode was reordering, the window cut can be

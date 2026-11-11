@@ -56,7 +56,7 @@ applied_delay(State) ->
     LossTime - ?SENT_AT.
 
 expected_delay(Rtt) ->
-    max(trunc(?TIME_THRESHOLD * Rtt), ?GRANULARITY).
+    max(ceil(?TIME_THRESHOLD * Rtt), ?GRANULARITY).
 
 %%====================================================================
 %% RTT bookkeeping these tests depend on
