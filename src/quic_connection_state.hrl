@@ -267,6 +267,8 @@
     %% HelloRetryRequest bookkeeping
     hrr_sent = false :: boolean(),
     hrr_group :: atom() | undefined,
+    %% Client: the HelloRetryRequest's suite, which the ServerHello must repeat
+    hrr_cipher :: atom() | undefined,
     %% Outgoing Initial-level CRYPTO stream offset. Stays 0 for a
     %% one-shot flight; bumps after HRR so CH2 / ServerHello continue
     %% the stream (RFC 9001 §4.1.3).

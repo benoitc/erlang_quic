@@ -7339,6 +7339,13 @@ process_tls_message(
                 true ->
                     ok
             end,
+            case server_hello_suite_fits(Cipher, ServerHelloMap, State#state.hs) of
+                false ->
+                    notify_owner({error, {tls_alert, illegal_parameter}}, State),
+                    alert_and_exit(?TLS_ALERT_ILLEGAL_PARAMETER, State, illegal_parameter);
+                true ->
+                    ok
+            end,
             %% Determine handshake type: PSK (with or without DHE) vs
             %% standard cert-auth. PSK selection is signalled by the
             %% `selected_psk_identity' extension echoed in ServerHello.
@@ -8372,6 +8379,14 @@ send_hello_retry_request(SelectedGroup, Cipher, SessionId, OriginalMsg, State) -
     },
     send_initial_packet(quic_frame:encode({crypto, 0, HRR}), [{crypto, 0, HRR}], State1).
 
+%% Client: the ServerHello repeats the HelloRetryRequest's suite (RFC 9846 §4.2.4).
+server_hello_suite_fits(Cipher, _ServerHello, #hs{hrr_cipher = HrrCipher}) when
+    HrrCipher =/= undefined, HrrCipher =/= Cipher
+->
+    false;
+server_hello_suite_fits(_Cipher, _ServerHello, _HS) ->
+    true.
+
 %% @private Client-side HelloRetryRequest handling (RFC 8446 §4.1.4).
 %% Validates the one-HRR and group rules, rebuilds CH2 reusing CH1's
 %% random + session_id, and rewrites the transcript to the synthetic
@@ -8422,6 +8437,7 @@ handle_hello_retry_request(
                 hs = (State#state.hs)#hs{
                     hrr_sent = true,
                     hrr_group = SelGroup,
+                    hrr_cipher = Cipher,
                     tls_group = SelGroup,
                     tls_private_key = PrivKey,
                     tls_transcript = Transcript,
