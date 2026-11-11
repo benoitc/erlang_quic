@@ -1083,7 +1083,7 @@ handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) -
             ),
             route_to_connection(DCID, Packet, RemoteAddr, State);
         {error, Reason} ->
-            ?LOG_WARNING(#{what => packet_parse_failed, reason => Reason}, ?QUIC_LOG_META),
+            ?LOG_DEBUG(#{what => packet_parse_failed, reason => Reason}, ?QUIC_LOG_META),
             ok
     end.
 

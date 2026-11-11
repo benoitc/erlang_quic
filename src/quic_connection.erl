@@ -5014,10 +5014,11 @@ handle_packet_loop(Data, State) ->
         {error, Reason} when
             Reason =:= padding_only;
             Reason =:= empty_packet;
-            Reason =:= invalid_fixed_bit
+            Reason =:= invalid_fixed_bit;
+            Reason =:= cid_too_long;
+            Reason =:= retry_scid_is_our_dcid
         ->
-            %% End of coalesced packets (padding or invalid trailing data)
-            %% This is normal, just re-enable socket and return
+            %% Trailing padding, or a packet the spec says to drop.
             maybe_reenable_socket(State),
             replay_early_packets(State);
         {error, no_app_keys} ->
