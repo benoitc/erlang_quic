@@ -83,9 +83,9 @@ new_loss_after_recovery_test() ->
     Cwnd3 = quic_cc:cwnd(S3),
     ?assert(Cwnd3 >= Cwnd1).
 
-%% RFC 9002 §7.3.1: the recovery period starts when the reduction is made,
-%% so a packet sent after that and lost later cuts the window again, also
-%% once recovery has been left.
+%% RFC 9002 §7.3.2 and Appendix B.6: the recovery period starts when the
+%% reduction is made, so a packet sent after that and lost later cuts the
+%% window again, also once recovery has been left.
 loss_sent_during_recovery_after_exit_test_() ->
     [
         {atom_to_list(A), fun() -> loss_sent_during_recovery_after_exit(A) end}

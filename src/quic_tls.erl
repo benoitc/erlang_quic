@@ -1475,7 +1475,7 @@ psk_binders_offset(OrderedExts, _ExtBlob) ->
 %% `ServerModes' is the list of psk_key_exchange modes the server is
 %%   willing to negotiate (defaults to `[psk_dhe_ke]`).
 %% `Cipher' is the suite the server selected. An external PSK is
-%%   SHA-256 (RFC 8446 Section 4.2.11), so it is only taken with a
+%%   SHA-256 (RFC 9846 Section 4.3.11), so it is only taken with a
 %%   SHA-256 suite.
 %%
 %% Returns:

@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
-%%% A cipher suite is only used when both sides allow it (RFC 8446
-%%% Section 4.1.1), never taken as a default when they do not.
+%%% A cipher suite is only used when both sides allow it (RFC 9846
+%%% Section 4.2.1), never taken as a default when they do not.
 
 -module(quic_cipher_suite_fallback_tests).
 
@@ -34,7 +34,7 @@ server_without_a_common_suite_aborts_test() ->
     }),
     ?assertEqual({tls_alert, ?TLS_ALERT_HANDSHAKE_FAILURE}, S#state.close_reason).
 
-%% RFC 8446 Section 4.1.4: a HelloRetryRequest is checked like a
+%% RFC 9846 Section 4.2.4: a HelloRetryRequest is checked like a
 %% ServerHello, before its suite is used for the transcript.
 hello_retry_request_with_a_suite_not_offered_test() ->
     HRR = quic_tls:build_hello_retry_request(<<>>, ?TLS_AES_256_GCM_SHA384, x25519),
@@ -56,7 +56,7 @@ hello_retry_request_with_a_suite_not_offered_test() ->
     }),
     ?assertEqual({tls_alert, ?TLS_ALERT_ILLEGAL_PARAMETER}, S#state.close_reason).
 
-%% An external PSK is SHA-256 (RFC 8446 Section 4.2.11), so it goes with a
+%% An external PSK is SHA-256 (RFC 9846 Section 4.3.11), so it goes with a
 %% suite of that hash and not with the one the binder was checked by.
 external_psk_needs_a_sha256_suite_test() ->
     {CH, _, _} = quic_tls:build_client_hello(#{
