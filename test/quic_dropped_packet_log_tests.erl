@@ -1,7 +1,8 @@
 %%% -*- erlang -*-
 %%%
 %%% Packets the spec says to drop (RFC 9000 Sections 17.2 and 17.2.5.1)
-%%% are dropped without a warning.
+%%% are dropped without a warning, and the warning for a packet that
+%%% fails to decrypt carries no stateless reset token.
 
 -module(quic_dropped_packet_log_tests).
 
@@ -36,6 +37,21 @@ undecryptable_packet_still_warns_test() ->
     S0 = client(),
     _ = captured(fun() -> handle(<<16#41, ?SCID/binary, 0:(40 * 8)>>, S0) end),
     ?assertMatch([packet_decode_decrypt_failed], warnings()).
+
+decrypt_warning_names_peer_cids_without_reset_tokens_test() ->
+    Token = binary:copy(<<16#AB>>, 16),
+    S0 = (client())#state{
+        cid_pool_state = quic_cid:set_initial_peer_cid(quic_cid:new(?SCID, 2), ?ODCID, Token)
+    },
+    _ = captured(fun() -> handle(<<16#41, ?SCID/binary, 0:(40 * 8)>>, S0) end),
+    receive
+        {logged, warning, packet_decode_decrypt_failed, R} ->
+            Text = lists:flatten(io_lib:format("~p", [R])),
+            ?assertEqual(nomatch, string:find(Text, quic_connection:binhex(Token))),
+            ?assertEqual([{0, quic_connection:binhex(?ODCID)}], maps:get(peer_cids, R))
+    after 0 ->
+        ?assert(false)
+    end.
 
 listener_logs_unparsable_packet_at_debug_test() ->
     Opts = #{cert => <<"cert">>, key => crypto:strong_rand_bytes(32), alpn => [<<"h3">>]},

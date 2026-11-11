@@ -5016,12 +5016,8 @@ handle_packet_loop(Data, State) ->
                     source => State#state.current_packet_source,
                     scid => binhex((State#state.cfg)#conn_cfg.scid),
                     dcid => binhex(State#state.dcid),
-                    known_reset_tokens => [
-                        {
-                            E#cid_entry.seq_num,
-                            binhex(E#cid_entry.cid),
-                            binhex(E#cid_entry.stateless_reset_token)
-                        }
+                    peer_cids => [
+                        {E#cid_entry.seq_num, binhex(E#cid_entry.cid)}
                      || E <- quic_cid:peer_entries(State#state.cid_pool_state)
                     ],
                     head => binhex(binary:part(Data, 0, min(16, byte_size(Data)))),
