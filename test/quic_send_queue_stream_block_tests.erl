@@ -141,6 +141,40 @@ reset_drops_parked_entries_test() ->
     ?assertEqual([{4, 0, ?SIZE}], ?S:queued_entries(S2)),
     ?assertEqual({?SIZE, 1}, {S2#state.send_queue_bytes, S2#state.send_queue_count}).
 
+%% Entries a new limit admits go out after the stream's data that
+%% connection credit held back, never ahead of it.
+admitted_entries_follow_data_held_by_connection_credit_test() ->
+    Offsets = [0, ?SIZE, 2 * ?SIZE, 3 * ?SIZE, 4 * ?SIZE],
+    S0 = queue([{0, O} || O <- Offsets], ?S:state_with_send_windows([{0, 3, 0}], 500)),
+    S1 = quic_connection:process_send_queue(S0),
+    S2 = quic_connection:process_frame(app, {max_stream_data, 0, 2 * ?SIZE}, S1),
+    ?assertEqual(500, highest(S2)),
+    S3 = quic_connection:process_frame(app, {max_stream_data, 0, 5 * ?SIZE}, S2),
+    S4 = quic_connection:process_frame(app, {max_data, 2 * ?SIZE}, S3),
+    ?assertEqual(2 * ?SIZE, highest(S4)),
+    ?assertEqual(
+        [{0, 2 * ?SIZE, ?SIZE}, {0, 3 * ?SIZE, ?SIZE}, {0, 4 * ?SIZE, ?SIZE}],
+        ?S:queued_entries(S4)
+    ),
+    S5 = quic_connection:process_frame(app, {max_data, 5 * ?SIZE}, S4),
+    ?assertEqual({5 * ?SIZE, []}, {highest(S5), ?S:queued_entries(S5)}).
+
+%% A write while the stream has parked data waits behind that data.
+a_write_while_parked_waits_behind_the_parked_data_test() ->
+    S0 = queue([{0, 0}, {0, ?SIZE}], ?S:state_with_send_windows([{0, 3, 0}], 0)),
+    S1 = queue([{0, 2 * ?SIZE}], quic_connection:process_send_queue(S0)),
+    ?assertEqual(
+        [{0, 0, ?SIZE}, {0, ?SIZE, ?SIZE}, {0, 2 * ?SIZE, ?SIZE}], ?S:parked_entries(S1)
+    ),
+
+    S2 = quic_connection:process_frame(app, {max_stream_data, 0, 3 * ?SIZE}, S1),
+    S3 = quic_connection:process_frame(app, {max_data, ?SIZE}, S2),
+    ?assertEqual(?SIZE, highest(S3)),
+    S4 = quic_connection:process_frame(app, {max_data, 3 * ?SIZE}, S3),
+    ?assertEqual({3 * ?SIZE, []}, {highest(S4), ?S:queued_entries(S4)}).
+
+highest(#state{streams = #{0 := #stream_state{send_highest = Highest}}}) -> Highest.
+
 queue(Entries, State) ->
     lists:foldl(
         fun({StreamId, Offset}, S) ->

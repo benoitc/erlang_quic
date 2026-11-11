@@ -11635,13 +11635,17 @@ queue_stream_data(
     Urgency = get_stream_urgency(StreamId, Streams),
     %% Cache DataSize in entry to avoid repeated iolist_size calls
     Entry = {stream_data, StreamId, Offset, DataBin, Fin, DataSize},
-    NewPQ =
-        case Where of
-            back -> quic_pqueue:in(Entry, Urgency, PQ);
-            front -> quic_pqueue:in_front(Entry, Urgency, PQ)
+    State1 =
+        case {Where, State#state.send_parked} of
+            {back, #{StreamId := Q} = Parked} ->
+                %% Behind data already parked, so it waits there too.
+                State#state{send_parked = Parked#{StreamId := queue:in(Entry, Q)}};
+            {back, _} ->
+                State#state{send_queue = quic_pqueue:in(Entry, Urgency, PQ)};
+            {front, _} ->
+                State#state{send_queue = quic_pqueue:in_front(Entry, Urgency, PQ)}
         end,
-    State#state{
-        send_queue = NewPQ,
+    State1#state{
         send_queue_bytes = QueueBytes + DataSize,
         send_queue_count = QueueCount + 1,
         send_queue_version = Version + 1
@@ -11726,16 +11730,17 @@ park_entry({_, _, Offset, _, _, _} = Entry, Q) ->
         _ -> queue:in(Entry, Q)
     end.
 
-%% Parked entries the new limit has room for go back to the bucket front.
+%% Parked entries the new limit has room for go back behind the stream's
+%% queued ones, which all have lower offsets.
 unpark_stream(StreamId, Max, #state{send_parked = Parked} = State) ->
     case Parked of
         #{StreamId := Q} ->
             {Ready, Rest} = split_parked(Q, Max, []),
             Urgency = get_stream_urgency(StreamId, State#state.streams),
             PQ = lists:foldl(
-                fun(E, Acc) -> quic_pqueue:in_front(E, Urgency, Acc) end,
+                fun(E, Acc) -> quic_pqueue:in(E, Urgency, Acc) end,
                 State#state.send_queue,
-                Ready
+                lists:reverse(Ready)
             ),
             Parked1 =
                 case queue:is_empty(Rest) of
