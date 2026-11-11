@@ -2825,12 +2825,7 @@ handle_request_stream_data(
 %% count against max_buffered_body.
 hold_behind_blocked(StreamId, Held, Fin, Stream, State) ->
     #state{blocked_streams = Blocked, stream_buffers = Buffers} = State,
-    Others = maps:fold(
-        fun(Id, _Entry, Sum) -> Sum + byte_size(maps:get(Id, Buffers, <<>>)) end,
-        0,
-        maps:remove(StreamId, Blocked)
-    ),
-    Total = State#state.buffered_bytes + Others + byte_size(Held),
+    Total = State#state.buffered_bytes + held_behind_blocked(StreamId, State) + byte_size(Held),
     case Total > State#state.max_buffered_body of
         true ->
             {Closed, State1} = fail_request_stream(
@@ -2853,6 +2848,17 @@ hold_behind_blocked(StreamId, Held, Fin, Stream, State) ->
             Stream1 = report_overhead(StreamId, Stream, State1),
             State1#state{streams = (State1#state.streams)#{StreamId => Stream1}}
     end.
+
+%% Bytes kept behind blocked HEADERS on streams other than StreamId.
+held_behind_blocked(StreamId, #state{blocked_streams = Blocked, stream_buffers = Buffers}) ->
+    maps:fold(
+        fun
+            (Id, _Entry, Sum) when Id =:= StreamId -> Sum;
+            (Id, _Entry, Sum) -> Sum + byte_size(maps:get(Id, Buffers, <<>>))
+        end,
+        0,
+        Blocked
+    ).
 
 %% The stream's FIN arrived after the last complete frame. If the body
 %% was already closed by a fin-marked frame delivery this is a no-op;
@@ -4688,7 +4694,8 @@ body_fits(StreamId, Payload, #state{role = server} = State) ->
         true ->
             true;
         false ->
-            State#state.buffered_bytes + charge(Payload) =< State#state.max_buffered_body
+            Held = State#state.buffered_bytes + held_behind_blocked(StreamId, State),
+            Held + charge(Payload) =< State#state.max_buffered_body
     end;
 body_fits(_StreamId, _Payload, _State) ->
     true.

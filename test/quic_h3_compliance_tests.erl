@@ -4080,6 +4080,27 @@ content_behind_blocked_headers_is_bounded_test() ->
     ?assertEqual(#{}, element(28, State2)),
     ?assertEqual(#{}, element(24, State2)).
 
+%% The same budget covers a body buffered for a handler: bytes held behind
+%% another stream's blocked HEADERS count against it.
+a_body_and_content_behind_blocked_headers_share_the_budget_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = blocking_state(#{
+        quic_conn => Quic, local_max_blocked_streams => 1, max_buffered_body => 300
+    }),
+    Held = quic_h3_frame:encode_data(binary:copy(<<"h">>, 200)),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        4, <<(blocked_request(1))/binary, Held/binary>>, false, State0
+    ),
+    ?assertEqual(nothing, next_owner_event()),
+    Body = quic_h3_frame:encode_data(binary:copy(<<"b">>, 100)),
+    {ok, _} = quic_h3_connection:handle_stream_data(
+        0, <<(request_frame(<<"POST">>, <<"/">>))/binary, Body/binary>>, false, State1
+    ),
+    ?assertMatch({request, 0, <<"POST">>, <<"/">>, _}, next_owner_event()),
+    ?assertEqual({stream_reset, 0, ?H3_EXCESSIVE_LOAD}, next_owner_event()),
+    ?assert(lists:member({close_stream, 0, ?H3_EXCESSIVE_LOAD}, fake_quic_calls(Quic))).
+
 %%====================================================================
 %% A blocked stream that is reset (RFC 9204 §4.4.2)
 %%====================================================================
