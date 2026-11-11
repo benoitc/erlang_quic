@@ -4196,6 +4196,58 @@ a_blocked_request_is_dispatched_once_unblocked_test() ->
     ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()).
 
 %%====================================================================
+%% Content-Length in a 2xx response to CONNECT (RFC 9110 §9.3.6)
+%%====================================================================
+
+%% The client ignores it: a tunnel may carry more or fewer bytes.
+a_connect_response_content_length_is_ignored_test() ->
+    lists:foreach(
+        fun({Body, Fin}) ->
+            flush_mailbox(),
+            State = connect_response_state(<<"CONNECT">>, <<"200">>),
+            Data = quic_h3_frame:encode_data(Body),
+            {ok, _} = quic_h3_connection:handle_stream_data(0, Data, Fin, State),
+            Events = owner_events(),
+            ?assertEqual([], [E || {stream_reset, _, _} = E <- Events]),
+            ?assert(lists:keymember(data, 1, Events))
+        end,
+        [{<<"0123456789">>, false}, {<<"0">>, true}]
+    ).
+
+%% Outside a 2xx to CONNECT it still bounds the content.
+a_content_length_still_bounds_other_responses_test() ->
+    lists:foreach(
+        fun({Method, Status}) ->
+            flush_mailbox(),
+            State = connect_response_state(Method, Status),
+            Data = quic_h3_frame:encode_data(<<"0123456789">>),
+            {ok, _} = quic_h3_connection:handle_stream_data(0, Data, false, State),
+            ?assert(lists:member({stream_reset, 0, ?H3_MESSAGE_ERROR}, owner_events()))
+        end,
+        [{<<"GET">>, <<"200">>}, {<<"CONNECT">>, <<"407">>}]
+    ).
+
+%% A client whose Method request on stream 0 got Status with
+%% content-length: 2.
+connect_response_state(Method, Status) ->
+    Stream = #h3_stream{
+        id = 0,
+        type = request,
+        state = half_closed_local,
+        frame_state = expecting_headers,
+        method = Method,
+        is_connect = (Method =:= <<"CONNECT">>)
+    },
+    State0 = make_test_state(#{
+        role => client, quic_conn => fake_quic_conn(), streams => #{0 => Stream}
+    }),
+    Response = quic_h3_frame:encode_headers(
+        quic_qpack:encode([{<<":status">>, Status}, {<<"content-length">>, <<"2">>}])
+    ),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, Response, false, State0),
+    State1.
+
+%%====================================================================
 %% HTTP datagrams on a stream this side reset (RFC 9297 §2.1)
 %%====================================================================
 

@@ -3485,13 +3485,24 @@ update_stream_with_headers(Headers, Stream, Role, State) ->
         ),
         %% Validate pseudo-headers based on role
         case Role of
-            server -> validate_request_headers(Stream1, State);
-            client -> validate_response_headers(Stream1, Headers)
-        end,
-        {ok, Stream1}
+            server ->
+                validate_request_headers(Stream1, State),
+                {ok, Stream1};
+            client ->
+                validate_response_headers(Stream1, Headers),
+                {ok, ignore_tunnel_length(Stream1)}
+        end
     catch
         throw:{header_error, Reason} -> {error, Reason}
     end.
+
+%% RFC 9110 Section 9.3.6: a client ignores Content-Length in a 2xx to CONNECT.
+ignore_tunnel_length(#h3_stream{is_connect = true, status = S} = Stream) when
+    is_integer(S), S >= 200, S < 300
+->
+    Stream#h3_stream{content_length = undefined};
+ignore_tunnel_length(Stream) ->
+    Stream.
 
 %% RFC 9114 Section 4.2 / RFC 9110 Section 5.1: validate field names and values.
 %% Detect uppercase names, invalid characters, and reject connection-specific
