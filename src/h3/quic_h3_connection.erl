@@ -4291,6 +4291,9 @@ do_send_response(
 ) when not is_integer(Status); Status < 100; Status > 599 ->
     %% RFC 9114 §4.3.2: :status must be a valid HTTP status code.
     {error, {invalid_status, Status}};
+do_send_response(_StreamId, 101, _Headers, _State) ->
+    %% RFC 9114 Section 4.5: HTTP/3 has no 101 (Switching Protocols).
+    {error, status_101_forbidden};
 do_send_response(
     StreamId,
     Status,
@@ -5007,6 +5010,9 @@ do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, {PushId, Method}, Push
     end.
 
 %% Send response headers on a push stream
+do_send_push_response(_PushId, 101, _Headers, _State) ->
+    %% RFC 9114 Section 4.5: HTTP/3 has no 101 (Switching Protocols).
+    {error, status_101_forbidden};
 do_send_push_response(
     PushId,
     Status,

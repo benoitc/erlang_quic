@@ -561,6 +561,33 @@ no_content_ended_stream_reset_is_unknown_test() ->
         quic_h3_connection:do_send_trailers(0, [{<<"x">>, <<"1">>}], State2)
     ).
 
+%% RFC 9114 Section 4.5: HTTP/3 has no 101, whichever call would send it.
+status_101_is_refused_test() ->
+    Quic = fake_quic_conn(),
+    Stream = #h3_stream{id = 0, type = request, state = open, method = <<"GET">>},
+    Push = #h3_stream{id = 3, type = push, state = open, method = <<"GET">>},
+    State = make_test_state(#{
+        role => server,
+        quic_conn => Quic,
+        streams => #{0 => Stream},
+        push_streams => #{0 => {3, Push}}
+    }),
+    Upgrade = [{<<"upgrade">>, <<"websocket">>}],
+    ?assertEqual(
+        {error, status_101_forbidden}, quic_h3_connection:do_respond(0, 101, Upgrade, <<>>, State)
+    ),
+    lists:foreach(
+        fun(Call) ->
+            From = {self(), make_ref()},
+            ?assertEqual(
+                {keep_state_and_data, [{reply, From, {error, status_101_forbidden}}]},
+                quic_h3_connection:connected({call, From}, Call, State)
+            )
+        end,
+        [{send_response, 0, 101, Upgrade}, {send_push_response, 0, 101, Upgrade}]
+    ),
+    ?assertEqual([], fake_quic_calls(Quic)).
+
 respond_invalid_status_test() ->
     {Result, Sends} = respond_capture(700, [], <<"hello">>, <<"GET">>),
     ?assertEqual({error, {invalid_status, 700}}, Result),
