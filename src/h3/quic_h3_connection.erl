@@ -3454,7 +3454,8 @@ finalize_stream_state(Stream, true, _Role) ->
 finalize_stream_state(#h3_stream{status = Status} = Stream, false, client) when
     is_integer(Status), Status >= 100, Status < 200
 ->
-    Stream#h3_stream{frame_state = expecting_headers};
+    %% RFC 9110 Section 15.2: a 1xx says nothing of the final response's content.
+    Stream#h3_stream{frame_state = expecting_headers, content_length = undefined};
 finalize_stream_state(Stream, false, _Role) ->
     Stream#h3_stream{frame_state = expecting_data}.
 

@@ -4860,6 +4860,30 @@ empty_data_on_a_no_content_response_is_accepted_test() ->
     ?assertMatch([{response, 0, 204, _}, {data, 0, <<>>, true}], owner_events()),
     ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic))).
 
+%% RFC 9110 Section 15.2: a Content-Length on a 1xx is not the final
+%% response's, whether the final response has its own or none.
+interim_content_length_does_not_carry_over_test() ->
+    lists:foreach(
+        fun(FinalFields) ->
+            flush_owner_events(),
+            Quic = fake_quic_conn(),
+            Response = <<
+                (response_frame(103, [{<<"content-length">>, <<"5">>}]))/binary,
+                (response_frame(200, FinalFields))/binary,
+                (quic_h3_frame:encode_data(<<"ok">>))/binary
+            >>,
+            {ok, _} = quic_h3_connection:handle_stream_data(
+                0, Response, true, client_request_state(Quic, <<"GET">>)
+            ),
+            ?assertMatch(
+                [{response, 0, 103, _}, {response, 0, 200, _}, {data, 0, <<"ok">>, true}],
+                owner_events()
+            ),
+            ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic)))
+        end,
+        [[], [{<<"content-length">>, <<"2">>}]]
+    ).
+
 %% A client that sent a request on stream 0 and waits for the response.
 client_request_state(Quic, Method) ->
     Stream = #h3_stream{
