@@ -287,6 +287,58 @@ push_stream_in_one_delivery_completes_test() ->
         [[{Push, true}], [{Head, false}, {Tail, true}]]
     ).
 
+%% RFC 9114 Section 4.1: the pushed response ends at the FIN wherever it
+%% arrives, after trailers or after the last DATA frame.
+push_completes_at_a_later_fin_test() ->
+    Head =
+        <<1, 5,
+            (quic_h3_frame:encode_headers(quic_qpack:encode([{<<":status">>, <<"200">>}])))/binary>>,
+    Data = quic_h3_frame:encode_data(<<"abc">>),
+    Trailers = quic_h3_frame:encode_headers(quic_qpack:encode([{<<"x-sum">>, <<"1">>}])),
+    lists:foreach(
+        fun({Body, Expected}) ->
+            _ = push_events(),
+            {ok, State1} = quic_h3_connection:handle_stream_data(
+                3, <<Head/binary, Data/binary, Body/binary>>, false, push_client_state()
+            ),
+            ?assertNotEqual(#{}, element(39, State1)),
+            {ok, State2} = quic_h3_connection:handle_stream_data(3, <<>>, true, State1),
+            Events = push_events(),
+            ?assertEqual(Expected, [E || E <- Events, element(1, E) =:= push_trailers]),
+            ?assert(lists:member({push_complete, 5}, Events)),
+            %% received_pushes is at position 39
+            ?assertEqual(#{}, element(39, State2))
+        end,
+        [{Trailers, [{push_trailers, 5, [{<<"x-sum">>, <<"1">>}]}]}, {<<>>, []}]
+    ).
+
+%% Nothing but the FIN may follow push trailers.
+frames_after_push_trailers_are_frame_unexpected_test() ->
+    Head =
+        <<1, 5,
+            (quic_h3_frame:encode_headers(quic_qpack:encode([{<<":status">>, <<"200">>}])))/binary>>,
+    Trailers = quic_h3_frame:encode_headers(quic_qpack:encode([{<<"x-sum">>, <<"1">>}])),
+    lists:foreach(
+        fun(Next) ->
+            {ok, State1} = quic_h3_connection:handle_stream_data(
+                3, <<Head/binary, Trailers/binary>>, false, push_client_state()
+            ),
+            ?assertMatch(
+                {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}, _},
+                quic_h3_connection:handle_stream_data(3, Next, false, State1)
+            )
+        end,
+        [Trailers, quic_h3_frame:encode_data(<<"x">>)]
+    ),
+    _ = push_events().
+
+push_client_state() ->
+    make_test_state(#{
+        role => client,
+        local_max_push_id => 10,
+        promised_pushes => #{5 => {0, [{<<":method">>, <<"GET">>}]}}
+    }).
+
 push_events() ->
     receive
         {quic_h3, _Conn, Event} -> [Event | push_events()]

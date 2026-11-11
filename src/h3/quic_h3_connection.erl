@@ -2383,11 +2383,31 @@ handle_push_stream_data(
                             <<>> -> maps:remove(StreamId, Buffers);
                             _ -> Buffers#{StreamId => Rest}
                         end,
-                    {ok, State1#state{stream_buffers = Buffers1}}
+                    case
+                        finish_push(StreamId, PushId, Fin, State1#state{stream_buffers = Buffers1})
+                    of
+                        {ok, State2} -> {ok, State2};
+                        {error, Reason} -> {error, Reason, State}
+                    end
             end;
         {error, Reason} ->
             {error, Reason, State}
     end.
+
+%% RFC 9114 Section 4.1: a pushed response ends at its stream's FIN,
+%% whichever delivery brings it.
+finish_push(StreamId, PushId, true, #state{received_pushes = Received, owner = Owner} = State) ->
+    case Received of
+        #{PushId := #h3_stream{id = StreamId, frame_state = expecting_data} = Stream} ->
+            apply_push_data(StreamId, PushId, <<>>, true, Stream, Owner, Received, State);
+        #{PushId := #h3_stream{id = StreamId, frame_state = complete}} ->
+            Owner ! {quic_h3, self(), {push_complete, PushId}},
+            cleanup_push_stream(PushId, StreamId, State);
+        _ ->
+            {ok, State}
+    end;
+finish_push(_StreamId, _PushId, false, State) ->
+    {ok, State}.
 
 %% Process frames on push stream
 process_push_frames(StreamId, PushId, Data, Fin, State) ->
@@ -2453,17 +2473,12 @@ handle_push_frame(
         #h3_stream{id = StreamId, frame_state = expecting_headers} ->
             handle_push_headers(StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, State);
         #h3_stream{id = StreamId, frame_state = expecting_data} = Stream ->
-            %% Only trailers (HEADERS with FIN) are allowed once body has started
-            case Fin of
-                true ->
-                    handle_push_trailers(
-                        StreamId, PushId, HeaderBlock, Decoder, Owner, Stream, State
-                    );
-                false ->
-                    {error,
-                        {connection_error, ?H3_FRAME_UNEXPECTED,
-                            <<"non-trailer HEADERS on push stream">>}}
-            end;
+            %% RFC 9114 Section 4.1: HEADERS after the content are the trailers.
+            handle_push_trailers(
+                StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, Stream, State
+            );
+        #h3_stream{id = StreamId, frame_state = complete} ->
+            {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"HEADERS after push trailers">>}};
         undefined ->
             %% Push stream not correlated (should not happen in normal flow)
             {error, {connection_error, ?H3_ID_ERROR, <<"unknown push stream">>}}
@@ -2482,6 +2497,8 @@ handle_push_frame(
                 {connection_error, ?H3_FRAME_UNEXPECTED, <<"DATA before HEADERS on push stream">>}};
         #h3_stream{id = StreamId, frame_state = expecting_data} = Stream ->
             apply_push_data(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State);
+        #h3_stream{id = StreamId, frame_state = complete} ->
+            {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"DATA after push trailers">>}};
         undefined ->
             {error, {connection_error, ?H3_ID_ERROR, <<"unknown push stream">>}}
     end;
@@ -2621,7 +2638,7 @@ cl_data_check(_, _, _) ->
 %% stream trailers (§4.1.2): no pseudo-headers, no forbidden connection-
 %% specific fields, Content-Length matches response headers, body size
 %% agrees with advertised content-length.
-handle_push_trailers(StreamId, PushId, HeaderBlock, Decoder, Owner, Stream, State) ->
+handle_push_trailers(StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, Stream, State) ->
     case decode_field_section(HeaderBlock, Decoder, State) of
         {{error, field_section_too_large}, _Decoder1} ->
             %% Trailers over our limit cost only this push.
@@ -2645,8 +2662,13 @@ handle_push_trailers(StreamId, PushId, HeaderBlock, Decoder, Owner, Stream, Stat
                 of
                     ok ->
                         Owner ! {quic_h3, self(), {push_trailers, PushId, Trailers}},
-                        Owner ! {quic_h3, self(), {push_complete, PushId}},
-                        cleanup_push_stream(PushId, StreamId, State1);
+                        Done = Stream#h3_stream{trailers = Trailers, frame_state = complete},
+                        Pushes = State1#state.received_pushes,
+                        finish_push(
+                            StreamId, PushId, Fin, State1#state{
+                                received_pushes = Pushes#{PushId => Done}
+                            }
+                        );
                     {error, Code} ->
                         {error,
                             {connection_error, Code, <<"push body length mismatch at trailers">>}}
