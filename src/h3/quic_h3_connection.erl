@@ -93,6 +93,9 @@
     (S#state.defer_requests andalso not S#state.settings_received)
 ).
 
+%% How many streams and pushes ended by a HEAD, 204 or 304 response are remembered.
+-define(NO_CONTENT_ENDED_MAX, 128).
+
 %% The peer opened this stream: client-initiated ids are even.
 -define(IS_PEER_STREAM(Id, S), ((S#state.role =:= server) =:= ((Id) band 1 =:= 0))).
 
@@ -156,6 +159,7 @@
 -type role() :: client | server.
 -type stream_id() :: non_neg_integer().
 -type error_code() :: non_neg_integer().
+-type no_content_key() :: stream_id() | {push, non_neg_integer()}.
 
 -record(state, {
     %% Underlying QUIC connection. `undefined' only in test state.
@@ -343,7 +347,10 @@
     %% stream_limit since its last notice (a request, open_bidi_stream/2,
     %% open_uni_stream/2), each told once an open of its kind would succeed.
     notify_streams = false :: boolean(),
-    streams_wanted = [] :: [request | bidi | uni]
+    streams_wanted = [] :: [request | bidi | uni],
+    %% Streams and pushes whose response ended on its HEADERS, oldest first in the queue.
+    no_content_ended = {sets:new([{version, 2}]), queue:new()} ::
+        {sets:set(no_content_key()), queue:queue(no_content_key())}
 }).
 
 %%====================================================================
@@ -4342,7 +4349,7 @@ end_on_headers(StreamId, HeadersFrame, Stream1, State) ->
     case quic:send_data(State#state.quic_conn, StreamId, HeadersFrame, true) of
         ok ->
             Pending = maps:remove(StreamId, State#state.pending_response_headers),
-            State1 = State#state{pending_response_headers = Pending},
+            State1 = remember_no_content(StreamId, State#state{pending_response_headers = Pending}),
             {ok, store_stream(StreamId, close_half(local, Stream1), State1)};
         {error, Reason} ->
             {error, Reason, State}
@@ -4356,7 +4363,13 @@ send_response_headers_now(StreamId, HeadersFrame, Stream1, State) ->
             {error, Reason, State}
     end.
 
-do_send_data(
+do_send_data(StreamId, Data, Fin, State) ->
+    case response_gate(StreamId, State) of
+        ended -> {ok, State};
+        open -> send_data_frame(StreamId, Data, Fin, State)
+    end.
+
+send_data_frame(
     StreamId,
     Data,
     Fin,
@@ -4390,7 +4403,13 @@ do_send_data(
             {error, unknown_stream}
     end.
 
-do_send_trailers(
+do_send_trailers(StreamId, Trailers, State) ->
+    case response_gate(StreamId, State) of
+        ended -> {ok, State};
+        open -> encode_and_send_trailers(StreamId, Trailers, State)
+    end.
+
+encode_and_send_trailers(
     StreamId,
     Trailers,
     #state{
@@ -4418,6 +4437,52 @@ do_send_trailers(
                 error ->
                     {error, unknown_stream}
             end
+    end.
+
+%% RFC 9110 Section 6.4.1: nothing follows a HEAD, 204 or 304 response, even after the stream.
+response_gate(StreamId, #state{role = server, streams = Streams} = State) ->
+    case Streams of
+        #{StreamId := #h3_stream{reset = true}} ->
+            open;
+        #{StreamId := #h3_stream{is_connect = false, method = Method, status = Status}} ->
+            ended_or_open(no_content_status(Method, Status));
+        #{} ->
+            ended_or_open(no_content_ended(StreamId, State))
+    end;
+response_gate(_StreamId, _State) ->
+    open.
+
+ended_or_open(true) -> ended;
+ended_or_open(false) -> open.
+
+no_content_ended(Key, #state{no_content_ended = {Ended, _}}) ->
+    sets:is_element(Key, Ended).
+
+remember_no_content(Key, #state{no_content_ended = {Ended, Order}} = State) ->
+    case sets:is_element(Key, Ended) of
+        true ->
+            State;
+        false ->
+            Ended1 = sets:add_element(Key, Ended),
+            State#state{no_content_ended = forget_oldest(Ended1, queue:in(Key, Order))}
+    end.
+
+forget_oldest(Ended, Order) ->
+    case sets:size(Ended) > ?NO_CONTENT_ENDED_MAX of
+        true ->
+            {{value, Oldest}, Order1} = queue:out(Order),
+            {sets:del_element(Oldest, Ended), Order1};
+        false ->
+            {Ended, Order}
+    end.
+
+forget_no_content(Key, #state{no_content_ended = {Ended, Order}} = State) ->
+    case sets:is_element(Key, Ended) of
+        true ->
+            Order1 = queue:delete(Key, Order),
+            State#state{no_content_ended = {sets:del_element(Key, Ended), Order1}};
+        false ->
+            State
     end.
 
 send_trailers_frame({error, _} = Error, _StreamId, _Trailers, _Encoded, _Stream) ->
@@ -4453,7 +4518,7 @@ do_cancel_stream(
     ErrorCode,
     #state{streams = Streams, pending_response_headers = Pending} = State
 ) ->
-    State1 = reset_request_stream(StreamId, ErrorCode, State),
+    State1 = reset_request_stream(StreamId, ErrorCode, forget_no_content(StreamId, State)),
     %% Drop what the cancelled stream was holding: unsent HEADERS, the
     %% partial frame buffer, and any body no handler claimed.
     State2 = release_buffered(StreamId, State1),
@@ -4981,7 +5046,8 @@ send_push_headers(QuicConn, StreamId, HeadersFrame, PushId, Stream1, State) ->
     NoContent = no_content_status(Method, Status),
     case quic:send_data(QuicConn, StreamId, HeadersFrame, NoContent) of
         ok when NoContent ->
-            {ok, State#state{push_streams = maps:remove(PushId, State#state.push_streams)}};
+            State1 = State#state{push_streams = maps:remove(PushId, State#state.push_streams)},
+            {ok, remember_no_content({push, PushId}, State1)};
         ok ->
             PushStreams = maps:put(PushId, {StreamId, Stream1}, State#state.push_streams),
             {ok, State#state{push_streams = PushStreams}};
@@ -5021,7 +5087,10 @@ do_send_push_data(
                     {error, Reason}
             end;
         error ->
-            {error, unknown_push_id}
+            case no_content_ended({push, PushId}, State) of
+                true -> {ok, State};
+                false -> {error, unknown_push_id}
+            end
     end.
 
 %%====================================================================

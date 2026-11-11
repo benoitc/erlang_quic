@@ -507,7 +507,8 @@ make_test_state(Overrides) ->
         held_bytes => 0,
         reset_final_size => false,
         notify_streams => false,
-        streams_wanted => []
+        streams_wanted => [],
+        no_content_ended => {sets:new([{version, 2}]), queue:new()}
     },
     Merged = maps:merge(Default, Overrides),
     {state, maps:get(quic_conn, Merged), maps:get(quic_ref, Merged), maps:get(role, Merged),
@@ -541,4 +542,4 @@ make_test_state(Overrides) ->
         maps:get(deferred_requests, Merged), maps:get(held_streams, Merged),
         maps:get(held_data, Merged), maps:get(held_bytes, Merged),
         maps:get(reset_final_size, Merged), maps:get(notify_streams, Merged),
-        maps:get(streams_wanted, Merged)}.
+        maps:get(streams_wanted, Merged), maps:get(no_content_ended, Merged)}.

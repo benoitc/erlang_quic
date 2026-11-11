@@ -29,7 +29,9 @@
     send_response_204_alone_ends_the_stream/1,
     many_204s_leave_no_stream_behind/1,
     no_content_responses_carry_no_data_frame/1,
-    no_content_push_ends_on_headers/1
+    no_content_push_ends_on_headers/1,
+    body_and_trailers_after_no_content_are_dropped/1,
+    push_body_after_no_content_is_dropped/1
 ]).
 
 -define(WAIT_MS, 3000).
@@ -50,7 +52,9 @@ all() ->
         send_response_204_alone_ends_the_stream,
         many_204s_leave_no_stream_behind,
         no_content_responses_carry_no_data_frame,
-        no_content_push_ends_on_headers
+        no_content_push_ends_on_headers,
+        body_and_trailers_after_no_content_are_dropped,
+        push_body_after_no_content_is_dropped
     ].
 
 init_per_suite(Config) ->
@@ -197,6 +201,45 @@ no_content_push_ends_on_headers(Config) ->
         quic_h3:close(Conn)
     end).
 
+%% A body or trailers offered after a no-content response are not sent,
+%% and the call still succeeds.
+body_and_trailers_after_no_content_are_dropped(Config) ->
+    with_server(Config, fun(Port) ->
+        Conn = connect(Port),
+        lists:foreach(
+            fun({Method, Path}) ->
+                _ = persistent_term:erase({?MODULE, result}),
+                {Wire, Events} = traced(Conn, Method, Path),
+                ?assertMatch([[headers, fin]], Wire, {Method, Path}),
+                ?assertMatch([{response, _, _, _}, {data, _, <<>>, true}], Events),
+                ?assertEqual(ok, handler_result())
+            end,
+            [
+                {<<"GET">>, <<"/body-204">>},
+                {<<"GET">>, <<"/body-304">>},
+                {<<"HEAD">>, <<"/body-head">>},
+                {<<"GET">>, <<"/trailers-204">>},
+                {<<"HEAD">>, <<"/trailers-head">>}
+            ]
+        ),
+        quic_h3:close(Conn)
+    end).
+
+push_body_after_no_content_is_dropped(Config) ->
+    with_server(Config, fun(Port) ->
+        Conn = connect(Port),
+        ok = quic_h3:set_max_push_id(Conn, 10),
+        timer:sleep(100),
+        _ = persistent_term:erase({?MODULE, result}),
+        {ok, _StreamId} = quic_h3:request(Conn, headers(<<"GET">>, <<"/push-204-body">>)),
+        Events = [E || E <- collect(Conn), is_push_event(E)],
+        ?assertMatch(
+            [{push_stream, _, _, _}, {push_response, _, 204, _}, {push_complete, _}], Events
+        ),
+        ?assertEqual(ok, handler_result()),
+        quic_h3:close(Conn)
+    end).
+
 %%====================================================================
 %% Server
 %%====================================================================
@@ -247,8 +290,32 @@ handle(Conn, StreamId, _Method, <<"/push-204">>, _Headers) ->
     {ok, PushId} = quic_h3:push(Conn, StreamId, headers(<<"GET">>, <<"/pushed">>)),
     ok = quic_h3:send_push_response(Conn, PushId, 204, []),
     ok = quic_h3:respond(Conn, StreamId, 200, [], <<"page">>);
+handle(Conn, StreamId, _Method, <<"/push-204-body">>, _Headers) ->
+    {ok, PushId} = quic_h3:push(Conn, StreamId, headers(<<"GET">>, <<"/pushed">>)),
+    ok = quic_h3:send_push_response(Conn, PushId, 204, []),
+    result(quic_h3:send_push_data(Conn, PushId, <<"oops">>, true)),
+    ok = quic_h3:respond(Conn, StreamId, 200, [], <<"page">>);
+handle(Conn, StreamId, _Method, <<"/body-", _/binary>> = Path, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, path_status(Path), [{<<"content-length">>, <<"4">>}]),
+    result(quic_h3:send_data(Conn, StreamId, <<"oops">>, true));
+handle(Conn, StreamId, _Method, <<"/trailers-", _/binary>> = Path, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, path_status(Path), []),
+    result(quic_h3:send_trailers(Conn, StreamId, [{<<"x-trailer">>, <<"t">>}]));
 handle(Conn, StreamId, _Method, _Path, _Headers) ->
     respond(Conn, StreamId, 404, <<>>).
+
+path_status(Path) ->
+    case binary:split(Path, <<"-">>) of
+        [_, <<"head">>] -> 200;
+        [_, Status] -> binary_to_integer(Status)
+    end.
+
+%% What the handler's last send call returned, for the test to check.
+result(Result) ->
+    persistent_term:put({?MODULE, result}, Result).
+
+handler_result() ->
+    persistent_term:get({?MODULE, result}, none).
 
 doc_headers() ->
     [

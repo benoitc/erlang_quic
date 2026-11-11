@@ -510,6 +510,57 @@ assert_empty_body(Sends) ->
     [{0, Payload, true}] = Sends,
     ?assertMatch({ok, {headers, _}, <<>>}, quic_h3_frame:decode(iolist_to_binary(Payload))).
 
+%% RFC 9110 Section 6.4.1: once a no-content response ended a stream, a body
+%% or trailers for it are dropped with ok, for the last 128 such streams.
+no_content_ended_streams_are_remembered_and_bounded_test() ->
+    Quic = fake_quic_conn(),
+    Ids = [I * 4 || I <- lists:seq(0, 129)],
+    Streams = maps:from_list([
+        {Id, #h3_stream{id = Id, type = request, state = half_closed_remote, method = <<"GET">>}}
+     || Id <- Ids
+    ]),
+    State0 = make_test_state(#{role => server, quic_conn => Quic, streams => Streams}),
+    State1 = lists:foldl(
+        fun(Id, S) ->
+            {ok, S1} = quic_h3_connection:do_respond(Id, 204, [], <<"body">>, S),
+            S1
+        end,
+        State0,
+        Ids
+    ),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State1)),
+    Sent = length(fake_quic_calls(Quic)),
+    Newest = lists:last(Ids),
+    ?assertMatch(
+        {ok, _}, quic_h3_connection:do_send_trailers(Newest, [{<<"x">>, <<"1">>}], State1)
+    ),
+    ?assertEqual(Sent, length(fake_quic_calls(Quic))),
+    ?assertEqual(
+        {error, unknown_stream},
+        quic_h3_connection:do_send_trailers(hd(Ids), [{<<"x">>, <<"1">>}], State1)
+    ),
+    %% a stream that never existed is still unknown
+    ?assertEqual(
+        {error, unknown_stream},
+        quic_h3_connection:do_send_trailers(1000, [{<<"x">>, <<"1">>}], State1)
+    ),
+    %% no_content_ended, the last #state field
+    {Ended, Order} = element(tuple_size(State1), State1),
+    ?assertEqual({128, 128}, {sets:size(Ended), queue:len(Order)}).
+
+%% A cancelled stream is unknown again, though its response ended it.
+no_content_ended_stream_reset_is_unknown_test() ->
+    Quic = fake_quic_conn(),
+    Stream = #h3_stream{id = 0, type = request, state = open, method = <<"GET">>},
+    State0 = make_test_state(#{role => server, quic_conn => Quic, streams => #{0 => Stream}}),
+    {ok, State1} = quic_h3_connection:do_respond(0, 204, [], <<>>, State0),
+    ?assertMatch({ok, _}, quic_h3_connection:do_send_trailers(0, [{<<"x">>, <<"1">>}], State1)),
+    State2 = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, State1),
+    ?assertEqual(
+        {error, unknown_stream},
+        quic_h3_connection:do_send_trailers(0, [{<<"x">>, <<"1">>}], State2)
+    ).
+
 respond_invalid_status_test() ->
     {Result, Sends} = respond_capture(700, [], <<"hello">>, <<"GET">>),
     ?assertEqual({error, {invalid_status, 700}}, Result),
@@ -3672,7 +3723,8 @@ make_test_state(Overrides) ->
         held_bytes => 0,
         reset_final_size => false,
         notify_streams => false,
-        streams_wanted => []
+        streams_wanted => [],
+        no_content_ended => {sets:new([{version, 2}]), queue:new()}
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -3710,7 +3762,7 @@ make_test_state(Overrides) ->
         maps:get(deferred_requests, Merged), maps:get(held_streams, Merged),
         maps:get(held_data, Merged), maps:get(held_bytes, Merged),
         maps:get(reset_final_size, Merged), maps:get(notify_streams, Merged),
-        maps:get(streams_wanted, Merged)}.
+        maps:get(streams_wanted, Merged), maps:get(no_content_ended, Merged)}.
 
 %%====================================================================
 %% WT_STREAM placement (draft-ietf-webtrans-http3-17 §4.3)
