@@ -13,8 +13,12 @@
     always_ok/3,
     server_denies/3,
     client_denies/3,
-    hangs_forever/3
+    hangs_forever/3,
+    reports_peer_node/3
 ]).
+
+%% Logger handler, so a test can read the reports a node logged.
+-export([log/2]).
 
 always_ok(_Conn, _Side, _Timeout) ->
     {ok, ok}.
@@ -33,3 +37,17 @@ hangs_forever(_Conn, _Side, _Timeout) ->
     receive
         never -> ok
     end.
+
+%% Claims to have authenticated the node named by the `-qauth_peer_node'
+%% boot argument, on either side.
+reports_peer_node(_Conn, _Side, _Timeout) ->
+    {ok, [[Name]]} = init:get_argument(qauth_peer_node),
+    {ok, {authenticated_node, list_to_atom(Name)}}.
+
+%% Appends each report's what/authenticated/claimed keys to the file in
+%% the handler config, synchronously, so nothing is lost on halt.
+log(#{msg := {report, #{what := _} = Report}}, #{config := #{file := File}}) ->
+    Kept = maps:with([what, authenticated, claimed], Report),
+    ok = file:write_file(File, io_lib:format("~p.~n", [Kept]), [append]);
+log(_Event, _Config) ->
+    ok.

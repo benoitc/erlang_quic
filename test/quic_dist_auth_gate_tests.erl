@@ -117,6 +117,102 @@ no_auth_proceeds_without_connected_test() ->
     Conn ! stop.
 
 %%====================================================================
+%% Authenticated node
+%%====================================================================
+
+admit_authenticated(Conn, AuthNode) ->
+    Cb = fun(_C, _Side, _T) -> {ok, {authenticated_node, AuthNode}} end,
+    {ok, Ctrl} = start_server_controller(Conn, {Cb, 5000}),
+    Ctrl ! {quic, Conn, {connected, #{}}},
+    handshaking = wait_for_state(Ctrl, handshaking, 40),
+    Ctrl.
+
+claim_matching_name_is_admitted_test() ->
+    Conn = fake_conn(self()),
+    Ctrl = admit_authenticated(Conn, 'a@host'),
+    ?assertEqual(ok, quic_dist_controller:claim_node(Ctrl, {static, "a@host"})),
+    ?assertEqual({ok, 'a@host'}, quic_dist_controller:get_node(Ctrl)),
+    gen_statem:stop(Ctrl),
+    Conn ! stop.
+
+%% Every claim other than the authenticated name stops the controller
+%% normally and answers with the mismatch, so dist_util shuts down.
+claim_other_name_is_refused_test_() ->
+    Claims = [{static, "b@host"}, {static, "a@host2"}, {dynamic, "host"}, malformed],
+    [{lists:flatten(io_lib:format("~p", [C])), fun() -> refused_claim(C) end} || C <- Claims].
+
+refused_claim(Claim) ->
+    Conn = fake_conn(self()),
+    Ctrl = admit_authenticated(Conn, 'a@host'),
+    MRef = erlang:monitor(process, Ctrl),
+    ?assertEqual(
+        {error, {auth_identity_mismatch, 'a@host', claimed(Claim)}},
+        quic_dist_controller:claim_node(Ctrl, Claim)
+    ),
+    receive
+        {'DOWN', MRef, process, Ctrl, Reason} -> ?assertEqual(normal, Reason)
+    after 2000 ->
+        ?assert(false)
+    end,
+    Conn ! stop.
+
+claimed({static, Name}) -> Name;
+claimed(Claim) -> Claim.
+
+%% A callback that does not name a node keeps today's behaviour: the
+%% announced name is recorded, whatever it is.
+claim_without_authenticated_node_is_admitted_test() ->
+    Conn = fake_conn(self()),
+    Cb = fun(_C, _Side, _T) -> {ok, anything} end,
+    {ok, Ctrl} = start_server_controller(Conn, {Cb, 5000}),
+    Ctrl ! {quic, Conn, {connected, #{}}},
+    handshaking = wait_for_state(Ctrl, handshaking, 40),
+    ?assertEqual(ok, quic_dist_controller:claim_node(Ctrl, {static, "b@host"})),
+    ?assertEqual({ok, 'b@host'}, quic_dist_controller:get_node(Ctrl)),
+    gen_statem:stop(Ctrl),
+    Conn ! stop.
+
+authenticated_node_must_be_an_atom_test() ->
+    Bad = {ok, {authenticated_node, "a@host"}},
+    ?assertEqual(
+        {error, {auth_callback_bad_return, Bad}},
+        quic_dist_auth:run(fun(_, _, _) -> Bad end, self(), server, 1000)
+    ),
+    Good = {ok, {authenticated_node, 'a@host'}},
+    ?assertEqual(Good, quic_dist_auth:run(fun(_, _, _) -> Good end, self(), server, 1000)).
+
+%% The name is read as dist_util reads it (kernel dist_util:recv_name/1).
+peer_name_test_() ->
+    NameMe = 16#02 bsl 32,
+    New = fun(Flags, Name) ->
+        Bin = list_to_binary(Name),
+        binary_to_list(<<$N, Flags:64, 7:32, (byte_size(Bin)):16, Bin/binary>>)
+    end,
+    [
+        ?_assertEqual({static, "a@host"}, quic_dist_auth:peer_name(New(0, "a@host"))),
+        ?_assertEqual({dynamic, "host"}, quic_dist_auth:peer_name(New(NameMe, "host"))),
+        ?_assertEqual(
+            {static, "a@host"},
+            quic_dist_auth:peer_name(binary_to_list(<<$n, 6:16, 0:32, "a@host">>))
+        ),
+        %% Bytes after the announced length are not part of the name.
+        ?_assertEqual(
+            {static, "a@h"},
+            quic_dist_auth:peer_name(
+                binary_to_list(<<$N, 0:64, 7:32, 3:16, "a@hostXYZ">>)
+            )
+        ),
+        ?_assertEqual(
+            malformed,
+            quic_dist_auth:peer_name(binary_to_list(<<$N, 0:64, 7:32, 40:16, "a@h">>))
+        ),
+        ?_assertEqual(malformed, quic_dist_auth:peer_name("Nshort")),
+        ?_assertEqual(malformed, quic_dist_auth:peer_name("n")),
+        ?_assertEqual(not_name, quic_dist_auth:peer_name([$r, 0, 0, 0, 1])),
+        ?_assertEqual(not_name, quic_dist_auth:peer_name(<<"Nbinary">>))
+    ].
+
+%%====================================================================
 %% Client handoff
 %%====================================================================
 

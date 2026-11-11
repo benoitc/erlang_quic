@@ -46,6 +46,11 @@
 -include("quic_dist.hrl").
 -include_lib("kernel/include/dist_util.hrl").
 -include_lib("kernel/include/net_address.hrl").
+-include_lib("kernel/include/logger.hrl").
+
+-define(QUIC_LOG_META, #{
+    domain => [erlang_quic, dist], report_cb => fun quic_log:format_report/2
+}).
 
 %% Dialyzer suppressions:
 %% - accept_connection: handshake functions have complex control flow
@@ -1199,7 +1204,7 @@ wait_for_connection(Kernel, Node, Conn, MyNode, Type, Timer, Config) ->
         {quic, Conn, {connected, _Info}} ->
             %% Optional auth handshake before the dist controller
             %% takes ownership.
-            case maybe_run_client_auth(Conn, Config) of
+            case maybe_run_client_auth(Conn, Node, Config) of
                 ok ->
                     start_client_controller(Kernel, Node, Conn, MyNode, Type, Timer);
                 {error, AuthReason} ->
@@ -1239,16 +1244,34 @@ exit_if_remarked() ->
     end.
 
 %% @private
-maybe_run_client_auth(_Conn, #quic_dist_config{auth_callback = undefined}) ->
+maybe_run_client_auth(_Conn, _Node, #quic_dist_config{auth_callback = undefined}) ->
     ok;
-maybe_run_client_auth(Conn, #quic_dist_config{
+maybe_run_client_auth(Conn, Node, #quic_dist_config{
     auth_callback = Callback,
     auth_handshake_timeout = Timeout
 }) ->
     case quic_dist_auth:run(Callback, Conn, client, Timeout) of
-        {ok, _} -> ok;
+        {ok, Info} -> check_dialed_node(quic_dist_auth:authenticated_node(Info), Node, Conn);
         {error, _} = Err -> Err
     end.
+
+%% @private
+%% A callback that authenticated a node must have reached the one dialed.
+check_dialed_node(undefined, _Node, _Conn) ->
+    ok;
+check_dialed_node(Node, Node, _Conn) ->
+    ok;
+check_dialed_node(AuthNode, Node, Conn) ->
+    ?LOG_WARNING(
+        #{
+            what => dist_auth_identity_mismatch,
+            conn => Conn,
+            authenticated => AuthNode,
+            claimed => Node
+        },
+        ?QUIC_LOG_META
+    ),
+    {error, {auth_identity_mismatch, AuthNode, Node}}.
 
 %% @private
 start_client_controller(Kernel, Node, Conn, MyNode, Type, Timer) ->
@@ -1309,15 +1332,9 @@ create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel) ->
         reject_flags = dist_util:strict_order_flags(),
         f_send = fun(Ctrl, Data) -> quic_dist_controller:send(Ctrl, Data) end,
         f_recv = fun(Ctrl, Len, Timeout) ->
-            %% Receive data and try to extract node name if this is the name message
-            Result = quic_dist_controller:recv(Ctrl, Len, Timeout),
-            case Result of
-                {ok, Data} ->
-                    %% Try to parse name message and store node in controller
-                    maybe_extract_node(Data, Ctrl),
-                    Result;
-                _ ->
-                    Result
+            case quic_dist_controller:recv(Ctrl, Len, Timeout) of
+                {ok, Data} = Ok -> claim_peer_name(Data, Ctrl, Ok);
+                Other -> Other
             end
         end,
         f_setopts_pre_nodeup = fun(Ctrl) ->
@@ -1358,34 +1375,18 @@ create_hs_data(DistCtrl, MyNode, Timer, Allowed, Kernel) ->
     }.
 
 %% @private
-%% Try to extract node name from name message and store in controller.
-%% The name message format depends on protocol version:
-%% Protocol 6: <<$N, Flags:64/big, Creation:32/big, NameLen:16/big, Name/binary>>
-%% Older: <<$n, Version:16/big, Flags:32/big, Name/binary>>
-maybe_extract_node([H | Rest], Ctrl) when H =:= $N; H =:= $n ->
-    try
-        case H of
-            $N ->
-                %% Protocol version 6 format
-                RestBin = list_to_binary(Rest),
-                <<_Flags:64/big, _Creation:32/big, NameLen:16/big, NameBin:NameLen/binary,
-                    _/binary>> = RestBin,
-                Node = binary_to_atom(NameBin, utf8),
-                quic_dist_controller:set_node(Ctrl, Node);
-            $n ->
-                %% Older protocol format
-                RestBin = list_to_binary(Rest),
-                <<_Version:16/big, _Flags:32/big, NameBin/binary>> = RestBin,
-                Node = binary_to_atom(NameBin, utf8),
-                quic_dist_controller:set_node(Ctrl, Node)
-        end
-    catch
-        _:_ ->
-            %% Failed to parse, not a name message or malformed
-            ok
-    end;
-maybe_extract_node(_, _) ->
-    ok.
+%% Hand the controller the name a peer announces, before dist_util reads
+%% it. An error here makes dist_util shut the handshake down.
+claim_peer_name(Data, Ctrl, Ok) ->
+    case quic_dist_auth:peer_name(Data) of
+        not_name ->
+            Ok;
+        Claim ->
+            case quic_dist_controller:claim_node(Ctrl, Claim) of
+                ok -> Ok;
+                {error, _} = Err -> Err
+            end
+    end.
 
 %% @private
 %% Get the stored node from controller, with fallback.

@@ -63,6 +63,7 @@
     set_supervisor/2,
     set_handshake_owner/2,
     set_node/2,
+    claim_node/2,
     get_node/1,
     getll/1,
     pre_nodeup/1
@@ -185,7 +186,10 @@
 
     %% Pending auth handshake (server role). `undefined' means the
     %% connection is admitted as soon as it is set up.
-    auth = undefined :: undefined | {quic_dist:auth_callback(), timeout()}
+    auth = undefined :: undefined | {quic_dist:auth_callback(), timeout()},
+    %% Node the auth callback authenticated (server role); the peer's
+    %% dist name must match it.
+    auth_node = undefined :: node() | undefined
 }).
 
 %%====================================================================
@@ -307,6 +311,17 @@ set_handshake_owner(Controller, Owner) when is_pid(Owner) ->
 -spec set_node(Controller :: pid(), Node :: node()) -> ok.
 set_node(Controller, Node) ->
     gen_statem:cast(Controller, {set_node, Node}).
+
+%% @doc Record the node name the peer announced in the dist handshake,
+%% as read by `quic_dist_auth:peer_name/1'. When the auth callback
+%% authenticated a node, any other name stops the controller, closing
+%% the connection, and is returned as an error.
+-spec claim_node(
+    Controller :: pid(),
+    Claim :: {static, string()} | {dynamic, string()} | malformed
+) -> ok | {error, {auth_identity_mismatch, node(), term()}}.
+claim_node(Controller, Claim) ->
+    gen_statem:call(Controller, {claim_node, Claim}).
 
 %% @doc Get the other node name.
 -spec get_node(Controller :: pid()) -> {ok, node()} | undefined.
@@ -545,12 +560,13 @@ init_state(
     #state{conn = Conn, auth = {Callback, Timeout}} = State
 ) ->
     case quic_dist_auth:run(Callback, Conn, server, Timeout) of
-        {ok, _} ->
+        {ok, Info} ->
             %% Only now: notify_acceptor/1 starts the dist_util worker,
             %% whose f_send/f_recv are calls into this process. Notifying
             %% before the callback returns would deadlock them against it.
             quic_dist:notify_acceptor(self()),
-            {next_state, handshaking, State#state{auth = undefined}};
+            AuthNode = quic_dist_auth:authenticated_node(Info),
+            {next_state, handshaking, State#state{auth = undefined, auth_node = AuthNode}};
         {error, Reason} ->
             ?LOG_WARNING(
                 #{what => dist_auth_refused, conn => Conn, reason => Reason},
@@ -578,6 +594,50 @@ init_state(info, {quic, Conn, {transport_error, Code, Reason}}, #state{conn = Co
     {stop, {transport_error, Code, Reason}};
 init_state(EventType, Event, State) ->
     handle_common_event(EventType, Event, init_state, State).
+
+%% @private
+%% Without an authenticated node the claim only names the peer, as
+%% before; malformed names are left to dist_util to refuse.
+handle_claim_node(From, Claim, #state{auth_node = undefined} = State) ->
+    State1 =
+        case Claim of
+            {_, Name} -> State#state{node = claimed_atom(Name, State#state.node)};
+            malformed -> State
+        end,
+    {keep_state, State1, [{reply, From, ok}]};
+handle_claim_node(From, {static, Name}, #state{auth_node = AuthNode} = State) when
+    is_list(Name)
+->
+    case atom_to_list(AuthNode) =:= Name of
+        true ->
+            {keep_state, State#state{node = AuthNode}, [{reply, From, ok}]};
+        false ->
+            refuse_claim(From, Name, State)
+    end;
+handle_claim_node(From, Claim, State) ->
+    refuse_claim(From, Claim, State).
+
+refuse_claim(From, Claimed, #state{conn = Conn, auth_node = AuthNode} = State) ->
+    ?LOG_WARNING(
+        #{
+            what => dist_auth_identity_mismatch,
+            conn => Conn,
+            authenticated => AuthNode,
+            claimed => Claimed
+        },
+        ?QUIC_LOG_META
+    ),
+    %% terminate/3 closes the connection; dist_util shuts the handshake
+    %% down on the error before the peer is marked pending or up.
+    Reply = {error, {auth_identity_mismatch, AuthNode, Claimed}},
+    {stop_and_reply, normal, [{reply, From, Reply}], State}.
+
+claimed_atom(Name, Default) ->
+    try
+        list_to_atom(Name)
+    catch
+        error:_ -> Default
+    end.
 
 %% @private
 %% Set up control and data streams once connection is ready.
@@ -936,6 +996,8 @@ handle_common_event(
     stop_and_fail_reads({shutdown, handshake_owner_down}, State);
 handle_common_event(cast, {set_node, Node}, _StateName, State) ->
     {keep_state, State#state{node = Node}};
+handle_common_event({call, From}, {claim_node, Claim}, _StateName, State) ->
+    handle_claim_node(From, Claim, State);
 handle_common_event({call, From}, get_node, _StateName, #state{node = Node} = State) ->
     Reply =
         case Node of
