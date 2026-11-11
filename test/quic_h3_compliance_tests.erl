@@ -843,29 +843,47 @@ trailer_no_content_length_ok_test() ->
 %% GOAWAY Blocked Stream Cleanup Tests (RFC 9114 Section 5.2)
 %%====================================================================
 
-goaway_clears_blocked_streams_test() ->
-    %% When GOAWAY is received, blocked streams should be cleared
-    State = make_test_state(#{
+%% A server's GOAWAY gives up the client's requests at or above its ID, and
+%% a later, lower one those down to it; the rest wait for the encoder
+%% stream. Stream Cancellation goes out for each one given up.
+server_goaway_drops_only_blocked_requests_at_or_above_its_id_test() ->
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{
+        role => client,
+        quic_conn => Quic,
+        settings_received => true,
+        local_decoder_stream => 10,
         blocked_streams => #{
+            0 => {1, <<>>, false},
             4 => {1, <<>>, false},
-            8 => {2, <<>>, false}
-        },
-        local_decoder_stream => undefined
+            8 => {2, <<>>, false},
+            3 => {1, <<>>, false}
+        }
     }),
-    Result = quic_h3_connection:cleanup_blocked_streams_on_goaway(State),
-    %% Blocked streams (tuple position 28) should be empty after cleanup
-    BlockedStreams = element(28, Result),
-    ?assertEqual(#{}, BlockedStreams).
+    {transition, goaway_received, State1} =
+        quic_h3_connection:handle_control_frame({goaway, 8}, State0),
+    %% blocked_streams is at position 28
+    ?assertEqual([0, 3, 4], lists:sort(maps:keys(element(28, State1)))),
+    {ok, State2} = quic_h3_connection:handle_control_frame({goaway, 4}, State1),
+    ?assertEqual([0, 3], lists:sort(maps:keys(element(28, State2)))),
+    Cancels = [Id || {send_data, 10, <<1:2, Id:6>>, false} <- fake_quic_calls(Quic)],
+    ?assertEqual([4, 8], lists:sort(Cancels)).
 
-goaway_empty_blocked_streams_test() ->
-    %% GOAWAY with no blocked streams should be a no-op
-    State = make_test_state(#{
-        blocked_streams => #{},
-        local_decoder_stream => undefined
+%% A client's GOAWAY carries a push ID: the requests the server waits on
+%% are not touched.
+client_goaway_keeps_blocked_requests_test() ->
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{
+        role => server,
+        quic_conn => Quic,
+        settings_received => true,
+        local_decoder_stream => 11,
+        blocked_streams => #{0 => {1, <<>>, false}, 8 => {2, <<>>, false}}
     }),
-    Result = quic_h3_connection:cleanup_blocked_streams_on_goaway(State),
-    BlockedStreams = element(28, Result),
-    ?assertEqual(#{}, BlockedStreams).
+    {transition, goaway_received, State1} =
+        quic_h3_connection:handle_control_frame({goaway, 0}, State0),
+    ?assertEqual([0, 8], lists:sort(maps:keys(element(28, State1)))),
+    ?assertEqual([], fake_quic_calls(Quic)).
 
 %%====================================================================
 %% SETTINGS Directionality Tests (RFC 9114 Section 7.2.4.1)

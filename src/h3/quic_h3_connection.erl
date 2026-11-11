@@ -112,7 +112,7 @@
     validate_request_headers/2,
     calculate_field_section_size/1,
     validate_outbound_headers/2,
-    cleanup_blocked_streams_on_goaway/1,
+    cleanup_blocked_streams_on_goaway/2,
     process_push_stream_id/5,
     update_stream_with_headers/4,
     allocate_push_id/1,
@@ -2074,13 +2074,14 @@ handle_control_frame({goaway, Id}, #state{role = Role} = State) ->
         ok ->
             case State#state.peer_goaway_id of
                 undefined ->
-                    State1 = cleanup_blocked_streams_on_goaway(State),
+                    State1 = cleanup_blocked_streams_on_goaway(Id, State),
                     {transition, goaway_received, State1#state{peer_goaway_id = Id}};
                 Old when Id > Old ->
                     %% RFC 9114 Section 5.2: GOAWAY ID MUST NOT increase
                     {error, {connection_error, ?H3_ID_ERROR, <<"GOAWAY ID increased">>}};
                 _ ->
-                    {ok, State#state{peer_goaway_id = Id}}
+                    State1 = cleanup_blocked_streams_on_goaway(Id, State),
+                    {ok, State1#state{peer_goaway_id = Id}}
             end;
         {error, Reason} ->
             {error, {connection_error, ?H3_ID_ERROR, Reason}}
@@ -5060,25 +5061,13 @@ send_stream_cancel(StreamId, #state{quic_conn = QuicConn, local_decoder_stream =
     _ = quic:send_data(QuicConn, Decoder, quic_qpack:encode_stream_cancel(StreamId), false),
     State.
 
-%% Clean up blocked streams when GOAWAY received (RFC 9114 Section 5.2)
-%% Send Stream Cancellation for each blocked stream (RFC 9204 Section 4.4.2)
-cleanup_blocked_streams_on_goaway(
-    #state{
-        blocked_streams = Blocked,
-        quic_conn = QuicConn,
-        local_decoder_stream = DecoderStream
-    } = State
-) when map_size(Blocked) > 0, DecoderStream =/= undefined ->
-    maps:foreach(
-        fun(StreamId, _) ->
-            Cancel = quic_qpack:encode_stream_cancel(StreamId),
-            quic:send_data(QuicConn, DecoderStream, Cancel, false)
-        end,
-        Blocked
-    ),
-    State#state{blocked_streams = #{}};
-cleanup_blocked_streams_on_goaway(State) ->
-    State#state{blocked_streams = #{}}.
+%% RFC 9114 Section 5.2: a server's GOAWAY gives up the requests at or
+%% above its ID; a client's names a push ID, which no blocked stream is.
+cleanup_blocked_streams_on_goaway(_Id, #state{role = server} = State) ->
+    State;
+cleanup_blocked_streams_on_goaway(Id, #state{blocked_streams = Blocked} = State) ->
+    Gone = [S || S <- maps:keys(Blocked), (S band 3) =:= 0, S >= Id],
+    lists:foldl(fun maybe_send_stream_cancel/2, State, Gone).
 
 send_goaway(
     #state{
