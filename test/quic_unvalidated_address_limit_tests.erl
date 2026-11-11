@@ -147,6 +147,17 @@ short_challenge(Data, #state{mig = #mig{pending_peer_validation = Path} = Mig} =
     },
     quic_connection:note_short_challenge(Data, 100, S).
 
+a_server_keeps_the_latest_probed_paths_test() ->
+    Addrs = [{{127, 0, 0, 1}, 40100 + N} || N <- lists:seq(1, 10)],
+    S = lists:foldl(
+        fun({PN, Addr}, S0) -> probe(PN, 60, Addr, S0) end,
+        with_spare_cid(state()),
+        lists:zip(lists:seq(1, 10), Addrs)
+    ),
+    Kept = [A || #path_state{remote_addr = A} <- quic_connection_test_support:alt_paths(S)],
+    ?assertEqual(lists:reverse(lists:nthtail(6, Addrs)), Kept),
+    ?assertEqual(not_found, quic_cid:retire_peer(S#state.cid_pool_state, <<1:64>>)).
+
 holds_data_to_a_second_address_during_the_handshake_test() ->
     with_peer(fun(Peer, Sock) ->
         S1 = hs_recv(1, 100, ?SPOOFED, handshaking()),

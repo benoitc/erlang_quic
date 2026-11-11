@@ -65,6 +65,9 @@
 %% A PATH_RESPONSE and a PATH_CHALLENGE in an unpadded 1-RTT packet.
 -define(SHORT_PROBE_ANSWER_SIZE, 60).
 
+%% Paths a server keeps for addresses that probed it.
+-define(MAX_PROBED_PATHS, 4).
+
 %% Suppress warnings for helper functions prepared for future use
 -compile([{nowarn_unused_function, [{send_handshake_ack, 1}, {contains_non_probing_frame, 1}]}]).
 
@@ -14065,11 +14068,16 @@ answer_probe_on_new_path(Addr, Via, ResponseData, #state{mig = Mig} = State, DCI
             _ ->
                 {Path1, [{path_response, ResponseData}]}
         end,
-    State1 = with_alt_path(Path, Others, State),
+    State1 = keep_probed_path(Path, Others, State),
     send_path_frames(Addr, Via, path_dcid(Path, State1), Frames, State1).
 
 with_alt_path(Path, Others, #state{mig = Mig} = State) ->
     State#state{mig = Mig#mig{alt_paths = [Path | Others]}}.
+
+%% The latest probed paths are kept; the least recently probed is dropped.
+keep_probed_path(Path, Others, State) ->
+    {Kept, Dropped} = lists:split(min(length(Others), ?MAX_PROBED_PATHS - 1), Others),
+    lists:foldl(fun retire_abandoned_path_cid/2, with_alt_path(Path, Kept, State), Dropped).
 
 probe_cid_for(Addr, Via, State) ->
     case Via =:= current_via(State) of
