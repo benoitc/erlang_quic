@@ -326,7 +326,7 @@ init_genudp_backend(Port, Opts) ->
             case ReusePort of
                 true -> [{reuseport, true}, {reuseport_lb, true}];
                 false -> []
-            end ++ ExtraFlags,
+            end ++ quic_socket:dont_fragment_opts(Family) ++ ExtraFlags,
     case gen_udp:open(Port, SocketOpts) of
         {ok, Socket} ->
             case open_preferred_sockets(Socket, Opts) of
@@ -367,7 +367,7 @@ open_preferred_sockets([{IP, Port} = Endpoint | Rest], Opts, Acc) ->
         | case maps:get(reuseport, Opts, false) of
             true -> [{reuseport, true}, {reuseport_lb, true}];
             false -> []
-        end
+        end ++ quic_socket:dont_fragment_opts(address_family(IP))
     ],
     case gen_udp:open(Port, SocketOpts) of
         {ok, S} ->
@@ -1089,7 +1089,7 @@ handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) -
             ),
             route_to_connection(DCID, Packet, RemoteAddr, State);
         {error, Reason} ->
-            ?LOG_WARNING(#{what => packet_parse_failed, reason => Reason}, ?QUIC_LOG_META),
+            ?LOG_DEBUG(#{what => packet_parse_failed, reason => Reason}, ?QUIC_LOG_META),
             ok
     end.
 
@@ -1137,6 +1137,8 @@ parse_packet_header(
     case supported_version(Version) of
         false ->
             {unsupported_version, DCID, SCID, Version};
+        true when DCIDLenField > 20; SCIDLen > 20 ->
+            {error, cid_too_long};
         true ->
             case quic_packet:bits_to_type(PacketType, Version) of
                 initial -> {initial, DCID, SCID, Version, Rest};

@@ -456,6 +456,14 @@ encode_alpn_list(Protocols) ->
     }}
     | {hrr, #{cipher := atom(), selected_group := atom() | unknown, extensions := map()}}
     | {error, term()}.
+parse_server_hello(
+    <<_:16, _:32/binary, SessionIdLen:8, _:SessionIdLen/binary, CipherSuite:16, _/binary>>
+) when
+    CipherSuite =/= ?TLS_AES_128_GCM_SHA256,
+    CipherSuite =/= ?TLS_AES_256_GCM_SHA384,
+    CipherSuite =/= ?TLS_CHACHA20_POLY1305_SHA256
+->
+    {error, illegal_parameter};
 parse_server_hello(<<
     % legacy_version
     ?TLS_VERSION_1_2:16,
@@ -858,6 +866,8 @@ decode_tp_value(?TP_RETRY_SCID, Value) ->
     Value;
 decode_tp_value(?TP_DISABLE_ACTIVE_MIGRATION, <<>>) ->
     true;
+decode_tp_value(?TP_DISABLE_ACTIVE_MIGRATION, _) ->
+    error({transport_parameter_error, disable_active_migration_non_empty});
 decode_tp_value(?TP_RESET_STREAM_AT, <<>>) ->
     true;
 decode_tp_value(?TP_RESET_STREAM_AT, _) ->
@@ -916,7 +926,7 @@ decode_preferred_address(<<
     CIDLen:8,
     CID:CIDLen/binary,
     StatelessResetToken:16/binary
->>) when CIDLen > 0 ->
+>>) when CIDLen > 0, CIDLen =< 20 ->
     %% RFC 9000 Section 18.2: never a zero-length connection ID
     %% Parse IPv4 - zero address means not present
     {IPv4Addr, IPv4PortVal} =
@@ -1052,8 +1062,7 @@ parse_server_key_share(_) ->
 
 cipher_from_suite(?TLS_AES_128_GCM_SHA256) -> aes_128_gcm;
 cipher_from_suite(?TLS_AES_256_GCM_SHA384) -> aes_256_gcm;
-cipher_from_suite(?TLS_CHACHA20_POLY1305_SHA256) -> chacha20_poly1305;
-cipher_from_suite(_) -> aes_128_gcm.
+cipher_from_suite(?TLS_CHACHA20_POLY1305_SHA256) -> chacha20_poly1305.
 
 %% @private Encode a single psk_key_exchange_mode byte (RFC 8446 §4.2.9).
 encode_psk_mode(psk_ke) -> <<?PSK_KE_MODE_KE:8>>;
