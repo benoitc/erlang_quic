@@ -243,8 +243,6 @@ All notable changes to this project will be documented in this file.
   now starts N listeners, with SO_REUSEPORT only when N is above 1, and
   `quic:get_server_connections/1` returns each connection once instead
   of once per listener.
-
-||||||| parent of da88b2b (Add the cipher suite, PSK and recovery fixes to the CHANGELOG)
 - NewReno and CUBIC moved the start of the recovery period to the moment
   they left recovery, so the loss of a packet sent during recovery was
   ignored and, under continued overload, the next window reduction came
