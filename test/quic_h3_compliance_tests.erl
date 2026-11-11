@@ -681,13 +681,61 @@ section_ack_only_for_sections_using_the_dynamic_table_test() ->
         0, request_frame(<<"GET">>, <<"/">>), true, State1
     ),
     ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()),
-    ?assertNot(lists:keymember(send_data, 1, fake_quic_calls(Quic))),
+    Increment = {send_data, 11, quic_qpack:encode_insert_count_increment(1), false},
+    ?assertEqual([Increment], [
+        Call
+     || Call <- fake_quic_calls(Quic), element(1, Call) =:= send_data
+    ]),
     {ok, _} = quic_h3_connection:handle_stream_data(4, blocked_request(1), true, State2),
     ?assertMatch({request, 4, <<"GET">>, <<"/">>, _}, next_owner_event()),
     ?assertEqual(
-        [{send_data, 11, quic_qpack:encode_section_ack(4), false}],
+        [Increment, {send_data, 11, quic_qpack:encode_section_ack(4), false}],
         [Call || Call <- fake_quic_calls(Quic), element(1, Call) =:= send_data]
     ).
+
+%% RFC 9204 Section 4.4.3: one Insert Count Increment per chunk of encoder
+%% stream data, for the entries it inserted that no acknowledgment covers.
+insert_count_increment_after_encoder_instructions_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = blocking_state(#{quic_conn => Quic, local_decoder_stream => 11}),
+    Two = <<(insert_literal(<<"x-a">>))/binary, (insert_literal(<<"x-b">>))/binary>>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(2, Two, false, State0),
+    {ok, State2} = quic_h3_connection:handle_stream_data(2, <<>>, false, State1),
+    {ok, State3} = quic_h3_connection:handle_stream_data(4, blocked_request(2), true, State2),
+    ?assertMatch({request, 4, <<"GET">>, <<"/">>, _}, next_owner_event()),
+    {ok, _} = quic_h3_connection:handle_stream_data(
+        2, insert_literal(<<"x-c">>), false, State3
+    ),
+    ?assertEqual(
+        [
+            quic_qpack:encode_insert_count_increment(2),
+            quic_qpack:encode_section_ack(4),
+            quic_qpack:encode_insert_count_increment(1)
+        ],
+        [Data || {send_data, 11, Data, false} <- fake_quic_calls(Quic)]
+    ).
+
+%% The encoder takes our increments: what it inserted, it can now refer to.
+insert_count_increment_is_accepted_by_our_encoder_test() ->
+    Encoder0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    Decoder0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    Fields = [{<<"x-dynamic">>, <<"a-value-long-enough-to-index">>}],
+    {First, Encoder1} = quic_qpack:encode(Fields, 0, Encoder0),
+    {ok, Decoder1} = quic_qpack:process_encoder_instructions(
+        quic_qpack:get_encoder_instructions(Encoder1), Decoder0
+    ),
+    {{ok, Fields}, Decoder2} = quic_qpack:decode(First, Decoder1),
+    Increment = quic_qpack:get_insert_count(Decoder2),
+    ?assert(Increment > 0),
+    {ok, Encoder2} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(Increment),
+        quic_qpack:clear_encoder_instructions(Encoder1)
+    ),
+    {Second, Encoder3} = quic_qpack:encode(Fields, 4, Encoder2),
+    ?assertEqual(<<>>, quic_qpack:get_encoder_instructions(Encoder3)),
+    ?assertNotEqual(0, binary:first(Second)),
+    ?assertMatch({{ok, Fields}, _}, quic_qpack:decode(Second, Decoder2)).
 
 section_ack_large_stream_id_test() ->
     %% Stream ID 200 should use multi-byte encoding

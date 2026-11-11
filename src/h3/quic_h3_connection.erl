@@ -2152,16 +2152,31 @@ handle_encoder_stream_data(
         {ok, Decoder1} ->
             %% All instructions processed - retry blocked streams
             State1 = State#state{qpack_decoder = Decoder1, encoder_buffer = <<>>},
-            retry_blocked_streams(State1);
+            retry_blocked_streams(send_insert_count_increment(State1));
         {incomplete, Rest, Decoder1} ->
             %% Partial instruction, buffer remaining data
             State1 = State#state{qpack_decoder = Decoder1, encoder_buffer = Rest},
             %% Still retry blocked streams - some may have become unblocked
-            retry_blocked_streams(State1);
+            retry_blocked_streams(send_insert_count_increment(State1));
         {error, Reason} ->
             %% RFC 9204 §6: errors decoding peer's encoder stream instructions
             %% are QPACK_ENCODER_STREAM_ERROR (0x201), not decompression-failed.
             {error, {connection_error, ?H3_QPACK_ENCODER_STREAM_ERROR, Reason}, State}
+    end.
+
+%% RFC 9204 Section 4.4.3: one Insert Count Increment per chunk of encoder stream data.
+send_insert_count_increment(#state{local_decoder_stream = undefined} = State) ->
+    State;
+send_insert_count_increment(#state{qpack_decoder = Decoder} = State) ->
+    case quic_qpack:take_insert_count_increment(Decoder) of
+        {0, _} ->
+            State;
+        {Increment, Decoder1} ->
+            Instruction = quic_qpack:encode_insert_count_increment(Increment),
+            _ = quic:send_data(
+                State#state.quic_conn, State#state.local_decoder_stream, Instruction, false
+            ),
+            State#state{qpack_decoder = Decoder1}
     end.
 
 %% Retry blocked streams that may have become unblocked after encoder instructions

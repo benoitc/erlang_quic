@@ -33,7 +33,8 @@
     body_and_trailers_after_no_content_are_dropped/1,
     push_body_after_no_content_is_dropped/1,
     no_content_length_on_1xx_or_204/1,
-    no_body_before_the_final_response/1
+    no_body_before_the_final_response/1,
+    dynamic_table_entries_are_acknowledged_and_used/1
 ]).
 
 -define(WAIT_MS, 3000).
@@ -58,7 +59,8 @@ all() ->
         body_and_trailers_after_no_content_are_dropped,
         push_body_after_no_content_is_dropped,
         no_content_length_on_1xx_or_204,
-        no_body_before_the_final_response
+        no_body_before_the_final_response,
+        dynamic_table_entries_are_acknowledged_and_used
     ].
 
 init_per_suite(Config) ->
@@ -291,13 +293,39 @@ no_body_before_the_final_response(Config) ->
         quic_h3:close(Conn)
     end).
 
+%% RFC 9204 Section 4.4.3: the client's decoder acknowledges the entries
+%% the server inserts, so later responses refer to them instead of
+%% inserting them again.
+dynamic_table_entries_are_acknowledged_and_used(Config) ->
+    Dyn = #{qpack_max_table_capacity => 4096, qpack_blocked_streams => 16},
+    with_server(Config, #{settings => Dyn}, fun(Port) ->
+        {ok, Conn} = quic_h3:connect("127.0.0.1", Port, #{
+            verify => false, sync => true, settings => Dyn
+        }),
+        {Wire1, Events1} = traced(Conn, <<"GET">>, <<"/dyn">>, blocks),
+        ?assertMatch([{response, _, 200, _} | _], Events1),
+        Inserted = await_acknowledged(server_encoder, 40),
+        ?assert(Inserted > 0),
+        {Wire2, Events2} = traced(Conn, <<"GET">>, <<"/dyn">>, blocks),
+        [{response, _, 200, Headers2} | _] = Events2,
+        ?assertEqual(dyn_headers(), [H || {<<"x-", _/binary>>, _} = H <- Headers2]),
+        ?assertMatch([[{headers, 0}, _ | _]], Wire1),
+        [[{headers, Ric2} | _]] = Wire2,
+        ?assertNotEqual(0, Ric2),
+        ?assertEqual(Inserted, quic_qpack:get_insert_count(server_encoder())),
+        quic_h3:close(Conn)
+    end).
+
 %%====================================================================
 %% Server
 %%====================================================================
 
 with_server(Config, F) ->
+    with_server(Config, #{}, F).
+
+with_server(Config, Extra, F) ->
     Name = list_to_atom("h3_no_content_" ++ integer_to_list(erlang:unique_integer([positive]))),
-    {ok, _} = quic_h3:start_server(Name, 0, #{
+    {ok, _} = quic_h3:start_server(Name, 0, Extra#{
         cert => ?config(cert, Config),
         key => ?config(key, Config),
         handler => fun(Conn, StreamId, Method, Path, Headers) ->
@@ -341,6 +369,8 @@ handle(Conn, StreamId, _Method, <<"/push-204">>, _Headers) ->
     {ok, PushId} = quic_h3:push(Conn, StreamId, headers(<<"GET">>, <<"/pushed">>)),
     ok = quic_h3:send_push_response(Conn, PushId, 204, []),
     ok = quic_h3:respond(Conn, StreamId, 200, [], <<"page">>);
+handle(Conn, StreamId, _Method, <<"/dyn">>, _Headers) ->
+    ok = quic_h3:respond(Conn, StreamId, 200, dyn_headers(), <<"body">>);
 handle(Conn, StreamId, _Method, <<"/data-first">>, _Headers) ->
     result(quic_h3:send_data(Conn, StreamId, <<"early">>, false)),
     ok = quic_h3:respond(Conn, StreamId, 200, [], <<"ok">>);
@@ -395,6 +425,31 @@ doc_headers() ->
 server_conn() ->
     persistent_term:get({?MODULE, server_conn}).
 
+dyn_headers() ->
+    [
+        {<<"x-dynamic-one">>, <<"a-value-long-enough-to-be-worth-indexing">>},
+        {<<"x-dynamic-two">>, <<"another-value-long-enough-to-index">>}
+    ].
+
+%% The server connection's QPACK encoder, #state.qpack_encoder at position 13.
+server_encoder() ->
+    {_, State} = sys:get_state(server_conn()),
+    element(13, State).
+
+%% Wait until the client has acknowledged every entry the server inserted.
+await_acknowledged(server_encoder, 0) ->
+    error(entries_never_acknowledged);
+await_acknowledged(server_encoder, Tries) ->
+    Encoder = server_encoder(),
+    Inserted = quic_qpack:get_insert_count(Encoder),
+    case (Inserted > 0) andalso (Inserted =:= quic_qpack:get_known_received_count(Encoder)) of
+        true ->
+            Inserted;
+        false ->
+            timer:sleep(50),
+            await_acknowledged(server_encoder, Tries - 1)
+    end.
+
 respond(Conn, StreamId, Status, Body) ->
     Headers = [
         {<<"content-type">>, <<"text/plain">>},
@@ -447,6 +502,9 @@ is_push_event(Event) ->
 %% The request, the client events, and the HTTP/3 frames the server wrote
 %% on the request stream, one list per quic:send_data/4 call.
 traced(Conn, Method, Path) ->
+    traced(Conn, Method, Path, frames).
+
+traced(Conn, Method, Path, Detail) ->
     Self = self(),
     Tracer = spawn(fun() -> tracer_loop(Self, []) end),
     erlang:trace(all, true, [call, {tracer, Tracer}]),
@@ -462,7 +520,7 @@ traced(Conn, Method, Path) ->
         after ?WAIT_MS -> error(no_trace)
         end,
     Wire = [
-        frames(iolist_to_binary(Data), Fin)
+        frames(iolist_to_binary(Data), Fin, Detail)
      || {Pid, [_Q, Sid, Data, Fin]} <- Calls, Sid =:= StreamId, Pid =/= Conn
     ],
     {Wire, Events}.
@@ -474,10 +532,15 @@ tracer_loop(Owner, Acc) ->
         _ -> tracer_loop(Owner, Acc)
     end.
 
-frames(<<>>, true) ->
+%% Each frame's type; with `blocks', a HEADERS frame also gives the first
+%% byte of its field section, the encoded Required Insert Count.
+frames(<<>>, true, _Detail) ->
     [fin];
-frames(<<>>, false) ->
+frames(<<>>, false, _Detail) ->
     [];
-frames(Bin, Fin) ->
+frames(Bin, Fin, Detail) ->
     {ok, Frame, Rest} = quic_h3_frame:decode(Bin),
-    [element(1, Frame) | frames(Rest, Fin)].
+    [frame(Frame, Detail) | frames(Rest, Fin, Detail)].
+
+frame({headers, <<Ric, _/binary>>}, blocks) -> {headers, Ric};
+frame(Frame, _Detail) -> element(1, Frame).
