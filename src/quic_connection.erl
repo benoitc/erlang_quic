@@ -8384,8 +8384,24 @@ server_hello_suite_fits(Cipher, _ServerHello, #hs{hrr_cipher = HrrCipher}) when
     HrrCipher =/= undefined, HrrCipher =/= Cipher
 ->
     false;
+%% An accepted PSK comes with a suite of its hash (RFC 9846 §4.3.11).
+server_hello_suite_fits(Cipher, #{selected_psk_identity := Idx}, #hs{tls_ch1_opts = Opts}) when
+    is_integer(Idx)
+->
+    case offered_psk_hash(Opts) of
+        undefined -> true;
+        Hash -> (quic_crypto:cipher_to_hash(Cipher) =:= Hash)
+    end;
 server_hello_suite_fits(_Cipher, _ServerHello, _HS) ->
     true.
+
+%% External PSKs are SHA-256; a ticket has the hash it was issued under.
+offered_psk_hash(#{external_psk := _}) ->
+    sha256;
+offered_psk_hash(#{session_ticket := #session_ticket{cipher = Cipher}}) ->
+    quic_crypto:cipher_to_hash(Cipher);
+offered_psk_hash(_Opts) ->
+    undefined.
 
 %% @private Client-side HelloRetryRequest handling (RFC 8446 §4.1.4).
 %% Validates the one-HRR and group rules, rebuilds CH2 reusing CH1's

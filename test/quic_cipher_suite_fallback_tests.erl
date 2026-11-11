@@ -131,3 +131,47 @@ server_hello(Cipher, Extra, #state{hs = #hs{tls_group = Group}} = S) ->
         key_share_group => Group
     }),
     quic_connection:process_tls_messages(initial, Msg, S).
+
+%% RFC 9846 Section 4.3.11: a server accepting an external PSK, which is
+%% SHA-256, selects a SHA-256 suite.
+external_psk_accepted_with_a_suite_of_its_hash_test() ->
+    Psk = {<<"id">>, <<"this-is-a-32-byte-test-secret!!!">>},
+    S = client_awaiting_server_hello(#{external_psk => Psk}),
+    Accepted = #{selected_psk_identity => 0},
+    ?assertMatch(
+        #hs{tls_state = awaiting_encrypted_extensions, selected_psk = #{}},
+        (server_hello(aes_128_gcm, Accepted, S))#state.hs
+    ),
+    ?assertExit({tls_alert, illegal_parameter}, server_hello(aes_256_gcm, Accepted, S)).
+
+%% The same for a resumption ticket, which carries the hash of the suite
+%% it was issued under, here one that allows 0-RTT.
+ticket_accepted_with_a_suite_of_its_hash_test() ->
+    Ticket = #session_ticket{
+        server_name = <<"localhost">>,
+        ticket = <<"ticket">>,
+        lifetime = 3600,
+        age_add = 0,
+        nonce = <<0>>,
+        resumption_secret = <<0:256>>,
+        max_early_data = 16#FFFFFFFF,
+        received_at = erlang:system_time(second),
+        cipher = aes_128_gcm,
+        alpn = <<"h3">>,
+        transport_params = #{}
+    },
+    S0 = client_awaiting_server_hello(#{session_ticket => Ticket}),
+    S = S0#state{
+        hs = (S0#state.hs)#hs{
+            server_name = <<"localhost">>,
+            ticket_store = quic_ticket:store_ticket(
+                <<"localhost">>, Ticket, quic_ticket:new_store()
+            )
+        }
+    },
+    Accepted = #{selected_psk_identity => 0},
+    ?assertMatch(
+        #hs{tls_state = awaiting_encrypted_extensions, selected_psk = #{}},
+        (server_hello(chacha20_poly1305, Accepted, S))#state.hs
+    ),
+    ?assertExit({tls_alert, illegal_parameter}, server_hello(aes_256_gcm, Accepted, S)).
