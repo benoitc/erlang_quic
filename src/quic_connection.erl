@@ -7277,9 +7277,11 @@ process_tls_message(
                 maps:get(early_data, ClientHelloInfo, false),
                 StateChIn
             ),
-            %% Select cipher suite (prefer server's order)
+            %% Server's order, steered to SHA-256 by a known external PSK.
+            #conn_cfg{cipher_preference = CipherPref, psk_config = PskConfig} = State#state.cfg,
+            KnownPsk = quic_tls_negotiation:known_external_psk(ClientHelloInfo, PskConfig),
             Cipher = quic_tls_negotiation:select_cipher(
-                CipherSuites, (State#state.cfg)#conn_cfg.cipher_preference
+                CipherSuites, CipherPref, external_psk_hash(KnownPsk)
             ),
             %% RFC 8446 §4.1.4 group negotiation: use the client's
             %% key_share directly when possible, otherwise send a
@@ -7303,7 +7305,13 @@ process_tls_message(
                         SelGroup, KeyShareEntries
                     ),
                     do_server_client_hello(
-                        SelGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
+                        SelGroup,
+                        ClientPubKey,
+                        Cipher,
+                        KnownPsk,
+                        ClientHelloInfo,
+                        OriginalMsg,
+                        State
                     );
                 {_, {hrr, HrrGroup}} when not (State#state.hs)#hs.hrr_sent ->
                     send_hello_retry_request(HrrGroup, Cipher, SessionId, OriginalMsg, State);
@@ -7998,10 +8006,16 @@ process_tls_message(_Level, Type, _Body, _OriginalMsg, State) ->
     ),
     send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State).
 
+%% External PSKs are SHA-256 (RFC 9846 §4.3.11).
+external_psk_hash({ok, _KnownPsk}) -> sha256;
+external_psk_hash(none) -> undefined.
+
 %% @private Continue a server-side ClientHello once the key-exchange
 %% group is settled (direct or post-HRR). SelectedGroup is the agreed
 %% named group; ClientPubKey is the client's key_share for it.
-do_server_client_hello(SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State0In) ->
+do_server_client_hello(
+    SelectedGroup, ClientPubKey, Cipher, KnownPsk, ClientHelloInfo, OriginalMsg, State0In
+) ->
     %% Remember the client's offered signature schemes for the server's
     %% CertificateVerify negotiation, then resolve the server cert (static
     %% or via the per-SNI callback) before any cert-path work runs.
@@ -8017,13 +8031,13 @@ do_server_client_hello(SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, Ori
             send_tls_alert(?TLS_ALERT_HANDSHAKE_FAILURE, Phrase, StateSig);
         {ok, State} ->
             do_server_client_hello_cont(
-                SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
+                SelectedGroup, ClientPubKey, Cipher, KnownPsk, ClientHelloInfo, OriginalMsg, State
             )
     end.
 
 %% @private Continue the ClientHello once the server cert/key are settled.
 do_server_client_hello_cont(
-    SelectedGroup, ClientPubKey, Cipher, ClientHelloInfo, OriginalMsg, State
+    SelectedGroup, ClientPubKey, Cipher, KnownPsk, ClientHelloInfo, OriginalMsg, State
 ) ->
     ClientALPN = maps:get(alpn_protocols, ClientHelloInfo, []),
     ClientRandom = maps:get(random, ClientHelloInfo, undefined),
@@ -8036,18 +8050,9 @@ do_server_client_hello_cont(
     %% Validate pre_shared_key placement, lookup identity, verify
     %% binder. On match the server skips the cert path and uses
     %% the PSK secret in the early_secret derivation below.
-    PskConfig = (State#state.cfg)#conn_cfg.psk_config,
-    ServerPskModes = [psk_dhe_ke, psk_ke],
-    ExternalPskResult =
-        case PskConfig of
-            undefined ->
-                none;
-            _ ->
-                quic_tls:select_psk(
-                    ClientHelloInfo, OriginalMsg, PskConfig, ServerPskModes, Cipher
-                )
-        end,
-    ok,
+    ExternalPskResult = quic_tls:select_psk(
+        ClientHelloInfo, OriginalMsg, KnownPsk, [psk_dhe_ke, psk_ke], Cipher
+    ),
 
     HashLen0 =
         case Cipher of

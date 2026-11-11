@@ -113,7 +113,7 @@ select_psk_returns_ok_for_matching_psk_test() ->
     Msg = build_external_ch([psk_dhe_ke]),
     {ok, CHMap} = quic_tls:parse_client_hello(ch_body(Msg)),
     Config = #{psks => #{?IDENTITY => ?SECRET}, psk_callback => undefined},
-    {ok, Sel} = quic_tls:select_psk(CHMap, Msg, Config, [psk_dhe_ke, psk_ke], aes_128_gcm),
+    {ok, Sel} = select_psk(CHMap, Msg, Config, [psk_dhe_ke, psk_ke]),
     ?assertEqual(?IDENTITY, maps:get(identity, Sel)),
     ?assertEqual(?SECRET, maps:get(secret, Sel)),
     ?assertEqual(psk_dhe_ke, maps:get(mode, Sel)),
@@ -131,7 +131,7 @@ select_psk_callback_wins_over_map_test() ->
     },
     ?assertEqual(
         {error, bad_binder},
-        quic_tls:select_psk(CHMap, Msg, Config, [psk_dhe_ke], aes_128_gcm)
+        select_psk(CHMap, Msg, Config, [psk_dhe_ke])
     ).
 
 select_psk_callback_falls_back_to_map_on_not_found_test() ->
@@ -141,7 +141,7 @@ select_psk_callback_falls_back_to_map_on_not_found_test() ->
         psk_callback => fun(_) -> not_found end,
         psks => #{?IDENTITY => ?SECRET}
     },
-    {ok, _} = quic_tls:select_psk(CHMap, Msg, Config, [psk_dhe_ke], aes_128_gcm).
+    {ok, _} = select_psk(CHMap, Msg, Config, [psk_dhe_ke]).
 
 select_psk_callback_crash_falls_back_to_map_test() ->
     Msg = build_external_ch([psk_dhe_ke]),
@@ -151,7 +151,7 @@ select_psk_callback_crash_falls_back_to_map_test() ->
         psks => #{?IDENTITY => ?SECRET}
     },
     %% Should not crash; falls through to the map.
-    {ok, _} = quic_tls:select_psk(CHMap, Msg, Config, [psk_dhe_ke], aes_128_gcm).
+    {ok, _} = select_psk(CHMap, Msg, Config, [psk_dhe_ke]).
 
 select_psk_unknown_identity_returns_none_test() ->
     Msg = build_external_ch([psk_dhe_ke]),
@@ -160,21 +160,21 @@ select_psk_unknown_identity_returns_none_test() ->
         psk_callback => undefined,
         psks => #{<<"other-identity">> => <<"some-secret">>}
     },
-    ?assertEqual(none, quic_tls:select_psk(CHMap, Msg, Config, [psk_dhe_ke], aes_128_gcm)).
+    ?assertEqual(none, select_psk(CHMap, Msg, Config, [psk_dhe_ke])).
 
 select_psk_mode_intersection_empty_returns_none_test() ->
     Msg = build_external_ch([psk_ke]),
     {ok, CHMap} = quic_tls:parse_client_hello(ch_body(Msg)),
     Config = #{psks => #{?IDENTITY => ?SECRET}, psk_callback => undefined},
     %% Client offered only psk_ke; server only allows psk_dhe_ke.
-    ?assertEqual(none, quic_tls:select_psk(CHMap, Msg, Config, [psk_dhe_ke], aes_128_gcm)).
+    ?assertEqual(none, select_psk(CHMap, Msg, Config, [psk_dhe_ke])).
 
 select_psk_picks_first_compatible_mode_test() ->
     Msg = build_external_ch([psk_ke, psk_dhe_ke]),
     {ok, CHMap} = quic_tls:parse_client_hello(ch_body(Msg)),
     Config = #{psks => #{?IDENTITY => ?SECRET}, psk_callback => undefined},
     %% Server accepts both; client preference is psk_ke first.
-    {ok, Sel} = quic_tls:select_psk(CHMap, Msg, Config, [psk_ke, psk_dhe_ke], aes_128_gcm),
+    {ok, Sel} = select_psk(CHMap, Msg, Config, [psk_ke, psk_dhe_ke]),
     ?assertEqual(psk_ke, maps:get(mode, Sel)).
 
 select_psk_bad_binder_test() ->
@@ -188,7 +188,7 @@ select_psk_bad_binder_test() ->
     Config = #{psks => #{?IDENTITY => ?SECRET}, psk_callback => undefined},
     ?assertEqual(
         {error, bad_binder},
-        quic_tls:select_psk(CHMap, Corrupted, Config, [psk_dhe_ke], aes_128_gcm)
+        select_psk(CHMap, Corrupted, Config, [psk_dhe_ke])
     ).
 
 select_psk_no_pre_shared_key_returns_none_test() ->
@@ -201,7 +201,12 @@ select_psk_no_pre_shared_key_returns_none_test() ->
     {Msg, _, _} = quic_tls:build_client_hello(Opts),
     {ok, CHMap} = quic_tls:parse_client_hello(ch_body(Msg)),
     Config = #{psks => #{?IDENTITY => ?SECRET}, psk_callback => undefined},
-    ?assertEqual(none, quic_tls:select_psk(CHMap, Msg, Config, [psk_dhe_ke], aes_128_gcm)).
+    ?assertEqual(none, select_psk(CHMap, Msg, Config, [psk_dhe_ke])).
+
+%% The server looks the identity up once, then checks the binder.
+select_psk(CHMap, Msg, Config, Modes) ->
+    Known = quic_tls_negotiation:known_external_psk(CHMap, Config),
+    quic_tls:select_psk(CHMap, Msg, Known, Modes, aes_128_gcm).
 
 %%====================================================================
 %% ServerHello PSK echo + key_share omission

@@ -3,7 +3,7 @@
 %%% TLS 1.3 negotiation choices: cipher suite, ALPN protocol, and
 %%% key-exchange group.
 %%%
-%%% Pure functions over what the ClientHello offered and what this
+%%% Functions over what the ClientHello offered and what this
 %%% endpoint is configured to accept. They decide; `quic_connection'
 %%% acts on the decision.
 %%%
@@ -15,6 +15,8 @@
 
 -export([
     select_cipher/2,
+    select_cipher/3,
+    known_external_psk/2,
     cipher_code_to_atom/1,
     cipher_atom_to_code/1,
     negotiate_alpn/2,
@@ -44,6 +46,68 @@ select_cipher(ClientCipherSuites, ServerPreference) ->
             end;
         _ ->
             select_first_match(ServerPreference, ClientCiphers)
+    end.
+
+%% @doc Server: as `select_cipher/2', preferring a suite of the PSK's `Hash' (RFC 9846 §4.3.11).
+-spec select_cipher([integer()], [atom()], sha256 | sha384 | undefined) -> atom() | none.
+select_cipher(ClientCipherSuites, ServerPreference, undefined) ->
+    select_cipher(ClientCipherSuites, ServerPreference);
+select_cipher(ClientCipherSuites, ServerPreference, Hash) ->
+    OfHash = [C || C <- ServerPreference, quic_crypto:cipher_to_hash(C) =:= Hash],
+    case select_cipher(ClientCipherSuites, OfHash) of
+        none -> select_cipher(ClientCipherSuites, ServerPreference);
+        Cipher -> Cipher
+    end.
+
+%% @doc Server: the first offered external PSK `PskConfig' knows, each identity looked up once.
+-spec known_external_psk(map(), map() | undefined) ->
+    {ok, #{identity_idx := non_neg_integer(), identity := binary(), secret := binary()}} | none.
+known_external_psk(#{pre_shared_key := #{identities := Identities}}, #{} = PskConfig) ->
+    find_known_psk(Identities, 0, PskConfig);
+known_external_psk(_ClientHello, _PskConfig) ->
+    none.
+
+find_known_psk([], _Idx, _PskConfig) ->
+    none;
+find_known_psk([{Identity, _Age} | Rest], Idx, PskConfig) ->
+    case lookup_psk_secret(Identity, PskConfig) of
+        {ok, Secret} -> {ok, #{identity_idx => Idx, identity => Identity, secret => Secret}};
+        not_found -> find_known_psk(Rest, Idx + 1, PskConfig)
+    end.
+
+lookup_psk_secret(Identity, #{psk_callback := Fn} = Config) when is_function(Fn, 1) ->
+    case safe_callback(Fn, Identity) of
+        {ok, Secret} when is_binary(Secret) ->
+            {ok, Secret};
+        _ ->
+            lookup_in_psk_map(Identity, Config)
+    end;
+lookup_psk_secret(Identity, Config) ->
+    lookup_in_psk_map(Identity, Config).
+
+lookup_in_psk_map(Identity, #{psks := Map}) when is_map(Map) ->
+    case maps:find(Identity, Map) of
+        {ok, Secret} when is_binary(Secret) -> {ok, Secret};
+        _ -> not_found
+    end;
+lookup_in_psk_map(_Identity, _) ->
+    not_found.
+
+safe_callback(Fn, Identity) ->
+    try Fn(Identity) of
+        Result -> Result
+    catch
+        Class:Reason:Stack ->
+            logger:warning(
+                #{
+                    what => psk_callback_failed,
+                    class => Class,
+                    reason => Reason,
+                    stack => Stack
+                },
+                #{domain => [erlang_quic, tls]}
+            ),
+            not_found
     end.
 
 select_first_match([], _) ->

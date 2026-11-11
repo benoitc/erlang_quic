@@ -68,8 +68,9 @@ external_psk_needs_a_sha256_suite_test() ->
     <<_:8, _:24, Body/binary>> = CH,
     {ok, CHMap} = quic_tls:parse_client_hello(Body),
     Config = #{psks => #{<<"id">> => <<"this-is-a-32-byte-test-secret!!!">>}},
-    ?assertMatch({ok, _}, quic_tls:select_psk(CHMap, CH, Config, [psk_dhe_ke], aes_128_gcm)),
-    ?assertEqual(none, quic_tls:select_psk(CHMap, CH, Config, [psk_dhe_ke], aes_256_gcm)).
+    Known = quic_tls_negotiation:known_external_psk(CHMap, Config),
+    ?assertMatch({ok, _}, quic_tls:select_psk(CHMap, CH, Known, [psk_dhe_ke], aes_128_gcm)),
+    ?assertEqual(none, quic_tls:select_psk(CHMap, CH, Known, [psk_dhe_ke], aes_256_gcm)).
 
 %% RFC 9846 Section 4.2.4: the ServerHello names the suite of the
 %% HelloRetryRequest before it.
@@ -175,3 +176,32 @@ ticket_accepted_with_a_suite_of_its_hash_test() ->
         (server_hello(chacha20_poly1305, Accepted, S))#state.hs
     ),
     ?assertExit({tls_alert, illegal_parameter}, server_hello(aes_256_gcm, Accepted, S)).
+
+%% RFC 9846 Section 4.3.11: a known external PSK steers the server to a
+%% suite of its hash when both sides allow one.
+psk_hash_steers_suite_selection_test() ->
+    Client = [?TLS_AES_256_GCM_SHA384, ?TLS_AES_128_GCM_SHA256],
+    Server = [aes_256_gcm, aes_128_gcm],
+    ?assertEqual(aes_128_gcm, quic_tls_negotiation:select_cipher(Client, Server, sha256)),
+    ?assertEqual(aes_256_gcm, quic_tls_negotiation:select_cipher(Client, Server, undefined)),
+    ?assertEqual(
+        aes_256_gcm, quic_tls_negotiation:select_cipher(Client, [aes_256_gcm], sha256)
+    ),
+    ?assertEqual(none, quic_tls_negotiation:select_cipher(Client, [chacha20_poly1305], sha256)).
+
+known_external_psk_needs_a_known_identity_test() ->
+    {CH, _, _} = quic_tls:build_client_hello(#{
+        server_name => <<"localhost">>,
+        alpn => [<<"h3">>],
+        transport_params => #{},
+        external_psk => {<<"id">>, <<"this-is-a-32-byte-test-secret!!!">>}
+    }),
+    <<_:8, _:24, Body/binary>> = CH,
+    {ok, CHMap} = quic_tls:parse_client_hello(Body),
+    Known = #{psks => #{<<"id">> => <<"this-is-a-32-byte-test-secret!!!">>}},
+    ?assertMatch(
+        {ok, #{identity_idx := 0, identity := <<"id">>}},
+        quic_tls_negotiation:known_external_psk(CHMap, Known)
+    ),
+    ?assertEqual(none, quic_tls_negotiation:known_external_psk(CHMap, #{psks => #{}})),
+    ?assertEqual(none, quic_tls_negotiation:known_external_psk(CHMap, undefined)).
