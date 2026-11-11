@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- An auth callback can return `{ok, {authenticated_node, Node}}`;
+  quic_dist then refuses a peer whose dist node name differs from the
+  authenticated one. Before, nothing tied the node a callback had
+  authenticated to the name the peer then used in the dist handshake.
+  Other return values work as before.
+
 ## [2.6.1] - 2026-11-08
 
 ### Fixed

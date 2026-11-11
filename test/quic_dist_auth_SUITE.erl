@@ -26,6 +26,9 @@
     auth_server_denies/1,
     auth_callback_hang_unbounded/1,
     auth_ok_repeated_connects/1,
+    auth_identity_match/1,
+    auth_identity_server_mismatch/1,
+    auth_identity_client_mismatch/1,
     register_with_epmd_visible/1
 ]).
 
@@ -39,6 +42,9 @@ all() ->
         auth_server_denies,
         auth_callback_hang_unbounded,
         auth_ok_repeated_connects,
+        auth_identity_match,
+        auth_identity_server_mismatch,
+        auth_identity_client_mismatch,
         register_with_epmd_visible
     ].
 
@@ -123,6 +129,104 @@ auth_ok_repeated_connects(Config) ->
     ct:log("target output:~n~s", [drain_port(TargetUdp)]),
     ?assertEqual(connected, Result).
 
+%% Both callbacks name the node really on the other end: admitted.
+auth_identity_match(Config) ->
+    Probe = probe_name("idok"),
+    {Target, Nodeups, Out} = identity_run(Config, "idok", Probe, atom_to_list(Probe), same),
+    ?assertEqual(connected, maps:get(verdict, Out)),
+    ?assertEqual([Probe], Nodeups),
+    ?assertNotEqual(Probe, Target).
+
+%% The server authenticated another node than the one the probe announces
+%% in the dist handshake: refused before the probe is ever up.
+auth_identity_server_mismatch(Config) ->
+    Probe = probe_name("idsrv"),
+    {_Target, Nodeups, Out} = identity_run(Config, "idsrv", Probe, "qauth_other@127.0.0.1", same),
+    ?assertEqual(refused, maps:get(verdict, Out)),
+    ?assertEqual([], Nodeups),
+    Mismatch = #{
+        what => dist_auth_identity_mismatch,
+        authenticated => 'qauth_other@127.0.0.1',
+        claimed => atom_to_list(Probe)
+    },
+    ?assert(lists:member(Mismatch, maps:get(target_events, Out))).
+
+%% The client authenticated another node than the one it dialed.
+auth_identity_client_mismatch(Config) ->
+    Probe = probe_name("idcli"),
+    {Target, Nodeups, Out} =
+        identity_run(Config, "idcli", Probe, atom_to_list(Probe), "qauth_other@127.0.0.1"),
+    ?assertEqual(refused, maps:get(verdict, Out)),
+    ?assertEqual([], Nodeups),
+    Mismatch = #{
+        what => dist_auth_identity_mismatch,
+        authenticated => 'qauth_other@127.0.0.1',
+        claimed => Target
+    },
+    ?assert(lists:member(Mismatch, maps:get(probe_events, Out))).
+
+%% Boot a target whose callback reports ServerSees and a probe named Probe
+%% whose callback reports ClientSees (`same' for the target's own name).
+%% The target records every node that comes up, hidden ones included, and
+%% both nodes record what they log.
+identity_run(Config, Tag, Probe, ServerSees, ClientSees) ->
+    Cb = "quic_dist_auth_test_cb:reports_peer_node",
+    PrivDir = ?config(priv_dir, Config),
+    NodeupFile = filename:join(PrivDir, "nodeups_" ++ Tag),
+    TargetEvents = filename:join(PrivDir, "target_events_" ++ Tag),
+    ProbeEvents = filename:join(PrivDir, "probe_events_" ++ Tag),
+    Spec = #{
+        tag => Tag,
+        auth_cb => Cb,
+        extra_args => ["-qauth_peer_node", ServerSees | event_log_args(TargetEvents)],
+        extra_eval => lists:flatten(
+            io_lib:format(
+                "spawn(fun() -> ok = net_kernel:monitor_nodes(true, [{node_type, all}]),"
+                " L = fun Loop() -> receive {nodeup, N, _} ->"
+                " ok = file:write_file(\"~s\", io_lib:format(\"~~p.~~n\", [N]), [append]),"
+                " Loop() end end, L() end),",
+                [NodeupFile]
+            )
+        )
+    },
+    {Target, _Port, Cookie, TargetUdp} = start_target(Config, Spec),
+    PeerArg =
+        case ClientSees of
+            same -> atom_to_list(Target);
+            Name -> Name
+        end,
+    ProbeOpts = #{
+        probe => Probe,
+        extra_args => ["-qauth_peer_node", PeerArg | event_log_args(ProbeEvents)]
+    },
+    {Verdict, _ProbeOut} = probe_run(Config, Tag, Target, Cookie, Cb, 10000, ProbeOpts),
+    ct:log("target output:~n~s", [drain_port(TargetUdp)]),
+    Out = #{
+        verdict => Verdict,
+        probe_events => consult_or_empty(ProbeEvents),
+        target_events => consult_or_empty(TargetEvents)
+    },
+    ct:log("identity run: ~p", [Out]),
+    {Target, consult_or_empty(NodeupFile), Out}.
+
+%% quic logs under its own domain, which the default handler drops, so
+%% each node also gets a handler that writes its reports to File.
+event_log_args(File) ->
+    Handler = io_lib:format(
+        "[{handler,qauth_events,quic_dist_auth_test_cb,#{config=>#{file=>~p}}}]", [File]
+    ),
+    ["-kernel", "logger", lists:flatten(Handler)].
+
+consult_or_empty(File) ->
+    case file:consult(File) of
+        {ok, Terms} -> Terms;
+        {error, enoent} -> []
+    end.
+
+probe_name(Tag) ->
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    list_to_atom("qauth_probe_" ++ Tag ++ "_" ++ Suffix ++ "@127.0.0.1").
+
 register_with_epmd_visible(Config) ->
     %% Boot a target with register_with_epmd=true and have it write its
     %% own quic_epmd:names/1 result to a file. Verify the short name is
@@ -173,6 +277,7 @@ start_target(Config, Spec) ->
     AuthTimeout = maps:get(auth_timeout, Spec, 10000),
     RegisterEpmd = maps:get(register_with_epmd, Spec, false),
     ExtraEval = maps:get(extra_eval, Spec, ""),
+    ExtraArgs = maps:get(extra_args, Spec, []),
 
     AuthArgs =
         case AuthCb of
@@ -228,7 +333,7 @@ start_target(Config, Spec) ->
             "-noinput",
             "-eval",
             Eval
-        ] ++ AuthArgs ++ EpmdArgs,
+        ] ++ AuthArgs ++ EpmdArgs ++ ExtraArgs,
 
     ErlExe = os:find_executable("erl"),
     Port = erlang:open_port({spawn_executable, ErlExe}, [
@@ -252,15 +357,19 @@ run_probe(Config, Tag, Target, TargetUdp, Cookie, AuthCb, AuthTimeout) ->
     run_probe(Config, Tag, Target, TargetUdp, Cookie, AuthCb, AuthTimeout, 1).
 
 run_probe(Config, Tag, Target, _TargetUdp, Cookie, AuthCb, AuthTimeout, Repeat) ->
+    {Verdict, _Out} = probe_run(
+        Config, Tag, Target, Cookie, AuthCb, AuthTimeout, #{repeat => Repeat}
+    ),
+    Verdict.
+
+probe_run(Config, Tag, Target, Cookie, AuthCb, AuthTimeout, Opts) ->
     CertDir = ?config(cert_dir, Config),
     PrivDir = ?config(priv_dir, Config),
     CertFile = filename:join(CertDir, "cert.pem"),
     KeyFile = filename:join(CertDir, "key.pem"),
-    Host = "127.0.0.1",
-    Suffix = integer_to_list(erlang:unique_integer([positive])),
-    Probe = list_to_atom(
-        "qauth_probe_" ++ Tag ++ "_" ++ Suffix ++ "@" ++ Host
-    ),
+    Repeat = maps:get(repeat, Opts, 1),
+    Probe = maps:get(probe, Opts, probe_name(Tag)),
+    ExtraArgs = maps:get(extra_args, Opts, []),
     ProbePort = pick_port(),
     ResultFile = filename:join(PrivDir, "probe_result_" ++ Tag),
 
@@ -339,7 +448,7 @@ run_probe(Config, Tag, Target, _TargetUdp, Cookie, AuthCb, AuthTimeout, Repeat) 
             "-noinput",
             "-eval",
             Eval
-        ] ++ AuthArgs,
+        ] ++ AuthArgs ++ ExtraArgs,
 
     ErlExe = os:find_executable("erl"),
     Port = erlang:open_port({spawn_executable, ErlExe}, [
@@ -350,12 +459,14 @@ run_probe(Config, Tag, Target, _TargetUdp, Cookie, AuthCb, AuthTimeout, Repeat) 
     ]),
     Out = wait_for_port_exit(Port, 30000),
     ct:log("probe ~s output:~n~s", [Tag, Out]),
-    case file:read_file(ResultFile) of
-        {ok, Bin} ->
-            list_to_atom(string:trim(binary_to_list(Bin)));
-        {error, _} ->
-            no_result
-    end.
+    Verdict =
+        case file:read_file(ResultFile) of
+            {ok, Bin} ->
+                list_to_atom(string:trim(binary_to_list(Bin)));
+            {error, _} ->
+                no_result
+        end,
+    {Verdict, Out}.
 
 %%====================================================================
 %% Low-level helpers

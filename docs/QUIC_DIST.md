@@ -501,7 +501,7 @@ The input handler:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `auth_callback` | `{Mod,Fun}` \| `fun/3` | `undefined` | Optional auth handshake run after the QUIC handshake but before `dist_util` |
+| `auth_callback` | `{Mod,Fun}` \| `fun/3` | `undefined` | Optional auth handshake run after the QUIC handshake but before `dist_util`; returning `{ok, {authenticated_node, Node}}` binds the connection to `Node` |
 | `auth_handshake_timeout` | integer | 10000 | Deadline (ms) for the QUIC handshake to complete before the callback runs; also passed to the callback |
 | `register_with_epmd` | boolean | `false` | When `true`, register the listening port via the configured `epmd_module` so external tooling (e.g. `epmd -names`) can resolve it |
 
@@ -522,6 +522,26 @@ Do not open a stream: stream ids are assigned in open order and both
 sides assume the control stream is stream 0, so an extra stream opened
 during authentication shifts every stream after it. See the
 `quic_dist_auth` behaviour module.
+
+To bind the connection to the node your callback authenticated, return
+`{ok, {authenticated_node, Node}}` with `Node` an atom:
+
+```erlang
+authenticate(Conn, _Side, _Timeout) ->
+    case verify_peer_key(Conn) of
+        {ok, Node} -> {ok, {authenticated_node, Node}};
+        {error, _} = Err -> Err
+    end.
+```
+
+quic_dist then refuses the connection unless the peer's dist node name
+is `Node`. On the server it checks the name the peer announces in the
+dist handshake, before the peer is marked pending or up, so it never
+shows in `nodes()` under another name; a peer asking for a dynamic name
+is refused too. The mismatch is logged as `dist_auth_identity_mismatch`.
+On the client it checks that `Node` is the node being dialed, and
+`net_kernel:connect_node/1` returns `false` otherwise. Any other
+`{ok, Info}` admits the peer without the check.
 
 On the server the callback runs in the dist controller, which owns the
 connection from the first packet; the acceptor is notified only once

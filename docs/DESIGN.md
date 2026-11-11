@@ -546,6 +546,16 @@ opened during authentication shifts everything that follows.
 Connection-level checks are what the hook is for: peer certificate,
 ALPN, transport parameters, PSK identity.
 
+A callback that returns `{ok, {authenticated_node, Node}}` binds the
+connection to `Node`. On the server the controller keeps it, and the
+dist worker's receive hands the controller the name the peer announces
+in its first handshake message, read as `dist_util` reads it. Any other
+name, or a request for a dynamic name, stops the controller and fails
+the receive, so `dist_util` shuts the handshake down before
+`mark_pending`. On the client the setup process refuses the connection
+when `Node` is not the node it dialed. Other `{ok, Info}` values bind
+nothing.
+
 Nothing bounds a callback that has already started. The
 `auth_handshake_timeout` guards the wait for the QUIC handshake to
 complete, not the callback's own execution.
