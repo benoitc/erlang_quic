@@ -87,8 +87,14 @@ on `inet6`, `{ip, _}` or `{ifaddr, _}`.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `pool_size` | integer | 1 | Number of listener processes |
-| `connection_handler` | function | - | Callback for new connections: returns `{ok, OwnerPid}`, or `{error, Reason}` to decline |
+| `connection_handler` | function | - | Callback for new connections: returns `{ok, OwnerPid}`, or `{error, Reason}` to decline; a declined client is answered with CONNECTION_REFUSED |
 | `alpn_handler` | fun/2 | - | Picks each connection's owner by the negotiated ALPN; see below |
+| `max_connections` | integer or `infinity` | `infinity` | Cap on concurrent connections; a client past it is answered with CONNECTION_REFUSED |
+
+A refused client gets CONNECTION_CLOSE in an Initial packet and stops at
+once instead of waiting for its handshake timeout (RFC 9000 Section
+5.2.2). Each listener sends at most 100 of these per second and drops the
+rest without a reply.
 
 ### Advanced Options
 
@@ -163,7 +169,8 @@ handle_connection(ConnPid, _DCID) ->
 
     %% Spawn a process to handle this connection. It becomes the owner
     %% of the connection. Return {error, Reason} instead to decline the
-    %% connection: the listener stops it without answering the client.
+    %% connection: the listener stops it and answers the client with
+    %% CONNECTION_REFUSED.
     {ok, spawn(fun() -> connection_loop(ConnPid) end)}.
 
 %% Start server with handler
