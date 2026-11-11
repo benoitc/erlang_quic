@@ -883,6 +883,7 @@ init({server, Opts}) ->
             listener = Listener,
             ticket_table = maps:get(ticket_table, Opts, undefined),
             sni_callback = SniCallback,
+            alpn_handler = maps:get(alpn_handler, Opts, undefined),
             server_preferred_address = PreferredAddress,
             cid_config = maps:get(cid_config, Opts, undefined),
             congestion_threshold = maps:get(congestion_threshold, Opts, 2),
@@ -8030,16 +8031,28 @@ do_server_client_hello(
         {error, Phrase} ->
             send_tls_alert(?TLS_ALERT_HANDSHAKE_FAILURE, Phrase, StateSig);
         {ok, State} ->
-            do_server_client_hello_cont(
-                SelectedGroup, ClientPubKey, Cipher, KnownPsk, ClientHelloInfo, OriginalMsg, State
-            )
+            ALPN = negotiate_alpn(maps:get(alpn_protocols, ClientHelloInfo, []), State),
+            case run_alpn_handler(ALPN, State) of
+                {error, Phrase} ->
+                    send_tls_alert(?TLS_ALERT_HANDSHAKE_FAILURE, Phrase, State);
+                {ok, StateOwned} ->
+                    do_server_client_hello_cont(
+                        SelectedGroup,
+                        ClientPubKey,
+                        Cipher,
+                        KnownPsk,
+                        ClientHelloInfo,
+                        OriginalMsg,
+                        ALPN,
+                        StateOwned
+                    )
+            end
     end.
 
 %% @private Continue the ClientHello once the server cert/key are settled.
 do_server_client_hello_cont(
-    SelectedGroup, ClientPubKey, Cipher, KnownPsk, ClientHelloInfo, OriginalMsg, State
+    SelectedGroup, ClientPubKey, Cipher, KnownPsk, ClientHelloInfo, OriginalMsg, ALPN, State
 ) ->
-    ClientALPN = maps:get(alpn_protocols, ClientHelloInfo, []),
     ClientRandom = maps:get(random, ClientHelloInfo, undefined),
     SessionId = maps:get(session_id, ClientHelloInfo, <<>>),
     %% Check for PSK (0-RTT/resumption/external)
@@ -8170,8 +8183,6 @@ do_server_client_hello_cont(
                 Exchange
         end,
 
-    ALPN = negotiate_alpn(ClientALPN, State),
-
     %% Build ServerHello. For PSK handshakes the ServerHello
     %% carries `selected_psk_identity'; for psk_ke it also
     %% omits key_share (RFC 8446 §4.2.9).
@@ -8295,6 +8306,37 @@ negotiate_alpn(ClientALPN, #state{cfg = #conn_cfg{alpn_list = ALPNList}} = State
             alert_and_exit(?TLS_ALERT_NO_APPLICATION_PROTOCOL, State, no_application_protocol);
         ALPN ->
             ALPN
+    end.
+
+%% Runs before any stream data can be decoded: neither 1-RTT nor 0-RTT
+%% keys exist yet, so the new owner sees every event.
+run_alpn_handler(_ALPN, #state{cfg = #conn_cfg{alpn_handler = undefined}} = State) ->
+    {ok, State};
+run_alpn_handler(undefined, State) ->
+    {ok, State};
+run_alpn_handler(ALPN, #state{cfg = #conn_cfg{alpn_handler = Fn}} = State) ->
+    try Fn(self(), ALPN) of
+        {ok, Owner} when is_pid(Owner) ->
+            {ok, reown(State, Owner)};
+        Other ->
+            ?LOG_WARNING(
+                #{what => alpn_handler_rejected, alpn => ALPN, result => Other},
+                ?QUIC_LOG_META
+            ),
+            {error, <<"alpn handler rejected the connection">>}
+    catch
+        Class:Reason:Stack ->
+            ?LOG_WARNING(
+                #{
+                    what => alpn_handler_failed,
+                    alpn => ALPN,
+                    class => Class,
+                    reason => Reason,
+                    stacktrace => Stack
+                },
+                ?QUIC_LOG_META
+            ),
+            {error, <<"alpn handler failed">>}
     end.
 
 check_negotiated_alpn(_ALPN, #state{cfg = #conn_cfg{alpn_list = []}}) ->

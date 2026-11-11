@@ -10,6 +10,15 @@ All notable changes to this project will be documented in this file.
   authenticated one. Before, nothing tied the node a callback had
   authenticated to the name the peer then used in the dist handshake.
   Other return values work as before.
+- Listener option `alpn_handler`, called with the connection and the
+  negotiated ALPN during the handshake, returns the connection's owner.
+  One listener can then hand each protocol to its own process, before
+  any stream data arrives. A handler that is not a fun of arity 2 is
+  refused when the server starts.
+- `quic_h3:accept/2` starts the server side of HTTP/3 on a connection
+  the application already holds, such as one an `alpn_handler` picked
+  for `h3`. It takes the per-connection options of
+  `quic_h3:start_server/3`.
 
 ### Changed
 - The default `pool_size` now runs one listener, as documented. It ran
@@ -26,6 +35,26 @@ All notable changes to this project will be documented in this file.
   `{closed, {tls_alert, Reason}}`.
 - With `idle_timeout => 0`, a handshake that hears nothing from the peer
   now ends after `disconnect_timeout` instead of never.
+- A FIN on the peer's control or QPACK streams went unnoticed; only a
+  reset closed the connection. Both now close it with
+  H3_CLOSED_CRITICAL_STREAM (RFC 9114 Section 6.2.1, RFC 9204 Section
+  4.2).
+- More streams waiting for the QPACK encoder stream than
+  SETTINGS_QPACK_BLOCKED_STREAMS allows now close the connection with
+  QPACK_DECOMPRESSION_FAILED, for trailers as well as HEADERS. Before,
+  blocked HEADERS past the limit only reset their stream, and blocked
+  trailers were not counted at all (RFC 9204 Section 2.1.2).
+- DATA before HEADERS on a request stream, HEADERS or DATA after the
+  trailers, and HEADERS or PUSH_PROMISE on an established CONNECT tunnel
+  now close the connection with H3_FRAME_UNEXPECTED instead of resetting
+  the stream (RFC 9114 Sections 4.1 and 4.4).
+- A server receiving CANCEL_PUSH for a push ID it never promised now
+  closes the connection with H3_ID_ERROR (RFC 9114 Section 7.2.3).
+- PRIORITY_UPDATE on a request or push stream, or received by a client,
+  was ignored or applied. It now closes the connection with
+  H3_FRAME_UNEXPECTED. On a server, one naming a stream that is not a
+  request stream, or a push not yet promised, closes it with H3_ID_ERROR
+  (RFC 9218 Section 7.2).
 
 ### Fixed
 - A write to a stream whose sending side had been reset, by the
@@ -218,6 +247,128 @@ All notable changes to this project will be documented in this file.
 - A client accepted a server that took its PSK, external or a resumption
   ticket, with a cipher suite whose hash is not the PSK's. It now aborts
   with illegal_parameter (RFC 9846 Section 4.3.11).
+- After `cancel_stream`, the rest of the request body was read as a new
+  request, so a HEADERS frame inside a body could be delivered as a
+  second request. A cancelled stream is now ignored until the peer ends
+  it, and the peer is asked to stop sending (RFC 9114 Section 4.1.1, RFC
+  9000 Section 3.5).
+- After `cancel_stream` on a request whose last bytes had reached the
+  QUIC connection but not yet the HTTP/3 one, those bytes were read as
+  the start of a new stream: a HEADERS frame among them became a second
+  request, anything else could close the connection. They are dropped
+  until the stream's end has been seen (RFC 9114 Section 4.1.1).
+- A request stream reset for an error of its own, a malformed message
+  for example, kept being read: only RESET_STREAM was sent, so the peer
+  went on sending a body nobody wanted. STOP_SENDING is sent as well, as
+  on `cancel_stream`, and the stream is forgotten once the peer has
+  ended it; one that failed at its FIN used to stay for the life of the
+  connection (RFC 9114 Section 8, RFC 9000 Section 3.5).
+- When several requests waiting for QPACK encoder stream data were
+  unblocked together and one was malformed, the others lost their state
+  or were never processed. Only the malformed one is reset now (RFC 9204
+  Section 2.1.2).
+- A stream reset while its HEADERS were waiting for the QPACK encoder
+  stream stayed blocked, and a later insertion delivered a request on
+  the reset stream. It is no longer blocked. Stream Cancellation now goes
+  to the peer for every request or push stream given up before it was
+  read to the end, by either side, not only for blocked ones, so the
+  peer's encoder can evict what that stream referred to (RFC 9204
+  Section 2.2.2.2).
+- A server remembered every push ID a client cancelled, promised or not,
+  so that set could grow without limit. A CANCEL_PUSH for a promised push
+  with no open stream is now ignored (RFC 9114 Section 7.2.3).
+- A server that answered requests without registering a stream handler
+  kept each request's unread body buffered after the exchange finished,
+  and eventually reset every new request with H3_EXCESSIVE_LOAD. The
+  buffer is released when the stream finishes.
+- The QPACK encoder kept an entry for every field section it sent,
+  including those a decoder never acknowledges, so memory grew with
+  every stream. Only sections that use the dynamic table are tracked,
+  each until the peer acknowledges it or cancels its stream, however the
+  stream ended, so the entries it uses are not evicted while the peer
+  may still need them.
+  Once 100 streams wait for acknowledgments, new streams are encoded
+  without the dynamic table, which bounds what a peer that never
+  acknowledges can make the encoder keep (RFC 9204 Sections 2.1.1 and
+  4.4.1).
+- The QPACK encoder could evict a dynamic table entry that a field
+  section still waiting for acknowledgment, or the section being
+  encoded, referred to, or one the peer had not yet acknowledged, and
+  inserted entries past the table capacity when nothing could be
+  evicted. The peer's decoder then failed on those sections. Such fields
+  are now sent as literals instead (RFC 9204 Section 2.1.1).
+- A Section Acknowledgment was sent for every field section received,
+  including those that do not use the dynamic table. A peer that checks
+  closes the connection with QPACK_DECODER_STREAM_ERROR. Only sections
+  with a non-zero Required Insert Count are acknowledged now (RFC 9204
+  Section 4.4.1).
+- The QPACK encoder encoded the Required Insert Count using our own
+  advertised table capacity instead of the peer's. When the two
+  differed, field sections stopped decoding after a few dynamic table
+  insertions (RFC 9204 Section 4.5.1.1).
+- An over-long integer on the QPACK decoder stream, or an insertion
+  naming a static table entry that does not exist on the encoder stream,
+  crashed the HTTP/3 connection process. They are now
+  QPACK_DECODER_STREAM_ERROR and QPACK_ENCODER_STREAM_ERROR (RFC 9204
+  Sections 3.1 and 6).
+- Huffman-encoded strings with more than 7 bits of padding, or padding
+  that is not all ones, were accepted. Both are decoding errors now (RFC
+  7541 Section 5.2, RFC 9204 Section 4.1.2).
+- DATA that followed HEADERS waiting for the QPACK encoder stream reset
+  the stream with H3_FRAME_UNEXPECTED, so a request with content failed
+  whenever its field section referred to a dynamic table entry that had
+  not arrived yet. What follows blocked HEADERS on a stream is now kept
+  and read in order once they decode. It counts against
+  `max_buffered_body` together with request bodies waiting for a handler
+  (RFC 9204 Section 2.1.2).
+- State kept for a peer's unidirectional stream (unknown stream types,
+  an incomplete stream type, streams claimed by a `stream_type_handler`)
+  was only released on a reset, so each stream ended with FIN left an
+  entry behind. It is released at the FIN (RFC 9114 Section 6.2.3).
+- A request or response with less content than its Content-Length was
+  accepted when the stream ended with a bare FIN, with trailers, or with
+  the HEADERS frame itself. All are now reset with H3_MESSAGE_ERROR (RFC
+  9114 Section 4.1.2).
+- A client held the tunnel of a successful CONNECT to the response's
+  Content-Length, and reset it once more bytes came. A 2xx response to
+  CONNECT has its Content-Length ignored (RFC 9110 Section 9.3.6).
+- `content-length: +10` and `:status: +200` were accepted. Both must be
+  digits only (RFC 9110 Sections 8.6 and 15); anything else is a
+  malformed message.
+- Trailers were only accepted when the stream's FIN arrived together
+  with their HEADERS frame; with the FIN in a later packet the stream
+  was reset with H3_FRAME_UNEXPECTED. HEADERS after the content are the
+  trailer section either way, and the message ends at the FIN (RFC 9114
+  Section 4.1).
+- PUSH_PROMISE after a response's trailers reset the stream. It is not
+  part of the response and is now accepted (RFC 9114 Section 4.1).
+- A server ignored a request stream that ended with no HEADERS at all,
+  empty or holding only frames of unknown types, and kept an entry for
+  it. The stream is now reset with H3_REQUEST_INCOMPLETE and forgotten
+  (RFC 9114 Section 4.1).
+- After a push was cancelled, bytes still arriving on its stream were
+  read as the start of a new unidirectional stream and could close the
+  connection. The stream is now ignored, and a push the client cancelled
+  is stopped with H3_REQUEST_CANCELLED (RFC 9114 Section 7.2.3).
+- A pushed response that arrived whole in one packet, from the push ID
+  to the FIN, never completed: the client got its headers and data but
+  no `push_complete`, and kept the push for the life of the connection.
+  The FIN is now seen wherever it arrives (RFC 9114 Section 4.6).
+- Push trailers whose FIN came in a later packet closed the connection,
+  and a push whose FIN came after its last DATA frame never completed.
+  Both now complete at the FIN, and anything but the FIN after push
+  trailers is H3_FRAME_UNEXPECTED (RFC 9114 Section 4.1).
+- A client that received GOAWAY gave up every response still waiting
+  for the QPACK encoder stream, including those to requests the server
+  had said it would answer, and a server did the same on a client's
+  GOAWAY, which only concerns pushes. Only requests at or above the
+  server's GOAWAY ID are given up now (RFC 9114 Section 5.2).
+- HTTP datagrams for a request stream this side had reset were still
+  delivered, and could still be sent. They are now dropped, and
+  `quic_h3:send_datagram/3` returns `{error, unknown_stream}` (RFC 9297
+  Section 2.1).
+- `send_trailers/3` on a stream that had finished or been reset crashed
+  the HTTP/3 connection process. It returns `{error, unknown_stream}`.
 
 ## [2.6.1] - 2026-11-08
 

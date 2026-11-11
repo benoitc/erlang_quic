@@ -40,6 +40,7 @@
     new/1,
     encode/2,
     encode/3,
+    release_stream/2,
     decode/2,
     decode/3
 ]).
@@ -47,6 +48,7 @@
 %% Dynamic table management
 -export([
     set_dynamic_capacity/2,
+    set_peer_max_capacity/2,
     get_dynamic_capacity/1,
     get_insert_count/1,
     get_last_ric/1,
@@ -83,6 +85,10 @@
 
 -include("quic_qpack_static_table.hrl").
 
+%% Streams with unacknowledged sections; the default stream limit (100) is
+%% about what a peer that acknowledges has in flight at once.
+-define(MAX_UNACKED_STREAMS, 100).
+
 %% State record for stateful encoding/decoding
 -record(qpack, {
     %% Dynamic table configuration
@@ -107,7 +113,11 @@
     %% Required insert count for last encoded block
     last_ric = 0 :: non_neg_integer(),
     %% Map of StreamId -> queue of outstanding RIC values (oldest first)
-    pending_sections = #{} :: #{non_neg_integer() => queue:queue(non_neg_integer())}
+    pending_sections = #{} :: #{non_neg_integer() => queue:queue(non_neg_integer())},
+    %% For an encoder state: the decoder's SETTINGS_QPACK_MAX_TABLE_CAPACITY,
+    %% which the Required Insert Count is encoded against. Until it is set,
+    %% max_allowed_capacity stands in for it.
+    peer_max_capacity :: non_neg_integer() | undefined
 }).
 
 -opaque state() :: #qpack{}.
@@ -189,7 +199,7 @@ encode(Headers, State) ->
     %% silently corrupts the section once a value reaches the prefix maximum
     %% (e.g. an encoded insert count of 255 on a long-lived dynamic table),
     %% because the decoder then reads a continuation byte that was never sent.
-    RICEncoded = encode_prefixed_int(encode_ric(RIC, State#qpack.max_allowed_capacity), 8, 0),
+    RICEncoded = encode_prefixed_int(encode_ric(RIC, ric_capacity(State)), 8, 0),
     BaseEncoded = encode_prefixed_int(BaseIC - RIC, 7, 0),
     Prefix = <<RICEncoded/binary, BaseEncoded/binary>>,
 
@@ -197,15 +207,30 @@ encode(Headers, State) ->
 
 %% @doc Encode headers with stream tracking for section acknowledgment.
 %% This variant tracks the RIC per stream for proper section_ack handling.
+%% RFC 9204 Section 4.4.1: only a section with a non-zero Required Insert
+%% Count is acknowledged, so only those are tracked. Once
+%% `MAX_UNACKED_STREAMS' streams wait for acknowledgments, a section for
+%% another stream uses literals and the static table only.
 -spec encode(headers(), non_neg_integer(), state()) -> {binary(), state()}.
+encode(Headers, StreamId, #qpack{pending_sections = Pending, use_dynamic = Dyn} = State) when
+    map_size(Pending) >= ?MAX_UNACKED_STREAMS, not is_map_key(StreamId, Pending)
+->
+    {Encoded, State1} = encode(Headers, State#qpack{use_dynamic = false}),
+    {Encoded, State1#qpack{use_dynamic = Dyn}};
 encode(Headers, StreamId, State) ->
-    {Encoded, State1} = encode(Headers, State),
-    RIC = State1#qpack.last_ric,
-    %% Append RIC to queue for this stream (FIFO: ack removes from front)
-    OldQueue = maps:get(StreamId, State1#qpack.pending_sections, queue:new()),
-    NewQueue = queue:in(RIC, OldQueue),
-    NewPending = maps:put(StreamId, NewQueue, State1#qpack.pending_sections),
-    {Encoded, State1#qpack{pending_sections = NewPending}}.
+    case encode(Headers, State) of
+        {Encoded, #qpack{last_ric = 0} = State1} ->
+            {Encoded, State1};
+        {Encoded, #qpack{last_ric = RIC, pending_sections = Pending} = State1} ->
+            %% Append RIC to queue for this stream (FIFO: ack removes from front)
+            Queue = queue:in(RIC, maps:get(StreamId, Pending, queue:new())),
+            {Encoded, State1#qpack{pending_sections = Pending#{StreamId => Queue}}}
+    end.
+
+%% @doc Forget the field sections still unacknowledged on a stream.
+-spec release_stream(non_neg_integer(), state()) -> state().
+release_stream(StreamId, #qpack{pending_sections = Pending} = State) ->
+    State#qpack{pending_sections = maps:remove(StreamId, Pending)}.
 
 %% @doc Decode QPACK-encoded headers with state.
 -spec decode(binary(), state()) ->
@@ -256,6 +281,14 @@ set_dynamic_capacity(Capacity, #qpack{max_allowed_capacity = Max} = State) ->
         encoder_instructions = [Instruction | State#qpack.encoder_instructions]
     },
     evict_to_fit(0, State1).
+
+%% @doc Tell an encoder the maximum table capacity its decoder advertised
+%% and set the capacity to it, or to our own ceiling if that is lower.
+%% RFC 9204 Section 4.5.1.1: the Required Insert Count is encoded modulo
+%% the decoder's maximum, not the capacity the encoder chose to use.
+-spec set_peer_max_capacity(non_neg_integer(), state()) -> state().
+set_peer_max_capacity(PeerMax, State) ->
+    set_dynamic_capacity(PeerMax, State#qpack{peer_max_capacity = PeerMax}).
 
 %% @doc Get dynamic table capacity.
 -spec get_dynamic_capacity(state()) -> non_neg_integer().
@@ -451,9 +484,12 @@ decode_set_capacity(Data) ->
 
 -spec apply_encoder_instruction(term(), state()) -> {ok, state()} | {error, term()}.
 apply_encoder_instruction({insert_name_ref, 1, Index, Value}, State) ->
-    %% Static table reference (get_static_entry throws on invalid index)
-    {Name, _} = get_static_entry(Index),
-    insert_entry(Name, Value, State);
+    try get_static_entry(Index) of
+        {Name, _} -> insert_entry(Name, Value, State)
+    catch
+        %% RFC 9204 Section 3.1: an encoder stream error.
+        throw:{invalid_static_index, Index} -> {error, {invalid_static_index, Index}}
+    end;
 apply_encoder_instruction({insert_name_ref, 0, Index, Value}, State) ->
     %% Dynamic table reference
     case get_dynamic_entry_by_relative(Index, State) of
@@ -506,7 +542,10 @@ process_decoder_instructions(Data, State) ->
             Error
     catch
         throw:incomplete ->
-            {incomplete, Data, State}
+            {incomplete, Data, State};
+        throw:{qpack_decompression_failed, Reason} ->
+            %% Thrown from the shared integer decoder (RFC 7541 Section 5.1).
+            {error, Reason}
     end.
 
 -spec decode_decoder_instruction(binary()) ->
@@ -584,6 +623,9 @@ decode_required_insert_count(_ERIC, 0, _InsertCount) ->
 decode_required_insert_count(ERIC, MaxEntries, InsertCount) ->
     quic_qpack_prefix:decode_ric(ERIC, MaxEntries, InsertCount).
 
+ric_capacity(#qpack{peer_max_capacity = undefined, max_allowed_capacity = Own}) -> Own;
+ric_capacity(#qpack{peer_max_capacity = PeerMax}) -> PeerMax.
+
 %% ERIC = (RIC mod (2 * MaxEntries)) + 1
 -spec encode_ric(non_neg_integer(), non_neg_integer()) -> non_neg_integer().
 encode_ric(0, _MaxSize) ->
@@ -602,7 +644,7 @@ encode_ric(RIC, MaxSize) ->
 encode_headers_tracking([], _BaseIC, State, Acc, MaxRef) ->
     {Acc, State, MaxRef};
 encode_headers_tracking([Header | Rest], BaseIC, State, Acc, MaxRef) ->
-    {Encoded, NewState, RefIndex} = encode_header_tracking(Header, BaseIC, State),
+    {Encoded, NewState, RefIndex} = encode_header_tracking(Header, BaseIC, MaxRef + 1, State),
     NewMaxRef =
         case RefIndex of
             none -> MaxRef;
@@ -612,9 +654,9 @@ encode_headers_tracking([Header | Rest], BaseIC, State, Acc, MaxRef) ->
 
 %% Encode header with tracking of referenced dynamic index
 %% This function also inserts entries into the dynamic table when appropriate
--spec encode_header_tracking(header(), non_neg_integer(), state()) ->
+-spec encode_header_tracking(header(), non_neg_integer(), non_neg_integer(), state()) ->
     {binary(), state(), integer() | none}.
-encode_header_tracking({Name, Value}, BaseIC, #qpack{use_dynamic = true} = State) ->
+encode_header_tracking({Name, Value}, BaseIC, InUse, #qpack{use_dynamic = true} = State) ->
     case find_dynamic_match(Name, Value, State) of
         {exact, AbsIndex} ->
             %% Check if peer has received this entry (can reference)
@@ -624,7 +666,7 @@ encode_header_tracking({Name, Value}, BaseIC, #qpack{use_dynamic = true} = State
                     {encode_indexed_dynamic(RelIndex), State, AbsIndex};
                 false ->
                     %% Entry exists but peer hasn't acked, use literal
-                    encode_with_insertion({Name, Value}, State)
+                    encode_with_insertion({Name, Value}, InUse, State)
             end;
         {name, AbsIndex} ->
             case can_reference(AbsIndex, State) of
@@ -632,13 +674,13 @@ encode_header_tracking({Name, Value}, BaseIC, #qpack{use_dynamic = true} = State
                     RelIndex = BaseIC - AbsIndex - 1,
                     {encode_literal_with_dynamic_name_ref(RelIndex, Value), State, AbsIndex};
                 false ->
-                    encode_with_insertion({Name, Value}, State)
+                    encode_with_insertion({Name, Value}, InUse, State)
             end;
         none ->
             %% No match in dynamic table, try to insert
-            encode_with_insertion({Name, Value}, State)
+            encode_with_insertion({Name, Value}, InUse, State)
     end;
-encode_header_tracking({Name, Value}, _BaseIC, State) ->
+encode_header_tracking({Name, Value}, _BaseIC, _InUse, State) ->
     {Encoded, NewState} = encode_header_static({Name, Value}, State),
     {Encoded, NewState, none}.
 
@@ -653,9 +695,12 @@ can_reference(AbsIndex, #qpack{known_received_count = KRC}) ->
 %% hasn't received yet. When we insert a new entry, we encode as literal because
 %% the encoder instruction hasn't been acknowledged. The entry is added to the
 %% dynamic table for future requests where it will be acknowledged.
--spec encode_with_insertion(header(), state()) -> {binary(), state(), integer() | none}.
-encode_with_insertion({Name, Value}, State) ->
-    case should_insert(Name, Value, State) of
+-spec encode_with_insertion(header(), non_neg_integer(), state()) ->
+    {binary(), state(), integer() | none}.
+encode_with_insertion({Name, Value}, InUse, State) ->
+    case
+        should_insert(Name, Value, State) andalso room_for(entry_size(Name, Value), InUse, State)
+    of
         true ->
             %% Insert into dynamic table and generate encoder instruction
             {State1, Instruction} = generate_insert_instruction(Name, Value, State),
@@ -907,6 +952,7 @@ decode_headers(<<2#01:2, _N:1, T:1, _:4, _/binary>> = Data, RIC, Base, State, Ac
         1 ->
             %% Static table reference
             {Name, _} = get_static_entry(Index),
+            (Index),
             decode_headers(
                 Rest2, RIC, Base, State, [{Name, Value} | Acc], left({Name, Value}, Left)
             );
@@ -1147,30 +1193,17 @@ insert_entry(Name, Value, State) ->
 entry_size(Name, Value) ->
     byte_size(Name) + byte_size(Value) + ?ENTRY_OVERHEAD.
 
-%% @doc Evict entries until there's room for an entry of the given size.
-%% RFC 9204 §3.2.1: an entry MUST NOT be evicted while still referenced by
-%% an unacknowledged section. We approximate this on the encoder by refusing
-%% to evict any entry whose absolute index is >= the smallest RIC across all
-%% pending sections. If no eviction is possible, leave the table as-is so
-%% the new insert is silently dropped.
+%% @doc Evict the oldest entries until there's room for an entry of the
+%% given size. The encoder checks room_for/3 first; a decoder evicts as told.
 -spec evict_to_fit(non_neg_integer(), state()) -> state().
 evict_to_fit(RequiredSize, #qpack{dyn_size = Size, dyn_max_size = MaxSize} = State) when
     Size + RequiredSize =< MaxSize
 ->
     State;
 evict_to_fit(_RequiredSize, #qpack{dyn_entries = []} = State) ->
-    %% No entries to evict
     State;
 evict_to_fit(RequiredSize, #qpack{dyn_entries = Entries} = State) ->
-    [{AbsIndex, _Header, _Sz} | _] = lists:reverse(Entries),
-    case is_entry_pinned(AbsIndex, State) of
-        true ->
-            %% Oldest entry is still referenced by an unacknowledged section;
-            %% bail out without evicting (§3.2.1).
-            State;
-        false ->
-            evict_oldest(RequiredSize, Entries, State)
-    end.
+    evict_oldest(RequiredSize, Entries, State).
 
 evict_oldest(RequiredSize, Entries, State) ->
     {Oldest, RestEntries} = lists:split(length(Entries) - 1, Entries),
@@ -1194,27 +1227,24 @@ evict_oldest(RequiredSize, Entries, State) ->
     },
     evict_to_fit(RequiredSize, State1).
 
-%% True if AbsIndex is referenced by any pending (unacked) section. A section
-%% with RIC R references entries [0..R-1], so entries with AbsIndex < R are
-%% pinned. We pin if AbsIndex < smallest pending RIC across all streams.
-is_entry_pinned(AbsIndex, #qpack{pending_sections = Pending}) when map_size(Pending) =:= 0 ->
-    AbsIndex >= 0 andalso false;
-is_entry_pinned(AbsIndex, #qpack{pending_sections = Pending}) ->
-    MinRIC = maps:fold(
-        fun(_StreamId, Q, Acc) ->
-            case queue:peek(Q) of
-                empty -> Acc;
-                {value, R} when Acc =:= undefined orelse R < Acc -> R;
-                _ -> Acc
-            end
-        end,
-        undefined,
-        Pending
-    ),
-    case MinRIC of
-        undefined -> false;
-        _ -> AbsIndex < MinRIC
-    end.
+%% RFC 9204 Section 2.1.1: an entry is evictable once its insertion is
+%% acknowledged and no unacknowledged section, the one being encoded
+%% included (it refers below InUse), may refer to it.
+room_for(Size, InUse, #qpack{dyn_entries = Entries, dyn_size = Used} = State) ->
+    Floor = max(InUse, max_pending_ric(State)),
+    Free = State#qpack.dyn_max_size - Used,
+    room_for(Size, Free, lists:reverse(Entries), Floor, State#qpack.known_received_count).
+
+room_for(Size, Free, _Entries, _Floor, _KRC) when Free >= Size ->
+    true;
+room_for(Size, Free, [{Abs, _, Sz} | Rest], Floor, KRC) when Abs < KRC, Abs >= Floor ->
+    room_for(Size, Free + Sz, Rest, Floor, KRC);
+room_for(_Size, _Free, _Entries, _Floor, _KRC) ->
+    false.
+
+%% A section with Required Insert Count R may refer to any entry below R.
+max_pending_ric(#qpack{pending_sections = Pending}) ->
+    maps:fold(fun(_Id, Q, Max) -> lists:max([Max | queue:to_list(Q)]) end, 0, Pending).
 
 %% @doc Get dynamic table entry by relative index.
 %% Relative index 0 is the most recently inserted entry.

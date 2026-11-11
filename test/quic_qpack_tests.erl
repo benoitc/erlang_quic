@@ -343,16 +343,19 @@ dynamic_large_insert_count_roundtrip_test() ->
             {ok, D1} = quic_qpack:process_encoder_instructions(
                 quic_qpack:get_encoder_instructions(E1), D
             ),
-            {quic_qpack:clear_encoder_instructions(E1), D1}
+            %% Acknowledged at once, so the oldest entries can be evicted.
+            {ok, E2} = quic_qpack:process_decoder_instructions(
+                quic_qpack:encode_insert_count_increment(1),
+                quic_qpack:clear_encoder_instructions(E1)
+            ),
+            {E2, D1}
         end,
         {E0, D0},
         lists:seq(0, 253)
     ),
-    {ok, Eack} = quic_qpack:process_decoder_instructions(
-        quic_qpack:encode_insert_count_increment(254), Ef
-    ),
+    ?assertEqual(254, quic_qpack:get_insert_count(Ef)),
     H = [{<<"h253">>, <<"v">>}],
-    {Ref, _E} = quic_qpack:encode(H, 999, Eack),
+    {Ref, _E} = quic_qpack:encode(H, 999, Ef),
     ?assertEqual({ok, H}, element(1, quic_qpack:decode(Ref, Df))).
 
 %%====================================================================
@@ -740,3 +743,210 @@ indexed_static_entry_without_value_test() ->
 static_entry_two_is_age_test() ->
     ?assertEqual({ok, [{<<"age">>, <<"0">>}]}, quic_qpack:decode(<<0, 0, 16#C2>>)),
     ?assertEqual(<<0, 0, 16#C2>>, quic_qpack:encode([{<<"age">>, <<"0">>}])).
+
+%%====================================================================
+%% Outstanding field sections (RFC 9204 §4.4.1)
+%%====================================================================
+
+%% A section with Required Insert Count 0 is never acknowledged, so
+%% encoding one with a stream ID leaves nothing behind for that stream.
+static_section_is_not_tracked_test() ->
+    H = [{<<":status">>, <<"200">>}],
+    E = quic_qpack:new(#{max_dynamic_size => 4096}),
+    ?assertEqual(quic_qpack:encode(H, E), quic_qpack:encode(H, 4, E)).
+
+%% One that references the dynamic table is, until it is acknowledged.
+dynamic_section_is_tracked_until_acked_test() ->
+    H = [{<<"x-custom">>, <<"value">>}],
+    E = encoder_with_acked_entry(H),
+    {Ref, Untracked} = quic_qpack:encode(H, E),
+    {Ref, Tracked} = quic_qpack:encode(H, 4, E),
+    ?assertEqual(1, quic_qpack:get_last_ric(Tracked)),
+    ?assertNotEqual(Untracked, Tracked),
+    ?assertEqual(
+        {ok, Untracked},
+        quic_qpack:process_decoder_instructions(quic_qpack:encode_section_ack(4), Tracked)
+    ).
+
+%% The acknowledgment is for the dynamic section even when a static one
+%% went out on the stream before it.
+section_ack_skips_static_sections_test() ->
+    H = [{<<"x-custom">>, <<"value">>}],
+    E0 = encoder_with_acked_entry(H),
+    {_, E1} = quic_qpack:encode([{<<":status">>, <<"103">>}], 4, E0),
+    {_, Untracked} = quic_qpack:encode(H, E1),
+    {_, Tracked} = quic_qpack:encode(H, 4, E1),
+    ?assertEqual(
+        {ok, Untracked},
+        quic_qpack:process_decoder_instructions(quic_qpack:encode_section_ack(4), Tracked)
+    ).
+
+%% A stream that is over is forgotten without an acknowledgment.
+release_stream_forgets_outstanding_sections_test() ->
+    H = [{<<"x-custom">>, <<"value">>}],
+    E = encoder_with_acked_entry(H),
+    {_, Untracked} = quic_qpack:encode(H, E),
+    {_, Tracked} = quic_qpack:encode(H, 4, E),
+    ?assertEqual(Tracked, quic_qpack:release_stream(8, Tracked)),
+    ?assertEqual(Untracked, quic_qpack:release_stream(4, Tracked)).
+
+%% Once 100 streams wait for acknowledgments, a section for another
+%% stream refers to no dynamic entry, so a peer that never acknowledges
+%% cannot grow what the encoder keeps. A stream already waiting, or one
+%% after an acknowledgment frees a slot, refers to the table again.
+unacknowledged_streams_are_bounded_test() ->
+    H = [{<<"x-custom">>, <<"value">>}],
+    E0 = encoder_with_acked_entry(H),
+    E1 = lists:foldl(
+        fun(N, E) ->
+            {_, E2} = quic_qpack:encode(H, 4 * N, E),
+            ?assertEqual(1, quic_qpack:get_last_ric(E2)),
+            E2
+        end,
+        E0,
+        lists:seq(0, 99)
+    ),
+    {Static, E3} = quic_qpack:encode(H, 400, E1),
+    ?assertEqual(0, quic_qpack:get_last_ric(E3)),
+    ?assertMatch(<<0, _/binary>>, Static),
+    ?assertEqual({ok, H}, quic_qpack:decode(Static)),
+    ?assertEqual(E3, quic_qpack:release_stream(400, E3)),
+    {_, E4} = quic_qpack:encode(H, 0, E1),
+    ?assertEqual(1, quic_qpack:get_last_ric(E4)),
+    {ok, E5} = quic_qpack:process_decoder_instructions(quic_qpack:encode_section_ack(8), E1),
+    {_, E6} = quic_qpack:encode(H, 400, E5),
+    ?assertEqual(1, quic_qpack:get_last_ric(E6)).
+
+%%====================================================================
+%% Evictable entries (RFC 9204 §2.1.1)
+%%====================================================================
+
+%% Room for one entry: a second needs the first evicted.
+-define(ONE_ENTRY, 64).
+
+%% An entry an unacknowledged section refers to is not evicted: the new
+%% field goes as a literal and the peer can still decode that section.
+an_entry_referenced_by_a_pending_section_is_not_evicted_test() ->
+    A = {<<"x-a">>, <<"1">>},
+    B = {<<"x-b">>, <<"2">>},
+    {E1, D1} = acked_pair([A]),
+    {Ref, E2} = quic_qpack:encode([A], 4, E1),
+    ?assertEqual(1, quic_qpack:get_last_ric(E2)),
+    {_, E3} = quic_qpack:encode([B], 8, E2),
+    ?assertEqual(<<>>, quic_qpack:get_encoder_instructions(E3)),
+    {ok, D2} = quic_qpack:process_encoder_instructions(quic_qpack:get_encoder_instructions(E3), D1),
+    ?assertEqual({ok, [A]}, element(1, quic_qpack:decode(Ref, D2))),
+    %% Once the section is acknowledged the entry can go.
+    {ok, E4} = quic_qpack:process_decoder_instructions(quic_qpack:encode_section_ack(4), E3),
+    {_, E5} = quic_qpack:encode([B], 12, E4),
+    ?assertNotEqual(<<>>, quic_qpack:get_encoder_instructions(E5)).
+
+%% Nor one the section being encoded refers to.
+an_entry_the_section_refers_to_is_not_evicted_test() ->
+    A = {<<"x-a">>, <<"1">>},
+    B = {<<"x-b">>, <<"2">>},
+    {E1, D1} = acked_pair([A]),
+    {Ref, E2} = quic_qpack:encode([A, B], 4, E1),
+    {ok, D2} = quic_qpack:process_encoder_instructions(quic_qpack:get_encoder_instructions(E2), D1),
+    ?assertEqual({ok, [A, B]}, element(1, quic_qpack:decode(Ref, D2))).
+
+%% Nor one whose insertion the decoder has not acknowledged.
+an_unacknowledged_entry_is_not_evicted_test() ->
+    E0 = quic_qpack:new(#{max_dynamic_size => ?ONE_ENTRY}),
+    {_, E1} = quic_qpack:encode([{<<"x-a">>, <<"1">>}], 0, E0),
+    E2 = quic_qpack:clear_encoder_instructions(E1),
+    {_, E3} = quic_qpack:encode([{<<"x-b">>, <<"2">>}], 4, E2),
+    ?assertEqual(<<>>, quic_qpack:get_encoder_instructions(E3)),
+    ?assertEqual(1, quic_qpack:get_insert_count(E3)).
+
+%% An encoder with room for one entry holding Fields, acknowledged, and the
+%% decoder that received them.
+acked_pair(Fields) ->
+    E0 = quic_qpack:new(#{max_dynamic_size => ?ONE_ENTRY}),
+    D0 = quic_qpack:new(#{max_dynamic_size => ?ONE_ENTRY}),
+    {_, E1} = quic_qpack:encode(Fields, 0, E0),
+    {ok, D1} = quic_qpack:process_encoder_instructions(quic_qpack:get_encoder_instructions(E1), D0),
+    {ok, E2} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(length(Fields)),
+        quic_qpack:clear_encoder_instructions(E1)
+    ),
+    {E2, D1}.
+
+%% An encoder whose dynamic table holds H, acknowledged by the decoder.
+encoder_with_acked_entry(H) ->
+    E0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    {_Literal, E1} = quic_qpack:encode(H, E0),
+    {ok, E2} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(1), quic_qpack:clear_encoder_instructions(E1)
+    ),
+    E2.
+
+%%====================================================================
+%% Instructions that cannot be interpreted (RFC 9204 §6)
+%%====================================================================
+
+%% RFC 7541 §5.1: an integer longer than the implementation takes is a
+%% decoding error. On the decoder stream it is returned, not thrown.
+decoder_instruction_with_overlong_integer_test() ->
+    Overlong = <<16#3F, (binary:copy(<<16#80>>, 9))/binary, 1>>,
+    ?assertEqual(
+        {error, prefixed_int_too_long},
+        quic_qpack:process_decoder_instructions(Overlong, quic_qpack:new())
+    ),
+    %% the same instruction with a value that fits
+    E0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    {_, E1} = quic_qpack:encode([{<<"x-custom">>, <<"value">>}], E0),
+    ?assertMatch({ok, _}, quic_qpack:process_decoder_instructions(<<1>>, E1)).
+
+%% RFC 9204 §3.1: the static table has entries 0 to 98.
+encoder_instruction_with_invalid_static_index_test() ->
+    D = quic_qpack:new(#{max_dynamic_size => 4096}),
+    %% Insert With Name Reference, static, index 99 then 98, value "v"
+    ?assertEqual(
+        {error, {invalid_static_index, 99}},
+        quic_qpack:process_encoder_instructions(<<16#FF, 36, 1, $v>>, D)
+    ),
+    {ok, D1} = quic_qpack:process_encoder_instructions(<<16#FF, 35, 1, $v>>, D),
+    ?assertEqual(1, quic_qpack:get_insert_count(D1)).
+
+%%====================================================================
+%% Required Insert Count against the decoder's maximum (RFC 9204 §4.5.1.1)
+%%====================================================================
+
+%% The encoder is willing to use more table than the decoder allows.
+%% MaxEntries is the decoder's, floor(100 / 32) = 3, so the encoded count
+%% wraps at 6: past that an encoder counting with its own 4096 sends a
+%% value the decoder cannot map back.
+ric_is_encoded_against_the_decoders_maximum_test() ->
+    ric_roundtrip(4096, 100).
+
+%% And the other way round: the decoder allows more than the encoder uses.
+ric_is_encoded_against_a_larger_decoder_maximum_test() ->
+    ric_roundtrip(64, 4096).
+
+ric_roundtrip(EncoderCeiling, DecoderMax) ->
+    E0 = quic_qpack:set_peer_max_capacity(
+        DecoderMax, quic_qpack:new(#{max_allowed_capacity => EncoderCeiling})
+    ),
+    ?assertEqual(min(EncoderCeiling, DecoderMax), quic_qpack:get_dynamic_capacity(E0)),
+    D0 = quic_qpack:new(#{max_allowed_capacity => DecoderMax}),
+    lists:foldl(
+        fun(N, {E, D}) ->
+            H = [{<<"x-", (integer_to_binary(N))/binary>>, <<"v">>}],
+            %% insert, let the decoder acknowledge, then refer to the entry
+            {_Literal, E1} = quic_qpack:encode(H, E),
+            {ok, D1} = quic_qpack:process_encoder_instructions(
+                quic_qpack:get_encoder_instructions(E1), D
+            ),
+            {ok, E2} = quic_qpack:process_decoder_instructions(
+                quic_qpack:encode_insert_count_increment(1),
+                quic_qpack:clear_encoder_instructions(E1)
+            ),
+            {Ref, E3} = quic_qpack:encode(H, E2),
+            ?assertEqual(N, quic_qpack:get_last_ric(E3)),
+            ?assertEqual({N, {ok, H}}, {N, element(1, quic_qpack:decode(Ref, D1))}),
+            {E3, D1}
+        end,
+        {E0, D0},
+        lists:seq(1, 300)
+    ).

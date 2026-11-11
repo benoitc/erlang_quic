@@ -43,6 +43,32 @@ critical_stream_closure_returns_error_test() ->
     Result = quic_h3_connection:handle_stream_closed(2, State),
     ?assertMatch({error, {connection_error, ?H3_CLOSED_CRITICAL_STREAM, _}}, Result).
 
+%% A FIN closes a critical stream as much as a reset does, whether it
+%% comes with the stream's first bytes or later.
+critical_stream_fin_returns_error_test() ->
+    Settings = quic_h3_frame:encode_settings(#{}),
+    State0 = make_test_state(#{
+        role => server, quic_conn => fake_quic_conn(), local_encoder_stream => 7
+    }),
+    ?assertMatch(
+        {error, {connection_error, ?H3_CLOSED_CRITICAL_STREAM, _}, _},
+        quic_h3_connection:handle_stream_data(2, <<0, Settings/binary>>, true, State0)
+    ),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        2, <<0, Settings/binary>>, false, State0
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(6, <<2>>, false, State1),
+    {ok, State3} = quic_h3_connection:handle_stream_data(10, <<3>>, false, State2),
+    [
+        ?assertMatch(
+            {error, {connection_error, ?H3_CLOSED_CRITICAL_STREAM, _}, _},
+            quic_h3_connection:handle_stream_data(StreamId, <<>>, true, State3)
+        )
+     || StreamId <- [2, 6, 10]
+    ],
+    %% a stream of some other type may end
+    ?assertMatch({ok, _}, quic_h3_connection:handle_stream_data(14, <<16#21>>, true, State3)).
+
 normal_stream_closure_succeeds_test() ->
     State = make_test_state(#{
         peer_control_stream => 2,
@@ -110,18 +136,137 @@ goaway_received_after_sent_keeps_our_id_test() ->
 %% Request Validation Tests (RFC 9114 Section 4.1)
 %%====================================================================
 
-data_before_headers_returns_stream_reset_test() ->
+%% RFC 9114 Section 4.1: an invalid sequence of frames is a connection
+%% error H3_FRAME_UNEXPECTED, a DATA frame before HEADERS among them.
+data_before_headers_is_a_connection_error_test() ->
     Stream = #h3_stream{id = 0, frame_state = expecting_headers},
-    State = make_test_state(#{}),
-    Result = quic_h3_connection:handle_request_frame(0, {data, <<"body">>}, false, Stream, State),
-    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+    lists:foreach(
+        fun(Role) ->
+            State = make_test_state(#{role => Role}),
+            ?assertMatch(
+                {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+                quic_h3_connection:handle_request_frame(0, {data, <<"body">>}, false, Stream, State)
+            )
+        end,
+        [client, server]
+    ).
 
-non_trailer_headers_after_body_returns_reset_test() ->
-    Stream = #h3_stream{id = 0, frame_state = expecting_data},
-    State = make_test_state(#{}),
-    %% HEADERS without FIN after body started
-    Result = quic_h3_connection:handle_request_frame(0, {headers, <<>>}, false, Stream, State),
-    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+%% HEADERS after the content are the trailer section even when the FIN
+%% comes in a later delivery; the message ends with the FIN.
+trailers_ahead_of_the_fin_are_trailers_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    Upload = <<
+        (request_frame(<<"POST">>, <<"/upload">>))/binary,
+        (quic_h3_frame:encode_data(<<"abc">>))/binary,
+        (trailers_frame())/binary
+    >>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, Upload, false, State0),
+    ?assertMatch({request, 0, <<"POST">>, <<"/upload">>, _}, next_owner_event()),
+    ?assertEqual({trailers, 0, [{<<"x-sum">>, <<"1">>}]}, next_owner_event()),
+    ?assertMatch(
+        #{0 := #h3_stream{state = open, frame_state = complete}},
+        quic_h3_connection:test_streams(State1)
+    ),
+    ?assertMatch(
+        #{0 := {_, _, false}}, quic_h3_connection:test_stream_data_buffers(State1)
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<>>, true, State1),
+    ?assertMatch(
+        #{0 := #h3_stream{state = half_closed_remote}}, quic_h3_connection:test_streams(State2)
+    ),
+    ?assertMatch(#{0 := {_, _, true}}, quic_h3_connection:test_stream_data_buffers(State2)),
+    ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic))).
+
+%% The same on a response; the exchange is over at the FIN.
+response_trailers_ahead_of_the_fin_are_trailers_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{
+        quic_conn => Quic,
+        streams => #{0 => #h3_stream{id = 0, type = request, state = half_closed_local}}
+    }),
+    Response = <<
+        (quic_h3_frame:encode_headers(quic_qpack:encode([{<<":status">>, <<"200">>}])))/binary,
+        (quic_h3_frame:encode_data(<<"abc">>))/binary,
+        (trailers_frame())/binary
+    >>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, Response, false, State0),
+    ?assertMatch({response, 0, 200, _}, next_owner_event()),
+    ?assertEqual({data, 0, <<"abc">>, false}, next_owner_event()),
+    ?assertEqual({trailers, 0, [{<<"x-sum">>, <<"1">>}]}, next_owner_event()),
+    ?assert(maps:is_key(0, quic_h3_connection:test_streams(State1))),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<>>, true, State1),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State2)),
+    ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic))).
+
+%% Nothing but the FIN may follow the trailer section: HEADERS or DATA
+%% after it is a connection error (RFC 9114 Section 4.1).
+frames_after_trailers_are_a_connection_error_test() ->
+    flush_owner_events(),
+    lists:foreach(
+        fun(Next) ->
+            State0 = make_test_state(#{role => server, quic_conn => fake_quic_conn()}),
+            Upload = <<
+                (request_frame(<<"POST">>, <<"/upload">>))/binary, (trailers_frame())/binary
+            >>,
+            {ok, State1} = quic_h3_connection:handle_stream_data(0, Upload, false, State0),
+            ?assertMatch(
+                {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}, _},
+                quic_h3_connection:handle_stream_data(0, Next, true, State1)
+            )
+        end,
+        [trailers_frame(), quic_h3_frame:encode_data(<<"x">>)]
+    ),
+    flush_owner_events().
+
+trailers_frame() ->
+    quic_h3_frame:encode_headers(quic_qpack:encode([{<<"x-sum">>, <<"1">>}])).
+
+%% A request stream that ends before any HEADERS, empty or with nothing
+%% but frames of unknown types, has no request to answer.
+request_stream_ending_without_headers_is_incomplete_test() ->
+    lists:foreach(
+        fun(Pieces) ->
+            flush_owner_events(),
+            Quic = fake_quic_conn(),
+            State0 = make_test_state(#{role => server, quic_conn => Quic}),
+            State1 = lists:foldl(
+                fun({Data, Fin}, State) ->
+                    {ok, Next} = quic_h3_connection:handle_stream_data(0, Data, Fin, State),
+                    Next
+                end,
+                State0,
+                Pieces
+            ),
+            ?assertEqual(
+                [{close_stream, 0, ?H3_REQUEST_INCOMPLETE}], fake_quic_calls(Quic)
+            ),
+            ?assertEqual(#{}, quic_h3_connection:test_streams(State1)),
+            ?assertEqual(nothing, next_owner_event())
+        end,
+        [
+            [{<<>>, true}],
+            [{<<16#21, 1, $x>>, true}],
+            [{<<16#21, 1, $x>>, false}, {<<>>, true}]
+        ]
+    ).
+
+%% One that ends after its HEADERS is a request.
+request_stream_ending_after_headers_is_complete_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        0, request_frame(<<"GET">>, <<"/">>), false, State0
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<>>, true, State1),
+    ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()),
+    ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic))),
+    ?assertMatch(
+        #{0 := #h3_stream{state = half_closed_remote}}, quic_h3_connection:test_streams(State2)
+    ).
 
 %%====================================================================
 %% Content-Length Enforcement Tests (RFC 9114 Section 4.1.2)
@@ -393,6 +538,27 @@ section_ack_encoding_test() ->
     Ack = quic_qpack:encode_section_ack(4),
     ?assertEqual(<<16#84>>, Ack).
 
+%% RFC 9204 Section 4.4.1: a field section is acknowledged only when its
+%% Required Insert Count is not zero, also with a dynamic table in use.
+section_ack_only_for_sections_using_the_dynamic_table_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = blocking_state(#{quic_conn => Quic, local_decoder_stream => 11}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        2, insert_literal(<<"x-a">>), false, State0
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        0, request_frame(<<"GET">>, <<"/">>), true, State1
+    ),
+    ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()),
+    ?assertNot(lists:keymember(send_data, 1, fake_quic_calls(Quic))),
+    {ok, _} = quic_h3_connection:handle_stream_data(4, blocked_request(1), true, State2),
+    ?assertMatch({request, 4, <<"GET">>, <<"/">>, _}, next_owner_event()),
+    ?assertEqual(
+        [{send_data, 11, quic_qpack:encode_section_ack(4), false}],
+        [Call || Call <- fake_quic_calls(Quic), element(1, Call) =:= send_data]
+    ).
+
 section_ack_large_stream_id_test() ->
     %% Stream ID 200 should use multi-byte encoding
     Ack = quic_qpack:encode_section_ack(200),
@@ -509,22 +675,38 @@ max_field_section_size_empty_headers_test() ->
 %% Frame After Complete State Tests (RFC 9114 Section 4.1)
 %%====================================================================
 
-frame_after_complete_returns_reset_test() ->
+frame_after_complete_is_a_connection_error_test() ->
     Stream = #h3_stream{id = 0, frame_state = complete},
     State = make_test_state(#{}),
-    %% Any frame on completed stream should be rejected (except unknown)
     Result = quic_h3_connection:handle_request_frame(
         0, {data, <<"body">>}, false, Stream, State
     ),
-    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+    ?assertMatch({error, {connection_error, ?H3_FRAME_UNEXPECTED, _}}, Result).
 
-headers_after_complete_returns_reset_test() ->
+headers_after_complete_is_a_connection_error_test() ->
     Stream = #h3_stream{id = 0, frame_state = complete},
     State = make_test_state(#{}),
     Result = quic_h3_connection:handle_request_frame(
         0, {headers, <<>>}, false, Stream, State
     ),
-    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+    ?assertMatch({error, {connection_error, ?H3_FRAME_UNEXPECTED, _}}, Result).
+
+%% PUSH_PROMISE is not part of the response and may follow it.
+push_promise_after_trailers_is_accepted_test() ->
+    flush_owner_events(),
+    Stream = #h3_stream{id = 0, frame_state = complete},
+    State = make_test_state(#{role => client, local_max_push_id => 10}),
+    Promise = quic_qpack:encode([
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/style.css">>}
+    ]),
+    ?assertMatch(
+        {ok, #h3_stream{frame_state = complete}, _},
+        quic_h3_connection:handle_request_frame(0, {push_promise, 0, Promise}, false, Stream, State)
+    ),
+    ?assertMatch({push_promise, 0, 0, _}, next_owner_event()).
 
 unknown_frame_after_complete_allowed_test() ->
     Stream = #h3_stream{id = 0, frame_state = complete},
@@ -696,29 +878,47 @@ trailer_no_content_length_ok_test() ->
 %% GOAWAY Blocked Stream Cleanup Tests (RFC 9114 Section 5.2)
 %%====================================================================
 
-goaway_clears_blocked_streams_test() ->
-    %% When GOAWAY is received, blocked streams should be cleared
-    State = make_test_state(#{
+%% A server's GOAWAY gives up the client's requests at or above its ID, and
+%% a later, lower one those down to it; the rest wait for the encoder
+%% stream. Stream Cancellation goes out for each one given up.
+server_goaway_drops_only_blocked_requests_at_or_above_its_id_test() ->
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{
+        role => client,
+        quic_conn => Quic,
+        settings_received => true,
+        local_decoder_stream => 10,
         blocked_streams => #{
+            0 => {1, <<>>, false},
             4 => {1, <<>>, false},
-            8 => {2, <<>>, false}
-        },
-        local_decoder_stream => undefined
+            8 => {2, <<>>, false},
+            3 => {1, <<>>, false}
+        }
     }),
-    Result = quic_h3_connection:cleanup_blocked_streams_on_goaway(State),
-    %% Blocked streams (tuple position 28) should be empty after cleanup
-    BlockedStreams = element(28, Result),
-    ?assertEqual(#{}, BlockedStreams).
+    {transition, goaway_received, State1} =
+        quic_h3_connection:handle_control_frame({goaway, 8}, State0),
+    %% blocked_streams is at position 28
+    ?assertEqual([0, 3, 4], lists:sort(maps:keys(element(28, State1)))),
+    {ok, State2} = quic_h3_connection:handle_control_frame({goaway, 4}, State1),
+    ?assertEqual([0, 3], lists:sort(maps:keys(element(28, State2)))),
+    Cancels = [Id || {send_data, 10, <<1:2, Id:6>>, false} <- fake_quic_calls(Quic)],
+    ?assertEqual([4, 8], lists:sort(Cancels)).
 
-goaway_empty_blocked_streams_test() ->
-    %% GOAWAY with no blocked streams should be a no-op
-    State = make_test_state(#{
-        blocked_streams => #{},
-        local_decoder_stream => undefined
+%% A client's GOAWAY carries a push ID: the requests the server waits on
+%% are not touched.
+client_goaway_keeps_blocked_requests_test() ->
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{
+        role => server,
+        quic_conn => Quic,
+        settings_received => true,
+        local_decoder_stream => 11,
+        blocked_streams => #{0 => {1, <<>>, false}, 8 => {2, <<>>, false}}
     }),
-    Result = quic_h3_connection:cleanup_blocked_streams_on_goaway(State),
-    BlockedStreams = element(28, Result),
-    ?assertEqual(#{}, BlockedStreams).
+    {transition, goaway_received, State1} =
+        quic_h3_connection:handle_control_frame({goaway, 0}, State0),
+    ?assertEqual([0, 8], lists:sort(maps:keys(element(28, State1)))),
+    ?assertEqual([], fake_quic_calls(Quic)).
 
 %%====================================================================
 %% SETTINGS Directionality Tests (RFC 9114 Section 7.2.4.1)
@@ -888,7 +1088,7 @@ data_buffered_when_no_handler_test() ->
         0, {data, <<"hello">>}, false, Stream, State
     ),
     %% Check that data was buffered (tuple position 44 for stream_data_buffers)
-    StreamDataBuffers = element(44, State2),
+    StreamDataBuffers = element(43, State2),
     ?assertMatch(#{0 := {[{<<"hello">>, false}], _, false}}, StreamDataBuffers),
     ?assertEqual(
         #{0 => {[{<<"hello">>, false}], 5 + ?H3_BUFFER_CHUNK_OVERHEAD, false}}, StreamDataBuffers
@@ -1099,6 +1299,32 @@ buffer_survives_a_plain_fin_test() ->
     {ok, _, State1} = deliver(0, <<"hello">>, true, buffering_state(#{})),
     ?assertMatch(#{0 := _}, quic_h3_connection:test_stream_data_buffers(State1)).
 
+%% Released once the exchange is over, though: the stream is gone, so no
+%% handler can come for it. A server that answers without registering one
+%% would otherwise spend the budget one request at a time and end up
+%% refusing every request with H3_EXCESSIVE_LOAD.
+answered_requests_do_not_spend_the_budget_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{
+        role => server, quic_conn => Quic, max_buffered_body => 4 * ?H3_BUFFER_CHUNK_OVERHEAD
+    }),
+    State1 = lists:foldl(
+        fun(StreamId, State) ->
+            {ok, StateA} = quic_h3_connection:handle_stream_data(
+                StreamId, request_frame(<<"GET">>, <<"/">>), true, State
+            ),
+            Answered = quic_h3_connection:do_respond(StreamId, 200, [], <<"ok">>, StateA),
+            ?assertMatch({ok, _}, Answered),
+            element(2, Answered)
+        end,
+        State0,
+        lists:seq(0, 36, 4)
+    ),
+    ?assertEqual(#{}, quic_h3_connection:test_stream_data_buffers(State1)),
+    ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic))),
+    flush_owner_events().
+
 %% A server holding one stream's body at the limit still refuses another
 %% stream's, because the budget belongs to the connection.
 budget_is_shared_across_streams_test() ->
@@ -1255,7 +1481,7 @@ multiple_chunks_buffered_in_order_test() ->
         0, {data, <<"chunk2">>}, true, Stream1, State1
     ),
     %% Check buffered data (stored in reverse order internally)
-    StreamDataBuffers = element(44, State2),
+    StreamDataBuffers = element(43, State2),
     {Chunks, Size, HadFin} = maps:get(0, StreamDataBuffers),
     ?assertEqual([{<<"chunk2">>, true}, {<<"chunk1">>, false}], Chunks),
     %% Charged size: both payloads plus the per-chunk overhead each one costs.
@@ -1741,7 +1967,7 @@ connect_tunnel_rejects_trailers_test() ->
     Result = quic_h3_connection:handle_request_frame(
         0, {headers, <<>>}, true, Stream, State
     ),
-    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+    ?assertMatch({error, {connection_error, ?H3_FRAME_UNEXPECTED, _}}, Result).
 
 connect_tunnel_rejects_push_promise_test() ->
     Stream = #h3_stream{id = 0, frame_state = expecting_data, is_connect = true},
@@ -1749,7 +1975,7 @@ connect_tunnel_rejects_push_promise_test() ->
     Result = quic_h3_connection:handle_request_frame(
         0, {push_promise, 1, <<>>}, false, Stream, State
     ),
-    ?assertMatch({error, {stream_reset, 0, ?H3_FRAME_UNEXPECTED}}, Result).
+    ?assertMatch({error, {connection_error, ?H3_FRAME_UNEXPECTED, _}}, Result).
 
 connect_tunnel_send_trailers_rejected_test() ->
     Stream = #h3_stream{id = 0, is_connect = true},
@@ -1759,6 +1985,21 @@ connect_tunnel_send_trailers_rejected_test() ->
     }),
     Result = quic_h3_connection:do_send_trailers(0, [{<<"foo">>, <<"bar">>}], State),
     ?assertMatch({error, connect_tunnel}, Result).
+
+%% Trailers for a stream that is gone, or that was cancelled and is only
+%% kept to drop what the peer still sends, are refused like any other
+%% write. The call used to crash the connection process.
+send_trailers_on_an_unknown_stream_is_refused_test() ->
+    State0 = make_test_state(#{role => server}),
+    ?assertEqual(
+        {error, unknown_stream},
+        quic_h3_connection:do_send_trailers(0, [{<<"foo">>, <<"bar">>}], State0)
+    ),
+    State1 = cancelled_upload(fake_quic_conn()),
+    ?assertEqual(
+        {error, unknown_stream},
+        quic_h3_connection:do_send_trailers(0, [{<<"foo">>, <<"bar">>}], State1)
+    ).
 
 %%====================================================================
 %% QPACK encoder state across a refused HEADERS write
@@ -2097,15 +2338,93 @@ duplicate_content_length_mismatch_rejected_test() ->
 %% PRIORITY_UPDATE on push (RFC 9218 §7.2)
 %%====================================================================
 
-priority_update_push_unknown_id_ignored_test() ->
-    State = make_test_state(#{role => server, push_streams => #{}}),
+%% A push promised and already finished is ignored.
+priority_update_push_finished_id_ignored_test() ->
+    State = make_test_state(#{
+        role => server, max_push_id => 50, next_push_id => 43, push_streams => #{}
+    }),
     Payload = <<(quic_varint:encode(42))/binary, "u=0">>,
     ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_push_frame(Payload, State)).
 
-priority_update_push_client_ignored_test() ->
-    State = make_test_state(#{role => client}),
-    Payload = <<(quic_varint:encode(5))/binary, "u=1">>,
-    ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_push_frame(Payload, State)).
+%% RFC 9218 §7.2: a push ID not yet promised, or above MAX_PUSH_ID, is a
+%% connection error H3_ID_ERROR.
+priority_update_push_unpromised_id_is_an_id_error_test() ->
+    State = make_test_state(#{
+        role => server, max_push_id => 50, next_push_id => 43, push_streams => #{}
+    }),
+    lists:foreach(
+        fun(PushId) ->
+            ?assertMatch(
+                {error, {connection_error, ?H3_ID_ERROR, _}},
+                quic_h3_connection:handle_priority_update_push_frame(
+                    <<(quic_varint:encode(PushId))/binary, "u=0">>, State
+                )
+            )
+        end,
+        [43, 51]
+    ).
+
+%% RFC 9218 §7.2: the request variant MUST name a request stream.
+priority_update_for_a_non_request_stream_is_an_id_error_test() ->
+    State = make_test_state(#{role => server}),
+    lists:foreach(
+        fun(StreamId) ->
+            ?assertMatch(
+                {error, {connection_error, ?H3_ID_ERROR, _}},
+                quic_h3_connection:handle_priority_update_frame(
+                    <<(quic_varint:encode(StreamId))/binary, "u=0">>, State
+                )
+            )
+        end,
+        [1, 2, 3, 6]
+    ).
+
+%% RFC 9218 §7.2: servers MUST NOT send PRIORITY_UPDATE; a client that
+%% receives either kind on the control stream closes the connection.
+priority_update_received_by_a_client_is_frame_unexpected_test() ->
+    State = make_test_state(#{role => client, settings_received => true}),
+    lists:foreach(
+        fun(Type) ->
+            ?assertMatch(
+                {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+                quic_h3_connection:handle_control_frame({unknown, Type, <<0, "u=1">>}, State)
+            )
+        end,
+        [?H3_FRAME_PRIORITY_UPDATE_REQUEST, ?H3_FRAME_PRIORITY_UPDATE_PUSH]
+    ).
+
+%% RFC 9218 §7.2: on any stream but the client control stream it is a
+%% connection error H3_FRAME_UNEXPECTED, on request and push streams alike.
+priority_update_off_the_control_stream_is_frame_unexpected_test() ->
+    Update = raw_frame(?H3_FRAME_PRIORITY_UPDATE_REQUEST, <<0, "u=1">>),
+    UpdatePush = raw_frame(?H3_FRAME_PRIORITY_UPDATE_PUSH, <<0, "u=1">>),
+    lists:foreach(
+        fun({Role, Frame}) ->
+            State = make_test_state(#{role => Role, quic_conn => fake_quic_conn()}),
+            Request = <<(request_frame(<<"POST">>, <<"/">>))/binary, Frame/binary>>,
+            ?assertMatch(
+                {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}, _},
+                quic_h3_connection:handle_stream_data(0, Request, false, State)
+            )
+        end,
+        [{server, Update}, {server, UpdatePush}]
+    ),
+    flush_owner_events(),
+    Push = #h3_stream{id = 3, type = push, state = open, frame_state = expecting_data},
+    PushState = make_test_state(#{role => client, received_pushes => #{0 => Push}}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_FRAME_UNEXPECTED, _}},
+        quic_h3_connection:handle_push_frame(
+            3, 0, {unknown, ?H3_FRAME_PRIORITY_UPDATE_REQUEST, <<0>>}, false, PushState
+        )
+    ).
+
+raw_frame(Type, Payload) ->
+    <<
+        (quic_varint:encode(Type))/binary,
+        (quic_varint:encode(byte_size(Payload)))/binary,
+        Payload/binary
+    >>.
 
 %%====================================================================
 %% Theme G: PRIORITY_UPDATE strict frame parsing (RFC 9218 §7)
@@ -2120,7 +2439,7 @@ priority_update_empty_payload_rejected_test() ->
 %% Well-formed PRIORITY_UPDATE for an unknown stream is silently ignored.
 priority_update_unknown_stream_ignored_test() ->
     State = make_test_state(#{role => server}),
-    Payload = <<(quic_varint:encode(99))/binary, "u=3">>,
+    Payload = <<(quic_varint:encode(100))/binary, "u=3">>,
     ?assertMatch({ok, _}, quic_h3_connection:handle_priority_update_frame(Payload, State)).
 
 %%====================================================================
@@ -2236,7 +2555,10 @@ rest_of_data_frame_after_stream_error_is_dropped_test() ->
     Quic = fake_quic_conn(),
     State0 = request_stream_state(client, #h3_stream{content_length = 2}, #{quic_conn => Quic}),
     {ok, State1} = quic_h3_connection:handle_stream_data(0, Head, false, State0),
-    ?assertEqual([{close_stream, 0, ?H3_MESSAGE_ERROR}], fake_quic_calls(Quic)),
+    ?assertEqual(
+        [{close_stream, 0, ?H3_MESSAGE_ERROR}, {stop_sending, 0, ?H3_MESSAGE_ERROR}],
+        fake_quic_calls(Quic)
+    ),
     %% The reset is reported once, and the dropped remainder adds nothing.
     ?assertEqual([{stream_reset, 0, ?H3_MESSAGE_ERROR}], owner_events()),
     ?assertMatch({ok, _}, quic_h3_connection:handle_stream_data(0, Tail, true, State1)),
@@ -2998,6 +3320,7 @@ priority_update_push_stream_updates_state_test() ->
     State = make_test_state(#{
         role => server,
         settings_received => true,
+        next_push_id => 1,
         push_streams => #{0 => {10, Stream}}
     }),
     Payload = <<0, "u=7, i">>,
@@ -3327,7 +3650,6 @@ make_test_state(Overrides) ->
         max_push_id => undefined,
         next_push_id => 0,
         push_streams => #{},
-        cancelled_pushes => sets:new([{version, 2}]),
         %% Client-side push state
         local_max_push_id => undefined,
         promised_pushes => #{},
@@ -3378,10 +3700,9 @@ make_test_state(Overrides) ->
         maps:get(local_max_field_section_size, Merged), maps:get(local_max_blocked_streams, Merged),
         %% Push fields
         maps:get(max_push_id, Merged), maps:get(next_push_id, Merged),
-        maps:get(push_streams, Merged), maps:get(cancelled_pushes, Merged),
-        maps:get(local_max_push_id, Merged), maps:get(promised_pushes, Merged),
-        maps:get(received_pushes, Merged), maps:get(local_cancelled_pushes, Merged),
-        maps:get(last_accepted_push_id, Merged),
+        maps:get(push_streams, Merged), maps:get(local_max_push_id, Merged),
+        maps:get(promised_pushes, Merged), maps:get(received_pushes, Merged),
+        maps:get(local_cancelled_pushes, Merged), maps:get(last_accepted_push_id, Merged),
         %% Per-stream handler registration
         maps:get(stream_handlers, Merged), maps:get(stream_data_buffers, Merged),
         maps:get(buffered_bytes, Merged), maps:get(max_buffered_body, Merged),
@@ -3600,3 +3921,988 @@ next_reset_event() ->
         {quic_h3, Self, {stream_type_closed, _, _} = E} -> E
     after 100 -> no_reset_event
     end.
+
+%%====================================================================
+%% Cancelled request streams (RFC 9114 §4.1.1)
+%%====================================================================
+
+%% The rest of a cancelled request's body is dropped, whatever it holds:
+%% here a HEADERS frame, which must not come out as a second request.
+body_after_a_cancel_is_not_a_new_request_test() ->
+    Quic = fake_quic_conn(),
+    State1 = cancelled_upload(Quic),
+    Inner = request_frame(<<"DELETE">>, <<"/admin">>),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, Inner, false, State1),
+    ?assertEqual(nothing, next_owner_event()),
+    ?assertMatch(
+        #{0 := #h3_stream{state = closed}}, quic_h3_connection:test_streams(State2)
+    ).
+
+%% Reading is aborted as well as sending.
+a_cancel_stops_the_peer_sending_test() ->
+    Quic = fake_quic_conn(),
+    _ = cancelled_upload(Quic),
+    ?assert(
+        lists:member({stop_sending, 0, ?H3_REQUEST_CANCELLED}, fake_quic_calls(Quic))
+    ).
+
+%% Another stream is still a request, and the cancelled one is forgotten
+%% once the peer ends it.
+a_cancel_leaves_other_streams_alone_test() ->
+    State1 = cancelled_upload(fake_quic_conn()),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        4, request_frame(<<"GET">>, <<"/">>), true, State1
+    ),
+    ?assertMatch({request, 4, <<"GET">>, <<"/">>, _}, next_owner_event()),
+    {ok, State3} = quic_h3_connection:handle_stream_data(0, <<"tail">>, true, State2),
+    ?assertNot(maps:is_key(0, quic_h3_connection:test_streams(State3))).
+
+%% The peer's RESET_STREAM in answer is not a second reset to report.
+the_reset_answering_a_cancel_is_not_reported_test() ->
+    State1 = cancelled_upload(fake_quic_conn()),
+    {keep_state, State2} = quic_h3_connection:handle_peer_reset(
+        0, ?H3_REQUEST_CANCELLED, undefined, State1
+    ),
+    ?assertEqual(nothing, next_owner_event()),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State2)).
+
+%% QUIC may have the whole stream, and have let go of it at the reset,
+%% while its last bytes are still on their way here. They are dropped
+%% like any others, and the FIN among them ends the wait.
+a_cancel_drops_what_quic_had_already_received_test() ->
+    Quic = spawn_link(fun Loop() ->
+        receive
+            {'$gen_call', From, {stop_sending, _, _}} ->
+                gen:reply(From, {error, unknown_stream}),
+                Loop();
+            {'$gen_call', From, _Call} ->
+                gen:reply(From, ok),
+                Loop()
+        end
+    end),
+    State1 = cancelled_upload(Quic),
+    Inner = request_frame(<<"DELETE">>, <<"/admin">>),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, Inner, false, State1),
+    ?assertEqual(nothing, next_owner_event()),
+    {ok, State3} = quic_h3_connection:handle_stream_data(0, Inner, true, State2),
+    ?assertEqual(nothing, next_owner_event()),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State3)).
+
+%% Nothing more can arrive on a request the peer has finished, so no entry
+%% is kept and no STOP_SENDING sent.
+a_cancel_after_the_request_ended_keeps_nothing_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        0, request_frame(<<"GET">>, <<"/">>), true, State0
+    ),
+    State2 = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, State1),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State2)),
+    ?assertNot(lists:keymember(stop_sending, 1, fake_quic_calls(Quic))).
+
+%% A server that has read a POST's HEADERS and part of its body, then
+%% cancelled it.
+cancelled_upload(Quic) ->
+    flush_owner_events(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    Start = <<
+        (request_frame(<<"POST">>, <<"/upload">>))/binary,
+        %% a DATA frame of 1000 bytes, 10 of them here
+        0,
+        (quic_varint:encode(1000))/binary,
+        "0123456789"
+    >>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, Start, false, State0),
+    {request, 0, <<"POST">>, <<"/upload">>, _} = next_owner_event(),
+    State2 = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, State1),
+    {stream_reset, 0, ?H3_REQUEST_CANCELLED} = next_owner_event(),
+    State2.
+
+request_frame(Method, Path) ->
+    request_frame(Method, Path, []).
+
+request_frame(Method, Path, Fields) ->
+    quic_h3_frame:encode_headers(
+        quic_qpack:encode([
+            {<<":method">>, Method},
+            {<<":scheme">>, <<"https">>},
+            {<<":authority">>, <<"example.com">>},
+            {<<":path">>, Path}
+            | Fields
+        ])
+    ).
+
+%%====================================================================
+%% Stream errors (RFC 9114 §8, RFC 9000 §3.5)
+%%====================================================================
+
+%% A stream reset for an error of its own is no longer read either, and
+%% its entry stays only until the peer ends it, as after a cancel.
+a_stream_error_stops_the_peer_sending_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, overlong_upload(), false, State0),
+    ?assertEqual(
+        [{close_stream, 0, ?H3_MESSAGE_ERROR}, {stop_sending, 0, ?H3_MESSAGE_ERROR}],
+        stream_calls(Quic)
+    ),
+    ?assertMatch(
+        #{0 := #h3_stream{state = closed, reset = true}}, quic_h3_connection:test_streams(State1)
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<"tail">>, true, State1),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State2)).
+
+%% Resets and STOP_SENDING, without the priority set at HEADERS.
+stream_calls(Quic) ->
+    [C || C <- fake_quic_calls(Quic), element(1, C) =/= set_stream_priority].
+
+%% A body longer than its Content-Length, a stream error.
+overlong_upload() ->
+    <<
+        (request_frame(<<"POST">>, <<"/">>, [{<<"content-length">>, <<"1">>}]))/binary,
+        (quic_h3_frame:encode_data(<<"abc">>))/binary
+    >>.
+
+%% The peer has finished the stream: there is nothing to stop, and no
+%% entry to keep.
+a_stream_error_at_the_fin_keeps_nothing_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, overlong_upload(), true, State0),
+    ?assertEqual([{close_stream, 0, ?H3_MESSAGE_ERROR}], stream_calls(Quic)),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State1)).
+
+a_stream_error_found_at_a_bare_fin_keeps_nothing_test() ->
+    {Quic, State1} = short_upload(),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<>>, true, State1),
+    ?assert(lists:member({close_stream, 0, ?H3_MESSAGE_ERROR}, fake_quic_calls(Quic))),
+    ?assertNot(lists:keymember(stop_sending, 1, fake_quic_calls(Quic))),
+    ?assertEqual(#{}, quic_h3_connection:test_streams(State2)).
+
+%%====================================================================
+%% Streams unblocked together (RFC 9204 §2.1.2)
+%%====================================================================
+
+%% Two requests wait for the same encoder stream data and one of them
+%% turns out malformed. Only that one is reset, whichever comes first.
+a_malformed_unblocked_request_leaves_the_next_one_test() ->
+    unblock_two(_Malformed = 0, _Good = 4).
+
+a_malformed_unblocked_request_leaves_the_previous_one_test() ->
+    unblock_two(_Malformed = 4, _Good = 0).
+
+unblock_two(Malformed, Good) ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = blocking_state(#{quic_conn => Quic, local_max_blocked_streams => 2}),
+    %% Entry 0 is a valid field, entry 1 has an uppercase name.
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        Good, blocked_request(1), true, State0
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        Malformed, blocked_request(2), true, State1
+    ),
+    ?assertEqual(nothing, next_owner_event()),
+    Inserts = <<(insert_literal(<<"x-a">>))/binary, (insert_literal(<<"X-B">>))/binary>>,
+    {ok, State3} = quic_h3_connection:handle_stream_data(2, Inserts, false, State2),
+    ?assertEqual(
+        [{request, Good, <<"GET">>}, {stream_reset, Malformed, ?H3_MESSAGE_ERROR}],
+        lists:sort([
+            case Event of
+                {request, Id, Method, _Path, _Headers} -> {request, Id, Method};
+                Other -> Other
+            end
+         || Event <- [next_owner_event(), next_owner_event()]
+        ])
+    ),
+    ?assert(lists:member({close_stream, Malformed, ?H3_MESSAGE_ERROR}, fake_quic_calls(Quic))),
+    Streams = quic_h3_connection:test_streams(State3),
+    ?assertMatch(#{Good := #h3_stream{method = <<"GET">>, reset = false}}, Streams),
+    %% the peer had finished the malformed one, so nothing is kept for it
+    ?assertNot(maps:is_key(Malformed, Streams)).
+
+%% A server whose decoder has a dynamic table, with the peer's encoder
+%% stream on stream 2.
+blocking_state(Overrides) ->
+    Defaults = #{
+        role => server,
+        peer_encoder_stream => 2,
+        qpack_decoder => quic_qpack:new(#{max_dynamic_size => 4096})
+    },
+    make_test_state(maps:merge(Defaults, Overrides)).
+
+%% A GET whose last field line is the newest of RIC dynamic table entries,
+%% so it needs that many insertions before it decodes.
+blocked_request(RIC) ->
+    quic_h3_frame:encode_headers(<<
+        %% Required Insert Count RIC (4096 / 32 = 128 entries), Base = RIC
+        (RIC + 1),
+        0,
+        %% :method GET, :scheme https, :path /
+        16#D1,
+        16#D7,
+        16#C1,
+        %% :authority a
+        16#50,
+        1,
+        $a,
+        %% dynamic entry Base - 1
+        16#80
+    >>).
+
+%% Insert With Literal Name, value "v".
+insert_literal(Name) ->
+    <<2#010:3, (byte_size(Name)):5, Name/binary, 1, $v>>.
+
+%%====================================================================
+%% Frames behind blocked HEADERS (RFC 9204 §2.1.2)
+%%====================================================================
+
+%% A request's content waits with its blocked HEADERS, whether it comes
+%% with them or later, and is read once they decode.
+content_with_blocked_headers_waits_test() ->
+    Upload = <<(blocked_request(1))/binary, (quic_h3_frame:encode_data(<<"abc">>))/binary>>,
+    content_behind_blocked_headers([{Upload, true}]).
+
+content_after_blocked_headers_waits_test() ->
+    <<Start:2/binary, End/binary>> = quic_h3_frame:encode_data(<<"abc">>),
+    content_behind_blocked_headers([
+        {<<(blocked_request(1))/binary, Start/binary>>, false}, {End, false}, {<<>>, true}
+    ]).
+
+content_behind_blocked_headers(Pieces) ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = blocking_state(#{quic_conn => Quic, local_max_blocked_streams => 1}),
+    State1 = lists:foldl(
+        fun({Data, Fin}, State) ->
+            {ok, Next} = quic_h3_connection:handle_stream_data(0, Data, Fin, State),
+            Next
+        end,
+        State0,
+        Pieces
+    ),
+    ?assertEqual(nothing, next_owner_event()),
+    ?assertEqual([], fake_quic_calls(Quic)),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        2, insert_literal(<<"x-a">>), false, State1
+    ),
+    ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()),
+    ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic))),
+    #{0 := {Chunks, _Size, true}} = quic_h3_connection:test_stream_data_buffers(State2),
+    ?assertEqual(<<"abc">>, iolist_to_binary([Piece || {Piece, _Fin} <- lists:reverse(Chunks)])),
+    ?assertMatch(
+        #{0 := #h3_stream{state = half_closed_remote, frame_state = complete}},
+        quic_h3_connection:test_streams(State2)
+    ).
+
+%% What is kept behind blocked HEADERS counts against max_buffered_body.
+content_behind_blocked_headers_is_bounded_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = blocking_state(#{
+        quic_conn => Quic, local_max_blocked_streams => 1, max_buffered_body => 8
+    }),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, blocked_request(1), false, State0),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        0, quic_h3_frame:encode_data(<<"0123456789">>), false, State1
+    ),
+    ?assertEqual({stream_reset, 0, ?H3_EXCESSIVE_LOAD}, next_owner_event()),
+    ?assert(lists:member({close_stream, 0, ?H3_EXCESSIVE_LOAD}, fake_quic_calls(Quic))),
+    ?assertMatch(
+        #{0 := #h3_stream{state = closed, reset = true}}, quic_h3_connection:test_streams(State2)
+    ),
+    %% blocked_streams is at position 28, stream_buffers at 24
+    ?assertEqual(#{}, element(28, State2)),
+    ?assertEqual(#{}, element(24, State2)).
+
+%% The same budget covers a body buffered for a handler: bytes held behind
+%% another stream's blocked HEADERS count against it.
+a_body_and_content_behind_blocked_headers_share_the_budget_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = blocking_state(#{
+        quic_conn => Quic, local_max_blocked_streams => 1, max_buffered_body => 300
+    }),
+    Held = quic_h3_frame:encode_data(binary:copy(<<"h">>, 200)),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        4, <<(blocked_request(1))/binary, Held/binary>>, false, State0
+    ),
+    ?assertEqual(nothing, next_owner_event()),
+    Body = quic_h3_frame:encode_data(binary:copy(<<"b">>, 100)),
+    {ok, _} = quic_h3_connection:handle_stream_data(
+        0, <<(request_frame(<<"POST">>, <<"/">>))/binary, Body/binary>>, false, State1
+    ),
+    ?assertMatch({request, 0, <<"POST">>, <<"/">>, _}, next_owner_event()),
+    ?assertEqual({stream_reset, 0, ?H3_EXCESSIVE_LOAD}, next_owner_event()),
+    ?assert(lists:member({close_stream, 0, ?H3_EXCESSIVE_LOAD}, fake_quic_calls(Quic))).
+
+%%====================================================================
+%% A blocked stream that is reset (RFC 9204 §4.4.2)
+%%====================================================================
+
+%% A stream cancelled while its HEADERS wait for the encoder stream gives
+%% them up: the decoder says so, and the insertion that would have
+%% unblocked them brings no request.
+a_reset_stream_is_no_longer_blocked_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = blocking_state(#{
+        quic_conn => Quic, local_max_blocked_streams => 1, local_decoder_stream => 11
+    }),
+    Data = <<(blocked_request(1))/binary, (quic_h3_frame:encode_data(<<"x">>))/binary>>,
+    {ok, Blocked} = quic_h3_connection:handle_stream_data(0, Data, false, State0),
+    State1 = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, Blocked),
+    ?assertEqual({stream_reset, 0, ?H3_REQUEST_CANCELLED}, next_owner_event()),
+    ?assert(
+        lists:member(
+            {send_data, 11, quic_qpack:encode_stream_cancel(0), false}, fake_quic_calls(Quic)
+        )
+    ),
+    {ok, _} = quic_h3_connection:handle_stream_data(2, insert_literal(<<"x-a">>), false, State1),
+    ?assertEqual(nothing, next_owner_event()).
+
+%% Left alone, the same HEADERS become a request once the entry is there.
+a_blocked_request_is_dispatched_once_unblocked_test() ->
+    flush_owner_events(),
+    State0 = blocking_state(#{quic_conn => fake_quic_conn(), local_max_blocked_streams => 1}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, blocked_request(1), true, State0),
+    ?assertEqual(nothing, next_owner_event()),
+    {ok, _} = quic_h3_connection:handle_stream_data(2, insert_literal(<<"x-a">>), false, State1),
+    ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()).
+
+%%====================================================================
+%% Content-Length in a 2xx response to CONNECT (RFC 9110 §9.3.6)
+%%====================================================================
+
+%% The client ignores it: a tunnel may carry more or fewer bytes.
+a_connect_response_content_length_is_ignored_test() ->
+    lists:foreach(
+        fun({Body, Fin}) ->
+            flush_mailbox(),
+            State = connect_response_state(<<"CONNECT">>, <<"200">>),
+            Data = quic_h3_frame:encode_data(Body),
+            {ok, _} = quic_h3_connection:handle_stream_data(0, Data, Fin, State),
+            Events = owner_events(),
+            ?assertEqual([], [E || {stream_reset, _, _} = E <- Events]),
+            ?assert(lists:keymember(data, 1, Events))
+        end,
+        [{<<"0123456789">>, false}, {<<"0">>, true}]
+    ).
+
+%% Outside a 2xx to CONNECT it still bounds the content.
+a_content_length_still_bounds_other_responses_test() ->
+    lists:foreach(
+        fun({Method, Status}) ->
+            flush_mailbox(),
+            State = connect_response_state(Method, Status),
+            Data = quic_h3_frame:encode_data(<<"0123456789">>),
+            {ok, _} = quic_h3_connection:handle_stream_data(0, Data, false, State),
+            ?assert(lists:member({stream_reset, 0, ?H3_MESSAGE_ERROR}, owner_events()))
+        end,
+        [{<<"GET">>, <<"200">>}, {<<"CONNECT">>, <<"407">>}]
+    ).
+
+%% A client whose Method request on stream 0 got Status with
+%% content-length: 2.
+connect_response_state(Method, Status) ->
+    Stream = #h3_stream{
+        id = 0,
+        type = request,
+        state = half_closed_local,
+        frame_state = expecting_headers,
+        method = Method,
+        is_connect = (Method =:= <<"CONNECT">>)
+    },
+    State0 = make_test_state(#{
+        role => client, quic_conn => fake_quic_conn(), streams => #{0 => Stream}
+    }),
+    Response = quic_h3_frame:encode_headers(
+        quic_qpack:encode([{<<":status">>, Status}, {<<"content-length">>, <<"2">>}])
+    ),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, Response, false, State0),
+    State1.
+
+%%====================================================================
+%% HTTP datagrams on a stream this side reset (RFC 9297 §2.1)
+%%====================================================================
+
+%% A request stream reset here is kept only to drop what arrives on it, so
+%% its datagrams are neither delivered nor sent.
+datagrams_on_a_locally_reset_stream_are_dropped_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    Streams = #{
+        0 => #h3_stream{id = 0, type = request, state = closed, reset = true},
+        4 => #h3_stream{id = 4, type = request, state = open}
+    },
+    State = make_test_state(#{
+        quic_conn => Quic,
+        role => server,
+        streams => Streams,
+        h3_datagram_enabled => true,
+        peer_h3_datagram_enabled => true
+    }),
+    {keep_state, _} = quic_h3_connection:connected(
+        info, {quic, Quic, {datagram, <<0, "a">>}}, State
+    ),
+    ?assertEqual(nothing, next_owner_event()),
+    {keep_state, _} = quic_h3_connection:connected(
+        info, {quic, Quic, {datagram, <<1, "b">>}}, State
+    ),
+    ?assertEqual({datagram, 4, <<"b">>}, next_owner_event()),
+    Ref = make_ref(),
+    {keep_state, _, [{reply, {_, Ref}, Refused}]} = quic_h3_connection:connected(
+        {call, {self(), Ref}}, {send_h3_datagram, 0, <<"c">>}, State
+    ),
+    ?assertEqual({error, unknown_stream}, Refused),
+    {keep_state, _, [{reply, {_, Ref}, ok}]} = quic_h3_connection:connected(
+        {call, {self(), Ref}}, {send_h3_datagram, 4, <<"d">>}, State
+    ).
+
+%%====================================================================
+%% Stream Cancellation for every abandoned stream (RFC 9204 §2.2.2.2)
+%%====================================================================
+
+%% A request still being read that this side cancels or resets: the peer's
+%% encoder is told its references on it are gone, blocked or not.
+cancelling_a_request_being_read_sends_stream_cancellation_test() ->
+    Quic = fake_quic_conn(),
+    State = quic_h3_connection:do_cancel_stream(
+        0, ?H3_REQUEST_CANCELLED, reading_state(Quic, 4096, open)
+    ),
+    ?assert(sent_stream_cancel(Quic, 0)),
+    %% Whatever arrives next is dropped, and no second one goes out.
+    {keep_state, _} = quic_h3_connection:handle_peer_reset(0, ?H3_REQUEST_CANCELLED, 0, State),
+    ?assertEqual(1, length([C || C <- fake_quic_calls(Quic), C =:= stream_cancel_call(0)])),
+    flush_owner_events().
+
+a_peer_reset_of_a_request_being_read_sends_stream_cancellation_test() ->
+    Quic = fake_quic_conn(),
+    {keep_state, _} = quic_h3_connection:handle_peer_reset(
+        0, ?H3_REQUEST_CANCELLED, 0, reading_state(Quic, 4096, open)
+    ),
+    ?assert(sent_stream_cancel(Quic, 0)),
+    flush_owner_events().
+
+%% The client's own request: the response is what is abandoned.
+a_client_cancelling_its_request_sends_stream_cancellation_test() ->
+    Quic = fake_quic_conn(),
+    State0 = setelement(4, reading_state(Quic, 4096, half_closed_local), client),
+    _ = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, State0),
+    ?assert(sent_stream_cancel(Quic, 0)),
+    flush_owner_events().
+
+%% Nothing is left to read once the peer's FIN is in, and a decoder that
+%% advertised no table capacity may leave it out.
+no_stream_cancellation_when_nothing_is_abandoned_test() ->
+    Quic1 = fake_quic_conn(),
+    _ = quic_h3_connection:do_cancel_stream(
+        0, ?H3_REQUEST_CANCELLED, reading_state(Quic1, 4096, half_closed_remote)
+    ),
+    ?assertNot(sent_stream_cancel(Quic1, 0)),
+    Quic2 = fake_quic_conn(),
+    _ = quic_h3_connection:do_cancel_stream(
+        0, ?H3_REQUEST_CANCELLED, reading_state(Quic2, 0, open)
+    ),
+    ?assertNot(sent_stream_cancel(Quic2, 0)),
+    flush_owner_events().
+
+%% A push the client stops reading, open or arriving after its cancel.
+cancelling_an_open_push_sends_stream_cancellation_test() ->
+    Quic = fake_quic_conn(),
+    Push = #h3_stream{id = 3, type = push, state = open, frame_state = expecting_data},
+    State = make_test_state(#{
+        role => client,
+        quic_conn => Quic,
+        local_decoder_stream => 11,
+        local_settings => #{qpack_max_table_capacity => 4096},
+        local_max_push_id => 10,
+        received_pushes => #{0 => Push}
+    }),
+    {keep_state, _} = quic_h3_connection:connected(cast, {cancel_push, 0}, State),
+    ?assert(sent_stream_cancel(Quic, 3)).
+
+a_push_arriving_after_its_cancel_sends_stream_cancellation_test() ->
+    Quic = fake_quic_conn(),
+    State = make_test_state(#{
+        role => client,
+        quic_conn => Quic,
+        local_decoder_stream => 11,
+        local_settings => #{qpack_max_table_capacity => 4096},
+        local_max_push_id => 10,
+        local_cancelled_pushes => sets:from_list([0], [{version, 2}])
+    }),
+    {ok, _} = quic_h3_connection:handle_stream_data(3, <<16#01, 0>>, false, State),
+    ?assert(sent_stream_cancel(Quic, 3)).
+
+%% Request stream 0 with its HEADERS read and its peer half in PeerHalf,
+%% our decoder stream 11, and Capacity advertised.
+reading_state(Quic, Capacity, PeerHalf) ->
+    Stream = #h3_stream{
+        id = 0, type = request, state = PeerHalf, frame_state = expecting_data
+    },
+    make_test_state(#{
+        role => server,
+        quic_conn => Quic,
+        local_decoder_stream => 11,
+        local_settings => #{qpack_max_table_capacity => Capacity},
+        streams => #{0 => Stream}
+    }).
+
+stream_cancel_call(StreamId) ->
+    {send_data, 11, quic_qpack:encode_stream_cancel(StreamId), false}.
+
+sent_stream_cancel(Quic, StreamId) ->
+    lists:member(stream_cancel_call(StreamId), fake_quic_calls(Quic)).
+
+%%====================================================================
+%% Unacknowledged field sections of a stream that is over (RFC 9204 §2.1.1)
+%%====================================================================
+
+%% A response that used the dynamic table keeps its entries referenced
+%% until the peer acknowledges the section or cancels the stream, however
+%% the stream ended on this side.
+a_finished_stream_keeps_its_sections_until_acknowledged_test() ->
+    {State0, Field} = dynamic_table_server(),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        0, request_frame(<<"GET">>, <<"/">>), true, State0
+    ),
+    {ok, State2} = quic_h3_connection:do_respond(0, 200, [Field], <<"ok">>, State1),
+    ?assertEqual(1, quic_qpack:get_last_ric(element(13, State2))),
+    ?assertEqual(error, maps:find(0, quic_h3_connection:test_streams(State2))),
+    ?assert(has_outstanding_sections(0, State2)),
+    {ok, State3} = peer_decoder_says(quic_qpack:encode_section_ack(0), State2),
+    ?assertNot(has_outstanding_sections(0, State3)),
+    flush_owner_events().
+
+a_cancelled_stream_keeps_its_sections_until_the_peer_cancels_test() ->
+    State = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, dynamic_response()),
+    ?assert(has_outstanding_sections(0, State)),
+    {ok, State1} = peer_decoder_says(quic_qpack:encode_stream_cancel(0), State),
+    ?assertNot(has_outstanding_sections(0, State1)),
+    flush_owner_events().
+
+%% A peer reset too: its decoder sends Stream Cancellation (RFC 9204 §4.4.2).
+a_peer_reset_stream_keeps_its_sections_until_the_peer_cancels_test() ->
+    {ok, State} = quic_h3_connection:handle_stream_closed(
+        0, ?H3_REQUEST_CANCELLED, dynamic_response()
+    ),
+    ?assert(has_outstanding_sections(0, State)),
+    ?assertNot(can_make_room(State)),
+    {ok, State1} = peer_decoder_says(quic_qpack:encode_stream_cancel(0), State),
+    ?assertNot(has_outstanding_sections(0, State1)),
+    ?assert(can_make_room(State1)).
+
+%% Whether the encoder would evict its one entry to insert a field filling
+%% the table.
+can_make_room(State) ->
+    Big = {<<"x-big">>, binary:copy(<<"b">>, 4096 - 5 - 32)},
+    {_, Encoder} = quic_qpack:encode([Big], 100, element(13, State)),
+    quic_qpack:get_encoder_instructions(Encoder) =/= <<>>.
+
+%% The same holds for a push stream, ended by its FIN or reset after the
+%% client's CANCEL_PUSH.
+a_finished_push_keeps_its_sections_until_acknowledged_test() ->
+    State0 = dynamic_push(),
+    From = {self(), make_ref()},
+    {keep_state, State1, _} = quic_h3_connection:connected(
+        {call, From}, {send_push_data, 0, <<"x">>, true}, State0
+    ),
+    ?assertEqual(#{}, element(36, State1)),
+    ?assert(has_outstanding_sections(3, State1)),
+    {ok, State2} = peer_decoder_says(quic_qpack:encode_section_ack(3), State1),
+    ?assertNot(has_outstanding_sections(3, State2)).
+
+a_cancelled_push_keeps_its_sections_until_the_peer_cancels_test() ->
+    {ok, State} = quic_h3_connection:handle_control_frame({cancel_push, 0}, dynamic_push()),
+    ?assertEqual(#{}, element(36, State)),
+    ?assert(has_outstanding_sections(3, State)),
+    {ok, State1} = peer_decoder_says(quic_qpack:encode_stream_cancel(3), State),
+    ?assertNot(has_outstanding_sections(3, State1)).
+
+%% Instructions arriving on the client's QPACK decoder stream, 10.
+peer_decoder_says(Bin, State) ->
+    quic_h3_connection:handle_stream_data(10, Bin, false, State).
+
+%% A server with push 0 on stream 3, whose response HEADERS refer to the
+%% dynamic table.
+dynamic_push() ->
+    {State0, Field} = dynamic_table_server(),
+    {_Headers, Encoder} = quic_qpack:encode([Field], 3, element(13, State0)),
+    Push = #h3_stream{id = 3, type = push, state = open, frame_state = expecting_data},
+    State1 = setelement(13, State0, Encoder),
+    %% max_push_id, next_push_id and push_streams are at 34, 35 and 36
+    State2 = setelement(36, setelement(35, setelement(34, State1, 10), 1), #{0 => {3, Push}}),
+    ?assert(has_outstanding_sections(3, State2)),
+    State2.
+
+%% A server whose encoder holds Field in its dynamic table, acknowledged.
+dynamic_table_server() ->
+    Field = {<<"x-custom">>, <<"value">>},
+    Encoder0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    {_Literal, Encoder1} = quic_qpack:encode([Field], Encoder0),
+    {ok, Encoder2} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(1),
+        quic_qpack:clear_encoder_instructions(Encoder1)
+    ),
+    State = make_test_state(#{
+        role => server,
+        quic_conn => fake_quic_conn(),
+        qpack_encoder => Encoder2,
+        peer_decoder_stream => 10,
+        settings_received => true
+    }),
+    {State, Field}.
+
+%% The same server with response HEADERS referring to that entry sent on
+%% stream 0, and the body still to come.
+dynamic_response() ->
+    {State0, Field} = dynamic_table_server(),
+    {_Headers, Encoder} = quic_qpack:encode([Field], 0, element(13, State0)),
+    Stream = #h3_stream{id = 0, type = request, state = half_closed_remote, status = 200},
+    State1 = setelement(13, State0, Encoder),
+    %% streams is at position 21
+    State2 = setelement(21, State1, #{0 => Stream}),
+    ?assert(has_outstanding_sections(0, State2)),
+    State2.
+
+%% qpack_encoder is at position 13.
+has_outstanding_sections(StreamId, State) ->
+    Encoder = element(13, State),
+    quic_qpack:release_stream(StreamId, Encoder) =/= Encoder.
+
+%%====================================================================
+%% Unidirectional streams that end with FIN
+%%====================================================================
+
+%% A stream of an unknown type is remembered so its bytes are ignored
+%% (RFC 9114 §6.2.3), and one whose type has not arrived is buffered.
+%% Both are forgotten when the stream ends, not only when it is reset.
+ended_uni_streams_are_forgotten_test() ->
+    State0 = make_test_state(#{role => server}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(2, <<16#21>>, false, State0),
+    ?assert(sets:is_element(2, quic_h3_connection:test_discarded_uni_streams(State1))),
+    {ok, State2} = quic_h3_connection:handle_stream_data(2, <<"ignored">>, true, State1),
+    %% the type and the FIN together
+    {ok, State3} = quic_h3_connection:handle_stream_data(6, <<16#21>>, true, State2),
+    %% a two-byte type cut short, then nothing
+    {ok, State4} = quic_h3_connection:handle_stream_data(10, <<16#40>>, false, State3),
+    ?assertEqual(#{10 => <<16#40>>}, element(24, State4)),
+    {ok, State5} = quic_h3_connection:handle_stream_data(10, <<>>, true, State4),
+    {ok, State6} = quic_h3_connection:handle_stream_data(14, <<>>, true, State5),
+    ?assertEqual(0, sets:size(quic_h3_connection:test_discarded_uni_streams(State6))),
+    %% uni_stream_buffers is at position 24
+    ?assertEqual(#{}, element(24, State6)).
+
+%% So is a stream the owner claimed, after its last bytes are delivered.
+an_ended_claimed_uni_stream_is_forgotten_test() ->
+    flush_mailbox(),
+    Claim = fun(_Dir, _StreamId, _Type) -> claim end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Claim}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        2, <<16#40, 16#54, "ab">>, false, State0
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(2, <<"cd">>, true, State1),
+    Self = self(),
+    ?assertEqual(
+        [
+            {stream_type_open, uni, 2, 16#54},
+            {stream_type_data, uni, 2, <<"ab">>, false},
+            {stream_type_data, uni, 2, <<"cd">>, true}
+        ],
+        [
+            receive
+                {quic_h3, Self, Event} -> Event
+            after 100 -> nothing
+            end
+         || _ <- [1, 2, 3]
+        ]
+    ),
+    %% claimed_uni_streams is at position 49
+    ?assertEqual(#{2 => 16#54}, element(48, State1)),
+    ?assertEqual(#{}, element(48, State2)).
+
+%%====================================================================
+%% QPACK stream errors (RFC 9204 §6)
+%%====================================================================
+
+%% An integer too long to take on the decoder stream.
+overlong_integer_on_the_decoder_stream_closes_the_connection_test() ->
+    State = make_test_state(#{role => server, peer_decoder_stream => 10}),
+    Overlong = <<16#3F, (binary:copy(<<16#80>>, 9))/binary, 1>>,
+    ?assertMatch(
+        {error, {connection_error, ?H3_QPACK_DECODER_STREAM_ERROR, _}, _},
+        quic_h3_connection:handle_stream_data(10, Overlong, false, State)
+    ).
+
+%% An insertion naming static table entry 99 on the encoder stream
+%% (RFC 9204 §3.1).
+invalid_static_index_on_the_encoder_stream_closes_the_connection_test() ->
+    State = blocking_state(#{}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_QPACK_ENCODER_STREAM_ERROR, _}, _},
+        quic_h3_connection:handle_stream_data(2, <<16#FF, 36, 1, $v>>, false, State)
+    ),
+    ?assertMatch(
+        {ok, _}, quic_h3_connection:handle_stream_data(2, <<16#FF, 35, 1, $v>>, false, State)
+    ).
+
+%%====================================================================
+%% Blocked streams limit (RFC 9204 §2.1.2)
+%%====================================================================
+
+%% Trailers that wait for the encoder stream block their stream like
+%% HEADERS do, so they count against SETTINGS_QPACK_BLOCKED_STREAMS.
+blocked_trailers_within_the_limit_wait_test() ->
+    State0 = blocking_state(#{local_max_blocked_streams => 1}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, upload_with_trailers(), true, State0),
+    %% blocked_streams is at position 28
+    ?assertMatch(#{0 := {1, _, true}}, element(28, State1)),
+    flush_owner_events().
+
+blocked_trailers_past_the_limit_close_the_connection_test() ->
+    State0 = blocking_state(#{local_max_blocked_streams => 1}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, upload_with_trailers(), true, State0),
+    ?assertMatch(
+        {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, _}, _},
+        quic_h3_connection:handle_stream_data(4, upload_with_trailers(), true, State1)
+    ),
+    flush_owner_events().
+
+%% The same for HEADERS, with the error RFC 9204 names.
+blocked_headers_past_the_limit_close_the_connection_test() ->
+    State0 = blocking_state(#{quic_conn => fake_quic_conn(), local_max_blocked_streams => 1}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, blocked_request(1), true, State0),
+    ?assertMatch(
+        {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, _}, _},
+        quic_h3_connection:handle_stream_data(4, blocked_request(1), true, State1)
+    ).
+
+%% A POST whose trailers refer to a dynamic table entry not yet inserted.
+upload_with_trailers() ->
+    <<
+        (request_frame(<<"POST">>, <<"/upload">>))/binary,
+        (quic_h3_frame:encode_data(<<"abc">>))/binary,
+        (quic_h3_frame:encode_headers(<<2, 0, 16#80>>))/binary
+    >>.
+
+%%====================================================================
+%% Content-Length when the message ends short (RFC 9114 §4.1.2)
+%%====================================================================
+
+%% Three of the ten bytes, then the stream ends with no more DATA.
+short_body_ended_by_a_bare_fin_is_malformed_test() ->
+    {Quic, State1} = short_upload(),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<>>, true, State1),
+    ?assertEqual({stream_reset, 0, ?H3_MESSAGE_ERROR}, next_owner_event()),
+    ?assert(lists:member({close_stream, 0, ?H3_MESSAGE_ERROR}, fake_quic_calls(Quic))),
+    ?assertEqual(#{}, quic_h3_connection:test_stream_data_buffers(State2)).
+
+%% The same body ended by trailers.
+short_body_ended_by_trailers_is_malformed_test() ->
+    {Quic, State1} = short_upload(),
+    Trailers = quic_h3_frame:encode_headers(quic_qpack:encode([{<<"x-sum">>, <<"1">>}])),
+    {ok, _} = quic_h3_connection:handle_stream_data(0, Trailers, true, State1),
+    ?assertEqual({stream_reset, 0, ?H3_MESSAGE_ERROR}, next_owner_event()),
+    ?assert(lists:member({close_stream, 0, ?H3_MESSAGE_ERROR}, fake_quic_calls(Quic))).
+
+%% No DATA at all: the request is not handed to the application.
+content_length_without_a_body_is_malformed_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    Request = request_frame(<<"POST">>, <<"/upload">>, [{<<"content-length">>, <<"10">>}]),
+    {ok, _} = quic_h3_connection:handle_stream_data(0, Request, true, State0),
+    ?assertEqual({stream_reset, 0, ?H3_MESSAGE_ERROR}, next_owner_event()),
+    ?assert(lists:member({close_stream, 0, ?H3_MESSAGE_ERROR}, fake_quic_calls(Quic))).
+
+%% A body of the stated length ends any of the three ways.
+full_body_is_accepted_however_it_ends_test() ->
+    Trailers = quic_h3_frame:encode_headers(quic_qpack:encode([{<<"x-sum">>, <<"1">>}])),
+    lists:foreach(
+        fun({Request, End}) ->
+            flush_owner_events(),
+            Quic = fake_quic_conn(),
+            State0 = make_test_state(#{role => server, quic_conn => Quic}),
+            {ok, State1} = quic_h3_connection:handle_stream_data(0, Request, false, State0),
+            {ok, _} = quic_h3_connection:handle_stream_data(0, End, true, State1),
+            ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic)))
+        end,
+        [
+            {upload_start(<<"3">>), <<>>},
+            {upload_start(<<"3">>), Trailers},
+            {request_frame(<<"POST">>, <<"/upload">>, [{<<"content-length">>, <<"0">>}]), <<>>}
+        ]
+    ),
+    flush_owner_events().
+
+%% A response to HEAD states the length a GET would have had (RFC 9110
+%% Section 8.6), so HEADERS that end the stream are complete.
+head_response_ending_at_headers_is_not_a_mismatch_test() ->
+    flush_owner_events(),
+    Stream = #h3_stream{
+        id = 0, type = request, state = half_closed_local, method = <<"HEAD">>
+    },
+    State0 = make_test_state(#{role => client, streams => #{0 => Stream}}),
+    Response = quic_h3_frame:encode_headers(
+        quic_qpack:encode([{<<":status">>, <<"200">>}, {<<"content-length">>, <<"10">>}])
+    ),
+    {ok, _} = quic_h3_connection:handle_stream_data(0, Response, true, State0),
+    ?assertMatch({response, 0, 200, _}, next_owner_event()),
+    flush_owner_events().
+
+%% A server that has read a POST announcing ten bytes and three of them.
+short_upload() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        0, upload_start(<<"10">>), false, State0
+    ),
+    {request, 0, <<"POST">>, <<"/upload">>, _} = next_owner_event(),
+    {Quic, State1}.
+
+upload_start(ContentLength) ->
+    <<
+        (request_frame(<<"POST">>, <<"/upload">>, [{<<"content-length">>, ContentLength}]))/binary,
+        (quic_h3_frame:encode_data(<<"abc">>))/binary
+    >>.
+
+%% RFC 9110 Section 8.6: Content-Length = 1*DIGIT, so no sign.
+signed_content_length_is_malformed_test() ->
+    State = make_test_state(#{role => server}),
+    Headers = fun(Value) -> valid_request_headers() ++ [{<<"content-length">>, Value}] end,
+    Stream = #h3_stream{id = 0},
+    [
+        ?assertEqual(
+            {error, {invalid_field, <<"content-length">>, Value}},
+            quic_h3_connection:update_stream_with_headers(Headers(Value), Stream, server, State)
+        )
+     || Value <- [<<"+10">>, <<"-0">>, <<>>]
+    ],
+    ?assertMatch(
+        {ok, #h3_stream{content_length = 10}},
+        quic_h3_connection:update_stream_with_headers(Headers(<<"10">>), Stream, server, State)
+    ).
+
+%% The same for :status, three digits (RFC 9110 Section 15).
+signed_status_is_malformed_test() ->
+    State = make_test_state(#{role => client}),
+    Stream = #h3_stream{id = 0},
+    ?assertEqual(
+        {error, {invalid_field, <<":status">>, <<"+200">>}},
+        quic_h3_connection:update_stream_with_headers(
+            [{<<":status">>, <<"+200">>}], Stream, client, State
+        )
+    ),
+    ?assertMatch(
+        {ok, #h3_stream{status = 200}},
+        quic_h3_connection:update_stream_with_headers(
+            [{<<":status">>, <<"200">>}], Stream, client, State
+        )
+    ).
+
+%%====================================================================
+%% Required Insert Count and the peer's table (RFC 9204 §4.5.1.1)
+%%====================================================================
+
+%% We would use 4096 bytes of table, the peer allows 100. What the peer
+%% decodes the Required Insert Count with is its own 100, so that is what
+%% our encoder has to count with once the SETTINGS are in.
+required_insert_count_follows_the_peers_table_capacity_test() ->
+    State0 = make_test_state(#{
+        role => server,
+        quic_conn => fake_quic_conn(),
+        local_encoder_stream => 3,
+        qpack_encoder => quic_qpack:new(#{max_allowed_capacity => 4096})
+    }),
+    {ok, State1} = quic_h3_connection:handle_control_frame(
+        {settings, #{qpack_max_table_capacity => 100}}, State0
+    ),
+    Encoder = element(13, State1),
+    ?assertEqual(100, quic_qpack:get_dynamic_capacity(Encoder)),
+    lists:foldl(
+        fun(N, {E, D}) ->
+            H = [{<<"x-", (integer_to_binary(N))/binary>>, <<"v">>}],
+            {_Literal, E1} = quic_qpack:encode(H, E),
+            {ok, D1} = quic_qpack:process_encoder_instructions(
+                quic_qpack:get_encoder_instructions(E1), D
+            ),
+            {ok, E2} = quic_qpack:process_decoder_instructions(
+                quic_qpack:encode_insert_count_increment(1),
+                quic_qpack:clear_encoder_instructions(E1)
+            ),
+            {Ref, E3} = quic_qpack:encode(H, E2),
+            ?assertEqual({N, {ok, H}}, {N, element(1, quic_qpack:decode(Ref, D1))}),
+            {E3, D1}
+        end,
+        {Encoder, quic_qpack:new(#{max_dynamic_size => 100})},
+        lists:seq(1, 20)
+    ).
+
+%%====================================================================
+%% Cancelled pushes whose stream is open (RFC 9114 §7.2.3)
+%%====================================================================
+
+%% The server withdraws a push it has started to send. What it had already
+%% put on the push stream still arrives, and is ignored: it used to be read
+%% as the start of a new stream, here one claiming to be the control stream.
+bytes_of_a_push_the_server_cancelled_are_ignored_test() ->
+    flush_owner_events(),
+    State0 = receiving_push(fake_quic_conn()),
+    {ok, State1} = quic_h3_connection:handle_control_frame({cancel_push, 0}, State0),
+    ?assertEqual({push_cancelled, 0}, next_owner_event()),
+    ?assertEqual(
+        {ok, State1}, quic_h3_connection:handle_stream_data(3, <<0, 2, "hi">>, false, State1)
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(3, <<>>, true, State1),
+    ?assertEqual(0, sets:size(quic_h3_connection:test_discarded_uni_streams(State2))),
+    ?assertEqual(nothing, next_owner_event()).
+
+%% A push the client cancels itself is ignored the same way.
+bytes_of_a_push_the_client_cancelled_are_ignored_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    State0 = receiving_push(Quic),
+    %% handle_push_frame cancels a push whose trailers are over the limit
+    {ok, State1} = quic_h3_connection:handle_push_frame(
+        3, 0, {headers, big_field_section()}, true, State0
+    ),
+    ?assertEqual({push_cancelled, 0}, next_owner_event()),
+    ?assertEqual(
+        {ok, State1}, quic_h3_connection:handle_stream_data(3, <<0, 2, "hi">>, false, State1)
+    ),
+    ?assertEqual(nothing, next_owner_event()).
+
+%% A push cancelled before its stream arrived: reading is aborted, and the
+%% frames after the push ID are not taken for a new stream either.
+a_cancelled_push_that_arrives_is_stopped_and_ignored_test() ->
+    Quic = fake_quic_conn(),
+    State0 = make_test_state(#{
+        role => client,
+        quic_conn => Quic,
+        local_max_push_id => 10,
+        local_cancelled_pushes => sets:from_list([5], [{version, 2}])
+    }),
+    {ok, State1} = quic_h3_connection:handle_stream_data(3, <<1, 5>>, false, State0),
+    ?assert(lists:member({stop_sending, 3, ?H3_REQUEST_CANCELLED}, fake_quic_calls(Quic))),
+    ?assertEqual(
+        {ok, State1}, quic_h3_connection:handle_stream_data(3, <<1, 2, 0, 0>>, false, State1)
+    ).
+
+%% A client reading the body of push 0 on stream 3.
+receiving_push(Quic) ->
+    Push = #h3_stream{id = 3, type = push, state = open, frame_state = expecting_data},
+    make_test_state(#{
+        role => client,
+        quic_conn => Quic,
+        settings_received => true,
+        local_control_stream => 2,
+        local_max_push_id => 10,
+        local_max_field_section_size => 1024,
+        received_pushes => #{0 => Push}
+    }).
