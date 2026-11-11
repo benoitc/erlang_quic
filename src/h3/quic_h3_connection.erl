@@ -5242,9 +5242,9 @@ validate_peer_h3_datagram(#state{quic_conn = QuicConn}) ->
 deliver_h3_datagram(Data, #state{owner = Owner} = State) ->
     case decode_h3_datagram(Data) of
         {ok, StreamId, Payload} ->
-            case maps:is_key(StreamId, State#state.streams) of
-                true -> Owner ! {quic_h3, self(), {datagram, StreamId, Payload}};
-                false -> ok
+            case live_stream(StreamId, State#state.streams) of
+                {ok, _} -> Owner ! {quic_h3, self(), {datagram, StreamId, Payload}};
+                error -> ok
             end;
         error ->
             ok
@@ -5268,10 +5268,10 @@ h3_send_datagram(StreamId, Data, State) ->
         false ->
             {error, h3_datagrams_disabled};
         true ->
-            case maps:is_key(StreamId, State#state.streams) of
-                false ->
+            case live_stream(StreamId, State#state.streams) of
+                error ->
                     {error, unknown_stream};
-                true ->
+                {ok, _} ->
                     QSID = quic_varint:encode(StreamId bsr 2),
                     Framed = <<QSID/binary, (iolist_to_binary(Data))/binary>>,
                     quic:send_datagram(State#state.quic_conn, Framed)

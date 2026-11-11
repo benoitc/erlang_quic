@@ -4136,6 +4136,43 @@ a_blocked_request_is_dispatched_once_unblocked_test() ->
     ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()).
 
 %%====================================================================
+%% HTTP datagrams on a stream this side reset (RFC 9297 §2.1)
+%%====================================================================
+
+%% A request stream reset here is kept only to drop what arrives on it, so
+%% its datagrams are neither delivered nor sent.
+datagrams_on_a_locally_reset_stream_are_dropped_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    Streams = #{
+        0 => #h3_stream{id = 0, type = request, state = closed, reset = true},
+        4 => #h3_stream{id = 4, type = request, state = open}
+    },
+    State = make_test_state(#{
+        quic_conn => Quic,
+        role => server,
+        streams => Streams,
+        h3_datagram_enabled => true,
+        peer_h3_datagram_enabled => true
+    }),
+    {keep_state, _} = quic_h3_connection:connected(
+        info, {quic, Quic, {datagram, <<0, "a">>}}, State
+    ),
+    ?assertEqual(nothing, next_owner_event()),
+    {keep_state, _} = quic_h3_connection:connected(
+        info, {quic, Quic, {datagram, <<1, "b">>}}, State
+    ),
+    ?assertEqual({datagram, 4, <<"b">>}, next_owner_event()),
+    Ref = make_ref(),
+    {keep_state, _, [{reply, {_, Ref}, Refused}]} = quic_h3_connection:connected(
+        {call, {self(), Ref}}, {send_h3_datagram, 0, <<"c">>}, State
+    ),
+    ?assertEqual({error, unknown_stream}, Refused),
+    {keep_state, _, [{reply, {_, Ref}, ok}]} = quic_h3_connection:connected(
+        {call, {self(), Ref}}, {send_h3_datagram, 4, <<"d">>}, State
+    ).
+
+%%====================================================================
 %% Stream Cancellation for every abandoned stream (RFC 9204 §2.2.2.2)
 %%====================================================================
 
