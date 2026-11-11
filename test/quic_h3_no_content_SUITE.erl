@@ -25,7 +25,16 @@
     head_with_content_length/1,
     no_content_statuses_with_content_length/1,
     a_genuinely_short_body_is_still_refused/1,
-    a_caller_supplied_status_is_not_duplicated/1
+    a_caller_supplied_status_is_not_duplicated/1,
+    send_response_204_alone_ends_the_stream/1,
+    many_204s_leave_no_stream_behind/1,
+    no_content_responses_carry_no_data_frame/1,
+    no_content_push_ends_on_headers/1,
+    body_and_trailers_after_no_content_are_dropped/1,
+    push_body_after_no_content_is_dropped/1,
+    no_content_length_on_1xx_or_204/1,
+    no_body_before_the_final_response/1,
+    dynamic_table_entries_are_acknowledged_and_used/1
 ]).
 
 -define(WAIT_MS, 3000).
@@ -42,7 +51,16 @@ all() ->
         head_with_content_length,
         no_content_statuses_with_content_length,
         a_genuinely_short_body_is_still_refused,
-        a_caller_supplied_status_is_not_duplicated
+        a_caller_supplied_status_is_not_duplicated,
+        send_response_204_alone_ends_the_stream,
+        many_204s_leave_no_stream_behind,
+        no_content_responses_carry_no_data_frame,
+        no_content_push_ends_on_headers,
+        body_and_trailers_after_no_content_are_dropped,
+        push_body_after_no_content_is_dropped,
+        no_content_length_on_1xx_or_204,
+        no_body_before_the_final_response,
+        dynamic_table_entries_are_acknowledged_and_used
     ].
 
 init_per_suite(Config) ->
@@ -115,16 +133,205 @@ a_caller_supplied_status_is_not_duplicated(Config) ->
         quic_h3:close(Conn)
     end).
 
+%% RFC 9110 Section 6.4.1: a 204 is complete on its HEADERS, so
+%% send_response/4 alone ends the stream.
+send_response_204_alone_ends_the_stream(Config) ->
+    with_server(Config, fun(Port) ->
+        Conn = connect(Port),
+        {ok, StreamId} = quic_h3:request(Conn, headers(<<"GET">>, <<"/204-alone">>)),
+        ?assertMatch({response, StreamId, 204, _}, next(Conn)),
+        ?assertEqual({data, StreamId, <<>>, true}, next(Conn)),
+        quic_h3:close(Conn)
+    end).
+
+%% Each of those streams is finished on the server, so none is left
+%% holding a slot of the peer's stream limit.
+many_204s_leave_no_stream_behind(Config) ->
+    with_server(Config, fun(Port) ->
+        Conn = connect(Port),
+        lists:foreach(
+            fun(_) ->
+                {ok, StreamId} = quic_h3:request(Conn, headers(<<"GET">>, <<"/204-alone">>)),
+                {response, StreamId, 204, _} = next(Conn),
+                {data, StreamId, <<>>, true} = next(Conn)
+            end,
+            lists:seq(1, 250)
+        ),
+        {ok, Next} = quic_h3:request(Conn, headers(<<"GET">>, <<"/doc">>)),
+        ?assertMatch({response, Next, 200, _}, next(Conn)),
+        ?assertEqual({data, Next, ?DOC, true}, next(Conn)),
+        {_, ServerState} = sys:get_state(server_conn()),
+        ?assertEqual(#{}, quic_h3_connection:test_streams(ServerState)),
+        quic_h3:close(Conn)
+    end).
+
+%% What the server writes on the request stream: the HEADERS frame with the
+%% FIN, and no DATA frame, whichever call made the response.
+no_content_responses_carry_no_data_frame(Config) ->
+    with_server(Config, fun(Port) ->
+        Conn = connect(Port),
+        lists:foreach(
+            fun({Method, Path}) ->
+                {Wire, Events} = traced(Conn, Method, Path),
+                ?assertMatch([[headers, fin]], Wire, {Method, Path}),
+                ?assertMatch([{response, _, _, _}, {data, _, <<>>, true}], Events)
+            end,
+            [
+                {<<"HEAD">>, <<"/doc">>},
+                {<<"GET">>, <<"/204">>},
+                {<<"GET">>, <<"/304">>},
+                {<<"HEAD">>, <<"/respond">>},
+                {<<"GET">>, <<"/respond-204">>},
+                {<<"GET">>, <<"/respond-304">>}
+            ]
+        ),
+        quic_h3:close(Conn)
+    end).
+
+%% A pushed 204 ends on its HEADERS too.
+no_content_push_ends_on_headers(Config) ->
+    with_server(Config, fun(Port) ->
+        Conn = connect(Port),
+        ok = quic_h3:set_max_push_id(Conn, 10),
+        timer:sleep(100),
+        {ok, StreamId} = quic_h3:request(Conn, headers(<<"GET">>, <<"/push-204">>)),
+        Events = collect(Conn),
+        ?assertMatch(
+            [
+                {push_stream, PushId, StreamId, _},
+                {push_response, PushId, 204, _},
+                {push_complete, PushId}
+            ],
+            [E || E <- Events, is_push_event(E)]
+        ),
+        quic_h3:close(Conn)
+    end).
+
+%% A body or trailers offered after a no-content response are not sent,
+%% and the call still succeeds.
+body_and_trailers_after_no_content_are_dropped(Config) ->
+    with_server(Config, fun(Port) ->
+        Conn = connect(Port),
+        lists:foreach(
+            fun({Method, Path}) ->
+                _ = persistent_term:erase({?MODULE, result}),
+                {Wire, Events} = traced(Conn, Method, Path),
+                ?assertMatch([[headers, fin]], Wire, {Method, Path}),
+                ?assertMatch([{response, _, _, _}, {data, _, <<>>, true}], Events),
+                ?assertEqual(ok, handler_result())
+            end,
+            [
+                {<<"GET">>, <<"/body-204">>},
+                {<<"GET">>, <<"/body-304">>},
+                {<<"HEAD">>, <<"/body-head">>},
+                {<<"GET">>, <<"/trailers-204">>},
+                {<<"HEAD">>, <<"/trailers-head">>}
+            ]
+        ),
+        quic_h3:close(Conn)
+    end).
+
+push_body_after_no_content_is_dropped(Config) ->
+    with_server(Config, fun(Port) ->
+        Conn = connect(Port),
+        ok = quic_h3:set_max_push_id(Conn, 10),
+        timer:sleep(100),
+        _ = persistent_term:erase({?MODULE, result}),
+        {ok, _StreamId} = quic_h3:request(Conn, headers(<<"GET">>, <<"/push-204-body">>)),
+        Events = [E || E <- collect(Conn), is_push_event(E)],
+        ?assertMatch(
+            [{push_stream, _, _, _}, {push_response, _, 204, _}, {push_complete, _}], Events
+        ),
+        ?assertEqual(ok, handler_result()),
+        quic_h3:close(Conn)
+    end).
+
+%% RFC 9110 Section 8.6: a server MUST NOT send Content-Length in a 1xx or
+%% 204 response. A 304 keeps the one the caller set.
+no_content_length_on_1xx_or_204(Config) ->
+    with_server(Config, fun(Port) ->
+        Conn = connect(Port),
+        ok = quic_h3:set_max_push_id(Conn, 10),
+        timer:sleep(100),
+        Lengths = fun(Path) ->
+            {ok, _} = quic_h3:request(Conn, headers(<<"GET">>, Path)),
+            [
+                {Status, proplists:get_value(<<"content-length">>, H)}
+             || {Kind, _, Status, H} <- collect(Conn),
+                (Kind =:= response) orelse (Kind =:= push_response)
+            ]
+        end,
+        ?assertEqual([{103, undefined}, {200, <<"2">>}], Lengths(<<"/cl-103">>)),
+        ?assertEqual([{204, undefined}], Lengths(<<"/cl-204">>)),
+        ?assertEqual([{304, <<"40">>}], Lengths(<<"/cl-304">>)),
+        ?assertEqual([{204, undefined}, {200, undefined}], Lengths(<<"/push-cl-204">>)),
+        quic_h3:close(Conn)
+    end).
+
+%% RFC 9114 Section 4.1: a body offered before the final response is
+%% refused, so the client still gets a well-formed response after it.
+no_body_before_the_final_response(Config) ->
+    with_server(Config, fun(Port) ->
+        Conn = connect(Port),
+        lists:foreach(
+            fun({Path, Frames}) ->
+                _ = persistent_term:erase({?MODULE, result}),
+                {Wire, Events} = traced(Conn, <<"GET">>, Path),
+                ?assertEqual({error, no_final_response}, handler_result()),
+                ?assertEqual(Frames, lists:append(Wire)),
+                ?assertMatch([{data, _, <<"ok">>, true}], [E || {data, _, _, _} = E <- Events]),
+                ?assertMatch({response, _, 200, _}, lists:keyfind(200, 3, Events))
+            end,
+            [
+                {<<"/data-first">>, [headers, data, fin]},
+                {<<"/103-then-data">>, [headers, headers, data, fin]}
+            ]
+        ),
+        %% the connection is still up
+        {ok, Next} = quic_h3:request(Conn, headers(<<"GET">>, <<"/doc">>)),
+        ?assertMatch({response, Next, 200, _}, next(Conn)),
+        quic_h3:close(Conn)
+    end).
+
+%% RFC 9204 Section 4.4.3: the client's decoder acknowledges the entries
+%% the server inserts, so later responses refer to them instead of
+%% inserting them again.
+dynamic_table_entries_are_acknowledged_and_used(Config) ->
+    Dyn = #{qpack_max_table_capacity => 4096, qpack_blocked_streams => 16},
+    with_server(Config, #{settings => Dyn}, fun(Port) ->
+        {ok, Conn} = quic_h3:connect("127.0.0.1", Port, #{
+            verify => false, sync => true, settings => Dyn
+        }),
+        {Wire1, Events1} = traced(Conn, <<"GET">>, <<"/dyn">>, blocks),
+        ?assertMatch([{response, _, 200, _} | _], Events1),
+        Inserted = await_acknowledged(server_encoder, 40),
+        ?assert(Inserted > 0),
+        {Wire2, Events2} = traced(Conn, <<"GET">>, <<"/dyn">>, blocks),
+        [{response, _, 200, Headers2} | _] = Events2,
+        ?assertEqual(dyn_headers(), [H || {<<"x-", _/binary>>, _} = H <- Headers2]),
+        ?assertMatch([[{headers, 0}, _ | _]], Wire1),
+        [[{headers, Ric2} | _]] = Wire2,
+        ?assertNotEqual(0, Ric2),
+        ?assertEqual(Inserted, quic_qpack:get_insert_count(server_encoder())),
+        quic_h3:close(Conn)
+    end).
+
 %%====================================================================
 %% Server
 %%====================================================================
 
 with_server(Config, F) ->
+    with_server(Config, #{}, F).
+
+with_server(Config, Extra, F) ->
     Name = list_to_atom("h3_no_content_" ++ integer_to_list(erlang:unique_integer([positive]))),
-    {ok, _} = quic_h3:start_server(Name, 0, #{
+    {ok, _} = quic_h3:start_server(Name, 0, Extra#{
         cert => ?config(cert, Config),
         key => ?config(key, Config),
-        handler => fun handle/5
+        handler => fun(Conn, StreamId, Method, Path, Headers) ->
+            persistent_term:put({?MODULE, server_conn}, Conn),
+            handle(Conn, StreamId, Method, Path, Headers)
+        end
     }),
     {ok, Port} = quic:get_server_port(Name),
     try
@@ -150,8 +357,98 @@ handle(Conn, StreamId, _Method, <<"/dup-status">>, _Headers) ->
     ok = quic_h3:send_data(Conn, StreamId, <<>>, true);
 handle(Conn, StreamId, _Method, <<"/short">>, _Headers) ->
     respond(Conn, StreamId, 200, <<"short">>);
+handle(Conn, StreamId, _Method, <<"/204-alone">>, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 204, []);
+handle(Conn, StreamId, _Method, <<"/respond">>, _Headers) ->
+    ok = quic_h3:respond(Conn, StreamId, 200, doc_headers(), ?DOC);
+handle(Conn, StreamId, _Method, <<"/respond-204">>, _Headers) ->
+    ok = quic_h3:respond(Conn, StreamId, 204, [], ?DOC);
+handle(Conn, StreamId, _Method, <<"/respond-304">>, _Headers) ->
+    ok = quic_h3:respond(Conn, StreamId, 304, doc_headers(), ?DOC);
+handle(Conn, StreamId, _Method, <<"/push-204">>, _Headers) ->
+    {ok, PushId} = quic_h3:push(Conn, StreamId, headers(<<"GET">>, <<"/pushed">>)),
+    ok = quic_h3:send_push_response(Conn, PushId, 204, []),
+    ok = quic_h3:respond(Conn, StreamId, 200, [], <<"page">>);
+handle(Conn, StreamId, _Method, <<"/dyn">>, _Headers) ->
+    ok = quic_h3:respond(Conn, StreamId, 200, dyn_headers(), <<"body">>);
+handle(Conn, StreamId, _Method, <<"/data-first">>, _Headers) ->
+    result(quic_h3:send_data(Conn, StreamId, <<"early">>, false)),
+    ok = quic_h3:respond(Conn, StreamId, 200, [], <<"ok">>);
+handle(Conn, StreamId, _Method, <<"/103-then-data">>, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 103, []),
+    result(quic_h3:send_data(Conn, StreamId, <<"early">>, false)),
+    ok = quic_h3:respond(Conn, StreamId, 200, [], <<"ok">>);
+handle(Conn, StreamId, _Method, <<"/cl-103">>, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 103, doc_headers()),
+    ok = quic_h3:respond(Conn, StreamId, 200, [{<<"content-length">>, <<"2">>}], <<"ok">>);
+handle(Conn, StreamId, _Method, <<"/cl-204">>, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 204, doc_headers());
+handle(Conn, StreamId, _Method, <<"/cl-304">>, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 304, doc_headers());
+handle(Conn, StreamId, _Method, <<"/push-cl-204">>, _Headers) ->
+    {ok, PushId} = quic_h3:push(Conn, StreamId, headers(<<"GET">>, <<"/pushed">>)),
+    ok = quic_h3:send_push_response(Conn, PushId, 204, doc_headers()),
+    ok = quic_h3:respond(Conn, StreamId, 200, [], <<"page">>);
+handle(Conn, StreamId, _Method, <<"/push-204-body">>, _Headers) ->
+    {ok, PushId} = quic_h3:push(Conn, StreamId, headers(<<"GET">>, <<"/pushed">>)),
+    ok = quic_h3:send_push_response(Conn, PushId, 204, []),
+    result(quic_h3:send_push_data(Conn, PushId, <<"oops">>, true)),
+    ok = quic_h3:respond(Conn, StreamId, 200, [], <<"page">>);
+handle(Conn, StreamId, _Method, <<"/body-", _/binary>> = Path, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, path_status(Path), [{<<"content-length">>, <<"4">>}]),
+    result(quic_h3:send_data(Conn, StreamId, <<"oops">>, true));
+handle(Conn, StreamId, _Method, <<"/trailers-", _/binary>> = Path, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, path_status(Path), []),
+    result(quic_h3:send_trailers(Conn, StreamId, [{<<"x-trailer">>, <<"t">>}]));
 handle(Conn, StreamId, _Method, _Path, _Headers) ->
     respond(Conn, StreamId, 404, <<>>).
+
+path_status(Path) ->
+    case binary:split(Path, <<"-">>) of
+        [_, <<"head">>] -> 200;
+        [_, Status] -> binary_to_integer(Status)
+    end.
+
+%% What the handler's last send call returned, for the test to check.
+result(Result) ->
+    persistent_term:put({?MODULE, result}, Result).
+
+handler_result() ->
+    persistent_term:get({?MODULE, result}, none).
+
+doc_headers() ->
+    [
+        {<<"content-type">>, <<"text/plain">>},
+        {<<"content-length">>, integer_to_binary(byte_size(?DOC))}
+    ].
+
+server_conn() ->
+    persistent_term:get({?MODULE, server_conn}).
+
+dyn_headers() ->
+    [
+        {<<"x-dynamic-one">>, <<"a-value-long-enough-to-be-worth-indexing">>},
+        {<<"x-dynamic-two">>, <<"another-value-long-enough-to-index">>}
+    ].
+
+%% The server connection's QPACK encoder, #state.qpack_encoder at position 13.
+server_encoder() ->
+    {_, State} = sys:get_state(server_conn()),
+    element(13, State).
+
+%% Wait until the client has acknowledged every entry the server inserted.
+await_acknowledged(server_encoder, 0) ->
+    error(entries_never_acknowledged);
+await_acknowledged(server_encoder, Tries) ->
+    Encoder = server_encoder(),
+    Inserted = quic_qpack:get_insert_count(Encoder),
+    case (Inserted > 0) andalso (Inserted =:= quic_qpack:get_known_received_count(Encoder)) of
+        true ->
+            Inserted;
+        false ->
+            timer:sleep(50),
+            await_acknowledged(server_encoder, Tries - 1)
+    end.
 
 respond(Conn, StreamId, Status, Body) ->
     Headers = [
@@ -187,3 +484,63 @@ next(Conn) ->
         {quic_h3, Conn, Event} -> Event
     after ?WAIT_MS -> heard_nothing
     end.
+
+%% Every event until the connection is quiet.
+collect(Conn) ->
+    case next(Conn) of
+        heard_nothing -> [];
+        Event -> [Event | collect(Conn)]
+    end.
+
+is_push_event(Event) ->
+    lists:member(element(1, Event), [push_stream, push_response, push_data, push_complete]).
+
+%%====================================================================
+%% Wire trace
+%%====================================================================
+
+%% The request, the client events, and the HTTP/3 frames the server wrote
+%% on the request stream, one list per quic:send_data/4 call.
+traced(Conn, Method, Path) ->
+    traced(Conn, Method, Path, frames).
+
+traced(Conn, Method, Path, Detail) ->
+    Self = self(),
+    Tracer = spawn(fun() -> tracer_loop(Self, []) end),
+    erlang:trace(all, true, [call, {tracer, Tracer}]),
+    erlang:trace_pattern({quic, send_data, 4}, true, [global]),
+    {ok, StreamId} = quic_h3:request(Conn, headers(Method, Path)),
+    Events = collect(Conn),
+    erlang:trace(all, false, [call]),
+    erlang:trace_pattern({quic, send_data, 4}, false, [global]),
+    Tracer ! {done, Self},
+    Calls =
+        receive
+            {calls, Tracer, C} -> C
+        after ?WAIT_MS -> error(no_trace)
+        end,
+    Wire = [
+        frames(iolist_to_binary(Data), Fin, Detail)
+     || {Pid, [_Q, Sid, Data, Fin]} <- Calls, Sid =:= StreamId, Pid =/= Conn
+    ],
+    {Wire, Events}.
+
+tracer_loop(Owner, Acc) ->
+    receive
+        {trace, Pid, call, {quic, send_data, Args}} -> tracer_loop(Owner, [{Pid, Args} | Acc]);
+        {done, Owner} -> Owner ! {calls, self(), lists:reverse(Acc)};
+        _ -> tracer_loop(Owner, Acc)
+    end.
+
+%% Each frame's type; with `blocks', a HEADERS frame also gives the first
+%% byte of its field section, the encoded Required Insert Count.
+frames(<<>>, true, _Detail) ->
+    [fin];
+frames(<<>>, false, _Detail) ->
+    [];
+frames(Bin, Fin, Detail) ->
+    {ok, Frame, Rest} = quic_h3_frame:decode(Bin),
+    [frame(Frame, Detail) | frames(Rest, Fin, Detail)].
+
+frame({headers, <<Ric, _/binary>>}, blocks) -> {headers, Ric};
+frame(Frame, _Detail) -> element(1, Frame).

@@ -116,6 +116,10 @@ Send body data on a request stream.
 For clients, this sends request body data. For servers, this sends response body data.
 Set `Fin` to `true` to indicate the end of the body.
 
+On the server, after a HEAD, 204 or 304 response it returns `ok` and sends
+nothing. Before a final response, with nothing or only a 1xx sent, it returns
+`{error, no_final_response}`. See [Responses without content](#responses-without-content).
+
 #### send_trailers/3
 
 Send trailers on a request stream.
@@ -124,7 +128,9 @@ Send trailers on a request stream.
 -spec send_trailers(conn(), stream_id(), headers()) -> ok | {error, term()}.
 ```
 
-Trailers are sent after the body and signal the end of the stream.
+Trailers are sent after the body and signal the end of the stream. On the
+server they follow the same rules as `send_data/4`: `ok` with nothing sent after
+a HEAD, 204 or 304 response, `{error, no_final_response}` before a final one.
 
 #### cancel/2, cancel/3
 
@@ -432,6 +438,44 @@ Send an HTTP response (server only).
 
 Sends the response status and headers. The body should be sent separately using `send_data/4`.
 
+Status 101 returns `{error, status_101_forbidden}`. A 1xx is interim and may be
+followed by more; Content-Length is removed from it.
+
+#### respond/5
+
+Send a full response, status, headers and body, in one call (server only).
+
+```erlang
+-spec respond(conn(), stream_id(), status(), headers(), binary()) -> ok | {error, term()}.
+```
+
+The HEADERS and the body go out together and end the stream. A HEAD, 204 or 304
+response sends no body. A 1xx returns `{error, informational_status}`; send it
+with `send_response/4`.
+
+#### Responses without content
+
+A final response to HEAD, and any 204 or 304, has no content (RFC 9110 Section
+6.4.1). This applies when you answer HEAD, or answer with 204 No Content or
+304 Not Modified.
+
+```erlang
+handle(Conn, StreamId, <<"HEAD">>, _Path, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 200, [{<<"content-length">>, <<"1024">>}]);
+handle(Conn, StreamId, _Method, _Path, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 204, []),
+    %% dropped: returns ok and sends nothing
+    ok = quic_h3:send_data(Conn, StreamId, <<"ignored">>, true).
+```
+
+- `send_response/4` sends the HEADERS at once and ends the stream; `respond/5` sends no body.
+- `send_data/4` and `send_trailers/3` after it return `ok` and send nothing.
+- Content-Length is removed from a 204 (RFC 9110 Section 8.6). A 304 and a HEAD response keep it.
+- Before a final response, `send_data/4` and `send_trailers/3` return `{error, no_final_response}` (RFC 9114 Section 4.1).
+- Status 101 is refused with `{error, status_101_forbidden}` (RFC 9114 Section 4.5).
+- Pushed responses follow the same rules with `send_push_response/4` and `send_push_data/4`.
+- As a client, DATA with content on such a response resets the stream with H3_MESSAGE_ERROR and none of it is delivered. A 101 received is reset the same way.
+
 ### Server Push API (RFC 9114 Section 4.6)
 
 #### push/3
@@ -467,7 +511,9 @@ Send response headers on a push stream (server only).
 -spec send_push_response(conn(), push_id(), status(), headers()) -> ok | {error, term()}.
 ```
 
-After `push/3` returns a push ID, use this to send the response headers.
+After `push/3` returns a push ID, use this to send the response headers. A
+pushed response to HEAD, or a 204 or 304, ends the push stream. Status 101
+returns `{error, status_101_forbidden}`.
 
 #### send_push_data/4
 
@@ -477,7 +523,9 @@ Send data on a push stream (server only).
 -spec send_push_data(conn(), push_id(), binary(), boolean()) -> ok | {error, term()}.
 ```
 
-Set `Fin` to `true` to indicate this is the last data.
+Set `Fin` to `true` to indicate this is the last data. After a HEAD, 204 or 304
+pushed response it returns `ok` and sends nothing; before a final response it
+returns `{error, no_final_response}`.
 
 ### Client Push API
 

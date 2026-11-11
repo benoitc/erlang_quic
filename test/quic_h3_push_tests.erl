@@ -332,6 +332,53 @@ frames_after_push_trailers_are_frame_unexpected_test() ->
     ),
     _ = push_events().
 
+%% RFC 9110 Sections 6.4.1 and 9.3.2: a pushed response to HEAD, or a
+%% pushed 204 or 304, has no content; DATA carrying any is malformed.
+data_on_a_no_content_push_is_malformed_test() ->
+    lists:foreach(
+        fun({Method, Status}) ->
+            _ = push_events(),
+            Push = <<
+                1,
+                5,
+                (push_response_frame(Status, []))/binary,
+                (quic_h3_frame:encode_data(<<"abc">>))/binary
+            >>,
+            ?assertMatch(
+                {error, {connection_error, ?H3_MESSAGE_ERROR, _}, _},
+                quic_h3_connection:handle_stream_data(3, Push, true, promised_state(Method))
+            ),
+            ?assertEqual([], [E || {push_data, _, _, _} = E <- push_events()])
+        end,
+        [{<<"HEAD">>, 200}, {<<"GET">>, 204}, {<<"GET">>, 304}]
+    ).
+
+%% The Content-Length of a pushed HEAD response is not a body length.
+head_push_with_content_length_and_no_body_completes_test() ->
+    _ = push_events(),
+    Push = <<
+        1,
+        5,
+        (push_response_frame(200, [{<<"content-length">>, <<"10">>}]))/binary,
+        (quic_h3_frame:encode_data(<<>>))/binary
+    >>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(3, Push, true, promised_state(<<"HEAD">>)),
+    ?assertEqual({push_complete, 5}, lists:last(push_events())),
+    %% received_pushes is at position 39
+    ?assertEqual(#{}, element(39, State1)).
+
+promised_state(Method) ->
+    make_test_state(#{
+        role => client,
+        local_max_push_id => 10,
+        promised_pushes => #{5 => {0, [{<<":method">>, Method}, {<<":path">>, <<"/p">>}]}}
+    }).
+
+push_response_frame(Status, Fields) ->
+    quic_h3_frame:encode_headers(
+        quic_qpack:encode([{<<":status">>, integer_to_binary(Status)} | Fields])
+    ).
+
 push_client_state() ->
     make_test_state(#{
         role => client,
@@ -374,6 +421,18 @@ push_response_with_path_pseudo_header_test() ->
     Headers = [{<<":status">>, <<"200">>}, {<<":path">>, <<"/">>}],
     Result = quic_h3_connection:validate_push_response_headers(Headers),
     ?assertMatch({error, <<"request pseudo-header in push response">>}, Result).
+
+%% RFC 9114 Section 4.5: no 101 in HTTP/3, pushed or not.
+push_response_101_is_malformed_test() ->
+    Result = quic_h3_connection:validate_push_response_headers([{<<":status">>, <<"101">>}]),
+    ?assertMatch({error, _}, Result),
+    _ = push_events(),
+    Push = <<1, 5, (push_response_frame(101, []))/binary>>,
+    ?assertMatch(
+        {error, {connection_error, ?H3_MESSAGE_ERROR, _}, _},
+        quic_h3_connection:handle_stream_data(3, Push, false, promised_state(<<"GET">>))
+    ),
+    ?assertEqual([], [E || {push_response, _, _, _} = E <- push_events()]).
 
 push_response_valid_test() ->
     Headers = [{<<":status">>, <<"200">>}, {<<"content-type">>, <<"text/html">>}],
@@ -507,7 +566,8 @@ make_test_state(Overrides) ->
         held_bytes => 0,
         reset_final_size => false,
         notify_streams => false,
-        streams_wanted => []
+        streams_wanted => [],
+        no_content_ended => {sets:new([{version, 2}]), queue:new()}
     },
     Merged = maps:merge(Default, Overrides),
     {state, maps:get(quic_conn, Merged), maps:get(quic_ref, Merged), maps:get(role, Merged),
@@ -541,4 +601,4 @@ make_test_state(Overrides) ->
         maps:get(deferred_requests, Merged), maps:get(held_streams, Merged),
         maps:get(held_data, Merged), maps:get(held_bytes, Merged),
         maps:get(reset_final_size, Merged), maps:get(notify_streams, Merged),
-        maps:get(streams_wanted, Merged)}.
+        maps:get(streams_wanted, Merged), maps:get(no_content_ended, Merged)}.

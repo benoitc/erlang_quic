@@ -52,7 +52,8 @@
     get_dynamic_capacity/1,
     get_insert_count/1,
     get_last_ric/1,
-    get_known_received_count/1
+    get_known_received_count/1,
+    take_insert_count_increment/1
 ]).
 
 %% Encoder stream processing (instructions FROM encoder)
@@ -253,7 +254,9 @@ decode(Data, State, MaxSize) ->
                 {{blocked, RIC}, State};
             false ->
                 {Headers, NewState} = decode_headers(Rest, RIC, Base, State, [], budget(MaxSize)),
-                {{ok, Headers}, NewState}
+                %% RFC 9204 Section 2.1.4: its Section Acknowledgment tells the encoder RIC.
+                KRC = max(NewState#qpack.known_received_count, RIC),
+                {{ok, Headers}, NewState#qpack{known_received_count = KRC}}
         end
     catch
         throw:incomplete ->
@@ -309,6 +312,15 @@ get_last_ric(#qpack{last_ric = RIC}) ->
 -spec get_known_received_count(state()) -> non_neg_integer().
 get_known_received_count(#qpack{known_received_count = KRC}) ->
     KRC.
+
+%% @doc Decoder side: the Insert Count Increment still to send, or 0 (RFC 9204 Section 4.4.3).
+-spec take_insert_count_increment(state()) -> {non_neg_integer(), state()}.
+take_insert_count_increment(#qpack{insert_count = IC, known_received_count = KRC} = State) when
+    IC > KRC
+->
+    {IC - KRC, State#qpack{known_received_count = IC}};
+take_insert_count_increment(State) ->
+    {0, State}.
 
 %% @doc Get pending encoder instructions.
 %% These should be sent on the encoder stream.

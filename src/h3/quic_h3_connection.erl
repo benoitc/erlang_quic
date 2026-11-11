@@ -93,6 +93,9 @@
     (S#state.defer_requests andalso not S#state.settings_received)
 ).
 
+%% How many streams and pushes ended by a HEAD, 204 or 304 response are remembered.
+-define(NO_CONTENT_ENDED_MAX, 128).
+
 %% The peer opened this stream: client-initiated ids are even.
 -define(IS_PEER_STREAM(Id, S), ((S#state.role =:= server) =:= ((Id) band 1 =:= 0))).
 
@@ -156,6 +159,7 @@
 -type role() :: client | server.
 -type stream_id() :: non_neg_integer().
 -type error_code() :: non_neg_integer().
+-type no_content_key() :: stream_id() | {push, non_neg_integer()}.
 
 -record(state, {
     %% Underlying QUIC connection. `undefined' only in test state.
@@ -343,7 +347,10 @@
     %% stream_limit since its last notice (a request, open_bidi_stream/2,
     %% open_uni_stream/2), each told once an open of its kind would succeed.
     notify_streams = false :: boolean(),
-    streams_wanted = [] :: [request | bidi | uni]
+    streams_wanted = [] :: [request | bidi | uni],
+    %% Streams and pushes whose response ended on its HEADERS, oldest first in the queue.
+    no_content_ended = {sets:new([{version, 2}]), queue:new()} ::
+        {sets:set(no_content_key()), queue:queue(no_content_key())}
 }).
 
 %%====================================================================
@@ -2145,16 +2152,31 @@ handle_encoder_stream_data(
         {ok, Decoder1} ->
             %% All instructions processed - retry blocked streams
             State1 = State#state{qpack_decoder = Decoder1, encoder_buffer = <<>>},
-            retry_blocked_streams(State1);
+            retry_blocked_streams(send_insert_count_increment(State1));
         {incomplete, Rest, Decoder1} ->
             %% Partial instruction, buffer remaining data
             State1 = State#state{qpack_decoder = Decoder1, encoder_buffer = Rest},
             %% Still retry blocked streams - some may have become unblocked
-            retry_blocked_streams(State1);
+            retry_blocked_streams(send_insert_count_increment(State1));
         {error, Reason} ->
             %% RFC 9204 §6: errors decoding peer's encoder stream instructions
             %% are QPACK_ENCODER_STREAM_ERROR (0x201), not decompression-failed.
             {error, {connection_error, ?H3_QPACK_ENCODER_STREAM_ERROR, Reason}, State}
+    end.
+
+%% RFC 9204 Section 4.4.3: one Insert Count Increment per chunk of encoder stream data.
+send_insert_count_increment(#state{local_decoder_stream = undefined} = State) ->
+    State;
+send_insert_count_increment(#state{qpack_decoder = Decoder} = State) ->
+    case quic_qpack:take_insert_count_increment(Decoder) of
+        {0, _} ->
+            State;
+        {Increment, Decoder1} ->
+            Instruction = quic_qpack:encode_insert_count_increment(Increment),
+            _ = quic:send_data(
+                State#state.quic_conn, State#state.local_decoder_stream, Instruction, false
+            ),
+            State#state{qpack_decoder = Decoder1}
     end.
 
 %% Retry blocked streams that may have become unblocked after encoder instructions
@@ -2316,6 +2338,7 @@ correlate_push_stream(
                 id = StreamId,
                 type = push,
                 state = open,
+                method = proplists:get_value(<<":method">>, Headers),
                 frame_state = expecting_headers
             },
             State1 = State#state{
@@ -2606,10 +2629,18 @@ extract_content_length(Headers) ->
 
 %% RFC 9114 §4.1.2: push DATA must respect content-length if advertised.
 apply_push_data(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State) ->
+    case (Payload =/= <<>>) andalso carries_no_content(Stream) of
+        true ->
+            {error, {connection_error, ?H3_MESSAGE_ERROR, <<"DATA on a push with no content">>}};
+        false ->
+            apply_push_body(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State)
+    end.
+
+apply_push_body(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State) ->
     Received0 = Received,
     Size = byte_size(Payload),
     NewReceived = Stream#h3_stream.body_received + Size,
-    CL = Stream#h3_stream.content_length,
+    CL = push_content_length(Stream),
     case cl_data_check(CL, NewReceived, Fin) of
         ok ->
             Owner ! {quic_h3, self(), {push_data, PushId, Payload, Fin}},
@@ -2623,6 +2654,13 @@ apply_push_data(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State) 
             end;
         {error, Code} ->
             {error, {connection_error, Code, <<"push content-length violated">>}}
+    end.
+
+%% RFC 9110 Section 8.6: on a no-content push the Content-Length is not a body length.
+push_content_length(Stream) ->
+    case carries_no_content(Stream) of
+        true -> undefined;
+        false -> Stream#h3_stream.content_length
     end.
 
 cl_data_check(undefined, _Received, _Fin) ->
@@ -2655,7 +2693,7 @@ handle_push_trailers(StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, Stream,
                 end,
                 case
                     cl_data_check(
-                        Stream#h3_stream.content_length,
+                        push_content_length(Stream),
                         Stream#h3_stream.body_received,
                         true
                     )
@@ -2707,6 +2745,9 @@ validate_push_response_headers(Headers) ->
 
 validate_push_response_status(StatusBin, Headers) ->
     try binary_to_integer(StatusBin) of
+        101 ->
+            %% RFC 9114 Section 4.5: HTTP/3 has no 101 (Switching Protocols).
+            {error, <<"101 in push response">>};
         Status when Status >= 100, Status < 600 ->
             case has_request_pseudo_headers(Headers) of
                 true -> {error, <<"request pseudo-header in push response">>};
@@ -2943,6 +2984,12 @@ with_status(Status, Headers) ->
         | [KV || {Name, _} = KV <- Headers, Name =/= <<":status">>]
     ].
 
+%% RFC 9110 Section 8.6: no Content-Length in a 1xx or 204; 304 and HEAD keep theirs.
+outbound_response_headers(Status, Headers) when Status < 200; Status =:= 204 ->
+    [H || {Name, _} = H <- Headers, Name =/= <<"content-length">>];
+outbound_response_headers(_Status, Headers) ->
+    Headers.
+
 %% A response that never carries content, so a Content-Length on it
 %% describes what a GET would have returned rather than what is on the
 %% wire (RFC 9110 Section 8.6 for HEAD, Section 6.4.1 for 204 and 304).
@@ -3052,6 +3099,19 @@ handle_request_frame(
     _State
 ) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"DATA before HEADERS">>}};
+%% RFC 9110 Sections 6.4.1 and 9.3.2: DATA with content on a HEAD, 204 or 304 is malformed.
+handle_request_frame(
+    StreamId,
+    {data, Payload},
+    _Fin,
+    #h3_stream{frame_state = expecting_data, is_connect = false, method = Method, status = Status},
+    #state{role = client}
+) when
+    Payload =/= <<>>, Method =:= <<"HEAD">>;
+    Payload =/= <<>>, Status =:= 204;
+    Payload =/= <<>>, Status =:= 304
+->
+    {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}};
 %% DATA frame - validate content-length if present (RFC 9114 Section 4.1.2)
 handle_request_frame(
     StreamId,
@@ -3412,7 +3472,8 @@ finalize_stream_state(Stream, true, _Role) ->
 finalize_stream_state(#h3_stream{status = Status} = Stream, false, client) when
     is_integer(Status), Status >= 100, Status < 200
 ->
-    Stream#h3_stream{frame_state = expecting_headers};
+    %% RFC 9110 Section 15.2: a 1xx says nothing of the final response's content.
+    Stream#h3_stream{frame_state = expecting_headers, content_length = undefined};
 finalize_stream_state(Stream, false, _Role) ->
     Stream#h3_stream{frame_state = expecting_data}.
 
@@ -3875,6 +3936,9 @@ validate_response_headers(#h3_stream{status = Status}, _Headers) when
     Status < 100; Status > 599
 ->
     throw({header_error, {invalid_field, <<":status">>, integer_to_binary(Status)}});
+validate_response_headers(#h3_stream{status = 101}, _Headers) ->
+    %% RFC 9114 Section 4.5: HTTP/3 has no 101 (Switching Protocols).
+    throw({header_error, {invalid_field, <<":status">>, <<"101">>}});
 validate_response_headers(_Stream, Headers) ->
     case response_has_request_pseudo(Headers) of
         {true, Name} -> throw({header_error, {invalid_field, Name, <<>>}});
@@ -4240,16 +4304,19 @@ send_request_headers(
 %% Coalesce a full response: send_response then a final send_data with end-stream
 %% in one connection call. Reuses do_send_response/4 (validation, QPACK, HEADERS
 %% buffering) and do_send_data/4 (which prepends the buffered HEADERS so they ride
-%% in the same QUIC packet as the body). HEAD, 204 and 304 send no body.
+%% in the same QUIC packet as the body). HEAD, 204 and 304 end on their HEADERS.
+do_respond(_StreamId, Status, _Headers, _Body, _State) when
+    is_integer(Status), Status >= 100, Status < 200, Status =/= 101
+->
+    %% RFC 9110 Section 15.2: a 1xx is interim; send it with send_response/4.
+    {error, informational_status};
 do_respond(StreamId, Status, Headers, Body, State) ->
+    NoContent = ends_on_headers(StreamId, Status, State),
     case do_send_response(StreamId, Status, Headers, State) of
+        {ok, State1} when NoContent ->
+            {ok, State1};
         {ok, State1} ->
-            Data =
-                case response_body_allowed(StreamId, Status, State1) of
-                    true -> Body;
-                    false -> <<>>
-                end,
-            case do_send_data(StreamId, Data, true, State1) of
+            case do_send_data(StreamId, Body, true, State1) of
                 {ok, _} = Ok -> Ok;
                 {error, Reason} -> {error, Reason, State1}
             end;
@@ -4257,14 +4324,20 @@ do_respond(StreamId, Status, Headers, Body, State) ->
             Err
     end.
 
-%% RFC 9110: HEAD requests and 204/304 responses carry no body.
-response_body_allowed(_StreamId, Status, _State) when Status =:= 204; Status =:= 304 ->
-    false;
-response_body_allowed(StreamId, _Status, #state{streams = Streams}) ->
-    case maps:find(StreamId, Streams) of
-        {ok, #h3_stream{method = <<"HEAD">>}} -> false;
-        _ -> true
+%% A no-content final response, except on a CONNECT tunnel.
+ends_on_headers(StreamId, Status, #state{streams = Streams}) ->
+    case Streams of
+        #{StreamId := #h3_stream{is_connect = false, method = Method}} ->
+            no_content_status(Method, Status);
+        _ ->
+            false
     end.
+
+%% RFC 9110 Section 6.4.1: a final response to HEAD, or a 204 or 304, has no content.
+no_content_status(Method, Status) when is_integer(Status), Status >= 200 ->
+    (Method =:= <<"HEAD">>) orelse (Status =:= 204) orelse (Status =:= 304);
+no_content_status(_Method, _Status) ->
+    false.
 
 do_send_response(
     _StreamId,
@@ -4274,6 +4347,9 @@ do_send_response(
 ) when not is_integer(Status); Status < 100; Status > 599 ->
     %% RFC 9114 §4.3.2: :status must be a valid HTTP status code.
     {error, {invalid_status, Status}};
+do_send_response(_StreamId, 101, _Headers, _State) ->
+    %% RFC 9114 Section 4.5: HTTP/3 has no 101 (Switching Protocols).
+    {error, status_101_forbidden};
 do_send_response(
     StreamId,
     Status,
@@ -4283,7 +4359,7 @@ do_send_response(
         streams = Streams
     } = State
 ) ->
-    AllHeaders = with_status(Status, Headers),
+    AllHeaders = with_status(Status, outbound_response_headers(Status, Headers)),
     %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
     case validate_outbound_headers(AllHeaders, State) of
         {error, Reason} ->
@@ -4320,13 +4396,29 @@ do_send_response(
 finish_send_response(StreamId, Status, HeadersFrame, Stream1, State) when
     Status >= 200, not Stream1#h3_stream.is_connect
 ->
-    Pending = maps:put(StreamId, HeadersFrame, State#state.pending_response_headers),
-    {ok, State#state{
-        streams = (State#state.streams)#{StreamId => Stream1},
-        pending_response_headers = Pending
-    }};
+    case no_content_status(Stream1#h3_stream.method, Status) of
+        true ->
+            end_on_headers(StreamId, HeadersFrame, Stream1, State);
+        false ->
+            Pending = maps:put(StreamId, HeadersFrame, State#state.pending_response_headers),
+            {ok, State#state{
+                streams = (State#state.streams)#{StreamId => Stream1},
+                pending_response_headers = Pending
+            }}
+    end;
 finish_send_response(StreamId, _Status, HeadersFrame, Stream1, State) ->
     send_response_headers_now(StreamId, HeadersFrame, Stream1, State).
+
+%% A HEAD, 204 or 304 response is complete on its HEADERS, sent with the FIN.
+end_on_headers(StreamId, HeadersFrame, Stream1, State) ->
+    case quic:send_data(State#state.quic_conn, StreamId, HeadersFrame, true) of
+        ok ->
+            Pending = maps:remove(StreamId, State#state.pending_response_headers),
+            State1 = remember_no_content(StreamId, State#state{pending_response_headers = Pending}),
+            {ok, store_stream(StreamId, close_half(local, Stream1), State1)};
+        {error, Reason} ->
+            {error, Reason, State}
+    end.
 
 send_response_headers_now(StreamId, HeadersFrame, Stream1, State) ->
     case quic:send_data(State#state.quic_conn, StreamId, HeadersFrame, false) of
@@ -4336,7 +4428,14 @@ send_response_headers_now(StreamId, HeadersFrame, Stream1, State) ->
             {error, Reason, State}
     end.
 
-do_send_data(
+do_send_data(StreamId, Data, Fin, State) ->
+    case response_gate(StreamId, State) of
+        ended -> {ok, State};
+        no_final_response -> {error, no_final_response};
+        open -> send_data_frame(StreamId, Data, Fin, State)
+    end.
+
+send_data_frame(
     StreamId,
     Data,
     Fin,
@@ -4370,7 +4469,14 @@ do_send_data(
             {error, unknown_stream}
     end.
 
-do_send_trailers(
+do_send_trailers(StreamId, Trailers, State) ->
+    case response_gate(StreamId, State) of
+        ended -> {ok, State};
+        no_final_response -> {error, no_final_response};
+        open -> encode_and_send_trailers(StreamId, Trailers, State)
+    end.
+
+encode_and_send_trailers(
     StreamId,
     Trailers,
     #state{
@@ -4398,6 +4504,60 @@ do_send_trailers(
                 error ->
                     {error, unknown_stream}
             end
+    end.
+
+%% RFC 9110 Section 6.4.1: nothing follows a HEAD, 204 or 304 response, even after the stream.
+response_gate(StreamId, #state{role = server, streams = Streams} = State) ->
+    case Streams of
+        #{StreamId := #h3_stream{reset = true}} ->
+            open;
+        #{StreamId := Stream} ->
+            stream_gate(Stream);
+        #{} ->
+            ended_or_open(no_content_ended(StreamId, State))
+    end;
+response_gate(_StreamId, _State) ->
+    open.
+
+%% RFC 9114 Section 4.1: no DATA or trailers ahead of the final response.
+stream_gate(#h3_stream{status = Status}) when not is_integer(Status); Status < 200 ->
+    no_final_response;
+stream_gate(#h3_stream{is_connect = true}) ->
+    open;
+stream_gate(#h3_stream{method = Method, status = Status}) ->
+    ended_or_open(no_content_status(Method, Status)).
+
+ended_or_open(true) -> ended;
+ended_or_open(false) -> open.
+
+no_content_ended(Key, #state{no_content_ended = {Ended, _}}) ->
+    sets:is_element(Key, Ended).
+
+remember_no_content(Key, #state{no_content_ended = {Ended, Order}} = State) ->
+    case sets:is_element(Key, Ended) of
+        true ->
+            State;
+        false ->
+            Ended1 = sets:add_element(Key, Ended),
+            State#state{no_content_ended = forget_oldest(Ended1, queue:in(Key, Order))}
+    end.
+
+forget_oldest(Ended, Order) ->
+    case sets:size(Ended) > ?NO_CONTENT_ENDED_MAX of
+        true ->
+            {{value, Oldest}, Order1} = queue:out(Order),
+            {sets:del_element(Oldest, Ended), Order1};
+        false ->
+            {Ended, Order}
+    end.
+
+forget_no_content(Key, #state{no_content_ended = {Ended, Order}} = State) ->
+    case sets:is_element(Key, Ended) of
+        true ->
+            Order1 = queue:delete(Key, Order),
+            State#state{no_content_ended = {sets:del_element(Key, Ended), Order1}};
+        false ->
+            State
     end.
 
 send_trailers_frame({error, _} = Error, _StreamId, _Trailers, _Encoded, _Stream) ->
@@ -4433,7 +4593,7 @@ do_cancel_stream(
     ErrorCode,
     #state{streams = Streams, pending_response_headers = Pending} = State
 ) ->
-    State1 = reset_request_stream(StreamId, ErrorCode, State),
+    State1 = reset_request_stream(StreamId, ErrorCode, forget_no_content(StreamId, State)),
     %% Drop what the cancelled stream was holding: unsent HEADERS, the
     %% partial frame buffer, and any body no handler claimed.
     State2 = release_buffered(StreamId, State1),
@@ -4866,15 +5026,21 @@ do_push_internal(
                 {ok, State2} ->
                     %% Send PUSH_PROMISE on request stream
                     PushPromiseFrame = quic_h3_frame:encode_push_promise(PushId, Encoded),
+                    {<<":method">>, Method} = lists:keyfind(<<":method">>, 1, Headers),
                     do_push_send(
-                        QuicConn, RequestStreamId, PushPromiseFrame, PushId, PushStreams, State2
+                        QuicConn,
+                        RequestStreamId,
+                        PushPromiseFrame,
+                        {PushId, Method},
+                        PushStreams,
+                        State2
                     );
                 {error, _} = Error ->
                     Error
             end
     end.
 
-do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, PushId, PushStreams, State) ->
+do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, {PushId, Method}, PushStreams, State) ->
     case quic:send_data(QuicConn, RequestStreamId, PushPromiseFrame, false) of
         ok ->
             %% Open push stream (unidirectional, server-initiated)
@@ -4891,6 +5057,7 @@ do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, PushId, PushStreams, S
                                 id = PushStreamId,
                                 type = push,
                                 state = open,
+                                method = Method,
                                 frame_state = expecting_headers
                             },
                             %% next_push_id already incremented by allocate_push_id
@@ -4909,6 +5076,9 @@ do_push_send(QuicConn, RequestStreamId, PushPromiseFrame, PushId, PushStreams, S
     end.
 
 %% Send response headers on a push stream
+do_send_push_response(_PushId, 101, _Headers, _State) ->
+    %% RFC 9114 Section 4.5: HTTP/3 has no 101 (Switching Protocols).
+    {error, status_101_forbidden};
 do_send_push_response(
     PushId,
     Status,
@@ -4919,7 +5089,7 @@ do_send_push_response(
         qpack_encoder = Encoder
     } = State
 ) ->
-    AllHeaders = with_status(Status, Headers),
+    AllHeaders = with_status(Status, outbound_response_headers(Status, Headers)),
     %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
     case validate_outbound_headers(AllHeaders, State) of
         {error, Reason} ->
@@ -4948,8 +5118,14 @@ do_send_push_response(
             end
     end.
 
+%% A HEAD, 204 or 304 pushed response ends on its HEADERS, as on a request stream.
 send_push_headers(QuicConn, StreamId, HeadersFrame, PushId, Stream1, State) ->
-    case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
+    #h3_stream{method = Method, status = Status} = Stream1,
+    NoContent = no_content_status(Method, Status),
+    case quic:send_data(QuicConn, StreamId, HeadersFrame, NoContent) of
+        ok when NoContent ->
+            State1 = State#state{push_streams = maps:remove(PushId, State#state.push_streams)},
+            {ok, remember_no_content({push, PushId}, State1)};
         ok ->
             PushStreams = maps:put(PushId, {StreamId, Stream1}, State#state.push_streams),
             {ok, State#state{push_streams = PushStreams}};
@@ -4968,6 +5144,9 @@ do_send_push_data(
     } = State
 ) ->
     case maps:find(PushId, PushStreams) of
+        {ok, {_StreamId, #h3_stream{status = Status}}} when not is_integer(Status); Status < 200 ->
+            %% RFC 9114 Section 4.1: no DATA ahead of the final response.
+            {error, no_final_response};
         {ok, {StreamId, Stream}} ->
             DataFrame = quic_h3_frame:encode_data(Data),
             case quic:send_data(QuicConn, StreamId, DataFrame, Fin) of
@@ -4989,7 +5168,10 @@ do_send_push_data(
                     {error, Reason}
             end;
         error ->
-            {error, unknown_push_id}
+            case no_content_ended({push, PushId}, State) of
+                true -> {ok, State};
+                false -> {error, unknown_push_id}
+            end
     end.
 
 %%====================================================================
