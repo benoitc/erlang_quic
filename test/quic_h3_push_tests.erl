@@ -332,6 +332,53 @@ frames_after_push_trailers_are_frame_unexpected_test() ->
     ),
     _ = push_events().
 
+%% RFC 9110 Sections 6.4.1 and 9.3.2: a pushed response to HEAD, or a
+%% pushed 204 or 304, has no content; DATA carrying any is malformed.
+data_on_a_no_content_push_is_malformed_test() ->
+    lists:foreach(
+        fun({Method, Status}) ->
+            _ = push_events(),
+            Push = <<
+                1,
+                5,
+                (push_response_frame(Status, []))/binary,
+                (quic_h3_frame:encode_data(<<"abc">>))/binary
+            >>,
+            ?assertMatch(
+                {error, {connection_error, ?H3_MESSAGE_ERROR, _}, _},
+                quic_h3_connection:handle_stream_data(3, Push, true, promised_state(Method))
+            ),
+            ?assertEqual([], [E || {push_data, _, _, _} = E <- push_events()])
+        end,
+        [{<<"HEAD">>, 200}, {<<"GET">>, 204}, {<<"GET">>, 304}]
+    ).
+
+%% The Content-Length of a pushed HEAD response is not a body length.
+head_push_with_content_length_and_no_body_completes_test() ->
+    _ = push_events(),
+    Push = <<
+        1,
+        5,
+        (push_response_frame(200, [{<<"content-length">>, <<"10">>}]))/binary,
+        (quic_h3_frame:encode_data(<<>>))/binary
+    >>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(3, Push, true, promised_state(<<"HEAD">>)),
+    ?assertEqual({push_complete, 5}, lists:last(push_events())),
+    %% received_pushes is at position 39
+    ?assertEqual(#{}, element(39, State1)).
+
+promised_state(Method) ->
+    make_test_state(#{
+        role => client,
+        local_max_push_id => 10,
+        promised_pushes => #{5 => {0, [{<<":method">>, Method}, {<<":path">>, <<"/p">>}]}}
+    }).
+
+push_response_frame(Status, Fields) ->
+    quic_h3_frame:encode_headers(
+        quic_qpack:encode([{<<":status">>, integer_to_binary(Status)} | Fields])
+    ).
+
 push_client_state() ->
     make_test_state(#{
         role => client,

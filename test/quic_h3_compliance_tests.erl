@@ -4824,6 +4824,55 @@ upload_with_trailers() ->
     >>.
 
 %%====================================================================
+%% Responses without content (RFC 9110 Sections 6.4.1, 9.3.2)
+%%====================================================================
+
+%% DATA carrying content on a response to HEAD, or on a 204 or 304, resets
+%% the stream with H3_MESSAGE_ERROR and none of it is delivered.
+data_on_a_no_content_response_is_malformed_test() ->
+    lists:foreach(
+        fun({Method, Status}) ->
+            flush_owner_events(),
+            Quic = fake_quic_conn(),
+            Response = <<
+                (response_frame(Status, []))/binary,
+                (quic_h3_frame:encode_data(<<"xyz">>))/binary
+            >>,
+            {ok, _} = quic_h3_connection:handle_stream_data(
+                0, Response, true, client_request_state(Quic, Method)
+            ),
+            ?assertMatch(
+                [{response, 0, Status, _}, {stream_reset, 0, ?H3_MESSAGE_ERROR}], owner_events()
+            ),
+            ?assert(lists:member({close_stream, 0, ?H3_MESSAGE_ERROR}, fake_quic_calls(Quic)))
+        end,
+        [{<<"HEAD">>, 200}, {<<"GET">>, 204}, {<<"GET">>, 304}]
+    ).
+
+%% An empty DATA frame carries no content, so it is not an error.
+empty_data_on_a_no_content_response_is_accepted_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    Response = <<(response_frame(204, []))/binary, (quic_h3_frame:encode_data(<<>>))/binary>>,
+    {ok, _} = quic_h3_connection:handle_stream_data(
+        0, Response, true, client_request_state(Quic, <<"GET">>)
+    ),
+    ?assertMatch([{response, 0, 204, _}, {data, 0, <<>>, true}], owner_events()),
+    ?assertNot(lists:keymember(close_stream, 1, fake_quic_calls(Quic))).
+
+%% A client that sent a request on stream 0 and waits for the response.
+client_request_state(Quic, Method) ->
+    Stream = #h3_stream{
+        id = 0, type = request, state = half_closed_local, method = Method, is_connect = false
+    },
+    make_test_state(#{role => client, quic_conn => Quic, streams => #{0 => Stream}}).
+
+response_frame(Status, Fields) ->
+    quic_h3_frame:encode_headers(
+        quic_qpack:encode([{<<":status">>, integer_to_binary(Status)} | Fields])
+    ).
+
+%%====================================================================
 %% Content-Length when the message ends short (RFC 9114 §4.1.2)
 %%====================================================================
 

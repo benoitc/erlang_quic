@@ -2323,6 +2323,7 @@ correlate_push_stream(
                 id = StreamId,
                 type = push,
                 state = open,
+                method = proplists:get_value(<<":method">>, Headers),
                 frame_state = expecting_headers
             },
             State1 = State#state{
@@ -2613,10 +2614,18 @@ extract_content_length(Headers) ->
 
 %% RFC 9114 §4.1.2: push DATA must respect content-length if advertised.
 apply_push_data(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State) ->
+    case (Payload =/= <<>>) andalso carries_no_content(Stream) of
+        true ->
+            {error, {connection_error, ?H3_MESSAGE_ERROR, <<"DATA on a push with no content">>}};
+        false ->
+            apply_push_body(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State)
+    end.
+
+apply_push_body(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State) ->
     Received0 = Received,
     Size = byte_size(Payload),
     NewReceived = Stream#h3_stream.body_received + Size,
-    CL = Stream#h3_stream.content_length,
+    CL = push_content_length(Stream),
     case cl_data_check(CL, NewReceived, Fin) of
         ok ->
             Owner ! {quic_h3, self(), {push_data, PushId, Payload, Fin}},
@@ -2630,6 +2639,13 @@ apply_push_data(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State) 
             end;
         {error, Code} ->
             {error, {connection_error, Code, <<"push content-length violated">>}}
+    end.
+
+%% RFC 9110 Section 8.6: on a no-content push the Content-Length is not a body length.
+push_content_length(Stream) ->
+    case carries_no_content(Stream) of
+        true -> undefined;
+        false -> Stream#h3_stream.content_length
     end.
 
 cl_data_check(undefined, _Received, _Fin) ->
@@ -2662,7 +2678,7 @@ handle_push_trailers(StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, Stream,
                 end,
                 case
                     cl_data_check(
-                        Stream#h3_stream.content_length,
+                        push_content_length(Stream),
                         Stream#h3_stream.body_received,
                         true
                     )
@@ -3065,6 +3081,19 @@ handle_request_frame(
     _State
 ) ->
     {error, {connection_error, ?H3_FRAME_UNEXPECTED, <<"DATA before HEADERS">>}};
+%% RFC 9110 Sections 6.4.1 and 9.3.2: DATA with content on a HEAD, 204 or 304 is malformed.
+handle_request_frame(
+    StreamId,
+    {data, Payload},
+    _Fin,
+    #h3_stream{frame_state = expecting_data, is_connect = false, method = Method, status = Status},
+    #state{role = client}
+) when
+    Payload =/= <<>>, Method =:= <<"HEAD">>;
+    Payload =/= <<>>, Status =:= 204;
+    Payload =/= <<>>, Status =:= 304
+->
+    {error, {stream_reset, StreamId, ?H3_MESSAGE_ERROR}};
 %% DATA frame - validate content-length if present (RFC 9114 Section 4.1.2)
 handle_request_frame(
     StreamId,
