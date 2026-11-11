@@ -582,7 +582,7 @@
 
     %% After a close of our own, the CONNECTION_CLOSE that answers the
     %% peer's packets and how many have arrived (RFC 9000 Section 10.2.1)
-    closing_frame :: {app | handshake | initial, tuple()} | undefined,
+    closing_frame :: {app | handshake | initial | none, tuple()} | undefined,
     closing_recv = 0 :: non_neg_integer(),
 
     %% Connection Migration (RFC 9000 Section 9)

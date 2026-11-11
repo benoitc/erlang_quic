@@ -2259,9 +2259,11 @@ draining(info, {udp, _Socket, IP, Port, _Data}, State) ->
 draining(info, {udp_batch, _Socket, IP, Port, Packets}, State) ->
     {keep_state, closing_reply({IP, Port}, length(Packets), State)};
 draining(info, {quic_packet, _Data, RemoteAddr}, State) ->
-    {keep_state, closing_reply(RemoteAddr, State)};
+    {keep_state, closing_reply(RemoteAddr, undefined, 1, State)};
+draining(info, {quic_packet, _Data, RemoteAddr, Via}, State) ->
+    {keep_state, closing_reply(RemoteAddr, Via, 1, State)};
 draining(info, {quic_packets, Packets, RemoteAddr}, State) ->
-    {keep_state, closing_reply(RemoteAddr, length(Packets), State)};
+    {keep_state, closing_reply(RemoteAddr, undefined, length(Packets), State)};
 draining(cast, {close, _Reason}, State) ->
     %% Ignore duplicate close requests - already draining
     {keep_state, State};
@@ -2278,24 +2280,33 @@ draining(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, draining, State).
 
 %% RFC 9000 Section 10.2.1: after a close of our own, packets from the
-%% peer's address are answered with the CONNECTION_CLOSE again, on the
-%% 1st, 2nd, 4th, 8th... packet. After the peer's close, or an idle
-%% timeout, nothing is sent.
+%% peer's address on the current path's socket are answered with the
+%% CONNECTION_CLOSE again, on the 1st, 2nd, 4th, 8th... packet. After
+%% the peer's close, or an idle timeout, nothing is sent.
 closing_reply(Addr, State) ->
     closing_reply(Addr, 1, State).
 
+closing_reply(Addr, N, State) ->
+    closing_reply(Addr, current_via(State), N, State).
+
 closing_reply(
     Addr,
+    Via,
     N,
     #state{remote_addr = Addr, closing_frame = {Level, Frame}, closing_recv = Recv} = State
 ) when Level =/= none ->
-    Recv1 = Recv + N,
-    State1 = State#state{closing_recv = Recv1},
-    case 1 bsl floor_log2(Recv1) > Recv of
-        true -> flush_event(emit_close_at_level(Level, Frame, State1), event);
-        false -> State1
+    case Via =:= current_via(State) of
+        true ->
+            Recv1 = Recv + N,
+            State1 = State#state{closing_recv = Recv1},
+            case 1 bsl floor_log2(Recv1) > Recv of
+                true -> flush_event(emit_close_at_level(Level, Frame, State1), event);
+                false -> State1
+            end;
+        false ->
+            State
     end;
-closing_reply(_Addr, _N, State) ->
+closing_reply(_Addr, _Via, _N, State) ->
     State.
 
 floor_log2(N) -> floor_log2(N, 0).

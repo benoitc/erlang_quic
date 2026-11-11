@@ -60,7 +60,32 @@ an_error_after_the_peers_close_is_not_resent_test() ->
         ?assertEqual(0, count(Sock))
     end).
 
+%% A packet that reached the preferred-address socket the connection now
+%% sends on is answered; one from the listening socket is not.
+answers_on_the_socket_of_the_current_path_test() ->
+    with_peer(fun(Peer, Sock) ->
+        {ok, Main} = gen_udp:open(0, [binary, {active, false}, {ip, {127, 0, 0, 1}}]),
+        try
+            S0 = sent(quic_connection:initiate_close(normal, state(Peer))),
+            _ = count(Sock),
+            Mig = S0#state.mig,
+            S1 = S0#state{mig = Mig#mig{main_sock = {Main, undefined}}},
+            Via = S1#state.socket,
+            S2 = draining_packet({quic_packet, <<>>, Peer}, S1),
+            ?assertEqual(0, count(Sock)),
+            ?assertEqual(0, S2#state.closing_recv),
+            S3 = draining_packet({quic_packet, <<>>, Peer, Via}, S2),
+            ?assertEqual(1, S3#state.closing_recv),
+            ?assertEqual(1, count(Sock))
+        after
+            gen_udp:close(Main)
+        end
+    end).
+
 draining_packet({quic_packet, _, _} = Msg, State) ->
+    {keep_state, S} = quic_connection:draining(info, Msg, State),
+    S;
+draining_packet({quic_packet, _, _, _} = Msg, State) ->
     {keep_state, S} = quic_connection:draining(info, Msg, State),
     S;
 draining_packet(Peer, State) ->
