@@ -55,6 +55,15 @@ All notable changes to this project will be documented in this file.
   H3_FRAME_UNEXPECTED. On a server, one naming a stream that is not a
   request stream, or a push not yet promised, closes it with H3_ID_ERROR
   (RFC 9218 Section 7.2).
+- `quic_h3:send_data/4`, `quic_h3:send_trailers/3` and
+  `quic_h3:send_push_data/4` return `ok` and send nothing after a HEAD,
+  204 or 304 response, which is already complete (RFC 9110 Section
+  6.4.1). Before a final response, with nothing or only a 1xx sent, they
+  return `{error, no_final_response}` (RFC 9114 Section 4.1).
+  `quic_h3:respond/5` with a 1xx status returns
+  `{error, informational_status}`, and status 101 given to
+  `send_response/4`, `respond/5` or `send_push_response/4` returns
+  `{error, status_101_forbidden}` (RFC 9114 Section 4.5).
 
 ### Fixed
 - A write to a stream whose sending side had been reset, by the
@@ -369,6 +378,38 @@ All notable changes to this project will be documented in this file.
   Section 2.1).
 - `send_trailers/3` on a stream that had finished or been reset crashed
   the HTTP/3 connection process. It returns `{error, unknown_stream}`.
+- A HEAD, 204 or 304 response sent with `quic_h3:send_response/4` alone
+  never reached the client, which waited for it, and its stream stayed
+  open on the server: after 100 of them the client could open no new
+  request. These responses now end the stream as they are sent (RFC 9110
+  Section 6.4.1, RFC 9114 Section 4.1).
+- `quic_h3:respond/5` followed a HEAD, 204 or 304 response with an empty
+  DATA frame. It now sends the response alone.
+- A body or trailers sent after a HEAD, 204 or 304 response went out, and
+  the client delivered them. They are now dropped (RFC 9110 Section
+  6.4.1).
+- A Content-Length the application set on a 1xx or 204 response was sent,
+  which RFC 9110 Section 8.6 forbids. It is now left out; 304 and HEAD
+  responses keep theirs.
+- A server could send a 101 response, which HTTP/3 does not have (RFC
+  9114 Section 4.5). It is now refused.
+- A body sent before the final response went out ahead of it, and the
+  client closed the connection with H3_FRAME_UNEXPECTED. It is now
+  refused (RFC 9114 Section 4.1).
+- Between two erlang_quic peers the QPACK dynamic table did no good: the
+  decoder never told the encoder which entries it had received, so the
+  encoder inserted the same fields again for every response. The decoder
+  now sends Insert Count Increment, and later field sections refer to the
+  entries already in the table (RFC 9204 Section 4.4.3).
+- The client accepted responses HTTP/3 does not allow, and misread one:
+  DATA with content on a response to HEAD, or on a 204 or 304, was
+  delivered; a 101 was taken as an interim response; and the
+  Content-Length of a 1xx was applied to the final response, which then
+  failed. The first two now reset the stream with H3_MESSAGE_ERROR, and
+  a 1xx's Content-Length is ignored (RFC 9110 Sections 6.4.1, 9.3.2 and
+  15.2, RFC 9114 Sections 4.1.2 and 4.5). A pushed response follows the
+  same rules, and a pushed HEAD response with a Content-Length no longer
+  fails for having no body.
 
 ## [2.6.1] - 2026-11-08
 
