@@ -4115,6 +4115,102 @@ a_blocked_request_is_dispatched_once_unblocked_test() ->
     ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()).
 
 %%====================================================================
+%% Stream Cancellation for every abandoned stream (RFC 9204 §2.2.2.2)
+%%====================================================================
+
+%% A request still being read that this side cancels or resets: the peer's
+%% encoder is told its references on it are gone, blocked or not.
+cancelling_a_request_being_read_sends_stream_cancellation_test() ->
+    Quic = fake_quic_conn(),
+    State = quic_h3_connection:do_cancel_stream(
+        0, ?H3_REQUEST_CANCELLED, reading_state(Quic, 4096, open)
+    ),
+    ?assert(sent_stream_cancel(Quic, 0)),
+    %% Whatever arrives next is dropped, and no second one goes out.
+    {keep_state, _} = quic_h3_connection:handle_peer_reset(0, ?H3_REQUEST_CANCELLED, 0, State),
+    ?assertEqual(1, length([C || C <- fake_quic_calls(Quic), C =:= stream_cancel_call(0)])),
+    flush_owner_events().
+
+a_peer_reset_of_a_request_being_read_sends_stream_cancellation_test() ->
+    Quic = fake_quic_conn(),
+    {keep_state, _} = quic_h3_connection:handle_peer_reset(
+        0, ?H3_REQUEST_CANCELLED, 0, reading_state(Quic, 4096, open)
+    ),
+    ?assert(sent_stream_cancel(Quic, 0)),
+    flush_owner_events().
+
+%% The client's own request: the response is what is abandoned.
+a_client_cancelling_its_request_sends_stream_cancellation_test() ->
+    Quic = fake_quic_conn(),
+    State0 = setelement(4, reading_state(Quic, 4096, half_closed_local), client),
+    _ = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, State0),
+    ?assert(sent_stream_cancel(Quic, 0)),
+    flush_owner_events().
+
+%% Nothing is left to read once the peer's FIN is in, and a decoder that
+%% advertised no table capacity may leave it out.
+no_stream_cancellation_when_nothing_is_abandoned_test() ->
+    Quic1 = fake_quic_conn(),
+    _ = quic_h3_connection:do_cancel_stream(
+        0, ?H3_REQUEST_CANCELLED, reading_state(Quic1, 4096, half_closed_remote)
+    ),
+    ?assertNot(sent_stream_cancel(Quic1, 0)),
+    Quic2 = fake_quic_conn(),
+    _ = quic_h3_connection:do_cancel_stream(
+        0, ?H3_REQUEST_CANCELLED, reading_state(Quic2, 0, open)
+    ),
+    ?assertNot(sent_stream_cancel(Quic2, 0)),
+    flush_owner_events().
+
+%% A push the client stops reading, open or arriving after its cancel.
+cancelling_an_open_push_sends_stream_cancellation_test() ->
+    Quic = fake_quic_conn(),
+    Push = #h3_stream{id = 3, type = push, state = open, frame_state = expecting_data},
+    State = make_test_state(#{
+        role => client,
+        quic_conn => Quic,
+        local_decoder_stream => 11,
+        local_settings => #{qpack_max_table_capacity => 4096},
+        local_max_push_id => 10,
+        received_pushes => #{0 => Push}
+    }),
+    {keep_state, _} = quic_h3_connection:connected(cast, {cancel_push, 0}, State),
+    ?assert(sent_stream_cancel(Quic, 3)).
+
+a_push_arriving_after_its_cancel_sends_stream_cancellation_test() ->
+    Quic = fake_quic_conn(),
+    State = make_test_state(#{
+        role => client,
+        quic_conn => Quic,
+        local_decoder_stream => 11,
+        local_settings => #{qpack_max_table_capacity => 4096},
+        local_max_push_id => 10,
+        local_cancelled_pushes => sets:from_list([0], [{version, 2}])
+    }),
+    {ok, _} = quic_h3_connection:handle_stream_data(3, <<16#01, 0>>, false, State),
+    ?assert(sent_stream_cancel(Quic, 3)).
+
+%% Request stream 0 with its HEADERS read and its peer half in PeerHalf,
+%% our decoder stream 11, and Capacity advertised.
+reading_state(Quic, Capacity, PeerHalf) ->
+    Stream = #h3_stream{
+        id = 0, type = request, state = PeerHalf, frame_state = expecting_data
+    },
+    make_test_state(#{
+        role => server,
+        quic_conn => Quic,
+        local_decoder_stream => 11,
+        local_settings => #{qpack_max_table_capacity => Capacity},
+        streams => #{0 => Stream}
+    }).
+
+stream_cancel_call(StreamId) ->
+    {send_data, 11, quic_qpack:encode_stream_cancel(StreamId), false}.
+
+sent_stream_cancel(Quic, StreamId) ->
+    lists:member(stream_cancel_call(StreamId), fake_quic_calls(Quic)).
+
+%%====================================================================
 %% Unacknowledged field sections of a stream that is over (RFC 9204 §2.1.1)
 %%====================================================================
 

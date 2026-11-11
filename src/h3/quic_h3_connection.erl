@@ -1525,7 +1525,7 @@ handle_new_stream(StreamId, bidirectional, #state{role = Role} = State) ->
                     quic:reset_stream(
                         State#state.quic_conn, StreamId, ?H3_REQUEST_REJECTED
                     ),
-                    {ok, State};
+                    {ok, abandon_sections(StreamId, State)};
                 false ->
                     case State#state.stream_type_handler of
                         undefined ->
@@ -2280,7 +2280,7 @@ process_push_stream_id(
             %% same; reading is aborted and the rest of it ignored.
             _ = quic:stop_sending(State#state.quic_conn, StreamId, ?H3_REQUEST_CANCELLED),
             {ok,
-                ignore_uni_stream(StreamId, State#state{
+                ignore_uni_stream(StreamId, (abandon_sections(StreamId, State))#state{
                     uni_stream_buffers = maps:remove(StreamId, Buffers)
                 })};
         {error, Reason} ->
@@ -5010,8 +5010,9 @@ stop_push_stream(PushId, #state{received_pushes = Received, quic_conn = QuicConn
 ignore_push_stream(PushId, #state{received_pushes = Received} = State) ->
     case Received of
         #{PushId := #h3_stream{id = StreamId}} ->
-            ignore_uni_stream(StreamId, State#state{
-                stream_buffers = maps:remove(StreamId, State#state.stream_buffers)
+            State1 = abandon_sections(StreamId, State),
+            ignore_uni_stream(StreamId, State1#state{
+                stream_buffers = maps:remove(StreamId, State1#state.stream_buffers)
             });
         _ ->
             State
@@ -5020,25 +5021,37 @@ ignore_push_stream(PushId, #state{received_pushes = Received} = State) ->
 ignore_uni_stream(StreamId, #state{discarded_uni_streams = Discarded} = State) ->
     State#state{discarded_uni_streams = sets:add_element(StreamId, Discarded)}.
 
-%% Send Stream Cancellation on decoder stream if stream was blocked (RFC 9204 Section 4.4.2)
-maybe_send_stream_cancel(
-    StreamId,
-    #state{
-        blocked_streams = Blocked,
-        quic_conn = QuicConn,
-        local_decoder_stream = DecoderStream
-    } = State
-) ->
-    case maps:is_key(StreamId, Blocked) of
-        true when DecoderStream =/= undefined ->
-            Cancel = quic_qpack:encode_stream_cancel(StreamId),
-            quic:send_data(QuicConn, DecoderStream, Cancel, false),
-            State#state{blocked_streams = maps:remove(StreamId, Blocked)};
-        true ->
-            State#state{blocked_streams = maps:remove(StreamId, Blocked)};
-        false ->
-            State
+%% RFC 9204 Section 2.2.2.2: a stream given up before all its field
+%% sections were read releases the peer's references to the dynamic table.
+maybe_send_stream_cancel(StreamId, #state{blocked_streams = Blocked} = State) ->
+    State1 = State#state{blocked_streams = maps:remove(StreamId, Blocked)},
+    case {maps:is_key(StreamId, Blocked), still_reading(StreamId, State)} of
+        {true, _} -> send_stream_cancel(StreamId, State1);
+        {false, true} -> abandon_sections(StreamId, State1);
+        {false, false} -> State1
     end.
+
+%% A request stream whose peer half has not ended, or a push being read.
+still_reading(StreamId, #state{streams = Streams, received_pushes = Pushes}) ->
+    case Streams of
+        #{StreamId := #h3_stream{reset = false, state = S}} ->
+            (S =:= open) orelse (S =:= half_closed_local);
+        _ ->
+            lists:any(fun(#h3_stream{id = Id}) -> Id =:= StreamId end, maps:values(Pushes))
+    end.
+
+%% A decoder that advertised no table capacity MAY omit Stream Cancellation.
+abandon_sections(StreamId, #state{local_settings = Local} = State) ->
+    case maps:get(qpack_max_table_capacity, Local, 0) of
+        0 -> State;
+        _ -> send_stream_cancel(StreamId, State)
+    end.
+
+send_stream_cancel(_StreamId, #state{local_decoder_stream = undefined} = State) ->
+    State;
+send_stream_cancel(StreamId, #state{quic_conn = QuicConn, local_decoder_stream = Decoder} = State) ->
+    _ = quic:send_data(QuicConn, Decoder, quic_qpack:encode_stream_cancel(StreamId), false),
+    State.
 
 %% Clean up blocked streams when GOAWAY received (RFC 9114 Section 5.2)
 %% Send Stream Cancellation for each blocked stream (RFC 9204 Section 4.4.2)
