@@ -787,6 +787,33 @@ release_stream_forgets_outstanding_sections_test() ->
     ?assertEqual(Tracked, quic_qpack:release_stream(8, Tracked)),
     ?assertEqual(Untracked, quic_qpack:release_stream(4, Tracked)).
 
+%% Once 100 streams wait for acknowledgments, a section for another
+%% stream refers to no dynamic entry, so a peer that never acknowledges
+%% cannot grow what the encoder keeps. A stream already waiting, or one
+%% after an acknowledgment frees a slot, refers to the table again.
+unacknowledged_streams_are_bounded_test() ->
+    H = [{<<"x-custom">>, <<"value">>}],
+    E0 = encoder_with_acked_entry(H),
+    E1 = lists:foldl(
+        fun(N, E) ->
+            {_, E2} = quic_qpack:encode(H, 4 * N, E),
+            ?assertEqual(1, quic_qpack:get_last_ric(E2)),
+            E2
+        end,
+        E0,
+        lists:seq(0, 99)
+    ),
+    {Static, E3} = quic_qpack:encode(H, 400, E1),
+    ?assertEqual(0, quic_qpack:get_last_ric(E3)),
+    ?assertMatch(<<0, _/binary>>, Static),
+    ?assertEqual({ok, H}, quic_qpack:decode(Static)),
+    ?assertEqual(E3, quic_qpack:release_stream(400, E3)),
+    {_, E4} = quic_qpack:encode(H, 0, E1),
+    ?assertEqual(1, quic_qpack:get_last_ric(E4)),
+    {ok, E5} = quic_qpack:process_decoder_instructions(quic_qpack:encode_section_ack(8), E1),
+    {_, E6} = quic_qpack:encode(H, 400, E5),
+    ?assertEqual(1, quic_qpack:get_last_ric(E6)).
+
 %% An encoder whose dynamic table holds H, acknowledged by the decoder.
 encoder_with_acked_entry(H) ->
     E0 = quic_qpack:new(#{max_dynamic_size => 4096}),

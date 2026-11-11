@@ -85,6 +85,10 @@
 
 -include("quic_qpack_static_table.hrl").
 
+%% Streams with unacknowledged sections; the default stream limit (100) is
+%% about what a peer that acknowledges has in flight at once.
+-define(MAX_UNACKED_STREAMS, 100).
+
 %% State record for stateful encoding/decoding
 -record(qpack, {
     %% Dynamic table configuration
@@ -204,8 +208,15 @@ encode(Headers, State) ->
 %% @doc Encode headers with stream tracking for section acknowledgment.
 %% This variant tracks the RIC per stream for proper section_ack handling.
 %% RFC 9204 Section 4.4.1: only a section with a non-zero Required Insert
-%% Count is acknowledged, so only those are tracked.
+%% Count is acknowledged, so only those are tracked. Once
+%% `MAX_UNACKED_STREAMS' streams wait for acknowledgments, a section for
+%% another stream uses literals and the static table only.
 -spec encode(headers(), non_neg_integer(), state()) -> {binary(), state()}.
+encode(Headers, StreamId, #qpack{pending_sections = Pending, use_dynamic = Dyn} = State) when
+    map_size(Pending) >= ?MAX_UNACKED_STREAMS, not is_map_key(StreamId, Pending)
+->
+    {Encoded, State1} = encode(Headers, State#qpack{use_dynamic = false}),
+    {Encoded, State1#qpack{use_dynamic = Dyn}};
 encode(Headers, StreamId, State) ->
     case encode(Headers, State) of
         {Encoded, #qpack{last_ric = 0} = State1} ->
@@ -216,8 +227,7 @@ encode(Headers, StreamId, State) ->
             {Encoded, State1#qpack{pending_sections = Pending#{StreamId => Queue}}}
     end.
 
-%% @doc Forget the field sections still unacknowledged on a stream that
-%% has finished or was reset.
+%% @doc Forget the field sections still unacknowledged on a stream.
 -spec release_stream(non_neg_integer(), state()) -> state().
 release_stream(StreamId, #qpack{pending_sections = Pending} = State) ->
     State#qpack{pending_sections = maps:remove(StreamId, Pending)}.

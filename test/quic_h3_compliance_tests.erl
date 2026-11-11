@@ -4115,32 +4115,76 @@ a_blocked_request_is_dispatched_once_unblocked_test() ->
     ?assertMatch({request, 0, <<"GET">>, <<"/">>, _}, next_owner_event()).
 
 %%====================================================================
-%% Unacknowledged field sections of a stream that is over (RFC 9204 §4.4.1)
+%% Unacknowledged field sections of a stream that is over (RFC 9204 §2.1.1)
 %%====================================================================
 
-%% A response that used the dynamic table waits for a Section
-%% Acknowledgment. Once its stream has finished or been reset the encoder
-%% waits no longer, so a peer that never acknowledges leaves nothing behind.
-a_finished_stream_has_no_outstanding_sections_test() ->
+%% A response that used the dynamic table keeps its entries referenced
+%% until the peer acknowledges the section or cancels the stream, however
+%% the stream ended on this side.
+a_finished_stream_keeps_its_sections_until_acknowledged_test() ->
     {State0, Field} = dynamic_table_server(),
     {ok, State1} = quic_h3_connection:handle_stream_data(
         0, request_frame(<<"GET">>, <<"/">>), true, State0
     ),
     {ok, State2} = quic_h3_connection:do_respond(0, 200, [Field], <<"ok">>, State1),
     ?assertEqual(1, quic_qpack:get_last_ric(element(13, State2))),
-    ?assertNot(has_outstanding_sections(0, State2)),
+    ?assertEqual(error, maps:find(0, quic_h3_connection:test_streams(State2))),
+    ?assert(has_outstanding_sections(0, State2)),
+    {ok, State3} = peer_decoder_says(quic_qpack:encode_section_ack(0), State2),
+    ?assertNot(has_outstanding_sections(0, State3)),
     flush_owner_events().
 
-a_cancelled_stream_has_no_outstanding_sections_test() ->
+a_cancelled_stream_keeps_its_sections_until_the_peer_cancels_test() ->
     State = quic_h3_connection:do_cancel_stream(0, ?H3_REQUEST_CANCELLED, dynamic_response()),
-    ?assertNot(has_outstanding_sections(0, State)),
+    ?assert(has_outstanding_sections(0, State)),
+    {ok, State1} = peer_decoder_says(quic_qpack:encode_stream_cancel(0), State),
+    ?assertNot(has_outstanding_sections(0, State1)),
     flush_owner_events().
 
-a_peer_reset_stream_has_no_outstanding_sections_test() ->
+%% A peer reset too: its decoder sends Stream Cancellation (RFC 9204 §4.4.2).
+a_peer_reset_stream_keeps_its_sections_until_the_peer_cancels_test() ->
     {ok, State} = quic_h3_connection:handle_stream_closed(
         0, ?H3_REQUEST_CANCELLED, dynamic_response()
     ),
-    ?assertNot(has_outstanding_sections(0, State)).
+    ?assert(has_outstanding_sections(0, State)),
+    {ok, State1} = peer_decoder_says(quic_qpack:encode_stream_cancel(0), State),
+    ?assertNot(has_outstanding_sections(0, State1)).
+
+%% The same holds for a push stream, ended by its FIN or reset after the
+%% client's CANCEL_PUSH.
+a_finished_push_keeps_its_sections_until_acknowledged_test() ->
+    State0 = dynamic_push(),
+    From = {self(), make_ref()},
+    {keep_state, State1, _} = quic_h3_connection:connected(
+        {call, From}, {send_push_data, 0, <<"x">>, true}, State0
+    ),
+    ?assertEqual(#{}, element(36, State1)),
+    ?assert(has_outstanding_sections(3, State1)),
+    {ok, State2} = peer_decoder_says(quic_qpack:encode_section_ack(3), State1),
+    ?assertNot(has_outstanding_sections(3, State2)).
+
+a_cancelled_push_keeps_its_sections_until_the_peer_cancels_test() ->
+    {ok, State} = quic_h3_connection:handle_control_frame({cancel_push, 0}, dynamic_push()),
+    ?assertEqual(#{}, element(36, State)),
+    ?assert(has_outstanding_sections(3, State)),
+    {ok, State1} = peer_decoder_says(quic_qpack:encode_stream_cancel(3), State),
+    ?assertNot(has_outstanding_sections(3, State1)).
+
+%% Instructions arriving on the client's QPACK decoder stream, 10.
+peer_decoder_says(Bin, State) ->
+    quic_h3_connection:handle_stream_data(10, Bin, false, State).
+
+%% A server with push 0 on stream 3, whose response HEADERS refer to the
+%% dynamic table.
+dynamic_push() ->
+    {State0, Field} = dynamic_table_server(),
+    {_Headers, Encoder} = quic_qpack:encode([Field], 3, element(13, State0)),
+    Push = #h3_stream{id = 3, type = push, state = open, frame_state = expecting_data},
+    State1 = setelement(13, State0, Encoder),
+    %% max_push_id, next_push_id and push_streams are at 34, 35 and 36
+    State2 = setelement(36, setelement(35, setelement(34, State1, 10), 1), #{0 => {3, Push}}),
+    ?assert(has_outstanding_sections(3, State2)),
+    State2.
 
 %% A server whose encoder holds Field in its dynamic table, acknowledged.
 dynamic_table_server() ->
@@ -4152,7 +4196,11 @@ dynamic_table_server() ->
         quic_qpack:clear_encoder_instructions(Encoder1)
     ),
     State = make_test_state(#{
-        role => server, quic_conn => fake_quic_conn(), qpack_encoder => Encoder2
+        role => server,
+        quic_conn => fake_quic_conn(),
+        qpack_encoder => Encoder2,
+        peer_decoder_stream => 10,
+        settings_received => true
     }),
     {State, Field}.
 

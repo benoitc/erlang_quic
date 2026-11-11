@@ -2731,8 +2731,7 @@ handle_cancel_push_server(
                 {ok, {StreamId, _Stream}} ->
                     %% Push stream active - reset it
                     quic:reset_stream(QuicConn, StreamId, ?H3_REQUEST_CANCELLED),
-                    State1 = release_sections(StreamId, State),
-                    {ok, State1#state{push_streams = maps:remove(PushId, PushStreams)}};
+                    {ok, State#state{push_streams = maps:remove(PushId, PushStreams)}};
                 error ->
                     %% Already sent, or never promised: a push stream is
                     %% opened with its promise, so there is none to hold back.
@@ -3992,7 +3991,7 @@ handle_stream_closed(
             %% H3_REQUEST_INCOMPLETE.
             State0 = maybe_reset_incomplete_request(StreamId, State),
             State1 = maybe_send_stream_cancel(StreamId, State0),
-            State2 = release_sections(StreamId, release_buffered(StreamId, State1)),
+            State2 = release_buffered(StreamId, State1),
             {ok, State2#state{
                 streams = maps:remove(StreamId, Streams),
                 stream_buffers = maps:remove(StreamId, Buffers),
@@ -4636,12 +4635,6 @@ find_handler_by_ref_iter(Ref, Iter) ->
             error
     end.
 
-%% The QPACK encoder stops waiting for acknowledgments on a stream that is
-%% over; a peer that never sends them would otherwise leave an entry behind
-%% for every stream.
-release_sections(StreamId, #state{qpack_encoder = Encoder} = State) ->
-    State#state{qpack_encoder = quic_qpack:release_stream(StreamId, Encoder)}.
-
 %% Hand a piece of body to whoever is reading it, or refuse it.
 %%
 %% A server holds a body only until the application registers a handler, so
@@ -4683,7 +4676,7 @@ close_half(local, Stream) ->
 %% GOAWAY-ed connection from ever draining. A body no handler came for
 %% goes with it, since none can register for the stream any more.
 store_stream(StreamId, #h3_stream{state = closed, reset = false}, State) ->
-    State1 = release_sections(StreamId, release_buffered(StreamId, State)),
+    State1 = release_buffered(StreamId, State),
     State1#state{streams = maps:remove(StreamId, State1#state.streams)};
 store_stream(StreamId, Stream, #state{streams = Streams} = State) ->
     State#state{streams = Streams#{StreamId => Stream}}.
@@ -4927,8 +4920,7 @@ do_send_push_data(
                     case Fin of
                         true ->
                             %% Push complete - remove from tracking
-                            State1 = release_sections(StreamId, State),
-                            {ok, State1#state{push_streams = maps:remove(PushId, PushStreams)}};
+                            {ok, State#state{push_streams = maps:remove(PushId, PushStreams)}};
                         false ->
                             Stream1 = Stream#h3_stream{
                                 %% Sent-side accounting; push stream is dropped on FIN.
@@ -5401,7 +5393,7 @@ reason_phrase(Reason) ->
 reset_request_stream(StreamId, ErrorCode, #state{quic_conn = QuicConn} = State) ->
     quic:reset_stream(QuicConn, StreamId, ErrorCode),
     State1 = maybe_send_stream_cancel(StreamId, State),
-    report_local_reset(StreamId, ErrorCode, release_sections(StreamId, State1)).
+    report_local_reset(StreamId, ErrorCode, State1).
 
 report_local_reset(StreamId, ErrorCode, State) ->
     case is_request_stream(StreamId, State) of
