@@ -95,6 +95,22 @@ no_common_alpn_is_refused_before_the_handler_test() ->
         quic:stop_server(Name)
     end.
 
+%% A hook the connection could not call is refused at start.
+a_handler_that_is_not_a_fun_of_two_is_refused_test() ->
+    {ok, _} = application:ensure_all_started(quic),
+    {Cert, Key} = quic_test_echo_server:cert_and_key(),
+    lists:foreach(
+        fun(Bad) ->
+            ?assertEqual(
+                {error, {invalid_alpn_handler, Bad}},
+                quic:start_server(quic_alpn_handler_bad, 0, #{
+                    cert => Cert, key => Key, alpn => [<<"proto-a">>], alpn_handler => Bad
+                })
+            )
+        end,
+        [fun(_Conn) -> ok end, not_a_fun, {quic_h3, accept}]
+    ).
+
 start_server(Opts) ->
     {ok, _} = application:ensure_all_started(quic),
     {Cert, Key} = quic_test_echo_server:cert_and_key(),

@@ -995,6 +995,7 @@ validate_server_opts(Opts) ->
                 credentials(server, Opts),
                 validate_receive_window(Opts),
                 validate_owner_queue(Opts),
+                validate_alpn_handler(Opts),
                 quic_listener:validate_reset_secret(Opts)
             ]);
         {error, _} = Error ->
@@ -1028,6 +1029,15 @@ validate_owner_queue(Opts) ->
         {ok, infinity} -> ok;
         {ok, N} when is_integer(N), N > 0 -> ok;
         {ok, N} -> {error, {invalid_max_owner_queue, N}}
+    end.
+
+%% @private `alpn_handler' is called with the connection and the ALPN.
+validate_alpn_handler(Opts) ->
+    case maps:find(alpn_handler, Opts) of
+        error -> ok;
+        {ok, undefined} -> ok;
+        {ok, F} when is_function(F, 2) -> ok;
+        {ok, F} -> {error, {invalid_alpn_handler, F}}
     end.
 
 %% @private Reject a `groups' option naming a key-exchange group this
