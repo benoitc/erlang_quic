@@ -35,11 +35,12 @@
 %%% '''
 %%%
 %%% Return `{ok, HandlerPid}' to take the connection, or `{error, Reason}'
-%%% to decline it. The listener then logs a warning and stops the
-%%% connection before it has seen a packet, so the client gets no answer
-%%% and gives up when its handshake times out. A handler that raises or
-%%% returns anything else also costs only that connection, and is logged
-%%% as an error. An arity-2 fun is called as `Fun(Conn, DCID)'.
+%%% to decline it. The listener then logs a warning, stops the
+%%% connection before it has seen a packet, and answers the client with
+%%% CONNECTION_CLOSE carrying CONNECTION_REFUSED (RFC 9000 Section 5.2.2).
+%%% A handler that raises or returns anything else also costs only that
+%%% connection: it is logged as an error and the client gets
+%%% INTERNAL_ERROR. An arity-2 fun is called as `Fun(Conn, DCID)'.
 %%%
 %%% === Return the final owner ===
 %%%
@@ -1240,10 +1241,8 @@ create_connection(
 spawn_with_limit(Validated, OrigDCID, RetrySCID, Packet, DCID, Version, RemoteAddr, State) ->
     case connection_limit_reached(State) of
         true ->
-            %% Silently drop (no reply) to avoid amplification; the client
-            %% retries or times out.
             ?LOG_WARNING(#{what => connection_limit_reached}, ?QUIC_LOG_META),
-            ok;
+            send_refusal(?QUIC_CONNECTION_REFUSED, Packet, DCID, Version, RemoteAddr, State);
         false ->
             create_connection_unconditional(
                 Validated, OrigDCID, RetrySCID, Packet, DCID, Version, RemoteAddr, State
@@ -1372,6 +1371,9 @@ create_connection_unconditional(
                         ?QUIC_LOG_META
                     ),
                     discard_connection(ConnPid, State),
+                    send_refusal(
+                        ?QUIC_CONNECTION_REFUSED, Packet, DCID, Version, RemoteAddr, State
+                    ),
                     {error, connection_declined};
                 {error, HandlerError} ->
                     ?LOG_ERROR(
@@ -1383,10 +1385,12 @@ create_connection_unconditional(
                         ?QUIC_LOG_META
                     ),
                     discard_connection(ConnPid, State),
+                    send_refusal(?QUIC_INTERNAL_ERROR, Packet, DCID, Version, RemoteAddr, State),
                     {error, connection_handler_error}
             end;
         {error, Reason} ->
             ?LOG_WARNING(#{what => start_connection_failed, reason => Reason}, ?QUIC_LOG_META),
+            send_refusal(?QUIC_INTERNAL_ERROR, Packet, DCID, Version, RemoteAddr, State),
             {error, Reason}
     end.
 
@@ -1426,6 +1430,31 @@ discard_connection(ConnPid, State) ->
 
 send_to_connection(ConnPid, Packet, RemoteAddr) ->
     ConnPid ! {quic_packet, Packet, RemoteAddr}.
+
+%% RFC 9000 Section 5.2.2: answer a refused Initial with CONNECTION_CLOSE.
+send_refusal(Code, Packet, DCID, Version, {IP, Port}, State) ->
+    case parse_initial_token(Packet) of
+        {ok, _Token, ClientSCID, DCID} ->
+            #listener_state{
+                socket = Socket, socket_state = SocketState, socket_backend = Backend
+            } = State,
+            Refusal = build_refusal(Code, ClientSCID, DCID, Version),
+            _ = send_packet(Socket, SocketState, Backend, IP, Port, Refusal),
+            ok;
+        _ ->
+            ok
+    end.
+
+%% Keyed from the Initial's DCID, the Retry SCID after a Retry.
+build_refusal(Code, ClientSCID, DCID, Version) ->
+    {Key, IV, HP} = quic_keys:derive_initial_server(DCID, Version),
+    Payload = quic_frame:encode({connection_close, transport, Code, 0, <<>>}),
+    FirstByte = 16#C0 bor (quic_packet:type_to_bits(initial, Version) bsl 4),
+    %% Empty token; Length covers the one-byte PN 0 and the 16-byte tag.
+    Prefix =
+        <<FirstByte, Version:32, (byte_size(ClientSCID)), ClientSCID/binary, (byte_size(DCID)),
+            DCID/binary, 0, (quic_varint:encode(byte_size(Payload) + 1 + 16))/binary>>,
+    quic_aead:protect_long_packet(aes_128_gcm, Key, IV, HP, 0, Prefix, Payload).
 
 %%====================================================================
 %% Stateless Reset (RFC 9000 Section 10.3)
