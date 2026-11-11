@@ -88,6 +88,7 @@ on `inet6`, `{ip, _}` or `{ifaddr, _}`.
 |--------|------|---------|-------------|
 | `pool_size` | integer | 1 | Number of listener processes |
 | `connection_handler` | function | - | Callback for new connections |
+| `alpn_handler` | fun/2 | - | Picks each connection's owner by the negotiated ALPN; see below |
 
 ### Advanced Options
 
@@ -170,6 +171,36 @@ quic:start_server(my_server, 4433, #{
     connection_handler => fun handle_connection/2
 }).
 ```
+
+### Choosing the owner by ALPN
+
+Use `alpn_handler` when one listener serves several protocols on one
+port. It is called in the connection process once the ClientHello has
+negotiated an ALPN, before any stream data can arrive, and the pid it
+returns becomes the connection's owner.
+
+```erlang
+quic:start_server(my_server, 4433, #{
+    cert => Cert,
+    key => Key,
+    alpn => [<<"h3">>, <<"myproto">>],
+    alpn_handler => fun
+        (Conn, <<"h3">>) ->
+            quic_h3:accept(Conn, #{handler => fun my_http:handle/5, owner => Router});
+        (Conn, <<"myproto">>) ->
+            {ok, spawn(fun() -> myproto:loop(Conn) end)}
+    end
+}).
+```
+
+- Return `{ok, Pid}`. Anything else, or an exception, fails the handshake
+  with `handshake_failure`.
+- Return quickly and do not call the connection synchronously: the hook
+  runs inside the handshake.
+- A ClientHello with no ALPN in common is refused with
+  `no_application_protocol` before the hook runs.
+- For HTTP/3, `quic_h3:accept/2` starts the HTTP/3 process; see
+  [HTTP3.md](HTTP3.md#accept2) for the listener options it needs.
 
 ### Manual Connection Handling
 

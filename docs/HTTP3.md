@@ -347,6 +347,73 @@ The handler can be:
 }).
 ```
 
+#### accept/2
+
+Start HTTP/3 on a QUIC connection you already hold, and get the HTTP/3
+process back. You need it when one listener serves HTTP/3 and other
+protocols on the same port, told apart by ALPN: `quic:start_server/3`
+picks each connection's owner with an `alpn_handler`, and the hook calls
+`accept/2` for the connections that negotiated `h3`.
+
+```erlang
+-spec accept(QuicConn, Opts) -> {ok, pid()} | {error, term()} when
+    QuicConn :: pid(),
+    Opts :: quic_h3:accept_opts().
+```
+
+**Arguments:**
+- `QuicConn` - The QUIC connection, the first argument of `alpn_handler`
+- `Opts` - HTTP/3 options for this connection
+
+**Options:**
+
+| Option | Type | Required | Description |
+|--------|------|----------|-------------|
+| `handler` | fun/5 or module | No | Request handler, as for `start_server/3` |
+| `owner` | pid | No | Receives the owner events (datagrams, claimed streams). Default: the caller, which inside `alpn_handler` is the QUIC connection process, so pass it |
+| `settings` | map | No | HTTP/3 settings |
+| `stream_type_handler` | fun/3 | No | Claims peer streams by their first varint |
+| `h3_datagram_enabled` | boolean | No | Enable HTTP datagrams (RFC 9297). Default `false` |
+| `max_buffered_body` | integer | No | Bytes held for the application across the connection's streams. Default 16 MiB |
+| `defer_requests_until_settings` | boolean | No | Hold requests until the client's SETTINGS arrive. Default `false` |
+| `stream_reset_final_size` | boolean | No | Report a claimed stream's reset with its final size. Default `false` |
+| `notify_streams_available` | boolean | No | Send `{streams_available, Dir}` after an open refused with `stream_limit`. Default `false` |
+
+**Steps:**
+
+1. Start the listener with every ALPN you serve and an `alpn_handler`.
+2. In the hook, call `accept/2` for `h3` and return its result. The
+   HTTP/3 process becomes the connection's owner during the handshake,
+   before any stream event.
+3. Set on the listener the QUIC options `start_server/3` would have set
+   for you:
+   - `stream_reset_final_size => true`, so claimed stream resets carry
+     their final size;
+   - `notify_streams_available => true`, when you pass it to `accept/2`;
+   - `max_datagram_frame_size` (for example `65535`), when you pass
+     `h3_datagram_enabled => true`.
+
+**Example:**
+
+```erlang
+Router = spawn(fun my_router:loop/0),
+{ok, _} = quic:start_server(my_server, 4433, #{
+    cert => CertDer,
+    key => KeyTerm,
+    alpn => [<<"h3">>, <<"myproto">>],
+    stream_reset_final_size => true,
+    alpn_handler => fun
+        (Conn, <<"h3">>) ->
+            quic_h3:accept(Conn, #{handler => fun my_http:handle/5, owner => Router});
+        (Conn, <<"myproto">>) ->
+            {ok, spawn(fun() -> myproto:loop(Conn) end)}
+    end
+}).
+```
+
+Bad options return `{error, {bad_opts, _}}`, and the returned error fails
+the handshake with `handshake_failure`.
+
 #### stop_server/1
 
 Stop an HTTP/3 server.

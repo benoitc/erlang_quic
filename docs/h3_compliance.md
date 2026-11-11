@@ -59,9 +59,11 @@ All tests live under `test/`; module names in the table are bare
 | §5.2 | GOAWAY server-sent ID is a client-initiated bidi stream | `quic_h3_compliance_tests:goaway_client_receives_non_bidi_id_rejected_test` ✓ |
 | §5.2 | GOAWAY client-sent ID is a push ID | `quic_h3_compliance_tests:goaway_server_receives_any_push_id_accepted_test` ✓ |
 | §5.2 | GOAWAY blocks new requests above threshold | `quic_h3_compliance_tests:goaway_blocks_new_request_stream_test` ✓ |
+| §5.2 | A server's GOAWAY gives up only blocked requests at or above its ID; a client's keeps them all | `quic_h3_compliance_tests:server_goaway_drops_only_blocked_requests_at_or_above_its_id_test`, `client_goaway_keeps_blocked_requests_test` ✓ |
 | §5.2 | Streams below the GOAWAY ID keep running: cancel, reset, trailers, response, calls | `quic_h3_goaway_SUITE` ✓ |
 | §5.2 | GOAWAY from both endpoints: the peer's ID is tracked apart from ours, each side may answer the other's | `quic_h3_compliance_tests:goaway_received_after_sent_*_test`, `quic_h3_event_forwarding_tests`, `quic_h3_goaway_SUITE:goaway_from_both_sides`, `quic_h3_goaway_interop_SUITE` (aioquic, quic-go, quiche) ✓ |
 | §7.2.3 | CANCEL_PUSH with push id > MAX_PUSH_ID → `H3_ID_ERROR` | `quic_h3_compliance_tests:cancel_push_above_max_push_id_is_id_error_test` ✓ |
+| §7.2.3 | Server receiving CANCEL_PUSH for a push ID no PUSH_PROMISE mentioned → `H3_ID_ERROR` | `quic_h3_push_tests:cancel_push_for_an_unpromised_id_is_an_id_error_test` ✓ |
 
 ### §6 Stream Handling
 
@@ -155,6 +157,8 @@ depends on these primitives.
 | §4.3 | `set_dynamic_capacity` API clamps to `max_allowed_capacity` | `quic_qpack_tests:set_dynamic_capacity_clamps_to_max_test` ✓ |
 | §4.4 | Decoder-stream Section Acknowledgment encoding | `quic_qpack_tests:section_ack_encoding_test`, `section_ack_large_stream_id_test` ✓ |
 | §4.4 | Decoder-stream Stream Cancellation encoding | `quic_qpack_tests:stream_cancel_encoding_test` ✓ |
+| §2.2.2.2 | Stream Cancellation for every stream given up before it is read, request or push | `quic_h3_compliance_tests:cancelling_a_request_being_read_sends_stream_cancellation_test`, `cancelling_an_open_push_sends_stream_cancellation_test` ✓ |
+| §2.1.1 | A field section stays referenced until Section Acknowledgment or Stream Cancellation; past 100 waiting streams the encoder uses literals | `quic_h3_compliance_tests:a_finished_stream_keeps_its_sections_until_acknowledged_test`, `quic_qpack_tests:unacknowledged_streams_are_bounded_test` ✓ |
 | §4.4.3 | Decoder-stream Insert Count Increment = 0 → `H3_QPACK_DECODER_STREAM_ERROR` | `quic_qpack_tests:insert_count_increment_zero_rejected_test` ✓ |
 | §5 | Huffman EOS / over-long padding → reject | `quic_qpack_tests:huffman_invalid_eos_rejected_test` ✓ |
 

@@ -51,6 +51,35 @@
 %%%     quic_h3:send_data(Conn, StreamId, <<"Hello, HTTP/3!">>, true).
 %%% '''
 %%%
+%%% == Serving HTTP/3 beside other protocols ==
+%%%
+%%% Use `accept/2' when one QUIC listener serves HTTP/3 and other
+%%% protocols, told apart by ALPN. Start the listener with
+%%% `quic:start_server/3' and an `alpn_handler', and start HTTP/3 from it
+%%% for the connections that negotiated `h3'. Pass `owner': inside the
+%%% hook the caller is the QUIC connection process, which is the default.
+%%%
+%%% ```
+%%% {ok, _} = quic:start_server(my_server, 4433, #{
+%%%     cert => CertDer,
+%%%     key => KeyTerm,
+%%%     alpn => [<<"h3">>, <<"myproto">>],
+%%%     stream_reset_final_size => true,
+%%%     alpn_handler => fun
+%%%         (Conn, <<"h3">>) ->
+%%%             quic_h3:accept(Conn, #{handler => fun handle_request/5, owner => Router});
+%%%         (Conn, <<"myproto">>) ->
+%%%             {ok, spawn(fun() -> myproto:loop(Conn) end)}
+%%%     end
+%%% }).
+%%% '''
+%%%
+%%% `start_server/3' sets three QUIC options that `accept/2' cannot, since
+%%% the listener already runs. Set them on the listener yourself:
+%%% `stream_reset_final_size => true', `notify_streams_available => true'
+%%% when you pass it to `accept/2', and `max_datagram_frame_size' (for
+%%% example 65535) when you pass `h3_datagram_enabled => true'.
+%%%
 %%% == Server Push (RFC 9114 Section 4.6) ==
 %%%
 %%% Server push allows a server to pre-emptively send resources to a client.
@@ -197,6 +226,7 @@
     error_code/0,
     connect_opts/0,
     server_opts/0,
+    accept_opts/0,
     push_id/0
 ]).
 
@@ -257,6 +287,20 @@
     max_buffered_body => non_neg_integer(),
     defer_requests_until_settings => boolean(),
     stream_reset_final_size => boolean()
+}.
+
+%% Options of accept/2: those start_server/3 applies to each connection.
+-type accept_opts() :: #{
+    %% Receives the connection's owner events. Default: the caller.
+    owner => pid(),
+    handler => fun((conn(), stream_id(), binary(), binary(), headers()) -> any()) | module(),
+    settings => map(),
+    stream_type_handler => stream_type_handler(),
+    h3_datagram_enabled => boolean(),
+    max_buffered_body => non_neg_integer(),
+    defer_requests_until_settings => boolean(),
+    stream_reset_final_size => boolean(),
+    notify_streams_available => boolean()
 }.
 
 -type server_opts() :: #{
@@ -708,22 +752,43 @@ resolve_per_conn_opts(Defaults, Fun, ConnPid) when is_function(Fun, 1) ->
 %% @doc Start the server side of HTTP/3 on a QUIC connection the caller
 %% already holds, and return the HTTP/3 process.
 %%
-%% `Opts' takes the per-connection options of `start_server/3':
-%% `handler', `settings', `stream_type_handler', `h3_datagram_enabled',
-%% `max_buffered_body', `defer_requests_until_settings' and `owner'
-%% (default: the caller). The HTTP/3 process must become the QUIC
-%% connection's owner before the connection delivers stream events:
-%% return it from the listener's `alpn_handler', which makes it the
-%% owner during the handshake.
+%% Use it from a listener's `alpn_handler' to serve HTTP/3 beside other
+%% protocols on one port (see the module doc). Returning the HTTP/3
+%% process from the hook makes it the QUIC connection's owner during the
+%% handshake, before any stream event.
 %%
+%% `Opts' takes the options `start_server/3' applies to each connection:
+%% `handler', `settings', `stream_type_handler', `h3_datagram_enabled',
+%% `max_buffered_body', `defer_requests_until_settings',
+%% `stream_reset_final_size', `notify_streams_available' and `owner'.
+%% `owner' defaults to the caller, which inside `alpn_handler' is the
+%% QUIC connection process, so pass the process that should receive the
+%% owner events.
+%%
+%% The handler can be:
+%% <ul>
+%%   <li>A function: `fun(Conn, StreamId, Method, Path, Headers) -> ok'</li>
+%%   <li>A module implementing `handle_request/5'</li>
+%% </ul>
+%%
+%% Example:
 %% ```
 %% alpn_handler => fun
-%%     (Conn, <<"h3">>) -> quic_h3:accept(Conn, #{handler => fun my_http:handle/5});
-%%     (Conn, <<"myproto">>) -> {ok, spawn(fun() -> myproto:loop(Conn) end)}
+%%     (Conn, <<"h3">>) ->
+%%         quic_h3:accept(Conn, #{handler => fun my_http:handle/5, owner => Router});
+%%     (Conn, <<"myproto">>) ->
+%%         {ok, spawn(fun() -> myproto:loop(Conn) end)}
 %% end
 %% '''
+%%
+%% Bad options return `{error, {bad_opts, _}}', which fails the
+%% handshake. The QUIC options `start_server/3' would set,
+%% `stream_reset_final_size', `notify_streams_available' and
+%% `max_datagram_frame_size', go on the listener.
 %% @end
--spec accept(pid(), map()) -> {ok, pid()} | {error, term()}.
+-spec accept(QuicConn, Opts) -> {ok, pid()} | {error, term()} when
+    QuicConn :: pid(),
+    Opts :: accept_opts().
 accept(QuicConnPid, Opts) ->
     try
         build_h3_opts(Opts#{

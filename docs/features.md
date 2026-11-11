@@ -271,6 +271,8 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
   `{stream_type_stop_sending, Direction, StreamId, ErrorCode}`
 - Per-connection owner override via `connection_handler` callback on
   `start_server/3` for hosting many sessions on one listener
+- `quic_h3:accept/2` - Start HTTP/3 on a connection an `alpn_handler`
+  routed by ALPN, so one listener serves HTTP/3 beside other protocols
 
 ### Streams
 - `quic:open_stream/1` - Open bidirectional stream
@@ -340,6 +342,7 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 - `preferred_ipv6` - Server preferred IPv6 address
 - `pool_size` - Number of listener processes for server pools (default: 1)
 - `connection_handler` - Callback for handling new connections
+- `alpn_handler` - On a server, `fun((Conn, Alpn) -> {ok, Owner} | {error, Reason})` called in the connection process once the ClientHello has negotiated `Alpn`, before any stream data; `Owner` becomes the connection's owner. An error, a bad result or an exception fails the handshake with `handshake_failure`. Not called when no ALPN is negotiated. A value that is not a fun of arity 2 fails `quic:start_server/3` with `{error, {invalid_alpn_handler, Value}}`
 - `monitor_owner` - Stop the connection with `{shutdown, owner_down}` and send CONNECTION_CLOSE when its owner process exits (default: `true` for accepted connections, `false` for client connections, which are linked to their caller unless supervised). Set `false` in the listener options to keep an accepted connection alive after its handler exits
 - `lb_config` - QUIC-LB configuration map for load balancer routing
 - `keep_alive_interval` - Keep-alive PING interval (`disabled`, `auto`, or milliseconds)
