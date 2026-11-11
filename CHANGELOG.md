@@ -67,6 +67,12 @@ All notable changes to this project will be documented in this file.
   `{error, status_101_forbidden}` (RFC 9114 Section 4.5).
 
 ### Fixed
+- Datagrams waiting for an unvalidated address to be validated, held back
+  by the anti-amplification limit, were kept without a bound, so a peer
+  that kept sending while its new address was checked could make the
+  connection hold an unbounded amount of memory. At most 64 are held now;
+  what a dropped one carried is sent again by loss recovery (RFC 9000
+  Section 8.1).
 - A server that refused a connection, at `max_connections` or when the
   `connection_handler` declined it, sent nothing, so the client waited
   for its handshake timeout. It now answers at once with
