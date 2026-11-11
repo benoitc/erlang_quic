@@ -422,6 +422,18 @@ push_response_with_path_pseudo_header_test() ->
     Result = quic_h3_connection:validate_push_response_headers(Headers),
     ?assertMatch({error, <<"request pseudo-header in push response">>}, Result).
 
+%% RFC 9114 Section 4.5: no 101 in HTTP/3, pushed or not.
+push_response_101_is_malformed_test() ->
+    Result = quic_h3_connection:validate_push_response_headers([{<<":status">>, <<"101">>}]),
+    ?assertMatch({error, _}, Result),
+    _ = push_events(),
+    Push = <<1, 5, (push_response_frame(101, []))/binary>>,
+    ?assertMatch(
+        {error, {connection_error, ?H3_MESSAGE_ERROR, _}, _},
+        quic_h3_connection:handle_stream_data(3, Push, false, promised_state(<<"GET">>))
+    ),
+    ?assertEqual([], [E || {push_response, _, _, _} = E <- push_events()]).
+
 push_response_valid_test() ->
     Headers = [{<<":status">>, <<"200">>}, {<<"content-type">>, <<"text/html">>}],
     Result = quic_h3_connection:validate_push_response_headers(Headers),

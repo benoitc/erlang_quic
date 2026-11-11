@@ -4884,6 +4884,18 @@ interim_content_length_does_not_carry_over_test() ->
         [[], [{<<"content-length">>, <<"2">>}]]
     ).
 
+%% RFC 9114 Section 4.5: HTTP/3 has no 101, so a response carrying one is
+%% malformed and the stream is reset.
+a_received_101_is_malformed_test() ->
+    flush_owner_events(),
+    Quic = fake_quic_conn(),
+    Response = <<(response_frame(101, []))/binary, (response_frame(200, []))/binary>>,
+    {ok, _} = quic_h3_connection:handle_stream_data(
+        0, Response, false, client_request_state(Quic, <<"GET">>)
+    ),
+    ?assertEqual([{stream_reset, 0, ?H3_MESSAGE_ERROR}], owner_events()),
+    ?assert(lists:member({close_stream, 0, ?H3_MESSAGE_ERROR}, fake_quic_calls(Quic))).
+
 %% A client that sent a request on stream 0 and waits for the response.
 client_request_state(Quic, Method) ->
     Stream = #h3_stream{

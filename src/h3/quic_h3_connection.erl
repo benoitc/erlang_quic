@@ -2730,6 +2730,9 @@ validate_push_response_headers(Headers) ->
 
 validate_push_response_status(StatusBin, Headers) ->
     try binary_to_integer(StatusBin) of
+        101 ->
+            %% RFC 9114 Section 4.5: HTTP/3 has no 101 (Switching Protocols).
+            {error, <<"101 in push response">>};
         Status when Status >= 100, Status < 600 ->
             case has_request_pseudo_headers(Headers) of
                 true -> {error, <<"request pseudo-header in push response">>};
@@ -3918,6 +3921,9 @@ validate_response_headers(#h3_stream{status = Status}, _Headers) when
     Status < 100; Status > 599
 ->
     throw({header_error, {invalid_field, <<":status">>, integer_to_binary(Status)}});
+validate_response_headers(#h3_stream{status = 101}, _Headers) ->
+    %% RFC 9114 Section 4.5: HTTP/3 has no 101 (Switching Protocols).
+    throw({header_error, {invalid_field, <<":status">>, <<"101">>}});
 validate_response_headers(_Stream, Headers) ->
     case response_has_request_pseudo(Headers) of
         {true, Name} -> throw({header_error, {invalid_field, Name, <<>>}});
