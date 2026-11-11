@@ -5094,10 +5094,12 @@ count_auth_failure(decryption_failed, #state{auth_failures = N} = State) ->
 count_auth_failure(_Reason, State) ->
     {ok, State}.
 
-integrity_limit(#state{app_keys = {#crypto_keys{cipher = chacha20_poly1305}, _}}) ->
-    1 bsl 36;
-integrity_limit(_State) ->
-    1 bsl 52.
+integrity_limit(#state{app_keys = {#crypto_keys{cipher = Cipher}, _}}) ->
+    aead_integrity_limit(Cipher).
+
+aead_integrity_limit(aes_128_gcm) -> 1 bsl 52;
+aead_integrity_limit(aes_256_gcm) -> 1 bsl 52;
+aead_integrity_limit(chacha20_poly1305) -> 1 bsl 36.
 
 %% Least time the last probe before a disconnect gets to be acknowledged.
 -define(DISCONNECT_GRACE_MS, 1000).

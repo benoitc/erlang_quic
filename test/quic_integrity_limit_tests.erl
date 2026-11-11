@@ -21,6 +21,16 @@ past_the_limit_closes_test() ->
     S = quic_connection:handle_packet_loop(forged(S0), S0),
     ?assertMatch({transport, ?QUIC_AEAD_LIMIT_REACHED, _}, S#state.close_reason).
 
+limit_per_aead_test() ->
+    ?assertEqual(1 bsl 52, quic_connection:integrity_limit(with_cipher(aes_128_gcm))),
+    ?assertEqual(1 bsl 52, quic_connection:integrity_limit(with_cipher(aes_256_gcm))),
+    ?assertEqual(1 bsl 36, quic_connection:integrity_limit(with_cipher(chacha20_poly1305))),
+    ?assertError(function_clause, quic_connection:integrity_limit(with_cipher(aes_128_ccm))).
+
+with_cipher(Cipher) ->
+    #state{app_keys = {K, _}} = S = state(),
+    S#state{app_keys = {K#crypto_keys{cipher = Cipher}, K#crypto_keys{cipher = Cipher}}}.
+
 state() ->
     S0 = quic_connection_test_support:state_sending(
         quic_connection_test_support:state_with_pn_app(
