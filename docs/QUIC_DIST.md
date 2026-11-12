@@ -116,11 +116,11 @@ QUIC idle timeout. See `quic_call.sh -h` for the full flag list.
 ### PSK-only authentication
 
 For closed clusters where running a CA is overkill, dist can
-authenticate via TLS 1.3 external PSK ([RFC 8446 §4.2.11][rfc8446])
+authenticate via TLS 1.3 external PSK ([RFC 9846 §4.3.11][rfc9846])
 instead of X.509 certs. Configure `psks` and/or `psk_callback` on
 the listener side and `external_psk` on the dialer side.
 
-[rfc8446]: https://www.rfc-editor.org/rfc/rfc8446#section-4.2.11
+[rfc9846]: https://www.rfc-editor.org/rfc/rfc9846#section-4.3.11
 
 ```erlang
 %% sys.config: every node has the same shared secret

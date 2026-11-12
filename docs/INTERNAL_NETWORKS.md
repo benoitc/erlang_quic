@@ -66,7 +66,7 @@ Notes:
 
 ## Drop certificates entirely
 
-Use an external PSK ([RFC 8446 §4.2.11][rfc8446-4-2-11]) when you
+Use an external PSK ([RFC 9846 §4.3.11][rfc9846-4-3-11]) when you
 control both ends and want no X.509 at all. Both sides share a secret
 out of band, and both sides are authenticated by it.
 
@@ -103,7 +103,7 @@ Notes:
 
 Full guide: [PSK.md](PSK.md).
 
-[rfc8446-4-2-11]: https://www.rfc-editor.org/rfc/rfc8446#section-4.2.11
+[rfc9846-4-3-11]: https://www.rfc-editor.org/rfc/rfc9846#section-4.3.11
 
 ## Erlang distribution
 

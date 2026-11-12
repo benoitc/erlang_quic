@@ -162,7 +162,7 @@ group_atom(?GROUP_SECP384R1) -> secp384r1;
 group_atom(?GROUP_X25519MLKEM768) -> x25519mlkem768;
 group_atom(Other) -> Other.
 
-%% @doc Decide the key-exchange group for a ClientHello (RFC 8446 §4.1.4).
+%% @doc Decide the key-exchange group for a ClientHello (RFC 9846 §4.2.4).
 %%
 %% Returns `{direct, Group}' when the client already sent a usable
 %% key_share, `{hrr, Group}' when a HelloRetryRequest is needed, or

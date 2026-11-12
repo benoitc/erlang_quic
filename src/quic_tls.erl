@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% QUIC TLS 1.3 Message Handling
-%%% RFC 8446 - TLS 1.3
+%%% RFC 9846 - TLS 1.3
 %%% RFC 9001 - Using TLS to Secure QUIC
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
@@ -68,7 +68,7 @@
     build_certificate_verify_client/3,
     verify_certificate_verify/4,
 
-    %% TLS 1.3 External PSK (RFC 8446 §4.2.11)
+    %% TLS 1.3 External PSK (RFC 9846 §4.3.11)
     select_psk/6,
     verify_resumption_binder/6,
     parse_extensions_ordered/1
@@ -108,7 +108,7 @@ build_client_hello(Opts) ->
         end,
 
     %% On a HelloRetryRequest retry, CH2 MUST reuse CH1's random and
-    %% legacy_session_id (RFC 8446 §4.1.2).
+    %% legacy_session_id (RFC 9846 §4.2.2).
     Random =
         case maps:get(retry_random, Opts, undefined) of
             undefined -> crypto:strong_rand_bytes(32);
@@ -139,13 +139,13 @@ default_groups() -> [x25519].
 default_sig_algs() ->
     [ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256, rsa_pkcs1_sha256, ed25519].
 
-%% @private Named-group atom to RFC 8446 §4.2.7 wire code.
+%% @private Named-group atom to RFC 9846 §4.3.7 wire code.
 group_to_code(x25519) -> ?GROUP_X25519;
 group_to_code(secp256r1) -> ?GROUP_SECP256R1;
 group_to_code(secp384r1) -> ?GROUP_SECP384R1;
 group_to_code(x25519mlkem768) -> ?GROUP_X25519MLKEM768.
 
-%% @private Signature-scheme atom to RFC 8446 §4.2.3 wire code.
+%% @private Signature-scheme atom to RFC 9846 §4.3.3 wire code.
 sig_alg_to_code(ecdsa_secp256r1_sha256) -> ?SIG_ECDSA_SECP256R1_SHA256;
 sig_alg_to_code(ecdsa_secp384r1_sha384) -> ?SIG_ECDSA_SECP384R1_SHA384;
 sig_alg_to_code(rsa_pss_rsae_sha256) -> ?SIG_RSA_PSS_RSAE_SHA256;
@@ -264,7 +264,7 @@ build_client_hello_standard(Random, PubKey, PrivKey, Opts) ->
 
 %% Build ClientHello with `pre_shared_key' extension for either a
 %% resumption ticket or an external PSK.
-%% RFC 8446 §4.2.11: pre_shared_key MUST be the last extension; the
+%% RFC 9846 §4.3.11: pre_shared_key MUST be the last extension; the
 %% binder is computed over the truncated ClientHello (everything
 %% before the binders section).
 build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer) ->
@@ -282,7 +282,7 @@ build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer)
     %% server's `psk_key_exchange_modes' decision).
     OptsWithModes = Opts#{psk_modes => Modes},
     BaseExtensions0 = build_client_hello_extensions(PubKey, OptsWithModes),
-    %% RFC 8446 §4.2.10 / RFC 9001 §4.6.1: offer 0-RTT by carrying an empty
+    %% RFC 9846 §4.3.10 / RFC 9001 §4.6.1: offer 0-RTT by carrying an empty
     %% early_data extension in the ClientHello (before pre_shared_key, which
     %% must remain the last extension), and only on a ticket that allows it.
     BaseExtensions =
@@ -298,7 +298,7 @@ build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer)
     BinderLen = quic_crypto:hash_len(Hash),
 
     %% PskIdentity: identity<1..2^16-1>, obfuscated_ticket_age.
-    %% External PSK uses age = 0 per RFC 8446 §4.2.11.
+    %% External PSK uses age = 0 per RFC 9846 §4.3.11.
     IdentityLen = byte_size(Identity),
     PskIdentity = <<IdentityLen:16, Identity/binary, Age:32>>,
     IdentitiesLen = byte_size(PskIdentity),
@@ -334,7 +334,7 @@ build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer)
     BindersSectionLen = byte_size(BindersSection),
     TruncatedLen = byte_size(ClientHelloBody) - BindersSectionLen,
     <<TruncatedBody:TruncatedLen/binary, _/binary>> = ClientHelloBody,
-    %% RFC 8446 §4.2.11.2: the binder transcript keeps every length field
+    %% RFC 9846 §4.3.11.2: the binder transcript keeps every length field
     %% (including the handshake-message length) at its final post-binder
     %% value; only the binder bytes are removed. So encode the full body and
     %% strip the binders off the end, preserving the full-length header.
@@ -426,7 +426,7 @@ build_client_hello_extensions(PubKey, Opts) ->
         TransportParamsData
     ),
 
-    %% PSK Key Exchange Modes — list of bytes per RFC 8446 §4.2.9.
+    %% PSK Key Exchange Modes — list of bytes per RFC 9846 §4.3.9.
     %% Defaults to `psk_dhe_ke' only; callers offering external PSK
     %% may pass `psk_modes => [psk_ke, psk_dhe_ke]` etc.
     Modes = maps:get(psk_modes, Opts, [psk_dhe_ke]),
@@ -530,7 +530,7 @@ selected_version(ExtMap) ->
         error -> {error, protocol_version}
     end.
 
-%% HelloRetryRequest (RFC 8446 §4.1.4): a ServerHello whose random is
+%% HelloRetryRequest (RFC 9846 §4.2.4): a ServerHello whose random is
 %% the HRR sentinel. Its key_share extension, if any, carries only the
 %% selected group (KeyShareHelloRetryRequest); its cookie, if any, goes
 %% back in the next ClientHello (RFC 9846 Section 4.3.2).
@@ -601,7 +601,7 @@ parse_server_hello_extensions(Random, SessionId, CipherSuite, ExtMap) ->
 
 %% @doc Parse EncryptedExtensions message.
 %% The `early_data' field signals whether the server accepted 0-RTT by
-%% echoing an empty `early_data' extension (RFC 8446 §4.2.10, RFC 9001
+%% echoing an empty `early_data' extension (RFC 9846 §4.3.10, RFC 9001
 %% §4.6.2). Presence is the entire signal; the extension body is empty
 %% on the EE path.
 -spec parse_encrypted_extensions(binary()) ->
@@ -1100,7 +1100,7 @@ parse_extensions(Data) ->
 %% @doc Parse an extensions blob preserving order and byte offsets.
 %% Returns [{Type, Data, ByteOffset, ByteSize}] where ByteOffset is the
 %% position of `Type' within `Data'. Rejects duplicate extension types
-%% per RFC 8446 §4.2 with {error, {duplicate_extension, Type}}; the
+%% per RFC 9846 §4.3 with {error, {duplicate_extension, Type}}; the
 %% caller maps that to an illegal_parameter alert.
 -spec parse_extensions_ordered(binary()) ->
     {ok, [{non_neg_integer(), binary(), non_neg_integer(), non_neg_integer()}]}
@@ -1152,7 +1152,7 @@ cipher_from_suite(?TLS_AES_128_GCM_SHA256) -> aes_128_gcm;
 cipher_from_suite(?TLS_AES_256_GCM_SHA384) -> aes_256_gcm;
 cipher_from_suite(?TLS_CHACHA20_POLY1305_SHA256) -> chacha20_poly1305.
 
-%% @private Encode a single psk_key_exchange_mode byte (RFC 8446 §4.2.9).
+%% @private Encode a single psk_key_exchange_mode byte (RFC 9846 §4.3.9).
 encode_psk_mode(psk_ke) -> <<?PSK_KE_MODE_KE:8>>;
 encode_psk_mode(psk_dhe_ke) -> <<?PSK_KE_MODE_DHE_KE:8>>.
 
@@ -1199,7 +1199,7 @@ parse_client_hello(<<
         {ok, OrderedExts} ->
             ExtMap = maps:from_list([{T, D} || {T, D, _Off, _Sz} <- OrderedExts]),
 
-            %% Validate pre_shared_key placement (must be last per RFC 8446 §4.2.11).
+            %% Validate pre_shared_key placement (must be last per RFC 9846 §4.3.11).
             Checks = [
                 offered_tls13(ExtMap),
                 null_compression(Compression),
@@ -1280,7 +1280,7 @@ build_server_hello(Opts) ->
     Message = encode_handshake_message(?TLS_SERVER_HELLO, ServerHello),
     {Message, PrivKey}.
 
-%% @doc Build a HelloRetryRequest (RFC 8446 §4.1.4). Wire-encoded as
+%% @doc Build a HelloRetryRequest (RFC 9846 §4.2.4). Wire-encoded as
 %% a ServerHello with the HRR sentinel random; its key_share carries
 %% only the selected group (no public key). Echoes the client's
 %% legacy_session_id and the negotiated cipher suite.
@@ -1335,7 +1335,7 @@ build_certificate(Context, Certs) ->
 -spec build_certificate_verify(non_neg_integer(), crypto:key_id(), binary()) -> binary().
 build_certificate_verify(SignatureAlgorithm, PrivateKey, TranscriptHash) ->
     %% Build the content to sign
-    %% RFC 8446 Section 4.4.3:
+    %% RFC 9846 Section 4.5.2:
     %% Content = 64 spaces + "TLS 1.3, server CertificateVerify" + 0x00 + TranscriptHash
     Spaces = binary:copy(<<32>>, 64),
     ContextString = <<"TLS 1.3, server CertificateVerify">>,
@@ -1399,7 +1399,7 @@ parse_alpn_list(_, _Acc) ->
     error.
 
 %% Parse pre_shared_key extension from ClientHello
-%% RFC 8446 Section 4.2.11
+%% RFC 9846 Section 4.3.11
 %% Returns: #{identities => [{Ticket, ObfuscatedAge}], binders => [Binder]}
 parse_pre_shared_key_ext(
     <<IdentitiesLen:16, IdentitiesData:IdentitiesLen/binary, BindersLen:16,
@@ -1448,7 +1448,7 @@ offered_tls13(ExtMap) ->
 
 %% @private
 %% Reject ClientHellos where pre_shared_key is not the final extension
-%% (RFC 8446 §4.2.11). Mapping `{error, psk_not_last}` to an
+%% (RFC 9846 §4.3.11). Mapping `{error, psk_not_last}` to an
 %% illegal_parameter alert is the caller's responsibility.
 validate_psk_extension_placement(OrderedExts) ->
     case lists:reverse(OrderedExts) of
@@ -1531,7 +1531,7 @@ u16_list(<<Len:16, Codes:Len/binary>>) when Len > 0, Len rem 2 =:= 0 ->
 u16_list(_) ->
     error.
 
-%% @private Parse supported_groups (RFC 8446 §4.2.7) into recognised
+%% @private Parse supported_groups (RFC 9846 §4.3.7) into recognised
 %% group atoms; unknown codes are dropped (they can't be selected).
 parse_supported_groups_ext(Data) ->
     case u16_list(Data) of
@@ -1539,7 +1539,7 @@ parse_supported_groups_ext(Data) ->
         error -> error
     end.
 
-%% @private Parse signature_algorithms (RFC 8446 §4.2.3) into the
+%% @private Parse signature_algorithms (RFC 9846 §4.3.3) into the
 %% list of wire codes (integers) in the order offered.
 parse_signature_algorithms_ext(Data) ->
     u16_list(Data).
@@ -1553,7 +1553,7 @@ code_to_group(_) -> unknown.
 
 %% @private
 %% Parse the psk_key_exchange_modes extension into a list of atoms.
-%% RFC 8446 §4.2.9: <<Len:8, Modes:Len/binary>>.
+%% RFC 9846 §4.3.9: <<Len:8, Modes:Len/binary>>.
 parse_psk_modes_ext(<<Len:8, Modes:Len/binary>>) when Len > 0 ->
     {ok, [decode_psk_mode(M) || <<M:8>> <= Modes]};
 parse_psk_modes_ext(_) ->
@@ -1674,7 +1674,7 @@ truncated_client_hello_hash(
     <<_MsgType:8, _Len:24, Body/binary>> = FullHandshakeMsg,
     ExtBlobOffsetInBody = extensions_offset_in_body(Body),
     AbsoluteBindersOff = 4 + ExtBlobOffsetInBody + BindersOffInExt,
-    %% RFC 8446 §4.2.11.2: keep every length field (including the
+    %% RFC 9846 §4.3.11.2: keep every length field (including the
     %% handshake-message length) at its final post-binder value; only the
     %% binder bytes are removed. FullHandshakeMsg already carries the
     %% full-length header, so hash its prefix as-is without rewrapping.
@@ -1701,7 +1701,7 @@ verify_psk_binder(Secret, Cipher, TruncatedHash, OfferedBinder) ->
 %% `Secret' is the resumption PSK, `PskBindersInfo' is the `psk_binders'
 %% map from `parse_client_hello/1', and `OfferedBinder' is the binder the
 %% client sent. `Prefix' is as for select_psk/6. Uses the "res binder"
-%% label (RFC 8446 §4.2.11.2).
+%% label (RFC 9846 §4.3.11.2).
 -spec verify_resumption_binder(binary(), atom(), binary(), binary(), map(), binary()) ->
     boolean().
 verify_resumption_binder(
@@ -1745,8 +1745,8 @@ build_server_hello_extensions(PubKey, Opts) ->
     SupportedVersions = encode_extension(?EXT_SUPPORTED_VERSIONS, <<?TLS_VERSION_1_3:16>>),
 
     %% Key share extension — included for psk_dhe_ke and standard
-    %% handshakes; omitted for psk_ke (PSK-only, no DHE per RFC 8446
-    %% §4.2.9).
+    %% handshakes; omitted for psk_ke (PSK-only, no DHE per RFC 9846
+    %% §4.3.9).
     KeyShare =
         case maps:get(selected_psk_mode, Opts, undefined) of
             psk_ke ->
@@ -1760,7 +1760,7 @@ build_server_hello_extensions(PubKey, Opts) ->
         end,
 
     %% pre_shared_key extension echo when a PSK was selected
-    %% (RFC 8446 §4.2.11 — ServerHello carries just selected_identity).
+    %% (RFC 9846 §4.3.11 — ServerHello carries just selected_identity).
     PskExt =
         case maps:find(selected_psk_identity, Opts) of
             {ok, Idx} when is_integer(Idx) ->
@@ -1792,7 +1792,7 @@ build_encrypted_extensions_list(Opts) ->
                 <<>>
         end,
 
-    %% Early data indication (RFC 8446 Section 4.2.10)
+    %% Early data indication (RFC 9846 Section 4.3.10)
     %% When server accepts early data, include empty early_data extension
     EarlyDataExt =
         case maps:get(early_data, Opts, false) of
@@ -1861,7 +1861,7 @@ convert_private_key(_, Key) ->
 %% Client Certificate Support (Mutual TLS)
 %%====================================================================
 
-%% @doc Build a CertificateRequest message (RFC 8446 §4.3.2) with the
+%% @doc Build a CertificateRequest message (RFC 9846 §4.4.2) with the
 %% default advertised signature schemes.
 -spec build_certificate_request(binary()) -> binary().
 build_certificate_request(Context) ->
@@ -1870,7 +1870,7 @@ build_certificate_request(Context) ->
     ]).
 
 %% @doc Build a CertificateRequest advertising the given signature
-%% schemes (RFC 8446 §4.3.2; signature_algorithms is required).
+%% schemes (RFC 9846 §4.4.2; signature_algorithms is required).
 -spec build_certificate_request(binary(), [atom()]) -> binary().
 build_certificate_request(Context, SigAlgAtoms) ->
     SigAlgs = iolist_to_binary([<<(sig_alg_to_code(A)):16>> || A <- SigAlgAtoms]),
@@ -1904,11 +1904,11 @@ parse_certificate_request(
 parse_certificate_request(_) ->
     {error, decode_error}.
 
-%% @doc Build a CertificateVerify message for client (RFC 8446 Section 4.4.3).
+%% @doc Build a CertificateVerify message for client (RFC 9846 Section 4.5.2).
 %% Uses "TLS 1.3, client CertificateVerify" context string.
 -spec build_certificate_verify_client(non_neg_integer(), term(), binary()) -> binary().
 build_certificate_verify_client(SignatureAlgorithm, PrivateKey, TranscriptHash) ->
-    %% RFC 8446 Section 4.4.3: Client uses different context string
+    %% RFC 9846 Section 4.5.2: Client uses different context string
     Spaces = binary:copy(<<32>>, 64),
     ContextString = <<"TLS 1.3, client CertificateVerify">>,
     Content = <<Spaces/binary, ContextString/binary, 0, TranscriptHash/binary>>,

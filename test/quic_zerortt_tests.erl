@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% QUIC 0-RTT / Early Data Tests
-%%% RFC 8446 Section 2.3 - 0-RTT Data
+%%% RFC 9846 Section 2.3 - 0-RTT Data
 %%% RFC 9001 Section 4.6 - 0-RTT
 %%%
 %%% @doc Tests for 0-RTT early data sending and acceptance.

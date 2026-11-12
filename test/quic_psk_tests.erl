@@ -1,5 +1,5 @@
 %%% -*- erlang -*-
-%%% Unit tests for TLS 1.3 external PSK support (RFC 8446 §4.2.11).
+%%% Unit tests for TLS 1.3 external PSK support (RFC 9846 §4.3.11).
 
 -module(quic_psk_tests).
 

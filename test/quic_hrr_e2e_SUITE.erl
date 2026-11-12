@@ -1,6 +1,6 @@
 %%% -*- erlang -*-
 %%%
-%%% HelloRetryRequest end-to-end suite (RFC 8446 §4.1.4).
+%%% HelloRetryRequest end-to-end suite (RFC 9846 §4.2.4).
 %%%
 %%% Drives full handshakes where the server's preferred key-exchange
 %%% group differs from the group the client sent a key_share for,

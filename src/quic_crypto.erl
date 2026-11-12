@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% QUIC TLS 1.3 Cryptographic Operations
-%%% RFC 8446 - TLS 1.3
+%%% RFC 9846 - TLS 1.3
 %%% RFC 9001 - Using TLS to Secure QUIC
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
@@ -100,7 +100,7 @@
 -define(HASH_LEN_384, 48).
 
 %%====================================================================
-%% Key Schedule (RFC 8446 Section 7.1)
+%% Key Schedule (RFC 9846 Section 7.1)
 %%====================================================================
 
 %% @doc Derive early secret without PSK (zeros).
@@ -142,7 +142,7 @@ derive_handshake_secret(Cipher, EarlySecret, SharedSecret) ->
     quic_hkdf:extract(Hash, Salt, SharedSecret).
 
 %% @doc Derive handshake secret for psk_ke (PSK-only, no DHE).
-%% RFC 8446 §7.1: when (EC)DHE is not used, the IKM is a zero-vector
+%% RFC 9846 §7.1: when (EC)DHE is not used, the IKM is a zero-vector
 %% of the negotiated hash's length.
 -spec derive_handshake_secret_psk_only(binary()) -> binary().
 derive_handshake_secret_psk_only(EarlySecret) ->
@@ -179,7 +179,7 @@ derive_master_secret(Cipher, HandshakeSecret) ->
     quic_hkdf:extract(Hash, Salt, IKM).
 
 %%====================================================================
-%% Traffic Secrets (RFC 8446 Section 7.1)
+%% Traffic Secrets (RFC 9846 Section 7.1)
 %%====================================================================
 
 %% @doc Derive client handshake traffic secret.
@@ -235,7 +235,7 @@ derive_server_app_secret(Cipher, MasterSecret, TranscriptHash) ->
     derive_secret(Hash, MasterSecret, <<"s ap traffic">>, TranscriptHash).
 
 %%====================================================================
-%% 0-RTT / Early Data (RFC 8446 Section 7.1)
+%% 0-RTT / Early Data (RFC 9846 Section 7.1)
 %%====================================================================
 
 %% @doc Derive client early traffic secret.
@@ -258,7 +258,7 @@ derive_early_exporter_master_secret(EarlySecret, ClientHelloHash) ->
     derive_secret(EarlySecret, <<"e exp master">>, ClientHelloHash).
 
 %% @doc Compute PSK binder value for a pre_shared_key extension.
-%% RFC 8446 Section 4.2.11.2:
+%% RFC 9846 Section 4.3.11.2:
 %%   binder_key = Derive-Secret(early_secret, "res binder" | "ext binder", "")
 %%   binder = HMAC(binder_key, Transcript-Hash(Truncated ClientHello))
 %% For resumption PSK, use "res binder". For external PSK, use "ext binder".
@@ -276,10 +276,10 @@ compute_psk_binder(Cipher, EarlySecret, TruncatedClientHelloHash, Type) ->
             external -> <<"ext binder">>
         end,
     %% binder_key = Derive-Secret(early_secret, label, "")
-    %% For empty context, derive_secret uses Hash("") as per RFC 8446.
+    %% For empty context, derive_secret uses Hash("") (RFC 9846 Section 7.1).
     BinderKey = derive_secret(Hash, EarlySecret, Label, <<>>),
-    %% The binder is a Finished MAC keyed by binder_key (RFC 8446 §4.2.11.2:
-    %% computed "in the same way as the Finished message", §4.4.4), so the
+    %% The binder is a Finished MAC keyed by binder_key (RFC 9846 §4.3.11.2:
+    %% computed "in the same way as the Finished message", §4.5.3), so the
     %% HMAC key is the finished_key derived from binder_key, not binder_key
     %% itself:
     %%   finished_key = HKDF-Expand-Label(binder_key, "finished", "", Hash.len)
@@ -304,7 +304,7 @@ derive_secret(Hash, Secret, Label, Messages) ->
     HashLen = hash_len(Hash),
     %% If Messages is already hash-length, assume it's pre-hashed
     %% Otherwise, compute Transcript-Hash(Messages) = Hash(Messages)
-    %% RFC 8446: Even for empty Messages, use Hash("") not empty binary
+    %% RFC 9846 Section 7.1: Even for empty Messages, use Hash("") not empty binary
     Context =
         case byte_size(Messages) of
             HashLen -> Messages;
@@ -314,7 +314,7 @@ derive_secret(Hash, Secret, Label, Messages) ->
     quic_hkdf:expand_label(Hash, Secret, Label, Context, HashLen).
 
 %%====================================================================
-%% Finished Key and Verify Data (RFC 8446 Section 4.4.4)
+%% Finished Key and Verify Data (RFC 9846 Section 4.5.3)
 %%====================================================================
 
 %% @doc Derive the finished key from a traffic secret.
@@ -361,7 +361,7 @@ transcript_hash(HashOrCipher, Messages) ->
 
 %% @doc Synthetic `message_hash' handshake message that replaces
 %% ClientHello1 in the transcript after a HelloRetryRequest
-%% (RFC 8446 §4.4.1). `HashClientHello1' is the digest over the
+%% (RFC 9846 §4.1). `HashClientHello1' is the digest over the
 %% complete CH1 handshake message. Both peers prepend the result
 %% to the post-HRR transcript.
 -spec hrr_transcript_prefix(atom(), binary()) -> binary().
@@ -521,7 +521,7 @@ is_all_zero(Binary) ->
     crypto:hash_equals(Binary, binary:copy(<<0>>, byte_size(Binary))).
 
 %% @private Length of a peer's key share for a classical group. TLS 1.3
-%% mandates the uncompressed point format (RFC 8446 §4.2.8.2), so each
+%% mandates the uncompressed point format (RFC 9846 §4.3.8.2), so each
 %% group has exactly one valid length. `undefined' for anything we
 %% cannot negotiate, which never matches a share size.
 peer_share_size(x25519) -> 32;

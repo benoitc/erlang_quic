@@ -2,7 +2,7 @@
 %%%
 %%% QUIC TLS 1.3 Compliance Tests
 %%% RFC 9001 - Using TLS to Secure QUIC
-%%% RFC 8446 - TLS 1.3
+%%% RFC 9846 - TLS 1.3
 %%%
 %%% Tests for full TLS 1.3 compliance in QUIC context.
 
@@ -350,7 +350,7 @@ quic_transport_params_extension_test() ->
     ?assertEqual(100, maps:get(initial_max_streams_bidi, Decoded)).
 
 %%====================================================================
-%% RFC 8446 - TLS 1.3 Key Schedule
+%% RFC 9846 - TLS 1.3 Key Schedule
 %%====================================================================
 
 tls13_early_secret_test() ->
@@ -470,7 +470,7 @@ parse_server_hello_aes_256_test() ->
     Cipher = maps:get(cipher, Parsed),
     ?assert(Cipher =:= aes_128_gcm orelse Cipher =:= aes_256_gcm).
 
-%% RFC 9001 §4.6 / RFC 8446 §4.2.11.2: resumption PSK binder verification
+%% RFC 9001 §4.6 / RFC 9846 §4.3.11.2: resumption PSK binder verification
 %% fails closed when the binder offset is unavailable. (The positive path,
 %% which needs a real ClientHello structure, is covered by the PSK e2e
 %% suite.)

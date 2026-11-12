@@ -114,7 +114,7 @@ hrr_random_is_sentinel_test() ->
     ?assertEqual(?TLS_HRR_RANDOM, Random).
 
 %%====================================================================
-%% Synthetic message_hash transcript prefix (RFC 8446 §4.4.1)
+%% Synthetic message_hash transcript prefix (RFC 9846 §4.1)
 %%====================================================================
 
 hrr_transcript_prefix_sha256_test() ->

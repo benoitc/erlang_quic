@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% The signature scheme in a peer's CertificateVerify has to fit its
-%%% certificate key (RFC 8446 Section 4.2.3, 4.4.3). A scheme that does
+%%% certificate key (RFC 9846 Sections 4.3.3 and 4.5.2). A scheme that does
 %%% not fit fails verification instead of raising.
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau

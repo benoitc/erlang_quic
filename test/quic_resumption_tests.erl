@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% QUIC Session Resumption Tests
-%%% RFC 8446 Section 4.6 - NewSessionTicket
+%%% RFC 9846 Section 4.7 - NewSessionTicket
 %%% RFC 9001 Section 4.6 - 0-RTT and Session Resumption
 %%%
 %%% @doc Tests for session ticket generation, storage, and PSK resumption.
@@ -75,7 +75,7 @@ new_session_ticket_decoding_test() ->
 
 %% Test resumption_master_secret derivation
 resumption_secret_derivation_test() ->
-    %% RFC 8446 Section 7.1:
+    %% RFC 9846 Section 7.1:
     %% resumption_master_secret = Derive-Secret(Master Secret, "res master", ClientHello..client Finished)
     Cipher = aes_128_gcm,
     MasterSecret = crypto:strong_rand_bytes(32),
@@ -96,7 +96,7 @@ resumption_secret_derivation_test() ->
 
 %% Test PSK derivation from resumption secret and ticket nonce
 psk_from_resumption_secret_test() ->
-    %% RFC 8446 Section 4.6.1:
+    %% RFC 9846 Section 4.7.1:
     %% PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, Hash.length)
     ResumptionSecret = crypto:strong_rand_bytes(32),
     Ticket = #session_ticket{
@@ -338,7 +338,7 @@ ticket_lookup_unknown_test() ->
 
 %% Test PSK binder computation
 psk_binder_computation_test() ->
-    %% RFC 8446 Section 4.2.11.2:
+    %% RFC 9846 Section 4.3.11.2:
     %% binder_value = HMAC(finished_key, Transcript-Hash(Truncated ClientHello))
     %% binder_key = Derive-Secret(early_secret, "res binder", "")
     PSK = crypto:strong_rand_bytes(32),
@@ -428,7 +428,7 @@ clienthello_with_psk_test() ->
     %% Decode and verify it's a ClientHello (type 1)
     <<1:8, _Len:24, _Body/binary>> = Msg.
 
-%% RFC 8446 §4.2.10: a client offers early data only on a ticket that
+%% RFC 9846 §4.3.10: a client offers early data only on a ticket that
 %% allows it, one whose NewSessionTicket carried a max_early_data.
 clienthello_offers_early_data_only_when_the_ticket_allows_test() ->
     ?assert(offers_early_data(16384)),

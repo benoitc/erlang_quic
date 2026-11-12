@@ -74,7 +74,7 @@ expand_label(Secret, Label, Context, Length) ->
     expand_label(sha256, Secret, Label, Context, Length).
 
 %% @doc HKDF-Expand-Label with specified hash algorithm.
-%% Implements TLS 1.3 HKDF-Expand-Label (RFC 8446 Section 7.1)
+%% Implements TLS 1.3 HKDF-Expand-Label (RFC 9846 Section 7.1)
 -spec expand_label(atom(), binary(), binary(), binary(), non_neg_integer()) -> binary().
 expand_label(Hash, Secret, Label, Context, Length) ->
     %% HkdfLabel structure:

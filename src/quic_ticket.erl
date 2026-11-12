@@ -124,7 +124,7 @@ clear_expired(Store) ->
 %%====================================================================
 
 %% @doc Derive the resumption_master_secret from the master secret.
-%% RFC 8446 Section 7.1:
+%% RFC 9846 Section 7.1:
 %%   resumption_master_secret = Derive-Secret(Master Secret, "res master", ClientHello..client Finished)
 -spec derive_resumption_secret(atom(), binary(), binary(), binary()) -> binary().
 derive_resumption_secret(Cipher, MasterSecret, TranscriptHash, _ClientFinished) ->
@@ -132,7 +132,7 @@ derive_resumption_secret(Cipher, MasterSecret, TranscriptHash, _ClientFinished) 
     quic_crypto:derive_secret(Hash, MasterSecret, <<"res master">>, TranscriptHash).
 
 %% @doc Derive PSK from resumption_master_secret and ticket nonce.
-%% RFC 8446 Section 4.6.1:
+%% RFC 9846 Section 4.7.1:
 %%   PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, Hash.length)
 -spec derive_psk(binary(), #session_ticket{}) -> binary().
 derive_psk(ResumptionSecret, #session_ticket{nonce = Nonce, cipher = Cipher}) ->
@@ -145,7 +145,7 @@ derive_psk(ResumptionSecret, #session_ticket{nonce = Nonce, cipher = Cipher}) ->
 %%====================================================================
 
 %% @doc Parse a NewSessionTicket message from the server.
-%% RFC 8446 Section 4.6.1:
+%% RFC 9846 Section 4.7.1:
 %%   struct {
 %%       uint32 ticket_lifetime;
 %%       uint32 ticket_age_add;
@@ -249,7 +249,7 @@ build_new_session_ticket(#session_ticket{
 %% read the clock, use the random source and mutate a public table.
 %%====================================================================
 
-%% Ticket TTL: 7 days in milliseconds (RFC 8446 recommends max 7 days)
+%% Ticket TTL: 7 days in milliseconds (RFC 9846 Section 4.7.1)
 -define(TICKET_TTL_MS, 7 * 24 * 60 * 60 * 1000).
 %% Max tickets to store (prevents unbounded memory growth)
 -define(MAX_TICKETS, 10000).

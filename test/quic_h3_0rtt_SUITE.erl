@@ -295,7 +295,7 @@ rejected_emits_event_and_does_not_auto_retry(Config) ->
 %% Test cases - multiple session tickets
 %%====================================================================
 
-%% Servers (RFC 8446 Section 4.6.1) MAY emit more than one ticket per
+%% Servers (RFC 9846 Section 4.7.1) MAY emit more than one ticket per
 %% connection. Our forwarding path must be lossless and deliver each
 %% one to the H3 owner. The in-process aioquic-style server we ship
 %% currently emits one ticket per handshake; this case asserts at

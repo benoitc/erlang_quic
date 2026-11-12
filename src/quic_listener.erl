@@ -146,7 +146,7 @@
     cert :: binary() | undefined,
     cert_chain :: [binary()],
     private_key :: term() | undefined,
-    %% TLS 1.3 external PSK (RFC 8446 §4.2.11). Either may be set
+    %% TLS 1.3 external PSK (RFC 9846 §4.3.11). Either may be set
     %% independently; per-handshake selection happens in quic_connection.
     psks :: #{binary() => binary()} | undefined,
     psk_callback :: fun((binary()) -> {ok, binary()} | not_found) | undefined,
@@ -404,7 +404,7 @@ extra_socket_family(Extra) ->
 %% @doc false
 handle_continue(discover_manager, {Socket, SocketState, Backend, Opts, Preferred}) ->
     %% Auth-method options: cert+key for X.509 auth, or PSK config
-    %% (psks / psk_callback) for TLS 1.3 external PSK (RFC 8446 §4.2.11).
+    %% (psks / psk_callback) for TLS 1.3 external PSK (RFC 9846 §4.3.11).
     %% At least one must be provided; both may coexist (per-handshake
     %% selection happens in quic_connection on ClientHello).
     Cert = maps:get(cert, Opts, undefined),
@@ -498,7 +498,7 @@ has_auth_method(Opts) when is_map(Opts) ->
 
 %% @private
 %% Either a cert+key pair for X.509 auth or PSK config for TLS 1.3
-%% external PSK (RFC 8446 §4.2.11) must be present. Both may coexist.
+%% external PSK (RFC 9846 §4.3.11) must be present. Both may coexist.
 %% A `sni_callback' supplies the cert/key per handshake, so it counts as
 %% an auth method even when no static cert/key is configured.
 has_auth_method(Cert, Key, _Psks, _Cb, _Sni) when Cert =/= undefined, Key =/= undefined -> ok;

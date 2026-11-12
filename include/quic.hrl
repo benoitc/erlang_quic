@@ -180,7 +180,7 @@
 -define(QUIC_LABEL_QUIC_KU, <<"quic ku">>).
 
 %%====================================================================
-%% TLS 1.3 Message Types (RFC 8446 Section 4)
+%% TLS 1.3 Message Types (RFC 9846 Section 4)
 %%====================================================================
 
 -define(TLS_CLIENT_HELLO, 1).
@@ -196,16 +196,16 @@
 -define(TLS_MESSAGE_HASH, 254).
 
 %%====================================================================
-%% TLS 1.3 Extension Types (RFC 8446 Section 4.2)
+%% TLS 1.3 Extension Types (RFC 9846 Section 4.3)
 %%====================================================================
 
 -define(EXT_SERVER_NAME, 0).
 -define(EXT_SUPPORTED_GROUPS, 10).
 -define(EXT_SIGNATURE_ALGORITHMS, 13).
 -define(EXT_ALPN, 16).
-% RFC 8446 Section 4.2.11
+% RFC 9846 Section 4.3.11
 -define(EXT_PRE_SHARED_KEY, 41).
-% RFC 8446 Section 4.2.10
+% RFC 9846 Section 4.3.10
 -define(EXT_EARLY_DATA, 42).
 -define(EXT_SUPPORTED_VERSIONS, 43).
 -define(EXT_COOKIE, 44).
@@ -214,7 +214,7 @@
 -define(EXT_QUIC_TRANSPORT_PARAMS, 57).
 
 %%====================================================================
-%% TLS 1.3 PSK Key Exchange Modes (RFC 8446 Section 4.2.9)
+%% TLS 1.3 PSK Key Exchange Modes (RFC 9846 Section 4.3.9)
 %%====================================================================
 
 %% PSK-only key establishment (no (EC)DHE; no forward secrecy)
@@ -223,7 +223,7 @@
 -define(PSK_KE_MODE_DHE_KE, 1).
 
 %%====================================================================
-%% TLS 1.3 Alerts (RFC 8446 Section 6)
+%% TLS 1.3 Alerts (RFC 9846 Section 6)
 %%====================================================================
 
 -define(TLS_ALERT_UNEXPECTED_MESSAGE, 10).
@@ -250,7 +250,7 @@
     type :: resumption | external,
     %% binary identity sent on the wire
     identity :: binary(),
-    %% obfuscated_ticket_age:32 — 0 for external PSKs (RFC 8446 §4.2.11)
+    %% obfuscated_ticket_age:32 — 0 for external PSKs (RFC 9846 §4.3.11)
     age = 0 :: non_neg_integer(),
     %% raw PSK secret (passed to HKDF unchanged)
     secret :: binary(),
@@ -262,7 +262,7 @@
     early_data = false :: boolean()
 }).
 
-%% HelloRetryRequest sentinel random (RFC 8446 §4.1.3): SHA-256 of
+%% HelloRetryRequest sentinel random (RFC 9846 §4.2.3): SHA-256 of
 %% "HelloRetryRequest". A ServerHello carrying this random IS an HRR.
 -define(TLS_HRR_RANDOM, <<
     16#CF,
@@ -300,7 +300,7 @@
 >>).
 
 %%====================================================================
-%% TLS 1.3 Named Groups (RFC 8446 Section 4.2.7)
+%% TLS 1.3 Named Groups (RFC 9846 Section 4.3.7)
 %%====================================================================
 
 -define(GROUP_SECP256R1, 16#0017).
@@ -312,7 +312,7 @@
 -define(GROUP_X25519MLKEM768, 16#11ec).
 
 %%====================================================================
-%% TLS 1.3 Signature Algorithms (RFC 8446 Section 4.2.3)
+%% TLS 1.3 Signature Algorithms (RFC 9846 Section 4.3.3)
 %%====================================================================
 
 -define(SIG_RSA_PKCS1_SHA256, 16#0401).
@@ -328,7 +328,7 @@
 -define(SIG_ED448, 16#0808).
 
 %%====================================================================
-%% TLS 1.3 Cipher Suites (RFC 8446 Section B.4)
+%% TLS 1.3 Cipher Suites (RFC 9846 Appendix B.4)
 %%====================================================================
 
 -define(TLS_AES_128_GCM_SHA256, 16#1301).

@@ -50,7 +50,7 @@ compute_shared_secret_rejects_bad_share_test() ->
         {error, illegal_parameter},
         quic_crypto:compute_shared_secret(x25519, Priv, <<1, 2, 3>>)
     ),
-    %% RFC 8446 §7.4.2 requires the X25519 all-zero check.
+    %% RFC 9846 §7.4.2 requires the X25519 all-zero check.
     ?assertEqual(
         {error, illegal_parameter},
         quic_crypto:compute_shared_secret(x25519, Priv, <<0:32/unit:8>>)

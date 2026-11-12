@@ -238,7 +238,7 @@ get_fd(Socket) ->
 %%   <li>`alpn' - ALPN protocols (default: [&lt;&lt;"h3"&gt;&gt;])</li>
 %%   <li>`server_name' - Server Name Indication, also the hostname
 %%       checked against the certificate (default: Host)</li>
-%%   <li>`external_psk' - TLS 1.3 external PSK (RFC 8446 §4.2.11).
+%%   <li>`external_psk' - TLS 1.3 external PSK (RFC 9846 §4.3.11).
 %%       `{Identity, Secret}' defaults to modes `[psk_dhe_ke]';
 %%       `{Identity, Secret, Modes}' takes an explicit non-empty
 %%       list (`psk_dhe_ke | psk_ke'). Mutually exclusive with
@@ -880,7 +880,7 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %%
 %% At least one authentication method must be configured: either a
 %% `cert' + `key' pair for X.509 auth, or `psks' / `psk_callback' for
-%% TLS 1.3 external PSK (RFC 8446 §4.2.11). Both may coexist; the
+%% TLS 1.3 external PSK (RFC 9846 §4.3.11). Both may coexist; the
 %% per-handshake selection rules are documented in docs/PSK.md.
 %% Without either, this returns `{error, no_auth_method}': QUIC has no
 %% unauthenticated mode (RFC 9001 §3).
@@ -893,7 +893,7 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %%       the certificate is refused with `{error, {invalid_server_key, _}}'.</li>
 %%   <li>`verify' - `true' or `verify_peer': request a client certificate
 %%       (mutual TLS) and validate any presented chain against `cacerts'
-%%       (RFC 8446 §4.4.2.4). A client that sends no certificate still
+%%       (RFC 9846 §4.5.1.3). A client that sends no certificate still
 %%       connects. `false' or `verify_none' (the default) requests none.</li>
 %%   <li>`cacerts' - Trust anchors (list of DER CA certs) for validating a
 %%       client certificate. Required, or `cacertfile', when `verify' or
@@ -918,7 +918,7 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %%   <li>`signature_algs' - accepted/advertised signature schemes; the
 %%       CertificateVerify scheme is the server's first choice the
 %%       client also offered. `rsa_pkcs1_*' is never selected for
-%%       CertificateVerify (RFC 8446 §4.4.3).</li>
+%%       CertificateVerify (RFC 9846 §4.5.2).</li>
 %%   <li>`pool_size' - Number of listener processes (default: 1)</li>
 %%   <li>`connection_handler' -
 %%       `fun((Conn) -> {ok, HandlerPid} | {error, Reason})'.
