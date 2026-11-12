@@ -62,9 +62,6 @@ init([]) ->
         period => 10
     },
 
-    %% Get distribution options for NAT support
-    DistOpts = application:get_env(quic, dist, []),
-
     Children = [
         #{
             id => quic_server_registry,
@@ -108,7 +105,8 @@ init([]) ->
         },
         #{
             id => quic_dist_sup,
-            start => {quic_dist_sup, start_link, [DistOpts]},
+            %% No options: the dist settings hold keys and PSKs.
+            start => {quic_dist_sup, start_link, []},
             restart => permanent,
             shutdown => infinity,
             type => supervisor,

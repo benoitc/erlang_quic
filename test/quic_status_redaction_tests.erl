@@ -200,6 +200,86 @@ dist_tickets_message_redacted_test() ->
     assert_absent([Ticket#session_ticket.resumption_secret], Status),
     ?assert(contains(Status, redacted)).
 
+%%====================================================================
+%% Distribution controller holding a session ticket
+%%====================================================================
+
+dist_controller_status_has_no_ticket_secret_test() ->
+    {Conn, Ctrl, Ticket} = dist_controller_with_ticket(),
+    Secret = Ticket#session_ticket.resumption_secret,
+    try
+        ?assert(contains_secret(sys:get_state(Ctrl), Secret)),
+        Status = sys:get_status(Ctrl),
+        assert_absent([Secret], Status),
+        ?assert(contains(Status, redacted))
+    after
+        gen_statem:stop(Ctrl),
+        Conn ! stop
+    end.
+
+dist_controller_crash_report_has_no_ticket_secret_test() ->
+    {Conn, Ctrl, Ticket} = dist_controller_with_ticket(),
+    Secret = Ticket#session_ticket.resumption_secret,
+    ?assert(contains_secret(sys:get_state(Ctrl), Secret)),
+    Events = captured(fun() ->
+        MRef = erlang:monitor(process, Ctrl),
+        sys:terminate(Ctrl, redaction_test),
+        receive
+            {'DOWN', MRef, process, Ctrl, _} -> ok
+        after ?TIMEOUT -> error(controller_alive)
+        end,
+        timer:sleep(200)
+    end),
+    Conn ! stop,
+    Labels = [L || #{msg := {report, #{label := L}}} <- Events],
+    ?assert(lists:member({gen_statem, terminate}, Labels)),
+    assert_absent([Secret], Events).
+
+dist_controller_queued_ticket_redacted_test() ->
+    Ticket = ticket(),
+    Status = quic_dist_controller:format_status(#{
+        state => connected,
+        data => {state, self()},
+        reason => normal,
+        queue => [{info, {quic, self(), {session_ticket, Ticket}}}],
+        postponed => [{info, {quic, self(), {session_ticket, Ticket}}}],
+        timeouts => [],
+        log => []
+    }),
+    assert_absent([Ticket#session_ticket.resumption_secret], Status),
+    ?assert(contains(Status, redacted)).
+
+%%====================================================================
+%% Dist settings are not kept in a supervisor
+%%====================================================================
+
+dist_settings_not_in_supervisor_status_test_() ->
+    {timeout, 30, fun dist_settings_not_in_supervisor_status/0}.
+
+dist_settings_not_in_supervisor_status() ->
+    [Psk, Ext, Lb] = [secret() || _ <- lists:seq(1, 3)],
+    Key = public_key:generate_key({namedCurve, secp256r1}),
+    Secrets = [Key#'ECPrivateKey'.privateKey, Psk, Ext, Lb],
+    Saved = application:get_env(quic, dist),
+    ok = application:stop(quic),
+    ok = application:set_env(quic, dist, [
+        {key, Key}, {psks, #{?PSK_ID => Psk}}, {external_psk, {?PSK_ID, Ext}}, {lb_key, Lb}
+    ]),
+    try
+        {ok, _} = application:ensure_all_started(quic),
+        lists:foreach(
+            fun(Name) -> assert_absent(Secrets, sys:get_status(whereis(Name))) end,
+            [quic_sup, quic_dist_sup]
+        )
+    after
+        ok = application:stop(quic),
+        case Saved of
+            {ok, Value} -> application:set_env(quic, dist, Value);
+            undefined -> application:unset_env(quic, dist)
+        end,
+        {ok, _} = application:ensure_all_started(quic)
+    end.
+
 %% Secrets nested in records and option maps anywhere in a term.
 nested_secrets_redacted_test() ->
     [Lb, Reset, Token, Psk, Ext] = [secret() || _ <- lists:seq(1, 5)],
@@ -220,6 +300,35 @@ nested_secrets_redacted_test() ->
 %%====================================================================
 %% Helpers
 %%====================================================================
+
+%% A server-role controller over a connection stub, holding a ticket
+%% the connection delivered.
+dist_controller_with_ticket() ->
+    Conn = spawn(fun conn_stub/0),
+    {ok, Ctrl} = quic_dist_controller:start_link(Conn, server, undefined),
+    true = unlink(Ctrl),
+    Ticket = ticket(),
+    Ctrl ! {quic, Conn, {session_ticket, Ticket}},
+    {Conn, Ctrl, Ticket}.
+
+%% Answers the calls a controller makes at startup.
+conn_stub() ->
+    receive
+        {'$gen_call', From, open_stream} ->
+            gen_statem:reply(From, {ok, 0}),
+            conn_stub();
+        {'$gen_call', From, _} ->
+            gen_statem:reply(From, ok),
+            conn_stub();
+        stop ->
+            ok;
+        _ ->
+            conn_stub()
+    end.
+
+contains_secret(Term, Secret) ->
+    Text = lists:flatten(io_lib:format("~w", [Term])),
+    string:find(Text, lists:flatten(io_lib:format("~w", [Secret]))) =/= nomatch.
 
 sup_sup(Sup) ->
     {quic_listener_sup_sup, Pid, _, _} =

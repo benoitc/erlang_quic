@@ -88,7 +88,8 @@
     init/1,
     callback_mode/0,
     terminate/3,
-    code_change/4
+    code_change/4,
+    format_status/1
 ]).
 
 %% State functions
@@ -508,6 +509,18 @@ terminate(_Reason, _StateName, #state{
 
 code_change(_OldVsn, StateName, State, _Extra) ->
     {ok, StateName, State}.
+
+%% Crash reports and sys:get_status/1 show no session ticket or secret.
+-spec format_status(gen_statem:format_status()) -> gen_statem:format_status().
+format_status(Status) ->
+    quic_redact:status(
+        maps:map(fun redact_status_data/2, Status), [data, queue, postponed, log]
+    ).
+
+redact_status_data(data, #state{} = State) ->
+    quic_redact:fields(State, [#state.session_ticket]);
+redact_status_data(_Key, Value) ->
+    Value.
 
 %%====================================================================
 %% State: init_state
