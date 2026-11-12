@@ -16,6 +16,7 @@
 -include("quic.hrl").
 
 -export([term/1, value/1, fields/2, status/2, seal/1, open/1]).
+-export([install_log_filter/0, remove_log_filter/0, log_filter/2]).
 -export_type([sealed/0]).
 
 %% Options passed as a supervisor child argument: printed as #Fun<...>.
@@ -133,3 +134,125 @@ tuple(T) when tuple_size(T) > 0 ->
     end;
 tuple(T) ->
     T.
+
+%%====================================================================
+%% Crash report filter
+%%====================================================================
+
+%% format_status/1 never sees the stack trace of a crash, which holds the
+%% arguments of the failing call (often the whole state), nor proc_lib's
+%% mailbox and dictionary. This primary logger filter covers them.
+
+%% @doc Add the crash report filter to the logger primary config.
+-spec install_log_filter() -> ok.
+install_log_filter() ->
+    try logger:add_primary_filter(?MODULE, {fun ?MODULE:log_filter/2, []}) of
+        _ -> ok
+    catch
+        _:_ -> ok
+    end.
+
+%% @doc Remove the crash report filter.
+-spec remove_log_filter() -> ok.
+remove_log_filter() ->
+    _ = logger:remove_primary_filter(?MODULE),
+    ok.
+
+%% @doc In crash, terminate and supervisor reports, drop the arguments of
+%% quic stack frames. From a quic process, also drop every frame's
+%% arguments and redact its state and secrets anywhere in the report.
+-spec log_filter(logger:log_event(), term()) -> logger:log_event().
+log_filter(#{msg := {report, #{label := Label} = Report}} = Event, _Extra) ->
+    case is_crash_label(Label) of
+        true -> Event#{msg := {report, crash_report(Report)}};
+        false -> Event
+    end;
+log_filter(Event, _Extra) ->
+    Event.
+
+is_crash_label({gen_statem, terminate}) -> true;
+is_crash_label({gen_server, terminate}) -> true;
+is_crash_label({proc_lib, crash}) -> true;
+is_crash_label({supervisor, _}) -> true;
+is_crash_label(_) -> false.
+
+%% The filter runs in the process that logs: the one that crashed, or
+%% the supervisor reporting its child.
+crash_report(Report) ->
+    case get('$initial_call') of
+        {Mod, _, _} when is_atom(Mod) ->
+            case is_quic_module(Mod) of
+                true -> maps:map(fun own_entry/2, frames(all, Report));
+                false -> frames(quic, Report)
+            end;
+        _ ->
+            frames(quic, Report)
+    end.
+
+is_quic_module(Mod) ->
+    case atom_to_binary(Mod) of
+        <<"quic", _/binary>> -> true;
+        _ -> false
+    end.
+
+%% Stack frames {M, F, Args, Location} get the arity instead of Args.
+frames(Scope, L) when is_list(L) ->
+    case is_stacktrace(L) of
+        true -> [frame(Scope, F) || F <- L];
+        false -> frames_list(Scope, L)
+    end;
+frames(Scope, T) when is_tuple(T) ->
+    list_to_tuple(frames_list(Scope, tuple_to_list(T)));
+frames(Scope, M) when is_map(M) ->
+    maps:map(fun(_K, V) -> frames(Scope, V) end, M);
+frames(_Scope, T) ->
+    T.
+
+frames_list(Scope, [H | T]) -> [frames(Scope, H) | frames_list(Scope, T)];
+frames_list(_Scope, []) -> [];
+frames_list(Scope, T) -> frames(Scope, T).
+
+is_stacktrace([_ | _] = L) ->
+    try
+        lists:all(fun is_frame/1, L)
+    catch
+        _:_ -> false
+    end;
+is_stacktrace(_) ->
+    false.
+
+is_frame({M, F, A, Loc}) when is_atom(M), is_atom(F), is_list(Loc) ->
+    is_list(A) orelse is_integer(A);
+is_frame(_) ->
+    false.
+
+frame(all, {M, F, Args, Loc}) when is_list(Args) ->
+    {M, F, length(Args), Loc};
+frame(quic, {M, F, Args, Loc} = Frame) when is_list(Args) ->
+    case is_quic_module(M) of
+        true -> {M, F, length(Args), Loc};
+        false -> Frame
+    end;
+frame(_Scope, Frame) ->
+    Frame.
+
+%% The report's `state' was formatted by format_status/1. Any other copy
+%% of a process state (a `state' record), in a reason, a message or a
+%% child report, is dropped.
+own_entry(state, V) -> term(V);
+own_entry(_K, V) -> term(states(V)).
+
+states(T) when is_tuple(T), tuple_size(T) > 1, element(1, T) =:= state ->
+    ?REDACTED;
+states(T) when is_tuple(T) ->
+    list_to_tuple(states_list(tuple_to_list(T)));
+states(L) when is_list(L) ->
+    states_list(L);
+states(M) when is_map(M) ->
+    maps:map(fun(_K, V) -> states(V) end, M);
+states(T) ->
+    T.
+
+states_list([H | T]) -> [states(H) | states_list(T)];
+states_list([]) -> [];
+states_list(T) -> states(T).

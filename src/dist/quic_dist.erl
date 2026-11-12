@@ -392,6 +392,8 @@ ensure_quic_minimal() ->
         {module, crypto} ->
             %% Create discovery ETS table if it doesn't exist
             ensure_discovery_table(),
+            %% Keep secrets out of crash reports before the app starts.
+            ok = quic_redact:install_log_filter(),
             %% Mark that we're in early boot mode
             put(quic_dist_early_boot, true),
             ok;

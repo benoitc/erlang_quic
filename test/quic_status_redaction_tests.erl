@@ -47,6 +47,101 @@ tls_alert_crash_report_has_no_secret() ->
     end).
 
 %%====================================================================
+%% Stack traces: format_status/1 never sees them
+%%====================================================================
+
+%% A quic process that crashes with function_clause on its state, under a
+%% supervisor, while a caller outside erlang_quic waits on it: the
+%% terminate, crash and supervisor reports, and the caller's crash
+%% report, show neither the state nor its secrets.
+crash_stack_trace_has_no_secret_test_() ->
+    {timeout, 30, fun crash_stack_trace_has_no_secret/0}.
+
+crash_stack_trace_has_no_secret() ->
+    process_flag(trap_exit, true),
+    with_connection(fun([Client | _], _ServerSecrets) ->
+        {_, State} = sys:get_state(Client),
+        Secrets = state_secrets(State),
+        Events = captured(fun() ->
+            {ok, Sup} = quic_redaction_crasher:start_sup(State),
+            [{crasher, Pid, worker, _}] = supervisor:which_children(Sup),
+            Caller = proc_lib:spawn(erlang, apply, [fun gen_statem:call/2, [Pid, crash]]),
+            Ref = monitor(process, Caller),
+            receive
+                {'DOWN', Ref, process, Caller, _} -> ok
+            after ?TIMEOUT -> error(caller_alive)
+            end,
+            timer:sleep(200),
+            unlink(Sup),
+            exit(Sup, shutdown)
+        end),
+        Labels = [L || #{msg := {report, #{label := L}}} <- Events],
+        ?assert(lists:member({gen_statem, terminate}, Labels)),
+        ?assert(lists:member({supervisor, child_terminated}, Labels)),
+        ?assertEqual(2, length([L || {proc_lib, crash} = L <- Labels])),
+        ?assert(contains(Events, function_clause)),
+        assert_absent(Secrets, Events)
+    end).
+
+%% Outside a quic process only quic frames lose their arguments.
+log_filter_other_process_test() ->
+    Secret = secret(),
+    Stack = [{quic_connection, f, [Secret], [{line, 1}]}, {lists, map, [x, [y]], []}],
+    Event = report({gen_server, terminate}, #{reason => {function_clause, Stack}}),
+    #{msg := {report, #{reason := {function_clause, Out}}}} = quic_redact:log_filter(Event, []),
+    ?assertEqual([{quic_connection, f, 1, [{line, 1}]}, {lists, map, [x, [y]], []}], Out).
+
+%% In a quic process every frame loses its arguments, and secrets and
+%% copies of a state are dropped, except the formatted `state'.
+log_filter_quic_process_test() ->
+    Secret = secret(),
+    Stack = [{lists, foldl, [Secret, #state{}, []], []}],
+    Report = #{
+        reason => {error, {badmatch, #state{}}, Stack},
+        queue => [{cast, #{key => Secret}}],
+        state => {connected, kept}
+    },
+    Out = in_quic_process(fun() ->
+        quic_redact:log_filter(report({gen_statem, terminate}, Report), [])
+    end),
+    #{msg := {report, #{reason := Reason, queue := Queue, state := St}}} = Out,
+    ?assertEqual({error, {badmatch, redacted}, [{lists, foldl, 3, []}]}, Reason),
+    ?assertEqual([{cast, #{key => redacted}}], Queue),
+    ?assertEqual({connected, kept}, St).
+
+log_filter_each_crash_label_test_() ->
+    Secret = secret(),
+    Frames = [{quic_connection, f, [Secret], []}],
+    [
+        ?_assertNot(contains_secret(quic_redact:log_filter(report(L, #{r => Frames}), []), Secret))
+     || L <- [{gen_statem, terminate}, {gen_server, terminate}, {proc_lib, crash}, {supervisor, x}]
+    ].
+
+log_filter_other_events_unchanged_test() ->
+    Secret = secret(),
+    Frames = [{quic_connection, f, [Secret], []}],
+    Events = [
+        report({application_controller, progress}, #{r => Frames}),
+        #{level => error, msg => {string, "x"}, meta => #{}},
+        #{level => error, msg => {"~p", [Frames]}, meta => #{}}
+    ],
+    [?assertEqual(E, quic_redact:log_filter(E, [])) || E <- Events].
+
+report(Label, Report) ->
+    #{level => error, msg => {report, Report#{label => Label}}, meta => #{}}.
+
+in_quic_process(F) ->
+    Self = self(),
+    Pid = spawn(fun() ->
+        put('$initial_call', {quic_connection, init, 1}),
+        Self ! {self(), F()}
+    end),
+    receive
+        {Pid, Result} -> Result
+    after ?TIMEOUT -> error(timeout)
+    end.
+
+%%====================================================================
 %% Live connections and the listener
 %%====================================================================
 

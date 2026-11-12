@@ -28,9 +28,10 @@
 %% Creates the top-level supervision tree for multi-pool server support.
 -spec start(application:start_type(), term()) -> {ok, pid()} | {error, term()}.
 start(_StartType, _StartArgs) ->
+    ok = quic_redact:install_log_filter(),
     quic_sup:start_link().
 
 %% @doc Stop the QUIC application.
 -spec stop(term()) -> ok.
 stop(_State) ->
-    ok.
+    quic_redact:remove_log_filter().
