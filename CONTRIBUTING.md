@@ -78,7 +78,7 @@ enough to get it on the list.
 
 ## Set up
 
-You need Erlang/OTP 27 or later and rebar3. Nothing else is required to build: the library has no dependencies.
+You need Erlang/OTP 27 or later and rebar3. Nothing else is required to build: the only dependency is idna (pure Erlang, no dependencies of its own), which rebar3 fetches.
 
 ```bash
 git clone --recursive https://github.com/benoitc/erlang_quic.git

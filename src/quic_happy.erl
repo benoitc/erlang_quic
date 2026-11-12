@@ -40,6 +40,8 @@ connect(Host, Port, Opts, Owner, Socket) ->
     case parse_host(Host) of
         {literal, IP} ->
             direct(IP, Port, Opts, Owner, Socket);
+        {error, _} = Error ->
+            Error;
         {name, Name} ->
             Family = maps:get(family, Opts, any),
             Opts1 = with_sni(Opts, Name),
@@ -284,18 +286,19 @@ finish(#{caller := Caller}, Result) ->
 %% Resolution helpers
 %%====================================================================
 
-%% @doc Classify a host: a (possibly bracketed) IP literal or a name.
+%% @doc Classify a host: an IP literal, bracketed or not, or a name.
+%% Brackets around anything but an IP literal are refused.
 -spec parse_host(inet:ip_address() | binary() | string()) ->
-    {literal, inet:ip_address()} | {name, string()}.
+    {literal, inet:ip_address()} | {name, string()} | {error, einval}.
 parse_host(IP) when is_tuple(IP) ->
     {literal, IP};
 parse_host(Host) when is_binary(Host) ->
     parse_host(binary_to_list(Host));
 parse_host(Host) when is_list(Host) ->
-    Stripped = strip_brackets(Host),
-    case inet:parse_address(Stripped) of
+    case quic_cert:host_address(Host) of
         {ok, IP} -> {literal, IP};
-        {error, _} -> {name, Stripped}
+        error when hd(Host) =:= $[ -> {error, einval};
+        error -> {name, Host}
     end.
 
 resolve_single(Name, inet) ->
@@ -342,11 +345,3 @@ with_sni(Opts, Name) ->
         true -> Opts;
         false -> Opts#{server_name => list_to_binary(Name)}
     end.
-
-strip_brackets([$[ | Rest]) ->
-    case lists:reverse(Rest) of
-        [$] | RevInner] -> lists:reverse(RevInner);
-        _ -> [$[ | Rest]
-    end;
-strip_brackets(Host) ->
-    Host.

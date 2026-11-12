@@ -59,7 +59,7 @@ start_server(Name, Port, Opts) when is_atom(Name), is_integer(Port), is_map(Opts
             ServerOpts = Opts#{name => Name},
             ChildSpec = #{
                 id => Name,
-                start => {quic_listener_sup, start_link, [Port, ServerOpts]},
+                start => {quic_listener_sup, start_link, [Port, quic_redact:seal(ServerOpts)]},
                 restart => permanent,
                 shutdown => infinity,
                 type => supervisor,
@@ -103,7 +103,7 @@ stop_server(Name) when is_atom(Name) ->
 server_spec(Name, Port, Opts) when is_atom(Name), is_integer(Port), is_map(Opts) ->
     #{
         id => Name,
-        start => {quic_listener_sup, start_link, [Port, Opts]},
+        start => {quic_listener_sup, start_link, [Port, quic_redact:seal(Opts)]},
         restart => permanent,
         shutdown => infinity,
         type => supervisor,

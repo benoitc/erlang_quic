@@ -126,6 +126,13 @@ if [[ ! -d "$EBIN" ]]; then
     exit 2
 fi
 
+# idna, quic's dependency, sits next to quic in a build or a release.
+if [[ -z "${IDNA_EBIN:-}" ]]; then
+    for d in "$QUIC_DIR"/../idna*/ebin; do
+        [[ -d "$d" ]] && IDNA_EBIN="$d" && break
+    done
+fi
+
 if [[ "$NAME_FLAG" == "-sname" ]]; then
     : "${NAME:=quic_call_$$}"
 else
@@ -148,6 +155,10 @@ ERL_ARGS=(
     -pa "$EBIN"
     -noinput
 )
+
+if [[ -n "${IDNA_EBIN:-}" ]]; then
+    ERL_ARGS+=( -pa "$IDNA_EBIN" )
+fi
 
 if [[ -n "$CONFIG" ]]; then
     ERL_ARGS+=( -config "$CONFIG" )

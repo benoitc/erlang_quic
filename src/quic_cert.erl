@@ -5,7 +5,7 @@
 %%% Performs the two checks RFC 9846 requires of a client after it
 %%% receives the server's Certificate message: chain validation against
 %%% a set of trust anchors (§4.5.1.3) and identity (hostname) matching
-%%% (RFC 6125). Signature verification of CertificateVerify is handled
+%%% (RFC 9525). Signature verification of CertificateVerify is handled
 %%% in `quic_tls:verify_certificate_verify/4'; this module covers the
 %%% chain and the name.
 
@@ -14,7 +14,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -export([validate_server/4, validate_client/3, cacerts_from_file/1, resolve_cacerts/1]).
--export([requests_client_cert/1, check_client_auth/1]).
+-export([requests_client_cert/1, check_client_auth/1, host_address/1, dns_name/1]).
 
 -define(MAX_PATH_LENGTH, 10).
 
@@ -243,24 +243,181 @@ is_issuer(Cert, Anchor) ->
 verify_hostname(_Leaf, undefined) ->
     ok;
 verify_hostname(Leaf, ServerName) when is_binary(ServerName) ->
-    Host = binary_to_list(ServerName),
     RefId =
-        case inet:parse_address(Host) of
+        case host_address(ServerName) of
             {ok, IP} -> {ip, IP};
-            {error, _} -> {dns_id, Host}
+            error -> dns_reference(ServerName)
         end,
-    case safe_verify_hostname(Leaf, RefId) of
+    case (RefId =/= error) andalso has_san_id(Leaf) andalso safe_verify_hostname(Leaf, RefId) of
         true -> ok;
         false -> {error, {hostname_mismatch, ServerName}}
     end.
 
-%% The `https' match fun applies the RFC 6125 §6.4.3 wildcard rules, which
-%% OTP's default match fun leaves out: without it a leftmost-label wildcard
-%% (`*.example.com') never matches, so wildcard-only servers are rejected.
-safe_verify_hostname(Leaf, RefId) ->
-    try
-        MatchFun = public_key:pkix_verify_hostname_match_fun(https),
-        public_key:pkix_verify_hostname(Leaf, [RefId], [{match_fun, MatchFun}])
+%% RFC 9525 Section 6.3: a reference name is matched in its A-label
+%% form. A name that is not a valid host name matches nothing.
+dns_reference(ServerName) ->
+    case dns_name(ServerName) of
+        {ok, Name} -> {dns_id, binary_to_list(Name)};
+        error -> error
+    end.
+
+%% @doc A host name as matched against certificates and sent as SNI:
+%% without a trailing dot, internationalized labels as A-labels (UTS 46
+%% mapping, STD3 rules). `error' when the result is not a host name
+%% (labels of 1 to 63 letters, digits, `-' or `_', at most 253 octets)
+%% or is an IP address.
+-spec dns_name(binary()) -> {ok, binary()} | error.
+dns_name(ServerName) when is_binary(ServerName) ->
+    case unicode:characters_to_list(ServerName) of
+        Name0 when is_list(Name0) ->
+            Name = drop_trailing_dot(Name0),
+            Encoded =
+                case is_ascii(Name) of
+                    true -> {ok, Name};
+                    false -> encode_idn(Name)
+                end,
+            case Encoded of
+                {ok, Ascii} ->
+                    case is_host_name(Ascii) of
+                        true -> {ok, list_to_binary(Ascii)};
+                        false -> error
+                    end;
+                error ->
+                    error
+            end;
+        _ ->
+            error
+    end.
+
+drop_trailing_dot(Name) ->
+    case lists:reverse(Name) of
+        [$. | Rest] -> lists:reverse(Rest);
+        _ -> Name
+    end.
+
+encode_idn(Name) ->
+    try idna:encode(Name, [uts46, {std3_rules, true}]) of
+        ALabels when is_list(ALabels) -> {ok, ALabels}
+    catch
+        _:_ -> error
+    end.
+
+%% An address with a trailing dot ("127.0.0.1.") is not a host name.
+is_host_name(Name) ->
+    length(Name) =< 253 andalso
+        lists:all(fun is_host_label/1, string:split(Name, ".", all)) andalso
+        host_address(Name) =:= error.
+
+is_host_label(Label) ->
+    Label =/= [] andalso length(Label) =< 63 andalso lists:all(fun is_label_char/1, Label).
+
+is_label_char(C) when C >= $a, C =< $z -> true;
+is_label_char(C) when C >= $A, C =< $Z -> true;
+is_label_char(C) when C >= $0, C =< $9 -> true;
+is_label_char($-) -> true;
+is_label_char($_) -> true;
+is_label_char(_) -> false.
+
+is_ascii(Name) ->
+    lists:all(fun(C) -> is_integer(C) andalso C >= 0 andalso C < 128 end, Name).
+
+%% @doc The address a host or server name gives as an IP literal, bare
+%% or in brackets (`[::1]'), with or without an IPv6 zone ID; `error'
+%% for a hostname.
+-spec host_address(binary() | string()) -> {ok, inet:ip_address()} | error.
+host_address(Host) when is_binary(Host) ->
+    host_address(binary_to_list(Host));
+host_address(Host) when is_list(Host) ->
+    Literal = strip_brackets(Host),
+    case inet:parse_address(Literal) of
+        {ok, IP} -> {ok, IP};
+        {error, _} -> zoned_ipv6_address(Literal)
+    end.
+
+%% inet:parse_address/1 takes a zone ID on link-local addresses only.
+zoned_ipv6_address(Literal) ->
+    case string:split(Literal, "%") of
+        [Addr, [_ | _]] ->
+            case inet:parse_ipv6strict_address(Addr) of
+                {ok, IP} -> {ok, IP};
+                {error, _} -> error
+            end;
+        _ ->
+            error
+    end.
+
+strip_brackets([$[ | Rest]) ->
+    case lists:reverse(Rest) of
+        [$] | RevInner] -> lists:reverse(RevInner);
+        _ -> [$[ | Rest]
+    end;
+strip_brackets(Host) ->
+    Host.
+
+%% RFC 9525 Section 2: the subject CN never identifies a service, so a
+%% leaf without a DNS-ID or IP-ID in subjectAltName matches no name.
+has_san_id(Leaf) ->
+    try public_key:pkix_decode_cert(Leaf, otp) of
+        #'OTPCertificate'{tbsCertificate = #'OTPTBSCertificate'{extensions = Exts}} ->
+            lists:any(fun is_san_id/1, san_entries(Exts))
     catch
         _:_ -> false
     end.
+
+san_entries(Exts) when is_list(Exts) ->
+    case lists:keyfind(?'id-ce-subjectAltName', #'Extension'.extnID, Exts) of
+        #'Extension'{extnValue = Names} when is_list(Names) -> Names;
+        _ -> []
+    end;
+san_entries(_) ->
+    [].
+
+is_san_id({dNSName, _}) -> true;
+is_san_id({iPAddress, _}) -> true;
+is_san_id(_) -> false.
+
+safe_verify_hostname(Leaf, RefId) ->
+    try
+        public_key:pkix_verify_hostname(Leaf, [RefId], [{match_fun, fun match_id/2}])
+    catch
+        _:_ -> false
+    end.
+
+%% DNS-IDs follow RFC 9525 Section 6.3; IP-IDs use OTP's octet-exact
+%% comparison (Section 6.4); nothing else matches.
+match_id({dns_id, Ref}, {dNSName, Presented}) ->
+    match_dns_id(Ref, Presented);
+match_id({ip, _}, {iPAddress, _}) ->
+    default;
+match_id(_, _) ->
+    false.
+
+match_dns_id(Ref, Presented) when is_list(Ref), is_list(Presented) ->
+    is_ascii(Presented) andalso match_ascii_dns_id(Ref, Presented);
+match_dns_id(_, _) ->
+    false.
+
+match_ascii_dns_id(Ref, Presented) ->
+    RefLabels = string:split(lower_ascii(Ref), ".", all),
+    case string:split(lower_ascii(Presented), ".", all) of
+        ["*" | Rest] ->
+            match_wildcard(RefLabels, Rest);
+        Labels ->
+            not lists:member($*, Presented) andalso Labels =:= RefLabels
+    end.
+
+%% A wildcard is the whole leftmost label and stands for exactly one
+%% non-empty label of the reference identifier; a bare `*' names no domain.
+match_wildcard(_RefLabels, []) ->
+    false;
+match_wildcard([First | RefRest], Rest) ->
+    First =/= "" andalso
+        not lists:member($*, First) andalso
+        not lists:member($*, lists:append(Rest)) andalso
+        RefRest =:= Rest.
+
+lower_ascii(S) ->
+    [lower_char(C) || C <- S].
+
+lower_char(C) when C >= $A, C =< $Z -> C + ($a - $A);
+lower_char(C) -> C.

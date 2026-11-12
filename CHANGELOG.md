@@ -4,6 +4,62 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- The client accepted a server certificate whose names RFC 9525 does not
+  allow to match the host: a wildcard that was only part of a label (such
+  as `f*o.example.com`), sat inside an `xn--` label, or was a lone `*`;
+  and, on OTP 27 and 28, a certificate with no subjectAltName whose
+  subject common name matched the host. These certificates are now
+  rejected as a hostname mismatch. Only the DNS and IP subjectAltName
+  entries are matched, and a wildcard counts only as the whole leftmost
+  label, standing for one label (RFC 9525 Sections 2, 6.3 and 6.4). An
+  internationalized host name is converted to A-labels, with UTS 46
+  mapping, before it is matched; a name that cannot be converted
+  matches no certificate. A server name that is not a valid host name,
+  such as one with brackets, a port or an empty label, matches no
+  certificate and is not sent as SNI.
+- A client that connected to an IP address, with verification on and no
+  `server_name`, did not check the server certificate's name: any
+  certificate that chained to the trust anchors was accepted. The
+  address is now checked against the certificate's IP subjectAltName
+  entries (RFC 9525 Section 6.4), and it is no longer sent as SNI
+  (RFC 6066 Section 3), including when given as `server_name`. An IPv6
+  address in brackets, such as `[::1]`, or with a zone ID counts as the
+  address, whether given as the host, as `server_name` or through
+  `quic_h3:connect`. A host in brackets that is not an IP address, such
+  as `[localhost]`, is refused with `{error, einval}` instead of being
+  dialled without its brackets. A hostname, as the host or as
+  `server_name`, works as before.
+- Crash reports, supervisor reports and `sys:get_status/1` printed
+  private keys, PSKs, TLS secrets, packet protection keys, session
+  ticket secrets, QUIC-LB keys and stateless reset secrets and tokens.
+  These are no longer shown for connections, listeners, the server
+  registry, HTTP/3 connections, distribution controllers and the
+  distribution ticket store. The server, listener pool, top-level and
+  distribution supervisors no longer keep these options in their state
+  or child specs. The stack trace of a crash could still show them in
+  the arguments of the failing call; erlang_quic now adds a logger
+  filter, `quic_redact`, that removes these arguments from crash,
+  terminate and supervisor reports.
+- With the optional crypto NIF built, a protected 1-RTT packet with an
+  empty payload made the receive path read frames from memory past the
+  decrypted packet. Only the decrypted bytes are read now, so such a
+  packet carries no frames and is rejected.
+- QUIC distribution with `verify_peer` and no CA still started its
+  early-boot listener, which then checked node certificates against the
+  system trust store. That listener now refuses to start, as the
+  supervised one already did. A `cacert` was also ignored when the
+  certificate came from files, and a `cacert_file` when the certificate
+  was given inline; the CA now applies however the certificate is given.
+- QUIC distribution read some malformed security settings as a default:
+  an unrecognised `verify` value as `verify_none`, a malformed
+  `auth_callback` or `psk_callback` as no callback, and a setting
+  repeated on the command line as unset. A malformed setting, a
+  repeated or unknown `-quic_dist` setting, or a certificate without
+  its key now stops distribution from starting, and connection setup,
+  with `{bad_config, Reason}`. One `-quic_dist` flag can now carry
+  several settings.
+
 ### Added
 - An auth callback can return `{ok, {authenticated_node, Node}}`;
   quic_dist then refuses a peer whose dist node name differs from the
@@ -21,6 +77,8 @@ All notable changes to this project will be documented in this file.
   `quic_h3:start_server/3`.
 
 ### Changed
+- erlang_quic now depends on idna, used to compare internationalized
+  host names with certificates.
 - The default `pool_size` now runs one listener, as documented. It ran
   two on Linux. Set `pool_size => 2` for the old behaviour.
 - A `connection_handler` that returns `{error, Reason}` now declines the
@@ -71,6 +129,11 @@ All notable changes to this project will be documented in this file.
 - TLS now follows RFC 9846, which obsoletes RFC 8446.
 
 ### Fixed
+- A client connecting to an internationalized host name sent it in
+  Server Name Indication as UTF-8, which servers do not match. It is now
+  sent as A-labels, and a name that is not a valid IDN is not sent
+  (RFC 6066 Section 3). A trailing dot is no longer sent, and a name
+  with one now matches a certificate for the same name without it.
 - A peer that sent a packet within each idle period kept a handshake open
   for ever, holding a connection and a `max_connections` slot. A
   handshake that has not completed within the idle timeout from its

@@ -121,6 +121,25 @@ On `socket_backend => socket` + Linux with UDP_SEGMENT support,
 plus `backend`, `gso_supported`, `gso_size`, `gro_enabled`, and
 `max_batch_packets`.
 
+### Crash reports
+
+Crash reports and `sys:get_status/1` of erlang_quic processes show no
+private key, PSK, traffic secret or session ticket. Status and the
+process state go through `format_status/1`. The stack trace of a crash
+can still carry the failing call's arguments, so when the `quic`
+application starts (or QUIC distribution starts before it), erlang_quic
+adds a primary logger filter, `quic_redact`. It drops the arguments of
+erlang_quic stack frames in crash, terminate and supervisor reports, and
+in reports from its own processes drops every frame's arguments and the
+secrets in the reason and mailbox.
+
+The filter stays out of other log events. Removing it brings back the
+arguments, and with them the secrets they hold:
+
+```erlang
+logger:remove_primary_filter(quic_redact).
+```
+
 ## Loading Certificates
 
 ### From PEM Files

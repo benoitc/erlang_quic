@@ -162,3 +162,67 @@ open_run_chacha_matches_sequential_test() ->
         ?assertEqual(lists:seq(100, 105), [PN || {PN, _FB, _P} <- Batch]),
         ?assertEqual(Payloads, [P || {_PN, _FB, {raw, P}} <- Batch])
     end).
+
+%% A 1-RTT packet with a valid tag and no plaintext: the in-NIF frame
+%% parser must see zero bytes, so open_run hands back {raw, <<>>} and
+%% the Erlang decoder rejects the frameless packet.
+open_run_empty_payload_test_() ->
+    [
+        {atom_to_list(Cipher), fun() -> with_nif(fun() -> empty_payload_check(Cipher) end) end}
+     || Cipher <- [aes_128_gcm, aes_256_gcm, chacha20_poly1305]
+    ].
+
+empty_payload_check(Cipher) ->
+    {Key, HP} = empty_keys(Cipher),
+    DCID = binary:copy(<<16#5a>>, 20),
+    Packet = seal_empty(Cipher, Key, HP, DCID, 0),
+    lists:foreach(
+        fun(N) ->
+            %% Vary what sits in the free heap past the plaintext, so a
+            %% read beyond it would decode those bytes as frames.
+            Junk = [list_to_binary(lists:duplicate(64, 1)) || _ <- lists:seq(1, N)],
+            _ = erlang:phash2(Junk),
+            ?assertEqual(
+                {ok, [{0, 16#43, {raw, <<>>}}]},
+                quic_aead_ctx:open_run(
+                    Cipher, Key, ?IV, HP, undefined, 0, byte_size(DCID), [Packet]
+                )
+            ),
+            <<Header:21/binary, Payload/binary>> = Packet,
+            ?assertEqual(
+                {ok, 0, 16#43, <<>>},
+                quic_aead_ctx:open_packet(Cipher, Key, ?IV, HP, undefined, 0, Header, Payload)
+            )
+        end,
+        lists:seq(0, 3000, 7)
+    ).
+
+empty_keys(aes_128_gcm) -> {?KEY, ?HP};
+empty_keys(_) -> {<<0:256>>, <<16#aa:8, 0:248>>}.
+
+%% Short header with a 4-byte packet number, sealed with OTP crypto
+%% over an empty plaintext: the payload is the PN and the tag only.
+seal_empty(Cipher, Key, HP, DCID, PN) ->
+    FB = 16#43,
+    Header = <<FB, DCID/binary, PN:32>>,
+    <<IVHi:4/binary, IVLo:64>> = ?IV,
+    Nonce = <<IVHi/binary, (IVLo bxor PN):64>>,
+    {<<>>, Tag} = crypto:crypto_one_time_aead(Cipher, Key, Nonce, <<>>, Header, true),
+    <<M0, M1, M2, M3, M4, _/binary>> = empty_mask(Cipher, HP, Tag),
+    <<PN0, PN1, PN2, PN3>> = <<PN:32>>,
+    <<
+        (FB bxor (M0 band 16#1f)),
+        DCID/binary,
+        (PN0 bxor M1),
+        (PN1 bxor M2),
+        (PN2 bxor M3),
+        (PN3 bxor M4),
+        Tag/binary
+    >>.
+
+empty_mask(aes_128_gcm, HP, Sample) ->
+    crypto:crypto_one_time(aes_128_ecb, HP, Sample, true);
+empty_mask(aes_256_gcm, HP, Sample) ->
+    crypto:crypto_one_time(aes_256_ecb, HP, Sample, true);
+empty_mask(chacha20_poly1305, HP, Sample) ->
+    crypto:crypto_one_time(chacha20, HP, Sample, <<0:40>>, true).

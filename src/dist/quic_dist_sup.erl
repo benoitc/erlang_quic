@@ -34,10 +34,11 @@
 start_link() ->
     start_link([]).
 
-%% @doc Start the distribution supervisor with options.
+%% @doc Start the distribution supervisor. `Opts' is ignored, and not
+%% kept: the supervisor state shows in sys:get_status/1.
 -spec start_link(Opts :: proplists:proplist()) -> {ok, pid()} | {error, term()}.
-start_link(Opts) ->
-    supervisor:start_link({local, ?MODULE}, ?MODULE, Opts).
+start_link(_Opts) ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 %%====================================================================
 %% Supervisor callbacks

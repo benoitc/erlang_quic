@@ -32,6 +32,7 @@ run(N, Seed, Cipher) ->
         true ->
             rand:seed(exsplus, {Seed, Seed * 7 + 1, Seed * 13 + 3}),
             {Parsed, Raw, Rejected} = loop(N, Cipher, 0, 0, 0),
+            ok = short_plaintexts(Cipher),
             io:format(
                 "fuzzed ~b packets (~s): parsed=~b raw=~b rejected=~b~n",
                 [N, Cipher, Parsed, Raw, Rejected]
@@ -63,6 +64,37 @@ loop(N, Cipher, P, R, X) ->
         skip ->
             loop(N - 1, Cipher, P, R, X + 1)
     end.
+
+%% protect_run needs four bytes of plaintext, so the shortest packets
+%% (an empty plaintext included) are sealed here with OTP crypto and a
+%% four-byte packet number, which leaves room for the HP sample.
+short_plaintexts(Cipher) ->
+    lists:foreach(
+        fun(Plain) ->
+            {ok, [{0, _FB, {raw, Plain}}]} = quic_aead_ctx:open_run(
+                Cipher, key(Cipher), ?IV, hp(Cipher), undefined, 0, byte_size(?DCID), [
+                    seal_short(Cipher, Plain)
+                ]
+            )
+        end,
+        [<<>>, <<16#1f>>, <<16#1f, 16#1f>>, <<16#1f, 16#1f, 16#1f>>]
+    ).
+
+seal_short(Cipher, Plain) ->
+    FB = ?FB_BASE bor 3,
+    Header = <<FB, ?DCID/binary, 0:32>>,
+    {CT, Tag} = crypto:crypto_one_time_aead(Cipher, key(Cipher), ?IV, Plain, Header, true),
+    Body = <<CT/binary, Tag/binary>>,
+    <<Sample:16/binary, _/binary>> = Body,
+    <<M0, Mask:4/binary, _/binary>> = mask(Cipher, Sample),
+    <<(FB bxor (M0 band 16#1f)), ?DCID/binary, Mask/binary, Body/binary>>.
+
+mask(aes_128_gcm, Sample) ->
+    crypto:crypto_one_time(aes_128_ecb, hp(aes_128_gcm), Sample, true);
+mask(aes_256_gcm, Sample) ->
+    crypto:crypto_one_time(aes_256_ecb, hp(aes_256_gcm), Sample, true);
+mask(chacha20_poly1305, Sample) ->
+    crypto:crypto_one_time(chacha20, hp(chacha20_poly1305), Sample, <<0:40>>, true).
 
 protect(Cipher, Plain) ->
     case

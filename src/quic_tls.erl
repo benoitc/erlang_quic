@@ -394,7 +394,7 @@ build_client_hello_extensions(PubKey, Opts) ->
 
     %% Server Name Indication
     SNI =
-        case ServerName of
+        case sni_host_name(ServerName) of
             undefined ->
                 <<>>;
             Name when is_binary(Name) ->
@@ -453,6 +453,23 @@ build_client_hello_extensions(PubKey, Opts) ->
         PskModes,
         Cookie
     ]).
+
+%% RFC 6066 Section 3: HostName is a DNS host name in ASCII without a
+%% trailing dot. An IP literal, bracketed or not, is not sent; neither
+%% is a name that is not a valid host name.
+sni_host_name(Name) when is_binary(Name) ->
+    case quic_cert:host_address(Name) of
+        {ok, _} -> undefined;
+        error -> sni_dns_name(Name)
+    end;
+sni_host_name(undefined) ->
+    undefined.
+
+sni_dns_name(Name) ->
+    case quic_cert:dns_name(Name) of
+        {ok, HostName} -> HostName;
+        error -> undefined
+    end.
 
 encode_alpn_list(Protocols) ->
     iolist_to_binary([<<(byte_size(P)):8, P/binary>> || P <- Protocols]).

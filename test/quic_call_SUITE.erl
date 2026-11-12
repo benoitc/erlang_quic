@@ -346,6 +346,8 @@ start_target(Config) ->
         "verify_none",
         "-pa",
         EbinDir,
+        "-pa",
+        filename:absname(filename:dirname(code:which(idna))),
         "-noinput",
         "-eval",
         Eval
