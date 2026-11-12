@@ -14,7 +14,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -export([validate_server/4, validate_client/3, cacerts_from_file/1, resolve_cacerts/1]).
--export([requests_client_cert/1, check_client_auth/1, host_address/1]).
+-export([requests_client_cert/1, check_client_auth/1, host_address/1, a_labels/1]).
 
 -define(MAX_PATH_LENGTH, 10).
 
@@ -256,19 +256,29 @@ verify_hostname(Leaf, ServerName) when is_binary(ServerName) ->
 %% RFC 9525 Section 6.3: a reference name is matched in its A-label
 %% form. A name that is not a valid IDN matches nothing.
 dns_reference(ServerName) ->
+    case a_labels(ServerName) of
+        {ok, Name} -> {dns_id, binary_to_list(Name)};
+        error -> error
+    end.
+
+%% @doc A host name in A-label form (UTS 46 mapping, STD3 rules), as
+%% matched against certificates and sent as SNI; an ASCII name is
+%% returned as is. `error' when the name is not a valid IDN.
+-spec a_labels(binary()) -> {ok, binary()} | error.
+a_labels(ServerName) when is_binary(ServerName) ->
     case unicode:characters_to_list(ServerName) of
         Name when is_list(Name) ->
             case is_ascii(Name) of
-                true -> {dns_id, Name};
-                false -> a_label_reference(Name)
+                true -> {ok, ServerName};
+                false -> encode_idn(Name)
             end;
         _ ->
             error
     end.
 
-a_label_reference(Name) ->
+encode_idn(Name) ->
     try idna:encode(Name, [uts46, {std3_rules, true}]) of
-        ALabels when is_list(ALabels) -> {dns_id, ALabels}
+        ALabels when is_list(ALabels) -> {ok, list_to_binary(ALabels)}
     catch
         _:_ -> error
     end.

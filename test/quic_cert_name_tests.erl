@@ -131,6 +131,17 @@ non_ascii_presented_name_refused_test() ->
         mismatch(<<"bücher.example"/utf8>>), check(Ca, Leaf, <<"bücher.example"/utf8>>)
     ).
 
+%% RFC 6066 Section 3: SNI carries the A-label form; a name that is not
+%% a valid IDN is not sent.
+u_label_sni_test_() ->
+    [
+        ?_assertEqual(<<"xn--bcher-kva.example">>, hello_sni(<<"bücher.example"/utf8>>)),
+        ?_assertEqual(<<"xn--bcher-kva.example">>, hello_sni(<<"ｂücher。example"/utf8>>)),
+        ?_assertEqual(<<"foo_bar.example">>, hello_sni(<<"foo_bar.example">>)),
+        ?_assertEqual(undefined, hello_sni(<<"bü cher.example"/utf8>>)),
+        ?_assertEqual(undefined, hello_sni(<<"bücher.example", 255>>))
+    ].
+
 %% ASCII names are matched as before, including labels IDNA rejects.
 ascii_reference_unchanged_test_() ->
     Ca = ca(),
@@ -204,6 +215,14 @@ ip_id_never_by_dns_id_test_() ->
 
 check(#{der := CaDer}, Leaf, Host) ->
     quic_cert:validate_server(Leaf, [], [CaDer], Host).
+
+hello_sni(ServerName) ->
+    {Msg, _, _} = quic_tls:build_client_hello(#{
+        server_name => ServerName, alpn => [<<"h3">>], transport_params => #{}
+    }),
+    <<1, _Len:24, Body/binary>> = Msg,
+    {ok, Info} = quic_tls:parse_client_hello(Body),
+    maps:get(server_name, Info, undefined).
 
 mismatch(Host) ->
     {error, {hostname_mismatch, Host}}.

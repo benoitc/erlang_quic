@@ -122,6 +122,10 @@ All notable changes to this project will be documented in this file.
 - TLS now follows RFC 9846, which obsoletes RFC 8446.
 
 ### Fixed
+- A client connecting to an internationalized host name sent it in
+  Server Name Indication as UTF-8, which servers do not match. It is now
+  sent as A-labels, and a name that is not a valid IDN is not sent
+  (RFC 6066 Section 3).
 - A peer that sent a packet within each idle period kept a handshake open
   for ever, holding a connection and a `max_connections` slot. A
   handshake that has not completed within the idle timeout from its
