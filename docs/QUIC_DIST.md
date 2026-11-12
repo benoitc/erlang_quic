@@ -484,6 +484,26 @@ and when both are set both are trusted. With `verify_peer` a listener
 needs a CA: without one, it does not start and `listen` returns
 `{error, client_auth_needs_cacerts}`.
 
+### Boot Flags and Malformed Settings
+
+You can give `cert`, `key`, `cacert`, `verify`, `auth_callback`,
+`auth_handshake_timeout`, `register_with_epmd` and `psk_callback` on
+the command line, either one per flag or several pairs in one:
+
+```bash
+erl ... -quic_dist_verify verify_peer -quic_dist_cacert /path/to/ca.pem
+erl ... -quic_dist verify verify_peer cacert /path/to/ca.pem
+```
+
+A boot flag wins over the application environment. A setting given
+more than once, in either form, a `-quic_dist` key quic_dist does not
+know, and a malformed value (a `verify` other than `verify_peer` or
+`verify_none`, a callback that is not `Mod:Fun`, `{Mod, Fun}` or a fun
+of the right arity, a `cacert` that is not DER, a certificate without
+its key) all fail `listen` with `{error, {bad_config, Reason}}` and
+connection setup with exit reason `{bad_config, Reason}`, instead of
+falling back to a default.
+
 ### Discovery Settings
 
 | Option | Type | Default | Description |

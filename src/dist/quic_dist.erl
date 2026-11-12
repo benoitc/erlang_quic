@@ -48,6 +48,20 @@
 -include_lib("kernel/include/net_address.hrl").
 -include_lib("kernel/include/logger.hrl").
 
+%% Keys of -quic_dist Key Value boot flags (get_init_arg/2, and "nodes"
+%% for quic_discovery_static).
+-define(QUIC_DIST_ARG_KEYS, [
+    "nodes",
+    "cert",
+    "key",
+    "cacert",
+    "verify",
+    "auth_callback",
+    "auth_handshake_timeout",
+    "register_with_epmd",
+    "psk_callback"
+]).
+
 -define(QUIC_LOG_META, #{
     domain => [erlang_quic, dist], report_cb => fun quic_log:format_report/2
 }).
@@ -196,9 +210,8 @@ listen(Name) ->
 listen(Name, ExtraOpts) ->
     %% Ensure quic application is started - distribution callbacks run
     %% very early, before -eval or application start
-    case ensure_quic_started() of
-        ok ->
-            Config = load_config(),
+    case {ensure_quic_started(), read_config()} of
+        {ok, {ok, Config}} ->
             Port = get_listen_port(),
             case start_quic_server(Name, Port, Config, ExtraOpts) of
                 {ok, ServerName, ActualPort} ->
@@ -223,8 +236,10 @@ listen(Name, ExtraOpts) ->
                 {error, Reason} ->
                     {error, Reason}
             end;
-        {error, Reason} ->
-            {error, Reason}
+        {{error, Reason}, _} ->
+            {error, Reason};
+        {ok, {error, _} = Error} ->
+            Error
     end.
 
 %% @private
@@ -413,19 +428,37 @@ ensure_named_set(Name) ->
     end.
 
 %% @private
+%% The configuration, or `{error, {bad_config, _}}' when a setting is
+%% malformed: a security setting that cannot be read fails rather than
+%% falling back to a default.
+read_config() ->
+    try
+        {ok, load_config()}
+    catch
+        error:{bad_config, _} = Reason -> {error, Reason}
+    end.
+
+%% @private
 %% Load distribution configuration from command-line args and application environment.
-%% Command-line arguments take precedence (using -quic_dist key value format).
+%% Command-line arguments take precedence (-quic_dist_Key Value, or
+%% -quic_dist Key Value ...); raises {bad_config, _} on a malformed value.
 load_config() ->
     %% First check init arguments (command line), then fall back to app env
-    DistOpts = application:get_env(quic, dist, []),
+    DistOpts =
+        case application:get_env(quic, dist, []) of
+            Opts when is_list(Opts); is_map(Opts) -> Opts;
+            Other -> error({bad_config, {dist, Other}})
+        end,
 
-    #quic_dist_config{
-        cert_file = get_init_arg(cert, get_opt(cert_file, DistOpts)),
-        key_file = get_init_arg(key, get_opt(key_file, DistOpts)),
-        cacert_file = get_init_arg(cacert, get_opt(cacert_file, DistOpts)),
-        cert = get_opt(cert, DistOpts),
+    Config = #quic_dist_config{
+        cert_file = validate_path(cert_file, get_init_arg(cert, get_opt(cert_file, DistOpts))),
+        key_file = validate_path(key_file, get_init_arg(key, get_opt(key_file, DistOpts))),
+        cacert_file = validate_path(
+            cacert_file, get_init_arg(cacert, get_opt(cacert_file, DistOpts))
+        ),
+        cert = validate_cert(get_opt(cert, DistOpts)),
         key = get_opt(key, DistOpts),
-        cacert = get_opt(cacert, DistOpts),
+        cacert = validate_cacert(get_opt(cacert, DistOpts)),
         verify = get_verify_opt(get_init_arg(verify, get_opt(verify, DistOpts, verify_none))),
         discovery_module = get_opt(discovery_module, DistOpts, quic_discovery_static),
         nodes = get_opt(nodes, DistOpts, []),
@@ -464,7 +497,52 @@ load_config() ->
             get_init_arg(psk_callback, get_opt(psk_callback, DistOpts))
         ),
         external_psk = validate_external_psk(get_opt(external_psk, DistOpts))
-    }.
+    },
+    validate_pairs(Config).
+
+%% @private
+validate_path(_Key, undefined) ->
+    undefined;
+validate_path(_Key, Path) when is_binary(Path) -> Path;
+validate_path(Key, Path) when is_list(Path) ->
+    case io_lib:printable_unicode_list(Path) of
+        true -> Path;
+        false -> error({bad_config, {Key, Path}})
+    end;
+validate_path(Key, Other) ->
+    error({bad_config, {Key, Other}}).
+
+%% @private
+validate_cert(undefined) -> undefined;
+validate_cert(Der) when is_binary(Der) -> Der;
+validate_cert(Other) -> error({bad_config, {cert, Other}}).
+
+%% @private
+validate_cacert(undefined) ->
+    undefined;
+validate_cacert(Der) when is_binary(Der) ->
+    Der;
+validate_cacert([_ | _] = Ders) ->
+    case lists:all(fun is_binary/1, Ders) of
+        true -> Ders;
+        false -> error({bad_config, {cacert, Ders}})
+    end;
+validate_cacert(Other) ->
+    error({bad_config, {cacert, Other}}).
+
+%% @private
+%% A certificate without its key, or a key without its certificate, is
+%% a mistake rather than a request for another credential source.
+validate_pairs(#quic_dist_config{cert = C, key = K}) when
+    (C =:= undefined) =/= (K =:= undefined)
+->
+    error({bad_config, {cert_and_key, inline_pair_incomplete}});
+validate_pairs(#quic_dist_config{cert_file = C, key_file = K}) when
+    (C =:= undefined) =/= (K =:= undefined)
+->
+    error({bad_config, {cert_and_key, file_pair_incomplete}});
+validate_pairs(Config) ->
+    Config.
 
 %% @private
 validate_psks(undefined) ->
@@ -488,10 +566,13 @@ validate_external_psk(undefined) ->
     undefined;
 validate_external_psk({Id, Secret}) when is_binary(Id), is_binary(Secret) ->
     {Id, Secret};
-validate_external_psk({Id, Secret, Modes}) when
-    is_binary(Id), is_binary(Secret), is_list(Modes), Modes =/= []
+validate_external_psk({Id, Secret, [_ | _] = Modes} = Ext) when
+    is_binary(Id), is_binary(Secret)
 ->
-    {Id, Secret, Modes};
+    case lists:all(fun(M) -> lists:member(M, [psk_dhe_ke, psk_ke]) end, Modes) of
+        true -> {Id, Secret, Modes};
+        false -> error({bad_config, {external_psk, Ext}})
+    end;
 validate_external_psk(Other) ->
     error({bad_config, {external_psk, Other}}).
 
@@ -506,14 +587,9 @@ parse_psk_callback({M, F}) when is_atom(M), is_atom(F) ->
 parse_psk_callback(F) when is_function(F, 1) ->
     F;
 parse_psk_callback(Str) when is_list(Str) ->
-    case string:split(Str, ":") of
-        [M, F] when M =/= "", F =/= "" ->
-            {list_to_atom(M), list_to_atom(F)};
-        _ ->
-            undefined
-    end;
-parse_psk_callback(_) ->
-    undefined.
+    parse_mf(psk_callback, Str);
+parse_psk_callback(Other) ->
+    error({bad_config, {psk_callback, Other}}).
 
 %% @private
 parse_auth_callback(undefined) ->
@@ -523,14 +599,17 @@ parse_auth_callback({M, F}) when is_atom(M), is_atom(F) ->
 parse_auth_callback(F) when is_function(F, 3) ->
     F;
 parse_auth_callback(Str) when is_list(Str) ->
-    case string:split(Str, ":") of
-        [M, F] when M =/= "", F =/= "" ->
-            {list_to_atom(M), list_to_atom(F)};
-        _ ->
-            undefined
-    end;
-parse_auth_callback(_) ->
-    undefined.
+    parse_mf(auth_callback, Str);
+parse_auth_callback(Other) ->
+    error({bad_config, {auth_callback, Other}}).
+
+%% @private
+%% "Module:Function" from vm.args.
+parse_mf(Key, Str) ->
+    case io_lib:printable_unicode_list(Str) andalso string:split(Str, ":", all) of
+        [M, F] when M =/= "", F =/= "" -> {list_to_atom(M), list_to_atom(F)};
+        _ -> error({bad_config, {Key, Str}})
+    end.
 
 %% @private
 parse_timeout(undefined, Default) ->
@@ -560,33 +639,48 @@ parse_bool("false", _) -> false;
 parse_bool(_, Default) -> Default.
 
 %% @private
-%% Get value from init argument -quic_dist_Key Value
+%% Value of -quic_dist_Key Value, or of Key in -quic_dist Key Value ...
+%% A key given more than once, by either form, is refused rather than
+%% resolved.
 get_init_arg(Key, Default) ->
-    ArgName = list_to_atom("quic_dist_" ++ atom_to_list(Key)),
-    case init:get_argument(ArgName) of
-        {ok, [[Value]]} ->
-            Value;
-        _ ->
-            %% Also try plain -quic_dist with key value pairs
-            case init:get_argument(quic_dist) of
-                {ok, Args} ->
-                    find_in_args(atom_to_list(Key), Args, Default);
-                _ ->
-                    Default
-            end
+    Flag = list_to_atom("quic_dist_" ++ atom_to_list(Key)),
+    Own =
+        case init:get_argument(Flag) of
+            {ok, [[Value]]} -> [Value];
+            {ok, Other} -> error({bad_config, {Flag, Other}});
+            error -> []
+        end,
+    Name = atom_to_list(Key),
+    case Own ++ [V || {K, V} <- quic_dist_args(), K =:= Name] of
+        [] -> Default;
+        [Value1] -> Value1;
+        Values -> error({bad_config, {Key, {repeated, Values}}})
     end.
 
 %% @private
-find_in_args(_Key, [], Default) -> Default;
-find_in_args(Key, [[Key, Value] | _], _Default) -> Value;
-find_in_args(Key, [_ | Rest], Default) -> find_in_args(Key, Rest, Default).
+%% Key/value pairs from every -quic_dist flag.
+quic_dist_args() ->
+    case init:get_argument(quic_dist) of
+        {ok, Args} -> lists:append([quic_dist_pairs(A, A) || A <- Args]);
+        error -> []
+    end.
+
+quic_dist_pairs([K, V | Rest], Arg) ->
+    case lists:member(K, ?QUIC_DIST_ARG_KEYS) of
+        true -> [{K, V} | quic_dist_pairs(Rest, Arg)];
+        false -> error({bad_config, {quic_dist, {unknown_key, K}}})
+    end;
+quic_dist_pairs([], _Arg) ->
+    [];
+quic_dist_pairs(_Odd, Arg) ->
+    error({bad_config, {quic_dist, Arg}}).
 
 %% @private
 get_verify_opt(verify_peer) -> verify_peer;
 get_verify_opt(verify_none) -> verify_none;
 get_verify_opt("verify_peer") -> verify_peer;
 get_verify_opt("verify_none") -> verify_none;
-get_verify_opt(_) -> verify_none.
+get_verify_opt(Other) -> error({bad_config, {verify, Other}}).
 
 %% @private
 get_opt(Key, Opts) ->
@@ -898,7 +992,12 @@ resolve_psk_callback(_) ->
 %% until the callback admits the peer, and notifies the acceptor itself;
 %% without one there is nothing to wait for and we notify here.
 handle_new_connection(Conn) ->
-    Config = load_config(),
+    case read_config() of
+        {ok, Config} -> start_server_controller(Conn, Config);
+        {error, _} = Error -> Error
+    end.
+
+start_server_controller(Conn, Config) ->
     Auth =
         case Config#quic_dist_config.auth_callback of
             undefined -> undefined;
@@ -980,6 +1079,12 @@ do_setup(Kernel, Node, Type, MyNode, LongOrShortNames, SetupTime) ->
         {error, AppReason} -> ?shutdown2(Node, {quic_app_start_failed, AppReason})
     end,
 
+    Config =
+        case read_config() of
+            {ok, C} -> C;
+            {error, ConfigReason} -> ?shutdown2(Node, ConfigReason)
+        end,
+
     %% Start setup timer
     Timer = dist_util:start_timer(SetupTime),
 
@@ -987,9 +1092,9 @@ do_setup(Kernel, Node, Type, MyNode, LongOrShortNames, SetupTime) ->
     case parse_node_name(Node, LongOrShortNames) of
         {ok, Host} ->
             %% Look up node address via discovery
-            case discover_node(Node, Host) of
+            case discover_node(Node, Host, Config) of
                 {ok, IP, Port} ->
-                    connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer);
+                    connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer, Config);
                 {error, Reason} ->
                     ?shutdown2(Node, {discovery_failed, Reason})
             end;
@@ -1019,8 +1124,7 @@ parse_node_name(Node, LongOrShortNames) ->
 
 %% @private
 %% Discover node address using configured discovery module.
-discover_node(Node, Host) ->
-    Config = load_config(),
+discover_node(Node, Host, Config) ->
     DiscoveryModule = Config#quic_dist_config.discovery_module,
 
     %% First check static configuration
@@ -1143,9 +1247,7 @@ ensure_connect_opts_table() ->
 
 %% @private
 %% Connect to the target node.
-connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer) ->
-    Config = load_config(),
-
+connect_to_node(Kernel, Node, IP, Port, MyNode, Type, Timer, Config) ->
     %% Prepare QUIC connection options
     case load_credentials(Config) of
         {ok, Cert, Key, CACert} ->
