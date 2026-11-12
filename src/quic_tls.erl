@@ -394,7 +394,7 @@ build_client_hello_extensions(PubKey, Opts) ->
 
     %% Server Name Indication
     SNI =
-        case ServerName of
+        case sni_host_name(ServerName) of
             undefined ->
                 <<>>;
             Name when is_binary(Name) ->
@@ -453,6 +453,15 @@ build_client_hello_extensions(PubKey, Opts) ->
         PskModes,
         Cookie
     ]).
+
+%% RFC 6066 Section 3: an IP literal is not a HostName, so it is not sent.
+sni_host_name(Name) when is_binary(Name) ->
+    case inet:parse_address(binary_to_list(Name)) of
+        {ok, _} -> undefined;
+        {error, _} -> Name
+    end;
+sni_host_name(undefined) ->
+    undefined.
 
 encode_alpn_list(Protocols) ->
     iolist_to_binary([<<(byte_size(P)):8, P/binary>> || P <- Protocols]).

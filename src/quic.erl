@@ -236,8 +236,10 @@ get_fd(Socket) ->
 %%   <li>`key' - Decoded private key for `cert'. One that cannot sign for
 %%       the certificate is refused with `{error, {invalid_client_key, _}}'.</li>
 %%   <li>`alpn' - ALPN protocols (default: [&lt;&lt;"h3"&gt;&gt;])</li>
-%%   <li>`server_name' - Server Name Indication, also the hostname
-%%       checked against the certificate (default: Host)</li>
+%%   <li>`server_name' - Name checked against the certificate and sent
+%%       as Server Name Indication (default: Host). An IP address is
+%%       checked against the certificate's IP subjectAltName entries and
+%%       not sent as SNI.</li>
 %%   <li>`external_psk' - TLS 1.3 external PSK (RFC 9846 §4.3.11).
 %%       `{Identity, Secret}' defaults to modes `[psk_dhe_ke]';
 %%       `{Identity, Secret, Modes}' takes an explicit non-empty

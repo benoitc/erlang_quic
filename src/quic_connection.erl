@@ -1174,13 +1174,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% Create connection reference (for internal use only)
     ConnRef = make_ref(),
 
-    %% Get server name for SNI
-    ServerName =
-        case maps:get(server_name, Opts, undefined) of
-            undefined when is_binary(Host) -> Host;
-            undefined when is_list(Host) -> list_to_binary(Host);
-            SN -> SN
-        end,
+    ServerName = client_server_name(Host, Opts),
 
     %% Get ALPN list
     AlpnOpt = maps:get(alpn, Opts, [<<"h3">>]),
@@ -2757,6 +2751,18 @@ with_remembered_params(
     apply_peer_transport_params_internal(Remembered, State);
 with_remembered_params(_Ticket, State) ->
     State.
+
+%% The name checked against the server certificate: `server_name', else
+%% the host, an address included (RFC 9525 Section 6.4). quic_tls keeps
+%% an address out of SNI.
+-spec client_server_name(binary() | string() | inet:ip_address(), map()) -> binary().
+client_server_name(Host, Opts) ->
+    case maps:get(server_name, Opts, undefined) of
+        undefined when is_binary(Host) -> Host;
+        undefined when is_list(Host) -> list_to_binary(Host);
+        undefined when is_tuple(Host) -> list_to_binary(inet:ntoa(Host));
+        SN -> SN
+    end.
 
 %% A ticket stored before tickets kept transport parameters.
 upgrade_ticket(Ticket) when is_tuple(Ticket), element(1, Ticket) =:= session_ticket ->

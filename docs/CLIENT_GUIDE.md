@@ -42,7 +42,7 @@ quic:close(Conn, normal).
 |--------|------|---------|-------------|
 | `alpn` | [binary()] | `[<<"h3">>]` | ALPN protocols to offer |
 | `verify` | boolean | true | Verify server certificate (`verify_peer` / `verify_none` also accepted) |
-| `server_name` | binary | Host | Server Name Indication |
+| `server_name` | binary | Host | Name checked against the certificate and sent as SNI; an IP address is checked but not sent |
 | `cert` | binary | - | Client certificate (for mTLS) |
 | `key` | term | - | Client private key (for mTLS), decoded; one that cannot sign for `cert` returns `{error, {invalid_client_key, _}}` |
 | `groups` | [atom()] | `[x25519]` | Key-exchange groups in preference order (`x25519`, `secp256r1`, `secp384r1`, `x25519mlkem768`). The head gets a `key_share`; the rest are HelloRetryRequest-eligible. `x25519mlkem768` is the post-quantum hybrid group (needs OTP 28.1+); naming an unsupported group returns `{error, {unsupported_group, _}}`. |
@@ -552,6 +552,9 @@ matched against the certificate's subjectAltName under RFC 9525: a `*.example.co
 SAN matches `host.example.com`, but not `example.com` and not `a.b.example.com`.
 A wildcard counts only as the whole leftmost label, and a certificate with no
 DNS or IP subjectAltName matches no name; its subject CN is not used.
+When the host is an IP address (a tuple or a string) and you set no
+`server_name`, the address must appear in the certificate's IP
+subjectAltName entries, and no SNI is sent.
 
 ### 2. Connection Pooling
 
