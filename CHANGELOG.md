@@ -68,6 +68,7 @@ All notable changes to this project will be documented in this file.
   `{error, informational_status}`, and status 101 given to
   `send_response/4`, `respond/5` or `send_push_response/4` returns
   `{error, status_101_forbidden}` (RFC 9114 Section 4.5).
+- TLS now follows RFC 9846, which obsoletes RFC 8446.
 
 ### Fixed
 - A peer that sent a packet within each idle period kept a handshake open
@@ -442,6 +443,55 @@ All notable changes to this project will be documented in this file.
   15.2, RFC 9114 Sections 4.1.2 and 4.5). A pushed response follows the
   same rules, and a pushed HEAD response with a Content-Length no longer
   fails for having no body.
+- Resuming a session or using an external PSK failed after a
+  HelloRetryRequest: the server checked the PSK binder without the first
+  ClientHello and the HelloRetryRequest in front, and the client refused
+  to retry with its PSK. Both sides now bind the PSK to the whole
+  handshake so far, and the retried ClientHello carries no early data
+  (RFC 9846 Sections 4.3.10 and 4.3.11.2).
+- The client did not check that a ServerHello or HelloRetryRequest selects
+  TLS 1.3, and the server did not check that a ClientHello offers it. Such
+  a handshake now ends with protocol_version, or with illegal_parameter
+  when another version is selected (RFC 9846 Section 4.3.1, RFC 9001
+  Section 4.2).
+- A NewSessionTicket cut short crashed the client's handling of it, and
+  one with bytes left over was accepted. A NewSessionTicket that does not
+  decode now ends the connection with decode_error (RFC 9846 Section
+  4.7.1).
+- A HelloRetryRequest asking for the key share the client had already
+  sent, or asking for nothing, got the same ClientHello again. The client
+  now ends the handshake with illegal_parameter, and sends back the cookie
+  of a HelloRetryRequest that carries one (RFC 9846 Sections 4.2.4 and
+  4.3.2).
+- The server resumed a session ticket for a client that had not offered
+  psk_dhe_ke, the only mode those tickets work in, and accepted a PSK
+  offered without psk_key_exchange_modes. It now does a full handshake in
+  the first case and ends the handshake with missing_extension in the
+  second. The client now ends the handshake with illegal_parameter when
+  the server picks a key exchange mode or PSK it did not offer (RFC 9846
+  Sections 4.3.9 and 4.3.11).
+- A ClientHello with a legacy_version other than 0x0303 was dropped
+  without an answer. The server now ends the handshake with
+  protocol_version, and with illegal_parameter for a ClientHello offering
+  compression (RFC 9846 Section 4.2.2).
+- A ServerHello or HelloRetryRequest with a legacy_version other than
+  0x0303 was ignored, and the client waited for its timeout. The client
+  now ends the handshake with protocol_version, and with illegal_parameter
+  when the session ID echo or the compression method is not what it sent
+  (RFC 9846 Sections 4.2.3 and 4.2.4).
+- Handshake messages with bytes left over inside an extension or after the
+  message, odd-length lists or empty names were accepted, or dropped
+  without an answer. Both sides now end the handshake with decode_error,
+  with illegal_parameter for a duplicate extension or a pre_shared_key
+  that is not the last extension, and with missing_extension for a
+  CertificateRequest without signature_algorithms (RFC 9846 Sections 4.3,
+  4.3.11 and 4.4.2).
+- The server sent session tickets to clients that had not offered
+  psk_dhe_ke and so could not use them. It now sends one only to a client
+  that did (RFC 9846 Section 4.7.1).
+- The client kept using a session ticket for as long as its lifetime said,
+  even past 7 days. It now stops after 7 days at most (RFC 9846 Section
+  4.7.1).
 
 ## [2.6.1] - 2026-11-08
 
