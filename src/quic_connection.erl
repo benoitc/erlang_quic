@@ -3374,6 +3374,8 @@ send_new_session_ticket(#state{hs = #hs{selected_psk = #{source := external}}} =
     %% we don't want to answer right now. A handshake resumed from a
     %% ticket gets a new one: tickets are single-use.
     State;
+send_new_session_ticket(#state{hs = #hs{peer_psk_dhe_ke = false}} = State) ->
+    State;
 send_new_session_ticket(#state{hs = #hs{resumption_secret = undefined}} = State) ->
     %% No resumption secret available - skip sending ticket
     State;
@@ -8068,6 +8070,9 @@ do_server_client_hello(
     StateSig = State0In#state{
         hs = (State0In#state.hs)#hs{
             peer_sig_algs = maps:get(signature_algorithms, ClientHelloInfo, []),
+            peer_psk_dhe_ke = lists:member(
+                psk_dhe_ke, maps:get(psk_key_exchange_modes, ClientHelloInfo, [])
+            ),
             %% The tickets this connection issues are bound to it.
             server_name = maps:get(server_name, ClientHelloInfo, undefined)
         }

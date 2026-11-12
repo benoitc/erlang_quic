@@ -265,6 +265,9 @@
     %% Peer's offered signature_algorithms (wire codes), set on the
     %% server when the ClientHello is parsed.
     peer_sig_algs = [] :: [non_neg_integer()],
+    %% Server: the client offered psk_dhe_ke, the mode our tickets resume
+    %% in, so it may be sent one (RFC 9846 Section 4.7.1).
+    peer_psk_dhe_ke = false :: boolean(),
     %% CertificateVerify scheme chosen for this handshake (wire code).
     cert_verify_code :: non_neg_integer() | undefined,
     %% Group of the key_share we sent (client) / selected (server)

@@ -205,6 +205,35 @@ external_psk_mode_not_offered_test() ->
         (client_after(SH, #{external_psk => Psk}))#state.close_reason
     ).
 
+%% RFC 9846 Section 4.7.1: a ticket goes to a client whose modes it can
+%% be used in, psk_dhe_ke for ours.
+ticket_issued_test_() ->
+    [
+        ?_assertEqual(true, ticket_issued(client_hello())),
+        ?_assertEqual(
+            false, ticket_issued(without_ext(?EXT_PSK_KEY_EXCHANGE_MODES, client_hello()))
+        ),
+        ?_assertEqual(
+            false,
+            ticket_issued(
+                set_ext(?EXT_PSK_KEY_EXCHANGE_MODES, <<1, ?PSK_KE_MODE_KE>>, client_hello())
+            )
+        )
+    ].
+
+%% Whether a server that took CH issues a ticket once it may.
+ticket_issued(CH) ->
+    Tab = ets:new(issued, [set, public]),
+    try
+        S = server_after(CH, Tab),
+        _ = quic_connection:send_new_session_ticket(S#state{
+            alpn = <<"h3">>, hs = (S#state.hs)#hs{resumption_secret = <<7:256>>}
+        }),
+        (ets:info(Tab, size) > 0)
+    after
+        ets:delete(Tab)
+    end.
+
 %% Whether a server resumed a ticket from a ClientHello offering Modes,
 %% and the PSK it selected.
 resume_with_modes(Modes) ->
