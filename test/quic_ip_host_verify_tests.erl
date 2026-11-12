@@ -230,6 +230,28 @@ address_literal_forms_test_() ->
             ?_assertEqual(error, quic_cert:host_address(<<"127.0.0.1%lo0">>))
         ].
 
+%% Brackets hold only an IP literal: anything else in them is not dialled,
+%% so what is dialled is always what the certificate is checked against.
+bracketed_non_address_refused_test_() ->
+    Hosts = ["[v1.ab]", <<"[localhost]">>, "[[::1]]", "[::1] ", "[::1]:443", "[ ::1]"],
+    [?_assertEqual({error, einval}, quic_connection:resolve_address(H, 443, any)) || H <- Hosts] ++
+        [?_assertEqual({error, einval}, quic_happy:parse_host(H)) || H <- Hosts] ++
+        [
+            ?_assertEqual(
+                {error, einval},
+                quic:connect("[localhost]", 4433, #{alpn => [<<"h3">>], verify => false}, self())
+            ),
+            ?_assertEqual(
+                {error, einval},
+                quic:connect(
+                    <<"[localhost]">>,
+                    4433,
+                    #{alpn => [<<"h3">>], verify => false, happy_eyeballs => false},
+                    self()
+                )
+            )
+        ].
+
 bracketed_name_is_the_address_test_() ->
     Ca = ca(),
     WithIp = leaf(Ca, [?LOOPBACK6_IP_SAN]),
@@ -247,7 +269,7 @@ bracketed_name_is_the_address_test_() ->
         ?_assertEqual(undefined, hello_sni(<<"[::1]">>)),
         ?_assertEqual(undefined, hello_sni(<<"[fe80::1%en0]">>)),
         ?_assertEqual({literal, ?LOOPBACK6}, quic_happy:parse_host("[::1%lo0]")),
-        ?_assertEqual({name, "localhost"}, quic_happy:parse_host("[localhost]"))
+        ?_assertEqual({error, einval}, quic_happy:parse_host("[localhost]"))
     ].
 
 %%====================================================================

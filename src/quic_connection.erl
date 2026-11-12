@@ -9782,8 +9782,11 @@ resolve_address(Host, Port, Family) when is_list(Host) ->
     case quic_cert:host_address(Host) of
         {ok, IP} ->
             {ok, {IP, Port}};
+        error when hd(Host) =:= $[ ->
+            %% Brackets hold only an IP literal (RFC 3986 Section 3.2.2).
+            {error, einval};
         error ->
-            case getaddr_family(strip_brackets(Host), Family) of
+            case getaddr_family(Host, Family) of
                 {ok, IP} -> {ok, {IP, Port}};
                 {error, _} = Error -> Error
             end
@@ -9799,15 +9802,6 @@ getaddr_family(Host, any) ->
         {ok, _} = Ok -> Ok;
         {error, _} -> inet:getaddr(Host, inet6)
     end.
-
-%% Drop a single pair of surrounding brackets from an IPv6 literal ("[::1]").
-strip_brackets([$[ | Rest]) ->
-    case lists:reverse(Rest) of
-        [$] | RevInner] -> lists:reverse(RevInner);
-        _ -> [$[ | Rest]
-    end;
-strip_brackets(Host) ->
-    Host.
 
 %% Derive initial encryption keys with specific QUIC version
 %% Version determines which salt to use (v1 vs v2)
