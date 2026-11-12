@@ -18,12 +18,19 @@ All notable changes to this project will be documented in this file.
   certificate that chained to the trust anchors was accepted. The
   address is now checked against the certificate's IP subjectAltName
   entries (RFC 9525 Section 6.4), and it is no longer sent as SNI
-  (RFC 6066 Section 3), including when given as `server_name`. A
-  hostname, as the host or as `server_name`, works as before.
-- Crash reports, supervisor reports and `sys:get_status/1` of
-  connections, listeners, their supervisors and the processes that keep
-  their options or session tickets printed private keys, PSKs, TLS
-  secrets and packet protection keys. These are no longer shown.
+  (RFC 6066 Section 3), including when given as `server_name`. An IPv6
+  address in brackets, such as `[::1]`, or with a zone ID counts as the
+  address, whether given as the host, as `server_name` or through
+  `quic_h3:connect`. A hostname, as the host or as `server_name`, works
+  as before.
+- Crash reports, supervisor reports and `sys:get_status/1` printed
+  private keys, PSKs, TLS secrets, packet protection keys, session
+  ticket secrets, QUIC-LB keys and stateless reset secrets and tokens.
+  These are no longer shown for connections, listeners, the server
+  registry, HTTP/3 connections, distribution controllers and the
+  distribution ticket store. The server, listener pool, top-level and
+  distribution supervisors no longer keep these options in their state
+  or child specs.
 - With the optional crypto NIF built, a protected 1-RTT packet with an
   empty payload made the receive path read frames from memory past the
   decrypted packet. Only the decrypted bytes are read now, so such a
