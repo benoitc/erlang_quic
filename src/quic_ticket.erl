@@ -67,6 +67,10 @@
 %% For QUIC, max_early_data_size in NewSessionTicket must be 0xffffffff.
 -define(QUIC_MAX_EARLY_DATA_SIZE, 16#FFFFFFFF).
 
+%% RFC 9846 Section 4.7.1: a ticket is used for 7 days at most after
+%% issuance, whatever its ticket_lifetime.
+-define(MAX_TICKET_AGE, 604800).
+
 %%====================================================================
 %% Ticket Storage API
 %%====================================================================
@@ -90,7 +94,7 @@ lookup_ticket(ServerName, Store) ->
         {ok, #session_ticket{received_at = ReceivedAt, lifetime = Lifetime} = Ticket} ->
             Now = erlang:system_time(second),
             Age = Now - ReceivedAt,
-            case Age =< Lifetime of
+            case Age =< min(Lifetime, ?MAX_TICKET_AGE) of
                 true -> {ok, Ticket};
                 % Expired
                 false -> error
@@ -110,7 +114,7 @@ clear_expired(Store) ->
     Now = erlang:system_time(second),
     maps:filter(
         fun(_ServerName, #session_ticket{received_at = ReceivedAt, lifetime = Lifetime}) ->
-            (Now - ReceivedAt) =< Lifetime
+            (Now - ReceivedAt) =< min(Lifetime, ?MAX_TICKET_AGE)
         end,
         Store
     ).

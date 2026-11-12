@@ -30,6 +30,31 @@ ticket_store_roundtrip_test() ->
     {ok, Retrieved} = quic_ticket:lookup_ticket(<<"example.com">>, Store1),
     ?assertEqual(<<"example.com">>, Retrieved#session_ticket.server_name).
 
+%% RFC 9846 Section 4.7.1: a client uses a ticket for 7 days at most,
+%% whatever lifetime the server gave it.
+ticket_used_for_seven_days_at_most_test_() ->
+    Day = 86400,
+    [
+        ?_assertEqual(Expected, lookup_aged(Age, Lifetime))
+     || {Age, Lifetime, Expected} <- [
+            {6 * Day, 16#FFFFFFFF, true},
+            {7 * Day, 16#FFFFFFFF, true},
+            {7 * Day + 1, 16#FFFFFFFF, false},
+            {8 * Day, 16#FFFFFFFF, false},
+            {2 * Day, Day, false}
+        ]
+    ].
+
+%% Whether a ticket received Age seconds ago with Lifetime is still
+%% used, by lookup and by the expiry sweep.
+lookup_aged(Age, Lifetime) ->
+    T = create_test_ticket(<<"example.com">>),
+    Aged = T#session_ticket{lifetime = Lifetime, received_at = erlang:system_time(second) - Age},
+    Store = quic_ticket:store_ticket(<<"example.com">>, Aged, quic_ticket:new_store()),
+    Found = (quic_ticket:lookup_ticket(<<"example.com">>, Store) =/= error),
+    ?assertEqual(Found, map_size(quic_ticket:clear_expired(Store)) =:= 1),
+    Found.
+
 ticket_store_clear_test() ->
     Store = quic_ticket:new_store(),
     Ticket = create_test_ticket(<<"example.com">>),
