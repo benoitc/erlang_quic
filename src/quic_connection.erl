@@ -914,7 +914,8 @@ init({server, Opts}) ->
     %% RFC 9000 §10.1: arm the idle timer once; it re-arms itself lazily
     %% from last_activity (the keep-alive timer is armed on entering the
     %% connected state).
-    {ok, idle, set_idle_timer(State)}.
+    State1 = set_idle_timer(State),
+    {ok, idle, State1, [handshake_deadline_action(State1)]}.
 
 %% Build congestion control options from connection options.
 %% Supports:
@@ -1357,7 +1358,8 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% RFC 9000 §10.1: arm the idle timer once; it re-arms itself lazily
     %% from last_activity (the keep-alive timer is armed on entering the
     %% connected state).
-    {ok, idle, set_idle_timer(State)}.
+    State1 = set_idle_timer(State),
+    {ok, idle, State1, [handshake_deadline_action(State1)]}.
 
 terminate(
     Reason,
@@ -1763,7 +1765,7 @@ connected(
     %% Everything queued above (pending data, NEW_TOKEN, the first PMTU
     %% probe) sits in the send batch; without a flush here it would
     %% only leave with the next event on this connection.
-    {keep_state, flush_event(State5, event)};
+    {keep_state, flush_event(State5, event), [{{timeout, handshake_deadline}, cancel}]};
 connected({call, From}, get_ref, #state{cfg = #conn_cfg{conn_ref = Ref}} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 connected({call, From}, get_state, State) ->
@@ -2469,13 +2471,21 @@ handle_common_event(info, {pacing_timeout, Ref}, StateName, #state{pacing_timer 
 handle_common_event(info, {pacing_timeout, _StaleRef}, _StateName, State) ->
     %% Ignore stale pacing timer (ref doesn't match or wrong state)
     {keep_state, State};
+%% RFC 9000 Section 10.1: a handshake still running at its deadline is closed, silently if idle.
+handle_common_event({timeout, handshake_deadline}, expired, StateName, State) when
+    StateName =:= idle orelse StateName =:= handshaking
+->
+    Reason =
+        case idle_expired(State) of
+            true -> idle_timeout;
+            false -> handshake_timeout
+        end,
+    emit_qlog_state_change(StateName, draining, State),
+    {next_state, draining, flush_event(initiate_close(Reason, State), event)};
 handle_common_event(info, {idle_timeout, Ref}, StateName, #state{idle_timer = Ref} = State) when
     Ref =/= undefined andalso StateName =/= draining andalso StateName =/= closed
 ->
-    %% Handle idle timeout - check if we've truly been idle
-    Now = erlang:monotonic_time(millisecond),
-    TimeSinceActivity = Now - State#state.last_activity,
-    case TimeSinceActivity >= idle_timeout(State) of
+    case idle_expired(State) of
         true ->
             %% Genuine idle timeout - initiate close
             NewState = initiate_close(idle_timeout, State#state{idle_timer = undefined}),
@@ -13481,6 +13491,23 @@ idle_timeout(#state{cfg = #conn_cfg{idle_timeout = Local}, transport_params = TP
         0 -> infinity;
         Timeout -> max(Timeout, 3 * quic_loss:persistent_congestion_pto(State#state.loss_state))
     end.
+
+idle_expired(State) ->
+    case idle_timeout(State) of
+        infinity -> false;
+        Timeout -> (erlang:monotonic_time(millisecond) - State#state.last_activity) >= Timeout
+    end.
+
+%% The handshake must complete within the idle timeout from its start, or
+%% the disconnect timeout when there is no idle timeout.
+handshake_deadline(#state{cfg = #conn_cfg{disconnect_timeout = DT}} = State) ->
+    case idle_timeout(State) of
+        infinity -> DT;
+        Timeout -> Timeout
+    end.
+
+handshake_deadline_action(State) ->
+    {{timeout, handshake_deadline}, handshake_deadline(State), expired}.
 
 advertised_idle_timeout(0, Peer) -> Peer;
 advertised_idle_timeout(Local, 0) -> Local;
