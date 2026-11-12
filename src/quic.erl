@@ -527,8 +527,12 @@ reset_stream(Conn, StreamId, ErrorCode) when is_pid(Conn) ->
 %% @doc Reset a stream with reliable delivery up to specified size.
 %% Data up to ReliableSize will be delivered before the reset takes effect.
 %% Requires peer support for the reliable stream reset extension
-%% (draft-ietf-quic-reliable-stream-reset-07).
-%% ReliableSize must be less than or equal to the amount of data already sent.
+%% (draft-ietf-quic-reliable-stream-reset-11 Section 3).
+%% ReliableSize must not exceed what was written on the stream. The frame's
+%% final size is what was sent plus the reliable bytes still queued; when
+%% that exceeds the peer's flow control limits the reset is refused with
+%% `{error, flow_control_blocked}' (draft-ietf-quic-reliable-stream-reset-11
+%% Section 4).
 -spec reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) ->
     ok | {error, term()}
 when
@@ -542,10 +546,17 @@ reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) when is_pid(Conn) ->
 %% @doc Keep the first `Size' bytes of a stream reliable when quic resets
 %% it on its own: answering the peer's STOP_SENDING, or on a send deadline.
 %% Such a reset is then a RESET_STREAM_AT with that reliable size, capped
-%% at what was written (draft-ietf-quic-reliable-stream-reset-07), when the
+%% at what was written (draft-ietf-quic-reliable-stream-reset-11 Section 5), when the
 %% peer advertised `reset_stream_at'; otherwise it stays a RESET_STREAM.
 %% WebTransport needs it for its stream header (draft-ietf-webtrans-http3-17
 %% Section 4.4). Without it nothing changes.
+%%
+%% This is an exception to draft-ietf-quic-reliable-stream-reset-11
+%% Section 5.4, which says a reset answering STOP_SENDING SHOULD have a
+%% reliable size of 0: without a reliable size set here, quic answers
+%% with a RESET_STREAM, and a later `reset_stream_at/4' on that stream is
+%% refused with `{error, cannot_increase_reliable_size}'. With one, the
+%% bytes it keeps are still sent, even if they were only queued.
 -spec set_stream_reliable_size(Conn, StreamId, Size) -> ok | {error, term()} when
     Conn :: pid(),
     StreamId :: non_neg_integer(),

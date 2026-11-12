@@ -23,7 +23,7 @@
 - [x] Unidirectional streams
 - [x] Stream prioritization (RFC 9218) with 8 urgency levels
 - [x] Incremental delivery flag support
-- [x] RESET_STREAM_AT extension (draft-ietf-quic-reliable-stream-reset-07)
+- [x] RESET_STREAM_AT extension (draft-ietf-quic-reliable-stream-reset-11)
 
 ### Flow Control
 - [x] Connection-level flow control (MAX_DATA)
@@ -186,7 +186,7 @@ See [docs/PSK.md](PSK.md). Pending follow-ups tracked in the
   - Block Cipher: Feistel network for variable lengths
 - [x] LB-aware CID generation in listener and connection
 
-## Reliable Stream Reset (draft-ietf-quic-reliable-stream-reset-07)
+## Reliable Stream Reset (draft-ietf-quic-reliable-stream-reset-11)
 
 RESET_STREAM_AT allows resetting a stream while ensuring data up to a specified
 offset is reliably delivered. Required for WebTransport where stream headers
@@ -194,7 +194,7 @@ must be received even if the stream is immediately reset.
 
 ### Features
 - [x] Frame type 0x24 (RESET_STREAM_AT) encode/decode
-- [x] Transport parameter negotiation (0x17f7586d2cb571)
+- [x] Transport parameter negotiation (0x1d, and 0x17f7586d2cb571 for draft -07 peers)
 - [x] Reliable delivery guarantee up to ReliableSize
 - [x] Retransmission filtering (data beyond ReliableSize not retransmitted)
 - [x] Validation: ReliableSize cannot exceed FinalSize
@@ -216,9 +216,10 @@ ok = quic:send_data(Conn, StreamId, Header, false),
 ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 ```
 
-When the peer stops the stream with STOP_SENDING, quic resets it by itself.
-Give the stream its reliable size up front and that reset keeps the
-header too:
+When the peer stops the stream with STOP_SENDING, quic resets it by itself
+with a reliable size of 0 (draft-ietf-quic-reliable-stream-reset-11 Section
+5.4). Give the stream its reliable size up front and that reset keeps the
+header too, as WebTransport needs:
 
 ```erlang
 ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).

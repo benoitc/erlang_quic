@@ -110,7 +110,7 @@ change. Docs and CHANGELOG entries go in the same pull request.
 
 The specs erlang_quic implements, at the version the code follows. Where a
 newer one exists it is listed under [Pending updates](#pending-updates).
-Last checked: 2026-11-08; the TLS table 2026-11-12.
+Last checked: 2026-11-08; the TLS table and reliable stream reset 2026-11-12.
 
 ### QUIC
 
@@ -125,7 +125,7 @@ Last checked: 2026-11-08; the TLS table 2026-11-12.
 | RFC 8899 DPLPMTUD | PMTU probing | `quic_pmtu` |
 | RFC 9438 CUBIC, RFC 9406 HyStart++ | congestion control | `quic_cc_cubic`, `quic_cc_newreno` |
 | draft-ietf-ccwg-bbr (revision not recorded) BBRv3 | congestion control | `quic_cc_bbr` |
-| draft-ietf-quic-reliable-stream-reset-07 | RESET_STREAM_AT, `reset_stream_at` transport parameter | `quic_connection` |
+| draft-ietf-quic-reliable-stream-reset-11 | RESET_STREAM_AT, `reset_stream_at` transport parameter (both ids) | `quic_connection`, `quic_tls` |
 | draft-ietf-quic-load-balancers (revision not recorded) QUIC-LB | routable connection IDs | `quic_lb` |
 | RFC 8305 Happy Eyeballs v2 | client address racing | `quic_happy` |
 
@@ -202,7 +202,6 @@ before any code changes.
 
 | Spec | Code follows | Latest | To check |
 |---|---|---|---|
-| Reliable stream reset | draft-ietf-quic-reliable-stream-reset-07 | -11 | frame type (`16#24`) and transport parameter id, Reliable Size and Final Size rules |
 | QUIC-LB | revision not recorded | draft-ietf-quic-load-balancers-22 | CID formats, config rotation bits, encryption modes in `quic_lb`; fix the "RFC 9312" citation |
 | BBR | revision not recorded | draft-ietf-ccwg-bbr-07 | state machine and gains in `quic_cc_bbr`; record the revision followed |
 

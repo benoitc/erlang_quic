@@ -92,7 +92,7 @@ encode({ack, Ranges, AckDelay, {ECT0, ECT1, ECNCE}}) ->
 encode({reset_stream, StreamId, ErrorCode, FinalSize}) ->
     <<?FRAME_RESET_STREAM, (quic_varint:encode(StreamId))/binary,
         (quic_varint:encode(ErrorCode))/binary, (quic_varint:encode(FinalSize))/binary>>;
-%% RESET_STREAM_AT (0x24) - draft-ietf-quic-reliable-stream-reset-07
+%% RESET_STREAM_AT (0x24) - draft-ietf-quic-reliable-stream-reset-11 Section 4
 encode({reset_stream_at, StreamId, ErrorCode, FinalSize, ReliableSize}) ->
     <<?FRAME_RESET_STREAM_AT, (quic_varint:encode(StreamId))/binary,
         (quic_varint:encode(ErrorCode))/binary, (quic_varint:encode(FinalSize))/binary,

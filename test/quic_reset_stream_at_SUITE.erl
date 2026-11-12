@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% RESET_STREAM_AT End-to-End Test Suite
-%%% draft-ietf-quic-reliable-stream-reset-07
+%%% draft-ietf-quic-reliable-stream-reset-11
 %%%
 %%% Tests the RESET_STREAM_AT extension between erlang_quic client and server.
 

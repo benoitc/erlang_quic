@@ -817,9 +817,12 @@ encode_transport_param(preferred_address, #preferred_address{} = PA) ->
     encode_tp(?TP_PREFERRED_ADDRESS, encode_preferred_address(PA));
 encode_transport_param(max_datagram_frame_size, Value) when Value > 0 ->
     encode_tp(?TP_MAX_DATAGRAM_FRAME_SIZE, quic_varint:encode(Value));
-%% draft-ietf-quic-reliable-stream-reset-07 - Reliable RESET_STREAM
+%% draft-ietf-quic-reliable-stream-reset-11 Section 3 - Reliable RESET_STREAM
 encode_transport_param(reset_stream_at, true) ->
-    encode_tp(?TP_RESET_STREAM_AT, <<>>);
+    <<
+        (encode_tp(?TP_RESET_STREAM_AT, <<>>))/binary,
+        (encode_tp(?TP_RESET_STREAM_AT_DRAFT07, <<>>))/binary
+    >>;
 encode_transport_param(_, _) ->
     <<>>.
 
@@ -834,7 +837,7 @@ encode_tp(Id, Value) ->
 decode_transport_params(Data) ->
     try
         case decode_transport_params_loop(Data, #{}) of
-            {ok, Params} -> validate_transport_params(Params);
+            {ok, Params} -> validate_transport_params(merge_reset_stream_at(Params));
             Error -> Error
         end
     catch
@@ -855,6 +858,13 @@ decode_transport_params_loop(Data, Acc) ->
         false ->
             DecodedValue = decode_tp_value(Id, Value),
             decode_transport_params_loop(Rest3, maps:put(Key, DecodedValue, Acc))
+    end.
+
+%% Either reset_stream_at id, or both, enables it; each must be empty, so both agree.
+merge_reset_stream_at(Params) ->
+    case maps:take(reset_stream_at_draft07, Params) of
+        {true, Rest} -> Rest#{reset_stream_at => true};
+        error -> Params
     end.
 
 %% @doc Validate transport parameter semantic constraints
@@ -950,6 +960,7 @@ tp_id_to_key(?TP_RETRY_SCID) -> retry_scid;
 tp_id_to_key(?TP_VERSION_INFORMATION) -> version_information;
 tp_id_to_key(?TP_MAX_DATAGRAM_FRAME_SIZE) -> max_datagram_frame_size;
 tp_id_to_key(?TP_RESET_STREAM_AT) -> reset_stream_at;
+tp_id_to_key(?TP_RESET_STREAM_AT_DRAFT07) -> reset_stream_at_draft07;
 tp_id_to_key(Id) -> {unknown, Id}.
 
 decode_tp_value(?TP_ORIGINAL_DCID, Value) ->
@@ -966,9 +977,9 @@ decode_tp_value(?TP_DISABLE_ACTIVE_MIGRATION, <<>>) ->
     true;
 decode_tp_value(?TP_DISABLE_ACTIVE_MIGRATION, _) ->
     error({transport_parameter_error, disable_active_migration_non_empty});
-decode_tp_value(?TP_RESET_STREAM_AT, <<>>) ->
+decode_tp_value(Id, <<>>) when Id =:= ?TP_RESET_STREAM_AT; Id =:= ?TP_RESET_STREAM_AT_DRAFT07 ->
     true;
-decode_tp_value(?TP_RESET_STREAM_AT, _) ->
+decode_tp_value(Id, _) when Id =:= ?TP_RESET_STREAM_AT; Id =:= ?TP_RESET_STREAM_AT_DRAFT07 ->
     %% Non-empty value is a TRANSPORT_PARAMETER_ERROR per spec
     error({transport_parameter_error, reset_stream_at_non_empty});
 decode_tp_value(?TP_PREFERRED_ADDRESS, Value) ->

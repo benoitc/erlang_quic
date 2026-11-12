@@ -119,7 +119,7 @@
     %% single-instance servers that don't need post-restart recovery.
     stateless_reset_secret = undefined :: binary() | undefined,
 
-    %% RESET_STREAM_AT support (draft-ietf-quic-reliable-stream-reset-07)
+    %% RESET_STREAM_AT support (draft-ietf-quic-reliable-stream-reset-11 Section 3)
     %% Local: whether we advertise support for RESET_STREAM_AT
     reset_stream_at_enabled = false :: boolean(),
 

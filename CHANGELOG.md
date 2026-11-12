@@ -127,6 +127,8 @@ All notable changes to this project will be documented in this file.
   `send_response/4`, `respond/5` or `send_push_response/4` returns
   `{error, status_101_forbidden}` (RFC 9114 Section 4.5).
 - TLS now follows RFC 9846, which obsoletes RFC 8446.
+- Reliable stream reset now follows draft-ietf-quic-reliable-stream-reset-11;
+  both transport parameter ids are sent and accepted.
 
 ### Fixed
 - A client connecting to an internationalized host name sent it in
@@ -181,7 +183,7 @@ All notable changes to this project will be documented in this file.
 - A RESET_STREAM_AT from the peer did not count the stream's final size
   against connection flow control, so connection credit fell behind what
   the peer had used and the peer could stall waiting for more (RFC 9000
-  Section 4.5, draft-ietf-quic-reliable-stream-reset-07).
+  Section 4.5, draft-ietf-quic-reliable-stream-reset-11).
 - After heavy packet loss left more than 64 ACK ranges, a packet number
   below the ranges kept was accepted again, so a duplicated packet was
   processed twice. Packet numbers below the lowest range kept are now
@@ -555,6 +557,44 @@ All notable changes to this project will be documented in this file.
 - The client kept using a session ticket for as long as its lifetime said,
   even past 7 days. It now stops after 7 days at most (RFC 9846 Section
   4.7.1).
+- The reset_stream_at transport parameter was sent and read only under
+  its draft -07 id, so peers on later drafts, which use 0x1d, could not
+  use RESET_STREAM_AT with erlang_quic. Both ids are now sent and either
+  is accepted, also for 0-RTT (draft-ietf-quic-reliable-stream-reset-11
+  Section 3).
+- A RESET_STREAM_AT could carry a final size that counted data still
+  waiting for flow control credit, past the limits the peer had granted,
+  which the peer must treat as a flow control error. The final size now
+  covers what was sent and the bytes kept reliable, and
+  `quic:reset_stream_at/4` returns `{error, flow_control_blocked}` when
+  even that is over the peer's limits
+  (draft-ietf-quic-reliable-stream-reset-11 Section 4).
+- A peer that changed a stream's final size in a RESET_STREAM_AT got
+  STREAM_STATE_ERROR instead of FINAL_SIZE_ERROR, and stream data past
+  the final size after a RESET_STREAM_AT, or a FIN that moved it, was
+  dropped without an error. Both now close the connection with
+  FINAL_SIZE_ERROR (draft-ietf-quic-reliable-stream-reset-11 Section
+  5.2).
+- After quic answered the peer's STOP_SENDING with RESET_STREAM, a call
+  to `quic:reset_stream_at/4` on the stream still sent a RESET_STREAM_AT
+  with a reliable size above 0. It is now refused, so the answer keeps a
+  reliable size of 0 (draft-ietf-quic-reliable-stream-reset-11 Section
+  5.4). A stream given a reliable size with
+  `quic:set_stream_reliable_size/3` is still answered with
+  RESET_STREAM_AT, as WebTransport needs, and the bytes it keeps are now
+  sent even when they were still queued; they were dropped, and the peer
+  waited for them.
+- Closing a stream after `quic:reset_stream_at/4` while its reliable bytes
+  were still on their way, or answering the peer's STOP_SENDING then,
+  sent a RESET_STREAM with another error code and final size, which the
+  peer must treat as a connection error. It now repeats those of the
+  RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset-11 Section 5.2).
+- A peer's RESET_STREAM and RESET_STREAM_AT on one stream with different
+  error codes were accepted, and the owner was told of the reset again
+  for each such frame, retransmissions included. A changed error code
+  now closes the connection with STREAM_STATE_ERROR, the owner hears of
+  the reset once, and no stream data is delivered after the peer's
+  RESET_STREAM (draft-ietf-quic-reliable-stream-reset-11 Section 5.2).
 
 ## [2.6.1] - 2026-11-08
 

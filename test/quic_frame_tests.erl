@@ -64,7 +64,7 @@ reset_stream_roundtrip_test() ->
     ?assertEqual(Frame, Decoded).
 
 %%====================================================================
-%% RESET_STREAM_AT Frame (0x24) - draft-ietf-quic-reliable-stream-reset-07
+%% RESET_STREAM_AT Frame (0x24) - draft-ietf-quic-reliable-stream-reset-11 Section 4
 %%====================================================================
 
 reset_stream_at_roundtrip_test() ->

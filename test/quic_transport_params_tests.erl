@@ -322,7 +322,7 @@ roundtrip_all_params_test() ->
 
 %%====================================================================
 %% RESET_STREAM_AT Transport Parameter Tests
-%% (draft-ietf-quic-reliable-stream-reset-07)
+%% (draft-ietf-quic-reliable-stream-reset-11 Section 3)
 %%====================================================================
 
 reset_stream_at_param_encode_decode_test() ->

@@ -1,6 +1,6 @@
 %%% -*- erlang -*-
 %%%
-%%% RESET_STREAM_AT Extension Tests (draft-ietf-quic-reliable-stream-reset-07)
+%%% RESET_STREAM_AT Extension Tests (draft-ietf-quic-reliable-stream-reset-11)
 %%%
 
 -module(quic_reset_stream_at_tests).
