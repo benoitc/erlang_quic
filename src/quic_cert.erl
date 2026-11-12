@@ -246,12 +246,35 @@ verify_hostname(Leaf, ServerName) when is_binary(ServerName) ->
     RefId =
         case host_address(ServerName) of
             {ok, IP} -> {ip, IP};
-            error -> {dns_id, binary_to_list(ServerName)}
+            error -> dns_reference(ServerName)
         end,
-    case has_san_id(Leaf) andalso safe_verify_hostname(Leaf, RefId) of
+    case (RefId =/= error) andalso has_san_id(Leaf) andalso safe_verify_hostname(Leaf, RefId) of
         true -> ok;
         false -> {error, {hostname_mismatch, ServerName}}
     end.
+
+%% RFC 9525 Section 6.3: a reference name is matched in its A-label
+%% form. A name that is not a valid IDN matches nothing.
+dns_reference(ServerName) ->
+    case unicode:characters_to_list(ServerName) of
+        Name when is_list(Name) ->
+            case is_ascii(Name) of
+                true -> {dns_id, Name};
+                false -> a_label_reference(Name)
+            end;
+        _ ->
+            error
+    end.
+
+a_label_reference(Name) ->
+    try idna:encode(Name, [uts46, {std3_rules, true}]) of
+        ALabels when is_list(ALabels) -> {dns_id, ALabels}
+    catch
+        _:_ -> error
+    end.
+
+is_ascii(Name) ->
+    lists:all(fun(C) -> is_integer(C) andalso C >= 0 andalso C < 128 end, Name).
 
 %% @doc The address a host or server name gives as an IP literal, bare
 %% or in brackets (`[::1]'), with or without an IPv6 zone ID; `error'
@@ -325,15 +348,18 @@ match_id(_, _) ->
     false.
 
 match_dns_id(Ref, Presented) when is_list(Ref), is_list(Presented) ->
+    is_ascii(Presented) andalso match_ascii_dns_id(Ref, Presented);
+match_dns_id(_, _) ->
+    false.
+
+match_ascii_dns_id(Ref, Presented) ->
     RefLabels = string:split(lower_ascii(Ref), ".", all),
     case string:split(lower_ascii(Presented), ".", all) of
         ["*" | Rest] ->
             match_wildcard(RefLabels, Rest);
         Labels ->
             not lists:member($*, Presented) andalso Labels =:= RefLabels
-    end;
-match_dns_id(_, _) ->
-    false.
+    end.
 
 %% A wildcard is the whole leftmost label and stands for exactly one
 %% non-empty label of the reference identifier; a bare `*' names no domain.

@@ -16,7 +16,8 @@
         kernel,
         stdlib,
         crypto,
-        ssl
+        ssl,
+        idna
     ]},
     {env, [
         %% Distribution configuration

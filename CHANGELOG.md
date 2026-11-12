@@ -12,7 +12,10 @@ All notable changes to this project will be documented in this file.
   subject common name matched the host. These certificates are now
   rejected as a hostname mismatch. Only the DNS and IP subjectAltName
   entries are matched, and a wildcard counts only as the whole leftmost
-  label, standing for one label (RFC 9525 Sections 2, 6.3 and 6.4).
+  label, standing for one label (RFC 9525 Sections 2, 6.3 and 6.4). An
+  internationalized host name is converted to A-labels, with UTS 46
+  mapping, before it is matched; a name that cannot be converted
+  matches no certificate.
 - A client that connected to an IP address, with verification on and no
   `server_name`, did not check the server certificate's name: any
   certificate that chained to the trust anchors was accepted. The
@@ -67,6 +70,8 @@ All notable changes to this project will be documented in this file.
   `quic_h3:start_server/3`.
 
 ### Changed
+- erlang_quic now depends on idna, used to compare internationalized
+  host names with certificates.
 - The default `pool_size` now runs one listener, as documented. It ran
   two on Linux. Set `pool_size => 2` for the old behaviour.
 - A `connection_handler` that returns `{error, Reason}` now declines the

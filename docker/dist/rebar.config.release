@@ -9,6 +9,7 @@
 {minimum_otp_vsn, "26"}.
 
 {deps, [
+    {idna, "~> 8.0"},
     {nat, "0.5.2"},
     {estun, "0.1.2"}
 ]}.

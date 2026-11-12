@@ -55,7 +55,7 @@ jobs:
         run: |
           test ! -e priv/quic_crypto_nif.so || { echo "NIF built without QUIC_BUILD_NIF=1"; exit 1; }
           rebar3 as test compile
-          erl -noshell -pa _build/test/lib/quic/ebin -eval '
+          erl -noshell -pa _build/test/lib/quic/ebin -pa _build/test/lib/idna/ebin -eval '
             application:ensure_all_started(quic),
             case quic_crypto_nif:is_loaded() of
               false -> halt(0);
@@ -93,7 +93,7 @@ jobs:
         run: |
           test -f priv/quic_crypto_nif.so || { echo "NIF was not built"; exit 1; }
           rebar3 as test compile
-          erl -noshell -pa _build/test/lib/quic/ebin -eval '
+          erl -noshell -pa _build/test/lib/quic/ebin -pa _build/test/lib/idna/ebin -eval '
             application:ensure_all_started(quic),
             case quic_crypto_nif:is_loaded() of
               true -> halt(0);
@@ -150,7 +150,7 @@ jobs:
       - name: Assert the app starts on OTP crypto
         run: |
           if (Test-Path apps/quic/priv/quic_crypto_nif.*) { throw "NIF was built" }
-          erl -noshell -pa _build/default/lib/quic/ebin -eval "{ok, _} = application:ensure_all_started(quic), false = quic_crypto_nif:is_loaded(), halt(0)."
+          erl -noshell -pa _build/default/lib/quic/ebin -pa _build/default/lib/idna/ebin -eval "{ok, _} = application:ensure_all_started(quic), false = quic_crypto_nif:is_loaded(), halt(0)."
 
       - name: Clean
         run: rebar3 clean
@@ -188,7 +188,7 @@ jobs:
             # build would silently drop the NIF coverage.
             test -f priv/quic_crypto_nif.so || { echo "NIF was not built"; exit 1; }
             ./rebar3 as test compile
-            erl -noshell -pa _build/test/lib/quic/ebin -eval '
+            erl -noshell -pa _build/test/lib/quic/ebin -pa _build/test/lib/idna/ebin -eval '
               application:ensure_all_started(quic),
               case quic_crypto_nif:is_loaded() of
                 true -> halt(0);
@@ -405,7 +405,7 @@ jobs:
         run: |
           test -f priv/quic_crypto_nif.so || { echo "NIF was not built"; exit 1; }
           rebar3 as test compile
-          erl -noshell -pa _build/test/lib/quic/ebin -eval '
+          erl -noshell -pa _build/test/lib/quic/ebin -pa _build/test/lib/idna/ebin -eval '
             application:ensure_all_started(quic),
             case quic_crypto_nif:is_loaded() of
               true -> halt(0);
@@ -479,7 +479,7 @@ jobs:
           # one that silently stops being covered fails here.
           for CIPHER in aes_128_gcm aes_256_gcm chacha20_poly1305; do
             LD_PRELOAD=$(gcc -print-file-name=libasan.so) \
-              erl -noshell -pa _build/test/lib/quic/ebin -pa _build/test/lib/quic/test -eval "
+              erl -noshell -pa _build/test/lib/quic/ebin -pa _build/test/lib/idna/ebin -pa _build/test/lib/quic/test -eval "
                 application:ensure_all_started(quic),
                 case quic_crypto_nif:is_loaded() of
                   false -> io:format(\"NIF not loaded, nothing fuzzed~n\"), halt(1);

@@ -64,6 +64,85 @@ bare_wildcard_test() ->
     ?assertEqual(mismatch(<<"localhost">>), check(Ca, Leaf, <<"localhost">>)).
 
 %%====================================================================
+%% Internationalized names: the reference is matched as A-labels
+%%====================================================================
+
+u_label_reference_test_() ->
+    Ca = ca(),
+    Leaf = leaf(Ca, "x", [{dNSName, "xn--bcher-kva.example"}]),
+    [
+        ?_assertEqual(ok, check(Ca, Leaf, Host))
+     || Host <- [
+            <<"bücher.example"/utf8>>,
+            <<"BÜCHER.Example"/utf8>>,
+            %% UTS46 maps fullwidth letters and the ideographic full stop.
+            <<"ｂücher。example"/utf8>>,
+            <<"xn--bcher-kva.example">>
+        ]
+    ] ++
+        [
+            ?_assertEqual(
+                mismatch(<<"bucher.example">>), check(Ca, Leaf, <<"bucher.example">>)
+            ),
+            ?_assertEqual(
+                mismatch(<<"bücher.example.org"/utf8>>),
+                check(Ca, Leaf, <<"bücher.example.org"/utf8>>)
+            )
+        ].
+
+u_label_wildcard_test_() ->
+    Ca = ca(),
+    Leaf = leaf(Ca, "x", [{dNSName, "*.example"}]),
+    Deep = leaf(Ca, "x", [{dNSName, "*.xn--bcher-kva.example"}]),
+    [
+        ?_assertEqual(ok, check(Ca, Leaf, <<"bücher.example"/utf8>>)),
+        ?_assertEqual(ok, check(Ca, Deep, <<"www.bücher.example"/utf8>>)),
+        ?_assertEqual(
+            mismatch(<<"a.bücher.example"/utf8>>), check(Ca, Leaf, <<"a.bücher.example"/utf8>>)
+        ),
+        ?_assertEqual(
+            mismatch(<<"bücher.example"/utf8>>), check(Ca, Deep, <<"bücher.example"/utf8>>)
+        )
+    ].
+
+%% A name that is not a valid IDN fails closed.
+invalid_idn_refused_test_() ->
+    Ca = ca(),
+    Leaf = leaf(Ca, "x", [{dNSName, "*.example"}, {dNSName, "xn--bcher-kva.example"}]),
+    [
+        ?_assertEqual(mismatch(Host), check(Ca, Leaf, Host))
+     || Host <- [
+            <<"bü cher.example"/utf8>>,
+            <<"b\x{2028}cher.example"/utf8>>,
+            <<"bü\x{E000}cher.example"/utf8>>,
+            <<"bü_cher.example"/utf8>>,
+            <<"bücher.example", 255>>,
+            %% A label longer than 63 characters (RFC 5890 Section 2.3.2.1).
+            <<"bü", (binary:copy(<<"c">>, 64))/binary, "her.example"/utf8>>
+        ]
+    ].
+
+%% A presented name that is not ASCII matches nothing, even byte for byte.
+non_ascii_presented_name_refused_test() ->
+    Ca = ca(),
+    Bytes = binary_to_list(<<"bücher.example"/utf8>>),
+    Leaf = leaf(Ca, "x", [{dNSName, Bytes}]),
+    ?assertEqual(
+        mismatch(<<"bücher.example"/utf8>>), check(Ca, Leaf, <<"bücher.example"/utf8>>)
+    ).
+
+%% ASCII names are matched as before, including labels IDNA rejects.
+ascii_reference_unchanged_test_() ->
+    Ca = ca(),
+    Leaf = leaf(Ca, "x", [{dNSName, "foo_bar.example"}, {dNSName, "*.example.org"}]),
+    [
+        ?_assertEqual(ok, check(Ca, Leaf, <<"foo_bar.example">>)),
+        ?_assertEqual(ok, check(Ca, Leaf, <<"FOO_BAR.example">>)),
+        ?_assertEqual(ok, check(Ca, Leaf, <<"a.example.org">>)),
+        ?_assertEqual(mismatch(<<"a.b.example.org">>), check(Ca, Leaf, <<"a.b.example.org">>))
+    ].
+
+%%====================================================================
 %% No DNS-ID or IP-ID: the subject CN is never used
 %%====================================================================
 

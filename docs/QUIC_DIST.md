@@ -59,7 +59,7 @@ erl -name node1@host1 \
     -start_epmd false \
     -quic_dist_port 4433 \
     -config sys.config \
-    -pa _build/default/lib/quic/ebin
+    -pa _build/default/lib/quic/ebin -pa _build/default/lib/idna/ebin
 ```
 
 ### Connecting Nodes
@@ -90,7 +90,7 @@ erl -name debug@host \
     -quic_dist_key  /path/to/key.pem \
     -setcookie <cookie> \
     -config sys.config \
-    -pa _build/default/lib/quic/ebin \
+    -pa _build/default/lib/quic/ebin -pa _build/default/lib/idna/ebin \
     -remsh node1@host1
 ```
 

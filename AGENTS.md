@@ -5,7 +5,7 @@ before you change anything; it applies to every agent and every change.
 
 ## Project Overview
 
-Pure Erlang QUIC implementation (RFC 9000/9001) with zero external dependencies. Requires Erlang/OTP 27 or later and rebar3.
+Pure Erlang QUIC implementation (RFC 9000/9001). Its only dependency is idna (pure Erlang, no dependencies of its own), used to match internationalized host names against certificates. Requires Erlang/OTP 27 or later and rebar3.
 
 ## First principle: compliance, latest spec, safety
 

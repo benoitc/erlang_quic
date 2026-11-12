@@ -45,7 +45,7 @@ run_tcp_bench() {
 
     # Start server node in background
     erl -sname bench_server -setcookie "$COOKIE" \
-        -pa _build/test/lib/quic/ebin \
+        -pa _build/test/lib/quic/ebin -pa _build/test/lib/idna/ebin \
         -pa _build/test/lib/quic/test \
         -noshell -eval "quic_dist_bench:server_loop()." &
     SERVER_PID=$!
@@ -53,7 +53,7 @@ run_tcp_bench() {
 
     # Run client benchmark
     erl -sname bench_client -setcookie "$COOKIE" \
-        -pa _build/test/lib/quic/ebin \
+        -pa _build/test/lib/quic/ebin -pa _build/test/lib/idna/ebin \
         -pa _build/test/lib/quic/test \
         -noshell -eval "
             quic_dist_bench:run('bench_server@$HOST', #{iterations => 5000}),
@@ -95,7 +95,7 @@ EOF
         -start_epmd false \
         -quic_dist_port 9100 \
         -config /tmp/quic_bench_sys \
-        -pa _build/test/lib/quic/ebin \
+        -pa _build/test/lib/quic/ebin -pa _build/test/lib/idna/ebin \
         -pa _build/test/lib/quic/test \
         -noshell -eval "
             application:ensure_all_started(quic),
@@ -111,7 +111,7 @@ EOF
         -start_epmd false \
         -quic_dist_port 9101 \
         -config /tmp/quic_bench_sys \
-        -pa _build/test/lib/quic/ebin \
+        -pa _build/test/lib/quic/ebin -pa _build/test/lib/idna/ebin \
         -pa _build/test/lib/quic/test \
         -noshell -eval "
             application:ensure_all_started(quic),
