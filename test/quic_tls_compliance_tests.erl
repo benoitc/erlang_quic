@@ -477,7 +477,7 @@ parse_server_hello_aes_256_test() ->
 verify_resumption_binder_fails_closed_without_offset_test() ->
     ?assertNot(
         quic_tls:verify_resumption_binder(
-            crypto:strong_rand_bytes(32), aes_128_gcm, <<"ch">>, undefined, <<"binder">>
+            crypto:strong_rand_bytes(32), aes_128_gcm, <<>>, <<"ch">>, undefined, <<"binder">>
         )
     ).
 

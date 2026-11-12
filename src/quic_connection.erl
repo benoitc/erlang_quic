@@ -2802,17 +2802,17 @@ default_cipher_preference() ->
 %% name, ALPN and hash it was issued under (RFC 8446 Sections 4.2.11 and
 %% 4.6.1). It is taken once its binder checks out, so of two handshakes
 %% presenting it only one resumes (RFC 9001 Section 9.2).
-resume_ticket(_Identity, _Binder, _Cipher, _Msg, _Info, #state{
+resume_ticket(_Identity, _Binder, _Cipher, _Hello, _Info, #state{
     cfg = #conn_cfg{ticket_table = undefined}
 }) ->
     error;
 resume_ticket(
-    Identity, Binder, Cipher, Msg, Info, #state{cfg = #conn_cfg{ticket_table = Tab}} = State
+    Identity, Binder, Cipher, Hello, Info, #state{cfg = #conn_cfg{ticket_table = Tab}} = State
 ) ->
     case quic_ticket:lookup_issued(Tab, Identity) of
         {ok, Ticket} ->
             case ticket_matches(Ticket, Cipher, Info, State) of
-                true -> check_resumption_binder(Identity, Ticket, Binder, Cipher, Msg, Info, Tab);
+                true -> check_resumption_binder(Identity, Ticket, Binder, Cipher, Hello, Info, Tab);
                 false -> error
             end;
         error ->
@@ -2828,11 +2828,12 @@ ticket_matches(
             quic_tls_negotiation:negotiate_alpn(ClientALPN, (State#state.cfg)#conn_cfg.alpn_list)) andalso
         (quic_crypto:cipher_to_hash(Issued) =:= quic_crypto:cipher_to_hash(Cipher)).
 
-check_resumption_binder(Identity, Ticket, Binder, Cipher, Msg, Info, Tab) ->
+%% Hello is {the transcript before this ClientHello, the ClientHello}.
+check_resumption_binder(Identity, Ticket, Binder, Cipher, {Prefix, Msg}, Info, Tab) ->
     ResumptionSecret = Ticket#session_ticket.resumption_secret,
     PSK = quic_ticket:derive_psk(ResumptionSecret, Ticket),
     Binders = maps:get(psk_binders, Info, undefined),
-    case quic_tls:verify_resumption_binder(PSK, Cipher, Msg, Binders, Binder) of
+    case quic_tls:verify_resumption_binder(PSK, Cipher, Prefix, Msg, Binders, Binder) of
         true ->
             case quic_ticket:take_issued(Tab, Identity) of
                 {ok, _} -> {ok, PSK, ResumptionSecret};
@@ -8056,14 +8057,22 @@ do_server_client_hello_cont(
     SessionId = maps:get(session_id, ClientHelloInfo, <<>>),
     %% Check for PSK (0-RTT/resumption/external)
     PSKInfo = maps:get(pre_shared_key, ClientHelloInfo, undefined),
-    WantsEarlyData = maps:get(early_data, ClientHelloInfo, false),
+    HrrSent = (State#state.hs)#hs.hrr_sent,
+    %% No early data after a HelloRetryRequest (RFC 9846 Section 4.3.10).
+    WantsEarlyData = maps:get(early_data, ClientHelloInfo, false) andalso not HrrSent,
+    %% message_hash(CH1) and the HRR, which the binder also covers.
+    BinderPrefix =
+        case HrrSent of
+            true -> (State#state.hs)#hs.tls_transcript;
+            false -> <<>>
+        end,
 
     %% TLS 1.3 external PSK selection (RFC 8446 §4.2.11).
     %% Validate pre_shared_key placement, lookup identity, verify
     %% binder. On match the server skips the cert path and uses
     %% the PSK secret in the early_secret derivation below.
     ExternalPskResult = quic_tls:select_psk(
-        ClientHelloInfo, OriginalMsg, KnownPsk, [psk_dhe_ke, psk_ke], Cipher
+        ClientHelloInfo, BinderPrefix, OriginalMsg, KnownPsk, [psk_dhe_ke, psk_ke], Cipher
     ),
 
     HashLen0 =
@@ -8095,7 +8104,12 @@ do_server_client_hello_cont(
                     #{identities := [{Identity, _Age} | _], binders := [Binder | _]} ->
                         case
                             resume_ticket(
-                                Identity, Binder, Cipher, OriginalMsg, ClientHelloInfo, State
+                                Identity,
+                                Binder,
+                                Cipher,
+                                {BinderPrefix, OriginalMsg},
+                                ClientHelloInfo,
+                                State
                             )
                         of
                             {ok, PSK, ResumptionSecret} ->
@@ -8457,27 +8471,18 @@ handle_hello_retry_request(
     #{cipher := Cipher, selected_group := SelGroup}, HrrMsg, State
 ) ->
     Ch1Opts = (State#state.hs)#hs.tls_ch1_opts,
-    PskOffered =
-        Ch1Opts =/= undefined andalso
-            (maps:get(external_psk, Ch1Opts, undefined) =/= undefined orelse
-                maps:get(session_ticket, Ch1Opts, undefined) =/= undefined),
     #conn_cfg{tls_groups = Groups, cipher_preference = Ciphers} = State#state.cfg,
     Offered = lists:member(SelGroup, Groups) andalso lists:member(Cipher, Ciphers),
-    case {(State#state.hs)#hs.hrr_sent, PskOffered, Offered} of
-        {true, _, _} ->
+    case {(State#state.hs)#hs.hrr_sent, Offered} of
+        {true, _} ->
             %% A second HRR is illegal (RFC 8446 §4.1.4).
             notify_owner({error, {tls_alert, unexpected_message}}, State),
             send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State);
-        {_, true, _} ->
-            %% PSK + HRR is out of scope for v1; aborting avoids a
-            %% silent binder-recompute gap.
-            notify_owner({error, {tls_alert, unexpected_message}}, State),
-            send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State);
-        {_, _, false} ->
+        {_, false} ->
             %% Server picked a group or a cipher suite we never offered.
             notify_owner({error, {tls_alert, illegal_parameter}}, State),
             send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
-        {false, false, true} ->
+        {false, true} ->
             %% Synthetic transcript: message_hash(CH1) || HRR. The
             %% current transcript holds exactly CH1.
             CH1Hash = quic_crypto:transcript_hash(Cipher, (State#state.hs)#hs.tls_transcript),
@@ -8485,11 +8490,13 @@ handle_hello_retry_request(
             BaseTranscript = <<Prefix/binary, HrrMsg/binary>>,
 
             %% Rebuild CH2: same random + session_id, key_share moved
-            %% to the server-selected group. supported_groups stays.
+            %% to the server-selected group, a PSK binder over the new
+            %% transcript and no early_data. supported_groups stays.
             Ch2Opts = Ch1Opts#{
                 key_share_group => SelGroup,
                 retry_random => (State#state.hs)#hs.tls_ch1_random,
-                retry_session_id => <<>>
+                retry_session_id => <<>>,
+                hrr_transcript => BaseTranscript
             },
             {CH2, PrivKey, _Random} = quic_tls:build_client_hello(Ch2Opts),
             Transcript = <<BaseTranscript/binary, CH2/binary>>,

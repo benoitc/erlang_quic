@@ -69,8 +69,8 @@
     verify_certificate_verify/4,
 
     %% TLS 1.3 External PSK (RFC 8446 §4.2.11)
-    select_psk/5,
-    verify_resumption_binder/5,
+    select_psk/6,
+    verify_resumption_binder/6,
     parse_extensions_ordered/1
 ]).
 
@@ -84,6 +84,8 @@
 %%   - alpn: List of ALPN protocols (list of binaries)
 %%   - transport_params: QUIC transport parameters (map)
 %%   - session_ticket: #session_ticket{} for resumption with PSK (optional)
+%%   - hrr_transcript: message_hash(CH1) and the HelloRetryRequest, when
+%%     this is the ClientHello that answers one
 %%
 %% Returns: {ClientHelloMsg, PrivateKey, Random}
 -spec build_client_hello(map()) -> {binary(), quic_crypto:kex_private(), binary()}.
@@ -278,7 +280,7 @@ build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer)
     %% early_data extension in the ClientHello (before pre_shared_key, which
     %% must remain the last extension), and only on a ticket that allows it.
     BaseExtensions =
-        case OfferEarlyData of
+        case OfferEarlyData andalso not maps:is_key(hrr_transcript, Opts) of
             true ->
                 <<BaseExtensions0/binary, (encode_extension(?EXT_EARLY_DATA, <<>>))/binary>>;
             false ->
@@ -334,7 +336,9 @@ build_client_hello_with_psk(Random, PubKey, PrivKey, Opts, #psk_offer{} = Offer)
     TruncatedMsg = binary:part(FullMsg, 0, byte_size(FullMsg) - BindersSectionLen),
 
     EarlySecret = quic_crypto:derive_early_secret(Cipher, Secret),
-    TruncatedHash = quic_crypto:transcript_hash(Cipher, TruncatedMsg),
+    %% After a HelloRetryRequest the binder also covers message_hash(CH1) and the HRR.
+    Prefix = maps:get(hrr_transcript, Opts, <<>>),
+    TruncatedHash = quic_crypto:transcript_hash(Cipher, <<Prefix/binary, TruncatedMsg/binary>>),
     Binder = quic_crypto:compute_psk_binder(Cipher, EarlySecret, TruncatedHash, OfferType),
 
     FinalBindersSection = <<(BinderLen + 1):16, BinderLen:8, Binder/binary>>,
@@ -1478,6 +1482,8 @@ psk_binders_offset(OrderedExts, _ExtBlob) ->
 %% `Cipher' is the suite the server selected. An external PSK is
 %%   SHA-256 (RFC 9846 Section 4.3.11), so it is only taken with a
 %%   SHA-256 suite.
+%% `Prefix' is the transcript before this ClientHello: empty, or
+%%   message_hash(CH1) and the HelloRetryRequest (RFC 9846 Section 4.3.11.2).
 %%
 %% Returns:
 %%   `{ok, #{identity_idx => N, secret => Secret, mode => Mode}}` on
@@ -1489,11 +1495,13 @@ psk_binders_offset(OrderedExts, _ExtBlob) ->
 %%   unknown_psk_identity);
 %%   `{error, bad_binder}` when an identity matched but the binder
 %%   didn't verify — caller MUST send decrypt_error (no cert fallback).
--spec select_psk(map(), binary(), {ok, map()} | none, [psk_dhe_ke | psk_ke], atom()) ->
+-spec select_psk(
+    map(), binary(), binary(), {ok, map()} | none, [psk_dhe_ke | psk_ke], atom()
+) ->
     {ok, map()} | none | {error, bad_binder}.
-select_psk(_CH, _FullMsg, none, _ServerModes, _Cipher) ->
+select_psk(_CH, _Prefix, _FullMsg, none, _ServerModes, _Cipher) ->
     none;
-select_psk(_CH, _FullMsg, _Known, _ServerModes, aes_256_gcm) ->
+select_psk(_CH, _Prefix, _FullMsg, _Known, _ServerModes, aes_256_gcm) ->
     none;
 select_psk(
     #{
@@ -1501,6 +1509,7 @@ select_psk(
         psk_key_exchange_modes := ClientModes,
         psk_binders := PskBindersInfo
     },
+    Prefix,
     FullHandshakeMsg,
     {ok, #{identity_idx := Idx, secret := Secret} = Known},
     ServerModes,
@@ -1511,7 +1520,7 @@ select_psk(
             none;
         [SelectedMode | _] ->
             TruncatedHash = truncated_client_hello_hash(
-                FullHandshakeMsg, PskBindersInfo, Cipher
+                Prefix, FullHandshakeMsg, PskBindersInfo, Cipher
             ),
             Binder = lists:nth(Idx + 1, Binders),
             case verify_psk_binder(Secret, Cipher, TruncatedHash, Binder) of
@@ -1520,7 +1529,7 @@ select_psk(
                 false -> {error, bad_binder}
             end
     end;
-select_psk(_, _, _, _, _) ->
+select_psk(_, _, _, _, _, _) ->
     none.
 
 mode_intersection(Client, Server) ->
@@ -1529,7 +1538,9 @@ mode_intersection(Client, Server) ->
 %% @private
 %% Slice the full handshake bytes down to the truncated ClientHello
 %% and compute its transcript hash.
-truncated_client_hello_hash(FullHandshakeMsg, #{binders_offset := BindersOffInExt}, Cipher) ->
+truncated_client_hello_hash(
+    Prefix, FullHandshakeMsg, #{binders_offset := BindersOffInExt}, Cipher
+) ->
     %% Handshake header = 4 bytes (msg_type:8, length:24).
     %% After that comes the body: legacy_version(2) + random(32) +
     %% session_id(1+N) + cipher_suites(2+N) + compression(1+N) +
@@ -1544,7 +1555,7 @@ truncated_client_hello_hash(FullHandshakeMsg, #{binders_offset := BindersOffInEx
     %% binder bytes are removed. FullHandshakeMsg already carries the
     %% full-length header, so hash its prefix as-is without rewrapping.
     <<TruncatedBytes:AbsoluteBindersOff/binary, _/binary>> = FullHandshakeMsg,
-    quic_crypto:transcript_hash(Cipher, TruncatedBytes).
+    quic_crypto:transcript_hash(Cipher, <<Prefix/binary, TruncatedBytes/binary>>).
 
 %% @private — find where the extensions blob starts within a
 %% ClientHello body.
@@ -1565,18 +1576,24 @@ verify_psk_binder(Secret, Cipher, TruncatedHash, OfferedBinder) ->
 %% @doc Verify a resumption PSK binder against a parsed ClientHello.
 %% `Secret' is the resumption PSK, `PskBindersInfo' is the `psk_binders'
 %% map from `parse_client_hello/1', and `OfferedBinder' is the binder the
-%% client sent. Uses the "res binder" label (RFC 8446 §4.2.11.2).
--spec verify_resumption_binder(binary(), atom(), binary(), map(), binary()) -> boolean().
-verify_resumption_binder(Secret, Cipher, FullClientHello, PskBindersInfo, OfferedBinder) when
+%% client sent. `Prefix' is as for select_psk/6. Uses the "res binder"
+%% label (RFC 8446 §4.2.11.2).
+-spec verify_resumption_binder(binary(), atom(), binary(), binary(), map(), binary()) ->
+    boolean().
+verify_resumption_binder(
+    Secret, Cipher, Prefix, FullClientHello, PskBindersInfo, OfferedBinder
+) when
     is_map(PskBindersInfo)
 ->
-    TruncatedHash = truncated_client_hello_hash(FullClientHello, PskBindersInfo, Cipher),
+    TruncatedHash = truncated_client_hello_hash(
+        Prefix, FullClientHello, PskBindersInfo, Cipher
+    ),
     EarlySecret = quic_crypto:derive_early_secret(Cipher, Secret),
     Expected = quic_crypto:compute_psk_binder(
         Cipher, EarlySecret, TruncatedHash, resumption
     ),
     hash_equals(Expected, OfferedBinder);
-verify_resumption_binder(_Secret, _Cipher, _FullClientHello, _PskBindersInfo, _OfferedBinder) ->
+verify_resumption_binder(_Secret, _Cipher, _Prefix, _FullClientHello, _PskBindersInfo, _Binder) ->
     %% Missing binder offset info — cannot verify, fail closed.
     false.
 

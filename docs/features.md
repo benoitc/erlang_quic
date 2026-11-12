@@ -429,9 +429,6 @@ mark known gaps that may land in a later release.
   generation and key_share wiring deferred).
 - [ ] Ed448 / ECDSA secp521r1-SHA512 signature schemes (constants
   defined; sign/verify branches deferred).
-- [ ] PSK + HelloRetryRequest in one handshake. Currently the client
-  aborts if HRR follows a PSK ClientHello (binder recompute over the
-  synthetic transcript is not implemented).
 
 ## Interop Runner Compliance
 
