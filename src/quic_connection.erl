@@ -6582,6 +6582,13 @@ process_frame(
             close_with_transport_error(
                 ?QUIC_FLOW_CONTROL_ERROR, <<"RESET_STREAM final size above limit">>, State
             );
+        {ok, #stream_state{recv_reset_at = R, recv_reset_error = Code}} when
+            R =/= undefined andalso Code =/= ErrorCode
+        ->
+            %% draft-ietf-quic-reliable-stream-reset-11 Section 5.2
+            close_with_transport_error(
+                ?QUIC_STREAM_STATE_ERROR, <<"RESET_STREAM error_code changed">>, State
+            );
         {ok, #stream_state{recv_done = true, final_size = FinalSize}} ->
             State;
         {ok, Stream} ->
@@ -6636,11 +6643,8 @@ process_frame(
                     close_with_transport_error(
                         ?QUIC_STREAM_STATE_ERROR, <<"RESET_STREAM_AT error_code changed">>, State
                     );
-                {ok, #stream_state{recv_reset_at = ExistingReliable}} when
-                    ExistingReliable =/= undefined andalso ReliableSize > ExistingReliable
-                ->
-                    %% Spec: Ignore if ReliableSize increased (not an error, just ignore)
-                    State;
+                {ok, #stream_state{recv_reset_error = Code} = Stream} when Code =/= undefined ->
+                    lower_recv_reset_at(StreamId, ReliableSize, Stream, State);
                 {ok, Stream} ->
                     case reset_size_error(Stream, FinalSize, State) of
                         {Code, Reason} ->
@@ -10555,16 +10559,36 @@ accept_reset_stream(
             final_size = FinalSize,
             recv_done = true,
             recv_buffer = gb_trees:empty(),
-            recv_buffered = 0
+            recv_buffered = 0,
+            recv_reset_at = zero_if_set(Stream#stream_state.recv_reset_at),
+            recv_reset_error = ErrorCode
         },
         Streams
     ),
     %% Data delivered earlier in this receive pass reaches the
     %% owner before the reset notification.
     StateFl = flush_pending_delivery(State),
-    notify_stream_reset(StreamId, ErrorCode, FinalSize, State),
+    %% After the peer's RESET_STREAM_AT it is Reliable Size 0, already reported.
+    case Stream#stream_state.recv_reset_error of
+        undefined -> notify_stream_reset(StreamId, ErrorCode, FinalSize, State);
+        _ -> ok
+    end,
     State1 = account_reset_stream(Stream, FinalSize, StateFl#state{streams = NewStreams}),
     maybe_reclaim_stream(StreamId, State1).
+
+%% After the peer's reset, a RESET_STREAM_AT only lowers the reliable size (reset-11 Section 5.2).
+lower_recv_reset_at(StreamId, ReliableSize, #stream_state{recv_reset_at = R} = Stream, State) when
+    is_integer(R), ReliableSize < R
+->
+    Delivered = (Stream#stream_state.recv_offset >= ReliableSize),
+    Lowered = Stream#stream_state{
+        recv_reset_at = ReliableSize, recv_done = Delivered orelse Stream#stream_state.recv_done
+    },
+    maybe_reclaim_stream(StreamId, State#state{
+        streams = maps:put(StreamId, Lowered, State#state.streams)
+    });
+lower_recv_reset_at(_StreamId, _ReliableSize, _Stream, State) ->
+    State.
 
 %% The owner hears of a peer's reset; with stream_reset_final_size it is
 %% also told the stream's final size, the bytes the peer counts against
@@ -10577,6 +10601,9 @@ notify_stream_reset(StreamId, ErrorCode, FinalSize, #state{owner = Owner, cfg = 
         end,
     Owner ! {quic, self(), Event},
     ok.
+
+zero_if_set(undefined) -> undefined;
+zero_if_set(_) -> 0.
 
 %% A RESET_STREAM for a stream not seen yet opens it already reset.
 reset_unseen_stream(
@@ -10598,7 +10625,10 @@ reset_unseen_stream(
                             NewStreams = maps:put(
                                 StreamId,
                                 NewStream#stream_state{
-                                    state = reset, final_size = FinalSize, recv_done = true
+                                    state = reset,
+                                    final_size = FinalSize,
+                                    recv_done = true,
+                                    recv_reset_error = ErrorCode
                                 },
                                 Streams
                             ),
