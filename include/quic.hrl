@@ -57,7 +57,7 @@
 -define(FRAME_DATAGRAM, 16#30).
 -define(FRAME_DATAGRAM_WITH_LEN, 16#31).
 
-%% RESET_STREAM_AT Frame (draft-ietf-quic-reliable-stream-reset-07)
+%% RESET_STREAM_AT Frame (draft-ietf-quic-reliable-stream-reset-11 Section 4)
 -define(FRAME_RESET_STREAM_AT, 16#24).
 
 %%====================================================================
@@ -706,7 +706,7 @@
     %% deadline_error_code: error code for RESET_STREAM on deadline expiry
     deadline_error_code = 16#FF :: non_neg_integer(),
 
-    %% RESET_STREAM_AT reliable size (draft-ietf-quic-reliable-stream-reset-07)
+    %% RESET_STREAM_AT reliable size (draft-ietf-quic-reliable-stream-reset-11 Section 5)
     %% Direction-split: send_* is our local reset reliable size, recv_* is the
     %% peer's. A bidi stream can carry both without clashing.
     send_reset_at = undefined :: non_neg_integer() | undefined,

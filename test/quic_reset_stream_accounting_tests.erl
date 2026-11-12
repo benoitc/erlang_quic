@@ -48,7 +48,7 @@ repeated_reset_is_counted_once_test() ->
     ?assertEqual(1, length(resets_notified())).
 
 %% The bytes below the reliable size still arrive, and are not counted
-%% again (draft-ietf-quic-reliable-stream-reset-07).
+%% again (draft-ietf-quic-reliable-stream-reset-11 Section 5.3).
 reset_stream_at_counts_the_final_size_test() ->
     S0 = reset_at(1000, 500, server_reset_at(100)),
     ?assertEqual(1000, S0#state.data_received),

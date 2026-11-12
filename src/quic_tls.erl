@@ -800,7 +800,7 @@ encode_transport_param(preferred_address, #preferred_address{} = PA) ->
     encode_tp(?TP_PREFERRED_ADDRESS, encode_preferred_address(PA));
 encode_transport_param(max_datagram_frame_size, Value) when Value > 0 ->
     encode_tp(?TP_MAX_DATAGRAM_FRAME_SIZE, quic_varint:encode(Value));
-%% draft-ietf-quic-reliable-stream-reset-07 - Reliable RESET_STREAM
+%% draft-ietf-quic-reliable-stream-reset-11 Section 3 - Reliable RESET_STREAM
 encode_transport_param(reset_stream_at, true) ->
     <<
         (encode_tp(?TP_RESET_STREAM_AT, <<>>))/binary,

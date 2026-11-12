@@ -1841,7 +1841,7 @@ connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
 %% RESET_STREAM_AT: Reset with reliable delivery up to ReliableSize
-%% (draft-ietf-quic-reliable-stream-reset-07)
+%% (draft-ietf-quic-reliable-stream-reset-11 Section 5)
 connected(
     {call, From}, {set_stream_reliable_size, StreamId, Size}, #state{streams = Streams} = State
 ) ->
@@ -2658,7 +2658,7 @@ send_client_hello(State) ->
             0 -> TransportParams0;
             _ -> TransportParams0#{max_datagram_frame_size => MaxDatagramSize}
         end,
-    %% Add reset_stream_at if enabled (draft-ietf-quic-reliable-stream-reset-07)
+    %% Add reset_stream_at if enabled (draft-ietf-quic-reliable-stream-reset-11 Section 3)
     TransportParams =
         case (State#state.cfg)#conn_cfg.reset_stream_at_enabled of
             false -> TransportParams1;
@@ -3039,7 +3039,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
             0 -> TransportParams0;
             _ -> TransportParams0#{max_datagram_frame_size => MaxDatagramSize}
         end,
-    %% Add reset_stream_at if enabled (draft-ietf-quic-reliable-stream-reset-07)
+    %% Add reset_stream_at if enabled (draft-ietf-quic-reliable-stream-reset-11 Section 3)
     TransportParams2 =
         case (State#state.cfg)#conn_cfg.reset_stream_at_enabled of
             false -> TransportParams1;
@@ -6615,7 +6615,7 @@ process_frame(
         State
     );
 %% RESET_STREAM_AT: Peer is aborting a stream with reliable delivery guarantee
-%% draft-ietf-quic-reliable-stream-reset-07
+%% draft-ietf-quic-reliable-stream-reset-11 Section 4
 process_frame(
     app,
     {reset_stream_at, StreamId, ErrorCode, FinalSize, ReliableSize},
@@ -8687,7 +8687,7 @@ do_process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
 clamp_recv_reset_at(StreamId, Offset, Data, Fin, State) ->
     End = Offset + byte_size(Data),
     case maps:find(StreamId, State#state.streams) of
-        %% Past the final size, or a FIN that moves it (reset-11 Section 5.2).
+        %% Past the final size, or a FIN that moves it (draft-ietf-quic-reliable-stream-reset-11 Section 5.2).
         {ok, #stream_state{recv_reset_at = R, final_size = FS}} when
             R =/= undefined andalso (End > FS orelse (Fin andalso End =/= FS))
         ->
@@ -10576,7 +10576,7 @@ accept_reset_stream(
     State1 = account_reset_stream(Stream, FinalSize, StateFl#state{streams = NewStreams}),
     maybe_reclaim_stream(StreamId, State1).
 
-%% After the peer's reset, a RESET_STREAM_AT only lowers the reliable size (reset-11 Section 5.2).
+%% After a reset, RESET_STREAM_AT only lowers the reliable size (draft-ietf-quic-reliable-stream-reset-11 Section 5.2).
 lower_recv_reset_at(StreamId, ReliableSize, #stream_state{recv_reset_at = R} = Stream, State) when
     is_integer(R), ReliableSize < R
 ->
@@ -12160,7 +12160,7 @@ do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
             {reset_stream, _, Code, FinalSize} =
                 ResetFrame = reset_frame(StreamId, ErrorCode, StreamState, State),
             NewState = send_frame(ResetFrame, State),
-            %% Reliable Size 0 for any later RESET_STREAM_AT (reset-11 Section 5.2).
+            %% Reliable Size 0 from here on (draft-ietf-quic-reliable-stream-reset-11 Section 5.2).
             UpdatedStream = StreamState#stream_state{
                 state = reset,
                 deadline_timer = undefined,
@@ -12179,7 +12179,7 @@ do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
             {error, unknown_stream}
     end.
 
-%% A RESET_STREAM after our RESET_STREAM_AT repeats its code and final size (reset-11 Section 5.2).
+%% Repeats our RESET_STREAM_AT's code and final size (draft-ietf-quic-reliable-stream-reset-11 Section 5.2).
 reset_frame(StreamId, ErrorCode, #stream_state{send_reset_at = undefined} = Stream, State) ->
     {reset_stream, StreamId, ErrorCode, reset_final_size(StreamId, Stream, State)};
 reset_frame(
@@ -12203,7 +12203,7 @@ do_stop_sending(StreamId, ErrorCode, #state{streams = Streams} = State) ->
     end.
 
 %% RESET_STREAM_AT: Reset stream with reliable delivery up to ReliableSize
-%% (draft-ietf-quic-reliable-stream-reset-07)
+%% (draft-ietf-quic-reliable-stream-reset-11 Section 5)
 do_reset_stream_at(
     StreamId,
     ErrorCode,
@@ -12246,7 +12246,7 @@ do_reset_stream_at_with_stream(StreamId, ErrorCode, ReliableSize, StreamState, S
             Error
     end.
 
-%% What was sent plus the queued reliable bytes, then fixed (reset-11 Section 4).
+%% What was sent plus the queued reliable bytes, then fixed (draft-ietf-quic-reliable-stream-reset-11 Section 4).
 reset_at_final_size(
     _StreamId, _ReliableSize, #stream_state{send_reset_at = RS} = Stream, _State
 ) when
@@ -12995,7 +12995,7 @@ is_current_limit(_, _State) ->
 %% Lost stream data is not resent once the send side is done: after a
 %% RESET_STREAM (RFC 9000 Section 3.1), or with the stream gone. Data
 %% beyond ReliableSize for streams with RESET_STREAM_AT is dropped too
-%% (draft-ietf-quic-reliable-stream-reset-07: SHOULD NOT be retransmitted).
+%% (draft-ietf-quic-reliable-stream-reset-11 Section 5: SHOULD NOT be retransmitted).
 filter_reset_stream_at_data(Frames, #state{streams = Streams}) ->
     lists:filtermap(
         fun(Frame) ->
