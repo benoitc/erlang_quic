@@ -24,6 +24,24 @@ All notable changes to this project will be documented in this file.
   connections, listeners, their supervisors and the processes that keep
   their options or session tickets printed private keys, PSKs, TLS
   secrets and packet protection keys. These are no longer shown.
+- With the optional crypto NIF built, a protected 1-RTT packet with an
+  empty payload made the receive path read frames from memory past the
+  decrypted packet. Only the decrypted bytes are read now, so such a
+  packet carries no frames and is rejected.
+- QUIC distribution with `verify_peer` and no CA still started its
+  early-boot listener, which then checked node certificates against the
+  system trust store. That listener now refuses to start, as the
+  supervised one already did. A `cacert` was also ignored when the
+  certificate came from files, and a `cacert_file` when the certificate
+  was given inline; the CA now applies however the certificate is given.
+- QUIC distribution read some malformed security settings as a default:
+  an unrecognised `verify` value as `verify_none`, a malformed
+  `auth_callback` or `psk_callback` as no callback, and a setting
+  repeated on the command line as unset. A malformed setting, a
+  repeated or unknown `-quic_dist` setting, or a certificate without
+  its key now stops distribution from starting, and connection setup,
+  with `{bad_config, Reason}`. One `-quic_dist` flag can now carry
+  several settings.
 
 ### Added
 - An auth callback can return `{ok, {authenticated_node, Node}}`;
