@@ -5,7 +5,7 @@
 %%% Performs the two checks RFC 9846 requires of a client after it
 %%% receives the server's Certificate message: chain validation against
 %%% a set of trust anchors (§4.5.1.3) and identity (hostname) matching
-%%% (RFC 6125). Signature verification of CertificateVerify is handled
+%%% (RFC 9525). Signature verification of CertificateVerify is handled
 %%% in `quic_tls:verify_certificate_verify/4'; this module covers the
 %%% chain and the name.
 
@@ -249,18 +249,72 @@ verify_hostname(Leaf, ServerName) when is_binary(ServerName) ->
             {ok, IP} -> {ip, IP};
             {error, _} -> {dns_id, Host}
         end,
-    case safe_verify_hostname(Leaf, RefId) of
+    case has_san_id(Leaf) andalso safe_verify_hostname(Leaf, RefId) of
         true -> ok;
         false -> {error, {hostname_mismatch, ServerName}}
     end.
 
-%% The `https' match fun applies the RFC 6125 §6.4.3 wildcard rules, which
-%% OTP's default match fun leaves out: without it a leftmost-label wildcard
-%% (`*.example.com') never matches, so wildcard-only servers are rejected.
-safe_verify_hostname(Leaf, RefId) ->
-    try
-        MatchFun = public_key:pkix_verify_hostname_match_fun(https),
-        public_key:pkix_verify_hostname(Leaf, [RefId], [{match_fun, MatchFun}])
+%% RFC 9525 Section 2: the subject CN never identifies a service, so a
+%% leaf without a DNS-ID or IP-ID in subjectAltName matches no name.
+has_san_id(Leaf) ->
+    try public_key:pkix_decode_cert(Leaf, otp) of
+        #'OTPCertificate'{tbsCertificate = #'OTPTBSCertificate'{extensions = Exts}} ->
+            lists:any(fun is_san_id/1, san_entries(Exts))
     catch
         _:_ -> false
     end.
+
+san_entries(Exts) when is_list(Exts) ->
+    case lists:keyfind(?'id-ce-subjectAltName', #'Extension'.extnID, Exts) of
+        #'Extension'{extnValue = Names} when is_list(Names) -> Names;
+        _ -> []
+    end;
+san_entries(_) ->
+    [].
+
+is_san_id({dNSName, _}) -> true;
+is_san_id({iPAddress, _}) -> true;
+is_san_id(_) -> false.
+
+safe_verify_hostname(Leaf, RefId) ->
+    try
+        public_key:pkix_verify_hostname(Leaf, [RefId], [{match_fun, fun match_id/2}])
+    catch
+        _:_ -> false
+    end.
+
+%% DNS-IDs follow RFC 9525 Section 6.3; IP-IDs use OTP's octet-exact
+%% comparison (Section 6.4); nothing else matches.
+match_id({dns_id, Ref}, {dNSName, Presented}) ->
+    match_dns_id(Ref, Presented);
+match_id({ip, _}, {iPAddress, _}) ->
+    default;
+match_id(_, _) ->
+    false.
+
+match_dns_id(Ref, Presented) when is_list(Ref), is_list(Presented) ->
+    RefLabels = string:split(lower_ascii(Ref), ".", all),
+    case string:split(lower_ascii(Presented), ".", all) of
+        ["*" | Rest] ->
+            match_wildcard(RefLabels, Rest);
+        Labels ->
+            not lists:member($*, Presented) andalso Labels =:= RefLabels
+    end;
+match_dns_id(_, _) ->
+    false.
+
+%% A wildcard is the whole leftmost label and stands for exactly one
+%% non-empty label of the reference identifier; a bare `*' names no domain.
+match_wildcard(_RefLabels, []) ->
+    false;
+match_wildcard([First | RefRest], Rest) ->
+    First =/= "" andalso
+        not lists:member($*, First) andalso
+        not lists:member($*, lists:append(Rest)) andalso
+        RefRest =:= Rest.
+
+lower_ascii(S) ->
+    [lower_char(C) || C <- S].
+
+lower_char(C) when C >= $A, C =< $Z -> C + ($a - $A);
+lower_char(C) -> C.

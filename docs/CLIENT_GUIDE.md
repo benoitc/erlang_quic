@@ -548,8 +548,10 @@ end.
 ```
 
 The name in `server_name` (or the host you passed to `quic:connect/4`) is
-matched against the certificate under the RFC 6125 HTTPS rules: a `*.example.com`
+matched against the certificate's subjectAltName under RFC 9525: a `*.example.com`
 SAN matches `host.example.com`, but not `example.com` and not `a.b.example.com`.
+A wildcard counts only as the whole leftmost label, and a certificate with no
+DNS or IP subjectAltName matches no name; its subject CN is not used.
 
 ### 2. Connection Pooling
 

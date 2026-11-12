@@ -137,7 +137,7 @@ Last checked: 2026-11-08; the TLS table 2026-11-12.
 | RFC 5869 HKDF | key schedule |
 | RFC 6066 TLS extensions | SNI |
 | RFC 7301 ALPN | protocol negotiation |
-| RFC 6125 service identity (obsoleted by RFC 9525) | hostname checks on the server certificate |
+| RFC 9525 service identity | hostname checks on the server certificate |
 
 ### HTTP/3
 
@@ -202,7 +202,6 @@ before any code changes.
 
 | Spec | Code follows | Latest | To check |
 |---|---|---|---|
-| Service identity | RFC 6125 | RFC 9525 | wildcard and CN-ID rules in `quic_cert` hostname checks |
 | Reliable stream reset | draft-ietf-quic-reliable-stream-reset-07 | -11 | frame type (`16#24`) and transport parameter id, Reliable Size and Final Size rules |
 | QUIC-LB | revision not recorded | draft-ietf-quic-load-balancers-22 | CID formats, config rotation bits, encryption modes in `quic_lb`; fix the "RFC 9312" citation |
 | BBR | revision not recorded | draft-ietf-ccwg-bbr-07 | state machine and gains in `quic_cc_bbr`; record the revision followed |
