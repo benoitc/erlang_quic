@@ -14,7 +14,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -export([validate_server/4, validate_client/3, cacerts_from_file/1, resolve_cacerts/1]).
--export([requests_client_cert/1, check_client_auth/1, host_address/1, a_labels/1]).
+-export([requests_client_cert/1, check_client_auth/1, host_address/1, dns_name/1]).
 
 -define(MAX_PATH_LENGTH, 10).
 
@@ -254,34 +254,69 @@ verify_hostname(Leaf, ServerName) when is_binary(ServerName) ->
     end.
 
 %% RFC 9525 Section 6.3: a reference name is matched in its A-label
-%% form. A name that is not a valid IDN matches nothing.
+%% form. A name that is not a valid host name matches nothing.
 dns_reference(ServerName) ->
-    case a_labels(ServerName) of
+    case dns_name(ServerName) of
         {ok, Name} -> {dns_id, binary_to_list(Name)};
         error -> error
     end.
 
-%% @doc A host name in A-label form (UTS 46 mapping, STD3 rules), as
-%% matched against certificates and sent as SNI; an ASCII name is
-%% returned as is. `error' when the name is not a valid IDN.
--spec a_labels(binary()) -> {ok, binary()} | error.
-a_labels(ServerName) when is_binary(ServerName) ->
+%% @doc A host name as matched against certificates and sent as SNI:
+%% without a trailing dot, internationalized labels as A-labels (UTS 46
+%% mapping, STD3 rules). `error' when the result is not a host name
+%% (labels of 1 to 63 letters, digits, `-' or `_', at most 253 octets)
+%% or is an IP address.
+-spec dns_name(binary()) -> {ok, binary()} | error.
+dns_name(ServerName) when is_binary(ServerName) ->
     case unicode:characters_to_list(ServerName) of
-        Name when is_list(Name) ->
-            case is_ascii(Name) of
-                true -> {ok, ServerName};
-                false -> encode_idn(Name)
+        Name0 when is_list(Name0) ->
+            Name = drop_trailing_dot(Name0),
+            Encoded =
+                case is_ascii(Name) of
+                    true -> {ok, Name};
+                    false -> encode_idn(Name)
+                end,
+            case Encoded of
+                {ok, Ascii} ->
+                    case is_host_name(Ascii) of
+                        true -> {ok, list_to_binary(Ascii)};
+                        false -> error
+                    end;
+                error ->
+                    error
             end;
         _ ->
             error
     end.
 
+drop_trailing_dot(Name) ->
+    case lists:reverse(Name) of
+        [$. | Rest] -> lists:reverse(Rest);
+        _ -> Name
+    end.
+
 encode_idn(Name) ->
     try idna:encode(Name, [uts46, {std3_rules, true}]) of
-        ALabels when is_list(ALabels) -> {ok, list_to_binary(ALabels)}
+        ALabels when is_list(ALabels) -> {ok, ALabels}
     catch
         _:_ -> error
     end.
+
+%% An address with a trailing dot ("127.0.0.1.") is not a host name.
+is_host_name(Name) ->
+    length(Name) =< 253 andalso
+        lists:all(fun is_host_label/1, string:split(Name, ".", all)) andalso
+        host_address(Name) =:= error.
+
+is_host_label(Label) ->
+    Label =/= [] andalso length(Label) =< 63 andalso lists:all(fun is_label_char/1, Label).
+
+is_label_char(C) when C >= $a, C =< $z -> true;
+is_label_char(C) when C >= $A, C =< $Z -> true;
+is_label_char(C) when C >= $0, C =< $9 -> true;
+is_label_char($-) -> true;
+is_label_char($_) -> true;
+is_label_char(_) -> false.
 
 is_ascii(Name) ->
     lists:all(fun(C) -> is_integer(C) andalso C >= 0 andalso C < 128 end, Name).

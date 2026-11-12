@@ -454,20 +454,20 @@ build_client_hello_extensions(PubKey, Opts) ->
         Cookie
     ]).
 
-%% RFC 6066 Section 3: an IP literal, bracketed or not, is not a
-%% HostName, so it is not sent; an internationalized name is sent as
-%% A-labels, and one that is not a valid IDN is not sent.
+%% RFC 6066 Section 3: HostName is a DNS host name in ASCII without a
+%% trailing dot. An IP literal, bracketed or not, is not sent; neither
+%% is a name that is not a valid host name.
 sni_host_name(Name) when is_binary(Name) ->
     case quic_cert:host_address(Name) of
         {ok, _} -> undefined;
-        error -> sni_a_labels(Name)
+        error -> sni_dns_name(Name)
     end;
 sni_host_name(undefined) ->
     undefined.
 
-sni_a_labels(Name) ->
-    case quic_cert:a_labels(Name) of
-        {ok, ALabels} -> ALabels;
+sni_dns_name(Name) ->
+    case quic_cert:dns_name(Name) of
+        {ok, HostName} -> HostName;
         error -> undefined
     end.
 

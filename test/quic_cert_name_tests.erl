@@ -142,6 +142,49 @@ u_label_sni_test_() ->
         ?_assertEqual(undefined, hello_sni(<<"bücher.example", 255>>))
     ].
 
+%% A reference that is not a host name matches nothing, even a dNSName
+%% spelled the same, and is not sent as SNI.
+malformed_reference_refused_test_() ->
+    Ca = ca(),
+    Long = binary:copy(<<"a">>, 64),
+    TooLong = iolist_to_binary(lists:join(".", lists:duplicate(4, binary:copy(<<"b">>, 63)))),
+    Names = [
+        <<"[v1.ab]">>,
+        <<"[::1].">>,
+        <<"[::1]:443">>,
+        <<"a..example">>,
+        <<"*.example.com">>,
+        <<" a.example">>,
+        <<"a.example:443">>,
+        <<"a%25.example">>,
+        <<".">>,
+        <<"127.0.0.1.">>,
+        <<"127.1.">>,
+        <<Long/binary, ".example">>,
+        TooLong
+    ],
+    [
+        {binary_to_list(N), [
+            ?_assertEqual(mismatch(N), check(Ca, leaf(Ca, "x", [{dNSName, binary_to_list(N)}]), N)),
+            ?_assertEqual(undefined, hello_sni(N))
+        ]}
+     || N <- Names
+    ].
+
+%% A trailing dot names the same host; it is matched and sent without it
+%% (RFC 6066 Section 3).
+trailing_dot_test_() ->
+    Ca = ca(),
+    Leaf = leaf(Ca, "x", [{dNSName, "foo.example.com"}]),
+    Idn = leaf(Ca, "x", [{dNSName, "xn--bcher-kva.example"}]),
+    [
+        ?_assertEqual(ok, check(Ca, Leaf, <<"foo.example.com.">>)),
+        ?_assertEqual(ok, check(Ca, Idn, <<"bücher.example."/utf8>>)),
+        ?_assertEqual(<<"foo.example.com">>, hello_sni(<<"foo.example.com.">>)),
+        ?_assertEqual(<<"xn--bcher-kva.example">>, hello_sni(<<"bücher.example."/utf8>>)),
+        ?_assertEqual(mismatch(<<"foo.example.com..">>), check(Ca, Leaf, <<"foo.example.com..">>))
+    ].
+
 %% ASCII names are matched as before, including labels IDNA rejects.
 ascii_reference_unchanged_test_() ->
     Ca = ca(),
