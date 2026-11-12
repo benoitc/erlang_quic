@@ -1,6 +1,6 @@
 ---
 name: rfc-compliance
-description: Check a change, commit or pull request in erlang_quic against the RFCs it claims to follow (RFC 9000, 9001, 9002, 9221, 9287, 9368, 9369, 8446, 8899, drafts). Use when reviewing a PR, before merging a protocol fix, or when asked whether code complies with the spec.
+description: Check a change, commit or pull request in erlang_quic against the RFCs it claims to follow (RFC 9000, 9001, 9002, 9221, 9287, 9368, 9369, 9846, 8899, drafts). Use when reviewing a PR, before merging a protocol fix, or when asked whether code complies with the spec.
 ---
 
 # RFC compliance check
@@ -14,7 +14,7 @@ Never quote the RFC from memory. Fetch the plain text once and grep it:
 
 ```bash
 mkdir -p "$SCRATCH/rfc" && cd "$SCRATCH/rfc"
-for r in 9000 9001 9002 9221 9287 9368 9369 8446 8899; do
+for r in 9000 9001 9002 9221 9287 9368 9369 9846 8899; do
   [ -f rfc$r.txt ] || curl -sfL https://www.rfc-editor.org/rfc/rfc$r.txt -o rfc$r.txt
 done
 grep -n "MUST discard any subsequent Retry" rfc9000.txt
