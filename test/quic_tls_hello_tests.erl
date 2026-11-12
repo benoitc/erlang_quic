@@ -57,6 +57,28 @@ client_hello_offering_only_tls12_test() ->
     ).
 
 %%====================================================================
+%% ClientHello legacy fields (RFC 9846 Section 4.2.2)
+%%====================================================================
+
+client_hello_legacy_version_test_() ->
+    [
+        ?_assertEqual(
+            {tls_alert, ?TLS_ALERT_PROTOCOL_VERSION},
+            server_close(with_legacy_version(V, client_hello()))
+        )
+     || V <- [16#0301, ?TLS_VERSION_1_3, 16#7f1c]
+    ].
+
+client_hello_compression_test_() ->
+    [
+        ?_assertEqual(
+            {tls_alert, ?TLS_ALERT_ILLEGAL_PARAMETER},
+            server_close(with_compression(M, client_hello()))
+        )
+     || M <- [<<1>>, <<1, 0>>, <<0, 1>>]
+    ].
+
+%%====================================================================
 %% HelloRetryRequest (RFC 9846 Section 4.2.4)
 %%====================================================================
 
@@ -242,6 +264,15 @@ parsed_client_hello(<<?TLS_CLIENT_HELLO, Len:24, Body:Len/binary>>) ->
 retried_client_hello(#state{hs = #hs{tls_transcript = Transcript}}) ->
     <<254, 32:24, _:32/binary, ?TLS_SERVER_HELLO, Len:24, _:Len/binary, CH2/binary>> = Transcript,
     parsed_client_hello(CH2).
+
+with_legacy_version(V, <<Type, Len:24, _:16, Rest/binary>>) ->
+    <<Type, Len:24, V:16, Rest/binary>>.
+
+with_compression(M, <<?TLS_CLIENT_HELLO, _:24, Body/binary>>) ->
+    <<V:16, R:32/binary, SL, S:SL/binary, CL:16, C:CL/binary, ML, _:ML/binary, Exts/binary>> =
+        Body,
+    New = <<V:16, R/binary, SL, S/binary, CL:16, C/binary, (byte_size(M)), M/binary, Exts/binary>>,
+    <<?TLS_CLIENT_HELLO, (byte_size(New)):24, New/binary>>.
 
 add_ext(Type, Data, Msg) ->
     map_exts(fun(Exts) -> Exts ++ [{Type, Data}] end, Msg).

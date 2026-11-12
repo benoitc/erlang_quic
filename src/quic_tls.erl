@@ -1133,6 +1133,9 @@ encode_psk_mode(psk_dhe_ke) -> <<?PSK_KE_MODE_DHE_KE:8>>.
 %%   - transport_params: QUIC transport parameters (if present)
 -spec parse_client_hello(binary()) ->
     {ok, map()} | {error, term()}.
+parse_client_hello(<<LegacyVersion:16, _/binary>>) when LegacyVersion =/= ?TLS_VERSION_1_2 ->
+    %% RFC 9846 Section 4.2.2.
+    {error, protocol_version};
 parse_client_hello(<<
     % Legacy version
     ?TLS_VERSION_1_2:16,
@@ -1142,7 +1145,7 @@ parse_client_hello(<<
     CipherSuitesLen:16,
     CipherSuites:CipherSuitesLen/binary,
     CompressionLen:8,
-    _Compression:CompressionLen/binary,
+    Compression:CompressionLen/binary,
     ExtLen:16,
     Extensions:ExtLen/binary,
     _Rest/binary
@@ -1160,6 +1163,7 @@ parse_client_hello(<<
             %% Validate pre_shared_key placement (must be last per RFC 8446 §4.2.11).
             Checks = [
                 offered_tls13(ExtMap),
+                null_compression(Compression),
                 validate_psk_extension_placement(OrderedExts),
                 psk_modes_offered(ExtMap)
             ],
@@ -1177,8 +1181,6 @@ parse_client_hello(<<
 parse_client_hello(Data) when is_binary(Data) ->
     %% Provide detailed error for debugging ClientHello parsing failures
     case Data of
-        <<Version:16, _/binary>> when Version =/= ?TLS_VERSION_1_2 ->
-            {error, {invalid_legacy_version, Version}};
         <<_:16, _Random:32/binary, SessionIdLen:8, Rest1/binary>> when
             byte_size(Rest1) < SessionIdLen
         ->
@@ -1368,6 +1370,10 @@ parse_pre_shared_key_ext(
     #{identities => Identities, binders => Binders};
 parse_pre_shared_key_ext(_) ->
     undefined.
+
+%% RFC 9846 Section 4.2.2: exactly the null compression method.
+null_compression(<<0>>) -> ok;
+null_compression(_) -> {error, illegal_parameter}.
 
 first_error([]) -> ok;
 first_error([ok | Rest]) -> first_error(Rest);
