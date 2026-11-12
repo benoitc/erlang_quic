@@ -7332,11 +7332,7 @@ process_tls_message(
                     send_tls_alert(?TLS_ALERT_HANDSHAKE_FAILURE, <<"no common group">>, State)
             end;
         {error, Reason} ->
-            ?LOG_ERROR(#{what => client_hello_parse_failed, reason => Reason}, ?QUIC_LOG_META),
-            case hello_alert(Reason) of
-                undefined -> StateChIn;
-                Alert -> send_tls_alert(Alert, StateChIn)
-            end
+            refuse_message(Reason, StateChIn)
     end;
 %% Client receives ServerHello
 process_tls_message(
@@ -7484,13 +7480,7 @@ process_tls_message(
                     send_initial_ack(State1)
             end;
         {error, Reason} ->
-            case hello_alert(Reason) of
-                undefined ->
-                    State;
-                Alert ->
-                    notify_owner({error, {tls_alert, Reason}}, State),
-                    send_tls_alert(Alert, State)
-            end
+            refuse_message(Reason, State)
     end;
 process_tls_message(
     _Level,
@@ -7543,13 +7533,8 @@ process_tls_message(
             %% 0-RTT data and notify the owner so the application protocol
             %% can re-issue the affected requests.
             finalize_zero_rtt_state(State1);
-        _ ->
-            State#state{
-                hs = (State#state.hs)#hs{
-                    tls_state = NextState,
-                    tls_transcript = Transcript
-                }
-            }
+        {error, Reason} ->
+            refuse_message(Reason, State)
     end;
 %% Client receives server Certificate
 process_tls_message(
@@ -7563,31 +7548,11 @@ process_tls_message(
     %% Parse and store peer certificate. The chain and identity are
     %% validated at CertificateVerify, where the signature also proves
     %% the server holds the leaf's private key.
-    {PeerCert, PeerCertChain} =
-        case quic_tls:parse_certificate(Body) of
-            {ok, #{certificates := [First | Rest]}} ->
-                {First, Rest};
-            {ok, #{certificates := []}} ->
-                {undefined, []};
-            {error, _} ->
-                {undefined, []}
-        end,
-    State1 = State#state{
-        hs = (State#state.hs)#hs{
-            tls_state = ?TLS_AWAITING_CERT_VERIFY,
-            tls_transcript = Transcript,
-            peer_cert = PeerCert,
-            peer_cert_chain = PeerCertChain
-        }
-    },
-    case (State#state.cfg)#conn_cfg.verify andalso (PeerCert =:= undefined) of
-        true ->
-            %% verify enabled but server sent no certificate.
-            ?LOG_ERROR(#{what => server_sent_no_certificate}, ?QUIC_LOG_META),
-            notify_owner({error, {certificate_invalid, no_certificate}}, State1),
-            send_tls_alert(?TLS_ALERT_CERTIFICATE_REQUIRED, State1);
-        false ->
-            State1
+    case quic_tls:parse_certificate(Body) of
+        {ok, #{certificates := Certs}} ->
+            server_certificate(Certs, Transcript, State);
+        {error, Reason} ->
+            refuse_message(Reason, State)
     end;
 %% Client receives server CertificateVerify
 process_tls_message(
@@ -7597,29 +7562,9 @@ process_tls_message(
     OriginalMsg,
     #state{cfg = #conn_cfg{role = client}, hs = #hs{tls_state = ?TLS_AWAITING_CERT_VERIFY}} = State
 ) ->
-    %% The signature is over the transcript up to and including
-    %% Certificate, i.e. before this message is appended.
-    {ClientHsKeys, _} = (State#state.hs)#hs.handshake_keys,
-    Cipher = ClientHsKeys#crypto_keys.cipher,
-    TranscriptHash = quic_crypto:transcript_hash(Cipher, (State#state.hs)#hs.tls_transcript),
-    Scheme =
-        case quic_tls:parse_certificate_verify(Body) of
-            {ok, #{algorithm := Alg}} -> code_to_sig_alg(Alg);
-            _ -> undefined
-        end,
-    Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
-    Advance = State#state{
-        hs = (State#state.hs)#hs{
-            tls_state = ?TLS_AWAITING_FINISHED,
-            tls_transcript = Transcript,
-            negotiated_scheme = Scheme
-        }
-    },
-    case (State#state.cfg)#conn_cfg.verify of
-        false ->
-            Advance;
-        true ->
-            verify_server_authentication(Body, TranscriptHash, Advance, State)
+    case quic_tls:parse_certificate_verify(Body) of
+        {ok, #{algorithm := Alg}} -> server_certificate_verify(Alg, Body, OriginalMsg, State);
+        {error, Reason} -> refuse_message(Reason, State)
     end;
 %% Client receives server's Finished
 process_tls_message(
@@ -7926,18 +7871,18 @@ process_tls_message(
     %% Capture the advertised signature_algorithms so the client can
     %% pick a compatible CertificateVerify scheme.
     Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
-    PeerSigAlgs =
-        case quic_tls:parse_certificate_request(Body) of
-            {ok, #{signature_algorithms := SA}} -> SA;
-            _ -> []
-        end,
-    State#state{
-        hs = (State#state.hs)#hs{
-            tls_transcript = Transcript,
-            cert_request_received = true,
-            peer_sig_algs = PeerSigAlgs
-        }
-    };
+    case quic_tls:parse_certificate_request(Body) of
+        {ok, #{signature_algorithms := PeerSigAlgs}} ->
+            State#state{
+                hs = (State#state.hs)#hs{
+                    tls_transcript = Transcript,
+                    cert_request_received = true,
+                    peer_sig_algs = PeerSigAlgs
+                }
+            };
+        {error, Reason} ->
+            refuse_message(Reason, State)
+    end;
 %% Server receives client Certificate (when verify=true)
 process_tls_message(
     _Level,
@@ -7984,8 +7929,8 @@ process_tls_message(
                         }
                     }
             end;
-        {error, _} ->
-            reject_client_cert({bad_cert, malformed}, State)
+        {error, Reason} ->
+            refuse_message(Reason, State)
     end;
 %% Server receives client CertificateVerify (when verify=true and client sent cert)
 process_tls_message(
@@ -8009,20 +7954,27 @@ process_tls_message(
 
     %% Verify signature (transcript is BEFORE CertificateVerify)
     TranscriptHash = quic_crypto:transcript_hash(Cipher, (State#state.hs)#hs.tls_transcript),
-    case quic_tls:verify_certificate_verify(Body, PeerCert, TranscriptHash, client) of
-        true ->
-            Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
-            State#state{
-                hs = (State#state.hs)#hs{
-                    tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
-                    tls_transcript = Transcript
-                }
-            };
-        false ->
-            %% Signature verification failed - send TLS decrypt_error alert
-            %% RFC 8446: decrypt_error (51) for signature verification failure
-            ?LOG_ERROR(#{what => client_cert_verify_failed}, ?QUIC_LOG_META),
-            send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
+    case quic_tls:parse_certificate_verify(Body) of
+        {error, Reason} ->
+            refuse_message(Reason, State);
+        {ok, _} ->
+            case quic_tls:verify_certificate_verify(Body, PeerCert, TranscriptHash, client) of
+                true ->
+                    Transcript = <<
+                        ((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary
+                    >>,
+                    State#state{
+                        hs = (State#state.hs)#hs{
+                            tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
+                            tls_transcript = Transcript
+                        }
+                    };
+                false ->
+                    %% Signature verification failed - send TLS decrypt_error alert
+                    %% RFC 8446: decrypt_error (51) for signature verification failure
+                    ?LOG_ERROR(#{what => client_cert_verify_failed}, ?QUIC_LOG_META),
+                    send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
+            end
     end;
 process_tls_message(_Level, Type, _Body, _OriginalMsg, State) ->
     %% A message the handshake is not waiting for (RFC 8446 Section 4).
@@ -8031,6 +7983,74 @@ process_tls_message(_Level, Type, _Body, _OriginalMsg, State) ->
         ?QUIC_LOG_META
     ),
     send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State).
+
+%% Client: the server's Certificate, decoded. The chain and identity are
+%% validated at CertificateVerify, where the signature also proves the
+%% server holds the leaf's private key.
+server_certificate(Certs, Transcript, State) ->
+    {PeerCert, PeerCertChain} =
+        case Certs of
+            [First | Rest] -> {First, Rest};
+            [] -> {undefined, []}
+        end,
+    State1 = State#state{
+        hs = (State#state.hs)#hs{
+            tls_state = ?TLS_AWAITING_CERT_VERIFY,
+            tls_transcript = Transcript,
+            peer_cert = PeerCert,
+            peer_cert_chain = PeerCertChain
+        }
+    },
+    case (State#state.cfg)#conn_cfg.verify andalso (PeerCert =:= undefined) of
+        true ->
+            %% verify enabled but server sent no certificate.
+            ?LOG_ERROR(#{what => server_sent_no_certificate}, ?QUIC_LOG_META),
+            notify_owner({error, {certificate_invalid, no_certificate}}, State1),
+            send_tls_alert(?TLS_ALERT_CERTIFICATE_REQUIRED, State1);
+        false ->
+            State1
+    end.
+
+%% Client: the server's CertificateVerify, decoded, signed with Alg.
+server_certificate_verify(Alg, Body, OriginalMsg, State) ->
+    %% The signature is over the transcript up to and including
+    %% Certificate, i.e. before this message is appended.
+    {ClientHsKeys, _} = (State#state.hs)#hs.handshake_keys,
+    Cipher = ClientHsKeys#crypto_keys.cipher,
+    TranscriptHash = quic_crypto:transcript_hash(Cipher, (State#state.hs)#hs.tls_transcript),
+    Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
+    Advance = State#state{
+        hs = (State#state.hs)#hs{
+            tls_state = ?TLS_AWAITING_FINISHED,
+            tls_transcript = Transcript,
+            negotiated_scheme = code_to_sig_alg(Alg)
+        }
+    },
+    case (State#state.cfg)#conn_cfg.verify of
+        false ->
+            Advance;
+        true ->
+            verify_server_authentication(Body, TranscriptHash, Advance, State)
+    end.
+
+%% A handshake message the parser refused, answered with the alert it
+%% names; anything that does not decode is a decode_error (RFC 9846
+%% Section 6.2).
+refuse_message(Reason, State) ->
+    {Code, Name} = parse_alert(Reason),
+    ?LOG_WARNING(#{what => tls_message_refused, reason => Reason}, ?QUIC_LOG_META),
+    case (State#state.cfg)#conn_cfg.role of
+        client -> notify_owner({error, {tls_alert, Name}}, State);
+        server -> ok
+    end,
+    send_tls_alert(Code, State).
+
+parse_alert(protocol_version) -> {?TLS_ALERT_PROTOCOL_VERSION, protocol_version};
+parse_alert(illegal_parameter) -> {?TLS_ALERT_ILLEGAL_PARAMETER, illegal_parameter};
+parse_alert({duplicate_extension, _}) -> {?TLS_ALERT_ILLEGAL_PARAMETER, illegal_parameter};
+parse_alert(psk_not_last) -> {?TLS_ALERT_ILLEGAL_PARAMETER, illegal_parameter};
+parse_alert(missing_extension) -> {?TLS_ALERT_MISSING_EXTENSION, missing_extension};
+parse_alert(_) -> {?TLS_ALERT_DECODE_ERROR, decode_error}.
 
 %% External PSKs are SHA-256 (RFC 9846 §4.3.11).
 external_psk_hash({ok, _KnownPsk}) -> sha256;
@@ -12791,13 +12811,6 @@ default_alert_phrase(?TLS_ALERT_UNKNOWN_CA) -> <<"unknown ca">>;
 default_alert_phrase(?TLS_ALERT_CERTIFICATE_REQUIRED) -> <<"certificate required">>;
 default_alert_phrase(?TLS_ALERT_NO_APPLICATION_PROTOCOL) -> <<"no application protocol">>;
 default_alert_phrase(_) -> <<"tls alert">>.
-
-%% The alert a hello the parser refused is answered with.
-hello_alert(protocol_version) -> ?TLS_ALERT_PROTOCOL_VERSION;
-hello_alert(illegal_parameter) -> ?TLS_ALERT_ILLEGAL_PARAMETER;
-hello_alert(decode_error) -> ?TLS_ALERT_DECODE_ERROR;
-hello_alert(missing_extension) -> ?TLS_ALERT_MISSING_EXTENSION;
-hello_alert(_) -> undefined.
 
 %% Normalise the `verify' option to a strict boolean. Accepts the
 %% historical booleans as well as ssl-style `verify_peer'/`verify_none'

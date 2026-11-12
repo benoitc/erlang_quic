@@ -115,9 +115,9 @@ build_certificate_request_with_context_test() ->
     ?assertEqual(Context, maps:get(context, Parsed)).
 
 parse_certificate_request_invalid_test() ->
-    ?assertEqual({error, invalid_certificate_request}, quic_tls:parse_certificate_request(<<>>)),
+    ?assertEqual({error, decode_error}, quic_tls:parse_certificate_request(<<>>)),
     ?assertEqual(
-        {error, invalid_certificate_request}, quic_tls:parse_certificate_request(<<1, 2>>)
+        {error, decode_error}, quic_tls:parse_certificate_request(<<1, 2>>)
     ).
 
 %%====================================================================

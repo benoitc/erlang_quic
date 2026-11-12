@@ -1,8 +1,7 @@
 %%% -*- erlang -*-
 %%%
-%%% A ClientHello, ServerHello or HelloRetryRequest that breaks a rule of
-%%% RFC 9846 Sections 4.2 and 4.3 ends the handshake with the alert the
-%%% RFC names for it.
+%%% A handshake message that breaks a rule of RFC 9846 Sections 4.2 to
+%%% 4.7 ends the handshake with the alert the RFC names for it.
 
 -module(quic_tls_hello_tests).
 
@@ -245,6 +244,194 @@ rebind(CH, Ticket) ->
     <<Truncated/binary, 33:16, 32, Binder/binary>>.
 
 %%====================================================================
+%% Extension data and message structure (RFC 9846 Sections 4.3 and 6.2)
+%%====================================================================
+
+client_hello_extension_with_trailing_data_test_() ->
+    Psk = {<<"id">>, <<"this-is-a-32-byte-test-secret!!!">>},
+    Exts = [
+        {?EXT_KEY_SHARE, #{}},
+        {?EXT_SERVER_NAME, #{}},
+        {?EXT_ALPN, #{}},
+        {?EXT_SUPPORTED_GROUPS, #{}},
+        {?EXT_SIGNATURE_ALGORITHMS, #{}},
+        {?EXT_PSK_KEY_EXCHANGE_MODES, #{}},
+        {?EXT_SUPPORTED_VERSIONS, #{}},
+        {?EXT_PRE_SHARED_KEY, #{external_psk => Psk}}
+    ],
+    [
+        {
+            integer_to_list(Type),
+            ?_assertEqual(
+                {tls_alert, ?TLS_ALERT_DECODE_ERROR},
+                server_close(append_to_ext(Type, <<0>>, client_hello(Extra)))
+            )
+        }
+     || {Type, Extra} <- Exts
+    ].
+
+client_hello_malformed_extension_test_() ->
+    Malformed = [
+        {?EXT_SUPPORTED_GROUPS, <<3:16, 0, 29, 0>>},
+        {?EXT_SIGNATURE_ALGORITHMS, <<1:16, 4>>},
+        {?EXT_SUPPORTED_GROUPS, <<0:16>>},
+        {?EXT_KEY_SHARE, <<6:16, 0, 29, 0, 32, 1, 2>>},
+        {?EXT_ALPN, <<3:16, 0, 1, $h>>},
+        {?EXT_SERVER_NAME, <<0:16>>},
+        {?EXT_PSK_KEY_EXCHANGE_MODES, <<0>>}
+    ],
+    [
+        ?_assertEqual(
+            {tls_alert, ?TLS_ALERT_DECODE_ERROR},
+            server_close(set_ext(Type, Data, client_hello()))
+        )
+     || {Type, Data} <- Malformed
+    ].
+
+client_hello_early_data_with_data_test() ->
+    ?assertEqual(
+        {tls_alert, ?TLS_ALERT_DECODE_ERROR},
+        server_close(add_ext(?EXT_EARLY_DATA, <<0>>, client_hello()))
+    ).
+
+client_hello_odd_cipher_suites_test() ->
+    ?assertEqual({tls_alert, ?TLS_ALERT_DECODE_ERROR}, server_close(with_suites(<<19, 1, 19>>))).
+
+client_hello_long_session_id_test() ->
+    <<T, _:24, V:16, R:32/binary, 0, Rest/binary>> = client_hello(),
+    Body = <<V:16, R/binary, 33, 0:264, Rest/binary>>,
+    ?assertEqual(
+        {tls_alert, ?TLS_ALERT_DECODE_ERROR},
+        server_close(<<T, (byte_size(Body)):24, Body/binary>>)
+    ).
+
+client_hello_trailing_data_test() ->
+    ?assertEqual(
+        {tls_alert, ?TLS_ALERT_DECODE_ERROR}, server_close(with_trailing_byte(client_hello()))
+    ).
+
+client_hello_duplicate_extension_test() ->
+    ?assertEqual(
+        {tls_alert, ?TLS_ALERT_ILLEGAL_PARAMETER},
+        server_close(map_exts(fun([E | Rest]) -> [E, E | Rest] end, client_hello()))
+    ).
+
+client_hello_pre_shared_key_not_last_test() ->
+    CH = client_hello(#{external_psk => {<<"id">>, <<"this-is-a-32-byte-test-secret!!!">>}}),
+    ?assertEqual(
+        {tls_alert, ?TLS_ALERT_ILLEGAL_PARAMETER},
+        server_close(map_exts(fun(Exts) -> [lists:last(Exts) | lists:droplast(Exts)] end, CH))
+    ).
+
+server_hello_malformed_extension_test_() ->
+    Malformed = [
+        {server_hello(), fun(M) -> append_to_ext(?EXT_KEY_SHARE, <<0>>, M) end},
+        {server_hello(), fun(M) -> add_ext(?EXT_PRE_SHARED_KEY, <<0, 0, 0>>, M) end},
+        {server_hello(), fun(M) -> append_to_ext(?EXT_SUPPORTED_VERSIONS, <<0>>, M) end},
+        {server_hello(), fun with_trailing_byte/1},
+        {hello_retry_request(), fun(M) -> append_to_ext(?EXT_KEY_SHARE, <<0>>, M) end},
+        {hello_retry_request(), fun(M) -> add_ext(?EXT_COOKIE, <<0:16>>, M) end},
+        {hello_retry_request(), fun with_trailing_byte/1}
+    ],
+    [
+        ?_assertEqual({tls_alert, ?TLS_ALERT_DECODE_ERROR}, client_close(F(Msg)))
+     || {Msg, F} <- Malformed
+    ].
+
+encrypted_extensions_test() ->
+    ?assertNotMatch({tls_alert, _}, in_handshake(client, awaiting_encrypted_extensions, ee(#{}))).
+
+encrypted_extensions_malformed_test_() ->
+    Malformed = [
+        set_ext(?EXT_ALPN, <<6:16, 2, "h3", 2, "h2">>, ee(#{})),
+        append_to_ext(?EXT_ALPN, <<0>>, ee(#{})),
+        add_ext(?EXT_EARLY_DATA, <<0>>, ee(#{})),
+        add_ext(?EXT_SERVER_NAME, <<0>>, ee(#{})),
+        add_ext(?EXT_SUPPORTED_GROUPS, <<1:16, 0>>, ee(#{})),
+        with_trailing_byte(ee(#{}))
+    ],
+    [
+        ?_assertEqual(
+            {tls_alert, ?TLS_ALERT_DECODE_ERROR},
+            in_handshake(client, awaiting_encrypted_extensions, Msg)
+        )
+     || Msg <- Malformed
+    ].
+
+certificate_malformed_test_() ->
+    Cert = <<"not checked here">>,
+    Entry = <<(byte_size(Cert)):24, Cert/binary>>,
+    Malformed = [
+        %% a byte after the certificate_list
+        <<0, (byte_size(Entry) + 2):24, Entry/binary, 0:16, 0>>,
+        %% an entry's extensions cut short
+        <<0, (byte_size(Entry) + 3):24, Entry/binary, 1:16, 0>>,
+        %% an empty cert_data
+        <<0, 5:24, 0:24, 0:16>>,
+        %% a list too short for an entry
+        <<0, 2:24, 0:16>>
+    ],
+    [
+        ?_assertEqual(
+            {tls_alert, ?TLS_ALERT_DECODE_ERROR},
+            in_handshake(Role, TlsState, handshake_msg(?TLS_CERTIFICATE, Body))
+        )
+     || Body <- Malformed,
+        {Role, TlsState} <- [{client, awaiting_certificate}, {server, awaiting_client_cert}]
+    ].
+
+certificate_verify_with_trailing_data_test_() ->
+    Body = <<16#0403:16, 2:16, 0, 0, 0>>,
+    [
+        ?_assertEqual(
+            {tls_alert, ?TLS_ALERT_DECODE_ERROR},
+            in_handshake(Role, TlsState, handshake_msg(?TLS_CERTIFICATE_VERIFY, Body))
+        )
+     || {Role, TlsState} <- [
+            {client, awaiting_certificate_verify}, {server, awaiting_client_cert_verify}
+        ]
+    ].
+
+certificate_request_test_() ->
+    CR = quic_tls:build_certificate_request(<<>>),
+    [
+        ?_assertEqual(
+            {tls_alert, ?TLS_ALERT_MISSING_EXTENSION},
+            in_handshake(client, awaiting_certificate, without_ext(?EXT_SIGNATURE_ALGORITHMS, CR))
+        ),
+        ?_assertEqual(
+            {tls_alert, ?TLS_ALERT_DECODE_ERROR},
+            in_handshake(
+                client, awaiting_certificate, append_to_ext(?EXT_SIGNATURE_ALGORITHMS, <<0>>, CR)
+            )
+        )
+    ].
+
+ee(Extra) ->
+    quic_tls:build_encrypted_extensions(Extra#{alpn => <<"h3">>, transport_params => #{}}).
+
+handshake_msg(Type, Body) ->
+    <<Type, (byte_size(Body)):24, Body/binary>>.
+
+with_trailing_byte(<<Type, Len:24, Body:Len/binary>>) ->
+    <<Type, (Len + 1):24, Body/binary, 0>>.
+
+with_suites(Suites) ->
+    <<T, _:24, V:16, R:32/binary, SL, S:SL/binary, CL:16, _:CL/binary, Rest/binary>> =
+        client_hello(),
+    Body = <<V:16, R/binary, SL, S/binary, (byte_size(Suites)):16, Suites/binary, Rest/binary>>,
+    <<T, (byte_size(Body)):24, Body/binary>>.
+
+append_to_ext(Type, Extra, Msg) ->
+    map_exts(
+        fun(Exts) ->
+            {Type, Data} = lists:keyfind(Type, 1, Exts),
+            lists:keyreplace(Type, 1, Exts, {Type, <<Data/binary, Extra/binary>>})
+        end,
+        Msg
+    ).
+
+%%====================================================================
 %% Messages
 %%====================================================================
 
@@ -334,6 +521,10 @@ split_exts(
     <<V:16, R:32/binary, SL, S:SL/binary, CL:16, C:CL/binary, ML, M:ML/binary, EL:16, E:EL/binary>>
 ) ->
     {<<V:16, R/binary, SL, S/binary, CL:16, C/binary, ML, M/binary>>, E};
+split_exts(?TLS_ENCRYPTED_EXTENSIONS, <<EL:16, E:EL/binary>>) ->
+    {<<>>, E};
+split_exts(?TLS_CERTIFICATE_REQUEST, <<CL, C:CL/binary, EL:16, E:EL/binary>>) ->
+    {<<CL, C/binary>>, E};
 split_exts(
     ?TLS_SERVER_HELLO,
     <<V:16, R:32/binary, SL, S:SL/binary, Suite:16, M, EL:16, E:EL/binary>>
@@ -382,6 +573,20 @@ client_after(Msg, Extra) ->
             ticket_store = Tickets
         }
     }).
+
+%% How a Role in TlsState, holding handshake keys, closes on the
+%% Handshake-level Msg.
+in_handshake(Role, TlsState, Msg) ->
+    S0 = quic_connection_test_support:with_keys_and_socket(
+        quic_connection_test_support:state_for_role(Role)
+    ),
+    #state{hs = HS, cfg = Cfg} = S0,
+    S = quic_connection:process_tls_messages(handshake, Msg, S0#state{
+        last_activity = erlang:monotonic_time(millisecond),
+        cfg = Cfg#conn_cfg{alpn_list = [<<"h3">>], verify = false, idle_timeout = 30000},
+        hs = HS#hs{tls_state = TlsState, tls_transcript = <<>>, peer_cert = <<"cert">>}
+    }),
+    S#state.close_reason.
 
 %% How a server waiting for a ClientHello closes on Msg.
 server_close(Msg) ->

@@ -489,9 +489,8 @@ parse_server_hello(<<
     CipherSuite:16,
     Compression:8,
     ExtensionsLen:16,
-    Extensions:ExtensionsLen/binary,
-    _Rest/binary
->>) ->
+    Extensions:ExtensionsLen/binary
+>>) when SessionIdLen =< 32 ->
     case parse_extensions(Extensions) of
         {ok, ExtMap} ->
             %% RFC 9846 Sections 4.2.3 and 4.2.4: the version first, then
@@ -510,7 +509,7 @@ parse_server_hello(<<
             Error
     end;
 parse_server_hello(_) ->
-    {error, invalid_server_hello}.
+    {error, decode_error}.
 
 server_legacy_version(?TLS_VERSION_1_2) -> ok;
 server_legacy_version(_) -> {error, protocol_version}.
@@ -565,10 +564,13 @@ parse_server_hello_extensions(Random, SessionId, CipherSuite, ExtMap) ->
     SelectedPsk =
         case maps:find(?EXT_PRE_SHARED_KEY, ExtMap) of
             {ok, <<Idx:16>>} -> Idx;
-            _ -> undefined
+            {ok, _} -> malformed;
+            error -> undefined
         end,
     KeyShareResult =
         case maps:find(?EXT_KEY_SHARE, ExtMap) of
+            _ when SelectedPsk =:= malformed ->
+                {error, decode_error};
             {ok, KeyShareData} ->
                 parse_server_key_share(KeyShareData);
             error when SelectedPsk =/= undefined ->
@@ -610,29 +612,40 @@ parse_server_hello_extensions(Random, SessionId, CipherSuite, ExtMap) ->
         early_data => boolean()
     }}
     | {error, term()}.
-parse_encrypted_extensions(<<ExtensionsLen:16, Extensions:ExtensionsLen/binary, _Rest/binary>>) ->
+parse_encrypted_extensions(<<ExtensionsLen:16, Extensions:ExtensionsLen/binary>>) ->
+    Specs = [
+        {alpn, ?EXT_ALPN, fun selected_alpn/1, undefined},
+        {early_data, ?EXT_EARLY_DATA, fun empty_ext/1, false},
+        {server_name, ?EXT_SERVER_NAME, fun empty_ext/1, false},
+        {supported_groups, ?EXT_SUPPORTED_GROUPS, fun u16_list/1, []}
+    ],
     case parse_extensions(Extensions) of
         {ok, ExtMap} ->
-            Alpn =
-                case maps:find(?EXT_ALPN, ExtMap) of
-                    {ok, <<_ListLen:16, ProtoLen:8, Proto:ProtoLen/binary, _/binary>>} ->
-                        Proto;
-                    _ ->
-                        undefined
-                end,
-            {TransportParams, TPStatus} = transport_params_ext(ExtMap),
-            EarlyData = maps:is_key(?EXT_EARLY_DATA, ExtMap),
-            {ok, #{
-                alpn => Alpn,
-                transport_params => TransportParams,
-                transport_params_status => TPStatus,
-                early_data => EarlyData
-            }};
+            case decode_extensions(Specs, ExtMap) of
+                {ok, #{alpn := Alpn, early_data := EarlyData}} ->
+                    {TransportParams, TPStatus} = transport_params_ext(ExtMap),
+                    {ok, #{
+                        alpn => Alpn,
+                        transport_params => TransportParams,
+                        transport_params_status => TPStatus,
+                        early_data => EarlyData
+                    }};
+                Error ->
+                    Error
+            end;
         Error ->
             Error
     end;
 parse_encrypted_extensions(_) ->
-    {error, invalid_encrypted_extensions}.
+    {error, decode_error}.
+
+%% RFC 7301 Section 3.1: the server's list holds exactly one name.
+selected_alpn(<<ListLen:16, ProtoLen:8, Proto:ProtoLen/binary>>) when
+    ProtoLen > 0, ListLen =:= ProtoLen + 1
+->
+    {ok, Proto};
+selected_alpn(_) ->
+    error.
 
 %% The quic_transport_parameters extension, decoded, and whether it was
 %% there and valid (RFC 9001 Section 8.2). The map is empty unless it was.
@@ -652,29 +665,35 @@ transport_params_ext(ExtMap) ->
     {ok, #{context := binary(), certificates := [binary()]}}
     | {error, term()}.
 parse_certificate(
-    <<ContextLen:8, Context:ContextLen/binary, CertsLen:24, CertsData:CertsLen/binary,
-        _Rest/binary>>
+    <<ContextLen:8, Context:ContextLen/binary, CertsLen:24, CertsData:CertsLen/binary>>
 ) ->
-    Certs = parse_certificate_list(CertsData),
-    {ok, #{context => Context, certificates => Certs}};
+    case parse_certificate_list(CertsData, []) of
+        {ok, Certs} -> {ok, #{context => Context, certificates => Certs}};
+        error -> {error, decode_error}
+    end;
 parse_certificate(_) ->
-    {error, invalid_certificate}.
+    {error, decode_error}.
 
-parse_certificate_list(<<>>) ->
-    [];
+parse_certificate_list(<<>>, Acc) ->
+    {ok, lists:reverse(Acc)};
 parse_certificate_list(
-    <<CertLen:24, Cert:CertLen/binary, ExtLen:16, _Ext:ExtLen/binary, Rest/binary>>
-) ->
-    [Cert | parse_certificate_list(Rest)].
+    <<CertLen:24, Cert:CertLen/binary, ExtLen:16, Ext:ExtLen/binary, Rest/binary>>, Acc
+) when CertLen > 0 ->
+    case parse_extensions_ordered(Ext) of
+        {ok, _} -> parse_certificate_list(Rest, [Cert | Acc]);
+        {error, _} -> error
+    end;
+parse_certificate_list(_, _Acc) ->
+    error.
 
 %% @doc Parse CertificateVerify message.
 -spec parse_certificate_verify(binary()) ->
     {ok, #{algorithm := non_neg_integer(), signature := binary()}}
     | {error, term()}.
-parse_certificate_verify(<<Algorithm:16, SigLen:16, Signature:SigLen/binary, _Rest/binary>>) ->
+parse_certificate_verify(<<Algorithm:16, SigLen:16, Signature:SigLen/binary>>) ->
     {ok, #{algorithm => Algorithm, signature => Signature}};
 parse_certificate_verify(_) ->
-    {error, invalid_certificate_verify}.
+    {error, decode_error}.
 
 %% @doc Parse Finished message.
 -spec parse_finished(binary()) -> {ok, binary()} | {error, term()}.
@@ -1110,16 +1129,23 @@ parse_extensions_ordered(Data, _Off, _Acc, _Seen) when byte_size(Data) < 4 ->
 parse_extensions_ordered(_, _, _, _) ->
     {error, invalid_extensions}.
 
-parse_server_key_share(<<?GROUP_X25519:16, 32:16, PubKey:32/binary>>) ->
+%% One KeyShareEntry, nothing after it (RFC 9846 Section 4.3); a share
+%% that does not fit its group is an illegal_parameter.
+parse_server_key_share(<<Group:16, Len:16, Share:Len/binary>>) when Len > 0 ->
+    server_key_share(Group, Share);
+parse_server_key_share(_) ->
+    {error, decode_error}.
+
+server_key_share(?GROUP_X25519, <<PubKey:32/binary>>) ->
     {ok, {x25519, PubKey}};
-parse_server_key_share(<<?GROUP_SECP256R1:16, 65:16, PubKey:65/binary>>) ->
+server_key_share(?GROUP_SECP256R1, <<PubKey:65/binary>>) ->
     {ok, {secp256r1, PubKey}};
-parse_server_key_share(<<?GROUP_SECP384R1:16, 97:16, PubKey:97/binary>>) ->
+server_key_share(?GROUP_SECP384R1, <<PubKey:97/binary>>) ->
     {ok, {secp384r1, PubKey}};
-parse_server_key_share(<<?GROUP_X25519MLKEM768:16, 1120:16, Share:1120/binary>>) ->
+server_key_share(?GROUP_X25519MLKEM768, <<Share:1120/binary>>) ->
     %% ML-KEM-768 ciphertext (1088) || X25519 public (32)
     {ok, {x25519mlkem768, Share}};
-parse_server_key_share(_) ->
+server_key_share(_Group, _Share) ->
     {error, illegal_parameter}.
 
 cipher_from_suite(?TLS_AES_128_GCM_SHA256) -> aes_128_gcm;
@@ -1160,11 +1186,11 @@ parse_client_hello(<<
     CompressionLen:8,
     Compression:CompressionLen/binary,
     ExtLen:16,
-    Extensions:ExtLen/binary,
-    _Rest/binary
->>) ->
-    %% Parse cipher suites
-    Ciphers = parse_cipher_suites(CipherSuites),
+    Extensions:ExtLen/binary
+>>) when
+    SessionIdLen =< 32, CipherSuitesLen >= 2, CipherSuitesLen rem 2 =:= 0
+->
+    Ciphers = [Suite || <<Suite:16>> <= CipherSuites],
 
     %% Parse extensions preserving order so PSK validation can assert
     %% pre_shared_key is the last extension and capture the binders
@@ -1191,24 +1217,21 @@ parse_client_hello(<<
         {error, Reason} ->
             {error, Reason}
     end;
-parse_client_hello(Data) when is_binary(Data) ->
-    %% Provide detailed error for debugging ClientHello parsing failures
-    case Data of
-        <<_:16, _Random:32/binary, SessionIdLen:8, Rest1/binary>> when
-            byte_size(Rest1) < SessionIdLen
-        ->
-            {error, {session_id_too_short, SessionIdLen, byte_size(Rest1)}};
-        <<_:16, _:32/binary, SessionIdLen:8, _:SessionIdLen/binary, CipherSuitesLen:16,
-            Rest2/binary>> when byte_size(Rest2) < CipherSuitesLen ->
-            {error, {cipher_suites_too_short, CipherSuitesLen, byte_size(Rest2)}};
-        % Minimum: 2 + 32 + 1 + 2 + 1 = 38 bytes
-        _ when byte_size(Data) < 38 ->
-            {error, {client_hello_too_short, byte_size(Data)}};
-        _ ->
-            {error, {invalid_client_hello, byte_size(Data)}}
-    end;
+parse_client_hello(<<
+    ?TLS_VERSION_1_2:16,
+    _Random:32/binary,
+    SessionIdLen:8,
+    _SessionId:SessionIdLen/binary,
+    CipherSuitesLen:16,
+    _CipherSuites:CipherSuitesLen/binary,
+    CompressionLen:8,
+    _Compression:CompressionLen/binary
+>>) ->
+    %% No extensions, so no supported_versions: an older ClientHello
+    %% (RFC 9846 Section 4.2.2, RFC 9001 Section 4.2).
+    {error, protocol_version};
 parse_client_hello(_) ->
-    {error, invalid_client_hello_not_binary}.
+    {error, decode_error}.
 
 %% @doc Build a ServerHello message.
 %% Options:
@@ -1331,45 +1354,49 @@ build_certificate_verify(SignatureAlgorithm, PrivateKey, TranscriptHash) ->
 %% Server-side Internal Functions
 %%====================================================================
 
-parse_cipher_suites(<<>>) ->
-    [];
-parse_cipher_suites(<<Suite:16, Rest/binary>>) ->
-    [Suite | parse_cipher_suites(Rest)].
-
-parse_client_key_shares(<<Len:16, Data:Len/binary, _/binary>>) ->
-    parse_key_share_entries(Data);
+parse_client_key_shares(<<Len:16, Data:Len/binary>>) ->
+    parse_key_share_entries(Data, []);
 parse_client_key_shares(_) ->
-    undefined.
+    error.
 
-parse_key_share_entries(<<>>) ->
-    [];
-parse_key_share_entries(<<Group:16, Len:16, KeyData:Len/binary, Rest/binary>>) ->
-    [{Group, KeyData} | parse_key_share_entries(Rest)];
-parse_key_share_entries(_) ->
-    [].
+parse_key_share_entries(<<>>, Acc) ->
+    {ok, lists:reverse(Acc)};
+parse_key_share_entries(<<Group:16, Len:16, KeyData:Len/binary, Rest/binary>>, Acc) when Len > 0 ->
+    parse_key_share_entries(Rest, [{Group, KeyData} | Acc]);
+parse_key_share_entries(_, _Acc) ->
+    error.
 
-parse_server_name_ext(<<Len:16, Data:Len/binary, _/binary>>) ->
-    parse_server_name_list(Data);
+%% RFC 6066 Section 3: the host_name entry of a non-empty list.
+parse_server_name_ext(<<Len:16, Data:Len/binary>>) when Len > 0 ->
+    parse_server_name_list(Data, undefined);
 parse_server_name_ext(_) ->
-    undefined.
+    error.
 
-parse_server_name_list(<<0:8, NameLen:16, Name:NameLen/binary, _/binary>>) ->
-    % Type 0 = hostname
-    Name;
-parse_server_name_list(_) ->
-    undefined.
+parse_server_name_list(<<>>, Name) ->
+    {ok, Name};
+parse_server_name_list(<<0:8, NameLen:16, Name:NameLen/binary, Rest/binary>>, undefined) when
+    NameLen > 0
+->
+    parse_server_name_list(Rest, Name);
+parse_server_name_list(<<_Type:8, NameLen:16, _:NameLen/binary, Rest/binary>>, Name) when
+    NameLen > 0
+->
+    parse_server_name_list(Rest, Name);
+parse_server_name_list(_, _Name) ->
+    error.
 
-parse_alpn_ext(<<Len:16, Data:Len/binary, _/binary>>) ->
-    parse_alpn_list(Data);
+%% RFC 7301 Section 3.1: a non-empty list of non-empty names.
+parse_alpn_ext(<<Len:16, Data:Len/binary>>) when Len > 0 ->
+    parse_alpn_list(Data, []);
 parse_alpn_ext(_) ->
-    [].
+    error.
 
-parse_alpn_list(<<>>) ->
-    [];
-parse_alpn_list(<<Len:8, Proto:Len/binary, Rest/binary>>) ->
-    [Proto | parse_alpn_list(Rest)];
-parse_alpn_list(_) ->
-    [].
+parse_alpn_list(<<>>, Acc) ->
+    {ok, lists:reverse(Acc)};
+parse_alpn_list(<<Len:8, Proto:Len/binary, Rest/binary>>, Acc) when Len > 0 ->
+    parse_alpn_list(Rest, [Proto | Acc]);
+parse_alpn_list(_, _Acc) ->
+    error.
 
 %% Parse pre_shared_key extension from ClientHello
 %% RFC 8446 Section 4.2.11
@@ -1378,11 +1405,14 @@ parse_pre_shared_key_ext(
     <<IdentitiesLen:16, IdentitiesData:IdentitiesLen/binary, BindersLen:16,
         BindersData:BindersLen/binary>>
 ) ->
-    Identities = parse_psk_identities(IdentitiesData),
-    Binders = parse_psk_binders(BindersData),
-    #{identities => Identities, binders => Binders};
+    case {parse_psk_identities(IdentitiesData, []), parse_psk_binders(BindersData, [])} of
+        {{ok, [_ | _] = Identities}, {ok, [_ | _] = Binders}} ->
+            {ok, #{identities => Identities, binders => Binders}};
+        _ ->
+            error
+    end;
 parse_pre_shared_key_ext(_) ->
-    undefined.
+    error.
 
 %% RFC 9846 Section 4.2.2: exactly the null compression method.
 null_compression(<<0>>) -> ok;
@@ -1438,82 +1468,81 @@ validate_psk_extension_placement(OrderedExts) ->
 %% extensions blob* so the caller can compute the truncated
 %% ClientHello for binder verification.
 finalise_client_hello(Random, SessionId, Ciphers, OrderedExts, ExtMap, ExtBlob) ->
-    KeyShare =
-        case maps:find(?EXT_KEY_SHARE, ExtMap) of
-            {ok, KsData} -> parse_client_key_shares(KsData);
-            error -> undefined
-        end,
-    ServerName =
-        case maps:find(?EXT_SERVER_NAME, ExtMap) of
-            {ok, SniData} -> parse_server_name_ext(SniData);
-            error -> undefined
-        end,
-    ALPNProtocols =
-        case maps:find(?EXT_ALPN, ExtMap) of
-            {ok, AlpnData} -> parse_alpn_ext(AlpnData);
-            error -> []
-        end,
-    {TransportParams, TPStatus} = transport_params_ext(ExtMap),
-    PSK =
-        case maps:find(?EXT_PRE_SHARED_KEY, ExtMap) of
-            {ok, PskData} -> parse_pre_shared_key_ext(PskData);
-            error -> undefined
-        end,
-    PskModes =
-        case maps:find(?EXT_PSK_KEY_EXCHANGE_MODES, ExtMap) of
-            {ok, ModesData} -> parse_psk_modes_ext(ModesData);
-            error -> []
-        end,
-    SupportedGroups =
-        case maps:find(?EXT_SUPPORTED_GROUPS, ExtMap) of
-            {ok, SgData} -> parse_supported_groups_ext(SgData);
-            error -> []
-        end,
-    SignatureAlgs =
-        case maps:find(?EXT_SIGNATURE_ALGORITHMS, ExtMap) of
-            {ok, SaData} -> parse_signature_algorithms_ext(SaData);
-            error -> []
-        end,
-    EarlyData = maps:is_key(?EXT_EARLY_DATA, ExtMap),
+    Specs = [
+        {key_share, ?EXT_KEY_SHARE, fun parse_client_key_shares/1, undefined},
+        {server_name, ?EXT_SERVER_NAME, fun parse_server_name_ext/1, undefined},
+        {alpn_protocols, ?EXT_ALPN, fun parse_alpn_ext/1, []},
+        {pre_shared_key, ?EXT_PRE_SHARED_KEY, fun parse_pre_shared_key_ext/1, undefined},
+        {psk_key_exchange_modes, ?EXT_PSK_KEY_EXCHANGE_MODES, fun parse_psk_modes_ext/1, []},
+        {supported_groups, ?EXT_SUPPORTED_GROUPS, fun parse_supported_groups_ext/1, []},
+        {signature_algorithms, ?EXT_SIGNATURE_ALGORITHMS, fun parse_signature_algorithms_ext/1, []},
+        {early_data, ?EXT_EARLY_DATA, fun empty_ext/1, false}
+    ],
+    case decode_extensions(Specs, ExtMap) of
+        {ok, Decoded} ->
+            {TransportParams, TPStatus} = transport_params_ext(ExtMap),
+            %% Binders-section offset within the extension data of the PSK
+            %% extension, plus the absolute offset within ExtBlob. The
+            %% caller combines these with the handshake-message header to
+            %% truncate the ClientHello for binder verification.
+            PskBinders = psk_binders_offset(OrderedExts, ExtBlob),
+            {ok, Decoded#{
+                random => Random,
+                session_id => SessionId,
+                cipher_suites => Ciphers,
+                extensions => ExtMap,
+                ordered_extensions => OrderedExts,
+                transport_params => TransportParams,
+                transport_params_status => TPStatus,
+                psk_binders => PskBinders
+            }};
+        {error, _} = Error ->
+            Error
+    end.
 
-    %% Binders-section offset within the extension data of the PSK
-    %% extension, plus the absolute offset within ExtBlob. The
-    %% caller combines these with the handshake-message header to
-    %% truncate the ClientHello for binder verification.
-    PskBinders = psk_binders_offset(OrderedExts, ExtBlob),
+%% Decode the extensions Specs names, each with its parser, into a map
+%% keyed as Specs says, Default for one that is absent. An extension
+%% with data left over, or that does not fit its structure, is a
+%% decode_error (RFC 9846 Section 4.3).
+decode_extensions(Specs, ExtMap) ->
+    decode_extensions(Specs, ExtMap, #{}).
 
-    {ok, #{
-        random => Random,
-        session_id => SessionId,
-        cipher_suites => Ciphers,
-        extensions => ExtMap,
-        ordered_extensions => OrderedExts,
-        key_share => KeyShare,
-        server_name => ServerName,
-        alpn_protocols => ALPNProtocols,
-        transport_params => TransportParams,
-        transport_params_status => TPStatus,
-        pre_shared_key => PSK,
-        psk_key_exchange_modes => PskModes,
-        psk_binders => PskBinders,
-        supported_groups => SupportedGroups,
-        signature_algorithms => SignatureAlgs,
-        early_data => EarlyData
-    }}.
+decode_extensions([], _ExtMap, Acc) ->
+    {ok, Acc};
+decode_extensions([{Key, Type, Parse, Default} | Rest], ExtMap, Acc) ->
+    case maps:find(Type, ExtMap) of
+        error ->
+            decode_extensions(Rest, ExtMap, Acc#{Key => Default});
+        {ok, Data} ->
+            case Parse(Data) of
+                {ok, Value} -> decode_extensions(Rest, ExtMap, Acc#{Key => Value});
+                error -> {error, decode_error}
+            end
+    end.
+
+%% An extension whose data is empty, such as early_data in a ClientHello
+%% or EncryptedExtensions (RFC 9846 Section 4.3.10).
+empty_ext(<<>>) -> {ok, true};
+empty_ext(_) -> error.
+
+%% A list of two-byte codes: an even, non-empty length.
+u16_list(<<Len:16, Codes:Len/binary>>) when Len > 0, Len rem 2 =:= 0 ->
+    {ok, [C || <<C:16>> <= Codes]};
+u16_list(_) ->
+    error.
 
 %% @private Parse supported_groups (RFC 8446 §4.2.7) into recognised
 %% group atoms; unknown codes are dropped (they can't be selected).
-parse_supported_groups_ext(<<ListLen:16, Codes:ListLen/binary, _/binary>>) ->
-    [code_to_group(C) || <<C:16>> <= Codes, code_to_group(C) =/= unknown];
-parse_supported_groups_ext(_) ->
-    [].
+parse_supported_groups_ext(Data) ->
+    case u16_list(Data) of
+        {ok, Codes} -> {ok, [code_to_group(C) || C <- Codes, code_to_group(C) =/= unknown]};
+        error -> error
+    end.
 
 %% @private Parse signature_algorithms (RFC 8446 §4.2.3) into the
 %% list of wire codes (integers) in the order offered.
-parse_signature_algorithms_ext(<<ListLen:16, Codes:ListLen/binary, _/binary>>) ->
-    [C || <<C:16>> <= Codes];
-parse_signature_algorithms_ext(_) ->
-    [].
+parse_signature_algorithms_ext(Data) ->
+    u16_list(Data).
 
 %% @private Named-group wire code to atom (unknown -> unknown).
 code_to_group(?GROUP_X25519) -> x25519;
@@ -1525,10 +1554,10 @@ code_to_group(_) -> unknown.
 %% @private
 %% Parse the psk_key_exchange_modes extension into a list of atoms.
 %% RFC 8446 §4.2.9: <<Len:8, Modes:Len/binary>>.
-parse_psk_modes_ext(<<Len:8, Modes:Len/binary, _/binary>>) ->
-    [decode_psk_mode(M) || <<M:8>> <= Modes];
+parse_psk_modes_ext(<<Len:8, Modes:Len/binary>>) when Len > 0 ->
+    {ok, [decode_psk_mode(M) || <<M:8>> <= Modes]};
 parse_psk_modes_ext(_) ->
-    [].
+    error.
 
 decode_psk_mode(?PSK_KE_MODE_KE) -> psk_ke;
 decode_psk_mode(?PSK_KE_MODE_DHE_KE) -> psk_dhe_ke;
@@ -1692,21 +1721,24 @@ verify_resumption_binder(_Secret, _Cipher, _Prefix, _FullClientHello, _PskBinder
     %% Missing binder offset info — cannot verify, fail closed.
     false.
 
-parse_psk_identities(<<>>) ->
-    [];
+parse_psk_identities(<<>>, Acc) ->
+    {ok, lists:reverse(Acc)};
 parse_psk_identities(
-    <<IdentityLen:16, Identity:IdentityLen/binary, ObfuscatedAge:32, Rest/binary>>
-) ->
-    [{Identity, ObfuscatedAge} | parse_psk_identities(Rest)];
-parse_psk_identities(_) ->
-    [].
+    <<IdentityLen:16, Identity:IdentityLen/binary, ObfuscatedAge:32, Rest/binary>>, Acc
+) when IdentityLen > 0 ->
+    parse_psk_identities(Rest, [{Identity, ObfuscatedAge} | Acc]);
+parse_psk_identities(_, _Acc) ->
+    error.
 
-parse_psk_binders(<<>>) ->
-    [];
-parse_psk_binders(<<BinderLen:8, Binder:BinderLen/binary, Rest/binary>>) ->
-    [Binder | parse_psk_binders(Rest)];
-parse_psk_binders(_) ->
-    [].
+%% PskBinderEntry<32..255> (RFC 9846 Section 4.3.11).
+parse_psk_binders(<<>>, Acc) ->
+    {ok, lists:reverse(Acc)};
+parse_psk_binders(<<BinderLen:8, Binder:BinderLen/binary, Rest/binary>>, Acc) when
+    BinderLen >= 32
+->
+    parse_psk_binders(Rest, [Binder | Acc]);
+parse_psk_binders(_, _Acc) ->
+    error.
 
 build_server_hello_extensions(PubKey, Opts) ->
     %% Supported versions extension (mandatory for TLS 1.3)
@@ -1855,21 +1887,22 @@ build_certificate_request(Context, SigAlgAtoms) ->
 %% can pick a compatible CertificateVerify scheme.
 -spec parse_certificate_request(binary()) -> {ok, map()} | {error, term()}.
 parse_certificate_request(
-    <<ContextLen:8, Context:ContextLen/binary, ExtLen:16, Extensions:ExtLen/binary, _/binary>>
+    <<ContextLen:8, Context:ContextLen/binary, ExtLen:16, Extensions:ExtLen/binary>>
 ) ->
-    SigAlgs =
-        case parse_extensions(Extensions) of
-            {ok, ExtMap} ->
-                case maps:find(?EXT_SIGNATURE_ALGORITHMS, ExtMap) of
-                    {ok, SaData} -> parse_signature_algorithms_ext(SaData);
-                    error -> []
-                end;
-            _ ->
-                []
-        end,
-    {ok, #{context => Context, signature_algorithms => SigAlgs}};
+    case parse_extensions(Extensions) of
+        {ok, #{?EXT_SIGNATURE_ALGORITHMS := SaData}} ->
+            case parse_signature_algorithms_ext(SaData) of
+                {ok, SigAlgs} -> {ok, #{context => Context, signature_algorithms => SigAlgs}};
+                error -> {error, decode_error}
+            end;
+        {ok, _} ->
+            %% RFC 9846 Section 4.4.2: signature_algorithms is required.
+            {error, missing_extension};
+        Error ->
+            Error
+    end;
 parse_certificate_request(_) ->
-    {error, invalid_certificate_request}.
+    {error, decode_error}.
 
 %% @doc Build a CertificateVerify message for client (RFC 8446 Section 4.4.3).
 %% Uses "TLS 1.3, client CertificateVerify" context string.
