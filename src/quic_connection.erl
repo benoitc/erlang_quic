@@ -7326,7 +7326,10 @@ process_tls_message(
             end;
         {error, Reason} ->
             ?LOG_ERROR(#{what => client_hello_parse_failed, reason => Reason}, ?QUIC_LOG_META),
-            StateChIn
+            case hello_alert(Reason) of
+                undefined -> StateChIn;
+                Alert -> send_tls_alert(Alert, StateChIn)
+            end
     end;
 %% Client receives ServerHello
 process_tls_message(
@@ -7461,11 +7464,14 @@ process_tls_message(
                     },
                     send_initial_ack(State1)
             end;
-        {error, illegal_parameter} ->
-            notify_owner({error, {tls_alert, illegal_parameter}}, State),
-            send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
-        {error, _} ->
-            State
+        {error, Reason} ->
+            case hello_alert(Reason) of
+                undefined ->
+                    State;
+                Alert ->
+                    notify_owner({error, {tls_alert, Reason}}, State),
+                    send_tls_alert(Alert, State)
+            end
     end;
 process_tls_message(
     _Level,
@@ -12744,6 +12750,7 @@ default_alert_phrase(?TLS_ALERT_ILLEGAL_PARAMETER) -> <<"illegal parameter">>;
 default_alert_phrase(?TLS_ALERT_UNEXPECTED_MESSAGE) -> <<"unexpected message">>;
 default_alert_phrase(?TLS_ALERT_DECRYPT_ERROR) -> <<"decrypt error">>;
 default_alert_phrase(?TLS_ALERT_DECODE_ERROR) -> <<"decode error">>;
+default_alert_phrase(?TLS_ALERT_PROTOCOL_VERSION) -> <<"protocol version">>;
 default_alert_phrase(?TLS_ALERT_INTERNAL_ERROR) -> <<"internal error">>;
 default_alert_phrase(?TLS_ALERT_UNKNOWN_PSK_IDENTITY) -> <<"unknown psk identity">>;
 default_alert_phrase(?TLS_ALERT_BAD_CERTIFICATE) -> <<"bad certificate">>;
@@ -12751,6 +12758,12 @@ default_alert_phrase(?TLS_ALERT_UNKNOWN_CA) -> <<"unknown ca">>;
 default_alert_phrase(?TLS_ALERT_CERTIFICATE_REQUIRED) -> <<"certificate required">>;
 default_alert_phrase(?TLS_ALERT_NO_APPLICATION_PROTOCOL) -> <<"no application protocol">>;
 default_alert_phrase(_) -> <<"tls alert">>.
+
+%% The alert a hello the parser refused is answered with.
+hello_alert(protocol_version) -> ?TLS_ALERT_PROTOCOL_VERSION;
+hello_alert(illegal_parameter) -> ?TLS_ALERT_ILLEGAL_PARAMETER;
+hello_alert(decode_error) -> ?TLS_ALERT_DECODE_ERROR;
+hello_alert(_) -> undefined.
 
 %% Normalise the `verify' option to a strict boolean. Accepts the
 %% historical booleans as well as ssl-style `verify_peer'/`verify_none'

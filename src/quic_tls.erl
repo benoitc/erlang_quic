@@ -484,62 +484,79 @@ parse_server_hello(<<
     _Rest/binary
 >>) ->
     case parse_extensions(Extensions) of
-        {ok, ExtMap} when Random =:= ?TLS_HRR_RANDOM ->
-            %% HelloRetryRequest (RFC 8446 §4.1.4): a ServerHello whose
-            %% random is the HRR sentinel. Its key_share extension
-            %% carries only the selected group (KeyShareHelloRetryRequest).
-            Cipher = cipher_from_suite(CipherSuite),
-            case maps:find(?EXT_KEY_SHARE, ExtMap) of
-                {ok, <<GroupCode:16>>} ->
-                    {hrr, #{
-                        cipher => Cipher,
-                        selected_group => code_to_group(GroupCode),
-                        extensions => ExtMap
-                    }};
-                _ ->
-                    {error, hrr_missing_key_share}
-            end;
         {ok, ExtMap} ->
-            Cipher = cipher_from_suite(CipherSuite),
-            SelectedPsk =
-                case maps:find(?EXT_PRE_SHARED_KEY, ExtMap) of
-                    {ok, <<Idx:16>>} -> Idx;
-                    _ -> undefined
-                end,
-            KeyShareResult =
-                case maps:find(?EXT_KEY_SHARE, ExtMap) of
-                    {ok, KeyShareData} ->
-                        parse_server_key_share(KeyShareData);
-                    error when SelectedPsk =/= undefined ->
-                        %% psk_ke handshake: no DHE → public_key=undefined.
-                        {ok, {undefined, undefined}};
-                    error ->
-                        {error, missing_key_share}
-                end,
-            case KeyShareResult of
-                {ok, {SelectedGroup, PubKey}} ->
-                    Base = #{
-                        public_key => PubKey,
-                        selected_group => SelectedGroup,
-                        cipher => Cipher,
-                        random => Random,
-                        session_id => SessionId,
-                        extensions => ExtMap
-                    },
-                    Result =
-                        case SelectedPsk of
-                            undefined -> Base;
-                            Idx2 -> Base#{selected_psk_identity => Idx2}
-                        end,
-                    {ok, Result};
-                Error ->
-                    Error
+            case selected_version(ExtMap) of
+                ok -> parse_server_hello_extensions(Random, SessionId, CipherSuite, ExtMap);
+                Error -> Error
             end;
         Error ->
             Error
     end;
 parse_server_hello(_) ->
     {error, invalid_server_hello}.
+
+%% RFC 9846 Section 4.3.1: a ServerHello or HelloRetryRequest names
+%% TLS 1.3 in supported_versions; without it the server picked an older
+%% version, which QUIC does not allow (RFC 9001 Section 4.2).
+selected_version(ExtMap) ->
+    case maps:find(?EXT_SUPPORTED_VERSIONS, ExtMap) of
+        {ok, <<?TLS_VERSION_1_3:16>>} -> ok;
+        {ok, <<_:16>>} -> {error, illegal_parameter};
+        {ok, _} -> {error, decode_error};
+        error -> {error, protocol_version}
+    end.
+
+%% HelloRetryRequest (RFC 8446 §4.1.4): a ServerHello whose random is
+%% the HRR sentinel. Its key_share extension carries only the selected
+%% group (KeyShareHelloRetryRequest).
+parse_server_hello_extensions(?TLS_HRR_RANDOM, _SessionId, CipherSuite, ExtMap) ->
+    Cipher = cipher_from_suite(CipherSuite),
+    case maps:find(?EXT_KEY_SHARE, ExtMap) of
+        {ok, <<GroupCode:16>>} ->
+            {hrr, #{
+                cipher => Cipher,
+                selected_group => code_to_group(GroupCode),
+                extensions => ExtMap
+            }};
+        _ ->
+            {error, hrr_missing_key_share}
+    end;
+parse_server_hello_extensions(Random, SessionId, CipherSuite, ExtMap) ->
+    Cipher = cipher_from_suite(CipherSuite),
+    SelectedPsk =
+        case maps:find(?EXT_PRE_SHARED_KEY, ExtMap) of
+            {ok, <<Idx:16>>} -> Idx;
+            _ -> undefined
+        end,
+    KeyShareResult =
+        case maps:find(?EXT_KEY_SHARE, ExtMap) of
+            {ok, KeyShareData} ->
+                parse_server_key_share(KeyShareData);
+            error when SelectedPsk =/= undefined ->
+                %% psk_ke handshake: no DHE → public_key=undefined.
+                {ok, {undefined, undefined}};
+            error ->
+                {error, missing_key_share}
+        end,
+    case KeyShareResult of
+        {ok, {SelectedGroup, PubKey}} ->
+            Base = #{
+                public_key => PubKey,
+                selected_group => SelectedGroup,
+                cipher => Cipher,
+                random => Random,
+                session_id => SessionId,
+                extensions => ExtMap
+            },
+            Result =
+                case SelectedPsk of
+                    undefined -> Base;
+                    Idx2 -> Base#{selected_psk_identity => Idx2}
+                end,
+            {ok, Result};
+        Error ->
+            Error
+    end.
 
 %% @doc Parse EncryptedExtensions message.
 %% The `early_data' field signals whether the server accepted 0-RTT by
@@ -1115,12 +1132,14 @@ parse_client_hello(<<
             ExtMap = maps:from_list([{T, D} || {T, D, _Off, _Sz} <- OrderedExts]),
 
             %% Validate pre_shared_key placement (must be last per RFC 8446 §4.2.11).
-            case validate_psk_extension_placement(OrderedExts) of
-                ok ->
+            case {validate_psk_extension_placement(OrderedExts), offered_tls13(ExtMap)} of
+                {ok, ok} ->
                     finalise_client_hello(
                         Random, SessionId, Ciphers, OrderedExts, ExtMap, Extensions
                     );
-                {error, _} = Err ->
+                {{error, _} = Err, _} ->
+                    Err;
+                {ok, {error, _} = Err} ->
                     Err
             end;
         {error, Reason} ->
@@ -1320,6 +1339,21 @@ parse_pre_shared_key_ext(
     #{identities => Identities, binders => Binders};
 parse_pre_shared_key_ext(_) ->
     undefined.
+
+%% RFC 9846 Section 4.3.1: QUIC is TLS 1.3 only (RFC 9001 Section 4.2),
+%% so supported_versions has to offer 0x0304.
+offered_tls13(ExtMap) ->
+    case maps:find(?EXT_SUPPORTED_VERSIONS, ExtMap) of
+        {ok, <<Len:8, Versions:Len/binary>>} when Len >= 2, (Len rem 2) =:= 0 ->
+            case lists:member(?TLS_VERSION_1_3, [V || <<V:16>> <= Versions]) of
+                true -> ok;
+                false -> {error, protocol_version}
+            end;
+        {ok, _} ->
+            {error, decode_error};
+        error ->
+            {error, protocol_version}
+    end.
 
 %% @private
 %% Reject ClientHellos where pre_shared_key is not the final extension
