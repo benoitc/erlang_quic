@@ -57,6 +57,51 @@ client_hello_offering_only_tls12_test() ->
     ).
 
 %%====================================================================
+%% HelloRetryRequest (RFC 9846 Section 4.2.4)
+%%====================================================================
+
+hello_retry_request_for_another_group_test() ->
+    S = client_after(hello_retry_request()),
+    ?assertEqual(undefined, S#state.close_reason),
+    ?assertMatch(#{key_share := [{?GROUP_SECP256R1, _}]}, retried_client_hello(S)).
+
+hello_retry_request_for_the_group_already_sent_test() ->
+    ?assertEqual(
+        {tls_alert, ?TLS_ALERT_ILLEGAL_PARAMETER},
+        client_close(quic_tls:build_hello_retry_request(<<>>, ?TLS_AES_128_GCM_SHA256, x25519))
+    ).
+
+hello_retry_request_changing_nothing_test() ->
+    ?assertEqual(
+        {tls_alert, ?TLS_ALERT_ILLEGAL_PARAMETER},
+        client_close(without_ext(?EXT_KEY_SHARE, hello_retry_request()))
+    ).
+
+%% The cookie is the change: it goes back, with the same key share.
+hello_retry_request_with_only_a_cookie_test() ->
+    HRR = add_ext(
+        ?EXT_COOKIE, <<5:16, "token">>, without_ext(?EXT_KEY_SHARE, hello_retry_request())
+    ),
+    S = client_after(HRR),
+    ?assertEqual(undefined, S#state.close_reason),
+    CH2 = retried_client_hello(S),
+    ?assertEqual(<<5:16, "token">>, maps:get(?EXT_COOKIE, maps:get(extensions, CH2))),
+    ?assertEqual(
+        maps:get(?EXT_KEY_SHARE, maps:get(extensions, first_client_hello())),
+        maps:get(?EXT_KEY_SHARE, maps:get(extensions, CH2))
+    ).
+
+hello_retry_request_with_a_cookie_for_the_group_already_sent_test() ->
+    HRR = add_ext(
+        ?EXT_COOKIE,
+        <<5:16, "token">>,
+        quic_tls:build_hello_retry_request(<<>>, ?TLS_AES_128_GCM_SHA256, x25519)
+    ),
+    S = client_after(HRR),
+    ?assertEqual(undefined, S#state.close_reason),
+    ?assertMatch(#{extensions := #{?EXT_COOKIE := <<5:16, "token">>}}, retried_client_hello(S)).
+
+%%====================================================================
 %% Messages
 %%====================================================================
 
@@ -81,8 +126,29 @@ client_hello_opts() ->
         alpn => [<<"h3">>],
         transport_params => #{},
         groups => [x25519, secp256r1],
-        ciphers => [aes_128_gcm]
+        ciphers => [aes_128_gcm],
+        key_pair => key_pair()
     }.
+
+key_pair() ->
+    {<<9:256>>, <<1:256>>}.
+
+first_client_hello() ->
+    {CH1, _, _} = quic_tls:build_client_hello(client_hello_opts()),
+    parsed_client_hello(CH1).
+
+parsed_client_hello(<<?TLS_CLIENT_HELLO, Len:24, Body:Len/binary>>) ->
+    {ok, CH} = quic_tls:parse_client_hello(Body),
+    CH.
+
+%% The ClientHello a client sent after a HelloRetryRequest: its
+%% transcript is message_hash(CH1), the HRR, then that ClientHello.
+retried_client_hello(#state{hs = #hs{tls_transcript = Transcript}}) ->
+    <<254, 32:24, _:32/binary, ?TLS_SERVER_HELLO, Len:24, _:Len/binary, CH2/binary>> = Transcript,
+    parsed_client_hello(CH2).
+
+add_ext(Type, Data, Msg) ->
+    map_exts(fun(Exts) -> Exts ++ [{Type, Data}] end, Msg).
 
 without_ext(Type, Msg) ->
     map_exts(fun(Exts) -> lists:keydelete(Type, 1, Exts) end, Msg).
@@ -118,6 +184,9 @@ split_exts(
 
 %% How a client that sent client_hello/0 closes on Msg.
 client_close(Msg) ->
+    (client_after(Msg))#state.close_reason.
+
+client_after(Msg) ->
     {CH1, Priv, Random} = quic_tls:build_client_hello(client_hello_opts()),
     S0 = quic_connection_test_support:with_keys_and_socket(
         quic_connection_test_support:state_for_role(client)
@@ -135,7 +204,7 @@ client_close(Msg) ->
             tls_ch1_opts = client_hello_opts()
         }
     }),
-    S#state.close_reason.
+    S.
 
 %% How a server waiting for a ClientHello closes on Msg.
 server_close(Msg) ->

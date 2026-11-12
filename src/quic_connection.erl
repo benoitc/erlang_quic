@@ -2668,13 +2668,16 @@ send_client_hello(State) ->
     %% Build ClientHello (with or without PSK for resumption / external).
     %% session_ticket and external_psk are mutually exclusive; build_client_hello/1
     %% raises {bad_opts, psk_conflict} if both are present.
+    Groups = (State#state.cfg)#conn_cfg.tls_groups,
     ClientHelloOpts0 = #{
         server_name => ServerName,
         alpn => AlpnList,
         transport_params => TransportParams,
         session_ticket => SessionTicket,
-        groups => (State#state.cfg)#conn_cfg.tls_groups,
-        ciphers => (State#state.cfg)#conn_cfg.cipher_preference
+        groups => Groups,
+        ciphers => (State#state.cfg)#conn_cfg.cipher_preference,
+        %% Kept for a HelloRetryRequest that leaves the key share as it is.
+        key_pair => quic_crypto:generate_key_pair(hd(Groups))
     },
     ClientHelloOpts1 =
         case (State#state.cfg)#conn_cfg.tls_sig_algs of
@@ -8474,18 +8477,26 @@ offered_psk_hash(_Opts) ->
 %% random + session_id, and rewrites the transcript to the synthetic
 %% message_hash(CH1) + HRR prefix.
 handle_hello_retry_request(
-    #{cipher := Cipher, selected_group := SelGroup}, HrrMsg, State
+    #{cipher := Cipher, selected_group := HrrGroup, cookie := Cookie}, HrrMsg, State
 ) ->
     Ch1Opts = (State#state.hs)#hs.tls_ch1_opts,
+    SentGroup = (State#state.hs)#hs.tls_group,
+    SelGroup =
+        case HrrGroup of
+            undefined -> SentGroup;
+            _ -> HrrGroup
+        end,
     #conn_cfg{tls_groups = Groups, cipher_preference = Ciphers} = State#state.cfg,
     Offered = lists:member(SelGroup, Groups) andalso lists:member(Cipher, Ciphers),
-    case {(State#state.hs)#hs.hrr_sent, Offered} of
+    %% RFC 9846 Section 4.2.4: a retry must change the ClientHello.
+    Changes = (SelGroup =/= SentGroup) orelse (Cookie =/= undefined),
+    case {(State#state.hs)#hs.hrr_sent, Offered andalso Changes} of
         {true, _} ->
             %% A second HRR is illegal (RFC 8446 §4.1.4).
             notify_owner({error, {tls_alert, unexpected_message}}, State),
             send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State);
         {_, false} ->
-            %% Server picked a group or a cipher suite we never offered.
+            %% A group or suite we never offered, or nothing to change.
             notify_owner({error, {tls_alert, illegal_parameter}}, State),
             send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
         {false, true} ->
@@ -8496,13 +8507,19 @@ handle_hello_retry_request(
             BaseTranscript = <<Prefix/binary, HrrMsg/binary>>,
 
             %% Rebuild CH2: same random + session_id, key_share moved
-            %% to the server-selected group, a PSK binder over the new
-            %% transcript and no early_data. supported_groups stays.
-            Ch2Opts = Ch1Opts#{
-                key_share_group => SelGroup,
+            %% to the server-selected group, the cookie echoed, a PSK
+            %% binder over the new transcript and no early_data.
+            %% supported_groups stays.
+            KeyShareOpts =
+                case HrrGroup of
+                    undefined -> Ch1Opts;
+                    _ -> (maps:remove(key_pair, Ch1Opts))#{key_share_group => SelGroup}
+                end,
+            Ch2Opts = KeyShareOpts#{
                 retry_random => (State#state.hs)#hs.tls_ch1_random,
                 retry_session_id => <<>>,
-                hrr_transcript => BaseTranscript
+                hrr_transcript => BaseTranscript,
+                cookie => Cookie
             },
             {CH2, PrivKey, _Random} = quic_tls:build_client_hello(Ch2Opts),
             Transcript = <<BaseTranscript/binary, CH2/binary>>,

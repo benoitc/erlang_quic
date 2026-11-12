@@ -86,6 +86,8 @@
 %%   - session_ticket: #session_ticket{} for resumption with PSK (optional)
 %%   - hrr_transcript: message_hash(CH1) and the HelloRetryRequest, when
 %%     this is the ClientHello that answers one
+%%   - cookie: the HelloRetryRequest's cookie, sent back
+%%   - key_pair: the key share to send, generated when absent
 %%
 %% Returns: {ClientHelloMsg, PrivateKey, Random}
 -spec build_client_hello(map()) -> {binary(), quic_crypto:kex_private(), binary()}.
@@ -99,7 +101,11 @@ build_client_hello(Opts) ->
     %% supported_groups is unchanged but the share moves to the
     %% server-selected group).
     HeadGroup = maps:get(key_share_group, Opts, hd(Groups)),
-    {PubKey, PrivKey} = quic_crypto:generate_key_pair(HeadGroup),
+    {PubKey, PrivKey} =
+        case maps:get(key_pair, Opts, undefined) of
+            undefined -> quic_crypto:generate_key_pair(HeadGroup);
+            KeyPair -> KeyPair
+        end,
 
     %% On a HelloRetryRequest retry, CH2 MUST reuse CH1's random and
     %% legacy_session_id (RFC 8446 §4.1.2).
@@ -430,6 +436,12 @@ build_client_hello_extensions(PubKey, Opts) ->
         <<(byte_size(ModeBytes)):8, ModeBytes/binary>>
     ),
 
+    Cookie =
+        case maps:get(cookie, Opts, undefined) of
+            undefined -> <<>>;
+            C -> encode_extension(?EXT_COOKIE, <<(byte_size(C)):16, C/binary>>)
+        end,
+
     iolist_to_binary([
         SupportedVersions,
         SupportedGroups,
@@ -438,7 +450,8 @@ build_client_hello_extensions(PubKey, Opts) ->
         SNI,
         AlpnExt,
         TransportParamsExt,
-        PskModes
+        PskModes,
+        Cookie
     ]).
 
 encode_alpn_list(Protocols) ->
@@ -507,19 +520,32 @@ selected_version(ExtMap) ->
     end.
 
 %% HelloRetryRequest (RFC 8446 §4.1.4): a ServerHello whose random is
-%% the HRR sentinel. Its key_share extension carries only the selected
-%% group (KeyShareHelloRetryRequest).
+%% the HRR sentinel. Its key_share extension, if any, carries only the
+%% selected group (KeyShareHelloRetryRequest); its cookie, if any, goes
+%% back in the next ClientHello (RFC 9846 Section 4.3.2).
 parse_server_hello_extensions(?TLS_HRR_RANDOM, _SessionId, CipherSuite, ExtMap) ->
-    Cipher = cipher_from_suite(CipherSuite),
-    case maps:find(?EXT_KEY_SHARE, ExtMap) of
-        {ok, <<GroupCode:16>>} ->
+    Group =
+        case maps:find(?EXT_KEY_SHARE, ExtMap) of
+            {ok, <<GroupCode:16>>} -> {ok, code_to_group(GroupCode)};
+            {ok, _} -> error;
+            error -> {ok, undefined}
+        end,
+    Cookie =
+        case maps:find(?EXT_COOKIE, ExtMap) of
+            {ok, <<Len:16, C:Len/binary>>} when Len > 0 -> {ok, C};
+            {ok, _} -> error;
+            error -> {ok, undefined}
+        end,
+    case {Group, Cookie} of
+        {{ok, SelectedGroup}, {ok, CookieData}} ->
             {hrr, #{
-                cipher => Cipher,
-                selected_group => code_to_group(GroupCode),
+                cipher => cipher_from_suite(CipherSuite),
+                selected_group => SelectedGroup,
+                cookie => CookieData,
                 extensions => ExtMap
             }};
         _ ->
-            {error, hrr_missing_key_share}
+            {error, decode_error}
     end;
 parse_server_hello_extensions(Random, SessionId, CipherSuite, ExtMap) ->
     Cipher = cipher_from_suite(CipherSuite),
