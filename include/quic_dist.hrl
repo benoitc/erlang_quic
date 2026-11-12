@@ -104,7 +104,7 @@
     cacert_file :: binary() | undefined,
     cert :: binary() | undefined,
     key :: term() | undefined,
-    cacert :: binary() | undefined,
+    cacert :: binary() | [binary()] | undefined,
     verify = verify_none :: verify_none | verify_peer,
 
     %% Discovery

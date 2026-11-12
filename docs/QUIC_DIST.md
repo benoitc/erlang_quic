@@ -472,10 +472,17 @@ The input handler:
 |--------|------|---------|-------------|
 | `cert_file` | string | - | Path to PEM certificate file |
 | `key_file` | string | - | Path to PEM private key file |
-| `cacert_file` | string | - | Path to CA certificate (for verify_peer) |
+| `cacert_file` | string | - | Path to a PEM file of CA certificates (for verify_peer) |
 | `cert` | binary | - | DER-encoded certificate (alternative to file) |
 | `key` | term | - | Private key term (alternative to file) |
-| `verify` | atom | `verify_none` | `verify_peer`: each node presents its certificate and checks the other's against `cacert_file` and the host part of its node name. `verify_none`: no certificate check |
+| `cacert` | binary \| [binary] | - | DER-encoded CA certificates (alternative to `cacert_file`) |
+| `verify` | atom | `verify_none` | `verify_peer`: each node presents its certificate and checks the other's against the CA and the host part of its node name. `verify_none`: no certificate check |
+
+The CA applies whichever way the certificate is given: `cacert` and
+`cacert_file` can each go with `cert`/`key` or `cert_file`/`key_file`,
+and when both are set both are trusted. With `verify_peer` a listener
+needs a CA: without one, it does not start and `listen` returns
+`{error, client_auth_needs_cacerts}`.
 
 ### Discovery Settings
 

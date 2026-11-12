@@ -724,17 +724,24 @@ start_supervised_server(Name, Port, Opts) ->
 %% This bypasses the supervisor tree since quic_sup isn't running yet.
 %% The listener is NOT linked to the distribution process to avoid
 %% crashing if distribution restarts.
+%% quic:start_server/3 refuses client authentication without trust
+%% anchors; this path skips it, so it runs the same check.
 start_standalone_listener(Name, Port, Opts) ->
     ServerName = dist_server_name(Name),
-    case quic_listener:start(Port, Opts) of
-        {ok, ListenerPid} ->
-            %% Get actual port
-            ActualPort = quic_listener:get_port(ListenerPid),
-            %% Register the listener for later adoption by quic_sup
-            register_early_boot_listener(ServerName, ListenerPid, ActualPort),
-            {ok, ServerName, ActualPort};
-        {error, Reason} ->
-            {error, Reason}
+    case quic_cert:check_client_auth(Opts) of
+        ok ->
+            case quic_listener:start(Port, Opts) of
+                {ok, ListenerPid} ->
+                    %% Get actual port
+                    ActualPort = quic_listener:get_port(ListenerPid),
+                    %% Register the listener for later adoption by quic_sup
+                    register_early_boot_listener(ServerName, ListenerPid, ActualPort),
+                    {ok, ServerName, ActualPort};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, _} = Error ->
+            Error
     end.
 
 %% @private
@@ -775,18 +782,15 @@ client_verify_opts(_Config, _CACert, _Node, Opts) ->
     Opts#{verify => false}.
 
 with_cacerts(undefined, Opts) -> Opts;
-with_cacerts(CACerts, Opts) when is_list(CACerts) -> Opts#{cacerts => CACerts};
-with_cacerts(CACert, Opts) when is_binary(CACert) -> Opts#{cacerts => [CACert]}.
+with_cacerts(CACerts, Opts) when is_list(CACerts) -> Opts#{cacerts => CACerts}.
 
-load_credentials(#quic_dist_config{cert = Cert, key = Key, cacert = CACert}) when
+load_credentials(#quic_dist_config{cert = Cert, key = Key} = Config) when
     Cert =/= undefined, Key =/= undefined
 ->
-    {ok, Cert, Key, CACert};
-load_credentials(#quic_dist_config{
-    cert_file = CertFile,
-    key_file = KeyFile,
-    cacert_file = CACertFile
-}) when CertFile =/= undefined, KeyFile =/= undefined ->
+    with_trust_anchors(Cert, Key, Config);
+load_credentials(#quic_dist_config{cert_file = CertFile, key_file = KeyFile} = Config) when
+    CertFile =/= undefined, KeyFile =/= undefined
+->
     try
         {ok, CertPem} = file:read_file(CertFile),
         {ok, KeyPem} = file:read_file(KeyFile),
@@ -810,19 +814,7 @@ load_credentials(#quic_dist_config{
                 [Entry] ->
                     Entry
             end,
-
-        %% Load CA certificate if provided
-        CACertDer =
-            case CACertFile of
-                undefined ->
-                    undefined;
-                _ ->
-                    %% A bundle is as valid as a single certificate here.
-                    {ok, CADers} = quic_cert:cacerts_from_file(CACertFile),
-                    CADers
-            end,
-
-        {ok, CertDer, KeyDer, CACertDer}
+        with_trust_anchors(CertDer, KeyDer, Config)
     catch
         _:Reason ->
             {error, {load_credentials, Reason}}
@@ -835,6 +827,27 @@ load_credentials(#quic_dist_config{} = Config) ->
     case psk_only_credentials_ok(Config) of
         true -> {ok, undefined, undefined, undefined};
         false -> {error, no_credentials}
+    end.
+
+%% The CA applies whichever way the certificate is given: `cacert' and
+%% `cacert_file' (a bundle is as valid as a single certificate) both add
+%% trust anchors.
+with_trust_anchors(Cert, Key, #quic_dist_config{cacert = CACert, cacert_file = CACertFile}) ->
+    Inline =
+        case CACert of
+            undefined -> [];
+            Der when is_binary(Der) -> [Der];
+            Ders when is_list(Ders) -> Ders
+        end,
+    FromFile =
+        case CACertFile of
+            undefined -> {ok, []};
+            _ -> quic_cert:cacerts_from_file(CACertFile)
+        end,
+    case FromFile of
+        {ok, []} when Inline =:= [] -> {ok, Cert, Key, undefined};
+        {ok, FileDers} -> {ok, Cert, Key, Inline ++ FileDers};
+        {error, Reason} -> {error, {load_credentials, Reason}}
     end.
 
 %% @private
