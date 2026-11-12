@@ -183,7 +183,7 @@ All notable changes to this project will be documented in this file.
 - A RESET_STREAM_AT from the peer did not count the stream's final size
   against connection flow control, so connection credit fell behind what
   the peer had used and the peer could stall waiting for more (RFC 9000
-  Section 4.5, draft-ietf-quic-reliable-stream-reset-07).
+  Section 4.5, draft-ietf-quic-reliable-stream-reset-11).
 - After heavy packet loss left more than 64 ACK ranges, a packet number
   below the ranges kept was accepted again, so a duplicated packet was
   processed twice. Packet numbers below the lowest range kept are now
