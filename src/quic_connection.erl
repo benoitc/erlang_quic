@@ -1326,7 +1326,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             idle_timeout = IdleTimeoutClient,
             keep_alive_interval = calculate_keep_alive_interval(Opts),
             disconnect_timeout = disconnect_timeout_opt(Opts),
-            %% TLS 1.3 external PSK (RFC 9846 §4.3.11) — mutually exclusive
+            %% TLS 1.3 external PSK (RFC 9846 §4.3.11), mutually exclusive
             %% with session_ticket; conflict raised by build_client_hello/1.
             external_psk = ExternalPsk,
             congestion_threshold = maps:get(congestion_threshold, Opts, 2),

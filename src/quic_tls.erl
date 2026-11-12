@@ -426,7 +426,7 @@ build_client_hello_extensions(PubKey, Opts) ->
         TransportParamsData
     ),
 
-    %% PSK Key Exchange Modes — list of bytes per RFC 9846 §4.3.9.
+    %% PSK Key Exchange Modes: list of bytes per RFC 9846 §4.3.9.
     %% Defaults to `psk_dhe_ke' only; callers offering external PSK
     %% may pass `psk_modes => [psk_ke, psk_dhe_ke]` etc.
     Modes = maps:get(psk_modes, Opts, [psk_dhe_ke]),
@@ -1760,7 +1760,7 @@ build_server_hello_extensions(PubKey, Opts) ->
         end,
 
     %% pre_shared_key extension echo when a PSK was selected
-    %% (RFC 9846 §4.3.11 — ServerHello carries just selected_identity).
+    %% (RFC 9846 §4.3.11: ServerHello carries just selected_identity).
     PskExt =
         case maps:find(selected_psk_identity, Opts) of
             {ok, Idx} when is_integer(Idx) ->

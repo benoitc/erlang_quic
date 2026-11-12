@@ -250,7 +250,7 @@
     type :: resumption | external,
     %% binary identity sent on the wire
     identity :: binary(),
-    %% obfuscated_ticket_age:32 — 0 for external PSKs (RFC 9846 §4.3.11)
+    %% obfuscated_ticket_age:32, 0 for external PSKs (RFC 9846 §4.3.11)
     age = 0 :: non_neg_integer(),
     %% raw PSK secret (passed to HKDF unchanged)
     secret :: binary(),
