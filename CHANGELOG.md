@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- The client accepted a server certificate whose names RFC 9525 does not
+  allow to match the host: a wildcard that was only part of a label (such
+  as `f*o.example.com`), sat inside an `xn--` label, or was a lone `*`;
+  and, on OTP 27 and 28, a certificate with no subjectAltName whose
+  subject common name matched the host. These certificates are now
+  rejected as a hostname mismatch. Only the DNS and IP subjectAltName
+  entries are matched, and a wildcard counts only as the whole leftmost
+  label, standing for one label (RFC 9525 Sections 2, 6.3 and 6.4).
+
 ### Added
 - An auth callback can return `{ok, {authenticated_node, Node}}`;
   quic_dist then refuses a peer whose dist node name differs from the
