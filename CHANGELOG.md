@@ -15,7 +15,9 @@ All notable changes to this project will be documented in this file.
   label, standing for one label (RFC 9525 Sections 2, 6.3 and 6.4). An
   internationalized host name is converted to A-labels, with UTS 46
   mapping, before it is matched; a name that cannot be converted
-  matches no certificate.
+  matches no certificate. A server name that is not a valid host name,
+  such as one with brackets, a port or an empty label, matches no
+  certificate and is not sent as SNI.
 - A client that connected to an IP address, with verification on and no
   `server_name`, did not check the server certificate's name: any
   certificate that chained to the trust anchors was accepted. The
@@ -24,8 +26,10 @@ All notable changes to this project will be documented in this file.
   (RFC 6066 Section 3), including when given as `server_name`. An IPv6
   address in brackets, such as `[::1]`, or with a zone ID counts as the
   address, whether given as the host, as `server_name` or through
-  `quic_h3:connect`. A hostname, as the host or as `server_name`, works
-  as before.
+  `quic_h3:connect`. A host in brackets that is not an IP address, such
+  as `[localhost]`, is refused with `{error, einval}` instead of being
+  dialled without its brackets. A hostname, as the host or as
+  `server_name`, works as before.
 - Crash reports, supervisor reports and `sys:get_status/1` printed
   private keys, PSKs, TLS secrets, packet protection keys, session
   ticket secrets, QUIC-LB keys and stateless reset secrets and tokens.
@@ -33,7 +37,10 @@ All notable changes to this project will be documented in this file.
   registry, HTTP/3 connections, distribution controllers and the
   distribution ticket store. The server, listener pool, top-level and
   distribution supervisors no longer keep these options in their state
-  or child specs.
+  or child specs. The stack trace of a crash could still show them in
+  the arguments of the failing call; erlang_quic now adds a logger
+  filter, `quic_redact`, that removes these arguments from crash,
+  terminate and supervisor reports.
 - With the optional crypto NIF built, a protected 1-RTT packet with an
   empty payload made the receive path read frames from memory past the
   decrypted packet. Only the decrypted bytes are read now, so such a
@@ -125,7 +132,8 @@ All notable changes to this project will be documented in this file.
 - A client connecting to an internationalized host name sent it in
   Server Name Indication as UTF-8, which servers do not match. It is now
   sent as A-labels, and a name that is not a valid IDN is not sent
-  (RFC 6066 Section 3).
+  (RFC 6066 Section 3). A trailing dot is no longer sent, and a name
+  with one now matches a certificate for the same name without it.
 - A peer that sent a packet within each idle period kept a handshake open
   for ever, holding a connection and a `max_connections` slot. A
   handshake that has not completed within the idle timeout from its
