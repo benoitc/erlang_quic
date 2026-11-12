@@ -158,14 +158,14 @@ derive_psk(ResumptionSecret, #session_ticket{nonce = Nonce, cipher = Cipher}) ->
         max_early_data := non_neg_integer()
     }}
     | {error, term()}.
-parse_new_session_ticket(<<Lifetime:32, AgeAdd:32, NonceLen, Rest/binary>>) ->
-    case Rest of
-        <<Nonce:NonceLen/binary, TicketLen:16, Rest1/binary>> when byte_size(Rest1) >= TicketLen ->
-            <<Ticket:TicketLen/binary, ExtLen:16, Extensions/binary>> = Rest1,
-            case byte_size(Extensions) >= ExtLen of
-                true ->
-                    <<ExtData:ExtLen/binary, _/binary>> = Extensions,
-                    MaxEarlyData = parse_early_data_extension(ExtData),
+parse_new_session_ticket(
+    <<Lifetime:32, AgeAdd:32, NonceLen, Nonce:NonceLen/binary, TicketLen:16,
+        Ticket:TicketLen/binary, ExtLen:16, Extensions:ExtLen/binary>>
+) when TicketLen > 0 ->
+    case quic_tls:parse_extensions_ordered(Extensions) of
+        {ok, Exts} ->
+            case early_data_size(lists:keyfind(?EXT_EARLY_DATA, 1, Exts)) of
+                {ok, MaxEarlyData} ->
                     {ok, #{
                         lifetime => Lifetime,
                         age_add => AgeAdd,
@@ -173,25 +173,20 @@ parse_new_session_ticket(<<Lifetime:32, AgeAdd:32, NonceLen, Rest/binary>>) ->
                         ticket => Ticket,
                         max_early_data => MaxEarlyData
                     }};
-                false ->
-                    {error, invalid_extensions}
+                error ->
+                    {error, decode_error}
             end;
-        _ ->
-            {error, invalid_ticket}
+        {error, _} ->
+            {error, decode_error}
     end;
 parse_new_session_ticket(_) ->
-    {error, invalid_format}.
+    {error, decode_error}.
 
-%% Parse early_data extension from NewSessionTicket
-%% Extension type 42 (0x002a) = early_data
-parse_early_data_extension(<<>>) ->
-    0;
-parse_early_data_extension(<<16#00, 16#2a, 4:16, MaxEarlyData:32, _Rest/binary>>) ->
-    MaxEarlyData;
-parse_early_data_extension(<<_Type:16, Len:16, _Data:Len/binary, Rest/binary>>) ->
-    parse_early_data_extension(Rest);
-parse_early_data_extension(_) ->
-    0.
+%% The early_data extension of a NewSessionTicket is a uint32
+%% max_early_data_size (RFC 9846 Section 4.3.10).
+early_data_size(false) -> {ok, 0};
+early_data_size({?EXT_EARLY_DATA, <<MaxEarlyData:32>>, _Off, _Size}) -> {ok, MaxEarlyData};
+early_data_size(_) -> error.
 
 %%====================================================================
 %% Ticket Creation (for server use)

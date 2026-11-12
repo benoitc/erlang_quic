@@ -7892,8 +7892,8 @@ process_tls_message(
                     resumption_secret = ResumptionSecret
                 }
             };
-        {error, _Reason} ->
-            State
+        {error, decode_error} ->
+            send_tls_alert(?TLS_ALERT_DECODE_ERROR, State)
     end;
 %% Client receives CertificateRequest from server (mutual TLS)
 process_tls_message(
