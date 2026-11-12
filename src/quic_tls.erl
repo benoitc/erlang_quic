@@ -473,32 +473,36 @@ encode_alpn_list(Protocols) ->
         extensions := map(),
         selected_psk_identity => non_neg_integer()
     }}
-    | {hrr, #{cipher := atom(), selected_group := atom() | unknown, extensions := map()}}
+    | {hrr, #{
+        cipher := atom(),
+        selected_group := atom() | unknown | undefined,
+        cookie := binary() | undefined,
+        session_id := binary(),
+        extensions := map()
+    }}
     | {error, term()}.
-parse_server_hello(
-    <<_:16, _:32/binary, SessionIdLen:8, _:SessionIdLen/binary, CipherSuite:16, _/binary>>
-) when
-    CipherSuite =/= ?TLS_AES_128_GCM_SHA256,
-    CipherSuite =/= ?TLS_AES_256_GCM_SHA384,
-    CipherSuite =/= ?TLS_CHACHA20_POLY1305_SHA256
-->
-    {error, illegal_parameter};
 parse_server_hello(<<
-    % legacy_version
-    ?TLS_VERSION_1_2:16,
+    LegacyVersion:16,
     Random:32/binary,
     SessionIdLen:8,
     SessionId:SessionIdLen/binary,
     CipherSuite:16,
-    % legacy_compression_method
-    0,
+    Compression:8,
     ExtensionsLen:16,
     Extensions:ExtensionsLen/binary,
     _Rest/binary
 >>) ->
     case parse_extensions(Extensions) of
         {ok, ExtMap} ->
-            case selected_version(ExtMap) of
+            %% RFC 9846 Sections 4.2.3 and 4.2.4: the version first, then
+            %% the legacy fields.
+            Checks = [
+                selected_version(ExtMap),
+                server_legacy_version(LegacyVersion),
+                tls13_suite(CipherSuite),
+                null_compression(<<Compression>>)
+            ],
+            case first_error(Checks) of
                 ok -> parse_server_hello_extensions(Random, SessionId, CipherSuite, ExtMap);
                 Error -> Error
             end;
@@ -507,6 +511,14 @@ parse_server_hello(<<
     end;
 parse_server_hello(_) ->
     {error, invalid_server_hello}.
+
+server_legacy_version(?TLS_VERSION_1_2) -> ok;
+server_legacy_version(_) -> {error, protocol_version}.
+
+tls13_suite(?TLS_AES_128_GCM_SHA256) -> ok;
+tls13_suite(?TLS_AES_256_GCM_SHA384) -> ok;
+tls13_suite(?TLS_CHACHA20_POLY1305_SHA256) -> ok;
+tls13_suite(_) -> {error, illegal_parameter}.
 
 %% RFC 9846 Section 4.3.1: a ServerHello or HelloRetryRequest names
 %% TLS 1.3 in supported_versions; without it the server picked an older
@@ -523,7 +535,7 @@ selected_version(ExtMap) ->
 %% the HRR sentinel. Its key_share extension, if any, carries only the
 %% selected group (KeyShareHelloRetryRequest); its cookie, if any, goes
 %% back in the next ClientHello (RFC 9846 Section 4.3.2).
-parse_server_hello_extensions(?TLS_HRR_RANDOM, _SessionId, CipherSuite, ExtMap) ->
+parse_server_hello_extensions(?TLS_HRR_RANDOM, SessionId, CipherSuite, ExtMap) ->
     Group =
         case maps:find(?EXT_KEY_SHARE, ExtMap) of
             {ok, <<GroupCode:16>>} -> {ok, code_to_group(GroupCode)};
@@ -542,6 +554,7 @@ parse_server_hello_extensions(?TLS_HRR_RANDOM, _SessionId, CipherSuite, ExtMap) 
                 cipher => cipher_from_suite(CipherSuite),
                 selected_group => SelectedGroup,
                 cookie => CookieData,
+                session_id => SessionId,
                 extensions => ExtMap
             }};
         _ ->

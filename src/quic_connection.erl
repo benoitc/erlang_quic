@@ -7347,6 +7347,10 @@ process_tls_message(
     #state{cfg = #conn_cfg{role = client}, hs = #hs{tls_state = ?TLS_AWAITING_SERVER_HELLO}} = State
 ) ->
     case quic_tls:parse_server_hello(Body) of
+        {_, #{session_id := Echo}} when Echo =/= <<>> ->
+            %% Our legacy_session_id is empty (RFC 9846 Section 4.2.3).
+            notify_owner({error, {tls_alert, illegal_parameter}}, State),
+            send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
         {hrr, HrrInfo} ->
             handle_hello_retry_request(HrrInfo, OriginalMsg, State);
         {ok, #{cipher := Cipher} = ServerHelloMap} ->
