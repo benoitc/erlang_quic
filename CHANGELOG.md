@@ -36,6 +36,9 @@ All notable changes to this project will be documented in this file.
   `{closed, {tls_alert, Reason}}`.
 - With `idle_timeout => 0`, a handshake that hears nothing from the peer
   now ends after `disconnect_timeout` instead of never.
+- The owner of a connection whose handshake ends at its deadline gets
+  `{closed, handshake_timeout}`. A handshake that heard nothing from the
+  peer for the whole idle timeout still ends with `{closed, idle_timeout}`.
 - A FIN on the peer's control or QPACK streams went unnoticed; only a
   reset closed the connection. Both now close it with
   H3_CLOSED_CRITICAL_STREAM (RFC 9114 Section 6.2.1, RFC 9204 Section
@@ -67,6 +70,19 @@ All notable changes to this project will be documented in this file.
   `{error, status_101_forbidden}` (RFC 9114 Section 4.5).
 
 ### Fixed
+- A peer that sent a packet within each idle period kept a handshake open
+  for ever, holding a connection and a `max_connections` slot. A
+  handshake that has not completed within the idle timeout from its
+  start, or `disconnect_timeout` when no idle timeout is set, now ends
+  (RFC 9000 Section 10.1).
+- A CONNECTION_CLOSE sent before the handshake was confirmed went out at
+  one encryption level only, in 1-RTT packets once there were 1-RTT
+  keys, which the peer may not be able to read yet, so the peer waited
+  for its own timeout. This held for a local close, a transport error, a
+  TLS alert and the close sent when a connection stops unexpectedly. The
+  close now also goes out in a Handshake packet, and from a server in an
+  Initial packet too. Below 1-RTT an application close is sent as
+  APPLICATION_ERROR without its reason (RFC 9000 Section 10.2.3).
 - Datagrams waiting for an unvalidated address to be validated, held back
   by the anti-amplification limit, were kept without a bound, so a peer
   that kept sending while its new address was checked could make the

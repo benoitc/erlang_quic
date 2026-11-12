@@ -491,7 +491,7 @@ The input handler:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `keep_alive_interval` | integer/atom | `disabled` | Keep-alive PING interval (ms), or `auto` for half idle timeout |
-| `idle_timeout` | integer | 30000 | Connection idle timeout (ms) |
+| `idle_timeout` | integer | 30000 | Connection idle timeout (ms); the handshake must also complete within it |
 | `max_data` | integer | 786432 | Connection flow control limit (bytes) |
 | `max_stream_data_bidi_local` | integer | 524288 | Stream flow control limit, streams we open (bytes) |
 | `max_stream_data_bidi_remote` | integer | 524288 | Stream flow control limit, peer-opened streams (bytes) |

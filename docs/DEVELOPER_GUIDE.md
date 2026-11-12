@@ -326,7 +326,7 @@ handle_quic_event({quic, Conn, Event}) ->
 |--------|------|---------|-------------|
 | `alpn` | `[binary()]` | `[<<"h3">>]` | ALPN protocols |
 | `verify` | `boolean()` | `true` on the client, `false` on the server | Verify the peer certificate. `verify_peer` and `verify_none` are accepted and normalized to a boolean |
-| `idle_timeout` | `integer()` | `30000` | Idle timeout (ms), 0 to disable |
+| `idle_timeout` | `integer()` | `30000` | Idle timeout (ms), 0 to disable; the handshake must also complete within it |
 | `max_data` | `integer()` | `786432` | Connection flow control (bytes) |
 | `max_stream_data_bidi_local` | `integer()` | `524288` | Receive window for streams we open (bytes) |
 | `max_stream_data_bidi_remote` | `integer()` | `524288` | Receive window for streams the peer opens (bytes) |
