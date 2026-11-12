@@ -6625,9 +6625,9 @@ process_frame(
                 {ok, #stream_state{final_size = ExistingFinalSize}} when
                     ExistingFinalSize =/= undefined andalso ExistingFinalSize =/= FinalSize
                 ->
-                    %% STREAM_STATE_ERROR: FinalSize changed
+                    %% draft-ietf-quic-reliable-stream-reset-11 Section 5.2
                     close_with_transport_error(
-                        ?QUIC_STREAM_STATE_ERROR, <<"RESET_STREAM_AT final_size changed">>, State
+                        ?QUIC_FINAL_SIZE_ERROR, <<"RESET_STREAM_AT final_size changed">>, State
                     );
                 {ok, #stream_state{recv_reset_error = ExistingError}} when
                     ExistingError =/= undefined andalso ExistingError =/= ErrorCode
@@ -8673,14 +8673,24 @@ do_process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
     case clamp_recv_reset_at(StreamId, Offset, Data, Fin, State) of
         drop ->
             State;
+        final_size_error ->
+            close_with_transport_error(
+                ?QUIC_FINAL_SIZE_ERROR, <<"stream data past its final size">>, State
+            );
         {ClampedData, ClampedFin} ->
             do_process_stream_data_buffered(StreamId, Offset, ClampedData, ClampedFin, State)
     end.
 
 %% Drop data at/after recv_reset_at, truncate a straddling chunk to the boundary
-%% (clearing Fin). Returns drop | {Data, Fin}.
+%% (clearing Fin). Returns drop | final_size_error | {Data, Fin}.
 clamp_recv_reset_at(StreamId, Offset, Data, Fin, State) ->
+    End = Offset + byte_size(Data),
     case maps:find(StreamId, State#state.streams) of
+        %% Past the final size, or a FIN that moves it (reset-11 Section 5.2).
+        {ok, #stream_state{recv_reset_at = R, final_size = FS}} when
+            R =/= undefined andalso (End > FS orelse (Fin andalso End =/= FS))
+        ->
+            final_size_error;
         {ok, #stream_state{recv_reset_at = R}} when R =/= undefined ->
             if
                 Offset >= R -> drop;
