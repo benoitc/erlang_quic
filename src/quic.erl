@@ -548,6 +548,13 @@ reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) when is_pid(Conn) ->
 %% peer advertised `reset_stream_at'; otherwise it stays a RESET_STREAM.
 %% WebTransport needs it for its stream header (draft-ietf-webtrans-http3-17
 %% Section 4.4). Without it nothing changes.
+%%
+%% This is an exception to draft-ietf-quic-reliable-stream-reset-11
+%% Section 5.4, which says a reset answering STOP_SENDING SHOULD have a
+%% reliable size of 0: without a reliable size set here, quic answers
+%% with a RESET_STREAM, and a later `reset_stream_at/4' on that stream is
+%% refused with `{error, cannot_increase_reliable_size}'. With one, the
+%% bytes it keeps are still sent, even if they were only queued.
 -spec set_stream_reliable_size(Conn, StreamId, Size) -> ok | {error, term()} when
     Conn :: pid(),
     StreamId :: non_neg_integer(),

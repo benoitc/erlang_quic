@@ -6757,13 +6757,10 @@ process_frame(
                         end,
                     %% Notify owner - they should stop sending and may send RESET_STREAM
                     Owner ! {quic, self(), {stop_sending, StreamId, ErrorCode}},
-                    %% Answer while the queue still shows what was sent, so
-                    %% the RESET_STREAM carries that as the final size, then
-                    %% remove the stream from the send queue.
-                    State1 = answer_stop_sending(StreamId, ErrorCode, Streams, State#state{
+                    %% The reset drops from the send queue what it does not keep reliable.
+                    answer_stop_sending(StreamId, ErrorCode, Streams, State#state{
                         streams = NewStreams
-                    }),
-                    purge_stream_send_queue(StreamId, State1)
+                    })
             end
     end;
 %% STREAM_DATA_BLOCKED: Peer is blocked by stream-level flow control
@@ -12129,10 +12126,14 @@ do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
             FinalSize = reset_final_size(StreamId, StreamState, State),
             ResetFrame = {reset_stream, StreamId, ErrorCode, FinalSize},
             NewState = send_frame(ResetFrame, State),
+            %% Reliable Size 0 for any later RESET_STREAM_AT (reset-11 Section 5.2).
             UpdatedStream = StreamState#stream_state{
                 state = reset,
                 deadline_timer = undefined,
-                send_done = true
+                send_done = true,
+                send_offset = FinalSize,
+                send_reset_at = 0,
+                send_reset_error = ErrorCode
             },
             %% Purge any queued STREAM frames so nothing is sent after the reset.
             State1 = purge_stream_send_queue(StreamId, NewState),
@@ -12626,6 +12627,9 @@ do_close_stream_deadline(StreamId, ErrorCode, #state{streams = Streams} = State)
                 state = reset,
                 send_buffer = [],
                 send_done = true,
+                send_offset = FinalSize,
+                send_reset_at = 0,
+                send_reset_error = ErrorCode,
                 deadline = undefined,
                 deadline_timer = undefined
             },

@@ -216,9 +216,10 @@ ok = quic:send_data(Conn, StreamId, Header, false),
 ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 ```
 
-When the peer stops the stream with STOP_SENDING, quic resets it by itself.
-Give the stream its reliable size up front and that reset keeps the
-header too:
+When the peer stops the stream with STOP_SENDING, quic resets it by itself
+with a reliable size of 0 (draft-ietf-quic-reliable-stream-reset-11 Section
+5.4). Give the stream its reliable size up front and that reset keeps the
+header too, as WebTransport needs:
 
 ```erlang
 ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
