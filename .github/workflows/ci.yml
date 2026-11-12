@@ -133,6 +133,14 @@ jobs:
         with:
           path: apps/quic
 
+      # The hex fetch of idna hangs rebar3 here too, so it builds from
+      # its tag as a sibling app; rebar3 then fetches nothing.
+      - uses: actions/checkout@v4
+        with:
+          repository: benoitc/erlang-idna
+          ref: '8.0.0'
+          path: apps/idna
+
       - name: Create the enclosing project
         run: Set-Content -Path rebar.config -Value "{deps, []}."
 
