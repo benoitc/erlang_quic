@@ -148,8 +148,9 @@
 %% RFC 9221 - QUIC Datagrams
 -define(TP_MAX_DATAGRAM_FRAME_SIZE, 16#20).
 
-%% draft-ietf-quic-reliable-stream-reset-07 - Reliable RESET_STREAM
--define(TP_RESET_STREAM_AT, 16#17f7586d2cb571).
+%% reset_stream_at: draft-ietf-quic-reliable-stream-reset-11 Section 3, then the -07 id.
+-define(TP_RESET_STREAM_AT, 16#1d).
+-define(TP_RESET_STREAM_AT_DRAFT07, 16#17f7586d2cb571).
 
 %%====================================================================
 %% Crypto Constants
