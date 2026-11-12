@@ -20,10 +20,10 @@ All notable changes to this project will be documented in this file.
   entries (RFC 9525 Section 6.4), and it is no longer sent as SNI
   (RFC 6066 Section 3), including when given as `server_name`. A
   hostname, as the host or as `server_name`, works as before.
-- Crash reports and `sys:get_status/1` of connections, listeners and
-  the processes that keep their options or session tickets printed
-  private keys, PSKs, TLS secrets and packet protection keys. These are
-  now shown as `redacted`.
+- Crash reports, supervisor reports and `sys:get_status/1` of
+  connections, listeners, their supervisors and the processes that keep
+  their options or session tickets printed private keys, PSKs, TLS
+  secrets and packet protection keys. These are no longer shown.
 
 ### Added
 - An auth callback can return `{ok, {authenticated_node, Node}}`;
