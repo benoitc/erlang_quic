@@ -46,9 +46,10 @@
 %% Options:
 %%   - pool_size: Number of listener processes (default 1)
 %%   - All other options are passed to quic_listener
--spec start_link(inet:port_number(), map()) -> {ok, pid()} | {error, term()}.
+-spec start_link(inet:port_number(), map() | fun(() -> map())) ->
+    {ok, pid()} | {error, term()}.
 start_link(Port, Opts) ->
-    supervisor:start_link(?MODULE, {Port, Opts}).
+    supervisor:start_link(?MODULE, {Port, quic_redact:seal(Opts)}).
 
 %% @doc Stop the listener pool supervisor.
 -spec stop(pid()) -> ok.
@@ -79,8 +80,9 @@ get_listeners(Sup) ->
 %% supervisor callbacks
 %%====================================================================
 
-init({Port, Opts}) ->
+init({Port, Sealed}) ->
     Self = self(),
+    Opts = quic_redact:open(Sealed),
 
     %% Register with server registry if name is provided
     %% This handles both initial start and supervisor restarts
@@ -109,7 +111,7 @@ init({Port, Opts}) ->
 
     ListenerSupSup = #{
         id => quic_listener_sup_sup,
-        start => {quic_listener_sup_sup, start_link, [Port, Opts, Self]},
+        start => {quic_listener_sup_sup, start_link, [Port, Sealed, Self]},
         restart => permanent,
         type => supervisor,
         modules => [quic_listener_sup_sup]

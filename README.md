@@ -60,6 +60,7 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 
 - Erlang/OTP 27 or later
 - rebar3
+- idna, the only dependency (pure Erlang, no dependencies of its own), fetched by rebar3
 
 ## Installation
 

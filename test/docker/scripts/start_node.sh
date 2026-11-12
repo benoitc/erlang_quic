@@ -66,7 +66,7 @@ cat > /app/vm.args << EOF
 -quic_dist_port ${QUIC_DIST_PORT}
 -setcookie quic_dist_test
 -config /app/sys.config
--pa /app/_build/default/lib/quic/ebin
+-pa /app/_build/default/lib/quic/ebin -pa /app/_build/default/lib/idna/ebin
 EOF
 
 echo "Starting node ${NODE_NAME} on port ${QUIC_DIST_PORT}"
@@ -88,7 +88,7 @@ exec erl \
     -quic_dist_port "$QUIC_DIST_PORT" \
     -setcookie quic_dist_test \
     -config /app/sys.config \
-    -pa /app/_build/default/lib/quic/ebin \
+    -pa /app/_build/default/lib/quic/ebin -pa /app/_build/default/lib/idna/ebin \
     -noshell \
     -eval "
         application:ensure_all_started(quic),

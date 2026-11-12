@@ -16,15 +16,17 @@
     init/1
 ]).
 
--spec start_link(inet:port_number(), map(), pid()) -> supervisor:startlink_ret().
+-spec start_link(inet:port_number(), map() | fun(() -> map()), pid()) ->
+    supervisor:startlink_ret().
 start_link(Port, Opts, Parent) ->
-    supervisor:start_link(?MODULE, {Port, Opts, Parent}).
+    supervisor:start_link(?MODULE, {Port, quic_redact:seal(Opts), Parent}).
 
 %%====================================================================
 %% supervisor callbacks
 %%====================================================================
 
-init({Port, Opts, Parent}) ->
+init({Port, Sealed, Parent}) ->
+    Opts = quic_redact:open(Sealed),
     PoolSize = max(1, maps:get(pool_size, Opts, 1)),
     Intensity = max(1, ceil(math:log2(PoolSize))),
     SupFlags = #{strategy => one_for_one, intensity => Intensity, period => 5},
@@ -43,7 +45,7 @@ init({Port, Opts, Parent}) ->
     Children = [
         #{
             id => {quic_listener, N},
-            start => {quic_listener, start_link, [Port, PoolOpts]},
+            start => {quic_listener, start_link, [Port, quic_redact:seal(PoolOpts)]},
             restart => permanent,
             shutdown => 5000,
             type => worker,

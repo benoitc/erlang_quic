@@ -19,7 +19,8 @@
     hp_block/3,
     protect_run/8,
     open_packet/8,
-    open_run/8
+    open_run/8,
+    key_id/1
 ]).
 
 -define(TAG_LEN, 16).
@@ -237,12 +238,20 @@ nif_enabled() ->
 %% keys (current + previous key phase per direction); stale entries
 %% from key updates are few and die with the process.
 ctx(Kind, Cipher, Key) ->
-    cached({Kind, Cipher, Key}, fun() ->
+    cached({Kind, Cipher, key_id(Key)}, fun() ->
         quic_crypto_nif:new_aead_ctx(Cipher, Key, Kind =:= qc_enc)
     end).
 
 hp_ctx(Cipher, Key) ->
-    cached({qc_hp, Cipher, Key}, fun() -> quic_crypto_nif:new_hp_ctx(Cipher, Key) end).
+    cached({qc_hp, Cipher, key_id(Key)}, fun() -> quic_crypto_nif:new_hp_ctx(Cipher, Key) end).
+
+%% @doc What a context cache is keyed by in place of the key, so the
+%% process dictionary, which crash reports and sys:get_status/1 print,
+%% holds no key. Two independent 32-bit hashes of a random key collide
+%% with probability 2^-64.
+-spec key_id(binary()) -> {non_neg_integer(), non_neg_integer()}.
+key_id(Key) ->
+    {erlang:phash2(Key, 1 bsl 32), erlang:phash2([Key], 1 bsl 32)}.
 
 %% Look the context up, creating it on a miss. A creation failure
 %% returns `error' rather than raising: every caller then takes the OTP

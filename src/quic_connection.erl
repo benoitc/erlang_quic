@@ -163,7 +163,8 @@
     init/1,
     callback_mode/0,
     terminate/3,
-    code_change/4
+    code_change/4,
+    format_status/1
 ]).
 
 %% State functions
@@ -1174,13 +1175,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% Create connection reference (for internal use only)
     ConnRef = make_ref(),
 
-    %% Get server name for SNI
-    ServerName =
-        case maps:get(server_name, Opts, undefined) of
-            undefined when is_binary(Host) -> Host;
-            undefined when is_list(Host) -> list_to_binary(Host);
-            SN -> SN
-        end,
+    ServerName = client_server_name(Host, Opts),
 
     %% Get ALPN list
     AlpnOpt = maps:get(alpn, Opts, [<<"h3">>]),
@@ -1445,6 +1440,39 @@ terminate(
 
 code_change(_OldVsn, StateName, State, _Extra) ->
     {ok, StateName, State}.
+
+%% Crash reports and sys:get_status/1 show no key, secret or PSK.
+-spec format_status(gen_statem:format_status()) -> gen_statem:format_status().
+format_status(Status) ->
+    quic_redact:status(
+        maps:map(fun redact_status_data/2, Status), [data, queue, postponed, log]
+    ).
+
+redact_status_data(data, #state{cfg = Cfg, hs = Hs} = State) ->
+    State#state{
+        cfg = quic_redact:fields(Cfg, [
+            #conn_cfg.stateless_reset_secret,
+            #conn_cfg.client_private_key,
+            #conn_cfg.external_psk,
+            #conn_cfg.psk_config,
+            #conn_cfg.sni_callback
+        ]),
+        hs = quic_redact:fields(setelement(#hs.early_keys, Hs, early_keys(Hs#hs.early_keys)), [
+            #hs.tls_private_key,
+            #hs.handshake_secret,
+            #hs.master_secret,
+            #hs.server_hs_secret,
+            #hs.client_hs_secret,
+            #hs.server_private_key,
+            #hs.resumption_secret,
+            #hs.selected_psk
+        ])
+    };
+redact_status_data(_Key, Value) ->
+    Value.
+
+early_keys({Keys, EarlySecret}) -> {Keys, quic_redact:value(EarlySecret)};
+early_keys(EarlyKeys) -> EarlyKeys.
 
 %%====================================================================
 %% State Functions
@@ -2757,6 +2785,27 @@ with_remembered_params(
     apply_peer_transport_params_internal(Remembered, State);
 with_remembered_params(_Ticket, State) ->
     State.
+
+%% The name checked against the server certificate: `server_name', else
+%% the host, an address included (RFC 9525 Section 6.4). An address,
+%% bracketed or not, becomes its plain text form; quic_tls keeps it out
+%% of SNI.
+-spec client_server_name(binary() | string() | inet:ip_address(), map()) -> binary().
+client_server_name(Host, Opts) ->
+    case maps:get(server_name, Opts, undefined) of
+        undefined -> reference_name(Host);
+        SN when is_binary(SN); is_list(SN) -> reference_name(SN);
+        SN -> SN
+    end.
+
+reference_name(IP) when is_tuple(IP) ->
+    list_to_binary(inet:ntoa(IP));
+reference_name(Name) ->
+    case quic_cert:host_address(Name) of
+        {ok, IP} -> list_to_binary(inet:ntoa(IP));
+        error when is_binary(Name) -> Name;
+        error -> list_to_binary(Name)
+    end.
 
 %% A ticket stored before tickets kept transport parameters.
 upgrade_ticket(Ticket) when is_tuple(Ticket), element(1, Ticket) =:= session_ticket ->
@@ -9741,12 +9790,14 @@ resolve_address(Host, Port, _Family) when is_tuple(Host) ->
 resolve_address(Host, Port, Family) when is_binary(Host) ->
     resolve_address(binary_to_list(Host), Port, Family);
 resolve_address(Host, Port, Family) when is_list(Host) ->
-    Stripped = strip_brackets(Host),
-    case inet:parse_address(Stripped) of
+    case quic_cert:host_address(Host) of
         {ok, IP} ->
             {ok, {IP, Port}};
-        {error, _} ->
-            case getaddr_family(Stripped, Family) of
+        error when hd(Host) =:= $[ ->
+            %% Brackets hold only an IP literal (RFC 3986 Section 3.2.2).
+            {error, einval};
+        error ->
+            case getaddr_family(Host, Family) of
                 {ok, IP} -> {ok, {IP, Port}};
                 {error, _} = Error -> Error
             end
@@ -9762,15 +9813,6 @@ getaddr_family(Host, any) ->
         {ok, _} = Ok -> Ok;
         {error, _} -> inet:getaddr(Host, inet6)
     end.
-
-%% Drop a single pair of surrounding brackets from an IPv6 literal ("[::1]").
-strip_brackets([$[ | Rest]) ->
-    case lists:reverse(Rest) of
-        [$] | RevInner] -> lists:reverse(RevInner);
-        _ -> [$[ | Rest]
-    end;
-strip_brackets(Host) ->
-    Host.
 
 %% Derive initial encryption keys with specific QUIC version
 %% Version determines which salt to use (v1 vs v2)

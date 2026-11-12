@@ -1,5 +1,5 @@
 #!/usr/bin/env escript
-%%! -pa _build/default/lib/quic/ebin -pa _build/test/lib/quic/test
+%%! -pa _build/default/lib/quic/ebin -pa _build/default/lib/idna/ebin -pa _build/test/lib/quic/test
 %% Server-to-client download benchmark driver.
 
 main(_) ->

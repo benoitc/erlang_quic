@@ -59,7 +59,7 @@ erl -name node1@host1 \
     -start_epmd false \
     -quic_dist_port 4433 \
     -config sys.config \
-    -pa _build/default/lib/quic/ebin
+    -pa _build/default/lib/quic/ebin -pa _build/default/lib/idna/ebin
 ```
 
 ### Connecting Nodes
@@ -90,7 +90,7 @@ erl -name debug@host \
     -quic_dist_key  /path/to/key.pem \
     -setcookie <cookie> \
     -config sys.config \
-    -pa _build/default/lib/quic/ebin \
+    -pa _build/default/lib/quic/ebin -pa _build/default/lib/idna/ebin \
     -remsh node1@host1
 ```
 
@@ -472,10 +472,37 @@ The input handler:
 |--------|------|---------|-------------|
 | `cert_file` | string | - | Path to PEM certificate file |
 | `key_file` | string | - | Path to PEM private key file |
-| `cacert_file` | string | - | Path to CA certificate (for verify_peer) |
+| `cacert_file` | string | - | Path to a PEM file of CA certificates (for verify_peer) |
 | `cert` | binary | - | DER-encoded certificate (alternative to file) |
 | `key` | term | - | Private key term (alternative to file) |
-| `verify` | atom | `verify_none` | `verify_peer`: each node presents its certificate and checks the other's against `cacert_file` and the host part of its node name. `verify_none`: no certificate check |
+| `cacert` | binary \| [binary] | - | DER-encoded CA certificates (alternative to `cacert_file`) |
+| `verify` | atom | `verify_none` | `verify_peer`: each node presents its certificate and checks the other's against the CA and the host part of its node name. `verify_none`: no certificate check |
+
+The CA applies whichever way the certificate is given: `cacert` and
+`cacert_file` can each go with `cert`/`key` or `cert_file`/`key_file`,
+and when both are set both are trusted. With `verify_peer` a listener
+needs a CA: without one, it does not start and `listen` returns
+`{error, client_auth_needs_cacerts}`.
+
+### Boot Flags and Malformed Settings
+
+You can give `cert`, `key`, `cacert`, `verify`, `auth_callback`,
+`auth_handshake_timeout`, `register_with_epmd` and `psk_callback` on
+the command line, either one per flag or several pairs in one:
+
+```bash
+erl ... -quic_dist_verify verify_peer -quic_dist_cacert /path/to/ca.pem
+erl ... -quic_dist verify verify_peer cacert /path/to/ca.pem
+```
+
+A boot flag wins over the application environment. A setting given
+more than once, in either form, a `-quic_dist` key quic_dist does not
+know, and a malformed value (a `verify` other than `verify_peer` or
+`verify_none`, a callback that is not `Mod:Fun`, `{Mod, Fun}` or a fun
+of the right arity, a `cacert` that is not DER, a certificate without
+its key) all fail `listen` with `{error, {bad_config, Reason}}` and
+connection setup with exit reason `{bad_config, Reason}`, instead of
+falling back to a default.
 
 ### Discovery Settings
 

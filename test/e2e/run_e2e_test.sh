@@ -58,7 +58,7 @@ erl -name "node1@127.0.0.1" \
     -quic_dist_cert "$TEST_DIR/certs/cert.pem" \
     -quic_dist_key "$TEST_DIR/certs/key.pem" \
     -setcookie quic_e2e_test \
-    -pa "$PROJECT_DIR/_build/default/lib/quic/ebin" \
+    -pa "$PROJECT_DIR/_build/default/lib/quic/ebin" -pa "$PROJECT_DIR/_build/default/lib/idna/ebin" \
     -noshell \
     -eval "
         %% Initialize discovery with node addresses
@@ -102,7 +102,7 @@ erl -name "node2@127.0.0.1" \
     -quic_dist_cert "$TEST_DIR/certs/cert.pem" \
     -quic_dist_key "$TEST_DIR/certs/key.pem" \
     -setcookie quic_e2e_test \
-    -pa "$PROJECT_DIR/_build/default/lib/quic/ebin" \
+    -pa "$PROJECT_DIR/_build/default/lib/quic/ebin" -pa "$PROJECT_DIR/_build/default/lib/idna/ebin" \
     -noshell \
     -eval "
         %% Initialize discovery with node addresses
