@@ -12101,13 +12101,17 @@ reset_own_stream(
             is_integer(Size)
         ->
             Reliable = min(min(Size, Sent), reset_at_limit(Stream, State)),
-            case do_reset_stream_at_with_stream(StreamId, ErrorCode, Reliable, Stream, State) of
+            Code = first_reset_code(ErrorCode, Stream),
+            case do_reset_stream_at_with_stream(StreamId, Code, Reliable, Stream, State) of
                 {ok, _} = Ok -> Ok;
-                {error, _} -> Plain(StreamId, ErrorCode, State)
+                {error, _} -> Plain(StreamId, Code, State)
             end;
         _ ->
             Plain(StreamId, ErrorCode, State)
     end.
+
+first_reset_code(_ErrorCode, #stream_state{send_reset_error = Code}) when is_integer(Code) -> Code;
+first_reset_code(ErrorCode, _Stream) -> ErrorCode.
 
 %% Send RESET_STREAM (RFC 9000 §3.2): closes the SEND direction only.
 %% The recv side stays alive so the caller can still issue
@@ -12123,8 +12127,8 @@ do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
                 undefined -> ok;
                 Timer -> erlang:cancel_timer(Timer)
             end,
-            FinalSize = reset_final_size(StreamId, StreamState, State),
-            ResetFrame = {reset_stream, StreamId, ErrorCode, FinalSize},
+            {reset_stream, _, Code, FinalSize} =
+                ResetFrame = reset_frame(StreamId, ErrorCode, StreamState, State),
             NewState = send_frame(ResetFrame, State),
             %% Reliable Size 0 for any later RESET_STREAM_AT (reset-11 Section 5.2).
             UpdatedStream = StreamState#stream_state{
@@ -12133,10 +12137,10 @@ do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
                 send_done = true,
                 send_offset = FinalSize,
                 send_reset_at = 0,
-                send_reset_error = ErrorCode
+                send_reset_error = Code
             },
             %% Purge any queued STREAM frames so nothing is sent after the reset.
-            State1 = purge_stream_send_queue(StreamId, NewState),
+            State1 = drop_send_reset_at(StreamId, purge_stream_send_queue(StreamId, NewState)),
             State2 = State1#state{
                 streams = maps:put(StreamId, UpdatedStream, State1#state.streams)
             },
@@ -12144,6 +12148,17 @@ do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
         error ->
             {error, unknown_stream}
     end.
+
+%% A RESET_STREAM after our RESET_STREAM_AT repeats its code and final size (reset-11 Section 5.2).
+reset_frame(StreamId, ErrorCode, #stream_state{send_reset_at = undefined} = Stream, State) ->
+    {reset_stream, StreamId, ErrorCode, reset_final_size(StreamId, Stream, State)};
+reset_frame(
+    StreamId, _ErrorCode, #stream_state{send_reset_error = Code, send_offset = Final}, _State
+) ->
+    {reset_stream, StreamId, Code, Final}.
+
+drop_send_reset_at(StreamId, #state{pending_send_reset_at = P} = State) ->
+    State#state{pending_send_reset_at = maps:remove(StreamId, P)}.
 
 %% Request peer to stop sending on a stream (RFC 9000 Section 19.5)
 do_stop_sending(StreamId, ErrorCode, #state{streams = Streams} = State) ->
@@ -12618,8 +12633,8 @@ do_close_stream_deadline(StreamId, ErrorCode, #state{streams = Streams} = State)
     case maps:find(StreamId, Streams) of
         {ok, StreamState} ->
             %% Send RESET_STREAM frame
-            FinalSize = reset_final_size(StreamId, StreamState, State),
-            ResetFrame = {reset_stream, StreamId, ErrorCode, FinalSize},
+            {reset_stream, _, Code, FinalSize} =
+                ResetFrame = reset_frame(StreamId, ErrorCode, StreamState, State),
             NewState = send_frame(ResetFrame, State),
             %% Local RESET_STREAM closes our send side; purge any queued frames
             %% so nothing is emitted after the reset, then reclaim if terminal.
@@ -12629,11 +12644,11 @@ do_close_stream_deadline(StreamId, ErrorCode, #state{streams = Streams} = State)
                 send_done = true,
                 send_offset = FinalSize,
                 send_reset_at = 0,
-                send_reset_error = ErrorCode,
+                send_reset_error = Code,
                 deadline = undefined,
                 deadline_timer = undefined
             },
-            State1 = purge_stream_send_queue(StreamId, NewState),
+            State1 = drop_send_reset_at(StreamId, purge_stream_send_queue(StreamId, NewState)),
             State2 = State1#state{
                 streams = maps:put(StreamId, NewStreamState, State1#state.streams)
             },
