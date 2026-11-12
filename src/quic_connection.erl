@@ -12553,28 +12553,12 @@ initiate_close(Reason, #state{mig = #mig{path_validation_timer = PathTimer}} = S
             %% RFC 9000 Section 10.1: an idle connection closes silently.
             State1#state{close_reason = Reason};
         undefined ->
-            handshake_close(State1#state{close_reason = Reason});
+            emit_close_at_level(select_close_level(handshake, State1), CloseFrame, State1#state{
+                close_reason = Reason
+            });
         _ ->
-            send_frame(CloseFrame, closing(Reason, app, CloseFrame, State1))
+            emit_close_at_level(app, CloseFrame, closing(Reason, app, CloseFrame, State1))
     end.
-
-%% RFC 9000 Section 10.2.3: before 1-RTT keys the close goes out as a
-%% CONNECTION_CLOSE of type 0x1c with APPLICATION_ERROR and no reason, at
-%% the Handshake level, and at the Initial level too from a server, which
-%% cannot know whether the client has Handshake keys.
-handshake_close(#state{cfg = #conn_cfg{role = Role}, hs = HS} = State) ->
-    CloseFrame = {connection_close, transport, ?QUIC_APPLICATION_ERROR, 0, <<>>},
-    Levels = [
-        Level
-     || {Level, Keys} <- [{handshake, HS#hs.handshake_keys}, {initial, HS#hs.initial_keys}],
-        Keys =/= undefined
-    ],
-    Send =
-        case Role of
-            server -> Levels;
-            client -> lists:sublist(Levels, 1)
-        end,
-    lists:foldl(fun(Level, S) -> emit_close_at_level(Level, CloseFrame, S) end, State, Send).
 
 %% A close without an application error code is APPLICATION_ERROR, a
 %% transport code, so it goes in a 0x1c frame (RFC 9000 Section 20.1).
@@ -12629,14 +12613,55 @@ select_close_level(initial, #state{hs = #hs{initial_keys = InitKeys}}) when
 select_close_level(_, _) ->
     none.
 
-emit_close_at_level(app, CloseFrame, State) ->
+%% RFC 9000 Section 10.2.3: until the handshake is confirmed the close
+%% also goes out at the levels below Level the peer may still be reading.
+emit_close_at_level(Level, CloseFrame, State) ->
+    lists:foldl(
+        fun(L, S) -> emit_close_in(L, handshake_close_frame(L, CloseFrame), S) end,
+        State,
+        close_levels(Level, State)
+    ).
+
+close_levels(none, _State) ->
+    [];
+close_levels(Level, #state{loss_state = LossState} = State) when LossState =/= undefined ->
+    case quic_loss:handshake_confirmed(LossState) of
+        true -> [Level];
+        false -> lower_close_levels(Level, State) ++ [Level]
+    end;
+close_levels(Level, State) ->
+    lower_close_levels(Level, State) ++ [Level].
+
+%% A server cannot know which keys the client has; a client knows the
+%% server has Handshake keys once it has them itself.
+lower_close_levels(app, #state{cfg = #conn_cfg{role = client}} = State) ->
+    [L || L <- [select_close_level(handshake, State)], L =/= none];
+lower_close_levels(_Level, #state{cfg = #conn_cfg{role = client}}) ->
+    [];
+lower_close_levels(Level, #state{hs = HS}) ->
+    Below =
+        case Level of
+            app -> [{initial, HS#hs.initial_keys}, {handshake, HS#hs.handshake_keys}];
+            handshake -> [{initial, HS#hs.initial_keys}];
+            initial -> []
+        end,
+    [L || {L, Keys} <- Below, Keys =/= undefined].
+
+%% RFC 9000 Section 10.2.3: an application close sent in an Initial or
+%% Handshake packet becomes a 0x1c APPLICATION_ERROR with no reason.
+handshake_close_frame(app, CloseFrame) ->
+    CloseFrame;
+handshake_close_frame(_Level, {connection_close, application, _, _, _}) ->
+    {connection_close, transport, ?QUIC_APPLICATION_ERROR, 0, <<>>};
+handshake_close_frame(_Level, CloseFrame) ->
+    CloseFrame.
+
+emit_close_in(app, CloseFrame, State) ->
     send_frame(CloseFrame, State);
-emit_close_at_level(handshake, CloseFrame, State) ->
+emit_close_in(handshake, CloseFrame, State) ->
     send_handshake_packet(quic_frame:encode(CloseFrame), [CloseFrame], State);
-emit_close_at_level(initial, CloseFrame, State) ->
-    send_initial_packet(quic_frame:encode(CloseFrame), [CloseFrame], State);
-emit_close_at_level(none, _CloseFrame, State) ->
-    State.
+emit_close_in(initial, CloseFrame, State) ->
+    send_initial_packet(quic_frame:encode(CloseFrame), [CloseFrame], State).
 
 %% Send CONNECTION_CLOSE frame during terminate (best effort)
 %% This is called when the process is terminating unexpectedly
@@ -12655,7 +12680,7 @@ send_connection_close(Reason, State) ->
     %% the caller must flush that socket_state for the frame to reach the
     %% wire.
     try
-        send_frame(CloseFrame, State)
+        emit_close_at_level(app, CloseFrame, State)
     catch
         _:_ -> State
     end.

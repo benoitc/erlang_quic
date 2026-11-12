@@ -347,6 +347,7 @@ with_keys_and_socket(State) ->
         hs = (State#state.hs)#hs{
             initial_keys = IK,
             handshake_keys = HK,
+            pn_initial = PNH,
             pn_handshake = PNH
         }
     }).
