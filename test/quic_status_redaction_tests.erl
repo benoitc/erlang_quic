@@ -95,6 +95,68 @@ listener_status_has_no_secret() ->
     end).
 
 %%====================================================================
+%% Supervisors holding server options
+%%====================================================================
+
+supervisor_status_has_no_secret_test_() ->
+    {timeout, 30, fun supervisor_status_has_no_secret/0}.
+
+supervisor_status_has_no_secret() ->
+    with_server(fun(#{sup := Sup, secrets := Secrets}) ->
+        Sups = [whereis(quic_server_sup), Sup, sup_sup(Sup)],
+        lists:foreach(
+            fun(Pid) ->
+                Status = sys:get_status(Pid),
+                assert_absent(Secrets, Status),
+                ?assert(has_sealed(Status))
+            end,
+            Sups
+        )
+    end).
+
+listener_restart_report_has_no_secret_test_() ->
+    {timeout, 30, fun listener_restart_report_has_no_secret/0}.
+
+listener_restart_report_has_no_secret() ->
+    with_server(fun(#{name := Name, sup := Sup, secrets := Secrets}) ->
+        [L1, L2] = quic_listener_sup:get_listeners(Sup),
+        Events = captured(fun() ->
+            exit(L1, kill),
+            timer:sleep(300)
+        end),
+        assert_absent(Secrets, Events),
+        ?assertMatch([_ | _], terminated_reports(Events)),
+        [New] = quic_listener_sup:get_listeners(Sup) -- [L2],
+        ?assertNotEqual(L1, New),
+        ?assertEqual(connected, connect_to(Name))
+    end).
+
+pool_restart_report_has_no_secret_test_() ->
+    {timeout, 30, fun pool_restart_report_has_no_secret/0}.
+
+pool_restart_report_has_no_secret() ->
+    with_server(fun(#{name := Name, sup := Sup, secrets := Secrets}) ->
+        Old = sup_sup(Sup),
+        Events = captured(fun() ->
+            exit(Old, kill),
+            timer:sleep(300)
+        end),
+        assert_absent(Secrets, Events),
+        ?assertMatch([_ | _], terminated_reports(Events)),
+        ?assertNotEqual(Old, sup_sup(Sup)),
+        ?assertEqual(2, length(quic_listener_sup:get_listeners(Sup))),
+        ?assertEqual(connected, connect_to(Name))
+    end).
+
+server_spec_has_no_secret_test() ->
+    Key = public_key:generate_key({namedCurve, secp256r1}),
+    Psk = secret(),
+    Spec = quic_server_sup:server_spec(n, 0, #{key => Key, psks => #{?PSK_ID => Psk}}),
+    assert_absent([Key#'ECPrivateKey'.privateKey, Psk], Spec),
+    #{start := {quic_listener_sup, start_link, [0, Sealed]}} = Spec,
+    ?assertMatch(#{key := Key}, quic_redact:open(Sealed)).
+
+%%====================================================================
 %% Other processes that see secrets
 %%====================================================================
 
@@ -158,6 +220,30 @@ nested_secrets_redacted_test() ->
 %%====================================================================
 %% Helpers
 %%====================================================================
+
+sup_sup(Sup) ->
+    {quic_listener_sup_sup, Pid, _, _} =
+        lists:keyfind(quic_listener_sup_sup, 1, supervisor:which_children(Sup)),
+    Pid.
+
+terminated_reports(Events) ->
+    [E || #{msg := {report, #{label := {supervisor, child_terminated}}}} = E <- Events].
+
+has_sealed(Term) ->
+    string:find(io_lib:format("~w", [Term]), "#Fun<quic_redact.") =/= nomatch.
+
+connect_to(Name) ->
+    {ok, Port} = quic:get_server_port(Name),
+    {ok, Conn} = quic:connect(
+        <<"127.0.0.1">>, Port, #{alpn => [<<"h3">>], verify => false}, self()
+    ),
+    Result =
+        receive
+            {quic, Conn, {connected, _}} -> connected
+        after ?TIMEOUT -> timeout
+        end,
+    _ = quic:safe_close(Conn),
+    Result.
 
 %% A connected client and its server connection.
 with_connection(F) ->
@@ -245,12 +331,17 @@ with_server(F) ->
     Psk = secret(),
     ResetSecret = secret(),
     Name = list_to_atom("quic_redaction_" ++ integer_to_list(erlang:unique_integer([positive]))),
-    {ok, Sup} = quic:start_server(Name, 0, #{
+    %% A fixed port, so a restarted listener binds the one clients use.
+    {ok, Probe} = gen_udp:open(0),
+    {ok, Free} = inet:port(Probe),
+    ok = gen_udp:close(Probe),
+    {ok, Sup} = quic:start_server(Name, Free, #{
         cert => Cert,
         key => Key,
         psks => #{?PSK_ID => Psk},
         reset_secret => ResetSecret,
-        alpn => [<<"h3">>]
+        alpn => [<<"h3">>],
+        pool_size => 2
     }),
     {ok, Port} = quic:get_server_port(Name),
     try

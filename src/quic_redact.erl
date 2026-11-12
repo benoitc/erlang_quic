@@ -15,7 +15,11 @@
 
 -include("quic.hrl").
 
--export([term/1, value/1, fields/2, status/2]).
+-export([term/1, value/1, fields/2, status/2, seal/1, open/1]).
+-export_type([sealed/0]).
+
+%% Options passed as a supervisor child argument: printed as #Fun<...>.
+-type sealed() :: fun(() -> map()).
 
 -define(REDACTED, redacted).
 
@@ -37,6 +41,17 @@
     stateless_reset_token,
     sni_callback
 ]).
+
+%% @doc Wrap options so that supervisor reports and
+%% sys:get_status/1 of the supervisor holding them print none of them.
+-spec seal(map() | sealed()) -> sealed().
+seal(Sealed) when is_function(Sealed, 0) -> Sealed;
+seal(Opts) when is_map(Opts) -> fun() -> Opts end.
+
+%% @doc The options `seal/1' wrapped; a plain map is returned as is.
+-spec open(map() | sealed()) -> map().
+open(Sealed) when is_function(Sealed, 0) -> Sealed();
+open(Opts) when is_map(Opts) -> Opts.
 
 %% @doc `redacted' for a set value; `undefined' is kept to show absence.
 -spec value(term()) -> term().

@@ -225,7 +225,8 @@
 %%   - connections_table: Shared ETS table for connection tracking (pool mode)
 %%   - preferred_ipv4: {IP, Port} for preferred IPv4 address (RFC 9000 Section 9.6)
 %%   - preferred_ipv6: {IP, Port} for preferred IPv6 address (RFC 9000 Section 9.6)
--spec start_link(inet:port_number(), map()) -> {ok, pid()} | {error, term()}.
+-spec start_link(inet:port_number(), map() | fun(() -> map())) ->
+    {ok, pid()} | {error, term()}.
 start_link(Port, Opts) ->
     gen_server:start_link(?MODULE, {Port, Opts}, []).
 
@@ -275,7 +276,9 @@ retire_cid(Listener, CID) ->
 %%====================================================================
 
 %% @doc false
--spec init({inet:port_number(), map()}) -> term().
+-spec init({inet:port_number(), map() | fun(() -> map())}) -> term().
+init({Port, Sealed}) when is_function(Sealed, 0) ->
+    init({Port, quic_redact:open(Sealed)});
 init({Port, Opts}) ->
     process_flag(trap_exit, true),
 
