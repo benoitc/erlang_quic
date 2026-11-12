@@ -552,9 +552,10 @@ matched against the certificate's subjectAltName under RFC 9525: a `*.example.co
 SAN matches `host.example.com`, but not `example.com` and not `a.b.example.com`.
 A wildcard counts only as the whole leftmost label, and a certificate with no
 DNS or IP subjectAltName matches no name; its subject CN is not used.
-When the host is an IP address (a tuple or a string) and you set no
-`server_name`, the address must appear in the certificate's IP
-subjectAltName entries, and no SNI is sent.
+When the host is an IP address (a tuple or a string, an IPv6 address
+bracketed or not, such as `"[::1]"`) and you set no `server_name`, the
+address must appear in the certificate's IP subjectAltName entries, and
+no SNI is sent. The same holds for an address given as `server_name`.
 
 ### 2. Connection Pooling
 

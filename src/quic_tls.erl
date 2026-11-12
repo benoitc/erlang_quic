@@ -454,11 +454,12 @@ build_client_hello_extensions(PubKey, Opts) ->
         Cookie
     ]).
 
-%% RFC 6066 Section 3: an IP literal is not a HostName, so it is not sent.
+%% RFC 6066 Section 3: an IP literal, bracketed or not, is not a
+%% HostName, so it is not sent.
 sni_host_name(Name) when is_binary(Name) ->
-    case inet:parse_address(binary_to_list(Name)) of
+    case quic_cert:host_address(Name) of
         {ok, _} -> undefined;
-        {error, _} -> Name
+        error -> Name
     end;
 sni_host_name(undefined) ->
     undefined.

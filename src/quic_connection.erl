@@ -2787,15 +2787,24 @@ with_remembered_params(_Ticket, State) ->
     State.
 
 %% The name checked against the server certificate: `server_name', else
-%% the host, an address included (RFC 9525 Section 6.4). quic_tls keeps
-%% an address out of SNI.
+%% the host, an address included (RFC 9525 Section 6.4). An address,
+%% bracketed or not, becomes its plain text form; quic_tls keeps it out
+%% of SNI.
 -spec client_server_name(binary() | string() | inet:ip_address(), map()) -> binary().
 client_server_name(Host, Opts) ->
     case maps:get(server_name, Opts, undefined) of
-        undefined when is_binary(Host) -> Host;
-        undefined when is_list(Host) -> list_to_binary(Host);
-        undefined when is_tuple(Host) -> list_to_binary(inet:ntoa(Host));
+        undefined -> reference_name(Host);
+        SN when is_binary(SN); is_list(SN) -> reference_name(SN);
         SN -> SN
+    end.
+
+reference_name(IP) when is_tuple(IP) ->
+    list_to_binary(inet:ntoa(IP));
+reference_name(Name) ->
+    case quic_cert:host_address(Name) of
+        {ok, IP} -> list_to_binary(inet:ntoa(IP));
+        error when is_binary(Name) -> Name;
+        error -> list_to_binary(Name)
     end.
 
 %% A ticket stored before tickets kept transport parameters.
@@ -9770,12 +9779,11 @@ resolve_address(Host, Port, _Family) when is_tuple(Host) ->
 resolve_address(Host, Port, Family) when is_binary(Host) ->
     resolve_address(binary_to_list(Host), Port, Family);
 resolve_address(Host, Port, Family) when is_list(Host) ->
-    Stripped = strip_brackets(Host),
-    case inet:parse_address(Stripped) of
+    case quic_cert:host_address(Host) of
         {ok, IP} ->
             {ok, {IP, Port}};
-        {error, _} ->
-            case getaddr_family(Stripped, Family) of
+        error ->
+            case getaddr_family(strip_brackets(Host), Family) of
                 {ok, IP} -> {ok, {IP, Port}};
                 {error, _} = Error -> Error
             end

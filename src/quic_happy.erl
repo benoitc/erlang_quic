@@ -292,10 +292,9 @@ parse_host(IP) when is_tuple(IP) ->
 parse_host(Host) when is_binary(Host) ->
     parse_host(binary_to_list(Host));
 parse_host(Host) when is_list(Host) ->
-    Stripped = strip_brackets(Host),
-    case inet:parse_address(Stripped) of
+    case quic_cert:host_address(Host) of
         {ok, IP} -> {literal, IP};
-        {error, _} -> {name, Stripped}
+        error -> {name, strip_brackets(Host)}
     end.
 
 resolve_single(Name, inet) ->

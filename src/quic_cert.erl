@@ -14,7 +14,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -export([validate_server/4, validate_client/3, cacerts_from_file/1, resolve_cacerts/1]).
--export([requests_client_cert/1, check_client_auth/1]).
+-export([requests_client_cert/1, check_client_auth/1, host_address/1]).
 
 -define(MAX_PATH_LENGTH, 10).
 
@@ -243,16 +243,48 @@ is_issuer(Cert, Anchor) ->
 verify_hostname(_Leaf, undefined) ->
     ok;
 verify_hostname(Leaf, ServerName) when is_binary(ServerName) ->
-    Host = binary_to_list(ServerName),
     RefId =
-        case inet:parse_address(Host) of
+        case host_address(ServerName) of
             {ok, IP} -> {ip, IP};
-            {error, _} -> {dns_id, Host}
+            error -> {dns_id, binary_to_list(ServerName)}
         end,
     case has_san_id(Leaf) andalso safe_verify_hostname(Leaf, RefId) of
         true -> ok;
         false -> {error, {hostname_mismatch, ServerName}}
     end.
+
+%% @doc The address a host or server name gives as an IP literal, bare
+%% or in brackets (`[::1]'), with or without an IPv6 zone ID; `error'
+%% for a hostname.
+-spec host_address(binary() | string()) -> {ok, inet:ip_address()} | error.
+host_address(Host) when is_binary(Host) ->
+    host_address(binary_to_list(Host));
+host_address(Host) when is_list(Host) ->
+    Literal = strip_brackets(Host),
+    case inet:parse_address(Literal) of
+        {ok, IP} -> {ok, IP};
+        {error, _} -> zoned_ipv6_address(Literal)
+    end.
+
+%% inet:parse_address/1 takes a zone ID on link-local addresses only.
+zoned_ipv6_address(Literal) ->
+    case string:split(Literal, "%") of
+        [Addr, [_ | _]] ->
+            case inet:parse_ipv6strict_address(Addr) of
+                {ok, IP} -> {ok, IP};
+                {error, _} -> error
+            end;
+        _ ->
+            error
+    end.
+
+strip_brackets([$[ | Rest]) ->
+    case lists:reverse(Rest) of
+        [$] | RevInner] -> lists:reverse(RevInner);
+        _ -> [$[ | Rest]
+    end;
+strip_brackets(Host) ->
+    Host.
 
 %% RFC 9525 Section 2: the subject CN never identifies a service, so a
 %% leaf without a DNS-ID or IP-ID in subjectAltName matches no name.

@@ -11,6 +11,11 @@
 
 -define(TIMEOUT, 5000).
 -define(LOOPBACK_IP_SAN, {iPAddress, [127, 0, 0, 1]}).
+-define(LOOPBACK6, {0, 0, 0, 0, 0, 0, 0, 1}).
+-define(LOOPBACK6_IP_SAN, {iPAddress, lists:duplicate(15, 0) ++ [1]}).
+-define(BRACKETED, [<<"[::1]">>, "[::1]"]).
+-define(DNS_SANS, [{dNSName, "[::1]"}, {dNSName, "::1"}]).
+-define(MISMATCH6, {error, {certificate_invalid, {hostname_mismatch, <<"::1">>}}}).
 
 %%====================================================================
 %% Address host, verify on
@@ -127,8 +132,149 @@ client_hello_sni_test_() ->
     ].
 
 %%====================================================================
+%% Bracketed IPv6 literal, as host or as server_name
+%%====================================================================
+
+%% `[::1]' names the address ::1: it is checked against iPAddress
+%% entries only, so a DNS entry spelling it does not match.
+bracketed_server_name_dns_san_refused_test_() ->
+    {timeout, 60, [
+        ?_test(
+            with_server6([San], fun(Port, Ca, _Sni) ->
+                Opts = (verify_opts(Ca))#{server_name => SN},
+                ?assertEqual(?MISMATCH6, connect(?LOOPBACK6, Port, Opts))
+            end)
+        )
+     || San <- ?DNS_SANS, SN <- ?BRACKETED
+    ]}.
+
+bracketed_server_name_ip_san_accepted_test_() ->
+    {timeout, 60, [
+        ?_test(
+            with_server6([?LOOPBACK6_IP_SAN], fun(Port, Ca, Sni) ->
+                Opts = (verify_opts(Ca))#{server_name => SN},
+                ?assertEqual(connected, connect(?LOOPBACK6, Port, Opts)),
+                ?assertEqual(undefined, Sni())
+            end)
+        )
+     || SN <- ?BRACKETED
+    ]}.
+
+bracketed_host_dns_san_refused_test_() ->
+    {timeout, 60, [
+        ?_test(
+            with_server6([San], fun(Port, Ca, _Sni) ->
+                ?assertEqual(?MISMATCH6, Dial(Host, Port, verify_opts(Ca)))
+            end)
+        )
+     || San <- ?DNS_SANS, Host <- ?BRACKETED, Dial <- dialers()
+    ]}.
+
+bracketed_host_ip_san_accepted_test_() ->
+    {timeout, 60, [
+        ?_test(
+            with_server6([?LOOPBACK6_IP_SAN], fun(Port, Ca, Sni) ->
+                ?assertEqual(connected, Dial(Host, Port, verify_opts(Ca))),
+                ?assertEqual(undefined, Sni())
+            end)
+        )
+     || Host <- ?BRACKETED, Dial <- dialers()
+    ]}.
+
+%% A zone ID is not part of the address the certificate names.
+zoned_host_ip_san_accepted_test_() ->
+    {timeout, 60, [
+        ?_test(
+            with_server6([?LOOPBACK6_IP_SAN], fun(Port, Ca, Sni) ->
+                ?assertEqual(connected, connect(Host, Port, verify_opts(Ca))),
+                ?assertEqual(undefined, Sni())
+            end)
+        )
+     || Host <- [<<"[::1%lo0]">>, "::1%lo0"]
+    ]}.
+
+%% quic_h3 sets server_name to the host it is given.
+h3_bracketed_host_dns_san_refused_test_() ->
+    {timeout, 30, [
+        ?_test(
+            with_h3_server6([San], fun(Port, Ca, _Sni) ->
+                ?assertEqual(?MISMATCH6, h3_connect(Port, Ca))
+            end)
+        )
+     || San <- ?DNS_SANS
+    ]}.
+
+h3_bracketed_host_ip_san_accepted_test_() ->
+    {timeout, 30, fun() ->
+        with_h3_server6([?LOOPBACK6_IP_SAN], fun(Port, Ca, Sni) ->
+            ?assertEqual(connected, h3_connect(Port, Ca)),
+            ?assertEqual(undefined, Sni())
+        end)
+    end}.
+
+address_literal_forms_test_() ->
+    [
+        ?_assertEqual({ok, ?LOOPBACK6}, quic_cert:host_address(H))
+     || H <- [<<"::1">>, "::1", <<"[::1]">>, "[::1]", <<"[::1%lo0]">>, "::1%2", <<"[::1%25eth0]">>]
+    ] ++
+        [
+            ?_assertEqual(
+                {ok, {65152, 0, 0, 0, 0, 0, 0, 1}}, quic_cert:host_address(<<"[fe80::1%en0]">>)
+            ),
+            ?_assertEqual({ok, {127, 0, 0, 1}}, quic_cert:host_address(<<"127.0.0.1">>)),
+            ?_assertEqual(error, quic_cert:host_address(<<"[::1">>)),
+            ?_assertEqual(error, quic_cert:host_address(<<"::1]">>)),
+            ?_assertEqual(error, quic_cert:host_address(<<"[::1%]">>)),
+            ?_assertEqual(error, quic_cert:host_address(<<"[localhost]">>)),
+            ?_assertEqual(error, quic_cert:host_address(<<"example.com">>)),
+            ?_assertEqual(error, quic_cert:host_address(<<"127.0.0.1%lo0">>))
+        ].
+
+bracketed_name_is_the_address_test_() ->
+    Ca = ca(),
+    WithIp = leaf(Ca, [?LOOPBACK6_IP_SAN]),
+    [
+        ?_assertEqual(<<"::1">>, quic_connection:client_server_name(<<"[::1]">>, #{})),
+        ?_assertEqual(<<"::1">>, quic_connection:client_server_name("[::1%lo0]", #{})),
+        ?_assertEqual(
+            <<"::1">>, quic_connection:client_server_name(?LOOPBACK6, #{server_name => "[::1]"})
+        ),
+        ?_assertEqual(ok, validate(Ca, WithIp, <<"[::1]">>)),
+        ?_assertEqual(
+            {error, {hostname_mismatch, <<"[::1]">>}},
+            validate(Ca, leaf(Ca, [{dNSName, "[::1]"}]), <<"[::1]">>)
+        ),
+        ?_assertEqual(undefined, hello_sni(<<"[::1]">>)),
+        ?_assertEqual(undefined, hello_sni(<<"[fe80::1%en0]">>)),
+        ?_assertEqual({literal, ?LOOPBACK6}, quic_happy:parse_host("[::1%lo0]")),
+        ?_assertEqual({name, "localhost"}, quic_happy:parse_host("[localhost]"))
+    ].
+
+%%====================================================================
 %% Helpers
 %%====================================================================
+
+%% quic:connect/4, and a connection process started with the host as
+%% given, as quic_h3 and quic_dist reach it.
+dialers() ->
+    [fun connect/3, fun connect_direct/3].
+
+connect_direct(Host, Port, Opts) ->
+    {ok, Pid} = quic_connection:start_link(Host, Port, Opts, self()),
+    await(Pid, Pid).
+
+h3_connect(Port, #{der := CaDer}) ->
+    case
+        quic_h3:connect(<<"[::1]">>, Port, #{
+            sync => true, connect_timeout => ?TIMEOUT, verify => true, cacerts => [CaDer]
+        })
+    of
+        {ok, Conn} ->
+            ok = quic_h3:close(Conn),
+            connected;
+        {error, _} = Error ->
+            Error
+    end.
 
 hello_sni(ServerName) ->
     {Msg, _, _} = quic_tls:build_client_hello(#{
@@ -144,6 +290,23 @@ verify_opts(#{der := CaDer}) ->
 %% Start a server presenting a leaf with `San', run F with its port, the
 %% CA and a fun returning the SNI the server saw on the last handshake.
 with_server(San, F) ->
+    with_server(San, #{}, F).
+
+with_server6(San, F) ->
+    with_server(San, #{extra_socket_opts => [{ip, ?LOOPBACK6}]}, F).
+
+with_server(San, Extra, F) ->
+    with_server(San, Extra, fun quic:start_server/3, F).
+
+with_h3_server6(San, F) ->
+    Start = fun(Name, Port, Opts) ->
+        quic_h3:start_server(Name, Port, #{
+            cert => maps:get(cert, Opts), key => maps:get(key, Opts), quic_opts => Opts
+        })
+    end,
+    with_server(San, #{extra_socket_opts => [{ip, ?LOOPBACK6}]}, Start, F).
+
+with_server(San, Extra, Start, F) ->
     {ok, _} = application:ensure_all_started(quic),
     Ca = ca(),
     {Leaf, Key} = leaf_and_key(Ca, San),
@@ -154,7 +317,8 @@ with_server(San, F) ->
         {ok, #{cert => Leaf, key => Key}}
     end,
     Name = list_to_atom("quic_ip_host_" ++ integer_to_list(erlang:unique_integer([positive]))),
-    {ok, _} = quic:start_server(Name, 0, #{alpn => [<<"h3">>], sni_callback => SniCb}),
+    Opts = Extra#{alpn => [<<"h3">>], sni_callback => SniCb, cert => Leaf, key => Key},
+    {ok, _} = Start(Name, 0, Opts),
     {ok, Port} = quic:get_server_port(Name),
     Sni = fun() ->
         receive
@@ -170,6 +334,9 @@ with_server(San, F) ->
 
 connect(Host, Port, Opts) ->
     {ok, Conn} = quic:connect(Host, Port, Opts, self()),
+    await(Conn, Conn).
+
+await(Conn, Close) ->
     Result =
         receive
             {quic, Conn, {connected, _}} -> connected;
@@ -177,7 +344,7 @@ connect(Host, Port, Opts) ->
             {quic, Conn, {closed, Reason}} -> {closed, Reason}
         after ?TIMEOUT -> timeout
         end,
-    _ = quic:safe_close(Conn),
+    _ = quic:safe_close(Close),
     Result.
 
 validate(#{der := CaDer}, Leaf, Name) ->
