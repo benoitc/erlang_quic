@@ -914,7 +914,8 @@ init({server, Opts}) ->
     %% RFC 9000 §10.1: arm the idle timer once; it re-arms itself lazily
     %% from last_activity (the keep-alive timer is armed on entering the
     %% connected state).
-    {ok, idle, set_idle_timer(State)}.
+    State1 = set_idle_timer(State),
+    {ok, idle, State1, [handshake_deadline_action(State1)]}.
 
 %% Build congestion control options from connection options.
 %% Supports:
@@ -1357,7 +1358,8 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% RFC 9000 §10.1: arm the idle timer once; it re-arms itself lazily
     %% from last_activity (the keep-alive timer is armed on entering the
     %% connected state).
-    {ok, idle, set_idle_timer(State)}.
+    State1 = set_idle_timer(State),
+    {ok, idle, State1, [handshake_deadline_action(State1)]}.
 
 terminate(
     Reason,
@@ -1452,10 +1454,10 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 
 idle(enter, _OldState, #state{cfg = #conn_cfg{role = client}} = State) ->
     %% Client: Start the handshake by sending Initial packet with ClientHello
-    {keep_state, arm_stall_timer(send_client_hello(State))};
+    {keep_state, send_client_hello(State)};
 idle(enter, _OldState, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% Server: Wait for Initial packet with ClientHello
-    {keep_state, arm_stall_timer(State)};
+    {keep_state, State};
 idle({call, From}, get_ref, #state{cfg = #conn_cfg{conn_ref = Ref}} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 idle({call, From}, get_state, State) ->
@@ -1763,7 +1765,7 @@ connected(
     %% Everything queued above (pending data, NEW_TOKEN, the first PMTU
     %% probe) sits in the send batch; without a flush here it would
     %% only leave with the next event on this connection.
-    {keep_state, flush_event(State5, event)};
+    {keep_state, flush_event(State5, event), [{{timeout, handshake_deadline}, cancel}]};
 connected({call, From}, get_ref, #state{cfg = #conn_cfg{conn_ref = Ref}} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 connected({call, From}, get_state, State) ->
@@ -2413,30 +2415,19 @@ handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref}
 handle_common_event(
     info, {disconnect_check, Ref}, StateName, #state{disconnect_timer = Ref} = State
 ) when
-    Ref =/= undefined andalso
-        (StateName =:= connected orelse StateName =:= handshaking orelse StateName =:= idle)
+    Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
 ->
     State1 = State#state{disconnect_timer = undefined},
     case disconnect_timeout_expired(State1) of
         true ->
             disconnect_deadline(State1);
-        false when StateName =:= connected ->
-            {keep_state, arm_disconnect_timer(State1)};
         false ->
-            handshake_stall_check(StateName, State1)
+            {keep_state, arm_disconnect_timer(State1)}
     end;
-%% Before handshaking, the idle timer, when there is one, bounds the handshake.
-handle_common_event(
-    info,
-    {disconnect_final, Ref},
-    idle,
-    #state{disconnect_timer = {final, Ref}, idle_timer = T} = State
-) when T =/= undefined ->
-    {keep_state, State};
 handle_common_event(
     info, {disconnect_final, Ref}, StateName, #state{disconnect_timer = {final, Ref}} = State
 ) when
-    StateName =:= connected orelse StateName =:= handshaking orelse StateName =:= idle
+    StateName =:= connected orelse StateName =:= handshaking
 ->
     State1 = State#state{disconnect_timer = undefined},
     case disconnect_timeout_expired(State1) of
@@ -2469,13 +2460,21 @@ handle_common_event(info, {pacing_timeout, Ref}, StateName, #state{pacing_timer 
 handle_common_event(info, {pacing_timeout, _StaleRef}, _StateName, State) ->
     %% Ignore stale pacing timer (ref doesn't match or wrong state)
     {keep_state, State};
+%% RFC 9000 Section 10.1: a handshake still running at its deadline is closed, silently if idle.
+handle_common_event({timeout, handshake_deadline}, expired, StateName, State) when
+    StateName =:= idle orelse StateName =:= handshaking
+->
+    Reason =
+        case idle_expired(State) of
+            true -> idle_timeout;
+            false -> handshake_timeout
+        end,
+    emit_qlog_state_change(StateName, draining, State),
+    {next_state, draining, flush_event(initiate_close(Reason, State), event)};
 handle_common_event(info, {idle_timeout, Ref}, StateName, #state{idle_timer = Ref} = State) when
     Ref =/= undefined andalso StateName =/= draining andalso StateName =/= closed
 ->
-    %% Handle idle timeout - check if we've truly been idle
-    Now = erlang:monotonic_time(millisecond),
-    TimeSinceActivity = Now - State#state.last_activity,
-    case TimeSinceActivity >= idle_timeout(State) of
+    case idle_expired(State) of
         true ->
             %% Genuine idle timeout - initiate close
             NewState = initiate_close(idle_timeout, State#state{idle_timer = undefined}),
@@ -12553,28 +12552,12 @@ initiate_close(Reason, #state{mig = #mig{path_validation_timer = PathTimer}} = S
             %% RFC 9000 Section 10.1: an idle connection closes silently.
             State1#state{close_reason = Reason};
         undefined ->
-            handshake_close(State1#state{close_reason = Reason});
+            emit_close_at_level(select_close_level(handshake, State1), CloseFrame, State1#state{
+                close_reason = Reason
+            });
         _ ->
-            send_frame(CloseFrame, closing(Reason, app, CloseFrame, State1))
+            emit_close_at_level(app, CloseFrame, closing(Reason, app, CloseFrame, State1))
     end.
-
-%% RFC 9000 Section 10.2.3: before 1-RTT keys the close goes out as a
-%% CONNECTION_CLOSE of type 0x1c with APPLICATION_ERROR and no reason, at
-%% the Handshake level, and at the Initial level too from a server, which
-%% cannot know whether the client has Handshake keys.
-handshake_close(#state{cfg = #conn_cfg{role = Role}, hs = HS} = State) ->
-    CloseFrame = {connection_close, transport, ?QUIC_APPLICATION_ERROR, 0, <<>>},
-    Levels = [
-        Level
-     || {Level, Keys} <- [{handshake, HS#hs.handshake_keys}, {initial, HS#hs.initial_keys}],
-        Keys =/= undefined
-    ],
-    Send =
-        case Role of
-            server -> Levels;
-            client -> lists:sublist(Levels, 1)
-        end,
-    lists:foldl(fun(Level, S) -> emit_close_at_level(Level, CloseFrame, S) end, State, Send).
 
 %% A close without an application error code is APPLICATION_ERROR, a
 %% transport code, so it goes in a 0x1c frame (RFC 9000 Section 20.1).
@@ -12629,14 +12612,55 @@ select_close_level(initial, #state{hs = #hs{initial_keys = InitKeys}}) when
 select_close_level(_, _) ->
     none.
 
-emit_close_at_level(app, CloseFrame, State) ->
+%% RFC 9000 Section 10.2.3: until the handshake is confirmed the close
+%% also goes out at the levels below Level the peer may still be reading.
+emit_close_at_level(Level, CloseFrame, State) ->
+    lists:foldl(
+        fun(L, S) -> emit_close_in(L, handshake_close_frame(L, CloseFrame), S) end,
+        State,
+        close_levels(Level, State)
+    ).
+
+close_levels(none, _State) ->
+    [];
+close_levels(Level, #state{loss_state = LossState} = State) when LossState =/= undefined ->
+    case quic_loss:handshake_confirmed(LossState) of
+        true -> [Level];
+        false -> lower_close_levels(Level, State) ++ [Level]
+    end;
+close_levels(Level, State) ->
+    lower_close_levels(Level, State) ++ [Level].
+
+%% A server cannot know which keys the client has; a client knows the
+%% server has Handshake keys once it has them itself.
+lower_close_levels(app, #state{cfg = #conn_cfg{role = client}} = State) ->
+    [L || L <- [select_close_level(handshake, State)], L =/= none];
+lower_close_levels(_Level, #state{cfg = #conn_cfg{role = client}}) ->
+    [];
+lower_close_levels(Level, #state{hs = HS}) ->
+    Below =
+        case Level of
+            app -> [{initial, HS#hs.initial_keys}, {handshake, HS#hs.handshake_keys}];
+            handshake -> [{initial, HS#hs.initial_keys}];
+            initial -> []
+        end,
+    [L || {L, Keys} <- Below, Keys =/= undefined].
+
+%% RFC 9000 Section 10.2.3: an application close sent in an Initial or
+%% Handshake packet becomes a 0x1c APPLICATION_ERROR with no reason.
+handshake_close_frame(app, CloseFrame) ->
+    CloseFrame;
+handshake_close_frame(_Level, {connection_close, application, _, _, _}) ->
+    {connection_close, transport, ?QUIC_APPLICATION_ERROR, 0, <<>>};
+handshake_close_frame(_Level, CloseFrame) ->
+    CloseFrame.
+
+emit_close_in(app, CloseFrame, State) ->
     send_frame(CloseFrame, State);
-emit_close_at_level(handshake, CloseFrame, State) ->
+emit_close_in(handshake, CloseFrame, State) ->
     send_handshake_packet(quic_frame:encode(CloseFrame), [CloseFrame], State);
-emit_close_at_level(initial, CloseFrame, State) ->
-    send_initial_packet(quic_frame:encode(CloseFrame), [CloseFrame], State);
-emit_close_at_level(none, _CloseFrame, State) ->
-    State.
+emit_close_in(initial, CloseFrame, State) ->
+    send_initial_packet(quic_frame:encode(CloseFrame), [CloseFrame], State).
 
 %% Send CONNECTION_CLOSE frame during terminate (best effort)
 %% This is called when the process is terminating unexpectedly
@@ -12655,7 +12679,7 @@ send_connection_close(Reason, State) ->
     %% the caller must flush that socket_state for the frame to reach the
     %% wire.
     try
-        send_frame(CloseFrame, State)
+        emit_close_at_level(app, CloseFrame, State)
     catch
         _:_ -> State
     end.
@@ -13457,6 +13481,23 @@ idle_timeout(#state{cfg = #conn_cfg{idle_timeout = Local}, transport_params = TP
         Timeout -> max(Timeout, 3 * quic_loss:persistent_congestion_pto(State#state.loss_state))
     end.
 
+idle_expired(State) ->
+    case idle_timeout(State) of
+        infinity -> false;
+        Timeout -> (erlang:monotonic_time(millisecond) - State#state.last_activity) >= Timeout
+    end.
+
+%% The handshake must complete within the idle timeout from its start, or
+%% the disconnect timeout when there is no idle timeout.
+handshake_deadline(#state{cfg = #conn_cfg{disconnect_timeout = DT}} = State) ->
+    case idle_timeout(State) of
+        infinity -> DT;
+        Timeout -> Timeout
+    end.
+
+handshake_deadline_action(State) ->
+    {{timeout, handshake_deadline}, handshake_deadline(State), expired}.
+
 advertised_idle_timeout(0, Peer) -> Peer;
 advertised_idle_timeout(Local, 0) -> Local;
 advertised_idle_timeout(Local, Peer) -> min(Local, Peer).
@@ -13519,27 +13560,6 @@ disconnect_deadline(#state{loss_state = LossState} = State) ->
     erlang:send_after(Grace, self(), {disconnect_final, Ref}),
     {keep_state, State1#state{disconnect_timer = {final, Ref}}}.
 
-%% With no idle timeout, a handshake that hears nothing from the peer for
-%% the disconnect timeout is abandoned, with or without data in flight.
-handshake_stall_check(_StateName, #state{idle_timer = undefined} = State) ->
-    #state{last_activity = LastActivity, cfg = #conn_cfg{disconnect_timeout = DT}} = State,
-    case (LastActivity + DT) - erlang:monotonic_time(millisecond) of
-        Remaining when Remaining =< 0 ->
-            {next_state, draining, declare_peer_dead(State)};
-        Remaining ->
-            {keep_state, arm_disconnect_timer(Remaining, State)}
-    end;
-handshake_stall_check(idle, State) ->
-    {keep_state, State};
-handshake_stall_check(_StateName, State) ->
-    {keep_state, arm_disconnect_timer(State)}.
-
-%% Before handshaking, the disconnect timer runs only when no idle timer does.
-arm_stall_timer(#state{idle_timer = undefined} = State) ->
-    arm_disconnect_timer(State);
-arm_stall_timer(State) ->
-    State.
-
 %% The disconnect timeout elapsed with ack-eliciting data in flight and
 %% no ACK: declare the peer dead instead of probing until the idle
 %% timeout. This is how a client escapes a restarted peer whose stateless
@@ -13582,9 +13602,6 @@ arm_disconnect_timer(
                     false -> DT
                 end
         end,
-    arm_disconnect_timer(Delay, State).
-
-arm_disconnect_timer(Delay, State) ->
     State1 = cancel_disconnect_timer(State),
     Ref = make_ref(),
     erlang:send_after(Delay, self(), {disconnect_check, Ref}),

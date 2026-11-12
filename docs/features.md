@@ -317,7 +317,7 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 - `quic_lb:expected_cid_len/1` - Calculate expected CID length from config
 
 ### Options
-- `idle_timeout` - Connection idle timeout in milliseconds (0 to disable)
+- `idle_timeout` - Connection idle timeout in milliseconds (0 to disable). It also bounds the handshake as a whole: a handshake that has not completed within it from its start is closed, and the owner gets `{closed, handshake_timeout}`
 - `max_data` - Connection-level flow control limit
 - `max_stream_data_bidi_local` - Stream-level limit for streams we open
 - `max_stream_data_bidi_remote` - Stream-level limit for streams the peer opens
@@ -357,7 +357,7 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 - `ciphers` - TLS 1.3 cipher suites to offer or accept, in preference order (default: `[aes_128_gcm, aes_256_gcm, chacha20_poly1305]` on a CPU with AES instructions, `[chacha20_poly1305, aes_128_gcm, aes_256_gcm]` without them, per `/proc/cpuinfo`). A server honours a client that lists `chacha20_poly1305` first whenever its own list allows the suite, so a peer without AES hardware gets ChaCha from either side
 - `max_burst_packets` - Packets allowed to leave per send drain, so a large queued write cannot monopolise the scheduler (default: 64)
 - `ack_packet_tolerance` - Ack-eliciting packets received before a 1-RTT ACK is sent, the RFC 9000 section 13.2.1 decimation threshold (default: 2)
-- `disconnect_timeout` - Milliseconds without a response from the peer before the connection is given up on, checked on its own timer (default: 16000). With `idle_timeout => 0` it also bounds a handshake that hears nothing from the peer
+- `disconnect_timeout` - Milliseconds without a response from the peer before the connection is given up on, checked on its own timer (default: 16000). With `idle_timeout => 0` it bounds the handshake as a whole instead: a handshake that has not completed within it from its start is closed
 - `pmtu_raise_interval` - Milliseconds between PMTU raise probes (default: 600000)
 - `delivery_coalescing` - Merge consecutive same-stream `stream_data` deliveries of one receive pass into a single owner message (default: `false`). Arrival order across streams is preserved and a `stream_reset` never overtakes data delivered before it, but an owner that counts messages rather than bytes sees fewer of them
 

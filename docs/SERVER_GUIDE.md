@@ -51,7 +51,7 @@ also advertise `secp256r1`.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `idle_timeout` | integer | 30000 | Idle timeout in ms (0 = disabled) |
+| `idle_timeout` | integer | 30000 | Idle timeout in ms (0 = disabled); the handshake must also complete within it |
 | `max_data` | integer | 786432 | Connection-level flow control limit |
 | `max_stream_data_bidi_local` | integer | 524288 | Flow control limit for streams we open |
 | `max_stream_data_bidi_remote` | integer | 524288 | Flow control limit for streams the peer opens |

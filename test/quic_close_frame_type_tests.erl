@@ -43,8 +43,10 @@ normal_stays_an_application_close_test() ->
         close_frames(fun() -> quic_connection:send_connection_close(shutdown, state()) end)
     ).
 
+%% Confirmed, so the close goes out in 1-RTT packets only.
 state() ->
-    ?S:with_keys_and_socket(?S:state_for_role(client)).
+    S = ?S:with_keys_and_socket(?S:state_for_role(client)),
+    ?S:state_set(S, loss_state, quic_loss:on_handshake_confirmed(?S:loss_state(S))).
 
 %% The CONNECTION_CLOSE frames handed to the encoder while Fun ran.
 close_frames(Fun) ->

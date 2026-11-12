@@ -87,7 +87,8 @@
     stream_recv/2,
     max_data_local/1,
     state_wanting_send_ready/2,
-    send_ready_wanted/1
+    send_ready_wanted/1,
+    handshake_with_timeouts/3
 ]).
 
 %% Update the spin-bit tracking state from a received 1-RTT packet.
@@ -347,6 +348,7 @@ with_keys_and_socket(State) ->
         hs = (State#state.hs)#hs{
             initial_keys = IK,
             handshake_keys = HK,
+            pn_initial = PNH,
             pn_handshake = PNH
         }
     }).
@@ -478,6 +480,19 @@ zero_rtt_client([First | _] = StreamIds) ->
 next_app_pn(#state{pn_app = #pn_space{next_pn = PN}}) -> PN.
 
 -spec state_for_client({inet:ip_address(), inet:port_number()}) -> #state{}.
+%% A sending Role mid-handshake, 1-RTT keys but nothing confirmed, its
+%% peer's address validated, owned by the caller, last heard from now.
+-spec handshake_with_timeouts(client | server, non_neg_integer(), timeout()) -> #state{}.
+handshake_with_timeouts(Role, Idle, Disconnect) ->
+    #state{cfg = Cfg, hs = HS} = S = with_keys_and_socket(state_for_role(Role)),
+    S#state{
+        owner = self(),
+        transport_params = #{},
+        last_activity = erlang:monotonic_time(millisecond),
+        cfg = Cfg#conn_cfg{idle_timeout = Idle, disconnect_timeout = Disconnect},
+        hs = HS#hs{pn_initial = empty_pn_space(), address_validated = true}
+    }.
+
 state_for_client(RemoteAddr) ->
     #state{app_keys = undefined, remote_addr = RemoteAddr, cfg = #conn_cfg{role = client}}.
 

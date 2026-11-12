@@ -81,7 +81,7 @@ packets automatically.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `idle_timeout` | integer | 30000 | Idle timeout in ms |
+| `idle_timeout` | integer | 30000 | Idle timeout in ms; the handshake must also complete within it |
 | `max_data` | integer | 786432 | Connection-level receive limit |
 | `max_stream_data_bidi_local` | integer | 524288 | Receive limit for streams we open |
 | `max_stream_data_bidi_remote` | integer | 524288 | Receive limit for streams the peer opens |
@@ -509,6 +509,9 @@ receive
     {quic, Conn, {closed, normal}} ->
         ok;
     {quic, Conn, {closed, idle_timeout}} ->
+        reconnect();
+    {quic, Conn, {closed, handshake_timeout}} ->
+        %% The handshake did not complete in time
         reconnect();
     {quic, Conn, {closed, {version_negotiation, Versions}}} ->
         %% The server speaks none of the QUIC versions we do
