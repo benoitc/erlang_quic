@@ -115,6 +115,7 @@ new_aead_ctx(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     c = enif_alloc_resource(qc_ctx_type, sizeof(qc_ctx));
     c->ctx = EVP_CIPHER_CTX_new();
     c->enc = enc;
+    c->hp_chacha = 0;
     if (c->ctx == NULL)
         goto fail;
     /* Set cipher + key once; nonce comes per packet. */
@@ -183,7 +184,7 @@ seal(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     ErlNifBinary nonce, aad, plain;
     ERL_NIF_TERM out_term;
     unsigned char *out;
-    int len = 0, len2 = 0;
+    int aadout = 0, len = 0, len2 = 0;
 
     (void)argc;
     if (enif_get_resource(env, argv[0], qc_ctx_type, (void **)&c) == 0 || c->enc != 1 ||
@@ -196,7 +197,7 @@ seal(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     if (EVP_EncryptInit_ex(c->ctx, NULL, NULL, NULL, nonce.data) != 1)
         return enif_make_tuple2(env, am_error, am_badarg);
-    if (aad.size > 0 && EVP_EncryptUpdate(c->ctx, NULL, &len, aad.data, (int)aad.size) != 1)
+    if (aad.size > 0 && EVP_EncryptUpdate(c->ctx, NULL, &aadout, aad.data, (int)aad.size) != 1)
         return enif_make_tuple2(env, am_error, am_badarg);
     if (plain.size > 0 &&
         EVP_EncryptUpdate(c->ctx, out, &len, plain.data, (int)plain.size) != 1)
@@ -217,7 +218,7 @@ open_(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     ErlNifBinary nonce, aad, ct, tag;
     ERL_NIF_TERM out_term;
     unsigned char *out;
-    int len = 0, len2 = 0;
+    int aadout = 0, len = 0, len2 = 0;
 
     (void)argc;
     if (enif_get_resource(env, argv[0], qc_ctx_type, (void **)&c) == 0 || c->enc != 0 ||
@@ -231,7 +232,7 @@ open_(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     if (EVP_DecryptInit_ex(c->ctx, NULL, NULL, NULL, nonce.data) != 1)
         return enif_make_tuple2(env, am_error, am_badarg);
-    if (aad.size > 0 && EVP_DecryptUpdate(c->ctx, NULL, &len, aad.data, (int)aad.size) != 1)
+    if (aad.size > 0 && EVP_DecryptUpdate(c->ctx, NULL, &aadout, aad.data, (int)aad.size) != 1)
         return enif_make_tuple2(env, am_error, am_badarg);
     if (ct.size > 0 && EVP_DecryptUpdate(c->ctx, out, &len, ct.data, (int)ct.size) != 1)
         return enif_make_tuple2(env, am_error, am_badarg);
@@ -312,7 +313,7 @@ protect_run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         unsigned pnlen, hlen;
         unsigned char *out, *body;
         ERL_NIF_TERM pkt;
-        int len = 0, len2 = 0;
+        int hdrout = 0, len = 0, len2 = 0;
 
         if (k >= MAX_RUN || enif_inspect_iolist_as_binary(env, head, &plain) == 0 ||
             plain.size < 4)
@@ -334,7 +335,7 @@ protect_run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         body = out + hlen;
 
         if (EVP_EncryptInit_ex(aead->ctx, NULL, NULL, NULL, nonce) != 1 ||
-            EVP_EncryptUpdate(aead->ctx, NULL, &len, header, (int)hlen) != 1 ||
+            EVP_EncryptUpdate(aead->ctx, NULL, &hdrout, header, (int)hlen) != 1 ||
             EVP_EncryptUpdate(aead->ctx, body, &len, plain.data, (int)plain.size) != 1 ||
             EVP_EncryptFinal_ex(aead->ctx, body + len, &len2) != 1 ||
             EVP_CIPHER_CTX_ctrl(aead->ctx, EVP_CTRL_AEAD_GET_TAG, TAG_LEN,
@@ -399,7 +400,7 @@ open_packet(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     ErlNifUInt64 trunc_pn = 0, pn;
     ERL_NIF_TERM plain_term;
     unsigned char *out;
-    int len = 0, len2 = 0;
+    int hdrout = 0, len = 0, len2 = 0;
 
     (void)argc;
     if (enif_get_resource(env, argv[0], qc_ctx_type, (void **)&aead) == 0 || aead->enc != 0 ||
@@ -441,7 +442,7 @@ open_packet(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     out = enif_make_new_binary(env, ctlen, &plain_term);
 
     if (EVP_DecryptInit_ex(aead->ctx, NULL, NULL, NULL, nonce) != 1 ||
-        EVP_DecryptUpdate(aead->ctx, NULL, &len, aad, (int)aadlen) != 1 ||
+        EVP_DecryptUpdate(aead->ctx, NULL, &hdrout, aad, (int)aadlen) != 1 ||
         (ctlen > 0 &&
          EVP_DecryptUpdate(aead->ctx, out, &len, payload.data + pnlen, (int)ctlen) != 1) ||
         EVP_CIPHER_CTX_ctrl(aead->ctx, EVP_CTRL_AEAD_SET_TAG, TAG_LEN,
@@ -678,7 +679,7 @@ open_run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         ERL_NIF_TERM plain_term;
         unsigned char *out, *payload;
         unsigned payload_size;
-        int len = 0, len2 = 0;
+        int hdrout = 0, len = 0, len2 = 0;
 
         if (enif_inspect_binary(env, head, &dgram) == 0 ||
             dgram.size < hdrlen + 4 + 16)
@@ -714,7 +715,7 @@ open_run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         out = enif_make_new_binary(env, ctlen, &plain_term);
 
         if (EVP_DecryptInit_ex(aead->ctx, NULL, NULL, NULL, nonce) != 1 ||
-            EVP_DecryptUpdate(aead->ctx, NULL, &len, aad, (int)aadlen) != 1 ||
+            EVP_DecryptUpdate(aead->ctx, NULL, &hdrout, aad, (int)aadlen) != 1 ||
             (ctlen > 0 &&
              EVP_DecryptUpdate(aead->ctx, out, &len, payload + pnlen, (int)ctlen) != 1) ||
             EVP_CIPHER_CTX_ctrl(aead->ctx, EVP_CTRL_AEAD_SET_TAG, TAG_LEN,
@@ -726,7 +727,7 @@ open_run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         {
             ERL_NIF_TERM frames;
             ERL_NIF_TERM third;
-            if (parse_quic_frames(env, plain_term, out, (unsigned)(len + len2), &frames))
+            if (parse_quic_frames(env, plain_term, out, ctlen, &frames))
                 third = frames;
             else
                 third = enif_make_tuple2(env, am_raw_f, plain_term);
