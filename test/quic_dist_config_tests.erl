@@ -276,7 +276,8 @@ server_cacerts(DistOpts) ->
 
 with_peer(Mode, DistOpts, Args, Fun) ->
     Lib = code:lib_dir(quic),
-    Paths = ["-pa", filename:join(Lib, "ebin"), "-pa", filename:join(Lib, "test")],
+    Idna = filename:dirname(code:which(idna)),
+    Paths = ["-pa", filename:join(Lib, "ebin"), "-pa", Idna, "-pa", filename:join(Lib, "test")],
     {ok, Peer, _} = peer:start(#{connection => standard_io, args => Paths ++ Args}),
     try
         case Mode of

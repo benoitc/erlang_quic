@@ -329,6 +329,8 @@ start_target(Config, Spec) ->
             "-pa",
             quic_ebin(),
             "-pa",
+            idna_ebin(),
+            "-pa",
             test_ebin(),
             "-noinput",
             "-eval",
@@ -444,6 +446,8 @@ probe_run(Config, Tag, Target, Cookie, AuthCb, AuthTimeout, Opts) ->
             "-pa",
             quic_ebin(),
             "-pa",
+            idna_ebin(),
+            "-pa",
             test_ebin(),
             "-noinput",
             "-eval",
@@ -482,6 +486,9 @@ quic_ebin() ->
 
 test_ebin() ->
     filename:absname(filename:dirname(code:which(?MODULE))).
+
+idna_ebin() ->
+    filename:absname(filename:dirname(code:which(idna))).
 
 generate_certs(Config) ->
     PrivDir = ?config(priv_dir, Config),

@@ -107,6 +107,8 @@ start_target(Config) ->
         "-pa",
         quic_ebin(),
         "-pa",
+        idna_ebin(),
+        "-pa",
         test_ebin(),
         "-noinput",
         "-eval",
@@ -184,6 +186,8 @@ run_probe(Config, Target, TargetPort, Cookie) ->
         "-pa",
         quic_ebin(),
         "-pa",
+        idna_ebin(),
+        "-pa",
         test_ebin(),
         "-noinput",
         "-eval",
@@ -217,6 +221,9 @@ quic_ebin() ->
 
 test_ebin() ->
     filename:absname(filename:dirname(code:which(?MODULE))).
+
+idna_ebin() ->
+    filename:absname(filename:dirname(code:which(idna))).
 
 pick_port() ->
     {ok, S} = gen_udp:open(0, [binary, {active, false}]),
