@@ -13,6 +13,17 @@ All notable changes to this project will be documented in this file.
   rejected as a hostname mismatch. Only the DNS and IP subjectAltName
   entries are matched, and a wildcard counts only as the whole leftmost
   label, standing for one label (RFC 9525 Sections 2, 6.3 and 6.4).
+- A client that connected to an IP address, with verification on and no
+  `server_name`, did not check the server certificate's name: any
+  certificate that chained to the trust anchors was accepted. The
+  address is now checked against the certificate's IP subjectAltName
+  entries (RFC 9525 Section 6.4), and it is no longer sent as SNI
+  (RFC 6066 Section 3), including when given as `server_name`. A
+  hostname, as the host or as `server_name`, works as before.
+- Crash reports and `sys:get_status/1` of connections, listeners and
+  the processes that keep their options or session tickets printed
+  private keys, PSKs, TLS secrets and packet protection keys. These are
+  now shown as `redacted`.
 
 ### Added
 - An auth callback can return `{ok, {authenticated_node, Node}}`;
