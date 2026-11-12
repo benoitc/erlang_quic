@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.7.0] - 2026-11-13
 
 ### Security
 - The client accepted a server certificate whose names RFC 9525 does not

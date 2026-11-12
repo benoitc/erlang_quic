@@ -110,7 +110,7 @@ change. Docs and CHANGELOG entries go in the same pull request.
 
 The specs erlang_quic implements, at the version the code follows. Where a
 newer one exists it is listed under [Pending updates](#pending-updates).
-Last checked: 2026-11-08; the TLS table and reliable stream reset 2026-11-12.
+Last checked: 2026-11-12.
 
 ### QUIC
 
@@ -197,7 +197,7 @@ citations and the table, with no CHANGELOG entry.
 
 ### Pending updates
 
-Known newer versions, checked 2026-11-08. Each needs the diff in step 2
+Known newer versions, checked 2026-11-12. Each needs the diff in step 2
 before any code changes.
 
 | Spec | Code follows | Latest | To check |
