@@ -1,6 +1,6 @@
 %%% -*- erlang -*-
 %%%
-%%% HelloRetryRequest end-to-end suite (RFC 8446 §4.1.4).
+%%% HelloRetryRequest end-to-end suite (RFC 9846 §4.2.4).
 %%%
 %%% Drives full handshakes where the server's preferred key-exchange
 %%% group differs from the group the client sent a key_share for,
@@ -21,14 +21,15 @@
 -export([
     hrr_secp256r1/1,
     no_common_group/1,
-    psk_plus_hrr_aborts/1
+    external_psk_after_hrr/1,
+    ticket_resumes_after_hrr/1
 ]).
 
 suite() ->
     [{timetrap, {minutes, 2}}].
 
 all() ->
-    [hrr_secp256r1, no_common_group, psk_plus_hrr_aborts].
+    [hrr_secp256r1, no_common_group, external_psk_after_hrr, ticket_resumes_after_hrr].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -73,9 +74,9 @@ no_common_group(_Config) ->
         stop_echo(Server)
     end.
 
-%% Client offers external_psk AND a group set that forces HRR. Per
-%% the v1 rule the client aborts when HRR follows a PSK ClientHello.
-psk_plus_hrr_aborts(_Config) ->
+%% RFC 9846 Section 4.3.11.2: after a HelloRetryRequest the PSK binder
+%% covers message_hash(CH1), the HRR and the truncated CH2, on both sides.
+external_psk_after_hrr(_Config) ->
     Identity = <<"id">>,
     Secret = <<"this-is-a-32-byte-test-secret!!!">>,
     {ok, Server} = start_echo(#{
@@ -90,7 +91,37 @@ psk_plus_hrr_aborts(_Config) ->
             groups => [x25519, secp256r1],
             external_psk => {Identity, Secret}
         },
-        ?assertMatch({error, _}, try_connect(Server, Opts))
+        ConnRef = connect(Server, Opts),
+        Info = wait_connected(ConnRef),
+        ?assertEqual(secp256r1, maps:get(negotiated_group, Info)),
+        ?assertMatch({error, _}, quic:peercert(ConnRef)),
+        ok = echo(ConnRef, <<"psk after hrr">>),
+        quic:close(ConnRef, normal)
+    after
+        stop_echo(Server)
+    end.
+
+%% A ticket resumes after a HelloRetryRequest, without early data
+%% (RFC 9846 Section 4.3.10).
+ticket_resumes_after_hrr(_Config) ->
+    {ok, Server} = start_echo(#{groups => [secp256r1]}),
+    try
+        Base = #{verify => false, alpn => [<<"echo">>], server_name => <<"localhost">>},
+        First = connect(Server, Base#{groups => [secp256r1]}),
+        _ = wait_connected(First),
+        Ticket =
+            receive
+                {quic, First, {session_ticket, T}} -> T
+            after 10000 -> ct:fail(no_session_ticket)
+            end,
+        quic:close(First, normal),
+        ConnRef = connect(Server, Base#{groups => [x25519, secp256r1], session_ticket => Ticket}),
+        Info = wait_connected(ConnRef),
+        ?assertEqual(secp256r1, maps:get(negotiated_group, Info)),
+        ?assertMatch({error, _}, quic:peercert(ConnRef)),
+        ?assertNot(quic:early_data_accepted(ConnRef)),
+        ok = echo(ConnRef, <<"resumed after hrr">>),
+        quic:close(ConnRef, normal)
     after
         stop_echo(Server)
     end.

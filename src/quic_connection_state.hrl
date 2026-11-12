@@ -73,7 +73,7 @@
     %% server validates a presented client cert; undefined = OS store
     cacerts :: [binary()] | undefined,
     %% Server-side mutual TLS: require a valid client certificate. When false, an
-    %% empty client Certificate is accepted (optional mTLS, RFC 8446 §4.4.2.4).
+    %% empty client Certificate is accepted (optional mTLS, RFC 9846 §4.5.1.3).
     require_client_cert = false :: boolean(),
     %% Option stream_reset_final_size: the owner's reset notice carries
     %% the stream's final size (RFC 9000 Section 4.5).
@@ -83,7 +83,7 @@
     %% open again.
     notify_streams_available = false :: boolean(),
 
-    %% Key-exchange + signature negotiation (RFC 8446 §4.1.4 / §4.2.3)
+    %% Key-exchange + signature negotiation (RFC 9846 §4.2.4 / §4.3.3)
     tls_groups = [x25519] :: [atom()],
     tls_sig_algs :: [atom()] | undefined,
     cipher_preference = [aes_128_gcm, aes_256_gcm, chacha20_poly1305] :: [atom()],
@@ -158,7 +158,7 @@
     %% ticket presented to this connection is looked up
     ticket_table :: ets:table() | undefined,
 
-    %% TLS 1.3 External PSK (RFC 8446 §4.2.11)
+    %% TLS 1.3 External PSK (RFC 9846 §4.3.11)
     %% Client-side: offered to the peer. Two-tuple form defaults to
     %% modes [psk_dhe_ke]; three-tuple form takes an explicit list.
     external_psk ::
@@ -265,6 +265,9 @@
     %% Peer's offered signature_algorithms (wire codes), set on the
     %% server when the ClientHello is parsed.
     peer_sig_algs = [] :: [non_neg_integer()],
+    %% Server: the client offered psk_dhe_ke, the mode our tickets resume
+    %% in, so it may be sent one (RFC 9846 Section 4.7.1).
+    peer_psk_dhe_ke = false :: boolean(),
     %% CertificateVerify scheme chosen for this handshake (wire code).
     cert_verify_code :: non_neg_integer() | undefined,
     %% Group of the key_share we sent (client) / selected (server)
@@ -345,7 +348,7 @@
     %% True if server sent CertificateRequest
     cert_request_received = false :: boolean(),
 
-    %% Session resumption (RFC 8446 Section 4.6)
+    %% Session resumption (RFC 9846 Section 4.7.1)
     resumption_secret :: binary() | undefined,
     % Default max 0-RTT data size
     max_early_data = 16384 :: non_neg_integer(),

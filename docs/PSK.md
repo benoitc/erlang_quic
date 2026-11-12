@@ -1,7 +1,7 @@
 # TLS 1.3 External PSK
 
 This guide covers TLS 1.3 external pre-shared key (PSK) support for
-QUIC connections, defined by [RFC 8446 §4.2.11][rfc8446-4-2-11].
+QUIC connections, defined by [RFC 9846 §4.3.11][rfc9846-4-3-11].
 External PSKs let two endpoints authenticate each other without
 X.509 certificates by sharing a secret out of band.
 
@@ -11,7 +11,7 @@ derivation is layered on top. If you need importer-style derivation
 to bind a PSK to a target protocol/KDF, do it before handing the
 secret to this library.
 
-[rfc8446-4-2-11]: https://www.rfc-editor.org/rfc/rfc8446#section-4.2.11
+[rfc9846-4-3-11]: https://www.rfc-editor.org/rfc/rfc9846#section-4.3.11
 [rfc9258]: https://www.rfc-editor.org/rfc/rfc9258
 
 ## When to use it

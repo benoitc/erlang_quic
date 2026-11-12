@@ -5698,7 +5698,7 @@ notify_stream(StreamId, Event, #state{stream_handlers = Handlers, owner = Owner}
     Target ! {quic_h3, self(), Event}.
 
 %% Forward a session ticket from the QUIC layer to the H3 owner.
-%% RFC 8446 Section 4.6.1: tickets may be issued at any time post-handshake;
+%% RFC 9846 Section 4.7.1: tickets may be issued at any time post-handshake;
 %% consumers need this to populate per-origin session caches.
 forward_session_ticket(T, #state{owner = Owner}) ->
     Owner ! {quic_h3, self(), {session_ticket, T}},

@@ -110,7 +110,7 @@ change. Docs and CHANGELOG entries go in the same pull request.
 
 The specs erlang_quic implements, at the version the code follows. Where a
 newer one exists it is listed under [Pending updates](#pending-updates).
-Last checked: 2026-11-08.
+Last checked: 2026-11-08; the TLS table 2026-11-12.
 
 ### QUIC
 
@@ -133,7 +133,7 @@ Last checked: 2026-11-08.
 
 | Spec | Scope |
 |---|---|
-| RFC 8446 TLS 1.3 (obsoleted by RFC 9846) | handshake, PSK and session tickets, 0-RTT, HelloRetryRequest |
+| RFC 9846 TLS 1.3 | handshake, PSK and session tickets, 0-RTT, HelloRetryRequest |
 | RFC 5869 HKDF | key schedule |
 | RFC 6066 TLS extensions | SNI |
 | RFC 7301 ALPN | protocol negotiation |
@@ -202,7 +202,6 @@ before any code changes.
 
 | Spec | Code follows | Latest | To check |
 |---|---|---|---|
-| TLS 1.3 | RFC 8446 | RFC 9846 | changes since RFC 8446 in the handshake, PSK, 0-RTT and key update rules `quic_tls` and `quic_connection` rely on |
 | Service identity | RFC 6125 | RFC 9525 | wildcard and CN-ID rules in `quic_cert` hostname checks |
 | Reliable stream reset | draft-ietf-quic-reliable-stream-reset-07 | -11 | frame type (`16#24`) and transport parameter id, Reliable Size and Final Size rules |
 | QUIC-LB | revision not recorded | draft-ietf-quic-load-balancers-22 | CID formats, config rotation bits, encryption modes in `quic_lb`; fix the "RFC 9312" citation |

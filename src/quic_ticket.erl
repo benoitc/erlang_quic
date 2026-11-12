@@ -67,6 +67,10 @@
 %% For QUIC, max_early_data_size in NewSessionTicket must be 0xffffffff.
 -define(QUIC_MAX_EARLY_DATA_SIZE, 16#FFFFFFFF).
 
+%% RFC 9846 Section 4.7.1: a ticket is used for 7 days at most after
+%% issuance, whatever its ticket_lifetime.
+-define(MAX_TICKET_AGE, 604800).
+
 %%====================================================================
 %% Ticket Storage API
 %%====================================================================
@@ -90,7 +94,7 @@ lookup_ticket(ServerName, Store) ->
         {ok, #session_ticket{received_at = ReceivedAt, lifetime = Lifetime} = Ticket} ->
             Now = erlang:system_time(second),
             Age = Now - ReceivedAt,
-            case Age =< Lifetime of
+            case Age =< min(Lifetime, ?MAX_TICKET_AGE) of
                 true -> {ok, Ticket};
                 % Expired
                 false -> error
@@ -110,7 +114,7 @@ clear_expired(Store) ->
     Now = erlang:system_time(second),
     maps:filter(
         fun(_ServerName, #session_ticket{received_at = ReceivedAt, lifetime = Lifetime}) ->
-            (Now - ReceivedAt) =< Lifetime
+            (Now - ReceivedAt) =< min(Lifetime, ?MAX_TICKET_AGE)
         end,
         Store
     ).
@@ -120,7 +124,7 @@ clear_expired(Store) ->
 %%====================================================================
 
 %% @doc Derive the resumption_master_secret from the master secret.
-%% RFC 8446 Section 7.1:
+%% RFC 9846 Section 7.1:
 %%   resumption_master_secret = Derive-Secret(Master Secret, "res master", ClientHello..client Finished)
 -spec derive_resumption_secret(atom(), binary(), binary(), binary()) -> binary().
 derive_resumption_secret(Cipher, MasterSecret, TranscriptHash, _ClientFinished) ->
@@ -128,7 +132,7 @@ derive_resumption_secret(Cipher, MasterSecret, TranscriptHash, _ClientFinished) 
     quic_crypto:derive_secret(Hash, MasterSecret, <<"res master">>, TranscriptHash).
 
 %% @doc Derive PSK from resumption_master_secret and ticket nonce.
-%% RFC 8446 Section 4.6.1:
+%% RFC 9846 Section 4.7.1:
 %%   PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, Hash.length)
 -spec derive_psk(binary(), #session_ticket{}) -> binary().
 derive_psk(ResumptionSecret, #session_ticket{nonce = Nonce, cipher = Cipher}) ->
@@ -141,7 +145,7 @@ derive_psk(ResumptionSecret, #session_ticket{nonce = Nonce, cipher = Cipher}) ->
 %%====================================================================
 
 %% @doc Parse a NewSessionTicket message from the server.
-%% RFC 8446 Section 4.6.1:
+%% RFC 9846 Section 4.7.1:
 %%   struct {
 %%       uint32 ticket_lifetime;
 %%       uint32 ticket_age_add;
@@ -158,14 +162,14 @@ derive_psk(ResumptionSecret, #session_ticket{nonce = Nonce, cipher = Cipher}) ->
         max_early_data := non_neg_integer()
     }}
     | {error, term()}.
-parse_new_session_ticket(<<Lifetime:32, AgeAdd:32, NonceLen, Rest/binary>>) ->
-    case Rest of
-        <<Nonce:NonceLen/binary, TicketLen:16, Rest1/binary>> when byte_size(Rest1) >= TicketLen ->
-            <<Ticket:TicketLen/binary, ExtLen:16, Extensions/binary>> = Rest1,
-            case byte_size(Extensions) >= ExtLen of
-                true ->
-                    <<ExtData:ExtLen/binary, _/binary>> = Extensions,
-                    MaxEarlyData = parse_early_data_extension(ExtData),
+parse_new_session_ticket(
+    <<Lifetime:32, AgeAdd:32, NonceLen, Nonce:NonceLen/binary, TicketLen:16,
+        Ticket:TicketLen/binary, ExtLen:16, Extensions:ExtLen/binary>>
+) when TicketLen > 0 ->
+    case quic_tls:parse_extensions_ordered(Extensions) of
+        {ok, Exts} ->
+            case early_data_size(lists:keyfind(?EXT_EARLY_DATA, 1, Exts)) of
+                {ok, MaxEarlyData} ->
                     {ok, #{
                         lifetime => Lifetime,
                         age_add => AgeAdd,
@@ -173,25 +177,20 @@ parse_new_session_ticket(<<Lifetime:32, AgeAdd:32, NonceLen, Rest/binary>>) ->
                         ticket => Ticket,
                         max_early_data => MaxEarlyData
                     }};
-                false ->
-                    {error, invalid_extensions}
+                error ->
+                    {error, decode_error}
             end;
-        _ ->
-            {error, invalid_ticket}
+        {error, _} ->
+            {error, decode_error}
     end;
 parse_new_session_ticket(_) ->
-    {error, invalid_format}.
+    {error, decode_error}.
 
-%% Parse early_data extension from NewSessionTicket
-%% Extension type 42 (0x002a) = early_data
-parse_early_data_extension(<<>>) ->
-    0;
-parse_early_data_extension(<<16#00, 16#2a, 4:16, MaxEarlyData:32, _Rest/binary>>) ->
-    MaxEarlyData;
-parse_early_data_extension(<<_Type:16, Len:16, _Data:Len/binary, Rest/binary>>) ->
-    parse_early_data_extension(Rest);
-parse_early_data_extension(_) ->
-    0.
+%% The early_data extension of a NewSessionTicket is a uint32
+%% max_early_data_size (RFC 9846 Section 4.3.10).
+early_data_size(false) -> {ok, 0};
+early_data_size({?EXT_EARLY_DATA, <<MaxEarlyData:32>>, _Off, _Size}) -> {ok, MaxEarlyData};
+early_data_size(_) -> error.
 
 %%====================================================================
 %% Ticket Creation (for server use)
@@ -250,7 +249,7 @@ build_new_session_ticket(#session_ticket{
 %% read the clock, use the random source and mutate a public table.
 %%====================================================================
 
-%% Ticket TTL: 7 days in milliseconds (RFC 8446 recommends max 7 days)
+%% Ticket TTL: 7 days in milliseconds (RFC 9846 Section 4.7.1)
 -define(TICKET_TTL_MS, 7 * 24 * 60 * 60 * 1000).
 %% Max tickets to store (prevents unbounded memory growth)
 -define(MAX_TICKETS, 10000).

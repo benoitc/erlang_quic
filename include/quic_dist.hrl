@@ -138,7 +138,7 @@
     %% epmd_module so external tooling (e.g. epmd -names) can find it.
     register_with_epmd = false :: boolean(),
 
-    %% TLS 1.3 external PSK (RFC 8446 §4.2.11). When set, the dist
+    %% TLS 1.3 external PSK (RFC 9846 §4.3.11). When set, the dist
     %% listener and/or client uses these instead of (or alongside) the
     %% cert+key pair above. See docs/PSK.md.
     psks = undefined :: undefined | #{binary() => binary()},

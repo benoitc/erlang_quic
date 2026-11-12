@@ -69,8 +69,8 @@ external_psk_needs_a_sha256_suite_test() ->
     {ok, CHMap} = quic_tls:parse_client_hello(Body),
     Config = #{psks => #{<<"id">> => <<"this-is-a-32-byte-test-secret!!!">>}},
     Known = quic_tls_negotiation:known_external_psk(CHMap, Config),
-    ?assertMatch({ok, _}, quic_tls:select_psk(CHMap, CH, Known, [psk_dhe_ke], aes_128_gcm)),
-    ?assertEqual(none, quic_tls:select_psk(CHMap, CH, Known, [psk_dhe_ke], aes_256_gcm)).
+    ?assertMatch({ok, _}, quic_tls:select_psk(CHMap, <<>>, CH, Known, [psk_dhe_ke], aes_128_gcm)),
+    ?assertEqual(none, quic_tls:select_psk(CHMap, <<>>, CH, Known, [psk_dhe_ke], aes_256_gcm)).
 
 %% RFC 9846 Section 4.2.4: the ServerHello names the suite of the
 %% HelloRetryRequest before it.

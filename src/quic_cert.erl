@@ -2,9 +2,9 @@
 %%%
 %%% Server certificate validation for QUIC clients.
 %%%
-%%% Performs the two checks RFC 8446 requires of a client after it
+%%% Performs the two checks RFC 9846 requires of a client after it
 %%% receives the server's Certificate message: chain validation against
-%%% a set of trust anchors (§4.4.2.4) and identity (hostname) matching
+%%% a set of trust anchors (§4.5.1.3) and identity (hostname) matching
 %%% (RFC 6125). Signature verification of CertificateVerify is handled
 %%% in `quic_tls:verify_certificate_verify/4'; this module covers the
 %%% chain and the name.
@@ -40,7 +40,7 @@ validate_server(Leaf, Intermediates, CaCerts, ServerName) when is_binary(Leaf) -
         {error, _} = Error -> Error
     end.
 
-%% @doc Validate a client's certificate chain (mutual TLS, RFC 8446 §4.4.2.4).
+%% @doc Validate a client's certificate chain (mutual TLS, RFC 9846 §4.5.1.3).
 %%
 %% Same trust-anchor chain validation as {@link validate_server/4}, but with no
 %% identity/hostname check: a client certificate is not bound to a server name,

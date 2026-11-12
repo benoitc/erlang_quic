@@ -24,7 +24,7 @@
 %% answers fails on its assertion rather than as a timeout.
 -define(CONNECT_TIMEOUT, 3000).
 
-%% TLS internal_error (RFC 8446 §6), carried as a QUIC crypto error
+%% TLS internal_error (RFC 9846 §6.2), carried as a QUIC crypto error
 %% (RFC 9001 §4.8).
 -define(INTERNAL_ERROR_CLOSE, 16#150).
 

@@ -1,6 +1,6 @@
 %%% -*- erlang -*-
 %%%
-%%% TLS 1.3 External PSK end-to-end suite (RFC 8446 §4.2.11).
+%%% TLS 1.3 External PSK end-to-end suite (RFC 9846 §4.3.11).
 %%%
 %%% Spins an in-process echo server with PSK config and drives full
 %%% handshakes through it: psk_dhe_ke, psk_ke (no-DHE), mixed

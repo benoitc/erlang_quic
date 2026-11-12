@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% Distribution over QUIC authenticated by TLS 1.3 external PSK
-%%% (RFC 8446 §4.2.11). No X.509 certs configured on either side;
+%%% (RFC 9846 §4.3.11). No X.509 certs configured on either side;
 %%% both peers share the same PSK callback module + identity.
 %%%
 %%% Boots two real erl VMs via open_port (mirrors

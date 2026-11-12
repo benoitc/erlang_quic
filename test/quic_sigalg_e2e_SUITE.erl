@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% Signature-algorithm negotiation end-to-end suite
-%%% (RFC 8446 §4.2.3 / §4.4.3).
+%%% (RFC 9846 §4.3.3 / §4.5.2).
 %%%
 %%% One single-cert listener per key type (matches the current
 %%% single-cert server API). Each test connects with a client

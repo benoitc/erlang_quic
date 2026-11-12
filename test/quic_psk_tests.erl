@@ -1,5 +1,5 @@
 %%% -*- erlang -*-
-%%% Unit tests for TLS 1.3 external PSK support (RFC 8446 §4.2.11).
+%%% Unit tests for TLS 1.3 external PSK support (RFC 9846 §4.3.11).
 
 -module(quic_psk_tests).
 
@@ -206,7 +206,7 @@ select_psk_no_pre_shared_key_returns_none_test() ->
 %% The server looks the identity up once, then checks the binder.
 select_psk(CHMap, Msg, Config, Modes) ->
     Known = quic_tls_negotiation:known_external_psk(CHMap, Config),
-    quic_tls:select_psk(CHMap, Msg, Known, Modes, aes_128_gcm).
+    quic_tls:select_psk(CHMap, <<>>, Msg, Known, Modes, aes_128_gcm).
 
 %%====================================================================
 %% ServerHello PSK echo + key_share omission

@@ -1,8 +1,8 @@
 %%% -*- erlang -*-
 %%%
 %%% Tests for client certificate support (mutual TLS)
-%%% RFC 8446 Section 4.3.2 - CertificateRequest
-%%% RFC 8446 Section 4.4.2 - Client Certificate
+%%% RFC 9846 Section 4.4.2 - CertificateRequest
+%%% RFC 9846 Section 4.5.1 - Client Certificate
 %%%
 
 -module(quic_client_cert_tests).
@@ -115,9 +115,9 @@ build_certificate_request_with_context_test() ->
     ?assertEqual(Context, maps:get(context, Parsed)).
 
 parse_certificate_request_invalid_test() ->
-    ?assertEqual({error, invalid_certificate_request}, quic_tls:parse_certificate_request(<<>>)),
+    ?assertEqual({error, decode_error}, quic_tls:parse_certificate_request(<<>>)),
     ?assertEqual(
-        {error, invalid_certificate_request}, quic_tls:parse_certificate_request(<<1, 2>>)
+        {error, decode_error}, quic_tls:parse_certificate_request(<<1, 2>>)
     ).
 
 %%====================================================================
@@ -232,7 +232,7 @@ verify_certificate_verify_wrong_role_test() ->
 %%====================================================================
 
 %% verify=true requests a client certificate but is optional mTLS by default:
-%% RFC 8446 §4.4.2.4 lets the server continue without client auth, so a client
+%% RFC 9846 §4.5.1.3 lets the server continue without client auth, so a client
 %% with no certificate still connects.
 server_verify_client_no_cert_test() ->
     ensure_started(),
@@ -266,7 +266,7 @@ server_verify_client_no_cert_test() ->
     end.
 
 %% require_client_cert=true makes mTLS mandatory: a client with no certificate
-%% is rejected with certificate_required (RFC 8446 §4.4.2.4).
+%% is rejected with certificate_required (RFC 9846 §4.5.1.3).
 server_require_client_cert_no_cert_test() ->
     ensure_started(),
     case generate_certs() of

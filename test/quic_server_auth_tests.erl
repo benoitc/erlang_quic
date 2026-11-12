@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%% Listener auth-method contract: QUIC has no unauthenticated mode
 %%% (RFC 9001 §3), so a listener must carry either X.509 credentials
-%%% or a TLS 1.3 external PSK (RFC 8446 §4.2.11) before it starts.
+%%% or a TLS 1.3 external PSK (RFC 9846 §4.3.11) before it starts.
 
 -module(quic_server_auth_tests).
 

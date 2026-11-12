@@ -81,8 +81,8 @@
         %% exercises a PSK handshake end-to-end. The forthcoming
         %% quic_psk_e2e_SUITE drives this code; drop these
         %% suppressions once the suite lands.
-        validate_client_psk_selection/2,
-        validate_client_psk_selection/4,
+        validate_client_psk_selection/3,
+        validate_client_psk_selection/5,
         notify_owner/2
     ]}
 ).
@@ -841,7 +841,7 @@ init({server, Opts}) ->
             require_client_cert = maps:get(require_client_cert, Opts, false),
             stream_reset_final_size = maps:get(stream_reset_final_size, Opts, false),
             notify_streams_available = maps:get(notify_streams_available, Opts, false),
-            %% TLS 1.3 external PSK config (RFC 8446 §4.2.11). Either or
+            %% TLS 1.3 external PSK config (RFC 9846 §4.3.11). Either or
             %% both may be `undefined'; if both are undefined the server
             %% only accepts cert-authenticated handshakes.
             psk_config = #{
@@ -1195,7 +1195,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% Extract session ticket for resumption (if provided)
     SessionTicket = upgrade_ticket(maps:get(session_ticket, Opts, undefined)),
 
-    %% Extract external PSK (RFC 8446 §4.2.11). Mutually exclusive
+    %% Extract external PSK (RFC 9846 §4.3.11). Mutually exclusive
     %% with session_ticket; validated when ClientHello is built.
     ExternalPsk = maps:get(external_psk, Opts, undefined),
 
@@ -1326,7 +1326,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             idle_timeout = IdleTimeoutClient,
             keep_alive_interval = calculate_keep_alive_interval(Opts),
             disconnect_timeout = disconnect_timeout_opt(Opts),
-            %% TLS 1.3 external PSK (RFC 8446 §4.2.11) — mutually exclusive
+            %% TLS 1.3 external PSK (RFC 9846 §4.3.11), mutually exclusive
             %% with session_ticket; conflict raised by build_client_hello/1.
             external_psk = ExternalPsk,
             congestion_threshold = maps:get(congestion_threshold, Opts, 2),
@@ -2668,13 +2668,16 @@ send_client_hello(State) ->
     %% Build ClientHello (with or without PSK for resumption / external).
     %% session_ticket and external_psk are mutually exclusive; build_client_hello/1
     %% raises {bad_opts, psk_conflict} if both are present.
+    Groups = (State#state.cfg)#conn_cfg.tls_groups,
     ClientHelloOpts0 = #{
         server_name => ServerName,
         alpn => AlpnList,
         transport_params => TransportParams,
         session_ticket => SessionTicket,
-        groups => (State#state.cfg)#conn_cfg.tls_groups,
-        ciphers => (State#state.cfg)#conn_cfg.cipher_preference
+        groups => Groups,
+        ciphers => (State#state.cfg)#conn_cfg.cipher_preference,
+        %% Kept for a HelloRetryRequest that leaves the key share as it is.
+        key_pair => quic_crypto:generate_key_pair(hd(Groups))
     },
     ClientHelloOpts1 =
         case (State#state.cfg)#conn_cfg.tls_sig_algs of
@@ -2799,40 +2802,44 @@ default_cipher_preference() ->
 %%====================================================================
 
 %% A ticket resumes only on the listener that issued it, for the server
-%% name, ALPN and hash it was issued under (RFC 8446 Sections 4.2.11 and
-%% 4.6.1). It is taken once its binder checks out, so of two handshakes
+%% name, ALPN and hash it was issued under (RFC 9846 Sections 4.3.11 and
+%% 4.7.1). It is taken once its binder checks out, so of two handshakes
 %% presenting it only one resumes (RFC 9001 Section 9.2).
-resume_ticket(_Identity, _Binder, _Cipher, _Msg, _Info, #state{
+resume_ticket(_Identity, _Binder, _Cipher, _Hello, _Info, #state{
     cfg = #conn_cfg{ticket_table = undefined}
 }) ->
     error;
 resume_ticket(
-    Identity, Binder, Cipher, Msg, Info, #state{cfg = #conn_cfg{ticket_table = Tab}} = State
+    Identity, Binder, Cipher, Hello, Info, #state{cfg = #conn_cfg{ticket_table = Tab}} = State
 ) ->
     case quic_ticket:lookup_issued(Tab, Identity) of
         {ok, Ticket} ->
             case ticket_matches(Ticket, Cipher, Info, State) of
-                true -> check_resumption_binder(Identity, Ticket, Binder, Cipher, Msg, Info, Tab);
+                true -> check_resumption_binder(Identity, Ticket, Binder, Cipher, Hello, Info, Tab);
                 false -> error
             end;
         error ->
             error
     end.
 
+%% A ticket resumes in psk_dhe_ke only, so the client has to allow that
+%% mode (RFC 9846 Section 4.3.9).
 ticket_matches(
     #session_ticket{server_name = SNI, alpn = ALPN, cipher = Issued}, Cipher, Info, State
 ) ->
     ClientALPN = maps:get(alpn_protocols, Info, []),
-    (SNI =:= sni_or_empty(maps:get(server_name, Info, undefined))) andalso
+    lists:member(psk_dhe_ke, maps:get(psk_key_exchange_modes, Info, [])) andalso
+        (SNI =:= sni_or_empty(maps:get(server_name, Info, undefined))) andalso
         (ALPN =:=
             quic_tls_negotiation:negotiate_alpn(ClientALPN, (State#state.cfg)#conn_cfg.alpn_list)) andalso
         (quic_crypto:cipher_to_hash(Issued) =:= quic_crypto:cipher_to_hash(Cipher)).
 
-check_resumption_binder(Identity, Ticket, Binder, Cipher, Msg, Info, Tab) ->
+%% Hello is {the transcript before this ClientHello, the ClientHello}.
+check_resumption_binder(Identity, Ticket, Binder, Cipher, {Prefix, Msg}, Info, Tab) ->
     ResumptionSecret = Ticket#session_ticket.resumption_secret,
     PSK = quic_ticket:derive_psk(ResumptionSecret, Ticket),
     Binders = maps:get(psk_binders, Info, undefined),
-    case quic_tls:verify_resumption_binder(PSK, Cipher, Msg, Binders, Binder) of
+    case quic_tls:verify_resumption_binder(PSK, Cipher, Prefix, Msg, Binders, Binder) of
         true ->
             case quic_ticket:take_issued(Tab, Identity) of
                 {ok, _} -> {ok, PSK, ResumptionSecret};
@@ -2863,21 +2870,26 @@ send_server_hello(ServerHelloMsg, State) ->
 
 %% Server: Send EncryptedExtensions, Certificate, CertificateVerify, Finished
 %% @private
-%% Client-side downgrade protection (RFC 8446 §4.1.3).
+%% Client-side check of the server's PSK selection (RFC 9846 §4.3.11).
 %% If the client offered an external_psk, the server MUST select it;
 %% any other ServerHello outcome (cert path, no PSK extension,
 %% identity index out of range) aborts the connection. Without this
 %% check a server with `verify => false` could silently fall back to
 %% an unauthenticated cert path while the client believed it was on
 %% the PSK path.
-validate_client_psk_selection(undefined, #state{cfg = #conn_cfg{external_psk = undefined}}) ->
+%%
+%% Mode is the one the ServerHello used: psk_ke without a key_share,
+%% psk_dhe_ke with one. A selection the client could not have asked for
+%% is an illegal_parameter (RFC 9846 Section 4.3.11).
+validate_client_psk_selection(undefined, _Mode, #state{cfg = #conn_cfg{external_psk = undefined}}) ->
     %% Neither side wants PSK — standard handshake.
     {ok, undefined};
-validate_client_psk_selection(undefined, #state{cfg = #conn_cfg{external_psk = _Offered}}) ->
+validate_client_psk_selection(undefined, _Mode, #state{cfg = #conn_cfg{external_psk = _Offered}}) ->
     %% Client offered, server didn't select.
     {error, server_did_not_select_psk};
 validate_client_psk_selection(
     Idx,
+    Mode,
     #state{
         cfg = #conn_cfg{external_psk = undefined},
         hs = #hs{
@@ -2887,35 +2899,31 @@ validate_client_psk_selection(
     }
 ) ->
     %% No external PSK was offered, so the server must have selected the
-    %% resumption ticket we offered. Re-derive that PSK from the stored
-    %% ticket; QUIC always uses psk_dhe_ke (the ECDHE share is present in
-    %% the ClientHello).
+    %% resumption ticket we offered, which only allows psk_dhe_ke.
     case quic_ticket:lookup_ticket(ServerName, TicketStore) of
-        {ok, #session_ticket{} = Ticket} when Idx =:= 0 ->
+        {ok, #session_ticket{} = Ticket} when Idx =:= 0, Mode =:= psk_dhe_ke ->
             %% Single-identity resumption offer: index 0 is the only valid
             %% choice. Re-derive the PSK the binder/early secret used.
             PSK = quic_ticket:derive_psk(Ticket#session_ticket.resumption_secret, Ticket),
             {ok, #{identity => Ticket#session_ticket.ticket, secret => PSK, mode => psk_dhe_ke}};
-        {ok, #session_ticket{}} ->
-            {error, selected_psk_index_out_of_range};
-        error ->
-            %% Server selected a PSK we never offered (or it expired).
-            {error, unexpected_psk_selection}
+        _ ->
+            {error, illegal_parameter}
     end;
-validate_client_psk_selection(Idx, #state{cfg = #conn_cfg{external_psk = {Identity, Secret}}}) ->
-    validate_client_psk_selection(Idx, Identity, Secret, [psk_dhe_ke]);
-validate_client_psk_selection(Idx, #state{cfg = #conn_cfg{external_psk = {Identity, Secret, Modes}}}) ->
-    validate_client_psk_selection(Idx, Identity, Secret, Modes).
+validate_client_psk_selection(Idx, Mode, #state{cfg = #conn_cfg{external_psk = {Identity, Secret}}}) ->
+    validate_client_psk_selection(Idx, Mode, Identity, Secret, [psk_dhe_ke]);
+validate_client_psk_selection(
+    Idx, Mode, #state{cfg = #conn_cfg{external_psk = {Identity, Secret, Modes}}}
+) ->
+    validate_client_psk_selection(Idx, Mode, Identity, Secret, Modes).
 
-validate_client_psk_selection(0, Identity, Secret, Modes) ->
-    %% Single-identity offer: index 0 is the only valid choice. The
-    %% mode actually used is detected later from ServerHello's
-    %% key_share presence; record the offered first-preference here
-    %% so the rest of the handshake routes through PSK.
-    [Mode | _] = Modes,
-    {ok, #{identity => Identity, secret => Secret, mode => Mode}};
-validate_client_psk_selection(_Idx, _Identity, _Secret, _Modes) ->
-    {error, selected_psk_index_out_of_range}.
+validate_client_psk_selection(0, Mode, Identity, Secret, Modes) ->
+    %% Single-identity offer: index 0 is the only valid choice.
+    case lists:member(Mode, Modes) of
+        true -> {ok, #{identity => Identity, secret => Secret, mode => Mode}};
+        false -> {error, illegal_parameter}
+    end;
+validate_client_psk_selection(_Idx, _Mode, _Identity, _Secret, _Modes) ->
+    {error, illegal_parameter}.
 
 %% @private
 %% Notify the connection owner of a handshake failure so quic:connect/4
@@ -2934,7 +2942,7 @@ notify_owner(_Msg, _State) ->
 %% such as a key from an sni_callback that cannot sign. Left to the packet
 %% loop it would be taken for a malformed datagram from the peer and
 %% dropped, and the client would wait out its timeout without an answer.
-%% Fail the handshake with internal_error (RFC 8446 Section 6.2) instead.
+%% Fail the handshake with internal_error (RFC 9846 Section 6.2) instead.
 %% exit is left alone, as in the packet loop: it is how the handshake
 %% aborts on purpose.
 server_handshake_flight(Cipher, TranscriptHash, State) ->
@@ -3083,7 +3091,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         early_data => (State#state.hs)#hs.early_data_accepted
     }),
 
-    %% PSK handshakes (RFC 8446 §4.6) skip CertificateRequest / Certificate /
+    %% PSK handshakes (RFC 9846 §4.4.2, §4.5.1) skip CertificateRequest / Certificate /
     %% CertificateVerify entirely. Cert path runs only when no PSK was
     %% selected for this handshake.
     {CertReqMsg, CertMsg, CertVerifyMsg, Transcript2, TranscriptHashForFinished} =
@@ -3163,7 +3171,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
             FinishedMsg/binary>>,
 
     %% The client sends a Certificate next only if we asked for one; a
-    %% resumed (PSK) handshake asks for none (RFC 8446 Section 4.6).
+    %% resumed (PSK) handshake asks for none (RFC 9846 Section 4.4.2).
     NextTlsState =
         case CertReqMsg of
             <<>> -> ?TLS_AWAITING_CLIENT_FINISHED;
@@ -3356,7 +3364,7 @@ send_handshake_done(State) ->
     send_frame(handshake_done, State).
 
 %% Server: Send NewSessionTicket after handshake completes
-%% RFC 8446 Section 4.6.1: Server sends NewSessionTicket in post-handshake message
+%% RFC 9846 Section 4.7.1: Server sends NewSessionTicket in post-handshake message
 %% In QUIC, this is sent as a TLS handshake message in a CRYPTO frame
 send_new_session_ticket(#state{hs = #hs{selected_psk = #{source := external}}} = State) ->
     %% Suppress NewSessionTicket on external-PSK handshakes (v1
@@ -3365,6 +3373,8 @@ send_new_session_ticket(#state{hs = #hs{selected_psk = #{source := external}}} =
     %% resumption ticket; mixing the two raises a binding question
     %% we don't want to answer right now. A handshake resumed from a
     %% ticket gets a new one: tickets are single-use.
+    State;
+send_new_session_ticket(#state{hs = #hs{peer_psk_dhe_ke = false}} = State) ->
     State;
 send_new_session_ticket(#state{hs = #hs{resumption_secret = undefined}} = State) ->
     %% No resumption secret available - skip sending ticket
@@ -7283,7 +7293,7 @@ process_tls_message(
             Cipher = quic_tls_negotiation:select_cipher(
                 CipherSuites, CipherPref, external_psk_hash(KnownPsk)
             ),
-            %% RFC 8446 §4.1.4 group negotiation: use the client's
+            %% RFC 9846 §4.2.4 group negotiation: use the client's
             %% key_share directly when possible, otherwise send a
             %% HelloRetryRequest for a mutually-supported group.
             %% do_server_client_hello/6 carries the full PSK/0-RTT path
@@ -7324,8 +7334,7 @@ process_tls_message(
                     send_tls_alert(?TLS_ALERT_HANDSHAKE_FAILURE, <<"no common group">>, State)
             end;
         {error, Reason} ->
-            ?LOG_ERROR(#{what => client_hello_parse_failed, reason => Reason}, ?QUIC_LOG_META),
-            StateChIn
+            refuse_message(Reason, StateChIn)
     end;
 %% Client receives ServerHello
 process_tls_message(
@@ -7336,10 +7345,14 @@ process_tls_message(
     #state{cfg = #conn_cfg{role = client}, hs = #hs{tls_state = ?TLS_AWAITING_SERVER_HELLO}} = State
 ) ->
     case quic_tls:parse_server_hello(Body) of
+        {_, #{session_id := Echo}} when Echo =/= <<>> ->
+            %% Our legacy_session_id is empty (RFC 9846 Section 4.2.3).
+            notify_owner({error, {tls_alert, illegal_parameter}}, State),
+            send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
         {hrr, HrrInfo} ->
             handle_hello_retry_request(HrrInfo, OriginalMsg, State);
         {ok, #{cipher := Cipher} = ServerHelloMap} ->
-            %% RFC 8446 §4.1.3: the selected suite must be one we offered.
+            %% RFC 9846 §4.2.3: the selected suite must be one we offered.
             case lists:member(Cipher, (State#state.cfg)#conn_cfg.cipher_preference) of
                 false ->
                     notify_owner({error, {tls_alert, illegal_parameter}}, State),
@@ -7360,7 +7373,15 @@ process_tls_message(
             ServerPubKey = maps:get(public_key, ServerHelloMap),
             ServerGroup = maps:get(selected_group, ServerHelloMap),
             SelectedPskIdx = maps:get(selected_psk_identity, ServerHelloMap, undefined),
-            case validate_client_psk_selection(SelectedPskIdx, State) of
+            PskMode =
+                case ServerPubKey of
+                    undefined -> psk_ke;
+                    _ -> psk_dhe_ke
+                end,
+            case validate_client_psk_selection(SelectedPskIdx, PskMode, State) of
+                {error, illegal_parameter} ->
+                    notify_owner({error, {tls_alert, illegal_parameter}}, State),
+                    send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
                 {error, Reason} ->
                     ?LOG_WARNING(
                         #{what => psk_not_selected, reason => Reason},
@@ -7460,11 +7481,8 @@ process_tls_message(
                     },
                     send_initial_ack(State1)
             end;
-        {error, illegal_parameter} ->
-            notify_owner({error, {tls_alert, illegal_parameter}}, State),
-            send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
-        {error, _} ->
-            State
+        {error, Reason} ->
+            refuse_message(Reason, State)
     end;
 process_tls_message(
     _Level,
@@ -7478,7 +7496,7 @@ process_tls_message(
     Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
 
     %% Next state depends on auth path: PSK-authenticated handshakes
-    %% skip Certificate/CertificateVerify (RFC 8446 §4.6.1) and go
+    %% skip Certificate/CertificateVerify (RFC 9846 §4.5.1) and go
     %% straight to Finished.
     NextState =
         case (State#state.hs)#hs.selected_psk of
@@ -7517,13 +7535,8 @@ process_tls_message(
             %% 0-RTT data and notify the owner so the application protocol
             %% can re-issue the affected requests.
             finalize_zero_rtt_state(State1);
-        _ ->
-            State#state{
-                hs = (State#state.hs)#hs{
-                    tls_state = NextState,
-                    tls_transcript = Transcript
-                }
-            }
+        {error, Reason} ->
+            refuse_message(Reason, State)
     end;
 %% Client receives server Certificate
 process_tls_message(
@@ -7537,31 +7550,11 @@ process_tls_message(
     %% Parse and store peer certificate. The chain and identity are
     %% validated at CertificateVerify, where the signature also proves
     %% the server holds the leaf's private key.
-    {PeerCert, PeerCertChain} =
-        case quic_tls:parse_certificate(Body) of
-            {ok, #{certificates := [First | Rest]}} ->
-                {First, Rest};
-            {ok, #{certificates := []}} ->
-                {undefined, []};
-            {error, _} ->
-                {undefined, []}
-        end,
-    State1 = State#state{
-        hs = (State#state.hs)#hs{
-            tls_state = ?TLS_AWAITING_CERT_VERIFY,
-            tls_transcript = Transcript,
-            peer_cert = PeerCert,
-            peer_cert_chain = PeerCertChain
-        }
-    },
-    case (State#state.cfg)#conn_cfg.verify andalso (PeerCert =:= undefined) of
-        true ->
-            %% verify enabled but server sent no certificate.
-            ?LOG_ERROR(#{what => server_sent_no_certificate}, ?QUIC_LOG_META),
-            notify_owner({error, {certificate_invalid, no_certificate}}, State1),
-            send_tls_alert(?TLS_ALERT_CERTIFICATE_REQUIRED, State1);
-        false ->
-            State1
+    case quic_tls:parse_certificate(Body) of
+        {ok, #{certificates := Certs}} ->
+            server_certificate(Certs, Transcript, State);
+        {error, Reason} ->
+            refuse_message(Reason, State)
     end;
 %% Client receives server CertificateVerify
 process_tls_message(
@@ -7571,29 +7564,9 @@ process_tls_message(
     OriginalMsg,
     #state{cfg = #conn_cfg{role = client}, hs = #hs{tls_state = ?TLS_AWAITING_CERT_VERIFY}} = State
 ) ->
-    %% The signature is over the transcript up to and including
-    %% Certificate, i.e. before this message is appended.
-    {ClientHsKeys, _} = (State#state.hs)#hs.handshake_keys,
-    Cipher = ClientHsKeys#crypto_keys.cipher,
-    TranscriptHash = quic_crypto:transcript_hash(Cipher, (State#state.hs)#hs.tls_transcript),
-    Scheme =
-        case quic_tls:parse_certificate_verify(Body) of
-            {ok, #{algorithm := Alg}} -> code_to_sig_alg(Alg);
-            _ -> undefined
-        end,
-    Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
-    Advance = State#state{
-        hs = (State#state.hs)#hs{
-            tls_state = ?TLS_AWAITING_FINISHED,
-            tls_transcript = Transcript,
-            negotiated_scheme = Scheme
-        }
-    },
-    case (State#state.cfg)#conn_cfg.verify of
-        false ->
-            Advance;
-        true ->
-            verify_server_authentication(Body, TranscriptHash, Advance, State)
+    case quic_tls:parse_certificate_verify(Body) of
+        {ok, #{algorithm := Alg}} -> server_certificate_verify(Alg, Body, OriginalMsg, State);
+        {error, Reason} -> refuse_message(Reason, State)
     end;
 %% Client receives server's Finished
 process_tls_message(
@@ -7666,7 +7639,7 @@ process_tls_message(
 
                     %% If server requested client certificate (CertificateRequest received),
                     %% send Certificate and optionally CertificateVerify before Finished
-                    %% RFC 8446 Section 4.4.2: client MUST send Certificate if server sent CertificateRequest
+                    %% RFC 9846 Section 4.5.1: client MUST send Certificate if server sent CertificateRequest
                     {CertPayload, Transcript2} =
                         case (State#state.hs)#hs.cert_request_received of
                             true ->
@@ -7767,7 +7740,7 @@ process_tls_message(
                         ((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary
                     >>,
 
-                    %% Derive resumption_master_secret (RFC 8446 Section 7.1)
+                    %% Derive resumption_master_secret (RFC 9846 Section 7.1)
                     %% resumption_master_secret = Derive-Secret(master_secret, "res master",
                     %%                                          ClientHello..client Finished)
                     FinalTranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
@@ -7798,7 +7771,7 @@ process_tls_message(
             send_tls_alert(?TLS_ALERT_DECODE_ERROR, State)
     end;
 %% Client receives NewSessionTicket from server (post-handshake)
-%% RFC 8446 Section 4.6.1
+%% RFC 9846 Section 4.7.1
 process_tls_message(
     _Level,
     ?TLS_NEW_SESSION_TICKET,
@@ -7885,8 +7858,8 @@ process_tls_message(
                     resumption_secret = ResumptionSecret
                 }
             };
-        {error, _Reason} ->
-            State
+        {error, decode_error} ->
+            send_tls_alert(?TLS_ALERT_DECODE_ERROR, State)
     end;
 %% Client receives CertificateRequest from server (mutual TLS)
 process_tls_message(
@@ -7900,18 +7873,18 @@ process_tls_message(
     %% Capture the advertised signature_algorithms so the client can
     %% pick a compatible CertificateVerify scheme.
     Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
-    PeerSigAlgs =
-        case quic_tls:parse_certificate_request(Body) of
-            {ok, #{signature_algorithms := SA}} -> SA;
-            _ -> []
-        end,
-    State#state{
-        hs = (State#state.hs)#hs{
-            tls_transcript = Transcript,
-            cert_request_received = true,
-            peer_sig_algs = PeerSigAlgs
-        }
-    };
+    case quic_tls:parse_certificate_request(Body) of
+        {ok, #{signature_algorithms := PeerSigAlgs}} ->
+            State#state{
+                hs = (State#state.hs)#hs{
+                    tls_transcript = Transcript,
+                    cert_request_received = true,
+                    peer_sig_algs = PeerSigAlgs
+                }
+            };
+        {error, Reason} ->
+            refuse_message(Reason, State)
+    end;
 %% Server receives client Certificate (when verify=true)
 process_tls_message(
     _Level,
@@ -7923,7 +7896,7 @@ process_tls_message(
     Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
     case quic_tls:parse_certificate(Body) of
         {ok, #{certificates := [First | Rest]}} ->
-            %% RFC 8446 §4.4.2.4: validate the client's certificate chain against
+            %% RFC 9846 §4.5.1.3: validate the client's certificate chain against
             %% our trust anchors before accepting it. Possession of the leaf's
             %% private key is checked next, on CertificateVerify; the signature
             %% check alone does not establish that the certificate is trusted.
@@ -7941,7 +7914,7 @@ process_tls_message(
                     reject_client_cert(Reason, State)
             end;
         {ok, #{certificates := []}} ->
-            %% RFC 8446 §4.4.2.4: an empty client Certificate means the client has
+            %% RFC 9846 §4.5.1.3: an empty client Certificate means the client has
             %% none. The server MAY continue without client auth or abort with
             %% certificate_required. Default to optional mTLS; only
             %% require_client_cert makes a client certificate mandatory.
@@ -7958,8 +7931,8 @@ process_tls_message(
                         }
                     }
             end;
-        {error, _} ->
-            reject_client_cert({bad_cert, malformed}, State)
+        {error, Reason} ->
+            refuse_message(Reason, State)
     end;
 %% Server receives client CertificateVerify (when verify=true and client sent cert)
 process_tls_message(
@@ -7983,28 +7956,103 @@ process_tls_message(
 
     %% Verify signature (transcript is BEFORE CertificateVerify)
     TranscriptHash = quic_crypto:transcript_hash(Cipher, (State#state.hs)#hs.tls_transcript),
-    case quic_tls:verify_certificate_verify(Body, PeerCert, TranscriptHash, client) of
-        true ->
-            Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
-            State#state{
-                hs = (State#state.hs)#hs{
-                    tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
-                    tls_transcript = Transcript
-                }
-            };
-        false ->
-            %% Signature verification failed - send TLS decrypt_error alert
-            %% RFC 8446: decrypt_error (51) for signature verification failure
-            ?LOG_ERROR(#{what => client_cert_verify_failed}, ?QUIC_LOG_META),
-            send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
+    case quic_tls:parse_certificate_verify(Body) of
+        {error, Reason} ->
+            refuse_message(Reason, State);
+        {ok, _} ->
+            case quic_tls:verify_certificate_verify(Body, PeerCert, TranscriptHash, client) of
+                true ->
+                    Transcript = <<
+                        ((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary
+                    >>,
+                    State#state{
+                        hs = (State#state.hs)#hs{
+                            tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
+                            tls_transcript = Transcript
+                        }
+                    };
+                false ->
+                    %% Signature verification failed - send TLS decrypt_error alert
+                    %% RFC 9846 Section 4.5.2: decrypt_error (51) for signature verification failure
+                    ?LOG_ERROR(#{what => client_cert_verify_failed}, ?QUIC_LOG_META),
+                    send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
+            end
     end;
 process_tls_message(_Level, Type, _Body, _OriginalMsg, State) ->
-    %% A message the handshake is not waiting for (RFC 8446 Section 4).
+    %% A message the handshake is not waiting for (RFC 9846 Section 4).
     ?LOG_WARNING(
         #{what => unexpected_tls_message, type => Type, tls_state => (State#state.hs)#hs.tls_state},
         ?QUIC_LOG_META
     ),
     send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State).
+
+%% Client: the server's Certificate, decoded. The chain and identity are
+%% validated at CertificateVerify, where the signature also proves the
+%% server holds the leaf's private key.
+server_certificate(Certs, Transcript, State) ->
+    {PeerCert, PeerCertChain} =
+        case Certs of
+            [First | Rest] -> {First, Rest};
+            [] -> {undefined, []}
+        end,
+    State1 = State#state{
+        hs = (State#state.hs)#hs{
+            tls_state = ?TLS_AWAITING_CERT_VERIFY,
+            tls_transcript = Transcript,
+            peer_cert = PeerCert,
+            peer_cert_chain = PeerCertChain
+        }
+    },
+    case (State#state.cfg)#conn_cfg.verify andalso (PeerCert =:= undefined) of
+        true ->
+            %% verify enabled but server sent no certificate.
+            ?LOG_ERROR(#{what => server_sent_no_certificate}, ?QUIC_LOG_META),
+            notify_owner({error, {certificate_invalid, no_certificate}}, State1),
+            send_tls_alert(?TLS_ALERT_CERTIFICATE_REQUIRED, State1);
+        false ->
+            State1
+    end.
+
+%% Client: the server's CertificateVerify, decoded, signed with Alg.
+server_certificate_verify(Alg, Body, OriginalMsg, State) ->
+    %% The signature is over the transcript up to and including
+    %% Certificate, i.e. before this message is appended.
+    {ClientHsKeys, _} = (State#state.hs)#hs.handshake_keys,
+    Cipher = ClientHsKeys#crypto_keys.cipher,
+    TranscriptHash = quic_crypto:transcript_hash(Cipher, (State#state.hs)#hs.tls_transcript),
+    Transcript = <<((State#state.hs)#hs.tls_transcript)/binary, OriginalMsg/binary>>,
+    Advance = State#state{
+        hs = (State#state.hs)#hs{
+            tls_state = ?TLS_AWAITING_FINISHED,
+            tls_transcript = Transcript,
+            negotiated_scheme = code_to_sig_alg(Alg)
+        }
+    },
+    case (State#state.cfg)#conn_cfg.verify of
+        false ->
+            Advance;
+        true ->
+            verify_server_authentication(Body, TranscriptHash, Advance, State)
+    end.
+
+%% A handshake message the parser refused, answered with the alert it
+%% names; anything that does not decode is a decode_error (RFC 9846
+%% Section 6.2).
+refuse_message(Reason, State) ->
+    {Code, Name} = parse_alert(Reason),
+    ?LOG_WARNING(#{what => tls_message_refused, reason => Reason}, ?QUIC_LOG_META),
+    case (State#state.cfg)#conn_cfg.role of
+        client -> notify_owner({error, {tls_alert, Name}}, State);
+        server -> ok
+    end,
+    send_tls_alert(Code, State).
+
+parse_alert(protocol_version) -> {?TLS_ALERT_PROTOCOL_VERSION, protocol_version};
+parse_alert(illegal_parameter) -> {?TLS_ALERT_ILLEGAL_PARAMETER, illegal_parameter};
+parse_alert({duplicate_extension, _}) -> {?TLS_ALERT_ILLEGAL_PARAMETER, illegal_parameter};
+parse_alert(psk_not_last) -> {?TLS_ALERT_ILLEGAL_PARAMETER, illegal_parameter};
+parse_alert(missing_extension) -> {?TLS_ALERT_MISSING_EXTENSION, missing_extension};
+parse_alert(_) -> {?TLS_ALERT_DECODE_ERROR, decode_error}.
 
 %% External PSKs are SHA-256 (RFC 9846 §4.3.11).
 external_psk_hash({ok, _KnownPsk}) -> sha256;
@@ -8022,6 +8070,9 @@ do_server_client_hello(
     StateSig = State0In#state{
         hs = (State0In#state.hs)#hs{
             peer_sig_algs = maps:get(signature_algorithms, ClientHelloInfo, []),
+            peer_psk_dhe_ke = lists:member(
+                psk_dhe_ke, maps:get(psk_key_exchange_modes, ClientHelloInfo, [])
+            ),
             %% The tickets this connection issues are bound to it.
             server_name = maps:get(server_name, ClientHelloInfo, undefined)
         }
@@ -8056,14 +8107,22 @@ do_server_client_hello_cont(
     SessionId = maps:get(session_id, ClientHelloInfo, <<>>),
     %% Check for PSK (0-RTT/resumption/external)
     PSKInfo = maps:get(pre_shared_key, ClientHelloInfo, undefined),
-    WantsEarlyData = maps:get(early_data, ClientHelloInfo, false),
+    HrrSent = (State#state.hs)#hs.hrr_sent,
+    %% No early data after a HelloRetryRequest (RFC 9846 Section 4.3.10).
+    WantsEarlyData = maps:get(early_data, ClientHelloInfo, false) andalso not HrrSent,
+    %% message_hash(CH1) and the HRR, which the binder also covers.
+    BinderPrefix =
+        case HrrSent of
+            true -> (State#state.hs)#hs.tls_transcript;
+            false -> <<>>
+        end,
 
-    %% TLS 1.3 external PSK selection (RFC 8446 §4.2.11).
+    %% TLS 1.3 external PSK selection (RFC 9846 §4.3.11).
     %% Validate pre_shared_key placement, lookup identity, verify
     %% binder. On match the server skips the cert path and uses
     %% the PSK secret in the early_secret derivation below.
     ExternalPskResult = quic_tls:select_psk(
-        ClientHelloInfo, OriginalMsg, KnownPsk, [psk_dhe_ke, psk_ke], Cipher
+        ClientHelloInfo, BinderPrefix, OriginalMsg, KnownPsk, [psk_dhe_ke, psk_ke], Cipher
     ),
 
     HashLen0 =
@@ -8095,7 +8154,12 @@ do_server_client_hello_cont(
                     #{identities := [{Identity, _Age} | _], binders := [Binder | _]} ->
                         case
                             resume_ticket(
-                                Identity, Binder, Cipher, OriginalMsg, ClientHelloInfo, State
+                                Identity,
+                                Binder,
+                                Cipher,
+                                {BinderPrefix, OriginalMsg},
+                                ClientHelloInfo,
+                                State
                             )
                         of
                             {ok, PSK, ResumptionSecret} ->
@@ -8147,7 +8211,7 @@ do_server_client_hello_cont(
                                 alert_and_exit(?TLS_ALERT_DECRYPT_ERROR, State, decrypt_error);
                             error ->
                                 %% Unknown or expired ticket: fall back to a
-                                %% full handshake (RFC 8446 §4.2.11).
+                                %% full handshake (RFC 9846 §4.3.11).
                                 {undefined, quic_crypto:derive_early_secret(Cipher, ZeroPSK),
                                     undefined}
                         end;
@@ -8184,7 +8248,7 @@ do_server_client_hello_cont(
 
     %% Build ServerHello. For PSK handshakes the ServerHello
     %% carries `selected_psk_identity'; for psk_ke it also
-    %% omits key_share (RFC 8446 §4.2.9).
+    %% omits key_share (RFC 9846 §4.3.9).
     ServerHelloOpts0 = #{
         cipher_suite => quic_tls_negotiation:cipher_atom_to_code(Cipher),
         key_pair => {ServerPubKey, ServerPrivKey},
@@ -8215,7 +8279,7 @@ do_server_client_hello_cont(
     TranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
 
     %% Derive handshake secrets. psk_ke (PSK-only) uses zero IKM
-    %% per RFC 8446 §7.1; psk_dhe_ke and standard handshakes use
+    %% per RFC 9846 §7.1; psk_dhe_ke and standard handshakes use
     %% the ECDHE shared secret.
     HandshakeSecret =
         case SelectedPsk of
@@ -8270,7 +8334,7 @@ do_server_client_hello_cont(
     keylog_handshake((State#state.hs)#hs.tls_ch1_random, ClientHsSecret, ServerHsSecret),
     keylog_handshake(ClientRandom, ClientHsSecret, ServerHsSecret),
     %% Negotiate the CertificateVerify scheme up front (cert
-    %% path only). No common scheme is fatal (RFC 8446 §4.4.3).
+    %% path only). No common scheme is fatal (RFC 9846 §4.5.2).
     case negotiate_cert_verify(SelectedPsk, State0) of
         {error, no_common_sig_alg} ->
             send_tls_alert(
@@ -8406,8 +8470,8 @@ negotiate_cert_verify(_None, State) ->
 
 %% @private Send a HelloRetryRequest for SelectedGroup and arm the
 %% server to receive the client's second ClientHello. The transcript
-%% is reset to the synthetic message_hash(CH1) + HRR per RFC 8446
-%% §4.4.1. No handshake keys exist yet, so HRR ships at Initial level.
+%% is reset to the synthetic message_hash(CH1) + HRR per RFC 9846
+%% §4.1. No handshake keys exist yet, so HRR ships at Initial level.
 send_hello_retry_request(SelectedGroup, Cipher, SessionId, OriginalMsg, State) ->
     CH1Hash = quic_crypto:transcript_hash(Cipher, OriginalMsg),
     Prefix = quic_crypto:hrr_transcript_prefix(Cipher, CH1Hash),
@@ -8449,35 +8513,34 @@ offered_psk_hash(#{session_ticket := #session_ticket{cipher = Cipher}}) ->
 offered_psk_hash(_Opts) ->
     undefined.
 
-%% @private Client-side HelloRetryRequest handling (RFC 8446 §4.1.4).
+%% @private Client-side HelloRetryRequest handling (RFC 9846 §4.2.4).
 %% Validates the one-HRR and group rules, rebuilds CH2 reusing CH1's
 %% random + session_id, and rewrites the transcript to the synthetic
 %% message_hash(CH1) + HRR prefix.
 handle_hello_retry_request(
-    #{cipher := Cipher, selected_group := SelGroup}, HrrMsg, State
+    #{cipher := Cipher, selected_group := HrrGroup, cookie := Cookie}, HrrMsg, State
 ) ->
     Ch1Opts = (State#state.hs)#hs.tls_ch1_opts,
-    PskOffered =
-        Ch1Opts =/= undefined andalso
-            (maps:get(external_psk, Ch1Opts, undefined) =/= undefined orelse
-                maps:get(session_ticket, Ch1Opts, undefined) =/= undefined),
+    SentGroup = (State#state.hs)#hs.tls_group,
+    SelGroup =
+        case HrrGroup of
+            undefined -> SentGroup;
+            _ -> HrrGroup
+        end,
     #conn_cfg{tls_groups = Groups, cipher_preference = Ciphers} = State#state.cfg,
     Offered = lists:member(SelGroup, Groups) andalso lists:member(Cipher, Ciphers),
-    case {(State#state.hs)#hs.hrr_sent, PskOffered, Offered} of
-        {true, _, _} ->
-            %% A second HRR is illegal (RFC 8446 §4.1.4).
+    %% RFC 9846 Section 4.2.4: a retry must change the ClientHello.
+    Changes = (SelGroup =/= SentGroup) orelse (Cookie =/= undefined),
+    case {(State#state.hs)#hs.hrr_sent, Offered andalso Changes} of
+        {true, _} ->
+            %% A second HRR is illegal (RFC 9846 §4.2.4).
             notify_owner({error, {tls_alert, unexpected_message}}, State),
             send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State);
-        {_, true, _} ->
-            %% PSK + HRR is out of scope for v1; aborting avoids a
-            %% silent binder-recompute gap.
-            notify_owner({error, {tls_alert, unexpected_message}}, State),
-            send_tls_alert(?TLS_ALERT_UNEXPECTED_MESSAGE, State);
-        {_, _, false} ->
-            %% Server picked a group or a cipher suite we never offered.
+        {_, false} ->
+            %% A group or suite we never offered, or nothing to change.
             notify_owner({error, {tls_alert, illegal_parameter}}, State),
             send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
-        {false, false, true} ->
+        {false, true} ->
             %% Synthetic transcript: message_hash(CH1) || HRR. The
             %% current transcript holds exactly CH1.
             CH1Hash = quic_crypto:transcript_hash(Cipher, (State#state.hs)#hs.tls_transcript),
@@ -8485,11 +8548,19 @@ handle_hello_retry_request(
             BaseTranscript = <<Prefix/binary, HrrMsg/binary>>,
 
             %% Rebuild CH2: same random + session_id, key_share moved
-            %% to the server-selected group. supported_groups stays.
-            Ch2Opts = Ch1Opts#{
-                key_share_group => SelGroup,
+            %% to the server-selected group, the cookie echoed, a PSK
+            %% binder over the new transcript and no early_data.
+            %% supported_groups stays.
+            KeyShareOpts =
+                case HrrGroup of
+                    undefined -> Ch1Opts;
+                    _ -> (maps:remove(key_pair, Ch1Opts))#{key_share_group => SelGroup}
+                end,
+            Ch2Opts = KeyShareOpts#{
                 retry_random => (State#state.hs)#hs.tls_ch1_random,
-                retry_session_id => <<>>
+                retry_session_id => <<>>,
+                hrr_transcript => BaseTranscript,
+                cookie => Cookie
             },
             {CH2, PrivKey, _Random} = quic_tls:build_client_hello(Ch2Opts),
             Transcript = <<BaseTranscript/binary, CH2/binary>>,
@@ -9792,7 +9863,7 @@ build_cert_request(#state{cfg = #conn_cfg{tls_sig_algs = SigAlgs}}) ->
 select_signature_algorithm(PrivateKey) ->
     hd(compatible_sig_schemes_codes(PrivateKey) ++ [?SIG_RSA_PSS_RSAE_SHA256]).
 
-%% CertificateVerify scheme negotiation (RFC 8446 §4.4.3). Intersects
+%% CertificateVerify scheme negotiation (RFC 9846 §4.5.2). Intersects
 %% the schemes the private key can produce (server preference order,
 %% optionally narrowed by `signature_algs') with the peer's offered
 %% list. `rsa_pkcs1_*` is never selected for CertificateVerify.
@@ -9810,7 +9881,7 @@ select_signature_algorithm(PrivateKey, ServerSigAlgs, ClientOfferedCodes) ->
     end.
 
 %% Wire codes the given private key can sign CertificateVerify with,
-%% in preference order. Excludes rsa_pkcs1_* (RFC 8446 §4.4.3).
+%% in preference order. Excludes rsa_pkcs1_* (RFC 9846 §4.5.2).
 %% Ed25519 decodes to an ECPrivateKey tuple carrying OID 1.3.101.112;
 %% match it before the generic EC clauses.
 compatible_sig_schemes_codes({'ECPrivateKey', _, _, {namedCurve, {1, 3, 101, 112}}, _, _}) ->
@@ -12737,6 +12808,7 @@ default_alert_phrase(?TLS_ALERT_ILLEGAL_PARAMETER) -> <<"illegal parameter">>;
 default_alert_phrase(?TLS_ALERT_UNEXPECTED_MESSAGE) -> <<"unexpected message">>;
 default_alert_phrase(?TLS_ALERT_DECRYPT_ERROR) -> <<"decrypt error">>;
 default_alert_phrase(?TLS_ALERT_DECODE_ERROR) -> <<"decode error">>;
+default_alert_phrase(?TLS_ALERT_PROTOCOL_VERSION) -> <<"protocol version">>;
 default_alert_phrase(?TLS_ALERT_INTERNAL_ERROR) -> <<"internal error">>;
 default_alert_phrase(?TLS_ALERT_UNKNOWN_PSK_IDENTITY) -> <<"unknown psk identity">>;
 default_alert_phrase(?TLS_ALERT_BAD_CERTIFICATE) -> <<"bad certificate">>;

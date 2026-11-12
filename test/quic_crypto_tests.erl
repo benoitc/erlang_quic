@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% Tests for QUIC TLS 1.3 Cryptographic Operations
-%%% RFC 8446 Test Vectors
+%%% TLS 1.3 key schedule (RFC 9846 Section 7.1)
 %%%
 
 -module(quic_crypto_tests).
@@ -202,20 +202,16 @@ transcript_hash_test() ->
     ?assertEqual(Expected, Result).
 
 %%====================================================================
-%% RFC 8446 Appendix B Test Vectors
+%% RFC 8448 Test Vectors
 %%====================================================================
 
-%% RFC 8446 Section 7.1 gives this example:
-%% early_secret with zero PSK and zero salt should be deterministic
-
-rfc8446_early_secret_zero_psk_test() ->
-    %% With all-zero PSK, early_secret is deterministic
-    %% HKDF-Extract(0, 0) with SHA-256
-    ZeroPSK = <<0:256>>,
-    ZeroSalt = <<0:256>>,
-    Expected = crypto:mac(hmac, sha256, ZeroSalt, ZeroPSK),
-    Result = quic_crypto:derive_early_secret(),
-    ?assertEqual(Expected, Result).
+%% RFC 8448 Section 3: with no PSK the early secret is HKDF-Extract(0, 0)
+%% over SHA-256.
+rfc8448_early_secret_zero_psk_test() ->
+    Expected = binary:decode_hex(
+        <<"33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a">>
+    ),
+    ?assertEqual(Expected, quic_crypto:derive_early_secret()).
 
 %%====================================================================
 %% Full Key Schedule Integration Test

@@ -616,7 +616,7 @@ cert_extensions(leaf) ->
 
 %%====================================================================
 %% quic_cert:validate_client/3 — mutual-TLS client chain validation
-%% (RFC 8446 §4.4.2.4)
+%% (RFC 9846 §4.5.1.3)
 %%
 %% Negative coverage for the gap this change closes: previously the server
 %% checked only the client's CertificateVerify signature (proof of private-key

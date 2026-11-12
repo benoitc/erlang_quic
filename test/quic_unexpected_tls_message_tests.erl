@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% A handshake message the TLS state machine is not waiting for is an
-%%% unexpected_message (RFC 8446 Section 4; QUIC error 0x010a, RFC 9001
+%%% unexpected_message (RFC 9846 Section 4; QUIC error 0x010a, RFC 9001
 %%% Section 4.8), not something to ignore.
 
 -module(quic_unexpected_tls_message_tests).

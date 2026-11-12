@@ -471,7 +471,7 @@ retry_token_in_initial(_Config) ->
 
 %% @doc Test session ticket storage
 resumption_ticket_storage(_Config) ->
-    ct:comment("RFC 8446 Section 4.6: Session ticket storage"),
+    ct:comment("RFC 9846 Section 4.7: Session ticket storage"),
 
     Store = quic_ticket:new_store(),
 
@@ -500,7 +500,7 @@ resumption_ticket_storage(_Config) ->
 
 %% @doc Test PSK derivation
 resumption_psk_derivation(_Config) ->
-    ct:comment("RFC 8446 Section 4.6.1: PSK derivation"),
+    ct:comment("RFC 9846 Section 4.7.1: PSK derivation"),
 
     %% Mock ticket with known values
     ResumptionSecret = crypto:strong_rand_bytes(32),
@@ -525,7 +525,7 @@ resumption_psk_derivation(_Config) ->
 
 %% @doc Test NewSessionTicket parsing
 resumption_ticket_parsing(_Config) ->
-    ct:comment("RFC 8446 Section 4.6.1: NewSessionTicket parsing"),
+    ct:comment("RFC 9846 Section 4.7.1: NewSessionTicket parsing"),
 
     %% Build a NewSessionTicket message
     Lifetime = 86400,
@@ -562,7 +562,7 @@ resumption_ticket_parsing(_Config) ->
 
 %% @doc Test early_data extension
 zerortt_early_data_extension(_Config) ->
-    ct:comment("RFC 8446: early_data extension (type 42)"),
+    ct:comment("RFC 9846 Section 4.3.10: early_data extension (type 42)"),
 
     %% Extension format: type (2) + length (2) + max_early_data (4)
     MaxEarlyData = 16384,
@@ -578,7 +578,7 @@ zerortt_early_data_extension(_Config) ->
 
 %% @doc Test early secret derivation
 zerortt_early_secret_derivation(_Config) ->
-    ct:comment("RFC 8446 Section 7.1: Early secret derivation"),
+    ct:comment("RFC 9846 Section 7.1: Early secret derivation"),
 
     %% Derive early secret (without PSK = zero PSK)
     EarlySecret = quic_crypto:derive_early_secret(),
