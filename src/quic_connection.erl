@@ -12084,8 +12084,8 @@ answer_stop_sending(StreamId, ErrorCode, StreamsBefore, State) ->
     end.
 
 %% A reset quic sends on its own: RESET_STREAM_AT keeping the stream's
-%% reliable size, capped at what was written, when the owner set one and
-%% the peer advertised reset_stream_at; otherwise Plain, a RESET_STREAM.
+%% reliable size, capped at what was written and the peer's limits, when the
+%% owner set one and the peer advertised reset_stream_at; else Plain, a RESET_STREAM.
 reset_own_stream(
     StreamId, ErrorCode, Plain, #state{streams = Streams, transport_params = TP} = State
 ) ->
@@ -12093,9 +12093,8 @@ reset_own_stream(
         {#{StreamId := #stream_state{reliable_size = Size, send_offset = Sent} = Stream}, true} when
             is_integer(Size)
         ->
-            case
-                do_reset_stream_at_with_stream(StreamId, ErrorCode, min(Size, Sent), Stream, State)
-            of
+            Reliable = min(min(Size, Sent), reset_at_limit(Stream, State)),
+            case do_reset_stream_at_with_stream(StreamId, ErrorCode, Reliable, Stream, State) of
                 {ok, _} = Ok -> Ok;
                 {error, _} -> Plain(StreamId, ErrorCode, State)
             end;
@@ -12170,20 +12169,40 @@ do_reset_stream_at(
     end.
 
 do_reset_stream_at_with_stream(StreamId, ErrorCode, ReliableSize, StreamState, State) ->
-    FinalSize = StreamState#stream_state.send_offset,
-    case validate_reset_stream_at(ReliableSize, FinalSize, ErrorCode, StreamState) of
+    Written = StreamState#stream_state.send_offset,
+    case validate_reset_stream_at(ReliableSize, Written, ErrorCode, StreamState) of
         ok ->
-            execute_reset_stream_at(
-                StreamId,
-                ErrorCode,
-                ReliableSize,
-                FinalSize,
-                StreamState,
-                State
-            );
+            FinalSize = reset_at_final_size(StreamId, ReliableSize, StreamState, State),
+            case FinalSize =< reset_at_limit(StreamState, State) of
+                true ->
+                    execute_reset_stream_at(
+                        StreamId,
+                        ErrorCode,
+                        ReliableSize,
+                        FinalSize,
+                        StreamState,
+                        State
+                    );
+                false ->
+                    {error, flow_control_blocked}
+            end;
         {error, _} = Error ->
             Error
     end.
+
+%% What was sent plus the queued reliable bytes, then fixed (reset-11 Section 4).
+reset_at_final_size(
+    _StreamId, _ReliableSize, #stream_state{send_reset_at = RS} = Stream, _State
+) when
+    RS =/= undefined
+->
+    Stream#stream_state.send_offset;
+reset_at_final_size(StreamId, ReliableSize, Stream, State) ->
+    max(ReliableSize, reset_final_size(StreamId, Stream, State)).
+
+%% The largest final size the peer's stream and connection limits allow.
+reset_at_limit(#stream_state{send_max_data = Max} = Stream, State) ->
+    min(Max, conn_allowance(Stream, 0, State#state.max_data_remote, State#state.data_sent)).
 
 validate_reset_stream_at(ReliableSize, FinalSize, ErrorCode, StreamState) ->
     ExistingReliable = StreamState#stream_state.send_reset_at,
@@ -12233,6 +12252,7 @@ execute_reset_stream_at(
     TruncatedBuffer = truncate_send_buffer(StreamState#stream_state.send_buffer, ReliableSize),
     UpdatedStream = StreamState#stream_state{
         state = reset,
+        send_offset = FinalSize,
         send_reset_at = ReliableSize,
         send_reset_error = ErrorCode,
         send_buffer = TruncatedBuffer,

@@ -526,7 +526,11 @@ reset_stream(Conn, StreamId, ErrorCode) when is_pid(Conn) ->
 %% Data up to ReliableSize will be delivered before the reset takes effect.
 %% Requires peer support for the reliable stream reset extension
 %% (draft-ietf-quic-reliable-stream-reset-07).
-%% ReliableSize must be less than or equal to the amount of data already sent.
+%% ReliableSize must not exceed what was written on the stream. The frame's
+%% final size is what was sent plus the reliable bytes still queued; when
+%% that exceeds the peer's flow control limits the reset is refused with
+%% `{error, flow_control_blocked}' (draft-ietf-quic-reliable-stream-reset-11
+%% Section 4).
 -spec reset_stream_at(Conn, StreamId, ErrorCode, ReliableSize) ->
     ok | {error, term()}
 when
