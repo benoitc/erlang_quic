@@ -102,11 +102,104 @@ hello_retry_request_with_a_cookie_for_the_group_already_sent_test() ->
     ?assertMatch(#{extensions := #{?EXT_COOKIE := <<5:16, "token">>}}, retried_client_hello(S)).
 
 %%====================================================================
+%% PSK key exchange modes (RFC 9846 Sections 4.3.9 and 4.3.11)
+%%====================================================================
+
+psk_without_modes_test_() ->
+    Offers = [
+        {external_psk, {<<"id">>, <<"this-is-a-32-byte-test-secret!!!">>}},
+        {session_ticket, ticket()}
+    ],
+    [
+        ?_assertEqual(
+            {tls_alert, ?TLS_ALERT_MISSING_EXTENSION},
+            server_close(without_ext(?EXT_PSK_KEY_EXCHANGE_MODES, client_hello(#{Key => Offer})))
+        )
+     || {Key, Offer} <- Offers
+    ].
+
+ticket_resumes_in_psk_dhe_ke_test() ->
+    ?assertMatch({true, #{source := ticket}}, resume_with_modes(<<?PSK_KE_MODE_DHE_KE>>)).
+
+ticket_not_resumed_without_psk_dhe_ke_test() ->
+    ?assertEqual({false, undefined}, resume_with_modes(<<?PSK_KE_MODE_KE>>)).
+
+ticket_selected_without_key_share_test() ->
+    SH = server_hello(#{selected_psk_identity => 0, selected_psk_mode => psk_ke}),
+    ?assertEqual(
+        {tls_alert, ?TLS_ALERT_ILLEGAL_PARAMETER},
+        (client_after(SH, #{session_ticket => ticket()}))#state.close_reason
+    ).
+
+ticket_selected_at_another_index_test() ->
+    SH = server_hello(#{selected_psk_identity => 1}),
+    ?assertEqual(
+        {tls_alert, ?TLS_ALERT_ILLEGAL_PARAMETER},
+        (client_after(SH, #{session_ticket => ticket()}))#state.close_reason
+    ).
+
+external_psk_mode_follows_the_key_share_test() ->
+    Psk = {<<"id">>, <<"this-is-a-32-byte-test-secret!!!">>, [psk_dhe_ke, psk_ke]},
+    SH = server_hello(#{selected_psk_identity => 0, selected_psk_mode => psk_ke}),
+    S = client_after(SH, #{external_psk => Psk}),
+    ?assertEqual(undefined, S#state.close_reason),
+    ?assertMatch(#{mode := psk_ke}, (S#state.hs)#hs.selected_psk).
+
+external_psk_mode_not_offered_test() ->
+    Psk = {<<"id">>, <<"this-is-a-32-byte-test-secret!!!">>, [psk_ke]},
+    SH = server_hello(#{selected_psk_identity => 0}),
+    ?assertEqual(
+        {tls_alert, ?TLS_ALERT_ILLEGAL_PARAMETER},
+        (client_after(SH, #{external_psk => Psk}))#state.close_reason
+    ).
+
+%% Whether a server resumed a ticket from a ClientHello offering Modes,
+%% and the PSK it selected.
+resume_with_modes(Modes) ->
+    Ticket = ticket(),
+    Tab = ets:new(issued, [set, public]),
+    try
+        quic_ticket:store_issued(Tab, Ticket),
+        CH = set_ext(
+            ?EXT_PSK_KEY_EXCHANGE_MODES,
+            <<(byte_size(Modes)), Modes/binary>>,
+            client_hello(#{session_ticket => Ticket})
+        ),
+        S = server_after(rebind(CH, Ticket), Tab),
+        {
+            quic_ticket:lookup_issued(Tab, Ticket#session_ticket.ticket) =:= error,
+            (S#state.hs)#hs.selected_psk
+        }
+    after
+        ets:delete(Tab)
+    end.
+
+ticket() ->
+    T = quic_ticket:create_ticket(<<"localhost">>, <<7:256>>, 0, aes_128_gcm, <<"h3">>),
+    T#session_ticket{transport_params = #{}}.
+
+%% CH with its resumption binder computed again over what it now holds.
+rebind(CH, Ticket) ->
+    Cipher = Ticket#session_ticket.cipher,
+    PSK = quic_ticket:derive_psk(Ticket#session_ticket.resumption_secret, Ticket),
+    Truncated = binary:part(CH, 0, byte_size(CH) - 35),
+    Binder = quic_crypto:compute_psk_binder(
+        Cipher,
+        quic_crypto:derive_early_secret(Cipher, PSK),
+        quic_crypto:transcript_hash(Cipher, Truncated),
+        resumption
+    ),
+    <<Truncated/binary, 33:16, 32, Binder/binary>>.
+
+%%====================================================================
 %% Messages
 %%====================================================================
 
 server_hello() ->
-    {Msg, _} = quic_tls:build_server_hello(#{
+    server_hello(#{}).
+
+server_hello(Extra) ->
+    {Msg, _} = quic_tls:build_server_hello(Extra#{
         cipher_suite => ?TLS_AES_128_GCM_SHA256,
         key_pair => quic_crypto:generate_key_pair(x25519),
         key_share_group => x25519
@@ -117,7 +210,10 @@ hello_retry_request() ->
     quic_tls:build_hello_retry_request(<<>>, ?TLS_AES_128_GCM_SHA256, secp256r1).
 
 client_hello() ->
-    {CH, _, _} = quic_tls:build_client_hello(client_hello_opts()),
+    client_hello(#{}).
+
+client_hello(Extra) ->
+    {CH, _, _} = quic_tls:build_client_hello(maps:merge(client_hello_opts(), Extra)),
     CH.
 
 client_hello_opts() ->
@@ -187,13 +283,27 @@ client_close(Msg) ->
     (client_after(Msg))#state.close_reason.
 
 client_after(Msg) ->
-    {CH1, Priv, Random} = quic_tls:build_client_hello(client_hello_opts()),
+    client_after(Msg, #{}).
+
+%% A client whose ClientHello carried Extra, after Msg.
+client_after(Msg, Extra) ->
+    Opts = maps:merge(client_hello_opts(), Extra),
+    {CH1, Priv, Random} = quic_tls:build_client_hello(Opts),
     S0 = quic_connection_test_support:with_keys_and_socket(
         quic_connection_test_support:state_for_role(client)
     ),
     #state{hs = HS, cfg = Cfg} = S0,
-    S = quic_connection:process_tls_messages(initial, Msg, S0#state{
-        cfg = Cfg#conn_cfg{cipher_preference = [aes_128_gcm], tls_groups = [x25519, secp256r1]},
+    Tickets =
+        case maps:find(session_ticket, Extra) of
+            {ok, T} -> quic_ticket:store_ticket(<<"localhost">>, T, quic_ticket:new_store());
+            error -> quic_ticket:new_store()
+        end,
+    quic_connection:process_tls_messages(initial, Msg, S0#state{
+        cfg = Cfg#conn_cfg{
+            cipher_preference = [aes_128_gcm],
+            tls_groups = [x25519, secp256r1],
+            external_psk = maps:get(external_psk, Extra, undefined)
+        },
         hs = HS#hs{
             pn_initial = HS#hs.pn_handshake,
             tls_state = awaiting_server_hello,
@@ -201,21 +311,30 @@ client_after(Msg) ->
             tls_private_key = Priv,
             tls_transcript = CH1,
             tls_ch1_random = Random,
-            tls_ch1_opts = client_hello_opts()
+            tls_ch1_opts = Opts,
+            server_name = <<"localhost">>,
+            ticket_store = Tickets
         }
-    }),
-    S.
+    }).
 
 %% How a server waiting for a ClientHello closes on Msg.
 server_close(Msg) ->
+    (server_after(Msg, undefined))#state.close_reason.
+
+%% A server issuing tickets into Tab, after Msg.
+server_after(Msg, Tab) ->
     S0 = quic_connection_test_support:with_keys_and_socket(
         quic_connection_test_support:state_for_role(server)
     ),
     #state{hs = HS, cfg = Cfg} = S0,
-    S = quic_connection:process_tls_messages(initial, Msg, S0#state{
+    quic_connection:process_tls_messages(initial, Msg, S0#state{
+        last_activity = erlang:monotonic_time(millisecond),
         cfg = Cfg#conn_cfg{
-            cipher_preference = [aes_128_gcm], tls_groups = [x25519], alpn_list = [<<"h3">>]
+            cipher_preference = [aes_128_gcm],
+            tls_groups = [x25519],
+            alpn_list = [<<"h3">>],
+            ticket_table = Tab,
+            idle_timeout = 30000
         },
         hs = HS#hs{tls_state = awaiting_client_hello, tls_transcript = <<>>}
-    }),
-    S#state.close_reason.
+    }).

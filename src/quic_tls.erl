@@ -562,7 +562,7 @@ parse_server_hello_extensions(Random, SessionId, CipherSuite, ExtMap) ->
                 %% psk_ke handshake: no DHE → public_key=undefined.
                 {ok, {undefined, undefined}};
             error ->
-                {error, missing_key_share}
+                {error, missing_extension}
         end,
     case KeyShareResult of
         {ok, {SelectedGroup, PubKey}} ->
@@ -1158,14 +1158,17 @@ parse_client_hello(<<
             ExtMap = maps:from_list([{T, D} || {T, D, _Off, _Sz} <- OrderedExts]),
 
             %% Validate pre_shared_key placement (must be last per RFC 8446 §4.2.11).
-            case {validate_psk_extension_placement(OrderedExts), offered_tls13(ExtMap)} of
-                {ok, ok} ->
+            Checks = [
+                offered_tls13(ExtMap),
+                validate_psk_extension_placement(OrderedExts),
+                psk_modes_offered(ExtMap)
+            ],
+            case first_error(Checks) of
+                ok ->
                     finalise_client_hello(
                         Random, SessionId, Ciphers, OrderedExts, ExtMap, Extensions
                     );
-                {{error, _} = Err, _} ->
-                    Err;
-                {ok, {error, _} = Err} ->
+                {error, _} = Err ->
                     Err
             end;
         {error, Reason} ->
@@ -1365,6 +1368,19 @@ parse_pre_shared_key_ext(
     #{identities => Identities, binders => Binders};
 parse_pre_shared_key_ext(_) ->
     undefined.
+
+first_error([]) -> ok;
+first_error([ok | Rest]) -> first_error(Rest);
+first_error([Error | _]) -> Error.
+
+%% RFC 9846 Sections 4.3.9 and 9.2: a PSK comes with the modes it may
+%% be used in.
+psk_modes_offered(#{?EXT_PRE_SHARED_KEY := _} = ExtMap) when
+    not is_map_key(?EXT_PSK_KEY_EXCHANGE_MODES, ExtMap)
+->
+    {error, missing_extension};
+psk_modes_offered(_ExtMap) ->
+    ok.
 
 %% RFC 9846 Section 4.3.1: QUIC is TLS 1.3 only (RFC 9001 Section 4.2),
 %% so supported_versions has to offer 0x0304.

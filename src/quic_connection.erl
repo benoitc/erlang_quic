@@ -81,8 +81,8 @@
         %% exercises a PSK handshake end-to-end. The forthcoming
         %% quic_psk_e2e_SUITE drives this code; drop these
         %% suppressions once the suite lands.
-        validate_client_psk_selection/2,
-        validate_client_psk_selection/4,
+        validate_client_psk_selection/3,
+        validate_client_psk_selection/5,
         notify_owner/2
     ]}
 ).
@@ -2822,11 +2822,14 @@ resume_ticket(
             error
     end.
 
+%% A ticket resumes in psk_dhe_ke only, so the client has to allow that
+%% mode (RFC 9846 Section 4.3.9).
 ticket_matches(
     #session_ticket{server_name = SNI, alpn = ALPN, cipher = Issued}, Cipher, Info, State
 ) ->
     ClientALPN = maps:get(alpn_protocols, Info, []),
-    (SNI =:= sni_or_empty(maps:get(server_name, Info, undefined))) andalso
+    lists:member(psk_dhe_ke, maps:get(psk_key_exchange_modes, Info, [])) andalso
+        (SNI =:= sni_or_empty(maps:get(server_name, Info, undefined))) andalso
         (ALPN =:=
             quic_tls_negotiation:negotiate_alpn(ClientALPN, (State#state.cfg)#conn_cfg.alpn_list)) andalso
         (quic_crypto:cipher_to_hash(Issued) =:= quic_crypto:cipher_to_hash(Cipher)).
@@ -2874,14 +2877,19 @@ send_server_hello(ServerHelloMsg, State) ->
 %% check a server with `verify => false` could silently fall back to
 %% an unauthenticated cert path while the client believed it was on
 %% the PSK path.
-validate_client_psk_selection(undefined, #state{cfg = #conn_cfg{external_psk = undefined}}) ->
+%%
+%% Mode is the one the ServerHello used: psk_ke without a key_share,
+%% psk_dhe_ke with one. A selection the client could not have asked for
+%% is an illegal_parameter (RFC 9846 Section 4.3.11).
+validate_client_psk_selection(undefined, _Mode, #state{cfg = #conn_cfg{external_psk = undefined}}) ->
     %% Neither side wants PSK — standard handshake.
     {ok, undefined};
-validate_client_psk_selection(undefined, #state{cfg = #conn_cfg{external_psk = _Offered}}) ->
+validate_client_psk_selection(undefined, _Mode, #state{cfg = #conn_cfg{external_psk = _Offered}}) ->
     %% Client offered, server didn't select.
     {error, server_did_not_select_psk};
 validate_client_psk_selection(
     Idx,
+    Mode,
     #state{
         cfg = #conn_cfg{external_psk = undefined},
         hs = #hs{
@@ -2891,35 +2899,31 @@ validate_client_psk_selection(
     }
 ) ->
     %% No external PSK was offered, so the server must have selected the
-    %% resumption ticket we offered. Re-derive that PSK from the stored
-    %% ticket; QUIC always uses psk_dhe_ke (the ECDHE share is present in
-    %% the ClientHello).
+    %% resumption ticket we offered, which only allows psk_dhe_ke.
     case quic_ticket:lookup_ticket(ServerName, TicketStore) of
-        {ok, #session_ticket{} = Ticket} when Idx =:= 0 ->
+        {ok, #session_ticket{} = Ticket} when Idx =:= 0, Mode =:= psk_dhe_ke ->
             %% Single-identity resumption offer: index 0 is the only valid
             %% choice. Re-derive the PSK the binder/early secret used.
             PSK = quic_ticket:derive_psk(Ticket#session_ticket.resumption_secret, Ticket),
             {ok, #{identity => Ticket#session_ticket.ticket, secret => PSK, mode => psk_dhe_ke}};
-        {ok, #session_ticket{}} ->
-            {error, selected_psk_index_out_of_range};
-        error ->
-            %% Server selected a PSK we never offered (or it expired).
-            {error, unexpected_psk_selection}
+        _ ->
+            {error, illegal_parameter}
     end;
-validate_client_psk_selection(Idx, #state{cfg = #conn_cfg{external_psk = {Identity, Secret}}}) ->
-    validate_client_psk_selection(Idx, Identity, Secret, [psk_dhe_ke]);
-validate_client_psk_selection(Idx, #state{cfg = #conn_cfg{external_psk = {Identity, Secret, Modes}}}) ->
-    validate_client_psk_selection(Idx, Identity, Secret, Modes).
+validate_client_psk_selection(Idx, Mode, #state{cfg = #conn_cfg{external_psk = {Identity, Secret}}}) ->
+    validate_client_psk_selection(Idx, Mode, Identity, Secret, [psk_dhe_ke]);
+validate_client_psk_selection(
+    Idx, Mode, #state{cfg = #conn_cfg{external_psk = {Identity, Secret, Modes}}}
+) ->
+    validate_client_psk_selection(Idx, Mode, Identity, Secret, Modes).
 
-validate_client_psk_selection(0, Identity, Secret, Modes) ->
-    %% Single-identity offer: index 0 is the only valid choice. The
-    %% mode actually used is detected later from ServerHello's
-    %% key_share presence; record the offered first-preference here
-    %% so the rest of the handshake routes through PSK.
-    [Mode | _] = Modes,
-    {ok, #{identity => Identity, secret => Secret, mode => Mode}};
-validate_client_psk_selection(_Idx, _Identity, _Secret, _Modes) ->
-    {error, selected_psk_index_out_of_range}.
+validate_client_psk_selection(0, Mode, Identity, Secret, Modes) ->
+    %% Single-identity offer: index 0 is the only valid choice.
+    case lists:member(Mode, Modes) of
+        true -> {ok, #{identity => Identity, secret => Secret, mode => Mode}};
+        false -> {error, illegal_parameter}
+    end;
+validate_client_psk_selection(_Idx, _Mode, _Identity, _Secret, _Modes) ->
+    {error, illegal_parameter}.
 
 %% @private
 %% Notify the connection owner of a handshake failure so quic:connect/4
@@ -7367,7 +7371,15 @@ process_tls_message(
             ServerPubKey = maps:get(public_key, ServerHelloMap),
             ServerGroup = maps:get(selected_group, ServerHelloMap),
             SelectedPskIdx = maps:get(selected_psk_identity, ServerHelloMap, undefined),
-            case validate_client_psk_selection(SelectedPskIdx, State) of
+            PskMode =
+                case ServerPubKey of
+                    undefined -> psk_ke;
+                    _ -> psk_dhe_ke
+                end,
+            case validate_client_psk_selection(SelectedPskIdx, PskMode, State) of
+                {error, illegal_parameter} ->
+                    notify_owner({error, {tls_alert, illegal_parameter}}, State),
+                    send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
                 {error, Reason} ->
                     ?LOG_WARNING(
                         #{what => psk_not_selected, reason => Reason},
@@ -12780,6 +12792,7 @@ default_alert_phrase(_) -> <<"tls alert">>.
 hello_alert(protocol_version) -> ?TLS_ALERT_PROTOCOL_VERSION;
 hello_alert(illegal_parameter) -> ?TLS_ALERT_ILLEGAL_PARAMETER;
 hello_alert(decode_error) -> ?TLS_ALERT_DECODE_ERROR;
+hello_alert(missing_extension) -> ?TLS_ALERT_MISSING_EXTENSION;
 hello_alert(_) -> undefined.
 
 %% Normalise the `verify' option to a strict boolean. Accepts the
