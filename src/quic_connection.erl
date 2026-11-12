@@ -163,7 +163,8 @@
     init/1,
     callback_mode/0,
     terminate/3,
-    code_change/4
+    code_change/4,
+    format_status/1
 ]).
 
 %% State functions
@@ -1439,6 +1440,39 @@ terminate(
 
 code_change(_OldVsn, StateName, State, _Extra) ->
     {ok, StateName, State}.
+
+%% Crash reports and sys:get_status/1 show no key, secret or PSK.
+-spec format_status(gen_statem:format_status()) -> gen_statem:format_status().
+format_status(Status) ->
+    quic_redact:status(
+        maps:map(fun redact_status_data/2, Status), [data, queue, postponed, log]
+    ).
+
+redact_status_data(data, #state{cfg = Cfg, hs = Hs} = State) ->
+    State#state{
+        cfg = quic_redact:fields(Cfg, [
+            #conn_cfg.stateless_reset_secret,
+            #conn_cfg.client_private_key,
+            #conn_cfg.external_psk,
+            #conn_cfg.psk_config,
+            #conn_cfg.sni_callback
+        ]),
+        hs = quic_redact:fields(setelement(#hs.early_keys, Hs, early_keys(Hs#hs.early_keys)), [
+            #hs.tls_private_key,
+            #hs.handshake_secret,
+            #hs.master_secret,
+            #hs.server_hs_secret,
+            #hs.client_hs_secret,
+            #hs.server_private_key,
+            #hs.resumption_secret,
+            #hs.selected_psk
+        ])
+    };
+redact_status_data(_Key, Value) ->
+    Value.
+
+early_keys({Keys, EarlySecret}) -> {Keys, quic_redact:value(EarlySecret)};
+early_keys(EarlyKeys) -> EarlyKeys.
 
 %%====================================================================
 %% State Functions

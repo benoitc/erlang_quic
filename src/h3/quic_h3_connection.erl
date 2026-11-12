@@ -61,7 +61,8 @@
     init/1,
     callback_mode/0,
     terminate/3,
-    code_change/4
+    code_change/4,
+    format_status/1
 ]).
 
 %% State functions
@@ -676,6 +677,11 @@ terminate(_Reason, _StateName, #state{quic_conn = QuicConn}) ->
 
 code_change(_OldVsn, StateName, State, _Extra) ->
     {ok, StateName, State}.
+
+%% Crash reports and sys:get_status/1 show no key, secret or PSK.
+-spec format_status(gen_statem:format_status()) -> gen_statem:format_status().
+format_status(Status) ->
+    quic_redact:status(Status, [data, queue, postponed, log]).
 
 %%====================================================================
 %% State: bootstrapping

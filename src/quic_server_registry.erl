@@ -46,7 +46,8 @@
     handle_call/3,
     handle_cast/2,
     handle_info/2,
-    terminate/2
+    terminate/2,
+    format_status/1
 ]).
 
 -define(TABLE, quic_server_registry_tab).
@@ -242,6 +243,11 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, _State) ->
     ok.
+
+%% Crash reports and sys:get_status/1 show no key, secret or PSK.
+-spec format_status(gen_server:format_status()) -> gen_server:format_status().
+format_status(Status) ->
+    quic_redact:status(Status, [state, message, log]).
 
 %%====================================================================
 %% Internal functions

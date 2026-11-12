@@ -343,8 +343,9 @@ aead_ctx(Cipher, Key, Enc) ->
                     undefined -> #{};
                     M -> M
                 end,
+            Id = quic_aead_ctx:key_id(Key),
             case Cache of
-                #{Key := Ctx} ->
+                #{Id := Ctx} ->
                     Ctx;
                 _ ->
                     Ctx = crypto:crypto_one_time_aead_init(Cipher, Key, ?TAG_LEN, Enc),
@@ -353,7 +354,7 @@ aead_ctx(Cipher, Key, Enc) ->
                             true -> #{};
                             false -> Cache
                         end,
-                    erlang:put(CacheKey, Kept#{Key => Ctx}),
+                    erlang:put(CacheKey, Kept#{Id => Ctx}),
                     Ctx
             end
     end.
@@ -386,8 +387,9 @@ ecb_ctx(Cipher, Key) ->
             undefined -> #{};
             M -> M
         end,
+    Id = quic_aead_ctx:key_id(Key),
     case Cache of
-        #{Key := Ctx} ->
+        #{Id := Ctx} ->
             Ctx;
         _ ->
             Ctx = crypto:crypto_init(Cipher, Key, true),
@@ -396,7 +398,7 @@ ecb_ctx(Cipher, Key) ->
                     true -> #{};
                     false -> Cache
                 end,
-            erlang:put({hp_ctx, Cipher}, Kept#{Key => Ctx}),
+            erlang:put({hp_ctx, Cipher}, Kept#{Id => Ctx}),
             Ctx
     end.
 

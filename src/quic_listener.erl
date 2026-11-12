@@ -115,7 +115,8 @@
     handle_cast/2,
     handle_info/2,
     terminate/2,
-    code_change/3
+    code_change/3,
+    format_status/1
 ]).
 
 -ifdef(TEST).
@@ -925,6 +926,22 @@ terminate(_Reason, _) ->
 %% @doc false
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+%% Crash reports and sys:get_status/1 show no key, secret or PSK.
+-spec format_status(gen_server:format_status()) -> gen_server:format_status().
+format_status(Status) ->
+    quic_redact:status(maps:map(fun redact_status_state/2, Status), [state, message, log]).
+
+redact_status_state(state, #listener_state{tls = Tls} = State) ->
+    Redacted = quic_redact:fields(Tls, [
+        #listener_tls.private_key,
+        #listener_tls.psks,
+        #listener_tls.psk_callback,
+        #listener_tls.sni_callback
+    ]),
+    quic_redact:fields(State#listener_state{tls = Redacted}, [#listener_state.reset_secret]);
+redact_status_state(_Key, Value) ->
+    Value.
 
 %%====================================================================
 %% Internal Functions
