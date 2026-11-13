@@ -379,3 +379,129 @@ snapshots_are_bounded_by_flight_test() ->
     Sim = run(sim(shallow_path()), ?SEC),
     ?assertEqual(in_flight(Sim), info(Sim, sent_packets)),
     ?assertEqual(0, info(go_idle(Sim, 0), sent_packets)).
+
+%%====================================================================
+%% State machine (Sections 5.3.1 - 5.3.3)
+%%====================================================================
+
+%% max_bw tracks the bottleneck within the 2% of the draft's test A.1.
+max_bw_matches_bottleneck_test() ->
+    Sim = run(sim(bulk_path()), 3 * ?SEC),
+    ?assert(abs(info(Sim, max_bw) - 10000000) =< 10000000 * 0.02).
+
+%% Samples taken while the sender had nothing to send are marked
+%% application-limited.
+app_limited_samples_are_marked_test() ->
+    Sim = run(sim(#{bw => 10000000, rtt => 20 * ?MS, app => {1200, 10 * ?MS}}), ?SEC),
+    ?assert(info(Sim, rs_app_limited)).
+
+startup_gains_test() ->
+    Info = quic_cc_bbr:info(quic_cc_bbr:new(#{})),
+    ?assertEqual(startup, maps:get(mode, Info)),
+    ?assertEqual(2.77, maps:get(pacing_gain, Info)),
+    ?assertEqual(2.0, maps:get(cwnd_gain, Info)).
+
+%% A.1: three rounds without 25% growth end Startup.
+startup_exits_on_bandwidth_plateau_test() ->
+    Sim = run_until(sim(bulk_path()), not_in_mode(startup), 5 * ?SEC),
+    Info = info(Sim),
+    ?assertEqual(drain, maps:get(mode, Info)),
+    ?assert(maps:get(full_bw_reached, Info)),
+    ?assert(maps:get(full_bw_now, Info)),
+    ?assertEqual(3, maps:get(full_bw_count, Info)),
+    ?assertEqual(0.5, maps:get(pacing_gain, Info)),
+    ?assertEqual(infinity, maps:get(inflight_longterm, Info)),
+    ?assertEqual(0, maps:get(lost_pkts, Sim)).
+
+%% A.3: Drain ends once in flight is down to the BDP.
+drain_exits_on_inflight_test() ->
+    Sim = run_until(sim(bulk_path()), not_in_mode(startup), 5 * ?SEC),
+    Out = run_until(Sim, not_in_mode(drain), 5 * ?SEC),
+    ?assertEqual(probe_bw_cruise, info(Out, mode)),
+    ?assert(info(Out, bytes_in_flight) =< info(Out, bdp) + 2 * ?MDS).
+
+%% A.4: Drain ends after three rounds even when in flight stays high,
+%% here because the bottleneck halved as Drain started.
+drain_exits_after_three_rounds_test() ->
+    Sim = run_until(sim(bulk_path()), not_in_mode(startup), 5 * ?SEC),
+    ?assertEqual(drain, info(Sim, mode)),
+    Start = info(Sim, round_count),
+    Out = run_until(set_bw(Sim, 5000000), not_in_mode(drain), 5 * ?SEC),
+    ?assert(lists:member(info(Out, mode), [probe_bw_down, probe_bw_cruise])),
+    ?assertEqual(Start + 4, info(Out, round_count)).
+
+%% ProbeBW cycles DOWN, CRUISE, REFILL, UP with the draft's gains.
+probe_bw_cycle_test() ->
+    Sim = to_probe_bw(sim(bulk_path())),
+    Refill = run_until(Sim, in_mode(probe_bw_refill), 5 * ?SEC),
+    ?assertEqual({1.0, 2.0}, {info(Refill, pacing_gain), info(Refill, cwnd_gain)}),
+    Up = run_until(Refill, in_mode(probe_bw_up), ?SEC),
+    ?assertEqual({1.25, 2.25}, {info(Up, pacing_gain), info(Up, cwnd_gain)}),
+    Down = run_until(Up, in_mode(probe_bw_down), 5 * ?SEC),
+    ?assertEqual({0.9, 2.0}, {info(Down, pacing_gain), info(Down, cwnd_gain)}),
+    Cruise = run_until(Down, in_mode(probe_bw_cruise), 5 * ?SEC),
+    ?assertEqual({1.0, 2.0}, {info(Cruise, pacing_gain), info(Cruise, cwnd_gain)}),
+    ?assertMatch(
+        [probe_bw_refill, probe_bw_up, probe_bw_down, probe_bw_cruise | _],
+        lists:dropwhile(fun(M) -> M =/= probe_bw_refill end, visited(Cruise))
+    ).
+
+%% REFILL lasts one round; UP ends on a bandwidth plateau (A.5).
+probe_bw_up_exits_on_plateau_test() ->
+    Sim = to_probe_bw(sim(bulk_path())),
+    Refill = run_until(Sim, in_mode(probe_bw_refill), 5 * ?SEC),
+    Up = run_until(Refill, in_mode(probe_bw_up), ?SEC),
+    ?assertEqual(info(Refill, round_count) + 1, info(Up, round_count)),
+    Down = run_until(Up, in_mode(probe_bw_down), 5 * ?SEC),
+    ?assert(info(Down, full_bw_now)),
+    ?assertNot(info(Down, prev_probe_too_high)).
+
+%% The wait before the next probe is 2 to 3 seconds (Section 5.3.3.8.3).
+probe_wait_is_two_to_three_seconds_test() ->
+    Wait = info(to_probe_bw(sim(bulk_path())), bw_probe_wait),
+    ?assert(Wait >= 2 * ?SEC),
+    ?assert(Wait =< 3 * ?SEC).
+
+%% A small BDP probes on the Reno time scale: within BDP rounds.
+small_bdp_probes_on_reno_time_scale_test() ->
+    Sim = to_probe_bw(sim(#{bw => 1000000, rtt => 10 * ?MS, buf => 100000})),
+    Up = run_until(Sim, in_mode(probe_bw_up), 3 * ?SEC),
+    ?assertEqual(probe_bw_up, info(Up, mode)),
+    ?assert(elapsed(Up) - elapsed(Sim) < ?SEC).
+
+%% A.16: max_bw forgets a faster path after two ProbeBW cycles.
+max_bw_adapts_down_after_two_cycles_test() ->
+    Sim = to_probe_bw(sim(bulk_path())),
+    Slow = run(Sim#{bw := 5000000}, 12 * ?SEC),
+    ?assert(info(Slow, cycle_count) >= info(Sim, cycle_count) + 2),
+    ?assert(abs(info(Slow, max_bw) - 5000000) =< 5000000 * 0.02).
+
+%% A.7: an application-limited flow without loss stays in Startup.
+app_limited_flow_stays_in_startup_test() ->
+    Sim = run(sim(#{bw => 10000000, rtt => 20 * ?MS, app => {1200, 2 * ?MS}}), 5 * ?SEC),
+    ?assertEqual([startup], visited(Sim)).
+
+%%====================================================================
+%% ProbeRTT (Section 5.3.4)
+%%====================================================================
+
+%% A.10: ProbeRTT after 10 s without a lower RTT, for 200 ms and a round.
+probe_rtt_after_min_rtt_expires_test() ->
+    Sim = to_probe_bw(sim(bulk_path())),
+    In = run_until(Sim, in_mode(probe_rtt), 15 * ?SEC),
+    ?assertEqual(probe_rtt, info(In, mode)),
+    ?assert(elapsed(In) >= 10 * ?SEC),
+    ?assertEqual({1.0, 0.5}, {info(In, pacing_gain), info(In, cwnd_gain)}),
+    Out = run_until(In, not_in_mode(probe_rtt), 2 * ?SEC),
+    ?assert(elapsed(Out) - elapsed(In) >= 200 * ?MS),
+    ?assertEqual(probe_bw_cruise, info(Out, mode)),
+    ?assertEqual(2.0, info(Out, cwnd_gain)).
+
+%% A.20: ProbeRTT before the pipe was filled returns to Startup.
+probe_rtt_during_startup_returns_to_startup_test() ->
+    Sim = sim(#{bw => 10000000, rtt => 20 * ?MS, app => {1200, 2 * ?MS}}),
+    In = run_until(Sim, in_mode(probe_rtt), 12 * ?SEC),
+    ?assertEqual(probe_rtt, info(In, mode)),
+    Out = run_until(In, not_in_mode(probe_rtt), 2 * ?SEC),
+    ?assertEqual(startup, info(Out, mode)),
+    ?assertEqual([startup, probe_rtt, startup], visited(Out)).

@@ -2,26 +2,26 @@
 %%%
 %%% QUIC BBRv3 Congestion Control
 %%% draft-ietf-ccwg-bbr-07
-%%% RFC 9406 - HyStart++: Modified Slow Start for TCP
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
 %%% Apache License 2.0
 %%%
-%%% @doc QUIC BBRv3 congestion control implementation.
+%%% @doc BBRv3 congestion control, following draft-ietf-ccwg-bbr-07.
 %%%
-%%% BBRv3 (Bottleneck Bandwidth and Round-trip propagation time) is a
-%%% model-based congestion control algorithm that aims to maximize throughput
-%%% while minimizing latency and packet loss.
+%%% BBR builds a model of the path from delivery rate and RTT samples and
+%%% paces at the estimated bandwidth, bounding data in flight to a
+%%% multiple of the estimated bandwidth-delay product.
 %%%
-%%% HyStart++ (RFC 9406) provides additional RTT-based startup exit detection
-%%% alongside BBR's bandwidth plateau detection for earlier, safer exits.
+%%% == States (Section 5.1) ==
 %%%
-%%% == States ==
-%%%
-%%% 1. Startup: Exponential bandwidth probing (2.885x pacing gain) with HyStart++ RTT monitoring
-%%% 2. Drain: Reduce queue built during startup (0.347x pacing gain)
-%%% 3. ProbeBW: Steady-state with cycling phases (DOWN/CRUISE/REFILL/UP)
-%%% 4. ProbeRTT: Periodic RTT measurement with reduced cwnd
+%%% - Startup: pacing gain 2.77, cwnd gain 2; exits on a bandwidth
+%%%   plateau.
+%%% - Drain: pacing gain 0.5 until in flight drops to the BDP, or after
+%%%   3 rounds.
+%%% - ProbeBW: DOWN (0.90), CRUISE (1.0), REFILL (1.0), UP (1.25, cwnd
+%%%   gain 2.25).
+%%% - ProbeRTT: cwnd gain 0.5 for 200 ms and one round when min_rtt has
+%%%   not been refreshed for 10 seconds.
 %%%
 %%% == Units ==
 %%%
@@ -31,12 +31,11 @@
 %%% == Per-packet state ==
 %%%
 %%% The `quic_cc' callbacks report bytes, not packets, so the delivery
-%%% rate sampler (draft-ietf-ccwg-bbr-07 Section 4.1) keeps the
-%%% per-packet snapshots in send order and matches acknowledged, lost and
-%%% discarded bytes against the oldest outstanding ones. QUIC
-%%% acknowledges and declares packets lost mostly in send order, so a
-%%% reordered acknowledgment only shifts a sample to a neighbouring
-%%% packet's snapshot.
+%%% rate sampler (Section 4.1) keeps the per-packet snapshots in send
+%%% order and matches acknowledged, lost and discarded bytes against the
+%%% oldest outstanding ones. QUIC acknowledges and declares packets lost
+%%% mostly in send order, so a reordered acknowledgment only shifts a
+%%% sample to a neighbouring packet's snapshot.
 %%%
 %%% The `*_at' functions take the current time and are what the
 %%% behaviour callbacks call with the clock; `info/1' returns the model.
@@ -99,32 +98,32 @@
 %% Constants (draft-ietf-ccwg-bbr-07 Section 2)
 %%====================================================================
 
--define(STARTUP_PACING_GAIN, 2.885).
--define(DRAIN_PACING_GAIN, 0.347).
+-define(STARTUP_PACING_GAIN, 2.77).
+-define(DRAIN_PACING_GAIN, 0.5).
 -define(DEFAULT_CWND_GAIN, 2.0).
--define(PROBE_BW_DOWN_PACING_GAIN, 0.91).
+-define(PROBE_BW_DOWN_PACING_GAIN, 0.9).
 -define(PROBE_BW_CRUISE_PACING_GAIN, 1.0).
 -define(PROBE_BW_REFILL_PACING_GAIN, 1.0).
 -define(PROBE_BW_UP_PACING_GAIN, 1.25).
+-define(PROBE_BW_UP_CWND_GAIN, 2.25).
+-define(PROBE_RTT_PACING_GAIN, 1.0).
 -define(PROBE_RTT_CWND_GAIN, 0.5).
 -define(PACING_MARGIN_PERCENT, 1).
 -define(LOSS_THRESH, 0.02).
 -define(BETA, 0.7).
+-define(HEADROOM, 0.15).
 -define(MIN_PIPE_CWND_PKTS, 4).
 -define(FULL_BW_GROWTH, 1.25).
 -define(FULL_BW_ROUNDS, 3).
-
-%% HyStart++ (RFC 9406): samples per round, RTT threshold bounds (ms)
-%% and the divisor of the last round's RTT.
--define(HYSTART_MIN_SAMPLES, 8).
--define(HYSTART_MIN_RTT_THRESH, 4).
--define(HYSTART_MAX_RTT_THRESH, 16).
--define(HYSTART_MIN_RTT_DIVISOR, 8).
+-define(DRAIN_MAX_ROUNDS, 3).
+-define(RENO_ROUNDS_BOUND, 63).
+-define(MAX_PROBE_UP_ROUNDS, 30).
 
 %% Times in microseconds.
 -define(MIN_RTT_FILTER_LEN, 10000000).
 -define(PROBE_RTT_DURATION, 200000).
--define(PROBE_RTT_INTERVAL, 5000000).
+-define(PROBE_WAIT_BASE, 2000000).
+-define(PROBE_WAIT_RAND, 1000000).
 -define(US_PER_SEC, 1000000).
 
 -define(MAX_DATAGRAM_SIZE, 1200).
@@ -192,6 +191,8 @@
     first_send_time = 0 :: integer(),
     app_limited = 0 :: non_neg_integer(),
     lifetime_min_rtt = infinity :: non_neg_integer() | infinity,
+    cwnd_limited_now = false :: boolean(),
+    cwnd_limited_prev = false :: boolean(),
     sent = queue:new() :: queue:queue(#pkt{}),
     rs = #rs{} :: #rs{},
 
@@ -202,36 +203,52 @@
     round_count = 0 :: non_neg_integer(),
     round_start = false :: boolean(),
     next_round_delivered = 0 :: non_neg_integer(),
+    idle_restart = false :: boolean(),
+    drain_start_round = 0 :: non_neg_integer(),
 
     %% Bandwidth model (Sections 2.9.1, 2.11)
     max_bw = 0 :: non_neg_integer(),
     bw_hi_cur = 0 :: non_neg_integer(),
     bw_hi_prev = 0 :: non_neg_integer(),
     cycle_count = 0 :: non_neg_integer(),
+    bw_shortterm = infinity :: volume(),
+    bw = 0 :: non_neg_integer(),
 
     %% Volume model (Section 2.9.2)
     min_rtt = infinity :: non_neg_integer() | infinity,
     min_rtt_stamp = 0 :: integer(),
+    min_rtt_expired = false :: boolean(),
+    inflight_longterm = infinity :: volume(),
+    inflight_shortterm = infinity :: volume(),
 
     %% Loss in the current round, and the in-flight cap it set
     loss_in_round = 0 :: non_neg_integer(),
     bytes_in_round = 0 :: non_neg_integer(),
     inflight_hi = infinity :: volume(),
 
-    %% Startup bandwidth plateau
+    %% Startup (Section 2.13)
+    full_bw_reached = false :: boolean(),
+    full_bw_now = false :: boolean(),
     full_bw = 0 :: non_neg_integer(),
     full_bw_count = 0 :: non_neg_integer(),
 
-    %% ProbeRTT
+    %% ProbeBW (Section 2.14)
+    is_bw_probe_stopping = false :: boolean(),
+    check_probe_loss = false :: boolean(),
+    bw_probe_up_acked = 0 :: non_neg_integer(),
+    probe_up_acked_per_inc = infinity :: volume(),
+    bw_probe_up_rounds = 0 :: non_neg_integer(),
+    rounds_since_probe_up = 0 :: non_neg_integer(),
+    bw_probe_wait = 0 :: non_neg_integer(),
+    cycle_stamp = 0 :: integer(),
+    prev_probe_too_high = false :: boolean(),
+    prev_probe_precautionary = false :: boolean(),
+
+    %% ProbeRTT (Section 2.16)
     prior_cwnd = 0 :: non_neg_integer(),
     probe_rtt_done_stamp = 0 :: integer(),
-
-    %% HyStart++ (RFC 9406): RTT samples this round, last and current
-    %% round's minimum RTT in milliseconds
-    hystart_enabled = true :: boolean(),
-    hystart_rtt_sample_count = 0 :: non_neg_integer(),
-    hystart_last_rtt = 0 :: non_neg_integer(),
-    hystart_curr_rtt = infinity :: non_neg_integer() | infinity,
+    probe_rtt_round_done = false :: boolean(),
+    probe_rtt_cwnd = infinity :: volume(),
 
     %% Loss recovery (RFC 9002 Section 7.3.2)
     in_recovery = false :: boolean(),
@@ -266,7 +283,6 @@ new_at(Opts, Now) ->
     MinimumWindow = max(maps:get(minimum_window, Opts, 2 * MDS), 2 * MDS),
     MinRecoveryDuration = maps:get(min_recovery_duration, Opts, 100) * 1000,
     InitialRtt = maps:get(initial_rtt, Opts, ?INITIAL_RTT),
-    HystartEnabled = maps:get(hystart_enabled, Opts, true),
     InitialCwnd = max(maps:get(initial_window, Opts, 10 * MDS), ?MIN_PIPE_CWND_PKTS * MDS),
     S0 = #bbr_state{
         max_datagram_size = MDS,
@@ -275,8 +291,7 @@ new_at(Opts, Now) ->
         min_recovery_duration = MinRecoveryDuration,
         cwnd = InitialCwnd,
         min_rtt_stamp = Now,
-        last_pacing_update = Now,
-        hystart_enabled = HystartEnabled
+        last_pacing_update = Now
     },
     %% Startup gain times the initial window over initial_rtt (ms).
     Rate = max(1, trunc(?STARTUP_PACING_GAIN * ((InitialCwnd * 1000) div InitialRtt))),
@@ -300,6 +315,8 @@ on_packet_sent_at(State, Size, Now) ->
         delivered = Delivered,
         lost = Lost,
         app_limited = AppLimited,
+        cwnd = Cwnd,
+        max_datagram_size = MDS,
         sent = Sent,
         bytes_in_round = BytesInRound
     } = State,
@@ -323,6 +340,7 @@ on_packet_sent_at(State, Size, Now) ->
         bytes_in_flight = InFlight,
         delivered_time = DeliveredTime,
         first_send_time = FirstSendTime,
+        cwnd_limited_now = State#bbr_state.cwnd_limited_now orelse (InFlight + MDS > Cwnd),
         sent = queue:in(Pkt, Sent),
         bytes_in_round = BytesInRound + Size
     }.
@@ -447,30 +465,21 @@ clear_app_limited(S) ->
     S.
 
 update_model_and_state(S0, Now) ->
-    S1 = update_min_rtt(end_loss_round(update_max_bw(S0)), Now),
-    run_state_machine(S1, Now).
+    S1 = end_loss_round(update_max_bw(S0)),
+    S2 = check_full_bw_reached(S1),
+    S3 = check_startup_done(S2),
+    S4 = check_drain_done(S3, Now),
+    S5 = update_probe_bw_cycle_phase(S4, Now),
+    S6 = update_min_rtt(S5, Now),
+    S7 = check_probe_rtt(S6, Now),
+    bound_bw_for_model(S7).
 
 update_control_parameters(S) ->
     set_pacing_rate(cap_cwnd(set_cwnd(S))).
 
-%% A new round clears the loss count, ends recovery and starts a new
-%% HyStart++ RTT round.
-end_loss_round(
-    #bbr_state{
-        round_start = true,
-        in_recovery = WasInRecovery,
-        inflight_hi = Hi,
-        hystart_curr_rtt = CurrRtt
-    } = S
-) ->
+%% A new round clears the loss count and ends recovery.
+end_loss_round(#bbr_state{round_start = true, in_recovery = WasInRecovery, inflight_hi = Hi} = S) ->
     S#bbr_state{
-        hystart_last_rtt =
-            case CurrRtt of
-                infinity -> 0;
-                _ -> CurrRtt
-            end,
-        hystart_curr_rtt = infinity,
-        hystart_rtt_sample_count = 0,
         loss_in_round = 0,
         bytes_in_round = 0,
         in_recovery = false,
@@ -494,7 +503,18 @@ update_round(
         next_round_delivered = Next
     } = S
 ) when Prior >= Next ->
-    (start_round(S))#bbr_state{round_count = S#bbr_state.round_count + 1, round_start = true};
+    #bbr_state{
+        round_count = Round,
+        rounds_since_probe_up = SinceUp,
+        cwnd_limited_now = LimitedNow
+    } = S,
+    (start_round(S))#bbr_state{
+        round_count = Round + 1,
+        rounds_since_probe_up = SinceUp + 1,
+        round_start = true,
+        cwnd_limited_prev = LimitedNow,
+        cwnd_limited_now = false
+    };
 update_round(S) ->
     S#bbr_state{round_start = false}.
 
@@ -519,44 +539,23 @@ advance_max_bw_filter(#bbr_state{cycle_count = Count, bw_hi_cur = 0} = S) ->
 advance_max_bw_filter(#bbr_state{cycle_count = Count, bw_hi_cur = Cur} = S) ->
     S#bbr_state{cycle_count = Count + 1, bw_hi_prev = Cur, bw_hi_cur = 0, max_bw = Cur}.
 
-%% Section 5.5.7: the lowest RTT sample over the last 10 seconds.
+%% Section 5.3.4.3 UpdateMinRTT.
 update_min_rtt(#bbr_state{min_rtt_stamp = Stamp, min_rtt = MinRtt, rs = #rs{rtt = Rtt}} = S, Now) ->
     Expired = (Now > Stamp + ?MIN_RTT_FILTER_LEN),
-    case (Rtt >= 0) andalso ((Rtt < MinRtt) orelse Expired) of
-        true -> S#bbr_state{min_rtt = Rtt, min_rtt_stamp = Now};
-        false -> S
-    end.
-
-%%====================================================================
-%% State machine
-%%====================================================================
-
-run_state_machine(#bbr_state{mode = startup} = S, _Now) ->
-    run_startup(S);
-run_state_machine(#bbr_state{mode = drain} = S, _Now) ->
-    run_drain(S);
-run_state_machine(#bbr_state{mode = probe_rtt} = S, Now) ->
-    run_probe_rtt(S, Now);
-run_state_machine(#bbr_state{min_rtt_stamp = Stamp} = S, Now) when
-    Now - Stamp > ?PROBE_RTT_INTERVAL
-->
-    enter_probe_rtt(S, Now);
-run_state_machine(S, _Now) ->
-    advance_probe_bw_phase(S).
-
-%% Startup ends when max_bw has not grown 25% in three ACKs, or when
-%% HyStart++ sees the RTT rise.
-run_startup(#bbr_state{max_bw = MaxBw, full_bw = FullBw, full_bw_count = Count} = S) ->
-    {FullBw1, Count1} =
-        case MaxBw >= trunc(FullBw * ?FULL_BW_GROWTH) of
-            true -> {MaxBw, 0};
-            false -> {FullBw, Count + 1}
+    S1 =
+        case Expired of
+            true -> S#bbr_state{probe_rtt_cwnd = bdp_multiple(S, ?PROBE_RTT_CWND_GAIN)};
+            false -> S
         end,
-    S1 = S#bbr_state{full_bw = FullBw1, full_bw_count = Count1},
-    case (Count1 >= ?FULL_BW_ROUNDS) orelse hystart_should_exit(S1) of
-        true -> exit_startup(S1);
-        false -> S1
+    S2 = S1#bbr_state{min_rtt_expired = Expired},
+    case (Rtt >= 0) andalso ((Rtt < MinRtt) orelse Expired) of
+        true -> S2#bbr_state{min_rtt = Rtt, min_rtt_stamp = Now};
+        false -> S2
     end.
+
+%%====================================================================
+%% Startup and Drain (Sections 5.3.1, 5.3.2)
+%%====================================================================
 
 enter_startup(S) ->
     S#bbr_state{
@@ -565,100 +564,333 @@ enter_startup(S) ->
         cwnd_gain = ?DEFAULT_CWND_GAIN
     }.
 
-exit_startup(S) ->
+reset_full_bw(S) ->
+    S#bbr_state{full_bw = 0, full_bw_count = 0, full_bw_now = false}.
+
+%% Section 5.3.1.2: three non-app-limited rounds without 25% growth.
+check_full_bw_reached(#bbr_state{full_bw_now = true} = S) ->
+    S;
+check_full_bw_reached(#bbr_state{round_start = false} = S) ->
+    S;
+check_full_bw_reached(#bbr_state{rs = #rs{is_app_limited = true}} = S) ->
+    S;
+check_full_bw_reached(#bbr_state{rs = #rs{delivery_rate = Rate}, full_bw = FullBw} = S) when
+    Rate >= FullBw * ?FULL_BW_GROWTH
+->
+    (reset_full_bw(S))#bbr_state{full_bw = Rate};
+check_full_bw_reached(#bbr_state{full_bw_count = Count} = S) ->
+    Now = (Count + 1 >= ?FULL_BW_ROUNDS),
+    S#bbr_state{
+        full_bw_count = Count + 1,
+        full_bw_now = Now,
+        full_bw_reached = S#bbr_state.full_bw_reached orelse Now
+    }.
+
+check_startup_done(S) ->
+    case S of
+        #bbr_state{mode = startup, full_bw_reached = true} -> enter_drain(S);
+        _ -> S
+    end.
+
+enter_drain(#bbr_state{round_count = Round} = S) ->
     S#bbr_state{
         mode = drain,
         pacing_gain = ?DRAIN_PACING_GAIN,
         cwnd_gain = ?DEFAULT_CWND_GAIN,
-        hystart_rtt_sample_count = 0,
-        hystart_last_rtt = 0,
-        hystart_curr_rtt = infinity
+        drain_start_round = Round
     }.
 
-%% Drain ends once in flight is down to the BDP.
-run_drain(#bbr_state{bytes_in_flight = InFlight, max_datagram_size = MDS} = S) ->
-    case InFlight =< max(bdp(S), ?MIN_PIPE_CWND_PKTS * MDS) of
-        true -> enter_probe_bw(S);
+check_drain_done(#bbr_state{mode = drain} = S, Now) ->
+    #bbr_state{bytes_in_flight = InFlight, round_count = Round, drain_start_round = Start} = S,
+    case (InFlight =< inflight(S, 1.0)) orelse (Round > Start + ?DRAIN_MAX_ROUNDS) of
+        true -> enter_probe_bw(S, Now);
         false -> S
-    end.
+    end;
+check_drain_done(S, _Now) ->
+    S.
 
-enter_probe_bw(S) ->
+%%====================================================================
+%% ProbeBW (Section 5.3.3)
+%%====================================================================
+
+enter_probe_bw(S, Now) ->
+    start_probe_bw_down(S#bbr_state{cwnd_gain = ?DEFAULT_CWND_GAIN}, Now).
+
+start_probe_bw_down(S0, Now) ->
+    S = pick_probe_wait(S0),
+    (start_round(S))#bbr_state{
+        probe_up_acked_per_inc = infinity,
+        cycle_stamp = Now,
+        is_bw_probe_stopping = true,
+        mode = probe_bw_down,
+        pacing_gain = ?PROBE_BW_DOWN_PACING_GAIN,
+        cwnd_gain = ?DEFAULT_CWND_GAIN
+    }.
+
+start_probe_bw_cruise(S) ->
     S#bbr_state{
         mode = probe_bw_cruise,
         pacing_gain = ?PROBE_BW_CRUISE_PACING_GAIN,
         cwnd_gain = ?DEFAULT_CWND_GAIN
     }.
 
-%% DOWN until in flight is at the BDP, CRUISE for an ACK, REFILL until
-%% in flight reaches the BDP, UP for an ACK.
-advance_probe_bw_phase(
-    #bbr_state{mode = Mode, bytes_in_flight = InFlight, max_datagram_size = MDS} = S
-) ->
-    Bdp = max(bdp(S), ?MIN_PIPE_CWND_PKTS * MDS),
-    case Mode of
-        probe_bw_down when InFlight =< Bdp ->
-            S#bbr_state{mode = probe_bw_cruise, pacing_gain = ?PROBE_BW_CRUISE_PACING_GAIN};
-        probe_bw_cruise ->
-            S#bbr_state{mode = probe_bw_refill, pacing_gain = ?PROBE_BW_REFILL_PACING_GAIN};
-        probe_bw_refill when InFlight >= Bdp ->
-            S#bbr_state{mode = probe_bw_up, pacing_gain = ?PROBE_BW_UP_PACING_GAIN};
-        probe_bw_up ->
-            advance_max_bw_filter(S#bbr_state{
-                mode = probe_bw_down, pacing_gain = ?PROBE_BW_DOWN_PACING_GAIN
-            });
-        _ ->
-            S
-    end.
-
-enter_probe_rtt(#bbr_state{cwnd = Cwnd} = S, Now) ->
-    S#bbr_state{
-        mode = probe_rtt,
-        prior_cwnd = Cwnd,
-        cwnd_gain = ?PROBE_RTT_CWND_GAIN,
-        probe_rtt_done_stamp = Now + ?PROBE_RTT_DURATION
+start_probe_bw_refill(S) ->
+    (start_round(reset_short_term_model(S)))#bbr_state{
+        bw_probe_up_rounds = 0,
+        bw_probe_up_acked = 0,
+        prev_probe_precautionary = false,
+        is_bw_probe_stopping = false,
+        mode = probe_bw_refill,
+        pacing_gain = ?PROBE_BW_REFILL_PACING_GAIN,
+        cwnd_gain = ?DEFAULT_CWND_GAIN
     }.
 
-%% ProbeRTT lasts 200 ms and until in flight is down to the minimum
-%% window, then restores cwnd.
-run_probe_rtt(#bbr_state{probe_rtt_done_stamp = Done, bytes_in_flight = InFlight} = S, Now) ->
-    case (Now >= Done) andalso (InFlight =< S#bbr_state.minimum_window) of
-        true ->
-            (enter_probe_bw(S))#bbr_state{cwnd = S#bbr_state.prior_cwnd, min_rtt_stamp = Now};
+start_probe_bw_up(#bbr_state{rs = #rs{delivery_rate = Rate}} = S) ->
+    S1 = (reset_full_bw(start_round(S)))#bbr_state{
+        full_bw = Rate,
+        mode = probe_bw_up,
+        pacing_gain = ?PROBE_BW_UP_PACING_GAIN,
+        cwnd_gain = ?PROBE_BW_UP_CWND_GAIN
+    },
+    raise_inflight_longterm_slope(S1).
+
+is_in_probe_bw(probe_bw_down) -> true;
+is_in_probe_bw(probe_bw_cruise) -> true;
+is_in_probe_bw(probe_bw_refill) -> true;
+is_in_probe_bw(probe_bw_up) -> true;
+is_in_probe_bw(_) -> false.
+
+%% Section 5.3.3.9 UpdateProbeBWCyclePhase.
+update_probe_bw_cycle_phase(#bbr_state{full_bw_reached = false} = S, _Now) ->
+    S;
+update_probe_bw_cycle_phase(S0, Now) ->
+    case adapt_long_term_model(S0) of
+        {true, S} ->
+            S;
+        {false, #bbr_state{mode = Mode} = S} ->
+            case is_in_probe_bw(Mode) of
+                true -> probe_bw_phase(Mode, S, Now);
+                false -> S
+            end
+    end.
+
+probe_bw_phase(probe_bw_down, S, Now) ->
+    case is_time_to_probe_bw(S, Now) of
+        {true, S1} ->
+            S1;
         false ->
-            S
+            case is_time_to_cruise(S) of
+                true -> start_probe_bw_cruise(S);
+                false -> S
+            end
+    end;
+probe_bw_phase(probe_bw_cruise, S, Now) ->
+    case is_time_to_probe_bw(S, Now) of
+        {true, S1} -> S1;
+        false -> S
+    end;
+probe_bw_phase(probe_bw_refill, #bbr_state{round_start = true} = S, _Now) ->
+    start_probe_bw_up(S#bbr_state{check_probe_loss = true});
+probe_bw_phase(probe_bw_refill, S, _Now) ->
+    S;
+probe_bw_phase(probe_bw_up, S0, Now) ->
+    case is_time_to_go_down(S0) of
+        {true, S} -> start_probe_bw_down(S#bbr_state{prev_probe_too_high = false}, Now);
+        {false, S} -> S
+    end.
+
+%% Section 5.3.3.8.3: after a random 2-3 s or a Reno-scale round count.
+is_time_to_probe_bw(#bbr_state{cycle_stamp = Stamp, bw_probe_wait = Wait} = S, Now) ->
+    case (Now > Stamp + Wait) orelse is_reno_coexistence_probe_time(S) of
+        true -> {true, start_probe_bw_refill(S)};
+        false -> false
+    end.
+
+pick_probe_wait(S) ->
+    S#bbr_state{
+        rounds_since_probe_up = rand:uniform(2) - 1,
+        bw_probe_wait = ?PROBE_WAIT_BASE + rand:uniform(?PROBE_WAIT_RAND + 1) - 1
+    }.
+
+%% Target inflight in packets, the unit the round bound is counted in.
+is_reno_coexistence_probe_time(
+    #bbr_state{rounds_since_probe_up = Rounds, max_datagram_size = MDS} = S
+) ->
+    RenoRounds = target_inflight(S) div MDS,
+    Rounds >= min(RenoRounds, ?RENO_ROUNDS_BOUND).
+
+target_inflight(#bbr_state{cwnd = Cwnd} = S) ->
+    min(bdp(S), Cwnd).
+
+is_time_to_cruise(#bbr_state{bytes_in_flight = InFlight, max_bw = MaxBw} = S) ->
+    (InFlight =< inflight_with_headroom(S)) andalso
+        (InFlight =< quantization_budget(S, bdp_multiple(S, MaxBw, 1.0))).
+
+%% Section 5.3.3.7: on a bandwidth plateau, or at the last loss level.
+is_time_to_go_down(
+    #bbr_state{prev_probe_too_high = true, bytes_in_flight = InFlight, inflight_longterm = Hi} = S
+) when InFlight >= Hi ->
+    {true, S#bbr_state{prev_probe_precautionary = true}};
+is_time_to_go_down(#bbr_state{cwnd = Cwnd, inflight_longterm = Hi, rs = RS} = S) ->
+    case is_cwnd_limited(S) andalso (Cwnd >= Hi) of
+        true ->
+            {false, (reset_full_bw(S))#bbr_state{full_bw = RS#rs.delivery_rate}};
+        false ->
+            {S#bbr_state.full_bw_now, S}
+    end.
+
+is_cwnd_limited(#bbr_state{cwnd_limited_now = Now, cwnd_limited_prev = Prev}) ->
+    Now orelse Prev.
+
+inflight_with_headroom(#bbr_state{inflight_longterm = infinity}) ->
+    infinity;
+inflight_with_headroom(#bbr_state{inflight_longterm = Hi, max_datagram_size = MDS} = S) ->
+    Headroom = max(MDS, trunc(?HEADROOM * Hi)),
+    max(Hi - Headroom, min_pipe_cwnd(S)).
+
+raise_inflight_longterm_slope(#bbr_state{bw_probe_up_rounds = Rounds, cwnd = Cwnd} = S) ->
+    Growth = 1 bsl Rounds,
+    S#bbr_state{
+        bw_probe_up_rounds = min(Rounds + 1, ?MAX_PROBE_UP_ROUNDS),
+        probe_up_acked_per_inc = max(Cwnd div Growth, S#bbr_state.max_datagram_size)
+    }.
+
+probe_inflight_longterm_upward(#bbr_state{cwnd = Cwnd, inflight_longterm = Hi} = S) ->
+    case is_cwnd_limited(S) andalso (Cwnd >= Hi) of
+        false ->
+            S;
+        true ->
+            #bbr_state{
+                bw_probe_up_acked = Acked0,
+                probe_up_acked_per_inc = PerInc,
+                rs = #rs{newly_acked = NewlyAcked},
+                max_datagram_size = MDS
+            } = S,
+            Acked = Acked0 + NewlyAcked,
+            S1 =
+                case Acked >= PerInc of
+                    true ->
+                        Delta = Acked div PerInc,
+                        S#bbr_state{
+                            bw_probe_up_acked = Acked - Delta * PerInc,
+                            inflight_longterm = Hi + Delta * MDS
+                        };
+                    false ->
+                        S#bbr_state{bw_probe_up_acked = Acked}
+                end,
+            case S1#bbr_state.round_start of
+                true -> raise_inflight_longterm_slope(S1);
+                false -> S1
+            end
+    end.
+
+%% Section 5.3.3.9 AdaptLongTermModel; `{true, S}' when it changed state.
+adapt_long_term_model(#bbr_state{is_bw_probe_stopping = true, round_start = true} = S0) ->
+    #bbr_state{mode = Mode, rs = #rs{is_app_limited = AppLimited}} = S0,
+    S1 = S0#bbr_state{check_probe_loss = false, is_bw_probe_stopping = false},
+    S2 =
+        case is_in_probe_bw(Mode) andalso (not AppLimited) of
+            true -> advance_max_bw_filter(S1);
+            false -> S1
+        end,
+    case
+        is_in_probe_bw(Mode) andalso S2#bbr_state.prev_probe_precautionary andalso
+            (not S2#bbr_state.prev_probe_too_high)
+    of
+        true -> {true, start_probe_bw_refill(S2)};
+        false -> adapt_upper_bounds(S2)
+    end;
+adapt_long_term_model(S) ->
+    adapt_upper_bounds(S).
+
+adapt_upper_bounds(#bbr_state{rs = RS} = S) ->
+    case is_inflight_too_high(RS) of
+        true ->
+            {false, S};
+        false ->
+            case S#bbr_state.inflight_longterm of
+                infinity ->
+                    {false, S};
+                Hi ->
+                    S1 = S#bbr_state{inflight_longterm = max(Hi, RS#rs.tx_in_flight)},
+                    case S1#bbr_state.mode of
+                        probe_bw_up -> {false, probe_inflight_longterm_upward(S1)};
+                        _ -> {false, S1}
+                    end
+            end
     end.
 
 %%====================================================================
-%% HyStart++ (RFC 9406)
+%% ProbeRTT (Section 5.3.4)
 %%====================================================================
 
-hystart_should_exit(#bbr_state{
-    hystart_enabled = true,
-    hystart_rtt_sample_count = Samples,
-    hystart_curr_rtt = CurrRtt,
-    hystart_last_rtt = LastRtt
-}) when Samples >= ?HYSTART_MIN_SAMPLES, is_integer(CurrRtt), CurrRtt > 0, LastRtt > 0 ->
-    (CurrRtt - LastRtt) > rtt_threshold(LastRtt);
-hystart_should_exit(_) ->
-    false.
+check_probe_rtt(
+    #bbr_state{mode = Mode, min_rtt_expired = true, idle_restart = false} = S0, Now
+) when
+    Mode =/= probe_rtt
+->
+    S1 = enter_probe_rtt(save_cwnd(S0)),
+    S2 = (start_round(S1))#bbr_state{probe_rtt_done_stamp = 0, is_bw_probe_stopping = true},
+    finish_check_probe_rtt(handle_probe_rtt(S2, Now));
+check_probe_rtt(#bbr_state{mode = probe_rtt} = S, Now) ->
+    finish_check_probe_rtt(handle_probe_rtt(S, Now));
+check_probe_rtt(S, _Now) ->
+    finish_check_probe_rtt(S).
 
-rtt_threshold(LastRtt) ->
-    max(
-        ?HYSTART_MIN_RTT_THRESH, min(LastRtt div ?HYSTART_MIN_RTT_DIVISOR, ?HYSTART_MAX_RTT_THRESH)
-    ).
-
-update_hystart_rtt(
-    #bbr_state{
-        hystart_enabled = true,
-        mode = startup,
-        hystart_curr_rtt = CurrRtt,
-        hystart_rtt_sample_count = Count
-    } = S,
-    Rtt
-) ->
-    S#bbr_state{hystart_curr_rtt = min(CurrRtt, Rtt), hystart_rtt_sample_count = Count + 1};
-update_hystart_rtt(S, _Rtt) ->
+finish_check_probe_rtt(#bbr_state{rs = #rs{delivered = D}} = S) when D > 0 ->
+    S#bbr_state{idle_restart = false};
+finish_check_probe_rtt(S) ->
     S.
+
+enter_probe_rtt(S) ->
+    S#bbr_state{
+        mode = probe_rtt,
+        pacing_gain = ?PROBE_RTT_PACING_GAIN,
+        cwnd_gain = ?PROBE_RTT_CWND_GAIN
+    }.
+
+handle_probe_rtt(S0, Now) ->
+    S = mark_app_limited(S0),
+    #bbr_state{probe_rtt_done_stamp = Done, bytes_in_flight = InFlight} = S,
+    case Done of
+        0 ->
+            case InFlight =< probe_rtt_cwnd(S) of
+                true ->
+                    (start_round(S))#bbr_state{
+                        probe_rtt_done_stamp = Now + ?PROBE_RTT_DURATION,
+                        probe_rtt_round_done = false
+                    };
+                false ->
+                    S
+            end;
+        _ ->
+            S1 =
+                case S#bbr_state.round_start of
+                    true -> S#bbr_state{probe_rtt_round_done = true};
+                    false -> S
+                end,
+            case S1#bbr_state.probe_rtt_round_done of
+                true -> check_probe_rtt_done(S1, Now);
+                false -> S1
+            end
+    end.
+
+check_probe_rtt_done(#bbr_state{probe_rtt_done_stamp = Done} = S, Now) when
+    Done =/= 0, Now > Done
+->
+    exit_probe_rtt(restore_cwnd(S#bbr_state{min_rtt_stamp = Now}), Now);
+check_probe_rtt_done(S, _Now) ->
+    S.
+
+exit_probe_rtt(S0, Now) ->
+    S = reset_short_term_model(S0),
+    case S#bbr_state.full_bw_reached of
+        true -> start_probe_bw_cruise(start_probe_bw_down(S, Now));
+        false -> enter_startup(S)
+    end.
+
+probe_rtt_cwnd(#bbr_state{probe_rtt_cwnd = Saved} = S) ->
+    max(min(bdp_multiple(S, ?PROBE_RTT_CWND_GAIN), Saved), min_pipe_cwnd(S)).
 
 %%====================================================================
 %% Loss
@@ -680,6 +912,16 @@ on_packets_lost_at(S, LostBytes, _Now) ->
         lost = Lost + LostBytes,
         loss_in_round = LossInRound + LostBytes
     }).
+
+%% QUIC has selective acknowledgments, so only the loss rate counts.
+is_inflight_too_high(#rs{lost = Lost, tx_in_flight = TxInFlight}) ->
+    Lost > TxInFlight * ?LOSS_THRESH.
+
+reset_short_term_model(S) ->
+    S#bbr_state{bw_shortterm = infinity, inflight_shortterm = infinity}.
+
+bound_bw_for_model(#bbr_state{max_bw = MaxBw, bw_shortterm = BwLo} = S) ->
+    S#bbr_state{bw = min(MaxBw, BwLo)}.
 
 %% @doc Handle a congestion event (packet loss detected).
 -spec on_congestion_event(cc_state(), non_neg_integer()) -> cc_state().
@@ -750,7 +992,7 @@ on_persistent_congestion(State) ->
 %% @doc Persistent congestion declared at time `Now'.
 -spec on_persistent_congestion_at(cc_state(), integer()) -> cc_state().
 on_persistent_congestion_at(#bbr_state{minimum_window = MinimumWindow} = S, _Now) ->
-    (enter_startup(S))#bbr_state{
+    (reset_full_bw(enter_startup(S)))#bbr_state{
         cwnd = MinimumWindow,
         max_bw = 0,
         bw_hi_cur = 0,
@@ -758,12 +1000,8 @@ on_persistent_congestion_at(#bbr_state{minimum_window = MinimumWindow} = S, _Now
         min_rtt = infinity,
         in_recovery = false,
         recovery_start = 0,
-        full_bw = 0,
-        full_bw_count = 0,
-        inflight_hi = infinity,
-        hystart_rtt_sample_count = 0,
-        hystart_last_rtt = 0,
-        hystart_curr_rtt = infinity
+        full_bw_reached = false,
+        inflight_hi = infinity
     }.
 
 %% @doc Detect persistent congestion from lost packets.
@@ -789,8 +1027,29 @@ min_pipe_cwnd(#bbr_state{max_datagram_size = MDS, minimum_window = MinWindow}) -
 
 bdp(#bbr_state{min_rtt = infinity}) ->
     0;
-bdp(#bbr_state{max_bw = MaxBw, min_rtt = MinRtt}) ->
-    (MaxBw * MinRtt) div ?US_PER_SEC.
+bdp(#bbr_state{bw = Bw, min_rtt = MinRtt}) ->
+    (Bw * MinRtt) div ?US_PER_SEC.
+
+bdp_multiple(#bbr_state{bw = Bw} = S, Gain) ->
+    bdp_multiple(S, Bw, Gain).
+
+bdp_multiple(#bbr_state{min_rtt = infinity, initial_window = IW}, _Bw, _Gain) ->
+    IW;
+bdp_multiple(#bbr_state{min_rtt = MinRtt}, Bw, Gain) ->
+    trunc(Gain * ((Bw * MinRtt) div ?US_PER_SEC)).
+
+%% Section 5.6.4.2; the QUIC offload budget is one send quantum.
+quantization_budget(
+    #bbr_state{send_quantum = Quantum, mode = Mode, max_datagram_size = MDS} = S, Cap
+) ->
+    Cap1 = max(max(Cap, Quantum), min_pipe_cwnd(S)),
+    case Mode of
+        probe_bw_up -> Cap1 + 2 * MDS;
+        _ -> Cap1
+    end.
+
+inflight(S, Gain) ->
+    quantization_budget(S, bdp_multiple(S, Gain)).
 
 %% cwnd is cwnd_gain x BDP, at least four packets.
 set_cwnd(#bbr_state{cwnd_gain = Gain, max_datagram_size = MDS} = S) ->
@@ -806,14 +1065,23 @@ cap_cwnd(#bbr_state{mode = Mode, inflight_hi = Hi, cwnd = Cwnd} = S) when
 cap_cwnd(S) ->
     S.
 
+%% Section 5.6.4.4.
+save_cwnd(#bbr_state{in_recovery = false, mode = Mode, cwnd = Cwnd} = S) when Mode =/= probe_rtt ->
+    S#bbr_state{prior_cwnd = Cwnd};
+save_cwnd(#bbr_state{prior_cwnd = Prior, cwnd = Cwnd} = S) ->
+    S#bbr_state{prior_cwnd = max(Prior, Cwnd)}.
+
+restore_cwnd(#bbr_state{prior_cwnd = Prior, cwnd = Cwnd} = S) ->
+    S#bbr_state{cwnd = max(Cwnd, Prior)}.
+
 %%====================================================================
 %% Pacing rate and send quantum (Sections 5.6.2, 5.6.3)
 %%====================================================================
 
-%% Pacing rate is pacing_gain x max_bw less 1%; no sample, no change.
-set_pacing_rate(#bbr_state{max_bw = 0} = S) ->
+%% Pacing rate is pacing_gain x bw less 1%; no sample, no change.
+set_pacing_rate(#bbr_state{bw = 0} = S) ->
     S;
-set_pacing_rate(#bbr_state{max_bw = Bw, pacing_gain = Gain, max_datagram_size = MDS} = S) ->
+set_pacing_rate(#bbr_state{bw = Bw, pacing_gain = Gain, max_datagram_size = MDS} = S) ->
     Rate = max(1, trunc(Gain * Bw * (100 - ?PACING_MARGIN_PERCENT) / 100)),
     S#bbr_state{pacing_rate = Rate, send_quantum = pacing_max_burst(MDS, Rate)}.
 
@@ -821,10 +1089,8 @@ set_pacing_rate(#bbr_state{max_bw = Bw, pacing_gain = Gain, max_datagram_size = 
 pacing_max_burst(MDS, PacingRate) ->
     max(12 * MDS, PacingRate div 500).
 
-%% @doc Feed the smoothed RTT (ms) to HyStart++.
+%% @doc BBR paces from its own model; the smoothed RTT is not used.
 -spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
-update_pacing_rate(State, SmoothedRTT) when SmoothedRTT > 0 ->
-    update_hystart_rtt(State, SmoothedRTT);
 update_pacing_rate(State, _SmoothedRTT) ->
     State.
 
@@ -1057,14 +1323,23 @@ info(#bbr_state{} = S) ->
         round_count => S#bbr_state.round_count,
         cycle_count => S#bbr_state.cycle_count,
         max_bw => S#bbr_state.max_bw,
+        bw => S#bbr_state.bw,
+        bw_shortterm => S#bbr_state.bw_shortterm,
         min_rtt => S#bbr_state.min_rtt,
         bdp => bdp(S),
+        inflight_longterm => S#bbr_state.inflight_longterm,
+        inflight_shortterm => S#bbr_state.inflight_shortterm,
+        full_bw_reached => S#bbr_state.full_bw_reached,
+        full_bw_now => S#bbr_state.full_bw_now,
         full_bw => S#bbr_state.full_bw,
         full_bw_count => S#bbr_state.full_bw_count,
         delivery_rate => (S#bbr_state.rs)#rs.delivery_rate,
         rs_app_limited => (S#bbr_state.rs)#rs.is_app_limited,
+        idle_restart => S#bbr_state.idle_restart,
         in_recovery => S#bbr_state.in_recovery,
         prior_cwnd => S#bbr_state.prior_cwnd,
+        prev_probe_too_high => S#bbr_state.prev_probe_too_high,
+        bw_probe_wait => S#bbr_state.bw_probe_wait,
         probe_rtt_done_stamp => S#bbr_state.probe_rtt_done_stamp,
         sent_packets => queue:len(S#bbr_state.sent)
     }.
