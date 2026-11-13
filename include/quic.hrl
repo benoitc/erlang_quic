@@ -752,7 +752,10 @@
     ack_ranges :: [{non_neg_integer(), non_neg_integer()}],
     %% Packet numbers below this are no longer accepted.
     recv_floor = 0 :: non_neg_integer(),
-    ack_eliciting_in_flight :: non_neg_integer()
+    ack_eliciting_in_flight :: non_neg_integer(),
+    %% Highest ECN-CE count the peer reported for this space (RFC 9002
+    %% Appendix B.7).
+    ecn_ce_count = 0 :: non_neg_integer()
 }).
 
 %% QUIC packet

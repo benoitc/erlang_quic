@@ -40,7 +40,6 @@
     on_packets_acked/3,
     on_packets_lost/2,
     on_congestion_event/2,
-    on_ecn_ce/2,
     on_persistent_congestion/1,
     detect_persistent_congestion/3,
     update_pacing_rate/2,
@@ -61,8 +60,7 @@
     pacing_delay/2,
     send_check/3,
     max_datagram_size/1,
-    min_recovery_duration/1,
-    ecn_ce_counter/1
+    min_recovery_duration/1
 ]).
 
 %%====================================================================
@@ -139,7 +137,6 @@
     undo = undefined ::
         {non_neg_integer(), non_neg_integer() | infinity, non_neg_integer(), non_neg_integer()}
         | undefined,
-    ecn_ce_counter = 0 :: non_neg_integer(),
     first_sent_time :: non_neg_integer() | undefined,
 
     %% HyStart++ state (RFC 9406)
@@ -729,70 +726,6 @@ on_spurious_congestion(#cubic_state{undo = {Cwnd, SSThresh, WMax, WLastMax}, cwn
     }.
 
 %%====================================================================
-%% ECN Support
-%%====================================================================
-
-%% @doc Handle ECN-CE signal.
--spec on_ecn_ce(cc_state(), non_neg_integer()) -> cc_state().
-on_ecn_ce(#cubic_state{ecn_ce_counter = OldCount} = State, NewCECount) when
-    NewCECount =< OldCount
-->
-    State;
-on_ecn_ce(#cubic_state{in_recovery = true, ecn_ce_counter = OldCount} = State, NewCECount) when
-    NewCECount > OldCount
-->
-    State#cubic_state{ecn_ce_counter = NewCECount};
-on_ecn_ce(
-    #cubic_state{
-        cwnd = Cwnd,
-        w_last_max = WLastMax,
-        minimum_window = MinimumWindow
-    } = State,
-    NewCECount
-) ->
-    Now = erlang:monotonic_time(millisecond),
-
-    %% Fast convergence for ECN (RFC 9438 Section 4.7)
-    {NewWMax, NewWLastMax} =
-        case Cwnd < WLastMax of
-            true ->
-                %% Fast convergence: W_max = cwnd * (1 + beta) / 2
-                FastConvergenceWMax = trunc(Cwnd * ?FAST_CONVERGENCE_FACTOR),
-                {FastConvergenceWMax, Cwnd};
-            false ->
-                %% Normal case
-                {Cwnd, Cwnd}
-        end,
-
-    NewSSThresh = max(trunc(Cwnd * ?CUBIC_BETA), MinimumWindow),
-    NewCwnd = max(NewSSThresh, MinimumWindow),
-
-    State#cubic_state{
-        cwnd = NewCwnd,
-        ssthresh = NewSSThresh,
-        w_max = NewWMax,
-        w_last_max = NewWLastMax,
-        recovery_start_time = Now,
-        in_recovery = true,
-        undo = undefined,
-        ecn_ce_counter = NewCECount,
-        epoch_start = 0,
-        origin_point = 0,
-        k = 0.0,
-        tcp_cwnd = 0,
-        %% Reset HyStart++ state
-        hystart_in_css = false,
-        hystart_css_rounds = 0,
-        hystart_rtt_sample_count = 0,
-        hystart_css_baseline_rtt = infinity,
-        hystart_round_start_time = 0
-    }.
-
-%% @doc Get the current ECN-CE counter.
--spec ecn_ce_counter(cc_state()) -> non_neg_integer().
-ecn_ce_counter(#cubic_state{ecn_ce_counter = C}) -> C.
-
-%%====================================================================
 %% Persistent Congestion
 %%====================================================================
 
@@ -1050,7 +983,6 @@ reset_for_retry(#cubic_state{initial_window = IW} = State) ->
         in_recovery = false,
         recovery_start_time = undefined,
         first_sent_time = undefined,
-        ecn_ce_counter = 0,
         w_max = 0,
         w_last_max = 0,
         k = 0.0,

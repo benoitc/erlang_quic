@@ -56,7 +56,6 @@
     on_packets_acked/3,
     on_packets_lost/2,
     on_congestion_event/2,
-    on_ecn_ce/2,
     on_persistent_congestion/1,
     detect_persistent_congestion/3,
     update_pacing_rate/2,
@@ -77,8 +76,7 @@
     pacing_delay/2,
     send_check/3,
     max_datagram_size/1,
-    min_recovery_duration/1,
-    ecn_ce_counter/1
+    min_recovery_duration/1
 ]).
 
 %% Application-limited marking and explicit-clock entry points
@@ -89,7 +87,6 @@
     on_packets_acked_at/3,
     on_packets_lost_at/3,
     on_congestion_event_at/3,
-    on_ecn_ce_at/3,
     on_persistent_congestion_at/2,
     info/1
 ]).
@@ -257,7 +254,7 @@
     prev_probe_precautionary = false :: boolean(),
 
     %% Undo (Section 2.15)
-    undo_state = none :: none | startup | probe_bw_up | ce,
+    undo_state = none :: none | startup | probe_bw_up,
     undo_bw_shortterm = 0 :: volume(),
     undo_inflight_shortterm = 0 :: volume(),
     undo_inflight_longterm = 0 :: volume(),
@@ -271,9 +268,6 @@
     %% Loss recovery (RFC 9002 Section 7.3.2)
     in_recovery = false :: boolean(),
     recovery_start = 0 :: integer(),
-
-    %% ECN
-    ecn_ce_counter = 0 :: non_neg_integer(),
 
     %% Pacing (Sections 5.6.2, 5.6.3)
     pacing_rate = 0 :: non_neg_integer(),
@@ -1022,7 +1016,7 @@ lose_bytes(S, 0, _Now) ->
 lose_bytes(#bbr_state{sent = Sent, lost = Lost} = S, Bytes, Now) ->
     case queue:out(Sent) of
         {empty, _} ->
-            note_loss(S#bbr_state{lost = Lost + Bytes}, 1);
+            note_loss(S#bbr_state{lost = Lost + Bytes});
         {{value, #pkt{size = Size} = P}, Rest} when Size =< Bytes ->
             S1 = handle_lost_packet(S#bbr_state{sent = Rest, lost = Lost + Size}, P, Now),
             lose_bytes(S1, Bytes - Size, Now);
@@ -1033,16 +1027,16 @@ lose_bytes(#bbr_state{sent = Sent, lost = Lost} = S, Bytes, Now) ->
             handle_lost_packet(S1, P#pkt{size = Bytes}, Now)
     end.
 
-%% Section 5.5.10.2 NoteLoss, for Events lost or CE-marked packets.
-note_loss(#bbr_state{is_loss_in_round = false, delivered = Delivered} = S, Events) ->
+%% Section 5.5.10.2 NoteLoss.
+note_loss(#bbr_state{is_loss_in_round = false, delivered = Delivered} = S) ->
     S1 = save_state_upon_loss(S#bbr_state{loss_round_delivered = Delivered}),
-    note_loss(S1#bbr_state{is_loss_in_round = true}, Events);
-note_loss(#bbr_state{loss_events_in_round = N} = S, Events) ->
-    S#bbr_state{loss_events_in_round = N + Events}.
+    note_loss(S1#bbr_state{is_loss_in_round = true});
+note_loss(#bbr_state{loss_events_in_round = N} = S) ->
+    S#bbr_state{loss_events_in_round = N + 1}.
 
 %% Section 5.5.10.2 HandleLostPacket.
 handle_lost_packet(S0, P, Now) ->
-    S = note_loss(S0, 1),
+    S = note_loss(S0),
     case S#bbr_state.check_probe_loss of
         false ->
             S;
@@ -1176,8 +1170,9 @@ reset_short_term_model(S) ->
 bound_bw_for_model(#bbr_state{max_bw = MaxBw, bw_shortterm = BwLo} = S) ->
     S#bbr_state{bw = min(MaxBw, BwLo)}.
 
-%% @doc Enter recovery when a packet sent after the current recovery
-%% period started is lost (RFC 9002 Section 7.3.2).
+%% @doc A congestion event, a loss or an ECN-CE increase (RFC 9002
+%% Section 7.1), enters recovery unless the packet was sent before the
+%% current recovery period started (RFC 9002 Section 7.3.2).
 -spec on_congestion_event(cc_state(), non_neg_integer()) -> cc_state().
 on_congestion_event(State, SentTimeMs) ->
     on_congestion_event_at(State, SentTimeMs, now_us()).
@@ -1208,48 +1203,8 @@ save_state_upon_loss(S0) ->
         undo_inflight_longterm = S#bbr_state.inflight_longterm
     }.
 
-%% @doc Treat newly CE-marked packets as lost (Section 3.7): they count
-%% towards the loss rate and start a recovery period. A later spurious
-%% loss signal does not undo them.
--spec on_ecn_ce(cc_state(), non_neg_integer()) -> cc_state().
-on_ecn_ce(State, NewCECount) ->
-    on_ecn_ce_at(State, NewCECount, now_us()).
-
-%% @doc ECN-CE count `NewCECount' reported at time `Now'.
--spec on_ecn_ce_at(cc_state(), non_neg_integer(), integer()) -> cc_state().
-on_ecn_ce_at(#bbr_state{ecn_ce_counter = Old} = S, NewCECount, _Now) when NewCECount =< Old ->
-    S;
-on_ecn_ce_at(
-    #bbr_state{ecn_ce_counter = Old, max_datagram_size = MDS, lost = Lost} = S0, NewCECount, Now
-) ->
-    Marks = NewCECount - Old,
-    S1 = note_loss(S0#bbr_state{ecn_ce_counter = NewCECount, lost = Lost + Marks * MDS}, Marks),
-    S2 =
-        case S1#bbr_state.check_probe_loss of
-            true -> check_ce_probe_loss(S1, Now);
-            false -> S1
-        end,
-    S3 =
-        case S2#bbr_state.in_recovery of
-            true -> S2;
-            false -> enter_recovery(S2, Now)
-        end,
-    S3#bbr_state{undo_state = ce}.
-
-%% CE marks while probing weigh like losses.
-check_ce_probe_loss(#bbr_state{rs = #rs{has_data = true} = RS0, lost = Lost} = S, Now) ->
-    RS = RS0#rs{lost = Lost - RS0#rs.prior_lost},
-    case is_inflight_too_high(RS) of
-        true -> handle_inflight_too_high(S, RS, Now);
-        false -> S
-    end;
-check_ce_probe_loss(S, _Now) ->
-    S.
-
 %% @doc Undo a loss recovery episode found to be spurious (Section 5.5.11.2).
 -spec on_spurious_congestion(cc_state()) -> cc_state().
-on_spurious_congestion(#bbr_state{undo_state = ce} = S) ->
-    S;
 on_spurious_congestion(S0) ->
     S = reset_full_bw(restore_cwnd(S0)),
     #bbr_state{
@@ -1634,10 +1589,6 @@ max_datagram_size(#bbr_state{max_datagram_size = MDS}) -> MDS.
 %% @doc Minimum recovery duration setting, in milliseconds.
 -spec min_recovery_duration(cc_state()) -> non_neg_integer().
 min_recovery_duration(#bbr_state{min_recovery_duration = D}) -> D div 1000.
-
-%% @doc Get the current ECN-CE counter.
--spec ecn_ce_counter(cc_state()) -> non_neg_integer().
-ecn_ce_counter(#bbr_state{ecn_ce_counter = C}) -> C.
 
 %% @doc The model and control parameters, for logging and tests.
 -spec info(cc_state()) -> #{atom() => term()}.

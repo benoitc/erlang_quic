@@ -41,7 +41,6 @@
     on_packets_acked/3,
     on_packets_lost/2,
     on_congestion_event/2,
-    on_ecn_ce/2,
     on_persistent_congestion/1,
     detect_persistent_congestion/3,
     update_pacing_rate/2,
@@ -64,8 +63,7 @@
     send_check_run/4,
     on_packets_sent/2,
     max_datagram_size/1,
-    min_recovery_duration/1,
-    ecn_ce_counter/1
+    min_recovery_duration/1
 ]).
 
 %% Constants from RFC 9002
@@ -113,10 +111,6 @@
 
     %% Persistent congestion detection
     first_sent_time :: non_neg_integer() | undefined,
-
-    %% ECN state (RFC 9002 Section 7.1)
-    %% Tracks the highest ECN-CE count acknowledged
-    ecn_ce_counter = 0 :: non_neg_integer(),
 
     %% Configuration
     %% The window this controller started with. cwnd evolves away from it,
@@ -741,51 +735,6 @@ on_spurious_congestion(#cc_state{undo = {Cwnd, SSThresh}, cwnd = Now} = State) -
     }.
 
 %%====================================================================
-%% ECN Support (RFC 9002 Section 7.1)
-%%====================================================================
-
-%% @doc Handle ECN-CE (Congestion Experienced) signal from ACK.
-%% RFC 9002: An increase in ECN-CE count is treated as a congestion signal.
-%% NewCECount is the ECN-CE count from the received ACK frame.
-%% SentTime is the time when the largest acknowledged packet was sent.
--spec on_ecn_ce(cc_state(), non_neg_integer()) -> cc_state().
-on_ecn_ce(#cc_state{ecn_ce_counter = OldCount} = State, NewCECount) when
-    NewCECount =< OldCount
-->
-    %% No new CE marks, no action needed
-    State;
-on_ecn_ce(#cc_state{in_recovery = true, ecn_ce_counter = OldCount} = State, NewCECount) when
-    NewCECount > OldCount
-->
-    %% Already in recovery, just update counter
-    State#cc_state{ecn_ce_counter = NewCECount};
-on_ecn_ce(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} = State, NewCECount) ->
-    %% RFC 9002: ECN-CE triggers the same response as packet loss
-    %% Enter recovery: ssthresh = cwnd * kLossReductionFactor
-    Now = erlang:monotonic_time(millisecond),
-    NewSSThresh = max(trunc(Cwnd * ?LOSS_REDUCTION_FACTOR), MinimumWindow),
-    NewCwnd = max(NewSSThresh, MinimumWindow),
-
-    State#cc_state{
-        cwnd = NewCwnd,
-        ssthresh = NewSSThresh,
-        recovery_start_time = Now,
-        in_recovery = true,
-        undo = undefined,
-        ecn_ce_counter = NewCECount,
-        %% Reset HyStart++ state
-        hystart_in_css = false,
-        hystart_css_rounds = 0,
-        hystart_rtt_sample_count = 0,
-        hystart_css_baseline_rtt = infinity,
-        hystart_round_start_time = 0
-    }.
-
-%% @doc Get the current ECN-CE counter.
--spec ecn_ce_counter(cc_state()) -> non_neg_integer().
-ecn_ce_counter(#cc_state{ecn_ce_counter = C}) -> C.
-
-%%====================================================================
 %% Queries
 %%====================================================================
 
@@ -809,7 +758,6 @@ reset_for_retry(#cc_state{initial_window = IW} = State) ->
         in_recovery = false,
         recovery_start_time = undefined,
         first_sent_time = undefined,
-        ecn_ce_counter = 0,
         pacing_tokens = State#cc_state.pacing_max_burst,
         pacing_rate = 0
     }.

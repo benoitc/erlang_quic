@@ -215,26 +215,30 @@ consume_app(#{app := #{pending := P} = App} = Sim) ->
 
 %% One ACK per delivered packet; lost packets three or more behind it
 %% are declared lost in the same ACK, as RFC 9002 packet threshold does.
+%% The controller sees the ACK in RFC 9002 Appendix A.7 order: the CE
+%% mark, the losses, then the acknowledged packet.
 ack_packet(#{now := Now, flight := F, undeclared := Undeclared, cc := CC0} = Sim) ->
     CC1 =
         case has_data(Sim) of
             true -> CC0;
             false -> quic_cc_bbr:on_app_limited(CC0)
         end,
-    {{value, {AckSeq, Size, _, Now, Ce}}, F1} = queue:out(F),
+    {{value, {AckSeq, Size, Sent, Now, Ce}}, F1} = queue:out(F),
     {Lost, Still} = lists:partition(fun({S, _, _, _, _}) -> S + 3 =< AckSeq end, Undeclared),
     {F2, Undeclared1} = normalize(F1, Still),
-    CC2 = quic_cc_bbr:on_packets_acked_at(CC1, Size, Now),
-    Sim1 = lose(Lost, Sim#{cc := CC2, flight := F2, undeclared := Undeclared1, last_ack := Now}),
-    case Ce of
-        true ->
-            Count = maps:get(ce_count, Sim1) + 1,
-            Sim1#{
-                ce_count := Count, cc := quic_cc_bbr:on_ecn_ce_at(maps:get(cc, Sim1), Count, Now)
-            };
-        false ->
-            Sim1
-    end.
+    {CC2, CeCount} =
+        case Ce of
+            true ->
+                {
+                    quic_cc_bbr:on_congestion_event_at(CC1, Sent div ?MS, Now),
+                    maps:get(ce_count, Sim) + 1
+                };
+            false ->
+                {CC1, maps:get(ce_count, Sim)}
+        end,
+    Sim1 = lose(Lost, Sim#{cc := CC2, ce_count := CeCount}),
+    CC3 = quic_cc_bbr:on_packets_acked_at(maps:get(cc, Sim1), Size, Now),
+    Sim1#{cc := CC3, flight := F2, undeclared := Undeclared1, last_ack := Now}.
 
 lose([], Sim) ->
     Sim;
@@ -662,30 +666,25 @@ loss_while_cruising_cuts_short_term_model_test() ->
     ?assert(BwLo =< MaxBw),
     ?assertEqual(BwLo, info(Lossy, bw)).
 
-%% CE marks count as congestion (Section 3.7): with no loss at all, a
-%% marking bottleneck still ends Startup and bounds inflight.
-ecn_ce_is_congestion_test() ->
-    Sim = run_until(sim((bulk_path())#{ce_above => 20000}), not_in_mode(startup), 5 * ?SEC),
-    ?assertEqual(0, maps:get(lost_pkts, Sim)),
-    ?assert(maps:get(ce_count, Sim) > 0),
-    ?assertNot(info(Sim, full_bw_now)),
-    ?assertNotEqual(infinity, info(Sim, inflight_longterm)).
+%% A CE mark is a congestion event (RFC 9002 Section 7.1): BBR enters
+%% recovery, saving its model, without counting the mark as loss.
+ecn_ce_enters_recovery_without_loss_test() ->
+    Sim = run_until(
+        sim((bulk_path())#{ce_above => 20000}),
+        fun(S) -> maps:get(ce_count, S) > 0 end,
+        5 * ?SEC
+    ),
+    ?assert(info(Sim, in_recovery)),
+    ?assertEqual(0, info(Sim, lost)),
+    ?assertEqual(0, maps:get(lost_pkts, Sim)).
 
 ecn_ce_starts_recovery_test() ->
     T = erlang:monotonic_time(microsecond),
     S0 = quic_cc_bbr:on_packet_sent_at(quic_cc_bbr:new(#{}), 1200, T),
-    S1 = quic_cc_bbr:on_ecn_ce_at(S0, 1, T + ?MS),
+    S1 = quic_cc_bbr:on_congestion_event_at(S0, T div 1000, T + ?MS),
     ?assert(quic_cc_bbr:in_recovery(S1)),
-    ?assertEqual(1200, maps:get(lost, quic_cc_bbr:info(S1))),
-    ?assertEqual(S1, quic_cc_bbr:on_ecn_ce_at(S1, 1, T + 2 * ?MS)).
-
-%% CE marks are congestion: a spurious loss signal after them undoes
-%% nothing.
-ecn_ce_is_not_undone_test() ->
-    Sim = run_until(sim((bulk_path())#{ce_above => 20000}), not_in_mode(startup), 5 * ?SEC),
-    CC = maps:get(cc, Sim),
-    ?assertEqual(ce, maps:get(undo_state, quic_cc_bbr:info(CC))),
-    ?assertEqual(CC, quic_cc_bbr:on_spurious_congestion(CC)).
+    ?assertEqual(0, maps:get(lost, quic_cc_bbr:info(S1))),
+    ?assertEqual(quic_cc_bbr:cwnd(S0), maps:get(prior_cwnd, quic_cc_bbr:info(S1))).
 
 %% A.18: a spurious loss episode that ended Startup returns to it.
 spurious_loss_returns_to_startup_test() ->

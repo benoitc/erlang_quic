@@ -495,47 +495,6 @@ on_persistent_congestion_clears_recovery_test() ->
     ?assertNot(quic_cc:in_recovery(S2)).
 
 %%====================================================================
-%% ECN-CE Tests
-%%====================================================================
-
-ecn_ce_triggers_congestion_response_test() ->
-    State = quic_cc:new(cubic, #{}),
-    InitialCwnd = quic_cc:cwnd(State),
-    ?assertEqual(0, quic_cc:ecn_ce_counter(State)),
-    S1 = quic_cc:on_ecn_ce(State, 1),
-    ?assertEqual(1, quic_cc:ecn_ce_counter(S1)),
-    ?assert(quic_cc:in_recovery(S1)),
-    NewCwnd = quic_cc:cwnd(S1),
-    ?assert(NewCwnd < InitialCwnd).
-
-ecn_ce_uses_cubic_beta_test() ->
-    %% ECN should also use beta=0.7
-    State = quic_cc:new(cubic, #{initial_window => 100000}),
-    InitialCwnd = quic_cc:cwnd(State),
-    S1 = quic_cc:on_ecn_ce(State, 1),
-    NewCwnd = quic_cc:cwnd(S1),
-    ExpectedCwnd = trunc(InitialCwnd * 0.7),
-    ?assertEqual(ExpectedCwnd, NewCwnd).
-
-ecn_ce_ignores_old_counts_test() ->
-    State = quic_cc:new(cubic, #{}),
-    S1 = quic_cc:on_ecn_ce(State, 5),
-    Cwnd1 = quic_cc:cwnd(S1),
-    S2 = quic_cc:on_ecn_ce(S1, 3),
-    Cwnd2 = quic_cc:cwnd(S2),
-    ?assertEqual(Cwnd1, Cwnd2).
-
-ecn_ce_in_recovery_updates_counter_only_test() ->
-    State = quic_cc:new(cubic, #{}),
-    S1 = quic_cc:on_ecn_ce(State, 1),
-    Cwnd1 = quic_cc:cwnd(S1),
-    ?assert(quic_cc:in_recovery(S1)),
-    S2 = quic_cc:on_ecn_ce(S1, 2),
-    Cwnd2 = quic_cc:cwnd(S2),
-    ?assertEqual(Cwnd1, Cwnd2),
-    ?assertEqual(2, quic_cc:ecn_ce_counter(S2)).
-
-%%====================================================================
 %% Pacing Precision Tests (Phase 1 Fix)
 %%====================================================================
 

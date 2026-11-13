@@ -6342,7 +6342,9 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
                     _ ->
                         CCState
                 end,
-            CCState3 = process_ecn_counts(ECN, CCState2),
+            {CCState3, NewLossState1, State0a} = process_ecn(
+                Level, ECN, LargestAcked, AckedPackets, CCState2, NewLossState, State
+            ),
             CCState4 = cc_after_loss(
                 CCState3, LostBytes, LargestLostSentTime, LostPackets, NewLossState
             ),
@@ -6370,8 +6372,8 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
                         CCState5
                 end,
 
-            State1 = State#state{
-                loss_state = NewLossState,
+            State1 = State0a#state{
+                loss_state = NewLossState1,
                 cc_state = CCState6,
                 pto_dirty = true
             },
@@ -9732,14 +9734,36 @@ cc_after_ack(CCState, AckedBytes, SentTime, true, AckedPackets, app, LossState) 
 cc_after_ack(CCState, AckedBytes, SentTime, true, _AckedPackets, _Level, _LossState) ->
     quic_cc:on_packets_acked(CCState, AckedBytes, SentTime).
 
-%% Process ECN counts from ACK frame (RFC 9002 Section 7.1)
-%% ECN-CE indicates network congestion experienced
-process_ecn_counts(undefined, CCState) ->
-    %% No ECN information in this ACK
-    CCState;
-process_ecn_counts({_ECT0, _ECT1, ECNCE}, CCState) ->
-    %% RFC 9002: An increase in ECN-CE count triggers congestion response
-    quic_cc:on_ecn_ce(CCState, ECNCE).
+%% RFC 9002 Section 7.1 and Appendix B.7: a CE count above the last one
+%% this space reported is a congestion event for the largest
+%% acknowledged packet. It is real congestion, so the loss episode it
+%% joins can no longer be undone as spurious.
+process_ecn(Level, {_ECT0, _ECT1, CE}, LargestAcked, [_ | _] = Acked, CC, LossState, State) ->
+    case pn_space(Level, State) of
+        #pn_space{ecn_ce_count = Old} = PNSpace when CE > Old ->
+            SentTime = largest_acked_sent_time(LargestAcked, Acked),
+            {
+                quic_cc:on_congestion_event(CC, SentTime),
+                quic_loss:confirm_losses(loss_space(Level), LossState),
+                put_pn_space(Level, PNSpace#pn_space{ecn_ce_count = CE}, State)
+            };
+        _ ->
+            {CC, LossState, State}
+    end;
+process_ecn(_Level, _ECN, _LargestAcked, _Acked, CC, LossState, State) ->
+    {CC, LossState, State}.
+
+%% The largest acknowledged packet when newly acknowledged, otherwise
+%% the newest one this ACK acknowledges.
+largest_acked_sent_time(LargestAcked, Acked) ->
+    case [T || #sent_packet{pn = PN, time_sent = T} <- Acked, PN =:= LargestAcked] of
+        [T | _] -> T;
+        [] -> lists:max([T || #sent_packet{time_sent = T} <- Acked])
+    end.
+
+loss_space(initial) -> initial;
+loss_space(handshake) -> handshake;
+loss_space(_) -> app.
 
 %% @doc The congestion-control consequences of declaring packets lost,
 %% for both the ACK path and the loss-detection timer: the bytes, the
@@ -10117,6 +10141,13 @@ classify_recv_trigger(_PN, _PNSpace) ->
 pn_space(initial, State) -> (State#state.hs)#hs.pn_initial;
 pn_space(handshake, State) -> (State#state.hs)#hs.pn_handshake;
 pn_space(_, State) -> State#state.pn_app.
+
+put_pn_space(initial, PNSpace, #state{hs = HS} = State) ->
+    State#state{hs = HS#hs{pn_initial = PNSpace}};
+put_pn_space(handshake, PNSpace, #state{hs = HS} = State) ->
+    State#state{hs = HS#hs{pn_handshake = PNSpace}};
+put_pn_space(_, PNSpace, State) ->
+    State#state{pn_app = PNSpace}.
 
 %% RFC 9000 Sections 17.2 and 17.3.1: the reserved bits are zero once
 %% both protections are removed.

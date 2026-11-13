@@ -42,6 +42,7 @@
     on_packet_sent/7,
     on_packets_sent_run/4,
     on_ack_received/4,
+    confirm_losses/2,
 
     %% Retransmission
     retransmittable_frames/1,
@@ -708,6 +709,16 @@ loss_kind(PN, LargestAcked, #pn_loss{reorder_threshold = PT}) when PN =< Largest
     packet;
 loss_kind(_PN, _LargestAcked, _P) ->
     time.
+
+%% @doc A congestion signal that is not a loss, an ECN-CE mark, makes the
+%% space's current loss episode real: no late acknowledgement undoes
+%% its window cut.
+-spec confirm_losses(space(), loss_state()) -> loss_state().
+confirm_losses(Space, State) ->
+    case pn(Space, State) of
+        #pn_loss{recent_lost = []} -> State;
+        P -> set_pn(Space, P#pn_loss{loss_confirmed = true}, State)
+    end.
 
 %% Split the remembered losses into those this ACK covers (spurious) and
 %% the rest, raise the thresholds for the spurious ones, and age out

@@ -234,21 +234,6 @@ newreno_recovery_cwnd_reduction_test() ->
     ?assert(NewCwnd < InitialCwnd),
     ?assertEqual(trunc(InitialCwnd * 0.7), NewCwnd).
 
-newreno_ecn_ce_test() ->
-    State = quic_cc_newreno:new(#{}),
-    ?assertEqual(0, quic_cc_newreno:ecn_ce_counter(State)),
-    S1 = quic_cc_newreno:on_ecn_ce(State, 5),
-    ?assertEqual(5, quic_cc_newreno:ecn_ce_counter(S1)),
-    ?assert(quic_cc_newreno:in_recovery(S1)).
-
-newreno_ecn_ce_no_duplicate_test() ->
-    State = quic_cc_newreno:new(#{}),
-    S1 = quic_cc_newreno:on_ecn_ce(State, 5),
-    %% Same or lower count should not trigger again
-    S2 = quic_cc_newreno:on_ecn_ce(S1, 5),
-    S3 = quic_cc_newreno:on_ecn_ce(S2, 3),
-    ?assertEqual(5, quic_cc_newreno:ecn_ce_counter(S3)).
-
 %%====================================================================
 %% Persistent Congestion Tests
 %%====================================================================

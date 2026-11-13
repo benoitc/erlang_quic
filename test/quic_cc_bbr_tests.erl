@@ -198,21 +198,6 @@ bbr_loss_below_threshold_test() ->
     %% Should enter recovery
     ?assert(quic_cc_bbr:in_recovery(S3)).
 
-bbr_ecn_ce_test() ->
-    State = quic_cc_bbr:new(#{}),
-    ?assertEqual(0, quic_cc_bbr:ecn_ce_counter(State)),
-    S1 = quic_cc_bbr:on_ecn_ce(State, 5),
-    ?assertEqual(5, quic_cc_bbr:ecn_ce_counter(S1)),
-    ?assert(quic_cc_bbr:in_recovery(S1)).
-
-bbr_ecn_ce_no_duplicate_test() ->
-    State = quic_cc_bbr:new(#{}),
-    S1 = quic_cc_bbr:on_ecn_ce(State, 5),
-    %% Same or lower count should not trigger again
-    S2 = quic_cc_bbr:on_ecn_ce(S1, 5),
-    S3 = quic_cc_bbr:on_ecn_ce(S2, 3),
-    ?assertEqual(5, quic_cc_bbr:ecn_ce_counter(S3)).
-
 bbr_persistent_congestion_test() ->
     %% Persistent congestion is QUIC's retransmission timeout: cwnd drops
     %% to the minimum window and the model is kept.
