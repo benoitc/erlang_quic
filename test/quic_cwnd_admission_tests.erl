@@ -338,6 +338,25 @@ app_probe_is_not_stranded_behind_handshake_data_test() ->
     ?assertEqual(next_pn(S1) + 1, next_pn(S2)).
 
 %%====================================================================
+%% Entering recovery (RFC 9002 Section 7.3.2)
+%%====================================================================
+
+%% The cut leaves the window below what is in flight. The first
+%% retransmission goes out all the same; the second waits.
+first_retransmission_goes_out_on_entering_recovery_test() ->
+    S0 = in_flight_with(20, fun(PN) -> [{retire_connection_id, PN}] end),
+    %% Packet 4 acknowledged: 0 and 1 are lost by the packet threshold.
+    S1 = quic_connection:process_frame(app, {ack, [{4, 0}], 0, undefined}, S0),
+    CC = cc(S1),
+    ?assert(quic_cc:in_recovery(CC)),
+    ?assert(quic_cc:bytes_in_flight(CC) > quic_cc:cwnd(CC)),
+    [[Sent]] = [strip_immediate_ack(Fs) || Fs <- sent_frames_from(20, S1)],
+    [Held] = held(S1),
+    ?assertEqual(
+        [{retire_connection_id, 0}, {retire_connection_id, 1}], lists:sort([Sent, Held])
+    ).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -374,17 +393,17 @@ in_flight(N) ->
 
 %% The same, the oldest packet carrying OldestFrames.
 in_flight(N, OldestFrames) ->
+    in_flight_with(N, fun
+        (0) -> OldestFrames;
+        (_) -> [ping]
+    end).
+
+%% N packets in flight, packet PN carrying FramesOf(PN).
+in_flight_with(N, FramesOf) ->
     S0 = app_state(),
     Sent = erlang:monotonic_time(millisecond) - 100,
     L = lists:foldl(
-        fun(PN, Acc) ->
-            Frames =
-                case PN of
-                    0 -> OldestFrames;
-                    _ -> [ping]
-                end,
-            quic_loss:on_packet_sent(app, Acc, PN, ?PKT, true, Frames, Sent)
-        end,
+        fun(PN, Acc) -> quic_loss:on_packet_sent(app, Acc, PN, ?PKT, true, FramesOf(PN), Sent) end,
         S0#state.loss_state,
         lists:seq(0, N - 1)
     ),
@@ -398,11 +417,14 @@ ack_all(#state{pn_app = #pn_space{next_pn = Next}} = S) ->
 
 %% Frames of each packet sent after the in_flight/1 flight, by packet
 %% number, ACK frames left out.
-sent_frames(#state{loss_state = L}) ->
+sent_frames(State) ->
+    sent_frames_from(?FLIGHT, State).
+
+sent_frames_from(From, #state{loss_state = L}) ->
     Sent = quic_loss:sent_packets(app, L),
     [
         [F || F <- Fs, element(1, frame_name(F)) =/= ack]
-     || {PN, #sent_packet{frames = Fs}} <- lists:sort(maps:to_list(Sent)), PN >= ?FLIGHT
+     || {PN, #sent_packet{frames = Fs}} <- lists:sort(maps:to_list(Sent)), PN >= From
     ].
 
 frame_name(F) when is_atom(F) -> {F};

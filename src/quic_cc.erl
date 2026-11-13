@@ -165,7 +165,10 @@
 %% Wrapper state that holds algorithm module and its state
 -record(cc_wrapper, {
     algorithm :: module(),
-    state :: term()
+    state :: term(),
+    %% RFC 9002 Section 7.3.2: one packet may go out past a window just cut
+    %% on entering recovery.
+    recovery_packet = false :: boolean()
 }).
 
 -opaque cc_state() :: #cc_wrapper{}.
@@ -221,7 +224,7 @@ new(Algorithm, Opts) ->
 %% @doc Record that a packet was sent.
 -spec on_packet_sent(cc_state(), non_neg_integer()) -> cc_state().
 on_packet_sent(#cc_wrapper{algorithm = Mod, state = State} = W, Size) ->
-    W#cc_wrapper{state = Mod:on_packet_sent(State, Size)}.
+    W#cc_wrapper{state = Mod:on_packet_sent(State, Size), recovery_packet = false}.
 
 %% @doc Process acknowledged packets.
 -spec on_packets_acked(cc_state(), non_neg_integer()) -> cc_state().
@@ -240,16 +243,22 @@ on_packets_acked(
 on_packets_lost(#cc_wrapper{algorithm = Mod, state = State} = W, LostBytes) ->
     W#cc_wrapper{state = Mod:on_packets_lost(State, LostBytes)}.
 
-%% @doc Handle a congestion event (packet loss detected).
+%% @doc Handle a congestion event (packet loss detected). A window cut at
+%% once lets the next packet out regardless of the new window (RFC 9002
+%% Section 7.3.2).
 -spec on_congestion_event(cc_state(), non_neg_integer()) -> cc_state().
 on_congestion_event(#cc_wrapper{algorithm = Mod, state = State} = W, SentTime) ->
-    W#cc_wrapper{state = Mod:on_congestion_event(State, SentTime)}.
+    NewState = Mod:on_congestion_event(State, SentTime),
+    Cut = (Mod:cwnd(NewState) < Mod:cwnd(State)),
+    W#cc_wrapper{
+        state = NewState, recovery_packet = Cut orelse W#cc_wrapper.recovery_packet
+    }.
 
 %% @doc Undo the last window reduction: every packet it was for turned
 %% out to be delivered, only late.
 -spec on_spurious_congestion(cc_state()) -> cc_state().
 on_spurious_congestion(#cc_wrapper{algorithm = Mod, state = State} = W) ->
-    W#cc_wrapper{state = Mod:on_spurious_congestion(State)}.
+    W#cc_wrapper{state = Mod:on_spurious_congestion(State), recovery_packet = false}.
 
 %% @doc The sender has nothing queued to send. BBR marks its delivery
 %% rate samples application-limited (draft-ietf-ccwg-bbr-07 Section
@@ -329,7 +338,7 @@ on_packets_discarded(#cc_wrapper{algorithm = Mod, state = State} = W, Bytes) ->
 %% controller instead would silently drop those.
 -spec reset_for_retry(cc_state()) -> cc_state().
 reset_for_retry(#cc_wrapper{algorithm = Mod, state = State} = W) ->
-    W#cc_wrapper{state = Mod:reset_for_retry(State)}.
+    W#cc_wrapper{state = Mod:reset_for_retry(State), recovery_packet = false}.
 
 %% @doc The congestion window this controller was configured with.
 %% cwnd evolves away from it, so a reset needs it to restore the
@@ -350,6 +359,8 @@ bytes_in_flight(#cc_wrapper{algorithm = Mod, state = State}) ->
 
 %% @doc Check if we can send more bytes.
 -spec can_send(cc_state(), non_neg_integer()) -> boolean().
+can_send(#cc_wrapper{recovery_packet = true}, _Size) ->
+    true;
 can_send(#cc_wrapper{algorithm = Mod, state = State}, Size) ->
     Mod:can_send(State, Size).
 
@@ -393,6 +404,7 @@ pacing_delay(#cc_wrapper{algorithm = Mod, state = State}, Size) ->
 send_check(#cc_wrapper{algorithm = Mod, state = State} = W, Size) ->
     case Mod:send_check(State, Size) of
         {ok, NewState} -> {ok, W#cc_wrapper{state = NewState}};
+        {blocked_cwnd, _} when W#cc_wrapper.recovery_packet -> {ok, W};
         Other -> Other
     end.
 
@@ -401,6 +413,11 @@ send_check(#cc_wrapper{algorithm = Mod, state = State} = W, Size) ->
 %% identical results.
 -spec send_check_run(cc_state(), non_neg_integer(), non_neg_integer()) ->
     {non_neg_integer(), cc_state()}.
+send_check_run(#cc_wrapper{recovery_packet = true} = W, Size, MaxK) when MaxK > 0 ->
+    case send_check_run(W#cc_wrapper{recovery_packet = false}, Size, MaxK) of
+        {0, _} -> {1, W};
+        {K, W1} -> {K, W1#cc_wrapper{recovery_packet = true}}
+    end;
 send_check_run(#cc_wrapper{algorithm = quic_cc_newreno, state = State} = W, Size, MaxK) ->
     {K, NewState} = quic_cc_newreno:send_check_run(State, Size, MaxK),
     {K, W#cc_wrapper{state = NewState}};
@@ -418,8 +435,10 @@ send_check_run_iter(W, Size, MaxK, K) ->
 %% @doc Batched on_packet_sent for a run: one update for newreno, a
 %% fold for other algorithms.
 -spec on_packets_sent(cc_state(), [non_neg_integer()]) -> cc_state().
+on_packets_sent(W, []) ->
+    W;
 on_packets_sent(#cc_wrapper{algorithm = quic_cc_newreno, state = State} = W, Sizes) ->
-    W#cc_wrapper{state = quic_cc_newreno:on_packets_sent(State, Sizes)};
+    W#cc_wrapper{state = quic_cc_newreno:on_packets_sent(State, Sizes), recovery_packet = false};
 on_packets_sent(W, Sizes) ->
     lists:foldl(fun(Size, Acc) -> on_packet_sent(Acc, Size) end, W, Sizes).
 

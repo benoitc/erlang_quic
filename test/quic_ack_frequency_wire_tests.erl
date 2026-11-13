@@ -78,7 +78,7 @@ refill() ->
 
 %% quic_cc's wrapper around a BBR state.
 wrap(BBR) ->
-    {cc_wrapper, quic_cc_bbr, BBR}.
+    {cc_wrapper, quic_cc_bbr, BBR, false}.
 
 %% A connected client using BBR whose packets reach Sock, nothing in
 %% flight so the window does not hold its packets back.

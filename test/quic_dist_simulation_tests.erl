@@ -568,9 +568,10 @@ tick_blocked_after_loss_burst_test() ->
     %% BUG CHECK: bytes_in_flight > cwnd means nothing can be sent
     case FinalBytesInFlight >= FinalCwnd of
         true ->
-            %% This is the problematic state - regular can_send fails
-            CanSendTick = quic_cc:can_send(CC2, 100),
-            ?assertNot(CanSendTick);
+            %% One packet may go out on entering recovery (RFC 9002
+            %% Section 7.3.2); the next waits for the window.
+            ?assert(quic_cc:can_send(CC2, 100)),
+            ?assertNot(quic_cc:can_send(quic_cc:on_packet_sent(CC2, 100), 100));
         false ->
             %% Still have room
             ok
