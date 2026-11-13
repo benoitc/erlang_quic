@@ -15,7 +15,7 @@
 %%% == States (Section 5.1) ==
 %%%
 %%% - Startup: pacing gain 2.77, cwnd gain 2; exits on a bandwidth
-%%%   plateau.
+%%%   plateau or on excessive loss.
 %%% - Drain: pacing gain 0.5 until in flight drops to the BDP, or after
 %%%   3 rounds.
 %%% - ProbeBW: DOWN (0.90), CRUISE (1.0), REFILL (1.0), UP (1.25, cwnd
@@ -113,6 +113,7 @@
 -define(BETA, 0.7).
 -define(HEADROOM, 0.15).
 -define(MIN_PIPE_CWND_PKTS, 4).
+-define(STARTUP_FULL_LOSS_CNT, 6).
 -define(FULL_BW_GROWTH, 1.25).
 -define(FULL_BW_ROUNDS, 3).
 -define(DRAIN_MAX_ROUNDS, 3).
@@ -221,10 +222,13 @@
     inflight_longterm = infinity :: volume(),
     inflight_shortterm = infinity :: volume(),
 
-    %% Loss in the current round, and the in-flight cap it set
-    loss_in_round = 0 :: non_neg_integer(),
-    bytes_in_round = 0 :: non_neg_integer(),
-    inflight_hi = infinity :: volume(),
+    %% Congestion signals (Section 2.10, 5.5.10)
+    bw_latest = 0 :: non_neg_integer(),
+    inflight_latest = 0 :: non_neg_integer(),
+    loss_round_delivered = 0 :: non_neg_integer(),
+    loss_round_start = false :: boolean(),
+    is_loss_in_round = false :: boolean(),
+    loss_events_in_round = 0 :: non_neg_integer(),
 
     %% Startup (Section 2.13)
     full_bw_reached = false :: boolean(),
@@ -244,8 +248,14 @@
     prev_probe_too_high = false :: boolean(),
     prev_probe_precautionary = false :: boolean(),
 
-    %% ProbeRTT (Section 2.16)
+    %% Undo (Section 2.15)
+    undo_state = none :: none | startup | probe_bw_up | ce,
+    undo_bw_shortterm = 0 :: volume(),
+    undo_inflight_shortterm = 0 :: volume(),
+    undo_inflight_longterm = 0 :: volume(),
     prior_cwnd = 0 :: non_neg_integer(),
+
+    %% ProbeRTT (Section 2.16)
     probe_rtt_done_stamp = 0 :: integer(),
     probe_rtt_round_done = false :: boolean(),
     probe_rtt_cwnd = infinity :: volume(),
@@ -317,8 +327,7 @@ on_packet_sent_at(State, Size, Now) ->
         app_limited = AppLimited,
         cwnd = Cwnd,
         max_datagram_size = MDS,
-        sent = Sent,
-        bytes_in_round = BytesInRound
+        sent = Sent
     } = State,
     {DeliveredTime, FirstSendTime} =
         case InFlight0 of
@@ -341,8 +350,7 @@ on_packet_sent_at(State, Size, Now) ->
         delivered_time = DeliveredTime,
         first_send_time = FirstSendTime,
         cwnd_limited_now = State#bbr_state.cwnd_limited_now orelse (InFlight + MDS > Cwnd),
-        sent = queue:in(Pkt, Sent),
-        bytes_in_round = BytesInRound + Size
+        sent = queue:in(Pkt, Sent)
     }.
 
 %% @doc The sender has no data queued: mark the connection
@@ -378,8 +386,10 @@ on_packets_acked_at(State, 0, _Now) ->
 on_packets_acked_at(State0, AckedBytes, Now) ->
     State1 = take_acked(State0, AckedBytes, Now),
     State2 = generate_rate_sample(State1),
+    %% Losses this ACK reveals come after it, so the model sees the
+    %% recovery this ACK may end.
     State3 = update_model_and_state(State2, Now),
-    update_control_parameters(State3).
+    update_control_parameters(maybe_exit_recovery(State3)).
 
 %% Section 4.1.2.3 UpdateRateSample, over the oldest outstanding bytes.
 take_acked(#bbr_state{bytes_in_flight = InFlight} = S, AckedBytes, Now) ->
@@ -464,33 +474,29 @@ clear_app_limited(#bbr_state{app_limited = AppLimited, delivered = Delivered} = 
 clear_app_limited(S) ->
     S.
 
+%% Recovery ends on the ACK of a packet sent after it began (RFC 9002 Section 7.3.2).
+maybe_exit_recovery(
+    #bbr_state{in_recovery = true, recovery_start = Start, rs = #rs{has_data = true, send_time = T}} =
+        S
+) when T > Start ->
+    restore_cwnd(S#bbr_state{in_recovery = false});
+maybe_exit_recovery(S) ->
+    S.
+
 update_model_and_state(S0, Now) ->
-    S1 = end_loss_round(update_max_bw(S0)),
-    S2 = check_full_bw_reached(S1),
-    S3 = check_startup_done(S2),
-    S4 = check_drain_done(S3, Now),
-    S5 = update_probe_bw_cycle_phase(S4, Now),
-    S6 = update_min_rtt(S5, Now),
-    S7 = check_probe_rtt(S6, Now),
-    bound_bw_for_model(S7).
+    S1 = update_latest_delivery_signals(S0),
+    S3 = update_congestion_signals(S1),
+    S4 = check_full_bw_reached(S3),
+    S5 = check_startup_done(S4),
+    S6 = check_drain_done(S5, Now),
+    S7 = update_probe_bw_cycle_phase(S6, Now),
+    S8 = update_min_rtt(S7, Now),
+    S9 = check_probe_rtt(S8, Now),
+    S10 = advance_latest_delivery_signals(S9),
+    bound_bw_for_model(S10).
 
 update_control_parameters(S) ->
-    set_pacing_rate(cap_cwnd(set_cwnd(S))).
-
-%% A new round clears the loss count and ends recovery.
-end_loss_round(#bbr_state{round_start = true, in_recovery = WasInRecovery, inflight_hi = Hi} = S) ->
-    S#bbr_state{
-        loss_in_round = 0,
-        bytes_in_round = 0,
-        in_recovery = false,
-        inflight_hi =
-            case WasInRecovery of
-                true -> infinity;
-                false -> Hi
-            end
-    };
-end_loss_round(S) ->
-    S.
+    set_pacing_rate(bound_cwnd_for_model(set_cwnd(S))).
 
 %%====================================================================
 %% Rounds and filters (Sections 5.5.1 - 5.5.7)
@@ -586,10 +592,34 @@ check_full_bw_reached(#bbr_state{full_bw_count = Count} = S) ->
         full_bw_reached = S#bbr_state.full_bw_reached orelse Now
     }.
 
-check_startup_done(S) ->
+check_startup_done(S0) ->
+    S = check_startup_high_loss(S0),
     case S of
         #bbr_state{mode = startup, full_bw_reached = true} -> enter_drain(S);
         _ -> S
+    end.
+
+%% Section 5.3.1.3: six loss events and LossThresh exceeded in recovery.
+check_startup_high_loss(#bbr_state{full_bw_reached = true} = S) ->
+    S;
+check_startup_high_loss(#bbr_state{loss_round_start = false} = S) ->
+    S;
+check_startup_high_loss(#bbr_state{in_recovery = false} = S) ->
+    S;
+check_startup_high_loss(#bbr_state{loss_events_in_round = N} = S) when
+    N < ?STARTUP_FULL_LOSS_CNT
+->
+    S;
+check_startup_high_loss(#bbr_state{rs = RS, inflight_latest = Latest} = S) ->
+    case is_inflight_too_high(RS) of
+        true ->
+            S#bbr_state{
+                undo_state = startup,
+                full_bw_reached = true,
+                inflight_longterm = max(bdp(S), Latest)
+            };
+        false ->
+            S
     end.
 
 enter_drain(#bbr_state{round_count = Round} = S) ->
@@ -617,7 +647,7 @@ enter_probe_bw(S, Now) ->
     start_probe_bw_down(S#bbr_state{cwnd_gain = ?DEFAULT_CWND_GAIN}, Now).
 
 start_probe_bw_down(S0, Now) ->
-    S = pick_probe_wait(S0),
+    S = pick_probe_wait(reset_congestion_signals(S0)),
     (start_round(S))#bbr_state{
         probe_up_acked_per_inc = infinity,
         cycle_stamp = Now,
@@ -659,6 +689,11 @@ is_in_probe_bw(probe_bw_cruise) -> true;
 is_in_probe_bw(probe_bw_refill) -> true;
 is_in_probe_bw(probe_bw_up) -> true;
 is_in_probe_bw(_) -> false.
+
+is_probing_bw(startup) -> true;
+is_probing_bw(probe_bw_refill) -> true;
+is_probing_bw(probe_bw_up) -> true;
+is_probing_bw(_) -> false.
 
 %% Section 5.3.3.9 UpdateProbeBWCyclePhase.
 update_probe_bw_cycle_phase(#bbr_state{full_bw_reached = false} = S, _Now) ->
@@ -893,7 +928,7 @@ probe_rtt_cwnd(#bbr_state{probe_rtt_cwnd = Saved} = S) ->
     max(min(bdp_multiple(S, ?PROBE_RTT_CWND_GAIN), Saved), min_pipe_cwnd(S)).
 
 %%====================================================================
-%% Loss
+%% Loss and congestion signals (Section 5.5.10)
 %%====================================================================
 
 %% @doc Process lost packets.
@@ -903,19 +938,162 @@ on_packets_lost(State, LostBytes) ->
 
 %% @doc Process `LostBytes' declared lost at time `Now'.
 -spec on_packets_lost_at(cc_state(), non_neg_integer(), integer()) -> cc_state().
-on_packets_lost_at(S, LostBytes, _Now) ->
-    #bbr_state{bytes_in_flight = InFlight, sent = Sent, lost = Lost, loss_in_round = LossInRound} =
-        S,
-    drop_sent_when_idle(S#bbr_state{
-        bytes_in_flight = max(0, InFlight - LostBytes),
-        sent = discard_bytes(Sent, LostBytes),
-        lost = Lost + LostBytes,
-        loss_in_round = LossInRound + LostBytes
-    }).
+on_packets_lost_at(#bbr_state{bytes_in_flight = InFlight} = S, LostBytes, Now) ->
+    S1 = lose_bytes(S, LostBytes, Now),
+    drop_sent_when_idle(S1#bbr_state{bytes_in_flight = max(0, InFlight - LostBytes)}).
+
+lose_bytes(S, 0, _Now) ->
+    S;
+lose_bytes(#bbr_state{sent = Sent, lost = Lost} = S, Bytes, Now) ->
+    case queue:out(Sent) of
+        {empty, _} ->
+            note_loss(S#bbr_state{lost = Lost + Bytes}, 1);
+        {{value, #pkt{size = Size} = P}, Rest} when Size =< Bytes ->
+            S1 = handle_lost_packet(S#bbr_state{sent = Rest, lost = Lost + Size}, P, Now),
+            lose_bytes(S1, Bytes - Size, Now);
+        {{value, #pkt{size = Size} = P}, Rest} ->
+            S1 = S#bbr_state{
+                sent = queue:in_r(P#pkt{size = Size - Bytes}, Rest), lost = Lost + Bytes
+            },
+            handle_lost_packet(S1, P#pkt{size = Bytes}, Now)
+    end.
+
+%% Section 5.5.10.2 NoteLoss, for Events lost or CE-marked packets.
+note_loss(#bbr_state{is_loss_in_round = false, delivered = Delivered} = S, Events) ->
+    S1 = save_state_upon_loss(S#bbr_state{loss_round_delivered = Delivered}),
+    note_loss(S1#bbr_state{is_loss_in_round = true}, Events);
+note_loss(#bbr_state{loss_events_in_round = N} = S, Events) ->
+    S#bbr_state{loss_events_in_round = N + Events}.
+
+%% Section 5.5.10.2 HandleLostPacket.
+handle_lost_packet(S0, P, Now) ->
+    S = note_loss(S0, 1),
+    case S#bbr_state.check_probe_loss of
+        false ->
+            S;
+        true ->
+            #pkt{tx_in_flight = TxInFlight, lost = PLost, is_app_limited = AppLimited} = P,
+            RS = (S#bbr_state.rs)#rs{
+                tx_in_flight = TxInFlight,
+                lost = S#bbr_state.lost - PLost,
+                is_app_limited = AppLimited
+            },
+            case is_inflight_too_high(RS) of
+                true ->
+                    RS1 = RS#rs{tx_in_flight = inflight_at_loss(RS, P#pkt.size)},
+                    handle_inflight_too_high(S, RS1, Now);
+                false ->
+                    S
+            end
+    end.
 
 %% QUIC has selective acknowledgments, so only the loss rate counts.
 is_inflight_too_high(#rs{lost = Lost, tx_in_flight = TxInFlight}) ->
     Lost > TxInFlight * ?LOSS_THRESH.
+
+%% In-flight volume at which losses crossed LossThresh within P.
+inflight_at_loss(#rs{tx_in_flight = TxInFlight, lost = Lost}, Size) ->
+    InflightPrev = max(0, TxInFlight - Size),
+    LostPrev = max(0, Lost - Size),
+    LostPrefix = (?LOSS_THRESH * InflightPrev - LostPrev) / (1 - ?LOSS_THRESH),
+    max(0, trunc(InflightPrev + LostPrefix)).
+
+handle_inflight_too_high(#bbr_state{mode = Mode} = S0, RS, Now) ->
+    S = S0#bbr_state{prev_probe_too_high = true, check_probe_loss = false},
+    S1 =
+        case RS#rs.is_app_limited of
+            false ->
+                Hi = max(RS#rs.tx_in_flight, trunc(target_inflight(S) * ?BETA)),
+                S#bbr_state{inflight_longterm = Hi};
+            true ->
+                S
+        end,
+    case Mode of
+        probe_bw_up -> start_probe_bw_down(S1#bbr_state{undo_state = probe_bw_up}, Now);
+        _ -> S1
+    end.
+
+%% Near the start of ACK processing.
+update_latest_delivery_signals(S) ->
+    #bbr_state{
+        bw_latest = BwLatest,
+        inflight_latest = InflightLatest,
+        loss_round_delivered = LossRoundDelivered,
+        delivered = Delivered,
+        rs = #rs{
+            delivery_rate = Rate,
+            delivered = RSDelivered,
+            has_data = HasData,
+            prior_delivered = Prior
+        }
+    } = S,
+    S1 = S#bbr_state{
+        loss_round_start = false,
+        bw_latest = max(BwLatest, Rate),
+        inflight_latest = max(InflightLatest, RSDelivered)
+    },
+    case HasData andalso (Prior >= LossRoundDelivered) of
+        true -> S1#bbr_state{loss_round_delivered = Delivered, loss_round_start = true};
+        false -> S1
+    end.
+
+%% Near the end of ACK processing.
+advance_latest_delivery_signals(#bbr_state{loss_round_start = true, rs = RS} = S) ->
+    S#bbr_state{
+        bw_latest = RS#rs.delivery_rate,
+        inflight_latest = RS#rs.delivered,
+        loss_events_in_round = 0
+    };
+advance_latest_delivery_signals(S) ->
+    S.
+
+reset_congestion_signals(S) ->
+    S#bbr_state{
+        is_loss_in_round = false,
+        loss_events_in_round = 0,
+        bw_latest = 0,
+        inflight_latest = 0
+    }.
+
+update_congestion_signals(S0) ->
+    S = update_max_bw(S0),
+    case S#bbr_state.loss_round_start of
+        false -> S;
+        true -> (adapt_lower_bounds_from_congestion(S))#bbr_state{is_loss_in_round = false}
+    end.
+
+%% Once a round outside probing, cut the short-term model by at most Beta.
+adapt_lower_bounds_from_congestion(#bbr_state{mode = Mode, is_loss_in_round = Loss} = S) ->
+    case (not is_probing_bw(Mode)) andalso Loss of
+        true -> loss_lower_bounds(init_lower_bounds(S));
+        false -> S
+    end.
+
+init_lower_bounds(#bbr_state{bw_shortterm = BwLo, inflight_shortterm = InLo} = S) ->
+    S#bbr_state{
+        bw_shortterm =
+            case BwLo of
+                infinity -> S#bbr_state.max_bw;
+                _ -> BwLo
+            end,
+        inflight_shortterm =
+            case InLo of
+                infinity -> S#bbr_state.cwnd;
+                _ -> InLo
+            end
+    }.
+
+loss_lower_bounds(S) ->
+    #bbr_state{
+        bw_latest = BwLatest,
+        inflight_latest = InflightLatest,
+        bw_shortterm = BwLo,
+        inflight_shortterm = InLo
+    } = S,
+    S#bbr_state{
+        bw_shortterm = max(BwLatest, trunc(?BETA * BwLo)),
+        inflight_shortterm = max(InflightLatest, trunc(?BETA * InLo))
+    }.
 
 reset_short_term_model(S) ->
     S#bbr_state{bw_shortterm = infinity, inflight_shortterm = infinity}.
@@ -923,7 +1101,8 @@ reset_short_term_model(S) ->
 bound_bw_for_model(#bbr_state{max_bw = MaxBw, bw_shortterm = BwLo} = S) ->
     S#bbr_state{bw = min(MaxBw, BwLo)}.
 
-%% @doc Handle a congestion event (packet loss detected).
+%% @doc Enter recovery when a packet sent after the current recovery
+%% period started is lost (RFC 9002 Section 7.3.2).
 -spec on_congestion_event(cc_state(), non_neg_integer()) -> cc_state().
 on_congestion_event(State, SentTimeMs) ->
     on_congestion_event_at(State, SentTimeMs, now_us()).
@@ -936,33 +1115,27 @@ on_congestion_event_at(
     SentTimeMs * 1000 =< Start
 ->
     S;
-on_congestion_event_at(
-    #bbr_state{in_recovery = true, recovery_start = Start, min_recovery_duration = Min} = S,
-    _SentTimeMs,
-    Now
-) when Now - Start < Min ->
-    S;
 on_congestion_event_at(S, _SentTimeMs, Now) ->
-    congestion_response(S, Now).
+    enter_recovery(S, Now).
 
-%% Loss above LossThresh in the round cuts max_bw by Beta and caps
-%% in flight at its current volume.
-congestion_response(S, Now) ->
-    #bbr_state{
-        bytes_in_round = BytesInRound,
-        loss_in_round = LossInRound,
-        max_bw = MaxBw,
-        bytes_in_flight = InFlight,
-        inflight_hi = Hi
-    } = S,
-    S1 =
-        case (BytesInRound > 0) andalso (LossInRound / BytesInRound > ?LOSS_THRESH) of
-            true -> S#bbr_state{max_bw = trunc(MaxBw * ?BETA), inflight_hi = min(Hi, InFlight)};
-            false -> S
-        end,
-    S1#bbr_state{in_recovery = true, recovery_start = Now, loss_in_round = 0, bytes_in_round = 0}.
+%% Section 5.6.4.4 OnEnterFastRecovery.
+enter_recovery(S, Now) ->
+    S1 = save_state_upon_loss(S),
+    S1#bbr_state{in_recovery = true, recovery_start = Now}.
 
-%% @doc Handle ECN-CE signal.
+%% Section 5.5.11.1; SaveCwnd() included.
+save_state_upon_loss(S0) ->
+    S = save_cwnd(S0),
+    S#bbr_state{
+        undo_state = none,
+        undo_bw_shortterm = S#bbr_state.bw_shortterm,
+        undo_inflight_shortterm = S#bbr_state.inflight_shortterm,
+        undo_inflight_longterm = S#bbr_state.inflight_longterm
+    }.
+
+%% @doc Treat newly CE-marked packets as lost (Section 3.7): they count
+%% towards the loss rate and start a recovery period. A later spurious
+%% loss signal does not undo them.
 -spec on_ecn_ce(cc_state(), non_neg_integer()) -> cc_state().
 on_ecn_ce(State, NewCECount) ->
     on_ecn_ce_at(State, NewCECount, now_us()).
@@ -971,38 +1144,88 @@ on_ecn_ce(State, NewCECount) ->
 -spec on_ecn_ce_at(cc_state(), non_neg_integer(), integer()) -> cc_state().
 on_ecn_ce_at(#bbr_state{ecn_ce_counter = Old} = S, NewCECount, _Now) when NewCECount =< Old ->
     S;
-on_ecn_ce_at(#bbr_state{max_bw = MaxBw} = S, NewCECount, Now) ->
-    S#bbr_state{
-        max_bw = trunc(MaxBw * ?BETA),
-        ecn_ce_counter = NewCECount,
-        in_recovery = true,
-        recovery_start = Now
-    }.
+on_ecn_ce_at(
+    #bbr_state{ecn_ce_counter = Old, max_datagram_size = MDS, lost = Lost} = S0, NewCECount, Now
+) ->
+    Marks = NewCECount - Old,
+    S1 = note_loss(S0#bbr_state{ecn_ce_counter = NewCECount, lost = Lost + Marks * MDS}, Marks),
+    S2 =
+        case S1#bbr_state.check_probe_loss of
+            true -> check_ce_probe_loss(S1, Now);
+            false -> S1
+        end,
+    S3 =
+        case S2#bbr_state.in_recovery of
+            true -> S2;
+            false -> enter_recovery(S2, Now)
+        end,
+    S3#bbr_state{undo_state = ce}.
 
-%% @doc BBR does not cut its model on loss, so there is nothing to undo.
+%% CE marks while probing weigh like losses.
+check_ce_probe_loss(#bbr_state{rs = #rs{has_data = true} = RS0, lost = Lost} = S, Now) ->
+    RS = RS0#rs{lost = Lost - RS0#rs.prior_lost},
+    case is_inflight_too_high(RS) of
+        true -> handle_inflight_too_high(S, RS, Now);
+        false -> S
+    end;
+check_ce_probe_loss(S, _Now) ->
+    S.
+
+%% @doc Undo a loss recovery episode found to be spurious (Section 5.5.11.2).
 -spec on_spurious_congestion(cc_state()) -> cc_state().
-on_spurious_congestion(State) ->
-    State.
+on_spurious_congestion(#bbr_state{undo_state = ce} = S) ->
+    S;
+on_spurious_congestion(S0) ->
+    S = reset_full_bw(restore_cwnd(S0)),
+    #bbr_state{
+        bw_shortterm = BwLo,
+        inflight_shortterm = InLo,
+        inflight_longterm = Hi,
+        undo_bw_shortterm = UBwLo,
+        undo_inflight_shortterm = UInLo,
+        undo_inflight_longterm = UHi,
+        undo_state = Undo,
+        mode = Mode
+    } = S,
+    S1 = S#bbr_state{
+        in_recovery = false,
+        is_loss_in_round = false,
+        loss_events_in_round = 0,
+        bw_shortterm = max(BwLo, UBwLo),
+        inflight_shortterm = max(InLo, UInLo),
+        inflight_longterm = max(Hi, UHi)
+    },
+    S2 =
+        case {Undo, Mode} of
+            {startup, startup} ->
+                S1;
+            {startup, probe_rtt} ->
+                S1#bbr_state{full_bw_reached = false};
+            {startup, _} ->
+                enter_startup(S1#bbr_state{full_bw_reached = false});
+            {probe_bw_up, probe_bw_up} ->
+                S1;
+            {probe_bw_up, probe_rtt} ->
+                S1;
+            {probe_bw_up, _} ->
+                start_probe_bw_refill(S1);
+            {none, _} ->
+                S1
+        end,
+    S2#bbr_state{undo_state = none}.
 
-%% @doc Handle persistent congestion: start over from Startup.
+%% @doc Persistent congestion is QUIC's retransmission timeout: save the
+%% model for undo and drop cwnd to the minimum window (RFC 9002 Section
+%% 7.6.2, draft-ietf-ccwg-bbr-07 Section 5.6.4.4).
 -spec on_persistent_congestion(cc_state()) -> cc_state().
 on_persistent_congestion(State) ->
     on_persistent_congestion_at(State, now_us()).
 
 %% @doc Persistent congestion declared at time `Now'.
 -spec on_persistent_congestion_at(cc_state(), integer()) -> cc_state().
-on_persistent_congestion_at(#bbr_state{minimum_window = MinimumWindow} = S, _Now) ->
-    (reset_full_bw(enter_startup(S)))#bbr_state{
-        cwnd = MinimumWindow,
-        max_bw = 0,
-        bw_hi_cur = 0,
-        bw_hi_prev = 0,
-        min_rtt = infinity,
-        in_recovery = false,
-        recovery_start = 0,
-        full_bw_reached = false,
-        inflight_hi = infinity
-    }.
+on_persistent_congestion_at(#bbr_state{minimum_window = MinimumWindow} = S, Now) ->
+    S1 = save_state_upon_loss(S),
+    S1#bbr_state{cwnd = MinimumWindow, in_recovery = true, recovery_start = Now}.
 
 %% @doc Detect persistent congestion from lost packets.
 -spec detect_persistent_congestion(
@@ -1056,14 +1279,22 @@ set_cwnd(#bbr_state{cwnd_gain = Gain, max_datagram_size = MDS} = S) ->
     Bdp = max(bdp(S), ?MIN_PIPE_CWND_PKTS * MDS),
     S#bbr_state{cwnd = max(trunc(Gain * Bdp), min_pipe_cwnd(S))}.
 
-%% Loss caps cwnd at the in-flight volume it was seen at, outside
-%% Startup and Drain.
-cap_cwnd(#bbr_state{mode = Mode, inflight_hi = Hi, cwnd = Cwnd} = S) when
-    Mode =/= startup, Mode =/= drain, Hi =/= infinity
-->
-    S#bbr_state{cwnd = max(min(Cwnd, Hi), min_pipe_cwnd(S))};
-cap_cwnd(S) ->
-    S.
+%% Section 5.6.4.7 BoundCwndForModel.
+bound_cwnd_for_model(#bbr_state{mode = Mode, cwnd = Cwnd, inflight_shortterm = InLo} = S) ->
+    Cap0 =
+        case Mode of
+            probe_bw_cruise ->
+                inflight_with_headroom(S);
+            probe_rtt ->
+                inflight_with_headroom(S);
+            _ ->
+                case is_in_probe_bw(Mode) of
+                    true -> S#bbr_state.inflight_longterm;
+                    false -> infinity
+                end
+        end,
+    Cap = max(min(Cap0, InLo), min_pipe_cwnd(S)),
+    S#bbr_state{cwnd = min(Cwnd, Cap)}.
 
 %% Section 5.6.4.4.
 save_cwnd(#bbr_state{in_recovery = false, mode = Mode, cwnd = Cwnd} = S) when Mode =/= probe_rtt ->
@@ -1338,6 +1569,7 @@ info(#bbr_state{} = S) ->
         idle_restart => S#bbr_state.idle_restart,
         in_recovery => S#bbr_state.in_recovery,
         prior_cwnd => S#bbr_state.prior_cwnd,
+        undo_state => S#bbr_state.undo_state,
         prev_probe_too_high => S#bbr_state.prev_probe_too_high,
         bw_probe_wait => S#bbr_state.bw_probe_wait,
         probe_rtt_done_stamp => S#bbr_state.probe_rtt_done_stamp,

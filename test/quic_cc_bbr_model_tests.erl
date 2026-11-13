@@ -505,3 +505,120 @@ probe_rtt_during_startup_returns_to_startup_test() ->
     Out = run_until(In, not_in_mode(probe_rtt), 2 * ?SEC),
     ?assertEqual(startup, info(Out, mode)),
     ?assertEqual([startup, probe_rtt, startup], visited(Out)).
+
+%%====================================================================
+%% Loss, ECN and undo (Sections 3.7, 5.3.1.3, 5.5.10, 5.5.11)
+%%====================================================================
+
+%% A shallow buffer ends Startup on loss, before any plateau, and sets
+%% inflight_longterm.
+startup_exits_on_high_loss_test() ->
+    Sim = run_until(sim(shallow_path()), not_in_mode(startup), 5 * ?SEC),
+    Info = info(Sim),
+    ?assertEqual(drain, maps:get(mode, Info)),
+    ?assert(maps:get(full_bw_reached, Info)),
+    ?assertNot(maps:get(full_bw_now, Info)),
+    ?assertNotEqual(infinity, maps:get(inflight_longterm, Info)),
+    ?assert(maps:get(lost_pkts, Sim) > 0).
+
+%% A.2: excessive loss ends Startup even when application-limited.
+startup_exits_on_loss_when_app_limited_test() ->
+    Out = run_until(lossy_app_limited(), not_in_mode(startup), 5 * ?SEC),
+    ?assertNotEqual(startup, info(Out, mode)),
+    ?assert(info(Out, full_bw_reached)),
+    ?assertNot(info(Out, full_bw_now)),
+    ?assertEqual(startup, info(Out, undo_state)).
+
+lossy_app_limited() ->
+    sim(#{bw => 10000000, rtt => 20 * ?MS, drop => 0.1, app => {12000, 2 * ?MS}}).
+
+%% A.21: loss in UP lowers inflight_longterm and goes to DOWN.
+probe_bw_up_exits_on_loss_test() ->
+    Sim = to_probe_bw(sim(shallow_path())),
+    Up = run_until(Sim, in_mode(probe_bw_up), 5 * ?SEC),
+    Hi = info(Up, inflight_longterm),
+    ?assertNotEqual(infinity, Hi),
+    Down = run_until(Up, not_in_mode(probe_bw_up), 5 * ?SEC),
+    ?assertEqual(probe_bw_down, info(Down, mode)),
+    ?assert(info(Down, prev_probe_too_high)),
+    ?assertEqual(probe_bw_up, info(Down, undo_state)),
+    ?assertNotEqual(infinity, info(Down, inflight_longterm)).
+
+%% Outside bandwidth probing, a round with loss cuts the short-term
+%% model by at most Beta (Section 5.5.10.3).
+loss_while_cruising_cuts_short_term_model_test() ->
+    Sim = run_until(to_probe_bw(sim(bulk_path())), in_mode(probe_bw_cruise), 5 * ?SEC),
+    MaxBw = info(Sim, max_bw),
+    Lossy = run_until(Sim#{drop := 0.05}, fun(S) -> info(S, bw_shortterm) =/= infinity end, ?SEC),
+    BwLo = info(Lossy, bw_shortterm),
+    ?assert(BwLo >= trunc(0.7 * MaxBw)),
+    ?assert(BwLo =< MaxBw),
+    ?assertEqual(BwLo, info(Lossy, bw)).
+
+%% CE marks count as congestion (Section 3.7): with no loss at all, a
+%% marking bottleneck still ends Startup and bounds inflight.
+ecn_ce_is_congestion_test() ->
+    Sim = run_until(sim((bulk_path())#{ce_above => 20000}), not_in_mode(startup), 5 * ?SEC),
+    ?assertEqual(0, maps:get(lost_pkts, Sim)),
+    ?assert(maps:get(ce_count, Sim) > 0),
+    ?assertNot(info(Sim, full_bw_now)),
+    ?assertNotEqual(infinity, info(Sim, inflight_longterm)).
+
+ecn_ce_starts_recovery_test() ->
+    T = erlang:monotonic_time(microsecond),
+    S0 = quic_cc_bbr:on_packet_sent_at(quic_cc_bbr:new(#{}), 1200, T),
+    S1 = quic_cc_bbr:on_ecn_ce_at(S0, 1, T + ?MS),
+    ?assert(quic_cc_bbr:in_recovery(S1)),
+    ?assertEqual(1200, maps:get(lost, quic_cc_bbr:info(S1))),
+    ?assertEqual(S1, quic_cc_bbr:on_ecn_ce_at(S1, 1, T + 2 * ?MS)).
+
+%% CE marks are congestion: a spurious loss signal after them undoes
+%% nothing.
+ecn_ce_is_not_undone_test() ->
+    Sim = run_until(sim((bulk_path())#{ce_above => 20000}), not_in_mode(startup), 5 * ?SEC),
+    CC = maps:get(cc, Sim),
+    ?assertEqual(ce, maps:get(undo_state, quic_cc_bbr:info(CC))),
+    ?assertEqual(CC, quic_cc_bbr:on_spurious_congestion(CC)).
+
+%% A.18: a spurious loss episode that ended Startup returns to it.
+spurious_loss_returns_to_startup_test() ->
+    Sim = run_until(lossy_app_limited(), not_in_mode(startup), 5 * ?SEC),
+    ?assertEqual(startup, info(Sim, undo_state)),
+    Undone = quic_cc_bbr:info(quic_cc_bbr:on_spurious_congestion(maps:get(cc, Sim))),
+    ?assertEqual(startup, maps:get(mode, Undone)),
+    ?assertNot(maps:get(full_bw_reached, Undone)),
+    ?assertEqual(infinity, maps:get(inflight_longterm, Undone)),
+    ?assertEqual(none, maps:get(undo_state, Undone)),
+    ?assertNot(maps:get(in_recovery, Undone)).
+
+%% A.18: a spurious loss episode that ended UP probes again from REFILL.
+spurious_loss_returns_to_probe_bw_refill_test() ->
+    Sim = to_probe_bw(sim(shallow_path())),
+    Up = run_until(Sim, in_mode(probe_bw_up), 5 * ?SEC),
+    Down = run_until(Up, not_in_mode(probe_bw_up), 5 * ?SEC),
+    ?assertEqual(probe_bw_up, info(Down, undo_state)),
+    Undone = quic_cc_bbr:info(quic_cc_bbr:on_spurious_congestion(maps:get(cc, Down))),
+    ?assertEqual(probe_bw_refill, maps:get(mode, Undone)).
+
+%% Persistent congestion drops cwnd to the minimum window; recovery
+%% ends on the ACK of a packet sent after it and restores cwnd.
+persistent_congestion_test() ->
+    Sim = run(to_probe_bw(sim(bulk_path())), ?SEC),
+    #{cc := CC, now := Now} = Sim,
+    Before = quic_cc_bbr:cwnd(CC),
+    CC1 = quic_cc_bbr:on_persistent_congestion_at(CC, Now),
+    ?assertEqual(2 * ?MDS, quic_cc_bbr:cwnd(CC1)),
+    ?assert(quic_cc_bbr:in_recovery(CC1)),
+    ?assertEqual(Before, maps:get(prior_cwnd, quic_cc_bbr:info(CC1))),
+    CC2 = quic_cc_bbr:on_packet_sent_at(CC1, ?MDS, Now + 1),
+    InFlight = quic_cc_bbr:bytes_in_flight(CC2),
+    CC3 = quic_cc_bbr:on_packets_acked_at(CC2, InFlight, Now + 50 * ?MS),
+    ?assertNot(quic_cc_bbr:in_recovery(CC3)),
+    ?assert(quic_cc_bbr:cwnd(CC3) >= 4 * ?MDS).
+
+%% Random loss below LossThresh does not stop the flow from using the
+%% path (Section 5.5.10).
+low_random_loss_keeps_throughput_test() ->
+    Sim = run(sim((bulk_path())#{drop => 0.01}), 10 * ?SEC),
+    Delivered = info(Sim, delivered),
+    ?assert(Delivered > 0.7 * 10000000 * 10).

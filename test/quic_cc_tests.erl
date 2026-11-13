@@ -589,7 +589,7 @@ spurious_congestion_without_cut_test() ->
     CC0 = quic_cc:new(newreno, #{}),
     ?assertEqual(CC0, quic_cc:on_spurious_congestion(CC0)).
 
-%% BBR does not cut on loss and keeps its state.
+%% A BBR state with no loss episode has nothing to undo.
 spurious_congestion_bbr_test() ->
     CC0 = quic_cc:new(bbr, #{}),
     ?assertEqual(CC0, quic_cc:on_spurious_congestion(CC0)).
