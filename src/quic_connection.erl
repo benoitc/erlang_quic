@@ -6331,31 +6331,31 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
             LostBytes = maps:get(lost_bytes, AckMeta, 0),
             LargestLostSentTime = maps:get(largest_lost_sent_time, AckMeta, undefined),
 
-            %% Only update CC ACK processing if there are ack-eliciting packets
-            %% When only non-ack-eliciting packets are ACKed, skip on_packets_acked
-            %% to prevent false recovery exit (LargestAckedSentTime=Now would always
-            %% satisfy > RecoveryStart after min_duration). Loss handling is done
-            %% separately by on_packets_lost and on_congestion_event.
-            CCState1 = cc_after_ack(
-                CCState,
+            %% RFC 9002 Appendix A.7: ECN, then the losses this ACK
+            %% reveals, then the packets it acknowledges. Every loss
+            %% behind the last window cut was only reordered: undo the
+            %% cut before all of them.
+            CCState2 =
+                case AckMeta of
+                    #{spurious_congestion := true} ->
+                        quic_cc:on_spurious_congestion(CCState);
+                    _ ->
+                        CCState
+                end,
+            CCState3 = process_ecn_counts(ECN, CCState2),
+            CCState4 = cc_after_loss(
+                CCState3, LostBytes, LargestLostSentTime, LostPackets, NewLossState
+            ),
+            %% Only ack-eliciting packets move the window: an ACK of
+            %% ACK-only packets has no send time to end recovery with.
+            CCState5 = cc_after_ack(
+                CCState4,
                 AckedBytes,
                 LargestAckedSentTime,
                 HasAckEliciting,
                 AckedPackets,
                 Level,
                 NewLossState
-            ),
-            %% Every loss behind the last window cut was only
-            %% reordered: undo the cut before this ACK's own losses.
-            CCState2 =
-                case AckMeta of
-                    #{spurious_congestion := true} ->
-                        quic_cc:on_spurious_congestion(CCState1);
-                    _ ->
-                        CCState1
-                end,
-            CCState5 = cc_after_loss(
-                CCState2, LostBytes, LargestLostSentTime, ECN, LostPackets, NewLossState
             ),
 
             %% Update pacing rate based on new RTT estimate (RFC 9002 Section 7.7)
@@ -9742,21 +9742,16 @@ process_ecn_counts({_ECT0, _ECT1, ECNCE}, CCState) ->
     quic_cc:on_ecn_ce(CCState, ECNCE).
 
 %% @doc The congestion-control consequences of declaring packets lost,
-%% in the order both the ACK path and the loss-detection timer apply
-%% them. ECN counts ride along because on an ACK they land between the
-%% congestion event and the persistent-congestion check, and
-%% `on_congestion_event/2' is guarded on the recovery period, so the
-%% order of the two is observable. A timer-driven loss has no ACK and
-%% passes `undefined', which process_ecn_counts/2 treats as a no-op.
+%% for both the ACK path and the loss-detection timer: the bytes, the
+%% congestion event, then persistent congestion (RFC 9002 Appendix B.8).
 -spec cc_after_loss(
     quic_cc:cc_state(),
     non_neg_integer(),
     non_neg_integer() | undefined,
-    term(),
     [#sent_packet{}],
     quic_loss:loss_state()
 ) -> quic_cc:cc_state().
-cc_after_loss(CCState, LostBytes, LargestLostSentTime, ECN, LostPackets0, LossState) ->
+cc_after_loss(CCState, LostBytes, LargestLostSentTime, LostPackets0, LossState) ->
     %% Losses on an earlier path say nothing about this one (RFC 9000
     %% Section 9.4); they only stop counting as in flight.
     LostPackets = [P || P <- LostPackets0, not quic_loss:on_earlier_path(LossState, P)],
@@ -9767,8 +9762,7 @@ cc_after_loss(CCState, LostBytes, LargestLostSentTime, ECN, LostPackets0, LossSt
             {_, []} -> CC1;
             _ -> quic_cc:on_congestion_event(CC1, LargestLostSentTime)
         end,
-    CC3 = process_ecn_counts(ECN, CC2),
-    check_persistent_congestion(LostPackets, LossState, CC3).
+    check_persistent_congestion(LostPackets, LossState, CC2).
 
 %% Check for persistent congestion (RFC 9002 Section 7.6)
 %% If lost packets span more than PTO * 3, reset to minimum window
@@ -13349,7 +13343,7 @@ apply_lost_packets(_Space, [], State) ->
 apply_lost_packets(Space, Lost, #state{cc_state = CCState, loss_state = LossState} = State) ->
     LostBytes = lists:sum([Sz || #sent_packet{size = Sz} <- Lost]),
     LargestLostSentTime = lists:max([TS || #sent_packet{time_sent = TS} <- Lost]),
-    NewCC = cc_after_loss(CCState, LostBytes, LargestLostSentTime, undefined, Lost, LossState),
+    NewCC = cc_after_loss(CCState, LostBytes, LargestLostSentTime, Lost, LossState),
     lists:foreach(
         fun(#sent_packet{pn = LostPN}) ->
             ?QLOG_EMIT_PACKET_LOST((State#state.cfg)#conn_cfg.qlog_ctx, #{

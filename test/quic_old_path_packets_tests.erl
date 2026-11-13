@@ -38,7 +38,7 @@ old_path_losses_are_no_congestion_event_test() ->
         }
      || {N, T, Sz} <- [{1, 1000, 1200}, {2, 1010, 1200}, {3, 1020, 1000}]
     ],
-    CC = quic_connection:cc_after_loss(CC0, 3400, 1020, undefined, Lost, S),
+    CC = quic_connection:cc_after_loss(CC0, 3400, 1020, Lost, S),
     ?assertEqual(quic_cc:cwnd(CC0), quic_cc:cwnd(CC)),
     ?assertEqual(0, quic_cc:bytes_in_flight(CC)).
 
