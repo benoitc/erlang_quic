@@ -14,6 +14,9 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% The simulator, for quic_ack_frequency_wire_tests.
+-export([sim/1, run_until/3, in_mode/1, to_probe_bw/1, bulk_path/0, info/2]).
+
 -define(MDS, 1200).
 -define(MS, 1000).
 -define(SEC, 1000000).
