@@ -15,7 +15,7 @@
 %%% == Available Algorithms ==
 %%%
 %%% - `newreno' (default): RFC 9002 NewReno implementation
-%%% - `bbr': BBRv3 (future implementation)
+%%% - `bbr': BBRv3, draft-ietf-ccwg-bbr-07
 %%%
 %%% == Usage ==
 %%%
@@ -50,7 +50,8 @@
     on_persistent_congestion/1,
     detect_persistent_congestion/3,
     update_pacing_rate/2,
-    update_mtu/2
+    update_mtu/2,
+    on_app_limited/1
 ]).
 
 %% API - Queries
@@ -252,6 +253,15 @@ on_ecn_ce(#cc_wrapper{algorithm = Mod, state = State} = W, ECNCE) ->
 -spec on_spurious_congestion(cc_state()) -> cc_state().
 on_spurious_congestion(#cc_wrapper{algorithm = Mod, state = State} = W) ->
     W#cc_wrapper{state = Mod:on_spurious_congestion(State)}.
+
+%% @doc The sender has nothing queued to send. BBR marks its delivery
+%% rate samples application-limited (draft-ietf-ccwg-bbr-07 Section
+%% 4.1.2.4); the other algorithms do not use it.
+-spec on_app_limited(cc_state()) -> cc_state().
+on_app_limited(#cc_wrapper{algorithm = quic_cc_bbr, state = State} = W) ->
+    W#cc_wrapper{state = quic_cc_bbr:on_app_limited(State)};
+on_app_limited(W) ->
+    W.
 
 %% @doc Handle persistent congestion.
 -spec on_persistent_congestion(cc_state()) -> cc_state().

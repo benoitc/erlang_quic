@@ -1821,7 +1821,7 @@ connected(cast, {set_owner, NewOwner}, #state{alpn = Alpn, transport_params = TP
     NewOwner ! {quic, self(), {connected, Info}},
     {keep_state, reown(State, NewOwner)};
 connected({call, From}, {send_datagram, Data}, State) ->
-    case do_send_datagram(Data, State) of
+    case do_send_datagram(Data, note_app_limited(State)) of
         {ok, NewState} ->
             %% Event-driven flush: flush batch and timers after user API call
             FlushedState = flush_event(NewState, event),
@@ -6291,8 +6291,9 @@ process_frame(Level, {crypto, Offset, Data}, State) ->
         false ->
             buffer_crypto_data(Level, Offset, Data, State)
     end;
-process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
+process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
     %% Process ACK - update loss detection and congestion control
+    State = note_app_limited(State0),
     #state{loss_state = LossState, cc_state = CCState} = State,
 
     %% Ranges is the codec's [{LargestAcked, FirstRange} | [{Gap, Range}]]
@@ -9702,6 +9703,18 @@ should_delay_ack(Frames) ->
 schedule_delayed_ack(app, State) ->
     arm_ack_timer(State).
 
+%% Nothing queued, retransmissions included, is app-limited
+%% (draft-ietf-ccwg-bbr-07 Section 4.1.2.4).
+note_app_limited(
+    #state{send_queue_count = 0, deferred_ctrl_retransmits = [], cc_state = CC} = State
+) ->
+    case quic_cc:on_app_limited(CC) of
+        CC -> State;
+        CC1 -> State#state{cc_state = CC1}
+    end;
+note_app_limited(State) ->
+    State.
+
 %% Acknowledged packets from an earlier path leave the window as they
 %% are and only stop counting as in flight (RFC 9000 Section 9.4).
 cc_after_ack(CCState, _AckedBytes, _SentTime, false, _AckedPackets, _Level, _LossState) ->
@@ -10785,7 +10798,9 @@ do_send_data(StreamId, Data, Fin, #state{streams = Streams} = State, Admission) 
                     DataSize = iolist_size(Data),
                     case admit_send(Admission, DataSize, State) of
                         true ->
-                            send_admitted_data(StreamId, StreamState, Data, DataSize, Fin, State);
+                            send_admitted_data(
+                                StreamId, StreamState, Data, DataSize, Fin, note_app_limited(State)
+                            );
                         false ->
                             {error, send_queue_full}
                     end
