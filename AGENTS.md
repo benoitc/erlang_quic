@@ -124,7 +124,7 @@ Last checked: 2026-11-12.
 | RFC 9221 DATAGRAM | DATAGRAM frames, `max_datagram_frame_size` | `quic_connection` |
 | RFC 8899 DPLPMTUD | PMTU probing | `quic_pmtu` |
 | RFC 9438 CUBIC, RFC 9406 HyStart++ | congestion control | `quic_cc_cubic`, `quic_cc_newreno` |
-| draft-ietf-ccwg-bbr (revision not recorded) BBRv3 | congestion control | `quic_cc_bbr` |
+| draft-ietf-ccwg-bbr-07 BBRv3 | congestion control | `quic_cc_bbr` |
 | draft-ietf-quic-reliable-stream-reset-11 | RESET_STREAM_AT, `reset_stream_at` transport parameter (both ids) | `quic_connection`, `quic_tls` |
 | draft-ietf-quic-load-balancers-22 QUIC-LB | routable connection IDs, plaintext and encrypted | `quic_lb` |
 | RFC 8305 Happy Eyeballs v2 | client address racing | `quic_happy` |
@@ -197,12 +197,11 @@ citations and the table, with no CHANGELOG entry.
 
 ### Pending updates
 
-Known newer versions, checked 2026-11-12. Each needs the diff in step 2
-before any code changes.
-
-| Spec | Code follows | Latest | To check |
-|---|---|---|---|
-| BBR | revision not recorded | draft-ietf-ccwg-bbr-07 | state machine and gains in `quic_cc_bbr`; record the revision followed |
+None known, checked 2026-11-12 (BBR on 2026-11-13). Next: the QUIC
+ACK frequency extension (draft-ietf-quic-ack-frequency), which
+draft-ietf-ccwg-bbr-07 Section 4.1.3.3 asks BBR to use. A newer
+version found later goes in a table here, with what is known to
+differ, and needs the diff in step 2 before any code changes.
 
 ## Skills
 

@@ -42,7 +42,6 @@ ack(Space, L0, CC0, PN, Now) ->
         CC1,
         maps:get(lost_bytes, Meta, 0),
         maps:get(largest_lost_sent_time, Meta, undefined),
-        undefined,
         Lost,
         L
     ),

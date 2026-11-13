@@ -138,9 +138,8 @@ bbr_startup_processes_acks_test() ->
 %%====================================================================
 
 bbr_loss_does_not_exit_startup_test() ->
-    %% BBRv3: Loss should NOT cause STARTUP exit.
-    %% STARTUP exits only on bandwidth plateau (no 25% growth for 3 rounds).
-    %% This prevents premature exit to DRAIN where pacing_gain drops to 0.35x.
+    %% One loss event is not the six a round needs to end Startup
+    %% (draft-ietf-ccwg-bbr-07 Section 5.3.1.3).
     State = quic_cc_bbr:new(#{min_recovery_duration => 0}),
     S1 = quic_cc_bbr:on_packet_sent(State, 12000),
     Now = erlang:monotonic_time(millisecond),
@@ -152,43 +151,29 @@ bbr_loss_does_not_exit_startup_test() ->
     %% Should remain in STARTUP (not exited due to loss)
     ?assert(quic_cc_bbr:in_slow_start(S3)).
 
-bbr_recovery_resets_after_round_test() ->
-    %% BBRv3: Recovery state should reset when a round completes.
-    %% This allows fresh loss detection in subsequent rounds.
-    State = quic_cc_bbr:new(#{min_recovery_duration => 0}),
-    %% Send data to establish next_round_delivered
-    S1 = quic_cc_bbr:on_packet_sent(State, 5000),
-    S2 = quic_cc_bbr:on_packets_acked(S1, 5000),
-    %% Enter recovery
-    Now = erlang:monotonic_time(millisecond),
-    S3 = quic_cc_bbr:on_congestion_event(S2, Now),
-    ?assert(quic_cc_bbr:in_recovery(S3)),
-    %% Send more data and ACK to complete a round
-    S4 = quic_cc_bbr:on_packet_sent(S3, 10000),
-    S5 = quic_cc_bbr:on_packets_acked(S4, 10000),
-    %% Recovery should be reset after round completion
+bbr_recovery_ends_on_ack_of_later_packet_test() ->
+    %% Recovery ends when a packet sent after it started is acknowledged
+    %% (RFC 9002 Section 7.3.2), not on an ACK of an earlier one.
+    T = erlang:monotonic_time(microsecond),
+    S1 = quic_cc_bbr:on_packet_sent_at(quic_cc_bbr:new(#{}), 5000, T),
+    S2 = quic_cc_bbr:on_congestion_event_at(S1, T div 1000, T + 10000),
+    ?assert(quic_cc_bbr:in_recovery(S2)),
+    S3 = quic_cc_bbr:on_packet_sent_at(S2, 5000, T + 20000),
+    S4 = quic_cc_bbr:on_packets_acked_at(S3, 5000, T + 40000),
+    ?assert(quic_cc_bbr:in_recovery(S4)),
+    S5 = quic_cc_bbr:on_packets_acked_at(S4, 5000, T + 60000),
     ?assertNot(quic_cc_bbr:in_recovery(S5)).
 
 bbr_sustained_transfer_with_loss_test() ->
-    %% Simulate sustained transfer with occasional loss.
-    %% BBR should stay in STARTUP and continue sending at high rate.
-    State = quic_cc_bbr:new(#{min_recovery_duration => 0}),
-
-    %% Simulate multiple rounds of sending with loss events
-    S1 = simulate_transfer_round(State, 50000),
+    %% A congestion event in Startup does not end it.
+    T = erlang:monotonic_time(microsecond),
+    S1 = transfer_round(quic_cc_bbr:new(#{}), 50000, T, T + 40000),
     ?assert(quic_cc_bbr:in_slow_start(S1)),
-
-    %% Another round with congestion event
-    Now = erlang:monotonic_time(millisecond),
-    S2 = quic_cc_bbr:on_congestion_event(S1, Now),
+    S2 = quic_cc_bbr:on_congestion_event_at(S1, (T + 40000) div 1000, T + 40000),
     ?assert(quic_cc_bbr:in_recovery(S2)),
-
-    S3 = simulate_transfer_round(S2, 50000),
-    %% Should still be in STARTUP, not prematurely exited to DRAIN
+    S3 = transfer_round(S2, 50000, T + 41000, T + 81000),
     ?assert(quic_cc_bbr:in_slow_start(S3)),
-    %% Recovery should be cleared after round
     ?assertNot(quic_cc_bbr:in_recovery(S3)),
-    %% Can still send data
     ?assert(quic_cc_bbr:can_send(S3, 1200)).
 
 %%====================================================================
@@ -213,32 +198,14 @@ bbr_loss_below_threshold_test() ->
     %% Should enter recovery
     ?assert(quic_cc_bbr:in_recovery(S3)).
 
-bbr_ecn_ce_test() ->
-    State = quic_cc_bbr:new(#{}),
-    ?assertEqual(0, quic_cc_bbr:ecn_ce_counter(State)),
-    S1 = quic_cc_bbr:on_ecn_ce(State, 5),
-    ?assertEqual(5, quic_cc_bbr:ecn_ce_counter(S1)),
-    ?assert(quic_cc_bbr:in_recovery(S1)).
-
-bbr_ecn_ce_no_duplicate_test() ->
-    State = quic_cc_bbr:new(#{}),
-    S1 = quic_cc_bbr:on_ecn_ce(State, 5),
-    %% Same or lower count should not trigger again
-    S2 = quic_cc_bbr:on_ecn_ce(S1, 5),
-    S3 = quic_cc_bbr:on_ecn_ce(S2, 3),
-    ?assertEqual(5, quic_cc_bbr:ecn_ce_counter(S3)).
-
 bbr_persistent_congestion_test() ->
+    %% Persistent congestion is QUIC's retransmission timeout: cwnd drops
+    %% to the minimum window and the model is kept.
     State = quic_cc_bbr:new(#{initial_window => 65536}),
-    InitialCwnd = quic_cc_bbr:cwnd(State),
     S1 = quic_cc_bbr:on_persistent_congestion(State),
-    NewCwnd = quic_cc_bbr:cwnd(S1),
-    ?assert(NewCwnd < InitialCwnd),
-    %% Should reset to minimum window
-    ?assertEqual(2400, NewCwnd),
-    %% Should return to startup
+    ?assertEqual(2400, quic_cc_bbr:cwnd(S1)),
     ?assert(quic_cc_bbr:in_slow_start(S1)),
-    ?assertNot(quic_cc_bbr:in_recovery(S1)).
+    ?assert(quic_cc_bbr:in_recovery(S1)).
 
 %%====================================================================
 %% Persistent Congestion Detection Tests
@@ -280,13 +247,12 @@ bbr_detect_persistent_congestion_above_threshold_test() ->
 
 bbr_pacing_initial_state_test() ->
     State = quic_cc_bbr:new(#{}),
-    %% Initially, pacing should allow sending (rate is 0, no rate limit)
+    %% The initial send quantum holds the initial window.
     ?assert(quic_cc_bbr:pacing_allows(State, 1200)),
     ?assertEqual(0, quic_cc_bbr:pacing_delay(State, 1200)).
 
 bbr_pacing_allows_with_tokens_test() ->
     State = quic_cc_bbr:new(#{}),
-    %% After init, tokens = max_burst (12 packets = 14400 bytes)
     ?assert(quic_cc_bbr:pacing_allows(State, 1200)).
 
 bbr_pacing_get_tokens_consumes_test() ->
@@ -298,7 +264,6 @@ bbr_pacing_get_tokens_consumes_test() ->
     ?assertEqual(5000, Allowed2).
 
 bbr_pacing_delay_within_burst_test() ->
-    %% With initial pacing, delay should be 0 within burst limit (14400 bytes)
     State = quic_cc_bbr:new(#{}),
     ?assertEqual(0, quic_cc_bbr:pacing_delay(State, 12000)).
 
@@ -407,22 +372,10 @@ bbr_via_facade_with_opts_test() ->
 %%====================================================================
 
 bbr_initial_pacing_rate_test() ->
-    %% Verify that pacing_rate > 0 after new() (the key fix)
-    %% With default cwnd of 10*1200=12000 bytes and initial_rtt=100ms:
-    %% pacing_rate = 2.885 * 12000 / 100 = ~346 bytes/ms
+    %% A non-zero initial rate: a zero rate once hung transfers.
     State = quic_cc_bbr:new(#{}),
-    %% Pacing should not allow 0 rate (which caused hangs)
-    %% We verify this by checking pacing_delay is 0 for reasonable sizes
-    %% because we have tokens available at a non-zero rate
     ?assertEqual(0, quic_cc_bbr:pacing_delay(State, 1200)),
     ?assert(quic_cc_bbr:pacing_allows(State, 1200)).
-
-bbr_initial_pacing_rate_custom_rtt_test() ->
-    %% Verify initial_rtt option is respected
-    State = quic_cc_bbr:new(#{initial_rtt => 50}),
-    %% With initial_rtt=50ms, pacing should be faster (2x the default)
-    ?assertEqual(0, quic_cc_bbr:pacing_delay(State, 1200)),
-    ?assert(quic_cc_bbr:pacing_allows(State, 12000)).
 
 bbr_first_ack_updates_bandwidth_test() ->
     %% Verify that after first ACK, bandwidth is updated properly
@@ -539,94 +492,8 @@ bbr_long_transfer_cwnd_stability_test() ->
     ?assert(quic_cc_bbr:can_send(FinalState, 1200)).
 
 %%====================================================================
-%% HyStart++ Tests (RFC 9406)
-%%====================================================================
-
-bbr_hystart_enabled_by_default_test() ->
-    %% HyStart++ should be enabled by default
-    State = quic_cc_bbr:new(#{}),
-    S1 = quic_cc_bbr:on_packet_sent(State, 1200),
-    S2 = quic_cc_bbr:on_packets_acked(S1, 1200),
-    %% Should still be in startup
-    ?assert(quic_cc_bbr:in_slow_start(S2)).
-
-bbr_hystart_disabled_test() ->
-    %% Test with HyStart++ disabled
-    State = quic_cc_bbr:new(#{hystart_enabled => false}),
-    S1 = quic_cc_bbr:on_packet_sent(State, 5000),
-    S2 = quic_cc_bbr:on_packets_acked(S1, 5000),
-    %% Should still be in startup
-    ?assert(quic_cc_bbr:in_slow_start(S2)).
-
-bbr_hystart_rtt_tracking_test() ->
-    %% Test that RTT samples are tracked during startup
-    State = quic_cc_bbr:new(#{}),
-    S1 = quic_cc_bbr:on_packet_sent(State, 5000),
-    %% Simulate RTT update
-    S2 = quic_cc_bbr:update_pacing_rate(S1, 50),
-    %% Should still be in startup
-    ?assert(quic_cc_bbr:in_slow_start(S2)).
-
-bbr_hystart_startup_continues_stable_rtt_test() ->
-    %% Test that startup continues normally with stable RTT
-    State = quic_cc_bbr:new(#{}),
-    %% Multiple rounds with stable RTT should stay in startup
-    S1 = simulate_stable_startup_rounds(State, 3),
-    ?assert(quic_cc_bbr:in_slow_start(S1)).
-
-bbr_hystart_reset_on_persistent_congestion_test() ->
-    %% Test that HyStart++ state resets on persistent congestion
-    State = quic_cc_bbr:new(#{}),
-    S1 = quic_cc_bbr:on_persistent_congestion(State),
-    %% Should be back in startup
-    ?assert(quic_cc_bbr:in_slow_start(S1)).
-
-%%====================================================================
-%% HyStart++ Dynamic RTT Threshold Tests (RFC 9406)
-%%====================================================================
-
-bbr_hystart_dynamic_threshold_low_rtt_test() ->
-    %% Low RTT (20ms): threshold = max(4, min(20/8, 16)) = max(4, 2) = 4ms
-    %% The threshold is clamped to the minimum of 4ms
-    State = quic_cc_bbr:new(#{}),
-    %% Simulate low RTT environment
-    S1 = quic_cc_bbr:update_pacing_rate(State, 20),
-    S2 = quic_cc_bbr:on_packet_sent(S1, 5000),
-    S3 = quic_cc_bbr:on_packets_acked(S2, 5000),
-    %% Should still be in startup
-    ?assert(quic_cc_bbr:in_slow_start(S3)).
-
-bbr_hystart_dynamic_threshold_medium_rtt_test() ->
-    %% Medium RTT (80ms): threshold = max(4, min(80/8, 16)) = max(4, 10) = 10ms
-    State = quic_cc_bbr:new(#{}),
-    %% Simulate medium RTT environment
-    S1 = quic_cc_bbr:update_pacing_rate(State, 80),
-    S2 = quic_cc_bbr:on_packet_sent(S1, 5000),
-    S3 = quic_cc_bbr:on_packets_acked(S2, 5000),
-    ?assert(quic_cc_bbr:in_slow_start(S3)).
-
-bbr_hystart_dynamic_threshold_high_rtt_test() ->
-    %% High RTT (200ms): threshold = max(4, min(200/8, 16)) = max(4, 16) = 16ms
-    %% The threshold is clamped to the maximum of 16ms
-    State = quic_cc_bbr:new(#{}),
-    %% Simulate high RTT environment
-    S1 = quic_cc_bbr:update_pacing_rate(State, 200),
-    S2 = quic_cc_bbr:on_packet_sent(S1, 5000),
-    S3 = quic_cc_bbr:on_packets_acked(S2, 5000),
-    ?assert(quic_cc_bbr:in_slow_start(S3)).
-
-%%====================================================================
 %% Helper Functions
 %%====================================================================
-
-%% Simulate multiple startup rounds with stable RTT
-simulate_stable_startup_rounds(State, 0) ->
-    State;
-simulate_stable_startup_rounds(State, N) ->
-    S1 = quic_cc_bbr:on_packet_sent(State, 5000),
-    S2 = quic_cc_bbr:update_pacing_rate(S1, 50),
-    S3 = quic_cc_bbr:on_packets_acked(S2, 5000),
-    simulate_stable_startup_rounds(S3, N - 1).
 
 send_until_full(State, Sent) ->
     case quic_cc_bbr:can_send(State, 1200) of
@@ -637,7 +504,7 @@ send_until_full(State, Sent) ->
             {State, Sent}
     end.
 
-%% Simulate a round of transfer (send and ACK bytes)
-simulate_transfer_round(State, Bytes) ->
-    S1 = quic_cc_bbr:on_packet_sent(State, Bytes),
-    quic_cc_bbr:on_packets_acked(S1, Bytes).
+%% Send Bytes at SentAt and acknowledge them at AckedAt (microseconds).
+transfer_round(State, Bytes, SentAt, AckedAt) ->
+    S1 = quic_cc_bbr:on_packet_sent_at(State, Bytes, SentAt),
+    quic_cc_bbr:on_packets_acked_at(S1, Bytes, AckedAt).

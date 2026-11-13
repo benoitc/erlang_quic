@@ -1821,7 +1821,7 @@ connected(cast, {set_owner, NewOwner}, #state{alpn = Alpn, transport_params = TP
     NewOwner ! {quic, self(), {connected, Info}},
     {keep_state, reown(State, NewOwner)};
 connected({call, From}, {send_datagram, Data}, State) ->
-    case do_send_datagram(Data, State) of
+    case do_send_datagram(Data, note_app_limited(State)) of
         {ok, NewState} ->
             %% Event-driven flush: flush batch and timers after user API call
             FlushedState = flush_event(NewState, event),
@@ -6291,8 +6291,9 @@ process_frame(Level, {crypto, Offset, Data}, State) ->
         false ->
             buffer_crypto_data(Level, Offset, Data, State)
     end;
-process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
+process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
     %% Process ACK - update loss detection and congestion control
+    State = note_app_limited(State0),
     #state{loss_state = LossState, cc_state = CCState} = State,
 
     %% Ranges is the codec's [{LargestAcked, FirstRange} | [{Gap, Range}]]
@@ -6330,31 +6331,33 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
             LostBytes = maps:get(lost_bytes, AckMeta, 0),
             LargestLostSentTime = maps:get(largest_lost_sent_time, AckMeta, undefined),
 
-            %% Only update CC ACK processing if there are ack-eliciting packets
-            %% When only non-ack-eliciting packets are ACKed, skip on_packets_acked
-            %% to prevent false recovery exit (LargestAckedSentTime=Now would always
-            %% satisfy > RecoveryStart after min_duration). Loss handling is done
-            %% separately by on_packets_lost and on_congestion_event.
-            CCState1 = cc_after_ack(
-                CCState,
+            %% RFC 9002 Appendix A.7: ECN, then the losses this ACK
+            %% reveals, then the packets it acknowledges. Every loss
+            %% behind the last window cut was only reordered: undo the
+            %% cut before all of them.
+            CCState2 =
+                case AckMeta of
+                    #{spurious_congestion := true} ->
+                        quic_cc:on_spurious_congestion(CCState);
+                    _ ->
+                        CCState
+                end,
+            {CCState3, NewLossState1, State0a} = process_ecn(
+                Level, ECN, LargestAcked, AckedPackets, CCState2, NewLossState, State
+            ),
+            CCState4 = cc_after_loss(
+                CCState3, LostBytes, LargestLostSentTime, LostPackets, NewLossState
+            ),
+            %% Only ack-eliciting packets move the window: an ACK of
+            %% ACK-only packets has no send time to end recovery with.
+            CCState5 = cc_after_ack(
+                CCState4,
                 AckedBytes,
                 LargestAckedSentTime,
                 HasAckEliciting,
                 AckedPackets,
                 Level,
                 NewLossState
-            ),
-            %% Every loss behind the last window cut was only
-            %% reordered: undo the cut before this ACK's own losses.
-            CCState2 =
-                case AckMeta of
-                    #{spurious_congestion := true} ->
-                        quic_cc:on_spurious_congestion(CCState1);
-                    _ ->
-                        CCState1
-                end,
-            CCState5 = cc_after_loss(
-                CCState2, LostBytes, LargestLostSentTime, ECN, LostPackets, NewLossState
             ),
 
             %% Update pacing rate based on new RTT estimate (RFC 9002 Section 7.7)
@@ -6369,8 +6372,8 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State) ->
                         CCState5
                 end,
 
-            State1 = State#state{
-                loss_state = NewLossState,
+            State1 = State0a#state{
+                loss_state = NewLossState1,
                 cc_state = CCState6,
                 pto_dirty = true
             },
@@ -9702,6 +9705,18 @@ should_delay_ack(Frames) ->
 schedule_delayed_ack(app, State) ->
     arm_ack_timer(State).
 
+%% Nothing queued, retransmissions included, is app-limited
+%% (draft-ietf-ccwg-bbr-07 Section 4.1.2.4).
+note_app_limited(
+    #state{send_queue_count = 0, deferred_ctrl_retransmits = [], cc_state = CC} = State
+) ->
+    case quic_cc:on_app_limited(CC) of
+        CC -> State;
+        CC1 -> State#state{cc_state = CC1}
+    end;
+note_app_limited(State) ->
+    State.
+
 %% Acknowledged packets from an earlier path leave the window as they
 %% are and only stop counting as in flight (RFC 9000 Section 9.4).
 cc_after_ack(CCState, _AckedBytes, _SentTime, false, _AckedPackets, _Level, _LossState) ->
@@ -9719,31 +9734,48 @@ cc_after_ack(CCState, AckedBytes, SentTime, true, AckedPackets, app, LossState) 
 cc_after_ack(CCState, AckedBytes, SentTime, true, _AckedPackets, _Level, _LossState) ->
     quic_cc:on_packets_acked(CCState, AckedBytes, SentTime).
 
-%% Process ECN counts from ACK frame (RFC 9002 Section 7.1)
-%% ECN-CE indicates network congestion experienced
-process_ecn_counts(undefined, CCState) ->
-    %% No ECN information in this ACK
-    CCState;
-process_ecn_counts({_ECT0, _ECT1, ECNCE}, CCState) ->
-    %% RFC 9002: An increase in ECN-CE count triggers congestion response
-    quic_cc:on_ecn_ce(CCState, ECNCE).
+%% RFC 9002 Section 7.1 and Appendix B.7: a CE count above the last one
+%% this space reported is a congestion event for the largest
+%% acknowledged packet. It is real congestion, so the loss episode it
+%% joins can no longer be undone as spurious.
+process_ecn(Level, {_ECT0, _ECT1, CE}, LargestAcked, [_ | _] = Acked, CC, LossState, State) ->
+    case pn_space(Level, State) of
+        #pn_space{ecn_ce_count = Old} = PNSpace when CE > Old ->
+            SentTime = largest_acked_sent_time(LargestAcked, Acked),
+            {
+                quic_cc:on_congestion_event(CC, SentTime),
+                quic_loss:confirm_losses(loss_space(Level), LossState),
+                put_pn_space(Level, PNSpace#pn_space{ecn_ce_count = CE}, State)
+            };
+        _ ->
+            {CC, LossState, State}
+    end;
+process_ecn(_Level, _ECN, _LargestAcked, _Acked, CC, LossState, State) ->
+    {CC, LossState, State}.
+
+%% The largest acknowledged packet when newly acknowledged, otherwise
+%% the newest one this ACK acknowledges.
+largest_acked_sent_time(LargestAcked, Acked) ->
+    case [T || #sent_packet{pn = PN, time_sent = T} <- Acked, PN =:= LargestAcked] of
+        [T | _] -> T;
+        [] -> lists:max([T || #sent_packet{time_sent = T} <- Acked])
+    end.
+
+loss_space(initial) -> initial;
+loss_space(handshake) -> handshake;
+loss_space(_) -> app.
 
 %% @doc The congestion-control consequences of declaring packets lost,
-%% in the order both the ACK path and the loss-detection timer apply
-%% them. ECN counts ride along because on an ACK they land between the
-%% congestion event and the persistent-congestion check, and
-%% `on_congestion_event/2' is guarded on the recovery period, so the
-%% order of the two is observable. A timer-driven loss has no ACK and
-%% passes `undefined', which process_ecn_counts/2 treats as a no-op.
+%% for both the ACK path and the loss-detection timer: the bytes, the
+%% congestion event, then persistent congestion (RFC 9002 Appendix B.8).
 -spec cc_after_loss(
     quic_cc:cc_state(),
     non_neg_integer(),
     non_neg_integer() | undefined,
-    term(),
     [#sent_packet{}],
     quic_loss:loss_state()
 ) -> quic_cc:cc_state().
-cc_after_loss(CCState, LostBytes, LargestLostSentTime, ECN, LostPackets0, LossState) ->
+cc_after_loss(CCState, LostBytes, LargestLostSentTime, LostPackets0, LossState) ->
     %% Losses on an earlier path say nothing about this one (RFC 9000
     %% Section 9.4); they only stop counting as in flight.
     LostPackets = [P || P <- LostPackets0, not quic_loss:on_earlier_path(LossState, P)],
@@ -9754,8 +9786,7 @@ cc_after_loss(CCState, LostBytes, LargestLostSentTime, ECN, LostPackets0, LossSt
             {_, []} -> CC1;
             _ -> quic_cc:on_congestion_event(CC1, LargestLostSentTime)
         end,
-    CC3 = process_ecn_counts(ECN, CC2),
-    check_persistent_congestion(LostPackets, LossState, CC3).
+    check_persistent_congestion(LostPackets, LossState, CC2).
 
 %% Check for persistent congestion (RFC 9002 Section 7.6)
 %% If lost packets span more than PTO * 3, reset to minimum window
@@ -10110,6 +10141,13 @@ classify_recv_trigger(_PN, _PNSpace) ->
 pn_space(initial, State) -> (State#state.hs)#hs.pn_initial;
 pn_space(handshake, State) -> (State#state.hs)#hs.pn_handshake;
 pn_space(_, State) -> State#state.pn_app.
+
+put_pn_space(initial, PNSpace, #state{hs = HS} = State) ->
+    State#state{hs = HS#hs{pn_initial = PNSpace}};
+put_pn_space(handshake, PNSpace, #state{hs = HS} = State) ->
+    State#state{hs = HS#hs{pn_handshake = PNSpace}};
+put_pn_space(_, PNSpace, State) ->
+    State#state{pn_app = PNSpace}.
 
 %% RFC 9000 Sections 17.2 and 17.3.1: the reserved bits are zero once
 %% both protections are removed.
@@ -10785,7 +10823,9 @@ do_send_data(StreamId, Data, Fin, #state{streams = Streams} = State, Admission) 
                     DataSize = iolist_size(Data),
                     case admit_send(Admission, DataSize, State) of
                         true ->
-                            send_admitted_data(StreamId, StreamState, Data, DataSize, Fin, State);
+                            send_admitted_data(
+                                StreamId, StreamState, Data, DataSize, Fin, note_app_limited(State)
+                            );
                         false ->
                             {error, send_queue_full}
                     end
@@ -13334,7 +13374,7 @@ apply_lost_packets(_Space, [], State) ->
 apply_lost_packets(Space, Lost, #state{cc_state = CCState, loss_state = LossState} = State) ->
     LostBytes = lists:sum([Sz || #sent_packet{size = Sz} <- Lost]),
     LargestLostSentTime = lists:max([TS || #sent_packet{time_sent = TS} <- Lost]),
-    NewCC = cc_after_loss(CCState, LostBytes, LargestLostSentTime, undefined, Lost, LossState),
+    NewCC = cc_after_loss(CCState, LostBytes, LargestLostSentTime, Lost, LossState),
     lists:foreach(
         fun(#sent_packet{pn = LostPN}) ->
             ?QLOG_EMIT_PACKET_LOST((State#state.cfg)#conn_cfg.qlog_ctx, #{

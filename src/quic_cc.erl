@@ -15,7 +15,7 @@
 %%% == Available Algorithms ==
 %%%
 %%% - `newreno' (default): RFC 9002 NewReno implementation
-%%% - `bbr': BBRv3 (future implementation)
+%%% - `bbr': BBRv3, draft-ietf-ccwg-bbr-07
 %%%
 %%% == Usage ==
 %%%
@@ -46,11 +46,11 @@
     on_packets_lost/2,
     on_congestion_event/2,
     on_spurious_congestion/1,
-    on_ecn_ce/2,
     on_persistent_congestion/1,
     detect_persistent_congestion/3,
     update_pacing_rate/2,
-    update_mtu/2
+    update_mtu/2,
+    on_app_limited/1
 ]).
 
 %% API - Queries
@@ -73,8 +73,7 @@
     send_check_run/4,
     on_packets_sent/2,
     max_datagram_size/1,
-    min_recovery_duration/1,
-    ecn_ce_counter/1
+    min_recovery_duration/1
 ]).
 
 %% API - Algorithm info
@@ -97,7 +96,6 @@
 ) -> State :: term().
 -callback on_packets_lost(State :: term(), LostBytes :: non_neg_integer()) -> State :: term().
 -callback on_congestion_event(State :: term(), SentTime :: non_neg_integer()) -> State :: term().
--callback on_ecn_ce(State :: term(), ECNCE :: non_neg_integer()) -> State :: term().
 -callback on_persistent_congestion(State :: term()) -> State :: term().
 -callback on_spurious_congestion(State :: term()) -> State :: term().
 -callback detect_persistent_congestion(
@@ -145,7 +143,6 @@
 -callback in_recovery(State :: term()) -> boolean().
 -callback max_datagram_size(State :: term()) -> pos_integer().
 -callback min_recovery_duration(State :: term()) -> non_neg_integer().
--callback ecn_ce_counter(State :: term()) -> non_neg_integer().
 
 %%====================================================================
 %% Types
@@ -242,16 +239,20 @@ on_packets_lost(#cc_wrapper{algorithm = Mod, state = State} = W, LostBytes) ->
 on_congestion_event(#cc_wrapper{algorithm = Mod, state = State} = W, SentTime) ->
     W#cc_wrapper{state = Mod:on_congestion_event(State, SentTime)}.
 
-%% @doc Handle ECN-CE signal.
--spec on_ecn_ce(cc_state(), non_neg_integer()) -> cc_state().
-on_ecn_ce(#cc_wrapper{algorithm = Mod, state = State} = W, ECNCE) ->
-    W#cc_wrapper{state = Mod:on_ecn_ce(State, ECNCE)}.
-
 %% @doc Undo the last window reduction: every packet it was for turned
 %% out to be delivered, only late.
 -spec on_spurious_congestion(cc_state()) -> cc_state().
 on_spurious_congestion(#cc_wrapper{algorithm = Mod, state = State} = W) ->
     W#cc_wrapper{state = Mod:on_spurious_congestion(State)}.
+
+%% @doc The sender has nothing queued to send. BBR marks its delivery
+%% rate samples application-limited (draft-ietf-ccwg-bbr-07 Section
+%% 4.1.2.4); the other algorithms do not use it.
+-spec on_app_limited(cc_state()) -> cc_state().
+on_app_limited(#cc_wrapper{algorithm = quic_cc_bbr, state = State} = W) ->
+    W#cc_wrapper{state = quic_cc_bbr:on_app_limited(State)};
+on_app_limited(W) ->
+    W.
 
 %% @doc Handle persistent congestion.
 -spec on_persistent_congestion(cc_state()) -> cc_state().
@@ -409,11 +410,6 @@ max_datagram_size(#cc_wrapper{algorithm = Mod, state = State}) ->
 -spec min_recovery_duration(cc_state()) -> non_neg_integer().
 min_recovery_duration(#cc_wrapper{algorithm = Mod, state = State}) ->
     Mod:min_recovery_duration(State).
-
-%% @doc Get the current ECN-CE counter.
--spec ecn_ce_counter(cc_state()) -> non_neg_integer().
-ecn_ce_counter(#cc_wrapper{algorithm = Mod, state = State}) ->
-    Mod:ecn_ce_counter(State).
 
 %% @doc Get the algorithm name for this CC state.
 -spec algorithm(cc_state()) -> cc_algorithm().
