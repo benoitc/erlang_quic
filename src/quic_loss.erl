@@ -1157,6 +1157,10 @@ is_retransmittable({connection_close, _, _, _, _}) -> false;
 %% DATAGRAM frames (RFC 9221) are unreliable and never retransmitted
 is_retransmittable({datagram, _}) -> false;
 is_retransmittable({datagram_with_length, _}) -> false;
+%% A PATH_RESPONSE is sent once and a PATH_CHALLENGE never repeats its data
+%% (RFC 9000 Sections 8.2.2 and 13.3).
+is_retransmittable({path_challenge, _}) -> false;
+is_retransmittable({path_response, _}) -> false;
 %% IMMEDIATE_ACK is not retransmitted (draft-ietf-quic-ack-frequency-14 Section 5)
 is_retransmittable(immediate_ack) -> false;
 is_retransmittable(_) -> true.

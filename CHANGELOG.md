@@ -148,6 +148,11 @@ All notable changes to this project will be documented in this file.
   retired that connection ID, offering it a connection ID it had
   already given up. A connection ID the peer has retired is no longer
   sent again (RFC 9000 Section 13.3).
+- A PATH_RESPONSE sent as an ordinary frame was sent again when its
+  packet was lost, and a lost PATH_CHALLENGE would have been repeated
+  with the same data. A PATH_RESPONSE is now sent once and a
+  PATH_CHALLENGE is never repeated; the peer's next challenge gets its
+  own response (RFC 9000 Sections 8.2.2 and 13.3).
 
 ## [2.7.0] - 2026-11-13
 

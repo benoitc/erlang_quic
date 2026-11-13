@@ -4060,6 +4060,9 @@ hold_frame(Frame, #state{ctrl_queue = {_, Q}} = State) when
         true -> State;
         false -> enqueue_ctrl(Frame, State)
     end;
+%% Not sent yet, so not a repeat: the one PATH_RESPONSE still goes out.
+hold_frame({path_response, _} = Frame, State) ->
+    enqueue_ctrl(Frame, State);
 hold_frame(Frame, State) ->
     case quic_loss:retransmittable_frames([Frame]) of
         [] -> State;

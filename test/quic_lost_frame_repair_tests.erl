@@ -134,6 +134,28 @@ new_connection_id_the_peer_retired_is_dropped_test() ->
     ?assertEqual([], resent([Frame], S1)).
 
 %%====================================================================
+%% PATH_CHALLENGE, PATH_RESPONSE
+%%====================================================================
+
+lost_path_response_is_not_resent_test() ->
+    ?assertEqual([], resent([{path_response, <<1, 2, 3, 4, 5, 6, 7, 8>>}], state())).
+
+lost_path_challenge_is_not_resent_test() ->
+    ?assertEqual([], resent([{path_challenge, <<1, 2, 3, 4, 5, 6, 7, 8>>}], state())).
+
+%% The response sent through the ordinary send path when the challenge's
+%% source address is unknown is not resent either.
+lost_fallback_path_response_is_not_resent_test() ->
+    Data = <<8, 7, 6, 5, 4, 3, 2, 1>>,
+    S0 = (state())#state{current_packet_source = undefined},
+    S1 = quic_connection:process_frame(app, {path_challenge, Data}, S0),
+    [Lost] = maps:values(quic_loss:sent_packets(app, ?S:loss_state(S1))),
+    ?assertEqual([{path_response, Data}], Lost#sent_packet.frames),
+    S2 = quic_connection:retransmit_lost_packets([Lost], S1),
+    ?assertEqual([], new_packets(S2, ?S:next_app_pn(S1))),
+    ?assertEqual([], held(S2)).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
