@@ -13803,9 +13803,7 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
         State1a#state{hs = (State1a#state.hs)#hs{hs_probe = true}}
     ),
     State2 = Probing#state{hs = (Probing#state.hs)#hs{hs_probe = false}},
-
-    State2a = flush_ctrl_queue(State2),
-    State2b = complete_send_reset_at(State2a),
+    State2b = complete_send_reset_at(State2),
 
     %% Flush immediately - probe packets and timers must not be batched
     State3 = flush_event(State2b, event),
@@ -13840,33 +13838,86 @@ probe_space(
 probe_space(Space, State) ->
     {Space, State}.
 
-%% Send a probe packet for PTO
-%% PTO probes are allowed to use control_allowance per RFC 9002
+%% Send a probe packet for PTO, exempt from the congestion window (RFC 9002
+%% Section 7.5).
 %% App-space PTO can fire before 1-RTT keys exist when tracked 0-RTT
 %% packets are outstanding. Handshake-space recovery drives progress
 %% until the keys arrive; sending nothing here avoids building an app
 %% packet without keys.
 send_probe_packet(app, #state{app_keys = undefined} = State) ->
     State;
-send_probe_packet(app, State) ->
-    case get_oldest_unacked_frames(app, State) of
-        {ok, Frames} ->
-            %% Retransmit oldest data as the probe, cwnd-exempt
-            send_retransmit_frames_cc(Frames, State);
-        none ->
-            %% No data to retransmit, send PING (always allowed as control)
-            Payload = quic_frame:encode(ping),
-            send_app_packet_internal(Payload, [ping], State)
-    end;
+send_probe_packet(app, #state{ctrl_queue = {_, Q}} = State) ->
+    Oldest =
+        case get_oldest_unacked_frames(app, State) of
+            {ok, Frames} -> [F || F <- Frames, is_current_limit(F, State)];
+            none -> []
+        end,
+    Held = [F || F <- queue:to_list(Q), is_current_limit(F, State)],
+    send_app_probe(Oldest, Held, State#state{ctrl_queue = {0, queue:new()}});
 send_probe_packet(Space, State) ->
-    %% A handshake probe replays that space's oldest CRYPTO, or a PING at
-    %% the same level when there is nothing outstanding, which is what
+    %% A handshake probe sends the first packet the window held back at that
+    %% level, else replays the oldest CRYPTO, else a PING, which is what
     %% the anti-deadlock timer arms for.
-    case get_oldest_unacked_frames(Space, State) of
-        {ok, Frames} ->
-            lists:foldl(fun(F, Acc) -> send_at_level(Space, F, Acc) end, State, Frames);
+    case send_pending_hs_probe(Space, State) of
+        {sent, State1} ->
+            State1;
         none ->
-            send_at_level(Space, ping, State)
+            case get_oldest_unacked_frames(Space, State) of
+                {ok, Frames} ->
+                    lists:foldl(fun(F, Acc) -> send_at_level(Space, F, Acc) end, State, Frames);
+                none ->
+                    send_at_level(Space, ping, State)
+            end
+    end.
+
+%% RFC 9002 Section 6.2.4: the probe carries the oldest unacknowledged
+%% frames and as many held control frames as fit beside them, or a PING
+%% when there is nothing else; the control frames left over stay held.
+send_app_probe([], [], State) ->
+    send_app_packet_internal(quic_frame:encode(ping), [ping], State);
+send_app_probe(Oldest, Held, State) ->
+    Budget = get_current_mtu(State) - ?RETRANSMIT_OVERHEAD,
+    {Probes, Left} = probe_packets(Oldest, Held, Budget),
+    hold_frames(Left, lists:foldl(fun send_retransmit_packet/2, State, Probes)).
+
+probe_packets([], Held, Budget) ->
+    [First | Rest] = pack_frames(Held, Budget),
+    {[First], lists:append(Rest)};
+probe_packets(Oldest, Held, Budget) ->
+    Packets = fit_to_mtu(Oldest, Budget),
+    {Init, [Last]} = lists:split(length(Packets) - 1, Packets),
+    {Fit, Left} = take_fitting(Held, Budget - frames_size(Last), []),
+    {Init ++ [Last ++ Fit], Left}.
+
+%% The frames from the head of the list that fit in Room bytes, in order.
+take_fitting([F | Rest] = Frames, Room, Acc) ->
+    case frames_size([F]) of
+        Size when Size =< Room -> take_fitting(Rest, Room - Size, [F | Acc]);
+        _ -> {lists:reverse(Acc), Frames}
+    end;
+take_fitting([], _Room, Acc) ->
+    {lists:reverse(Acc), []}.
+
+frames_size(Frames) ->
+    iolist_size([quic_frame:encode(F) || F <- Frames]).
+
+%% The first handshake packet the window held back at Space, sent as the
+%% probe.
+send_pending_hs_probe(
+    Space, #state{hs = #hs{pending_hs = Pending, pending_hs_bytes = Bytes}} = State
+) ->
+    case queue:out(maps:get(Space, Pending, queue:new())) of
+        {empty, _} ->
+            none;
+        {{value, {Payload, Frames}}, Rest} ->
+            Held = max(0, maps:get(Space, Bytes, 0) - iolist_size(Payload)),
+            State1 = State#state{
+                hs = (State#state.hs)#hs{
+                    pending_hs = Pending#{Space => Rest},
+                    pending_hs_bytes = Bytes#{Space => Held}
+                }
+            },
+            {sent, send_at_level(Space, Payload, Frames, State1)}
     end.
 
 %% Get frames from the oldest unacked packet for probe retransmission

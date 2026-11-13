@@ -268,6 +268,76 @@ chunk_run_stays_within_cwnd(Pacing) ->
     ?assert(quic_cc:bytes_in_flight(CC) =< quic_cc:cwnd(CC)).
 
 %%====================================================================
+%% PTO probes
+%%====================================================================
+
+%% The probe goes out past the window, is charged, and carries the held
+%% control frames beside the oldest unacknowledged data (RFC 9002
+%% Sections 6.2.4 and 7.5).
+probe_carries_held_control_frames_test() ->
+    S0 = in_flight(?FLIGHT),
+    Token = binary:copy(<<"t">>, 16),
+    F1 = {new_connection_id, 1, 0, <<"cid-0001">>, Token},
+    F2 = {max_data, S0#state.max_data_local},
+    S1 = quic_connection:send_frame(F2, quic_connection:send_frame(F1, S0)),
+    S2 = quic_connection:handle_pto_timeout(S1#state{pto_space = app}),
+    ?assertEqual([], held(S2)),
+    ?assertEqual([[ping, F1, F2]], [strip_immediate_ack(Fs) || Fs <- sent_frames(S2)]),
+    ?assert(quic_cc:bytes_in_flight(cc(S2)) > quic_cc:cwnd(cc(S2))).
+
+%% Held frames that do not fit the probe stay held, in order.
+probe_leaves_what_does_not_fit_held_test() ->
+    S0 = in_flight(?FLIGHT),
+    Frames = [{new_token, binary:copy(<<N>>, 400)} || N <- lists:seq(1, 4)],
+    S1 = lists:foldl(fun quic_connection:send_frame/2, S0, Frames),
+    S2 = quic_connection:handle_pto_timeout(S1#state{pto_space = app}),
+    [[ping | Sent]] = [strip_immediate_ack(Fs) || Fs <- sent_frames(S2)],
+    ?assertNotEqual([], Sent),
+    ?assertNotEqual([], held(S2)),
+    ?assertEqual(Frames, Sent ++ held(S2)).
+
+%% A limit a newer one replaced is not what the probe resends.
+probe_does_not_resend_a_superseded_limit_test() ->
+    Old = 1000,
+    S0 = in_flight(?FLIGHT, [{max_data, Old}]),
+    S1 = S0#state{max_data_local = Old + 1000, pto_space = app},
+    S2 = quic_connection:handle_pto_timeout(S1),
+    ?assertEqual([[ping]], [strip_immediate_ack(Fs) || Fs <- sent_frames(S2)]).
+
+%% Handshake data the window held back is what the Handshake probe sends.
+handshake_probe_sends_what_the_window_held_test() ->
+    S0 = quic_connection_test_support:state_set(
+        full(
+            quic_connection_test_support:state_sending(
+                quic_connection_test_support:state_with_keys(server)
+            )
+        ),
+        address_validated,
+        true
+    ),
+    Frames = [{crypto, 0, <<"fin">>}],
+    S1 = quic_connection:send_handshake_packet(<<6, 0, 3, "fin">>, Frames, S0),
+    ?assertEqual(1, length(quic_connection_test_support:pending_hs(S1, handshake))),
+    S2 = quic_connection:handle_pto_timeout(S1#state{pto_space = handshake}),
+    ?assertEqual([], quic_connection_test_support:pending_hs(S2, handshake)),
+    #state{loss_state = L} = S2,
+    ?assertMatch(
+        [#sent_packet{frames = Frames}], maps:values(quic_loss:sent_packets(handshake, L))
+    ).
+
+%% An application probe goes out with handshake packets still held.
+app_probe_is_not_stranded_behind_handshake_data_test() ->
+    S0 = in_flight(?FLIGHT),
+    #state{hs = HS} = S0,
+    Pending = queue:from_list([{<<6, 0, 3, "fin">>, [{crypto, 0, <<"fin">>}]}]),
+    S1 = S0#state{
+        pto_space = app,
+        hs = HS#hs{pending_hs = #{initial => queue:new(), handshake => Pending}}
+    },
+    S2 = quic_connection:handle_pto_timeout(S1),
+    ?assertEqual(next_pn(S1) + 1, next_pn(S2)).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -300,10 +370,21 @@ app_state() ->
 
 %% N tracked packets of ?PKT bytes in flight, filling a window of N packets.
 in_flight(N) ->
+    in_flight(N, [ping]).
+
+%% The same, the oldest packet carrying OldestFrames.
+in_flight(N, OldestFrames) ->
     S0 = app_state(),
     Sent = erlang:monotonic_time(millisecond) - 100,
     L = lists:foldl(
-        fun(PN, Acc) -> quic_loss:on_packet_sent(app, Acc, PN, ?PKT, true, [ping], Sent) end,
+        fun(PN, Acc) ->
+            Frames =
+                case PN of
+                    0 -> OldestFrames;
+                    _ -> [ping]
+                end,
+            quic_loss:on_packet_sent(app, Acc, PN, ?PKT, true, Frames, Sent)
+        end,
         S0#state.loss_state,
         lists:seq(0, N - 1)
     ),
@@ -383,3 +464,6 @@ pacing(pacing_off, S) ->
     S;
 pacing(pacing_on, #state{cfg = Cfg} = S) ->
     S#state{cfg = Cfg#conn_cfg{pacing_enabled = true}}.
+
+strip_immediate_ack(Frames) ->
+    [F || F <- Frames, F =/= immediate_ack].
