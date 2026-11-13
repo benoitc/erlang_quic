@@ -136,6 +136,9 @@ All notable changes to this project will be documented in this file.
   or the stream had been reset. It is now sent again only while the
   connection or stream is still blocked at that limit (RFC 9000
   Section 13.3).
+- A lost STOP_SENDING was sent again after the stream had received all
+  its data or the peer had reset it. It is now sent again only while
+  the receive side of the stream is still open (RFC 9000 Section 13.3).
 
 ## [2.7.0] - 2026-11-13
 

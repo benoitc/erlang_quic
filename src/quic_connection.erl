@@ -13545,6 +13545,13 @@ is_current_limit({streams_blocked, bidi, Limit}, State) ->
     Limit =:= State#state.max_streams_bidi_remote;
 is_current_limit({streams_blocked, uni, Limit}, State) ->
     Limit =:= State#state.max_streams_uni_remote;
+%% STOP_SENDING is resent until the receiving part reaches "Data Recvd" or
+%% "Reset Recvd" (RFC 9000 Section 13.3), which recv_done marks.
+is_current_limit({stop_sending, StreamId, _}, #state{streams = Streams}) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream_state{recv_done = Done}} -> not Done;
+        error -> false
+    end;
 %% draft-ietf-quic-ack-frequency-14 Section 4: resend only the latest request.
 is_current_limit({ack_frequency, Seq, _, _, _}, #state{ack_freq_req = #ack_freq_req{seq = Seq}}) ->
     true;

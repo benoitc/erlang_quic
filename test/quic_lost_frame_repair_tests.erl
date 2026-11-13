@@ -73,6 +73,29 @@ streams_blocked_after_the_limit_rose_is_dropped_test() ->
     ?assertEqual([], resent([{streams_blocked, uni, 3}], S)).
 
 %%====================================================================
+%% STOP_SENDING
+%%====================================================================
+
+stop_sending_while_receiving_is_resent_test() ->
+    ?assertEqual([{stop_sending, 0, 7}], resent([{stop_sending, 0, 7}], blocked())).
+
+stop_sending_after_all_data_arrived_is_dropped_test() ->
+    S0 = blocked(),
+    S1 = quic_connection:process_frame(app, {stream, 0, 0, <<"done">>, true}, S0),
+    ?assertMatch(#{0 := #stream_state{recv_done = true}}, S1#state.streams),
+    ?assertEqual([], resent([{stop_sending, 0, 7}], S1)).
+
+stop_sending_after_the_peer_reset_is_dropped_test() ->
+    S0 = blocked(),
+    S1 = quic_connection:process_frame(app, {reset_stream, 0, 9, 0}, S0),
+    ?assertMatch(#{0 := #stream_state{recv_done = true}}, S1#state.streams),
+    ?assertEqual([], resent([{stop_sending, 0, 7}], S1)).
+
+stop_sending_for_a_gone_stream_is_dropped_test() ->
+    S = blocked(),
+    ?assertEqual([], resent([{stop_sending, 0, 7}], S#state{streams = #{}})).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -100,7 +123,7 @@ held(#state{ctrl_queue = {_, Q}}) ->
     queue:to_list(Q).
 
 %% Blocked on every limit: 5000 bytes on the connection, 300 on stream 0,
-%% 10 bidirectional and 3 unidirectional streams.
+%% 10 bidirectional and 3 unidirectional streams. Stream 0 also receives.
 blocked() ->
     S = state(),
     S#state{
@@ -110,7 +133,17 @@ blocked() ->
         max_streams_uni_remote = 3,
         streams = #{
             0 => #stream_state{
-                id = 0, send_offset = 400, send_max_data = 300, send_highest = 300, send_fin = false
+                id = 0,
+                state = open,
+                send_offset = 400,
+                send_max_data = 300,
+                send_highest = 300,
+                send_fin = false,
+                send_buffer = [],
+                recv_offset = 0,
+                recv_max_data = 1000,
+                recv_fin = false,
+                recv_buffer = gb_trees:empty()
             }
         }
     }.
@@ -121,6 +154,8 @@ with_stream(StreamId, Fun, #state{streams = Streams} = State) ->
 state() ->
     S0 = ?S:with_keys_and_socket(?S:state_for_role(client)),
     S0#state{
+        owner = self(),
+        cfg = (S0#state.cfg)#conn_cfg{fc_max_receive_window = 1000},
         max_data_local = 1000,
         max_streams_bidi_local = 100,
         max_streams_uni_local = 100
