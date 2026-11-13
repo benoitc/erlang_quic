@@ -723,15 +723,18 @@ coalesce_small_stream(DataSize, StreamWindow, ConnWindow) ->
         send_queue_version = 1,
         streams = #{0 => #stream_state{id = 0, send_max_data = StreamWindow}},
         max_data_remote = ConnWindow,
-        data_sent = 0
+        data_sent = 0,
+        cc_state = quic_cc:new()
     },
-    case quic_connection:dequeue_small_stream_frame_tuple(State0) of
-        {ok, _FrameTuple, #state{
-            send_queue_bytes = NewBytes,
-            send_queue_count = NewCount,
-            send_queue_version = NewVersion,
-            data_sent = Sent
-        }} ->
+    case quic_connection:dequeue_small_stream_frame_tuple(0, State0) of
+        {ok, _FrameTuple,
+            #state{
+                send_queue_bytes = NewBytes,
+                send_queue_count = NewCount,
+                send_queue_version = NewVersion,
+                data_sent = Sent
+            },
+            _CCState} ->
             #{
                 dequeued => true,
                 send_queue_bytes => NewBytes,
@@ -739,7 +742,7 @@ coalesce_small_stream(DataSize, StreamWindow, ConnWindow) ->
                 send_queue_version => NewVersion,
                 data_sent => Sent
             };
-        none ->
+        {none, _} ->
             #{
                 dequeued => false,
                 send_queue_bytes => DataSize,

@@ -1763,7 +1763,8 @@ connected(
     end,
     %% Send any data that was queued before connection established
     State1 = arm_disconnect_timer(State#state{pending_data = []}),
-    State2 = send_pending_data(Pending, State1),
+    %% 0-RTT data the window held back goes first, as 1-RTT.
+    State2 = send_pending_data(Pending, send_held(State1)),
     %% RFC 9000 Section 9.6: Client validates server's preferred address
     State3 =
         case Role of
@@ -3810,12 +3811,15 @@ count(Ix, #state{cfg = #conn_cfg{counters = C}}) ->
 
 %% Try to coalesce ACK frame with small pending stream data
 %% Takes frame tuples (not encoded) to avoid re-decode overhead
-maybe_coalesce_ack_with_data(AckFrameTuple, State) ->
-    case dequeue_small_stream_frame_tuple(State) of
-        {ok, StreamFrameTuple, State1} ->
-            %% Send coalesced frames - pass tuples directly
-            send_frame_tuples([AckFrameTuple, StreamFrameTuple], State1);
-        none ->
+maybe_coalesce_ack_with_data(AckFrameTuple, State0) ->
+    AckBin = quic_frame:encode(AckFrameTuple),
+    case dequeue_small_stream_frame_tuple(byte_size(AckBin), State0) of
+        {ok, StreamFrameTuple, State1, CCState} ->
+            Payload = [AckBin, quic_frame:encode(StreamFrameTuple)],
+            send_app_packet_internal(
+                Payload, [AckFrameTuple, StreamFrameTuple], State1, CCState
+            );
+        {none, State} ->
             %% Flush the pending stream-data batch first: the ACK-only
             %% packet is ~60 bytes and would break GSO uniformity on the
             %% opt-in socket backend (see `quic_socket:gso_batch_uniform/2'),
@@ -3824,13 +3828,38 @@ maybe_coalesce_ack_with_data(AckFrameTuple, State) ->
             %% the ACK start a fresh batch that flushes at the next
             %% send-cycle boundary.
             State1 = flush_socket_batch(State),
-            send_app_packet_internal(quic_frame:encode(AckFrameTuple), [AckFrameTuple], State1)
+            send_app_packet_internal(AckBin, [AckFrameTuple], State1)
     end.
 
-%% Dequeue a small stream frame tuple if available (< 500 bytes)
-%% Returns the frame tuple (not encoded) to avoid re-decode overhead
+%% Dequeue a small stream frame tuple if available (< 500 bytes) and the
+%% window has room for it beside an ACK of AckSize bytes. Returns the frame
+%% tuple (not encoded) to avoid re-decode overhead.
 -define(SMALL_FRAME_THRESHOLD, 500).
-dequeue_small_stream_frame_tuple(
+dequeue_small_stream_frame_tuple(AckSize, State0) ->
+    case quic_pqueue:peek(State0#state.send_queue) of
+        {value, {stream_data, StreamId, Offset, Data, Fin, DataSize}} when
+            DataSize < ?SMALL_FRAME_THRESHOLD
+        ->
+            %% A queued entry is often one the peer's window has no room
+            %% for yet: it rides along only once both windows admit it.
+            case check_send_queue_flow_control(StreamId, Offset, DataSize, State0) of
+                ok ->
+                    Frame = {stream, StreamId, Offset, Data, Fin},
+                    Size = AckSize + DataSize + ?MAX_STREAM_FRAME_HEADER,
+                    case app_admit(Size, [Frame], State0) of
+                        {ok, State, CCState} ->
+                            {ok, Frame, take_small_stream_entry(State), CCState};
+                        {blocked, State} ->
+                            {none, State}
+                    end;
+                {blocked, _} ->
+                    {none, State0}
+            end;
+        _ ->
+            {none, State0}
+    end.
+
+take_small_stream_entry(
     #state{
         send_queue = PQ,
         send_queue_bytes = QueueBytes,
@@ -3838,43 +3867,21 @@ dequeue_small_stream_frame_tuple(
         send_queue_version = Version
     } = State
 ) ->
-    case quic_pqueue:peek(PQ) of
-        {value, {stream_data, StreamId, Offset, Data, Fin, DataSize}} when
-            DataSize < ?SMALL_FRAME_THRESHOLD
-        ->
-            %% A queued entry is often one the peer's window has no room
-            %% for yet: it rides along only once both windows admit it.
-            case check_send_queue_flow_control(StreamId, Offset, DataSize, State) of
-                ok ->
-                    %% Remove from queue and return frame tuple (not encoded).
-                    %% send_queue_bytes must be decremented here to match the
-                    %% accounting done in process_send_queue_entry/1; otherwise
-                    %% the counter leaks until it crosses ?MAX_SEND_QUEUE_BYTES.
-                    %% data_sent and the FIN are settled as that path does.
-                    {{value, _}, NewPQ} = quic_pqueue:out(PQ),
-                    StreamFrameTuple = {stream, StreamId, Offset, Data, Fin},
-                    NewState = count_sent(StreamId, Offset + DataSize, State#state{
-                        send_queue = NewPQ,
-                        send_queue_bytes = max(0, QueueBytes - DataSize),
-                        send_queue_count = max(0, QueueCount - 1),
-                        send_queue_version = Version + 1
-                    }),
-                    {ok, StreamFrameTuple, fin_sent_if(Fin, StreamId, NewState)};
-                {blocked, _} ->
-                    none
-            end;
-        _ ->
-            none
-    end.
+    %% send_queue_bytes must be decremented here to match the accounting done
+    %% in process_send_queue_entry/1; otherwise the counter leaks until it
+    %% crosses ?MAX_SEND_QUEUE_BYTES. data_sent and the FIN are settled as
+    %% that path does.
+    {{value, {stream_data, StreamId, Offset, _Data, Fin, DataSize}}, NewPQ} = quic_pqueue:out(PQ),
+    NewState = count_sent(StreamId, Offset + DataSize, State#state{
+        send_queue = NewPQ,
+        send_queue_bytes = max(0, QueueBytes - DataSize),
+        send_queue_count = max(0, QueueCount - 1),
+        send_queue_version = Version + 1
+    }),
+    fin_sent_if(Fin, StreamId, NewState).
 
 fin_sent_if(true, StreamId, State) -> mark_fin_sent(StreamId, State);
 fin_sent_if(false, _StreamId, State) -> State.
-
-%% Send multiple frame tuples in a single packet
-%% Takes frame tuples, encodes them, and passes directly to loss tracking
-send_frame_tuples(FrameTuples, State) ->
-    Payload = iolist_to_binary([quic_frame:encode(F) || F <- FrameTuples]),
-    send_app_packet_internal(Payload, FrameTuples, State).
 
 %% Send a Handshake packet
 send_handshake_packet(_Payload, _Frames, #state{hs = #hs{handshake_keys = undefined}} = State) ->
@@ -4012,6 +4019,12 @@ admit_in_flight(Size, State0) ->
 cc_check(CCState, Size, true) -> quic_cc:send_check(CCState, Size);
 cc_check(CCState, Size, false) -> cwnd_only_check(CCState, Size).
 
+%% Stream data waits behind held control frames.
+stream_check(_CCState, _Size, _Pacing, #state{ctrl_queue = {Held, _}}) when Held > 0 ->
+    {blocked_cwnd, 0};
+stream_check(CCState, Size, Pacing, _State) ->
+    cc_check(CCState, Size, Pacing).
+
 %% The pending coalesced packet is not in flight yet: when a send of Size
 %% payload bytes would overflow it, or not fit the window beside it, the
 %% pending packet goes out first so the check sees its bytes.
@@ -4030,7 +4043,12 @@ settle_pending(_Size, State) ->
 %% queue (its credit is already spent), control frames to the control queue.
 %% ACK, PADDING, CONNECTION_CLOSE and DATAGRAM are not resent.
 hold_frames(Frames, State) ->
-    lists:foldl(fun hold_frame/2, State, Frames).
+    {Streams, Ctrl} = lists:partition(fun is_stream_frame/1, Frames),
+    %% Each stream entry goes in front of the queue, so the last goes first.
+    lists:foldl(fun hold_frame/2, lists:foldr(fun hold_frame/2, State, Streams), Ctrl).
+
+is_stream_frame({stream, _, _, _, _}) -> true;
+is_stream_frame(_) -> false.
 
 hold_frame({stream, StreamId, Offset, Data, Fin}, State) ->
     enqueue_retransmit_stream(StreamId, Offset, Data, Fin, State);
@@ -11413,14 +11431,25 @@ zero_rtt_sends(Acc, #state{hs = #hs{early_keys = {EarlyKeys, _}}} = State0) ->
             drain_send_msgs(Acc, 63)
         ),
     MaxPayload = get_max_stream_data_per_packet(State1),
-    State = lists:foldl(
-        fun(Frames, S) ->
-            send_zero_rtt_packet([quic_frame:encode(F) || F <- Frames], Frames, EarlyKeys, S)
-        end,
-        State1,
-        pack_frames(lists:reverse(RevFrames), MaxPayload)
+    State = send_zero_rtt_packets(
+        pack_frames(lists:reverse(RevFrames), MaxPayload), EarlyKeys, State1
     ),
     {keep_state, State, [{reply, F, R} || {F, R} <- lists:reverse(RevReplies), F =/= async]}.
+
+%% RFC 9002 Section 7: 0-RTT packets wait for the window like 1-RTT ones.
+%% The refused packet and everything behind it are queued, their credit
+%% already counted, and go out as 1-RTT once the handshake completes.
+send_zero_rtt_packets([], _EarlyKeys, State) ->
+    State;
+send_zero_rtt_packets([Frames | Rest] = Packets, EarlyKeys, State) ->
+    Payload = [quic_frame:encode(F) || F <- Frames],
+    case app_admit(iolist_size(Payload), Frames, State) of
+        {ok, State1, CCState} ->
+            Sent = send_zero_rtt_packet(Payload, Frames, EarlyKeys, State1#state{cc_state = CCState}),
+            send_zero_rtt_packets(Rest, EarlyKeys, Sent);
+        {blocked, State1} ->
+            hold_frames(lists:append(Packets), State1)
+    end.
 
 zero_rtt_frames(StreamId, Data, Fin, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
@@ -11841,20 +11870,14 @@ send_stream_fragments(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where)
 
 %% @doc Send stream data that fits in a single packet.
 %% Data is a binary (normalised by send_stream_data_fragmented_tracked/5).
-send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where) when
+send_stream_single_packet(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Where) when
     is_binary(Data)
 ->
-    #state{cc_state = CCState, cfg = #conn_cfg{pacing_enabled = PacingEnabled}} = State,
     DataSize = byte_size(Data),
+    #state{cc_state = CCState, cfg = #conn_cfg{pacing_enabled = PacingEnabled}} =
+        State = settle_pending(DataSize + ?MAX_STREAM_FRAME_HEADER, State0),
     PacketSize = DataSize + ?PACKET_OVERHEAD,
-    %% Fused cwnd + pacing check. With pacing disabled the check
-    %% degenerates to cwnd-only in one record match.
-    Check =
-        case PacingEnabled of
-            true -> quic_cc:send_check(CCState, PacketSize);
-            false -> cwnd_only_check(CCState, PacketSize)
-        end,
-    case Check of
+    case stream_check(CCState, PacketSize, PacingEnabled, State) of
         {ok, NewCCState} ->
             Frame = {stream, StreamId, Offset, Data, Fin},
             Payload = quic_frame:encode_iodata(Frame),
@@ -12170,15 +12193,13 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
             )
     end.
 
-send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
+send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx) ->
     {chunked_ctx, MaxChunkSize, PacketSize, _HeaderPrefix, _LengthVarint, Where} = Ctx,
-    #state{cc_state = CCState, cfg = #conn_cfg{pacing_enabled = PacingEnabled}} = State,
-    Check =
-        case PacingEnabled of
-            true -> quic_cc:send_check(CCState, PacketSize);
-            false -> cwnd_only_check(CCState, PacketSize)
-        end,
-    case Check of
+    %% The run goes out after any pending coalesced packet, so that packet
+    %% is in flight before the window is checked.
+    #state{cc_state = CCState, cfg = #conn_cfg{pacing_enabled = PacingEnabled}} =
+        State = flush_pending_packet(State0),
+    case stream_check(CCState, PacketSize, PacingEnabled, State) of
         {ok, NewCCState} ->
             %% First chunk approved. Approve as many further full
             %% chunks as CC/pacing and the burst budget allow, then
@@ -12187,12 +12208,14 @@ send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSen
             %% the largest own-time item on the bulk-send profile.
             FullChunks = byte_size(Data) div MaxChunkSize,
             BudgetLeft = max(1, (State#state.cfg)#conn_cfg.burst_budget - State#state.burst_sent),
-            KMax = min(FullChunks, BudgetLeft),
+            %% The window room counts the first chunk too.
+            CwndChunks = max(1, quic_cc:available_cwnd(CCState) div PacketSize),
+            KMax = min(min(FullChunks, BudgetLeft), CwndChunks),
             {K, CCStateK} = approve_more_chunks(
                 NewCCState, PacketSize, PacingEnabled, KMax, 1
             ),
-            State0 = State#state{cc_state = CCStateK},
-            send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, K);
+            State1 = State#state{cc_state = CCStateK},
+            send_stream_chunk_run(StreamId, Offset, Data, Fin, State1, BytesSentSoFar, Ctx, K);
         {blocked_pacing, Delay} ->
             ?LOG_DEBUG(
                 #{

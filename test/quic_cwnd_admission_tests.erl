@@ -209,6 +209,65 @@ control_queue_overflow_closes_test() ->
     ?assertMatch({transport, ?QUIC_INTERNAL_ERROR, _}, close_error(S1)).
 
 %%====================================================================
+%% Other paths into the window
+%%====================================================================
+
+%% Small stream data rides with an ACK only when the window has room for
+%% it; otherwise the ACK goes alone and the data stays queued.
+ack_with_small_stream_waits_for_cwnd_test() ->
+    S0 = quic_connection_test_support:queue_stream(owing_ack(in_flight(?FLIGHT)), 0, 0, <<"x">>),
+    S1 = quic_connection:send_app_ack(S0),
+    ?assertEqual(next_pn(S0) + 1, next_pn(S1)),
+    ?assertEqual(?FLIGHT * ?PKT, quic_cc:bytes_in_flight(cc(S1))),
+    ?assertEqual([{0, 0, 1}], quic_connection_test_support:queued_entries(S1)).
+
+ack_with_small_stream_rides_when_there_is_room_test() ->
+    S0 = quic_connection_test_support:queue_stream(owing_ack(app_state()), 0, 0, <<"x">>),
+    S1 = quic_connection:send_app_ack(S0),
+    ?assertEqual(next_pn(S0) + 1, next_pn(S1)),
+    ?assertEqual([], quic_connection_test_support:queued_entries(S1)),
+    ?assert(quic_cc:bytes_in_flight(cc(S1)) > 0).
+
+%% 0-RTT data waits for the window; what it holds back is queued and goes
+%% out as 1-RTT.
+zero_rtt_waits_for_cwnd_test() ->
+    S0 = full(quic_connection_test_support:zero_rtt_client([0])),
+    From = {self(), make_ref()},
+    {keep_state, S1, [{reply, From, ok}]} =
+        quic_connection:zero_rtt_sends([{From, 0, <<"early">>, false}], S0),
+    ?assertEqual(next_pn(S0), next_pn(S1)),
+    ?assertEqual(?CWND, quic_cc:bytes_in_flight(cc(S1))),
+    ?assertMatch(
+        {value, {retransmit_stream, 0, 0, <<"early">>, false, 5}},
+        quic_connection_test_support:queue_head(S1)
+    ).
+
+%% Coalesced stream sends are checked with the bytes already pending.
+coalesced_stream_sends_stay_within_cwnd_test() ->
+    Data = binary:copy(<<"s">>, 600),
+    S0 = (with_room(app_state(), 1000))#state{coalesce = true},
+    {ok, S1} = quic_connection:do_send_data(0, Data, false, S0, check),
+    {ok, S2} = quic_connection:do_send_data(0, Data, false, S1, check),
+    CC = cc(quic_connection:flush_pending_packet(S2)),
+    ?assert(quic_cc:bytes_in_flight(CC) =< quic_cc:cwnd(CC)).
+
+%% A run of full chunks counts the first chunk against the window too.
+chunk_run_stays_within_cwnd_test_() ->
+    [
+        {atom_to_list(P), fun() -> chunk_run_stays_within_cwnd(P) end}
+     || P <- [pacing_off, pacing_on]
+    ].
+
+chunk_run_stays_within_cwnd(Pacing) ->
+    S = app_state(),
+    Chunk = quic_connection:get_max_stream_data_per_packet(S),
+    S0 = pacing(Pacing, with_room(S, 2 * (Chunk + 50))),
+    {ok, S1} = quic_connection:do_send_data(0, binary:copy(<<"c">>, 10 * Chunk), false, S0, check),
+    CC = cc(S1),
+    ?assert(next_pn(S1) > next_pn(S0)),
+    ?assert(quic_cc:bytes_in_flight(CC) =< quic_cc:cwnd(CC)).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -319,3 +378,8 @@ control_frames() ->
         ping,
         {path_response, <<1, 2, 3, 4, 5, 6, 7, 8>>}
     ].
+
+pacing(pacing_off, S) ->
+    S;
+pacing(pacing_on, #state{cfg = Cfg} = S) ->
+    S#state{cfg = Cfg#conn_cfg{pacing_enabled = true}}.
