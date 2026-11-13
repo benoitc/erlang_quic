@@ -384,6 +384,7 @@ app_state() ->
         max_data_local = 1000000,
         max_streams_bidi_local = 100,
         max_streams_uni_local = 100,
+        max_streams_bidi_remote = 10,
         last_activity = erlang:monotonic_time(millisecond)
     }.
 
@@ -466,9 +467,9 @@ control_frames() ->
         {max_data, S#state.max_data_local},
         {max_stream_data, 0, 1000000},
         {max_streams, bidi, S#state.max_streams_bidi_local},
-        {data_blocked, 1000},
-        {stream_data_blocked, 0, 1000},
-        {streams_blocked, bidi, 10},
+        {data_blocked, S#state.max_data_remote},
+        {stream_data_blocked, 0, 1000000},
+        {streams_blocked, bidi, S#state.max_streams_bidi_remote},
         {new_connection_id, 1, 0, <<"cid-0001">>, Token},
         {retire_connection_id, 0},
         {reset_stream, 0, 0, 0},

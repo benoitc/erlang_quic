@@ -131,6 +131,11 @@ All notable changes to this project will be documented in this file.
   (RFC 9000 Section 13.3). It no longer is; the probe timeout still
   sends a PING when nothing else is outstanding, so keep-alive and
   liveness checks work as before.
+- A lost DATA_BLOCKED, STREAM_DATA_BLOCKED or STREAMS_BLOCKED was sent
+  again with its old limit even after the peer had raised that limit,
+  or the stream had been reset. It is now sent again only while the
+  connection or stream is still blocked at that limit (RFC 9000
+  Section 13.3).
 
 ## [2.7.0] - 2026-11-13
 

@@ -34,6 +34,45 @@ ping_only_packet_is_acknowledged_without_delay_test() ->
     ?assertNot(quic_connection:should_delay_ack([ping, padding])).
 
 %%====================================================================
+%% DATA_BLOCKED, STREAM_DATA_BLOCKED, STREAMS_BLOCKED
+%%====================================================================
+
+data_blocked_at_the_current_limit_is_resent_test() ->
+    ?assertEqual([{data_blocked, 5000}], resent([{data_blocked, 5000}], blocked())).
+
+data_blocked_after_the_limit_rose_is_dropped_test() ->
+    S = blocked(),
+    ?assertEqual([], resent([{data_blocked, 5000}], S#state{max_data_remote = 9000})).
+
+stream_data_blocked_at_the_current_limit_is_resent_test() ->
+    ?assertEqual(
+        [{stream_data_blocked, 0, 300}], resent([{stream_data_blocked, 0, 300}], blocked())
+    ).
+
+stream_data_blocked_after_the_limit_rose_is_dropped_test() ->
+    S = with_stream(0, fun(St) -> St#stream_state{send_max_data = 600} end, blocked()),
+    ?assertEqual([], resent([{stream_data_blocked, 0, 300}], S)).
+
+stream_data_blocked_after_reset_is_dropped_test() ->
+    S = with_stream(0, fun(St) -> St#stream_state{send_done = true} end, blocked()),
+    ?assertEqual([], resent([{stream_data_blocked, 0, 300}], S)),
+    S1 = with_stream(0, fun(St) -> St#stream_state{send_reset_at = 100} end, blocked()),
+    ?assertEqual([], resent([{stream_data_blocked, 0, 300}], S1)).
+
+stream_data_blocked_for_a_gone_stream_is_dropped_test() ->
+    S = blocked(),
+    ?assertEqual([], resent([{stream_data_blocked, 0, 300}], S#state{streams = #{}})).
+
+streams_blocked_at_the_current_limit_is_resent_test() ->
+    ?assertEqual([{streams_blocked, bidi, 10}], resent([{streams_blocked, bidi, 10}], blocked())),
+    ?assertEqual([{streams_blocked, uni, 3}], resent([{streams_blocked, uni, 3}], blocked())).
+
+streams_blocked_after_the_limit_rose_is_dropped_test() ->
+    S = (blocked())#state{max_streams_bidi_remote = 20, max_streams_uni_remote = 5},
+    ?assertEqual([], resent([{streams_blocked, bidi, 10}], S)),
+    ?assertEqual([], resent([{streams_blocked, uni, 3}], S)).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -59,6 +98,25 @@ sent(State) ->
 
 held(#state{ctrl_queue = {_, Q}}) ->
     queue:to_list(Q).
+
+%% Blocked on every limit: 5000 bytes on the connection, 300 on stream 0,
+%% 10 bidirectional and 3 unidirectional streams.
+blocked() ->
+    S = state(),
+    S#state{
+        max_data_remote = 5000,
+        data_sent = 5000,
+        max_streams_bidi_remote = 10,
+        max_streams_uni_remote = 3,
+        streams = #{
+            0 => #stream_state{
+                id = 0, send_offset = 400, send_max_data = 300, send_highest = 300, send_fin = false
+            }
+        }
+    }.
+
+with_stream(StreamId, Fun, #state{streams = Streams} = State) ->
+    State#state{streams = maps:update_with(StreamId, Fun, Streams)}.
 
 state() ->
     S0 = ?S:with_keys_and_socket(?S:state_for_role(client)),

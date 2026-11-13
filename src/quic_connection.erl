@@ -13515,8 +13515,9 @@ retransmit_lost_packets([#sent_packet{frames = Frames} | Rest], State) ->
     State1 = send_retransmit_frames_cc(CurrentFrames, State),
     retransmit_lost_packets(Rest, State1).
 
-%% RFC 9000 Section 13.3: a lost MAX_DATA, MAX_STREAM_DATA or MAX_STREAMS
-%% is resent only if no larger value has been sent since, and
+%% Whether a lost or held frame still carries current information
+%% (RFC 9000 Section 13.3). A MAX_DATA, MAX_STREAM_DATA or MAX_STREAMS is
+%% resent only if no larger value has been sent since, and
 %% MAX_STREAM_DATA not once the final size is known.
 is_current_limit({max_data, N}, State) ->
     N >= State#state.max_data_local;
@@ -13529,6 +13530,21 @@ is_current_limit({max_stream_data, StreamId, N}, #state{streams = Streams}) ->
         {ok, #stream_state{final_size = undefined, recv_max_data = Max}} -> N >= Max;
         _ -> false
     end;
+%% A BLOCKED frame is resent only while still blocked at the limit it
+%% carries (RFC 9000 Section 13.3).
+is_current_limit({data_blocked, Limit}, State) ->
+    Limit =:= State#state.max_data_remote;
+is_current_limit({stream_data_blocked, StreamId, Limit}, #state{streams = Streams}) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream_state{send_done = false, send_reset_at = undefined, send_max_data = Max}} ->
+            Limit =:= Max;
+        _ ->
+            false
+    end;
+is_current_limit({streams_blocked, bidi, Limit}, State) ->
+    Limit =:= State#state.max_streams_bidi_remote;
+is_current_limit({streams_blocked, uni, Limit}, State) ->
+    Limit =:= State#state.max_streams_uni_remote;
 %% draft-ietf-quic-ack-frequency-14 Section 4: resend only the latest request.
 is_current_limit({ack_frequency, Seq, _, _, _}, #state{ack_freq_req = #ack_freq_req{seq = Seq}}) ->
     true;
