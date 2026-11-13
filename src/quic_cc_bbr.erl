@@ -136,6 +136,13 @@
 -define(SEND_QUANTUM_MAX, 65536).
 
 -define(MAX_DATAGRAM_SIZE, 1200).
+
+%% ACK frequency (Section 4.1.3.3): the RFC 9000 max_ack_delay default
+%% in microseconds, the loss detector's packet threshold, and how many
+%% times an exhausted cwnd may halve a reduced request.
+-define(DEFAULT_ACK_DELAY_US, 25000).
+-define(ACK_REORDERING_THRESHOLD, 3).
+-define(MAX_ACK_FREQ_SHIFT, 4).
 -define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 
 %%====================================================================
@@ -276,6 +283,11 @@
     in_recovery = false :: boolean(),
     recovery_start = 0 :: integer(),
 
+    %% ACK frequency (Sections 4.1.3.3, 5.5.8.2): what the peer was asked,
+    %% and how often an exhausted cwnd halved the reduced request
+    ack_freq = undefined :: quic_cc:ack_frequency() | undefined,
+    ack_freq_shift = 0 :: non_neg_integer(),
+
     %% Pacing (Sections 5.6.2, 5.6.3)
     pacing_rate = 0 :: non_neg_integer(),
     has_seen_rtt = false :: boolean(),
@@ -415,7 +427,7 @@ on_packets_acked_at(State0, AckedBytes, Now) ->
     State2 = generate_rate_sample(State1),
     State3 = maybe_exit_recovery(State2),
     State4 = update_model_and_state(State3, Now),
-    update_control_parameters(State4).
+    update_ack_freq_shift(update_control_parameters(State4)).
 
 %% Section 4.1.2.3 UpdateRateSample, over the oldest outstanding bytes.
 take_acked(#bbr_state{bytes_in_flight = InFlight} = S, AckedBytes, Now) ->
@@ -1309,6 +1321,13 @@ quantization_budget(#bbr_state{mode = Mode, max_datagram_size = MDS} = S, Inflig
     end.
 
 %% Section 5.5.8.2; no pacing offload term: no SO_TXTIME, GSO only segments.
+%% Reduced ACK frequency adds min(Ack-Eliciting Threshold, Requested Max
+%% Ack Delay * BBR.max_bw).
+offload_budget(#bbr_state{send_quantum = Quantum, ack_freq = {Threshold, DelayUs, _}} = S) when
+    Threshold > 1
+->
+    #bbr_state{max_datagram_size = MDS, max_bw = MaxBw} = S,
+    Quantum + min(Threshold * MDS, (DelayUs * MaxBw) div ?US_PER_SEC);
 offload_budget(#bbr_state{send_quantum = Quantum}) ->
     Quantum.
 
@@ -1640,6 +1659,8 @@ info(#bbr_state{} = S) ->
         prev_probe_too_high => S#bbr_state.prev_probe_too_high,
         bw_probe_wait => S#bbr_state.bw_probe_wait,
         probe_rtt_done_stamp => S#bbr_state.probe_rtt_done_stamp,
+        ack_frequency => S#bbr_state.ack_freq,
+        ack_freq_shift => S#bbr_state.ack_freq_shift,
         sent_packets => queue:len(S#bbr_state.sent)
     }.
 
@@ -1647,19 +1668,53 @@ info(#bbr_state{} = S) ->
 %% ACK frequency (Section 4.1.3.3)
 %%====================================================================
 
-%% @doc The ACK frequency to ask of the peer: none yet.
+%% @doc The ACK frequency to ask of the peer in the current phase:
+%% Ack-Eliciting Threshold, Requested Max Ack Delay (microseconds) and
+%% Reordering Threshold.
 -spec ack_frequency(cc_state(), non_neg_integer()) -> quic_cc:ack_frequency() | none.
-ack_frequency(_S, _SmoothedRttUs) ->
-    none.
+ack_frequency(#bbr_state{mode = Mode} = S, SmoothedRttUs) when
+    Mode =:= probe_bw_down; Mode =:= probe_bw_cruise
+->
+    reduced_ack_frequency(S, SmoothedRttUs);
+ack_frequency(S, SmoothedRttUs) ->
+    frequent_ack_frequency(S, SmoothedRttUs).
 
-%% @doc Whether the last packet of a flight should carry IMMEDIATE_ACK.
+%% Startup, Drain, ProbeBW_REFILL, ProbeBW_UP and ProbeRTT: at least 4 ACKs
+%% per round trip, never fewer than RFC 9000 Section 13.2 gives.
+frequent_ack_frequency(#bbr_state{cwnd = Cwnd, max_datagram_size = MDS}, SmoothedRttUs) ->
+    Threshold = min(1, max(0, (Cwnd div MDS) div 4 - 1)),
+    {Threshold, max(1, min(?DEFAULT_ACK_DELAY_US, SmoothedRttUs div 4)), 1}.
+
+%% ProbeBW_DOWN and ProbeBW_CRUISE: up to a quarter of cwnd and half an
+%% RTT, halved each time an exhausted cwnd asked for more ACKs.
+reduced_ack_frequency(S, SmoothedRttUs) ->
+    #bbr_state{cwnd = Cwnd, max_datagram_size = MDS, ack_freq_shift = Shift} = S,
+    Threshold = max(1, ((Cwnd div MDS) div 4) bsr Shift),
+    {Threshold, max(1, (SmoothedRttUs div 2) bsr Shift), ?ACK_REORDERING_THRESHOLD}.
+
+%% @doc Whether the last packet of a flight should carry IMMEDIATE_ACK:
+%% in ProbeRTT, for a timely min_rtt sample.
 -spec immediate_ack(cc_state()) -> boolean().
-immediate_ack(_S) ->
-    false.
+immediate_ack(#bbr_state{mode = probe_rtt}) -> true;
+immediate_ack(_S) -> false.
 
 %% @doc The peer was asked for this ACK frequency.
 -spec on_ack_frequency(cc_state(), quic_cc:ack_frequency()) -> cc_state().
-on_ack_frequency(S, _Request) ->
+on_ack_frequency(S, Request) ->
+    S#bbr_state{ack_freq = Request}.
+
+%% Section 4.1.3.3: a round that exhausted cwnd under a reduced ACK
+%% frequency asks for more ACKs; one that did not gives one step back.
+update_ack_freq_shift(#bbr_state{round_start = true, ack_freq = {T, _, _}} = S) when T > 1 ->
+    #bbr_state{cwnd_limited_prev = Limited, ack_freq_shift = Shift} = S,
+    S#bbr_state{
+        ack_freq_shift =
+            case Limited of
+                true -> min(Shift + 1, ?MAX_ACK_FREQ_SHIFT);
+                false -> max(Shift - 1, 0)
+            end
+    };
+update_ack_freq_shift(S) ->
     S.
 
 now_us() ->

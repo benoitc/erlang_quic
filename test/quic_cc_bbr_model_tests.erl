@@ -758,3 +758,87 @@ low_random_loss_keeps_throughput_test() ->
     Sim = run(sim((bulk_path())#{drop => 0.01}), 10 * ?SEC),
     Delivered = info(Sim, delivered),
     ?assert(Delivered > 0.7 * 10000000 * 10).
+
+%%====================================================================
+%% ACK frequency (Sections 4.1.3.3 and 5.5.8.2)
+%%====================================================================
+
+-define(SRTT, 40 * ?MS).
+
+%% Startup asks for at least 4 ACKs per round trip.
+startup_asks_for_frequent_acks_test() ->
+    Sim = run(sim(bulk_path()), 100 * ?MS),
+    ?assertEqual(startup, info(Sim, mode)),
+    assert_frequent(Sim).
+
+%% ProbeBW_DOWN and ProbeBW_CRUISE ask for an ACK per quarter cwnd and
+%% half an RTT, with the loss detector's packet threshold.
+cruise_asks_for_fewer_acks_test() ->
+    Sim = run_until(to_probe_bw(sim(bulk_path())), in_mode(probe_bw_cruise), 5 * ?SEC),
+    ?assertEqual(probe_bw_cruise, info(Sim, mode)),
+    CwndPkts = info(Sim, cwnd) div ?MDS,
+    ?assertEqual(
+        {CwndPkts div 4, ?SRTT div 2, 3}, quic_cc_bbr:ack_frequency(maps:get(cc, Sim), ?SRTT)
+    ),
+    ?assert(CwndPkts div 4 > 1).
+
+%% Upon entering ProbeBW_REFILL, and through ProbeBW_UP, frequent again.
+refill_and_up_ask_for_frequent_acks_test() ->
+    Cruise = run_until(to_probe_bw(sim(bulk_path())), in_mode(probe_bw_cruise), 5 * ?SEC),
+    Refill = run_until(Cruise, in_mode(probe_bw_refill), 5 * ?SEC),
+    ?assertEqual(probe_bw_refill, info(Refill, mode)),
+    assert_frequent(Refill),
+    Up = run_until(Refill, in_mode(probe_bw_up), 5 * ?SEC),
+    ?assertEqual(probe_bw_up, info(Up, mode)),
+    assert_frequent(Up).
+
+%% ProbeRTT asks for IMMEDIATE_ACK at each flight's end; no other phase does.
+probe_rtt_asks_for_immediate_ack_test() ->
+    Sim = to_probe_bw(sim(bulk_path())),
+    ?assertNot(quic_cc_bbr:immediate_ack(maps:get(cc, Sim))),
+    In = run_until(Sim, in_mode(probe_rtt), 15 * ?SEC),
+    ?assertEqual(probe_rtt, info(In, mode)),
+    ?assert(quic_cc_bbr:immediate_ack(maps:get(cc, In))),
+    assert_frequent(In),
+    Out = run_until(In, not_in_mode(probe_rtt), 2 * ?SEC),
+    ?assertNot(quic_cc_bbr:immediate_ack(maps:get(cc, Out))).
+
+%% Section 5.5.8.2: reduced ACK frequency adds min(Ack-Eliciting
+%% Threshold, Requested Max Ack Delay * max_bw) to the offload budget.
+offload_budget_counts_reduced_ack_frequency_test() ->
+    Sim = run(to_probe_bw(sim(bulk_path())), ?SEC),
+    CC = maps:get(cc, Sim),
+    Quantum = info(Sim, send_quantum),
+    MaxBw = info(Sim, max_bw),
+    ?assertEqual(Quantum, info(Sim, offload_budget)),
+    Delay = fun(T, D) ->
+        maps:get(offload_budget, quic_cc_bbr:info(quic_cc_bbr:on_ack_frequency(CC, {T, D, 3})))
+    end,
+    ?assertEqual(Quantum + 10 * ?MDS, Delay(10, 20 * ?MS)),
+    ?assertEqual(Quantum + (?MS * MaxBw) div ?SEC, Delay(1000, ?MS)),
+    %% No reduction, no extra budget.
+    ?assertEqual(Quantum, Delay(1, 20 * ?MS)).
+
+%% A sender that exhausts cwnd before the next ACK asks for more ACKs;
+%% once it no longer does, it steps back.
+exhausted_cwnd_raises_ack_frequency_test() ->
+    Cruise = run_until(to_probe_bw(sim(bulk_path())), in_mode(probe_bw_cruise), 5 * ?SEC),
+    Before = quic_cc_bbr:ack_frequency(maps:get(cc, Cruise), ?SRTT),
+    Reduced = Cruise#{cc := quic_cc_bbr:on_ack_frequency(maps:get(cc, Cruise), Before)},
+    %% The receiver holds its ACKs for longer than cwnd lasts.
+    Starved = run(Reduced#{ack_every := 120 * ?MS}, 100 * ?MS),
+    ?assert(info(Starved, ack_freq_shift) > 0),
+    {T, D, 3} = quic_cc_bbr:ack_frequency(maps:get(cc, Starved), ?SRTT),
+    CwndPkts = info(Starved, cwnd) div ?MDS,
+    ?assert(T < max(2, CwndPkts div 4)),
+    ?assert(D < ?SRTT div 2),
+    Relaxed = run(Starved#{ack_every := 1}, 2 * ?SEC),
+    ?assert(info(Relaxed, ack_freq_shift) < info(Starved, ack_freq_shift)).
+
+assert_frequent(Sim) ->
+    {T, D, R} = quic_cc_bbr:ack_frequency(maps:get(cc, Sim), ?SRTT),
+    CwndPkts = info(Sim, cwnd) div ?MDS,
+    ?assert(T =< 1),
+    ?assert(CwndPkts div (T + 1) >= 4),
+    ?assert(D =< ?SRTT div 4),
+    ?assertEqual(1, R).

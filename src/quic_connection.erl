@@ -7038,20 +7038,27 @@ maybe_request_ack_frequency(#state{cc_state = CC, loss_state = LossState} = Stat
         Request -> request_ack_frequency(Request, State)
     end.
 
-request_ack_frequency({Threshold, Delay0, Reordering}, #state{transport_params = TP} = State) ->
+request_ack_frequency({Threshold, Delay0, Reordering0}, #state{transport_params = TP} = State) ->
     case maps:get(min_ack_delay, TP, undefined) of
         undefined ->
             State;
         PeerMin ->
             %% Section 4: no less than the peer's min_ack_delay, below 2^14 ms.
             Delay = min(max(Delay0, PeerMin), ?MAX_REQUESTED_ACK_DELAY_US - 1),
-            Request = {Threshold, Delay, Reordering},
+            Request = {Threshold, Delay, reordering_threshold(Reordering0, State)},
             Now = erlang:monotonic_time(millisecond),
             case ack_frequency_due(Request, Now, State) of
                 true -> send_ack_frequency(Request, Now, State);
                 false -> State
             end
     end.
+
+%% Section 9: a Reordering Threshold above 1 follows loss detection's
+%% packet threshold, which grows with the reordering seen.
+reordering_threshold(Reordering, #state{loss_state = LossState}) when Reordering > 1 ->
+    max(Reordering, quic_loss:reorder_threshold(app, LossState));
+reordering_threshold(Reordering, _State) ->
+    Reordering.
 
 %% A change asking for ACKs as often or more goes out at once; one asking
 %% for fewer at most once per smoothed RTT (Section 8.1).

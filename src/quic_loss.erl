@@ -73,6 +73,7 @@
     set_peer_ack_params/3,
     max_ack_delay/1,
     set_max_ack_delay/2,
+    reorder_threshold/2,
     on_handshake_confirmed/1,
 
     %% Queries
@@ -1002,6 +1003,12 @@ set_peer_ack_params(#loss_state{} = State, Exponent, MaxAckDelay) ->
 %% @doc The peer's max_ack_delay (ms) the PTO and RTT samples use.
 -spec max_ack_delay(loss_state()) -> non_neg_integer().
 max_ack_delay(#loss_state{max_ack_delay = MaxAckDelay}) -> MaxAckDelay.
+
+%% @doc The packet threshold loss detection uses in a space, raised by
+%% reordering it has seen (RFC 9002 Section 6.1.1).
+-spec reorder_threshold(space(), loss_state()) -> pos_integer().
+reorder_threshold(Space, #loss_state{} = State) ->
+    (pn(Space, State))#pn_loss.reorder_threshold.
 
 %% @doc Use MaxAckDelay (ms) for the peer's max_ack_delay, as an
 %% ACK_FREQUENCY request changes it (draft-ietf-quic-ack-frequency-14 Section 7).
