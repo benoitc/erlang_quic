@@ -105,7 +105,7 @@ rest without a reply.
 | `pmtu_max_mtu` | integer | 1500 | Maximum MTU to probe |
 | `preferred_ipv4` | tuple | - | Preferred IPv4 address for migration |
 | `preferred_ipv6` | tuple | - | Preferred IPv6 address for migration |
-| `lb_config` | map | - | QUIC-LB configuration (RFC 9312) |
+| `lb_config` | map | - | QUIC-LB configuration (draft-ietf-quic-load-balancers-22) |
 | `server_send_batching` | boolean | true | Per-connection send batching over the shared listener socket. On Linux + `socket_backend => socket` with UDP_SEGMENT, coalesces outgoing packets into GSO super-datagrams; no-op on macOS / gen_udp. Set to `false` to fall back to direct `gen_udp:send/4`. |
 
 ## Observability
@@ -298,7 +298,7 @@ end.
 }).
 ```
 
-## Load Balancer Integration (RFC 9312)
+## Load Balancer Integration (draft-ietf-quic-load-balancers-22)
 
 ```erlang
 %% Configure QUIC-LB for load balancer routing
@@ -306,7 +306,7 @@ LBConfig = #{
     server_id => <<1, 2, 3, 4>>,        % Unique server identifier
     algorithm => encrypted,              % plaintext | encrypted
     key => crypto:strong_rand_bytes(16), % Encryption key (not for plaintext)
-    config_rotation => 0                 % Config rotation bits (0-7)
+    config_rotation => 0                 % Config rotation bits (0-6)
 },
 
 {ok, _} = quic:start_server(lb_server, 4433, #{
@@ -315,6 +315,19 @@ LBConfig = #{
     lb_config => LBConfig
 }).
 ```
+
+Notes:
+
+- `plaintext` puts the server ID in the CID as is. `encrypted` needs a
+  16-byte `key` and produces the CIDs a draft-22 load balancer decodes
+  with the same key.
+- `server_id` and `nonce_len` (default 4, at least 4) add up to 19 bytes
+  or less. The CID is one byte longer than their sum.
+- `stream_cipher` and `block_cipher`, from earlier drafts, are refused:
+  the server does not start and returns
+  `{error, {invalid_lb_config, {unsupported_lb_algorithm, Algorithm}}}`.
+- `quic_lb:decode_server_id/2` takes the same configuration and returns
+  the server ID of a CID, for a load balancer written in Erlang.
 
 ## Connection Migration (RFC 9000 Section 9)
 

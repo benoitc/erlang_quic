@@ -829,7 +829,7 @@
 }).
 
 %%====================================================================
-%% QUIC-LB (RFC 9312) - QUIC Load Balancer Configuration
+%% QUIC-LB (draft-ietf-quic-load-balancers-22) - QUIC Load Balancer Configuration
 %%====================================================================
 
 %% Config Rotation for unroutable packets (CR bits = 0b111)

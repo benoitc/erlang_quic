@@ -175,7 +175,7 @@ See [docs/PSK.md](PSK.md). Pending follow-ups tracked in the
 - [x] Updated initial salt
 - [x] Updated retry integrity tag key
 
-## QUIC-LB Load Balancer Support (RFC 9312)
+## QUIC-LB Load Balancer Support (draft-ietf-quic-load-balancers-22)
 
 - [x] Server ID encoding in Connection IDs for LB routing
 - [x] Config rotation bits for LB coordination
@@ -308,7 +308,7 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 - `quic:get_server_connections/1` - Get server connection PIDs
 - `quic:which_servers/0` - List all running servers
 
-### Load Balancer (RFC 9312)
+### Load Balancer (draft-ietf-quic-load-balancers-22)
 - `quic_lb:new_config/1` - Create LB configuration from options map
 - `quic_lb:new_cid_config/1` - Create CID generation configuration
 - `quic_lb:generate_cid/1` - Generate CID with encoded server_id

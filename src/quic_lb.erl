@@ -1,14 +1,15 @@
 %%% -*- erlang -*-
 %%%
 %%% QUIC-LB Connection ID Encoding
-%%% RFC 9312 - QUIC-LB: Generating Routable QUIC Connection IDs
+%%% draft-ietf-quic-load-balancers-22 - QUIC-LB: Generating Routable QUIC Connection IDs
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
 %%% Apache License 2.0
 %%%
 %%% @doc QUIC Load Balancer Connection ID encoding and decoding.
 %%%
-%%% This module implements RFC 9312 Connection ID encoding schemes
+%%% This module implements the QUIC-LB (draft-ietf-quic-load-balancers-22)
+%%% Connection ID encoding schemes
 %%% that allow load balancers to route QUIC packets to the correct
 %%% server based on server identity encoded in the Connection ID.
 %%%
@@ -16,7 +17,7 @@
 %%%
 %%% The first byte contains:
 %%% - CR (Config Rotation): 3 bits identifying the configuration
-%%% - Length: 5 bits (CID length - 1, so 0-19 maps to 1-20 bytes)
+%%% - Length: 5 bits, the number of bytes after the first octet
 %%%
 %%% <pre>
 %%% +--------+----------------+--------+
@@ -24,6 +25,8 @@
 %%% | Len:5  | (1-15 bytes)   | (4-18) |
 %%% +--------+----------------+--------+
 %%% </pre>
+%%%
+%%% Server ID and nonce together are at most 19 bytes (Section 5.3).
 %%%
 %%% == Algorithms ==
 %%%
@@ -264,7 +267,7 @@ expected_cid_len(#lb_config{server_id_len = ServerIDLen, nonce_len = NonceLen}) 
     1 + ServerIDLen + NonceLen.
 
 %%====================================================================
-%% Plaintext Encoding (RFC 9312 Section 4.1)
+%% Plaintext Encoding (draft-ietf-quic-load-balancers-22 Section 5.4)
 %%====================================================================
 
 %% @private Encode plaintext CID

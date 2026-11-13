@@ -1,6 +1,6 @@
 %%% -*- erlang -*-
 %%%
-%%% With QUIC-LB configured (RFC 9312), the CIDs offered in
+%%% With QUIC-LB configured (draft-ietf-quic-load-balancers-22), the CIDs offered in
 %%% NEW_CONNECTION_ID carry the server ID like the handshake CID, so the
 %%% load balancer still routes a peer that switches to one.
 

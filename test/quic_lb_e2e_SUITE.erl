@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% End-to-End Tests for QUIC-LB CID Encoding
-%%% RFC 9312 - QUIC-LB: Generating Routable QUIC Connection IDs
+%%% draft-ietf-quic-load-balancers-22 - QUIC-LB: Generating Routable QUIC Connection IDs
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
 %%% Apache License 2.0

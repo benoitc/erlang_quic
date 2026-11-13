@@ -199,7 +199,7 @@
         fun((pid()) -> {ok, pid()} | {error, term()})
         | fun((pid(), binary()) -> {ok, pid()} | {error, term()})
         | undefined,
-    %% QUIC-LB CID configuration (RFC 9312)
+    %% QUIC-LB CID configuration (draft-ietf-quic-load-balancers-22)
     cid_config :: #cid_config{} | undefined,
     %% Expected DCID length for short header packets
     dcid_len = 8 :: pos_integer(),
@@ -435,7 +435,7 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts, Preferred
     %% Generate or use provided stateless reset secret
     ResetSecret = maps:get(reset_secret, Opts, crypto:strong_rand_bytes(32)),
 
-    %% Initialize QUIC-LB CID configuration (RFC 9312)
+    %% Initialize QUIC-LB CID configuration (draft-ietf-quic-load-balancers-22)
     {ok, {CIDConfig, DCIDLen}} = init_cid_config(Opts, ResetSecret),
 
     %% Start GRO receiver if using socket backend
