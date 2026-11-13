@@ -60,6 +60,10 @@
 %% RESET_STREAM_AT Frame (draft-ietf-quic-reliable-stream-reset-11 Section 4)
 -define(FRAME_RESET_STREAM_AT, 16#24).
 
+%% ACK_FREQUENCY and IMMEDIATE_ACK (draft-ietf-quic-ack-frequency-14 Sections 4 and 5)
+-define(FRAME_ACK_FREQUENCY, 16#af).
+-define(FRAME_IMMEDIATE_ACK, 16#1f).
+
 %%====================================================================
 %% Stream Frame Flags (bits 0-2 of frame type 0x08-0x0f)
 %%====================================================================
@@ -151,6 +155,9 @@
 %% reset_stream_at: draft-ietf-quic-reliable-stream-reset-11 Section 3, then the -07 id.
 -define(TP_RESET_STREAM_AT, 16#1d).
 -define(TP_RESET_STREAM_AT_DRAFT07, 16#17f7586d2cb571).
+
+%% min_ack_delay in microseconds (draft-ietf-quic-ack-frequency-14 Section 3)
+-define(TP_MIN_ACK_DELAY, 16#ff04de1b).
 
 %%====================================================================
 %% Crypto Constants

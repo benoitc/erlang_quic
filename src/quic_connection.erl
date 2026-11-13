@@ -6197,6 +6197,9 @@ frame_permitted(zero_rtt, Frame) ->
         {new_token, _} -> false;
         {path_response, _} -> false;
         handshake_done -> false;
+        %% draft-ietf-quic-ack-frequency-14 Section 3: never in 0-RTT
+        {ack_frequency, _, _, _, _} -> false;
+        immediate_ack -> false;
         _ -> true
     end;
 frame_permitted(_Level, _Frame) ->
@@ -6651,6 +6654,12 @@ process_frame(
         error ->
             reset_unseen_stream(StreamId, ErrorCode, FinalSize, State)
     end;
+%% Without our min_ack_delay transport parameter both frame types are
+%% unknown on this connection (RFC 9000 Section 12.4).
+process_frame(app, {ack_frequency, _, _, _, _}, State) ->
+    ack_frequency_not_negotiated(?FRAME_ACK_FREQUENCY, State);
+process_frame(app, immediate_ack, State) ->
+    ack_frequency_not_negotiated(?FRAME_IMMEDIATE_ACK, State);
 %% Without our reset_stream_at transport parameter the frame type is
 %% unknown on this connection (RFC 9000 Section 12.4).
 process_frame(
@@ -6920,6 +6929,16 @@ process_frame(
 process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
     State.
+
+ack_frequency_not_negotiated(FrameType, State) ->
+    close_with_error(
+        app,
+        transport,
+        ?QUIC_FRAME_ENCODING_ERROR,
+        FrameType,
+        <<"ACK frequency not negotiated">>,
+        State
+    ).
 
 %% What an ACK means beyond loss and congestion accounting. Only the
 %% application space has streams, PMTU probes and a send queue, so the

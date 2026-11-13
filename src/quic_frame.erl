@@ -55,7 +55,10 @@
         FrameType :: non_neg_integer() | undefined, Reason :: binary()}
     | handshake_done
     | {datagram, Data :: binary()}
-    | {datagram_with_length, Data :: binary()}.
+    | {datagram_with_length, Data :: binary()}
+    | {ack_frequency, SeqNum :: non_neg_integer(), AckElicitingThreshold :: non_neg_integer(),
+        RequestedMaxAckDelay :: non_neg_integer(), ReorderingThreshold :: non_neg_integer()}
+    | immediate_ack.
 
 -type ecn_counts() :: {
     ECT0 :: non_neg_integer(), ECT1 :: non_neg_integer(), ECNCE :: non_neg_integer()
@@ -168,7 +171,19 @@ encode({datagram, Data}) ->
     <<?FRAME_DATAGRAM, Data/binary>>;
 %% DATAGRAM_WITH_LENGTH (0x31 - includes length)
 encode({datagram_with_length, Data}) ->
-    <<?FRAME_DATAGRAM_WITH_LEN, (quic_varint:encode(byte_size(Data)))/binary, Data/binary>>.
+    <<?FRAME_DATAGRAM_WITH_LEN, (quic_varint:encode(byte_size(Data)))/binary, Data/binary>>;
+%% ACK_FREQUENCY (0xaf) - draft-ietf-quic-ack-frequency-14 Section 4
+encode({ack_frequency, SeqNum, Threshold, MaxAckDelay, Reordering}) ->
+    <<
+        (quic_varint:encode(?FRAME_ACK_FREQUENCY))/binary,
+        (quic_varint:encode(SeqNum))/binary,
+        (quic_varint:encode(Threshold))/binary,
+        (quic_varint:encode(MaxAckDelay))/binary,
+        (quic_varint:encode(Reordering))/binary
+    >>;
+%% IMMEDIATE_ACK (0x1f) - draft-ietf-quic-ack-frequency-14 Section 5
+encode(immediate_ack) ->
+    <<?FRAME_IMMEDIATE_ACK>>.
 
 %% @doc Encode a frame as iodata. For STREAM frames with a binary Data
 %% this returns `[Header, Data]' without copying the payload into the
@@ -341,6 +356,16 @@ decode(<<?FRAME_DATAGRAM_WITH_LEN, Rest/binary>>) ->
             <<Data:Length/binary, Rest2/binary>> = Rest1,
             {{datagram_with_length, Data}, Rest2}
     end;
+%% ACK_FREQUENCY (0xaf, a two-byte varint type)
+decode(<<1:2, ?FRAME_ACK_FREQUENCY:14, Rest/binary>>) ->
+    {SeqNum, Rest1} = quic_varint:decode(Rest),
+    {Threshold, Rest2} = quic_varint:decode(Rest1),
+    {MaxAckDelay, Rest3} = quic_varint:decode(Rest2),
+    {Reordering, Rest4} = quic_varint:decode(Rest3),
+    {{ack_frequency, SeqNum, Threshold, MaxAckDelay, Reordering}, Rest4};
+%% IMMEDIATE_ACK (0x1f)
+decode(<<?FRAME_IMMEDIATE_ACK, Rest/binary>>) ->
+    {immediate_ack, Rest};
 %% The frame type is a varint (RFC 9000 Section 12.4).
 decode(<<0:2, Type:6, _/binary>>) ->
     {error, {unknown_frame_type, Type}};
