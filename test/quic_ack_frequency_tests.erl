@@ -142,6 +142,48 @@ not_in_long_header_or_zero_rtt_test_() ->
         Frame <- [{ack_frequency, 0, 1, 1000, 1}, immediate_ack]
     ].
 
+%% A connected receiver that can send ACKs and has received nothing yet.
+receiver() ->
+    S = quic_connection_test_support:state_sending(
+        quic_connection_test_support:state_with_keys(client)
+    ),
+    S#state{
+        pn_app = #pn_space{
+            next_pn = 0,
+            largest_recv = undefined,
+            recv_time = undefined,
+            ack_ranges = [],
+            ack_eliciting_in_flight = 0
+        }
+    }.
+
+%% Receive each {PN, Frames} as a 1-RTT packet; yes where it sent an ACK.
+acks(S, Packets) ->
+    element(1, run(S, Packets)).
+
+run(S0, Packets) ->
+    lists:mapfoldl(
+        fun({PN, Frames}, Acc) ->
+            Before = acks_sent(Acc),
+            Now = erlang:monotonic_time(millisecond),
+            Acc1 = quic_connection:record_received_pn(app, PN, Acc, Now),
+            Acc2 = lists:foldl(fun(F, A) -> process(app, F, A) end, Acc1, Frames),
+            Acc3 = quic_connection:maybe_send_ack(app, Frames, Acc2),
+            {
+                case acks_sent(Acc3) - Before of
+                    0 -> no;
+                    1 -> yes
+                end,
+                Acc3
+            }
+        end,
+        S0,
+        Packets
+    ).
+
+acks_sent(S) ->
+    quic_connection:count(?C_ACK_SENT, S).
+
 decode(Params) ->
     quic_tls:decode_transport_params(quic_tls:encode_transport_params(Params)).
 
@@ -165,9 +207,142 @@ server_state() ->
 not_negotiated_test_() ->
     [
         {atom_to_list(name(Frame)), fun() ->
-            ?assertMatch(
-                {transport, ?QUIC_FRAME_ENCODING_ERROR, _}, close(app, Frame)
-            )
+            S0 = server_state(),
+            S = process(app, Frame, S0#state{cfg = (S0#state.cfg)#conn_cfg{ack_frequency = false}}),
+            ?assertMatch({transport, ?QUIC_FRAME_ENCODING_ERROR, _}, S#state.close_reason)
         end}
      || Frame <- [{ack_frequency, 0, 1, 1000, 1}, immediate_ack]
     ].
+
+%%====================================================================
+%% Receiver (Sections 3, 4, 5 and 6)
+%%====================================================================
+
+advertises_min_ack_delay_by_default_test() ->
+    S = server_state(),
+    ?assertEqual(#{min_ack_delay => 1000}, quic_connection:with_min_ack_delay(#{}, S)),
+    ?assertEqual(
+        #{},
+        quic_connection:with_min_ack_delay(#{}, S#state{
+            cfg = (S#state.cfg)#conn_cfg{ack_frequency = false}
+        })
+    ).
+
+requested_max_ack_delay_bounds_test_() ->
+    [
+        {integer_to_list(Delay), fun() ->
+            S = process(app, {ack_frequency, 0, 1, Delay, 1}, receiver()),
+            case Valid of
+                true ->
+                    ?assertEqual(undefined, S#state.close_reason),
+                    ?assertEqual(Delay div 1000, quic_connection:ack_delay_ms(S));
+                false ->
+                    ?assertMatch(
+                        {transport, ?QUIC_PROTOCOL_VIOLATION, _}, S#state.close_reason
+                    )
+            end
+        end}
+     || {Delay, Valid} <- [
+            {0, false}, {999, false}, {1000, true}, {16383999, true}, {16384000, false}
+        ]
+    ].
+
+stale_sequence_numbers_ignored_test() ->
+    S1 = process(app, {ack_frequency, 5, 9, 4000, 1}, receiver()),
+    ?assertEqual(10, quic_connection:ack_tolerance(S1)),
+    S2 = process(app, {ack_frequency, 3, 1, 2000, 1}, S1),
+    S3 = process(app, {ack_frequency, 5, 1, 2000, 1}, S2),
+    ?assertEqual(10, quic_connection:ack_tolerance(S3)),
+    ?assertEqual(4, quic_connection:ack_delay_ms(S3)),
+    S4 = process(app, {ack_frequency, 6, 0, 2000, 1}, S3),
+    ?assertEqual(1, quic_connection:ack_tolerance(S4)),
+    ?assertEqual(2, quic_connection:ack_delay_ms(S4)).
+
+threshold_is_capped_test() ->
+    S = process(app, {ack_frequency, 0, 1 bsl 40, 25000, 1}, receiver()),
+    ?assertEqual(65, quic_connection:ack_tolerance(S)).
+
+default_acks_every_second_packet_test() ->
+    ?assertEqual([no, yes, no, yes], acks(receiver(), [{N, [ping]} || N <- lists:seq(0, 3)])).
+
+threshold_delays_the_ack_test() ->
+    %% Section 6: an ACK once more than Ack-Eliciting Threshold packets arrived.
+    S = process(app, {ack_frequency, 0, 3, 25000, 1}, receiver()),
+    ?assertEqual(
+        [no, no, no, yes, no],
+        acks(S, [{N, [ping]} || N <- lists:seq(0, 4)])
+    ).
+
+threshold_zero_acks_every_packet_test() ->
+    S = process(app, {ack_frequency, 0, 0, 25000, 1}, receiver()),
+    ?assertEqual([yes, yes, yes], acks(S, [{N, [ping]} || N <- lists:seq(0, 2)])).
+
+timer_uses_requested_max_ack_delay_test() ->
+    S0 = process(app, {ack_frequency, 0, 9, 3000, 1}, receiver()),
+    S = quic_connection:arm_ack_timer(S0),
+    Left = erlang:read_timer(S#state.ack_timer),
+    ?assert(is_integer(Left) andalso Left =< 3).
+
+shorter_delay_drops_an_armed_timer_test() ->
+    S0 = quic_connection:arm_ack_timer(receiver()),
+    Timer = S0#state.ack_timer,
+    S = process(app, {ack_frequency, 0, 1, 2000, 1}, S0),
+    ?assertEqual(undefined, S#state.ack_timer),
+    ?assertEqual(false, erlang:read_timer(Timer)).
+
+immediate_ack_acks_at_once_test() ->
+    S = process(app, {ack_frequency, 0, 9, 25000, 1}, receiver()),
+    ?assertEqual(
+        [no, yes, no],
+        acks(S, [{0, [ping]}, {1, [ping, immediate_ack]}, {2, [ping]}])
+    ),
+    %% Alone in a packet, and without any ACK_FREQUENCY before it.
+    ?assertEqual([yes], acks(receiver(), [{0, [immediate_ack]}])).
+
+immediate_ack_in_a_sequential_run_test() ->
+    S0 = process(app, {ack_frequency, 0, 9, 25000, 1}, receiver()),
+    %% The run's receive bookkeeping is done before its frames.
+    {_, S1} = run(S0, [{N, []} || N <- [0, 1, 2]]),
+    S = quic_connection:fold_opened_seq(
+        [{0, 16#40, [ping]}, {1, 16#40, [ping, immediate_ack]}, {2, 16#40, [ping]}], S1, 0, 0
+    ),
+    ?assertEqual(undefined, S#state.close_reason),
+    ?assertEqual(1, acks_sent(S)),
+    ?assertEqual(1, S#state.ack_elicited_count).
+
+reordering_threshold_one_is_the_default_test() ->
+    %% RFC 9000 Section 13.2.1: a packet above a gap is acknowledged at once.
+    S = process(app, {ack_frequency, 0, 9, 25000, 1}, receiver()),
+    ?assertEqual([no, yes], acks(S, [{0, [ping]}, {2, [ping]}])),
+    ?assertEqual([no, yes], acks(receiver(), [{0, [ping]}, {2, [ping]}])).
+
+reordering_threshold_zero_test() ->
+    %% Section 6.2: out-of-order packets do not ACK at once.
+    S = process(app, {ack_frequency, 0, 9, 25000, 0}, receiver()),
+    ?assertEqual([no, no, no], acks(S, [{0, [ping]}, {3, [ping]}, {1, [ping]}])).
+
+reordering_threshold_three_test() ->
+    %% Section 6.2.1, Table 1: ACKs on packets 5, 9 and 10.
+    S = process(app, {ack_frequency, 0, 100, 25000, 3}, receiver()),
+    ?assertEqual(
+        [no, no, no, no, yes, no, yes, yes],
+        acks(S, [{N, [ping]} || N <- [0, 1, 3, 4, 5, 8, 9, 10]])
+    ).
+
+reordering_threshold_five_test() ->
+    %% Section 6.2.1, Table 2: ACKs on packets 7 and 9.
+    S = process(app, {ack_frequency, 0, 100, 25000, 5}, receiver()),
+    ?assertEqual(
+        [no, no, no, no, no, yes, no, yes],
+        acks(S, [{N, [ping]} || N <- [0, 1, 3, 5, 6, 7, 8, 9]])
+    ).
+
+late_packet_already_reported_missing_test() ->
+    %% Section 6.2, second condition: at or below Largest Acked - threshold.
+    S0 = process(app, {ack_frequency, 0, 100, 25000, 3}, receiver()),
+    {[no, no, no, yes], S1} = run(S0, [{N, [ping]} || N <- [0, 2, 3, 4]]),
+    ?assertEqual([yes], acks(S1, [{1, [ping]}])),
+    %% Within the window: no ACK.
+    S2 = process(app, {ack_frequency, 0, 4, 25000, 3}, receiver()),
+    {[no, no, no, no, yes], S3} = run(S2, [{N, [ping]} || N <- [0, 1, 2, 4, 5]]),
+    ?assertEqual([no], acks(S3, [{3, [ping]}])).
