@@ -16670,8 +16670,10 @@ send_pmtu_probe_packet(_ProbeSize, _Frames, #state{app_keys = undefined} = State
     %% No keys available yet
     State;
 send_pmtu_probe_packet(ProbeSize, Frames, #state{dcid = DCID, pn_app = PNSpace} = State) ->
-    %% Encode PING + explicit PADDING frames
-    EncodedFrames = encode_pmtu_frames(Frames),
+    %% Encode PING + explicit PADDING frames, with IMMEDIATE_ACK when the peer
+    %% takes it so the probe's ACK beats the probe timer
+    %% (draft-ietf-quic-ack-frequency-14 Section 8.3)
+    EncodedFrames = <<(pmtu_immediate_ack(State))/binary, (encode_pmtu_frames(Frames))/binary>>,
 
     %% Calculate extra padding needed to reach target probe size
     %% Account for: header (1 + DCID), PN (1-4), auth tag (16)
@@ -16699,6 +16701,12 @@ send_pmtu_probe_packet(ProbeSize, Frames, #state{dcid = DCID, pn_app = PNSpace} 
     %% connection on an MTU-limited path died on the first periodic
     %% re-probe, both ends at once.
     send_app_packet_internal(PaddedFrames, [], State).
+
+pmtu_immediate_ack(State) ->
+    case peer_takes_ack_frequency(State) of
+        true -> quic_frame:encode(immediate_ack);
+        false -> <<>>
+    end.
 
 %% @doc Encode PMTU probe frames (PING + PADDING).
 -spec encode_pmtu_frames([term()]) -> binary().

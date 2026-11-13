@@ -251,6 +251,23 @@ pto_probe_retransmission_carries_immediate_ack_test() ->
     [_, Probe] = probe_frames(S0),
     ?assertEqual([{max_data, 100000}, immediate_ack], Probe).
 
+pmtu_probe_carries_immediate_ack_test() ->
+    %% Section 8.3: "A sender MAY bundle an IMMEDIATE_ACK frame with any PMTU probes".
+    <<16#1f, 1, 0, _/binary>> = pmtu_probe_payload(sender(#{min_ack_delay => 1000})),
+    <<1, 0, _/binary>> = pmtu_probe_payload(sender(#{})),
+    %% Padding still makes up the probe size.
+    ?assertEqual(
+        byte_size(pmtu_probe_payload(sender(#{}))),
+        byte_size(pmtu_probe_payload(sender(#{min_ack_delay => 1000})))
+    ).
+
+%% The probe's payload, held back from the wire by coalescing.
+pmtu_probe_payload(S0) ->
+    S = quic_connection:send_pmtu_probe_packet(1400, [ping, {padding, 10}], S0#state{
+        coalesce = true
+    }),
+    iolist_to_binary(lists:reverse(S#state.pend_payload)).
+
 probe_frames(#state{hs = HS} = S0) ->
     S = quic_connection:send_probe_packet(app, S0#state{hs = HS#hs{hs_probe = true}}),
     [P#sent_packet.frames || P <- sent(S)].
