@@ -579,6 +579,14 @@ send_quantum_test() ->
     Slow = run(to_probe_bw(sim(#{bw => 100000, rtt => 10 * ?MS, buf => 20000})), ?SEC),
     ?assertEqual(2 * ?MDS, info(Slow, send_quantum)).
 
+%% The QUIC offload budget is one send quantum and floors max_inflight
+%% (Sections 5.5.8.2 and 5.6.4.2).
+offload_budget_is_the_send_quantum_test() ->
+    Sim = run(to_probe_bw(sim(bulk_path())), ?SEC),
+    #{offload_budget := Budget, send_quantum := Quantum, max_inflight := MaxInflight} = info(Sim),
+    ?assertEqual(Quantum, Budget),
+    ?assert(MaxInflight >= Budget).
+
 %% A.14: a BDP of about one packet still keeps four packets of cwnd.
 sub_packet_bdp_keeps_min_pipe_cwnd_test() ->
     Sim = run(to_probe_bw(sim(#{bw => 100000, rtt => ?MS, buf => 20000})), 2 * ?SEC),

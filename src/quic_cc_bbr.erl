@@ -1292,15 +1292,18 @@ bdp_multiple(#bbr_state{min_rtt = infinity, initial_window = IW}, _Bw, _Gain) ->
 bdp_multiple(#bbr_state{min_rtt = MinRtt}, Bw, Gain) ->
     trunc(Gain * ((Bw * MinRtt) div ?US_PER_SEC)).
 
-%% Section 5.6.4.2; the QUIC offload budget is one send quantum.
-quantization_budget(
-    #bbr_state{send_quantum = Quantum, mode = Mode, max_datagram_size = MDS} = S, Cap
-) ->
-    Cap1 = max(max(Cap, Quantum), min_pipe_cwnd(S)),
+%% Section 5.6.4.2 QuantizationBudget.
+quantization_budget(#bbr_state{mode = Mode, max_datagram_size = MDS} = S, InflightCap0) ->
+    InflightCap1 = max(InflightCap0, offload_budget(S)),
+    InflightCap = max(InflightCap1, min_pipe_cwnd(S)),
     case Mode of
-        probe_bw_up -> Cap1 + 2 * MDS;
-        _ -> Cap1
+        probe_bw_up -> InflightCap + 2 * MDS;
+        _ -> InflightCap
     end.
+
+%% Section 5.5.8.2; no pacing offload term: no SO_TXTIME, GSO only segments.
+offload_budget(#bbr_state{send_quantum = Quantum}) ->
+    Quantum.
 
 inflight(S, Gain) ->
     quantization_budget(S, bdp_multiple(S, Gain)).
@@ -1601,6 +1604,7 @@ info(#bbr_state{} = S) ->
         cwnd => S#bbr_state.cwnd,
         pacing_rate => S#bbr_state.pacing_rate,
         send_quantum => S#bbr_state.send_quantum,
+        offload_budget => offload_budget(S),
         bytes_in_flight => S#bbr_state.bytes_in_flight,
         delivered => S#bbr_state.delivered,
         lost => S#bbr_state.lost,
