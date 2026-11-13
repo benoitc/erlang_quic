@@ -507,6 +507,113 @@ probe_rtt_during_startup_returns_to_startup_test() ->
     ?assertEqual([startup, probe_rtt, startup], visited(Out)).
 
 %%====================================================================
+%% Congestion window and pacing (Sections 5.4, 5.5.9, 5.6)
+%%====================================================================
+
+%% Before the first RTT sample the pacing rate is 2.77 x the initial
+%% window per millisecond; the first sample replaces the millisecond.
+initial_pacing_rate_test() ->
+    T = erlang:monotonic_time(microsecond),
+    S0 = quic_cc_bbr:new(#{initial_window => 12000}),
+    ?assertEqual(trunc(2.77 * 12000 * 1000), maps:get(pacing_rate, quic_cc_bbr:info(S0))),
+    S1 = quic_cc_bbr:on_packet_sent_at(S0, 1200, T),
+    S2 = quic_cc_bbr:on_packets_acked_at(S1, 1200, T + 40 * ?MS),
+    ?assertEqual(trunc(2.77 * 12000 * 25), maps:get(pacing_rate, quic_cc_bbr:info(S2))).
+
+%% cwnd grows by the bytes each ACK newly acknowledges.
+cwnd_grows_by_acked_bytes_test() ->
+    T = erlang:monotonic_time(microsecond),
+    S0 = quic_cc_bbr:new(#{initial_window => 12000}),
+    S1 = quic_cc_bbr:on_packet_sent_at(quic_cc_bbr:on_packet_sent_at(S0, 1200, T), 1200, T),
+    S2 = quic_cc_bbr:on_packets_acked_at(S1, 1200, T + 40 * ?MS),
+    ?assertEqual(13200, quic_cc_bbr:cwnd(S2)),
+    S3 = quic_cc_bbr:on_packets_acked_at(S2, 1200, T + 41 * ?MS),
+    ?assertEqual(14400, quic_cc_bbr:cwnd(S3)).
+
+%% Once the pipe is full cwnd stays within max_inflight, about two BDPs.
+cwnd_bounded_by_max_inflight_test() ->
+    Sim = run(to_probe_bw(sim(bulk_path())), ?SEC),
+    #{cwnd := Cwnd, max_inflight := MaxInflight, bdp := Bdp} = info(Sim),
+    ?assert(Cwnd =< MaxInflight),
+    ?assert(Cwnd >= Bdp),
+    ?assert(MaxInflight =< 2 * Bdp + info(Sim, extra_acked) + info(Sim, send_quantum)).
+
+%% The pacing rate never drops before the pipe is full (Section 5.6.2).
+pacing_rate_only_rises_in_startup_test() ->
+    %% Past the first RTT sample, which sets the initial rate.
+    Rates = startup_pacing_rates(run(sim(bulk_path()), 50 * ?MS), []),
+    ?assert(length(Rates) > 100),
+    ?assertEqual(lists:sort(Rates), lists:reverse(Rates)).
+
+startup_pacing_rates(Sim, Acc) ->
+    Next = run(Sim, ?MS),
+    case info(Next, mode) of
+        startup -> startup_pacing_rates(Next, [info(Next, pacing_rate) | Acc]);
+        _ -> Acc
+    end.
+
+%% Nor in a ProbeRTT entered before the pipe was full, whose gain is 1.
+pacing_rate_kept_in_probe_rtt_before_full_bw_test() ->
+    Sim = sim(#{bw => 10000000, rtt => 20 * ?MS, app => {1200, 2 * ?MS}}),
+    Before = run_until(Sim, fun(S) -> elapsed(S) >= 9 * ?SEC end, 10 * ?SEC),
+    In = run_until(Before, in_mode(probe_rtt), 3 * ?SEC),
+    ?assertNot(info(In, full_bw_reached)),
+    ?assert(info(In, pacing_rate) >= info(Before, pacing_rate)).
+
+%% In ProbeBW the rate is pacing_gain x bw less a 1% margin.
+pacing_rate_has_one_percent_margin_test() ->
+    Sim = run_until(to_probe_bw(sim(bulk_path())), in_mode(probe_bw_cruise), 5 * ?SEC),
+    ?assertEqual(trunc(info(Sim, bw) * 0.99), info(Sim, pacing_rate)).
+
+%% The send quantum is a millisecond of pacing, between two packets
+%% and 64 KB.
+send_quantum_test() ->
+    Mid = run(to_probe_bw(sim(bulk_path())), ?SEC),
+    ?assertEqual(info(Mid, pacing_rate) div 1000, info(Mid, send_quantum)),
+    Fast = run(to_probe_bw(sim(#{bw => 125000000, rtt => 10 * ?MS, buf => 2500000})), ?SEC),
+    ?assertEqual(65536, info(Fast, send_quantum)),
+    Slow = run(to_probe_bw(sim(#{bw => 100000, rtt => 10 * ?MS, buf => 20000})), ?SEC),
+    ?assertEqual(2 * ?MDS, info(Slow, send_quantum)).
+
+%% A.14: a BDP of about one packet still keeps four packets of cwnd.
+sub_packet_bdp_keeps_min_pipe_cwnd_test() ->
+    Sim = run(to_probe_bw(sim(#{bw => 100000, rtt => ?MS, buf => 20000})), 2 * ?SEC),
+    ?assert(info(Sim, bdp) < 2 * ?MDS),
+    ?assert(info(Sim, cwnd) >= 4 * ?MDS).
+
+%% A.12: aggregated ACKs raise extra_acked and cwnd above two BDPs.
+ack_aggregation_raises_cwnd_test() ->
+    Sim = run(sim((bulk_path())#{ack_every => 10 * ?MS}), 3 * ?SEC),
+    #{extra_acked := Extra, max_inflight := MaxInflight, bdp := Bdp} = info(Sim),
+    ?assert(Extra > 0),
+    ?assert(MaxInflight > 2 * Bdp).
+
+%% Restarting from idle in ProbeBW paces at exactly bw (Section 5.4.1).
+restart_from_idle_paces_at_bw_test() ->
+    Sim = run(to_probe_bw(sim(bulk_path())), ?SEC),
+    Idle = go_idle(Sim, ?SEC),
+    #{cc := CC, now := Now} = Idle,
+    CC1 = quic_cc_bbr:on_packet_sent_at(CC, ?MDS, Now),
+    Info = quic_cc_bbr:info(CC1),
+    ?assert(maps:get(idle_restart, Info)),
+    ?assertEqual(trunc(maps:get(bw, Info) * 0.99), maps:get(pacing_rate, Info)).
+
+%% A.11: idling past the min_rtt window does not trigger ProbeRTT.
+idle_restart_skips_probe_rtt_test() ->
+    Sim = run(to_probe_bw(sim(bulk_path())), ?SEC),
+    Idle = go_idle(Sim, 11 * ?SEC),
+    Back = run(resume(Idle#{modes := [info(Idle, mode)]}), ?SEC),
+    ?assertNot(lists:member(probe_rtt, visited(Back))),
+    ?assertNot(info(Back, idle_restart)).
+
+%% A.10: ProbeRTT holds cwnd to half the BDP.
+probe_rtt_bounds_cwnd_test() ->
+    In = run_until(to_probe_bw(sim(bulk_path())), in_mode(probe_rtt), 15 * ?SEC),
+    Held = run(In, 100 * ?MS),
+    ?assertEqual(probe_rtt, info(Held, mode)),
+    ?assert(info(Held, cwnd) =< max(info(Held, bdp) div 2, 4 * ?MDS) + ?MDS).
+
+%%====================================================================
 %% Loss, ECN and undo (Sections 3.7, 5.3.1.3, 5.5.10, 5.5.11)
 %%====================================================================
 

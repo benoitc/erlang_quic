@@ -117,6 +117,7 @@
 -define(FULL_BW_GROWTH, 1.25).
 -define(FULL_BW_ROUNDS, 3).
 -define(DRAIN_MAX_ROUNDS, 3).
+-define(EXTRA_ACKED_FILTER_LEN, 10).
 -define(RENO_ROUNDS_BOUND, 63).
 -define(MAX_PROBE_UP_ROUNDS, 30).
 
@@ -127,8 +128,10 @@
 -define(PROBE_WAIT_RAND, 1000000).
 -define(US_PER_SEC, 1000000).
 
+%% Send quantum bounds (Section 5.6.3).
+-define(SEND_QUANTUM_MAX, 65536).
+
 -define(MAX_DATAGRAM_SIZE, 1200).
--define(INITIAL_RTT, 100).
 -define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 
 %%====================================================================
@@ -219,6 +222,11 @@
     min_rtt = infinity :: non_neg_integer() | infinity,
     min_rtt_stamp = 0 :: integer(),
     min_rtt_expired = false :: boolean(),
+    extra_acked = 0 :: non_neg_integer(),
+    extra_acked_interval_start = 0 :: integer(),
+    extra_acked_delivered = 0 :: non_neg_integer(),
+    extra_acked_filter = [] :: [{non_neg_integer(), non_neg_integer()}],
+    max_inflight = 0 :: non_neg_integer(),
     inflight_longterm = infinity :: volume(),
     inflight_shortterm = infinity :: volume(),
 
@@ -269,6 +277,7 @@
 
     %% Pacing (Sections 5.6.2, 5.6.3)
     pacing_rate = 0 :: non_neg_integer(),
+    has_seen_rtt = false :: boolean(),
     send_quantum = 0 :: non_neg_integer(),
     pacing_tokens = 0 :: non_neg_integer(),
     last_pacing_update = 0 :: integer()
@@ -292,7 +301,6 @@ new_at(Opts, Now) ->
     MDS = maps:get(max_datagram_size, Opts, ?MAX_DATAGRAM_SIZE),
     MinimumWindow = max(maps:get(minimum_window, Opts, 2 * MDS), 2 * MDS),
     MinRecoveryDuration = maps:get(min_recovery_duration, Opts, 100) * 1000,
-    InitialRtt = maps:get(initial_rtt, Opts, ?INITIAL_RTT),
     InitialCwnd = max(maps:get(initial_window, Opts, 10 * MDS), ?MIN_PIPE_CWND_PKTS * MDS),
     S0 = #bbr_state{
         max_datagram_size = MDS,
@@ -301,12 +309,17 @@ new_at(Opts, Now) ->
         min_recovery_duration = MinRecoveryDuration,
         cwnd = InitialCwnd,
         min_rtt_stamp = Now,
+        extra_acked_interval_start = Now,
         last_pacing_update = Now
     },
-    %% Startup gain times the initial window over initial_rtt (ms).
-    Rate = max(1, trunc(?STARTUP_PACING_GAIN * ((InitialCwnd * 1000) div InitialRtt))),
-    Quantum = pacing_max_burst(MDS, Rate),
-    enter_startup(S0#bbr_state{pacing_rate = Rate, send_quantum = Quantum, pacing_tokens = Quantum}).
+    S1 = enter_startup(init_pacing_rate(S0, 1000)),
+    S2 = set_send_quantum(S1),
+    S2#bbr_state{pacing_tokens = S2#bbr_state.send_quantum}.
+
+%% Section 5.6.2: nominal bandwidth is the initial window over srtt.
+init_pacing_rate(#bbr_state{initial_window = IW} = S, SrttUs) ->
+    Nominal = (IW * ?US_PER_SEC) div max(1, SrttUs),
+    S#bbr_state{pacing_rate = max(1, trunc(?STARTUP_PACING_GAIN * Nominal))}.
 
 %%====================================================================
 %% Per-transmit steps (Sections 4.1.2.2, 5.2.2, 5.4)
@@ -319,7 +332,8 @@ on_packet_sent(State, Size) ->
 
 %% @doc Record that a packet was sent at time `Now' (microseconds).
 -spec on_packet_sent_at(cc_state(), non_neg_integer(), integer()) -> cc_state().
-on_packet_sent_at(State, Size, Now) ->
+on_packet_sent_at(State0, Size, Now) ->
+    State = handle_restart_from_idle(State0, Now),
     #bbr_state{
         bytes_in_flight = InFlight0,
         delivered = Delivered,
@@ -352,6 +366,18 @@ on_packet_sent_at(State, Size, Now) ->
         cwnd_limited_now = State#bbr_state.cwnd_limited_now orelse (InFlight + MDS > Cwnd),
         sent = queue:in(Pkt, Sent)
     }.
+
+handle_restart_from_idle(
+    #bbr_state{bytes_in_flight = 0, app_limited = AppLimited, mode = Mode} = S, Now
+) when AppLimited =/= 0 ->
+    S1 = S#bbr_state{idle_restart = true, extra_acked_interval_start = Now},
+    case is_in_probe_bw(Mode) of
+        true -> set_pacing_rate_with_gain(S1, 1.0);
+        false when Mode =:= probe_rtt -> check_probe_rtt_done(S1, Now);
+        false -> S1
+    end;
+handle_restart_from_idle(S, _Now) ->
+    S.
 
 %% @doc The sender has no data queued: mark the connection
 %% application-limited if cwnd has room (Section 4.1.2.4).
@@ -457,7 +483,7 @@ generate_rate_sample(#bbr_state{rs = RS, lifetime_min_rtt = MinRtt0, delivered =
     #rs{rtt = Rtt, send_elapsed = SendElapsed, ack_elapsed = AckElapsed, prior_delivered = Prior} =
         RS,
     MinRtt = min(MinRtt0, Rtt),
-    S1 = clear_app_limited(S#bbr_state{lifetime_min_rtt = MinRtt}),
+    S1 = clear_app_limited(maybe_init_pacing_from_rtt(S#bbr_state{lifetime_min_rtt = MinRtt}, Rtt)),
     Interval = max(SendElapsed, AckElapsed),
     RSDelivered = Delivered - Prior,
     Rate =
@@ -474,6 +500,12 @@ clear_app_limited(#bbr_state{app_limited = AppLimited, delivered = Delivered} = 
 clear_app_limited(S) ->
     S.
 
+%% Section 5.6.2: the initial pacing rate uses the first RTT sample.
+maybe_init_pacing_from_rtt(#bbr_state{has_seen_rtt = false} = S, Rtt) when Rtt >= 0 ->
+    set_send_quantum(init_pacing_rate(S#bbr_state{has_seen_rtt = true}, Rtt));
+maybe_init_pacing_from_rtt(S, _Rtt) ->
+    S.
+
 %% Recovery ends on the ACK of a packet sent after it began (RFC 9002 Section 7.3.2).
 maybe_exit_recovery(
     #bbr_state{in_recovery = true, recovery_start = Start, rs = #rs{has_data = true, send_time = T}} =
@@ -485,7 +517,8 @@ maybe_exit_recovery(S) ->
 
 update_model_and_state(S0, Now) ->
     S1 = update_latest_delivery_signals(S0),
-    S3 = update_congestion_signals(S1),
+    S2 = update_congestion_signals(S1),
+    S3 = update_ack_aggregation(S2, Now),
     S4 = check_full_bw_reached(S3),
     S5 = check_startup_done(S4),
     S6 = check_drain_done(S5, Now),
@@ -496,7 +529,7 @@ update_model_and_state(S0, Now) ->
     bound_bw_for_model(S10).
 
 update_control_parameters(S) ->
-    set_pacing_rate(bound_cwnd_for_model(set_cwnd(S))).
+    set_cwnd(set_send_quantum(set_pacing_rate(S))).
 
 %%====================================================================
 %% Rounds and filters (Sections 5.5.1 - 5.5.7)
@@ -558,6 +591,48 @@ update_min_rtt(#bbr_state{min_rtt_stamp = Stamp, min_rtt = MinRtt, rs = #rs{rtt 
         true -> S2#bbr_state{min_rtt = Rtt, min_rtt_stamp = Now};
         false -> S2
     end.
+
+%% Section 5.5.9: excess data acknowledged beyond bw over the interval.
+update_ack_aggregation(S, Now) ->
+    #bbr_state{
+        extra_acked_interval_start = Start,
+        extra_acked_delivered = Delivered0,
+        bw = Bw,
+        cwnd = Cwnd,
+        rs = #rs{newly_acked = Acked},
+        full_bw_reached = FullBw,
+        round_count = Round,
+        extra_acked_filter = Filter
+    } = S,
+    Expected0 = (Bw * (Now - Start)) div ?US_PER_SEC,
+    {Delivered1, Start1, Expected} =
+        case Delivered0 =< Expected0 of
+            true -> {0, Now, 0};
+            false -> {Delivered0, Start, Expected0}
+        end,
+    Delivered = Delivered1 + Acked,
+    Extra = max(0, min(Delivered - Expected, Cwnd)),
+    Len =
+        case FullBw of
+            true -> ?EXTRA_ACKED_FILTER_LEN;
+            false -> 1
+        end,
+    Filter1 = windowed_max(Filter, Round, Extra, Len),
+    S#bbr_state{
+        extra_acked_interval_start = Start1,
+        extra_acked_delivered = Delivered,
+        extra_acked_filter = Filter1,
+        extra_acked = lists:max([V || {_, V} <- Filter1])
+    }.
+
+%% Max of the samples from the last `Len' rounds, one entry per round.
+windowed_max([{Round, V} | Rest], Round, Value, Len) ->
+    trim_window([{Round, max(V, Value)} | Rest], Round, Len);
+windowed_max(Filter, Round, Value, Len) ->
+    trim_window([{Round, Value} | Filter], Round, Len).
+
+trim_window(Filter, Round, Len) ->
+    [E || {R, _} = E <- Filter, R + Len > Round].
 
 %%====================================================================
 %% Startup and Drain (Sections 5.3.1, 5.3.2)
@@ -1274,10 +1349,36 @@ quantization_budget(
 inflight(S, Gain) ->
     quantization_budget(S, bdp_multiple(S, Gain)).
 
-%% cwnd is cwnd_gain x BDP, at least four packets.
-set_cwnd(#bbr_state{cwnd_gain = Gain, max_datagram_size = MDS} = S) ->
-    Bdp = max(bdp(S), ?MIN_PIPE_CWND_PKTS * MDS),
-    S#bbr_state{cwnd = max(trunc(Gain * Bdp), min_pipe_cwnd(S))}.
+update_max_inflight(#bbr_state{cwnd_gain = Gain, extra_acked = Extra} = S) ->
+    S#bbr_state{max_inflight = quantization_budget(S, bdp_multiple(S, Gain) + Extra)}.
+
+%% Section 5.6.4.6: grow by acked data, within max_inflight once full.
+set_cwnd(S0) ->
+    S = update_max_inflight(S0),
+    #bbr_state{
+        cwnd = Cwnd0,
+        max_inflight = MaxInflight,
+        full_bw_reached = FullBw,
+        delivered = Delivered,
+        initial_window = IW,
+        rs = #rs{newly_acked = Acked}
+    } = S,
+    Cwnd1 =
+        case FullBw of
+            true ->
+                min(Cwnd0 + Acked, MaxInflight);
+            false when Cwnd0 < MaxInflight; Delivered < IW ->
+                Cwnd0 + Acked;
+            false ->
+                Cwnd0
+        end,
+    Cwnd2 = max(Cwnd1, min_pipe_cwnd(S)),
+    bound_cwnd_for_model(bound_cwnd_for_probe_rtt(S#bbr_state{cwnd = Cwnd2})).
+
+bound_cwnd_for_probe_rtt(#bbr_state{mode = probe_rtt, cwnd = Cwnd} = S) ->
+    S#bbr_state{cwnd = min(Cwnd, probe_rtt_cwnd(S))};
+bound_cwnd_for_probe_rtt(S) ->
+    S.
 
 %% Section 5.6.4.7 BoundCwndForModel.
 bound_cwnd_for_model(#bbr_state{mode = Mode, cwnd = Cwnd, inflight_shortterm = InLo} = S) ->
@@ -1309,16 +1410,21 @@ restore_cwnd(#bbr_state{prior_cwnd = Prior, cwnd = Cwnd} = S) ->
 %% Pacing rate and send quantum (Sections 5.6.2, 5.6.3)
 %%====================================================================
 
-%% Pacing rate is pacing_gain x bw less 1%; no sample, no change.
-set_pacing_rate(#bbr_state{bw = 0} = S) ->
-    S;
-set_pacing_rate(#bbr_state{bw = Bw, pacing_gain = Gain, max_datagram_size = MDS} = S) ->
-    Rate = max(1, trunc(Gain * Bw * (100 - ?PACING_MARGIN_PERCENT) / 100)),
-    S#bbr_state{pacing_rate = Rate, send_quantum = pacing_max_burst(MDS, Rate)}.
+set_pacing_rate(#bbr_state{pacing_gain = Gain} = S) ->
+    set_pacing_rate_with_gain(S, Gain).
 
-%% Two milliseconds at the paced rate, floored at 12 packets.
-pacing_max_burst(MDS, PacingRate) ->
-    max(12 * MDS, PacingRate div 500).
+%% Before the pipe is full the rate only goes up.
+set_pacing_rate_with_gain(#bbr_state{bw = Bw, full_bw_reached = Full, pacing_rate = Old} = S, Gain) ->
+    Rate = trunc(Gain * Bw * (100 - ?PACING_MARGIN_PERCENT) / 100),
+    case Full orelse (Rate > Old) of
+        true -> S#bbr_state{pacing_rate = max(1, Rate)};
+        false -> S
+    end.
+
+%% One millisecond at the pacing rate, between 2 packets and 64 KB.
+set_send_quantum(#bbr_state{pacing_rate = Rate, max_datagram_size = MDS} = S) ->
+    Quantum = max(min(Rate div 1000, ?SEND_QUANTUM_MAX), 2 * MDS),
+    S#bbr_state{send_quantum = Quantum, pacing_tokens = min(S#bbr_state.pacing_tokens, Quantum)}.
 
 %% @doc BBR paces from its own model; the smoothed RTT is not used.
 -spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
@@ -1443,11 +1549,7 @@ update_mtu(#bbr_state{max_datagram_size = OldMDS, minimum_window = OldMinWin} = 
         #{what => bbr_mtu_updated, old_mtu => OldMDS, new_mtu => NewMTU},
         ?QUIC_LOG_META
     ),
-    State#bbr_state{
-        max_datagram_size = NewMTU,
-        minimum_window = NewMinimumWindow,
-        send_quantum = pacing_max_burst(NewMTU, State#bbr_state.pacing_rate)
-    }.
+    set_send_quantum(State#bbr_state{max_datagram_size = NewMTU, minimum_window = NewMinimumWindow}).
 
 %% @doc Get the current congestion window.
 -spec cwnd(cc_state()) -> non_neg_integer().
@@ -1558,6 +1660,8 @@ info(#bbr_state{} = S) ->
         bw_shortterm => S#bbr_state.bw_shortterm,
         min_rtt => S#bbr_state.min_rtt,
         bdp => bdp(S),
+        extra_acked => S#bbr_state.extra_acked,
+        max_inflight => S#bbr_state.max_inflight,
         inflight_longterm => S#bbr_state.inflight_longterm,
         inflight_shortterm => S#bbr_state.inflight_shortterm,
         full_bw_reached => S#bbr_state.full_bw_reached,

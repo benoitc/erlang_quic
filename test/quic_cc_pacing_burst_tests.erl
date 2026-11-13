@@ -5,7 +5,8 @@
 %%% Both fixes landed in NewReno only: the burst allowance scales with
 %%% the pacing rate (2 ms worth, floored at 12 packets), and a smoothed
 %%% RTT of 0 on a sub-millisecond link paces as 1 ms instead of freezing
-%%% the rate.
+%%% the rate. BBR bursts its send quantum instead: 1 ms worth, between 2
+%%% packets and 64 KB (draft-ietf-ccwg-bbr-07 Section 5.6.3).
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
 %%% Apache License 2.0
@@ -47,15 +48,15 @@ cubic_zero_rtt_paces_as_one_millisecond_test() ->
 %% BBR
 %%====================================================================
 
-bbr_burst_scales_with_pacing_rate_test() ->
-    ?assert(burst_ceiling(quic_cc_bbr, bbr_paced(4000000)) > 12 * ?MDS).
+bbr_burst_is_one_millisecond_of_pacing_test() ->
+    ?assertEqual(bbr_rate(12000) div 1000, burst_ceiling(quic_cc_bbr, bbr_paced(12000))).
 
-bbr_burst_keeps_the_floor_at_low_rates_test() ->
-    ?assertEqual(12 * ?MDS, burst_ceiling(quic_cc_bbr, bbr_paced(12000))).
+bbr_burst_is_capped_at_64k_test() ->
+    ?assertEqual(65536, burst_ceiling(quic_cc_bbr, bbr_paced(4000000))).
 
-bbr_update_mtu_scales_burst_with_rate_test() ->
-    Bumped = quic_cc_bbr:update_mtu(bbr_paced(4000000), 1400),
-    ?assert(burst_ceiling(quic_cc_bbr, Bumped) > 12 * 1400).
+bbr_update_mtu_keeps_the_quantum_test() ->
+    Bumped = quic_cc_bbr:update_mtu(bbr_paced(12000), 1400),
+    ?assertEqual(bbr_rate(12000) div 1000, burst_ceiling(quic_cc_bbr, Bumped)).
 
 %%====================================================================
 %% Helpers
@@ -69,10 +70,12 @@ cubic_paced(Cwnd, RttMs) ->
     State = quic_cc_cubic:new(#{max_datagram_size => ?MDS, initial_window => Cwnd}),
     quic_cc_cubic:update_pacing_rate(State, RttMs).
 
-%% BBR sets its rate from its own bandwidth estimate, which starts at
-%% initial_window / initial_rtt.
+%% Before an RTT sample BBR paces at 2.77 x the initial window per ms.
+bbr_rate(Cwnd) ->
+    trunc(2.77 * Cwnd * 1000).
+
 bbr_paced(Cwnd) ->
-    quic_cc_bbr:new(#{max_datagram_size => ?MDS, initial_window => Cwnd, initial_rtt => 100}).
+    quic_cc_bbr:new(#{max_datagram_size => ?MDS, initial_window => Cwnd}).
 
 burst_ceiling(Mod, State) ->
     converge(Mod, State, Mod:get_pacing_tokens(State, ?HUGE), 0).

@@ -262,13 +262,12 @@ bbr_detect_persistent_congestion_above_threshold_test() ->
 
 bbr_pacing_initial_state_test() ->
     State = quic_cc_bbr:new(#{}),
-    %% Initially, pacing should allow sending (rate is 0, no rate limit)
+    %% The initial send quantum holds the initial window.
     ?assert(quic_cc_bbr:pacing_allows(State, 1200)),
     ?assertEqual(0, quic_cc_bbr:pacing_delay(State, 1200)).
 
 bbr_pacing_allows_with_tokens_test() ->
     State = quic_cc_bbr:new(#{}),
-    %% After init, tokens = max_burst (12 packets = 14400 bytes)
     ?assert(quic_cc_bbr:pacing_allows(State, 1200)).
 
 bbr_pacing_get_tokens_consumes_test() ->
@@ -280,7 +279,6 @@ bbr_pacing_get_tokens_consumes_test() ->
     ?assertEqual(5000, Allowed2).
 
 bbr_pacing_delay_within_burst_test() ->
-    %% With initial pacing, delay should be 0 within burst limit (14400 bytes)
     State = quic_cc_bbr:new(#{}),
     ?assertEqual(0, quic_cc_bbr:pacing_delay(State, 12000)).
 
@@ -389,22 +387,10 @@ bbr_via_facade_with_opts_test() ->
 %%====================================================================
 
 bbr_initial_pacing_rate_test() ->
-    %% Verify that pacing_rate > 0 after new() (the key fix)
-    %% With default cwnd of 10*1200=12000 bytes and initial_rtt=100ms:
-    %% pacing_rate = 2.885 * 12000 / 100 = ~346 bytes/ms
+    %% A non-zero initial rate: a zero rate once hung transfers.
     State = quic_cc_bbr:new(#{}),
-    %% Pacing should not allow 0 rate (which caused hangs)
-    %% We verify this by checking pacing_delay is 0 for reasonable sizes
-    %% because we have tokens available at a non-zero rate
     ?assertEqual(0, quic_cc_bbr:pacing_delay(State, 1200)),
     ?assert(quic_cc_bbr:pacing_allows(State, 1200)).
-
-bbr_initial_pacing_rate_custom_rtt_test() ->
-    %% Verify initial_rtt option is respected
-    State = quic_cc_bbr:new(#{initial_rtt => 50}),
-    %% With initial_rtt=50ms, pacing should be faster (2x the default)
-    ?assertEqual(0, quic_cc_bbr:pacing_delay(State, 1200)),
-    ?assert(quic_cc_bbr:pacing_allows(State, 12000)).
 
 bbr_first_ack_updates_bandwidth_test() ->
     %% Verify that after first ACK, bandwidth is updated properly
