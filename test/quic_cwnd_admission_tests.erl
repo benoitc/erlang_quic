@@ -272,8 +272,8 @@ chunk_run_stays_within_cwnd(Pacing) ->
 %%====================================================================
 
 %% The probe goes out past the window, is charged, and carries the held
-%% control frames beside the oldest unacknowledged data (RFC 9002
-%% Sections 6.2.4 and 7.5).
+%% control frames (RFC 9002 Sections 6.2.4 and 7.5); the oldest packet's
+%% PING needs no repair (RFC 9000 Section 13.3).
 probe_carries_held_control_frames_test() ->
     S0 = in_flight(?FLIGHT),
     Token = binary:copy(<<"t">>, 16),
@@ -282,7 +282,7 @@ probe_carries_held_control_frames_test() ->
     S1 = quic_connection:send_frame(F2, quic_connection:send_frame(F1, S0)),
     S2 = quic_connection:handle_pto_timeout(S1#state{pto_space = app}),
     ?assertEqual([], held(S2)),
-    ?assertEqual([[ping, F1, F2]], [strip_immediate_ack(Fs) || Fs <- sent_frames(S2)]),
+    ?assertEqual([[F1, F2]], [strip_immediate_ack(Fs) || Fs <- sent_frames(S2)]),
     ?assert(quic_cc:bytes_in_flight(cc(S2)) > quic_cc:cwnd(cc(S2))).
 
 %% Held frames that do not fit the probe stay held, in order.
@@ -291,7 +291,7 @@ probe_leaves_what_does_not_fit_held_test() ->
     Frames = [{new_token, binary:copy(<<N>>, 400)} || N <- lists:seq(1, 4)],
     S1 = lists:foldl(fun quic_connection:send_frame/2, S0, Frames),
     S2 = quic_connection:handle_pto_timeout(S1#state{pto_space = app}),
-    [[ping | Sent]] = [strip_immediate_ack(Fs) || Fs <- sent_frames(S2)],
+    [Sent] = [strip_immediate_ack(Fs) || Fs <- sent_frames(S2)],
     ?assertNotEqual([], Sent),
     ?assertNotEqual([], held(S2)),
     ?assertEqual(Frames, Sent ++ held(S2)).

@@ -213,7 +213,9 @@ only_the_latest_request_is_resent_test() ->
     ?assert(quic_connection:is_current_limit({ack_frequency, 1, 1, 4000, 1}, S2)).
 
 immediate_ack_is_not_retransmitted_test() ->
-    ?assertEqual([ping], quic_loss:retransmittable_frames([immediate_ack, ping])).
+    ?assertEqual(
+        [{max_data, 100}], quic_loss:retransmittable_frames([immediate_ack, {max_data, 100}])
+    ).
 
 immediate_ack_on_the_flight_end_test() ->
     meck:new(quic_cc, [passthrough]),

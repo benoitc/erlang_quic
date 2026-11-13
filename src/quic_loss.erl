@@ -1117,8 +1117,8 @@ ack_delay_to_ms(AckDelay, #loss_state{ack_delay_exponent = Exp}) ->
 %% Retransmission Helpers
 %%====================================================================
 
-%% @doc Filter frames to get only retransmittable ones.
-%% Per RFC 9002, PADDING, ACK, and CONNECTION_CLOSE frames are not retransmitted.
+%% @doc The frames of a lost packet whose information is sent again
+%% (RFC 9000 Section 13.3).
 -spec retransmittable_frames([term()]) -> [term()].
 retransmittable_frames(Frames) ->
     lists:filter(fun is_retransmittable/1, Frames).
@@ -1146,6 +1146,8 @@ stream_has_unacked_below(#loss_state{} = State, StreamId, ReliableSize) ->
     ).
 
 %% Check if a frame is retransmittable
+%% PING and PADDING carry no information to repair (RFC 9000 Section 13.3).
+is_retransmittable(ping) -> false;
 is_retransmittable(padding) -> false;
 is_retransmittable({padding, _}) -> false;
 is_retransmittable({ack, _, _, _}) -> false;

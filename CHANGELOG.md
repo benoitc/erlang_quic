@@ -127,6 +127,10 @@ All notable changes to this project will be documented in this file.
   Appendix B.7). This changes NewReno and CUBIC when the peer reports
   ECN. A window cut by a CE mark is no longer undone when losses from
   the same episode later prove spurious.
+- A lost PING was sent again, although it carries nothing to repair
+  (RFC 9000 Section 13.3). It no longer is; the probe timeout still
+  sends a PING when nothing else is outstanding, so keep-alive and
+  liveness checks work as before.
 
 ## [2.7.0] - 2026-11-13
 

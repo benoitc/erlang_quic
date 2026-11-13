@@ -10123,11 +10123,16 @@ should_delay_ack([{stream, _, _, _, _} | _]) ->
     %% so the packet never qualifies for the datagram-only delay.
     false;
 should_delay_ack(Frames) ->
-    AckEliciting = [F || F <- Frames, quic_ack:is_ack_eliciting_frame(F)],
-    Retransmittable = quic_loss:retransmittable_frames(AckEliciting),
-    %% If all ack-eliciting frames are non-retransmittable, delay ACK,
-    %% unless one asks for it now (draft-ietf-quic-ack-frequency-14 Section 5)
-    (Retransmittable =:= []) andalso not lists:member(immediate_ack, AckEliciting).
+    %% Only DATAGRAM frames among the ack-eliciting ones; IMMEDIATE_ACK asks
+    %% for the ACK now (draft-ietf-quic-ack-frequency-14 Section 5).
+    lists:all(
+        fun(F) -> is_datagram_frame(F) orelse not quic_ack:is_ack_eliciting_frame(F) end,
+        Frames
+    ).
+
+is_datagram_frame({datagram, _}) -> true;
+is_datagram_frame({datagram_with_length, _}) -> true;
+is_datagram_frame(_) -> false.
 
 %% Schedule a delayed ACK (datagram-only path; RFC 9221 §5.2).
 %% Shares the same ack_timer field with the count-based decimation
