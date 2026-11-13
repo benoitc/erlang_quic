@@ -847,7 +847,7 @@
     %% Config rotation bits (0-6, 7 = unroutable)
     config_rotation = 0 :: 0..6,
     %% Encoding algorithm
-    algorithm = plaintext :: plaintext | stream_cipher | block_cipher,
+    algorithm = plaintext :: plaintext | encrypted | stream_cipher | block_cipher,
     %% Server ID (1-15 bytes identifying this server)
     server_id :: binary(),
     %% Length of server ID in bytes

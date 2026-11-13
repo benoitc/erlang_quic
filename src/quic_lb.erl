@@ -28,8 +28,11 @@
 %%% == Algorithms ==
 %%%
 %%% 1. Plaintext: No encryption, server_id visible in CID
-%%% 2. Stream Cipher: AES-128-CTR encrypts first octet + server_id
-%%% 3. Block Cipher: AES-128-ECB with Feistel network for non-16-byte
+%%% 2. Encrypted: AES-128-ECB single pass for a 16-byte server ID and nonce,
+%%%    four-pass Feistel network otherwise (draft-ietf-quic-load-balancers-22
+%%%    Section 5.4)
+%%% 3. Stream Cipher: AES-128-CTR encrypts first octet + server_id
+%%% 4. Block Cipher: AES-128-ECB with Feistel network for non-16-byte
 %%%
 %%% @end
 
@@ -57,7 +60,7 @@
 %%
 %% Options:
 %%   - server_id: binary() (required) - Server identifier (1-15 bytes)
-%%   - algorithm: plaintext | stream_cipher | block_cipher (default: plaintext)
+%%   - algorithm: plaintext | encrypted | stream_cipher | block_cipher (default: plaintext)
 %%   - config_rotation: 0..6 (default: 0)
 %%   - nonce_len: 4..18 (default: 4)
 %%   - key: binary() - 16-byte AES key (required for cipher algorithms)
@@ -146,7 +149,7 @@ validate_config(#lb_config{
     Validations = [
         {CR >= 0 andalso CR =< 6, {invalid_config_rotation, CR}},
         {
-            lists:member(Algorithm, [plaintext, stream_cipher, block_cipher]),
+            lists:member(Algorithm, [plaintext, encrypted, stream_cipher, block_cipher]),
             {invalid_algorithm, Algorithm}
         },
         {is_binary(ServerID), {invalid_server_id, not_binary}},
@@ -213,6 +216,8 @@ generate_cid(#cid_config{lb_config = LBConfig}, Nonce) ->
     case Algorithm of
         plaintext ->
             encode_plaintext(FirstByte, ServerID, ActualNonce);
+        encrypted ->
+            <<FirstByte, (encrypt(<<ServerID/binary, ActualNonce/binary>>, Key))/binary>>;
         stream_cipher ->
             encode_stream_cipher(FirstByte, ServerID, ActualNonce, Key);
         block_cipher ->
@@ -225,6 +230,8 @@ decode_server_id(CID, #lb_config{algorithm = Algorithm} = Config) when byte_size
     case Algorithm of
         plaintext ->
             decode_plaintext(CID, Config);
+        encrypted ->
+            decode_encrypted(CID, Config);
         stream_cipher ->
             decode_stream_cipher(CID, Config);
         block_cipher ->
@@ -266,6 +273,95 @@ decode_plaintext(<<_FirstByte, Rest/binary>>, #lb_config{server_id_len = ServerI
         _ ->
             {error, cid_too_short}
     end.
+
+%%====================================================================
+%% Encrypted Encoding (draft-ietf-quic-load-balancers-22 Section 5.4)
+%%====================================================================
+
+%% @private A 16-byte server ID and nonce is one AES block (Section 5.4.1).
+encrypt(<<_:16/binary>> = Block, Key) ->
+    crypto:crypto_one_time(aes_128_ecb, Key, Block, true);
+encrypt(Plain, Key) ->
+    Len = byte_size(Plain),
+    {L0, R0} = split_halves(Plain),
+    R1 = feistel_pass(Key, Len, 1, L0, R0),
+    L1 = feistel_pass(Key, Len, 2, R1, L0),
+    R2 = feistel_pass(Key, Len, 3, L1, R1),
+    L2 = feistel_pass(Key, Len, 4, R2, L1),
+    join_halves(L2, R2, Len).
+
+%% @private Decode an encrypted CID (Section 5.5).
+decode_encrypted(
+    <<_FirstByte, Rest/binary>>,
+    #lb_config{server_id_len = ServerIDLen, nonce_len = NonceLen, key = Key}
+) ->
+    Len = ServerIDLen + NonceLen,
+    case Rest of
+        <<Body:Len/binary, _ServerUse/binary>> ->
+            Plain = decrypt(Body, ServerIDLen, NonceLen, Key),
+            <<ServerID:ServerIDLen/binary, _/bits>> = Plain,
+            {ok, ServerID};
+        _ ->
+            {error, cid_too_short}
+    end.
+
+%% @private Returns at least the server ID bits of the plaintext.
+decrypt(<<_:16/binary>> = Block, _ServerIDLen, _NonceLen, Key) ->
+    crypto:crypto_one_time(aes_128_ecb, Key, Block, false);
+decrypt(Body, ServerIDLen, NonceLen, Key) ->
+    Len = byte_size(Body),
+    {L2, R2} = split_halves(Body),
+    L1 = feistel_pass(Key, Len, 4, R2, L2),
+    R1 = feistel_pass(Key, Len, 3, L1, R2),
+    L0 = feistel_pass(Key, Len, 2, R1, L1),
+    case ServerIDLen =< NonceLen of
+        %% left_0 holds the whole server ID, a fourth pass is not needed.
+        true ->
+            L0;
+        false ->
+            R0 = feistel_pass(Key, Len, 1, L0, R1),
+            join_halves(L0, R0, Len)
+    end.
+
+%% @private XOR Half with AES-ECB(expand(Len, Pass, Input)); odd passes
+%% write the right half, even passes the left (Section 5.4.2.3).
+feistel_pass(Key, Len, Pass, Input, Half) ->
+    HalfLen = byte_size(Half),
+    Expanded = <<Input/binary, 0:((14 - HalfLen) * 8), Len, Pass>>,
+    <<Mask:HalfLen/binary, _/binary>> = crypto:crypto_one_time(aes_128_ecb, Key, Expanded, true),
+    clear_nibble(crypto:exor(Half, Mask), Len rem 2, Pass rem 2).
+
+%% @private With an odd length, the left half ends and the right half
+%% starts with four zero bits.
+clear_nibble(Half, 0, _Side) ->
+    Half;
+clear_nibble(<<_:4, Rest/bits>>, 1, 1) ->
+    <<0:4, Rest/bits>>;
+clear_nibble(Half, 1, 0) ->
+    Keep = bit_size(Half) - 4,
+    <<Bits:Keep/bits, _:4>> = Half,
+    <<Bits/bits, 0:4>>.
+
+%% @private Split into equal halves; an odd middle octet is split by nibble.
+split_halves(Bin) ->
+    Bits = byte_size(Bin) * 4,
+    <<Left:Bits/bits, Right:Bits/bits>> = Bin,
+    {pad_bits(Left, last), pad_bits(Right, first)}.
+
+pad_bits(Bits, _Side) when bit_size(Bits) rem 8 =:= 0 ->
+    Bits;
+pad_bits(Bits, last) ->
+    <<Bits/bits, 0:4>>;
+pad_bits(Bits, first) ->
+    <<0:4, Bits/bits>>.
+
+%% @private Inverse of split_halves/1 for a Len-octet result.
+join_halves(Left, Right, Len) ->
+    Bits = Len * 4,
+    Skip = bit_size(Right) - Bits,
+    <<LeftBits:Bits/bits, _/bits>> = Left,
+    <<_:Skip, RightBits/bits>> = Right,
+    <<LeftBits/bits, RightBits/bits>>.
 
 %%====================================================================
 %% Stream Cipher Encoding (RFC 9312 Section 4.2)

@@ -260,6 +260,100 @@ plaintext_cid_config(CR, SID, Nonce) ->
     make_cid_config(plaintext_lb_config(CR, SID, byte_size(Nonce))).
 
 %%====================================================================
+%% draft-ietf-quic-load-balancers-22 Section 5.4 encryption
+%%====================================================================
+
+-define(B2_KEY, <<16#8f95f09245765f80256934e50c66207f:128>>).
+
+%% {CR, ServerID, Nonce, CID} from Appendix B.2. The draft prints the
+%% cr_bits 3 CID with first octet 0x12 (config rotation 0); 0x72 is the
+%% first octet for config rotation 3 and 18 octets, the rest matches.
+encrypted_vectors() ->
+    [
+        {0, <<16#ed793a:24>>, <<16#ee080dbf:32>>, <<16#0720b1d07b359d3c:64>>},
+        {1, <<16#ed793a51d49b8f5fab65:80>>, <<16#ee080dbf48:40>>, <<
+            16#2fcc381bc74cb4fbad2823a3d1f8fed2:128
+        >>},
+        {2, <<16#ed793a51d49b8f5f:64>>, <<16#ee080dbf48c0d1e5:64>>, <<
+            16#504dd2d05a7b0de9b2b9907afb5ecf8cc3:136
+        >>},
+        {3, <<16#ed793a51d49b8f5fab:72>>, <<16#ee080dbf48c0d1e55d:72>>, <<
+            16#725779c9cc86beb3a3a4a3ca96fce4bfe0cdbc:152
+        >>}
+    ].
+
+encrypted_lb_config(CR, SID, NonceLen, Key) ->
+    {ok, LB} = quic_lb:new_config(#{
+        server_id => SID,
+        algorithm => encrypted,
+        config_rotation => CR,
+        nonce_len => NonceLen,
+        key => Key
+    }),
+    LB.
+
+encrypted_vector_encode_test_() ->
+    [
+        ?_assertEqual(
+            CID,
+            quic_lb:generate_cid(
+                make_cid_config(encrypted_lb_config(CR, SID, byte_size(Nonce), ?B2_KEY)), Nonce
+            )
+        )
+     || {CR, SID, Nonce, CID} <- encrypted_vectors()
+    ].
+
+encrypted_vector_decode_test_() ->
+    [
+        ?_assertEqual(
+            {ok, SID},
+            quic_lb:decode_server_id(CID, encrypted_lb_config(CR, SID, byte_size(Nonce), ?B2_KEY))
+        )
+     || {CR, SID, Nonce, CID} <- encrypted_vectors()
+    ].
+
+%% Section 5.4.2.4 worked example: 7 octets, split by nibble.
+encryption_example_test() ->
+    Key = <<16#fdf726a9893ec05c0632d3956680baf0:128>>,
+    LB = encrypted_lb_config(0, <<16#31441a:24>>, 4, Key),
+    CID = quic_lb:generate_cid(make_cid_config(LB), <<16#9c69c275:32>>),
+    ?assertEqual(<<16#0767947d29be054a:64>>, CID),
+    ?assertEqual({ok, <<16#31441a:24>>}, quic_lb:decode_server_id(CID, LB)).
+
+%% The single pass is plain AES-128-ECB over the server ID and nonce.
+encrypted_single_pass_is_aes_ecb_test() ->
+    Key = crypto:strong_rand_bytes(16),
+    SID = crypto:strong_rand_bytes(6),
+    Nonce = crypto:strong_rand_bytes(10),
+    CID = quic_lb:generate_cid(make_cid_config(encrypted_lb_config(0, SID, 10, Key)), Nonce),
+    Block = crypto:crypto_one_time(aes_128_ecb, Key, <<SID/binary, Nonce/binary>>, true),
+    ?assertEqual(<<16, Block/binary>>, CID).
+
+%% Every server ID and nonce length the draft allows, both decode paths.
+encrypted_roundtrip_all_lengths_test() ->
+    Key = crypto:strong_rand_bytes(16),
+    [
+        begin
+            SID = crypto:strong_rand_bytes(SIDLen),
+            LB = encrypted_lb_config(5, SID, NonceLen, Key),
+            CID = quic_lb:generate_cid(make_cid_config(LB)),
+            ?assertEqual(1 + SIDLen + NonceLen, byte_size(CID)),
+            ?assertEqual(5, quic_lb:get_config_rotation(CID)),
+            ?assertNotEqual(SID, binary:part(CID, 1, SIDLen)),
+            ?assertEqual({ok, SID}, quic_lb:decode_server_id(CID, LB))
+        end
+     || SIDLen <- lists:seq(1, 15), NonceLen <- lists:seq(4, 19 - SIDLen)
+    ],
+    ok.
+
+%% Octets a server appends after the nonce do not change the server ID.
+encrypted_decode_ignores_server_use_octets_test() ->
+    {CR, SID, Nonce, CID} = lists:nth(2, encrypted_vectors()),
+    LB = encrypted_lb_config(CR, SID, byte_size(Nonce), ?B2_KEY),
+    ?assertEqual({ok, SID}, quic_lb:decode_server_id(<<CID/binary, 1, 2, 3>>, LB)),
+    ?assertEqual({error, cid_too_short}, quic_lb:decode_server_id(binary:part(CID, 0, 15), LB)).
+
+%%====================================================================
 %% Stream Cipher Encoding Tests
 %%====================================================================
 
