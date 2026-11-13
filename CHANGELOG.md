@@ -9,6 +9,33 @@ All notable changes to this project will be documented in this file.
   owner: the one `connection_handler` returned, or the listener without
   one. An owner started by `connection_handler` can now be told the
   negotiated ALPN without keeping a map from connection to owner.
+- QUIC-LB now follows draft-ietf-quic-load-balancers-22. The new
+  `encrypted` algorithm produces the encrypted connection IDs the draft
+  defines (Section 5.4), which a load balancer that follows it decodes
+  with the same key.
+
+### Changed
+- Breaking: the `stream_cipher` and `block_cipher` QUIC-LB algorithms
+  are refused. Their connection IDs followed no QUIC-LB draft, so a
+  load balancer could not read the server ID from them. A server
+  configured with either no longer starts; use `encrypted` and give the
+  load balancer the same key.
+- A server whose `lb_config` is invalid no longer starts and returns
+  `{error, {invalid_lb_config, Reason}}`. It used to log a warning and
+  issue random connection IDs the load balancer could not route.
+
+### Fixed
+- A QUIC-LB server ID and nonce longer than 19 bytes together were
+  accepted. The connection IDs were longer than QUIC allows and their
+  first byte named the wrong configuration. They are now refused
+  (draft-ietf-quic-load-balancers-22 Section 5.3).
+- A QUIC-LB configuration rotation, nonce length or connection ID
+  length that was not an integer was accepted and made connection ID
+  generation fail later. It is now refused when the configuration is
+  created.
+- `quic_lb:decode_server_id/2` returned a server ID for a connection ID
+  whose first three bits name another configuration. It now returns
+  `{error, config_rotation_mismatch}` (Section 3.1).
 
 ## [2.7.0] - 2026-11-13
 

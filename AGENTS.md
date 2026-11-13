@@ -126,7 +126,7 @@ Last checked: 2026-11-12.
 | RFC 9438 CUBIC, RFC 9406 HyStart++ | congestion control | `quic_cc_cubic`, `quic_cc_newreno` |
 | draft-ietf-ccwg-bbr (revision not recorded) BBRv3 | congestion control | `quic_cc_bbr` |
 | draft-ietf-quic-reliable-stream-reset-11 | RESET_STREAM_AT, `reset_stream_at` transport parameter (both ids) | `quic_connection`, `quic_tls` |
-| draft-ietf-quic-load-balancers (revision not recorded) QUIC-LB | routable connection IDs | `quic_lb` |
+| draft-ietf-quic-load-balancers-22 QUIC-LB | routable connection IDs, plaintext and encrypted | `quic_lb` |
 | RFC 8305 Happy Eyeballs v2 | client address racing | `quic_happy` |
 
 ### TLS
@@ -151,8 +151,8 @@ Last checked: 2026-11-12.
 | RFC 9220 extended CONNECT over HTTP/3 | `enable_connect_protocol`, `:protocol` | `quic_h3_connection` |
 | draft-ietf-webtrans-http3-17 | the primitives WebTransport needs: SETTINGS_WT_ENABLED, WT_STREAM, claimed streams | `quic_h3_connection` |
 
-Code comments call QUIC-LB "RFC 9312", which is the QUIC manageability
-document; it is draft-ietf-quic-load-balancers. Erlang distribution over QUIC
+QUIC-LB is draft-ietf-quic-load-balancers, not RFC 9312, which is the QUIC
+manageability document. Erlang distribution over QUIC
 (`quic_dist`) follows the OTP distribution protocol, which is documented in
 the OTP sources rather than an RFC.
 
@@ -202,7 +202,6 @@ before any code changes.
 
 | Spec | Code follows | Latest | To check |
 |---|---|---|---|
-| QUIC-LB | revision not recorded | draft-ietf-quic-load-balancers-22 | CID formats, config rotation bits, encryption modes in `quic_lb`; fix the "RFC 9312" citation |
 | BBR | revision not recorded | draft-ietf-ccwg-bbr-07 | state machine and gains in `quic_cc_bbr`; record the revision followed |
 
 ## Skills
@@ -249,7 +248,7 @@ rebar3 ex_doc                                     # Generate docs
 
 **Flow Control & Loss:** `quic_flow.erl` (standalone connection-level accounting helper; the flow control that runs is inline in `quic_connection.erl`), `quic_cc.erl` (congestion control behaviour and dispatch; NewReno, CUBIC and BBR live in `quic_cc_newreno.erl`, `quic_cc_cubic.erl`, `quic_cc_bbr.erl`), `quic_loss.erl` (loss detection/recovery), `quic_ack.erl` (ACK processing)
 
-**Other:** `quic_ticket.erl` (session tickets/PSK), `quic_lb.erl` (QUIC-LB RFC 9312)
+**Other:** `quic_ticket.erl` (session tickets/PSK), `quic_lb.erl` (QUIC-LB, draft-ietf-quic-load-balancers-22)
 
 ### Supervision Tree
 
