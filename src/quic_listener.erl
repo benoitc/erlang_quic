@@ -104,7 +104,8 @@
     register_cid/3,
     retire_cid/2,
     has_auth_method/1,
-    validate_reset_secret/1
+    validate_reset_secret/1,
+    validate_lb_config/1
 ]).
 
 %% gen_server callbacks
@@ -287,12 +288,14 @@ init({Port, Opts}) ->
     %% Default: gen_udp for backwards compatibility
     Backend = maps:get(socket_backend, Opts, gen_udp),
 
-    case {validate_reset_secret(Opts), Backend} of
-        {{error, Reason}, _} ->
+    case {validate_reset_secret(Opts), validate_lb_config(Opts), Backend} of
+        {{error, Reason}, _, _} ->
             {stop, Reason};
-        {ok, socket} ->
+        {ok, {error, Reason}, _} ->
+            {stop, Reason};
+        {ok, ok, socket} ->
             init_socket_backend(Port, Opts);
-        {ok, gen_udp} ->
+        {ok, ok, gen_udp} ->
             init_genudp_backend(Port, Opts)
     end.
 
@@ -433,7 +436,7 @@ handle_continue(discover_manager, {Socket, SocketState, Backend, Opts, Preferred
     ResetSecret = maps:get(reset_secret, Opts, crypto:strong_rand_bytes(32)),
 
     %% Initialize QUIC-LB CID configuration (RFC 9312)
-    {CIDConfig, DCIDLen} = init_cid_config(Opts, ResetSecret),
+    {ok, {CIDConfig, DCIDLen}} = init_cid_config(Opts, ResetSecret),
 
     %% Start GRO receiver if using socket backend
     GROReceiver = maybe_start_gro_receiver(Backend, SocketState),
@@ -488,6 +491,15 @@ validate_reset_secret(Opts) ->
         {ok, S} when is_binary(S), byte_size(S) >= 32 -> ok;
         {ok, S} when is_binary(S) -> {error, {invalid_reset_secret, byte_size(S)}};
         {ok, S} -> {error, {invalid_reset_secret, S}}
+    end.
+
+%% @doc A listener issues only CIDs its `lb_config' describes, so an
+%% `lb_config' that cannot be used is refused instead of ignored.
+-spec validate_lb_config(map()) -> ok | {error, {invalid_lb_config, term()}}.
+validate_lb_config(Opts) ->
+    case init_cid_config(Opts, undefined) of
+        {ok, _} -> ok;
+        {error, Reason} -> {error, {invalid_lb_config, Reason}}
     end.
 
 -spec has_auth_method(map()) -> ok | {error, no_auth_method}.
@@ -997,60 +1009,26 @@ safe_delete_table(Tab) ->
     end.
 
 %% Initialize QUIC-LB CID configuration from options
-%% Returns {CIDConfig | undefined, DCIDLen}
+%% Returns {ok, {CIDConfig | undefined, DCIDLen}} | {error, Reason}
 init_cid_config(Opts, ResetSecret) ->
     case maps:get(lb_config, Opts, undefined) of
         undefined ->
-            %% No LB config - use default random CIDs
-            DCIDLen = maps:get(cid_len, Opts, 8),
-            {undefined, DCIDLen};
+            {ok, {undefined, maps:get(cid_len, Opts, 8)}};
         LBConfig when is_map(LBConfig) ->
-            %% LB config provided as map - create config
             case quic_lb:new_config(LBConfig) of
-                {ok, LBCfg} ->
-                    CIDLen = quic_lb:expected_cid_len(LBCfg),
-                    case
-                        quic_lb:new_cid_config(#{
-                            lb_config => LBCfg,
-                            cid_len => CIDLen,
-                            reset_secret => ResetSecret
-                        })
-                    of
-                        {ok, CIDConfig} ->
-                            {CIDConfig, CIDLen};
-                        {error, Reason} ->
-                            ?LOG_WARNING(
-                                #{what => invalid_cid_config, reason => Reason},
-                                ?QUIC_LOG_META
-                            ),
-                            {undefined, 8}
-                    end;
-                {error, Reason} ->
-                    ?LOG_WARNING(
-                        #{what => invalid_lb_config, reason => Reason},
-                        ?QUIC_LOG_META
-                    ),
-                    {undefined, 8}
+                {ok, LBCfg} -> lb_cid_config(LBCfg, ResetSecret);
+                {error, _} = Error -> Error
             end;
         #lb_config{} = LBCfg ->
-            %% LB config provided as record
-            CIDLen = quic_lb:expected_cid_len(LBCfg),
-            case
-                quic_lb:new_cid_config(#{
-                    lb_config => LBCfg,
-                    cid_len => CIDLen,
-                    reset_secret => ResetSecret
-                })
-            of
-                {ok, CIDConfig} ->
-                    {CIDConfig, CIDLen};
-                {error, Reason} ->
-                    ?LOG_WARNING(
-                        #{what => invalid_cid_config, reason => Reason},
-                        ?QUIC_LOG_META
-                    ),
-                    {undefined, 8}
-            end
+            lb_cid_config(LBCfg, ResetSecret);
+        _ ->
+            {error, badarg}
+    end.
+
+lb_cid_config(LBCfg, ResetSecret) ->
+    case quic_lb:new_cid_config(#{lb_config => LBCfg, reset_secret => ResetSecret}) of
+        {ok, #cid_config{cid_len = CIDLen} = CIDConfig} -> {ok, {CIDConfig, CIDLen}};
+        {error, _} = Error -> Error
     end.
 
 add_cid(CID, ConnPid, #listener_state{connections = Conns, cid_index = Index}) ->

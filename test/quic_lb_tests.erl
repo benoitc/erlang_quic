@@ -775,6 +775,42 @@ listener_integration_test_() ->
             end}
         ]}.
 
+%% An lb_config that cannot be used stops the listener from starting
+%% instead of leaving it on random CIDs the load balancer cannot route.
+bad_lb_config() ->
+    #{server_id => <<1, 2, 3, 4>>, nonce_len => 3}.
+
+listener_refuses_invalid_lb_config_test() ->
+    {Cert, Key} = quic_test_echo_server:cert_and_key(),
+    ?assertEqual(
+        {error, {invalid_lb_config, {invalid_nonce_len, 3}}},
+        quic_listener:start(0, #{
+            cert => Cert, key => Key, alpn => [<<"h3">>], lb_config => bad_lb_config()
+        })
+    ).
+
+listener_refuses_non_map_lb_config_test() ->
+    {Cert, Key} = quic_test_echo_server:cert_and_key(),
+    ?assertEqual(
+        {error, {invalid_lb_config, badarg}},
+        quic_listener:start(0, #{
+            cert => Cert, key => Key, alpn => [<<"h3">>], lb_config => [{server_id, <<1>>}]
+        })
+    ).
+
+start_server_refuses_invalid_lb_config_test() ->
+    {ok, _} = application:ensure_all_started(quic),
+    {Cert, Key} = quic_test_echo_server:cert_and_key(),
+    Name = list_to_atom("lb_config_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    Result = quic:start_server(Name, 0, #{
+        cert => Cert, key => Key, alpn => [<<"h3">>], lb_config => bad_lb_config()
+    }),
+    case Result of
+        {ok, _} -> quic:stop_server(Name);
+        _ -> ok
+    end,
+    ?assertEqual({error, {invalid_lb_config, {invalid_nonce_len, 3}}}, Result).
+
 generate_test_cert() ->
     Cert = <<"test_certificate_data">>,
     PrivKey = crypto:strong_rand_bytes(32),
