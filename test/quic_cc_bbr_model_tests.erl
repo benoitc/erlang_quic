@@ -738,7 +738,11 @@ persistent_congestion_test() ->
     InFlight = quic_cc_bbr:bytes_in_flight(CC2),
     CC3 = quic_cc_bbr:on_packets_acked_at(CC2, InFlight, Now + 50 * ?MS),
     ?assertNot(quic_cc_bbr:in_recovery(CC3)),
-    ?assert(quic_cc_bbr:cwnd(CC3) >= 4 * ?MDS).
+    %% RestoreCwnd, then SetCwnd bounds it to max_inflight.
+    ?assertEqual(
+        min(Before + InFlight, maps:get(max_inflight, quic_cc_bbr:info(CC3))),
+        quic_cc_bbr:cwnd(CC3)
+    ).
 
 %% Random loss below LossThresh does not stop the flow from using the
 %% path (Section 5.5.10).

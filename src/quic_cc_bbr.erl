@@ -1243,9 +1243,11 @@ on_spurious_congestion(S0) ->
         end,
     S2#bbr_state{undo_state = none}.
 
-%% @doc Persistent congestion is QUIC's retransmission timeout: save the
-%% model for undo and drop cwnd to the minimum window (RFC 9002 Section
-%% 7.6.2, draft-ietf-ccwg-bbr-07 Section 5.6.4.4).
+%% @doc Persistent congestion is QUIC's retransmission timeout. cwnd
+%% drops to the minimum window (RFC 9002 Section 7.6.2 and Appendix
+%% B.8). As on an RTO, BBR first saves cwnd and its model
+%% (draft-ietf-ccwg-bbr-07 Sections 5.5.11.1 and 5.6.4.4) and restores
+%% cwnd when the recovery this starts ends.
 -spec on_persistent_congestion(cc_state()) -> cc_state().
 on_persistent_congestion(State) ->
     on_persistent_congestion_at(State, now_us()).
