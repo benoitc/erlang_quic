@@ -301,12 +301,17 @@ Where `K = cbrt(W_max * beta / C)` and `C = 0.4`, `beta = 0.7`.
 
 ### BBR
 
-BBR probes for maximum bandwidth and minimum RTT:
+`quic_cc_bbr` follows draft-ietf-ccwg-bbr-07 (BBRv3). It probes for
+maximum bandwidth and minimum RTT:
 
-1. **Startup**: Doubles sending rate each RTT until bandwidth plateaus
-2. **Drain**: Reduces inflight to match BDP
-3. **ProbeBW**: Cycles through pacing gain phases
-4. **ProbeRTT**: Periodically reduces cwnd to measure min RTT
+1. **Startup**: Doubles sending rate each round trip until bandwidth plateaus or loss is high
+2. **Drain**: Reduces inflight to the BDP
+3. **ProbeBW**: Cycles DOWN, CRUISE, REFILL and UP, probing for bandwidth every 2 to 3 seconds
+4. **ProbeRTT**: When min RTT has not dropped for 10 seconds, halves cwnd for 200 ms to measure it
+
+The `quic_cc` callbacks report bytes, so the delivery rate sampler
+matches acknowledged and lost bytes against per-packet snapshots kept in
+send order.
 
 ### Packet Pacing
 

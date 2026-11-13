@@ -23,6 +23,19 @@ All notable changes to this project will be documented in this file.
 - A server whose `lb_config` is invalid no longer starts and returns
   `{error, {invalid_lb_config, Reason}}`. It used to log a warning and
   issue random connection IDs the load balancer could not route.
+- BBR now follows draft-ietf-ccwg-bbr-07 (BBRv3). It measures
+  bandwidth per packet, ends Startup on heavy loss as well as on a
+  bandwidth plateau, lowers its rate and data in flight by at most 30%
+  per round trip with loss or ECN congestion marks, and probes for more
+  bandwidth every 2 to 3 seconds, sooner on paths with a small
+  bandwidth-delay product. Startup no longer ends on an RTT increase
+  (HyStart++), which the draft does not use.
+- With BBR, persistent congestion drops the congestion window to the
+  minimum and keeps the bandwidth and RTT estimates, instead of starting
+  over from Startup.
+- BBR sends bursts of at most 1 ms at its pacing rate, between 2
+  packets and 64 KB (draft-ietf-ccwg-bbr-07 Section 5.6.3), instead of
+  2 ms with a floor of 12 packets.
 
 ### Fixed
 - A QUIC-LB server ID and nonce longer than 19 bytes together were
@@ -36,6 +49,17 @@ All notable changes to this project will be documented in this file.
 - `quic_lb:decode_server_id/2` returned a server ID for a connection ID
   whose first three bits name another configuration. It now returns
   `{error, config_rotation_mismatch}` (Section 3.1).
+- BBR counted a round trip on every ACK, so it left Startup after a few
+  ACKs, well before the path was full, and forgot bandwidth samples
+  within one round trip. It now counts one round per round trip
+  (draft-ietf-ccwg-bbr-07 Section 5.5.1).
+- An application sending less than BBR allowed lowered BBR's bandwidth
+  estimate. Such samples now count only when they raise it
+  (draft-ietf-ccwg-bbr-07 Section 5.5.4).
+- BBR's ProbeRTT started only from ProbeBW and always returned there.
+  It now starts from any state once the minimum RTT is 10 seconds old
+  and returns to Startup if the path was never filled
+  (draft-ietf-ccwg-bbr-07 Section 5.3.4).
 
 ## [2.7.0] - 2026-11-13
 
