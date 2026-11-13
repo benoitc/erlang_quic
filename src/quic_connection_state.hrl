@@ -252,9 +252,6 @@
     %% sample granularity and slower loss feedback, bounded by the
     %% max_ack_delay timer either way.
     ack_packet_tolerance = ?ACK_PACKET_TOLERANCE :: pos_integer(),
-    %% ACK frequency extension (draft-ietf-quic-ack-frequency-14): we
-    %% advertise min_ack_delay, follow a peer's requests, and send our own.
-    ack_frequency = true :: boolean(),
 
     %% QLOG Tracing (draft-ietf-quic-qlog-quic-events)
     qlog_ctx :: #qlog_ctx{} | undefined

@@ -878,7 +878,6 @@ init({server, Opts}) ->
             stateless_reset_secret = maps:get(reset_secret, Opts, undefined),
             retry_scid_for_tp = maps:get(retry_scid, Opts, undefined),
             reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
-            ack_frequency = ack_frequency_opt(Opts),
             idle_timeout = IdleTimeout,
             keep_alive_interval = calculate_keep_alive_interval(Opts),
             disconnect_timeout = disconnect_timeout_opt(Opts),
@@ -1319,7 +1318,6 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             spin_bit_enabled = spin_bit_enabled(Opts),
             stateless_reset_secret = maps:get(reset_secret, Opts, undefined),
             reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
-            ack_frequency = ack_frequency_opt(Opts),
             idle_timeout = IdleTimeoutClient,
             keep_alive_interval = calculate_keep_alive_interval(Opts),
             disconnect_timeout = disconnect_timeout_opt(Opts),
@@ -2694,8 +2692,7 @@ send_client_hello(State) ->
             case (State#state.cfg)#conn_cfg.reset_stream_at_enabled of
                 false -> TransportParams1;
                 true -> TransportParams1#{reset_stream_at => true}
-            end,
-            State
+            end
         ),
 
     %% Build ClientHello (with or without PSK for resumption / external).
@@ -2823,10 +2820,8 @@ upgrade_ticket(Ticket) ->
 
 %% draft-ietf-quic-ack-frequency-14 Section 3: min_ack_delay announces we
 %% take ACK_FREQUENCY and IMMEDIATE_ACK.
-with_min_ack_delay(TP, #state{cfg = #conn_cfg{ack_frequency = true}}) ->
-    TP#{min_ack_delay => ?MIN_ACK_DELAY_US};
-with_min_ack_delay(TP, _State) ->
-    TP.
+with_min_ack_delay(TP) ->
+    TP#{min_ack_delay => ?MIN_ACK_DELAY_US}.
 
 %% What a ticket keeps of the server's transport parameters: all the
 %% client processes, except those Section 7.4.1 takes from the new
@@ -3106,8 +3101,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
             case (State#state.cfg)#conn_cfg.reset_stream_at_enabled of
                 false -> TransportParams1;
                 true -> TransportParams1#{reset_stream_at => true}
-            end,
-            State
+            end
         ),
     %% Add preferred_address if configured (RFC 9000 Section 9.6)
     %% Server MUST NOT send preferred_address if disable_active_migration is set
@@ -6693,21 +6687,12 @@ process_frame(
         error ->
             reset_unseen_stream(StreamId, ErrorCode, FinalSize, State)
     end;
-process_frame(
-    app,
-    {ack_frequency, Seq, Threshold, Delay, Reordering},
-    #state{cfg = #conn_cfg{ack_frequency = true}} = State
-) ->
+%% We always advertise min_ack_delay (draft-ietf-quic-ack-frequency-14 Section 3).
+process_frame(app, {ack_frequency, Seq, Threshold, Delay, Reordering}, State) ->
     apply_ack_frequency(Seq, Threshold, Delay, Reordering, State);
 %% Section 5: ACK the packet carrying it at once.
-process_frame(app, immediate_ack, #state{cfg = #conn_cfg{ack_frequency = true}} = State) ->
-    State#state{last_recv_trigger = reordered};
-%% Without our min_ack_delay transport parameter both frame types are
-%% unknown on this connection (RFC 9000 Section 12.4).
-process_frame(app, {ack_frequency, _, _, _, _}, State) ->
-    ack_frequency_not_negotiated(?FRAME_ACK_FREQUENCY, State);
 process_frame(app, immediate_ack, State) ->
-    ack_frequency_not_negotiated(?FRAME_IMMEDIATE_ACK, State);
+    State#state{last_recv_trigger = reordered};
 %% Without our reset_stream_at transport parameter the frame type is
 %% unknown on this connection (RFC 9000 Section 12.4).
 process_frame(
@@ -7029,8 +7014,6 @@ largest_acked_sent(#peer_ack_freq{largest_acked = L}) -> L.
 
 %% Ask the peer for the ACK frequency the congestion controller wants, once
 %% it advertised min_ack_delay (draft-ietf-quic-ack-frequency-14 Section 4).
-maybe_request_ack_frequency(#state{cfg = #conn_cfg{ack_frequency = false}} = State) ->
-    State;
 maybe_request_ack_frequency(#state{cc_state = CC, loss_state = LossState} = State) ->
     SrttUs = quic_rtt:smoothed(quic_loss:rtt(LossState)) * 1000,
     case quic_cc:ack_frequency(CC, SrttUs) of
@@ -7088,6 +7071,7 @@ send_ack_frequency({Threshold, Delay, Reordering} = Request, Now, State0) ->
             undefined -> 0;
             #ack_freq_req{seq = Last} -> Last + 1
         end,
+    %% Sent like the other control frames; their cwnd check is reviewed separately.
     State = send_frame({ack_frequency, Seq, Threshold, Delay, Reordering}, State0),
     #state{loss_state = LossState, cc_state = CC} = State,
     %% Section 7: the PTO uses the larger max_ack_delay until the peer has the request.
@@ -7151,21 +7135,9 @@ flight_end_immediate_ack(Bytes, More, CC, State) ->
         ((quic_cc:available_cwnd(CC) < Bytes + quic_cc:max_datagram_size(CC)) orelse
             (not More andalso (State#state.send_queue_count =:= 0))).
 
-%% The peer advertised min_ack_delay and the extension is on (Section 3).
-peer_takes_ack_frequency(#state{cfg = #conn_cfg{ack_frequency = false}}) ->
-    false;
+%% The peer advertised min_ack_delay (Section 3).
 peer_takes_ack_frequency(#state{transport_params = TP}) ->
     maps:is_key(min_ack_delay, TP).
-
-ack_frequency_not_negotiated(FrameType, State) ->
-    close_with_error(
-        app,
-        transport,
-        ?QUIC_FRAME_ENCODING_ERROR,
-        FrameType,
-        <<"ACK frequency not negotiated">>,
-        State
-    ).
 
 %% What an ACK means beyond loss and congestion accounting. Only the
 %% application space has streams, PMTU probes and a send queue, so the
@@ -9866,13 +9838,6 @@ flush_recv_pass(State0) ->
             end;
         _ ->
             State
-    end.
-
-%% On unless set to `false'.
-ack_frequency_opt(Opts) ->
-    case maps:get(ack_frequency, Opts, true) of
-        false -> false;
-        _ -> true
     end.
 
 %% A boolean option: true only when set to exactly `true'.

@@ -327,8 +327,7 @@ offload budget grows by the data a reduced ACK frequency holds back
 ### ACK frequency
 
 draft-ietf-quic-ack-frequency-14. Each connection advertises
-`min_ack_delay` of 1 ms (the ACK timer's granularity) unless
-`ack_frequency => false`.
+`min_ack_delay` of 1 ms, the ACK timer's granularity.
 
 - Receiving: a newer ACK_FREQUENCY sets how many ack-eliciting packets
   wait for an ACK (capped at 64), the ACK timer delay, and when a gap

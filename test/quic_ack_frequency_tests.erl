@@ -325,13 +325,11 @@ server_state() ->
     #state{hs = HS} = S0,
     S0#state{hs = HS#hs{pn_initial = HS#hs.pn_handshake}}.
 
-%% Without our min_ack_delay both frame types are unknown: FRAME_ENCODING_ERROR.
-not_negotiated_test_() ->
+%% We always advertise min_ack_delay, so both frames are accepted in 1-RTT.
+accepted_in_one_rtt_test_() ->
     [
         {atom_to_list(name(Frame)), fun() ->
-            S0 = server_state(),
-            S = process(app, Frame, S0#state{cfg = (S0#state.cfg)#conn_cfg{ack_frequency = false}}),
-            ?assertMatch({transport, ?QUIC_FRAME_ENCODING_ERROR, _}, S#state.close_reason)
+            ?assertEqual(undefined, close(app, Frame))
         end}
      || Frame <- [{ack_frequency, 0, 1, 1000, 1}, immediate_ack]
     ].
@@ -340,15 +338,8 @@ not_negotiated_test_() ->
 %% Receiver (Sections 3, 4, 5 and 6)
 %%====================================================================
 
-advertises_min_ack_delay_by_default_test() ->
-    S = server_state(),
-    ?assertEqual(#{min_ack_delay => 1000}, quic_connection:with_min_ack_delay(#{}, S)),
-    ?assertEqual(
-        #{},
-        quic_connection:with_min_ack_delay(#{}, S#state{
-            cfg = (S#state.cfg)#conn_cfg{ack_frequency = false}
-        })
-    ).
+advertises_min_ack_delay_test() ->
+    ?assertEqual(#{min_ack_delay => 1000}, quic_connection:with_min_ack_delay(#{})).
 
 requested_max_ack_delay_bounds_test_() ->
     [
