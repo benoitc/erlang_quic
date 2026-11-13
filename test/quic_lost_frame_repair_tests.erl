@@ -96,6 +96,28 @@ stop_sending_for_a_gone_stream_is_dropped_test() ->
     ?assertEqual([], resent([{stop_sending, 0, 7}], S#state{streams = #{}})).
 
 %%====================================================================
+%% RESET_STREAM_AT
+%%====================================================================
+
+reset_stream_at_with_the_current_reliable_size_is_resent_test() ->
+    {Frame, S} = reset_at(),
+    ?assertEqual([Frame], resent([Frame], S)).
+
+reset_stream_at_after_a_lower_reliable_size_is_dropped_test() ->
+    {Frame, S0} = reset_at(),
+    {ok, S1} = quic_connection:do_reset_stream_at(0, 9, 450, S0),
+    ?assertEqual([], resent([Frame], S1)).
+
+reset_stream_at_after_reset_stream_is_dropped_test() ->
+    {Frame, S0} = reset_at(),
+    {ok, S1} = quic_connection:do_close_stream(0, 9, S0),
+    ?assertEqual([], resent([Frame], S1)).
+
+reset_stream_at_for_a_reclaimed_stream_is_resent_test() ->
+    {Frame, S} = reset_at(),
+    ?assertEqual([Frame], resent([Frame], S#state{streams = #{}})).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -105,7 +127,7 @@ resent(Frames, State) ->
         pn = 0, time_sent = 0, ack_eliciting = true, in_flight = true, size = 50, frames = Frames
     },
     S = quic_connection:retransmit_lost_packets([Lost], State),
-    lists:append([Fs || {_PN, Fs} <- sent(S)]) ++ held(S).
+    lists:append(new_packets(S, ?S:next_app_pn(State))) ++ held(S) -- held(State).
 
 %% Frames of the packets sent at or after packet number From.
 new_packets(State, From) ->
@@ -147,6 +169,16 @@ blocked() ->
             }
         }
     }.
+
+%% A stream reset with RESET_STREAM_AT, code 9 and Reliable Size 500,
+%% with 400 bytes sent and 600 queued; returns the frame sent.
+reset_at() ->
+    S0 = ?S:state_with_send_stream(0, 400, false),
+    {ok, S1} = quic_connection:queue_blocked_send(0, 400, binary:copy(<<0>>, 600), false, 600, S0),
+    S2 = S1#state{owner = self(), coalesce = false, transport_params = #{reset_stream_at => true}},
+    {ok, S} = quic_connection:do_reset_stream_at(0, 9, 500, S2),
+    [Frame] = [F || {_, Fs} <- sent(S), {reset_stream_at, _, _, _, _} = F <- Fs],
+    {Frame, S}.
 
 with_stream(StreamId, Fun, #state{streams = Streams} = State) ->
     State#state{streams = maps:update_with(StreamId, Fun, Streams)}.

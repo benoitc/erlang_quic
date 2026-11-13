@@ -13545,6 +13545,15 @@ is_current_limit({streams_blocked, bidi, Limit}, State) ->
     Limit =:= State#state.max_streams_bidi_remote;
 is_current_limit({streams_blocked, uni, Limit}, State) ->
     Limit =:= State#state.max_streams_uni_remote;
+%% Only the RESET_STREAM_AT carrying the current Reliable Size is resent:
+%% sending an older one would raise it again
+%% (draft-ietf-quic-reliable-stream-reset-11 Section 5.2). A reclaimed
+%% stream keeps no record, so its frame is resent unchanged.
+is_current_limit({reset_stream_at, StreamId, _, _, Reliable}, #state{streams = Streams}) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream_state{send_reset_at = Current}} -> Reliable =:= Current;
+        error -> true
+    end;
 %% STOP_SENDING is resent until the receiving part reaches "Data Recvd" or
 %% "Reset Recvd" (RFC 9000 Section 13.3), which recv_done marks.
 is_current_limit({stop_sending, StreamId, _}, #state{streams = Streams}) ->

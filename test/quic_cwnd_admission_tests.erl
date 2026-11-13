@@ -473,7 +473,7 @@ control_frames() ->
         {new_connection_id, 1, 0, <<"cid-0001">>, Token},
         {retire_connection_id, 0},
         {reset_stream, 0, 0, 0},
-        {reset_stream_at, 0, 0, 10, 5},
+        {reset_stream_at, 4, 0, 10, 5},
         {stop_sending, 0, 0},
         handshake_done,
         {new_token, Token},

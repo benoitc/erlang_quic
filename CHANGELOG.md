@@ -139,6 +139,11 @@ All notable changes to this project will be documented in this file.
 - A lost STOP_SENDING was sent again after the stream had received all
   its data or the peer had reset it. It is now sent again only while
   the receive side of the stream is still open (RFC 9000 Section 13.3).
+- A lost RESET_STREAM_AT was sent again even after a later reset of
+  the same stream had lowered its reliable size, so the peer could see
+  the reliable size go back up, which the draft forbids. Only the
+  reset carrying the current reliable size is sent again now
+  (draft-ietf-quic-reliable-stream-reset-11 Section 5.2).
 
 ## [2.7.0] - 2026-11-13
 
