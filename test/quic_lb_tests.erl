@@ -223,6 +223,43 @@ plaintext_encoding_test_() ->
     ].
 
 %%====================================================================
+%% draft-ietf-quic-load-balancers-22 Appendix B.1 vectors
+%%====================================================================
+
+%% {CR, ServerID, Nonce, CID}. The second B.1 row prints the nonce
+%% without its leading zero (9 hex digits) and the first octet as "20a";
+%% the row here is that vector with the nonce read as 0x03487d970b.
+plaintext_vectors() ->
+    [
+        {0, <<16#c4605e:24>>, <<16#4504cc4f:32>>, <<16#07c4605e4504cc4f:64>>},
+        {1, <<16#350d28b420:40>>, <<16#03487d970b:40>>, <<16#2a350d28b42003487d970b:88>>}
+    ].
+
+plaintext_vector_encode_test_() ->
+    [
+        ?_assertEqual(CID, quic_lb:generate_cid(plaintext_cid_config(CR, SID, Nonce), Nonce))
+     || {CR, SID, Nonce, CID} <- plaintext_vectors()
+    ].
+
+plaintext_vector_decode_test_() ->
+    [
+        ?_assertEqual(
+            {ok, SID},
+            quic_lb:decode_server_id(CID, plaintext_lb_config(CR, SID, byte_size(Nonce)))
+        )
+     || {CR, SID, Nonce, CID} <- plaintext_vectors()
+    ].
+
+plaintext_lb_config(CR, SID, NonceLen) ->
+    {ok, LB} = quic_lb:new_config(#{
+        server_id => SID, algorithm => plaintext, config_rotation => CR, nonce_len => NonceLen
+    }),
+    LB.
+
+plaintext_cid_config(CR, SID, Nonce) ->
+    make_cid_config(plaintext_lb_config(CR, SID, byte_size(Nonce))).
+
+%%====================================================================
 %% Stream Cipher Encoding Tests
 %%====================================================================
 
