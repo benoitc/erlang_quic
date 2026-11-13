@@ -20,8 +20,11 @@ All notable changes to this project will be documented in this file.
   to a peer that supports it asks for fewer ACKs while the bandwidth
   is steady and for more while probing, and for an immediate ACK at the
   end of each flight in ProbeRTT (draft-ietf-ccwg-bbr-07 Section
-  4.1.3.3). Until a peer sends a request, acknowledgments go out as
-  before.
+  4.1.3.3). To a peer that supports it, PTO probes, PMTU probes and
+  the first packet after a client moves to a new path ask for an
+  immediate ACK, so loss recovery, path MTU discovery and migration are
+  not slowed by the peer's ACK delay. Until a peer sends a request,
+  acknowledgments go out as before.
 
 ### Changed
 - Breaking: the `stream_cipher` and `block_cipher` QUIC-LB algorithms

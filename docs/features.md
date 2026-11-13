@@ -38,7 +38,7 @@
 - [x] Packet number reconstruction per RFC 9000 Appendix A
 - [x] Coalesced packets
 - [x] Frame coalescing (ACK + small stream data in single packet)
-- [x] ACK frequency extension (draft-ietf-quic-ack-frequency-14): every connection advertises `min_ack_delay` (1 ms) and follows the peer's ACK_FREQUENCY and IMMEDIATE_ACK; with BBR it also asks a peer that advertised `min_ack_delay` for fewer ACKs in steady state
+- [x] ACK frequency extension (draft-ietf-quic-ack-frequency-14): every connection advertises `min_ack_delay` (1 ms) and follows the peer's ACK_FREQUENCY and IMMEDIATE_ACK; with BBR it also asks a peer that advertised `min_ack_delay` for fewer ACKs in steady state. PTO probes, PMTU probes and the first packet after a client migration carry IMMEDIATE_ACK to such a peer
 - [x] HTTP/3 response HEADERS coalesced with the first DATA frame so the
   response headers and first body bytes ride in one 1-RTT packet (a large
   body still fragments; only the standalone HEADERS packet is removed)

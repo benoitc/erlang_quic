@@ -339,6 +339,9 @@ draft-ietf-quic-ack-frequency-14. Each connection advertises
   RTT for fewer, and resends only the latest one when lost. The PTO
   keeps the larger `max_ack_delay` until the peer acknowledges a
   smaller one (Section 7).
+- To a peer that advertised `min_ack_delay`, IMMEDIATE_ACK also rides
+  on 1-RTT PTO probes (Section 7), on PMTU probes (Section 8.3), and
+  goes out alone after a client moves to a new path (Section 8.4).
 
 ### Packet Pacing
 
