@@ -26,13 +26,16 @@ All notable changes to this project will be documented in this file.
 - BBR now follows draft-ietf-ccwg-bbr-07 (BBRv3). It measures
   bandwidth per packet, ends Startup on heavy loss as well as on a
   bandwidth plateau, lowers its rate and data in flight by at most 30%
-  per round trip with loss or ECN congestion marks, and probes for more
-  bandwidth every 2 to 3 seconds, sooner on paths with a small
-  bandwidth-delay product. Startup no longer ends on an RTT increase
-  (HyStart++), which the draft does not use.
+  per round trip with loss, and probes for more bandwidth every 2 to 3
+  seconds, sooner on paths with a small bandwidth-delay product.
+  Startup no longer ends on an RTT increase (HyStart++), which the
+  draft does not use. On an ECN congestion mark BBR enters recovery,
+  with its window bounded by its model; the draft defines no further
+  response to ECN.
 - With BBR, persistent congestion drops the congestion window to the
   minimum and keeps the bandwidth and RTT estimates, instead of starting
-  over from Startup.
+  over from Startup. The window from before comes back when the
+  recovery ends.
 - BBR sends bursts of at most 1 ms at its pacing rate, between 2
   packets and 64 KB (draft-ietf-ccwg-bbr-07 Section 5.6.3), instead of
   2 ms with a floor of 12 packets.
@@ -60,6 +63,19 @@ All notable changes to this project will be documented in this file.
   It now starts from any state once the minimum RTT is 10 seconds old
   and returns to Startup if the path was never filled
   (draft-ietf-ccwg-bbr-07 Section 5.3.4).
+- An ACK that both acknowledged packets and revealed a loss grew the
+  congestion window with those packets before cutting it, for every
+  congestion controller. The loss now counts first, so packets sent
+  before the recovery it starts no longer grow the window
+  (RFC 9002 Appendix A.7).
+- ECN-CE counts were compared with one count shared by all packet
+  number spaces, so an increase in one space after a higher count in
+  another was missed. Each space now keeps its own count, and an
+  increase is a congestion event for the largest acknowledged packet;
+  a recovery already under way absorbs it (RFC 9002 Section 7.1 and
+  Appendix B.7). This changes NewReno and CUBIC when the peer reports
+  ECN. A window cut by a CE mark is no longer undone when losses from
+  the same episode later prove spurious.
 
 ## [2.7.0] - 2026-11-13
 

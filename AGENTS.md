@@ -197,9 +197,11 @@ citations and the table, with no CHANGELOG entry.
 
 ### Pending updates
 
-None known, checked 2026-11-12 (BBR on 2026-11-13). A newer version
-found later goes in a table here, with what is known to differ, and
-needs the diff in step 2 before any code changes.
+None known, checked 2026-11-12 (BBR on 2026-11-13). Next: the QUIC
+ACK frequency extension (draft-ietf-quic-ack-frequency), which
+draft-ietf-ccwg-bbr-07 Section 4.1.3.3 asks BBR to use. A newer
+version found later goes in a table here, with what is known to
+differ, and needs the diff in step 2 before any code changes.
 
 ## Skills
 
