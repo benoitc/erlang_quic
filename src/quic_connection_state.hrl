@@ -16,6 +16,8 @@
 -define(MAX_PENDING_HS_BYTES, 1048576).
 %% 1-RTT datagrams held for an unvalidated address (RFC 9000 Section 8.1).
 -define(MAX_HELD_DATAGRAMS, 64).
+%% Control frames the congestion window may hold back, as quic-go bounds them.
+-define(MAX_CTRL_QUEUE, 16384).
 
 %% ACK packet tolerance for 1-RTT (RFC 9002 §6.2).
 %% The receiver SHOULD send an ACK frame in response to at least every
@@ -535,9 +537,9 @@
     pending_send_reset_at = #{} :: #{non_neg_integer() => non_neg_integer()},
     %% FIN acked but earlier bytes still queued or in flight
     pending_fin_reclaim = #{} :: #{non_neg_integer() => non_neg_integer()},
-    %% Lost control-frame retransmissions deferred by congestion control, replayed
-    %% through the CC-checked retransmit path when cwnd reopens.
-    deferred_ctrl_retransmits = [] :: [term()],
+    %% Control frames the congestion window held back, fresh or lost, in
+    %% send order with their count; sent before stream data when it reopens.
+    ctrl_queue = {0, queue:new()} :: {non_neg_integer(), queue:queue(term())},
     %% Remote: peer's advertised max size (0 = not supported)
     max_datagram_frame_size_remote = 0 :: non_neg_integer(),
     datagram_recv_queue = queue:new() :: queue:queue(binary()),

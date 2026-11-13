@@ -23,8 +23,8 @@ queued_data_is_not_app_limited_test() ->
     S = (state(bbr))#state{send_queue_count = 1},
     ?assertEqual(S, quic_connection:note_app_limited(S)).
 
-deferred_retransmit_is_not_app_limited_test() ->
-    S = (state(bbr))#state{deferred_ctrl_retransmits = [ping]},
+held_control_frame_is_not_app_limited_test() ->
+    S = (state(bbr))#state{ctrl_queue = {1, queue:from_list([ping])}},
     ?assertEqual(S, quic_connection:note_app_limited(S)).
 
 other_controllers_are_untouched_test() ->

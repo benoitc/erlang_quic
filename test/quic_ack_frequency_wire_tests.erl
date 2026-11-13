@@ -78,10 +78,12 @@ refill() ->
 
 %% quic_cc's wrapper around a BBR state.
 wrap(BBR) ->
-    {cc_wrapper, quic_cc_bbr, BBR}.
+    {cc_wrapper, quic_cc_bbr, BBR, false}.
 
-%% A connected client using BBR whose packets reach Sock.
-connection(BBR, PeerTP) ->
+%% A connected client using BBR whose packets reach Sock, nothing in
+%% flight so the window does not hold its packets back.
+connection(BBR0, PeerTP) ->
+    BBR = quic_cc_bbr:on_packets_discarded(BBR0, quic_cc_bbr:bytes_in_flight(BBR0)),
     {ok, Sock} = gen_udp:open(0, [binary, {ip, {127, 0, 0, 1}}, {active, false}]),
     {ok, Port} = inet:port(Sock),
     S = quic_connection_test_support:state_sending(

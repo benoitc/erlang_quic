@@ -3,7 +3,7 @@
 %%% Tests for QUIC Congestion Control Invariants and Protocol Compliance
 %%%
 %%% These tests verify that critical protocol invariants are maintained:
-%%% - bytes_in_flight never exceeds cwnd (except control_allowance)
+%%% - bytes_in_flight never exceeds cwnd
 %%% - Time-based loss detection requires PN < LargestAcked per RFC 9002
 %%% - PTO backoff is not reset by probe retransmissions
 %%%
@@ -69,11 +69,9 @@ bytes_in_flight_send_ack_loss_cycle_test() ->
     S4 = quic_cc:on_packets_lost(S3, 10000),
     ?assertEqual(0, quic_cc:bytes_in_flight(S4)).
 
-%% Test that control packets respect control_allowance
-control_allowance_respected_test() ->
+%% A full window refuses even a small packet (RFC 9002 Section 7).
+full_window_refuses_small_packet_test() ->
     State = quic_cc:new(#{initial_window => 14720}),
-
-    %% Fill cwnd
     S1 = lists:foldl(
         fun(_, Acc) ->
             case quic_cc:can_send(Acc, 1200) of
@@ -84,20 +82,10 @@ control_allowance_respected_test() ->
         State,
         lists:seq(1, 20)
     ),
-
-    Cwnd = quic_cc:cwnd(S1),
-    InFlight = quic_cc:bytes_in_flight(S1),
-
-    %% Regular send should be blocked
-    ?assertNot(quic_cc:can_send(S1, 1200)),
-
-    %% Control send with allowance should be allowed
-    %% (up to control_allowance = 1200 bytes over cwnd)
-    ?assert(quic_cc:can_send_control(S1, 100)),
-
-    %% But only up to the allowance
-    OverAllowance = Cwnd - InFlight + 1201,
-    ?assertNot(quic_cc:can_send_control(S1, OverAllowance)).
+    Room = quic_cc:cwnd(S1) - quic_cc:bytes_in_flight(S1),
+    ?assert(quic_cc:can_send(S1, Room)),
+    ?assertNot(quic_cc:can_send(S1, Room + 1)),
+    ?assertMatch({blocked_cwnd, _}, quic_cc:send_check(S1, Room + 1)).
 
 %% Stress test: rapid sends and acks should maintain invariant
 stress_rapid_send_ack_test() ->
@@ -131,7 +119,7 @@ stress_rapid_send_ack_test() ->
             %% Verify invariant at each step
             InFlight = quic_cc:bytes_in_flight(S3),
             Cwnd = quic_cc:cwnd(S3),
-            %% Allow control_allowance (1200) overhead
+            %% A loss cut can leave one packet above the new window.
             ?assert(InFlight =< Cwnd + 1200),
             {S3, I}
         end,

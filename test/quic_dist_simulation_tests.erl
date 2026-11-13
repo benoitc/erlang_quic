@@ -500,40 +500,23 @@ pacing_prevents_burst_loss_test() ->
     ?assert(Delay >= 0).
 
 %%====================================================================
-%% Control Message Allowance - Tick Blocking Fix
+%% Tick under a full window
 %%====================================================================
 
-tick_blocked_when_cwnd_full_test() ->
-    %% This test verifies the fix for the net_tick_timeout bug.
-    %% When bytes_in_flight equals cwnd, regular can_send blocks all sends,
-    %% but can_send_control allows small control messages through using
-    %% the control_allowance (default 1200 bytes).
-
+%% RFC 9002 Section 7: a tick waits for the window like any other
+%% packet, and goes out once an acknowledgement frees room.
+tick_waits_for_cwnd_test() ->
     CCState = quic_cc:new(#{
         initial_window => 65536,
         minimum_window => 2400
     }),
-
-    %% Fill the congestion window completely
-    %% (simulating large data in flight)
     FullCwnd = quic_cc:cwnd(CCState),
     CC1 = quic_cc:on_packet_sent(CCState, FullCwnd),
-
-    %% Now bytes_in_flight = cwnd
-    ?assertEqual(FullCwnd, quic_cc:bytes_in_flight(CC1)),
-    ?assertEqual(FullCwnd, quic_cc:cwnd(CC1)),
-
-    %% 4-byte tick + packet overhead
     TickSize = 4 + 20,
-
-    %% Regular can_send blocks the tick (expected - cwnd is full)
-    CanSendRegular = quic_cc:can_send(CC1, TickSize),
-    ?assertNot(CanSendRegular),
-
-    %% FIX: can_send_control allows control messages through
-    %% because they can exceed cwnd by up to control_allowance (1200 bytes)
-    CanSendControl = quic_cc:can_send_control(CC1, TickSize),
-    ?assert(CanSendControl).
+    ?assertNot(quic_cc:can_send(CC1, TickSize)),
+    ?assertMatch({blocked_cwnd, 0}, quic_cc:send_check(CC1, TickSize)),
+    CC2 = quic_cc:on_packets_acked(CC1, 1200),
+    ?assert(quic_cc:can_send(CC2, TickSize)).
 
 tick_blocked_after_loss_burst_test() ->
     %% Simulate realistic scenario:
@@ -585,9 +568,10 @@ tick_blocked_after_loss_burst_test() ->
     %% BUG CHECK: bytes_in_flight > cwnd means nothing can be sent
     case FinalBytesInFlight >= FinalCwnd of
         true ->
-            %% This is the problematic state - regular can_send fails
-            CanSendTick = quic_cc:can_send(CC2, 100),
-            ?assertNot(CanSendTick);
+            %% One packet may go out on entering recovery (RFC 9002
+            %% Section 7.3.2); the next waits for the window.
+            ?assert(quic_cc:can_send(CC2, 100)),
+            ?assertNot(quic_cc:can_send(quic_cc:on_packet_sent(CC2, 100), 100));
         false ->
             %% Still have room
             ok

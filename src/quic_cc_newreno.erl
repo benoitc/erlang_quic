@@ -52,15 +52,14 @@
     ssthresh/1,
     bytes_in_flight/1,
     can_send/2,
-    can_send_control/2,
     available_cwnd/1,
     in_slow_start/1,
     in_recovery/1,
     pacing_allows/2,
     get_pacing_tokens/2,
     pacing_delay/2,
-    send_check/3,
-    send_check_run/4,
+    send_check/2,
+    send_check_run/3,
     on_packets_sent/2,
     max_datagram_size/1,
     min_recovery_duration/1
@@ -122,10 +121,6 @@
     %% Minimum time to stay in recovery (ms)
     %% Prevents rapid re-entry on low-latency networks
     min_recovery_duration = 100 :: non_neg_integer(),
-
-    %% Control message allowance (bytes) - allows critical small messages
-    %% to exceed cwnd by this amount to prevent blocking ticks
-    control_allowance = 1200 :: non_neg_integer(),
 
     %% Pacing state (RFC 9002 Section 7.7)
     %% Pacing prevents bursts by spacing out packet sends
@@ -779,16 +774,6 @@ bytes_in_flight(#cc_state{bytes_in_flight = B}) -> B.
 can_send(#cc_state{cwnd = Cwnd, bytes_in_flight = InFlight}, Size) ->
     InFlight + Size =< Cwnd.
 
-%% @doc Check if a control message can be sent.
-%% Control messages (ticks, ACKs) can exceed cwnd by control_allowance
-%% to prevent net_tick_timeout in distribution.
-%% RFC 9002 recommends allowing at least one packet for progress.
--spec can_send_control(cc_state(), non_neg_integer()) -> boolean().
-can_send_control(
-    #cc_state{cwnd = Cwnd, bytes_in_flight = InFlight, control_allowance = Allowance}, Size
-) ->
-    InFlight + Size =< Cwnd + Allowance.
-
 %% @doc Get the available congestion window (cwnd - bytes_in_flight).
 -spec available_cwnd(cc_state()) -> non_neg_integer().
 available_cwnd(#cc_state{cwnd = Cwnd, bytes_in_flight = InFlight}) ->
@@ -1021,9 +1006,9 @@ pacing_delay(
 
 %% @doc Fused cwnd + pacing check for the hot send path.
 %% One monotonic_time call, one record match. Replaces
-%% can_send/can_send_control + pacing_allows + pacing_delay +
+%% can_send + pacing_allows + pacing_delay +
 %% get_pacing_tokens on every packet.
--spec send_check(cc_state(), non_neg_integer(), non_neg_integer()) ->
+-spec send_check(cc_state(), non_neg_integer()) ->
     {ok, cc_state()}
     | {blocked_cwnd, non_neg_integer()}
     | {blocked_pacing, non_neg_integer()}.
@@ -1031,18 +1016,11 @@ send_check(
     #cc_state{
         cwnd = Cwnd,
         bytes_in_flight = InFlight,
-        control_allowance = Allowance,
         pacing_rate = Rate
     } = State,
-    Size,
-    Urgency
+    Size
 ) ->
-    CwndLimit =
-        case Urgency of
-            0 -> Cwnd + Allowance;
-            _ -> Cwnd
-        end,
-    case InFlight + Size =< CwndLimit of
+    case InFlight + Size =< Cwnd of
         false ->
             {blocked_cwnd, max(0, Cwnd - InFlight)};
         true when Rate =:= 0 ->
@@ -1074,25 +1052,18 @@ send_check(
 %% calls would, minus the sub-millisecond token refill between
 %% iterations, so the batch is never more permissive. Returns how many
 %% packets were approved and the updated state.
--spec send_check_run(cc_state(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
+-spec send_check_run(cc_state(), non_neg_integer(), non_neg_integer()) ->
     {non_neg_integer(), cc_state()}.
 send_check_run(
     #cc_state{
         cwnd = Cwnd,
         bytes_in_flight = InFlight,
-        control_allowance = Allowance,
         pacing_rate = Rate
     } = State,
     Size,
-    MaxK,
-    Urgency
+    MaxK
 ) ->
-    CwndLimit =
-        case Urgency of
-            0 -> Cwnd + Allowance;
-            _ -> Cwnd
-        end,
-    Room = CwndLimit - InFlight,
+    Room = Cwnd - InFlight,
     KC =
         case Room >= Size of
             true -> min(MaxK, Room div Size);

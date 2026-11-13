@@ -51,14 +51,13 @@
     ssthresh/1,
     bytes_in_flight/1,
     can_send/2,
-    can_send_control/2,
     available_cwnd/1,
     in_slow_start/1,
     in_recovery/1,
     pacing_allows/2,
     get_pacing_tokens/2,
     pacing_delay/2,
-    send_check/3,
+    send_check/2,
     max_datagram_size/1,
     min_recovery_duration/1
 ]).
@@ -171,7 +170,6 @@
     minimum_window :: non_neg_integer(),
     max_datagram_size :: pos_integer(),
     min_recovery_duration = 100 :: non_neg_integer(),
-    control_allowance = 1200 :: non_neg_integer(),
 
     %% Pacing state
     pacing_rate = 0 :: non_neg_integer(),
@@ -886,7 +884,7 @@ pacing_delay(
     end.
 
 %% @doc Fused cwnd + pacing check for the hot send path.
--spec send_check(cc_state(), non_neg_integer(), non_neg_integer()) ->
+-spec send_check(cc_state(), non_neg_integer()) ->
     {ok, cc_state()}
     | {blocked_cwnd, non_neg_integer()}
     | {blocked_pacing, non_neg_integer()}.
@@ -894,18 +892,11 @@ send_check(
     #cubic_state{
         cwnd = Cwnd,
         bytes_in_flight = InFlight,
-        control_allowance = Allowance,
         pacing_rate = Rate
     } = State,
-    Size,
-    Urgency
+    Size
 ) ->
-    CwndLimit =
-        case Urgency of
-            0 -> Cwnd + Allowance;
-            _ -> Cwnd
-        end,
-    case InFlight + Size =< CwndLimit of
+    case InFlight + Size =< Cwnd of
         false ->
             {blocked_cwnd, max(0, Cwnd - InFlight)};
         true when Rate =:= 0 ->
@@ -1010,13 +1001,6 @@ bytes_in_flight(#cubic_state{bytes_in_flight = B}) -> B.
 -spec can_send(cc_state(), non_neg_integer()) -> boolean().
 can_send(#cubic_state{cwnd = Cwnd, bytes_in_flight = InFlight}, Size) ->
     InFlight + Size =< Cwnd.
-
-%% @doc Check if a control message can be sent.
--spec can_send_control(cc_state(), non_neg_integer()) -> boolean().
-can_send_control(
-    #cubic_state{cwnd = Cwnd, bytes_in_flight = InFlight, control_allowance = Allowance}, Size
-) ->
-    InFlight + Size =< Cwnd + Allowance.
 
 %% @doc Get the available congestion window.
 -spec available_cwnd(cc_state()) -> non_neg_integer().

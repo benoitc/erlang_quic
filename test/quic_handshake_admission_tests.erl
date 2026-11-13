@@ -274,7 +274,7 @@ payload() -> <<"handshake-crypto-payload">>.
 frames() -> [{crypto, 0, <<"handshake-crypto-payload">>}].
 
 %% A connection whose congestion window is entirely spoken for, so
-%% admission refuses anything above the control allowance. The peer
+%% admission refuses any packet in flight. The peer
 %% address is validated, which takes the amplification budget out of it:
 %% these cases are about the window.
 blocked_state() ->
@@ -317,7 +317,7 @@ paced_out_state() ->
 spend_pacing_tokens(CC, 0) ->
     CC;
 spend_pacing_tokens(CC, Budget) ->
-    case quic_cc:send_check(CC, 2000, 0) of
+    case quic_cc:send_check(CC, 2000) of
         {ok, Next} -> spend_pacing_tokens(Next, Budget - 1);
         _Blocked -> CC
     end.

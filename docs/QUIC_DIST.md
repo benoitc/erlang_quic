@@ -189,8 +189,13 @@ QUIC distribution uses multiple streams for different purposes:
 
 The control stream (stream 0) has the highest priority (urgency 0), ensuring that:
 - Handshake messages are delivered promptly
-- Tick frames for liveness detection bypass congestion
+- Tick frames go out ahead of queued distribution data
 - Critical signals are not blocked by bulk data transfers
+
+Urgency orders streams; it does not let them past the congestion window.
+Ticks wait for the window like any other packet (RFC 9002 Section 7), and
+liveness counts every QUIC packet received, so a full window does not
+cause a false `net_tick_timeout`.
 
 ### User Streams API
 
@@ -426,9 +431,10 @@ net_kernel                quic_dist_controller              quic_connection
 - Any received QUIC packet proves the peer is alive
 
 The controller also sends QUIC PING frames on tick, which:
-- Bypass congestion control (transport-level frames)
 - Elicit ACK responses from the peer
 - Ensure transport activity even when streams are blocked
+- Wait for the congestion window like any packet; when it stays full,
+  the next PTO probe carries them
 
 ### Backpressure
 

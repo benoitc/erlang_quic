@@ -130,7 +130,7 @@
     %% 0-RTT accessors (RFC 9001 §4.6)
     has_early_keys/1,
     early_data_accepted/1,
-    %% Transport-level PING (bypasses congestion control)
+    %% Transport-level PING
     send_ping/1,
     %% PMTU Discovery (RFC 8899)
     get_mtu/1,
@@ -845,12 +845,13 @@ early_data_accepted(Conn) when is_pid(Conn) ->
 
 %% @doc Send a PING frame on the connection.
 %%
-%% PING frames are transport-level frames that bypass congestion control.
-%% They elicit an ACK from the peer and can be used for liveness checking.
-%% This is useful for distribution tick messages that must get through
-%% even when the connection is congested.
+%% A PING elicits an ACK from the peer and can be used for liveness
+%% checking. Like every packet in flight it waits for the congestion
+%% window (RFC 9002 Section 7): when the window is full it is queued and
+%% goes out once an ACK opens room, or with the next PTO probe.
 %%
-%% Returns `ok' if the PING was sent, or `{error, Reason}' if it failed.
+%% Returns `ok' once the PING is sent or queued, or `{error, Reason}' if
+%% it failed.
 -spec send_ping(Conn) -> ok | {error, term()} when
     Conn :: pid().
 send_ping(Conn) when is_pid(Conn) ->

@@ -1,6 +1,6 @@
 %% The batched send-side primitives the chunk-run sender uses must
-%% agree with their per-packet counterparts: send_check_run/4 with
-%% sequential send_check/3 calls that account each packet as sent,
+%% agree with their per-packet counterparts: send_check_run/3 with
+%% sequential send_check/2 calls that account each packet as sent,
 %% on_packets_sent/2 with a fold of on_packet_sent/2, and
 %% on_packets_sent_run/3 with a fold of on_packet_sent/6.
 -module(quic_send_run_bookkeeping_tests).
@@ -14,14 +14,12 @@ newreno(Cwnd) ->
 
 %% The honest per-packet reference: check, then account the packet as
 %% sent before the next check, as the one-at-a-time send path does.
-sequential_checks(_State, _Size, 0, _Urgency, K) ->
+sequential_checks(_State, _Size, 0, K) ->
     K;
-sequential_checks(State, Size, Left, Urgency, K) ->
-    case quic_cc_newreno:send_check(State, Size, Urgency) of
+sequential_checks(State, Size, Left, K) ->
+    case quic_cc_newreno:send_check(State, Size) of
         {ok, S1} ->
-            sequential_checks(
-                quic_cc_newreno:on_packet_sent(S1, Size), Size, Left - 1, Urgency, K + 1
-            );
+            sequential_checks(quic_cc_newreno:on_packet_sent(S1, Size), Size, Left - 1, K + 1);
         _ ->
             K
     end.
@@ -30,18 +28,15 @@ sequential_checks(State, Size, Left, Urgency, K) ->
 %% state untouched.
 unpaced_run_matches_cwnd_test() ->
     S = newreno(10 * ?MDS),
-    ?assertEqual({10, S}, quic_cc_newreno:send_check_run(S, ?MDS, 64, 1)),
-    ?assertEqual(10, sequential_checks(S, ?MDS, 64, 1, 0)),
-    ?assertEqual({4, S}, quic_cc_newreno:send_check_run(S, ?MDS, 4, 1)),
-    %% Control urgency gets the allowance on top of cwnd.
-    {KCtl, _} = quic_cc_newreno:send_check_run(S, ?MDS, 64, 0),
-    ?assertEqual(sequential_checks(S, ?MDS, 64, 0, 0), KCtl).
+    ?assertEqual({10, S}, quic_cc_newreno:send_check_run(S, ?MDS, 64)),
+    ?assertEqual(10, sequential_checks(S, ?MDS, 64, 0)),
+    ?assertEqual({4, S}, quic_cc_newreno:send_check_run(S, ?MDS, 4)).
 
 nothing_fits_test() ->
     S0 = newreno(3 * ?MDS),
     S = quic_cc_newreno:on_packet_sent(S0, 3 * ?MDS),
-    ?assertEqual({0, S}, quic_cc_newreno:send_check_run(S, ?MDS, 8, 1)),
-    ?assertEqual(0, sequential_checks(S, ?MDS, 8, 1, 0)).
+    ?assertEqual({0, S}, quic_cc_newreno:send_check_run(S, ?MDS, 8)),
+    ?assertEqual(0, sequential_checks(S, ?MDS, 8, 0)).
 
 %% Paced with a saturated bucket: the batch approves what the bucket
 %% holds, never more than the sequential path would.
@@ -49,8 +44,8 @@ paced_run_is_bounded_by_the_bucket_test() ->
     S0 = quic_cc_newreno:update_pacing_rate(newreno(400 * ?MDS), 50),
     %% Let the bucket fill to its burst ceiling.
     timer:sleep(50),
-    {KRun, _} = quic_cc_newreno:send_check_run(S0, ?MDS, 400, 1),
-    KSeq = sequential_checks(S0, ?MDS, 400, 1, 0),
+    {KRun, _} = quic_cc_newreno:send_check_run(S0, ?MDS, 400),
+    KSeq = sequential_checks(S0, ?MDS, 400, 0),
     ?assert(KRun > 0),
     ?assert(KRun =< KSeq),
     %% The sequential loop refills between iterations, so it can approve

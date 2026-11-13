@@ -543,7 +543,9 @@ state_get(#state{} = S, initial_next_pn) -> ((S#state.hs)#hs.pn_initial)#pn_spac
 state_get(#state{} = S, handshake_next_pn) -> ((S#state.hs)#hs.pn_handshake)#pn_space.next_pn;
 state_get(#state{} = S, packets_sent) -> quic_connection:count(?C_PACKETS_SENT, S);
 state_get(#state{} = S, amp_tx) -> (S#state.hs)#hs.amp_tx;
-state_get(#state{} = S, pacing_timer) -> S#state.pacing_timer.
+state_get(#state{} = S, pacing_timer) -> S#state.pacing_timer;
+state_get(#state{} = S, cc_state) -> S#state.cc_state;
+state_get(#state{} = S, send_queue_version) -> S#state.send_queue_version.
 
 state_set(#state{} = S, loss_state, V) ->
     S#state{loss_state = V};
@@ -721,15 +723,18 @@ coalesce_small_stream(DataSize, StreamWindow, ConnWindow) ->
         send_queue_version = 1,
         streams = #{0 => #stream_state{id = 0, send_max_data = StreamWindow}},
         max_data_remote = ConnWindow,
-        data_sent = 0
+        data_sent = 0,
+        cc_state = quic_cc:new()
     },
-    case quic_connection:dequeue_small_stream_frame_tuple(State0) of
-        {ok, _FrameTuple, #state{
-            send_queue_bytes = NewBytes,
-            send_queue_count = NewCount,
-            send_queue_version = NewVersion,
-            data_sent = Sent
-        }} ->
+    case quic_connection:dequeue_small_stream_frame_tuple(0, State0) of
+        {ok, _FrameTuple,
+            #state{
+                send_queue_bytes = NewBytes,
+                send_queue_count = NewCount,
+                send_queue_version = NewVersion,
+                data_sent = Sent
+            },
+            _CCState} ->
             #{
                 dequeued => true,
                 send_queue_bytes => NewBytes,
@@ -737,7 +742,7 @@ coalesce_small_stream(DataSize, StreamWindow, ConnWindow) ->
                 send_queue_version => NewVersion,
                 data_sent => Sent
             };
-        none ->
+        {none, _} ->
             #{
                 dequeued => false,
                 send_queue_bytes => DataSize,
@@ -837,7 +842,7 @@ requeued_offsets(Where) ->
         }
     },
     S1 = quic_connection:queue_stream_data(0, 1000, <<0:8000>>, false, S0, back),
-    Ctx = {chunked_ctx, 1200, 3, 1200, <<>>, <<>>, Where},
+    Ctx = {chunked_ctx, 1200, 1200, <<>>, <<>>, Where},
     {S2, 0} = quic_connection:send_stream_chunked_step(0, 0, <<0:8000>>, false, S1, 0, Ctx),
     %% The step arms a zero-delay continuation by messaging this process.
     receive

@@ -247,9 +247,9 @@ pto_probe_carries_immediate_ack_test() ->
     ?assertEqual([[ping]], probe_frames(sender(#{}))).
 
 pto_probe_retransmission_carries_immediate_ack_test() ->
-    S0 = quic_connection:send_frame({max_data, 100000}, sender(#{min_ack_delay => 1000})),
+    S0 = quic_connection:send_frame({retire_connection_id, 0}, sender(#{min_ack_delay => 1000})),
     [_, Probe] = probe_frames(S0),
-    ?assertEqual([{max_data, 100000}, immediate_ack], Probe).
+    ?assertEqual([{retire_connection_id, 0}, immediate_ack], Probe).
 
 pmtu_probe_carries_immediate_ack_test() ->
     %% Section 8.3: "A sender MAY bundle an IMMEDIATE_ACK frame with any PMTU probes".
