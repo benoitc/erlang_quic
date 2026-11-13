@@ -71,15 +71,14 @@
     ssthresh/1,
     bytes_in_flight/1,
     can_send/2,
-    can_send_control/2,
     available_cwnd/1,
     in_slow_start/1,
     in_recovery/1,
     pacing_allows/2,
     get_pacing_tokens/2,
     pacing_delay/2,
-    send_check/3,
-    send_check_run/4,
+    send_check/2,
+    send_check_run/3,
     on_packets_sent/2,
     max_datagram_size/1,
     min_recovery_duration/1
@@ -121,16 +120,11 @@
 -callback pacing_delay(State :: term(), Size :: non_neg_integer()) -> non_neg_integer().
 
 %% Fused send check (cwnd + pacing) used by the hot send path.
-%% Urgency 0 uses the control-allowance variant of the cwnd check.
 %% Returns one of:
 %%   {ok, NewState}          — cwnd + pacing both allow; tokens consumed
 %%   {blocked_cwnd, Avail}   — cwnd would overflow; Avail = max(0, cwnd - inflight)
 %%   {blocked_pacing, Delay} — pacing blocks for Delay ms
--callback send_check(
-    State :: term(),
-    Size :: non_neg_integer(),
-    Urgency :: non_neg_integer()
-) ->
+-callback send_check(State :: term(), Size :: non_neg_integer()) ->
     {ok, State :: term()}
     | {blocked_cwnd, non_neg_integer()}
     | {blocked_pacing, non_neg_integer()}.
@@ -146,7 +140,6 @@
 -callback ssthresh(State :: term()) -> non_neg_integer() | infinity.
 -callback bytes_in_flight(State :: term()) -> non_neg_integer().
 -callback can_send(State :: term(), Size :: non_neg_integer()) -> boolean().
--callback can_send_control(State :: term(), Size :: non_neg_integer()) -> boolean().
 -callback available_cwnd(State :: term()) -> non_neg_integer().
 -callback in_slow_start(State :: term()) -> boolean().
 -callback in_recovery(State :: term()) -> boolean().
@@ -360,11 +353,6 @@ bytes_in_flight(#cc_wrapper{algorithm = Mod, state = State}) ->
 can_send(#cc_wrapper{algorithm = Mod, state = State}, Size) ->
     Mod:can_send(State, Size).
 
-%% @doc Check if a control message can be sent.
--spec can_send_control(cc_state(), non_neg_integer()) -> boolean().
-can_send_control(#cc_wrapper{algorithm = Mod, state = State}, Size) ->
-    Mod:can_send_control(State, Size).
-
 %% @doc Get the available congestion window.
 -spec available_cwnd(cc_state()) -> non_neg_integer().
 available_cwnd(#cc_wrapper{algorithm = Mod, state = State}) ->
@@ -398,34 +386,32 @@ pacing_delay(#cc_wrapper{algorithm = Mod, state = State}, Size) ->
 
 %% @doc Fused send check (cwnd + pacing) for the hot send path.
 %% See the behavior callback for the return shape.
--spec send_check(cc_state(), non_neg_integer(), non_neg_integer()) ->
+-spec send_check(cc_state(), non_neg_integer()) ->
     {ok, cc_state()}
     | {blocked_cwnd, non_neg_integer()}
     | {blocked_pacing, non_neg_integer()}.
-send_check(#cc_wrapper{algorithm = Mod, state = State} = W, Size, Urgency) ->
-    case Mod:send_check(State, Size, Urgency) of
+send_check(#cc_wrapper{algorithm = Mod, state = State} = W, Size) ->
+    case Mod:send_check(State, Size) of
         {ok, NewState} -> {ok, W#cc_wrapper{state = NewState}};
         Other -> Other
     end.
 
 %% @doc Batched send_check: approve up to MaxK packets of Size in one
-%% pass. Native for newreno; other algorithms fold send_check/3 with
+%% pass. Native for newreno; other algorithms fold send_check/2 with
 %% identical results.
--spec send_check_run(cc_state(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
+-spec send_check_run(cc_state(), non_neg_integer(), non_neg_integer()) ->
     {non_neg_integer(), cc_state()}.
-send_check_run(
-    #cc_wrapper{algorithm = quic_cc_newreno, state = State} = W, Size, MaxK, Urgency
-) ->
-    {K, NewState} = quic_cc_newreno:send_check_run(State, Size, MaxK, Urgency),
+send_check_run(#cc_wrapper{algorithm = quic_cc_newreno, state = State} = W, Size, MaxK) ->
+    {K, NewState} = quic_cc_newreno:send_check_run(State, Size, MaxK),
     {K, W#cc_wrapper{state = NewState}};
-send_check_run(W, Size, MaxK, Urgency) ->
-    send_check_run_iter(W, Size, MaxK, Urgency, 0).
+send_check_run(W, Size, MaxK) ->
+    send_check_run_iter(W, Size, MaxK, 0).
 
-send_check_run_iter(W, _Size, MaxK, _Urgency, K) when K >= MaxK ->
+send_check_run_iter(W, _Size, MaxK, K) when K >= MaxK ->
     {K, W};
-send_check_run_iter(W, Size, MaxK, Urgency, K) ->
-    case send_check(W, Size, Urgency) of
-        {ok, W1} -> send_check_run_iter(W1, Size, MaxK, Urgency, K + 1);
+send_check_run_iter(W, Size, MaxK, K) ->
+    case send_check(W, Size) of
+        {ok, W1} -> send_check_run_iter(W1, Size, MaxK, K + 1);
         _ -> {K, W}
     end.
 

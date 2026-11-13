@@ -45,13 +45,3 @@ loss_retransmission_is_refused_above_cwnd_test() ->
 loss_retransmission_passes_an_open_window_test() ->
     CC = quic_cc:new(),
     ?assert(quic_connection:retransmit_cc_allowed(normal, CC, ?PACKET)).
-
-%% The loss gate is the congestion window proper, not the more lenient
-%% control allowance: a state the control gate would wave through is
-%% still refused once cwnd is spent.
-loss_gate_is_cwnd_not_the_control_allowance_test() ->
-    CC = full_window(),
-    case quic_cc:can_send_control(CC, ?PACKET) of
-        true -> ?assertNot(quic_connection:retransmit_cc_allowed(normal, CC, ?PACKET));
-        false -> ok
-    end.

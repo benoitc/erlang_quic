@@ -217,6 +217,12 @@
 %% Max send queue size in bytes (16 MB default) - prevents memory exhaustion from queued data
 -define(MAX_SEND_QUEUE_BYTES, 16777216).
 
+%% Estimate packet overhead (header + AEAD tag + frame header).
+-define(PACKET_OVERHEAD, 50).
+-define(RETRANSMIT_OVERHEAD, 50).
+%% Type, stream ID, offset and length, each at its largest.
+-define(MAX_STREAM_FRAME_HEADER, 25).
+
 %% Bounds on the client Finished retransmission interval. The floor keeps
 %% a near-zero PTO from spinning; the ceiling keeps a long RTT estimate
 %% from parking the flight past the idle timeout.
@@ -3523,9 +3529,7 @@ admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{hs = #hs{hs_probe = tr
 admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{cc_state = undefined} = State) ->
     {ok, State};
 admit(Space, true, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
-    %% Urgency 0 buys the control allowance: a handshake flight is small
-    %% and stalling it behind a full window stalls the connection.
-    case quic_cc:send_check(CCState, Size, 0) of
+    case quic_cc:send_check(CCState, Size) of
         {ok, NewCC} ->
             {ok, State#state{cc_state = NewCC}};
         {blocked_cwnd, _Avail} ->
@@ -11524,11 +11528,6 @@ discard_zero_rtt_packets(#state{loss_state = LossState, cc_state = CCState} = St
         pto_dirty = true
     }.
 
-%% Estimate packet overhead (header + AEAD tag + frame header).
-%% Kept as a macro for the stream-chunking paths that sized themselves
-%% against it historically.
--define(PACKET_OVERHEAD, 50).
-
 %% RFC 9000 Section 17.4: the spin bit is disabled on at least one
 %% connection in 16, even where it is allowed.
 spin_bit_enabled(Opts) ->
@@ -11735,18 +11734,15 @@ send_stream_fragments(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where)
 send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Where) when
     is_binary(Data)
 ->
-    #state{cc_state = CCState, streams = Streams, cfg = #conn_cfg{pacing_enabled = PacingEnabled}} =
-        State,
+    #state{cc_state = CCState, cfg = #conn_cfg{pacing_enabled = PacingEnabled}} = State,
     DataSize = byte_size(Data),
     PacketSize = DataSize + ?PACKET_OVERHEAD,
-    %% Control streams (urgency 0) can exceed cwnd to prevent tick blocking
-    Urgency = get_stream_urgency(StreamId, Streams),
-    %% Fused cwnd + pacing check (Phase 1). With pacing disabled the
-    %% check degenerates to cwnd-only in one record match.
+    %% Fused cwnd + pacing check. With pacing disabled the check
+    %% degenerates to cwnd-only in one record match.
     Check =
         case PacingEnabled of
-            true -> quic_cc:send_check(CCState, PacketSize, Urgency);
-            false -> cwnd_only_check(CCState, PacketSize, Urgency)
+            true -> quic_cc:send_check(CCState, PacketSize);
+            false -> cwnd_only_check(CCState, PacketSize)
         end,
     case Check of
         {ok, NewCCState} ->
@@ -11784,24 +11780,24 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Wh
 
 %% Approve up to KMax-1 additional same-size sends against CC/pacing,
 %% consuming pacing tokens exactly as the one-at-a-time path would.
-approve_more_chunks(CC, _Size, _Urgency, _Pacing, KMax, K) when K >= KMax ->
+approve_more_chunks(CC, _Size, _Pacing, KMax, K) when K >= KMax ->
     {K, CC};
-approve_more_chunks(CC, Size, Urgency, true, KMax, K) ->
+approve_more_chunks(CC, Size, true, KMax, K) ->
     %% One batched CC/pacing check for the rest of the run instead of
     %% a send_check per chunk.
-    {KExtra, CC1} = quic_cc:send_check_run(CC, Size, KMax - K, Urgency),
+    {KExtra, CC1} = quic_cc:send_check_run(CC, Size, KMax - K),
     {K + KExtra, CC1};
-approve_more_chunks(CC, Size, Urgency, false, KMax, K) ->
+approve_more_chunks(CC, Size, false, KMax, K) ->
     %% Pacing off: count how many more chunks fit in the window,
     %% accounting each on a scratch copy so the checks see the chunks
     %% already approved. The real CC state is updated once for the run.
-    {cwnd_room_chunks(CC, Size, Urgency, KMax, K), CC}.
+    {cwnd_room_chunks(CC, Size, KMax, K), CC}.
 
-cwnd_room_chunks(_CC, _Size, _Urgency, KMax, K) when K >= KMax ->
+cwnd_room_chunks(_CC, _Size, KMax, K) when K >= KMax ->
     K;
-cwnd_room_chunks(CC, Size, Urgency, KMax, K) ->
-    case cwnd_only_check(CC, Size, Urgency) of
-        {ok, _} -> cwnd_room_chunks(quic_cc:on_packet_sent(CC, Size), Size, Urgency, KMax, K + 1);
+cwnd_room_chunks(CC, Size, KMax, K) ->
+    case cwnd_only_check(CC, Size) of
+        {ok, _} -> cwnd_room_chunks(quic_cc:on_packet_sent(CC, Size), Size, KMax, K + 1);
         _ -> K
     end.
 
@@ -11809,7 +11805,7 @@ cwnd_room_chunks(CC, Size, Urgency, KMax, K) ->
 %% wire packet to the socket, then update loss/CC/PN/counters and
 %% rebuild #state{} ONCE for the whole run instead of once per packet.
 send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, K) ->
-    {chunked_ctx, MaxChunkSize, _Urgency, _PacketSize, HeaderPrefix, LengthVarint, _Where} = Ctx,
+    {chunked_ctx, MaxChunkSize, _PacketSize, HeaderPrefix, LengthVarint, _Where} = Ctx,
     %% A packet still pending from send coalescing goes out first so
     %% the wire order matches the send order.
     State = flush_pending_packet(flush_long_datagram(State0)),
@@ -12007,27 +12003,21 @@ build_chunk_iodata(_HeaderPrefix, 0, _LengthVarint, _Chunk, Frame) ->
 
 %% Cwnd-only check used when pacing is disabled. Keeps the call sites
 %% uniform with {ok,_} / {blocked_cwnd,_} while avoiding any pacing work.
-cwnd_only_check(CCState, Size, Urgency) ->
-    CanSend =
-        case Urgency of
-            0 -> quic_cc:can_send_control(CCState, Size);
-            _ -> quic_cc:can_send(CCState, Size)
-        end,
-    case CanSend of
+cwnd_only_check(CCState, Size) ->
+    case quic_cc:can_send(CCState, Size) of
         true -> {ok, CCState};
         false -> {blocked_cwnd, quic_cc:available_cwnd(CCState)}
     end.
 
 %% @doc Send stream data that requires chunking.
 %%
-%% Per-drain constants (Urgency, MaxChunkSize, PacketSize) are cached
+%% Per-drain constants (MaxChunkSize, PacketSize) are cached
 %% here once and threaded through send_stream_chunked_loop/9 instead of
 %% being re-looked-up for every chunk via a tail-call back into
 %% send_stream_data_fragmented_tracked/6. For a 10 MB upload this cuts
 %% thousands of get_stream_urgency/2 / get_max_stream_data_per_packet/1
 %% calls and record-pattern matches out of the hot send loop.
 send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunkSize, Where) ->
-    Urgency = get_stream_urgency(StreamId, State#state.streams),
     PacketSize = MaxChunkSize + ?PACKET_OVERHEAD,
     %% Pre-compute the stream-frame header parts that stay constant
     %% across every mid-chunk packet in this drain. The type byte
@@ -12037,7 +12027,7 @@ send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunk
     LengthVarint = quic_varint:encode(MaxChunkSize),
     HeaderPrefix =
         <<(?FRAME_STREAM bor ?STREAM_FLAG_OFF bor ?STREAM_FLAG_LEN):8, StreamIdVarint/binary>>,
-    Ctx = {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint, Where},
+    Ctx = {chunked_ctx, MaxChunkSize, PacketSize, HeaderPrefix, LengthVarint, Where},
     send_stream_chunked_loop(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx).
 
 %% Inner chunked-send loop. Cached values in `Ctx' never change within a
@@ -12045,7 +12035,7 @@ send_stream_chunked(StreamId, Offset, Data, Fin, State, BytesSentSoFar, MaxChunk
 %% `send_stream_single_packet/6' so a partial last chunk gets a correctly
 %% sized packet (Length != MaxChunkSize) and can also carry a FIN.
 send_stream_chunked_loop(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
-    {chunked_ctx, MaxChunkSize, _Urgency, _PacketSize, _HeaderPrefix, _LengthVarint, Where} = Ctx,
+    {chunked_ctx, MaxChunkSize, _PacketSize, _HeaderPrefix, _LengthVarint, Where} = Ctx,
     DataSize = byte_size(Data),
     case DataSize =< MaxChunkSize of
         true ->
@@ -12059,7 +12049,7 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
     %% popped off the queue has to go back in front of the higher-offset
     %% entries it was ahead of, or the stream goes out on the wire
     %% interleaved for the rest of the transfer.
-    {chunked_ctx, _, _, _, _, _, Where} = Ctx,
+    {chunked_ctx, _, _, _, _, Where} = Ctx,
     case burst_exhausted(State) of
         true ->
             QueuedState = queue_stream_data(StreamId, Offset, Data, Fin, State, Where),
@@ -12071,12 +12061,12 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
     end.
 
 send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
-    {chunked_ctx, MaxChunkSize, Urgency, PacketSize, _HeaderPrefix, _LengthVarint, Where} = Ctx,
+    {chunked_ctx, MaxChunkSize, PacketSize, _HeaderPrefix, _LengthVarint, Where} = Ctx,
     #state{cc_state = CCState, cfg = #conn_cfg{pacing_enabled = PacingEnabled}} = State,
     Check =
         case PacingEnabled of
-            true -> quic_cc:send_check(CCState, PacketSize, Urgency);
-            false -> cwnd_only_check(CCState, PacketSize, Urgency)
+            true -> quic_cc:send_check(CCState, PacketSize);
+            false -> cwnd_only_check(CCState, PacketSize)
         end,
     case Check of
         {ok, NewCCState} ->
@@ -12089,7 +12079,7 @@ send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSen
             BudgetLeft = max(1, (State#state.cfg)#conn_cfg.burst_budget - State#state.burst_sent),
             KMax = min(FullChunks, BudgetLeft),
             {K, CCStateK} = approve_more_chunks(
-                NewCCState, PacketSize, Urgency, PacingEnabled, KMax, 1
+                NewCCState, PacketSize, PacingEnabled, KMax, 1
             ),
             State0 = State#state{cc_state = CCStateK},
             send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, K);
@@ -12249,10 +12239,11 @@ process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
                         false -> park_blocked_head(StreamId, Offset, State)
                     end
             end;
-        {value, {retransmit_stream, _StreamId, _Offset, _Data, _Fin, DataSize}} ->
-            %% Retransmits are exempt from flow control (bytes already counted),
-            %% but still gated by congestion control via the retransmit allowance.
-            case quic_cc:can_send_control(State#state.cc_state, DataSize + ?PACKET_OVERHEAD) of
+        {value, {retransmit_stream, StreamId, Offset, _Data, _Fin, DataSize}} ->
+            %% Exempt from flow control (already counted); the gate sizes the
+            %% packet as send_retransmit_packet/3 does.
+            Size = retransmit_stream_size(StreamId, Offset, DataSize),
+            case quic_cc:can_send(State#state.cc_state, Size) of
                 true ->
                     process_send_queue_entry(State);
                 false ->
@@ -12260,6 +12251,16 @@ process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
                     State
             end
     end.
+
+%% The packet send_retransmit_packet/3 builds for one STREAM frame.
+retransmit_stream_size(StreamId, Offset, DataSize) ->
+    OffsetLen =
+        case Offset of
+            0 -> 0;
+            _ -> quic_varint:encode_len(Offset)
+        end,
+    1 + quic_varint:encode_len(StreamId) + OffsetLen + quic_varint:encode_len(DataSize) +
+        DataSize + ?RETRANSMIT_OVERHEAD.
 
 %% A stream window holds back only its stream (RFC 9000 Section 4.1).
 park_blocked_head(StreamId, Offset, #state{streams = Streams} = State) ->
@@ -13437,10 +13438,6 @@ filter_reset_stream_at_data(Frames, #state{streams = Streams}) ->
         end,
         Frames
     ).
-
--define(RETRANSMIT_OVERHEAD, 50).
-%% Type, stream ID, offset and length, each at its largest.
--define(MAX_STREAM_FRAME_HEADER, 25).
 
 %% Send frames for retransmission with congestion control check
 send_retransmit_frames_cc([], State) ->

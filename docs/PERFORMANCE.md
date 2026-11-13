@@ -43,11 +43,11 @@ All of the work went into the hot path, on both the send and the
 receive side. In no particular order:
 
 * The per packet cwnd and pacing check is now fused into
-  `quic_cc:send_check/3`. One BIF call and one record match, where
+  `quic_cc:send_check/2`. One BIF call and one record match, where
   the old version needed four.
 * The chunked send loop used to recompute the same values on every
-  chunk. The stream urgency, the max stream data per packet, and
-  the stream frame header prefix now live in a per drain context.
+  chunk. The max stream data per packet and the stream frame header
+  prefix now live in a per drain context.
 * The qlog macros check the `?QLOG_ENABLED` flag at the call site,
   so when qlog is off nobody builds the event map.
 * The receive hot path takes a single `monotonic_time` sample and

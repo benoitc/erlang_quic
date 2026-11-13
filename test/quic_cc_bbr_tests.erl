@@ -101,20 +101,14 @@ bbr_available_cwnd_test() ->
     ?assertEqual(Cwnd - 5000, quic_cc_bbr:available_cwnd(S1)).
 
 %%====================================================================
-%% Control Message Allowance Tests
+%% Full window (RFC 9002 Section 7)
 %%====================================================================
 
-bbr_can_send_control_when_cwnd_full_test() ->
+bbr_full_window_refuses_small_send_test() ->
     State = quic_cc_bbr:new(#{initial_window => 65536}),
     S1 = quic_cc_bbr:on_packet_sent(State, 65536),
-    ?assertNot(quic_cc_bbr:can_send(S1, 100)),
-    ?assert(quic_cc_bbr:can_send_control(S1, 100)).
-
-bbr_can_send_control_respects_allowance_test() ->
-    State = quic_cc_bbr:new(#{initial_window => 65536}),
-    S1 = quic_cc_bbr:on_packet_sent(State, 65536),
-    %% Large packet exceeds allowance (1200 bytes default)
-    ?assertNot(quic_cc_bbr:can_send_control(S1, 2000)).
+    ?assertNot(quic_cc_bbr:can_send(S1, 24)),
+    ?assertEqual({blocked_cwnd, 0}, quic_cc_bbr:send_check(S1, 24)).
 
 %%====================================================================
 %% Startup State Tests
