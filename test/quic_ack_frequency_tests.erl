@@ -268,6 +268,40 @@ pmtu_probe_payload(S0) ->
     }),
     iolist_to_binary(lists:reverse(S#state.pend_payload)).
 
+migration_sends_immediate_ack_test() ->
+    %% Section 8.4: a client "can send only an IMMEDIATE_ACK frame, which is
+    %% a non-probing frame".
+    ?assert(lists:member(immediate_ack, migrated(#{min_ack_delay => 1000}))),
+    ?assertNot(lists:member(immediate_ack, migrated(#{}))).
+
+preferred_address_migration_sends_immediate_ack_test() ->
+    ?assert(lists:member(immediate_ack, moved_to_preferred(#{min_ack_delay => 1000}))),
+    ?assertNot(lists:member(immediate_ack, moved_to_preferred(#{}))).
+
+%% Frames queued by a client migration with a spare peer CID.
+migrated(TP) ->
+    S0 = quic_connection_test_support:state_for_cid_limit(3),
+    S1 = quic_connection:process_frame(
+        app, {new_connection_id, 1, 0, <<1:64>>, <<0:128>>}, S0#state{transport_params = TP}
+    ),
+    S2 = quic_connection:migrate_to({{127, 0, 0, 1}, 4433}, S1),
+    ?assertEqual(<<1:64>>, S2#state.dcid),
+    quic_connection_test_support:pending_frames(S2).
+
+%% Frames queued once the server's preferred address is validated.
+moved_to_preferred(TP) ->
+    S0 = quic_connection_test_support:client_with_preferred_address(true),
+    Path = #path_state{
+        remote_addr = {{127, 0, 0, 1}, 9}, status = validated, is_nat_rebinding = false
+    },
+    S = quic_connection:maybe_migrate_to_preferred_address(Path, S0#state{
+        transport_params = TP,
+        owner = self(),
+        pmtu_state = quic_pmtu:new(#{pmtu_enabled => false})
+    }),
+    ?assertEqual(<<"pref-cid">>, S#state.dcid),
+    quic_connection_test_support:pending_frames(S) ++ sent_frames(S).
+
 probe_frames(#state{hs = HS} = S0) ->
     S = quic_connection:send_probe_packet(app, S0#state{hs = HS#hs{hs_probe = true}}),
     [P#sent_packet.frames || P <- sent(S)].

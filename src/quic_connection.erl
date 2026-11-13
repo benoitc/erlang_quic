@@ -15961,7 +15961,9 @@ maybe_migrate_to_preferred_address(
             %% Switch CID BEFORE sending any packets (including PMTU probes)
             State2 = switch_to_preferred_cid(PA, State1),
             %% Clear the preferred_address field since migration is complete
-            State3 = State2#state{mig = (State2#state.mig)#mig{preferred_address = undefined}},
+            State3 = migration_immediate_ack(
+                State2#state{mig = (State2#state.mig)#mig{preferred_address = undefined}}
+            ),
             %% Now start PMTU probing on the new path with correct CID
             maybe_send_pmtu_probe(State3);
         false ->
@@ -15997,9 +15999,17 @@ has_unused_cid(#state{cid_pool_state = Pool, dcid = CurrentDCID}) ->
 migrate_to(RemoteAddr, #state{dcid = OldDCID} = State) ->
     case start_path_probe(RemoteAddr, State) of
         {ok, State1, NewCID, _Seq} ->
-            retire_path_cid(OldDCID, State1#state{dcid = NewCID});
+            migration_immediate_ack(retire_path_cid(OldDCID, State1#state{dcid = NewCID}));
         none ->
             State
+    end.
+
+%% draft-ietf-quic-ack-frequency-14 Section 8.4: an IMMEDIATE_ACK alone is a
+%% non-probing frame, so the peer moves to the new path and acknowledges at once.
+migration_immediate_ack(State) ->
+    case peer_takes_ack_frequency(State) of
+        true -> send_frame(immediate_ack, State);
+        false -> State
     end.
 
 %% Find a path by challenge data
