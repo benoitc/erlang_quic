@@ -439,11 +439,13 @@ encrypted_roundtrip_all_lengths_test() ->
     [
         begin
             SID = crypto:strong_rand_bytes(SIDLen),
+            Nonce = crypto:strong_rand_bytes(NonceLen),
             LB = encrypted_lb_config(5, SID, NonceLen, Key),
-            CID = quic_lb:generate_cid(make_cid_config(LB)),
+            CID = quic_lb:generate_cid(make_cid_config(LB), Nonce),
             ?assertEqual(1 + SIDLen + NonceLen, byte_size(CID)),
             ?assertEqual(5, quic_lb:get_config_rotation(CID)),
-            ?assertNotEqual(SID, binary:part(CID, 1, SIDLen)),
+            %% At least 5 octets: an unchanged body is a 2^-40 chance.
+            ?assertNotEqual(<<SID/binary, Nonce/binary>>, binary:part(CID, 1, SIDLen + NonceLen)),
             ?assertEqual({ok, SID}, quic_lb:decode_server_id(CID, LB))
         end
      || SIDLen <- lists:seq(1, 15), NonceLen <- lists:seq(4, 19 - SIDLen)
