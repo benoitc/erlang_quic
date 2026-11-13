@@ -4075,7 +4075,8 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
     {Payload1, Frames1} =
         case
             AckEliciting andalso
-                flight_end_immediate_ack(erlang:iolist_size(Payload0), false, CCState, State)
+                (probe_immediate_ack(State) orelse
+                    flight_end_immediate_ack(erlang:iolist_size(Payload0), false, CCState, State))
         of
             true -> {[Payload0, quic_frame:encode(immediate_ack)], Frames0 ++ [immediate_ack]};
             false -> {Payload0, Frames0}
@@ -7134,6 +7135,13 @@ flight_end_immediate_ack(Bytes, More, CC, State) ->
     quic_cc:immediate_ack(CC) andalso peer_takes_ack_frequency(State) andalso
         ((quic_cc:available_cwnd(CC) < Bytes + quic_cc:max_datagram_size(CC)) orelse
             (not More andalso (State#state.send_queue_count =:= 0))).
+
+%% Section 7: a PTO probe can carry IMMEDIATE_ACK, so its ACK is not
+%% held back by the peer's ACK delay.
+probe_immediate_ack(#state{hs = #hs{hs_probe = true}} = State) ->
+    peer_takes_ack_frequency(State);
+probe_immediate_ack(_State) ->
+    false.
 
 %% The peer advertised min_ack_delay (Section 3).
 peer_takes_ack_frequency(#state{transport_params = TP}) ->

@@ -238,6 +238,24 @@ no_immediate_ack_unless_asked_test() ->
     ?assertEqual([[ping]], [P#sent_packet.frames || P <- sent(S)]).
 
 %%====================================================================
+%% Optional IMMEDIATE_ACK uses (Sections 7, 8.3 and 8.4)
+%%====================================================================
+
+pto_probe_carries_immediate_ack_test() ->
+    %% Section 7: "When sending PTO packets, one can include an IMMEDIATE_ACK frame".
+    ?assertEqual([[ping, immediate_ack]], probe_frames(sender(#{min_ack_delay => 1000}))),
+    ?assertEqual([[ping]], probe_frames(sender(#{}))).
+
+pto_probe_retransmission_carries_immediate_ack_test() ->
+    S0 = quic_connection:send_frame({max_data, 100000}, sender(#{min_ack_delay => 1000})),
+    [_, Probe] = probe_frames(S0),
+    ?assertEqual([{max_data, 100000}, immediate_ack], Probe).
+
+probe_frames(#state{hs = HS} = S0) ->
+    S = quic_connection:send_probe_packet(app, S0#state{hs = HS#hs{hs_probe = true}}),
+    [P#sent_packet.frames || P <- sent(S)].
+
+%%====================================================================
 %% Where the frames may appear
 %%====================================================================
 
