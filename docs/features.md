@@ -180,10 +180,10 @@ See [docs/PSK.md](PSK.md). Pending follow-ups tracked in the
 - [x] Server ID encoding in Connection IDs for LB routing
 - [x] Config rotation bits for LB coordination
 - [x] Variable CID length support (1-20 bytes)
-- [x] Three encoding algorithms:
+- [x] Two encoding algorithms:
   - Plaintext: Server ID visible in CID (no encryption)
-  - Stream Cipher: AES-128-CTR encryption
-  - Block Cipher: Feistel network for variable lengths
+  - Encrypted: AES-128-ECB, one pass when server ID and nonce are 16
+    bytes, a four-pass Feistel network otherwise
 - [x] LB-aware CID generation in listener and connection
 
 ## Reliable Stream Reset (draft-ietf-quic-reliable-stream-reset-11)

@@ -57,39 +57,42 @@ config_creation_test_() ->
             )
         end},
 
-        {"Create stream cipher config", fun() ->
+        {"Create encrypted config", fun() ->
             ServerID = <<1, 2, 3, 4, 5>>,
             Key = crypto:strong_rand_bytes(16),
             Result = quic_lb:new_config(#{
                 server_id => ServerID,
-                algorithm => stream_cipher,
+                algorithm => encrypted,
                 key => Key
             }),
             ?assertMatch(
                 {ok, #lb_config{
                     server_id = ServerID,
-                    algorithm = stream_cipher,
+                    algorithm = encrypted,
                     key = Key
                 }},
                 Result
             )
         end},
 
-        {"Create block cipher config", fun() ->
-            ServerID = <<1, 2, 3, 4, 5, 6>>,
-            Key = crypto:strong_rand_bytes(16),
-            Result = quic_lb:new_config(#{
-                server_id => ServerID,
-                algorithm => block_cipher,
-                key => Key
-            }),
-            ?assertMatch(
-                {ok, #lb_config{
-                    server_id = ServerID,
-                    algorithm = block_cipher,
-                    key = Key
-                }},
-                Result
+        {"Pre-draft-22 algorithms are refused", fun() ->
+            [
+                ?assertEqual(
+                    {error, {unsupported_lb_algorithm, Algorithm}},
+                    quic_lb:new_config(#{
+                        server_id => <<1, 2, 3, 4>>,
+                        algorithm => Algorithm,
+                        key => crypto:strong_rand_bytes(16)
+                    })
+                )
+             || Algorithm <- [stream_cipher, block_cipher]
+            ]
+        end},
+
+        {"Unknown algorithm is refused", fun() ->
+            ?assertEqual(
+                {error, {invalid_algorithm, rot13}},
+                quic_lb:new_config(#{server_id => <<1, 2, 3, 4>>, algorithm => rot13})
             )
         end},
 
@@ -116,9 +119,9 @@ config_creation_test_() ->
         {"Cipher algorithm without key fails", fun() ->
             Result = quic_lb:new_config(#{
                 server_id => <<1, 2, 3, 4>>,
-                algorithm => stream_cipher
+                algorithm => encrypted
             }),
-            ?assertMatch({error, {missing_or_invalid_key, stream_cipher}}, Result)
+            ?assertMatch({error, {missing_or_invalid_key, encrypted}}, Result)
         end},
 
         {"Invalid nonce length fails", fun() ->
@@ -353,210 +356,18 @@ encrypted_decode_ignores_server_use_octets_test() ->
     ?assertEqual({ok, SID}, quic_lb:decode_server_id(<<CID/binary, 1, 2, 3>>, LB)),
     ?assertEqual({error, cid_too_short}, quic_lb:decode_server_id(binary:part(CID, 0, 15), LB)).
 
-%%====================================================================
-%% Stream Cipher Encoding Tests
-%%====================================================================
-
-stream_cipher_encoding_test_() ->
+encrypted_preserves_config_rotation_test() ->
+    Key = crypto:strong_rand_bytes(16),
     [
-        {"Generate stream cipher CID", fun() ->
-            ServerID = <<1, 2, 3, 4>>,
-            Key = crypto:strong_rand_bytes(16),
-            {ok, LBConfig} = quic_lb:new_config(#{
-                server_id => ServerID,
-                algorithm => stream_cipher,
-                key => Key
-            }),
-            CIDConfig = make_cid_config(LBConfig),
-            CID = quic_lb:generate_cid(CIDConfig),
-            ?assertEqual(9, byte_size(CID)),
-            ?assert(quic_lb:is_lb_routable(CID))
-        end},
-
-        {"Decode stream cipher CID roundtrip", fun() ->
-            ServerID = <<10, 20, 30, 40, 50>>,
-            Key = crypto:strong_rand_bytes(16),
-            {ok, LBConfig} = quic_lb:new_config(#{
-                server_id => ServerID,
-                algorithm => stream_cipher,
-                key => Key
-            }),
-            CIDConfig = make_cid_config(LBConfig),
-            CID = quic_lb:generate_cid(CIDConfig),
-            Result = quic_lb:decode_server_id(CID, LBConfig),
-            ?assertEqual({ok, ServerID}, Result)
-        end},
-
-        {"Stream cipher with different nonce lengths", fun() ->
-            ServerID = <<1, 2, 3, 4>>,
-            Key = crypto:strong_rand_bytes(16),
-            lists:foreach(
-                fun(NonceLen) ->
-                    {ok, LBConfig} = quic_lb:new_config(#{
-                        server_id => ServerID,
-                        algorithm => stream_cipher,
-                        nonce_len => NonceLen,
-                        key => Key
-                    }),
-                    CIDConfig = make_cid_config(LBConfig),
-                    CID = quic_lb:generate_cid(CIDConfig),
-                    ExpectedLen = 1 + 4 + NonceLen,
-                    ?assertEqual(ExpectedLen, byte_size(CID)),
-                    ?assertEqual({ok, ServerID}, quic_lb:decode_server_id(CID, LBConfig))
-                end,
-                [4, 8, 12, 16, 18]
-            )
-        end},
-
-        {"Stream cipher preserves config rotation", fun() ->
-            ServerID = <<1, 2, 3>>,
-            Key = crypto:strong_rand_bytes(16),
-            lists:foreach(
-                fun(CR) ->
-                    {ok, LBConfig} = quic_lb:new_config(#{
-                        server_id => ServerID,
-                        algorithm => stream_cipher,
-                        config_rotation => CR,
-                        key => Key
-                    }),
-                    CIDConfig = make_cid_config(LBConfig),
-                    CID = quic_lb:generate_cid(CIDConfig),
-                    ?assertEqual(CR, quic_lb:get_config_rotation(CID)),
-                    ?assertEqual({ok, ServerID}, quic_lb:decode_server_id(CID, LBConfig))
-                end,
-                [0, 1, 2, 3, 4, 5, 6]
-            )
-        end}
-    ].
-
-%%====================================================================
-%% Block Cipher Encoding Tests
-%%====================================================================
-
-block_cipher_encoding_test_() ->
-    [
-        {"Generate block cipher CID (short - Feistel)", fun() ->
-            %% CID < 16 bytes uses Feistel network
-            ServerID = <<1, 2, 3, 4>>,
-            Key = crypto:strong_rand_bytes(16),
-            {ok, LBConfig} = quic_lb:new_config(#{
-                server_id => ServerID,
-                algorithm => block_cipher,
-                nonce_len => 4,
-                key => Key
-            }),
-            CIDConfig = make_cid_config(LBConfig),
-            CID = quic_lb:generate_cid(CIDConfig),
-            %% 1 + 4 + 4 = 9 bytes (< 16, uses Feistel)
-            ?assertEqual(9, byte_size(CID)),
-            ?assert(quic_lb:is_lb_routable(CID))
-        end},
-
-        {"Decode block cipher CID roundtrip (short - Feistel)", fun() ->
-            ServerID = <<10, 20, 30, 40>>,
-            Key = crypto:strong_rand_bytes(16),
-            {ok, LBConfig} = quic_lb:new_config(#{
-                server_id => ServerID,
-                algorithm => block_cipher,
-                nonce_len => 4,
-                key => Key
-            }),
-            CIDConfig = make_cid_config(LBConfig),
-            CID = quic_lb:generate_cid(CIDConfig),
-            Result = quic_lb:decode_server_id(CID, LBConfig),
-            ?assertEqual({ok, ServerID}, Result)
-        end},
-
-        {"Generate block cipher CID (exact 16 bytes - direct AES)", fun() ->
-            %% CID = 16 bytes uses direct AES-ECB
-
-            % 11 bytes
-            ServerID = <<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11>>,
-            Key = crypto:strong_rand_bytes(16),
-            {ok, LBConfig} = quic_lb:new_config(#{
-                server_id => ServerID,
-                algorithm => block_cipher,
-                % 1 + 11 + 4 = 16 bytes
-                nonce_len => 4,
-                key => Key
-            }),
-            CIDConfig = make_cid_config(LBConfig),
-            CID = quic_lb:generate_cid(CIDConfig),
-            ?assertEqual(16, byte_size(CID)),
-            ?assert(quic_lb:is_lb_routable(CID))
-        end},
-
-        {"Decode block cipher CID roundtrip (exact 16 bytes)", fun() ->
-            % 11 bytes
-            ServerID = <<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11>>,
-            Key = crypto:strong_rand_bytes(16),
-            {ok, LBConfig} = quic_lb:new_config(#{
-                server_id => ServerID,
-                algorithm => block_cipher,
-                nonce_len => 4,
-                key => Key
-            }),
-            CIDConfig = make_cid_config(LBConfig),
-            CID = quic_lb:generate_cid(CIDConfig),
-            Result = quic_lb:decode_server_id(CID, LBConfig),
-            ?assertEqual({ok, ServerID}, Result)
-        end},
-
-        {"Generate block cipher CID (long - truncated)", fun() ->
-            %% CID > 16 bytes uses truncated cipher
-
-            % 15 bytes
-            ServerID = <<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15>>,
-            Key = crypto:strong_rand_bytes(16),
-            {ok, LBConfig} = quic_lb:new_config(#{
-                server_id => ServerID,
-                algorithm => block_cipher,
-                % 1 + 15 + 4 = 20 bytes
-                nonce_len => 4,
-                key => Key
-            }),
-            CIDConfig = make_cid_config(LBConfig),
-            CID = quic_lb:generate_cid(CIDConfig),
-            ?assertEqual(20, byte_size(CID)),
-            ?assert(quic_lb:is_lb_routable(CID))
-        end},
-
-        {"Decode block cipher CID roundtrip (long - truncated)", fun() ->
-            ServerID = <<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15>>,
-            Key = crypto:strong_rand_bytes(16),
-            {ok, LBConfig} = quic_lb:new_config(#{
-                server_id => ServerID,
-                algorithm => block_cipher,
-                nonce_len => 4,
-                key => Key
-            }),
-            CIDConfig = make_cid_config(LBConfig),
-            CID = quic_lb:generate_cid(CIDConfig),
-            Result = quic_lb:decode_server_id(CID, LBConfig),
-            ?assertEqual({ok, ServerID}, Result)
-        end},
-
-        {"Block cipher with various sizes", fun() ->
-            Key = crypto:strong_rand_bytes(16),
-            %% Test different server_id sizes to exercise all code paths
-            lists:foreach(
-                fun(ServerIDLen) ->
-                    ServerID = crypto:strong_rand_bytes(ServerIDLen),
-                    {ok, LBConfig} = quic_lb:new_config(#{
-                        server_id => ServerID,
-                        algorithm => block_cipher,
-                        nonce_len => 4,
-                        key => Key
-                    }),
-                    CIDConfig = make_cid_config(LBConfig),
-                    CID = quic_lb:generate_cid(CIDConfig),
-                    Result = quic_lb:decode_server_id(CID, LBConfig),
-                    ?assertEqual({ok, ServerID}, Result)
-                end,
-                lists:seq(1, 15)
-            )
-        end}
-    ].
+        begin
+            LB = encrypted_lb_config(CR, <<1, 2, 3>>, 4, Key),
+            CID = quic_lb:generate_cid(make_cid_config(LB)),
+            ?assertEqual(CR, quic_lb:get_config_rotation(CID)),
+            ?assertEqual({ok, <<1, 2, 3>>}, quic_lb:decode_server_id(CID, LB))
+        end
+     || CR <- lists:seq(0, 6)
+    ],
+    ok.
 
 %%====================================================================
 %% Helper Function Tests
@@ -702,33 +513,13 @@ listener_integration_test_() ->
                 ok = quic_listener:stop(Listener)
             end},
 
-            {"Listener starts with stream cipher LB config", fun() ->
+            {"Listener starts with encrypted LB config", fun() ->
                 {Cert, PrivKey} = generate_test_cert(),
                 ServerID = <<5, 6, 7, 8, 9>>,
                 Key = crypto:strong_rand_bytes(16),
                 LBConfig = #{
                     server_id => ServerID,
-                    algorithm => stream_cipher,
-                    key => Key
-                },
-                Opts = #{
-                    cert => Cert,
-                    key => PrivKey,
-                    alpn => [<<"h3">>],
-                    lb_config => LBConfig
-                },
-                {ok, Listener} = quic_listener:start_link(0, Opts),
-                ?assert(is_pid(Listener)),
-                ok = quic_listener:stop(Listener)
-            end},
-
-            {"Listener starts with block cipher LB config", fun() ->
-                {Cert, PrivKey} = generate_test_cert(),
-                ServerID = <<10, 11, 12, 13, 14, 15>>,
-                Key = crypto:strong_rand_bytes(16),
-                LBConfig = #{
-                    server_id => ServerID,
-                    algorithm => block_cipher,
+                    algorithm => encrypted,
                     key => Key
                 },
                 Opts = #{
@@ -835,32 +626,9 @@ stability_test_() ->
             )
         end},
 
-        {"Multiple stream cipher roundtrips", fun() ->
+        {"Multiple encrypted roundtrips", fun() ->
             ServerID = <<200, 201, 202, 203, 204>>,
-            Key = crypto:strong_rand_bytes(16),
-            {ok, LBConfig} = quic_lb:new_config(#{
-                server_id => ServerID,
-                algorithm => stream_cipher,
-                key => Key
-            }),
-            CIDConfig = make_cid_config(LBConfig),
-            lists:foreach(
-                fun(_) ->
-                    CID = quic_lb:generate_cid(CIDConfig),
-                    ?assertEqual({ok, ServerID}, quic_lb:decode_server_id(CID, LBConfig))
-                end,
-                lists:seq(1, 100)
-            )
-        end},
-
-        {"Multiple block cipher roundtrips", fun() ->
-            ServerID = <<150, 151, 152, 153, 154, 155>>,
-            Key = crypto:strong_rand_bytes(16),
-            {ok, LBConfig} = quic_lb:new_config(#{
-                server_id => ServerID,
-                algorithm => block_cipher,
-                key => Key
-            }),
+            LBConfig = encrypted_lb_config(0, ServerID, 4, crypto:strong_rand_bytes(16)),
             CIDConfig = make_cid_config(LBConfig),
             lists:foreach(
                 fun(_) ->

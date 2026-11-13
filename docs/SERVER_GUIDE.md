@@ -304,7 +304,7 @@ end.
 %% Configure QUIC-LB for load balancer routing
 LBConfig = #{
     server_id => <<1, 2, 3, 4>>,        % Unique server identifier
-    algorithm => stream_cipher,          % plaintext | stream_cipher | block_cipher
+    algorithm => encrypted,              % plaintext | encrypted
     key => crypto:strong_rand_bytes(16), % Encryption key (not for plaintext)
     config_rotation => 0                 % Config rotation bits (0-7)
 },
