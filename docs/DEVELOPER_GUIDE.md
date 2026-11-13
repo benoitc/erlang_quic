@@ -174,7 +174,7 @@ start_server(Port, Cert, Key) ->
 %% Configure server for load balancer routing
 start_lb_server(Port, Cert, Key, ServerId) ->
     LbConfig = #{
-        algorithm => stream_cipher,
+        algorithm => encrypted,
         server_id => ServerId,       % Unique ID for this server (binary)
         key => crypto:strong_rand_bytes(16),
         nonce_len => 8

@@ -1010,7 +1010,8 @@ validate_server_opts(Opts) ->
                 validate_receive_window(Opts),
                 validate_owner_queue(Opts),
                 validate_alpn_handler(Opts),
-                quic_listener:validate_reset_secret(Opts)
+                quic_listener:validate_reset_secret(Opts),
+                quic_listener:validate_lb_config(Opts)
             ]);
         {error, _} = Error ->
             Error

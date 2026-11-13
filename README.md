@@ -13,7 +13,7 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 - DATAGRAM frame support for unreliable data (RFC 9221)
 - QUIC v2 support (RFC 9369)
 - Server mode with listener and pooled listeners (SO_REUSEPORT)
-- QUIC-LB load balancer support with routable CIDs (RFC 9312)
+- QUIC-LB load balancer support with routable CIDs (draft-ietf-quic-load-balancers-22)
 - Retry packet handling for address validation (RFC 9000 Section 8.1)
 - Stateless reset support (RFC 9000 Section 10.3)
 - Spin bit (RFC 9000 §17.4) and full NEW_TOKEN issuance/validation
@@ -212,7 +212,7 @@ See [docs/features.md](docs/features.md) for the complete API reference and feat
 `quic_h3:send_data/3,4`, `quic_h3:start_server/3`, `quic_h3:open_bidi_stream/1,2`,
 `quic_h3:send_datagram/3` (RFC 9114 / 9204 / 9297)
 
-**Load Balancer:** `quic_lb:new_config/1`, `quic_lb:generate_cid/1` (RFC 9312)
+**Load Balancer:** `quic_lb:new_config/1`, `quic_lb:generate_cid/1` (draft-ietf-quic-load-balancers-22)
 
 ## Building
 

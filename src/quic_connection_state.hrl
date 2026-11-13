@@ -175,7 +175,7 @@
         }
         | undefined,
 
-    %% QUIC-LB CID configuration (RFC 9312)
+    %% QUIC-LB CID configuration (draft-ietf-quic-load-balancers-22)
     cid_config :: #cid_config{} | undefined,
 
     %% Backpressure configuration (for distribution connections)

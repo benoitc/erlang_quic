@@ -829,7 +829,7 @@
 }).
 
 %%====================================================================
-%% QUIC-LB (RFC 9312) - QUIC Load Balancer Configuration
+%% QUIC-LB (draft-ietf-quic-load-balancers-22) - QUIC Load Balancer Configuration
 %%====================================================================
 
 %% Config Rotation for unroutable packets (CR bits = 0b111)
@@ -840,6 +840,8 @@
 -define(LB_MAX_NONCE_LEN, 18).
 %% Minimum nonce length
 -define(LB_MIN_NONCE_LEN, 4).
+%% Maximum server ID plus nonce length
+-define(LB_MAX_SERVER_ID_NONCE_LEN, 19).
 
 %% QUIC-LB Configuration record
 %% Defines how the load balancer encodes server identity in CIDs
@@ -847,14 +849,14 @@
     %% Config rotation bits (0-6, 7 = unroutable)
     config_rotation = 0 :: 0..6,
     %% Encoding algorithm
-    algorithm = plaintext :: plaintext | stream_cipher | block_cipher,
+    algorithm = plaintext :: plaintext | encrypted,
     %% Server ID (1-15 bytes identifying this server)
     server_id :: binary(),
     %% Length of server ID in bytes
     server_id_len :: 1..15,
     %% Length of nonce in bytes (4-18)
     nonce_len = 4 :: 4..18,
-    %% Encryption key (16 bytes for AES-128, required for cipher algorithms)
+    %% Encryption key (16 bytes for AES-128, required for encrypted)
     key :: binary() | undefined
 }).
 

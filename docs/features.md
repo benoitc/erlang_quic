@@ -175,15 +175,15 @@ See [docs/PSK.md](PSK.md). Pending follow-ups tracked in the
 - [x] Updated initial salt
 - [x] Updated retry integrity tag key
 
-## QUIC-LB Load Balancer Support (RFC 9312)
+## QUIC-LB Load Balancer Support (draft-ietf-quic-load-balancers-22)
 
 - [x] Server ID encoding in Connection IDs for LB routing
 - [x] Config rotation bits for LB coordination
 - [x] Variable CID length support (1-20 bytes)
-- [x] Three encoding algorithms:
+- [x] Two encoding algorithms:
   - Plaintext: Server ID visible in CID (no encryption)
-  - Stream Cipher: AES-128-CTR encryption
-  - Block Cipher: Feistel network for variable lengths
+  - Encrypted: AES-128-ECB, one pass when server ID and nonce are 16
+    bytes, a four-pass Feistel network otherwise
 - [x] LB-aware CID generation in listener and connection
 
 ## Reliable Stream Reset (draft-ietf-quic-reliable-stream-reset-11)
@@ -308,7 +308,7 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 - `quic:get_server_connections/1` - Get server connection PIDs
 - `quic:which_servers/0` - List all running servers
 
-### Load Balancer (RFC 9312)
+### Load Balancer (draft-ietf-quic-load-balancers-22)
 - `quic_lb:new_config/1` - Create LB configuration from options map
 - `quic_lb:new_cid_config/1` - Create CID generation configuration
 - `quic_lb:generate_cid/1` - Generate CID with encoded server_id
