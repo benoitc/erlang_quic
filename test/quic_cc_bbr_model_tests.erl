@@ -632,6 +632,24 @@ startup_exits_on_high_loss_test() ->
     ?assertNotEqual(infinity, maps:get(inflight_longterm, Info)),
     ?assert(maps:get(lost_pkts, Sim) > 0).
 
+%% Recovery ends before the model sees an ACK (draft-ietf-ccwg-bbr-07
+%% Section 5.6.4.4): an ACK that ends recovery does not count as a round
+%% in recovery for the Startup loss exit (Section 5.3.1.3).
+recovery_ended_by_this_ack_is_over_for_the_model_test() ->
+    T = erlang:monotonic_time(microsecond),
+    S0 = lists:foldl(
+        fun(_, S) -> quic_cc_bbr:on_packet_sent_at(S, ?MDS, T) end,
+        quic_cc_bbr:new_at(#{}, T),
+        lists:seq(1, 20)
+    ),
+    S1 = quic_cc_bbr:on_congestion_event_at(S0, T div ?MS, T + 10 * ?MS),
+    S2 = quic_cc_bbr:on_packets_acked_at(S1, ?MDS, T + 40 * ?MS),
+    S3 = quic_cc_bbr:on_packet_sent_at(S2, ?MDS, T + 45 * ?MS),
+    S4 = quic_cc_bbr:on_packets_lost_at(S3, 6 * ?MDS, T + 50 * ?MS),
+    S5 = quic_cc_bbr:on_packets_acked_at(S4, 14 * ?MDS, T + 60 * ?MS),
+    ?assertNot(quic_cc_bbr:in_recovery(S5)),
+    ?assertEqual(startup, maps:get(mode, quic_cc_bbr:info(S5))).
+
 %% A.2: excessive loss ends Startup even when application-limited.
 startup_exits_on_loss_when_app_limited_test() ->
     Out = run_until(lossy_app_limited(), not_in_mode(startup), 5 * ?SEC),

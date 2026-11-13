@@ -406,10 +406,9 @@ on_packets_acked_at(State, 0, _Now) ->
 on_packets_acked_at(State0, AckedBytes, Now) ->
     State1 = take_acked(State0, AckedBytes, Now),
     State2 = generate_rate_sample(State1),
-    %% Losses this ACK reveals come after it, so the model sees the
-    %% recovery this ACK may end.
-    State3 = update_model_and_state(State2, Now),
-    update_control_parameters(maybe_exit_recovery(State3)).
+    State3 = maybe_exit_recovery(State2),
+    State4 = update_model_and_state(State3, Now),
+    update_control_parameters(State4).
 
 %% Section 4.1.2.3 UpdateRateSample, over the oldest outstanding bytes.
 take_acked(#bbr_state{bytes_in_flight = InFlight} = S, AckedBytes, Now) ->
