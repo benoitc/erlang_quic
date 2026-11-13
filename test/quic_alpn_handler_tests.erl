@@ -95,8 +95,56 @@ no_common_alpn_is_refused_before_the_handler_test() ->
         quic:stop_server(Name)
     end.
 
+%% The 3-argument form gets the owner connection_handler chose, so it
+%% can hand the connection on to it.
+owner_from_connection_handler_is_passed_test() ->
+    Test = self(),
+    Pre = relay(pre, Test),
+    Name = start_server(#{
+        connection_handler => fun(_Conn) -> {ok, Pre} end,
+        alpn_handler => fun(Conn, Alpn, Owner) ->
+            Test ! {handler_called, Conn, Alpn, Owner},
+            {ok, Owner}
+        end
+    }),
+    try
+        {ok, Client} = connect(Name, <<"proto-a">>),
+        receive
+            {handler_called, _Conn, <<"proto-a">>, Owner} -> ?assertEqual(Pre, Owner)
+        after ?TIMEOUT -> error(handler_not_called)
+        end,
+        receive
+            {pre, {quic, _, {connected, #{alpn := <<"proto-a">>}}}} -> ok
+        after ?TIMEOUT -> error(owner_not_connected)
+        end,
+        quic:close(Client, normal)
+    after
+        quic:stop_server(Name)
+    end.
+
+%% Without a connection_handler the current owner is the listener.
+listener_is_the_owner_without_connection_handler_test() ->
+    Test = self(),
+    Name = start_server(#{
+        alpn_handler => fun(_Conn, Alpn, Owner) ->
+            Test ! {handler_called, Owner},
+            {ok, relay(Alpn, Test)}
+        end
+    }),
+    try
+        {ok, Client} = connect(Name, <<"proto-b">>),
+        receive
+            {handler_called, Owner} ->
+                ?assertEqual({quic_listener, init, 1}, proc_lib:translate_initial_call(Owner))
+        after ?TIMEOUT -> error(handler_not_called)
+        end,
+        quic:close(Client, normal)
+    after
+        quic:stop_server(Name)
+    end.
+
 %% A hook the connection could not call is refused at start.
-a_handler_that_is_not_a_fun_of_two_is_refused_test() ->
+a_handler_of_another_arity_is_refused_test() ->
     {ok, _} = application:ensure_all_started(quic),
     {Cert, Key} = quic_test_echo_server:cert_and_key(),
     lists:foreach(
@@ -108,7 +156,7 @@ a_handler_that_is_not_a_fun_of_two_is_refused_test() ->
                 })
             )
         end,
-        [fun(_Conn) -> ok end, not_a_fun, {quic_h3, accept}]
+        [fun(_Conn) -> ok end, fun(_, _, _, _) -> ok end, not_a_fun, {quic_h3, accept}]
     ).
 
 start_server(Opts) ->

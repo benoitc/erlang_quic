@@ -950,7 +950,10 @@ get_peer_transport_params(Conn) when is_pid(Conn) ->
 %%       `{error, _}', a malformed result, or a raised exception fails the
 %%       handshake with a `handshake_failure' alert.</li>
 %%   <li>`alpn_handler' -
-%%       `fun((Conn :: pid(), Alpn :: binary()) -> {ok, Owner :: pid()} | {error, term()})'.
+%%       `fun((Conn :: pid(), Alpn :: binary()) -> {ok, Owner :: pid()} | {error, term()})'
+%%       or `fun((Conn, Alpn, CurrentOwner :: pid()) -> ...)', which also
+%%       gets the current owner: the one `connection_handler' returned, or
+%%       the listener without one.
 %%       Invoked in the connection process once the ClientHello has
 %%       negotiated `Alpn', before any stream data can be decoded;
 %%       `Owner' becomes the connection's owner from there, after any
@@ -1042,12 +1045,13 @@ validate_owner_queue(Opts) ->
         {ok, N} -> {error, {invalid_max_owner_queue, N}}
     end.
 
-%% @private `alpn_handler' is called with the connection and the ALPN.
+%% @private `alpn_handler' is called with the connection and the ALPN,
+%% and in its 3-argument form the current owner.
 validate_alpn_handler(Opts) ->
     case maps:find(alpn_handler, Opts) of
         error -> ok;
         {ok, undefined} -> ok;
-        {ok, F} when is_function(F, 2) -> ok;
+        {ok, F} when is_function(F, 2); is_function(F, 3) -> ok;
         {ok, F} -> {error, {invalid_alpn_handler, F}}
     end.
 

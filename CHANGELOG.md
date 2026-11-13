@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `alpn_handler` can take a third argument, the connection's current
+  owner: the one `connection_handler` returned, or the listener without
+  one. An owner started by `connection_handler` can now be told the
+  negotiated ALPN without keeping a map from connection to owner.
+
 ## [2.7.0] - 2026-11-13
 
 ### Security
