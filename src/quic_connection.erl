@@ -2688,10 +2688,12 @@ send_client_hello(State) ->
         end,
     %% Add reset_stream_at if enabled (draft-ietf-quic-reliable-stream-reset-11 Section 3)
     TransportParams =
-        case (State#state.cfg)#conn_cfg.reset_stream_at_enabled of
-            false -> TransportParams1;
-            true -> TransportParams1#{reset_stream_at => true}
-        end,
+        with_min_ack_delay(
+            case (State#state.cfg)#conn_cfg.reset_stream_at_enabled of
+                false -> TransportParams1;
+                true -> TransportParams1#{reset_stream_at => true}
+            end
+        ),
 
     %% Build ClientHello (with or without PSK for resumption / external).
     %% session_ticket and external_psk are mutually exclusive; build_client_hello/1
@@ -2815,6 +2817,11 @@ upgrade_ticket(Ticket) when is_tuple(Ticket), element(1, Ticket) =:= session_tic
     end;
 upgrade_ticket(Ticket) ->
     Ticket.
+
+%% draft-ietf-quic-ack-frequency-14 Section 3: min_ack_delay announces we
+%% take ACK_FREQUENCY and IMMEDIATE_ACK.
+with_min_ack_delay(TP) ->
+    TP#{min_ack_delay => ?MIN_ACK_DELAY_US}.
 
 %% What a ticket keeps of the server's transport parameters: all the
 %% client processes, except those Section 7.4.1 takes from the new
@@ -3090,10 +3097,12 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         end,
     %% Add reset_stream_at if enabled (draft-ietf-quic-reliable-stream-reset-11 Section 3)
     TransportParams2 =
-        case (State#state.cfg)#conn_cfg.reset_stream_at_enabled of
-            false -> TransportParams1;
-            true -> TransportParams1#{reset_stream_at => true}
-        end,
+        with_min_ack_delay(
+            case (State#state.cfg)#conn_cfg.reset_stream_at_enabled of
+                false -> TransportParams1;
+                true -> TransportParams1#{reset_stream_at => true}
+            end
+        ),
     %% Add preferred_address if configured (RFC 9000 Section 9.6)
     %% Server MUST NOT send preferred_address if disable_active_migration is set
     TransportParams3 =
@@ -3771,11 +3780,14 @@ send_app_ack(#state{ack_timer = Ref, pn_app = PNSpace} = State, RecvPass) ->
         [_ | _] ->
             AckFrameTuple = quic_ack:ack_frame_for(PNSpace, erlang:monotonic_time(millisecond)),
             bump(?C_ACK_SENT, 1, State),
-            maybe_coalesce_ack_with_data(AckFrameTuple, State#state{
-                ack_timer = undefined,
-                ack_elicited_count = 0,
-                recv_pass = RecvPass
-            })
+            maybe_coalesce_ack_with_data(
+                AckFrameTuple,
+                note_ack_sent(State#state{
+                    ack_timer = undefined,
+                    ack_elicited_count = 0,
+                    recv_pass = RecvPass
+                })
+            )
     end.
 
 %% Bump the ack_sent counter. Called once per ACK packet that is about
@@ -4060,7 +4072,16 @@ end_coalescing(true, #state{pend_payload = PP, pend_frames = PF} = State) ->
 send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
     State = flush_long_datagram(State0),
     AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames0),
-    {Payload, Frames, AckFields} = piggyback_ack(AckEliciting, Payload0, Frames0, State),
+    {Payload1, Frames1} =
+        case
+            AckEliciting andalso
+                (probe_immediate_ack(State) orelse
+                    flight_end_immediate_ack(erlang:iolist_size(Payload0), false, CCState, State))
+        of
+            true -> {[Payload0, quic_frame:encode(immediate_ack)], Frames0 ++ [immediate_ack]};
+            false -> {Payload0, Frames0}
+        end,
+    {Payload, Frames, AckFields} = piggyback_ack(AckEliciting, Payload1, Frames1, State),
     #state{
         dcid = DCID,
         app_keys = {ClientKeys, ServerKeys},
@@ -4183,7 +4204,12 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
         ack_timer = AckTimer,
         ack_elicited_count = AckCount
     },
-    after_sealed(KeyLimit, note_amp_send(Packet, PacketSize, AmpRoom, Hold, State1)).
+    State2 =
+        case AckFields of
+            acked -> note_ack_sent(State1);
+            none -> State1
+        end,
+    after_sealed(KeyLimit, note_amp_send(Packet, PacketSize, AmpRoom, Hold, State2)).
 
 %% An ack-eliciting packet carries the pending ACK when it fits the data
 %% budget (RFC 9000 §13.2.1 lets an ACK ride on any 1-RTT packet), so an
@@ -4752,8 +4778,16 @@ fold_opened_seq([{_PN, _FB, Opened} | Rest], State, N, Elicited) ->
                 {NewState, Elicited};
             true ->
                 case should_delay_ack(Frames) of
-                    true -> {schedule_delayed_ack(app, NewState), Elicited};
-                    false -> {NewState, Elicited + 1}
+                    true ->
+                        {schedule_delayed_ack(app, NewState), Elicited};
+                    false ->
+                        case NewState#state.last_recv_trigger of
+                            %% An IMMEDIATE_ACK in the run
+                            reordered ->
+                                {(send_app_ack(NewState))#state{last_recv_trigger = sequential}, 0};
+                            sequential ->
+                                {NewState, Elicited + 1}
+                        end
                 end
         end,
     fold_opened_seq(Rest, State2, N + 1, Elicited2).
@@ -6197,6 +6231,9 @@ frame_permitted(zero_rtt, Frame) ->
         {new_token, _} -> false;
         {path_response, _} -> false;
         handshake_done -> false;
+        %% draft-ietf-quic-ack-frequency-14 Section 3: never in 0-RTT
+        {ack_frequency, _, _, _, _} -> false;
+        immediate_ack -> false;
         _ -> true
     end;
 frame_permitted(_Level, _Frame) ->
@@ -6651,6 +6688,12 @@ process_frame(
         error ->
             reset_unseen_stream(StreamId, ErrorCode, FinalSize, State)
     end;
+%% We always advertise min_ack_delay (draft-ietf-quic-ack-frequency-14 Section 3).
+process_frame(app, {ack_frequency, Seq, Threshold, Delay, Reordering}, State) ->
+    apply_ack_frequency(Seq, Threshold, Delay, Reordering, State);
+%% Section 5: ACK the packet carrying it at once.
+process_frame(app, immediate_ack, State) ->
+    State#state{last_recv_trigger = reordered};
 %% Without our reset_stream_at transport parameter the frame type is
 %% unknown on this connection (RFC 9000 Section 12.4).
 process_frame(
@@ -6921,6 +6964,189 @@ process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
     State.
 
+%% draft-ietf-quic-ack-frequency-14 Section 4: a Requested Max Ack Delay
+%% below our min_ack_delay or at 2^14 ms or more is a PROTOCOL_VIOLATION.
+apply_ack_frequency(_Seq, _Threshold, Delay, _Reordering, State) when
+    Delay < ?MIN_ACK_DELAY_US orelse Delay >= ?MAX_REQUESTED_ACK_DELAY_US
+->
+    close_with_error(
+        app,
+        transport,
+        ?QUIC_PROTOCOL_VIOLATION,
+        ?FRAME_ACK_FREQUENCY,
+        <<"invalid Requested Max Ack Delay">>,
+        State
+    );
+%% Section 4: only a Sequence Number above the largest processed counts.
+apply_ack_frequency(
+    Seq,
+    _Threshold,
+    _Delay,
+    _Reordering,
+    #state{
+        peer_ack_freq = #peer_ack_freq{seq = Last}
+    } = State
+) when Seq =< Last ->
+    State;
+apply_ack_frequency(Seq, Threshold, DelayUs, Reordering, #state{ack_timer = Timer} = State) ->
+    DelayMs = DelayUs div 1000,
+    %% A timer armed for a longer delay is dropped; this ack-eliciting packet arms a new one.
+    NewTimer =
+        case (DelayMs < ack_delay_ms(State)) of
+            true ->
+                cancel_timer(Timer),
+                undefined;
+            false ->
+                Timer
+        end,
+    State#state{
+        ack_timer = NewTimer,
+        peer_ack_freq = #peer_ack_freq{
+            seq = Seq,
+            tolerance = min(Threshold, ?MAX_ACK_ELICITING_THRESHOLD) + 1,
+            max_ack_delay = DelayMs,
+            reordering = Reordering,
+            largest_acked = largest_acked_sent(State#state.peer_ack_freq)
+        }
+    }.
+
+largest_acked_sent(undefined) -> -1;
+largest_acked_sent(#peer_ack_freq{largest_acked = L}) -> L.
+
+%% Ask the peer for the ACK frequency the congestion controller wants, once
+%% it advertised min_ack_delay (draft-ietf-quic-ack-frequency-14 Section 4).
+maybe_request_ack_frequency(#state{cc_state = CC, loss_state = LossState} = State) ->
+    SrttUs = quic_rtt:smoothed(quic_loss:rtt(LossState)) * 1000,
+    case quic_cc:ack_frequency(CC, SrttUs) of
+        none -> State;
+        Request -> request_ack_frequency(Request, State)
+    end.
+
+request_ack_frequency({Threshold, Delay0, Reordering0}, #state{transport_params = TP} = State) ->
+    case maps:get(min_ack_delay, TP, undefined) of
+        undefined ->
+            State;
+        PeerMin ->
+            %% Section 4: no less than the peer's min_ack_delay, below 2^14 ms.
+            Delay = min(max(Delay0, PeerMin), ?MAX_REQUESTED_ACK_DELAY_US - 1),
+            Request = {Threshold, Delay, reordering_threshold(Reordering0, State)},
+            Now = erlang:monotonic_time(millisecond),
+            case ack_frequency_due(Request, Now, State) of
+                true -> send_ack_frequency(Request, Now, State);
+                false -> State
+            end
+    end.
+
+%% Section 9: a Reordering Threshold above 1 follows loss detection's
+%% packet threshold, which grows with the reordering seen.
+reordering_threshold(Reordering, #state{loss_state = LossState}) when Reordering > 1 ->
+    max(Reordering, quic_loss:reorder_threshold(app, LossState));
+reordering_threshold(Reordering, _State) ->
+    Reordering.
+
+%% A change asking for ACKs as often or more goes out at once; one asking
+%% for fewer at most once per smoothed RTT (Section 8.1).
+ack_frequency_due({T, D, R} = Request, Now, State) ->
+    {CT, CD, CR, SentAt} = current_ack_frequency(State),
+    case Request of
+        {CT, CD, CR} ->
+            false;
+        _ when T =< CT, D =< CD, R =< CR ->
+            true;
+        _ when SentAt =:= undefined ->
+            true;
+        _ ->
+            Now - SentAt >= quic_rtt:smoothed(quic_loss:rtt(State#state.loss_state))
+    end.
+
+%% What the peer does now: RFC 9000 Section 13.2 until we asked otherwise.
+current_ack_frequency(#state{ack_freq_req = undefined, transport_params = TP}) ->
+    {1, maps:get(max_ack_delay, TP, ?DEFAULT_MAX_ACK_DELAY) * 1000, 1, undefined};
+current_ack_frequency(#state{ack_freq_req = Req}) ->
+    #ack_freq_req{threshold = T, max_ack_delay = D, reordering = R, sent_at = SentAt} = Req,
+    {T, D, R, SentAt}.
+
+send_ack_frequency({Threshold, Delay, Reordering} = Request, Now, State0) ->
+    Seq =
+        case State0#state.ack_freq_req of
+            undefined -> 0;
+            #ack_freq_req{seq = Last} -> Last + 1
+        end,
+    %% Sent like the other control frames; their cwnd check is reviewed separately.
+    State = send_frame({ack_frequency, Seq, Threshold, Delay, Reordering}, State0),
+    #state{loss_state = LossState, cc_state = CC} = State,
+    %% Section 7: the PTO uses the larger max_ack_delay until the peer has the request.
+    DelayMs = (Delay + 999) div 1000,
+    {LossState1, Pending} =
+        case (DelayMs >= quic_loss:max_ack_delay(LossState)) of
+            true -> {quic_loss:set_max_ack_delay(LossState, DelayMs), undefined};
+            false -> {LossState, DelayMs}
+        end,
+    State#state{
+        loss_state = LossState1,
+        cc_state = quic_cc:on_ack_frequency(CC, Request),
+        ack_freq_req = #ack_freq_req{
+            seq = Seq,
+            threshold = Threshold,
+            max_ack_delay = Delay,
+            reordering = Reordering,
+            sent_at = Now,
+            pending_pto_delay = Pending
+        }
+    }.
+
+%% Section 7: a lower max_ack_delay counts once its request is acknowledged.
+ack_frequency_acked(
+    Acked,
+    #state{
+        ack_freq_req = #ack_freq_req{seq = Seq, pending_pto_delay = DelayMs} = Req,
+        loss_state = LossState
+    } = State
+) when DelayMs =/= undefined ->
+    case
+        lists:any(
+            fun(#sent_packet{frames = Frames}) ->
+                lists:any(
+                    fun
+                        ({ack_frequency, S, _, _, _}) -> S =:= Seq;
+                        (_) -> false
+                    end,
+                    Frames
+                )
+            end,
+            Acked
+        )
+    of
+        true ->
+            State#state{
+                loss_state = quic_loss:set_max_ack_delay(LossState, DelayMs),
+                ack_freq_req = Req#ack_freq_req{pending_pto_delay = undefined}
+            };
+        false ->
+            State
+    end;
+ack_frequency_acked(_Acked, State) ->
+    State.
+
+%% draft-ietf-quic-ack-frequency-14 Section 5: the controller may want the
+%% packet that ends a flight, cwnd full or nothing left queued, to carry
+%% IMMEDIATE_ACK.
+flight_end_immediate_ack(Bytes, More, CC, State) ->
+    quic_cc:immediate_ack(CC) andalso peer_takes_ack_frequency(State) andalso
+        ((quic_cc:available_cwnd(CC) < Bytes + quic_cc:max_datagram_size(CC)) orelse
+            (not More andalso (State#state.send_queue_count =:= 0))).
+
+%% Section 7: a PTO probe can carry IMMEDIATE_ACK, so its ACK is not
+%% held back by the peer's ACK delay.
+probe_immediate_ack(#state{hs = #hs{hs_probe = true}} = State) ->
+    peer_takes_ack_frequency(State);
+probe_immediate_ack(_State) ->
+    false.
+
+%% The peer advertised min_ack_delay (Section 3).
+peer_takes_ack_frequency(#state{transport_params = TP}) ->
+    maps:is_key(min_ack_delay, TP).
+
 %% What an ACK means beyond loss and congestion accounting. Only the
 %% application space has streams, PMTU probes and a send queue, so the
 %% handshake spaces take the short path: replay what was lost, at their
@@ -6977,9 +7203,12 @@ app_ack_tail(AckedPackets, LostPackets, State1) ->
             FinSids -> lists:foldl(fun settle_fin_ack/2, State4, FinSids)
         end,
 
+    %% Ask the peer for the ACK frequency the controller wants now.
+    State4b = maybe_request_ack_frequency(ack_frequency_acked(AckedPackets, State4a)),
+
     %% Try to send queued data now that cwnd may have freed up.
     %% This also drains retransmit_stream entries deferred by CC.
-    State6 = process_send_queue(State4a),
+    State6 = process_send_queue(State4b),
     %% cwnd reopened: replay CC-deferred control retransmits, then
     %% complete any local reset-at reclaim whose reliable bytes are
     %% now acked.
@@ -9464,7 +9693,7 @@ flush_socket_batch(State0) ->
 %% A receive pass only counts ack-eliciting packets; an ACK still owed at
 %% its end gets the max_ack_delay timer here.
 pass_ack_timer(#state{ack_elicited_count = 0, ack_timer = Timer}) -> Timer;
-pass_ack_timer(#state{ack_timer = Timer}) -> ensure_ack_timer(Timer).
+pass_ack_timer(#state{ack_timer = Timer} = State) -> ensure_ack_timer(Timer, State).
 
 flushed_socket_state(undefined) ->
     undefined;
@@ -9594,7 +9823,7 @@ maybe_decimate_app_ack(#state{recv_pass = true} = State) ->
     State#state{ack_elicited_count = State#state.ack_elicited_count + 1};
 maybe_decimate_app_ack(State) ->
     NewCount = State#state.ack_elicited_count + 1,
-    case NewCount >= (State#state.cfg)#conn_cfg.ack_packet_tolerance of
+    case (NewCount >= ack_tolerance(State)) orelse gap_ack_due(State) of
         true ->
             send_app_ack(State);
         false ->
@@ -9610,14 +9839,11 @@ maybe_decimate_app_ack(State) ->
 flush_recv_pass(State0) ->
     State = flush_pending_delivery(State0),
     case State of
-        #state{
-            ack_elicited_count = Count,
-            close_reason = undefined,
-            cfg = #conn_cfg{ack_packet_tolerance = Tol}
-        } when
-            Count >= Tol
-        ->
-            send_app_ack(State, false);
+        #state{ack_elicited_count = Count, close_reason = undefined} when Count > 0 ->
+            case (Count >= ack_tolerance(State)) orelse gap_ack_due(State) of
+                true -> send_app_ack(State, false);
+                false -> State
+            end;
         _ ->
             State
     end.
@@ -9673,15 +9899,83 @@ flush_pending_delivery(#state{pend_deliver = {StreamId, Acc, Fin}, owner = Owner
 arm_ack_timer(#state{ack_timer = Ref} = State) when Ref =/= undefined ->
     State;
 arm_ack_timer(#state{ack_timer = undefined} = State) ->
-    State#state{ack_timer = ensure_ack_timer(undefined)}.
+    State#state{ack_timer = ensure_ack_timer(undefined, State)}.
 
 %% The armed ACK timer, arming one if there is none. A start_timer
 %% reference is also the timer handle, so cancel_timer/1 stops it and a
 %% piggybacked ACK leaves no stale timeout behind.
-ensure_ack_timer(undefined) ->
-    erlang:start_timer(?DEFAULT_MAX_ACK_DELAY, self(), send_delayed_ack);
-ensure_ack_timer(Ref) ->
+ensure_ack_timer(undefined, State) ->
+    erlang:start_timer(ack_delay_ms(State), self(), send_delayed_ack);
+ensure_ack_timer(Ref, _State) ->
     Ref.
+
+%% Our max_ack_delay: the peer's Requested Max Ack Delay once it sent one
+%% (draft-ietf-quic-ack-frequency-14 Section 4).
+ack_delay_ms(#state{peer_ack_freq = undefined}) -> ?DEFAULT_MAX_ACK_DELAY;
+ack_delay_ms(#state{peer_ack_freq = #peer_ack_freq{max_ack_delay = D}}) -> D.
+
+%% Ack-eliciting packets that send an ACK: the option, or Ack-Eliciting
+%% Threshold + 1 once the peer sent one (Section 6).
+ack_tolerance(#state{peer_ack_freq = undefined, cfg = #conn_cfg{ack_packet_tolerance = T}}) -> T;
+ack_tolerance(#state{peer_ack_freq = #peer_ack_freq{tolerance = T}}) -> T.
+
+%% Section 6.2: with a Reordering Threshold above 1, an out-of-order packet
+%% sends an ACK only once the peer could declare a packet lost.
+recv_trigger(Trigger, _PN, #state{peer_ack_freq = undefined}) ->
+    Trigger;
+recv_trigger(sequential, _PN, _State) ->
+    sequential;
+recv_trigger(reordered, _PN, #state{peer_ack_freq = #peer_ack_freq{reordering = 1}}) ->
+    reordered;
+recv_trigger(reordered, _PN, #state{peer_ack_freq = #peer_ack_freq{reordering = 0}}) ->
+    sequential;
+recv_trigger(reordered, PN, #state{peer_ack_freq = AF, pn_app = Space}) ->
+    #peer_ack_freq{reordering = RT, largest_acked = LA} = AF,
+    case (PN =< LA - RT) orelse gap_ack_due(Space, AF) of
+        true -> reordered;
+        false -> sequential
+    end.
+
+%% Section 6.2, first condition, for the packets decimation counts.
+gap_ack_due(#state{peer_ack_freq = #peer_ack_freq{reordering = RT} = AF, pn_app = Space}) when
+    RT > 1
+->
+    gap_ack_due(Space, AF);
+gap_ack_due(_State) ->
+    false.
+
+%% The smallest missing packet the last ACK did not report as missing
+%% is Reordering Threshold or more below the largest received.
+gap_ack_due(#pn_space{largest_recv = Largest, ack_ranges = Ranges}, AF) when
+    is_integer(Largest)
+->
+    #peer_ack_freq{reordering = RT, largest_acked = LA} = AF,
+    case smallest_missing_above(LA - RT, lists:reverse(Ranges)) of
+        none -> false;
+        Missing -> (Largest - Missing >= RT)
+    end;
+gap_ack_due(_Space, _AF) ->
+    false.
+
+%% Ranges ascending; gaps between them are the missing packets.
+smallest_missing_above(Floor, [{_, End}, {Next, _} = R | Rest]) ->
+    case (Next - 1 > Floor) of
+        true -> max(End + 1, Floor + 1);
+        false -> smallest_missing_above(Floor, [R | Rest])
+    end;
+smallest_missing_above(_Floor, _Ranges) ->
+    none.
+
+%% Section 6.2: the Largest Acked the reordering test measures from.
+note_ack_sent(
+    #state{
+        peer_ack_freq = #peer_ack_freq{reordering = RT} = AF,
+        pn_app = #pn_space{largest_recv = Largest}
+    } = State
+) when RT > 1, is_integer(Largest) ->
+    State#state{peer_ack_freq = AF#peer_ack_freq{largest_acked = Largest}};
+note_ack_sent(State) ->
+    State.
 
 %%====================================================================
 %% Frame classification for ACK policy
@@ -9696,8 +9990,9 @@ should_delay_ack([{stream, _, _, _, _} | _]) ->
 should_delay_ack(Frames) ->
     AckEliciting = [F || F <- Frames, quic_ack:is_ack_eliciting_frame(F)],
     Retransmittable = quic_loss:retransmittable_frames(AckEliciting),
-    %% If all ack-eliciting frames are non-retransmittable, delay ACK
-    Retransmittable =:= [].
+    %% If all ack-eliciting frames are non-retransmittable, delay ACK,
+    %% unless one asks for it now (draft-ietf-quic-ack-frequency-14 Section 5)
+    (Retransmittable =:= []) andalso not lists:member(immediate_ack, AckEliciting).
 
 %% Schedule a delayed ACK (datagram-only path; RFC 9221 §5.2).
 %% Shares the same ack_timer field with the count-based decimation
@@ -10116,13 +10411,15 @@ record_received_pn(app, PN, State, Now) ->
     PNSpace = State#state.pn_app,
     Trigger = classify_recv_trigger(PN, PNSpace),
     NewPNSpace = quic_ack:update_pn_space_recv(PN, PNSpace, Now),
-    State#state{pn_app = NewPNSpace, last_recv_trigger = Trigger};
+    State1 = State#state{pn_app = NewPNSpace},
+    State1#state{last_recv_trigger = recv_trigger(Trigger, PN, State1)};
 record_received_pn(zero_rtt, PN, State, Now) ->
     %% 0-RTT uses the same PN space as 1-RTT (app)
     PNSpace = State#state.pn_app,
     Trigger = classify_recv_trigger(PN, PNSpace),
     NewPNSpace = quic_ack:update_pn_space_recv(PN, PNSpace, Now),
-    State#state{pn_app = NewPNSpace, last_recv_trigger = Trigger};
+    State1 = State#state{pn_app = NewPNSpace},
+    State1#state{last_recv_trigger = recv_trigger(Trigger, PN, State1)};
 record_received_pn(_, _PN, State, _Now) ->
     State.
 
@@ -11259,8 +11556,10 @@ short_header_first_byte(KeyPhase, PNLen, #state{cfg = #conn_cfg{spin_bit_enabled
 %% state record, together ~10% of receive CPU on bulk flows. Same
 %% logic as those helpers; the spin part mirrors update_spin_from_recv.
 record_app_recv(FirstByte, PN, #state{pn_app = PNSpace} = State, Now) ->
-    Trigger = classify_recv_trigger(PN, PNSpace),
     NewPNSpace = quic_ack:update_pn_space_recv(PN, PNSpace, Now),
+    Trigger = recv_trigger(
+        classify_recv_trigger(PN, PNSpace), PN, State#state{pn_app = NewPNSpace}
+    ),
     {SpinRecv, SpinLargest, SpinOut} =
         case PN > State#state.spin_recv_largest_pn of
             true ->
@@ -11537,8 +11836,18 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
     %% Build the run's frames and QUIC-frame payloads, then seal all K
     %% packets: one fused NIF call when available (header, nonce, AEAD
     %% and header protection in C), per-packet Erlang sealing otherwise.
-    {Frames, Payloads, Offset1, Rest} =
+    {Frames, Payloads0, Offset1, Rest} =
         build_run_payloads(K, StreamId, Offset, Data, HeaderPrefix, LengthVarint, MaxChunkSize),
+    %% The run's last packet may end a flight; the chunk size leaves room for one byte.
+    Payloads =
+        case
+            flight_end_immediate_ack(
+                K * (MaxChunkSize + ?PACKET_OVERHEAD), (byte_size(Rest) > 0), CCState, State
+            )
+        of
+            true -> with_immediate_ack_last(Payloads0);
+            false -> Payloads0
+        end,
     FirstByteBase = short_header_first_byte(KeyPhase, 1, State),
     Packets =
         case quic_aead_ctx:protect_run(Cipher, Key, IV, HP, PN0, FirstByteBase, DCID, Payloads) of
@@ -11623,6 +11932,9 @@ build_run_payloads(K, Sid, Offset, Data, HeaderPrefix, LengthVarint, MCS, FrAcc,
         [Frame | FrAcc],
         [Payload | PlAcc]
     ).
+
+with_immediate_ack_last([Last]) -> [[Last, quic_frame:encode(immediate_ack)]];
+with_immediate_ack_last([P | Rest]) -> [P | with_immediate_ack_last(Rest)].
 
 %% A run to an unvalidated address goes through the amplification limit
 %% one datagram at a time; a held one is tracked as sent.
@@ -13078,6 +13390,11 @@ is_current_limit({max_stream_data, StreamId, N}, #state{streams = Streams}) ->
         {ok, #stream_state{final_size = undefined, recv_max_data = Max}} -> N >= Max;
         _ -> false
     end;
+%% draft-ietf-quic-ack-frequency-14 Section 4: resend only the latest request.
+is_current_limit({ack_frequency, Seq, _, _, _}, #state{ack_freq_req = #ack_freq_req{seq = Seq}}) ->
+    true;
+is_current_limit({ack_frequency, _, _, _, _}, _State) ->
+    false;
 is_current_limit(_, _State) ->
     true.
 
@@ -15644,7 +15961,9 @@ maybe_migrate_to_preferred_address(
             %% Switch CID BEFORE sending any packets (including PMTU probes)
             State2 = switch_to_preferred_cid(PA, State1),
             %% Clear the preferred_address field since migration is complete
-            State3 = State2#state{mig = (State2#state.mig)#mig{preferred_address = undefined}},
+            State3 = migration_immediate_ack(
+                State2#state{mig = (State2#state.mig)#mig{preferred_address = undefined}}
+            ),
             %% Now start PMTU probing on the new path with correct CID
             maybe_send_pmtu_probe(State3);
         false ->
@@ -15680,9 +15999,17 @@ has_unused_cid(#state{cid_pool_state = Pool, dcid = CurrentDCID}) ->
 migrate_to(RemoteAddr, #state{dcid = OldDCID} = State) ->
     case start_path_probe(RemoteAddr, State) of
         {ok, State1, NewCID, _Seq} ->
-            retire_path_cid(OldDCID, State1#state{dcid = NewCID});
+            migration_immediate_ack(retire_path_cid(OldDCID, State1#state{dcid = NewCID}));
         none ->
             State
+    end.
+
+%% draft-ietf-quic-ack-frequency-14 Section 8.4: an IMMEDIATE_ACK alone is a
+%% non-probing frame, so the peer moves to the new path and acknowledges at once.
+migration_immediate_ack(State) ->
+    case peer_takes_ack_frequency(State) of
+        true -> send_frame(immediate_ack, State);
+        false -> State
     end.
 
 %% Find a path by challenge data
@@ -16353,8 +16680,10 @@ send_pmtu_probe_packet(_ProbeSize, _Frames, #state{app_keys = undefined} = State
     %% No keys available yet
     State;
 send_pmtu_probe_packet(ProbeSize, Frames, #state{dcid = DCID, pn_app = PNSpace} = State) ->
-    %% Encode PING + explicit PADDING frames
-    EncodedFrames = encode_pmtu_frames(Frames),
+    %% Encode PING + explicit PADDING frames, with IMMEDIATE_ACK when the peer
+    %% takes it so the probe's ACK beats the probe timer
+    %% (draft-ietf-quic-ack-frequency-14 Section 8.3)
+    EncodedFrames = <<(pmtu_immediate_ack(State))/binary, (encode_pmtu_frames(Frames))/binary>>,
 
     %% Calculate extra padding needed to reach target probe size
     %% Account for: header (1 + DCID), PN (1-4), auth tag (16)
@@ -16382,6 +16711,12 @@ send_pmtu_probe_packet(ProbeSize, Frames, #state{dcid = DCID, pn_app = PNSpace} 
     %% connection on an MTU-limited path died on the first periodic
     %% re-probe, both ends at once.
     send_app_packet_internal(PaddedFrames, [], State).
+
+pmtu_immediate_ack(State) ->
+    case peer_takes_ack_frequency(State) of
+        true -> quic_frame:encode(immediate_ack);
+        false -> <<>>
+    end.
 
 %% @doc Encode PMTU probe frames (PING + PADDING).
 -spec encode_pmtu_frames([term()]) -> binary().

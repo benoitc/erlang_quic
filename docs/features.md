@@ -38,6 +38,7 @@
 - [x] Packet number reconstruction per RFC 9000 Appendix A
 - [x] Coalesced packets
 - [x] Frame coalescing (ACK + small stream data in single packet)
+- [x] ACK frequency extension (draft-ietf-quic-ack-frequency-14): every connection advertises `min_ack_delay` (1 ms) and follows the peer's ACK_FREQUENCY and IMMEDIATE_ACK; with BBR it also asks a peer that advertised `min_ack_delay` for fewer ACKs in steady state. PTO probes, PMTU probes and the first packet after a client migration carry IMMEDIATE_ACK to such a peer
 - [x] HTTP/3 response HEADERS coalesced with the first DATA frame so the
   response headers and first body bytes ride in one 1-RTT packet (a large
   body still fragments; only the standalone HEADERS packet is removed)
@@ -95,7 +96,7 @@ than from its own timer.
 - [x] Pluggable congestion control behavior
 - [x] NewReno (default, RFC 9002)
 - [x] CUBIC (RFC 9438)
-- [x] BBR (Bottleneck Bandwidth and RTT)
+- [x] BBR (Bottleneck Bandwidth and RTT), asking the peer for fewer ACKs in steady state through the ACK frequency extension
 - [x] HyStart++ slow start (RFC 9406) for all algorithms
 - [x] Slow start with improved exit detection
 - [x] Congestion avoidance
@@ -357,7 +358,7 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 - `versions` - QUIC versions this connection also accepts, for RFC 9368 compatible version negotiation (default: the negotiated `version` alone)
 - `ciphers` - TLS 1.3 cipher suites to offer or accept, in preference order (default: `[aes_128_gcm, aes_256_gcm, chacha20_poly1305]` on a CPU with AES instructions, `[chacha20_poly1305, aes_128_gcm, aes_256_gcm]` without them, per `/proc/cpuinfo`). A server honours a client that lists `chacha20_poly1305` first whenever its own list allows the suite, so a peer without AES hardware gets ChaCha from either side
 - `max_burst_packets` - Packets allowed to leave per send drain, so a large queued write cannot monopolise the scheduler (default: 64)
-- `ack_packet_tolerance` - Ack-eliciting packets received before a 1-RTT ACK is sent, the RFC 9000 section 13.2.1 decimation threshold (default: 2)
+- `ack_packet_tolerance` - Ack-eliciting packets received before a 1-RTT ACK is sent, the RFC 9000 section 13.2.1 decimation threshold (default: 2). A peer's ACK_FREQUENCY request replaces it for the connection
 - `disconnect_timeout` - Milliseconds without a response from the peer before the connection is given up on, checked on its own timer (default: 16000). With `idle_timeout => 0` it bounds the handshake as a whole instead: a handshake that has not completed within it from its start is closed
 - `pmtu_raise_interval` - Milliseconds between PMTU raise probes (default: 600000)
 - `delivery_coalescing` - Merge consecutive same-stream `stream_data` deliveries of one receive pass into a single owner message (default: `false`). Arrival order across streams is preserved and a `stream_reset` never overtakes data delivered before it, but an owner that counts messages rather than bytes sees fewer of them

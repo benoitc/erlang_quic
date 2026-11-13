@@ -459,6 +459,16 @@ encode_frame({new_token, Token}) ->
     #{frame_type => <<"new_token">>, length => byte_size(Token)};
 encode_frame({datagram, Data}) ->
     #{frame_type => <<"datagram">>, length => iolist_size(Data)};
+encode_frame({ack_frequency, SeqNum, Threshold, MaxAckDelay, Reordering}) ->
+    #{
+        frame_type => <<"ack_frequency">>,
+        sequence_number => SeqNum,
+        ack_eliciting_threshold => Threshold,
+        request_max_ack_delay => MaxAckDelay,
+        reordering_threshold => Reordering
+    };
+encode_frame(immediate_ack) ->
+    #{frame_type => <<"immediate_ack">>};
 encode_frame(Frame) when is_tuple(Frame) ->
     #{frame_type => <<"unknown">>, raw => element(1, Frame)};
 encode_frame(_) ->

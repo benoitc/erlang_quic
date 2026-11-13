@@ -144,8 +144,10 @@ Frames are processed in order within a packet. Key frame types:
 | PATH_RESPONSE (0x1b) | Path validation response |
 | CONNECTION_CLOSE (0x1c-0x1d) | Close connection |
 | HANDSHAKE_DONE (0x1e) | Server signals handshake confirmed |
+| IMMEDIATE_ACK (0x1f) | Ask the peer to acknowledge now (draft-ietf-quic-ack-frequency-14) |
 | RESET_STREAM_AT (0x24) | Reset with reliable delivery up to an offset |
 | DATAGRAM (0x30-0x31) | Unreliable datagram (RFC 9221) |
+| ACK_FREQUENCY (0xaf) | Ask the peer to acknowledge less or more often (draft-ietf-quic-ack-frequency-14) |
 
 ## TLS Integration
 
@@ -312,6 +314,34 @@ maximum bandwidth and minimum RTT:
 The `quic_cc` callbacks report bytes, so the delivery rate sampler
 matches acknowledged and lost bytes against per-packet snapshots kept in
 send order.
+
+When the peer advertised `min_ack_delay`, BBR sets the peer's ACK
+frequency per phase (draft-ietf-ccwg-bbr-07 Section 4.1.3.3): at least 4
+ACKs per round trip in Startup, Drain, ProbeBW_REFILL, ProbeBW_UP and
+ProbeRTT; one ACK per quarter cwnd and half a smoothed RTT in
+ProbeBW_DOWN and ProbeBW_CRUISE, halved for each round that exhausts
+cwnd; IMMEDIATE_ACK on the last packet of each flight in ProbeRTT. The
+offload budget grows by the data a reduced ACK frequency holds back
+(Section 5.5.8.2).
+
+### ACK frequency
+
+draft-ietf-quic-ack-frequency-14. Each connection advertises
+`min_ack_delay` of 1 ms, the ACK timer's granularity.
+
+- Receiving: a newer ACK_FREQUENCY sets how many ack-eliciting packets
+  wait for an ACK (capped at 64), the ACK timer delay, and when a gap
+  in packet numbers sends an ACK at once (Section 6.2). IMMEDIATE_ACK
+  sends one at once.
+- Sending: `quic_cc:ack_frequency/2` gives the controller's request;
+  only BBR makes one. The connection sends it when the peer advertised
+  `min_ack_delay`, at once for more ACKs and at most once per smoothed
+  RTT for fewer, and resends only the latest one when lost. The PTO
+  keeps the larger `max_ack_delay` until the peer acknowledges a
+  smaller one (Section 7).
+- To a peer that advertised `min_ack_delay`, IMMEDIATE_ACK also rides
+  on 1-RTT PTO probes (Section 7), on PMTU probes (Section 8.3), and
+  goes out alone after a client moves to a new path (Section 8.4).
 
 ### Packet Pacing
 

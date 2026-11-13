@@ -179,6 +179,17 @@ connection_close_frame() ->
 handshake_done_frame() ->
     handshake_done.
 
+%% Generate an ACK_FREQUENCY frame (draft-ietf-quic-ack-frequency-14 Section 4)
+ack_frequency_frame() ->
+    ?LET(
+        {Seq, Threshold, Delay, Reordering},
+        {varint(), varint(), varint(), varint()},
+        {ack_frequency, Seq, Threshold, Delay, Reordering}
+    ).
+
+varint() ->
+    oneof([range(0, 63), range(64, 16383), range(0, 16#3FFFFFFFFFFFFFFF)]).
+
 %% Generate any frame
 any_frame() ->
     oneof([
@@ -200,7 +211,9 @@ any_frame() ->
         path_challenge_frame(),
         path_response_frame(),
         connection_close_frame(),
-        handshake_done_frame()
+        handshake_done_frame(),
+        ack_frequency_frame(),
+        immediate_ack
     ]).
 
 %%====================================================================

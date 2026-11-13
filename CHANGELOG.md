@@ -13,6 +13,18 @@ All notable changes to this project will be documented in this file.
   `encrypted` algorithm produces the encrypted connection IDs the draft
   defines (Section 5.4), which a load balancer that follows it decodes
   with the same key.
+- The QUIC ACK frequency extension (draft-ietf-quic-ack-frequency-14).
+  Connections advertise `min_ack_delay` and follow a peer's request to
+  acknowledge less or more often, or at once, which lets a peer cut
+  the ACK traffic it receives on bulk transfers. With BBR, a connection
+  to a peer that supports it asks for fewer ACKs while the bandwidth
+  is steady and for more while probing, and for an immediate ACK at the
+  end of each flight in ProbeRTT (draft-ietf-ccwg-bbr-07 Section
+  4.1.3.3). To a peer that supports it, PTO probes, PMTU probes and
+  the first packet after a client moves to a new path ask for an
+  immediate ACK, so loss recovery, path MTU discovery and migration are
+  not slowed by the peer's ACK delay. Until a peer sends a request,
+  acknowledgments go out as before.
 
 ### Changed
 - Breaking: the `stream_cipher` and `block_cipher` QUIC-LB algorithms

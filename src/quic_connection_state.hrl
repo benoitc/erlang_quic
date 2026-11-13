@@ -23,6 +23,15 @@
 %% ACK traffic for RTT-sample granularity.
 -define(ACK_PACKET_TOLERANCE, 2).
 
+%% Our min_ack_delay in microseconds (draft-ietf-quic-ack-frequency-14
+%% Section 3): the ACK timer has millisecond granularity.
+-define(MIN_ACK_DELAY_US, 1000).
+%% A peer's Ack-Eliciting Threshold above this is followed as this many,
+%% so a delayed ACK stays within the ACK ranges kept.
+-define(MAX_ACK_ELICITING_THRESHOLD, 64).
+%% Requested Max Ack Delay must stay below 2^14 ms, in microseconds.
+-define(MAX_REQUESTED_ACK_DELAY_US, 16384000).
+
 %% Default per-drain send burst budget in packets (max_burst_packets
 %% option). See the burst_budget field.
 -define(DEFAULT_MAX_BURST_PACKETS, 64).
@@ -38,6 +47,32 @@
 -define(C_DATAGRAM_RECV_DROPPED, 8).
 -define(C_SEND_QUEUE_FULL_REFUSALS, 9).
 -define(N_COUNTERS, 9).
+
+%% The ACK_FREQUENCY request the peer last made of us.
+-record(peer_ack_freq, {
+    seq :: non_neg_integer(),
+    %% Ack-eliciting packets that send an ACK: Ack-Eliciting Threshold + 1
+    tolerance :: pos_integer(),
+    %% Requested Max Ack Delay, in milliseconds
+    max_ack_delay :: pos_integer(),
+    reordering :: non_neg_integer(),
+    %% Largest packet number our last ACK reported (Section 6.2)
+    largest_acked = -1 :: integer()
+}).
+
+%% The ACK_FREQUENCY request we last sent (draft-ietf-quic-ack-frequency-14
+%% Section 4).
+-record(ack_freq_req, {
+    seq :: non_neg_integer(),
+    threshold :: non_neg_integer(),
+    %% Requested Max Ack Delay, in microseconds
+    max_ack_delay :: pos_integer(),
+    reordering :: non_neg_integer(),
+    %% Millisecond time it was sent
+    sent_at :: integer(),
+    %% A lower max_ack_delay (ms) the PTO takes once this request is acknowledged
+    pending_pto_delay :: pos_integer() | undefined
+}).
 
 %% Connection state record
 %% Write-once connection configuration, set in init/1 and never
@@ -666,6 +701,11 @@
     %% (RFC 9002 §6.2 reordering recommendation) and count-based
     %% decimation.
     last_recv_trigger = sequential :: sequential | reordered,
+    %% The peer's latest ACK_FREQUENCY request (draft-ietf-quic-ack-frequency-14
+    %% Section 4); it replaces ack_packet_tolerance and the ACK timer delay.
+    peer_ack_freq = undefined :: #peer_ack_freq{} | undefined,
+    %% Our latest ACK_FREQUENCY request to the peer.
+    ack_freq_req = undefined :: #ack_freq_req{} | undefined,
 
     %% Small-send coalescing (issue #201). While `coalesce' is true -
     %% only within one drained batch of send_data/send_data_async

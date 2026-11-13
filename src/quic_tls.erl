@@ -823,6 +823,9 @@ encode_transport_param(reset_stream_at, true) ->
         (encode_tp(?TP_RESET_STREAM_AT, <<>>))/binary,
         (encode_tp(?TP_RESET_STREAM_AT_DRAFT07, <<>>))/binary
     >>;
+%% draft-ietf-quic-ack-frequency-14 Section 3
+encode_transport_param(min_ack_delay, Value) ->
+    encode_tp(?TP_MIN_ACK_DELAY, quic_varint:encode(Value));
 encode_transport_param(_, _) ->
     <<>>.
 
@@ -923,6 +926,16 @@ validate_max_ack_delay(Params) ->
         N when N >= 16384 ->
             {error, {transport_parameter_error, max_ack_delay_too_large, N}};
         _ ->
+            validate_min_ack_delay(Params)
+    end.
+
+validate_min_ack_delay(Params) ->
+    %% draft-ietf-quic-ack-frequency-14 Section 3: min_ack_delay (us) =< max_ack_delay (ms)
+    MaxAckDelayUs = maps:get(max_ack_delay, Params, ?DEFAULT_MAX_ACK_DELAY) * 1000,
+    case maps:get(min_ack_delay, Params, undefined) of
+        N when is_integer(N), N > MaxAckDelayUs ->
+            {error, {transport_parameter_error, min_ack_delay_too_large, N}};
+        _ ->
             validate_max_streams(Params)
     end.
 
@@ -961,6 +974,7 @@ tp_id_to_key(?TP_VERSION_INFORMATION) -> version_information;
 tp_id_to_key(?TP_MAX_DATAGRAM_FRAME_SIZE) -> max_datagram_frame_size;
 tp_id_to_key(?TP_RESET_STREAM_AT) -> reset_stream_at;
 tp_id_to_key(?TP_RESET_STREAM_AT_DRAFT07) -> reset_stream_at_draft07;
+tp_id_to_key(?TP_MIN_ACK_DELAY) -> min_ack_delay;
 tp_id_to_key(Id) -> {unknown, Id}.
 
 decode_tp_value(?TP_ORIGINAL_DCID, Value) ->
@@ -997,7 +1011,8 @@ decode_tp_value(Id, Value) when
     Id =:= ?TP_ACK_DELAY_EXPONENT;
     Id =:= ?TP_MAX_ACK_DELAY;
     Id =:= ?TP_ACTIVE_CONNECTION_ID_LIMIT;
-    Id =:= ?TP_MAX_DATAGRAM_FRAME_SIZE
+    Id =:= ?TP_MAX_DATAGRAM_FRAME_SIZE;
+    Id =:= ?TP_MIN_ACK_DELAY
 ->
     %% Known integer parameters are varints, filling the value exactly
     {Int, <<>>} = quic_varint:decode(Value),
